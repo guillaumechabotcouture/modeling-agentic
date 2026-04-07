@@ -206,13 +206,19 @@ async def run(question: str, max_rounds: int, max_sessions: int) -> None:
             trace_file.close()
             break
         except Exception as e:
-            print(f"\nSession {session_num} error: {e}", flush=True)
+            error_str = str(e)
+            print(f"\nSession {session_num} error: {error_str}", flush=True)
             trace_file.write(json.dumps({
                 "ts": datetime.now().isoformat(),
                 "type": "session_error",
-                "error": str(e),
+                "error": error_str,
             }) + "\n")
             trace_file.close()
+
+            # Don't retry policy blocks -- they'll fail every time
+            if "Usage Policy" in error_str or "violate" in error_str:
+                print("Policy block detected. Try rephrasing the question.", flush=True)
+                break
 
             if session_num >= max_sessions:
                 print("Max sessions reached.", flush=True)
