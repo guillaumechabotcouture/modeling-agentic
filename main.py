@@ -1091,37 +1091,37 @@ async def run(question: str, max_rounds: int, max_sessions: int = 5,
 
         # Check if work is complete
         done, total, has_report = checklist_status(run_path)
+        completion = done / total if total > 0 else 0
 
-        if has_report and total > 0 and done == total:
-            print(
-                f"\nAll checklist items complete ({done}/{total}). "
-                f"Report written.",
-                flush=True,
-            )
+        print(
+            f"\nStatus: checklist {done}/{total} ({completion:.0%}) | "
+            f"report: {'yes' if has_report else 'no'}",
+            flush=True,
+        )
+
+        # Only stop if checklist is >=95% complete AND report exists
+        if has_report and total > 0 and completion >= 0.95:
+            print(f"Checklist >=95% complete with report. Done.", flush=True)
             break
-        elif has_report and done > 0:
-            # Report exists and some work done -- good enough
-            print(
-                f"\nReport written. Checklist: {done}/{total} complete.",
-                flush=True,
-            )
-            break
-        elif total > 0 and done == total:
-            print(f"\nChecklist complete ({done}/{total}). No report yet.", flush=True)
-            # Continue -- need report
-        elif total > 0:
+        elif total > 0 and completion >= 0.95 and not has_report:
+            print(f"Checklist nearly done but no report. Continuing...", flush=True)
+        elif has_report and total > 0 and completion < 0.95:
             remaining = total - done
             print(
-                f"\nChecklist: {done}/{total} complete, "
-                f"{remaining} remaining. Continuing...",
+                f"Report exists but {remaining} checklist items remain. "
+                f"Continuing to finish outstanding work...",
                 flush=True,
             )
+        elif total > 0:
+            remaining = total - done
+            print(f"{remaining} items remaining. Continuing...", flush=True)
+        elif not has_report and total == 0:
+            # No checklist and no report -- keep going
+            print("No checklist or report yet. Continuing...", flush=True)
         else:
-            # No checklist yet -- only stop if we have a report
-            if has_report:
-                print("\nReport written (no checklist found).", flush=True)
-                break
-            print("\nNo checklist or report yet. Continuing...", flush=True)
+            # Edge case: has report, no checklist
+            print("Report written (no checklist). Done.", flush=True)
+            break
 
     # Save final metadata
     elapsed_total = (datetime.now() - run_start).total_seconds()
