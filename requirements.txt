@@ -1,0 +1,17 @@
+claude-agent-sdk
+numpy
+scipy
+pandas
+matplotlib
+seaborn
+requests
+
+# Model fitting and statistics
+lmfit
+statsmodels
+scikit-learn
+xgboost
+prophet
+
+# Bayesian modeling (optional, heavier dependency)
+# pymc
