@@ -84,6 +84,27 @@ async def run_agent(
 
     print(f"\n--- {stage_name.upper()} ---", flush=True)
 
+    # Retry up to 2 times on CLI errors
+    max_retries = 2
+    for attempt in range(max_retries + 1):
+        try:
+            return await _run_agent_inner(
+                system_prompt, prompt, tools, run_path, stage_name,
+                trace_file, agents, start_time, pre_tool_hook, tool_count,
+            )
+        except Exception as e:
+            if attempt < max_retries and "I/O operation" in str(e):
+                import time
+                print(f"[{stage_name}] CLI error, retrying ({attempt+1}/{max_retries})...", flush=True)
+                time.sleep(3)
+            else:
+                raise
+
+
+async def _run_agent_inner(
+    system_prompt, prompt, tools, run_path, stage_name,
+    trace_file, agents, start_time, pre_tool_hook, tool_count,
+):
     async for message in query(
         prompt=prompt,
         options=ClaudeAgentOptions(

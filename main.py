@@ -101,17 +101,22 @@ async def run_pipeline(
         }) + "\n")
 
         # Run from current stage forward
+        # Small delay between stages to let CLI processes clean up
+        import time as _time
+
         if stage_index(stage) <= stage_index("plan"):
             await run_stage(
                 planner, question, run_dir, run_path,
                 trace_file, start_time, "plan",
             )
+            _time.sleep(2)
 
         if stage_index(stage) <= stage_index("data"):
             await run_stage(
                 data, question, run_dir, run_path,
                 trace_file, start_time, "data",
             )
+            _time.sleep(2)
 
         if stage_index(stage) <= stage_index("model"):
             await run_stage(
@@ -119,12 +124,14 @@ async def run_pipeline(
                 trace_file, start_time, "model",
                 round_num=round_num,
             )
+            _time.sleep(2)
 
         if stage_index(stage) <= stage_index("analyze"):
             await run_stage(
                 analyst, question, run_dir, run_path,
                 trace_file, start_time, "analyze",
             )
+            _time.sleep(2)
 
         # Critique: 3 reviewers in parallel
         print(f"\n{'='*60}", flush=True)
