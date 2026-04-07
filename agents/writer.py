@@ -56,7 +56,11 @@ For each: prediction, evidence, verdict. This is the scientific heart.
 - Technical details
 
 ## CRITICAL: Presentation Standards
-- Every figure: numbered caption + interpretation sentence
+- Every figure MUST be embedded using markdown image syntax:
+  ![Figure N: Caption text](figures/filename.png)
+  Do NOT just write "Figure 23 (model_fit.png): description" -- that
+  won't render. Use the ![alt](path) syntax so the figure appears in
+  the PDF.
 - Every table: numbered caption + column headers with units
 - Label findings as CAUSAL / ASSOCIATIONAL / PROXY
 - No overclaiming -- conclusions must match the evidence
