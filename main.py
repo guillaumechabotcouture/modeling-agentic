@@ -6,6 +6,9 @@ import json
 import os
 import re
 from datetime import datetime
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from agents import run_agent, run_critique_with_fallback, parse_critique_target, STAGES, stage_index
 from agents import planner, data, modeler, analyst
