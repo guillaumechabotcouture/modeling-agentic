@@ -43,6 +43,17 @@ For each key finding:
 - Are mechanisms cited that don't match the model structure?
   (e.g., "regression explains the dynamics" is wrong)
 
+## Modeling Economy
+Read {run_dir}/modeling_strategy.md (if it exists):
+- Was a simple model tried first?
+- Is the final model complexity justified by the improvement?
+- Could the key hypotheses be answered with a simpler model?
+- If the agent jumped straight to a complex model without trying
+  simple alternatives → flag as a concern
+- If a simpler model answered the question adequately but the agent
+  built something more complex anyway → REVISE (unnecessary complexity
+  wastes compute and reduces interpretability)
+
 ## You can request work at ANY stage:
 - **NEW_HYPOTHESES**: "Results suggest H8 (nOPV2 impact) not in original set"
 - **NEW_DATA**: "Can't distinguish H1 from H2 without subnational data"

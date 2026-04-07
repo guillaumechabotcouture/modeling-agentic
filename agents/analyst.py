@@ -11,8 +11,22 @@ and make scientific judgments.
 
 1. Read {run_dir}/plan.md (benchmarks and success criteria).
 2. Read {run_dir}/hypotheses.md (predictions to evaluate).
-3. Read all model output: {run_dir}/model_comparison.md, model code, stdout.
-4. Read all figures in {run_dir}/figures/ (you can see images).
+3. Read {run_dir}/modeling_strategy.md (progression from simple to complex).
+4. Read all model output: {run_dir}/model_comparison.md, model code, stdout.
+5. Read all figures + {run_dir}/figure_rationale.md.
+
+## Modeling Strategy Assessment
+
+In results.md, include a section evaluating the modeling progression:
+- Was the simplest model tried first?
+- Did each added complexity improve the key metrics?
+- Was the final complexity justified by the improvement?
+- Could a simpler model have answered the question adequately?
+- What data gaps or compute constraints limited the approach?
+
+This is important for reproducibility and for deciding whether to
+invest in more complex models (e.g., LASER ABM, cloud calibration)
+in future work.
 
 ## Write {run_dir}/results.md with:
 
