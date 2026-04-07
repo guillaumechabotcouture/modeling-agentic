@@ -12,6 +12,35 @@ from claude_agent_sdk import (
     HookMatcher,
 )
 
+MAX_FIGURE_PIXELS = 10_000_000  # 10MP -- anything larger is likely a bug
+
+def _check_figure_size(path: str, stage_name: str) -> None:
+    """Warn and resize oversized PNG files."""
+    import os
+    if not os.path.exists(path) or not path.endswith(".png"):
+        return
+    try:
+        from PIL import Image
+        Image.MAX_IMAGE_PIXELS = 2_000_000_000  # Allow opening for inspection
+        img = Image.open(path)
+        pixels = img.size[0] * img.size[1]
+        if pixels > MAX_FIGURE_PIXELS:
+            # Resize to reasonable dimensions preserving aspect ratio
+            ratio = (MAX_FIGURE_PIXELS / pixels) ** 0.5
+            new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
+            print(
+                f"[{stage_name}] WARNING: {os.path.basename(path)} is "
+                f"{img.size[0]}x{img.size[1]} ({pixels/1e6:.0f}MP). "
+                f"Resizing to {new_size[0]}x{new_size[1]}.",
+                flush=True,
+            )
+            img = img.resize(new_size, Image.LANCZOS)
+            img.save(path)
+        img.close()
+    except Exception:
+        pass  # Don't let figure checking crash the pipeline
+
+
 # Stage ordering for the pipeline state machine
 STAGES = ["plan", "data", "model", "analyze", "critique", "write"]
 
@@ -75,6 +104,27 @@ async def run_agent(
         trace_file.flush()
         return {}
 
+    async def post_tool_hook(input_data, tool_use_id, context):
+        """Check written PNG files for oversized figures."""
+        import os
+        tool_name = input_data.get("tool_name", "")
+        tool_input = input_data.get("tool_input", {})
+        # Check after Bash or Write -- figure might have been created
+        if tool_name in ("Bash", "Write"):
+            file_path = tool_input.get("file_path", "")
+            if file_path.endswith(".png"):
+                _check_figure_size(file_path, stage_name)
+        # Also scan figures/ after any Bash (model scripts save PNGs)
+        if tool_name == "Bash":
+            fig_dir = os.path.join(run_path, "figures")
+            if os.path.isdir(fig_dir):
+                for fname in os.listdir(fig_dir):
+                    if fname.endswith(".png"):
+                        _check_figure_size(
+                            os.path.join(fig_dir, fname), stage_name
+                        )
+        return {}
+
     trace_file.write(json.dumps({
         "ts": datetime.now().isoformat(),
         "type": "stage_start",
@@ -116,6 +166,9 @@ async def _run_agent_inner(
             hooks={
                 "PreToolUse": [
                     HookMatcher(matcher=None, hooks=[pre_tool_hook])
+                ],
+                "PostToolUse": [
+                    HookMatcher(matcher=None, hooks=[post_tool_hook])
                 ],
             },
         ),
