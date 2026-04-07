@@ -72,6 +72,69 @@ Do NOT hand-code ODE transmission models when LASER exists. LASER handles:
 - Birth/death vital dynamics
 - Calibration via calabaria framework
 
+## MODEL EXECUTION MONITORING
+
+When running model scripts, do NOT just launch and sleep-poll. Instead:
+
+1. **Run with real-time output**: Use `python -u model.py 2>&1 | tee output.log`
+   or capture stdout/stderr to a log file.
+
+2. **Add progress printing to model code**: Every model script MUST print
+   progress updates as it runs:
+   ```python
+   # At minimum, print every N iterations or every M seconds:
+   print(f"[tick {t}/{n_ticks}] S={S:.0f} I={I:.0f} R={R:.0f} prevalence={I/N:.4f}", flush=True)
+   # For optimization:
+   print(f"[trial {i}/{n_trials}] loss={loss:.4f} best={best_loss:.4f}", flush=True)
+   ```
+
+3. **Set a timeout**: If model produces no output for 120 seconds, kill it.
+   ```bash
+   timeout 300 python model.py > output.log 2>&1 || echo "TIMEOUT"
+   ```
+
+4. **Check output after partial run**: Read the log file to determine:
+   - Is it making progress? (tick count increasing)
+   - Is it stuck? (same output repeated)
+   - Are values reasonable? (no NaN, no negative populations, prevalence 0-1)
+   - What's the projected total runtime? (if 10% done in 30s → 300s total)
+
+5. **Estimate runtime BEFORE running**: Before launching a full model run,
+   do a short benchmark:
+   ```python
+   import time
+   t0 = time.time()
+   model.run(n_ticks=100)  # Run 100 ticks only
+   elapsed = time.time() - t0
+   projected = elapsed * (total_ticks / 100)
+   print(f"Benchmark: 100 ticks in {elapsed:.1f}s → projected {projected:.0f}s for {total_ticks} ticks")
+   ```
+   If projected runtime > 5 minutes, either:
+   - Reduce resolution (fewer patches, larger time steps)
+   - Run a coarser version first, then refine only the best configuration
+   - Note that calabaria cloud compute is needed for full resolution
+   Log the benchmark result in progress.md so the analyst knows the
+   computational cost of the model.
+
+6. **Kill and adjust if needed**: If projected runtime > 10 minutes for a
+   single simulation, the model is too complex for local compute. Simplify:
+   - Reduce n_ticks or n_patches
+   - Use larger time steps
+   - Reduce n_trials for optimization
+   - Note in model_comparison.md that cloud compute (calabaria) is needed
+     for full-resolution runs
+
+6. **Never sleep-poll blindly**: Instead of `sleep 300 && cat output.log`,
+   use a loop that checks every 15 seconds:
+   ```bash
+   for i in $(seq 1 20); do
+     sleep 15
+     tail -3 output.log
+     # Check if process is still running
+     if ! kill -0 $PID 2>/dev/null; then break; fi
+   done
+   ```
+
 **Parallel model testing**: Spawn multiple model-tester subagents in a
 SINGLE response to try different approaches concurrently:
 - model-tester 1: "Fit [model A] to {run_dir}/data/. Save to {run_dir}/model_a.py"
