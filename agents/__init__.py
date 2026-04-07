@@ -140,7 +140,8 @@ async def run_agent(
         try:
             return await _run_agent_inner(
                 system_prompt, prompt, tools, run_path, stage_name,
-                trace_file, agents, start_time, pre_tool_hook, tool_count,
+                trace_file, agents, start_time, pre_tool_hook, post_tool_hook,
+                tool_count,
             )
         except Exception as e:
             if attempt < max_retries and "I/O operation" in str(e):
@@ -153,7 +154,8 @@ async def run_agent(
 
 async def _run_agent_inner(
     system_prompt, prompt, tools, run_path, stage_name,
-    trace_file, agents, start_time, pre_tool_hook, tool_count,
+    trace_file, agents, start_time, pre_tool_hook, post_tool_hook,
+    tool_count,
 ):
     async for message in query(
         prompt=prompt,
