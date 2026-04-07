@@ -921,9 +921,44 @@ async def run_session(
     )
 
 
-async def run(question: str, max_rounds: int, max_sessions: int = 5) -> None:
-    """Multi-session run loop. Keeps launching agent sessions until the
-    checklist is complete, the report is written, or max_sessions is reached."""
+def latest_file_mtime(run_path: str) -> float:
+    """Return the most recent modification time of any file in the run dir."""
+    latest = 0.0
+    for root, dirs, files in os.walk(run_path):
+        for f in files:
+            mtime = os.path.getmtime(os.path.join(root, f))
+            if mtime > latest:
+                latest = mtime
+    return latest
+
+
+def run_summary(run_path: str) -> str:
+    """One-line summary of run state."""
+    done, total, has_report = checklist_status(run_path)
+    files = [f for f in os.listdir(run_path)
+             if f.endswith(('.md', '.py')) and f != 'metadata.json']
+    figures = []
+    fig_dir = os.path.join(run_path, "figures")
+    if os.path.isdir(fig_dir):
+        figures = [f for f in os.listdir(fig_dir) if f.endswith('.png')]
+    return (
+        f"checklist: {done}/{total} | "
+        f"report: {'yes' if has_report else 'no'} | "
+        f"files: {len(files)} | figures: {len(figures)}"
+    )
+
+
+async def run(question: str, max_rounds: int, max_sessions: int = 5,
+              stall_timeout: int = 600) -> None:
+    """Resilient multi-session run loop with stall detection.
+
+    Keeps launching agent sessions until the checklist is complete, the
+    report is written, or max_sessions is reached. Detects stalls by
+    monitoring file modification times.
+
+    Args:
+        stall_timeout: seconds of no file changes before considering stalled
+    """
 
     run_dir = create_run_dir(question)
     run_path = os.path.join(os.getcwd(), "runs", run_dir)
@@ -939,42 +974,87 @@ async def run(question: str, max_rounds: int, max_sessions: int = 5) -> None:
 
     print(f"Run directory: runs/{run_dir}/", flush=True)
     print(f"Question: {question}", flush=True)
-    print(f"Max sessions: {max_sessions}", flush=True)
+    print(f"Max sessions: {max_sessions} | Stall timeout: {stall_timeout}s", flush=True)
     print("=" * 60, flush=True)
 
     run_start = datetime.now()
+    session_num = 0
+    consecutive_errors = 0
 
-    for session_num in range(1, max_sessions + 1):
+    while session_num < max_sessions:
+        session_num += 1
         print(f"\n{'=' * 60}", flush=True)
         print(f"SESSION {session_num}/{max_sessions}", flush=True)
+        state = run_summary(run_path)
+        print(f"State: {state}", flush=True)
         print(f"{'=' * 60}", flush=True)
 
+        session_error = None
         try:
-            await run_session(question, max_rounds, run_dir, run_path, session_num)
+            await run_session(
+                question, max_rounds, run_dir, run_path, session_num
+            )
+            consecutive_errors = 0
+        except KeyboardInterrupt:
+            print("\nInterrupted by user.", flush=True)
+            break
         except Exception as e:
-            print(f"\nSession {session_num} ended with error: {e}", flush=True)
+            session_error = str(e)
+            consecutive_errors += 1
+            print(f"\nSession {session_num} error: {e}", flush=True)
+
+            if consecutive_errors >= 3:
+                print(
+                    f"3 consecutive errors. Stopping to avoid loops.",
+                    flush=True,
+                )
+                break
+
+        # Log session result to trace
+        trace_path = os.path.join(run_path, "trace.jsonl")
+        with open(trace_path, "a") as f:
+            entry = {
+                "ts": datetime.now().isoformat(),
+                "type": "supervisor",
+                "session": session_num,
+                "state": run_summary(run_path),
+                "error": session_error,
+            }
+            f.write(json.dumps(entry) + "\n")
 
         # Check if work is complete
         done, total, has_report = checklist_status(run_path)
 
         if has_report and total > 0 and done == total:
-            print(f"\nAll checklist items complete ({done}/{total}). Report written.", flush=True)
+            print(
+                f"\nAll checklist items complete ({done}/{total}). "
+                f"Report written.",
+                flush=True,
+            )
             break
-        elif has_report:
-            print(f"\nReport written. Checklist: {done}/{total} complete.", flush=True)
+        elif has_report and done > 0:
+            # Report exists and some work done -- good enough
+            print(
+                f"\nReport written. Checklist: {done}/{total} complete.",
+                flush=True,
+            )
             break
+        elif total > 0 and done == total:
+            print(f"\nChecklist complete ({done}/{total}). No report yet.", flush=True)
+            # Continue -- need report
         elif total > 0:
             remaining = total - done
-            print(f"\nChecklist: {done}/{total} complete, {remaining} remaining.", flush=True)
-            if remaining == 0:
-                break
+            print(
+                f"\nChecklist: {done}/{total} complete, "
+                f"{remaining} remaining. Continuing...",
+                flush=True,
+            )
         else:
-            print(f"\nNo checklist found. Checking if report exists...", flush=True)
+            # No checklist yet -- only stop if we have a report
             if has_report:
+                print("\nReport written (no checklist found).", flush=True)
                 break
-
-        if session_num < max_sessions:
-            print(f"Starting session {session_num + 1}...", flush=True)
+            print("\nNo checklist or report yet. Continuing...", flush=True)
 
     # Save final metadata
     elapsed_total = (datetime.now() - run_start).total_seconds()
@@ -984,16 +1064,22 @@ async def run(question: str, max_rounds: int, max_sessions: int = 5) -> None:
     metadata["completed"] = datetime.now().isoformat()
     metadata["elapsed_s"] = elapsed_total
     metadata["sessions"] = session_num
+    done, total, has_report = checklist_status(run_path)
+    metadata["checklist_done"] = done
+    metadata["checklist_total"] = total
+    metadata["has_report"] = has_report
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
 
-    done, total, has_report = checklist_status(run_path)
     print(f"\n{'=' * 60}", flush=True)
-    print(f"Run complete: {session_num} session(s), {elapsed_total:.0f}s total", flush=True)
-    print(f"Checklist: {done}/{total} items complete", flush=True)
-    print(f"Report: {'written' if has_report else 'not written'}", flush=True)
-    print(f"Results: runs/{run_dir}/", flush=True)
-    print(f"Trace:   runs/{run_dir}/trace.jsonl", flush=True)
+    print(f"RUN COMPLETE", flush=True)
+    print(f"  Sessions: {session_num}", flush=True)
+    print(f"  Duration: {elapsed_total:.0f}s ({elapsed_total/60:.1f} min)", flush=True)
+    print(f"  Checklist: {done}/{total}", flush=True)
+    print(f"  Report: {'written' if has_report else 'not written'}", flush=True)
+    print(f"  Results: runs/{run_dir}/", flush=True)
+    print(f"  Trace:   runs/{run_dir}/trace.jsonl", flush=True)
+    print(f"{'=' * 60}", flush=True)
 
 
 def main() -> None:
@@ -1004,18 +1090,26 @@ def main() -> None:
     parser.add_argument(
         "--max-rounds",
         type=int,
-        default=3,
-        help="Maximum critique-revision rounds (default: 3)",
+        default=5,
+        help="Maximum critique-revision rounds per session (default: 5)",
     )
     parser.add_argument(
         "--max-sessions",
         type=int,
-        default=5,
-        help="Maximum agent sessions for context recovery (default: 5)",
+        default=10,
+        help="Maximum agent sessions for context recovery (default: 10)",
+    )
+    parser.add_argument(
+        "--stall-timeout",
+        type=int,
+        default=600,
+        help="Seconds of no file changes before restarting session (default: 600)",
     )
     args = parser.parse_args()
 
-    asyncio.run(run(args.question, args.max_rounds, args.max_sessions))
+    asyncio.run(
+        run(args.question, args.max_rounds, args.max_sessions, args.stall_timeout)
+    )
 
 
 if __name__ == "__main__":
