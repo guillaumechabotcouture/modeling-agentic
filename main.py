@@ -87,6 +87,20 @@ After each critique round, read the critique feedback and add ALL requested
 items to this checklist before starting work. This ensures nothing is missed
 across long runs with multiple critique rounds.
 
+## PARALLELISM PRINCIPLE
+
+You have access to subagents (literature-researcher, model-tester) that run
+concurrently. **Always prefer parallel over sequential work.** When you need
+to do 3 things that don't depend on each other, spawn 3 subagents in a
+SINGLE response -- don't do them one at a time. This applies to:
+- Research: spawn multiple literature-researchers for different topics
+- Data downloads: launch multiple Bash calls simultaneously
+- Model building: spawn multiple model-testers for different approaches
+- Any independent tasks: WebSearch, WebFetch, Write, Bash in parallel
+
+The SDK runs parallel tool calls concurrently. A single response with 5
+tool calls completes in the time of the slowest one, not the sum of all 5.
+
 ## CORE PRINCIPLES
 
 1. **Published results are validation data.** Before building anything new,
@@ -145,20 +159,33 @@ return a structured modeling plan including:
 **Follow the planner's recommendations.** Save the plan to {run_dir}/plan.md.
 
 ### PHASE 1: RESEARCH
-- Use WebSearch to find academic papers, known mathematical relationships, and data
-- Use WebFetch to read key papers and data pages
-- For each paper found, extract: model type, key assumptions, data sources, performance
-- Identify the **standard model** for this problem domain
-- Look for existing Python packages that implement domain-specific models
-- Summarize findings in {run_dir}/research_notes.md
+Spawn **multiple literature-researcher subagents in parallel** to cover
+different aspects simultaneously. For example:
+- Researcher 1: "Find papers on [specific model type] for [domain]. Extract
+  quantitative results (AUC, OR, coefficients with CIs). Write findings to
+  {run_dir}/research_modeling.md"
+- Researcher 2: "Find public datasets for [topic]. For each dataset, record
+  URL, coverage, variables, and download instructions. Write to
+  {run_dir}/research_data.md"
+- Researcher 3: "Find Python packages that implement [domain] models. For
+  each, note: package name, what it does, install command, example usage.
+  Write to {run_dir}/research_packages.md"
+
+Launch all researchers in the SAME response (multiple Agent tool calls) so
+they run concurrently. Then synthesize their findings into
+{run_dir}/research_notes.md.
 
 ### PHASE 2: DATA GATHERING
-- Find and download ALL available public datasets, not just one. More data
-  sources = stronger validation. For each dataset note its source authority,
-  temporal/spatial coverage, and known limitations.
-- Download using Python via Bash, save to {run_dir}/data/
+Download ALL available datasets **in parallel** using multiple Bash calls
+in the same response. For example:
+- Bash 1: curl dataset A → {run_dir}/data/dataset_a.csv
+- Bash 2: curl dataset B → {run_dir}/data/dataset_b.csv
+- Bash 3: python script to fetch from API C → {run_dir}/data/dataset_c.csv
+
+Launch all downloads simultaneously. Then verify each file.
+- For each dataset note its source authority, temporal/spatial coverage,
+  and known limitations
 - If no direct data available, use published parameter values from literature
-- Create {run_dir}/data/ directory if needed
 - **Data diversity matters**: seek data from multiple geographies, time periods,
   and collection methods. A model validated on diverse data is more credible.
 
@@ -260,18 +287,23 @@ Write {run_dir}/results.md with:
   including uncertainty ranges
 - Honest limitations assessment -- specific, not generic
 
-### PHASE 5b: PARALLEL MODEL TESTING (OPTIONAL BUT RECOMMENDED)
-Before running the critique, consider spawning **model-tester** subagents in
-parallel to try alternative approaches. For example:
-- One model-tester fits a SARIMAX
-- Another fits a gradient boosting model
-- Another tries a Bayesian approach
+### PHASE 5b: PARALLEL MODEL TESTING (DO THIS)
+Spawn **multiple model-tester subagents in parallel** to try different
+approaches simultaneously. In a SINGLE response, invoke multiple Agent
+tool calls:
+- model-tester 1: "Fit a [model type A] to the data in {run_dir}/data/.
+  Save code to {run_dir}/model_a.py and results to {run_dir}/results_a.md.
+  Include train/test split, metrics, and figures in {run_dir}/figures/a_*.png"
+- model-tester 2: "Fit a [model type B] to the same data. Save to
+  {run_dir}/model_b.py and {run_dir}/results_b.md"
+- model-tester 3: "Fit a [model type C]..."
 
-Each writes results to a subdirectory. You then compare and pick the best.
-This is much faster than building models sequentially.
+All three run concurrently. When they complete, read all results, compare
+performance, and select the best approach (or build an ensemble).
+Write the comparison to {run_dir}/model_comparison.md.
 
-You can also spawn **literature-researcher** subagents in parallel to dig
-deeper into specific papers or find additional data sources.
+This is NOT optional for complex problems. Testing 3 approaches in parallel
+takes the same time as testing 1, and gives much better results.
 
 ### PHASE 6: CRITIQUE
 - Update {run_dir}/progress.md with current status
