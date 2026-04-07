@@ -11,12 +11,46 @@ from claude_agent_sdk import (
     AgentDefinition,
     AssistantMessage,
     ResultMessage,
+    HookMatcher,
 )
 
 
 MODELING_SYSTEM_PROMPT = """\
 You are a mathematical modeling expert. Given a research question, you will build
 a quantitative model through a structured, disciplined workflow.
+
+## PROGRESS TRACKING (CRITICAL FOR LONG RUNS)
+
+Maintain a progress file at {run_dir}/progress.md. Update it after completing
+each phase. This file is your institutional memory -- if context is compacted
+or you lose track, read this file first to understand where you are.
+
+Format:
+```
+# Progress
+
+## Current Phase: [phase name]
+## Completed Phases:
+- [x] Phase 0: Planning -- plan.md written
+- [x] Phase 1: Research -- research_notes.md written, 5 papers reviewed
+- [ ] Phase 2: Data -- downloading from [source]
+...
+
+## Key Decisions Made:
+- Chose SARIMAX over SEIR because [reason]
+- Using temporal split at [date] because [reason]
+
+## Known Issues:
+- Data has gap in [period]
+- Package X not available, using Y instead
+
+## Next Steps:
+1. [specific next action]
+2. [specific next action]
+```
+
+Update this file FREQUENTLY -- at minimum after each phase and after each
+critique round. Read it at the start of your work to orient yourself.
 
 ## CORE PRINCIPLES
 
@@ -148,7 +182,21 @@ Write {run_dir}/results.md with:
   including uncertainty ranges
 - Honest limitations assessment
 
+### PHASE 5b: PARALLEL MODEL TESTING (OPTIONAL BUT RECOMMENDED)
+Before running the critique, consider spawning **model-tester** subagents in
+parallel to try alternative approaches. For example:
+- One model-tester fits a SARIMAX
+- Another fits a gradient boosting model
+- Another tries a Bayesian approach
+
+Each writes results to a subdirectory. You then compare and pick the best.
+This is much faster than building models sequentially.
+
+You can also spawn **literature-researcher** subagents in parallel to dig
+deeper into specific papers or find additional data sources.
+
 ### PHASE 6: CRITIQUE
+- Update {run_dir}/progress.md with current status
 - Invoke the **modeling-critique** agent to review {run_dir}/results.md,
   {run_dir}/model.py, and the figures
 - If verdict is REVISE, address each specific piece of feedback
@@ -541,9 +589,19 @@ async def run(question: str, max_rounds: int) -> None:
     critique_prompt = CRITIQUE_PROMPT.format(run_dir=f"runs/{run_dir}")
     planner_prompt = PLANNER_PROMPT.format(run_dir=f"runs/{run_dir}")
 
+    # Initialize progress file
+    progress_path = os.path.join(run_path, "progress.md")
+    with open(progress_path, "w") as f:
+        f.write(f"# Progress\n\n## Current Phase: Starting\n")
+        f.write(f"## Research Question: {question}\n")
+        f.write(f"## Max Critique Rounds: {max_rounds}\n\n")
+        f.write(f"## Completed Phases:\n\n## Key Decisions Made:\n\n")
+        f.write(f"## Known Issues:\n\n## Next Steps:\n1. Invoke research-planner\n")
+
     prompt = (
         f"Research question: {question}\n\n"
         f"Save all your work to the runs/{run_dir}/ directory:\n"
+        f"- runs/{run_dir}/progress.md (UPDATE THIS FREQUENTLY)\n"
         f"- runs/{run_dir}/plan.md (modeling plan from research-planner)\n"
         f"- runs/{run_dir}/research_notes.md (literature review)\n"
         f"- runs/{run_dir}/eda.py (exploratory data analysis script)\n"
@@ -596,6 +654,24 @@ async def run(question: str, max_rounds: int) -> None:
             return f"Agent: {subagent}"
         return name
 
+    # Hook-based tool tracking
+    async def pre_tool_hook(input_data, tool_use_id, context):
+        """Log tool calls via hooks -- captures subagent tools too."""
+        nonlocal tool_count
+        tool_count += 1
+        tool_name = input_data.get("tool_name", "unknown")
+        tool_input = input_data.get("tool_input", {})
+        summary = format_tool_summary(tool_name, tool_input)
+        elapsed = (datetime.now() - start_time).total_seconds()
+        print(f"[{elapsed:6.0f}s | #{tool_count}] {summary}", flush=True)
+        trace(
+            "tool_use",
+            tool=tool_name,
+            summary=summary,
+            input_preview={k: str(v)[:200] for k, v in tool_input.items()},
+        )
+        return {}
+
     trace("run_start", question=question, max_rounds=max_rounds, run_dir=run_dir)
 
     async for message in query(
@@ -613,25 +689,71 @@ async def run(question: str, max_rounds: int) -> None:
                 "Grep",
                 "Agent",
             ],
-            permission_mode="acceptEdits",
+            permission_mode="bypassPermissions",
+            setting_sources=["project"],
+            hooks={
+                "PreToolUse": [
+                    HookMatcher(matcher=None, hooks=[pre_tool_hook])
+                ],
+            },
             agents={
                 "research-planner": AgentDefinition(
                     description=(
                         "Research and modeling strategist. Invoke FIRST before "
                         "any modeling work. Searches literature, identifies "
-                        "standard approaches, surveys data sources, and "
-                        "produces a structured modeling plan with checklist."
+                        "standard approaches, extracts published benchmarks, "
+                        "surveys data sources, and produces a structured "
+                        "modeling plan with success criteria and checklist."
                     ),
                     prompt=planner_prompt,
                     tools=["WebSearch", "WebFetch", "Read", "Glob", "Grep"],
                 ),
+                "literature-researcher": AgentDefinition(
+                    description=(
+                        "Deep literature researcher. Use to search for and "
+                        "read specific papers, extract quantitative results, "
+                        "find datasets, or investigate a specific modeling "
+                        "approach. Can run in parallel with other researchers."
+                    ),
+                    prompt=(
+                        "You are a research assistant. Search for and read "
+                        "papers, extract specific quantitative results "
+                        "(coefficients, AUCs, ORs, CIs, sample sizes), and "
+                        "write findings to files. Be thorough and precise -- "
+                        "extract exact numbers, not summaries."
+                    ),
+                    tools=["WebSearch", "WebFetch", "Write", "Read"],
+                    model="sonnet",
+                ),
+                "model-tester": AgentDefinition(
+                    description=(
+                        "Model testing specialist. Use to test an alternative "
+                        "modeling approach in parallel. Give it a specific "
+                        "model type to implement and test (e.g., 'fit a "
+                        "Random Forest to the data in {run_dir}/data/ and "
+                        "save results'). Can run in parallel with other "
+                        "model-testers to compare approaches."
+                    ),
+                    prompt=(
+                        "You are a model implementation and testing specialist. "
+                        "Implement the specific model you're asked to build, "
+                        "fit it to the data, evaluate it with proper train/test "
+                        "splits, and save results. Write concise code using "
+                        "established packages. Save your model code and "
+                        "results to the directory specified."
+                    ),
+                    tools=["Bash", "Write", "Read", "Edit", "Glob"],
+                    model="sonnet",
+                ),
                 "modeling-critique": AgentDefinition(
                     description=(
-                        "Mathematical modeling critic. Invoke after building "
+                        "Senior scientific reviewer. Invoke after building "
                         "and validating a model. Reviews code, results, AND "
-                        "all figures (visually). Enforces validation checklists "
-                        "and can request specific new figures, metrics, and "
-                        "analyses. Will REVISE if required outputs are missing."
+                        "all figures (visually). Enforces hard blockers, "
+                        "compares against published benchmarks, evaluates "
+                        "scientific quality. Can request specific new figures, "
+                        "metrics, and analyses. Will REVISE if quality is "
+                        "insufficient for publication."
                     ),
                     prompt=critique_prompt,
                     tools=["Read", "Glob", "Grep"],
@@ -641,36 +763,14 @@ async def run(question: str, max_rounds: int) -> None:
         ),
     ):
         if isinstance(message, AssistantMessage):
-            parent = getattr(message, "parent_tool_use_id", None)
-            ctx = " (subagent)" if parent else ""
-
             for block in message.content:
                 if hasattr(block, "text") and block.text:
                     print(block.text, flush=True)
-                    trace("text", text=block.text[:500], context=ctx.strip())
-                elif hasattr(block, "name"):
-                    input_data = getattr(block, "input", {}) or {}
-                    summary = format_tool_summary(block.name, input_data)
-                    tool_count += 1
-                    elapsed = (datetime.now() - start_time).total_seconds()
-                    print(
-                        f"[{elapsed:6.0f}s | #{tool_count}]{ctx} {summary}",
-                        flush=True,
-                    )
-                    trace(
-                        "tool_use",
-                        tool=block.name,
-                        summary=summary,
-                        input_preview={
-                            k: str(v)[:200] for k, v in input_data.items()
-                        },
-                        context=ctx.strip(),
-                    )
+                    trace("text", text=block.text[:500])
         elif isinstance(message, ResultMessage):
             print(f"\nDone: {message.subtype}", flush=True)
             trace("result", subtype=getattr(message, "subtype", ""))
         else:
-            # Log other message types for debugging
             msg_type = type(message).__name__
             trace("other", message_type=msg_type)
 
