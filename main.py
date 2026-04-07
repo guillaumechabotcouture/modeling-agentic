@@ -13,6 +13,26 @@ from agents import critique_methods, critique_domain, critique_presentation
 from agents import writer
 
 
+def detect_resume_stage(run_path: str) -> str:
+    """Check what files exist to determine where to resume the pipeline."""
+    def has(f):
+        return os.path.exists(os.path.join(run_path, f))
+
+    if not has("plan.md"):
+        return "plan"
+    if not has("data_quality.md"):
+        return "data"
+    if not has("model_comparison.md") and not has("model.py"):
+        return "model"
+    if not has("results.md"):
+        return "analyze"
+    if not any(has(f) for f in ["critique_methods.md", "critique_domain.md", "critique_presentation.md"]):
+        return "critique"
+    if not has("report.md"):
+        return "write"
+    return "complete"
+
+
 def slugify(text: str, max_len: int = 40) -> str:
     slug = text.lower().strip()
     slug = re.sub(r'[^\w\s-]', '', slug)
@@ -86,7 +106,13 @@ async def run_pipeline(
 ) -> None:
     """Run the full modeling pipeline with critique loop."""
 
-    stage = "plan"
+    # Detect where to resume from existing files
+    stage = detect_resume_stage(run_path)
+    if stage == "complete":
+        print("All stages already complete. Nothing to do.", flush=True)
+        return
+    if stage != "plan":
+        print(f"Resuming from: {stage} (prior stages detected on disk)", flush=True)
 
     for round_num in range(1, max_rounds + 1):
         print(f"\n{'='*60}", flush=True)
