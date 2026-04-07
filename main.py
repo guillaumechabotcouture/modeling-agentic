@@ -136,6 +136,9 @@ Write {run_dir}/results.md with:
 - Data Sources (with URLs)
 - Validation Results: train vs test metrics, forecast skill vs baseline
 - Residual diagnostics interpretation
+- **Success Criteria Scorecard**: read {run_dir}/plan.md, find the Success
+  Criteria section, and report each criterion with PASS/FAIL and the actual
+  measured value. This is critical -- the critique agent will check this.
 - 3-5 concrete questions this model can answer, with computed example answers
   including uncertainty ranges
 - Honest limitations assessment
@@ -198,7 +201,16 @@ build the model yourself.
    - **Standard**: the well-established approach from literature
    - **Advanced**: a more sophisticated option if data supports it
 
-7. **Create a checklist** of specific steps for the modeler to follow.
+7. **Define success criteria**: Based on the literature and domain, define
+   concrete, measurable criteria for what constitutes a good model. These
+   should be specific numbers, not vague goals. Derive them from:
+   - Published benchmarks (e.g., "top FluSight models achieve WIS of X")
+   - Domain norms (e.g., "epi models typically achieve R-squared of 0.6-0.8")
+   - Statistical standards (e.g., "95% PI coverage should be 85-98%")
+   - If no published benchmarks exist, set criteria relative to the baseline
+     (e.g., "must beat baseline by at least 15% on RMSE")
+
+8. **Create a checklist** of specific steps for the modeler to follow.
 
 ## Output format:
 
@@ -208,8 +220,36 @@ Write your plan as structured markdown with these sections:
 - Available Data Sources (table: source, URL, coverage, variables)
 - Recommended Python Packages
 - Candidate Models (baseline, standard, advanced with rationale)
+- Success Criteria (specific, measurable thresholds -- see section below)
 - Modeling Checklist (numbered, specific, actionable steps)
 - Key Risks and Pitfalls to avoid
+
+### Success Criteria section format:
+
+```
+## Success Criteria
+
+A model is considered **good** if it meets ALL of these:
+
+### Minimum bar (must achieve to be acceptable):
+- [ ] Positive forecast skill score vs [specific baseline] on held-out test data
+- [ ] 95% prediction interval coverage between X% and Y%
+- [ ] Residuals show no significant autocorrelation (Ljung-Box p > 0.05)
+- [ ] [domain-specific criterion, e.g., "peak timing predicted within 2 weeks"]
+
+### Target performance (based on published benchmarks):
+- [ ] Out-of-sample RMSE below X (derived from: [source])
+- [ ] Forecast skill score above Y (derived from: [source])
+- [ ] [metric] comparable to [published benchmark model]
+
+### Stretch goals:
+- [ ] Beats the standard approach from literature
+- [ ] Calibrated prediction intervals (coverage within 5% of nominal)
+- [ ] Interpretable parameters consistent with domain knowledge
+```
+
+These criteria will be used by the critique agent to evaluate the model.
+The modeler should report progress against each criterion in results.md.
 """
 
 
@@ -288,7 +328,22 @@ plot type) so the modeler can act on it.
 - [ ] Sensitivity analysis: for mechanistic models, show how outputs
       change when key parameters are varied +/- 20%
 
-## STEP 4: DOMAIN-SPECIFIC REVIEW
+## STEP 4: EVALUATE AGAINST SUCCESS CRITERIA
+
+Read {run_dir}/plan.md and find the **Success Criteria** section. The planner
+defined specific, measurable thresholds. For each criterion:
+- Check if the modeler reported the relevant metric in results.md
+- Check if the metric meets the threshold
+- Mark as PASS, FAIL, or NOT REPORTED
+
+If the plan has no success criteria, flag this as an issue and apply these
+defaults:
+- Positive forecast skill score vs baseline
+- 95% PI coverage between 80-98%
+- Ljung-Box p > 0.05 on residuals
+- Out-of-sample RMSE better than naive baseline
+
+## STEP 5: DOMAIN-SPECIFIC REVIEW
 
 Check the model against domain knowledge:
 - Are parameter values physiologically/physically plausible?
@@ -296,7 +351,7 @@ Check the model against domain knowledge:
 - Are there known phenomena the model fails to capture?
 - Would a domain expert find the conclusions reasonable?
 
-## STEP 5: SCORING
+## STEP 6: SCORING
 
 Rate each dimension 1-5:
 1. **Mathematical Rigor** (1-5): Equations correct? Assumptions reasonable?
@@ -331,6 +386,9 @@ Rate each dimension 1-5:
 - Code Quality: X/5 -- (justification)
 - Figures and Presentation: X/5 -- (justification)
 - Completeness: X/5 -- (justification)
+
+## Success Criteria Evaluation
+(for each criterion from plan.md: PASS / FAIL / NOT REPORTED, with the actual value)
 
 ## Verdict: ACCEPT / REVISE
 
