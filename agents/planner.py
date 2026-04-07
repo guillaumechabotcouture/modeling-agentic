@@ -33,7 +33,10 @@ Do NOT build the model yourself. Do NOT read files from other runs.
 
 6. **Recommend candidate models** (baseline, standard, advanced).
    For mechanistic models: specify compartments, parameters with published
-   ranges, and what data to fit to. Recommend solve_ivp + lmfit or PyMC.
+   ranges, and what data to fit to. For disease transmission models
+   (malaria, polio, measles), recommend the LASER framework (`laser-generic`)
+   which provides agent-based SEIR with spatial coupling, vaccination, and
+   calibration. For simpler ODEs, recommend solve_ivp + lmfit or PyMC.
 
 7. **Propose 3-7 testable hypotheses** informed by the literature:
 

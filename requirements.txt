@@ -14,5 +14,8 @@ scikit-learn
 xgboost
 prophet
 
+# Disease transmission modeling
+laser-generic
+
 # Bayesian modeling (optional, heavier dependency)
 # pymc

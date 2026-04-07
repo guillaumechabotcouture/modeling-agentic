@@ -9,15 +9,21 @@ AGENTS = {
         description=(
             "Model testing specialist. Implement and test a specific model "
             "approach. Give it a model type, data path, and output location. "
-            "Can run multiple in parallel to compare approaches."
+            "Can run multiple in parallel to compare approaches. "
+            "For disease transmission models, use the LASER framework "
+            "(laser-generic package) -- see the laser-spatial-disease-modeling skill."
         ),
         prompt=(
-            "You are a model implementation specialist. Implement the specific "
-            "model you're asked to build, fit it to the data, evaluate with "
-            "proper train/test splits, and save results. Use established "
-            "packages. Write concise code."
+            "You are a model implementation specialist for public health research. "
+            "Implement the specific model you're asked to build, fit it to the data, "
+            "evaluate with proper train/test splits, and save results. Use established "
+            "packages. For disease transmission models (malaria, polio, etc.), "
+            "use the LASER framework (laser-generic). See the "
+            "laser-spatial-disease-modeling skill for API reference and common pitfalls. "
+            "Write concise code."
         ),
         tools=["Bash", "Write", "Read", "Edit", "Glob"],
+        skills=["laser-spatial-disease-modeling", "epi-model-parametrization"],
         model="sonnet",
     ),
 }
@@ -40,6 +46,7 @@ interpret results or test hypotheses -- that's the analyst's job.
 **Use established packages, don't hand-code:**
 | Need | Package |
 |------|---------|
+| **Spatial disease modeling** | **`laser-generic`** (LASER framework -- PREFERRED for epi) |
 | Curve fitting | `lmfit` |
 | Statistical models (GLM, ARIMA) | `statsmodels` |
 | Bayesian models | `PyMC` |
@@ -49,6 +56,21 @@ interpret results or test hypotheses -- that's the analyst's job.
 | ODE solving | `scipy.integrate.solve_ivp` |
 | Fitting ODE models to data | `lmfit` + `solve_ivp` |
 | Bayesian mechanistic | `PyMC` + `pytensor` |
+
+**For disease transmission models (malaria, polio, etc.), use LASER:**
+LASER (Light Agent Spatial modeling for ERadication) provides agent-based
+SEIR with gravity-model spatial coupling, seasonal forcing, vaccination
+campaigns, and calibration. It is the preferred framework for spatial epi
+models. `pip install laser-generic`. See the laser-spatial-disease-modeling
+skill for API reference, verification checks, and common pitfalls.
+
+Do NOT hand-code ODE transmission models when LASER exists. LASER handles:
+- Per-patch SEIR dynamics with agent-level state tracking
+- Gravity-model spatial coupling between patches
+- Seasonal forcing via ValuesMap
+- Routine immunization and campaign vaccination
+- Birth/death vital dynamics
+- Calibration via calabaria framework
 
 **Parallel model testing**: Spawn multiple model-tester subagents in a
 SINGLE response to try different approaches concurrently:
