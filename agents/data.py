@@ -47,7 +47,45 @@ document all datasets needed for the modeling task.
        the WHO country profile says?)
    - Save validation results to {run_dir}/data_validation.txt
 
-8. **Distinguish raw data from compiled parameters:**
+8. **Data provenance log** -- write {run_dir}/data_provenance.md that for
+   EVERY data file records an auditable chain:
+   - Filename
+   - Source URL or API endpoint (exact URL used to download)
+   - Download timestamp
+   - Command used to download (exact curl/python command)
+   - Original file hash (md5sum after download, before any processing)
+   - Any transformations applied (filtering, renaming, merging, imputation)
+   - For compiled/hand-entered data: cite the exact paper, table number,
+     and page number where each value came from
+   - Spot-check values: for each file, pick 2-3 specific values and
+     document where they came from so a human can verify
+
+   Format:
+   ```
+   ## who_nga_incidence.csv
+   - **Source**: WHO GHO API endpoint https://ghoapi.azureedge.net/api/...
+   - **Downloaded**: 2026-04-07T10:47:00
+   - **Command**: `curl -sL "https://..." -o data/who_nga_incidence.csv`
+   - **MD5**: a1b2c3d4e5f6...
+   - **Rows**: 25 (years 2000-2024)
+   - **Transformations**: filtered to Nigeria (NGA), selected columns year + value
+   - **Spot checks**:
+     - 2023 incidence = 299/1000 → matches WHO WMR 2024 country profile
+     - 2010 incidence = 353/1000 → matches WHO GHO web interface
+   ```
+
+   For compiled parameter tables:
+   ```
+   ## intervention_effectiveness_meta.csv
+   - **Source**: Compiled from literature (not a single download)
+   - **Row 1**: ITN OR=0.44 (0.41-0.48) → Farnert 2018, Table 2, page 5
+   - **Row 2**: IRS OR=0.35 (0.27-0.44) → Chanda-Kapata 2022, Table 3
+   - **Spot checks**:
+     - ITN OR=0.44 → verified against PMC5877091 abstract: "OR 0.44 (0.41-0.48)" ✓
+     - IRS OR=0.35 → verified against PMC9308352 abstract: "OR 0.35 (0.27-0.44)" ✓
+   ```
+
+9. **Distinguish raw data from compiled parameters:**
    - Raw datasets (downloaded from APIs): should be large (1000+ rows),
      contain time series or survey microdata
    - Compiled parameter tables (from literature): small CSVs with
