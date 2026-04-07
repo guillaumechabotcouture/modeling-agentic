@@ -654,55 +654,84 @@ def create_run_dir(question: str) -> str:
     return run_name
 
 
-async def run(question: str, max_rounds: int) -> None:
-    run_dir = create_run_dir(question)
-    run_path = os.path.join(os.getcwd(), "runs", run_dir)
+def checklist_status(run_path: str) -> tuple[int, int, bool]:
+    """Read checklist.md and return (done, total, has_report)."""
+    checklist_path = os.path.join(run_path, "checklist.md")
+    report_path = os.path.join(run_path, "report.md")
+    has_report = os.path.exists(report_path)
 
-    print(f"Run directory: runs/{run_dir}/", flush=True)
-    print(f"Question: {question}", flush=True)
-    print("=" * 60, flush=True)
+    if not os.path.exists(checklist_path):
+        return 0, 0, has_report
+
+    done = 0
+    total = 0
+    with open(checklist_path) as f:
+        for line in f:
+            stripped = line.strip()
+            if stripped.startswith("- [x]") or stripped.startswith("- [X]"):
+                done += 1
+                total += 1
+            elif stripped.startswith("- [ ]"):
+                total += 1
+    return done, total, has_report
+
+
+async def run_session(
+    question: str,
+    max_rounds: int,
+    run_dir: str,
+    run_path: str,
+    session_num: int,
+) -> None:
+    """Run a single agent session within a multi-session run."""
+    run_dir_rel = f"runs/{run_dir}"
 
     system_prompt = MODELING_SYSTEM_PROMPT.format(
-        max_rounds=max_rounds, run_dir=f"runs/{run_dir}"
+        max_rounds=max_rounds, run_dir=run_dir_rel
     )
-    critique_prompt = CRITIQUE_PROMPT.format(run_dir=f"runs/{run_dir}")
-    planner_prompt = PLANNER_PROMPT.format(run_dir=f"runs/{run_dir}")
+    critique_prompt = CRITIQUE_PROMPT.format(run_dir=run_dir_rel)
+    planner_prompt = PLANNER_PROMPT.format(run_dir=run_dir_rel)
 
-    # Initialize progress file
-    progress_path = os.path.join(run_path, "progress.md")
-    with open(progress_path, "w") as f:
-        f.write(f"# Progress\n\n## Current Phase: Starting\n")
-        f.write(f"## Research Question: {question}\n")
-        f.write(f"## Max Critique Rounds: {max_rounds}\n\n")
-        f.write(f"## Completed Phases:\n\n## Key Decisions Made:\n\n")
-        f.write(f"## Known Issues:\n\n## Next Steps:\n1. Invoke research-planner\n")
+    if session_num == 1:
+        prompt = (
+            f"Research question: {question}\n\n"
+            f"Save all your work to the {run_dir_rel}/ directory:\n"
+            f"- {run_dir_rel}/progress.md (UPDATE AFTER EACH PHASE)\n"
+            f"- {run_dir_rel}/checklist.md (TRACK ALL WORK ITEMS)\n"
+            f"- {run_dir_rel}/plan.md (modeling plan from research-planner)\n"
+            f"- {run_dir_rel}/research_notes.md (literature review)\n"
+            f"- {run_dir_rel}/eda.py (exploratory data analysis script)\n"
+            f"- {run_dir_rel}/model.py (model code)\n"
+            f"- {run_dir_rel}/results.md (analysis and results)\n"
+            f"- {run_dir_rel}/report.md (final report)\n\n"
+            f"Maximum critique rounds: {max_rounds}\n\n"
+            f"Start by invoking the research-planner agent with the question."
+        )
+    else:
+        prompt = (
+            f"Continue working on the modeling task.\n\n"
+            f"Research question: {question}\n\n"
+            f"IMPORTANT: Read these files FIRST to understand current state:\n"
+            f"1. {run_dir_rel}/progress.md -- what phase you're in\n"
+            f"2. {run_dir_rel}/checklist.md -- what's done and what remains\n"
+            f"3. {run_dir_rel}/plan.md -- the modeling plan\n\n"
+            f"Pick up where the previous session left off. Check the checklist\n"
+            f"for uncompleted items and work through them. Update progress.md\n"
+            f"and checklist.md as you go.\n\n"
+            f"Maximum critique rounds: {max_rounds}"
+        )
 
-    prompt = (
-        f"Research question: {question}\n\n"
-        f"Save all your work to the runs/{run_dir}/ directory:\n"
-        f"- runs/{run_dir}/progress.md (UPDATE AFTER EACH PHASE)\n"
-        f"- runs/{run_dir}/checklist.md (TRACK ALL WORK ITEMS)\n"
-        f"- runs/{run_dir}/plan.md (modeling plan from research-planner)\n"
-        f"- runs/{run_dir}/research_notes.md (literature review)\n"
-        f"- runs/{run_dir}/eda.py (exploratory data analysis script)\n"
-        f"- runs/{run_dir}/model.py (model code)\n"
-        f"- runs/{run_dir}/results.md (analysis and results)\n"
-        f"- runs/{run_dir}/report.md (final report)\n\n"
-        f"Maximum critique rounds: {max_rounds}\n\n"
-        f"Start by invoking the research-planner agent with the question."
-    )
-
-    # Set up trace log
+    # Set up trace log (append for continuation sessions)
     trace_path = os.path.join(run_path, "trace.jsonl")
-    trace_file = open(trace_path, "w")
+    trace_file = open(trace_path, "a")
     tool_count = 0
     start_time = datetime.now()
 
     def trace(event_type: str, **data):
-        """Write a trace event to the JSONL log."""
         entry = {
             "ts": datetime.now().isoformat(),
             "elapsed_s": (datetime.now() - start_time).total_seconds(),
+            "session": session_num,
             "type": event_type,
             **data,
         }
@@ -710,7 +739,6 @@ async def run(question: str, max_rounds: int) -> None:
         trace_file.flush()
 
     def format_tool_summary(name: str, input_data: dict) -> str:
-        """Create a human-readable one-line summary of a tool call."""
         if name == "WebSearch":
             return f'WebSearch: "{input_data.get("query", "")}"'
         elif name == "WebFetch":
@@ -734,23 +762,18 @@ async def run(question: str, max_rounds: int) -> None:
             return f"Agent: {subagent}"
         return name
 
-    # Hook-based tool tracking
     async def pre_tool_hook(input_data, tool_use_id, context):
-        """Log tool calls via hooks -- captures subagent tools too."""
         nonlocal tool_count
         tool_count += 1
         tool_name = input_data.get("tool_name", "unknown")
         tool_input = input_data.get("tool_input", {})
         summary = format_tool_summary(tool_name, tool_input)
         elapsed = (datetime.now() - start_time).total_seconds()
-        print(f"[{elapsed:6.0f}s | #{tool_count}] {summary}", flush=True)
-        trace(
-            "tool_use",
-            tool=tool_name,
-            summary=summary,
-            input_preview={k: str(v)[:200] for k, v in tool_input.items()},
-        )
+        print(f"[S{session_num} {elapsed:6.0f}s | #{tool_count}] {summary}", flush=True)
+        trace("tool_use", tool=tool_name, summary=summary)
         return {}
+
+    trace("session_start", session=session_num, question=question)
 
     trace("run_start", question=question, max_rounds=max_rounds, run_dir=run_dir)
 
@@ -854,22 +877,89 @@ async def run(question: str, max_rounds: int) -> None:
             msg_type = type(message).__name__
             trace("other", message_type=msg_type)
 
-    # Save completion metadata
-    elapsed_total = (datetime.now() - start_time).total_seconds()
-    trace("run_complete", tool_count=tool_count, elapsed_s=elapsed_total)
+    # Save session metadata
+    elapsed_session = (datetime.now() - start_time).total_seconds()
+    trace("session_complete", tool_count=tool_count, elapsed_s=elapsed_session)
     trace_file.close()
 
+    print(
+        f"\nSession {session_num} complete: {elapsed_session:.0f}s, "
+        f"{tool_count} tool calls",
+        flush=True,
+    )
+
+
+async def run(question: str, max_rounds: int, max_sessions: int = 5) -> None:
+    """Multi-session run loop. Keeps launching agent sessions until the
+    checklist is complete, the report is written, or max_sessions is reached."""
+
+    run_dir = create_run_dir(question)
+    run_path = os.path.join(os.getcwd(), "runs", run_dir)
+
+    # Initialize progress file
+    progress_path = os.path.join(run_path, "progress.md")
+    with open(progress_path, "w") as f:
+        f.write(f"# Progress\n\n## Current Phase: Starting\n")
+        f.write(f"## Research Question: {question}\n")
+        f.write(f"## Max Critique Rounds: {max_rounds}\n\n")
+        f.write(f"## Completed Phases:\n\n## Key Decisions Made:\n\n")
+        f.write(f"## Known Issues:\n\n## Next Steps:\n1. Invoke research-planner\n")
+
+    print(f"Run directory: runs/{run_dir}/", flush=True)
+    print(f"Question: {question}", flush=True)
+    print(f"Max sessions: {max_sessions}", flush=True)
+    print("=" * 60, flush=True)
+
+    run_start = datetime.now()
+
+    for session_num in range(1, max_sessions + 1):
+        print(f"\n{'=' * 60}", flush=True)
+        print(f"SESSION {session_num}/{max_sessions}", flush=True)
+        print(f"{'=' * 60}", flush=True)
+
+        try:
+            await run_session(question, max_rounds, run_dir, run_path, session_num)
+        except Exception as e:
+            print(f"\nSession {session_num} ended with error: {e}", flush=True)
+
+        # Check if work is complete
+        done, total, has_report = checklist_status(run_path)
+
+        if has_report and total > 0 and done == total:
+            print(f"\nAll checklist items complete ({done}/{total}). Report written.", flush=True)
+            break
+        elif has_report:
+            print(f"\nReport written. Checklist: {done}/{total} complete.", flush=True)
+            break
+        elif total > 0:
+            remaining = total - done
+            print(f"\nChecklist: {done}/{total} complete, {remaining} remaining.", flush=True)
+            if remaining == 0:
+                break
+        else:
+            print(f"\nNo checklist found. Checking if report exists...", flush=True)
+            if has_report:
+                break
+
+        if session_num < max_sessions:
+            print(f"Starting session {session_num + 1}...", flush=True)
+
+    # Save final metadata
+    elapsed_total = (datetime.now() - run_start).total_seconds()
     metadata_path = os.path.join(run_path, "metadata.json")
     with open(metadata_path) as f:
         metadata = json.load(f)
     metadata["completed"] = datetime.now().isoformat()
     metadata["elapsed_s"] = elapsed_total
-    metadata["tool_count"] = tool_count
+    metadata["sessions"] = session_num
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
 
+    done, total, has_report = checklist_status(run_path)
     print(f"\n{'=' * 60}", flush=True)
-    print(f"Run complete in {elapsed_total:.0f}s ({tool_count} tool calls)", flush=True)
+    print(f"Run complete: {session_num} session(s), {elapsed_total:.0f}s total", flush=True)
+    print(f"Checklist: {done}/{total} items complete", flush=True)
+    print(f"Report: {'written' if has_report else 'not written'}", flush=True)
     print(f"Results: runs/{run_dir}/", flush=True)
     print(f"Trace:   runs/{run_dir}/trace.jsonl", flush=True)
 
@@ -885,9 +975,15 @@ def main() -> None:
         default=3,
         help="Maximum critique-revision rounds (default: 3)",
     )
+    parser.add_argument(
+        "--max-sessions",
+        type=int,
+        default=5,
+        help="Maximum agent sessions for context recovery (default: 5)",
+    )
     args = parser.parse_args()
 
-    asyncio.run(run(args.question, args.max_rounds))
+    asyncio.run(run(args.question, args.max_rounds, args.max_sessions))
 
 
 if __name__ == "__main__":
