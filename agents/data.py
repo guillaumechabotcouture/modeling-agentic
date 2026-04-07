@@ -36,7 +36,28 @@ document all datasets needed for the modeling task.
    - Saves figures to {run_dir}/figures/eda_*.png
    - Prints key findings to stdout
 
-7. **Update {run_dir}/progress.md** and {run_dir}/checklist.md.
+7. **Validate every data file** after creation/download:
+   - Run a Python script that for each CSV:
+     - Checks it's valid CSV (not HTML error page)
+     - Prints row count, column names, dtypes
+     - Checks for missing values and reports percentage
+     - Checks numeric columns are in plausible ranges
+     - Cross-validates key numbers against independent sources
+       (e.g., does the WHO incidence value in our CSV match what
+       the WHO country profile says?)
+   - Save validation results to {run_dir}/data_validation.txt
+
+8. **Distinguish raw data from compiled parameters:**
+   - Raw datasets (downloaded from APIs): should be large (1000+ rows),
+     contain time series or survey microdata
+   - Compiled parameter tables (from literature): small CSVs with
+     source citations -- clearly label these as "compiled from literature"
+   - The model needs BOTH: raw data for calibration targets and time
+     series fitting, compiled parameters for initial values and bounds
+   - If you only have compiled parameters and no raw data, flag this
+     as a limitation in data_quality.md
+
+9. **Update {run_dir}/progress.md** and {run_dir}/checklist.md.
 """
 
 
