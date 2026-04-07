@@ -52,18 +52,69 @@ Format:
 Update this file FREQUENTLY -- at minimum after each phase and after each
 critique round. Read it at the start of your work to orient yourself.
 
+## WORK TRACKING (checklist.md)
+
+Maintain a checklist at {run_dir}/checklist.md that tracks ALL work items.
+This is the single source of truth for what needs to be done.
+
+Initialize it from the planner's Modeling Checklist. When the critique agent
+requests new work (figures, metrics, analyses), ADD those items to the
+checklist. Check off items as you complete them.
+
+Format:
+```
+# Work Checklist
+
+## From Planner:
+- [x] Download NHSN data for WA state
+- [x] EDA: time series plots, ACF/PACF
+- [ ] Implement SARIMAX model
+- [ ] Implement gradient boosting baseline
+...
+
+## From Critique Round 1:
+- [ ] Add QQ plot of residuals (figures/residuals_qq.png)
+- [ ] Compute forecast skill score vs naive baseline
+- [ ] Fix model convergence warning
+...
+
+## From Critique Round 2:
+- [ ] Sensitivity analysis on key parameters
+...
+```
+
+After each critique round, read the critique feedback and add ALL requested
+items to this checklist before starting work. This ensures nothing is missed
+across long runs with multiple critique rounds.
+
 ## CORE PRINCIPLES
 
-1. **Don't reinvent the wheel.** Use established Python packages (see Framework Guide
-   below) instead of hand-coding models. A 50-line script using statsmodels or lmfit
-   beats an 800-line hand-rolled implementation.
-2. **Start simple, add complexity.** Always build the simplest reasonable model first
-   as a baseline. Only add complexity if it demonstrably improves out-of-sample
-   performance.
-3. **Validate before you trust.** Never report in-sample fit as model quality. Always
-   use held-out data (temporal split for time series).
-4. **Quantify uncertainty.** Report prediction intervals, not just point estimates.
-   Use lmfit or PyMC which provide uncertainty automatically.
+1. **Published results are validation data.** Before building anything new,
+   check plan.md for published benchmarks. Try to reproduce key published
+   findings with similar data. If you can match Grassly's OR or Voorman's
+   AUC, your pipeline is validated. If you can't, debug before proceeding.
+   Disagreements with published work are either bugs in your model or
+   genuine findings -- investigate which.
+
+2. **More data = better model.** Seek out multiple data sources and fit to
+   each independently. A model that works on NHSN data AND FluSurv-NET AND
+   published cohort results is much stronger than one that fits a single
+   dataset. Geographic and temporal diversity in data makes the model more
+   generalizable and more credible.
+
+3. **Don't reinvent the wheel.** Use established Python packages (see Framework
+   Guide below) instead of hand-coding models. A 50-line script using
+   statsmodels or lmfit beats an 800-line hand-rolled implementation.
+
+4. **Start simple, add complexity.** Always build the simplest reasonable model
+   first as a baseline. Only add complexity if it demonstrably improves
+   out-of-sample performance.
+
+5. **Validate before you trust.** Never report in-sample fit as model quality.
+   Always use held-out data (temporal split for time series).
+
+6. **Quantify uncertainty.** Report prediction intervals, not just point
+   estimates. Use lmfit or PyMC which provide uncertainty automatically.
 
 ## FRAMEWORK GUIDE -- USE THESE, DON'T HAND-CODE
 
@@ -102,10 +153,14 @@ return a structured modeling plan including:
 - Summarize findings in {run_dir}/research_notes.md
 
 ### PHASE 2: DATA GATHERING
-- Find and download public datasets (CSV, JSON from government/research sources)
+- Find and download ALL available public datasets, not just one. More data
+  sources = stronger validation. For each dataset note its source authority,
+  temporal/spatial coverage, and known limitations.
 - Download using Python via Bash, save to {run_dir}/data/
 - If no direct data available, use published parameter values from literature
 - Create {run_dir}/data/ directory if needed
+- **Data diversity matters**: seek data from multiple geographies, time periods,
+  and collection methods. A model validated on diverse data is more credible.
 
 ### PHASE 3: DATA EXPLORATION (do this before modeling!)
 Write and run a short EDA script ({run_dir}/eda.py) that:
@@ -115,6 +170,19 @@ Write and run a short EDA script ({run_dir}/eda.py) that:
 - Checks distributions, seasonality, trends
 - Saves EDA plots to {run_dir}/figures/
 - Prints findings to stdout
+
+### PHASE 3b: REPRODUCE PUBLISHED FINDINGS
+Before building your own model, check plan.md for Published Benchmarks.
+Pick 1-2 key published results and try to reproduce them:
+- Use similar data, similar model specification
+- Compare your result to the published value
+- If they match (within CI): your pipeline is validated, proceed
+- If they disagree: investigate why before building further
+  - Different data resolution? Different time period? Bug in your code?
+  - Document the investigation in results.md
+
+This step is NOT optional. It catches pipeline bugs early and builds
+confidence that subsequent novel results are real.
 
 ### PHASE 4: MODEL BUILDING
 Follow this checklist in order:
@@ -167,20 +235,30 @@ Write {run_dir}/results.md with:
 - Model Description: type, package used, and rationale
 - Key Assumptions
 - Mathematical Formulation (equations, parameters with fitted values and CIs)
-- Data Sources (with URLs)
+- Data Sources (with URLs) -- list ALL datasets used, not just primary
+- **Cross-Dataset Validation**: if multiple datasets are available, fit the
+  model to each independently and compare. Report whether the model
+  generalizes across datasets or only works on one.
 - Validation Results: train vs test metrics, forecast skill vs baseline
 - Residual diagnostics interpretation
 - **Published Benchmarks Comparison**: read {run_dir}/plan.md, find the
-  Published Benchmarks table. For each published result, report our
-  corresponding value, whether they agree, and explain any discrepancies.
-  This is the core scientific validation -- showing our model is consistent
-  with (or improves upon) established findings.
+  Published Benchmarks table. For EACH published result:
+  - Report our corresponding value with CI
+  - AGREE: our value falls within published CI or within 2x
+  - DISAGREE: explain why -- different data? different resolution? potential
+    issue in published work? If our result is more extreme on easier data
+    (e.g., country-level vs district-level), flag potential overfitting.
+  - This is the core scientific validation. Treat it as seriously as the
+    train/test split.
 - **Success Criteria Scorecard**: read {run_dir}/plan.md, find the Success
   Criteria section, and report each criterion with PASS/FAIL and the actual
-  measured value. This is critical -- the critique agent will check this.
+  measured value.
+- **What we learned that's new**: explicitly state what this analysis adds
+  beyond existing published work. If it only confirms known results with
+  less rigor, acknowledge that. Novel findings should be clearly flagged.
 - 3-5 concrete questions this model can answer, with computed example answers
   including uncertainty ranges
-- Honest limitations assessment
+- Honest limitations assessment -- specific, not generic
 
 ### PHASE 5b: PARALLEL MODEL TESTING (OPTIONAL BUT RECOMMENDED)
 Before running the critique, consider spawning **model-tester** subagents in
@@ -530,17 +608,18 @@ Rate each dimension 1-5:
 
 ## Verdict: ACCEPT / REVISE
 
-## Required Work
-(things that MUST be done -- hard blockers, failed criteria, missing outputs)
+## Checklist Items for Next Round
+Format these as markdown checklist items that the modeler will add to
+{run_dir}/checklist.md. Be specific and actionable.
 
-## Requested Figures
-(specific new figures with exact filenames and descriptions)
+### Must Fix (blocking acceptance):
+- [ ] [specific action with exact file/metric names]
 
-## Requested Analyses
-(deeper analyses, benchmark comparisons, sensitivity checks)
+### Should Add (important for quality):
+- [ ] [specific action]
 
-## Scientific Improvements
-(what would make this publishable or more useful for decision-makers)
+### Nice to Have (would strengthen the work):
+- [ ] [specific action]
 """
 
 
@@ -601,7 +680,8 @@ async def run(question: str, max_rounds: int) -> None:
     prompt = (
         f"Research question: {question}\n\n"
         f"Save all your work to the runs/{run_dir}/ directory:\n"
-        f"- runs/{run_dir}/progress.md (UPDATE THIS FREQUENTLY)\n"
+        f"- runs/{run_dir}/progress.md (UPDATE AFTER EACH PHASE)\n"
+        f"- runs/{run_dir}/checklist.md (TRACK ALL WORK ITEMS)\n"
         f"- runs/{run_dir}/plan.md (modeling plan from research-planner)\n"
         f"- runs/{run_dir}/research_notes.md (literature review)\n"
         f"- runs/{run_dir}/eda.py (exploratory data analysis script)\n"
