@@ -130,6 +130,34 @@ tool calls completes in the time of the slowest one, not the sum of all 5.
 6. **Quantify uncertainty.** Report prediction intervals, not just point
    estimates. Use lmfit or PyMC which provide uncertainty automatically.
 
+## CAUSAL REASONING
+
+Before interpreting any coefficient as a causal effect, ask:
+
+1. **Does the predictor measure what you claim?**
+   - Pol3 post-OPV2-switch measures bOPV coverage, NOT type 2 immunity
+   - GDP per capita measures wealth, NOT disease risk directly
+   - If your predictor is a proxy, say "proxy for X" not "X"
+
+2. **Could the relationship be confounded?**
+   - Variables correlated with both predictor and outcome
+   - Time trends that affect both (e.g., IPV rollout coincides with switch)
+   - Draw the causal DAG if uncertain
+
+3. **Could the analysis design create the effect?**
+   - Ecological fallacy: country-level associations ≠ individual-level effects
+   - Aggregation bias: averaging hides within-group variation
+   - Survivorship bias: only observing countries that report
+
+4. **What would falsify the causal claim?**
+   - If you claim X causes Y, what evidence would convince you otherwise?
+
+Label every key finding in results.md and report.md as one of:
+- **CAUSAL** (randomized or quasi-experimental evidence)
+- **ASSOCIATIONAL** (observational, potential confounding acknowledged)
+- **PROXY RELATIONSHIP** (predictor is a proxy for the true driver -- state
+  what the true driver is and why the proxy is reasonable)
+
 ## FRAMEWORK GUIDE -- USE THESE, DON'T HAND-CODE
 
 | Need | Package | Example |
@@ -141,6 +169,8 @@ tool calls completes in the time of the slowest one, not the sum of all 5.
 | ML baselines | `scikit-learn` | `RandomForestRegressor`, cross-validation |
 | Gradient boosting | `xgboost` | Best tabular prediction |
 | ODE solving | `scipy.integrate.solve_ivp` | Use solve_ivp, not deprecated odeint |
+| Fitting ODE models to data | `lmfit` + `solve_ivp` | Define ODE, fit params to time series |
+| Bayesian mechanistic | `PyMC` + `pytensor` | ODE + posterior inference |
 | Epi modeling | `epyestim` | Rt estimation |
 
 Before writing any model code, check if a package already implements it. Search with
@@ -159,23 +189,22 @@ return a structured modeling plan including:
 **Follow the planner's recommendations.** Save the plan to {run_dir}/plan.md.
 
 ### PHASE 1: HYPOTHESES
-Before any research or modeling, think carefully about the question and
-write {run_dir}/hypotheses.md with:
+Read the planner's Hypotheses table from {run_dir}/plan.md. Evaluate the
+proposed hypotheses -- the planner has done the literature review and is
+well-positioned to propose informed hypotheses, but they are a starting
+point, not the final word.
 
-**1. Candidate hypotheses**: List 3-7 competing explanations for the
-phenomenon in question. These should be substantive scientific hypotheses,
-not modeling choices. For example:
-- "cVDPV2 emergence is driven primarily by low routine immunization"
-- "cVDPV2 emergence is driven primarily by the immunity gap after OPV2 cessation"
-- "Northern Nigeria has more emergences due to subnational coverage heterogeneity"
-- "Type 2 reverts faster than types 1 and 3 due to Sabin 2 genetic instability"
+Write {run_dir}/hypotheses.md with:
+
+**1. Candidate hypotheses**: Start from the planner's table. You may:
+- Add hypotheses the planner missed
+- Refine predictions to be more specific/quantitative
+- Re-assess testability now that you know the available data better
+- Reorder priorities
 
 **2. Predictions**: For each hypothesis, state what you would expect to see
-in the data if it's TRUE vs FALSE:
-- H1 true → emergence rate should correlate with Pol3 coverage (r > 0.5)
-- H1 false → countries with high coverage should still have emergences
-- H2 true → emergence rate should increase monotonically after 2016
-- H2 false → emergence rate should be stable or decrease after switch
+in the data if it's TRUE vs FALSE. Be specific and quantitative where
+possible (e.g., "r > 0.5" not just "should correlate").
 
 **3. Falsifiability assessment**: For each hypothesis, state whether it is
 testable with available data. If not, explain what data would be needed.
@@ -217,6 +246,15 @@ Launch all downloads simultaneously. Then verify each file.
 - If no direct data available, use published parameter values from literature
 - **Data diversity matters**: seek data from multiple geographies, time periods,
   and collection methods. A model validated on diverse data is more credible.
+- **Cross-dataset validation requirement**: If multiple data sources exist
+  (e.g., OWID + FluSurv-NET + published cohort data), you MUST fit the model
+  to at least 2 sources independently and compare:
+  - Do you get the same coefficients/effect sizes?
+  - If yes: strong evidence the finding is real
+  - If no: investigate why (different populations, measurements, time periods)
+    and report which you trust more
+  If only one dataset is available, compare your results to published
+  estimates from different datasets as indirect cross-validation.
 
 ### PHASE 3: DATA EXPLORATION (do this before modeling!)
 Write and run a short EDA script ({run_dir}/eda.py) that:
@@ -333,6 +371,15 @@ Write {run_dir}/results.md with:
   less rigor, acknowledge that. Novel findings should be clearly flagged.
 - 3-5 concrete questions this model can answer, with computed example answers
   including uncertainty ranges
+- **Model structure sensitivity**: Test at least 2 alternative functional
+  forms for key relationships and report how conclusions change:
+  - Linear vs log vs threshold (e.g., does coverage have a threshold at 80%?)
+  - With and without interaction terms
+  - Different distributional assumptions (Poisson vs NB vs ZINB)
+  Report: "Our key finding (X reduces Y by Z%) is robust/sensitive to model
+  specification. Under alternative specification A, the effect is..."
+  If conclusions change substantially under plausible alternatives, flag
+  this prominently as a limitation.
 - Honest limitations assessment -- specific, not generic
 
 ### PHASE 5b: PARALLEL MODEL TESTING (DO THIS)
@@ -447,8 +494,16 @@ on the literature and data sources you find, not on prior runs in this project.
 
 ## Your process:
 
-1. **Classify the problem**: Is this forecasting, causal inference, mechanistic
-   modeling, or something else?
+1. **Classify the problem**: Explicitly consider whether the question requires:
+   - **Statistical model** (what predicts the outcome?) → regression, ML
+   - **Mechanistic/dynamic model** (why/how does the outcome occur?) →
+     compartmental models, ODEs, agent-based
+   - **Both** (understand mechanism AND predict) → mechanistic model
+     validated against data
+
+   Questions containing "why", "how does", "what drives", "explain the
+   mechanism", or "dynamics" strongly suggest a mechanistic model is needed.
+   If the question asks for a dynamic model, DO NOT recommend only regression.
 
 2. **Search for prior work**: Use WebSearch to find 3-5 papers or resources that
    model the same or similar phenomena. For each, extract:
@@ -486,6 +541,16 @@ on the literature and data sources you find, not on prior runs in this project.
    - **Standard**: the well-established approach from literature
    - **Advanced**: a more sophisticated option if data supports it
 
+   If the question calls for a mechanistic model:
+   - **Baseline**: simplest analytical approximation (e.g., exponential growth)
+   - **Standard**: the established compartmental model (e.g., SEIR)
+   - **Advanced**: the standard model with extensions relevant to the question
+     (e.g., SEIR + immunity waning + vaccination + strain-specific dynamics)
+   Specify compartments, key parameters with published ranges, and what data
+   the model should be fitted to. Recommend `scipy.integrate.solve_ivp` for
+   ODEs, `lmfit` for fitting ODE models to data, `PyMC` for Bayesian
+   parameter estimation of mechanistic models.
+
 8. **Define success criteria**: Based on the literature and domain, define
    concrete, measurable criteria for what constitutes a good model. These
    should be specific numbers, not vague goals. Derive them from:
@@ -507,8 +572,25 @@ Write your plan as structured markdown with these sections:
 - Recommended Python Packages
 - Candidate Models (baseline, standard, advanced with rationale)
 - Success Criteria (specific, measurable thresholds -- see format below)
+- Hypotheses (informed by literature review -- see format below)
 - Modeling Checklist (numbered, specific, actionable steps)
 - Key Risks and Pitfalls to avoid
+
+### Hypotheses section format:
+
+Based on your literature review, propose 3-7 testable hypotheses:
+
+```
+## Hypotheses
+
+| # | Hypothesis | If TRUE, expect... | If FALSE, expect... | Testable? | Priority | Source |
+|---|-----------|--------------------|--------------------|-----------|----------|--------|
+| H1 | [statement] | [prediction] | [prediction] | YES/PARTIAL/NO | HIGH/MED/LOW | [paper] |
+| H2 | ... | ... | ... | ... | ... | ... |
+```
+
+For each hypothesis, cite the published evidence that motivates it.
+These hypotheses will be refined by the modeler and drive the analysis.
 
 ### Published Benchmarks Table (CRITICAL)
 
@@ -649,6 +731,11 @@ plot type) so the modeler can act on it.
 - [ ] Clear table separating TRAINING metrics from TEST metrics
       (a single R-squared without specifying train vs test is unacceptable)
 
+### Cross-dataset validation:
+- [ ] Were multiple data sources sought? If only one used, was this justified?
+- [ ] If multiple sources available, was the model fit to each independently?
+- [ ] Do results agree across datasets? If not, is the discrepancy explained?
+
 ### Required validation procedures:
 - [ ] Train/test split: must be temporal for time series (never random)
       At least 20% of data held out, or one full season for seasonal data
@@ -679,6 +766,19 @@ These are automatic REVISE regardless of overall quality:
 
 If ANY hard blocker is present, verdict is REVISE. Do not score further until
 hard blockers are resolved.
+
+## STEP 4b: CAUSAL REASONING CHECK
+
+For each key finding in results.md:
+- Is the predictor-outcome relationship labeled (CAUSAL/ASSOCIATIONAL/PROXY)?
+- If labeled CAUSAL: is there experimental or quasi-experimental evidence?
+- If a proxy is used: is it acknowledged? Is the true mechanism discussed?
+- Are confounders identified and discussed?
+- Example red flag: "Pol3 coverage reduces type 2 emergence" -- Pol3 is bOPV
+  (no type 2), so this is a proxy for health system capacity, not a direct
+  type 2 immunity effect.
+
+If key findings have unacknowledged proxy relationships = REVISE.
 
 ## STEP 5: EVALUATE HYPOTHESIS TESTING
 
@@ -731,6 +831,12 @@ Ask yourself these questions as a peer reviewer:
    to act on it? Are the findings actionable?
 6. **What's missing**: What analysis would a reviewer request in revision?
    Don't wait for the next round -- request it now.
+7. **Domain consistency**: Do the interpretations make scientific sense?
+   - Proxy variables interpreted as direct causes?
+   - Effect sizes implausibly large or small for the domain?
+   - Conclusions that contradict well-established domain knowledge?
+   - Mechanisms cited that don't match the model structure?
+   (e.g., claiming a regression model "explains the dynamics" of a process)
 
 ## STEP 9: SCORING
 
@@ -740,6 +846,8 @@ Rate each dimension 1-5:
    Was falsification attempted (not just confirmation)?
 2. **Scientific Rigor** (1-5): Would this survive peer review? Are methods
    appropriate, assumptions justified, and results correctly interpreted?
+   Were alternative model structures tested (not just parameter sensitivity)?
+   Are causal claims properly labeled and justified?
 3. **Comparison to Literature** (1-5): Are results compared to published
    benchmarks? Are agreements/disagreements explained? Does this add value
    beyond what's already known?
