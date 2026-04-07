@@ -136,6 +136,11 @@ Write {run_dir}/results.md with:
 - Data Sources (with URLs)
 - Validation Results: train vs test metrics, forecast skill vs baseline
 - Residual diagnostics interpretation
+- **Published Benchmarks Comparison**: read {run_dir}/plan.md, find the
+  Published Benchmarks table. For each published result, report our
+  corresponding value, whether they agree, and explain any discrepancies.
+  This is the core scientific validation -- showing our model is consistent
+  with (or improves upon) established findings.
 - **Success Criteria Scorecard**: read {run_dir}/plan.md, find the Success
   Criteria section, and report each criterion with PASS/FAIL and the actual
   measured value. This is critical -- the critique agent will check this.
@@ -171,37 +176,52 @@ research the topic.
 Your job is to think carefully about the question and produce a plan. Do NOT
 build the model yourself.
 
+IMPORTANT: Do not read or reference files from other runs. Only use web
+searches and fetches for your research. Your output should be based entirely
+on the literature and data sources you find, not on prior runs in this project.
+
 ## Your process:
 
 1. **Classify the problem**: Is this forecasting, causal inference, mechanistic
    modeling, or something else?
 
 2. **Search for prior work**: Use WebSearch to find 3-5 papers or resources that
-   model the same or similar phenomena. For each, note:
+   model the same or similar phenomena. For each, extract:
    - What model type they used
-   - What data they used
-   - What performance they achieved
+   - What data they used (exact dataset, sample size, time period)
+   - **Specific quantitative results** they reported: coefficients, odds ratios,
+     AUC, RMSE, R-squared, prediction intervals -- exact numbers with CIs
    - What packages/tools they used
+   - Key limitations the authors acknowledged
 
-3. **Identify the standard approach**: What is the "textbook" model for this
-   problem? What's the state-of-the-art?
+3. **Extract published comparison points**: This is critical. From the papers,
+   build a table of specific numbers our model must reproduce or improve upon.
+   For example:
+   - "Grassly et al. found OR=0.68 per 10% immunity increase (95% CI: 0.59-0.78)"
+   - "Voorman et al. achieved AUC=0.88 at 12-month horizon on district-level data"
+   - "FluSight baseline achieves WIS of X on national-level forecasts"
 
-4. **Survey available data**: Search for public datasets. For each, note:
+   These are not just benchmarks -- they are **validation targets**. If our model
+   finds substantially different effect sizes or performance, we must explain why.
+   Agreement confirms our model; disagreement may reveal issues in our model OR
+   in the published work.
+
+5. **Survey available data**: Search for public datasets. For each, note:
    - URL and source authority
    - Temporal/spatial coverage
    - Key variables available
    - Known quality issues
 
-5. **Search for existing packages**: Look for Python packages that already
+6. **Search for existing packages**: Look for Python packages that already
    implement models for this domain. Don't assume the modeler needs to code
    from scratch.
 
-6. **Recommend candidate models** (ranked):
+7. **Recommend candidate models** (ranked):
    - **Baseline**: the simplest reasonable model (e.g., seasonal naive, linear regression)
    - **Standard**: the well-established approach from literature
    - **Advanced**: a more sophisticated option if data supports it
 
-7. **Define success criteria**: Based on the literature and domain, define
+8. **Define success criteria**: Based on the literature and domain, define
    concrete, measurable criteria for what constitutes a good model. These
    should be specific numbers, not vague goals. Derive them from:
    - Published benchmarks (e.g., "top FluSight models achieve WIS of X")
@@ -210,60 +230,96 @@ build the model yourself.
    - If no published benchmarks exist, set criteria relative to the baseline
      (e.g., "must beat baseline by at least 15% on RMSE")
 
-8. **Create a checklist** of specific steps for the modeler to follow.
+9. **Create a checklist** of specific steps for the modeler to follow.
 
 ## Output format:
 
 Write your plan as structured markdown with these sections:
 - Problem Classification
 - Literature Summary (table: paper, model type, data, performance, tools)
+- **Published Benchmarks Table** (see format below)
 - Available Data Sources (table: source, URL, coverage, variables)
 - Recommended Python Packages
 - Candidate Models (baseline, standard, advanced with rationale)
-- Success Criteria (specific, measurable thresholds -- see section below)
+- Success Criteria (specific, measurable thresholds -- see format below)
 - Modeling Checklist (numbered, specific, actionable steps)
 - Key Risks and Pitfalls to avoid
 
-### Success Criteria section format:
+### Published Benchmarks Table (CRITICAL)
+
+Extract every quantitative result from the literature that our model should
+reproduce or compare against. This table drives validation.
+
+```
+## Published Benchmarks
+
+| Source | Result | Value | CI/Range | Data Used | Notes |
+|--------|--------|-------|----------|-----------|-------|
+| Grassly 2022 | OR per 10% immunity increase | 0.68 | 0.59-0.78 | District-level, Africa | Our OR should be in this range |
+| Voorman 2022 | AUC at 12-month horizon | 0.88 | -- | District, 69 countries | We use country-level so expect lower |
+| ... | ... | ... | ... | ... | ... |
+
+### How to use these benchmarks:
+1. If our model agrees (within CI): confirms our approach
+2. If our model disagrees: investigate why -- could be our error, different
+   data/resolution, or a genuine finding that challenges prior work
+3. Report each comparison explicitly in results.md
+```
+
+### Success Criteria format:
 
 ```
 ## Success Criteria
 
-A model is considered **good** if it meets ALL of these:
+The model must be of sufficient scientific quality that its findings would
+be defensible in a peer review or policy discussion.
+
+### Hard blockers (any of these = automatic failure):
+- [ ] Model must converge without warnings
+- [ ] No negative skill scores on primary metric vs baseline
+- [ ] All reported coefficients/effects must have confidence intervals
+- [ ] Key predictors must be statistically significant (p < 0.05)
+- [ ] No VIF > 10 among predictors in the final reported model
 
 ### Minimum bar (must achieve to be acceptable):
-- [ ] Positive forecast skill score vs [specific baseline] on held-out test data
-- [ ] 95% prediction interval coverage between X% and Y%
-- [ ] Residuals show no significant autocorrelation (Ljung-Box p > 0.05)
-- [ ] [domain-specific criterion, e.g., "peak timing predicted within 2 weeks"]
+- [ ] Positive forecast skill score vs [specific baseline] on held-out data
+- [ ] 95% prediction interval coverage between 85% and 98%
+- [ ] Key effect sizes consistent with published benchmarks (within 2x)
+- [ ] Residuals show no systematic patterns
+- [ ] [domain-specific criterion]
 
 ### Target performance (based on published benchmarks):
-- [ ] Out-of-sample RMSE below X (derived from: [source])
-- [ ] Forecast skill score above Y (derived from: [source])
-- [ ] [metric] comparable to [published benchmark model]
+- [ ] [metric] comparable to [published benchmark] (source: [paper])
+- [ ] Effect sizes within published confidence intervals
+- [ ] Novel insight or confirmation that adds value beyond existing work
 
-### Stretch goals:
-- [ ] Beats the standard approach from literature
-- [ ] Calibrated prediction intervals (coverage within 5% of nominal)
-- [ ] Interpretable parameters consistent with domain knowledge
+### Scientific quality:
+- [ ] Could a reviewer reproduce these results from the description?
+- [ ] Are conclusions supported by the evidence (not overclaimed)?
+- [ ] Are limitations specific and honest (not generic disclaimers)?
+- [ ] Does the model add value -- what do we learn that we didn't know?
 ```
 
 These criteria will be used by the critique agent to evaluate the model.
-The modeler should report progress against each criterion in results.md.
+The modeler must report against each criterion AND against each published
+benchmark in results.md.
 """
 
 
 CRITIQUE_PROMPT = """\
-You are a rigorous mathematical modeling reviewer. You will review ALL outputs
-from the modeling agent: text files, code, AND figures.
+You are a senior scientific reviewer evaluating a modeling study for
+publication quality. Your standard is: would this survive peer review?
+Would a decision-maker trust these results? You are not grading homework --
+you are ensuring scientific rigor.
 
 ## STEP 1: READ ALL OUTPUTS
 
 First, use Glob to find all files in {run_dir}/:
+- Read {run_dir}/plan.md (modeling plan -- especially Published Benchmarks
+  and Success Criteria sections)
 - Read {run_dir}/results.md (analysis and results)
 - Read {run_dir}/model.py (model code)
 - Read {run_dir}/research_notes.md (literature review)
-- Read {run_dir}/plan.md (modeling plan, if it exists)
 
 ## STEP 2: REVIEW ALL FIGURES (CRITICAL)
 
@@ -275,7 +331,8 @@ For each figure, evaluate:
 - Are legends present and readable?
 - Does the visual match what the text claims?
 - Are scales appropriate (not misleading)?
-- Is the figure informative or just decorative?
+- Is the figure publication quality or just a quick plot?
+- Would this figure be clear to someone reading a paper?
 
 ## STEP 3: ENFORCE VALIDATION CHECKLIST
 
@@ -328,88 +385,114 @@ plot type) so the modeler can act on it.
 - [ ] Sensitivity analysis: for mechanistic models, show how outputs
       change when key parameters are varied +/- 20%
 
-## STEP 4: EVALUATE AGAINST SUCCESS CRITERIA
+## STEP 4: CHECK HARD BLOCKERS
 
-Read {run_dir}/plan.md and find the **Success Criteria** section. The planner
-defined specific, measurable thresholds. For each criterion:
-- Check if the modeler reported the relevant metric in results.md
-- Check if the metric meets the threshold
-- Mark as PASS, FAIL, or NOT REPORTED
+These are automatic REVISE regardless of overall quality:
+- [ ] Model convergence: any convergence warnings or max-iteration limits?
+- [ ] Negative skill score: does the primary model perform worse than baseline?
+- [ ] Missing CIs: are key coefficients/effects reported without confidence intervals?
+- [ ] Non-significant key predictors: are the main variables of interest
+      non-significant (p > 0.05) in the final reported model?
+- [ ] Extreme collinearity: VIF > 10 among predictors in the final model?
+      (a reduced model to address collinearity is acceptable only if the
+      full model is not the one used for key conclusions)
+- [ ] Non-convergence presented as valid results
 
-If the plan has no success criteria, flag this as an issue and apply these
-defaults:
-- Positive forecast skill score vs baseline
-- 95% PI coverage between 80-98%
-- Ljung-Box p > 0.05 on residuals
-- Out-of-sample RMSE better than naive baseline
+If ANY hard blocker is present, verdict is REVISE. Do not score further until
+hard blockers are resolved.
 
-## STEP 5: DOMAIN-SPECIFIC REVIEW
+## STEP 5: COMPARE AGAINST PUBLISHED BENCHMARKS
 
-Check the model against domain knowledge:
-- Are parameter values physiologically/physically plausible?
-- Do the results align with published literature?
-- Are there known phenomena the model fails to capture?
-- Would a domain expert find the conclusions reasonable?
+Read {run_dir}/plan.md and find the **Published Benchmarks** table. For each
+published result:
+- Did the modeler compare their result against it?
+- Does our result agree (within published CI or within 2x)?
+- If it disagrees, is there a plausible explanation?
+- If our result is BETTER than published on easier data (e.g., country-level
+  vs district-level), flag potential overfitting or data leakage
 
-## STEP 6: SCORING
+Also check: did the modeler find any discrepancies with published work that
+could indicate issues in prior studies? This is valuable and should be noted.
+
+## STEP 6: EVALUATE AGAINST SUCCESS CRITERIA
+
+Read {run_dir}/plan.md Success Criteria. For each criterion:
+- Mark as PASS, FAIL, or NOT REPORTED with the actual value
+- Hard blockers and minimum bar criteria must all pass for ACCEPT
+- Target and stretch are informational
+
+## STEP 7: SCIENTIFIC QUALITY REVIEW
+
+Ask yourself these questions as a peer reviewer:
+1. **Reproducibility**: Could someone reproduce these results from the
+   description? Are data sources, preprocessing steps, and model
+   specifications fully documented?
+2. **Overclaiming**: Are conclusions supported by the evidence? Is the
+   abstract/summary honest about what the model can and cannot do?
+3. **Usefulness**: Does this model tell us something we didn't already know?
+   Or does it just confirm published results with less rigor?
+4. **Limitations**: Are they specific and honest, or generic disclaimers?
+   ("ecological fallacy" is a real limitation; "more data would help" is not)
+5. **Decision relevance**: If a policymaker read this, would they be able
+   to act on it? Are the findings actionable?
+6. **What's missing**: What analysis would a reviewer request in revision?
+   Don't wait for the next round -- request it now.
+
+## STEP 8: SCORING
 
 Rate each dimension 1-5:
-1. **Mathematical Rigor** (1-5): Equations correct? Assumptions reasonable?
-   Established packages used? Parameters plausible?
-2. **Data Quality** (1-5): Sources credible? Proper train/test split?
-   Data issues acknowledged?
-3. **Model Validity** (1-5): Addresses the question? Out-of-sample validation?
-   Beats baseline? Prediction intervals included?
-4. **Code Quality** (1-5): Concise and well-structured? Uses established
-   packages? Runs correctly? Not over-engineered?
-5. **Figures and Presentation** (1-5): All required figures present? Axes
-   labeled with units? Visually clear? Figures match text claims?
-6. **Completeness** (1-5): All required metrics reported? Limitations honest
-   and specific? Questions demonstrated with uncertainty?
+1. **Scientific Rigor** (1-5): Would this survive peer review? Are methods
+   appropriate, assumptions justified, and results correctly interpreted?
+2. **Comparison to Literature** (1-5): Are results compared to published
+   benchmarks? Are agreements/disagreements explained? Does this add value
+   beyond what's already known?
+3. **Validation Quality** (1-5): Proper out-of-sample evaluation? Beats
+   baseline? Calibrated uncertainty? Residual diagnostics interpreted?
+4. **Figures and Presentation** (1-5): Publication quality? Clear, labeled,
+   informative? Do they support the narrative?
+5. **Usefulness** (1-5): Does this answer the research question? Are findings
+   actionable? Would a decision-maker trust and use these results?
 
 ## Verdict Rules
-- ACCEPT if average score >= 4 and no dimension below 3
-- REVISE otherwise
+- If ANY hard blocker is present: REVISE (regardless of scores)
+- If average score >= 4 and no dimension below 3: ACCEPT
+- Otherwise: REVISE
 
 ## Response Format
 
-## Required Outputs Check
-(list each required item with PRESENT or MISSING)
+## Hard Blockers
+(list each hard blocker checked: CLEAR or BLOCKED with explanation)
 
-## Figure Review
-(for each figure: filename, what it shows, any issues found)
-
-## Scores
-- Mathematical Rigor: X/5 -- (justification)
-- Data Quality: X/5 -- (justification)
-- Model Validity: X/5 -- (justification)
-- Code Quality: X/5 -- (justification)
-- Figures and Presentation: X/5 -- (justification)
-- Completeness: X/5 -- (justification)
+## Published Benchmarks Comparison
+(for each benchmark from plan.md: our value vs published value, AGREE/DISAGREE,
+ explanation if disagree. Flag any potential issues found in published work.)
 
 ## Success Criteria Evaluation
-(for each criterion from plan.md: PASS / FAIL / NOT REPORTED, with the actual value)
+(for each criterion from plan.md: PASS / FAIL / NOT REPORTED, with actual value)
+
+## Figure Review
+(for each figure: filename, what it shows, publication quality? any issues?)
+
+## Scores
+- Scientific Rigor: X/5 -- (justification)
+- Comparison to Literature: X/5 -- (justification)
+- Validation Quality: X/5 -- (justification)
+- Figures and Presentation: X/5 -- (justification)
+- Usefulness: X/5 -- (justification)
 
 ## Verdict: ACCEPT / REVISE
 
 ## Required Work
-(things that MUST be done -- missing required outputs, broken code, wrong results)
+(things that MUST be done -- hard blockers, failed criteria, missing outputs)
 
 ## Requested Figures
-(specific new figures to generate, with exact descriptions:
- e.g., "Generate a QQ plot of model residuals saved as {run_dir}/figures/qq_residuals.png")
-
-## Requested Metrics
-(specific metrics to compute and add to results.md:
- e.g., "Compute forecast skill score: 1 - RMSE_model/RMSE_naive_seasonal")
+(specific new figures with exact filenames and descriptions)
 
 ## Requested Analyses
-(deeper analyses to perform:
- e.g., "Run sensitivity analysis varying R0 from 1.0 to 1.5 and plot
-  how peak hospitalization predictions change")
+(deeper analyses, benchmark comparisons, sensitivity checks)
 
-## Other Improvements
-(nice-to-haves that would strengthen the work but are not blocking acceptance)
+## Scientific Improvements
+(what would make this publishable or more useful for decision-makers)
 """
 
 
