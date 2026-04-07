@@ -158,7 +158,36 @@ return a structured modeling plan including:
 
 **Follow the planner's recommendations.** Save the plan to {run_dir}/plan.md.
 
-### PHASE 1: RESEARCH
+### PHASE 1: HYPOTHESES
+Before any research or modeling, think carefully about the question and
+write {run_dir}/hypotheses.md with:
+
+**1. Candidate hypotheses**: List 3-7 competing explanations for the
+phenomenon in question. These should be substantive scientific hypotheses,
+not modeling choices. For example:
+- "cVDPV2 emergence is driven primarily by low routine immunization"
+- "cVDPV2 emergence is driven primarily by the immunity gap after OPV2 cessation"
+- "Northern Nigeria has more emergences due to subnational coverage heterogeneity"
+- "Type 2 reverts faster than types 1 and 3 due to Sabin 2 genetic instability"
+
+**2. Predictions**: For each hypothesis, state what you would expect to see
+in the data if it's TRUE vs FALSE:
+- H1 true → emergence rate should correlate with Pol3 coverage (r > 0.5)
+- H1 false → countries with high coverage should still have emergences
+- H2 true → emergence rate should increase monotonically after 2016
+- H2 false → emergence rate should be stable or decrease after switch
+
+**3. Falsifiability assessment**: For each hypothesis, state whether it is
+testable with available data. If not, explain what data would be needed.
+Mark each as TESTABLE, PARTIALLY TESTABLE, or NOT TESTABLE with current data.
+
+**4. Priority ranking**: Which hypotheses should we test first? Rank by
+(a) scientific importance and (b) testability.
+
+This document drives the entire modeling effort. Every model you build
+should be designed to discriminate between hypotheses, not just fit data.
+
+### PHASE 2: RESEARCH
 Spawn **multiple literature-researcher subagents in parallel** to cover
 different aspects simultaneously. For example:
 - Researcher 1: "Find papers on [specific model type] for [domain]. Extract
@@ -212,6 +241,18 @@ This step is NOT optional. It catches pipeline bugs early and builds
 confidence that subsequent novel results are real.
 
 ### PHASE 4: MODEL BUILDING
+**Every model must be designed to test hypotheses**, not just fit data.
+Before writing code, re-read {run_dir}/hypotheses.md and decide:
+- Which hypotheses does this model test?
+- What coefficient, parameter, or comparison would support vs refute each?
+- What would a null result look like?
+- Could the model design hide a real effect? (e.g., collinearity, wrong
+  functional form, aggregation bias)
+
+Design models that discriminate between hypotheses. If H1 says "coverage
+drives emergence" and H2 says "immunity gap drives emergence", build
+models that can tell them apart -- not just one that includes both.
+
 Follow this checklist in order:
 
 ```
@@ -280,6 +321,13 @@ Write {run_dir}/results.md with:
 - **Success Criteria Scorecard**: read {run_dir}/plan.md, find the Success
   Criteria section, and report each criterion with PASS/FAIL and the actual
   measured value.
+- **Hypothesis Verdicts**: For EACH hypothesis from {run_dir}/hypotheses.md:
+  - What prediction did it make?
+  - What did the data/model show? (specific numbers)
+  - Verdict: SUPPORTED, REFUTED, INCONCLUSIVE, or NOT TESTED
+  - If INCONCLUSIVE: what additional data or analysis would resolve it?
+  - If the evidence surprised you (contradicted expectations), discuss why
+  This is the scientific core of the results -- not the metrics tables.
 - **What we learned that's new**: explicitly state what this analysis adds
   beyond existing published work. If it only confirms known results with
   less rigor, acknowledge that. Novel findings should be clearly flagged.
@@ -322,6 +370,7 @@ Required sections:
 **1. Introduction and Research Question**
 - What question are we answering and why it matters
 - Brief literature context (what's known, what's the gap)
+- Hypotheses being tested (summary from hypotheses.md)
 
 **2. Data**
 This section is CRITICAL and often missing. For EACH dataset used:
@@ -364,9 +413,14 @@ Every table must have:
 - Column headers with units where applicable
 - A note explaining abbreviations or special values
 
-**7. Discussion**
+**7. Hypothesis Verdicts**
+For each hypothesis: prediction, evidence, verdict (SUPPORTED/REFUTED/
+INCONCLUSIVE). This is the scientific heart of the report.
+
+**8. Discussion**
 - What we learned that's new (beyond confirming known results)
 - How our findings compare to published work (agree/disagree/extend)
+- What hypotheses remain unresolved and what would resolve them
 - Actionable implications for decision-makers
 - Specific, honest limitations (not generic disclaimers)
 
@@ -626,7 +680,22 @@ These are automatic REVISE regardless of overall quality:
 If ANY hard blocker is present, verdict is REVISE. Do not score further until
 hard blockers are resolved.
 
-## STEP 5: COMPARE AGAINST PUBLISHED BENCHMARKS
+## STEP 5: EVALUATE HYPOTHESIS TESTING
+
+Read {run_dir}/hypotheses.md and check:
+- Were hypotheses stated BEFORE the analysis (not post-hoc)?
+- For each hypothesis: was a specific, falsifiable prediction made?
+- Was the model designed to discriminate between competing hypotheses?
+- Are verdicts supported by the evidence (not overclaimed)?
+- For INCONCLUSIVE verdicts: is the reason genuine (insufficient data)
+  or could a better analysis resolve it?
+- Did the analyst avoid confirmation bias? (looking for evidence that
+  would REFUTE their preferred hypothesis, not just support it)
+
+If {run_dir}/hypotheses.md is missing = automatic REVISE. Modeling without
+hypotheses is data dredging, not science.
+
+## STEP 6: COMPARE AGAINST PUBLISHED BENCHMARKS
 
 Read {run_dir}/plan.md and find the **Published Benchmarks** table. For each
 published result:
@@ -639,14 +708,14 @@ published result:
 Also check: did the modeler find any discrepancies with published work that
 could indicate issues in prior studies? This is valuable and should be noted.
 
-## STEP 6: EVALUATE AGAINST SUCCESS CRITERIA
+## STEP 7: EVALUATE AGAINST SUCCESS CRITERIA
 
 Read {run_dir}/plan.md Success Criteria. For each criterion:
 - Mark as PASS, FAIL, or NOT REPORTED with the actual value
 - Hard blockers and minimum bar criteria must all pass for ACCEPT
 - Target and stretch are informational
 
-## STEP 7: SCIENTIFIC QUALITY REVIEW
+## STEP 8: SCIENTIFIC QUALITY REVIEW
 
 Ask yourself these questions as a peer reviewer:
 1. **Reproducibility**: Could someone reproduce these results from the
@@ -663,19 +732,22 @@ Ask yourself these questions as a peer reviewer:
 6. **What's missing**: What analysis would a reviewer request in revision?
    Don't wait for the next round -- request it now.
 
-## STEP 8: SCORING
+## STEP 9: SCORING
 
 Rate each dimension 1-5:
-1. **Scientific Rigor** (1-5): Would this survive peer review? Are methods
+1. **Hypothesis Testing** (1-5): Were hypotheses stated upfront? Were models
+   designed to discriminate between them? Are verdicts supported by evidence?
+   Was falsification attempted (not just confirmation)?
+2. **Scientific Rigor** (1-5): Would this survive peer review? Are methods
    appropriate, assumptions justified, and results correctly interpreted?
-2. **Comparison to Literature** (1-5): Are results compared to published
+3. **Comparison to Literature** (1-5): Are results compared to published
    benchmarks? Are agreements/disagreements explained? Does this add value
    beyond what's already known?
-3. **Validation Quality** (1-5): Proper out-of-sample evaluation? Beats
+4. **Validation Quality** (1-5): Proper out-of-sample evaluation? Beats
    baseline? Calibrated uncertainty? Residual diagnostics interpreted?
-4. **Figures and Presentation** (1-5): Publication quality? Clear, labeled,
-   informative? Do they support the narrative?
-5. **Usefulness** (1-5): Does this answer the research question? Are findings
+5. **Figures and Presentation** (1-5): Publication quality? Numbered captions
+   with interpretations? Proper data section? Tables with headers and units?
+6. **Usefulness** (1-5): Does this answer the research question? Are findings
    actionable? Would a decision-maker trust and use these results?
 
 ## Verdict Rules
@@ -699,6 +771,7 @@ Rate each dimension 1-5:
 (for each figure: filename, what it shows, publication quality? any issues?)
 
 ## Scores
+- Hypothesis Testing: X/5 -- (justification)
 - Scientific Rigor: X/5 -- (justification)
 - Comparison to Literature: X/5 -- (justification)
 - Validation Quality: X/5 -- (justification)
@@ -797,6 +870,7 @@ async def run_session(
             f"Save all your work to the {run_dir_rel}/ directory:\n"
             f"- {run_dir_rel}/progress.md (UPDATE AFTER EACH PHASE)\n"
             f"- {run_dir_rel}/checklist.md (TRACK ALL WORK ITEMS)\n"
+            f"- {run_dir_rel}/hypotheses.md (BEFORE any modeling)\n"
             f"- {run_dir_rel}/plan.md (modeling plan from research-planner)\n"
             f"- {run_dir_rel}/research_notes.md (literature review)\n"
             f"- {run_dir_rel}/eda.py (exploratory data analysis script)\n"
