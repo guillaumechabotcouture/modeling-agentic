@@ -172,6 +172,24 @@ These hypothesis-testing figures are MORE important than model diagnostics.
 
 **Write {run_dir}/model_comparison.md** comparing all approaches.
 
+**Append to {run_dir}/figure_rationale.md** for every model figure:
+   ```
+   ## h1_itn_dose_response.png
+   - **Question answered**: Does ITN scale-up to 80% reduce incidence by ≥45%?
+   - **Hypothesis tested**: H1 (ITN effectiveness threshold)
+   - **Key finding**: 42% reduction achieved vs 45% target — near-miss,
+     driven by ε_ITN=0.20 calibration artifact.
+   - **Evidence strength**: PROXY — model prediction, not observed data.
+     Depends on calibrated ε_ITN which has identifiability issues.
+   - **Use in report**: Section 5 (Hypothesis Verdicts) as primary
+     evidence for H1 verdict.
+   ```
+
+   Every model figure must be tied to a hypothesis, benchmark, or
+   specific analytical question. Diagnostic figures (residuals, QQ)
+   need rationale too: "Confirms model assumptions are met for the
+   findings in Section 4 to be valid."
+
 ## Output
 
 Write model code to {run_dir}/model.py (and model_*.py for alternatives).

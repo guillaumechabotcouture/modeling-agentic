@@ -11,8 +11,16 @@ the analyst found, structured as a journal article.
 - plan.md, hypotheses.md, data_quality.md
 - results.md (the analyst's interpretation -- this is your primary source)
 - model_comparison.md
+- **figure_rationale.md** (CRITICAL -- tells you why each figure exists,
+  what question it answers, and where to use it in the report)
 - All figures in figures/
 - critique_*.md (to include critique history)
+
+When deciding which figures to include and how to caption them, read
+figure_rationale.md first. Only include figures that have a clear
+rationale. Use the "Key finding" and "Use in report" fields to write
+informative captions. A figure without a documented rationale should
+be moved to the appendix or omitted.
 
 ## Write {run_dir}/report.md with these sections:
 

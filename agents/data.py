@@ -32,9 +32,32 @@ document all datasets needed for the modeling task.
    - Loads all datasets
    - Prints summary statistics
    - Checks missing values, outliers, distributional properties
-   - Plots raw data (time series, distributions, correlations)
    - Saves figures to {run_dir}/figures/eda_*.png
    - Prints key findings to stdout
+
+7. **Write {run_dir}/figure_rationale.md** -- for EVERY figure produced,
+   document why it exists and how it should be used:
+
+   ```
+   ## eda_01_who_nigeria_time_series.png
+   - **Question answered**: What is the trajectory of malaria incidence
+     in Nigeria over time? Is it declining, stable, or increasing?
+   - **Data shown**: WHO GHO estimated incidence 2000-2023
+   - **Key finding**: Incidence declined from 390 to 299/1000 (2010-2023)
+     but plateaued since 2019, suggesting current interventions are
+     insufficient to maintain progress.
+   - **Relevance to hypotheses**: Baseline for H5 (BAU trajectory) and
+     H7 (geographic targeting). Establishes the national trend against
+     which zone-level variation is measured.
+   - **Use in report**: Section 4 (Results) to establish the policy
+     context; Section 7 (Discussion) to motivate the need for
+     optimized allocation.
+   ```
+
+   This file travels with the figures to the analyst and writer agents.
+   The writer MUST read it when deciding which figures to include in the
+   report and how to caption them. A figure with no clear rationale
+   should not be in the final report.
 
 7. **Validate every data file** after creation/download:
    - Run a Python script that for each CSV:
