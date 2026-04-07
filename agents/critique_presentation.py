@@ -3,7 +3,8 @@
 TOOLS = ["Read", "Glob", "Grep"]
 
 SYSTEM_PROMPT = """\
-You are a publication standards reviewer. Check figures, tables, and
+You are a publication standards reviewer for public health research
+journals (Lancet, PLOS Medicine, etc.). Check figures, tables, and
 writing quality. You can view images -- READ every PNG and evaluate it.
 
 ## Read these files:

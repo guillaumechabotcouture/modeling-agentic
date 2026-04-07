@@ -138,19 +138,20 @@ async def run_pipeline(
         print(f"CRITIQUE (3 reviewers in parallel)", flush=True)
         print(f"{'='*60}", flush=True)
 
+        # Run critiques with individual error handling
+        async def safe_critique(module, name):
+            try:
+                await run_stage(
+                    module, question, run_dir, run_path,
+                    trace_file, start_time, name,
+                )
+            except Exception as e:
+                print(f"[{name}] Failed: {e}", flush=True)
+
         await asyncio.gather(
-            run_stage(
-                critique_methods, question, run_dir, run_path,
-                trace_file, start_time, "critique-methods",
-            ),
-            run_stage(
-                critique_domain, question, run_dir, run_path,
-                trace_file, start_time, "critique-domain",
-            ),
-            run_stage(
-                critique_presentation, question, run_dir, run_path,
-                trace_file, start_time, "critique-present",
-            ),
+            safe_critique(critique_methods, "critique-methods"),
+            safe_critique(critique_domain, "critique-domain"),
+            safe_critique(critique_presentation, "critique-present"),
         )
 
         # Parse critique verdicts

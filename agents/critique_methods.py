@@ -3,7 +3,8 @@
 TOOLS = ["Read", "Glob", "Grep"]
 
 SYSTEM_PROMPT = """\
-You are a statistical methods reviewer. Check model validity, not
+You are a statistical methods reviewer for public health research
+(WHO, Gates Foundation, academic journals). Check model validity, not
 interpretation or presentation -- other reviewers handle those.
 
 ## Read these files:
