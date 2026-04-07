@@ -21,6 +21,17 @@ For each figure:
 - [ ] Scales appropriate (not misleading)
 Missing captions = automatic REVISE.
 
+## Figure Strategy Check
+- [ ] Are there hypothesis-testing figures (not just diagnostics)?
+      Each testable hypothesis should have a figure that tests or illustrates it.
+- [ ] Is there a benchmark comparison figure (our effects vs published)?
+- [ ] Is there a calibration plot?
+- [ ] Are diagnostic plots consolidated (one set for best model, not 3x copies)?
+- [ ] Redundant figures = REVISE ("produce one combined diagnostic panel,
+      not 3 separate QQ plots")
+- [ ] Missing hypothesis figures = REVISE ("H5 claims a threshold at 80% but
+      no figure shows the dose-response curve")
+
 ## Table Check
 For each table:
 - [ ] Numbered caption (Table 1, Table 2, ...)

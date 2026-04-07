@@ -60,7 +60,30 @@ SINGLE response to try different approaches concurrently:
 - Train/test split (temporal for time series)
 - Out-of-sample RMSE, MAE, skill score vs baseline
 - Prediction intervals
-- Figures: model_fit.png, pred_vs_obs.png, residuals_*.png, residuals_qq.png
+
+## FIGURE STRATEGY (READ THIS CAREFULLY)
+
+Do NOT produce 3 copies of every diagnostic for 3 models. That's clutter.
+Instead, produce two types of figures:
+
+**1. Diagnostics (ONE set for the BEST model only):**
+- model_fit.png: predicted vs observed time series
+- pred_vs_obs.png: scatter with 1:1 line
+- residuals_combined.png: 4-panel (residuals vs time, histogram, ACF, QQ)
+- pi_coverage.png: prediction intervals on test data
+
+**2. Hypothesis-testing figures (these are the important ones):**
+Design figures that directly test or illustrate each hypothesis:
+- H: "switch increased risk" → pre/post comparison figure with effect size
+- H: "coverage is protective" → dose-response curve with threshold marked
+- H: "threshold at 80%" → spline fit showing the non-linearity
+- H: "geographic variation" → choropleth map or country risk ranking
+- benchmark_comparison.png: forest plot comparing our effect sizes
+  side-by-side with published values (Grassly, Voorman, etc.)
+- calibration.png: predicted probabilities vs observed frequencies
+
+Read {run_dir}/hypotheses.md and design one figure per testable hypothesis.
+These hypothesis-testing figures are MORE important than model diagnostics.
 
 **Write {run_dir}/model_comparison.md** comparing all approaches.
 
