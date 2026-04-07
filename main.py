@@ -7,7 +7,7 @@ import os
 import re
 from datetime import datetime
 
-from agents import run_agent, parse_critique_target, STAGES, stage_index
+from agents import run_agent, run_critique_with_fallback, parse_critique_target, STAGES, stage_index
 from agents import planner, data, modeler, analyst
 from agents import critique_methods, critique_domain, critique_presentation
 from agents import writer
@@ -164,20 +164,27 @@ async def run_pipeline(
         print(f"CRITIQUE (3 reviewers in parallel)", flush=True)
         print(f"{'='*60}", flush=True)
 
-        # Run critiques with individual error handling
-        async def safe_critique(module, name):
-            try:
-                await run_stage(
-                    module, question, run_dir, run_path,
-                    trace_file, start_time, name,
-                )
-            except Exception as e:
-                print(f"[{name}] Failed: {e}", flush=True)
+        # Run critiques with cascading fallback (Claude → GPT)
+        run_dir_rel = f"runs/{run_dir}"
+
+        async def run_critique(module, stage_name, output_file):
+            sys_prompt = module.SYSTEM_PROMPT.replace("{run_dir}", run_dir_rel)
+            prompt = module.make_prompt(question, run_dir_rel)
+            await run_critique_with_fallback(
+                system_prompt=sys_prompt,
+                prompt=prompt,
+                tools=module.TOOLS,
+                run_path=run_path,
+                stage_name=stage_name,
+                trace_file=trace_file,
+                output_filename=output_file,
+                start_time=start_time,
+            )
 
         await asyncio.gather(
-            safe_critique(critique_methods, "critique-methods"),
-            safe_critique(critique_domain, "critique-domain"),
-            safe_critique(critique_presentation, "critique-present"),
+            run_critique(critique_methods, "crit-methods", "critique_methods.md"),
+            run_critique(critique_domain, "crit-domain", "critique_domain.md"),
+            run_critique(critique_presentation, "crit-present", "critique_presentation.md"),
         )
 
         # Parse critique verdicts

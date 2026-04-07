@@ -1,4 +1,5 @@
 claude-agent-sdk
+openai
 numpy
 scipy
 pandas
