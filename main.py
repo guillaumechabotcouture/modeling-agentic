@@ -314,15 +314,68 @@ takes the same time as testing 1, and gives much better results.
 - Maximum {max_rounds} critique rounds
 
 ### PHASE 7: FINAL REPORT
-Write {run_dir}/report.md combining:
-- Research question and modeling plan
-- Literature context
-- Data sources and quality
-- Model description with equations
-- Validation results with figures (reference PNGs in {run_dir}/figures/)
-- Questions the model can answer with example answers and uncertainty
-- Limitations and future improvements
+Write {run_dir}/report.md as a publication-quality document. This should
+read like a journal article, not a log of what you did.
+
+Required sections:
+
+**1. Introduction and Research Question**
+- What question are we answering and why it matters
+- Brief literature context (what's known, what's the gap)
+
+**2. Data**
+This section is CRITICAL and often missing. For EACH dataset used:
+- Source name and authority (e.g., "WHO/UNICEF WUENIC")
+- What variables it contains and what we used
+- Temporal and geographic coverage (exact years, number of countries)
+- Sample size (rows, unique countries, unique years)
+- **Data quality assessment**: What's good about this data? What are its
+  limitations? Are there coverage gaps, reporting changes, missing values?
+  How were missing values handled?
+- A summary table of all datasets with coverage and quality notes
+
+**3. Methods**
+- Model specification with equations
+- Variable definitions and transformations
+- Train/test split rationale
+- Baseline model description
+- Evaluation metrics and why they were chosen
+
+**4. Results**
+- Model comparison table with all metrics
+- Key parameter estimates with confidence intervals
+- Published benchmarks comparison table
+
+**5. Figures**
+EVERY figure must have:
+- A numbered caption (Figure 1, Figure 2, ...)
+- A descriptive title explaining what the figure shows
+- An interpretation sentence: what should the reader take away?
+- Example: "Figure 3: Predicted vs observed cVDPV2 cases on the held-out
+  test set (2021-2023). Points cluster along the 1:1 line for low-count
+  countries but the model underpredicts extreme outbreaks (>200 cases)."
+
+Do NOT just say "see figure X" -- describe what the figure shows and
+what it means in the text.
+
+**6. Tables**
+Every table must have:
+- A numbered caption (Table 1, Table 2, ...)
+- Column headers with units where applicable
+- A note explaining abbreviations or special values
+
+**7. Discussion**
+- What we learned that's new (beyond confirming known results)
+- How our findings compare to published work (agree/disagree/extend)
+- Actionable implications for decision-makers
+- Specific, honest limitations (not generic disclaimers)
+
+**8. Questions the Model Can Answer**
+- 3-5 concrete questions with computed answers including uncertainty
+
+**9. Appendix**
 - Critique history and responses
+- Technical details (convergence, sensitivity analysis)
 """
 
 
@@ -485,12 +538,26 @@ Use Glob to find all PNGs in {run_dir}/figures/. Then use Read to view EACH
 figure file. You can see images -- examine every figure carefully.
 
 For each figure, evaluate:
+- Does it have a numbered caption (Figure 1, Figure 2, ...) in the report?
+- Does the caption explain what the figure shows AND what to take away?
 - Are axes labeled with units?
 - Are legends present and readable?
 - Does the visual match what the text claims?
 - Are scales appropriate (not misleading)?
 - Is the figure publication quality or just a quick plot?
-- Would this figure be clear to someone reading a paper?
+- Figures without proper captions in the report = automatic REVISE
+
+For each table, evaluate:
+- Does it have a numbered caption (Table 1, Table 2, ...)?
+- Are column headers clear with units where applicable?
+- Are abbreviations explained?
+- Tables without captions or with unlabeled columns = automatic REVISE
+
+Check for a dedicated **Data** section in the report that describes:
+- Each dataset used (source, coverage, variables, quality)
+- What's good and what's limited about each
+- How missing data was handled
+- If this section is missing or just a bullet list of URLs = automatic REVISE
 
 ## STEP 3: ENFORCE VALIDATION CHECKLIST
 
