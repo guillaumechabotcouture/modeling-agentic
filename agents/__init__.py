@@ -330,13 +330,27 @@ def parse_critique_target(run_path: str) -> str:
         with open(path) as f:
             content = f.read()
 
-        # Look for verdict
-        verdict_match = re.search(r"##\s*Verdict:\s*(PASS|REVISE|ACCEPT)", content, re.IGNORECASE)
-        if not verdict_match or verdict_match.group(1).upper() == "PASS":
+        # Look for verdict -- handle **bold**, whitespace, and multiline
+        verdict_match = re.search(
+            r"##\s*Verdict[:\s]*\*{0,2}\s*(PASS|REVISE|ACCEPT)\s*\*{0,2}",
+            content, re.IGNORECASE
+        )
+        if not verdict_match:
+            # Fallback: search anywhere for REVISE/ACCEPT as standalone word
+            if re.search(r"\bREVISE\b", content[:500]):
+                verdict = "REVISE"
+            else:
+                continue
+        else:
+            verdict = verdict_match.group(1).upper()
+
+        if verdict == "PASS" or verdict == "ACCEPT":
             continue
 
-        # Look for target stage
-        target_match = re.search(r"##\s*Target:\s*(\w+)", content, re.IGNORECASE)
+        # Look for target stage -- handle **bold** and various formats
+        target_match = re.search(r"##?\s*Target[:\s]*\*{0,2}\s*(\w+)", content, re.IGNORECASE)
+        if not target_match:
+            target_match = re.search(r"Target\s*(?:Stage|stage)?[:\s]+\*{0,2}(\w+)", content, re.IGNORECASE)
         if target_match:
             target = target_match.group(1).lower()
             # Map common names
