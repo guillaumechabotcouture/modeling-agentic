@@ -42,7 +42,7 @@ def _check_figure_size(path: str, stage_name: str) -> None:
 
 
 # Stage ordering for the pipeline state machine
-STAGES = ["plan", "data", "model", "analyze", "critique", "write"]
+STAGES = ["plan", "data", "model", "analyze", "critique", "strategist", "write"]
 
 
 def stage_index(name: str) -> int:

@@ -13,7 +13,7 @@ load_dotenv()
 from agents import run_agent, run_critique_with_fallback, parse_critique_target, STAGES, stage_index
 from agents import planner, data, modeler, analyst
 from agents import critique_methods, critique_domain, critique_presentation
-from agents import writer
+from agents import strategist, writer
 
 
 def detect_resume_stage(run_path: str) -> str:
@@ -43,6 +43,47 @@ def detect_resume_stage(run_path: str) -> str:
     if not has("report.md"):
         return "write"
     return "complete"
+
+
+def _parse_strategy_decision(run_path: str) -> str:
+    """Read strategy_decision.md and return the target stage or 'accept'."""
+    import re
+    path = os.path.join(run_path, "strategy_decision.md")
+    if not os.path.exists(path):
+        # Fallback to critique parsing if strategist didn't write
+        return parse_critique_target(run_path)
+
+    with open(path) as f:
+        content = f.read()
+
+    # Look for Strategy Decision line
+    decision_match = re.search(
+        r"Strategy\s*Decision[:\s]*\*{0,2}\s*(PATCH|RETHINK|REDIRECT|ACCEPT|DECLARE.SCOPE)\s*\*{0,2}",
+        content, re.IGNORECASE
+    )
+
+    if not decision_match:
+        # Fallback
+        return parse_critique_target(run_path)
+
+    decision = decision_match.group(1).upper().replace("_", " ").strip()
+
+    if decision in ("ACCEPT", "DECLARE SCOPE", "DECLARE_SCOPE"):
+        return "accept"
+
+    # For PATCH, RETHINK, REDIRECT: find the target stage
+    target_match = re.search(
+        r"Target\s*Stage[:\s]*\*{0,2}\s*(\w+)",
+        content, re.IGNORECASE
+    )
+    if target_match:
+        target = target_match.group(1).lower()
+        target = {"model": "model", "data": "data", "plan": "plan",
+                   "write": "write", "analyze": "analyze",
+                   "modeler": "model", "planner": "plan"}.get(target, "model")
+        return target
+
+    return "model"  # default
 
 
 def slugify(text: str, max_len: int = 40) -> str:
@@ -215,8 +256,20 @@ async def run_pipeline(
         except Exception:
             pass  # Don't let git issues block the pipeline
 
-        # Parse critique verdicts
-        target = parse_critique_target(run_path)
+        # Strategist: principled decision about what to do next
+        print(f"\n{'='*60}", flush=True)
+        print(f"STRATEGIST", flush=True)
+        print(f"{'='*60}", flush=True)
+
+        _time.sleep(2)
+        await run_stage(
+            strategist, question, run_dir, run_path,
+            trace_file, start_time, "strategist",
+        )
+        _time.sleep(2)
+
+        # Read strategist decision
+        target = _parse_strategy_decision(run_path)
 
         trace_file.write(json.dumps({
             "ts": datetime.now().isoformat(),
