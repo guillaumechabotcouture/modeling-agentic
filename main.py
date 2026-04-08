@@ -365,7 +365,18 @@ async def run(question: str, max_rounds: int, max_sessions: int) -> None:
             if session_num >= max_sessions:
                 print("Max sessions reached.", flush=True)
                 break
-            print("Restarting pipeline...", flush=True)
+
+            # Exponential backoff: 30s, 60s, 120s, 240s...
+            backoff = min(30 * (2 ** (session_num - 1)), 300)
+            if "529" in error_str or "overload" in error_str.lower():
+                backoff = min(60 * (2 ** (session_num - 1)), 600)
+                print(f"API overloaded. Waiting {backoff}s before retry...", flush=True)
+            else:
+                print(f"Waiting {backoff}s before retry...", flush=True)
+
+            import time as _backoff_time
+            _backoff_time.sleep(backoff)
+            print(f"Restarting pipeline (session {session_num + 1})...", flush=True)
 
     # Save metadata
     elapsed = (datetime.now() - run_start).total_seconds()
@@ -475,11 +486,20 @@ async def run_existing(question, run_dir, run_path, max_rounds, max_sessions):
             error_str = str(e)
             print(f"\nSession error: {error_str}", flush=True)
             trace_file.close()
-            if "Usage Policy" in error_str:
+            if "Usage Policy" in error_str or "violate" in error_str:
                 print("Policy block. Try rephrasing.", flush=True)
                 break
             if session_num >= max_sessions:
                 break
+
+            backoff = min(30 * (2 ** (session_num - 1)), 300)
+            if "529" in error_str or "overload" in error_str.lower():
+                backoff = min(60 * (2 ** (session_num - 1)), 600)
+                print(f"API overloaded. Waiting {backoff}s before retry...", flush=True)
+            else:
+                print(f"Waiting {backoff}s before retry...", flush=True)
+            import time as _backoff_time
+            _backoff_time.sleep(backoff)
 
     elapsed = (datetime.now() - run_start).total_seconds()
     print(f"\nResume complete: {elapsed:.0f}s ({elapsed/60:.1f} min)", flush=True)
