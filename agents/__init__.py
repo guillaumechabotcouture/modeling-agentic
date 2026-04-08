@@ -152,6 +152,9 @@ async def run_agent(
     }) + "\n")
     trace_file.flush()
 
+    # Clean up orphaned Claude processes before each stage
+    cleanup_orphaned_claude_processes()
+
     print(f"\n--- {stage_name.upper()} ---", flush=True)
 
     # Retry up to 2 times on CLI errors
