@@ -199,6 +199,22 @@ async def run_pipeline(
             run_critique(critique_presentation, "crit-present", "critique_presentation.md"),
         )
 
+        # Git commit the run state after each critique round
+        try:
+            import subprocess
+            subprocess.run(
+                ["git", "add", "-A", run_path],
+                capture_output=True, cwd=os.getcwd()
+            )
+            subprocess.run(
+                ["git", "commit", "-m",
+                 f"Run {run_dir}: round {round_num} complete"],
+                capture_output=True, cwd=os.getcwd()
+            )
+            print(f"[git] Committed round {round_num} state", flush=True)
+        except Exception:
+            pass  # Don't let git issues block the pipeline
+
         # Parse critique verdicts
         target = parse_critique_target(run_path)
 

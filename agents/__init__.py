@@ -347,17 +347,39 @@ def parse_critique_target(run_path: str) -> str:
         if verdict == "PASS" or verdict == "ACCEPT":
             continue
 
-        # Look for target stage -- handle **bold** and various formats
-        target_match = re.search(r"##?\s*Target[:\s]*\*{0,2}\s*(\w+)", content, re.IGNORECASE)
+        # Look for Primary Target first
+        target_match = re.search(
+            r"Primary\s*Target[:\s]*\*{0,2}\s*(\w+)",
+            content, re.IGNORECASE
+        )
+        # Fallback: look for ## Target
         if not target_match:
-            target_match = re.search(r"Target\s*(?:Stage|stage)?[:\s]+\*{0,2}(\w+)", content, re.IGNORECASE)
+            target_match = re.search(
+                r"##?\s*Target[:\s]*\*{0,2}\s*(\w+)",
+                content, re.IGNORECASE
+            )
+        # Fallback: look for "Target Stage:"
+        if not target_match:
+            target_match = re.search(
+                r"Target\s*(?:Stage|stage)?[:\s]+\*{0,2}(\w+)",
+                content, re.IGNORECASE
+            )
+        # Fallback: check which stage-feedback sections have content
+        if not target_match:
+            stage_map = {"plan": "plan", "data": "data", "model": "model",
+                         "analyze": "analyze", "write": "write"}
+            for section_name, stage in stage_map.items():
+                pattern = rf"Feedback for {section_name.upper()} stage.*?\n(- \[.\].*)"
+                if re.search(pattern, content, re.IGNORECASE | re.DOTALL):
+                    target_match = type('Match', (), {'group': lambda s, i: stage})()
+                    break
+
         if target_match:
             target = target_match.group(1).lower()
-            # Map common names
             target = {"model": "model", "data": "data", "plan": "plan",
                        "hypotheses": "plan", "planner": "plan",
                        "modeler": "model", "analyse": "analyze",
-                       "analyze": "analyze"}.get(target, "model")
+                       "analyze": "analyze", "write": "write"}.get(target, "model")
         else:
             target = "model"  # default: back to modeler
 

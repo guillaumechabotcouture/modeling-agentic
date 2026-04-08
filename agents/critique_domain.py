@@ -54,22 +54,45 @@ Read {run_dir}/modeling_strategy.md (if it exists):
   built something more complex anyway → REVISE (unnecessary complexity
   wastes compute and reduces interpretability)
 
-## You can request work at ANY stage:
-- **NEW_HYPOTHESES**: "Results suggest H8 (nOPV2 impact) not in original set"
-- **NEW_DATA**: "Can't distinguish H1 from H2 without subnational data"
-- **NEW_MODEL**: "Regression can't test immunity waning -- need ODE model"
+## CRITICAL: Target the RIGHT stage, not just MODEL
+
+When you identify an issue, ask: which agent is best positioned to fix it?
+
+| Issue type | Target stage | Example |
+|---|---|---|
+| Missing data, wrong data, data quality | **DATA** | "Need age-stratified PfPR (U5 vs all-age) to identify R0 and waning separately" |
+| Wrong hypotheses, missing hypotheses | **PLAN** | "H8 (nOPV2 impact) should be added; re-run planner to update plan" |
+| Model code bugs, wrong specification | **MODEL** | "H3 figure has calculation error in additive baseline" |
+| Misinterpretation, overclaiming | **ANALYZE** | "H2 verdict is overclaimed; R²=0.89 is calibration artifact" |
+| Missing figures, bad captions | **MODEL** or **ANALYZE** | Depends on who produces the output |
+
+Do NOT default to MODEL for everything. If the fundamental problem is that
+the data doesn't exist to answer the question, sending it back to MODEL
+just makes the modeler work around the gap instead of fixing it.
 
 ## Write {run_dir}/critique_domain.md
 
-## Verdict: PASS or REVISE
-## Target: PLAN / DATA / MODEL / ANALYZE (specify which stage)
-## Reason: [why this stage needs revisiting]
+Structure your feedback by target stage:
 
-## Checklist Items
-### Must Fix:
+## Verdict: PASS or REVISE
+
+## Feedback for PLAN stage:
+(hypotheses to add/modify, benchmarks to update)
 - [ ] [specific item]
-### New Work Requested:
-- [ ] [new hypothesis / data / model to pursue]
+
+## Feedback for DATA stage:
+(datasets to find, quality issues to resolve, validation data needed)
+- [ ] [specific item]
+
+## Feedback for MODEL stage:
+(code fixes, specification changes, sensitivity analyses)
+- [ ] [specific item]
+
+## Feedback for ANALYZE stage:
+(interpretation corrections, overclaiming, missing comparisons)
+- [ ] [specific item]
+
+## Primary Target: [the stage with the most critical blockers]
 """
 
 

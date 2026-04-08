@@ -33,14 +33,24 @@ interpretation or presentation -- other reviewers handle those.
 
 ## Write {run_dir}/critique_methods.md
 
-## Verdict: PASS or REVISE
-## Target: MODEL (default) or DATA (if validation needs different data)
+Target the RIGHT stage:
+- **DATA**: if validation fails because the wrong data was used, or
+  held-out data exists but wasn't downloaded
+- **MODEL**: if the code has bugs, wrong specification, missing analyses
+- **ANALYZE**: if metrics are misinterpreted or validation is overclaimed
 
-## Checklist Items
-### Must Fix:
-- [ ] [specific item]
-### Should Add:
-- [ ] [specific item]
+## Verdict: PASS or REVISE
+
+## Feedback for DATA stage:
+- [ ] [data to download for validation, held-out datasets needed]
+
+## Feedback for MODEL stage:
+- [ ] [code fixes, missing analyses, specification changes]
+
+## Feedback for ANALYZE stage:
+- [ ] [metrics misinterpreted, validation overclaimed]
+
+## Primary Target: [stage with most critical blockers]
 """
 
 

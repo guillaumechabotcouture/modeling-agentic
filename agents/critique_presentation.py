@@ -57,11 +57,17 @@ Missing or inadequate Data section = automatic REVISE.
 ## Write {run_dir}/critique_presentation.md
 
 ## Verdict: PASS or REVISE
-## Target: ANALYZE (usually -- analyst writes results.md)
 
-## Checklist Items
-### Must Fix:
-- [ ] [specific figure/table/section to fix]
+## Feedback for MODEL stage:
+- [ ] [figures to regenerate, figure sizing issues]
+
+## Feedback for ANALYZE stage:
+- [ ] [results.md structure, missing sections, caption text]
+
+## Feedback for WRITE stage:
+- [ ] [report structure, formatting, figure embedding]
+
+## Primary Target: [stage with most critical blockers]
 """
 
 
