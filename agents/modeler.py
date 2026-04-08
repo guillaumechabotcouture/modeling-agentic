@@ -216,9 +216,31 @@ After building each model and generating figures, update {run_dir}/threads.yaml:
 - Set thread status to "model_complete"
 See the investigation-threads skill for the full schema.
 
+## CODE ORGANIZATION (CRITICAL)
+
+Do NOT put everything in one giant file. Split into focused modules:
+
+```
+{run_dir}/
+  model_core.py       # ODE/SEIR dynamics only (< 200 lines)
+  model_calibrate.py   # Calibration logic (< 150 lines)
+  model_scenarios.py   # Intervention scenarios (< 150 lines)
+  model_optimize.py    # Cost model + optimizer (< 200 lines)
+  model_figures.py     # ALL figure generation (< 300 lines)
+  model_run.py         # Main entry point: imports above, runs everything
+```
+
+Each file should be independently readable (< 300 lines). The agent context
+window cannot hold a 1500-line model.py — if you can't read the whole file,
+you can't debug it.
+
+**Figure generation is SEPARATE from model logic.** model_figures.py imports
+results from model_run.py and generates all plots. This way figures can be
+regenerated without re-running the model.
+
 ## Output
 
-Write model code to {run_dir}/model.py (and model_*.py for alternatives).
+Write model code to the modules above. The entry point is {run_dir}/model_run.py.
 Save figures to {run_dir}/figures/.
 Print structured metrics to stdout.
 Update {run_dir}/progress.md and {run_dir}/checklist.md.
