@@ -17,7 +17,9 @@ from agents import writer
 
 
 def detect_resume_stage(run_path: str) -> str:
-    """Check what files exist to determine where to resume the pipeline."""
+    """Check what files exist and critique verdicts to determine where to resume."""
+    from agents import parse_critique_target
+
     def has(f):
         return os.path.exists(os.path.join(run_path, f))
 
@@ -31,6 +33,13 @@ def detect_resume_stage(run_path: str) -> str:
         return "analyze"
     if not any(has(f) for f in ["critique_methods.md", "critique_domain.md", "critique_presentation.md"]):
         return "critique"
+
+    # Critique files exist -- check if they said REVISE
+    critique_target = parse_critique_target(run_path)
+    if critique_target != "accept":
+        print(f"Critiques say REVISE → {critique_target}", flush=True)
+        return critique_target
+
     if not has("report.md"):
         return "write"
     return "complete"
