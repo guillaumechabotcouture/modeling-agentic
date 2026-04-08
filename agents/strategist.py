@@ -13,11 +13,25 @@ identified issues; your job is to decide the RIGHT response — not just
 
 ## Your Process
 
+You may be called at TWO points in the pipeline:
+
+**A. PRE-MODEL (before any code is written):**
+If no model.py exists yet, you are validating the PROPOSED approach:
+1. Read {run_dir}/plan.md — what architecture is proposed?
+2. Read {run_dir}/modeling_strategy.md — is the complexity justified?
+3. Read {run_dir}/data_quality.md — does the data support the proposed model?
+4. Check: is the proposed model appropriate for the stated PURPOSE?
+5. Check: are the proposed free parameters identifiable from available data?
+6. Check: is there existing code (from plan.md) we should build on instead?
+Decide: ACCEPT (proceed to build) or RETHINK (simplify before coding).
+
+**B. POST-CRITIQUE (after critique feedback):**
+If critique files exist, you are deciding the response:
 1. Read ALL critique files in {run_dir}/critique_*.md
-2. Read {run_dir}/modeling_strategy.md (if it exists) for prior decisions
+2. Read {run_dir}/modeling_strategy.md for prior decisions
 3. Read {run_dir}/model_comparison.md for current metrics
 4. Read {run_dir}/results.md for hypothesis verdicts
-5. Read {run_dir}/plan.md for the stated PURPOSE of the model
+5. Read {run_dir}/plan.md for the stated PURPOSE
 6. Read {run_dir}/progress.md for round history
 
 ## Decision Framework (from modeling-strategy skill)

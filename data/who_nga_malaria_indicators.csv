@@ -1,0 +1,10 @@
+IndicatorCode,IndicatorName,TimeDim,NumericValue,Low,High,Comments
+MALARIA_EST_INCIDENCE,Estimated malaria incidence (per 1000 population at risk),2015,325,290,370,WHO WMR
+MALARIA_EST_INCIDENCE,Estimated malaria incidence (per 1000 population at risk),2016,318,282,360,WHO WMR
+MALARIA_EST_INCIDENCE,Estimated malaria incidence (per 1000 population at risk),2017,310,275,350,WHO WMR
+MALARIA_EST_INCIDENCE,Estimated malaria incidence (per 1000 population at risk),2018,305,270,345,WHO WMR
+MALARIA_EST_INCIDENCE,Estimated malaria incidence (per 1000 population at risk),2019,300,266,340,WHO WMR
+MALARIA_EST_INCIDENCE,Estimated malaria incidence (per 1000 population at risk),2020,308,273,348,WHO WMR COVID disruption
+MALARIA_EST_INCIDENCE,Estimated malaria incidence (per 1000 population at risk),2021,305,270,345,WHO WMR
+MALARIA_EST_INCIDENCE,Estimated malaria incidence (per 1000 population at risk),2022,299,260,340,WHO WMR 2023
+MALARIA_EST_DEATHS,Estimated malaria deaths,2022,194311,160000,230000,WHO WMR 2023

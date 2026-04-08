@@ -1,0 +1,11 @@
+benchmark_id,description,type,value,unit,lower_ci,upper_ci,source,year,tolerance_pct,match_type
+B01,WHO incidence 2022,incidence,299,per_1000,260,340,WHO WMR 2023,2022,20,MUST MATCH
+B02,National PfPR 2018 microscopy,pfpr,23.0,pct,20.0,26.0,NMIS 2018,2018,3,MUST MATCH
+B03,National PfPR 2010 microscopy,pfpr,42.0,pct,38.0,46.0,NMIS 2010,2010,5,MUST MATCH
+B04,SS zone PfPR 2010 highest,pfpr,55.0,pct,50.0,60.0,NMIS 2010,2010,5,MUST MATCH
+B05,SW zone PfPR 2010 lowest,pfpr,30.0,pct,26.0,34.0,NMIS 2010,2010,5,MUST MATCH
+B06,National PfPR 2021 RDT-adj,pfpr,26.6,pct,23.0,30.0,NMIS 2021,2021,5,SHOULD MATCH
+B07,PfPR 2015 national,pfpr,27.0,pct,24.0,30.0,NMIS 2015,2015,4,SHOULD MATCH
+B08,NC zone 2018 lowest,pfpr,18.0,pct,14.0,22.0,NMIS 2018,2018,5,SHOULD MATCH
+B09,Malaria deaths annual est,deaths,194311,absolute,160000,230000,WHO WMR 2023,2022,25,VALIDATE DIRECTION
+B10,ITN use rate 2021 national,coverage,45.0,pct,40.0,50.0,NMIS 2021,2021,10,VALIDATE DIRECTION

@@ -1,0 +1,16 @@
+zone,year,pfpr_pct,method,source,notes
+North West,2010,45.0,microscopy,NMIS 2010,Zone-level survey
+North East,2010,42.0,microscopy,NMIS 2010,Zone-level survey
+North Central,2010,50.0,microscopy,NMIS 2010,Zone-level survey
+South West,2010,30.0,microscopy,NMIS 2010,Zone-level survey
+South South,2010,55.0,microscopy,NMIS 2010,Zone-level survey
+South East,2010,45.0,microscopy,NMIS 2010,Zone-level survey
+National,2015,27.0,microscopy,NMIS 2015,National only
+North West,2018,35.0,microscopy,NMIS 2018,Zone-level survey
+North East,2018,32.0,microscopy,NMIS 2018,Zone-level survey
+North Central,2018,18.0,microscopy,NMIS 2018,Zone-level survey
+South West,2018,16.0,microscopy,NMIS 2018,Zone-level survey
+South South,2018,28.0,microscopy,NMIS 2018,Zone-level survey
+South East,2018,27.0,microscopy,NMIS 2018,Zone-level survey
+National,2018,23.0,microscopy,NMIS 2018,National validation holdout
+National,2021,26.6,RDT-adjusted,NMIS 2021,37% RDT * 0.72 conversion

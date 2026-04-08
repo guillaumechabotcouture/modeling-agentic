@@ -198,6 +198,26 @@ async def run_pipeline(
             _time.sleep(2)
 
         if stage_index(stage) <= stage_index("model"):
+            # Pre-MODEL strategist checkpoint: validate approach before coding
+            print(f"\n--- PRE-MODEL STRATEGY CHECK ---", flush=True)
+            _time.sleep(2)
+            await run_stage(
+                strategist, question, run_dir, run_path,
+                trace_file, start_time, "pre-strategy",
+            )
+            _time.sleep(2)
+
+            # Check if strategist says RETHINK before any code is written
+            pre_target = _parse_strategy_decision(run_path)
+            if pre_target == "accept":
+                # Strategist approved the approach, proceed to MODEL
+                pass
+            elif pre_target in ("data", "plan"):
+                # Strategist wants to go back upstream
+                print(f"Pre-model strategist: REDIRECT → {pre_target}", flush=True)
+                stage = pre_target
+                continue
+
             await run_stage(
                 modeler, question, run_dir, run_path,
                 trace_file, start_time, "model",
