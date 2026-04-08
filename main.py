@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from agents import run_agent, run_critique_with_fallback, parse_critique_target, STAGES, stage_index
+from agents import run_agent, run_critique_with_fallback, parse_critique_target, STAGES, stage_index, cleanup_orphaned_claude_processes
 from agents import planner, data, modeler, analyst
 from agents import critique_methods, critique_domain, critique_presentation
 from agents import strategist, writer
@@ -375,6 +375,7 @@ async def run(question: str, max_rounds: int, max_sessions: int) -> None:
                 print(f"Waiting {backoff}s before retry...", flush=True)
 
             import time as _backoff_time
+            cleanup_orphaned_claude_processes()
             _backoff_time.sleep(backoff)
             print(f"Restarting pipeline (session {session_num + 1})...", flush=True)
 

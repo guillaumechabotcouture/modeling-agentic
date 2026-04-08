@@ -14,6 +14,26 @@ from claude_agent_sdk import (
 
 MAX_FIGURE_PIXELS = 10_000_000  # 10MP -- anything larger is likely a bug
 
+
+def cleanup_orphaned_claude_processes():
+    """Kill orphaned claude CLI processes from crashed agent sessions.
+    These accumulate at 400-600MB each and cause OOM SIGKILL crashes."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "claude.*stream-json"],
+            capture_output=True, text=True
+        )
+        pids = result.stdout.strip().split('\n')
+        pids = [p for p in pids if p]
+        if len(pids) > 2:  # Keep max 2 (current session), kill the rest
+            orphans = pids[2:]
+            for pid in orphans:
+                subprocess.run(["kill", "-9", pid], capture_output=True)
+            print(f"[cleanup] Killed {len(orphans)} orphaned claude processes", flush=True)
+    except Exception:
+        pass
+
 def _check_figure_size(path: str, stage_name: str) -> None:
     """Warn and resize oversized PNG files."""
     import os
