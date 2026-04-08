@@ -1,0 +1,27 @@
+run_dir: prototype_runs/20260408_1258
+question: What is the relationship between vaccination coverage and measles outbreaks
+  in sub-Saharan Africa?
+created: '2026-04-08T12:58:33.643033'
+threads:
+- id: T1_literature
+  question: 'What does the literature say about: What is the relationship between
+    vaccination coverage and measles outbreaks in s?'
+  type: research
+  status: planned
+  branch: thread/T1_literature
+  worktree: null
+  data_required: []
+  outputs: []
+  verdict: null
+- id: T2_data_model
+  question: 'Can we build a simple model for: What is the relationship between vaccination
+    coverage and measles outbreaks in s?'
+  type: modeling
+  status: planned
+  depends_on:
+  - T1_literature
+  branch: thread/T2_data_model
+  worktree: null
+  data_required: []
+  outputs: []
+  verdict: null
