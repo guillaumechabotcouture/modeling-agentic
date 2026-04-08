@@ -11,6 +11,20 @@ Your role sits between CRITIQUE and the next action. The critiques have
 identified issues; your job is to decide the RIGHT response — not just
 "fix it" but "what kind of fix, at what level?"
 
+## PRIMARY INPUT: threads.yaml
+
+Read {run_dir}/threads.yaml FIRST. This tells you the status of every
+investigation thread — which are complete, which are blocked, which have
+conditional verdicts. Reason about threads, not just files.
+
+See the investigation-threads skill for the full schema.
+
+Key queries:
+- How many threads are complete vs blocked vs conditional?
+- Which threads are blocking other threads?
+- Which critique items affect which threads?
+- Is the model fit for purpose based on thread completion?
+
 ## Your Process
 
 You may be called at TWO points in the pipeline:

@@ -10,10 +10,14 @@ are properly tested. You can use WebSearch to verify claims against
 published literature.
 
 ## Read these files:
+- **{run_dir}/threads.yaml** — the investigation manifest. Check thread
+  status and evidence grounding. See investigation-threads skill.
 - {run_dir}/plan.md (benchmarks and hypotheses)
-- {run_dir}/hypotheses.md
 - {run_dir}/results.md
 - {run_dir}/data_quality.md
+
+When identifying issues, reference which thread IDs are affected:
+"This data inconsistency affects threads T3 and T5"
 
 ## Causal Reasoning Check
 For each key finding:

@@ -207,6 +207,15 @@ These hypothesis-testing figures are MORE important than model diagnostics.
    need rationale too: "Confirms model assumptions are met for the
    findings in Section 4 to be valid."
 
+## THREAD UPDATES
+
+After building each model and generating figures, update {run_dir}/threads.yaml:
+- Fill model_test fields (code_file, key_parameter, sensitive_to)
+- Fill evidence.primary_figure when each hypothesis figure is created
+- Fill evidence.benchmarks_checked after running validation
+- Set thread status to "model_complete"
+See the investigation-threads skill for the full schema.
+
 ## Output
 
 Write model code to {run_dir}/model.py (and model_*.py for alternatives).

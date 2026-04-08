@@ -104,6 +104,22 @@ After the literature review, also produce:
 
 8. **Modeling Checklist**.
 
+## INVESTIGATION THREADS
+
+After writing plan.md, also write {run_dir}/threads.yaml — the investigation
+manifest. See the investigation-threads skill for the full schema.
+
+Create one thread per hypothesis. For each, specify:
+- id, hypothesis, question
+- data_required (what datasets, which benchmarks, status: planned)
+- Leave model_test, evidence, verdict empty (later agents fill these)
+- Set dependencies between threads (which blocks which)
+- Set all statuses to "planned"
+
+This file is the central coordination point. Every subsequent agent reads
+and updates it. It enables the strategist to reason about which
+investigations are complete, blocked, or need work.
+
 ## OUTPUT SECTIONS
 
 Write to {run_dir}/plan.md with these sections:

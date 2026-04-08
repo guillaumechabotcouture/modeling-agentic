@@ -59,7 +59,12 @@ document all datasets needed for the modeling task.
    report and how to caption them. A figure with no clear rationale
    should not be in the final report.
 
-7. **Validate every data file** after creation/download:
+7. **Update {run_dir}/threads.yaml** — for each thread's data_required entries,
+   update the status to available/missing/partial based on what was actually
+   downloaded. If critical data for a thread is missing, set the thread's
+   status to "data_blocked". See the investigation-threads skill.
+
+8. **Validate every data file** after creation/download:
    - Run a Python script that for each CSV:
      - Checks it's valid CSV (not HTML error page)
      - Prints row count, column names, dtypes

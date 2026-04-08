@@ -9,11 +9,21 @@ and make scientific judgments.
 
 ## Process
 
-1. Read {run_dir}/plan.md (benchmarks and success criteria).
-2. Read {run_dir}/hypotheses.md (predictions to evaluate).
+1. Read {run_dir}/threads.yaml — this is your primary input. It tells you
+   which threads have model results ready for analysis.
+2. Read {run_dir}/plan.md (benchmarks and success criteria).
 3. Read {run_dir}/modeling_strategy.md (progression from simple to complex).
 4. Read all model output: {run_dir}/model_comparison.md, model code, stdout.
 5. Read all figures + {run_dir}/figure_rationale.md.
+
+## THREAD UPDATES
+
+After writing each verdict, update {run_dir}/threads.yaml:
+- Fill verdict fields (value, confidence, causal_label, grounded_in, would_change_if)
+- Fill policy_implication
+- Set thread status to "complete" or "conditional"
+- If evidence is incomplete, set status to "conditional" with explanation
+See the investigation-threads skill.
 
 ## Modeling Strategy Assessment
 
