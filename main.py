@@ -304,13 +304,96 @@ def main():
     parser = argparse.ArgumentParser(
         description="Build a mathematical model for a research question"
     )
-    parser.add_argument("question", help="The research question to model")
+    parser.add_argument("question", nargs="?", help="The research question to model")
     parser.add_argument("--max-rounds", type=int, default=5,
                         help="Max critique-revision rounds (default: 5)")
     parser.add_argument("--max-sessions", type=int, default=10,
                         help="Max sessions for context recovery (default: 10)")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Resume an existing run directory (e.g., runs/2026-04-07_1523_...)")
     args = parser.parse_args()
-    asyncio.run(run(args.question, args.max_rounds, args.max_sessions))
+
+    if args.resume:
+        # Resume an existing run
+        run_path = args.resume if os.path.isabs(args.resume) else os.path.join(os.getcwd(), args.resume)
+        if not os.path.isdir(run_path):
+            print(f"Error: {run_path} not found")
+            return
+
+        # Read question from metadata
+        meta_path = os.path.join(run_path, "metadata.json")
+        if os.path.exists(meta_path):
+            with open(meta_path) as f:
+                meta = json.load(f)
+            question = meta.get("question", "")
+        else:
+            question = args.question or ""
+
+        if not question:
+            print("Error: no question found in metadata and none provided")
+            return
+
+        run_dir = os.path.basename(run_path)
+        asyncio.run(run_existing(question, run_dir, run_path,
+                                 args.max_rounds, args.max_sessions))
+    else:
+        if not args.question:
+            print("Error: question is required (or use --resume)")
+            return
+        asyncio.run(run(args.question, args.max_rounds, args.max_sessions))
+
+
+async def run_existing(question, run_dir, run_path, max_rounds, max_sessions):
+    """Resume an existing run from its current state."""
+    print(f"Resuming: {run_dir}/", flush=True)
+    print(f"Question: {question}", flush=True)
+
+    stage = detect_resume_stage(run_path)
+    print(f"Detected stage: {stage}", flush=True)
+
+    if stage == "complete":
+        print("Run already complete.", flush=True)
+        return
+
+    run_start = datetime.now()
+    trace_path = os.path.join(run_path, "trace.jsonl")
+
+    for session_num in range(1, max_sessions + 1):
+        print(f"\n{'#'*60}", flush=True)
+        print(f"RESUME SESSION {session_num}/{max_sessions}", flush=True)
+        print(f"{'#'*60}", flush=True)
+
+        trace_file = open(trace_path, "a")
+        trace_file.write(json.dumps({
+            "ts": datetime.now().isoformat(),
+            "type": "resume_session",
+            "session": session_num,
+            "stage": stage,
+        }) + "\n")
+
+        try:
+            await run_pipeline(
+                question, run_dir, run_path, max_rounds,
+                trace_file, run_start,
+            )
+            trace_file.close()
+            break
+        except KeyboardInterrupt:
+            print("\nInterrupted.", flush=True)
+            trace_file.close()
+            break
+        except Exception as e:
+            error_str = str(e)
+            print(f"\nSession error: {error_str}", flush=True)
+            trace_file.close()
+            if "Usage Policy" in error_str:
+                print("Policy block. Try rephrasing.", flush=True)
+                break
+            if session_num >= max_sessions:
+                break
+
+    elapsed = (datetime.now() - run_start).total_seconds()
+    print(f"\nResume complete: {elapsed:.0f}s ({elapsed/60:.1f} min)", flush=True)
 
 
 if __name__ == "__main__":
