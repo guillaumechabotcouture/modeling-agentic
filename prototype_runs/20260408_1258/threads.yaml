@@ -7,9 +7,9 @@ threads:
   question: 'What does the literature say about: What is the relationship between
     vaccination coverage and measles outbreaks in s?'
   type: research
-  status: planned
+  status: complete
   branch: thread/T1_literature
-  worktree: null
+  worktree: /tmp/modeling-worktree-T1_literature
   data_required: []
   outputs: []
   verdict: null
