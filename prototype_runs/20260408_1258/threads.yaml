@@ -17,11 +17,11 @@ threads:
   question: 'Can we build a simple model for: What is the relationship between vaccination
     coverage and measles outbreaks in s?'
   type: modeling
-  status: planned
+  status: complete
   depends_on:
   - T1_literature
   branch: thread/T2_data_model
-  worktree: null
+  worktree: /tmp/modeling-worktree-T2_data_model
   data_required: []
   outputs: []
   verdict: null
