@@ -100,11 +100,15 @@ def log_message(message, trace_file):
         print(f"  [{status_marker} {message.status}] {message.summary[:120]}", flush=True)
         usage = None
         if message.usage:
-            usage = {
-                "total_tokens": message.usage.total_tokens,
-                "tool_uses": message.usage.tool_uses,
-                "duration_ms": message.usage.duration_ms,
-            }
+            u = message.usage
+            if isinstance(u, dict):
+                usage = u
+            else:
+                usage = {
+                    "total_tokens": u.total_tokens,
+                    "tool_uses": u.tool_uses,
+                    "duration_ms": u.duration_ms,
+                }
         trace_file.write(json.dumps({
             "ts": datetime.now().isoformat(),
             "type": "task_notification",
