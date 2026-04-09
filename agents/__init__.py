@@ -137,7 +137,7 @@ def build_agents() -> dict[str, AgentDefinition]:
             description=writer.DESCRIPTION,
             prompt=writer.SYSTEM_PROMPT,
             tools=writer.TOOLS,
-            model="sonnet",
+            model="opus",  # needs to synthesize the most complex output
             maxTurns=60,
             skills=["investigation-threads"],
         ),
