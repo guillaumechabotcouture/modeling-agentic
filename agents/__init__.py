@@ -21,7 +21,7 @@ def cleanup_orphaned_claude_processes():
     import subprocess
     try:
         result = subprocess.run(
-            ["pgrep", "-f", "claude.*stream-json"],
+            ["pgrep", "-f", "claude_agent_sdk/_bundled/claude"],
             capture_output=True, text=True
         )
         pids = result.stdout.strip().split('\n')
