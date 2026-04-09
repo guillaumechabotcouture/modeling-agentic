@@ -43,7 +43,7 @@ intervention effect sizes, and disease burden numbers. For each one:
    is from THAT subgroup, not the overall estimate.
 5. For budget/funding figures: WebSearch "[funder] [country] [disease]
    grant [year]" and verify the amount is disease-specific. If the
-   source is a combined HIV/TB/malaria grant, flag this immediately.
+   source is a combined multi-disease grant, flag this immediately.
 6. Cross-check arithmetic: does (country share %) × (global total) =
    the national figure used in the report?
 
@@ -63,7 +63,8 @@ For each key finding:
 - If PROXY: is the true mechanism named? Is the proxy justified?
 - Are confounders identified?
 - Red flag: predictor interpreted as direct cause when it's a proxy
-  (e.g., "Pol3 reduces type 2 emergence" when Pol3 is bOPV with no type 2)
+  (e.g., a coverage metric attributed causal effect when it's a proxy
+  for a different underlying mechanism)
 
 ## Hypothesis Testing Check
 - Were hypotheses stated before analysis (not post-hoc)?
@@ -101,7 +102,7 @@ When you identify an issue, ask: which agent is best positioned to fix it?
 
 | Issue type | Target stage | Example |
 |---|---|---|
-| Missing data, wrong data, data quality | **DATA** | "Need age-stratified PfPR (U5 vs all-age) to identify R0 and waning separately" |
+| Missing data, wrong data, data quality | **DATA** | "Need age-stratified prevalence to identify transmission and waning parameters separately" |
 | Wrong hypotheses, missing hypotheses | **PLAN** | "H8 (nOPV2 impact) should be added; re-run planner to update plan" |
 | Model code bugs, wrong specification | **MODEL** | "H3 figure has calculation error in additive baseline" |
 | Misinterpretation, overclaiming | **ANALYZE** | "H2 verdict is overclaimed; R²=0.89 is calibration artifact" |

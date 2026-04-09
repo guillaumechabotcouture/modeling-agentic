@@ -44,19 +44,13 @@ document all datasets needed for the modeling task.
    document why it exists and how it should be used:
 
    ```
-   ## eda_01_who_nigeria_time_series.png
-   - **Question answered**: What is the trajectory of malaria incidence
-     in Nigeria over time? Is it declining, stable, or increasing?
-   - **Data shown**: WHO GHO estimated incidence 2000-2023
-   - **Key finding**: Incidence declined from 390 to 299/1000 (2010-2023)
-     but plateaued since 2019, suggesting current interventions are
-     insufficient to maintain progress.
-   - **Relevance to hypotheses**: Baseline for H5 (BAU trajectory) and
-     H7 (geographic targeting). Establishes the national trend against
-     which zone-level variation is measured.
-   - **Use in report**: Section 4 (Results) to establish the policy
-     context; Section 7 (Discussion) to motivate the need for
-     optimized allocation.
+   ## eda_01_incidence_time_series.png
+   - **Question answered**: What is the trajectory of disease incidence
+     over time? Is it declining, stable, or increasing?
+   - **Data shown**: [Source] estimated incidence [time period]
+   - **Key finding**: [Describe the trend and its implications]
+   - **Relevance to hypotheses**: [Which hypotheses does this inform?]
+   - **Use in report**: [Which report section(s) should include this?]
    ```
 
    This file travels with the figures to the analyst and writer agents.
@@ -95,27 +89,27 @@ document all datasets needed for the modeling task.
 
    Format:
    ```
-   ## who_nga_incidence.csv
-   - **Source**: WHO GHO API endpoint https://ghoapi.azureedge.net/api/...
-   - **Downloaded**: 2026-04-07T10:47:00
-   - **Command**: `curl -sL "https://..." -o data/who_nga_incidence.csv`
-   - **MD5**: a1b2c3d4e5f6...
-   - **Rows**: 25 (years 2000-2024)
-   - **Transformations**: filtered to Nigeria (NGA), selected columns year + value
+   ## [dataset_name].csv
+   - **Source**: [API endpoint or organization] [exact URL]
+   - **Downloaded**: [ISO timestamp]
+   - **Command**: `curl -sL "https://..." -o data/[filename].csv`
+   - **MD5**: [hash]
+   - **Rows**: [count] ([description of coverage])
+   - **Transformations**: [any filtering, renaming, merging]
    - **Spot checks**:
-     - 2023 incidence = 299/1000 → matches WHO WMR 2024 country profile
-     - 2010 incidence = 353/1000 → matches WHO GHO web interface
+     - [value 1] → matches [independent source]
+     - [value 2] → matches [independent source]
    ```
 
    For compiled parameter tables:
    ```
-   ## intervention_effectiveness_meta.csv
+   ## [parameter_table_name].csv
    - **Source**: Compiled from literature (not a single download)
-   - **Row 1**: ITN OR=0.44 (0.41-0.48) → Farnert 2018, Table 2, page 5
-   - **Row 2**: IRS OR=0.35 (0.27-0.44) → Chanda-Kapata 2022, Table 3
+   - **Row 1**: [parameter] = [value (CI)] → [Author Year], Table [N], page [N]
+   - **Row 2**: [parameter] = [value (CI)] → [Author Year], Table [N]
    - **Spot checks**:
-     - ITN OR=0.44 → verified against PMC5877091 abstract: "OR 0.44 (0.41-0.48)" ✓
-     - IRS OR=0.35 → verified against PMC9308352 abstract: "OR 0.35 (0.27-0.44)" ✓
+     - [value 1] → verified against [PMCID] abstract: "[exact quote]" ✓
+     - [value 2] → verified against [PMCID] abstract: "[exact quote]" ✓
    ```
 
 9. **Distinguish raw data from compiled parameters:**

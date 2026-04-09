@@ -74,7 +74,7 @@ structured citation data, not just keyword matches.
 Search for existing implementations:
 - "github [author last name] [disease] model" for key paper authors
 - Check if the papers link to code repositories
-- Search for the specific framework (EMOD, OpenMalaria, LASER) + this disease
+- Search for the specific framework or package used in key papers + this disease
 - If code exists: note URL, language, license, and what it covers
 
 ### Phase 5: Methodological Blueprint
@@ -98,10 +98,10 @@ For EVERY number in plan.md (effect sizes, prevalence values, costs,
 budget figures, case counts, population statistics), write one entry:
 
 ```
-## [C1] ITN protective efficacy (all coverage levels)
-- **Value**: OR = 0.44 (95% CI: 0.41-0.48)
+## [C1] [Parameter or statistic name]
+- **Value**: [point estimate] ([95% CI])
 - **Source**: [First Author] et al. [Year], [Journal full name]
-- **DOI/PMCID**: [exact identifier, e.g., PMC5877091]
+- **DOI/PMCID**: [exact identifier, e.g., PMC1234567]
 - **Location**: Table [N], page [N]. Subgroup: [name if applicable, or "overall"]
 - **URL verified**: [URL you actually fetched via WebFetch]
 - **Verbatim quote**: "[copy-paste the exact sentence from the paper containing this number]"

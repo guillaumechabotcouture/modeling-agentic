@@ -34,7 +34,7 @@ Read {run_dir}/citations.md (if it exists). For each key model parameter
 2. Read the model code and check: does the parameter VALUE in the code
    match the cited value in citations.md exactly?
 3. If the model applies a parameter at a specific condition (e.g.,
-   "IRS effect at ≥80% coverage"), does the citation reference THAT
+   "intervention effect at ≥80% coverage"), does the citation reference THAT
    specific subgroup? Or is the overall estimate being misapplied to
    a conditional context?
 4. Is an incidence rate ratio being used as a general relative risk?
@@ -46,8 +46,8 @@ Flag as **HIGH-severity hard blocker**:
 - Parameter in code doesn't match cited value
 - Overall estimate used where subgroup-specific estimate was claimed
 - Effect size applied more broadly than its source supports
-  (e.g., "RR=0.61 for MDA" when this is from a specific subgroup
-  at 1-3 months in higher-transmission areas only)
+  (e.g., an RR from a specific subgroup at a specific time window
+  being applied as a general effect across all settings)
 
 ## Validation Checklist
 - [ ] Temporal train/test split (never random for time series)

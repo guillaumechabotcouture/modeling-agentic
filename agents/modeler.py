@@ -21,10 +21,9 @@ MODEL_TESTER_PROMPT = (
     "You are a model implementation specialist for public health research. "
     "Implement the specific model you're asked to build, fit it to the data, "
     "evaluate with proper train/test splits, and save results. Use established "
-    "packages. For disease transmission models (malaria, polio, etc.), "
-    "use the LASER framework (laser-generic). See the "
-    "laser-spatial-disease-modeling skill for API reference and common pitfalls. "
-    "Write concise code."
+    "packages. For spatial disease transmission models, consider the LASER "
+    "framework (laser-generic). See the laser-spatial-disease-modeling skill "
+    "for API reference and common pitfalls. Write concise code."
 )
 MODEL_TESTER_TOOLS = ["Bash", "Write", "Read", "Edit", "Glob"]
 MODEL_TESTER_SKILLS = ["laser-spatial-disease-modeling", "epi-model-parametrization"]
@@ -75,20 +74,24 @@ Follow its instructions.
 | Fitting ODE models to data | `lmfit` + `solve_ivp` |
 | Bayesian mechanistic | `PyMC` + `pytensor` |
 
-**For disease transmission models (malaria, polio, etc.), use LASER:**
+**For spatial disease transmission models, consider LASER:**
 LASER (Light Agent Spatial modeling for ERadication) provides agent-based
 SEIR with gravity-model spatial coupling, seasonal forcing, vaccination
-campaigns, and calibration. It is the preferred framework for spatial epi
-models. `pip install laser-generic`. See the laser-spatial-disease-modeling
-skill for API reference, verification checks, and common pitfalls.
+campaigns, and calibration. `pip install laser-generic`. See the
+laser-spatial-disease-modeling skill for API reference and common pitfalls.
 
-Do NOT hand-code ODE transmission models when LASER exists. LASER handles:
+LASER is appropriate when the model needs:
 - Per-patch SEIR dynamics with agent-level state tracking
 - Gravity-model spatial coupling between patches
 - Seasonal forcing via ValuesMap
 - Routine immunization and campaign vaccination
 - Birth/death vital dynamics
 - Calibration via calabaria framework
+
+For simpler models (deterministic ODE, equilibrium solutions, or models
+without spatial coupling), standard scipy/lmfit may be more appropriate.
+Choose the framework that fits the model complexity, not the most complex
+framework available.
 
 ## MODEL EXECUTION MONITORING
 
@@ -192,13 +195,12 @@ These hypothesis-testing figures are MORE important than model diagnostics.
 
 **Append to {run_dir}/figure_rationale.md** for every model figure:
    ```
-   ## h1_itn_dose_response.png
-   - **Question answered**: Does ITN scale-up to 80% reduce incidence by ≥45%?
-   - **Hypothesis tested**: H1 (ITN effectiveness threshold)
-   - **Key finding**: 42% reduction achieved vs 45% target — near-miss,
-     driven by ε_ITN=0.20 calibration artifact.
-   - **Evidence strength**: PROXY — model prediction, not observed data.
-     Depends on calibrated ε_ITN which has identifiability issues.
+   ## h1_intervention_dose_response.png
+   - **Question answered**: Does intervention X at Y% coverage reduce
+     the outcome by the hypothesized threshold?
+   - **Hypothesis tested**: H1 ([hypothesis name])
+   - **Key finding**: [What the figure shows, with specific numbers]
+   - **Evidence strength**: [CAUSAL/ASSOCIATIONAL/PROXY — and why]
    - **Use in report**: Section 5 (Hypothesis Verdicts) as primary
      evidence for H1 verdict.
    ```
