@@ -124,7 +124,7 @@ def build_agents() -> dict[str, AgentDefinition]:
             tools=critique_domain.TOOLS,
             model="opus",
             maxTurns=40,  # increased: now does citation verification with WebSearch+WebFetch
-            skills=["investigation-threads"],
+            skills=["investigation-threads", "model-fitness"],
         ),
         "critique-presentation": AgentDefinition(
             description=critique_presentation.DESCRIPTION,
@@ -223,28 +223,25 @@ Wait for all three to complete.
 Read all three critique files yourself. Then, BEFORE triaging individual
 items, do a fit-for-purpose assessment:
 
-#### FIT-FOR-PURPOSE GATE (do this first)
-Re-read the original research question. Then answer these questions
-by reading plan.md, modeling_strategy.md, and results.md:
+#### FIT-FOR-PURPOSE GATE (do this first — see model-fitness skill)
 
-1. WHO IS THE AUDIENCE? (e.g., Global Fund reviewers, WHO policy team,
-   academic journal). What standards do they expect?
-2. WHAT DECISIONS will be made from this model? List them specifically.
-3. For EACH decision: does the model structure capture the mechanisms
-   that differentiate the options? For example:
-   - If comparing age-targeted interventions → does it have age structure?
-   - If computing cost per DALY → does it have a mortality module?
-   - If comparing geographic targeting → does it have sufficient spatial
-     resolution?
-   - If the audience expects comparison to an established model → can
-     this model reproduce that model's key finding?
-4. Would the intended audience accept this model's structure, or would
-   they immediately flag a missing feature as disqualifying?
+Use the model-fitness skill's evaluation checklist. Re-read the original
+research question, then assess:
 
-If the answer to #3 or #4 reveals a structural gap: this is RETHINK,
-regardless of what the individual critique items say. Do not let
-individually-patchable items distract from a structural mismatch
-between the model and its purpose.
+1. WHO IS THE AUDIENCE and what do they require? (The skill has specific
+   requirements for Global Fund, WHO, journals, and internal use.)
+2. WHAT DECISIONS will be made? List the intervention comparisons.
+3. For EACH comparison: does the model capture the MECHANISM that
+   differentiates the options? (The skill calls this the "mechanism test.")
+4. Does the model answer the SAME question that was asked, or a SIMPLER
+   one? (The skill calls this the "simpler question test.")
+5. Would the audience ENGAGE with the results or REJECT the structure?
+   (The skill calls this the "audience rejection test.")
+
+If #3, #4, or #5 reveals a structural gap: this is RETHINK and the
+model needs Level escalation — regardless of what individual critique
+items say. Do not let individually-patchable items distract from a
+structural mismatch.
 
 Write your fit-for-purpose assessment in {run_dir}/progress.md before
 proceeding to the decision framework below.
