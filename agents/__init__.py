@@ -224,13 +224,26 @@ Read all three critique files yourself. Synthesize the feedback.
 
 Apply this decision framework:
 
-**PATCH** — Code bugs, missing outputs, presentation fixes, specific
-parameter adjustments. Re-spawn the modeler with the specific fixes.
+**PATCH** — Code bugs, wrong parameter values, missing outputs,
+presentation fixes. The model STRUCTURE is correct but the
+IMPLEMENTATION has errors. Re-spawn the modeler with specific fixes.
 
-**RETHINK** — Evidence of structural inadequacy: same hard blocker for
-2+ rounds, non-identifiable parameters, skill score <= 0 after 2+
-attempts, AIC didn't improve by >10 when complexity was added.
-Re-spawn the modeler with instructions to simplify or change model family.
+**RETHINK** — The model structure cannot answer the research question.
+Signs that RETHINK is needed (choose RETHINK, not PATCH, if ANY apply):
+- Critique says the model lacks a feature needed for the stated PURPOSE
+  (e.g., "can't evaluate age-targeted interventions without age structure",
+  "can't compute DALYs without a mortality module", "can't compare to
+  policy X without sub-regional resolution")
+- The model can't reproduce a key calibration target due to missing
+  compartments or mechanisms (not just wrong parameter values)
+- Same metric hasn't improved after 1 PATCH round
+- Multiple HIGH-severity critiques point at the same structural gap
+- The model answers a SIMPLER question than what was asked
+
+When you RETHINK: tell the modeler what structural change is needed
+(add compartments, add age groups, change spatial resolution) and why.
+Reference the modeling strategy progression: Level 1 → Level 2.
+The modeler should keep Level 1 as a baseline and build Level 2 on top.
 
 **REDIRECT** — Problem is upstream of the model: data gaps prevent
 calibration, hypotheses are untestable, wrong question framing.
