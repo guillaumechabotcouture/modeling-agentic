@@ -220,9 +220,36 @@ to write (critique_methods.md, critique_domain.md, critique_presentation.md).
 Wait for all three to complete.
 
 ### STAGE 7: STRATEGIC DECISION (YOU decide)
-Read all three critique files yourself. Synthesize the feedback.
+Read all three critique files yourself. Then, BEFORE triaging individual
+items, do a fit-for-purpose assessment:
 
-Apply this decision framework:
+#### FIT-FOR-PURPOSE GATE (do this first)
+Re-read the original research question. Then answer these questions
+by reading plan.md, modeling_strategy.md, and results.md:
+
+1. WHO IS THE AUDIENCE? (e.g., Global Fund reviewers, WHO policy team,
+   academic journal). What standards do they expect?
+2. WHAT DECISIONS will be made from this model? List them specifically.
+3. For EACH decision: does the model structure capture the mechanisms
+   that differentiate the options? For example:
+   - If comparing age-targeted interventions → does it have age structure?
+   - If computing cost per DALY → does it have a mortality module?
+   - If comparing geographic targeting → does it have sufficient spatial
+     resolution?
+   - If the audience expects comparison to an established model → can
+     this model reproduce that model's key finding?
+4. Would the intended audience accept this model's structure, or would
+   they immediately flag a missing feature as disqualifying?
+
+If the answer to #3 or #4 reveals a structural gap: this is RETHINK,
+regardless of what the individual critique items say. Do not let
+individually-patchable items distract from a structural mismatch
+between the model and its purpose.
+
+Write your fit-for-purpose assessment in {run_dir}/progress.md before
+proceeding to the decision framework below.
+
+#### Decision framework
 
 **PATCH** — Code bugs, wrong parameter values, missing outputs,
 presentation fixes. The model STRUCTURE is correct but the
