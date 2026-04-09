@@ -87,6 +87,43 @@ From the literature, construct a specific blueprint:
 This blueprint should be detailed enough that the modeler can follow it
 without re-reading all the papers.
 
+## CITATION INDEX (CRITICAL FOR DOWNSTREAM VERIFICATION)
+
+After the literature review, write {run_dir}/citations.md — a structured
+index of EVERY quantitative claim used in plan.md. This file is read by
+the critique agents to verify facts. Without it, critiques cannot check
+your work.
+
+For EVERY number in plan.md (effect sizes, prevalence values, costs,
+budget figures, case counts, population statistics), write one entry:
+
+```
+## [C1] ITN protective efficacy (all coverage levels)
+- **Value**: OR = 0.44 (95% CI: 0.41-0.48)
+- **Source**: [First Author] et al. [Year], [Journal full name]
+- **DOI/PMCID**: [exact identifier, e.g., PMC5877091]
+- **Location**: Table [N], page [N]. Subgroup: [name if applicable, or "overall"]
+- **URL verified**: [URL you actually fetched via WebFetch]
+- **Verbatim quote**: "[copy-paste the exact sentence from the paper containing this number]"
+```
+
+Rules:
+- Every row in the Published Benchmarks Table must reference a citation ID
+- Every intervention effect size must have a citation ID
+- Budget and funding figures MUST cite the PRIMARY source (e.g., the
+  Global Fund grant signing page or data explorer, NOT a news article
+  or summary). If a grant covers multiple diseases, state the
+  disease-specific amount — do not attribute a combined total to one disease.
+- If a value comes from a SUBGROUP analysis, name the exact subgroup
+  (e.g., "≥80% coverage", "children 3-59 months", "P. falciparum only")
+- The "Verbatim quote" field must be copied directly from the paper.
+  This prevents paraphrasing errors and author name confabulation.
+- The "URL verified" field must be a URL you actually visited with
+  WebFetch during your review — not a guessed URL.
+- Number each citation sequentially: C1, C2, C3, ...
+- Cross-reference: in plan.md, write [C1] next to each number so the
+  critique agents can trace every claim back to its source.
+
 ## REMAINING PLAN COMPONENTS
 
 After the literature review, also produce:
@@ -126,14 +163,14 @@ This file is the central coordination point. Every subsequent agent reads
 and updates it. It enables the strategist to reason about which
 investigations are complete, blocked, or need work.
 
-## OUTPUT SECTIONS
+## OUTPUT FILES
 
-Write to {run_dir}/plan.md with these sections:
+**{run_dir}/plan.md** with these sections:
 - Problem Classification
 - Literature Review (detailed table with 10+ papers)
 - Methodological Blueprint (specific recommendations from literature)
 - Existing Code and Implementations
-- Published Benchmarks Table (15+ quantitative targets)
+- Published Benchmarks Table (15+ quantitative targets, each with [CN] citation ID)
 - Available Data Sources
 - Recommended Python Packages
 - Candidate Models (baseline, standard, advanced)
@@ -141,6 +178,10 @@ Write to {run_dir}/plan.md with these sections:
 - Success Criteria
 - Modeling Checklist
 - Key Risks and Pitfalls
+
+**{run_dir}/citations.md** — citation index (see CITATION INDEX section above).
+
+**{run_dir}/threads.yaml** — investigation manifest.
 """
 
 

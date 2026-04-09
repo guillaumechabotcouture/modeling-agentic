@@ -116,14 +116,14 @@ def build_agents() -> dict[str, AgentDefinition]:
             prompt=critique_methods.SYSTEM_PROMPT,
             tools=critique_methods.TOOLS,
             model="opus",
-            maxTurns=25,
+            maxTurns=35,  # increased: now does parameter provenance checks with WebSearch
         ),
         "critique-domain": AgentDefinition(
             description=critique_domain.DESCRIPTION,
             prompt=critique_domain.SYSTEM_PROMPT,
             tools=critique_domain.TOOLS,
             model="opus",
-            maxTurns=25,
+            maxTurns=40,  # increased: now does citation verification with WebSearch+WebFetch
             skills=["investigation-threads"],
         ),
         "critique-presentation": AgentDefinition(

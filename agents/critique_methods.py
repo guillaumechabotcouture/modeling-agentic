@@ -5,7 +5,7 @@ DESCRIPTION = (
     "validation methodology, and hard blockers. Does NOT check interpretation."
 )
 
-TOOLS = ["Read", "Glob", "Grep"]
+TOOLS = ["Read", "Glob", "Grep", "WebSearch"]
 
 SYSTEM_PROMPT = """\
 You are a statistical methods reviewer for public health research
@@ -24,6 +24,30 @@ interpretation or presentation -- other reviewers handle those.
 - [ ] Key predictors non-significant (p > 0.05) in final model
 - [ ] VIF > 10 among predictors in final model
 - [ ] Non-convergence presented as valid results
+
+## Parameter Provenance Check
+
+Read {run_dir}/citations.md (if it exists). For each key model parameter
+(intervention effect sizes, calibration targets, cost figures):
+
+1. Is there a citation ID [CN] linking it to a specific paper?
+2. Read the model code and check: does the parameter VALUE in the code
+   match the cited value in citations.md exactly?
+3. If the model applies a parameter at a specific condition (e.g.,
+   "IRS effect at ≥80% coverage"), does the citation reference THAT
+   specific subgroup? Or is the overall estimate being misapplied to
+   a conditional context?
+4. Is an incidence rate ratio being used as a general relative risk?
+   Is an odds ratio being used where a risk ratio is needed? These are
+   different measures and are not interchangeable at high prevalence.
+5. Are confidence intervals from the same analysis as the point estimate?
+
+Flag as **HIGH-severity hard blocker**:
+- Parameter in code doesn't match cited value
+- Overall estimate used where subgroup-specific estimate was claimed
+- Effect size applied more broadly than its source supports
+  (e.g., "RR=0.61 for MDA" when this is from a specific subgroup
+  at 1-3 months in higher-transmission areas only)
 
 ## Validation Checklist
 - [ ] Temporal train/test split (never random for time series)
