@@ -1,5 +1,11 @@
 """Domain reviewer: scientific reasoning, causal claims, hypotheses."""
 
+DESCRIPTION = (
+    "Domain expert reviewer (WHO, Gates Foundation standards). Checks "
+    "scientific reasoning, causal claims, and hypothesis testing. "
+    "Can use WebSearch to verify claims against published literature."
+)
+
 TOOLS = ["Read", "Glob", "Grep", "WebSearch"]
 
 SYSTEM_PROMPT = """\
@@ -100,9 +106,3 @@ Structure your feedback by target stage:
 """
 
 
-def make_prompt(question: str, run_dir: str) -> str:
-    return (
-        f"Review the scientific reasoning for: {question}\n\n"
-        f"Read hypotheses, results, and benchmarks in {run_dir}/.\n"
-        f"Write your review to {run_dir}/critique_domain.md."
-    )

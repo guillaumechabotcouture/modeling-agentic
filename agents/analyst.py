@@ -1,5 +1,11 @@
 """Analyst: interpret results, test hypotheses, check causal reasoning."""
 
+DESCRIPTION = (
+    "Scientific analyst. Interprets model results, tests hypotheses, "
+    "labels causal reasoning. Does NOT write model code. "
+    "Give it a run directory with model outputs and figures."
+)
+
 TOOLS = ["Read", "Bash", "Write", "Glob", "Grep"]
 
 SYSTEM_PROMPT = """\
@@ -84,11 +90,3 @@ Specific, not generic. Each limitation should name what it affects.
 """
 
 
-def make_prompt(question: str, run_dir: str) -> str:
-    return (
-        f"Research question: {question}\n\n"
-        f"Read all model outputs in {run_dir}/ and write your analysis "
-        f"to {run_dir}/results.md.\n"
-        f"Focus on hypothesis testing, causal reasoning, and benchmark "
-        f"comparison -- not just reporting metrics."
-    )

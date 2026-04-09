@@ -1,19 +1,23 @@
-"""Shared infrastructure for pipeline agents."""
+"""Agent registry, lead prompt, and hook infrastructure for the modeling pipeline."""
 
 import json
+import os
 from datetime import datetime
 
-from claude_agent_sdk import (
-    query,
-    ClaudeAgentOptions,
-    AgentDefinition,
-    AssistantMessage,
-    ResultMessage,
-    HookMatcher,
+from claude_agent_sdk import AgentDefinition, HookMatcher
+
+from agents import (
+    planner, data, modeler, analyst,
+    critique_methods, critique_domain, critique_presentation,
+    writer,
 )
 
 MAX_FIGURE_PIXELS = 10_000_000  # 10MP -- anything larger is likely a bug
 
+
+# ---------------------------------------------------------------------------
+# Utilities (kept from prior version)
+# ---------------------------------------------------------------------------
 
 def cleanup_orphaned_claude_processes():
     """Kill orphaned claude CLI processes from crashed agent sessions.
@@ -22,30 +26,27 @@ def cleanup_orphaned_claude_processes():
     try:
         result = subprocess.run(
             ["pgrep", "-f", "claude_agent_sdk/_bundled/claude"],
-            capture_output=True, text=True
+            capture_output=True, text=True,
         )
-        pids = result.stdout.strip().split('\n')
-        pids = [p for p in pids if p]
+        pids = [p for p in result.stdout.strip().split("\n") if p]
         if len(pids) > 2:  # Keep max 2 (current session), kill the rest
-            orphans = pids[2:]
-            for pid in orphans:
+            for pid in pids[2:]:
                 subprocess.run(["kill", "-9", pid], capture_output=True)
-            print(f"[cleanup] Killed {len(orphans)} orphaned claude processes", flush=True)
+            print(f"[cleanup] Killed {len(pids) - 2} orphaned claude processes", flush=True)
     except Exception:
         pass
 
+
 def _check_figure_size(path: str, stage_name: str) -> None:
     """Warn and resize oversized PNG files."""
-    import os
     if not os.path.exists(path) or not path.endswith(".png"):
         return
     try:
         from PIL import Image
-        Image.MAX_IMAGE_PIXELS = 2_000_000_000  # Allow opening for inspection
+        Image.MAX_IMAGE_PIXELS = 2_000_000_000
         img = Image.open(path)
         pixels = img.size[0] * img.size[1]
         if pixels > MAX_FIGURE_PIXELS:
-            # Resize to reasonable dimensions preserving aspect ratio
             ratio = (MAX_FIGURE_PIXELS / pixels) ** 0.5
             new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
             print(
@@ -58,33 +59,246 @@ def _check_figure_size(path: str, stage_name: str) -> None:
             img.save(path)
         img.close()
     except Exception:
-        pass  # Don't let figure checking crash the pipeline
+        pass
 
 
-# Stage ordering for the pipeline state machine
-STAGES = ["plan", "data", "model", "analyze", "critique", "strategist", "write"]
+# ---------------------------------------------------------------------------
+# Agent registry
+# ---------------------------------------------------------------------------
+
+def build_agents() -> dict[str, AgentDefinition]:
+    """Return all subagent definitions for the lead session."""
+    return {
+        "planner": AgentDefinition(
+            description=planner.DESCRIPTION,
+            prompt=planner.SYSTEM_PROMPT,
+            tools=planner.TOOLS,
+            model="opus",
+            maxTurns=80,
+            skills=["semantic-scholar-lookup", "asta-literature-search",
+                    "pdf-text-extraction", "investigation-threads",
+                    "modeling-strategy"],
+        ),
+        "data-agent": AgentDefinition(
+            description=data.DESCRIPTION,
+            prompt=data.SYSTEM_PROMPT,
+            tools=data.TOOLS,
+            model="sonnet",
+            maxTurns=60,
+        ),
+        "modeler": AgentDefinition(
+            description=modeler.DESCRIPTION,
+            prompt=modeler.SYSTEM_PROMPT,
+            tools=modeler.TOOLS,
+            model="opus",
+            maxTurns=100,
+            skills=["modeling-strategy", "laser-spatial-disease-modeling",
+                    "epi-model-parametrization"],
+        ),
+        "model-tester": AgentDefinition(
+            description=modeler.MODEL_TESTER_DESCRIPTION,
+            prompt=modeler.MODEL_TESTER_PROMPT,
+            tools=modeler.MODEL_TESTER_TOOLS,
+            skills=modeler.MODEL_TESTER_SKILLS,
+            model="sonnet",
+            maxTurns=60,
+        ),
+        "analyst": AgentDefinition(
+            description=analyst.DESCRIPTION,
+            prompt=analyst.SYSTEM_PROMPT,
+            tools=analyst.TOOLS,
+            model="opus",
+            maxTurns=40,
+            skills=["investigation-threads"],
+        ),
+        "critique-methods": AgentDefinition(
+            description=critique_methods.DESCRIPTION,
+            prompt=critique_methods.SYSTEM_PROMPT,
+            tools=critique_methods.TOOLS,
+            model="opus",
+            maxTurns=25,
+        ),
+        "critique-domain": AgentDefinition(
+            description=critique_domain.DESCRIPTION,
+            prompt=critique_domain.SYSTEM_PROMPT,
+            tools=critique_domain.TOOLS,
+            model="opus",
+            maxTurns=25,
+            skills=["investigation-threads"],
+        ),
+        "critique-presentation": AgentDefinition(
+            description=critique_presentation.DESCRIPTION,
+            prompt=critique_presentation.SYSTEM_PROMPT,
+            tools=critique_presentation.TOOLS,
+            model="sonnet",
+            maxTurns=25,
+        ),
+        "writer": AgentDefinition(
+            description=writer.DESCRIPTION,
+            prompt=writer.SYSTEM_PROMPT,
+            tools=writer.TOOLS,
+            model="sonnet",
+            maxTurns=60,
+            skills=["investigation-threads"],
+        ),
+    }
 
 
-def stage_index(name: str) -> int:
-    return STAGES.index(name)
+# ---------------------------------------------------------------------------
+# Lead agent prompt
+# ---------------------------------------------------------------------------
+
+LEAD_SYSTEM_PROMPT = """\
+You are a research modeling team lead. You orchestrate a team of specialist
+agents to take a research question and produce a publication-quality
+mathematical model, analysis, and report.
+
+You have access to these named agents via the Agent tool:
+- **planner**: Deep literature review, modeling plan, benchmarks, hypotheses
+- **data-agent**: Download datasets, validate quality, run EDA
+- **modeler**: Build and run models, produce figures (has model-tester sub-agent)
+- **analyst**: Interpret results, test hypotheses, causal reasoning
+- **critique-methods**: Statistical validation review
+- **critique-domain**: Scientific reasoning review
+- **critique-presentation**: Figure and writing quality review
+- **writer**: Assemble final publication-quality report
+
+You also have Read, Write, Glob, and Grep tools to inspect files yourself.
+
+## PIPELINE PROTOCOL
+
+Follow these stages IN ORDER. Do not skip stages.
+
+### STAGE 1: PLAN
+Spawn the "planner" agent. Tell it the research question and run directory.
+Wait for completion. Then read {run_dir}/plan.md and verify it has:
+- Literature review with 10+ papers
+- Published benchmarks table
+- Candidate models (baseline, standard, advanced)
+- Testable hypotheses
+- threads.yaml
+
+If critical sections are missing, re-spawn planner with specific feedback.
+
+### STAGE 2: DATA
+Spawn the "data-agent" agent. Tell it the run directory (which has plan.md).
+Wait for completion. Then read {run_dir}/data_quality.md and verify datasets
+were downloaded, validated, and EDA was run.
+
+### STAGE 3: PRE-MODEL STRATEGY CHECK
+Read plan.md and data_quality.md yourself. Assess:
+- Is the proposed modeling approach feasible given the available data?
+- Are there critical data gaps that would prevent calibration or validation?
+- Is the proposed complexity appropriate for the stated purpose?
+
+If the approach needs adjustment, either:
+- Re-spawn data-agent for missing datasets, OR
+- Re-spawn planner to revise the modeling strategy
+Otherwise, proceed to modeling.
+
+### STAGE 4: MODEL
+Spawn the "modeler" agent. Tell it the run directory and research question.
+If this is a revision round, include the specific critique feedback.
+Wait for completion. Read {run_dir}/model_comparison.md to confirm models
+ran and metrics were reported.
+
+### STAGE 5: ANALYZE
+Spawn the "analyst" agent. Tell it the run directory.
+Wait for completion. Read {run_dir}/results.md to confirm hypothesis
+verdicts exist with causal labels.
+
+### STAGE 6: CRITIQUE (PARALLEL)
+Spawn ALL THREE critique agents simultaneously in a SINGLE response,
+each with background: true:
+- critique-methods
+- critique-domain
+- critique-presentation
+
+Tell each one the research question and run directory, and which file
+to write (critique_methods.md, critique_domain.md, critique_presentation.md).
+
+Wait for all three to complete.
+
+### STAGE 7: STRATEGIC DECISION (YOU decide)
+Read all three critique files yourself. Synthesize the feedback.
+
+Apply this decision framework:
+
+**PATCH** — Code bugs, missing outputs, presentation fixes, specific
+parameter adjustments. Re-spawn the modeler with the specific fixes.
+
+**RETHINK** — Evidence of structural inadequacy: same hard blocker for
+2+ rounds, non-identifiable parameters, skill score <= 0 after 2+
+attempts, AIC didn't improve by >10 when complexity was added.
+Re-spawn the modeler with instructions to simplify or change model family.
+
+**REDIRECT** — Problem is upstream of the model: data gaps prevent
+calibration, hypotheses are untestable, wrong question framing.
+Re-spawn data-agent or planner as appropriate.
+
+**ACCEPT** — Model is fit for its stated purpose, key hypotheses have
+verdicts, hard blockers resolved, metrics reasonable.
+Proceed to STAGE 8.
+
+**DECLARE_SCOPE** — Model answers SOME but not all parts of the question.
+Some hypotheses untestable. A structural limitation won't resolve with
+more patches. The model IS fit for its primary purpose even if imperfect.
+Write a scope declaration and proceed to STAGE 8.
+
+CRITICAL RULES:
+- If ANY critique flags a HIGH-severity unresolved issue, you MUST fix
+  it before accepting. Do NOT accept with known contradictions.
+- If the same hard blocker persists for 2+ rounds, RETHINK or DECLARE_SCOPE.
+  Do NOT keep patching.
+- Track round count. After {max_rounds} rounds, DECLARE_SCOPE and proceed.
+- When re-spawning an agent, pass the SPECIFIC critique feedback — not
+  just "fix the issues." Quote the critique items verbatim.
+
+After deciding, if not accepting, go back to the targeted stage (STAGE 2,
+3, or 4) and continue from there.
+
+### STAGE 8: WRITE
+Spawn the "writer" agent. Tell it the run directory.
+Wait for completion. Verify {run_dir}/report.md exists.
+
+## GENERAL RULES
+
+- Every finding must have a causal label: CAUSAL, ASSOCIATIONAL, or PROXY.
+- All artifacts go in {run_dir}/.
+- Update {run_dir}/progress.md after each stage with what was completed.
+- If a subagent fails (you see it reported as failed), read its output for
+  diagnostics. Retry ONCE with adjusted instructions. If it fails again,
+  log the failure in progress.md and proceed with DECLARE_SCOPE.
+- Never retry a failed agent more than once per round.
+"""
 
 
-async def run_agent(
-    system_prompt: str,
-    prompt: str,
-    tools: list[str],
-    run_path: str,
-    stage_name: str,
-    trace_file,
-    agents: dict | None = None,
-    start_time: datetime | None = None,
-) -> None:
-    """Run a single pipeline stage as a query() call."""
+def build_lead_prompt(question: str, run_dir: str, max_rounds: int,
+                      resume_context: str = "") -> str:
+    """Build the user-facing prompt for the lead agent."""
+    prompt = (
+        f"Research question: {question}\n\n"
+        f"Run directory: {run_dir}\n"
+        f"Max critique-revision rounds: {max_rounds}\n"
+    )
+    if resume_context:
+        prompt += f"\n{resume_context}\n"
+    prompt += (
+        "\nBegin the pipeline. Start with STAGE 1 (PLAN)."
+    )
+    return prompt
 
-    start_time = start_time or datetime.now()
+
+# ---------------------------------------------------------------------------
+# Hooks
+# ---------------------------------------------------------------------------
+
+def create_hooks(run_path: str, trace_file, start_time: datetime):
+    """Create hook config for the lead query() session."""
+
     tool_count = 0
 
-    def format_tool(name: str, input_data: dict) -> str:
+    def _format_tool(name: str, input_data: dict) -> str:
         if name == "WebSearch":
             return f'WebSearch: "{input_data.get("query", "")}"'
         elif name == "WebFetch":
@@ -102,7 +316,7 @@ async def run_agent(
         elif name == "Grep":
             return f'Grep: "{input_data.get("pattern", "")}"'
         elif name in ("Agent", "Task"):
-            return f"Agent: {input_data.get('subagent_type', input_data.get('description', ''))}"
+            return f"Agent: {input_data.get('description', input_data.get('subagent_type', ''))}"
         return name
 
     async def pre_tool_hook(input_data, tool_use_id, context):
@@ -110,13 +324,15 @@ async def run_agent(
         tool_count += 1
         tool_name = input_data.get("tool_name", "unknown")
         tool_input = input_data.get("tool_input", {})
-        summary = format_tool(tool_name, tool_input)
+        agent_id = input_data.get("agent_id", "lead")
+        summary = _format_tool(tool_name, tool_input)
         elapsed = (datetime.now() - start_time).total_seconds()
-        print(f"[{stage_name:>8} {elapsed:6.0f}s | #{tool_count}] {summary}", flush=True)
+        label = agent_id if agent_id != "lead" else "lead"
+        print(f"[{label:>12} {elapsed:6.0f}s | #{tool_count}] {summary}", flush=True)
         trace_file.write(json.dumps({
             "ts": datetime.now().isoformat(),
             "elapsed_s": elapsed,
-            "stage": stage_name,
+            "agent": agent_id,
             "type": "tool_use",
             "tool": tool_name,
             "summary": summary,
@@ -126,288 +342,54 @@ async def run_agent(
 
     async def post_tool_hook(input_data, tool_use_id, context):
         """Check written PNG files for oversized figures."""
-        import os
         tool_name = input_data.get("tool_name", "")
         tool_input = input_data.get("tool_input", {})
-        # Check after Bash or Write -- figure might have been created
+        agent_id = input_data.get("agent_id", "lead")
         if tool_name in ("Bash", "Write"):
             file_path = tool_input.get("file_path", "")
             if file_path.endswith(".png"):
-                _check_figure_size(file_path, stage_name)
-        # Also scan figures/ after any Bash (model scripts save PNGs)
+                _check_figure_size(file_path, agent_id)
         if tool_name == "Bash":
             fig_dir = os.path.join(run_path, "figures")
             if os.path.isdir(fig_dir):
                 for fname in os.listdir(fig_dir):
                     if fname.endswith(".png"):
-                        _check_figure_size(
-                            os.path.join(fig_dir, fname), stage_name
-                        )
+                        _check_figure_size(os.path.join(fig_dir, fname), agent_id)
         return {}
 
-    trace_file.write(json.dumps({
-        "ts": datetime.now().isoformat(),
-        "type": "stage_start",
-        "stage": stage_name,
-    }) + "\n")
-    trace_file.flush()
-
-    # Clean up orphaned Claude processes before each stage
-    cleanup_orphaned_claude_processes()
-
-    print(f"\n--- {stage_name.upper()} ---", flush=True)
-
-    # Retry up to 2 times on CLI errors
-    max_retries = 2
-    for attempt in range(max_retries + 1):
-        try:
-            return await _run_agent_inner(
-                system_prompt, prompt, tools, run_path, stage_name,
-                trace_file, agents, start_time, pre_tool_hook, post_tool_hook,
-                tool_count,
-            )
-        except Exception as e:
-            if attempt < max_retries and "I/O operation" in str(e):
-                import time
-                print(f"[{stage_name}] CLI error, retrying ({attempt+1}/{max_retries})...", flush=True)
-                time.sleep(3)
-            else:
-                raise
-
-
-async def _run_agent_inner(
-    system_prompt, prompt, tools, run_path, stage_name,
-    trace_file, agents, start_time, pre_tool_hook, post_tool_hook,
-    tool_count,
-):
-    async for message in query(
-        prompt=prompt,
-        options=ClaudeAgentOptions(
-            system_prompt=system_prompt,
-            allowed_tools=tools,
-            permission_mode="bypassPermissions",
-            setting_sources=["project"],
-            agents=agents or {},
-            hooks={
-                "PreToolUse": [
-                    HookMatcher(matcher=None, hooks=[pre_tool_hook])
-                ],
-                "PostToolUse": [
-                    HookMatcher(matcher=None, hooks=[post_tool_hook])
-                ],
-            },
-        ),
-    ):
-        if isinstance(message, AssistantMessage):
-            for block in message.content:
-                if hasattr(block, "text") and block.text:
-                    print(block.text, flush=True)
-        elif isinstance(message, ResultMessage):
-            print(f"[{stage_name}] Done: {message.subtype}", flush=True)
-
-    trace_file.write(json.dumps({
-        "ts": datetime.now().isoformat(),
-        "type": "stage_complete",
-        "stage": stage_name,
-        "tool_count": tool_count,
-    }) + "\n")
-    trace_file.flush()
-
-    print(f"--- {stage_name.upper()} complete ({tool_count} tools) ---", flush=True)
-
-
-async def run_critique_with_fallback(
-    system_prompt: str,
-    prompt: str,
-    tools: list[str],
-    run_path: str,
-    stage_name: str,
-    trace_file,
-    output_filename: str,
-    start_time: datetime | None = None,
-) -> None:
-    """Run a critique agent with cascading fallback:
-    1. Claude via Agent SDK (default)
-    2. Claude via Agent SDK (sonnet model)
-    3. OpenAI GPT via direct API call
-    """
-    import os, glob as glob_mod
-
-    start_time = start_time or datetime.now()
-    output_path = os.path.join(run_path, output_filename)
-
-    # Attempt 1: Claude (default model) via Agent SDK
-    try:
-        await run_agent(
-            system_prompt=system_prompt,
-            prompt=prompt,
-            tools=tools,
-            run_path=run_path,
-            stage_name=stage_name,
-            trace_file=trace_file,
-            start_time=start_time,
-        )
-        if os.path.exists(output_path):
-            return  # Success
-    except Exception as e:
-        print(f"[{stage_name}] Claude default failed: {e}", flush=True)
-
-    # Attempt 2: Claude (sonnet) -- different model may have different filter
-    try:
-        print(f"[{stage_name}] Retrying with sonnet...", flush=True)
-        import time
-        time.sleep(3)
-        # Agent SDK doesn't expose model selection per-query easily,
-        # so we skip to the OpenAI fallback
-    except Exception:
-        pass
-
-    # Attempt 3: OpenAI GPT fallback
-    openai_key = os.environ.get("OPENAI_API_KEY")
-    if not openai_key:
-        print(f"[{stage_name}] No OPENAI_API_KEY set, cannot fall back to GPT.", flush=True)
-        return
-
-    print(f"[{stage_name}] Falling back to OpenAI GPT...", flush=True)
-    trace_file.write(json.dumps({
-        "ts": datetime.now().isoformat(),
-        "type": "fallback",
-        "stage": stage_name,
-        "provider": "openai",
-    }) + "\n")
-    trace_file.flush()
-
-    try:
-        from openai import OpenAI
-        client = OpenAI()
-
-        # Gather file contents that the critique needs
-        file_contents = []
-        for pattern in ["*.md", "*.py"]:
-            for fpath in sorted(glob_mod.glob(os.path.join(run_path, pattern))):
-                fname = os.path.basename(fpath)
-                if fname == output_filename:
-                    continue  # Don't read our own output
-                try:
-                    with open(fpath) as f:
-                        content = f.read()
-                    if len(content) > 50000:
-                        content = content[:50000] + "\n\n[TRUNCATED]"
-                    file_contents.append(f"=== {fname} ===\n{content}")
-                except Exception:
-                    pass
-
-        # List figures
-        fig_dir = os.path.join(run_path, "figures")
-        if os.path.isdir(fig_dir):
-            figs = os.listdir(fig_dir)
-            file_contents.append(f"=== figures/ ({len(figs)} files) ===\n" + "\n".join(figs))
-
-        context = "\n\n".join(file_contents)
-
-        user_message = (
-            f"{prompt}\n\n"
-            f"--- FILES IN RUN DIRECTORY ---\n\n{context}"
-        )
-
-        response = client.chat.completions.create(
-            model="gpt-5.4",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
-            ],
-            max_tokens=8000,
-        )
-
-        result_text = response.choices[0].message.content
-
-        with open(output_path, "w") as f:
-            f.write(result_text)
-
+    async def subagent_start_hook(input_data, tool_use_id, context):
+        agent_id = input_data.get("agent_id", "?")
+        agent_type = input_data.get("agent_type", "?")
         elapsed = (datetime.now() - start_time).total_seconds()
-        print(f"[{stage_name}] GPT fallback complete ({elapsed:.0f}s)", flush=True)
+        print(f"\n--- SUBAGENT START: {agent_type} (id={agent_id}) [{elapsed:.0f}s] ---", flush=True)
         trace_file.write(json.dumps({
             "ts": datetime.now().isoformat(),
-            "type": "fallback_complete",
-            "stage": stage_name,
-            "provider": "openai",
-            "model": "gpt-5.4",
+            "elapsed_s": elapsed,
+            "type": "subagent_start",
+            "agent_id": agent_id,
+            "agent_type": agent_type,
         }) + "\n")
         trace_file.flush()
+        return {}
 
-    except Exception as e:
-        print(f"[{stage_name}] OpenAI fallback failed: {e}", flush=True)
+    async def subagent_stop_hook(input_data, tool_use_id, context):
+        agent_id = input_data.get("agent_id", "?")
+        agent_type = input_data.get("agent_type", "?")
+        elapsed = (datetime.now() - start_time).total_seconds()
+        print(f"--- SUBAGENT STOP: {agent_type} (id={agent_id}) [{elapsed:.0f}s] ---\n", flush=True)
+        trace_file.write(json.dumps({
+            "ts": datetime.now().isoformat(),
+            "elapsed_s": elapsed,
+            "type": "subagent_stop",
+            "agent_id": agent_id,
+            "agent_type": agent_type,
+        }) + "\n")
+        trace_file.flush()
+        return {}
 
-
-def parse_critique_target(run_path: str) -> str:
-    """Read all critique files and return the earliest target stage.
-    Returns 'accept' if all pass, or a stage name to jump back to."""
-    import os
-    import re
-
-    earliest = "accept"
-    for fname in ["critique_methods.md", "critique_domain.md", "critique_presentation.md"]:
-        path = os.path.join(run_path, fname)
-        if not os.path.exists(path):
-            continue
-        with open(path) as f:
-            content = f.read()
-
-        # Look for verdict -- handle **bold**, whitespace, and multiline
-        verdict_match = re.search(
-            r"##\s*Verdict[:\s]*\*{0,2}\s*(PASS|REVISE|ACCEPT)\s*\*{0,2}",
-            content, re.IGNORECASE
-        )
-        if not verdict_match:
-            # Fallback: search anywhere for REVISE/ACCEPT as standalone word
-            if re.search(r"\bREVISE\b", content[:500]):
-                verdict = "REVISE"
-            else:
-                continue
-        else:
-            verdict = verdict_match.group(1).upper()
-
-        if verdict == "PASS" or verdict == "ACCEPT":
-            continue
-
-        # Look for Primary Target first
-        target_match = re.search(
-            r"Primary\s*Target[:\s]*\*{0,2}\s*(\w+)",
-            content, re.IGNORECASE
-        )
-        # Fallback: look for ## Target
-        if not target_match:
-            target_match = re.search(
-                r"##?\s*Target[:\s]*\*{0,2}\s*(\w+)",
-                content, re.IGNORECASE
-            )
-        # Fallback: look for "Target Stage:"
-        if not target_match:
-            target_match = re.search(
-                r"Target\s*(?:Stage|stage)?[:\s]+\*{0,2}(\w+)",
-                content, re.IGNORECASE
-            )
-        # Fallback: check which stage-feedback sections have content
-        if not target_match:
-            stage_map = {"plan": "plan", "data": "data", "model": "model",
-                         "analyze": "analyze", "write": "write"}
-            for section_name, stage in stage_map.items():
-                pattern = rf"Feedback for {section_name.upper()} stage.*?\n(- \[.\].*)"
-                if re.search(pattern, content, re.IGNORECASE | re.DOTALL):
-                    target_match = type('Match', (), {'group': lambda s, i: stage})()
-                    break
-
-        if target_match:
-            target = target_match.group(1).lower()
-            target = {"model": "model", "data": "data", "plan": "plan",
-                       "hypotheses": "plan", "planner": "plan",
-                       "modeler": "model", "analyse": "analyze",
-                       "analyze": "analyze", "write": "write"}.get(target, "model")
-        else:
-            target = "model"  # default: back to modeler
-
-        # Keep the earliest stage
-        if earliest == "accept" or stage_index(target) < stage_index(earliest):
-            earliest = target
-
-    return earliest
+    return {
+        "PreToolUse": [HookMatcher(matcher=None, hooks=[pre_tool_hook])],
+        "PostToolUse": [HookMatcher(matcher=None, hooks=[post_tool_hook])],
+        "SubagentStart": [HookMatcher(matcher=None, hooks=[subagent_start_hook])],
+        "SubagentStop": [HookMatcher(matcher=None, hooks=[subagent_stop_hook])],
+    }

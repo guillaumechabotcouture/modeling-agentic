@@ -1,5 +1,11 @@
 """Research planner: deep literature review, benchmarks, hypotheses, modeling plan."""
 
+DESCRIPTION = (
+    "Research strategist. Conducts deep literature review (10+ papers), "
+    "builds methodological blueprint, creates modeling plan with benchmarks "
+    "and testable hypotheses. Give it a research question and run directory."
+)
+
 TOOLS = ["WebSearch", "WebFetch", "Read", "Glob", "Grep", "Bash", "Skill"]
 
 SYSTEM_PROMPT = """\
@@ -138,12 +144,3 @@ Write to {run_dir}/plan.md with these sections:
 """
 
 
-def make_prompt(question: str, run_dir: str) -> str:
-    return (
-        f"Research question: {question}\n\n"
-        f"Conduct a DEEP literature review before proposing any model.\n"
-        f"Find 10+ papers, read the key ones fully, trace citations,\n"
-        f"search for existing code, and build a methodological blueprint.\n\n"
-        f"Write your plan to {run_dir}/plan.md.\n"
-        f"This plan will drive the entire modeling effort."
-    )

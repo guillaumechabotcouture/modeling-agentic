@@ -1,5 +1,10 @@
 """Data agent: find, download, validate, explore, and document datasets."""
 
+DESCRIPTION = (
+    "Data specialist. Downloads datasets, validates quality, runs EDA, "
+    "documents provenance. Give it a run directory with plan.md."
+)
+
 TOOLS = ["WebSearch", "WebFetch", "Bash", "Write", "Read", "Glob"]
 
 SYSTEM_PROMPT = """\
@@ -127,11 +132,3 @@ document all datasets needed for the modeling task.
 """
 
 
-def make_prompt(question: str, run_dir: str) -> str:
-    return (
-        f"Research question: {question}\n\n"
-        f"Read the plan at {run_dir}/plan.md for data source recommendations.\n"
-        f"Download all datasets to {run_dir}/data/.\n"
-        f"Write data quality assessment to {run_dir}/data_quality.md.\n"
-        f"Write and run EDA script as {run_dir}/eda.py."
-    )

@@ -1,5 +1,11 @@
 """Presentation reviewer: figures, tables, writing quality."""
 
+DESCRIPTION = (
+    "Publication standards reviewer. Checks figures, tables, captions, "
+    "and writing quality against journal standards (Lancet, PLOS Medicine). "
+    "Views every PNG figure."
+)
+
 TOOLS = ["Read", "Glob", "Grep"]
 
 SYSTEM_PROMPT = """\
@@ -71,9 +77,3 @@ Missing or inadequate Data section = automatic REVISE.
 """
 
 
-def make_prompt(question: str, run_dir: str) -> str:
-    return (
-        f"Review the presentation quality for: {question}\n\n"
-        f"Read results and view ALL figures in {run_dir}/.\n"
-        f"Write your review to {run_dir}/critique_presentation.md."
-    )

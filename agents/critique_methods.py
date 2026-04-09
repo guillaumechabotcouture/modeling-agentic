@@ -1,5 +1,10 @@
 """Methods reviewer: statistical validation and model quality."""
 
+DESCRIPTION = (
+    "Statistical methods reviewer. Checks model validity, convergence, "
+    "validation methodology, and hard blockers. Does NOT check interpretation."
+)
+
 TOOLS = ["Read", "Glob", "Grep"]
 
 SYSTEM_PROMPT = """\
@@ -54,9 +59,3 @@ Target the RIGHT stage:
 """
 
 
-def make_prompt(question: str, run_dir: str) -> str:
-    return (
-        f"Review the statistical methods and validation for: {question}\n\n"
-        f"Read model code and results in {run_dir}/.\n"
-        f"Write your review to {run_dir}/critique_methods.md."
-    )

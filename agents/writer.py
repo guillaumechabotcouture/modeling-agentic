@@ -1,5 +1,11 @@
 """Writer: assemble final publication-quality report."""
 
+DESCRIPTION = (
+    "Scientific writer. Assembles publication-quality report from analysis "
+    "outputs. Does NOT make new scientific claims. "
+    "Give it a run directory with results.md and figures."
+)
+
 TOOLS = ["Read", "Write", "Glob"]
 
 SYSTEM_PROMPT = """\
@@ -78,9 +84,3 @@ For EACH dataset (from data_quality.md):
 """
 
 
-def make_prompt(question: str, run_dir: str) -> str:
-    return (
-        f"Write the final report for: {question}\n\n"
-        f"Read all outputs in {run_dir}/ and assemble into "
-        f"{run_dir}/report.md as a publication-quality document."
-    )

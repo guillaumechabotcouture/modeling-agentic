@@ -1,32 +1,33 @@
 """Modeler: build, run, and validate models. Code-focused, not analysis."""
 
-from claude_agent_sdk import AgentDefinition
+DESCRIPTION = (
+    "Model builder. Writes code, runs models, produces metrics and figures. "
+    "Give it a run directory with plan.md and data. "
+    "Can spawn model-tester subagents for parallel model comparison."
+)
 
 TOOLS = ["Bash", "Write", "Edit", "Read", "Glob", "Grep", "Agent"]
 
-AGENTS = {
-    "model-tester": AgentDefinition(
-        description=(
-            "Model testing specialist. Implement and test a specific model "
-            "approach. Give it a model type, data path, and output location. "
-            "Can run multiple in parallel to compare approaches. "
-            "For disease transmission models, use the LASER framework "
-            "(laser-generic package) -- see the laser-spatial-disease-modeling skill."
-        ),
-        prompt=(
-            "You are a model implementation specialist for public health research. "
-            "Implement the specific model you're asked to build, fit it to the data, "
-            "evaluate with proper train/test splits, and save results. Use established "
-            "packages. For disease transmission models (malaria, polio, etc.), "
-            "use the LASER framework (laser-generic). See the "
-            "laser-spatial-disease-modeling skill for API reference and common pitfalls. "
-            "Write concise code."
-        ),
-        tools=["Bash", "Write", "Read", "Edit", "Glob"],
-        skills=["laser-spatial-disease-modeling", "epi-model-parametrization"],
-        model="sonnet",
-    ),
-}
+# model-tester is declared flat in the lead's agent registry so the
+# modeler can spawn it via the Agent tool.
+MODEL_TESTER_DESCRIPTION = (
+    "Model testing specialist. Implement and test a specific model "
+    "approach. Give it a model type, data path, and output location. "
+    "Can run multiple in parallel to compare approaches. "
+    "For disease transmission models, use the LASER framework "
+    "(laser-generic package) -- see the laser-spatial-disease-modeling skill."
+)
+MODEL_TESTER_PROMPT = (
+    "You are a model implementation specialist for public health research. "
+    "Implement the specific model you're asked to build, fit it to the data, "
+    "evaluate with proper train/test splits, and save results. Use established "
+    "packages. For disease transmission models (malaria, polio, etc.), "
+    "use the LASER framework (laser-generic). See the "
+    "laser-spatial-disease-modeling skill for API reference and common pitfalls. "
+    "Write concise code."
+)
+MODEL_TESTER_TOOLS = ["Bash", "Write", "Read", "Edit", "Glob"]
+MODEL_TESTER_SKILLS = ["laser-spatial-disease-modeling", "epi-model-parametrization"]
 
 SYSTEM_PROMPT = """\
 You are a model builder for public health and epidemiological research.
@@ -247,19 +248,3 @@ Update {run_dir}/progress.md and {run_dir}/checklist.md.
 """
 
 
-def make_prompt(question: str, run_dir: str, round_num: int = 1) -> str:
-    if round_num == 1:
-        return (
-            f"Research question: {question}\n\n"
-            f"Read {run_dir}/plan.md, {run_dir}/hypotheses.md, and "
-            f"{run_dir}/data_quality.md.\n"
-            f"Build the candidate models from the plan.\n"
-            f"Save code to {run_dir}/model.py and figures to {run_dir}/figures/."
-        )
-    return (
-        f"Research question: {question}\n\n"
-        f"This is revision round {round_num}.\n"
-        f"Read the critique feedback in {run_dir}/critique_*.md.\n"
-        f"Read {run_dir}/checklist.md for outstanding items.\n"
-        f"Address each critique item and update your models."
-    )
