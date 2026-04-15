@@ -11,19 +11,24 @@ TOOLS = ["Bash", "Write", "Edit", "Read", "Glob", "Grep", "Agent"]
 # model-tester is declared flat in the lead's agent registry so the
 # modeler can spawn it via the Agent tool.
 MODEL_TESTER_DESCRIPTION = (
-    "Model testing specialist. Implement and test a specific model "
-    "approach. Give it a model type, data path, and output location. "
-    "Can run multiple in parallel to compare approaches. "
-    "For disease transmission models, use the LASER framework "
-    "(laser-generic package) -- see the laser-spatial-disease-modeling skill."
+    "Model testing specialist. Can implement a new model, OR clone and run "
+    "an existing published model (even in R/C++) as a reference baseline. "
+    "Give it a model type or repo URL, data path, and output location. "
+    "Spawn multiple in parallel to compare your model against published "
+    "implementations."
 )
 MODEL_TESTER_PROMPT = (
     "You are a model implementation specialist for public health research. "
-    "Implement the specific model you're asked to build, fit it to the data, "
-    "evaluate with proper train/test splits, and save results. Use established "
-    "packages. For spatial disease transmission models, consider the LASER "
-    "framework (laser-generic). See the laser-spatial-disease-modeling skill "
-    "for API reference and common pitfalls. Write concise code."
+    "You may be asked to do one of two things:\n"
+    "1. Implement and test a specific model approach from scratch.\n"
+    "2. Clone and run an existing published model (possibly in R, C++, or "
+    "another language) to produce reference outputs for comparison.\n\n"
+    "For task 2: clone the repo, install dependencies (R packages, compilers, "
+    "etc.), adapt the inputs to match the current dataset, run the model, "
+    "and save the outputs in a comparable format (CSV/JSON). The goal is to "
+    "produce reference results the modeler can benchmark against.\n\n"
+    "For both tasks: fit to the data, evaluate with proper metrics, and save "
+    "results. Write concise code."
 )
 MODEL_TESTER_TOOLS = ["Bash", "Write", "Read", "Edit", "Glob"]
 MODEL_TESTER_SKILLS = ["laser-spatial-disease-modeling", "epi-model-parametrization"]
@@ -184,10 +189,17 @@ When running model scripts, do NOT just launch and sleep-poll. Instead:
    ```
 
 **Parallel model testing**: Spawn multiple model-tester subagents in a
-SINGLE response to try different approaches concurrently:
-- model-tester 1: "Fit [model A] to {run_dir}/data/. Save to {run_dir}/model_a.py"
-- model-tester 2: "Fit [model B]. Save to {run_dir}/model_b.py"
-- model-tester 3: "Fit [model C]. Save to {run_dir}/model_c.py"
+SINGLE response to compare approaches concurrently. A model-tester can
+either build a new model OR clone and run an existing published model
+as a reference baseline:
+- model-tester 1: "Clone github.com/mrc-ide/deterministic-malaria-model,
+  install R deps, run with [these parameters], save outputs to {run_dir}/reference_griffin/"
+- model-tester 2: "Build our Python ODE model. Save to {run_dir}/model_ours.py"
+- model-tester 3: "Fit [alternative approach]. Save to {run_dir}/model_alt.py"
+
+Running a published model as a reference gives you ground truth to
+validate against — if your model disagrees with a well-validated
+published implementation, investigate before trusting your model.
 
 **Every model must produce:**
 - Train/test split (temporal for time series)
