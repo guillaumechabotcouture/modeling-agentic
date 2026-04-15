@@ -131,13 +131,12 @@ After the literature review, also produce:
 1. **Problem classification**: statistical, mechanistic, or both?
    (see modeling-strategy skill for purpose-driven selection)
 
-2. **Existing Code and Implementations** (CRITICAL — the modeler will
-   clone and adapt these rather than building from scratch):
-   - Search GitHub for published model code for this disease/question
-   - For each repo: URL, language, license, what it implements, usability
-   - Explicitly recommend which repo the modeler should start from
-   - If a paper's methods section cites a code repository, include it
-   - The modeler WILL clone these repos, so verify URLs are correct
+2. **Existing Code and Implementations**: Search GitHub and paper
+   supplements for published model code relevant to this question.
+   For each repo found: URL, language, license, what it implements,
+   usability assessment. If a paper's methods section cites a code
+   repository, include it. The modeler may choose to clone and adapt
+   these rather than building from scratch.
 
 3. **Published Benchmarks table**: every quantitative result from the
    literature that our model should reproduce or compare against.

@@ -54,23 +54,16 @@ Follow its instructions.
 3. Read {run_dir}/data_quality.md and EDA output to understand the data.
 4. Read any critique feedback files ({run_dir}/critique_*.md) if this is
    a revision round.
-5. **SEARCH FOR EXISTING IMPLEMENTATIONS BEFORE WRITING CODE.**
+5. **Check for existing implementations you can build on.**
    Read the "Existing Code and Implementations" section of plan.md.
-   If the planner identified relevant code repos:
-   - Clone them (`git clone --depth 1`)
-   - Read the key model files to understand the implementation
-   - Adapt/translate the model rather than reimplementing from scratch
-   - Document which repo you adapted from in modeling_strategy.md
-
-   If no repos are listed, search yourself:
-   - `gh search repos "{disease} {model type} compartmental"` on GitHub
-   - Look for published model code cited in the papers from plan.md
-   - Prefer repos with: open license, the disease you need, working code
-
-   ADAPTING a published, validated model is ALWAYS preferred over building
-   from scratch. A hand-coded model will likely miss critical dynamics
-   (e.g., immunity, superinfection, waning) that published models spent
-   years getting right. Clone first, customize second.
+   Also consider searching GitHub yourself (`gh search repos`) or
+   checking whether papers in the literature review published their code.
+   Cloning and adapting a published model is often faster and more
+   reliable than reimplementing complex dynamics from scratch —
+   especially for diseases with intricate biology (immunity, vectors,
+   superinfection) where getting the equations right takes years of
+   domain expertise. Note what you found in modeling_strategy.md and
+   whether you're building on existing code or starting fresh (and why).
 6. Write {run_dir}/modeling_strategy.md with Level 0 feasibility check.
    Include: which existing code you found, what you're adapting from,
    what modifications are needed.
