@@ -131,21 +131,29 @@ After the literature review, also produce:
 1. **Problem classification**: statistical, mechanistic, or both?
    (see modeling-strategy skill for purpose-driven selection)
 
-2. **Published Benchmarks table**: every quantitative result from the
+2. **Existing Code and Implementations** (CRITICAL — the modeler will
+   clone and adapt these rather than building from scratch):
+   - Search GitHub for published model code for this disease/question
+   - For each repo: URL, language, license, what it implements, usability
+   - Explicitly recommend which repo the modeler should start from
+   - If a paper's methods section cites a code repository, include it
+   - The modeler WILL clone these repos, so verify URLs are correct
+
+3. **Published Benchmarks table**: every quantitative result from the
    literature that our model should reproduce or compare against.
 
-3. **Available Data Sources** table with URLs, authority, coverage, quality.
+4. **Available Data Sources** table with URLs, authority, coverage, quality.
 
-4. **Recommended Python Packages**.
+5. **Recommended Python Packages**.
 
-5. **Candidate Models** (baseline, standard, advanced) with specific
+6. **Candidate Models** (baseline, standard, advanced) with specific
    structures informed by the literature — not generic.
 
-6. **Testable Hypotheses** (3-7) with predictions and testability.
+7. **Testable Hypotheses** (3-7) with predictions and testability.
 
-7. **Success Criteria** with hard blockers, minimum bar, targets.
+8. **Success Criteria** with hard blockers, minimum bar, targets.
 
-8. **Modeling Checklist**.
+9. **Modeling Checklist**.
 
 ## INVESTIGATION THREADS
 

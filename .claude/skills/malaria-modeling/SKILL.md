@@ -218,6 +218,53 @@ Common causes of out-of-range cost-effectiveness:
 - Do NOT use a single national R0 when sub-national variation is >5-fold
 - Do NOT model ITN and IRS effects as independent when they target the
   same vector population (they are sub-additive at best)
+- Do NOT hand-code malaria transmission from scratch — clone and adapt
+  a published implementation (see below)
+
+### CRITICAL: Use Existing Published Code
+
+Simple SIR/SEIR/SEDATU ODEs CANNOT sustain PfPR above ~30% because
+they deplete susceptibles without modeling superinfection and acquired
+immunity. This is a fundamental limitation, not a parameter tuning
+issue. The Hill function "solves" calibration by abandoning dynamics
+entirely, but then intervention effects are just static OR multipliers
+— not mechanistic.
+
+**You MUST start from an existing published malaria model implementation:**
+
+1. **Griffin et al. deterministic model** (PREFERRED starting point):
+   `git clone --depth 1 https://github.com/mrc-ide/deterministic-malaria-model`
+   - R/C code, MIT license, fully open
+   - Has: age-structured immunity (clinical + anti-parasite), superinfection,
+     ITN/IRS intervention effects, seasonal forcing, 34-site parameterization
+   - Translate the core ODE system to Python, keeping the immunity equations
+   - This model can sustain PfPR >70% at high EIR because immunity limits
+     disease, not infection
+
+2. **malariasimulation** (R package, Imperial College):
+   `git clone --depth 1 https://github.com/mrc-ide/malariasimulation`
+   - Individual-based version of Griffin et al., R, MIT license
+   - More complex but same immunity dynamics
+   - Consider if you need individual-level tracking
+
+3. **HBHI Nigeria archetype code** (for Nigeria-specific work):
+   `git clone --depth 1 https://github.com/numalariamodeling/hbhi-nigeria-publication-2021`
+   - R/Python, Apache-2.0, the actual code behind Ozodiegwu et al. 2023
+   - 774-LGA archetype assignments, calibration targets, scenario configs
+   - Requires EMOD binary for simulation, but archetype/data code is reusable
+
+4. **OpenMalaria** (Swiss TPH):
+   `git clone --depth 1 https://github.com/SwissTPH/openmalaria`
+   - C++, GPL, detailed within-host dynamics
+   - More complex than needed for allocation models
+
+**Workflow:** Clone Griffin deterministic model → read the ODE system
+(especially the immunity equations in `odin_model.R`) → translate to
+Python with scipy.integrate.solve_ivp → calibrate to your targets →
+add intervention mechanisms → optimize.
+
+This takes less time than building from scratch and produces a model
+that actually works at high transmission intensity.
 
 ---
 
