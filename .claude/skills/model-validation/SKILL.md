@@ -111,3 +111,63 @@ Guidelines for interpreting model quality:
 | Highly stochastic systems | Beat naive baseline | > 0.3 | 75-95% |
 
 These are rough guidelines. Always compare to published benchmarks in your specific domain.
+
+---
+
+### 7. Optimization & Resource Allocation Validation
+
+When a model includes optimization or resource allocation, apply these
+validation gates BEFORE accepting results. Do not skip gates.
+
+#### Gate 1: Intervention Effect Verification (after calibration, before scenarios)
+
+Compute the MARGINAL EFFECT of each intervention at high coverage
+(e.g., 80%) in each geographic unit. Print a table:
+
+| Area | Intervention | Baseline metric | With 80% cov | Reduction (%) | Published range |
+|------|-------------|----------------|--------------|---------------|-----------------|
+
+**STOP conditions (report to lead, do not proceed to optimization):**
+- Any intervention reduces burden by <1% where published evidence shows >10%
+- Any intervention has ZERO effect in an area where it is deployed
+- A calibrated parameter hits an optimizer bound (cap)
+- Cost-effectiveness for any intervention is >5x outside published range
+
+#### Gate 2: Scenario Ranking Verification (after scenarios, before optimization)
+
+Verify relative intervention rankings match published evidence:
+- Does the most cost-effective intervention in the model match literature?
+- Are the relative magnitudes (not just rankings) plausible?
+- Does each intervention the question asks about have a meaningful effect?
+
+**STOP condition:** If model's intervention rankings contradict published
+evidence (e.g., SMC appears worthless when literature shows it is highly
+effective), the model structure cannot support optimization. Fix the model's
+intervention mechanism first, then optimize.
+
+#### Gate 3: Optimization Result Sanity (after optimization)
+
+- Does the optimizer invest in the highest-burden areas? If not, is there
+  a documented, clinically plausible reason (e.g., diminishing returns at
+  very high existing coverage) or is it a model artifact?
+- Does every intervention the question asks about get nonzero allocation?
+  If one gets 0%, verify the model's cost-effectiveness for that
+  intervention against published ranges before accepting.
+- Is the overall cost per DALY in the right ballpark vs published ranges?
+- Would a domain expert engage with the result, or immediately reject it?
+
+Report ALL gate results in `{run_dir}/modeling_strategy.md` so the lead
+agent and critics can review them.
+
+#### Dynamic vs Equilibrium Model Selection
+
+If the research question involves:
+- Time-limited interventions (seasonal chemoprophylaxis, campaigns, MDA)
+- Optimizing intervention timing or seasonality
+- Transient scale-up dynamics
+- Interventions with nonlinear dose-response at high coverage
+
+Then you MUST use a dynamic model (ODE with time steps, difference
+equations, or agent-based), NOT equilibrium algebra. Equilibrium models
+average away seasonal and transient effects, producing systematically
+wrong marginal intervention effects for time-limited interventions.

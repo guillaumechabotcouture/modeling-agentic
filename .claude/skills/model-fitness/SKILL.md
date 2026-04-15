@@ -258,3 +258,56 @@ Level 1 IS good enough when the audience is internal decision support
 or rapid analysis. Level 1 is NOT good enough when the audience is a
 Global Fund proposal or a Lancet paper. Match the level to the audience,
 not to your time budget.
+
+---
+
+## 7. Optimization Result Sanity Checks
+
+When the model includes optimization or resource allocation, apply
+these checks BEFORE deciding ACCEPT vs RETHINK at the Stage 7 decision
+point.
+
+### The "Would a Domain Expert Laugh?" Test
+
+Mentally show the optimization result to a domain expert. Would they:
+(a) Engage with the tradeoffs --> PASS
+(b) Immediately say "this can't be right" --> FAIL --> RETHINK
+
+Examples of obvious failures that indicate structural model problems:
+- Zero investment in the highest-burden geographic area
+- Zero allocation to an intervention WHO recommends for this setting
+- Cost per DALY 100x outside the published range for an intervention
+- The optimal portfolio ignores a dimension the question specifically
+  asks about (e.g., "allocate across ITN, IRS, and SMC" but SMC gets 0%)
+
+### Cost-Effectiveness Benchmark Table
+
+Before accepting any optimization, the lead should verify:
+
+| Intervention | Model $/DALY | Published $/DALY range | Within 5x? |
+|-------------|-------------|----------------------|------------|
+| ... | ... | ... | YES/NO |
+
+If ANY intervention is outside 5x of its published range, the model's
+representation of that intervention is structurally wrong. This is
+RETHINK, not PATCH -- fixing a parameter won't fix a broken mechanism.
+
+### Geographic Allocation Sanity
+
+For geographic optimization, verify:
+- Highest-burden area gets investment (or there is a documented,
+  clinically plausible reason it doesn't -- e.g., already at near-
+  universal coverage)
+- No area is completely zeroed out unless it has near-zero baseline
+  burden
+- The allocation pattern is explainable in terms of burden, cost, and
+  intervention effectiveness -- not model artifacts (EIR cap, step-
+  function thresholds, equilibrium saturation)
+
+### Convergent Structural Critique
+
+If the methods AND domain critics both flag the same structural issue
+as HIGH severity, this is converging evidence of a fundamental problem.
+This is RETHINK regardless of what individual critique items say. Do
+not let individually-patchable symptoms obscure a shared structural
+root cause.

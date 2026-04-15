@@ -77,7 +77,7 @@ def build_agents() -> dict[str, AgentDefinition]:
             maxTurns=80,
             skills=["semantic-scholar-lookup", "asta-literature-search",
                     "pdf-text-extraction", "investigation-threads",
-                    "modeling-strategy"],
+                    "modeling-strategy", "malaria-modeling"],
         ),
         "data-agent": AgentDefinition(
             description=data.DESCRIPTION,
@@ -93,13 +93,14 @@ def build_agents() -> dict[str, AgentDefinition]:
             model="opus",
             maxTurns=100,
             skills=["modeling-strategy", "laser-spatial-disease-modeling",
-                    "epi-model-parametrization"],
+                    "epi-model-parametrization", "malaria-modeling",
+                    "model-validation"],
         ),
         "model-tester": AgentDefinition(
             description=modeler.MODEL_TESTER_DESCRIPTION,
             prompt=modeler.MODEL_TESTER_PROMPT,
             tools=modeler.MODEL_TESTER_TOOLS,
-            skills=modeler.MODEL_TESTER_SKILLS,
+            skills=modeler.MODEL_TESTER_SKILLS + ["malaria-modeling"],
             model="sonnet",
             maxTurns=60,
         ),
@@ -109,7 +110,7 @@ def build_agents() -> dict[str, AgentDefinition]:
             tools=analyst.TOOLS,
             model="opus",
             maxTurns=40,
-            skills=["investigation-threads"],
+            skills=["investigation-threads", "malaria-modeling"],
         ),
         "critique-methods": AgentDefinition(
             description=critique_methods.DESCRIPTION,
@@ -117,6 +118,7 @@ def build_agents() -> dict[str, AgentDefinition]:
             tools=critique_methods.TOOLS,
             model="opus",
             maxTurns=35,  # increased: now does parameter provenance checks with WebSearch
+            skills=["malaria-modeling", "model-validation"],
         ),
         "critique-domain": AgentDefinition(
             description=critique_domain.DESCRIPTION,
@@ -124,7 +126,7 @@ def build_agents() -> dict[str, AgentDefinition]:
             tools=critique_domain.TOOLS,
             model="opus",
             maxTurns=40,  # increased: now does citation verification with WebSearch+WebFetch
-            skills=["investigation-threads", "model-fitness"],
+            skills=["investigation-threads", "model-fitness", "malaria-modeling"],
         ),
         "critique-presentation": AgentDefinition(
             description=critique_presentation.DESCRIPTION,
@@ -287,6 +289,8 @@ CRITICAL RULES:
   it before accepting. Do NOT accept with known contradictions.
 - If the same hard blocker persists for 2+ rounds, RETHINK or DECLARE_SCOPE.
   Do NOT keep patching.
+- RETHINK early is cheap. If round 1 critique reveals structural issues,
+  RETHINK immediately — don't waste a round patching a broken structure.
 - Track round count. After {max_rounds} rounds, DECLARE_SCOPE and proceed.
 - When re-spawning an agent, pass the SPECIFIC critique feedback — not
   just "fix the issues." Quote the critique items verbatim.
