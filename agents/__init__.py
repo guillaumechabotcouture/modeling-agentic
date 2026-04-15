@@ -77,7 +77,8 @@ def build_agents() -> dict[str, AgentDefinition]:
             maxTurns=80,
             skills=["semantic-scholar-lookup", "asta-literature-search",
                     "pdf-text-extraction", "investigation-threads",
-                    "modeling-strategy", "malaria-modeling"],
+                    "modeling-strategy", "malaria-modeling",
+                    "basic_epi_modeling", "vectors", "vaccination"],
         ),
         "data-agent": AgentDefinition(
             description=data.DESCRIPTION,
@@ -94,13 +95,22 @@ def build_agents() -> dict[str, AgentDefinition]:
             maxTurns=100,
             skills=["modeling-strategy", "laser-spatial-disease-modeling",
                     "epi-model-parametrization", "malaria-modeling",
-                    "model-validation"],
+                    "model-validation",
+                    # starsim_ai: disease modeling fundamentals
+                    "vectors", "sir-models", "sir-elaborations",
+                    "vaccination", "parameter-estimation",
+                    # starsim_ai: starsim framework
+                    "starsim-dev-intro", "starsim-dev-diseases",
+                    "starsim-dev-interventions", "starsim-dev-calibration",
+                    "starsim-dev-networks", "starsim-dev-demographics"],
         ),
         "model-tester": AgentDefinition(
             description=modeler.MODEL_TESTER_DESCRIPTION,
             prompt=modeler.MODEL_TESTER_PROMPT,
             tools=modeler.MODEL_TESTER_TOOLS,
-            skills=modeler.MODEL_TESTER_SKILLS + ["malaria-modeling"],
+            skills=modeler.MODEL_TESTER_SKILLS + ["malaria-modeling",
+                    "starsim-dev-intro", "starsim-dev-diseases",
+                    "starsim-dev-interventions", "starsim-dev-calibration"],
             model="sonnet",
             maxTurns=60,
         ),
@@ -110,7 +120,8 @@ def build_agents() -> dict[str, AgentDefinition]:
             tools=analyst.TOOLS,
             model="opus",
             maxTurns=40,
-            skills=["investigation-threads", "malaria-modeling"],
+            skills=["investigation-threads", "malaria-modeling",
+                    "basic_epi_modeling", "surveillance"],
         ),
         "critique-methods": AgentDefinition(
             description=critique_methods.DESCRIPTION,
@@ -118,7 +129,8 @@ def build_agents() -> dict[str, AgentDefinition]:
             tools=critique_methods.TOOLS,
             model="opus",
             maxTurns=35,  # increased: now does parameter provenance checks with WebSearch
-            skills=["malaria-modeling", "model-validation"],
+            skills=["malaria-modeling", "model-validation",
+                    "parameter-estimation"],
         ),
         "critique-domain": AgentDefinition(
             description=critique_domain.DESCRIPTION,
@@ -126,7 +138,8 @@ def build_agents() -> dict[str, AgentDefinition]:
             tools=critique_domain.TOOLS,
             model="opus",
             maxTurns=40,  # increased: now does citation verification with WebSearch+WebFetch
-            skills=["investigation-threads", "model-fitness", "malaria-modeling"],
+            skills=["investigation-threads", "model-fitness", "malaria-modeling",
+                    "vectors", "vaccination"],
         ),
         "critique-presentation": AgentDefinition(
             description=critique_presentation.DESCRIPTION,

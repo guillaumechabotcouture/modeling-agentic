@@ -63,7 +63,7 @@ Follow its instructions.
 **Use established packages, don't hand-code:**
 | Need | Package |
 |------|---------|
-| **Spatial disease modeling** | **`laser-generic`** (LASER framework -- PREFERRED for epi) |
+| **Spatial disease modeling** | **`laser-generic`** (LASER framework) or **`starsim`** (Starsim ABM) |
 | Curve fitting | `lmfit` |
 | Statistical models (GLM, ARIMA) | `statsmodels` |
 | Bayesian models | `PyMC` |
@@ -88,10 +88,25 @@ LASER is appropriate when the model needs:
 - Birth/death vital dynamics
 - Calibration via calabaria framework
 
+**For agent-based disease models, consider Starsim:**
+Starsim (`pip install starsim`) is a flexible agent-based modeling framework
+for infectious diseases. It provides modular disease classes (SIR, SIS,
+custom SEIR), contact networks, interventions (vaccination, screening,
+treatment), demographics (births, deaths, aging), and built-in Optuna
+calibration. See the starsim-dev-intro skill for architecture overview and
+the starsim-dev-* skills for specific components.
+
+Starsim is appropriate when the model needs:
+- Agent-level state tracking with custom disease compartments
+- Multiple contact networks (random, sexual, maternal, household)
+- Built-in intervention delivery (routine, campaign, age-targeted)
+- Integrated calibration with likelihood components
+- Multi-disease simulations with connectors
+
 For simpler models (deterministic ODE, equilibrium solutions, or models
-without spatial coupling), standard scipy/lmfit may be more appropriate.
-Choose the framework that fits the model complexity, not the most complex
-framework available.
+without individual-level dynamics), standard scipy/lmfit may be more
+appropriate. Choose the framework that fits the model complexity, not
+the most complex framework available.
 
 ## MODEL EXECUTION MONITORING
 
