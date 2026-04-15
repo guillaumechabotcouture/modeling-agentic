@@ -61,7 +61,27 @@ def create_run_dir(question: str) -> str:
 
 
 def build_resume_context(run_path: str) -> str:
-    """Check what files exist for resume context."""
+    """Build resume context from pipeline_state.yaml or file detection."""
+    # Prefer structured state file
+    state_path = os.path.join(run_path, "pipeline_state.yaml")
+    if os.path.exists(state_path):
+        try:
+            import yaml
+            with open(state_path) as f:
+                state = yaml.safe_load(f)
+            stage = state.get("current_stage", "PLAN")
+            round_num = state.get("current_round", 1)
+            completed = list(state.get("completed", {}).keys())
+            return (
+                f"RESUME: Pipeline is at stage {stage}, round {round_num}. "
+                f"Completed stages: {', '.join(completed)}. "
+                f"Read {run_path}/progress.md and pipeline_state.yaml for full context. "
+                f"Continue from stage {stage}."
+            )
+        except Exception:
+            pass  # Fall through to file detection
+
+    # Fallback: detect existing files
     existing = []
     for fname in [
         "plan.md", "threads.yaml", "data_quality.md", "data_provenance.md",

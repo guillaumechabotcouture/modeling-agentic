@@ -223,11 +223,13 @@ Wait for completion. Read {run_dir}/results.md to confirm hypothesis
 verdicts exist with causal labels.
 
 ### STAGE 6: CRITIQUE (PARALLEL)
-Spawn ALL THREE critique agents simultaneously in a SINGLE response,
-each with background: true:
+Spawn ALL THREE critique agents simultaneously in a SINGLE response:
 - critique-methods
 - critique-domain
 - critique-presentation
+
+Do NOT use background: true. Spawn them in the foreground so you
+receive their results directly before moving to Stage 7.
 
 Tell each one the research question and run directory, and which file
 to write (critique_methods.md, critique_domain.md, critique_presentation.md).
@@ -320,6 +322,15 @@ Wait for completion. Verify {run_dir}/report.md exists.
 - Every finding must have a causal label: CAUSAL, ASSOCIATIONAL, or PROXY.
 - All artifacts go in {run_dir}/.
 - Update {run_dir}/progress.md after each stage with what was completed.
+- After each stage, update {run_dir}/pipeline_state.yaml so the pipeline
+  can resume cleanly if interrupted. Use this YAML format:
+  ```yaml
+  current_stage: MODEL  # the NEXT stage to run
+  current_round: 1
+  completed:
+    PLAN: {at: "timestamp"}
+    DATA: {at: "timestamp"}
+  ```
 - If a subagent fails (you see it reported as failed), read its output for
   diagnostics. Retry ONCE with adjusted instructions. If it fails again,
   log the failure in progress.md and proceed with DECLARE_SCOPE.
