@@ -48,6 +48,84 @@ comparison. Signs of mismatch:
 
 ---
 
+## 1b. Build vs Adapt: The Implementation Decision
+
+After deciding WHAT model to build, decide HOW to build it. Published
+implementations exist for most well-studied diseases. The choice between
+building from scratch and adapting existing code is a cost-risk tradeoff,
+not a preference.
+
+### Classify Each Model Component
+
+For each mechanism your model needs, ask: **how hard is this to get right
+from scratch?**
+
+| Difficulty | Examples | Build vs Adapt |
+|-----------|---------|----------------|
+| **Routine** — standard equations, well-documented, hard to get wrong | SEIR compartments, seasonal forcing (sinusoidal), cost optimization, data loading | Build from scratch — faster than learning someone else's code |
+| **Moderate** — requires careful parameterization, easy to make subtle errors | Age-structured transmission, OR-to-RR conversion, waning immunity (single-rate), dose-response curves | Either — depends on time budget and available code |
+| **Hard** — multi-layer dynamics where subtle errors produce models that calibrate but give wrong intervention effects | Superinfection + acquired immunity (clinical + anti-parasite), within-host parasite dynamics, vector genetics, multi-strain competition | Strongly prefer adapting existing code — these dynamics took domain experts years to get right |
+
+### The Key Question
+
+> "If I build this from scratch and get the hard dynamics slightly wrong,
+> will I know? Or will the model calibrate fine and produce plausible-looking
+> but incorrect intervention effects?"
+
+For **routine** components, mistakes are obvious (negative populations,
+conservation violations, NaN). For **hard** components, mistakes hide:
+the model calibrates to baseline data but intervention effects are wrong
+because the feedback loops are subtly broken. A fudge factor (scale factor,
+detection fraction) can mask this — the model matches totals but the
+marginal response to interventions is mechanistically wrong.
+
+### Decision Framework
+
+```
+1. List the HARD mechanisms your model needs
+2. For each: does published, open-source code exist?
+   - YES and same language → clone and adapt (lowest risk)
+   - YES but different language → assess translation effort:
+     * Can you call it as a subprocess? (R from Python, C from Python)
+     * Can you run it as a reference via a model-tester subagent?
+     * Is the translation tractable in your time budget?
+   - NO → build from scratch, but budget extra time for validation
+3. For ROUTINE mechanisms: build from scratch (faster, cleaner)
+4. Document your decision and reasoning in modeling_strategy.md
+```
+
+### Running Reference Implementations
+
+Even when building from scratch, consider running a published
+implementation in parallel as a **reference baseline**:
+- Spawn a model-tester subagent to clone, install, and run the
+  reference model with the same inputs
+- Compare your model's intervention effects against the reference
+- If they agree on direction and magnitude (within 2x): your model
+  is likely correct
+- If they disagree: investigate before trusting your model —
+  the published implementation has been validated by domain experts
+
+This is especially valuable for hard dynamics where your from-scratch
+implementation might calibrate correctly but produce wrong marginal
+effects. The reference model catches this.
+
+### Common Trap: Underestimating Translation Cost, Overestimating Build Cost
+
+Modelers often think "translating R to Python is too risky" and choose to
+build from scratch. But building complex dynamics from scratch has its own
+risks — and the failure mode is worse: translation errors are usually
+obvious (code doesn't run, numbers don't match), while from-scratch
+errors are often invisible (model runs, calibrates, but intervention
+effects are subtly wrong).
+
+If you find yourself adding a scale factor, detection fraction, or
+calibration multiplier to match targets that the published model matches
+mechanistically — that's a signal you should have adapted instead of
+building from scratch.
+
+---
+
 ## 2. Pattern-Oriented Modeling (Grimm 2005)
 
 > "A model from which the patterns emerge should contain the right mechanisms
