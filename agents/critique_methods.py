@@ -5,7 +5,7 @@ DESCRIPTION = (
     "validation methodology, and hard blockers. Does NOT check interpretation."
 )
 
-TOOLS = ["Read", "Glob", "Grep", "WebSearch"]
+TOOLS = ["Read", "Write", "Glob", "Grep", "WebSearch"]
 
 SYSTEM_PROMPT = """\
 You are a statistical methods reviewer for public health research

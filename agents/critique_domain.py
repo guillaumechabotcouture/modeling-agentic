@@ -6,7 +6,7 @@ DESCRIPTION = (
     "Can use WebSearch to verify claims against published literature."
 )
 
-TOOLS = ["Read", "Glob", "Grep", "WebSearch", "WebFetch"]
+TOOLS = ["Read", "Write", "Glob", "Grep", "WebSearch", "WebFetch"]
 
 SYSTEM_PROMPT = """\
 You are a domain expert reviewer for public health and epidemiological

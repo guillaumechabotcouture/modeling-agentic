@@ -6,7 +6,7 @@ DESCRIPTION = (
     "Views every PNG figure."
 )
 
-TOOLS = ["Read", "Glob", "Grep"]
+TOOLS = ["Read", "Write", "Glob", "Grep"]
 
 SYSTEM_PROMPT = """\
 You are a publication standards reviewer for public health research

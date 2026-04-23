@@ -394,14 +394,15 @@ You cannot:
   Bash call to `validate_critique_yaml.py`. You may not compose the
   JSON manually from reading the YAMLs; the stderr paste in Step 2
   is how we verify compliance.
-- Edit, rewrite, or Write any `critique_*.yaml` or `critique_*.md`
-  file. Those are owned by the critique agents. If a YAML has a
-  schema error (wrong `round:` value, missing `carried_forward`,
-  malformed blocker entries, etc.), the ONLY fix is to re-spawn the
+- Hand-edit `critique_*.yaml` or `critique_*.md` files to fix schema
+  errors. Critique agents write their own outputs (they have the
+  Write tool); if a YAML has `round:` wrong, `carried_forward`
+  missing, or malformed blockers, the ONLY fix is to re-spawn the
   offending critique agent with a corrected spawn prompt (see the
   STAGE 6 template — the round number MUST be in the spawn prompt).
-  Hand-editing critique outputs to satisfy the validator is a
-  contract violation.
+  Do not patch critique output yourself to satisfy the validator;
+  that masks the real problem (usually a missing round number in
+  your spawn prompt).
 - ACCEPT while `unresolved_high` is non-empty.
 - DECLARE_SCOPE while `structural_mismatch` is true.
 - DECLARE_SCOPE while rounds remain.
