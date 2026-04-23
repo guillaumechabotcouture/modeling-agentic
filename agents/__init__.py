@@ -25,7 +25,7 @@ AGENT_MAX_TURNS = {
     "analyst": 40,
     "critique-methods": 35,
     "critique-domain": 40,
-    "critique-presentation": 25,
+    "critique-presentation": 30,
     "writer": 60,
 }
 
@@ -161,7 +161,7 @@ def build_agents() -> dict[str, AgentDefinition]:
             prompt=critique_presentation.SYSTEM_PROMPT,
             tools=critique_presentation.TOOLS,
             model="sonnet",
-            maxTurns=25,
+            maxTurns=30,
         ),
         "writer": AgentDefinition(
             description=writer.DESCRIPTION,
