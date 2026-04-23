@@ -20,12 +20,12 @@ MAX_FIGURE_PIXELS = 10_000_000  # 10MP -- anything larger is likely a bug
 AGENT_MAX_TURNS = {
     "planner": 80,
     "data-agent": 60,
-    "modeler": 100,
+    "modeler": 150,
     "model-tester": 60,
     "analyst": 40,
     "critique-methods": 35,
-    "critique-domain": 40,
-    "critique-presentation": 30,
+    "critique-domain": 50,
+    "critique-presentation": 40,
     "writer": 60,
 }
 
@@ -107,7 +107,7 @@ def build_agents() -> dict[str, AgentDefinition]:
             prompt=modeler.SYSTEM_PROMPT,
             tools=modeler.TOOLS,
             model="opus",
-            maxTurns=100,
+            maxTurns=150,
             skills=["modeling-strategy", "laser-spatial-disease-modeling",
                     "epi-model-parametrization", "malaria-modeling",
                     "model-validation",
@@ -152,7 +152,7 @@ def build_agents() -> dict[str, AgentDefinition]:
             prompt=critique_domain.SYSTEM_PROMPT,
             tools=critique_domain.TOOLS,
             model="opus",
-            maxTurns=40,  # increased: now does citation verification with WebSearch+WebFetch
+            maxTurns=50,  # increased after malaria run ran_to_cap at 39/40
             skills=["investigation-threads", "model-fitness", "malaria-modeling",
                     "vectors", "vaccination"],
         ),
@@ -161,7 +161,7 @@ def build_agents() -> dict[str, AgentDefinition]:
             prompt=critique_presentation.SYSTEM_PROMPT,
             tools=critique_presentation.TOOLS,
             model="sonnet",
-            maxTurns=30,
+            maxTurns=40,  # bumped 25→30 post-measles, 30→40 post-malaria (30/30 ran_to_cap in round 2)
         ),
         "writer": AgentDefinition(
             description=writer.DESCRIPTION,
@@ -253,6 +253,25 @@ Each critique agent writes TWO files:
 - `critique_{name}.yaml` — machine-readable blocker manifest (see the
   `critique-blockers-schema` skill for the required schema)
 
+#### Spawn-prompt template (MANDATORY)
+
+When invoking each critique agent via the Agent tool, the prompt you
+pass MUST begin with the literal line `This is critique round N.` where
+N is the current round number (starting at 1). Without this line the
+critique agent falls back to round 1 and emits a YAML with `round: 1`
+regardless of the actual round, which the validator will reject with a
+schema error and cost you a revision cycle.
+
+Example spawn-prompt opening for round 2+:
+
+```
+This is critique round 2. Research question: [verbatim question].
+Run directory: runs/<run_name>. Read the prior round's
+critique_<name>.yaml and populate carried_forward for every HIGH or
+MEDIUM blocker from round 1 (still_present true or false with
+resolved_evidence). See the critique-blockers-schema skill.
+```
+
 Wait for all three to complete.
 
 ### STAGE 7: MECHANICAL DECISION GATE
@@ -284,10 +303,20 @@ schema error — stop and fix before proceeding.
 #### Step 2: Write the decision record
 
 Before taking any action, append a `## Stage 7 decision (round N)`
-section to `{run_dir}/progress.md` containing the validator's JSON
-output verbatim, plus one sentence explaining your planned next step
-(e.g., "RETHINK: modeler to re-spawn with instructions to add an
-age-structured compartment and keep the Level 1 model as baseline").
+section to `{run_dir}/progress.md` containing:
+
+1. The validator's JSON output verbatim (from stdout when `--json` is
+   set) — inside a fenced ```json block.
+2. The validator's human-readable stderr output verbatim — inside a
+   fenced ``` block labeled "validator stderr". This is the
+   multi-line `STAGE 7 decision (round N/M)` block with per-blocker
+   lines. Pasting the stderr is MANDATORY: it is the audit evidence
+   that you actually ran the validator rather than composing the
+   decision manually from reading the YAML files. A Stage 7 block
+   without verbatim stderr output is a contract violation.
+3. One sentence explaining your planned next step (e.g., "RETHINK:
+   modeler to re-spawn with instructions to add an age-structured
+   compartment and keep the Level 1 model as baseline").
 
 This is your audit trail. Future resumes read it.
 
@@ -345,8 +374,18 @@ The validator has already decided for you. Your job is to carry it out:
 #### Forbidden moves
 
 You cannot:
-- Skip the validator. Every round 6 decision must follow a Bash call
-  to `validate_critique_yaml.py`.
+- Skip the validator. Every STAGE 7 decision must follow a fresh
+  Bash call to `validate_critique_yaml.py`. You may not compose the
+  JSON manually from reading the YAMLs; the stderr paste in Step 2
+  is how we verify compliance.
+- Edit, rewrite, or Write any `critique_*.yaml` or `critique_*.md`
+  file. Those are owned by the critique agents. If a YAML has a
+  schema error (wrong `round:` value, missing `carried_forward`,
+  malformed blocker entries, etc.), the ONLY fix is to re-spawn the
+  offending critique agent with a corrected spawn prompt (see the
+  STAGE 6 template — the round number MUST be in the spawn prompt).
+  Hand-editing critique outputs to satisfy the validator is a
+  contract violation.
 - ACCEPT while `unresolved_high` is non-empty.
 - DECLARE_SCOPE while `structural_mismatch` is true.
 - DECLARE_SCOPE while rounds remain.

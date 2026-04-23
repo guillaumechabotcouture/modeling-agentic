@@ -201,7 +201,7 @@ async def run(question: str, max_rounds: int, max_sessions: int,
         options = ClaudeAgentOptions(
             system_prompt=lead_system,
             agents=agents,
-            allowed_tools=["Agent", "Read", "Write", "Glob", "Grep"],
+            allowed_tools=["Agent", "Bash", "Read", "Write", "Glob", "Grep"],
             permission_mode="bypassPermissions",
             setting_sources=["project"],
             hooks=hooks,

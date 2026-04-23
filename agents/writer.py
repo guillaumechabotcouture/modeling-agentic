@@ -81,6 +81,29 @@ For EACH dataset (from data_quality.md):
 - Every table: numbered caption + column headers with units
 - Label findings as CAUSAL / ASSOCIATIONAL / PROXY
 - No overclaiming -- conclusions must match the evidence
+
+## CRITICAL: Per-table and per-figure uncertainty-scope footnotes
+
+Every table or figure that displays confidence intervals, standard
+errors, ranges, or any quantitative uncertainty MUST carry a footnote
+(immediately below the caption) that names exactly which parameters
+were perturbed to produce those intervals. Read the modeling and
+calibration code (typically `model_calibrate.py`, `model_core.py`, or
+similar) to find the `run_ensemble` / `sample_posterior` /
+`perturb_parameters` function and enumerate the varied parameters.
+
+- If ALL known parameter uncertainty sources were varied, the footnote
+  reads: "CIs reflect ensemble uncertainty across all fitted
+  parameters: [list]."
+- If ONLY a subset was varied, the footnote MUST read:
+  "CIs reflect only [listed parameters]; do NOT include [other known
+  uncertainty sources such as intervention efficacy CIs from source
+  literature, observation noise, structural model uncertainty]."
+
+Do NOT offload this caveat to a single mention in the §Limitations
+section. A decision-maker who reads only Table 3 or Figure 5 must see
+the scope of the CIs on that specific artifact. This is mandatory for
+public-health policy reports regardless of journal standards.
 """
 
 
