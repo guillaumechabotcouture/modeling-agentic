@@ -37,6 +37,23 @@ except ImportError:
     print("ERROR: pyyaml not installed. Run: pip install pyyaml", file=sys.stderr)
     sys.exit(2)
 
+# spec_compliance is a sibling module; import is lazy so validation without
+# the --spec-compliance flag doesn't require it to be present.
+_SPEC_COMPLIANCE_AVAILABLE = None  # tri-state: None=unchecked, True=ok, False=missing
+
+def _load_spec_compliance():
+    global _SPEC_COMPLIANCE_AVAILABLE
+    if _SPEC_COMPLIANCE_AVAILABLE is False:
+        return None
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import spec_compliance  # noqa: E402
+        _SPEC_COMPLIANCE_AVAILABLE = True
+        return spec_compliance
+    except ImportError:
+        _SPEC_COMPLIANCE_AVAILABLE = False
+        return None
+
 
 REVIEWERS = ("critique-methods", "critique-domain", "critique-presentation")
 PREFIXES = {"critique-methods": "M-", "critique-domain": "D-",
@@ -239,7 +256,101 @@ def decide(critiques: dict[str, dict], max_rounds: int,
         "action": action,
         "rule_matched": rule_matched,
         "rationale": rationale,
+        "spec_violations": [],
     }
+
+
+def incorporate_spec_violations(decision: dict, violations: list[dict],
+                                max_rounds: int, current_round: int) -> dict:
+    """Fold spec_compliance violations into the decision.
+
+    Framework / approach HIGH violations force `structural_mismatch=True`
+    (the mechanical backstop: critiques missed an architectural issue, so
+    the gate itself catches it). Budget / archetype HIGH violations add
+    synthetic `OBJ-NNN` blockers to `unresolved_high`. MEDIUM violations
+    are attached for visibility but do not change the action.
+
+    This function is idempotent: calling it twice yields identical output.
+    """
+    # Start from the existing decision; we'll mutate a shallow copy.
+    d = dict(decision)
+    d["spec_violations"] = violations
+    structural_kinds = {"framework_missing", "approach_mismatch"}
+    objective_kinds = {"budget_underutilized", "archetype_aggregation_unvalidated"}
+
+    high_struct = [v for v in violations
+                   if v["severity"] == "HIGH" and v["kind"] in structural_kinds]
+    high_objective = [v for v in violations
+                      if v["severity"] == "HIGH" and v["kind"] in objective_kinds]
+
+    # Force structural_mismatch when any structural HIGH violation exists.
+    if high_struct:
+        d["structural_mismatch"] = True
+        reviewers = list(d.get("structural_reviewers") or [])
+        if "spec-compliance" not in reviewers:
+            reviewers.append("spec-compliance")
+        d["structural_reviewers"] = reviewers
+
+    # Add synthetic blockers for objective HIGH violations.
+    base_id = len([b for b in d["unresolved_high"]
+                   if b.get("reviewer") == "spec-compliance"])
+    for i, v in enumerate(high_objective, start=base_id + 1):
+        d["unresolved_high"].append({
+            "reviewer": "spec-compliance",
+            "id": f"OBJ-{i:03d}",
+            "category": "STRUCTURAL",  # re-route via STRUCTURAL so PATCH heuristic
+                                        # escalates to RETHINK if it recurs.
+            "target_stage": "MODEL",
+            "first_seen_round": current_round,
+            "claim": f"{v['kind']}: {v['evidence']}",
+        })
+
+    # Recompute action from the adjusted state (same rule ordering as decide()).
+    unresolved_high = d["unresolved_high"]
+    structural = d["structural_mismatch"]
+    rounds_remaining = max_rounds - current_round
+
+    if structural:
+        if rounds_remaining > 0:
+            action = "RETHINK_STRUCTURAL"
+            rationale = (
+                f"Structural mismatch detected by {d['structural_reviewers']}. "
+                f"Must RETHINK — not patchable, not scope-declarable."
+            )
+        else:
+            action = "RUN_FAILED"
+            rationale = (
+                f"Structural mismatch detected by {d['structural_reviewers']} "
+                f"with no rounds remaining. Run fails: delivered model does "
+                f"not answer the question. Do NOT spawn writer."
+            )
+        rule_matched = 1
+    elif unresolved_high and rounds_remaining > 0:
+        action = "PATCH_OR_RETHINK"
+        rationale = (
+            f"{len(unresolved_high)} HIGH blocker(s) unresolved "
+            f"(incl. spec-compliance), {rounds_remaining} round(s) "
+            f"remaining. ACCEPT is forbidden."
+        )
+        rule_matched = 2
+    elif unresolved_high and rounds_remaining <= 0:
+        action = "DECLARE_SCOPE"
+        rationale = (
+            f"{len(unresolved_high)} HIGH blocker(s) unresolved, rounds "
+            f"exhausted. Must write scope_declaration.yaml acknowledging "
+            f"each blocker by id, and writer must embed verbatim in "
+            f"Limitations. DECLARE_SCOPE is NOT the same as ACCEPT."
+        )
+        rule_matched = 3
+    else:
+        action = "ACCEPT"
+        rationale = "No unresolved HIGH blockers, no structural mismatch."
+        rule_matched = 4
+
+    d["action"] = action
+    d["rule_matched"] = rule_matched
+    d["rationale"] = rationale
+    return d
 
 
 def render_text(decision: dict, current_round: int, max_rounds: int) -> str:
@@ -254,6 +365,12 @@ def render_text(decision: dict, current_round: int, max_rounds: int) -> str:
     lines.append(f"  structural_mismatch: {decision['structural_mismatch']}"
                  + (f" (from: {decision['structural_reviewers']})"
                     if decision["structural_mismatch"] else ""))
+    spec = decision.get("spec_violations") or []
+    if spec:
+        lines.append(f"  spec_violations: {len(spec)}")
+        for v in spec:
+            lines.append(f"    - [{v['severity']}] {v['kind']}: "
+                         f"{v['evidence'][:120]}")
     lines.append(f"  rounds_remaining: {decision['rounds_remaining']}")
     lines.append(f"  rule_matched: {decision['rule_matched']}")
     lines.append(f"  action: {decision['action']}")
@@ -269,6 +386,11 @@ def main() -> int:
     p.add_argument("--json", action="store_true",
                    help="Emit machine-readable JSON to stdout (in addition "
                         "to human summary on stderr)")
+    p.add_argument("--spec-compliance", action="store_true",
+                   help="Run spec-compliance checks (framework/approach/"
+                        "budget/archetype) against the research question "
+                        "in metadata.json and fold HIGH violations into "
+                        "the gate decision. See scripts/spec_compliance.py.")
     args = p.parse_args()
 
     if not os.path.isdir(args.run_dir):
@@ -294,6 +416,32 @@ def main() -> int:
         return 3
 
     decision = decide(critiques, args.max_rounds, args.current_round)
+
+    if args.spec_compliance:
+        spec_module = _load_spec_compliance()
+        if spec_module is None:
+            print("ERROR: --spec-compliance requested but scripts/"
+                  "spec_compliance.py could not be imported.", file=sys.stderr)
+            return 2
+        meta_path = os.path.join(args.run_dir, "metadata.json")
+        if not os.path.exists(meta_path):
+            print(f"ERROR: --spec-compliance requires {meta_path} "
+                  f"but it does not exist.", file=sys.stderr)
+            return 2
+        with open(meta_path) as f:
+            meta = json.load(f)
+        question = meta.get("question", "")
+        if not question:
+            print(f"ERROR: {meta_path} has no 'question' field; cannot "
+                  f"run spec-compliance check.", file=sys.stderr)
+            return 2
+        required = spec_module.detect_required_spec(question)
+        check_result = spec_module.check_spec_compliance(required, args.run_dir)
+        decision = incorporate_spec_violations(
+            decision, check_result["violations"],
+            args.max_rounds, args.current_round,
+        )
+
     print(render_text(decision, args.current_round, args.max_rounds),
           file=sys.stderr)
     if args.json:

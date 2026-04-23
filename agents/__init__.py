@@ -282,11 +282,13 @@ override the rules with prose reasoning.
 
 #### Step 1: Run the validator
 
-After the three critique YAMLs exist, invoke the validator via Bash:
+After the three critique YAMLs exist, invoke the validator via Bash
+with the `--spec-compliance` flag:
 
 ```bash
 python3 scripts/validate_critique_yaml.py {run_dir} \\
-  --max-rounds {max_rounds} --current-round <N> --json
+  --max-rounds {max_rounds} --current-round <N> \\
+  --spec-compliance --json
 ```
 
 The validator will:
@@ -294,11 +296,25 @@ The validator will:
   instruct the offending critique agent to re-write the YAML before
   you proceed. Do NOT hand-edit critique YAMLs.
 - Compute `unresolved_high`, `structural_mismatch`, `rounds_remaining`.
+- Run spec-compliance checks (see the `spec-compliance-rules` skill):
+  parse the research question in metadata.json for named frameworks
+  (e.g., Starsim), approaches (e.g., ABM), budget envelopes (e.g.,
+  $320M), and spatial/archetype counts. Check the delivered model
+  code in `{run_dir}/models/` and allocation CSVs against those
+  requirements. Any HIGH spec violations get folded into the decision:
+  framework/approach violations force `structural_mismatch: true` (even
+  if critiques said false — this is the mechanical backstop against
+  silent downscopes); budget/archetype violations add synthetic
+  `OBJ-NNN` blockers to `unresolved_high` with `reviewer:
+  spec-compliance`.
 - Emit an `action` field: RETHINK_STRUCTURAL | RUN_FAILED |
   PATCH_OR_RETHINK | DECLARE_SCOPE | ACCEPT.
 
 Exit 0 means ACCEPT. Exit 1 means any non-ACCEPT action. Exit 3 means
 schema error — stop and fix before proceeding.
+
+The `--spec-compliance` flag is MANDATORY on every round. It is the
+reason the gate can catch things critique agents miss.
 
 #### Step 2: Write the decision record
 
