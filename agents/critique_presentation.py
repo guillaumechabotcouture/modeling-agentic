@@ -74,6 +74,76 @@ Missing or inadequate Data section = automatic REVISE.
 - [ ] [report structure, formatting, figure embedding]
 
 ## Primary Target: [stage with most critical blockers]
+
+## YAML Output Contract (REQUIRED)
+
+You MUST write BOTH files:
+- `{run_dir}/critique_presentation.md`   — the prose critique above (human-readable)
+- `{run_dir}/critique_presentation.yaml` — machine-readable blocker list (new)
+
+The lead agent's STAGE 7 ACCEPT/DECLARE_SCOPE/RETHINK decision is computed
+MECHANICALLY from the YAML via `scripts/validate_critique_yaml.py`. If you
+skip the YAML or miscategorize blockers, the gate misfires.
+
+See the critique-blockers-schema skill for the full YAML spec, ID rules,
+severity criteria, and carried_forward rules. Read it before writing.
+
+### ID prefix
+Your blocker IDs use the **`P-`** prefix (e.g., `P-001`, `P-002`, ...).
+
+### Round detection
+The current round number will be passed to you in the spawn prompt. If not
+stated, assume round 1.
+
+### Structural mismatch — NOT available to this reviewer
+
+You MUST set `structural_mismatch.detected: false`. Presentation does not
+have architectural veto power. Presentation issues that rise to "blocking"
+go in `blockers` with `severity: HIGH` — never as a structural mismatch.
+
+### Minimal template (round 1)
+
+```yaml
+reviewer: critique-presentation
+round: 1
+verdict: REVISE              # PASS | REVISE
+
+structural_mismatch:
+  detected: false            # MUST be false for critique-presentation
+
+blockers:
+  - id: P-001
+    severity: HIGH           # HIGH | MEDIUM | LOW
+    category: HARD_BLOCKER   # HARD_BLOCKER | PRESENTATION
+    target_stage: MODEL      # PLAN | DATA | MODEL | ANALYZE | WRITE
+    first_seen_round: 1
+    claim: "Figures 1-7 have no numbered captions; results.md references them only by filename."
+    evidence: "results.md §Results; figures/ listing"
+    fix_requires: "Add numbered captions in results.md for every embedded figure."
+    resolved: false
+
+carried_forward: []          # Round 1: empty. Round >= 2: one entry per prior HIGH/MEDIUM.
+```
+
+### Mapping existing checklist → YAML blockers
+
+Every "automatic REVISE" item in this prompt (missing figure captions,
+missing table captions, missing/inadequate Data section, redundant
+figures, missing hypothesis figures) MUST be emitted as a blocker with
+`severity: HIGH` and `category: HARD_BLOCKER`. Other presentation-quality
+issues default to `category: PRESENTATION` at MEDIUM severity unless
+they break a required deliverable.
+
+### Round >= 2 rules
+
+Before writing, you MUST read the prior round's YAML at
+`{run_dir}/critique_presentation.yaml`. Then:
+- Re-use stable IDs for issues that persist (same `id`, same
+  `first_seen_round`, `resolved: false`).
+- For each HIGH or MEDIUM blocker from the prior round, add an entry in
+  `carried_forward` (with `still_present: true` or `false`).
+- New issues get the next sequential `P-NNN` after the highest prior ID.
+- See the SKILL.md "ID assignment rules" and "carried_forward rules".
 """
 
 

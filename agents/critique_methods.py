@@ -80,6 +80,78 @@ Target the RIGHT stage:
 - [ ] [metrics misinterpreted, validation overclaimed]
 
 ## Primary Target: [stage with most critical blockers]
+
+## YAML Output Contract (REQUIRED)
+
+You MUST write BOTH files:
+- `{run_dir}/critique_methods.md`   — the prose critique above (human-readable)
+- `{run_dir}/critique_methods.yaml` — machine-readable blocker list (new)
+
+The lead agent's STAGE 7 ACCEPT/DECLARE_SCOPE/RETHINK decision is computed
+MECHANICALLY from the YAML via `scripts/validate_critique_yaml.py`. If you
+skip the YAML or miscategorize blockers, the gate misfires.
+
+See the critique-blockers-schema skill for the full YAML spec, ID rules,
+severity criteria, and carried_forward rules. Read it before writing.
+
+### ID prefix
+Your blocker IDs use the **`M-`** prefix (e.g., `M-001`, `M-002`, ...).
+
+### Round detection
+The current round number will be passed to you in the spawn prompt. If not
+stated, assume round 1.
+
+### Minimal template (round 1)
+
+```yaml
+reviewer: critique-methods
+round: 1
+verdict: REVISE              # PASS | REVISE
+
+structural_mismatch:
+  detected: false
+  # Set detected: true ONLY when the model CLASS is wrong for the question:
+  #   - question requires stochastic dynamics, model is deterministic ODE
+  #   - question requires time-series, model is cross-sectional regression
+  #   - question names a framework (ABM, Starsim, compartmental SEIR) and
+  #     the delivered model does not use it
+  # When detected: true, REQUIRED fields:
+  #   description: "..."
+  #   evidence_files: ["model/core.py", "plan.md:§3.2"]
+  #   fix_requires: RETHINK
+
+blockers:
+  - id: M-001
+    severity: HIGH           # HIGH | MEDIUM | LOW
+    category: HARD_BLOCKER   # HARD_BLOCKER | METHODS | CITATIONS | DATA | STRUCTURAL | ...
+    target_stage: MODEL      # PLAN | DATA | MODEL | ANALYZE | WRITE
+    first_seen_round: 1
+    claim: "Primary model skill score -0.14 vs baseline on held-out test."
+    evidence: "results.md §Baseline; figures/skill_bar.png"
+    fix_requires: "Add seasonality or switch to state-space, OR declare scope."
+    resolved: false
+
+carried_forward: []          # Round 1: empty. Round >= 2: one entry per prior HIGH/MEDIUM.
+```
+
+### Mapping existing checklist → YAML blockers
+
+Every item in your "Hard Blockers (any = automatic REVISE)" list above
+that you actually find in the run MUST be emitted as a blocker with
+`severity: HIGH` and `category: HARD_BLOCKER`. Every "HIGH-severity hard
+blocker" called out in the Parameter Provenance Check MUST be emitted as
+`severity: HIGH` and `category: CITATIONS`.
+
+### Round >= 2 rules
+
+Before writing, you MUST read the prior round's YAML at
+`{run_dir}/critique_methods.yaml`. Then:
+- Re-use stable IDs for issues that persist (same `id`, same
+  `first_seen_round`, `resolved: false`).
+- For each HIGH or MEDIUM blocker from the prior round, add an entry in
+  `carried_forward` (with `still_present: true` or `false`).
+- New issues get the next sequential `M-NNN` after the highest prior ID.
+- See the SKILL.md "ID assignment rules" and "carried_forward rules".
 """
 
 

@@ -14,6 +14,21 @@ from agents import (
 
 MAX_FIGURE_PIXELS = 10_000_000  # 10MP -- anything larger is likely a bug
 
+# Mirror of maxTurns configured in build_agents(). Used by subagent_stop_hook
+# to annotate stop events with an approximate stop reason (ran_to_cap vs
+# completed_under_cap) based on observed tool-use count.
+AGENT_MAX_TURNS = {
+    "planner": 80,
+    "data-agent": 60,
+    "modeler": 100,
+    "model-tester": 60,
+    "analyst": 40,
+    "critique-methods": 35,
+    "critique-domain": 40,
+    "critique-presentation": 25,
+    "writer": 60,
+}
+
 
 # ---------------------------------------------------------------------------
 # Utilities (kept from prior version)
@@ -231,87 +246,121 @@ Spawn ALL THREE critique agents simultaneously in a SINGLE response:
 Do NOT use background: true. Spawn them in the foreground so you
 receive their results directly before moving to Stage 7.
 
-Tell each one the research question and run directory, and which file
-to write (critique_methods.md, critique_domain.md, critique_presentation.md).
+Tell each one the research question, run directory, AND the current
+critique round number (starts at 1, increments per revision cycle).
+Each critique agent writes TWO files:
+- `critique_{name}.md` — human-readable prose (as before)
+- `critique_{name}.yaml` — machine-readable blocker manifest (see the
+  `critique-blockers-schema` skill for the required schema)
 
 Wait for all three to complete.
 
-### STAGE 7: STRATEGIC DECISION (YOU decide)
-Read all three critique files yourself. Then, BEFORE triaging individual
-items, do a fit-for-purpose assessment:
+### STAGE 7: MECHANICAL DECISION GATE
 
-#### FIT-FOR-PURPOSE GATE (do this first — see model-fitness skill)
+The STAGE 7 decision is NOT a free judgment call. You compute it
+mechanically from the three critique YAML files. You do not get to
+override the rules with prose reasoning.
 
-Use the model-fitness skill's evaluation checklist. Re-read the original
-research question, then assess:
+#### Step 1: Run the validator
 
-1. WHO IS THE AUDIENCE and what do they require? (The skill has specific
-   requirements for Global Fund, WHO, journals, and internal use.)
-2. WHAT DECISIONS will be made? List the intervention comparisons.
-3. For EACH comparison: does the model capture the MECHANISM that
-   differentiates the options? (The skill calls this the "mechanism test.")
-4. Does the model answer the SAME question that was asked, or a SIMPLER
-   one? (The skill calls this the "simpler question test.")
-5. Would the audience ENGAGE with the results or REJECT the structure?
-   (The skill calls this the "audience rejection test.")
+After the three critique YAMLs exist, invoke the validator via Bash:
 
-If #3, #4, or #5 reveals a structural gap: this is RETHINK and the
-model needs Level escalation — regardless of what individual critique
-items say. Do not let individually-patchable items distract from a
-structural mismatch.
+```bash
+python3 scripts/validate_critique_yaml.py {run_dir} \\
+  --max-rounds {max_rounds} --current-round <N> --json
+```
 
-Write your fit-for-purpose assessment in {run_dir}/progress.md before
-proceeding to the decision framework below.
+The validator will:
+- Schema-check all three YAML files. Exit code 3 = schema error;
+  instruct the offending critique agent to re-write the YAML before
+  you proceed. Do NOT hand-edit critique YAMLs.
+- Compute `unresolved_high`, `structural_mismatch`, `rounds_remaining`.
+- Emit an `action` field: RETHINK_STRUCTURAL | RUN_FAILED |
+  PATCH_OR_RETHINK | DECLARE_SCOPE | ACCEPT.
 
-#### Decision framework
+Exit 0 means ACCEPT. Exit 1 means any non-ACCEPT action. Exit 3 means
+schema error — stop and fix before proceeding.
 
-**PATCH** — Code bugs, wrong parameter values, missing outputs,
-presentation fixes. The model STRUCTURE is correct but the
-IMPLEMENTATION has errors. Re-spawn the modeler with specific fixes.
+#### Step 2: Write the decision record
 
-**RETHINK** — The model structure cannot answer the research question.
-Signs that RETHINK is needed (choose RETHINK, not PATCH, if ANY apply):
-- Critique says the model lacks a feature needed for the stated PURPOSE
-  (e.g., "can't evaluate age-targeted interventions without age structure",
-  "can't compute DALYs without a mortality module", "can't compare to
-  policy X without sub-regional resolution")
-- The model can't reproduce a key calibration target due to missing
-  compartments or mechanisms (not just wrong parameter values)
-- Same metric hasn't improved after 1 PATCH round
-- Multiple HIGH-severity critiques point at the same structural gap
-- The model answers a SIMPLER question than what was asked
+Before taking any action, append a `## Stage 7 decision (round N)`
+section to `{run_dir}/progress.md` containing the validator's JSON
+output verbatim, plus one sentence explaining your planned next step
+(e.g., "RETHINK: modeler to re-spawn with instructions to add an
+age-structured compartment and keep the Level 1 model as baseline").
 
-When you RETHINK: tell the modeler what structural change is needed
-(add compartments, add age groups, change spatial resolution) and why.
-Reference the modeling strategy progression: Level 1 → Level 2.
-The modeler should keep Level 1 as a baseline and build Level 2 on top.
+This is your audit trail. Future resumes read it.
 
-**REDIRECT** — Problem is upstream of the model: data gaps prevent
-calibration, hypotheses are untestable, wrong question framing.
-Re-spawn data-agent or planner as appropriate.
+#### Step 3: Execute the action
 
-**ACCEPT** — Model is fit for its stated purpose, key hypotheses have
-verdicts, hard blockers resolved, metrics reasonable.
-Proceed to STAGE 8.
+The validator has already decided for you. Your job is to carry it out:
 
-**DECLARE_SCOPE** — Model answers SOME but not all parts of the question.
-Some hypotheses untestable. A structural limitation won't resolve with
-more patches. The model IS fit for its primary purpose even if imperfect.
-Write a scope declaration and proceed to STAGE 8.
+- **RETHINK_STRUCTURAL**: the model's architecture does not match the
+  question. Do NOT patch. Do NOT DECLARE_SCOPE. Re-spawn the modeler
+  with the structural-mismatch `description` from the critique YAML as
+  the primary instruction. Reference modeling strategy Level
+  progression where appropriate.
 
-CRITICAL RULES:
-- If ANY critique flags a HIGH-severity unresolved issue, you MUST fix
-  it before accepting. Do NOT accept with known contradictions.
-- If the same hard blocker persists for 2+ rounds, RETHINK or DECLARE_SCOPE.
-  Do NOT keep patching.
-- RETHINK early is cheap. If round 1 critique reveals structural issues,
-  RETHINK immediately — don't waste a round patching a broken structure.
-- Track round count. After {max_rounds} rounds, DECLARE_SCOPE and proceed.
-- When re-spawning an agent, pass the SPECIFIC critique feedback — not
-  just "fix the issues." Quote the critique items verbatim.
+- **RUN_FAILED**: structural mismatch AND no rounds remaining. Write
+  `RUN_FAILED` at the top of progress.md with the structural mismatch
+  description. Do NOT spawn the writer. End the pipeline. The
+  delivered model does not answer the question asked; shipping a
+  report would misrepresent what was built.
 
-After deciding, if not accepting, go back to the targeted stage (STAGE 2,
-3, or 4) and continue from there.
+- **PATCH_OR_RETHINK**: HIGH blockers remain and rounds are left. You
+  choose PATCH vs RETHINK using the heuristics below. ACCEPT is
+  forbidden. DECLARE_SCOPE is forbidden.
+
+  * **PATCH** when blockers are `target_stage: MODEL | ANALYZE` and
+    category is HARD_BLOCKER, METHODS, CAUSAL, HYPOTHESES, CITATIONS,
+    or PRESENTATION, AND none of the PATCH→RETHINK escalation triggers
+    below apply. Re-spawn the target_stage agent with the verbatim
+    `claim` + `fix_requires` text from each blocker.
+
+  * **RETHINK** when ANY apply:
+    - Any blocker has `category: STRUCTURAL`.
+    - The same blocker `id` has `first_seen_round < current_round`
+      AND was not resolved by an intervening patch (check
+      `carried_forward[].still_present: true` in the latest critique).
+      Don't patch the same thing twice.
+    - Two or more HIGH blockers across critiques point at the same
+      model mechanism (e.g., all three mention "no age structure").
+
+  * **REDIRECT** (subcase of PATCH) when all unresolved HIGH blockers
+    have `target_stage: PLAN | DATA`. Re-spawn planner or data-agent
+    with the verbatim blocker text, not the modeler.
+
+- **DECLARE_SCOPE**: HIGH blockers remain and rounds exhausted.
+  Before spawning the writer, you MUST write
+  `{run_dir}/scope_declaration.yaml` acknowledging each unresolved
+  HIGH blocker by id with a `why_unresolved` paragraph and an
+  `impact_on_conclusions` paragraph. Then include in the writer spawn
+  the instruction: "Embed the scope_declaration.yaml acknowledgments
+  verbatim in report.md §Limitations. Do not soften the language. Do
+  not omit blockers."
+
+- **ACCEPT**: no unresolved HIGH blockers, no structural mismatch.
+  Proceed to STAGE 8.
+
+#### Forbidden moves
+
+You cannot:
+- Skip the validator. Every round 6 decision must follow a Bash call
+  to `validate_critique_yaml.py`.
+- ACCEPT while `unresolved_high` is non-empty.
+- DECLARE_SCOPE while `structural_mismatch` is true.
+- DECLARE_SCOPE while rounds remain.
+- Overrule the validator's action with prose. If you believe a HIGH
+  blocker is mis-severity, instruct the critique agent to re-write
+  the YAML and re-run the validator. Do not paper over it.
+
+When re-spawning an agent after PATCH/RETHINK/REDIRECT, pass the
+SPECIFIC blocker text — not just "fix the issues." Quote the
+`claim` and `fix_requires` fields verbatim, grouped by blocker id.
+
+After deciding, if not ACCEPTing, go back to the targeted stage
+(STAGE 2, 3, or 4) and continue from there. Increment the round
+counter before the next STAGE 6.
 
 ### STAGE 8: WRITE
 Spawn the "writer" agent. Tell it the run directory.
@@ -362,6 +411,7 @@ def create_hooks(run_path: str, trace_file, start_time: datetime):
     """Create hook config for the lead query() session."""
 
     tool_count = 0
+    per_agent_tool_counts: dict[str, int] = {}
 
     def _format_tool(name: str, input_data: dict) -> str:
         if name == "WebSearch":
@@ -390,6 +440,7 @@ def create_hooks(run_path: str, trace_file, start_time: datetime):
         tool_name = input_data.get("tool_name", "unknown")
         tool_input = input_data.get("tool_input", {})
         agent_id = input_data.get("agent_id", "lead")
+        per_agent_tool_counts[agent_id] = per_agent_tool_counts.get(agent_id, 0) + 1
         summary = _format_tool(tool_name, tool_input)
         elapsed = (datetime.now() - start_time).total_seconds()
         label = agent_id if agent_id != "lead" else "lead"
@@ -441,13 +492,27 @@ def create_hooks(run_path: str, trace_file, start_time: datetime):
         agent_id = input_data.get("agent_id", "?")
         agent_type = input_data.get("agent_type", "?")
         elapsed = (datetime.now() - start_time).total_seconds()
-        print(f"--- SUBAGENT STOP: {agent_type} (id={agent_id}) [{elapsed:.0f}s] ---\n", flush=True)
+        turns_used = per_agent_tool_counts.get(agent_id, 0)
+        max_turns = AGENT_MAX_TURNS.get(agent_type, None)
+        if max_turns is None:
+            approx_stop_reason = "unknown"
+        elif turns_used >= max_turns - 2:
+            approx_stop_reason = "ran_to_cap"
+        else:
+            approx_stop_reason = "completed_under_cap"
+        print(
+            f"--- SUBAGENT STOP: {agent_type} (id={agent_id}) [{elapsed:.0f}s] "
+            f"turns={turns_used} {approx_stop_reason} ---\n",
+            flush=True,
+        )
         trace_file.write(json.dumps({
             "ts": datetime.now().isoformat(),
             "elapsed_s": elapsed,
             "type": "subagent_stop",
             "agent_id": agent_id,
             "agent_type": agent_type,
+            "turns_used": turns_used,
+            "approx_stop_reason": approx_stop_reason,
         }) + "\n")
         trace_file.flush()
         return {}

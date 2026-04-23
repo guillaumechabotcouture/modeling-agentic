@@ -176,7 +176,6 @@ async def run(question: str, max_rounds: int, max_sessions: int,
         "{max_rounds}", str(max_rounds)
     )
     lead_prompt = build_lead_prompt(question, run_dir_rel, max_rounds, resume_context)
-    hooks = create_hooks(run_path, open(trace_path, "a"), run_start)
 
     session_id = None
 
@@ -191,6 +190,12 @@ async def run(question: str, max_rounds: int, max_sessions: int,
             "type": "session_start",
             "session": session_num,
         }) + "\n")
+        # Create hooks per session so the hook closure captures the current
+        # (freshly opened) trace_file. Previously hooks captured a file opened
+        # once before the loop; after a session crash that fd was closed and
+        # subsequent sessions' tool_use / subagent_start/stop events silently
+        # failed to write.
+        hooks = create_hooks(run_path, trace_file, run_start)
 
         # On resume sessions, use the saved session_id if available
         options = ClaudeAgentOptions(
