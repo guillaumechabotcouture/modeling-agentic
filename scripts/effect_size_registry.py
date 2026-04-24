@@ -49,7 +49,8 @@ except ImportError:
 VALID_KINDS = {
     "odds_ratio", "relative_risk", "hazard_ratio", "incidence_rate_ratio",
     "efficacy", "coverage", "proportion", "rate", "cost_usd",
-    "prevalence", "duration_days",
+    "prevalence", "duration_days", "dimensionless", "count",
+    "population", "probability", "ratio",
 }
 RATIO_KINDS = {"odds_ratio", "relative_risk", "hazard_ratio", "incidence_rate_ratio"}
 BOUNDED_01_KINDS = {"efficacy", "coverage", "proportion", "prevalence"}
@@ -66,13 +67,20 @@ _CONVERSION_TOKENS = (
 # Parse citations.md
 # ---------------------------------------------------------------------------
 
-_YAML_BLOCK_RE = re.compile(
-    r"##\s*Parameter\s+Registry[^\n]*\n(?:.*?\n)*?"
-    r"```(?:yaml|yml)\s*\n"
-    r"(?P<body>.*?)"
-    r"\n```",
-    re.IGNORECASE | re.DOTALL,
+# Header of the Parameter Registry section. Linear scan.
+_REGISTRY_HEADER_RE = re.compile(
+    r"^##\s*Parameter\s+Registry[^\n]*$",
+    re.IGNORECASE | re.MULTILINE,
 )
+# Fenced ```yaml ... ``` block — anchored to the fence opening so the
+# engine can't backtrack across the whole tail of the file.
+_YAML_FENCE_RE = re.compile(
+    r"```(?:yaml|yml)?[ \t]*\n(?P<body>[\s\S]*?)\n```",
+    re.IGNORECASE,
+)
+# Next top-level section header (`## `) after a given offset — used to
+# bound the Parameter Registry section.
+_NEXT_H2_RE = re.compile(r"^##\s", re.MULTILINE)
 
 # Match per-parameter detail sections like `### <name> (detail)` or bare
 # `### <name>`. Captures the name from the first word after ###.
@@ -81,12 +89,21 @@ _DETAIL_HEADER_RE = re.compile(
     re.MULTILINE,
 )
 
-# Match a top-level bullet within a detail section:
-#   - **key**: value...
-# Used to harvest non-code-refs fields.
+# Match the HEADER of a top-level bullet within a detail section:
+#   - **key**: <rest-of-line>
+# We intentionally match only the first line (no DOTALL). The bullet's
+# full value is reconstructed by slicing the body between consecutive
+# bullet header positions — this avoids catastrophic backtracking from
+# combining `.*?` with a complex lookahead.
 _DETAIL_BULLET_RE = re.compile(
-    r"^-\s+\*\*(?P<key>[\w_-]+)\*\*\s*:\s*(?P<value>.*?)(?=\n-\s+\*\*|\n###|\n##|\Z)",
-    re.MULTILINE | re.DOTALL,
+    r"^-\s+\*\*(?P<key>[\w_-]+)\*\*\s*:[ \t]*(?P<first_line>[^\n]*)$",
+    re.MULTILINE,
+)
+# A line that ends a bullet's continuation range (next top-level bullet,
+# next section header, or end-of-text).
+_BULLET_BOUNDARY_RE = re.compile(
+    r"^(?:-\s+\*\*[\w_-]+\*\*\s*:|##\s|###\s)",
+    re.MULTILINE,
 )
 
 # Within a `code_refs` bullet, each sub-bullet is a file:line reference.
@@ -124,24 +141,43 @@ def _parse_detail_sections(text: str, yaml_end: int) -> dict[str, dict]:
         body = tail[start:end]
 
         details: dict = {}
-        for bullet in _DETAIL_BULLET_RE.finditer(body):
+        # Collect bullet headers, then slice body between consecutive
+        # boundaries. Linear scan — no backtracking.
+        bullets = list(_DETAIL_BULLET_RE.finditer(body))
+        for j, bullet in enumerate(bullets):
             key = bullet.group("key").lower()
-            value = bullet.group("value")
+            first_line = bullet.group("first_line")
+            # Continuation slice: from end of header line to the next
+            # boundary (top-level bullet or section header).
+            cont_start = bullet.end()
+            cont_end = len(body)
+            boundary = _BULLET_BOUNDARY_RE.search(body, cont_start + 1)
+            if boundary is not None:
+                cont_end = boundary.start()
+            continuation = body[cont_start:cont_end]
+
             if key == "code_refs":
-                # Sub-bullets: each line `  - <ref>` becomes a cleaned ref.
+                # Sub-bullets live in the continuation, one per line.
                 refs = []
-                for m in _CODE_REF_LINE_RE.finditer(value):
+                for m in _CODE_REF_LINE_RE.finditer(continuation):
                     raw = m.group(1).strip()
-                    # Drop trailing parenthetical annotations, keep "file:line".
-                    # `models/optimization.py:73 (LLIN_OR = 0.44)` -> `models/optimization.py:73`
                     cleaned = re.split(r"\s*\(", raw, maxsplit=1)[0].strip()
                     if cleaned:
                         refs.append(cleaned)
                 if refs:
                     details["code_refs"] = refs
             else:
-                # Single-line value: strip trailing whitespace/newlines.
-                details[key] = value.strip()
+                # Single-line value: prefer first_line when populated,
+                # else fall back to the continuation's first non-blank
+                # line (handles `- **key**:\n  value` shape).
+                value = first_line.strip()
+                if not value:
+                    for line in continuation.splitlines():
+                        stripped = line.strip()
+                        if stripped:
+                            value = stripped
+                            break
+                details[key] = value
 
         if details:
             out[name] = details
@@ -163,22 +199,46 @@ def load_priors(citations_md_path: str) -> dict[str, Any]:
         raise FileNotFoundError(f"citations.md not found: {citations_md_path}")
     with open(citations_md_path) as f:
         text = f.read()
-    m = _YAML_BLOCK_RE.search(text)
-    if m is None:
+
+    # Step 1: find the `## Parameter Registry` header, then the next
+    # top-level section header that bounds it. Linear scans, no
+    # backtracking hazards.
+    header = _REGISTRY_HEADER_RE.search(text)
+    if header is None:
         return {"parameters": []}
+    section_start = header.end()
+    next_h2 = _NEXT_H2_RE.search(text, section_start + 1)
+    section_end = next_h2.start() if next_h2 else len(text)
+    section = text[section_start:section_end]
+
+    # Step 2: try a fenced ```yaml block first; fall back to bare YAML
+    # (common modeler shape is to write the mapping/list directly under
+    # the section header, no fences).
+    fence = _YAML_FENCE_RE.search(section)
+    if fence is not None:
+        yaml_text = fence.group("body")
+        yaml_end_in_text = section_start + fence.end()
+    else:
+        yaml_text = section
+        yaml_end_in_text = section_end
+
     try:
-        body = yaml.safe_load(m.group("body"))
+        body = yaml.safe_load(yaml_text)
     except yaml.YAMLError as e:
         raise ValueError(f"invalid YAML in Parameter Registry: {e}")
+
+    # Accept both shapes: `{parameters: [...]}` or a bare list `[...]`.
+    if isinstance(body, list):
+        body = {"parameters": body}
     if not isinstance(body, dict) or "parameters" not in body:
-        raise ValueError("Parameter Registry YAML must be a mapping with "
-                         "a top-level `parameters:` list")
+        raise ValueError("Parameter Registry must be a list of parameter "
+                         "mappings or a mapping with a `parameters:` list")
     params = body.get("parameters") or []
     if not isinstance(params, list):
         raise ValueError("`parameters:` must be a list")
 
-    # Merge detail sections from after the YAML fence.
-    details_by_name = _parse_detail_sections(text, m.end())
+    # Merge detail sections from after the YAML body.
+    details_by_name = _parse_detail_sections(text, yaml_end_in_text)
 
     for i, p in enumerate(params):
         if not isinstance(p, dict):
