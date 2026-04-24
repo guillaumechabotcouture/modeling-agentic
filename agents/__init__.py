@@ -242,10 +242,69 @@ If this is a revision round, include the specific critique feedback.
 Wait for completion. Read {run_dir}/model_comparison.md to confirm models
 ran and metrics were reported.
 
+Modeler outputs additionally required by Phase 2:
+- `{run_dir}/models/outcome_fn.py` exposing `outcome_fn(params) -> dict`
+  for STAGE 5b UNCERTAINTY (see uncertainty-quantification skill).
+- `{run_dir}/models/model_comparison.yaml` listing ≥3 candidate model
+  structures with predictions and (ideally) LOO predictions (see
+  multi-structural-comparison skill).
+- `{run_dir}/models/identifiability.yaml` listing fitted parameters
+  with bounds and a loss_fn reference (see identifiability-analysis skill).
+
 ### STAGE 5: ANALYZE
 Spawn the "analyst" agent. Tell it the run directory.
 Wait for completion. Read {run_dir}/results.md to confirm hypothesis
 verdicts exist with causal labels.
+
+### STAGE 5b: RIGOR (UNCERTAINTY + MULTI-STRUCTURAL + IDENTIFIABILITY)
+
+Run three mechanical rigor checks after analysis and before critique. All
+three are invoked directly via Bash — no subagent spawn.
+
+#### Step 1: Multi-structural comparison
+
+```bash
+python3 scripts/compare_models.py {run_dir}
+```
+
+Reads `models/model_comparison.yaml` (modeler must have supplied it).
+Writes `model_comparison_formal.yaml`. Flags DEGENERATE_FIT_DETECTED when
+training RMSE is near-zero but LOO-CV RMSE is large — the "AIC lies"
+pattern. A flagged degenerate fit must be addressed in
+`modeling_strategy.md` (partial pooling, tied parameters, or honest
+scope declaration) before STAGE 7 can ACCEPT. See
+`multi-structural-comparison` skill.
+
+#### Step 2: Uncertainty propagation
+
+```bash
+python3 scripts/propagate_uncertainty.py {run_dir} --n-draws 200
+```
+
+Reads registered parameter priors from `citations.md` (`## Parameter
+Registry` section, see effect-size-priors skill) and runs
+`models/outcome_fn.py::outcome_fn` 200 times with sampled params. Writes
+`uncertainty_report.yaml` with per-output credible intervals and
+categorical stability distributions. See `uncertainty-quantification`
+skill.
+
+If `outcome_fn` is too slow for 200 local draws (>2 hours total), the
+modeler should build a surrogate or use cloud compute — see the
+`cloud-compute` skill for the decision rule and spot-instance config.
+
+#### Step 3: Identifiability
+
+```bash
+python3 scripts/identifiability.py {run_dir}
+```
+
+Reads `models/identifiability.yaml` (modeler supplies). Computes Fisher
+SEs and profile-likelihood scans. Writes `identifiability.yaml` flagging
+any fitted parameters that are ridge-trapped (unidentified). See
+`identifiability-analysis` skill.
+
+After all three pass (or the modeler explicitly scope-declares any
+flagged issues), proceed to STAGE 6 CRITIQUE.
 
 ### STAGE 6: CRITIQUE (PARALLEL)
 Spawn ALL FOUR critique agents simultaneously in a SINGLE response:

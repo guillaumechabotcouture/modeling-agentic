@@ -331,6 +331,66 @@ doesn't exist).
 
 Skipping the registry for a load-bearing parameter is a MEDIUM blocker.
 Misclassifying kind or introducing OR/RR conflation is a HIGH blocker.
+
+## PHASE 2 RIGOR ARTIFACTS (REQUIRED)
+
+After calibration, produce three additional artifacts that feed the
+STAGE 5b mechanical rigor checks:
+
+### 1. Uncertainty quantification — `{run_dir}/models/outcome_fn.py`
+
+Expose a deterministic callable `outcome_fn(params: dict) -> dict` that
+runs the decision-relevant portion of the model under a specific
+parameter set. See the `uncertainty-quantification` skill. The lead
+runs `scripts/propagate_uncertainty.py` which samples 200 draws from
+registered parameter priors (above) and aggregates per-output CIs.
+
+If the full model is too slow for 200 local draws (>2 hours total),
+build a surrogate (emulator on a sparse grid of full-model runs) and
+expose the surrogate via `outcome_fn`. Document the surrogate's RMSE
+against grid points in `models/outcome_fn_calibration.md`.
+
+Alternative: use cloud compute via `modelops-calabaria` / `mops`. See
+the `cloud-compute` skill for the decision rule (spot instances,
+budget guards, auto-teardown) — but a good surrogate is usually the
+simpler option.
+
+### 2. Multi-structural comparison — `{run_dir}/models/model_comparison.yaml`
+
+Produce ≥3 candidate model structures (null, simple, full) and a
+comparison manifest. See the `multi-structural-comparison` skill for
+the schema. The lead runs `scripts/compare_models.py` which computes
+RMSE, LOO-CV RMSE, AIC, BIC, and flags DEGENERATE FIT (saturated
+parameterization hiding as a great calibration).
+
+A degenerate-fit flag requires resolution before ACCEPT: partial
+pooling, tied parameters, or explicit scope declaration.
+
+### 3. Identifiability — `{run_dir}/models/identifiability.yaml`
+
+Expose a loss function (typically in outcome_fn.py) and a manifest
+listing each fitted parameter with its point estimate and plausible
+bounds. See the `identifiability-analysis` skill. The lead runs
+`scripts/identifiability.py` which computes Fisher SEs and profile-
+likelihood scans, flagging any parameter that's ridge-trapped
+(unidentified).
+
+Unidentified parameters used in policy outputs are a HIGH blocker.
+Resolve via informative priors, tying redundant parameters, or
+removing the parameter (fix at a default).
+
+### Time budget guidance
+
+These three artifacts are additional deliverables, not optional. Budget
+~20% of your total turn count to produce them rigorously. The three
+scripts are fast:
+- `propagate_uncertainty.py` ~ minutes for 200 draws IF outcome_fn is fast
+- `compare_models.py` ~ seconds (just computes ICs from your predictions)
+- `identifiability.py` ~ seconds × (n_params × 20 profile points)
+
+The expensive part is building `outcome_fn` and fitting ≥3 candidate
+structures. Design for this from the start — don't tack it on at the
+end of a round.
 """
 
 

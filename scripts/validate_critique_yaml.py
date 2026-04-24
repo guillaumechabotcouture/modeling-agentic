@@ -276,7 +276,189 @@ def decide(critiques: dict[str, dict], max_rounds: int,
         "rationale": rationale,
         "spec_violations": [],
         "registry_violations": [],
+        "rigor_violations": [],
     }
+
+
+def _check_rigor_artifacts(run_dir: str) -> list[dict]:
+    """Check for Phase 2 rigor artifacts. Returns a list of violations.
+
+    Each rigor stage has a prerequisite + an artifact:
+      UQ: outcome_fn.py (prereq) + uncertainty_report.yaml (artifact)
+      Multi-structural: model_comparison.yaml (prereq) + model_comparison_formal.yaml (artifact)
+      Identifiability: identifiability.yaml in models/ (prereq) + identifiability.yaml in run_dir (artifact)
+
+    Missing artifact when prereq exists → HIGH blocker. If neither exists,
+    the modeler didn't engage with that stage at all — SEPARATE MEDIUM
+    blocker flagging the missing prerequisite.
+    """
+    violations = []
+
+    # UQ: outcome_fn.py → uncertainty_report.yaml
+    outcome_fn_path = os.path.join(run_dir, "models", "outcome_fn.py")
+    uq_report_path = os.path.join(run_dir, "uncertainty_report.yaml")
+    if os.path.exists(outcome_fn_path):
+        if not os.path.exists(uq_report_path):
+            violations.append({
+                "kind": "uq_report_missing",
+                "severity": "HIGH",
+                "stage": "UQ",
+                "claim": ("models/outcome_fn.py exists but "
+                          "uncertainty_report.yaml is missing. Run "
+                          "`python3 scripts/propagate_uncertainty.py {run_dir}` "
+                          "to generate it. See uncertainty-quantification skill."),
+            })
+    else:
+        violations.append({
+            "kind": "outcome_fn_missing",
+            "severity": "MEDIUM",
+            "stage": "UQ",
+            "claim": ("models/outcome_fn.py is absent — modeler did not expose "
+                      "a deterministic outcome function for uncertainty "
+                      "propagation. See uncertainty-quantification skill."),
+        })
+
+    # Multi-structural: models/model_comparison.yaml → model_comparison_formal.yaml
+    msc_manifest = os.path.join(run_dir, "models", "model_comparison.yaml")
+    msc_report = os.path.join(run_dir, "model_comparison_formal.yaml")
+    if os.path.exists(msc_manifest):
+        if not os.path.exists(msc_report):
+            violations.append({
+                "kind": "msc_report_missing",
+                "severity": "HIGH",
+                "stage": "MULTI_STRUCTURAL",
+                "claim": ("models/model_comparison.yaml exists but "
+                          "model_comparison_formal.yaml is missing. Run "
+                          "`python3 scripts/compare_models.py {run_dir}`. "
+                          "See multi-structural-comparison skill."),
+            })
+        else:
+            # Additionally check the formal report for DEGENERATE_FIT_DETECTED
+            try:
+                with open(msc_report) as f:
+                    formal = yaml.safe_load(f) or {}
+                verdict = formal.get("verdict", "")
+                if verdict == "DEGENERATE_FIT_DETECTED":
+                    deg = formal.get("degenerate_fit", {})
+                    violations.append({
+                        "kind": "degenerate_fit",
+                        "severity": "HIGH",
+                        "stage": "MULTI_STRUCTURAL",
+                        "claim": (f"compare_models flagged DEGENERATE FIT on "
+                                  f"model {deg.get('model', '?')}: "
+                                  f"{deg.get('reason', '(no reason given)')}"),
+                    })
+                elif verdict == "INSUFFICIENT_STRUCTURES":
+                    violations.append({
+                        "kind": "insufficient_structures",
+                        "severity": "HIGH",
+                        "stage": "MULTI_STRUCTURAL",
+                        "claim": ("Modeler supplied fewer than 3 candidate "
+                                  "structures for comparison. See "
+                                  "multi-structural-comparison skill."),
+                    })
+            except (yaml.YAMLError, OSError):
+                pass
+    else:
+        violations.append({
+            "kind": "msc_manifest_missing",
+            "severity": "MEDIUM",
+            "stage": "MULTI_STRUCTURAL",
+            "claim": ("models/model_comparison.yaml is absent — modeler did "
+                      "not produce a multi-structural comparison. See "
+                      "multi-structural-comparison skill."),
+        })
+
+    # Identifiability: models/identifiability.yaml → identifiability.yaml (run_dir)
+    id_manifest = os.path.join(run_dir, "models", "identifiability.yaml")
+    id_report = os.path.join(run_dir, "identifiability.yaml")
+    if os.path.exists(id_manifest):
+        if not os.path.exists(id_report):
+            violations.append({
+                "kind": "identifiability_report_missing",
+                "severity": "HIGH",
+                "stage": "IDENTIFIABILITY",
+                "claim": ("models/identifiability.yaml exists but "
+                          "identifiability.yaml is missing. Run "
+                          "`python3 scripts/identifiability.py {run_dir}`. "
+                          "See identifiability-analysis skill."),
+            })
+        else:
+            try:
+                with open(id_report) as f:
+                    id_rep = yaml.safe_load(f) or {}
+                verdict = id_rep.get("verdict", "")
+                if verdict == "UNIDENTIFIED_PARAMETERS":
+                    unidentified = [
+                        name for name, p in id_rep.get("parameters", {}).items()
+                        if p.get("status") == "unidentified"
+                    ]
+                    violations.append({
+                        "kind": "unidentified_parameters",
+                        "severity": "HIGH",
+                        "stage": "IDENTIFIABILITY",
+                        "claim": (f"identifiability analysis flagged "
+                                  f"{len(unidentified)} ridge-trapped "
+                                  f"parameter(s): {unidentified}. See "
+                                  f"identifiability.yaml for profile-likelihood "
+                                  f"details. Resolve via partial pooling, tied "
+                                  f"parameters, or explicit scope declaration."),
+                    })
+            except (yaml.YAMLError, OSError):
+                pass
+    # NOTE: absence of identifiability.yaml with NO manifest is MEDIUM — many
+    # models have no fitted parameters. Don't force this check universally.
+
+    return violations
+
+
+def _incorporate_rigor_violations(decision: dict, violations: list[dict],
+                                  max_rounds: int, current_round: int) -> dict:
+    """Fold rigor-artifact violations into unresolved_high (for HIGH) or
+    attach for visibility (for MEDIUM). Uses RIG-NNN prefix."""
+    d = dict(decision)
+    d["rigor_violations"] = violations
+
+    base_id = len([b for b in d["unresolved_high"]
+                   if b.get("reviewer") == "rigor-artifacts"])
+    for i, v in enumerate(
+            [x for x in violations if x["severity"] == "HIGH"],
+            start=base_id + 1):
+        d["unresolved_high"].append({
+            "reviewer": "rigor-artifacts",
+            "id": f"RIG-{i:03d}",
+            "category": "METHODS",
+            "target_stage": "MODEL",
+            "first_seen_round": current_round,
+            "claim": f"{v['stage']}/{v['kind']}: {v['claim']}",
+        })
+
+    # Recompute action (same rule ordering).
+    unresolved_high = d["unresolved_high"]
+    structural = d.get("structural_mismatch", False)
+    rounds_remaining = max_rounds - current_round
+
+    if structural:
+        action = "RETHINK_STRUCTURAL" if rounds_remaining > 0 else "RUN_FAILED"
+        rule_matched = 1
+    elif unresolved_high and rounds_remaining > 0:
+        action = "PATCH_OR_RETHINK"
+        rule_matched = 2
+    elif unresolved_high and rounds_remaining <= 0:
+        action = "DECLARE_SCOPE"
+        rule_matched = 3
+    else:
+        action = "ACCEPT"
+        rule_matched = 4
+
+    d["action"] = action
+    d["rule_matched"] = rule_matched
+    if rule_matched in (1, 2):
+        d["rationale"] = (
+            f"{len(unresolved_high)} HIGH blocker(s) unresolved (incl. rigor), "
+            f"{rounds_remaining} round(s) remaining. ACCEPT is forbidden."
+        )
+    return d
 
 
 def incorporate_registry_violations(decision: dict, violations: list[dict],
@@ -466,6 +648,12 @@ def render_text(decision: dict, current_round: int, max_rounds: int) -> str:
         for v in reg:
             lines.append(f"    - [{v['severity']}] {v['kind']} "
                          f"({v['name']}): {v['claim'][:120]}")
+    rig = decision.get("rigor_violations") or []
+    if rig:
+        lines.append(f"  rigor_violations: {len(rig)}")
+        for v in rig:
+            lines.append(f"    - [{v['severity']}] {v['stage']}/{v['kind']}: "
+                         f"{v['claim'][:120]}")
     lines.append(f"  rounds_remaining: {decision['rounds_remaining']}")
     lines.append(f"  rule_matched: {decision['rule_matched']}")
     lines.append(f"  action: {decision['action']}")
@@ -495,6 +683,14 @@ def main() -> int:
     p.add_argument("--repo-root", default=None,
                    help="Repo root for resolving code_refs "
                         "(defaults to current working directory)")
+    p.add_argument("--rigor-artifacts", action="store_true",
+                   help="Check for Phase 2 rigor artifacts: "
+                        "uncertainty_report.yaml, model_comparison_formal.yaml, "
+                        "identifiability.yaml. HIGH blocker if any is missing "
+                        "when its prerequisites exist (outcome_fn.py, "
+                        "model_comparison.yaml, identifiability.yaml). See the "
+                        "uncertainty-quantification, multi-structural-comparison, "
+                        "and identifiability-analysis skills.")
     args = p.parse_args()
 
     if not os.path.isdir(args.run_dir):
@@ -556,6 +752,14 @@ def main() -> int:
             decision, check_result["violations"],
             args.max_rounds, args.current_round,
         )
+
+    if args.rigor_artifacts:
+        rigor_violations = _check_rigor_artifacts(args.run_dir)
+        if rigor_violations:
+            decision = _incorporate_rigor_violations(
+                decision, rigor_violations,
+                args.max_rounds, args.current_round,
+            )
 
     if args.parameter_registry:
         registry_module = _load_effect_size_registry()
