@@ -360,14 +360,28 @@ override the rules with prose reasoning.
 
 #### Step 1: Run the validator
 
-After the three critique YAMLs exist, invoke the validator via Bash
-with the `--spec-compliance` flag:
+After the four critique YAMLs exist (methods, domain, presentation,
+redteam), invoke the validator via Bash with ALL THREE gate flags:
 
 ```bash
 python3 scripts/validate_critique_yaml.py {run_dir} \\
   --max-rounds {max_rounds} --current-round <N> \\
-  --spec-compliance --json
+  --spec-compliance --parameter-registry --rigor-artifacts --json
 ```
+
+All three flags are MANDATORY every round. They run three mechanical
+backstops that catch what the critique agents miss:
+
+- `--spec-compliance` — framework/approach/budget/archetype checks
+  against the research question (Commit Phase 1.5 Commit B). Forces
+  structural_mismatch when e.g. "Starsim" is required but not used.
+- `--parameter-registry` — OR/RR conflation, code-vs-CSV cost
+  crosscheck, param_unregistered tags (Phase 2 Commit A). Reads the
+  `## Parameter Registry` YAML from citations.md.
+- `--rigor-artifacts` — verifies uncertainty_report.yaml,
+  model_comparison_formal.yaml, and identifiability.yaml exist and
+  are clean (Phase 2 Commits B+C+D). Flags DEGENERATE_FIT_DETECTED,
+  UNIDENTIFIED_PARAMETERS, or missing prerequisites.
 
 The validator will:
 - Schema-check all three YAML files. Exit code 3 = schema error;
