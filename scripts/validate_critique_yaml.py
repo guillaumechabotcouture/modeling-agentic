@@ -71,12 +71,14 @@ def _load_effect_size_registry():
         return None
 
 
-REVIEWERS = ("critique-methods", "critique-domain", "critique-presentation")
+REVIEWERS = ("critique-methods", "critique-domain", "critique-presentation",
+             "critique-redteam")
 PREFIXES = {"critique-methods": "M-", "critique-domain": "D-",
-            "critique-presentation": "P-"}
+            "critique-presentation": "P-", "critique-redteam": "R-"}
 FILENAMES = {"critique-methods": "critique_methods.yaml",
              "critique-domain": "critique_domain.yaml",
-             "critique-presentation": "critique_presentation.yaml"}
+             "critique-presentation": "critique_presentation.yaml",
+             "critique-redteam": "critique_redteam.yaml"}
 
 VALID_SEVERITY = {"HIGH", "MEDIUM", "LOW"}
 VALID_VERDICT = {"PASS", "REVISE"}
@@ -503,6 +505,13 @@ def main() -> int:
     schema_errors = []
     for reviewer in REVIEWERS:
         path = os.path.join(args.run_dir, FILENAMES[reviewer])
+        # critique-redteam is optional: runs predating Commit E won't have
+        # critique_redteam.yaml. If the file is absent, skip without error.
+        # If it's present, validate it normally. This is NOT a permission to
+        # skip red-team going forward — the lead is still required to spawn
+        # all four critique agents in STAGE 6.
+        if reviewer == "critique-redteam" and not os.path.exists(path):
+            continue
         try:
             critiques[reviewer] = validate_critique(path, reviewer,
                                                     args.current_round)

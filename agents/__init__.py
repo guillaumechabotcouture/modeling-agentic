@@ -8,7 +8,7 @@ from claude_agent_sdk import AgentDefinition, HookMatcher
 
 from agents import (
     planner, data, modeler, analyst,
-    critique_methods, critique_domain, critique_presentation,
+    critique_methods, critique_domain, critique_presentation, red_team,
     writer,
 )
 
@@ -26,6 +26,7 @@ AGENT_MAX_TURNS = {
     "critique-methods": 35,
     "critique-domain": 50,
     "critique-presentation": 40,
+    "critique-redteam": 50,
     "writer": 60,
 }
 
@@ -163,6 +164,15 @@ def build_agents() -> dict[str, AgentDefinition]:
             model="sonnet",
             maxTurns=40,  # bumped 25→30 post-measles, 30→40 post-malaria (30/30 ran_to_cap in round 2)
         ),
+        "critique-redteam": AgentDefinition(
+            description=red_team.DESCRIPTION,
+            prompt=red_team.SYSTEM_PROMPT,
+            tools=red_team.TOOLS,
+            model="opus",  # adversarial judgment + WebFetch-heavy research
+            maxTurns=50,
+            skills=["adversarial-redteam", "critique-blockers-schema",
+                    "effect-size-priors"],
+        ),
         "writer": AgentDefinition(
             description=writer.DESCRIPTION,
             prompt=writer.SYSTEM_PROMPT,
@@ -238,10 +248,11 @@ Wait for completion. Read {run_dir}/results.md to confirm hypothesis
 verdicts exist with causal labels.
 
 ### STAGE 6: CRITIQUE (PARALLEL)
-Spawn ALL THREE critique agents simultaneously in a SINGLE response:
+Spawn ALL FOUR critique agents simultaneously in a SINGLE response:
 - critique-methods
 - critique-domain
 - critique-presentation
+- critique-redteam  (adversarial — see the adversarial-redteam skill)
 
 Do NOT use background: true. Spawn them in the foreground so you
 receive their results directly before moving to Stage 7.
@@ -252,6 +263,14 @@ Each critique agent writes TWO files:
 - `critique_{name}.md` — human-readable prose (as before)
 - `critique_{name}.yaml` — machine-readable blocker manifest (see the
   `critique-blockers-schema` skill for the required schema)
+
+The fourth agent (critique-redteam) is adversarial: its job is to find
+what the other three would miss — cross-file numeric discrepancies,
+aggregate claims that exceed external totals, methodological fidelity
+gaps vs cited prior work, data-vintage vs decision-year mismatches, and
+hidden operational assumptions. It uses prefix `R-` for blocker IDs and
+has the same architectural-veto authority (may set
+`structural_mismatch.detected: true`) as methods and domain.
 
 #### Spawn-prompt template (MANDATORY)
 
@@ -272,7 +291,7 @@ MEDIUM blocker from round 1 (still_present true or false with
 resolved_evidence). See the critique-blockers-schema skill.
 ```
 
-Wait for all three to complete.
+Wait for all four to complete.
 
 ### STAGE 7: MECHANICAL DECISION GATE
 
