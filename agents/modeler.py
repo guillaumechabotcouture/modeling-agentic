@@ -332,6 +332,49 @@ doesn't exist).
 Skipping the registry for a load-bearing parameter is a MEDIUM blocker.
 Misclassifying kind or introducing OR/RR conflation is a HIGH blocker.
 
+### PARAMETER COVERAGE (Phase 3 Commit A2)
+
+Every parameter you register MUST appear in code — AND, for
+decision-critical kinds (`odds_ratio`, `relative_risk`, `hazard_ratio`,
+`incidence_rate_ratio`, `efficacy`, `cost_usd`, `proportion`), it MUST
+be threaded through the UQ entry point (`models/outcome_fn.py` or
+`models/outcome_fn_surrogate.py`) as `params.get('NAME')` or
+`params['NAME']`.
+
+Two HIGH-severity failure patterns the validator catches mechanically:
+
+- **`param_not_in_code`**: you registered a parameter in
+  `## Parameter Registry` but neither its name nor any of its
+  `code_refs` resolves to a file under `models/`. Either add the code
+  or remove the registry entry.
+
+- **`param_frozen_in_uq`**: the parameter is in code (e.g., as an
+  UPPER_CASE constant in `optimization.py`), but your `outcome_fn`
+  never does `params.get('NAME', default)` to override it with the
+  sampled value. The UQ draws from the prior but the value is
+  effectively frozen at the hardcoded default. This is the R-022
+  failure pattern — it silently shrinks the reported credible
+  intervals by an order of magnitude.
+
+When you register a parameter with an effect-size CI (IRS OR, SMC RR,
+intervention cost, CFR, clinical fraction, etc.), ALSO add a line to
+your UQ entry point:
+
+```python
+def outcome_fn(params: dict) -> dict:
+    # ... load data ...
+    # For EVERY registered decision-critical parameter, accept an override
+    # from the sampled dict and apply it to the optimizer's constants.
+    opt.IRS_OR = params.get('irs_or_high_coverage', opt.IRS_OR)
+    opt.LLIN_COST = params.get('standard_llin_cost', opt.LLIN_COST)
+    opt.CFR_U5 = params.get('case_fatality_rate', opt.CFR_U5)
+    # ... etc. for every registered param ...
+```
+
+If you register 15 parameters and thread only 5, the cost CI will span
+0.007% of the mean — obviously wrong, and the validator will block
+ACCEPT with 10 HIGH `param_frozen_in_uq` blockers.
+
 ## PHASE 2 RIGOR ARTIFACTS (REQUIRED)
 
 After calibration, produce three additional artifacts that feed the

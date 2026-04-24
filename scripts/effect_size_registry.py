@@ -393,6 +393,172 @@ def _line_near_has_conversion(context: list[str]) -> bool:
     return any(tok in joined for tok in _CONVERSION_TOKENS)
 
 
+# Kinds where missing coverage is HIGH severity. These drive policy
+# outputs and their absence from code means the UQ or allocation is
+# silently ignoring them. `proportion` covers CFRs, death fractions,
+# clinical_fraction — all directly multiply into burden calculations.
+# Other kinds (duration_days, rate, prevalence, coverage) get MEDIUM.
+_HIGH_SEVERITY_KINDS = {
+    "odds_ratio", "relative_risk", "hazard_ratio", "incidence_rate_ratio",
+    "efficacy", "cost_usd", "proportion",
+}
+
+# Entry points for "is the parameter in the UQ path?" check. If outcome_fn.py
+# exists, it's the canonical UQ surrogate. If not, fall back to outcome_fn_*.py.
+_UQ_ENTRY_POINT_CANDIDATES = (
+    "models/outcome_fn.py",
+    "models/outcome_fn_surrogate.py",
+    "models/outcome_fn_full.py",
+)
+
+
+def _find_uq_entry_points(repo_root: str) -> list[str]:
+    """Return existing UQ entry-point file paths (absolute)."""
+    out = []
+    for rel in _UQ_ENTRY_POINT_CANDIDATES:
+        p = os.path.join(repo_root, rel)
+        if os.path.isfile(p):
+            out.append(p)
+    return out
+
+
+def _collect_models_py_files(repo_root: str) -> list[str]:
+    """Return all .py files under models/ (excluding __pycache__)."""
+    models_dir = os.path.join(repo_root, "models")
+    if not os.path.isdir(models_dir):
+        return []
+    out = []
+    for root, dirs, files in os.walk(models_dir):
+        dirs[:] = [d for d in dirs if d != "__pycache__" and d != "archive"]
+        for f in files:
+            if f.endswith(".py"):
+                out.append(os.path.join(root, f))
+    return out
+
+
+def _name_appears_in(text: str, name: str) -> bool:
+    """Check whether `name` appears as an identifier in `text`.
+
+    Matches `name`, `params['name']`, `params["name"]`, `params.get('name'`,
+    `# @registry:name`. Uses word-boundary regex to avoid partial matches.
+    """
+    # The name might also appear in docstrings or comments; for our purposes
+    # that's fine — modeler documented it there, it's referenced.
+    # Word-boundary match on the bare identifier.
+    if re.search(r"\b" + re.escape(name) + r"\b", text):
+        return True
+    return False
+
+
+def _name_in_uq_path(text: str, name: str) -> bool:
+    """Check whether `name` appears as a `params['name']` or
+    `params.get('name'` reference — the UQ-path contract for outcome_fn.
+    Raw module-level constants (like `opt.LLIN_OR`) do NOT count; those
+    are frozen and not threaded through UQ."""
+    patterns = [
+        r"params\s*\[\s*['\"]" + re.escape(name) + r"['\"]\s*\]",
+        r"params\s*\.\s*get\s*\(\s*['\"]" + re.escape(name) + r"['\"]",
+    ]
+    return any(re.search(p, text) for p in patterns)
+
+
+def check_tagging_coverage(registry: dict, repo_root: str) -> list[dict]:
+    """For each registered parameter, check whether:
+
+    1. The name appears ANYWHERE in models/*.py. If not → `param_not_in_code`
+       (HIGH for decision-critical kinds, MEDIUM otherwise). The modeler
+       registered a literature constant but didn't wire it into the code.
+
+    2. For parameters with decision-critical kinds specifically, the name
+       appears as `params['NAME']` / `params.get('NAME'` in at least one
+       UQ entry point (models/outcome_fn*.py). If not → `param_frozen_in_uq`
+       (HIGH). This is the R-022 signal: the param is drawn from priors
+       but never overrides the optimizer's hardcoded constant, so its
+       uncertainty doesn't propagate.
+
+    Returns a list of violations (same shape as other check_registry
+    violation dicts).
+    """
+    violations: list[dict] = []
+    all_models_files = _collect_models_py_files(repo_root)
+    if not all_models_files:
+        return []  # No model code to scan; silent no-op.
+
+    # Concatenate all model code for the "anywhere in models/" check.
+    all_models_text = ""
+    for path in all_models_files:
+        try:
+            with open(path) as f:
+                all_models_text += f.read() + "\n"
+        except (OSError, UnicodeDecodeError):
+            continue
+
+    uq_entry_paths = _find_uq_entry_points(repo_root)
+    uq_entry_text = ""
+    for path in uq_entry_paths:
+        try:
+            with open(path) as f:
+                uq_entry_text += f.read() + "\n"
+        except (OSError, UnicodeDecodeError):
+            continue
+
+    # Pre-compute code_ref resolution so we can use it as primary signal.
+    resolved = resolve_code_refs(registry, repo_root)
+
+    for p in registry.get("parameters", []):
+        name = p["name"]
+        kind = p["kind"]
+        high = kind in _HIGH_SEVERITY_KINDS
+
+        # Check 1: is the parameter in code?
+        # Primary signal: at least one code_ref resolves to a real file:line.
+        # This handles the common case where the registry uses snake_case
+        # but the code uses UPPER_CASE constants (e.g. PBO_OR_VS_STD) —
+        # the code_ref tells us exactly where the constant lives.
+        # Fallback: scan all models/ for the name as an identifier.
+        refs_for_name = resolved.get(name, [])
+        has_resolved_ref = any(r.exists and r.line is not None
+                               for r in refs_for_name)
+        has_name_occurrence = _name_appears_in(all_models_text, name)
+
+        if not has_resolved_ref and not has_name_occurrence:
+            violations.append({
+                "kind": "param_not_in_code",
+                "severity": "HIGH" if high else "MEDIUM",
+                "name": name,
+                "claim": (f"Parameter '{name}' (kind={kind}) is registered "
+                          f"but neither its name nor any of its code_refs "
+                          f"resolves to code under models/. The registry "
+                          f"entry has no corresponding implementation."),
+                "evidence": f"code_refs={[r.path + ':' + str(r.line) if r.line else r.path for r in refs_for_name]}; "
+                            f"name_occurrence_search negative across "
+                            f"{len(all_models_files)} .py files",
+            })
+            continue  # No point checking UQ path if param isn't in code at all.
+
+        # Check 2: is the name plumbed through the UQ entry point?
+        if uq_entry_text and high:
+            if not _name_in_uq_path(uq_entry_text, name):
+                entry_names = ", ".join(
+                    os.path.relpath(p, repo_root) for p in uq_entry_paths)
+                violations.append({
+                    "kind": "param_frozen_in_uq",
+                    "severity": "HIGH",
+                    "name": name,
+                    "claim": (f"Parameter '{name}' (kind={kind}) appears in "
+                              f"models/ but is NOT referenced as "
+                              f"params['{name}'] or params.get('{name}') in "
+                              f"any UQ entry point ({entry_names}). Its "
+                              f"uncertainty is NOT being propagated — the "
+                              f"UQ samples from its prior but never threads "
+                              f"the value through the outcome calculation. "
+                              f"This is the R-022 failure pattern."),
+                    "evidence": f"UQ entry points scanned: {entry_names}",
+                })
+
+    return violations
+
+
 def _csv_values_match(csv_path: str, registered_value: float,
                       tolerance: float = 0.10) -> tuple[bool, Optional[str]]:
     """Return (matched?, note). Scan CSV for any numeric column with values
@@ -416,7 +582,8 @@ def _csv_values_match(csv_path: str, registered_value: float,
     return False, None
 
 
-def check_registry(registry: dict, repo_root: str) -> dict:
+def check_registry(registry: dict, repo_root: str,
+                   run_dir: Optional[str] = None) -> dict:
     """Run all mechanical checks on a loaded registry. Returns {violations: [...]}.
 
     Each violation is a dict with keys:
@@ -425,6 +592,13 @@ def check_registry(registry: dict, repo_root: str) -> dict:
       name:     parameter name
       claim:    short human-readable problem
       evidence: the raw code snippet or value
+
+    repo_root: used for resolving `code_refs` paths that include a
+        `runs/<name>/` prefix, and for scanning pipeline code (agents/,
+        scripts/) for `@registry:NAME` tags.
+    run_dir: if provided, used for scanning model code under
+        `{run_dir}/models/` for the Phase 3 A2 tagging-coverage check.
+        Falls back to repo_root when omitted (old behavior).
     """
     violations: list[dict] = []
     resolved = resolve_code_refs(registry, repo_root)
@@ -499,7 +673,14 @@ def check_registry(registry: dict, repo_root: str) -> dict:
                         "evidence": cr.path,
                     })
 
-    # 5. param_unregistered — code has @registry:X but X not in registry.
+    # 5b. param_not_in_code / param_frozen_in_uq — Phase 3 Commit A2.
+    # For each registered param, check whether it's in models/ at all
+    # and whether it's threaded through the UQ entry point. Scans under
+    # {run_dir}/models/ (or {repo_root}/models/ if run_dir unavailable).
+    scan_root = run_dir if run_dir else repo_root
+    violations.extend(check_tagging_coverage(registry, scan_root))
+
+    # 6. param_unregistered — code has @registry:X but X not in registry.
     # Only scan model code directories, not pipeline infrastructure.
     registered_names = {p["name"] for p in registry.get("parameters", [])}
     scan_roots = []
@@ -743,6 +924,53 @@ parameters:
         ok(params_by_name["bar_rr"].get("code_refs") == [
             "models/optimization.py:85"],
            f"F: bar_rr code_refs got {params_by_name['bar_rr'].get('code_refs')}")
+
+        # --- Case H: param_not_in_code + param_frozen_in_uq (A2) ---
+        # Registry has 3 params:
+        #   alpha_or: used in models/ AND in outcome_fn.py (clean)
+        #   beta_or: in optimization.py but NOT in outcome_fn.py (frozen UQ)
+        #   gamma_or: NOT anywhere in models/ (not in code)
+        repo_h = os.path.join(repo, "case_h")
+        os.makedirs(os.path.join(repo_h, "models"), exist_ok=True)
+        with open(os.path.join(repo_h, "models", "optimization.py"), "w") as f:
+            f.write("ALPHA_OR = 0.5\n"
+                    "BETA_OR = 0.3\n"
+                    "def run(alpha_or, beta_or):\n"
+                    "    return alpha_or + beta_or\n")
+        with open(os.path.join(repo_h, "models", "outcome_fn.py"), "w") as f:
+            f.write("import optimization as opt\n"
+                    "def outcome_fn(params):\n"
+                    "    opt.ALPHA_OR = params.get('alpha_or', opt.ALPHA_OR)\n"
+                    "    # BUG: beta_or drawn from prior but never overridden\n"
+                    "    return opt.run(opt.ALPHA_OR, opt.BETA_OR)\n")
+        with open(os.path.join(repo_h, "citations.md"), "w") as f:
+            f.write("## Parameter Registry\n\n```yaml\nparameters:\n"
+                    "  - name: alpha_or\n"
+                    "    value: 0.5\n"
+                    "    kind: odds_ratio\n"
+                    "    source: C1\n"
+                    "  - name: beta_or\n"
+                    "    value: 0.3\n"
+                    "    kind: odds_ratio\n"
+                    "    source: C1\n"
+                    "  - name: gamma_or\n"
+                    "    value: 0.7\n"
+                    "    kind: odds_ratio\n"
+                    "    source: C1\n"
+                    "```\n")
+        registry_h = load_priors(os.path.join(repo_h, "citations.md"))
+        violations_h = check_tagging_coverage(registry_h, repo_h)
+        kinds_h = [v["kind"] for v in violations_h]
+        names_h = [v["name"] for v in violations_h]
+        ok("param_not_in_code" in kinds_h and "gamma_or" in names_h,
+           f"H: gamma_or (not in code) flagged; got {list(zip(kinds_h, names_h))}")
+        ok("param_frozen_in_uq" in kinds_h and "beta_or" in names_h,
+           f"H: beta_or (frozen in UQ) flagged; got {list(zip(kinds_h, names_h))}")
+        ok("alpha_or" not in names_h,
+           f"H: alpha_or (correctly plumbed) should NOT be flagged")
+        # Kind-weighted severity: all three are odds_ratio → HIGH
+        ok(all(v["severity"] == "HIGH" for v in violations_h),
+           f"H: all odds_ratio violations should be HIGH; got {[v['severity'] for v in violations_h]}")
 
         # --- Case G: YAML-provided code_refs WIN over detail section ---
         # (Detail section should only fill in what's missing.)

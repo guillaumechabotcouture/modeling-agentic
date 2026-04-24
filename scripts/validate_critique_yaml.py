@@ -466,9 +466,17 @@ def incorporate_registry_violations(decision: dict, violations: list[dict],
     """Fold effect-size-registry violations into the decision.
 
     HIGH violations (or_rr_conflation, registry_value_mismatch,
-    cost_crosscheck_mismatch) add synthetic `REG-NNN` blockers to
-    `unresolved_high`. MEDIUM violations (registry_missing_ref,
-    param_unregistered, subgroup_mismatch) are attached for visibility only.
+    cost_crosscheck_mismatch, param_not_in_code, param_frozen_in_uq)
+    add synthetic `REG-NNN` blockers to `unresolved_high`. MEDIUM
+    violations (registry_missing_ref, param_unregistered,
+    subgroup_mismatch) are attached for visibility only.
+
+    param_frozen_in_uq (Phase 3 Commit A2) is the mechanical R-022
+    detector: registered parameter appears in code (e.g. as an
+    UPPER_CASE constant in optimization.py) but is not referenced as
+    params['NAME'] / params.get('NAME') in any UQ entry point, so its
+    uncertainty is drawn from priors but never propagated through the
+    outcome calculation.
 
     Registry violations do NOT force `structural_mismatch=True` — they are
     parameter-provenance issues, not architectural mismatches. A failed
@@ -779,7 +787,8 @@ def main() -> int:
         except (ValueError, FileNotFoundError) as e:
             print(f"ERROR loading registry: {e}", file=sys.stderr)
             return 2
-        reg_result = registry_module.check_registry(registry, repo_root)
+        reg_result = registry_module.check_registry(
+            registry, repo_root, run_dir=args.run_dir)
         decision = incorporate_registry_violations(
             decision, reg_result["violations"],
             args.max_rounds, args.current_round,
