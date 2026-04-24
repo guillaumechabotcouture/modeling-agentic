@@ -169,6 +169,12 @@ def _add(a, b):
     return a + b
 
 
+def _hello(name: str) -> str:
+    """Module-level hello function used by the live cloud self-test.
+    Must be importable by qualified name so workers can unpickle it."""
+    return f"hello {name}"
+
+
 # ---------------------------------------------------------------------------
 # Function-to-task serialization
 # ---------------------------------------------------------------------------
@@ -302,10 +308,17 @@ class BatchRunner:
     # ---- Pool lifecycle ----
 
     def ensure_pool(self, pool_name: str, vm_size: str = DEFAULT_VM_SIZE,
-                    max_nodes: int = 8, dedicated_nodes: int = 0,
-                    auto_scale: bool = True) -> None:
-        """Create a pool if it doesn't exist. Default: autoscale 0 to
-        `max_nodes` low-priority VMs of `vm_size`."""
+                    max_nodes: int = 8, use_low_priority: bool = True,
+                    dedicated_nodes: int = 0, auto_scale: bool = True) -> None:
+        """Create a pool if it doesn't exist.
+
+        Default: autoscale 0 → `max_nodes` low-priority VMs. For Free Trial
+        subscriptions (lowPriorityCoreQuota=0), pass `use_low_priority=False`
+        to autoscale dedicated nodes instead.
+
+        Static (non-autoscale) mode: pass `auto_scale=False` with an explicit
+        `dedicated_nodes` count (and `max_nodes` for low-priority size).
+        """
         self._require_config()
         from azure.batch import models as batch_models
         from azure.batch.models import BatchErrorException
@@ -320,35 +333,51 @@ class BatchRunner:
             if "PoolNotFound" not in str(e):
                 raise
 
-        # Autoscale formula: scale low-priority to pending task count,
-        # capped at max_nodes. When no tasks pending, scale to zero.
+        # Pick which node-type variable the autoscale formula drives.
+        if use_low_priority:
+            target_var = "$TargetLowPriorityNodes"
+            other_var = "$TargetDedicatedNodes"
+        else:
+            target_var = "$TargetDedicatedNodes"
+            other_var = "$TargetLowPriorityNodes"
+
         autoscale_formula = (
             "startingNumberOfVMs = 0;\n"
             f"maxNumberofVMs = {max_nodes};\n"
             "pendingTaskSamplePercent = $PendingTasks.GetSamplePercent(60 * TimeInterval_Second);\n"
             "pendingTaskSamples = pendingTaskSamplePercent < 70 ? startingNumberOfVMs : avg($PendingTasks.GetSample(60 * TimeInterval_Second));\n"
-            "$TargetLowPriorityNodes = min(maxNumberofVMs, pendingTaskSamples);\n"
-            f"$TargetDedicatedNodes = {dedicated_nodes};\n"
+            f"{target_var} = min(maxNumberofVMs, pendingTaskSamples);\n"
+            f"{other_var} = 0;\n"
             "$NodeDeallocationOption = taskcompletion;\n"
         )
+
+        if auto_scale:
+            pool_kwargs = dict(
+                enable_auto_scale=True,
+                auto_scale_formula=autoscale_formula,
+                auto_scale_evaluation_interval="PT5M",
+                target_low_priority_nodes=0,
+                target_dedicated_nodes=0,
+            )
+        else:
+            pool_kwargs = dict(
+                target_low_priority_nodes=max_nodes if use_low_priority else 0,
+                target_dedicated_nodes=dedicated_nodes if not use_low_priority else 0,
+            )
 
         pool = batch_models.PoolAddParameter(
             id=pool_name,
             vm_size=vm_size,
             virtual_machine_configuration=batch_models.VirtualMachineConfiguration(
                 image_reference=batch_models.ImageReference(
-                    publisher="microsoft-azure-batch",
-                    offer="ubuntu-server-container",
-                    sku="22-04-lts",
+                    publisher="canonical",
+                    offer="0001-com-ubuntu-server-jammy",
+                    sku="22_04-lts",
                     version="latest",
                 ),
                 node_agent_sku_id="batch.node.ubuntu 22.04",
             ),
-            enable_auto_scale=auto_scale,
-            auto_scale_formula=autoscale_formula if auto_scale else None,
-            auto_scale_evaluation_interval="PT5M",
-            target_low_priority_nodes=0 if auto_scale else max_nodes,
-            target_dedicated_nodes=0 if auto_scale else dedicated_nodes,
+            **pool_kwargs,
         )
         batch.pool.add(pool)
 
@@ -635,24 +664,32 @@ def _run_cloud_self_test() -> int:
     try:
         pool_name = f"self-test-{uuid4().hex[:8]}"
         print(f"  creating pool {pool_name}...", file=sys.stderr)
-        runner.ensure_pool(pool_name, vm_size="Standard_A1_v2", max_nodes=1)
-        print("  submitting hello task...", file=sys.stderr)
+        # Free Trial subscriptions have lowPriorityCoreQuota=0, so the
+        # self-test defaults to dedicated nodes. One A1_v2 (1 vCPU) is
+        # cheap (~$0.04/hr, ~$0.005 for a 5-minute test) and fits within
+        # the default 4-vCPU dedicated quota.
+        runner.ensure_pool(pool_name, vm_size="Standard_A1_v2",
+                           max_nodes=1, use_low_priority=False,
+                           auto_scale=False, dedicated_nodes=1)
+        print("  submitting hello task (using builtin len)...", file=sys.stderr)
 
-        def hello(name: str):
-            return f"hello {name}"
-
+        # Use a stdlib builtin so the worker doesn't need any custom code.
+        # len("hello world") == 11. For real workloads, the modeler's
+        # outcome_fn lives in models/outcome_fn.py; we'll add a workflow
+        # that packages + uploads the models/ directory separately.
         job_id = runner.submit_function_tasks(
             pool_name=pool_name,
-            fn=hello,
-            args_list=[{"name": "world"}],
+            fn=len,
+            args_list=["hello world"],
             budget_usd_cap=0.10,
             avg_task_seconds=30.0,
+            pip_deps=[],
         )
         print(f"  job {job_id} submitted, waiting...", file=sys.stderr)
         results = runner.wait_and_collect(job_id, timeout_minutes=20)
         print(f"  results: {results}", file=sys.stderr)
         ok = (results and results[0] and results[0].get("ok")
-              and results[0].get("result") == "hello world")
+              and results[0].get("result") == 11)
         runner.delete_pool(pool_name)
         if ok:
             print("OK: live cloud self-test passed.", file=sys.stderr)
