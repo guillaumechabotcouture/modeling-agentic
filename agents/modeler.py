@@ -438,14 +438,37 @@ Unidentified parameters used in policy outputs are a HIGH blocker.
 Resolve via informative priors, tying redundant parameters, or
 removing the parameter (fix at a default).
 
+### 4. Decision rule — `{run_dir}/decision_rule.md` (when allocation is produced)
+
+If this run produces an allocation CSV (`*allocation*.csv`,
+`*budget*.csv`, `*optimization*.csv`), you MUST also produce
+`{run_dir}/decision_rule.md` articulating the rule a program officer
+will use. See the `decision-rule-extraction` skill for the schema.
+
+A 774-row table is not a policy artifact. The validator blocks HIGH
+on `decision_rule_missing` when an allocation exists without the rule.
+
+Choose `rule_type`:
+- `tabular` / `tree`: accuracy ≥ 95% with a short form (≤ 7 nodes/cells).
+- `prose-with-exceptions`: accuracy ≥ 90% with a listed exception set.
+- `non-compressible`: no compact rule reaches 90%; you must write a
+  Justification section explaining why (interaction terms, stakeholder
+  pre-commitments, optimizer near-ties).
+
+Do NOT fabricate a rule. A 60%-accuracy "rule" presented as policy is
+worse than declaring `non-compressible` honestly. The validator emits
+`decision_rule_low_accuracy` HIGH when `rule_type ≠ non-compressible`,
+`accuracy_vs_optimizer < 0.90`, AND `exceptions_count == 0`.
+
 ### Time budget guidance
 
-These three artifacts are additional deliverables, not optional. Budget
-~20% of your total turn count to produce them rigorously. The three
-scripts are fast:
+These artifacts are additional deliverables, not optional. Budget ~20%
+of your total turn count to produce them rigorously. The scripts are
+fast:
 - `propagate_uncertainty.py` ~ minutes for 200 draws IF outcome_fn is fast
 - `compare_models.py` ~ seconds (just computes ICs from your predictions)
 - `identifiability.py` ~ seconds × (n_params × 20 profile points)
+- `decision_rule.md` — manual authoring, ~30 minutes once optimizer ran
 
 The expensive part is building `outcome_fn` and fitting ≥3 candidate
 structures. Design for this from the start — don't tack it on at the

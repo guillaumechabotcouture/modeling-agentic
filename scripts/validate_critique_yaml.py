@@ -409,6 +409,147 @@ def _check_rigor_artifacts(run_dir: str) -> list[dict]:
     # NOTE: absence of identifiability.yaml with NO manifest is MEDIUM — many
     # models have no fitted parameters. Don't force this check universally.
 
+    # Decision rule (Phase 3 Commit C): required when an allocation CSV exists.
+    violations.extend(_check_decision_rule_artifact(run_dir))
+
+    return violations
+
+
+# Phase 3 Commit C: decision rule as required rigor artifact.
+import glob as _glob_module
+import re as _re_module
+
+_ALLOCATION_GLOBS = ("*allocation*.csv", "*budget*.csv", "*optimization*.csv")
+_DECISION_RULE_FRONTMATTER_RE = _re_module.compile(
+    r"^---\s*\n(.+?)\n---\s*\n", _re_module.DOTALL
+)
+_REQUIRED_RULE_SECTIONS = ("## Features", "## Rule", "## Validation")
+_VALID_RULE_TYPES = {
+    "tabular", "tree", "prose-with-exceptions", "non-compressible",
+}
+_ACCURACY_RE = _re_module.compile(
+    r"^\s*-?\s*`?accuracy_vs_optimizer`?\s*[:=]\s*([0-9.]+)",
+    _re_module.MULTILINE,
+)
+_EXCEPTIONS_COUNT_RE = _re_module.compile(
+    r"^\s*-?\s*`?exceptions_count`?\s*[:=]\s*(\d+)",
+    _re_module.MULTILINE,
+)
+
+
+def _find_allocation_csvs(run_dir: str) -> list[str]:
+    found: list[str] = []
+    for pattern in _ALLOCATION_GLOBS:
+        found.extend(_glob_module.glob(os.path.join(run_dir, pattern)))
+        found.extend(_glob_module.glob(os.path.join(run_dir, "data", pattern)))
+    return sorted(set(found))
+
+
+def _check_decision_rule_artifact(run_dir: str) -> list[dict]:
+    """Decision rule (Phase 3 Commit C): if an allocation CSV exists,
+    require decision_rule.md with a valid schema. Emits:
+      - decision_rule_missing HIGH
+      - decision_rule_malformed HIGH
+      - decision_rule_low_accuracy HIGH
+    """
+    allocations = _find_allocation_csvs(run_dir)
+    if not allocations:
+        return []
+
+    rule_path = os.path.join(run_dir, "decision_rule.md")
+    if not os.path.exists(rule_path):
+        return [{
+            "kind": "decision_rule_missing",
+            "severity": "HIGH",
+            "stage": "DECISION_RULE",
+            "claim": (
+                f"Allocation CSV(s) present ({', '.join(os.path.basename(p) for p in allocations)}) "
+                f"but decision_rule.md is absent. A 774-row table is not a "
+                f"defensible policy artifact. Write decision_rule.md per the "
+                f"decision-rule-extraction skill — tabular, tree, prose, or "
+                f"non-compressible with justification."
+            ),
+        }]
+
+    with open(rule_path) as f:
+        text = f.read()
+
+    fm_match = _DECISION_RULE_FRONTMATTER_RE.match(text)
+    if not fm_match:
+        return [{
+            "kind": "decision_rule_malformed",
+            "severity": "HIGH",
+            "stage": "DECISION_RULE",
+            "claim": (
+                "decision_rule.md is missing YAML front-matter "
+                "(`--- rule_type: ... ---` at the top of the file). "
+                "See decision-rule-extraction skill for the schema."
+            ),
+        }]
+
+    try:
+        fm = yaml.safe_load(fm_match.group(1)) or {}
+    except yaml.YAMLError as e:
+        return [{
+            "kind": "decision_rule_malformed",
+            "severity": "HIGH",
+            "stage": "DECISION_RULE",
+            "claim": f"decision_rule.md front-matter is not valid YAML: {e}",
+        }]
+
+    rule_type = fm.get("rule_type")
+    if rule_type not in _VALID_RULE_TYPES:
+        return [{
+            "kind": "decision_rule_malformed",
+            "severity": "HIGH",
+            "stage": "DECISION_RULE",
+            "claim": (
+                f"decision_rule.md front-matter `rule_type` is "
+                f"{rule_type!r}; must be one of "
+                f"{sorted(_VALID_RULE_TYPES)}."
+            ),
+        }]
+
+    missing_sections = [s for s in _REQUIRED_RULE_SECTIONS if s not in text]
+    if rule_type == "non-compressible" and "## Justification" not in text:
+        missing_sections.append("## Justification")
+    if missing_sections:
+        return [{
+            "kind": "decision_rule_malformed",
+            "severity": "HIGH",
+            "stage": "DECISION_RULE",
+            "claim": (
+                f"decision_rule.md is missing required section(s): "
+                f"{missing_sections}. See decision-rule-extraction skill."
+            ),
+        }]
+
+    violations: list[dict] = []
+    if rule_type != "non-compressible":
+        acc_match = _ACCURACY_RE.search(text)
+        exc_match = _EXCEPTIONS_COUNT_RE.search(text)
+        if acc_match and exc_match:
+            try:
+                accuracy = float(acc_match.group(1))
+                exc_count = int(exc_match.group(1))
+                if accuracy < 0.90 and exc_count == 0:
+                    violations.append({
+                        "kind": "decision_rule_low_accuracy",
+                        "severity": "HIGH",
+                        "stage": "DECISION_RULE",
+                        "claim": (
+                            f"decision_rule.md claims rule_type={rule_type!r} "
+                            f"with accuracy_vs_optimizer={accuracy:.2f} and "
+                            f"exceptions_count=0. You cannot claim a rule with "
+                            f"< 0.90 accuracy AND no declared exceptions. "
+                            f"Either list the disagreeing units in "
+                            f"exceptions_list, or switch rule_type to "
+                            f"`non-compressible` with a Justification."
+                        ),
+                    })
+            except (ValueError, TypeError):
+                pass
+
     return violations
 
 

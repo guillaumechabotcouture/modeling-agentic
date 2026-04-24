@@ -104,6 +104,24 @@ Do NOT offload this caveat to a single mention in the §Limitations
 section. A decision-maker who reads only Table 3 or Figure 5 must see
 the scope of the CIs on that specific artifact. This is mandatory for
 public-health policy reports regardless of journal standards.
+
+## DECISION RULE (Phase 3 Commit C)
+
+If `{run_dir}/decision_rule.md` exists, embed it VERBATIM in the
+§Policy Recommendations section of the report. The rule statement
+(the table, tree, or prose block), the feature list, the
+accuracy-vs-optimizer value, and the exceptions (count and list) MUST
+all appear in the body of the report — not buried in an appendix.
+
+If `rule_type == non-compressible`, include the Justification
+paragraph in §Policy Recommendations so the reader understands why
+the allocation doesn't admit a compact rule. The allocation CSV
+filename should still be referenced so the program officer knows
+where to find per-unit choices.
+
+A program officer reading the report must be able to answer "what is
+the rule?" from §Policy Recommendations alone. Hiding the rule in an
+appendix defeats the purpose of producing the artifact.
 """
 
 
