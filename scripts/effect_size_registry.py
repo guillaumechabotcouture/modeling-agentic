@@ -74,9 +74,87 @@ _YAML_BLOCK_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# Match per-parameter detail sections like `### <name> (detail)` or bare
+# `### <name>`. Captures the name from the first word after ###.
+_DETAIL_HEADER_RE = re.compile(
+    r"^###\s+(?P<name>[A-Za-z_][\w]*)(?:\s+\([^)]*\))?\s*$",
+    re.MULTILINE,
+)
+
+# Match a top-level bullet within a detail section:
+#   - **key**: value...
+# Used to harvest non-code-refs fields.
+_DETAIL_BULLET_RE = re.compile(
+    r"^-\s+\*\*(?P<key>[\w_-]+)\*\*\s*:\s*(?P<value>.*?)(?=\n-\s+\*\*|\n###|\n##|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+
+# Within a `code_refs` bullet, each sub-bullet is a file:line reference.
+_CODE_REF_LINE_RE = re.compile(
+    r"^\s*-\s+([^\n]+)$",
+    re.MULTILINE,
+)
+
+
+def _parse_detail_sections(text: str, yaml_end: int) -> dict[str, dict]:
+    """Scan the portion of citations.md after the YAML block for per-
+    parameter detail sections. Returns {name: {field: value, ...}} with
+    `code_refs` parsed from sub-bullets. Other Markdown fields are stored
+    as raw strings (caller can decide which to merge).
+
+    Detail section format (lines 0+ match `^###`):
+        ### <name> (detail)        <-- or just `### <name>`
+        - **name**: <name>
+        - **value**: <v>
+        - **kind**: <k>
+        - **code_refs**:
+          - models/foo.py:12 (LLIN_OR = 0.44)
+          - models/bar.py:33
+        - **conversion**: ...
+    """
+    tail = text[yaml_end:]
+    out: dict[str, dict] = {}
+
+    # Enumerate section headers with their start positions.
+    headers = list(_DETAIL_HEADER_RE.finditer(tail))
+    for i, hdr in enumerate(headers):
+        name = hdr.group("name")
+        start = hdr.end()
+        end = headers[i + 1].start() if i + 1 < len(headers) else len(tail)
+        body = tail[start:end]
+
+        details: dict = {}
+        for bullet in _DETAIL_BULLET_RE.finditer(body):
+            key = bullet.group("key").lower()
+            value = bullet.group("value")
+            if key == "code_refs":
+                # Sub-bullets: each line `  - <ref>` becomes a cleaned ref.
+                refs = []
+                for m in _CODE_REF_LINE_RE.finditer(value):
+                    raw = m.group(1).strip()
+                    # Drop trailing parenthetical annotations, keep "file:line".
+                    # `models/optimization.py:73 (LLIN_OR = 0.44)` -> `models/optimization.py:73`
+                    cleaned = re.split(r"\s*\(", raw, maxsplit=1)[0].strip()
+                    if cleaned:
+                        refs.append(cleaned)
+                if refs:
+                    details["code_refs"] = refs
+            else:
+                # Single-line value: strip trailing whitespace/newlines.
+                details[key] = value.strip()
+
+        if details:
+            out[name] = details
+    return out
+
 
 def load_priors(citations_md_path: str) -> dict[str, Any]:
     """Parse the `## Parameter Registry` YAML block from citations.md.
+
+    Also scans any `### <name>` / `### <name> (detail)` sections that
+    follow the YAML block and merges their fields (especially
+    `code_refs`) into matching YAML entries. YAML wins on conflict —
+    detail sections only fill in fields the YAML omitted.
 
     Returns {'parameters': [dict, ...]}. Raises on parse errors.
     Returns empty list if the section is absent.
@@ -98,6 +176,10 @@ def load_priors(citations_md_path: str) -> dict[str, Any]:
     params = body.get("parameters") or []
     if not isinstance(params, list):
         raise ValueError("`parameters:` must be a list")
+
+    # Merge detail sections from after the YAML fence.
+    details_by_name = _parse_detail_sections(text, m.end())
+
     for i, p in enumerate(params):
         if not isinstance(p, dict):
             raise ValueError(f"parameters[{i}] must be a mapping")
@@ -107,6 +189,12 @@ def load_priors(citations_md_path: str) -> dict[str, Any]:
         if p["kind"] not in VALID_KINDS:
             raise ValueError(f"parameters[{i}] has invalid kind "
                              f"{p['kind']!r}; valid: {sorted(VALID_KINDS)}")
+        # Fill in missing fields from the detail section if present.
+        name = p["name"]
+        if name in details_by_name:
+            for key, value in details_by_name[name].items():
+                if key not in p or p[key] in (None, "", []):
+                    p[key] = value
     return body
 
 
@@ -599,6 +687,87 @@ def _run_self_test() -> int:
         ok(all(0 <= s <= 1 for s in samples), "E: efficacy samples in [0,1]")
         mean = sum(samples) / len(samples)
         ok(0.45 < mean < 0.65, f"E: beta mean ~ 0.55, got {mean:.3f}")
+
+        # --- Case F: detail-section merge (Phase 3 Commit A1) ---
+        # YAML registry with no code_refs; detail section below provides them.
+        # Expected: after load_priors, each parameter has code_refs populated.
+        citations_with_details = """# Citations
+
+## [C1] Foo et al.
+
+## Parameter Registry
+
+```yaml
+parameters:
+  - name: foo_or
+    value: 0.44
+    kind: odds_ratio
+    source: C1
+  - name: bar_rr
+    value: 0.27
+    kind: relative_risk
+    source: C1
+```
+
+### foo_or (detail)
+- **name**: foo_or
+- **value**: 0.44
+- **kind**: odds_ratio
+- **source**: [C1] Foo et al.
+- **subgroup**: overall
+- **applies_to**: FOI reduction from ITN
+- **code_refs**:
+  - models/optimization.py:73 (FOO_OR = 0.44)
+  - models/outcome_fn.py:46 (foo_or default)
+- **conversion**: OR-to-RR via or_to_rr
+
+### bar_rr
+- **name**: bar_rr
+- **value**: 0.27
+- **kind**: relative_risk
+- **source**: [C1] Foo et al.
+- **code_refs**:
+  - models/optimization.py:85
+"""
+        citations_path2 = os.path.join(repo, "citations_details.md")
+        with open(citations_path2, "w") as f:
+            f.write(citations_with_details)
+        merged = load_priors(citations_path2)
+        params_by_name = {p["name"]: p for p in merged["parameters"]}
+        ok("foo_or" in params_by_name, "F: foo_or parsed")
+        ok(params_by_name["foo_or"].get("code_refs") == [
+            "models/optimization.py:73", "models/outcome_fn.py:46"],
+           f"F: foo_or code_refs got {params_by_name['foo_or'].get('code_refs')}")
+        ok(params_by_name["foo_or"].get("subgroup") == "overall",
+           "F: foo_or subgroup merged from detail")
+        ok(params_by_name["bar_rr"].get("code_refs") == [
+            "models/optimization.py:85"],
+           f"F: bar_rr code_refs got {params_by_name['bar_rr'].get('code_refs')}")
+
+        # --- Case G: YAML-provided code_refs WIN over detail section ---
+        # (Detail section should only fill in what's missing.)
+        citations_yaml_wins = """## Parameter Registry
+
+```yaml
+parameters:
+  - name: baz_or
+    value: 0.5
+    kind: odds_ratio
+    source: C1
+    code_refs: ['models/yaml_source.py:10']
+```
+
+### baz_or (detail)
+- **code_refs**:
+  - models/detail_source.py:99
+"""
+        citations_path3 = os.path.join(repo, "citations_yaml_wins.md")
+        with open(citations_path3, "w") as f:
+            f.write(citations_yaml_wins)
+        merged2 = load_priors(citations_path3)
+        baz = next(p for p in merged2["parameters"] if p["name"] == "baz_or")
+        ok(baz["code_refs"] == ["models/yaml_source.py:10"],
+           f"G: YAML code_refs wins; got {baz['code_refs']}")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)
