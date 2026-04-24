@@ -27,27 +27,42 @@ interpretation or presentation -- other reviewers handle those.
 
 ## Parameter Provenance Check
 
-Read {run_dir}/citations.md (if it exists). For each key model parameter
-(intervention effect sizes, calibration targets, cost figures):
+Read {run_dir}/citations.md (if it exists). The `## Parameter Registry`
+section is the machine-readable contract; the validator
+(`scripts/effect_size_registry.py`) runs mechanical checks on it. Your
+job is the judgment layer on top. See the `effect-size-priors` skill for
+the schema and the specific failure modes the validator catches.
+
+For each parameter in the registry (and for any load-bearing constant in
+code that is NOT in the registry):
 
 1. Is there a citation ID [CN] linking it to a specific paper?
-2. Read the model code and check: does the parameter VALUE in the code
-   match the cited value in citations.md exactly?
-3. If the model applies a parameter at a specific condition (e.g.,
-   "intervention effect at ≥80% coverage"), does the citation reference THAT
-   specific subgroup? Or is the overall estimate being misapplied to
-   a conditional context?
-4. Is an incidence rate ratio being used as a general relative risk?
-   Is an odds ratio being used where a risk ratio is needed? These are
-   different measures and are not interchangeable at high prevalence.
-5. Are confidence intervals from the same analysis as the point estimate?
+2. Does the parameter VALUE in the code match the cited value?
+3. Is the `kind` classification correct? Specifically: **did the source
+   paper report an odds ratio, a relative risk, a hazard ratio, or an
+   incidence rate ratio?** Misclassification is a HIGH hard-blocker —
+   OR and RR are not interchangeable when outcome prevalence is high
+   (>~10%). At PfPR 40%, OR=0.35 corresponds to RR≈0.47, not 0.35.
+4. Is the `subgroup` specification tight enough? An overall estimate
+   applied to a conditional context (e.g., RR at ≥80% coverage applied
+   to all coverage levels) is a HIGH hard-blocker.
+5. Are the 95% CIs in the registry the same ones reported in the source
+   paper (not a different analysis from the same paper)?
+6. Are ALL use-sites in code listed in `code_refs`? (Grep the model
+   code for the parameter name to check.)
 
 Flag as **HIGH-severity hard blocker**:
-- Parameter in code doesn't match cited value
+- OR/RR or IRR/RR conflation (kind misclassified or used without conversion)
+- Parameter value in code doesn't match registered value (>1%)
 - Overall estimate used where subgroup-specific estimate was claimed
 - Effect size applied more broadly than its source supports
-  (e.g., an RR from a specific subgroup at a specific time window
-  being applied as a general effect across all settings)
+- Cost value in code disagrees with "source" CSV by >10%
+- Load-bearing constant with no registry entry AND no citation
+
+Flag as **MEDIUM**:
+- Subgroup field is vague ("general population" for a specific-setting trial)
+- `code_refs` incomplete (parameter used in other files not listed)
+- `ci_low`/`ci_high` missing from registry (prevents proper UQ propagation)
 
 ## Validation Checklist
 - [ ] Temporal train/test split (never random for time series)

@@ -286,6 +286,51 @@ Write model code to the modules above. The entry point is {run_dir}/model_run.py
 Save figures to {run_dir}/figures/.
 Print structured metrics to stdout.
 Update {run_dir}/progress.md and {run_dir}/checklist.md.
+
+## PARAMETER REGISTRY (REQUIRED for literature-sourced constants)
+
+Every numerical constant you write into model code that came from a
+specific cited paper (intervention effect sizes, odds ratios, relative
+risks, efficacies, cost figures, calibration targets with published CIs)
+MUST be registered. See the `effect-size-priors` skill for the full
+contract.
+
+### For every such constant:
+
+1. Add an entry to `{run_dir}/citations.md` under a `## Parameter Registry`
+   section (create the section if it doesn't exist). Required fields per
+   entry: `name`, `value`, `ci_low`, `ci_high`, `kind`, `source` (matches
+   a `[CNN]` in the same file), `subgroup`, `applies_to`, `code_refs` (a
+   list of `file:line` strings pointing at every use site).
+2. Add a `# @registry:<name>` comment on the code line where the literal
+   lives, immediately above or same-line:
+
+   ```python
+   # @registry:irs_odds_ratio
+   irs_or = 0.35
+   ```
+
+3. **The `kind` field is load-bearing.** `odds_ratio` is NOT
+   interchangeable with `relative_risk`. If the source paper reports an
+   OR (typical for logistic regression / case-control), classify it
+   `kind: odds_ratio` and use an explicit `or_to_rr(OR, baseline_p)`
+   conversion before applying it as a multiplicative RR. The validator
+   flags `or_rr_conflation` HIGH when `kind: odds_ratio` is used without
+   a conversion in ±5 lines of context.
+
+4. **For cost parameters** (`kind: cost_usd`): include ALL CSV files
+   that hold related cost data in `code_refs`. If the CSV value and the
+   code literal disagree by >10%, the validator flags
+   `cost_crosscheck_mismatch` HIGH.
+
+### The validator runs `python3 scripts/effect_size_registry.py <run_dir>`
+to detect: `registry_value_mismatch` (code literal ≠ registered value),
+`or_rr_conflation`, `cost_crosscheck_mismatch`, `param_unregistered`
+(tag without a registry entry), `registry_missing_ref` (listed code_ref
+doesn't exist).
+
+Skipping the registry for a load-bearing parameter is a MEDIUM blocker.
+Misclassifying kind or introducing OR/RR conflation is a HIGH blocker.
 """
 
 

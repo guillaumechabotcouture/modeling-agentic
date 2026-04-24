@@ -55,6 +55,22 @@ def _load_spec_compliance():
         return None
 
 
+_REGISTRY_AVAILABLE = None
+
+def _load_effect_size_registry():
+    global _REGISTRY_AVAILABLE
+    if _REGISTRY_AVAILABLE is False:
+        return None
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import effect_size_registry  # noqa: E402
+        _REGISTRY_AVAILABLE = True
+        return effect_size_registry
+    except ImportError:
+        _REGISTRY_AVAILABLE = False
+        return None
+
+
 REVIEWERS = ("critique-methods", "critique-domain", "critique-presentation")
 PREFIXES = {"critique-methods": "M-", "critique-domain": "D-",
             "critique-presentation": "P-"}
@@ -257,7 +273,78 @@ def decide(critiques: dict[str, dict], max_rounds: int,
         "rule_matched": rule_matched,
         "rationale": rationale,
         "spec_violations": [],
+        "registry_violations": [],
     }
+
+
+def incorporate_registry_violations(decision: dict, violations: list[dict],
+                                    max_rounds: int, current_round: int) -> dict:
+    """Fold effect-size-registry violations into the decision.
+
+    HIGH violations (or_rr_conflation, registry_value_mismatch,
+    cost_crosscheck_mismatch) add synthetic `REG-NNN` blockers to
+    `unresolved_high`. MEDIUM violations (registry_missing_ref,
+    param_unregistered, subgroup_mismatch) are attached for visibility only.
+
+    Registry violations do NOT force `structural_mismatch=True` — they are
+    parameter-provenance issues, not architectural mismatches. A failed
+    registry check at round N means the run cannot ACCEPT until the modeler
+    patches the parameter or the registry entry.
+
+    Idempotent: calling twice yields identical output.
+    """
+    d = dict(decision)
+    d["registry_violations"] = violations
+
+    base_id = len([b for b in d["unresolved_high"]
+                   if b.get("reviewer") == "effect-size-registry"])
+    for i, v in enumerate(
+            [x for x in violations if x["severity"] == "HIGH"],
+            start=base_id + 1):
+        d["unresolved_high"].append({
+            "reviewer": "effect-size-registry",
+            "id": f"REG-{i:03d}",
+            "category": "CITATIONS",
+            "target_stage": "MODEL",
+            "first_seen_round": current_round,
+            "claim": f"{v['kind']} ({v['name']}): {v['claim']}",
+        })
+
+    # Recompute action using the same rule ordering. If spec-compliance has
+    # also been run and set structural=True, the structural rule still fires
+    # first; registry violations just add HIGHs underneath.
+    unresolved_high = d["unresolved_high"]
+    structural = d.get("structural_mismatch", False)
+    rounds_remaining = max_rounds - current_round
+
+    if structural:
+        action = "RETHINK_STRUCTURAL" if rounds_remaining > 0 else "RUN_FAILED"
+        rule_matched = 1
+        rationale = d.get("rationale", "")
+    elif unresolved_high and rounds_remaining > 0:
+        action = "PATCH_OR_RETHINK"
+        rationale = (
+            f"{len(unresolved_high)} HIGH blocker(s) unresolved "
+            f"(incl. registry), {rounds_remaining} round(s) remaining. "
+            f"ACCEPT is forbidden."
+        )
+        rule_matched = 2
+    elif unresolved_high and rounds_remaining <= 0:
+        action = "DECLARE_SCOPE"
+        rationale = (
+            f"{len(unresolved_high)} HIGH blocker(s) unresolved, rounds "
+            f"exhausted. Must write scope_declaration.yaml."
+        )
+        rule_matched = 3
+    else:
+        action = "ACCEPT"
+        rationale = "No unresolved HIGH blockers, no structural mismatch."
+        rule_matched = 4
+
+    d["action"] = action
+    d["rule_matched"] = rule_matched
+    d["rationale"] = rationale
+    return d
 
 
 def incorporate_spec_violations(decision: dict, violations: list[dict],
@@ -371,6 +458,12 @@ def render_text(decision: dict, current_round: int, max_rounds: int) -> str:
         for v in spec:
             lines.append(f"    - [{v['severity']}] {v['kind']}: "
                          f"{v['evidence'][:120]}")
+    reg = decision.get("registry_violations") or []
+    if reg:
+        lines.append(f"  registry_violations: {len(reg)}")
+        for v in reg:
+            lines.append(f"    - [{v['severity']}] {v['kind']} "
+                         f"({v['name']}): {v['claim'][:120]}")
     lines.append(f"  rounds_remaining: {decision['rounds_remaining']}")
     lines.append(f"  rule_matched: {decision['rule_matched']}")
     lines.append(f"  action: {decision['action']}")
@@ -391,6 +484,15 @@ def main() -> int:
                         "budget/archetype) against the research question "
                         "in metadata.json and fold HIGH violations into "
                         "the gate decision. See scripts/spec_compliance.py.")
+    p.add_argument("--parameter-registry", action="store_true",
+                   help="Run effect-size-registry checks against the "
+                        "`## Parameter Registry` section of citations.md "
+                        "and fold HIGH violations (OR/RR conflation, "
+                        "value mismatch, cost crosscheck) into the gate "
+                        "decision. See scripts/effect_size_registry.py.")
+    p.add_argument("--repo-root", default=None,
+                   help="Repo root for resolving code_refs "
+                        "(defaults to current working directory)")
     args = p.parse_args()
 
     if not os.path.isdir(args.run_dir):
@@ -430,15 +532,43 @@ def main() -> int:
             return 2
         with open(meta_path) as f:
             meta = json.load(f)
-        question = meta.get("question", "")
+        # Accept either 'question' (the canonical key written by main.py)
+        # or 'research_question' (which some lead agents rewrite it to
+        # while populating other metadata). Both carry the same value.
+        question = meta.get("question") or meta.get("research_question") or ""
         if not question:
-            print(f"ERROR: {meta_path} has no 'question' field; cannot "
-                  f"run spec-compliance check.", file=sys.stderr)
+            print(f"ERROR: {meta_path} has no 'question' or "
+                  f"'research_question' field; cannot run spec-compliance "
+                  f"check.", file=sys.stderr)
             return 2
         required = spec_module.detect_required_spec(question)
         check_result = spec_module.check_spec_compliance(required, args.run_dir)
         decision = incorporate_spec_violations(
             decision, check_result["violations"],
+            args.max_rounds, args.current_round,
+        )
+
+    if args.parameter_registry:
+        registry_module = _load_effect_size_registry()
+        if registry_module is None:
+            print("ERROR: --parameter-registry requested but "
+                  "scripts/effect_size_registry.py could not be imported.",
+                  file=sys.stderr)
+            return 2
+        citations_path = os.path.join(args.run_dir, "citations.md")
+        if not os.path.exists(citations_path):
+            print(f"ERROR: --parameter-registry requires {citations_path} "
+                  f"but it does not exist.", file=sys.stderr)
+            return 2
+        repo_root = args.repo_root or os.getcwd()
+        try:
+            registry = registry_module.load_priors(citations_path)
+        except (ValueError, FileNotFoundError) as e:
+            print(f"ERROR loading registry: {e}", file=sys.stderr)
+            return 2
+        reg_result = registry_module.check_registry(registry, repo_root)
+        decision = incorporate_registry_violations(
+            decision, reg_result["violations"],
             args.max_rounds, args.current_round,
         )
 
