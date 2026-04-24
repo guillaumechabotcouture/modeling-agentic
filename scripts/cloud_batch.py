@@ -86,7 +86,9 @@ VM_LOW_PRIORITY_USD_PER_HR = {
 }
 VM_DEDICATED_MULTIPLIER = 5.0
 
-DEFAULT_VM_SIZE = "Standard_D4s_v5"
+DEFAULT_VM_SIZE = "Standard_A2_v2"  # 2 vCPUs, fits Free Trial A-series quota.
+                                     # Override to D-series on Pay-As-You-Go
+                                     # for more RAM and faster CPUs.
 DEFAULT_POOL_LOCATION = "eastus2"
 DEFAULT_BUDGET_USD_CAP = 5.0
 

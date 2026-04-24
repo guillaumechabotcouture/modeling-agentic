@@ -275,22 +275,31 @@ pattern. A flagged degenerate fit must be addressed in
 scope declaration) before STAGE 7 can ACCEPT. See
 `multi-structural-comparison` skill.
 
-#### Step 2: Uncertainty propagation
+#### Step 2: Uncertainty propagation (cloud-enabled)
 
 ```bash
-python3 scripts/propagate_uncertainty.py {run_dir} --n-draws 200
+python3 scripts/propagate_uncertainty.py {run_dir} --n-draws 200 \\
+    --cloud --cloud-max-nodes 4 --cloud-budget-usd 5.0
 ```
 
 Reads registered parameter priors from `citations.md` (`## Parameter
-Registry` section, see effect-size-priors skill) and runs
-`models/outcome_fn.py::outcome_fn` 200 times with sampled params. Writes
+Registry` section, see effect-size-priors skill). With `--cloud`,
+submits each draw as an Azure Batch task running on dedicated Standard_D4s_v5
+nodes; without `--cloud` runs all draws locally. Writes
 `uncertainty_report.yaml` with per-output credible intervals and
 categorical stability distributions. See `uncertainty-quantification`
-skill.
+and `cloud-compute` skills.
 
-If `outcome_fn` is too slow for 200 local draws (>2 hours total), the
-modeler should build a surrogate or use cloud compute — see the
-`cloud-compute` skill for the decision rule and spot-instance config.
+Cloud prerequisites (one-time setup, already in place):
+- AZ_* env vars loaded from `.env` (AZ_SUBSCRIPTION_ID, AZ_BATCH_ACCOUNT,
+  AZ_BATCH_ACCOUNT_URL, AZ_STORAGE_ACCOUNT, AZ_STORAGE_CONTAINER).
+- Batch + storage accounts provisioned in `modeling-rg` (eastus2).
+- You MUST `set -a && source .env && set +a` before invoking the
+  command above so the env vars are loaded into the Bash subprocess.
+
+Use `--cloud` when `outcome_fn` is slow (>5s per call) or when the
+modeler hasn't built a local surrogate. For fast surrogate evals, local
+is fine and saves ~2 min of pool spin-up overhead.
 
 #### Step 3: Identifiability
 

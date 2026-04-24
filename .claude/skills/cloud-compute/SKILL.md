@@ -80,24 +80,59 @@ Most malaria-style ABMs run well on D4s_v5. A 200-draw UQ in 8
 parallel workers completes in ~12 min of wall time = **$0.07** at
 low-priority pricing. Dozens of test runs per Free Trial $200 credit.
 
-## Free Trial quota realities
+## Free Trial quota realities (READ THIS BEFORE CHOOSING A VM SIZE)
 
-New personal Azure subscriptions are Free Trial by default:
+New personal Azure subscriptions are Free Trial by default. The quota
+structure has a trap that bit us on first provisioning:
 
-- $200 credit, 30 days.
-- Spending Limit automatically ON — services pause when credit hits $0.
-- **Quota for low-priority cores may be 0** on some regions. Request
-  a quota increase in the Azure portal → Subscriptions → "Usage +
-  quotas" → filter for "Low-priority" → select region + VM family →
-  "Request Quota Increase". Usually approved same-day for reasonable
-  amounts (10–20 cores).
-- **Once the trial converts to Pay-As-You-Go**, the Spending Limit
-  turns off. Set up a **Budget alert** in Cost Management BEFORE this
-  happens.
+- **Total dedicated core quota**: usually 4 on Free Trial (look at
+  `az batch account show -n <name> -g <rg> --query dedicatedCoreQuota`).
+- **Low-priority / spot quota**: **0 on Free Trial**. Spot nodes are
+  disabled until you upgrade to Pay-As-You-Go or request an increase.
+- **Per-family quotas on top of the total**: Azure enforces separate
+  quotas per VM SKU family. Even if your total quota is 4 cores, that
+  doesn't mean you can run 1 × Standard_D4s_v5 (4 cores) — the
+  **standardDSv5Family** quota may be separate and small. The first
+  error you'll see is:
+  `AccountVMSeriesCoreQuotaReached: The specified account has reached
+   VM series core quota for standardDSv5Family`.
 
-The modeler should assume <10 vCPUs available on Free Trial unless a
-quota increase has been approved. For small-batch UQ (8 tasks × 4
-vCPUs each), this usually works.
+**The fix**: use the **A-series** on Free Trial. A1_v2 (1 vCPU) and
+A2_v2 (2 vCPUs) live in a different family with looser quota. For
+modeling-agentic's UQ workloads, **Standard_A2_v2** at 2 nodes = 4
+total vCPUs fits comfortably in Free Trial and still runs surrogate-
+backed outcome_fns in parallel. That's what our defaults are set to.
+
+Upgrade to Pay-As-You-Go when you outgrow A-series:
+- Upgrade process: portal → Subscriptions → "Upgrade" button. $0 to
+  upgrade itself.
+- Request quota increase for DSv5 family in the portal after upgrade.
+- Set up a Budget alert in Cost Management BEFORE upgrade (Free Trial's
+  spending limit turns off on upgrade).
+
+**Check before first pool create**:
+```bash
+# Per-family quotas in your region
+az vm list-usage -l eastus2 --query "[?limit>\`0\`].{family:name.value, used:currentValue, limit:limit}" -o table
+```
+
+Or before a specific pool attempt, check with a dry-run:
+```bash
+python3 scripts/cloud_batch.py --estimate-cost --vm-size Standard_A2_v2 \
+    --n-tasks 200 --avg-seconds 30 --max-nodes 2
+```
+
+## Default VM sizes in modeling-agentic
+
+- `DEFAULT_VM_SIZE` in `cloud_batch.py` = **Standard_A2_v2** (Free Trial safe).
+- `propagate_uncertainty.py --cloud-vm-size` default = **Standard_A2_v2**.
+- `propagate_uncertainty.py --cloud-max-nodes` default = **2**.
+
+When you have Pay-As-You-Go + DSv5 quota, override with flags:
+```bash
+python3 scripts/propagate_uncertainty.py {run_dir} --cloud \
+    --cloud-vm-size Standard_D4s_v5 --cloud-max-nodes 8
+```
 
 ## The `scripts/cloud_batch.py` wrapper
 
