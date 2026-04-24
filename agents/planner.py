@@ -189,6 +189,19 @@ investigations are complete, blocked, or need work.
 **{run_dir}/citations.md** — citation index (see CITATION INDEX section above).
 
 **{run_dir}/threads.yaml** — investigation manifest.
+
+**{run_dir}/metadata.json** — update this file with a `decision_year`
+field if the research question implies one:
+- "Global Fund GC7" / "GC7 allocation" → `"decision_year": 2024`
+- "Global Fund GC8" / "GC8 allocation" → `"decision_year": 2027`
+- "Global Fund GC9" / "GC9 allocation" → `"decision_year": 2030`
+- Explicit year like "by 2030" or "for 2028" → use that year.
+- Otherwise leave unset; the validator falls back to the year from
+  `metadata.started`.
+
+The spec-compliance gate uses `decision_year` to assess data/methodology
+vintage gaps. A primary calibration dataset with vintage ≥10 years
+older than `decision_year` is a HIGH `data_vintage_stale` blocker.
 """
 
 

@@ -117,6 +117,53 @@ _SPATIAL_PATTERN = re.compile(
 
 _ARCHETYPE_PATTERN = re.compile(r"\b(\d+)\s+archetypes?\b", re.IGNORECASE)
 
+# Question-based decision-year hints (GF funding cycles, common target years).
+_DECISION_YEAR_PATTERNS = [
+    (re.compile(r"\bGC7\b", re.IGNORECASE), 2024),
+    (re.compile(r"\bGC8\b", re.IGNORECASE), 2027),
+    (re.compile(r"\bGC9\b", re.IGNORECASE), 2030),
+    (re.compile(r"\bby\s+(20\d{2})\b", re.IGNORECASE), None),  # dynamic
+    (re.compile(r"\bfor\s+(20\d{2})\b", re.IGNORECASE), None),
+]
+
+
+def detect_decision_year(question: str, metadata: Optional[dict] = None) -> Optional[int]:
+    """Parse a decision year from the question + metadata.
+
+    Priority:
+      1. Explicit `decision_year` field in metadata.json (if present).
+      2. GF funding cycle (GC7 → 2024, GC8 → 2027, GC9 → 2030).
+      3. "by YYYY" / "for YYYY" numeric phrases.
+      4. Year of metadata['started'] as fallback.
+    Returns None when no decision year can be inferred.
+    """
+    if metadata:
+        if "decision_year" in metadata and metadata["decision_year"]:
+            try:
+                return int(metadata["decision_year"])
+            except (ValueError, TypeError):
+                pass
+
+    for pattern, year in _DECISION_YEAR_PATTERNS:
+        m = pattern.search(question)
+        if m:
+            if year is not None:
+                return year
+            # Dynamic pattern: captured group is the year.
+            try:
+                return int(m.group(1))
+            except (ValueError, IndexError):
+                continue
+
+    if metadata:
+        for key in ("started", "created"):
+            if key in metadata and metadata[key]:
+                try:
+                    return int(str(metadata[key])[:4])
+                except (ValueError, TypeError):
+                    pass
+    return None
+
 
 def detect_required_spec(question: str) -> dict:
     """Parse a research question for declared requirements.
@@ -502,6 +549,239 @@ def _check_budget(budget_envelope: float, budget_raw: str,
 
 
 # ---------------------------------------------------------------------------
+# Data vintage check (Phase 3 Commit B)
+# ---------------------------------------------------------------------------
+
+# Preferred structured marker going forward.
+_VINTAGE_LABEL_RE = re.compile(
+    r"^\*\*Vintage\*\*:\s*(\d{4})\b", re.MULTILINE
+)
+
+# Fallback: extract year from "**Temporal coverage**: ..." prose lines.
+_TEMPORAL_COVERAGE_RE = re.compile(
+    r"^\*\*Temporal coverage\*\*:\s*([^\n]+)$", re.MULTILINE
+)
+_YEAR_IN_LINE_RE = re.compile(r"\b(19|20)(\d{2})\b")
+
+# Section headers in data_quality.md: `## N. filename.csv` or `## filename`.
+_DATA_SECTION_RE = re.compile(
+    r"^##\s+(?:\d+\.\s+)?(?P<name>[^\n]+?)\s*$", re.MULTILINE
+)
+
+
+def _parse_data_sections(data_quality_md: str) -> list[dict]:
+    """Parse data_quality.md into per-section dicts with extracted vintage.
+
+    Returns list of {name, start, end, body, vintage, vintage_source}.
+    vintage_source is "structured" (from **Vintage**:) or "temporal" (from
+    **Temporal coverage**:) or None (no vintage found).
+    """
+    sections = []
+    headers = list(_DATA_SECTION_RE.finditer(data_quality_md))
+    # Skip the first section if it's the document title (no dataset name).
+    for i, hdr in enumerate(headers):
+        name = hdr.group("name").strip()
+        if name.lower().startswith("nigeria malaria") or "assessment" in name.lower():
+            continue
+        start = hdr.end()
+        end = headers[i + 1].start() if i + 1 < len(headers) else len(data_quality_md)
+        body = data_quality_md[start:end]
+
+        vintage = None
+        source = None
+        m = _VINTAGE_LABEL_RE.search(body)
+        if m:
+            vintage = int(m.group(1))
+            source = "structured"
+        else:
+            tc = _TEMPORAL_COVERAGE_RE.search(body)
+            if tc:
+                years = [
+                    int(match.group(0))
+                    for match in _YEAR_IN_LINE_RE.finditer(tc.group(1))
+                ]
+                if years:
+                    # Use the EARLIEST year mentioned — that's the base
+                    # vintage of the data. If text says "2010-2021", the
+                    # data starts at 2010.
+                    vintage = min(years)
+                    source = "temporal"
+
+        sections.append({
+            "name": name,
+            "body": body,
+            "vintage": vintage,
+            "vintage_source": source,
+        })
+    return sections
+
+
+_PRIMARY_LABEL_RE = re.compile(
+    r"^\*\*Primary calibration\*\*:\s*(yes|no|true|false)\b",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def _is_primary_calibration_section(section: dict) -> bool:
+    """Prefer the structured `**Primary calibration**: yes/no` line when
+    present. Fall back to prose heuristics for legacy files."""
+    m = _PRIMARY_LABEL_RE.search(section["body"])
+    if m:
+        return m.group(1).lower() in ("yes", "true")
+    body_low = section["body"].lower()
+    return any(kw in body_low for kw in (
+        "calibration target", "primary authority",
+        "primary national survey",
+    ))
+
+
+def check_data_vintage(run_dir: str, decision_year: Optional[int]) -> list[dict]:
+    """Check dataset vintages in data_quality.md against decision_year.
+
+    Emits:
+      - `data_vintage_stale` HIGH when gap ≥ 10 on a primary calibration target
+      - `data_vintage_stale` MEDIUM when gap 5-9 (any dataset)
+      - `vintage_unstructured` MEDIUM when data_quality.md exists but has
+        no **Vintage** labels (going-forward contract)
+    """
+    violations = []
+    if decision_year is None:
+        return []  # Nothing to compare against.
+
+    dq_path = os.path.join(run_dir, "data_quality.md")
+    if not os.path.exists(dq_path):
+        return []
+    with open(dq_path) as f:
+        text = f.read()
+
+    sections = _parse_data_sections(text)
+    if not sections:
+        return []
+
+    structured_count = sum(
+        1 for s in sections if s["vintage_source"] == "structured"
+    )
+    if structured_count == 0 and sections:
+        violations.append({
+            "kind": "vintage_unstructured",
+            "severity": "MEDIUM",
+            "evidence": (
+                f"data_quality.md has {len(sections)} dataset sections but "
+                f"none carries a structured `**Vintage**: YYYY` line. "
+                f"Data-agent must emit `**Vintage**: YYYY` per section."
+            ),
+        })
+
+    for section in sections:
+        if section["vintage"] is None:
+            continue
+        gap = decision_year - section["vintage"]
+        if gap < 5:
+            continue
+        is_primary = _is_primary_calibration_section(section)
+        if gap >= 10 and is_primary:
+            severity = "HIGH"
+        elif gap >= 10:
+            severity = "MEDIUM"
+        else:  # 5-9
+            severity = "MEDIUM"
+        violations.append({
+            "kind": "data_vintage_stale",
+            "severity": severity,
+            "primary": is_primary,
+            "vintage": section["vintage"],
+            "gap": gap,
+            "evidence": (
+                f"{section['name']}: vintage {section['vintage']} "
+                f"({section['vintage_source']}), decision year {decision_year}, "
+                f"gap = {gap} years"
+                + (" (primary calibration target)" if is_primary else "")
+            ),
+        })
+    return violations
+
+
+# ---------------------------------------------------------------------------
+# Methodological vintage check (Phase 3 Commit B)
+# ---------------------------------------------------------------------------
+
+# Matches "following <Author YYYY>" or "archetype clustering per [CN]
+# (<Author> YYYY)" — methodological-basis claims tied to cited papers.
+_METHOD_CITE_RE = re.compile(
+    r"\b(?:following|based\s+on|using\s+the\s+method\s+of|per|adapted\s+from|replic\w+\s+of)\s+"
+    r"(?:the\s+)?(?:\w+\s+(?:et\s+al\.?\s+)?(\d{4})|\[C\d+\])",
+    re.IGNORECASE,
+)
+
+_CITATION_YEAR_RE = re.compile(
+    r"^##\s+\[(C\d+)\][^\n]*?(\d{4})", re.MULTILINE
+)
+
+
+def _extract_citation_years(citations_md: str) -> dict[str, int]:
+    """Parse `## [CN] ... YYYY` headers for citation years."""
+    out = {}
+    for m in _CITATION_YEAR_RE.finditer(citations_md):
+        out[m.group(1)] = int(m.group(2))
+    return out
+
+
+def check_methodological_vintage(run_dir: str,
+                                 decision_year: Optional[int]) -> list[dict]:
+    """If plan.md / modeling_strategy.md cites a methodological basis
+    (e.g. 'archetype clustering per [C2]' or 'following Author YYYY')
+    and the cited paper is ≥ 10 years before the decision year, flag as
+    `methodology_vintage_stale` MEDIUM. Cheap signal — doesn't require
+    reading the cited paper.
+    """
+    violations = []
+    if decision_year is None:
+        return []
+
+    citations_md = os.path.join(run_dir, "citations.md")
+    citation_years: dict[str, int] = {}
+    if os.path.exists(citations_md):
+        with open(citations_md) as f:
+            citation_years = _extract_citation_years(f.read())
+
+    for md_name in ("plan.md", "modeling_strategy.md"):
+        path = os.path.join(run_dir, md_name)
+        if not os.path.exists(path):
+            continue
+        with open(path) as f:
+            text = f.read()
+        for m in _METHOD_CITE_RE.finditer(text):
+            # Either a year was captured directly (\d{4}) or a [CN] ref.
+            year = None
+            if m.group(1):
+                try:
+                    year = int(m.group(1))
+                except ValueError:
+                    continue
+            else:
+                # Extract [CN] from the full match.
+                cn = re.search(r"\[(C\d+)\]", m.group(0))
+                if cn and cn.group(1) in citation_years:
+                    year = citation_years[cn.group(1)]
+            if year is None:
+                continue
+            gap = decision_year - year
+            if gap >= 10:
+                # Capture 40 chars of context for evidence.
+                context = text[max(0, m.start() - 20):m.end() + 20]
+                violations.append({
+                    "kind": "methodology_vintage_stale",
+                    "severity": "MEDIUM",
+                    "evidence": (
+                        f"{md_name}: methodological basis cited from "
+                        f"{year} ({gap}-year gap vs decision year "
+                        f"{decision_year}). Context: '{context.strip()}...'"
+                    ),
+                })
+    return violations
+
+
+# ---------------------------------------------------------------------------
 # Archetype check (advisory)
 # ---------------------------------------------------------------------------
 
@@ -541,25 +821,70 @@ def _check_archetype_aggregation(archetype_spec: int, spatial_n: Optional[int],
         except OSError:
             continue
 
-    if bound_found:
-        return None
+    # Phase 3 D: check for a STRUCTURED bound, not just any prose match.
+    # `**Within-archetype error**: <value>` (or `variance`) is the
+    # machine-readable contract. If it's absent, the bound is treated
+    # as undocumented and severity defaults to HIGH (any reduction
+    # without a quantitative bound).
+    structured_bound_re = re.compile(
+        r"^\*\*Within-archetype\s+(?:error|variance)\*\*:\s*([0-9.]+)\s*(pp|%)?\s*$",
+        re.MULTILINE | re.IGNORECASE,
+    )
+    structured_bound_value: Optional[float] = None
+    structured_bound_unit: Optional[str] = None
+    for md_name in ("modeling_strategy.md", "model_comparison.md", "results.md"):
+        md_path = os.path.join(run_dir, md_name)
+        if not os.path.exists(md_path):
+            continue
+        try:
+            with open(md_path) as f:
+                text = f.read()
+        except OSError:
+            continue
+        m = structured_bound_re.search(text)
+        if m:
+            structured_bound_value = float(m.group(1))
+            structured_bound_unit = m.group(2) or "pp"
+            break
 
-    # Severity: HIGH if reduction is >5x, else MEDIUM.
     ratio = archetype_spec / k_used
-    severity = "HIGH" if ratio >= 5 else "MEDIUM"
+
+    if structured_bound_value is not None:
+        # A structured bound is present. Severity depends on its magnitude.
+        if structured_bound_value > 20:
+            severity = "MEDIUM"
+            kind = "archetype_bound_weak"
+            reason = (
+                f"Structured bound documented "
+                f"(**Within-archetype error**: {structured_bound_value}{structured_bound_unit}) "
+                f"but exceeds 20{structured_bound_unit} threshold — within-archetype "
+                f"heterogeneity is too large to defend LGA-level guidance."
+            )
+        else:
+            # Bound is documented and tight enough — no blocker.
+            return None
+    else:
+        # No structured bound → HIGH by default (Phase 3 D: any K_used <
+        # K_spec without explicit quantitative bound blocks ACCEPT).
+        severity = "HIGH"
+        kind = "archetype_aggregation_unvalidated"
+        reason = (
+            f"No structured within-archetype error bound found. "
+            f"{ratio:.1f}× reduction from {archetype_spec} → {k_used} "
+            f"archetypes requires an explicit `**Within-archetype error**: "
+            f"<value>pp` line in modeling_strategy.md before LGA-level "
+            f"guidance is defensible."
+        )
+
     return {
-        "kind": "archetype_aggregation_unvalidated",
+        "kind": kind,
         "required": archetype_spec,
         "severity": severity,
         "used": k_used,
         "evidence": (
             f"Question names {archetype_spec} archetypes; code uses "
             f"{k_used} (grepped models/ for A1/A2/... identifiers). "
-            "No within-archetype error bound or aggregation-error discussion "
-            "found in model_comparison.md, results.md, or modeling_strategy.md. "
-            f"{'Major (' if severity == 'HIGH' else 'Moderate ('}"
-            f"{ratio:.1f}×) reduction requires a quantitative bound on "
-            "within-archetype heterogeneity before LGA-level guidance is credible."
+            + reason
         ),
     }
 
@@ -568,8 +893,13 @@ def _check_archetype_aggregation(archetype_spec: int, spatial_n: Optional[int],
 # Top-level check
 # ---------------------------------------------------------------------------
 
-def check_spec_compliance(required: dict, run_dir: str) -> dict:
-    """Run all applicable checks. Returns {'violations': [...]}."""
+def check_spec_compliance(required: dict, run_dir: str,
+                          decision_year: Optional[int] = None) -> dict:
+    """Run all applicable checks. Returns {'violations': [...]}.
+
+    decision_year: used for Phase 3 B vintage checks. Pass None to skip
+    vintage checks entirely (preserves legacy behavior).
+    """
     violations: list[dict] = []
     code_by_file = _read_models_code(run_dir)
 
@@ -599,6 +929,11 @@ def check_spec_compliance(required: dict, run_dir: str) -> dict:
         v = _check_archetype_aggregation(arch, spatial_n, run_dir)
         if v is not None:
             violations.append(v)
+
+    # Phase 3 Commit B: data + methodological vintage.
+    if decision_year is not None:
+        violations.extend(check_data_vintage(run_dir, decision_year))
+        violations.extend(check_methodological_vintage(run_dir, decision_year))
 
     return {"violations": violations}
 
@@ -722,6 +1057,100 @@ def _run_self_test() -> int:
         kinds_e = {v["kind"] for v in ve["violations"]}
         ok("budget_underutilized" not in kinds_e,
            f"E: $290M of $320M = 90.6% should NOT trigger, got {kinds_e}")
+
+        # --- Phase 3 Commit B: data vintage ---
+
+        # Case F: primary calibration dataset with vintage 2006, decision_year
+        # 2024 → gap 18 → HIGH data_vintage_stale.
+        with open(os.path.join(d, "data_quality.md"), "w") as f:
+            f.write("## lga_archetypes.csv\n"
+                    "**Vintage**: 2006\n"
+                    "**Primary calibration**: yes\n"
+                    "Archetype clustering derived from 2006 DHS + MIS.\n\n"
+                    "## seasonal_profiles.csv\n"
+                    "**Vintage**: 2015\n"
+                    "**Primary calibration**: no\n"
+                    "Seasonal ITN usage profile.\n")
+        required_f = {"frameworks": [], "approaches": [],
+                      "budget_envelope": None, "budget_raw": None,
+                      "spatial_units": None, "archetype_spec": None}
+        vf = check_spec_compliance(required_f, d, decision_year=2024)
+        vints_f = [v for v in vf["violations"] if v["kind"] == "data_vintage_stale"]
+        ok(any(v["severity"] == "HIGH" and v.get("primary")
+               for v in vints_f),
+           f"F: expected HIGH data_vintage_stale on primary "
+           f"calibration target, got {[(v['severity'], v.get('primary')) for v in vints_f]}")
+        ok(any(v["severity"] == "MEDIUM" and not v.get("primary")
+               for v in vints_f),
+           f"F: expected MEDIUM on non-primary 2015 dataset (gap=9)")
+
+        # Case G: data_quality.md with no structured Vintage lines →
+        # vintage_unstructured MEDIUM.
+        with open(os.path.join(d, "data_quality.md"), "w") as f:
+            f.write("## some_dataset.csv\n"
+                    "Collected sometime around 2010 or so.\n"
+                    "Data quality is good.\n")
+        vg = check_spec_compliance(required_f, d, decision_year=2024)
+        kinds_g = {v["kind"] for v in vg["violations"]}
+        ok("vintage_unstructured" in kinds_g,
+           f"G: expected vintage_unstructured, got {kinds_g}")
+
+        # --- Phase 3 Commit D: archetype bound refinement ---
+
+        # Case H: K=6, N=22, structured bound 3pp → no HIGH; no
+        # archetype_bound_weak (3pp ≤ 20).
+        with open(os.path.join(d, "models", "model.py"), "w") as f:
+            f.write("archetypes = ['A1','A2','A3','A4','A5','A6']\n")
+        with open(os.path.join(d, "modeling_strategy.md"), "w") as f:
+            f.write("## Archetype aggregation\n"
+                    "Collapsing 22 archetypes to 6 for tractability.\n"
+                    "**Within-archetype error**: 3pp\n")
+        required_h = {"frameworks": [], "approaches": [],
+                      "budget_envelope": None, "budget_raw": None,
+                      "spatial_units": None, "archetype_spec": 22}
+        vh = check_spec_compliance(required_h, d)
+        kinds_h = {v["kind"] for v in vh["violations"]}
+        ok("archetype_aggregation_unvalidated" not in kinds_h,
+           f"H: structured bound present, expected no HIGH archetype, got {kinds_h}")
+        ok("archetype_bound_weak" not in kinds_h,
+           f"H: 3pp is a tight bound, no bound_weak expected, got {kinds_h}")
+
+        # Case I: K=6, N=22, structured bound 25pp → MEDIUM
+        # archetype_bound_weak.
+        with open(os.path.join(d, "modeling_strategy.md"), "w") as f:
+            f.write("## Archetype aggregation\n"
+                    "Collapsing 22 archetypes to 6 for tractability.\n"
+                    "**Within-archetype error**: 25pp\n")
+        vi = check_spec_compliance(required_h, d)
+        kinds_i = {v["kind"] for v in vi["violations"]}
+        ok("archetype_bound_weak" in kinds_i,
+           f"I: 25pp exceeds 20, expected archetype_bound_weak, got {kinds_i}")
+        ok("archetype_aggregation_unvalidated" not in kinds_i,
+           f"I: bound is documented (if weak), no _unvalidated expected")
+
+        # Case J: K=6, N=22, NO structured bound → HIGH
+        # archetype_aggregation_unvalidated.
+        with open(os.path.join(d, "modeling_strategy.md"), "w") as f:
+            f.write("## Archetype aggregation\n"
+                    "Collapsing to 6 archetypes, error is small.\n")
+        vj = check_spec_compliance(required_h, d)
+        kinds_j = {v["kind"] for v in vj["violations"]}
+        ok("archetype_aggregation_unvalidated" in kinds_j,
+           f"J: no structured bound, expected HIGH _unvalidated, got {kinds_j}")
+
+        # --- decision_year detection ---
+        meta_gc7 = {"question": "Global Fund GC7 allocation for Nigeria",
+                    "started": "2026-04-23T07:00:00"}
+        ok(detect_decision_year(meta_gc7["question"], meta_gc7) == 2024,
+           "K: GC7 → 2024")
+        meta_gc8 = {"question": "Build a GC8 allocation model",
+                    "started": "2026-04-23T07:00:00"}
+        ok(detect_decision_year(meta_gc8["question"], meta_gc8) == 2027,
+           "L: GC8 → 2027")
+        meta_fallback = {"question": "A model of measles",
+                         "started": "2026-04-23T07:00:00"}
+        ok(detect_decision_year(meta_fallback["question"], meta_fallback) == 2026,
+           "M: fallback to metadata.started year")
 
     # --- Summary ---
     if failures:

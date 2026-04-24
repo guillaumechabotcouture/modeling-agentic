@@ -375,6 +375,22 @@ If you register 15 parameters and thread only 5, the cost CI will span
 0.007% of the mean — obviously wrong, and the validator will block
 ACCEPT with 10 HIGH `param_frozen_in_uq` blockers.
 
+### ARCHETYPE AGGREGATION (Phase 3 Commit B)
+
+If your model aggregates entities (LGAs, districts, states) into
+archetypes and the plan specifies N archetypes, you MUST either:
+1. Use N archetypes exactly, OR
+2. Aggregate to K < N AND document a within-archetype error bound in
+   `{run_dir}/modeling_strategy.md` via a line of the exact form:
+
+   ```
+   **Within-archetype error**: 3pp
+   ```
+
+   (or `**Within-archetype variance**: 0.05` — units `pp`, `%`, or a
+   raw fraction). Without this line, `archetype_aggregation_unvalidated`
+   fires HIGH. A bound > 20pp / 20% triggers MEDIUM `archetype_bound_weak`.
+
 ## PHASE 2 RIGOR ARTIFACTS (REQUIRED)
 
 After calibration, produce three additional artifacts that feed the

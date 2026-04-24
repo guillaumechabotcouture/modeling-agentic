@@ -555,7 +555,16 @@ def incorporate_spec_violations(decision: dict, violations: list[dict],
     d = dict(decision)
     d["spec_violations"] = violations
     structural_kinds = {"framework_missing", "approach_mismatch"}
-    objective_kinds = {"budget_underutilized", "archetype_aggregation_unvalidated"}
+    # Phase 3 B+D extends objective_kinds with vintage, methodology,
+    # and bound-weak archetype categories.
+    objective_kinds = {
+        "budget_underutilized",
+        "archetype_aggregation_unvalidated",
+        "archetype_bound_weak",
+        "data_vintage_stale",
+        "methodology_vintage_stale",
+        "vintage_unstructured",
+    }
 
     high_struct = [v for v in violations
                    if v["severity"] == "HIGH" and v["kind"] in structural_kinds]
@@ -755,7 +764,9 @@ def main() -> int:
                   f"check.", file=sys.stderr)
             return 2
         required = spec_module.detect_required_spec(question)
-        check_result = spec_module.check_spec_compliance(required, args.run_dir)
+        decision_year = spec_module.detect_decision_year(question, meta)
+        check_result = spec_module.check_spec_compliance(
+            required, args.run_dir, decision_year=decision_year)
         decision = incorporate_spec_violations(
             decision, check_result["violations"],
             args.max_rounds, args.current_round,

@@ -118,17 +118,62 @@ have run yet).
 If the question names N archetypes (`"22 archetypes"`, etc.), the check
 greps models/ for archetype identifiers (`A1`, `A2`, …, `A22`) to
 estimate how many the code actually uses (K). If K < N, the check looks
-for an error-bound discussion in `model_comparison.md`, `results.md`, or
-`modeling_strategy.md` (keywords: `within_archetype_error`,
-`within-archetype error`, `aggregation error`, `archetype variance`).
+for a **structured** error-bound line in `modeling_strategy.md` of the
+exact form:
+
+```markdown
+**Within-archetype error**: 3pp
+**Within-archetype variance**: 0.05
+```
+
+Units: `pp` (percentage points), `%` (percent), or a bare number
+(fractional). The structured form is mandatory — prose discussion of
+"aggregation error" is no longer accepted. (Phase 3 Commit B refinement.)
 
 - K absent/unknown → no check.
 - K ≥ N → compliant.
-- K < N with error bound documented → compliant.
-- K < N with no error bound, N/K ≥ 5 → HIGH violation
-  (`archetype_aggregation_unvalidated`).
-- K < N with no error bound, N/K < 5 → MEDIUM violation (does not block
-  ACCEPT but is surfaced).
+- K < N with structured bound documented and value ≤ 20 → compliant.
+- K < N with structured bound documented and value > 20 → MEDIUM
+  violation (`archetype_bound_weak`): the bound is so loose it doesn't
+  justify the collapse.
+- K < N with no structured bound → HIGH violation
+  (`archetype_aggregation_unvalidated`). Always HIGH now regardless of
+  N/K ratio — the question named N and the team chose K; the team owes
+  a justification.
+
+### 5. Data vintage (Phase 3 Commit B)
+
+Each `data_quality.md` dataset section MUST contain a line of the form:
+
+```markdown
+**Vintage**: 2021
+```
+
+This is the year the underlying data was COLLECTED, not the year the
+source was published. The check reads `decision_year` from
+`metadata.json` (planner writes this at STAGE 1) or falls back to the
+year of `metadata.started`.
+
+For each `**Vintage**: YYYY` line:
+- `gap = decision_year - vintage`.
+- If the section marks `**Primary calibration**: yes` AND `gap ≥ 10` →
+  HIGH `data_vintage_stale`. You are calibrating 2024 decisions against
+  2010-and-older data.
+- If `5 ≤ gap < 10` → MEDIUM `data_vintage_stale` (any dataset, primary
+  or not).
+- If `gap ≥ 10` on a non-primary dataset → MEDIUM.
+- `data_quality.md` exists but contains no `**Vintage**` lines at all
+  → MEDIUM `vintage_unstructured`.
+
+### 6. Methodological vintage (Phase 3 Commit B)
+
+Scans `plan.md` and `modeling_strategy.md` for methodological references
+like `"archetype clustering per Ozodiegwu 2023"` or `"following Smith
+et al. 2008"`. Matches citation year against the cited year itself (or
+the year-suffix in the author phrase). If `decision_year - cited_year ≥
+15` → MEDIUM `methodology_vintage_stale`. Clustering/archetypization/
+efficacy-estimation methods older than ~15 years are routinely refreshed;
+using a pre-2010 methodology for a 2024 decision is a red flag.
 
 ## How violations map to gate action
 
@@ -141,7 +186,11 @@ into the existing decision:
 | `approach_mismatch`                  | HIGH     | Force `structural_mismatch: true` → RETHINK_STRUCTURAL |
 | `budget_underutilized`               | HIGH     | Add synthetic `OBJ-NNN` blocker to `unresolved_high` → PATCH_OR_RETHINK |
 | `archetype_aggregation_unvalidated`  | HIGH     | Add synthetic `OBJ-NNN` blocker to `unresolved_high` |
-| `archetype_aggregation_unvalidated`  | MEDIUM   | Reported but does not change action             |
+| `archetype_bound_weak`               | MEDIUM   | Reported but does not change action             |
+| `data_vintage_stale`                 | HIGH     | Add synthetic `OBJ-NNN` blocker (primary calibration, gap ≥10) |
+| `data_vintage_stale`                 | MEDIUM   | Reported but does not change action             |
+| `vintage_unstructured`               | MEDIUM   | Reported but does not change action             |
+| `methodology_vintage_stale`          | MEDIUM   | Reported but does not change action             |
 
 When `structural_mismatch` is forced true by spec-compliance, the
 `structural_reviewers` list includes the literal string

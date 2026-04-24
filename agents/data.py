@@ -25,13 +25,27 @@ document all datasets needed for the modeling task.
    of them. The modeler will need to fit to each independently.
 
 5. **Write {run_dir}/data_quality.md** with for EACH dataset:
+   - Section header: `## <filename>` or `## <dataset name>`
+   - `**Vintage**: YYYY` -- the year the underlying data was COLLECTED
+     (not the year the source was published). REQUIRED, machine-read.
+     For multi-year datasets, use the most recent collection year.
+   - `**Temporal coverage**: <description>` -- human-readable coverage
+     span, e.g., "2018-2021 DHS survey rounds".
+   - `**Primary calibration**: yes/no` -- is this dataset a target the
+     model will calibrate against? Mark at most one as primary.
    - Source name and authority
    - Variables available and what we'll use
-   - Temporal and geographic coverage (exact years, countries)
+   - Geographic coverage (exact countries/regions)
    - Sample size (rows, unique entities)
    - **Quality assessment**: What's good? What's limited?
    - Coverage gaps, reporting changes, missing values
    - How missing values should be handled
+
+   The `**Vintage**` line is a machine-readable contract. The
+   spec-compliance gate parses it and blocks HIGH when a primary
+   calibration target has a vintage gap ≥10 years vs the decision year
+   (MEDIUM for 5-9 years on any dataset). Missing `**Vintage**` lines
+   trigger a MEDIUM `vintage_unstructured` blocker.
 
 6. **Write and run {run_dir}/eda.py** that:
    - Loads all datasets
