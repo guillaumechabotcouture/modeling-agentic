@@ -276,7 +276,8 @@ _NUMERIC_LITERAL_RE = re.compile(r"[-+]?(?:\d+\.\d+|\d+)(?:[eE][-+]?\d+)?")
 _REGISTRY_TAG_RE = re.compile(r"#\s*@registry\s*:\s*([A-Za-z_][\w]*)")
 
 
-def _resolve_one(code_ref: str, repo_root: str) -> ResolvedRef:
+def _resolve_one(code_ref: str, repo_root: str,
+                 run_dir: Optional[str] = None) -> ResolvedRef:
     # Accept "models/foo.py:123" (file:line) or "data/costs.csv" (whole-file).
     parts = code_ref.rsplit(":", 1)
     if len(parts) == 2 and parts[1].isdigit():
@@ -286,7 +287,16 @@ def _resolve_one(code_ref: str, repo_root: str) -> ResolvedRef:
         rel_path = code_ref
         line = None
 
-    abs_path = os.path.join(repo_root, rel_path)
+    # Prefer run_dir-relative resolution when provided. The modeler writes
+    # per-run paths like `models/foo.py:38` that live at
+    # `{run_dir}/models/foo.py`, not `{repo_root}/models/foo.py`.
+    abs_path = None
+    if run_dir:
+        candidate = os.path.join(run_dir, rel_path)
+        if os.path.exists(candidate):
+            abs_path = candidate
+    if abs_path is None:
+        abs_path = os.path.join(repo_root, rel_path)
     if not os.path.exists(abs_path):
         return ResolvedRef(abs_path, line, False, None, None, [])
 
@@ -326,13 +336,14 @@ def _resolve_one(code_ref: str, repo_root: str) -> ResolvedRef:
     return ResolvedRef(abs_path, line, True, line_text, numeric_literal, context)
 
 
-def resolve_code_refs(registry: dict, repo_root: str) -> dict[str, list[ResolvedRef]]:
+def resolve_code_refs(registry: dict, repo_root: str,
+                      run_dir: Optional[str] = None) -> dict[str, list[ResolvedRef]]:
     """For each parameter, resolve its code_refs. Returns {name: [ResolvedRef]}."""
     out: dict[str, list[ResolvedRef]] = {}
     for p in registry.get("parameters", []):
         refs = []
         for ref in (p.get("code_refs") or []):
-            refs.append(_resolve_one(ref, repo_root))
+            refs.append(_resolve_one(ref, repo_root, run_dir=run_dir))
         out[p["name"]] = refs
     return out
 
@@ -661,7 +672,7 @@ def check_registry(registry: dict, repo_root: str,
         Falls back to repo_root when omitted (old behavior).
     """
     violations: list[dict] = []
-    resolved = resolve_code_refs(registry, repo_root)
+    resolved = resolve_code_refs(registry, repo_root, run_dir=run_dir)
 
     for p in registry.get("parameters", []):
         name = p["name"]
@@ -688,6 +699,17 @@ def check_registry(registry: dict, repo_root: str,
         # 2. registry_value_mismatch — code literal ≠ registry value.
         for r in py_refs:
             if r.numeric_literal is None:
+                continue
+            # Defensive: if the parameter name does NOT appear on the
+            # referenced line itself, the literal we picked up isn't
+            # actually the registered constant — skip. Real refs point
+            # at lines like `VE = 0.97` or `params['VE'] = 0.97`; docstring
+            # or adjacent-line targets silently become false positives
+            # when the regex pulls a stray numeric from prose. (We don't
+            # fall back to ±5 context because valid assignments do place
+            # the name on the line itself.)
+            line_text = r.line_text or ""
+            if name not in line_text:
                 continue
             if value == 0:
                 same = r.numeric_literal == 0
@@ -741,22 +763,21 @@ def check_registry(registry: dict, repo_root: str,
     violations.extend(check_tagging_coverage(registry, scan_root))
 
     # 6. param_unregistered — code has @registry:X but X not in registry.
-    # Only scan model code directories, not pipeline infrastructure.
+    # Scan ONLY the active run's models/ dir when run_dir is provided
+    # (avoids pulling in @registry tags from sibling runs). Fall back to
+    # {repo_root}/models/ for legacy callers.
     registered_names = {p["name"] for p in registry.get("parameters", [])}
     scan_roots = []
-    for candidate in ("models", "src", "code"):
-        full = os.path.join(repo_root, candidate)
-        if os.path.isdir(full):
-            scan_roots.append(full)
-    # If repo_root IS the run directory itself (has a models/ subdir), we've
-    # added it above. If not (e.g., caller passed the parent repo root), also
-    # search any run-dir-looking subdirs.
-    if not scan_roots:
-        # As a fallback, scan the repo_root itself but still skip infrastructure.
-        scan_roots = [repo_root]
+    scan_bases = [run_dir] if run_dir else [repo_root]
+    for base in scan_bases:
+        for candidate in ("models", "src", "code"):
+            full = os.path.join(base, candidate)
+            if os.path.isdir(full):
+                scan_roots.append(full)
 
     _pipeline_skip = ("agents", "scripts", ".claude", ".git", "__pycache__",
-                      ".venv", "node_modules", "experiments", ".pytest_cache")
+                      ".venv", "node_modules", "experiments", ".pytest_cache",
+                      "runs", "archive", "benchmark", "data", "workspace")
     for start in scan_roots:
         for root, dirs, files in os.walk(start):
             dirs[:] = [d for d in dirs if d not in _pipeline_skip]
