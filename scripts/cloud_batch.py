@@ -165,8 +165,10 @@ def _square(x):
     return x * x
 
 
-def _add(a, b):
-    return a + b
+def _first_key(d):
+    """Helper for the offline self-test — takes a single dict arg and
+    returns the first key. Used to validate the fn(args) calling convention."""
+    return next(iter(d.keys())) if d else None
 
 
 def _hello(name: str) -> str:
@@ -194,13 +196,18 @@ def serialize_function_and_args(fn: Callable, args: Any) -> bytes:
 
 
 def deserialize_and_run(blob_bytes: bytes) -> Any:
-    """Worker-side: run the pickled callable with the pickled args."""
+    """Worker-side: run the pickled callable with the pickled args.
+
+    Calling convention: args is passed as a single positional argument.
+    Scientific functions like `outcome_fn(params)` where `params` is a
+    dict match this naturally — the modeler passes
+    args_list=[{"irs_rr": 0.35, ...}, ...] and each call is
+    `fn({"irs_rr": 0.35, ...})`.
+
+    If you genuinely want kwarg-unpacking (`fn(**args)`), wrap your
+    function: `def wrapped(args): return fn(**args)`."""
     payload = pickle.loads(blob_bytes)
-    fn = payload["fn"]
-    args = payload["args"]
-    if isinstance(args, dict):
-        return fn(**args)
-    return fn(args)
+    return payload["fn"](payload["args"])
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +451,7 @@ class BatchRunner:
             budget_usd_cap: float = DEFAULT_BUDGET_USD_CAP,
             avg_task_seconds: float = 30.0,
             force: bool = False,
+            models_dir: Optional[str] = None,
     ) -> str:
         """Submit N tasks to the pool, one per entry in args_list.
 
@@ -453,6 +461,12 @@ class BatchRunner:
         Pre-flight budget guard: if the estimated cost (based on
         len(args_list), avg_task_seconds, pool max_nodes, vm_size) exceeds
         `budget_usd_cap`, refuses to submit unless `force=True`.
+
+        models_dir: optional path to a directory (typically `{run_dir}/models`)
+            that will be tar'd and uploaded as a shared job blob. The task
+            command extracts it alongside the worker script and adds its
+            root to sys.path so custom user functions (e.g., outcome_fn)
+            can be imported by the worker when unpickling.
         """
         self._require_config()
         from azure.batch import models as batch_models
@@ -497,6 +511,19 @@ class BatchRunner:
         worker_blob = f"{job_id}/worker.py"
         self._upload_blob(worker_blob, worker_script.encode())
 
+        # 2b. Optionally tar + upload models_dir for worker-side import.
+        models_sas = None
+        if models_dir:
+            if not os.path.isdir(models_dir):
+                raise FileNotFoundError(f"models_dir not a directory: {models_dir}")
+            import tarfile
+            tar_buf = io.BytesIO()
+            with tarfile.open(fileobj=tar_buf, mode="w:gz") as tar:
+                tar.add(models_dir, arcname="models")
+            tar_blob = f"{job_id}/models.tar.gz"
+            self._upload_blob(tar_blob, tar_buf.getvalue())
+            models_sas = self._generate_sas_url(tar_blob)
+
         # 3. Create the job.
         job = batch_models.JobAddParameter(
             id=job_id,
@@ -516,11 +543,17 @@ class BatchRunner:
             output_sas = self._generate_sas_url(output_blob)
             pip_line = (f"pip install --quiet {pip_install} && "
                         if pip_install else "")
+            models_line = (
+                f"curl -sSL \"{models_sas}\" -o models.tar.gz && "
+                "tar xzf models.tar.gz && "
+                if models_sas else ""
+            )
             command = (
                 "/bin/bash -c '"
                 "set -e; "
                 f"{pip_line}"
                 f"curl -sSL \"{worker_sas}\" -o worker.py && "
+                f"{models_line}"
                 f"curl -sSL \"{input_sas}\" -o input.pkl && "
                 "python3 worker.py input.pkl output.pkl && "
                 f"curl -sSL -X PUT -T output.pkl -H \"x-ms-blob-type: BlockBlob\" \"{output_sas}\""
@@ -577,8 +610,18 @@ class BatchRunner:
 
 _WORKER_SCRIPT = r"""#!/usr/bin/env python3
 '''Worker-side script. Reads input.pkl, runs the pickled function, writes
-output.pkl.'''
-import pickle, sys, traceback
+output.pkl. If a `./models/` directory is present (extracted from
+models.tar.gz by the task command before invoking this script), its path
+is prepended to sys.path so pickled functions from user modules can be
+resolved during unpickling.'''
+import pickle, sys, os, traceback
+
+# Make local files importable by pickle's module-resolution.
+cwd = os.path.abspath(".")
+sys.path.insert(0, cwd)
+models_dir = os.path.join(cwd, "models")
+if os.path.isdir(models_dir):
+    sys.path.insert(0, models_dir)
 
 input_path, output_path = sys.argv[1], sys.argv[2]
 with open(input_path, 'rb') as f:
@@ -586,10 +629,10 @@ with open(input_path, 'rb') as f:
 fn = payload['fn']
 args = payload['args']
 try:
-    if isinstance(args, dict):
-        result = fn(**args)
-    else:
-        result = fn(args)
+    # Always pass args as a single positional argument. Scientific
+    # outcome_fn(params) matches this. If you want kwarg unpacking, wrap
+    # your function yourself.
+    result = fn(args)
     with open(output_path, 'wb') as f:
         pickle.dump({'ok': True, 'result': result}, f)
 except Exception as e:
@@ -633,13 +676,14 @@ def _run_offline_self_test() -> int:
     # pickle cannot serialize locally-defined functions (the fn is stored
     # by qualified name, which must resolve on the worker). Real workloads
     # put their function in models/outcome_fn.py and the worker imports it.
-    payload = serialize_function_and_args(_square, {"x": 7})
-    ok(deserialize_and_run(payload) == 49,
-       f"serialize+run _square: got {deserialize_and_run(payload)}, want 49")
-    payload2 = serialize_function_and_args(_add, {"a": 3, "b": 4})
-    ok(deserialize_and_run(payload2) == 7, "two-arg serialize+run _add")
-    payload3 = serialize_function_and_args(_square, 9)  # positional
-    ok(deserialize_and_run(payload3) == 81, "positional arg round-trip")
+    # Calling convention: fn(args) — args is a single positional arg. For
+    # outcome_fn(params), pass the params dict as args.
+    payload = serialize_function_and_args(_square, 9)
+    ok(deserialize_and_run(payload) == 81,
+       f"serialize+run _square(9) = 81, got {deserialize_and_run(payload)}")
+    payload2 = serialize_function_and_args(_first_key, {"a": 3, "b": 4})
+    ok(deserialize_and_run(payload2) == "a",
+       f"dict arg passed as single param: got {deserialize_and_run(payload2)}")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)
@@ -648,6 +692,86 @@ def _run_offline_self_test() -> int:
         return 1
     print("OK: offline self-test passed.", file=sys.stderr)
     return 0
+
+
+def _run_cloud_module_test() -> int:
+    """Second live cloud test: validate the models_dir tarball upload
+    path. Creates a scratch module with a user function, submits a job
+    that pickles that function by qualified name, worker extracts the
+    tarball and unpickles + runs. Proves custom outcome_fn modules work."""
+    import tempfile
+    import subprocess
+    print("[cloud_batch] Live cloud module-upload self-test. Validates "
+          "that worker can import a user-provided module from the tarball.",
+          file=sys.stderr)
+    try:
+        runner = BatchRunner()
+        runner._require_config()
+    except RuntimeError as e:
+        print(f"[cloud_batch] ERROR: {e}", file=sys.stderr)
+        return 2
+
+    with tempfile.TemporaryDirectory() as tmp:
+        models_dir = os.path.join(tmp, "models")
+        os.makedirs(models_dir)
+        # Write a scratch user module with a toy outcome_fn. Note: we import
+        # from a top-level module name (scratch_outcome); worker's
+        # sys.path insertion of ./models/ lets it find this.
+        with open(os.path.join(models_dir, "scratch_outcome.py"), "w") as f:
+            f.write(
+                "def compute(params):\n"
+                "    # Exercises dict-unpacking and simple math so we know the\n"
+                "    # worker really called our code, not a builtin.\n"
+                "    x = params.get('x', 0)\n"
+                "    y = params.get('y', 0)\n"
+                "    return {'sum': x + y, 'prod': x * y, 'label': 'scratch'}\n"
+            )
+        # Now import that function the same way a modeler would, so the
+        # pickle stores its qualified name.
+        sys.path.insert(0, models_dir)
+        import scratch_outcome
+        user_fn = scratch_outcome.compute
+        # Sanity-check locally before cloud submission.
+        local_result = user_fn({"x": 3, "y": 4})
+        assert local_result == {"sum": 7, "prod": 12, "label": "scratch"}, \
+            f"local sanity failed: {local_result}"
+
+        pool_name = f"module-test-{uuid4().hex[:8]}"
+        try:
+            print(f"  creating pool {pool_name}...", file=sys.stderr)
+            runner.ensure_pool(pool_name, vm_size="Standard_A1_v2",
+                               max_nodes=1, use_low_priority=False,
+                               auto_scale=False, dedicated_nodes=1)
+            print("  submitting 2 tasks via models_dir tarball...",
+                  file=sys.stderr)
+            job_id = runner.submit_function_tasks(
+                pool_name=pool_name,
+                fn=user_fn,
+                args_list=[{"x": 3, "y": 4}, {"x": 10, "y": 20}],
+                budget_usd_cap=0.10,
+                avg_task_seconds=30.0,
+                pip_deps=[],
+                models_dir=models_dir,
+            )
+            print(f"  job {job_id} submitted, waiting...", file=sys.stderr)
+            results = runner.wait_and_collect(job_id, timeout_minutes=20)
+            print(f"  results: {results}", file=sys.stderr)
+            expected = [
+                {"ok": True, "result": {"sum": 7, "prod": 12, "label": "scratch"}},
+                {"ok": True, "result": {"sum": 30, "prod": 200, "label": "scratch"}},
+            ]
+            ok = results == expected
+            if ok:
+                print("OK: live cloud module-upload test passed.",
+                      file=sys.stderr)
+                return 0
+            print(f"FAIL: expected {expected}, got {results}", file=sys.stderr)
+            return 1
+        finally:
+            try:
+                runner.delete_pool(pool_name)
+            except Exception:
+                pass
 
 
 def _run_cloud_self_test() -> int:
@@ -712,6 +836,11 @@ def main() -> int:
                    help="Offline self-test (no Azure calls)")
     p.add_argument("--self-test-cloud", action="store_true",
                    help="Live cloud self-test (~$0.01, requires AZ_* env vars)")
+    p.add_argument("--self-test-cloud-module", action="store_true",
+                   help="Live cloud test of user-module upload path "
+                        "(~$0.01, requires AZ_* env vars). Validates "
+                        "models_dir tarball packaging and worker-side "
+                        "sys.path insertion.")
     p.add_argument("--estimate-cost", action="store_true")
     p.add_argument("--vm-size", default=DEFAULT_VM_SIZE)
     p.add_argument("--n-tasks", type=int, default=200)
@@ -725,6 +854,8 @@ def main() -> int:
         return _run_offline_self_test()
     if args.self_test_cloud:
         return _run_cloud_self_test()
+    if args.self_test_cloud_module:
+        return _run_cloud_module_test()
     if args.estimate_cost:
         est = estimate_cost(args.n_tasks, args.avg_seconds, args.vm_size,
                             args.max_nodes,
