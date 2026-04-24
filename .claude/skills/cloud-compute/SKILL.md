@@ -1,260 +1,288 @@
 ---
 name: cloud-compute
-description: When and how to scale model execution to the cloud via
-  modelops-calabaria (mops). Decision rule for local vs cloud based on
-  outcome_fn cost and N draws. Azure AKS + Dask architecture with spot-
-  instance node pools for 60-80% cost reduction. Template infra.yaml with
-  spot config, budget guards, and auto-teardown. Specifies which stages
-  benefit most (STAGE 5b UNCERTAINTY with N>100 draws, multi-structural
-  LOO-CV for expensive full models, ensemble calibration). Use when the
-  modeler is deciding whether to implement a cloud path, configuring
-  infra.yaml, or planning a workload that exceeds 10 worker-hours of local
-  compute. Trigger phrases include "cloud compute", "mops", "AKS", "spot
-  instance", "Dask cluster", "cost control", "distributed calibration",
-  "modelops infra".
+description: Cloud execution of models, calibration, and rigor workloads via
+  Azure Batch (primary) or AKS/Dask (escalation). Covers five workload classes —
+  single-model runs, UQ propagation, Optuna calibration, multi-structural
+  LOO-CV, sensitivity analysis — and how each maps to Batch pool+tasks with
+  low-priority (spot) nodes. Cost model, quota expectations for Free Trial
+  vs Pay-As-You-Go, and teardown discipline. Use when the modeler is deciding
+  whether to go cloud, configuring a Batch pool, or escalating from Batch to
+  AKS/Dask. Trigger phrases include "azure batch", "cloud compute", "low
+  priority", "spot instance", "cost control", "distributed calibration",
+  "cloud calibration", "parallel UQ", "AKS escalation".
 ---
 
-# Cloud Compute via modelops-calabaria (`mops`)
+# Cloud Compute via Azure Batch (primary)
 
-## Overview
+## What this skill chose and why
 
-`modelops-calabaria` ships two CLIs: `cb` (local science) and `mops`
-(cloud infrastructure on Azure AKS + Dask). See
-`.claude/skills/modelops-calabaria/SKILL.md` for the full framework;
-this skill focuses on the **decision rule** (when to go cloud) and
-**cost control** via spot instances.
+**Azure Batch** is the primary cloud surface for this project. It's the
+right tool for every workload we have:
 
-## When to use cloud
+- Task-parallel execution of pre-built scripts / containers.
+- Pool of VMs (on-demand or low-priority / spot).
+- Auto-scales pool to zero when no jobs queued.
+- Native "low-priority nodes" = ~60–80% cost reduction vs on-demand,
+  with 30-second eviction notice (tasks are automatically re-queued).
+- No cluster overhead: pool sits at zero nodes when idle, $0/hr.
+- Dead-simple Python SDK (`azure.batch`).
 
-Rule of thumb, keyed off `outcome_fn` cost and the number of
-evaluations required:
+**Azure Kubernetes Service (AKS) + Dask** is the escalation path. Better
+for: persistent interactive clusters, Dask-distributed calabaria
+workflows with fast iteration, workloads that benefit from a live Dask
+scheduler managing state across tasks. The calabaria `mops` CLI
+targets this architecture — use it when you have `mops` available and
+the workload justifies the cluster overhead.
 
-| Workload                                               | Local time          | Decision                     |
-|--------------------------------------------------------|---------------------|------------------------------|
-| UQ: 200 draws, outcome_fn < 2s                         | <10 min             | LOCAL                        |
-| UQ: 200 draws, outcome_fn 2–30s                        | 10 min – 2 hr       | LOCAL if convenient          |
-| UQ: 200 draws, outcome_fn > 30s                        | >2 hr               | **CLOUD** (or surrogate first)|
-| Per-unit stability: 1000+ draws for 774 LGAs each      | Many hours–days     | **CLOUD**                    |
-| Multi-structural LOO-CV: full model refit 22+ times    | Depends on model    | CLOUD if full > 5 min/fit    |
-| Optuna calibration: 1000+ trials                       | Hours–days          | **CLOUD** (8–16 workers)     |
-| Identifiability profile scan: 20 × N params × loss     | Usually fast local  | LOCAL                        |
+For this project as of Phase 2: **Batch first, AKS only if Batch falls short.**
 
-**Rule of thumb**: if the total compute is >10 worker-hours, cloud.
-If <2 worker-hours, local. In between is a judgment call based on
-whether the modeler is iterating rapidly (local) or finalizing (cloud
-is fine to wait for).
+## Workload → Batch mapping
 
-**Alternative to cloud**: build a surrogate (emulator on a sparse grid
-of full-model runs). This is often the fastest path for UQ because it
-turns a 200× ABM workload into 200× cheap emulator calls after ~30
-full runs. See the `uncertainty-quantification` skill.
+| Workload | Pattern | Task shape | Typical cost (low-priority, Standard_D4s_v5) |
+|---|---|---|---|
+| **Single ABM run** | 1 task, 1 VM | Python script or container takes params CSV, writes output CSV to Blob | ~$0.02 / hr (1 VM × 1 hr × $0.025/hr) |
+| **UQ propagation** | N tasks in parallel | Each task: sample params, run `outcome_fn`, write result to blob | 200 tasks × 30s × ~$0.001/task ≈ **$0.20** |
+| **Optuna calibration** | M parallel workers, shared Optuna storage | Each worker pings storage for next trial, runs ABM, reports loss | 1000 trials × 1 min × 8 parallel × $0.025/hr = ~**$1.70** |
+| **Multi-structural LOO-CV** | N × M tasks (N models × M leave-one-out partitions) | Each task refits one model with one partition held out | ~$0.30 for 22 targets × 3 models |
+| **Sensitivity analysis** | Grid or Sobol in parallel | Same as UQ but with structured parameter draws | Same as UQ |
 
-## Azure AKS + spot node pools (cost control)
+Every class reduces to "submit N tasks to a Batch pool, each task runs
+a function, collect outputs." The `scripts/cloud_batch.py` helper
+abstracts this.
 
-Azure AKS supports two node-pool types:
+## Spot / low-priority mechanics (cost control)
 
-- **On-demand pool**: standard VMs at full price. Used for the
-  Dask scheduler and any must-not-interrupt workloads.
-- **Spot pool**: preemptible VMs at 60–90% discount. Interrupted
-  with ~30 seconds' notice when Azure reclaims capacity. Dask is
-  interrupt-tolerant if each SimTask is idempotent and results are
-  persisted — which they are under `mops`'s default job model.
+Azure Batch has two priority types for nodes in a pool:
 
-For UQ, multi-structural, and Optuna workloads, **the workers belong
-on spot**. The scheduler stays on on-demand (small, cheap, shouldn't be
-interrupted).
+- **Dedicated**: on-demand VMs. Full price. Never interrupted.
+- **Low-priority**: preemptible VMs at ~60–80% discount. Can be
+  reclaimed by Azure with 30-second notice. Batch automatically
+  re-queues interrupted tasks on another node.
 
-### Template `infra.yaml` with spot workers
+**For this project: all pools are low-priority unless a task literally
+can't tolerate interruption** (e.g., a multi-hour ABM simulation with no
+checkpointing). For most workloads — where each task is idempotent and
+writes outputs when done — interruption is free: the task just runs
+again. Dozens of interruptions across hundreds of tasks still come in
+at 60–80% of on-demand cost.
 
-Drop this into `{run_dir}/infra.yaml` or the project root. Adjust the
-subscription/resource_group/region fields to match your Azure account.
+### Typical per-hour costs (eastus2, late 2025)
 
-```yaml
-# infra.yaml — Azure AKS with spot worker pool for cost-controlled
-# distributed model execution. Tear down after every run with
-# `mops infra down` to stop billing.
+| VM size | On-demand | Low-priority (typical) |
+|---|---|---|
+| Standard_A1_v2 (1 vCPU, 2 GB) | $0.043 | $0.010 |
+| Standard_D2s_v5 (2 vCPU, 8 GB) | $0.096 | $0.020 |
+| Standard_D4s_v5 (4 vCPU, 16 GB) | $0.192 | $0.040 |
+| Standard_D8s_v5 (8 vCPU, 32 GB) | $0.384 | $0.080 |
+| Standard_D16s_v5 (16 vCPU, 64 GB) | $0.768 | $0.160 |
 
-cluster:
-  name: modeling-agentic-cluster
-  subscription_id: ${AZURE_SUBSCRIPTION_ID}   # from environment
-  resource_group: modeling-agentic-rg
-  region: eastus2                              # highest spot availability
-  kubernetes_version: "1.29"
+Most malaria-style ABMs run well on D4s_v5. A 200-draw UQ in 8
+parallel workers completes in ~12 min of wall time = **$0.07** at
+low-priority pricing. Dozens of test runs per Free Trial $200 credit.
 
-node_pools:
-  # Scheduler pool: small, always-on, not interruptible.
-  - name: scheduler
-    vm_size: Standard_D2s_v5      # 2 vCPU, 8 GB — sufficient for Dask scheduler
-    node_count: 1
-    spot: false
-    auto_scale: false
-    labels:
-      role: scheduler
-    taints:
-      - "role=scheduler:NoSchedule"
+## Free Trial quota realities
 
-  # Worker pool: spot instances, scale-to-zero when idle.
-  - name: workers-spot
-    vm_size: Standard_D8s_v5      # 8 vCPU, 32 GB per worker
-    min_count: 0                   # scale down to 0 when cluster idle
-    max_count: 16                  # cap at 16 workers
-    spot: true
-    spot_max_price: 0.20           # USD per hour per VM; spot VMs priced
-                                   # against this ceiling, interrupted if
-                                   # on-demand price exceeds it
-    spot_eviction_policy: Delete
-    auto_scale: true
-    labels:
-      role: worker
-      spot: "true"
+New personal Azure subscriptions are Free Trial by default:
 
-dask:
-  scheduler:
-    cpu: 2
-    memory: 8Gi
-    node_selector:
-      role: scheduler
-  workers:
-    cpu: 8
-    memory: 32Gi
-    node_selector:
-      role: worker
-    # Ensure workers tolerate the non-spot taint / prefer spot nodes.
-    tolerations:
-      - key: "kubernetes.azure.com/scalesetpriority"
-        value: "spot"
-        effect: "NoSchedule"
+- $200 credit, 30 days.
+- Spending Limit automatically ON — services pause when credit hits $0.
+- **Quota for low-priority cores may be 0** on some regions. Request
+  a quota increase in the Azure portal → Subscriptions → "Usage +
+  quotas" → filter for "Low-priority" → select region + VM family →
+  "Request Quota Increase". Usually approved same-day for reasonable
+  amounts (10–20 cores).
+- **Once the trial converts to Pay-As-You-Go**, the Spending Limit
+  turns off. Set up a **Budget alert** in Cost Management BEFORE this
+  happens.
 
-# Budget guard: aborts the run if cumulative cost exceeds this ceiling.
-budget:
-  max_usd: 50                       # per-run cap; override with --budget CLI
-  warn_at_usd: 30
-  check_interval_seconds: 300
+The modeler should assume <10 vCPUs available on Free Trial unless a
+quota increase has been approved. For small-batch UQ (8 tasks × 4
+vCPUs each), this usually works.
 
-# Idle auto-teardown: if no jobs have run for this many minutes, tear
-# down. Prevents forgotten clusters from burning budget.
-auto_teardown:
-  enabled: true
-  idle_minutes: 30
+## The `scripts/cloud_batch.py` wrapper
+
+Python API exposed by the wrapper:
+
+```python
+from scripts.cloud_batch import BatchRunner
+
+runner = BatchRunner(
+    subscription_id="048cd8f6-c126-46f7-919c-a895e9a8e2cd",
+    batch_account="mymodelingruns",
+    batch_account_url="https://mymodelingruns.eastus2.batch.azure.com",
+    storage_account="mymodelingstorage",
+    resource_group="modeling-agentic-rg",
+)
+
+# 1. Create a pool (autoscale 0 → max_nodes, low-priority).
+runner.create_pool(
+    pool_name="uq-pool",
+    vm_size="Standard_D4s_v5",
+    max_nodes=8,
+    low_priority=True,
+    dedicated_nodes=0,
+    idle_minutes_before_shutdown=10,
+)
+
+# 2. Submit tasks. Each task runs a Python function against a set of args.
+task_ids = runner.submit_function_tasks(
+    pool_name="uq-pool",
+    job_id="uq-run-2026-04-24",
+    fn=my_outcome_fn,
+    args_list=[{"params": draw} for draw in draws],
+    container_image="python:3.12-slim",       # or custom image
+    pip_deps=["numpy", "scipy", "starsim"],
+    budget_usd_cap=10.0,                       # hard abort if est. cost > this
+)
+
+# 3. Wait for tasks to complete, collect outputs.
+results = runner.wait_and_collect("uq-run-2026-04-24")
+
+# 4. Teardown.
+runner.delete_pool("uq-pool")   # or set auto_delete=True when creating
 ```
 
-### Workflow with spot
+The wrapper handles:
+- Auth via `DefaultAzureCredential` (picks up `az login` automatically)
+- Serialization of function + args to JSON (pickle fallback)
+- Output collection from Blob storage
+- Budget guard (estimates cost from pool size × duration before submission)
+- Graceful teardown on success OR exception
 
-```bash
-# 1. Set credentials (once).
-export AZURE_SUBSCRIPTION_ID=...
-export AZURE_CLIENT_ID=...            # service principal
-export AZURE_CLIENT_SECRET=...
-export AZURE_TENANT_ID=...
-az login --service-principal \
-    -u $AZURE_CLIENT_ID \
-    -p $AZURE_CLIENT_SECRET \
-    --tenant $AZURE_TENANT_ID
+### Budget guard (pre-flight check)
 
-# 2. Stand up the cluster (scheduler + 0 spot workers initially).
-mops infra up --config infra.yaml
+Before submitting a batch of N tasks, the wrapper estimates:
 
-# 3. Package the model (OCI bundle).
-mops bundle push models/ --tag malaria-v1.0
+    estimated_cost = (N_tasks × avg_task_duration_sec / 3600) × vcores / N_nodes × rate_per_node_hr
 
-# 4. Submit the UQ job. Workers auto-scale up on spot.
-mops jobs submit uq \
-    --bundle malaria:v1.0 \
-    --n-draws 200 \
-    --workers 8 \
-    --outcome-fn models/outcome_fn.py::outcome_fn \
-    --registry-path citations.md
+If > `budget_usd_cap`, the wrapper refuses to submit and prints the
+estimate. Override with `--force` if you know what you're doing.
 
-# 5. Monitor.
-mops jobs status uq
-mops jobs logs uq --tail
+## The workflow (first-run recipe)
 
-# 6. Pull results.
-mops jobs results uq --output uncertainty_report.yaml
+1. **Verify Azure auth is fresh and on the right subscription**:
+   ```
+   az account show
+   ```
+   If not on your personal sub:
+   ```
+   az account set --subscription 048cd8f6-c126-46f7-919c-a895e9a8e2cd
+   ```
 
-# 7. Tear down — CRITICAL. Spot nodes still cost money when idle.
-mops infra down
-```
+2. **Provision the Batch account once per project** (one-time setup):
+   ```
+   az group create -n modeling-agentic-rg -l eastus2
+   az storage account create -n mymodelingstorage -g modeling-agentic-rg \
+       -l eastus2 --sku Standard_LRS
+   az batch account create -n mymodelingruns -g modeling-agentic-rg \
+       -l eastus2 --storage-account mymodelingstorage
+   ```
+   Takes ~2 minutes. Stores ~$0/month at idle.
 
-## Estimated costs (USD, rough)
+3. **Set environment variables** (so the wrapper picks them up):
+   ```
+   export AZ_SUBSCRIPTION_ID=048cd8f6-c126-46f7-919c-a895e9a8e2cd
+   export AZ_RESOURCE_GROUP=modeling-agentic-rg
+   export AZ_BATCH_ACCOUNT=mymodelingruns
+   export AZ_STORAGE_ACCOUNT=mymodelingstorage
+   ```
 
-Eastus2 spot prices as of late 2025 (always verify before a run):
+4. **First test run**: submit a trivial "hello world" task, verify
+   end-to-end:
+   ```
+   python3 scripts/cloud_batch.py --self-test-cloud
+   ```
+   Costs ~$0.01. Stands up a pool with 1 low-priority node, runs one
+   task that prints "hello", tears down. Validates auth, quota, and
+   the pool lifecycle.
 
-| VM size           | On-demand | Spot (typical) | Spot ceiling |
-|-------------------|-----------|----------------|--------------|
-| Standard_D2s_v5   | $0.096/hr | —              | —            |
-| Standard_D8s_v5   | $0.384/hr | $0.05-0.12/hr  | $0.20/hr     |
-| Standard_D16s_v5  | $0.768/hr | $0.10-0.24/hr  | $0.40/hr     |
-| Standard_D32s_v5  | $1.536/hr | $0.20-0.50/hr  | $0.80/hr     |
+5. **Real workload** (e.g., UQ with 200 draws):
+   ```
+   python3 scripts/propagate_uncertainty.py {run_dir} \
+       --n-draws 200 --cloud --max-parallel 8
+   ```
+   Cost: ~$0.07. Wall time: ~12 min.
 
-Example workload: 200 UQ draws × 30s each × 8 workers = ~12 minutes
-wall time. Scheduler on-demand ($0.096 × 0.5h) + 8 spot workers at
-~$0.10/hr for 12 min = ~$0.21 + $0.16 = **<$0.50**.
+## Workload-specific patterns
 
-Example heavy: 1000 Optuna trials × 60s each × 16 workers = ~1 hour.
-Cluster total: ~$0.10 (scheduler) + 16 × $0.10/hr × 1h = **~$1.70**.
+### UQ propagation (automated via `--cloud` flag)
 
-The `budget.max_usd` guard in `infra.yaml` is a hard abort. Always set
-it before running; default to **$50 per run** unless the workload
-demands more.
+`scripts/propagate_uncertainty.py --cloud` submits N draws as tasks.
+Each task pickles `outcome_fn` + params, uploads to Blob, the worker
+runs the function and writes result to Blob. Master collects and
+aggregates.
 
-## When NOT to use cloud
+### Calibration (Optuna on Batch)
 
-- **Exploratory iteration**: the modeler is changing outcome_fn code
-  every 5 minutes. Cloud turnaround is too slow.
-- **Small N (<100) and fast fn (<5s)**: trivially local.
-- **Credential / access barriers**: if the Azure setup isn't in place,
-  don't hack around it — either request credentials or build a
-  surrogate for local runs.
-- **Interactive debugging**: run the outcome_fn on a single sample
-  locally first to catch bugs. Cloud amplifies latency on debugging.
+`scripts/batch_calibrate.py` is the entry point. Architecture:
 
-## Modeler's workflow: "when to cloud-ify"
+- Master (local): Optuna study with SQLite or Azure PostgreSQL
+  storage.
+- N workers (Batch tasks, each a persistent task that loops): ask
+  study for next trial, run ABM, report loss.
 
-1. First, run `outcome_fn` on a single parameter draw locally. Verify
-   it returns the expected dict shape and finishes in reasonable time.
-2. Run 10 draws locally with `propagate_uncertainty.py --n-draws 10`
-   to catch shape/unit bugs cheaply.
-3. Estimate total cost: 200 draws × (measured per-call time). If >2
-   hours, decide: surrogate (build one, re-run local) or cloud.
-4. For cloud: verify credentials are in place. Bring up the cluster,
-   verify with a tiny job (`mops jobs submit uq --n-draws 10`), then
-   scale up.
-5. Tear down when done. Check `az` or Azure Portal to confirm no
-   lingering resources.
+Shared Optuna storage is the key. For <500 trials, SQLite on
+Azure Files works. For >500 or concurrent workers >16, use Azure
+Database for PostgreSQL (Basic tier: ~$0.017/hr = $1.22 for a 3-day
+calibration run).
+
+### Multi-structural LOO-CV
+
+`scripts/compare_models.py --loo-cloud` (to be added). For each
+candidate model × each held-out target, submit one Batch task that
+refits the model and predicts the held-out point.
+
+### Single-model runs
+
+For a single ABM invocation (e.g., reproducing a published baseline),
+use the wrapper directly: 1 task, no parallelism, just offloading a
+long compute from the laptop.
+
+## When to escalate from Batch to AKS/Dask
+
+- **Iterating rapidly** on a complex Dask-distributed calabaria
+  workflow. AKS keeps the cluster warm; Batch's per-task startup
+  overhead (~60–90 sec for pool creation) is wasted.
+- **Fine-grained task graphs** (thousands of short dependencies).
+  Batch doesn't have native DAG support; Dask does.
+- **Shared in-memory state across tasks** (e.g., a calibrated
+  emulator that's expensive to load). Dask's warm process pools amortize
+  load cost; Batch re-loads per task.
+
+For the modeling-agentic project today, we don't hit any of these.
+Batch covers everything.
+
+## Teardown discipline (critical)
+
+Batch pools at low-priority, autoscaled to zero idle, cost ~$0 when
+idle. But a Batch account itself costs $0 too. There's no background
+fee to worry about.
+
+HOWEVER:
+- **A pool stuck at nonzero dedicated nodes** costs on-demand rates.
+- **A forgotten Blob container with large files** costs ~$0.02/GB/month.
+- **A PostgreSQL instance** for Optuna shared storage costs ~$0.017/hr
+  continuously ($12/month). Delete when not actively calibrating.
+
+`BatchRunner` supports `auto_delete=True` at pool creation which
+deletes the pool when the job completes. Use it.
 
 ## Security notes
 
-- Never commit Azure credentials to the repo. Use environment
-  variables (`.env` is git-ignored) or Azure Managed Identity.
-- The budget guard protects against runaway spend, but a forgotten
-  cluster at idle (spot pool scaled to 0, scheduler alone) still
-  costs ~$0.10/hour — $72/month if left running. Always tear down.
-- Spot nodes are preemptible. If a job can't tolerate interruption
-  (e.g., a single long-running simulation with no checkpointing),
-  run it on on-demand instead. Dask's default behavior re-runs an
-  interrupted SimTask on another worker, so Optuna/UQ workloads are
-  interruption-tolerant by design.
+- Credentials via `DefaultAzureCredential` — picks up `az login`
+  automatically. No secrets in the repo.
+- Task code and args go to Blob; sensitive data should be encrypted
+  if included.
+- Spot eviction is normal; tasks must be idempotent.
+- Never run a long expensive task as **dedicated** unless the cost of
+  running it twice on low-priority outweighs the cost of running it
+  once on-demand.
 
-## Integration points in the pipeline
+## Summary
 
-- **STAGE 5b UNCERTAINTY**: `propagate_uncertainty.py` doesn't call
-  `mops` directly. The modeler decides at outcome_fn design time
-  whether to build a cloud-backed callable (which would
-  `mops jobs submit` internally and block on results) or a local
-  one. The skill documents both patterns.
-- **Multi-structural comparison**: full-model LOO-CV is often cloud-
-  sized (22 refits × full-model cost). Modeler can use `mops jobs
-  submit loocv --bundle ...` as the refit engine, or build a
-  surrogate fit-from-summary.
-- **Optuna calibration**: well-supported out of the box by `mops jobs
-  submit calibrate`. This is the canonical calabaria use case.
-
-## Summary recommendation
-
-- **Default local**. Build a surrogate before reaching for cloud.
-- **Use spot**. Workers on spot, scheduler on on-demand. The 60–80%
-  cost savings apply to the bulk of the workload.
-- **Budget guard + auto-teardown**. Both in `infra.yaml`. Non-negotiable.
-- **Keep credentials out of git**. Env vars only.
-- **Validate with a 10-draw pilot job** before scaling to 200+.
+- **Batch is the default.** One primitive covers single runs, UQ,
+  calibration, LOO-CV, sensitivity.
+- **Low-priority everywhere** unless demonstrated intolerance.
+- **Budget guard + auto-delete + env-var-based auth.** Non-negotiable.
+- **AKS/Dask is an escalation**, not the starting point.
+- **Free Trial gets us through dozens of test runs** before upgrade.
