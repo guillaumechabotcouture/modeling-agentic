@@ -280,6 +280,70 @@ def decide(critiques: dict[str, dict], max_rounds: int,
     }
 
 
+# Phase 4 Commit α: zero-width CI detector.
+# Threshold rationale: 0.5% relative width catches optimizer-bounded
+# outputs (e.g., total_cost when greedy fills budget) and hardcoded
+# calibration targets (CI ~ 1e-7 of the target value). Looser would miss
+# them; tighter would flag legitimately well-constrained outputs.
+_CI_DEGENERATE_THRESHOLD = 0.005
+
+
+def _check_uq_ci_quality(uq_report_path: str) -> list[dict]:
+    """Phase 4 Commit α: scan uncertainty_report.yaml for degenerate CIs.
+
+    Fires `ci_degenerate` MEDIUM when an output's 95% CI relative width
+    (ci_high - ci_low) / |mean| is below 0.5%. Such outputs are usually
+    mechanically constrained (greedy-optimizer budget fills, hardcoded
+    calibration targets) and should be reported as point estimates with
+    a footnote explaining why, not alongside genuine CIs.
+    """
+    violations: list[dict] = []
+    try:
+        with open(uq_report_path) as f:
+            uq_report = yaml.safe_load(f) or {}
+    except (yaml.YAMLError, OSError):
+        return violations
+
+    scalar_outputs = uq_report.get("scalar_outputs") or {}
+    if not isinstance(scalar_outputs, dict):
+        return violations
+
+    for output_name, stats in scalar_outputs.items():
+        if not isinstance(stats, dict):
+            continue
+        mean = stats.get("mean")
+        lo = stats.get("ci_low")
+        hi = stats.get("ci_high")
+        if mean is None or lo is None or hi is None:
+            continue
+        try:
+            mean_f = float(mean)
+            lo_f = float(lo)
+            hi_f = float(hi)
+        except (TypeError, ValueError):
+            continue
+        if abs(mean_f) < 1e-9:
+            continue  # zero-mean output; relative width is undefined
+        relative_width = (hi_f - lo_f) / abs(mean_f)
+        if relative_width < _CI_DEGENERATE_THRESHOLD:
+            violations.append({
+                "kind": "ci_degenerate",
+                "severity": "MEDIUM",
+                "stage": "UQ",
+                "claim": (
+                    f"{output_name} 95% CI [{lo_f:.6g}, {hi_f:.6g}] is "
+                    f"{relative_width * 100:.3f}% of mean ({mean_f:.6g}). "
+                    f"Either the perturbed parameters do not affect this "
+                    f"output (greedy-optimizer budget fill, hardcoded "
+                    f"calibration target, etc.), or the surrogate "
+                    f"flattens it. Report as a point estimate with a "
+                    f"footnote, or widen the parameter ranges that drive "
+                    f"this output."
+                ),
+            })
+    return violations
+
+
 def _check_rigor_artifacts(run_dir: str) -> list[dict]:
     """Check for Phase 2 rigor artifacts. Returns a list of violations.
 
@@ -308,6 +372,9 @@ def _check_rigor_artifacts(run_dir: str) -> list[dict]:
                           "`python3 scripts/propagate_uncertainty.py {run_dir}` "
                           "to generate it. See uncertainty-quantification skill."),
             })
+        else:
+            # Phase 4 Commit α: detect zero-width CIs.
+            violations.extend(_check_uq_ci_quality(uq_report_path))
     else:
         violations.append({
             "kind": "outcome_fn_missing",
@@ -819,11 +886,105 @@ def render_text(decision: dict, current_round: int, max_rounds: int) -> str:
     return "\n".join(lines)
 
 
+def _run_self_test() -> int:
+    """Run inline self-test cases. Returns 0 if all pass, 1 otherwise.
+
+    Cases cover the Phase 4 mechanical checks (ci_degenerate, etc.).
+    Pre-Phase-4 logic (decide(), incorporate_*) is exercised end-to-end
+    by the existing critique-fixture runs, so it is not duplicated here.
+    """
+    import tempfile
+
+    failures: list[str] = []
+
+    def ok(cond: bool, label: str) -> None:
+        if not cond:
+            failures.append(label)
+
+    # --- Phase 4 Commit α: zero-width CI detector ---
+    with tempfile.TemporaryDirectory() as d:
+        # Case A1: degenerate cost CI (greedy-fill pattern from 1302 run).
+        uq_a = os.path.join(d, "uq_a.yaml")
+        with open(uq_a, "w") as f:
+            f.write(
+                "n_draws: 200\n"
+                "n_errors: 0\n"
+                "scalar_outputs:\n"
+                "  total_cost_3yr:\n"
+                "    mean: 320000000\n"
+                "    median: 320000000\n"
+                "    ci_low: 319200000\n"
+                "    ci_high: 320000000\n"
+                "    n: 200\n"
+            )
+        va = _check_uq_ci_quality(uq_a)
+        ok(any(v["kind"] == "ci_degenerate" for v in va),
+           f"A1: expected ci_degenerate on optimizer-bounded cost, got {va}")
+        ok(all(v["severity"] == "MEDIUM" for v in va),
+           f"A1: ci_degenerate must be MEDIUM, got {[v['severity'] for v in va]}")
+
+        # Case A2: legitimate wide CI — should NOT fire.
+        uq_b = os.path.join(d, "uq_b.yaml")
+        with open(uq_b, "w") as f:
+            f.write(
+                "scalar_outputs:\n"
+                "  cases_averted_3yr:\n"
+                "    mean: 20000000\n"
+                "    ci_low: 15000000\n"
+                "    ci_high: 25000000\n"
+                "    n: 200\n"
+            )
+        vb = _check_uq_ci_quality(uq_b)
+        ok(not vb, f"A2: ±25% CI should not fire, got {vb}")
+
+        # Case A3: zero-mean output is skipped (relative width undefined).
+        uq_c = os.path.join(d, "uq_c.yaml")
+        with open(uq_c, "w") as f:
+            f.write(
+                "scalar_outputs:\n"
+                "  net_change:\n"
+                "    mean: 0\n"
+                "    ci_low: 0\n"
+                "    ci_high: 0\n"
+                "    n: 200\n"
+            )
+        vc = _check_uq_ci_quality(uq_c)
+        ok(not vc, f"A3: zero-mean output should be skipped, got {vc}")
+
+        # Case A4: hardcoded calibration target (CI ~ 1e-7 of mean) — fires.
+        uq_d = os.path.join(d, "uq_d.yaml")
+        with open(uq_d, "w") as f:
+            f.write(
+                "scalar_outputs:\n"
+                "  national_pfpr_baseline:\n"
+                "    mean: 0.20967654\n"
+                "    ci_low: 0.20967654\n"
+                "    ci_high: 0.20967654\n"
+                "    n: 200\n"
+            )
+        vd = _check_uq_ci_quality(uq_d)
+        ok(any(v["kind"] == "ci_degenerate" for v in vd),
+           f"A4: hardcoded calibration target should fire, got {vd}")
+
+    # --- Summary ---
+    if failures:
+        print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)
+        for f in failures:
+            print(f"  - {f}", file=sys.stderr)
+        return 1
+    print("OK: all self-test cases passed.", file=sys.stderr)
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("run_dir", help="Run directory containing critique_*.yaml")
-    p.add_argument("--max-rounds", type=int, required=True)
-    p.add_argument("--current-round", type=int, required=True)
+    p.add_argument("run_dir", nargs="?",
+                   help="Run directory containing critique_*.yaml")
+    p.add_argument("--max-rounds", type=int)
+    p.add_argument("--current-round", type=int)
+    p.add_argument("--self-test", action="store_true",
+                   help="Run inline self-test cases and exit. "
+                        "Does not require run_dir / --max-rounds / --current-round.")
     p.add_argument("--json", action="store_true",
                    help="Emit machine-readable JSON to stdout (in addition "
                         "to human summary on stderr)")
@@ -850,6 +1011,16 @@ def main() -> int:
                         "uncertainty-quantification, multi-structural-comparison, "
                         "and identifiability-analysis skills.")
     args = p.parse_args()
+
+    if args.self_test:
+        return _run_self_test()
+
+    if args.run_dir is None:
+        p.error("run_dir is required (or use --self-test)")
+    if args.max_rounds is None:
+        p.error("--max-rounds is required")
+    if args.current_round is None:
+        p.error("--current-round is required")
 
     if not os.path.isdir(args.run_dir):
         print(f"ERROR: {args.run_dir} is not a directory", file=sys.stderr)
