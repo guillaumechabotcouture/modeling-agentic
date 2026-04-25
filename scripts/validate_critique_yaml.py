@@ -209,6 +209,57 @@ def validate_critique(path: str, expected_reviewer: str,
     return doc
 
 
+_ESCALATION_HIGH_THRESHOLD = 3  # patch_attempts >= 3 triggers mandatory escalation
+
+
+def _compute_blocker_attempts(critiques: dict[str, dict],
+                              current_round: int) -> dict[str, dict]:
+    """Phase 5 ζ: count consecutive PATCH attempts per blocker_id by
+    inspecting `carried_forward[]` entries with `still_present: true`.
+
+    Semantic: when a blocker first appeared in round R and is still
+    present in current round N (still_present: true), then PATCH was
+    attempted (N - R) times without resolving it. patch_attempts >= 2
+    means the same fix approach has failed at least twice; >= 3 means
+    something structurally different is needed (new agent class,
+    cross-stage escalation, or scope declaration).
+
+    Returns {blocker_id: {"first_seen_round": R, "patch_attempts": K,
+                           "category": C, "target_stage": S,
+                           "still_present": True}}.
+    """
+    out: dict[str, dict] = {}
+    blocker_meta: dict[str, dict] = {}
+    for reviewer, doc in critiques.items():
+        for b in doc.get("blockers", []):
+            blocker_meta[b["id"]] = {
+                "category": b.get("category"),
+                "target_stage": b.get("target_stage"),
+                "severity": b.get("severity"),
+                "reviewer": reviewer,
+            }
+        for entry in doc.get("carried_forward", []):
+            if not entry.get("still_present"):
+                continue
+            bid = entry["id"]
+            prior = entry.get("prior_round", current_round)
+            attempts = max(0, current_round - prior)
+            existing = out.get(bid)
+            # If multiple critiques carry the same id, take max attempts.
+            if existing is None or attempts > existing["patch_attempts"]:
+                meta = blocker_meta.get(bid, {})
+                out[bid] = {
+                    "first_seen_round": prior,
+                    "patch_attempts": attempts,
+                    "category": meta.get("category"),
+                    "target_stage": meta.get("target_stage"),
+                    "severity": meta.get("severity"),
+                    "reviewer": meta.get("reviewer"),
+                    "still_present": True,
+                }
+    return out
+
+
 def decide(critiques: dict[str, dict], max_rounds: int,
            current_round: int) -> dict:
     unresolved_high = []
@@ -223,6 +274,14 @@ def decide(critiques: dict[str, dict], max_rounds: int,
                     "first_seen_round": b["first_seen_round"],
                     "claim": b["claim"],
                 })
+
+    # Phase 5 ζ: consecutive-PATCH-attempt counter.
+    blocker_attempts = _compute_blocker_attempts(critiques, current_round)
+    escalation_required = any(
+        info["severity"] == "HIGH"
+        and info["patch_attempts"] >= _ESCALATION_HIGH_THRESHOLD
+        for info in blocker_attempts.values()
+    )
 
     structural_reviewers = [r for r, d in critiques.items()
                             if d["structural_mismatch"]["detected"]]
@@ -278,6 +337,9 @@ def decide(critiques: dict[str, dict], max_rounds: int,
         "spec_violations": [],
         "registry_violations": [],
         "rigor_violations": [],
+        # Phase 5 ζ: stuck-blocker tracking.
+        "blocker_attempts": blocker_attempts,
+        "escalation_required": escalation_required,
     }
 
 
@@ -1535,6 +1597,32 @@ def render_text(decision: dict, current_round: int, max_rounds: int) -> str:
         for v in rig:
             lines.append(f"    - [{v['severity']}] {v['stage']}/{v['kind']}: "
                          f"{v['claim'][:120]}")
+    # Phase 5 ζ: surface stuck blockers so the lead can pick the right
+    # escalation path (SCOPE_DECLARE_EARLY, CROSS_STAGE_ESCALATE, etc.).
+    attempts = decision.get("blocker_attempts") or {}
+    stuck = [(bid, info) for bid, info in attempts.items()
+             if info.get("patch_attempts", 0) >= 2]
+    if stuck:
+        lines.append(f"  stuck_blockers: {len(stuck)} "
+                     f"(>=2 failed PATCH attempts)")
+        for bid, info in stuck:
+            lines.append(
+                f"    - {bid} {info.get('reviewer','?')} "
+                f"category={info.get('category')} "
+                f"target={info.get('target_stage')} "
+                f"attempts={info['patch_attempts']} "
+                f"first_seen=round {info['first_seen_round']}"
+            )
+    if decision.get("escalation_required"):
+        lines.append(
+            "  escalation_required: TRUE — at least one HIGH blocker "
+            "has >=3 failed PATCH attempts. Re-spawning the same "
+            "target_stage with the same fix instructions is forbidden. "
+            "Apply category-aware escalation (see STAGE 7 prompt: "
+            "SCOPE_DECLARE_EARLY for PRESENTATION, CROSS_STAGE_ESCALATE "
+            "for HARD_BLOCKER/METHODS, originating-critique re-spawn "
+            "for HYPOTHESES/CITATIONS)."
+        )
     lines.append(f"  rounds_remaining: {decision['rounds_remaining']}")
     lines.append(f"  rule_matched: {decision['rule_matched']}")
     lines.append(f"  action: {decision['action']}")
@@ -1931,6 +2019,98 @@ def _run_self_test() -> int:
         ok(any(v["kind"] == "comparator_efficiency_outlier" for v in ve6),
            f"E6: single-comparator 4x ratio should fire (>3x threshold), "
            f"got {ve6}")
+
+    # --- Phase 5 Commit ζ: carry-forward attempt counter ---
+    # Helper to build a synthetic critique doc inline.
+    def _make_critique(reviewer, round_n, blockers, carried_forward=None,
+                       structural=False):
+        return {
+            "reviewer": reviewer,
+            "round": round_n,
+            "verdict": "REVISE",
+            "structural_mismatch": {"detected": structural},
+            "blockers": blockers,
+            "carried_forward": carried_forward or [],
+        }
+
+    # Case F1: blocker first seen round 1, still_present in round 4.
+    # Expected: patch_attempts = 4 - 1 = 3 → escalation_required=True.
+    crit_f1 = {
+        "critique-presentation": _make_critique(
+            "critique-presentation", round_n=4,
+            blockers=[{
+                "id": "P-001", "severity": "HIGH",
+                "category": "PRESENTATION", "target_stage": "WRITE",
+                "first_seen_round": 1, "claim": "figure embedding",
+                "resolved": False,
+            }],
+            carried_forward=[{
+                "id": "P-001", "prior_round": 1,
+                "still_present": True, "notes": "still wrong",
+            }],
+        ),
+    }
+    dec_f1 = decide(crit_f1, max_rounds=5, current_round=4)
+    ok(dec_f1.get("escalation_required") is True,
+       f"F1: P-001 carried 3 rounds should set escalation_required=True, "
+       f"got {dec_f1.get('escalation_required')}")
+    ok(dec_f1["blocker_attempts"]["P-001"]["patch_attempts"] == 3,
+       f"F1: patch_attempts should be 3, got "
+       f"{dec_f1['blocker_attempts']['P-001']['patch_attempts']}")
+
+    # Case F2: blocker first seen round 2, still_present in round 3.
+    # Expected: patch_attempts = 1 → no escalation_required.
+    crit_f2 = {
+        "critique-methods": _make_critique(
+            "critique-methods", round_n=3,
+            blockers=[{
+                "id": "M-005", "severity": "HIGH",
+                "category": "METHODS", "target_stage": "MODEL",
+                "first_seen_round": 2, "claim": "rate inconsistency",
+                "resolved": False,
+            }],
+            carried_forward=[{
+                "id": "M-005", "prior_round": 2,
+                "still_present": True, "notes": "still off",
+            }],
+        ),
+    }
+    dec_f2 = decide(crit_f2, max_rounds=5, current_round=3)
+    ok(dec_f2.get("escalation_required") is False,
+       f"F2: M-005 carried 1 round should NOT set escalation_required, "
+       f"got {dec_f2.get('escalation_required')}")
+    ok(dec_f2["blocker_attempts"]["M-005"]["patch_attempts"] == 1,
+       f"F2: patch_attempts should be 1, got "
+       f"{dec_f2['blocker_attempts']['M-005']['patch_attempts']}")
+
+    # Case F3: blocker resolved (still_present=false) does NOT count.
+    crit_f3 = {
+        "critique-domain": _make_critique(
+            "critique-domain", round_n=3,
+            blockers=[{
+                "id": "D-002", "severity": "HIGH",
+                "category": "HARD_BLOCKER", "target_stage": "DATA",
+                "first_seen_round": 2, "claim": "smc eligibility",
+                "resolved": True,
+            }],
+            carried_forward=[{
+                "id": "D-002", "prior_round": 2,
+                "still_present": False,
+                "notes": "fixed by NMEP 21-state list",
+            }],
+        ),
+    }
+    dec_f3 = decide(crit_f3, max_rounds=5, current_round=3)
+    ok("D-002" not in dec_f3.get("blocker_attempts", {}),
+       f"F3: resolved blockers should NOT appear in blocker_attempts, "
+       f"got {dec_f3.get('blocker_attempts')}")
+
+    # Case F4: render_text surfaces stuck_blockers + escalation_required.
+    rendered = render_text(dec_f1, current_round=4, max_rounds=5)
+    ok("stuck_blockers:" in rendered,
+       f"F4: render_text should mention stuck_blockers, got:\n{rendered}")
+    ok("escalation_required: TRUE" in rendered,
+       f"F4: render_text should flag escalation_required, got:\n{rendered}")
 
     # --- Summary ---
     if failures:

@@ -476,6 +476,48 @@ The validator has already decided for you. Your job is to carry it out:
     have `target_stage: PLAN | DATA`. Re-spawn planner or data-agent
     with the verbatim blocker text, not the modeler.
 
+  * **Stuck-blocker escalation (Phase 5 Commit ζ)** — when the
+    validator output contains `stuck_blockers:` lines (any HIGH
+    blocker with `patch_attempts >= 2`) or `escalation_required:
+    TRUE` (any HIGH blocker with `patch_attempts >= 3`), the same
+    `target_stage` re-spawn with the same fix instructions has
+    already failed multiple times. Re-trying it a third time is
+    forbidden — apply category-aware escalation:
+
+    - **PRESENTATION** category, attempts >= 2 → `SCOPE_DECLARE_EARLY`.
+      Stop re-spawning the analyst/writer. Add the blocker to
+      `scope_declaration.yaml` with `infeasible_within_pipeline:
+      true` and a brief rationale (e.g., "requires document-format
+      conversion outside the agent toolkit"). Continue to the next
+      patch or to STAGE 8 with the writer instructed to embed the
+      declaration verbatim in §Limitations. The pipeline cannot
+      solve every presentation problem; some require external tools.
+
+    - **HARD_BLOCKER / METHODS** category, attempts >= 2 →
+      `CROSS_STAGE_ESCALATE`. The first re-spawn went to the same
+      stage (e.g., MODEL); the second time, try a DIFFERENT stage —
+      the issue may live where the critique didn't expect. For a
+      MODEL blocker that's failed twice, re-spawn ANALYZE with the
+      blocker text reframed as "the analysis assumes X, but the
+      model doesn't support X" or re-spawn WRITE with "the report
+      claims Y, but the underlying model produces Z". Document the
+      cross-stage move in progress.md.
+
+    - **HYPOTHESES / CITATIONS** category, attempts >= 2 → re-spawn
+      the ORIGINATING CRITIQUE AGENT (not the target_stage agent).
+      The blocker may be ill-specified or the critique may have
+      misjudged severity. Tell the critique agent the verbatim
+      claim from prior rounds and ask it to re-verify whether the
+      issue is real and what specific fix would resolve it.
+
+    - **STRUCTURAL** category — already covered by RETHINK_STRUCTURAL
+      above. No additional escalation needed.
+
+    When `escalation_required: TRUE` (>=3 attempts), ACCEPT is
+    forbidden until the stuck blocker either clears or is moved to
+    `scope_declaration.yaml`. Do not spawn the same target_stage
+    agent with the same fix instructions a fourth time.
+
 - **DECLARE_SCOPE**: HIGH blockers remain and rounds exhausted.
   Before spawning the writer, you MUST write
   `{run_dir}/scope_declaration.yaml` acknowledging each unresolved
