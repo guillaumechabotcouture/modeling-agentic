@@ -127,11 +127,46 @@ they can't answer "what's the rule?" with a short statement.
 The validator parses the YAML front-matter + required section
 headings. Violations:
 
-| Violation                    | Severity | Trigger                                                                 |
-|------------------------------|----------|-------------------------------------------------------------------------|
-| `decision_rule_missing`      | HIGH     | `*allocation*.csv` exists; `decision_rule.md` absent.                    |
-| `decision_rule_malformed`    | HIGH     | File exists but front-matter or required section is missing/invalid.    |
-| `decision_rule_low_accuracy` | HIGH     | `rule_type ≠ non-compressible`, `accuracy_vs_optimizer < 0.90`, and `exceptions_count == 0`. You can't claim a rule with < 90% accuracy AND no declared exceptions. |
+| Violation                          | Severity | Trigger                                                                 |
+|------------------------------------|----------|-------------------------------------------------------------------------|
+| `decision_rule_missing`            | HIGH     | `*allocation*.csv` exists (top-level, `data/`, or `models/`); `decision_rule.md` absent. |
+| `decision_rule_malformed`          | HIGH     | File exists but front-matter or required section is missing/invalid.    |
+| `decision_rule_low_accuracy`       | HIGH     | `rule_type ≠ non-compressible`, `accuracy_vs_optimizer < 0.90`, and `exceptions_count == 0`. You can't claim a rule with < 90% accuracy AND no declared exceptions. |
+| `decision_rule_self_referential`   | MEDIUM   | A rule node references the optimizer's output rather than an input feature (Phase 4 Commit γ). Tokens that fire: `the optimizer`, `optimizer's choice`, `optimizer output`, `optimized choice`, `budget cut`, `funded set`, `in the funded`, `cost-effective enough`, `fall within the budget`, `ranked by`, `selected by the model`, `the model recommends`. The Justification section is exempt. |
+
+## Forbidden patterns: self-referential rule nodes
+
+A rule node's question must be answerable from **input features alone**
+(archetype, PfPR, population, geographic zone, a concrete CE-cutoff
+value like `> $20/case`). It must NOT be answerable only after running
+the optimizer. The following patterns are mechanically rejected (γ
+check):
+
+❌ "Is the LGA in the funded set?" — funded set is the optimizer's
+   output. A program officer can't apply this without running the
+   model.
+
+❌ "Is the LGA cost-effective enough to fund at $107M/yr?" — same
+   problem. The "cost-effective enough" threshold is implicit in the
+   optimizer's ranking; it's not a value the rule states.
+
+❌ "Was the LGA ranked by the optimizer?" — output, not input.
+
+✅ "Is PfPR > 25%?" — input feature with a stated cutoff.
+
+✅ "Is the LGA in the SMC-eligible northern zones (NW, NE, NC)?" —
+   geographic input from the archetype table.
+
+✅ "Is cases-averted-per-dollar > $20/case?" — concrete CE cutoff
+   value the rule itself states. (Compute the cutoff value during
+   rule extraction and bake it into the node.)
+
+If you cannot find a compact set of input features that recovers ≥90%
+of the optimizer's choices, switch `rule_type` to `non-compressible`
+and explain in the Justification section why the allocation doesn't
+admit a compact rule. The Justification section is exempt from the
+self-reference check, so referencing the optimizer is allowed there
+to honestly explain the non-compressibility.
 
 ## Writer integration
 

@@ -617,10 +617,17 @@ _EXCEPTIONS_COUNT_RE = _re_module.compile(
 
 
 def _find_allocation_csvs(run_dir: str) -> list[str]:
+    """Glob for allocation CSVs at the top level, under data/, and under
+    models/. The models/ search was added in Phase 4 (Commit γ era) to
+    fix a latent Phase 3 oversight: modelers commonly write
+    `models/optimization_allocation.csv` rather than the run-dir top
+    level, which silently skipped the entire decision-rule check.
+    """
     found: list[str] = []
     for pattern in _ALLOCATION_GLOBS:
         found.extend(_glob_module.glob(os.path.join(run_dir, pattern)))
         found.extend(_glob_module.glob(os.path.join(run_dir, "data", pattern)))
+        found.extend(_glob_module.glob(os.path.join(run_dir, "models", pattern)))
     return sorted(set(found))
 
 
@@ -653,9 +660,17 @@ def _check_decision_rule_artifact(run_dir: str) -> list[dict]:
     with open(rule_path) as f:
         text = f.read()
 
+    # Accumulate violations across all checks rather than returning early
+    # on the first malformed condition. This lets the Phase 4 γ
+    # self-reference check run even when the schema check has already
+    # flagged a malformed rule — a malformed file may still have
+    # self-referential prose worth surfacing, and the modeler should see
+    # both issues in one round.
+    violations: list[dict] = []
+    rule_type = None
     fm_match = _DECISION_RULE_FRONTMATTER_RE.match(text)
     if not fm_match:
-        return [{
+        violations.append({
             "kind": "decision_rule_malformed",
             "severity": "HIGH",
             "stage": "DECISION_RULE",
@@ -664,36 +679,37 @@ def _check_decision_rule_artifact(run_dir: str) -> list[dict]:
                 "(`--- rule_type: ... ---` at the top of the file). "
                 "See decision-rule-extraction skill for the schema."
             ),
-        }]
-
-    try:
-        fm = yaml.safe_load(fm_match.group(1)) or {}
-    except yaml.YAMLError as e:
-        return [{
-            "kind": "decision_rule_malformed",
-            "severity": "HIGH",
-            "stage": "DECISION_RULE",
-            "claim": f"decision_rule.md front-matter is not valid YAML: {e}",
-        }]
-
-    rule_type = fm.get("rule_type")
-    if rule_type not in _VALID_RULE_TYPES:
-        return [{
-            "kind": "decision_rule_malformed",
-            "severity": "HIGH",
-            "stage": "DECISION_RULE",
-            "claim": (
-                f"decision_rule.md front-matter `rule_type` is "
-                f"{rule_type!r}; must be one of "
-                f"{sorted(_VALID_RULE_TYPES)}."
-            ),
-        }]
+        })
+    else:
+        try:
+            fm = yaml.safe_load(fm_match.group(1)) or {}
+            rule_type = fm.get("rule_type")
+            if rule_type not in _VALID_RULE_TYPES:
+                violations.append({
+                    "kind": "decision_rule_malformed",
+                    "severity": "HIGH",
+                    "stage": "DECISION_RULE",
+                    "claim": (
+                        f"decision_rule.md front-matter `rule_type` is "
+                        f"{rule_type!r}; must be one of "
+                        f"{sorted(_VALID_RULE_TYPES)}."
+                    ),
+                })
+                rule_type = None
+        except yaml.YAMLError as e:
+            violations.append({
+                "kind": "decision_rule_malformed",
+                "severity": "HIGH",
+                "stage": "DECISION_RULE",
+                "claim": (f"decision_rule.md front-matter is not valid "
+                          f"YAML: {e}"),
+            })
 
     missing_sections = [s for s in _REQUIRED_RULE_SECTIONS if s not in text]
     if rule_type == "non-compressible" and "## Justification" not in text:
         missing_sections.append("## Justification")
     if missing_sections:
-        return [{
+        violations.append({
             "kind": "decision_rule_malformed",
             "severity": "HIGH",
             "stage": "DECISION_RULE",
@@ -701,10 +717,8 @@ def _check_decision_rule_artifact(run_dir: str) -> list[dict]:
                 f"decision_rule.md is missing required section(s): "
                 f"{missing_sections}. See decision-rule-extraction skill."
             ),
-        }]
-
-    violations: list[dict] = []
-    if rule_type != "non-compressible":
+        })
+    if rule_type is not None and rule_type != "non-compressible":
         acc_match = _ACCURACY_RE.search(text)
         exc_match = _EXCEPTIONS_COUNT_RE.search(text)
         if acc_match and exc_match:
@@ -729,7 +743,85 @@ def _check_decision_rule_artifact(run_dir: str) -> list[dict]:
             except (ValueError, TypeError):
                 pass
 
+    # Phase 4 Commit γ: self-reference detection. A rule node referencing
+    # the optimizer's output ("be in the funded set", "cost-effective
+    # enough", etc.) is non-actionable — a program officer can't apply it
+    # without running the optimizer. The 0.97 accuracy claim becomes
+    # mathematically correct but functionally useless. Defensible rules
+    # use only INPUT FEATURES (PfPR, archetype, concrete CE cutoff) — not
+    # outputs of the optimization itself. MEDIUM severity (rule is
+    # technically correct; surfacing the usability defect).
+    #
+    # Approach: search the whole body MINUS the Justification section
+    # (where prose explanation of why-no-compact-rule is allowed to
+    # reference the optimizer). This catches non-canonical rule headers
+    # like `## Decision Tree (4 nodes)` and `## Simplified Rule (prose)`
+    # without requiring the modeler to use exact `## Rule` boilerplate.
+    rule_body = _strip_justification_section(text)
+    found = [t for t in _SELF_REFERENCE_TOKENS
+             if t.lower() in rule_body.lower()]
+    if found:
+        violations.append({
+            "kind": "decision_rule_self_referential",
+            "severity": "MEDIUM",
+            "stage": "DECISION_RULE",
+            "claim": (
+                f"decision_rule.md (outside ## Justification) contains "
+                f"self-reference token(s) {found}. A rule node "
+                f"referencing the optimizer's output (e.g. 'be in the "
+                f"funded set', 'cost-effective enough') is non-actionable: "
+                f"a program officer can't apply it without re-running the "
+                f"model. Replace with an INPUT FEATURE — e.g. "
+                f"'cases-averted-per-dollar > $X/case' (a concrete CE "
+                f"cutoff value the rule can be evaluated against) — or "
+                f"declare rule_type=non-compressible with a Justification "
+                f"explaining why no compact rule applies."
+            ),
+        })
+
     return violations
+
+
+def _strip_justification_section(text: str) -> str:
+    """Phase 4 Commit γ helper. Return `text` with the `## Justification`
+    section removed (slice from header to next `##` or end-of-text).
+    Pattern reused from scripts/effect_size_registry.py linear scan.
+
+    Used to scan the rule body for self-reference tokens while allowing
+    prose in Justification (where referencing the optimizer's output is
+    the legitimate use case for non-compressible rules).
+    """
+    hdr_re = re.compile(r"^##\s+Justification\b.*$", re.MULTILINE)
+    m = hdr_re.search(text)
+    if m is None:
+        return text
+    next_h2 = re.search(r"^##\s", text[m.end():], re.MULTILINE)
+    if next_h2 is None:
+        return text[:m.start()]
+    return text[:m.start()] + text[m.end() + next_h2.start():]
+
+
+# Phase 4 Commit γ: tokens flagging a rule node as self-referential.
+# Tokens are chosen to be specific phrases rather than bare words like
+# "optimizer" (which legitimately appears in field names like
+# `accuracy_vs_optimizer`). The Justification section is stripped before
+# this scan, so prose explanation in non-compressible rules can still
+# reference the optimizer.
+_SELF_REFERENCE_TOKENS = (
+    "the optimizer",
+    "optimizer's choice",
+    "optimizer output",
+    "optimized choice",
+    "budget cut",
+    "funded set",
+    "in the funded",
+    "cost-effective enough",
+    "cost effective enough",
+    "fall within the budget",
+    "ranked by",
+    "selected by the model",
+    "the model recommends",
+)
 
 
 def _incorporate_rigor_violations(decision: dict, violations: list[dict],
@@ -1145,6 +1237,74 @@ def _run_self_test() -> int:
         ok(not vb5,
            f"B5: data-driven outcome_fn (no surrogate naming) should not fire, "
            f"got {vb5}")
+
+    # --- Phase 4 Commit γ: decision-rule self-reference detector ---
+    with tempfile.TemporaryDirectory() as d:
+        # Create the allocation CSV so _check_decision_rule_artifact
+        # actually runs (it short-circuits when no allocation exists).
+        with open(os.path.join(d, "lga_allocation.csv"), "w") as f:
+            f.write("lga,package\nA,X\n")
+
+        # Case C1: rule with self-reference token in ## Rule section → MEDIUM
+        with open(os.path.join(d, "decision_rule.md"), "w") as f:
+            f.write(
+                "---\n"
+                "rule_type: tree\n"
+                "---\n"
+                "# Decision Rule\n"
+                "## Features\n- archetype\n- pfpr\n"
+                "## Rule\n"
+                "1. Is the LGA in the funded set?\n"
+                "   YES -> PBO+SMC\n"
+                "   NO -> baseline\n"
+                "## Validation\n"
+                "- accuracy_vs_optimizer: 0.97\n"
+                "- exceptions_count: 5\n"
+            )
+        vc1 = _check_decision_rule_artifact(d)
+        ok(any(v["kind"] == "decision_rule_self_referential"
+               and v["severity"] == "MEDIUM" for v in vc1),
+           f"C1: 'in the funded set' in Rule should fire MEDIUM, got {vc1}")
+
+        # Case C2: rule with concrete cutoff (no self-reference) → no fire
+        with open(os.path.join(d, "decision_rule.md"), "w") as f:
+            f.write(
+                "---\n"
+                "rule_type: tree\n"
+                "---\n"
+                "# Decision Rule\n"
+                "## Features\n- archetype\n- pfpr\n"
+                "## Rule\n"
+                "1. Is PfPR > 0.25?\n"
+                "   YES -> PBO+SMC\n"
+                "   NO -> baseline\n"
+                "## Validation\n"
+                "- accuracy_vs_optimizer: 0.95\n"
+                "- exceptions_count: 8\n"
+            )
+        vc2 = _check_decision_rule_artifact(d)
+        ok(not any(v["kind"] == "decision_rule_self_referential" for v in vc2),
+           f"C2: concrete-cutoff rule should not fire self-referential, got {vc2}")
+
+        # Case C3: token only in Justification (non-compressible) → no fire
+        with open(os.path.join(d, "decision_rule.md"), "w") as f:
+            f.write(
+                "---\n"
+                "rule_type: non-compressible\n"
+                "---\n"
+                "# Decision Rule\n"
+                "## Features\n- archetype\n- pfpr\n- 12 others\n"
+                "## Rule\nSee Justification.\n"
+                "## Validation\n"
+                "- accuracy_vs_optimizer: 0.61\n"
+                "- exceptions_count: 325\n"
+                "## Justification\n"
+                "The optimizer's choices reflect strong stakeholder "
+                "pre-commitments and near-ties; no compact rule applies.\n"
+            )
+        vc3 = _check_decision_rule_artifact(d)
+        ok(not any(v["kind"] == "decision_rule_self_referential" for v in vc3),
+           f"C3: token in Justification only should not fire, got {vc3}")
 
     # --- Summary ---
     if failures:
