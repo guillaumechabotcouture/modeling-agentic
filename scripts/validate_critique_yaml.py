@@ -288,7 +288,10 @@ def decide(critiques: dict[str, dict], max_rounds: int,
 # interventions, different denominator) — the check forces an
 # explanation in §Discussion, not a model rebuild.
 _AVERTED_ROW_RE = re.compile(
-    r"\b(?:deaths?|cases?|dalys?)\s+averted\b", re.IGNORECASE,
+    # Phase 5 ε: also match "avertable" (2057 Hard Blocker Scorecard
+    # used "Deaths avertable" instead of "Deaths averted").
+    r"\b(?:deaths?|cases?|dalys?|infections?)\s+avert(?:ed|able)\b",
+    re.IGNORECASE,
 )
 _COST_PER_ROW_RE = re.compile(
     r"\bcost\s*per\s+(?:death|case|daly|life|infection)\b", re.IGNORECASE,
@@ -299,22 +302,34 @@ _BUDGET_ROW_RE = re.compile(
 _THIS_WORK_HEADER_RE = re.compile(
     r"\bthis\s+(?:model|work|analysis|study|paper|report)\b|"
     r"\bcurrent\s+(?:model|work|analysis|study)\b|"
-    r"\bour\s+(?:model|work|analysis|study)\b",
+    r"\bour\s+(?:model|work|analysis|study)\b|"
+    # Phase 5 ε: match Hard Blocker Scorecard format columns like
+    # "Model Value", "Model Estimate", "Model Output", "Model Result".
+    r"\bmodel\s+(?:value|estimate|output|result|finding|prediction)\b",
     re.IGNORECASE,
 )
 # Accept e.g. "Scott 2017 (Optima)", "Ozodiegwu 2023 (EMOD)", "EMOD",
-# "Optima". Capture group 1 = year if present.
+# "Optima". Phase 5 Commit ε: also accept generic comparator headers
+# like "Published Value", "Benchmark Estimate", "Reference Result",
+# "Literature Finding" — the 2057 malaria Hard Blocker Scorecard
+# format used "Published Value" as its single comparator column.
 _COMPARATOR_HEADER_RE = re.compile(
     r"[A-Z][\w-]+(?:\s+et\s+al\.?)?\s+(\d{4})|"
-    r"\b(?:EMOD|OpenMalaria|Optima|Spectrum|GBD)\b",
+    r"\b(?:EMOD|OpenMalaria|Optima|Spectrum|GBD)\b|"
+    r"\b(?:Published|Benchmark|Comparator|Reference|Literature)\s+"
+    r"(?:Value|Estimate|Result|Finding)\b",
     re.IGNORECASE,
 )
 # Numeric with optional sign, comma thousands, decimal, scientific,
 # and SI suffix (k/K/m/M/b/B/t/T) or unit suffix ($, %).
+# Phase 5 fix: require at least one comma-group in the comma-form
+# alternative; the prior `(?:,\d{3})*` allowing zero comma-groups made
+# the engine match "201" then "5" separately for the input "2015".
+# The `\b...\b` boundaries prevent partial-match drift.
 _NUMERIC_TOKEN_RE = re.compile(
     r"(?P<sign>[-+]?)\$?\s*"
-    r"(?P<num>\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)"
-    r"(?P<suffix>[kKmMbBtT]?)"
+    r"(?P<num>\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)"
+    r"(?P<suffix>[kKmMbBtT]?)\b"
 )
 # Time-horizon suffix in cells like "/3yr", "/5 years", "/yr", "per year".
 _HORIZON_RE = re.compile(
@@ -327,8 +342,24 @@ def _extract_last_numeric(cell: str) -> Optional[float]:
     """Extract the LAST numeric token from a cell string. Modelers
     typically write the original then a parenthesized normalization
     (e.g. `84,000/5yr (~50,400/3yr)`); the LAST token is the normalized
-    figure that should be used for cross-column comparison."""
-    matches = list(_NUMERIC_TOKEN_RE.finditer(cell))
+    figure that should be used for cross-column comparison.
+
+    Phase 5 fixes:
+      - Strip horizon suffixes (`/3yr`, `/5 years`, `/yr`, `per year`)
+        BEFORE extracting numerics. Otherwise the regex picks up the
+        horizon's digit (e.g., "5" from "/5yr") as the last numeric.
+      - Strip parenthetical citations (`(Bhatt 2015)`, `(Author Year)`)
+        BEFORE extracting numerics. Citation years would otherwise be
+        picked up as the last numeric, replacing the actual quantity.
+        Normalization parentheticals like `(~50,400/3yr)` start with
+        non-letter characters (digit, ~, $) so they are NOT stripped.
+    """
+    stripped = _HORIZON_RE.sub("", cell)
+    # Strip `(Author Year)` style citations — paren content beginning
+    # with an alphabetic character. Keeps `(50,400/3yr)`, `($107M)`,
+    # `(~12%)` — anything starting with a digit/punctuation.
+    stripped = re.sub(r"\(\s*[A-Za-z][^)]*\)", "", stripped)
+    matches = list(_NUMERIC_TOKEN_RE.finditer(stripped))
     if not matches:
         return None
     m = matches[-1]
@@ -427,8 +458,12 @@ def _check_comparator_efficiency(run_dir: str) -> list[dict]:
         # First column is the row-label column ("Finding" / "Metric"
         # etc). Subsequent columns are this-work + comparators.
         comparator_cols = headers[1:]
-        if len(comparator_cols) < 3:
-            continue  # need at least this + 2 comparators
+        # Phase 5 ε: require at least this + 1 comparator. Phase 4
+        # required ≥2 comparators; the 2057 malaria Hard Blocker
+        # Scorecard table has only one comparator column ("Published
+        # Value"), so ≥2 silently skipped a real 10× efficiency gap.
+        if len(comparator_cols) < 2:
+            continue
 
         this_idx = None
         comp_indices: list[int] = []
@@ -438,29 +473,59 @@ def _check_comparator_efficiency(run_dir: str) -> list[dict]:
                     this_idx = idx
             elif _COMPARATOR_HEADER_RE.search(hdr):
                 comp_indices.append(idx)
-        if this_idx is None or len(comp_indices) < 2:
+        if this_idx is None or len(comp_indices) < 1:
             continue  # not a this-vs-comparators table
 
+        # Stricter thresholds when we have only ONE comparator
+        # (single-comparator outliers are noisier; require a more
+        # extreme gap before firing).
+        single_comparator = len(comp_indices) == 1
+        averted_high_threshold = 3.0 if single_comparator else 1.5
+        averted_low_threshold = 1.0 / averted_high_threshold  # inverse direction
+        cost_per_low_threshold = 0.33 if single_comparator else 0.7
+        cost_per_high_threshold = 1.0 / cost_per_low_threshold  # inverse direction
+
         # Collect averted/budget/cost-per rows from this table.
+        # Phase 5 ε: also check the first non-label cell for the metric
+        # name. The Hard Blocker Scorecard format is
+        # `| ID | Metric | Model | Published | Status |` where row.label
+        # is just an ID (e.g. "B21") and cells[0] holds the metric
+        # name ("Deaths avertable"). Use concatenation for matching and
+        # for display so violations are interpretable in either layout.
+        def _display_label(row: dict) -> str:
+            lbl = row.get("label", "")
+            cells = row.get("cells") or []
+            first = cells[0] if cells else ""
+            # ID-only labels: stitch in the first cell
+            if first and (len(lbl) <= 4 or
+                          re.fullmatch(r"[A-Z]+-?\d+", lbl)):
+                return f"{lbl} {first}".strip()
+            return lbl.strip()
+
         averted_row = None
         budget_row = None
         for row in tbl["rows"]:
-            label = row["label"]
-            if averted_row is None and _AVERTED_ROW_RE.search(label):
+            label_search = (row["label"] + " "
+                            + (row["cells"][0] if row["cells"] else ""))
+            if averted_row is None and _AVERTED_ROW_RE.search(label_search):
                 averted_row = row
-            if budget_row is None and _BUDGET_ROW_RE.search(label):
+            if budget_row is None and _BUDGET_ROW_RE.search(label_search):
                 budget_row = row
-            if _COST_PER_ROW_RE.search(label):
-                # Direct cost-per-X check.
+            if _COST_PER_ROW_RE.search(label_search):
+                label = _display_label(row)
+                # Direct cost-per-X check (this < min: more efficient;
+                # this > max: less efficient — both worth surfacing).
                 cells = row["cells"]
                 this_val = _extract_last_numeric(cells[this_idx])
                 comp_vals = [
                     _extract_last_numeric(cells[i]) for i in comp_indices
                 ]
                 comp_vals = [v for v in comp_vals if v is not None]
-                if this_val is not None and len(comp_vals) >= 2:
-                    if this_val > 0 and min(comp_vals) > 0 \
-                            and this_val / min(comp_vals) < 0.7:
+                if this_val is not None and comp_vals and this_val > 0:
+                    min_comp = min(comp_vals)
+                    max_comp_val = max(comp_vals)
+                    if min_comp > 0 \
+                            and this_val / min_comp < cost_per_low_threshold:
                         violations.append({
                             "kind": "comparator_efficiency_outlier",
                             "severity": "MEDIUM",
@@ -469,9 +534,10 @@ def _check_comparator_efficiency(run_dir: str) -> list[dict]:
                                 f"report.md comparison table row "
                                 f"'{label}': this work claims "
                                 f"{this_val:.4g} vs comparators "
-                                f"min={min(comp_vals):.4g} "
-                                f"(ratio {this_val / min(comp_vals):.2f}). "
-                                f"Cost-per is {(1 - this_val / min(comp_vals)) * 100:.0f}% "
+                                f"min={min_comp:.4g} "
+                                f"(ratio {this_val / min_comp:.2f}). "
+                                f"Cost-per is "
+                                f"{(1 - this_val / min_comp) * 100:.0f}% "
                                 f"better than the most-efficient "
                                 f"comparator. Add a §Discussion "
                                 f"subsection explaining the gap (new "
@@ -479,8 +545,81 @@ def _check_comparator_efficiency(run_dir: str) -> list[dict]:
                                 f"normalization) or revise the table."
                             ),
                         })
+                    elif max_comp_val > 0 \
+                            and this_val / max_comp_val > cost_per_high_threshold:
+                        violations.append({
+                            "kind": "comparator_efficiency_outlier",
+                            "severity": "MEDIUM",
+                            "stage": "REPORT",
+                            "claim": (
+                                f"report.md comparison table row "
+                                f"'{label}': this work claims "
+                                f"{this_val:.4g} vs comparators "
+                                f"max={max_comp_val:.4g} "
+                                f"(ratio {this_val / max_comp_val:.2f}). "
+                                f"Cost-per is "
+                                f"{(this_val / max_comp_val - 1) * 100:.0f}% "
+                                f"WORSE than the least-efficient "
+                                f"comparator — suggests systematic "
+                                f"undercounting of cases averted, a "
+                                f"different denominator, or a real "
+                                f"regression. Explain in §Discussion."
+                            ),
+                        })
 
-        if averted_row is None or budget_row is None:
+        if averted_row is None:
+            continue
+
+        if budget_row is None:
+            # Phase 5 ε: when the table has no budget row (Hard Blocker
+            # Scorecard format: rows are direct claims, not budget-
+            # normalized comparisons), do a direct ratio check on the
+            # averted values themselves. Less sensitive than the cross-
+            # row efficiency check below; only fires on extreme ratios.
+            this_val = _extract_last_numeric(
+                averted_row["cells"][this_idx])
+            comp_vals = []
+            comp_labels = []
+            for ci in comp_indices:
+                v = _extract_last_numeric(averted_row["cells"][ci])
+                if v is not None and v > 0:
+                    comp_vals.append(v)
+                    comp_labels.append(comparator_cols[ci])
+            if this_val is not None and this_val > 0 and comp_vals:
+                max_comp_val = max(comp_vals)
+                min_comp_val = min(comp_vals)
+                if this_val / max_comp_val > averted_high_threshold:
+                    violations.append({
+                        "kind": "comparator_efficiency_outlier",
+                        "severity": "MEDIUM",
+                        "stage": "REPORT",
+                        "claim": (
+                            f"report.md row '{_display_label(averted_row)}': "
+                            f"this work claims {this_val:.4g} vs "
+                            f"comparator(s) max={max_comp_val:.4g} "
+                            f"({this_val / max_comp_val:.1f}x). "
+                            f"Add a §Discussion subsection explaining "
+                            f"the gap or revise the table."
+                        ),
+                    })
+                elif this_val / min_comp_val < averted_low_threshold:
+                    violations.append({
+                        "kind": "comparator_efficiency_outlier",
+                        "severity": "MEDIUM",
+                        "stage": "REPORT",
+                        "claim": (
+                            f"report.md row '{_display_label(averted_row)}': "
+                            f"this work claims {this_val:.4g} vs "
+                            f"comparator(s) min={min_comp_val:.4g} "
+                            f"({this_val / min_comp_val:.2f}x). "
+                            f"This UNDERPERFORMANCE requires "
+                            f"explanation: systematic undercounting "
+                            f"(e.g., U5-only when comparator is "
+                            f"all-age), different denominators, or a "
+                            f"real model deficiency. Quantify in "
+                            f"§Discussion."
+                        ),
+                    })
             continue
 
         # Cross-row efficiency: deaths_per_year / budget_per_year per column.
@@ -510,35 +649,62 @@ def _check_comparator_efficiency(run_dir: str) -> list[dict]:
                 continue
             comp_effs.append((comparator_cols[ci], a / b))
 
-        # ≥1 valid comparator required. The originally-planned ≥2 floor
-        # would miss real outliers when other comparator cells are N/A
-        # (the 1302 malaria run had Ozodiegwu = N/A; only Scott 2017 had
-        # numeric values). MEDIUM severity is the false-positive hedge:
-        # the violation surfaces a question for §Discussion, not a block.
         if not comp_effs:
             continue
+
+        # Phase 5 ε: fire on EITHER over-claim (this >> comparators) OR
+        # under-claim (this << comparators). 2057 deaths-averted case
+        # is the inverse of 1302's: this work is 10× LESS efficient
+        # than Scott 2017, suggesting systematic undercounting.
         max_comp = max(comp_effs, key=lambda x: x[1])
-        ratio = this_eff / max_comp[1] if max_comp[1] > 0 else None
-        if ratio is None or ratio <= 1.5:
-            continue
-        violations.append({
-            "kind": "comparator_efficiency_outlier",
-            "severity": "MEDIUM",
-            "stage": "REPORT",
-            "claim": (
-                f"report.md comparison table: this work's per-dollar "
-                f"efficiency on '{averted_row['label']}' / "
-                f"'{budget_row['label']}' is "
-                f"{this_eff:.4g} per year-dollar, "
-                f"{ratio:.1f}x the best comparator "
-                f"({max_comp[0]} at {max_comp[1]:.4g}). This level of "
-                f"improvement requires explanation: new interventions "
-                f"that comparators didn't include, structural model "
-                f"differences, or different denominators. Add a "
-                f"§Discussion subsection articulating the gap or revise "
-                f"to normalize comparator estimates to common units."
-            ),
-        })
+        min_comp = min(comp_effs, key=lambda x: x[1])
+        if max_comp[1] > 0:
+            over_ratio = this_eff / max_comp[1]
+            if over_ratio > averted_high_threshold:
+                violations.append({
+                    "kind": "comparator_efficiency_outlier",
+                    "severity": "MEDIUM",
+                    "stage": "REPORT",
+                    "claim": (
+                        f"report.md comparison table: this work's "
+                        f"per-dollar efficiency on "
+                        f"'{averted_row['label']}' / "
+                        f"'{budget_row['label']}' is "
+                        f"{this_eff:.4g} per year-dollar, "
+                        f"{over_ratio:.1f}x the best comparator "
+                        f"({max_comp[0]} at {max_comp[1]:.4g}). This "
+                        f"level of improvement requires explanation: "
+                        f"new interventions that comparators didn't "
+                        f"include, structural model differences, or "
+                        f"different denominators. Add a §Discussion "
+                        f"subsection articulating the gap or revise to "
+                        f"normalize comparator estimates to common units."
+                    ),
+                })
+                continue
+        if this_eff > 0 and min_comp[1] > 0:
+            under_ratio = this_eff / min_comp[1]
+            if under_ratio < averted_low_threshold:
+                violations.append({
+                    "kind": "comparator_efficiency_outlier",
+                    "severity": "MEDIUM",
+                    "stage": "REPORT",
+                    "claim": (
+                        f"report.md comparison table: this work's "
+                        f"per-dollar efficiency on "
+                        f"'{averted_row['label']}' / "
+                        f"'{budget_row['label']}' is "
+                        f"{this_eff:.4g} per year-dollar, only "
+                        f"{under_ratio:.2f}x the WORST comparator "
+                        f"({min_comp[0]} at {min_comp[1]:.4g}). This "
+                        f"level of UNDERPERFORMANCE requires "
+                        f"explanation: systematic undercounting "
+                        f"(e.g., U5-only deaths when comparator counts "
+                        f"all-age), different denominators, or a real "
+                        f"model deficiency. Quantify the methodological "
+                        f"gap in §Discussion or revise to normalize."
+                    ),
+                })
 
     return violations
 
@@ -1066,13 +1232,21 @@ def _strip_justification_section(text: str) -> str:
     return text[:m.start()] + text[m.end() + next_h2.start():]
 
 
-# Phase 4 Commit γ: tokens flagging a rule node as self-referential.
-# Tokens are chosen to be specific phrases rather than bare words like
-# "optimizer" (which legitimately appears in field names like
+# Phase 4 Commit γ + Phase 5 Commit ε: tokens flagging a rule node as
+# self-referential. Tokens are specific phrases (avoiding bare words
+# like "optimizer" that legitimately appear in field names such as
 # `accuracy_vs_optimizer`). The Justification section is stripped before
 # this scan, so prose explanation in non-compressible rules can still
 # reference the optimizer.
+#
+# Phase 5 Commit ε added budget-availability variants — the 2057 malaria
+# run's decision rule node 5 was "Is PfPR >= 15% AND budget remaining?",
+# the same pattern as 1302's "cost-effective enough" but worded around
+# budget availability rather than cost-effectiveness. A program officer
+# can't apply node 5 without re-running the optimizer to see what budget
+# remains.
 _SELF_REFERENCE_TOKENS = (
+    # Phase 4 (optimizer/funded-set patterns)
     "the optimizer",
     "optimizer's choice",
     "optimizer output",
@@ -1086,6 +1260,19 @@ _SELF_REFERENCE_TOKENS = (
     "ranked by",
     "selected by the model",
     "the model recommends",
+    # Phase 5 ε (budget-availability patterns)
+    "budget remaining",
+    "budget available",
+    "if budget allows",
+    "if budget remains",
+    "subject to budget",
+    "remaining funds",
+    "funds remaining",
+    "funds available",
+    "if funds remain",
+    "funds permitting",
+    "budget permitting",
+    "as budget allows",
 )
 
 
@@ -1632,6 +1819,118 @@ def _run_self_test() -> int:
         vd4 = _check_comparator_efficiency(d)
         ok(any(v["kind"] == "comparator_efficiency_outlier" for v in vd4),
            f"D4: cost-per-death row 50% cheaper should fire, got {vd4}")
+
+    # --- Phase 5 Commit ε: γ + δ extensions ---
+    with tempfile.TemporaryDirectory() as d:
+        # Case E1: γ widening — "budget remaining" in rule body fires.
+        with open(os.path.join(d, "lga_allocation.csv"), "w") as f:
+            f.write("lga,package\nA,X\n")
+        with open(os.path.join(d, "decision_rule.md"), "w") as f:
+            f.write(
+                "---\n"
+                "rule_type: tree\n"
+                "---\n"
+                "# Decision Rule\n"
+                "## Features\n- pfpr\n- archetype\n"
+                "## Rule\n"
+                "1. Is PfPR >= 25%?\n"
+                "   YES -> Go to 2\n"
+                "   NO -> baseline\n"
+                "2. Is PfPR >= 15% AND budget remaining?\n"
+                "   YES -> Standard LLIN 80%\n"
+                "   NO -> baseline\n"
+                "## Validation\n"
+                "- accuracy_vs_optimizer: 0.95\n"
+                "- exceptions_count: 7\n"
+            )
+        ve1 = _check_decision_rule_artifact(d)
+        ok(any(v["kind"] == "decision_rule_self_referential" for v in ve1),
+           f"E1: 'budget remaining' should fire γ MEDIUM, got {ve1}")
+
+    # Case E2: δ generic comparator header (Hard Blocker Scorecard format).
+    # 2057 malaria pattern: single "Published Value" column + Scott 2017
+    # row with deaths-averted gap.
+    with tempfile.TemporaryDirectory() as d:
+        report_e2 = os.path.join(d, "report.md")
+        with open(report_e2, "w") as f:
+            f.write(
+                "# Report\n\n"
+                "| ID | This Model | Published Value | Status |\n"
+                "|----|------------|-----------------|--------|\n"
+                "| Cost per death averted | $105,000 | $10,400 (Scott 2017) | DISAGREE |\n"
+            )
+        ve2 = _check_comparator_efficiency(d)
+        ok(any(v["kind"] == "comparator_efficiency_outlier" for v in ve2),
+           f"E2: 'Published Value' column + 10x worse cost-per-death "
+           f"should fire δ inverse direction, got {ve2}")
+
+    # Case E3: δ inverse direction with averted+budget rows
+    # (this work UNDER-claims vs comparator).
+    with tempfile.TemporaryDirectory() as d:
+        report_e3 = os.path.join(d, "report.md")
+        with open(report_e3, "w") as f:
+            f.write(
+                "# Report\n\n"
+                "| Finding | This Work | Scott 2017 | Ozodiegwu 2023 |\n"
+                "|---------|-----------|------------|----------------|\n"
+                "| Deaths averted | 3,046/3yr | 84,000/5yr | N/A |\n"
+                "| Budget | $107M/yr | $175M/yr | N/A |\n"
+            )
+        ve3 = _check_comparator_efficiency(d)
+        ok(any(v["kind"] == "comparator_efficiency_outlier"
+               and "UNDERPERFORMANCE" in v["claim"] for v in ve3),
+           f"E3: deaths 10x less efficient than Scott should fire inverse, "
+           f"got {ve3}")
+
+    # Case E4: legitimate Published Value column where ratio is in
+    # acceptable range — should NOT fire.
+    with tempfile.TemporaryDirectory() as d:
+        report_e4 = os.path.join(d, "report.md")
+        with open(report_e4, "w") as f:
+            f.write(
+                "# Report\n\n"
+                "| Metric | This Model | Published Value | Status |\n"
+                "|--------|------------|-----------------|--------|\n"
+                "| Cases averted/yr | 16,500 | 17,000 (Bhatt 2015) | AGREE |\n"
+                "| Budget | $100M/yr | $105M/yr | AGREE |\n"
+            )
+        ve4 = _check_comparator_efficiency(d)
+        ok(not ve4,
+           f"E4: similar values should not fire even with generic header, "
+           f"got {ve4}")
+
+    # Case E5: single-comparator stricter threshold — 2x improvement
+    # should NOT fire (was 1.5x for ≥2 comparators; now 3x for single).
+    with tempfile.TemporaryDirectory() as d:
+        report_e5 = os.path.join(d, "report.md")
+        with open(report_e5, "w") as f:
+            f.write(
+                "# Report\n\n"
+                "| Metric | This Work | Scott 2017 |\n"
+                "|--------|-----------|------------|\n"
+                "| Cases averted/yr | 30,000 | 15,000 |\n"
+                "| Budget | $100M/yr | $100M/yr |\n"
+            )
+        ve5 = _check_comparator_efficiency(d)
+        ok(not ve5,
+           f"E5: single-comparator 2x ratio should NOT fire (threshold 3x), "
+           f"got {ve5}")
+
+    # Case E6: single-comparator 4x improvement — SHOULD fire.
+    with tempfile.TemporaryDirectory() as d:
+        report_e6 = os.path.join(d, "report.md")
+        with open(report_e6, "w") as f:
+            f.write(
+                "# Report\n\n"
+                "| Metric | This Work | Scott 2017 |\n"
+                "|--------|-----------|------------|\n"
+                "| Cases averted/yr | 60,000 | 15,000 |\n"
+                "| Budget | $100M/yr | $100M/yr |\n"
+            )
+        ve6 = _check_comparator_efficiency(d)
+        ok(any(v["kind"] == "comparator_efficiency_outlier" for v in ve6),
+           f"E6: single-comparator 4x ratio should fire (>3x threshold), "
+           f"got {ve6}")
 
     # --- Summary ---
     if failures:

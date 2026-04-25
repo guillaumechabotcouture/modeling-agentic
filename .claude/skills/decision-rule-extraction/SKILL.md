@@ -132,7 +132,7 @@ headings. Violations:
 | `decision_rule_missing`            | HIGH     | `*allocation*.csv` exists (top-level, `data/`, or `models/`); `decision_rule.md` absent. |
 | `decision_rule_malformed`          | HIGH     | File exists but front-matter or required section is missing/invalid.    |
 | `decision_rule_low_accuracy`       | HIGH     | `rule_type ≠ non-compressible`, `accuracy_vs_optimizer < 0.90`, and `exceptions_count == 0`. You can't claim a rule with < 90% accuracy AND no declared exceptions. |
-| `decision_rule_self_referential`   | MEDIUM   | A rule node references the optimizer's output rather than an input feature (Phase 4 Commit γ). Tokens that fire: `the optimizer`, `optimizer's choice`, `optimizer output`, `optimized choice`, `budget cut`, `funded set`, `in the funded`, `cost-effective enough`, `fall within the budget`, `ranked by`, `selected by the model`, `the model recommends`. The Justification section is exempt. |
+| `decision_rule_self_referential`   | MEDIUM   | A rule node references the optimizer's output rather than an input feature (Phase 4 Commit γ; Phase 5 Commit ε widened). Tokens that fire include: `the optimizer`, `optimizer's choice`, `optimizer output`, `optimized choice`, `budget cut`, `funded set`, `in the funded`, `cost-effective enough`, `fall within the budget`, `ranked by`, `selected by the model`, `the model recommends`, `budget remaining`, `budget available`, `if budget allows`, `subject to budget`, `remaining funds`, `funds remaining`, `funds available`, `funds permitting`, `budget permitting`. The Justification section is exempt. |
 
 ## Forbidden patterns: self-referential rule nodes
 
@@ -151,6 +151,13 @@ check):
    optimizer's ranking; it's not a value the rule states.
 
 ❌ "Was the LGA ranked by the optimizer?" — output, not input.
+
+❌ "Is PfPR ≥ 15% AND budget remaining?" — "budget remaining" is the
+   optimizer's output state, not an input. A program officer can't
+   evaluate this without re-running the optimizer.
+
+❌ "Is the LGA cost-effective enough to fund AND budget available?" —
+   compound self-reference; both clauses fail the input-only test.
 
 ✅ "Is PfPR > 25%?" — input feature with a stated cutoff.
 
