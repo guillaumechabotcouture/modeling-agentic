@@ -463,6 +463,23 @@ The validator has already decided for you. Your job is to carry it out:
     below apply. Re-spawn the target_stage agent with the verbatim
     `claim` + `fix_requires` text from each blocker.
 
+  * **Parallelism in PATCH (Phase 5 Commit η)** — when this PATCH
+    round's blockers span MULTIPLE target_stages (e.g., some target
+    MODEL, some target ANALYZE, some target WRITE), spawn the
+    corresponding agents IN A SINGLE RESPONSE — the same parallel-
+    spawn pattern as STAGE 6 CRITIQUE. The target stages edit
+    largely disjoint files: modeler edits `models/`, analyst edits
+    `results.md`, writer edits `report.md`. No race conditions
+    arise in practice. Parallel spawns shave 30-60 minutes per
+    multi-stage patch round vs serial; over a typical 5-round
+    pipeline this compounds to 1-2 hours of saved wall-clock.
+
+    When this PATCH round's blockers all target a single stage,
+    spawn that one agent and wait — no parallelism to be gained.
+    When in doubt, group blockers by `target_stage` first; each
+    distinct stage with at least one HIGH blocker becomes one
+    spawn in the same response.
+
   * **RETHINK** when ANY apply:
     - Any blocker has `category: STRUCTURAL`.
     - The same blocker `id` has `first_seen_round < current_round`
