@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from typing import Any
 
@@ -280,6 +281,112 @@ def decide(critiques: dict[str, dict], max_rounds: int,
     }
 
 
+# Phase 4 Commit β: surrogate UQ documentation requirement.
+# When outcome_fn.py reads precomputed CSVs and rescales rather than
+# calling the actual model, the 200-draw "ensemble" is a closed-form
+# recomputation, not a Monte Carlo over the model. The headline CIs
+# reflect parameter uncertainty in a closed-form formula — readers
+# typically assume Monte-Carlo-over-model. Require explicit calibration
+# documentation when the surrogate path is taken.
+_REAL_MODEL_PATTERNS = [
+    re.compile(r"\bss\.Sim\s*\("),
+    re.compile(r"\bstarsim\.Sim\s*\("),
+    re.compile(r"\bsim\.run\s*\("),
+    re.compile(r"\bsolve_ivp\s*\("),
+    re.compile(r"\bodeint\s*\("),
+    re.compile(r"\.simulate\s*\("),
+    re.compile(r"\bMonteCarlo\s*\("),
+]
+# Surrogate detection: look for the precomputed-CSV naming convention
+# anywhere in outcome_fn.py. Matches both direct read_csv calls
+# (`pd.read_csv("package_evaluation.csv")`) and indirected ones
+# (`path = os.path.join(..., "package_evaluation.csv"); pd.read_csv(path)`).
+# Pairing these naming patterns with "no real-model call" is the
+# surrogate signal.
+_SURROGATE_PATTERNS = [
+    re.compile(
+        r"['\"][^'\"]*"
+        r"(?:package_eval|calibration_results|scenarios|grid_results|"
+        r"emulator_grid|surrogate_grid|package_evaluation)"
+        r"[^'\"]*\.(?:csv|parquet|feather|pkl|npz)['\"]",
+        re.IGNORECASE,
+    ),
+]
+
+
+def _check_surrogate_uq_documented(run_dir: str) -> list[dict]:
+    """Phase 4 Commit β: detect surrogate UQ without calibration docs.
+
+    If outcome_fn.py reads a precomputed CSV (named e.g. *package_eval*,
+    *calibration_results*, *scenarios*, *grid_results*) AND does NOT
+    call any real-model runner (ss.Sim, sim.run, solve_ivp, odeint,
+    .simulate), require models/outcome_fn_calibration.md documenting
+    surrogate RMSE vs the full model on a validation grid.
+
+    Emits:
+      surrogate_uq_undocumented HIGH      — surrogate path, no calibration md
+      surrogate_calibration_missing_rmse  — md exists but no RMSE figure
+                                            (MEDIUM)
+    """
+    outcome_fn_path = os.path.join(run_dir, "models", "outcome_fn.py")
+    if not os.path.exists(outcome_fn_path):
+        return []
+    try:
+        with open(outcome_fn_path) as f:
+            text = f.read()
+    except (OSError, UnicodeDecodeError):
+        return []
+
+    has_real = any(p.search(text) for p in _REAL_MODEL_PATTERNS)
+    has_surrogate = any(p.search(text) for p in _SURROGATE_PATTERNS)
+    if not (has_surrogate and not has_real):
+        return []
+
+    cal_md_path = os.path.join(run_dir, "models", "outcome_fn_calibration.md")
+    if not os.path.exists(cal_md_path):
+        return [{
+            "kind": "surrogate_uq_undocumented",
+            "severity": "HIGH",
+            "stage": "UQ",
+            "claim": (
+                "models/outcome_fn.py reads a precomputed CSV "
+                "(package_evaluation / calibration_results / scenarios / "
+                "grid_results) and does NOT call the model "
+                "(no ss.Sim/sim.run/solve_ivp/odeint/.simulate). The "
+                "200-draw 'ensemble' is therefore a closed-form "
+                "recomputation, not a Monte Carlo over the model — the "
+                "headline CIs reflect parameter uncertainty under the "
+                "surrogate's analytical assumptions only. Required: "
+                "models/outcome_fn_calibration.md documenting (1) the "
+                "surrogate architecture (interpolation method, grid "
+                "resolution), (2) RMSE vs full-model validation grid "
+                "(>= 10 grid points), (3) cross-validation error, "
+                "(4) extrapolation bounds. Without this document the "
+                "report's CI framing misrepresents what was computed."
+            ),
+        }]
+    try:
+        with open(cal_md_path) as f:
+            cal_text = f.read()
+    except (OSError, UnicodeDecodeError):
+        cal_text = ""
+    if not re.search(r"\bRMSE\b", cal_text, re.I):
+        return [{
+            "kind": "surrogate_calibration_missing_rmse",
+            "severity": "MEDIUM",
+            "stage": "UQ",
+            "claim": (
+                "models/outcome_fn_calibration.md exists but does not "
+                "contain an RMSE validation figure. The doc must "
+                "validate the surrogate against the full model on a "
+                "grid of >=10 points and report per-output RMSE. "
+                "Without an RMSE figure the surrogate's accuracy is "
+                "unaudited."
+            ),
+        }]
+    return []
+
+
 # Phase 4 Commit α: zero-width CI detector.
 # Threshold rationale: 0.5% relative width catches optimizer-bounded
 # outputs (e.g., total_cost when greedy fills budget) and hardcoded
@@ -375,6 +482,11 @@ def _check_rigor_artifacts(run_dir: str) -> list[dict]:
         else:
             # Phase 4 Commit α: detect zero-width CIs.
             violations.extend(_check_uq_ci_quality(uq_report_path))
+        # Phase 4 Commit β: when outcome_fn is a surrogate, require
+        # documentation. (Runs even when uncertainty_report.yaml is
+        # missing — the surrogate framing issue exists regardless of
+        # whether UQ has been re-run.)
+        violations.extend(_check_surrogate_uq_documented(run_dir))
     else:
         violations.append({
             "kind": "outcome_fn_missing",
@@ -965,6 +1077,74 @@ def _run_self_test() -> int:
         vd = _check_uq_ci_quality(uq_d)
         ok(any(v["kind"] == "ci_degenerate" for v in vd),
            f"A4: hardcoded calibration target should fire, got {vd}")
+
+    # --- Phase 4 Commit β: surrogate UQ documentation requirement ---
+    with tempfile.TemporaryDirectory() as d:
+        models = os.path.join(d, "models")
+        os.makedirs(models)
+
+        # Case B1: surrogate-only outcome_fn, no calibration md → HIGH.
+        with open(os.path.join(models, "outcome_fn.py"), "w") as f:
+            f.write(
+                "import pandas as pd\n"
+                "def outcome_fn(params):\n"
+                "    df = pd.read_csv('package_evaluation.csv')\n"
+                "    return {'cases_averted': df.cases_averted.sum() * 0.95}\n"
+            )
+        vb1 = _check_surrogate_uq_documented(d)
+        ok(any(v["kind"] == "surrogate_uq_undocumented"
+               and v["severity"] == "HIGH" for v in vb1),
+           f"B1: surrogate outcome_fn without calibration md should fire HIGH, "
+           f"got {vb1}")
+
+        # Case B2: surrogate + calibration md without RMSE → MEDIUM.
+        with open(os.path.join(models, "outcome_fn_calibration.md"), "w") as f:
+            f.write("# Surrogate calibration\n\nWe used grid interpolation.\n")
+        vb2 = _check_surrogate_uq_documented(d)
+        ok(any(v["kind"] == "surrogate_calibration_missing_rmse"
+               and v["severity"] == "MEDIUM" for v in vb2),
+           f"B2: calibration md without RMSE should fire MEDIUM, got {vb2}")
+
+        # Case B3: surrogate + calibration md WITH RMSE → no fire.
+        with open(os.path.join(models, "outcome_fn_calibration.md"), "w") as f:
+            f.write(
+                "# Surrogate calibration\n\n"
+                "Validation grid (12 points). RMSE per output:\n"
+                "- cases_averted: 0.03\n"
+                "- cost: 0.02\n"
+            )
+        vb3 = _check_surrogate_uq_documented(d)
+        ok(not vb3, f"B3: surrogate + RMSE-documented should not fire, got {vb3}")
+
+        # Case B4: real-model outcome_fn (calls ss.Sim) → no fire even
+        # if a CSV is also read.
+        with open(os.path.join(models, "outcome_fn.py"), "w") as f:
+            f.write(
+                "import starsim as ss\n"
+                "import pandas as pd\n"
+                "def outcome_fn(params):\n"
+                "    df = pd.read_csv('package_evaluation.csv')\n"
+                "    sim = ss.Sim(diseases=ss.SIR(), n_agents=1000)\n"
+                "    sim.run()\n"
+                "    return {'cases_averted': sim.results.cum_infections[-1]}\n"
+            )
+        vb4 = _check_surrogate_uq_documented(d)
+        ok(not vb4, f"B4: real-model outcome_fn should not fire, got {vb4}")
+
+        # Case B5: outcome_fn that reads only data/ csvs (not surrogate
+        # naming) and calls no model — should not fire (low-recall but
+        # avoids false positives on legitimate data-driven outcome_fns).
+        with open(os.path.join(models, "outcome_fn.py"), "w") as f:
+            f.write(
+                "import pandas as pd\n"
+                "def outcome_fn(params):\n"
+                "    df = pd.read_csv('data/observations.csv')\n"
+                "    return {'rmse': ((df.obs - df.pred)**2).mean()**0.5}\n"
+            )
+        vb5 = _check_surrogate_uq_documented(d)
+        ok(not vb5,
+           f"B5: data-driven outcome_fn (no surrogate naming) should not fire, "
+           f"got {vb5}")
 
     # --- Summary ---
     if failures:

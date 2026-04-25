@@ -406,8 +406,46 @@ registered parameter priors (above) and aggregates per-output CIs.
 
 If the full model is too slow for 200 local draws (>2 hours total),
 build a surrogate (emulator on a sparse grid of full-model runs) and
-expose the surrogate via `outcome_fn`. Document the surrogate's RMSE
-against grid points in `models/outcome_fn_calibration.md`.
+expose the surrogate via `outcome_fn`.
+
+**Surrogate-path requirements (Phase 4 Commit β).** When the surrogate
+path is taken, `models/outcome_fn_calibration.md` is MANDATORY and must
+contain ALL of the following:
+
+- **Surrogate architecture**: interpolation method (linear / RBF /
+  spline / GP), grid resolution per dimension, total grid points.
+- **Validation grid**: ≥10 full-model runs at parameter combinations
+  NOT used to fit the surrogate (test set, not training set).
+- **Per-output RMSE**: a numeric RMSE figure for each output the
+  surrogate produces, validated against the test set. The literal
+  word "RMSE" must appear in this section. Example:
+  ```
+  ## Validation
+  - Test set: 12 full-model runs at LHS-sampled parameter draws
+    outside the training grid.
+  - RMSE per output (test set vs surrogate prediction):
+    - cases_averted_3yr: 0.041 (4.1% of mean)
+    - cost_per_case_averted: 0.018
+  ```
+- **Cross-validation error**: leave-one-out or k-fold error vs the
+  training grid.
+- **Extrapolation bounds**: parameter regions outside the grid where
+  the surrogate may break down. The propagate_uncertainty draws MUST
+  stay inside these bounds.
+
+Without `models/outcome_fn_calibration.md`, the validator emits a HIGH
+`surrogate_uq_undocumented` blocker — because surrogate UQ presented as
+full-model UQ misrepresents what the headline CIs mean. A program
+officer reading "95% CI [15.5M, 25.5M] cases averted" should know
+whether those bounds reflect Monte Carlo over the model or closed-form
+rescaling of point estimates.
+
+Detection of the surrogate path is mechanical: if `outcome_fn.py`
+references a precomputed CSV named `package_evaluation`,
+`calibration_results`, `scenarios`, `grid_results`, `emulator_grid`,
+or `surrogate_grid` AND does not call any real-model runner (`ss.Sim`,
+`sim.run`, `solve_ivp`, `odeint`, `.simulate`), the surrogate path is
+detected and the calibration document is required.
 
 Alternative: use cloud compute via `modelops-calabaria` / `mops`. See
 the `cloud-compute` skill for the decision rule (spot instances,
