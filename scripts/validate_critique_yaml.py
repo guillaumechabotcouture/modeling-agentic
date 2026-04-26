@@ -26,6 +26,7 @@ error rather than swallowing it.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import re
@@ -1084,7 +1085,107 @@ def _check_rigor_artifacts(run_dir: str) -> list[dict]:
     # Phase 4 Commit δ: cross-comparator efficiency outlier check.
     violations.extend(_check_comparator_efficiency(run_dir))
 
+    # Phase 6 Commit θ: optimizer-quality benchmark.
+    violations.extend(_check_optimization_quality(run_dir))
+
     return violations
+
+
+def _check_optimization_quality(run_dir: str) -> list[dict]:
+    """Phase 6 Commit θ: when an allocation/decision_rule artifact
+    exists, the modeler must compare their primary optimizer to ≥1
+    alternative method (ILP, SA, random-restart) and report the gap.
+
+    Emits:
+      optimization_quality_missing      MEDIUM — decision_rule.md or
+                                                 allocation CSV present
+                                                 but no benchmark file
+      optimization_quality_no_benchmark HIGH   — file exists but
+                                                 benchmark_methods is empty
+      optimization_quality_malformed    HIGH   — schema/method violations
+      optimization_quality_gap_too_large MEDIUM — gap_pct > 10%
+    """
+    decision_rule = os.path.join(run_dir, "decision_rule.md")
+    allocs = _find_allocation_csvs(run_dir)
+    if not (os.path.exists(decision_rule) or allocs):
+        return []  # No allocation produced; no requirement.
+
+    yaml_path = os.path.join(run_dir, "models", "optimization_quality.yaml")
+    if not os.path.exists(yaml_path):
+        return [{
+            "kind": "optimization_quality_missing",
+            "severity": "MEDIUM",
+            "stage": "OPTIMIZATION",
+            "claim": (
+                "Allocation produced but models/optimization_quality.yaml "
+                "is absent. The primary optimizer must be benchmarked "
+                "against at least one alternative method (ILP via PuLP, "
+                "simulated annealing, random-restart greedy, or brute "
+                "force when feasible) so the optimality gap is "
+                "quantified. A greedy optimizer's headline 'X% advantage' "
+                "claim is meaningless without knowing whether X% is 100% "
+                "of the achievable improvement or 60% of it. See the "
+                "optimizer-method-selection skill."
+            ),
+        }]
+
+    # Lazy import to avoid circular dependency / missing-deps at import time.
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "optimization_quality",
+            os.path.join(os.path.dirname(__file__), "optimization_quality.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    except Exception as e:
+        return [{
+            "kind": "optimization_quality_malformed",
+            "severity": "HIGH",
+            "stage": "OPTIMIZATION",
+            "claim": (f"Could not load scripts/optimization_quality.py: {e}"),
+        }]
+
+    result = mod.validate_optimization_quality(yaml_path)
+    out = []
+    if result["verdict"] == "MALFORMED":
+        out.append({
+            "kind": "optimization_quality_malformed",
+            "severity": "HIGH",
+            "stage": "OPTIMIZATION",
+            "claim": (f"models/optimization_quality.yaml is malformed: "
+                      f"{'; '.join(result['errors'])}"),
+        })
+    elif result["verdict"] == "NO_BENCHMARK":
+        out.append({
+            "kind": "optimization_quality_no_benchmark",
+            "severity": "HIGH",
+            "stage": "OPTIMIZATION",
+            "claim": (
+                "models/optimization_quality.yaml exists but "
+                "benchmark_methods is empty. At least one benchmark "
+                "method (ILP, SA, random-restart) must be present so "
+                "the gap_pct can be computed. Greedy-only optimization "
+                "with no quality benchmark is not ACCEPT-grade."
+            ),
+        })
+    elif result["verdict"] == "GAP_TOO_LARGE":
+        out.append({
+            "kind": "optimization_quality_gap_too_large",
+            "severity": "MEDIUM",
+            "stage": "OPTIMIZATION",
+            "claim": (
+                f"Optimizer gap_pct = {result['gap_pct']:.2f}%; primary "
+                f"method ({result['primary']['method']}) is well below "
+                f"best benchmark ({result['best']['method']} at "
+                f"{result['best']['objective']:.4g} vs "
+                f"{result['primary']['objective']:.4g}). Either switch "
+                f"the primary method to the better one, improve the "
+                f"primary's parameters (more random restarts, longer SA "
+                f"cooling, etc.), or scope-declare why a >10% gap is "
+                f"acceptable for this question."
+            ),
+        })
+    return out
 
 
 # Phase 3 Commit C: decision rule as required rigor artifact.
@@ -2111,6 +2212,71 @@ def _run_self_test() -> int:
        f"F4: render_text should mention stuck_blockers, got:\n{rendered}")
     ok("escalation_required: TRUE" in rendered,
        f"F4: render_text should flag escalation_required, got:\n{rendered}")
+
+    # --- Phase 6 Commit θ: optimizer-quality benchmark ---
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        # Case G1: decision_rule + allocation exist; no optimization_quality.yaml
+        with open(os.path.join(d, "decision_rule.md"), "w") as f:
+            f.write(
+                "---\nrule_type: tree\n---\n"
+                "# Decision Rule\n"
+                "## Features\n- pfpr\n"
+                "## Rule\n1. PfPR > 0.25? -> PBO\n"
+                "## Validation\n- accuracy_vs_optimizer: 0.95\n"
+                "- exceptions_count: 5\n"
+            )
+        with open(os.path.join(d, "lga_allocation.csv"), "w") as f:
+            f.write("lga,package\nA,X\n")
+        vg1 = _check_optimization_quality(d)
+        ok(any(v["kind"] == "optimization_quality_missing" for v in vg1),
+           f"G1: decision_rule without optimization_quality.yaml should fire MEDIUM, "
+           f"got {vg1}")
+
+        # Case G2: yaml present, clean (small gap).
+        with open(os.path.join(d, "models", "optimization_quality.yaml"), "w") as f:
+            f.write(
+                "primary_method: greedy\n"
+                "primary_objective: 5400000\n"
+                "benchmark_methods:\n"
+                "  - method: ilp_pulp\n"
+                "    objective: 5450000\n"
+                "    runtime_sec: 300\n"
+            )
+        vg2 = _check_optimization_quality(d)
+        ok(not vg2,
+           f"G2: clean optimization_quality.yaml should not fire, got {vg2}")
+
+        # Case G3: gap > 10%.
+        with open(os.path.join(d, "models", "optimization_quality.yaml"), "w") as f:
+            f.write(
+                "primary_method: greedy\n"
+                "primary_objective: 4000000\n"
+                "benchmark_methods:\n"
+                "  - method: ilp_pulp\n"
+                "    objective: 5500000\n"
+            )
+        vg3 = _check_optimization_quality(d)
+        ok(any(v["kind"] == "optimization_quality_gap_too_large" for v in vg3),
+           f"G3: 27% gap should fire MEDIUM, got {vg3}")
+
+        # Case G4: yaml present but no benchmarks.
+        with open(os.path.join(d, "models", "optimization_quality.yaml"), "w") as f:
+            f.write(
+                "primary_method: greedy\n"
+                "primary_objective: 5400000\n"
+                "benchmark_methods: []\n"
+            )
+        vg4 = _check_optimization_quality(d)
+        ok(any(v["kind"] == "optimization_quality_no_benchmark"
+               and v["severity"] == "HIGH" for v in vg4),
+           f"G4: empty benchmarks should fire HIGH, got {vg4}")
+
+    # Case G5: no decision_rule and no allocation → check is silent.
+    with tempfile.TemporaryDirectory() as d:
+        vg5 = _check_optimization_quality(d)
+        ok(not vg5,
+           f"G5: no allocation = no optimization_quality requirement, got {vg5}")
 
     # --- Summary ---
     if failures:

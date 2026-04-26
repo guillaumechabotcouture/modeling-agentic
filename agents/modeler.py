@@ -476,6 +476,37 @@ Unidentified parameters used in policy outputs are a HIGH blocker.
 Resolve via informative priors, tying redundant parameters, or
 removing the parameter (fix at a default).
 
+### 4a. Optimizer-quality benchmark (Phase 6 Commit θ — when allocation is produced)
+
+If this run produces an allocation (decision_rule.md or
+*allocation*.csv), you MUST also produce
+`{run_dir}/models/optimization_quality.yaml` documenting how your
+primary optimizer compares to at least ONE alternative method.
+
+A greedy "X% improvement over uniform" claim is meaningless without a
+benchmark — greedy can produce 60% of the achievable improvement on
+problems with package interactions or budget cliffs. The
+`optimizer-method-selection` skill teaches when to use which optimizer
+and provides PuLP/SA code templates.
+
+Required schema:
+```yaml
+primary_method: greedy | ilp_pulp | simulated_annealing | random_restart_K
+primary_objective: <number>
+objective_name: cases_averted_per_year
+benchmark_methods:
+  - method: ilp_pulp
+    objective: <number>
+    runtime_sec: <number>
+    notes: ...
+gap_pct: <100*(best - primary)/best>
+```
+
+The validator emits MEDIUM `optimization_quality_missing` if the file
+is absent, HIGH `optimization_quality_no_benchmark` if benchmark_methods
+is empty, and MEDIUM `optimization_quality_gap_too_large` if gap_pct
+exceeds 10%. See `optimizer-method-selection` skill.
+
 ### 4. Decision rule — `{run_dir}/decision_rule.md` (when allocation is produced)
 
 If this run produces an allocation CSV (`*allocation*.csv`,
