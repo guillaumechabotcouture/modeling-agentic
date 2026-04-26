@@ -50,10 +50,19 @@ VALID_METHODS = {
     "greedy", "marginal_greedy", "ilp_pulp", "ilp_cbc", "ilp_gurobi",
     "simulated_annealing", "random_restart", "brute_force",
     "genetic_algorithm", "branch_and_bound",
+    # Reference baselines (not optimizers per se, but legitimate
+    # benchmarks): uniform allocation, proportional-to-population,
+    # status quo, no-allocation. Modelers often compare against these.
+    "uniform", "uniform_allocation", "proportional", "status_quo",
+    "current_allocation", "no_allocation", "baseline",
 }
-# Anything matching `random_restart_\d+` or `simulated_annealing_\w+` etc.
-# also passes; the prefix matches one of VALID_METHODS.
-VALID_PREFIXES = {"random_restart", "simulated_annealing", "ilp"}
+# Prefix-matched: anything starting with these. Includes "uniform_*"
+# (e.g., "uniform_llin80"), "random_restart_K", "simulated_annealing_T*",
+# "ilp_*" variants.
+VALID_PREFIXES = {
+    "random_restart", "simulated_annealing", "ilp",
+    "uniform", "proportional",
+}
 
 DEFAULT_GAP_THRESHOLD_PCT = 10.0  # MEDIUM blocker if exceeded
 
