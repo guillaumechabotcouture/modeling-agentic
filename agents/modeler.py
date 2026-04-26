@@ -476,6 +476,40 @@ Unidentified parameters used in policy outputs are a HIGH blocker.
 Resolve via informative priors, tying redundant parameters, or
 removing the parameter (fix at a default).
 
+### 4c. Allocation cross-validation (Phase 6 Commit κ — when allocation is produced)
+
+When this run produces an allocation, the allocation rule must be
+cross-validated under spatial holdout. This is DIFFERENT from
+calibration CV (LOO via compare_models.py): allocation CV asks
+whether the OPTIMIZER's recommended package for unit X would change
+if you had calibrated on the other n-1 units instead.
+
+Required artifact: `{run_dir}/models/allocation_robustness.yaml`:
+```yaml
+holdout_method: leave-one-archetype-out
+n_folds: 22
+metrics:
+  rank_correlation_worst_fold: 0.78
+  cases_averted_gap_pct_worst_fold: 8.5
+  rule_classification_concordance_pct_worst_fold: 88
+verdict: ROBUST  # ROBUST | FRAGILE | UNSTABLE; recomputed by validator
+notes: |
+  Per-fold details, holdout strategy rationale.
+```
+
+Verdict thresholds (worst-fold):
+- ROBUST: rank_corr ≥ 0.70 AND cases_gap ≤ 15% AND rule_concordance ≥ 80%
+- FRAGILE: middle band on any metric
+- UNSTABLE: rank_corr < 0.40 OR cases_gap > 30% OR rule_concordance < 60%
+
+The validator emits MEDIUM `allocation_robustness_missing` if absent,
+HIGH `allocation_unstable` if UNSTABLE (rebuild model with
+regularization or restrict to in-sample units), and MEDIUM
+`allocation_fragile` if FRAGILE (scope-declare in §Limitations).
+
+See the `allocation-cross-validation` skill for the full holdout
+algorithm, choice of holdout strategy, and worked example.
+
 ### 4b. DALY-weighted analysis (Phase 6 Commit ι — when allocation is produced)
 
 When this run produces an allocation/decision_rule, the report MUST

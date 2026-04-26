@@ -1091,7 +1091,111 @@ def _check_rigor_artifacts(run_dir: str) -> list[dict]:
     # Phase 6 Commit ι: DALY-first analysis when allocation produced.
     violations.extend(_check_daly_when_allocation(run_dir))
 
+    # Phase 6 Commit κ: allocation cross-validation.
+    violations.extend(_check_allocation_robustness(run_dir))
+
     return violations
+
+
+def _check_allocation_robustness(run_dir: str) -> list[dict]:
+    """Phase 6 Commit κ: allocation rule must be cross-validated under
+    spatial holdout. The modeler runs k-fold leave-one-spatial-unit-out
+    re-optimization themselves and writes models/allocation_robustness.yaml.
+
+    Emits:
+      allocation_robustness_missing  MEDIUM — file absent
+      allocation_robustness_malformed HIGH — schema violations
+      allocation_unstable             HIGH — worst-fold metrics fail
+                                              ROBUST and FRAGILE bands
+      allocation_fragile              MEDIUM — middle-band, scope-declare
+    """
+    decision_rule = os.path.join(run_dir, "decision_rule.md")
+    allocs = _find_allocation_csvs(run_dir)
+    if not (os.path.exists(decision_rule) or allocs):
+        return []
+
+    yaml_path = os.path.join(run_dir, "models", "allocation_robustness.yaml")
+    if not os.path.exists(yaml_path):
+        return [{
+            "kind": "allocation_robustness_missing",
+            "severity": "MEDIUM",
+            "stage": "OPTIMIZATION",
+            "claim": (
+                "Allocation produced but models/allocation_robustness.yaml "
+                "is absent. The allocation rule must be cross-validated: "
+                "hold out k spatial units (e.g., leave-one-archetype-out "
+                "or 5-fold-by-state), re-run the optimizer on the "
+                "remaining n-k, and measure how well the rule generalizes "
+                "to the held-out units. A 22-archetype calibration "
+                "achieving 7.8pp RMSE in-sample says nothing about "
+                "whether the optimizer's allocation rule overfits "
+                "specific archetype EIRs. See the "
+                "allocation-cross-validation skill."
+            ),
+        }]
+
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "allocation_robustness",
+            os.path.join(os.path.dirname(__file__), "allocation_robustness.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    except Exception as e:
+        return [{
+            "kind": "allocation_robustness_malformed",
+            "severity": "HIGH",
+            "stage": "OPTIMIZATION",
+            "claim": (f"Could not load scripts/allocation_robustness.py: {e}"),
+        }]
+
+    result = mod.validate_allocation_robustness(yaml_path)
+    out = []
+    if result["verdict"] == "MALFORMED":
+        out.append({
+            "kind": "allocation_robustness_malformed",
+            "severity": "HIGH",
+            "stage": "OPTIMIZATION",
+            "claim": (f"models/allocation_robustness.yaml is malformed: "
+                      f"{'; '.join(result.get('errors') or [])}"),
+        })
+    elif result["verdict"] == "UNSTABLE":
+        out.append({
+            "kind": "allocation_unstable",
+            "severity": "HIGH",
+            "stage": "OPTIMIZATION",
+            "claim": (
+                f"Allocation cross-validation verdict: UNSTABLE. "
+                f"Worst-fold metrics fail even the FRAGILE band: rank "
+                f"correlation < 0.40 OR cases-averted gap > 30% OR rule "
+                f"classification concordance < 60%. The optimizer's "
+                f"allocation does NOT generalize to held-out spatial "
+                f"units — applying this rule to LGAs/states outside the "
+                f"calibration set is unjustified. Either rebuild the "
+                f"model with regularization / pooling / spatial structure "
+                f"to improve generalization, or scope-declare the "
+                f"recommendation as applicable only to the in-sample "
+                f"22 archetypes. Metrics: {result.get('metrics')}"
+            ),
+        })
+    elif result["verdict"] == "FRAGILE":
+        out.append({
+            "kind": "allocation_fragile",
+            "severity": "MEDIUM",
+            "stage": "OPTIMIZATION",
+            "claim": (
+                f"Allocation cross-validation verdict: FRAGILE. "
+                f"Worst-fold metrics fall in the middle band: rank "
+                f"correlation 0.40-0.70 OR cases-averted gap 15-30% OR "
+                f"rule classification concordance 60-80%. The allocation "
+                f"is plausibly generalizable but with substantial "
+                f"per-fold variability. Add a §Limitations paragraph "
+                f"quantifying the worst-fold gap and identifying which "
+                f"types of held-out units are hardest to predict. "
+                f"Metrics: {result.get('metrics')}"
+            ),
+        })
+    return out
 
 
 _DALY_MENTION_RE = re.compile(
@@ -2466,6 +2570,70 @@ def _run_self_test() -> int:
             f.write("lga,package\nA,X\n")
         vh5 = _check_daly_when_allocation(d)
         ok(not vh5, f"H5: pre-writer (no report.md) should be silent, got {vh5}")
+
+    # --- Phase 6 Commit κ: allocation cross-validation ---
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        # Setup: allocation produced.
+        with open(os.path.join(d, "decision_rule.md"), "w") as f:
+            f.write("# DR\n")
+        with open(os.path.join(d, "lga_allocation.csv"), "w") as f:
+            f.write("lga,package\nA,X\n")
+
+        # Case I1: no robustness file → MEDIUM missing.
+        vi1 = _check_allocation_robustness(d)
+        ok(any(v["kind"] == "allocation_robustness_missing" for v in vi1),
+           f"I1: missing robustness file should fire MEDIUM, got {vi1}")
+
+        # Case I2: ROBUST verdict → no fire.
+        with open(os.path.join(d, "models", "allocation_robustness.yaml"), "w") as f:
+            f.write(
+                "holdout_method: leave-one-archetype-out\n"
+                "n_folds: 22\n"
+                "metrics:\n"
+                "  rank_correlation_worst_fold: 0.85\n"
+                "  cases_averted_gap_pct_worst_fold: 5\n"
+                "  rule_classification_concordance_pct_worst_fold: 92\n"
+                "verdict: ROBUST\n"
+            )
+        vi2 = _check_allocation_robustness(d)
+        ok(not vi2, f"I2: ROBUST verdict should not fire, got {vi2}")
+
+        # Case I3: UNSTABLE → HIGH.
+        with open(os.path.join(d, "models", "allocation_robustness.yaml"), "w") as f:
+            f.write(
+                "holdout_method: leave-one-archetype-out\n"
+                "n_folds: 22\n"
+                "metrics:\n"
+                "  rank_correlation_worst_fold: 0.30\n"
+                "  cases_averted_gap_pct_worst_fold: 12\n"
+                "  rule_classification_concordance_pct_worst_fold: 85\n"
+            )
+        vi3 = _check_allocation_robustness(d)
+        ok(any(v["kind"] == "allocation_unstable" and v["severity"] == "HIGH"
+               for v in vi3),
+           f"I3: UNSTABLE verdict should fire HIGH, got {vi3}")
+
+        # Case I4: FRAGILE → MEDIUM.
+        with open(os.path.join(d, "models", "allocation_robustness.yaml"), "w") as f:
+            f.write(
+                "holdout_method: leave-one-archetype-out\n"
+                "n_folds: 22\n"
+                "metrics:\n"
+                "  rank_correlation_worst_fold: 0.55\n"
+                "  cases_averted_gap_pct_worst_fold: 20\n"
+                "  rule_classification_concordance_pct_worst_fold: 70\n"
+            )
+        vi4 = _check_allocation_robustness(d)
+        ok(any(v["kind"] == "allocation_fragile" and v["severity"] == "MEDIUM"
+               for v in vi4),
+           f"I4: FRAGILE verdict should fire MEDIUM, got {vi4}")
+
+    # Case I5: no allocation → check is silent.
+    with tempfile.TemporaryDirectory() as d:
+        vi5 = _check_allocation_robustness(d)
+        ok(not vi5,
+           f"I5: no allocation = no robustness requirement, got {vi5}")
 
     # --- Summary ---
     if failures:
