@@ -58,10 +58,11 @@ VALID_METHODS = {
 }
 # Prefix-matched: anything starting with these. Includes "uniform_*"
 # (e.g., "uniform_llin80"), "random_restart_K", "simulated_annealing_T*",
-# "ilp_*" variants.
+# "ilp_*", "greedy_*" (e.g., "greedy_two_pass", "greedy_single_pass"),
+# and "ga_*" (genetic algorithm variants).
 VALID_PREFIXES = {
     "random_restart", "simulated_annealing", "ilp",
-    "uniform", "proportional",
+    "uniform", "proportional", "greedy", "genetic", "ga_",
 }
 
 DEFAULT_GAP_THRESHOLD_PCT = 10.0  # MEDIUM blocker if exceeded
