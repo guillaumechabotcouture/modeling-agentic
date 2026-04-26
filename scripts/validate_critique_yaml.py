@@ -1088,7 +1088,121 @@ def _check_rigor_artifacts(run_dir: str) -> list[dict]:
     # Phase 6 Commit θ: optimizer-quality benchmark.
     violations.extend(_check_optimization_quality(run_dir))
 
+    # Phase 6 Commit ι: DALY-first analysis when allocation produced.
+    violations.extend(_check_daly_when_allocation(run_dir))
+
     return violations
+
+
+_DALY_MENTION_RE = re.compile(
+    r"\b(?:DALY|DALYs|disability[-\s]adjusted\s+life[-\s]year"
+    r"|life[-\s]year[s]?\s+lost|YLL|YLD)\b",
+    re.IGNORECASE,
+)
+# Headers that signal "this is a Limitations / Scope acknowledgment
+# section, not the main analysis body". We strip these from the text
+# before checking for DALY engagement so a single throwaway DALY
+# acknowledgment in Limitations doesn't satisfy the gate.
+_LIMITATIONS_HEADER_RE = re.compile(
+    r"^#{1,4}\s+\d*\.?\s*"
+    r"(?:Limitations?|Scope\s+Declaration|Caveats?|"
+    r"Unresolved\s+(?:HIGH|Blockers?)|Known\s+Issues?)"
+    r"[^\n]*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def _strip_limitations_and_scope(text: str) -> str:
+    """Remove §Limitations / §Scope Declaration / §Caveats sections
+    so DALY mentions in those sections don't satisfy the
+    daly_analysis_missing check. Returns the text with each such
+    section sliced from header to next same-level (or higher)
+    section header. Linear scan."""
+    out_parts = []
+    last_end = 0
+    headers = list(_LIMITATIONS_HEADER_RE.finditer(text))
+    for m in headers:
+        # Determine the level (count of '#' at the header start).
+        hdr_text = m.group(0)
+        level = len(hdr_text) - len(hdr_text.lstrip("#"))
+        # Find the next header at this level or shallower (more
+        # important).
+        next_header_re = re.compile(
+            rf"^#{{1,{level}}}\s+",
+            re.MULTILINE,
+        )
+        section_end = len(text)
+        for next_m in next_header_re.finditer(text, m.end()):
+            section_end = next_m.start()
+            break
+        out_parts.append(text[last_end:m.start()])
+        last_end = section_end
+    out_parts.append(text[last_end:])
+    return "".join(out_parts)
+
+
+def _check_daly_when_allocation(run_dir: str) -> list[dict]:
+    """Phase 6 Commit ι: when a model produces an allocation, the
+    report must mention DALYs (or explicitly justify their absence).
+
+    Cases-averted alone treats a 6-month-old's averted infection
+    identically to an adult's, dramatically under-weighting U5-targeted
+    interventions like SMC. GF / GBD / WHO use DALY-denominated
+    cost-effectiveness as the standard. A Global Fund supplementary
+    analysis without DALYs gets sent back.
+
+    Emits:
+      daly_analysis_missing MEDIUM — decision_rule.md or allocation
+                                     CSV exists, but report.md has no
+                                     DALY/YLL/YLD/disability-adjusted
+                                     mentions.
+    """
+    decision_rule = os.path.join(run_dir, "decision_rule.md")
+    allocs = _find_allocation_csvs(run_dir)
+    if not (os.path.exists(decision_rule) or allocs):
+        return []  # No allocation produced; no requirement.
+
+    report = os.path.join(run_dir, "report.md")
+    if not os.path.exists(report):
+        # Report not yet written; check will run again post-writer.
+        return []
+
+    try:
+        with open(report) as f:
+            text = f.read()
+    except (OSError, UnicodeDecodeError):
+        return []
+
+    # Strip §Limitations and §Scope-declaration sections — a single
+    # "we didn't compute DALYs" throwaway in Limitations shouldn't
+    # satisfy the check; the analysis must engage with DALYs in
+    # Methods / Results / Discussion / Cost-Effectiveness.
+    text_outside_limitations = _strip_limitations_and_scope(text)
+    if _DALY_MENTION_RE.search(text_outside_limitations):
+        return []  # DALYs engaged with in the analysis body.
+
+    return [{
+        "kind": "daly_analysis_missing",
+        "severity": "MEDIUM",
+        "stage": "REPORT",
+        "claim": (
+            "Allocation/decision_rule produced but report.md does not "
+            "mention DALYs (or YLL/YLD/disability-adjusted life-years). "
+            "Cases-averted alone treats a 6-month-old's averted "
+            "infection identically to an adult's, structurally biasing "
+            "the recommendation toward all-age interventions over "
+            "child-targeted ones (SMC, IPTp, paediatric vaccines). "
+            "Global Fund / GBD / WHO benchmarks are DALY-denominated; "
+            "without DALY-averted figures, the report cannot be "
+            "compared to published cost-effectiveness thresholds. "
+            "Add either (1) a DALY-averted column alongside "
+            "cases-averted in the primary table, (2) a §Cost-"
+            "Effectiveness section with $/DALY estimates, or (3) a "
+            "Methods/Limitations paragraph justifying DALY irrelevance "
+            "for this specific analysis. See the daly-weighted-analysis "
+            "skill for disease-specific anchor tables."
+        ),
+    }]
 
 
 def _check_optimization_quality(run_dir: str) -> list[dict]:
@@ -2277,6 +2391,81 @@ def _run_self_test() -> int:
         vg5 = _check_optimization_quality(d)
         ok(not vg5,
            f"G5: no allocation = no optimization_quality requirement, got {vg5}")
+
+    # --- Phase 6 Commit ι: DALY-first analysis ---
+    with tempfile.TemporaryDirectory() as d:
+        # Case H1: allocation + report.md without DALY mentions → fires.
+        with open(os.path.join(d, "decision_rule.md"), "w") as f:
+            f.write("---\nrule_type: tree\n---\n# DR\n")
+        with open(os.path.join(d, "lga_allocation.csv"), "w") as f:
+            f.write("lga,package\nA,X\n")
+        with open(os.path.join(d, "report.md"), "w") as f:
+            f.write(
+                "# Report\n\n"
+                "## Results\n"
+                "Cases averted: 5.41M. Cost per case: $59.\n"
+            )
+        vh1 = _check_daly_when_allocation(d)
+        ok(any(v["kind"] == "daly_analysis_missing" for v in vh1),
+           f"H1: report without DALY mentions should fire MEDIUM, got {vh1}")
+
+        # Case H2: report includes DALY-averted column → no fire.
+        with open(os.path.join(d, "report.md"), "w") as f:
+            f.write(
+                "# Report\n\n"
+                "## Results\n"
+                "Cases averted: 5.41M. DALYs averted: 71K.\n"
+                "Cost per DALY: $4,500.\n"
+            )
+        vh2 = _check_daly_when_allocation(d)
+        ok(not vh2, f"H2: DALY mention present, should not fire, got {vh2}")
+
+        # Case H3: DALY mention ONLY in §Limitations (a throwaway
+        # acknowledgment) → SHOULD fire, because Phase 6 ι requires
+        # actual engagement in the analysis body, not just a Limitations
+        # bullet saying "we didn't do this."
+        with open(os.path.join(d, "report.md"), "w") as f:
+            f.write(
+                "# Report\n\n"
+                "## Results\n"
+                "Cases averted: 5.41M.\n"
+                "## Limitations\n"
+                "We did not compute disability-adjusted life-years. "
+                "Future work should include YLL estimates per package.\n"
+            )
+        vh3 = _check_daly_when_allocation(d)
+        ok(any(v["kind"] == "daly_analysis_missing" for v in vh3),
+           f"H3: DALY mention only in §Limitations is a throwaway, "
+           f"should still fire, got {vh3}")
+
+        # Case H3b: DALY mention in §Methods/§Results → no fire.
+        with open(os.path.join(d, "report.md"), "w") as f:
+            f.write(
+                "# Report\n\n"
+                "## Results\n"
+                "Cases averted: 5.41M. DALYs averted: 71K.\n"
+                "## Limitations\n"
+                "Foo bar.\n"
+            )
+        vh3b = _check_daly_when_allocation(d)
+        ok(not vh3b, f"H3b: DALY in §Results outside Limitations should "
+           f"satisfy check, got {vh3b}")
+
+    # Case H4: no allocation → silent.
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "report.md"), "w") as f:
+            f.write("# Report\n\nNo allocation produced.\n")
+        vh4 = _check_daly_when_allocation(d)
+        ok(not vh4, f"H4: no allocation = no requirement, got {vh4}")
+
+    # Case H5: allocation + no report.md yet → silent (writer hasn't run).
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "decision_rule.md"), "w") as f:
+            f.write("# DR\n")
+        with open(os.path.join(d, "lga_allocation.csv"), "w") as f:
+            f.write("lga,package\nA,X\n")
+        vh5 = _check_daly_when_allocation(d)
+        ok(not vh5, f"H5: pre-writer (no report.md) should be silent, got {vh5}")
 
     # --- Summary ---
     if failures:

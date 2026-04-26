@@ -476,6 +476,40 @@ Unidentified parameters used in policy outputs are a HIGH blocker.
 Resolve via informative priors, tying redundant parameters, or
 removing the parameter (fix at a default).
 
+### 4b. DALY-weighted analysis (Phase 6 Commit ι — when allocation is produced)
+
+When this run produces an allocation/decision_rule, the report MUST
+include DALY-averted figures alongside cases-averted, OR explicitly
+justify their absence in §Methods (not §Limitations).
+
+Cases-averted alone treats a 6-month-old's averted infection
+identically to an adult's, structurally biasing the recommendation
+toward all-age interventions over child-targeted ones (SMC, IPTp,
+paediatric vaccines). Global Fund / GBD / WHO benchmarks are
+DALY-denominated; without DALY-averted figures, the report cannot
+be compared to published cost-effectiveness thresholds.
+
+Required output: at least ONE of:
+
+1. **DALY-averted column alongside cases-averted** in the primary
+   results table:
+   ```
+   | Package | LGAs | Cases Averted | DALYs Averted | $/Case | $/DALY |
+   ```
+
+2. **A separate §Cost-Effectiveness section** with $/DALY estimates.
+
+3. **A §Methods justification paragraph** explaining why DALYs are
+   not relevant for THIS analysis (must address: are interventions
+   age-targeted? do packages differ in mortality risk? is the
+   audience GF/GBD/WHO?). A throwaway in §Limitations does NOT count.
+
+Disease-specific DALY anchor tables (malaria, TB, HIV, measles)
+are in the `daly-weighted-analysis` skill.
+
+The validator emits MEDIUM `daly_analysis_missing` if no DALY
+mention exists outside §Limitations / §Scope sections.
+
 ### 4a. Optimizer-quality benchmark (Phase 6 Commit θ — when allocation is produced)
 
 If this run produces an allocation (decision_rule.md or
