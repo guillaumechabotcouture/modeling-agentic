@@ -63,7 +63,12 @@ def parse_attached_skills(agents_init_path: str) -> set[str]:
         # Strip line comments before extracting names — comments could
         # contain hyphenated phrases that look like skill names.
         body = re.sub(r"#[^\n]*", "", body)
-        for name in re.findall(r'"([a-z][a-z0-9-]+)"', body):
+        # The character class includes `_` because at least one real
+        # skill (`basic_epi_modeling`) is snake-cased. Without the
+        # underscore, the regex silently dropped that attachment and
+        # would also fail to flag a misspelling like
+        # `basic_epi_modelling` as a phantom (review fix #1).
+        for name in re.findall(r'"([a-z][a-z0-9_-]+)"', body):
             attached.add(name)
     return attached
 
@@ -182,6 +187,26 @@ def _run_self_test() -> int:
         r6 = validate(d)
         ok(r6["phantoms"] == ["halffinished"],
            f"T6: dir without SKILL.md should be phantom when attached, got {r6}")
+
+        # T7 (review fix #1): snake_case skill names must be parsed and
+        # cross-checked. A real skill `basic_epi_modeling` exists and is
+        # attached in agents/__init__.py; the original regex dropped it
+        # because the character class lacked `_`. This case verifies the
+        # fix by registering both a present snake_case skill (no phantom)
+        # and a misspelled one (phantom).
+        os.makedirs(os.path.join(d, ".claude", "skills", "basic_epi_modeling"))
+        with open(os.path.join(d, ".claude", "skills",
+                               "basic_epi_modeling", "SKILL.md"), "w") as f:
+            f.write("# basic_epi_modeling\n")
+        with open(os.path.join(d, "agents", "__init__.py"), "w") as f:
+            f.write('skills=["basic_epi_modeling", "basic_epi_modelling"]\n')
+        r7 = validate(d)
+        ok("basic_epi_modeling" in r7["attached"],
+           f"T7: snake_case skill should be parsed as attached, got "
+           f"{r7['attached']}")
+        ok(r7["phantoms"] == ["basic_epi_modelling"],
+           f"T7: snake_case misspelling should be flagged as phantom, "
+           f"got {r7['phantoms']}")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)

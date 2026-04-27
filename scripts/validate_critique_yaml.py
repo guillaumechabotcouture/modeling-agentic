@@ -4093,7 +4093,16 @@ def main() -> int:
         )
 
     if args.rigor_artifacts:
-        rigor_violations = _check_rigor_artifacts(args.run_dir)
+        # Phase 10 review fix #3: thread args.current_round through to
+        # _check_rigor_artifacts so the Phase 10 ψ allocation-gate
+        # coordinator can apply round-aware MEDIUM consolidation. The
+        # lead already passes --current-round on every invocation
+        # (see agents/__init__.py around line 392); previously this
+        # call site dropped it on the floor and the new ψ behavior
+        # was unreachable from production.
+        rigor_violations = _check_rigor_artifacts(
+            args.run_dir, round_n=args.current_round,
+        )
         if rigor_violations:
             decision = _incorporate_rigor_violations(
                 decision, rigor_violations,

@@ -395,7 +395,8 @@ model.run("Simulation")
 
 # ALWAYS verify after running. Define verify_model_health() inline in
 # your models/ directory implementing the 5 sanity checks from §1.3.
-from .verification_checks import verify_model_health
+# (Add models/ to sys.path; this is an absolute import, not relative.)
+from verification_checks import verify_model_health
 verify_model_health(model)
 ```
 
