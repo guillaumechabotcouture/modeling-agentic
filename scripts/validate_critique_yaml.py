@@ -1097,7 +1097,132 @@ def _check_rigor_artifacts(run_dir: str) -> list[dict]:
     # Phase 7 Commit λ: STAGE 8.5 WRITER_QA pass.
     violations.extend(_check_writer_qa(run_dir))
 
+    # Phase 7 Commit μ: plan-promised criteria enforcement.
+    violations.extend(_check_plan_criteria(run_dir))
+
     return violations
+
+
+def _check_plan_criteria(run_dir: str) -> list[dict]:
+    """Phase 7 Commit μ: when planner emits success_criteria.yaml,
+    each tier's criteria are mechanically evaluated against the named
+    artifacts. Hard blocker failures are HIGH; minimum bar failures
+    are MEDIUM (Phase 5 ζ stuck-blocker logic escalates after 2+
+    attempts).
+
+    Emits:
+      plan_criteria_missing       MEDIUM — plan.md exists but no
+                                            success_criteria.yaml (legacy
+                                            runs OK; new runs should
+                                            produce it)
+      plan_hard_blocker_failed    HIGH    — hard blocker failed (per id)
+      plan_minimum_bar_failed     MEDIUM  — minimum bar failed (per id)
+      plan_criterion_not_tested   MEDIUM  — criterion's artifact/field
+                                            wasn't found
+    """
+    plan = os.path.join(run_dir, "plan.md")
+    if not os.path.exists(plan):
+        return []
+
+    yaml_path = os.path.join(run_dir, "success_criteria.yaml")
+    if not os.path.exists(yaml_path):
+        return [{
+            "kind": "plan_criteria_missing",
+            "severity": "MEDIUM",
+            "stage": "PLAN_CRITERIA",
+            "claim": (
+                "plan.md exists but success_criteria.yaml is absent. "
+                "The planner must produce a structured "
+                "success_criteria.yaml alongside plan.md so each "
+                "minimum-bar / hard-blocker criterion can be "
+                "mechanically evaluated. Without it, plan-promised "
+                "criteria silently slide into §Limitations bullets "
+                "(see 1935 malaria run, where 'malariasimulation "
+                "cross-validation' was promised but never enforced). "
+                "See planner prompt and scripts/plan_criteria.py "
+                "schema."
+            ),
+        }]
+
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "plan_criteria",
+            os.path.join(os.path.dirname(__file__), "plan_criteria.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    except Exception as e:
+        return [{
+            "kind": "plan_criteria_malformed",
+            "severity": "HIGH",
+            "stage": "PLAN_CRITERIA",
+            "claim": (f"Could not load scripts/plan_criteria.py: {e}"),
+        }]
+
+    result = mod.evaluate_plan_criteria(run_dir)
+
+    if result.get("verdict") == "MALFORMED":
+        return [{
+            "kind": "plan_criteria_malformed",
+            "severity": "HIGH",
+            "stage": "PLAN_CRITERIA",
+            "claim": (f"success_criteria.yaml is malformed: "
+                      f"{'; '.join(result.get('errors') or [])}"),
+        }]
+
+    if result.get("verdict") != "OK":
+        return []
+
+    out: list[dict] = []
+    for entry in result.get("hard_blockers") or []:
+        if entry["status"] == "FAIL":
+            out.append({
+                "kind": "plan_hard_blocker_failed",
+                "severity": "HIGH",
+                "stage": "PLAN_CRITERIA",
+                "claim": (
+                    f"Hard blocker {entry['id']} FAILED: "
+                    f"{entry['criterion']} ({entry['evidence']})"
+                ),
+            })
+        elif entry["status"] == "NOT_TESTED":
+            out.append({
+                "kind": "plan_criterion_not_tested",
+                "severity": "MEDIUM",
+                "stage": "PLAN_CRITERIA",
+                "claim": (
+                    f"Hard blocker {entry['id']} NOT_TESTED: "
+                    f"{entry['criterion']} ({entry['evidence']}). "
+                    f"The plan promised this criterion; the modeler "
+                    f"must produce the artifact + field, or the "
+                    f"planner must remove the promise."
+                ),
+            })
+    for entry in result.get("minimum_bar") or []:
+        if entry["status"] == "FAIL":
+            out.append({
+                "kind": "plan_minimum_bar_failed",
+                "severity": "MEDIUM",
+                "stage": "PLAN_CRITERIA",
+                "claim": (
+                    f"Minimum bar {entry['id']} FAILED: "
+                    f"{entry['criterion']} ({entry['evidence']})"
+                ),
+            })
+        elif entry["status"] == "NOT_TESTED":
+            out.append({
+                "kind": "plan_criterion_not_tested",
+                "severity": "MEDIUM",
+                "stage": "PLAN_CRITERIA",
+                "claim": (
+                    f"Minimum bar {entry['id']} NOT_TESTED: "
+                    f"{entry['criterion']} ({entry['evidence']}). "
+                    f"Modeler must populate the field in the artifact "
+                    f"or scope-declare why the criterion is "
+                    f"unachievable for this run."
+                ),
+            })
+    return out
 
 
 def _check_writer_qa(run_dir: str) -> list[dict]:
@@ -2740,6 +2865,75 @@ def _run_self_test() -> int:
         vj5 = _check_writer_qa(d)
         ok(not vj5,
            f"J5: pre-writer (no report.md) should be silent, got {vj5}")
+
+    # --- Phase 7 Commit μ: plan-criterion enforcement ---
+    with tempfile.TemporaryDirectory() as d:
+        # Case K1: plan.md exists but no success_criteria.yaml → MEDIUM
+        with open(os.path.join(d, "plan.md"), "w") as f:
+            f.write("# Plan\n\nGoals.\n")
+        vk1 = _check_plan_criteria(d)
+        ok(any(v["kind"] == "plan_criteria_missing" for v in vk1),
+           f"K1: plan.md without success_criteria.yaml should fire MEDIUM, "
+           f"got {vk1}")
+
+        # Case K2: hard_blocker FAILED → HIGH
+        with open(os.path.join(d, "success_criteria.yaml"), "w") as f:
+            f.write(
+                "hard_blockers:\n"
+                "  - id: HB-001\n"
+                "    criterion: \"PfPR RMSE under threshold\"\n"
+                "    metric: zone_pfpr_rmse_pp\n"
+                "    threshold: 3.0\n"
+                "    operator: \"<=\"\n"
+                "    artifact: model_comparison_formal.yaml\n"
+                "    artifact_field: zone_pfpr_rmse_pp\n"
+            )
+        with open(os.path.join(d, "model_comparison_formal.yaml"), "w") as f:
+            f.write("zone_pfpr_rmse_pp: 5.0\n")  # > 3.0
+        vk2 = _check_plan_criteria(d)
+        ok(any(v["kind"] == "plan_hard_blocker_failed"
+               and v["severity"] == "HIGH" for v in vk2),
+           f"K2: failed hard blocker should fire HIGH, got {vk2}")
+
+        # Case K3: minimum_bar NOT_TESTED → MEDIUM
+        with open(os.path.join(d, "success_criteria.yaml"), "w") as f:
+            f.write(
+                "minimum_bar:\n"
+                "  - id: MB-001\n"
+                "    criterion: \"malariasimulation comparison\"\n"
+                "    metric: malariasimulation_comparison_done\n"
+                "    threshold: 1\n"
+                "    operator: \"==\"\n"
+                "    artifact: model_comparison_formal.yaml\n"
+                "    artifact_field: malariasimulation_comparison_done\n"
+            )
+        with open(os.path.join(d, "model_comparison_formal.yaml"), "w") as f:
+            f.write("zone_pfpr_rmse_pp: 5.0\n")  # field missing
+        vk3 = _check_plan_criteria(d)
+        ok(any(v["kind"] == "plan_criterion_not_tested" for v in vk3),
+           f"K3: NOT_TESTED criterion should fire MEDIUM, got {vk3}")
+
+        # Case K4: hard_blocker PASS → no fire
+        with open(os.path.join(d, "success_criteria.yaml"), "w") as f:
+            f.write(
+                "hard_blockers:\n"
+                "  - id: HB-001\n"
+                "    criterion: \"PfPR RMSE under threshold\"\n"
+                "    metric: zone_pfpr_rmse_pp\n"
+                "    threshold: 5.0\n"
+                "    operator: \"<=\"\n"
+                "    artifact: model_comparison_formal.yaml\n"
+                "    artifact_field: zone_pfpr_rmse_pp\n"
+            )
+        vk4 = _check_plan_criteria(d)
+        ok(not vk4,
+           f"K4: PASS hard blocker should not fire, got {vk4}")
+
+    # Case K5: no plan.md → silent (pre-planner runs).
+    with tempfile.TemporaryDirectory() as d:
+        vk5 = _check_plan_criteria(d)
+        ok(not vk5,
+           f"K5: pre-planner (no plan.md) should be silent, got {vk5}")
 
     # --- Summary ---
     if failures:

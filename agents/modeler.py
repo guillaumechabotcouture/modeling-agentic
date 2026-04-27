@@ -575,6 +575,39 @@ is absent, HIGH `optimization_quality_no_benchmark` if benchmark_methods
 is empty, and MEDIUM `optimization_quality_gap_too_large` if gap_pct
 exceeds 10%. See `optimizer-method-selection` skill.
 
+### 4d. Plan-promised criteria (Phase 7 Commit μ)
+
+If `{run_dir}/success_criteria.yaml` exists (planner emits it
+alongside plan.md), you MUST populate the artifacts named in each
+criterion's `artifact` and `artifact_field` so the validator can
+evaluate them. For example, if a hard_blocker says:
+
+```yaml
+- id: HB-001
+  metric: zone_pfpr_rmse_pp
+  threshold: 3.0
+  operator: "<="
+  artifact: model_comparison_formal.yaml
+  artifact_field: zone_pfpr_rmse_pp
+```
+
+Your `model_comparison_formal.yaml` MUST include a top-level field
+`zone_pfpr_rmse_pp: <value>`. Same for minimum_bar criteria —
+populate every `artifact_field` listed.
+
+Special cases:
+- `malariasimulation_comparison_done`: set to 1 if you ran the
+  comparison, 0 if not. The 0-value will fire `plan_minimum_bar_failed`
+  (correct behavior — you promised it; either deliver or escalate).
+- Dotted fields like `metrics.rank_correlation_worst_fold` mean nested
+  yaml; populate `metrics: { rank_correlation_worst_fold: 0.85 }`.
+
+The validator emits HIGH `plan_hard_blocker_failed` per failed hard
+blocker, MEDIUM `plan_minimum_bar_failed` per failed minimum_bar,
+and MEDIUM `plan_criterion_not_tested` per criterion whose artifact
+field is missing. Do NOT silently drop a promised criterion — either
+populate the field or scope-declare why it's unachievable.
+
 ### 4. Decision rule — `{run_dir}/decision_rule.md` (when allocation is produced)
 
 If this run produces an allocation CSV (`*allocation*.csv`,

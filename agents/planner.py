@@ -152,6 +152,72 @@ After the literature review, also produce:
 
 8. **Success Criteria** with hard blockers, minimum bar, targets.
 
+   You MUST also emit a STRUCTURED `{run_dir}/success_criteria.yaml`
+   alongside plan.md (Phase 7 Commit μ). The yaml is the
+   machine-readable version of the prose Success Criteria section
+   and is mechanically evaluated at STAGE 7 by
+   `scripts/plan_criteria.py`. Schema:
+
+   ```yaml
+   hard_blockers:
+     - id: HB-001
+       criterion: "Model reproduces NMIS 2021 zone PfPR within ±3 pp"
+       metric: zone_pfpr_rmse_pp
+       threshold: 3.0
+       operator: "<="
+       artifact: model_comparison_formal.yaml
+       artifact_field: zone_pfpr_rmse_pp
+
+   minimum_bar:
+     - id: MB-001
+       criterion: "Cross-validation against malariasimulation R package"
+       metric: malariasimulation_comparison_done
+       threshold: 1
+       operator: "=="
+       artifact: model_comparison_formal.yaml
+       artifact_field: malariasimulation_comparison_done
+
+     - id: MB-002
+       criterion: "Allocation cross-validation worst-fold rank correlation"
+       metric: rank_corr_worst
+       threshold: 0.7
+       operator: ">="
+       artifact: allocation_robustness.yaml
+       artifact_field: "metrics.rank_correlation_worst_fold"
+
+   targets:
+     - id: T-001
+       criterion: "Optimization gap_pct under 5%"
+       metric: gap_pct
+       threshold: 5.0
+       operator: "<="
+       artifact: optimization_quality.yaml
+       artifact_field: gap_pct
+   ```
+
+   Each criterion MUST specify:
+   - `id` (HB-NNN, MB-NNN, T-NNN)
+   - `criterion` (human-readable)
+   - `metric` (snake_case label)
+   - `threshold` (numeric or boolean)
+   - `operator` (one of `<=`, `>=`, `<`, `>`, `==`, `!=`)
+   - `artifact` (filename relative to run_dir, may be in models/ or
+     results/ subdirs)
+   - `artifact_field` (dot-syntax path inside the yaml file)
+
+   The validator emits HIGH `plan_hard_blocker_failed` for failed
+   hard_blockers, MEDIUM `plan_minimum_bar_failed` for failed
+   minimum_bar entries, and MEDIUM `plan_criterion_not_tested` when
+   the modeler didn't populate the artifact field. This means
+   hard_blockers ARE actually blocking (force RETHINK), and
+   minimum_bar criteria become HIGH after Phase 5 ζ stuck-blocker
+   logic (after 2+ failed PATCH attempts).
+
+   Do NOT promise minimum_bar criteria you cannot operationalize.
+   If a criterion needs an external tool (e.g., malariasimulation R
+   package), confirm the modeler has access; otherwise downgrade to
+   targets or drop entirely.
+
 9. **Modeling Checklist**.
 
 ## INVESTIGATION THREADS
