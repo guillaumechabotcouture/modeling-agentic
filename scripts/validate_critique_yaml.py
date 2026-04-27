@@ -1100,7 +1100,105 @@ def _check_rigor_artifacts(run_dir: str) -> list[dict]:
     # Phase 7 Commit μ: plan-promised criteria enforcement.
     violations.extend(_check_plan_criteria(run_dir))
 
+    # Phase 7 Commit ν: universal-coverage benchmark.
+    violations.extend(_check_universal_coverage(run_dir))
+
     return violations
+
+
+def _check_universal_coverage(run_dir: str) -> list[dict]:
+    """Phase 7 Commit ν: when allocation is produced, the modeler
+    must compute a universal-coverage benchmark scenario quantifying
+    the budget required to cover all spatial units at the dominant
+    intervention package, alongside the budget-constrained allocation.
+    This surfaces the "fund 26%, BAU for 66%" concession quantitatively.
+
+    Required artifact: `{run_dir}/models/universal_coverage.yaml` with:
+      total_units: <int>
+      gc7_actual_budget: <number>
+      budget_for_universal_*: <number>  # at least one
+      gc7_dalys_averted: <number>
+      universal_coverage_dalys_averted_estimate: <number>
+      gc7_efficiency_pct: <number>      # gc7 / universal * 100
+
+    Emits:
+      universal_coverage_missing  MEDIUM — allocation exists, no yaml
+      universal_coverage_malformed MEDIUM — yaml exists but missing
+                                             required fields
+    """
+    decision_rule = os.path.join(run_dir, "decision_rule.md")
+    allocs = _find_allocation_csvs(run_dir)
+    if not (os.path.exists(decision_rule) or allocs):
+        return []
+
+    yaml_path = os.path.join(run_dir, "models", "universal_coverage.yaml")
+    if not os.path.exists(yaml_path):
+        return [{
+            "kind": "universal_coverage_missing",
+            "severity": "MEDIUM",
+            "stage": "OPTIMIZATION",
+            "claim": (
+                "Allocation produced but models/universal_coverage.yaml "
+                "is absent. The modeler must compute a universal-"
+                "coverage benchmark (cost to fund all spatial units at "
+                "the dominant package) alongside the budget-constrained "
+                "allocation. This surfaces the 'fund X%, BAU for Y%' "
+                "concession quantitatively rather than burying it in "
+                "§Limitations. Required fields: total_units, "
+                "gc7_actual_budget, budget_for_universal_<package>, "
+                "gc7_dalys_averted, universal_coverage_dalys_averted_"
+                "estimate, gc7_efficiency_pct. See "
+                "mechanistic-vs-hybrid-architecture skill."
+            ),
+        }]
+
+    try:
+        with open(yaml_path) as f:
+            data = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError) as e:
+        return [{
+            "kind": "universal_coverage_malformed",
+            "severity": "MEDIUM",
+            "stage": "OPTIMIZATION",
+            "claim": f"universal_coverage.yaml load error: {e}",
+        }]
+
+    if not isinstance(data, dict):
+        return [{
+            "kind": "universal_coverage_malformed",
+            "severity": "MEDIUM",
+            "stage": "OPTIMIZATION",
+            "claim": "universal_coverage.yaml must be a top-level mapping",
+        }]
+
+    missing = []
+    for required in (
+        "total_units", "gc7_actual_budget",
+        "gc7_dalys_averted",
+        "universal_coverage_dalys_averted_estimate",
+        "gc7_efficiency_pct",
+    ):
+        if required not in data:
+            missing.append(required)
+    # At least one budget_for_universal_* must exist
+    has_universal_budget = any(
+        k.startswith("budget_for_universal_") for k in data.keys()
+    )
+    if not has_universal_budget:
+        missing.append("budget_for_universal_<package>")
+
+    if missing:
+        return [{
+            "kind": "universal_coverage_malformed",
+            "severity": "MEDIUM",
+            "stage": "OPTIMIZATION",
+            "claim": (
+                f"universal_coverage.yaml missing required field(s): "
+                f"{missing}"
+            ),
+        }]
+
+    return []
 
 
 def _check_plan_criteria(run_dir: str) -> list[dict]:
@@ -2934,6 +3032,54 @@ def _run_self_test() -> int:
         vk5 = _check_plan_criteria(d)
         ok(not vk5,
            f"K5: pre-planner (no plan.md) should be silent, got {vk5}")
+
+    # --- Phase 7 Commit ν: universal-coverage benchmark ---
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "decision_rule.md"), "w") as f:
+            f.write("# DR\n")
+        with open(os.path.join(d, "lga_allocation.csv"), "w") as f:
+            f.write("lga,package\nA,X\n")
+
+        # Case L1: allocation but no universal_coverage.yaml → MEDIUM
+        vl1 = _check_universal_coverage(d)
+        ok(any(v["kind"] == "universal_coverage_missing" for v in vl1),
+           f"L1: allocation without universal_coverage should fire MEDIUM, "
+           f"got {vl1}")
+
+        # Case L2: complete universal_coverage.yaml → no fire
+        with open(os.path.join(d, "models", "universal_coverage.yaml"), "w") as f:
+            f.write(
+                "total_units: 774\n"
+                "gc7_actual_budget: 107000000\n"
+                "budget_for_universal_pbo_llin_80: 346000000\n"
+                "gc7_dalys_averted: 2760000\n"
+                "universal_coverage_dalys_averted_estimate: 8500000\n"
+                "gc7_efficiency_pct: 32.5\n"
+                "notes: |\n"
+                "  Universal PBO LLIN at $346M/yr would avert 8.5M DALYs;\n"
+                "  GC7 at $107M achieves 32.5% of that.\n"
+            )
+        vl2 = _check_universal_coverage(d)
+        ok(not vl2,
+           f"L2: complete universal_coverage.yaml should not fire, got {vl2}")
+
+        # Case L3: missing required field → MEDIUM malformed
+        with open(os.path.join(d, "models", "universal_coverage.yaml"), "w") as f:
+            f.write(
+                "total_units: 774\n"
+                # missing gc7_actual_budget, etc.
+            )
+        vl3 = _check_universal_coverage(d)
+        ok(any(v["kind"] == "universal_coverage_malformed" for v in vl3),
+           f"L3: missing required fields should fire malformed MEDIUM, "
+           f"got {vl3}")
+
+    # Case L4: no allocation → silent.
+    with tempfile.TemporaryDirectory() as d:
+        vl4 = _check_universal_coverage(d)
+        ok(not vl4,
+           f"L4: no allocation = no requirement, got {vl4}")
 
     # --- Summary ---
     if failures:

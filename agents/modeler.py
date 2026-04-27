@@ -575,6 +575,70 @@ is absent, HIGH `optimization_quality_no_benchmark` if benchmark_methods
 is empty, and MEDIUM `optimization_quality_gap_too_large` if gap_pct
 exceeds 10%. See `optimizer-method-selection` skill.
 
+### 4e. Universal-coverage benchmark (Phase 7 Commit ν)
+
+When this run produces an allocation, you MUST also emit
+`{run_dir}/models/universal_coverage.yaml` documenting the budget
+required to fund all spatial units at the dominant intervention
+package, alongside the budget-constrained allocation. This surfaces
+the "fund X%, BAU for Y%" concession quantitatively rather than
+hiding it in §Limitations.
+
+Required schema:
+```yaml
+total_units: 774
+gc7_actual_budget: 107000000              # $/yr or total over horizon
+budget_for_universal_pbo_llin_80: 346000000   # at least one of these
+budget_for_universal_full_package: 982000000  # additional baselines OK
+gc7_dalys_averted: 2760000
+universal_coverage_dalys_averted_estimate: 8500000
+gc7_efficiency_pct: 32.5  # gc7 / universal * 100
+notes: |
+  At PBO LLIN 80% across all 774 LGAs ($346M/yr incremental), the
+  model estimates 8.5M DALYs averted/yr — 3× the GC7 budget result.
+  The 32.5% efficiency reflects the budget binding before reaching
+  optimal scale. NMEP/donors should consider co-financing to close
+  this gap.
+```
+
+Compute by:
+1. Sum incremental cost of dominant package across all units
+2. Apply the same effect multipliers per unit to estimate DALYs
+3. Report ratio gc7_dalys / universal_dalys * 100
+
+### 4f. Architecture: HYBRID by default for allocation analyses (Phase 7 Commit ν)
+
+If this run produces an allocation/decision_rule, START WITH the
+HYBRID architecture: calibrate baseline transmission with your
+chosen ABM/ODE framework (Starsim, EMOD, malariasimulation, custom
+SEIR), but estimate intervention effects with PUBLISHED meta-analysis
+multipliers (OR/RR from RCTs) applied as multipliers to the
+calibrated baseline.
+
+Why: pure-mechanistic ABM intervention effects rarely match published
+meta-analyses on the first try and create domain-implausible ICERs
+(see 1935 malaria run: pure ABM → LLIN ICER $144-306/DALY, 3-7x
+outside Cochrane benchmark $27-44; the modeler had to rebuild as
+hybrid in round 4 anyway). Standard NMP planning practice (Ozodiegwu
+2023, Scott 2017, Galactionova 2017) uses hybrid by default.
+
+The hybrid pattern in code:
+```python
+# Calibrate baseline with ABM:
+calibrated_pfpr = calibrate_starsim_per_archetype(targets_nmis_2021)
+
+# Apply published intervention multipliers (NOT ABM-derived effects):
+def intervention_effect(intervention, p0):
+    if intervention == "llin_standard":
+        OR = 0.44  # Yang 2018
+        return OR / ((1 - p0) + p0 * OR)
+    # ... etc.
+```
+
+Reserve full-mechanistic for transmission research, not allocation.
+See `mechanistic-vs-hybrid-architecture` skill for the decision tree
+and worked example of the 1935 4-round evolution.
+
 ### 4d. Plan-promised criteria (Phase 7 Commit μ)
 
 If `{run_dir}/success_criteria.yaml` exists (planner emits it
