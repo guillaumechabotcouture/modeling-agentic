@@ -30,11 +30,19 @@ This writes a sidecar `<png_path>.provenance.json` with:
 Two checks are enforced:
 
 1. Annotation presence — each expected_annotation must appear as a
-   substring in the calling script's source text. The modeler
-   asserts "this figure currently says X"; the script's source must
-   support that. If a later regeneration silently flips a title from
-   "H1 SUPPORTED" to "H1 NULL", the assertion fails because the new
-   script no longer contains "H1 SUPPORTED".
+   substring SOMEWHERE in the calling script's source text (the
+   `validate_figure(...)` call itself is stripped first, so the
+   assertion can't satisfy itself). This is intentionally a loose
+   check: the substring may sit in `plt.title(...)`, in a comment,
+   in a docstring, or in dead code — anything that keeps the
+   expected text co-located with the script that drew the figure.
+   Catches the common drift case (title is regenerated → comments
+   and plt.title literals fall out of sync together), but does NOT
+   prove the substring is the figure's actual title. A modeler who
+   keeps stale annotation literals lying around in comments after
+   editing the title call WILL pass this check. Tightening to "must
+   appear as a string-literal argument to plt.title|set_title|
+   plt.text|annotate" is a Phase 10 candidate.
 
 2. Source data freshness — the rigor gate
    (`scripts/validate_critique_yaml.py::_check_figure_validator`)
@@ -184,9 +192,12 @@ def validate_figure(png_path: str,
         from. The validator hashes each. Empty list is allowed but
         means staleness cannot be detected.
     expected_annotations
-        List of strings the modeler asserts appear inside the
-        figure (titles, legends, overlay text, axis labels). Each
-        must appear as a substring of the calling script's source.
+        List of strings the modeler asserts are co-located with the
+        figure's drawing code. Each must appear as a substring of
+        the calling script's source (anywhere — title call, comment,
+        docstring, all count). NOT a proof that the string is the
+        figure's actual title; only that it lives in the same file
+        as the savefig. See module docstring for the rationale.
     expected_n_data_points
         Optional sanity check, recorded in the sidecar for
         downstream consumers. Not asserted here.
@@ -235,7 +246,8 @@ def validate_figure(png_path: str,
         "source_hashes": source_hashes,
         "expected_annotations": list(expected_annotations),
         "expected_n_data_points": expected_n_data_points,
-        "written_at_utc": datetime.datetime.utcnow().isoformat() + "Z",
+        "written_at_utc": datetime.datetime.now(
+            datetime.timezone.utc).isoformat(),
     }
     with open(_provenance_path(png_path), "w") as f:
         json.dump(sidecar, f, indent=2, sort_keys=True)

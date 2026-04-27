@@ -334,12 +334,19 @@ checks fire in `validate_critique_yaml.py` per round:
 
 `expected_annotations` are checked at write time against the
 calling script's source text (with the `validate_figure(...)` call
-itself stripped before search), so accidental drift like "title
-says +105% while body says 2%" surfaces the moment the figure is
-regenerated. List the annotations that matter for the figure's
-claim — typically the headline number(s), the comparator labels,
-and the verdict text. If you cannot list any (e.g., a pure scatter
-with no overlaid text), pass `expected_annotations=[]`.
+itself stripped before search). The check is intentionally loose:
+the string must appear SOMEWHERE in the script — title call,
+legend, axis label, OR a comment / docstring co-located with the
+drawing code. It does NOT prove the string is the figure's actual
+title. The point is to keep the asserted text co-located with the
+script that drew the figure: the common drift case (script
+regenerated → annotation, comment, and title-call all updated
+together) is caught; a modeler who carefully maintains stale
+literals in comments WILL silently pass. List the annotations that
+matter for the figure's claim — typically the headline number(s),
+the comparator labels, and the verdict text. If you cannot list
+any (e.g., a pure scatter with no overlaid text), pass
+`expected_annotations=[]`.
 
 If a figure is genuinely untraceable to a CSV (e.g., a schematic
 diagram), pass `source_data_paths=[]`. Staleness then cannot fire,

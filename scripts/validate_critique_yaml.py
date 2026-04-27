@@ -1804,6 +1804,12 @@ def _check_sensitivity_analysis(run_dir: str) -> list[dict]:
     return out
 
 
+# How many lines of lookahead after a savefig() call we tolerate
+# before requiring a validate_figure() call. 10 fits the typical
+# pattern of `plt.savefig(...); plt.close(); validate_figure(...)`.
+_VALIDATOR_LOOKAHEAD_LINES = 10
+
+
 def _check_figure_validator(run_dir: str) -> list[dict]:
     """Phase 9 Commit ρ: write-time figure validator.
 
@@ -1915,12 +1921,6 @@ def _check_figure_validator(run_dir: str) -> list[dict]:
                     ),
                 })
     return out
-
-
-# How many lines of lookahead after a savefig() call we tolerate
-# before requiring a validate_figure() call. 10 fits the typical
-# pattern of `plt.savefig(...); plt.close(); validate_figure(...)`.
-_VALIDATOR_LOOKAHEAD_LINES = 10
 
 
 # Phase 3 Commit C: decision rule as required rigor artifact.
@@ -3523,11 +3523,8 @@ def _run_self_test() -> int:
         # fire. Recompute the hash properly via figure_validator helper.
         spec = importlib.util.spec_from_file_location(
             "figure_validator",
-            os.path.join(os.path.dirname(__file__).replace("tasks/",  ""),
-                         "scripts", "figure_validator.py")
-            if False  # dynamic loader path — keep the real one below
-            else os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              "figure_validator.py")
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "figure_validator.py"),
         )
         fv = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(fv)
