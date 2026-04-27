@@ -71,6 +71,22 @@ except ImportError:
 PROFILE_CI_THRESHOLD = 1.92
 
 
+class LossFunctionReoptimizesError(Exception):
+    """Raised when the modeler-supplied loss function appears to internally
+    re-optimize all parameters rather than evaluating residuals at the
+    EXACT supplied parameter values. The diagnostic: perturbing any
+    parameter produces no measurable change in the returned loss, because
+    the inner optimizer compensates. Profile-likelihood scans on such a
+    function are meaningless — every profile is flat by construction,
+    yielding false-positive ridge-trapped verdicts.
+
+    Phase 9 Commit σ: two consecutive malaria runs (1721, 0013) wasted
+    a HIGH RIG-001 blocker on this code artifact. The fix is to detect
+    re-optimizing loss at load time, before profile_likelihood() is
+    called, and tell the modeler explicitly to rewrite calibration_loss
+    as a pointwise function (no inner solver/calibrator/fitter)."""
+
+
 def load_loss_fn(run_dir: str, spec: str) -> Callable[[dict], float]:
     """Load the modeler-provided loss function. spec format matches
     propagate_uncertainty's outcome_fn: 'path/file.py::fn_name'."""
@@ -125,6 +141,68 @@ def fisher_diagonal(loss_fn: Callable[[dict], float],
         else:
             out[name] = 1.0 / math.sqrt(d2)
     return out
+
+
+def assert_loss_fn_is_pointwise(loss_fn: Callable[[dict], float],
+                                point: dict[str, float],
+                                eps_frac: float = 0.05,
+                                tol: float = 1e-9) -> None:
+    """Detect re-optimizing loss functions before profile_likelihood runs.
+
+    A pointwise loss must produce a measurable change when AT LEAST one
+    parameter is perturbed by a non-trivial fraction of its point value.
+    A re-optimizing loss (e.g., one that internally re-fits all parameters
+    via scipy.optimize.minimize before computing the residual) returns
+    near-identical values for every perturbation, because the inner solver
+    compensates. profile_likelihood() on such a loss yields flat curves
+    for every parameter, and classify() then mis-flags every parameter
+    as ridge-trapped — RIG-001 false-positive HIGH.
+
+    Raises LossFunctionReoptimizesError if the maximum |Δloss| across
+    all single-parameter perturbations is below `tol`. Tolerance is
+    deliberately tight (1e-9) so genuine numerical noise from a true
+    pointwise function still passes.
+    """
+    f0 = loss_fn(point)
+    max_change = 0.0
+    n_evaluated = 0
+    for name, p0 in point.items():
+        h = max(abs(p0) * eps_frac, 1e-3)
+        plus = dict(point); plus[name] = p0 + h
+        try:
+            f1 = loss_fn(plus)
+        except Exception:
+            # An exception on perturbation is fine — what we care about
+            # is whether ANY perturbation moves the loss. A loss that
+            # raises on every perturbation is its own problem and will
+            # surface at the profile_likelihood call site.
+            continue
+        n_evaluated += 1
+        delta = abs(f1 - f0) if math.isfinite(f1) and math.isfinite(f0) else 0.0
+        if delta > max_change:
+            max_change = delta
+
+    if n_evaluated == 0:
+        # Every perturbation raised — let profile_likelihood report that;
+        # not our concern here.
+        return
+
+    if max_change < tol:
+        raise LossFunctionReoptimizesError(
+            "Loss function returns identical values (max |Δloss| = "
+            f"{max_change:g} < {tol:g}) for every parameter perturbation "
+            f"of {n_evaluated} parameter(s). This indicates the loss "
+            "function is internally re-optimizing all parameters rather "
+            "than evaluating residuals at the supplied values. Rewrite "
+            "calibration_loss(params: dict) -> float as a POINTWISE "
+            "function: compute residuals at the EXACT supplied parameter "
+            "values WITHOUT calling any optimizer / calibrator / fitter "
+            "inside. If your model has no analytic residual (e.g., loss "
+            "is only defined as the output of a calibration loop), "
+            "declare scope and skip identifiability analysis — DO NOT "
+            "submit a re-optimizing loss, which produces guaranteed "
+            "false-positive ridge-trapped verdicts."
+        )
 
 
 def profile_likelihood(loss_fn: Callable[[dict], float],
@@ -245,6 +323,14 @@ def analyze(run_dir: str) -> dict:
     # Build point dict for Fisher calc.
     point = {p["name"]: float(p["point_estimate"]) for p in params_manifest}
 
+    # Phase 9 Commit σ: catch re-optimizing loss before profile_likelihood
+    # runs. A loss that internally re-fits compensates for every
+    # perturbation, producing flat profiles for every parameter. Surface
+    # this as an explicit error — telling the modeler to rewrite — rather
+    # than letting it cascade into a fleet of false-positive ridge-trapped
+    # verdicts.
+    assert_loss_fn_is_pointwise(loss_fn, point)
+
     fisher = fisher_diagonal(loss_fn, point)
 
     param_results = {}
@@ -350,6 +436,82 @@ def _run_self_test() -> int:
         report = analyze(d)
         ok(report["verdict"] == "CLEAN",
            f"B: verdict CLEAN; got {report['verdict']}")
+
+    # Case C (Phase 9 Commit σ): re-optimizing loss must be caught at
+    # load time. Two consecutive malaria runs (1721 and 0013) wasted a
+    # HIGH RIG-001 blocker on this exact pattern: calibration_loss()
+    # internally re-fits all parameters, returning a constant minimum
+    # value regardless of input. We simulate that here with a constant-
+    # returning loss; assert_loss_fn_is_pointwise must raise.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "models", "loss.py"), "w") as f:
+            f.write(
+                "def loss(p):\n"
+                "    # Mimics a calibration_loss() that re-fits internally:\n"
+                "    # always returns the same minimum regardless of inputs.\n"
+                "    return 0.42\n"
+            )
+        with open(os.path.join(d, "models", "identifiability.yaml"), "w") as f:
+            f.write(
+                "loss_fn: models/loss.py::loss\n"
+                "parameters:\n"
+                "  - name: a\n"
+                "    point_estimate: 1.0\n"
+                "    lower_bound: 0.5\n"
+                "    upper_bound: 1.5\n"
+                "  - name: b\n"
+                "    point_estimate: 2.0\n"
+                "    lower_bound: 1.5\n"
+                "    upper_bound: 2.5\n"
+            )
+        raised = False
+        try:
+            analyze(d)
+        except LossFunctionReoptimizesError:
+            raised = True
+        ok(raised,
+           "C: reoptimizing (constant) loss should raise "
+           "LossFunctionReoptimizesError; analyze() did not raise")
+
+    # Case D (Phase 9 Commit σ): partial flat-ridge — sharp in one
+    # parameter, truly flat in another — must NOT raise. Only ALL-flat
+    # losses indicate re-optimization; a genuine ridge in one parameter
+    # is exactly what classify() is designed to detect downstream.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "models", "loss.py"), "w") as f:
+            f.write(
+                "def loss(p):\n"
+                "    # Sharp in beta, flat in ridge — the canonical\n"
+                "    # ridge-trapped pattern that profile_likelihood is\n"
+                "    # designed to flag downstream.\n"
+                "    beta = p['beta']\n"
+                "    ridge = p['ridge']\n"
+                "    return (beta - 0.5) ** 2 * 2000 + 0.0 * ridge\n"
+            )
+        with open(os.path.join(d, "models", "identifiability.yaml"), "w") as f:
+            f.write(
+                "loss_fn: models/loss.py::loss\n"
+                "parameters:\n"
+                "  - name: beta\n"
+                "    point_estimate: 0.5\n"
+                "    lower_bound: 0.0\n"
+                "    upper_bound: 1.0\n"
+                "  - name: ridge\n"
+                "    point_estimate: 0.5\n"
+                "    lower_bound: 0.0\n"
+                "    upper_bound: 1.0\n"
+            )
+        # Should NOT raise — the sharp beta dimension proves the loss
+        # is pointwise; ridge is genuinely unidentified, which is fine.
+        report = analyze(d)
+        ok(report["parameters"]["beta"]["status"] == "well_identified",
+           f"D: partial-ridge beta should be well_identified; got "
+           f"{report['parameters']['beta']['status']}")
+        ok(report["parameters"]["ridge"]["status"] == "unidentified",
+           f"D: partial-ridge ridge should still classify as unidentified; "
+           f"got {report['parameters']['ridge']['status']}")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)

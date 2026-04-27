@@ -511,6 +511,24 @@ Unidentified parameters used in policy outputs are a HIGH blocker.
 Resolve via informative priors, tying redundant parameters, or
 removing the parameter (fix at a default).
 
+**The loss function MUST be pointwise** (Phase 9 Commit σ contract).
+`calibration_loss(params: dict) -> float` MUST evaluate residuals at
+the EXACT supplied parameter values. It MUST NOT call any optimizer,
+calibrator, or fitter inside — every internal `scipy.optimize`,
+`minimize`, calibration loop, or ABM grid-search would compensate for
+your perturbation and return a constant value, producing flat
+profile-likelihood curves for every parameter and a guaranteed
+false-positive UNIDENTIFIED_PARAMETERS verdict. Two prior runs (1721,
+0013) wasted a HIGH RIG-001 blocker on this exact code artifact.
+
+`scripts/identifiability.py` now calls `assert_loss_fn_is_pointwise`
+before running profile scans; a re-optimizing loss raises
+`LossFunctionReoptimizesError` at load time and identifiability.yaml
+will not be written. If your model has no analytic residual (loss is
+only definable as the output of a calibration loop), declare scope in
+§Limitations and skip identifiability — DO NOT submit a re-optimizing
+loss.
+
 ### 4c. Allocation cross-validation (Phase 6 Commit κ — when allocation is produced)
 
 When this run produces an allocation, the allocation rule must be
