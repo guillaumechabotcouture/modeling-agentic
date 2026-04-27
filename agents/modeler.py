@@ -47,11 +47,6 @@ Key principles:
 - Test identifiability before adding parameters
 - Write reasoning to {run_dir}/modeling_strategy.md
 
-If a {run_dir}/strategy_decision.md exists from the strategist agent,
-READ IT FIRST. It tells you whether to PATCH (specific fixes), RETHINK
-(simplify or change approach), or REDIRECT (back to data/plan).
-Follow its instructions.
-
 ## Process
 
 1. Read {run_dir}/plan.md for candidate models and checklist.
