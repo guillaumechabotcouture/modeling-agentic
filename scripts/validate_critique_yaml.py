@@ -1096,6 +1096,28 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None) -> list[dic
     # Phase 9 Commit ρ: write-time figure validator + provenance check.
     violations.extend(_check_figure_validator(run_dir))
 
+    # Phase 12 Commit α: cross-file numeric consistency check.
+    # Catches the failure mode the 104914 run shipped: 4+ verifiable
+    # internal numeric inconsistencies (cost-per-case $5.05 vs $4.71
+    # in same file, figure_rationale stale by 2.4×, title Round 4 vs
+    # actual Round 6) that no validator was comparing across sibling
+    # artifacts. Only redteam caught two of them in round 6.
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "numeric_consistency",
+            os.path.join(os.path.dirname(__file__), "numeric_consistency.py"),
+        )
+        nc_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(nc_mod)
+        violations.extend(nc_mod.check_numeric_consistency(run_dir))
+    except Exception as e:
+        violations.append({
+            "kind": "numeric_consistency_load_error",
+            "severity": "HIGH",
+            "stage": "WRITE",
+            "claim": f"Could not load scripts/numeric_consistency.py: {e}",
+        })
+
     # Phase 10 Commit ψ: allocation-gate coordinator. The five
     # allocation-triggered checks (optimization_quality, daly,
     # allocation_robustness, universal_coverage, sensitivity_analysis)
