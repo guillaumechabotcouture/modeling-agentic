@@ -27,6 +27,7 @@ Exit:
 from __future__ import annotations
 
 import argparse
+import ast
 import os
 import re
 import sys
@@ -48,28 +49,133 @@ def _repo_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def parse_attached_skills(agents_init_path: str) -> set[str]:
-    """Return the set of skill names referenced in any `skills=[...]`
-    list in agents/__init__.py. Handles multi-line lists. Ignores
-    comments. Reuses no project utility — this is a one-off parse."""
+def _resolve_attribute_to_list(attr_node: ast.Attribute,
+                               agents_dir: str) -> list[str] | None:
+    """Resolve `modeler.MODEL_TESTER_SKILLS` → the list of strings
+    assigned to `MODEL_TESTER_SKILLS` at module level in
+    `agents/modeler.py`. Returns None if the reference can't be
+    resolved (we'll emit a warning rather than treat as phantom)."""
+    if not isinstance(attr_node.value, ast.Name):
+        return None
+    module_name = attr_node.value.id  # e.g., "modeler"
+    attr_name = attr_node.attr        # e.g., "MODEL_TESTER_SKILLS"
+    module_path = os.path.join(agents_dir, f"{module_name}.py")
+    if not os.path.isfile(module_path):
+        return None
+    try:
+        with open(module_path) as f:
+            tree = ast.parse(f.read())
+    except (SyntaxError, OSError):
+        return None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == attr_name:
+                    return _resolve_skills_value(node.value, agents_dir)
+    return None
+
+
+def _resolve_skills_value(value: ast.AST,
+                          agents_dir: str) -> list[str] | None:
+    """Recursively resolve any AST expression assigned to a skills=
+    keyword (or to a module-level constant referenced by one). Handles
+    string-literal lists, BinOp(Add) of two resolvable parts, and
+    Attribute references to module-level constants in sibling files.
+    Returns None when the value can't be resolved without execution."""
+    if isinstance(value, ast.List):
+        out: list[str] = []
+        for elt in value.elts:
+            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                out.append(elt.value)
+            else:
+                # Mixed: at least one element couldn't be resolved.
+                # Take what we have but signal partial via the warning
+                # path — the caller checks for None vs partial via
+                # length comparison if it cares.
+                pass
+        return out
+    if isinstance(value, ast.BinOp) and isinstance(value.op, ast.Add):
+        left = _resolve_skills_value(value.left, agents_dir)
+        right = _resolve_skills_value(value.right, agents_dir)
+        if left is None or right is None:
+            # One side unresolved → fail closed; caller will warn.
+            return None
+        return left + right
+    if isinstance(value, ast.Attribute):
+        return _resolve_attribute_to_list(value, agents_dir)
+    if isinstance(value, ast.Name):
+        # Same-file constant reference. Walk the same module's tree
+        # (caller would supply it ideally; here we just bail because
+        # the actual real-world case in agents/__init__.py is
+        # cross-module — adding same-file resolution would be dead
+        # code today).
+        return None
+    return None
+
+
+def parse_attached_skills(agents_init_path: str,
+                          warnings: list[str] | None = None) -> set[str]:
+    """Return the set of skill names referenced in any `skills=...`
+    keyword argument inside agents/__init__.py. Phase 11 Commit η
+    (F8): replaces the previous regex parser, which silently dropped
+    `skills=mod.SOMETHING + [...]` patterns. Now uses ast.parse and
+    recursively resolves cross-module Attribute references (e.g.,
+    modeler.MODEL_TESTER_SKILLS) by reading sibling files under
+    agents/.
+
+    If `warnings` is provided, unresolved references are appended
+    (e.g., a future dynamic expression we can't statically resolve).
+    Unresolved references are NOT treated as phantoms — they're
+    surfaced for human review."""
     with open(agents_init_path) as f:
         src = f.read()
+    try:
+        tree = ast.parse(src)
+    except SyntaxError as e:
+        # If agents/__init__.py is broken, fall back to an empty set
+        # and warn loudly. The validator's exit code will then flag
+        # every attached skill as unattached (a different kind of
+        # error, but at least visible).
+        if warnings is not None:
+            warnings.append(f"agents/__init__.py SyntaxError: {e}")
+        return set()
+
+    agents_dir = os.path.dirname(os.path.abspath(agents_init_path))
     attached: set[str] = set()
-    # Match `skills = [` (or `skills=[`) and capture up to the closing
-    # `]`. Multi-line and comments are tolerated; we extract every
-    # double-quoted identifier inside the list body.
-    for m in re.finditer(r"skills\s*=\s*\[(.*?)\]", src, re.DOTALL):
-        body = m.group(1)
-        # Strip line comments before extracting names — comments could
-        # contain hyphenated phrases that look like skill names.
-        body = re.sub(r"#[^\n]*", "", body)
-        # The character class includes `_` because at least one real
-        # skill (`basic_epi_modeling`) is snake-cased. Without the
-        # underscore, the regex silently dropped that attachment and
-        # would also fail to flag a misspelling like
-        # `basic_epi_modelling` as a phantom (review fix #1).
-        for name in re.findall(r'"([a-z][a-z0-9_-]+)"', body):
-            attached.add(name)
+
+    def _record(value_node: ast.AST) -> None:
+        resolved = _resolve_skills_value(value_node, agents_dir)
+        if resolved is None:
+            # Couldn't resolve the value statically. Surface it but
+            # don't claim it's a phantom — the value might point to a
+            # legitimately-attached skill list we just can't read.
+            if warnings is not None:
+                try:
+                    snippet = ast.unparse(value_node)
+                except AttributeError:
+                    snippet = "<unparseable>"
+                warnings.append(
+                    f"agents/__init__.py:{value_node.lineno}: skills="
+                    f"{snippet} could not be statically resolved; skipped."
+                )
+            return
+        attached.update(resolved)
+
+    for node in ast.walk(tree):
+        # Form 1: `skills=...` as a kwarg in a function call (the
+        # production case in AgentDefinition(...)).
+        if isinstance(node, ast.keyword) and node.arg == "skills":
+            _record(node.value)
+            continue
+        # Form 2: `skills = [...]` as a top-level (or any-scope)
+        # assignment to the name `skills`. Less common in production
+        # but supported so test fixtures and possible future inline
+        # definitions both work.
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "skills":
+                    _record(node.value)
+                    break
     return attached
 
 
@@ -94,9 +200,15 @@ def validate(repo_root: str | None = None) -> dict:
       existing: sorted list of skills with a SKILL.md
       phantoms: attached but neither in existing nor in _MCP_SKILLS
       orphans: existing but never attached
+      warnings: list of strings for skills= expressions we couldn't
+                statically resolve (Phase 11 Commit η F8)
     """
     root = repo_root or _repo_root()
-    attached = parse_attached_skills(os.path.join(root, "agents", "__init__.py"))
+    warnings: list[str] = []
+    attached = parse_attached_skills(
+        os.path.join(root, "agents", "__init__.py"),
+        warnings=warnings,
+    )
     existing = list_existing_skills(os.path.join(root, ".claude", "skills"))
     phantoms = sorted(attached - existing - _MCP_SKILLS)
     orphans = sorted(existing - attached)
@@ -105,6 +217,7 @@ def validate(repo_root: str | None = None) -> dict:
         "existing": sorted(existing),
         "phantoms": phantoms,
         "orphans": orphans,
+        "warnings": warnings,
     }
 
 
@@ -208,6 +321,57 @@ def _run_self_test() -> int:
            f"T7: snake_case misspelling should be flagged as phantom, "
            f"got {r7['phantoms']}")
 
+        # T8 (Phase 11 Commit η F8): dynamic skills= expressions
+        # (Attribute reference + List concatenation) must be resolved.
+        # The real-world case is `skills=modeler.MODEL_TESTER_SKILLS +
+        # ["malaria-modeling", ...]` at agents/__init__.py:143. Build a
+        # fixture with a sibling module exporting a list, an
+        # __init__.py that uses it via BinOp(Add, Attribute, List), and
+        # confirm both halves are recognized.
+        os.makedirs(os.path.join(d, ".claude", "skills", "child-skill"))
+        with open(os.path.join(d, ".claude", "skills",
+                               "child-skill", "SKILL.md"), "w") as f:
+            f.write("# child-skill\n")
+        os.makedirs(os.path.join(d, ".claude", "skills", "parent_skill"))
+        with open(os.path.join(d, ".claude", "skills",
+                               "parent_skill", "SKILL.md"), "w") as f:
+            f.write("# parent_skill\n")
+        with open(os.path.join(d, "agents", "modeler.py"), "w") as f:
+            f.write('PARENT_SKILLS = ["parent_skill"]\n')
+        with open(os.path.join(d, "agents", "__init__.py"), "w") as f:
+            f.write(
+                "from agents import modeler\n"
+                'AgentDefinition(skills=modeler.PARENT_SKILLS + ["child-skill"])\n'
+            )
+        r8 = validate(d)
+        ok("parent_skill" in r8["attached"],
+           f"T8: cross-module Attribute reference should resolve "
+           f"(parent_skill from modeler.PARENT_SKILLS); got "
+           f"{r8['attached']}")
+        ok("child-skill" in r8["attached"],
+           f"T8: literal-list right-hand side of BinOp(Add) should "
+           f"resolve (child-skill); got {r8['attached']}")
+        ok(r8["phantoms"] == [],
+           f"T8: both sides resolved + both have SKILL.md → no "
+           f"phantoms; got {r8['phantoms']}")
+
+        # T9 (Phase 11 Commit η F8): unresolvable dynamic expression
+        # produces a warning, NOT a phantom. Reference an attribute on
+        # a module we can't resolve (no sibling .py). The validator
+        # must return cleanly with the unresolved expression in
+        # `warnings` rather than treating it as a phantom skill name.
+        with open(os.path.join(d, "agents", "__init__.py"), "w") as f:
+            f.write(
+                'AgentDefinition(skills=some_external.UNKNOWN_LIST)\n'
+            )
+        r9 = validate(d)
+        ok(r9["phantoms"] == [],
+           f"T9: unresolvable dynamic skills= must NOT produce "
+           f"phantoms, got {r9['phantoms']}")
+        ok(len(r9["warnings"]) >= 1,
+           f"T9: unresolvable dynamic skills= must surface a warning, "
+           f"got {r9.get('warnings')}")
+
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)
         for f in failures:
@@ -240,6 +404,11 @@ def main() -> int:
     if result["phantoms"]:
         for name in result["phantoms"]:
             print(f"  - {name}", file=sys.stderr)
+    if result.get("warnings"):
+        print(f"Warnings:  {len(result['warnings'])} unresolved "
+              f"skills= expression(s) (not phantoms)", file=sys.stderr)
+        for w in result["warnings"]:
+            print(f"  - {w}", file=sys.stderr)
     if args.show_orphans:
         print(f"Orphans:   {len(result['orphans'])} have SKILL.md "
               f"but no agent attaches them", file=sys.stderr)
