@@ -26,6 +26,7 @@ error rather than swallowing it.
 from __future__ import annotations
 
 import argparse
+import glob
 import importlib.util
 import json
 import os
@@ -1924,24 +1925,24 @@ def _check_figure_validator(run_dir: str) -> list[dict]:
 
 
 # Phase 3 Commit C: decision rule as required rigor artifact.
-import glob as _glob_module
-import re as _re_module
+# (Phase 10 Commit χ: removed mid-file aliased re/glob imports;
+# `re` is imported at the top of the file and `glob` joined it.)
 
 _ALLOCATION_GLOBS = ("*allocation*.csv", "*budget*.csv", "*optimization*.csv")
-_DECISION_RULE_FRONTMATTER_RE = _re_module.compile(
-    r"^---\s*\n(.+?)\n---\s*\n", _re_module.DOTALL
+_DECISION_RULE_FRONTMATTER_RE = re.compile(
+    r"^---\s*\n(.+?)\n---\s*\n", re.DOTALL
 )
 _REQUIRED_RULE_SECTIONS = ("## Features", "## Rule", "## Validation")
 _VALID_RULE_TYPES = {
     "tabular", "tree", "prose-with-exceptions", "non-compressible",
 }
-_ACCURACY_RE = _re_module.compile(
+_ACCURACY_RE = re.compile(
     r"^\s*-?\s*`?accuracy_vs_optimizer`?\s*[:=]\s*([0-9.]+)",
-    _re_module.MULTILINE,
+    re.MULTILINE,
 )
-_EXCEPTIONS_COUNT_RE = _re_module.compile(
+_EXCEPTIONS_COUNT_RE = re.compile(
     r"^\s*-?\s*`?exceptions_count`?\s*[:=]\s*(\d+)",
-    _re_module.MULTILINE,
+    re.MULTILINE,
 )
 
 
@@ -1954,9 +1955,9 @@ def _find_allocation_csvs(run_dir: str) -> list[str]:
     """
     found: list[str] = []
     for pattern in _ALLOCATION_GLOBS:
-        found.extend(_glob_module.glob(os.path.join(run_dir, pattern)))
-        found.extend(_glob_module.glob(os.path.join(run_dir, "data", pattern)))
-        found.extend(_glob_module.glob(os.path.join(run_dir, "models", pattern)))
+        found.extend(glob.glob(os.path.join(run_dir, pattern)))
+        found.extend(glob.glob(os.path.join(run_dir, "data", pattern)))
+        found.extend(glob.glob(os.path.join(run_dir, "models", pattern)))
     return sorted(set(found))
 
 
@@ -1986,8 +1987,25 @@ def _check_decision_rule_artifact(run_dir: str) -> list[dict]:
             ),
         }]
 
-    with open(rule_path) as f:
-        text = f.read()
+    # Phase 10 Commit χ: previously this open() was unguarded — a
+    # binary or UTF-8-corrupt decision_rule.md would crash STAGE 7
+    # entirely instead of emitting a HIGH violation the modeler can
+    # respond to.
+    try:
+        with open(rule_path, encoding="utf-8") as f:
+            text = f.read()
+    except (UnicodeDecodeError, OSError) as e:
+        return [{
+            "kind": "decision_rule_unreadable",
+            "severity": "HIGH",
+            "stage": "OPTIMIZATION",
+            "claim": (
+                f"decision_rule.md exists but cannot be read as UTF-8 "
+                f"text: {type(e).__name__}: {e}. The validator cannot "
+                f"verify the rule schema, self-reference, or accuracy. "
+                f"Re-save decision_rule.md as UTF-8 plain text."
+            ),
+        }]
 
     # Accumulate violations across all checks rather than returning early
     # on the first malformed condition. This lets the Phase 4 γ
@@ -2054,7 +2072,16 @@ def _check_decision_rule_artifact(run_dir: str) -> list[dict]:
             try:
                 accuracy = float(acc_match.group(1))
                 exc_count = int(exc_match.group(1))
-                if accuracy < 0.90 and exc_count == 0:
+                # Phase 10 Commit χ: severity recalibration. The
+                # original threshold fired HIGH at < 0.90, but a 22-
+                # archetype × 8-package allocation rule with 0.85
+                # accuracy is publication-defensible (Global Fund
+                # rules routinely run 0.80-0.90). HIGH should be
+                # reserved for rules that are genuinely indefensible
+                # (< 0.75 with no declared exceptions). The 0.75-0.90
+                # band moves to MEDIUM — surface in §Limitations,
+                # don't block ACCEPT.
+                if accuracy < 0.75 and exc_count == 0:
                     violations.append({
                         "kind": "decision_rule_low_accuracy",
                         "severity": "HIGH",
@@ -2062,11 +2089,29 @@ def _check_decision_rule_artifact(run_dir: str) -> list[dict]:
                         "claim": (
                             f"decision_rule.md claims rule_type={rule_type!r} "
                             f"with accuracy_vs_optimizer={accuracy:.2f} and "
-                            f"exceptions_count=0. You cannot claim a rule with "
-                            f"< 0.90 accuracy AND no declared exceptions. "
+                            f"exceptions_count=0. < 0.75 accuracy with no "
+                            f"declared exceptions is indefensible — a "
+                            f"program officer applying this rule would "
+                            f"differ from the optimizer on > 25% of units. "
                             f"Either list the disagreeing units in "
                             f"exceptions_list, or switch rule_type to "
                             f"`non-compressible` with a Justification."
+                        ),
+                    })
+                elif accuracy < 0.90 and exc_count == 0:
+                    violations.append({
+                        "kind": "decision_rule_low_accuracy",
+                        "severity": "MEDIUM",
+                        "stage": "DECISION_RULE",
+                        "claim": (
+                            f"decision_rule.md claims rule_type={rule_type!r} "
+                            f"with accuracy_vs_optimizer={accuracy:.2f} and "
+                            f"exceptions_count=0. Accuracy in the 0.75-0.90 "
+                            f"band is publication-defensible but should be "
+                            f"surfaced in §Limitations: a program officer "
+                            f"applying this rule will differ from the "
+                            f"optimizer on 10-25% of units. Consider listing "
+                            f"the largest-disagreement units as exceptions."
                         ),
                     })
             except (ValueError, TypeError):
@@ -3548,6 +3593,137 @@ def _run_self_test() -> int:
         vf6 = _check_figure_validator(d)
         ok(any(v["kind"] == "figure_staleness_detected" for v in vf6),
            f"F6: missing source CSV should fire staleness, got {vf6}")
+
+    # --- Phase 10 Commit χ: validator robustness self-tests ---
+
+    # P1-P2: _check_plan_criteria. (A "malformed schema" case would
+    # require coordinating with scripts/plan_criteria.py's
+    # evaluate_plan_criteria contract, which isn't in this commit's
+    # scope; the missing-yaml MEDIUM is the path most likely to drift.)
+    with tempfile.TemporaryDirectory() as d:
+        # P1: no plan.md → silent (legacy runs without plan are out of scope)
+        vp1 = _check_plan_criteria(d)
+        ok(not vp1, f"P1: no plan.md = no fire, got {vp1}")
+
+        # P2: plan.md exists but no success_criteria.yaml → MEDIUM
+        # plan_criteria_missing (the planner forgot to emit it).
+        with open(os.path.join(d, "plan.md"), "w") as f:
+            f.write("# Plan\n")
+        vp2 = _check_plan_criteria(d)
+        ok(any(v["kind"] == "plan_criteria_missing"
+               and v["severity"] == "MEDIUM" for v in vp2),
+           f"P2: plan.md without success_criteria.yaml should fire MEDIUM, "
+           f"got {vp2}")
+
+    # W1-W3: _check_writer_qa
+    with tempfile.TemporaryDirectory() as d:
+        # W1: no report.md → silent
+        vw1 = _check_writer_qa(d)
+        ok(not vw1, f"W1: no report.md = no fire, got {vw1}")
+
+        # W2: report.md present, writer_qa_report.yaml CLEAN → silent
+        with open(os.path.join(d, "report.md"), "w") as f:
+            f.write("# Report\n")
+        with open(os.path.join(d, "writer_qa_report.yaml"), "w") as f:
+            f.write("verdict: CLEAN\nmajor_issues: []\nminor_issues: []\n")
+        vw2 = _check_writer_qa(d)
+        ok(not vw2, f"W2: CLEAN writer_qa should not fire, got {vw2}")
+
+        # W3: report.md present but writer_qa_report.yaml missing →
+        # MEDIUM writer_qa_unrun.
+        os.remove(os.path.join(d, "writer_qa_report.yaml"))
+        vw3 = _check_writer_qa(d)
+        ok(any(v["severity"] == "MEDIUM" for v in vw3),
+           f"W3: report without writer_qa should fire MEDIUM, got {vw3}")
+
+    # U1-U3: _check_universal_coverage
+    with tempfile.TemporaryDirectory() as d:
+        # U1: no allocation → silent
+        vu1 = _check_universal_coverage(d)
+        ok(not vu1, f"U1: no allocation = no fire, got {vu1}")
+
+        # U2: allocation present, no universal_coverage.yaml → MEDIUM
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "lga_allocation.csv"), "w") as f:
+            f.write("lga,package\nA,X\n")
+        vu2 = _check_universal_coverage(d)
+        ok(any(v["kind"] == "universal_coverage_missing"
+               and v["severity"] == "MEDIUM" for v in vu2),
+           f"U2: missing universal_coverage.yaml should fire MEDIUM, got {vu2}")
+
+        # U3: allocation + valid universal_coverage.yaml → silent
+        with open(os.path.join(d, "models", "universal_coverage.yaml"), "w") as f:
+            f.write(
+                "scenario:\n"
+                "  description: Universal coverage of standard ITN.\n"
+                "  total_cost: 200000000\n"
+                "  dalys_averted: 500000\n"
+                "comparator:\n"
+                "  description: Optimized allocation.\n"
+                "  total_cost: 320000000\n"
+                "  dalys_averted: 476000\n"
+                "verdict: OPTIMIZED_BEATS_UNIVERSAL\n"
+            )
+        vu3 = _check_universal_coverage(d)
+        ok(not any(v["kind"] == "universal_coverage_missing" for v in vu3),
+           f"U3: present universal_coverage.yaml should not fire missing, got {vu3}")
+
+    # DR-X: _check_decision_rule_artifact unreadable-file path
+    # (Phase 10 Commit χ — previously a binary file would crash)
+    with tempfile.TemporaryDirectory() as d:
+        # Need an allocation present so the check runs
+        with open(os.path.join(d, "lga_allocation.csv"), "w") as f:
+            f.write("lga,package\nA,X\n")
+        # Write a binary blob as decision_rule.md
+        with open(os.path.join(d, "decision_rule.md"), "wb") as f:
+            f.write(bytes(range(256)))  # invalid UTF-8 byte sequence
+        vdr = _check_decision_rule_artifact(d)
+        ok(any(v["kind"] == "decision_rule_unreadable"
+               and v["severity"] == "HIGH" for v in vdr),
+           f"DR-X: binary decision_rule.md should fire HIGH "
+           f"decision_rule_unreadable, got {vdr}")
+
+    # DR-Acc: severity recalibration on decision_rule_low_accuracy
+    # (Phase 10 Commit χ — 0.85 is now MEDIUM, < 0.75 is HIGH)
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "lga_allocation.csv"), "w") as f:
+            f.write("lga,package\nA,X\n")
+        # 0.85 accuracy with no exceptions → MEDIUM (was HIGH pre-χ)
+        with open(os.path.join(d, "decision_rule.md"), "w") as f:
+            f.write(
+                "---\nrule_type: tabular\n---\n"
+                "## Features\nx\n"
+                "## Rule\ny\n"
+                "## Validation\n"
+                "- accuracy_vs_optimizer: 0.85\n"
+                "- exceptions_count: 0\n"
+            )
+        vdr_med = _check_decision_rule_artifact(d)
+        med_hits = [v for v in vdr_med
+                    if v["kind"] == "decision_rule_low_accuracy"]
+        ok(any(v["severity"] == "MEDIUM" for v in med_hits),
+           f"DR-Acc: 0.85 accuracy with 0 exceptions should fire MEDIUM, "
+           f"got {med_hits}")
+        ok(not any(v["severity"] == "HIGH" for v in med_hits),
+           f"DR-Acc: 0.85 accuracy must NOT fire HIGH (recalibrated), "
+           f"got {med_hits}")
+
+        # 0.70 accuracy with no exceptions → HIGH (still)
+        with open(os.path.join(d, "decision_rule.md"), "w") as f:
+            f.write(
+                "---\nrule_type: tabular\n---\n"
+                "## Features\nx\n"
+                "## Rule\ny\n"
+                "## Validation\n"
+                "- accuracy_vs_optimizer: 0.70\n"
+                "- exceptions_count: 0\n"
+            )
+        vdr_high = _check_decision_rule_artifact(d)
+        high_hits = [v for v in vdr_high
+                     if v["kind"] == "decision_rule_low_accuracy"]
+        ok(any(v["severity"] == "HIGH" for v in high_hits),
+           f"DR-Acc: 0.70 accuracy with 0 exceptions should fire HIGH, "
+           f"got {high_hits}")
 
     # --- Summary ---
     if failures:
