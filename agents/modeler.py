@@ -284,6 +284,74 @@ This self-check costs ~5-10 image reads per modeler turn (PNG reads
 are fast). It catches the class of issues that has caused ≈30% of
 late-round HIGH blockers across prior malaria runs.
 
+### Figure validator contract (Phase 9 Commit ρ — write-time invariant)
+
+The Phase 8 Commit ξ multimodal self-check above is judgment-based
+and proved unreliable in the 0013 live run: D-022 (stale AIC values
+in `model_comparison.png`) and D-023 (stale calibration scatter)
+were not caught until round 8 with no rounds left to regenerate.
+Phase 9 makes figure freshness a write-time invariant the
+modeler's own code enforces — no agent in the pipeline has to
+"remember" to look.
+
+**After every `plt.savefig()` call**, your figure script MUST call
+`validate_figure(...)` from `scripts/figure_validator.py`:
+
+```python
+from figure_validator import validate_figure  # add scripts/ to sys.path
+
+fig, ax = plt.subplots()
+ax.plot(zone_pfpr_observed, zone_pfpr_modeled, "o")
+ax.set_title(f"Calibration scatter — RMSE = {rmse:.2f}pp (n = {len(df)} LGAs)")
+plt.savefig(f"{run_dir}/figures/calibration_scatter.png", dpi=150)
+plt.close()
+
+validate_figure(
+    f"{run_dir}/figures/calibration_scatter.png",
+    source_data_paths=[f"{run_dir}/data/lga_pfpr_observed.csv",
+                       f"{run_dir}/models/zone_calibration.csv"],
+    expected_annotations=[
+        f"RMSE = {rmse:.2f}pp",
+        "Calibration scatter",
+    ],
+)
+```
+
+`validate_figure` writes a sidecar `<png>.provenance.json` recording
+the SHA-256 hash of every source CSV at write time and the
+annotation strings you assert appear in the figure. Two enforcement
+checks fire in `validate_critique_yaml.py` per round:
+
+1. **`figure_staleness_detected` HIGH** — if any source CSV's hash
+   later differs from the recorded hash, the figure was drawn from
+   data that has since changed (the D-022 / D-023 failure mode).
+   Regenerate from current data and re-call `validate_figure()`.
+
+2. **`figure_validator_missing` MEDIUM** — every `plt.savefig` must
+   have a `validate_figure(` call within the next 10 lines. The
+   gate scans your `*.py` files and fires this if any savefig is
+   uncovered.
+
+`expected_annotations` are checked at write time against the
+calling script's source text (with the `validate_figure(...)` call
+itself stripped before search). The check is intentionally loose:
+the string must appear SOMEWHERE in the script — title call,
+legend, axis label, OR a comment / docstring co-located with the
+drawing code. It does NOT prove the string is the figure's actual
+title. The point is to keep the asserted text co-located with the
+script that drew the figure: the common drift case (script
+regenerated → annotation, comment, and title-call all updated
+together) is caught; a modeler who carefully maintains stale
+literals in comments WILL silently pass. List the annotations that
+matter for the figure's claim — typically the headline number(s),
+the comparator labels, and the verdict text. If you cannot list
+any (e.g., a pure scatter with no overlaid text), pass
+`expected_annotations=[]`.
+
+If a figure is genuinely untraceable to a CSV (e.g., a schematic
+diagram), pass `source_data_paths=[]`. Staleness then cannot fire,
+but the validator-call coverage check is still satisfied.
+
 ## THREAD UPDATES
 
 After building each model and generating figures, update {run_dir}/threads.yaml:
@@ -431,6 +499,31 @@ archetypes and the plan specifies N archetypes, you MUST either:
 After calibration, produce three additional artifacts that feed the
 STAGE 5b mechanical rigor checks:
 
+### Rigor artifact timeline (Phase 9 Commit τ — draft early, iterate)
+
+Rigor artifacts are NOT one-shot round-8 gate-checks. The 0013 run's
+sensitivity_analysis.yaml arrived in round 8 with verdict UNSTABLE
+and zero remaining rounds to act on it; identifiability.yaml hit the
+same trap in earlier runs. **Draft each artifact at its earliest
+defensible round so per-round critique can iterate** — that is the
+entire point of having multiple critique rounds.
+
+| Artifact | First draft | Finalize | What "draft" means |
+|---|---|---|---|
+| `models/outcome_fn.py` | r1-2 | r3 | Calibration callable returning a single deterministic outcome dict; can be coarse. |
+| `models/model_comparison.yaml` | r1-2 | r3 | At least null + simple + full candidate; AIC/BIC can be approximate. |
+| `models/identifiability.yaml` | r1-2 | r3 | Manifest with point estimates + bounds; loss function pointwise (see §3 contract). |
+| `models/sensitivity_analysis.yaml` | **r2-3** | r6-7 | After your FIRST optimizer pass; 2 load-bearing parameters, one alternative value each. Expand perturbations and tighten verdicts in later rounds. |
+| `models/allocation_robustness.yaml` | r3-4 | r6 | Leave-one-archetype-out CV on the draft allocation; per-fold metrics may be coarse initially. |
+| `decision_rule.md` | r6-7 | r7 | Derived from finalized allocation; this one is genuinely late by construction. |
+
+When the rigor gate fires MEDIUM `*_missing` in an early round, treat
+it as a nudge to draft the artifact, not as a blocker to ignore. The
+0013 sensitivity analysis was technically MEDIUM in rounds 1-7
+(MEDIUM does not block ACCEPT) but the modeler deferred it until the
+allocation was final, then could not act on the resulting UNSTABLE
+verdict because rounds were exhausted. Don't repeat that pattern.
+
 ### 1. Uncertainty quantification — `{run_dir}/models/outcome_fn.py`
 
 Expose a deterministic callable `outcome_fn(params: dict) -> dict` that
@@ -510,6 +603,24 @@ likelihood scans, flagging any parameter that's ridge-trapped
 Unidentified parameters used in policy outputs are a HIGH blocker.
 Resolve via informative priors, tying redundant parameters, or
 removing the parameter (fix at a default).
+
+**The loss function MUST be pointwise** (Phase 9 Commit σ contract).
+`calibration_loss(params: dict) -> float` MUST evaluate residuals at
+the EXACT supplied parameter values. It MUST NOT call any optimizer,
+calibrator, or fitter inside — every internal `scipy.optimize`,
+`minimize`, calibration loop, or ABM grid-search would compensate for
+your perturbation and return a constant value, producing flat
+profile-likelihood curves for every parameter and a guaranteed
+false-positive UNIDENTIFIED_PARAMETERS verdict. Two prior runs (1721,
+0013) wasted a HIGH RIG-001 blocker on this exact code artifact.
+
+`scripts/identifiability.py` now calls `assert_loss_fn_is_pointwise`
+before running profile scans; a re-optimizing loss raises
+`LossFunctionReoptimizesError` at load time and identifiability.yaml
+will not be written. If your model has no analytic residual (loss is
+only definable as the output of a calibration loop), declare scope in
+§Limitations and skip identifiability — DO NOT submit a re-optimizing
+loss.
 
 ### 4c. Allocation cross-validation (Phase 6 Commit κ — when allocation is produced)
 
@@ -707,14 +818,41 @@ and MEDIUM `plan_criterion_not_tested` per criterion whose artifact
 field is missing. Do NOT silently drop a promised criterion — either
 populate the field or scope-declare why it's unachievable.
 
-### 4g. Sensitivity analysis on load-bearing parameters (Phase 8 Commit π)
+### 4g. Sensitivity analysis on load-bearing parameters (Phase 8 Commit π, Phase 9 Commit τ)
 
-When this run produces an allocation, you MUST also produce
+When this run produces an allocation, you MUST produce
 `{run_dir}/models/sensitivity_analysis.yaml` perturbing the 2-3
 LOAD-BEARING parameters of the recommendation and reporting whether
 the primary recommendation flips. A senior modeler does not stop at
 "the optimizer ran"; they re-run the optimizer at alternative
 parameter values and report whether the policy choice survives.
+
+**Two-phase contract** (Phase 9 Commit τ): the artifact is not a
+round-8 one-shot. Draft it after your FIRST optimizer pass — round
+2-3 — and iterate as your allocation evolves:
+
+- **Draft (round 2-3)**: list at least 2 load-bearing parameters,
+  one alternative value each (e.g., a 95% CI endpoint or a competing
+  published estimate). Run the optimizer once at each alternative
+  value and record `rank_change_top_n`, `primary_recommendation_changes`.
+  Verdict can be preliminary; perturbations may be sparse. The
+  point is to surface fragility while there are still rounds to act.
+
+- **Iterate (rounds 4-6)**: as the allocation stabilizes, expand to
+  3 parameters and add the second perturbation per parameter (both
+  CI endpoints, not just one). If a perturbation is producing an
+  UNSTABLE verdict, this is the round where you fix it — narrow
+  the parameter range with stronger evidence, switch to a more
+  robust objective, or scope-declare in §Limitations.
+
+- **Finalize (round 6-7, before STAGE 7)**: full perturbation grid,
+  reported verdict matches computed verdict (the validator rejects
+  any mismatch as MALFORMED), notes section explains each load-
+  bearing choice.
+
+The 0013 run's sensitivity_analysis.yaml first appeared in round 8
+with UNSTABLE verdict and 0 remaining rounds — exactly the failure
+mode this two-phase contract is designed to prevent.
 
 **Identifying load-bearing parameters**: which parameter, if changed
 to its alternative published value (or 95% CI endpoint), would change

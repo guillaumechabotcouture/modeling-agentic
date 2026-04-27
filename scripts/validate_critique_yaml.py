@@ -1106,6 +1106,9 @@ def _check_rigor_artifacts(run_dir: str) -> list[dict]:
     # Phase 8 Commit π: load-bearing parameter sensitivity analysis.
     violations.extend(_check_sensitivity_analysis(run_dir))
 
+    # Phase 9 Commit ρ: write-time figure validator + provenance check.
+    violations.extend(_check_figure_validator(run_dir))
+
     return violations
 
 
@@ -1798,6 +1801,125 @@ def _check_sensitivity_analysis(run_dir: str) -> list[dict]:
                 f"alternative parameter values flip the choice."
             ),
         })
+    return out
+
+
+# How many lines of lookahead after a savefig() call we tolerate
+# before requiring a validate_figure() call. 10 fits the typical
+# pattern of `plt.savefig(...); plt.close(); validate_figure(...)`.
+_VALIDATOR_LOOKAHEAD_LINES = 10
+
+
+def _check_figure_validator(run_dir: str) -> list[dict]:
+    """Phase 9 Commit ρ: write-time figure validator.
+
+    Two complementary checks fire per round:
+
+    1. Source-data freshness — for every `<png>.provenance.json`
+       sidecar in `{run_dir}/figures/`, recompute hashes of each
+       recorded source CSV. If any hash differs, the figure was
+       drawn from data that has since changed (the D-022 / D-023
+       failure mode). Severity HIGH `figure_staleness_detected`.
+
+    2. Validator-call coverage — every `*.py` file in `{run_dir}/`
+       and `{run_dir}/models/` is scanned for `plt.savefig(`. Each
+       savefig must have a `validate_figure(` within the next
+       `_VALIDATOR_LOOKAHEAD_LINES` lines, and the corresponding
+       PNG must have a `.provenance.json` sidecar at gate time.
+       Missing validator call → MEDIUM `figure_validator_missing`.
+
+    The check is silent when no figures exist (e.g., before any
+    modeler round has produced output). It is intentionally NOT
+    gated on allocation presence: figures are part of every run.
+    """
+    figures_dir = os.path.join(run_dir, "figures")
+    out: list[dict] = []
+
+    # --- Check 1: source-data freshness via sidecar hash compare ---
+    if os.path.isdir(figures_dir):
+        # Lazy-load figure_validator.check_staleness once. Same
+        # importlib pattern as _check_sensitivity_analysis above.
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "figure_validator",
+                os.path.join(os.path.dirname(__file__), "figure_validator.py"),
+            )
+            fv_mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(fv_mod)
+        except Exception as e:
+            out.append({
+                "kind": "figure_validator_load_error",
+                "severity": "HIGH",
+                "stage": "ANALYZE",
+                "claim": f"Could not load scripts/figure_validator.py: {e}",
+            })
+            return out
+
+        for entry in sorted(os.listdir(figures_dir)):
+            if not entry.endswith(".png"):
+                continue
+            png_path = os.path.join(figures_dir, entry)
+            sidecar = png_path + ".provenance.json"
+            if not os.path.exists(sidecar):
+                # Missing sidecar handled by check 2 (script-level
+                # coverage scan); skip here.
+                continue
+            status = fv_mod.check_staleness(png_path)
+            if status["status"] == "stale":
+                stale_list = ", ".join(status.get("stale_sources", [])
+                                       + status.get("missing_sources", []))
+                out.append({
+                    "kind": "figure_staleness_detected",
+                    "severity": "HIGH",
+                    "stage": "ANALYZE",
+                    "claim": (
+                        f"Figure {entry} was drawn from source data that "
+                        f"has since changed. The recorded provenance "
+                        f"hash no longer matches the current content of: "
+                        f"{stale_list}. Regenerate the figure from the "
+                        f"current data and re-call validate_figure(). "
+                        f"This is the D-022 / D-023 failure mode "
+                        f"(corrected AIC values, stale calibration "
+                        f"residuals) that the 0013 run caught only at "
+                        f"round 8."
+                    ),
+                })
+
+    # --- Check 2: every plt.savefig must have a validate_figure nearby ---
+    py_files: list[str] = []
+    for root in (run_dir, os.path.join(run_dir, "models")):
+        if not os.path.isdir(root):
+            continue
+        for entry in os.listdir(root):
+            if entry.endswith(".py"):
+                py_files.append(os.path.join(root, entry))
+
+    for py in py_files:
+        try:
+            with open(py) as f:
+                lines = f.readlines()
+        except OSError:
+            continue
+        for idx, ln in enumerate(lines):
+            if "plt.savefig(" not in ln and ".savefig(" not in ln:
+                continue
+            window = "".join(lines[idx:idx + _VALIDATOR_LOOKAHEAD_LINES])
+            if "validate_figure(" not in window:
+                out.append({
+                    "kind": "figure_validator_missing",
+                    "severity": "MEDIUM",
+                    "stage": "ANALYZE",
+                    "claim": (
+                        f"{os.path.relpath(py, run_dir)}:{idx + 1} calls "
+                        f"savefig but no validate_figure(...) appears "
+                        f"within the next {_VALIDATOR_LOOKAHEAD_LINES} "
+                        f"lines. Phase 9 Commit ρ requires every "
+                        f"plt.savefig to be paired with a validate_figure "
+                        f"call so source-data hashes and annotation "
+                        f"strings are recorded at write time. See "
+                        f"scripts/figure_validator.py for the API."
+                    ),
+                })
     return out
 
 
@@ -3324,6 +3446,108 @@ def _run_self_test() -> int:
         vm6 = _check_sensitivity_analysis(d)
         ok(not vm6,
            f"M6: no allocation = no requirement, got {vm6}")
+
+    # --- Phase 9 Commit ρ: write-time figure validator ---
+    with tempfile.TemporaryDirectory() as d:
+        figs = os.path.join(d, "figures")
+        os.makedirs(figs)
+        models_dir = os.path.join(d, "models")
+        os.makedirs(models_dir)
+
+        # F1: empty run dir, no figures → silent.
+        vf1 = _check_figure_validator(d)
+        ok(not vf1, f"F1: empty run dir = no fire, got {vf1}")
+
+        # F2: a script with plt.savefig but no validate_figure within
+        # 10 lines → MEDIUM figure_validator_missing.
+        with open(os.path.join(models_dir, "model_figures.py"), "w") as f:
+            f.write(
+                "import matplotlib.pyplot as plt\n"
+                "fig, ax = plt.subplots()\n"
+                "ax.plot([1, 2, 3])\n"
+                "plt.savefig('figures/eda.png')\n"
+                "plt.close()\n"
+            )
+        vf2 = _check_figure_validator(d)
+        ok(any(v["kind"] == "figure_validator_missing"
+               and v["severity"] == "MEDIUM" for v in vf2),
+           f"F2: savefig without validate_figure should fire MEDIUM, "
+           f"got {vf2}")
+
+        # F3: same script with validate_figure within 10 lines → silent
+        # (no provenance needed because no PNG actually exists; check 1
+        # is silent on missing-sidecar PNGs and check 2 sees the
+        # validate_figure call within the lookahead window).
+        with open(os.path.join(models_dir, "model_figures.py"), "w") as f:
+            f.write(
+                "import matplotlib.pyplot as plt\n"
+                "from figure_validator import validate_figure\n"
+                "fig, ax = plt.subplots()\n"
+                "ax.plot([1, 2, 3])\n"
+                "plt.savefig('figures/eda.png')\n"
+                "plt.close()\n"
+                "validate_figure('figures/eda.png', source_data_paths=[],\n"
+                "                expected_annotations=[])\n"
+            )
+        vf3 = _check_figure_validator(d)
+        ok(not any(v["kind"] == "figure_validator_missing" for v in vf3),
+           f"F3: savefig with validate_figure within 10 lines should not "
+           f"fire figure_validator_missing, got {vf3}")
+
+        # F4: a PNG with a stale provenance sidecar → HIGH
+        # figure_staleness_detected. Construct the sidecar by hand
+        # with a recorded hash that won't match the actual CSV.
+        png = os.path.join(figs, "stale_fig.png")
+        with open(png, "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
+        src_csv = os.path.join(d, "models", "src.csv")
+        with open(src_csv, "w") as f:
+            f.write("a,b\n1,2\n")
+        # Write a sidecar claiming a hash that's not actually the CSV's.
+        with open(png + ".provenance.json", "w") as f:
+            json.dump({
+                "png_path": os.path.abspath(png),
+                "generator_script": None,
+                "source_hashes": {src_csv: "deadbeef" * 8},
+                "expected_annotations": [],
+                "expected_n_data_points": None,
+                "written_at_utc": "2026-04-27T00:00:00Z",
+            }, f)
+        vf4 = _check_figure_validator(d)
+        ok(any(v["kind"] == "figure_staleness_detected"
+               and v["severity"] == "HIGH" for v in vf4),
+           f"F4: hash mismatch should fire HIGH figure_staleness_detected, "
+           f"got {vf4}")
+
+        # F5: a fresh sidecar (current hash matches CSV) → no staleness
+        # fire. Recompute the hash properly via figure_validator helper.
+        spec = importlib.util.spec_from_file_location(
+            "figure_validator",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "figure_validator.py"),
+        )
+        fv = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fv)
+        with open(png + ".provenance.json", "w") as f:
+            json.dump({
+                "png_path": os.path.abspath(png),
+                "generator_script": None,
+                "source_hashes": {src_csv: fv._hash_file(src_csv)},
+                "expected_annotations": [],
+                "expected_n_data_points": None,
+                "written_at_utc": "2026-04-27T00:00:00Z",
+            }, f)
+        vf5 = _check_figure_validator(d)
+        ok(not any(v["kind"] == "figure_staleness_detected" for v in vf5),
+           f"F5: matching hash should not fire staleness, got {vf5}")
+
+        # F6: a missing source file referenced in the sidecar → still
+        # treated as stale (the source the figure was drawn from is
+        # gone, so the figure cannot be defended).
+        os.remove(src_csv)
+        vf6 = _check_figure_validator(d)
+        ok(any(v["kind"] == "figure_staleness_detected" for v in vf6),
+           f"F6: missing source CSV should fire staleness, got {vf6}")
 
     # --- Summary ---
     if failures:
