@@ -1096,6 +1096,28 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None) -> list[dic
     # Phase 9 Commit ρ: write-time figure validator + provenance check.
     violations.extend(_check_figure_validator(run_dir))
 
+    # Phase 12 Commit α: cross-file numeric consistency check.
+    # Catches the failure mode the 104914 run shipped: 4+ verifiable
+    # internal numeric inconsistencies (cost-per-case $5.05 vs $4.71
+    # in same file, figure_rationale stale by 2.4×, title Round 4 vs
+    # actual Round 6) that no validator was comparing across sibling
+    # artifacts. Only redteam caught two of them in round 6.
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "numeric_consistency",
+            os.path.join(os.path.dirname(__file__), "numeric_consistency.py"),
+        )
+        nc_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(nc_mod)
+        violations.extend(nc_mod.check_numeric_consistency(run_dir))
+    except Exception as e:
+        violations.append({
+            "kind": "numeric_consistency_load_error",
+            "severity": "HIGH",
+            "stage": "WRITE",
+            "claim": f"Could not load scripts/numeric_consistency.py: {e}",
+        })
+
     # Phase 10 Commit ψ: allocation-gate coordinator. The five
     # allocation-triggered checks (optimization_quality, daly,
     # allocation_robustness, universal_coverage, sensitivity_analysis)
@@ -1108,6 +1130,25 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None) -> list[dic
     # `allocation_rigor_in_progress` (still in drafting window) or
     # `allocation_rigor_drafts_overdue` (past deadline).
     violations.extend(_check_allocation_rigor_status(run_dir, round_n=round_n))
+
+    # Phase 12 Commit γ: ecological-fallacy / within-zone heterogeneity
+    # check. When the model calibrates to k zones but allocates to
+    # n>>k spatial units (Nigeria 6→774 in 104914), within-zone
+    # variation is invisible to the optimizer. Require an artifact
+    # bounding the impact loss when the aggregation ratio is high.
+    violations.extend(_check_within_zone_heterogeneity(run_dir))
+
+    # Phase 12 Commit β: round-aware escalation of persisting MEDIUMs.
+    # Catches the failure mode the 104914 run shipped: 18 figure_
+    # validator_missing MEDIUMs persisted r2→r6, presentation P-005..
+    # P-009 persisted r1→r6, decision_rule_self_referential persisted
+    # r2→r6 — none blocked ACCEPT because MEDIUM doesn't, and the
+    # contracts had no "ignored 4 rounds in a row, escalating"
+    # mechanism. Escalates qualifying persistent MEDIUMs to HIGH so
+    # ACCEPT is forced to either fix or scope-declare explicitly.
+    if round_n is not None:
+        violations.extend(_check_persistent_medium_escalation(
+            run_dir, round_n=round_n))
 
     return violations
 
@@ -2041,6 +2082,311 @@ def _check_allocation_rigor_status(run_dir: str,
                 f"rounds left to act."
             ),
         })
+    return out
+
+
+# Phase 12 Commit γ: ecological-fallacy / within-zone heterogeneity.
+#
+# When calibration_units / allocation_units < 0.1 (ecological
+# aggregation likely), require models/within_zone_heterogeneity.yaml
+# bounding the impact loss. The 104914 run had 6 zones → 774 LGAs
+# (ratio 0.0078), with within-zone PfPR varying 5.9%-77.3% per
+# data_quality.md. results.md acknowledges this in one line; the
+# magnitude is unbounded. A reviewer cannot tell if the headline
+# 54.7M cases averted would drop by 5%, 15%, or 30% under realistic
+# within-zone heterogeneity.
+_ECOLOGICAL_AGGREGATION_THRESHOLD = 0.1
+
+
+def _detect_calibration_allocation_ratio(run_dir: str) -> tuple[int, int] | None:
+    """Detect (calibration_units, allocation_units) pair from a run
+    dir. Returns None if either count is unavailable.
+
+    calibration_units: from models/model_comparison_formal.yaml
+        n_targets field (the number of zone-level calibration targets).
+    allocation_units: from models/lga_allocation.csv (row count
+        excluding header), or any *allocation*.csv in models/.
+    """
+    cal_path = os.path.join(run_dir, "model_comparison_formal.yaml")
+    if not os.path.exists(cal_path):
+        cal_path = os.path.join(run_dir, "models", "model_comparison_formal.yaml")
+    cal_units: int | None = None
+    if os.path.exists(cal_path):
+        try:
+            with open(cal_path) as f:
+                doc = yaml.safe_load(f) or {}
+            n_targets = doc.get("n_targets")
+            if isinstance(n_targets, int):
+                cal_units = n_targets
+        except (yaml.YAMLError, OSError):
+            pass
+
+    alloc_units: int | None = None
+    for entry in (os.listdir(os.path.join(run_dir, "models"))
+                  if os.path.isdir(os.path.join(run_dir, "models")) else []):
+        if "allocation" in entry and entry.endswith(".csv"):
+            try:
+                with open(os.path.join(run_dir, "models", entry)) as f:
+                    rows = sum(1 for _ in f) - 1  # exclude header
+                if rows > 0 and (alloc_units is None or rows > alloc_units):
+                    alloc_units = rows
+            except OSError:
+                continue
+
+    if cal_units is None or alloc_units is None or alloc_units == 0:
+        return None
+    return (cal_units, alloc_units)
+
+
+def _check_within_zone_heterogeneity(run_dir: str) -> list[dict]:
+    """Phase 12 Commit γ: when calibration_units / allocation_units
+    < 0.1, require models/within_zone_heterogeneity.yaml bounding
+    the impact loss from ecological aggregation.
+
+    Emits:
+      within_zone_heterogeneity_missing      MEDIUM — yaml absent
+                                                       and ratio < 0.1
+      within_zone_heterogeneity_malformed    HIGH   — yaml schema/verdict
+                                                       violations
+      within_zone_heterogeneity_unbounded    HIGH   — UNBOUNDED verdict
+                                                       (>25% impact loss)
+      within_zone_heterogeneity_inconclusive MEDIUM — INCONCLUSIVE
+                                                       (10-25% loss)
+    """
+    pair = _detect_calibration_allocation_ratio(run_dir)
+    if pair is None:
+        return []  # no calibration/allocation detected; check is silent
+    cal_units, alloc_units = pair
+    ratio = cal_units / alloc_units
+    if ratio >= _ECOLOGICAL_AGGREGATION_THRESHOLD:
+        return []  # not aggregating much; check is silent
+
+    yaml_path = os.path.join(run_dir, "models", "within_zone_heterogeneity.yaml")
+    if not os.path.exists(yaml_path):
+        return [{
+            "kind": "within_zone_heterogeneity_missing",
+            "severity": "MEDIUM",
+            "stage": "MODEL",
+            "claim": (
+                f"Model calibrates to {cal_units} units but allocates to "
+                f"{alloc_units} units (ratio {ratio:.4f} < "
+                f"{_ECOLOGICAL_AGGREGATION_THRESHOLD}). Within-unit "
+                f"heterogeneity is invisible to the optimizer; the "
+                f"impact loss is unbounded. Required artifact: "
+                f"`models/within_zone_heterogeneity.yaml` bounding the "
+                f"impact loss from realistic within-unit value variation. "
+                f"See the ecological-fallacy-quantification skill and "
+                f"scripts/within_zone_sensitivity.py for the schema."
+            ),
+        }]
+
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "within_zone_sensitivity",
+            os.path.join(os.path.dirname(__file__),
+                         "within_zone_sensitivity.py"),
+        )
+        wzs = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(wzs)
+    except Exception as e:
+        return [{
+            "kind": "within_zone_heterogeneity_malformed",
+            "severity": "HIGH",
+            "stage": "MODEL",
+            "claim": f"Could not load scripts/within_zone_sensitivity.py: {e}",
+        }]
+
+    result = wzs.validate_within_zone_heterogeneity(yaml_path)
+    out: list[dict] = []
+    if result["verdict"] == "MALFORMED":
+        out.append({
+            "kind": "within_zone_heterogeneity_malformed",
+            "severity": "HIGH",
+            "stage": "MODEL",
+            "claim": (f"models/within_zone_heterogeneity.yaml is malformed: "
+                      f"{'; '.join(result['errors'])}"),
+        })
+    elif result["verdict"] == "UNBOUNDED":
+        s = result.get("summary", {})
+        out.append({
+            "kind": "within_zone_heterogeneity_unbounded",
+            "severity": "HIGH",
+            "stage": "MODEL",
+            "claim": (
+                f"Within-zone heterogeneity sensitivity verdict UNBOUNDED: "
+                f"worst-case impact loss "
+                f"{s.get('worst_loss_pct', 0):.1f}% under realistic "
+                f"within-unit variation. The headline cases-averted is "
+                f"NOT defensible at the LGA level. Either narrow the "
+                f"perturbation range with stronger evidence (e.g., "
+                f"sub-zone PfPR sample), refit at the lower aggregation "
+                f"level, or scope-declare the recommendation as zone-"
+                f"level only."
+            ),
+        })
+    elif result["verdict"] == "INCONCLUSIVE":
+        s = result.get("summary", {})
+        out.append({
+            "kind": "within_zone_heterogeneity_inconclusive",
+            "severity": "MEDIUM",
+            "stage": "MODEL",
+            "claim": (
+                f"Within-zone heterogeneity verdict INCONCLUSIVE: "
+                f"worst-case impact loss "
+                f"{s.get('worst_loss_pct', 0):.1f}%. Surface in §Sensitivity "
+                f"of report.md, not just §Limitations. The 10-25% range "
+                f"is publication-defensible but a Global Fund reviewer "
+                f"will want to see the explicit bound."
+            ),
+        })
+    return out
+
+
+# Phase 12 Commit β: round-aware MEDIUM-to-HIGH escalation ledger.
+#
+# A MEDIUM that fires the same way for ≥ N rounds is signal the
+# modeler is ignoring it. The 104914 run had 18 figure_validator_
+# missing MEDIUMs persist r2→r6 because MEDIUM doesn't block ACCEPT
+# and no validator escalated. This ledger maps validator-emitted
+# kinds to their persistence-to-HIGH threshold (number of distinct
+# rounds the kind appears in stage7_round*_stderr.txt).
+#
+# Critique-blocker IDs (e.g., P-005, R-007) are escalated separately
+# via `first_seen_round` in the critique YAML — see _escalate_
+# critique_blockers below.
+_VALIDATOR_KIND_ESCALATION_THRESHOLDS = {
+    "figure_validator_missing": 4,
+    "decision_rule_self_referential": 3,
+    "optimization_quality_missing": 4,
+    # `optimization_quality_*_failed` includes the R-005-class
+    # "no ILP benchmark" MEDIUMs that persisted in 104914
+    "optimization_quality_alternative_missing": 4,
+}
+
+# Critique-blocker IDs from critique-presentation that should
+# escalate after persisting N rounds. (Phase 11 review surfaced
+# P-005 through P-009 persisting all 6 rounds.)
+_CRITIQUE_BLOCKER_ESCALATION_THRESHOLD = 4  # rounds since first_seen
+
+
+def _check_persistent_medium_escalation(run_dir: str,
+                                        round_n: int) -> list[dict]:
+    """Phase 12 Commit β: scan stage7_round*_stderr.txt for validator
+    MEDIUMs that have persisted across multiple rounds and the round
+    critique YAMLs for blocker MEDIUMs with old `first_seen_round`.
+    Re-emit qualifying entries as HIGH so the gate forces fix-or-
+    scope-declare rather than passing.
+
+    Returns a list of HIGH `<kind>_persistent` and
+    `<id>_persistent` violations. Silent if nothing escalates.
+
+    Known limitation (Path A — validator-kind escalation): persistence
+    is counted by scanning `stage7_round{N}_stderr.txt` files in the
+    run dir. The lead is supposed to write one per gate invocation,
+    but in practice not every round's stderr is saved (the 104914 run
+    only had rounds 2/3/4 stderr present, no rounds 5/6). When earlier
+    rounds' stderr is missing, the count is a LOWER BOUND, and a
+    genuinely-persistent MEDIUM may not reach the threshold via Path A.
+    Path B (critique-blocker escalation via `first_seen_round` in the
+    YAML) is more reliable because the YAML is overwritten each round
+    and the field is explicitly set by the critique agent.
+    """
+    out: list[dict] = []
+
+    # --- Path A: validator-kind escalation via stderr scan ---
+    # The lead writes stage7_round{N}_stderr.txt at gate time.
+    # Count the distinct rounds where each tracked kind appears.
+    rounds_with_kind: dict[str, set[int]] = {
+        kind: set() for kind in _VALIDATOR_KIND_ESCALATION_THRESHOLDS}
+    for entry in os.listdir(run_dir) if os.path.isdir(run_dir) else []:
+        m = re.match(r"stage7_round(\d+)_stderr\.txt$", entry)
+        if not m:
+            continue
+        try:
+            n = int(m.group(1))
+        except ValueError:
+            continue
+        try:
+            with open(os.path.join(run_dir, entry), encoding="utf-8") as f:
+                text = f.read()
+        except (UnicodeDecodeError, OSError):
+            continue
+        for kind in _VALIDATOR_KIND_ESCALATION_THRESHOLDS:
+            if kind in text:
+                rounds_with_kind[kind].add(n)
+
+    for kind, rounds_seen in rounds_with_kind.items():
+        threshold = _VALIDATOR_KIND_ESCALATION_THRESHOLDS[kind]
+        if len(rounds_seen) >= threshold:
+            sorted_rounds = sorted(rounds_seen)
+            out.append({
+                "kind": f"{kind}_persistent",
+                "severity": "HIGH",
+                "stage": "GATE",
+                "claim": (
+                    f"{kind} MEDIUM has persisted across "
+                    f"{len(rounds_seen)} distinct rounds "
+                    f"({sorted_rounds}) without resolution. Phase 12 "
+                    f"Commit β escalates to HIGH after "
+                    f"{threshold} rounds — the modeler must either "
+                    f"resolve the underlying issue (e.g., add "
+                    f"validate_figure() calls, fix the decision-rule "
+                    f"self-reference, or run an ILP benchmark) or "
+                    f"explicitly scope-declare why it cannot be "
+                    f"resolved within the pipeline."
+                ),
+            })
+
+    # --- Path B: critique-blocker escalation via first_seen_round ---
+    # Walk each critique YAML's blockers list. For MEDIUM blockers
+    # with first_seen_round set and resolved != True, escalate to
+    # HIGH if (round_n - first_seen_round) >= threshold.
+    for reviewer_yaml in ("critique_methods.yaml", "critique_domain.yaml",
+                          "critique_presentation.yaml",
+                          "critique_redteam.yaml"):
+        path = os.path.join(run_dir, reviewer_yaml)
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path) as f:
+                doc = yaml.safe_load(f) or {}
+        except (yaml.YAMLError, OSError):
+            continue
+        for blocker in doc.get("blockers") or []:
+            if not isinstance(blocker, dict):
+                continue
+            severity = blocker.get("severity")
+            if severity != "MEDIUM":
+                continue
+            if blocker.get("resolved") is True:
+                continue
+            first_seen = blocker.get("first_seen_round")
+            if first_seen is None:
+                continue
+            try:
+                persisted = int(round_n) - int(first_seen)
+            except (TypeError, ValueError):
+                continue
+            if persisted < _CRITIQUE_BLOCKER_ESCALATION_THRESHOLD:
+                continue
+            blocker_id = blocker.get("id", "<unknown>")
+            short_claim = str(blocker.get("claim") or "").strip().split("\n")[0][:140]
+            out.append({
+                "kind": f"{blocker_id}_persistent",
+                "severity": "HIGH",
+                "stage": "GATE",
+                "claim": (
+                    f"{reviewer_yaml.replace('.yaml','')} blocker "
+                    f"{blocker_id} (MEDIUM) first seen in round "
+                    f"{first_seen}, still unresolved at round "
+                    f"{round_n} ({persisted} rounds persistence ≥ "
+                    f"{_CRITIQUE_BLOCKER_ESCALATION_THRESHOLD}). "
+                    f"Phase 12 Commit β escalates to HIGH. Fix the "
+                    f"underlying issue or scope-declare. Original: "
+                    f"\"{short_claim}\""
+                ),
+            })
+
     return out
 
 
@@ -3973,6 +4319,99 @@ def _run_self_test() -> int:
            f"in_progress MEDIUM, got {[v['kind'] for v in vq6]}")
         ok(len(legacy_missing) == 0,
            f"Q6: legacy *_missing must be consolidated, got {legacy_missing}")
+
+    # --- Phase 12 Commit β: round-aware escalation of persisting MEDIUMs ---
+
+    # E1: validator-kind escalation — figure_validator_missing in 4
+    # distinct stage7_round*_stderr.txt files at round_n=6 → HIGH.
+    with tempfile.TemporaryDirectory() as d:
+        for rn in (2, 3, 4, 5):
+            with open(os.path.join(d, f"stage7_round{rn}_stderr.txt"), "w") as f:
+                f.write(f"unresolved_high: 0 blocker(s)\n"
+                        f"  - [MEDIUM] ANALYZE/figure_validator_missing: "
+                        f"eda.py:{rn*10} calls savefig...\n")
+        ve1 = _check_persistent_medium_escalation(d, round_n=6)
+        ok(any(v["kind"] == "figure_validator_missing_persistent"
+               and v["severity"] == "HIGH" for v in ve1),
+           f"E1: figure_validator_missing in 4 rounds should escalate "
+           f"HIGH, got {ve1}")
+
+    # E2: same kind in 3 rounds (below threshold) → silent.
+    with tempfile.TemporaryDirectory() as d:
+        for rn in (2, 3, 4):
+            with open(os.path.join(d, f"stage7_round{rn}_stderr.txt"), "w") as f:
+                f.write("[MEDIUM] figure_validator_missing\n")
+        ve2 = _check_persistent_medium_escalation(d, round_n=4)
+        ok(not any(v["kind"] == "figure_validator_missing_persistent"
+                   for v in ve2),
+           f"E2: 3 rounds is below threshold (4); should NOT escalate, "
+           f"got {ve2}")
+
+    # E3: decision_rule_self_referential in 3 rounds (threshold=3) → HIGH.
+    with tempfile.TemporaryDirectory() as d:
+        for rn in (2, 3, 4):
+            with open(os.path.join(d, f"stage7_round{rn}_stderr.txt"), "w") as f:
+                f.write("[MEDIUM] decision_rule_self_referential: rule references optimizer\n")
+        ve3 = _check_persistent_medium_escalation(d, round_n=4)
+        ok(any(v["kind"] == "decision_rule_self_referential_persistent"
+               and v["severity"] == "HIGH" for v in ve3),
+           f"E3: decision_rule_self_referential at threshold 3 should "
+           f"escalate, got {ve3}")
+
+    # E4: critique-blocker MEDIUM with old first_seen_round → HIGH.
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "critique_presentation.yaml"), "w") as f:
+            f.write(
+                "reviewer: critique-presentation\n"
+                "round: 6\n"
+                "blockers:\n"
+                "  - id: P-005\n"
+                "    severity: MEDIUM\n"
+                "    first_seen_round: 1\n"
+                "    claim: Tornado chart Y-axis uses code names\n"
+                "    resolved: false\n"
+            )
+        ve4 = _check_persistent_medium_escalation(d, round_n=6)
+        ok(any(v["kind"] == "P-005_persistent"
+               and v["severity"] == "HIGH" for v in ve4),
+           f"E4: P-005 first_seen=1 at round 6 (5 rounds persistence ≥ 4) "
+           f"should escalate, got {ve4}")
+
+    # E5: critique-blocker MEDIUM resolved → silent.
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "critique_presentation.yaml"), "w") as f:
+            f.write(
+                "reviewer: critique-presentation\n"
+                "round: 6\n"
+                "blockers:\n"
+                "  - id: P-005\n"
+                "    severity: MEDIUM\n"
+                "    first_seen_round: 1\n"
+                "    resolved: true\n"
+                "    claim: was resolved in round 4\n"
+            )
+        ve5 = _check_persistent_medium_escalation(d, round_n=6)
+        ok(not any(v["kind"] == "P-005_persistent" for v in ve5),
+           f"E5: resolved blocker should NOT escalate, got {ve5}")
+
+    # E6: critique-blocker MEDIUM persistence below threshold → silent.
+    # first_seen=4, round=6 → persisted only 2 rounds; threshold 4.
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "critique_presentation.yaml"), "w") as f:
+            f.write(
+                "reviewer: critique-presentation\n"
+                "round: 6\n"
+                "blockers:\n"
+                "  - id: P-099\n"
+                "    severity: MEDIUM\n"
+                "    first_seen_round: 4\n"
+                "    claim: recent issue\n"
+                "    resolved: false\n"
+            )
+        ve6 = _check_persistent_medium_escalation(d, round_n=6)
+        ok(not any(v["kind"] == "P-099_persistent" for v in ve6),
+           f"E6: 2 rounds persistence (below threshold 4) should NOT "
+           f"escalate, got {ve6}")
 
     # --- Phase 11 Commit υ (F3): STAGE 7 mandatory flag enforcement ---
     import subprocess

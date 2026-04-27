@@ -5,6 +5,8 @@ import argparse
 import json
 import os
 import re
+import shutil
+import sys
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -287,6 +289,63 @@ async def run(question: str, max_rounds: int, max_sessions: int,
             lead_prompt = build_lead_prompt(question, run_dir_rel, max_rounds, resume_context)
             print(f"Restarting pipeline (session {session_num + 1})...", flush=True)
 
+    # Phase 12 Commit δ: report.md persistence safety net.
+    # The 104914 run had a 32-second window between writer-QA passing
+    # CLEAN (which proves report.md existed) and main.py's final-state
+    # check (which found it gone). No `rm` in the log; cause unknown.
+    # Defensive: if writer_qa_report.yaml says CLEAN, ensure a snapshot
+    # exists. If report.md is gone but the snapshot exists, restore it
+    # and flag the recovery in meta["status"]. Pre-existing bug; this
+    # is a safety net, not a root-cause fix.
+    report_path = os.path.join(run_path, "report.md")
+    snapshot_path = os.path.join(run_path, "report.snapshot.md")
+    qa_yaml_path = os.path.join(run_path, "writer_qa_report.yaml")
+    writer_qa_clean = False
+    try:
+        if os.path.exists(qa_yaml_path):
+            with open(qa_yaml_path) as f:
+                qa_text = f.read()
+            # writer_qa_report.yaml has `verdict: CLEAN` on a line of
+            # its own when no major / minor issues remain. Cheap regex
+            # lookup avoids a yaml import at this point in main.py.
+            if "verdict: CLEAN" in qa_text:
+                writer_qa_clean = True
+    except OSError:
+        pass
+
+    if writer_qa_clean and os.path.exists(report_path):
+        # Snapshot the report immediately so any later disappearance
+        # is recoverable.
+        try:
+            shutil.copyfile(report_path, snapshot_path)
+        except OSError as e:
+            print(f"[WARNING] could not snapshot report.md: {e}", flush=True)
+
+    # If report.md is gone but writer_qa was CLEAN and snapshot exists,
+    # restore from snapshot. This catches the 104914 failure mode.
+    report_restored = False
+    if (writer_qa_clean and not os.path.exists(report_path)
+            and os.path.exists(snapshot_path)):
+        try:
+            shutil.copyfile(snapshot_path, report_path)
+            report_restored = True
+            print(f"[WARNING] report.md was missing despite CLEAN "
+                  f"writer_qa; restored from {snapshot_path}", flush=True)
+        except OSError as e:
+            print(f"[ERROR] report.md missing AND restore failed: {e}",
+                  flush=True)
+
+    # Fail-loud assertion: report.md missing but writer_qa was CLEAN
+    # is the 104914 failure mode. Always log to stderr so external
+    # orchestrators see it.
+    if writer_qa_clean and not os.path.exists(report_path):
+        print(
+            "[ERROR] report.md is missing despite CLEAN writer_qa "
+            "verdict. Pipeline state corrupted between writer-QA and "
+            "final state check. Investigate stage7_round*_stderr.txt "
+            "and trace.jsonl for the file's deletion path.",
+            file=sys.stderr, flush=True)
+
     # Save final metadata
     elapsed = (datetime.now() - run_start).total_seconds()
     metadata_path = os.path.join(run_path, "metadata.json")
@@ -296,10 +355,13 @@ async def run(question: str, max_rounds: int, max_sessions: int,
     # finished (kept for backward compat with existing readers).
     # `status` is the new authoritative discriminator: "completed" |
     # "interrupted" | "policy_blocked" | "max_sessions_reached" |
-    # "unknown_error". Automation should consult `status`, not the
-    # presence of `completed`.
+    # "unknown_error" | "completed_with_report_restored" (Phase 12 δ).
+    # Automation should consult `status`, not the presence of `completed`.
     meta["completed"] = datetime.now().isoformat()
-    meta["status"] = terminal_status
+    if report_restored:
+        meta["status"] = "completed_with_report_restored"
+    else:
+        meta["status"] = terminal_status
     meta["elapsed_s"] = elapsed
     meta["sessions"] = session_num
     meta["has_report"] = os.path.exists(os.path.join(run_path, "report.md"))
