@@ -118,7 +118,23 @@ def build_agents() -> dict[str, AgentDefinition]:
                     # starsim_ai: starsim framework
                     "starsim-dev-intro", "starsim-dev-diseases",
                     "starsim-dev-interventions", "starsim-dev-calibration",
-                    "starsim-dev-networks", "starsim-dev-demographics"],
+                    "starsim-dev-networks", "starsim-dev-demographics",
+                    # Phase 10 Commit φ: rigor skills the modeler must read
+                    # to satisfy the validator's gates. Previously orphaned
+                    # despite being referenced in modeler prose and gate
+                    # error messages — a major contributor to the 0013
+                    # RIG-001/002/003 unresolvable-blocker pattern.
+                    "identifiability-analysis",
+                    "multi-structural-comparison",
+                    "uncertainty-quantification",
+                    "allocation-cross-validation",
+                    "decision-rule-extraction",
+                    "optimizer-method-selection",
+                    "daly-weighted-analysis",
+                    "mechanistic-vs-hybrid-architecture",
+                    # Phase 10 Commit ω: remediation skill for SENSITIVE
+                    # / UNSTABLE sensitivity verdicts (RIG-003 escalation).
+                    "sensitivity-analysis-remediation"],
         ),
         "model-tester": AgentDefinition(
             description=modeler.MODEL_TESTER_DESCRIPTION,

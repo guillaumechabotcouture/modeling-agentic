@@ -4,6 +4,8 @@ A multi-agent system for building publication-quality epidemiological and public
 
 Built on the [Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview).
 
+> **Working in this codebase?** Read [`CLAUDE.md`](./CLAUDE.md) first — it lays out the four layers (orchestration / rigor gates / skills / runs), the skill-to-agent attachment matrix, the Phase 1-10 commit ledger, and the rigor-artifact timeline.
+
 ## Architecture
 
 A single **lead agent** orchestrates ten specialist subagents through a staged pipeline. The lead reads and writes files, delegates via the `Agent` tool, invokes the mechanical validator, makes PATCH/RETHINK decisions, and tracks state in `pipeline_state.yaml` for crash-safe resume.

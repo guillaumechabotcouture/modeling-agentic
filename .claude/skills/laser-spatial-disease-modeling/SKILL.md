@@ -55,17 +55,23 @@ If `season.mean() != 1.0`, the effective transmission rate is systematically hig
 
 **After building ANY component, verify it. After running ANY simulation, verify outputs.**
 
-The `scripts/verification_checks.py` module provides 5 automated checks:
+Implement these 5 automated checks inline in your `models/` directory
+(prior bundled `scripts/verification_checks.py` was never shipped — see
+`runs/*/models/` for working examples that build and call them):
+
 - `check_population_trajectory()` — catches wrong birthrate units
 - `check_compartment_nonnegativity()` — catches depletion bugs
 - `check_vaccination_effect()` — catches the susceptibility-vs-state bug
 - `check_spatial_coupling()` — catches zero networks
 - `check_epidemic_dynamics()` — catches beta-too-low or missing importation
 
-Call `verify_model_health(model)` after every `model.run()`:
+Call `verify_model_health(model)` after every `model.run()`. Expected
+shape:
 
 ```python
-from verification_checks import verify_model_health
+def verify_model_health(model, raise_on_critical=True):
+    """Run 5 sanity checks and report. Define inline in your models/ dir."""
+    ...
 
 model.run("Simulation")
 verify_model_health(model)  # Prints report, raises on critical failures
@@ -321,10 +327,18 @@ RoutineImmunizationEx(model, coverage_fn, dose_timing)
 
 #### Option B: VaccinationCampaign (custom, simpler API)
 
-From `scripts/custom_components.py`. Supports correlated missedness for hard-to-reach populations:
+Define inline in your `models/` directory (no bundled
+`custom_components.py` — implement the class yourself; see
+`runs/*/models/` for prior working implementations). Supports
+correlated missedness for hard-to-reach populations:
 
 ```python
-from custom_components import VaccinationCampaign
+# In models/custom_components.py (your own file):
+class VaccinationCampaign:
+    """State-based vaccination with optional correlated missedness."""
+    def __init__(self, model, period, coverage, age_lower, age_upper,
+                 unreachable_frac=0.0):
+        ...
 
 VaccinationCampaign(model, period=180, coverage=coverage_array,
                     age_lower=0, age_upper=5*365,
@@ -379,7 +393,9 @@ model.components = [
 # Set up gravity network (Step 4) then run:
 model.run("Simulation")
 
-# ALWAYS verify after running:
+# ALWAYS verify after running. Define verify_model_health() inline in
+# your models/ directory implementing the 5 sanity checks from §1.3.
+# (Add models/ to sys.path; this is an absolute import, not relative.)
 from verification_checks import verify_model_health
 verify_model_health(model)
 ```
@@ -412,13 +428,13 @@ class MyComponent:
         pass
 ```
 
-**Production pattern** (from `scripts/custom_components.py`):
+**Production pattern** (implement in your `models/custom_components.py`):
 - `__init__`: Store model reference, add custom properties, validate inputs
 - `step(tick)`: Main logic — modify states, update node counts
 - `on_birth(istart, iend, tick)`: Initialize per-agent properties for newborns
 - Always update node-level counts (`nodes.S`, `nodes.R`) when changing agent states
 
-See `scripts/custom_components.py` for complete reference implementations of `Importation`, `VaccinationCampaign`, and `SeasonalTransmission`.
+For working reference implementations of `Importation`, `VaccinationCampaign`, and `SeasonalTransmission`, see prior runs under `runs/*/models/`.
 
 ---
 
@@ -468,7 +484,7 @@ class MySpatialSEIR(BaseModel):
         ...
 ```
 
-A complete disease-agnostic template is in `scripts/laser_basemodel.py`. Customize the component list, parameter ranges, and output extractors for your disease.
+For a disease-agnostic `SpatialSEIRModel(BaseModel)` template, see prior runs under `runs/*/models/` and adapt the component list, parameter ranges, and output extractors for your disease.
 
 **Next step:** Use the `modelops-calabaria` skill for calibration workflow (Sobol sweeps, Optuna optimization, scenario analysis).
 
@@ -507,7 +523,7 @@ If the model health report shows failures, consult Layer 3 below for diagnosis.
 
 ### 3.1 Post-Build Verification Suite
 
-Run after every `model.run()` using `verify_model_health(model)` from `scripts/verification_checks.py`. The 5 checks:
+Run after every `model.run()` using `verify_model_health(model)` from your inline `models/verification_checks.py` (implement per §1.3 — no bundled module ships with this skill). The 5 checks:
 
 | Check | What It Catches | Critical? |
 |-------|-----------------|-----------|
@@ -600,14 +616,12 @@ plt.xlabel("Day"); plt.ylabel("R/N"); plt.show()
 
 ---
 
-## Bundled Resources
+## Reference Material
 
-- **`scripts/custom_components.py`** — `Importation` (susceptible-targeted seeding), `VaccinationCampaign` (correct state-based vaccination with correlated missedness), and `SeasonalTransmission` (advanced customization example)
-- **`scripts/calibration_metrics.py`** — CCS logistic fitting, wavelet phase similarity scoring, combined ranking, and `compute_calibration_loss()` bridge for calabaria `TrialResult`
-- **`scripts/laser_basemodel.py`** — Disease-agnostic `SpatialSEIRModel(BaseModel)` template with post-run verification
-- **`scripts/verification_checks.py`** — 5 automated model health checks: population trajectory, compartment non-negativity, vaccination effect, spatial coupling, epidemic dynamics. Call `verify_model_health(model)` after every run.
 - **`references/laser_api_reference.md`** — Complete LASER v1.0.0 API documentation (Model, LaserFrame, PropertySet, all component variants, vital dynamics, migration models, distributions)
 - **`references/wavelet_analysis.md`** — Wavelet transform functions, phase difference computation, and traveling wave detection workflow
+
+For working **example implementations** of `Importation`, `VaccinationCampaign`, `SeasonalTransmission`, `verify_model_health`, the calibration metrics (CCS logistic fitting, wavelet phase scoring, `compute_calibration_loss`), and a `SpatialSEIRModel(BaseModel)` template, see prior runs under `runs/*/models/`. These are not bundled with this skill — implement them inline in your own `models/` directory, copying the patterns from a prior run that solved a similar disease.
 
 ---
 

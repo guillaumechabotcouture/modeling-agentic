@@ -26,6 +26,7 @@ error rather than swallowing it.
 from __future__ import annotations
 
 import argparse
+import glob
 import importlib.util
 import json
 import os
@@ -942,7 +943,7 @@ def _check_uq_ci_quality(uq_report_path: str) -> list[dict]:
     return violations
 
 
-def _check_rigor_artifacts(run_dir: str) -> list[dict]:
+def _check_rigor_artifacts(run_dir: str, round_n: int | None = None) -> list[dict]:
     """Check for Phase 2 rigor artifacts. Returns a list of violations.
 
     Each rigor stage has a prerequisite + an artifact:
@@ -1080,19 +1081,11 @@ def _check_rigor_artifacts(run_dir: str) -> list[dict]:
     # models have no fitted parameters. Don't force this check universally.
 
     # Decision rule (Phase 3 Commit C): required when an allocation CSV exists.
+    # decision_rule_missing is HIGH — passes through unchanged below.
     violations.extend(_check_decision_rule_artifact(run_dir))
 
     # Phase 4 Commit δ: cross-comparator efficiency outlier check.
     violations.extend(_check_comparator_efficiency(run_dir))
-
-    # Phase 6 Commit θ: optimizer-quality benchmark.
-    violations.extend(_check_optimization_quality(run_dir))
-
-    # Phase 6 Commit ι: DALY-first analysis when allocation produced.
-    violations.extend(_check_daly_when_allocation(run_dir))
-
-    # Phase 6 Commit κ: allocation cross-validation.
-    violations.extend(_check_allocation_robustness(run_dir))
 
     # Phase 7 Commit λ: STAGE 8.5 WRITER_QA pass.
     violations.extend(_check_writer_qa(run_dir))
@@ -1100,14 +1093,21 @@ def _check_rigor_artifacts(run_dir: str) -> list[dict]:
     # Phase 7 Commit μ: plan-promised criteria enforcement.
     violations.extend(_check_plan_criteria(run_dir))
 
-    # Phase 7 Commit ν: universal-coverage benchmark.
-    violations.extend(_check_universal_coverage(run_dir))
-
-    # Phase 8 Commit π: load-bearing parameter sensitivity analysis.
-    violations.extend(_check_sensitivity_analysis(run_dir))
-
     # Phase 9 Commit ρ: write-time figure validator + provenance check.
     violations.extend(_check_figure_validator(run_dir))
+
+    # Phase 10 Commit ψ: allocation-gate coordinator. The five
+    # allocation-triggered checks (optimization_quality, daly,
+    # allocation_robustness, universal_coverage, sensitivity_analysis)
+    # were previously called individually here, each emitting its own
+    # MEDIUM `*_missing` violation. The 0013 round-2 critique reported
+    # 5 simultaneous MEDIUMs — noise that conditioned the modeler to
+    # defer rather than draft early. The coordinator runs all five,
+    # passes through every HIGH unchanged, and consolidates the
+    # MEDIUM `*_missing` violations into a single round-aware
+    # `allocation_rigor_in_progress` (still in drafting window) or
+    # `allocation_rigor_drafts_overdue` (past deadline).
+    violations.extend(_check_allocation_rigor_status(run_dir, round_n=round_n))
 
     return violations
 
@@ -1923,25 +1923,146 @@ def _check_figure_validator(run_dir: str) -> list[dict]:
     return out
 
 
+# Phase 10 Commit ψ: allocation-gate coordinator.
+#
+# Per the Phase 9 τ rigor-artifact-timeline, each allocation-
+# triggered artifact has a "draft by round X" deadline. After that
+# round, a MEDIUM `*_missing` becomes a `drafts_overdue` MEDIUM —
+# signaling the modeler is past the planned drafting window and at
+# real risk of arriving at STAGE 7 with no time to fix verdict
+# failures. Within the drafting window, all missing artifacts roll
+# up into a single `in_progress` MEDIUM rather than the modeler
+# seeing 5 individual `*_missing` violations.
+_ALLOCATION_DRAFT_DEADLINES = {
+    "sensitivity_analysis_missing": 4,    # τ says draft r2-3
+    "allocation_robustness_missing": 5,   # τ says draft r3-4
+    "universal_coverage_missing":   5,    # not on τ; treated as r3-4 draft
+    "daly_analysis_missing":        5,    # not on τ; produced with allocation
+    "optimization_quality_missing": 5,    # not on τ; produced with allocation
+}
+
+# The five MEDIUM `_missing` kinds the coordinator consolidates. HIGH
+# verdicts (UNSTABLE, MALFORMED, etc.) and HIGH `decision_rule_missing`
+# are NOT consolidated — they pass through unchanged so the lead's
+# STAGE 7 logic still sees real failures.
+_ALLOCATION_MEDIUM_MISSING_KINDS = frozenset(_ALLOCATION_DRAFT_DEADLINES.keys())
+
+
+def _check_allocation_rigor_status(run_dir: str,
+                                   round_n: int | None = None) -> list[dict]:
+    """Phase 10 Commit ψ: coordinate the five allocation-triggered
+    rigor checks.
+
+    Calls each helper, then:
+      1. Pass through every non-MEDIUM-missing violation unchanged
+         (HIGHs always; MEDIUM verdict failures like `*_sensitive`).
+      2. Collect the MEDIUM `_missing` kinds (5 of them).
+      3. If `round_n` is None, fall back to legacy behavior — the
+         five `_missing` violations are returned individually as
+         before. This preserves callers that don't pass round_n.
+      4. If `round_n` is supplied:
+           - For each missing artifact, look up its deadline.
+           - Within the drafting window: emit a single
+             `allocation_rigor_in_progress` MEDIUM listing the
+             missing artifacts.
+           - Past at least one deadline: emit a single
+             `allocation_rigor_drafts_overdue` MEDIUM listing the
+             overdue artifacts (and any still-in-window ones, for
+             context).
+    """
+    raw: list[dict] = []
+    raw.extend(_check_optimization_quality(run_dir))
+    raw.extend(_check_daly_when_allocation(run_dir))
+    raw.extend(_check_allocation_robustness(run_dir))
+    raw.extend(_check_universal_coverage(run_dir))
+    raw.extend(_check_sensitivity_analysis(run_dir))
+
+    out: list[dict] = []
+    missing_kinds: list[dict] = []
+    for v in raw:
+        if (v.get("kind") in _ALLOCATION_MEDIUM_MISSING_KINDS
+                and v.get("severity") == "MEDIUM"):
+            missing_kinds.append(v)
+        else:
+            # Pass through HIGHs and other MEDIUMs unchanged.
+            out.append(v)
+
+    if not missing_kinds:
+        return out
+
+    if round_n is None:
+        # Legacy mode: behave exactly as before — return all five
+        # MEDIUMs individually so callers without round context see
+        # no behavior change.
+        out.extend(missing_kinds)
+        return out
+
+    overdue: list[str] = []
+    in_progress: list[str] = []
+    for v in missing_kinds:
+        deadline = _ALLOCATION_DRAFT_DEADLINES.get(v["kind"], 5)
+        artifact = v["kind"].replace("_missing", "")
+        if round_n > deadline:
+            overdue.append(f"{artifact} (deadline r{deadline})")
+        else:
+            in_progress.append(f"{artifact} (deadline r{deadline})")
+
+    if overdue:
+        details = "Overdue: " + "; ".join(overdue)
+        if in_progress:
+            details += ". Still in window: " + "; ".join(in_progress) + "."
+        else:
+            details += "."
+        out.append({
+            "kind": "allocation_rigor_drafts_overdue",
+            "severity": "MEDIUM",
+            "stage": "OPTIMIZATION",
+            "claim": (
+                f"Allocation rigor artifacts past their drafting "
+                f"deadline (round {round_n}). {details} The Phase 9 τ "
+                f"timeline asks for these to be drafted (even with "
+                f"placeholder values) earlier so per-round critique "
+                f"can iterate on verdicts. Arriving at STAGE 7 with a "
+                f"first draft of sensitivity_analysis or allocation_"
+                f"robustness is exactly the 0013 failure mode."
+            ),
+        })
+    else:
+        out.append({
+            "kind": "allocation_rigor_in_progress",
+            "severity": "MEDIUM",
+            "stage": "OPTIMIZATION",
+            "claim": (
+                f"Allocation rigor artifacts in drafting window "
+                f"(round {round_n}). Pending: "
+                f"{'; '.join(in_progress)}. This is a coordinated "
+                f"reminder, not a blocker — draft each artifact "
+                f"early so verdict failures surface while there are "
+                f"rounds left to act."
+            ),
+        })
+    return out
+
+
 # Phase 3 Commit C: decision rule as required rigor artifact.
-import glob as _glob_module
-import re as _re_module
+# (Phase 10 Commit χ: removed mid-file aliased re/glob imports;
+# `re` is imported at the top of the file and `glob` joined it.)
 
 _ALLOCATION_GLOBS = ("*allocation*.csv", "*budget*.csv", "*optimization*.csv")
-_DECISION_RULE_FRONTMATTER_RE = _re_module.compile(
-    r"^---\s*\n(.+?)\n---\s*\n", _re_module.DOTALL
+_DECISION_RULE_FRONTMATTER_RE = re.compile(
+    r"^---\s*\n(.+?)\n---\s*\n", re.DOTALL
 )
 _REQUIRED_RULE_SECTIONS = ("## Features", "## Rule", "## Validation")
 _VALID_RULE_TYPES = {
     "tabular", "tree", "prose-with-exceptions", "non-compressible",
 }
-_ACCURACY_RE = _re_module.compile(
+_ACCURACY_RE = re.compile(
     r"^\s*-?\s*`?accuracy_vs_optimizer`?\s*[:=]\s*([0-9.]+)",
-    _re_module.MULTILINE,
+    re.MULTILINE,
 )
-_EXCEPTIONS_COUNT_RE = _re_module.compile(
+_EXCEPTIONS_COUNT_RE = re.compile(
     r"^\s*-?\s*`?exceptions_count`?\s*[:=]\s*(\d+)",
-    _re_module.MULTILINE,
+    re.MULTILINE,
 )
 
 
@@ -1954,9 +2075,9 @@ def _find_allocation_csvs(run_dir: str) -> list[str]:
     """
     found: list[str] = []
     for pattern in _ALLOCATION_GLOBS:
-        found.extend(_glob_module.glob(os.path.join(run_dir, pattern)))
-        found.extend(_glob_module.glob(os.path.join(run_dir, "data", pattern)))
-        found.extend(_glob_module.glob(os.path.join(run_dir, "models", pattern)))
+        found.extend(glob.glob(os.path.join(run_dir, pattern)))
+        found.extend(glob.glob(os.path.join(run_dir, "data", pattern)))
+        found.extend(glob.glob(os.path.join(run_dir, "models", pattern)))
     return sorted(set(found))
 
 
@@ -1986,8 +2107,25 @@ def _check_decision_rule_artifact(run_dir: str) -> list[dict]:
             ),
         }]
 
-    with open(rule_path) as f:
-        text = f.read()
+    # Phase 10 Commit χ: previously this open() was unguarded — a
+    # binary or UTF-8-corrupt decision_rule.md would crash STAGE 7
+    # entirely instead of emitting a HIGH violation the modeler can
+    # respond to.
+    try:
+        with open(rule_path, encoding="utf-8") as f:
+            text = f.read()
+    except (UnicodeDecodeError, OSError) as e:
+        return [{
+            "kind": "decision_rule_unreadable",
+            "severity": "HIGH",
+            "stage": "OPTIMIZATION",
+            "claim": (
+                f"decision_rule.md exists but cannot be read as UTF-8 "
+                f"text: {type(e).__name__}: {e}. The validator cannot "
+                f"verify the rule schema, self-reference, or accuracy. "
+                f"Re-save decision_rule.md as UTF-8 plain text."
+            ),
+        }]
 
     # Accumulate violations across all checks rather than returning early
     # on the first malformed condition. This lets the Phase 4 γ
@@ -2054,7 +2192,16 @@ def _check_decision_rule_artifact(run_dir: str) -> list[dict]:
             try:
                 accuracy = float(acc_match.group(1))
                 exc_count = int(exc_match.group(1))
-                if accuracy < 0.90 and exc_count == 0:
+                # Phase 10 Commit χ: severity recalibration. The
+                # original threshold fired HIGH at < 0.90, but a 22-
+                # archetype × 8-package allocation rule with 0.85
+                # accuracy is publication-defensible (Global Fund
+                # rules routinely run 0.80-0.90). HIGH should be
+                # reserved for rules that are genuinely indefensible
+                # (< 0.75 with no declared exceptions). The 0.75-0.90
+                # band moves to MEDIUM — surface in §Limitations,
+                # don't block ACCEPT.
+                if accuracy < 0.75 and exc_count == 0:
                     violations.append({
                         "kind": "decision_rule_low_accuracy",
                         "severity": "HIGH",
@@ -2062,11 +2209,29 @@ def _check_decision_rule_artifact(run_dir: str) -> list[dict]:
                         "claim": (
                             f"decision_rule.md claims rule_type={rule_type!r} "
                             f"with accuracy_vs_optimizer={accuracy:.2f} and "
-                            f"exceptions_count=0. You cannot claim a rule with "
-                            f"< 0.90 accuracy AND no declared exceptions. "
+                            f"exceptions_count=0. < 0.75 accuracy with no "
+                            f"declared exceptions is indefensible — a "
+                            f"program officer applying this rule would "
+                            f"differ from the optimizer on > 25% of units. "
                             f"Either list the disagreeing units in "
                             f"exceptions_list, or switch rule_type to "
                             f"`non-compressible` with a Justification."
+                        ),
+                    })
+                elif accuracy < 0.90 and exc_count == 0:
+                    violations.append({
+                        "kind": "decision_rule_low_accuracy",
+                        "severity": "MEDIUM",
+                        "stage": "DECISION_RULE",
+                        "claim": (
+                            f"decision_rule.md claims rule_type={rule_type!r} "
+                            f"with accuracy_vs_optimizer={accuracy:.2f} and "
+                            f"exceptions_count=0. Accuracy in the 0.75-0.90 "
+                            f"band is publication-defensible but should be "
+                            f"surfaced in §Limitations: a program officer "
+                            f"applying this rule will differ from the "
+                            f"optimizer on 10-25% of units. Consider listing "
+                            f"the largest-disagreement units as exceptions."
                         ),
                     })
             except (ValueError, TypeError):
@@ -3549,6 +3714,266 @@ def _run_self_test() -> int:
         ok(any(v["kind"] == "figure_staleness_detected" for v in vf6),
            f"F6: missing source CSV should fire staleness, got {vf6}")
 
+    # --- Phase 10 Commit χ: validator robustness self-tests ---
+
+    # P1-P2: _check_plan_criteria. (A "malformed schema" case would
+    # require coordinating with scripts/plan_criteria.py's
+    # evaluate_plan_criteria contract, which isn't in this commit's
+    # scope; the missing-yaml MEDIUM is the path most likely to drift.)
+    with tempfile.TemporaryDirectory() as d:
+        # P1: no plan.md → silent (legacy runs without plan are out of scope)
+        vp1 = _check_plan_criteria(d)
+        ok(not vp1, f"P1: no plan.md = no fire, got {vp1}")
+
+        # P2: plan.md exists but no success_criteria.yaml → MEDIUM
+        # plan_criteria_missing (the planner forgot to emit it).
+        with open(os.path.join(d, "plan.md"), "w") as f:
+            f.write("# Plan\n")
+        vp2 = _check_plan_criteria(d)
+        ok(any(v["kind"] == "plan_criteria_missing"
+               and v["severity"] == "MEDIUM" for v in vp2),
+           f"P2: plan.md without success_criteria.yaml should fire MEDIUM, "
+           f"got {vp2}")
+
+    # W1-W3: _check_writer_qa
+    with tempfile.TemporaryDirectory() as d:
+        # W1: no report.md → silent
+        vw1 = _check_writer_qa(d)
+        ok(not vw1, f"W1: no report.md = no fire, got {vw1}")
+
+        # W2: report.md present, writer_qa_report.yaml CLEAN → silent
+        with open(os.path.join(d, "report.md"), "w") as f:
+            f.write("# Report\n")
+        with open(os.path.join(d, "writer_qa_report.yaml"), "w") as f:
+            f.write("verdict: CLEAN\nmajor_issues: []\nminor_issues: []\n")
+        vw2 = _check_writer_qa(d)
+        ok(not vw2, f"W2: CLEAN writer_qa should not fire, got {vw2}")
+
+        # W3: report.md present but writer_qa_report.yaml missing →
+        # MEDIUM writer_qa_unrun.
+        os.remove(os.path.join(d, "writer_qa_report.yaml"))
+        vw3 = _check_writer_qa(d)
+        ok(any(v["severity"] == "MEDIUM" for v in vw3),
+           f"W3: report without writer_qa should fire MEDIUM, got {vw3}")
+
+    # U1-U3: _check_universal_coverage
+    with tempfile.TemporaryDirectory() as d:
+        # U1: no allocation → silent
+        vu1 = _check_universal_coverage(d)
+        ok(not vu1, f"U1: no allocation = no fire, got {vu1}")
+
+        # U2: allocation present, no universal_coverage.yaml → MEDIUM
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "lga_allocation.csv"), "w") as f:
+            f.write("lga,package\nA,X\n")
+        vu2 = _check_universal_coverage(d)
+        ok(any(v["kind"] == "universal_coverage_missing"
+               and v["severity"] == "MEDIUM" for v in vu2),
+           f"U2: missing universal_coverage.yaml should fire MEDIUM, got {vu2}")
+
+        # U3: allocation + valid universal_coverage.yaml → silent
+        with open(os.path.join(d, "models", "universal_coverage.yaml"), "w") as f:
+            f.write(
+                "scenario:\n"
+                "  description: Universal coverage of standard ITN.\n"
+                "  total_cost: 200000000\n"
+                "  dalys_averted: 500000\n"
+                "comparator:\n"
+                "  description: Optimized allocation.\n"
+                "  total_cost: 320000000\n"
+                "  dalys_averted: 476000\n"
+                "verdict: OPTIMIZED_BEATS_UNIVERSAL\n"
+            )
+        vu3 = _check_universal_coverage(d)
+        ok(not any(v["kind"] == "universal_coverage_missing" for v in vu3),
+           f"U3: present universal_coverage.yaml should not fire missing, got {vu3}")
+
+    # DR-X: _check_decision_rule_artifact unreadable-file path
+    # (Phase 10 Commit χ — previously a binary file would crash)
+    with tempfile.TemporaryDirectory() as d:
+        # Need an allocation present so the check runs
+        with open(os.path.join(d, "lga_allocation.csv"), "w") as f:
+            f.write("lga,package\nA,X\n")
+        # Write a binary blob as decision_rule.md
+        with open(os.path.join(d, "decision_rule.md"), "wb") as f:
+            f.write(bytes(range(256)))  # invalid UTF-8 byte sequence
+        vdr = _check_decision_rule_artifact(d)
+        ok(any(v["kind"] == "decision_rule_unreadable"
+               and v["severity"] == "HIGH" for v in vdr),
+           f"DR-X: binary decision_rule.md should fire HIGH "
+           f"decision_rule_unreadable, got {vdr}")
+
+    # DR-Acc: severity recalibration on decision_rule_low_accuracy
+    # (Phase 10 Commit χ — 0.85 is now MEDIUM, < 0.75 is HIGH)
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "lga_allocation.csv"), "w") as f:
+            f.write("lga,package\nA,X\n")
+        # 0.85 accuracy with no exceptions → MEDIUM (was HIGH pre-χ)
+        with open(os.path.join(d, "decision_rule.md"), "w") as f:
+            f.write(
+                "---\nrule_type: tabular\n---\n"
+                "## Features\nx\n"
+                "## Rule\ny\n"
+                "## Validation\n"
+                "- accuracy_vs_optimizer: 0.85\n"
+                "- exceptions_count: 0\n"
+            )
+        vdr_med = _check_decision_rule_artifact(d)
+        med_hits = [v for v in vdr_med
+                    if v["kind"] == "decision_rule_low_accuracy"]
+        ok(any(v["severity"] == "MEDIUM" for v in med_hits),
+           f"DR-Acc: 0.85 accuracy with 0 exceptions should fire MEDIUM, "
+           f"got {med_hits}")
+        ok(not any(v["severity"] == "HIGH" for v in med_hits),
+           f"DR-Acc: 0.85 accuracy must NOT fire HIGH (recalibrated), "
+           f"got {med_hits}")
+
+        # 0.70 accuracy with no exceptions → HIGH (still)
+        with open(os.path.join(d, "decision_rule.md"), "w") as f:
+            f.write(
+                "---\nrule_type: tabular\n---\n"
+                "## Features\nx\n"
+                "## Rule\ny\n"
+                "## Validation\n"
+                "- accuracy_vs_optimizer: 0.70\n"
+                "- exceptions_count: 0\n"
+            )
+        vdr_high = _check_decision_rule_artifact(d)
+        high_hits = [v for v in vdr_high
+                     if v["kind"] == "decision_rule_low_accuracy"]
+        ok(any(v["severity"] == "HIGH" for v in high_hits),
+           f"DR-Acc: 0.70 accuracy with 0 exceptions should fire HIGH, "
+           f"got {high_hits}")
+
+    # --- Phase 10 Commit ψ: allocation-gate coordinator ---
+    # Q1: round 2, allocation present, no rigor artifacts → 1 MEDIUM
+    # `allocation_rigor_in_progress` (NOT 5 separate `*_missing`).
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "lga_allocation.csv"), "w") as f:
+            f.write("lga,package\nA,X\n")
+        with open(os.path.join(d, "decision_rule.md"), "w") as f:
+            f.write("---\nrule_type: tabular\n---\n## Features\n## Rule\n## Validation\n")
+        vq1 = _check_allocation_rigor_status(d, round_n=2)
+        rigor_in_progress = [v for v in vq1
+                             if v["kind"] == "allocation_rigor_in_progress"]
+        legacy_missing = [v for v in vq1
+                          if v["kind"] in _ALLOCATION_MEDIUM_MISSING_KINDS]
+        ok(len(rigor_in_progress) == 1,
+           f"Q1: round 2 should have 1 in_progress MEDIUM, got {vq1}")
+        ok(len(legacy_missing) == 0,
+           f"Q1: round 2 should NOT pass through individual *_missing, "
+           f"got {legacy_missing}")
+
+    # Q2: round 6, sensitivity still missing → 1 MEDIUM
+    # `allocation_rigor_drafts_overdue` (sensitivity deadline is r4).
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "lga_allocation.csv"), "w") as f:
+            f.write("lga,package\nA,X\n")
+        with open(os.path.join(d, "decision_rule.md"), "w") as f:
+            f.write("---\nrule_type: tabular\n---\n## Features\n## Rule\n## Validation\n")
+        vq2 = _check_allocation_rigor_status(d, round_n=6)
+        overdue = [v for v in vq2
+                   if v["kind"] == "allocation_rigor_drafts_overdue"]
+        ok(len(overdue) == 1,
+           f"Q2: round 6 with missing artifacts should fire 1 drafts_overdue, "
+           f"got {vq2}")
+        # The overdue should mention sensitivity_analysis (deadline r4).
+        ok(any("sensitivity_analysis" in v["claim"] for v in overdue),
+           f"Q2: drafts_overdue claim should name sensitivity_analysis, "
+           f"got {overdue}")
+
+    # Q3: HIGH verdict failures pass through unchanged, even with the
+    # coordinator active. UNSTABLE sensitivity at round 8 must still
+    # fire HIGH `sensitivity_analysis_unstable`.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "lga_allocation.csv"), "w") as f:
+            f.write("lga,package\nA,X\n")
+        with open(os.path.join(d, "decision_rule.md"), "w") as f:
+            f.write("---\nrule_type: tabular\n---\n## Features\n## Rule\n## Validation\n")
+        with open(os.path.join(d, "models", "sensitivity_analysis.yaml"), "w") as f:
+            f.write(
+                "load_bearing_parameters:\n"
+                "  - id: SA-001\n"
+                "    parameter: pbo_or\n"
+                "    primary_value: 0.55\n"
+                "    primary_objective: 4565827\n"
+                "    perturbations:\n"
+                "      - value: 0.37\n"
+                "        objective: 4400000\n"
+                "        rank_change_top_n: 50\n"
+                "        primary_recommendation_changes: true\n"
+                "      - value: 0.81\n"
+                "        objective: 4720000\n"
+                "        rank_change_top_n: 40\n"
+                "        primary_recommendation_changes: true\n"
+                "  - id: SA-002\n"
+                "    parameter: smc_irr\n"
+                "    primary_value: 0.27\n"
+                "    primary_objective: 4565827\n"
+                "    perturbations:\n"
+                "      - value: 0.25\n"
+                "        objective: 4640000\n"
+                "        rank_change_top_n: 8\n"
+                "        primary_recommendation_changes: false\n"
+                "verdict: UNSTABLE\n"
+            )
+        vq3 = _check_allocation_rigor_status(d, round_n=8)
+        unstable = [v for v in vq3
+                    if v["kind"] == "sensitivity_analysis_unstable"]
+        ok(len(unstable) == 1 and unstable[0]["severity"] == "HIGH",
+           f"Q3: UNSTABLE sensitivity should still fire HIGH (passes through "
+           f"the coordinator), got {vq3}")
+
+    # Q4: every artifact present and CLEAN → coordinator silent.
+    # (No allocation produced = no rigor checks fire = silent. This
+    # case is the simplest verification that the coordinator doesn't
+    # synthesize false-positive in_progress when there's nothing to
+    # report.)
+    with tempfile.TemporaryDirectory() as d:
+        vq4 = _check_allocation_rigor_status(d, round_n=2)
+        ok(not vq4, f"Q4: no allocation = silent coordinator, got {vq4}")
+
+    # Q5: round_n=None preserves legacy behavior — every missing
+    # artifact comes through individually.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "lga_allocation.csv"), "w") as f:
+            f.write("lga,package\nA,X\n")
+        with open(os.path.join(d, "decision_rule.md"), "w") as f:
+            f.write("---\nrule_type: tabular\n---\n## Features\n## Rule\n## Validation\n")
+        vq5 = _check_allocation_rigor_status(d, round_n=None)
+        legacy_count = sum(1 for v in vq5
+                           if v["kind"] in _ALLOCATION_MEDIUM_MISSING_KINDS)
+        rolled_up = [v for v in vq5
+                     if v["kind"] in ("allocation_rigor_in_progress",
+                                      "allocation_rigor_drafts_overdue")]
+        ok(legacy_count >= 4 and not rolled_up,
+           f"Q5: round_n=None should pass through individual *_missing "
+           f"(legacy behavior, no roll-up), got {vq5}")
+
+    # Q6: `_check_rigor_artifacts` with round_n=2 ALSO produces 1
+    # in_progress MEDIUM (proves the round_n is threaded all the way
+    # through the public entry point).
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "lga_allocation.csv"), "w") as f:
+            f.write("lga,package\nA,X\n")
+        with open(os.path.join(d, "decision_rule.md"), "w") as f:
+            f.write("---\nrule_type: tabular\n---\n## Features\n## Rule\n## Validation\n")
+        vq6 = _check_rigor_artifacts(d, round_n=2)
+        rigor_in_progress = [v for v in vq6
+                             if v["kind"] == "allocation_rigor_in_progress"]
+        legacy_missing = [v for v in vq6
+                          if v["kind"] in _ALLOCATION_MEDIUM_MISSING_KINDS]
+        ok(len(rigor_in_progress) == 1,
+           f"Q6: round_n threaded through _check_rigor_artifacts; expected 1 "
+           f"in_progress MEDIUM, got {[v['kind'] for v in vq6]}")
+        ok(len(legacy_missing) == 0,
+           f"Q6: legacy *_missing must be consolidated, got {legacy_missing}")
+
     # --- Summary ---
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)
@@ -3668,7 +4093,16 @@ def main() -> int:
         )
 
     if args.rigor_artifacts:
-        rigor_violations = _check_rigor_artifacts(args.run_dir)
+        # Phase 10 review fix #3: thread args.current_round through to
+        # _check_rigor_artifacts so the Phase 10 ψ allocation-gate
+        # coordinator can apply round-aware MEDIUM consolidation. The
+        # lead already passes --current-round on every invocation
+        # (see agents/__init__.py around line 392); previously this
+        # call site dropped it on the floor and the new ψ behavior
+        # was unreachable from production.
+        rigor_violations = _check_rigor_artifacts(
+            args.run_dir, round_n=args.current_round,
+        )
         if rigor_violations:
             decision = _incorporate_rigor_violations(
                 decision, rigor_violations,
