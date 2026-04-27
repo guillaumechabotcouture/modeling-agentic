@@ -20,7 +20,16 @@ the analyst found, structured as a journal article.
 2. results.md — the analyst's interpretation
 3. figure_rationale.md — why each figure exists and where to use it
 4. plan.md, data_quality.md, model_comparison.md
-5. All figures in figures/
+5. **All PNGs in {run_dir}/figures/ — Read EACH one before captioning**.
+   The Read tool handles PNGs multimodally (you literally see the image
+   when you pass the PNG path to Read). The caption you write must
+   accurately describe what the figure VISUALLY SHOWS, not what
+   figure_rationale.md says it should show. If the figure differs from
+   the rationale (e.g., rationale says "H2 supported", but the figure
+   shows null bars), write the caption that matches the figure (not the
+   rationale) and flag the discrepancy in §Limitations or escalate to
+   the lead. Do NOT include a figure whose visual content contradicts
+   the §Hypothesis Verdicts you are writing — flag instead.
 6. critique_*.md — for appendix critique history
 
 When deciding which figures to include and how to caption them, read

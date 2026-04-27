@@ -88,7 +88,19 @@ deeper.
    design.
 6. Every file under `{run_dir}/models/` — cross-reference numeric
    literals against both the report and the data CSVs.
-7. `{run_dir}/critique_methods.yaml`, `critique_domain.yaml`,
+7. **Every PNG under `{run_dir}/figures/`** — the Read tool handles
+   PNGs multimodally (you literally see the image when you pass the
+   PNG path to Read). Cross-file numeric audit is your role; that
+   includes cross-checking figure annotations against text claims AND
+   against the underlying CSV/yaml artifacts. Specifically: when you
+   see a comparator claim in the report ("X% improvement", "Y deaths
+   averted", "Z% coverage", "n = N LGAs"), open the corresponding
+   figure and confirm the visual content matches the textual claim.
+   The 1935 fig07 H1 panel showed "+105%" while the body text said
+   "2%" — the only way to catch this kind of inconsistency is to view
+   the figure. Open at least the calibration plot, the allocation
+   map, and every hypothesis-verdict figure (`h*_*.png`).
+8. `{run_dir}/critique_methods.yaml`, `critique_domain.yaml`,
    `critique_presentation.yaml` (when they exist — they run in
    parallel with you) — on round ≥ 2, also your prior round's
    `critique_redteam.yaml`.

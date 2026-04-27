@@ -111,37 +111,106 @@ This is the canonical "what happens when the modeler skips this skill":
 
 **Lesson**: Round 4 should have been round 1. The 1935 modeler wasted 3 rounds and roughly $20-30 of API spend reaching a framing that's standard practice in the field. The hybrid is the right answer; the only reason to deviate is a mechanistic-research question, which allocation analyses are not.
 
-## Quick-start template
+## Quick-start template — explicit Starsim hybrid skeleton
 
-When your run produces an allocation CSV:
+When your run produces an allocation CSV, follow this skeleton. The
+**ABM container MUST be constructed and run** (`ss.Sim(people=ss.People(...))
+.run()`) even if the disease dynamics inside are scalar/compartmental —
+that is precisely the canonical hybrid pattern. The 1721 modeler hit
+2 rounds of `approach_mismatch` cycling because its first attempts
+were "scalar Hill function + RCT multipliers" with no ABM container at
+all. This skeleton is the unambiguous answer.
 
 ```python
-# In your modeler's outcome_fn or burden estimator:
+import starsim as ss
+import numpy as np
 
-# 1. Calibrate baseline PfPR per archetype using your ABM
-calibrated_pfpr = calibrate_starsim_per_archetype(targets_nmis_2021)
+# 1. Define the disease module. Compartmental scalar dynamics inside an
+#    ABM container IS hybrid. The ABM gives you spatial heterogeneity,
+#    explicit time stepping, and Starsim's intervention application
+#    machinery; the disease module gives you tractable transmission
+#    dynamics that are easy to calibrate per archetype.
+class MalariaModel(ss.Module):
+    """SEADTP scalar compartments inside a Starsim ABM container."""
+    def __init__(self, pars=None, **kwargs):
+        super().__init__(pars=pars, **kwargs)
+        # ... S/E/A/D/T/P scalar compartments,
+        #     EIR-driven force of infection, etc.
 
-# 2. Apply published intervention multipliers (NOT ABM-derived effects)
-def intervention_effect(intervention, p0):
-    """Convert published OR/RR to RR at baseline PfPR p0."""
+    def step(self):
+        # scalar compartment updates (S/E/A/D/T/P, etc.)
+        ...
+
+# 2. Calibrate baseline transmission with the ABM (one Sim per archetype):
+def calibrate_per_archetype(archetype_id: int, target_pfpr: float) -> float:
+    """Binary-search EIR scaling factor to hit target PfPR."""
+    sim = ss.Sim(
+        n_agents=1000,                                # explicit ABM size
+        people=ss.People(n_agents=1000),              # ss.People constructor
+        diseases=MalariaModel(pars={"eir_scale": 1.0}),
+        interventions=[],                             # baseline (no interventions)
+        dur=ss.years(3),
+        unit="month",
+    )
+    sim.run()                                          # ABM runs here
+    return sim.results["pfpr_mean"]
+
+# 3. Apply published RCT/meta-analysis multipliers AT ALLOCATION TIME
+#    (NOT inside the ABM dynamics — keeping these separate is what
+#    makes this hybrid rather than full-mechanistic).
+def intervention_effect_multiplier(intervention: str, p0: float) -> float:
+    """OR / RR / IRR from published meta-analyses, returned as RR at p0."""
     if intervention == "llin_standard":
-        OR = 0.44  # Yang 2018
-        RR = OR / ((1 - p0) + p0 * OR)
+        OR = 0.44                          # Yang 2018
+        return OR / ((1 - p0) + p0 * OR)   # OR → RR at baseline PfPR p0
     elif intervention == "pbo_llin":
-        # 44% prevalence reduction vs standard (Protopopoff 2018)
-        RR_standard = intervention_effect("llin_standard", p0)
-        RR = RR_standard * 0.56  # 44% additional reduction
+        OR = 0.55                          # Protopopoff 2018 lifecycle
+        return OR / ((1 - p0) + p0 * OR)
     elif intervention == "irs_non_pyrethroid":
-        OR = 0.35  # Zhou 2022
-        RR = OR / ((1 - p0) + p0 * OR)
-    elif intervention == "smc":
-        return 0.27  # RR for clinical malaria, U5 only — Thwing 2024
-    # ... etc.
-    return RR
+        OR = 0.35                          # Zhou 2022
+        return OR / ((1 - p0) + p0 * OR)
+    elif intervention == "smc_under5":
+        return 0.27                        # Thwing 2024 IRR — clinical
+    elif intervention == "rts_s":
+        return 0.61                        # Asante 2024 IRR — clinical, U5
+    raise ValueError(intervention)
 
-# 3. Compute cases averted = baseline_cases * (1 - RR_combination)
-# 4. Compute DALYs averted with age-stratified weights (see daly-weighted-analysis skill)
+# 4. Compute cases averted = baseline_cases * (1 - combined_RR)
+# 5. Compute DALYs averted with age-stratified weights
+#    (see daly-weighted-analysis skill).
 ```
+
+## What hybrid is NOT
+
+These patterns LOOK like hybrid but actually skip the ABM step. The
+spec-compliance gate (Phase 1.5 Commit B + Phase 8 Commit ο) catches
+most of them as `approach_mismatch` HIGH:
+
+❌ **Scalar Hill function PfPR=f(EIR) + RCT multipliers.** No ABM
+   container. Will fail spec-compliance approach_mismatch.
+
+❌ **ODE compartmental + RCT multipliers.** Same problem if not
+   wrapped in `ss.Sim()`. Pure `scipy.integrate.solve_ivp` is not
+   hybrid; it is full analytical.
+
+❌ **`import starsim as ss` without `ss.Sim()` / `ss.People()`
+   construction.** Imports alone don't constitute ABM use — the
+   spec-compliance gate explicitly catches this cosmetic-wrap pattern.
+
+❌ **Subclassing `ss.SIS` or `ss.Disease` without ever running
+   `sim.run()`.** Same cosmetic-wrap issue.
+
+✅ **`ss.Sim(people=ss.People(n_agents=N), diseases=MalariaModel(ss.Module))
+   .run()` THEN apply published RCT multipliers in `outcome_fn`.**
+   Scalar compartments inside the disease module are FINE — that is
+   the canonical hybrid pattern.
+
+If the question requires Starsim, the ABM container MUST be
+constructed and run, even if the disease dynamics inside it are
+compartmental/scalar. The spec-compliance heuristic recognizes
+`class X(ss.Module)`, `class X(ss.Disease)`, `class X(ss.Intervention)`,
+and `ss.Sim(...)` as unambiguous ABM signals — any one of these makes
+the ABM-vs-ODE counting heuristic stand down.
 
 ## Related skills
 

@@ -301,6 +301,29 @@ _ABM_SIGNALS = [
      "per-agent class definition"),
 ]
 
+# UNAMBIGUOUS ABM signals — patterns that can only exist inside a Starsim
+# (or equivalent ABM-framework) program. Their presence proves the model
+# runs through an agent-based simulation container regardless of how many
+# scalar/compartmental dynamics the disease module uses internally — that
+# is the canonical "hybrid" pattern (ABM container, compartmental
+# dynamics, RCT multipliers applied at allocation time). When ANY of
+# these appear, _check_abm returns None even if scipy.integrate signals
+# also appear (e.g., in unrelated utility code).
+_UNAMBIGUOUS_ABM_SIGNALS = [
+    (re.compile(r"^class\s+\w+\s*\(\s*ss\.Module\s*[,)]", re.MULTILINE),
+     "class X(ss.Module) — Starsim disease/intervention module"),
+    (re.compile(r"^class\s+\w+\s*\(\s*ss\.Disease\s*[,)]", re.MULTILINE),
+     "class X(ss.Disease) — Starsim disease subclass"),
+    (re.compile(r"^class\s+\w+\s*\(\s*ss\.Intervention\s*[,)]", re.MULTILINE),
+     "class X(ss.Intervention) — Starsim intervention subclass"),
+    (re.compile(r"^class\s+\w+\s*\(\s*ss\.SIS\s*[,)]", re.MULTILINE),
+     "class X(ss.SIS) — Starsim SIS subclass"),
+    (re.compile(r"^class\s+\w+\s*\(\s*ss\.SIR\s*[,)]", re.MULTILINE),
+     "class X(ss.SIR) — Starsim SIR subclass"),
+    (re.compile(r"\bss\.Sim\s*\("), "ss.Sim(...) construction"),
+    (re.compile(r"\bstarsim\.Sim\s*\("), "starsim.Sim(...) construction"),
+]
+
 
 def _scan(patterns, code: str) -> list[str]:
     hits = []
@@ -308,6 +331,31 @@ def _scan(patterns, code: str) -> list[str]:
         if pattern.search(code):
             hits.append(label)
     return hits
+
+
+# Match Python triple-quoted strings (both """ and '''), single-line strings
+# in either quote style, and # comments. Used to strip non-code regions
+# before pattern matching, so a `class X(ss.Module)` inside a docstring
+# can't masquerade as real ABM evidence.
+_PYTHON_STRING_OR_COMMENT_RE = re.compile(
+    r'"""(?:.|\n)*?"""'        # triple-double
+    r"|'''(?:.|\n)*?'''"       # triple-single
+    r'|"(?:\\.|[^"\\\n])*"'    # double-quoted
+    r"|'(?:\\.|[^'\\\n])*'"    # single-quoted
+    r"|#[^\n]*"                # comment-to-EOL
+)
+
+
+def _strip_strings_and_comments(code: str) -> str:
+    """Replace Python string literals and # comments with whitespace of
+    matching length. Preserves line numbers and column offsets so MULTILINE
+    `^class ...` patterns still work, while preventing false-positive
+    matches on Starsim symbols mentioned inside docstrings, type annotations
+    expressed as strings, or # noqa comments."""
+    def _blank(m: re.Match) -> str:
+        # Preserve newlines so line-anchored patterns continue to work.
+        return "".join("\n" if c == "\n" else " " for c in m.group(0))
+    return _PYTHON_STRING_OR_COMMENT_RE.sub(_blank, code)
 
 
 def _check_framework(framework: str, code_by_file: dict[str, str]) -> Optional[dict]:
@@ -384,11 +432,33 @@ def _check_framework(framework: str, code_by_file: dict[str, str]) -> Optional[d
 def _check_abm(code_by_file: dict[str, str]) -> Optional[dict]:
     abm_hits: list[str] = []
     ode_hits: list[str] = []
+    unambig_abm_hits: list[str] = []
+    # Strip strings/comments uniformly for all three scans. A pattern
+    # like `class X(ss.Module)` or `solve_ivp(` inside a docstring,
+    # a # TODO comment, or a string-literal type annotation is not
+    # evidence of how the model actually runs — it's narrative about
+    # what the code does or might do. Counting these as evidence
+    # produces false positives on the ODE side and false negatives on
+    # the ABM-suppression side. The strip preserves line numbers and
+    # column offsets, so MULTILINE `^class ...` patterns still work.
     for path, code in code_by_file.items():
-        for label in _scan(_ABM_SIGNALS, code):
+        stripped = _strip_strings_and_comments(code)
+        for label in _scan(_ABM_SIGNALS, stripped):
             abm_hits.append(f"{path}: {label}")
-        for label in _scan(_ODE_SIGNALS, code):
+        for label in _scan(_ODE_SIGNALS, stripped):
             ode_hits.append(f"{path}: {label}")
+        for label in _scan(_UNAMBIGUOUS_ABM_SIGNALS, stripped):
+            unambig_abm_hits.append(f"{path}: {label}")
+
+    # Phase 8 Commit ο: any unambiguous ABM signal proves the model runs
+    # through an ABM container. Don't second-guess by counting ODE signals.
+    # `class X(ss.Module)` with scalar compartment dynamics inside is the
+    # canonical hybrid pattern (ABM container + compartmental disease
+    # dynamics + RCT multipliers applied at allocation time) — this is
+    # standard NMP planning practice (Ozodiegwu 2023, Galactionova 2017),
+    # not a violation.
+    if unambig_abm_hits:
+        return None
 
     if abm_hits and not ode_hits:
         return None  # clearly ABM
@@ -400,7 +470,8 @@ def _check_abm(code_by_file: dict[str, str]) -> Optional[dict]:
             "severity": "HIGH",
             "evidence": (
                 "No agent-based indicators found (ss.People, per-agent class, "
-                "etc.). Primary dynamics appear compartmental via: "
+                "ss.Sim, class X(ss.Module/Disease/Intervention), etc.). "
+                "Primary dynamics appear compartmental via: "
                 + "; ".join(ode_hits[:3])
                 + (f" (+{len(ode_hits)-3} more)" if len(ode_hits) > 3 else "")
             ),
@@ -408,17 +479,25 @@ def _check_abm(code_by_file: dict[str, str]) -> Optional[dict]:
 
     if abm_hits and ode_hits:
         # Both present — possible hybrid. Heuristic: if ODE signals outnumber
-        # ABM signals by >2x, call it ODE-dominant.
-        if len(ode_hits) > 2 * len(abm_hits):
+        # ABM signals by >5x AND none of the unambiguous ABM signals are
+        # present, call it ODE-dominant. Threshold raised from 2x to 5x in
+        # Phase 8 Commit ο: the 1721 modeler's `class X(ss.Module)` with
+        # scalar dynamics inside was misread as ODE-dominant under the 2x
+        # rule, costing 2 rounds of structural-mismatch cycling. With the
+        # unambiguous-signals override above, we should rarely reach this
+        # branch; when we do, require an extreme imbalance.
+        if len(ode_hits) > 5 * len(abm_hits):
             return {
                 "kind": "approach_mismatch",
                 "required": "abm",
                 "severity": "HIGH",
                 "evidence": (
                     f"Found ABM indicators ({len(abm_hits)}) but "
-                    f"ODE/compartmental signals ({len(ode_hits)}) dominate. "
-                    "Primary dynamics run through ODE solver. Examples: "
-                    + "; ".join(ode_hits[:2])
+                    f"ODE/compartmental signals ({len(ode_hits)}) overwhelm "
+                    "them (>5x) and no unambiguous Starsim ABM construction "
+                    "(ss.Sim, class X(ss.Module/Disease/Intervention)) "
+                    "is present. Primary dynamics run through ODE solver. "
+                    "Examples: " + "; ".join(ode_hits[:2])
                 ),
             }
         return None  # mixed but ABM signals are competitive
@@ -429,9 +508,9 @@ def _check_abm(code_by_file: dict[str, str]) -> Optional[dict]:
         "required": "abm",
         "severity": "HIGH",
         "evidence": (
-            "No agent-based indicators (ss.People, per-agent class) AND no "
-            "clear simulation dynamics found in models/. Cannot verify "
-            "model is agent-based."
+            "No agent-based indicators (ss.People, ss.Sim, class X(ss.Module/"
+            "Disease/Intervention), per-agent class) AND no clear simulation "
+            "dynamics found in models/. Cannot verify model is agent-based."
         ),
     }
 
@@ -1031,6 +1110,88 @@ def _run_self_test() -> int:
            f"C: starsim used properly; unexpected framework_missing in {kinds_c}")
         ok("approach_mismatch" not in kinds_c,
            f"C: ss.People present; unexpected approach_mismatch in {kinds_c}")
+
+        # Case C2 (Phase 8 Commit ο): 1721-pattern hybrid — `class X(ss.Module)`
+        # with scalar compartmental dynamics inside, run via ss.Sim/ss.People.
+        # Must NOT trigger approach_mismatch despite the scalar `* dt`-style
+        # updates inside the module body.
+        with open(os.path.join(models, "model.py"), "w") as f:
+            f.write("import starsim as ss\n"
+                    "import numpy as np\n"
+                    "class MalariaModel(ss.Module):\n"
+                    "    def __init__(self, pars=None, **kwargs):\n"
+                    "        super().__init__(pars=pars, **kwargs)\n"
+                    "    def step(self):\n"
+                    "        # Scalar SEADTP compartments inside the module —\n"
+                    "        # the ABM container is what makes this hybrid.\n"
+                    "        S = self.S; E = self.E; A = self.A\n"
+                    "        dS = -self.foi * S * self.dt\n"
+                    "        dE = (self.foi * S - self.sigma * E) * self.dt\n"
+                    "        dA = (self.sigma * E - self.gamma * A) * self.dt\n"
+                    "        self.S = S + dS\n"
+                    "        self.E = E + dE\n"
+                    "        self.A = A + dA\n"
+                    "people = ss.People(n_agents=1000)\n"
+                    "sim = ss.Sim(people=people, diseases=MalariaModel(), dur=10)\n"
+                    "sim.run()\n")
+        vc2 = check_spec_compliance(required_a, d)
+        kinds_c2 = {v["kind"] for v in vc2["violations"]}
+        ok("approach_mismatch" not in kinds_c2,
+           f"C2: 1721 hybrid pattern (ss.Module + ss.Sim + scalar dynamics); "
+           f"unexpected approach_mismatch in {kinds_c2}")
+        ok("framework_missing" not in kinds_c2,
+           f"C2: ss.Sim + ss.People present; unexpected framework_missing in {kinds_c2}")
+
+        # Case C3 (Phase 8 Commit ο): pure scipy without any starsim → MUST
+        # still trigger approach_mismatch. Preserves the original detection.
+        with open(os.path.join(models, "model.py"), "w") as f:
+            f.write("import numpy as np\n"
+                    "from scipy.integrate import solve_ivp\n"
+                    "def rhs(t, y): return -0.1 * y\n"
+                    "solve_ivp(rhs, [0, 10], [1.0])\n")
+        vc3 = check_spec_compliance(required_a, d)
+        kinds_c3 = {v["kind"] for v in vc3["violations"]}
+        ok("approach_mismatch" in kinds_c3,
+           f"C3: pure scipy.solve_ivp, no starsim; expected approach_mismatch, got {kinds_c3}")
+
+        # Case C5 (Phase 8 review fix #1): unambiguous-ABM-signal pattern
+        # appearing inside a docstring or # comment must NOT suppress
+        # approach_mismatch on otherwise-scipy-only code. The actual
+        # delivered model is pure scipy; the docstring just talks about
+        # what the modeler plans to do later.
+        with open(os.path.join(models, "model.py"), "w") as f:
+            f.write('"""Module docstring.\n\n'
+                    "Eventually we will rewrite this as:\n\n"
+                    "    class MalariaModel(ss.Module): ...\n"
+                    "    sim = ss.Sim(people=ss.People(n_agents=1000))\n"
+                    "    sim.run()\n\n"
+                    'For now the dynamics live in scipy."""\n'
+                    "import numpy as np\n"
+                    "from scipy.integrate import solve_ivp\n"
+                    "# TODO: replace with class Foo(ss.Module) eventually\n"
+                    "def rhs(t, y): return -0.1 * y\n"
+                    "solve_ivp(rhs, [0, 10], [1.0])\n")
+        vc5 = check_spec_compliance(required_a, d)
+        kinds_c5 = {v["kind"] for v in vc5["violations"]}
+        ok("approach_mismatch" in kinds_c5,
+           f"C5: ss.Module/ss.Sim only in docstring+comment; expected "
+           f"approach_mismatch, got {kinds_c5}")
+
+        # Case C4 (Phase 8 Commit ο): cosmetic-import — `import starsim`
+        # without ever constructing ss.Sim → MUST fire framework_missing
+        # (and approach_mismatch, since no unambiguous ABM signal).
+        with open(os.path.join(models, "model.py"), "w") as f:
+            f.write("import starsim as ss  # noqa\n"
+                    "import numpy as np\n"
+                    "from scipy.integrate import solve_ivp\n"
+                    "def rhs(t, y): return -0.1 * y\n"
+                    "solve_ivp(rhs, [0, 10], [1.0])\n")
+        vc4 = check_spec_compliance(required_a, d)
+        kinds_c4 = {v["kind"] for v in vc4["violations"]}
+        ok("framework_missing" in kinds_c4,
+           f"C4: cosmetic starsim import only; expected framework_missing, got {kinds_c4}")
+        ok("approach_mismatch" in kinds_c4,
+           f"C4: cosmetic starsim import only; expected approach_mismatch, got {kinds_c4}")
 
         # Case D: budget envelope check.
         with open(os.path.join(d, "lga_allocation.csv"), "w") as f:
