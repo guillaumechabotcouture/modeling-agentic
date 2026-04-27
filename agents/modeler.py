@@ -707,6 +707,95 @@ and MEDIUM `plan_criterion_not_tested` per criterion whose artifact
 field is missing. Do NOT silently drop a promised criterion — either
 populate the field or scope-declare why it's unachievable.
 
+### 4g. Sensitivity analysis on load-bearing parameters (Phase 8 Commit π)
+
+When this run produces an allocation, you MUST also produce
+`{run_dir}/models/sensitivity_analysis.yaml` perturbing the 2-3
+LOAD-BEARING parameters of the recommendation and reporting whether
+the primary recommendation flips. A senior modeler does not stop at
+"the optimizer ran"; they re-run the optimizer at alternative
+parameter values and report whether the policy choice survives.
+
+**Identifying load-bearing parameters**: which parameter, if changed
+to its alternative published value (or 95% CI endpoint), would change
+the dominant intervention package, the highest-burden zone allocation,
+or the comparator-vs-optimized winner? Common malaria load-bearing
+parameters:
+- PBO net OR (lifecycle vs 9-month vs 25-month from same RCT —
+  Protopopoff 2018 reports all three; the choice of which to use can
+  flip the dual-AI vs PBO selection)
+- SMC IRR 95% CI endpoints (Thwing 2024)
+- Dual-AI net IRR 95% CI (Barker 2023)
+- Case fatality rate (Africa-wide vs SSA-specific vs national)
+- Cost per net (UNICEF vs PMI vs commercial procurement)
+- DALY age weights (uniform vs WHO 2010 age weights)
+
+For each load-bearing parameter:
+1. Run the FULL optimizer at the alternative value (not just a
+   perturbation of the comparison; you need an actual re-optimization).
+2. Compare top-50 LGA package assignments to the primary allocation.
+3. Report `rank_change_top_n` (count of top-N LGAs whose package
+   assignment differs) and `primary_recommendation_changes` (boolean
+   — does the headline recommendation flip?).
+
+Schema (write to `{run_dir}/models/sensitivity_analysis.yaml`):
+
+```yaml
+load_bearing_parameters:
+  - id: SA-001
+    parameter: pbo_lifecycle_or
+    description: "PBO net OR — drives dual-AI vs PBO selection"
+    primary_value: 0.55
+    primary_objective: 4565827
+    perturbations:
+      - value: 0.37                          # 9-month OR (Protopopoff 2018 9m)
+        objective: 4480000
+        rank_change_top_n: 0                 # 0 = top-50 unchanged
+        primary_recommendation_changes: false
+        notes: "PBO becomes preferred over dual-AI in 38 LGAs..."
+      - value: 0.81                          # 25-month OR
+        objective: 4710000
+        rank_change_top_n: 0
+        primary_recommendation_changes: false
+  - id: SA-002
+    parameter: smc_clinical_irr
+    primary_value: 0.27
+    primary_objective: 4565827
+    perturbations:
+      - value: 0.25                          # CI lower bound
+        objective: 4640000
+        rank_change_top_n: 5
+        primary_recommendation_changes: false
+      - value: 0.29                          # CI upper bound
+        objective: 4500000
+        rank_change_top_n: 7
+        primary_recommendation_changes: false
+verdict: ROBUST | SENSITIVE | UNSTABLE
+notes: |
+  Each load-bearing parameter is perturbed to its 95% CI endpoints
+  (or to alternative published values for parameters with multiple
+  defensible choices) and the optimizer is re-run at each value.
+```
+
+Verdict thresholds (worst perturbation across all parameters):
+- **ROBUST**: no perturbation flips the primary recommendation AND
+  worst rank_change_top_n ≤ 10. ACCEPT-grade.
+- **SENSITIVE**: ≤ 1 perturbation flips OR worst rank_change_top_n
+  ≤ 30. Surface in §Sensitivity (or §Cost-effectiveness) of report.md
+  — do NOT bury in §Limitations.
+- **UNSTABLE**: ≥ 2 perturbations flip OR worst rank_change_top_n
+  > 30. The recommendation cannot be defended as-is — pick a more
+  robust parameterization, narrow the perturbation range with
+  stronger evidence, or rebuild around a different objective.
+
+The validator emits MEDIUM `sensitivity_analysis_missing` when the
+yaml is absent, HIGH `sensitivity_analysis_malformed` on schema
+violations, MEDIUM `sensitivity_analysis_sensitive` on SENSITIVE
+verdict, and HIGH `sensitivity_analysis_unstable` on UNSTABLE.
+
+At least 2 load-bearing parameters are required (single-parameter
+sensitivity does not establish robustness across the recommendation).
+
 ### 4. Decision rule — `{run_dir}/decision_rule.md` (when allocation is produced)
 
 If this run produces an allocation CSV (`*allocation*.csv`,

@@ -1103,6 +1103,9 @@ def _check_rigor_artifacts(run_dir: str) -> list[dict]:
     # Phase 7 Commit ν: universal-coverage benchmark.
     violations.extend(_check_universal_coverage(run_dir))
 
+    # Phase 8 Commit π: load-bearing parameter sensitivity analysis.
+    violations.extend(_check_sensitivity_analysis(run_dir))
+
     return violations
 
 
@@ -1687,6 +1690,112 @@ def _check_optimization_quality(run_dir: str) -> list[dict]:
                 f"primary's parameters (more random restarts, longer SA "
                 f"cooling, etc.), or scope-declare why a >10% gap is "
                 f"acceptable for this question."
+            ),
+        })
+    return out
+
+
+def _check_sensitivity_analysis(run_dir: str) -> list[dict]:
+    """Phase 8 Commit π: when an allocation/decision_rule artifact
+    exists, the modeler must perturb 2-3 load-bearing parameters and
+    report whether the primary recommendation flips. The artifact
+    lives at `{run_dir}/models/sensitivity_analysis.yaml`.
+
+    Emits:
+      sensitivity_analysis_missing      MEDIUM — allocation present but
+                                                  no sensitivity yaml
+      sensitivity_analysis_malformed    HIGH   — schema violations
+      sensitivity_analysis_unstable     HIGH   — UNSTABLE verdict
+      sensitivity_analysis_sensitive    MEDIUM — SENSITIVE verdict
+    """
+    decision_rule = os.path.join(run_dir, "decision_rule.md")
+    allocs = _find_allocation_csvs(run_dir)
+    if not (os.path.exists(decision_rule) or allocs):
+        return []  # No allocation produced; no requirement.
+
+    yaml_path = os.path.join(run_dir, "models", "sensitivity_analysis.yaml")
+    if not os.path.exists(yaml_path):
+        return [{
+            "kind": "sensitivity_analysis_missing",
+            "severity": "MEDIUM",
+            "stage": "OPTIMIZATION",
+            "claim": (
+                "Allocation produced but models/sensitivity_analysis.yaml "
+                "is absent. The recommendation must be tested for "
+                "robustness against perturbations of its 2-3 LOAD-BEARING "
+                "parameters (the parameters whose 95% CI endpoints could "
+                "change the dominant intervention package, the highest-"
+                "burden zone allocation, or the comparator-vs-optimized "
+                "winner). For each parameter: re-run the optimizer at "
+                "alternative values, compare top-50 LGA package "
+                "assignments, and report rank_change_top_n + "
+                "primary_recommendation_changes. Verdict ROBUST is "
+                "required for ACCEPT-grade analysis. SENSITIVE must be "
+                "scope-declared in §Limitations. UNSTABLE means the "
+                "recommendation cannot be defended as-is. See "
+                "scripts/sensitivity_analysis.py for the schema."
+            ),
+        }]
+
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "sensitivity_analysis",
+            os.path.join(os.path.dirname(__file__), "sensitivity_analysis.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    except Exception as e:
+        return [{
+            "kind": "sensitivity_analysis_malformed",
+            "severity": "HIGH",
+            "stage": "OPTIMIZATION",
+            "claim": f"Could not load scripts/sensitivity_analysis.py: {e}",
+        }]
+
+    result = mod.validate_sensitivity_analysis(yaml_path)
+    out = []
+    if result["verdict"] == "MALFORMED":
+        out.append({
+            "kind": "sensitivity_analysis_malformed",
+            "severity": "HIGH",
+            "stage": "OPTIMIZATION",
+            "claim": (f"models/sensitivity_analysis.yaml is malformed: "
+                      f"{'; '.join(result['errors'])}"),
+        })
+    elif result["verdict"] == "UNSTABLE":
+        s = result.get("summary", {})
+        out.append({
+            "kind": "sensitivity_analysis_unstable",
+            "severity": "HIGH",
+            "stage": "OPTIMIZATION",
+            "claim": (
+                f"Sensitivity analysis verdict UNSTABLE: "
+                f"{s.get('flips', 0)} of {s.get('total_perturbations', 0)} "
+                f"perturbations flip the primary recommendation, worst "
+                f"top-N rank change is {s.get('worst_rank_change_top_n', 0)}. "
+                f"The allocation cannot be defended as-is; either pick a "
+                f"more robust parameterization, narrow the perturbation "
+                f"range with stronger evidence, or rebuild the optimization "
+                f"around an objective whose ranking is robust to these "
+                f"parameter ranges."
+            ),
+        })
+    elif result["verdict"] == "SENSITIVE":
+        s = result.get("summary", {})
+        out.append({
+            "kind": "sensitivity_analysis_sensitive",
+            "severity": "MEDIUM",
+            "stage": "OPTIMIZATION",
+            "claim": (
+                f"Sensitivity analysis verdict SENSITIVE: "
+                f"{s.get('flips', 0)} of {s.get('total_perturbations', 0)} "
+                f"perturbations flip the primary recommendation; worst "
+                f"top-N rank change is {s.get('worst_rank_change_top_n', 0)}. "
+                f"The recommendation is not robust under all plausible "
+                f"parameter values. Surface this in §Sensitivity (or "
+                f"§Cost-effectiveness) of report.md, not just §Limitations: "
+                f"a decision-maker reading the headline must see which "
+                f"alternative parameter values flip the choice."
             ),
         })
     return out
@@ -3080,6 +3189,141 @@ def _run_self_test() -> int:
         vl4 = _check_universal_coverage(d)
         ok(not vl4,
            f"L4: no allocation = no requirement, got {vl4}")
+
+    # --- Phase 8 Commit π: load-bearing parameter sensitivity analysis ---
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "decision_rule.md"), "w") as f:
+            f.write("# DR\n")
+        with open(os.path.join(d, "lga_allocation.csv"), "w") as f:
+            f.write("lga,package\nA,X\n")
+
+        # Case M1: allocation but no sensitivity_analysis.yaml → MEDIUM.
+        vm1 = _check_sensitivity_analysis(d)
+        ok(any(v["kind"] == "sensitivity_analysis_missing"
+               and v["severity"] == "MEDIUM" for v in vm1),
+           f"M1: allocation without sensitivity_analysis.yaml should fire "
+           f"MEDIUM, got {vm1}")
+
+        # Case M2: ROBUST verdict (clean) → no fire.
+        with open(os.path.join(d, "models", "sensitivity_analysis.yaml"), "w") as f:
+            f.write(
+                "load_bearing_parameters:\n"
+                "  - id: SA-001\n"
+                "    parameter: pbo_or\n"
+                "    primary_value: 0.55\n"
+                "    primary_objective: 4565827\n"
+                "    perturbations:\n"
+                "      - value: 0.37\n"
+                "        objective: 4480000\n"
+                "        rank_change_top_n: 5\n"
+                "        primary_recommendation_changes: false\n"
+                "      - value: 0.81\n"
+                "        objective: 4710000\n"
+                "        rank_change_top_n: 3\n"
+                "        primary_recommendation_changes: false\n"
+                "  - id: SA-002\n"
+                "    parameter: smc_irr\n"
+                "    primary_value: 0.27\n"
+                "    primary_objective: 4565827\n"
+                "    perturbations:\n"
+                "      - value: 0.25\n"
+                "        objective: 4640000\n"
+                "        rank_change_top_n: 8\n"
+                "        primary_recommendation_changes: false\n"
+                "verdict: ROBUST\n"
+            )
+        vm2 = _check_sensitivity_analysis(d)
+        ok(not vm2, f"M2: ROBUST verdict should not fire, got {vm2}")
+
+        # Case M3: SENSITIVE verdict → MEDIUM.
+        with open(os.path.join(d, "models", "sensitivity_analysis.yaml"), "w") as f:
+            f.write(
+                "load_bearing_parameters:\n"
+                "  - id: SA-001\n"
+                "    parameter: pbo_or\n"
+                "    primary_value: 0.55\n"
+                "    primary_objective: 4565827\n"
+                "    perturbations:\n"
+                "      - value: 0.37\n"
+                "        objective: 4400000\n"
+                "        rank_change_top_n: 25\n"
+                "        primary_recommendation_changes: true\n"
+                "  - id: SA-002\n"
+                "    parameter: smc_irr\n"
+                "    primary_value: 0.27\n"
+                "    primary_objective: 4565827\n"
+                "    perturbations:\n"
+                "      - value: 0.25\n"
+                "        objective: 4640000\n"
+                "        rank_change_top_n: 8\n"
+                "        primary_recommendation_changes: false\n"
+                "verdict: SENSITIVE\n"
+            )
+        vm3 = _check_sensitivity_analysis(d)
+        ok(any(v["kind"] == "sensitivity_analysis_sensitive"
+               and v["severity"] == "MEDIUM" for v in vm3),
+           f"M3: SENSITIVE verdict should fire MEDIUM, got {vm3}")
+
+        # Case M4: UNSTABLE verdict → HIGH.
+        with open(os.path.join(d, "models", "sensitivity_analysis.yaml"), "w") as f:
+            f.write(
+                "load_bearing_parameters:\n"
+                "  - id: SA-001\n"
+                "    parameter: pbo_or\n"
+                "    primary_value: 0.55\n"
+                "    primary_objective: 4565827\n"
+                "    perturbations:\n"
+                "      - value: 0.37\n"
+                "        objective: 4400000\n"
+                "        rank_change_top_n: 50\n"
+                "        primary_recommendation_changes: true\n"
+                "      - value: 0.81\n"
+                "        objective: 4720000\n"
+                "        rank_change_top_n: 40\n"
+                "        primary_recommendation_changes: true\n"
+                "  - id: SA-002\n"
+                "    parameter: smc_irr\n"
+                "    primary_value: 0.27\n"
+                "    primary_objective: 4565827\n"
+                "    perturbations:\n"
+                "      - value: 0.25\n"
+                "        objective: 4640000\n"
+                "        rank_change_top_n: 8\n"
+                "        primary_recommendation_changes: false\n"
+                "verdict: UNSTABLE\n"
+            )
+        vm4 = _check_sensitivity_analysis(d)
+        ok(any(v["kind"] == "sensitivity_analysis_unstable"
+               and v["severity"] == "HIGH" for v in vm4),
+           f"M4: UNSTABLE verdict should fire HIGH, got {vm4}")
+
+        # Case M5: malformed (only 1 load-bearing parameter) → HIGH.
+        with open(os.path.join(d, "models", "sensitivity_analysis.yaml"), "w") as f:
+            f.write(
+                "load_bearing_parameters:\n"
+                "  - id: SA-001\n"
+                "    parameter: pbo_or\n"
+                "    primary_value: 0.55\n"
+                "    primary_objective: 4565827\n"
+                "    perturbations:\n"
+                "      - value: 0.37\n"
+                "        objective: 4400000\n"
+                "        rank_change_top_n: 5\n"
+                "        primary_recommendation_changes: false\n"
+                "verdict: ROBUST\n"
+            )
+        vm5 = _check_sensitivity_analysis(d)
+        ok(any(v["kind"] == "sensitivity_analysis_malformed"
+               and v["severity"] == "HIGH" for v in vm5),
+           f"M5: only 1 load-bearing parameter should fire HIGH malformed, "
+           f"got {vm5}")
+
+    # Case M6: no allocation → silent.
+    with tempfile.TemporaryDirectory() as d:
+        vm6 = _check_sensitivity_analysis(d)
+        ok(not vm6,
+           f"M6: no allocation = no requirement, got {vm6}")
 
     # --- Summary ---
     if failures:
