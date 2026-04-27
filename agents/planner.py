@@ -252,6 +252,32 @@ investigations are complete, blocked, or need work.
 - Modeling Checklist
 - Key Risks and Pitfalls
 
+**{run_dir}/hypotheses.md** — the testable hypotheses table from
+plan.md, but as a standalone file. This is the canonical hypothesis
+source for downstream agents (modeler, analyst, critique-domain,
+writer). plan.md retains the prose-form Hypotheses section for
+narrative continuity; hypotheses.md is what every other agent reads.
+
+Required format:
+
+```markdown
+# Hypotheses
+
+| ID | Hypothesis | Prediction | Testable via |
+|----|-----------|------------|--------------|
+| H1 | <claim>    | <quantitative prediction> | <model output / metric> |
+| H2 | ...        | ...        | ...          |
+```
+
+3-7 entries. Each row must give a falsifiable prediction (numeric
+where possible) and the specific model output or metric that would
+support / refute it. Phase 11 Commit υ (F6) — earlier runs only had
+the Hypotheses section inside plan.md, while modeler / analyst /
+critique-domain / writer all read `{run_dir}/hypotheses.md` as a
+separate file. Critique-domain treats the missing file as automatic
+REVISE; you MUST write it as a standalone file in addition to the
+plan.md section.
+
 **{run_dir}/citations.md** — citation index (see CITATION INDEX section above).
 
 **{run_dir}/threads.yaml** — investigation manifest.
