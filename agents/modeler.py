@@ -492,6 +492,31 @@ archetypes and the plan specifies N archetypes, you MUST either:
 After calibration, produce three additional artifacts that feed the
 STAGE 5b mechanical rigor checks:
 
+### Rigor artifact timeline (Phase 9 Commit τ — draft early, iterate)
+
+Rigor artifacts are NOT one-shot round-8 gate-checks. The 0013 run's
+sensitivity_analysis.yaml arrived in round 8 with verdict UNSTABLE
+and zero remaining rounds to act on it; identifiability.yaml hit the
+same trap in earlier runs. **Draft each artifact at its earliest
+defensible round so per-round critique can iterate** — that is the
+entire point of having multiple critique rounds.
+
+| Artifact | First draft | Finalize | What "draft" means |
+|---|---|---|---|
+| `models/outcome_fn.py` | r1-2 | r3 | Calibration callable returning a single deterministic outcome dict; can be coarse. |
+| `models/model_comparison.yaml` | r1-2 | r3 | At least null + simple + full candidate; AIC/BIC can be approximate. |
+| `models/identifiability.yaml` | r1-2 | r3 | Manifest with point estimates + bounds; loss function pointwise (see §3 contract). |
+| `models/sensitivity_analysis.yaml` | **r2-3** | r6-7 | After your FIRST optimizer pass; 2 load-bearing parameters, one alternative value each. Expand perturbations and tighten verdicts in later rounds. |
+| `models/allocation_robustness.yaml` | r3-4 | r6 | Leave-one-archetype-out CV on the draft allocation; per-fold metrics may be coarse initially. |
+| `decision_rule.md` | r6-7 | r7 | Derived from finalized allocation; this one is genuinely late by construction. |
+
+When the rigor gate fires MEDIUM `*_missing` in an early round, treat
+it as a nudge to draft the artifact, not as a blocker to ignore. The
+0013 sensitivity analysis was technically MEDIUM in rounds 1-7
+(MEDIUM does not block ACCEPT) but the modeler deferred it until the
+allocation was final, then could not act on the resulting UNSTABLE
+verdict because rounds were exhausted. Don't repeat that pattern.
+
 ### 1. Uncertainty quantification — `{run_dir}/models/outcome_fn.py`
 
 Expose a deterministic callable `outcome_fn(params: dict) -> dict` that
@@ -786,14 +811,41 @@ and MEDIUM `plan_criterion_not_tested` per criterion whose artifact
 field is missing. Do NOT silently drop a promised criterion — either
 populate the field or scope-declare why it's unachievable.
 
-### 4g. Sensitivity analysis on load-bearing parameters (Phase 8 Commit π)
+### 4g. Sensitivity analysis on load-bearing parameters (Phase 8 Commit π, Phase 9 Commit τ)
 
-When this run produces an allocation, you MUST also produce
+When this run produces an allocation, you MUST produce
 `{run_dir}/models/sensitivity_analysis.yaml` perturbing the 2-3
 LOAD-BEARING parameters of the recommendation and reporting whether
 the primary recommendation flips. A senior modeler does not stop at
 "the optimizer ran"; they re-run the optimizer at alternative
 parameter values and report whether the policy choice survives.
+
+**Two-phase contract** (Phase 9 Commit τ): the artifact is not a
+round-8 one-shot. Draft it after your FIRST optimizer pass — round
+2-3 — and iterate as your allocation evolves:
+
+- **Draft (round 2-3)**: list at least 2 load-bearing parameters,
+  one alternative value each (e.g., a 95% CI endpoint or a competing
+  published estimate). Run the optimizer once at each alternative
+  value and record `rank_change_top_n`, `primary_recommendation_changes`.
+  Verdict can be preliminary; perturbations may be sparse. The
+  point is to surface fragility while there are still rounds to act.
+
+- **Iterate (rounds 4-6)**: as the allocation stabilizes, expand to
+  3 parameters and add the second perturbation per parameter (both
+  CI endpoints, not just one). If a perturbation is producing an
+  UNSTABLE verdict, this is the round where you fix it — narrow
+  the parameter range with stronger evidence, switch to a more
+  robust objective, or scope-declare in §Limitations.
+
+- **Finalize (round 6-7, before STAGE 7)**: full perturbation grid,
+  reported verdict matches computed verdict (the validator rejects
+  any mismatch as MALFORMED), notes section explains each load-
+  bearing choice.
+
+The 0013 run's sensitivity_analysis.yaml first appeared in round 8
+with UNSTABLE verdict and 0 remaining rounds — exactly the failure
+mode this two-phase contract is designed to prevent.
 
 **Identifying load-bearing parameters**: which parameter, if changed
 to its alternative published value (or 95% CI endpoint), would change
