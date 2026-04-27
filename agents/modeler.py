@@ -510,6 +510,7 @@ entire point of having multiple critique rounds.
 | `models/identifiability.yaml` | r1-2 | r3 | Manifest with point estimates + bounds; loss function pointwise (see §3 contract). |
 | `models/sensitivity_analysis.yaml` | **r2-3** | r6-7 | After your FIRST optimizer pass; 2 load-bearing parameters, one alternative value each. Expand perturbations and tighten verdicts in later rounds. |
 | `models/allocation_robustness.yaml` | r3-4 | r6 | Leave-one-archetype-out CV on the draft allocation; per-fold metrics may be coarse initially. |
+| `models/within_zone_heterogeneity.yaml` | r3-4 | r6 | Required when `calibration_units / allocation_units < 0.1` (Phase 12 γ). The 0013/104914 runs had 6 zones → 774 LGAs; within-zone PfPR varies 5.9-77.3%. Bound the impact loss with a perturbation re-run. See the `ecological-fallacy-quantification` skill. |
 | `decision_rule.md` | r6-7 | r7 | Derived from finalized allocation; this one is genuinely late by construction. |
 
 When the rigor gate fires MEDIUM `*_missing` in an early round, treat

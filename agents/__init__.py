@@ -194,7 +194,10 @@ def build_agents() -> dict[str, AgentDefinition]:
                     "mechanistic-vs-hybrid-architecture",
                     # Phase 10 Commit ω: remediation skill for SENSITIVE
                     # / UNSTABLE sensitivity verdicts (RIG-003 escalation).
-                    "sensitivity-analysis-remediation"],
+                    "sensitivity-analysis-remediation",
+                    # Phase 12 Commit γ: required when calibration_units /
+                    # allocation_units < 0.1 (e.g., 6 zones → 774 LGAs).
+                    "ecological-fallacy-quantification"],
         ),
         "model-tester": AgentDefinition(
             description=modeler.MODEL_TESTER_DESCRIPTION,

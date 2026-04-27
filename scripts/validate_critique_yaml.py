@@ -1131,6 +1131,13 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None) -> list[dic
     # `allocation_rigor_drafts_overdue` (past deadline).
     violations.extend(_check_allocation_rigor_status(run_dir, round_n=round_n))
 
+    # Phase 12 Commit γ: ecological-fallacy / within-zone heterogeneity
+    # check. When the model calibrates to k zones but allocates to
+    # n>>k spatial units (Nigeria 6→774 in 104914), within-zone
+    # variation is invisible to the optimizer. Require an artifact
+    # bounding the impact loss when the aggregation ratio is high.
+    violations.extend(_check_within_zone_heterogeneity(run_dir))
+
     # Phase 12 Commit β: round-aware escalation of persisting MEDIUMs.
     # Catches the failure mode the 104914 run shipped: 18 figure_
     # validator_missing MEDIUMs persisted r2→r6, presentation P-005..
@@ -2073,6 +2080,163 @@ def _check_allocation_rigor_status(run_dir: str,
                 f"reminder, not a blocker — draft each artifact "
                 f"early so verdict failures surface while there are "
                 f"rounds left to act."
+            ),
+        })
+    return out
+
+
+# Phase 12 Commit γ: ecological-fallacy / within-zone heterogeneity.
+#
+# When calibration_units / allocation_units < 0.1 (ecological
+# aggregation likely), require models/within_zone_heterogeneity.yaml
+# bounding the impact loss. The 104914 run had 6 zones → 774 LGAs
+# (ratio 0.0078), with within-zone PfPR varying 5.9%-77.3% per
+# data_quality.md. results.md acknowledges this in one line; the
+# magnitude is unbounded. A reviewer cannot tell if the headline
+# 54.7M cases averted would drop by 5%, 15%, or 30% under realistic
+# within-zone heterogeneity.
+_ECOLOGICAL_AGGREGATION_THRESHOLD = 0.1
+
+
+def _detect_calibration_allocation_ratio(run_dir: str) -> tuple[int, int] | None:
+    """Detect (calibration_units, allocation_units) pair from a run
+    dir. Returns None if either count is unavailable.
+
+    calibration_units: from models/model_comparison_formal.yaml
+        n_targets field (the number of zone-level calibration targets).
+    allocation_units: from models/lga_allocation.csv (row count
+        excluding header), or any *allocation*.csv in models/.
+    """
+    cal_path = os.path.join(run_dir, "model_comparison_formal.yaml")
+    if not os.path.exists(cal_path):
+        cal_path = os.path.join(run_dir, "models", "model_comparison_formal.yaml")
+    cal_units: int | None = None
+    if os.path.exists(cal_path):
+        try:
+            with open(cal_path) as f:
+                doc = yaml.safe_load(f) or {}
+            n_targets = doc.get("n_targets")
+            if isinstance(n_targets, int):
+                cal_units = n_targets
+        except (yaml.YAMLError, OSError):
+            pass
+
+    alloc_units: int | None = None
+    for entry in (os.listdir(os.path.join(run_dir, "models"))
+                  if os.path.isdir(os.path.join(run_dir, "models")) else []):
+        if "allocation" in entry and entry.endswith(".csv"):
+            try:
+                with open(os.path.join(run_dir, "models", entry)) as f:
+                    rows = sum(1 for _ in f) - 1  # exclude header
+                if rows > 0 and (alloc_units is None or rows > alloc_units):
+                    alloc_units = rows
+            except OSError:
+                continue
+
+    if cal_units is None or alloc_units is None or alloc_units == 0:
+        return None
+    return (cal_units, alloc_units)
+
+
+def _check_within_zone_heterogeneity(run_dir: str) -> list[dict]:
+    """Phase 12 Commit γ: when calibration_units / allocation_units
+    < 0.1, require models/within_zone_heterogeneity.yaml bounding
+    the impact loss from ecological aggregation.
+
+    Emits:
+      within_zone_heterogeneity_missing      MEDIUM — yaml absent
+                                                       and ratio < 0.1
+      within_zone_heterogeneity_malformed    HIGH   — yaml schema/verdict
+                                                       violations
+      within_zone_heterogeneity_unbounded    HIGH   — UNBOUNDED verdict
+                                                       (>25% impact loss)
+      within_zone_heterogeneity_inconclusive MEDIUM — INCONCLUSIVE
+                                                       (10-25% loss)
+    """
+    pair = _detect_calibration_allocation_ratio(run_dir)
+    if pair is None:
+        return []  # no calibration/allocation detected; check is silent
+    cal_units, alloc_units = pair
+    ratio = cal_units / alloc_units
+    if ratio >= _ECOLOGICAL_AGGREGATION_THRESHOLD:
+        return []  # not aggregating much; check is silent
+
+    yaml_path = os.path.join(run_dir, "models", "within_zone_heterogeneity.yaml")
+    if not os.path.exists(yaml_path):
+        return [{
+            "kind": "within_zone_heterogeneity_missing",
+            "severity": "MEDIUM",
+            "stage": "MODEL",
+            "claim": (
+                f"Model calibrates to {cal_units} units but allocates to "
+                f"{alloc_units} units (ratio {ratio:.4f} < "
+                f"{_ECOLOGICAL_AGGREGATION_THRESHOLD}). Within-unit "
+                f"heterogeneity is invisible to the optimizer; the "
+                f"impact loss is unbounded. Required artifact: "
+                f"`models/within_zone_heterogeneity.yaml` bounding the "
+                f"impact loss from realistic within-unit value variation. "
+                f"See the ecological-fallacy-quantification skill and "
+                f"scripts/within_zone_sensitivity.py for the schema."
+            ),
+        }]
+
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "within_zone_sensitivity",
+            os.path.join(os.path.dirname(__file__),
+                         "within_zone_sensitivity.py"),
+        )
+        wzs = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(wzs)
+    except Exception as e:
+        return [{
+            "kind": "within_zone_heterogeneity_malformed",
+            "severity": "HIGH",
+            "stage": "MODEL",
+            "claim": f"Could not load scripts/within_zone_sensitivity.py: {e}",
+        }]
+
+    result = wzs.validate_within_zone_heterogeneity(yaml_path)
+    out: list[dict] = []
+    if result["verdict"] == "MALFORMED":
+        out.append({
+            "kind": "within_zone_heterogeneity_malformed",
+            "severity": "HIGH",
+            "stage": "MODEL",
+            "claim": (f"models/within_zone_heterogeneity.yaml is malformed: "
+                      f"{'; '.join(result['errors'])}"),
+        })
+    elif result["verdict"] == "UNBOUNDED":
+        s = result.get("summary", {})
+        out.append({
+            "kind": "within_zone_heterogeneity_unbounded",
+            "severity": "HIGH",
+            "stage": "MODEL",
+            "claim": (
+                f"Within-zone heterogeneity sensitivity verdict UNBOUNDED: "
+                f"worst-case impact loss "
+                f"{s.get('worst_loss_pct', 0):.1f}% under realistic "
+                f"within-unit variation. The headline cases-averted is "
+                f"NOT defensible at the LGA level. Either narrow the "
+                f"perturbation range with stronger evidence (e.g., "
+                f"sub-zone PfPR sample), refit at the lower aggregation "
+                f"level, or scope-declare the recommendation as zone-"
+                f"level only."
+            ),
+        })
+    elif result["verdict"] == "INCONCLUSIVE":
+        s = result.get("summary", {})
+        out.append({
+            "kind": "within_zone_heterogeneity_inconclusive",
+            "severity": "MEDIUM",
+            "stage": "MODEL",
+            "claim": (
+                f"Within-zone heterogeneity verdict INCONCLUSIVE: "
+                f"worst-case impact loss "
+                f"{s.get('worst_loss_pct', 0):.1f}%. Surface in §Sensitivity "
+                f"of report.md, not just §Limitations. The 10-25% range "
+                f"is publication-defensible but a Global Fund reviewer "
+                f"will want to see the explicit bound."
             ),
         })
     return out
