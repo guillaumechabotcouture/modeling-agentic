@@ -131,7 +131,10 @@ def build_agents() -> dict[str, AgentDefinition]:
                     "decision-rule-extraction",
                     "optimizer-method-selection",
                     "daly-weighted-analysis",
-                    "mechanistic-vs-hybrid-architecture"],
+                    "mechanistic-vs-hybrid-architecture",
+                    # Phase 10 Commit ω: remediation skill for SENSITIVE
+                    # / UNSTABLE sensitivity verdicts (RIG-003 escalation).
+                    "sensitivity-analysis-remediation"],
         ),
         "model-tester": AgentDefinition(
             description=modeler.MODEL_TESTER_DESCRIPTION,
