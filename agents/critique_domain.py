@@ -22,6 +22,17 @@ published literature.
 - {run_dir}/plan.md (benchmarks and hypotheses)
 - {run_dir}/results.md
 - {run_dir}/data_quality.md
+- **{run_dir}/figures/*.png — the hypothesis-verdict figures**. The
+  Read tool handles PNGs multimodally; pass each PNG path to Read and
+  you will see the image. Open every `h*_*.png` (one per hypothesis)
+  to verify it visually supports the verdict claimed in §Hypothesis
+  Verdicts. A figure captioned "H2 SUPPORTED" must visually show the
+  supporting evidence (effect sizes, error bars, comparison
+  direction). If the figure shows the OPPOSITE of what the verdict
+  claims (or shows null/inconclusive evidence for a "SUPPORTED"
+  verdict), flag as a HIGH blocker with `category: HARD_BLOCKER` (or
+  `category: STRUCTURAL` if the underlying analysis cannot support
+  the claim regardless of presentation).
 
 When identifying issues, reference which thread IDs are affected:
 "This data inconsistency affects threads T3 and T5"

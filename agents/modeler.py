@@ -249,6 +249,41 @@ These hypothesis-testing figures are MORE important than model diagnostics.
    need rationale too: "Confirms model assumptions are met for the
    findings in Section 4 to be valid."
 
+### Figure self-check (Phase 8 Commit ξ — multimodal verification)
+
+After producing each figure (with `model_figures.py` or equivalent),
+you MUST visually verify it by Reading the resulting PNG file. The
+Read tool natively handles PNG files multimodally — pass the absolute
+path to `{run_dir}/figures/{name}.png` and you will see the image.
+
+For each generated figure, confirm THREE things:
+
+1. **Annotations match the underlying data.** If a figure overlays
+   "RMSE = 0.26pp" or "n = 53 LGAs" or "+34% reduction", trace each
+   annotation back to the calculation that produced it. Prior runs
+   shipped figures whose RMSE annotation said 0.22pp while the body
+   text said 0.26pp because the modeler never opened its own PNG.
+
+2. **Title/legend/axes match what the figure shows.** A figure
+   captioned "H1 SUPPORTED: dual-AI > PBO" while the bars actually
+   show PBO ahead of dual-AI is a critical bug. A panel labeled
+   "+105% improvement" while the y-axis values are 2% is a critical
+   bug. The only way to catch this kind of inconsistency is to view
+   the figure side-by-side with its caption.
+
+3. **Labels readable, units present.** x/y axis labels, legend
+   entries, color-bar ticks all present with units, not truncated or
+   overlapping.
+
+If you find a discrepancy: regenerate the figure with corrected code
+OR correct the caption/annotation in the source script. Do NOT paper
+over with a "see footnote about discrepancy" — the figure must match
+the data on first delivery.
+
+This self-check costs ~5-10 image reads per modeler turn (PNG reads
+are fast). It catches the class of issues that has caused ≈30% of
+late-round HIGH blockers across prior malaria runs.
+
 ## THREAD UPDATES
 
 After building each model and generating figures, update {run_dir}/threads.yaml:

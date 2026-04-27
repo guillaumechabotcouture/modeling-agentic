@@ -620,6 +620,18 @@ The validator also flags `writer_qa_missing` MEDIUM if the QA pass
 wasn't run, and `writer_qa_unresolved` MEDIUM if the verdict is
 REVISE/MAJOR_REVISION at run completion.
 
+#### Multimodal spot-check (Phase 8 Commit ξ — optional)
+
+After `writer_qa.py` returns CLEAN, you MAY spot-check 2-3 of the
+most prominent figures yourself: the calibration plot, the allocation
+map (or choropleth), and at least one hypothesis-verdict panel. The
+Read tool natively handles PNGs — pass an absolute path under
+`{run_dir}/figures/` and you will see the image. Confirm the figure's
+visual content is consistent with the headline numbers in §Results.
+This is judgment-based and not a gate; if you spot a clear
+inconsistency, re-spawn the writer with the specific finding rather
+than letting the report ship.
+
 ## GENERAL RULES
 
 - Every finding must have a causal label: CAUSAL, ASSOCIATIONAL, or PROXY.
