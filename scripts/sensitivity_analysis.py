@@ -71,7 +71,10 @@ def _compute_verdict(parameters: list[dict]) -> tuple[str, dict]:
     """Compute the worst-case verdict from the perturbation outcomes.
 
     Returns (verdict, summary) where summary has worst_rank_change,
-    flips, and total_perturbations.
+    flips, and total_perturbations. Returns "MALFORMED" with an empty
+    summary when there are no perturbations to evaluate — defense-in-
+    depth so a caller that bypasses the schema check still cannot
+    silently obtain a ROBUST verdict from no data.
     """
     flips = 0
     worst_rank = 0
@@ -90,6 +93,9 @@ def _compute_verdict(parameters: list[dict]) -> tuple[str, dict]:
         "worst_rank_change_top_n": worst_rank,
         "total_perturbations": total,
     }
+
+    if total == 0:
+        return "MALFORMED", summary
 
     if flips == 0 and worst_rank <= ROBUST_RANK_THRESHOLD:
         return "ROBUST", summary
@@ -162,11 +168,21 @@ def validate_sensitivity_analysis(yaml_path: str) -> dict:
                         errors.append(
                             f"load_bearing_parameters[{i}].perturbations"
                             f"[{j}] missing field {required!r}")
-                if "rank_change_top_n" in pert and not isinstance(
-                        pert["rank_change_top_n"], (int, float)):
-                    errors.append(
-                        f"load_bearing_parameters[{i}].perturbations[{j}]"
-                        f".rank_change_top_n must be numeric")
+                if "rank_change_top_n" in pert:
+                    rc = pert["rank_change_top_n"]
+                    if not isinstance(rc, (int, float)):
+                        errors.append(
+                            f"load_bearing_parameters[{i}].perturbations[{j}]"
+                            f".rank_change_top_n must be numeric")
+                    elif isinstance(rc, bool) or rc < 0:
+                        # bool is a subclass of int in Python; reject
+                        # explicitly. Negative rank changes are
+                        # meaningless (the count of LGAs whose package
+                        # assignment differs cannot be < 0).
+                        errors.append(
+                            f"load_bearing_parameters[{i}].perturbations[{j}]"
+                            f".rank_change_top_n must be a non-negative "
+                            f"integer (got {rc!r})")
                 if "primary_recommendation_changes" in pert and not isinstance(
                         pert["primary_recommendation_changes"], bool):
                     errors.append(
@@ -191,6 +207,18 @@ def validate_sensitivity_analysis(yaml_path: str) -> dict:
                 ], "summary": {}}
 
     computed, summary = _compute_verdict(parameters)
+
+    # _compute_verdict returns MALFORMED when total perturbations == 0.
+    # Surface that here as a schema error rather than a verdict.
+    if computed == "MALFORMED":
+        return {"verdict": "MALFORMED", "computed_verdict": None,
+                "reported_verdict": data.get("verdict"),
+                "errors": [
+                    "No perturbations found across any load_bearing_"
+                    "parameters; cannot compute a verdict from empty "
+                    "data."
+                ], "summary": summary}
+
     reported = data.get("verdict")
     if reported is not None and reported not in VALID_VERDICTS:
         return {"verdict": "MALFORMED", "computed_verdict": computed,
@@ -199,6 +227,28 @@ def validate_sensitivity_analysis(yaml_path: str) -> dict:
                     f"verdict {reported!r} not recognized; "
                     f"must be one of {sorted(VALID_VERDICTS)}"
                 ], "summary": summary}
+
+    # Reported-vs-computed mismatch: the modeler self-reports a verdict
+    # the data does not support. Flag as MALFORMED so the modeler must
+    # either (a) correct the reported verdict or (b) correct the
+    # perturbation outcomes that produced the disagreement. Silent
+    # acceptance of the computed value would let a self-reported
+    # ROBUST stand even when the perturbations show flips.
+    if reported is not None and reported != computed:
+        return {
+            "verdict": "MALFORMED",
+            "computed_verdict": computed,
+            "reported_verdict": reported,
+            "errors": [
+                f"verdict mismatch: reported {reported!r} but data "
+                f"computes {computed!r} (flips={summary['flips']}, "
+                f"worst rank change top-N="
+                f"{summary['worst_rank_change_top_n']}). Either correct "
+                f"the reported verdict to match the data or fix the "
+                f"perturbation outcomes."
+            ],
+            "summary": summary,
+        }
 
     return {
         "verdict": computed,
@@ -422,6 +472,84 @@ def _run_self_test() -> int:
         ok(r8["verdict"] == "MALFORMED",
            f"T8: non-bool primary_recommendation_changes should be MALFORMED, "
            f"got {r8}")
+
+        # T9 (review fix #2): reported verdict ROBUST disagrees with
+        # computed UNSTABLE → MALFORMED.
+        f9 = os.path.join(d, "t9.yaml")
+        with open(f9, "w") as f:
+            f.write(
+                "load_bearing_parameters:\n"
+                "  - id: SA-001\n"
+                "    parameter: pbo_or\n"
+                "    primary_value: 0.55\n"
+                "    primary_objective: 4565827\n"
+                "    perturbations:\n"
+                "      - value: 0.37\n"
+                "        objective: 4400000\n"
+                "        rank_change_top_n: 50\n"
+                "        primary_recommendation_changes: true\n"
+                "      - value: 0.81\n"
+                "        objective: 4720000\n"
+                "        rank_change_top_n: 40\n"
+                "        primary_recommendation_changes: true\n"
+                "  - id: SA-002\n"
+                "    parameter: smc_irr\n"
+                "    primary_value: 0.27\n"
+                "    primary_objective: 4565827\n"
+                "    perturbations:\n"
+                "      - value: 0.25\n"
+                "        objective: 4640000\n"
+                "        rank_change_top_n: 8\n"
+                "        primary_recommendation_changes: false\n"
+                "verdict: ROBUST\n"  # data computes UNSTABLE; modeler self-deception
+            )
+        r9 = validate_sensitivity_analysis(f9)
+        ok(r9["verdict"] == "MALFORMED",
+           f"T9: reported ROBUST vs computed UNSTABLE should fire MALFORMED, "
+           f"got {r9}")
+        ok(r9["computed_verdict"] == "UNSTABLE",
+           f"T9: computed_verdict should still be exposed as UNSTABLE, "
+           f"got {r9['computed_verdict']}")
+        ok(r9["reported_verdict"] == "ROBUST",
+           f"T9: reported_verdict should be exposed as ROBUST, "
+           f"got {r9['reported_verdict']}")
+
+        # T10 (review fix #4): negative rank_change_top_n is meaningless
+        # → MALFORMED.
+        f10 = os.path.join(d, "t10.yaml")
+        with open(f10, "w") as f:
+            f.write(
+                "load_bearing_parameters:\n"
+                "  - id: SA-001\n"
+                "    parameter: pbo_or\n"
+                "    primary_value: 0.55\n"
+                "    primary_objective: 4565827\n"
+                "    perturbations:\n"
+                "      - value: 0.37\n"
+                "        objective: 4400000\n"
+                "        rank_change_top_n: -5\n"
+                "        primary_recommendation_changes: false\n"
+                "  - id: SA-002\n"
+                "    parameter: smc_irr\n"
+                "    primary_value: 0.27\n"
+                "    primary_objective: 4565827\n"
+                "    perturbations:\n"
+                "      - value: 0.25\n"
+                "        objective: 4640000\n"
+                "        rank_change_top_n: 8\n"
+                "        primary_recommendation_changes: false\n"
+            )
+        r10 = validate_sensitivity_analysis(f10)
+        ok(r10["verdict"] == "MALFORMED",
+           f"T10: negative rank_change_top_n should fire MALFORMED, got {r10}")
+
+        # T11 (review fix #3): _compute_verdict on empty parameters
+        # returns MALFORMED rather than silent ROBUST.
+        verdict, summary = _compute_verdict([])
+        ok(verdict == "MALFORMED",
+           f"T11: _compute_verdict([]) should return MALFORMED, got {verdict}")
+        ok(summary["total_perturbations"] == 0,
+           f"T11: summary.total_perturbations should be 0, got {summary}")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)

@@ -333,6 +333,31 @@ def _scan(patterns, code: str) -> list[str]:
     return hits
 
 
+# Match Python triple-quoted strings (both """ and '''), single-line strings
+# in either quote style, and # comments. Used to strip non-code regions
+# before pattern matching, so a `class X(ss.Module)` inside a docstring
+# can't masquerade as real ABM evidence.
+_PYTHON_STRING_OR_COMMENT_RE = re.compile(
+    r'"""(?:.|\n)*?"""'        # triple-double
+    r"|'''(?:.|\n)*?'''"       # triple-single
+    r'|"(?:\\.|[^"\\\n])*"'    # double-quoted
+    r"|'(?:\\.|[^'\\\n])*'"    # single-quoted
+    r"|#[^\n]*"                # comment-to-EOL
+)
+
+
+def _strip_strings_and_comments(code: str) -> str:
+    """Replace Python string literals and # comments with whitespace of
+    matching length. Preserves line numbers and column offsets so MULTILINE
+    `^class ...` patterns still work, while preventing false-positive
+    matches on Starsim symbols mentioned inside docstrings, type annotations
+    expressed as strings, or # noqa comments."""
+    def _blank(m: re.Match) -> str:
+        # Preserve newlines so line-anchored patterns continue to work.
+        return "".join("\n" if c == "\n" else " " for c in m.group(0))
+    return _PYTHON_STRING_OR_COMMENT_RE.sub(_blank, code)
+
+
 def _check_framework(framework: str, code_by_file: dict[str, str]) -> Optional[dict]:
     """Return a violation dict or None if compliant."""
     if framework == "starsim":
@@ -408,12 +433,21 @@ def _check_abm(code_by_file: dict[str, str]) -> Optional[dict]:
     abm_hits: list[str] = []
     ode_hits: list[str] = []
     unambig_abm_hits: list[str] = []
+    # Strip strings/comments uniformly for all three scans. A pattern
+    # like `class X(ss.Module)` or `solve_ivp(` inside a docstring,
+    # a # TODO comment, or a string-literal type annotation is not
+    # evidence of how the model actually runs — it's narrative about
+    # what the code does or might do. Counting these as evidence
+    # produces false positives on the ODE side and false negatives on
+    # the ABM-suppression side. The strip preserves line numbers and
+    # column offsets, so MULTILINE `^class ...` patterns still work.
     for path, code in code_by_file.items():
-        for label in _scan(_ABM_SIGNALS, code):
+        stripped = _strip_strings_and_comments(code)
+        for label in _scan(_ABM_SIGNALS, stripped):
             abm_hits.append(f"{path}: {label}")
-        for label in _scan(_ODE_SIGNALS, code):
+        for label in _scan(_ODE_SIGNALS, stripped):
             ode_hits.append(f"{path}: {label}")
-        for label in _scan(_UNAMBIGUOUS_ABM_SIGNALS, code):
+        for label in _scan(_UNAMBIGUOUS_ABM_SIGNALS, stripped):
             unambig_abm_hits.append(f"{path}: {label}")
 
     # Phase 8 Commit ο: any unambiguous ABM signal proves the model runs
@@ -1119,6 +1153,29 @@ def _run_self_test() -> int:
         kinds_c3 = {v["kind"] for v in vc3["violations"]}
         ok("approach_mismatch" in kinds_c3,
            f"C3: pure scipy.solve_ivp, no starsim; expected approach_mismatch, got {kinds_c3}")
+
+        # Case C5 (Phase 8 review fix #1): unambiguous-ABM-signal pattern
+        # appearing inside a docstring or # comment must NOT suppress
+        # approach_mismatch on otherwise-scipy-only code. The actual
+        # delivered model is pure scipy; the docstring just talks about
+        # what the modeler plans to do later.
+        with open(os.path.join(models, "model.py"), "w") as f:
+            f.write('"""Module docstring.\n\n'
+                    "Eventually we will rewrite this as:\n\n"
+                    "    class MalariaModel(ss.Module): ...\n"
+                    "    sim = ss.Sim(people=ss.People(n_agents=1000))\n"
+                    "    sim.run()\n\n"
+                    'For now the dynamics live in scipy."""\n'
+                    "import numpy as np\n"
+                    "from scipy.integrate import solve_ivp\n"
+                    "# TODO: replace with class Foo(ss.Module) eventually\n"
+                    "def rhs(t, y): return -0.1 * y\n"
+                    "solve_ivp(rhs, [0, 10], [1.0])\n")
+        vc5 = check_spec_compliance(required_a, d)
+        kinds_c5 = {v["kind"] for v in vc5["violations"]}
+        ok("approach_mismatch" in kinds_c5,
+           f"C5: ss.Module/ss.Sim only in docstring+comment; expected "
+           f"approach_mismatch, got {kinds_c5}")
 
         # Case C4 (Phase 8 Commit ο): cosmetic-import — `import starsim`
         # without ever constructing ss.Sim → MUST fire framework_missing
