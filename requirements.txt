@@ -7,6 +7,16 @@ matplotlib
 seaborn
 requests
 
+# Phase 11 Commit η (F2): directly imported but previously omitted.
+# main.py:9 imports dotenv; agents/__init__.py:61 imports PIL; 10+
+# scripts under scripts/ import yaml. A clean install from README
+# crashed at startup before this fix.
+python-dotenv
+PyYAML
+Pillow
+# Phase 11 Commit η (F7): UID/PPID-aware orphan-process cleanup.
+psutil
+
 # Model fitting and statistics
 lmfit
 statsmodels

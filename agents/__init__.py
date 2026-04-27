@@ -37,18 +37,78 @@ AGENT_MAX_TURNS = {
 
 def cleanup_orphaned_claude_processes():
     """Kill orphaned claude CLI processes from crashed agent sessions.
-    These accumulate at 400-600MB each and cause OOM SIGKILL crashes."""
-    import subprocess
+    These accumulate at 400-600MB each and cause OOM SIGKILL crashes.
+
+    Phase 11 Commit η (F7): scoped to processes owned by the current
+    user AND whose parent process is the current Python process (or
+    one of its descendants). Previously: ``pgrep -f`` matched system-
+    wide, so concurrent runs of this pipeline (or any other user's
+    Claude SDK use on the host) could be killed by a sibling run.
+
+    Filters:
+      - UID match (only the current user's processes)
+      - PPID lineage (parent must be in our process tree, so we don't
+        touch siblings' children)
+      - Age >= 60s (don't kill a child that's still initializing)
+    """
+    import os
     try:
-        result = subprocess.run(
-            ["pgrep", "-f", "claude_agent_sdk/_bundled/claude"],
-            capture_output=True, text=True,
-        )
-        pids = [p for p in result.stdout.strip().split("\n") if p]
-        if len(pids) > 2:  # Keep max 2 (current session), kill the rest
-            for pid in pids[2:]:
-                subprocess.run(["kill", "-9", pid], capture_output=True)
-            print(f"[cleanup] Killed {len(pids) - 2} orphaned claude processes", flush=True)
+        import psutil
+    except ImportError:
+        # psutil is in requirements.txt, but be defensive: if it's
+        # missing, fall back to a no-op rather than crashing the run.
+        return
+
+    try:
+        my_uid = os.getuid()
+        # Build the set of "PIDs in my process tree": me + my children
+        # (recursive). The SDK spawns bundled-claude as a descendant of
+        # our python process, so any bundled-claude whose parent isn't
+        # in this set is from another run and must NOT be touched.
+        my_pid = os.getpid()
+        my_tree: set[int] = {my_pid}
+        try:
+            for child in psutil.Process(my_pid).children(recursive=True):
+                my_tree.add(child.pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+        import time
+        now = time.time()
+        candidates = []
+        for proc in psutil.process_iter(["pid", "ppid", "uids", "cmdline",
+                                         "create_time"]):
+            try:
+                info = proc.info
+                cmdline = " ".join(info.get("cmdline") or [])
+                if "claude_agent_sdk/_bundled/claude" not in cmdline:
+                    continue
+                if not info.get("uids") or info["uids"].real != my_uid:
+                    continue
+                if info.get("ppid") not in my_tree:
+                    continue
+                if (now - (info.get("create_time") or now)) < 60:
+                    continue
+                candidates.append(proc)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+        # Keep the 2 most-recently-started in our tree (current session
+        # + a buffer); kill the rest.
+        candidates.sort(key=lambda p: p.info.get("create_time") or 0,
+                        reverse=True)
+        to_kill = candidates[2:]
+        killed = 0
+        for proc in to_kill:
+            try:
+                proc.kill()
+                killed += 1
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        if killed:
+            print(f"[cleanup] Killed {killed} orphaned claude processes "
+                  f"(filtered to my UID + my process tree, age>=60s)",
+                  flush=True)
     except Exception:
         pass
 

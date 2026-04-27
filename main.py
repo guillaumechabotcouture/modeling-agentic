@@ -38,11 +38,24 @@ def slugify(text: str, max_len: int = 40) -> str:
 def create_run_dir(question: str) -> str:
     runs_root = os.path.join(os.getcwd(), "runs")
     os.makedirs(runs_root, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M")
+    # Phase 11 Commit η (F5): seconds-granularity timestamp + collision
+    # detection. Previously: minute granularity + os.makedirs(...,
+    # exist_ok=True) silently reused the dir, then metadata.json was
+    # rewritten with mode "w", clobbering the prior run's record.
+    # Now: if `{ts}_{slug}` exists, append `-2`, `-3`, ... until a
+    # free name is found, and write metadata.json with mode "x"
+    # (exclusive create) so any latent race surfaces as
+    # FileExistsError rather than silent overwrite.
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     slug = slugify(question)
-    run_name = f"{timestamp}_{slug}"
+    base_name = f"{timestamp}_{slug}"
+    run_name = base_name
+    suffix = 2
+    while os.path.exists(os.path.join(runs_root, run_name)):
+        run_name = f"{base_name}-{suffix}"
+        suffix += 1
     run_path = os.path.join(runs_root, run_name)
-    os.makedirs(run_path, exist_ok=True)
+    os.makedirs(run_path)  # no exist_ok — we know it's free
     os.makedirs(os.path.join(run_path, "data"), exist_ok=True)
     os.makedirs(os.path.join(run_path, "figures"), exist_ok=True)
 
@@ -51,7 +64,7 @@ def create_run_dir(question: str) -> str:
         "started": datetime.now().isoformat(),
         "run_dir": run_name,
     }
-    with open(os.path.join(run_path, "metadata.json"), "w") as f:
+    with open(os.path.join(run_path, "metadata.json"), "x") as f:
         json.dump(metadata, f, indent=2)
 
     with open(os.path.join(run_path, "progress.md"), "w") as f:
@@ -179,6 +192,15 @@ async def run(question: str, max_rounds: int, max_sessions: int,
 
     session_id = None
 
+    # Phase 11 Commit η (F1): discriminate terminal states so external
+    # orchestrators (cron / watchdog / scheduler) checking metadata can
+    # tell completion apart from interruption / policy-block / max-
+    # sessions exhaustion. Default to "unknown_error" — the for-loop
+    # only exits via one of the explicit `break` branches below; if it
+    # ever falls through without hitting a branch, this default at
+    # least flags the bug instead of silently claiming success.
+    terminal_status = "unknown_error"
+
     for session_num in range(1, max_sessions + 1):
         print(f"\n{'#'*60}", flush=True)
         print(f"SESSION {session_num}/{max_sessions}", flush=True)
@@ -218,11 +240,13 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                     session_id = getattr(message, "session_id", None)
 
             trace_file.close()
+            terminal_status = "completed"
             break  # Pipeline completed successfully
 
         except KeyboardInterrupt:
             print("\nInterrupted.", flush=True)
             trace_file.close()
+            terminal_status = "interrupted"
             break
 
         except Exception as e:
@@ -238,10 +262,12 @@ async def run(question: str, max_rounds: int, max_sessions: int,
             # Don't retry policy blocks
             if "Usage Policy" in error_str or "violate" in error_str:
                 print("Policy block detected. Try rephrasing the question.", flush=True)
+                terminal_status = "policy_blocked"
                 break
 
             if session_num >= max_sessions:
                 print("Max sessions reached.", flush=True)
+                terminal_status = "max_sessions_reached"
                 break
 
             # Exponential backoff
@@ -266,7 +292,14 @@ async def run(question: str, max_rounds: int, max_sessions: int,
     metadata_path = os.path.join(run_path, "metadata.json")
     with open(metadata_path) as f:
         meta = json.load(f)
+    # Phase 11 Commit η (F1): `completed` is the timestamp the run loop
+    # finished (kept for backward compat with existing readers).
+    # `status` is the new authoritative discriminator: "completed" |
+    # "interrupted" | "policy_blocked" | "max_sessions_reached" |
+    # "unknown_error". Automation should consult `status`, not the
+    # presence of `completed`.
     meta["completed"] = datetime.now().isoformat()
+    meta["status"] = terminal_status
     meta["elapsed_s"] = elapsed
     meta["sessions"] = session_num
     meta["has_report"] = os.path.exists(os.path.join(run_path, "report.md"))
@@ -277,7 +310,7 @@ async def run(question: str, max_rounds: int, max_sessions: int,
 
     has_report = meta["has_report"]
     print(f"\n{'='*60}", flush=True)
-    print(f"RUN COMPLETE", flush=True)
+    print(f"RUN {terminal_status.upper()}", flush=True)
     print(f"  Duration: {elapsed:.0f}s ({elapsed/60:.1f} min)", flush=True)
     print(f"  Sessions: {session_num}", flush=True)
     print(f"  Report: {'written' if has_report else 'not written'}", flush=True)
