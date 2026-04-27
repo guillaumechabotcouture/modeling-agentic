@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
 from datetime import datetime
 from dotenv import load_dotenv
@@ -316,8 +317,7 @@ async def run(question: str, max_rounds: int, max_sessions: int,
         # Snapshot the report immediately so any later disappearance
         # is recoverable.
         try:
-            import shutil as _shutil
-            _shutil.copyfile(report_path, snapshot_path)
+            shutil.copyfile(report_path, snapshot_path)
         except OSError as e:
             print(f"[WARNING] could not snapshot report.md: {e}", flush=True)
 
@@ -327,8 +327,7 @@ async def run(question: str, max_rounds: int, max_sessions: int,
     if (writer_qa_clean and not os.path.exists(report_path)
             and os.path.exists(snapshot_path)):
         try:
-            import shutil as _shutil
-            _shutil.copyfile(snapshot_path, report_path)
+            shutil.copyfile(snapshot_path, report_path)
             report_restored = True
             print(f"[WARNING] report.md was missing despite CLEAN "
                   f"writer_qa; restored from {snapshot_path}", flush=True)

@@ -38,42 +38,17 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import re
 import sys
-from typing import Callable, Optional
+from typing import Optional
 
 
 MEDIUM_DRIFT_THRESHOLD = 0.05   # 5%
 HIGH_DRIFT_THRESHOLD = 0.25     # 25%
 
-# Tokens for parsing M / k / no-suffix numeric claims like "54.7M cases"
-# or "127.5M". Returns the value scaled to its base unit.
-_NUMERIC_M_RE = re.compile(r"(\d+(?:\.\d+)?)\s*M\b")
-_NUMERIC_K_RE = re.compile(r"(\d+(?:\.\d+)?)\s*k\b")
 _DOLLAR_PER_CASE_RE = re.compile(r"\$(\d+(?:\.\d+)?)\s*/\s*case")
-_DOLLAR_PER_DALY_RE = re.compile(r"\$(\d+(?:\.\d+)?)\s*/\s*DALY",
-                                 re.IGNORECASE)
 _ROUND_TITLE_RE = re.compile(r"Round\s*(\d+)", re.IGNORECASE)
-
-
-def _parse_m_or_raw(text: str) -> Optional[float]:
-    """Parse '54.7M' → 54_700_000, '127500000' → 127500000.
-    Returns None if no parse possible."""
-    m = _NUMERIC_M_RE.search(text)
-    if m:
-        return float(m.group(1)) * 1_000_000
-    k = _NUMERIC_K_RE.search(text)
-    if k:
-        return float(k.group(1)) * 1_000
-    raw = re.search(r"\b(\d+(?:\.\d+)?)\b", text)
-    if raw:
-        v = float(raw.group(1))
-        # Heuristic: a "cases averted" value < 1000 was probably a
-        # millions-stripped number; flag for caller to decide.
-        return v
-    return None
 
 
 def _drift_pct(claimed: float, authoritative: float) -> float:
@@ -97,21 +72,13 @@ def _load_authoritative(run_dir: str) -> dict:
     """Load the authoritative source values used for cross-checking.
 
     Each key is a claim_id; the value is the canonical number. Missing
-    sources produce a None value; the cross-check then reports
-    `authoritative_unavailable` rather than guessing. Both the per-
-    archetype and portfolio-level numbers are loaded so claims like
-    "$4.71/case for PBO in NW" can be checked against the per-archetype
-    row, not the portfolio average.
+    sources produce a None value; the cross-check then skips that claim
+    silently rather than guessing.
     """
     auth: dict = {
         "headline_cases_averted": None,
         "headline_uniform_cases": None,
-        "improvement_pct": None,
-        "cost_per_case_portfolio": None,
-        "cost_per_daly_portfolio": None,
         "pbo_nw_cost_per_case": None,
-        "pbo_nw_pfpr_reduction": None,
-        "pbo_nw_smc_pfpr_reduction": None,
         "final_round": None,
     }
 
@@ -122,23 +89,15 @@ def _load_authoritative(run_dir: str) -> dict:
                 s = json.load(f)
             auth["headline_cases_averted"] = float(s.get("total_cases_averted", 0)) or None
             auth["headline_uniform_cases"] = float(s.get("uniform_cases_averted", 0)) or None
-            if (auth["headline_cases_averted"] is not None
-                    and auth["headline_uniform_cases"] is not None
-                    and auth["headline_uniform_cases"] != 0):
-                auth["improvement_pct"] = (
-                    (auth["headline_cases_averted"] - auth["headline_uniform_cases"])
-                    / auth["headline_uniform_cases"] * 100.0
-                )
-            auth["cost_per_case_portfolio"] = s.get("cost_per_case_averted")
-            auth["cost_per_daly_portfolio"] = s.get("cost_per_daly_averted")
         except (json.JSONDecodeError, OSError, KeyError):
             pass
 
-    # Per-archetype numbers from package_evaluation.csv. The
-    # PBO-in-NW row (the famous $5.05/$4.71 contradiction in 104914)
-    # is in the row with archetype="Taura", zone="North West",
-    # package="llin_pbo". We parse the FIRST NW/llin_pbo row we find
-    # (Taura — alphabetically first archetype in the run).
+    # Per-archetype PBO-in-NW cost from package_evaluation.csv. We use
+    # the first NW/llin_pbo row encountered (file-order, not
+    # alphabetical) — within a single run, all NW/llin_pbo archetype
+    # rows share the same cost_per_case_averted because the cost is
+    # a function of zone-level baseline ITN coverage and package
+    # composition, not archetype-specific population.
     eval_path = os.path.join(run_dir, "models", "package_evaluation.csv")
     if os.path.exists(eval_path):
         try:
@@ -154,23 +113,6 @@ def _load_authoritative(run_dir: str) -> dict:
                         try:
                             auth["pbo_nw_cost_per_case"] = float(
                                 cells[idx["cost_per_case_averted"]])
-                            auth["pbo_nw_pfpr_reduction"] = float(
-                                cells[idx["pfpr_reduction_pct"]])
-                        except (KeyError, ValueError):
-                            pass
-                        break
-                # Reset and look for PBO+SMC in NW
-                f.seek(0)
-                f.readline()
-                for line in f:
-                    cells = line.strip().split(",")
-                    if len(cells) <= max(idx.values()):
-                        continue
-                    if (cells[idx.get("zone", -1)] == "North West"
-                            and cells[idx.get("package", -1)] == "llin_pbo_smc"):
-                        try:
-                            auth["pbo_nw_smc_pfpr_reduction"] = float(
-                                cells[idx["pfpr_reduction_pct"]])
                         except (KeyError, ValueError):
                             pass
                         break
@@ -196,8 +138,7 @@ def _load_authoritative(run_dir: str) -> dict:
     return auth
 
 
-def _scan_doc_costs(doc_path: str, doc_text: str
-                    ) -> list[tuple[float, str, str, str]]:
+def _scan_doc_costs(doc_text: str) -> list[tuple[float, str, str, str]]:
     """Find all '$X/case' occurrences in a doc with three windows:
       - left_window (25 chars BEFORE the match) — for entity
         classification
@@ -292,13 +233,15 @@ def check_numeric_consistency(run_dir: str) -> list[dict]:
     violations: list[dict] = []
     auth = _load_authoritative(run_dir)
 
-    # Report-level files to scan. scope_declaration.yaml is YAML but
-    # we read it as text — numeric drift detection is regex-based.
+    # Files scanned for cross-doc cases-averted drift. results.md and
+    # figure_rationale.md are the headline-number locations; the cost-
+    # per-case same-doc check is hardcoded to results.md below since
+    # decision_rule.md and scope_declaration.yaml don't typically
+    # contain $X/case mentions. Expanding either set is a Phase 13
+    # candidate if drift surfaces in those files.
     report_files = [
         "results.md",
         "figure_rationale.md",
-        "decision_rule.md",
-        "scope_declaration.yaml",
     ]
 
     # --- Same-doc inconsistency: PBO-in-NW cost-per-case ---
@@ -310,7 +253,7 @@ def check_numeric_consistency(run_dir: str) -> list[dict]:
         try:
             with open(results_path, encoding="utf-8") as f:
                 text = f.read()
-            costs = _scan_doc_costs(results_path, text)
+            costs = _scan_doc_costs(text)
             # Filter to "PBO ALONE" + "NW" / "North West" context.
             # Critical: exclude PBO+SMC, PBO+IRS, and standard-LLIN
             # mentions. The 104914 retro fired false positives on
@@ -348,20 +291,26 @@ def check_numeric_consistency(run_dir: str) -> list[dict]:
                     pbo_nw_costs.append((val, ctx))
             distinct = sorted({round(v, 2) for v, _ in pbo_nw_costs})
             if len(distinct) > 1:
+                if auth['pbo_nw_cost_per_case'] is not None:
+                    claim_msg = (
+                        f"results.md contains {len(distinct)} distinct "
+                        f"cost-per-case values for PBO in NW: {distinct}. "
+                        f"The CSV-authoritative value is "
+                        f"${auth['pbo_nw_cost_per_case']:.2f}/case "
+                        f"(models/package_evaluation.csv, first NW/llin_pbo "
+                        f"row). All in-text mentions must agree to within "
+                        f"{MEDIUM_DRIFT_THRESHOLD*100:.0f}%."
+                    )
+                else:
+                    claim_msg = (
+                        f"results.md contains {len(distinct)} distinct "
+                        f"cost-per-case values for PBO in NW: {distinct}. "
+                        f"Authoritative source unavailable; cannot determine "
+                        f"which is correct, but the in-text spread is itself "
+                        f"a problem."
+                    )
                 violations.append(_build_violation(
-                    "same_doc_inconsistency", "MEDIUM",
-                    f"results.md contains {len(distinct)} distinct cost-per-case "
-                    f"values for PBO in NW: {distinct}. The CSV-authoritative "
-                    f"value is "
-                    f"${auth['pbo_nw_cost_per_case']:.2f}/case "
-                    f"(models/package_evaluation.csv, Taura row). "
-                    f"All in-text mentions must agree to within {MEDIUM_DRIFT_THRESHOLD*100:.0f}%."
-                    if auth['pbo_nw_cost_per_case'] is not None else
-                    f"results.md contains {len(distinct)} distinct cost-per-case "
-                    f"values for PBO in NW: {distinct}. authoritative source "
-                    f"unavailable; cannot determine which is correct, but the "
-                    f"in-text spread is itself a problem."
-                ))
+                    "same_doc_inconsistency", "MEDIUM", claim_msg))
             # Cross-check vs authoritative
             if auth["pbo_nw_cost_per_case"] is not None and pbo_nw_costs:
                 for val, ctx in pbo_nw_costs:
@@ -372,9 +321,10 @@ def check_numeric_consistency(run_dir: str) -> list[dict]:
                                 else "numeric_drift_detected")
                         violations.append(_build_violation(
                             kind, sev,
-                            f"results.md claims $\\${val:.2f}/case for PBO in NW "
-                            f"but models/package_evaluation.csv (Taura/NW/"
-                            f"llin_pbo) is $\\${auth['pbo_nw_cost_per_case']:.2f}/case "
+                            f"results.md claims ${val:.2f}/case for PBO in NW "
+                            f"but models/package_evaluation.csv (NW/"
+                            f"llin_pbo first row) is "
+                            f"${auth['pbo_nw_cost_per_case']:.2f}/case "
                             f"({drift*100:.1f}% drift). Context: "
                             f"\"...{ctx.strip()[:120]}...\"."
                         ))
@@ -425,15 +375,18 @@ def check_numeric_consistency(run_dir: str) -> list[dict]:
             if m:
                 claimed_round = int(m.group(1))
                 if claimed_round != auth["final_round"]:
+                    # A round mismatch always fires; HIGH when the drift
+                    # exceeds the extreme threshold, MEDIUM otherwise.
+                    # Kind matches the convention used elsewhere in this
+                    # module: `_extreme` for HIGH, `_detected` for MEDIUM.
                     drift = abs(claimed_round - auth["final_round"]) / max(
                         auth["final_round"], 1)
-                    sev = ("HIGH" if drift > HIGH_DRIFT_THRESHOLD
-                           else "MEDIUM" if drift > MEDIUM_DRIFT_THRESHOLD
-                           else None)
-                    if sev is None:
-                        sev = "MEDIUM"  # round mismatch always at least MEDIUM
+                    if drift > HIGH_DRIFT_THRESHOLD:
+                        sev, kind = "HIGH", "numeric_drift_extreme"
+                    else:
+                        sev, kind = "MEDIUM", "numeric_drift_detected"
                     violations.append(_build_violation(
-                        "numeric_drift_detected", sev,
+                        kind, sev,
                         f"results.md title says \"Round {claimed_round}\" but "
                         f"progress.md shows STAGE 7 decisions through "
                         f"Round {auth['final_round']} (the authoritative "

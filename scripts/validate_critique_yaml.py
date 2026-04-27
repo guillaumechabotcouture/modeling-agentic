@@ -2279,6 +2279,17 @@ def _check_persistent_medium_escalation(run_dir: str,
 
     Returns a list of HIGH `<kind>_persistent` and
     `<id>_persistent` violations. Silent if nothing escalates.
+
+    Known limitation (Path A — validator-kind escalation): persistence
+    is counted by scanning `stage7_round{N}_stderr.txt` files in the
+    run dir. The lead is supposed to write one per gate invocation,
+    but in practice not every round's stderr is saved (the 104914 run
+    only had rounds 2/3/4 stderr present, no rounds 5/6). When earlier
+    rounds' stderr is missing, the count is a LOWER BOUND, and a
+    genuinely-persistent MEDIUM may not reach the threshold via Path A.
+    Path B (critique-blocker escalation via `first_seen_round` in the
+    YAML) is more reliable because the YAML is overwritten each round
+    and the field is explicitly set by the critique agent.
     """
     out: list[dict] = []
 
