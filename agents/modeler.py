@@ -284,6 +284,67 @@ This self-check costs ~5-10 image reads per modeler turn (PNG reads
 are fast). It catches the class of issues that has caused ≈30% of
 late-round HIGH blockers across prior malaria runs.
 
+### Figure validator contract (Phase 9 Commit ρ — write-time invariant)
+
+The Phase 8 Commit ξ multimodal self-check above is judgment-based
+and proved unreliable in the 0013 live run: D-022 (stale AIC values
+in `model_comparison.png`) and D-023 (stale calibration scatter)
+were not caught until round 8 with no rounds left to regenerate.
+Phase 9 makes figure freshness a write-time invariant the
+modeler's own code enforces — no agent in the pipeline has to
+"remember" to look.
+
+**After every `plt.savefig()` call**, your figure script MUST call
+`validate_figure(...)` from `scripts/figure_validator.py`:
+
+```python
+from figure_validator import validate_figure  # add scripts/ to sys.path
+
+fig, ax = plt.subplots()
+ax.plot(zone_pfpr_observed, zone_pfpr_modeled, "o")
+ax.set_title(f"Calibration scatter — RMSE = {rmse:.2f}pp (n = {len(df)} LGAs)")
+plt.savefig(f"{run_dir}/figures/calibration_scatter.png", dpi=150)
+plt.close()
+
+validate_figure(
+    f"{run_dir}/figures/calibration_scatter.png",
+    source_data_paths=[f"{run_dir}/data/lga_pfpr_observed.csv",
+                       f"{run_dir}/models/zone_calibration.csv"],
+    expected_annotations=[
+        f"RMSE = {rmse:.2f}pp",
+        "Calibration scatter",
+    ],
+)
+```
+
+`validate_figure` writes a sidecar `<png>.provenance.json` recording
+the SHA-256 hash of every source CSV at write time and the
+annotation strings you assert appear in the figure. Two enforcement
+checks fire in `validate_critique_yaml.py` per round:
+
+1. **`figure_staleness_detected` HIGH** — if any source CSV's hash
+   later differs from the recorded hash, the figure was drawn from
+   data that has since changed (the D-022 / D-023 failure mode).
+   Regenerate from current data and re-call `validate_figure()`.
+
+2. **`figure_validator_missing` MEDIUM** — every `plt.savefig` must
+   have a `validate_figure(` call within the next 10 lines. The
+   gate scans your `*.py` files and fires this if any savefig is
+   uncovered.
+
+`expected_annotations` are checked at write time against the
+calling script's source text (with the `validate_figure(...)` call
+itself stripped before search), so accidental drift like "title
+says +105% while body says 2%" surfaces the moment the figure is
+regenerated. List the annotations that matter for the figure's
+claim — typically the headline number(s), the comparator labels,
+and the verdict text. If you cannot list any (e.g., a pure scatter
+with no overlaid text), pass `expected_annotations=[]`.
+
+If a figure is genuinely untraceable to a CSV (e.g., a schematic
+diagram), pass `source_data_paths=[]`. Staleness then cannot fire,
+but the validator-call coverage check is still satisfied.
+
 ## THREAD UPDATES
 
 After building each model and generating figures, update {run_dir}/threads.yaml:
