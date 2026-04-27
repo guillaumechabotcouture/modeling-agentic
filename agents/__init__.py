@@ -582,6 +582,44 @@ counter before the next STAGE 6.
 Spawn the "writer" agent. Tell it the run directory.
 Wait for completion. Verify {run_dir}/report.md exists.
 
+### STAGE 8.5: WRITER_QA (Phase 7 Commit λ)
+
+After report.md is written, run a mechanical post-writer QA pass to
+catch the late-round writer/figure inconsistency class observed in
+prior runs (text-figure misalignments, stale UQ numbers, figure
+annotation discrepancies, stale CRITICAL CAVEATs):
+
+```bash
+python3 scripts/writer_qa.py {run_dir}
+```
+
+This writes `{run_dir}/writer_qa_report.yaml` with one of three verdicts:
+
+- **CLEAN**: no issues. Pipeline complete.
+
+- **REVISE**: ≤2 MAJOR + any MINOR issues. Re-spawn the writer ONCE
+  with the writer_qa_report.yaml's `issues` list as input:
+  "Fix these specific text-figure inconsistencies and stale numbers,
+  then re-emit report.md. After your fixes, run
+  `python3 scripts/writer_qa.py {run_dir}` and verify the verdict is
+  CLEAN before completing."
+
+- **MAJOR_REVISION**: >2 MAJOR issues. Re-spawn writer up to TWICE.
+  If still not CLEAN after the second attempt, scope-declare the
+  remaining QA issues in scope_declaration.yaml and proceed.
+
+The writer_qa pass catches:
+- Stale UQ numbers (text vs uncertainty_report.yaml mismatches by 10x+)
+- Figure-text comparator inconsistency (figure caption says X%,
+  surrounding text says Y%, with abs(log10(X/Y)) > 0.5)
+- Figure annotation vs body-text metric mismatches (e.g., RMSE 0.22pp
+  in caption, 0.26pp in text)
+- Stale CRITICAL CAVEATs (§Limitations references bugs already fixed)
+
+The validator also flags `writer_qa_missing` MEDIUM if the QA pass
+wasn't run, and `writer_qa_unresolved` MEDIUM if the verdict is
+REVISE/MAJOR_REVISION at run completion.
+
 ## GENERAL RULES
 
 - Every finding must have a causal label: CAUSAL, ASSOCIATIONAL, or PROXY.

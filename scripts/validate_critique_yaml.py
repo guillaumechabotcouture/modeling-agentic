@@ -1094,7 +1094,70 @@ def _check_rigor_artifacts(run_dir: str) -> list[dict]:
     # Phase 6 Commit κ: allocation cross-validation.
     violations.extend(_check_allocation_robustness(run_dir))
 
+    # Phase 7 Commit λ: STAGE 8.5 WRITER_QA pass.
+    violations.extend(_check_writer_qa(run_dir))
+
     return violations
+
+
+def _check_writer_qa(run_dir: str) -> list[dict]:
+    """Phase 7 Commit λ: when report.md exists, the writer must run
+    a post-write QA pass via scripts/writer_qa.py and the result must
+    be CLEAN.
+
+    Emits:
+      writer_qa_missing    MEDIUM — report.md exists but no
+                                    writer_qa_report.yaml
+      writer_qa_unresolved MEDIUM — qa report says REVISE/MAJOR_REVISION
+                                    (writer didn't iterate on the issues)
+    """
+    report = os.path.join(run_dir, "report.md")
+    if not os.path.exists(report):
+        return []  # Writer hasn't run yet; nothing to QA.
+
+    qa_path = os.path.join(run_dir, "writer_qa_report.yaml")
+    if not os.path.exists(qa_path):
+        return [{
+            "kind": "writer_qa_missing",
+            "severity": "MEDIUM",
+            "stage": "WRITER_QA",
+            "claim": (
+                "report.md exists but writer_qa_report.yaml is absent. "
+                "STAGE 8.5 requires a post-writer QA pass via "
+                "`python3 scripts/writer_qa.py {run_dir}`. The pass "
+                "checks for stale UQ numbers, figure-text comparator "
+                "inconsistencies, figure annotation vs body-text "
+                "metric mismatches, and stale CRITICAL CAVEATs in "
+                "§Limitations."
+            ),
+        }]
+
+    try:
+        with open(qa_path) as f:
+            data = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError):
+        return []
+
+    verdict = data.get("verdict", "")
+    if verdict in ("REVISE", "MAJOR_REVISION"):
+        n_major = data.get("n_major", 0)
+        n_minor = data.get("n_minor", 0)
+        return [{
+            "kind": "writer_qa_unresolved",
+            "severity": "MEDIUM",
+            "stage": "WRITER_QA",
+            "claim": (
+                f"writer_qa verdict is {verdict} with {n_major} MAJOR "
+                f"and {n_minor} MINOR issues. The lead must re-spawn "
+                f"the writer with the QA report's issues as input, or "
+                f"scope-declare the writer-QA limitations explicitly. "
+                f"Common patterns: stale numbers from pre-fix drafts, "
+                f"figure-text comparator inconsistencies, figure "
+                f"annotations that disagree with body-text metric "
+                f"values."
+            ),
+        }]
+    return []
 
 
 def _check_allocation_robustness(run_dir: str) -> list[dict]:
@@ -2634,6 +2697,49 @@ def _run_self_test() -> int:
         vi5 = _check_allocation_robustness(d)
         ok(not vi5,
            f"I5: no allocation = no robustness requirement, got {vi5}")
+
+    # --- Phase 7 Commit λ: STAGE 8.5 WRITER_QA ---
+    with tempfile.TemporaryDirectory() as d:
+        # Case J1: report.md exists, no writer_qa_report.yaml → MEDIUM.
+        with open(os.path.join(d, "report.md"), "w") as f:
+            f.write("# Report\n\nContent.\n")
+        vj1 = _check_writer_qa(d)
+        ok(any(v["kind"] == "writer_qa_missing" for v in vj1),
+           f"J1: report without writer_qa should fire MEDIUM, got {vj1}")
+
+        # Case J2: writer_qa CLEAN → no fire.
+        with open(os.path.join(d, "writer_qa_report.yaml"), "w") as f:
+            f.write("verdict: CLEAN\nn_major: 0\nn_minor: 0\nissues: []\n")
+        vj2 = _check_writer_qa(d)
+        ok(not vj2, f"J2: CLEAN verdict should not fire, got {vj2}")
+
+        # Case J3: REVISE → MEDIUM unresolved.
+        with open(os.path.join(d, "writer_qa_report.yaml"), "w") as f:
+            f.write(
+                "verdict: REVISE\nn_major: 1\nn_minor: 2\n"
+                "issues:\n"
+                "  - kind: figure_annotation_inconsistency\n"
+                "    severity: MAJOR\n"
+            )
+        vj3 = _check_writer_qa(d)
+        ok(any(v["kind"] == "writer_qa_unresolved" for v in vj3),
+           f"J3: REVISE verdict should fire MEDIUM, got {vj3}")
+
+        # Case J4: MAJOR_REVISION → MEDIUM unresolved.
+        with open(os.path.join(d, "writer_qa_report.yaml"), "w") as f:
+            f.write(
+                "verdict: MAJOR_REVISION\nn_major: 5\nn_minor: 0\n"
+                "issues: []\n"
+            )
+        vj4 = _check_writer_qa(d)
+        ok(any(v["kind"] == "writer_qa_unresolved" for v in vj4),
+           f"J4: MAJOR_REVISION verdict should fire MEDIUM, got {vj4}")
+
+    # Case J5: no report.md → silent.
+    with tempfile.TemporaryDirectory() as d:
+        vj5 = _check_writer_qa(d)
+        ok(not vj5,
+           f"J5: pre-writer (no report.md) should be silent, got {vj5}")
 
     # --- Summary ---
     if failures:
