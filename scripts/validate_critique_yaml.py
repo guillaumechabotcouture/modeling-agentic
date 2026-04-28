@@ -1138,6 +1138,16 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None) -> list[dic
     # bounding the impact loss when the aggregation ratio is high.
     violations.extend(_check_within_zone_heterogeneity(run_dir))
 
+    # Phase 13 Commit α: disease-agnostic structural sanity checks.
+    # The 190855 run shipped DECLARE_SCOPE with internally consistent
+    # numbers but no gate cross-checked aggregate impact against the
+    # model's own internal relationships. Eight generic checks via
+    # models/sanity_schema.yaml: mass balance, per-unit intensity,
+    # share closure, derived consistency, composite dimensions,
+    # counterfactual ratio, structural-uncertainty carry-forward,
+    # outlier sniff. Schema is required at round ≥ 3.
+    violations.extend(_check_sanity_schema(run_dir, round_n=round_n))
+
     # Phase 12 Commit β: round-aware escalation of persisting MEDIUMs.
     # Catches the failure mode the 104914 run shipped: 18 figure_
     # validator_missing MEDIUMs persisted r2→r6, presentation P-005..
@@ -2239,6 +2249,135 @@ def _check_within_zone_heterogeneity(run_dir: str) -> list[dict]:
                 f"will want to see the explicit bound."
             ),
         })
+    return out
+
+
+# Phase 13 Commit α: disease-agnostic structural sanity checks.
+#
+# `models/sanity_schema.yaml` declares abstract slots (outcome,
+# exposure, shares, derived-consistency formulas, composite-dimension
+# windows, counterfactual ratio, structural-uncertainty carry-
+# forward, outlier sniff). `scripts/sanity_checks.py` runs eight
+# generic structural checks against the schema. The schema is
+# required when the modeler has had time to compute headline outputs
+# (round ≥ 3). Each failed check emits a MEDIUM advisory; none block
+# ACCEPT. The modeler can opt out of any check via
+# `scope_declaration.yaml`'s `sanity_check_acknowledged: <id>` list.
+_SANITY_SCHEMA_REQUIRED_FROM_ROUND = 3
+
+
+def _check_sanity_schema(run_dir: str,
+                          round_n: int | None = None) -> list[dict]:
+    """Phase 13 Commit α: validate models/sanity_schema.yaml.
+
+    Emits:
+      sanity_schema_missing               MEDIUM — yaml absent at r≥3
+      sanity_schema_invalid               HIGH   — yaml malformed
+      sanity_check_failed_<id>            MEDIUM — one per failed check
+    """
+    if round_n is not None and round_n < _SANITY_SCHEMA_REQUIRED_FROM_ROUND:
+        return []  # Too early; modeler still composing outputs.
+
+    yaml_path = os.path.join(run_dir, "models", "sanity_schema.yaml")
+    if not os.path.exists(yaml_path):
+        if round_n is None:
+            return []  # Round unknown; defer.
+        return [{
+            "kind": "sanity_schema_missing",
+            "severity": "MEDIUM",
+            "stage": "MODEL",
+            "claim": (
+                f"Required artifact `models/sanity_schema.yaml` is "
+                f"absent at round {round_n} (≥ "
+                f"{_SANITY_SCHEMA_REQUIRED_FROM_ROUND}). The modeler "
+                f"must declare abstract slots (outcome name, baseline "
+                f"reservoir, exposure unit, shares, derived-consistency "
+                f"formulas, composite-dimension windows, structural-"
+                f"uncertainty bounds) so eight disease-agnostic "
+                f"structural checks can run. See the `sanity-schema` "
+                f"skill and `scripts/sanity_checks.py --self-test` for "
+                f"the schema."
+            ),
+        }]
+
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "sanity_checks",
+            os.path.join(os.path.dirname(__file__), "sanity_checks.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    except Exception as e:
+        return [{
+            "kind": "sanity_schema_invalid",
+            "severity": "HIGH",
+            "stage": "MODEL",
+            "claim": f"Could not load scripts/sanity_checks.py: {e}",
+        }]
+
+    result = mod.validate_sanity_schema(yaml_path, run_dir=run_dir)
+    if result["verdict"] == "MALFORMED":
+        return [{
+            "kind": "sanity_schema_invalid",
+            "severity": "HIGH",
+            "stage": "MODEL",
+            "claim": (f"models/sanity_schema.yaml is malformed: "
+                      f"{'; '.join(result.get('errors') or ['(no detail)'])}"),
+        }]
+
+    # Honor explicit opt-outs from scope_declaration.yaml.
+    acknowledged = _load_sanity_check_acknowledged(run_dir)
+
+    out: list[dict] = []
+    for c in result.get("checks", []):
+        if c.get("passed"):
+            continue
+        check_id = c.get("id", "unknown")
+        if check_id in acknowledged:
+            continue
+        out.append({
+            "kind": f"sanity_check_failed_{check_id}",
+            "severity": "MEDIUM",
+            "stage": "MODEL",
+            "claim": (
+                f"Sanity check {check_id!r} failed: {c.get('claim', '')}. "
+                f"Either fix the underlying numbers/relationships in "
+                f"models/sanity_schema.yaml or acknowledge with "
+                f"`sanity_check_acknowledged: [{check_id}]` in "
+                f"scope_declaration.yaml (with rationale)."
+            ),
+        })
+    return out
+
+
+def _load_sanity_check_acknowledged(run_dir: str) -> set[str]:
+    """Read scope_declaration.yaml for `sanity_check_acknowledged: [...]`
+    entries. Returns the set of check IDs the modeler has explicitly
+    documented as out-of-scope."""
+    path = os.path.join(run_dir, "scope_declaration.yaml")
+    if not os.path.exists(path):
+        return set()
+    try:
+        with open(path) as f:
+            doc = yaml.safe_load(f) or {}
+    except (yaml.YAMLError, OSError):
+        return set()
+    out: set[str] = set()
+    # Top-level `sanity_check_acknowledged: [id1, id2]` form.
+    top = doc.get("sanity_check_acknowledged")
+    if isinstance(top, list):
+        out.update(str(x) for x in top)
+    # Per-declaration form: declarations[*].sanity_check_acknowledged
+    decls = doc.get("declarations") or []
+    if isinstance(decls, list):
+        for d in decls:
+            if not isinstance(d, dict):
+                continue
+            ack = d.get("sanity_check_acknowledged")
+            if isinstance(ack, list):
+                out.update(str(x) for x in ack)
+            elif isinstance(ack, str):
+                out.add(ack)
     return out
 
 
