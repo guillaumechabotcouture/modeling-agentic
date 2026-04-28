@@ -99,6 +99,7 @@ import argparse
 import ast
 import json
 import os
+import re
 import sys
 
 try:
@@ -106,6 +107,14 @@ try:
 except ImportError:
     print("ERROR: pyyaml not installed", file=sys.stderr)
     sys.exit(2)
+
+
+# Module-level regexes — compiled once, scanned per text (not per check).
+_NUMERIC_TOKEN_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(M|million|k|thousand)?",
+    re.IGNORECASE,
+)
+_NUMERIC_COMMA_RE = re.compile(r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?)")
 
 
 # Whitelisted AST nodes for derived_consistency formula evaluation.
@@ -490,14 +499,9 @@ def _text_contains_value(text: str, target: float,
                           tol_frac: float = 0.02) -> bool:
     """Return True if `text` contains a numeric token within tol_frac
     of `target`. Handles M/million/k/thousand suffixes and
-    comma-formatted integers."""
-    import re
-    pat = re.compile(
-        r"(\d+(?:\.\d+)?)\s*(M|million|k|thousand)?",
-        re.IGNORECASE)
-    pat_comma = re.compile(r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?)")
-    candidates: list[float] = []
-    for m in pat.finditer(text):
+    comma-formatted integers. Short-circuits on first match."""
+    tol = 0.0 if target == 0 else abs(target) * tol_frac
+    for m in _NUMERIC_TOKEN_RE.finditer(text):
         try:
             v = float(m.group(1))
         except ValueError:
@@ -507,16 +511,16 @@ def _text_contains_value(text: str, target: float,
             v *= 1_000_000
         elif unit in ("k", "thousand"):
             v *= 1_000
-        candidates.append(v)
-    for m in pat_comma.finditer(text):
+        if abs(v - target) <= tol:
+            return True
+    for m in _NUMERIC_COMMA_RE.finditer(text):
         try:
-            candidates.append(float(m.group(1).replace(",", "")))
+            v = float(m.group(1).replace(",", ""))
         except ValueError:
             continue
-    if target == 0:
-        return any(c == 0 for c in candidates)
-    tol = abs(target) * tol_frac
-    return any(abs(c - target) <= tol for c in candidates)
+        if abs(v - target) <= tol:
+            return True
+    return False
 
 
 def _check_outlier_sniff(schema: dict, run_dir: str) -> list[dict]:
@@ -626,22 +630,29 @@ def validate_sanity_schema(yaml_path: str,
     if run_dir is None:
         run_dir = os.path.dirname(os.path.dirname(os.path.abspath(yaml_path)))
 
+    # Catch only the user-input-driven exception classes that
+    # arise from malformed schema entries (TypeError on non-numeric
+    # fields, KeyError on missing keys we didn't pre-validate,
+    # IndexError on bad list shapes, ValueError on number parsing,
+    # OSError on file reads). Anything else is a real bug — let it
+    # surface during development.
+    _USER_INPUT_EXC = (TypeError, KeyError, IndexError, ValueError,
+                        OSError, AttributeError)
     checks: list[dict] = []
     for _name, fn in _CHECKS:
         try:
             checks.extend(fn(schema))
-        except Exception as e:  # noqa: BLE001 — defense in depth
+        except _USER_INPUT_EXC as e:
             checks.append({"id": _name, "passed": False,
                            "claim": f"{_name} crashed: {e}"})
-    # Run-dir-aware checks separately
     try:
         checks.extend(_check_heterogeneity_carryforward(schema, run_dir))
-    except Exception as e:  # noqa: BLE001
+    except _USER_INPUT_EXC as e:
         checks.append({"id": "heterogeneity_carryforward", "passed": False,
                        "claim": f"heterogeneity check crashed: {e}"})
     try:
         checks.extend(_check_outlier_sniff(schema, run_dir))
-    except Exception as e:  # noqa: BLE001
+    except _USER_INPUT_EXC as e:
         checks.append({"id": "outlier_sniff", "passed": False,
                        "claim": f"outlier_sniff crashed: {e}"})
 

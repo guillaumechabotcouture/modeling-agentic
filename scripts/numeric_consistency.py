@@ -117,6 +117,42 @@ def _has_zone_qualifier(window_text: str) -> bool:
     return any(tok in w for tok in _NON_HEADLINE_TOKENS)
 
 
+def _extract_zone_from_window(window: str, zone_alt_map: dict,
+                               from_right: bool = False,
+                               require_no_sentence_break: bool = False
+                               ) -> tuple[str | None, int]:
+    """Find the closest zone keyword in `window` (using word-boundary
+    regex) and return (canonical_zone_name, distance) or (None, 999).
+
+    `from_right`: when True, distance = position from start of window
+    (closer to the source = smaller distance). When False (default),
+    distance = chars between zone-end and window-end (closer to the
+    source = smaller distance, since the source is at end of left
+    window).
+
+    `require_no_sentence_break`: when True (right-window fallback
+    mode), skip a zone match if any of `.`, `;`, `\\n` appears
+    between window start and the zone — that means the zone is in
+    the next sentence, not attributable to the source percent."""
+    matched_zone = None
+    best_dist = 999
+    for zm in _ZONE_RE.finditer(window):
+        z_str = zm.group(0).lower().replace("-", "")
+        z_canonical = (zone_alt_map.get(z_str)
+                       or zone_alt_map.get(z_str.replace(" ", "")))
+        if z_canonical is None:
+            continue
+        if require_no_sentence_break:
+            between = window[:zm.start()]
+            if any(ch in between for ch in (".", ";", "\n")):
+                continue
+        dist = zm.start() if from_right else len(window) - zm.end()
+        if dist < best_dist:
+            best_dist = dist
+            matched_zone = z_canonical
+    return matched_zone, best_dist
+
+
 def _is_table_row(doc_text: str, pos: int) -> bool:
     """Return True if `pos` falls inside a markdown table row
     (the line begins with `|`). Table cells almost always have
@@ -599,42 +635,14 @@ def _check_count_drift(run_dir: str, auth: dict,
                 # (closest to the percent). Only fall back to the
                 # RIGHT window when the left has none — handles
                 # both "NW receives 78%" and "78% to NW" but
-                # avoids "NW: 75%; NC: 24%" attribution drift
-                # (where the right zone is the NEXT clause's).
-                matched_zone = None
-                best_dist = 999
-                for zm in _ZONE_RE.finditer(left_window):
-                    z_str = zm.group(0).lower().replace("-", "")
-                    z_canonical = (zone_alt_map.get(z_str)
-                                   or zone_alt_map.get(
-                                       z_str.replace(" ", "")))
-                    if z_canonical is None:
-                        continue
-                    dist = len(left_window) - zm.end()
-                    if dist < best_dist:
-                        best_dist = dist
-                        matched_zone = z_canonical
+                # avoids "NW: 75%; NC: 24%" attribution drift.
+                matched_zone, _ = _extract_zone_from_window(
+                    left_window, zone_alt_map, from_right=False)
                 if matched_zone is None:
-                    # Fallback to right-window only when nothing in
-                    # left. Require that the right zone match come
-                    # BEFORE any sentence boundary (period, semicolon,
-                    # newline) — otherwise the zone is in the NEXT
-                    # sentence and not attributable to this percent.
-                    best_right_dist = 999
-                    for zm in _ZONE_RE.finditer(right_window):
-                        z_str = zm.group(0).lower().replace("-", "")
-                        z_canonical = (zone_alt_map.get(z_str)
-                                       or zone_alt_map.get(
-                                           z_str.replace(" ", "")))
-                        if z_canonical is None:
-                            continue
-                        between = right_window[:zm.start()]
-                        if any(ch in between for ch in (".", ";", "\n")):
-                            continue
-                        dist = zm.start()
-                        if dist < best_right_dist:
-                            best_right_dist = dist
-                            matched_zone = z_canonical
+                    matched_zone, _ = _extract_zone_from_window(
+                        right_window, zone_alt_map,
+                        from_right=True,
+                        require_no_sentence_break=True)
                 if matched_zone is None:
                     continue
                 auth_share = auth_zones[matched_zone]
