@@ -100,6 +100,9 @@ skill changes are listed below; bug fixes are not.
 | 8     | ξ, ο, π| Multimodal figure-viewing audit (prompt-only); hybrid spec-compliance hardening; sensitivity-analysis required artifact |
 | 9     | σ, ρ, τ| Identifiability false-positive fix (assert_loss_fn_is_pointwise); write-time figure validator + provenance hashes; rigor-artifact timeline |
 | 10    | φ, χ, ψ, ω | Skills hygiene + dead-code sweep; validator robustness (non-crashing reads + 9 new self-tests + severity recalibration); allocation-gate coordinator (round-aware MEDIUM consolidation); docs + sensitivity-remediation skill |
+| 11    | η, υ   | Terminal status discrimination (completed_with_report_restored); F5 run-dir collision prevention                                  |
+| 12    | α, β, γ, δ | Cross-file numeric consistency (`scripts/numeric_consistency.py`); round-aware MEDIUM-to-HIGH escalation; ecological-fallacy required artifact + skill; `report.md` snapshot/restore |
+| 13    | α, β   | Disease-agnostic sanity schema (`scripts/sanity_checks.py` + skill, 8 internal-only structural checks); α numeric_consistency extended to `decision_rule.md` and new token classes (LGA counts, package counts, budget shares) |
 
 ## Conventions
 

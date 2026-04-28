@@ -50,6 +50,132 @@ HIGH_DRIFT_THRESHOLD = 0.25     # 25%
 _DOLLAR_PER_CASE_RE = re.compile(r"\$(\d+(?:\.\d+)?)\s*/\s*case")
 _ROUND_TITLE_RE = re.compile(r"Round\s*(\d+)", re.IGNORECASE)
 
+# Phase 13 Commit β: extended token classes for staleness drift.
+# The 190855 run shipped decision_rule.md claiming 121 LGAs (CSV: 123)
+# and figure_rationale.md claiming "104 dual-AI" (CSV: 106). α v1
+# scanned only $X/case and X[M] cases averted. v2 adds three classes
+# anchored on labeled context to avoid false positives on bare digits.
+#
+# LGA-count: require a TOTAL-allocation anchor to avoid matching
+# legitimate per-subset counts ("106 dual-AI LGAs", "93 NW LGAs").
+# Accepted forms:
+#   "121 LGAs allocated|received|receive"  (right-window anchor)
+#   "121 of N LGAs"                         (left "of N" anchor)
+#   "all 121 LGAs"                          (left "all" anchor)
+#   "total of 121 LGAs"                     (left "total of" anchor)
+_LGA_COUNT_RE = re.compile(
+    r"(\d{1,4})\s+LGAs?\b",
+    re.IGNORECASE,
+)
+_LGA_COUNT_OF_N_RE = re.compile(
+    r"(\d{1,4})\s+of\s+\d{1,4}\s+LGAs?\b",
+    re.IGNORECASE,
+)
+_LGA_TOTAL_LEFT_TOKENS = (" all ", "total of ", "allocate to ",
+                          "allocated to ", "across ")
+_LGA_TOTAL_RIGHT_TOKENS = (" allocated", " received", " receive",
+                           " in total", " total")
+
+# Zone qualifiers that mark a count as a PER-ZONE subset (NOT the
+# global aggregate). When a zone token (or "of 774", the universe
+# pattern, or "<", the prediction-range marker, or "Prediction"
+# anchor) appears in the 30-char window around an LGA-count or
+# package-count match, the match is skipped: "93 NW LGAs",
+# "76 dual-AI in NW", "NC zone has 14 LGAs allocated", "X of 774 LGAs",
+# "<100 LGAs", "Prediction: 250-400 LGAs" are all per-subset / non-
+# headline counts.
+_ZONE_RE = re.compile(
+    r"\b(NW|NE|NC|SW|SE|SS"
+    r"|north[\s\-]?(?:west|east|central)"
+    r"|south[\s\-]?(?:west|east|south))\b",
+    re.IGNORECASE,
+)
+_NON_HEADLINE_TOKENS = (
+    " of 774",         # universe of all LGAs
+    "of 774 ",         # universe form
+    "<",                # prediction range "<100"
+    "prediction",       # hypothesis prediction context
+    "predicted",
+    "expected",
+    "should",
+    "may receive",
+    "could receive",
+    "hypothesis",       # hypothesis statement
+    "h1 ", "h2 ", "h3 ", "h4 ", "h5 ", "h6 ", "h7 ",   # H<N> labels
+    "(h1)", "(h2)", "(h3)", "(h4)", "(h5)", "(h6)", "(h7)",
+    "accuracy",         # decision-rule accuracy line
+)
+
+
+def _has_zone_qualifier(window_text: str) -> bool:
+    """Return True if a per-zone qualifier or non-headline anchor
+    appears in the window. Uses regex word boundaries to avoid
+    false positives like 'zo**NE**' matching 'NE'."""
+    if _ZONE_RE.search(window_text):
+        return True
+    w = window_text.lower()
+    return any(tok in w for tok in _NON_HEADLINE_TOKENS)
+
+
+def _extract_zone_from_window(window: str, zone_alt_map: dict,
+                               from_right: bool = False,
+                               require_no_sentence_break: bool = False
+                               ) -> tuple[str | None, int]:
+    """Find the closest zone keyword in `window` (using word-boundary
+    regex) and return (canonical_zone_name, distance) or (None, 999).
+
+    `from_right`: when True, distance = position from start of window
+    (closer to the source = smaller distance). When False (default),
+    distance = chars between zone-end and window-end (closer to the
+    source = smaller distance, since the source is at end of left
+    window).
+
+    `require_no_sentence_break`: when True (right-window fallback
+    mode), skip a zone match if any of `.`, `;`, `\\n` appears
+    between window start and the zone — that means the zone is in
+    the next sentence, not attributable to the source percent."""
+    matched_zone = None
+    best_dist = 999
+    for zm in _ZONE_RE.finditer(window):
+        z_str = zm.group(0).lower().replace("-", "")
+        z_canonical = (zone_alt_map.get(z_str)
+                       or zone_alt_map.get(z_str.replace(" ", "")))
+        if z_canonical is None:
+            continue
+        if require_no_sentence_break:
+            between = window[:zm.start()]
+            if any(ch in between for ch in (".", ";", "\n")):
+                continue
+        dist = zm.start() if from_right else len(window) - zm.end()
+        if dist < best_dist:
+            best_dist = dist
+            matched_zone = z_canonical
+    return matched_zone, best_dist
+
+
+def _is_table_row(doc_text: str, pos: int) -> bool:
+    """Return True if `pos` falls inside a markdown table row
+    (the line begins with `|`). Table cells almost always have
+    zone/archetype context in their row header that's lost in a
+    30-char window — skip them to avoid false positives."""
+    line_start = doc_text.rfind("\n", 0, pos) + 1
+    line_end = doc_text.find("\n", pos)
+    if line_end == -1:
+        line_end = len(doc_text)
+    line = doc_text[line_start:line_end].lstrip()
+    return line.startswith("|")
+# Match "104 dual-AI", "17 PBO", "12 SMC LGAs". Anchored on the
+# package keyword to avoid catching arbitrary digit-keyword pairs.
+_PACKAGE_COUNT_RE = re.compile(
+    r"(\d{1,4})\s+(dual[\s\-_]?ai|pbo|standard\s+llin|smc|irs)\b",
+    re.IGNORECASE,
+)
+# Match "78.1% of budget", "11% of cost", "10.8% of allocation".
+_BUDGET_SHARE_RE = re.compile(
+    r"(\d{1,3}(?:\.\d+)?)\s*%\s+of\s+(?:the\s+)?(?:budget|cost|allocation)",
+    re.IGNORECASE,
+)
+
 
 def _drift_pct(claimed: float, authoritative: float) -> float:
     """Relative drift |claimed - authoritative| / |authoritative|.
@@ -80,6 +206,10 @@ def _load_authoritative(run_dir: str) -> dict:
         "headline_uniform_cases": None,
         "pbo_nw_cost_per_case": None,
         "final_round": None,
+        # Phase 13 β: extended canonical truth from allocation_result.csv.
+        "n_allocated_lgas": None,        # rows with cost > 0
+        "package_counts": {},            # {dual_ai: 106, pbo: 17, ...}
+        "zone_budget_shares": {},        # {NW: 0.781, NC: 0.108, ...}
     }
 
     summary_path = os.path.join(run_dir, "models", "optimization_summary.json")
@@ -116,6 +246,60 @@ def _load_authoritative(run_dir: str) -> dict:
                         except (KeyError, ValueError):
                             pass
                         break
+        except OSError:
+            pass
+
+    # Phase 13 β: extended canonical truth from allocation CSVs.
+    # Look for any *allocation*.csv under models/. Compute:
+    #   - n_allocated_lgas (rows with total_cost_usd > 0)
+    #   - per-package counts (group by `package` column)
+    #   - per-zone budget shares (sum cost by `zone`, divided by total)
+    alloc_path: str | None = None
+    models_dir = os.path.join(run_dir, "models")
+    if os.path.isdir(models_dir):
+        for entry in os.listdir(models_dir):
+            if "allocation" in entry and entry.endswith(".csv"):
+                alloc_path = os.path.join(models_dir, entry)
+                break
+    if alloc_path:
+        try:
+            with open(alloc_path) as f:
+                header = f.readline().strip().split(",")
+                idx = {n: i for i, n in enumerate(header)}
+                cost_col = idx.get("total_cost_usd")
+                pkg_col = idx.get("package")
+                zone_col = idx.get("zone")
+                pkg_counts: dict = {}
+                zone_costs: dict = {}
+                n_allocated = 0
+                total_cost = 0.0
+                for line in f:
+                    cells = line.strip().split(",")
+                    if cost_col is None or len(cells) <= cost_col:
+                        continue
+                    try:
+                        c = float(cells[cost_col])
+                    except ValueError:
+                        continue
+                    if c <= 0:
+                        continue
+                    n_allocated += 1
+                    total_cost += c
+                    if pkg_col is not None and len(cells) > pkg_col:
+                        pkg = cells[pkg_col].strip().lower()
+                        if pkg and pkg != "baseline_act":
+                            pkg_counts[pkg] = pkg_counts.get(pkg, 0) + 1
+                    if zone_col is not None and len(cells) > zone_col:
+                        z = cells[zone_col].strip()
+                        if z:
+                            zone_costs[z] = zone_costs.get(z, 0.0) + c
+                if n_allocated > 0:
+                    auth["n_allocated_lgas"] = n_allocated
+                if pkg_counts:
+                    auth["package_counts"] = pkg_counts
+                if zone_costs and total_cost > 0:
+                    auth["zone_budget_shares"] = {
+                        z: c / total_cost for z, c in zone_costs.items()}
         except OSError:
             pass
 
@@ -210,6 +394,275 @@ def _scan_doc_cases_averted(doc_text: str) -> list[tuple[float, str, str]]:
     return out
 
 
+def _normalize_package_token(tok: str) -> str:
+    """Map regex-matched package keyword to the canonical CSV
+    `package` column value. The CSV uses underscored snake_case
+    (e.g., 'llin_dual_ai', 'llin_pbo'); the prose uses 'dual-AI',
+    'PBO', 'standard LLIN'. This normalizer aligns them."""
+    t = tok.lower().replace("-", "_").replace(" ", "_")
+    # Common aliases
+    aliases = {
+        "dual_ai": "llin_dual_ai",
+        "dualai": "llin_dual_ai",
+        "pbo": "llin_pbo",
+        "standard_llin": "llin_standard",
+        "smc": "smc",
+        "irs": "irs",
+    }
+    return aliases.get(t, t)
+
+
+def _scan_lga_counts(doc_text: str) -> list[tuple[int, str]]:
+    """Find labeled LGA counts that refer to the TOTAL allocated
+    set (not per-subset counts). Requires either:
+      - "X of N LGAs" form (unambiguous total), OR
+      - left-window anchor (all / total of / across), OR
+      - right-window anchor (allocated / received / receive / in total)
+    Returns (count, context) tuples."""
+    out = []
+    seen_positions: set[int] = set()
+    # Try "X of N LGAs" first (highest-confidence total form). Skip
+    # if a zone qualifier appears in the left/right window or if the
+    # second number is the universe size (774 for Nigeria) — "X of
+    # 774 LGAs" is the unallocated-or-decision-rule-accuracy form,
+    # NOT the X-allocated-of-Y-total form.
+    for m in _LGA_COUNT_OF_N_RE.finditer(doc_text):
+        try:
+            n = int(m.group(1))
+        except ValueError:
+            continue
+        if n < 10 or n > 5000:
+            continue
+        # Inspect the matched text for "of 774" — skip if so.
+        matched = m.group(0).lower()
+        if " of 774" in matched or "of 774 " in matched:
+            continue
+        left_window = doc_text[max(0, m.start() - 30):m.start()]
+        right_window = doc_text[m.end():
+                                 min(len(doc_text), m.end() + 30)]
+        if _has_zone_qualifier(left_window + " " + right_window):
+            continue
+        seen_positions.add(m.start())
+        ctx_start = max(0, m.start() - 60)
+        ctx_end = min(len(doc_text), m.end() + 60)
+        out.append((n, doc_text[ctx_start:ctx_end]))
+    # Then sweep for bare "X LGAs" with anchor in left or right window.
+    for m in _LGA_COUNT_RE.finditer(doc_text):
+        if m.start() in seen_positions:
+            continue
+        try:
+            n = int(m.group(1))
+        except ValueError:
+            continue
+        if n < 10 or n > 5000:
+            continue
+        left_window = doc_text[max(0, m.start() - 30):m.start()]
+        right_window = doc_text[m.end():
+                                 min(len(doc_text), m.end() + 30)]
+        # Skip per-zone subsets.
+        if _has_zone_qualifier(left_window + " " + right_window):
+            continue
+        lw = left_window.lower()
+        rw = right_window.lower()
+        has_left_anchor = any(tok in lw
+                              for tok in _LGA_TOTAL_LEFT_TOKENS)
+        has_right_anchor = any(rw.startswith(tok)
+                               for tok in _LGA_TOTAL_RIGHT_TOKENS)
+        if not (has_left_anchor or has_right_anchor):
+            continue
+        ctx_start = max(0, m.start() - 60)
+        ctx_end = min(len(doc_text), m.end() + 60)
+        out.append((n, doc_text[ctx_start:ctx_end]))
+    return out
+
+
+def _scan_package_counts(doc_text: str) -> list[tuple[int, str, str]]:
+    """Find labeled package counts. Skips per-zone subsets (any
+    match with a zone qualifier in the 30-char window). Returns
+    (count, package_token, context) tuples."""
+    out = []
+    for m in _PACKAGE_COUNT_RE.finditer(doc_text):
+        try:
+            n = int(m.group(1))
+        except ValueError:
+            continue
+        if n < 1 or n > 5000:
+            continue
+        # Skip markdown table rows — table cells almost always have
+        # per-zone/per-archetype row headers that the narrow window
+        # can't see.
+        if _is_table_row(doc_text, m.start()):
+            continue
+        left_window = doc_text[max(0, m.start() - 30):m.start()]
+        right_window = doc_text[m.end():
+                                 min(len(doc_text), m.end() + 30)]
+        # Skip per-zone subsets.
+        if _has_zone_qualifier(left_window + " " + right_window):
+            continue
+        pkg_raw = m.group(2)
+        pkg_norm = _normalize_package_token(pkg_raw)
+        ctx_start = max(0, m.start() - 60)
+        ctx_end = min(len(doc_text), m.end() + 60)
+        out.append((n, pkg_norm, doc_text[ctx_start:ctx_end]))
+    return out
+
+
+def _scan_budget_shares(doc_text: str) -> list[tuple[float, int, str, str, str]]:
+    """Find labeled budget shares ("78.1% of budget"). Returns
+    (fraction, left_window, right_window, context) tuples.
+    Fraction in [0, 1]. The left_window (40 chars BEFORE) and
+    right_window (40 chars AFTER) are what callers use to identify
+    which zone — the zone may appear before ("NW: 78% of budget")
+    OR after ("78% of budget to NW")."""
+    out = []
+    for m in _BUDGET_SHARE_RE.finditer(doc_text):
+        try:
+            pct = float(m.group(1))
+        except ValueError:
+            continue
+        if pct < 0 or pct > 100:
+            continue
+        left_start = max(0, m.start() - 40)
+        right_end = min(len(doc_text), m.end() + 40)
+        ctx_start = max(0, m.start() - 60)
+        ctx_end = min(len(doc_text), m.end() + 60)
+        left_window = doc_text[left_start:m.start()]
+        right_window = doc_text[m.end():right_end]
+        out.append((pct / 100.0, m.start(), left_window, right_window,
+                    doc_text[ctx_start:ctx_end]))
+    return out
+
+
+def _check_count_drift(run_dir: str, auth: dict,
+                        report_files: list[str]) -> list[dict]:
+    """Phase 13 β: cross-doc drift on LGA counts, package counts,
+    and budget shares. Truth is models/allocation_result.csv (loaded
+    into auth by _load_authoritative). Each scanned file's count
+    must agree to within 5% MEDIUM / 25% HIGH."""
+    out: list[dict] = []
+    auth_n_lga = auth.get("n_allocated_lgas")
+    auth_pkgs = auth.get("package_counts") or {}
+    auth_zones = auth.get("zone_budget_shares") or {}
+    if auth_n_lga is None and not auth_pkgs and not auth_zones:
+        return []
+
+    for fname in report_files:
+        fpath = os.path.join(run_dir, fname)
+        if not os.path.exists(fpath):
+            continue
+        try:
+            with open(fpath, encoding="utf-8") as f:
+                text = f.read()
+        except (UnicodeDecodeError, OSError):
+            continue
+
+        # LGA counts
+        if auth_n_lga is not None:
+            for n, ctx in _scan_lga_counts(text):
+                # Skip "774 LGAs" (the universe — not the allocated
+                # subset). Accept anything else as a candidate.
+                if n in (774,):  # known total-Nigeria LGA count
+                    continue
+                drift = _drift_pct(n, auth_n_lga)
+                sev = _severity_for_drift(drift)
+                if sev is not None:
+                    kind = ("numeric_drift_extreme" if sev == "HIGH"
+                            else "numeric_drift_detected")
+                    out.append(_build_violation(
+                        kind, sev,
+                        f"{fname} reports {n} LGAs but "
+                        f"models/allocation_result.csv shows "
+                        f"{auth_n_lga} allocated "
+                        f"({drift*100:.1f}% drift). Context: "
+                        f"\"...{ctx.strip()[:120]}...\"."
+                    ))
+
+        # Package counts
+        for n, pkg_norm, ctx in _scan_package_counts(text):
+            auth_count = auth_pkgs.get(pkg_norm)
+            if auth_count is None or auth_count == 0:
+                continue
+            drift = _drift_pct(n, auth_count)
+            sev = _severity_for_drift(drift)
+            if sev is not None:
+                kind = ("numeric_drift_extreme" if sev == "HIGH"
+                        else "numeric_drift_detected")
+                out.append(_build_violation(
+                    kind, sev,
+                    f"{fname} reports {n} {pkg_norm} LGAs but "
+                    f"models/allocation_result.csv shows "
+                    f"{auth_count} ({drift*100:.1f}% drift). "
+                    f"Context: \"...{ctx.strip()[:120]}...\"."
+                ))
+
+        # Budget shares (zone-wise). The text doesn't always tag
+        # which zone — we look for the zone keyword only in the
+        # 40-char LEFT window to avoid pulling in zones from
+        # adjacent clauses (e.g., "NW: 78%; NC: 22%" must NOT
+        # match NC's 22% to NW's authoritative share). We also
+        # skip prediction/range anchors ("predicts", "<", "25-35%").
+        if auth_zones:
+            zone_alt_map = {z.lower(): z for z in auth_zones}
+            for z_key in list(zone_alt_map):
+                # Add abbreviated form (NW, NC, ...) for full-name zones.
+                zone_alt_map.setdefault(
+                    z_key.replace(" ", "")
+                          .replace("north", "n")
+                          .replace("south", "s")
+                          .replace("east", "e")
+                          .replace("west", "w"),
+                    zone_alt_map[z_key])
+            for (share, pos, left_window, right_window,
+                 ctx) in _scan_budget_shares(text):
+                # Skip table rows — the row header carries zone
+                # context the window can't see.
+                if _is_table_row(text, pos):
+                    continue
+                # Skip if this is a prediction range or hypothesis.
+                lw_lower = left_window.lower()
+                non_headline = ("prediction", "predicted",
+                                "expected", "should receive",
+                                "may receive", "could receive",
+                                "<", "approximately ", "hypothesis",
+                                "h1 ", "h2 ", "h3 ", "h4 ", "h5 ",
+                                "h6 ", "h7 ",
+                                "(h1)", "(h2)", "(h3)", "(h4)",
+                                "(h5)", "(h6)", "(h7)",
+                                "(25-", "(20-", "(30-")
+                if any(tok in lw_lower for tok in non_headline):
+                    continue
+                # Prefer the zone keyword in the LEFT window
+                # (closest to the percent). Only fall back to the
+                # RIGHT window when the left has none — handles
+                # both "NW receives 78%" and "78% to NW" but
+                # avoids "NW: 75%; NC: 24%" attribution drift.
+                matched_zone, _ = _extract_zone_from_window(
+                    left_window, zone_alt_map, from_right=False)
+                if matched_zone is None:
+                    matched_zone, _ = _extract_zone_from_window(
+                        right_window, zone_alt_map,
+                        from_right=True,
+                        require_no_sentence_break=True)
+                if matched_zone is None:
+                    continue
+                auth_share = auth_zones[matched_zone]
+                drift = _drift_pct(share, auth_share)
+                sev = _severity_for_drift(drift)
+                if sev is not None:
+                    kind = ("numeric_drift_extreme" if sev == "HIGH"
+                            else "numeric_drift_detected")
+                    out.append(_build_violation(
+                        kind, sev,
+                        f"{fname} reports {share*100:.1f}% of budget "
+                        f"for {matched_zone} but "
+                        f"models/allocation_result.csv shows "
+                        f"{auth_share*100:.1f}% "
+                        f"({drift*100:.1f}% drift). Context: "
+                        f"\"...{ctx.strip()[:120]}...\"."
+                    ))
+    return out
+
+
 def _build_violation(kind: str, severity: str, claim: str,
                      stage: str = "WRITE") -> dict:
     return {
@@ -233,15 +686,17 @@ def check_numeric_consistency(run_dir: str) -> list[dict]:
     violations: list[dict] = []
     auth = _load_authoritative(run_dir)
 
-    # Files scanned for cross-doc cases-averted drift. results.md and
-    # figure_rationale.md are the headline-number locations; the cost-
-    # per-case same-doc check is hardcoded to results.md below since
-    # decision_rule.md and scope_declaration.yaml don't typically
-    # contain $X/case mentions. Expanding either set is a Phase 13
-    # candidate if drift surfaces in those files.
+    # Files scanned for cross-doc cases-averted drift. results.md,
+    # figure_rationale.md, and (Phase 13 β) decision_rule.md are the
+    # headline-number locations. The cost-per-case same-doc check is
+    # still hardcoded to results.md below; decision_rule.md typically
+    # doesn't contain $X/case mentions but does carry LGA counts,
+    # package counts, and budget shares — those are checked separately
+    # via _check_count_drift below.
     report_files = [
         "results.md",
         "figure_rationale.md",
+        "decision_rule.md",
     ]
 
     # --- Same-doc inconsistency: PBO-in-NW cost-per-case ---
@@ -366,6 +821,13 @@ def check_numeric_consistency(run_dir: str) -> list[dict]:
                         f"optimization output."
                     ))
 
+    # --- Phase 13 β: extended count drift across decision_rule.md,
+    # results.md, figure_rationale.md ---
+    # LGA counts ("121 LGAs allocated"), package counts ("104 dual-AI"),
+    # budget shares ("78.1% of budget"). Each is cross-referenced
+    # against models/allocation_result.csv truth.
+    violations.extend(_check_count_drift(run_dir, auth, report_files))
+
     # --- Round-number drift: results.md title vs progress.md ---
     if auth["final_round"] is not None and os.path.exists(results_path):
         try:
@@ -413,7 +875,9 @@ def _run_self_test() -> int:
                      pkg_eval_rows: list[dict] | None = None,
                      progress_text: str | None = None,
                      results_text: str | None = None,
-                     figure_rationale_text: str | None = None) -> None:
+                     figure_rationale_text: str | None = None,
+                     decision_rule_text: str | None = None,
+                     allocation_rows: list[dict] | None = None) -> None:
         os.makedirs(os.path.join(d, "models"), exist_ok=True)
         if opt_summary is not None:
             with open(os.path.join(d, "models", "optimization_summary.json"),
@@ -436,6 +900,16 @@ def _run_self_test() -> int:
         if figure_rationale_text is not None:
             with open(os.path.join(d, "figure_rationale.md"), "w") as f:
                 f.write(figure_rationale_text)
+        if decision_rule_text is not None:
+            with open(os.path.join(d, "decision_rule.md"), "w") as f:
+                f.write(decision_rule_text)
+        if allocation_rows is not None:
+            cols = ["lga_name", "zone", "package", "total_cost_usd"]
+            with open(os.path.join(d, "models", "allocation_result.csv"),
+                      "w") as f:
+                f.write(",".join(cols) + "\n")
+                for row in allocation_rows:
+                    f.write(",".join(str(row.get(c, "")) for c in cols) + "\n")
 
     # T1: clean run, all numbers consistent → silent
     with tempfile.TemporaryDirectory() as d:
@@ -573,6 +1047,126 @@ def _run_self_test() -> int:
     with tempfile.TemporaryDirectory() as d:
         v = check_numeric_consistency(d)
         ok(not v, f"T8: empty run dir should be silent, got {v}")
+
+    # Phase 13 β: T9-T12 cover the extended count-drift checks.
+
+    # T9: LGA count drift in decision_rule.md (110 vs CSV 130 ≈ 15%).
+    # The 1.6% drift in 190855 (121 vs 123) was below MEDIUM_DRIFT_
+    # THRESHOLD; the gate intentionally tolerates sub-5% drift. Test
+    # uses a realistic ≥10% drift above threshold. The text uses the
+    # canonical aggregate phrasing "110 LGAs allocated" — which
+    # triggers the right-anchor "allocated" and has no zone qualifier
+    # (the bare 110 LGAs without "in NW" / table-cell context).
+    with tempfile.TemporaryDirectory() as d:
+        rows = []
+        for i in range(65):
+            rows.append({"lga_name": f"lga_{i}", "zone": "NW",
+                         "package": "llin_dual_ai",
+                         "total_cost_usd": 2_000_000})
+        for i in range(65):
+            rows.append({"lga_name": f"lga_n_{i}", "zone": "NC",
+                         "package": "llin_dual_ai",
+                         "total_cost_usd": 2_000_000})
+        make_run_dir(d,
+            allocation_rows=rows,
+            progress_text="STAGE 7 decision (round 6/8)\n",
+            decision_rule_text=(
+                "# Decision Rule\n"
+                "## Allocation Summary\n"
+                "Total of 110 LGAs allocated.\n"
+            ))
+        v = check_numeric_consistency(d)
+        ok(any(x["kind"] == "numeric_drift_detected"
+               and "110" in x["claim"] and "130" in x["claim"]
+               for x in v),
+           f"T9: 110 vs 130 LGA-count drift should fire MEDIUM, got {v}")
+
+    # T10: package count drift in figure_rationale.md
+    # (figure says 80 dual-AI, CSV has 106 ≈ 24.5%).
+    with tempfile.TemporaryDirectory() as d:
+        rows = []
+        for i in range(106):
+            rows.append({"lga_name": f"lga_{i}", "zone": "NW",
+                         "package": "llin_dual_ai",
+                         "total_cost_usd": 2_000_000})
+        make_run_dir(d,
+            allocation_rows=rows,
+            progress_text="STAGE 7 decision (round 6/8)\n",
+            figure_rationale_text=(
+                "## allocation breakdown\n"
+                "80 dual-AI, 17 PBO LGAs.\n"
+            ))
+        v = check_numeric_consistency(d)
+        ok(any(x["kind"] == "numeric_drift_detected"
+               and "dual" in x["claim"].lower()
+               and "80" in x["claim"] and "106" in x["claim"]
+               for x in v),
+           f"T10: 80 vs 106 dual-AI package-count drift should fire "
+           f"MEDIUM, got {v}")
+
+    # T11: budget share drift across files (decision_rule says 70% NW
+    # but CSV has 78%). Should fire numeric_drift_detected.
+    with tempfile.TemporaryDirectory() as d:
+        rows = []
+        for i in range(78):
+            rows.append({"lga_name": f"lga_{i}", "zone": "NW",
+                         "package": "llin_dual_ai",
+                         "total_cost_usd": 1_000_000})
+        for i in range(22):
+            rows.append({"lga_name": f"lga_n_{i}", "zone": "NC",
+                         "package": "llin_dual_ai",
+                         "total_cost_usd": 1_000_000})
+        # NW budget share: 78M / 100M = 78%
+        make_run_dir(d,
+            allocation_rows=rows,
+            progress_text="STAGE 7 decision (round 6/8)\n",
+            decision_rule_text=(
+                "# Decision Rule\n"
+                "## NW Zone Allocation\n"
+                "70% of budget goes to NW.\n"
+            ))
+        v = check_numeric_consistency(d)
+        ok(any(x["kind"] == "numeric_drift_detected"
+               and "70" in x["claim"] and "78" in x["claim"]
+               for x in v),
+           f"T11: 70% vs 78% budget-share drift should fire MEDIUM, "
+           f"got {v}")
+
+    # T12: clean — all sources match CSV → no count-drift violations.
+    with tempfile.TemporaryDirectory() as d:
+        rows = []
+        for i in range(123):
+            rows.append({"lga_name": f"lga_{i}",
+                         "zone": "NW" if i < 93 else "NC",
+                         "package": ("llin_dual_ai" if i < 106
+                                     else "llin_pbo"),
+                         "total_cost_usd": 1_000_000})
+        # CSV: 123 LGAs, 106 dual-AI, 17 PBO, NW 93/123 by count =
+        # cost share NW 93M/123M = 75.6%; NC 30/123 = 24.4%
+        make_run_dir(d,
+            opt_summary={"total_cases_averted": 54_700_000,
+                         "uniform_cases_averted": 21_200_000},
+            allocation_rows=rows,
+            progress_text="STAGE 7 decision (round 6/8)\n",
+            decision_rule_text=(
+                "# Decision Rule\n"
+                "## Allocation\n"
+                "123 LGAs receive intervention. NW Zone Allocation: "
+                "75.6% of budget; NC: 24.4% of budget.\n"
+                "Mix: 106 dual-AI, 17 PBO.\n"
+            ))
+        v = check_numeric_consistency(d)
+        # No count-drift violations expected. Other classes (cost,
+        # round, etc.) may still fire — we only assert on count_drift.
+        count_v = [x for x in v
+                   if x["kind"].startswith("numeric_drift")
+                   and ("LGA" in x["claim"]
+                        or "% of budget" in x["claim"]
+                        or "dual" in x["claim"].lower()
+                        or "pbo" in x["claim"].lower())]
+        ok(not count_v,
+           f"T12: clean run should produce no count-drift violations, "
+           f"got {count_v}")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)

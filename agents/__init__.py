@@ -197,7 +197,11 @@ def build_agents() -> dict[str, AgentDefinition]:
                     "sensitivity-analysis-remediation",
                     # Phase 12 Commit γ: required when calibration_units /
                     # allocation_units < 0.1 (e.g., 6 zones → 774 LGAs).
-                    "ecological-fallacy-quantification"],
+                    "ecological-fallacy-quantification",
+                    # Phase 13 Commit α: disease-agnostic structural sanity
+                    # manifest (models/sanity_schema.yaml) — eight checks
+                    # via scripts/sanity_checks.py. Required at round ≥ 3.
+                    "sanity-schema"],
         ),
         "model-tester": AgentDefinition(
             description=modeler.MODEL_TESTER_DESCRIPTION,
