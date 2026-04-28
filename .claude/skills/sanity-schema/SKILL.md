@@ -239,9 +239,15 @@ Net: one MEDIUM, surfaced exactly the issue the deep-dive review identified.
   facts (≤95%, ≤unit cap) or modeler-declared windows.
 - It does not validate the units of your declared values. You
   declare DALYs vs cases vs deaths; the script trusts the labels.
-- It does not block ACCEPT. Every check emits MEDIUM. Persistent
-  MEDIUMs may escalate via Phase 12 β, but a single failed check at
-  one round is just an advisory.
+- **It does not block ACCEPT and never escalates to HIGH.** Every
+  check emits MEDIUM. Unlike the validator-kind escalations Phase 12 β
+  applies to (e.g., `figure_validator_missing` after 4 rounds),
+  `sanity_check_failed_*` kinds are intentionally NOT in
+  `_VALIDATOR_KIND_ESCALATION_THRESHOLDS`. The advisory is permanent
+  by design — repeated failure across rounds remains visible in the
+  STAGE 7 stderr but does not gate the run. The expectation is that
+  the modeler either fixes the underlying numbers or acknowledges
+  the failure via `scope_declaration.yaml`.
 
 ## Drafting timeline
 

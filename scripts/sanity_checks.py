@@ -523,8 +523,15 @@ def _text_contains_value(text: str, target: float,
     return False
 
 
+_OUTLIER_SUPPORTED_RULES = {"max_over_median"}
+
+
 def _check_outlier_sniff(schema: dict, run_dir: str) -> list[dict]:
-    """max(metric)/median(metric) ≤ threshold for an allocation column."""
+    """max(metric)/median(metric) ≤ threshold for an allocation column.
+
+    The median is the upper-median for even-length lists
+    (`ratios[len // 2]`) — adequate for a robustness sniff and
+    avoids floating-point rounding artifacts."""
     sec = schema.get("outlier_sniff")
     if not isinstance(sec, dict):
         return []
@@ -533,6 +540,12 @@ def _check_outlier_sniff(schema: dict, run_dir: str) -> list[dict]:
     denom_col = sec.get("denominator_col")
     threshold = sec.get("threshold", 10.0)
     metric_name = sec.get("metric", "metric")
+    rule = sec.get("rule", "max_over_median")
+    if rule not in _OUTLIER_SUPPORTED_RULES:
+        return [{"id": "outlier_sniff", "passed": False,
+                 "claim": (f"outlier_sniff.rule {rule!r} is not "
+                           f"supported. Supported rules: "
+                           f"{sorted(_OUTLIER_SUPPORTED_RULES)}.")}]
     if not csv_rel or not num_col:
         return []
     csv_path = os.path.join(run_dir, csv_rel)
@@ -850,6 +863,38 @@ def _run_self_test() -> int:
                for c in r["checks"]),
            f"W-formula-disallowed: function call should be rejected, "
            f"got {r}")
+
+    # W-formula-power: ** operator is allowed and computes correctly.
+    with tempfile.TemporaryDirectory() as d:
+        p = write_schema(d,
+            "derived_consistency:\n"
+            "  - primary: x\n"
+            "    primary_value: 10\n"
+            "    derived: y\n"
+            "    derived_actual: 100\n"
+            "    formula: \"primary ** 2\"\n"
+            "    tol: 0.05\n")
+        r = validate_sanity_schema(p, run_dir=d)
+        ok(r["verdict"] == "PASS",
+           f"W-formula-power: 10**2 == 100 should PASS, got {r}")
+
+    # W-outlier-bad-rule: unsupported rule should fail with a
+    # clear message rather than silently using max_over_median.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "models", "alloc.csv"), "w") as f:
+            f.write("name,value\n1,1.0\n2,2.0\n")
+        p = write_schema(d,
+            "outlier_sniff:\n"
+            "  rule: max_over_p95\n"
+            "  threshold: 10.0\n"
+            "  csv_path: models/alloc.csv\n"
+            "  numerator_col: value\n")
+        r = validate_sanity_schema(p, run_dir=d)
+        ok(any(c["id"] == "outlier_sniff" and not c["passed"]
+               and "max_over_p95" in c["claim"]
+               for c in r["checks"]),
+           f"W-outlier-bad-rule: unsupported rule should fail, got {r}")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)

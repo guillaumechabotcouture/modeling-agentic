@@ -71,7 +71,7 @@ _LGA_COUNT_OF_N_RE = re.compile(
     r"(\d{1,4})\s+of\s+\d{1,4}\s+LGAs?\b",
     re.IGNORECASE,
 )
-_LGA_TOTAL_LEFT_TOKENS = ("of n ", " all ", "total of ", "allocate to ",
+_LGA_TOTAL_LEFT_TOKENS = (" all ", "total of ", "allocate to ",
                           "allocated to ", "across ")
 _LGA_TOTAL_RIGHT_TOKENS = (" allocated", " received", " receive",
                            " in total", " total")
