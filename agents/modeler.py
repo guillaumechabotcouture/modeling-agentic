@@ -505,6 +505,7 @@ entire point of having multiple critique rounds.
 
 | Artifact | First draft | Finalize | What "draft" means |
 |---|---|---|---|
+| `models/identifiability_a_priori.yaml` | **r1 (PRE-MODEL)** | r2 | **PRE-MODEL** (Phase 15 α). Count free fitted parameters vs independent calibration targets. Verdict IDENTIFIABLE if ratio < 1, MARGINAL if 1-3, OVER_SATURATED if > 3. **NOT scope-declarable at OVER_SATURATED — architecture must be fixed.** Required BEFORE the first MODEL stage spawn. See the `pre-model-identifiability-arithmetic` skill. |
 | `models/outcome_fn.py` | r1-2 | r3 | Calibration callable returning a single deterministic outcome dict; can be coarse. |
 | `models/model_comparison.yaml` | r1-2 | r3 | At least null + simple + full candidate; AIC/BIC can be approximate. |
 | `models/identifiability.yaml` | r1-2 | r3 | Manifest with point estimates + bounds; loss function pointwise (see §3 contract). |

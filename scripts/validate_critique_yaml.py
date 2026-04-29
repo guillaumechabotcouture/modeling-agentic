@@ -1148,6 +1148,18 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None) -> list[dic
     # outlier sniff. Schema is required at round ≥ 3.
     violations.extend(_check_sanity_schema(run_dir, round_n=round_n))
 
+    # Phase 15 Commit α: a-priori identifiability arithmetic.
+    # The 224202 run shipped ACCEPT with 3/3 fitted parameters
+    # post-hoc-flagged unidentified — but should have been caught at
+    # strategy time by 30 seconds of arithmetic (40 fitted params /
+    # 6 independent targets = 6.67× over-saturated). This check
+    # enforces a pre-model artifact requiring the modeler to count
+    # parameters vs targets BEFORE building. Verdict OVER_SATURATED
+    # without resolution is HIGH and explicitly NOT scope-declarable
+    # — the architecture must be fixed at strategy time.
+    violations.extend(_check_identifiability_a_priori(run_dir,
+                                                       round_n=round_n))
+
     # Phase 12 Commit β: round-aware escalation of persisting MEDIUMs.
     # Catches the failure mode the 104914 run shipped: 18 figure_
     # validator_missing MEDIUMs persisted r2→r6, presentation P-005..
@@ -2379,6 +2391,219 @@ def _load_sanity_check_acknowledged(run_dir: str) -> set[str]:
             elif isinstance(ack, str):
                 out.add(ack)
     return out
+
+
+# Phase 15 Commit α: a-priori identifiability arithmetic.
+#
+# The 224202 run shipped a HYBRID model with 40 fitted parameters
+# fitting 6 zone-level PfPR targets — over-saturated by 6.7×, yet
+# the issue was only caught post-hoc at STAGE 5b RIGOR (round 3+).
+# By that point the architecture was sunk cost; the modeler scope-
+# declared 3 unidentified parameters and proceeded with a decorative
+# ABM (predictions equivalent to PfPR × literature_OR).
+#
+# Phase 15 α requires a PRE-MODEL artifact with parameters/targets
+# arithmetic, before the FIRST model build. Verdict OVER_SATURATED
+# without a resolution decision blocks ACCEPT (HIGH). Critically,
+# this kind is NOT scope-declarable — the modeler must fix the
+# architecture, add data, or downgrade to the analytical model.
+_IDENTIFIABILITY_A_PRIORI_REQUIRED_FROM_ROUND = 2
+
+
+def _check_identifiability_a_priori(run_dir: str,
+                                     round_n: int | None = None
+                                     ) -> list[dict]:
+    """Phase 15 α: validate models/identifiability_a_priori.yaml.
+
+    Emits:
+      identifiability_a_priori_missing  MEDIUM @ r=2, HIGH @ r≥3
+      identifiability_a_priori_invalid  HIGH (yaml MALFORMED)
+      pre_model_over_saturated          HIGH (verdict OVER_SATURATED
+                                              without resolution)
+      pre_model_marginal_identifiability MEDIUM (verdict MARGINAL)
+      pre_model_decorative_undocumented HIGH (resolution=accept_decorative
+                                               without details)
+
+    The pre_model_* kinds are NOT scope-declarable via
+    sanity_check_acknowledged or scope_declaration.yaml. Architecture
+    choice is inside pipeline reach; the modeler must redesign,
+    not declare scope.
+    """
+    if round_n is not None and round_n < 1:
+        return []  # Round 1 is the drafting window; silent.
+
+    yaml_path = os.path.join(run_dir, "models",
+                             "identifiability_a_priori.yaml")
+
+    if not os.path.exists(yaml_path):
+        if round_n is None:
+            return []  # Round unknown; defer to caller.
+        if round_n < _IDENTIFIABILITY_A_PRIORI_REQUIRED_FROM_ROUND:
+            return []  # Drafting window; silent.
+        # At r≥2 the artifact is required. Severity escalates to HIGH
+        # at r≥3 to align with Phase 12 β's persistence ledger.
+        severity = "HIGH" if round_n >= 3 else "MEDIUM"
+        return [{
+            "kind": "identifiability_a_priori_missing",
+            "severity": severity,
+            "stage": "PRE_MODEL",
+            "claim": (
+                f"Required artifact `models/identifiability_a_priori.yaml` "
+                f"is absent at round {round_n} (≥ "
+                f"{_IDENTIFIABILITY_A_PRIORI_REQUIRED_FROM_ROUND}). "
+                f"Before committing to a model architecture, count "
+                f"free fitted parameters vs independent calibration "
+                f"targets. Verdict IDENTIFIABLE if ratio < 1, MARGINAL "
+                f"if 1-3, OVER_SATURATED if > 3. See the `pre-model-"
+                f"identifiability-arithmetic` skill and "
+                f"`scripts/identifiability_a_priori.py --self-test` "
+                f"for the schema. This artifact is NOT scope-"
+                f"declarable — architecture choice is inside pipeline "
+                f"reach."
+            ),
+        }]
+
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "identifiability_a_priori",
+            os.path.join(os.path.dirname(__file__),
+                         "identifiability_a_priori.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    except Exception as e:
+        return [{
+            "kind": "identifiability_a_priori_invalid",
+            "severity": "HIGH",
+            "stage": "PRE_MODEL",
+            "claim": (f"Could not load "
+                      f"scripts/identifiability_a_priori.py: {e}"),
+        }]
+
+    result = mod.validate_identifiability_a_priori(yaml_path)
+    if result["verdict"] == "MALFORMED":
+        errors = result.get("errors") or []
+        # Distinguish the decorative-undocumented sub-case: the
+        # validator's error message for accept_decorative-without-
+        # details starts with "resolution.decision is 'accept_decorative'".
+        # The over-saturated-without-any-resolution error is generic
+        # ("verdict X requires a resolution field..."). Match the
+        # specific decorative-sub-case prefix only.
+        if any(
+            e.lstrip().startswith(
+                "resolution.decision is 'accept_decorative'")
+            for e in errors
+        ):
+            return [{
+                "kind": "pre_model_decorative_undocumented",
+                "severity": "HIGH",
+                "stage": "PRE_MODEL",
+                "claim": (f"identifiability_a_priori.yaml declares "
+                          f"resolution.decision='accept_decorative' "
+                          f"without resolution.details text. Decorative "
+                          f"architectures must be justified (100-300 "
+                          f"words). Errors: {'; '.join(errors)}"),
+            }]
+        # Generic missing-resolution case: the YAML's verdict is
+        # OVER_SATURATED but no resolution decision was provided.
+        # Fire as pre_model_over_saturated to match the user-facing
+        # contract (the issue is over-saturation, not malformed YAML).
+        if (result.get("computed_verdict") == "OVER_SATURATED"
+                and any("requires a `resolution`" in e for e in errors)):
+            s = result.get("summary", {})
+            return [{
+                "kind": "pre_model_over_saturated",
+                "severity": "HIGH",
+                "stage": "PRE_MODEL",
+                "claim": (
+                    f"Pre-model identifiability arithmetic flags "
+                    f"OVER_SATURATED: {s.get('n_fitted', 0)} fitted "
+                    f"parameters / {s.get('n_targets', 0)} independent "
+                    f"calibration targets = "
+                    f"{s.get('ratio', 0):.2f}× ratio (threshold > 3.0). "
+                    f"resolution.decision is required. Pick one: "
+                    f"(a) reduce params (tie across groups), "
+                    f"(b) add independent calibration targets, "
+                    f"(c) downgrade to analytical model, or "
+                    f"(d) accept_decorative with 100-300 word justification. "
+                    f"NOT scope-declarable."
+                ),
+            }]
+        return [{
+            "kind": "identifiability_a_priori_invalid",
+            "severity": "HIGH",
+            "stage": "PRE_MODEL",
+            "claim": (f"models/identifiability_a_priori.yaml is "
+                      f"malformed: {'; '.join(errors)}. NOT scope-"
+                      f"declarable — fix the artifact."),
+        }]
+
+    if result["verdict"] == "OVER_SATURATED":
+        s = result.get("summary", {})
+        # has_resolution=True means the modeler documented a resolution
+        # decision (tie_params, downgrade_to_analytical, accept_decorative
+        # with details, etc.). The artifact still reports the CURRENT
+        # over-saturated state but commits to a redesign — fire MEDIUM
+        # advisory rather than HIGH blocker. Once the redesign is
+        # implemented, the YAML should be updated to show the new
+        # parameter counts and verdict IDENTIFIABLE.
+        if s.get("has_resolution"):
+            return [{
+                "kind": "pre_model_over_saturated_with_commitment",
+                "severity": "MEDIUM",
+                "stage": "PRE_MODEL",
+                "claim": (
+                    f"Pre-model identifiability arithmetic flags "
+                    f"OVER_SATURATED: {s.get('n_fitted', 0)} fitted "
+                    f"/ {s.get('n_targets', 0)} targets = "
+                    f"{s.get('ratio', 0):.2f}×. Resolution committed "
+                    f"in artifact. Once redesign is implemented, "
+                    f"update identifiability_a_priori.yaml to show the "
+                    f"new fitted count and verdict IDENTIFIABLE."
+                ),
+            }]
+        return [{
+            "kind": "pre_model_over_saturated",
+            "severity": "HIGH",
+            "stage": "PRE_MODEL",
+            "claim": (
+                f"Pre-model identifiability arithmetic flags "
+                f"OVER_SATURATED: {s.get('n_fitted', 0)} fitted "
+                f"parameters / {s.get('n_targets', 0)} independent "
+                f"calibration targets = "
+                f"{s.get('ratio', 0):.2f}× ratio (threshold > 3.0). "
+                f"The proposed architecture is structurally "
+                f"unidentifiable. Pick one resolution: (a) reduce "
+                f"params (tie across groups), (b) add independent "
+                f"calibration targets, (c) downgrade to analytical "
+                f"model (no calibration), or (d) explicitly "
+                f"acknowledge a decorative architecture with 100-300 "
+                f"word justification of what the architecture "
+                f"contributes that the analytical model does not. "
+                f"This blocker is NOT scope-declarable — architecture "
+                f"choice is inside pipeline reach."
+            ),
+        }]
+
+    if result["verdict"] == "MARGINAL":
+        s = result.get("summary", {})
+        return [{
+            "kind": "pre_model_marginal_identifiability",
+            "severity": "MEDIUM",
+            "stage": "PRE_MODEL",
+            "claim": (
+                f"Pre-model identifiability arithmetic flags "
+                f"MARGINAL: {s.get('n_fitted', 0)} fitted / "
+                f"{s.get('n_targets', 0)} targets = "
+                f"{s.get('ratio', 0):.2f}× ratio (1.0-3.0 band). "
+                f"The model is at risk for ridge-trapped parameters. "
+                f"Post-hoc identifiability check at STAGE 5b will "
+                f"confirm or refute. Surface as a caveat in "
+                f"§Limitations."
+            ),
+        }]
+
+    return []  # IDENTIFIABLE — silent pass
 
 
 # Phase 12 Commit β: round-aware MEDIUM-to-HIGH escalation ledger.

@@ -104,6 +104,7 @@ skill changes are listed below; bug fixes are not.
 | 12    | α, β, γ, δ | Cross-file numeric consistency (`scripts/numeric_consistency.py`); round-aware MEDIUM-to-HIGH escalation; ecological-fallacy required artifact + skill; `report.md` snapshot/restore |
 | 13    | α, β   | Disease-agnostic sanity schema (`scripts/sanity_checks.py` + skill, 8 internal-only structural checks); α numeric_consistency extended to `decision_rule.md` and new token classes (LGA counts, package counts, budget shares) |
 | 14    | α, β   | Universe-completeness sanity check (cross-checks schema's `allocation.units_total` vs allocation CSV row count); exact-match opt-in for integer counts (`exact_counts: [lga_count, package_count]` schema field), `report.md` added to count-drift scan list, `allocation.canonical_csv` field for multi-scenario runs, column-name tolerance |
+| 15    | α      | A-priori identifiability arithmetic — first **PRE-MODEL** rigor gate. `models/identifiability_a_priori.yaml` (params/targets ratio, verdict IDENTIFIABLE/MARGINAL/OVER_SATURATED) required before MODEL stage spawns. OVER_SATURATED is **not scope-declarable** — architecture must be fixed at strategy time. Inverts Phase 12-14's scope-declare-anything semantics for one class. New `pre-model-identifiability-arithmetic` skill teaches the 30-second arithmetic |
 
 ## Conventions
 

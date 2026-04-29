@@ -154,7 +154,12 @@ def build_agents() -> dict[str, AgentDefinition]:
             skills=["semantic-scholar-lookup", "asta-literature-search",
                     "pdf-text-extraction", "investigation-threads",
                     "modeling-strategy", "malaria-modeling",
-                    "basic_epi_modeling", "vectors", "vaccination"],
+                    "basic_epi_modeling", "vectors", "vaccination",
+                    # Phase 15 α: planner produces calibration-targets
+                    # section of plan.md and must understand the
+                    # parameter-vs-target arithmetic. Required for the
+                    # round-1 identifiability_a_priori.yaml artifact.
+                    "pre-model-identifiability-arithmetic"],
         ),
         "data-agent": AgentDefinition(
             description=data.DESCRIPTION,
@@ -201,7 +206,13 @@ def build_agents() -> dict[str, AgentDefinition]:
                     # Phase 13 Commit α: disease-agnostic structural sanity
                     # manifest (models/sanity_schema.yaml) — eight checks
                     # via scripts/sanity_checks.py. Required at round ≥ 3.
-                    "sanity-schema"],
+                    "sanity-schema",
+                    # Phase 15 Commit α: pre-model identifiability
+                    # arithmetic (models/identifiability_a_priori.yaml).
+                    # Count free fitted params vs independent calibration
+                    # targets BEFORE building. Verdict OVER_SATURATED is
+                    # NOT scope-declarable — architecture must be fixed.
+                    "pre-model-identifiability-arithmetic"],
         ),
         "model-tester": AgentDefinition(
             description=modeler.MODEL_TESTER_DESCRIPTION,
