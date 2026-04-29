@@ -48,6 +48,34 @@ comparison. Signs of mismatch:
 
 ---
 
+## 1a. A-Priori Identifiability (BEFORE choosing architecture)
+
+Before committing to a model architecture, do this 30-second arithmetic:
+
+1. Count INDEPENDENT calibration targets (not synthetic disaggregations
+   — independent measurements only).
+2. Count FREE parameters in the proposed architecture (fitted, not
+   fixed-from-literature).
+3. Compute the ratio. If params >> targets, your model is structurally
+   unidentifiable. Pick one:
+   - Reduce params (tie across groups, partial pooling)
+   - Add data (more independent targets — different years, biomarkers)
+   - Document explicitly that calibration is decorative
+   - Reduce architecture complexity (fewer archetypes)
+
+See the `pre-model-identifiability-arithmetic` skill for the full
+contract and worked examples. Required artifact:
+`models/identifiability_a_priori.yaml`. Phase 15 α made this a
+pre-model gate; OVER_SATURATED is **not scope-declarable**.
+
+The 1935 run taught us "don't use pure ABM with mismatched intervention
+effects." The 224202 run taught us the next lesson: "don't use HYBRID
+ABM with unidentifiable calibration knobs — it gives the same problem
+in a different costume." Both are caught by counting parameters vs
+targets before committing.
+
+---
+
 ## 1b. Build vs Adapt: The Implementation Decision
 
 After deciding WHAT model to build, decide HOW to build it. Published

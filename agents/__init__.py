@@ -154,7 +154,12 @@ def build_agents() -> dict[str, AgentDefinition]:
             skills=["semantic-scholar-lookup", "asta-literature-search",
                     "pdf-text-extraction", "investigation-threads",
                     "modeling-strategy", "malaria-modeling",
-                    "basic_epi_modeling", "vectors", "vaccination"],
+                    "basic_epi_modeling", "vectors", "vaccination",
+                    # Phase 15 α: planner produces calibration-targets
+                    # section of plan.md and must understand the
+                    # parameter-vs-target arithmetic. Required for the
+                    # round-1 identifiability_a_priori.yaml artifact.
+                    "pre-model-identifiability-arithmetic"],
         ),
         "data-agent": AgentDefinition(
             description=data.DESCRIPTION,
@@ -201,7 +206,13 @@ def build_agents() -> dict[str, AgentDefinition]:
                     # Phase 13 Commit α: disease-agnostic structural sanity
                     # manifest (models/sanity_schema.yaml) — eight checks
                     # via scripts/sanity_checks.py. Required at round ≥ 3.
-                    "sanity-schema"],
+                    "sanity-schema",
+                    # Phase 15 Commit α: pre-model identifiability
+                    # arithmetic (models/identifiability_a_priori.yaml).
+                    # Count free fitted params vs independent calibration
+                    # targets BEFORE building. Verdict OVER_SATURATED is
+                    # NOT scope-declarable — architecture must be fixed.
+                    "pre-model-identifiability-arithmetic"],
         ),
         "model-tester": AgentDefinition(
             description=modeler.MODEL_TESTER_DESCRIPTION,
@@ -313,6 +324,44 @@ Read plan.md and data_quality.md yourself. Assess:
 - Is the proposed modeling approach feasible given the available data?
 - Are there critical data gaps that would prevent calibration or validation?
 - Is the proposed complexity appropriate for the stated purpose?
+
+**A-PRIORI IDENTIFIABILITY (Phase 15 α — REQUIRED before STAGE 4):**
+
+Before spawning the modeler, instruct the planner (or yourself in
+advisory capacity) to produce `{run_dir}/models/identifiability_a_priori.yaml`
+counting:
+- Independent calibration targets (do NOT count derived/synthetic
+  disaggregations — only independent measurements)
+- Free fitted parameters in the proposed architecture
+- Ratio: fitted / targets
+
+Read the artifact. Then run the validator:
+
+```bash
+python3 scripts/identifiability_a_priori.py {run_dir} --json
+```
+
+Decision rules:
+- If verdict is OVER_SATURATED:
+  - Re-spawn the planner with the explicit instruction "your proposed
+    architecture has K free parameters fitting N independent targets
+    (ratio R > 3). Pick one: (a) reduce parameters by tying across
+    groups, (b) add independent calibration targets, (c) downgrade to
+    analytical model, or (d) document why a decorative calibration is
+    acceptable in the resolution field."
+  - Do NOT spawn the modeler with an OVER_SATURATED verdict unless
+    the resolution field documents a path that brings the verdict
+    down to IDENTIFIABLE or MARGINAL.
+
+- If verdict is MARGINAL: proceed to MODEL stage but flag in the
+  round-1 STAGE 7 decision that the model is at-risk for ridge-trapped
+  parameters; the post-hoc identifiability check at STAGE 5b will
+  confirm or refute.
+
+- If verdict is IDENTIFIABLE: proceed to MODEL stage normally.
+
+This rule is NOT scope-declarable. Architecture choice is inside
+pipeline reach. See the `pre-model-identifiability-arithmetic` skill.
 
 If the approach needs adjustment, either:
 - Re-spawn data-agent for missing datasets, OR

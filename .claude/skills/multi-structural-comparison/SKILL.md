@@ -15,6 +15,17 @@ description: Contract for multi-structural model comparison. Modeler must
 
 # Multi-Structural Model Comparison
 
+## Pre-build complement (Phase 15 α)
+
+This skill catches degenerate-fit POST-HOC (training RMSE ≈ 0,
+LOO-CV-RMSE >> null). For the PRE-BUILD complement (avoid degenerate
+fit by counting params vs targets first), see
+`pre-model-identifiability-arithmetic`. The two skills are
+intentionally redundant — pre-build catches obvious cases (k > n/2
+saturation) in 30 seconds of arithmetic, post-build catches subtle
+ones (e.g., approximate identifiability collapse under correlated
+parameters).
+
 ## Why this stage exists
 
 The malaria run reported a 1.1 pp MAE on zone-level PfPR calibration —

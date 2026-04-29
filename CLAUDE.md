@@ -36,7 +36,7 @@ sub-agents and running mechanical rigor checks between rounds.
              ▼
 ┌────────────────────────────────────────────────────────────────┐
 │  SKILLS  .claude/skills/                                       │
-│  48 SKILL.md files covering domain knowledge (malaria,         │
+│  52 SKILL.md files covering domain knowledge (malaria,         │
 │  Starsim, LASER), rigor contracts (UQ, identifiability,        │
 │  sensitivity), and process (modeling-strategy, threads).       │
 │  Attached to agents in agents/__init__.py.                     │
@@ -64,7 +64,7 @@ sub-agents and running mechanical rigor checks between rounds.
 
 ## Skill-to-agent attachment matrix
 
-48 skills exist under `.claude/skills/`. Phase 10 commit φ resolved
+52 skills exist under `.claude/skills/`. Phase 10 commit φ resolved
 the long-standing 54%-orphan rate; the remaining orphans are
 domain-specific Starsim sub-skills not yet attached. Run
 `python3 scripts/validate_skill_attachments.py --show-orphans` to
@@ -73,7 +73,7 @@ see the live picture.
 | Agent (`agents/__init__.py`) | Skills attached (high level)                                          |
 |------------------------------|-----------------------------------------------------------------------|
 | **planner**                  | investigation-threads, malaria-modeling, vaccination, vectors, etc.   |
-| **modeler**                  | modeling-strategy, laser-spatial-disease-modeling, parameter-estimation, **all 9 rigor skills** (identifiability, multi-structural, UQ, allocation-CV, decision-rule, optimizer-method, DALY, mech-vs-hybrid, sensitivity-remediation) — Phase 10 ω |
+| **modeler**                  | modeling-strategy, laser-spatial-disease-modeling, parameter-estimation, **all 12 rigor skills** (identifiability, multi-structural, UQ, allocation-CV, decision-rule, optimizer-method, DALY, mech-vs-hybrid, sensitivity-remediation, ecological-fallacy-quantification, sanity-schema, pre-model-identifiability-arithmetic) — Phase 10 ω + Phase 12 γ + Phase 13 α + Phase 15 α |
 | **analyst**                  | malaria-modeling, model-validation, surveillance, basic_epi_modeling  |
 | **critique-domain**          | model-fitness, malaria-modeling, vectors, vaccination                 |
 | **critique-redteam**         | adversarial-redteam, critique-blockers-schema, effect-size-priors     |
@@ -104,6 +104,7 @@ skill changes are listed below; bug fixes are not.
 | 12    | α, β, γ, δ | Cross-file numeric consistency (`scripts/numeric_consistency.py`); round-aware MEDIUM-to-HIGH escalation; ecological-fallacy required artifact + skill; `report.md` snapshot/restore |
 | 13    | α, β   | Disease-agnostic sanity schema (`scripts/sanity_checks.py` + skill, 8 internal-only structural checks); α numeric_consistency extended to `decision_rule.md` and new token classes (LGA counts, package counts, budget shares) |
 | 14    | α, β   | Universe-completeness sanity check (cross-checks schema's `allocation.units_total` vs allocation CSV row count); exact-match opt-in for integer counts (`exact_counts: [lga_count, package_count]` schema field), `report.md` added to count-drift scan list, `allocation.canonical_csv` field for multi-scenario runs, column-name tolerance |
+| 15    | α, β, γ | A-priori identifiability arithmetic — first **PRE-MODEL** rigor gate. α: `models/identifiability_a_priori.yaml` (params/targets ratio, verdict IDENTIFIABLE/MARGINAL/OVER_SATURATED) required before MODEL stage spawns; OVER_SATURATED is **not scope-declarable** — architecture must be fixed at strategy time (inverts Phase 12-14's scope-declare-anything semantics for one class); new `pre-model-identifiability-arithmetic` skill teaches the 30-second arithmetic. β: STAGE 3 lead prompt rewritten with three branches (IDENTIFIABLE/MARGINAL/OVER_SATURATED); validator self-tests I1/I1b (round-gated missing-artifact MEDIUM/HIGH), I2 (OVER_SATURATED-without-resolution → HIGH), I3 (OVER_SATURATED-with-commitment → MEDIUM), I3b/I3c (MARGINAL with/without resolution → MEDIUM), I4 (IDENTIFIABLE silent), I5/I5b (AST-based structural enforcement plus behavioral check that scope_declaration cannot silence the HIGH), I6 (round_n=1/None silent for non-IDENTIFIABLE artifacts). γ: skill cross-references in `modeling-strategy`, `identifiability-analysis` (post-hoc as backstop), `mechanistic-vs-hybrid-architecture` (when to abandon HYBRID), `multi-structural-comparison` (pre-build complement) |
 
 ## Conventions
 
@@ -131,13 +132,17 @@ skill changes are listed below; bug fixes are not.
 Before opening a PR:
 
 ```bash
-# All six self-tests must report "OK: all self-test cases passed."
+# All ten self-tests must report "OK: all self-test cases passed."
 python3 scripts/figure_validator.py --self-test
 python3 scripts/identifiability.py --self-test
+python3 scripts/identifiability_a_priori.py --self-test    # Phase 15 α
+python3 scripts/numeric_consistency.py --self-test         # Phase 12 α
+python3 scripts/sanity_checks.py --self-test               # Phase 13 α
 python3 scripts/sensitivity_analysis.py --self-test
 python3 scripts/spec_compliance.py --self-test
 python3 scripts/validate_critique_yaml.py --self-test
 python3 scripts/validate_skill_attachments.py --self-test
+python3 scripts/within_zone_sensitivity.py --self-test     # Phase 12 γ
 ```
 
 Live verification (kicks off a real malaria run, ~5 hours, ~$25):

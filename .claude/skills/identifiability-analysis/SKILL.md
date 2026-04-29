@@ -18,6 +18,29 @@ description: Contract for parameter identifiability analysis. The modeler,
 
 # Parameter Identifiability Analysis
 
+## When to invoke this skill (vs. pre-model-identifiability-arithmetic)
+
+This skill covers POST-HOC identifiability (Fisher info + profile
+likelihood after fitting). It is the BACKSTOP for cases where
+strategy-time arithmetic missed an over-saturation. The PRIMARY
+identifiability check is `pre-model-identifiability-arithmetic`,
+invoked at STAGE 3 before any code is written. If that skill's gate
+passes, this skill's post-hoc check confirms; if the pre-model
+check fails, this skill should never be reached (the architecture
+is redesigned at strategy time).
+
+The two are complementary:
+- **Pre-model (Phase 15 α):** counts free fitted parameters vs
+  independent calibration targets. Catches obvious over-saturation
+  in 30 seconds of arithmetic. Verdict: IDENTIFIABLE / MARGINAL /
+  OVER_SATURATED.
+- **Post-hoc (this skill, Phase 9 σ):** runs Fisher information +
+  profile likelihood after fitting. Catches subtle ridge-trapping
+  the pre-model arithmetic might miss (e.g., approximate
+  identifiability collapse under correlated parameters, parameters
+  that a-priori looked free but turn out to interact with others
+  in a way that flattens the loss surface).
+
 ## Why this exists
 
 The malaria structural probe found that the ABM's recovery rate γ lives
