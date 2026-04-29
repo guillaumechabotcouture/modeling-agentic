@@ -53,9 +53,16 @@ exposure:
   years: 3                         # default 1 if absent
 
 allocation:
-  units_total: 774                 # documentation only
+  units_total: 774                 # Phase 14 α: enforced — cross-checked against
+                                    # allocation CSV row count; MEDIUM
+                                    # `universe_completeness` fires when CSV has
+                                    # strictly fewer rows
   units_allocated: 123
   budget: 319_829_076
+  canonical_csv: models/allocation_result.csv  # Phase 14 β: optional pointer
+                                    # for multi-scenario runs (multiple
+                                    # *allocation*.csv files); declares which
+                                    # one is the headline source
 
 shares:                            # every share-set must close to its target
   - name: zone_budget

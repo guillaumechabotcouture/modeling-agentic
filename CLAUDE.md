@@ -103,6 +103,7 @@ skill changes are listed below; bug fixes are not.
 | 11    | η, υ   | Terminal status discrimination (completed_with_report_restored); F5 run-dir collision prevention                                  |
 | 12    | α, β, γ, δ | Cross-file numeric consistency (`scripts/numeric_consistency.py`); round-aware MEDIUM-to-HIGH escalation; ecological-fallacy required artifact + skill; `report.md` snapshot/restore |
 | 13    | α, β   | Disease-agnostic sanity schema (`scripts/sanity_checks.py` + skill, 8 internal-only structural checks); α numeric_consistency extended to `decision_rule.md` and new token classes (LGA counts, package counts, budget shares) |
+| 14    | α, β   | Universe-completeness sanity check (cross-checks schema's `allocation.units_total` vs allocation CSV row count); exact-match opt-in for integer counts (`exact_counts: [lga_count, package_count]` schema field), `report.md` added to count-drift scan list, `allocation.canonical_csv` field for multi-scenario runs, column-name tolerance |
 
 ## Conventions
 

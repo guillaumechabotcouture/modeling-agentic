@@ -43,6 +43,11 @@ import re
 import sys
 from typing import Optional
 
+try:
+    import yaml
+except ImportError:  # yaml is optional for non-schema-aware callers
+    yaml = None  # type: ignore
+
 
 MEDIUM_DRIFT_THRESHOLD = 0.05   # 5%
 HIGH_DRIFT_THRESHOLD = 0.25     # 25%
@@ -210,6 +215,11 @@ def _load_authoritative(run_dir: str) -> dict:
         "n_allocated_lgas": None,        # rows with cost > 0
         "package_counts": {},            # {dual_ai: 106, pbo: 17, ...}
         "zone_budget_shares": {},        # {NW: 0.781, NC: 0.108, ...}
+        # Phase 14 review fix: relative path of the allocation CSV
+        # actually consulted (resolved via canonical_csv → legacy →
+        # alphabetical fallback). Surfaced in violation messages so
+        # users debugging a flagged drift see the right file name.
+        "alloc_source": None,
     }
 
     summary_path = os.path.join(run_dir, "models", "optimization_summary.json")
@@ -254,10 +264,27 @@ def _load_authoritative(run_dir: str) -> dict:
     #   - n_allocated_lgas (rows with total_cost_usd > 0)
     #   - per-package counts (group by `package` column)
     #   - per-zone budget shares (sum cost by `zone`, divided by total)
+    #
+    # Phase 14 β: multi-scenario runs (e.g., 103105 had
+    # allocation_optimal_{200,320,400}M.csv plus _abm_ variants) need
+    # the modeler to declare the canonical headline CSV. Resolution
+    # order:
+    #   1. models/sanity_schema.yaml's `allocation.canonical_csv` field
+    #      (relative to run_dir; explicit is best)
+    #   2. models/allocation_result.csv (legacy convention used in
+    #      104914 / 190855)
+    #   3. First *allocation*.csv alphabetically (legacy fallback;
+    #      may be wrong on multi-scenario runs but preserves
+    #      backward compat)
     alloc_path: str | None = None
     models_dir = os.path.join(run_dir, "models")
-    if os.path.isdir(models_dir):
-        for entry in os.listdir(models_dir):
+    canonical = _load_canonical_alloc_path_from_schema(run_dir)
+    if canonical and os.path.exists(canonical):
+        alloc_path = canonical
+    elif os.path.exists(os.path.join(models_dir, "allocation_result.csv")):
+        alloc_path = os.path.join(models_dir, "allocation_result.csv")
+    elif os.path.isdir(models_dir):
+        for entry in sorted(os.listdir(models_dir)):
             if "allocation" in entry and entry.endswith(".csv"):
                 alloc_path = os.path.join(models_dir, entry)
                 break
@@ -266,9 +293,22 @@ def _load_authoritative(run_dir: str) -> dict:
             with open(alloc_path) as f:
                 header = f.readline().strip().split(",")
                 idx = {n: i for i, n in enumerate(header)}
-                cost_col = idx.get("total_cost_usd")
-                pkg_col = idx.get("package")
-                zone_col = idx.get("zone")
+                # Phase 14 β: accept multiple column-name conventions.
+                # Different runs use total_cost_usd, cost_3yr, etc.
+                # First match wins.
+                cost_col = next(
+                    (idx[c] for c in ("total_cost_usd", "cost_3yr",
+                                       "cost_usd", "cost",
+                                       "total_cost") if c in idx),
+                    None)
+                pkg_col = next(
+                    (idx[c] for c in ("package", "assigned_package",
+                                       "package_name") if c in idx),
+                    None)
+                zone_col = next(
+                    (idx[c] for c in ("zone", "zone_abbr",
+                                       "zone_name") if c in idx),
+                    None)
                 pkg_counts: dict = {}
                 zone_costs: dict = {}
                 n_allocated = 0
@@ -295,6 +335,8 @@ def _load_authoritative(run_dir: str) -> dict:
                             zone_costs[z] = zone_costs.get(z, 0.0) + c
                 if n_allocated > 0:
                     auth["n_allocated_lgas"] = n_allocated
+                    auth["alloc_source"] = os.path.relpath(
+                        alloc_path, start=run_dir)
                 if pkg_counts:
                     auth["package_counts"] = pkg_counts
                 if zone_costs and total_cost > 0:
@@ -445,8 +487,18 @@ def _scan_lga_counts(doc_text: str) -> list[tuple[int, str]]:
         seen_positions.add(m.start())
         ctx_start = max(0, m.start() - 60)
         ctx_end = min(len(doc_text), m.end() + 60)
-        out.append((n, doc_text[ctx_start:ctx_end]))
-    # Then sweep for bare "X LGAs" with anchor in left or right window.
+        # "X of N LGAs" is unambiguously aggregate.
+        out.append((n, doc_text[ctx_start:ctx_end], "aggregate"))
+    # Then sweep for bare "X LGAs" matches. Two confidence tiers:
+    #   - HIGH-CONFIDENCE AGGREGATE: positive anchor (left/right
+    #     match against canonical "TOTAL" phrasing). Existing 5%/25%
+    #     drift classifier applies as before (Phase 13 β behavior).
+    #   - HEADLINE-CANDIDATE (Phase 14 β): no positive anchor, but
+    #     near a budget-share phrase ("X% of budget", "100% of") or
+    #     a package keyword. ONLY contributes to exact-mode firing
+    #     for sub-5% drifts (catches 313 vs 312-class staleness
+    #     without flagging alternative-scenario counts like 394 LGAs
+    #     in Scenario B that legitimately differ from the headline).
     for m in _LGA_COUNT_RE.finditer(doc_text):
         if m.start() in seen_positions:
             continue
@@ -456,10 +508,11 @@ def _scan_lga_counts(doc_text: str) -> list[tuple[int, str]]:
             continue
         if n < 10 or n > 5000:
             continue
+        if _is_table_row(doc_text, m.start()):
+            continue
         left_window = doc_text[max(0, m.start() - 30):m.start()]
         right_window = doc_text[m.end():
                                  min(len(doc_text), m.end() + 30)]
-        # Skip per-zone subsets.
         if _has_zone_qualifier(left_window + " " + right_window):
             continue
         lw = left_window.lower()
@@ -468,11 +521,25 @@ def _scan_lga_counts(doc_text: str) -> list[tuple[int, str]]:
                               for tok in _LGA_TOTAL_LEFT_TOKENS)
         has_right_anchor = any(rw.startswith(tok)
                                for tok in _LGA_TOTAL_RIGHT_TOKENS)
-        if not (has_left_anchor or has_right_anchor):
+        # Phase 14 β: headline-candidate signals — strong
+        # "this IS the total" phrasing or budget-share neighbor.
+        wider = doc_text[max(0, m.start() - 80):
+                          min(len(doc_text), m.end() + 80)].lower()
+        is_headline_candidate = any(tok in wider
+                                     for tok in ("100% of budget",
+                                                  "100% of the budget",
+                                                  "% of the budget",
+                                                  "concentrating "))
+        if not (has_left_anchor or has_right_anchor
+                or is_headline_candidate):
             continue
         ctx_start = max(0, m.start() - 60)
         ctx_end = min(len(doc_text), m.end() + 60)
-        out.append((n, doc_text[ctx_start:ctx_end]))
+        # Tag with confidence level so the count-drift check can
+        # apply different drift rules per tier.
+        confidence = ("aggregate" if (has_left_anchor or has_right_anchor)
+                      else "headline_candidate")
+        out.append((n, doc_text[ctx_start:ctx_end], confidence))
     return out
 
 
@@ -533,12 +600,42 @@ def _scan_budget_shares(doc_text: str) -> list[tuple[float, int, str, str, str]]
     return out
 
 
+def _classify_drift(drift: float, exact_class: str | None,
+                     exact_counts: set[str] | None
+                     ) -> tuple[str | None, str | None]:
+    """Phase 14 β: severity-and-kind dispatcher honoring exact-match
+    opt-in. When `exact_class` is in `exact_counts` AND drift is
+    sub-5% (below the existing Phase 13 β MEDIUM threshold), return
+    (MEDIUM, exact_count_drift) — catches integer-staleness like 313
+    vs 312 (0.32% drift) that the existing classifier silently
+    tolerates. Above 5%, fall back to the existing classifier so
+    legitimate alternative-scenario counts (e.g., 394 LGAs in
+    Scenario B vs 312 headline) still get the original Phase 13 β
+    treatment."""
+    if (exact_counts and exact_class in exact_counts
+            and 0 < drift < MEDIUM_DRIFT_THRESHOLD):
+        return "MEDIUM", "exact_count_drift"
+    sev = _severity_for_drift(drift)
+    if sev is None:
+        return None, None
+    kind = ("numeric_drift_extreme" if sev == "HIGH"
+            else "numeric_drift_detected")
+    return sev, kind
+
+
 def _check_count_drift(run_dir: str, auth: dict,
-                        report_files: list[str]) -> list[dict]:
+                        report_files: list[str],
+                        exact_counts: set[str] | None = None
+                        ) -> list[dict]:
     """Phase 13 β: cross-doc drift on LGA counts, package counts,
     and budget shares. Truth is models/allocation_result.csv (loaded
     into auth by _load_authoritative). Each scanned file's count
-    must agree to within 5% MEDIUM / 25% HIGH."""
+    must agree to within 5% MEDIUM / 25% HIGH.
+
+    Phase 14 β: when `exact_counts` declares a count class as
+    integer-exact (e.g., {'lga_count', 'package_count'}), drift > 0
+    fires MEDIUM `exact_count_drift` regardless of magnitude. The
+    schema field comes from models/sanity_schema.yaml."""
     out: list[dict] = []
     auth_n_lga = auth.get("n_allocated_lgas")
     auth_pkgs = auth.get("package_counts") or {}
@@ -558,20 +655,28 @@ def _check_count_drift(run_dir: str, auth: dict,
 
         # LGA counts
         if auth_n_lga is not None:
-            for n, ctx in _scan_lga_counts(text):
+            for n, ctx, confidence in _scan_lga_counts(text):
                 # Skip "774 LGAs" (the universe — not the allocated
                 # subset). Accept anything else as a candidate.
                 if n in (774,):  # known total-Nigeria LGA count
                     continue
                 drift = _drift_pct(n, auth_n_lga)
-                sev = _severity_for_drift(drift)
+                # Phase 14 β: headline_candidate scans (no positive
+                # anchor, but headline-like context) only contribute
+                # to exact-mode firing on small drifts. Above the
+                # 5% MEDIUM threshold they're skipped — likely an
+                # alternative-scenario count, not headline staleness.
+                if confidence == "headline_candidate":
+                    if not (exact_counts and "lga_count" in exact_counts
+                            and 0 < drift < MEDIUM_DRIFT_THRESHOLD):
+                        continue
+                sev, kind = _classify_drift(drift, "lga_count",
+                                              exact_counts)
                 if sev is not None:
-                    kind = ("numeric_drift_extreme" if sev == "HIGH"
-                            else "numeric_drift_detected")
                     out.append(_build_violation(
                         kind, sev,
                         f"{fname} reports {n} LGAs but "
-                        f"models/allocation_result.csv shows "
+                        f"{auth.get("alloc_source") or "models/allocation_result.csv"} shows "
                         f"{auth_n_lga} allocated "
                         f"({drift*100:.1f}% drift). Context: "
                         f"\"...{ctx.strip()[:120]}...\"."
@@ -583,14 +688,13 @@ def _check_count_drift(run_dir: str, auth: dict,
             if auth_count is None or auth_count == 0:
                 continue
             drift = _drift_pct(n, auth_count)
-            sev = _severity_for_drift(drift)
+            sev, kind = _classify_drift(drift, "package_count",
+                                          exact_counts)
             if sev is not None:
-                kind = ("numeric_drift_extreme" if sev == "HIGH"
-                        else "numeric_drift_detected")
                 out.append(_build_violation(
                     kind, sev,
                     f"{fname} reports {n} {pkg_norm} LGAs but "
-                    f"models/allocation_result.csv shows "
+                    f"{auth.get("alloc_source") or "models/allocation_result.csv"} shows "
                     f"{auth_count} ({drift*100:.1f}% drift). "
                     f"Context: \"...{ctx.strip()[:120]}...\"."
                 ))
@@ -647,15 +751,16 @@ def _check_count_drift(run_dir: str, auth: dict,
                     continue
                 auth_share = auth_zones[matched_zone]
                 drift = _drift_pct(share, auth_share)
-                sev = _severity_for_drift(drift)
+                # Budget shares are NOT integer-exact by nature
+                # (rounded percentages). exact_counts only governs
+                # integer count classes — pass None as exact_class.
+                sev, kind = _classify_drift(drift, None, exact_counts)
                 if sev is not None:
-                    kind = ("numeric_drift_extreme" if sev == "HIGH"
-                            else "numeric_drift_detected")
                     out.append(_build_violation(
                         kind, sev,
                         f"{fname} reports {share*100:.1f}% of budget "
                         f"for {matched_zone} but "
-                        f"models/allocation_result.csv shows "
+                        f"{auth.get("alloc_source") or "models/allocation_result.csv"} shows "
                         f"{auth_share*100:.1f}% "
                         f"({drift*100:.1f}% drift). Context: "
                         f"\"...{ctx.strip()[:120]}...\"."
@@ -673,30 +778,102 @@ def _build_violation(kind: str, severity: str, claim: str,
     }
 
 
-def check_numeric_consistency(run_dir: str) -> list[dict]:
+_SCHEMA_LOADER_EXC = (OSError,) + (
+    (yaml.YAMLError,) if yaml is not None else ())
+
+
+def _load_sanity_schema_dict(run_dir: str) -> dict | None:
+    """Phase 14 β: load and parse models/sanity_schema.yaml once
+    per `check_numeric_consistency` invocation. Returns the parsed
+    dict, or None if the file is absent, unreadable, malformed, or
+    not a mapping. Both `_load_canonical_alloc_path_from_schema`
+    and `_load_exact_counts_from_schema` consume the result."""
+    if yaml is None:
+        return None
+    path = os.path.join(run_dir, "models", "sanity_schema.yaml")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            doc = yaml.safe_load(f) or {}
+    except _SCHEMA_LOADER_EXC:
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def _load_canonical_alloc_path_from_schema(run_dir: str) -> str | None:
+    """Phase 14 β: read `allocation.canonical_csv` from
+    models/sanity_schema.yaml. Returns absolute path under run_dir
+    when set; None otherwise. Multi-scenario runs (multiple
+    allocation_*.csv files) use this to point the gate at the
+    headline-source CSV explicitly."""
+    doc = _load_sanity_schema_dict(run_dir)
+    if doc is None:
+        return None
+    sec = doc.get("allocation")
+    if not isinstance(sec, dict):
+        return None
+    rel = sec.get("canonical_csv")
+    if not isinstance(rel, str):
+        return None
+    return os.path.join(run_dir, rel)
+
+
+def _load_exact_counts_from_schema(run_dir: str) -> set[str]:
+    """Phase 14 β: read `exact_counts: [...]` from
+    models/sanity_schema.yaml. Returns the set of integer-exact
+    count classes the modeler has opted in to. Empty set when the
+    schema is absent, malformed, or doesn't declare the field —
+    behavior then defaults to Phase 13 β's 5%/25% thresholds."""
+    doc = _load_sanity_schema_dict(run_dir)
+    if doc is None:
+        return set()
+    val = doc.get("exact_counts")
+    if isinstance(val, list):
+        return {str(x) for x in val}
+    return set()
+
+
+def check_numeric_consistency(run_dir: str,
+                                exact_counts: set[str] | None = None
+                                ) -> list[dict]:
     """Cross-check report-level numeric claims against authoritative
     sources. Returns a list of violations.
 
-    Three classes of violation:
+    Four classes of violation:
       numeric_drift_detected    MEDIUM — cross-doc drift >5% from authority
       numeric_drift_extreme     HIGH   — cross-doc drift >25% from authority
       same_doc_inconsistency    MEDIUM — same labeled metric, different
                                           numbers in same file
+      exact_count_drift         MEDIUM — Phase 14 β: any non-zero drift on
+                                          a count class declared as
+                                          integer-exact in
+                                          models/sanity_schema.yaml's
+                                          `exact_counts` list
+
+    If `exact_counts` is None, the schema is auto-loaded from
+    `<run_dir>/models/sanity_schema.yaml`. Pass an explicit set to
+    override (used by self-tests).
     """
     violations: list[dict] = []
     auth = _load_authoritative(run_dir)
+    if exact_counts is None:
+        exact_counts = _load_exact_counts_from_schema(run_dir)
 
-    # Files scanned for cross-doc cases-averted drift. results.md,
-    # figure_rationale.md, and (Phase 13 β) decision_rule.md are the
-    # headline-number locations. The cost-per-case same-doc check is
-    # still hardcoded to results.md below; decision_rule.md typically
-    # doesn't contain $X/case mentions but does carry LGA counts,
-    # package counts, and budget shares — those are checked separately
-    # via _check_count_drift below.
+    # Files scanned for cross-doc drift. results.md and
+    # figure_rationale.md are headline-number locations (Phase 12 α);
+    # decision_rule.md was added in Phase 13 β; report.md was added
+    # in Phase 14 β after the 103105 retro found "313 LGAs" appearing
+    # 4 times in report.md (and only there) while the CSV truth is
+    # 312. The cost-per-case same-doc check is still hardcoded to
+    # results.md below — report.md doesn't typically contain
+    # "$X/case" same-doc patterns, so adding it would create noise
+    # without catching anything.
     report_files = [
         "results.md",
         "figure_rationale.md",
         "decision_rule.md",
+        "report.md",
     ]
 
     # --- Same-doc inconsistency: PBO-in-NW cost-per-case ---
@@ -826,7 +1003,8 @@ def check_numeric_consistency(run_dir: str) -> list[dict]:
     # LGA counts ("121 LGAs allocated"), package counts ("104 dual-AI"),
     # budget shares ("78.1% of budget"). Each is cross-referenced
     # against models/allocation_result.csv truth.
-    violations.extend(_check_count_drift(run_dir, auth, report_files))
+    violations.extend(_check_count_drift(run_dir, auth, report_files,
+                                            exact_counts=exact_counts))
 
     # --- Round-number drift: results.md title vs progress.md ---
     if auth["final_round"] is not None and os.path.exists(results_path):
@@ -1167,6 +1345,76 @@ def _run_self_test() -> int:
         ok(not count_v,
            f"T12: clean run should produce no count-drift violations, "
            f"got {count_v}")
+
+    # Phase 14 β: T13-T15 cover exact-match opt-in.
+
+    # T13: 313 vs 312 LGAs (0.32% drift, sub-5% by design) fires
+    # MEDIUM exact_count_drift when exact_counts={'lga_count'}.
+    # The 103105 retro pattern.
+    with tempfile.TemporaryDirectory() as d:
+        rows = []
+        for i in range(312):
+            rows.append({"lga_name": f"lga_{i}", "zone": "NW",
+                         "package": "llin_pbo",
+                         "total_cost_usd": 1_000_000})
+        make_run_dir(d,
+            allocation_rows=rows,
+            progress_text="STAGE 7 decision (round 6/8)\n",
+            decision_rule_text=(
+                "# Decision Rule\n"
+                "## Allocation Summary\n"
+                "Total of 313 LGAs allocated.\n"
+            ))
+        v = check_numeric_consistency(d, exact_counts={"lga_count"})
+        ok(any(x["kind"] == "exact_count_drift"
+               and "313" in x["claim"] and "312" in x["claim"]
+               for x in v),
+           f"T13: 313 vs 312 with exact_counts opt-in should fire "
+           f"MEDIUM exact_count_drift, got {v}")
+
+    # T14: same 0.32% drift with exact_counts UNSET → silent
+    # (backward compat: Phase 13 β's 5% threshold tolerates it).
+    with tempfile.TemporaryDirectory() as d:
+        rows = []
+        for i in range(312):
+            rows.append({"lga_name": f"lga_{i}", "zone": "NW",
+                         "package": "llin_pbo",
+                         "total_cost_usd": 1_000_000})
+        make_run_dir(d,
+            allocation_rows=rows,
+            progress_text="STAGE 7 decision (round 6/8)\n",
+            decision_rule_text=(
+                "# Decision Rule\n"
+                "## Allocation Summary\n"
+                "Total of 313 LGAs allocated.\n"
+            ))
+        v = check_numeric_consistency(d)  # no exact_counts
+        ok(not any(x["kind"] == "exact_count_drift" for x in v)
+           and not any("313" in x["claim"] and "312" in x["claim"]
+                       and x["kind"].startswith("numeric_drift")
+                       for x in v),
+           f"T14: 0.32% drift without exact_counts should be silent, "
+           f"got {v}")
+
+    # T15: exact_counts opt-in but counts MATCH exactly → silent.
+    with tempfile.TemporaryDirectory() as d:
+        rows = []
+        for i in range(312):
+            rows.append({"lga_name": f"lga_{i}", "zone": "NW",
+                         "package": "llin_pbo",
+                         "total_cost_usd": 1_000_000})
+        make_run_dir(d,
+            allocation_rows=rows,
+            progress_text="STAGE 7 decision (round 6/8)\n",
+            decision_rule_text=(
+                "# Decision Rule\n"
+                "## Allocation Summary\n"
+                "Total of 312 LGAs allocated.\n"
+            ))
+        v = check_numeric_consistency(d, exact_counts={"lga_count"})
+        ok(not any(x["kind"] == "exact_count_drift" for x in v),
+           f"T15: 312 == 312 should be silent under exact_counts, "
+           f"got {v}")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)

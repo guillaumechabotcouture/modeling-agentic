@@ -38,9 +38,18 @@ exposure:
   years: 3
 
 allocation:
-  units_total: 774
+  units_total: 774               # declared universe size; Phase 14 α
+                                  # cross-checks against allocation CSV row count
   units_allocated: 123
   budget: 319_829_076
+
+exact_counts: [lga_count, package_count, of_n_denominator]
+                                  # Phase 14 β opt-in: count classes that
+                                  # must match the CSV exactly. Drift > 0
+                                  # fires MEDIUM `exact_count_drift`
+                                  # regardless of magnitude. Backward
+                                  # compatible — if absent, default Phase 13 β
+                                  # 5%/25% thresholds apply.
 
 shares:
   - name: zone_budget
@@ -609,6 +618,83 @@ def _check_outlier_sniff(schema: dict, run_dir: str) -> list[dict]:
                        f"(≤ {threshold}×)")}]
 
 
+def _count_allocation_csv_rows(run_dir: str) -> int | None:
+    """Phase 14 α: return the MAX row count (excluding header) across
+    all `*allocation*.csv` files under run_dir, run_dir/data, and
+    run_dir/models. Returns None if no allocation CSV is found.
+
+    The MAX is the right aggregator: when a run has multiple budget
+    scenarios (e.g., allocation_optimal_320M.csv, _400M.csv) the
+    universe size is the same across all of them; taking max is
+    robust to one file having dropped rows mid-write."""
+    candidates: list[str] = []
+    for sub in ("", "data", "models"):
+        d = os.path.join(run_dir, sub) if sub else run_dir
+        if not os.path.isdir(d):
+            continue
+        for entry in os.listdir(d):
+            if "allocation" in entry and entry.endswith(".csv"):
+                candidates.append(os.path.join(d, entry))
+    if not candidates:
+        return None
+    best = 0
+    for path in candidates:
+        try:
+            with open(path) as f:
+                rows = sum(1 for _ in f) - 1  # exclude header
+        except OSError:
+            continue
+        if rows > best:
+            best = rows
+    return best if best > 0 else None
+
+
+def _check_universe_completeness(schema: dict, run_dir: str) -> list[dict]:
+    """Phase 14 α: compare schema.allocation.units_total against the
+    actual row count of allocation CSVs. Catches silent universe
+    shrinkage: when the modeler frames the question against N units
+    but data joins drop M units before optimization, the result
+    silently answers a different question.
+
+    Triggers MEDIUM `universe_completeness` (failed) when schema
+    declares units_total and CSV row count is strictly less.
+    Silently passes when:
+      - schema.allocation.units_total is absent (opt-in field)
+      - no allocation CSV exists (early-round invocation)
+      - declared units_total equals or is below CSV row count
+        (over-counting the declaration is benign — the CSV has more
+        units than the framing claimed; an unusual but not
+        consequence-bearing case)."""
+    sec = schema.get("allocation")
+    if not isinstance(sec, dict):
+        return []
+    declared = sec.get("units_total")
+    if declared is None:
+        return []
+    try:
+        declared = int(declared)
+    except (TypeError, ValueError):
+        return [{"id": "universe_completeness", "passed": False,
+                 "claim": (f"allocation.units_total {declared!r} is not "
+                           f"an integer")}]
+    csv_rows = _count_allocation_csv_rows(run_dir)
+    if csv_rows is None:
+        return []  # no allocation CSV yet; silent
+    if csv_rows >= declared:
+        return [{"id": "universe_completeness", "passed": True,
+                 "claim": (f"allocation universe complete: declared "
+                           f"{declared}, CSV has {csv_rows} ✓")}]
+    dropped = declared - csv_rows
+    return [{"id": "universe_completeness", "passed": False,
+             "claim": (f"Schema declares {declared} allocation units "
+                       f"but allocation CSV has {csv_rows} rows. "
+                       f"{dropped} unit(s) silently dropped during "
+                       f"data prep — the model is answering for "
+                       f"{csv_rows} units while the framing claims "
+                       f"{declared}. Either fix the upstream join or "
+                       f"document the dropout explicitly in §Data Gaps.")}]
+
+
 _CHECKS = (
     ("mass_balance", _check_mass_balance),
     ("per_unit_intensity", _check_per_unit_intensity),
@@ -668,6 +754,11 @@ def validate_sanity_schema(yaml_path: str,
     except _USER_INPUT_EXC as e:
         checks.append({"id": "outlier_sniff", "passed": False,
                        "claim": f"outlier_sniff crashed: {e}"})
+    try:
+        checks.extend(_check_universe_completeness(schema, run_dir))
+    except _USER_INPUT_EXC as e:
+        checks.append({"id": "universe_completeness", "passed": False,
+                       "claim": f"universe_completeness crashed: {e}"})
 
     failed = [c for c in checks if not c.get("passed", False)]
     verdict = "PASS" if not failed else "FAIL"
@@ -895,6 +986,72 @@ def _run_self_test() -> int:
                and "max_over_p95" in c["claim"]
                for c in r["checks"]),
            f"W-outlier-bad-rule: unsupported rule should fail, got {r}")
+
+    # W-universe-shrink: schema declares 774 LGAs, allocation CSV has
+    # 769 → universe_completeness fires (the 103105 retro pattern).
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "models",
+                               "allocation_optimal_320M.csv"), "w") as f:
+            f.write("lga_name,total_cost_usd\n")
+            for i in range(769):
+                f.write(f"lga_{i},1000\n")
+        p = write_schema(d,
+            "allocation:\n"
+            "  units_total: 774\n"
+            "  units_allocated: 312\n"
+            "  budget: 320000000\n")
+        r = validate_sanity_schema(p, run_dir=d)
+        ok(any(c["id"] == "universe_completeness" and not c["passed"]
+               and "774" in c["claim"] and "769" in c["claim"]
+               and "5" in c["claim"]
+               for c in r["checks"]),
+           f"W-universe-shrink: 774 declared vs 769 CSV should fail, "
+           f"got {r}")
+
+    # W-universe-clean: declared = CSV row count → passes silently.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "models",
+                               "allocation_optimal_320M.csv"), "w") as f:
+            f.write("lga_name,total_cost_usd\n")
+            for i in range(774):
+                f.write(f"lga_{i},1000\n")
+        p = write_schema(d,
+            "allocation:\n"
+            "  units_total: 774\n"
+            "  budget: 320000000\n")
+        r = validate_sanity_schema(p, run_dir=d)
+        ok(all(c["passed"] for c in r["checks"]
+               if c["id"] == "universe_completeness"),
+           f"W-universe-clean: 774 == 774 should PASS, got {r}")
+
+    # W-universe-no-csv: declared but no CSV in run_dir → silent.
+    with tempfile.TemporaryDirectory() as d:
+        p = write_schema(d,
+            "allocation:\n"
+            "  units_total: 774\n")
+        r = validate_sanity_schema(p, run_dir=d)
+        ok(not any(c["id"] == "universe_completeness"
+                   for c in r["checks"]),
+           f"W-universe-no-csv: missing CSV should be silent, got {r}")
+
+    # W-universe-over: declared 100 but CSV has 200 → silent
+    # (over-counting framing is benign — uncommon edge case).
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "models",
+                               "allocation_optimal.csv"), "w") as f:
+            f.write("lga_name,total_cost_usd\n")
+            for i in range(200):
+                f.write(f"lga_{i},1000\n")
+        p = write_schema(d,
+            "allocation:\n"
+            "  units_total: 100\n")
+        r = validate_sanity_schema(p, run_dir=d)
+        ok(all(c["passed"] for c in r["checks"]
+               if c["id"] == "universe_completeness"),
+           f"W-universe-over: declared < CSV should PASS, got {r}")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)
