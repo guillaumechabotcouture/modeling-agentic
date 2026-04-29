@@ -43,6 +43,11 @@ import re
 import sys
 from typing import Optional
 
+try:
+    import yaml
+except ImportError:  # yaml is optional for non-schema-aware callers
+    yaml = None  # type: ignore
+
 
 MEDIUM_DRIFT_THRESHOLD = 0.05   # 5%
 HIGH_DRIFT_THRESHOLD = 0.25     # 25%
@@ -766,22 +771,37 @@ def _build_violation(kind: str, severity: str, claim: str,
     }
 
 
+_SCHEMA_LOADER_EXC = (OSError,) + (
+    (yaml.YAMLError,) if yaml is not None else ())
+
+
+def _load_sanity_schema_dict(run_dir: str) -> dict | None:
+    """Phase 14 β: load and parse models/sanity_schema.yaml once
+    per `check_numeric_consistency` invocation. Returns the parsed
+    dict, or None if the file is absent, unreadable, malformed, or
+    not a mapping. Both `_load_canonical_alloc_path_from_schema`
+    and `_load_exact_counts_from_schema` consume the result."""
+    if yaml is None:
+        return None
+    path = os.path.join(run_dir, "models", "sanity_schema.yaml")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            doc = yaml.safe_load(f) or {}
+    except _SCHEMA_LOADER_EXC:
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
 def _load_canonical_alloc_path_from_schema(run_dir: str) -> str | None:
     """Phase 14 β: read `allocation.canonical_csv` from
     models/sanity_schema.yaml. Returns absolute path under run_dir
     when set; None otherwise. Multi-scenario runs (multiple
     allocation_*.csv files) use this to point the gate at the
     headline-source CSV explicitly."""
-    path = os.path.join(run_dir, "models", "sanity_schema.yaml")
-    if not os.path.exists(path):
-        return None
-    try:
-        import yaml
-        with open(path) as f:
-            doc = yaml.safe_load(f) or {}
-    except Exception:
-        return None
-    if not isinstance(doc, dict):
+    doc = _load_sanity_schema_dict(run_dir)
+    if doc is None:
         return None
     sec = doc.get("allocation")
     if not isinstance(sec, dict):
@@ -798,16 +818,8 @@ def _load_exact_counts_from_schema(run_dir: str) -> set[str]:
     count classes the modeler has opted in to. Empty set when the
     schema is absent, malformed, or doesn't declare the field —
     behavior then defaults to Phase 13 β's 5%/25% thresholds."""
-    path = os.path.join(run_dir, "models", "sanity_schema.yaml")
-    if not os.path.exists(path):
-        return set()
-    try:
-        import yaml
-        with open(path) as f:
-            doc = yaml.safe_load(f) or {}
-    except Exception:
-        return set()
-    if not isinstance(doc, dict):
+    doc = _load_sanity_schema_dict(run_dir)
+    if doc is None:
         return set()
     val = doc.get("exact_counts")
     if isinstance(val, list):
