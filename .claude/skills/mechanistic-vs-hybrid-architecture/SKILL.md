@@ -85,6 +85,30 @@ Is the analysis a budget-allocation decision?
 └── NO, methods comparison only → Analytical (or hybrid as benchmark)
 ```
 
+## When to abandon HYBRID architecture mid-strategy (Phase 15 α)
+
+HYBRID architecture (calibrated baseline + literature intervention
+multipliers) is the default for budget-allocation analyses. But if
+the calibration step is unidentifiable (params > targets), the ABM
+contributes nothing the literature multipliers don't already supply.
+The model becomes a decorative wrapper over `PfPR × OR`.
+
+Before committing to HYBRID, run `pre-model-identifiability-arithmetic`
+arithmetic on the calibration step. If the verdict is OVER_SATURATED:
+
+- **Tie calibration params across archetypes/groups** to bring the
+  ratio back to IDENTIFIABLE (best for retaining ABM mechanism diversity).
+- **Drop the ABM entirely** and use the analytical model
+  `PfPR_post = PfPR_baseline × OR × programmatic_factor` (cleaner
+  and more honest about what the model is actually doing).
+
+The 224202 run shipped a HYBRID with 40 fitted params for 6 targets
+and post-hoc identifiability flagged 3/3 fitted params unidentified.
+The modeler scope-declared and proceeded; the ABM was decorative.
+This is the failure mode this section is meant to prevent.
+
+---
+
 ## Worked example: 1935 malaria 4-round evolution
 
 This is the canonical "what happens when the modeler skips this skill":
