@@ -4838,6 +4838,98 @@ def _run_self_test() -> int:
        "S2: severity is MEDIUM (not HIGH; legacy carve-out is now "
        "user-scope-declarable)")
 
+    # === Phase 15 β: STAGE 3 a-priori identifiability self-tests ===
+    # F1-F5 verify the pre-model gate fires correctly across the five
+    # scenarios documented in the plan: missing artifact, OVER_SAT
+    # without resolution, OVER_SAT with resolution, IDENTIFIABLE,
+    # scope-declared (which must NOT silence the HIGH).
+    import tempfile as _tempfile
+    import yaml as _yaml
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # F1: missing artifact at r=2 → MEDIUM identifiability_a_priori_missing
+        v = _check_identifiability_a_priori(_d, round_n=2)
+        ok(any(x["kind"] == "identifiability_a_priori_missing"
+               and x["severity"] == "MEDIUM" for x in v),
+           f"F1: missing artifact at r=2 should fire MEDIUM, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # F1b: missing artifact at r≥3 escalates to HIGH
+        v = _check_identifiability_a_priori(_d, round_n=3)
+        ok(any(x["kind"] == "identifiability_a_priori_missing"
+               and x["severity"] == "HIGH" for x in v),
+           f"F1b: missing artifact at r=3 should fire HIGH, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # F2: OVER_SATURATED without resolution → HIGH pre_model_over_saturated
+        os.makedirs(os.path.join(_d, "models"))
+        with open(os.path.join(_d, "models",
+                               "identifiability_a_priori.yaml"), "w") as f:
+            _yaml.safe_dump({"total_independent_targets": 6,
+                             "total_fitted_parameters": 40,
+                             "verdict": "OVER_SATURATED"}, f)
+        v = _check_identifiability_a_priori(_d, round_n=2)
+        ok(any(x["kind"] == "pre_model_over_saturated"
+               and x["severity"] == "HIGH" for x in v),
+           f"F2: OVER_SAT no-res should fire HIGH "
+           f"pre_model_over_saturated, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # F3: OVER_SATURATED with resolution.decision → MEDIUM advisory
+        os.makedirs(os.path.join(_d, "models"))
+        with open(os.path.join(_d, "models",
+                               "identifiability_a_priori.yaml"), "w") as f:
+            _yaml.safe_dump({"total_independent_targets": 6,
+                             "total_fitted_parameters": 40,
+                             "verdict": "OVER_SATURATED",
+                             "resolution": {"decision": "tie_params_by_ecotype",
+                                            "details": "5 ecotype values"}}, f)
+        v = _check_identifiability_a_priori(_d, round_n=2)
+        ok(any(x["kind"] == "pre_model_over_saturated_with_commitment"
+               and x["severity"] == "MEDIUM" for x in v),
+           f"F3: OVER_SAT with resolution should fire MEDIUM "
+           f"with_commitment, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # F4: IDENTIFIABLE → silent (no violations)
+        os.makedirs(os.path.join(_d, "models"))
+        with open(os.path.join(_d, "models",
+                               "identifiability_a_priori.yaml"), "w") as f:
+            _yaml.safe_dump({"total_independent_targets": 6,
+                             "total_fitted_parameters": 5,
+                             "verdict": "IDENTIFIABLE"}, f)
+        v = _check_identifiability_a_priori(_d, round_n=2)
+        ok(not any(x["kind"].startswith("pre_model_")
+                   or x["kind"].startswith("identifiability_a_priori_")
+                   for x in v),
+           f"F4: IDENTIFIABLE should be silent, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # F5: scope_declared:true on the kind STILL fires HIGH
+        # (the inversion check — scope-declaration cannot close
+        # pre_model_over_saturated). We verify this by writing a
+        # scope_declaration.yaml that lists the kind and confirming
+        # the gate still fires HIGH. Note: the integration check does
+        # NOT call _load_sanity_check_acknowledged for these kinds —
+        # documented in code comments.
+        os.makedirs(os.path.join(_d, "models"))
+        with open(os.path.join(_d, "models",
+                               "identifiability_a_priori.yaml"), "w") as f:
+            _yaml.safe_dump({"total_independent_targets": 6,
+                             "total_fitted_parameters": 40,
+                             "verdict": "OVER_SATURATED"}, f)
+        with open(os.path.join(_d, "scope_declaration.yaml"), "w") as f:
+            _yaml.safe_dump({"sanity_check_acknowledged": [
+                "pre_model_over_saturated",
+                "identifiability_a_priori_missing",
+            ]}, f)
+        v = _check_identifiability_a_priori(_d, round_n=2)
+        ok(any(x["kind"] == "pre_model_over_saturated"
+               and x["severity"] == "HIGH" for x in v),
+           f"F5: scope_declared on kind should NOT silence HIGH "
+           f"pre_model_over_saturated (architecture is inside pipeline "
+           f"reach), got {v}")
+
     # --- Summary ---
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)
