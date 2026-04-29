@@ -33,6 +33,7 @@ The check fires:
 - HIGH `identifiability_a_priori_missing` at r≥3
 - HIGH `identifiability_a_priori_invalid` if YAML malformed
 - HIGH `pre_model_over_saturated` if verdict OVER_SATURATED without resolution
+- MEDIUM `pre_model_over_saturated_with_commitment` if verdict OVER_SATURATED but a `resolution.decision` is documented (the modeler has committed to a redesign — advisory until the YAML is updated to show the new fitted count and verdict IDENTIFIABLE)
 - MEDIUM `pre_model_marginal_identifiability` if verdict MARGINAL
 - HIGH `pre_model_decorative_undocumented` if `accept_decorative` lacks details
 
@@ -62,10 +63,15 @@ calibration_targets:
     derivation: "6 zones × 1 PfPR measurement each"
 total_independent_targets: 6        # sum of n_independent across sources
 
-proposed_parameters:
+proposed_parameters:                # documentation only — the validator
+                                    # reads only the totals below, not these
+                                    # entries. Use this list to show your
+                                    # work; if its sums disagree with the
+                                    # totals, fix the totals (the validator
+                                    # trusts the scalar fields).
   - name: ext_foi_per_archetype
     count: 20                       # 20 archetypes × 1 ext_foi each
-    fitted: true                    # tells the validator to count
+    fitted: true
     prior_constraint: weak          # weak | strong | none | literature
   - name: dur_immune_per_archetype
     count: 20
@@ -76,8 +82,8 @@ proposed_parameters:
     fitted: false                   # fixed from Yang 2018; not counted
     prior_constraint: literature
 
-total_fitted_parameters: 40         # sum of fitted=true counts
-total_fixed_parameters: 5
+total_fitted_parameters: 40         # ENFORCED — validator reads this scalar
+total_fixed_parameters: 5           # documentation only
 
 ratio: 6.67                         # total_fitted / total_independent_targets
 verdict: OVER_SATURATED             # IDENTIFIABLE | MARGINAL | OVER_SATURATED

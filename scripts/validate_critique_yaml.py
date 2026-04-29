@@ -2427,11 +2427,12 @@ def _check_identifiability_a_priori(run_dir: str,
     The pre_model_* kinds are NOT scope-declarable via
     sanity_check_acknowledged or scope_declaration.yaml. Architecture
     choice is inside pipeline reach; the modeler must redesign,
-    not declare scope.
+    not declare scope. Concretely, this function intentionally does
+    NOT call `_load_sanity_check_acknowledged` (the helper used by
+    `_check_sanity_schema` for opt-out filtering). The non-scope-
+    declarable contract is enforced by structural omission of that
+    call, not by a runtime check.
     """
-    if round_n is not None and round_n < 1:
-        return []  # Round 1 is the drafting window; silent.
-
     yaml_path = os.path.join(run_dir, "models",
                              "identifiability_a_priori.yaml")
 
@@ -2471,7 +2472,12 @@ def _check_identifiability_a_priori(run_dir: str,
         )
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-    except Exception as e:
+    # Narrow exception scope per Phase 13/14 review-fix convention:
+    # ImportError covers spec_from_file_location / exec_module failures,
+    # OSError covers missing/unreadable script files, AttributeError
+    # covers loader-spec API misuse. Bare `except Exception` would also
+    # swallow KeyboardInterrupt / SystemExit, which is undesirable.
+    except (ImportError, OSError, AttributeError) as e:
         return [{
             "kind": "identifiability_a_priori_invalid",
             "severity": "HIGH",
@@ -2539,49 +2545,25 @@ def _check_identifiability_a_priori(run_dir: str,
         }]
 
     if result["verdict"] == "OVER_SATURATED":
+        # When validate_identifiability_a_priori returns verdict
+        # OVER_SATURATED (not MALFORMED), the artifact has a documented
+        # resolution decision — has_resolution is True by construction.
+        # The over-saturated-without-resolution case returns MALFORMED
+        # above and is dispatched there as HIGH pre_model_over_saturated.
+        # So this branch always fires the MEDIUM commitment advisory.
         s = result.get("summary", {})
-        # has_resolution=True means the modeler documented a resolution
-        # decision (tie_params, downgrade_to_analytical, accept_decorative
-        # with details, etc.). The artifact still reports the CURRENT
-        # over-saturated state but commits to a redesign — fire MEDIUM
-        # advisory rather than HIGH blocker. Once the redesign is
-        # implemented, the YAML should be updated to show the new
-        # parameter counts and verdict IDENTIFIABLE.
-        if s.get("has_resolution"):
-            return [{
-                "kind": "pre_model_over_saturated_with_commitment",
-                "severity": "MEDIUM",
-                "stage": "PRE_MODEL",
-                "claim": (
-                    f"Pre-model identifiability arithmetic flags "
-                    f"OVER_SATURATED: {s.get('n_fitted', 0)} fitted "
-                    f"/ {s.get('n_targets', 0)} targets = "
-                    f"{s.get('ratio', 0):.2f}×. Resolution committed "
-                    f"in artifact. Once redesign is implemented, "
-                    f"update identifiability_a_priori.yaml to show the "
-                    f"new fitted count and verdict IDENTIFIABLE."
-                ),
-            }]
         return [{
-            "kind": "pre_model_over_saturated",
-            "severity": "HIGH",
+            "kind": "pre_model_over_saturated_with_commitment",
+            "severity": "MEDIUM",
             "stage": "PRE_MODEL",
             "claim": (
                 f"Pre-model identifiability arithmetic flags "
                 f"OVER_SATURATED: {s.get('n_fitted', 0)} fitted "
-                f"parameters / {s.get('n_targets', 0)} independent "
-                f"calibration targets = "
-                f"{s.get('ratio', 0):.2f}× ratio (threshold > 3.0). "
-                f"The proposed architecture is structurally "
-                f"unidentifiable. Pick one resolution: (a) reduce "
-                f"params (tie across groups), (b) add independent "
-                f"calibration targets, (c) downgrade to analytical "
-                f"model (no calibration), or (d) explicitly "
-                f"acknowledge a decorative architecture with 100-300 "
-                f"word justification of what the architecture "
-                f"contributes that the analytical model does not. "
-                f"This blocker is NOT scope-declarable — architecture "
-                f"choice is inside pipeline reach."
+                f"/ {s.get('n_targets', 0)} targets = "
+                f"{s.get('ratio', 0):.2f}×. Resolution committed "
+                f"in artifact. Once redesign is implemented, "
+                f"update identifiability_a_priori.yaml to show the "
+                f"new fitted count and verdict IDENTIFIABLE."
             ),
         }]
 
@@ -4839,29 +4821,32 @@ def _run_self_test() -> int:
        "user-scope-declarable)")
 
     # === Phase 15 β: STAGE 3 a-priori identifiability self-tests ===
-    # F1-F5 verify the pre-model gate fires correctly across the five
+    # I1-I5 verify the pre-model gate fires correctly across the five
     # scenarios documented in the plan: missing artifact, OVER_SAT
     # without resolution, OVER_SAT with resolution, IDENTIFIABLE,
-    # scope-declared (which must NOT silence the HIGH).
+    # scope-declared (which must NOT silence the HIGH). The I-prefix
+    # is for "identifiability" — Phase 5 ζ already used F1-F4 for
+    # stuck-blocker tests and Phase 9 ρ used F1-F6 for figure-validator
+    # tests, so the F-prefix is taken in this self-test block.
     import tempfile as _tempfile
     import yaml as _yaml
 
     with _tempfile.TemporaryDirectory() as _d:
-        # F1: missing artifact at r=2 → MEDIUM identifiability_a_priori_missing
+        # I1: missing artifact at r=2 → MEDIUM identifiability_a_priori_missing
         v = _check_identifiability_a_priori(_d, round_n=2)
         ok(any(x["kind"] == "identifiability_a_priori_missing"
                and x["severity"] == "MEDIUM" for x in v),
-           f"F1: missing artifact at r=2 should fire MEDIUM, got {v}")
+           f"I1: missing artifact at r=2 should fire MEDIUM, got {v}")
 
     with _tempfile.TemporaryDirectory() as _d:
-        # F1b: missing artifact at r≥3 escalates to HIGH
+        # I1b: missing artifact at r≥3 escalates to HIGH
         v = _check_identifiability_a_priori(_d, round_n=3)
         ok(any(x["kind"] == "identifiability_a_priori_missing"
                and x["severity"] == "HIGH" for x in v),
-           f"F1b: missing artifact at r=3 should fire HIGH, got {v}")
+           f"I1b: missing artifact at r=3 should fire HIGH, got {v}")
 
     with _tempfile.TemporaryDirectory() as _d:
-        # F2: OVER_SATURATED without resolution → HIGH pre_model_over_saturated
+        # I2: OVER_SATURATED without resolution → HIGH pre_model_over_saturated
         os.makedirs(os.path.join(_d, "models"))
         with open(os.path.join(_d, "models",
                                "identifiability_a_priori.yaml"), "w") as f:
@@ -4871,11 +4856,11 @@ def _run_self_test() -> int:
         v = _check_identifiability_a_priori(_d, round_n=2)
         ok(any(x["kind"] == "pre_model_over_saturated"
                and x["severity"] == "HIGH" for x in v),
-           f"F2: OVER_SAT no-res should fire HIGH "
+           f"I2: OVER_SAT no-res should fire HIGH "
            f"pre_model_over_saturated, got {v}")
 
     with _tempfile.TemporaryDirectory() as _d:
-        # F3: OVER_SATURATED with resolution.decision → MEDIUM advisory
+        # I3: OVER_SATURATED with resolution.decision → MEDIUM advisory
         os.makedirs(os.path.join(_d, "models"))
         with open(os.path.join(_d, "models",
                                "identifiability_a_priori.yaml"), "w") as f:
@@ -4887,11 +4872,11 @@ def _run_self_test() -> int:
         v = _check_identifiability_a_priori(_d, round_n=2)
         ok(any(x["kind"] == "pre_model_over_saturated_with_commitment"
                and x["severity"] == "MEDIUM" for x in v),
-           f"F3: OVER_SAT with resolution should fire MEDIUM "
+           f"I3: OVER_SAT with resolution should fire MEDIUM "
            f"with_commitment, got {v}")
 
     with _tempfile.TemporaryDirectory() as _d:
-        # F4: IDENTIFIABLE → silent (no violations)
+        # I4: IDENTIFIABLE → silent (no violations)
         os.makedirs(os.path.join(_d, "models"))
         with open(os.path.join(_d, "models",
                                "identifiability_a_priori.yaml"), "w") as f:
@@ -4902,16 +4887,43 @@ def _run_self_test() -> int:
         ok(not any(x["kind"].startswith("pre_model_")
                    or x["kind"].startswith("identifiability_a_priori_")
                    for x in v),
-           f"F4: IDENTIFIABLE should be silent, got {v}")
+           f"I4: IDENTIFIABLE should be silent, got {v}")
 
     with _tempfile.TemporaryDirectory() as _d:
-        # F5: scope_declared:true on the kind STILL fires HIGH
-        # (the inversion check — scope-declaration cannot close
-        # pre_model_over_saturated). We verify this by writing a
-        # scope_declaration.yaml that lists the kind and confirming
-        # the gate still fires HIGH. Note: the integration check does
-        # NOT call _load_sanity_check_acknowledged for these kinds —
-        # documented in code comments.
+        # I5: structural enforcement check — verify the function does
+        # NOT call _load_sanity_check_acknowledged. The inversion of
+        # the scope-declare-anything semantics for pre_model_* kinds
+        # is enforced by structural omission of that call (no runtime
+        # check). A behavioral test can't catch the regression directly
+        # because writing scope_declaration.yaml has zero effect on a
+        # function that doesn't read it. So we AST-inspect the
+        # function: a Call node referencing _load_sanity_check_
+        # acknowledged would fail this assertion. Mere docstring
+        # mentions of the helper (e.g., to explain WHY it's omitted)
+        # are tolerated because the AST sees them as Constant strings,
+        # not Calls.
+        import ast as _ast
+        import inspect as _inspect
+        import textwrap as _textwrap
+        _src = _textwrap.dedent(
+            _inspect.getsource(_check_identifiability_a_priori))
+        _tree = _ast.parse(_src)
+        _calls_loader = any(
+            isinstance(node, _ast.Call)
+            and isinstance(node.func, _ast.Name)
+            and node.func.id == "_load_sanity_check_acknowledged"
+            for node in _ast.walk(_tree)
+        )
+        ok(not _calls_loader,
+           "I5: _check_identifiability_a_priori must NOT call "
+           "_load_sanity_check_acknowledged. Pre-model arithmetic is "
+           "non-scope-declarable; adding the loader call would silently "
+           "allow scope_declaration.yaml to silence "
+           "pre_model_over_saturated.")
+        # Companion behavioral check: even with scope_declaration.yaml
+        # listing the kind, the gate fires HIGH. Pairs with the source
+        # check above — together they catch both static (loader added)
+        # and dynamic (loader added but gated) regressions.
         os.makedirs(os.path.join(_d, "models"))
         with open(os.path.join(_d, "models",
                                "identifiability_a_priori.yaml"), "w") as f:
@@ -4926,7 +4938,7 @@ def _run_self_test() -> int:
         v = _check_identifiability_a_priori(_d, round_n=2)
         ok(any(x["kind"] == "pre_model_over_saturated"
                and x["severity"] == "HIGH" for x in v),
-           f"F5: scope_declared on kind should NOT silence HIGH "
+           f"I5b: scope_declared on kind should NOT silence HIGH "
            f"pre_model_over_saturated (architecture is inside pipeline "
            f"reach), got {v}")
 
