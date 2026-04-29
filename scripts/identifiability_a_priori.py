@@ -137,6 +137,12 @@ def validate_identifiability_a_priori(yaml_path: str) -> dict:
             f"total_independent_targets must be positive "
             f"(got {n_targets}); a model with zero targets is not "
             f"calibratable")
+    if n_fitted is not None and n_fitted < 0:
+        errors.append(
+            f"total_fitted_parameters must be non-negative "
+            f"(got {n_fitted}); negative parameter counts are "
+            f"semantically meaningless and would yield a negative "
+            f"ratio that silently bypasses the OVER_SATURATED gate")
 
     if errors:
         return {"verdict": "MALFORMED", "computed_verdict": None,
@@ -303,6 +309,21 @@ def _run_self_test() -> int:
            f"W6: reported IDENTIFIABLE vs computed OVER_SATURATED should "
            f"be MALFORMED, got {r6}")
 
+        # W7b: negative total_fitted_parameters → MALFORMED.
+        # Without this guard, -5/6 = -0.83 silently computes
+        # IDENTIFIABLE.
+        f7b = os.path.join(d, "w7b.yaml")
+        with open(f7b, "w") as f:
+            f.write(
+                "total_independent_targets: 6\n"
+                "total_fitted_parameters: -5\n"
+                "verdict: IDENTIFIABLE\n"
+            )
+        r7b = validate_identifiability_a_priori(f7b)
+        ok(r7b["verdict"] == "MALFORMED"
+           and any("non-negative" in e for e in r7b["errors"]),
+           f"W7b: negative fitted params should be MALFORMED, got {r7b}")
+
         # W7: accept_decorative without details → MALFORMED
         f7 = os.path.join(d, "w7.yaml")
         with open(f7, "w") as f:
@@ -358,7 +379,12 @@ def main() -> int:
             for e in result["errors"]:
                 print(f"  - {e}", file=sys.stderr)
 
-    return 0 if result["verdict"] == "IDENTIFIABLE" else 1
+    # Exit 0 for IDENTIFIABLE (proceed) and MARGINAL (proceed with
+    # caveats — documented as advisory). Exit 1 for OVER_SATURATED,
+    # MALFORMED, MISSING (callers must redesign or supply the
+    # artifact). Mirrors the documented severity contract: MARGINAL
+    # is MEDIUM advisory, not blocking.
+    return 0 if result["verdict"] in {"IDENTIFIABLE", "MARGINAL"} else 1
 
 
 if __name__ == "__main__":

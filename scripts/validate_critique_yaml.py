@@ -2416,13 +2416,25 @@ def _check_identifiability_a_priori(run_dir: str,
     """Phase 15 α: validate models/identifiability_a_priori.yaml.
 
     Emits:
-      identifiability_a_priori_missing  MEDIUM @ r=2, HIGH @ r≥3
-      identifiability_a_priori_invalid  HIGH (yaml MALFORMED)
-      pre_model_over_saturated          HIGH (verdict OVER_SATURATED
-                                              without resolution)
-      pre_model_marginal_identifiability MEDIUM (verdict MARGINAL)
-      pre_model_decorative_undocumented HIGH (resolution=accept_decorative
-                                               without details)
+      identifiability_a_priori_missing       MEDIUM @ r=2, HIGH @ r≥3
+      identifiability_a_priori_invalid       HIGH (yaml MALFORMED)
+      pre_model_over_saturated               HIGH (OVER_SATURATED
+                                                   without resolution)
+      pre_model_over_saturated_with_commitment
+                                             MEDIUM (OVER_SATURATED
+                                                     with documented
+                                                     resolution.decision)
+      pre_model_marginal_identifiability     MEDIUM (verdict MARGINAL)
+      pre_model_decorative_undocumented      HIGH (resolution=
+                                                   accept_decorative
+                                                   without details)
+
+    Round gating: returns [] when round_n is None (caller has not
+    supplied a round; defer) or round_n < required_round (drafting
+    window). Applies uniformly to missing-artifact AND present-artifact
+    branches — the artifact is in flux during round 1 and shouldn't
+    fire MEDIUM advisories until the modeler has had a full round to
+    refine it.
 
     The pre_model_* kinds are NOT scope-declarable via
     sanity_check_acknowledged or scope_declaration.yaml. Architecture
@@ -2433,14 +2445,20 @@ def _check_identifiability_a_priori(run_dir: str,
     declarable contract is enforced by structural omission of that
     call, not by a runtime check.
     """
+    # Round gating applies uniformly to all branches. Round 1 is the
+    # drafting window; round_n=None means the caller hasn't supplied a
+    # round (defer). Both produce silent passes regardless of artifact
+    # state — without this, MEDIUM advisories fire spuriously when a
+    # planner produces a draft artifact at round 1.
+    if round_n is None:
+        return []
+    if round_n < _IDENTIFIABILITY_A_PRIORI_REQUIRED_FROM_ROUND:
+        return []
+
     yaml_path = os.path.join(run_dir, "models",
                              "identifiability_a_priori.yaml")
 
     if not os.path.exists(yaml_path):
-        if round_n is None:
-            return []  # Round unknown; defer to caller.
-        if round_n < _IDENTIFIABILITY_A_PRIORI_REQUIRED_FROM_ROUND:
-            return []  # Drafting window; silent.
         # At r≥2 the artifact is required. Severity escalates to HIGH
         # at r≥3 to align with Phase 12 β's persistence ledger.
         severity = "HIGH" if round_n >= 3 else "MEDIUM"
@@ -2472,12 +2490,12 @@ def _check_identifiability_a_priori(run_dir: str,
         )
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-    # Narrow exception scope per Phase 13/14 review-fix convention:
-    # ImportError covers spec_from_file_location / exec_module failures,
-    # OSError covers missing/unreadable script files, AttributeError
-    # covers loader-spec API misuse. Bare `except Exception` would also
-    # swallow KeyboardInterrupt / SystemExit, which is undesirable.
-    except (ImportError, OSError, AttributeError) as e:
+    # Bare `except Exception` matches the 8 other importlib loaders in
+    # this file. A narrower (ImportError, OSError, AttributeError) tuple
+    # would let SyntaxError escape and crash the validator if the loaded
+    # script ever has invalid Python. KeyboardInterrupt/SystemExit are
+    # not Exception subclasses, so they still propagate.
+    except Exception as e:
         return [{
             "kind": "identifiability_a_priori_invalid",
             "severity": "HIGH",
@@ -2510,12 +2528,14 @@ def _check_identifiability_a_priori(run_dir: str,
                           f"architectures must be justified (100-300 "
                           f"words). Errors: {'; '.join(errors)}"),
             }]
-        # Generic missing-resolution case: the YAML's verdict is
-        # OVER_SATURATED but no resolution decision was provided.
-        # Fire as pre_model_over_saturated to match the user-facing
-        # contract (the issue is over-saturation, not malformed YAML).
-        if (result.get("computed_verdict") == "OVER_SATURATED"
-                and any("requires a `resolution`" in e for e in errors)):
+        # Generic missing-resolution case: dispatch on computed_verdict
+        # so the user-facing kind matches the actual problem (over-
+        # saturation or marginality), not "malformed YAML". MARGINAL
+        # missing-resolution is MEDIUM advisory; OVER_SATURATED is HIGH.
+        missing_resolution = any(
+            "requires a `resolution`" in e for e in errors)
+        if (missing_resolution
+                and result.get("computed_verdict") == "OVER_SATURATED"):
             s = result.get("summary", {})
             return [{
                 "kind": "pre_model_over_saturated",
@@ -2533,6 +2553,24 @@ def _check_identifiability_a_priori(run_dir: str,
                     f"(c) downgrade to analytical model, or "
                     f"(d) accept_decorative with 100-300 word justification. "
                     f"NOT scope-declarable."
+                ),
+            }]
+        if (missing_resolution
+                and result.get("computed_verdict") == "MARGINAL"):
+            s = result.get("summary", {})
+            return [{
+                "kind": "pre_model_marginal_identifiability",
+                "severity": "MEDIUM",
+                "stage": "PRE_MODEL",
+                "claim": (
+                    f"Pre-model identifiability arithmetic flags "
+                    f"MARGINAL: {s.get('n_fitted', 0)} fitted / "
+                    f"{s.get('n_targets', 0)} targets = "
+                    f"{s.get('ratio', 0):.2f}× ratio (1.0-3.0 band). "
+                    f"`resolution` field is missing. The model is at "
+                    f"risk for ridge-trapped parameters; document the "
+                    f"mitigation (or acknowledge the risk) in "
+                    f"resolution.decision."
                 ),
             }]
         return [{
@@ -4876,6 +4914,44 @@ def _run_self_test() -> int:
            f"with_commitment, got {v}")
 
     with _tempfile.TemporaryDirectory() as _d:
+        # I3b: MARGINAL with resolution → MEDIUM pre_model_marginal_identifiability
+        os.makedirs(os.path.join(_d, "models"))
+        with open(os.path.join(_d, "models",
+                               "identifiability_a_priori.yaml"), "w") as f:
+            _yaml.safe_dump({"total_independent_targets": 6,
+                             "total_fitted_parameters": 12,
+                             "verdict": "MARGINAL",
+                             "resolution": {
+                                 "decision": "tie_params_partial",
+                                 "details": "ridge-trapping acknowledged"}},
+                            f)
+        v = _check_identifiability_a_priori(_d, round_n=2)
+        ok(any(x["kind"] == "pre_model_marginal_identifiability"
+               and x["severity"] == "MEDIUM" for x in v),
+           f"I3b: MARGINAL verdict should fire MEDIUM "
+           f"pre_model_marginal_identifiability, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # I3c: MARGINAL without resolution → MEDIUM (not HIGH-invalid).
+        # Severity must match the documented contract; missing resolution
+        # is the same class of issue as having one — the difference is
+        # only in the claim text.
+        os.makedirs(os.path.join(_d, "models"))
+        with open(os.path.join(_d, "models",
+                               "identifiability_a_priori.yaml"), "w") as f:
+            _yaml.safe_dump({"total_independent_targets": 6,
+                             "total_fitted_parameters": 12,
+                             "verdict": "MARGINAL"}, f)
+        v = _check_identifiability_a_priori(_d, round_n=2)
+        ok(any(x["kind"] == "pre_model_marginal_identifiability"
+               and x["severity"] == "MEDIUM" for x in v),
+           f"I3c: MARGINAL no-res should fire MEDIUM (not HIGH "
+           f"identifiability_a_priori_invalid), got {v}")
+        ok(not any(x["kind"] == "identifiability_a_priori_invalid"
+                   for x in v),
+           f"I3c: MARGINAL no-res must NOT fire HIGH invalid, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
         # I4: IDENTIFIABLE → silent (no violations)
         os.makedirs(os.path.join(_d, "models"))
         with open(os.path.join(_d, "models",
@@ -4941,6 +5017,24 @@ def _run_self_test() -> int:
            f"I5b: scope_declared on kind should NOT silence HIGH "
            f"pre_model_over_saturated (architecture is inside pipeline "
            f"reach), got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # I6: round gating — present artifact with non-IDENTIFIABLE
+        # verdict at round_n=1 (drafting window) or round_n=None (caller
+        # didn't supply round) must be silent. Without this, the
+        # planner's round-1 draft fires spurious MEDIUM advisories.
+        os.makedirs(os.path.join(_d, "models"))
+        with open(os.path.join(_d, "models",
+                               "identifiability_a_priori.yaml"), "w") as f:
+            _yaml.safe_dump({"total_independent_targets": 6,
+                             "total_fitted_parameters": 40,
+                             "verdict": "OVER_SATURATED",
+                             "resolution": {"decision": "tie_params_by_ecotype",
+                                            "details": "5 ecotypes"}}, f)
+        ok(_check_identifiability_a_priori(_d, round_n=1) == [],
+           "I6: round_n=1 must be silent even for OVER_SATURATED artifact")
+        ok(_check_identifiability_a_priori(_d, round_n=None) == [],
+           "I6: round_n=None must be silent even for OVER_SATURATED artifact")
 
     # --- Summary ---
     if failures:
