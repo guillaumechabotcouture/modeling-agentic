@@ -215,6 +215,11 @@ def _load_authoritative(run_dir: str) -> dict:
         "n_allocated_lgas": None,        # rows with cost > 0
         "package_counts": {},            # {dual_ai: 106, pbo: 17, ...}
         "zone_budget_shares": {},        # {NW: 0.781, NC: 0.108, ...}
+        # Phase 14 review fix: relative path of the allocation CSV
+        # actually consulted (resolved via canonical_csv → legacy →
+        # alphabetical fallback). Surfaced in violation messages so
+        # users debugging a flagged drift see the right file name.
+        "alloc_source": None,
     }
 
     summary_path = os.path.join(run_dir, "models", "optimization_summary.json")
@@ -330,6 +335,8 @@ def _load_authoritative(run_dir: str) -> dict:
                             zone_costs[z] = zone_costs.get(z, 0.0) + c
                 if n_allocated > 0:
                     auth["n_allocated_lgas"] = n_allocated
+                    auth["alloc_source"] = os.path.relpath(
+                        alloc_path, start=run_dir)
                 if pkg_counts:
                     auth["package_counts"] = pkg_counts
                 if zone_costs and total_cost > 0:
@@ -669,7 +676,7 @@ def _check_count_drift(run_dir: str, auth: dict,
                     out.append(_build_violation(
                         kind, sev,
                         f"{fname} reports {n} LGAs but "
-                        f"models/allocation_result.csv shows "
+                        f"{auth.get("alloc_source") or "models/allocation_result.csv"} shows "
                         f"{auth_n_lga} allocated "
                         f"({drift*100:.1f}% drift). Context: "
                         f"\"...{ctx.strip()[:120]}...\"."
@@ -687,7 +694,7 @@ def _check_count_drift(run_dir: str, auth: dict,
                 out.append(_build_violation(
                     kind, sev,
                     f"{fname} reports {n} {pkg_norm} LGAs but "
-                    f"models/allocation_result.csv shows "
+                    f"{auth.get("alloc_source") or "models/allocation_result.csv"} shows "
                     f"{auth_count} ({drift*100:.1f}% drift). "
                     f"Context: \"...{ctx.strip()[:120]}...\"."
                 ))
@@ -753,7 +760,7 @@ def _check_count_drift(run_dir: str, auth: dict,
                         kind, sev,
                         f"{fname} reports {share*100:.1f}% of budget "
                         f"for {matched_zone} but "
-                        f"models/allocation_result.csv shows "
+                        f"{auth.get("alloc_source") or "models/allocation_result.csv"} shows "
                         f"{auth_share*100:.1f}% "
                         f"({drift*100:.1f}% drift). Context: "
                         f"\"...{ctx.strip()[:120]}...\"."
