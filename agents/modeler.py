@@ -1,5 +1,17 @@
 """Modeler: build, run, and validate models. Code-focused, not analysis."""
 
+import os
+import sys
+
+# Single source of truth for the rigor artifact timeline. The table in
+# the SYSTEM_PROMPT below is rendered from .claude/orchestration/
+# rigor_artifacts.yaml at import time, so adding/changing artifacts is
+# a one-file edit (the manifest) instead of a four-file edit (manifest
+# + this prompt + validator + CLAUDE.md ledger).
+sys.path.insert(0, os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "..", "scripts")))
+from lib.rigor_artifacts import render_timeline_markdown  # noqa: E402
+
 DESCRIPTION = (
     "Model builder. Writes code, runs models, produces metrics and figures. "
     "Give it a run directory with plan.md and data. "
@@ -52,9 +64,18 @@ Key principles:
 1. Read {run_dir}/plan.md for candidate models and checklist.
 2. Read {run_dir}/hypotheses.md to understand what the models must test.
 3. Read {run_dir}/data_quality.md and EDA output to understand the data.
-4. Read any critique feedback files ({run_dir}/critique_*.md) if this is
+4. **Read {run_dir}/pre_mortem.yaml (Phase 17 α — REQUIRED).** This is
+   the pre-mortem domain critic's output, written before you were
+   spawned. It lists HIGH-impact concerns (architecture, data,
+   feasibility, blind spots, expert priors) the modeler must address
+   BEFORE building. For each HIGH concern: address it in
+   modeling_strategy.md § Pre-mortem Responses, or scope-declare it in
+   scope_declaration.yaml with explicit justification. Then update
+   pre_mortem.yaml's `addressed_in:` field on each concern to point to
+   the exact section. Unaddressed HIGH at round ≥ 2 blocks ACCEPT.
+5. Read any critique feedback files ({run_dir}/critique_*.md) if this is
    a revision round.
-5. **Check for existing implementations you can build on.**
+6. **Check for existing implementations you can build on.**
    Read the "Existing Code and Implementations" section of plan.md.
    Also consider searching GitHub yourself (`gh search repos`) or
    checking whether papers in the literature review published their code.
@@ -64,10 +85,15 @@ Key principles:
    superinfection) where getting the equations right takes years of
    domain expertise. Note what you found in modeling_strategy.md and
    whether you're building on existing code or starting fresh (and why).
-6. Write {run_dir}/modeling_strategy.md with Level 0 feasibility check.
+7. Write {run_dir}/modeling_strategy.md with Level 0 feasibility check.
    Include: which existing code you found, what you're adapting from,
-   what modifications are needed.
-7. Build Level 1 minimal model first. Assess. Then decide whether to
+   what modifications are needed. **Add a `## Pre-mortem Responses`
+   section** with one subsection per HIGH concern from pre_mortem.yaml.
+   Each subsection: quote the concern (one line), state response
+   (ADDRESSED / SCOPE_DECLARED / DEFERRED), point to the specific
+   plan/model/analysis change that resolves it (or the scope-declaration
+   entry).
+8. Build Level 1 minimal model first. Assess. Then decide whether to
    proceed to Level 2 or stop.
 
 ## Modeling Rules
@@ -503,17 +529,7 @@ same trap in earlier runs. **Draft each artifact at its earliest
 defensible round so per-round critique can iterate** — that is the
 entire point of having multiple critique rounds.
 
-| Artifact | First draft | Finalize | What "draft" means |
-|---|---|---|---|
-| `models/identifiability_a_priori.yaml` | **r1 (PRE-MODEL)** | r2 | **PRE-MODEL** (Phase 15 α). Count free fitted parameters vs independent calibration targets. Verdict IDENTIFIABLE if ratio < 1, MARGINAL if 1-3, OVER_SATURATED if > 3. **NOT scope-declarable at OVER_SATURATED — architecture must be fixed.** Required BEFORE the first MODEL stage spawn. See the `pre-model-identifiability-arithmetic` skill. |
-| `models/outcome_fn.py` | r1-2 | r3 | Calibration callable returning a single deterministic outcome dict; can be coarse. |
-| `models/model_comparison.yaml` | r1-2 | r3 | At least null + simple + full candidate; AIC/BIC can be approximate. |
-| `models/identifiability.yaml` | r1-2 | r3 | Manifest with point estimates + bounds; loss function pointwise (see §3 contract). |
-| `models/sensitivity_analysis.yaml` | **r2-3** | r6-7 | After your FIRST optimizer pass; 2 load-bearing parameters, one alternative value each. Expand perturbations and tighten verdicts in later rounds. |
-| `models/allocation_robustness.yaml` | r3-4 | r6 | Leave-one-archetype-out CV on the draft allocation; per-fold metrics may be coarse initially. |
-| `models/within_zone_heterogeneity.yaml` | r3-4 | r6 | Required when `calibration_units / allocation_units < 0.1` (Phase 12 γ). The 0013/104914 runs had 6 zones → 774 LGAs; within-zone PfPR varies 5.9-77.3%. Bound the impact loss with a perturbation re-run. See the `ecological-fallacy-quantification` skill. |
-| `models/sanity_schema.yaml` | r2-3 | r6 | Disease-agnostic structural sanity manifest (Phase 13 α). Declares abstract slots (outcome, exposure, shares, derived-consistency formulas, composite-dimension windows, counterfactual ratio, structural-uncertainty carry-forward, outlier sniff). Eight generic checks via `scripts/sanity_checks.py`. Each failed check emits MEDIUM advisory; explicit exemptions go in `scope_declaration.yaml` under `sanity_check_acknowledged`. See the `sanity-schema` skill. |
-| `decision_rule.md` | r6-7 | r7 | Derived from finalized allocation; this one is genuinely late by construction. |
+__RIGOR_TIMELINE_TABLE__
 
 When the rigor gate fires MEDIUM `*_missing` in an early round, treat
 it as a nudge to draft the artifact, not as a blocker to ignore. The
@@ -968,5 +984,11 @@ The expensive part is building `outcome_fn` and fitting ≥3 candidate
 structures. Design for this from the start — don't tack it on at the
 end of a round.
 """
+
+# Splice the rigor-artifact timeline table into the prompt at module
+# load. Sentinel-replace (not str.format) preserves the literal
+# `{run_dir}` placeholders that main.py substitutes per-run.
+SYSTEM_PROMPT = SYSTEM_PROMPT.replace(
+    "__RIGOR_TIMELINE_TABLE__", render_timeline_markdown())
 
 

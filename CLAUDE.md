@@ -105,6 +105,8 @@ skill changes are listed below; bug fixes are not.
 | 13    | α, β   | Disease-agnostic sanity schema (`scripts/sanity_checks.py` + skill, 8 internal-only structural checks); α numeric_consistency extended to `decision_rule.md` and new token classes (LGA counts, package counts, budget shares) |
 | 14    | α, β   | Universe-completeness sanity check (cross-checks schema's `allocation.units_total` vs allocation CSV row count); exact-match opt-in for integer counts (`exact_counts: [lga_count, package_count]` schema field), `report.md` added to count-drift scan list, `allocation.canonical_csv` field for multi-scenario runs, column-name tolerance |
 | 15    | α, β, γ | A-priori identifiability arithmetic — first **PRE-MODEL** rigor gate. α: `models/identifiability_a_priori.yaml` (params/targets ratio, verdict IDENTIFIABLE/MARGINAL/OVER_SATURATED) required before MODEL stage spawns; OVER_SATURATED is **not scope-declarable** — architecture must be fixed at strategy time (inverts Phase 12-14's scope-declare-anything semantics for one class); new `pre-model-identifiability-arithmetic` skill teaches the 30-second arithmetic. β: STAGE 3 lead prompt rewritten with three branches (IDENTIFIABLE/MARGINAL/OVER_SATURATED); validator self-tests I1/I1b (round-gated missing-artifact MEDIUM/HIGH), I2 (OVER_SATURATED-without-resolution → HIGH), I3 (OVER_SATURATED-with-commitment → MEDIUM), I3b/I3c (MARGINAL with/without resolution → MEDIUM), I4 (IDENTIFIABLE silent), I5/I5b (AST-based structural enforcement plus behavioral check that scope_declaration cannot silence the HIGH), I6 (round_n=1/None silent for non-IDENTIFIABLE artifacts). γ: skill cross-references in `modeling-strategy`, `identifiability-analysis` (post-hoc as backstop), `mechanistic-vs-hybrid-architecture` (when to abandon HYBRID), `multi-structural-comparison` (pre-build complement) |
+| 16    | α      | **Architecture, not a new gate.** Rigor-artifact manifest extracted to `.claude/orchestration/rigor_artifacts.yaml` as the single source of truth for artifact paths, draft/finalize rounds, scope-declarability, and skill cross-references. New `scripts/lib/rigor_artifacts.py` exposes `artifact_path()` / `produced_path()` / `render_timeline_markdown()`. `agents/modeler.py` SYSTEM_PROMPT renders the timeline table from the manifest at module load (sentinel substitution). `scripts/validate_critique_yaml.py` resolves all 11 rigor-artifact paths through the manifest instead of ~12 hardcoded `os.path.join(run_dir, "models", "<name>.yaml")` constants. Phase 16+ artifact additions are now a one-file YAML edit instead of ≥5 synchronized changes (manifest + modeler prompt + validator + skill + ledger). |
+| 17    | γ, α, β, δ | **Adversarial restructure.** Targets the three error classes that survived ACCEPT in 2026-04-29_161312: (1) paraphrase/label drift across files, (2) self-contradicting artifacts after patches, (3) real-world plausibility (procurement, supply, vintage). γ: `.claude/orchestration/expert_priors.yaml` — 10-prior cross-run institutional memory (Nigeria GBD 12.8M DALYs, global PBO LLIN supply ceiling, GC7 disaggregation, MAP API auth, OR-to-RR Zhang-Yu, multiplicative-independence pitfall, etc.); new `scripts/lib/expert_priors.py` loader with question-keyword + decision-year matchers. α: new `agents/critique_premortem.py` agent + `pre-mortem-domain` skill — clean-slate adversarial critic spawned in PRE-MODEL window (STAGE 3, parallel to identifiability_a_priori). Reads only plan.md + hypotheses.md + matching priors; emits `pre_mortem.yaml` with HIGH-impact concerns categorized ARCHITECTURE/DATA/FEASIBILITY/BLIND_SPOT/EXPERT_PRIOR. Modeler must address each HIGH in `modeling_strategy.md § Pre-mortem Responses` (or scope-declare). 6 validator self-tests (PM1-PM6). β: new `scripts/coherence_audit.py` — three duties (label coherence, cross-file count/cost, self-contradicting artifacts) reusing `_scan_*` primitives from `numeric_consistency.py`. Runs alongside `writer_qa.py` post-WRITE. Validator integration via `_check_coherence_audit` (5 self-tests CA1-CA6) with Phase 10 ψ-style MEDIUM consolidation per duty. Retro on 2026-04-29_161312 fires 8 HIGH label_coherence (R-019), 1 HIGH cross_file_counts (R-005), 1 MEDIUM self_contradicting (M-010). δ: priors registry rides on **literature consensus**, not reviewer judgment. Schema upgrade adds `literature_corroboration: list[Citation]` (≥2 for MEDIUM, ≥3 for HIGH; primary/corroborating/supporting/contextual relevance) and `last_literature_check` per prior. New `auto_validation:` config block (per-severity min sources + max age). New `validate_priors()` (structural — no network) emits issues for insufficient_sources / stale / no_primary_source / unverified_doi; warnings auto-flow into pre-mortem agent spawn prompt via `validation_warnings_for_pre_mortem()`. New `retro_test(run_dir)` walks past critique markdowns and reports coverage of expert-prior-class blockers. New CLI `--validate`, `--match-yaml` (YAML with full corroboration for spawn injection), `--retro-test`, `--enrich-suggestions`. 10 priors re-corroborated with 2-3 cited sources each. Retro-test on 2026-04-29_161312: **87.5% coverage on expert-prior-class blockers** (caught R-007/R-009/R-010/R-011/R-012/R-014/R-018); on 2026-04-28_224202: 100% (D-008). |
 
 ## Conventions
 
@@ -121,21 +123,28 @@ skill changes are listed below; bug fixes are not.
   gate, the PR description includes a retro-check against the most
   recent `runs/` directory showing the gate produces the expected
   output. See PR #1 / #2 / #3 for examples.
-- **Rigor-artifact timeline**: see `agents/modeler.py` § 4 for which
-  artifacts are due at which round. Phase 10 ψ added round-aware
-  consolidation: missing artifacts within their drafting window
-  produce 1 MEDIUM `allocation_rigor_in_progress`, not 5 separate
-  `*_missing` MEDIUMs.
+- **Rigor-artifact timeline**: the source of truth is
+  `.claude/orchestration/rigor_artifacts.yaml` (Phase 16 α).
+  `agents/modeler.py` § 4 renders that manifest into a markdown table
+  at module load; `scripts/validate_critique_yaml.py` resolves
+  artifact paths via `lib.rigor_artifacts.artifact_path()`. To add a
+  Phase N+1 artifact, edit the manifest and add the validator check;
+  the prompt, ledger, and skill links will pull from the manifest.
+  Phase 10 ψ's round-aware consolidation (1 `allocation_rigor_in_progress`
+  MEDIUM in window vs 5 separate `*_missing`) still applies.
 
 ## How to verify changes end-to-end
 
 Before opening a PR:
 
 ```bash
-# All ten self-tests must report "OK: all self-test cases passed."
+# All thirteen self-tests must report "OK: all self-test cases passed."
+python3 scripts/coherence_audit.py --self-test             # Phase 17 β
 python3 scripts/figure_validator.py --self-test
 python3 scripts/identifiability.py --self-test
 python3 scripts/identifiability_a_priori.py --self-test    # Phase 15 α
+python3 scripts/lib/expert_priors.py --self-test           # Phase 17 γ
+python3 scripts/lib/rigor_artifacts.py --self-test         # Phase 16 α
 python3 scripts/numeric_consistency.py --self-test         # Phase 12 α
 python3 scripts/sanity_checks.py --self-test               # Phase 13 α
 python3 scripts/sensitivity_analysis.py --self-test
