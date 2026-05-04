@@ -251,13 +251,16 @@ def _scan_dollar_amount_with_package(doc_text: str) -> list[dict]:
                 amt *= 1_000_000
             elif unit in ("k", "thousand"):
                 amt *= 1_000
-            else:
-                # No unit suffix. Bare dollar amounts < $1M are
-                # almost always per-unit ratios ($/DALY, $/case,
-                # $/person) or per-person costs ($1.20/person/yr),
-                # not portfolio claims worth checking against the
-                # CSV. Phase 17 ε: skip these to eliminate the
-                # 115318-retro false-positive class.
+            elif amt < 1_000_000:
+                # No unit suffix AND amount < $1M: almost always a
+                # per-unit ratio ($/DALY, $/case, $/person) or per-
+                # person cost ($1.20/person/yr), not a portfolio claim
+                # worth checking against the CSV. Phase 17 ε: skip
+                # these to eliminate the 115318-retro false-positive
+                # class. Bare amounts ≥ $1M (e.g., "$320,000,000")
+                # are kept — they are rare but legitimate portfolio
+                # claims when prose writes the integer instead of
+                # using an M suffix.
                 continue
             # Wider context window for filtering
             ctx_start = max(0, m.start() - 80)
