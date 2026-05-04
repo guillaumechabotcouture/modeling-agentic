@@ -1,7 +1,9 @@
-"""Phase 17 β — Coherence audit.
+"""Phase 17 β + Phase 18 β — Coherence audit.
 
-Standalone post-WRITE validator that catches the residual drift class
-that survived to ACCEPT in the 2026-04-29_161312 run:
+Standalone post-WRITE validator. Phase 17 β shipped duties 1-3
+catching the residual drift class that survived to ACCEPT in the
+2026-04-29_161312 run; Phase 18 β added duty 4 (ledger binding) to
+catch unbound prose against `models/claims_ledger.yaml`:
 
   Duty 1 (label coherence): verdict labels in prose contradict the
     canonical YAML source (R-019: decision_rule.md says "UNSTABLE"
@@ -16,6 +18,13 @@ that survived to ACCEPT in the 2026-04-29_161312 run:
     YAML contradict structured fields in the same file (M-010:
     identifiability.yaml notes claim seasonal_amplitude "converged
     to 0.1" while `point_estimate: 0.8702`).
+
+  Duty 4 (ledger binding, Phase 18 β + δ): every currency, scalar,
+    percentage, count, and verdict label in `report.md` must appear
+    in `models/claims_ledger.yaml`'s rendered values OR within 5%
+    proximity of a ledger numeric. Raw surviving `[CLAIM:id]` tokens
+    are also flagged HIGH. No-op when the ledger is absent (the
+    `_check_claims_ledger_present` validator fires separately).
 
 The auditor runs after WRITE, alongside `scripts/writer_qa.py`. It
 emits `coherence_audit.yaml` at run_dir root. The validator
@@ -624,8 +633,46 @@ def _audit_self_contradicting(run_dir: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Duty 4 — Ledger binding (Phase 18 β)
+# Duty 4 — Ledger binding (Phase 18 β + δ)
 # ---------------------------------------------------------------------------
+
+# 5% proximity: a prose value within ±5% of any ledger numeric value
+# is considered bound. Phase 18 δ — the original implementation
+# claimed this in a comment but only checked exact-string matches.
+_PROXIMITY_TOLERANCE = 0.05
+
+# Generic-use qualifiers for verdict labels — when these phrases
+# appear in the 25-char window around a label match, the label is
+# treated as English usage, not a verdict claim. Phase 18 δ extends
+# the original (robust to / sensitive analysis / sensitivity
+# analysis) with common methodology phrases that produce false
+# positives ("supported by WHO guidelines", "refuted by recent
+# evidence", "inconclusive evidence").
+_LEDGER_BINDING_GENERIC_USE_QUALIFIERS = (
+    "robust to", "robust against", "robust standard",
+    "sensitive to", "sensitive analysis", "sensitive parameters",
+    "sensitivity analysis",
+    "supported by", "supported in", "supported via",
+    "refuted by", "refuted in",
+    "inconclusive evidence", "inconclusive results",
+)
+
+
+def _within_proximity(value: float,
+                       bound_numeric_values: set[float],
+                       tolerance: float = _PROXIMITY_TOLERANCE) -> bool:
+    """Return True if `value` is within `tolerance` of any value in
+    `bound_numeric_values`. Used by `_audit_ledger_binding` so that
+    legitimate prose rounding ("$197M" when ledger has $197.8M) does
+    not fire spurious HIGH violations."""
+    if not bound_numeric_values:
+        return False
+    abs_value = abs(value)
+    for bv in bound_numeric_values:
+        denom = max(abs_value, abs(bv), 1.0)
+        if abs(value - bv) / denom <= tolerance:
+            return True
+    return False
 
 
 def _audit_ledger_binding(run_dir: str) -> list[dict]:
@@ -638,8 +685,23 @@ def _audit_ledger_binding(run_dir: str) -> list[dict]:
     This duty scans the rendered report for numbers/labels and
     confirms each appears as a ledger value.
 
-    Returns HIGH for unbound numbers/labels, MEDIUM consolidated
-    advisory for moderate drift counts.
+    Scans:
+      - Currency amounts ("$320M", "$320,000,000")
+      - Bare scalars with M/K/B suffix ("7.47M DALYs")
+      - Standalone percentages ("52.5%")
+      - Verdict labels ("ROBUST" / "SENSITIVE" / "SUPPORTED" etc.)
+      - Raw `[CLAIM:id]` tokens (Phase 18 δ — catches skipped renders)
+
+    Matching:
+      - Verbatim string match against pre-computed renderings
+      - Numeric proximity match: a prose value within 5% of any
+        ledger numeric is considered bound (handles legitimate
+        rounding like "$197M" when ledger has $197.8M)
+      - Generic-use qualifier list filters non-claim contexts
+        ("sensitivity analysis", "supported by", etc.)
+
+    Returns HIGH per unbound number/label/raw-token. Per-duty
+    consolidation happens in `_check_coherence_audit` (Phase 10 ψ).
 
     If `claims_ledger.yaml` is absent, this duty is a no-op (the
     `_check_claims_ledger_present` check will fire separately).
@@ -664,6 +726,11 @@ def _audit_ledger_binding(run_dir: str) -> list[dict]:
     # as "7.47M", "7.5M", "7,467,997", etc. We index multiple
     # renderings to make matching robust.
     bound_values: set[str] = set()
+    # Parallel set of canonical numeric values. The 5% proximity
+    # check (Phase 18 δ) compares prose-extracted numbers against
+    # this set to handle legitimate rounding ("$197M" when ledger
+    # has $197.8M) without firing false positives.
+    bound_numeric_values: set[float] = set()
     for c in ledger_claims:
         if not isinstance(c, dict):
             continue
@@ -679,6 +746,7 @@ def _audit_ledger_binding(run_dir: str) -> list[dict]:
                 fv = float(v)
             except (TypeError, ValueError):
                 continue
+            bound_numeric_values.add(fv)
             # Magnitude-suffix renderings at multiple precisions
             for divisor, suffix in (
                 (1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K"),
@@ -698,6 +766,7 @@ def _audit_ledger_binding(run_dir: str) -> list[dict]:
                 fv = float(v)
             except (TypeError, ValueError):
                 continue
+            bound_numeric_values.add(fv)
             for prec in (0, 1, 2):
                 bound_values.add(f"{fv:.{prec}f}%")
         elif kind == "label":
@@ -708,6 +777,7 @@ def _audit_ledger_binding(run_dir: str) -> list[dict]:
             try:
                 bound_values.add(str(int(v)))
                 bound_values.add(f"{int(v):,}")
+                bound_numeric_values.add(float(int(v)))
             except (TypeError, ValueError):
                 pass
         # Add CI-bound endpoints too (so "5.14M" in prose is
@@ -722,6 +792,7 @@ def _audit_ledger_binding(run_dir: str) -> list[dict]:
             except (TypeError, ValueError):
                 continue
             bound_values.add(str(cv).strip())
+            bound_numeric_values.add(fcv)
             for divisor, suffix in (
                 (1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K"),
             ):
@@ -793,6 +864,12 @@ def _audit_ledger_binding(run_dir: str) -> list[dict]:
         if not is_bound:
             if str(int(scaled)) in bound_values or f"{int(scaled):,}" in bound_values:
                 is_bound = True
+        # Phase 18 δ: 5% proximity check — handles legitimate prose
+        # rounding ("$197M" when ledger has $197.8M). The comment
+        # block above promised this; the original implementation
+        # only had (a) and (c).
+        if not is_bound and _within_proximity(scaled, bound_numeric_values):
+            is_bound = True
         # Skip per-unit ratios + small bare amounts (already filtered
         # by cross_file_counts, but apply same logic here for parity)
         if amt < 1_000 and not unit:
@@ -836,14 +913,12 @@ def _audit_ledger_binding(run_dir: str) -> list[dict]:
         label_raw = m.group(1)
         upper = label_raw.upper()
         # Skip generic-use ("robust to perturbations", "sensitive
-        # analysis"); reuse same qualifiers as duty 1
+        # analysis", "supported by WHO", etc.). Phase 18 δ extended
+        # the list with methodology phrases that were producing
+        # false positives in the live retro.
         win = text[max(0, m.start() - 25):
                    min(len(text), m.end() + 25)].lower()
-        if any(q in win for q in (
-            "robust to", "robust against", "robust standard",
-            "sensitive to", "sensitive analysis", "sensitive parameters",
-            "sensitivity analysis",
-        )):
+        if any(q in win for q in _LEDGER_BINDING_GENERIC_USE_QUALIFIERS):
             continue
         if upper in bound_values:
             continue
@@ -864,6 +939,155 @@ def _audit_ledger_binding(run_dir: str) -> list[dict]:
             ),
             "canonical_source": "models/claims_ledger.yaml",
             "drifted_value": upper,
+        })
+
+    # Scan bare scalars with M/K/B suffix (Phase 18 δ — the original
+    # implementation only scanned currency. Bare scalars like
+    # "7.47M DALYs" are exactly the R-019 / R-020 motivating drift
+    # class; not catching them defeats the purpose).
+    pat_scalar = re.compile(
+        r"(?<![\$\d])(\d+(?:\.\d+)?)\s*(M|million|K|k|B|billion)\b",
+        re.IGNORECASE,
+    )
+    for m in pat_scalar.finditer(text):
+        try:
+            amt = float(m.group(1))
+        except ValueError:
+            continue
+        unit = (m.group(2) or "").lower()
+        if unit in ("m", "million"):
+            scaled = amt * 1_000_000
+        elif unit in ("k",):
+            scaled = amt * 1_000
+        elif unit in ("b", "billion"):
+            scaled = amt * 1_000_000_000
+        else:
+            continue
+        # Skip if next 25 chars contain /DALY etc. (per-unit ratios)
+        ratio_suffix = text[m.end():
+                            min(len(text), m.end() + 25)].lower()
+        if any(s in ratio_suffix for s in
+               ("/daly", "/case", "/person", " per daly",
+                " per case", " per person")):
+            continue
+        # Bound if exact rendering match or 5% proximity
+        is_bound = False
+        for divisor, suffix in (
+            (1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K"),
+        ):
+            if abs(scaled) >= divisor:
+                for prec in (0, 1, 2, 3):
+                    s = f"{scaled / divisor:.{prec}f}".rstrip("0").rstrip(".") + suffix
+                    if s in bound_values:
+                        is_bound = True
+                        break
+            if is_bound:
+                break
+        if not is_bound and _within_proximity(scaled, bound_numeric_values):
+            is_bound = True
+        if is_bound:
+            continue
+        display = f"{m.group(1).strip()}{unit.upper() if unit in ('m','k','b') else 'M'}"
+        key = ("scalar", display)
+        if key in seen_unbound:
+            continue
+        seen_unbound.add(key)
+        line_no = text.count("\n", 0, m.start()) + 1
+        ctx_start = max(0, m.start() - 50)
+        ctx_end = min(len(text), m.end() + 50)
+        unbound.append({
+            "id": f"CA-LB-{len(unbound) + 1:03d}",
+            "severity": "HIGH",
+            "duty": "ledger_binding",
+            "location": f"report.md:{line_no}",
+            "claim": (
+                f"Scalar `{display}` in prose is not in claims_ledger.yaml. "
+                f"Phase 18 α requires every scalar/count to be "
+                f"`[CLAIM:id]`-referenced from the ledger. Context: "
+                f"…{text[ctx_start:ctx_end].replace(chr(10), ' ').strip()[:140]}…"
+            ),
+            "canonical_source": "models/claims_ledger.yaml",
+            "drifted_value": display,
+        })
+
+    # Scan standalone percentages (Phase 18 δ). Bound by exact
+    # rendering or 5% proximity.
+    pat_percent = re.compile(r"(?<![\d\.])(\d+(?:\.\d+)?)\s*%")
+    for m in pat_percent.finditer(text):
+        try:
+            pct = float(m.group(1))
+        except ValueError:
+            continue
+        # Skip generic-use percentages: "95% CI" / "95 % CI" /
+        # "95% confidence interval" / "ci coverage" — these are
+        # CI metadata, not claim values. Look at 25 chars after
+        # the match for `CI`, `confidence`, etc.
+        right_window = text[m.end():
+                            min(len(text), m.end() + 25)].lower()
+        if (right_window.startswith(" ci")
+                or right_window.startswith("ci")
+                or right_window.lstrip().startswith("ci ")
+                or right_window.lstrip().startswith("confidence")):
+            continue
+        win = text[max(0, m.start() - 30):
+                   min(len(text), m.end() + 30)].lower()
+        if any(q in win for q in ("ci coverage", "confidence interval")):
+            continue
+        is_bound = False
+        for prec in (0, 1, 2):
+            if f"{pct:.{prec}f}%" in bound_values:
+                is_bound = True
+                break
+        if not is_bound and _within_proximity(pct, bound_numeric_values):
+            is_bound = True
+        if is_bound:
+            continue
+        display = f"{m.group(1).strip()}%"
+        key = ("pct", display)
+        if key in seen_unbound:
+            continue
+        seen_unbound.add(key)
+        line_no = text.count("\n", 0, m.start()) + 1
+        unbound.append({
+            "id": f"CA-LB-{len(unbound) + 1:03d}",
+            "severity": "HIGH",
+            "duty": "ledger_binding",
+            "location": f"report.md:{line_no}",
+            "claim": (
+                f"Percentage `{display}` in prose is not in "
+                f"claims_ledger.yaml (no exact-rendering match and not "
+                f"within 5% of any ledger numeric)."
+            ),
+            "canonical_source": "models/claims_ledger.yaml",
+            "drifted_value": display,
+        })
+
+    # Scan for raw `[CLAIM:id]` tokens that escaped rendering (Phase
+    # 18 δ — catches the failure mode where the lead skips STAGE 8.1
+    # `python3 scripts/render_claims.py` and ships the writer's
+    # un-substituted draft as report.md). Any surviving token is a
+    # HIGH violation regardless of whether the id is in the ledger.
+    pat_raw_claim = re.compile(r"\[CLAIM:[A-Za-z0-9_]+\]")
+    for m in pat_raw_claim.finditer(text):
+        token = m.group(0)
+        key = ("raw_claim", token)
+        if key in seen_unbound:
+            continue
+        seen_unbound.add(key)
+        line_no = text.count("\n", 0, m.start()) + 1
+        unbound.append({
+            "id": f"CA-LB-{len(unbound) + 1:03d}",
+            "severity": "HIGH",
+            "duty": "ledger_binding",
+            "location": f"report.md:{line_no}",
+            "claim": (
+                f"Raw `{token}` reference survived in report.md — "
+                f"`scripts/render_claims.py` was not invoked or failed "
+                f"to substitute. Run STAGE 8.1: "
+                f"`python3 scripts/render_claims.py {{run_dir}}`."
+            ),
+            "canonical_source": "models/claims_ledger.yaml",
+            "drifted_value": token,
         })
 
     return unbound

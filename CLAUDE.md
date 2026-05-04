@@ -27,10 +27,11 @@ sub-agents and running mechanical rigor checks between rounds.
              ▼
 ┌────────────────────────────────────────────────────────────────┐
 │  RIGOR GATES  scripts/                                         │
-│  validate_critique_yaml.py (~4100 lines, 30+ _check_* fns)     │
+│  validate_critique_yaml.py — main gate, many _check_* fns      │
 │  + standalone validators: identifiability.py,                  │
 │  sensitivity_analysis.py, figure_validator.py,                 │
-│  spec_compliance.py, etc. Each script has --self-test.         │
+│  spec_compliance.py, coherence_audit.py, render_claims.py,     │
+│  etc. Every script under scripts/ has --self-test.             │
 └────────────┬───────────────────────────────────────────────────┘
              │
              ▼

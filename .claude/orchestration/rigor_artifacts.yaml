@@ -209,7 +209,7 @@ artifacts:
     path: models/claims_ledger.yaml
     first_draft_round: 1
     finalize_round: 3
-    stage: model
+    stage: analyze
     skill: investigation-threads
     triggered_by: always
     scope_declarable: false

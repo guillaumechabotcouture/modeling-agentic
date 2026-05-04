@@ -2893,12 +2893,16 @@ def _check_claims_ledger_present(run_dir: str,
         })
         return out
 
-    # Empty ledger at round ≥ required: still HIGH (analyst produced
-    # the file but registered zero claims, defeating the contract).
+    # Empty ledger: severity matches the missing-file gating to avoid
+    # penalizing the analyst who creates a partial file at r=2 more
+    # harshly than one who creates none. Phase 18 δ — the original
+    # logic fired HIGH unconditionally regardless of round.
     if not claims:
+        empty_severity = "HIGH" \
+            if round_n >= _CLAIMS_LEDGER_REQUIRED_FROM_ROUND else "MEDIUM"
         out.append({
             "kind": "claims_ledger_invalid",
-            "severity": "HIGH",
+            "severity": empty_severity,
             "stage": "ANALYZE",
             "claim": ("`models/claims_ledger.yaml` is present but contains "
                       "zero claims. Phase 18 α requires every quantitative "

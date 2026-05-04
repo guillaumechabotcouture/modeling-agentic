@@ -36,7 +36,8 @@ _MANIFEST_PATH = os.path.normpath(
                  ".claude", "orchestration", "rigor_artifacts.yaml")
 )
 
-_VALID_STAGES = frozenset({"pre_model", "model", "allocation", "write"})
+_VALID_STAGES = frozenset(
+    {"pre_model", "model", "analyze", "allocation", "write"})
 _VALID_TRIGGERS = frozenset({"always", "allocation", "aggregation_ratio_lt_0.1"})
 
 
