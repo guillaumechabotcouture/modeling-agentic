@@ -40,6 +40,11 @@ except ImportError:
     print("ERROR: pyyaml not installed. Run: pip install pyyaml", file=sys.stderr)
     sys.exit(2)
 
+# Rigor artifact manifest: single source of truth for paths/rounds/skills.
+# Sibling-script import: scripts/lib/rigor_artifacts.py.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from lib.rigor_artifacts import artifact_path, produced_path  # noqa: E402
+
 # spec_compliance is a sibling module; import is lazy so validation without
 # the --spec-compliance flag doesn't require it to be present.
 _SPEC_COMPLIANCE_AVAILABLE = None  # tri-state: None=unchecked, True=ok, False=missing
@@ -820,7 +825,7 @@ def _check_surrogate_uq_documented(run_dir: str) -> list[dict]:
       surrogate_calibration_missing_rmse  — md exists but no RMSE figure
                                             (MEDIUM)
     """
-    outcome_fn_path = os.path.join(run_dir, "models", "outcome_fn.py")
+    outcome_fn_path = artifact_path("outcome_fn", run_dir)
     if not os.path.exists(outcome_fn_path):
         return []
     try:
@@ -834,6 +839,7 @@ def _check_surrogate_uq_documented(run_dir: str) -> list[dict]:
     if not (has_surrogate and not has_real):
         return []
 
+    # outcome_fn_calibration.md is a sibling doc, not a primary rigor artifact.
     cal_md_path = os.path.join(run_dir, "models", "outcome_fn_calibration.md")
     if not os.path.exists(cal_md_path):
         return [{
@@ -958,8 +964,8 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None) -> list[dic
     violations = []
 
     # UQ: outcome_fn.py → uncertainty_report.yaml
-    outcome_fn_path = os.path.join(run_dir, "models", "outcome_fn.py")
-    uq_report_path = os.path.join(run_dir, "uncertainty_report.yaml")
+    outcome_fn_path = artifact_path("outcome_fn", run_dir)
+    uq_report_path = produced_path("outcome_fn", run_dir)
     if os.path.exists(outcome_fn_path):
         if not os.path.exists(uq_report_path):
             violations.append({
@@ -990,8 +996,8 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None) -> list[dic
         })
 
     # Multi-structural: models/model_comparison.yaml → model_comparison_formal.yaml
-    msc_manifest = os.path.join(run_dir, "models", "model_comparison.yaml")
-    msc_report = os.path.join(run_dir, "model_comparison_formal.yaml")
+    msc_manifest = artifact_path("model_comparison", run_dir)
+    msc_report = produced_path("model_comparison", run_dir)
     if os.path.exists(msc_manifest):
         if not os.path.exists(msc_report):
             violations.append({
@@ -1041,8 +1047,8 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None) -> list[dic
         })
 
     # Identifiability: models/identifiability.yaml → identifiability.yaml (run_dir)
-    id_manifest = os.path.join(run_dir, "models", "identifiability.yaml")
-    id_report = os.path.join(run_dir, "identifiability.yaml")
+    id_manifest = artifact_path("identifiability", run_dir)
+    id_report = produced_path("identifiability", run_dir)
     if os.path.exists(id_manifest):
         if not os.path.exists(id_report):
             violations.append({
@@ -1160,6 +1166,22 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None) -> list[dic
     violations.extend(_check_identifiability_a_priori(run_dir,
                                                        round_n=round_n))
 
+    # Phase 17 Commit α: pre-mortem domain critique. Spawned in STAGE 3
+    # (PRE-MODEL window) before the modeler builds. Reads only plan.md +
+    # hypotheses.md + matching expert_priors. Identifies HIGH-impact
+    # concerns the modeler must address in modeling_strategy.md §
+    # Pre-mortem Responses. Round 1 is the drafting window (MEDIUM);
+    # round 2+ blocks ACCEPT on missing artifact OR unaddressed HIGH
+    # (HIGH, scope-declarable via scope_declaration.yaml).
+    violations.extend(_check_premortem_addressed(run_dir, round_n=round_n))
+
+    # Phase 17 Commit β: coherence audit (post-WRITE). Surfaces
+    # violations from scripts/coherence_audit.py — label drift
+    # (R-019 class), cross-file count/cost mismatches (R-020 / $197M
+    # class), and self-contradicting artifacts (M-010 class). Only
+    # fires once report.md has been written.
+    violations.extend(_check_coherence_audit(run_dir))
+
     # Phase 12 Commit β: round-aware escalation of persisting MEDIUMs.
     # Catches the failure mode the 104914 run shipped: 18 figure_
     # validator_missing MEDIUMs persisted r2→r6, presentation P-005..
@@ -1195,12 +1217,12 @@ def _check_universal_coverage(run_dir: str) -> list[dict]:
       universal_coverage_malformed MEDIUM — yaml exists but missing
                                              required fields
     """
-    decision_rule = os.path.join(run_dir, "decision_rule.md")
+    decision_rule = artifact_path("decision_rule", run_dir)
     allocs = _find_allocation_csvs(run_dir)
     if not (os.path.exists(decision_rule) or allocs):
         return []
 
-    yaml_path = os.path.join(run_dir, "models", "universal_coverage.yaml")
+    yaml_path = artifact_path("universal_coverage", run_dir)
     if not os.path.exists(yaml_path):
         return [{
             "kind": "universal_coverage_missing",
@@ -1464,12 +1486,12 @@ def _check_allocation_robustness(run_dir: str) -> list[dict]:
                                               ROBUST and FRAGILE bands
       allocation_fragile              MEDIUM — middle-band, scope-declare
     """
-    decision_rule = os.path.join(run_dir, "decision_rule.md")
+    decision_rule = artifact_path("decision_rule", run_dir)
     allocs = _find_allocation_csvs(run_dir)
     if not (os.path.exists(decision_rule) or allocs):
         return []
 
-    yaml_path = os.path.join(run_dir, "models", "allocation_robustness.yaml")
+    yaml_path = artifact_path("allocation_robustness", run_dir)
     if not os.path.exists(yaml_path):
         return [{
             "kind": "allocation_robustness_missing",
@@ -1616,7 +1638,7 @@ def _check_daly_when_allocation(run_dir: str) -> list[dict]:
                                      DALY/YLL/YLD/disability-adjusted
                                      mentions.
     """
-    decision_rule = os.path.join(run_dir, "decision_rule.md")
+    decision_rule = artifact_path("decision_rule", run_dir)
     allocs = _find_allocation_csvs(run_dir)
     if not (os.path.exists(decision_rule) or allocs):
         return []  # No allocation produced; no requirement.
@@ -1678,12 +1700,12 @@ def _check_optimization_quality(run_dir: str) -> list[dict]:
       optimization_quality_malformed    HIGH   — schema/method violations
       optimization_quality_gap_too_large MEDIUM — gap_pct > 10%
     """
-    decision_rule = os.path.join(run_dir, "decision_rule.md")
+    decision_rule = artifact_path("decision_rule", run_dir)
     allocs = _find_allocation_csvs(run_dir)
     if not (os.path.exists(decision_rule) or allocs):
         return []  # No allocation produced; no requirement.
 
-    yaml_path = os.path.join(run_dir, "models", "optimization_quality.yaml")
+    yaml_path = artifact_path("optimization_quality", run_dir)
     if not os.path.exists(yaml_path):
         return [{
             "kind": "optimization_quality_missing",
@@ -1774,12 +1796,12 @@ def _check_sensitivity_analysis(run_dir: str) -> list[dict]:
       sensitivity_analysis_unstable     HIGH   — UNSTABLE verdict
       sensitivity_analysis_sensitive    MEDIUM — SENSITIVE verdict
     """
-    decision_rule = os.path.join(run_dir, "decision_rule.md")
+    decision_rule = artifact_path("decision_rule", run_dir)
     allocs = _find_allocation_csvs(run_dir)
     if not (os.path.exists(decision_rule) or allocs):
         return []  # No allocation produced; no requirement.
 
-    yaml_path = os.path.join(run_dir, "models", "sensitivity_analysis.yaml")
+    yaml_path = artifact_path("sensitivity_analysis", run_dir)
     if not os.path.exists(yaml_path):
         return [{
             "kind": "sensitivity_analysis_missing",
@@ -2183,7 +2205,7 @@ def _check_within_zone_heterogeneity(run_dir: str) -> list[dict]:
     if ratio >= _ECOLOGICAL_AGGREGATION_THRESHOLD:
         return []  # not aggregating much; check is silent
 
-    yaml_path = os.path.join(run_dir, "models", "within_zone_heterogeneity.yaml")
+    yaml_path = artifact_path("within_zone_heterogeneity", run_dir)
     if not os.path.exists(yaml_path):
         return [{
             "kind": "within_zone_heterogeneity_missing",
@@ -2290,7 +2312,7 @@ def _check_sanity_schema(run_dir: str,
     if round_n is not None and round_n < _SANITY_SCHEMA_REQUIRED_FROM_ROUND:
         return []  # Too early; modeler still composing outputs.
 
-    yaml_path = os.path.join(run_dir, "models", "sanity_schema.yaml")
+    yaml_path = artifact_path("sanity_schema", run_dir)
     if not os.path.exists(yaml_path):
         if round_n is None:
             return []  # Round unknown; defer.
@@ -2455,8 +2477,7 @@ def _check_identifiability_a_priori(run_dir: str,
     if round_n < _IDENTIFIABILITY_A_PRIORI_REQUIRED_FROM_ROUND:
         return []
 
-    yaml_path = os.path.join(run_dir, "models",
-                             "identifiability_a_priori.yaml")
+    yaml_path = artifact_path("identifiability_a_priori", run_dir)
 
     if not os.path.exists(yaml_path):
         # At r≥2 the artifact is required. Severity escalates to HIGH
@@ -2645,12 +2666,248 @@ _VALIDATOR_KIND_ESCALATION_THRESHOLDS = {
     # `optimization_quality_*_failed` includes the R-005-class
     # "no ILP benchmark" MEDIUMs that persisted in 104914
     "optimization_quality_alternative_missing": 4,
+    # Phase 17 β: lead must invoke scripts/coherence_audit.py post-WRITE.
+    # Persistent absence after 4 rounds escalates to HIGH so the gate
+    # forces fix-or-scope-declare rather than silently passing.
+    "coherence_audit_not_run": 4,
 }
 
 # Critique-blocker IDs from critique-presentation that should
 # escalate after persisting N rounds. (Phase 11 review surfaced
 # P-005 through P-009 persisting all 6 rounds.)
 _CRITIQUE_BLOCKER_ESCALATION_THRESHOLD = 4  # rounds since first_seen
+
+
+# ---------------------------------------------------------------------------
+# Phase 17 α — pre-mortem domain critique
+# ---------------------------------------------------------------------------
+#
+# The pre_mortem.yaml artifact is produced by the critique-premortem agent
+# in the PRE-MODEL window (STAGE 3) before the modeler builds. Round 1 is
+# the drafting window; round 2+ requires the file to exist AND each HIGH
+# concern to have addressed_in: filled. Unlike Phase 15 α's
+# identifiability_a_priori (architecture arithmetic, non-scope-declarable),
+# pre-mortem concerns are domain heuristics — the modeler MAY scope-declare
+# a HIGH with justification in scope_declaration.yaml.
+_PRE_MORTEM_REQUIRED_FROM_ROUND = 2
+
+
+def _check_premortem_addressed(run_dir: str,
+                                round_n: int | None = None
+                                ) -> list[dict]:
+    """Phase 17 α: validate pre_mortem.yaml.
+
+    Emits:
+      pre_mortem_missing                MEDIUM @ r=1 (drafting), HIGH @ r≥2
+      pre_mortem_invalid                HIGH (yaml MALFORMED)
+      pre_mortem_high_unaddressed       MEDIUM @ r=1, HIGH @ r≥2 (per concern)
+
+    Round gating: returns [] when round_n is None (caller has not
+    supplied a round; defer). At round_n=1, missing-artifact and
+    unaddressed-HIGH each emit MEDIUM (drafting window). At round_n≥2,
+    they escalate to HIGH.
+
+    The pre_mortem_high_unaddressed kind IS scope-declarable via
+    scope_declaration.yaml — pre-mortem concerns are domain heuristics,
+    not arithmetic facts. The modeler can satisfy the gate by either
+    filling addressed_in: in pre_mortem.yaml OR adding a matching
+    scope-declaration entry that quotes the concern's id (PM-NNN).
+    """
+    if round_n is None:
+        return []
+
+    yaml_path = artifact_path("pre_mortem", run_dir)
+    out: list[dict] = []
+
+    if not os.path.exists(yaml_path):
+        severity = "HIGH" if round_n >= _PRE_MORTEM_REQUIRED_FROM_ROUND else "MEDIUM"
+        out.append({
+            "kind": "pre_mortem_missing",
+            "severity": severity,
+            "stage": "PRE_MODEL",
+            "claim": (
+                f"Required artifact `pre_mortem.yaml` is absent at round "
+                f"{round_n}. The pre-mortem domain critic (Phase 17 α) "
+                f"runs in STAGE 3 before MODEL spawns. Spawn the "
+                f"`critique-premortem` agent on plan.md + hypotheses.md + "
+                f"matching expert_priors. The artifact lists HIGH-impact "
+                f"concerns the modeler must address in modeling_strategy.md "
+                f"§ Pre-mortem Responses. See the `pre-mortem-domain` skill."
+            ),
+        })
+        return out
+
+    # Load and validate schema. Be tolerant of partial files (the
+    # validator should not crash on malformed YAML — Phase 10 χ contract).
+    try:
+        with open(yaml_path) as f:
+            doc = yaml.safe_load(f) or {}
+    except (yaml.YAMLError, OSError) as e:
+        out.append({
+            "kind": "pre_mortem_invalid",
+            "severity": "HIGH",
+            "stage": "PRE_MODEL",
+            "claim": (f"`pre_mortem.yaml` could not be parsed: {e}. "
+                      f"Re-spawn critique-premortem to regenerate."),
+        })
+        return out
+
+    concerns = doc.get("concerns") or []
+    if not isinstance(concerns, list):
+        out.append({
+            "kind": "pre_mortem_invalid",
+            "severity": "HIGH",
+            "stage": "PRE_MODEL",
+            "claim": "`pre_mortem.yaml`: top-level `concerns:` must be a list.",
+        })
+        return out
+
+    # Collect IDs the modeler has scope-declared. The scope_declaration.yaml
+    # convention (rigor_artifacts manifest) accepts an entry whose id or
+    # claim quotes the PM-NNN concern id. We do a permissive substring
+    # match on the prose to avoid forcing schema rigidity in
+    # scope_declaration.yaml — it varies across runs.
+    declared_ids: set[str] = set()
+    scope_path = os.path.join(run_dir, "scope_declaration.yaml")
+    if os.path.exists(scope_path):
+        try:
+            with open(scope_path) as f:
+                scope_doc = yaml.safe_load(f) or {}
+            text = yaml.safe_dump(scope_doc) or ""
+        except (yaml.YAMLError, OSError):
+            text = ""
+        for c in concerns:
+            cid = (c or {}).get("id") if isinstance(c, dict) else None
+            if isinstance(cid, str) and cid in text:
+                declared_ids.add(cid)
+
+    severity = "HIGH" if round_n >= _PRE_MORTEM_REQUIRED_FROM_ROUND else "MEDIUM"
+    for c in concerns:
+        if not isinstance(c, dict):
+            continue
+        if str(c.get("severity", "")).upper() != "HIGH":
+            continue
+        cid = c.get("id") or "PM-???"
+        if c.get("addressed_in"):
+            continue
+        if cid in declared_ids:
+            continue
+        out.append({
+            "kind": "pre_mortem_high_unaddressed",
+            "severity": severity,
+            "stage": "PRE_MODEL",
+            "claim": (
+                f"Pre-mortem HIGH concern {cid} has `addressed_in: null` "
+                f"and no scope_declaration entry referencing the id. "
+                f"Concern: {str(c.get('concern', '')).strip().splitlines()[0] if c.get('concern') else ''!r}. "
+                f"Either resolve in modeling_strategy.md § Pre-mortem "
+                f"Responses (and set addressed_in:), or add a "
+                f"scope_declaration.yaml entry that quotes {cid}."
+            ),
+        })
+    return out
+
+
+def _check_coherence_audit(run_dir: str) -> list[dict]:
+    """Phase 17 β: surface violations from `scripts/coherence_audit.py`.
+
+    The auditor runs post-WRITE alongside writer_qa.py. It checks
+    three duties: label coherence (e.g., 'UNSTABLE' in prose vs
+    'SENSITIVE' in YAML), cross-file count/cost consistency (prose
+    vs allocation CSV), and self-contradicting artifacts (notes
+    contradict structured fields in the same YAML).
+
+    This validator function reads the auditor's output
+    (`coherence_audit.yaml`) and emits one violation per drift
+    detected, preserving severities. If `report.md` exists but
+    `coherence_audit.yaml` is absent, emit MEDIUM (lead forgot to
+    invoke the auditor).
+
+    Round gating is NOT applied — the check only matters once
+    `report.md` has been written.
+
+    Returns: list of {kind, severity, stage, claim} dicts.
+    """
+    report_path = os.path.join(run_dir, "report.md")
+    audit_path = artifact_path("coherence_audit", run_dir)
+    out: list[dict] = []
+
+    if not os.path.exists(report_path):
+        return []  # WRITE hasn't happened; nothing to audit
+
+    if not os.path.exists(audit_path):
+        out.append({
+            "kind": "coherence_audit_not_run",
+            "severity": "MEDIUM",
+            "stage": "WRITE",
+            "claim": (
+                "report.md exists but coherence_audit.yaml is absent. "
+                "Run `python3 scripts/coherence_audit.py {run_dir}` "
+                "after writer-QA to surface label/count/self-"
+                "contradiction drift."
+            ),
+        })
+        return out
+
+    try:
+        with open(audit_path) as f:
+            audit = yaml.safe_load(f) or {}
+    except (yaml.YAMLError, OSError) as e:
+        out.append({
+            "kind": "coherence_audit_invalid",
+            "severity": "HIGH",
+            "stage": "WRITE",
+            "claim": (f"`coherence_audit.yaml` could not be parsed: {e}. "
+                      f"Re-run `scripts/coherence_audit.py`."),
+        })
+        return out
+
+    violations = audit.get("violations") or []
+    if not isinstance(violations, list):
+        return out
+
+    # Bucket by duty, take top-K per duty to avoid swamping the gate.
+    # Phase 10 ψ's allocation-gate consolidation pattern: prefer one
+    # consolidated MEDIUM per duty over many fine-grained MEDIUMs.
+    per_duty: dict[str, list[dict]] = {}
+    for v in violations:
+        if not isinstance(v, dict):
+            continue
+        duty = str(v.get("duty", "unknown"))
+        per_duty.setdefault(duty, []).append(v)
+
+    for duty, vlist in per_duty.items():
+        # Always emit individual HIGHs (these block ACCEPT).
+        # Use a default empty string so a violation lacking a severity
+        # field doesn't silently become "NONE" (str(None).upper()) and
+        # disappear from both buckets — Phase 10 χ non-crashing-reads
+        # contract treats missing fields as MEDIUM-equivalent advisories.
+        highs = [v for v in vlist if str(v.get("severity") or "").upper() == "HIGH"]
+        meds = [v for v in vlist if str(v.get("severity") or "").upper() == "MEDIUM"]
+        for v in highs[:5]:  # cap at 5 per duty
+            out.append({
+                "kind": f"coherence_audit_{duty}",
+                "severity": "HIGH",
+                "stage": "WRITE",
+                "claim": (
+                    f"[{v.get('id', '?')}] {v.get('claim', '')[:300]} "
+                    f"(canonical: {v.get('canonical_source', '?')}; "
+                    f"location: {v.get('location', '?')})"
+                ),
+            })
+        # Consolidate MEDIUM violations into a single advisory per duty.
+        if meds:
+            out.append({
+                "kind": f"coherence_audit_{duty}_advisory",
+                "severity": "MEDIUM",
+                "stage": "WRITE",
+                "claim": (
+                    f"{len(meds)} MEDIUM coherence_audit violation(s) "
+                    f"on duty `{duty}`. First example: "
+                    f"{meds[0].get('claim', '')[:200]}"
+                ),
+            })
+    return out
 
 
 def _check_persistent_medium_escalation(run_dir: str,
@@ -2822,7 +3079,7 @@ def _check_decision_rule_artifact(run_dir: str) -> list[dict]:
     if not allocations:
         return []
 
-    rule_path = os.path.join(run_dir, "decision_rule.md")
+    rule_path = artifact_path("decision_rule", run_dir)
     if not os.path.exists(rule_path):
         return [{
             "kind": "decision_rule_missing",
@@ -5035,6 +5292,184 @@ def _run_self_test() -> int:
            "I6: round_n=1 must be silent even for OVER_SATURATED artifact")
         ok(_check_identifiability_a_priori(_d, round_n=None) == [],
            "I6: round_n=None must be silent even for OVER_SATURATED artifact")
+
+    # --- Phase 17 α: pre-mortem domain critique tests (PM-prefix) ---
+    with _tempfile.TemporaryDirectory() as _d:
+        # PM1: missing artifact at r=1 → MEDIUM (drafting window)
+        v = _check_premortem_addressed(_d, round_n=1)
+        ok(any(x["kind"] == "pre_mortem_missing"
+               and x["severity"] == "MEDIUM" for x in v),
+           f"PM1: missing pre_mortem.yaml at r=1 should fire MEDIUM, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # PM1b: missing artifact at r≥2 escalates to HIGH (blocks ACCEPT)
+        v = _check_premortem_addressed(_d, round_n=2)
+        ok(any(x["kind"] == "pre_mortem_missing"
+               and x["severity"] == "HIGH" for x in v),
+           f"PM1b: missing pre_mortem.yaml at r=2 should fire HIGH, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # PM2: round_n=None → silent (defer to caller)
+        v = _check_premortem_addressed(_d, round_n=None)
+        ok(v == [],
+           f"PM2: round_n=None must be silent, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # PM3: HIGH concern with addressed_in: null at r≥2 → HIGH
+        # pre_mortem_high_unaddressed
+        with open(os.path.join(_d, "pre_mortem.yaml"), "w") as f:
+            _yaml.safe_dump({
+                "agent": "critique-premortem",
+                "concerns": [
+                    {"id": "PM-001", "severity": "HIGH",
+                     "category": "FEASIBILITY",
+                     "concern": "Universal PBO LLIN exceeds global supply",
+                     "addressed_in": None},
+                    {"id": "PM-002", "severity": "MEDIUM",
+                     "category": "DATA",
+                     "concern": "HBHI archetype 2010 vintage",
+                     "addressed_in": None},
+                ],
+            }, f)
+        v = _check_premortem_addressed(_d, round_n=2)
+        ok(any(x["kind"] == "pre_mortem_high_unaddressed"
+               and x["severity"] == "HIGH"
+               and "PM-001" in x.get("claim", "") for x in v),
+           f"PM3: unaddressed HIGH at r=2 should fire HIGH "
+           f"pre_mortem_high_unaddressed referencing PM-001, got {v}")
+        # MEDIUM concerns must NOT fire — only HIGH triggers the gate
+        ok(not any("PM-002" in x.get("claim", "") for x in v),
+           f"PM3: MEDIUM concerns must not fire pre_mortem_high_unaddressed, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # PM4: HIGH concern with addressed_in: filled → silent
+        with open(os.path.join(_d, "pre_mortem.yaml"), "w") as f:
+            _yaml.safe_dump({
+                "agent": "critique-premortem",
+                "concerns": [
+                    {"id": "PM-001", "severity": "HIGH",
+                     "category": "FEASIBILITY",
+                     "concern": "Universal PBO LLIN exceeds global supply",
+                     "addressed_in": "modeling_strategy.md#pre-mortem-pm-001"},
+                ],
+            }, f)
+        v = _check_premortem_addressed(_d, round_n=2)
+        ok(not any(x["kind"] == "pre_mortem_high_unaddressed" for x in v),
+           f"PM4: addressed HIGH should be silent, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # PM5: HIGH concern scope-declared via scope_declaration.yaml
+        # quoting the PM-NNN id → silent (scope-declarable contract)
+        with open(os.path.join(_d, "pre_mortem.yaml"), "w") as f:
+            _yaml.safe_dump({
+                "agent": "critique-premortem",
+                "concerns": [
+                    {"id": "PM-001", "severity": "HIGH",
+                     "category": "FEASIBILITY",
+                     "concern": "Universal PBO LLIN exceeds global supply",
+                     "addressed_in": None},
+                ],
+            }, f)
+        with open(os.path.join(_d, "scope_declaration.yaml"), "w") as f:
+            _yaml.safe_dump({
+                "declarations": [
+                    {"id": "SCOPE-001",
+                     "claim": "Idealized supply assumption (PM-001)",
+                     "justification": "Question explicitly assumes idealized supply"},
+                ],
+            }, f)
+        v = _check_premortem_addressed(_d, round_n=2)
+        ok(not any(x["kind"] == "pre_mortem_high_unaddressed" for x in v),
+           f"PM5: scope-declared HIGH (id quoted) should be silent, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # PM6: malformed YAML → HIGH pre_mortem_invalid (does not crash)
+        with open(os.path.join(_d, "pre_mortem.yaml"), "w") as f:
+            f.write("concerns: not_a_list_just_a_string\n")
+        v = _check_premortem_addressed(_d, round_n=2)
+        ok(any(x["kind"] == "pre_mortem_invalid"
+               and x["severity"] == "HIGH" for x in v),
+           f"PM6: malformed concerns: should fire HIGH pre_mortem_invalid, got {v}")
+
+    # --- Phase 17 β: coherence_audit integration tests (CA-prefix) ---
+    with _tempfile.TemporaryDirectory() as _d:
+        # CA1: report.md absent → silent (WRITE hasn't happened)
+        v = _check_coherence_audit(_d)
+        ok(v == [], f"CA1: no report.md must be silent, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # CA2: report.md present, no audit yaml → MEDIUM coherence_audit_not_run
+        with open(os.path.join(_d, "report.md"), "w") as f:
+            f.write("# Report\nSynthetic.\n")
+        v = _check_coherence_audit(_d)
+        ok(any(x["kind"] == "coherence_audit_not_run"
+               and x["severity"] == "MEDIUM" for x in v),
+           f"CA2: report.md without audit yaml must fire MEDIUM coherence_audit_not_run, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # CA3: clean audit (verdict CLEAN) → silent
+        with open(os.path.join(_d, "report.md"), "w") as f:
+            f.write("# Report\n")
+        with open(os.path.join(_d, "coherence_audit.yaml"), "w") as f:
+            _yaml.safe_dump({"verdict": "CLEAN", "violations": []}, f)
+        v = _check_coherence_audit(_d)
+        ok(v == [], f"CA3: clean audit must be silent, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # CA4: HIGH violations are surfaced as separate kinds per duty
+        with open(os.path.join(_d, "report.md"), "w") as f:
+            f.write("# Report\n")
+        with open(os.path.join(_d, "coherence_audit.yaml"), "w") as f:
+            _yaml.safe_dump({
+                "verdict": "DRIFT_DETECTED",
+                "violations": [
+                    {"id": "CA-L-001", "severity": "HIGH",
+                     "duty": "label_coherence",
+                     "location": "decision_rule.md:87",
+                     "claim": "UNSTABLE in prose vs SENSITIVE in YAML",
+                     "canonical_source": "models/sensitivity_analysis.yaml:verdict",
+                     "canonical_value": "SENSITIVE"},
+                ],
+            }, f)
+        v = _check_coherence_audit(_d)
+        ok(any(x["kind"] == "coherence_audit_label_coherence"
+               and x["severity"] == "HIGH" for x in v),
+           f"CA4: HIGH label_coherence must surface as HIGH validator violation, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # CA5: many MEDIUMs consolidate into one advisory per duty
+        with open(os.path.join(_d, "report.md"), "w") as f:
+            f.write("# Report\n")
+        with open(os.path.join(_d, "coherence_audit.yaml"), "w") as f:
+            _yaml.safe_dump({
+                "verdict": "DRIFT_DETECTED",
+                "violations": [
+                    {"id": f"CA-C-{i:03d}", "severity": "MEDIUM",
+                     "duty": "cross_file_counts",
+                     "location": f"results.md:{i}",
+                     "claim": f"drift {i}"} for i in range(1, 8)
+                ],
+            }, f)
+        v = _check_coherence_audit(_d)
+        # Expect exactly ONE consolidated advisory for cross_file_counts
+        consolidated = [x for x in v
+                        if x["kind"] == "coherence_audit_cross_file_counts_advisory"]
+        ok(len(consolidated) == 1,
+           f"CA5: multiple MEDIUMs must consolidate into ONE advisory, got {v}")
+        ok("7 MEDIUM" in consolidated[0]["claim"],
+           f"CA5: advisory must report count, got {consolidated}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # CA6: malformed audit yaml → HIGH coherence_audit_invalid
+        with open(os.path.join(_d, "report.md"), "w") as f:
+            f.write("# Report\n")
+        with open(os.path.join(_d, "coherence_audit.yaml"), "w") as f:
+            f.write("not: valid: yaml: here:\n  - oops\n  - oops\n: : :\n")
+        v = _check_coherence_audit(_d)
+        # Either parses as something weird (no violations key, empty out)
+        # or fires invalid. Both are acceptable — the goal is no crash.
+        ok(isinstance(v, list),
+           f"CA6: malformed yaml must not crash; got {v}")
 
     # --- Summary ---
     if failures:

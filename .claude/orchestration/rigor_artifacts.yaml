@@ -1,0 +1,206 @@
+# Phase 2 rigor artifacts — single source of truth.
+#
+# Read by:
+#   - agents/modeler.py: renders the timeline table in SYSTEM_PROMPT
+#   - scripts/validate_critique_yaml.py: artifact paths for _check_* functions
+#   - scripts/lib/rigor_artifacts.py: loader + render helpers
+#
+# To add a new artifact (e.g., for Phase N+1):
+#   1. Add a new entry below.
+#   2. In scripts/validate_critique_yaml.py, look up the path via
+#      `from lib.rigor_artifacts import artifact_path; p = artifact_path("<id>", run_dir)`.
+#   3. Run `python3 scripts/lib/rigor_artifacts.py --self-test`.
+#   4. Update the CLAUDE.md phase ledger.
+#
+# Schema (per artifact):
+#   id                 stable identifier referenced by validator code
+#   path               filename relative to run_dir
+#   first_draft_round  earliest round the modeler must produce a draft
+#   finalize_round     round by which the artifact must be final
+#   stage              pre_model | model | allocation
+#   skill              skill name in .claude/skills/ that explains the contract
+#   triggered_by       always | allocation | aggregation_ratio_lt_0.1
+#   scope_declarable   may the modeler scope-declare instead of producing it?
+#                      (false for non-scope-declarable kinds — e.g.
+#                      identifiability_a_priori OVER_SATURATED)
+#   produces           list of derived report paths the validator also reads
+#                      (e.g. propagate_uncertainty.py reads outcome_fn.py and
+#                      writes uncertainty_report.yaml)
+#   description        1–2 line summary for the rendered timeline table
+
+artifacts:
+  - id: identifiability_a_priori
+    path: models/identifiability_a_priori.yaml
+    first_draft_round: 1
+    finalize_round: 2
+    stage: pre_model
+    skill: pre-model-identifiability-arithmetic
+    triggered_by: always
+    scope_declarable: false
+    description: |
+      **PRE-MODEL** (Phase 15 α). Count free fitted parameters vs independent
+      calibration targets. Verdict IDENTIFIABLE if ratio < 1, MARGINAL if 1–3,
+      OVER_SATURATED if > 3. **NOT scope-declarable at OVER_SATURATED — architecture
+      must be fixed.** Required BEFORE the first MODEL stage spawn.
+
+  - id: pre_mortem
+    path: pre_mortem.yaml
+    first_draft_round: 1
+    finalize_round: 2
+    stage: pre_model
+    skill: pre-mortem-domain
+    triggered_by: always
+    scope_declarable: true
+    description: |
+      **PRE-MODEL** (Phase 17 α). Adversarial domain critique on a clean
+      slate (only plan.md + hypotheses.md + matching expert priors).
+      Concerns categorized ARCHITECTURE / DATA / FEASIBILITY / BLIND_SPOT /
+      EXPERT_PRIOR with HIGH/MEDIUM/LOW severities. Modeler must address each
+      HIGH in `modeling_strategy.md § Pre-mortem Responses` (or scope-declare
+      with justification). Catches what gates can't — supply-chain ceilings,
+      data vintage, multiplicative-independence assumptions.
+
+  - id: outcome_fn
+    path: models/outcome_fn.py
+    first_draft_round: 1
+    finalize_round: 3
+    stage: model
+    skill: uncertainty-quantification
+    triggered_by: always
+    scope_declarable: true
+    produces:
+      - uncertainty_report.yaml
+    description: |
+      Calibration callable returning a single deterministic outcome dict; can be
+      coarse. Surrogate path requires `models/outcome_fn_calibration.md`.
+
+  - id: model_comparison
+    path: models/model_comparison.yaml
+    first_draft_round: 1
+    finalize_round: 3
+    stage: model
+    skill: multi-structural-comparison
+    triggered_by: always
+    scope_declarable: true
+    produces:
+      - model_comparison_formal.yaml
+    description: |
+      At least null + simple + full candidate; AIC/BIC can be approximate.
+
+  - id: identifiability
+    path: models/identifiability.yaml
+    first_draft_round: 1
+    finalize_round: 3
+    stage: model
+    skill: identifiability-analysis
+    triggered_by: always
+    scope_declarable: true
+    produces:
+      - identifiability.yaml
+    description: |
+      Manifest with point estimates + bounds; loss function pointwise (see §3
+      contract).
+
+  - id: sensitivity_analysis
+    path: models/sensitivity_analysis.yaml
+    first_draft_round: 2
+    finalize_round: 7
+    stage: allocation
+    skill: sensitivity-analysis-remediation
+    triggered_by: allocation
+    scope_declarable: true
+    description: |
+      After your FIRST optimizer pass; 2 load-bearing parameters, one alternative
+      value each. Expand perturbations and tighten verdicts in later rounds.
+
+  - id: allocation_robustness
+    path: models/allocation_robustness.yaml
+    first_draft_round: 3
+    finalize_round: 6
+    stage: allocation
+    skill: allocation-cross-validation
+    triggered_by: allocation
+    scope_declarable: true
+    description: |
+      Leave-one-archetype-out CV on the draft allocation; per-fold metrics may be
+      coarse initially.
+
+  - id: within_zone_heterogeneity
+    path: models/within_zone_heterogeneity.yaml
+    first_draft_round: 3
+    finalize_round: 6
+    stage: model
+    skill: ecological-fallacy-quantification
+    triggered_by: aggregation_ratio_lt_0.1
+    scope_declarable: true
+    description: |
+      Required when `calibration_units / allocation_units < 0.1` (Phase 12 γ).
+      Bound the impact loss with a perturbation re-run.
+
+  - id: sanity_schema
+    path: models/sanity_schema.yaml
+    first_draft_round: 2
+    finalize_round: 6
+    stage: model
+    skill: sanity-schema
+    triggered_by: always
+    scope_declarable: true
+    description: |
+      Disease-agnostic structural sanity manifest (Phase 13 α). Eight generic
+      checks via `scripts/sanity_checks.py`. Each failed check emits MEDIUM
+      advisory; explicit exemptions in `scope_declaration.yaml`.
+
+  - id: optimization_quality
+    path: models/optimization_quality.yaml
+    first_draft_round: 3
+    finalize_round: 6
+    stage: allocation
+    skill: optimizer-method-selection
+    triggered_by: allocation
+    scope_declarable: true
+    description: |
+      Document how primary optimizer compares to ≥1 alternative method; gap_pct
+      ≤ 10% required.
+
+  - id: universal_coverage
+    path: models/universal_coverage.yaml
+    first_draft_round: 3
+    finalize_round: 6
+    stage: allocation
+    skill: mechanistic-vs-hybrid-architecture
+    triggered_by: allocation
+    scope_declarable: true
+    description: |
+      Budget required to fund all spatial units at the dominant package; surfaces
+      the GC7 efficiency vs universal-coverage gap.
+
+  - id: decision_rule
+    path: decision_rule.md
+    first_draft_round: 6
+    finalize_round: 7
+    stage: allocation
+    skill: decision-rule-extraction
+    triggered_by: allocation
+    scope_declarable: true
+    description: |
+      Derived from finalized allocation; this one is genuinely late by
+      construction.
+
+  - id: coherence_audit
+    path: coherence_audit.yaml
+    first_draft_round: 7
+    finalize_round: 8
+    stage: write
+    skill: pre-mortem-domain
+    triggered_by: always
+    scope_declarable: true
+    description: |
+      **POST-WRITE** (Phase 17 β). Auto-generated by
+      `scripts/coherence_audit.py` after report.md is written. Three
+      duties: label_coherence (prose verdict labels vs YAML source),
+      cross_file_counts (prose counts/$ vs allocation CSV),
+      self_contradicting (prose notes vs structured fields in same
+      YAML). Validator-output artifact (script-produced, not modeler-
+      produced); registered in the manifest so path resolution stays
+      uniform with other rigor artifacts (Phase 16 α single-source-of-
+      truth principle).

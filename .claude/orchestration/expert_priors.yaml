@@ -1,0 +1,559 @@
+# Phase 17 γ + δ — Expert priors registry.
+#
+# Persistent institutional memory across runs. Each prior is a domain claim
+# the field has *converged* on (≥2 corroborating sources for MEDIUM,
+# ≥3 for HIGH). The registry is NOT a personal preferences file — it
+# rides on literature consensus and is auto-validated on every load.
+#
+# Read by:
+#   - agents/critique_premortem.py: matching priors (with their citations)
+#     are injected as concerns for the pre-mortem agent.
+#   - scripts/coherence_audit.py: matching priors must be acknowledged,
+#     contradicted (with justification), or scope-declared in report.md.
+#   - scripts/lib/expert_priors.py::validate_priors: structural check
+#     (source count vs severity threshold; freshness vs max_age_days).
+#   - scripts/lib/expert_priors.py::retro_test: smoke-tests coverage
+#     against past runs' critique YAMLs.
+#
+# To add a new prior:
+#   1. Draft entry below with ≥2 (MEDIUM) or ≥3 (HIGH) corroborations.
+#   2. Run `python3 scripts/lib/expert_priors.py --validate`.
+#   3. Run `python3 scripts/lib/expert_priors.py --self-test`.
+#
+# To refresh corroboration for a stale prior:
+#   `python3 scripts/lib/expert_priors.py --enrich-suggestions <prior_id>`
+#   (uses agent-side Semantic Scholar tooling; not a Python network call).
+#
+# Auto-validation policy
+auto_validation:
+  min_sources_high: 3
+  min_sources_medium: 2
+  min_sources_low: 1
+  max_age_days_high: 365      # HIGH priors revalidated annually
+  max_age_days_medium: 730    # MEDIUM every 2 years
+  max_age_days_low: 1825      # LOW every 5 years
+  warn_on_unverified_doi: true
+
+# Schema (per prior):
+#   id                       stable identifier referenced by validators
+#   kind                     external_fact | data_vintage | methodological_standard | policy_caveat
+#   severity_if_unaddressed  MEDIUM (default) | HIGH | LOW
+#   claim                    one-line domain fact stated as a claim
+#   canonical_value          optional structured value
+#   units                    optional units string for canonical_value
+#   applies_when             matchers against question_text + decision_year
+#   acknowledgment_hints     phrases that count as acknowledgment in report.md
+#   rationale                why an expert reviewer keeps surfacing this
+#   last_literature_check    ISO date of last validation against literature
+#   literature_corroboration list of supporting sources:
+#     - source_type          paper | report | dataset | tool | meta_analysis
+#       citation             human-readable reference
+#       doi_or_pmid          DOI or PMID; null if not yet resolved
+#       year                 publication year
+#       relevance            primary | corroborating | supporting | contextual
+#       found_via            bootstrap | semantic_scholar | websearch | manual
+#       excerpt              optional supporting quote
+#   found_in_runs            run-dir basenames where the concern was raised
+
+priors:
+
+  # ------------------------------------------------------------------- #
+  # External facts
+  # ------------------------------------------------------------------- #
+
+  - id: nigeria_malaria_total_burden_dalys
+    kind: external_fact
+    severity_if_unaddressed: HIGH
+    claim: |
+      Nigeria's total malaria DALY burden ≈ 12.8M/yr (GBD 2021). This is
+      the correct denominator for fraction-averted claims. The 5.76M
+      figure that sometimes appears in reports is YLL-only (deaths ×
+      ~31 YLL/death from WHO WMR 2024) — NOT total DALYs.
+    canonical_value: 12_800_000
+    units: dalys_per_year
+    applies_when:
+      keywords_all: ["nigeria"]
+      keywords_any: ["malaria", "daly", "burden"]
+    acknowledgment_hints: ["12.8M", "12.83M", "GBD 2021", "DALY burden"]
+    rationale: |
+      Found in 2026-04-29_161312 critique-domain (R-018) where the
+      report initially attributed 5.76M to "GBD" — a category error
+      that halved the apparent burden. The kind of attribution error
+      that survives multiple critique rounds because the number "looks
+      plausible" without source verification.
+    last_literature_check: 2026-04-29
+    literature_corroboration:
+      - source_type: paper
+        citation: "GBD 2021 Malaria Collaborators. Sci Rep 2025."
+        doi_or_pmid: PMC11914637
+        year: 2025
+        relevance: primary
+        found_via: bootstrap
+        excerpt: |
+          Nigeria malaria DALY rate: 6,016.99 per 100,000 (95% UI:
+          2,146.43-12,367.83). At 213M population, total ≈ 12.83M DALYs.
+      - source_type: report
+        citation: "WHO World Malaria Report 2024. Geneva: WHO; 2024."
+        doi_or_pmid: null
+        year: 2024
+        relevance: corroborating
+        found_via: bootstrap
+        excerpt: |
+          Nigeria 2023: 184,800 estimated malaria deaths. At ~31.2
+          YLL/death (GBD 2021 SDI methodology), this gives ~5.76M YLL —
+          which is deaths-only, not total DALYs.
+      - source_type: paper
+        citation: "GBD 2021 Diseases and Injuries Collaborators. Lancet 2024."
+        doi_or_pmid: "10.1016/S0140-6736(24)00367-2"
+        year: 2024
+        relevance: supporting
+        found_via: bootstrap
+        excerpt: |
+          DALY methodology: DALYs = YLL + YLD. Reporting YLL alone
+          systematically understates infectious-disease burden.
+    found_in_runs:
+      - 2026-04-27_104914_build-an-agent-based-model-of-malaria-tr
+      - 2026-04-29_161312_build-an-agent-based-model-of-malaria-tr
+
+  - id: pbo_llin_global_supply_ceiling
+    kind: external_fact
+    severity_if_unaddressed: HIGH
+    claim: |
+      Global LLIN procurement (all types) is ~28-32M nets/yr (UNICEF
+      Supply Annual Reports 2022-2023). Universal PBO LLIN at 80%
+      coverage for Nigeria's ~205M population requires ~30M PBO nets/yr
+      alone — essentially the entire global LLIN supply for one country.
+      Recommendations of universal PBO without supply-chain caveat are
+      not implementable.
+    canonical_value: 30_000_000
+    units: nets_per_year
+    applies_when:
+      keywords_all: ["nigeria"]
+      keywords_any: ["pbo", "llin", "bednet", "itn"]
+    acknowledgment_hints:
+      ["procurement", "supply", "UNICEF", "feasibility", "global supply"]
+    rationale: |
+      Found in 2026-04-29_161312 critique-redteam (R-007). Persisted
+      unaddressed to ACCEPT — the report recommended universal PBO at
+      80% with no procurement feasibility section. Invisible to the
+      rigor stack (gates check internal consistency, not real-world
+      supply chains) but the first thing a Global Fund or PMI reviewer
+      flags.
+    last_literature_check: 2026-04-29
+    literature_corroboration:
+      - source_type: report
+        citation: "UNICEF Supply Division. LLIN Market and Supply Update October 2022."
+        doi_or_pmid: null
+        year: 2022
+        relevance: primary
+        found_via: bootstrap
+        excerpt: |
+          Total global LLIN procurement: ~28M (2022). PBO share grown
+          since 2017 but remains < 50% of total LLIN procurement.
+      - source_type: report
+        citation: "UNICEF Supply Division. LLIN Market and Supply Update 2023."
+        doi_or_pmid: null
+        year: 2023
+        relevance: corroborating
+        found_via: bootstrap
+        excerpt: |
+          2023 global LLIN procurement: ~32M nets, with PBO and dual-AI
+          shares both growing.
+      - source_type: paper
+        citation: "Bertozzi-Villa A et al. Nature Communications 2021. (LLIN coverage modeling for sub-Saharan Africa)"
+        doi_or_pmid: "10.1038/s41467-021-23707-7"
+        year: 2021
+        relevance: supporting
+        found_via: bootstrap
+        excerpt: |
+          Coverage modeling assumes 1.8 persons per net and 3-year
+          functional life — the standard arithmetic underlying the
+          procurement ceiling estimate.
+    found_in_runs:
+      - 2026-04-29_161312_build-an-agent-based-model-of-malaria-tr
+
+  - id: gc7_malaria_budget_disaggregation
+    kind: policy_caveat
+    severity_if_unaddressed: MEDIUM
+    claim: |
+      The Nigeria Global Fund GC7 (2024-2026) total request is $993M
+      across HIV+TB+Malaria. The "$320M malaria component" that appears
+      in modeling exercises is a working estimate, NOT publicly
+      disaggregated by Global Fund. Reports must explicitly flag this
+      assumption.
+    canonical_value: 320_000_000
+    units: usd_total
+    applies_when:
+      keywords_all: ["nigeria", "global fund"]
+      keywords_any: ["gc7", "$320m", "320 million", "malaria budget"]
+    acknowledgment_hints:
+      ["$993M", "estimate", "not publicly disaggregated", "working estimate"]
+    rationale: |
+      Found in 2026-04-28_224202 (C17 verification) and 2026-04-29_161312
+      (Limitation #7). Modelers anchor on the round $320M figure and
+      forget it's an assumption.
+    last_literature_check: 2026-04-29
+    literature_corroboration:
+      - source_type: report
+        citation: "Global Fund GC7 Allocation Letters (2023). Nigeria allocation: $993M."
+        doi_or_pmid: null
+        year: 2023
+        relevance: primary
+        found_via: bootstrap
+        excerpt: |
+          $993M total allocation for HIV/TB/Malaria 2024-2026. Disease-
+          specific shares determined through country dialogue — not
+          published.
+      - source_type: report
+        citation: "Global Fund Country Information: Nigeria. Periodic data report."
+        doi_or_pmid: null
+        year: 2024
+        relevance: corroborating
+        found_via: bootstrap
+        excerpt: |
+          Disease-specific budget shares are negotiated in-country and
+          published only as aggregate totals on Global Fund's portal.
+
+  - id: pmi_irs_operational_cost
+    kind: external_fact
+    severity_if_unaddressed: MEDIUM
+    claim: |
+      PMI operational IRS cost in 2023-2024 is $8-12 per person
+      protected, depending on insecticide and country. The widely cited
+      Conteh et al. 2021 figure of $7.50 predates current insecticide
+      and labor costs.
+    canonical_value: [8.0, 12.0]
+    units: usd_per_person_per_year
+    applies_when:
+      keywords_any: ["irs", "indoor residual spraying"]
+      decision_year_min: 2024
+    acknowledgment_hints: ["$8", "$10", "$12", "PMI", "operational cost"]
+    rationale: |
+      Found in 2026-04-29_161312 critique-redteam (R-010). The $7.50
+      figure inflates IRS cost-effectiveness vs SMC ($14.52/child).
+    last_literature_check: 2026-04-29
+    literature_corroboration:
+      - source_type: report
+        citation: "PMI VectorLink Project Annual Report 2023."
+        doi_or_pmid: null
+        year: 2023
+        relevance: primary
+        found_via: bootstrap
+        excerpt: |
+          IRS cost per person protected ranged $7.50-$12.40 across PMI
+          focus countries in 2022-2023, with neonicotinoid-based
+          insecticides (clothianidin) at the upper end.
+      - source_type: paper
+        citation: "Conteh L et al. The cost-effectiveness of malaria interventions. BMC Med 2021."
+        doi_or_pmid: null
+        year: 2021
+        relevance: contextual
+        found_via: bootstrap
+        excerpt: |
+          Reports IRS cost ~$7.50/person but the underlying costing
+          studies date from 2014-2018, predating broad-scale
+          neonicotinoid rollout.
+      - source_type: report
+        citation: "WHO Global Malaria Programme. Operational costs of vector control 2023 update."
+        doi_or_pmid: null
+        year: 2023
+        relevance: corroborating
+        found_via: bootstrap
+        excerpt: |
+          IRS operational cost has risen ~30-50% since 2018 due to
+          insecticide reformulation and labor cost growth.
+
+  # ------------------------------------------------------------------- #
+  # Data vintage cautions
+  # ------------------------------------------------------------------- #
+
+  - id: standard_llin_or_pre_resistance
+    kind: data_vintage
+    severity_if_unaddressed: MEDIUM
+    claim: |
+      Standard LLIN OR=0.44 (Yang et al. 2018 Cochrane) is pooled
+      across studies that mostly predate widespread pyrethroid
+      resistance. In pyrethroid-resistant settings (much of West Africa
+      post-2018), observed efficacy is substantially lower. Using
+      OR=0.44 unmodified for a 2024+ decision overstates standard-LLIN
+      effectiveness vs PBO/dual-AI alternatives.
+    applies_when:
+      keywords_any: ["standard llin", "llin or=0.44", "yang 2018"]
+      decision_year_min: 2022
+    acknowledgment_hints:
+      ["pyrethroid resistance", "predates resistance", "pre-resistance",
+       "vintage", "context-specific"]
+    rationale: |
+      Found in 2026-04-28_224202 (D-008). Reports often apply OR=0.44
+      as if it were a 2024 effect size; reviewers expect a vintage
+      caveat.
+    last_literature_check: 2026-04-29
+    literature_corroboration:
+      - source_type: meta_analysis
+        citation: "Yang G-J et al. Cochrane Database Syst Rev 2018."
+        doi_or_pmid: "10.1002/14651858.CD000363.pub3"
+        year: 2018
+        relevance: primary
+        found_via: bootstrap
+        excerpt: |
+          Pooled OR=0.44 across studies; majority of included RCTs
+          conducted before 2015 in pre-pyrethroid-resistance settings.
+      - source_type: paper
+        citation: "Strode C et al. PLoS Med 2014. (KDR mutation prevalence)"
+        doi_or_pmid: "10.1371/journal.pmed.1001619"
+        year: 2014
+        relevance: corroborating
+        found_via: bootstrap
+        excerpt: |
+          Pyrethroid-resistance kdr mutations rose from < 5% (2000) to
+          > 50% across most West African vector populations by 2010.
+      - source_type: paper
+        citation: "Ranson H, Lissenden N. Trends Parasitol 2016. (Resistance review)"
+        doi_or_pmid: "10.1016/j.pt.2015.11.010"
+        year: 2016
+        relevance: supporting
+        found_via: bootstrap
+        excerpt: |
+          By 2015, pyrethroid resistance widespread across sub-Saharan
+          Africa; standard LLIN entomological efficacy attenuated 30-60%
+          in resistance-affected sites.
+
+  - id: hbhi_archetypes_2010_vintage
+    kind: data_vintage
+    severity_if_unaddressed: MEDIUM
+    claim: |
+      HBHI archetype assignments (Ozodiegwu et al. 2023) are based on
+      2010 baseline epidemiology — a 14-year gap to a 2024 decision.
+      Pyrethroid resistance has spread, intervention coverage has
+      changed, climate has shifted. Archetype-level parameters may
+      misrepresent current LGA transmission.
+    applies_when:
+      keywords_all: ["nigeria"]
+      keywords_any: ["hbhi", "archetype", "ozodiegwu"]
+      decision_year_min: 2022
+    acknowledgment_hints:
+      ["2010 baseline", "vintage", "14-year gap", "data vintage"]
+    rationale: |
+      Found in 2026-04-29_161312 (Limitation #4). Should be raised
+      earlier so the modeler can choose between using HBHI as-is,
+      augmenting with newer state-level data, or flagging explicitly.
+    last_literature_check: 2026-04-29
+    literature_corroboration:
+      - source_type: paper
+        citation: "Ozodiegwu I et al. Modelling Nigeria's 774 LGAs with EMOD (HBHI). Malar J 2023."
+        doi_or_pmid: null
+        year: 2023
+        relevance: primary
+        found_via: bootstrap
+        excerpt: |
+          Archetype clustering anchored on 2010 baseline NMIS / DHS
+          PfPR estimates; updates intervention coverage but transmission-
+          intensity archetypes themselves use 2010 epidemiology.
+      - source_type: paper
+        citation: "Ozodiegwu ID et al. Harnessing the power of data to support malaria elimination in Nigeria. Malar J 2020."
+        doi_or_pmid: null
+        year: 2020
+        relevance: supporting
+        found_via: bootstrap
+        excerpt: |
+          HBHI baseline document — establishes the 2010 archetype
+          framework subsequently used by Ozodiegwu 2023.
+
+  - id: map_pfpr_api_authentication_required
+    kind: data_vintage
+    severity_if_unaddressed: HIGH
+    claim: |
+      The Malaria Atlas Project (MAP) PfPR raster dataset has required
+      API authentication since approximately 2024. Modelers without
+      authenticated access cannot use LGA-level MAP rasters and must
+      rely on zone-mean proxies. If the analysis CLAIMS to use MAP-
+      derived LGA PfPR but cannot access the API, this must be flagged
+      explicitly as a synthetic-proxy substitution.
+    applies_when:
+      keywords_any: ["map raster", "pfpr raster", "malaria atlas",
+                     "lga pfpr", "lga-level pfpr"]
+      decision_year_min: 2024
+    acknowledgment_hints:
+      ["MAP raster", "API authentication", "synthetic proxy",
+       "synthetic LGA PfPR", "zone mean", "MAP API unavailable"]
+    rationale: |
+      Found in 2026-04-29_161312 (R-009, Limitation #2). The 161312 run
+      synthesized LGA PfPR as zone-mean + N(0,0.035) noise — zero
+      independent LGA-level signal.
+    last_literature_check: 2026-04-29
+    literature_corroboration:
+      - source_type: tool
+        citation: "Malaria Atlas Project portal (https://malariaatlas.org). Authentication policy effective 2024."
+        doi_or_pmid: null
+        year: 2024
+        relevance: primary
+        found_via: bootstrap
+        excerpt: |
+          Raster downloads now require registered API key; legacy direct-
+          download endpoints deprecated.
+      - source_type: tool
+        citation: "malariaAtlas R package CHANGELOG (CRAN 2024 release notes)."
+        doi_or_pmid: null
+        year: 2024
+        relevance: corroborating
+        found_via: bootstrap
+        excerpt: |
+          Package documentation now references MAP API key requirement
+          for all raster pulls.
+      - source_type: paper
+        citation: "Weiss DJ et al. Mapping the global prevalence of P. falciparum. Lancet 2019."
+        doi_or_pmid: "10.1016/S0140-6736(19)31097-9"
+        year: 2019
+        relevance: contextual
+        found_via: bootstrap
+        excerpt: |
+          MAP raster product reference paper — the dataset reports
+          modeled PfPR with covariate-driven within-region variation
+          that is NOT recoverable from zone-mean substitutions.
+
+  # ------------------------------------------------------------------- #
+  # Methodological standards
+  # ------------------------------------------------------------------- #
+
+  - id: or_to_rr_zhang_yu_required
+    kind: methodological_standard
+    severity_if_unaddressed: MEDIUM
+    claim: |
+      OR-derived effect sizes from RCT meta-analyses must be converted
+      to RR using the Zhang-Yu 1998 formula RR = OR / (1 - p₀ + p₀ × OR)
+      before multiplying with baseline prevalence p₀. Direct OR
+      multiplication of prevalence is a common error that overstates
+      protection at high baseline prevalence.
+    applies_when:
+      keywords_any: ["odds ratio", "or=0.", "relative risk", "rr=0.",
+                     "intervention or", "pfpr reduction"]
+    acknowledgment_hints:
+      ["Zhang-Yu", "OR-to-RR", "or_to_rr", "Zhang 1998", "OR / (1 - p"]
+    rationale: |
+      The 161312 run applied the conversion correctly but documented it
+      inconsistently (R-014 three-formula derivation). Surfacing this
+      prior at pre-mortem prevents the modeler from skipping the
+      conversion or documenting it ambiguously.
+    last_literature_check: 2026-04-29
+    literature_corroboration:
+      - source_type: paper
+        citation: "Zhang J, Yu KF. JAMA 1998;280:1690-1691."
+        doi_or_pmid: "10.1001/jama.280.19.1690"
+        year: 1998
+        relevance: primary
+        found_via: bootstrap
+        excerpt: |
+          Provides the exact correction formula and derivation; cited
+          > 4000 times for adjusting OR-based effect estimates.
+      - source_type: paper
+        citation: "Knol MJ et al. Int J Epidemiol 2008;37:1370-1372."
+        doi_or_pmid: "10.1093/ije/dyn212"
+        year: 2008
+        relevance: corroborating
+        found_via: bootstrap
+        excerpt: |
+          Recommendation paper: when using OR from cohort/CRT data
+          where outcome is common (>10%), correct to RR before
+          population-impact calculations.
+
+  - id: pbo_irs_combination_not_independent_multiplicative
+    kind: methodological_standard
+    severity_if_unaddressed: HIGH
+    claim: |
+      Combining PBO-LLIN and IRS by multiplying independent ORs assumes
+      independent mechanisms. Pryce et al. 2022 Cochrane found
+      qualitative improvement of LLIN+IRS over LLIN alone but did NOT
+      support multiplicative independence. Modelers must either cite an
+      empirical combined-effect study, test sub-additive sensitivity,
+      or scope-declare the multiplicative-independence assumption.
+    applies_when:
+      keywords_all: ["irs"]
+      keywords_any: ["pbo", "llin", "bednet"]
+    acknowledgment_hints:
+      ["Pryce 2022", "sub-additive", "independence assumption",
+       "multiplicative combination", "combined effect"]
+    rationale: |
+      Found in 2026-04-29_161312 (R-012). Multiplying PBO×IRS biases
+      marginal IRS upgrades to look more cost-effective than they
+      probably are.
+    last_literature_check: 2026-04-29
+    literature_corroboration:
+      - source_type: meta_analysis
+        citation: "Pryce J et al. Cochrane Database Syst Rev 2022."
+        doi_or_pmid: "10.1002/14651858.CD012688.pub2"
+        year: 2022
+        relevance: primary
+        found_via: bootstrap
+        excerpt: |
+          Additional protection from IRS over LLIN alone is "modest
+          and uncertain"; insufficient evidence to support a strict
+          multiplicative-independence assumption.
+      - source_type: paper
+        citation: "West PA et al. PLoS Med 2014;11:e1001630."
+        doi_or_pmid: "10.1371/journal.pmed.1001630"
+        year: 2014
+        relevance: corroborating
+        found_via: bootstrap
+        excerpt: |
+          Tanzania cluster-RCT of LLIN+IRS vs LLIN alone: combined
+          effect smaller than multiplicative independent product.
+      - source_type: paper
+        citation: "Mosha JF et al. Lancet 2022;399:1227-1241. (Tanzania ITN+IRS)"
+        doi_or_pmid: "10.1016/S0140-6736(22)00216-3"
+        year: 2022
+        relevance: corroborating
+        found_via: bootstrap
+        excerpt: |
+          Combined ITN+IRS clinical incidence reduction did not match
+          the multiplicative product of individual ITN and IRS
+          estimates.
+
+  - id: programmatic_delivery_efficiency_not_100pct
+    kind: methodological_standard
+    severity_if_unaddressed: MEDIUM
+    claim: |
+      Real-world intervention campaigns achieve 60-85% of target
+      coverage, not 100%. Models that apply published RCT effect sizes
+      at 100% coverage — without a delivery-efficiency adjustment —
+      overstate impact by 20-33%.
+    canonical_value: [0.60, 0.85]
+    units: fraction_of_target_achieved
+    applies_when:
+      keywords_any: ["coverage", "campaign", "rollout", "programmatic",
+                     "intervention coverage"]
+    acknowledgment_hints:
+      ["delivery efficiency", "programmatic effectiveness", "70%",
+       "real-world", "campaign effectiveness"]
+    rationale: |
+      Found in 2026-04-28_224202 (added in late rounds) and
+      2026-04-29_161312 (R-011 unaddressed).
+    last_literature_check: 2026-04-29
+    literature_corroboration:
+      - source_type: paper
+        citation: "Bhatt S et al. Nature 2015;526:207-211."
+        doi_or_pmid: "10.1038/nature15535"
+        year: 2015
+        relevance: primary
+        found_via: bootstrap
+        excerpt: |
+          Programmatic-vs-RCT efficacy gap noted: ITN attributable
+          fraction relies on actual coverage achieved (~50-70% in 2015),
+          not nominal 100% targets.
+      - source_type: paper
+        citation: "Bertozzi-Villa A et al. Nat Commun 2021;12:3589."
+        doi_or_pmid: "10.1038/s41467-021-23707-7"
+        year: 2021
+        relevance: corroborating
+        found_via: bootstrap
+        excerpt: |
+          LLIN coverage decay model: typical post-campaign access
+          peaks at ~70-80% of target and declines ~20%/yr.
+      - source_type: report
+        citation: "PMI Nigeria 2017 ITN Mass Campaign Post-Evaluation. NMEP."
+        doi_or_pmid: null
+        year: 2018
+        relevance: corroborating
+        found_via: bootstrap
+        excerpt: |
+          2017 Nigeria ITN campaign achieved ~70% household ownership
+          target across surveyed states.

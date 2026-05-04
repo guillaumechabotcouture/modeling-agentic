@@ -8,7 +8,8 @@ from claude_agent_sdk import AgentDefinition, HookMatcher
 
 from agents import (
     planner, data, modeler, analyst,
-    critique_methods, critique_domain, critique_presentation, red_team,
+    critique_methods, critique_domain, critique_premortem,
+    critique_presentation, red_team,
     writer,
 )
 
@@ -25,6 +26,7 @@ AGENT_MAX_TURNS = {
     "analyst": 40,
     "critique-methods": 35,
     "critique-domain": 50,
+    "critique-premortem": 30,
     "critique-presentation": 40,
     "critique-redteam": 50,
     "writer": 60,
@@ -251,6 +253,22 @@ def build_agents() -> dict[str, AgentDefinition]:
             skills=["investigation-threads", "model-fitness", "malaria-modeling",
                     "vectors", "vaccination"],
         ),
+        # Phase 17 α: pre-mortem domain critic. Spawned in the PRE-MODEL
+        # window (STAGE 3) before the modeler builds. Reads only plan.md +
+        # hypotheses.md + matching expert_priors. Emits pre_mortem.yaml
+        # listing HIGH-impact concerns the modeler must address (or
+        # scope-declare) in modeling_strategy.md § Pre-mortem Responses.
+        "critique-premortem": AgentDefinition(
+            description=critique_premortem.DESCRIPTION,
+            prompt=critique_premortem.SYSTEM_PROMPT,
+            tools=critique_premortem.TOOLS,
+            model="opus",  # adversarial roleplay strength on a clean slate
+            maxTurns=30,
+            skills=["pre-mortem-domain", "adversarial-redteam",
+                    "model-fitness", "modeling-strategy",
+                    "malaria-modeling", "vectors", "vaccination",
+                    "surveillance", "effect-size-priors"],
+        ),
         "critique-presentation": AgentDefinition(
             description=critique_presentation.DESCRIPTION,
             prompt=critique_presentation.SYSTEM_PROMPT,
@@ -324,6 +342,50 @@ Read plan.md and data_quality.md yourself. Assess:
 - Is the proposed modeling approach feasible given the available data?
 - Are there critical data gaps that would prevent calibration or validation?
 - Is the proposed complexity appropriate for the stated purpose?
+
+**PRE-MORTEM DOMAIN CRITIQUE (Phase 17 α — REQUIRED before STAGE 4):**
+
+Spawn the **critique-premortem** agent in parallel with (or just before)
+the identifiability_a_priori arithmetic. This is an adversarial domain
+critic on a clean slate — it reads only `plan.md`, `hypotheses.md`,
+`success_criteria.yaml`, the question, and the matching subset of
+`.claude/orchestration/expert_priors.yaml`. Its job is to identify
+HIGH-impact concerns (architecture, data, feasibility, blind spots) that
+would be expensive to fix once MODEL has built.
+
+To compute the matching priors AND surface registry health, run:
+
+```bash
+# Validate registry first (Phase 17 δ — cheap structural check)
+python3 scripts/lib/expert_priors.py --validate
+
+# Generate the YAML block to inject into the agent's spawn prompt:
+python3 scripts/lib/expert_priors.py --match-yaml "<question>" --decision-year <year>
+```
+
+The `--match-yaml` output is a structured YAML doc with each matching
+prior's full `literature_corroboration` (≥2 sources for MEDIUM, ≥3 for
+HIGH). Inject the entire block as `MATCHING_PRIORS` in the spawn
+prompt. The agent uses the corroborations to ground each concern in
+cited literature — concerns are not the agent's opinions but the
+field's convergent positions.
+
+The agent writes `{run_dir}/pre_mortem.yaml` with concerns categorized
+ARCHITECTURE / DATA / FEASIBILITY / BLIND_SPOT / EXPERT_PRIOR.
+
+After the agent completes, read `pre_mortem.yaml`. For each HIGH concern,
+ensure the modeler addresses it in `modeling_strategy.md § Pre-mortem
+Responses` (filling `addressed_in:` in the YAML). If a HIGH cannot be
+addressed, the modeler must scope-declare it in `scope_declaration.yaml`
+with justification.
+
+The validator (`scripts/validate_critique_yaml.py`) enforces this:
+- Round 1: missing `pre_mortem.yaml` → MEDIUM (drafting window)
+- Round ≥ 2: missing `pre_mortem.yaml` or unaddressed HIGH → HIGH (blocks
+  ACCEPT, but scope-declarable — pre-mortem concerns are domain heuristics,
+  not arithmetic facts)
+
+See the `pre-mortem-domain` skill.
 
 **A-PRIORI IDENTIFIABILITY (Phase 15 α — REQUIRED before STAGE 4):**
 
@@ -751,6 +813,41 @@ The writer_qa pass catches:
 The validator also flags `writer_qa_missing` MEDIUM if the QA pass
 wasn't run, and `writer_qa_unresolved` MEDIUM if the verdict is
 REVISE/MAJOR_REVISION at run completion.
+
+#### Coherence audit (Phase 17 Commit β — REQUIRED alongside writer_qa)
+
+After (or alongside) writer_qa, run the coherence auditor:
+
+```bash
+python3 scripts/coherence_audit.py {run_dir}
+```
+
+This writes `{run_dir}/coherence_audit.yaml` with three duties:
+
+- **label_coherence**: prose verdict labels (UNSTABLE, SENSITIVE,
+  ROBUST, etc.) cross-checked against canonical YAML sources
+  (sensitivity_analysis.yaml, etc.). HIGH on each mismatch.
+- **cross_file_counts**: prose package counts and dollar amounts
+  reconciled against allocation_optimized.csv. HIGH on > 25%
+  drift, MEDIUM on > 5% drift.
+- **self_contradicting**: notes prose in identifiability.yaml,
+  sensitivity_analysis.yaml, within_zone_heterogeneity.yaml
+  cross-checked against same-file structured fields (e.g., notes
+  claim "converged to 0.1" while point_estimate: 0.87). MEDIUM
+  default, HIGH when drift > 5x.
+
+The validator's `_check_coherence_audit` folds HIGH violations
+into the STAGE 7 decision. If the auditor was not run, MEDIUM
+`coherence_audit_not_run` fires.
+
+If `coherence_audit.yaml` returns DRIFT_DETECTED with HIGH
+violations, the lead should either:
+- Re-spawn the writer with the specific drifts to fix
+  (`coherence_audit.yaml::violations` is the input list), then
+  re-run the auditor to verify CLEAN, OR
+- Scope-declare the residual drift in `scope_declaration.yaml`
+  with justification (e.g., "the prose 'UNSTABLE' is the operator's
+  own assessment, not a verdict mismatch").
 
 #### Multimodal spot-check (Phase 8 Commit ξ — optional)
 
