@@ -2666,6 +2666,10 @@ _VALIDATOR_KIND_ESCALATION_THRESHOLDS = {
     # `optimization_quality_*_failed` includes the R-005-class
     # "no ILP benchmark" MEDIUMs that persisted in 104914
     "optimization_quality_alternative_missing": 4,
+    # Phase 17 β: lead must invoke scripts/coherence_audit.py post-WRITE.
+    # Persistent absence after 4 rounds escalates to HIGH so the gate
+    # forces fix-or-scope-declare rather than silently passing.
+    "coherence_audit_not_run": 4,
 }
 
 # Critique-blocker IDs from critique-presentation that should
@@ -2825,7 +2829,7 @@ def _check_coherence_audit(run_dir: str) -> list[dict]:
     Returns: list of {kind, severity, stage, claim} dicts.
     """
     report_path = os.path.join(run_dir, "report.md")
-    audit_path = os.path.join(run_dir, "coherence_audit.yaml")
+    audit_path = artifact_path("coherence_audit", run_dir)
     out: list[dict] = []
 
     if not os.path.exists(report_path):
@@ -2874,8 +2878,12 @@ def _check_coherence_audit(run_dir: str) -> list[dict]:
 
     for duty, vlist in per_duty.items():
         # Always emit individual HIGHs (these block ACCEPT).
-        highs = [v for v in vlist if str(v.get("severity")).upper() == "HIGH"]
-        meds = [v for v in vlist if str(v.get("severity")).upper() == "MEDIUM"]
+        # Use a default empty string so a violation lacking a severity
+        # field doesn't silently become "NONE" (str(None).upper()) and
+        # disappear from both buckets — Phase 10 χ non-crashing-reads
+        # contract treats missing fields as MEDIUM-equivalent advisories.
+        highs = [v for v in vlist if str(v.get("severity") or "").upper() == "HIGH"]
+        meds = [v for v in vlist if str(v.get("severity") or "").upper() == "MEDIUM"]
         for v in highs[:5]:  # cap at 5 per duty
             out.append({
                 "kind": f"coherence_audit_{duty}",

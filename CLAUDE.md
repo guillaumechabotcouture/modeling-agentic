@@ -116,9 +116,10 @@ skill changes are listed below; bug fixes are not.
 - **Severity hierarchy**: HIGH blocks STAGE 7 ACCEPT; MEDIUM is a
   warning; LOW is informational. The `_check_*` functions return
   `[{"kind": str, "severity": "HIGH" | "MEDIUM", "claim": str, ...}]`.
-- **Self-test discipline**: every script under `scripts/` has a
-  `--self-test` flag that runs inline test cases. Run all six
-  before opening a PR (see verification below).
+- **Self-test discipline**: every script under `scripts/` (and
+  `scripts/lib/`) has a `--self-test` flag that runs inline test
+  cases. Run all of them before opening a PR (see verification block
+  below for the current list).
 - **Retro-checks against real runs**: when a Phase ships a new
   gate, the PR description includes a retro-check against the most
   recent `runs/` directory showing the gate produces the expected

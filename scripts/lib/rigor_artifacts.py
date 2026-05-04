@@ -36,7 +36,7 @@ _MANIFEST_PATH = os.path.normpath(
                  ".claude", "orchestration", "rigor_artifacts.yaml")
 )
 
-_VALID_STAGES = frozenset({"pre_model", "model", "allocation"})
+_VALID_STAGES = frozenset({"pre_model", "model", "allocation", "write"})
 _VALID_TRIGGERS = frozenset({"always", "allocation", "aggregation_ratio_lt_0.1"})
 
 
@@ -192,7 +192,9 @@ def _self_test() -> int:
     ids = {a.id for a in arts}
     must = {"identifiability_a_priori", "outcome_fn", "model_comparison",
             "identifiability", "sensitivity_analysis", "allocation_robustness",
-            "within_zone_heterogeneity", "sanity_schema", "decision_rule"}
+            "within_zone_heterogeneity", "sanity_schema", "decision_rule",
+            # Phase 17 α + β additions
+            "pre_mortem", "coherence_audit"}
     missing = must - ids
     assert not missing, f"manifest missing required ids: {sorted(missing)}"
 
@@ -224,6 +226,13 @@ def _self_test() -> int:
     a = artifact("identifiability_a_priori")
     assert not a.scope_declarable, \
         "identifiability_a_priori must be scope_declarable=false (Phase 15 α contract)"
+
+    # T5b: scope_declarable=True enforced for pre_mortem (Phase 17 α
+    # contract: pre-mortem concerns are domain heuristics, not
+    # arithmetic facts; the modeler may scope-declare a HIGH).
+    a = artifact("pre_mortem")
+    assert a.scope_declarable, \
+        "pre_mortem must be scope_declarable=true (Phase 17 α contract)"
 
     # T6: validation errors on a malformed manifest.
     bad = "artifacts:\n  - id: x\n    path: x.yaml\n"

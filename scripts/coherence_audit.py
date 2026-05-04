@@ -64,11 +64,14 @@ _LABEL_CANONICAL_SOURCES = [
         "allowed_values": ["ROBUST", "SENSITIVE", "UNSTABLE"],
         "prose_files": ["report.md", "decision_rule.md", "results.md"],
         # Aliases that should also count as a mention of a label
-        # (e.g., "allocation is unstable" → UNSTABLE)
+        # (e.g., "allocation is unstable" → UNSTABLE). Matched
+        # case-insensitively so title-case ("Robust", "Sensitive",
+        # "Unstable") at sentence starts and after punctuation is
+        # caught alongside ALL-CAPS verdict labels and lowercase prose.
         "alias_patterns": {
-            "ROBUST": [r"\bROBUST\b", r"\brobust\b"],
-            "SENSITIVE": [r"\bSENSITIVE\b", r"\bsensitive\b"],
-            "UNSTABLE": [r"\bUNSTABLE\b", r"\bunstable\b"],
+            "ROBUST": [r"\brobust\b"],
+            "SENSITIVE": [r"\bsensitive\b"],
+            "UNSTABLE": [r"\bunstable\b"],
         },
         # If the prose word appears next to one of these qualifier words,
         # it's a generic English usage, not a verdict claim — skip.
@@ -125,7 +128,7 @@ def _audit_label_coherence(run_dir: str) -> list[dict]:
                 if label.upper() == canonical_upper:
                     continue  # the canonical label is OK to appear
                 for pat in src["alias_patterns"].get(label, []):
-                    for m in re.finditer(pat, text):
+                    for m in re.finditer(pat, text, re.IGNORECASE):
                         # Inspect 30-char window around the match for
                         # generic-use qualifiers — skip if found.
                         win_start = max(0, m.start() - 25)
@@ -171,15 +174,27 @@ _COUNT_DRIFT_THRESHOLD = 0.05
 
 
 def _read_allocation_csv(run_dir: str) -> list[dict] | None:
-    """Find and parse allocation_optimized.csv (or allocation.csv)."""
-    for name in ("allocation_optimized.csv", "allocation.csv"):
-        path = os.path.join(run_dir, name)
-        if os.path.exists(path):
-            try:
-                with open(path) as f:
-                    return list(csv.DictReader(f))
-            except OSError:
-                return None
+    """Find and parse the allocation CSV.
+
+    Searches the same locations as
+    `validate_critique_yaml.py::_find_allocation_csvs`: run_dir root,
+    then `data/` and `models/` subdirectories. Real runs place
+    allocation CSVs in any of these (root for 161312 / 115318;
+    `models/` for several earlier runs in 224202-class trees).
+    """
+    candidates = ("allocation_optimized.csv", "allocation.csv")
+    search_dirs = (run_dir,
+                   os.path.join(run_dir, "data"),
+                   os.path.join(run_dir, "models"))
+    for d in search_dirs:
+        for name in candidates:
+            path = os.path.join(d, name)
+            if os.path.exists(path):
+                try:
+                    with open(path) as f:
+                        return list(csv.DictReader(f))
+                except OSError:
+                    return None
     return None
 
 
@@ -236,8 +251,13 @@ def _scan_dollar_amount_with_package(doc_text: str) -> list[dict]:
                 amt *= 1_000_000
             elif unit in ("k", "thousand"):
                 amt *= 1_000
-            elif amt < 1_000:
-                # < 1000 likely a per-person figure ($1.20/person/yr)
+            else:
+                # No unit suffix. Bare dollar amounts < $1M are
+                # almost always per-unit ratios ($/DALY, $/case,
+                # $/person) or per-person costs ($1.20/person/yr),
+                # not portfolio claims worth checking against the
+                # CSV. Phase 17 ε: skip these to eliminate the
+                # 115318-retro false-positive class.
                 continue
             # Wider context window for filtering
             ctx_start = max(0, m.start() - 80)
@@ -255,6 +275,17 @@ def _scan_dollar_amount_with_package(doc_text: str) -> list[dict]:
                                      min(len(doc_text), m.end() + 40)]
             full_dollar_phrase = m.group(0) + after_dollar
             if any(p.search(full_dollar_phrase) for p in _BUDGET_POOL_PATTERNS):
+                continue
+            # Skip per-unit cost ratios (e.g., "$1,500/DALY",
+            # "$30/case", "$8/person/year") — these are unit prices,
+            # not portfolio costs. Phase 17 ε regression fix: the
+            # 115318 retro had 6 false positives where $/DALY ratios
+            # in narrative were classified as package costs.
+            ratio_suffix = doc_text[m.end():
+                                    min(len(doc_text), m.end() + 25)].lower()
+            if any(s in ratio_suffix for s in
+                   ("/daly", "/case", "/person", " per daly",
+                    " per case", " per person")):
                 continue
             # Skip markdown table rows — table cells often pair
             # benchmark-vs-our-value comparisons that aren't package-cost
@@ -278,7 +309,10 @@ def _audit_cross_file_counts(run_dir: str) -> list[dict]:
     if rows is None or not rows:
         return violations
 
-    # Compute canonical aggregates from the CSV
+    # Compute canonical aggregates from the CSV. Cost column varies
+    # across run schemas: older runs (161312) use `annual_cost`; newer
+    # runs (115318+) use `cost_usd`. Try both.
+    cost_columns = ("annual_cost", "cost_usd")
     pkg_counts: dict[str, int] = {}
     pkg_costs: dict[str, float] = {}
     for r in rows:
@@ -286,13 +320,16 @@ def _audit_cross_file_counts(run_dir: str) -> list[dict]:
         if not pkg:
             continue
         pkg_counts[pkg] = pkg_counts.get(pkg, 0) + 1
-        try:
-            cost = float(r.get("annual_cost", "0") or 0)
-        except (TypeError, ValueError):
-            cost = 0.0
+        cost = 0.0
+        for col in cost_columns:
+            v = r.get(col)
+            if v not in (None, ""):
+                try:
+                    cost = float(v)
+                    break
+                except (TypeError, ValueError):
+                    continue
         pkg_costs[pkg] = pkg_costs.get(pkg, 0.0) + cost
-    total_lgas = len(rows)
-    total_cost = sum(pkg_costs.values())
 
     # Read the report (the writer's output is the primary target)
     for prose_file in ("report.md", "decision_rule.md", "results.md"):
