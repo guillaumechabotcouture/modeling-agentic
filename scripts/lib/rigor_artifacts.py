@@ -194,7 +194,9 @@ def _self_test() -> int:
             "identifiability", "sensitivity_analysis", "allocation_robustness",
             "within_zone_heterogeneity", "sanity_schema", "decision_rule",
             # Phase 17 α + β additions
-            "pre_mortem", "coherence_audit"}
+            "pre_mortem", "coherence_audit",
+            # Phase 18 α addition
+            "claims_ledger"}
     missing = must - ids
     assert not missing, f"manifest missing required ids: {sorted(missing)}"
 
@@ -233,6 +235,13 @@ def _self_test() -> int:
     a = artifact("pre_mortem")
     assert a.scope_declarable, \
         "pre_mortem must be scope_declarable=true (Phase 17 α contract)"
+
+    # T5c: scope_declarable=False enforced for claims_ledger (Phase 18 α
+    # contract: writer cannot produce a clean report without a complete
+    # ledger; modeler/analyst must produce one or rework).
+    a = artifact("claims_ledger")
+    assert not a.scope_declarable, \
+        "claims_ledger must be scope_declarable=false (Phase 18 α contract)"
 
     # T6: validation errors on a malformed manifest.
     bad = "artifacts:\n  - id: x\n    path: x.yaml\n"
