@@ -204,3 +204,23 @@ artifacts:
       produced); registered in the manifest so path resolution stays
       uniform with other rigor artifacts (Phase 16 α single-source-of-
       truth principle).
+
+  - id: claims_ledger
+    path: models/claims_ledger.yaml
+    first_draft_round: 1
+    finalize_round: 3
+    stage: model
+    skill: investigation-threads
+    triggered_by: always
+    scope_declarable: false
+    description: |
+      **ANALYZE-stage artifact** (Phase 18 α). Single source of truth
+      for every quantitative or categorical claim that may appear in
+      report.md. Schema: claims[].{id, claim_kind, value, units, ci_low,
+      ci_high, source_artifact, source_field, causal_label, confidence}.
+      Writer references each claim via `[CLAIM:claim_id]` syntax;
+      `scripts/render_claims.py` substitutes at write-time. Coherence
+      auditor's `ledger_binding` duty (Phase 18 β) verifies every
+      number/label in report.md is ledger-bound. **NOT scope-
+      declarable** — once ANALYZE produces results, the writer needs
+      a complete ledger or it cannot produce a clean report.

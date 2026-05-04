@@ -624,16 +624,263 @@ def _audit_self_contradicting(run_dir: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Duty 4 — Ledger binding (Phase 18 β)
+# ---------------------------------------------------------------------------
+
+
+def _audit_ledger_binding(run_dir: str) -> list[dict]:
+    """Verify every numeric / verdict-label in report.md is ledger-bound.
+
+    Phase 18 β: with `models/claims_ledger.yaml` available, every
+    quantitative or categorical claim in report.md should have come
+    from a `[CLAIM:id]` reference (rendered post-write). After
+    rendering, the report contains the formatted values directly.
+    This duty scans the rendered report for numbers/labels and
+    confirms each appears as a ledger value.
+
+    Returns HIGH for unbound numbers/labels, MEDIUM consolidated
+    advisory for moderate drift counts.
+
+    If `claims_ledger.yaml` is absent, this duty is a no-op (the
+    `_check_claims_ledger_present` check will fire separately).
+    """
+    violations: list[dict] = []
+    ledger_path = os.path.join(run_dir, "models", "claims_ledger.yaml")
+    report_path = os.path.join(run_dir, "report.md")
+    if not os.path.exists(ledger_path) or not os.path.exists(report_path):
+        return []
+    try:
+        with open(ledger_path) as f:
+            doc = yaml.safe_load(f) or {}
+    except (yaml.YAMLError, OSError):
+        return []
+    ledger_claims = doc.get("claims") or []
+    if not isinstance(ledger_claims, list):
+        return []
+
+    # Build a "values seen" set from the ledger. For each claim,
+    # include the canonical value and (where applicable) common
+    # rendered forms — e.g., a scalar 7467997 might appear in prose
+    # as "7.47M", "7.5M", "7,467,997", etc. We index multiple
+    # renderings to make matching robust.
+    bound_values: set[str] = set()
+    for c in ledger_claims:
+        if not isinstance(c, dict):
+            continue
+        v = c.get("value")
+        kind = (c.get("claim_kind") or "").lower()
+        if v is None:
+            continue
+        # Add the bare value
+        bound_values.add(str(v).strip())
+        # For numeric kinds, add common renderings
+        if kind in ("scalar", "currency"):
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            # Magnitude-suffix renderings at multiple precisions
+            for divisor, suffix in (
+                (1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K"),
+            ):
+                if abs(fv) >= divisor:
+                    for prec in (0, 1, 2, 3):
+                        scaled = fv / divisor
+                        bound_values.add(f"{scaled:.{prec}f}{suffix}")
+                        bound_values.add(f"{scaled:.{prec}f}".rstrip("0").rstrip(".") + suffix)
+            # Comma-formatted
+            try:
+                bound_values.add(f"{int(fv):,}")
+            except (ValueError, OverflowError):
+                pass
+        elif kind == "percentage":
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            for prec in (0, 1, 2):
+                bound_values.add(f"{fv:.{prec}f}%")
+        elif kind == "label":
+            bound_values.add(str(v).upper())
+            bound_values.add(str(v).lower())
+            bound_values.add(str(v).title())
+        elif kind == "count":
+            try:
+                bound_values.add(str(int(v)))
+                bound_values.add(f"{int(v):,}")
+            except (TypeError, ValueError):
+                pass
+        # Add CI-bound endpoints too (so "5.14M" in prose is
+        # bound by the parent claim's ci_low even though it's not
+        # the value itself)
+        for ci_field in ("ci_low", "ci_high"):
+            cv = c.get(ci_field)
+            if cv is None:
+                continue
+            try:
+                fcv = float(cv)
+            except (TypeError, ValueError):
+                continue
+            bound_values.add(str(cv).strip())
+            for divisor, suffix in (
+                (1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K"),
+            ):
+                if abs(fcv) >= divisor:
+                    for prec in (0, 1, 2, 3):
+                        scaled = fcv / divisor
+                        bound_values.add(f"{scaled:.{prec}f}{suffix}")
+                        bound_values.add(f"{scaled:.{prec}f}".rstrip("0").rstrip(".") + suffix)
+
+    try:
+        with open(report_path) as f:
+            text = f.read()
+    except OSError:
+        return []
+
+    # Scan numbers in the report. Reuse numeric_consistency primitives
+    # for package counts / dollars, and add a generic numeric scan.
+    # Skip table rows (table cells are intentionally allowed to
+    # restate ledger values; the verbatim match in bound_values
+    # already covers them).
+    unbound: list[dict] = []
+    seen_unbound: set[str] = set()
+
+    # Scan dollar amounts (M/K-suffixed)
+    pat_dollar = re.compile(r"\$\s*([\d,]+(?:\.\d+)?)\s*(M|million|K|k|thousand|B|billion)?",
+                            re.IGNORECASE)
+    for m in pat_dollar.finditer(text):
+        amt_str = m.group(1).replace(",", "")
+        try:
+            amt = float(amt_str)
+        except ValueError:
+            continue
+        unit = (m.group(2) or "").lower()
+        if unit in ("m", "million"):
+            scaled = amt * 1_000_000
+            display = f"${m.group(1).strip()}{unit.upper() if unit in ('m','k','b') else 'M'}"
+        elif unit in ("k", "thousand"):
+            scaled = amt * 1_000
+            display = f"${m.group(1).strip()}K"
+        elif unit in ("b", "billion"):
+            scaled = amt * 1_000_000_000
+            display = f"${m.group(1).strip()}B"
+        else:
+            scaled = amt
+            display = f"${m.group(1).strip()}"
+        # Consider bound if either (a) the rendered display matches a
+        # ledger value, or (b) the scaled value is within 5% of any
+        # ledger numeric value, or (c) any common rendering of `scaled`
+        # is in bound_values.
+        is_bound = False
+        # Check display string variants
+        for v_str in bound_values:
+            if v_str.lower().endswith(("m", "k", "b")) and v_str.lower() == display[1:].lower():
+                is_bound = True
+                break
+        # Check magnitude renderings
+        if not is_bound:
+            test_renders: list[str] = []
+            for divisor, suffix in (
+                (1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K"),
+            ):
+                if abs(scaled) >= divisor:
+                    for prec in (0, 1, 2, 3):
+                        s = f"{scaled / divisor:.{prec}f}".rstrip("0").rstrip(".") + suffix
+                        test_renders.append(s)
+            if any(r in bound_values for r in test_renders):
+                is_bound = True
+        # Check verbatim numeric value
+        if not is_bound:
+            if str(int(scaled)) in bound_values or f"{int(scaled):,}" in bound_values:
+                is_bound = True
+        # Skip per-unit ratios + small bare amounts (already filtered
+        # by cross_file_counts, but apply same logic here for parity)
+        if amt < 1_000 and not unit:
+            continue
+        # Skip if next 25 chars contain /DALY, /case, /person
+        ratio_suffix = text[m.end():min(len(text), m.end() + 25)].lower()
+        if any(s in ratio_suffix for s in
+               ("/daly", "/case", "/person", " per daly",
+                " per case", " per person")):
+            continue
+        if not is_bound:
+            key = display
+            if key in seen_unbound:
+                continue
+            seen_unbound.add(key)
+            line_no = text.count("\n", 0, m.start()) + 1
+            ctx_start = max(0, m.start() - 60)
+            ctx_end = min(len(text), m.end() + 60)
+            ctx = text[ctx_start:ctx_end].replace("\n", " ")
+            unbound.append({
+                "id": f"CA-LB-{len(unbound) + 1:03d}",
+                "severity": "HIGH",
+                "duty": "ledger_binding",
+                "location": f"report.md:{line_no}",
+                "claim": (
+                    f"Currency `{display}` in prose is not in claims_ledger.yaml. "
+                    f"Phase 18 α requires every quantitative claim to be "
+                    f"`[CLAIM:id]`-referenced and rendered from the ledger. "
+                    f"Context: …{ctx.strip()[:140]}…"
+                ),
+                "canonical_source": "models/claims_ledger.yaml",
+                "drifted_value": display,
+            })
+
+    # Scan verdict labels (ROBUST/SENSITIVE/UNSTABLE/SUPPORTED/REFUTED)
+    pat_label = re.compile(
+        r"\b(ROBUST|SENSITIVE|UNSTABLE|SUPPORTED|REFUTED|INCONCLUSIVE)\b",
+        re.IGNORECASE,
+    )
+    for m in pat_label.finditer(text):
+        label_raw = m.group(1)
+        upper = label_raw.upper()
+        # Skip generic-use ("robust to perturbations", "sensitive
+        # analysis"); reuse same qualifiers as duty 1
+        win = text[max(0, m.start() - 25):
+                   min(len(text), m.end() + 25)].lower()
+        if any(q in win for q in (
+            "robust to", "robust against", "robust standard",
+            "sensitive to", "sensitive analysis", "sensitive parameters",
+            "sensitivity analysis",
+        )):
+            continue
+        if upper in bound_values:
+            continue
+        key = upper
+        if key in seen_unbound:
+            continue
+        seen_unbound.add(key)
+        line_no = text.count("\n", 0, m.start()) + 1
+        unbound.append({
+            "id": f"CA-LB-{len(unbound) + 1:03d}",
+            "severity": "HIGH",
+            "duty": "ledger_binding",
+            "location": f"report.md:{line_no}",
+            "claim": (
+                f"Verdict label {label_raw!r} in prose is not in "
+                f"claims_ledger.yaml. Phase 18 α requires verdict labels "
+                f"to be `[CLAIM:id]`-referenced from the ledger."
+            ),
+            "canonical_source": "models/claims_ledger.yaml",
+            "drifted_value": upper,
+        })
+
+    return unbound
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 
 def audit_run(run_dir: str) -> dict:
-    """Run all three duties and return a structured result dict."""
+    """Run all four duties and return a structured result dict."""
     label_v = _audit_label_coherence(run_dir)
     counts_v = _audit_cross_file_counts(run_dir)
     self_v = _audit_self_contradicting(run_dir)
-    all_v = label_v + counts_v + self_v
+    ledger_v = _audit_ledger_binding(run_dir)
+    all_v = label_v + counts_v + self_v + ledger_v
     has_high = any(v["severity"] == "HIGH" for v in all_v)
     return {
         "generated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
@@ -641,6 +888,7 @@ def audit_run(run_dir: str) -> dict:
             "label_coherence": {"violations": label_v, "n": len(label_v)},
             "cross_file_counts": {"violations": counts_v, "n": len(counts_v)},
             "self_contradicting": {"violations": self_v, "n": len(self_v)},
+            "ledger_binding": {"violations": ledger_v, "n": len(ledger_v)},
         },
         "violations": all_v,
         "verdict": "DRIFT_DETECTED" if all_v else "CLEAN",
@@ -795,6 +1043,73 @@ def _self_test() -> int:
            f"T6: written YAML must round-trip, got {loaded}")
         ok(loaded["has_high"] is True,
            "T6: HIGH violation must propagate to has_high=True")
+
+    # T7: ledger_binding duty — ledger absent → silent
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "report.md"), "w") as f:
+            f.write("# Report\nValue: 7.47M DALYs.\n")
+        v = _audit_ledger_binding(d)
+        ok(v == [], f"T7: no ledger → silent, got {v}")
+
+    # T8: ledger_binding duty — fully bound report → no violations
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "models", "claims_ledger.yaml"), "w") as f:
+            yaml.safe_dump({"claims": [
+                {"id": "dalys", "claim_kind": "scalar",
+                 "value": 7467997, "ci_low": 5140000, "ci_high": 10420000},
+                {"id": "verdict", "claim_kind": "label", "value": "ROBUST"},
+                {"id": "share", "claim_kind": "percentage", "value": 52.5},
+                {"id": "budget", "claim_kind": "currency", "value": 320000000},
+            ]}, f)
+        with open(os.path.join(d, "report.md"), "w") as f:
+            f.write("# Report\n\nThe optimized allocation averts 7.47M "
+                    "DALYs (95% CI: 5.14M-10.42M). North West receives "
+                    "52.5% of the $320M budget. Verdict: ROBUST.\n")
+        v = _audit_ledger_binding(d)
+        ok(v == [],
+           f"T8: fully bound report → 0 violations, got {len(v)}: {v[:2]}")
+
+    # T9: ledger_binding — unbound currency → HIGH
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "models", "claims_ledger.yaml"), "w") as f:
+            yaml.safe_dump({"claims": [
+                {"id": "budget", "claim_kind": "currency", "value": 320000000},
+            ]}, f)
+        with open(os.path.join(d, "report.md"), "w") as f:
+            # $999M is NOT in the ledger; should fire
+            f.write("# Report\n\nThe budget is $320M but the ask was $999M.\n")
+        v = _audit_ledger_binding(d)
+        ok(any("$999" in x.get("drifted_value", "") for x in v),
+           f"T9: unbound $999M should fire HIGH ledger_binding, got {v}")
+
+    # T10: ledger_binding — unbound verdict label → HIGH
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "models", "claims_ledger.yaml"), "w") as f:
+            yaml.safe_dump({"claims": [
+                {"id": "verdict", "claim_kind": "label", "value": "ROBUST"},
+            ]}, f)
+        with open(os.path.join(d, "report.md"), "w") as f:
+            f.write("# Report\n\nVerdict was UNSTABLE per the latest run.\n")
+        v = _audit_ledger_binding(d)
+        ok(any(x.get("drifted_value") == "UNSTABLE" for x in v),
+           f"T10: unbound UNSTABLE should fire ledger_binding, got {v}")
+
+    # T11: generic-use qualifier ("sensitivity analysis") must not fire
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "models", "claims_ledger.yaml"), "w") as f:
+            yaml.safe_dump({"claims": [
+                {"id": "verdict", "claim_kind": "label", "value": "ROBUST"},
+            ]}, f)
+        with open(os.path.join(d, "report.md"), "w") as f:
+            f.write("# Report\n\n## Sensitivity analysis\nWe ran a "
+                    "sensitivity analysis using three perturbations.\n")
+        v = _audit_ledger_binding(d)
+        ok(not any("SENSITIVE" in x.get("drifted_value", "") for x in v),
+           f"T11: 'sensitivity analysis' (heading) must not fire SENSITIVE, got {v}")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)

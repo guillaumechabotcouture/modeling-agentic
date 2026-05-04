@@ -1182,6 +1182,13 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None) -> list[dic
     # fires once report.md has been written.
     violations.extend(_check_coherence_audit(run_dir))
 
+    # Phase 18 Commit α: claims ledger present + schema-valid. The
+    # analyst must register every quantitative/categorical claim in
+    # models/claims_ledger.yaml so the writer can [CLAIM:id]-bind the
+    # report. Round 2 → MEDIUM if absent; round ≥ 3 → HIGH (NOT
+    # scope-declarable per Phase 18 α contract).
+    violations.extend(_check_claims_ledger_present(run_dir, round_n=round_n))
+
     # Phase 12 Commit β: round-aware escalation of persisting MEDIUMs.
     # Catches the failure mode the 104914 run shipped: 18 figure_
     # validator_missing MEDIUMs persisted r2→r6, presentation P-005..
@@ -2804,6 +2811,98 @@ def _check_premortem_addressed(run_dir: str,
                 f"Responses (and set addressed_in:), or add a "
                 f"scope_declaration.yaml entry that quotes {cid}."
             ),
+        })
+    return out
+
+
+_CLAIMS_LEDGER_REQUIRED_FROM_ROUND = 3
+
+
+def _check_claims_ledger_present(run_dir: str,
+                                  round_n: int | None = None
+                                  ) -> list[dict]:
+    """Phase 18 α: validate models/claims_ledger.yaml.
+
+    Emits:
+      claims_ledger_missing      MEDIUM @ r=2, HIGH @ r≥3
+      claims_ledger_invalid      HIGH (yaml malformed or schema violation)
+      claims_ledger_ci_violated  HIGH (ci_low > value or ci_high < value)
+
+    Round gating: round_n=None or round 1 → silent (drafting window).
+    Round 2 → MEDIUM if absent. Round ≥ 3 → HIGH if absent.
+
+    The ledger is NOT scope-declarable (Phase 18 α contract): the
+    writer cannot produce a clean report without it, so the modeler
+    must produce one or scope-declare ABSENCE-OF-WRITER (no report).
+    """
+    if round_n is None or round_n < 2:
+        return []
+
+    yaml_path = artifact_path("claims_ledger", run_dir)
+    out: list[dict] = []
+
+    if not os.path.exists(yaml_path):
+        severity = "HIGH" if round_n >= _CLAIMS_LEDGER_REQUIRED_FROM_ROUND \
+            else "MEDIUM"
+        out.append({
+            "kind": "claims_ledger_missing",
+            "severity": severity,
+            "stage": "ANALYZE",
+            "claim": (
+                f"Required artifact `models/claims_ledger.yaml` is "
+                f"absent at round {round_n}. Phase 18 α requires the "
+                f"analyst to register every quantitative or categorical "
+                f"claim in the ledger before writing results.md, so the "
+                f"writer can reference each via `[CLAIM:claim_id]` "
+                f"syntax. See the analyst SYSTEM_PROMPT § Claims Ledger."
+            ),
+        })
+        return out
+
+    # Validate the schema by reusing render_claims.load_claims, which
+    # checks CI bounds and duplicate ids. Don't fail the whole run on
+    # parse error — emit HIGH coherence_audit_invalid-style violation.
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "render_claims",
+            os.path.join(os.path.dirname(__file__), "render_claims.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    except Exception as e:  # noqa: BLE001
+        out.append({
+            "kind": "claims_ledger_invalid",
+            "severity": "HIGH",
+            "stage": "ANALYZE",
+            "claim": (f"Could not load scripts/render_claims.py to "
+                      f"validate ledger: {e}."),
+        })
+        return out
+
+    try:
+        claims = mod.load_claims(yaml_path)
+    except (ValueError, FileNotFoundError) as e:
+        kind = "claims_ledger_ci_violated" \
+            if "CI bounds violated" in str(e) else "claims_ledger_invalid"
+        out.append({
+            "kind": kind,
+            "severity": "HIGH",
+            "stage": "ANALYZE",
+            "claim": (f"`models/claims_ledger.yaml` failed schema "
+                      f"validation: {e}"),
+        })
+        return out
+
+    # Empty ledger at round ≥ required: still HIGH (analyst produced
+    # the file but registered zero claims, defeating the contract).
+    if not claims:
+        out.append({
+            "kind": "claims_ledger_invalid",
+            "severity": "HIGH",
+            "stage": "ANALYZE",
+            "claim": ("`models/claims_ledger.yaml` is present but contains "
+                      "zero claims. Phase 18 α requires every quantitative "
+                      "or categorical claim in results.md to be registered."),
         })
     return out
 
@@ -5470,6 +5569,64 @@ def _run_self_test() -> int:
         # or fires invalid. Both are acceptable — the goal is no crash.
         ok(isinstance(v, list),
            f"CA6: malformed yaml must not crash; got {v}")
+
+    # --- Phase 18 α: claims_ledger tests (CL-prefix) ---
+    with _tempfile.TemporaryDirectory() as _d:
+        # CL1: round_n=None and round=1 → silent (drafting window)
+        ok(_check_claims_ledger_present(_d, round_n=None) == [],
+           "CL1: round_n=None must be silent")
+        ok(_check_claims_ledger_present(_d, round_n=1) == [],
+           "CL1: round_n=1 (drafting window) must be silent")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # CL2: missing at round 2 → MEDIUM claims_ledger_missing
+        v = _check_claims_ledger_present(_d, round_n=2)
+        ok(any(x["kind"] == "claims_ledger_missing"
+               and x["severity"] == "MEDIUM" for x in v),
+           f"CL2: missing at r=2 should be MEDIUM, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # CL3: missing at round 3+ → HIGH (blocks ACCEPT)
+        v = _check_claims_ledger_present(_d, round_n=3)
+        ok(any(x["kind"] == "claims_ledger_missing"
+               and x["severity"] == "HIGH" for x in v),
+           f"CL3: missing at r=3 should be HIGH, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # CL4: well-formed ledger at r=3 → silent
+        os.makedirs(os.path.join(_d, "models"))
+        with open(os.path.join(_d, "models", "claims_ledger.yaml"), "w") as f:
+            _yaml.safe_dump({"claims": [
+                {"id": "a", "claim_kind": "scalar", "value": 100,
+                 "ci_low": 80, "ci_high": 120},
+                {"id": "b", "claim_kind": "label", "value": "ROBUST"},
+            ]}, f)
+        v = _check_claims_ledger_present(_d, round_n=3)
+        ok(v == [], f"CL4: well-formed ledger should be silent, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # CL5: CI bounds violated → HIGH claims_ledger_ci_violated
+        os.makedirs(os.path.join(_d, "models"))
+        with open(os.path.join(_d, "models", "claims_ledger.yaml"), "w") as f:
+            _yaml.safe_dump({"claims": [
+                {"id": "bad", "claim_kind": "scalar", "value": 50,
+                 "ci_low": 80, "ci_high": 120},
+            ]}, f)
+        v = _check_claims_ledger_present(_d, round_n=3)
+        ok(any(x["kind"] == "claims_ledger_ci_violated"
+               and x["severity"] == "HIGH" for x in v),
+           f"CL5: CI bounds violated should fire HIGH ci_violated, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # CL6: empty ledger at r=3 → HIGH claims_ledger_invalid
+        os.makedirs(os.path.join(_d, "models"))
+        with open(os.path.join(_d, "models", "claims_ledger.yaml"), "w") as f:
+            _yaml.safe_dump({"claims": []}, f)
+        v = _check_claims_ledger_present(_d, round_n=3)
+        ok(any(x["kind"] == "claims_ledger_invalid"
+               and x["severity"] == "HIGH"
+               and "zero claims" in x.get("claim", "") for x in v),
+           f"CL6: empty ledger should fire HIGH invalid w/ zero-claims claim, got {v}")
 
     # --- Summary ---
     if failures:

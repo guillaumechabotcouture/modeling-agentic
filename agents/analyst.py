@@ -21,6 +21,10 @@ and make scientific judgments.
 3. Read {run_dir}/modeling_strategy.md (progression from simple to complex).
 4. Read all model output: {run_dir}/model_comparison.md, model code, stdout.
 5. Read all figures + {run_dir}/figure_rationale.md.
+6. **Produce {run_dir}/models/claims_ledger.yaml BEFORE writing results.md** —
+   see the Claims Ledger section below. Every quantitative or categorical
+   claim that will appear in your `results.md` (and the writer's
+   `report.md`) must be registered in the ledger first.
 
 ## THREAD UPDATES
 
@@ -87,6 +91,98 @@ With computed answers including uncertainty ranges.
 
 ### Limitations
 Specific, not generic. Each limitation should name what it affects.
+
+## Claims Ledger (Phase 18 α — REQUIRED before results.md)
+
+You must produce `{run_dir}/models/claims_ledger.yaml` listing every
+quantitative or categorical claim that will appear in your `results.md`
+or the writer's `report.md`. The writer is bound to reference your
+ledger entries by ID using `[CLAIM:claim_id]` syntax — narrative prose
+may use the references inline, and `scripts/render_claims.py`
+substitutes them at write-time. **The writer cannot introduce numbers
+or labels that are not in the ledger.** This is the structural fix for
+the paraphrase-drift class (R-019, R-020, $197M conflation).
+
+### What goes in the ledger
+- Every scalar with CI (DALYs averted, cost-effectiveness, RMSE, …)
+- Every count (LGAs allocated to package X, archetypes calibrated, …)
+- Every percentage / share (NW budget share, package coverage, …)
+- Every currency figure ($320M total, $122.4M IRS Phase 2, …)
+- Every verdict label (sensitivity ROBUST/SENSITIVE/UNSTABLE,
+  hypothesis SUPPORTED/REFUTED/INCONCLUSIVE, …)
+- Every external-fact citation (GBD 2021 12.8M, UNICEF supply
+  ceiling, …) — values you cite from priors or literature
+
+### What does NOT go in the ledger
+- Free prose (sentences without numbers/labels)
+- Section headers, paragraph structure
+- Generic methodology language
+
+### Schema (one entry per claim)
+
+```yaml
+generated_at: <ISO 8601>
+claims:
+  - id: dalys_optimized_mean              # stable; writer references this
+    claim_kind: scalar                    # scalar | count | label | percentage | currency | citation
+    value: 7467997
+    units: dalys_per_year                 # required for scalar/currency
+    ci_low: 5140000                       # optional, for scalar/percentage
+    ci_high: 10420000
+    source_artifact: uncertainty_report.yaml
+    source_field: scalar_outputs.total_dalys_averted_optimized.mean
+    causal_label: PROXY                   # CAUSAL | ASSOCIATIONAL | PROXY | BY_CONSTRUCTION
+    confidence: HIGH                      # HIGH | MEDIUM | LOW
+    related_text: "DALYs averted under optimized allocation"
+
+  - id: nw_share_pct
+    claim_kind: percentage
+    value: 52.5
+    source_artifact: allocation_optimized.csv
+    source_field: "filter zone='North West'.cost_usd.sum() / total"
+    causal_label: BY_CONSTRUCTION
+    confidence: HIGH
+
+  - id: sensitivity_verdict
+    claim_kind: label
+    value: ROBUST
+    allowed_values: [ROBUST, SENSITIVE, UNSTABLE]
+    source_artifact: models/sensitivity_analysis.yaml
+    source_field: verdict
+    causal_label: BY_CONSTRUCTION
+    confidence: HIGH
+
+  - id: gbd_2021_nigeria_burden
+    claim_kind: scalar
+    value: 12800000
+    units: dalys_per_year
+    source_artifact: external
+    source_field: "GBD 2021 Malaria Collaborators (PMC11914637); 6017/100k * 213M pop"
+    causal_label: BY_CONSTRUCTION
+    confidence: HIGH
+
+  - id: total_budget
+    claim_kind: currency
+    value: 320000000
+    units: usd
+    source_artifact: plan.md
+    source_field: "Global Fund GC7 malaria component (working estimate)"
+    causal_label: BY_CONSTRUCTION
+    confidence: HIGH
+```
+
+### Internal consistency requirement
+
+For scalar/percentage claims with CIs: `ci_low <= value <= ci_high`.
+The validator will reject ledgers where this is violated.
+
+### Round behavior
+
+Round 1 is the drafting window — the ledger MAY be partial. By round
+3 the ledger must cover every quantitative claim that appears in
+`results.md`. The validator's `_check_claims_ledger_present` enforces
+this. The coherence auditor's `ledger_binding` duty checks every
+number/label in `report.md` against the ledger at write time.
 """
 
 
