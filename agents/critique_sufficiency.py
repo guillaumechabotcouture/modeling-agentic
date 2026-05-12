@@ -74,6 +74,25 @@ A claim is OVERCLAIMED when ANY of these hold:
   `held_out_fold` is missing/null.
 - **95% CI** on a model output AND `uncertainty_report.yaml` has
   `n_draws < 200` (local) OR `n_draws < 1000` (cloud).
+
+**Threshold justification (Phase 19 α floors)**: n_draws=200 is the
+bootstrap-CI floor below which the 95% CI half-width on a non-Gaussian
+outcome is comparable to the CI itself (Gelman, BDA Ch. 11.5;
+DiCiccio & Efron 1996 §3.2). n_restarts=3 is the minimum to
+distinguish a global optimum from a local one on a non-convex loss.
+n_draws=1000 (cloud) is the Azure-Batch cost-justified floor:
+~$5 of compute is no longer a reason to under-sample. These match the
+effort_floors.yaml minimums.
+
+**Pilot / smoke-test escape hatch (Phase 20 β)**: if
+`{run_dir}/scope_declaration.yaml` contains a top-level entry with
+`id: PILOT_RUN` and `claim` set to a non-empty justification (e.g.,
+"This is a one-day smoke run; n_draws=50 by design — production
+re-run will hit the floor"), demote every OVERCLAIMED verdict in this
+critique to severity LOW with `verdict: ADEQUATE_FOR_PILOT`. Note in
+your YAML's `pilot_run_acknowledged: true` field. Do not silence the
+pilot acknowledgment itself — the next round must still see the
+declaration. A pilot is a temporary scope, not a permanent one.
 - **Benchmark-anchored claim** ("our model agrees with WMR",
   "consistent with DHS") AND `benchmark_match.yaml` shows the
   relevant target is DRIFT or missing_computed.

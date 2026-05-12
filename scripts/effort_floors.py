@@ -297,10 +297,47 @@ _SHORTCUT_COMMENT_RE = re.compile(r"#\s*(TODO|FIXME|HACK|XXX|SHORTCUT)\b",
                                     re.IGNORECASE)
 
 
+# Phase 20 β: filenames/path-components that flag a file as test, smoke,
+# or example code rather than production. Small literals in these files
+# are intentional (`n_draws=5` in a smoke test, `maxiter=10` in an
+# example) and must not fire shortcut HIGH. The exclusion is best-effort
+# — anyone who writes a production module called `test_outcomes.py`
+# evades the scan, but that's an acceptable trade for not blocking real
+# Phase 19 runs on legitimate test code.
+_TEST_OR_EXAMPLE_FILENAME_RE = re.compile(
+    r"(^|[/_-])(test|tests|smoke|example|examples|fixture|fixtures|"
+    r"sandbox|scratch|notebook|notebooks)([/_-]|$|\.)",
+    re.IGNORECASE,
+)
+
+
+def _is_test_or_example_path(path: str) -> bool:
+    """True if any path component or filename signals test/smoke/
+    example code. Catches `tests/foo.py`, `foo_test.py`, `test_foo.py`,
+    `examples/foo.py`, `foo_smoke.py`, `foo_example.py`, etc.
+    """
+    parts = path.replace("\\", "/").split("/")
+    if any(_TEST_OR_EXAMPLE_FILENAME_RE.search(p) for p in parts):
+        return True
+    return False
+
+
 def _probe_ast_shortcut_scan(run_dir: str,
                               floor: Floor) -> tuple[bool, int | None, str, list[str]]:
     """AST + textual scan over *.py under models/. Returns
-    (passes, count, diagnostic, file_findings)."""
+    (passes, count, diagnostic, file_findings).
+
+    Phase 20 β scope notes:
+    - Skips test/smoke/example files (see `_is_test_or_example_path`).
+    - The scan is **best-effort**. It catches direct keyword arguments
+      (`optimize(n_trials=5)`) and direct name assignments
+      (`n_draws = 5`), but it does NOT catch dict-config patterns
+      (`config = {"n_trials": 5}; optimize(**config)`), attribute-set
+      shortcuts (`cfg.n_trials = 5`), or values read from CLI/env. A
+      modeler determined to evade the scan can always do so; the floor
+      is a tripwire for the casual `n_draws=5` left-behind, not a
+      sandbox.
+    """
     base = os.path.join(run_dir, floor.artifact.rstrip("/"))
     if not os.path.isdir(base):
         return True, None, f"{floor.artifact} not a directory", []
@@ -310,6 +347,12 @@ def _probe_ast_shortcut_scan(run_dir: str,
             if not fname.endswith(".py"):
                 continue
             path = os.path.join(root, fname)
+            # Phase 20 β: skip test/smoke/example files. Small literals
+            # in these files are intentional (smoke-test draws, example
+            # max_iter ceilings) and would otherwise burn the shortcut
+            # budget toward HIGH at round ≥ 2.
+            if _is_test_or_example_path(os.path.relpath(path, base)):
+                continue
             try:
                 with open(path, encoding="utf-8") as f:
                     src = f.read()
@@ -643,6 +686,83 @@ def _self_test() -> int:
         # 500 < 1000 floor → fires MEDIUM
         ok(len(viols) == 1 and viols[0]["severity"] == "MEDIUM",
            f"T13: cloud UQ at 500 draws should fire MEDIUM, got {viols}")
+
+    # T14 (Phase 20 β): AST shortcut scan skips test/smoke/example
+    # files. Smoke-test draw counts and example max_iter ceilings are
+    # intentional small literals; firing on them poisons the budget.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        # Production file: should fire
+        with open(os.path.join(d, "models", "model_run.py"), "w") as f:
+            f.write("def run():\n    n_replicates = 1\n    return n_replicates\n")
+        # Test file: should be skipped
+        with open(os.path.join(d, "models", "test_smoke.py"), "w") as f:
+            f.write("def test_one():\n    n_draws = 5\n    assert n_draws\n")
+        # Examples subdir: should be skipped
+        os.makedirs(os.path.join(d, "models", "examples"))
+        with open(os.path.join(d, "models", "examples", "demo.py"), "w") as f:
+            f.write("# TODO: extend example\nn_iter = 10\n")
+        rep = evaluate(d)
+        viols = [v for v in rep["violations"]
+                 if v["floor_id"] == "shortcut_markers_in_model_code"]
+        joined = " | ".join(viols[0]["findings"]) if viols else ""
+        ok(len(viols) == 1, f"T14: production shortcut must fire, got {viols}")
+        ok("model_run.py" in joined and "n_replicates" in joined,
+           f"T14: production finding must be present, got {joined}")
+        ok("test_smoke.py" not in joined,
+           f"T14: test_smoke.py must be skipped, got {joined}")
+        ok("examples/demo.py" not in joined and "demo.py" not in joined,
+           f"T14: examples/ must be skipped, got {joined}")
+
+    # T14b (Phase 20 β): truthy-but-not-a-list `held_out_fold` placeholder
+    # (e.g. `"yes"`, a bare number) no longer satisfies the floor.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "models", "calibration_result.yaml"), "w") as f:
+            yaml.safe_dump({
+                "n_restarts": 3, "n_iterations": 1000,
+                "held_out_fold": "yes",
+            }, f)
+        rep = evaluate(d)
+        viols = [v for v in rep["violations"]
+                 if v["floor_id"] == "calibration_held_out"]
+        ok(len(viols) == 1 and viols[0]["severity"] == "HIGH",
+           f"T14b: placeholder string must fail HIGH, got {viols}")
+
+    # T14c (Phase 20 β): empty indices list also fails the floor.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "models", "calibration_result.yaml"), "w") as f:
+            yaml.safe_dump({
+                "n_restarts": 3, "n_iterations": 1000,
+                "held_out_fold": {"indices": []},
+            }, f)
+        rep = evaluate(d)
+        viols = [v for v in rep["violations"]
+                 if v["floor_id"] == "calibration_held_out"]
+        ok(len(viols) == 1 and viols[0]["severity"] == "HIGH",
+           f"T14c: empty indices list must fail HIGH, got {viols}")
+
+    # T15 (Phase 20 β): `_is_test_or_example_path` recognizes the
+    # common variants without spuriously matching production names.
+    cases = [
+        ("test_outcome.py", True),
+        ("outcome_test.py", True),
+        ("tests/foo.py", True),
+        ("smoke/run.py", True),
+        ("run_smoke.py", True),
+        ("examples/foo.py", True),
+        ("notebooks/explore.py", True),
+        ("scratch/quick.py", True),
+        ("model_run.py", False),
+        ("outcome_fn.py", False),
+        ("estimate.py", False),
+        ("contestable.py", False),
+    ]
+    for relpath, expected in cases:
+        got = _is_test_or_example_path(relpath)
+        ok(got is expected,
+           f"T15: _is_test_or_example_path({relpath!r}) → {got}, expected {expected}")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)

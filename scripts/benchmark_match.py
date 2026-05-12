@@ -148,6 +148,20 @@ def _band(target: dict) -> tuple[float | None, float | None, str]:
             f = float(factor)
             if f <= 0:
                 return None, None, (f"tolerance_factor must be > 0, got {factor!r}")
+            # Phase 20 β: reject sub-unit factor. A factor < 1 inverts
+            # the band (low = tv/f > tv > tv*f = high), so the
+            # `low <= observed <= high` check in `evaluate` is always
+            # False and every benchmark fires DRIFT regardless of the
+            # observed value. The natural-language reading
+            # `tolerance_factor: 0.2` → "±20%" is wrong but plausible;
+            # surface the misuse instead of silently breaking.
+            if f < 1.0:
+                return None, None, (
+                    f"tolerance_factor must be ≥ 1.0 (got {factor!r}); "
+                    f"factor is multiplicative — for ±20% bands use "
+                    f"`tolerance_factor: 1.25` or `tolerance_abs: "
+                    f"<0.2*target_value>`"
+                )
             # For target=0 the factor band collapses; require abs in that case.
             if tv == 0 and abs_tol is None:
                 return None, None, ("target_value == 0 with no "
@@ -455,6 +469,45 @@ def _self_test() -> int:
             loaded = yaml.safe_load(f)
         ok(loaded["verdict"] == "PASS",
            f"T9: roundtrip must preserve verdict, got {loaded}")
+
+    # T10 (Phase 20 β): sub-unit tolerance_factor is rejected before
+    # producing an inverted, always-DRIFT band. `tolerance_factor: 0.5`
+    # naively reads as "±50%" but is multiplicative — it would invert
+    # `low/high` and silently fail every benchmark.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "models", "benchmark_targets.yaml"), "w") as f:
+            yaml.safe_dump({
+                "benchmarks": [
+                    {"id": "b1", "metric": "incidence", "target_value": 400,
+                     "tolerance_factor": 0.5, "source": "WMR 2023",
+                     "computed_value": 387},
+                ]
+            }, f)
+        rep = evaluate(d)
+        # Should be a band-construction failure (DRIFT with diagnostic),
+        # not silently inverting bands and computing False inclusion.
+        r = rep["results"][0]
+        ok(r.get("band_low") is None and r.get("band_high") is None,
+           f"T10: sub-unit factor must NOT yield a band, got {r}")
+        ok("must be ≥ 1.0" in (r.get("diagnostic") or ""),
+           f"T10: diagnostic must explain factor ≥ 1, got {r}")
+
+    # T10b (Phase 20 β): tolerance_factor exactly 1.0 produces a
+    # zero-width band — narrow but mathematically valid.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "models", "benchmark_targets.yaml"), "w") as f:
+            yaml.safe_dump({
+                "benchmarks": [
+                    {"id": "b1", "metric": "incidence", "target_value": 400,
+                     "tolerance_factor": 1.0, "source": "WMR 2023",
+                     "computed_value": 400},
+                ]
+            }, f)
+        rep = evaluate(d)
+        ok(rep["verdict"] == "PASS",
+           f"T10b: factor=1.0 with exact match should PASS, got {rep}")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)
