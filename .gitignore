@@ -11,7 +11,10 @@ watchdog.sh
 
 # Local run logs and scratch
 *.log
-run_*.sh
+# Anchor run_*.sh to repo root only (Phase 20 γ) — without the leading
+# slash, a future scripts/run_pipeline.sh or ci/run_smoke.sh would be
+# silently ignored.
+/run_*.sh
 stage7_*stderr*.txt
 validate_stderr_*.txt
 validator_stderr_*.txt
