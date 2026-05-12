@@ -17,10 +17,15 @@ the analyst found, structured as a journal article.
 1. **{run_dir}/threads.yaml** — the investigation manifest. This tells you
    which threads are complete, conditional, or blocked. Structure the report
    around complete threads. See the investigation-threads skill.
-2. results.md — the analyst's interpretation
-3. figure_rationale.md — why each figure exists and where to use it
-4. plan.md, data_quality.md, model_comparison.md
-5. **All PNGs in {run_dir}/figures/ — Read EACH one before captioning**.
+2. **{run_dir}/models/claims_ledger.yaml — REQUIRED (Phase 18 α).** This
+   is your single source of truth for every numeric, percentage, count,
+   currency figure, and verdict label that may appear in the report.
+   You CANNOT introduce a number or label that is not in this ledger.
+   See "Claim References" below.
+3. results.md — the analyst's interpretation
+4. figure_rationale.md — why each figure exists and where to use it
+5. plan.md, data_quality.md, model_comparison.md
+6. **All PNGs in {run_dir}/figures/ — Read EACH one before captioning**.
    The Read tool handles PNGs multimodally (you literally see the image
    when you pass the PNG path to Read). The caption you write must
    accurately describe what the figure VISUALLY SHOWS, not what
@@ -80,6 +85,55 @@ For EACH dataset (from data_quality.md):
 **8. Appendix**
 - Critique history and responses
 - Technical details
+
+## Claim References (Phase 18 α — REQUIRED)
+
+The analyst produces `models/claims_ledger.yaml` with every quantitative
+or categorical claim that may appear in the report. **You MUST reference
+each such claim by its ID using `[CLAIM:claim_id]` syntax** — the
+post-write `scripts/render_claims.py` substitutes the ID with the
+formatted value. Do NOT write literal numbers, percentages, currency
+figures, counts, or verdict labels inline; reference them.
+
+### Examples (write these in your draft)
+
+- "The optimized allocation averts [CLAIM:dalys_optimized_mean] at
+  [CLAIM:cost_per_daly_optimized_mean]."
+- "North West receives [CLAIM:nw_share_pct] of the budget."
+- "Sensitivity verdict: [CLAIM:sensitivity_verdict]."
+- "Total budget: [CLAIM:total_budget]."
+
+After rendering, those become (in `report.md`):
+
+- "The optimized allocation averts 7.47M DALYs/yr (95% CI: 5.14M-10.42M)
+  at $43/DALY (95% CI: $31-$63)."
+- "North West receives 52.5% of the budget."
+- "Sensitivity verdict: ROBUST."
+- "Total budget: $320M."
+
+### Free prose still allowed
+
+Section headers, paragraph structure, methodology descriptions,
+discussion narrative — all free prose. Only quantitative/categorical
+claims must reference the ledger.
+
+### What gets caught
+
+The coherence auditor's `ledger_binding` duty (Phase 18 β) scans your
+finished `report.md` for any numeric, percentage, currency, or verdict
+label that is NOT covered by a `[CLAIM:id]` reference and is not in the
+ledger. Each such drift is a HIGH violation. The structural fix
+eliminates the entire R-019 / R-020 / $197M-conflation class — your
+prose cannot drift if it is not free to re-narrate.
+
+### If the ledger is missing a claim you need
+
+Do NOT add the number directly to the report. Instead:
+1. Stop drafting that sentence.
+2. Re-read `models/claims_ledger.yaml` to confirm it's truly absent.
+3. If absent: emit a TODO comment in `report.md` noting the missing
+   claim ID, and continue drafting the rest. The lead will route the
+   missing-claim list back to the analyst for ledger amendment.
 
 ## CRITICAL: Presentation Standards
 - Every figure MUST be embedded using markdown image syntax:

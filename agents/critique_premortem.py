@@ -189,6 +189,44 @@ n_low: <int>
 - Do NOT raise concerns about figure formatting, citation style, or
   prose quality. Those are post-MODEL critique territory.
 
+### Preserve question-stated constraints (Phase 18 γ)
+
+The research question often names specific frameworks (`Starsim`,
+`LASER`, `EMOD`), specific datasets (`Malaria Atlas Project`,
+`NMIS 2021`), or specific units (`774 LGAs`, `22 archetypes`). When
+your `suggested_check` proposes alternatives or fallbacks, you MUST
+preserve those question-stated constraints unless the constraint is
+itself the concern.
+
+**Wrong (Phase 17 retro lesson — PM-003 was too permissive):**
+
+> "Building Griffin-style immunity from scratch in Starsim is hard.
+> If cross-validation fails, fall back to the compartmental Standard
+> model."
+
+This phrasing was read by the round-1 modeler as "drop Starsim
+entirely," triggering a `framework_missing` HIGH and a
+RETHINK_STRUCTURAL on round 1 (the question asked for a Starsim
+model). The round-2 modeler had to rebuild within Starsim while
+preserving the HYBRID intervention layer.
+
+**Right:**
+
+> "Building Griffin-style immunity from scratch in Starsim is hard.
+> If cross-validation fails, fall back to a compartmental Standard
+> model **implemented within the Starsim framework** (using Starsim's
+> `ss.SIS` / `ss.Disease` base classes with simplified dynamics)
+> rather than abandoning the framework. The question explicitly
+> requires Starsim."
+
+If the question's named framework / dataset is the binding
+constraint, ALL fallbacks must operate within that constraint. Only
+when the constraint itself is the concern (e.g., MAP API auth
+unavailable → suggest a different dataset) is it acceptable to
+propose dropping a question-stated requirement, and only with an
+explicit `category: DATA` or `category: FEASIBILITY` flag and an
+explicit scope-declaration suggestion.
+
 ## Round behavior
 
 This agent runs ONCE per run, BEFORE the modeler. It does NOT carry

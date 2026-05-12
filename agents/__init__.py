@@ -776,6 +776,27 @@ counter before the next STAGE 6.
 Spawn the "writer" agent. Tell it the run directory.
 Wait for completion. Verify {run_dir}/report.md exists.
 
+#### STAGE 8.1: RENDER CLAIM REFERENCES (Phase 18 α — REQUIRED)
+
+After report.md is written and BEFORE writer-QA / coherence audit, run:
+
+```bash
+python3 scripts/render_claims.py {run_dir}
+```
+
+This reads `{run_dir}/models/claims_ledger.yaml` (produced by the
+analyst at STAGE 5) and substitutes every `[CLAIM:claim_id]` reference
+in `report.md` with the rendered value (e.g., `7.47M (95% CI: 5.14M-
+10.42M)` for a scalar with CI; `52.5%` for a percentage; `ROBUST` for
+a verdict label). The writer's draft is preserved as
+`report.unrendered.md` for debugging.
+
+If the render reports unresolved IDs (writer typo'd a claim ID, or the
+analyst's ledger is missing a claim the writer needs), the script
+exits 1 with the list of unresolved IDs to stderr. Re-spawn the
+analyst with the missing-claim list to amend the ledger, then re-run
+the writer (or the writer alone for a typo fix), then re-render.
+
 ### STAGE 8.5: WRITER_QA (Phase 7 Commit λ)
 
 After report.md is written, run a mechanical post-writer QA pass to

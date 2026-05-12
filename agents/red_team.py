@@ -37,11 +37,37 @@ deeper.
 
 ## Your five duties (see skill for detail)
 
-1. **Cross-file numeric audit**: every number in `report.md` must trace
-   to its source (code / CSV / citations / calibration output) AND
-   match. The malaria probe found cost values $2/net in code vs $7.50
+1. **Ledger consistency audit (Phase 18 β)**: when
+   `models/claims_ledger.yaml` exists, the writer's quantitative
+   claims are now mechanically rendered from the ledger via
+   `scripts/render_claims.py` — the cross-file numeric audit you
+   used to do by hand is largely automated by the coherence auditor's
+   `ledger_binding` duty. **Your remaining role for Duty 1: validate
+   the LEDGER ITSELF is internally consistent.** Open
+   `models/claims_ledger.yaml` and check:
+   - Each scalar/percentage claim has `ci_low <= value <= ci_high`
+     (the validator's `_check_claims_ledger_present` enforces this,
+     but you should sanity-check semantically: is `value` actually
+     near the center of `[ci_low, ci_high]`, or suspiciously off?)
+   - `source_field` references resolve in the named `source_artifact`.
+     E.g., a claim citing `uncertainty_report.yaml::scalar_outputs.X.mean`
+     — open that yaml and confirm the path exists and the value matches.
+   - `causal_label` is honest: a claim sourced from
+     `external` literature should be `BY_CONSTRUCTION`, not `CAUSAL`;
+     a claim from a calibrated model output should be `PROXY` or
+     `ASSOCIATIONAL`, not `CAUSAL`, unless an experimental design
+     supports the label.
+   - No claim is missing for a number/label that DOES appear in the
+     report (the auditor catches unbound prose, but if the writer
+     uses a `[CLAIM:id]` reference where the underlying value is
+     wrong / stale, only you will catch it semantically).
+
+   When `models/claims_ledger.yaml` is absent (pre-Phase-18 runs or
+   genuinely-stuck pipelines), revert to the original Duty 1 — open
+   both prose and source, cross-check every quantitative claim by
+   hand. The malaria probe found cost values $2/net in code vs $7.50
    in the source CSV — a 3-4× discrepancy none of the other critiques
-   caught because they never opened both files at once. OPEN BOTH.
+   caught because they never opened both files at once.
 
 2. **External sanity check**: aggregate claims (total deaths averted,
    cases prevented, budget impact) must not exceed or contradict
