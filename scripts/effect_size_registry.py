@@ -249,6 +249,12 @@ def load_priors(citations_md_path: str) -> dict[str, Any]:
         if p["kind"] not in VALID_KINDS:
             raise ValueError(f"parameters[{i}] has invalid kind "
                              f"{p['kind']!r}; valid: {sorted(VALID_KINDS)}")
+        # Expand ci_95: [low, high] -> ci_low, ci_high (common registry format).
+        if "ci_95" in p and isinstance(p["ci_95"], (list, tuple)) and len(p["ci_95"]) == 2:
+            if "ci_low" not in p or p["ci_low"] is None:
+                p["ci_low"] = p["ci_95"][0]
+            if "ci_high" not in p or p["ci_high"] is None:
+                p["ci_high"] = p["ci_95"][1]
         # Fill in missing fields from the detail section if present.
         name = p["name"]
         if name in details_by_name:

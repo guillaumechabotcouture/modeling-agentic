@@ -8,3 +8,16 @@ workspace/
 .env
 .env.*
 watchdog.sh
+
+# Local run logs and scratch
+*.log
+run_*.sh
+stage7_*stderr*.txt
+validate_stderr_*.txt
+validator_stderr_*.txt
+.claude/scheduled_tasks.lock
+
+# Local scratch experiments and one-off reports at repo root
+benchmark/
+experiments/
+/*.pdf
