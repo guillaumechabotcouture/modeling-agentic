@@ -658,6 +658,48 @@ _LEDGER_BINDING_GENERIC_USE_QUALIFIERS = (
 )
 
 
+# Phase 20 α: CI/credible-interval/significance-level prose markers.
+# When any of these appears in a ±35-char window around a `N%` match,
+# the percentage is interval-coverage metadata, not a claim value, and
+# the ledger-binding scan filters it out. Sufficiency-critic (Phase 19
+# δ) actively incentivizes Bayesian framing — without these qualifiers
+# the next run would fire HIGH on every "95% credible interval" /
+# "5% significance level" / "(CI: ...)" the writer produces.
+_PERCENTAGE_CI_METADATA_PHRASES = (
+    " ci", " ci:", " ci,", " ci)", " ci.", " ci-",
+    "(ci ", "(ci:", "(ci,",
+    "confidence interval", "credible interval", "credible region",
+    "credibility region", "credibility interval", "credible band",
+    "bayesian ci",
+    "significance level", "ci coverage",
+)
+
+
+def _fenced_or_inline_code_spans(text: str) -> list[tuple[int, int]]:
+    """Return spans of fenced code blocks and inline-code regions.
+    Phase 20 α: report.md may legitimately contain `[CLAIM:id]` inside
+    a code fence (documenting the syntax) — the audit must not fire
+    `raw_claim` HIGH on those documented examples.
+    """
+    spans: list[tuple[int, int]] = []
+    fence_pat = re.compile(r"^(?:```|~~~)", re.MULTILINE)
+    starts = [m.start() for m in fence_pat.finditer(text)]
+    for i in range(0, len(starts) - 1, 2):
+        end_idx = text.find("\n", starts[i + 1])
+        if end_idx == -1:
+            end_idx = len(text)
+        spans.append((starts[i], end_idx + 1))
+    inline_pat = re.compile(r"`[^`\n]+`")
+    for m in inline_pat.finditer(text):
+        if not any(s <= m.start() < e for s, e in spans):
+            spans.append((m.start(), m.end()))
+    return spans
+
+
+def _in_protected_span(spans: list[tuple[int, int]], pos: int) -> bool:
+    return any(s <= pos < e for s, e in spans)
+
+
 def _within_proximity(value: float,
                        bound_numeric_values: set[float],
                        tolerance: float = _PROXIMITY_TOLERANCE) -> bool:
@@ -830,11 +872,14 @@ def _audit_ledger_binding(run_dir: str) -> list[dict]:
     except OSError:
         return []
 
-    # Scan numbers in the report. Reuse numeric_consistency primitives
-    # for package counts / dollars, and add a generic numeric scan.
-    # Skip table rows (table cells are intentionally allowed to
-    # restate ledger values; the verbatim match in bound_values_by_kind
-    # already covers them).
+    # Phase 20 α: protect fenced code blocks and inline `code` regions.
+    # report.md may document the `[CLAIM:id]` syntax or show example
+    # values in code examples; scans below skip matches inside these
+    # spans. Note: table cells are NOT exempt — a table cell holding a
+    # number absent from the ledger is still drift. The `bound_values`
+    # lookup is what gives legitimate table cells their pass.
+    protected_spans = _fenced_or_inline_code_spans(text)
+
     unbound: list[dict] = []
     seen_unbound: set[str] = set()
 
@@ -842,6 +887,8 @@ def _audit_ledger_binding(run_dir: str) -> list[dict]:
     pat_dollar = re.compile(r"\$\s*([\d,]+(?:\.\d+)?)\s*(M|million|K|k|thousand|B|billion)?",
                             re.IGNORECASE)
     for m in pat_dollar.finditer(text):
+        if _in_protected_span(protected_spans, m.start()):
+            continue
         amt_str = m.group(1).replace(",", "")
         try:
             amt = float(amt_str)
@@ -934,6 +981,8 @@ def _audit_ledger_binding(run_dir: str) -> list[dict]:
         re.IGNORECASE,
     )
     for m in pat_label.finditer(text):
+        if _in_protected_span(protected_spans, m.start()):
+            continue
         label_raw = m.group(1)
         upper = label_raw.upper()
         # Skip generic-use ("robust to perturbations", "sensitive
@@ -974,6 +1023,8 @@ def _audit_ledger_binding(run_dir: str) -> list[dict]:
         re.IGNORECASE,
     )
     for m in pat_scalar.finditer(text):
+        if _in_protected_span(protected_spans, m.start()):
+            continue
         try:
             amt = float(m.group(1))
         except ValueError:
@@ -1039,24 +1090,23 @@ def _audit_ledger_binding(run_dir: str) -> list[dict]:
     # rendering or 5% proximity.
     pat_percent = re.compile(r"(?<![\d\.])(\d+(?:\.\d+)?)\s*%")
     for m in pat_percent.finditer(text):
+        if _in_protected_span(protected_spans, m.start()):
+            continue
         try:
             pct = float(m.group(1))
         except ValueError:
             continue
-        # Skip generic-use percentages: "95% CI" / "95 % CI" /
-        # "95% confidence interval" / "ci coverage" — these are
-        # CI metadata, not claim values. Look at 25 chars after
-        # the match for `CI`, `confidence`, etc.
-        right_window = text[m.end():
-                            min(len(text), m.end() + 25)].lower()
-        if (right_window.startswith(" ci")
-                or right_window.startswith("ci")
-                or right_window.lstrip().startswith("ci ")
-                or right_window.lstrip().startswith("confidence")):
-            continue
-        win = text[max(0, m.start() - 30):
-                   min(len(text), m.end() + 30)].lower()
-        if any(q in win for q in ("ci coverage", "confidence interval")):
+        # Phase 20 α: filter percentages that are interval-coverage
+        # metadata (CI / credible interval / significance level /
+        # parenthetical (CI: ...) forms) — not claim values. The prior
+        # right-window-only check missed "95% credible interval",
+        # "95% Bayesian CI", "At a 95% (CI: ...)", and "5% significance
+        # level" — all of which Phase 19 δ's sufficiency critic
+        # incentivizes the writer to produce.
+        match_window = text[max(0, m.start() - 30):
+                            min(len(text), m.end() + 35)].lower()
+        if any(p in match_window
+               for p in _PERCENTAGE_CI_METADATA_PHRASES):
             continue
         is_bound = False
         for prec in (0, 1, 2):
@@ -1102,6 +1152,8 @@ def _audit_ledger_binding(run_dir: str) -> list[dict]:
         re.IGNORECASE,
     )
     for m in pat_count.finditer(text):
+        if _in_protected_span(protected_spans, m.start()):
+            continue
         raw_n = m.group(1)
         unit = m.group(2)
         try:
@@ -1148,8 +1200,13 @@ def _audit_ledger_binding(run_dir: str) -> list[dict]:
     # `python3 scripts/render_claims.py` and ships the writer's
     # un-substituted draft as report.md). Any surviving token is a
     # HIGH violation regardless of whether the id is in the ledger.
-    pat_raw_claim = re.compile(r"\[CLAIM:[A-Za-z0-9_]+\]")
+    # Phase 20 α: broaden regex to also catch `[CLAIM:id:NO_VALUE]`
+    # tokens (the form `render_claim()` emits for null-value claims).
+    # Belt-and-suspenders against `load_claims()`'s null-value reject.
+    pat_raw_claim = re.compile(r"\[CLAIM:[A-Za-z0-9_:]+\]")
     for m in pat_raw_claim.finditer(text):
+        if _in_protected_span(protected_spans, m.start()):
+            continue
         token = m.group(0)
         key = ("raw_claim", token)
         if key in seen_unbound:
@@ -1455,6 +1512,81 @@ def _self_test() -> int:
         v = _audit_ledger_binding(d)
         ok(not any(x.get("drifted_value") == "774 LGAs" for x in v),
            f"T14: ledger-bound 774 LGAs should be silent, got {v}")
+
+    # T15 (Phase 20 α): Bayesian / credible-interval / significance
+    # prose must NOT fire HIGH on the percentage scan. The prior
+    # right-window-only check missed all four shapes below; Phase 19 δ
+    # sufficiency critic actively pushes the writer toward this prose.
+    bayesian_prose_cases = [
+        ("95% credible interval contains the estimate.", "95%"),
+        ("Using a 95% Bayesian CI, the value lies within bounds.", "95%"),
+        ("At a 95% (CI: 5.1M-10.4M), the model converges.", "95%"),
+        ("At the 5% significance level we reject the null.", "5%"),
+        ("The 90% credibility region excludes zero.", "90%"),
+        ("The 95% credible region contains the estimate.", "95%"),
+    ]
+    for prose, expected_pct in bayesian_prose_cases:
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "models"))
+            with open(os.path.join(d, "models", "claims_ledger.yaml"), "w") as f:
+                yaml.safe_dump({"claims": [
+                    {"id": "x", "claim_kind": "scalar", "value": 100},
+                ]}, f)
+            with open(os.path.join(d, "report.md"), "w") as f:
+                f.write(f"# Report\n\n{prose}\n")
+            v = _audit_ledger_binding(d)
+            ok(not any(x.get("drifted_value") == expected_pct
+                       and x.get("claim", "").startswith("Percentage")
+                       for x in v),
+               f"T15 Bayesian/CI prose {prose!r} should NOT fire "
+               f"HIGH on {expected_pct}, got {v}")
+
+    # T16 (Phase 20 α): legitimate percentage claim still fires HIGH
+    # when not paired with CI/credible/significance language.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "models", "claims_ledger.yaml"), "w") as f:
+            yaml.safe_dump({"claims": [
+                {"id": "share", "claim_kind": "percentage", "value": 52.5},
+            ]}, f)
+        with open(os.path.join(d, "report.md"), "w") as f:
+            f.write("# Report\n\nNorth West gets 77.3% of the budget.\n")
+        v = _audit_ledger_binding(d)
+        ok(any(x.get("drifted_value") == "77.3%" for x in v),
+           f"T16: legitimate unbound 77.3% must still fire, got {v}")
+
+    # T17 (Phase 20 α): `[CLAIM:id]` inside a fenced code block must
+    # NOT fire `raw_claim` HIGH (writer documents the syntax in a code
+    # example).
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "models", "claims_ledger.yaml"), "w") as f:
+            yaml.safe_dump({"claims": [
+                {"id": "x", "claim_kind": "scalar", "value": 100},
+            ]}, f)
+        with open(os.path.join(d, "report.md"), "w") as f:
+            f.write("# Report\n\nUse `[CLAIM:x]` to reference a claim. "
+                    "Example:\n\n```\n[CLAIM:x]\n```\n\nIt renders.\n")
+        v = _audit_ledger_binding(d)
+        ok(not any(x.get("drifted_value", "").startswith("[CLAIM:")
+                   for x in v),
+           f"T17: [CLAIM:] inside fenced/inline code must not fire, got {v}")
+
+    # T18 (Phase 20 α): currency/scalar inside a fenced code block must
+    # NOT fire on values absent from the ledger (writer can show
+    # examples without binding them).
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "models", "claims_ledger.yaml"), "w") as f:
+            yaml.safe_dump({"claims": [
+                {"id": "budget", "claim_kind": "currency", "value": 320000000},
+            ]}, f)
+        with open(os.path.join(d, "report.md"), "w") as f:
+            f.write("# Report\n\nThe ledger holds `$320M`. Example "
+                    "syntax:\n\n```\nbudget: $999M\n```\n")
+        v = _audit_ledger_binding(d)
+        ok(not any("$999" in x.get("drifted_value", "") for x in v),
+           f"T18: $999M inside a code fence must not fire, got {v}")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)

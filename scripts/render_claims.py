@@ -45,6 +45,42 @@ import yaml
 
 _CLAIM_REF_RE = re.compile(r"\[CLAIM:([A-Za-z0-9_]+)\]")
 
+# Kinds whose claims must carry a non-null `value`. Citation kinds are
+# always required to have a value (the citation string); the other
+# value-bearing kinds are listed explicitly so future kinds can opt out
+# if there's a real reason. Phase 20 α: closes the null-value gap that
+# rendered `[CLAIM:id:NO_VALUE]` markers into report.md unflagged.
+_VALUE_REQUIRED_KINDS = frozenset({
+    "scalar", "count", "label", "percentage", "currency", "citation",
+})
+
+
+def _fenced_or_inline_code_spans(text: str) -> list[tuple[int, int]]:
+    """Return spans of fenced code blocks (``` / ~~~) and inline code
+    (backtick-delimited) in `text`. Used to skip `[CLAIM:id]` references
+    that appear inside documentation/examples of the syntax itself."""
+    spans: list[tuple[int, int]] = []
+    # Fenced blocks: pair up consecutive fence markers on their own lines.
+    fence_pat = re.compile(r"^(?:```|~~~)", re.MULTILINE)
+    starts = [m.start() for m in fence_pat.finditer(text)]
+    for i in range(0, len(starts) - 1, 2):
+        # Find end-of-line for the closing fence so we include the
+        # entire fenced region.
+        end_idx = text.find("\n", starts[i + 1])
+        if end_idx == -1:
+            end_idx = len(text)
+        spans.append((starts[i], end_idx + 1))
+    # Inline code: `...` on a single line (avoid spanning newlines).
+    inline_pat = re.compile(r"`[^`\n]+`")
+    for m in inline_pat.finditer(text):
+        if not any(s <= m.start() < e for s, e in spans):
+            spans.append((m.start(), m.end()))
+    return spans
+
+
+def _in_protected_span(spans: list[tuple[int, int]], pos: int) -> bool:
+    return any(s <= pos < e for s, e in spans)
+
 # ----- Magnitude helpers ------------------------------------------------ #
 
 
@@ -56,7 +92,7 @@ def _format_magnitude(v: float, decimals: int = 2) -> str:
     >>> _format_magnitude(320_000_000)
     '320M'
     >>> _format_magnitude(2_300_000_000)
-    '2.30B'
+    '2.3B'
     >>> _format_magnitude(63)
     '63'
     """
@@ -173,6 +209,15 @@ def load_claims(ledger_path: str) -> dict[str, dict]:
             raise ValueError(
                 f"{ledger_path}: claims[{i}] kind {kind!r} not in "
                 f"{sorted(_VALID_KINDS)}")
+        # Phase 20 α: every value-bearing claim must have a non-null
+        # `value`. Without this check, render_claim() emitted a
+        # `[CLAIM:id:NO_VALUE]` marker that escaped the audit's raw-claim
+        # regex (which only matched bare `[CLAIM:id]` tokens) and
+        # shipped to report.md.
+        if kind in _VALUE_REQUIRED_KINDS and c.get("value") is None:
+            raise ValueError(
+                f"{ledger_path}: claims[{i}] {cid!r} of kind {kind!r} "
+                f"must have a non-null `value` field")
         # CI consistency
         if kind in ("scalar", "percentage"):
             v = c.get("value")
@@ -199,10 +244,17 @@ def render_text(text: str, claims: dict[str, dict]) -> tuple[str, list[str]]:
     """Substitute every `[CLAIM:id]` reference in `text` with its rendered
     value. Returns (new_text, unresolved_ids). If unresolved IDs exist,
     the caller decides whether to fail or write a partial render.
+
+    Phase 20 α: `[CLAIM:id]` tokens inside fenced code blocks or inline
+    `code` spans are left intact so the writer can document the syntax
+    in report.md without those examples getting substituted.
     """
     unresolved: list[str] = []
+    protected = _fenced_or_inline_code_spans(text)
 
     def _sub(m: re.Match) -> str:
+        if _in_protected_span(protected, m.start()):
+            return m.group(0)
         cid = m.group(1)
         c = claims.get(cid)
         if c is None:
@@ -404,6 +456,48 @@ def _self_test() -> int:
         ok(not result["ok"], f"T8 should fail with unresolved: {result}")
         ok(result["unresolved_ids"] == ["b_typo"],
            f"T8 unresolved list: {result}")
+
+    # T9 (Phase 20 α): load_claims rejects null `value` for value-bearing
+    # kinds. Closes the gap where `[CLAIM:id:NO_VALUE]` markers escaped
+    # the audit's raw-claim regex.
+    with tempfile.TemporaryDirectory() as d:
+        ledger_path = os.path.join(d, "claims_ledger.yaml")
+        with open(ledger_path, "w") as f:
+            yaml.safe_dump({"claims": [
+                {"id": "novalue", "claim_kind": "scalar", "value": None},
+            ]}, f)
+        try:
+            load_claims(ledger_path)
+            ok(False, "T9: should have raised on null value for scalar")
+        except ValueError as e:
+            ok("non-null" in str(e),
+               f"T9 error msg: {e}")
+
+    # T10 (Phase 20 α): `[CLAIM:id]` inside a fenced code block is left
+    # intact so the writer can document the syntax in report.md.
+    claims_t10 = {
+        "x": {"id": "x", "claim_kind": "scalar", "value": 100},
+    }
+    text = ("Use [CLAIM:x] in prose, but inside\n"
+            "```\n"
+            "Example: [CLAIM:x]\n"
+            "```\n"
+            "the reference is preserved.\n")
+    new_text, un = render_text(text, claims_t10)
+    ok(not un, f"T10 unresolved: {un}")
+    ok("Example: [CLAIM:x]" in new_text,
+       f"T10 fenced reference must be preserved: {new_text!r}")
+    ok("Use 100 in prose" in new_text,
+       f"T10 inline reference must be rendered: {new_text!r}")
+
+    # T11 (Phase 20 α): `[CLAIM:id]` inside inline backticks is left
+    # intact.
+    text = "The token `[CLAIM:x]` is documented syntax; [CLAIM:x] is a real claim."
+    new_text, un = render_text(text, claims_t10)
+    ok("`[CLAIM:x]`" in new_text,
+       f"T11 inline-code reference must be preserved: {new_text!r}")
+    ok(new_text.count("100") == 1,
+       f"T11 only one substitution should occur: {new_text!r}")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)
