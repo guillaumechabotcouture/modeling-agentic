@@ -3124,48 +3124,37 @@ def _check_effort_floors(run_dir: str,
         or os.path.isdir(os.path.join(run_dir, "models"))
     )
 
-    if not os.path.exists(report_path):
-        if not triggers_present:
-            return []
-        # Try to compute the report ourselves so the gate is non-skippable.
-        mod = _load_effort_floors_module()
-        if mod is None:
-            return [{
-                "kind": "effort_floors_unavailable",
-                "severity": "MEDIUM",
-                "stage": "GATE",
-                "claim": (
-                    "effort_floors_report.yaml is absent and "
-                    "scripts/effort_floors.py could not be imported. "
-                    "Run `python3 scripts/effort_floors.py {run_dir}` "
-                    "manually. See Phase 19 α."
-                ),
-            }]
-        try:
-            rep = mod.evaluate(run_dir)
-            mod.write_report(run_dir, rep)
-        except (ValueError, FileNotFoundError) as e:
-            return [{
-                "kind": "effort_floors_unavailable",
-                "severity": "MEDIUM",
-                "stage": "GATE",
-                "claim": (f"Could not compute effort floors: {e}. "
-                          f"Run `python3 scripts/effort_floors.py {run_dir}` "
-                          f"and resolve the manifest error."),
-            }]
-    else:
-        try:
-            with open(report_path) as f:
-                rep = yaml.safe_load(f) or {}
-        except (yaml.YAMLError, OSError) as e:
-            return [{
-                "kind": "effort_floors_unavailable",
-                "severity": "MEDIUM",
-                "stage": "GATE",
-                "claim": (f"Could not parse {report_path}: {e}. "
-                          f"Re-run `python3 scripts/effort_floors.py "
-                          f"{run_dir}`."),
-            }]
+    if not triggers_present:
+        return []
+
+    # Always recompute the derived report. It is a cache of model artifacts,
+    # not an authoritative input; reusing it across rounds can preserve stale
+    # violations or stale PASS results after the modeler changes outputs/code.
+    mod = _load_effort_floors_module()
+    if mod is None:
+        return [{
+            "kind": "effort_floors_unavailable",
+            "severity": "MEDIUM",
+            "stage": "GATE",
+            "claim": (
+                "effort_floors_report.yaml cannot be refreshed because "
+                "scripts/effort_floors.py could not be imported. Run "
+                f"`python3 scripts/effort_floors.py {run_dir}` manually. "
+                "See Phase 19 α."
+            ),
+        }]
+    try:
+        rep = mod.evaluate(run_dir)
+        mod.write_report(run_dir, rep)
+    except (ValueError, FileNotFoundError) as e:
+        return [{
+            "kind": "effort_floors_unavailable",
+            "severity": "MEDIUM",
+            "stage": "GATE",
+            "claim": (f"Could not compute effort floors: {e}. "
+                      f"Run `python3 scripts/effort_floors.py {run_dir}` "
+                      f"and resolve the manifest error."),
+        }]
 
     violations = rep.get("violations") or []
     if not isinstance(violations, list):
@@ -3466,44 +3455,32 @@ def _check_benchmark_match(run_dir: str,
             ),
         }]
 
-    # Case 2: targets exist. Resolve a fresh report.
-    if not os.path.exists(report_path):
-        mod = _load_benchmark_match_module()
-        if mod is None:
-            return [{
-                "kind": "benchmark_match_unavailable",
-                "severity": "MEDIUM",
-                "stage": "GATE",
-                "claim": (
-                    "benchmark_match.yaml absent and "
-                    "scripts/benchmark_match.py could not be "
-                    "imported. Run "
-                    f"`python3 scripts/benchmark_match.py {run_dir}` "
-                    "manually. Phase 19 γ."
-                ),
-            }]
-        try:
-            rep = mod.evaluate(run_dir)
-            mod.write_report(run_dir, rep)
-        except (ValueError, FileNotFoundError) as e:
-            return [{
-                "kind": "benchmark_match_unavailable",
-                "severity": "MEDIUM",
-                "stage": "GATE",
-                "claim": f"benchmark_match evaluation failed: {e}",
-            }]
-    else:
-        try:
-            with open(report_path) as f:
-                rep = yaml.safe_load(f) or {}
-        except (yaml.YAMLError, OSError) as e:
-            return [{
-                "kind": "benchmark_match_unavailable",
-                "severity": "MEDIUM",
-                "stage": "GATE",
-                "claim": (f"Could not parse {report_path}: {e}. "
-                          "Re-run `scripts/benchmark_match.py`."),
-            }]
+    # Case 2: targets exist. Always resolve a fresh report; the YAML is a
+    # derived cache and can go stale when computed_value or computed_field
+    # targets change between critique rounds.
+    mod = _load_benchmark_match_module()
+    if mod is None:
+        return [{
+            "kind": "benchmark_match_unavailable",
+            "severity": "MEDIUM",
+            "stage": "GATE",
+            "claim": (
+                "benchmark_match.yaml cannot be refreshed because "
+                "scripts/benchmark_match.py could not be imported. Run "
+                f"`python3 scripts/benchmark_match.py {run_dir}` "
+                "manually. Phase 19 γ."
+            ),
+        }]
+    try:
+        rep = mod.evaluate(run_dir)
+        mod.write_report(run_dir, rep)
+    except (ValueError, FileNotFoundError) as e:
+        return [{
+            "kind": "benchmark_match_unavailable",
+            "severity": "MEDIUM",
+            "stage": "GATE",
+            "claim": f"benchmark_match evaluation failed: {e}",
+        }]
 
     verdict = str(rep.get("verdict") or "PENDING").upper()
     if verdict == "MALFORMED":
@@ -6378,6 +6355,21 @@ def _run_self_test() -> int:
         ok(not match, f"EF5: 500 draws should be silent on local floor, got {match}")
 
     with _tempfile.TemporaryDirectory() as _d:
+        # EF5b: stale cached report must be refreshed. Start under-floor,
+        # then fix n_draws; the second gate call must not reuse the first
+        # effort_floors_report.yaml.
+        with open(os.path.join(_d, "uncertainty_report.yaml"), "w") as f:
+            _yaml.safe_dump({"n_draws": 50}, f)
+        v1 = _check_effort_floors(_d, round_n=3)
+        ok(any(x["kind"] == "effort_floor_uq_min_draws_local" for x in v1),
+           f"EF5b: first under-floor run should fire, got {v1}")
+        with open(os.path.join(_d, "uncertainty_report.yaml"), "w") as f:
+            _yaml.safe_dump({"n_draws": 500}, f)
+        v2 = _check_effort_floors(_d, round_n=3)
+        ok(not any(x["kind"] == "effort_floor_uq_min_draws_local" for x in v2),
+           f"EF5b: refreshed report should clear fixed n_draws, got {v2}")
+
+    with _tempfile.TemporaryDirectory() as _d:
         # EF6: shortcut markers in model code → MEDIUM at <3, HIGH at >=3.
         os.makedirs(os.path.join(_d, "models"))
         with open(os.path.join(_d, "models", "run.py"), "w") as f:
@@ -6598,6 +6590,29 @@ def _run_self_test() -> int:
         ok(not any(x["kind"] in ("benchmark_drift", "benchmark_computed_missing")
                    for x in v),
            f"BM6: all in-band must be silent, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # BM6b: stale cached benchmark_match.yaml must be refreshed.
+        os.makedirs(os.path.join(_d, "models"))
+        targets_path = os.path.join(_d, "models", "benchmark_targets.yaml")
+        with open(targets_path, "w") as f:
+            _yaml.safe_dump({"benchmarks": [
+                {"id": "b1", "metric": "x", "target_value": 400,
+                 "tolerance_factor": 1.5, "source": "WMR",
+                 "computed_value": 100},
+            ]}, f)
+        v1 = _check_benchmark_match(_d, round_n=2)
+        ok(any(x["kind"] == "benchmark_drift" for x in v1),
+           f"BM6b: first drifted target should fire, got {v1}")
+        with open(targets_path, "w") as f:
+            _yaml.safe_dump({"benchmarks": [
+                {"id": "b1", "metric": "x", "target_value": 400,
+                 "tolerance_factor": 1.5, "source": "WMR",
+                 "computed_value": 400},
+            ]}, f)
+        v2 = _check_benchmark_match(_d, round_n=2)
+        ok(not any(x["kind"] == "benchmark_drift" for x in v2),
+           f"BM6b: refreshed report should clear fixed benchmark, got {v2}")
 
     with _tempfile.TemporaryDirectory() as _d:
         # BM7: missing computed → HIGH benchmark_computed_missing at r≥2

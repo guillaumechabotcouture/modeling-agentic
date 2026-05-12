@@ -725,12 +725,32 @@ def _audit_ledger_binding(run_dir: str) -> list[dict]:
     # rendered forms — e.g., a scalar 7467997 might appear in prose
     # as "7.47M", "7.5M", "7,467,997", etc. We index multiple
     # renderings to make matching robust.
-    bound_values: set[str] = set()
-    # Parallel set of canonical numeric values. The 5% proximity
-    # check (Phase 18 δ) compares prose-extracted numbers against
-    # this set to handle legitimate rounding ("$197M" when ledger
-    # has $197.8M) without firing false positives.
-    bound_numeric_values: set[float] = set()
+    bound_values_by_kind: dict[str, set[str]] = {
+        "scalar": set(),
+        "currency": set(),
+        "percentage": set(),
+        "count": set(),
+        "label": set(),
+    }
+    # Parallel sets of canonical numeric values. Proximity is deliberately
+    # kind-aware so an unrelated count=53 cannot bind a prose percentage
+    # like 52.5%, and a scalar 320M cannot bind "$320M".
+    bound_numeric_values_by_kind: dict[str, set[float]] = {
+        "scalar": set(),
+        "currency": set(),
+        "percentage": set(),
+        "count": set(),
+    }
+
+    def _add_bound(kind: str, value: str) -> None:
+        s = str(value).strip()
+        if kind in bound_values_by_kind:
+            bound_values_by_kind[kind].add(s)
+
+    def _add_numeric(kind: str, value: float) -> None:
+        if kind in bound_numeric_values_by_kind:
+            bound_numeric_values_by_kind[kind].add(value)
+
     for c in ledger_claims:
         if not isinstance(c, dict):
             continue
@@ -739,14 +759,14 @@ def _audit_ledger_binding(run_dir: str) -> list[dict]:
         if v is None:
             continue
         # Add the bare value
-        bound_values.add(str(v).strip())
+        _add_bound(kind, str(v).strip())
         # For numeric kinds, add common renderings
         if kind in ("scalar", "currency"):
             try:
                 fv = float(v)
             except (TypeError, ValueError):
                 continue
-            bound_numeric_values.add(fv)
+            _add_numeric(kind, fv)
             # Magnitude-suffix renderings at multiple precisions
             for divisor, suffix in (
                 (1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K"),
@@ -754,11 +774,11 @@ def _audit_ledger_binding(run_dir: str) -> list[dict]:
                 if abs(fv) >= divisor:
                     for prec in (0, 1, 2, 3):
                         scaled = fv / divisor
-                        bound_values.add(f"{scaled:.{prec}f}{suffix}")
-                        bound_values.add(f"{scaled:.{prec}f}".rstrip("0").rstrip(".") + suffix)
+                        _add_bound(kind, f"{scaled:.{prec}f}{suffix}")
+                        _add_bound(kind, f"{scaled:.{prec}f}".rstrip("0").rstrip(".") + suffix)
             # Comma-formatted
             try:
-                bound_values.add(f"{int(fv):,}")
+                _add_bound(kind, f"{int(fv):,}")
             except (ValueError, OverflowError):
                 pass
         elif kind == "percentage":
@@ -766,23 +786,25 @@ def _audit_ledger_binding(run_dir: str) -> list[dict]:
                 fv = float(v)
             except (TypeError, ValueError):
                 continue
-            bound_numeric_values.add(fv)
+            _add_numeric(kind, fv)
             for prec in (0, 1, 2):
-                bound_values.add(f"{fv:.{prec}f}%")
+                _add_bound(kind, f"{fv:.{prec}f}%")
         elif kind == "label":
-            bound_values.add(str(v).upper())
-            bound_values.add(str(v).lower())
-            bound_values.add(str(v).title())
+            _add_bound(kind, str(v).upper())
+            _add_bound(kind, str(v).lower())
+            _add_bound(kind, str(v).title())
         elif kind == "count":
             try:
-                bound_values.add(str(int(v)))
-                bound_values.add(f"{int(v):,}")
-                bound_numeric_values.add(float(int(v)))
+                _add_bound(kind, str(int(v)))
+                _add_bound(kind, f"{int(v):,}")
+                _add_numeric(kind, float(int(v)))
             except (TypeError, ValueError):
                 pass
         # Add CI-bound endpoints too (so "5.14M" in prose is
         # bound by the parent claim's ci_low even though it's not
         # the value itself)
+        if kind not in ("scalar", "currency", "percentage"):
+            continue
         for ci_field in ("ci_low", "ci_high"):
             cv = c.get(ci_field)
             if cv is None:
@@ -791,16 +813,16 @@ def _audit_ledger_binding(run_dir: str) -> list[dict]:
                 fcv = float(cv)
             except (TypeError, ValueError):
                 continue
-            bound_values.add(str(cv).strip())
-            bound_numeric_values.add(fcv)
+            _add_bound(kind, str(cv).strip())
+            _add_numeric(kind, fcv)
             for divisor, suffix in (
                 (1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K"),
             ):
                 if abs(fcv) >= divisor:
                     for prec in (0, 1, 2, 3):
                         scaled = fcv / divisor
-                        bound_values.add(f"{scaled:.{prec}f}{suffix}")
-                        bound_values.add(f"{scaled:.{prec}f}".rstrip("0").rstrip(".") + suffix)
+                        _add_bound(kind, f"{scaled:.{prec}f}{suffix}")
+                        _add_bound(kind, f"{scaled:.{prec}f}".rstrip("0").rstrip(".") + suffix)
 
     try:
         with open(report_path) as f:
@@ -811,7 +833,7 @@ def _audit_ledger_binding(run_dir: str) -> list[dict]:
     # Scan numbers in the report. Reuse numeric_consistency primitives
     # for package counts / dollars, and add a generic numeric scan.
     # Skip table rows (table cells are intentionally allowed to
-    # restate ledger values; the verbatim match in bound_values
+    # restate ledger values; the verbatim match in bound_values_by_kind
     # already covers them).
     unbound: list[dict] = []
     seen_unbound: set[str] = set()
@@ -844,7 +866,7 @@ def _audit_ledger_binding(run_dir: str) -> list[dict]:
         # is in bound_values.
         is_bound = False
         # Check display string variants
-        for v_str in bound_values:
+        for v_str in bound_values_by_kind["currency"]:
             if v_str.lower().endswith(("m", "k", "b")) and v_str.lower() == display[1:].lower():
                 is_bound = True
                 break
@@ -858,17 +880,19 @@ def _audit_ledger_binding(run_dir: str) -> list[dict]:
                     for prec in (0, 1, 2, 3):
                         s = f"{scaled / divisor:.{prec}f}".rstrip("0").rstrip(".") + suffix
                         test_renders.append(s)
-            if any(r in bound_values for r in test_renders):
+            if any(r in bound_values_by_kind["currency"] for r in test_renders):
                 is_bound = True
         # Check verbatim numeric value
         if not is_bound:
-            if str(int(scaled)) in bound_values or f"{int(scaled):,}" in bound_values:
+            if (str(int(scaled)) in bound_values_by_kind["currency"]
+                    or f"{int(scaled):,}" in bound_values_by_kind["currency"]):
                 is_bound = True
         # Phase 18 δ: 5% proximity check — handles legitimate prose
         # rounding ("$197M" when ledger has $197.8M). The comment
         # block above promised this; the original implementation
         # only had (a) and (c).
-        if not is_bound and _within_proximity(scaled, bound_numeric_values):
+        if not is_bound and _within_proximity(
+                scaled, bound_numeric_values_by_kind["currency"]):
             is_bound = True
         # Skip per-unit ratios + small bare amounts (already filtered
         # by cross_file_counts, but apply same logic here for parity)
@@ -920,7 +944,7 @@ def _audit_ledger_binding(run_dir: str) -> list[dict]:
                    min(len(text), m.end() + 25)].lower()
         if any(q in win for q in _LEDGER_BINDING_GENERIC_USE_QUALIFIERS):
             continue
-        if upper in bound_values:
+        if upper in bound_values_by_kind["label"]:
             continue
         key = upper
         if key in seen_unbound:
@@ -978,12 +1002,13 @@ def _audit_ledger_binding(run_dir: str) -> list[dict]:
             if abs(scaled) >= divisor:
                 for prec in (0, 1, 2, 3):
                     s = f"{scaled / divisor:.{prec}f}".rstrip("0").rstrip(".") + suffix
-                    if s in bound_values:
+                    if s in bound_values_by_kind["scalar"]:
                         is_bound = True
                         break
             if is_bound:
                 break
-        if not is_bound and _within_proximity(scaled, bound_numeric_values):
+        if not is_bound and _within_proximity(
+                scaled, bound_numeric_values_by_kind["scalar"]):
             is_bound = True
         if is_bound:
             continue
@@ -1035,10 +1060,11 @@ def _audit_ledger_binding(run_dir: str) -> list[dict]:
             continue
         is_bound = False
         for prec in (0, 1, 2):
-            if f"{pct:.{prec}f}%" in bound_values:
+            if f"{pct:.{prec}f}%" in bound_values_by_kind["percentage"]:
                 is_bound = True
                 break
-        if not is_bound and _within_proximity(pct, bound_numeric_values):
+        if not is_bound and _within_proximity(
+                pct, bound_numeric_values_by_kind["percentage"]):
             is_bound = True
         if is_bound:
             continue
@@ -1057,6 +1083,61 @@ def _audit_ledger_binding(run_dir: str) -> list[dict]:
                 f"Percentage `{display}` in prose is not in "
                 f"claims_ledger.yaml (no exact-rendering match and not "
                 f"within 5% of any ledger numeric)."
+            ),
+            "canonical_source": "models/claims_ledger.yaml",
+            "drifted_value": display,
+        })
+
+    # Scan bare count claims in count-unit contexts. Keep this conservative:
+    # standalone years, table row numbers, and percentages are handled elsewhere.
+    count_units = (
+        "lga", "lgas", "archetype", "archetypes", "state", "states",
+        "ward", "wards", "facility", "facilities", "package", "packages",
+        "draw", "draws", "restart", "restarts", "fold", "folds",
+        "parameter", "parameters", "scenario", "scenarios",
+    )
+    unit_alt = "|".join(count_units)
+    pat_count = re.compile(
+        rf"(?<![\d\.])(\d{{1,6}}(?:,\d{{3}})*)\s+({unit_alt})\b",
+        re.IGNORECASE,
+    )
+    for m in pat_count.finditer(text):
+        raw_n = m.group(1)
+        unit = m.group(2)
+        try:
+            n = int(raw_n.replace(",", ""))
+        except ValueError:
+            continue
+        # Avoid common prose dates like "2026 states..." if the regex ever
+        # sees them; count claims in this pipeline are below four digits
+        # except comma-formatted universe counts.
+        if n >= 1900 and "," not in raw_n:
+            continue
+        is_bound = (
+            str(n) in bound_values_by_kind["count"]
+            or f"{n:,}" in bound_values_by_kind["count"]
+            or _within_proximity(float(n), bound_numeric_values_by_kind["count"])
+        )
+        if is_bound:
+            continue
+        display = f"{raw_n} {unit}"
+        key = ("count", display.lower())
+        if key in seen_unbound:
+            continue
+        seen_unbound.add(key)
+        line_no = text.count("\n", 0, m.start()) + 1
+        ctx_start = max(0, m.start() - 50)
+        ctx_end = min(len(text), m.end() + 50)
+        unbound.append({
+            "id": f"CA-LB-{len(unbound) + 1:03d}",
+            "severity": "HIGH",
+            "duty": "ledger_binding",
+            "location": f"report.md:{line_no}",
+            "claim": (
+                f"Count `{display}` in prose is not in claims_ledger.yaml. "
+                f"Phase 18 α requires every count claim to be "
+                f"`[CLAIM:id]`-referenced from the ledger. Context: "
+                f"…{text[ctx_start:ctx_end].replace(chr(10), ' ').strip()[:140]}…"
             ),
             "canonical_source": "models/claims_ledger.yaml",
             "drifted_value": display,
@@ -1334,6 +1415,46 @@ def _self_test() -> int:
         v = _audit_ledger_binding(d)
         ok(not any("SENSITIVE" in x.get("drifted_value", "") for x in v),
            f"T11: 'sensitivity analysis' (heading) must not fire SENSITIVE, got {v}")
+
+    # T12: proximity is claim-kind-aware. A count near a percentage
+    # must not bind the percentage claim.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "models", "claims_ledger.yaml"), "w") as f:
+            yaml.safe_dump({"claims": [
+                {"id": "lga_count", "claim_kind": "count", "value": 53},
+            ]}, f)
+        with open(os.path.join(d, "report.md"), "w") as f:
+            f.write("# Report\n\nCoverage increased by 52.5%.\n")
+        v = _audit_ledger_binding(d)
+        ok(any(x.get("drifted_value") == "52.5%" for x in v),
+           f"T12: count=53 must not proximity-bind 52.5%, got {v}")
+
+    # T13: unbound bare count in a count-unit context → HIGH.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "models", "claims_ledger.yaml"), "w") as f:
+            yaml.safe_dump({"claims": [
+                {"id": "other_count", "claim_kind": "count", "value": 63},
+            ]}, f)
+        with open(os.path.join(d, "report.md"), "w") as f:
+            f.write("# Report\n\nThe analysis covers 774 LGAs.\n")
+        v = _audit_ledger_binding(d)
+        ok(any(x.get("drifted_value") == "774 LGAs" for x in v),
+           f"T13: unbound 774 LGAs should fire ledger_binding, got {v}")
+
+    # T14: ledger-bound count in a count-unit context → silent.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "models", "claims_ledger.yaml"), "w") as f:
+            yaml.safe_dump({"claims": [
+                {"id": "lga_count", "claim_kind": "count", "value": 774},
+            ]}, f)
+        with open(os.path.join(d, "report.md"), "w") as f:
+            f.write("# Report\n\nThe analysis covers 774 LGAs.\n")
+        v = _audit_ledger_binding(d)
+        ok(not any(x.get("drifted_value") == "774 LGAs" for x in v),
+           f"T14: ledger-bound 774 LGAs should be silent, got {v}")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)

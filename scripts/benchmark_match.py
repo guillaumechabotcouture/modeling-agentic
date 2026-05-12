@@ -213,6 +213,13 @@ def evaluate(run_dir: str) -> dict:
             "n_benchmarks": 0, "n_drifted": 0,
             "missing_computed": 0, "results": [],
         }
+    if not targets:
+        return {
+            "verdict": "MALFORMED",
+            "error": "`benchmarks:` must contain at least one target",
+            "n_benchmarks": 0, "n_drifted": 0,
+            "missing_computed": 0, "results": [],
+        }
     results: list[BenchResult] = []
     missing_computed = 0
     for i, t in enumerate(targets):
@@ -420,6 +427,16 @@ def _self_test() -> int:
         rep = evaluate(d)
         ok(rep["verdict"] == "MALFORMED",
            f"T8: non-list benchmarks must be MALFORMED, got {rep}")
+
+    # T8b: empty benchmark list must not silently bypass acceptance.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "models", "benchmark_targets.yaml"), "w") as f:
+            yaml.safe_dump({"benchmarks": []}, f)
+        rep = evaluate(d)
+        ok(rep["verdict"] == "MALFORMED"
+           and "at least one" in rep.get("error", ""),
+           f"T8b: empty benchmarks must be MALFORMED, got {rep}")
 
     # T9: write_report round-trips
     with tempfile.TemporaryDirectory() as d:

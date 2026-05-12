@@ -853,6 +853,25 @@ The validator also flags `writer_qa_missing` MEDIUM if the QA pass
 wasn't run, and `writer_qa_unresolved` MEDIUM if the verdict is
 REVISE/MAJOR_REVISION at run completion.
 
+#### Sufficiency critic (Phase 19 δ — REQUIRED alongside writer_qa)
+
+After (or alongside) writer_qa, spawn the "critique-sufficiency" agent.
+Tell it the run directory and current round. Wait for completion and
+verify `{run_dir}/critique_sufficiency.yaml` exists.
+
+The sufficiency critic reads `report.md`, `models/claims_ledger.yaml`,
+`benchmark_match.yaml`, `effort_floors_report.yaml`,
+`models/calibration_result.yaml`, and `uncertainty_report.yaml`. It
+decides whether each high-stakes report claim is supported by the
+evidence base. The validator converts any OVERCLAIMED verdict at
+round ≥ 2 into a HIGH `claim_overclaimed` blocker.
+
+If the critic emits OVERCLAIMED verdicts, re-spawn the writer with the
+specific `claim_verdicts` entries to downgrade the prose, or re-run the
+underlying modeling work to strengthen the evidence. Then re-run
+`scripts/render_claims.py`, writer_qa, coherence audit, and the
+sufficiency critic before the final validator call.
+
 #### Coherence audit (Phase 17 Commit β — REQUIRED alongside writer_qa)
 
 After (or alongside) writer_qa, run the coherence auditor:
