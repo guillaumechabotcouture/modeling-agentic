@@ -9,7 +9,7 @@ from claude_agent_sdk import AgentDefinition, HookMatcher
 from agents import (
     planner, data, modeler, analyst,
     critique_methods, critique_domain, critique_premortem,
-    critique_presentation, red_team,
+    critique_presentation, critique_sufficiency, red_team,
     writer,
 )
 
@@ -29,6 +29,9 @@ AGENT_MAX_TURNS = {
     "critique-premortem": 30,
     "critique-presentation": 40,
     "critique-redteam": 50,
+    # Phase 19 δ: sufficiency critic. Bounded — it reads YAML artifacts
+    # and emits per-claim verdicts; doesn't need WebSearch / lit work.
+    "critique-sufficiency": 30,
     "writer": 60,
 }
 
@@ -283,6 +286,21 @@ def build_agents() -> dict[str, AgentDefinition]:
             model="opus",  # adversarial judgment + WebFetch-heavy research
             maxTurns=50,
             skills=["adversarial-redteam", "critique-blockers-schema",
+                    "effect-size-priors"],
+        ),
+        # Phase 19 δ: sufficiency critic. Spawned POST-WRITE parallel to
+        # writer-QA and the coherence audit. Reads report.md + ledger +
+        # rigor artifacts (benchmark_match, effort_floors, calibration,
+        # uncertainty) and emits per-claim OVERCLAIMED/ADEQUATE verdicts.
+        # OVERCLAIMED at round ≥ 2 fires HIGH `claim_overclaimed` in the
+        # validator (scope-declarable).
+        "critique-sufficiency": AgentDefinition(
+            description=critique_sufficiency.DESCRIPTION,
+            prompt=critique_sufficiency.SYSTEM_PROMPT,
+            tools=critique_sufficiency.TOOLS,
+            model="opus",  # claim-strength judgment benefits from opus
+            maxTurns=30,
+            skills=["evidence-sufficiency", "critique-blockers-schema",
                     "effect-size-priors"],
         ),
         "writer": AgentDefinition(

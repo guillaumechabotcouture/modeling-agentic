@@ -1,0 +1,146 @@
+# Phase 19 α — effort floors.
+#
+# Quantitative minimums for what counts as "actually tried." Read by
+# scripts/effort_floors.py and surfaced through
+# scripts/validate_critique_yaml.py::_check_effort_floors.
+#
+# Why this exists
+# ---------------
+# Phases 2-18 hardened the harness against paraphrase drift, cross-file
+# inconsistency, and structural punt. None of those gates check whether
+# the underlying work was done with enough effort. Validators verify
+# that `uncertainty_report.yaml` exists and is internally consistent;
+# they do not check that 100 draws is enough to estimate a 95% CI on a
+# non-Gaussian outcome. This manifest closes that gap.
+#
+# Schema (per floor)
+# ------------------
+#   id            stable identifier referenced by the script + validator
+#   probe         which artifact / code-scan resolves the value
+#   field         YAML dot-path or AST-literal token name to read
+#   minimum       hard floor; below → violation
+#   severity      HIGH | MEDIUM (MEDIUM only for guidance-class floors)
+#   scope_declarable
+#                 false → cannot be punted by adding a scope-declaration
+#                 entry. true → may be scope-declared with justification.
+#   triggered_by  always | uq_present | sensitivity_present | calibration_present
+#   rationale     1-2 line justification (cited in the violation message)
+#
+# To add a floor (e.g., min_bayesian_chains):
+#   1. Add an entry below.
+#   2. Add a probe in scripts/effort_floors.py if `probe` is new.
+#   3. Run `python3 scripts/effort_floors.py --self-test`.
+#   4. Run `python3 scripts/validate_critique_yaml.py --self-test`.
+#   5. Update the CLAUDE.md ledger.
+
+defaults:
+  # Round at which floors begin enforcing. Earlier rounds emit advisories.
+  enforce_from_round: 2
+
+floors:
+  - id: uq_min_draws_local
+    probe: yaml_field
+    artifact: uncertainty_report.yaml
+    field: n_draws
+    minimum: 200
+    severity: HIGH
+    scope_declarable: false
+    triggered_by: uq_present
+    rationale: |
+      Below 200 draws the 95% CI on a non-Gaussian outcome has bootstrap
+      width comparable to the CI itself. The Phase 4 α ci_degenerate
+      check catches one failure mode; this one catches the cheaper
+      "ran 50 draws and called it done" pattern.
+
+  - id: uq_min_draws_cloud
+    probe: yaml_field
+    artifact: uncertainty_report.yaml
+    field: n_draws
+    minimum: 1000
+    severity: MEDIUM
+    scope_declarable: true
+    triggered_by: cloud_uq_present
+    rationale: |
+      When UQ uses Azure Batch (cost ~$5 for 1000 draws), there is no
+      excuse for fewer than 1000. Local mode keeps the lower floor.
+
+  - id: sensitivity_min_perturbation_points
+    probe: yaml_field_list_length
+    artifact: models/sensitivity_analysis.yaml
+    field: parameters[*].perturbations
+    minimum: 3
+    severity: HIGH
+    scope_declarable: false
+    triggered_by: sensitivity_present
+    rationale: |
+      One alternative value per parameter (the Phase 8 π minimum) is
+      enough to spot a sign-flip but not to characterize a response
+      surface. Three points (centered + two flanks) is the floor for
+      claiming "robust to ±X% perturbation."
+
+  - id: sensitivity_min_params_perturbed
+    probe: yaml_field_list_length
+    artifact: models/sensitivity_analysis.yaml
+    field: parameters
+    minimum: 5
+    severity: MEDIUM
+    scope_declarable: true
+    triggered_by: sensitivity_present
+    rationale: |
+      Perturbing 2 "load-bearing" parameters is the bare minimum; 5
+      gives meaningful coverage of typical calibration surfaces.
+
+  - id: calibration_min_restarts
+    probe: yaml_field
+    artifact: models/calibration_result.yaml
+    field: n_restarts
+    minimum: 3
+    severity: HIGH
+    scope_declarable: false
+    triggered_by: calibration_present
+    rationale: |
+      Single-start calibration cannot distinguish a global optimum from
+      a local one. Three independent restarts with the same convergence
+      criterion is the floor for any non-convex loss surface.
+
+  - id: calibration_min_iterations
+    probe: yaml_field
+    artifact: models/calibration_result.yaml
+    field: n_iterations
+    minimum: 500
+    severity: MEDIUM
+    scope_declarable: true
+    triggered_by: calibration_present
+    rationale: |
+      Below 500 iterations on a derivative-free optimizer (Nelder-Mead,
+      CMA-ES) the budget rarely covers the basin; gradient-based methods
+      can sometimes converge faster but the floor catches the common
+      "maxiter=50 default" shortcut.
+
+  - id: calibration_held_out
+    probe: yaml_field_truthy
+    artifact: models/calibration_result.yaml
+    field: held_out_fold
+    minimum: 1
+    severity: HIGH
+    scope_declarable: true
+    triggered_by: calibration_present
+    rationale: |
+      Without a held-out evaluation the optimizer's reported fit is
+      training error, which monotonically improves with parameter
+      count. The post-hoc identifiability check catches ridge-trapped
+      parameters; this floor catches "no cross-validation at all."
+
+  - id: shortcut_markers_in_model_code
+    probe: ast_shortcut_scan
+    artifact: models/
+    field: model_files
+    minimum: 0          # zero markers tolerated above MEDIUM threshold
+    severity: MEDIUM
+    scope_declarable: true
+    triggered_by: always
+    rationale: |
+      AST scan for TODO/FIXME/HACK markers, bare `pass` exception
+      handlers, hard-coded "shortcut" literals (n_replicates=1,
+      maxiter=10, n_draws=10, t_end=5 for malaria). Each marker is one
+      MEDIUM; >= 3 markers escalates to HIGH (handled in validator).
