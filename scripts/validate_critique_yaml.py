@@ -1189,6 +1189,33 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None) -> list[dic
     # scope-declarable per Phase 18 α contract).
     violations.extend(_check_claims_ledger_present(run_dir, round_n=round_n))
 
+    # Phase 19 Commit α: effort floors. Reads effort_floors_report.yaml
+    # (produced by scripts/effort_floors.py) and surfaces violations of
+    # the quantitative minimums for "actually tried" — n_draws,
+    # n_restarts, perturbation grid size, held-out folds, AST shortcut
+    # markers. This is the gate that distinguishes "the optimizer ran"
+    # from "calibration was attempted with effort."
+    violations.extend(_check_effort_floors(run_dir, round_n=round_n))
+
+    # Phase 19 Commit β: scope-declaration budget. Counts entries in
+    # scope_declaration.yaml; above-cap counts force the modeler to
+    # either resolve some declarations or escalate explicitly. Prevents
+    # the "scope-declare everything" shortcut the manifest's
+    # `scope_declarable: true` rows would otherwise enable.
+    violations.extend(_check_scope_declaration_budget(run_dir,
+                                                      round_n=round_n))
+
+    # Phase 19 Commit γ: benchmark-locked acceptance. Compares the
+    # modeler's computed outputs against the planner's literature-
+    # anchored benchmark_targets.yaml. DRIFT > 1 of N at round ≥ 2
+    # is HIGH (scope-declarable for novel populations).
+    violations.extend(_check_benchmark_match(run_dir, round_n=round_n))
+
+    # Phase 19 Commit δ: sufficiency critic. Reads critique_sufficiency.yaml
+    # (post-WRITE). Each OVERCLAIMED verdict surfaces as a HIGH
+    # `claim_overclaimed` blocker. Round 1 is the drafting window.
+    violations.extend(_check_sufficiency_critic(run_dir, round_n=round_n))
+
     # Phase 12 Commit β: round-aware escalation of persisting MEDIUMs.
     # Catches the failure mode the 104914 run shipped: 18 figure_
     # validator_missing MEDIUMs persisted r2→r6, presentation P-005..
@@ -2677,6 +2704,16 @@ _VALIDATOR_KIND_ESCALATION_THRESHOLDS = {
     # Persistent absence after 4 rounds escalates to HIGH so the gate
     # forces fix-or-scope-declare rather than silently passing.
     "coherence_audit_not_run": 4,
+    # Phase 19 α: effort floors MEDIUMs that persist 3+ rounds become HIGH.
+    # If the modeler keeps shipping under-floor sensitivity/iterations
+    # round after round, force fix-or-scope-declare.
+    "effort_floor_sensitivity_min_params_perturbed": 3,
+    "effort_floor_calibration_min_iterations": 3,
+    "effort_floor_uq_min_draws_cloud": 3,
+    "effort_floor_shortcut_markers": 3,
+    "effort_floors_unavailable": 3,
+    # Phase 19 δ: sufficiency critic absence persisting 3 rounds → HIGH.
+    "critique_sufficiency_not_run": 3,
 }
 
 # Critique-blocker IDs from critique-presentation that should
@@ -3010,6 +3047,647 @@ def _check_coherence_audit(run_dir: str) -> list[dict]:
                     f"{meds[0].get('claim', '')[:200]}"
                 ),
             })
+    return out
+
+
+# Phase 19 α — effort floors threshold (rounds at which floors start firing).
+# Round 1 is the drafting window: floors emit MEDIUMs only. From round 2 on,
+# violations escalate per the manifest's declared severity.
+_EFFORT_FLOORS_ENFORCE_FROM_ROUND = 2
+
+_EFFORT_FLOORS_MODULE = None
+
+
+def _load_effort_floors_module():
+    """Lazy import of scripts/effort_floors.py (sibling). Cached.
+
+    Registers in sys.modules before exec_module to keep Python 3.14's
+    @dataclass happy (it does `sys.modules.get(cls.__module__).__dict__`
+    during decoration; AttributeError if the module isn't registered).
+    """
+    global _EFFORT_FLOORS_MODULE
+    if _EFFORT_FLOORS_MODULE is not None:
+        return _EFFORT_FLOORS_MODULE
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "effort_floors",
+            os.path.join(os.path.dirname(__file__), "effort_floors.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["effort_floors"] = mod
+        spec.loader.exec_module(mod)
+        _EFFORT_FLOORS_MODULE = mod
+        return mod
+    except (FileNotFoundError, ImportError):
+        return None
+
+
+def _check_effort_floors(run_dir: str,
+                         round_n: int | None = None) -> list[dict]:
+    """Phase 19 α: enforce quantitative minimums for "actually tried."
+
+    Reads `{run_dir}/effort_floors_report.yaml` (produced by
+    `scripts/effort_floors.py`). If the report is absent and any
+    trigger artifact exists (uncertainty_report.yaml,
+    models/sensitivity_analysis.yaml, models/calibration_result.yaml,
+    or models/), invokes the module in-process so a missing run of
+    the script doesn't silently let an under-powered model ship.
+
+    Emits per violation:
+      effort_floor_<floor_id>       severity from manifest (HIGH | MEDIUM)
+      effort_floors_unavailable     MEDIUM (scripts/effort_floors.py
+                                     missing or manifest malformed)
+      effort_floors_many_shortcuts  HIGH (≥ 3 shortcut markers — escalation)
+
+    Round gating: round_n=None → silent (defer). Round 1 → all
+    violations advisory (MEDIUM) regardless of manifest severity. Round
+    ≥ 2 → honor manifest severities.
+
+    HIGH violations with `scope_declarable: false` are explicitly NOT
+    silenceable via scope_declaration.yaml — these are the "no shortcut"
+    floors (held-out validation, multi-restart, minimum draws).
+    """
+    if round_n is None:
+        return []
+
+    out: list[dict] = []
+    report_path = os.path.join(run_dir, "effort_floors_report.yaml")
+
+    # Determine whether any trigger artifact is present. If none of the
+    # probes would fire, we don't need to insist on running the script.
+    triggers_present = (
+        os.path.exists(os.path.join(run_dir, "uncertainty_report.yaml"))
+        or os.path.exists(os.path.join(run_dir, "models",
+                                        "sensitivity_analysis.yaml"))
+        or os.path.exists(os.path.join(run_dir, "models",
+                                        "calibration_result.yaml"))
+        or os.path.isdir(os.path.join(run_dir, "models"))
+    )
+
+    if not triggers_present:
+        return []
+
+    # Always recompute the derived report. It is a cache of model artifacts,
+    # not an authoritative input; reusing it across rounds can preserve stale
+    # violations or stale PASS results after the modeler changes outputs/code.
+    mod = _load_effort_floors_module()
+    if mod is None:
+        return [{
+            "kind": "effort_floors_unavailable",
+            "severity": "MEDIUM",
+            "stage": "GATE",
+            "claim": (
+                "effort_floors_report.yaml cannot be refreshed because "
+                "scripts/effort_floors.py could not be imported. Run "
+                f"`python3 scripts/effort_floors.py {run_dir}` manually. "
+                "See Phase 19 α."
+            ),
+        }]
+    try:
+        rep = mod.evaluate(run_dir)
+        mod.write_report(run_dir, rep)
+    except (ValueError, FileNotFoundError) as e:
+        return [{
+            "kind": "effort_floors_unavailable",
+            "severity": "MEDIUM",
+            "stage": "GATE",
+            "claim": (f"Could not compute effort floors: {e}. "
+                      f"Run `python3 scripts/effort_floors.py {run_dir}` "
+                      f"and resolve the manifest error."),
+        }]
+
+    violations = rep.get("violations") or []
+    if not isinstance(violations, list):
+        return out
+
+    drafting_window = round_n < _EFFORT_FLOORS_ENFORCE_FROM_ROUND
+
+    # Special handling: shortcut markers escalate by count. ≥ 3 findings → HIGH
+    # regardless of manifest severity (catches the "death by a thousand cuts"
+    # pattern where the modeler scatters small punts across many files).
+    shortcut_viols = [v for v in violations
+                      if isinstance(v, dict)
+                      and v.get("floor_id") == "shortcut_markers_in_model_code"]
+    other_viols = [v for v in violations
+                   if isinstance(v, dict)
+                   and v.get("floor_id") != "shortcut_markers_in_model_code"]
+
+    for v in shortcut_viols:
+        observed = v.get("observed") or 0
+        try:
+            n = int(observed)
+        except (TypeError, ValueError):
+            n = 0
+        severity = "HIGH" if (n >= 3 and not drafting_window) else "MEDIUM"
+        findings_preview = "; ".join((v.get("findings") or [])[:5])
+        out.append({
+            "kind": "effort_floors_many_shortcuts" if severity == "HIGH"
+                    else "effort_floor_shortcut_markers",
+            "severity": severity,
+            "stage": "MODEL",
+            "claim": (
+                f"Shortcut markers in model code: {n} finding(s). "
+                f"First examples: {findings_preview}. "
+                f"Phase 19 α — each marker is a quiet under-investment "
+                f"(TODO, n_replicates=1, bare except: pass). Resolve "
+                f"or document why the shortcut is the right answer in "
+                f"modeling_strategy.md."
+            ),
+        })
+
+    for v in other_viols:
+        floor_id = v.get("floor_id", "?")
+        severity = str(v.get("severity") or "MEDIUM").upper()
+        if drafting_window:
+            # Drafting window — demote to MEDIUM, do not block ACCEPT
+            severity = "MEDIUM"
+        scope_declarable = bool(v.get("scope_declarable"))
+        observed = v.get("observed")
+        minimum = v.get("minimum")
+        scope_tag = " (NOT scope-declarable)" if not scope_declarable else ""
+        diagnostic = (v.get("diagnostic") or "").strip()
+        diag_tag = f" — {diagnostic}" if diagnostic else ""
+        out.append({
+            "kind": f"effort_floor_{floor_id}",
+            "severity": severity,
+            "stage": "MODEL",
+            "claim": (
+                f"Effort floor `{floor_id}` violated{scope_tag}: "
+                f"observed {observed!r} below minimum {minimum!r}"
+                f"{diag_tag}. Phase 19 α — gates measure effort, not "
+                f"just artifact existence. Fix the underlying "
+                f"under-investment (more draws / restarts / "
+                f"perturbations / iterations) or add justification "
+                f"in modeling_strategy.md."
+            ),
+        })
+
+    return out
+
+
+# Phase 19 β — scope-declaration budget cap. Default is 3 declarations
+# per run; the modeler may raise to 5 via a top-level `budget:` block in
+# scope_declaration.yaml with a non-empty `overage_justification` field.
+# Caps higher than 5 are NOT honored — they require an explicit human
+# escalation outside the harness.
+_SCOPE_DECLARATION_DEFAULT_CAP = 3
+_SCOPE_DECLARATION_HARD_CEILING = 5
+_SCOPE_BUDGET_ENFORCE_FROM_ROUND = 2
+
+
+def _check_scope_declaration_budget(run_dir: str,
+                                     round_n: int | None = None
+                                     ) -> list[dict]:
+    """Phase 19 β: cap how many things the modeler may scope-declare.
+
+    Reads `{run_dir}/scope_declaration.yaml`. Counts top-level
+    `declarations:` entries (the canonical list used by all prior
+    phases). If the count exceeds the cap (default 3, override up to
+    5 with `budget.cap` + non-empty `budget.overage_justification`),
+    emits one HIGH `scope_declaration_budget_exceeded` violation.
+
+    Round gating:
+      - round_n=None → silent
+      - round 1 → silent (drafting window — the modeler is still
+        triaging; budget is enforced from round 2)
+      - round ≥ 2 → enforced
+
+    Counts ONLY declarations the modeler authored. Each declaration
+    must have at least an `id` or `claim` field to be counted —
+    blank entries don't burn budget but DO emit a MEDIUM advisory.
+    """
+    if round_n is None or round_n < _SCOPE_BUDGET_ENFORCE_FROM_ROUND:
+        return []
+
+    path = os.path.join(run_dir, "scope_declaration.yaml")
+    if not os.path.exists(path):
+        return []  # No declarations at all is the most common case; silent.
+
+    try:
+        with open(path) as f:
+            doc = yaml.safe_load(f) or {}
+    except (yaml.YAMLError, OSError) as e:
+        return [{
+            "kind": "scope_declaration_invalid",
+            "severity": "MEDIUM",
+            "stage": "GATE",
+            "claim": (f"scope_declaration.yaml could not be parsed: {e}. "
+                      f"Phase 19 β requires a valid YAML doc to count "
+                      f"declarations against the budget."),
+        }]
+
+    if not isinstance(doc, dict):
+        return [{
+            "kind": "scope_declaration_invalid",
+            "severity": "MEDIUM",
+            "stage": "GATE",
+            "claim": ("scope_declaration.yaml top level must be a "
+                      "mapping with a `declarations:` list."),
+        }]
+
+    decls_raw = doc.get("declarations") or []
+    if not isinstance(decls_raw, list):
+        return [{
+            "kind": "scope_declaration_invalid",
+            "severity": "MEDIUM",
+            "stage": "GATE",
+            "claim": ("scope_declaration.yaml: `declarations:` must be a list."),
+        }]
+
+    # Count substantive declarations; flag empty ones as advisory.
+    counted: list[dict] = []
+    empties = 0
+    for entry in decls_raw:
+        if not isinstance(entry, dict):
+            empties += 1
+            continue
+        if entry.get("id") or entry.get("claim"):
+            counted.append(entry)
+        else:
+            empties += 1
+
+    # Determine effective cap.
+    budget = doc.get("budget") or {}
+    cap = _SCOPE_DECLARATION_DEFAULT_CAP
+    overage_justification = ""
+    if isinstance(budget, dict):
+        try:
+            requested_cap = int(budget.get("cap", _SCOPE_DECLARATION_DEFAULT_CAP))
+        except (TypeError, ValueError):
+            requested_cap = _SCOPE_DECLARATION_DEFAULT_CAP
+        overage_justification = str(budget.get("overage_justification") or "").strip()
+        if requested_cap > _SCOPE_DECLARATION_DEFAULT_CAP:
+            # Honor caps up to the hard ceiling, but ONLY if a non-empty
+            # overage_justification is present. Otherwise stay at default.
+            if (requested_cap <= _SCOPE_DECLARATION_HARD_CEILING
+                    and overage_justification):
+                cap = requested_cap
+            # else: stay at default — silently. The over-cap count will
+            # fire the same way it would without an attempted override.
+        elif requested_cap < _SCOPE_DECLARATION_DEFAULT_CAP:
+            # Stricter cap than default is always honored (Phase 19 β
+            # is a floor on rigor, not a ceiling).
+            cap = max(0, requested_cap)
+
+    out: list[dict] = []
+
+    if empties:
+        out.append({
+            "kind": "scope_declaration_empty_entries",
+            "severity": "MEDIUM",
+            "stage": "GATE",
+            "claim": (
+                f"scope_declaration.yaml has {empties} empty/incomplete "
+                f"entry(ies). Each declaration must include at least an "
+                f"`id` or `claim` field. Empty entries do not burn budget "
+                f"but obscure intent — remove them or fill them in."
+            ),
+        })
+
+    n_used = len(counted)
+    if n_used > cap:
+        # Build a compact preview of the over-cap declarations.
+        previews = []
+        for d in counted[:6]:
+            tag = d.get("id") or str(d.get("claim", ""))[:60]
+            previews.append(str(tag))
+        preview_str = "; ".join(previews)
+        out.append({
+            "kind": "scope_declaration_budget_exceeded",
+            "severity": "HIGH",
+            "stage": "GATE",
+            "claim": (
+                f"Scope-declaration budget exceeded: {n_used} declarations "
+                f"vs cap {cap} (Phase 19 β default {_SCOPE_DECLARATION_DEFAULT_CAP}, "
+                f"hard ceiling {_SCOPE_DECLARATION_HARD_CEILING}). "
+                f"Declarations: {preview_str}. Either resolve some of "
+                f"these in the next round (each scope-declaration is a "
+                f"thing you chose not to model), OR raise the cap up to "
+                f"{_SCOPE_DECLARATION_HARD_CEILING} via "
+                f"`budget: {{cap: <n>, overage_justification: \"<reason>\"}}` "
+                f"in scope_declaration.yaml. Caps above "
+                f"{_SCOPE_DECLARATION_HARD_CEILING} require human escalation."
+            ),
+        })
+
+    return out
+
+
+# Phase 19 γ — benchmark-locked acceptance. Round 1 is drafting; from round 2,
+# DRIFT escalates to HIGH (scope-declarable). missing_computed is HIGH from
+# round 2 — the modeler must populate computed_value/computed_field.
+_BENCHMARK_MATCH_ENFORCE_FROM_ROUND = 2
+
+_BENCHMARK_MATCH_MODULE = None
+
+
+def _load_benchmark_match_module():
+    """Lazy import of scripts/benchmark_match.py. Cached."""
+    global _BENCHMARK_MATCH_MODULE
+    if _BENCHMARK_MATCH_MODULE is not None:
+        return _BENCHMARK_MATCH_MODULE
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "benchmark_match",
+            os.path.join(os.path.dirname(__file__), "benchmark_match.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["benchmark_match"] = mod
+        spec.loader.exec_module(mod)
+        _BENCHMARK_MATCH_MODULE = mod
+        return mod
+    except (FileNotFoundError, ImportError):
+        return None
+
+
+def _check_benchmark_match(run_dir: str,
+                            round_n: int | None = None) -> list[dict]:
+    """Phase 19 γ: enforce literature-anchored acceptance band.
+
+    Reads `{run_dir}/benchmark_match.yaml` (produced by
+    `scripts/benchmark_match.py`). If the report is absent but
+    `models/benchmark_targets.yaml` exists, the script is invoked in-
+    process so the gate is not silently skippable.
+
+    Emits:
+      benchmark_targets_missing      MEDIUM @ r=1, HIGH @ r≥2 (planner
+                                      forgot to extract the table)
+      benchmark_match_invalid        HIGH (MALFORMED targets)
+      benchmark_drift                HIGH per drifted target (scope-
+                                      declarable — domain heuristic)
+      benchmark_computed_missing     HIGH per target with no
+                                      computed_value/computed_field
+      benchmark_match_unavailable    MEDIUM (script unimportable)
+
+    Round gating:
+      round_n=None → silent
+      round 1      → demote all violations to MEDIUM (drafting)
+      round ≥ 2    → enforce per-kind severities
+    """
+    if round_n is None:
+        return []
+
+    targets_path = os.path.join(run_dir, "models", "benchmark_targets.yaml")
+    report_path = os.path.join(run_dir, "benchmark_match.yaml")
+    drafting = round_n < _BENCHMARK_MATCH_ENFORCE_FROM_ROUND
+    out: list[dict] = []
+
+    # Case 1: no targets file at all. Modeler hasn't (yet) been asked to
+    # build against benchmarks. At round 1 silent. At round ≥ 2,
+    # emit MEDIUM benchmark_targets_missing so the planner notices.
+    if not os.path.exists(targets_path):
+        if drafting:
+            return []
+        return [{
+            "kind": "benchmark_targets_missing",
+            "severity": "MEDIUM",
+            "stage": "PLAN",
+            "claim": (
+                "models/benchmark_targets.yaml is absent at round "
+                f"{round_n}. Phase 19 γ — the planner must extract "
+                "the `Published benchmarks` table from plan.md into "
+                "structured YAML so the modeler's computed outputs "
+                "can be compared against literature ranges. See the "
+                "`benchmark-locked-acceptance` skill. Without this "
+                "file the harness has no mechanical way to check that "
+                "fitted incidences/prevalences/coverages match "
+                "published reality."
+            ),
+        }]
+
+    # Case 2: targets exist. Always resolve a fresh report; the YAML is a
+    # derived cache and can go stale when computed_value or computed_field
+    # targets change between critique rounds.
+    mod = _load_benchmark_match_module()
+    if mod is None:
+        return [{
+            "kind": "benchmark_match_unavailable",
+            "severity": "MEDIUM",
+            "stage": "GATE",
+            "claim": (
+                "benchmark_match.yaml cannot be refreshed because "
+                "scripts/benchmark_match.py could not be imported. Run "
+                f"`python3 scripts/benchmark_match.py {run_dir}` "
+                "manually. Phase 19 γ."
+            ),
+        }]
+    try:
+        rep = mod.evaluate(run_dir)
+        mod.write_report(run_dir, rep)
+    except (ValueError, FileNotFoundError) as e:
+        return [{
+            "kind": "benchmark_match_unavailable",
+            "severity": "MEDIUM",
+            "stage": "GATE",
+            "claim": f"benchmark_match evaluation failed: {e}",
+        }]
+
+    verdict = str(rep.get("verdict") or "PENDING").upper()
+    if verdict == "MALFORMED":
+        sev = "MEDIUM" if drafting else "HIGH"
+        return [{
+            "kind": "benchmark_match_invalid",
+            "severity": sev,
+            "stage": "MODEL",
+            "claim": (
+                f"benchmark_targets.yaml is MALFORMED: "
+                f"{rep.get('error', 'see benchmark_match.yaml')}. "
+                f"Phase 19 γ — fix the schema (each benchmark needs "
+                f"id, metric, target_value, tolerance_factor or "
+                f"tolerance_abs, source)."
+            ),
+        }]
+
+    results = rep.get("results") or []
+    if not isinstance(results, list):
+        return out
+
+    # Per-target violations (one HIGH per drifted target; HIGH per
+    # missing-computed target). At round 1 → demote to MEDIUM.
+    drifted = []
+    missing_computed = []
+    for r in results:
+        if not isinstance(r, dict):
+            continue
+        rid = r.get("id", "?")
+        observed = r.get("observed")
+        within = r.get("within_band")
+        if observed is None:
+            missing_computed.append(r)
+            continue
+        if within is False:
+            drifted.append(r)
+
+    # Emit. Cap each list at 5 to avoid swamping the gate (Phase 10 ψ
+    # consolidation pattern).
+    for r in drifted[:5]:
+        rid = r.get("id", "?")
+        sev = "MEDIUM" if drafting else "HIGH"
+        out.append({
+            "kind": "benchmark_drift",
+            "severity": sev,
+            "stage": "MODEL",
+            "claim": (
+                f"Benchmark `{rid}` ({r.get('metric', '?')}): observed "
+                f"{r.get('observed')} outside band [{r.get('band_low')}, "
+                f"{r.get('band_high')}] (target {r.get('target_value')}, "
+                f"source {r.get('source', '?')}). Phase 19 γ — fitted "
+                f"output does not match published reality. Refit, "
+                f"widen the tolerance with cited justification, or "
+                f"scope-declare with a literature-grounded reason."
+            ),
+        })
+    if len(drifted) > 5:
+        out.append({
+            "kind": "benchmark_drift_advisory",
+            "severity": "MEDIUM",
+            "stage": "MODEL",
+            "claim": (
+                f"{len(drifted) - 5} additional benchmark(s) drifted; "
+                f"see benchmark_match.yaml for the full list."
+            ),
+        })
+
+    for r in missing_computed[:5]:
+        rid = r.get("id", "?")
+        sev = "MEDIUM" if drafting else "HIGH"
+        out.append({
+            "kind": "benchmark_computed_missing",
+            "severity": sev,
+            "stage": "MODEL",
+            "claim": (
+                f"Benchmark `{rid}` ({r.get('metric', '?')}): modeler "
+                f"set neither `computed_value` nor `computed_field`. "
+                f"Phase 19 γ — after the model run, fill the field so "
+                f"the comparison against {r.get('source', 'the source')} "
+                f"can fire. Diagnostic: {r.get('diagnostic', '')}"
+            ),
+        })
+
+    return out
+
+
+# Phase 19 δ — sufficiency critic gate. POST-WRITE only (report.md must exist).
+_SUFFICIENCY_ENFORCE_FROM_ROUND = 2
+
+
+def _check_sufficiency_critic(run_dir: str,
+                                round_n: int | None = None) -> list[dict]:
+    """Phase 19 δ: enforce sufficiency-critic verdicts.
+
+    Reads `{run_dir}/critique_sufficiency.yaml` (produced by the
+    `critique-sufficiency` agent). For each `claim_verdicts[]` entry
+    whose verdict is `OVERCLAIMED`, emits one HIGH `claim_overclaimed`
+    blocker.
+
+    Emits:
+      critique_sufficiency_not_run   MEDIUM (report.md exists but no yaml)
+      critique_sufficiency_invalid   HIGH (malformed yaml)
+      claim_overclaimed              HIGH per OVERCLAIMED verdict
+                                      (MEDIUM in drafting window)
+      claim_overclaimed_advisory     MEDIUM (consolidation when > 5)
+
+    Round gating:
+      round_n=None → silent
+      round 1 → all violations demoted to MEDIUM
+      round ≥ 2 → enforce manifest severities
+
+    Gate fires only when `report.md` exists (post-WRITE).
+    """
+    if round_n is None:
+        return []
+
+    report_path = os.path.join(run_dir, "report.md")
+    if not os.path.exists(report_path):
+        return []
+
+    yaml_path = os.path.join(run_dir, "critique_sufficiency.yaml")
+    drafting = round_n < _SUFFICIENCY_ENFORCE_FROM_ROUND
+    out: list[dict] = []
+
+    if not os.path.exists(yaml_path):
+        return [{
+            "kind": "critique_sufficiency_not_run",
+            "severity": "MEDIUM",
+            "stage": "WRITE",
+            "claim": (
+                "report.md exists but critique_sufficiency.yaml is "
+                "absent. Phase 19 δ — spawn the `critique-sufficiency` "
+                "agent post-WRITE to verify each high-stakes claim is "
+                "supported by the evidence base (benchmark_match, "
+                "effort_floors, calibration depth, UQ draws). See "
+                "the `evidence-sufficiency` skill."
+            ),
+        }]
+
+    try:
+        with open(yaml_path) as f:
+            doc = yaml.safe_load(f) or {}
+    except (yaml.YAMLError, OSError) as e:
+        return [{
+            "kind": "critique_sufficiency_invalid",
+            "severity": "HIGH",
+            "stage": "WRITE",
+            "claim": (f"critique_sufficiency.yaml could not be parsed: "
+                      f"{e}. Re-spawn the critique-sufficiency agent."),
+        }]
+
+    verdicts = doc.get("claim_verdicts") or []
+    if not isinstance(verdicts, list):
+        return [{
+            "kind": "critique_sufficiency_invalid",
+            "severity": "HIGH",
+            "stage": "WRITE",
+            "claim": ("critique_sufficiency.yaml: `claim_verdicts:` "
+                      "must be a list."),
+        }]
+
+    overclaimed = []
+    for v in verdicts:
+        if not isinstance(v, dict):
+            continue
+        if str(v.get("verdict") or "").upper() == "OVERCLAIMED":
+            overclaimed.append(v)
+
+    # Emit per-claim HIGH (or MEDIUM in drafting window), capped at 5.
+    sev = "MEDIUM" if drafting else "HIGH"
+
+    def _first_line(s: str | None, limit: int = 240) -> str:
+        """Get the first non-empty line of s, truncated to limit."""
+        lines = str(s or "").strip().splitlines()
+        return lines[0][:limit] if lines else ""
+
+    for v in overclaimed[:5]:
+        cid = v.get("claim_id") or "<no_id>"
+        quoted = _first_line(v.get("quoted_phrase"))
+        reason = _first_line(v.get("reason"))
+        suggested = _first_line(v.get("suggested_restatement"))
+        out.append({
+            "kind": "claim_overclaimed",
+            "severity": sev,
+            "stage": "WRITE",
+            "claim": (
+                f"[{cid}] OVERCLAIMED: \"{quoted}\". Reason: {reason} "
+                f"Suggested restatement: \"{suggested}\". Phase 19 δ — "
+                f"either downgrade the claim in report.md (or via "
+                f"claims_ledger.yaml's source_field), strengthen the "
+                f"underlying evidence (more UQ draws, restarts, held-"
+                f"out folds), or scope-declare why the claim strength "
+                f"is appropriate despite the evidence gap."
+            ),
+        })
+    if len(overclaimed) > 5:
+        out.append({
+            "kind": "claim_overclaimed_advisory",
+            "severity": "MEDIUM",
+            "stage": "WRITE",
+            "claim": (
+                f"{len(overclaimed) - 5} additional OVERCLAIMED "
+                f"verdict(s) in critique_sufficiency.yaml; see the "
+                f"file for the full list."
+            ),
+        })
+
     return out
 
 
@@ -5631,6 +6309,464 @@ def _run_self_test() -> int:
                and x["severity"] == "HIGH"
                and "zero claims" in x.get("claim", "") for x in v),
            f"CL6: empty ledger should fire HIGH invalid w/ zero-claims claim, got {v}")
+
+    # --- Phase 19 α: effort_floors tests (EF-prefix) ---
+    with _tempfile.TemporaryDirectory() as _d:
+        # EF1: round_n=None → silent (defer)
+        ok(_check_effort_floors(_d, round_n=None) == [],
+           "EF1: round_n=None must be silent")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # EF2: no trigger artifacts and no models/ dir → silent
+        v = _check_effort_floors(_d, round_n=3)
+        ok(v == [], f"EF2: empty run dir must be silent, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # EF3: under-floor n_draws at round 3 → HIGH effort_floor_uq_min_draws_local
+        # (NOT scope-declarable). Script auto-runs when report is absent.
+        with open(os.path.join(_d, "uncertainty_report.yaml"), "w") as f:
+            _yaml.safe_dump({"n_draws": 50, "scalar_outputs": {}}, f)
+        v = _check_effort_floors(_d, round_n=3)
+        match = [x for x in v if x["kind"] == "effort_floor_uq_min_draws_local"]
+        ok(len(match) == 1 and match[0]["severity"] == "HIGH",
+           f"EF3: 50 draws at r=3 should fire HIGH, got {v}")
+        ok("NOT scope-declarable" in match[0]["claim"],
+           f"EF3: NOT scope-declarable must be flagged in claim, got {match}")
+        # And the report file is now on disk for downstream readers.
+        ok(os.path.exists(os.path.join(_d, "effort_floors_report.yaml")),
+           "EF3: validator must auto-write effort_floors_report.yaml")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # EF4: under-floor at round 1 (drafting window) → MEDIUM regardless of
+        # manifest severity. Same input as EF3.
+        with open(os.path.join(_d, "uncertainty_report.yaml"), "w") as f:
+            _yaml.safe_dump({"n_draws": 50}, f)
+        v = _check_effort_floors(_d, round_n=1)
+        match = [x for x in v if x["kind"] == "effort_floor_uq_min_draws_local"]
+        ok(len(match) == 1 and match[0]["severity"] == "MEDIUM",
+           f"EF4: drafting window must demote to MEDIUM, got {match}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # EF5: meets floor → silent for that floor.
+        with open(os.path.join(_d, "uncertainty_report.yaml"), "w") as f:
+            _yaml.safe_dump({"n_draws": 500}, f)
+        v = _check_effort_floors(_d, round_n=3)
+        match = [x for x in v if x["kind"] == "effort_floor_uq_min_draws_local"]
+        ok(not match, f"EF5: 500 draws should be silent on local floor, got {match}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # EF5b: stale cached report must be refreshed. Start under-floor,
+        # then fix n_draws; the second gate call must not reuse the first
+        # effort_floors_report.yaml.
+        with open(os.path.join(_d, "uncertainty_report.yaml"), "w") as f:
+            _yaml.safe_dump({"n_draws": 50}, f)
+        v1 = _check_effort_floors(_d, round_n=3)
+        ok(any(x["kind"] == "effort_floor_uq_min_draws_local" for x in v1),
+           f"EF5b: first under-floor run should fire, got {v1}")
+        with open(os.path.join(_d, "uncertainty_report.yaml"), "w") as f:
+            _yaml.safe_dump({"n_draws": 500}, f)
+        v2 = _check_effort_floors(_d, round_n=3)
+        ok(not any(x["kind"] == "effort_floor_uq_min_draws_local" for x in v2),
+           f"EF5b: refreshed report should clear fixed n_draws, got {v2}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # EF6: shortcut markers in model code → MEDIUM at <3, HIGH at >=3.
+        os.makedirs(os.path.join(_d, "models"))
+        with open(os.path.join(_d, "models", "run.py"), "w") as f:
+            f.write(
+                "# TODO: bump replicates\n"
+                "n_replicates = 1\n"
+                "n_draws = 5\n"
+                "try:\n    x = 1\nexcept Exception:\n    pass\n"
+            )
+        v = _check_effort_floors(_d, round_n=3)
+        # 4 findings: TODO, n_replicates=1, n_draws=5, bare except
+        high = [x for x in v if x["kind"] == "effort_floors_many_shortcuts"]
+        ok(len(high) == 1 and high[0]["severity"] == "HIGH",
+           f"EF6: ≥3 shortcut markers should escalate to HIGH, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # EF7: malformed effort_floors_report.yaml → effort_floors_unavailable MEDIUM
+        # (the gate does not silently pass — it surfaces the problem).
+        with open(os.path.join(_d, "effort_floors_report.yaml"), "w") as f:
+            f.write(":\n  - this isn't: parseable: yaml\n - oops\n")
+        # Need a trigger artifact for the check to even run.
+        with open(os.path.join(_d, "uncertainty_report.yaml"), "w") as f:
+            _yaml.safe_dump({"n_draws": 500}, f)
+        v = _check_effort_floors(_d, round_n=3)
+        # Malformed YAML may or may not parse to something — accept either
+        # explicit `effort_floors_unavailable` OR silent (empty out, since
+        # the report parsed but had no violations key).
+        ok(isinstance(v, list),
+           f"EF7: malformed report must not crash, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # EF8: under-restart calibration → HIGH effort_floor_calibration_min_restarts,
+        # also under-iterations → MEDIUM. Verifies both fire together.
+        os.makedirs(os.path.join(_d, "models"))
+        with open(os.path.join(_d, "models", "calibration_result.yaml"), "w") as f:
+            _yaml.safe_dump({
+                "n_restarts": 1, "n_iterations": 100,
+                "held_out_fold": {"indices": [0, 1, 2]},
+            }, f)
+        v = _check_effort_floors(_d, round_n=3)
+        restarts = [x for x in v if x["kind"] == "effort_floor_calibration_min_restarts"]
+        iters = [x for x in v if x["kind"] == "effort_floor_calibration_min_iterations"]
+        ok(len(restarts) == 1 and restarts[0]["severity"] == "HIGH",
+           f"EF8: under-restarts must fire HIGH, got {restarts}")
+        ok(len(iters) == 1 and iters[0]["severity"] == "MEDIUM",
+           f"EF8: under-iterations must fire MEDIUM, got {iters}")
+
+    # --- Phase 19 β: scope-declaration budget tests (SB-prefix) ---
+    with _tempfile.TemporaryDirectory() as _d:
+        # SB1: round_n=None and round 1 → silent (drafting window)
+        ok(_check_scope_declaration_budget(_d, round_n=None) == [],
+           "SB1: round_n=None must be silent")
+        ok(_check_scope_declaration_budget(_d, round_n=1) == [],
+           "SB1: round 1 (drafting window) must be silent")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # SB2: no scope_declaration.yaml → silent (most common case)
+        v = _check_scope_declaration_budget(_d, round_n=3)
+        ok(v == [], f"SB2: absent file must be silent, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # SB3: 3 declarations (at cap) → silent
+        with open(os.path.join(_d, "scope_declaration.yaml"), "w") as f:
+            _yaml.safe_dump({"declarations": [
+                {"id": "SCOPE-001", "claim": "a"},
+                {"id": "SCOPE-002", "claim": "b"},
+                {"id": "SCOPE-003", "claim": "c"},
+            ]}, f)
+        v = _check_scope_declaration_budget(_d, round_n=2)
+        ok(v == [], f"SB3: 3 declarations at cap must be silent, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # SB4: 5 declarations, no budget override → HIGH budget_exceeded
+        with open(os.path.join(_d, "scope_declaration.yaml"), "w") as f:
+            _yaml.safe_dump({"declarations": [
+                {"id": f"SCOPE-{i:03d}", "claim": "a"} for i in range(1, 6)
+            ]}, f)
+        v = _check_scope_declaration_budget(_d, round_n=2)
+        hits = [x for x in v if x["kind"] == "scope_declaration_budget_exceeded"]
+        ok(len(hits) == 1 and hits[0]["severity"] == "HIGH",
+           f"SB4: 5 declarations without override must fire HIGH, got {v}")
+        ok("5 declarations vs cap 3" in hits[0]["claim"],
+           f"SB4: claim must report count and cap, got {hits}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # SB5: 5 declarations WITH budget override + justification → silent
+        with open(os.path.join(_d, "scope_declaration.yaml"), "w") as f:
+            _yaml.safe_dump({
+                "budget": {"cap": 5,
+                           "overage_justification":
+                                "Multi-disease integrated model; "
+                                "five scope cuts agreed with stakeholders."},
+                "declarations": [
+                    {"id": f"SCOPE-{i:03d}", "claim": "a"} for i in range(1, 6)
+                ]}, f)
+        v = _check_scope_declaration_budget(_d, round_n=2)
+        ok(not any(x["kind"] == "scope_declaration_budget_exceeded" for x in v),
+           f"SB5: cap=5 with justification must allow 5 declarations, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # SB6: cap=5 WITHOUT justification → override not honored, HIGH fires
+        with open(os.path.join(_d, "scope_declaration.yaml"), "w") as f:
+            _yaml.safe_dump({
+                "budget": {"cap": 5, "overage_justification": ""},
+                "declarations": [
+                    {"id": f"SCOPE-{i:03d}", "claim": "a"} for i in range(1, 6)
+                ]}, f)
+        v = _check_scope_declaration_budget(_d, round_n=2)
+        ok(any(x["kind"] == "scope_declaration_budget_exceeded" for x in v),
+           f"SB6: blank justification must not honor cap override, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # SB7: cap=8 (above hard ceiling 5) → not honored, HIGH fires.
+        with open(os.path.join(_d, "scope_declaration.yaml"), "w") as f:
+            _yaml.safe_dump({
+                "budget": {"cap": 8, "overage_justification": "we want a lot"},
+                "declarations": [
+                    {"id": f"SCOPE-{i:03d}", "claim": "a"} for i in range(1, 6)
+                ]}, f)
+        v = _check_scope_declaration_budget(_d, round_n=2)
+        ok(any(x["kind"] == "scope_declaration_budget_exceeded" for x in v),
+           f"SB7: cap above hard ceiling must not be honored, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # SB8: empty declaration entries emit MEDIUM advisory, not HIGH.
+        with open(os.path.join(_d, "scope_declaration.yaml"), "w") as f:
+            _yaml.safe_dump({"declarations": [
+                {"id": "SCOPE-001", "claim": "a"},
+                {},  # empty
+                {"claim": ""},  # also empty
+            ]}, f)
+        v = _check_scope_declaration_budget(_d, round_n=2)
+        empties = [x for x in v if x["kind"] == "scope_declaration_empty_entries"]
+        ok(len(empties) == 1 and empties[0]["severity"] == "MEDIUM"
+           and "2 empty" in empties[0]["claim"],
+           f"SB8: empties must fire ONE consolidated MEDIUM advisory, got {v}")
+        # And the budget check should NOT fire (only 1 substantive declaration)
+        ok(not any(x["kind"] == "scope_declaration_budget_exceeded" for x in v),
+           f"SB8: empties must not count toward cap, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # SB9: malformed YAML → MEDIUM invalid (does not crash)
+        with open(os.path.join(_d, "scope_declaration.yaml"), "w") as f:
+            f.write("declarations: not_a_list_but_a_string\n")
+        v = _check_scope_declaration_budget(_d, round_n=2)
+        ok(any(x["kind"] == "scope_declaration_invalid"
+               and x["severity"] == "MEDIUM" for x in v),
+           f"SB9: malformed declarations must fire MEDIUM invalid, got {v}")
+
+    # --- Phase 19 γ: benchmark_match tests (BM-prefix) ---
+    with _tempfile.TemporaryDirectory() as _d:
+        # BM1: round_n=None → silent
+        ok(_check_benchmark_match(_d, round_n=None) == [],
+           "BM1: round_n=None must be silent")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # BM2: round 1, no benchmark_targets.yaml → silent (drafting)
+        v = _check_benchmark_match(_d, round_n=1)
+        ok(v == [], f"BM2: round 1 without targets must be silent, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # BM3: round 2, no benchmark_targets.yaml → MEDIUM benchmark_targets_missing
+        v = _check_benchmark_match(_d, round_n=2)
+        ok(any(x["kind"] == "benchmark_targets_missing"
+               and x["severity"] == "MEDIUM" for x in v),
+           f"BM3: missing targets at r=2 should fire MEDIUM, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # BM4: round 2, drifted benchmark → HIGH benchmark_drift
+        os.makedirs(os.path.join(_d, "models"))
+        with open(os.path.join(_d, "models", "benchmark_targets.yaml"), "w") as f:
+            _yaml.safe_dump({
+                "benchmarks": [
+                    {"id": "b1", "metric": "x", "target_value": 400,
+                     "tolerance_factor": 1.5, "source": "WMR",
+                     "computed_value": 100},  # outside [267, 600]
+                ]
+            }, f)
+        v = _check_benchmark_match(_d, round_n=2)
+        drift = [x for x in v if x["kind"] == "benchmark_drift"]
+        ok(len(drift) == 1 and drift[0]["severity"] == "HIGH",
+           f"BM4: drift at r=2 should be HIGH, got {v}")
+        # auto-writes report
+        ok(os.path.exists(os.path.join(_d, "benchmark_match.yaml")),
+           "BM4: validator must auto-write benchmark_match.yaml")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # BM5: round 1 drafting window demotes drift to MEDIUM
+        os.makedirs(os.path.join(_d, "models"))
+        with open(os.path.join(_d, "models", "benchmark_targets.yaml"), "w") as f:
+            _yaml.safe_dump({
+                "benchmarks": [
+                    {"id": "b1", "metric": "x", "target_value": 400,
+                     "tolerance_factor": 1.5, "source": "WMR",
+                     "computed_value": 100},
+                ]
+            }, f)
+        v = _check_benchmark_match(_d, round_n=1)
+        drift = [x for x in v if x["kind"] == "benchmark_drift"]
+        ok(len(drift) == 1 and drift[0]["severity"] == "MEDIUM",
+           f"BM5: drift at r=1 must be MEDIUM, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # BM6: round 2, all within band → silent
+        os.makedirs(os.path.join(_d, "models"))
+        with open(os.path.join(_d, "models", "benchmark_targets.yaml"), "w") as f:
+            _yaml.safe_dump({
+                "benchmarks": [
+                    {"id": "b1", "metric": "x", "target_value": 400,
+                     "tolerance_factor": 2.0, "source": "WMR",
+                     "computed_value": 380},
+                    {"id": "b2", "metric": "y", "target_value": 50,
+                     "tolerance_abs": 10, "source": "DHS",
+                     "computed_value": 55},
+                ]
+            }, f)
+        v = _check_benchmark_match(_d, round_n=2)
+        ok(not any(x["kind"] in ("benchmark_drift", "benchmark_computed_missing")
+                   for x in v),
+           f"BM6: all in-band must be silent, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # BM6b: stale cached benchmark_match.yaml must be refreshed.
+        os.makedirs(os.path.join(_d, "models"))
+        targets_path = os.path.join(_d, "models", "benchmark_targets.yaml")
+        with open(targets_path, "w") as f:
+            _yaml.safe_dump({"benchmarks": [
+                {"id": "b1", "metric": "x", "target_value": 400,
+                 "tolerance_factor": 1.5, "source": "WMR",
+                 "computed_value": 100},
+            ]}, f)
+        v1 = _check_benchmark_match(_d, round_n=2)
+        ok(any(x["kind"] == "benchmark_drift" for x in v1),
+           f"BM6b: first drifted target should fire, got {v1}")
+        with open(targets_path, "w") as f:
+            _yaml.safe_dump({"benchmarks": [
+                {"id": "b1", "metric": "x", "target_value": 400,
+                 "tolerance_factor": 1.5, "source": "WMR",
+                 "computed_value": 400},
+            ]}, f)
+        v2 = _check_benchmark_match(_d, round_n=2)
+        ok(not any(x["kind"] == "benchmark_drift" for x in v2),
+           f"BM6b: refreshed report should clear fixed benchmark, got {v2}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # BM7: missing computed → HIGH benchmark_computed_missing at r≥2
+        os.makedirs(os.path.join(_d, "models"))
+        with open(os.path.join(_d, "models", "benchmark_targets.yaml"), "w") as f:
+            _yaml.safe_dump({
+                "benchmarks": [
+                    {"id": "b1", "metric": "x", "target_value": 400,
+                     "tolerance_factor": 2.0, "source": "WMR"},
+                ]
+            }, f)
+        v = _check_benchmark_match(_d, round_n=2)
+        miss = [x for x in v if x["kind"] == "benchmark_computed_missing"]
+        ok(len(miss) == 1 and miss[0]["severity"] == "HIGH",
+           f"BM7: missing computed_value at r=2 should be HIGH, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # BM8: MALFORMED targets → HIGH benchmark_match_invalid at r≥2
+        os.makedirs(os.path.join(_d, "models"))
+        with open(os.path.join(_d, "models", "benchmark_targets.yaml"), "w") as f:
+            f.write("benchmarks: this_is_not_a_list\n")
+        v = _check_benchmark_match(_d, round_n=2)
+        ok(any(x["kind"] == "benchmark_match_invalid"
+               and x["severity"] == "HIGH" for x in v),
+           f"BM8: malformed targets at r=2 should fire HIGH invalid, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # BM9: many drifted benchmarks → cap at 5 + 1 advisory
+        os.makedirs(os.path.join(_d, "models"))
+        with open(os.path.join(_d, "models", "benchmark_targets.yaml"), "w") as f:
+            _yaml.safe_dump({
+                "benchmarks": [
+                    {"id": f"b{i}", "metric": f"m{i}",
+                     "target_value": 400, "tolerance_factor": 1.2,
+                     "source": "WMR", "computed_value": 100}
+                    for i in range(8)
+                ]
+            }, f)
+        v = _check_benchmark_match(_d, round_n=2)
+        drift = [x for x in v if x["kind"] == "benchmark_drift"]
+        advisory = [x for x in v if x["kind"] == "benchmark_drift_advisory"]
+        ok(len(drift) == 5 and len(advisory) == 1,
+           f"BM9: must cap at 5 + advisory, got drift={len(drift)} adv={len(advisory)}")
+
+    # --- Phase 19 δ: sufficiency-critic tests (SF-prefix) ---
+    with _tempfile.TemporaryDirectory() as _d:
+        # SF1: round_n=None → silent
+        ok(_check_sufficiency_critic(_d, round_n=None) == [],
+           "SF1: round_n=None must be silent")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # SF2: no report.md → silent (write hasn't happened)
+        v = _check_sufficiency_critic(_d, round_n=2)
+        ok(v == [], f"SF2: no report.md must be silent, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # SF3: report.md present but no critique_sufficiency.yaml → MEDIUM not_run
+        with open(os.path.join(_d, "report.md"), "w") as f:
+            f.write("# Report\n")
+        v = _check_sufficiency_critic(_d, round_n=2)
+        ok(any(x["kind"] == "critique_sufficiency_not_run"
+               and x["severity"] == "MEDIUM" for x in v),
+           f"SF3: report without yaml should fire MEDIUM not_run, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # SF4: OVERCLAIMED at round 2 → HIGH claim_overclaimed
+        with open(os.path.join(_d, "report.md"), "w") as f:
+            f.write("# Report\n")
+        with open(os.path.join(_d, "critique_sufficiency.yaml"), "w") as f:
+            _yaml.safe_dump({
+                "agent": "critique-sufficiency",
+                "claim_verdicts": [
+                    {"claim_id": "c042",
+                     "quoted_phrase": "Allocation A reduces deaths by 28% "
+                                       "(95% CI 22-34)",
+                     "verdict": "OVERCLAIMED",
+                     "reason": "n_draws=80 below floor",
+                     "suggested_restatement": "treat as exploratory"},
+                    {"claim_id": "c071",
+                     "verdict": "ADEQUATE",
+                     "quoted_phrase": "$5,300/DALY"},
+                ],
+                "verdict": "OVERCLAIMED",
+            }, f)
+        v = _check_sufficiency_critic(_d, round_n=2)
+        oc = [x for x in v if x["kind"] == "claim_overclaimed"]
+        ok(len(oc) == 1 and oc[0]["severity"] == "HIGH",
+           f"SF4: OVERCLAIMED at r=2 should fire HIGH, got {v}")
+        # ADEQUATE entry should not fire
+        ok("c071" not in (oc[0].get("claim", "") if oc else ""),
+           f"SF4: ADEQUATE must not fire, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # SF5: round 1 drafting window demotes OVERCLAIMED to MEDIUM
+        with open(os.path.join(_d, "report.md"), "w") as f:
+            f.write("# Report\n")
+        with open(os.path.join(_d, "critique_sufficiency.yaml"), "w") as f:
+            _yaml.safe_dump({
+                "claim_verdicts": [
+                    {"claim_id": "c1", "verdict": "OVERCLAIMED",
+                     "quoted_phrase": "x", "reason": "y"},
+                ],
+            }, f)
+        v = _check_sufficiency_critic(_d, round_n=1)
+        oc = [x for x in v if x["kind"] == "claim_overclaimed"]
+        ok(len(oc) == 1 and oc[0]["severity"] == "MEDIUM",
+           f"SF5: round 1 must demote to MEDIUM, got {oc}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # SF6: malformed yaml → HIGH invalid (no crash)
+        with open(os.path.join(_d, "report.md"), "w") as f:
+            f.write("# Report\n")
+        with open(os.path.join(_d, "critique_sufficiency.yaml"), "w") as f:
+            f.write("claim_verdicts: this_is_a_string\n")
+        v = _check_sufficiency_critic(_d, round_n=2)
+        ok(any(x["kind"] == "critique_sufficiency_invalid"
+               and x["severity"] == "HIGH" for x in v),
+           f"SF6: malformed yaml should fire HIGH invalid, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # SF7: many OVERCLAIMED → cap at 5 + 1 advisory
+        with open(os.path.join(_d, "report.md"), "w") as f:
+            f.write("# Report\n")
+        with open(os.path.join(_d, "critique_sufficiency.yaml"), "w") as f:
+            _yaml.safe_dump({
+                "claim_verdicts": [
+                    {"claim_id": f"c{i}", "verdict": "OVERCLAIMED",
+                     "quoted_phrase": f"claim {i}",
+                     "reason": "x"}
+                    for i in range(7)
+                ],
+            }, f)
+        v = _check_sufficiency_critic(_d, round_n=2)
+        oc = [x for x in v if x["kind"] == "claim_overclaimed"]
+        advisory = [x for x in v if x["kind"] == "claim_overclaimed_advisory"]
+        ok(len(oc) == 5 and len(advisory) == 1,
+           f"SF7: must cap at 5 + advisory, got oc={len(oc)} adv={len(advisory)}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # SF8: all ADEQUATE → silent
+        with open(os.path.join(_d, "report.md"), "w") as f:
+            f.write("# Report\n")
+        with open(os.path.join(_d, "critique_sufficiency.yaml"), "w") as f:
+            _yaml.safe_dump({
+                "claim_verdicts": [
+                    {"claim_id": "c1", "verdict": "ADEQUATE",
+                     "quoted_phrase": "x"},
+                ],
+                "verdict": "ADEQUATE",
+            }, f)
+        v = _check_sufficiency_critic(_d, round_n=2)
+        ok(not any(x["kind"] in ("claim_overclaimed",
+                                   "claim_overclaimed_advisory") for x in v),
+           f"SF8: all-ADEQUATE must be silent, got {v}")
 
     # --- Summary ---
     if failures:

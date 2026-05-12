@@ -9,7 +9,7 @@ from claude_agent_sdk import AgentDefinition, HookMatcher
 from agents import (
     planner, data, modeler, analyst,
     critique_methods, critique_domain, critique_premortem,
-    critique_presentation, red_team,
+    critique_presentation, critique_sufficiency, red_team,
     writer,
 )
 
@@ -29,6 +29,9 @@ AGENT_MAX_TURNS = {
     "critique-premortem": 30,
     "critique-presentation": 40,
     "critique-redteam": 50,
+    # Phase 19 δ: sufficiency critic. Bounded — it reads YAML artifacts
+    # and emits per-claim verdicts; doesn't need WebSearch / lit work.
+    "critique-sufficiency": 30,
     "writer": 60,
 }
 
@@ -283,6 +286,21 @@ def build_agents() -> dict[str, AgentDefinition]:
             model="opus",  # adversarial judgment + WebFetch-heavy research
             maxTurns=50,
             skills=["adversarial-redteam", "critique-blockers-schema",
+                    "effect-size-priors"],
+        ),
+        # Phase 19 δ: sufficiency critic. Spawned POST-WRITE parallel to
+        # writer-QA and the coherence audit. Reads report.md + ledger +
+        # rigor artifacts (benchmark_match, effort_floors, calibration,
+        # uncertainty) and emits per-claim OVERCLAIMED/ADEQUATE verdicts.
+        # OVERCLAIMED at round ≥ 2 fires HIGH `claim_overclaimed` in the
+        # validator (scope-declarable).
+        "critique-sufficiency": AgentDefinition(
+            description=critique_sufficiency.DESCRIPTION,
+            prompt=critique_sufficiency.SYSTEM_PROMPT,
+            tools=critique_sufficiency.TOOLS,
+            model="opus",  # claim-strength judgment benefits from opus
+            maxTurns=30,
+            skills=["evidence-sufficiency", "critique-blockers-schema",
                     "effect-size-priors"],
         ),
         "writer": AgentDefinition(
@@ -834,6 +852,25 @@ The writer_qa pass catches:
 The validator also flags `writer_qa_missing` MEDIUM if the QA pass
 wasn't run, and `writer_qa_unresolved` MEDIUM if the verdict is
 REVISE/MAJOR_REVISION at run completion.
+
+#### Sufficiency critic (Phase 19 δ — REQUIRED alongside writer_qa)
+
+After (or alongside) writer_qa, spawn the "critique-sufficiency" agent.
+Tell it the run directory and current round. Wait for completion and
+verify `{run_dir}/critique_sufficiency.yaml` exists.
+
+The sufficiency critic reads `report.md`, `models/claims_ledger.yaml`,
+`benchmark_match.yaml`, `effort_floors_report.yaml`,
+`models/calibration_result.yaml`, and `uncertainty_report.yaml`. It
+decides whether each high-stakes report claim is supported by the
+evidence base. The validator converts any OVERCLAIMED verdict at
+round ≥ 2 into a HIGH `claim_overclaimed` blocker.
+
+If the critic emits OVERCLAIMED verdicts, re-spawn the writer with the
+specific `claim_verdicts` entries to downgrade the prose, or re-run the
+underlying modeling work to strengthen the evidence. Then re-run
+`scripts/render_claims.py`, writer_qa, coherence audit, and the
+sufficiency critic before the final validator call.
 
 #### Coherence audit (Phase 17 Commit β — REQUIRED alongside writer_qa)
 

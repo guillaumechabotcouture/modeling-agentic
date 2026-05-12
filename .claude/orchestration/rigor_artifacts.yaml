@@ -224,3 +224,25 @@ artifacts:
       number/label in report.md is ledger-bound. **NOT scope-
       declarable** — once ANALYZE produces results, the writer needs
       a complete ledger or it cannot produce a clean report.
+
+  - id: benchmark_targets
+    path: models/benchmark_targets.yaml
+    first_draft_round: 1
+    finalize_round: 4
+    stage: model
+    skill: benchmark-locked-acceptance
+    triggered_by: always
+    scope_declarable: true
+    produces:
+      - benchmark_match.yaml
+    description: |
+      **Phase 19 γ.** Literature-anchored acceptance gate. Planner
+      extracts the published-benchmarks table from plan.md into
+      structured YAML: each target carries `target_value`,
+      `tolerance_factor` (or `tolerance_abs`), `source`. Modeler fills
+      `computed_value` (or `computed_field` pointer) after the model
+      run. `scripts/benchmark_match.py` writes `benchmark_match.yaml`
+      with PASS/DRIFT/MALFORMED. Drift on > 1 of N benchmarks blocks
+      ACCEPT unless scope-declared with literature-grounded
+      justification. Scope-declarable because some questions imply
+      novel populations where direct benchmarks don't exist.
