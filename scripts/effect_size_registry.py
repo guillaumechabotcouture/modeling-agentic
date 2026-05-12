@@ -250,11 +250,22 @@ def load_priors(citations_md_path: str) -> dict[str, Any]:
             raise ValueError(f"parameters[{i}] has invalid kind "
                              f"{p['kind']!r}; valid: {sorted(VALID_KINDS)}")
         # Expand ci_95: [low, high] -> ci_low, ci_high (common registry format).
-        if "ci_95" in p and isinstance(p["ci_95"], (list, tuple)) and len(p["ci_95"]) == 2:
+        # Phase 20 γ: reject malformed shapes (length != 2, non-numeric)
+        # instead of silently no-op'ing. A length-1 or length-3 value is
+        # almost always a typo, and silently dropping it leaves
+        # `ci_low`/`ci_high` unset — `sample_from_prior` later errors
+        # with a confusing "ci_low missing" message far from the root.
+        if "ci_95" in p and p["ci_95"] is not None:
+            ci_95 = p["ci_95"]
+            if not isinstance(ci_95, (list, tuple)) or len(ci_95) != 2:
+                raise ValueError(
+                    f"parameters[{i}] has malformed ci_95 (must be a "
+                    f"length-2 list [low, high], got {ci_95!r})"
+                )
             if "ci_low" not in p or p["ci_low"] is None:
-                p["ci_low"] = p["ci_95"][0]
+                p["ci_low"] = ci_95[0]
             if "ci_high" not in p or p["ci_high"] is None:
-                p["ci_high"] = p["ci_95"][1]
+                p["ci_high"] = ci_95[1]
         # Fill in missing fields from the detail section if present.
         name = p["name"]
         if name in details_by_name:
@@ -1083,6 +1094,63 @@ parameters:
         baz = next(p for p in merged2["parameters"] if p["name"] == "baz_or")
         ok(baz["code_refs"] == ["models/yaml_source.py:10"],
            f"G: YAML code_refs wins; got {baz['code_refs']}")
+
+    # H (Phase 20 γ): malformed ci_95 (length != 2) raises ValueError
+    # rather than silently no-op'ing and leaving ci_low/ci_high unset.
+    with tempfile.TemporaryDirectory() as repo:
+        # length-1
+        bad_len1 = """## Parameter Registry
+
+```yaml
+parameters:
+  - name: bad_or
+    value: 0.5
+    kind: odds_ratio
+    source: C1
+    ci_95: [0.3]
+```
+"""
+        bad_path = os.path.join(repo, "bad_len1.md")
+        with open(bad_path, "w") as f:
+            f.write(bad_len1)
+        try:
+            load_priors(bad_path)
+            ok(False, "H: length-1 ci_95 must raise ValueError")
+        except ValueError as e:
+            ok("malformed ci_95" in str(e),
+               f"H: length-1 ci_95 message: {e}")
+
+        # length-3
+        bad_len3 = bad_len1.replace("[0.3]", "[0.3, 0.5, 0.7]")
+        bad_path3 = os.path.join(repo, "bad_len3.md")
+        with open(bad_path3, "w") as f:
+            f.write(bad_len3)
+        try:
+            load_priors(bad_path3)
+            ok(False, "H: length-3 ci_95 must raise ValueError")
+        except ValueError as e:
+            ok("malformed ci_95" in str(e),
+               f"H: length-3 ci_95 message: {e}")
+
+        # valid length-2 still works and populates ci_low / ci_high
+        good = bad_len1.replace("[0.3]", "[0.3, 0.7]")
+        good_path = os.path.join(repo, "good.md")
+        with open(good_path, "w") as f:
+            f.write(good)
+        merged_good = load_priors(good_path)
+        gp = next(p for p in merged_good["parameters"] if p["name"] == "bad_or")
+        ok(gp.get("ci_low") == 0.3 and gp.get("ci_high") == 0.7,
+           f"H: valid ci_95 must expand to ci_low/ci_high, got {gp}")
+
+        # ci_95: null is silently ignored (legitimate "no CI available")
+        null_ci = bad_len1.replace("ci_95: [0.3]", "ci_95: null")
+        null_path = os.path.join(repo, "null_ci.md")
+        with open(null_path, "w") as f:
+            f.write(null_ci)
+        merged_null = load_priors(null_path)
+        np_ = next(p for p in merged_null["parameters"] if p["name"] == "bad_or")
+        ok(np_.get("ci_low") is None and np_.get("ci_high") is None,
+           f"H: null ci_95 must NOT raise; ci_low/ci_high stay unset, got {np_}")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)

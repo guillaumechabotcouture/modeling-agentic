@@ -3162,6 +3162,40 @@ def _check_effort_floors(run_dir: str,
 
     drafting_window = round_n < _EFFORT_FLOORS_ENFORCE_FROM_ROUND
 
+    # Phase 20 β: close the round-1 escape. If the run has rigor
+    # triggers present AND the floor evaluator surfaced any
+    # would-be-HIGH violation at round 1, ACCEPT must wait for at
+    # least round 2 so the manifest severities can fire. A run that
+    # converges in one round and ships under the drafting demotion
+    # silently bypasses effort enforcement — exactly the failure mode
+    # Phase 19 α was supposed to close.
+    if drafting_window and violations:
+        would_be_high = [
+            v for v in violations
+            if isinstance(v, dict) and v.get("severity") == "HIGH"
+        ]
+        if would_be_high:
+            preview = ", ".join(
+                str(v.get("floor_id") or "?") for v in would_be_high[:5]
+            )
+            out.append({
+                "kind": "effort_floors_require_followup_round",
+                "severity": "HIGH",
+                "stage": "GATE",
+                "claim": (
+                    f"At round {round_n}, the drafting window demotes "
+                    f"effort-floor violations to MEDIUM. The current run "
+                    f"has {len(would_be_high)} would-be-HIGH "
+                    f"violation(s) [{preview}], so ACCEPT must wait "
+                    f"until round ≥ {_EFFORT_FLOORS_ENFORCE_FROM_ROUND} "
+                    f"to let the gate enforce. Either resolve the "
+                    f"underlying floors (more draws / restarts / "
+                    f"held-out folds) and re-run, or continue iterating; "
+                    f"a one-round run on a triggers-present model "
+                    f"cannot ACCEPT under Phase 20 β."
+                ),
+            })
+
     # Special handling: shortcut markers escalate by count. ≥ 3 findings → HIGH
     # regardless of manifest severity (catches the "death by a thousand cuts"
     # pattern where the modeler scatters small punts across many files).
@@ -3310,6 +3344,8 @@ def _check_scope_declaration_budget(run_dir: str,
     budget = doc.get("budget") or {}
     cap = _SCOPE_DECLARATION_DEFAULT_CAP
     overage_justification = ""
+    requested_cap = _SCOPE_DECLARATION_DEFAULT_CAP
+    cap_override_diagnostic = ""  # Phase 20 β: surface rejected overrides
     if isinstance(budget, dict):
         try:
             requested_cap = int(budget.get("cap", _SCOPE_DECLARATION_DEFAULT_CAP))
@@ -3317,19 +3353,46 @@ def _check_scope_declaration_budget(run_dir: str,
             requested_cap = _SCOPE_DECLARATION_DEFAULT_CAP
         overage_justification = str(budget.get("overage_justification") or "").strip()
         if requested_cap > _SCOPE_DECLARATION_DEFAULT_CAP:
-            # Honor caps up to the hard ceiling, but ONLY if a non-empty
-            # overage_justification is present. Otherwise stay at default.
             if (requested_cap <= _SCOPE_DECLARATION_HARD_CEILING
                     and overage_justification):
                 cap = requested_cap
-            # else: stay at default — silently. The over-cap count will
-            # fire the same way it would without an attempted override.
+            elif requested_cap > _SCOPE_DECLARATION_HARD_CEILING:
+                # Phase 20 β: don't let an attempted-but-over-ceiling
+                # override be silent. The modeler reading the HIGH
+                # would otherwise not realize their override was
+                # rejected (vs unread).
+                cap_override_diagnostic = (
+                    f"requested cap {requested_cap} exceeds hard ceiling "
+                    f"{_SCOPE_DECLARATION_HARD_CEILING}; using default "
+                    f"{_SCOPE_DECLARATION_DEFAULT_CAP}. Caps above the "
+                    f"hard ceiling require human escalation, not a YAML "
+                    f"edit."
+                )
+            else:
+                # requested_cap > default and <= ceiling, but no
+                # justification supplied → reject the override and say so.
+                cap_override_diagnostic = (
+                    f"requested cap {requested_cap} requires a non-empty "
+                    f"`overage_justification` (got empty); using default "
+                    f"{_SCOPE_DECLARATION_DEFAULT_CAP}."
+                )
         elif requested_cap < _SCOPE_DECLARATION_DEFAULT_CAP:
             # Stricter cap than default is always honored (Phase 19 β
             # is a floor on rigor, not a ceiling).
             cap = max(0, requested_cap)
 
     out: list[dict] = []
+
+    if cap_override_diagnostic:
+        out.append({
+            "kind": "scope_declaration_cap_override_rejected",
+            "severity": "MEDIUM",
+            "stage": "GATE",
+            "claim": (
+                f"Cap override in scope_declaration.yaml `budget:` block "
+                f"was not honored: {cap_override_diagnostic}"
+            ),
+        })
 
     if empties:
         out.append({
@@ -3649,8 +3712,18 @@ def _check_sufficiency_critic(run_dir: str,
         if str(v.get("verdict") or "").upper() == "OVERCLAIMED":
             overclaimed.append(v)
 
+    # Phase 20 β: pilot-run escape hatch. The agent honors a top-level
+    # `PILOT_RUN` entry in scope_declaration.yaml by emitting
+    # `pilot_run_acknowledged: true`; the validator demotes
+    # OVERCLAIMED → MEDIUM in that case. A pilot is a temporary scope —
+    # the pilot declaration itself stays visible to the next round, so
+    # the modeler can't permanently silence the gate.
+    pilot_acknowledged = bool(doc.get("pilot_run_acknowledged"))
+
     # Emit per-claim HIGH (or MEDIUM in drafting window), capped at 5.
     sev = "MEDIUM" if drafting else "HIGH"
+    if pilot_acknowledged:
+        sev = "MEDIUM"
 
     def _first_line(s: str | None, limit: int = 240) -> str:
         """Get the first non-empty line of s, truncated to limit."""
@@ -6417,6 +6490,33 @@ def _run_self_test() -> int:
         ok(len(iters) == 1 and iters[0]["severity"] == "MEDIUM",
            f"EF8: under-iterations must fire MEDIUM, got {iters}")
 
+    with _tempfile.TemporaryDirectory() as _d:
+        # EF9 (Phase 20 β): round-1 ACCEPT escape is closed. A run with
+        # rigor triggers and would-be-HIGH floor violations must NOT be
+        # acceptable at round 1; the validator emits a HIGH
+        # `effort_floors_require_followup_round`.
+        with open(os.path.join(_d, "uncertainty_report.yaml"), "w") as f:
+            _yaml.safe_dump({"n_draws": 50}, f)
+        v = _check_effort_floors(_d, round_n=1)
+        followup = [x for x in v
+                    if x["kind"] == "effort_floors_require_followup_round"]
+        ok(len(followup) == 1 and followup[0]["severity"] == "HIGH",
+           f"EF9: round 1 with would-be-HIGH must fire follow-up HIGH, got {v}")
+        # Individual floor violations should still be MEDIUM at round 1.
+        uq = [x for x in v if x["kind"] == "effort_floor_uq_min_draws_local"]
+        ok(uq and uq[0]["severity"] == "MEDIUM",
+           f"EF9: individual floors at r=1 stay MEDIUM (drafting), got {uq}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # EF9b (Phase 20 β): round-1 run with NO would-be-HIGH (clean
+        # floor evaluation) does not fire the follow-up requirement.
+        with open(os.path.join(_d, "uncertainty_report.yaml"), "w") as f:
+            _yaml.safe_dump({"n_draws": 500}, f)
+        v = _check_effort_floors(_d, round_n=1)
+        ok(not any(x["kind"] == "effort_floors_require_followup_round"
+                   for x in v),
+           f"EF9b: clean run at r=1 must not fire follow-up HIGH, got {v}")
+
     # --- Phase 19 β: scope-declaration budget tests (SB-prefix) ---
     with _tempfile.TemporaryDirectory() as _d:
         # SB1: round_n=None and round 1 → silent (drafting window)
@@ -6518,6 +6618,52 @@ def _run_self_test() -> int:
         ok(any(x["kind"] == "scope_declaration_invalid"
                and x["severity"] == "MEDIUM" for x in v),
            f"SB9: malformed declarations must fire MEDIUM invalid, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # SB10 (Phase 20 β): rejected cap-override (above ceiling) now
+        # emits MEDIUM `scope_declaration_cap_override_rejected` so the
+        # modeler can see the override didn't take effect.
+        with open(os.path.join(_d, "scope_declaration.yaml"), "w") as f:
+            _yaml.safe_dump({
+                "budget": {"cap": 8, "overage_justification": "we want a lot"},
+                "declarations": [
+                    {"id": f"SCOPE-{i:03d}", "claim": "a"} for i in range(1, 4)
+                ]}, f)
+        v = _check_scope_declaration_budget(_d, round_n=2)
+        rejected = [x for x in v
+                    if x["kind"] == "scope_declaration_cap_override_rejected"]
+        ok(len(rejected) == 1 and rejected[0]["severity"] == "MEDIUM"
+           and "exceeds hard ceiling" in rejected[0]["claim"],
+           f"SB10: above-ceiling override must surface MEDIUM, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # SB11 (Phase 20 β): rejected cap-override (missing justification)
+        # also emits the MEDIUM advisory.
+        with open(os.path.join(_d, "scope_declaration.yaml"), "w") as f:
+            _yaml.safe_dump({
+                "budget": {"cap": 5, "overage_justification": ""},
+                "declarations": [
+                    {"id": f"SCOPE-{i:03d}", "claim": "a"} for i in range(1, 4)
+                ]}, f)
+        v = _check_scope_declaration_budget(_d, round_n=2)
+        rejected = [x for x in v
+                    if x["kind"] == "scope_declaration_cap_override_rejected"]
+        ok(len(rejected) == 1 and rejected[0]["severity"] == "MEDIUM"
+           and "non-empty" in rejected[0]["claim"],
+           f"SB11: missing-justification override must surface MEDIUM, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # SB12 (Phase 20 β): valid cap-override is silent on the new advisory.
+        with open(os.path.join(_d, "scope_declaration.yaml"), "w") as f:
+            _yaml.safe_dump({
+                "budget": {"cap": 5, "overage_justification": "documented"},
+                "declarations": [
+                    {"id": f"SCOPE-{i:03d}", "claim": "a"} for i in range(1, 4)
+                ]}, f)
+        v = _check_scope_declaration_budget(_d, round_n=2)
+        ok(not any(x["kind"] == "scope_declaration_cap_override_rejected"
+                   for x in v),
+           f"SB12: valid override must not fire the rejection advisory, got {v}")
 
     # --- Phase 19 γ: benchmark_match tests (BM-prefix) ---
     with _tempfile.TemporaryDirectory() as _d:
@@ -6767,6 +6913,27 @@ def _run_self_test() -> int:
         ok(not any(x["kind"] in ("claim_overclaimed",
                                    "claim_overclaimed_advisory") for x in v),
            f"SF8: all-ADEQUATE must be silent, got {v}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # SF9 (Phase 20 β): pilot_run_acknowledged demotes OVERCLAIMED
+        # from HIGH to MEDIUM at round ≥ 2. The pilot declaration must
+        # still be visible to the next round (the demotion is per-claim,
+        # not silenced).
+        with open(os.path.join(_d, "report.md"), "w") as f:
+            f.write("# Report\n")
+        with open(os.path.join(_d, "critique_sufficiency.yaml"), "w") as f:
+            _yaml.safe_dump({
+                "pilot_run_acknowledged": True,
+                "claim_verdicts": [
+                    {"claim_id": "c1", "verdict": "OVERCLAIMED",
+                     "quoted_phrase": "smoke-test claim",
+                     "reason": "n_draws=50, pilot run"},
+                ],
+            }, f)
+        v = _check_sufficiency_critic(_d, round_n=2)
+        oc = [x for x in v if x["kind"] == "claim_overclaimed"]
+        ok(len(oc) == 1 and oc[0]["severity"] == "MEDIUM",
+           f"SF9: pilot_run_acknowledged must demote OVERCLAIMED to MEDIUM, got {v}")
 
     # --- Summary ---
     if failures:

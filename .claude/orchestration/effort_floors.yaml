@@ -118,18 +118,26 @@ floors:
       "maxiter=50 default" shortcut.
 
   - id: calibration_held_out
-    probe: yaml_field_truthy
+    # Phase 20 β: switched from yaml_field_truthy → yaml_field_list_length
+    # on `held_out_fold.indices` and flipped scope_declarable to false.
+    # The truthy probe accepted any truthy placeholder
+    # (held_out_fold: "yes" / 0.1 / {indices: []} all passed); the new
+    # probe requires a concrete non-empty index list. The CLAUDE.md
+    # ledger lists "held-out fold required" as a no-shortcut floor.
+    probe: yaml_field_list_length
     artifact: models/calibration_result.yaml
-    field: held_out_fold
+    field: held_out_fold.indices
     minimum: 1
     severity: HIGH
-    scope_declarable: true
+    scope_declarable: false
     triggered_by: calibration_present
     rationale: |
       Without a held-out evaluation the optimizer's reported fit is
       training error, which monotonically improves with parameter
       count. The post-hoc identifiability check catches ridge-trapped
       parameters; this floor catches "no cross-validation at all."
+      The probe demands `held_out_fold.indices` be a non-empty list so
+      a placeholder string ("yes") or empty list cannot satisfy it.
 
   - id: shortcut_markers_in_model_code
     probe: ast_shortcut_scan
