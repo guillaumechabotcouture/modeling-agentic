@@ -17,10 +17,23 @@ DECLARE_SCOPE | ACCEPT.
 
 Usage:
     python scripts/validate_critique_yaml.py <run_dir> \\
-        --max-rounds 5 --current-round 2 [--json]
+        --max-rounds 5 --current-round 2 \\
+        --spec-compliance --parameter-registry --rigor-artifacts \\
+        [--post-write] [--json] [--no-history]
 
-Exits non-zero on schema violations so the lead's Bash call surfaces the
-error rather than swallowing it.
+`--post-write` (Phase 21 β) is the post-WRITE gate main.py runs after the
+session: report.md and post-WRITE artifacts become required and writer-QA /
+coherence-audit failures block.
+
+Phase 21 β semantics: the gate fails closed (unparseable / wrong-shape /
+unknown-verdict / unstamped artifacts and crashing checks are HIGH);
+missing required artifacts forbid ACCEPT at every round; non-scope-
+declarable findings open at round exhaustion yield RUN_FAILED (rule 5),
+never DECLARE_SCOPE. Each invocation appends to
+<run_dir>/validator_history.jsonl unless --no-history.
+
+Exit codes: 0 ACCEPT; 1 any other action; 2 usage / missing inputs;
+3 critique schema errors; 4 validator crashed (JSON action VALIDATOR_ERROR).
 """
 
 from __future__ import annotations
@@ -43,7 +56,144 @@ except ImportError:
 # Rigor artifact manifest: single source of truth for paths/rounds/skills.
 # Sibling-script import: scripts/lib/rigor_artifacts.py.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from lib.rigor_artifacts import artifact_path, produced_path  # noqa: E402
+from lib.rigor_artifacts import (  # noqa: E402
+    artifact, artifact_path, load_artifacts, produced_path)
+# Phase 21 β: fail-closed loading + crash guard + ledger provenance.
+from lib.safe_io import finite_number, run_guarded, safe_load_mapping  # noqa: E402
+from lib import provenance as _provenance  # noqa: E402
+
+
+# Phase 21 β: closed verdict vocabularies of each producing script. A
+# verdict outside these sets was hand-written (the 235631 run shipped
+# `DEGENERATE_FIT_ACKNOWLEDGED` / `PARAMETERS_IDENTIFIED_BY_CONSTRUCTION`)
+# and fails closed as `<prefix>_unknown_verdict` HIGH. Where the producing
+# script exports `VERDICTS`, that tuple is authoritative (see
+# _producer_verdicts); the literals below are the fallback.
+_PRODUCER_VERDICTS = {
+    "compare_models": ("CLEAN", "DEGENERATE_FIT_DETECTED",
+                       "INSUFFICIENT_STRUCTURES"),
+    "identifiability": ("CLEAN", "UNIDENTIFIED_PARAMETERS",
+                        "WEAKLY_IDENTIFIED_PARAMETERS", "UNKNOWN_LOSS_SCALE"),
+    "identifiability_a_priori": ("IDENTIFIABLE", "MARGINAL", "OVER_SATURATED",
+                                 "MALFORMED", "MISSING"),
+    "sensitivity_analysis": ("ROBUST", "SENSITIVE", "UNSTABLE", "MALFORMED",
+                             "MISSING"),
+    "allocation_robustness": ("ROBUST", "FRAGILE", "UNSTABLE", "MALFORMED",
+                              "MISSING"),
+    "optimization_quality": ("CLEAN", "GAP_TOO_LARGE", "NO_BENCHMARK",
+                             "MALFORMED", "MISSING"),
+    "within_zone_sensitivity": ("BOUNDED", "UNBOUNDED", "INCONCLUSIVE",
+                                "MALFORMED", "MISSING"),
+    "writer_qa": ("CLEAN", "REVISE", "MAJOR_REVISION"),
+    "coherence_audit": ("CLEAN", "DRIFT_DETECTED"),
+    "benchmark_match": ("PASS", "DRIFT", "MALFORMED", "ABSENT", "PENDING"),
+    "critique_sufficiency_claim": ("OVERCLAIMED", "ADEQUATE", "UNDERCLAIMED",
+                                   "ADEQUATE_FOR_PILOT"),
+}
+
+# Phase 21 β: script-produced artifacts must carry the producer stamp the
+# script writes (and, where present, the hash of the manifest it read).
+# artifact id → (producer script name, produced-path index)
+_STAMPED_ARTIFACTS = {
+    "compare_models": "scripts/compare_models.py",
+    "identifiability": "scripts/identifiability.py",
+    "propagate_uncertainty": "scripts/propagate_uncertainty.py",
+}
+
+
+def _producer_verdicts(name: str) -> tuple[str, ...]:
+    """VERDICTS exported by scripts/<name>.py, else the local fallback."""
+    try:
+        v = getattr(_load_sibling(name), "VERDICTS", None)
+        if isinstance(v, (tuple, list)) and v:
+            return tuple(str(x) for x in v)
+    except Exception:  # noqa: BLE001 — fall back to the literal table
+        pass
+    return _PRODUCER_VERDICTS[name]
+
+
+def _producer_stamp_violations(doc: dict, prefix: str, producer_key: str,
+                               manifest_path: Optional[str], stage: str,
+                               shown: str) -> list[dict]:
+    """Phase 21 β: HIGH `<prefix>_not_script_produced` when the producer
+    stamp is missing/wrong; HIGH `<prefix>_stale` when the recorded
+    manifest hash differs from the current manifest (the report predates
+    a manifest edit — re-run the script)."""
+    import hashlib
+    want = _STAMPED_ARTIFACTS[producer_key]
+    if str(doc.get("producer") or "") != want:
+        return [{
+            "kind": f"{prefix}_not_script_produced",
+            "severity": "HIGH",
+            "stage": stage,
+            "scope_declarable": False,
+            "claim": (f"`{shown}` has producer {doc.get('producer')!r}, "
+                      f"expected {want!r}. Gate inputs must be written by "
+                      f"their producing script, not by hand. Re-run "
+                      f"`python3 {want} {{run_dir}}`."),
+        }]
+    rec = doc.get("manifest_sha256")
+    if rec and manifest_path and os.path.exists(manifest_path):
+        with open(manifest_path, "rb") as f:
+            cur = hashlib.sha256(f.read()).hexdigest()
+        if cur != rec:
+            return [{
+                "kind": f"{prefix}_stale",
+                "severity": "HIGH",
+                "stage": stage,
+                "scope_declarable": False,
+                "claim": (f"`{shown}` was produced from a different version "
+                          f"of {os.path.basename(manifest_path)} (sha256 "
+                          f"mismatch). Re-run `python3 {want} {{run_dir}}`."),
+            }]
+    return []
+
+
+# Phase 21 β: kinds that may never be resolved by DECLARE_SCOPE. At round
+# exhaustion any of these turns the decision into RUN_FAILED. Sources:
+#   - violations carrying `scope_declarable: False` (effort floors, safe_io,
+#     provenance, required-artifact gating) — honored per finding;
+#   - rigor_artifacts.yaml entries with `scope_declarable: false` — every
+#     kind prefixed with the artifact id is non-declarable;
+#   - the explicit list below (Phase 15 α pre_model_* contract, Phase 21 β
+#     evidence-integrity kinds).
+_NON_DECLARABLE_KINDS = frozenset({
+    "pre_model_over_saturated",
+    "pre_model_decorative_undocumented",
+    "claim_source_unresolved",
+    "claim_source_mismatch",
+    "claim_ci_unsourced",
+    "claim_ci_mismatch",
+    "ci_degenerate",
+    "uq_output_nonfinite",
+    "validator_check_crashed",
+    "pilot_run_unbacked",
+    # Phase 21 δ eligibility probe (benefit computed on the wrong population)
+    "eligibility_benefit_without_eligible",
+    "eligibility_benefit_scales_with_total",
+    "eligibility_probe_error",
+    "a_priori_count_mismatch",
+})
+_NON_DECLARABLE_SUFFIXES = ("_invalid", "_unknown_verdict",
+                            "_not_script_produced", "_stale")
+
+
+def _manifest_non_declarable_prefixes() -> tuple[str, ...]:
+    try:
+        return tuple(f"{a.id}_" for a in load_artifacts()
+                     if not a.scope_declarable)
+    except (OSError, ValueError, yaml.YAMLError):
+        return ()
+
+
+def is_non_declarable(kind: str, explicit: Any = None) -> bool:
+    """Phase 21 β: may a finding of this kind be closed by DECLARE_SCOPE?"""
+    if explicit is False:
+        return True
+    k = str(kind or "")
+    if k in _NON_DECLARABLE_KINDS or k.endswith(_NON_DECLARABLE_SUFFIXES):
+        return True
+    return k.startswith(_manifest_non_declarable_prefixes())
 
 # spec_compliance is a sibling module; import is lazy so validation without
 # the --spec-compliance flag doesn't require it to be present.
@@ -198,13 +348,24 @@ def validate_critique(path: str, expected_reviewer: str,
 
     _validate_structural(doc.get("structural_mismatch"), ctx, expected_reviewer)
 
-    blockers = doc.get("blockers", [])
+    # Phase 21 β: `blockers:` is required (an omitted list used to read as
+    # "no blockers" → ACCEPT), and a REVISE verdict must name at least one
+    # unresolved blocker — REVISE with nothing open is self-contradictory.
+    _require("blockers" in doc, f"{ctx}: missing required key 'blockers' "
+                                f"(use `blockers: []` for none)")
+    blockers = doc["blockers"]
     _require(isinstance(blockers, list), f"{ctx}: blockers must be a list")
     seen_ids = set()
     for b in blockers:
         _validate_blocker(b, ctx, prefix)
         _require(b["id"] not in seen_ids, f"{ctx}: duplicate blocker id {b['id']}")
         seen_ids.add(b["id"])
+
+    if doc.get("verdict") == "REVISE":
+        _require(any(isinstance(b, dict) and b.get("resolved") is False
+                     for b in blockers),
+                 f"{ctx}: verdict REVISE requires at least one unresolved "
+                 f"blocker")
 
     if current_round == 1:
         _require(doc.get("carried_forward", []) == [],
@@ -231,6 +392,13 @@ def _compute_blocker_attempts(critiques: dict[str, dict],
     something structurally different is needed (new agent class,
     cross-stage escalation, or scope declaration).
 
+    Phase 21 β: R is the blocker's `first_seen_round` (from the current
+    `blockers[]` entry with the same id, or the carried_forward entry's
+    own `first_seen_round`), falling back to `prior_round` only when
+    neither is present. Real critics set `prior_round = N-1` (the round
+    they compared against), so the pre-21 `N - prior_round` was always 1
+    and escalation never fired on real runs.
+
     Returns {blocker_id: {"first_seen_round": R, "patch_attempts": K,
                            "category": C, "target_stage": S,
                            "still_present": True}}.
@@ -244,19 +412,29 @@ def _compute_blocker_attempts(critiques: dict[str, dict],
                 "target_stage": b.get("target_stage"),
                 "severity": b.get("severity"),
                 "reviewer": reviewer,
+                "first_seen_round": b.get("first_seen_round"),
             }
+    for reviewer, doc in critiques.items():
         for entry in doc.get("carried_forward", []):
             if not entry.get("still_present"):
                 continue
             bid = entry["id"]
-            prior = entry.get("prior_round", current_round)
-            attempts = max(0, current_round - prior)
+            meta = blocker_meta.get(bid, {})
+            first_seen = None
+            for cand in (meta.get("first_seen_round"),
+                         entry.get("first_seen_round"),
+                         entry.get("prior_round")):
+                if isinstance(cand, int) and not isinstance(cand, bool):
+                    first_seen = cand
+                    break
+            if first_seen is None:
+                first_seen = current_round
+            attempts = max(0, current_round - first_seen)
             existing = out.get(bid)
             # If multiple critiques carry the same id, take max attempts.
             if existing is None or attempts > existing["patch_attempts"]:
-                meta = blocker_meta.get(bid, {})
                 out[bid] = {
-                    "first_seen_round": prior,
+                    "first_seen_round": first_seen,
                     "patch_attempts": attempts,
                     "category": meta.get("category"),
                     "target_stage": meta.get("target_stage"),
@@ -265,6 +443,93 @@ def _compute_blocker_attempts(critiques: dict[str, dict],
                     "still_present": True,
                 }
     return out
+
+
+def _recompute_action(d: dict, max_rounds: int, current_round: int,
+                      source: str = "") -> dict:
+    """Phase 21 β: the single STAGE 7 rule ordering.
+
+    Previously copy-pasted into decide() and three incorporate_*
+    functions (and the copies had drifted). Rules:
+
+      1  structural mismatch            → RETHINK_STRUCTURAL / RUN_FAILED
+      2  HIGH or accept-blocker, rounds → PATCH_OR_RETHINK
+      5  exhausted, any non-declarable  → RUN_FAILED
+      3  exhausted, all declarable      → DECLARE_SCOPE
+      4  nothing outstanding            → ACCEPT
+
+    `accept_blockers` are required artifacts that are absent (Phase 21
+    β): they forbid ACCEPT at every round, even when no HIGH is open.
+    """
+    unresolved_high = d.get("unresolved_high") or []
+    accept_blockers = d.get("accept_blockers") or []
+    structural = d.get("structural_mismatch", False)
+    rounds_remaining = max_rounds - current_round
+    outstanding = list(unresolved_high) + list(accept_blockers)
+    non_declarable = [b for b in outstanding
+                      if is_non_declarable(b.get("kind"),
+                                           b.get("scope_declarable"))]
+    src = f" (incl. {source})" if source else ""
+
+    if structural:
+        reviewers = d.get("structural_reviewers")
+        if rounds_remaining > 0:
+            action = "RETHINK_STRUCTURAL"
+            rationale = (
+                f"Structural mismatch detected by {reviewers}. "
+                f"Must RETHINK — not patchable, not scope-declarable."
+            )
+        else:
+            action = "RUN_FAILED"
+            rationale = (
+                f"Structural mismatch detected by {reviewers} "
+                f"with no rounds remaining. Run fails: delivered model does "
+                f"not answer the question. Do NOT spawn writer."
+            )
+        rule_matched = 1
+    elif outstanding and rounds_remaining > 0:
+        action = "PATCH_OR_RETHINK"
+        parts = []
+        if unresolved_high:
+            parts.append(f"{len(unresolved_high)} HIGH blocker(s) unresolved{src}")
+        if accept_blockers:
+            parts.append(f"{len(accept_blockers)} required artifact(s) missing")
+        rationale = (f"{'; '.join(parts)}, {rounds_remaining} round(s) "
+                     f"remaining. ACCEPT is forbidden.")
+        rule_matched = 2
+    elif non_declarable:
+        action = "RUN_FAILED"
+        preview = ", ".join(sorted({str(b.get("kind") or b.get("id"))
+                                    for b in non_declarable})[:8])
+        rationale = (
+            f"Rounds exhausted with {len(non_declarable)} NON-scope-"
+            f"declarable finding(s) open [{preview}]. These cannot be "
+            f"closed by scope_declaration.yaml (Phase 15 α / 18 α / 19 α / "
+            f"21 β contracts). Run fails; do NOT spawn writer as if "
+            f"accepted."
+        )
+        rule_matched = 5
+    elif outstanding:
+        action = "DECLARE_SCOPE"
+        rationale = (
+            f"{len(outstanding)} HIGH blocker(s)/missing artifact(s) "
+            f"unresolved{src}, rounds exhausted. Must write "
+            f"scope_declaration.yaml acknowledging each blocker by id, "
+            f"and writer must embed verbatim in Limitations. "
+            f"DECLARE_SCOPE is NOT the same as ACCEPT."
+        )
+        rule_matched = 3
+    else:
+        action = "ACCEPT"
+        rationale = ("No unresolved HIGH blockers, no missing required "
+                     "artifacts, no structural mismatch.")
+        rule_matched = 4
+
+    d["rounds_remaining"] = rounds_remaining
+    d["action"] = action
+    d["rule_matched"] = rule_matched
+    d["rationale"] = rationale
+    return d
 
 
 def decide(critiques: dict[str, dict], max_rounds: int,
@@ -280,6 +545,8 @@ def decide(critiques: dict[str, dict], max_rounds: int,
                     "target_stage": b["target_stage"],
                     "first_seen_round": b["first_seen_round"],
                     "claim": b["claim"],
+                    "kind": "critique_blocker",
+                    "scope_declarable": True,
                 })
 
     # Phase 5 ζ: consecutive-PATCH-attempt counter.
@@ -292,55 +559,12 @@ def decide(critiques: dict[str, dict], max_rounds: int,
 
     structural_reviewers = [r for r, d in critiques.items()
                             if d["structural_mismatch"]["detected"]]
-    structural = bool(structural_reviewers)
-    rounds_remaining = max_rounds - current_round
 
-    # Rule ordering matches LEAD_SYSTEM_PROMPT STAGE 7.
-    if structural:
-        if rounds_remaining > 0:
-            action = "RETHINK_STRUCTURAL"
-            rationale = (
-                f"Structural mismatch detected by {structural_reviewers}. "
-                f"Must RETHINK — not patchable, not scope-declarable."
-            )
-        else:
-            action = "RUN_FAILED"
-            rationale = (
-                f"Structural mismatch detected by {structural_reviewers} "
-                f"with no rounds remaining. Run fails: delivered model does "
-                f"not answer the question. Do NOT spawn writer."
-            )
-        rule_matched = 1
-    elif unresolved_high and rounds_remaining > 0:
-        action = "PATCH_OR_RETHINK"
-        rationale = (
-            f"{len(unresolved_high)} HIGH blocker(s) unresolved, "
-            f"{rounds_remaining} round(s) remaining. "
-            f"ACCEPT is forbidden."
-        )
-        rule_matched = 2
-    elif unresolved_high and rounds_remaining <= 0:
-        action = "DECLARE_SCOPE"
-        rationale = (
-            f"{len(unresolved_high)} HIGH blocker(s) unresolved, rounds "
-            f"exhausted. Must write scope_declaration.yaml acknowledging "
-            f"each blocker by id, and writer must embed verbatim in "
-            f"Limitations. DECLARE_SCOPE is NOT the same as ACCEPT."
-        )
-        rule_matched = 3
-    else:
-        action = "ACCEPT"
-        rationale = "No unresolved HIGH blockers, no structural mismatch."
-        rule_matched = 4
-
-    return {
+    d = {
         "unresolved_high": unresolved_high,
-        "structural_mismatch": structural,
+        "accept_blockers": [],
+        "structural_mismatch": bool(structural_reviewers),
         "structural_reviewers": structural_reviewers,
-        "rounds_remaining": rounds_remaining,
-        "action": action,
-        "rule_matched": rule_matched,
-        "rationale": rationale,
         "spec_violations": [],
         "registry_violations": [],
         "rigor_violations": [],
@@ -348,6 +572,26 @@ def decide(critiques: dict[str, dict], max_rounds: int,
         "blocker_attempts": blocker_attempts,
         "escalation_required": escalation_required,
     }
+    return _recompute_action(d, max_rounds, current_round)
+
+
+def _append_synthetic_blockers(d: dict, reviewer: str, prefix: str,
+                               new_entries: list[dict]) -> None:
+    """Phase 21 β: idempotent append. An entry already present (same
+    reviewer + kind + claim) is not re-added, so calling an incorporate_*
+    function twice yields identical output."""
+    existing = [b for b in d["unresolved_high"] if b.get("reviewer") == reviewer]
+    seen = {(b.get("kind"), b.get("claim")) for b in existing}
+    n = len(existing)
+    for e in new_entries:
+        key = (e.get("kind"), e.get("claim"))
+        if key in seen:
+            continue
+        seen.add(key)
+        n += 1
+        entry = {"reviewer": reviewer, "id": f"{prefix}-{n:03d}"}
+        entry.update(e)
+        d["unresolved_high"].append(entry)
 
 
 # Phase 4 Commit δ: cross-comparator efficiency outlier check.
@@ -384,7 +628,10 @@ _THIS_WORK_HEADER_RE = re.compile(
 # format used "Published Value" as its single comparator column.
 _COMPARATOR_HEADER_RE = re.compile(
     r"[A-Z][\w-]+(?:\s+et\s+al\.?)?\s+(\d{4})|"
-    r"\b(?:EMOD|OpenMalaria|Optima|Spectrum|GBD)\b|"
+    # Phase 21 β: named comparator frameworks across disease areas (the
+    # author-year alternative above covers everything else).
+    r"\b(?:EMOD|OpenMalaria|Optima|Spectrum|GBD|IHME|LiST|Starsim|"
+    r"Covasim|EpiModel)\b|"
     r"\b(?:Published|Benchmark|Comparator|Reference|Literature)\s+"
     r"(?:Value|Estimate|Result|Finding)\b",
     re.IGNORECASE,
@@ -893,73 +1140,264 @@ def _check_surrogate_uq_documented(run_dir: str) -> list[dict]:
 _CI_DEGENERATE_THRESHOLD = 0.005
 
 
-def _check_uq_ci_quality(uq_report_path: str) -> list[dict]:
-    """Phase 4 Commit α: scan uncertainty_report.yaml for degenerate CIs.
+def _load_uq_deterministic_declarations(run_dir: str) -> dict[str, str]:
+    """Phase 21 β: outputs the modeler declares deterministic by design
+    (e.g. total spend under a binding budget constraint), with a reason.
 
-    Fires `ci_degenerate` MEDIUM when an output's 95% CI relative width
-    (ci_high - ci_low) / |mean| is below 0.5%. Such outputs are usually
-    mechanically constrained (greedy-optimizer budget fills, hardcoded
-    calibration targets) and should be reported as point estimates with
-    a footnote explaining why, not alongside genuine CIs.
+    Read from `models/uq_declarations.yaml`:
+        deterministic_outputs:
+          total_cost: "Budget constraint binds; spend equals the envelope."
+    and from per-output `deterministic: true` + `deterministic_reason:` in
+    uncertainty_report.yaml. Entries without a non-empty reason are ignored.
     """
-    violations: list[dict] = []
-    try:
-        with open(uq_report_path) as f:
-            uq_report = yaml.safe_load(f) or {}
-    except (yaml.YAMLError, OSError):
+    out: dict[str, str] = {}
+    path = os.path.join(run_dir, "models", "uq_declarations.yaml")
+    doc, _ = safe_load_mapping(path, "uq_declarations")
+    if doc:
+        decl = doc.get("deterministic_outputs")
+        if isinstance(decl, dict):
+            for k, v in decl.items():
+                if isinstance(v, str) and v.strip():
+                    out[str(k)] = v.strip()
+    return out
+
+
+def _check_uq_ci_quality(uq_report_path: str) -> list[dict]:
+    """Phase 4 Commit α / Phase 21 β: scan uncertainty_report.yaml for
+    degenerate and non-finite intervals.
+
+    `ci_degenerate` fires when an output's 95% CI relative width
+    (ci_high - ci_low) / |mean| is below 0.5% (or the width is exactly 0)
+    while more than one draw was run. Phase 21 β raised it from MEDIUM to
+    HIGH and made it NOT scope-declarable: 2026-05-03_235631 shipped 9/9
+    zero-width outputs as MEDIUM while the report printed a wide CI for
+    the same quantity. An output that is deterministic by design is
+    exempted only by an explicit declaration with a reason
+    (models/uq_declarations.yaml `deterministic_outputs:` or per-output
+    `deterministic: true` + `deterministic_reason:`).
+
+    `uq_output_nonfinite` (HIGH) fires on NaN/inf mean or bounds; an
+    unparseable / non-mapping report is `uncertainty_report_invalid` (HIGH).
+    """
+    report, violations = safe_load_mapping(
+        uq_report_path, "uncertainty_report", stage="UQ",
+        required_keys=["scalar_outputs"],
+        expected_types={"scalar_outputs": dict},
+        display_path="uncertainty_report.yaml")
+    if report is None:
         return violations
 
-    scalar_outputs = uq_report.get("scalar_outputs") or {}
-    if not isinstance(scalar_outputs, dict):
-        return violations
+    run_dir = os.path.dirname(uq_report_path)
+    declared = _load_uq_deterministic_declarations(run_dir)
+    n_draws = finite_number(report.get("n_successful"))
+    if n_draws is None:
+        n_draws = finite_number(report.get("n_draws"))
+    multi_draw = n_draws is None or n_draws > 1
+    # Phase 21 δ: propagate_uncertainty.py now lists degenerate outputs
+    # itself; trust-but-verify — honor its list AND keep the width check
+    # for reports that predate the field.
+    flagged = report.get("degenerate_outputs")
+    flagged = {str(x) for x in flagged} if isinstance(flagged, list) else set()
 
-    for output_name, stats in scalar_outputs.items():
+    for output_name, stats in report["scalar_outputs"].items():
         if not isinstance(stats, dict):
+            violations.append({
+                "kind": "uncertainty_report_invalid",
+                "severity": "HIGH",
+                "stage": "UQ",
+                "scope_declarable": False,
+                "claim": (f"scalar_outputs.{output_name} must be a mapping "
+                          f"with mean/ci_low/ci_high, got "
+                          f"{type(stats).__name__}."),
+            })
             continue
-        mean = stats.get("mean")
-        lo = stats.get("ci_low")
-        hi = stats.get("ci_high")
-        if mean is None or lo is None or hi is None:
+        raw = {k: stats.get(k) for k in ("mean", "ci_low", "ci_high")}
+        if any(v is None for v in raw.values()):
+            violations.append({
+                "kind": "uncertainty_report_invalid",
+                "severity": "HIGH",
+                "stage": "UQ",
+                "scope_declarable": False,
+                "claim": (f"scalar_outputs.{output_name} is missing "
+                          f"{[k for k, v in raw.items() if v is None]}."),
+            })
             continue
-        try:
-            mean_f = float(mean)
-            lo_f = float(lo)
-            hi_f = float(hi)
-        except (TypeError, ValueError):
+        vals = {k: finite_number(v) for k, v in raw.items()}
+        if any(v is None for v in vals.values()):
+            violations.append({
+                "kind": "uq_output_nonfinite",
+                "severity": "HIGH",
+                "stage": "UQ",
+                "scope_declarable": False,
+                "claim": (f"{output_name}: non-finite/non-numeric UQ "
+                          f"summary {raw}. NaN draws must be excluded and "
+                          f"counted as failures, not summarised."),
+            })
             continue
+        mean_f, lo_f, hi_f = vals["mean"], vals["ci_low"], vals["ci_high"]
+        if not multi_draw:
+            continue  # effort floors own the n_draws minimum
+        if output_name in declared or (
+                stats.get("deterministic") is True
+                and str(stats.get("deterministic_reason") or "").strip()):
+            continue
+        width = hi_f - lo_f
         if abs(mean_f) < 1e-9:
-            continue  # zero-mean output; relative width is undefined
-        relative_width = (hi_f - lo_f) / abs(mean_f)
-        if relative_width < _CI_DEGENERATE_THRESHOLD:
+            degenerate = width <= 0
+            rel_txt = "zero width"
+        else:
+            relative_width = width / abs(mean_f)
+            degenerate = width <= 0 or relative_width < _CI_DEGENERATE_THRESHOLD
+            rel_txt = f"{relative_width * 100:.3f}% of mean ({mean_f:.6g})"
+        if output_name in flagged or stats.get("degenerate") is True:
+            degenerate = True
+            diag = str(stats.get("degenerate_diagnostic") or "").strip()
+            if diag:
+                rel_txt += f"; producer diagnostic: {diag}"
+        if degenerate:
             violations.append({
                 "kind": "ci_degenerate",
-                "severity": "MEDIUM",
+                "severity": "HIGH",
                 "stage": "UQ",
+                "scope_declarable": False,
                 "claim": (
                     f"{output_name} 95% CI [{lo_f:.6g}, {hi_f:.6g}] is "
-                    f"{relative_width * 100:.3f}% of mean ({mean_f:.6g}). "
-                    f"Either the perturbed parameters do not affect this "
-                    f"output (greedy-optimizer budget fill, hardcoded "
-                    f"calibration target, etc.), or the surrogate "
-                    f"flattens it. Report as a point estimate with a "
-                    f"footnote, or widen the parameter ranges that drive "
-                    f"this output."
+                    f"{rel_txt} after "
+                    f"{int(n_draws) if n_draws is not None else '?'} draws. "
+                    f"Either the sampled parameters never reach this "
+                    f"output (frozen in outcome_fn, surrogate flattening, "
+                    f"parameters not wired through), or it is "
+                    f"deterministic by design — then declare it in "
+                    f"models/uq_declarations.yaml `deterministic_outputs:` "
+                    f"with a reason and report it as a point estimate. "
+                    f"Any interval quoted elsewhere for this output is "
+                    f"unsupported."
                 ),
             })
     return violations
 
 
-def _check_rigor_artifacts(run_dir: str, round_n: int | None = None) -> list[dict]:
-    """Check for Phase 2 rigor artifacts. Returns a list of violations.
+def _msc_report_path(run_dir: str) -> str:
+    """model_comparison_formal.yaml at its manifest location, falling back
+    to models/ (some runs write it there)."""
+    p = produced_path("model_comparison", run_dir)
+    if not os.path.exists(p):
+        alt = os.path.join(os.path.dirname(artifact_path("model_comparison",
+                                                         run_dir)),
+                           os.path.basename(p))
+        if os.path.exists(alt):
+            return alt
+    return p
+
+
+def _msc_report_violations(msc_report: str,
+                           manifest_path: Optional[str] = None) -> list[dict]:
+    formal, out = safe_load_mapping(
+        msc_report, "model_comparison_formal", stage="MULTI_STRUCTURAL",
+        allowed_verdicts=_producer_verdicts("compare_models"),
+        display_path="model_comparison_formal.yaml")
+    if formal is None or out:
+        return out
+    out = _producer_stamp_violations(
+        formal, "model_comparison_formal", "compare_models", manifest_path,
+        "MULTI_STRUCTURAL", "model_comparison_formal.yaml")
+    if out:
+        return out
+    verdict = formal["verdict"]
+    if verdict == "DEGENERATE_FIT_DETECTED":
+        deg = formal.get("degenerate_fit")
+        deg = deg if isinstance(deg, dict) else {}
+        out.append({
+            "kind": "degenerate_fit",
+            "severity": "HIGH",
+            "stage": "MULTI_STRUCTURAL",
+            "claim": (f"compare_models flagged DEGENERATE FIT on "
+                      f"model {deg.get('model', '?')}: "
+                      f"{deg.get('reason', '(no reason given)')}"),
+        })
+    elif verdict == "INSUFFICIENT_STRUCTURES":
+        out.append({
+            "kind": "insufficient_structures",
+            "severity": "HIGH",
+            "stage": "MULTI_STRUCTURAL",
+            "claim": ("Modeler supplied fewer than 3 candidate "
+                      "structures for comparison. See "
+                      "multi-structural-comparison skill."),
+        })
+    return out
+
+
+def _identifiability_parameters(id_rep: dict) -> list[tuple[str, dict]]:
+    params = id_rep.get("parameters")
+    if isinstance(params, dict):
+        return [(str(k), v) for k, v in params.items() if isinstance(v, dict)]
+    if isinstance(params, list):
+        return [(str(p.get("name", f"param_{i}")), p)
+                for i, p in enumerate(params) if isinstance(p, dict)]
+    return []
+
+
+def _identifiability_report_violations(id_report: str,
+                                       manifest_path: Optional[str] = None
+                                       ) -> list[dict]:
+    id_rep, out = safe_load_mapping(
+        id_report, "identifiability_report", stage="IDENTIFIABILITY",
+        allowed_verdicts=_producer_verdicts("identifiability"),
+        display_path="identifiability.yaml")
+    if id_rep is None or out:
+        return out
+    out = _producer_stamp_violations(
+        id_rep, "identifiability_report", "identifiability", manifest_path,
+        "IDENTIFIABILITY", "identifiability.yaml")
+    if out:
+        return out
+    verdict = id_rep["verdict"]
+    params = _identifiability_parameters(id_rep)
+    if verdict == "UNIDENTIFIED_PARAMETERS":
+        unidentified = [n for n, p in params if p.get("status") == "unidentified"]
+        out.append({
+            "kind": "unidentified_parameters",
+            "severity": "HIGH",
+            "stage": "IDENTIFIABILITY",
+            "claim": (f"identifiability analysis flagged "
+                      f"{len(unidentified)} ridge-trapped "
+                      f"parameter(s): {unidentified}. See "
+                      f"identifiability.yaml for profile-likelihood "
+                      f"details. Resolve via partial pooling, tied "
+                      f"parameters, or explicit scope declaration."),
+        })
+    elif verdict == "UNKNOWN_LOSS_SCALE":
+        out.append({
+            "kind": "identifiability_loss_scale_unknown",
+            "severity": "HIGH",
+            "stage": "IDENTIFIABILITY",
+            "claim": ("identifiability.py could not classify parameters "
+                      "because models/identifiability.yaml does not "
+                      "declare a usable `loss_type` (nll | deviance | chi2 "
+                      "| sse/mse with n_obs). Profile-likelihood thresholds "
+                      "are only meaningful on a log-likelihood scale."),
+        })
+    elif verdict == "WEAKLY_IDENTIFIED_PARAMETERS":
+        weak = [n for n, p in params if p.get("status") == "weakly_identified"]
+        out.append({
+            "kind": "weakly_identified_parameters",
+            "severity": "MEDIUM",
+            "stage": "IDENTIFIABILITY",
+            "claim": (f"identifiability analysis flagged {len(weak)} weakly "
+                      f"identified parameter(s): {weak}. Report their "
+                      f"intervals as wide and avoid point-estimate claims "
+                      f"that depend on them."),
+        })
+    return out
+
+
+def _check_core_rigor_reports(run_dir: str) -> list[dict]:
+    """Phase 2 core rigor reports: UQ, multi-structural, identifiability.
 
     Each rigor stage has a prerequisite + an artifact:
       UQ: outcome_fn.py (prereq) + uncertainty_report.yaml (artifact)
       Multi-structural: model_comparison.yaml (prereq) + model_comparison_formal.yaml (artifact)
       Identifiability: identifiability.yaml in models/ (prereq) + identifiability.yaml in run_dir (artifact)
-
-    Missing artifact when prereq exists → HIGH blocker. If neither exists,
-    the modeler didn't engage with that stage at all — SEPARATE MEDIUM
-    blocker flagging the missing prerequisite.
     """
     violations = []
 
@@ -980,6 +1418,12 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None) -> list[dic
         else:
             # Phase 4 Commit α: detect zero-width CIs.
             violations.extend(_check_uq_ci_quality(uq_report_path))
+            # Phase 21 β: must be written by propagate_uncertainty.py.
+            uq_doc, _ = safe_load_mapping(uq_report_path, "uncertainty_report")
+            if uq_doc is not None:
+                violations.extend(_producer_stamp_violations(
+                    uq_doc, "uncertainty_report", "propagate_uncertainty",
+                    None, "UQ", "uncertainty_report.yaml"))
         # Phase 4 Commit β: when outcome_fn is a surrogate, require
         # documentation. (Runs even when uncertainty_report.yaml is
         # missing — the surrogate framing issue exists regardless of
@@ -997,7 +1441,7 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None) -> list[dic
 
     # Multi-structural: models/model_comparison.yaml → model_comparison_formal.yaml
     msc_manifest = artifact_path("model_comparison", run_dir)
-    msc_report = produced_path("model_comparison", run_dir)
+    msc_report = _msc_report_path(run_dir)
     if os.path.exists(msc_manifest):
         if not os.path.exists(msc_report):
             violations.append({
@@ -1010,32 +1454,8 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None) -> list[dic
                           "See multi-structural-comparison skill."),
             })
         else:
-            # Additionally check the formal report for DEGENERATE_FIT_DETECTED
-            try:
-                with open(msc_report) as f:
-                    formal = yaml.safe_load(f) or {}
-                verdict = formal.get("verdict", "")
-                if verdict == "DEGENERATE_FIT_DETECTED":
-                    deg = formal.get("degenerate_fit", {})
-                    violations.append({
-                        "kind": "degenerate_fit",
-                        "severity": "HIGH",
-                        "stage": "MULTI_STRUCTURAL",
-                        "claim": (f"compare_models flagged DEGENERATE FIT on "
-                                  f"model {deg.get('model', '?')}: "
-                                  f"{deg.get('reason', '(no reason given)')}"),
-                    })
-                elif verdict == "INSUFFICIENT_STRUCTURES":
-                    violations.append({
-                        "kind": "insufficient_structures",
-                        "severity": "HIGH",
-                        "stage": "MULTI_STRUCTURAL",
-                        "claim": ("Modeler supplied fewer than 3 candidate "
-                                  "structures for comparison. See "
-                                  "multi-structural-comparison skill."),
-                    })
-            except (yaml.YAMLError, OSError):
-                pass
+            # Phase 21 β: closed-vocabulary verdict check (fail closed).
+            violations.extend(_msc_report_violations(msc_report, msc_manifest))
     else:
         violations.append({
             "kind": "msc_manifest_missing",
@@ -1061,174 +1481,259 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None) -> list[dic
                           "See identifiability-analysis skill."),
             })
         else:
-            try:
-                with open(id_report) as f:
-                    id_rep = yaml.safe_load(f) or {}
-                verdict = id_rep.get("verdict", "")
-                if verdict == "UNIDENTIFIED_PARAMETERS":
-                    unidentified = [
-                        name for name, p in id_rep.get("parameters", {}).items()
-                        if p.get("status") == "unidentified"
-                    ]
-                    violations.append({
-                        "kind": "unidentified_parameters",
-                        "severity": "HIGH",
-                        "stage": "IDENTIFIABILITY",
-                        "claim": (f"identifiability analysis flagged "
-                                  f"{len(unidentified)} ridge-trapped "
-                                  f"parameter(s): {unidentified}. See "
-                                  f"identifiability.yaml for profile-likelihood "
-                                  f"details. Resolve via partial pooling, tied "
-                                  f"parameters, or explicit scope declaration."),
-                    })
-            except (yaml.YAMLError, OSError):
-                pass
+            violations.extend(_identifiability_report_violations(
+                id_report, id_manifest))
     # NOTE: absence of identifiability.yaml with NO manifest is MEDIUM — many
     # models have no fitted parameters. Don't force this check universally.
 
-    # Decision rule (Phase 3 Commit C): required when an allocation CSV exists.
-    # decision_rule_missing is HIGH — passes through unchanged below.
-    violations.extend(_check_decision_rule_artifact(run_dir))
+    return violations
 
-    # Phase 4 Commit δ: cross-comparator efficiency outlier check.
-    violations.extend(_check_comparator_efficiency(run_dir))
 
-    # Phase 7 Commit λ: STAGE 8.5 WRITER_QA pass.
-    violations.extend(_check_writer_qa(run_dir))
+# Phase 21 β: when does an artifact's absence forbid ACCEPT? Read from the
+# raw manifest (`required_for_accept:`; the Artifact dataclass does not
+# carry it), defaulting from `triggered_by`.
+_TRIGGER_DEFAULT_REQUIREMENT = {
+    "always": "always",
+    "allocation": "allocation",
+    "aggregation_ratio_lt_0.1": "aggregation",
+}
 
-    # Phase 7 Commit μ: plan-promised criteria enforcement.
-    violations.extend(_check_plan_criteria(run_dir))
 
-    # Phase 9 Commit ρ: write-time figure validator + provenance check.
-    violations.extend(_check_figure_validator(run_dir))
-
-    # Phase 12 Commit α: cross-file numeric consistency check.
-    # Catches the failure mode the 104914 run shipped: 4+ verifiable
-    # internal numeric inconsistencies (cost-per-case $5.05 vs $4.71
-    # in same file, figure_rationale stale by 2.4×, title Round 4 vs
-    # actual Round 6) that no validator was comparing across sibling
-    # artifacts. Only redteam caught two of them in round 6.
+def _manifest_requirements() -> dict[str, str]:
+    import lib.rigor_artifacts as _ra
     try:
-        spec = importlib.util.spec_from_file_location(
-            "numeric_consistency",
-            os.path.join(os.path.dirname(__file__), "numeric_consistency.py"),
-        )
-        nc_mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(nc_mod)
-        violations.extend(nc_mod.check_numeric_consistency(run_dir))
-    except Exception as e:
-        violations.append({
-            "kind": "numeric_consistency_load_error",
+        with open(_ra._MANIFEST_PATH, encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError):
+        raw = {}
+    reqs: dict[str, str] = {}
+    by_id = {str(e.get("id")): e for e in raw.get("artifacts") or []
+             if isinstance(e, dict)}
+    for a in load_artifacts():
+        mode = (by_id.get(a.id) or {}).get("required_for_accept")
+        reqs[a.id] = str(mode) if mode else \
+            _TRIGGER_DEFAULT_REQUIREMENT.get(a.triggered_by, "always")
+    return reqs
+
+
+def _not_applicable_artifacts(run_dir: str) -> set[str]:
+    """Artifact ids declared `not_applicable` (with a justification) in
+    scope_declaration.yaml, e.g.
+        declarations:
+          - id: SD-004
+            not_applicable: identifiability
+            justification: "No parameters are fitted; all are literature values."
+    """
+    _doc, entries, _ = _load_scope_declarations(run_dir)
+    out: set[str] = set()
+    for e in entries:
+        na = e.get("not_applicable")
+        if na and _entry_has_justification(e):
+            for x in (na if isinstance(na, list) else [na]):
+                out.add(str(x).strip())
+    return out
+
+
+def _allocation_present(run_dir: str) -> bool:
+    return bool(_find_allocation_csvs(run_dir)) or os.path.exists(
+        artifact_path("decision_rule", run_dir))
+
+
+def _check_required_artifacts(run_dir: str, post_write: bool = False
+                              ) -> list[dict]:
+    """Phase 21 β: required artifacts gate ACCEPT at EVERY round.
+
+    Pre-21, most missing artifacts were round-gated MEDIUMs, so a run with
+    schema-valid empty critiques could ACCEPT at round 1 or 2 with no
+    model artifacts at all. Each missing required artifact is now a
+    `required_artifact_missing` accept-blocker: PATCH while rounds remain;
+    at exhaustion DECLARE_SCOPE if the artifact is scope-declarable,
+    RUN_FAILED if not. A scope-declarable artifact can be exempted with a
+    justified `not_applicable:` entry in scope_declaration.yaml.
+    """
+    reqs = _manifest_requirements()
+    allocation = _allocation_present(run_dir)
+    pair = _detect_calibration_allocation_ratio(run_dir)
+    aggregation = bool(pair) and pair[0] / pair[1] < _ECOLOGICAL_AGGREGATION_THRESHOLD
+    fitted = any(os.path.exists(artifact_path(i, run_dir))
+                 for i in ("identifiability", "model_comparison"))
+    applies = {"always": True, "allocation": allocation,
+               "aggregation": aggregation, "fitted_parameters": fitted,
+               "post_write": post_write, "never": False}
+    exempt = _not_applicable_artifacts(run_dir)
+    out: list[dict] = []
+    for a in load_artifacts():
+        mode = reqs.get(a.id, "always")
+        if not applies.get(mode, True):
+            continue
+        if os.path.exists(artifact_path(a.id, run_dir)):
+            continue
+        if a.scope_declarable and a.id in exempt:
+            continue
+        out.append({
+            "kind": "required_artifact_missing",
+            "severity": "HIGH",
+            "stage": a.stage.upper(),
+            "accept_blocker": True,
+            "artifact": a.id,
+            "target_stage": {"pre_model": "PLAN", "write": "WRITE",
+                             "analyze": "ANALYZE"}.get(a.stage, "MODEL"),
+            "scope_declarable": a.scope_declarable,
+            "claim": (f"Required artifact `{a.path}` ({a.id}, required "
+                      f"when: {mode}) is absent. ACCEPT is impossible "
+                      f"without it at any round"
+                      + ("" if a.scope_declarable else
+                         " and it is NOT scope-declarable")
+                      + f". See the `{a.skill}` skill."),
+        })
+    if post_write and not os.path.exists(os.path.join(run_dir, "report.md")):
+        out.append({
+            "kind": "required_artifact_missing",
             "severity": "HIGH",
             "stage": "WRITE",
-            "claim": f"Could not load scripts/numeric_consistency.py: {e}",
+            "accept_blocker": True,
+            "artifact": "report",
+            "target_stage": "WRITE",
+            "scope_declarable": False,
+            "claim": "Post-WRITE gate: report.md is absent.",
         })
+    return out
 
-    # Phase 10 Commit ψ: allocation-gate coordinator. The five
-    # allocation-triggered checks (optimization_quality, daly,
-    # allocation_robustness, universal_coverage, sensitivity_analysis)
-    # were previously called individually here, each emitting its own
-    # MEDIUM `*_missing` violation. The 0013 round-2 critique reported
-    # 5 simultaneous MEDIUMs — noise that conditioned the modeler to
-    # defer rather than draft early. The coordinator runs all five,
-    # passes through every HIGH unchanged, and consolidates the
-    # MEDIUM `*_missing` violations into a single round-aware
-    # `allocation_rigor_in_progress` (still in drafting window) or
-    # `allocation_rigor_drafts_overdue` (past deadline).
-    violations.extend(_check_allocation_rigor_status(run_dir, round_n=round_n))
 
-    # Phase 12 Commit γ: ecological-fallacy / within-zone heterogeneity
-    # check. When the model calibrates to k zones but allocates to
-    # n>>k spatial units (Nigeria 6→774 in 104914), within-zone
-    # variation is invisible to the optimizer. Require an artifact
-    # bounding the impact loss when the aggregation ratio is high.
-    violations.extend(_check_within_zone_heterogeneity(run_dir))
+def _check_eligibility_probe(run_dir: str,
+                             round_n: int | None = None) -> list[dict]:
+    """Phase 21 β/δ: behavioral eligible-population check via
+    scripts/eligibility_probe.py (benefit must vanish when the eligible
+    population is zero and must not scale with the ineligible population).
 
+    Required (missing manifest = HIGH `eligibility_manifest_missing`) when
+    an allocation exists. Round 1 is the drafting window: HIGHs demote to
+    MEDIUM. Absent probe module → skip (no finding).
+    """
+    try:
+        mod = _load_sibling("eligibility_probe")
+    except (FileNotFoundError, ImportError):
+        return []
+    findings = mod.check(run_dir, require=_allocation_present(run_dir))
+    if not isinstance(findings, list):
+        raise TypeError(f"eligibility_probe.check returned {type(findings).__name__}")
+    drafting = round_n is not None and round_n < 2
+    out = []
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        v = dict(f)
+        v.setdefault("stage", "MODEL")
+        if drafting and v.get("severity") == "HIGH":
+            v["severity"] = "MEDIUM"
+        out.append(v)
+    return out
+
+
+def _check_a_priori_counts(run_dir: str,
+                           round_n: int | None = None) -> list[dict]:
+    """Phase 21 β/δ: the a-priori identifiability counts must match the
+    built model (identifiability_a_priori.cross_check_counts). 235631
+    declared 17 params / 37 targets (IDENTIFIABLE) while the comparison
+    manifest showed k=22 vs n=22. Gated like the a-priori artifact."""
+    if round_n is None or round_n < _IDENTIFIABILITY_A_PRIORI_REQUIRED_FROM_ROUND:
+        return []
+    try:
+        mod = _load_sibling("identifiability_a_priori")
+    except (FileNotFoundError, ImportError):
+        return []
+    fn = getattr(mod, "cross_check_counts", None)
+    if fn is None:
+        return []
+    out = []
+    for f in fn(run_dir) or []:
+        if isinstance(f, dict):
+            v = dict(f)
+            v.setdefault("stage", "PRE_MODEL")
+            out.append(v)
+    return out
+
+
+def _check_rigor_artifacts(run_dir: str, round_n: int | None = None,
+                           post_write: bool = False) -> list[dict]:
+    """Run every rigor check. Returns a list of violations.
+
+    Phase 21 β: every check runs through `run_guarded`, so an exception
+    inside any `_check_*` becomes a HIGH `validator_check_crashed` finding
+    instead of crashing the gate (exit 1, no JSON) or silently returning
+    nothing. `post_write=True` (CLI `--post-write`) additionally requires
+    report.md / post-WRITE artifacts and makes writer-QA / coherence
+    unavailability HIGH. Violations are annotated with `first_seen_round`
+    from validator_history.jsonl.
+    """
+    G = run_guarded
+    violations: list[dict] = []
+    # Phase 2 core reports (UQ, multi-structural, identifiability).
+    violations += G(_check_core_rigor_reports, run_dir)
+    # Phase 21 β: missing required artifacts forbid ACCEPT at any round.
+    violations += G(_check_required_artifacts, run_dir, post_write=post_write)
+    # Decision rule (Phase 3 Commit C): required when an allocation CSV exists.
+    violations += G(_check_decision_rule_artifact, run_dir)
+    # Phase 4 Commit δ: cross-comparator efficiency outlier check.
+    violations += G(_check_comparator_efficiency, run_dir)
+    # Phase 7 Commit λ: STAGE 8.5 WRITER_QA pass (recomputed, Phase 21 β).
+    violations += G(_check_writer_qa, run_dir, post_write=post_write)
+    # Phase 7 Commit μ: plan-promised criteria enforcement.
+    violations += G(_check_plan_criteria, run_dir)
+    # Phase 9 Commit ρ: write-time figure validator + provenance check.
+    violations += G(_check_figure_validator, run_dir)
+    # Phase 12 Commit α: cross-file numeric consistency check.
+    violations += G(lambda rd: _load_sibling("numeric_consistency")
+                    .check_numeric_consistency(rd), run_dir,
+                    check_name="numeric_consistency")
+    # Phase 10 Commit ψ: allocation-gate coordinator (optimization_quality,
+    # daly, allocation_robustness, universal_coverage, sensitivity_analysis;
+    # round-aware MEDIUM consolidation).
+    violations += G(_check_allocation_rigor_status, run_dir, round_n=round_n)
+    # Phase 12 Commit γ: ecological-fallacy / within-unit heterogeneity.
+    violations += G(_check_within_zone_heterogeneity, run_dir)
     # Phase 13 Commit α: disease-agnostic structural sanity checks.
-    # The 190855 run shipped DECLARE_SCOPE with internally consistent
-    # numbers but no gate cross-checked aggregate impact against the
-    # model's own internal relationships. Eight generic checks via
-    # models/sanity_schema.yaml: mass balance, per-unit intensity,
-    # share closure, derived consistency, composite dimensions,
-    # counterfactual ratio, structural-uncertainty carry-forward,
-    # outlier sniff. Schema is required at round ≥ 3.
-    violations.extend(_check_sanity_schema(run_dir, round_n=round_n))
-
-    # Phase 15 Commit α: a-priori identifiability arithmetic.
-    # The 224202 run shipped ACCEPT with 3/3 fitted parameters
-    # post-hoc-flagged unidentified — but should have been caught at
-    # strategy time by 30 seconds of arithmetic (40 fitted params /
-    # 6 independent targets = 6.67× over-saturated). This check
-    # enforces a pre-model artifact requiring the modeler to count
-    # parameters vs targets BEFORE building. Verdict OVER_SATURATED
-    # without resolution is HIGH and explicitly NOT scope-declarable
-    # — the architecture must be fixed at strategy time.
-    violations.extend(_check_identifiability_a_priori(run_dir,
-                                                       round_n=round_n))
-
-    # Phase 17 Commit α: pre-mortem domain critique. Spawned in STAGE 3
-    # (PRE-MODEL window) before the modeler builds. Reads only plan.md +
-    # hypotheses.md + matching expert_priors. Identifies HIGH-impact
-    # concerns the modeler must address in modeling_strategy.md §
-    # Pre-mortem Responses. Round 1 is the drafting window (MEDIUM);
-    # round 2+ blocks ACCEPT on missing artifact OR unaddressed HIGH
-    # (HIGH, scope-declarable via scope_declaration.yaml).
-    violations.extend(_check_premortem_addressed(run_dir, round_n=round_n))
-
-    # Phase 17 Commit β: coherence audit (post-WRITE). Surfaces
-    # violations from scripts/coherence_audit.py — label drift
-    # (R-019 class), cross-file count/cost mismatches (R-020 / $197M
-    # class), and self-contradicting artifacts (M-010 class). Only
-    # fires once report.md has been written.
-    violations.extend(_check_coherence_audit(run_dir))
-
-    # Phase 18 Commit α: claims ledger present + schema-valid. The
-    # analyst must register every quantitative/categorical claim in
-    # models/claims_ledger.yaml so the writer can [CLAIM:id]-bind the
-    # report. Round 2 → MEDIUM if absent; round ≥ 3 → HIGH (NOT
-    # scope-declarable per Phase 18 α contract).
-    violations.extend(_check_claims_ledger_present(run_dir, round_n=round_n))
-
-    # Phase 19 Commit α: effort floors. Reads effort_floors_report.yaml
-    # (produced by scripts/effort_floors.py) and surfaces violations of
-    # the quantitative minimums for "actually tried" — n_draws,
-    # n_restarts, perturbation grid size, held-out folds, AST shortcut
-    # markers. This is the gate that distinguishes "the optimizer ran"
-    # from "calibration was attempted with effort."
-    violations.extend(_check_effort_floors(run_dir, round_n=round_n))
-
-    # Phase 19 Commit β: scope-declaration budget. Counts entries in
-    # scope_declaration.yaml; above-cap counts force the modeler to
-    # either resolve some declarations or escalate explicitly. Prevents
-    # the "scope-declare everything" shortcut the manifest's
-    # `scope_declarable: true` rows would otherwise enable.
-    violations.extend(_check_scope_declaration_budget(run_dir,
-                                                      round_n=round_n))
-
-    # Phase 19 Commit γ: benchmark-locked acceptance. Compares the
-    # modeler's computed outputs against the planner's literature-
-    # anchored benchmark_targets.yaml. DRIFT > 1 of N at round ≥ 2
-    # is HIGH (scope-declarable for novel populations).
-    violations.extend(_check_benchmark_match(run_dir, round_n=round_n))
-
-    # Phase 19 Commit δ: sufficiency critic. Reads critique_sufficiency.yaml
-    # (post-WRITE). Each OVERCLAIMED verdict surfaces as a HIGH
-    # `claim_overclaimed` blocker. Round 1 is the drafting window.
-    violations.extend(_check_sufficiency_critic(run_dir, round_n=round_n))
-
-    # Phase 12 Commit β: round-aware escalation of persisting MEDIUMs.
-    # Catches the failure mode the 104914 run shipped: 18 figure_
-    # validator_missing MEDIUMs persisted r2→r6, presentation P-005..
-    # P-009 persisted r1→r6, decision_rule_self_referential persisted
-    # r2→r6 — none blocked ACCEPT because MEDIUM doesn't, and the
-    # contracts had no "ignored 4 rounds in a row, escalating"
-    # mechanism. Escalates qualifying persistent MEDIUMs to HIGH so
-    # ACCEPT is forced to either fix or scope-declare explicitly.
+    violations += G(_check_sanity_schema, run_dir, round_n=round_n)
+    # Phase 15 Commit α: a-priori identifiability arithmetic (NOT
+    # scope-declarable at OVER_SATURATED).
+    violations += G(_check_identifiability_a_priori, run_dir, round_n=round_n)
+    # Phase 21 β/δ: a-priori counts must match the built model.
+    violations += G(_check_a_priori_counts, run_dir, round_n=round_n)
+    # Phase 17 Commit α: pre-mortem domain critique.
+    violations += G(_check_premortem_addressed, run_dir, round_n=round_n)
+    # Phase 17 Commit β: coherence audit (post-WRITE; recomputed, 21 β).
+    violations += G(_check_coherence_audit, run_dir, post_write=post_write)
+    # Phase 18 Commit α + 21 β: claims ledger present, schema-valid, and
+    # every claim matches the artifact it cites (NOT scope-declarable).
+    violations += G(_check_claims_ledger_present, run_dir, round_n=round_n)
+    # Phase 19 Commit α: effort floors.
+    violations += G(_check_effort_floors, run_dir, round_n=round_n)
+    # Phase 19 Commit β: scope-declaration budget.
+    violations += G(_check_scope_declaration_budget, run_dir, round_n=round_n)
+    # Phase 19 Commit γ: benchmark-locked acceptance.
+    violations += G(_check_benchmark_match, run_dir, round_n=round_n)
+    # Phase 19 Commit δ: sufficiency critic (post-WRITE).
+    violations += G(_check_sufficiency_critic, run_dir, round_n=round_n)
+    # Phase 21 β/δ: eligible-population behavioral probe.
+    violations += G(_check_eligibility_probe, run_dir, round_n=round_n)
+    # Phase 12 Commit β: round-aware escalation of persisting MEDIUMs
+    # (history-backed since Phase 21 β).
     if round_n is not None:
-        violations.extend(_check_persistent_medium_escalation(
-            run_dir, round_n=round_n))
-
+        violations += G(_check_persistent_medium_escalation, run_dir,
+                        round_n=round_n,
+                        current_kinds={v.get("kind") for v in violations})
+    _annotate_first_seen(run_dir, violations)
     return violations
+
+
+# Phase 21 β: canonical funder-neutral key → legacy aliases.
+_UNIVERSAL_COVERAGE_FIELDS = (
+    ("total_units", ()),
+    ("actual_budget", ("gc7_actual_budget",)),
+    ("dalys_averted", ("gc7_dalys_averted",)),
+    ("universal_coverage_dalys_averted_estimate", ()),
+    ("efficiency_pct", ("gc7_efficiency_pct",)),
+)
 
 
 def _check_universal_coverage(run_dir: str) -> list[dict]:
@@ -1240,11 +1745,15 @@ def _check_universal_coverage(run_dir: str) -> list[dict]:
 
     Required artifact: `{run_dir}/models/universal_coverage.yaml` with:
       total_units: <int>
-      gc7_actual_budget: <number>
+      actual_budget: <number>           # the constrained envelope
       budget_for_universal_*: <number>  # at least one
-      gc7_dalys_averted: <number>
+      dalys_averted: <number>           # under the constrained allocation
       universal_coverage_dalys_averted_estimate: <number>
-      gc7_efficiency_pct: <number>      # gc7 / universal * 100
+      efficiency_pct: <number>          # constrained / universal * 100
+
+    Phase 21 β: keys are funder-neutral. The pre-21 funder-specific names
+    (`gc7_actual_budget`, `gc7_dalys_averted`, `gc7_efficiency_pct`) are
+    accepted as legacy aliases.
 
     Emits:
       universal_coverage_missing  MEDIUM — allocation exists, no yaml
@@ -1270,9 +1779,9 @@ def _check_universal_coverage(run_dir: str) -> list[dict]:
                 "allocation. This surfaces the 'fund X%, BAU for Y%' "
                 "concession quantitatively rather than burying it in "
                 "§Limitations. Required fields: total_units, "
-                "gc7_actual_budget, budget_for_universal_<package>, "
-                "gc7_dalys_averted, universal_coverage_dalys_averted_"
-                "estimate, gc7_efficiency_pct. See "
+                "actual_budget, budget_for_universal_<package>, "
+                "dalys_averted, universal_coverage_dalys_averted_"
+                "estimate, efficiency_pct. See "
                 "mechanistic-vs-hybrid-architecture skill."
             ),
         }]
@@ -1297,13 +1806,8 @@ def _check_universal_coverage(run_dir: str) -> list[dict]:
         }]
 
     missing = []
-    for required in (
-        "total_units", "gc7_actual_budget",
-        "gc7_dalys_averted",
-        "universal_coverage_dalys_averted_estimate",
-        "gc7_efficiency_pct",
-    ):
-        if required not in data:
+    for required, aliases in _UNIVERSAL_COVERAGE_FIELDS:
+        if not any(k in data for k in (required, *aliases)):
             missing.append(required)
     # At least one budget_for_universal_* must exist
     has_universal_budget = any(
@@ -1360,8 +1864,8 @@ def _check_plan_criteria(run_dir: str) -> list[dict]:
                 "minimum-bar / hard-blocker criterion can be "
                 "mechanically evaluated. Without it, plan-promised "
                 "criteria silently slide into §Limitations bullets "
-                "(see 1935 malaria run, where 'malariasimulation "
-                "cross-validation' was promised but never enforced). "
+                "(e.g. a promised external-model cross-validation that "
+                "is never run). "
                 "See planner prompt and scripts/plan_criteria.py "
                 "schema."
             ),
@@ -1448,51 +1952,96 @@ def _check_plan_criteria(run_dir: str) -> list[dict]:
     return out
 
 
-def _check_writer_qa(run_dir: str) -> list[dict]:
+def _load_sibling(name: str):
+    """Import scripts/<name>.py by path (no package install needed).
+    Registered in sys.modules so dataclasses in the module resolve."""
+    if name in sys.modules and getattr(sys.modules[name], "__file__", "") \
+            .endswith(f"{name}.py"):
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(
+        name, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           f"{name}.py"))
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return mod
+
+
+# Self-test hook: replace the in-process writer_qa computation.
+_WRITER_QA_FN = None
+
+
+def _check_writer_qa(run_dir: str, post_write: bool = False) -> list[dict]:
     """Phase 7 Commit λ: when report.md exists, the writer must run
     a post-write QA pass via scripts/writer_qa.py and the result must
     be CLEAN.
 
+    Phase 21 β: the gate no longer trusts a cached writer_qa_report.yaml
+    (it could predate later report edits, or be hand-written). It
+    recomputes writer_qa in-process and refreshes the YAML. An unreadable
+    report.md is HIGH `report_unreadable` (writer_qa.py used to call it
+    CLEAN). In post-WRITE mode (`--post-write`) a MAJOR_REVISION verdict
+    is HIGH and the writer_qa module being unavailable is HIGH.
+
     Emits:
-      writer_qa_missing    MEDIUM — report.md exists but no
-                                    writer_qa_report.yaml
-      writer_qa_unresolved MEDIUM — qa report says REVISE/MAJOR_REVISION
-                                    (writer didn't iterate on the issues)
+      writer_qa_unresolved MEDIUM (HIGH for MAJOR_REVISION in post-write)
+      writer_qa_unknown_verdict HIGH
+      writer_qa_unavailable  MEDIUM (HIGH in post-write)
+      report_unreadable      HIGH
     """
     report = os.path.join(run_dir, "report.md")
     if not os.path.exists(report):
-        return []  # Writer hasn't run yet; nothing to QA.
-
-    qa_path = os.path.join(run_dir, "writer_qa_report.yaml")
-    if not os.path.exists(qa_path):
+        return []  # Writer hasn't run yet; post-write absence is gated separately.
+    try:
+        with open(report, encoding="utf-8") as f:
+            f.read()
+    except (OSError, UnicodeDecodeError) as e:
         return [{
-            "kind": "writer_qa_missing",
-            "severity": "MEDIUM",
+            "kind": "report_unreadable",
+            "severity": "HIGH",
             "stage": "WRITER_QA",
-            "claim": (
-                "report.md exists but writer_qa_report.yaml is absent. "
-                "STAGE 8.5 requires a post-writer QA pass via "
-                "`python3 scripts/writer_qa.py {run_dir}`. The pass "
-                "checks for stale UQ numbers, figure-text comparator "
-                "inconsistencies, figure annotation vs body-text "
-                "metric mismatches, and stale CRITICAL CAVEATs in "
-                "§Limitations."
-            ),
+            "scope_declarable": False,
+            "claim": f"report.md exists but cannot be read as UTF-8: {e}",
         }]
 
     try:
-        with open(qa_path) as f:
-            data = yaml.safe_load(f) or {}
-    except (OSError, yaml.YAMLError):
-        return []
+        if _WRITER_QA_FN is not None:
+            result = _WRITER_QA_FN(run_dir)
+        else:
+            mod = _load_sibling("writer_qa")
+            result = mod.writer_qa(run_dir)
+            mod.write_report(run_dir, result)
+        verdict = str(result.verdict or "").strip().upper()
+        n_major, n_minor = result.n_major, result.n_minor
+    except Exception as e:  # noqa: BLE001 — fail closed below
+        return [{
+            "kind": "writer_qa_unavailable",
+            "severity": "HIGH" if post_write else "MEDIUM",
+            "stage": "WRITER_QA",
+            "claim": (f"writer_qa could not be computed in-process "
+                      f"({type(e).__name__}: {e}). Run "
+                      f"`python3 scripts/writer_qa.py {run_dir}`."),
+        }]
 
-    verdict = data.get("verdict", "")
+    if verdict not in _PRODUCER_VERDICTS["writer_qa"]:
+        return [{
+            "kind": "writer_qa_unknown_verdict",
+            "severity": "HIGH",
+            "stage": "WRITER_QA",
+            "scope_declarable": False,
+            "claim": (f"writer_qa returned verdict {verdict!r}, outside "
+                      f"{list(_PRODUCER_VERDICTS['writer_qa'])}."),
+        }]
     if verdict in ("REVISE", "MAJOR_REVISION"):
-        n_major = data.get("n_major", 0)
-        n_minor = data.get("n_minor", 0)
+        severity = ("HIGH" if post_write and verdict == "MAJOR_REVISION"
+                    else "MEDIUM")
         return [{
             "kind": "writer_qa_unresolved",
-            "severity": "MEDIUM",
+            "severity": severity,
             "stage": "WRITER_QA",
             "claim": (
                 f"writer_qa verdict is {verdict} with {n_major} MAJOR "
@@ -1506,6 +2055,26 @@ def _check_writer_qa(run_dir: str) -> list[dict]:
             ),
         }]
     return []
+
+
+def _unknown_result_verdict(result: Any, producer: str, prefix: str,
+                            stage: str) -> list[dict]:
+    """Phase 21 β: a sibling validator's result must be a mapping whose
+    verdict is in the producer's vocabulary. Anything else is HIGH — the
+    pre-21 if/elif chains passed any unexpected verdict silently."""
+    allowed = _producer_verdicts(producer)
+    verdict = result.get("verdict") if isinstance(result, dict) else None
+    if verdict in allowed:
+        return []
+    return [{
+        "kind": f"{prefix}_unknown_verdict",
+        "severity": "HIGH",
+        "stage": stage,
+        "scope_declarable": False,
+        "claim": (f"scripts/{producer}.py returned verdict {verdict!r} "
+                  f"(result type {type(result).__name__}); expected one of "
+                  f"{list(allowed)}."),
+    }]
 
 
 def _check_allocation_robustness(run_dir: str) -> list[dict]:
@@ -1534,13 +2103,13 @@ def _check_allocation_robustness(run_dir: str) -> list[dict]:
             "claim": (
                 "Allocation produced but models/allocation_robustness.yaml "
                 "is absent. The allocation rule must be cross-validated: "
-                "hold out k spatial units (e.g., leave-one-archetype-out "
+                "hold out k units (e.g., leave-one-calibration-unit-out "
                 "or 5-fold-by-state), re-run the optimizer on the "
                 "remaining n-k, and measure how well the rule generalizes "
-                "to the held-out units. A 22-archetype calibration "
-                "achieving 7.8pp RMSE in-sample says nothing about "
-                "whether the optimizer's allocation rule overfits "
-                "specific archetype EIRs. See the "
+                "to the held-out units. A good in-sample calibration "
+                "fit says nothing about whether the optimizer's "
+                "allocation rule overfits unit-specific calibrated "
+                "values. See the "
                 "allocation-cross-validation skill."
             ),
         }]
@@ -1561,7 +2130,10 @@ def _check_allocation_robustness(run_dir: str) -> list[dict]:
         }]
 
     result = mod.validate_allocation_robustness(yaml_path)
-    out = []
+    out = _unknown_result_verdict(result, "allocation_robustness",
+                                  "allocation_robustness", "OPTIMIZATION")
+    if out:
+        return out
     if result["verdict"] == "MALFORMED":
         out.append({
             "kind": "allocation_robustness_malformed",
@@ -1581,12 +2153,12 @@ def _check_allocation_robustness(run_dir: str) -> list[dict]:
                 f"correlation < 0.40 OR cases-averted gap > 30% OR rule "
                 f"classification concordance < 60%. The optimizer's "
                 f"allocation does NOT generalize to held-out spatial "
-                f"units — applying this rule to LGAs/states outside the "
+                f"units — applying this rule to allocation units outside the "
                 f"calibration set is unjustified. Either rebuild the "
                 f"model with regularization / pooling / spatial structure "
                 f"to improve generalization, or scope-declare the "
                 f"recommendation as applicable only to the in-sample "
-                f"22 archetypes. Metrics: {result.get('metrics')}"
+                f"calibration units. Metrics: {result.get('metrics')}"
             ),
         })
     elif result["verdict"] == "FRAGILE":
@@ -1660,10 +2232,10 @@ def _check_daly_when_allocation(run_dir: str) -> list[dict]:
     """Phase 6 Commit ι: when a model produces an allocation, the
     report must mention DALYs (or explicitly justify their absence).
 
-    Cases-averted alone treats a 6-month-old's averted infection
-    identically to an adult's, dramatically under-weighting U5-targeted
-    interventions like SMC. GF / GBD / WHO use DALY-denominated
-    cost-effectiveness as the standard. A Global Fund supplementary
+    Cases-averted alone treats an infant's averted episode identically
+    to an adult's, dramatically under-weighting interventions that
+    target high-mortality groups. Funders, GBD and WHO use DALY-
+    denominated cost-effectiveness as the standard; an allocation
     analysis without DALYs gets sent back.
 
     Emits:
@@ -1706,8 +2278,10 @@ def _check_daly_when_allocation(run_dir: str) -> list[dict]:
             "Cases-averted alone treats a 6-month-old's averted "
             "infection identically to an adult's, structurally biasing "
             "the recommendation toward all-age interventions over "
-            "child-targeted ones (SMC, IPTp, paediatric vaccines). "
-            "Global Fund / GBD / WHO benchmarks are DALY-denominated; "
+            "ones targeting high-mortality groups (e.g. infant "
+            "vaccination, chemoprevention in young children, treatment "
+            "of advanced disease). Funder / GBD / WHO cost-effectiveness "
+            "benchmarks are DALY-denominated; "
             "without DALY-averted figures, the report cannot be "
             "compared to published cost-effectiveness thresholds. "
             "Add either (1) a DALY-averted column alongside "
@@ -1775,7 +2349,10 @@ def _check_optimization_quality(run_dir: str) -> list[dict]:
         }]
 
     result = mod.validate_optimization_quality(yaml_path)
-    out = []
+    out = _unknown_result_verdict(result, "optimization_quality",
+                                  "optimization_quality", "OPTIMIZATION")
+    if out:
+        return out
     if result["verdict"] == "MALFORMED":
         out.append({
             "kind": "optimization_quality_malformed",
@@ -1849,7 +2426,7 @@ def _check_sensitivity_analysis(run_dir: str) -> list[dict]:
                 "change the dominant intervention package, the highest-"
                 "burden zone allocation, or the comparator-vs-optimized "
                 "winner). For each parameter: re-run the optimizer at "
-                "alternative values, compare top-50 LGA package "
+                "alternative values, compare top-50 unit package "
                 "assignments, and report rank_change_top_n + "
                 "primary_recommendation_changes. Verdict ROBUST is "
                 "required for ACCEPT-grade analysis. SENSITIVE must be "
@@ -1875,7 +2452,10 @@ def _check_sensitivity_analysis(run_dir: str) -> list[dict]:
         }]
 
     result = mod.validate_sensitivity_analysis(yaml_path)
-    out = []
+    out = _unknown_result_verdict(result, "sensitivity_analysis",
+                                  "sensitivity_analysis", "OPTIMIZATION")
+    if out:
+        return out
     if result["verdict"] == "MALFORMED":
         out.append({
             "kind": "sensitivity_analysis_malformed",
@@ -2185,9 +2765,7 @@ def _detect_calibration_allocation_ratio(run_dir: str) -> tuple[int, int] | None
     allocation_units: from models/lga_allocation.csv (row count
         excluding header), or any *allocation*.csv in models/.
     """
-    cal_path = os.path.join(run_dir, "model_comparison_formal.yaml")
-    if not os.path.exists(cal_path):
-        cal_path = os.path.join(run_dir, "models", "model_comparison_formal.yaml")
+    cal_path = _msc_report_path(run_dir)
     cal_units: int | None = None
     if os.path.exists(cal_path):
         try:
@@ -2275,7 +2853,10 @@ def _check_within_zone_heterogeneity(run_dir: str) -> list[dict]:
         }]
 
     result = wzs.validate_within_zone_heterogeneity(yaml_path)
-    out: list[dict] = []
+    out: list[dict] = _unknown_result_verdict(
+        result, "within_zone_sensitivity", "within_zone_heterogeneity", "MODEL")
+    if out:
+        return out
     if result["verdict"] == "MALFORMED":
         out.append({
             "kind": "within_zone_heterogeneity_malformed",
@@ -2294,12 +2875,12 @@ def _check_within_zone_heterogeneity(run_dir: str) -> list[dict]:
                 f"Within-zone heterogeneity sensitivity verdict UNBOUNDED: "
                 f"worst-case impact loss "
                 f"{s.get('worst_loss_pct', 0):.1f}% under realistic "
-                f"within-unit variation. The headline cases-averted is "
-                f"NOT defensible at the LGA level. Either narrow the "
-                f"perturbation range with stronger evidence (e.g., "
-                f"sub-zone PfPR sample), refit at the lower aggregation "
-                f"level, or scope-declare the recommendation as zone-"
-                f"level only."
+                f"within-unit variation. The headline impact is NOT "
+                f"defensible at the allocation-unit level. Either narrow "
+                f"the perturbation range with stronger evidence (e.g., a "
+                f"sub-unit sample of the driving covariate), refit at the "
+                f"finer aggregation level, or scope-declare the "
+                f"recommendation as calibration-unit-level only."
             ),
         })
     elif result["verdict"] == "INCONCLUSIVE":
@@ -2313,8 +2894,8 @@ def _check_within_zone_heterogeneity(run_dir: str) -> list[dict]:
                 f"worst-case impact loss "
                 f"{s.get('worst_loss_pct', 0):.1f}%. Surface in §Sensitivity "
                 f"of report.md, not just §Limitations. The 10-25% range "
-                f"is publication-defensible but a Global Fund reviewer "
-                f"will want to see the explicit bound."
+                f"is publication-defensible but a funder or peer "
+                f"reviewer will want to see the explicit bound."
             ),
         })
     return out
@@ -2696,14 +3277,15 @@ def _check_identifiability_a_priori(run_dir: str,
 _VALIDATOR_KIND_ESCALATION_THRESHOLDS = {
     "figure_validator_missing": 4,
     "decision_rule_self_referential": 3,
-    "optimization_quality_missing": 4,
-    # `optimization_quality_*_failed` includes the R-005-class
-    # "no ILP benchmark" MEDIUMs that persisted in 104914
-    "optimization_quality_alternative_missing": 4,
-    # Phase 17 β: lead must invoke scripts/coherence_audit.py post-WRITE.
-    # Persistent absence after 4 rounds escalates to HIGH so the gate
-    # forces fix-or-scope-declare rather than silently passing.
-    "coherence_audit_not_run": 4,
+    # Phase 21 β: `optimization_quality_missing` never reaches the gate
+    # output (the Phase 10 ψ coordinator folds it into allocation_rigor_*)
+    # and `optimization_quality_alternative_missing` was never emitted.
+    # The coordinator's overdue kind is what persists.
+    "allocation_rigor_drafts_overdue": 2,
+    "optimization_quality_gap_too_large": 3,
+    # Phase 21 β: the gate now runs the coherence audit itself; what can
+    # persist is the auditor being unavailable.
+    "coherence_audit_unavailable": 3,
     # Phase 19 α: effort floors MEDIUMs that persist 3+ rounds become HIGH.
     # If the modeler keeps shipping under-floor sensitivity/iterations
     # round after round, force fix-or-scope-declare.
@@ -2711,10 +3293,81 @@ _VALIDATOR_KIND_ESCALATION_THRESHOLDS = {
     "effort_floor_calibration_min_iterations": 3,
     "effort_floor_uq_min_draws_cloud": 3,
     "effort_floor_shortcut_markers": 3,
-    "effort_floors_unavailable": 3,
     # Phase 19 δ: sufficiency critic absence persisting 3 rounds → HIGH.
     "critique_sufficiency_not_run": 3,
+    # Phase 21 β: MEDIUMs observed to persist to the final round of real
+    # runs without ever blocking.
+    "plan_criterion_not_tested": 3,
+    "benchmark_targets_missing": 2,
+    "pre_model_over_saturated_with_commitment": 2,
+    "weakly_identified_parameters": 3,
 }
+
+# Phase 21 β: per-round validator findings, appended by main() on every
+# invocation. Replaces counting `stage7_round*_stderr.txt` files, which no
+# prompt or code reliably wrote (present in 2 of 8 runs).
+_VALIDATOR_HISTORY_FILE = "validator_history.jsonl"
+
+
+def _load_validator_history(run_dir: str) -> dict[int, set[str]]:
+    """{round: set(kinds)} from validator_history.jsonl (union over all
+    invocations in a round). Malformed lines are skipped."""
+    out: dict[int, set[str]] = {}
+    path = os.path.join(run_dir, _VALIDATOR_HISTORY_FILE)
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+    except (OSError, UnicodeDecodeError):
+        return out
+    for line in lines:
+        try:
+            rec = json.loads(line)
+            rnd = int(rec["round"])
+            kinds = {str(x["kind"]) for x in rec.get("findings") or []
+                     if isinstance(x, dict) and x.get("kind")}
+        except (ValueError, KeyError, TypeError):
+            continue
+        out.setdefault(rnd, set()).update(kinds)
+    return out
+
+
+def _append_validator_history(run_dir: str, round_n: int, decision: dict,
+                              post_write: bool) -> None:
+    import datetime as _dt
+    rec = {
+        "round": round_n,
+        "post_write": post_write,
+        "at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        "action": decision.get("action"),
+        "findings": [{"kind": v.get("kind"), "severity": v.get("severity"),
+                      "stage": v.get("stage")}
+                     for v in (decision.get("rigor_violations") or [])],
+    }
+    try:
+        with open(os.path.join(run_dir, _VALIDATOR_HISTORY_FILE), "a",
+                  encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError as e:
+        print(f"WARNING: could not append validator history: {e}",
+              file=sys.stderr)
+
+
+def _annotate_first_seen(run_dir: str, violations: list[dict]) -> None:
+    """Phase 21 β: give each rigor violation the earliest round its kind
+    appeared in validator history, so persisting rigor HIGHs look stuck
+    (Phase 5 ζ) instead of always being 'first seen this round'. The key
+    is the kind, so distinct instances of one kind share a first round —
+    an over-estimate of persistence only when an old instance was fixed
+    and a new one appeared."""
+    hist = _load_validator_history(run_dir)
+    first: dict[str, int] = {}
+    for rnd in sorted(hist):
+        for k in hist[rnd]:
+            first.setdefault(k, rnd)
+    for v in violations:
+        if "first_seen_round" not in v and v.get("kind") in first:
+            v["first_seen_round"] = first[v["kind"]]
+
 
 # Critique-blocker IDs from critique-presentation that should
 # escalate after persisting N rounds. (Phase 11 review surfaced
@@ -2734,6 +3387,53 @@ _CRITIQUE_BLOCKER_ESCALATION_THRESHOLD = 4  # rounds since first_seen
 # pre-mortem concerns are domain heuristics — the modeler MAY scope-declare
 # a HIGH with justification in scope_declaration.yaml.
 _PRE_MORTEM_REQUIRED_FROM_ROUND = 2
+
+
+_PLACEHOLDER_REFS = frozenset({"", "TODO", "TBD", "N/A", "NA", "NONE",
+                               "NULL", "-", "PENDING", "LATER"})
+_MD_HEADING_RE = re.compile(r"^#{1,6}\s+(.+?)\s*#*\s*$", re.MULTILINE)
+
+
+def _slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
+
+def _addressed_in_resolves(run_dir: str, ref: Any) -> bool:
+    """Phase 21 β: `addressed_in` must point at real content, e.g.
+    `modeling_strategy.md § Pre-mortem Responses` or
+    `modeling_strategy.md#pre-mortem-pm-001`. Placeholders (TODO, TBD,
+    N/A, ...) and references to files that do not exist do not count."""
+    if not isinstance(ref, str) or ref.strip().upper() in _PLACEHOLDER_REFS:
+        return False
+    m = re.match(r"^\s*([^§#:]+?)\s*(?:(§|#|:)\s*(.*))?$", ref)
+    if not m:
+        return False
+    fname, sep, section = m.group(1).strip(), m.group(2), (m.group(3) or "").strip()
+    if fname.upper() in _PLACEHOLDER_REFS:
+        return False
+    path = None
+    for cand in (os.path.join(run_dir, fname),
+                 os.path.join(run_dir, "models", os.path.basename(fname))):
+        if os.path.isfile(cand):
+            path = cand
+            break
+    if path is None:
+        return False
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except (OSError, UnicodeDecodeError):
+        return False
+    if not text.strip():
+        return False
+    if not section or sep == ":":
+        return True
+    headings = [h.strip() for h in _MD_HEADING_RE.findall(text)]
+    if sep == "§":
+        return any(section.lower() in h.lower() for h in headings)
+    want = _slug(section)
+    return any(_slug(h).startswith(want) or want in _slug(h) for h in headings) \
+        or want in _slug(text)
 
 
 def _check_premortem_addressed(run_dir: str,
@@ -2781,58 +3481,38 @@ def _check_premortem_addressed(run_dir: str,
         })
         return out
 
-    # Load and validate schema. Be tolerant of partial files (the
-    # validator should not crash on malformed YAML — Phase 10 χ contract).
-    try:
-        with open(yaml_path) as f:
-            doc = yaml.safe_load(f) or {}
-    except (yaml.YAMLError, OSError) as e:
-        out.append({
-            "kind": "pre_mortem_invalid",
-            "severity": "HIGH",
-            "stage": "PRE_MODEL",
-            "claim": (f"`pre_mortem.yaml` could not be parsed: {e}. "
-                      f"Re-spawn critique-premortem to regenerate."),
-        })
-        return out
+    # Phase 21 β: fail closed — unparseable, non-mapping, or a renamed
+    # top-level key (e.g. `high_concerns:`) is HIGH invalid, not [].
+    doc, invalid = safe_load_mapping(
+        yaml_path, "pre_mortem", stage="PRE_MODEL",
+        required_keys=["concerns"], expected_types={"concerns": list},
+        display_path="pre_mortem.yaml")
+    if doc is None:
+        return invalid
+    concerns = doc["concerns"]
 
-    concerns = doc.get("concerns") or []
-    if not isinstance(concerns, list):
-        out.append({
-            "kind": "pre_mortem_invalid",
-            "severity": "HIGH",
-            "stage": "PRE_MODEL",
-            "claim": "`pre_mortem.yaml`: top-level `concerns:` must be a list.",
-        })
-        return out
-
-    # Collect IDs the modeler has scope-declared. The scope_declaration.yaml
-    # convention (rigor_artifacts manifest) accepts an entry whose id or
-    # claim quotes the PM-NNN concern id. We do a permissive substring
-    # match on the prose to avoid forcing schema rigidity in
-    # scope_declaration.yaml — it varies across runs.
+    # Phase 21 β: a concern counts as scope-declared only via a structured
+    # declaration entry (blocker_id / blocker_ids / id == PM-NNN) that also
+    # carries a justification. The pre-21 check accepted the id appearing
+    # anywhere in the file, e.g. `notes: "PM-001…PM-007"`.
     declared_ids: set[str] = set()
-    scope_path = os.path.join(run_dir, "scope_declaration.yaml")
-    if os.path.exists(scope_path):
-        try:
-            with open(scope_path) as f:
-                scope_doc = yaml.safe_load(f) or {}
-            text = yaml.safe_dump(scope_doc) or ""
-        except (yaml.YAMLError, OSError):
-            text = ""
-        for c in concerns:
-            cid = (c or {}).get("id") if isinstance(c, dict) else None
-            if isinstance(cid, str) and cid in text:
-                declared_ids.add(cid)
+    _sd_doc, sd_entries, _ = _load_scope_declarations(run_dir)
+    for e in sd_entries:
+        if not _entry_has_justification(e):
+            continue
+        declared_ids |= _entry_declared_ids(e, structured_only=True)
+        if e.get("id"):
+            declared_ids.add(str(e["id"]))
 
     severity = "HIGH" if round_n >= _PRE_MORTEM_REQUIRED_FROM_ROUND else "MEDIUM"
     for c in concerns:
         if not isinstance(c, dict):
             continue
-        if str(c.get("severity", "")).upper() != "HIGH":
+        # Phase 21 β: CRITICAL (and any unknown severity) is at least HIGH.
+        if str(c.get("severity", "")).strip().upper() in ("MEDIUM", "LOW"):
             continue
         cid = c.get("id") or "PM-???"
-        if c.get("addressed_in"):
+        if _addressed_in_resolves(run_dir, c.get("addressed_in")):
             continue
         if cid in declared_ids:
             continue
@@ -2841,8 +3521,11 @@ def _check_premortem_addressed(run_dir: str,
             "severity": severity,
             "stage": "PRE_MODEL",
             "claim": (
-                f"Pre-mortem HIGH concern {cid} has `addressed_in: null` "
-                f"and no scope_declaration entry referencing the id. "
+                f"Pre-mortem HIGH concern {cid} has no resolvable "
+                f"`addressed_in:` (got {c.get('addressed_in')!r}; it must "
+                f"name an existing run file, optionally `§ Section`) and "
+                f"no structured scope_declaration entry (blocker_id: {cid} "
+                f"+ justification). "
                 f"Concern: {str(c.get('concern', '')).strip().splitlines()[0] if c.get('concern') else ''!r}. "
                 f"Either resolve in modeling_strategy.md § Pre-mortem "
                 f"Responses (and set addressed_in:), or add a "
@@ -2945,95 +3628,145 @@ def _check_claims_ledger_present(run_dir: str,
                       "zero claims. Phase 18 α requires every quantitative "
                       "or categorical claim in results.md to be registered."),
         })
+        return out
+
+    out.extend(_ledger_provenance_violations(yaml_path, run_dir))
     return out
 
 
-def _check_coherence_audit(run_dir: str) -> list[dict]:
+_PROVENANCE_PER_KIND_CAP = 5
+
+
+def _ledger_provenance_violations(ledger_path: str, run_dir: str) -> list[dict]:
+    """Phase 21 β: every ledger claim must match the artifact it cites.
+
+    Delegates to scripts/lib/provenance.py. All findings are HIGH and NOT
+    scope-declarable. Display is capped per kind; the overflow is one
+    more HIGH (capping must never turn a blocker into an advisory).
+    """
+    doc, findings = safe_load_mapping(ledger_path, "claims_ledger",
+                                      stage="ANALYZE",
+                                      display_path="models/claims_ledger.yaml")
+    if doc is None:
+        return findings
+    res = _provenance.check_ledger_provenance(doc, run_dir)
+    by_kind: dict[str, list[dict]] = {}
+    for f in res["findings"]:
+        by_kind.setdefault(f["kind"], []).append(f)
+    out: list[dict] = []
+    for kind, fs in by_kind.items():
+        out.extend(fs[:_PROVENANCE_PER_KIND_CAP])
+        if len(fs) > _PROVENANCE_PER_KIND_CAP:
+            out.append({
+                "kind": kind,
+                "severity": "HIGH",
+                "stage": "ANALYZE",
+                "scope_declarable": False,
+                "claim": (f"{len(fs) - _PROVENANCE_PER_KIND_CAP} additional "
+                          f"{kind} finding(s) in models/claims_ledger.yaml "
+                          f"({res['n_checked']} checked, {res['n_external']} "
+                          f"external, {res['n_total']} total). Run "
+                          f"`python3 scripts/lib/provenance.py {{run_dir}}` "
+                          f"for the full list."),
+            })
+    return out
+
+
+# Self-test hook: replace the in-process coherence audit computation.
+_COHERENCE_AUDIT_FN = None
+
+
+def _check_coherence_audit(run_dir: str, post_write: bool = False) -> list[dict]:
     """Phase 17 β: surface violations from `scripts/coherence_audit.py`.
 
     The auditor runs post-WRITE alongside writer_qa.py. It checks
-    three duties: label coherence (e.g., 'UNSTABLE' in prose vs
-    'SENSITIVE' in YAML), cross-file count/cost consistency (prose
-    vs allocation CSV), and self-contradicting artifacts (notes
-    contradict structured fields in the same YAML).
+    label coherence (e.g., 'UNSTABLE' in prose vs 'SENSITIVE' in YAML),
+    cross-file count/cost consistency (prose vs allocation CSV),
+    self-contradicting artifacts (notes contradict structured fields in
+    the same YAML), and ledger binding (Phase 18 β).
 
-    This validator function reads the auditor's output
-    (`coherence_audit.yaml`) and emits one violation per drift
-    detected, preserving severities. If `report.md` exists but
-    `coherence_audit.yaml` is absent, emit MEDIUM (lead forgot to
-    invoke the auditor).
-
-    Round gating is NOT applied — the check only matters once
-    `report.md` has been written.
+    Phase 21 β: the gate recomputes the audit in-process on the current
+    report.md and refreshes `coherence_audit.yaml`, instead of trusting
+    the cached file. 2026-05-03_235631's progress.md said "coherence_audit
+    (CLEAN)" while a re-run on the final report found 21 HIGH
+    ledger_binding drifts. A malformed audit result (non-dict, non-list
+    violations, non-dict entries) is HIGH `coherence_audit_invalid`; an
+    unimportable auditor is MEDIUM (HIGH in post-write mode).
 
     Returns: list of {kind, severity, stage, claim} dicts.
     """
     report_path = os.path.join(run_dir, "report.md")
-    audit_path = artifact_path("coherence_audit", run_dir)
     out: list[dict] = []
 
     if not os.path.exists(report_path):
         return []  # WRITE hasn't happened; nothing to audit
 
-    if not os.path.exists(audit_path):
-        out.append({
-            "kind": "coherence_audit_not_run",
-            "severity": "MEDIUM",
-            "stage": "WRITE",
-            "claim": (
-                "report.md exists but coherence_audit.yaml is absent. "
-                "Run `python3 scripts/coherence_audit.py {run_dir}` "
-                "after writer-QA to surface label/count/self-"
-                "contradiction drift."
-            ),
-        })
-        return out
-
     try:
-        with open(audit_path) as f:
-            audit = yaml.safe_load(f) or {}
-    except (yaml.YAMLError, OSError) as e:
-        out.append({
+        if _COHERENCE_AUDIT_FN is not None:
+            audit = _COHERENCE_AUDIT_FN(run_dir)
+        else:
+            mod = _load_sibling("coherence_audit")
+            audit = mod.audit_run(run_dir)
+            mod.write_audit_yaml(run_dir, audit)
+    except Exception as e:  # noqa: BLE001 — fail closed below
+        return [{
+            "kind": "coherence_audit_unavailable",
+            "severity": "HIGH" if post_write else "MEDIUM",
+            "stage": "WRITE",
+            "claim": (f"coherence audit could not be computed in-process "
+                      f"({type(e).__name__}: {e}). Run "
+                      f"`python3 scripts/coherence_audit.py {run_dir}`."),
+        }]
+
+    violations = audit.get("violations") if isinstance(audit, dict) else None
+    if not isinstance(violations, list) or not all(
+            isinstance(v, dict) for v in violations):
+        return [{
             "kind": "coherence_audit_invalid",
             "severity": "HIGH",
             "stage": "WRITE",
-            "claim": (f"`coherence_audit.yaml` could not be parsed: {e}. "
-                      f"Re-run `scripts/coherence_audit.py`."),
-        })
-        return out
-
-    violations = audit.get("violations") or []
-    if not isinstance(violations, list):
-        return out
+            "scope_declarable": False,
+            "claim": ("coherence audit result must be a mapping with a "
+                      "`violations:` list of mappings; got "
+                      f"{type(audit).__name__} / "
+                      f"{type(violations).__name__}."),
+        }]
 
     # Bucket by duty, take top-K per duty to avoid swamping the gate.
     # Phase 10 ψ's allocation-gate consolidation pattern: prefer one
     # consolidated MEDIUM per duty over many fine-grained MEDIUMs.
     per_duty: dict[str, list[dict]] = {}
     for v in violations:
-        if not isinstance(v, dict):
-            continue
         duty = str(v.get("duty", "unknown"))
         per_duty.setdefault(duty, []).append(v)
 
     for duty, vlist in per_duty.items():
-        # Always emit individual HIGHs (these block ACCEPT).
-        # Use a default empty string so a violation lacking a severity
-        # field doesn't silently become "NONE" (str(None).upper()) and
-        # disappear from both buckets — Phase 10 χ non-crashing-reads
-        # contract treats missing fields as MEDIUM-equivalent advisories.
-        highs = [v for v in vlist if str(v.get("severity") or "").upper() == "HIGH"]
-        meds = [v for v in vlist if str(v.get("severity") or "").upper() == "MEDIUM"]
+        # Always emit individual HIGHs (these block ACCEPT). Missing
+        # severity is treated as HIGH (fail closed — Phase 21 β).
+        highs = [v for v in vlist
+                 if str(v.get("severity") or "HIGH").upper() == "HIGH"]
+        meds = [v for v in vlist
+                if str(v.get("severity") or "").upper() == "MEDIUM"]
         for v in highs[:5]:  # cap at 5 per duty
             out.append({
                 "kind": f"coherence_audit_{duty}",
                 "severity": "HIGH",
                 "stage": "WRITE",
                 "claim": (
-                    f"[{v.get('id', '?')}] {v.get('claim', '')[:300]} "
+                    f"[{v.get('id', '?')}] {str(v.get('claim') or '')[:300]} "
                     f"(canonical: {v.get('canonical_source', '?')}; "
                     f"location: {v.get('location', '?')})"
                 ),
+            })
+        if len(highs) > 5:
+            # Phase 21 β: the overflow is still HIGH — capping display must
+            # not make the remaining drifts advisory.
+            out.append({
+                "kind": f"coherence_audit_{duty}",
+                "severity": "HIGH",
+                "stage": "WRITE",
+                "claim": (f"{len(highs) - 5} additional HIGH {duty} "
+                          f"violation(s); see coherence_audit.yaml."),
             })
         # Consolidate MEDIUM violations into a single advisory per duty.
         if meds:
@@ -3044,7 +3777,7 @@ def _check_coherence_audit(run_dir: str) -> list[dict]:
                 "claim": (
                     f"{len(meds)} MEDIUM coherence_audit violation(s) "
                     f"on duty `{duty}`. First example: "
-                    f"{meds[0].get('claim', '')[:200]}"
+                    f"{str(meds[0].get('claim') or '')[:200]}"
                 ),
             })
     return out
@@ -3111,16 +3844,13 @@ def _check_effort_floors(run_dir: str,
         return []
 
     out: list[dict] = []
-    report_path = os.path.join(run_dir, "effort_floors_report.yaml")
 
     # Determine whether any trigger artifact is present. If none of the
     # probes would fire, we don't need to insist on running the script.
     triggers_present = (
-        os.path.exists(os.path.join(run_dir, "uncertainty_report.yaml"))
-        or os.path.exists(os.path.join(run_dir, "models",
-                                        "sensitivity_analysis.yaml"))
-        or os.path.exists(os.path.join(run_dir, "models",
-                                        "calibration_result.yaml"))
+        os.path.exists(produced_path("outcome_fn", run_dir))
+        or os.path.exists(artifact_path("sensitivity_analysis", run_dir))
+        or os.path.exists(artifact_path("calibration_result", run_dir))
         or os.path.isdir(os.path.join(run_dir, "models"))
     )
 
@@ -3132,9 +3862,10 @@ def _check_effort_floors(run_dir: str,
     # violations or stale PASS results after the modeler changes outputs/code.
     mod = _load_effort_floors_module()
     if mod is None:
+        # Phase 21 β: fail closed — an unevaluable floor set is HIGH.
         return [{
             "kind": "effort_floors_unavailable",
-            "severity": "MEDIUM",
+            "severity": "HIGH",
             "stage": "GATE",
             "claim": (
                 "effort_floors_report.yaml cannot be refreshed because "
@@ -3146,10 +3877,10 @@ def _check_effort_floors(run_dir: str,
     try:
         rep = mod.evaluate(run_dir)
         mod.write_report(run_dir, rep)
-    except (ValueError, FileNotFoundError) as e:
+    except Exception as e:  # noqa: BLE001 — Phase 21 β: fail closed
         return [{
             "kind": "effort_floors_unavailable",
-            "severity": "MEDIUM",
+            "severity": "HIGH",
             "stage": "GATE",
             "claim": (f"Could not compute effort floors: {e}. "
                       f"Run `python3 scripts/effort_floors.py {run_dir}` "
@@ -3245,6 +3976,9 @@ def _check_effort_floors(run_dir: str,
             "kind": f"effort_floor_{floor_id}",
             "severity": severity,
             "stage": "MODEL",
+            # Phase 21 β: carried to the decision — a non-declarable floor
+            # open at round exhaustion is RUN_FAILED, not DECLARE_SCOPE.
+            "scope_declarable": scope_declarable,
             "claim": (
                 f"Effort floor `{floor_id}` violated{scope_tag}: "
                 f"observed {observed!r} below minimum {minimum!r}"
@@ -3257,6 +3991,96 @@ def _check_effort_floors(run_dir: str,
         })
 
     return out
+
+
+# ---------------------------------------------------------------------------
+# Phase 21 β — scope_declaration.yaml normalization
+# ---------------------------------------------------------------------------
+#
+# Real runs used at least eight different top-level keys for their
+# declarations (`declarations`, `scope_declarations`, `unresolved_blockers`,
+# `unresolved_high_blockers`, `acknowledged_limitations`, ...), referenced
+# blockers via `blocker_id`, lists of ids, or ids embedded in prose, and
+# marked some entries `status: RESOLVED`. The Phase 19 β budget counted only
+# `declarations:` entries with `id`/`claim`, so any other shape burned zero
+# budget; the pre-mortem check accepted any substring anywhere in the file.
+# One normalizer now feeds both.
+
+_BLOCKER_ID_RE = re.compile(r"\b[A-Z][A-Z0-9]{0,5}-\d{2,4}\b")
+_STRUCTURED_ID_FIELDS = ("blocker_id", "blocker_ids", "blockers", "covers",
+                         "concern_id", "concern_ids", "ids", "acknowledges",
+                         "blocker")
+_JUSTIFICATION_FIELDS = ("why_unresolved", "justification", "rationale",
+                         "claim", "reason", "impact_on_conclusions",
+                         "description")
+_NON_DECLARATION_KEYS = frozenset({"budget", "version", "run_dir",
+                                   "generated_at", "declared_at"})
+
+
+def _load_scope_declarations(run_dir: str
+                             ) -> tuple[Optional[dict], list[dict], list[dict]]:
+    """Return (doc, entries, findings) for scope_declaration.yaml.
+
+    `entries` is every mapping found in any top-level list (except the
+    `budget` block and metadata keys), plus any top-level mapping value
+    that itself looks like a declaration (has an id field). Entries with
+    `status: RESOLVED` are dropped — they declare nothing.
+    """
+    path = artifact_path("scope_declaration", run_dir)
+    doc, findings = safe_load_mapping(path, "scope_declaration", stage="GATE",
+                                      display_path="scope_declaration.yaml")
+    if doc is None:
+        return None, [], findings
+    entries: list[dict] = []
+    for key, val in doc.items():
+        if key in _NON_DECLARATION_KEYS:
+            continue
+        items = val if isinstance(val, list) else (
+            [dict(val, id=val.get("id", key))]
+            if isinstance(val, dict) else [])
+        for e in items:
+            if isinstance(e, dict):
+                if str(e.get("status") or "").strip().upper() == "RESOLVED":
+                    continue
+                entries.append(e)
+            elif isinstance(e, str) and e.strip():
+                entries.append({"claim": e})
+            else:
+                entries.append({})
+    return doc, entries, findings
+
+
+def _strings_in(obj: Any) -> list[str]:
+    if isinstance(obj, str):
+        return [obj]
+    if isinstance(obj, dict):
+        return [s for v in obj.values() for s in _strings_in(v)]
+    if isinstance(obj, list):
+        return [s for v in obj for s in _strings_in(v)]
+    return []
+
+
+def _entry_declared_ids(entry: dict, structured_only: bool) -> set[str]:
+    """Blocker ids an entry declares. Structured fields always count;
+    with structured_only=False, ids mentioned anywhere in the entry's
+    text count too (one entry listing 20 ids declares 20 blockers).
+    The entry's own `id` (e.g. SD-001) is not a blocker reference unless
+    it is the only identifier present."""
+    ids: set[str] = set()
+    for f in _STRUCTURED_ID_FIELDS:
+        v = entry.get(f)
+        for x in (v if isinstance(v, list) else [v]):
+            if isinstance(x, (str, int)) and str(x).strip():
+                ids.add(str(x).strip())
+    if not structured_only:
+        own = str(entry.get("id") or "")
+        for txt in _strings_in({k: v for k, v in entry.items() if k != "id"}):
+            ids.update(m for m in _BLOCKER_ID_RE.findall(txt) if m != own)
+    return ids
+
+
+def _entry_has_justification(entry: dict) -> bool:
+    return any(str(entry.get(f) or "").strip() for f in _JUSTIFICATION_FIELDS)
 
 
 # Phase 19 β — scope-declaration budget cap. Default is 3 declarations
@@ -3293,34 +4117,15 @@ def _check_scope_declaration_budget(run_dir: str,
     if round_n is None or round_n < _SCOPE_BUDGET_ENFORCE_FROM_ROUND:
         return []
 
-    path = os.path.join(run_dir, "scope_declaration.yaml")
-    if not os.path.exists(path):
-        return []  # No declarations at all is the most common case; silent.
+    doc, entries, findings = _load_scope_declarations(run_dir)
+    if doc is None:
+        # Absent → silent (most common case). Unparseable / non-mapping →
+        # the safe_io HIGH is downgraded to the historical MEDIUM here;
+        # the declarations it may contain are unusable either way.
+        return [dict(f, severity="MEDIUM") for f in findings]
 
-    try:
-        with open(path) as f:
-            doc = yaml.safe_load(f) or {}
-    except (yaml.YAMLError, OSError) as e:
-        return [{
-            "kind": "scope_declaration_invalid",
-            "severity": "MEDIUM",
-            "stage": "GATE",
-            "claim": (f"scope_declaration.yaml could not be parsed: {e}. "
-                      f"Phase 19 β requires a valid YAML doc to count "
-                      f"declarations against the budget."),
-        }]
-
-    if not isinstance(doc, dict):
-        return [{
-            "kind": "scope_declaration_invalid",
-            "severity": "MEDIUM",
-            "stage": "GATE",
-            "claim": ("scope_declaration.yaml top level must be a "
-                      "mapping with a `declarations:` list."),
-        }]
-
-    decls_raw = doc.get("declarations") or []
-    if not isinstance(decls_raw, list):
+    decls_raw = doc.get("declarations")
+    if decls_raw is not None and not isinstance(decls_raw, list):
         return [{
             "kind": "scope_declaration_invalid",
             "severity": "MEDIUM",
@@ -3328,14 +4133,19 @@ def _check_scope_declaration_budget(run_dir: str,
             "claim": ("scope_declaration.yaml: `declarations:` must be a list."),
         }]
 
-    # Count substantive declarations; flag empty ones as advisory.
+    # Phase 21 β: budget unit is the distinct blocker id declared, across
+    # every list in the file. Entries that reference no id but carry
+    # substance count 1 each; empty entries are advisory only.
+    declared: set[str] = set()
     counted: list[dict] = []
     empties = 0
-    for entry in decls_raw:
-        if not isinstance(entry, dict):
-            empties += 1
-            continue
-        if entry.get("id") or entry.get("claim"):
+    for i, entry in enumerate(entries):
+        ids = _entry_declared_ids(entry, structured_only=False)
+        if ids:
+            declared.update(ids)
+            counted.append(entry)
+        elif entry.get("id") or _entry_has_justification(entry):
+            declared.add(str(entry.get("id") or f"<entry {i + 1}>"))
             counted.append(entry)
         else:
             empties += 1
@@ -3407,21 +4217,18 @@ def _check_scope_declaration_budget(run_dir: str,
             ),
         })
 
-    n_used = len(counted)
+    n_used = len(declared)
     if n_used > cap:
         # Build a compact preview of the over-cap declarations.
-        previews = []
-        for d in counted[:6]:
-            tag = d.get("id") or str(d.get("claim", ""))[:60]
-            previews.append(str(tag))
-        preview_str = "; ".join(previews)
+        preview_str = "; ".join(sorted(declared)[:8])
         out.append({
             "kind": "scope_declaration_budget_exceeded",
             "severity": "HIGH",
             "stage": "GATE",
             "claim": (
                 f"Scope-declaration budget exceeded: {n_used} declarations "
-                f"vs cap {cap} (Phase 19 β default {_SCOPE_DECLARATION_DEFAULT_CAP}, "
+                f"vs cap {cap} (distinct blocker ids across {len(counted)} "
+                f"entries;  (Phase 19 β default {_SCOPE_DECLARATION_DEFAULT_CAP}, "
                 f"hard ceiling {_SCOPE_DECLARATION_HARD_CEILING}). "
                 f"Declarations: {preview_str}. Either resolve some of "
                 f"these in the next round (each scope-declaration is a "
@@ -3490,8 +4297,7 @@ def _check_benchmark_match(run_dir: str,
     if round_n is None:
         return []
 
-    targets_path = os.path.join(run_dir, "models", "benchmark_targets.yaml")
-    report_path = os.path.join(run_dir, "benchmark_match.yaml")
+    targets_path = artifact_path("benchmark_targets", run_dir)
     drafting = round_n < _BENCHMARK_MATCH_ENFORCE_FROM_ROUND
     out: list[dict] = []
 
@@ -3525,7 +4331,7 @@ def _check_benchmark_match(run_dir: str,
     if mod is None:
         return [{
             "kind": "benchmark_match_unavailable",
-            "severity": "MEDIUM",
+            "severity": "HIGH",  # Phase 21 β: fail closed
             "stage": "GATE",
             "claim": (
                 "benchmark_match.yaml cannot be refreshed because "
@@ -3537,15 +4343,24 @@ def _check_benchmark_match(run_dir: str,
     try:
         rep = mod.evaluate(run_dir)
         mod.write_report(run_dir, rep)
-    except (ValueError, FileNotFoundError) as e:
+    except Exception as e:  # noqa: BLE001 — Phase 21 β: fail closed
         return [{
             "kind": "benchmark_match_unavailable",
-            "severity": "MEDIUM",
+            "severity": "HIGH",
             "stage": "GATE",
             "claim": f"benchmark_match evaluation failed: {e}",
         }]
 
     verdict = str(rep.get("verdict") or "PENDING").upper()
+    if verdict not in _PRODUCER_VERDICTS["benchmark_match"]:
+        return [{
+            "kind": "benchmark_match_unknown_verdict",
+            "severity": "HIGH",
+            "stage": "GATE",
+            "scope_declarable": False,
+            "claim": (f"benchmark_match returned verdict {verdict!r}, outside "
+                      f"{list(_PRODUCER_VERDICTS['benchmark_match'])}."),
+        }]
     if verdict == "MALFORMED":
         sev = "MEDIUM" if drafting else "HIGH"
         return [{
@@ -3561,9 +4376,16 @@ def _check_benchmark_match(run_dir: str,
             ),
         }]
 
-    results = rep.get("results") or []
+    results = rep.get("results")
+    if results is None:
+        results = []
     if not isinstance(results, list):
-        return out
+        return [{
+            "kind": "benchmark_match_invalid",
+            "severity": "HIGH",
+            "stage": "MODEL",
+            "claim": "benchmark_match result `results` must be a list.",
+        }]
 
     # Per-target violations (one HIGH per drifted target; HIGH per
     # missing-computed target). At round 1 → demote to MEDIUM.
@@ -3578,7 +4400,9 @@ def _check_benchmark_match(run_dir: str,
         if observed is None:
             missing_computed.append(r)
             continue
-        if within is False:
+        # Phase 21 β: anything but an explicit True is drift (a missing or
+        # non-boolean within_band must not pass silently).
+        if within is not True:
             drifted.append(r)
 
     # Emit. Cap each list at 5 to avoid swamping the gate (Phase 10 ψ
@@ -3602,8 +4426,9 @@ def _check_benchmark_match(run_dir: str,
         })
     if len(drifted) > 5:
         out.append({
-            "kind": "benchmark_drift_advisory",
-            "severity": "MEDIUM",
+            # Phase 21 β: overflow stays a blocker at the same severity.
+            "kind": "benchmark_drift",
+            "severity": "MEDIUM" if drafting else "HIGH",
             "stage": "MODEL",
             "claim": (
                 f"{len(drifted) - 5} additional benchmark(s) drifted; "
@@ -3664,7 +4489,7 @@ def _check_sufficiency_critic(run_dir: str,
     if not os.path.exists(report_path):
         return []
 
-    yaml_path = os.path.join(run_dir, "critique_sufficiency.yaml")
+    yaml_path = artifact_path("critique_sufficiency", run_dir)
     drafting = round_n < _SUFFICIENCY_ENFORCE_FROM_ROUND
     out: list[dict] = []
 
@@ -3683,42 +4508,64 @@ def _check_sufficiency_critic(run_dir: str,
             ),
         }]
 
-    try:
-        with open(yaml_path) as f:
-            doc = yaml.safe_load(f) or {}
-    except (yaml.YAMLError, OSError) as e:
-        return [{
-            "kind": "critique_sufficiency_invalid",
-            "severity": "HIGH",
-            "stage": "WRITE",
-            "claim": (f"critique_sufficiency.yaml could not be parsed: "
-                      f"{e}. Re-spawn the critique-sufficiency agent."),
-        }]
+    # Phase 21 β: fail closed on shape (renamed key `verdicts:` → invalid).
+    doc, invalid = safe_load_mapping(
+        yaml_path, "critique_sufficiency", stage="WRITE",
+        required_keys=["claim_verdicts"],
+        expected_types={"claim_verdicts": list},
+        display_path="critique_sufficiency.yaml")
+    if doc is None:
+        return invalid
+    verdicts = doc["claim_verdicts"]
 
-    verdicts = doc.get("claim_verdicts") or []
-    if not isinstance(verdicts, list):
-        return [{
-            "kind": "critique_sufficiency_invalid",
-            "severity": "HIGH",
-            "stage": "WRITE",
-            "claim": ("critique_sufficiency.yaml: `claim_verdicts:` "
-                      "must be a list."),
-        }]
-
+    allowed = _PRODUCER_VERDICTS["critique_sufficiency_claim"]
     overclaimed = []
+    unknown = []
     for v in verdicts:
         if not isinstance(v, dict):
+            unknown.append(repr(v)[:60])
             continue
-        if str(v.get("verdict") or "").upper() == "OVERCLAIMED":
+        verdict = str(v.get("verdict") or "").strip().upper()
+        if verdict not in allowed:
+            unknown.append(f"{v.get('claim_id', '?')}={verdict or '<empty>'}")
+        elif verdict == "OVERCLAIMED":
             overclaimed.append(v)
+    if unknown:
+        out.append({
+            "kind": "critique_sufficiency_unknown_verdict",
+            "severity": "HIGH",
+            "stage": "WRITE",
+            "scope_declarable": False,
+            "claim": (f"critique_sufficiency.yaml has claim verdict(s) "
+                      f"outside {list(allowed)}: {unknown[:6]}."),
+        })
 
-    # Phase 20 β: pilot-run escape hatch. The agent honors a top-level
-    # `PILOT_RUN` entry in scope_declaration.yaml by emitting
-    # `pilot_run_acknowledged: true`; the validator demotes
-    # OVERCLAIMED → MEDIUM in that case. A pilot is a temporary scope —
-    # the pilot declaration itself stays visible to the next round, so
-    # the modeler can't permanently silence the gate.
-    pilot_acknowledged = bool(doc.get("pilot_run_acknowledged"))
+    # Phase 20 β: pilot-run escape hatch. Phase 21 β: the critic's
+    # `pilot_run_acknowledged: true` only demotes when scope_declaration.yaml
+    # really contains a PILOT_RUN entry with a justification; otherwise
+    # it is HIGH `pilot_run_unbacked` and no demotion happens.
+    pilot_acknowledged = False
+    if doc.get("pilot_run_acknowledged"):
+        _sd, sd_entries, _ = _load_scope_declarations(run_dir)
+        backed = any(
+            "PILOT_RUN" in {str(e.get("id") or "").upper(),
+                            str(e.get("category") or "").upper()}
+            and _entry_has_justification(e)
+            for e in sd_entries)
+        if backed:
+            pilot_acknowledged = True
+        else:
+            out.append({
+                "kind": "pilot_run_unbacked",
+                "severity": "HIGH",
+                "stage": "WRITE",
+                "scope_declarable": False,
+                "claim": ("critique_sufficiency.yaml sets "
+                          "`pilot_run_acknowledged: true` but "
+                          "scope_declaration.yaml has no `id: PILOT_RUN` "
+                          "entry with a justification. OVERCLAIMED "
+                          "verdicts are not demoted."),
+            })
 
     # Emit per-claim HIGH (or MEDIUM in drafting window), capped at 5.
     sev = "MEDIUM" if drafting else "HIGH"
@@ -3765,7 +4612,9 @@ def _check_sufficiency_critic(run_dir: str,
 
 
 def _check_persistent_medium_escalation(run_dir: str,
-                                        round_n: int) -> list[dict]:
+                                        round_n: int,
+                                        current_kinds: Optional[set] = None
+                                        ) -> list[dict]:
     """Phase 12 Commit β: scan stage7_round*_stderr.txt for validator
     MEDIUMs that have persisted across multiple rounds and the round
     critique YAMLs for blocker MEDIUMs with old `first_seen_round`.
@@ -3774,6 +4623,10 @@ def _check_persistent_medium_escalation(run_dir: str,
 
     Returns a list of HIGH `<kind>_persistent` and
     `<id>_persistent` violations. Silent if nothing escalates.
+
+    Phase 21 β: Path A now reads validator_history.jsonl (appended by
+    the validator on every invocation) plus `current_kinds` from this
+    invocation. The text below describes the pre-21 limitation.
 
     Known limitation (Path A — validator-kind escalation): persistence
     is counted by scanning `stage7_round{N}_stderr.txt` files in the
@@ -3788,11 +4641,19 @@ def _check_persistent_medium_escalation(run_dir: str,
     """
     out: list[dict] = []
 
-    # --- Path A: validator-kind escalation via stderr scan ---
-    # The lead writes stage7_round{N}_stderr.txt at gate time.
-    # Count the distinct rounds where each tracked kind appears.
+    # --- Path A: validator-kind escalation ---
+    # Phase 21 β: rounds come from validator_history.jsonl (written by the
+    # validator itself) plus the current invocation's kinds; legacy
+    # stage7_round{N}_stderr.txt files are still read when present.
     rounds_with_kind: dict[str, set[int]] = {
         kind: set() for kind in _VALIDATOR_KIND_ESCALATION_THRESHOLDS}
+    for rnd, kinds in _load_validator_history(run_dir).items():
+        for kind in _VALIDATOR_KIND_ESCALATION_THRESHOLDS:
+            if kind in kinds:
+                rounds_with_kind[kind].add(rnd)
+    for kind in (current_kinds or ()):
+        if kind in rounds_with_kind:
+            rounds_with_kind[kind].add(int(round_n))
     for entry in os.listdir(run_dir) if os.path.isdir(run_dir) else []:
         m = re.match(r"stage7_round(\d+)_stderr\.txt$", entry)
         if not m:
@@ -3941,7 +4802,7 @@ def _check_decision_rule_artifact(run_dir: str) -> list[dict]:
             "stage": "DECISION_RULE",
             "claim": (
                 f"Allocation CSV(s) present ({', '.join(os.path.basename(p) for p in allocations)}) "
-                f"but decision_rule.md is absent. A 774-row table is not a "
+                f"but decision_rule.md is absent. A per-unit table is not a "
                 f"defensible policy artifact. Write decision_rule.md per the "
                 f"decision-rule-extraction skill — tabular, tree, prose, or "
                 f"non-compressible with justification."
@@ -4155,13 +5016,19 @@ _SELF_REFERENCE_TOKENS = (
     "optimizer's choice",
     "optimizer output",
     "optimized choice",
-    "budget cut",
+    # Phase 21 β: "budget cut" removed — "under a 20% budget cut, drop X"
+    # is a legitimate scenario branch on an input, not a self-reference.
     "funded set",
     "in the funded",
     "cost-effective enough",
     "cost effective enough",
     "fall within the budget",
-    "ranked by",
+    # Phase 21 β: bare "ranked by" matched input-feature rankings
+    # ("ranked by baseline incidence"); only model/optimizer rankings
+    # are self-referential.
+    "ranked by the model",
+    "ranked by the optimizer",
+    "ranked by optimizer",
     "selected by the model",
     "the model recommends",
     # Phase 5 ε (budget-availability patterns)
@@ -4183,50 +5050,59 @@ _SELF_REFERENCE_TOKENS = (
 def _incorporate_rigor_violations(decision: dict, violations: list[dict],
                                   max_rounds: int, current_round: int) -> dict:
     """Fold rigor-artifact violations into unresolved_high (for HIGH) or
-    attach for visibility (for MEDIUM). Uses RIG-NNN prefix."""
+    attach for visibility (for MEDIUM). Uses RIG-NNN prefix.
+
+    Phase 21 β: each RIG entry keeps `kind` and `scope_declarable` (so the
+    non-declarable contract survives to the decision), and `first_seen_round`
+    comes from the violation when the validator history knows it.
+    `required_artifact_missing` violations become `accept_blockers`
+    regardless of severity. Idempotent.
+    """
     d = dict(decision)
+    d["unresolved_high"] = list(d.get("unresolved_high") or [])
+    d["accept_blockers"] = list(d.get("accept_blockers") or [])
     d["rigor_violations"] = violations
 
-    base_id = len([b for b in d["unresolved_high"]
-                   if b.get("reviewer") == "rigor-artifacts"])
-    for i, v in enumerate(
-            [x for x in violations if x["severity"] == "HIGH"],
-            start=base_id + 1):
-        d["unresolved_high"].append({
-            "reviewer": "rigor-artifacts",
-            "id": f"RIG-{i:03d}",
+    entries = []
+    seen_accept = {(b.get("kind"), b.get("claim")) for b in d["accept_blockers"]}
+    for v in violations:
+        if v.get("accept_blocker"):
+            key = (v.get("kind"), v.get("claim"))
+            if key not in seen_accept:
+                seen_accept.add(key)
+                d["accept_blockers"].append({
+                    "reviewer": "rigor-artifacts",
+                    "id": f"REQ-{len(d['accept_blockers']) + 1:03d}",
+                    "category": "METHODS",
+                    "target_stage": v.get("target_stage", "MODEL"),
+                    "first_seen_round": v.get("first_seen_round", current_round),
+                    "claim": v["claim"],
+                    "kind": v["kind"],
+                    "scope_declarable": not is_non_declarable(
+                        v["kind"], v.get("scope_declarable")),
+                })
+            continue
+        if v.get("severity") != "HIGH":
+            continue
+        entries.append({
             "category": "METHODS",
             "target_stage": "MODEL",
-            "first_seen_round": current_round,
-            "claim": f"{v['stage']}/{v['kind']}: {v['claim']}",
+            "first_seen_round": v.get("first_seen_round", current_round),
+            "claim": f"{v.get('stage', '?')}/{v['kind']}: {v.get('claim', '')}",
+            "kind": v["kind"],
+            "scope_declarable": not is_non_declarable(
+                v["kind"], v.get("scope_declarable")),
         })
+    _append_synthetic_blockers(d, "rigor-artifacts", "RIG", entries)
 
-    # Recompute action (same rule ordering).
-    unresolved_high = d["unresolved_high"]
-    structural = d.get("structural_mismatch", False)
-    rounds_remaining = max_rounds - current_round
-
-    if structural:
-        action = "RETHINK_STRUCTURAL" if rounds_remaining > 0 else "RUN_FAILED"
-        rule_matched = 1
-    elif unresolved_high and rounds_remaining > 0:
-        action = "PATCH_OR_RETHINK"
-        rule_matched = 2
-    elif unresolved_high and rounds_remaining <= 0:
-        action = "DECLARE_SCOPE"
-        rule_matched = 3
-    else:
-        action = "ACCEPT"
-        rule_matched = 4
-
-    d["action"] = action
-    d["rule_matched"] = rule_matched
-    if rule_matched in (1, 2):
-        d["rationale"] = (
-            f"{len(unresolved_high)} HIGH blocker(s) unresolved (incl. rigor), "
-            f"{rounds_remaining} round(s) remaining. ACCEPT is forbidden."
-        )
-    return d
+    # Phase 21 β: rigor HIGHs persisting >= the Phase 5 ζ threshold also
+    # require escalation (first_seen_round comes from validator history).
+    if any(b.get("reviewer") == "rigor-artifacts"
+           and current_round - int(b.get("first_seen_round") or current_round)
+           >= _ESCALATION_HIGH_THRESHOLD
+           for b in d["unresolved_high"]):
+        d["escalation_required"] = True
+    return _recompute_action(d, max_rounds, current_round, "rigor")
 
 
 def incorporate_registry_violations(decision: dict, violations: list[dict],
@@ -4254,57 +5130,19 @@ def incorporate_registry_violations(decision: dict, violations: list[dict],
     Idempotent: calling twice yields identical output.
     """
     d = dict(decision)
+    d["unresolved_high"] = list(d.get("unresolved_high") or [])
     d["registry_violations"] = violations
-
-    base_id = len([b for b in d["unresolved_high"]
-                   if b.get("reviewer") == "effect-size-registry"])
-    for i, v in enumerate(
-            [x for x in violations if x["severity"] == "HIGH"],
-            start=base_id + 1):
-        d["unresolved_high"].append({
-            "reviewer": "effect-size-registry",
-            "id": f"REG-{i:03d}",
-            "category": "CITATIONS",
-            "target_stage": "MODEL",
-            "first_seen_round": current_round,
-            "claim": f"{v['kind']} ({v['name']}): {v['claim']}",
-        })
-
-    # Recompute action using the same rule ordering. If spec-compliance has
-    # also been run and set structural=True, the structural rule still fires
-    # first; registry violations just add HIGHs underneath.
-    unresolved_high = d["unresolved_high"]
-    structural = d.get("structural_mismatch", False)
-    rounds_remaining = max_rounds - current_round
-
-    if structural:
-        action = "RETHINK_STRUCTURAL" if rounds_remaining > 0 else "RUN_FAILED"
-        rule_matched = 1
-        rationale = d.get("rationale", "")
-    elif unresolved_high and rounds_remaining > 0:
-        action = "PATCH_OR_RETHINK"
-        rationale = (
-            f"{len(unresolved_high)} HIGH blocker(s) unresolved "
-            f"(incl. registry), {rounds_remaining} round(s) remaining. "
-            f"ACCEPT is forbidden."
-        )
-        rule_matched = 2
-    elif unresolved_high and rounds_remaining <= 0:
-        action = "DECLARE_SCOPE"
-        rationale = (
-            f"{len(unresolved_high)} HIGH blocker(s) unresolved, rounds "
-            f"exhausted. Must write scope_declaration.yaml."
-        )
-        rule_matched = 3
-    else:
-        action = "ACCEPT"
-        rationale = "No unresolved HIGH blockers, no structural mismatch."
-        rule_matched = 4
-
-    d["action"] = action
-    d["rule_matched"] = rule_matched
-    d["rationale"] = rationale
-    return d
+    entries = [{
+        "category": "CITATIONS",
+        "target_stage": "MODEL",
+        "first_seen_round": current_round,
+        "claim": f"{v['kind']} ({v.get('name', '?')}): {v.get('claim', '')}",
+        "kind": v["kind"],
+        "scope_declarable": not is_non_declarable(
+            v["kind"], v.get("scope_declarable")),
+    } for v in violations if v.get("severity") == "HIGH"]
+    _append_synthetic_blockers(d, "effect-size-registry", "REG", entries)
+    return _recompute_action(d, max_rounds, current_round, "registry")
 
 
 def incorporate_spec_violations(decision: dict, violations: list[dict],
@@ -4313,31 +5151,27 @@ def incorporate_spec_violations(decision: dict, violations: list[dict],
 
     Framework / approach HIGH violations force `structural_mismatch=True`
     (the mechanical backstop: critiques missed an architectural issue, so
-    the gate itself catches it). Budget / archetype HIGH violations add
-    synthetic `OBJ-NNN` blockers to `unresolved_high`. MEDIUM violations
-    are attached for visibility but do not change the action.
+    the gate itself catches it). Other HIGH violations (budget envelope,
+    unit-count, vintage) add synthetic `OBJ-NNN` blockers to
+    `unresolved_high`. MEDIUM violations are attached for visibility but
+    do not change the action.
+
+    Phase 21 β: every HIGH that is not structural becomes an OBJ blocker
+    (previously only an allowlist of kinds did, so a new spec_compliance
+    HIGH — e.g. budget_exceeded — would have been silently dropped).
 
     This function is idempotent: calling it twice yields identical output.
     """
-    # Start from the existing decision; we'll mutate a shallow copy.
     d = dict(decision)
+    d["unresolved_high"] = list(d.get("unresolved_high") or [])
     d["spec_violations"] = violations
     structural_kinds = {"framework_missing", "approach_mismatch"}
-    # Phase 3 B+D extends objective_kinds with vintage, methodology,
-    # and bound-weak archetype categories.
-    objective_kinds = {
-        "budget_underutilized",
-        "archetype_aggregation_unvalidated",
-        "archetype_bound_weak",
-        "data_vintage_stale",
-        "methodology_vintage_stale",
-        "vintage_unstructured",
-    }
 
     high_struct = [v for v in violations
                    if v["severity"] == "HIGH" and v["kind"] in structural_kinds]
     high_objective = [v for v in violations
-                      if v["severity"] == "HIGH" and v["kind"] in objective_kinds]
+                      if v["severity"] == "HIGH"
+                      and v["kind"] not in structural_kinds]
 
     # Force structural_mismatch when any structural HIGH violation exists.
     if high_struct:
@@ -4347,66 +5181,18 @@ def incorporate_spec_violations(decision: dict, violations: list[dict],
             reviewers.append("spec-compliance")
         d["structural_reviewers"] = reviewers
 
-    # Add synthetic blockers for objective HIGH violations.
-    base_id = len([b for b in d["unresolved_high"]
-                   if b.get("reviewer") == "spec-compliance"])
-    for i, v in enumerate(high_objective, start=base_id + 1):
-        d["unresolved_high"].append({
-            "reviewer": "spec-compliance",
-            "id": f"OBJ-{i:03d}",
-            "category": "STRUCTURAL",  # re-route via STRUCTURAL so PATCH heuristic
-                                        # escalates to RETHINK if it recurs.
-            "target_stage": "MODEL",
-            "first_seen_round": current_round,
-            "claim": f"{v['kind']}: {v['evidence']}",
-        })
-
-    # Recompute action from the adjusted state (same rule ordering as decide()).
-    unresolved_high = d["unresolved_high"]
-    structural = d["structural_mismatch"]
-    rounds_remaining = max_rounds - current_round
-
-    if structural:
-        if rounds_remaining > 0:
-            action = "RETHINK_STRUCTURAL"
-            rationale = (
-                f"Structural mismatch detected by {d['structural_reviewers']}. "
-                f"Must RETHINK — not patchable, not scope-declarable."
-            )
-        else:
-            action = "RUN_FAILED"
-            rationale = (
-                f"Structural mismatch detected by {d['structural_reviewers']} "
-                f"with no rounds remaining. Run fails: delivered model does "
-                f"not answer the question. Do NOT spawn writer."
-            )
-        rule_matched = 1
-    elif unresolved_high and rounds_remaining > 0:
-        action = "PATCH_OR_RETHINK"
-        rationale = (
-            f"{len(unresolved_high)} HIGH blocker(s) unresolved "
-            f"(incl. spec-compliance), {rounds_remaining} round(s) "
-            f"remaining. ACCEPT is forbidden."
-        )
-        rule_matched = 2
-    elif unresolved_high and rounds_remaining <= 0:
-        action = "DECLARE_SCOPE"
-        rationale = (
-            f"{len(unresolved_high)} HIGH blocker(s) unresolved, rounds "
-            f"exhausted. Must write scope_declaration.yaml acknowledging "
-            f"each blocker by id, and writer must embed verbatim in "
-            f"Limitations. DECLARE_SCOPE is NOT the same as ACCEPT."
-        )
-        rule_matched = 3
-    else:
-        action = "ACCEPT"
-        rationale = "No unresolved HIGH blockers, no structural mismatch."
-        rule_matched = 4
-
-    d["action"] = action
-    d["rule_matched"] = rule_matched
-    d["rationale"] = rationale
-    return d
+    entries = [{
+        "category": "STRUCTURAL",  # re-route via STRUCTURAL so PATCH heuristic
+                                    # escalates to RETHINK if it recurs.
+        "target_stage": "MODEL",
+        "first_seen_round": current_round,
+        "claim": f"{v['kind']}: {v.get('evidence', v.get('claim', ''))}",
+        "kind": v["kind"],
+        "scope_declarable": not is_non_declarable(
+            v["kind"], v.get("scope_declarable")),
+    } for v in high_objective]
+    _append_synthetic_blockers(d, "spec-compliance", "OBJ", entries)
+    return _recompute_action(d, max_rounds, current_round, "spec-compliance")
 
 
 def render_text(decision: dict, current_round: int, max_rounds: int) -> str:
@@ -4417,7 +5203,15 @@ def render_text(decision: dict, current_round: int, max_rounds: int) -> str:
     for b in decision["unresolved_high"]:
         lines.append(f"    - {b['reviewer']} {b['id']} "
                      f"(target={b['target_stage']}, "
-                     f"since round {b['first_seen_round']}): {b['claim'][:100]}")
+                     f"since round {b['first_seen_round']})"
+                     f"{' [NOT scope-declarable]' if is_non_declarable(b.get('kind'), b.get('scope_declarable')) and b.get('kind') != 'critique_blocker' else ''}"
+                     f": {b['claim'][:100]}")
+    accept_blockers = decision.get("accept_blockers") or []
+    if accept_blockers:
+        lines.append(f"  accept_blockers (required artifacts missing): "
+                     f"{len(accept_blockers)}")
+        for b in accept_blockers:
+            lines.append(f"    - {b['id']}: {b['claim'][:140]}")
     lines.append(f"  structural_mismatch: {decision['structural_mismatch']}"
                  + (f" (from: {decision['structural_reviewers']})"
                     if decision["structural_mismatch"] else ""))
@@ -4506,8 +5300,18 @@ def _run_self_test() -> int:
         va = _check_uq_ci_quality(uq_a)
         ok(any(v["kind"] == "ci_degenerate" for v in va),
            f"A1: expected ci_degenerate on optimizer-bounded cost, got {va}")
-        ok(all(v["severity"] == "MEDIUM" for v in va),
-           f"A1: ci_degenerate must be MEDIUM, got {[v['severity'] for v in va]}")
+        # Phase 21 β: raised to HIGH, not scope-declarable.
+        ok(all(v["severity"] == "HIGH" and v.get("scope_declarable") is False
+               for v in va),
+           f"A1: ci_degenerate must be HIGH non-declarable, got {va}")
+        # A1b: explicit deterministic declaration with a reason → silent.
+        os.makedirs(os.path.join(d, "models"), exist_ok=True)
+        with open(os.path.join(d, "models", "uq_declarations.yaml"), "w") as f:
+            f.write("deterministic_outputs:\n"
+                    "  total_cost_3yr: 'Budget constraint binds.'\n")
+        ok(_check_uq_ci_quality(uq_a) == [],
+           "A1b: declared deterministic output must be silent")
+        os.remove(os.path.join(d, "models", "uq_declarations.yaml"))
 
         # Case A2: legitimate wide CI — should NOT fire.
         uq_b = os.path.join(d, "uq_b.yaml")
@@ -4535,7 +5339,105 @@ def _run_self_test() -> int:
                 "    n: 200\n"
             )
         vc = _check_uq_ci_quality(uq_c)
-        ok(not vc, f"A3: zero-mean output should be skipped, got {vc}")
+        # Phase 21 β: an exactly-zero-width interval is degenerate even at
+        # mean 0; a zero-mean output with real spread is not.
+        ok(any(v["kind"] == "ci_degenerate" for v in vc),
+           f"A3: zero-mean zero-width output must fire, got {vc}")
+        uq_c2 = os.path.join(d, "uq_c2.yaml")
+        with open(uq_c2, "w") as f:
+            f.write("scalar_outputs:\n  net_change:\n    mean: 0\n"
+                    "    ci_low: -5\n    ci_high: 5\n")
+        ok(_check_uq_ci_quality(uq_c2) == [],
+           "A3b: zero-mean output with spread is silent")
+
+        # Phase 21 β cases A5-A9.
+        def _uq(name, text):
+            pth = os.path.join(d, name)
+            with open(pth, "w") as f:
+                f.write(text)
+            return _check_uq_ci_quality(pth)
+        v5 = _uq("uq5.yaml", "scalar_outputs:\n  x:\n    mean: .nan\n"
+                             "    ci_low: 1\n    ci_high: 2\n")
+        ok([v["kind"] for v in v5] == ["uq_output_nonfinite"],
+           f"A5: NaN mean → uq_output_nonfinite, got {v5}")
+        v6 = _uq("uq6.yaml", "n_draws: 1\nscalar_outputs:\n  x:\n"
+                             "    mean: 3\n    ci_low: 3\n    ci_high: 3\n")
+        ok(v6 == [], f"A6: single draw → no degenerate finding, got {v6}")
+        v7 = _uq("uq7.yaml", "- not a mapping\n")
+        ok([v["kind"] for v in v7] == ["uncertainty_report_invalid"],
+           f"A7: list top-level → invalid, got {v7}")
+        v8 = _uq("uq8.yaml", "scalar_outputs:\n  x:\n    mean: 3\n"
+                             "    ci_low: 3\n    ci_high: 3\n"
+                             "    deterministic: true\n"
+                             "    deterministic_reason: fixed by design\n")
+        ok(v8 == [], f"A8: per-output deterministic + reason silent, got {v8}")
+        v9 = _uq("uq9.yaml", "scalar_outputs:\n  x:\n    mean: 3\n"
+                             "    ci_low: 3\n    ci_high: 3\n"
+                             "    deterministic: true\n")
+        ok(any(v["kind"] == "ci_degenerate" for v in v9),
+           f"A9: deterministic without reason still fires, got {v9}")
+        v10 = _uq("uq10.yaml", "degenerate_outputs: [x]\nscalar_outputs:\n"
+                               "  x:\n    mean: 3\n    ci_low: 1\n"
+                               "    ci_high: 5\n")
+        ok(any(v["kind"] == "ci_degenerate" for v in v10),
+           f"A10: producer-flagged degenerate output fires, got {v10}")
+
+    # --- Phase 21 β: closed verdict vocabularies + producer stamps ---
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        man = os.path.join(d, "models", "identifiability.yaml")
+        with open(man, "w") as f:
+            f.write("loss_type: nll\n")
+        import hashlib as _hl
+        sha = _hl.sha256(open(man, "rb").read()).hexdigest()
+        rep = os.path.join(d, "identifiability.yaml")
+
+        def _id(doc):
+            with open(rep, "w") as f:
+                yaml.safe_dump(doc, f)
+            return [v["kind"] for v in
+                    _identifiability_report_violations(rep, man)]
+        ok(_id({"verdict": "PARAMETERS_IDENTIFIED_BY_CONSTRUCTION",
+                "producer": "scripts/identifiability.py"})
+           == ["identifiability_report_unknown_verdict"],
+           "V1: invented identifiability verdict → unknown_verdict HIGH")
+        ok(_id({"verdict": "CLEAN"})
+           == ["identifiability_report_not_script_produced"],
+           "V2: missing producer stamp → not_script_produced HIGH")
+        ok(_id({"verdict": "CLEAN", "producer": "scripts/identifiability.py",
+                "manifest_sha256": "0" * 64})
+           == ["identifiability_report_stale"],
+           "V3: manifest hash mismatch → stale HIGH")
+        ok(_id({"verdict": "CLEAN", "producer": "scripts/identifiability.py",
+                "manifest_sha256": sha}) == [],
+           "V4: stamped CLEAN report is silent")
+        ok(_id({"verdict": "UNKNOWN_LOSS_SCALE",
+                "producer": "scripts/identifiability.py",
+                "manifest_sha256": sha})
+           == ["identifiability_loss_scale_unknown"],
+           "V5: UNKNOWN_LOSS_SCALE fails closed")
+        ok(_id({"verdict": "UNIDENTIFIED_PARAMETERS",
+                "producer": "scripts/identifiability.py",
+                "parameters": [{"name": "beta", "status": "unidentified"}]})
+           == ["unidentified_parameters"],
+           "V6: parameters as a list does not crash")
+        with open(rep, "w") as f:
+            f.write("- not a mapping\n")
+        ok([v["kind"] for v in _identifiability_report_violations(rep, man)]
+           == ["identifiability_report_invalid"],
+           "V7: list top-level → invalid HIGH")
+        msc = os.path.join(d, "model_comparison_formal.yaml")
+        with open(msc, "w") as f:
+            yaml.safe_dump({"verdict": "DEGENERATE_FIT_ACKNOWLEDGED",
+                            "producer": "scripts/compare_models.py"}, f)
+        ok([v["kind"] for v in _msc_report_violations(msc)]
+           == ["model_comparison_formal_unknown_verdict"],
+           "V8: invented compare_models verdict → unknown_verdict HIGH")
+        ok(all(is_non_declarable(k) for k in (
+            "identifiability_report_unknown_verdict",
+            "model_comparison_formal_not_script_produced",
+            "uncertainty_report_stale")),
+           "V9: invalid/unknown/unstamped/stale kinds are non-declarable")
 
         # Case A4: hardcoded calibration target (CI ~ 1e-7 of mean) — fires.
         uq_d = os.path.join(d, "uq_d.yaml")
@@ -4886,8 +5788,12 @@ def _run_self_test() -> int:
                 "first_seen_round": 1, "claim": "figure embedding",
                 "resolved": False,
             }],
+            # Phase 21 β: real critics set prior_round = N-1 (the round
+            # they compared against). The pre-21 fixture used
+            # prior_round == first_seen_round, which hid that attempts
+            # were computed from prior_round and so were always 1.
             carried_forward=[{
-                "id": "P-001", "prior_round": 1,
+                "id": "P-001", "prior_round": 3,
                 "still_present": True, "notes": "still wrong",
             }],
         ),
@@ -5160,40 +6066,69 @@ def _run_self_test() -> int:
 
     # --- Phase 7 Commit λ: STAGE 8.5 WRITER_QA ---
     with tempfile.TemporaryDirectory() as d:
-        # Case J1: report.md exists, no writer_qa_report.yaml → MEDIUM.
+        # Case J1 (Phase 21 β): report.md exists → writer_qa recomputed
+        # in-process; a plain report is CLEAN and the YAML is refreshed.
         with open(os.path.join(d, "report.md"), "w") as f:
             f.write("# Report\n\nContent.\n")
         vj1 = _check_writer_qa(d)
-        ok(any(v["kind"] == "writer_qa_missing" for v in vj1),
-           f"J1: report without writer_qa should fire MEDIUM, got {vj1}")
+        ok(vj1 == [] and os.path.exists(
+            os.path.join(d, "writer_qa_report.yaml")),
+           f"J1: recomputed CLEAN + refreshed yaml, got {vj1}")
 
-        # Case J2: writer_qa CLEAN → no fire.
+        # Case J2 (Phase 21 β): a stale/hand-written cached verdict is not
+        # trusted — recomputation wins.
         with open(os.path.join(d, "writer_qa_report.yaml"), "w") as f:
-            f.write("verdict: CLEAN\nn_major: 0\nn_minor: 0\nissues: []\n")
+            f.write("verdict: REVISE\nn_major: 1\nn_minor: 0\nissues: []\n")
         vj2 = _check_writer_qa(d)
-        ok(not vj2, f"J2: CLEAN verdict should not fire, got {vj2}")
+        ok(not vj2, f"J2: cached REVISE ignored when recompute is CLEAN, got {vj2}")
 
-        # Case J3: REVISE → MEDIUM unresolved.
-        with open(os.path.join(d, "writer_qa_report.yaml"), "w") as f:
-            f.write(
-                "verdict: REVISE\nn_major: 1\nn_minor: 2\n"
-                "issues:\n"
-                "  - kind: figure_annotation_inconsistency\n"
-                "    severity: MAJOR\n"
-            )
-        vj3 = _check_writer_qa(d)
-        ok(any(v["kind"] == "writer_qa_unresolved" for v in vj3),
-           f"J3: REVISE verdict should fire MEDIUM, got {vj3}")
+        class _FakeQA:
+            def __init__(self, verdict, n_major=0, n_minor=0):
+                self.verdict, self.n_major, self.n_minor = verdict, n_major, n_minor
 
-        # Case J4: MAJOR_REVISION → MEDIUM unresolved.
-        with open(os.path.join(d, "writer_qa_report.yaml"), "w") as f:
-            f.write(
-                "verdict: MAJOR_REVISION\nn_major: 5\nn_minor: 0\n"
-                "issues: []\n"
-            )
-        vj4 = _check_writer_qa(d)
-        ok(any(v["kind"] == "writer_qa_unresolved" for v in vj4),
-           f"J4: MAJOR_REVISION verdict should fire MEDIUM, got {vj4}")
+        global _WRITER_QA_FN
+        try:
+            # Case J3: REVISE → MEDIUM unresolved.
+            _WRITER_QA_FN = lambda _d: _FakeQA("REVISE", 1, 2)  # noqa: E731
+            vj3 = _check_writer_qa(d)
+            ok(any(v["kind"] == "writer_qa_unresolved"
+                   and v["severity"] == "MEDIUM" for v in vj3),
+               f"J3: REVISE verdict should fire MEDIUM, got {vj3}")
+
+            # Case J4: MAJOR_REVISION → MEDIUM pre-WRITE, HIGH post-WRITE.
+            _WRITER_QA_FN = lambda _d: _FakeQA("MAJOR_REVISION", 5)  # noqa: E731
+            vj4 = _check_writer_qa(d)
+            ok(any(v["kind"] == "writer_qa_unresolved"
+                   and v["severity"] == "MEDIUM" for v in vj4),
+               f"J4: MAJOR_REVISION verdict should fire MEDIUM, got {vj4}")
+            vj4b = _check_writer_qa(d, post_write=True)
+            ok(any(v["kind"] == "writer_qa_unresolved"
+                   and v["severity"] == "HIGH" for v in vj4b),
+               f"J4b: MAJOR_REVISION post-write must be HIGH, got {vj4b}")
+
+            # Case J6: invented verdict → HIGH unknown.
+            _WRITER_QA_FN = lambda _d: _FakeQA("LOOKS_FINE")  # noqa: E731
+            vj6 = _check_writer_qa(d)
+            ok([v["kind"] for v in vj6] == ["writer_qa_unknown_verdict"],
+               f"J6: unknown verdict → HIGH, got {vj6}")
+
+            # Case J7: writer_qa crashes → unavailable (HIGH post-write).
+            def _boom(_d):
+                raise RuntimeError("boom")
+            _WRITER_QA_FN = _boom
+            vj7 = _check_writer_qa(d, post_write=True)
+            ok(any(v["kind"] == "writer_qa_unavailable"
+                   and v["severity"] == "HIGH" for v in vj7),
+               f"J7: unavailable post-write must be HIGH, got {vj7}")
+        finally:
+            _WRITER_QA_FN = None
+
+        # Case J8: non-UTF-8 report → HIGH report_unreadable.
+        with open(os.path.join(d, "report.md"), "wb") as f:
+            f.write(b"\xff\xfe\x00bad")
+        vj8 = _check_writer_qa(d)
+        ok([v["kind"] for v in vj8] == ["report_unreadable"],
+           f"J8: unreadable report → HIGH, got {vj8}")
 
     # Case J5: no report.md → silent.
     with tempfile.TemporaryDirectory() as d:
@@ -5590,12 +6525,13 @@ def _run_self_test() -> int:
         vw2 = _check_writer_qa(d)
         ok(not vw2, f"W2: CLEAN writer_qa should not fire, got {vw2}")
 
-        # W3: report.md present but writer_qa_report.yaml missing →
-        # MEDIUM writer_qa_unrun.
+        # W3 (Phase 21 β): report.md present but writer_qa_report.yaml
+        # missing → the gate runs writer_qa itself and writes the YAML.
         os.remove(os.path.join(d, "writer_qa_report.yaml"))
         vw3 = _check_writer_qa(d)
-        ok(any(v["severity"] == "MEDIUM" for v in vw3),
-           f"W3: report without writer_qa should fire MEDIUM, got {vw3}")
+        ok(vw3 == [] and os.path.exists(
+            os.path.join(d, "writer_qa_report.yaml")),
+           f"W3: gate recomputes writer_qa when the yaml is absent, got {vw3}")
 
     # U1-U3: _check_universal_coverage
     with tempfile.TemporaryDirectory() as d:
@@ -6207,9 +7143,32 @@ def _run_self_test() -> int:
                      "addressed_in": "modeling_strategy.md#pre-mortem-pm-001"},
                 ],
             }, f)
+        # Phase 21 β: addressed_in must resolve to real content.
+        with open(os.path.join(_d, "modeling_strategy.md"), "w") as f:
+            f.write("# Strategy\n\n## Pre-mortem PM-001\nSupply capped.\n")
         v = _check_premortem_addressed(_d, round_n=2)
         ok(not any(x["kind"] == "pre_mortem_high_unaddressed" for x in v),
            f"PM4: addressed HIGH should be silent, got {v}")
+
+        def _pm(addressed, severity="HIGH"):
+            with open(os.path.join(_d, "pre_mortem.yaml"), "w") as f:
+                _yaml.safe_dump({"concerns": [
+                    {"id": "PM-001", "severity": severity,
+                     "concern": "x", "addressed_in": addressed}]}, f)
+            return [x["kind"] for x in _check_premortem_addressed(_d, round_n=2)]
+        # PM4b-e (Phase 21 β)
+        ok("pre_mortem_high_unaddressed" in _pm("TODO"),
+           "PM4b: addressed_in TODO must not count")
+        ok("pre_mortem_high_unaddressed" in _pm("missing_file.md § X"),
+           "PM4c: addressed_in naming a nonexistent file must not count")
+        ok("pre_mortem_high_unaddressed" not in _pm(
+            "modeling_strategy.md § Pre-mortem"),
+           "PM4d: existing file + matching § heading counts")
+        ok("pre_mortem_high_unaddressed" in _pm(
+            "modeling_strategy.md § Nonexistent Section"),
+           "PM4e: § heading that does not exist must not count")
+        ok("pre_mortem_high_unaddressed" in _pm(None, severity="CRITICAL"),
+           "PM8: CRITICAL severity is treated as ≥ HIGH")
 
     with _tempfile.TemporaryDirectory() as _d:
         # PM5: HIGH concern scope-declared via scope_declaration.yaml
@@ -6227,14 +7186,32 @@ def _run_self_test() -> int:
         with open(os.path.join(_d, "scope_declaration.yaml"), "w") as f:
             _yaml.safe_dump({
                 "declarations": [
-                    {"id": "SCOPE-001",
-                     "claim": "Idealized supply assumption (PM-001)",
+                    {"id": "SCOPE-001", "blocker_id": "PM-001",
+                     "claim": "Idealized supply assumption",
                      "justification": "Question explicitly assumes idealized supply"},
                 ],
             }, f)
         v = _check_premortem_addressed(_d, round_n=2)
         ok(not any(x["kind"] == "pre_mortem_high_unaddressed" for x in v),
-           f"PM5: scope-declared HIGH (id quoted) should be silent, got {v}")
+           f"PM5: structured scope declaration should be silent, got {v}")
+
+        # PM5b (Phase 21 β): the id merely appearing in prose / notes does
+        # not declare it.
+        with open(os.path.join(_d, "scope_declaration.yaml"), "w") as f:
+            _yaml.safe_dump({"notes": "PM-001 through PM-007 acknowledged",
+                             "declarations": [
+                                 {"id": "SCOPE-001",
+                                  "claim": "Idealized supply (PM-001)"}]}, f)
+        v = _check_premortem_addressed(_d, round_n=2)
+        ok(any(x["kind"] == "pre_mortem_high_unaddressed" for x in v),
+           f"PM5b: prose-only mention must not silence, got {v}")
+
+        # PM9 (Phase 21 β): renamed top-level key → HIGH invalid, not [].
+        with open(os.path.join(_d, "pre_mortem.yaml"), "w") as f:
+            _yaml.safe_dump({"high_concerns": [{"id": "PM-001"}]}, f)
+        v = _check_premortem_addressed(_d, round_n=2)
+        ok([x["kind"] for x in v] == ["pre_mortem_invalid"],
+           f"PM9: renamed key must be HIGH invalid, got {v}")
 
     with _tempfile.TemporaryDirectory() as _d:
         # PM6: malformed YAML → HIGH pre_mortem_invalid (does not crash)
@@ -6252,29 +7229,40 @@ def _run_self_test() -> int:
         ok(v == [], f"CA1: no report.md must be silent, got {v}")
 
     with _tempfile.TemporaryDirectory() as _d:
-        # CA2: report.md present, no audit yaml → MEDIUM coherence_audit_not_run
+        # CA2 (Phase 21 β): report.md present, no audit yaml → the gate
+        # runs the auditor itself and writes coherence_audit.yaml.
         with open(os.path.join(_d, "report.md"), "w") as f:
             f.write("# Report\nSynthetic.\n")
         v = _check_coherence_audit(_d)
-        ok(any(x["kind"] == "coherence_audit_not_run"
-               and x["severity"] == "MEDIUM" for x in v),
-           f"CA2: report.md without audit yaml must fire MEDIUM coherence_audit_not_run, got {v}")
+        ok(isinstance(v, list) and os.path.exists(
+            os.path.join(_d, "coherence_audit.yaml")),
+           f"CA2: gate must recompute + write the audit, got {v}")
 
-    with _tempfile.TemporaryDirectory() as _d:
-        # CA3: clean audit (verdict CLEAN) → silent
-        with open(os.path.join(_d, "report.md"), "w") as f:
-            f.write("# Report\n")
-        with open(os.path.join(_d, "coherence_audit.yaml"), "w") as f:
-            _yaml.safe_dump({"verdict": "CLEAN", "violations": []}, f)
-        v = _check_coherence_audit(_d)
-        ok(v == [], f"CA3: clean audit must be silent, got {v}")
+    global _COHERENCE_AUDIT_FN
+    try:
+        with _tempfile.TemporaryDirectory() as _d:
+            with open(os.path.join(_d, "report.md"), "w") as f:
+                f.write("# Report\n")
+            # CA2b: a cached CLEAN audit is ignored — recomputation wins.
+            with open(os.path.join(_d, "coherence_audit.yaml"), "w") as f:
+                _yaml.safe_dump({"verdict": "CLEAN", "violations": []}, f)
+            _COHERENCE_AUDIT_FN = lambda _r: {  # noqa: E731
+                "verdict": "DRIFT_DETECTED", "violations": [
+                    {"id": "CA-B-001", "severity": "HIGH",
+                     "duty": "ledger_binding", "claim": "6M unbound"}]}
+            v = _check_coherence_audit(_d)
+            ok(any(x["kind"] == "coherence_audit_ledger_binding"
+                   and x["severity"] == "HIGH" for x in v),
+               f"CA2b: stale cached CLEAN must not hide recomputed HIGH, got {v}")
 
-    with _tempfile.TemporaryDirectory() as _d:
-        # CA4: HIGH violations are surfaced as separate kinds per duty
-        with open(os.path.join(_d, "report.md"), "w") as f:
-            f.write("# Report\n")
-        with open(os.path.join(_d, "coherence_audit.yaml"), "w") as f:
-            _yaml.safe_dump({
+            # CA3: clean audit → silent
+            _COHERENCE_AUDIT_FN = lambda _r: {"verdict": "CLEAN",  # noqa: E731
+                                              "violations": []}
+            v = _check_coherence_audit(_d)
+            ok(v == [], f"CA3: clean audit must be silent, got {v}")
+
+            # CA4: HIGH violations are surfaced as separate kinds per duty
+            _COHERENCE_AUDIT_FN = lambda _r: {  # noqa: E731
                 "verdict": "DRIFT_DETECTED",
                 "violations": [
                     {"id": "CA-L-001", "severity": "HIGH",
@@ -6284,18 +7272,14 @@ def _run_self_test() -> int:
                      "canonical_source": "models/sensitivity_analysis.yaml:verdict",
                      "canonical_value": "SENSITIVE"},
                 ],
-            }, f)
-        v = _check_coherence_audit(_d)
-        ok(any(x["kind"] == "coherence_audit_label_coherence"
-               and x["severity"] == "HIGH" for x in v),
-           f"CA4: HIGH label_coherence must surface as HIGH validator violation, got {v}")
+            }
+            v = _check_coherence_audit(_d)
+            ok(any(x["kind"] == "coherence_audit_label_coherence"
+                   and x["severity"] == "HIGH" for x in v),
+               f"CA4: HIGH label_coherence must surface as HIGH validator violation, got {v}")
 
-    with _tempfile.TemporaryDirectory() as _d:
-        # CA5: many MEDIUMs consolidate into one advisory per duty
-        with open(os.path.join(_d, "report.md"), "w") as f:
-            f.write("# Report\n")
-        with open(os.path.join(_d, "coherence_audit.yaml"), "w") as f:
-            _yaml.safe_dump({
+            # CA5: many MEDIUMs consolidate into one advisory per duty
+            _COHERENCE_AUDIT_FN = lambda _r: {  # noqa: E731
                 "verdict": "DRIFT_DETECTED",
                 "violations": [
                     {"id": f"CA-C-{i:03d}", "severity": "MEDIUM",
@@ -6303,27 +7287,51 @@ def _run_self_test() -> int:
                      "location": f"results.md:{i}",
                      "claim": f"drift {i}"} for i in range(1, 8)
                 ],
-            }, f)
-        v = _check_coherence_audit(_d)
-        # Expect exactly ONE consolidated advisory for cross_file_counts
-        consolidated = [x for x in v
-                        if x["kind"] == "coherence_audit_cross_file_counts_advisory"]
-        ok(len(consolidated) == 1,
-           f"CA5: multiple MEDIUMs must consolidate into ONE advisory, got {v}")
-        ok("7 MEDIUM" in consolidated[0]["claim"],
-           f"CA5: advisory must report count, got {consolidated}")
+            }
+            v = _check_coherence_audit(_d)
+            consolidated = [x for x in v
+                            if x["kind"] == "coherence_audit_cross_file_counts_advisory"]
+            ok(len(consolidated) == 1,
+               f"CA5: multiple MEDIUMs must consolidate into ONE advisory, got {v}")
+            ok(consolidated and "7 MEDIUM" in consolidated[0]["claim"],
+               f"CA5: advisory must report count, got {consolidated}")
 
-    with _tempfile.TemporaryDirectory() as _d:
-        # CA6: malformed audit yaml → HIGH coherence_audit_invalid
-        with open(os.path.join(_d, "report.md"), "w") as f:
-            f.write("# Report\n")
-        with open(os.path.join(_d, "coherence_audit.yaml"), "w") as f:
-            f.write("not: valid: yaml: here:\n  - oops\n  - oops\n: : :\n")
-        v = _check_coherence_audit(_d)
-        # Either parses as something weird (no violations key, empty out)
-        # or fires invalid. Both are acceptable — the goal is no crash.
-        ok(isinstance(v, list),
-           f"CA6: malformed yaml must not crash; got {v}")
+            # CA5b (Phase 21 β): > 5 HIGHs → overflow stays HIGH.
+            _COHERENCE_AUDIT_FN = lambda _r: {  # noqa: E731
+                "verdict": "DRIFT_DETECTED",
+                "violations": [{"id": f"H{i}", "severity": "HIGH",
+                                "duty": "ledger_binding", "claim": "x"}
+                               for i in range(8)]}
+            v = _check_coherence_audit(_d)
+            ok(len([x for x in v if x["severity"] == "HIGH"]) == 6,
+               f"CA5b: 5 HIGHs + 1 HIGH overflow summary, got {len(v)}")
+
+            # CA6 (Phase 21 β): malformed audit shapes → HIGH invalid.
+            for bad in ({"violations": "not-a-list"}, {}, ["x"],
+                        {"violations": [None]}, {"violations": {"a": 1}}):
+                _COHERENCE_AUDIT_FN = lambda _r, _b=bad: _b  # noqa: E731
+                v = _check_coherence_audit(_d)
+                ok([x["kind"] for x in v] == ["coherence_audit_invalid"],
+                   f"CA6: malformed audit {bad!r} must be HIGH invalid, got {v}")
+
+            # CA7: missing severity treated as HIGH; claim None doesn't crash.
+            _COHERENCE_AUDIT_FN = lambda _r: {"violations": [  # noqa: E731
+                {"duty": "label_coherence", "claim": None}]}
+            v = _check_coherence_audit(_d)
+            ok(any(x["severity"] == "HIGH" for x in v),
+               f"CA7: severity-less violation → HIGH, got {v}")
+
+            # CA8: auditor crash → MEDIUM pre-write, HIGH post-write.
+            def _boom(_r):
+                raise RuntimeError("boom")
+            _COHERENCE_AUDIT_FN = _boom
+            ok([x["severity"] for x in _check_coherence_audit(_d)] == ["MEDIUM"],
+               "CA8: unavailable pre-write is MEDIUM")
+            ok([x["severity"] for x in
+                _check_coherence_audit(_d, post_write=True)] == ["HIGH"],
+               "CA8b: unavailable post-write is HIGH")
+    finally:
+        _COHERENCE_AUDIT_FN = None
 
     # --- Phase 18 α: claims_ledger tests (CL-prefix) ---
     with _tempfile.TemporaryDirectory() as _d:
@@ -6353,11 +7361,33 @@ def _run_self_test() -> int:
         with open(os.path.join(_d, "models", "claims_ledger.yaml"), "w") as f:
             _yaml.safe_dump({"claims": [
                 {"id": "a", "claim_kind": "scalar", "value": 100,
-                 "ci_low": 80, "ci_high": 120},
-                {"id": "b", "claim_kind": "label", "value": "ROBUST"},
+                 "ci_low": 80, "ci_high": 120,
+                 "source_artifact": "models/out.yaml",
+                 "source_field": "total.mean"},
+                {"id": "b", "claim_kind": "label", "value": "ROBUST",
+                 "source_artifact": "models/out.yaml",
+                 "source_field": "verdict"},
             ]}, f)
+        with open(os.path.join(_d, "models", "out.yaml"), "w") as f:
+            _yaml.safe_dump({"verdict": "ROBUST", "total": {
+                "mean": 100, "ci_low": 80, "ci_high": 120}}, f)
         v = _check_claims_ledger_present(_d, round_n=3)
-        ok(v == [], f"CL4: well-formed ledger should be silent, got {v}")
+        ok(v == [], f"CL4: well-formed sourced ledger should be silent, got {v}")
+
+        # CL7 (Phase 21 β): ledger value contradicts its cited artifact
+        # (235631 class) → HIGH claim_source_mismatch / claim_ci_mismatch,
+        # non-declarable.
+        with open(os.path.join(_d, "models", "out.yaml"), "w") as f:
+            _yaml.safe_dump({"verdict": "SENSITIVE", "total": {
+                "mean": 100, "ci_low": 100, "ci_high": 100}}, f)
+        v = _check_claims_ledger_present(_d, round_n=3)
+        kinds = sorted(x["kind"] for x in v)
+        ok(kinds == ["claim_ci_mismatch", "claim_ci_mismatch",
+                     "claim_source_mismatch"]
+           and all(x["severity"] == "HIGH"
+                   and is_non_declarable(x["kind"], x.get("scope_declarable"))
+                   for x in v),
+           f"CL7: provenance mismatches must be HIGH non-declarable, got {kinds}")
 
     with _tempfile.TemporaryDirectory() as _d:
         # CL5: CI bounds violated → HIGH claims_ledger_ci_violated
@@ -6619,6 +7649,32 @@ def _run_self_test() -> int:
                and x["severity"] == "MEDIUM" for x in v),
            f"SB9: malformed declarations must fire MEDIUM invalid, got {v}")
 
+    # SB13-SB17 (Phase 21 β): budget-bypass shapes now count.
+    def _sb(doc):
+        with _tempfile.TemporaryDirectory() as _d2:
+            with open(os.path.join(_d2, "scope_declaration.yaml"), "w") as f:
+                _yaml.safe_dump(doc, f)
+            return [x["kind"] for x in
+                    _check_scope_declaration_budget(_d2, round_n=2)]
+    ok("scope_declaration_budget_exceeded" in _sb({"declarations": [
+        {"blocker_id": f"M-{i:03d}", "why_unresolved": "x"} for i in range(5)]}),
+       "SB13: blocker_id/why_unresolved-only entries burn budget")
+    ok("scope_declaration_budget_exceeded" in _sb({"declarations": [
+        {"id": "SD-001", "claim": "covers " + ", ".join(
+            f"R-{i:03d}" for i in range(20))}]}),
+       "SB14: one entry listing 20 ids counts 20")
+    ok("scope_declaration_budget_exceeded" in _sb({"scope_declarations": [
+        {"id": f"SD-{i:03d}", "claim": "x"} for i in range(5)]}),
+       "SB15: alternate top-level key counts")
+    ok("scope_declaration_budget_exceeded" not in _sb({"declarations": [
+        {"id": f"SD-{i:03d}", "blocker_id": f"M-{i:03d}", "claim": "x",
+         "status": "RESOLVED"} for i in range(5)]}),
+       "SB16: status RESOLVED entries do not count")
+    ok("scope_declaration_budget_exceeded" not in _sb({"declarations": [
+        {"id": "SD-001", "blocker_ids": ["M-001", "M-002"], "claim": "x"},
+        {"id": "SD-002", "blocker_id": "M-001", "claim": "dup"}]}),
+       "SB17: the same blocker id declared twice counts once")
+
     with _tempfile.TemporaryDirectory() as _d:
         # SB10 (Phase 20 β): rejected cap-override (above ceiling) now
         # emits MEDIUM `scope_declaration_cap_override_rejected` so the
@@ -6799,9 +7855,9 @@ def _run_self_test() -> int:
             }, f)
         v = _check_benchmark_match(_d, round_n=2)
         drift = [x for x in v if x["kind"] == "benchmark_drift"]
-        advisory = [x for x in v if x["kind"] == "benchmark_drift_advisory"]
-        ok(len(drift) == 5 and len(advisory) == 1,
-           f"BM9: must cap at 5 + advisory, got drift={len(drift)} adv={len(advisory)}")
+        # Phase 21 β: 5 itemized + 1 overflow summary, all HIGH.
+        ok(len(drift) == 6 and all(x["severity"] == "HIGH" for x in drift),
+           f"BM9: must cap at 5 + 1 HIGH overflow, got drift={len(drift)}")
 
     # --- Phase 19 δ: sufficiency-critic tests (SF-prefix) ---
     with _tempfile.TemporaryDirectory() as _d:
@@ -6930,10 +7986,336 @@ def _run_self_test() -> int:
                      "reason": "n_draws=50, pilot run"},
                 ],
             }, f)
+        # SF10 (Phase 21 β): without a PILOT_RUN scope declaration the
+        # critic's flag is unbacked → HIGH and no demotion.
+        v = _check_sufficiency_critic(_d, round_n=2)
+        ok(any(x["kind"] == "pilot_run_unbacked" for x in v)
+           and any(x["kind"] == "claim_overclaimed" and x["severity"] == "HIGH"
+                   for x in v),
+           f"SF10: unbacked pilot flag must not demote, got {v}")
+        with open(os.path.join(_d, "scope_declaration.yaml"), "w") as f:
+            _yaml.safe_dump({"declarations": [
+                {"id": "PILOT_RUN", "claim": "Smoke test of the pipeline."}]}, f)
         v = _check_sufficiency_critic(_d, round_n=2)
         oc = [x for x in v if x["kind"] == "claim_overclaimed"]
         ok(len(oc) == 1 and oc[0]["severity"] == "MEDIUM",
-           f"SF9: pilot_run_acknowledged must demote OVERCLAIMED to MEDIUM, got {v}")
+           f"SF9: backed pilot_run_acknowledged must demote OVERCLAIMED to MEDIUM, got {v}")
+
+        # SF11: invented verdict → HIGH; SF12: renamed key → HIGH invalid.
+        with open(os.path.join(_d, "critique_sufficiency.yaml"), "w") as f:
+            _yaml.safe_dump({"claim_verdicts": [
+                {"claim_id": "c1", "verdict": "MOSTLY_FINE"}]}, f)
+        ok(any(x["kind"] == "critique_sufficiency_unknown_verdict"
+               for x in _check_sufficiency_critic(_d, round_n=2)),
+           "SF11: unknown claim verdict must fire HIGH")
+        with open(os.path.join(_d, "critique_sufficiency.yaml"), "w") as f:
+            _yaml.safe_dump({"verdicts": [
+                {"claim_id": "c1", "verdict": "OVERCLAIMED"}]}, f)
+        ok([x["kind"] for x in _check_sufficiency_critic(_d, round_n=2)]
+           == ["critique_sufficiency_invalid"],
+           "SF12: renamed top-level key must be HIGH invalid")
+
+    # --- Phase 21 β: escalation-registry hygiene ---
+    # Every kind listed for round-aware escalation must actually be emitted
+    # somewhere; pre-21 the registry carried two kinds nothing emitted.
+    _scripts_dir = os.path.dirname(os.path.abspath(__file__))
+    _src = ""
+    for _fn in sorted(glob.glob(os.path.join(_scripts_dir, "*.py"))):
+        with open(_fn, encoding="utf-8") as _f:
+            _txt = _f.read()
+        if _fn.endswith("validate_critique_yaml.py"):
+            _a = _txt.index("_VALIDATOR_KIND_ESCALATION_THRESHOLDS = {")
+            _txt = _txt[:_a] + _txt[_txt.index("}", _a):]
+        _src += _txt
+    try:
+        with open(os.path.join(_scripts_dir, "..", ".claude", "orchestration",
+                               "effort_floors.yaml"), encoding="utf-8") as _f:
+            _floor_ids = {str(x.get("id")) for x in
+                          (yaml.safe_load(_f) or {}).get("floors") or []
+                          if isinstance(x, dict)}
+    except (OSError, yaml.YAMLError):
+        _floor_ids = set()
+    for _kind in _VALIDATOR_KIND_ESCALATION_THRESHOLDS:
+        _emitted = f'"{_kind}"' in _src
+        if not _emitted and _kind.startswith("effort_floor_"):
+            _emitted = _kind[len("effort_floor_"):] in _floor_ids
+        ok(_emitted, f"ER1: escalation kind {_kind!r} is never emitted")
+
+    # --- Phase 21 β: validator history drives Path A + first_seen ---
+    with tempfile.TemporaryDirectory() as d:
+        for rnd in (1, 2):
+            _append_validator_history(d, rnd, {"action": "PATCH_OR_RETHINK",
+                "rigor_violations": [{"kind": "plan_criterion_not_tested",
+                                      "severity": "MEDIUM", "stage": "P"}]},
+                False)
+        h = _load_validator_history(d)
+        ok(h == {1: {"plan_criterion_not_tested"},
+                 2: {"plan_criterion_not_tested"}},
+           f"H1: history round-trips, got {h}")
+        v = _check_persistent_medium_escalation(
+            d, round_n=3, current_kinds={"plan_criterion_not_tested"})
+        ok(any(x["kind"] == "plan_criterion_not_tested_persistent"
+               and x["severity"] == "HIGH" for x in v),
+           f"H2: 3 rounds of plan_criterion_not_tested → HIGH, got {v}")
+        vs = [{"kind": "plan_criterion_not_tested"}, {"kind": "new_kind"}]
+        _annotate_first_seen(d, vs)
+        ok(vs[0].get("first_seen_round") == 1 and "first_seen_round" not in vs[1],
+           f"H3: first_seen_round from history, got {vs}")
+        with open(os.path.join(d, _VALIDATOR_HISTORY_FILE), "a") as f:
+            f.write("not json\n")
+        ok(1 in _load_validator_history(d), "H4: malformed lines skipped")
+
+    # --- Phase 21 β: decision semantics (non-declarable, accept-blockers,
+    # idempotency) ---
+    _base = decide({}, max_rounds=8, current_round=8)
+    ok(_base["action"] == "ACCEPT", "D0: nothing open at exhaustion → ACCEPT")
+    _nd = [{"kind": "pre_model_over_saturated", "severity": "HIGH",
+            "stage": "PRE_MODEL", "claim": "40 params / 6 targets"}]
+    _dl = [{"kind": "sensitivity_analysis_unstable", "severity": "HIGH",
+            "stage": "OPTIMIZATION", "claim": "flips"}]
+    ok(_incorporate_rigor_violations(_base, _nd, 8, 8)["action"] == "RUN_FAILED",
+       "D1: non-declarable HIGH at exhaustion → RUN_FAILED")
+    ok(_incorporate_rigor_violations(_base, _dl, 8, 8)["action"] == "DECLARE_SCOPE",
+       "D2: declarable-only HIGH at exhaustion → DECLARE_SCOPE")
+    ok(_incorporate_rigor_violations(_base, _nd, 8, 5)["action"]
+       == "PATCH_OR_RETHINK", "D3: non-declarable with rounds left → PATCH")
+    _ef = [{"kind": "effort_floor_calibration_held_out", "severity": "HIGH",
+            "stage": "MODEL", "claim": "no held-out", "scope_declarable": False}]
+    ok(_incorporate_rigor_violations(_base, _ef, 8, 8)["action"] == "RUN_FAILED",
+       "D4: per-finding scope_declarable=False honored at exhaustion")
+    _req = [{"kind": "required_artifact_missing", "severity": "HIGH",
+             "stage": "MODEL", "claim": "x missing", "accept_blocker": True,
+             "scope_declarable": True}]
+    _r1 = _incorporate_rigor_violations(decide({}, 8, 1), _req, 8, 1)
+    ok(_r1["action"] == "PATCH_OR_RETHINK" and _r1["accept_blockers"]
+       and not _r1["unresolved_high"],
+       f"D5: accept-blocker forbids ACCEPT at round 1, got {_r1['action']}")
+    ok(_incorporate_rigor_violations(_base, _req, 8, 8)["action"]
+       == "DECLARE_SCOPE", "D6: declarable missing artifact at exhaustion")
+    _req_nd = [dict(_req[0], scope_declarable=False)]
+    ok(_incorporate_rigor_violations(_base, _req_nd, 8, 8)["action"]
+       == "RUN_FAILED", "D7: non-declarable missing artifact → RUN_FAILED")
+    _twice = _incorporate_rigor_violations(
+        _incorporate_rigor_violations(_base, _dl + _req, 8, 3), _dl + _req, 8, 3)
+    ok(len(_twice["unresolved_high"]) == 1 and len(_twice["accept_blockers"]) == 1,
+       f"D8: incorporate is idempotent, got {len(_twice['unresolved_high'])}"
+       f"/{len(_twice['accept_blockers'])}")
+    _sv = [{"kind": "budget_exceeded", "severity": "HIGH",
+            "evidence": "spend 200% of envelope"}]
+    ok(incorporate_spec_violations(_base, _sv, 8, 5)["action"]
+       == "PATCH_OR_RETHINK", "D9: any non-structural spec HIGH blocks")
+    ok(not _base["unresolved_high"], "D10: incorporate does not mutate input")
+
+    # --- Phase 21 β: end-to-end CLI on fixture run dirs ---
+    import subprocess as _sp
+
+    def _fixture(d, round_n):
+        with open(os.path.join(d, "metadata.json"), "w") as f:
+            json.dump({"question": "Estimate the impact of a campaign."}, f)
+        with open(os.path.join(d, "citations.md"), "w") as f:
+            f.write("# Citations\n\n## Parameter Registry\n\n"
+                    "```yaml\nparameters: []\n```\n")
+        for rev in REVIEWERS:
+            with open(os.path.join(d, FILENAMES[rev]), "w") as f:
+                yaml.safe_dump({"reviewer": rev, "round": round_n,
+                                "verdict": "PASS",
+                                "structural_mismatch": {"detected": False},
+                                "blockers": [], "carried_forward": []}, f)
+
+    def _cli(d, cur, mx=8):
+        r = _sp.run([sys.executable, os.path.abspath(__file__), d,
+                     "--max-rounds", str(mx), "--current-round", str(cur),
+                     "--spec-compliance", "--parameter-registry",
+                     "--rigor-artifacts", "--json", "--no-history"],
+                    capture_output=True, text=True, timeout=300)
+        try:
+            return r.returncode, json.loads(r.stdout)
+        except json.JSONDecodeError:
+            return r.returncode, {"_stdout": r.stdout, "_stderr": r.stderr[-800:]}
+
+    with tempfile.TemporaryDirectory() as d:
+        _fixture(d, 1)
+        rc, out = _cli(d, 1)
+        ok(rc == 1 and out.get("action") == "PATCH_OR_RETHINK",
+           f"E1: empty schema-valid run at r1 must not ACCEPT, got {rc} "
+           f"{out.get('action')} {out.get('_stderr', '')}")
+        _fixture(d, 8)
+        rc, out = _cli(d, 8)
+        ok(out.get("action") == "RUN_FAILED",
+           f"E2: empty run at r8/8 (non-declarable artifacts missing) → "
+           f"RUN_FAILED, got {out.get('action')}")
+        # E3: renamed verdict blocks even with all else quiet.
+        os.makedirs(os.path.join(d, "models"), exist_ok=True)
+        with open(os.path.join(d, "models", "model_comparison.yaml"), "w") as f:
+            f.write("models: []\n")
+        with open(os.path.join(d, "model_comparison_formal.yaml"), "w") as f:
+            yaml.safe_dump({"verdict": "DEGENERATE_FIT_ACKNOWLEDGED",
+                            "producer": "scripts/compare_models.py"}, f)
+        _fixture(d, 4)
+        rc, out = _cli(d, 4)
+        kinds = [b.get("kind") for b in out.get("unresolved_high", [])]
+        ok("model_comparison_formal_unknown_verdict" in kinds,
+           f"E3: renamed verdict must be an unresolved HIGH, got {kinds}")
+        # E4: a REVISE critique with blockers omitted is a schema error.
+        with open(os.path.join(d, "critique_methods.yaml"), "w") as f:
+            yaml.safe_dump({"reviewer": "critique-methods", "round": 4,
+                            "verdict": "REVISE",
+                            "structural_mismatch": {"detected": False},
+                            "carried_forward": []}, f)
+        rc, out = _cli(d, 4)
+        ok(rc == 3, f"E4: omitted blockers → schema error exit 3, got {rc}")
+
+    # E5: zero-width CI + ledger mismatch (235631 class) block at mid-round
+    # and fail the run at exhaustion.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "models", "outcome_fn.py"), "w") as f:
+            f.write("def outcome_fn(p):\n    return {'y': 1.0}\n")
+        with open(os.path.join(d, "uncertainty_report.yaml"), "w") as f:
+            yaml.safe_dump({"producer": "scripts/propagate_uncertainty.py",
+                            "n_draws": 200, "scalar_outputs": {"y": {
+                                "mean": 1769757.25, "ci_low": 1769757.25,
+                                "ci_high": 1769757.25}}}, f)
+        with open(os.path.join(d, "models", "claims_ledger.yaml"), "w") as f:
+            yaml.safe_dump({"claims": [{
+                "id": "y_mean", "claim_kind": "scalar", "value": 1806250,
+                "ci_low": 749219, "ci_high": 2900144,
+                "source_artifact": "uncertainty_report.yaml",
+                "source_field": "scalar_outputs.y.mean"}]}, f)
+        vv = _check_rigor_artifacts(d, round_n=5)
+        kinds = {v["kind"] for v in vv if v["severity"] == "HIGH"}
+        ok({"ci_degenerate", "claim_source_mismatch",
+            "claim_ci_mismatch"} <= kinds,
+           f"E5: zero-width CI + ledger mismatch must be HIGH, got {sorted(kinds)}")
+        dec = _incorporate_rigor_violations(decide({}, 8, 8), vv, 8, 8)
+        ok(dec["action"] == "RUN_FAILED",
+           f"E5b: at exhaustion these are non-declarable → RUN_FAILED, "
+           f"got {dec['action']}")
+
+    # E6: a check that crashes yields HIGH validator_check_crashed.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "models", "model_comparison.yaml"), "w") as f:
+            f.write("x: 1\n")
+        with open(os.path.join(d, "model_comparison_formal.yaml"), "w") as f:
+            f.write("verdict: CLEAN\nproducer: scripts/compare_models.py\n")
+        _orig = globals()["_check_comparator_efficiency"]
+        try:
+            def _boom(_rd):
+                raise AttributeError("'list' object has no attribute 'get'")
+            globals()["_check_comparator_efficiency"] = _boom
+            vv = _check_rigor_artifacts(d, round_n=2)
+        finally:
+            globals()["_check_comparator_efficiency"] = _orig
+        ok(any(v["kind"] == "validator_check_crashed" and v["severity"] == "HIGH"
+               for v in vv), "E6: crashing check → HIGH validator_check_crashed")
+
+    # E7: not_applicable exempts a scope-declarable artifact only.
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "scope_declaration.yaml"), "w") as f:
+            yaml.safe_dump({"declarations": [
+                {"id": "SD-001", "not_applicable": "identifiability",
+                 "justification": "No fitted parameters."},
+                {"id": "SD-002", "not_applicable": "claims_ledger",
+                 "justification": "trying to skip a non-declarable one"}]}, f)
+        req = {v["artifact"] for v in _check_required_artifacts(d)}
+        ok("identifiability" not in req and "claims_ledger" in req,
+           f"E7: not_applicable honored only for declarable artifacts, got {req}")
+        ok("report" not in req and "report" in
+           {v["artifact"] for v in _check_required_artifacts(d, post_write=True)},
+           "E7b: report.md required only in post-write mode")
+
+    # --- Phase 21 β: E8 POSITIVE CONTROL ---
+    # A gate that blocks everything passes every negative test above. E8
+    # builds a complete, honest, non-malaria run (generic vaccination
+    # campaign across six districts; scripts/lib/positive_control.py — the
+    # script-produced artifacts come from the real producers) and asserts
+    # the real CLI ACCEPTs it in stage-7 and --post-write mode, at round 2
+    # and at max_rounds. Then single-defect mutations must flip it.
+    import shutil as _shutil
+    from lib import positive_control as _pc
+
+    def _cli_pc(d, cur, post_write, mx=8):
+        cmd = [sys.executable, os.path.abspath(__file__), d,
+               "--max-rounds", str(mx), "--current-round", str(cur),
+               "--spec-compliance", "--parameter-registry",
+               "--rigor-artifacts", "--json", "--no-history"]
+        if post_write:
+            cmd.append("--post-write")
+        r = _sp.run(cmd, capture_output=True, text=True, timeout=300)
+        try:
+            out = json.loads(r.stdout)
+        except json.JSONDecodeError:
+            out = {"action": f"<no json; stderr: {r.stderr[-400:]}>"}
+        open_ = ([b.get("kind") for b in out.get("unresolved_high") or []]
+                 + [b.get("kind") for b in out.get("accept_blockers") or []])
+        return r.returncode, out.get("action"), open_
+
+    with tempfile.TemporaryDirectory() as _root:
+        pc = os.path.join(_root, "pc")
+        try:
+            _pc.build(pc, round_n=2)
+            built = True
+        except Exception as e:  # noqa: BLE001
+            built = False
+            ok(False, f"E8: positive-control fixture failed to build: "
+                      f"{type(e).__name__}: {e}")
+        if built:
+            for cur in (2, 8):
+                _pc.set_round(pc, cur)
+                for pw in (False, True):
+                    rc, action, open_ = _cli_pc(pc, cur, pw)
+                    ok(rc == 0 and action == "ACCEPT",
+                       f"E8: honest run must ACCEPT (round {cur}/8, "
+                       f"post_write={pw}); got exit {rc} {action} {open_}")
+
+            def _mutant(name, mutate):
+                md = os.path.join(_root, name)
+                _shutil.copytree(pc, md)
+                mutate(md)
+                return md
+
+            def _edit_yaml(path, fn):
+                with open(path) as f:
+                    doc = yaml.safe_load(f)
+                fn(doc)
+                with open(path, "w") as f:
+                    yaml.safe_dump(doc, f, sort_keys=False)
+
+            def _zero_width(md):
+                def fn(doc):
+                    o = doc["scalar_outputs"]["total_dalys_averted"]
+                    o["ci_low"] = o["ci_high"] = o["mean"]
+                _edit_yaml(os.path.join(md, "uncertainty_report.yaml"), fn)
+
+            def _renamed_verdict(md):
+                def fn(doc):
+                    doc["verdict"] = "DEGENERATE_FIT_ACKNOWLEDGED"
+                _edit_yaml(os.path.join(md, "model_comparison_formal.yaml"), fn)
+
+            def _ledger_off(md):
+                def fn(doc):
+                    for c in doc["claims"]:
+                        if c["id"] == "dalys_total":
+                            c["value"] = round(c["value"] * 1.10, 1)
+                _edit_yaml(os.path.join(md, "models", "claims_ledger.yaml"), fn)
+
+            for name, mutate, expect in (
+                    ("zero_width_ci", _zero_width, "ci_degenerate"),
+                    ("renamed_verdict", _renamed_verdict,
+                     "model_comparison_formal_unknown_verdict"),
+                    ("ledger_off_10pct", _ledger_off, "claim_source_mismatch")):
+                md = _mutant(name, mutate)
+                for cur in (2, 8):
+                    _pc.set_round(md, cur)
+                    rc, action, open_ = _cli_pc(md, cur, post_write=True)
+                    ok(rc != 0 and action != "ACCEPT" and expect in open_,
+                       f"E8 mutant {name} (round {cur}/8) must not ACCEPT "
+                       f"and must report {expect}; got {action} {open_}")
+                    if cur == 8:
+                        ok(action == "RUN_FAILED",
+                           f"E8 mutant {name} at exhaustion is non-"
+                           f"declarable → RUN_FAILED; got {action}")
 
     # --- Summary ---
     if failures:
@@ -6979,6 +8361,14 @@ def main() -> int:
                         "model_comparison.yaml, identifiability.yaml). See the "
                         "uncertainty-quantification, multi-structural-comparison, "
                         "and identifiability-analysis skills.")
+    p.add_argument("--post-write", action="store_true",
+                   help="Phase 21 β: post-WRITE gate. Requires report.md and "
+                        "post-WRITE artifacts (critique_sufficiency.yaml); "
+                        "writer-QA MAJOR_REVISION and auditor unavailability "
+                        "become HIGH. main.py runs this after the session.")
+    p.add_argument("--no-history", action="store_true",
+                   help="Do not append to <run_dir>/validator_history.jsonl "
+                        "(for read-only retro checks).")
     args = p.parse_args()
 
     if args.self_test:
@@ -7072,11 +8462,18 @@ def main() -> int:
             return 2
         required = spec_module.detect_required_spec(question)
         decision_year = spec_module.detect_decision_year(question, meta)
-        check_result = spec_module.check_spec_compliance(
-            required, args.run_dir, decision_year=decision_year)
+        # Phase 21 β: a spec-compliance crash is a HIGH finding, not exit 1.
+        spec_violations = run_guarded(
+            lambda: spec_module.check_spec_compliance(
+                required, args.run_dir,
+                decision_year=decision_year)["violations"],
+            check_name="spec_compliance")
+        crashed = [v for v in spec_violations
+                   if v.get("kind") == "validator_check_crashed"]
+        for v in crashed:
+            v.setdefault("evidence", v["claim"])
         decision = incorporate_spec_violations(
-            decision, check_result["violations"],
-            args.max_rounds, args.current_round,
+            decision, spec_violations, args.max_rounds, args.current_round,
         )
 
     if args.rigor_artifacts:
@@ -7089,6 +8486,7 @@ def main() -> int:
         # was unreachable from production.
         rigor_violations = _check_rigor_artifacts(
             args.run_dir, round_n=args.current_round,
+            post_write=args.post_write,
         )
         # Phase 11 Commit υ (F3): missing critique_redteam.yaml is a
         # MEDIUM violation now, not a silent skip. The lead is required
@@ -7136,13 +8534,20 @@ def main() -> int:
         except (ValueError, FileNotFoundError) as e:
             print(f"ERROR loading registry: {e}", file=sys.stderr)
             return 2
-        reg_result = registry_module.check_registry(
-            registry, repo_root, run_dir=args.run_dir)
+        reg_violations = run_guarded(
+            lambda: registry_module.check_registry(
+                registry, repo_root, run_dir=args.run_dir)["violations"],
+            check_name="effect_size_registry")
+        for v in reg_violations:
+            v.setdefault("name", "-")
         decision = incorporate_registry_violations(
-            decision, reg_result["violations"],
-            args.max_rounds, args.current_round,
+            decision, reg_violations, args.max_rounds, args.current_round,
         )
 
+    decision["post_write"] = bool(args.post_write)
+    if not args.no_history:
+        _append_validator_history(args.run_dir, args.current_round, decision,
+                                  args.post_write)
     print(render_text(decision, args.current_round, args.max_rounds),
           file=sys.stderr)
     if args.json:
@@ -7152,5 +8557,24 @@ def main() -> int:
     return 0 if decision["action"] == "ACCEPT" else 1
 
 
+def _main_fail_closed() -> int:
+    """Phase 21 β: an unexpected crash still yields a machine-readable
+    verdict. Exit 4 = validator error (never ACCEPT)."""
+    try:
+        return main()
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001
+        import traceback as _tb
+        _tb.print_exc()
+        if "--json" in sys.argv:
+            print(json.dumps({
+                "action": "VALIDATOR_ERROR",
+                "rationale": f"validator crashed: {type(e).__name__}: {e}",
+                "unresolved_high": [], "accept_blockers": [],
+            }, indent=2))
+        return 4
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_main_fail_closed())
