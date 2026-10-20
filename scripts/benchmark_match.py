@@ -40,6 +40,12 @@ If both are set, both must hold (intersection).
 Verdict
 -------
 PASS if all benchmarks are within band. DRIFT if any are outside.
+MALFORMED (Phase 21 γ) if any target is malformed: non-mapping entry,
+non-finite / non-numeric target or observed value, tolerance_factor
+> 10, or tolerance_abs non-finite or wider than |target_value| without
+a `tolerance_justification`. A malformed target used to be dropped
+from the verdict, so one good target plus a typo'd one read PASS, and
+an unbounded tolerance (factor 1000, abs .inf) passed anything.
 
 Exit status
 -----------
@@ -51,12 +57,24 @@ Exit status
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 from dataclasses import dataclass, field
 from typing import Any
 
 import yaml
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from lib.text_spans import resolve_dotpath as _resolve_dotpath  # noqa: E402
+
+# Phase 21 γ: maximum multiplicative tolerance. A factor-10 band already
+# spans two orders of magnitude; anything wider accepts any plausible
+# output and is not a benchmark.
+MAX_TOLERANCE_FACTOR = 10.0
+
+# Closed verdict vocabulary (read by validate_critique_yaml.py).
+VERDICTS = ("PASS", "DRIFT", "MALFORMED", "ABSENT", "PENDING")
 
 
 @dataclass
@@ -70,6 +88,7 @@ class BenchResult:
     within_band: bool
     source: str
     diagnostic: str = ""
+    malformed: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -82,18 +101,8 @@ class BenchResult:
             "within_band": self.within_band,
             "source": self.source,
             "diagnostic": self.diagnostic,
+            "malformed": self.malformed,
         }
-
-
-def _resolve_dotpath(doc: Any, path: str) -> Any:
-    parts = path.split(".")
-    cur: Any = doc
-    for part in parts:
-        if isinstance(cur, dict):
-            cur = cur.get(part)
-        else:
-            return None
-    return cur
 
 
 def _resolve_computed_field(run_dir: str, ref: str) -> tuple[float | None, str]:
@@ -139,6 +148,8 @@ def _band(target: dict) -> tuple[float | None, float | None, str]:
         tv = float(target["target_value"])
     except (KeyError, TypeError, ValueError) as e:
         return None, None, f"target_value invalid: {e}"
+    if not math.isfinite(tv):
+        return None, None, f"target_value must be finite, got {tv!r}"
     factor = target.get("tolerance_factor")
     abs_tol = target.get("tolerance_abs")
     low: float | None = None
@@ -155,6 +166,11 @@ def _band(target: dict) -> tuple[float | None, float | None, str]:
             # observed value. The natural-language reading
             # `tolerance_factor: 0.2` → "±20%" is wrong but plausible;
             # surface the misuse instead of silently breaking.
+            if not math.isfinite(f) or f > MAX_TOLERANCE_FACTOR:
+                return None, None, (
+                    f"tolerance_factor {factor!r} exceeds the maximum "
+                    f"{MAX_TOLERANCE_FACTOR:g}; a band that wide is not a "
+                    f"benchmark")
             if f < 1.0:
                 return None, None, (
                     f"tolerance_factor must be ≥ 1.0 (got {factor!r}); "
@@ -175,6 +191,14 @@ def _band(target: dict) -> tuple[float | None, float | None, str]:
             a = float(abs_tol)
             if a < 0:
                 return None, None, (f"tolerance_abs must be ≥ 0, got {abs_tol!r}")
+            if not math.isfinite(a):
+                return None, None, f"tolerance_abs must be finite, got {abs_tol!r}"
+            justification = str(target.get("tolerance_justification") or "").strip()
+            if tv != 0 and a > abs(tv) and not justification:
+                return None, None, (
+                    f"tolerance_abs {a:g} is wider than |target_value| "
+                    f"{abs(tv):g}; add `tolerance_justification:` or tighten "
+                    f"the band")
             ab_low = tv - a
             ab_high = tv + a
             # Intersection
@@ -238,6 +262,15 @@ def evaluate(run_dir: str) -> dict:
     missing_computed = 0
     for i, t in enumerate(targets):
         if not isinstance(t, dict):
+            # Phase 21 γ: a non-mapping entry is a malformed target, not
+            # an absent one.
+            results.append(BenchResult(
+                id=f"benchmark_{i}", metric="?", target_value=float("nan"),
+                observed=None, band_low=None, band_high=None,
+                within_band=False, source="?",
+                diagnostic=f"benchmarks[{i}] is not a mapping ({t!r})",
+                malformed=True,
+            ))
             continue
         tid = str(t.get("id") or f"benchmark_{i}")
         metric = str(t.get("metric") or tid)
@@ -250,10 +283,20 @@ def evaluate(run_dir: str) -> dict:
                 observed=None, band_low=None, band_high=None,
                 within_band=False, source=source,
                 diagnostic=f"target_value invalid: {e}",
+                malformed=True,
             ))
             continue
         low, high, band_diag = _band(t)
         observed, obs_diag = _resolve_observed(run_dir, t)
+        if observed is not None and not math.isfinite(observed):
+            results.append(BenchResult(
+                id=tid, metric=metric, target_value=tv,
+                observed=None, band_low=low, band_high=high,
+                within_band=False, source=source,
+                diagnostic=f"computed value is not finite ({observed!r})",
+                malformed=True,
+            ))
+            continue
         if observed is None:
             missing_computed += 1
             results.append(BenchResult(
@@ -268,7 +311,7 @@ def evaluate(run_dir: str) -> dict:
                 id=tid, metric=metric, target_value=tv,
                 observed=observed, band_low=low, band_high=high,
                 within_band=False, source=source,
-                diagnostic=band_diag,
+                diagnostic=band_diag, malformed=True,
             ))
             continue
         within = low <= observed <= high
@@ -279,21 +322,32 @@ def evaluate(run_dir: str) -> dict:
             diagnostic="",
         ))
 
-    n_drifted = sum(1 for r in results if r.observed is not None and not r.within_band)
+    n_malformed = sum(1 for r in results if r.malformed)
+    n_drifted = sum(1 for r in results
+                    if r.observed is not None and not r.within_band
+                    and not r.malformed)
     n_total = len([r for r in results if r.observed is not None])
-    verdict = "PASS" if (n_drifted == 0 and missing_computed == 0
-                          and n_total > 0) else (
-        "DRIFT" if (n_drifted > 0 or missing_computed > 0)
-        else "PENDING"
-    )
-    return {
+    if n_malformed:
+        verdict = "MALFORMED"
+    elif n_drifted > 0 or missing_computed > 0:
+        verdict = "DRIFT"
+    elif n_total > 0:
+        verdict = "PASS"
+    else:
+        verdict = "PENDING"
+    out = {
         "verdict": verdict,
         "n_benchmarks": len(results),
         "n_with_observed": n_total,
         "n_drifted": n_drifted,
         "missing_computed": missing_computed,
+        "n_malformed": n_malformed,
         "results": [r.to_dict() for r in results],
     }
+    if n_malformed:
+        out["error"] = "; ".join(f"{r.id}: {r.diagnostic}"
+                                 for r in results if r.malformed)[:500]
+    return out
 
 
 def write_report(run_dir: str, report: dict) -> str:
@@ -508,6 +562,56 @@ def _self_test() -> int:
         rep = evaluate(d)
         ok(rep["verdict"] == "PASS",
            f"T10b: factor=1.0 with exact match should PASS, got {rep}")
+
+    # T11 (Phase 21 γ): a malformed target makes the whole verdict
+    # MALFORMED — one good target no longer masks a typo'd one, and
+    # unbounded tolerances / non-finite values / non-mappings are not
+    # silently accepted or skipped.
+    good = {"id": "ok", "metric": "measles_incidence", "target_value": 120,
+            "tolerance_factor": 1.5, "source": "WHO 2024",
+            "computed_value": 118}
+    bad_cases = {
+        "str_target": {**good, "id": "b", "target_value": "~0.3"},
+        "huge_factor": {**good, "id": "b", "tolerance_factor": 1000},
+        "inf_abs": {"id": "b", "metric": "m", "target_value": 10,
+                    "tolerance_abs": float("inf"), "source": "s",
+                    "computed_value": 1e9},
+        "wide_abs": {"id": "b", "metric": "m", "target_value": 10,
+                     "tolerance_abs": 50, "source": "s", "computed_value": 55},
+        "nan_observed": {**good, "id": "b", "computed_value": float("nan")},
+        "non_mapping": "incidence 120 per 100k",
+    }
+    for label, bad in bad_cases.items():
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "models"))
+            with open(os.path.join(d, "models", "benchmark_targets.yaml"), "w") as f:
+                yaml.safe_dump({"benchmarks": [good, bad]}, f)
+            rep = evaluate(d)
+            ok(rep["verdict"] == "MALFORMED" and rep.get("n_malformed") == 1,
+               f"T11 {label}: expected MALFORMED, got {rep['verdict']} "
+               f"(n_malformed={rep.get('n_malformed')})")
+    # T11b: a wide absolute tolerance with a written justification is ok.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "models", "benchmark_targets.yaml"), "w") as f:
+            yaml.safe_dump({"benchmarks": [{
+                "id": "b", "metric": "m", "target_value": 10,
+                "tolerance_abs": 50, "source": "s", "computed_value": 55,
+                "tolerance_justification": "survey CI spans 0-60"}]}, f)
+        rep = evaluate(d)
+        ok(rep["verdict"] == "PASS", f"T11b: justified band should PASS, got {rep}")
+    # T11c: computed_field supports list indices via the shared resolver.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "out.yaml"), "w") as f:
+            yaml.safe_dump({"series": [{"v": 5.0}, {"v": 7.0}]}, f)
+        with open(os.path.join(d, "models", "benchmark_targets.yaml"), "w") as f:
+            yaml.safe_dump({"benchmarks": [{
+                "id": "b", "metric": "m", "target_value": 7,
+                "tolerance_factor": 1.2, "source": "s",
+                "computed_field": "out.yaml::series.1.v"}]}, f)
+        rep = evaluate(d)
+        ok(rep["verdict"] == "PASS", f"T11c: indexed computed_field, got {rep}")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)

@@ -17,8 +17,8 @@ calls:
 
     validate_figure(
         png_path,
-        source_data_paths=["data/lga_pfpr.csv", ...],
-        expected_annotations=["RMSE = 0.66pp", "n=53 LGAs", ...],
+        source_data_paths=["data/district_prevalence.csv", ...],
+        expected_annotations=["RMSE = 0.66pp", "n=53 districts", ...],
     )
 
 This writes a sidecar `<png_path>.provenance.json` with:

@@ -47,20 +47,29 @@ except ImportError:
     print("ERROR: pyyaml not installed", file=sys.stderr)
     sys.exit(2)
 
-# Reuse mature utilities from the validator. Lazy import to avoid
-# circular dependency at module load time.
+# Phase 21 γ: closed verdict vocabulary (the validator treats an
+# exported VERDICTS tuple as authoritative). MISSING / ERROR are
+# fail-closed outcomes for an absent or unreadable report.md — the
+# script used to return CLEAN for both.
+VERDICTS = ("CLEAN", "REVISE", "MAJOR_REVISION", "MISSING", "ERROR")
+
+
+def normalize_verdict(v: object) -> str:
+    """'major revision' / 'major-revision' / 'Major_Revision' →
+    'MAJOR_REVISION'. Unknown strings are returned upper-cased so the
+    consumer can reject them."""
+    return re.sub(r"[\s\-]+", "_", str(v or "").strip()).upper()
+
+
+# Phase 21 γ: the helpers come from scripts/lib/md_helpers.py instead of
+# exec'ing the whole validator module.
 def _load_validator_helpers():
-    """Lazy-load _parse_md_tables, _extract_last_numeric,
-    _strip_limitations_and_scope from validate_critique_yaml.py."""
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(
-        "validate_critique_yaml",
-        os.path.join(os.path.dirname(__file__), "validate_critique_yaml.py"),
-    )
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return (mod._parse_md_tables, mod._extract_last_numeric,
-            mod._strip_limitations_and_scope)
+    """Return (_parse_md_tables, _extract_last_numeric,
+    _strip_limitations_and_scope)."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from lib import md_helpers as _md
+    return (_md._parse_md_tables, _md._extract_last_numeric,
+            _md._strip_limitations_and_scope)
 
 
 # Markdown image reference: ![caption](path/to/file.png)
@@ -123,7 +132,7 @@ class QAIssue:
 
 @dataclass
 class QAResult:
-    verdict: str  # CLEAN | REVISE | MAJOR_REVISION
+    verdict: str  # CLEAN | REVISE | MAJOR_REVISION | MISSING | ERROR
     issues: list[QAIssue] = field(default_factory=list)
     n_major: int = 0
     n_minor: int = 0
@@ -416,13 +425,19 @@ def writer_qa(run_dir: str) -> QAResult:
     """Run all writer-QA checks on report.md. Returns QAResult."""
     report_path = os.path.join(run_dir, "report.md")
     if not os.path.exists(report_path):
-        return QAResult(verdict="CLEAN", issues=[])
+        return QAResult(verdict="MISSING", issues=[QAIssue(
+            kind="report_missing", severity="MAJOR", section=None,
+            description="report.md does not exist; nothing was QA'd.",
+            evidence=report_path)], n_major=1)
 
     try:
-        with open(report_path) as f:
+        with open(report_path, encoding="utf-8") as f:
             text = f.read()
-    except (OSError, UnicodeDecodeError):
-        return QAResult(verdict="CLEAN", issues=[])
+    except (OSError, UnicodeDecodeError) as e:
+        return QAResult(verdict="ERROR", issues=[QAIssue(
+            kind="report_unreadable", severity="MAJOR", section=None,
+            description=f"report.md could not be read ({type(e).__name__}).",
+            evidence=str(e)[:200])], n_major=1)
 
     # Lazy-load helpers from validate_critique_yaml.
     parse_tables, extract_numeric, strip_limitations = _load_validator_helpers()
@@ -592,6 +607,24 @@ def _run_self_test() -> int:
             data = yaml.safe_load(f)
         ok(data["verdict"] == "CLEAN" and data["n_major"] == 0,
            f"T6: writer_qa_report.yaml roundtrip failed, got {data}")
+
+    # Phase 21 γ: missing / unreadable report.md fails closed; verdict
+    # normalization for consumers reading the YAML.
+    with tempfile.TemporaryDirectory() as d:
+        r = writer_qa(d)
+        ok(r.verdict == "MISSING" and r.n_major == 1,
+           f"T-missing: absent report.md must be MISSING, got {r.verdict}")
+        with open(os.path.join(d, "report.md"), "wb") as fh:
+            fh.write(b"\xff\xfe\x00bad utf8 \xc3\x28")
+        r = writer_qa(d)
+        ok(r.verdict == "ERROR", f"T-unreadable: must be ERROR, got {r.verdict}")
+    for raw, want in (("major revision", "MAJOR_REVISION"),
+                      ("Major-Revision", "MAJOR_REVISION"),
+                      (" clean ", "CLEAN"), (None, "")):
+        ok(normalize_verdict(raw) == want,
+           f"T-normalize: {raw!r} → {normalize_verdict(raw)!r}, want {want!r}")
+    ok(set(VERDICTS) >= {"CLEAN", "REVISE", "MAJOR_REVISION"},
+       "T-verdicts: VERDICTS must include the Phase 7 vocabulary")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)

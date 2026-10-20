@@ -17,13 +17,20 @@
 # ------------------
 #   id            stable identifier referenced by the script + validator
 #   probe         which artifact / code-scan resolves the value
-#   field         YAML dot-path or AST-literal token name to read
+#   field         YAML dot-path or AST-literal token name to read.
+#                 Phase 21 γ: `a|b` = first present of several paths.
+#   subtract_field
+#                 optional dot-path whose integer value is subtracted
+#                 from `field` (e.g. n_draws - n_errors = successful
+#                 draws; a floor on requested draws let 20% failures
+#                 through).
 #   minimum       hard floor; below → violation
 #   severity      HIGH | MEDIUM (MEDIUM only for guidance-class floors)
 #   scope_declarable
 #                 false → cannot be punted by adding a scope-declaration
 #                 entry. true → may be scope-declared with justification.
-#   triggered_by  always | uq_present | sensitivity_present | calibration_present
+#   triggered_by  always | uq_present | cloud_uq_present | sensitivity_present
+#                 | calibration_present | calibration_evidence
 #   rationale     1-2 line justification (cited in the violation message)
 #
 # To add a floor (e.g., min_bayesian_chains):
@@ -41,7 +48,8 @@ floors:
   - id: uq_min_draws_local
     probe: yaml_field
     artifact: uncertainty_report.yaml
-    field: n_draws
+    field: n_successful|n_draws
+    subtract_field: n_failed|n_errors
     minimum: 200
     severity: HIGH
     scope_declarable: false
@@ -55,7 +63,8 @@ floors:
   - id: uq_min_draws_cloud
     probe: yaml_field
     artifact: uncertainty_report.yaml
-    field: n_draws
+    field: n_successful|n_draws
+    subtract_field: n_failed|n_errors
     minimum: 1000
     severity: MEDIUM
     scope_declarable: true
@@ -67,21 +76,27 @@ floors:
   - id: sensitivity_min_perturbation_points
     probe: yaml_field_list_length
     artifact: models/sensitivity_analysis.yaml
-    field: parameters[*].perturbations
-    minimum: 3
+    # Phase 21 γ: the Phase 19 path `parameters[*].perturbations` did not
+    # exist in the canonical schema (scripts/sensitivity_analysis.py reads
+    # `load_bearing_parameters`), so every valid file failed this HIGH,
+    # non-declarable floor. Three points = the primary value plus two
+    # flanking perturbations, hence minimum 2 perturbations per parameter.
+    field: load_bearing_parameters[*].perturbations
+    minimum: 2
     severity: HIGH
     scope_declarable: false
     triggered_by: sensitivity_present
     rationale: |
       One alternative value per parameter (the Phase 8 π minimum) is
       enough to spot a sign-flip but not to characterize a response
-      surface. Three points (centered + two flanks) is the floor for
-      claiming "robust to ±X% perturbation."
+      surface. Three points (the primary value + two flanking
+      perturbations) is the floor for claiming "robust to ±X%
+      perturbation."
 
   - id: sensitivity_min_params_perturbed
     probe: yaml_field_list_length
     artifact: models/sensitivity_analysis.yaml
-    field: parameters
+    field: load_bearing_parameters
     minimum: 5
     severity: MEDIUM
     scope_declarable: true
@@ -89,6 +104,27 @@ floors:
     rationale: |
       Perturbing 2 "load-bearing" parameters is the bare minimum; 5
       gives meaningful coverage of typical calibration surfaces.
+
+  - id: calibration_result_missing
+    # Phase 21 γ: the three calibration floors below only fire when
+    # models/calibration_result.yaml exists, so the cheapest way to pass
+    # them was to never write it. When other artifacts show parameters
+    # were fitted (identifiability manifest, model comparison with
+    # k_params > 0, a calibration log/output), the result file itself is
+    # required.
+    probe: artifact_present
+    artifact: models/calibration_result.yaml
+    field: "-"
+    minimum: 1
+    severity: HIGH
+    scope_declarable: false
+    triggered_by: calibration_evidence
+    rationale: |
+      Parameters were fitted (identifiability / model-comparison /
+      calibration outputs exist) but models/calibration_result.yaml is
+      absent, so restart count, iteration budget, and held-out fold
+      cannot be verified. Write it with n_restarts, n_iterations, and
+      held_out_fold.indices.
 
   - id: calibration_min_restarts
     probe: yaml_field
@@ -150,5 +186,5 @@ floors:
     rationale: |
       AST scan for TODO/FIXME/HACK markers, bare `pass` exception
       handlers, hard-coded "shortcut" literals (n_replicates=1,
-      maxiter=10, n_draws=10, t_end=5 for malaria). Each marker is one
+      maxiter=10, n_draws=10, n_trials=5). Each marker is one
       MEDIUM; >= 3 markers escalates to HIGH (handled in validator).

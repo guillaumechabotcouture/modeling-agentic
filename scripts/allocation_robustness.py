@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 
@@ -63,6 +64,9 @@ VALID_HOLDOUT_METHODS = {
     "leave-one-out",
     "k-fold",
 }
+
+# Closed verdict vocabulary (read by validate_critique_yaml.py).
+VERDICTS = ("ROBUST", "FRAGILE", "UNSTABLE", "MALFORMED", "MISSING")
 
 # Verdict thresholds — applied to WORST-fold metrics.
 ROBUST_RANK_CORR_MIN = 0.70
@@ -141,13 +145,25 @@ def validate_allocation_robustness(yaml_path: str) -> dict:
         errors.append("metrics must be a mapping")
         metrics = {}
 
+    # Phase 21 γ: a present worst-fold metric must be a finite number.
+    # `null` / NaN / inf / strings were treated as "no signal" by
+    # compute_verdict, so a missing measurement could yield ROBUST.
+    worst_keys = [f"{base}_worst_fold" for base in
+                  ("rank_correlation", "cases_averted_gap_pct",
+                   "rule_classification_concordance_pct")]
+    finite_present = 0
+    for k in worst_keys:
+        if k not in metrics:
+            continue
+        v = metrics[k]
+        if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                or not math.isfinite(v):
+            errors.append(f"metrics.{k} must be a finite number, got {v!r}")
+        else:
+            finite_present += 1
+
     # At minimum, require ONE of the three metric pairs.
-    has_any_metric = any(
-        f"{base}_worst_fold" in metrics
-        for base in ("rank_correlation",
-                     "cases_averted_gap_pct",
-                     "rule_classification_concordance_pct")
-    )
+    has_any_metric = finite_present > 0 or any(k in metrics for k in worst_keys)
     if not has_any_metric:
         errors.append(
             "metrics must include at least one of: "
@@ -180,6 +196,21 @@ def _run_self_test() -> int:
             failures.append(label)
 
     with tempfile.TemporaryDirectory() as d:
+        # Case T0 (Phase 21 γ): null / NaN / inf / string worst-fold
+        # metrics are MALFORMED, never ROBUST.
+        for bad in ("null", ".nan", ".inf", "'high'"):
+            fb = os.path.join(d, "t0.yaml")
+            with open(fb, "w") as f:
+                f.write(
+                    "holdout_method: leave-one-out\n"
+                    "n_folds: 10\n"
+                    "metrics:\n"
+                    f"  rank_correlation_worst_fold: {bad}\n"
+                    "verdict: ROBUST\n")
+            r0 = validate_allocation_robustness(fb)
+            ok(r0["verdict"] == "MALFORMED",
+               f"T0: worst-fold {bad} must be MALFORMED, got {r0['verdict']}")
+
         # Case T1: ROBUST.
         f1 = os.path.join(d, "t1.yaml")
         with open(f1, "w") as f:

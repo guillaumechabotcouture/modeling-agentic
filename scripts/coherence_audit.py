@@ -55,6 +55,21 @@ import yaml
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _THIS_DIR)
 import numeric_consistency as _nc  # type: ignore  # noqa: E402
+from lib.text_spans import code_spans, in_spans  # noqa: E402
+
+
+# Phase 21 γ: kept as thin wrappers (shared implementation in
+# scripts/lib/text_spans.py).
+def _fenced_or_inline_code_spans(text: str) -> list[tuple[int, int]]:
+    return code_spans(text, inline=True)
+
+
+def _in_protected_span(spans: list[tuple[int, int]], pos: int) -> bool:
+    return in_spans(spans, pos)
+
+
+# Closed verdict vocabulary (read by validate_critique_yaml.py).
+VERDICTS = ("CLEAN", "DRIFT_DETECTED")
 
 
 # ---------------------------------------------------------------------------
@@ -176,35 +191,29 @@ def _audit_label_coherence(run_dir: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 # Tolerance for numeric drift before we flag. The 161312 R-020 case is a
-# 7-LGA gap on 691 (1.0%); the $197M vs $177M conflation is 11%. We pick
-# 5% as the default threshold — large enough to ignore rounding, small
-# enough to catch conflation.
+# 1.0% gap; the $197M vs $177M conflation is 11%. We pick 5% as the
+# default threshold — large enough to ignore rounding, small enough to
+# catch conflation.
 _COUNT_DRIFT_THRESHOLD = 0.05
+
+_COST_COLUMNS = ("annual_cost", "cost_usd", "total_cost_usd", "cost",
+                 "total_cost", "cost_3yr")
+_PACKAGE_COLUMNS = ("package", "assigned_package", "package_name")
 
 
 def _read_allocation_csv(run_dir: str) -> list[dict] | None:
     """Find and parse the allocation CSV.
 
-    Searches the same locations as
-    `validate_critique_yaml.py::_find_allocation_csvs`: run_dir root,
-    then `data/` and `models/` subdirectories. Real runs place
-    allocation CSVs in any of these (root for 161312 / 115318;
-    `models/` for several earlier runs in 224202-class trees).
+    Phase 21 γ: resolution is shared with numeric_consistency
+    (`allocation.canonical_csv` → models/allocation_result.csv → first
+    *allocation*.csv under models/, run root, data/, preferring the
+    optimized one), so both auditors read the same file.
     """
-    candidates = ("allocation_optimized.csv", "allocation.csv")
-    search_dirs = (run_dir,
-                   os.path.join(run_dir, "data"),
-                   os.path.join(run_dir, "models"))
-    for d in search_dirs:
-        for name in candidates:
-            path = os.path.join(d, name)
-            if os.path.exists(path):
-                try:
-                    with open(path) as f:
-                        return list(csv.DictReader(f))
-                except OSError:
-                    return None
-    return None
+    path = _nc._resolve_alloc_path(run_dir)
+    if path is None:
+        return None
+    rows = _nc._read_csv_rows(path)
+    return rows or None
 
 
 # Threshold/hypothetical markers that disqualify a "$X for package P"
@@ -216,124 +225,104 @@ _HYPOTHETICAL_MARKERS = (
     "rises above", "drops below",
 )
 
-# "$X budget" sub-patterns where X is the dollar amount itself —
-# the prose is naming the budget pool, not a package cost.
+# "$X budget" sub-patterns where X is the dollar amount itself — the
+# prose is naming the budget pool, not a package cost. Phase 21 γ:
+# generic ("$320M grant budget", "the $45M programme envelope"), no
+# funder-specific keywords.
 _BUDGET_POOL_PATTERNS = (
-    re.compile(r"\$\s*[\d.,]+\s*M?\s+(?:gc7|annual|total|overall)\s+budget",
-               re.IGNORECASE),
-    re.compile(r"the\s+\$\s*[\d.,]+\s*M?\s+(?:gc7|annual|total|overall)?\s*budget",
+    re.compile(r"\$\s*[\d.,]+\s*(?:[MBK]|million|billion|thousand)?\s+"
+               r"(?:[A-Za-z0-9\-]+\s+){0,2}(?:budget|envelope|allocation\b)",
                re.IGNORECASE),
 )
 
+# Unit-price suffix right after an amount: "$1,500/DALY", "$30 per
+# case", "$8/person/year". Generic: any "/word" or "per word".
+# "$320M/774" (a per-unit budget share) is a ratio too.
+_PER_UNIT_SUFFIX_RE = re.compile(r"\s*(?:/\s*[A-Za-z0-9]|per\s+[A-Za-z])",
+                                 re.IGNORECASE)
 
-def _scan_dollar_amount_with_package(doc_text: str) -> list[dict]:
-    """Find prose like 'PBO LLIN 80% costs ~$197M' tightly enough
-    to catch package-cost claims, and discard threshold/hypothetical
-    framings (e.g., 'SMC becomes cost-effective if budget exceeds
-    $450M' is NOT a claim that SMC costs $450M).
+
+def _scan_dollar_amount_with_package(doc_text: str,
+                                     vocab: Any = None) -> list[dict]:
+    """Find prose like '<package> costs ~$197M' tightly enough to catch
+    package-cost claims, and discard threshold/hypothetical framings
+    (e.g., 'X becomes cost-effective if budget exceeds $450M' is NOT a
+    claim that X costs $450M).
+
+    Phase 21 γ: package names come from the run vocabulary (allocation
+    CSV package ids, labels, unique tokens, schema aliases) instead of a
+    fixed intervention list.
     """
+    vocab = vocab or _nc.RunVocabulary()
     out: list[dict] = []
-    pkg_tokens = ["pbo llin", "pbo+irs", "dual-ai", "dual ai",
-                  "standard llin", "smc", "irs", "pbo"]
-    seen: set[tuple[int, int]] = set()
-    for pkg_tok in pkg_tokens:
-        # Tight span (60 chars) between package keyword and the dollar
-        # amount. Forbid intervening sentence boundaries ('.' or '|'
-        # which mark table cells we want to read separately) and the
-        # word "if" (which strongly signals hypothetical framing).
-        pat = re.compile(
-            rf"\b({re.escape(pkg_tok)})\b[^.|\n]{{0,60}}?"
-            r"\$\s*([\d.,]+)\s*(M|million|K|k|thousand)?",
-            re.IGNORECASE,
-        )
-        for m in pat.finditer(doc_text):
-            key = (m.start(), m.end())
-            if key in seen:
-                continue
-            seen.add(key)
-            try:
-                amt = float(m.group(2).replace(",", ""))
-            except ValueError:
-                continue
-            unit = (m.group(3) or "").lower()
-            if unit in ("m", "million"):
-                amt *= 1_000_000
-            elif unit in ("k", "thousand"):
-                amt *= 1_000
-            elif amt < 1_000_000:
-                # No unit suffix AND amount < $1M: almost always a
-                # per-unit ratio ($/DALY, $/case, $/person) or per-
-                # person cost ($1.20/person/yr), not a portfolio claim
-                # worth checking against the CSV. Phase 17 ε: skip
-                # these to eliminate the 115318-retro false-positive
-                # class. Bare amounts ≥ $1M (e.g., "$320,000,000")
-                # are kept — they are rare but legitimate portfolio
-                # claims when prose writes the integer instead of
-                # using an M suffix.
-                continue
-            # Wider context window for filtering
-            ctx_start = max(0, m.start() - 80)
-            ctx_end = min(len(doc_text), m.end() + 80)
-            ctx = doc_text[ctx_start:ctx_end].replace("\n", " ")
-            cl = ctx.lower()
-            # Skip hypothetical/threshold framings
-            if any(mk in cl for mk in _HYPOTHETICAL_MARKERS):
-                continue
-            # Skip if the matched dollar amount IS the budget pool
-            # (e.g., "$320M GC7 budget" — naming the budget, not a
-            # package cost). Check the 40 chars after the dollar
-            # match to see if the dollar phrase IS the budget.
-            after_dollar = doc_text[m.end():
-                                     min(len(doc_text), m.end() + 40)]
-            full_dollar_phrase = m.group(0) + after_dollar
-            if any(p.search(full_dollar_phrase) for p in _BUDGET_POOL_PATTERNS):
-                continue
-            # Skip per-unit cost ratios (e.g., "$1,500/DALY",
-            # "$30/case", "$8/person/year") — these are unit prices,
-            # not portfolio costs. Phase 17 ε regression fix: the
-            # 115318 retro had 6 false positives where $/DALY ratios
-            # in narrative were classified as package costs.
-            ratio_suffix = doc_text[m.end():
-                                    min(len(doc_text), m.end() + 25)].lower()
-            if any(s in ratio_suffix for s in
-                   ("/daly", "/case", "/person", " per daly",
-                    " per case", " per person")):
-                continue
-            # Skip markdown table rows — table cells often pair
-            # benchmark-vs-our-value comparisons that aren't package-cost
-            # claims (e.g., "IRS outcompetes SMC at $320M" — naming the
-            # comparison budget, not claiming IRS cost = $320M).
-            if _nc._is_table_row(doc_text, m.start()):
-                continue
-            out.append({
-                "package_token": _nc._normalize_package_token(pkg_tok),
-                "dollar_usd": amt,
-                "context": ctx,
-                "match_start": m.start(),
-            })
+    amount_re = re.compile(
+        r"[^.|\n]{0,60}?\$\s*([\d.,]+)\s*(?:(M|million|K|k|thousand|B|billion)\b)?",
+        re.IGNORECASE)
+    for ps, pe, pid in vocab.find_packages(doc_text):
+        if _nc._joined_combination(doc_text, pe, vocab):
+            continue  # "X+Y costs $…" names a combination, not package X
+        m = amount_re.match(doc_text, pe)
+        if m is None or re.search(r"\bif\b", m.group(0), re.IGNORECASE):
+            continue
+        dollar_start = m.start() + m.group(0).rfind("$")
+        try:
+            amt = float(m.group(1).replace(",", "").rstrip("."))
+        except ValueError:
+            continue
+        unit = (m.group(2) or "").lower()
+        if unit in ("m", "million"):
+            amt *= 1_000_000
+        elif unit in ("k", "thousand"):
+            amt *= 1_000
+        elif unit in ("b", "billion"):
+            amt *= 1_000_000_000
+        elif amt < 1_000_000:
+            # No unit suffix AND amount < $1M: almost always a per-unit
+            # price, not a portfolio claim (Phase 17 ε).
+            continue
+        ctx_start = max(0, ps - 80)
+        ctx_end = min(len(doc_text), m.end() + 80)
+        ctx = doc_text[ctx_start:ctx_end].replace("\n", " ")
+        if any(mk in ctx.lower() for mk in _HYPOTHETICAL_MARKERS):
+            continue
+        phrase = doc_text[dollar_start:min(len(doc_text), m.end() + 40)]
+        if any(p.match(phrase) for p in _BUDGET_POOL_PATTERNS):
+            continue
+        if _PER_UNIT_SUFFIX_RE.match(doc_text, m.end()):
+            continue
+        if _nc._is_table_row(doc_text, ps):
+            continue
+        out.append({
+            "package_token": pid,
+            "dollar_usd": amt,
+            "context": ctx,
+            "match_start": ps,
+        })
     return out
 
 
+def _pkg_tokens(pid: str) -> set[str]:
+    return {t for t in re.split(r"[_\-\s+]+", pid.lower()) if t}
+
+
 def _audit_cross_file_counts(run_dir: str) -> list[dict]:
-    """Reconcile prose numerics against allocation_optimized.csv."""
+    """Reconcile prose numerics against the allocation CSV."""
     violations: list[dict] = []
     rows = _read_allocation_csv(run_dir)
     if rows is None or not rows:
         return violations
+    vocab = _nc.build_vocabulary(run_dir, alloc_rows=rows)
 
-    # Compute canonical aggregates from the CSV. Cost column varies
-    # across run schemas: older runs (161312) use `annual_cost`; newer
-    # runs (115318+) use `cost_usd`. Try both.
-    cost_columns = ("annual_cost", "cost_usd")
+    pkg_col = _nc._pick_col(rows, _PACKAGE_COLUMNS)
     pkg_counts: dict[str, int] = {}
     pkg_costs: dict[str, float] = {}
     for r in rows:
-        pkg = r.get("package", "").strip()
+        pkg = (r.get(pkg_col) or "").strip().lower() if pkg_col else ""
         if not pkg:
             continue
         pkg_counts[pkg] = pkg_counts.get(pkg, 0) + 1
         cost = 0.0
-        for col in cost_columns:
+        for col in _COST_COLUMNS:
             v = r.get(col)
             if v not in (None, ""):
                 try:
@@ -343,7 +332,6 @@ def _audit_cross_file_counts(run_dir: str) -> list[dict]:
                     continue
         pkg_costs[pkg] = pkg_costs.get(pkg, 0.0) + cost
 
-    # Read the report (the writer's output is the primary target)
     for prose_file in ("report.md", "decision_rule.md", "results.md"):
         ppath = os.path.join(run_dir, prose_file)
         if not os.path.exists(ppath):
@@ -355,27 +343,21 @@ def _audit_cross_file_counts(run_dir: str) -> list[dict]:
             continue
 
         # Sub-duty 2a: package counts
-        # _scan_package_counts returns (count, package_norm, context).
-        for n, pkg_norm, ctx in _nc._scan_package_counts(text):
-            if not pkg_norm:
-                continue
-            # Map base tokens (e.g., 'pbo' / 'irs') to a CSV package
-            # key. 'pbo' likely refers to 'pbo_llin_80'; 'smc' to
-            # 'smc' or 'pbo_llin_80_smc' depending on context.
-            csv_pkg_key = _resolve_csv_package(pkg_norm, ctx, pkg_counts)
-            canonical = pkg_counts.get(csv_pkg_key) if csv_pkg_key else None
+        for n, pkg_id, ctx in _nc._scan_package_counts(text, vocab):
+            canonical = pkg_counts.get(pkg_id)
             if canonical is None:
                 continue
             if abs(n - canonical) / max(canonical, 1) > _COUNT_DRIFT_THRESHOLD:
-                line_no = text.count("\n", 0, text.find(ctx.strip()[:20])) + 1 \
-                    if ctx.strip()[:20] in text else 1
+                anchor = ctx.strip()[:20]
+                line_no = (text.count("\n", 0, text.find(anchor)) + 1
+                           if anchor in text else 1)
                 violations.append({
                     "id": f"CA-C-{len(violations) + 1:03d}",
                     "severity": "HIGH",
                     "duty": "cross_file_counts",
                     "location": f"{prose_file}:~{line_no}",
                     "claim": (
-                        f"Prose says {n} LGAs for package {pkg_norm!r}, "
+                        f"Prose says {n} units for package {pkg_id!r}, "
                         f"but allocation CSV has {canonical}. "
                         f"Drift {abs(n - canonical)/canonical*100:.1f}%. "
                         f"Context: …{ctx.strip()[:120]}…"
@@ -385,54 +367,39 @@ def _audit_cross_file_counts(run_dir: str) -> list[dict]:
                     "drifted_value": n,
                 })
 
-        # Sub-duty 2b: package costs (the $197M conflation class)
-        for hit in _scan_dollar_amount_with_package(text):
-            pkg_norm = hit["package_token"]
+        # Sub-duty 2b: package costs (the $197M conflation class).
+        # Two readings: (a) cost of units assigned exactly this package;
+        # (b) cost of every package that contains this package's
+        # components (e.g. "a" inside "a_plus_b"). Flag only when the
+        # prose differs from BOTH.
+        for hit in _scan_dollar_amount_with_package(text, vocab):
+            pkg_id = hit["package_token"]
             amt = hit["dollar_usd"]
-            # Look up canonical cost for this package. Two possible
-            # interpretations: (a) cost OF this package's LGAs,
-            # (b) cost contribution OF this package across all LGAs
-            # (only meaningful if packages compose, e.g., PBO is in
-            # both pbo_llin_80 and pbo_llin_80_irs). The safer check:
-            # flag only when the prose's $-amount differs from BOTH
-            # interpretations by > threshold.
-            if pkg_norm in pkg_costs:
-                canonical_a = pkg_costs[pkg_norm]
-            else:
-                # Try fuzzy match
-                canonical_a = None
-                for csv_pkg in pkg_costs:
-                    if pkg_norm in csv_pkg:
-                        canonical_a = pkg_costs[csv_pkg]
-                        break
+            canonical_a = pkg_costs.get(pkg_id)
             if canonical_a is None:
                 continue
-            # Interpretation (b): cost of any package whose name
-            # CONTAINS this token (e.g., 'pbo' is in both pbo_llin_80
-            # and pbo_llin_80_irs). Sum those.
-            canonical_b = sum(
-                c for k, c in pkg_costs.items() if pkg_norm in k
-            )
+            toks = _pkg_tokens(pkg_id)
+            canonical_b = sum(c for k, c in pkg_costs.items()
+                              if toks <= _pkg_tokens(k))
             drift_a = abs(amt - canonical_a) / max(canonical_a, 1)
             drift_b = abs(amt - canonical_b) / max(canonical_b, 1)
-            # Flag when neither interpretation matches AND the prose
-            # is NOT plausibly close to either.
             if drift_a > _COUNT_DRIFT_THRESHOLD and \
                     drift_b > _COUNT_DRIFT_THRESHOLD:
                 line_no = text.count("\n", 0, hit["match_start"]) + 1
                 violations.append({
                     "id": f"CA-C-{len(violations) + 1:03d}",
-                    "severity": "MEDIUM",  # Cost conflation is often
-                    # MEDIUM-grade because it can be defensible (e.g.,
-                    # rounding); HIGH only if drift > 25%.
+                    # MEDIUM by default (can be defensible rounding);
+                    # HIGH when > 25% off both readings.
+                    "severity": ("HIGH" if drift_a > 0.25 and drift_b > 0.25
+                                 else "MEDIUM"),
                     "duty": "cross_file_counts",
                     "location": f"{prose_file}:~{line_no}",
                     "claim": (
                         f"Prose says ${amt/1e6:.1f}M for package "
-                        f"{pkg_norm!r}, but CSV-computed cost is "
-                        f"${canonical_a/1e6:.1f}M (LGAs assigned this "
+                        f"{pkg_id!r}, but CSV-computed cost is "
+                        f"${canonical_a/1e6:.1f}M (units assigned this "
                         f"exact package) or ${canonical_b/1e6:.1f}M "
-                        f"(any package containing {pkg_norm!r}). "
+                        f"(any package containing it). "
                         f"Min drift {min(drift_a, drift_b)*100:.1f}%. "
                         f"Context: …{hit['context'].strip()[:120]}…"
                     ),
@@ -443,69 +410,7 @@ def _audit_cross_file_counts(run_dir: str) -> list[dict]:
                     ),
                     "drifted_value": f"${amt/1e6:.1f}M",
                 })
-                # Escalate to HIGH if drift is > 25% on both
-                if drift_a > 0.25 and drift_b > 0.25:
-                    violations[-1]["severity"] = "HIGH"
-
-    # Track totals for the summary
     return violations
-
-
-def _resolve_csv_package(
-    base_token: str, ctx: str, pkg_counts: dict[str, int]
-) -> str | None:
-    """Map a base package token (e.g., 'pbo', 'irs') from the prose
-    scan to the canonical CSV package key.
-
-    Priority:
-      1. Exact match (e.g., 'smc' → 'smc' if present in CSV).
-      2. Context-augmented match (e.g., 'pbo' + 'IRS' in context →
-         'pbo_llin_80_irs'; 'pbo' alone → 'pbo_llin_80').
-      3. First fuzzy substring match.
-    """
-    if not pkg_counts:
-        return None
-    # 1. Exact
-    if base_token in pkg_counts:
-        return base_token
-    # 2. Context-augmented for known compositions
-    cl = ctx.lower()
-    bt = base_token.lower()
-    if bt in ("pbo", "llin_pbo"):
-        if "irs" in cl and "pbo_llin_80_irs" in pkg_counts:
-            return "pbo_llin_80_irs"
-        if "smc" in cl and "pbo_llin_80_smc" in pkg_counts:
-            return "pbo_llin_80_smc"
-        if "pbo_llin_80" in pkg_counts:
-            return "pbo_llin_80"
-    # 3. Fuzzy substring
-    for csv_pkg in pkg_counts:
-        if bt in csv_pkg or csv_pkg in bt:
-            return csv_pkg
-    return None
-
-
-def _extract_package_from_context(ctx: str) -> str | None:
-    """Best-effort: extract a normalized package token from a
-    context window. Used to attach package_count scan results to
-    a CSV package."""
-    cl = ctx.lower()
-    candidates = [
-        ("pbo llin 80% + irs", "pbo_llin_80_irs"),
-        ("pbo llin 80% + smc", "pbo_llin_80_smc"),
-        ("pbo+irs", "pbo_llin_80_irs"),
-        ("pbo llin 80%", "pbo_llin_80"),
-        ("pbo llin", "pbo_llin_80"),
-        ("dual-ai", "llin_dual_ai"),
-        ("dual ai", "llin_dual_ai"),
-        ("standard llin", "llin_standard"),
-        ("smc", "smc"),
-        ("irs", "irs"),
-    ]
-    for needle, norm in candidates:
-        if needle in cl:
-            return norm
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -633,21 +538,19 @@ def _audit_self_contradicting(run_dir: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Duty 4 — Ledger binding (Phase 18 β + δ)
+# Duty 4 — Ledger binding (Phase 18 β + δ, Phase 21 γ)
 # ---------------------------------------------------------------------------
-
-# 5% proximity: a prose value within ±5% of any ledger numeric value
-# is considered bound. Phase 18 δ — the original implementation
-# claimed this in a comment but only checked exact-string matches.
-_PROXIMITY_TOLERANCE = 0.05
+#
+# Phase 21 γ binding rule. A prose number binds to a ledger value only
+# when the NEAREST same-kind ledger value (value or CI endpoint) renders
+# to the prose figure at the prose figure's own precision: |ledger −
+# prose| < one unit of the last displayed digit ("$197M" binds 197.8M,
+# "$335M" does not bind 320M; "52.4%" does not bind 50%). The Phase 18 δ
+# flat 5% band let nearby invented numbers through.
 
 # Generic-use qualifiers for verdict labels — when these phrases
 # appear in the 25-char window around a label match, the label is
-# treated as English usage, not a verdict claim. Phase 18 δ extends
-# the original (robust to / sensitive analysis / sensitivity
-# analysis) with common methodology phrases that produce false
-# positives ("supported by WHO guidelines", "refuted by recent
-# evidence", "inconclusive evidence").
+# treated as English usage, not a verdict claim.
 _LEDGER_BINDING_GENERIC_USE_QUALIFIERS = (
     "robust to", "robust against", "robust standard",
     "sensitive to", "sensitive analysis", "sensitive parameters",
@@ -657,98 +560,134 @@ _LEDGER_BINDING_GENERIC_USE_QUALIFIERS = (
     "inconclusive evidence", "inconclusive results",
 )
 
+_VERDICT_WORDS = ("ROBUST", "SENSITIVE", "UNSTABLE", "SUPPORTED",
+                  "REFUTED", "INCONCLUSIVE")
 
-# Phase 20 α: CI/credible-interval/significance-level prose markers.
-# When any of these appears in a ±35-char window around a `N%` match,
-# the percentage is interval-coverage metadata, not a claim value, and
-# the ledger-binding scan filters it out. Sufficiency-critic (Phase 19
-# δ) actively incentivizes Bayesian framing — without these qualifiers
-# the next run would fire HIGH on every "95% credible interval" /
-# "5% significance level" / "(CI: ...)" the writer produces.
-_PERCENTAGE_CI_METADATA_PHRASES = (
-    " ci", " ci:", " ci,", " ci)", " ci.", " ci-",
-    "(ci ", "(ci:", "(ci,",
-    "confidence interval", "credible interval", "credible region",
-    "credibility region", "credibility interval", "credible band",
-    "bayesian ci",
-    "significance level", "ci coverage",
+# A percentage is interval/test METADATA (not a claim) when the words
+# right after it name the interval or test ("95% CI", "95% credible
+# interval", "(95% CI: …)", "5% significance level") or the words right
+# before it do ("coverage of 95%", "at the 5% level"). Phase 21 γ: the
+# Phase 20 α ±35-char window also skipped claim values that merely sat
+# near a CI ("99% (95% CI: 10-20%)" skipped the 99%) and matched
+# " ci" inside "city".
+_PCT_METADATA_RIGHT_RE = re.compile(
+    r"^\s*\(?\s*(?:bayesian\s+)?(?:ci|cri|ui|pi|hdi|hpd)\b"
+    r"|^\s*(?:bayesian\s+)?(?:confidence|credible|credibility|uncertainty|"
+    r"prediction|posterior|highest[\s-]density)\s+"
+    r"(?:interval|region|band|level|bound)"
+    r"|^\s*(?:significance|confidence)\s+level"
+    r"|^\s*level\b",
+    re.IGNORECASE)
+_PCT_METADATA_LEFT_RE = re.compile(
+    # Only interval coverage is metadata; bare "coverage 80%" is
+    # intervention coverage, a claim.
+    r"(?:(?:ci|interval|nominal|credible)\s+coverage|significance|alpha|"
+    r"confidence\s+level)\s*(?:of|=|:|at)?\s*$",
+    re.IGNORECASE)
+
+# Currency prefixes recognized in prose (amounts are compared to the
+# ledger's currency values numerically; the code is kept for display).
+_CURRENCY_PREFIX = r"(US\$|\$|USD\s?|EUR\s?|€|£|GBP\s?|₦|NGN\s?|KES\s?|INR\s?|₹)"
+
+_MAG = {"b": 1e9, "bn": 1e9, "billion": 1e9,
+        "m": 1e6, "mn": 1e6, "million": 1e6,
+        "k": 1e3, "thousand": 1e3}
+_MAG_DISPLAY = {"b": "B", "bn": "B", "billion": "B",
+                "m": "M", "mn": "M", "million": "M",
+                "k": "K", "thousand": "K"}
+
+_NUMBER = r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)"
+
+_PAT_CURRENCY = re.compile(
+    _CURRENCY_PREFIX + r"\s*" + _NUMBER +
+    r"(?:\s*(billion|bn|million|mn|thousand|[BMK]|k)(?![A-Za-z]))?",
+    re.IGNORECASE)
+# Case-sensitive single-letter suffixes: "100m" is metres (a raster
+# resolution), "5 b" is not a magnitude; "100M"/"5B"/"22K"/"22k" are.
+_PAT_SCALAR = re.compile(
+    r"(?<![\$\d.,€£₦₹])" + _NUMBER +
+    r"\s*((?i:billion|million|thousand)|bn|mn|[BMK]|k)(?![A-Za-z])")
+_PAT_PERCENT = re.compile(r"(?<![\d.,])(\d+(?:\.\d+)?)\s*%")
+_PAT_PCT_RANGE = re.compile(
+    r"(?<![\d.,])(\d+(?:\.\d+)?)\s*%?\s*(?:–|—|-|to)\s*\d+(?:\.\d+)?\s*%")
+_PAT_COMMA_INT = re.compile(r"(?<![\d.,$€£₦₹])(\d{1,3}(?:,\d{3})+)(?![\d,]|\.\d)")
+_PAT_RAW_CLAIM = re.compile(r"\[CLAIM:[^\]\n]*\]")
+_PAT_LABEL = re.compile(
+    r"\b((?:NOT|NON)[\s_\-]+)?(" + "|".join(_VERDICT_WORDS) + r")\b",
+    re.IGNORECASE)
+
+# Generic allocation-unit / count nouns (plural forms included via the
+# regex). Domain-neutral: admin units, sites, modeling objects.
+_COUNT_UNITS = (
+    "lga", "lgas", "district", "districts", "county", "counties",
+    "province", "provinces", "region", "regions", "zone", "zones",
+    "state", "states", "ward", "wards", "commune", "communes",
+    "municipality", "municipalities", "facility", "facilities",
+    "site", "sites", "cluster", "clusters", "village", "villages",
+    "archetype", "archetypes", "package", "packages", "draw", "draws",
+    "restart", "restarts", "fold", "folds", "parameter", "parameters",
+    "scenario", "scenarios", "unit", "units",
 )
+_PAT_COUNT = re.compile(
+    rf"(?<![\d.,])(\d{{1,6}}(?:,\d{{3}})*)\s+({'|'.join(_COUNT_UNITS)})\b",
+    re.IGNORECASE)
 
 
-def _fenced_or_inline_code_spans(text: str) -> list[tuple[int, int]]:
-    """Return spans of fenced code blocks and inline-code regions.
-    Phase 20 α: report.md may legitimately contain `[CLAIM:id]` inside
-    a code fence (documenting the syntax) — the audit must not fire
-    `raw_claim` HIGH on those documented examples.
-    """
-    spans: list[tuple[int, int]] = []
-    fence_pat = re.compile(r"^(?:```|~~~)", re.MULTILINE)
-    starts = [m.start() for m in fence_pat.finditer(text)]
-    for i in range(0, len(starts) - 1, 2):
-        end_idx = text.find("\n", starts[i + 1])
-        if end_idx == -1:
-            end_idx = len(text)
-        spans.append((starts[i], end_idx + 1))
-    inline_pat = re.compile(r"`[^`\n]+`")
-    for m in inline_pat.finditer(text):
-        if not any(s <= m.start() < e for s, e in spans):
-            spans.append((m.start(), m.end()))
-    return spans
+def _norm_label(s: str) -> str:
+    return re.sub(r"[\s_\-]+", " ", str(s).strip()).upper()
 
 
-def _in_protected_span(spans: list[tuple[int, int]], pos: int) -> bool:
-    return any(s <= pos < e for s, e in spans)
+def _last_digit_unit(num_str: str, multiplier: float) -> float:
+    """One unit of the last displayed digit, in absolute terms."""
+    s = num_str.replace(",", "")
+    decimals = len(s.split(".", 1)[1]) if "." in s else 0
+    return (10.0 ** -decimals) * multiplier
 
 
-def _within_proximity(value: float,
-                       bound_numeric_values: set[float],
-                       tolerance: float = _PROXIMITY_TOLERANCE) -> bool:
-    """Return True if `value` is within `tolerance` of any value in
-    `bound_numeric_values`. Used by `_audit_ledger_binding` so that
-    legitimate prose rounding ("$197M" when ledger has $197.8M) does
-    not fire spurious HIGH violations."""
-    if not bound_numeric_values:
+def _bound_to_nearest(value: float, unit: float,
+                      candidates: list[float]) -> bool:
+    """True when the nearest candidate is within one last-digit unit."""
+    if not candidates:
         return False
-    abs_value = abs(value)
-    for bv in bound_numeric_values:
-        denom = max(abs_value, abs(bv), 1.0)
+    nearest = min(candidates, key=lambda c: abs(c - value))
+    return abs(nearest - value) < unit * (1 - 1e-9) or nearest == value
+
+
+def _within_proximity(value: float, bound_numeric_values,
+                      tolerance: float = 0.05) -> bool:
+    """Kept for API compatibility (Phase 18 δ). Phase 21 γ binding uses
+    `_bound_to_nearest` instead."""
+    for bv in bound_numeric_values or ():
+        denom = max(abs(value), abs(bv), 1.0)
         if abs(value - bv) / denom <= tolerance:
             return True
     return False
 
 
+def _line_ctx(text: str, start: int, end: int, pad: int = 60) -> tuple[int, str]:
+    line_no = text.count("\n", 0, start) + 1
+    ctx = text[max(0, start - pad):min(len(text), end + pad)]
+    return line_no, ctx.replace("\n", " ").strip()[:140]
+
+
 def _audit_ledger_binding(run_dir: str) -> list[dict]:
     """Verify every numeric / verdict-label in report.md is ledger-bound.
 
-    Phase 18 β: with `models/claims_ledger.yaml` available, every
-    quantitative or categorical claim in report.md should have come
-    from a `[CLAIM:id]` reference (rendered post-write). After
-    rendering, the report contains the formatted values directly.
-    This duty scans the rendered report for numbers/labels and
-    confirms each appears as a ledger value.
+    Scans (outside fenced code blocks; inline code is NOT exempt for
+    numbers — a reader still sees them):
+      - Currency amounts ("$320M", "USD 900 million", "$1,200,000")
+      - Bare scalars with magnitude suffix ("7.47M DALYs", "1.2 billion")
+      - Unsuffixed comma-grouped numbers ("412,331 cases")
+      - Percentages, including both ends of ranges ("10–20%")
+      - Counts in count-unit contexts ("63 districts")
+      - Verdict labels, negation-aware ("NOT SUPPORTED" ≠ SUPPORTED)
+      - Raw `[CLAIM:...]` tokens (any id shape) that escaped rendering
 
-    Scans:
-      - Currency amounts ("$320M", "$320,000,000")
-      - Bare scalars with M/K/B suffix ("7.47M DALYs")
-      - Standalone percentages ("52.5%")
-      - Verdict labels ("ROBUST" / "SENSITIVE" / "SUPPORTED" etc.)
-      - Raw `[CLAIM:id]` tokens (Phase 18 δ — catches skipped renders)
+    Per-unit prices ("$1,500 per DALY", "$30/case") are skipped.
 
-    Matching:
-      - Verbatim string match against pre-computed renderings
-      - Numeric proximity match: a prose value within 5% of any
-        ledger numeric is considered bound (handles legitimate
-        rounding like "$197M" when ledger has $197.8M)
-      - Generic-use qualifier list filters non-claim contexts
-        ("sensitivity analysis", "supported by", etc.)
-
-    Returns HIGH per unbound number/label/raw-token. Per-duty
-    consolidation happens in `_check_coherence_audit` (Phase 10 ψ).
-
-    If `claims_ledger.yaml` is absent, this duty is a no-op (the
-    `_check_claims_ledger_present` check will fire separately).
+    No-op when either claims_ledger.yaml or report.md is absent (the
+    `_check_claims_ledger_present` check fires separately).
     """
-    violations: list[dict] = []
     ledger_path = os.path.join(run_dir, "models", "claims_ledger.yaml")
     report_path = os.path.join(run_dir, "report.md")
     if not os.path.exists(ledger_path) or not os.path.exists(report_path):
@@ -758,475 +697,207 @@ def _audit_ledger_binding(run_dir: str) -> list[dict]:
             doc = yaml.safe_load(f) or {}
     except (yaml.YAMLError, OSError):
         return []
-    ledger_claims = doc.get("claims") or []
+    ledger_claims = doc.get("claims") if isinstance(doc, dict) else None
     if not isinstance(ledger_claims, list):
         return []
-
-    # Build a "values seen" set from the ledger. For each claim,
-    # include the canonical value and (where applicable) common
-    # rendered forms — e.g., a scalar 7467997 might appear in prose
-    # as "7.47M", "7.5M", "7,467,997", etc. We index multiple
-    # renderings to make matching robust.
-    bound_values_by_kind: dict[str, set[str]] = {
-        "scalar": set(),
-        "currency": set(),
-        "percentage": set(),
-        "count": set(),
-        "label": set(),
-    }
-    # Parallel sets of canonical numeric values. Proximity is deliberately
-    # kind-aware so an unrelated count=53 cannot bind a prose percentage
-    # like 52.5%, and a scalar 320M cannot bind "$320M".
-    bound_numeric_values_by_kind: dict[str, set[float]] = {
-        "scalar": set(),
-        "currency": set(),
-        "percentage": set(),
-        "count": set(),
-    }
-
-    def _add_bound(kind: str, value: str) -> None:
-        s = str(value).strip()
-        if kind in bound_values_by_kind:
-            bound_values_by_kind[kind].add(s)
-
-    def _add_numeric(kind: str, value: float) -> None:
-        if kind in bound_numeric_values_by_kind:
-            bound_numeric_values_by_kind[kind].add(value)
-
-    for c in ledger_claims:
-        if not isinstance(c, dict):
-            continue
-        v = c.get("value")
-        kind = (c.get("claim_kind") or "").lower()
-        if v is None:
-            continue
-        # Add the bare value
-        _add_bound(kind, str(v).strip())
-        # For numeric kinds, add common renderings
-        if kind in ("scalar", "currency"):
-            try:
-                fv = float(v)
-            except (TypeError, ValueError):
-                continue
-            _add_numeric(kind, fv)
-            # Magnitude-suffix renderings at multiple precisions
-            for divisor, suffix in (
-                (1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K"),
-            ):
-                if abs(fv) >= divisor:
-                    for prec in (0, 1, 2, 3):
-                        scaled = fv / divisor
-                        _add_bound(kind, f"{scaled:.{prec}f}{suffix}")
-                        _add_bound(kind, f"{scaled:.{prec}f}".rstrip("0").rstrip(".") + suffix)
-            # Comma-formatted
-            try:
-                _add_bound(kind, f"{int(fv):,}")
-            except (ValueError, OverflowError):
-                pass
-        elif kind == "percentage":
-            try:
-                fv = float(v)
-            except (TypeError, ValueError):
-                continue
-            _add_numeric(kind, fv)
-            for prec in (0, 1, 2):
-                _add_bound(kind, f"{fv:.{prec}f}%")
-        elif kind == "label":
-            _add_bound(kind, str(v).upper())
-            _add_bound(kind, str(v).lower())
-            _add_bound(kind, str(v).title())
-        elif kind == "count":
-            try:
-                _add_bound(kind, str(int(v)))
-                _add_bound(kind, f"{int(v):,}")
-                _add_numeric(kind, float(int(v)))
-            except (TypeError, ValueError):
-                pass
-        # Add CI-bound endpoints too (so "5.14M" in prose is
-        # bound by the parent claim's ci_low even though it's not
-        # the value itself)
-        if kind not in ("scalar", "currency", "percentage"):
-            continue
-        for ci_field in ("ci_low", "ci_high"):
-            cv = c.get(ci_field)
-            if cv is None:
-                continue
-            try:
-                fcv = float(cv)
-            except (TypeError, ValueError):
-                continue
-            _add_bound(kind, str(cv).strip())
-            _add_numeric(kind, fcv)
-            for divisor, suffix in (
-                (1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K"),
-            ):
-                if abs(fcv) >= divisor:
-                    for prec in (0, 1, 2, 3):
-                        scaled = fcv / divisor
-                        _add_bound(kind, f"{scaled:.{prec}f}{suffix}")
-                        _add_bound(kind, f"{scaled:.{prec}f}".rstrip("0").rstrip(".") + suffix)
-
     try:
         with open(report_path) as f:
             text = f.read()
     except OSError:
         return []
 
-    # Phase 20 α: protect fenced code blocks and inline `code` regions.
-    # report.md may document the `[CLAIM:id]` syntax or show example
-    # values in code examples; scans below skip matches inside these
-    # spans. Note: table cells are NOT exempt — a table cell holding a
-    # number absent from the ledger is still drift. The `bound_values`
-    # lookup is what gives legitimate table cells their pass.
-    protected_spans = _fenced_or_inline_code_spans(text)
-
-    unbound: list[dict] = []
-    seen_unbound: set[str] = set()
-
-    # Scan dollar amounts (M/K-suffixed)
-    pat_dollar = re.compile(r"\$\s*([\d,]+(?:\.\d+)?)\s*(M|million|K|k|thousand|B|billion)?",
-                            re.IGNORECASE)
-    for m in pat_dollar.finditer(text):
-        if _in_protected_span(protected_spans, m.start()):
+    nums: dict[str, list[float]] = {k: [] for k in
+                                    ("scalar", "currency", "percentage", "count")}
+    labels: set[str] = set()
+    for c in ledger_claims:
+        if not isinstance(c, dict):
             continue
-        amt_str = m.group(1).replace(",", "")
-        try:
-            amt = float(amt_str)
-        except ValueError:
+        kind = str(c.get("claim_kind") or "").lower()
+        v = c.get("value")
+        if v is None:
             continue
-        unit = (m.group(2) or "").lower()
-        if unit in ("m", "million"):
-            scaled = amt * 1_000_000
-            display = f"${m.group(1).strip()}{unit.upper() if unit in ('m','k','b') else 'M'}"
-        elif unit in ("k", "thousand"):
-            scaled = amt * 1_000
-            display = f"${m.group(1).strip()}K"
-        elif unit in ("b", "billion"):
-            scaled = amt * 1_000_000_000
-            display = f"${m.group(1).strip()}B"
-        else:
-            scaled = amt
-            display = f"${m.group(1).strip()}"
-        # Consider bound if either (a) the rendered display matches a
-        # ledger value, or (b) the scaled value is within 5% of any
-        # ledger numeric value, or (c) any common rendering of `scaled`
-        # is in bound_values.
-        is_bound = False
-        # Check display string variants
-        for v_str in bound_values_by_kind["currency"]:
-            if v_str.lower().endswith(("m", "k", "b")) and v_str.lower() == display[1:].lower():
-                is_bound = True
-                break
-        # Check magnitude renderings
-        if not is_bound:
-            test_renders: list[str] = []
-            for divisor, suffix in (
-                (1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K"),
-            ):
-                if abs(scaled) >= divisor:
-                    for prec in (0, 1, 2, 3):
-                        s = f"{scaled / divisor:.{prec}f}".rstrip("0").rstrip(".") + suffix
-                        test_renders.append(s)
-            if any(r in bound_values_by_kind["currency"] for r in test_renders):
-                is_bound = True
-        # Check verbatim numeric value
-        if not is_bound:
-            if (str(int(scaled)) in bound_values_by_kind["currency"]
-                    or f"{int(scaled):,}" in bound_values_by_kind["currency"]):
-                is_bound = True
-        # Phase 18 δ: 5% proximity check — handles legitimate prose
-        # rounding ("$197M" when ledger has $197.8M). The comment
-        # block above promised this; the original implementation
-        # only had (a) and (c).
-        if not is_bound and _within_proximity(
-                scaled, bound_numeric_values_by_kind["currency"]):
-            is_bound = True
-        # Skip per-unit ratios + small bare amounts (already filtered
-        # by cross_file_counts, but apply same logic here for parity)
-        if amt < 1_000 and not unit:
+        if kind == "label":
+            labels.add(_norm_label(v))
             continue
-        # Skip if next 25 chars contain /DALY, /case, /person
-        ratio_suffix = text[m.end():min(len(text), m.end() + 25)].lower()
-        if any(s in ratio_suffix for s in
-               ("/daly", "/case", "/person", " per daly",
-                " per case", " per person")):
+        if kind not in nums:
             continue
-        if not is_bound:
-            key = display
-            if key in seen_unbound:
+        for fld in ("value", "ci_low", "ci_high"):
+            x = c.get(fld)
+            if x is None or isinstance(x, bool):
                 continue
-            seen_unbound.add(key)
-            line_no = text.count("\n", 0, m.start()) + 1
-            ctx_start = max(0, m.start() - 60)
-            ctx_end = min(len(text), m.end() + 60)
-            ctx = text[ctx_start:ctx_end].replace("\n", " ")
-            unbound.append({
-                "id": f"CA-LB-{len(unbound) + 1:03d}",
-                "severity": "HIGH",
-                "duty": "ledger_binding",
-                "location": f"report.md:{line_no}",
-                "claim": (
-                    f"Currency `{display}` in prose is not in claims_ledger.yaml. "
-                    f"Phase 18 α requires every quantitative claim to be "
-                    f"`[CLAIM:id]`-referenced and rendered from the ledger. "
-                    f"Context: …{ctx.strip()[:140]}…"
-                ),
-                "canonical_source": "models/claims_ledger.yaml",
-                "drifted_value": display,
-            })
+            try:
+                fx = float(x)
+            except (TypeError, ValueError):
+                continue
+            if fx == fx:
+                nums[kind].append(fx)
 
-    # Scan verdict labels (ROBUST/SENSITIVE/UNSTABLE/SUPPORTED/REFUTED)
-    pat_label = re.compile(
-        r"\b(ROBUST|SENSITIVE|UNSTABLE|SUPPORTED|REFUTED|INCONCLUSIVE)\b",
-        re.IGNORECASE,
-    )
-    for m in pat_label.finditer(text):
-        if _in_protected_span(protected_spans, m.start()):
-            continue
-        label_raw = m.group(1)
-        upper = label_raw.upper()
-        # Skip generic-use ("robust to perturbations", "sensitive
-        # analysis", "supported by WHO", etc.). Phase 18 δ extended
-        # the list with methodology phrases that were producing
-        # false positives in the live retro.
-        win = text[max(0, m.start() - 25):
-                   min(len(text), m.end() + 25)].lower()
-        if any(q in win for q in _LEDGER_BINDING_GENERIC_USE_QUALIFIERS):
-            continue
-        if upper in bound_values_by_kind["label"]:
-            continue
-        key = upper
-        if key in seen_unbound:
-            continue
-        seen_unbound.add(key)
-        line_no = text.count("\n", 0, m.start()) + 1
+    fenced = code_spans(text, inline=False)
+    with_inline = code_spans(text, inline=True)
+    unbound: list[dict] = []
+    seen: set = set()
+
+    def _emit(key, line_no: int, claim: str, drifted: str) -> None:
+        if key in seen:
+            return
+        seen.add(key)
         unbound.append({
             "id": f"CA-LB-{len(unbound) + 1:03d}",
             "severity": "HIGH",
             "duty": "ledger_binding",
             "location": f"report.md:{line_no}",
-            "claim": (
-                f"Verdict label {label_raw!r} in prose is not in "
-                f"claims_ledger.yaml. Phase 18 α requires verdict labels "
-                f"to be `[CLAIM:id]`-referenced from the ledger."
-            ),
+            "claim": claim,
             "canonical_source": "models/claims_ledger.yaml",
-            "drifted_value": upper,
+            "drifted_value": drifted,
         })
 
-    # Scan bare scalars with M/K/B suffix (Phase 18 δ — the original
-    # implementation only scanned currency. Bare scalars like
-    # "7.47M DALYs" are exactly the R-019 / R-020 motivating drift
-    # class; not catching them defeats the purpose).
-    pat_scalar = re.compile(
-        r"(?<![\$\d])(\d+(?:\.\d+)?)\s*(M|million|K|k|B|billion)\b",
-        re.IGNORECASE,
-    )
-    for m in pat_scalar.finditer(text):
-        if _in_protected_span(protected_spans, m.start()):
-            continue
-        try:
-            amt = float(m.group(1))
-        except ValueError:
-            continue
-        unit = (m.group(2) or "").lower()
-        if unit in ("m", "million"):
-            scaled = amt * 1_000_000
-        elif unit in ("k",):
-            scaled = amt * 1_000
-        elif unit in ("b", "billion"):
-            scaled = amt * 1_000_000_000
-        else:
-            continue
-        # Skip if next 25 chars contain /DALY etc. (per-unit ratios)
-        ratio_suffix = text[m.end():
-                            min(len(text), m.end() + 25)].lower()
-        if any(s in ratio_suffix for s in
-               ("/daly", "/case", "/person", " per daly",
-                " per case", " per person")):
-            continue
-        # Bound if exact rendering match or 5% proximity
-        is_bound = False
-        for divisor, suffix in (
-            (1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K"),
-        ):
-            if abs(scaled) >= divisor:
-                for prec in (0, 1, 2, 3):
-                    s = f"{scaled / divisor:.{prec}f}".rstrip("0").rstrip(".") + suffix
-                    if s in bound_values_by_kind["scalar"]:
-                        is_bound = True
-                        break
-            if is_bound:
-                break
-        if not is_bound and _within_proximity(
-                scaled, bound_numeric_values_by_kind["scalar"]):
-            is_bound = True
-        if is_bound:
-            continue
-        display = f"{m.group(1).strip()}{unit.upper() if unit in ('m','k','b') else 'M'}"
-        key = ("scalar", display)
-        if key in seen_unbound:
-            continue
-        seen_unbound.add(key)
-        line_no = text.count("\n", 0, m.start()) + 1
-        ctx_start = max(0, m.start() - 50)
-        ctx_end = min(len(text), m.end() + 50)
-        unbound.append({
-            "id": f"CA-LB-{len(unbound) + 1:03d}",
-            "severity": "HIGH",
-            "duty": "ledger_binding",
-            "location": f"report.md:{line_no}",
-            "claim": (
-                f"Scalar `{display}` in prose is not in claims_ledger.yaml. "
-                f"Phase 18 α requires every scalar/count to be "
-                f"`[CLAIM:id]`-referenced from the ledger. Context: "
-                f"…{text[ctx_start:ctx_end].replace(chr(10), ' ').strip()[:140]}…"
-            ),
-            "canonical_source": "models/claims_ledger.yaml",
-            "drifted_value": display,
-        })
+    def _is_per_unit(end: int) -> bool:
+        return bool(_PER_UNIT_SUFFIX_RE.match(text, end))
 
-    # Scan standalone percentages (Phase 18 δ). Bound by exact
-    # rendering or 5% proximity.
-    pat_percent = re.compile(r"(?<![\d\.])(\d+(?:\.\d+)?)\s*%")
-    for m in pat_percent.finditer(text):
-        if _in_protected_span(protected_spans, m.start()):
-            continue
-        try:
-            pct = float(m.group(1))
-        except ValueError:
-            continue
-        # Phase 20 α: filter percentages that are interval-coverage
-        # metadata (CI / credible interval / significance level /
-        # parenthetical (CI: ...) forms) — not claim values. The prior
-        # right-window-only check missed "95% credible interval",
-        # "95% Bayesian CI", "At a 95% (CI: ...)", and "5% significance
-        # level" — all of which Phase 19 δ's sufficiency critic
-        # incentivizes the writer to produce.
-        match_window = text[max(0, m.start() - 30):
-                            min(len(text), m.end() + 35)].lower()
-        if any(p in match_window
-               for p in _PERCENTAGE_CI_METADATA_PHRASES):
-            continue
-        is_bound = False
-        for prec in (0, 1, 2):
-            if f"{pct:.{prec}f}%" in bound_values_by_kind["percentage"]:
-                is_bound = True
-                break
-        if not is_bound and _within_proximity(
-                pct, bound_numeric_values_by_kind["percentage"]):
-            is_bound = True
-        if is_bound:
-            continue
-        display = f"{m.group(1).strip()}%"
-        key = ("pct", display)
-        if key in seen_unbound:
-            continue
-        seen_unbound.add(key)
-        line_no = text.count("\n", 0, m.start()) + 1
-        unbound.append({
-            "id": f"CA-LB-{len(unbound) + 1:03d}",
-            "severity": "HIGH",
-            "duty": "ledger_binding",
-            "location": f"report.md:{line_no}",
-            "claim": (
-                f"Percentage `{display}` in prose is not in "
-                f"claims_ledger.yaml (no exact-rendering match and not "
-                f"within 5% of any ledger numeric)."
-            ),
-            "canonical_source": "models/claims_ledger.yaml",
-            "drifted_value": display,
-        })
+    claimed_spans: list[tuple[int, int]] = []
 
-    # Scan bare count claims in count-unit contexts. Keep this conservative:
-    # standalone years, table row numbers, and percentages are handled elsewhere.
-    count_units = (
-        "lga", "lgas", "archetype", "archetypes", "state", "states",
-        "ward", "wards", "facility", "facilities", "package", "packages",
-        "draw", "draws", "restart", "restarts", "fold", "folds",
-        "parameter", "parameters", "scenario", "scenarios",
-    )
-    unit_alt = "|".join(count_units)
-    pat_count = re.compile(
-        rf"(?<![\d\.])(\d{{1,6}}(?:,\d{{3}})*)\s+({unit_alt})\b",
-        re.IGNORECASE,
-    )
-    for m in pat_count.finditer(text):
-        if _in_protected_span(protected_spans, m.start()):
+    # Currency
+    for m in _PAT_CURRENCY.finditer(text):
+        if in_spans(fenced, m.start()):
             continue
+        claimed_spans.append((m.start(), m.end()))
+        num_s, mag = m.group(2), (m.group(3) or "").lower()
+        mult = _MAG.get(mag, 1.0)
+        amt = float(num_s.replace(",", "")) * mult
+        if not mag and amt < 1_000:
+            continue  # small bare amounts are prices, not portfolio claims
+        if _is_per_unit(m.end()):
+            continue
+        if _bound_to_nearest(amt, _last_digit_unit(num_s, mult),
+                             nums["currency"]):
+            continue
+        display = f"{m.group(1).strip()}{num_s}{_MAG_DISPLAY.get(mag, '')}"
+        line_no, ctx = _line_ctx(text, m.start(), m.end())
+        _emit(("cur", display), line_no,
+              f"Currency `{display}` in prose is not in claims_ledger.yaml "
+              f"(no ledger currency value renders to it). Every "
+              f"quantitative claim must be `[CLAIM:id]`-referenced and "
+              f"rendered from the ledger. Context: …{ctx}…", display)
+
+    def _inside_claimed(pos: int) -> bool:
+        return any(s <= pos < e for s, e in claimed_spans)
+
+    # Scalars with magnitude suffix
+    for m in _PAT_SCALAR.finditer(text):
+        if in_spans(fenced, m.start()) or _inside_claimed(m.start()):
+            continue
+        claimed_spans.append((m.start(), m.end()))
+        num_s, mag = m.group(1), m.group(2).lower()
+        mult = _MAG[mag]
+        val = float(num_s.replace(",", "")) * mult
+        if _is_per_unit(m.end()):
+            continue
+        if _bound_to_nearest(val, _last_digit_unit(num_s, mult),
+                             nums["scalar"] + nums["count"]):
+            continue
+        display = f"{num_s}{_MAG_DISPLAY[mag]}"
+        line_no, ctx = _line_ctx(text, m.start(), m.end(), 50)
+        _emit(("scalar", display), line_no,
+              f"Scalar `{display}` in prose is not in claims_ledger.yaml. "
+              f"Every scalar/count must be `[CLAIM:id]`-referenced from "
+              f"the ledger. Context: …{ctx}…", display)
+
+    # Percentages (and lower ends of ranges)
+    pct_hits: list[tuple[int, int, str]] = []
+    for m in _PAT_PERCENT.finditer(text):
+        pct_hits.append((m.start(1), m.end(), m.group(1)))
+    for m in _PAT_PCT_RANGE.finditer(text):
+        pct_hits.append((m.start(1), m.end(1), m.group(1)))
+    for start, end, num_s in sorted(set(pct_hits)):
+        if in_spans(fenced, start) or _inside_claimed(start):
+            continue
+        after = text[end:end + 40]
+        if after.startswith("%"):
+            after = after[1:]
+        if _PCT_METADATA_RIGHT_RE.match(after) or \
+                _PCT_METADATA_LEFT_RE.search(text[max(0, start - 30):start]):
+            continue
+        pct = float(num_s)
+        if _bound_to_nearest(pct, _last_digit_unit(num_s, 1.0),
+                             nums["percentage"]):
+            continue
+        display = f"{num_s}%"
+        line_no, _ = _line_ctx(text, start, end)
+        _emit(("pct", display), line_no,
+              f"Percentage `{display}` in prose is not in "
+              f"claims_ledger.yaml (no ledger percentage renders to it).",
+              display)
+
+    # Counts in count-unit contexts
+    for m in _PAT_COUNT.finditer(text):
+        if in_spans(fenced, m.start()) or _inside_claimed(m.start()):
+            continue
+        claimed_spans.append((m.start(), m.end()))
         raw_n = m.group(1)
-        unit = m.group(2)
-        try:
-            n = int(raw_n.replace(",", ""))
-        except ValueError:
-            continue
-        # Avoid common prose dates like "2026 states..." if the regex ever
-        # sees them; count claims in this pipeline are below four digits
-        # except comma-formatted universe counts.
+        n = int(raw_n.replace(",", ""))
         if n >= 1900 and "," not in raw_n:
+            continue  # bare 4-digit numbers before a unit are usually years
+        if _bound_to_nearest(float(n), 1.0, nums["count"] + nums["scalar"]):
             continue
-        is_bound = (
-            str(n) in bound_values_by_kind["count"]
-            or f"{n:,}" in bound_values_by_kind["count"]
-            or _within_proximity(float(n), bound_numeric_values_by_kind["count"])
-        )
-        if is_bound:
-            continue
-        display = f"{raw_n} {unit}"
-        key = ("count", display.lower())
-        if key in seen_unbound:
-            continue
-        seen_unbound.add(key)
-        line_no = text.count("\n", 0, m.start()) + 1
-        ctx_start = max(0, m.start() - 50)
-        ctx_end = min(len(text), m.end() + 50)
-        unbound.append({
-            "id": f"CA-LB-{len(unbound) + 1:03d}",
-            "severity": "HIGH",
-            "duty": "ledger_binding",
-            "location": f"report.md:{line_no}",
-            "claim": (
-                f"Count `{display}` in prose is not in claims_ledger.yaml. "
-                f"Phase 18 α requires every count claim to be "
-                f"`[CLAIM:id]`-referenced from the ledger. Context: "
-                f"…{text[ctx_start:ctx_end].replace(chr(10), ' ').strip()[:140]}…"
-            ),
-            "canonical_source": "models/claims_ledger.yaml",
-            "drifted_value": display,
-        })
+        display = f"{raw_n} {m.group(2)}"
+        line_no, ctx = _line_ctx(text, m.start(), m.end(), 50)
+        _emit(("count", display.lower()), line_no,
+              f"Count `{display}` in prose is not in claims_ledger.yaml. "
+              f"Every count claim must be `[CLAIM:id]`-referenced from the "
+              f"ledger. Context: …{ctx}…", display)
 
-    # Scan for raw `[CLAIM:id]` tokens that escaped rendering (Phase
-    # 18 δ — catches the failure mode where the lead skips STAGE 8.1
-    # `python3 scripts/render_claims.py` and ships the writer's
-    # un-substituted draft as report.md). Any surviving token is a
-    # HIGH violation regardless of whether the id is in the ledger.
-    # Phase 20 α: broaden regex to also catch `[CLAIM:id:NO_VALUE]`
-    # tokens (the form `render_claim()` emits for null-value claims).
-    # Belt-and-suspenders against `load_claims()`'s null-value reject.
-    pat_raw_claim = re.compile(r"\[CLAIM:[A-Za-z0-9_:]+\]")
-    for m in pat_raw_claim.finditer(text):
-        if _in_protected_span(protected_spans, m.start()):
+    # Unsuffixed comma-grouped numbers ("412,331 cases")
+    for m in _PAT_COMMA_INT.finditer(text):
+        if in_spans(fenced, m.start()) or _inside_claimed(m.start()):
+            continue
+        if text[m.end():m.end() + 2].lstrip().startswith("%"):
+            continue
+        n = float(m.group(1).replace(",", ""))
+        if _bound_to_nearest(n, 1.0, nums["scalar"] + nums["count"]
+                             + nums["currency"]):
+            continue
+        display = m.group(1)
+        line_no, ctx = _line_ctx(text, m.start(), m.end(), 50)
+        _emit(("comma", display), line_no,
+              f"Number `{display}` in prose is not in claims_ledger.yaml. "
+              f"Context: …{ctx}…", display)
+
+    # Verdict labels (negation-aware)
+    for m in _PAT_LABEL.finditer(text):
+        if in_spans(fenced, m.start()):
+            continue
+        neg = m.group(1)
+        word = m.group(2)
+        label = _norm_label(("NOT " if neg else "") + word)
+        win = text[max(0, m.start() - 25):min(len(text), m.end() + 25)].lower()
+        if not neg and any(q in win for q in
+                           _LEDGER_BINDING_GENERIC_USE_QUALIFIERS):
+            continue
+        if label in labels:
+            continue
+        line_no, _ = _line_ctx(text, m.start(), m.end())
+        raw = m.group(0)
+        _emit(("label", label), line_no,
+              f"Verdict label {raw!r} in prose is not in claims_ledger.yaml"
+              + (" (the ledger holds the un-negated label, which this "
+                 "phrase contradicts)" if neg and _norm_label(word) in labels
+                 else "")
+              + ". Verdict labels must be `[CLAIM:id]`-referenced from the "
+                "ledger.", label)
+
+    # Raw `[CLAIM:...]` tokens that escaped rendering (any id shape —
+    # `[CLAIM:foo-bar]`, `[CLAIM:id:NO_VALUE]`). Inline/fenced code
+    # documenting the syntax is exempt.
+    for m in _PAT_RAW_CLAIM.finditer(text):
+        if in_spans(with_inline, m.start()):
             continue
         token = m.group(0)
-        key = ("raw_claim", token)
-        if key in seen_unbound:
-            continue
-        seen_unbound.add(key)
-        line_no = text.count("\n", 0, m.start()) + 1
-        unbound.append({
-            "id": f"CA-LB-{len(unbound) + 1:03d}",
-            "severity": "HIGH",
-            "duty": "ledger_binding",
-            "location": f"report.md:{line_no}",
-            "claim": (
-                f"Raw `{token}` reference survived in report.md — "
-                f"`scripts/render_claims.py` was not invoked or failed "
-                f"to substitute. Run STAGE 8.1: "
-                f"`python3 scripts/render_claims.py {{run_dir}}`."
-            ),
-            "canonical_source": "models/claims_ledger.yaml",
-            "drifted_value": token,
-        })
+        line_no, _ = _line_ctx(text, m.start(), m.end())
+        _emit(("raw_claim", token), line_no,
+              f"Raw `{token}` reference survived in report.md — "
+              f"`scripts/render_claims.py` was not invoked or failed "
+              f"to substitute. Run STAGE 8.1: "
+              f"`python3 scripts/render_claims.py {{run_dir}}`.", token)
 
     return unbound
 
@@ -1236,8 +907,22 @@ def _audit_ledger_binding(run_dir: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
+def _sha256_or_none(path: str) -> str | None:
+    import hashlib
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
 def audit_run(run_dir: str) -> dict:
-    """Run all four duties and return a structured result dict."""
+    """Run all four duties and return a structured result dict.
+
+    Phase 21 γ: `inputs_sha256` records the report and ledger the audit
+    saw, so a consumer can tell a stale coherence_audit.yaml (report
+    edited after the audit) from a current one.
+    """
     label_v = _audit_label_coherence(run_dir)
     counts_v = _audit_cross_file_counts(run_dir)
     self_v = _audit_self_contradicting(run_dir)
@@ -1255,6 +940,11 @@ def audit_run(run_dir: str) -> dict:
         "violations": all_v,
         "verdict": "DRIFT_DETECTED" if all_v else "CLEAN",
         "has_high": has_high,
+        "inputs_sha256": {
+            "report": _sha256_or_none(os.path.join(run_dir, "report.md")),
+            "ledger": _sha256_or_none(
+                os.path.join(run_dir, "models", "claims_ledger.yaml")),
+        },
     }
 
 
@@ -1587,6 +1277,119 @@ def _self_test() -> int:
         v = _audit_ledger_binding(d)
         ok(not any("$999" in x.get("drifted_value", "") for x in v),
            f"T18: $999M inside a code fence must not fire, got {v}")
+
+    # ---- Phase 21 γ ---------------------------------------------------- #
+
+    def _lb(claims: list[dict], prose: str) -> list[dict]:
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "models"))
+            with open(os.path.join(d, "models", "claims_ledger.yaml"), "w") as f:
+                yaml.safe_dump({"claims": claims}, f)
+            with open(os.path.join(d, "report.md"), "w") as f:
+                f.write(prose)
+            return _audit_ledger_binding(d)
+
+    def _drifts(v: list[dict]) -> set[str]:
+        return {str(x.get("drifted_value")) for x in v}
+
+    # T19: decimal / comma tails of a bound currency are not separate
+    # scalars ("$251.6M" ≠ "6M"; "$1,200M" ≠ "200M").
+    v = _lb([{"id": "a", "claim_kind": "currency", "value": 251_600_000},
+             {"id": "b", "claim_kind": "currency", "value": 1_200_000_000}],
+            "Costs: | $251.6M | and a $1,200M envelope.\n")
+    ok(not v, f"T19: bound decimal/comma currency must be silent, got {v}")
+
+    # T20: per-unit prices with a space before "per" are skipped for any
+    # unit word.
+    v = _lb([{"id": "x", "claim_kind": "scalar", "value": 1}],
+            "Cost-effectiveness is $1,500 per DALY and $1,250 per child "
+            "vaccinated; also $30/case.\n")
+    ok(not any(x.get("drifted_value", "").startswith("$") for x in v),
+       f"T20: per-unit prices must be skipped, got {v}")
+
+    # T21: a claim next to a CI is still checked; " ci" inside "city" is
+    # not CI metadata.
+    v = _lb([{"id": "e", "claim_kind": "percentage", "value": 15,
+              "ci_low": 10, "ci_high": 20}],
+            "Efficacy is 99% (95% CI: 10-20%). 87% of the city population.\n")
+    ok({"99%", "87%"} <= _drifts(v) and "95%" not in _drifts(v)
+       and "10%" not in _drifts(v),
+       f"T21: 99%/87% must fire, 95%/10% must not, got {_drifts(v)}")
+
+    # T22: negation-aware labels.
+    v = _lb([{"id": "h", "claim_kind": "label", "value": "SUPPORTED"}],
+            "Hypothesis H2 is NOT SUPPORTED by the model.\n")
+    ok("NOT SUPPORTED" in _drifts(v), f"T22: negated label must fire, got {v}")
+    v = _lb([{"id": "r", "claim_kind": "label", "value": "NOT_ROBUST"}],
+            "The allocation is NOT ROBUST to the vaccine efficacy prior.\n")
+    ok(not v, f"T22b: NOT_ROBUST ↔ 'NOT ROBUST' must bind, got {v}")
+
+    # T23: binding is to the nearest ledger value at the prose figure's
+    # precision — nearby invented numbers no longer pass.
+    v = _lb([{"id": "b", "claim_kind": "currency", "value": 320_000_000},
+             {"id": "s", "claim_kind": "percentage", "value": 50},
+             {"id": "n", "claim_kind": "count", "value": 774},
+             {"id": "c", "claim_kind": "currency", "value": 197_800_000}],
+            "Budget $335M; share 52.4%; we fund 740 districts. "
+            "Component cost $197M.\n")
+    ok({"$335M", "52.4%", "740 districts"} <= _drifts(v),
+       f"T23: near-miss numbers must fire, got {_drifts(v)}")
+    ok("$197M" not in _drifts(v), f"T23: $197M binds 197.8M, got {_drifts(v)}")
+
+    # T24: unsuffixed comma numbers, both range ends, "billion" display,
+    # numbers in inline code, non-$ currency prefixes.
+    v = _lb([{"id": "x", "claim_kind": "scalar", "value": 1}],
+            "The plan averts 412,331 cases; coverage 10–20%; "
+            "cost 1.2 billion doses; ledger shows `$999M`; "
+            "USD 900 million total.\n")
+    d24 = _drifts(v)
+    ok({"412,331", "10%", "20%", "1.2B", "$999M"} <= d24,
+       f"T24: expected unbound tokens, got {d24}")
+    ok(any(x.startswith("USD") and x.endswith("900M") for x in d24),
+       f"T24: USD-prefixed currency must be scanned, got {d24}")
+
+    # T25: raw `[CLAIM:...]` tokens with hyphen/dot ids are flagged.
+    v = _lb([{"id": "x", "claim_kind": "scalar", "value": 1}],
+            "Population raster: WorldPop 100m grid; 30 km buffer.\n")
+    ok(not v, f"T24b: '100m' (metres) is not a magnitude, got {v}")
+
+    v = _lb([{"id": "x", "claim_kind": "scalar", "value": 1}],
+            "Averts [CLAIM:cases-averted] cases ([CLAIM:h2.verdict]).\n")
+    ok({"[CLAIM:cases-averted]", "[CLAIM:h2.verdict]"} <= _drifts(v),
+       f"T25: raw hyphen/dot tokens must fire, got {_drifts(v)}")
+
+    # T26: audit records input hashes for staleness detection.
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "report.md"), "w") as f:
+            f.write("# R\n")
+        res = audit_run(d)
+        ok(isinstance(res.get("inputs_sha256"), dict)
+           and len(res["inputs_sha256"].get("report") or "") == 64
+           and res["inputs_sha256"].get("ledger") is None,
+           f"T26: inputs_sha256 must hash report, got {res.get('inputs_sha256')}")
+
+    # T27: cross-file counts with a non-malaria package vocabulary taken
+    # from the allocation CSV (measles campaign vs routine).
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "allocation_optimized.csv"), "w") as f:
+            f.write("district,zone,package,cost_usd\n")
+            for i in range(30):
+                f.write(f"D{i},Coast,sia_mr,100000\n")
+            for i in range(30, 40):
+                f.write(f"D{i},Coast,routine_mcv2,20000\n")
+        with open(os.path.join(d, "report.md"), "w") as f:
+            f.write("## Allocation\n\nIn total 45 SIA districts are "
+                    "funded; the SIA campaign costs $9.0M overall.\n")
+        v = _audit_cross_file_counts(d)
+        ok(any(x["drifted_value"] == 45 and x["canonical_value"] == 30
+               for x in v), f"T27: 45 vs 30 SIA must fire, got {v}")
+        ok(any("$9.0M" == x["drifted_value"] for x in v),
+           f"T27: $9.0M vs $3.0M SIA cost must fire, got {v}")
+        with open(os.path.join(d, "report.md"), "w") as f:
+            f.write("Each district receives SIA at a budget share of "
+                    "$12M/40 under the uniform rule.\n")
+        v = _audit_cross_file_counts(d)
+        ok(not v, f"T27b: '$12M/40' is a per-unit share, got {v}")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)
