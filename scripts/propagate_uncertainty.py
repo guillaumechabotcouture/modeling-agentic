@@ -64,12 +64,13 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import math
 import os
 import random
 import sys
 import traceback
 from collections import Counter
-from statistics import mean
+from statistics import mean, pstdev
 from typing import Any, Callable, Optional
 
 try:
@@ -123,34 +124,39 @@ def _propagate_cloud(
             f"the repo .env or export before running."
         )
 
-    # Provision the pool if absent. Always use dedicated nodes unless the
-    # caller explicitly sets low-priority (Free Trial subs have 0 quota).
-    runner.ensure_pool(
-        pool_name=pool_name,
-        vm_size=vm_size,
-        max_nodes=max_nodes,
-        use_low_priority=use_low_priority,
-        auto_scale=False,
-        dedicated_nodes=(0 if use_low_priority else max_nodes),
-    )
+    # Phase 21 δ: budget guard BEFORE any resource is created, priced for
+    # the node type actually requested (dedicated by default).
+    avg_task_seconds = 30.0
+    cloud.preflight_budget(len(params_list), avg_task_seconds, vm_size,
+                           max_nodes, use_low_priority, budget_usd_cap)
 
-    print(f"  cloud: submitting {len(params_list)} tasks to pool "
-          f"'{pool_name}' ({vm_size}, "
-          f"{'low-priority' if use_low_priority else 'dedicated'} × "
-          f"{max_nodes})", file=sys.stderr)
-    job_id = runner.submit_function_tasks(
-        pool_name=pool_name,
-        fn=fn,
-        args_list=params_list,
-        pip_deps=[],  # workers only need stdlib + whatever's in the
-                      # container image; outcome_fn's deps must be importable
-                      # from the tarballed models/ directory.
-        budget_usd_cap=budget_usd_cap,
-        avg_task_seconds=30.0,
-        models_dir=models_dir,
-    )
-    print(f"  cloud: job {job_id} submitted, waiting...", file=sys.stderr)
-    raw_results = runner.wait_and_collect(job_id, timeout_minutes=120)
+    # Provision the pool if absent and guarantee teardown of a pool this
+    # invocation created — on success, exception, or timeout. Static
+    # dedicated pools bill until deleted, so this is not optional.
+    # Always use dedicated nodes unless the caller explicitly sets
+    # low-priority (Free Trial subs have 0 quota).
+    spec = cloud.PoolSpec(name=pool_name, vm_size=vm_size,
+                          max_nodes=max_nodes, auto_delete=True)
+    with runner.managed_pool(spec, use_low_priority=use_low_priority,
+                             auto_scale=False):
+        print(f"  cloud: submitting {len(params_list)} tasks to pool "
+              f"'{pool_name}' ({vm_size}, "
+              f"{'low-priority' if use_low_priority else 'dedicated'} × "
+              f"{max_nodes})", file=sys.stderr)
+        job_id = runner.submit_function_tasks(
+            pool_name=pool_name,
+            fn=fn,
+            args_list=params_list,
+            pip_deps=[],  # workers only need stdlib + whatever's in the
+                          # container image; outcome_fn's deps must be importable
+                          # from the tarballed models/ directory.
+            budget_usd_cap=budget_usd_cap,
+            avg_task_seconds=avg_task_seconds,
+            models_dir=models_dir,
+            low_priority=use_low_priority,
+        )
+        print(f"  cloud: job {job_id} submitted, waiting...", file=sys.stderr)
+        raw_results = runner.wait_and_collect(job_id, timeout_minutes=120)
     print(f"  cloud: {len(raw_results)} results collected", file=sys.stderr)
 
     # Unpack: each raw result is {'ok': bool, 'result'/'error': ...}
@@ -314,6 +320,7 @@ def propagate(run_dir: str, n_draws: int = 200, seed: int = 42,
             if verbose and (i + 1) % 50 == 0:
                 print(f"  [{i+1}/{n_draws}] draws complete", file=sys.stderr)
 
+    n_nonfinite: dict[str, int] = {}
     for i, out in enumerate(outs):
         if isinstance(out, dict) and "_error" in out:
             errors.append(out["_error"])
@@ -324,8 +331,15 @@ def propagate(run_dir: str, n_draws: int = 200, seed: int = 42,
                                       f"got {type(out).__name__}"})
             continue
         for key, val in out.items():
-            if isinstance(val, (int, float)):
-                scalar_results.setdefault(key, []).append(float(val))
+            if isinstance(val, bool):
+                categorical_results.setdefault(key, []).append(str(val))
+            elif isinstance(val, (int, float)):
+                # Phase 21 δ: NaN/inf must not enter sorted() — NaN
+                # comparisons silently corrupt order statistics.
+                if math.isfinite(val):
+                    scalar_results.setdefault(key, []).append(float(val))
+                else:
+                    n_nonfinite[key] = n_nonfinite.get(key, 0) + 1
             elif isinstance(val, str):
                 categorical_results.setdefault(key, []).append(val)
             # Silently ignore other types (lists, dicts) — outcome_fn
@@ -338,20 +352,59 @@ def propagate(run_dir: str, n_draws: int = 200, seed: int = 42,
             f"{errors[-1]}. Aborting."
         )
 
+    # Parameter sample summary (computed first: the degeneracy diagnostic
+    # needs to know whether the sampler actually varied the inputs).
+    parameter_samples = {}
+    for name, samples in per_param_samples.items():
+        samples_sorted = sorted(samples)
+        n = len(samples_sorted)
+        parameter_samples[name] = {
+            "mean": float(mean(samples)),
+            "std": float(pstdev(samples)) if n > 1 else 0.0,
+            "ci_low": float(samples_sorted[int(0.025 * n)]),
+            "ci_high": float(samples_sorted[min(n - 1, int(0.975 * n))]),
+        }
+    varied_params = [n for n, ps in parameter_samples.items() if ps["std"] > 0]
+
     # Aggregate scalars.
     scalar_summary = {}
+    degenerate_outputs: list[str] = []
     for key, vals in scalar_results.items():
         if not vals:
             continue
         vals_sorted = sorted(vals)
         n = len(vals_sorted)
-        scalar_summary[key] = {
+        entry = {
             "mean": float(mean(vals)),
             "median": float(vals_sorted[n // 2]),
             "ci_low": float(vals_sorted[int(0.025 * n)]),
             "ci_high": float(vals_sorted[min(n - 1, int(0.975 * n))]),
             "n": n,
+            "n_nonfinite": n_nonfinite.get(key, 0),
         }
+        # Phase 21 δ: a zero-width interval from uncertain inputs is a
+        # defect, not a precise answer. Flag it with a diagnostic.
+        scale = max(abs(entry["mean"]), 1e-300)
+        if n > 1 and (vals_sorted[-1] - vals_sorted[0]) / scale < 1e-12:
+            entry["degenerate"] = True
+            entry["degenerate_diagnostic"] = (
+                "every draw produced the same value although "
+                f"{len(varied_params)} sampled parameter(s) varied — "
+                "outcome_fn likely ignores its `params` argument (e.g. reads "
+                "module-level constants or a cached result)"
+                if varied_params else
+                "every draw produced the same value AND no sampled parameter "
+                "varied — the registry priors have zero width or the sampler "
+                "returned constants")
+            degenerate_outputs.append(key)
+        scalar_summary[key] = entry
+    for key, cnt in n_nonfinite.items():
+        if key not in scalar_summary:
+            scalar_summary[key] = {"n": 0, "n_nonfinite": cnt,
+                                   "degenerate": True,
+                                   "degenerate_diagnostic":
+                                       "all draws were NaN/inf"}
+            degenerate_outputs.append(key)
 
     # Aggregate categoricals.
     categorical_summary = {}
@@ -365,21 +418,21 @@ def propagate(run_dir: str, n_draws: int = 200, seed: int = 42,
             "n": len(vals),
         }
 
-    # Parameter sample summary.
-    parameter_samples = {}
-    for name, samples in per_param_samples.items():
-        samples_sorted = sorted(samples)
-        n = len(samples_sorted)
-        parameter_samples[name] = {
-            "mean": float(mean(samples)),
-            "ci_low": float(samples_sorted[int(0.025 * n)]),
-            "ci_high": float(samples_sorted[min(n - 1, int(0.975 * n))]),
-        }
-
+    n_failed = len(errors)
     return {
+        "producer": "scripts/propagate_uncertainty.py",
+        # Phase 21 δ: effort floors read these, not n_draws alone —
+        # n_draws is what was requested; n_successful is what the CIs
+        # are built from.
+        "backend": "cloud" if cloud else "local",
         "n_draws": n_draws,
+        "n_draws_requested": n_draws,
+        "n_successful": len(outs) - n_failed,
+        "n_failed": n_failed,
+        "degenerate_outputs": degenerate_outputs,
+        "sampler_varied_parameters": len(varied_params),
         "seed": seed,
-        "n_errors": len(errors),
+        "n_errors": n_failed,
         "errors": errors[:5],  # truncate
         "scalar_outputs": scalar_summary,
         "categorical_outputs": categorical_summary,
@@ -476,6 +529,82 @@ parameters:
 
         ok("irs_effect" in report["parameter_samples"],
            "param samples recorded")
+        # Phase 21 δ: provenance + success accounting.
+        ok(report["backend"] == "local" and report["n_draws_requested"] == 200
+           and report["n_successful"] == 200 and report["n_failed"] == 0,
+           f"P21-1: backend/n_successful/n_failed recorded; got "
+           f"{ {k: report.get(k) for k in ('backend', 'n_successful', 'n_failed')} }")
+        ok(report["degenerate_outputs"] == [] and
+           report["parameter_samples"]["irs_effect"]["std"] > 0,
+           "P21-2: healthy run has no degenerate outputs and nonzero std")
+
+        # P21-3: outcome_fn that ignores params → zero-width CI flagged
+        # degenerate with the "ignores params" diagnostic; NaN draws are
+        # excluded and counted rather than sorted.
+        with open(os.path.join(run_dir, "models", "outcome_fn.py"), "w") as f:
+            f.write("CACHED = 1769757.25\n"
+                    "_i = [0]\n"
+                    "def outcome_fn(params):\n"
+                    "    _i[0] += 1\n"
+                    "    return {'total_benefit': CACHED,\n"
+                    "            'noisy': float('nan') if _i[0] % 10 == 0\n"
+                    "                     else params['irs_effect']}\n")
+        rep3 = propagate(run_dir, n_draws=100, seed=1)
+        tb = rep3["scalar_outputs"]["total_benefit"]
+        ok(tb.get("degenerate") is True
+           and "ignores its `params`" in tb.get("degenerate_diagnostic", "")
+           and "total_benefit" in rep3["degenerate_outputs"],
+           f"P21-3: constant output flagged degenerate; got {tb}")
+        nz = rep3["scalar_outputs"]["noisy"]
+        ok(nz["n"] == 90 and nz["n_nonfinite"] == 10
+           and nz["ci_low"] <= nz["median"] <= nz["ci_high"]
+           and not nz.get("degenerate"),
+           f"P21-4: NaN draws excluded + counted; got {nz}")
+
+        # P21-5: cloud path against the in-memory Azure fake — budget is
+        # rejected before any pool is created; on success the created
+        # pool is deleted; on a mid-run failure it is deleted too.
+        cloud_mod = _import_sibling_module("cloud_batch")
+        with open(os.path.join(run_dir, "models", "outcome_fn.py"), "w") as f:
+            f.write(outcome_fn_src)
+        orig_runner = cloud_mod.BatchRunner
+        try:
+            with cloud_mod._FakeAzure() as fa:
+                r1 = fa.runner()
+                cloud_mod.BatchRunner = lambda: r1
+                raised = False
+                try:
+                    propagate(run_dir, n_draws=50, seed=2, cloud=True,
+                              cloud_budget_usd_cap=1e-6)
+                except cloud_mod.BudgetExceededError:
+                    raised = True
+                ok(raised and fa.calls == [],
+                   f"P21-5: budget rejection precedes provisioning; calls {fa.calls}")
+            with cloud_mod._FakeAzure() as fa:
+                r2 = fa.runner()
+                cloud_mod.BatchRunner = lambda: r2
+                rep5 = propagate(run_dir, n_draws=20, seed=2, cloud=True,
+                                 cloud_budget_usd_cap=100.0)
+                ok(rep5["backend"] == "cloud" and rep5["n_successful"] == 20
+                   and ("pool.delete", "uq-pool") in fa.calls,
+                   f"P21-6: cloud success → results + pool deleted; calls {fa.calls}")
+            with cloud_mod._FakeAzure(task_mode="hang") as fa:
+                runner = fa.runner()
+                orig_wait = runner.wait_and_collect
+                runner.wait_and_collect = (lambda job_id, timeout_minutes=120:
+                                           orig_wait(job_id, timeout_minutes=0.0001,
+                                                     poll_seconds=0))
+                cloud_mod.BatchRunner = lambda: runner
+                timed_out = False
+                try:
+                    propagate(run_dir, n_draws=5, seed=2, cloud=True,
+                              cloud_budget_usd_cap=100.0)
+                except TimeoutError:
+                    timed_out = True
+                ok(timed_out and ("pool.delete", "uq-pool") in fa.calls,
+                   f"P21-7: cloud timeout → pool deleted; calls {fa.calls}")
+        finally:
+            cloud_mod.BatchRunner = orig_runner
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)

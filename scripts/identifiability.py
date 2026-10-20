@@ -12,7 +12,34 @@ estimates, this tool reports for each fitted parameter:
   within 1.92 units of the optimum (equivalent to a 95% profile-likelihood
   CI for a chi-squared / normal likelihood).
 - `status`: `well_identified` (rel SE < 10%) | `weakly_identified` (10–50%)
-  | `unidentified` (SE > 50% OR profile loss flat over >5× the CI range).
+  | `unidentified` (SE > 50% OR profile loss flat over >5× the CI range
+  OR the parameter loads on a near-null Hessian eigen-direction).
+
+Phase 21 δ corrections (the pre-21 tool reported CLEAN for a loss that
+only depends on β/γ, the exact ridge it exists to catch):
+
+- SE now comes from sqrt(diag(F⁻¹)) on the FULL finite-difference
+  Hessian, not 1/sqrt(F_ii). The diagonal-only SE is the conditional
+  SE holding every other parameter fixed; it cannot see correlated
+  ridges.
+- Ridges are detected from the eigen-decomposition of the Hessian in
+  scale-free (relative) coordinates. Every parameter that loads on a
+  near-null / weak direction is `unidentified`, and the output reports
+  the parameter combination that is unconstrained.
+- The profile likelihood re-optimizes the nuisance parameters at each
+  grid point (bounded L-BFGS-B, warm-started, maxiter-capped). Manifest
+  `profile: conditional` opts out (cheap slice); the output then records
+  `profile_method: conditional` as weaker evidence.
+- The 1.92 threshold is only meaningful on a negative-log-likelihood
+  scale, so the manifest must declare `loss_type`:
+    nll       loss is −log L (up to a constant)
+    deviance  loss is −2 log L (chi2 is an alias)
+    sse / mse sum / mean of squared residuals; converted to the
+              Gaussian profile NLL (n_obs/2)·log(SSE), which requires
+              `n_obs`. This makes verdicts invariant to rescaling the
+              loss by a constant.
+  A missing/unknown loss_type (or sse/mse without n_obs) yields verdict
+  UNKNOWN_LOSS_SCALE, which consumers must treat as failing.
 
 The "unidentified / ridge-trapped" status is the diagnostic we want: a
 parameter whose value doesn't actually affect the fit. This is the γ
@@ -24,6 +51,9 @@ The modeler supplies a manifest at `{run_dir}/models/identifiability.yaml`:
 ```yaml
 loss_fn: "models/outcome_fn.py::loss"   # importable callable: loss(params) -> float
                                           # same module + scheme as outcome_fn.py
+loss_type: sse                 # nll | deviance | chi2 | sse | mse (REQUIRED, Phase 21 δ)
+n_obs: 22                      # required for sse / mse
+profile: full                  # full (default, re-optimizes nuisance) | conditional
 parameters:
   - name: beta
     point_estimate: 0.5
@@ -70,6 +100,30 @@ except ImportError:
 # -2 * (logL(profile) - logL(max)) < 3.84, equivalent to loss increase < 1.92.
 PROFILE_CI_THRESHOLD = 1.92
 
+# Phase 21 δ: closed verdict vocabulary. The validator allowlists these;
+# any other string in identifiability.yaml means the file was not
+# produced by this tool (or was hand-edited) and must fail closed.
+VERDICTS = (
+    "CLEAN",
+    "WEAKLY_IDENTIFIED_PARAMETERS",
+    "UNIDENTIFIED_PARAMETERS",
+    "UNKNOWN_LOSS_SCALE",
+)
+PASSING_VERDICTS = ("CLEAN",)
+PRODUCER = "scripts/identifiability.py"
+
+LOSS_TYPES_NLL_FACTOR = {"nll": 1.0, "deviance": 0.5, "chi2": 0.5}
+LOSS_TYPES_SQUARED = ("sse", "mse")
+
+# Ridge detection in relative coordinates: a Hessian eigen-direction
+# whose implied relative SE exceeds this is unconstrained (same 50% cut
+# classify() uses for single parameters). Eigenvalues below
+# RIDGE_EIG_RTOL·λ_max are treated as numerically zero.
+RIDGE_REL_SE = 0.50
+RIDGE_EIG_RTOL = 1e-8
+RIDGE_LOADING_MIN = 0.30
+PROFILE_MAXITER = 100
+
 
 class LossFunctionReoptimizesError(Exception):
     """Raised when the modeler-supplied loss function appears to internally
@@ -112,34 +166,162 @@ def load_loss_fn(run_dir: str, spec: str) -> Callable[[dict], float]:
     return fn
 
 
+def resolve_loss_scale(manifest: dict) -> tuple[Optional[Callable[[float], float]], Optional[str]]:
+    """Phase 21 δ: map the manifest's `loss_type` to a transform that puts
+    the loss on a negative-log-likelihood scale (up to an additive
+    constant), so PROFILE_CI_THRESHOLD and Fisher SEs mean what they
+    say. Returns (transform, None) or (None, reason) when the scale is
+    unknown — the caller then reports UNKNOWN_LOSS_SCALE."""
+    lt = manifest.get("loss_type")
+    if lt is None:
+        return None, ("manifest has no `loss_type` (nll | deviance | chi2 | "
+                      "sse | mse); the 1.92 profile threshold and Fisher SE "
+                      "are only meaningful on a −log L scale")
+    lt = str(lt).strip().lower()
+    if lt in LOSS_TYPES_NLL_FACTOR:
+        k = LOSS_TYPES_NLL_FACTOR[lt]
+        return (lambda v, k=k: k * v), None
+    if lt in LOSS_TYPES_SQUARED:
+        n_obs = manifest.get("n_obs")
+        try:
+            n_obs = int(n_obs)
+        except (TypeError, ValueError):
+            n_obs = None
+        if not n_obs or n_obs <= 0:
+            return None, (f"loss_type {lt!r} requires a positive integer "
+                          f"`n_obs` to convert to a Gaussian profile NLL")
+        # Gaussian errors with σ profiled out: −log L = (n/2)·log(SSE) + c.
+        # mse = SSE/n differs only by a constant inside the log. This form
+        # is invariant to multiplying the loss by any constant.
+        return (lambda v, n=n_obs: 0.5 * n * math.log(max(v, 1e-300))), None
+    return None, (f"loss_type {lt!r} not recognized; use one of "
+                  f"{sorted(list(LOSS_TYPES_NLL_FACTOR) + list(LOSS_TYPES_SQUARED))}")
+
+
+def _step(p0: float, bounds: Optional[tuple[float, float]],
+          step_frac: float) -> float:
+    """Finite-difference step scaled to |p| with a floor tied to the
+    plausible range, so parameters on very different scales get
+    comparable relative resolution."""
+    floor = 1e-6
+    if bounds is not None and bounds[1] > bounds[0]:
+        floor = max(floor, 1e-4 * (bounds[1] - bounds[0]))
+    return max(abs(p0) * step_frac, floor)
+
+
+def hessian(loss_fn: Callable[[dict], float], point: dict[str, float],
+            bounds: Optional[dict[str, tuple[float, float]]] = None,
+            step_frac: float = 0.01):
+    """Full central-difference Hessian of loss_fn at `point`.
+    Returns (names, H as numpy array). Costs 2k + 2k(k−1) evaluations."""
+    import numpy as np
+    names = list(point)
+    k = len(names)
+    bounds = bounds or {}
+    h = [_step(point[n], bounds.get(n), step_frac) for n in names]
+    f0 = loss_fn(point)
+
+    def ev(deltas):
+        q = dict(point)
+        for i, d in deltas:
+            q[names[i]] = point[names[i]] + d
+        return loss_fn(q)
+
+    H = np.zeros((k, k))
+    for i in range(k):
+        fp = ev([(i, h[i])]); fm = ev([(i, -h[i])])
+        H[i, i] = (fp - 2 * f0 + fm) / (h[i] * h[i])
+    for i in range(k):
+        for j in range(i + 1, k):
+            fpp = ev([(i, h[i]), (j, h[j])]); fpm = ev([(i, h[i]), (j, -h[j])])
+            fmp = ev([(i, -h[i]), (j, h[j])]); fmm = ev([(i, -h[i]), (j, -h[j])])
+            H[i, j] = H[j, i] = (fpp - fpm - fmp + fmm) / (4 * h[i] * h[j])
+    return names, H
+
+
+def fisher_analysis(loss_fn: Callable[[dict], float], point: dict[str, float],
+                    bounds: Optional[dict[str, tuple[float, float]]] = None,
+                    step_frac: float = 0.01) -> dict:
+    """Phase 21 δ: SE from sqrt(diag(F⁻¹)) on the full Hessian of the NLL,
+    plus ridge detection from the eigen-decomposition in relative
+    coordinates (θ_i / s_i, s_i = |θ_i| or the bound range when θ_i≈0).
+
+    Returns {se: {name: se|None}, ridges: [ {combination, rel_se,
+    eigenvalue, params} ], ridge_params: set, condition_number}."""
+    import numpy as np
+    names, H = hessian(loss_fn, point, bounds, step_frac)
+    bounds = bounds or {}
+    scale = []
+    for n in names:
+        v = abs(point[n])
+        if v < 1e-12:
+            b = bounds.get(n)
+            v = (b[1] - b[0]) if b and b[1] > b[0] else 1.0
+        scale.append(v)
+    D = np.diag(scale)
+    Hs = D @ H @ D
+    Hs = 0.5 * (Hs + Hs.T)
+    if not np.all(np.isfinite(Hs)):
+        return {"se": {n: None for n in names}, "ridges": [],
+                "ridge_params": set(names), "condition_number": None,
+                "error": "non-finite Hessian entries"}
+    evals, evecs = np.linalg.eigh(Hs)
+    lam_max = float(max(abs(evals).max(), 1e-300))
+    ridges = []
+    ridge_params: set[str] = set()
+    for idx, lam in enumerate(evals):
+        lam = float(lam)
+        null = lam <= RIDGE_EIG_RTOL * lam_max
+        rel_se_dir = (float("inf") if lam <= 0 else 1.0 / math.sqrt(lam))
+        if null or rel_se_dir > RIDGE_REL_SE:
+            v = evecs[:, idx]
+            loaded = [(names[i], float(v[i])) for i in range(len(names))
+                      if abs(v[i]) >= RIDGE_LOADING_MIN]
+            if not loaded:
+                continue
+            combo = " + ".join(f"{c:+.2f}·{n}/{scale[names.index(n)]:.3g}"
+                               for n, c in loaded)
+            ridges.append({
+                "combination": combo,
+                "params": [n for n, _ in loaded],
+                "eigenvalue_relative": lam,
+                "rel_se_along_direction": (None if not math.isfinite(rel_se_dir)
+                                           else round(rel_se_dir, 4)),
+                "null_direction": bool(null),
+            })
+            ridge_params.update(n for n, _ in loaded)
+    pos = evals[evals > RIDGE_EIG_RTOL * lam_max]
+    cond = (float(pos.max() / pos.min()) if len(pos) == len(evals) and len(pos)
+            else float("inf"))
+    # Pseudo-inverse over the positive (identified) eigen-directions only,
+    # in scaled coordinates, then back to native units. Parameters loading
+    # on a null direction have infinite SE → reported as None.
+    keep = evals > RIDGE_EIG_RTOL * lam_max
+    cov_s = (evecs[:, keep] / evals[keep]) @ evecs[:, keep].T
+    null_params = {n for r in ridges if r["null_direction"] for n in r["params"]}
+    se = {}
+    for i, n in enumerate(names):
+        var = float(cov_s[i, i]) * scale[i] ** 2
+        se[n] = (math.sqrt(var) if var > 0 and n not in null_params
+                 else None)
+    return {"se": se, "ridges": ridges, "ridge_params": ridge_params,
+            "condition_number": cond}
+
+
 def fisher_diagonal(loss_fn: Callable[[dict], float],
                     point: dict[str, float],
                     step_frac: float = 0.01) -> dict[str, Optional[float]]:
-    """Approximate Fisher information diagonal via central differences on
-    the loss (treating loss as 2·NLL, i.e., deviance-like).
-
-    Returns {name: se} where se = 1 / sqrt(0.5 * d²loss/dp²) on a
-    quadratic approximation. Returns None for parameters where the
-    second derivative is non-positive (not a minimum, so SE ill-defined)."""
+    """Conditional SE (1/sqrt(F_ii), all other parameters held fixed).
+    Retained for reference only — Phase 21 δ: this ignores correlations
+    and must not be used for classification; see fisher_analysis()."""
     f0 = loss_fn(point)
     out = {}
     for name, p0 in point.items():
-        if abs(p0) < 1e-12:
-            h = max(step_frac, 1e-6)
-        else:
-            h = max(abs(p0) * step_frac, 1e-6)
+        h = max(abs(p0) * step_frac, 1e-6)
         plus = dict(point); plus[name] = p0 + h
         minus = dict(point); minus[name] = p0 - h
-        fp = loss_fn(plus)
-        fm = loss_fn(minus)
-        d2 = (fp - 2 * f0 + fm) / (h * h)
-        # For loss = NLL (or deviance), d²/dp² ≈ 1/σ²; we interpret loss as
-        # (relative) log-likelihood and report SE = 1/sqrt(d²loss/dp²).
-        # If loss is NLL, this is the textbook Fisher SE.
-        if d2 <= 1e-12:
-            out[name] = None
-        else:
-            out[name] = 1.0 / math.sqrt(d2)
+        d2 = (loss_fn(plus) - 2 * f0 + loss_fn(minus)) / (h * h)
+        out[name] = None if d2 <= 1e-12 else 1.0 / math.sqrt(d2)
     return out
 
 
@@ -208,11 +390,19 @@ def assert_loss_fn_is_pointwise(loss_fn: Callable[[dict], float],
 def profile_likelihood(loss_fn: Callable[[dict], float],
                        point: dict[str, float],
                        param: dict,
-                       n_points: int = 20) -> dict:
-    """Scan the loss function while varying one parameter from lower_bound
-    to upper_bound, holding others at their point estimates. Returns a
-    list of (param_value, loss) pairs plus a 95% CI range where the
-    profile loss stays within PROFILE_CI_THRESHOLD of the minimum."""
+                       n_points: int = 20,
+                       nuisance_bounds: Optional[dict[str, tuple[float, float]]] = None,
+                       method: str = "full",
+                       maxiter: int = PROFILE_MAXITER) -> dict:
+    """Profile the (NLL-scaled) loss over one parameter's plausible range.
+
+    Phase 21 δ: with method="full" (default) the nuisance parameters are
+    re-optimized at every grid point (bounded L-BFGS-B, warm-started from
+    the previous grid point, maxiter-capped), so a parameter whose effect
+    another parameter can absorb shows a flat profile. method="conditional"
+    keeps the pre-21 slice (others held at point estimates) and is reported
+    as weaker evidence. Returns the curve plus the 95% CI range where the
+    profile stays within PROFILE_CI_THRESHOLD of its minimum."""
     name = param["name"]
     lo = float(param["lower_bound"])
     hi = float(param["upper_bound"])
@@ -228,31 +418,69 @@ def profile_likelihood(loss_fn: Callable[[dict], float],
     else:
         grid = [lo + (hi - lo) * i / (n - 1) for i in range(n)]
 
-    curve = []
-    for v in grid:
-        p = dict(point); p[name] = v
+    others = [k for k in point if k != name]
+    nuisance_bounds = nuisance_bounds or {}
+    do_reopt = method == "full" and others
+    if do_reopt:
+        from scipy.optimize import minimize
+        bnds = [nuisance_bounds.get(k, (None, None)) for k in others]
+
+    def _safe(p):
         try:
-            loss = loss_fn(p)
-        except Exception as e:
-            loss = float("inf")
-        curve.append((v, loss))
+            v = loss_fn(p)
+        except Exception:
+            return float("inf")
+        return v if math.isfinite(v) else float("inf")
+
+    curve = []
+    # Warm-start outward from the point estimate in both directions so the
+    # nuisance solution tracks a continuous ridge.
+    order = sorted(range(len(grid)), key=lambda i: abs(grid[i] - point[name]))
+    start_idx = order[0]
+    warm = {}
+    results = [None] * len(grid)
+    for direction in (range(start_idx, len(grid)), range(start_idx - 1, -1, -1)):
+        x0 = [point[k] for k in others]
+        for i in direction:
+            v = grid[i]
+            if not do_reopt:
+                p = dict(point); p[name] = v
+                results[i] = _safe(p)
+                continue
+
+            def f(x, v=v):
+                p = dict(point); p[name] = v
+                p.update(zip(others, (float(xi) for xi in x)))
+                val = _safe(p)
+                return val if math.isfinite(val) else 1e300
+
+            try:
+                r = minimize(f, x0, method="L-BFGS-B", bounds=bnds,
+                             options={"maxiter": maxiter})
+                val = float(r.fun)
+                # Never report worse than the conditional slice.
+                p = dict(point); p[name] = v
+                val = min(val, _safe(p))
+                x0 = list(r.x)
+            except Exception:
+                p = dict(point); p[name] = v
+                val = _safe(p)
+            results[i] = val if val < 1e299 else float("inf")
+    curve = list(zip(grid, results))
 
     loss_values = [l for _, l in curve if math.isfinite(l)]
     if not loss_values:
         return {"curve": curve, "ci_low": None, "ci_high": None,
-                "flat_ratio": float("nan")}
+                "flat_ratio": float("nan"), "method": method}
     min_loss = min(loss_values)
     threshold = min_loss + PROFILE_CI_THRESHOLD
 
-    # Find the widest contiguous range where loss ≤ threshold.
     within = [v for v, l in curve if math.isfinite(l) and l <= threshold]
     ci_low = min(within) if within else None
     ci_high = max(within) if within else None
 
-    # Flat-ridge metric: max loss in the scan - min loss, expressed as
-    # fraction of the expected likelihood "curvature" over the range.
-    # If the full scan spans ~1.92 units total, the parameter is hardly
-    # constrained at all → ridge-trapped.
+    # Flat-ridge metric: if the full scan spans < 1.92 NLL units, the
+    # parameter is hardly constrained at all → ridge-trapped.
     total_range = max(loss_values) - min_loss
     flat_ratio = total_range / PROFILE_CI_THRESHOLD if total_range > 0 else 0
 
@@ -262,13 +490,21 @@ def profile_likelihood(loss_fn: Callable[[dict], float],
         "ci_low": ci_low,
         "ci_high": ci_high,
         "flat_ratio": flat_ratio,
+        "method": "full" if do_reopt else "conditional",
     }
 
 
 def classify(name: str, point_estimate: float, fisher_se: Optional[float],
-             profile: dict) -> tuple[str, str]:
+             profile: dict,
+             ridge: Optional[dict] = None) -> tuple[str, str]:
     """Classify the parameter's identifiability status and write one line
-    explaining why. Returns (status, explanation)."""
+    explaining why. Returns (status, explanation). `ridge` (Phase 21 δ)
+    is the weak/null Hessian eigen-direction this parameter loads on."""
+    if ridge is not None:
+        return ("unidentified",
+                "loads on an unconstrained parameter combination "
+                f"({ridge['combination']}); the data constrain the "
+                "combination's complement, not this parameter on its own.")
     if profile.get("flat_ratio") is not None and profile["flat_ratio"] < 1.0:
         # The full scan over the parameter's plausible range doesn't
         # move loss even by the CI threshold. Ridge-trapped.
@@ -306,22 +542,31 @@ def analyze(run_dir: str) -> dict:
     if not os.path.exists(manifest_path):
         raise FileNotFoundError(
             f"{manifest_path} not found. Modeler must supply the manifest "
-            f"(see the identifiability skill — to be added)."
+            f"(see the identifiability-analysis skill)."
         )
     with open(manifest_path) as f:
         manifest = yaml.safe_load(f) or {}
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest must be a YAML mapping")
 
     loss_spec = manifest.get("loss_fn")
     if not loss_spec:
         raise ValueError("manifest missing `loss_fn:` (path::fn_name)")
-    loss_fn = load_loss_fn(run_dir, loss_spec)
+    raw_loss_fn = load_loss_fn(run_dir, loss_spec)
 
     params_manifest = manifest.get("parameters", [])
-    if not params_manifest:
-        raise ValueError("manifest missing `parameters:` list")
+    if not isinstance(params_manifest, list) or not params_manifest:
+        raise ValueError("manifest `parameters:` must be a non-empty list")
+    for p in params_manifest:
+        if not isinstance(p, dict) or "name" not in p or "point_estimate" not in p:
+            raise ValueError("each parameter needs `name` and `point_estimate`")
 
     # Build point dict for Fisher calc.
     point = {p["name"]: float(p["point_estimate"]) for p in params_manifest}
+    bounds = {}
+    for p in params_manifest:
+        if "lower_bound" in p and "upper_bound" in p:
+            bounds[p["name"]] = (float(p["lower_bound"]), float(p["upper_bound"]))
 
     # Phase 9 Commit σ: catch re-optimizing loss before profile_likelihood
     # runs. A loss that internally re-fits compensates for every
@@ -329,18 +574,45 @@ def analyze(run_dir: str) -> dict:
     # this as an explicit error — telling the modeler to rewrite — rather
     # than letting it cascade into a fleet of false-positive ridge-trapped
     # verdicts.
-    assert_loss_fn_is_pointwise(loss_fn, point)
+    assert_loss_fn_is_pointwise(raw_loss_fn, point)
 
-    fisher = fisher_diagonal(loss_fn, point)
+    # Phase 21 δ: put the loss on an NLL scale. Unknown scale → we still
+    # compute diagnostics in raw units (ridge detection in relative
+    # coordinates is scale-free) but the verdict is UNKNOWN_LOSS_SCALE.
+    transform, scale_err = resolve_loss_scale(manifest)
+    if transform is None:
+        loss_fn = raw_loss_fn
+    else:
+        loss_fn = lambda q, _f=raw_loss_fn, _t=transform: _t(_f(q))
+
+    fa = fisher_analysis(loss_fn, point, bounds)
+    fisher = fa["se"]
+    ridge_for: dict[str, dict] = {}
+    for r in fa["ridges"]:
+        for n in r["params"]:
+            ridge_for.setdefault(n, r)
+
+    profile_method = str(manifest.get("profile", "full")).strip().lower()
+    if profile_method not in ("full", "conditional"):
+        profile_method = "full"
 
     param_results = {}
     status_counts = {"well_identified": 0, "weakly_identified": 0,
                      "unidentified": 0}
+    methods_used = set()
     for p in params_manifest:
         name = p["name"]
         pe = float(p["point_estimate"])
-        prof = profile_likelihood(loss_fn, point, p)
-        status, explanation = classify(name, pe, fisher.get(name), prof)
+        if name in bounds:
+            prof = profile_likelihood(
+                loss_fn, point, p, nuisance_bounds=bounds,
+                method=str(p.get("profile", profile_method)).lower())
+        else:
+            prof = {"ci_low": None, "ci_high": None, "flat_ratio": None,
+                    "method": "none"}
+        methods_used.add(prof.get("method"))
+        status, explanation = classify(name, pe, fisher.get(name), prof,
+                                       ridge_for.get(name))
         status_counts[status] = status_counts.get(status, 0) + 1
         param_results[name] = {
             "point_estimate": pe,
@@ -352,22 +624,53 @@ def analyze(run_dir: str) -> dict:
             "profile_ci_low": prof.get("ci_low"),
             "profile_ci_high": prof.get("ci_high"),
             "profile_flat_ratio": (round(prof["flat_ratio"], 3)
-                                   if prof.get("flat_ratio") is not None else None),
+                                   if prof.get("flat_ratio") is not None
+                                   and math.isfinite(prof["flat_ratio"])
+                                   else None),
+            "profile_method": prof.get("method"),
             "status": status,
             "explanation": explanation,
         }
 
+    if status_counts.get("unidentified", 0) > 0:
+        verdict = "UNIDENTIFIED_PARAMETERS"
+    elif scale_err is not None:
+        verdict = "UNKNOWN_LOSS_SCALE"
+    elif status_counts.get("weakly_identified", 0) > 0:
+        verdict = "WEAKLY_IDENTIFIED_PARAMETERS"
+    else:
+        verdict = "CLEAN"
+    assert verdict in VERDICTS
+
     return {
+        "producer": PRODUCER,
+        "manifest_sha256": _sha256_file(manifest_path),
         "n_parameters": len(params_manifest),
+        "loss_type": manifest.get("loss_type"),
+        "loss_scale_error": scale_err,
+        "se_method": "sqrt(diag(pinv(Hessian)))",
+        "profile_method": ("conditional" if methods_used <= {"conditional", "none"}
+                           and "conditional" in methods_used else
+                           "full" if methods_used <= {"full", "none"} else "mixed"),
+        "evidence_strength": ("conditional_profile"
+                              if "conditional" in methods_used else "full"),
+        "hessian_condition_number": (None if fa.get("condition_number") is None
+                                     or not math.isfinite(fa["condition_number"])
+                                     else round(fa["condition_number"], 3)),
+        "ridges": fa["ridges"],
         "parameters": param_results,
         "status_counts": status_counts,
-        "verdict": ("CLEAN"
-                    if status_counts.get("unidentified", 0) == 0
-                    and status_counts.get("weakly_identified", 0) == 0
-                    else ("UNIDENTIFIED_PARAMETERS"
-                          if status_counts.get("unidentified", 0) > 0
-                          else "WEAKLY_IDENTIFIED_PARAMETERS")),
+        "verdict": verdict,
     }
+
+
+def _sha256_file(path: str) -> Optional[str]:
+    import hashlib
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
 
 
 def _run_self_test() -> int:
@@ -391,6 +694,7 @@ def _run_self_test() -> int:
         with open(os.path.join(d, "models", "identifiability.yaml"), "w") as f:
             f.write(
                 "loss_fn: models/loss.py::loss\n"
+                "loss_type: nll\n"
                 "parameters:\n"
                 "  - name: beta\n"
                 "    point_estimate: 0.5\n"
@@ -418,11 +722,12 @@ def _run_self_test() -> int:
             f.write(
                 "def loss(p):\n"
                 "    a = p['a']; b = p['b']\n"
-                "    return (a - 1.0) ** 2 * 50 + (b - 2.0) ** 2 * 80\n"
+                "    return (a - 1.0) ** 2 * 5000 + (b - 2.0) ** 2 * 8000\n"
             )
         with open(os.path.join(d, "models", "identifiability.yaml"), "w") as f:
             f.write(
                 "loss_fn: models/loss.py::loss\n"
+                "loss_type: nll\n"
                 "parameters:\n"
                 "  - name: a\n"
                 "    point_estimate: 1.0\n"
@@ -455,6 +760,7 @@ def _run_self_test() -> int:
         with open(os.path.join(d, "models", "identifiability.yaml"), "w") as f:
             f.write(
                 "loss_fn: models/loss.py::loss\n"
+                "loss_type: nll\n"
                 "parameters:\n"
                 "  - name: a\n"
                 "    point_estimate: 1.0\n"
@@ -493,6 +799,7 @@ def _run_self_test() -> int:
         with open(os.path.join(d, "models", "identifiability.yaml"), "w") as f:
             f.write(
                 "loss_fn: models/loss.py::loss\n"
+                "loss_type: nll\n"
                 "parameters:\n"
                 "  - name: beta\n"
                 "    point_estimate: 0.5\n"
@@ -512,6 +819,91 @@ def _run_self_test() -> int:
         ok(report["parameters"]["ridge"]["status"] == "unidentified",
            f"D: partial-ridge ridge should still classify as unidentified; "
            f"got {report['parameters']['ridge']['status']}")
+
+    # Phase 21 δ helpers.
+    def _run(loss_src: str, params: list[tuple], extra: str = "") -> dict:
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "models"))
+            with open(os.path.join(d, "models", "loss.py"), "w") as f:
+                f.write(loss_src)
+            lines = ["loss_fn: models/loss.py::loss"]
+            if extra:
+                lines.append(extra.rstrip("\n"))
+            lines.append("parameters:")
+            for name, pe, lo, hi in params:
+                lines += [f"  - name: {name}", f"    point_estimate: {pe}",
+                          f"    lower_bound: {lo}", f"    upper_bound: {hi}",
+                          "    profile_n_points: 9"]
+            with open(os.path.join(d, "models", "identifiability.yaml"), "w") as f:
+                f.write("\n".join(lines) + "\n")
+            return analyze(d)
+
+    # Case E (Phase 21 δ): only the ratio β/γ is identifiable. The pre-21
+    # diagonal-Fisher + conditional-slice tool returned CLEAN here.
+    rE = _run("def loss(p):\n    return 500 * (p['beta'] / p['gamma'] - 2.0) ** 2\n",
+              [("beta", 0.4, 0.05, 2.0), ("gamma", 0.2, 0.05, 2.0)],
+              "loss_type: nll")
+    ok(rE["verdict"] == "UNIDENTIFIED_PARAMETERS",
+       f"E: ratio-only loss must be UNIDENTIFIED; got {rE['verdict']}")
+    ok(all(rE["parameters"][n]["status"] == "unidentified"
+           for n in ("beta", "gamma")),
+       f"E: both ratio params unidentified; got "
+       f"{[rE['parameters'][n]['status'] for n in ('beta', 'gamma')]}")
+    ok(any(set(r["params"]) == {"beta", "gamma"} for r in rE["ridges"]),
+       f"E: ridge should name the beta/gamma combination; got {rE['ridges']}")
+
+    # Case F (Phase 21 δ): sum-only loss — a+b identified, a and b not.
+    rF = _run("def loss(p):\n    return 10000 * (p['a'] + p['b'] - 2.0) ** 2\n",
+              [("a", 1.0, 0.0, 2.0), ("b", 1.0, 0.0, 2.0)], "loss_type: nll")
+    ok(rF["verdict"] == "UNIDENTIFIED_PARAMETERS",
+       f"F: sum-only loss must be UNIDENTIFIED; got {rF['verdict']}")
+    ok(all(rF["parameters"][n]["profile_flat_ratio"] is not None
+           and rF["parameters"][n]["profile_flat_ratio"] < 1.0
+           for n in ("a", "b")),
+       f"F: re-optimized profiles must be flat; got "
+       f"{[rF['parameters'][n]['profile_flat_ratio'] for n in ('a', 'b')]}")
+
+    # Case G (Phase 21 δ): SSE verdicts invariant to rescaling the loss.
+    sse_src = ("XS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]\n"
+               "YS = [1.1, 2.9, 5.2, 6.8, 9.1, 11.0, 12.8, 15.2, 17.1, 18.9]\n"
+               "SCALE = {c}\n"
+               "def loss(p):\n"
+               "    return SCALE * sum((y - (p['a'] + p['b'] * x)) ** 2\n"
+               "                       for x, y in zip(XS, YS))\n")
+    pg = [("a", 1.04, 0.0, 3.0), ("b", 1.99, 1.0, 3.0)]
+    rG1 = _run(sse_src.format(c=1.0), pg, "loss_type: sse\nn_obs: 10")
+    rG2 = _run(sse_src.format(c=2000.0), pg, "loss_type: sse\nn_obs: 10")
+    ok(rG1["verdict"] == rG2["verdict"],
+       f"G: verdict must not depend on loss scale; {rG1['verdict']} vs {rG2['verdict']}")
+    ok(all(rG1["parameters"][n]["status"] == rG2["parameters"][n]["status"]
+           and abs((rG1["parameters"][n]["relative_se"] or 0)
+                   - (rG2["parameters"][n]["relative_se"] or 0)) < 1e-3
+           for n in ("a", "b")),
+       f"G: per-param status/SE must be scale-invariant; "
+       f"{rG1['parameters']} vs {rG2['parameters']}")
+    ok(rG1["parameters"]["b"]["status"] == "well_identified",
+       f"G: slope well identified; got {rG1['parameters']['b']['status']}")
+
+    # Case H (Phase 21 δ): missing loss_type → UNKNOWN_LOSS_SCALE (fails).
+    rH = _run("def loss(p):\n    return (p['a'] - 1) ** 2 * 5000\n",
+              [("a", 1.0, 0.5, 1.5)])
+    ok(rH["verdict"] == "UNKNOWN_LOSS_SCALE",
+       f"H: no loss_type must be UNKNOWN_LOSS_SCALE; got {rH['verdict']}")
+    rH2 = _run("def loss(p):\n    return (p['a'] - 1) ** 2 * 5000\n",
+               [("a", 1.0, 0.5, 1.5)], "loss_type: sse")
+    ok(rH2["verdict"] == "UNKNOWN_LOSS_SCALE" and rH2["loss_scale_error"],
+       f"H2: sse without n_obs must be UNKNOWN_LOSS_SCALE; got {rH2['verdict']}")
+
+    # Case I (Phase 21 δ): conditional opt-out is recorded as weaker evidence.
+    rI = _run("def loss(p):\n    return (p['a'] - 1) ** 2 * 5000 + (p['b'] - 2) ** 2 * 8000\n",
+              [("a", 1.0, 0.5, 1.5), ("b", 2.0, 1.5, 2.5)],
+              "loss_type: nll\nprofile: conditional")
+    ok(rI["verdict"] == "CLEAN" and rI["evidence_strength"] == "conditional_profile",
+       f"I: conditional profile CLEAN with weaker evidence; got "
+       f"{rI['verdict']} / {rI['evidence_strength']}")
+    ok(set(VERDICTS) >= {rE["verdict"], rG1["verdict"], rH["verdict"], rI["verdict"]}
+       and rI["producer"] == PRODUCER,
+       "I2: verdicts within closed VERDICTS set and producer stamped")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)

@@ -83,6 +83,16 @@ except ImportError:
     sys.exit(2)
 
 
+# Phase 21 δ: closed verdict vocabulary. The validator allowlists these;
+# any other string in model_comparison_formal.yaml (e.g. a hand-edited
+# "DEGENERATE_FIT_ACKNOWLEDGED") was not produced by this tool and must
+# fail closed. Acknowledging a degenerate fit belongs in
+# scope_declaration.yaml, never in this tool's output.
+VERDICTS = ("CLEAN", "DEGENERATE_FIT_DETECTED", "INSUFFICIENT_STRUCTURES")
+PASSING_VERDICTS = ("CLEAN",)
+PRODUCER = "scripts/compare_models.py"
+
+
 def rmse(observed: list[float], predicted: list[float]) -> float:
     if len(observed) != len(predicted):
         raise ValueError(f"length mismatch: {len(observed)} vs {len(predicted)}")
@@ -330,6 +340,29 @@ def _run_self_test() -> int:
     ok(report_c["verdict"] == "INSUFFICIENT_STRUCTURES",
        f"C: INSUFFICIENT expected; got {report_c['verdict']}")
 
+    # D (Phase 21 δ): every verdict compare() can emit is in VERDICTS.
+    ok({report["verdict"], report_b["verdict"], report_c["verdict"]}
+       <= set(VERDICTS),
+       "D: compare() verdicts must be within the closed VERDICTS set")
+
+    # E (Phase 21 δ): CLI stamps producer + manifest hash; non-mapping
+    # manifest exits 2 instead of crashing.
+    import subprocess, tempfile
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "models", "model_comparison.yaml"), "w") as f:
+            yaml.safe_dump(manifest_a, f)
+        subprocess.run([sys.executable, __file__, d], capture_output=True)
+        with open(os.path.join(d, "model_comparison_formal.yaml")) as f:
+            out = yaml.safe_load(f)
+        ok(out.get("producer") == PRODUCER and len(out.get("manifest_sha256", "")) == 64,
+           f"E: producer/manifest_sha256 stamped; got {out.get('producer')}")
+        with open(os.path.join(d, "models", "model_comparison.yaml"), "w") as f:
+            f.write("- just\n- a list\n")
+        rc = subprocess.run([sys.executable, __file__, d],
+                            capture_output=True).returncode
+        ok(rc == 2, f"E2: list manifest must exit 2; got {rc}")
+
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)
         for f in failures:
@@ -360,14 +393,29 @@ def main() -> int:
               f"See the multi-structural-comparison skill.", file=sys.stderr)
         return 2
 
-    with open(manifest_path) as f:
-        manifest = yaml.safe_load(f)
+    try:
+        with open(manifest_path) as f:
+            manifest = yaml.safe_load(f)
+    except yaml.YAMLError as e:
+        print(f"ERROR: {manifest_path} is not valid YAML: {e}", file=sys.stderr)
+        return 2
+    if not isinstance(manifest, dict):
+        print(f"ERROR: {manifest_path} must be a YAML mapping", file=sys.stderr)
+        return 2
 
     try:
         report = compare(manifest)
-    except ValueError as e:
-        print(f"ERROR: {e}", file=sys.stderr)
+    except (ValueError, KeyError, TypeError) as e:
+        print(f"ERROR: {type(e).__name__}: {e}", file=sys.stderr)
         return 2
+    # Phase 21 δ: provenance stamp so consumers can tell tool output from
+    # hand-written files and detect a stale report.
+    import hashlib
+    with open(manifest_path, "rb") as f:
+        report = {"producer": PRODUCER,
+                  "manifest_sha256": hashlib.sha256(f.read()).hexdigest(),
+                  **report}
+    assert report["verdict"] in VERDICTS
 
     output_path = args.output or os.path.join(
         args.run_dir, "model_comparison_formal.yaml")

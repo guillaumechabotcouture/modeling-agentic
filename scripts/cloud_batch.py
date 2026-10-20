@@ -61,6 +61,7 @@ import pickle
 import sys
 import time
 import traceback
+import contextlib
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Optional
 from uuid import uuid4
@@ -104,7 +105,9 @@ class PoolSpec:
     low_priority_nodes: int = 0
     dedicated_nodes: int = 0
     max_nodes: int = 8          # autoscale ceiling for low-priority
-    auto_delete: bool = True    # delete pool when job completes
+    auto_delete: bool = True    # Phase 21 δ: delete the pool on exit of
+                                # managed_pool() IF this invocation created
+                                # it. Pre-existing pools are never deleted.
     image_offer: str = "ubuntu-server-container"
     image_sku: str = "22-04-lts"
     image_publisher: str = "microsoft-azure-batch"
@@ -157,6 +160,40 @@ def estimate_cost(n_tasks: int, avg_task_seconds: float, vm_size: str,
         estimated_usd=estimated_usd,
         note=note,
     )
+
+
+class BudgetExceededError(RuntimeError):
+    """Raised by preflight_budget() before any Azure resource is created."""
+
+
+def preflight_budget(n_tasks: int, avg_task_seconds: float, vm_size: str,
+                     max_nodes: int, low_priority: bool,
+                     budget_usd_cap: float, force: bool = False) -> CostEstimate:
+    """Phase 21 δ: pure budget guard that runs BEFORE provisioning.
+
+    Pre-21 the only guard lived in submit_function_tasks(), i.e. after
+    ensure_pool() had already created (billing) nodes, and it always
+    priced at low-priority rates — ~5× too low for the default dedicated
+    pool. This prices the node type that will actually be used."""
+    est = estimate_cost(n_tasks, avg_task_seconds, vm_size, max_nodes,
+                        low_priority=low_priority)
+    print(f"[cloud_batch] Estimated cost: ${est.estimated_usd:.4f} "
+          f"({est.n_tasks} tasks × {est.avg_task_seconds:.0f}s on "
+          f"{vm_size} {'low-priority' if low_priority else 'dedicated'}, "
+          f"~{est.n_nodes_effective} nodes)", file=sys.stderr)
+    if est.estimated_usd > budget_usd_cap and not force:
+        raise BudgetExceededError(
+            f"Estimated cost ${est.estimated_usd:.4f} exceeds budget "
+            f"cap ${budget_usd_cap}. Raise budget_usd_cap or pass "
+            f"force=True to override.")
+    return est
+
+
+# Phase 21 δ: per-task wall-clock ceiling so a hung task cannot hold a
+# billing node indefinitely, and transient-error retry policy for polling.
+DEFAULT_TASK_MAX_WALL_MINUTES = 60
+POLL_MAX_CONSECUTIVE_ERRORS = 5
+SAS_DEFAULT_HOURS = 3
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +285,10 @@ class BatchRunner:
         self._credential = None
         self._batch_client = None
         self._blob_client = None
+        # Phase 21 δ: pools created by THIS runner (name → low_priority).
+        # Only these are eligible for teardown.
+        self._created_pools: dict[str, bool] = {}
+        self._delegation_key = None
 
     def _require_config(self):
         missing = []
@@ -318,8 +359,10 @@ class BatchRunner:
 
     def ensure_pool(self, pool_name: str, vm_size: str = DEFAULT_VM_SIZE,
                     max_nodes: int = 8, use_low_priority: bool = True,
-                    dedicated_nodes: int = 0, auto_scale: bool = True) -> None:
-        """Create a pool if it doesn't exist.
+                    dedicated_nodes: int = 0, auto_scale: bool = True) -> bool:
+        """Create a pool if it doesn't exist. Returns True iff this call
+        created it (Phase 21 δ ownership tracking — only created pools are
+        torn down by managed_pool()).
 
         Default: autoscale 0 → `max_nodes` low-priority VMs. For Free Trial
         subscriptions (lowPriorityCoreQuota=0), pass `use_low_priority=False`
@@ -337,7 +380,10 @@ class BatchRunner:
         # Does pool already exist?
         try:
             batch.pool.get(pool_name)
-            return  # Pool exists, reuse.
+            print(f"[cloud_batch] reusing pre-existing pool '{pool_name}' — "
+                  f"it will NOT be deleted by this invocation; delete it "
+                  f"yourself if nothing else uses it.", file=sys.stderr)
+            return False  # Pool exists, reuse.
         except BatchErrorException as e:
             if "PoolNotFound" not in str(e):
                 raise
@@ -389,6 +435,56 @@ class BatchRunner:
             **pool_kwargs,
         )
         batch.pool.add(pool)
+        self._created_pools[pool_name] = bool(use_low_priority)
+        return True
+
+    @contextlib.contextmanager
+    def managed_pool(self, spec: "PoolSpec", use_low_priority: bool,
+                     auto_scale: bool = False):
+        """Phase 21 δ: provision `spec` and guarantee teardown.
+
+        Yields True if the pool was created here. On exit — success,
+        exception, timeout, or KeyboardInterrupt — deletes the pool iff
+        this invocation created it and spec.auto_delete is set. A
+        pre-existing pool is never deleted."""
+        created = False
+        try:
+            created = self.ensure_pool(
+                pool_name=spec.name, vm_size=spec.vm_size,
+                max_nodes=spec.max_nodes, use_low_priority=use_low_priority,
+                dedicated_nodes=(0 if use_low_priority else spec.max_nodes),
+                auto_scale=auto_scale)
+            yield created
+        finally:
+            if created and spec.auto_delete:
+                try:
+                    self.delete_pool(spec.name)
+                    print(f"[cloud_batch] deleted pool '{spec.name}'",
+                          file=sys.stderr)
+                except Exception as e:  # noqa: BLE001 — must not mask
+                    print(f"[cloud_batch] WARNING: failed to delete pool "
+                          f"'{spec.name}' ({e}). DELETE IT MANUALLY — it "
+                          f"is still billing.", file=sys.stderr)
+
+    def pool_is_low_priority(self, pool_info) -> bool:
+        """Infer node type of an existing pool for pricing. Unknown →
+        False (price as dedicated, the conservative choice)."""
+        name = getattr(pool_info, "id", None)
+        if name in self._created_pools:
+            return self._created_pools[name]
+        if (getattr(pool_info, "target_low_priority_nodes", 0) or 0) > 0 and \
+                not (getattr(pool_info, "target_dedicated_nodes", 0) or 0):
+            return True
+        formula = getattr(pool_info, "auto_scale_formula", None) or ""
+        return "$TargetLowPriorityNodes = min" in formula
+
+    def terminate_job(self, job_id: str) -> None:
+        """Best-effort: stop a job's running tasks (used on timeout)."""
+        try:
+            self._batch_get().job.terminate(job_id)
+        except Exception as e:  # noqa: BLE001
+            print(f"[cloud_batch] WARNING: could not terminate job "
+                  f"{job_id}: {e}", file=sys.stderr)
 
     def delete_pool(self, pool_name: str) -> None:
         self._require_config()
@@ -421,24 +517,30 @@ class BatchRunner:
         except Exception:
             return None
 
-    def _generate_sas_url(self, blob_name: str, hours: int = 8) -> str:
+    def _generate_sas_url(self, blob_name: str, hours: int = SAS_DEFAULT_HOURS,
+                          access: str = "r") -> str:
+        """User-delegation SAS for one blob. Phase 21 δ: least privilege —
+        access="r" for inputs the worker downloads, access="cw" for the
+        output it uploads — and a short expiry (default 3 h, was 8 h with
+        read+write on every blob)."""
         from azure.storage.blob import generate_blob_sas, BlobSasPermissions
-        from datetime import datetime, timedelta
+        from datetime import datetime, timedelta, timezone
         blob_svc = self._blob_get()
-        # We need the storage account key for SAS. If we don't have it,
-        # we need to request it via management plane with the credential.
-        # For simplicity, use user-delegation SAS which uses AAD credentials.
-        user_delegation_key = blob_svc.get_user_delegation_key(
-            key_start_time=datetime.utcnow() - timedelta(minutes=5),
-            key_expiry_time=datetime.utcnow() + timedelta(hours=hours),
-        )
+        now = datetime.now(timezone.utc)
+        if self._delegation_key is None:
+            self._delegation_key = blob_svc.get_user_delegation_key(
+                key_start_time=now - timedelta(minutes=5),
+                key_expiry_time=now + timedelta(hours=hours),
+            )
+        perm = BlobSasPermissions(read="r" in access, create="c" in access,
+                                  write="w" in access)
         sas_token = generate_blob_sas(
             account_name=self.storage_account,
             container_name=self.storage_container,
             blob_name=blob_name,
-            user_delegation_key=user_delegation_key,
-            permission=BlobSasPermissions(read=True, write=True),
-            expiry=datetime.utcnow() + timedelta(hours=hours),
+            user_delegation_key=self._delegation_key,
+            permission=perm,
+            expiry=now + timedelta(hours=hours),
         )
         return (f"https://{self.storage_account}.blob.core.windows.net/"
                 f"{self.storage_container}/{blob_name}?{sas_token}")
@@ -454,6 +556,8 @@ class BatchRunner:
             avg_task_seconds: float = 30.0,
             force: bool = False,
             models_dir: Optional[str] = None,
+            low_priority: Optional[bool] = None,
+            task_max_wall_minutes: int = DEFAULT_TASK_MAX_WALL_MINUTES,
     ) -> str:
         """Submit N tasks to the pool, one per entry in args_list.
 
@@ -485,17 +589,12 @@ class BatchRunner:
         if max_nodes < 1:
             max_nodes = 8
 
-        est = estimate_cost(len(args_list), avg_task_seconds, vm_size,
-                            max_nodes, low_priority=True)
-        print(f"[cloud_batch] Estimated cost: ${est.estimated_usd:.4f} "
-              f"({est.n_tasks} tasks × {est.avg_task_seconds:.0f}s on "
-              f"{vm_size}, ~{est.n_nodes_effective} nodes)", file=sys.stderr)
-        if est.estimated_usd > budget_usd_cap and not force:
-            raise RuntimeError(
-                f"Estimated cost ${est.estimated_usd:.4f} exceeds budget "
-                f"cap ${budget_usd_cap}. Raise budget_usd_cap or pass "
-                f"force=True to override."
-            )
+        # Phase 21 δ: price the node type the pool actually uses (was
+        # hardcoded low_priority=True → ~5× under-estimate on dedicated).
+        if low_priority is None:
+            low_priority = self.pool_is_low_priority(pool_info)
+        preflight_budget(len(args_list), avg_task_seconds, vm_size,
+                         max_nodes, low_priority, budget_usd_cap, force)
 
         if job_id is None:
             job_id = f"job-{uuid4().hex[:12]}"
@@ -524,25 +623,31 @@ class BatchRunner:
                 tar.add(models_dir, arcname="models")
             tar_blob = f"{job_id}/models.tar.gz"
             self._upload_blob(tar_blob, tar_buf.getvalue())
-            models_sas = self._generate_sas_url(tar_blob)
+            models_sas = self._generate_sas_url(tar_blob, access="r")
 
         # 3. Create the job.
+        from datetime import timedelta
+        n_waves = max(1, -(-len(args_list) // max(1, max_nodes)))
         job = batch_models.JobAddParameter(
             id=job_id,
             pool_info=batch_models.PoolInformation(pool_id=pool_name),
             on_all_tasks_complete="terminateJob",
+            # Phase 21 δ: job-level ceiling = waves × per-task ceiling.
+            constraints=batch_models.JobConstraints(
+                max_wall_clock_time=timedelta(
+                    minutes=task_max_wall_minutes * n_waves + 30)),
         )
         batch.job.add(job)
 
         # 4. Create tasks.
-        worker_sas = self._generate_sas_url(worker_blob)
+        worker_sas = self._generate_sas_url(worker_blob, access="r")
         pip_install = " ".join(pip_deps or [])
         tasks = []
         for i, blob_name in enumerate(blob_names):
-            input_sas = self._generate_sas_url(blob_name)
+            input_sas = self._generate_sas_url(blob_name, access="r")
             output_blob = f"{job_id}/task-{i:06d}/output.pkl"
-            # Output SAS is write-only; we use upload at task end.
-            output_sas = self._generate_sas_url(output_blob)
+            # Output SAS is create/write-only; we use upload at task end.
+            output_sas = self._generate_sas_url(output_blob, access="cw")
             pip_line = (f"pip install --quiet {pip_install} && "
                         if pip_install else "")
             models_line = (
@@ -564,6 +669,9 @@ class BatchRunner:
             tasks.append(batch_models.TaskAddParameter(
                 id=f"task-{i:06d}",
                 command_line=command,
+                constraints=batch_models.TaskConstraints(
+                    max_wall_clock_time=timedelta(minutes=task_max_wall_minutes),
+                    max_task_retry_count=1),
             ))
 
         # Submit in chunks of 100 per API limit.
@@ -582,13 +690,26 @@ class BatchRunner:
         batch = self._batch_get()
 
         deadline = time.time() + timeout_minutes * 60
+        consecutive_errors = 0
         while time.time() < deadline:
-            tasks = list(batch.task.list(job_id))
+            try:
+                tasks = list(batch.task.list(job_id))
+                consecutive_errors = 0
+            except Exception as e:  # noqa: BLE001 — Phase 21 δ: transient
+                consecutive_errors += 1
+                if consecutive_errors >= POLL_MAX_CONSECUTIVE_ERRORS:
+                    raise
+                print(f"[cloud_batch] task.list error ({e}); retry "
+                      f"{consecutive_errors}/{POLL_MAX_CONSECUTIVE_ERRORS}",
+                      file=sys.stderr)
+                time.sleep(poll_seconds * consecutive_errors)
+                continue
             states = [t.state for t in tasks]
-            if all(s == batch_models.TaskState.completed for s in states):
+            if tasks and all(s == batch_models.TaskState.completed for s in states):
                 break
             time.sleep(poll_seconds)
         else:
+            self.terminate_job(job_id)
             raise TimeoutError(
                 f"Job {job_id} did not complete within {timeout_minutes} min"
             )
@@ -608,6 +729,9 @@ class BatchRunner:
                 except Exception:
                     results.append(None)
         return results
+
+
+_REAL_BATCH_RUNNER = BatchRunner
 
 
 _WORKER_SCRIPT = r"""#!/usr/bin/env python3
@@ -642,6 +766,169 @@ except Exception as e:
         pickle.dump({'ok': False, 'error': repr(e),
                      'traceback': traceback.format_exc()}, f)
 """
+
+
+# ---------------------------------------------------------------------------
+# Phase 21 δ: in-memory fake of the azure SDK surface BatchRunner touches.
+# Used by the offline self-tests (here and in propagate_uncertainty.py) to
+# prove pool teardown / budget ordering without any network call.
+# ---------------------------------------------------------------------------
+
+class _FakeAzure:
+    """Context manager installing fake `azure.batch` / `azure.storage.blob`
+    modules. `calls` records every mutating Azure operation in order.
+    task_mode: "complete" (tasks finish and write outputs), "hang" (never
+    complete), "flaky" (task.list raises twice, then completes)."""
+
+    def __init__(self, existing_pools=(), task_mode="complete"):
+        self.existing = set(existing_pools)
+        self.task_mode = task_mode
+        self.calls: list[tuple] = []
+        self.blobs: dict[str, bytes] = {}
+        self._saved: dict = {}
+        self._flaky_left = 2
+
+    # -- module construction --
+    def _modules(self):
+        import types
+        fake = self
+
+        class BatchErrorException(Exception):
+            pass
+
+        class _Obj:
+            def __init__(self, **kw):
+                self.__dict__.update(kw)
+
+        models = types.ModuleType("azure.batch.models")
+        for n in ("PoolAddParameter", "VirtualMachineConfiguration",
+                  "ImageReference", "JobAddParameter", "PoolInformation",
+                  "JobConstraints", "TaskConstraints", "TaskAddParameter"):
+            setattr(models, n, type(n, (_Obj,), {}))
+        models.BatchErrorException = BatchErrorException
+
+        class TaskState:
+            completed = "completed"
+            running = "running"
+        models.TaskState = TaskState
+
+        class Pools:
+            def get(self, name):
+                if name in fake.existing:
+                    return _Obj(id=name, vm_size=DEFAULT_VM_SIZE,
+                                target_low_priority_nodes=0,
+                                target_dedicated_nodes=2,
+                                auto_scale_formula=None)
+                raise BatchErrorException("PoolNotFound")
+
+            def add(self, pool):
+                fake.calls.append(("pool.add", pool.id))
+                fake.existing.add(pool.id)
+
+            def delete(self, name):
+                fake.calls.append(("pool.delete", name))
+                fake.existing.discard(name)
+
+        class Jobs:
+            def add(self, job):
+                fake.calls.append(("job.add", job.id))
+
+            def terminate(self, job_id):
+                fake.calls.append(("job.terminate", job_id))
+
+        class Tasks:
+            def __init__(self):
+                self.by_job: dict[str, list] = {}
+
+            def add_collection(self, job_id, tasks):
+                fake.calls.append(("task.add_collection", len(tasks)))
+                for t in tasks:
+                    self.by_job.setdefault(job_id, []).append(t.id)
+                    if fake.task_mode != "hang":
+                        idx = int(t.id.split("-")[-1])
+                        inp = fake.blobs[f"{job_id}/task-{idx:06d}/input.pkl"]
+                        try:
+                            res = {"ok": True, "result": deserialize_and_run(inp)}
+                        except Exception as e:  # noqa: BLE001
+                            res = {"ok": False, "error": repr(e)}
+                        fake.blobs[f"{job_id}/task-{idx:06d}/output.pkl"] = \
+                            pickle.dumps(res)
+
+            def list(self, job_id):
+                if fake.task_mode == "flaky" and fake._flaky_left > 0:
+                    fake._flaky_left -= 1
+                    raise ConnectionError("transient")
+                state = ("running" if fake.task_mode == "hang" else "completed")
+                return [_Obj(id=i, state=state)
+                        for i in self.by_job.get(job_id, [])]
+
+        class BatchClient:
+            def __init__(self):
+                self.pool, self.job, self.task = Pools(), Jobs(), Tasks()
+
+        batch_mod = types.ModuleType("azure.batch")
+        batch_mod.models = models
+        batch_mod.BatchServiceClient = lambda *a, **k: BatchClient()
+
+        class Container:
+            def upload_blob(self, name, data, overwrite=True):
+                fake.blobs[name] = data
+
+            def download_blob(self, name):
+                data = fake.blobs[name]
+                return _Obj(readall=lambda: data)
+
+        class BlobSvc:
+            def get_container_client(self, c):
+                return Container()
+
+            def get_user_delegation_key(self, **kw):
+                return "key"
+
+        class BlobSasPermissions:
+            def __init__(self, read=False, create=False, write=False):
+                self.read, self.create, self.write = read, create, write
+
+        def generate_blob_sas(**kw):
+            perm = kw["permission"]
+            fake.calls.append(("sas", kw["blob_name"],
+                               "r" * perm.read + "c" * perm.create + "w" * perm.write))
+            return "sig"
+
+        blob_mod = types.ModuleType("azure.storage.blob")
+        blob_mod.BlobSasPermissions = BlobSasPermissions
+        blob_mod.generate_blob_sas = generate_blob_sas
+        blob_mod.BlobServiceClient = lambda **k: BlobSvc()
+        az = types.ModuleType("azure")
+        storage = types.ModuleType("azure.storage")
+        self.client = BatchClient()
+        self.blob_svc = BlobSvc()
+        return {"azure": az, "azure.batch": batch_mod,
+                "azure.batch.models": models, "azure.storage": storage,
+                "azure.storage.blob": blob_mod}
+
+    def runner(self) -> "BatchRunner":
+        # _REAL_BATCH_RUNNER: tests may monkeypatch the BatchRunner name.
+        r = _REAL_BATCH_RUNNER(subscription_id="s", batch_account="b",
+                               batch_account_url="https://b", storage_account="st")
+        r._batch_client = self.client
+        r._blob_client = self.blob_svc
+        return r
+
+    def __enter__(self):
+        mods = self._modules()
+        for k, v in mods.items():
+            self._saved[k] = sys.modules.get(k)
+            sys.modules[k] = v
+        return self
+
+    def __exit__(self, *exc):
+        for k, v in self._saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -687,12 +974,109 @@ def _run_offline_self_test() -> int:
     ok(deserialize_and_run(payload2) == "a",
        f"dict arg passed as single param: got {deserialize_and_run(payload2)}")
 
+    # --- Phase 21 δ: pricing + lifecycle against the in-memory fake ---
+    lp = estimate_cost(200, 30.0, "Standard_A2_v2", 2, low_priority=True)
+    dd = estimate_cost(200, 30.0, "Standard_A2_v2", 2, low_priority=False)
+    ok(abs(dd.estimated_usd / lp.estimated_usd - VM_DEDICATED_MULTIPLIER) < 1e-9,
+       f"P1: dedicated priced at {VM_DEDICATED_MULTIPLIER}× low-priority; got "
+       f"{dd.estimated_usd / lp.estimated_usd:.2f}×")
+
+    spec = PoolSpec(name="p-new", max_nodes=2)
+    # L1: success path deletes the pool this invocation created.
+    with _FakeAzure() as fa:
+        r = fa.runner()
+        with r.managed_pool(spec, use_low_priority=False):
+            job = r.submit_function_tasks("p-new", _square, [2, 3],
+                                          budget_usd_cap=100.0)
+            res = r.wait_and_collect(job, timeout_minutes=1, poll_seconds=0)
+        ok([x.get("result") for x in res] == [4, 9],
+           f"L1: results collected; got {res}")
+        ok(("pool.delete", "p-new") in fa.calls,
+           f"L1: created pool deleted on success; calls {fa.calls}")
+        sas = [c for c in fa.calls if c[0] == "sas"]
+        ok(all(c[2] == "r" for c in sas if not c[1].endswith("output.pkl"))
+           and all(c[2] == "cw" for c in sas if c[1].endswith("output.pkl")),
+           f"L1b: least-privilege SAS (r inputs, cw outputs); got {sas}")
+    # L2: exception inside the session still deletes.
+    with _FakeAzure() as fa:
+        r = fa.runner()
+        try:
+            with r.managed_pool(spec, use_low_priority=False):
+                raise ValueError("boom")
+        except ValueError:
+            pass
+        ok(("pool.delete", "p-new") in fa.calls,
+           f"L2: created pool deleted on exception; calls {fa.calls}")
+    # L3: timeout deletes the pool and terminates the job.
+    with _FakeAzure(task_mode="hang") as fa:
+        r = fa.runner()
+        timed_out = False
+        try:
+            with r.managed_pool(spec, use_low_priority=False):
+                job = r.submit_function_tasks("p-new", _square, [2],
+                                              budget_usd_cap=100.0)
+                r.wait_and_collect(job, timeout_minutes=0.0001, poll_seconds=0)
+        except TimeoutError:
+            timed_out = True
+        ok(timed_out and ("pool.delete", "p-new") in fa.calls
+           and any(c[0] == "job.terminate" for c in fa.calls),
+           f"L3: timeout → job terminated + pool deleted; calls {fa.calls}")
+    # L4: a pre-existing pool is reused and never deleted.
+    with _FakeAzure(existing_pools={"p-new"}) as fa:
+        r = fa.runner()
+        with r.managed_pool(spec, use_low_priority=False) as created:
+            pass
+        ok(created is False and not any(c[0] == "pool.delete" for c in fa.calls)
+           and not any(c[0] == "pool.add" for c in fa.calls),
+           f"L4: pre-existing pool untouched; calls {fa.calls}")
+    # L5: auto_delete=False keeps even a created pool.
+    with _FakeAzure() as fa:
+        r = fa.runner()
+        with r.managed_pool(PoolSpec(name="keep", auto_delete=False),
+                            use_low_priority=False):
+            pass
+        ok(not any(c[0] == "pool.delete" for c in fa.calls),
+           f"L5: auto_delete=False honored; calls {fa.calls}")
+    # L6: budget guard raises before ANY create call.
+    with _FakeAzure() as fa:
+        r = fa.runner()
+        raised = False
+        try:
+            preflight_budget(10_000, 600.0, "Standard_D32s_v5", 4,
+                             low_priority=False, budget_usd_cap=1.0)
+            with r.managed_pool(spec, use_low_priority=False):
+                pass
+        except BudgetExceededError:
+            raised = True
+        ok(raised and fa.calls == [],
+           f"L6: budget rejected before provisioning; calls {fa.calls}")
+    # L7: submit on a dedicated pool prices dedicated (was low-priority).
+    with _FakeAzure(existing_pools={"ded"}) as fa:
+        r = fa.runner()
+        raised = False
+        try:
+            # 200 × 30s on 2 dedicated A2_v2 ≈ $0.27; low-priority ≈ $0.05.
+            r.submit_function_tasks("ded", _square, list(range(200)),
+                                    budget_usd_cap=0.10)
+        except BudgetExceededError:
+            raised = True
+        ok(raised, "L7: dedicated pool priced at dedicated rate in submit")
+    # L8: transient task.list errors are retried, not fatal.
+    with _FakeAzure(task_mode="flaky") as fa:
+        r = fa.runner()
+        with r.managed_pool(spec, use_low_priority=False):
+            job = r.submit_function_tasks("p-new", _square, [5],
+                                          budget_usd_cap=100.0)
+            res = r.wait_and_collect(job, timeout_minutes=1, poll_seconds=0)
+        ok(res and res[0].get("result") == 25,
+           f"L8: flaky task.list retried; got {res}")
+
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)
         for f in failures:
             print(f"  - {f}", file=sys.stderr)
         return 1
-    print("OK: offline self-test passed.", file=sys.stderr)
+    print("OK: all self-test cases passed.", file=sys.stderr)
     return 0
 
 
