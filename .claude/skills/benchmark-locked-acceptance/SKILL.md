@@ -8,8 +8,8 @@ description: Translate published benchmarks into structured acceptance bands the
 ## What this is for
 
 Most planner outputs include a "Published benchmarks" prose table —
-WMR-2023 incidence per 1,000 PYO, DHS ITN-use percentages, NMIS PfPR
-ranges, etc. Without a mechanical gate, those numbers stay prose and
+incidence per 1,000 person-years from a WHO disease report, DHS/MICS
+coverage percentages, survey prevalence ranges, GBD death counts, etc. Without a mechanical gate, those numbers stay prose and
 the modeler's fitted outputs are never compared against them. A model
 can ship with a calibrated incidence 4× the literature range and the
 report will still ACCEPT because nothing computed the comparison.
@@ -46,20 +46,20 @@ benchmarks:
     tolerance_factor: 2.0           # acceptance band [target/factor, target*factor]
     # OR an absolute tolerance:
     # tolerance_abs: 80
-    source: "WMR 2023, Table A.5, Nigeria row"
+    source: "WHO disease report (e.g., World Malaria Report), annex table, country row"
 
     # Modeler fills ONE of these after the model run:
     computed_value: 387             # inline numeric
     # OR
     computed_field: "uncertainty_report.yaml::scalar_outputs.incidence.mean"
 
-  - id: itn_use_under5_pct
-    metric: itn_use_under5
-    target_value: 56
+  - id: mcv1_coverage_national
+    metric: mcv1_coverage
+    target_value: 68
     units: pct
-    tolerance_abs: 8                # band [48, 64]
-    source: "DHS 2018 Nigeria, Table 11.4"
-    computed_value: 51
+    tolerance_abs: 8                # band [60, 76]
+    source: "WHO/UNICEF WUENIC estimates, country row, latest year"
+    computed_value: 71
 ```
 
 ## Tolerance defaults
@@ -87,8 +87,12 @@ benchmarks:
 ## What HIGH violations look like
 
 `scripts/benchmark_match.py` emits DRIFT when at least one benchmark's
-observed value is outside its band. The validator escalates DRIFT to
-HIGH at round ≥ 2; round 1 is the drafting window (MEDIUM advisory).
+observed value is outside its band. The validator raises one HIGH per
+drifted target (not one per file, and not "only when more than one
+drifts") at round ≥ 2; round 1 is the drafting window (MEDIUM
+advisory). A target whose `target_value` or tolerance is malformed is
+reported as MALFORMED and counts against the verdict; it is not
+silently dropped.
 `missing_computed` (modeler never filled `computed_value`) is HIGH
 from round 2 onward — it's the most common failure mode.
 
@@ -97,7 +101,7 @@ from round 2 onward — it's the most common failure mode.
 Phases 2-18 hardened the harness against paraphrase drift, structural
 punt, and cross-file inconsistency. None of those gates check whether
 the *model's numbers* match published reality. A modeler can ship a
-fitted PfPR of 0.5% when WMR says 24% and the report will still pass
+fitted prevalence of 0.5% when the national survey says 24% and the report will still pass
 identifiability_a_priori (the model is identifiable), pass
 multi-structural-comparison (AIC says simpler model wins), pass UQ
 (CIs are wide), pass coherence (numbers are self-consistent). The

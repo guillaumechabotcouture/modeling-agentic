@@ -1,14 +1,13 @@
 ---
 name: optimizer-method-selection
-description: When a model produces a budget-constrained allocation
-  (e.g., distributing $320M across 774 LGAs and 8 intervention
-  packages), the modeler must justify the optimizer choice by
-  comparing the primary method against at least one alternative —
-  ILP via PuLP, simulated annealing, random-restart greedy, or brute
-  force when feasible. The Phase 6 Commit θ gate enforces this via
-  models/optimization_quality.yaml. Trigger phrases include
-  "optimization quality", "greedy vs ILP", "optimizer benchmark",
-  "optimality gap", "is greedy good enough".
+description: >-
+  When a model produces a budget-constrained allocation across many units and
+  intervention packages, justify the optimizer by benchmarking the primary
+  method against at least one alternative (ILP via PuLP, simulated annealing,
+  random-restart greedy, or brute force when feasible) in
+  `models/optimization_quality.yaml`. Trigger phrases include "optimization
+  quality", "greedy vs ILP", "optimizer benchmark", "optimality gap", "is
+  greedy good enough".
 ---
 
 # Optimizer Method Selection
@@ -30,7 +29,7 @@ optimizer's gap_pct against ≥1 benchmark method.
 ## Decision tree: which optimizer for which problem
 
 ```
-Is the objective separable per spatial unit (per-LGA cases averted)?
+Is the objective separable per allocation unit (per-district outcomes averted)?
 ├── YES, with simple budget constraint
 │   ├── Greedy marginal CE is fine
 │   │   Benchmark against: random-restart greedy (k=20 starts)
@@ -41,13 +40,13 @@ Is the objective separable per spatial unit (per-LGA cases averted)?
 │   ├── ILP via PuLP+CBC is the right tool
 │   │   Benchmark against: greedy (to show the gap)
 │   │   Expected gap: 2-15% in greedy's favor
-│   └── Use this when: "fund exactly K LGAs", "package P excludes Q"
+│   └── Use this when: "fund exactly K districts", "package P excludes Q"
 │
-└── NO (cross-LGA spillovers, package interactions)
+└── NO (cross-unit spillovers, herd effects, package interactions)
     ├── Simulated annealing or genetic algorithm
     │   Benchmark against: random-restart greedy
     │   Expected gap: variable; report best-of-N runs
-    └── Use this when: spatial coupling, herd effects across LGAs
+    └── Use this when: spatial coupling, herd effects across units
 ```
 
 ## Code templates
@@ -105,8 +104,8 @@ def ilp_allocation(units, packages, budget, score_fn):
     return chosen, prob.objective.value()
 ```
 
-For Nigeria 774 LGAs × 8 packages = 6192 binary variables. CBC solves
-to within 1% of optimal in <5 minutes on typical hardware.
+For example, 774 districts × 8 packages = 6192 binary variables. CBC
+solves to within 1% of optimal in <5 minutes on typical hardware.
 
 ### Simulated annealing (when the objective is non-convex)
 
@@ -170,7 +169,8 @@ either:
    `solver.gapRel` or report `MIP gap` from CBC alongside the
    objective.
 
-4. **Brute force when intractable** (8^774 = infeasible). State
+4. **Brute force when intractable** (e.g., 8 packages over 774 units
+   = 8^774 = infeasible). State
    explicitly that brute force is infeasible and use ILP as the gold
    standard instead.
 

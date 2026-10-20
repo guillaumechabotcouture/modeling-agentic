@@ -1,15 +1,13 @@
 ---
 name: epi-model-parametrization
-description: Guide for researching epidemiological parameters, identifying
-  calibration targets, and determining model structure for spatial disease
-  transmission models. Use when the user needs to find R0, infectious/latent
-  periods, birth/death rates, vaccination coverage, observed data for
-  calibration, or guidance on model component selection (compartment type,
-  seasonal forcing, spatial coupling, vaccination strategy). Trigger phrases
-  include "research parameters", "what parameters do I need", "find R0 for",
-  "epidemiological data sources", "disease parameters", "parametrize model",
-  "calibration targets", "model structure for", "parameter space",
-  "what data do I need".
+description: >-
+  Guide for researching epidemiological parameters, calibration targets, and
+  model structure for transmission models. Use when finding R0,
+  latent/infectious periods, demographic rates, vaccination coverage, observed
+  calibration data, or choosing compartments, seasonal forcing, spatial
+  coupling, and vaccination strategy. Trigger phrases include "research
+  parameters", "find R0 for", "epidemiological data sources", "parametrize
+  model", "calibration targets", "what data do I need".
 ---
 
 # Epidemiological Model Parametrization Guide

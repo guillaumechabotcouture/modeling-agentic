@@ -1,17 +1,14 @@
 ---
 name: spec-compliance-rules
-description: Mechanical backstop that parses the research question for
-  named frameworks (Starsim, LASER, stisim, EMOD), approaches (ABM,
-  compartmental, stochastic), budget envelopes, and spatial/archetype
-  counts, then verifies the delivered model code and allocation CSVs
-  against those requirements. Invoked by the STAGE 7 validator via
-  `--spec-compliance`. Framework/approach HIGH violations force
-  `structural_mismatch: true` regardless of what critique agents said;
-  budget/archetype HIGH violations add synthetic OBJ-NNN blockers to
-  `unresolved_high`. Use when critique agents may be too generous about
-  whether a rebuilt model actually satisfies an architectural requirement.
-  Trigger phrases include "spec compliance", "framework check", "budget
-  underutilized", "starsim not running", "silent downscope".
+description: >-
+  Mechanical backstop that parses the research question for named frameworks
+  (Starsim, LASER, stisim, EMOD), approaches (ABM, compartmental, stochastic),
+  budget envelopes, and spatial/archetype counts, then verifies delivered
+  model code and allocation CSVs against them. Framework/approach HIGH
+  violations force structural_mismatch; budget violations (under- or
+  over-spend) add OBJ-NNN blockers. Trigger phrases include "spec compliance",
+  "framework check", "budget underutilized", "budget exceeded", "silent
+  downscope".
 ---
 
 # Spec-Compliance Rules
@@ -20,7 +17,7 @@ description: Mechanical backstop that parses the research question for
 
 The STAGE 7 gate trusts critique agents to flag architectural issues via
 the `structural_mismatch` field in `critique_*.yaml`. In practice,
-critique agents can be generous: the malaria Nigeria run shipped a
+critique agents can be generous: an early national malaria run shipped a
 compartmental ODE when the question explicitly asked for a Starsim ABM.
 Round 1 critiques correctly flagged the mismatch (structural_mismatch
 veto fired → RETHINK). But in round 2 both critique-methods and
@@ -100,7 +97,8 @@ numeric references).
 When a budget IS parsed, the check:
 
 1. Globs `{run_dir}/*allocation*.csv`, `*budget*.csv`,
-   `*optimization*.csv`, and the same under `{run_dir}/data/`.
+   `*optimization*.csv`, and the same under `{run_dir}/data/` and
+   `{run_dir}/models/`.
 2. Picks the largest CSV and finds its cost-like column (`cost`,
    `total_cost`, `budget`, `price`, etc. — excluding per-unit columns
    like `cost_per_daly`).
@@ -109,6 +107,9 @@ When a budget IS parsed, the check:
 4. Computes `utilization = sum / budget_envelope`.
 5. If `utilization < 0.80` → HIGH violation of kind
    `budget_underutilized`.
+6. If the allocation spends MORE than the envelope (beyond a small
+   rounding tolerance) → HIGH over-spend violation. An allocation that
+   is infeasible under the stated budget is not a recommendation.
 
 If no allocation CSV exists, no violation (optimization step may not
 have run yet).
@@ -168,7 +169,7 @@ For each `**Vintage**: YYYY` line:
 ### 6. Methodological vintage (Phase 3 Commit B)
 
 Scans `plan.md` and `modeling_strategy.md` for methodological references
-like `"archetype clustering per Ozodiegwu 2023"` or `"following Smith
+like `"archetype clustering per [Author 2013]"` or `"following Smith
 et al. 2008"`. Matches citation year against the cited year itself (or
 the year-suffix in the author phrase). If `decision_year - cited_year ≥
 15` → MEDIUM `methodology_vintage_stale`. Clustering/archetypization/

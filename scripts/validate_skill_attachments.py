@@ -19,9 +19,17 @@ Usage:
     python3 scripts/validate_skill_attachments.py             # check repo
     python3 scripts/validate_skill_attachments.py --self-test # inline tests
 
+Phase 21 ε: every SKILL.md must also open with YAML frontmatter that
+parses and carries a non-empty `name` (matching its directory) and
+`description`. A skill whose frontmatter fails to parse loses its
+description in the harness and is never auto-triggered, and the
+attachment check alone cannot see that.
+
 Exit:
-    0 — every attached skill resolves
-    1 — at least one phantom (attached but no SKILL.md and not in allowlist)
+    0 — every attached skill resolves and every SKILL.md has valid
+        frontmatter
+    1 — at least one phantom (attached but no SKILL.md and not in
+        allowlist) or at least one SKILL.md with invalid frontmatter
 """
 
 from __future__ import annotations
@@ -192,6 +200,45 @@ def list_existing_skills(skills_root: str) -> set[str]:
     return out
 
 
+def check_frontmatter(skill_md_path: str) -> str | None:
+    """Return None when the SKILL.md frontmatter is valid, else a short
+    reason string. Valid means: file starts with a `---` line, a closing
+    `---` line exists, the block parses as a YAML mapping, and `name`
+    (equal to the directory name) and `description` are non-empty
+    strings."""
+    import yaml
+
+    try:
+        with open(skill_md_path, encoding="utf-8") as f:
+            text = f.read()
+    except (OSError, UnicodeDecodeError) as e:
+        return f"unreadable: {e}"
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return "no frontmatter (file must start with a '---' line)"
+    try:
+        close = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
+    except StopIteration:
+        return "frontmatter is not closed by a '---' line"
+    try:
+        meta = yaml.safe_load("\n".join(lines[1:close]))
+    except yaml.YAMLError as e:
+        first = str(e).splitlines()[0] if str(e) else type(e).__name__
+        return f"frontmatter is not valid YAML ({first}); quote the description or use '>-'"
+    if not isinstance(meta, dict):
+        return "frontmatter is not a YAML mapping"
+    expected = os.path.basename(os.path.dirname(skill_md_path))
+    name = meta.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return "frontmatter missing non-empty 'name'"
+    if name != expected:
+        return f"frontmatter name '{name}' does not match directory '{expected}'"
+    desc = meta.get("description")
+    if not isinstance(desc, str) or not desc.strip():
+        return "frontmatter missing non-empty 'description'"
+    return None
+
+
 def validate(repo_root: str | None = None) -> dict:
     """Cross-check the attached set against the existing set.
 
@@ -202,6 +249,9 @@ def validate(repo_root: str | None = None) -> dict:
       orphans: existing but never attached
       warnings: list of strings for skills= expressions we couldn't
                 statically resolve (Phase 11 Commit η F8)
+      invalid_frontmatter: sorted list of (skill, reason) for SKILL.md
+                files whose frontmatter is missing or malformed
+                (Phase 21 ε)
     """
     root = repo_root or _repo_root()
     warnings: list[str] = []
@@ -209,7 +259,13 @@ def validate(repo_root: str | None = None) -> dict:
         os.path.join(root, "agents", "__init__.py"),
         warnings=warnings,
     )
-    existing = list_existing_skills(os.path.join(root, ".claude", "skills"))
+    skills_root = os.path.join(root, ".claude", "skills")
+    existing = list_existing_skills(skills_root)
+    invalid_frontmatter = []
+    for name in sorted(existing):
+        reason = check_frontmatter(os.path.join(skills_root, name, "SKILL.md"))
+        if reason is not None:
+            invalid_frontmatter.append((name, reason))
     phantoms = sorted(attached - existing - _MCP_SKILLS)
     orphans = sorted(existing - attached)
     return {
@@ -218,6 +274,7 @@ def validate(repo_root: str | None = None) -> dict:
         "phantoms": phantoms,
         "orphans": orphans,
         "warnings": warnings,
+        "invalid_frontmatter": invalid_frontmatter,
     }
 
 
@@ -372,6 +429,37 @@ def _run_self_test() -> int:
            f"T9: unresolvable dynamic skills= must surface a warning, "
            f"got {r9.get('warnings')}")
 
+    # T10-T14 (Phase 21 ε): frontmatter validation.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "agents"))
+        with open(os.path.join(d, "agents", "__init__.py"), "w") as f:
+            f.write('skills=["good", "colon", "bare", "wrongname", "nodesc"]\n')
+
+        def _skill(name: str, body: str) -> None:
+            os.makedirs(os.path.join(d, ".claude", "skills", name))
+            with open(os.path.join(d, ".claude", "skills", name, "SKILL.md"), "w") as f:
+                f.write(body)
+
+        _skill("good", "---\nname: good\ndescription: >-\n  Uses a: colon safely.\n---\n# good\n")
+        _skill("colon", "---\nname: colon\ndescription: Duties: audit things.\n---\n# colon\n")
+        _skill("bare", "# bare\n\nNo frontmatter at all.\n")
+        _skill("wrongname", "---\nname: other\ndescription: x\n---\n")
+        _skill("nodesc", "---\nname: nodesc\n---\n")
+        r = validate(d)
+        bad = dict(r["invalid_frontmatter"])
+        ok("good" not in bad,
+           f"T10: folded description with a colon is valid, got {bad.get('good')}")
+        ok("not valid YAML" in bad.get("colon", ""),
+           f"T11: unquoted 'Duties: ...' must fail YAML parse, got {bad.get('colon')}")
+        ok("no frontmatter" in bad.get("bare", ""),
+           f"T12: SKILL.md without frontmatter must fail, got {bad.get('bare')}")
+        ok("does not match" in bad.get("wrongname", ""),
+           f"T13: name/dir mismatch must fail, got {bad.get('wrongname')}")
+        ok("description" in bad.get("nodesc", ""),
+           f"T14: missing description must fail, got {bad.get('nodesc')}")
+        ok(r["phantoms"] == [],
+           f"T10-T14: frontmatter failures are not phantoms, got {r['phantoms']}")
+
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)
         for f in failures:
@@ -409,13 +497,18 @@ def main() -> int:
               f"skills= expression(s) (not phantoms)", file=sys.stderr)
         for w in result["warnings"]:
             print(f"  - {w}", file=sys.stderr)
+    if result["invalid_frontmatter"]:
+        print(f"Invalid:   {len(result['invalid_frontmatter'])} SKILL.md "
+              f"file(s) with missing or malformed frontmatter", file=sys.stderr)
+        for name, reason in result["invalid_frontmatter"]:
+            print(f"  - {name}: {reason}", file=sys.stderr)
     if args.show_orphans:
         print(f"Orphans:   {len(result['orphans'])} have SKILL.md "
               f"but no agent attaches them", file=sys.stderr)
         for name in result["orphans"]:
             print(f"  - {name}", file=sys.stderr)
 
-    return 1 if result["phantoms"] else 0
+    return 1 if (result["phantoms"] or result["invalid_frontmatter"]) else 0
 
 
 if __name__ == "__main__":

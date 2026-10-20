@@ -1,14 +1,13 @@
 ---
 name: critique-blockers-schema
-description: Structured YAML contract for critique agents. Each critique writes a
-  machine-readable sibling YAML alongside its markdown file, listing blockers with
-  stable IDs, severity, target stage, and resolution state. The lead agent's
-  STAGE 7 ACCEPT/DECLARE_SCOPE/RETHINK decision is computed mechanically from
-  these YAML files via scripts/validate_critique_yaml.py — NOT judged from the
-  prose. Use when writing critique_methods.yaml, critique_domain.yaml, or
-  critique_presentation.yaml, or when the lead is deciding whether the writer
-  may be spawned. Trigger phrases include "blocker", "critique yaml",
-  "structural mismatch", "unresolved high", "carried forward", "stage 7 gate".
+description: >-
+  Structured YAML contract for critique agents. Each critique writes a sibling
+  YAML listing blockers with stable IDs, severity, target stage,
+  first_seen_round, and resolution state. The STAGE 7 decision (ACCEPT / PATCH
+  / DECLARE_SCOPE / RETHINK / RUN_FAILED) is computed mechanically from these
+  files by scripts/validate_critique_yaml.py, not judged from prose. Trigger
+  phrases include "blocker", "critique yaml", "structural mismatch",
+  "unresolved high", "carried forward", "stage 7 gate".
 ---
 
 # Critique Blockers Schema

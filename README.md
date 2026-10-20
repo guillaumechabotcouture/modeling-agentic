@@ -1,28 +1,31 @@
 # modeling-agentic
 
-A multi-agent system for building publication-quality epidemiological and public-health models. Give it a research question; it researches the topic, pulls data, builds and calibrates models using established frameworks (Starsim, LASER, stisim, scipy/lmfit), runs quantitative rigor checks (uncertainty propagation, multi-structural comparison, identifiability), critiques the result from four angles — with one of them adversarial — and a **mechanical STAGE 7 gate** then computes the decision (PATCH / RETHINK / ACCEPT / DECLARE_SCOPE / RUN_FAILED) from structured blocker YAMLs so critique agents cannot talk themselves into generous verdicts. Finally a writer assembles the report.
+A multi-agent system for building publication-quality epidemiological and public-health models, for any disease area (malaria, measles, TB, HIV, polio, NCDs, ...). Give it a research question; it researches the topic, pulls data, builds and calibrates models using established frameworks (Starsim, LASER, stisim, scipy/lmfit), runs quantitative rigor checks (uncertainty propagation, multi-structural comparison, identifiability), critiques the result from several angles (methods, domain, presentation, an adversarial red team, a pre-model pre-mortem, and a post-write evidence-sufficiency check), and a **mechanical STAGE 7 gate** then computes the decision (PATCH / RETHINK / ACCEPT / DECLARE_SCOPE / RUN_FAILED) from structured blocker YAMLs so critique agents cannot talk themselves into generous verdicts. Finally a writer assembles the report.
 
 Built on the [Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview).
 
-> **Working in this codebase?** Read [`CLAUDE.md`](./CLAUDE.md) first — it lays out the four layers (orchestration / rigor gates / skills / runs), the skill-to-agent attachment matrix, the Phase 1-10 commit ledger, and the rigor-artifact timeline.
+> **Working in this codebase?** Read [`CLAUDE.md`](./CLAUDE.md) first — it lays out the four layers (orchestration / rigor gates / skills / runs), the agent registry, run exit statuses, conventions, and the self-test list. The phase-by-phase history is in [`CHANGELOG.md`](./CHANGELOG.md).
 
 ## Architecture
 
-A single **lead agent** orchestrates ten specialist subagents through a staged pipeline. The lead reads and writes files, delegates via the `Agent` tool, invokes the mechanical validator, makes PATCH/RETHINK decisions, and tracks state in `pipeline_state.yaml` for crash-safe resume.
+A single **lead agent** orchestrates eleven specialist subagents through a staged pipeline. The lead delegates via the `Agent` tool (registered agent types only), invokes the mechanical validator, makes PATCH/RETHINK decisions, and tracks state in `pipeline_state.yaml` for crash-safe resume. A PreToolUse hook (`agents/enforcement.py`) stops agents from editing harness code or files they don't own: the lead cannot write critique YAMLs or `models/**`, and script outputs can only be written by their scripts. The harness is hashed at start and end of a run, and any change marks the run `harness_tampered`.
 
 | Agent | Role | Model | Tools |
 |-------|------|:---:|------|
-| **lead** | Orchestration, STAGE 7 mechanical gate, PATCH/RETHINK decisions | opus | Agent, Bash, Read, Write, Glob, Grep |
-| **planner** | Literature review, benchmarks, hypotheses, modeling strategy, threads | opus | WebSearch, WebFetch, Read, Write, Glob, Grep |
-| **data-agent** | Download datasets, validate quality, run exploratory analysis | sonnet | Bash, Write, Read, Edit, Glob |
-| **modeler** | Build, run, and compare models; generate rigor artifacts + figures | opus | Bash, Write, Edit, Read, Glob, Grep, Agent |
-| ↳ **model-tester** | *(subagent of modeler)* — reimplement a candidate or clone a published model as a reference baseline | sonnet | Bash, Write, Read, Edit, Glob |
-| **analyst** | Interpret results, test hypotheses, assign causal labels | opus | Bash, Write, Read, Glob, Grep |
-| **critique-methods** | Statistical validation, parameter provenance | opus | WebSearch, Read, Write, Glob, Grep |
-| **critique-domain** | Scientific reasoning, citation verification, fit-for-purpose | opus | WebSearch, WebFetch, Read, Write, Glob, Grep |
+| **lead** | Orchestration, STAGE 7 mechanical gate, PATCH/RETHINK decisions | opus | Agent, Bash, Read, Write, Glob, Grep, Skill |
+| **planner** | Literature review, benchmarks, hypotheses, modeling strategy, threads | opus | WebSearch, WebFetch, Read, Glob, Grep, Bash, Skill |
+| **data-agent** | Download datasets, validate quality, run exploratory analysis | sonnet | WebSearch, WebFetch, Bash, Write, Read, Glob |
+| **modeler** | Build, run, and compare models; generate rigor artifacts + figures | opus | Bash, Write, Edit, Read, Glob, Grep |
+| **analyst** | Interpret results, test hypotheses, assign causal labels; claims ledger | opus | Read, Bash, Write, Glob, Grep |
+| **critique-premortem** | Pre-model, clean-slate adversarial critique of the plan (`pre_mortem.yaml`) | opus | Read, Write, Glob, Grep, WebSearch, WebFetch |
+| **critique-methods** | Statistical validation, parameter provenance | opus | Read, Write, Glob, Grep, WebSearch |
+| **critique-domain** | Scientific reasoning, citation verification, fit-for-purpose | opus | Read, Write, Glob, Grep, WebSearch, WebFetch |
 | **critique-presentation** | Figure and writing quality | sonnet | Read, Write, Glob, Grep |
-| **critique-redteam** | Adversarial: cross-file numeric audits, vintage drift, hidden assumptions | opus | WebSearch, WebFetch, Read, Write, Glob, Grep |
-| **writer** | Assemble final publication-quality report; embed decision rule verbatim | opus | Read, Write, Edit, Glob, Grep |
+| **critique-redteam** | Adversarial: ledger consistency, external sanity, vintage drift, hidden assumptions | opus | Read, Write, Bash, Glob, Grep, WebSearch, WebFetch |
+| **critique-sufficiency** | Post-write check that each claim's strength matches its evidence | opus | Read, Write, Glob, Grep |
+| **writer** | Assemble final publication-quality report; embed decision rule verbatim | opus | Read, Write, Glob |
+
+`agents/__init__.py` (`_registry()`) is the source of truth for this table.
 
 ## Pipeline
 
@@ -34,13 +37,13 @@ Question
                                                   metadata.json{decision_year}
  STAGE 2   DATA                data-agent      → data/, data_quality.md (with **Vintage** lines),
                                                   data_provenance.md, eda.py, figures/eda_*.png
- STAGE 3   PRE-MODEL CHECK     lead            → feasibility assessment before modeling
+ STAGE 3   PRE-MODEL CHECK     lead + premortem → identifiability_a_priori.yaml, pre_mortem.yaml
  STAGE 4   MODEL               modeler         → models/, modeling_strategy.md (with
                                                   **Within-archetype error** when aggregating),
+                                                  eligibility_manifest.yaml (targeted interventions),
                                                   model_comparison.yaml, figures/fig_*.png,
                                                   citations.md (Parameter Registry), outcome_fn.py,
                                                   identifiability.yaml, decision_rule.md (if allocation)
-                                (↳ model-tester in parallel for clone-first baselines)
  STAGE 5   ANALYZE             analyst         → results.md (CAUSAL/ASSOCIATIONAL/PROXY labels)
  STAGE 5b  RIGOR (Bash, 3 scripts, no subagent):
              multi-structural  compare_models.py      → model_comparison_formal.yaml
@@ -63,14 +66,17 @@ Question
           └── RUN_FAILED          → structural mismatch with no rounds left; end, no writer
           │
           ▼
- STAGE 8   WRITE                writer          → report.md (embeds decision_rule.md verbatim)
+ STAGE 8   WRITE                writer          → report.md (embeds decision_rule.md verbatim;
+                                                  numbers via [CLAIM:id] from claims_ledger.yaml)
+          then writer-QA, coherence audit, sufficiency critic
+ POST-RUN  main.py re-runs the validator → final_gate.json; terminal status + exit code
 ```
 
 Stages 4–7 loop up to `--max-rounds` times. STAGE 7 is not a judgment call — the lead runs the validator and executes whatever action the exit code prescribes. The multi-line `STAGE 7 decision (round N/M)` stderr block is pasted verbatim into `progress.md` as an audit trail.
 
 ## Mechanical backstops (what the gate catches that critique agents miss)
 
-Adversarial critique alone has proven insufficient: across three malaria runs, critique agents accepted reports that shipped with registered-but-unused parameters, pre-2010 calibration data used for 2024 decisions, and 774-row allocation tables without articulated rules. Phase 1.5, Phase 2, and Phase 3 added a series of pure-function checks that run independently of critique judgment.
+Adversarial critique alone has proven insufficient: in early runs, critique agents accepted reports that shipped with registered-but-unused parameters, calibration data more than a decade older than the decision year, and allocation tables of several hundred rows without an articulated rule. Phase 1.5, Phase 2, and Phase 3 added a series of pure-function checks that run independently of critique judgment.
 
 | Check | Invoked via | Catches |
 |---|---|---|
@@ -87,18 +93,20 @@ The modeler ships these alongside the model code:
 - `citations.md` with a `## Parameter Registry` YAML block — every literature-sourced constant declared with kind, value/CI, source, and `code_refs` pointing to where it's used.
 - `models/outcome_fn.py` — deterministic `outcome_fn(params: dict) -> dict` callable that runs the decision-relevant portion of the model under a parameter set. The registry's sampled draws flow through this.
 - `models/model_comparison.yaml` — ≥3 candidate model structures (null, simple, full) with their training/LOO-CV errors.
-- `models/identifiability.yaml` — loss function + per-parameter point estimates and plausible bounds.
+- `models/identifiability.yaml` — loss function, `loss_type`, and per-parameter point estimates and plausible bounds.
+- `models/claims_ledger.yaml` — every quantitative or categorical claim the report makes, with its source artifact and field.
+- `models/eligibility_manifest.yaml` — for targeted interventions, which input fields hold the eligible and total populations (checked behaviorally by `scripts/eligibility_probe.py`).
 - `modeling_strategy.md` with `**Within-archetype error**: Xpp` line when aggregating K<N archetypes.
 - `decision_rule.md` (when allocation CSV produced) — tabular / tree / prose / non-compressible rule with `accuracy_vs_optimizer` and exceptions list.
 - `data_quality.md` with `**Vintage**: YYYY`, `**Temporal coverage**`, `**Primary calibration**: yes/no` per dataset (written by the data-agent).
 
 ## Cloud compute (optional)
 
-Azure Batch support for slow `outcome_fn` evaluations. `scripts/propagate_uncertainty.py --cloud` submits each of the 200 draws as a Batch task on `Standard_D4s_v5` dedicated nodes (or `Standard_A2_v2` for free-trial quota). See the `cloud-compute` skill; env vars live in `.env` (`AZ_*`), pool spin-up is auto, teardown is budget-bounded.
+Azure Batch support for slow `outcome_fn` evaluations. `scripts/propagate_uncertainty.py --cloud` submits each draw as a Batch task on `Standard_D4s_v5` dedicated nodes (or `Standard_A2_v2` for free-trial quota). See the `cloud-compute` skill. Credentials live in `.env` (`AZ_*`) and are passed to agents only when `main.py --cloud` is set. Pools created by a run are deleted in a `finally` block. Install the extras with `pip install -r requirements-cloud.txt`.
 
 ## Skills ecosystem
 
-45 skills under `.claude/skills/` attached per-agent in `agents/__init__.py`. See `.claude/skills/README.md` for the indexed list; broad groups:
+56 skills under `.claude/skills/`, attached per-agent in `agents/__init__.py`. Domain skills attach only when the question matches their trigger words. See `.claude/skills/README.md` for the indexed list; broad groups:
 
 - **Pipeline rigor** — `adversarial-redteam`, `critique-blockers-schema`, `spec-compliance-rules`, `effect-size-priors`, `uncertainty-quantification`, `multi-structural-comparison`, `identifiability-analysis`, `decision-rule-extraction`
 - **Modeling strategy & evaluation** — `modeling-strategy`, `modeling-fundamentals`, `model-fitness`, `model-validation`, `investigation-threads`
@@ -111,6 +119,7 @@ Azure Batch support for slow `outcome_fn` evaluations. `scripts/propagate_uncert
 
 - **Mechanical gates beat argument** — critique agents produce blocker YAMLs; the lead does not override the validator.
 - **Clone-first, build-second** — modelers check for existing published code before reimplementing.
+- **Disease-agnostic gates** — rigor checks reason about allocation units, eligible populations, and claims, never about a specific disease; domain knowledge lives in disease skills and the expert-priors registry.
 - **Frameworks, not hand-rolled dynamics** — Starsim / LASER / stisim for disease transmission; lmfit / statsmodels / PyMC / scipy for fitting.
 - **Structured metadata over prose** — vintage, archetype error bounds, decision year, parameter registry all live in machine-readable form.
 - **Causal labels required** — every finding must be tagged CAUSAL, ASSOCIATIONAL, or PROXY.
@@ -123,6 +132,8 @@ pip install -r requirements.txt
 export ANTHROPIC_API_KEY=your-key
 
 python main.py "Build a model of malaria incidence in Nigeria including ITNs, IRS, SMC, and case management, to inform Global Fund GC7 resource allocation (~$320M)."
+# or any other disease area, e.g.
+python main.py "Which districts should receive measles follow-up campaigns next year given a fixed vaccine and operations budget?"
 ```
 
 ### CLI options
@@ -132,14 +143,19 @@ python main.py "Build a model of malaria incidence in Nigeria including ITNs, IR
 | `--max-rounds N` | 5 | Max critique-revision cycles |
 | `--max-sessions N` | 10 | Max top-level sessions (for retry-after-crash / context recovery) |
 | `--resume runs/<dir>` | — | Resume a prior run from its `pipeline_state.yaml` or detected artifacts |
+| `--cloud` | off | Pass Azure credentials to agents for Batch UQ |
+| `--self-test` | — | Run inline self-tests (no API calls) and exit |
+
+Exit codes: 0 accepted (`completed`, `completed_with_report_restored`); 2 finished without an accepted gate (`completed_scope_declared`, `completed_gate_not_accepted`, `completed_gate_error`, `completed_gate_not_run`, `completed_no_report`, `run_failed`); 1 `harness_tampered` or error; 130 interrupted.
 
 ## Run outputs
 
 Each run writes to `runs/<timestamp>_<slug>/`:
 
 ```
-runs/2026-04-23_2328_build-an-agent-based-model-of-malaria-tr/
-├── metadata.json                  Question, decision_year, timestamps, sessions, elapsed
+runs/<timestamp>_<question-slug>/      (gitignored; local only)
+├── metadata.json                  Question, decision_year, timestamps, sessions, terminal status
+├── final_gate.json                Post-run validator decision
 ├── trace.jsonl                    Structured log of every tool call + subagent lifecycle
 ├── pipeline_state.yaml            Resume state: current stage, round, completed stages
 ├── progress.md                    Stage log + verbatim STAGE 7 decision blocks
@@ -176,6 +192,7 @@ runs/2026-04-23_2328_build-an-agent-based-model-of-malaria-tr/
 ├── critique_domain.{md,yaml}
 ├── critique_presentation.{md,yaml}
 ├── critique_redteam.{md,yaml}     Adversarial findings (R-NNN blocker IDs)
+├── pre_mortem.yaml                Pre-model concerns (PM-NNN)
 │
 └── report.md                      Final report; decision_rule embedded in §Policy Recommendations
 ```
@@ -188,8 +205,11 @@ runs/2026-04-23_2328_build-an-agent-based-model-of-malaria-tr/
 | `scripts/spec_compliance.py` | Framework / budget / archetype / vintage checks (from the question) |
 | `scripts/effect_size_registry.py` | Parameter registry parse + tagging coverage |
 | `scripts/compare_models.py` | Multi-structural LOO-CV + degenerate-fit detection |
-| `scripts/propagate_uncertainty.py` | 200-draw uncertainty propagation (local or `--cloud`) |
-| `scripts/identifiability.py` | Fisher SEs + profile-likelihood scans |
+| `scripts/propagate_uncertainty.py` | Uncertainty propagation (local or `--cloud`; draw floors in `effort_floors.yaml`) |
+| `scripts/identifiability.py` | Full-Hessian Fisher SEs, ridge check, re-optimized profile likelihood |
+| `scripts/eligibility_probe.py` | Behavioral check that targeted-intervention benefits scale with the eligible population |
+| `scripts/coherence_audit.py`, `scripts/render_claims.py` | Claims-ledger rendering and report↔ledger binding audit |
+| `scripts/effort_floors.py`, `scripts/benchmark_match.py` | Effort minimums and published-benchmark acceptance bands |
 | `scripts/cloud_batch.py` | Azure Batch SDK wrapper (pool mgmt, task submit, teardown) |
 
 ## Crash recovery and resume
@@ -197,16 +217,15 @@ runs/2026-04-23_2328_build-an-agent-based-model-of-malaria-tr/
 Long runs (4–8 hours) occasionally crash mid-pipeline (API overload, OOM, orphaned processes). Handled in two places:
 
 - **Within a run** — the lead writes `pipeline_state.yaml` after every completed stage. If a session dies, the next session reads that file and restarts from the next stage.
-- **Across sessions** — `main.py` retries up to `--max-sessions` times with exponential backoff, using the saved `session_id` to resume lead context when possible, and rebuilding resume context from artifacts when not.
+- **Across sessions** — `main.py` retries up to `--max-sessions` times with exponential backoff, resuming the lead conversation by `session_id` when one was captured and rebuilding resume context from artifacts otherwise.
 - **Orphaned-process cleanup** — `cleanup_orphaned_claude_processes()` kills stale CLI processes from prior crashes to prevent accumulating 400–600 MB zombies.
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.14 (the version the pins in `requirements.txt` were validated on; 3.10+ likely works but is untested)
 - An [Anthropic API key](https://platform.claude.com/)
-- Scientific Python stack: `numpy`, `scipy`, `pandas`, `matplotlib`, `seaborn`, `lmfit`, `statsmodels`, `xgboost`, `prophet`
-- Disease modeling: `laser-generic` in `requirements.txt`; `starsim` and `stisim` install separately when skills invoke them
-- Optional: `pymc` for Bayesian mechanistic models; Azure Batch + Storage account for `--cloud` UQ
+- `pip install -r requirements.txt` — pinned harness, scientific stack (`numpy`, `scipy`, `pandas`, `matplotlib`, `seaborn`, `lmfit`, `statsmodels`, `scikit-learn`, `xgboost`, `PuLP`, `optuna`, `geopandas`), and frameworks (`starsim`, `laser-core`, `laser.generic`)
+- Optional: `requirements-cloud.txt` (Azure Batch + Storage) for `--cloud` UQ; `pymc` for Bayesian mechanistic models; `stisim` installs separately when its skill is used
 
 ## Layout
 
@@ -214,19 +233,18 @@ Long runs (4–8 hours) occasionally crash mid-pipeline (API overload, OOM, orph
 modeling-agentic/
 ├── main.py                    CLI entry point + retry/resume loop
 ├── agents/
-│   ├── __init__.py            Lead prompt, agent registry, STAGE 1–8 orchestration
-│   ├── planner.py
-│   ├── data.py
-│   ├── modeler.py             (includes model-tester definitions)
-│   ├── analyst.py
-│   ├── critique_{methods,domain,presentation}.py
+│   ├── __init__.py            Lead prompt, agent registry, hooks
+│   ├── enforcement.py         PreToolUse path/agent denies, harness hashing, env filtering
+│   ├── planner.py, data.py, modeler.py, analyst.py
+│   ├── critique_{methods,domain,presentation,premortem,sufficiency}.py
 │   ├── red_team.py
 │   └── writer.py
-├── scripts/                   Mechanical validators + rigor scripts
-├── .claude/skills/            45 skills attached to agents by role
-├── runs/                      Timestamped run outputs
-├── benchmark/                 A/B test infrastructure (Lego-first variant)
-└── data/, workspace/          Shared caches
+├── scripts/                   Mechanical validators + rigor scripts (scripts/lib/ shared helpers)
+├── .claude/skills/            56 skills attached to agents by role
+├── .claude/orchestration/     rigor_artifacts.yaml, effort_floors.yaml, expert_priors.yaml
+├── CHANGELOG.md               Phase ledger
+├── runs/                      Timestamped run outputs (gitignored)
+└── data/                      Small shared reference CSVs
 ```
 
 ## Giving feedback

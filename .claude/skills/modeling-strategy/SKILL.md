@@ -1,14 +1,13 @@
 ---
 name: modeling-strategy
-description: Principled framework for model selection, complexity management,
-  and strategic decision-making in mathematical modeling. Covers purpose-driven
-  model selection, information criteria (AIC/BIC), parameter identifiability,
-  pattern-oriented modeling, and the rethink-vs-patch decision. Use when
-  deciding model complexity, comparing model architectures, assessing
-  identifiability, declaring model scope, or deciding whether to simplify.
-  Trigger phrases include "model selection", "should I add complexity",
-  "AIC BIC comparison", "identifiability", "parsimony", "fit for purpose",
-  "rethink approach", "simplify model", "model scope", "pattern-oriented".
+description: >-
+  Framework for model selection and complexity management: purpose-driven
+  selection, AIC/BIC, identifiability, pattern-oriented modeling, and the
+  rethink-vs-patch decision. Use when deciding model complexity, comparing
+  architectures, declaring scope, or deciding whether to simplify. Trigger
+  phrases include "model selection", "should I add complexity", "AIC BIC
+  comparison", "parsimony", "rethink approach", "simplify model", "model
+  scope", "pattern-oriented".
 ---
 
 # Modeling Strategy: Principled Complexity Management
@@ -26,8 +25,8 @@ needs the most biologically realistic model.
 | Purpose | Goal | Complexity Principle | Example |
 |---------|------|---------------------|---------|
 | **Prediction / Forecasting** | Predict future values with uncertainty | PARSIMONY — simplest model with positive skill score | "How many flu hospitalizations next week?" |
-| **Scenario Comparison / Allocation** | Rank interventions or allocations | FIT-FOR-PURPOSE — capture mechanisms that differentiate scenarios | "Should Nigeria invest more in ITNs or IRS?" |
-| **Mechanistic Understanding** | Understand why a phenomenon occurs | IDENTIFIABILITY — every parameter must be estimable | "Why does northern Nigeria have more cVDPV2 emergences?" |
+| **Scenario Comparison / Allocation** | Rank interventions or allocations | FIT-FOR-PURPOSE — capture mechanisms that differentiate scenarios | "Should the program invest more in HPV vaccination or cervical screening?" |
+| **Mechanistic Understanding** | Understand why a phenomenon occurs | IDENTIFIABILITY — every parameter must be estimable | "Why do some regions have more cVDPV2 emergences?" |
 
 ### Decision Rule
 
@@ -172,16 +171,16 @@ pattern to answer the question?**
 4. Build mechanisms only for categories 1 and 2
 5. Do NOT add mechanisms for category 3 patterns
 
-### Example (Malaria Nigeria Allocation)
+### Example (national measles campaign allocation)
 
 | Pattern | Category | Mechanism Needed? |
 |---------|----------|-------------------|
-| Zone-level PfPR heterogeneity | MUST (drives allocation) | Yes: zone-specific EIR |
-| Seasonal transmission timing | MUST (affects intervention timing) | Yes: seasonal forcing |
-| ITN dose-response | MUST (key intervention) | Yes: coverage → prevalence |
-| Historical 2010-2021 decline | NICE (validation) | Only if data exists to calibrate |
-| Stochastic fadeout in low-transmission zones | IRRELEVANT at zone scale | No |
-| Individual-level immune dynamics | IRRELEVANT for allocation | No |
+| District-level immunity gaps | MUST (drives allocation) | Yes: district-specific susceptible fraction |
+| Seasonal transmission timing | MUST (affects campaign timing) | Yes: seasonal forcing |
+| Campaign coverage → susceptible depletion | MUST (key intervention) | Yes: coverage with correlated missedness |
+| Historical outbreak sequence | NICE (validation) | Only if case data exist to calibrate |
+| Stochastic fadeout in small districts | MUST if the question is about outbreak risk; IRRELEVANT for a burden-averted ranking | Depends on the question |
+| Within-household contact structure | IRRELEVANT for allocation | No |
 
 ---
 
@@ -267,7 +266,7 @@ available data?** If not, it creates false precision.
 ### Common Mistake: Estimating Non-Identifiable Parameters
 
 Run 10 example: (β_eff, wan_mean) were jointly non-identifiable from
-6-point cross-sectional PfPR. The agent estimated both, creating a
+6-point cross-sectional prevalence data. The agent estimated both, creating a
 non-identifiability ridge. A principled response: fix wan_mean to the
 literature value (180 days) and estimate β_eff only.
 
@@ -346,7 +345,7 @@ it's scientific integrity.
 
 ### What would extend the scope:
 - [Specific data, model changes, or compute needed]
-- Example: "LGA-level DHIS2 treatment data + Bayesian calibration
+- Example: "District-level DHIS2 treatment data + Bayesian calibration
   via calabaria cloud would enable longitudinal validation"
 ```
 

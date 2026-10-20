@@ -1,31 +1,44 @@
-claude-agent-sdk
-openai
-numpy
-scipy
-pandas
-matplotlib
-seaborn
-requests
+# Pinned to the versions validated in the project .venv (Python 3.14.3)
+# on 2026-10-20 (Phase 21 ε). Bump deliberately and re-run every
+# --self-test (see CLAUDE.md) plus a live retro before merging a bump.
+# Cloud execution extras live in requirements-cloud.txt.
 
-# Phase 11 Commit η (F2): directly imported but previously omitted.
-# main.py:9 imports dotenv; agents/__init__.py:61 imports PIL; 10+
-# scripts under scripts/ import yaml. A clean install from README
-# crashed at startup before this fix.
-python-dotenv
-PyYAML
-Pillow
-# Phase 11 Commit η (F7): UID/PPID-aware orphan-process cleanup.
-psutil
+# --- Harness (main.py, agents/, scripts/) ---
+claude-agent-sdk==0.1.56
+python-dotenv==1.2.2
+PyYAML==6.0.3
+Pillow==12.2.0          # agents/__init__.py figure checks
+psutil==7.2.2           # agents/__init__.py orphan-process cleanup
+requests==2.33.1        # scripts/cloud_batch.py
+numpy==2.4.4
+scipy==1.17.1           # scripts/identifiability.py
 
-# Model fitting and statistics
-lmfit
-statsmodels
-scikit-learn
-xgboost
-prophet
+# --- Modeling toolkit used by agent-generated model code ---
+# Not imported by the harness itself, but the modeler prompt and skills
+# direct agents to these libraries and past runs import them.
+pandas==3.0.2
+matplotlib==3.10.8
+seaborn==0.13.2
+statsmodels==0.14.6
+scikit-learn==1.8.0
+lmfit==1.3.4
+xgboost==3.2.0
+PuLP==3.3.0             # ILP benchmark (optimizer-method-selection skill)
+optuna==4.8.0           # calibration (modelops-calabaria skill)
+geopandas==1.1.3
+rasterio==1.5.0
+sciris==3.2.9
 
-# Disease transmission modeling
-laser-generic
+# --- Disease-modeling frameworks ---
+starsim==3.3.2
+laser-core==1.0.1
+laser.generic==1.1.0
+polars==1.39.3          # laser-spatial-disease-modeling skill scripts
+numba==0.65.0           # laser-spatial-disease-modeling skill scripts
+
+# Removed in Phase 21 ε: openai (never imported), prophet (never
+# imported by the harness or any run; statsmodels covers the time-series
+# cases the modeler prompt lists).
 
 # Bayesian modeling (optional, heavier dependency)
 # pymc

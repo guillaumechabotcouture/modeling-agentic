@@ -1,6 +1,12 @@
 ---
 name: sensitivity-analysis-remediation
-description: Phase 10 ω — interpretation and remediation of `models/sensitivity_analysis.yaml` verdicts (ROBUST / SENSITIVE / UNSTABLE). Phase 8 π made the artifact required and Phase 9 τ pushed it earlier in the pipeline. This skill teaches the modeler what each verdict means operationally and which escalation paths are available when verdict=UNSTABLE — the failure mode of the 0013 malaria run (RIG-003). Trigger phrases include "sensitivity UNSTABLE", "sensitivity SENSITIVE", "RIG-003", "perturbation flips", "primary_recommendation_changes", "narrow CI", "scope-declare sensitivity".
+description: >-
+  Interpreting and remediating `models/sensitivity_analysis.yaml` verdicts
+  (ROBUST / SENSITIVE / UNSTABLE): what each means operationally and which
+  escalation paths exist when the primary recommendation flips under
+  perturbation. Trigger phrases include "sensitivity UNSTABLE", "sensitivity
+  SENSITIVE", "perturbation flips", "primary_recommendation_changes",
+  "load_bearing_parameters", "scope-declare sensitivity".
 type: rigor-remediation
 ---
 
@@ -26,9 +32,18 @@ mechanically. The thresholds (in `scripts/sensitivity_analysis.py`):
 | SENSITIVE | ≤ 1 perturbation flips OR worst rank-change-top-N ≤ 30     | Real but bounded fragility. Surface in §Sensitivity (NOT §Limitations). MEDIUM blocker. |
 | UNSTABLE  | ≥ 2 perturbations flip OR worst rank-change-top-N > 30     | Recommendation cannot be defended as-is. HIGH blocker.                            |
 
-The 0013 run produced UNSTABLE: 1 of 8 perturbations flipped (PBO OR
-upper CI 0.81 → standard ITN reverts to dominance, 54 of top-50 LGAs
-re-ranked, DALYs averted shifted 0.476M → 1.155M).
+**Define "primary recommendation" as the decision rule, not the funded
+set.** Under a binding budget almost any cost perturbation moves the
+marginal unit in or out of the funded set, so scoring flips on the set
+makes every honest analysis UNSTABLE. Score flips on the priority
+ranking / decision rule (`decision_rule.md`) and report funded-set
+changes separately under `funded_set_changes`.
+
+The 0013 national malaria run produced UNSTABLE: 1 of 8 perturbations
+flipped the primary recommendation (moving one product's effect size
+to its upper CI made the cheaper alternative dominate), the top-unit
+ranking changed far beyond the 30-unit threshold, and DALYs averted
+shifted 0.476M → 1.155M.
 
 ## Decision tree when verdict ≠ ROBUST
 
@@ -47,7 +62,7 @@ mechanical false-positive:
   alternative estimate. If a perturbation comes from your own
   guess, drop it.
 - **Are you computing rank_change_top_n correctly?** It's the count
-  of top-50 LGAs (or top-N for the chosen N) whose package
+  of top-50 allocation units (or top-N for the chosen N) whose package
   assignment differs between the primary and perturbed allocation —
   not the absolute rank shift. Re-check the calculation.
 
@@ -79,8 +94,8 @@ evidence in `citations.md` § Parameter Registry.**
 #### Path B — Reformulate the optimizer objective (medium)
 
 If the recommendation flips because the objective function is too
-sensitive to one parameter (PBO OR drives the LLIN-vs-PBO choice in
-the 0013 run), consider:
+sensitive to one parameter (one product's effect size drove the
+choice between two products in the 0013 run), consider:
 
 - **Two-stage objective**: first maximize expected DALYs averted,
   then prefer recommendations that are robust under the parameter's
@@ -88,7 +103,7 @@ the 0013 run), consider:
   optimizer.
 - **Worst-case (minimax) objective**: maximize DALYs averted at the
   WORST CI endpoint. Conservative; may flatten the recommendation
-  (everyone gets standard ITN), which the program officer can
+  (everyone gets the standard package), which the program officer can
   accept as a defensible default.
 - **Robust portfolio**: split budget between two packages that win
   at different ends of the parameter range.
@@ -102,12 +117,13 @@ When the parameter is genuinely uncertain and no stronger evidence
 exists, scope-declare in §Limitations:
 
 ```
-The recommendation is sensitive to the PBO OR (Protopopoff 2018,
-9-month vs 25-month). At the 25-month endpoint (OR=0.81), standard
-ITN dominates PBO in 54 of the top-50 LGAs. We recommend
-preferring standard ITN where program-officer judgment expects
-real-world durability closer to the 9-month figure, and PBO where
-durability assumptions match the 25-month endpoint.
+The recommendation is sensitive to vaccine efficacy against
+infection after waning ([Author YYYY], 12-month vs 36-month follow-up).
+At the 36-month endpoint (efficacy 0.35), the two-dose schedule is
+preferred over the three-dose schedule in 31 of the top-50 districts.
+We recommend the three-dose schedule where program judgment expects
+durable protection closer to the 12-month estimate, and the two-dose
+schedule where the 36-month estimate is more plausible.
 ```
 
 This path means the report ships with verdict=UNSTABLE in the

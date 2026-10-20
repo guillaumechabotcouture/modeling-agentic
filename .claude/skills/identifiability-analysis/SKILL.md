@@ -1,19 +1,14 @@
 ---
 name: identifiability-analysis
-description: Contract for parameter identifiability analysis. The modeler,
-  after calibration, exposes a loss function over fitted parameters and a
-  manifest at models/identifiability.yaml listing each parameter with its
-  point estimate and plausible bounds. identifiability.py computes a
-  Fisher-information diagonal (via finite differences) and runs a
-  profile-likelihood scan for each parameter, classifying each as
-  well_identified / weakly_identified / unidentified. Catches the
-  "ridge-trapped" failure mode — parameters whose values don't actually
-  affect the fit (e.g., γ in the malaria structural probe). Use when
-  writing the manifest, interpreting identifiability.yaml, or when the
-  gate flags ridge-trapped parameters that are policy-relevant. Trigger
-  phrases include "identifiability", "Fisher information", "profile
-  likelihood", "ridge trapped", "unidentified parameter", "parameter
-  estimability".
+description: >-
+  Contract for post-calibration identifiability analysis. The modeler exposes
+  a loss function and `models/identifiability.yaml` (point estimates, bounds,
+  loss_type). identifiability.py computes the full Fisher information matrix
+  and re-optimized profile likelihoods, classifying each parameter as
+  well_identified / weakly_identified / unidentified, which catches
+  ridge-trapped and jointly non-identifiable parameters. Trigger phrases
+  include "identifiability", "Fisher information", "profile likelihood",
+  "ridge trapped", "unidentified parameter".
 ---
 
 # Parameter Identifiability Analysis
@@ -66,6 +61,16 @@ loss_fn: "models/outcome_fn.py::loss"
   # Must be deterministic. Use the same file as outcome_fn when possible
   # to share pre-loaded state.
 
+loss_type: sse
+  # REQUIRED. nll | deviance | chi2 | sse | mse. The 1.92 profile
+  # threshold only means "95% CI" on a negative-log-likelihood scale;
+  # sse/mse are converted to the Gaussian profile NLL (n_obs/2)·log(SSE).
+  # Missing or unknown → verdict UNKNOWN_LOSS_SCALE, which fails the gate.
+n_obs: 22                             # required when loss_type is sse or mse
+profile: full                         # full (default; re-optimizes the other
+                                      # parameters) | conditional (cheap slice,
+                                      # weaker evidence)
+
 parameters:
   - name: beta                        # fitted parameter name
     point_estimate: 0.5               # from calibration
@@ -89,22 +94,35 @@ the same bounds you'd use for the prior when sampling.
 
 For each parameter:
 
-1. **Fisher SE** — local curvature of the loss at the point estimate:
+1. **Fisher SE** — from the FULL finite-difference Hessian H of the
+   (NLL-scaled) loss at the point estimate:
 
    ```
-   d²loss/dp² ≈ (loss(p+h) - 2·loss(p) + loss(p-h)) / h²
-   Fisher SE = 1 / sqrt(d²loss/dp²)
+   SE_i = sqrt( (H⁻¹)_ii )
    ```
 
-2. **Profile-likelihood scan** — holds other parameters at their point
-   estimates; varies this parameter over [lower_bound, upper_bound] on
-   a grid (default 20 points). Records the loss at each grid point.
+   NOT 1/sqrt(H_ii). The diagonal-only form is the conditional SE with
+   every other parameter held fixed, and it cannot see correlated
+   ridges: a loss that depends only on β/γ gives small diagonal SEs
+   for both even though neither is identified.
 
-3. **95% profile CI** — the range where profile loss stays within 1.92
+2. **Ridge (eigen) check** — eigen-decomposition of the Hessian in
+   relative coordinates. Any parameter loading on a near-null direction
+   is `unidentified`, and the output names the unconstrained
+   combination (e.g., "β/γ is constrained, β and γ separately are not").
+
+3. **Profile-likelihood scan** — varies this parameter over
+   [lower_bound, upper_bound] on a grid (default 20 points) and
+   RE-OPTIMIZES the other parameters at each grid point. Records the
+   profile loss at each point. (`profile: conditional` holds them fixed
+   instead; that is a slice, not a profile, and is recorded as weaker
+   evidence.)
+
+4. **95% profile CI** — the range where profile loss stays within 1.92
    units of the minimum (equivalent to 95% CI for a chi-squared /
    normal likelihood).
 
-4. **Flat-ratio** — (max_loss - min_loss) across the scan, divided by
+5. **Flat-ratio** — (max_loss - min_loss) across the scan, divided by
    the CI threshold (1.92). A parameter whose full-range scan spans
    less than 1 CI threshold is effectively unconstrained.
 
@@ -114,7 +132,7 @@ For each parameter:
 |----------------------|-----------------------------------------------------------|
 | `well_identified`    | Fisher rel SE < 10%                                       |
 | `weakly_identified`  | 10% ≤ rel SE < 50%                                        |
-| `unidentified`       | rel SE ≥ 50% OR flat_ratio < 1.0 (ridge-trapped)          |
+| `unidentified`       | rel SE ≥ 50% OR flat_ratio < 1.0 (ridge-trapped) OR loads on a near-null Hessian direction |
 
 The `flat_ratio < 1.0` check is what catches ridge trapping. If the
 profile loss barely moves across the full plausible range, Fisher SE
@@ -146,7 +164,7 @@ Three options:
    estimate ± 10%, don't fit it — fix it at the literature value.
 
 2. **Add data that constrains the parameter**. If γ is unidentified by
-   zone-level PfPR, age-stratified data or incidence time series would
+   zone-level prevalence alone, age-stratified data or incidence time series would
    identify it. Adding data is often the right move but expensive.
 
 3. **Remove the parameter** (fix at a default value). If γ is
