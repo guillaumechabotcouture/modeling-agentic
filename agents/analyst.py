@@ -105,12 +105,12 @@ the paraphrase-drift class (R-019, R-020, $197M conflation).
 
 ### What goes in the ledger
 - Every scalar with CI (DALYs averted, cost-effectiveness, RMSE, …)
-- Every count (LGAs allocated to package X, archetypes calibrated, …)
-- Every percentage / share (NW budget share, package coverage, …)
-- Every currency figure ($320M total, $122.4M IRS Phase 2, …)
+- Every count (units allocated to package X, archetypes calibrated, …)
+- Every percentage / share (a region's budget share, package coverage, …)
+- Every currency figure (total budget, cost of one package line, …)
 - Every verdict label (sensitivity ROBUST/SENSITIVE/UNSTABLE,
   hypothesis SUPPORTED/REFUTED/INCONCLUSIVE, …)
-- Every external-fact citation (GBD 2021 12.8M, UNICEF supply
+- Every external-fact citation (a GBD burden estimate, a supply
   ceiling, …) — values you cite from priors or literature
 
 ### What does NOT go in the ledger
@@ -135,11 +135,11 @@ claims:
     confidence: HIGH                      # HIGH | MEDIUM | LOW
     related_text: "DALYs averted under optimized allocation"
 
-  - id: nw_share_pct
+  - id: region_a_share_pct
     claim_kind: percentage
     value: 52.5
-    source_artifact: allocation_optimized.csv
-    source_field: "filter zone='North West'.cost_usd.sum() / total"
+    source_artifact: models/allocation_summary.yaml   # derived ratios must be written to an artifact first
+    source_field: shares_by_region.region_a.pct
     causal_label: BY_CONSTRUCTION
     confidence: HIGH
 
@@ -152,12 +152,12 @@ claims:
     causal_label: BY_CONSTRUCTION
     confidence: HIGH
 
-  - id: gbd_2021_nigeria_burden
+  - id: gbd_national_burden
     claim_kind: scalar
     value: 12800000
     units: dalys_per_year
     source_artifact: external
-    source_field: "GBD 2021 Malaria Collaborators (PMC11914637); 6017/100k * 213M pop"
+    source_field: "GBD <round> estimate for the disease and country (cite PMID); rate/100k * population"
     causal_label: BY_CONSTRUCTION
     confidence: HIGH
 
@@ -166,10 +166,26 @@ claims:
     value: 320000000
     units: usd
     source_artifact: plan.md
-    source_field: "Global Fund GC7 malaria component (working estimate)"
+    source_field: "funder allocation letter for the disease component (primary source)"
     causal_label: BY_CONSTRUCTION
     confidence: HIGH
 ```
+
+### Provenance is checked mechanically (Phase 21 β)
+
+`scripts/lib/provenance.py` resolves every `source_artifact` +
+`source_field` and fails the gate (HIGH, not scope-declarable) when the
+field is missing or its value / CI differs from the ledger. Grammar:
+- YAML/JSON: dot path with list indices (`scalar_outputs.total_cost.mean`,
+  `folds[0].rmse`). If the path ends in `mean`/`median`/`value`, sibling
+  `ci_low`/`ci_high` supply the CI; or give `ci_source_field` explicitly.
+- CSV: `<column>.<agg>()` (sum, mean, median, min, max, count, nunique)
+  or `len()`, with one optional filter: `cost_usd.sum() where region='A'`.
+- `.py`: a module-level constant name.
+- `external` / `literature` / prose files (`plan.md`) are not resolved;
+  use them only for literature or programme inputs, never for model outputs.
+A ledger CI with no resolvable CI source is a failure: copy CIs from
+`uncertainty_report.yaml`, never from memory or an earlier draft.
 
 ### Internal consistency requirement
 

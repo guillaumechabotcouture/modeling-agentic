@@ -71,8 +71,8 @@ deeper.
 
 2. **External sanity check**: aggregate claims (total deaths averted,
    cases prevented, budget impact) must not exceed or contradict
-   published totals (WHO World Malaria Report, IHME GBD, national
-   programs) without explicit modeling justification. WebSearch national
+   published totals (the relevant WHO disease report, IHME GBD,
+   national programs) without explicit modeling justification. WebSearch national
    totals. Compute the ratio of the claim to the total. Flag claims
    >50% of published total without justification. Flag claims that
    exceed published totals outright.

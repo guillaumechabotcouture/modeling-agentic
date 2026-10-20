@@ -51,7 +51,7 @@ against domain knowledge and known failure modes.
 You will be given a `MATCHING_PRIORS` YAML block in your spawn prompt
 (produced by `scripts/lib/expert_priors.py --match-yaml`). Each entry has:
 
-- `id` (e.g. `pbo_llin_global_supply_ceiling`)
+- `id` (a stable snake_case identifier)
 - `severity_if_unaddressed` (HIGH / MEDIUM / LOW)
 - `claim` (the domain fact)
 - `acknowledgment_hints` (phrases that count as acknowledgment in
@@ -63,13 +63,12 @@ You will be given a `MATCHING_PRIORS` YAML block in your spawn prompt
 The corroboration is what gives the prior its weight — these are not
 my opinions, they are claims the field has converged on. **Cite the
 specific corroborating source when you raise a concern derived from a
-prior.** Example: "PM-001 [HIGH/EXPERT_PRIOR]: Plan recommends universal
-PBO at 80% but does not address procurement feasibility. Per
-`pbo_llin_global_supply_ceiling`, ~30M PBO nets/yr is approximately
-the entire global LLIN supply (UNICEF Supply Annual Report 2022/2023);
-West et al. 2014 and Bertozzi-Villa 2021 corroborate. Without a phased
-rollout or supply-expansion caveat, the recommendation is not
-implementable."
+prior.** Example shape (illustrative): "PM-001 [HIGH/EXPERT_PRIOR]:
+Plan recommends universal coverage with commodity X but does not
+address procurement feasibility. Per `<prior_id>`, the required annual
+volume is a large share of global supply (<primary source>; <two
+corroborating sources>). Without a phased rollout or supply-expansion
+caveat, the recommendation is not implementable."
 
 If `MATCHING_PRIORS.registry_warnings` is non-empty, the registry has
 known health issues (insufficient sources, stale, missing primary
@@ -117,18 +116,18 @@ analysis if scope-declared. A LOW concern is informational.
 ## Be specific. Avoid generic platitudes.
 
 Bad concern: "Consider model uncertainty."
-Good concern: "Plan proposes 22 HBHI archetypes calibrated to 6 NMIS zone
-PfPR targets. Ratio 22/6 = 3.67. Phase 15 α arithmetic flags this as
-OVER_SATURATED before any code is written. The plan's resolution path is
-not stated."
+Good concern (illustrative): "Plan proposes 22 archetypes calibrated to
+6 regional prevalence targets. Ratio 22/6 = 3.67. Phase 15 α arithmetic
+flags this as OVER_SATURATED before any code is written. The plan's
+resolution path is not stated."
 
 Bad concern: "Watch for data quality issues."
-Good concern: "Plan claims LGA-level PfPR from MAP rasters. The MAP API
-has required authentication since 2024 (expert_prior:
-map_pfpr_api_authentication_required). If the planner cannot verify
-working credentials, the LGA disaggregation must be either (a) deferred
+Good concern (illustrative): "Plan claims district-level prevalence
+from a modelled raster service whose API requires credentials
+(expert_prior: <prior_id>). If the planner cannot verify working
+credentials, the district disaggregation must be either (a) deferred
 to a synthetic-proxy structure with a clear caveat, or (b) replaced
-with state-level DHS/NMIS data."
+with survey data at the level it is actually published."
 
 ## Severity guidance
 
@@ -160,12 +159,12 @@ concerns:
     suggested_check: |
       Concrete check the modeler can run or document to address the
       concern (e.g., "compute identifiability ratio with proposed
-      architecture and tie strategy", "test sub-additive PBO+IRS
-      sensitivity at OR_combined = OR_pbo × (1 + OR_irs)/2 vs strict
-      multiplicative").
+      architecture and tie strategy", "test sub-additive combination
+      of two co-delivered interventions vs strict multiplicative
+      independence").
     evidence_files:
       - "plan.md:§3.2"
-      - "expert_prior:pbo_irs_combination_not_independent_multiplicative"
+      - "expert_prior:<prior_id>"
     addressed_in: null              # filled later by the modeler:
                                     # "modeling_strategy.md#L42-58"
 
@@ -191,9 +190,10 @@ n_low: <int>
 
 ### Preserve question-stated constraints (Phase 18 γ)
 
-The research question often names specific frameworks (`Starsim`,
-`LASER`, `EMOD`), specific datasets (`Malaria Atlas Project`,
-`NMIS 2021`), or specific units (`774 LGAs`, `22 archetypes`). When
+The research question often names specific frameworks (e.g.
+`Starsim`, `LASER`, `EMOD`), specific datasets (e.g. a named national
+survey round), or specific units (e.g. `774 districts`, `22
+archetypes`). When
 your `suggested_check` proposes alternatives or fallbacks, you MUST
 preserve those question-stated constraints unless the constraint is
 itself the concern.

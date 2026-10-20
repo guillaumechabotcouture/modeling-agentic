@@ -1,0 +1,354 @@
+"""Phase 21 α: structural enforcement for the lead session.
+
+The STAGE 7 gate is only meaningful if the files it reads were produced
+by the agents and scripts that own them. Before Phase 21 that rested on
+prompt prose: the lead (and any built-in ``general-purpose`` agent it
+spawned) could and did rewrite critique YAMLs, rigor-artifact verdicts,
+and even gate code mid-run. This module moves those rules into code:
+
+- ``check_tool_use`` is called from the PreToolUse hook and returns a
+  deny reason (or None) for Write/Edit/Bash/Read/Agent calls that touch
+  protected paths or spawn unregistered agents.
+- ``hash_harness`` / ``diff_harness`` give tamper evidence: main.py
+  hashes the harness at run start and re-hashes at run end, so a write
+  that slips past the Bash heuristics still surfaces as
+  ``harness_tampered``.
+- ``filtered_env`` strips cloud credentials from the agent subprocess
+  environment unless cloud execution was requested.
+
+Everything here is disease-agnostic: protection is defined by file
+ownership (harness code, critique outputs, modeler outputs, script
+outputs), never by domain content.
+"""
+
+from __future__ import annotations
+
+import fnmatch
+import hashlib
+import os
+import re
+import shlex
+
+REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
+
+# Harness code and configuration. No agent may write these.
+HARNESS_DIRS = ("scripts", "agents", ".claude")
+HARNESS_FILES = ("main.py", "CLAUDE.md", "CHANGELOG.md", "requirements.txt",
+                 "requirements-cloud.txt")
+
+# Subtrees hashed for tamper evidence. `.claude/` as a whole also holds
+# lock files and local settings that change legitimately, so only the
+# orchestration manifests and skills are hashed.
+HASHED_DIRS = ("scripts", "agents", ".claude/orchestration", ".claude/skills")
+HASHED_FILES = HARNESS_FILES
+_HASH_SKIP_DIRS = {"__pycache__", ".pytest_cache"}
+_HASH_SKIP_SUFFIXES = (".pyc", ".pyo")
+
+# Files inside a run directory that only a script may produce. Writing
+# them with Write/Edit is how a verdict gets rewritten
+# (e.g. DETECTED -> ACKNOWLEDGED) without the evidence changing. Paths
+# are relative to the run directory; globs allowed.
+SCRIPT_OUTPUTS = (
+    "model_comparison_formal.yaml",
+    "models/model_comparison_formal.yaml",
+    "identifiability.yaml",
+    "uncertainty_report.yaml",
+    "coherence_audit.yaml",
+    "writer_qa_report.yaml",
+    "benchmark_match.yaml",
+    "effort_floors_report.yaml",
+    "sanity_report.yaml",
+    "validator_history.jsonl",       # Phase 21 β round-over-round memory
+    "models/eligibility_probe.yaml",  # scripts/eligibility_probe.py
+    "report.md",          # produced by scripts/render_claims.py
+    # Written by main.py itself (plain Python, not a tool call). The
+    # validator reads the research question from metadata.json, so an
+    # agent rewriting it could neuter spec-compliance.
+    "metadata.json",
+    "harness_manifest.json",
+    "trace.jsonl",
+    "final_gate.json",
+    "final_gate_stderr.txt",
+)
+
+# Files the lead may not write directly: it must re-spawn the owning
+# agent. critique_* belong to the critique agents; models/** to the
+# modeler/analyst/planner.
+LEAD_PROTECTED = (
+    "critique_*.yaml",
+    "critique_*.md",
+    "models/*",
+    "models/**",
+)
+
+# Narrow carve-outs from SCRIPT_OUTPUTS: the writer drafts report.md
+# before render_claims runs; the planner records `decision_year` in
+# metadata.json (main.py restores the original question at run end, so
+# the carve-out cannot rewrite what spec-compliance checks against).
+_OUTPUT_CARVE_OUTS = {"report.md": {"writer"}, "metadata.json": {"planner"}}
+
+_WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
+_AGENT_TOOLS = {"Agent", "Task"}
+
+# Environment variable prefixes holding cloud / third-party credentials.
+# They are only passed to agent subprocesses when cloud execution is on.
+CLOUD_ENV_PREFIXES = ("AZ_", "AZURE_", "OPENAI_", "AWS_", "GOOGLE_")
+
+
+# ---------------------------------------------------------------------------
+# Path classification
+# ---------------------------------------------------------------------------
+
+def _abspath(path: str, cwd: str | None = None) -> str:
+    path = os.path.expanduser(path.strip().strip("'\""))
+    if not os.path.isabs(path):
+        path = os.path.join(cwd or REPO_ROOT, path)
+    return os.path.normpath(path)
+
+
+def is_harness_path(path: str, cwd: str | None = None) -> bool:
+    """True when `path` is harness code/config under the repo root."""
+    p = _abspath(path, cwd)
+    rel = os.path.relpath(p, REPO_ROOT)
+    if rel.startswith(".."):
+        return False
+    if rel in HARNESS_FILES:
+        return True
+    first = rel.split(os.sep, 1)[0]
+    return first in HARNESS_DIRS
+
+
+def is_env_file(path: str, cwd: str | None = None) -> bool:
+    """True for the repo's .env / .env.* credential files."""
+    base = os.path.basename(_abspath(path, cwd))
+    return base == ".env" or base.startswith(".env.")
+
+
+def _run_rel(path: str, run_path: str, cwd: str | None = None) -> str | None:
+    p = _abspath(path, cwd)
+    rel = os.path.relpath(p, os.path.normpath(run_path))
+    if rel.startswith(".."):
+        return None
+    return rel.replace(os.sep, "/")
+
+
+def _matches(rel: str, patterns) -> bool:
+    return any(fnmatch.fnmatch(rel, pat) for pat in patterns)
+
+
+def protected_reason(path: str, run_path: str, agent_type: str | None,
+                     cwd: str | None = None) -> str | None:
+    """Return why `agent_type` (None = lead) may not write `path`."""
+    if is_env_file(path, cwd):
+        return "credential files (.env) are not accessible to agents"
+    if is_harness_path(path, cwd):
+        return ("harness code/config (scripts/, agents/, .claude/, main.py, "
+                "CLAUDE.md) is read-only during a run")
+    rel = _run_rel(path, run_path, cwd)
+    if rel is None:
+        return None
+    if _matches(rel, SCRIPT_OUTPUTS):
+        if agent_type in _OUTPUT_CARVE_OUTS.get(rel, ()):
+            return None
+        return (f"{rel} is produced by a pipeline script; re-run the script "
+                f"instead of writing it by hand")
+    if agent_type is None and _matches(rel, LEAD_PROTECTED):
+        return (f"{rel} is owned by a specialist agent; the lead must "
+                f"re-spawn the owning agent rather than edit it")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Bash heuristics
+# ---------------------------------------------------------------------------
+
+_SEGMENT_SPLIT = re.compile(r"\|\||&&|;|\||\n")
+_REDIRECT = re.compile(r"(?:\d|&)?>>?\s*([^\s;&|<>]+)")
+_PY_WRITE = re.compile(
+    r"""open\(\s*(?:f?['"])([^'"]+)['"]\s*,\s*['"][wax+]"""
+    r"""|Path\(\s*(?:f?['"])([^'"]+)['"]\s*\)\s*\.\s*write_(?:text|bytes)"""
+)
+_ENV_REF = re.compile(r"""(?:^|[\s/'"=<(])\.env(?:\.[\w-]+)?(?=$|[\s'";|&)<>])""")
+# Commands whose path arguments are all written / destroyed.
+_DESTRUCTIVE_ALL_ARGS = {"rm", "rmdir", "truncate", "shred", "chmod", "chown",
+                         "touch", "unlink"}
+# Commands whose last path argument is the destination.
+_DEST_LAST_ARG = {"cp", "mv", "install", "ln", "rsync"}
+# In-place editors: any path argument is modified.
+_INPLACE = {"sed", "perl", "gsed"}
+_GIT_WRITE = {"checkout", "restore", "apply", "am", "stash", "reset",
+              "clean", "rm", "mv"}
+
+
+def _tokens(segment: str) -> list[str]:
+    try:
+        return shlex.split(segment, posix=True)
+    except ValueError:
+        return segment.split()
+
+
+def bash_write_targets(command: str) -> list[str]:
+    """Best-effort list of paths a shell command writes to.
+
+    Heuristic, not a shell parser. It covers the forms observed in past
+    runs (redirection, tee, sed -i, cp/mv/rm, git checkout/restore, and
+    python one-liners with open(..., 'w')). Anything it misses is caught
+    after the fact by the harness hash in main.py.
+    """
+    targets: list[str] = []
+    targets.extend(m.group(1) for m in _REDIRECT.finditer(command)
+                   if m.group(1) not in ("/dev/null", "&1", "&2"))
+    for m in _PY_WRITE.finditer(command):
+        targets.append(m.group(1) or m.group(2))
+    for segment in _SEGMENT_SPLIT.split(command):
+        toks = _tokens(segment.strip())
+        if not toks:
+            continue
+        # Skip leading env assignments / sudo / command wrappers.
+        while toks and (re.match(r"^\w+=", toks[0]) or toks[0] in ("sudo", "command", "env")):
+            toks = toks[1:]
+        if not toks:
+            continue
+        cmd = os.path.basename(toks[0])
+        args = [t for t in toks[1:] if not t.startswith("-")]
+        if cmd == "tee":
+            targets.extend(args)
+        elif cmd in _DESTRUCTIVE_ALL_ARGS:
+            targets.extend(args)
+        elif cmd in _DEST_LAST_ARG and args:
+            targets.append(args[-1])
+            if cmd == "mv":
+                targets.extend(args[:-1])  # moving a file away also removes it
+        elif cmd in _INPLACE and any(t.startswith("-i") or t == "--in-place"
+                                     or (t.startswith("-") and "i" in t[1:] and cmd == "perl")
+                                     for t in toks[1:]):
+            targets.extend(args[1:] if args else [])
+        elif cmd == "git" and len(toks) > 1 and toks[1] in _GIT_WRITE:
+            path_args = [t for t in toks[2:] if not t.startswith("-") and t != "--"]
+            targets.extend(path_args or ["."])
+    return targets
+
+
+def bash_reason(command: str, run_path: str, agent_type: str | None,
+                cwd: str | None = None) -> str | None:
+    """Deny reason for a Bash command, or None."""
+    if _ENV_REF.search(command):
+        return ("credential files (.env) are not accessible to agents; cloud "
+                "credentials are provided in the environment when --cloud is set")
+    for target in bash_write_targets(command):
+        if target in (".", "./"):
+            target = cwd or REPO_ROOT
+        reason = protected_reason(target, run_path, agent_type, cwd)
+        if reason:
+            return f"command writes to {target}: {reason}"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Hook entry point
+# ---------------------------------------------------------------------------
+
+def check_tool_use(tool_name: str, tool_input: dict, run_path: str,
+                   agent_type: str | None, registered_agents,
+                   cwd: str | None = None) -> str | None:
+    """Return a deny reason for this tool call, or None to allow it.
+
+    `agent_type` is None for the lead (main thread) and the subagent's
+    registry name otherwise.
+    """
+    tool_input = tool_input or {}
+    if tool_name in _WRITE_TOOLS:
+        path = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
+        if path:
+            return protected_reason(path, run_path, agent_type, cwd)
+        return None
+    if tool_name == "Read":
+        path = tool_input.get("file_path") or ""
+        if path and is_env_file(path, cwd):
+            return "credential files (.env) are not accessible to agents"
+        return None
+    if tool_name == "Bash":
+        return bash_reason(tool_input.get("command") or "", run_path,
+                           agent_type, cwd)
+    if tool_name in _AGENT_TOOLS:
+        sub = tool_input.get("subagent_type")
+        if not sub or sub not in registered_agents:
+            return (f"subagent_type {sub!r} is not in the pipeline registry "
+                    f"({', '.join(sorted(registered_agents))}). Built-in "
+                    f"agents such as general-purpose are not allowed: spawn "
+                    f"the specialist that owns the work.")
+        return None
+    return None
+
+
+def deny_output(reason: str) -> dict:
+    """PreToolUse hook response that blocks the call (SDK schema)."""
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": f"Phase 21 enforcement: {reason}",
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tamper evidence
+# ---------------------------------------------------------------------------
+
+def hash_harness(repo_root: str = REPO_ROOT) -> dict[str, str]:
+    """sha256 of every hashed harness file, keyed by repo-relative path."""
+    out: dict[str, str] = {}
+
+    def _add(path: str) -> None:
+        h = hashlib.sha256()
+        try:
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 16), b""):
+                    h.update(chunk)
+        except OSError:
+            return
+        out[os.path.relpath(path, repo_root).replace(os.sep, "/")] = h.hexdigest()
+
+    for d in HASHED_DIRS:
+        root = os.path.join(repo_root, d)
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(x for x in dirnames if x not in _HASH_SKIP_DIRS)
+            for fname in sorted(filenames):
+                if fname.endswith(_HASH_SKIP_SUFFIXES) or fname == ".DS_Store":
+                    continue
+                _add(os.path.join(dirpath, fname))
+    for fname in HASHED_FILES:
+        p = os.path.join(repo_root, fname)
+        if os.path.isfile(p):
+            _add(p)
+    return out
+
+
+def diff_harness(before: dict[str, str], after: dict[str, str]) -> dict[str, list[str]]:
+    """{'modified': [...], 'added': [...], 'removed': [...]} (empty lists when clean)."""
+    return {
+        "modified": sorted(k for k in before.keys() & after.keys() if before[k] != after[k]),
+        "added": sorted(after.keys() - before.keys()),
+        "removed": sorted(before.keys() - after.keys()),
+    }
+
+
+def harness_changed(diff: dict[str, list[str]]) -> bool:
+    return any(diff.get(k) for k in ("modified", "added", "removed"))
+
+
+# ---------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------
+
+def filtered_env(environ: dict[str, str], allow_cloud: bool) -> dict[str, str]:
+    """Overrides for ClaudeAgentOptions.env.
+
+    The SDK merges os.environ with options.env, so variables cannot be
+    removed, only overridden. Cloud credentials are blanked when cloud
+    execution is off; downstream code treats empty as unset.
+    """
+    if allow_cloud:
+        return {}
+    return {k: "" for k in environ if k.startswith(CLOUD_ENV_PREFIXES)}

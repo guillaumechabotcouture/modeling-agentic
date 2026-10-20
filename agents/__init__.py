@@ -2,6 +2,8 @@
 
 import json
 import os
+import re
+import shutil
 from datetime import datetime
 
 from claude_agent_sdk import AgentDefinition, HookMatcher
@@ -12,28 +14,92 @@ from agents import (
     critique_presentation, critique_sufficiency, red_team,
     writer,
 )
+from agents import enforcement
 
 MAX_FIGURE_PIXELS = 10_000_000  # 10MP -- anything larger is likely a bug
 
-# Mirror of maxTurns configured in build_agents(). Used by subagent_stop_hook
-# to annotate stop events with an approximate stop reason (ran_to_cap vs
-# completed_under_cap) based on observed tool-use count.
-AGENT_MAX_TURNS = {
-    "planner": 80,
-    "data-agent": 60,
-    "modeler": 150,
-    "model-tester": 60,
-    "analyst": 40,
-    "critique-methods": 35,
-    "critique-domain": 50,
-    "critique-premortem": 30,
-    "critique-presentation": 40,
-    "critique-redteam": 50,
-    # Phase 19 δ: sufficiency critic. Bounded — it reads YAML artifacts
-    # and emits per-claim verdicts; doesn't need WebSearch / lit work.
-    "critique-sufficiency": 30,
-    "writer": 60,
+REPO_ROOT = enforcement.REPO_ROOT
+SKILLS_ROOT = os.path.join(REPO_ROOT, ".claude", "skills")
+EFFORT_FLOORS_PATH = os.path.join(REPO_ROOT, ".claude", "orchestration",
+                                  "effort_floors.yaml")
+
+# Phase 21 α: skills whose content is specific to one disease or one
+# simulation framework. They stay listed in build_agents() (so
+# scripts/validate_skill_attachments.py can parse the attachment
+# matrix statically) but are only attached when the research question
+# matches their trigger phrases. A measles or TB question no longer
+# loads the malaria guide into six agents' context. Trigger phrases are
+# read from each SKILL.md description, plus the extra keywords below
+# for terms the description does not spell out. Skills not listed
+# here are disease-agnostic and always attached.
+DOMAIN_SKILL_EXTRA_KEYWORDS: dict[str, list[str]] = {
+    "malaria-modeling": ["malaria", "plasmodium", "falciparum", "vivax",
+                         "anopheles"],
+    "vectors": ["vector", "mosquito", "malaria", "dengue", "zika",
+                "chikungunya", "cholera", "waterborne", "tick", "aedes",
+                "anopheles", "multi-strain", "serotype"],
+    "stisim-modeling": ["stisim", "hiv", "syphilis", "chlamydia",
+                        "gonorrhea", "sexually transmitted", "sti"],
 }
+DOMAIN_SKILL_PREFIXES: dict[str, list[str]] = {
+    # Framework sub-skills: attach only when the framework is named.
+    "starsim-dev-": ["starsim", "stisim"],
+}
+
+
+def _skill_description(name: str) -> str:
+    path = os.path.join(SKILLS_ROOT, name, "SKILL.md")
+    try:
+        with open(path) as f:
+            text = f.read()
+    except OSError:
+        return ""
+    m = re.match(r"^---\n(.*?)\n---", text, re.S)
+    if not m:
+        return ""
+    try:
+        import yaml
+        fm = yaml.safe_load(m.group(1)) or {}
+    except Exception:
+        return ""
+    return str(fm.get("description") or "") if isinstance(fm, dict) else ""
+
+
+def _skill_triggers(name: str) -> list[str] | None:
+    """Keywords for a gated skill, or None when the skill is not gated."""
+    keywords = None
+    if name in DOMAIN_SKILL_EXTRA_KEYWORDS:
+        keywords = list(DOMAIN_SKILL_EXTRA_KEYWORDS[name])
+        keywords += re.findall(r'"([^"]+)"', _skill_description(name))
+    for prefix, kws in DOMAIN_SKILL_PREFIXES.items():
+        if name.startswith(prefix):
+            keywords = list(kws)
+    return keywords
+
+
+def _question_matches(question: str, keywords: list[str]) -> bool:
+    q = question.lower()
+    for kw in keywords:
+        kw = kw.strip().lower()
+        if kw and re.search(r"(?<![a-z0-9])" + re.escape(kw) + r"(?![a-z0-9])", q):
+            return True
+    return False
+
+
+def select_skills(skills: list[str], question: str) -> list[str]:
+    """Drop gated domain skills the research question doesn't call for.
+
+    An empty question keeps everything (used by tooling that inspects
+    the full attachment matrix).
+    """
+    if not question:
+        return list(skills)
+    out = []
+    for name in skills:
+        triggers = _skill_triggers(name)
+        if triggers is None or _question_matches(question, triggers):
+            out.append(name)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -147,8 +213,25 @@ def _check_figure_size(path: str, stage_name: str) -> None:
 # Agent registry
 # ---------------------------------------------------------------------------
 
-def build_agents() -> dict[str, AgentDefinition]:
-    """Return all subagent definitions for the lead session."""
+def build_agents(question: str = "", run_dir: str | None = None
+                 ) -> dict[str, AgentDefinition]:
+    """Return all subagent definitions for the lead session.
+
+    Phase 21 α: `question` gates disease-/framework-specific skills
+    (see select_skills); `run_dir` is substituted for the `{run_dir}`
+    placeholder in every subagent prompt (previously only the lead's
+    prompt was substituted, so subagents saw a literal `{run_dir}`).
+    """
+    agents = _registry()
+    for name, d in agents.items():
+        if d.skills:
+            d.skills = select_skills(d.skills, question)
+        if run_dir:
+            d.prompt = d.prompt.replace("{run_dir}", run_dir)
+    return agents
+
+
+def _registry() -> dict[str, AgentDefinition]:
     return {
         "planner": AgentDefinition(
             description=planner.DESCRIPTION,
@@ -164,7 +247,10 @@ def build_agents() -> dict[str, AgentDefinition]:
                     # section of plan.md and must understand the
                     # parameter-vs-target arithmetic. Required for the
                     # round-1 identifiability_a_priori.yaml artifact.
-                    "pre-model-identifiability-arithmetic"],
+                    "pre-model-identifiability-arithmetic",
+                    # Phase 21: planner writes the "Published benchmarks"
+                    # table that becomes models/benchmark_targets.yaml.
+                    "benchmark-locked-acceptance"],
         ),
         "data-agent": AgentDefinition(
             description=data.DESCRIPTION,
@@ -205,6 +291,9 @@ def build_agents() -> dict[str, AgentDefinition]:
                     # Phase 10 Commit ω: remediation skill for SENSITIVE
                     # / UNSTABLE sensitivity verdicts (RIG-003 escalation).
                     "sensitivity-analysis-remediation",
+                    # Phase 21: modeler translates plan benchmarks into
+                    # models/benchmark_targets.yaml (Phase 19 γ gate).
+                    "benchmark-locked-acceptance",
                     # Phase 12 Commit γ: required when calibration_units /
                     # allocation_units < 0.1 (e.g., 6 zones → 774 LGAs).
                     "ecological-fallacy-quantification",
@@ -217,17 +306,11 @@ def build_agents() -> dict[str, AgentDefinition]:
                     # Count free fitted params vs independent calibration
                     # targets BEFORE building. Verdict OVER_SATURATED is
                     # NOT scope-declarable — architecture must be fixed.
-                    "pre-model-identifiability-arithmetic"],
-        ),
-        "model-tester": AgentDefinition(
-            description=modeler.MODEL_TESTER_DESCRIPTION,
-            prompt=modeler.MODEL_TESTER_PROMPT,
-            tools=modeler.MODEL_TESTER_TOOLS,
-            skills=modeler.MODEL_TESTER_SKILLS + ["malaria-modeling",
-                    "starsim-dev-intro", "starsim-dev-diseases",
-                    "starsim-dev-interventions", "starsim-dev-calibration"],
-            model="sonnet",
-            maxTurns=60,
+                    "pre-model-identifiability-arithmetic",
+                    # Phase 21 α: benefit and cost must share the
+                    # eligible-population denominator; probed by
+                    # scripts/eligibility_probe.py.
+                    "eligible-population-consistency"],
         ),
         "analyst": AgentDefinition(
             description=analyst.DESCRIPTION,
@@ -323,17 +406,26 @@ You are a research modeling team lead. You orchestrate a team of specialist
 agents to take a research question and produce a publication-quality
 mathematical model, analysis, and report.
 
-You have access to these named agents via the Agent tool:
-- **planner**: Deep literature review, modeling plan, benchmarks, hypotheses
-- **data-agent**: Download datasets, validate quality, run EDA
-- **modeler**: Build and run models, produce figures (has model-tester sub-agent)
-- **analyst**: Interpret results, test hypotheses, causal reasoning
-- **critique-methods**: Statistical validation review
-- **critique-domain**: Scientific reasoning review
-- **critique-presentation**: Figure and writing quality review
-- **writer**: Assemble final publication-quality report
+You have access to these named agents via the Agent tool (generated
+from the agent registry; these are the ONLY agents you may spawn —
+built-in agents such as general-purpose are blocked):
 
-You also have Read, Write, Glob, and Grep tools to inspect files yourself.
+__AGENT_ROSTER__
+
+You also have Bash, Read, Write, Glob, and Grep tools.
+
+**Ownership is enforced, not requested (Phase 21 α).** A PreToolUse
+hook denies, for every agent: writes to harness code (scripts/,
+agents/, .claude/, main.py, CLAUDE.md), reads of credential files, and
+hand-written versions of script outputs (model_comparison_formal.yaml,
+identifiability.yaml, uncertainty_report.yaml, coherence_audit.yaml,
+writer_qa_report.yaml, benchmark_match.yaml, effort_floors_report.yaml,
+report.md outside the writer, metadata.json). For you, the lead, it
+also denies writing critique_*.yaml / critique_*.md and anything under
+{run_dir}/models/. To change any of those, re-spawn the agent or re-run
+the script that owns the file. The harness is hashed at run start and
+end; any change marks the run `harness_tampered`. You write only
+progress.md, pipeline_state.yaml, and scope_declaration.yaml.
 
 ## PIPELINE PROTOCOL
 
@@ -407,9 +499,9 @@ See the `pre-mortem-domain` skill.
 
 **A-PRIORI IDENTIFIABILITY (Phase 15 α — REQUIRED before STAGE 4):**
 
-Before spawning the modeler, instruct the planner (or yourself in
-advisory capacity) to produce `{run_dir}/models/identifiability_a_priori.yaml`
-counting:
+Before spawning the modeler, spawn (or re-spawn) the planner to produce
+`{run_dir}/models/identifiability_a_priori.yaml` (you cannot write under
+`models/` yourself) counting:
 - Independent calibration targets (do NOT count derived/synthetic
   disaggregations — only independent measurements)
 - Free fitted parameters in the proposed architecture
@@ -470,8 +562,8 @@ verdicts exist with causal labels.
 
 ### STAGE 5b: RIGOR (UNCERTAINTY + MULTI-STRUCTURAL + IDENTIFIABILITY)
 
-Run three mechanical rigor checks after analysis and before critique. All
-three are invoked directly via Bash — no subagent spawn.
+Run these mechanical rigor checks after analysis and before critique.
+All are invoked directly via Bash — no subagent spawn.
 
 #### Step 1: Multi-structural comparison
 
@@ -490,9 +582,20 @@ scope declaration) before STAGE 7 can ACCEPT. See
 #### Step 2: Uncertainty propagation (cloud-enabled)
 
 ```bash
-python3 scripts/propagate_uncertainty.py {run_dir} --n-draws 200 \\
-    --cloud --cloud-max-nodes 4 --cloud-budget-usd 5.0
+# local (fast outcome_fn):
+python3 scripts/propagate_uncertainty.py {run_dir} --n-draws <local floor>
+# cloud (slow outcome_fn):
+python3 scripts/propagate_uncertainty.py {run_dir} --n-draws <cloud floor> \\
+    --cloud --cloud-max-nodes 4 --cloud-budget-usd <budget>
 ```
+
+Draw-count floors are read from `.claude/orchestration/effort_floors.yaml`
+(rendered here at load time):
+
+__UQ_DRAW_FLOORS__
+
+Requesting exactly the floor leaves no margin for failed draws: the
+floor applies to SUCCESSFUL draws, so request ~10% more.
 
 Reads registered parameter priors from `citations.md` (`## Parameter
 Registry` section, see effect-size-priors skill). With `--cloud`,
@@ -502,12 +605,17 @@ nodes; without `--cloud` runs all draws locally. Writes
 categorical stability distributions. See `uncertainty-quantification`
 and `cloud-compute` skills.
 
-Cloud prerequisites (one-time setup, already in place):
-- AZ_* env vars loaded from `.env` (AZ_SUBSCRIPTION_ID, AZ_BATCH_ACCOUNT,
-  AZ_BATCH_ACCOUNT_URL, AZ_STORAGE_ACCOUNT, AZ_STORAGE_CONTAINER).
-- Batch + storage accounts provisioned in `modeling-rg` (eastus2).
-- You MUST `set -a && source .env && set +a` before invoking the
-  command above so the env vars are loaded into the Bash subprocess.
+Cloud prerequisites: the AZ_* variables (AZ_SUBSCRIPTION_ID,
+AZ_BATCH_ACCOUNT, AZ_BATCH_ACCOUNT_URL, AZ_STORAGE_ACCOUNT,
+AZ_STORAGE_CONTAINER) are present in your environment only when the
+run was launched with `--cloud`. Do not read `.env` (the hook blocks
+it). If the variables are empty, run UQ locally.
+
+With `--cloud`, the script runs a budget preflight BEFORE provisioning
+(it refuses if the estimated cost exceeds `--cloud-budget-usd`) and
+tears down the pool it created on success, failure, or timeout.
+`uncertainty_report.yaml` records `backend` and `n_successful`; the
+draw floors above apply to `n_successful`.
 
 Use `--cloud` when `outcome_fn` is slow (>5s per call) or when the
 modeler hasn't built a local surrogate. For fast surrogate evals, local
@@ -524,8 +632,21 @@ SEs and profile-likelihood scans. Writes `identifiability.yaml` flagging
 any fitted parameters that are ridge-trapped (unidentified). See
 `identifiability-analysis` skill.
 
-After all three pass (or the modeler explicitly scope-declares any
-flagged issues), proceed to STAGE 6 CRITIQUE.
+#### Step 4: Eligible-population probe (Phase 21 δ — when interventions are compared or allocated)
+
+```bash
+python3 scripts/eligibility_probe.py {run_dir}
+```
+
+Reads `models/eligibility_manifest.yaml` (modeler supplies; see the
+`eligible-population-consistency` skill) and calls the modeler's
+outcome function with perturbed population inputs. A HIGH means an
+intervention's benefit is computed on a population it does not reach
+(e.g. an age-targeted intervention credited with averting cases in all
+ages). Route it to the modeler; it is a model bug, not a scope issue.
+
+After all checks pass (or the modeler explicitly scope-declares any
+flagged issues that are declarable), proceed to STAGE 6 CRITIQUE.
 
 ### STAGE 6: CRITIQUE (PARALLEL)
 Spawn ALL FOUR critique agents simultaneously in a SINGLE response:
@@ -576,7 +697,7 @@ Wait for all four to complete.
 ### STAGE 7: MECHANICAL DECISION GATE
 
 The STAGE 7 decision is NOT a free judgment call. You compute it
-mechanically from the three critique YAML files. You do not get to
+mechanically from the four critique YAML files. You do not get to
 override the rules with prose reasoning.
 
 #### Step 1: Run the validator
@@ -605,7 +726,7 @@ backstops that catch what the critique agents miss:
   UNIDENTIFIED_PARAMETERS, or missing prerequisites.
 
 The validator will:
-- Schema-check all three YAML files. Exit code 3 = schema error;
+- Schema-check all four YAML files. Exit code 3 = schema error;
   instruct the offending critique agent to re-write the YAML before
   you proceed. Do NOT hand-edit critique YAMLs.
 - Compute `unresolved_high`, `structural_mismatch`, `rounds_remaining`.
@@ -786,9 +907,10 @@ When re-spawning an agent after PATCH/RETHINK/REDIRECT, pass the
 SPECIFIC blocker text — not just "fix the issues." Quote the
 `claim` and `fix_requires` fields verbatim, grouped by blocker id.
 
-After deciding, if not ACCEPTing, go back to the targeted stage
-(STAGE 2, 3, or 4) and continue from there. Increment the round
-counter before the next STAGE 6.
+After deciding, if not ACCEPTing, go back to the stage named by the
+unresolved blockers' `target_stage` (PLAN, DATA, MODEL, ANALYZE, or
+WRITE) and continue from there. Increment the round counter before the
+next STAGE 6.
 
 ### STAGE 8: WRITE
 Spawn the "writer" agent. Tell it the run directory.
@@ -832,10 +954,12 @@ This writes `{run_dir}/writer_qa_report.yaml` with one of three verdicts:
 
 - **REVISE**: ≤2 MAJOR + any MINOR issues. Re-spawn the writer ONCE
   with the writer_qa_report.yaml's `issues` list as input:
-  "Fix these specific text-figure inconsistencies and stale numbers,
-  then re-emit report.md. After your fixes, run
-  `python3 scripts/writer_qa.py {run_dir}` and verify the verdict is
-  CLEAN before completing."
+  "Fix these specific text-figure inconsistencies and stale numbers.
+  Start from report.unrendered.md (the draft that still carries the
+  [CLAIM:id] references), apply the fixes, and write the revised draft
+  to report.md. Keep every number as a [CLAIM:id] reference." The
+  writer has no Bash, so YOU then re-run `render_claims.py`,
+  `writer_qa.py`, and the coherence audit and confirm CLEAN.
 
 - **MAJOR_REVISION**: >2 MAJOR issues. Re-spawn writer up to TWICE.
   If still not CLEAN after the second attempt, scope-declare the
@@ -907,6 +1031,19 @@ violations, the lead should either:
   with justification (e.g., "the prose 'UNSTABLE' is the operator's
   own assessment, not a verdict mismatch").
 
+#### STAGE 8.9: FINAL GATE (Phase 21 α — REQUIRED)
+
+The post-WRITE checks (render_claims, writer_qa, coherence audit,
+sufficiency critic) run AFTER the STAGE 7 decision, so their HIGHs only
+count if the validator runs again. After all of them are done, re-run
+the full STAGE 7 validator command (same flags, same round number) and
+record it in progress.md under `## Final gate`. If the action is not
+ACCEPT (or DECLARE_SCOPE at rounds exhausted), treat it exactly like a
+STAGE 7 result: route the blockers to their target_stage and iterate
+while rounds remain. main.py also re-runs this gate itself when the
+session ends and records the result in metadata.json; a report without
+a passing final gate is not recorded as `completed`.
+
 #### Multimodal spot-check (Phase 8 Commit ξ — optional)
 
 After `writer_qa.py` returns CLEAN, you MAY spot-check 2-3 of the
@@ -935,9 +1072,61 @@ than letting the report ship.
   ```
 - If a subagent fails (you see it reported as failed), read its output for
   diagnostics. Retry ONCE with adjusted instructions. If it fails again,
-  log the failure in progress.md and proceed with DECLARE_SCOPE.
+  log the failure in progress.md and continue to STAGE 6/7: the missing
+  output will surface as blockers and the validator decides the action
+  (DECLARE_SCOPE is only available once rounds are exhausted).
 - Never retry a failed agent more than once per round.
 """
+
+
+
+def load_effort_floors(path: str = EFFORT_FLOORS_PATH) -> list[dict]:
+    """Floors from .claude/orchestration/effort_floors.yaml ([] if unreadable)."""
+    try:
+        import yaml
+        with open(path) as f:
+            doc = yaml.safe_load(f) or {}
+    except Exception:
+        return []
+    floors = doc.get("floors") if isinstance(doc, dict) else None
+    return [f for f in floors if isinstance(f, dict)] if isinstance(floors, list) else []
+
+
+def _floor_by_id(floors: list[dict], floor_id: str) -> dict | None:
+    return next((f for f in floors if f.get("id") == floor_id), None)
+
+
+def render_uq_draw_floors(floors: list[dict] | None = None) -> str:
+    """Markdown bullet list of the UQ draw-count floors."""
+    floors = load_effort_floors() if floors is None else floors
+    lines = []
+    for fid, label in (("uq_min_draws_local", "local"),
+                       ("uq_min_draws_cloud", "cloud")):
+        f = _floor_by_id(floors, fid)
+        if f is None:
+            continue
+        declarable = "scope-declarable" if f.get("scope_declarable") else "NOT scope-declarable"
+        lines.append(f"- {label}: >= {f.get('minimum')} successful draws "
+                     f"({f.get('severity')}, {declarable}; floor `{fid}`)")
+    return "\n".join(lines) or (
+        "- (effort_floors.yaml unreadable: see .claude/orchestration/effort_floors.yaml)")
+
+
+def render_agent_roster(agents: dict[str, AgentDefinition] | None = None) -> str:
+    """One line per registered agent, from the registry itself."""
+    agents = _registry() if agents is None else agents
+    lines = []
+    for name, d in agents.items():
+        desc = " ".join((d.description or "").split())
+        if len(desc) > 220:
+            desc = desc[:217].rsplit(" ", 1)[0] + "..."
+        lines.append(f"- **{name}**: {desc}")
+    return "\n".join(lines)
+
+
+LEAD_SYSTEM_PROMPT = (LEAD_SYSTEM_PROMPT
+                      .replace("__AGENT_ROSTER__", render_agent_roster())
+                      .replace("__UQ_DRAW_FLOORS__", render_uq_draw_floors()))
 
 
 def build_lead_prompt(question: str, run_dir: str, max_rounds: int,
@@ -949,10 +1138,11 @@ def build_lead_prompt(question: str, run_dir: str, max_rounds: int,
         f"Max critique-revision rounds: {max_rounds}\n"
     )
     if resume_context:
+        # Phase 21 α: the resume context names the stage to continue
+        # from; appending "Start with STAGE 1" contradicted it.
         prompt += f"\n{resume_context}\n"
-    prompt += (
-        "\nBegin the pipeline. Start with STAGE 1 (PLAN)."
-    )
+    else:
+        prompt += "\nBegin the pipeline. Start with STAGE 1 (PLAN)."
     return prompt
 
 
@@ -960,11 +1150,55 @@ def build_lead_prompt(question: str, run_dir: str, max_rounds: int,
 # Hooks
 # ---------------------------------------------------------------------------
 
-def create_hooks(run_path: str, trace_file, start_time: datetime):
-    """Create hook config for the lead query() session."""
+def _safe_write(trace_file, record: dict) -> None:
+    try:
+        trace_file.write(json.dumps(record) + "\n")
+        trace_file.flush()
+    except (ValueError, OSError):
+        pass
+
+
+def snapshot_report(run_path: str, state: dict) -> bool:
+    """Copy report.md to report.snapshot.md when it changed since the
+    last snapshot. Phase 21 α: called after every tool use, so the
+    snapshot exists before any later disappearance (Phase 12 δ only
+    snapshotted at run end, after the failure it guarded against).
+    Returns True when a snapshot was written."""
+    report = os.path.join(run_path, "report.md")
+    try:
+        st = os.stat(report)
+    except OSError:
+        return False
+    key = (st.st_mtime_ns, st.st_size)
+    if state.get("report_key") == key or st.st_size == 0:
+        return False
+    try:
+        shutil.copyfile(report, os.path.join(run_path, "report.snapshot.md"))
+    except OSError:
+        return False
+    state["report_key"] = key
+    return True
+
+
+def create_hooks(run_path: str, trace_file, start_time: datetime,
+                 registered_agents=None, max_turns: dict[str, int] | None = None):
+    """Create hook config for the lead query() session.
+
+    Phase 21 α: PreToolUse also enforces file ownership and the agent
+    registry via agents.enforcement.check_tool_use (deny, not warn);
+    PostToolUse snapshots report.md whenever it changes.
+    `registered_agents` defaults to the full registry.
+    """
 
     tool_count = 0
     per_agent_tool_counts: dict[str, int] = {}
+    agent_types: dict[str, str] = {}
+    snapshot_state: dict = {}
+    if registered_agents is None:
+        registered_agents = set(_registry().keys())
+    registered_agents = set(registered_agents)
+    if max_turns is None:
+        max_turns = {n: d.maxTurns for n, d in _registry().items()}
 
     def _format_tool(name: str, input_data: dict) -> str:
         if name == "WebSearch":
@@ -984,35 +1218,53 @@ def create_hooks(run_path: str, trace_file, start_time: datetime):
         elif name == "Grep":
             return f'Grep: "{input_data.get("pattern", "")}"'
         elif name in ("Agent", "Task"):
-            return f"Agent: {input_data.get('description', input_data.get('subagent_type', ''))}"
+            return (f"Agent[{input_data.get('subagent_type', '?')}]: "
+                    f"{input_data.get('description', '')}")
         return name
 
     async def pre_tool_hook(input_data, tool_use_id, context):
         nonlocal tool_count
         tool_count += 1
         tool_name = input_data.get("tool_name", "unknown")
-        tool_input = input_data.get("tool_input", {})
+        tool_input = input_data.get("tool_input", {}) or {}
         agent_id = input_data.get("agent_id", "lead")
+        # agent_type is absent on the main thread (the lead).
+        agent_type = input_data.get("agent_type") if "agent_id" in input_data else None
+        if agent_type is None and "agent_id" in input_data:
+            # Inside a subagent whose type the CLI didn't report: use the
+            # SubagentStart record; never fall back to the lead's
+            # (stricter, ownership-based) rules for a specialist.
+            agent_type = agent_types.get(agent_id, "unknown-subagent")
         per_agent_tool_counts[agent_id] = per_agent_tool_counts.get(agent_id, 0) + 1
         summary = _format_tool(tool_name, tool_input)
         elapsed = (datetime.now() - start_time).total_seconds()
-        label = agent_id if agent_id != "lead" else "lead"
-        print(f"[{label:>12} {elapsed:6.0f}s | #{tool_count}] {summary}", flush=True)
-        trace_file.write(json.dumps({
+        label = agent_type or agent_id
+        deny_reason = enforcement.check_tool_use(
+            tool_name, tool_input, run_path, agent_type, registered_agents,
+            cwd=input_data.get("cwd"))
+        status = "DENIED" if deny_reason else ""
+        print(f"[{label:>12} {elapsed:6.0f}s | #{tool_count}] {status} {summary}".replace("]  ", "] "),
+              flush=True)
+        record = {
             "ts": datetime.now().isoformat(),
             "elapsed_s": elapsed,
             "agent": agent_id,
+            "agent_type": agent_type or ("lead" if agent_id == "lead" else None),
             "type": "tool_use",
             "tool": tool_name,
             "summary": summary,
-        }) + "\n")
-        trace_file.flush()
+        }
+        if deny_reason:
+            record["denied"] = deny_reason
+        _safe_write(trace_file, record)  # a closed trace must not disable enforcement
+        if deny_reason:
+            return enforcement.deny_output(deny_reason)
         return {}
 
     async def post_tool_hook(input_data, tool_use_id, context):
-        """Check written PNG files for oversized figures."""
+        """Check written PNG files for oversized figures; snapshot report.md."""
         tool_name = input_data.get("tool_name", "")
-        tool_input = input_data.get("tool_input", {})
+        tool_input = input_data.get("tool_input", {}) or {}
         agent_id = input_data.get("agent_id", "lead")
         if tool_name in ("Bash", "Write"):
             file_path = tool_input.get("file_path", "")
@@ -1024,21 +1276,22 @@ def create_hooks(run_path: str, trace_file, start_time: datetime):
                 for fname in os.listdir(fig_dir):
                     if fname.endswith(".png"):
                         _check_figure_size(os.path.join(fig_dir, fname), agent_id)
+        snapshot_report(run_path, snapshot_state)
         return {}
 
     async def subagent_start_hook(input_data, tool_use_id, context):
         agent_id = input_data.get("agent_id", "?")
         agent_type = input_data.get("agent_type", "?")
+        agent_types[agent_id] = agent_type
         elapsed = (datetime.now() - start_time).total_seconds()
         print(f"\n--- SUBAGENT START: {agent_type} (id={agent_id}) [{elapsed:.0f}s] ---", flush=True)
-        trace_file.write(json.dumps({
+        _safe_write(trace_file, {
             "ts": datetime.now().isoformat(),
             "elapsed_s": elapsed,
             "type": "subagent_start",
             "agent_id": agent_id,
             "agent_type": agent_type,
-        }) + "\n")
-        trace_file.flush()
+        })
         return {}
 
     async def subagent_stop_hook(input_data, tool_use_id, context):
@@ -1046,10 +1299,10 @@ def create_hooks(run_path: str, trace_file, start_time: datetime):
         agent_type = input_data.get("agent_type", "?")
         elapsed = (datetime.now() - start_time).total_seconds()
         turns_used = per_agent_tool_counts.get(agent_id, 0)
-        max_turns = AGENT_MAX_TURNS.get(agent_type, None)
-        if max_turns is None:
+        cap = max_turns.get(agent_type)
+        if cap is None:
             approx_stop_reason = "unknown"
-        elif turns_used >= max_turns - 2:
+        elif turns_used >= cap - 2:
             approx_stop_reason = "ran_to_cap"
         else:
             approx_stop_reason = "completed_under_cap"
@@ -1058,7 +1311,7 @@ def create_hooks(run_path: str, trace_file, start_time: datetime):
             f"turns={turns_used} {approx_stop_reason} ---\n",
             flush=True,
         )
-        trace_file.write(json.dumps({
+        _safe_write(trace_file, {
             "ts": datetime.now().isoformat(),
             "elapsed_s": elapsed,
             "type": "subagent_stop",
@@ -1066,8 +1319,7 @@ def create_hooks(run_path: str, trace_file, start_time: datetime):
             "agent_type": agent_type,
             "turns_used": turns_used,
             "approx_stop_reason": approx_stop_reason,
-        }) + "\n")
-        trace_file.flush()
+        })
         return {}
 
     return {

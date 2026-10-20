@@ -161,21 +161,21 @@ After the literature review, also produce:
    ```yaml
    hard_blockers:
      - id: HB-001
-       criterion: "Model reproduces NMIS 2021 zone PfPR within ±3 pp"
-       metric: zone_pfpr_rmse_pp
+       criterion: "Model reproduces the most recent survey's regional prevalence within ±3 pp"
+       metric: calibration_rmse_pp
        threshold: 3.0
        operator: "<="
-       artifact: model_comparison_formal.yaml
-       artifact_field: zone_pfpr_rmse_pp
+       artifact: models/plan_metrics.yaml
+       artifact_field: calibration_rmse_pp
 
    minimum_bar:
      - id: MB-001
-       criterion: "Cross-validation against malariasimulation R package"
-       metric: malariasimulation_comparison_done
+       criterion: "Cross-validation against a published reference implementation"
+       metric: reference_model_comparison_done
        threshold: 1
        operator: "=="
-       artifact: model_comparison_formal.yaml
-       artifact_field: malariasimulation_comparison_done
+       artifact: models/plan_metrics.yaml
+       artifact_field: reference_model_comparison_done
 
      - id: MB-002
        criterion: "Allocation cross-validation worst-fold rank correlation"
@@ -202,7 +202,10 @@ After the literature review, also produce:
    - `threshold` (numeric or boolean)
    - `operator` (one of `<=`, `>=`, `<`, `>`, `==`, `!=`)
    - `artifact` (filename relative to run_dir, may be in models/ or
-     results/ subdirs)
+     results/ subdirs). Name a modeler-owned file (default
+     `models/plan_metrics.yaml`), not a script output such as
+     model_comparison_formal.yaml: script outputs are write-protected
+     (Phase 21 α), so the modeler could not populate the field.
    - `artifact_field` (dot-syntax path inside the yaml file)
 
    The validator emits HIGH `plan_hard_blocker_failed` for failed
@@ -214,7 +217,7 @@ After the literature review, also produce:
    logic (after 2+ failed PATCH attempts).
 
    Do NOT promise minimum_bar criteria you cannot operationalize.
-   If a criterion needs an external tool (e.g., malariasimulation R
+   If a criterion needs an external tool (e.g., a published R
    package), confirm the modeler has access; otherwise downgrade to
    targets or drop entirely.
 
@@ -284,9 +287,9 @@ plan.md section.
 
 **{run_dir}/metadata.json** — update this file with a `decision_year`
 field if the research question implies one:
-- "Global Fund GC7" / "GC7 allocation" → `"decision_year": 2024`
-- "Global Fund GC8" / "GC8 allocation" → `"decision_year": 2027`
-- "Global Fund GC9" / "GC9 allocation" → `"decision_year": 2030`
+- A named funding cycle → the cycle's first implementation year
+  (examples: Global Fund GC7 → 2024, GC8 → 2027). Look up cycles you
+  do not know rather than guessing.
 - Explicit year like "by 2030" or "for 2028" → use that year.
 - Otherwise leave unset; the validator falls back to the year from
   `metadata.started`.
