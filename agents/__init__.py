@@ -154,7 +154,7 @@ def build_agents() -> dict[str, AgentDefinition]:
             description=planner.DESCRIPTION,
             prompt=planner.SYSTEM_PROMPT,
             tools=planner.TOOLS,
-            model="opus",
+            model="claude-opus-5-5",
             maxTurns=80,
             skills=["semantic-scholar-lookup", "asta-literature-search",
                     "pdf-text-extraction", "investigation-threads",
@@ -170,14 +170,14 @@ def build_agents() -> dict[str, AgentDefinition]:
             description=data.DESCRIPTION,
             prompt=data.SYSTEM_PROMPT,
             tools=data.TOOLS,
-            model="sonnet",
+            model="claude-sonnet-5-5",
             maxTurns=60,
         ),
         "modeler": AgentDefinition(
             description=modeler.DESCRIPTION,
             prompt=modeler.SYSTEM_PROMPT,
             tools=modeler.TOOLS,
-            model="opus",
+            model="claude-opus-5-5",
             maxTurns=150,
             skills=["modeling-strategy", "laser-spatial-disease-modeling",
                     "epi-model-parametrization", "malaria-modeling",
@@ -226,14 +226,14 @@ def build_agents() -> dict[str, AgentDefinition]:
             skills=modeler.MODEL_TESTER_SKILLS + ["malaria-modeling",
                     "starsim-dev-intro", "starsim-dev-diseases",
                     "starsim-dev-interventions", "starsim-dev-calibration"],
-            model="sonnet",
+            model="claude-sonnet-5-5",
             maxTurns=60,
         ),
         "analyst": AgentDefinition(
             description=analyst.DESCRIPTION,
             prompt=analyst.SYSTEM_PROMPT,
             tools=analyst.TOOLS,
-            model="opus",
+            model="claude-opus-5-5",
             maxTurns=40,
             skills=["investigation-threads", "malaria-modeling",
                     "basic_epi_modeling", "surveillance"],
@@ -242,7 +242,7 @@ def build_agents() -> dict[str, AgentDefinition]:
             description=critique_methods.DESCRIPTION,
             prompt=critique_methods.SYSTEM_PROMPT,
             tools=critique_methods.TOOLS,
-            model="opus",
+            model="claude-opus-5-5",
             maxTurns=35,  # increased: now does parameter provenance checks with WebSearch
             skills=["malaria-modeling", "model-validation",
                     "parameter-estimation"],
@@ -251,7 +251,7 @@ def build_agents() -> dict[str, AgentDefinition]:
             description=critique_domain.DESCRIPTION,
             prompt=critique_domain.SYSTEM_PROMPT,
             tools=critique_domain.TOOLS,
-            model="opus",
+            model="claude-opus-5-5",
             maxTurns=50,  # increased after malaria run ran_to_cap at 39/40
             skills=["investigation-threads", "model-fitness", "malaria-modeling",
                     "vectors", "vaccination"],
@@ -265,7 +265,7 @@ def build_agents() -> dict[str, AgentDefinition]:
             description=critique_premortem.DESCRIPTION,
             prompt=critique_premortem.SYSTEM_PROMPT,
             tools=critique_premortem.TOOLS,
-            model="opus",  # adversarial roleplay strength on a clean slate
+            model="claude-opus-5-5",  # adversarial roleplay strength on a clean slate
             maxTurns=30,
             skills=["pre-mortem-domain", "adversarial-redteam",
                     "model-fitness", "modeling-strategy",
@@ -276,14 +276,14 @@ def build_agents() -> dict[str, AgentDefinition]:
             description=critique_presentation.DESCRIPTION,
             prompt=critique_presentation.SYSTEM_PROMPT,
             tools=critique_presentation.TOOLS,
-            model="sonnet",
+            model="claude-sonnet-5-5",
             maxTurns=40,  # bumped 25→30 post-measles, 30→40 post-malaria (30/30 ran_to_cap in round 2)
         ),
         "critique-redteam": AgentDefinition(
             description=red_team.DESCRIPTION,
             prompt=red_team.SYSTEM_PROMPT,
             tools=red_team.TOOLS,
-            model="opus",  # adversarial judgment + WebFetch-heavy research
+            model="claude-opus-5-5",  # adversarial judgment + WebFetch-heavy research
             maxTurns=50,
             skills=["adversarial-redteam", "critique-blockers-schema",
                     "effect-size-priors"],
@@ -298,7 +298,7 @@ def build_agents() -> dict[str, AgentDefinition]:
             description=critique_sufficiency.DESCRIPTION,
             prompt=critique_sufficiency.SYSTEM_PROMPT,
             tools=critique_sufficiency.TOOLS,
-            model="opus",  # claim-strength judgment benefits from opus
+            model="claude-opus-5-5",  # claim-strength judgment benefits from opus
             maxTurns=30,
             skills=["evidence-sufficiency", "critique-blockers-schema",
                     "effect-size-priors"],
@@ -307,7 +307,7 @@ def build_agents() -> dict[str, AgentDefinition]:
             description=writer.DESCRIPTION,
             prompt=writer.SYSTEM_PROMPT,
             tools=writer.TOOLS,
-            model="opus",  # needs to synthesize the most complex output
+            model="claude-opus-5-5",  # needs to synthesize the most complex output
             maxTurns=60,
             skills=["investigation-threads"],
         ),

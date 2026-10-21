@@ -225,6 +225,7 @@ async def run(question: str, max_rounds: int, max_sessions: int,
         options = ClaudeAgentOptions(
             system_prompt=lead_system,
             agents=agents,
+            model="claude-opus-5-5",  # A/B baseline: pin only, no Phase 21 changes
             allowed_tools=["Agent", "Bash", "Read", "Write", "Glob", "Grep"],
             permission_mode="bypassPermissions",
             setting_sources=["project"],
