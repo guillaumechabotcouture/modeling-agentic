@@ -19,6 +19,7 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     AssistantMessage,
     ResultMessage,
+    UserMessage,
     SystemMessage,
     TaskStartedMessage,
     TaskProgressMessage,
@@ -1009,6 +1010,8 @@ def _run_self_test() -> int:
                           {enforcement.MODEL_DEEP: {}}, False),
        "PF1 system python not flagged")
     ok(evaluate_preflight(good, {}, False), "PF1 empty model_usage not flagged")
+    ok(evaluate_preflight(good + "\nPREFLIGHT_OK line.", {enforcement.MODEL_DEEP: {}}, False) == [],
+       "PF1 prose 'PREFLIGHT_OK line' wrongly counted as an interpreter")
     ok(evaluate_preflight(good, {enforcement.MODEL_DEEP: {}, "claude-haiku-5-5": {}}, False) == [],
        "PF1 CLI-internal haiku wrongly flagged")
 
@@ -1043,7 +1046,9 @@ def evaluate_preflight(text: str, model_usage: dict | None,
     problems = []
     if is_error:
         problems.append("preflight session ended with an error result")
-    hits = re.findall(r"PREFLIGHT_OK\s+(\S+)", text or "")
+    # Absolute paths only: the model's prose can say "PREFLIGHT_OK line"
+    # (seen on Coiled 2026-10-21), which must not count as an interpreter.
+    hits = re.findall(r"PREFLIGHT_OK\s+(/\S+)", text or "")
     want = os.path.realpath(sys.executable)
     if len(hits) < 2:
         problems.append(
@@ -1096,6 +1101,14 @@ async def run_preflight(allow_cloud: bool = False) -> dict:
             for b in m.content:
                 if hasattr(b, "text"):
                     texts.append(b.text)
+        elif isinstance(m, UserMessage) and isinstance(m.content, list):
+            # The probe's real Bash output (tool results), not a paraphrase.
+            for b in m.content:
+                c = getattr(b, "content", None)
+                if isinstance(c, str):
+                    texts.append(c)
+                elif isinstance(c, list):
+                    texts.extend(x.get("text", "") for x in c if isinstance(x, dict))
         elif isinstance(m, ResultMessage):
             result = m
             if getattr(m, "result", None):
