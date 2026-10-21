@@ -231,12 +231,19 @@ def _load_effect_size_registry():
 
 REVIEWERS = ("critique-methods", "critique-domain", "critique-presentation",
              "critique-redteam")
+# Phase 21 ζ: optional cross-model critic (scripts/cross_model_critic.py,
+# Codex CLI). Included only when its YAML exists; written by the script,
+# never by an agent, so it may carry verdict UNAVAILABLE.
+OPTIONAL_REVIEWERS = ("critique-crossmodel",)
 PREFIXES = {"critique-methods": "M-", "critique-domain": "D-",
-            "critique-presentation": "P-", "critique-redteam": "R-"}
+            "critique-presentation": "P-", "critique-redteam": "R-",
+            "critique-crossmodel": "X-"}
 FILENAMES = {"critique-methods": "critique_methods.yaml",
              "critique-domain": "critique_domain.yaml",
              "critique-presentation": "critique_presentation.yaml",
-             "critique-redteam": "critique_redteam.yaml"}
+             "critique-redteam": "critique_redteam.yaml",
+             "critique-crossmodel": "critique_crossmodel.yaml"}
+_CROSS_MODEL_UNAVAILABLE_HIGH_AFTER = 3  # consecutive rounds
 
 VALID_SEVERITY = {"HIGH", "MEDIUM", "LOW"}
 VALID_VERDICT = {"PASS", "REVISE"}
@@ -343,8 +350,15 @@ def validate_critique(path: str, expected_reviewer: str,
              f"got {doc.get('reviewer')!r}")
     _require(doc.get("round") == current_round,
              f"{ctx}: round must be {current_round}, got {doc.get('round')!r}")
-    _require(doc.get("verdict") in VALID_VERDICT,
-             f"{ctx}: verdict must be one of {VALID_VERDICT}")
+    valid_verdicts = (VALID_VERDICT | {"UNAVAILABLE"}
+                      if expected_reviewer in OPTIONAL_REVIEWERS else VALID_VERDICT)
+    _require(doc.get("verdict") in valid_verdicts,
+             f"{ctx}: verdict must be one of {valid_verdicts}")
+    if doc.get("verdict") == "UNAVAILABLE":
+        _require(isinstance(doc.get("unavailable_reason"), str)
+                 and doc["unavailable_reason"].strip(),
+                 f"{ctx}: verdict UNAVAILABLE requires a non-empty "
+                 f"unavailable_reason")
 
     _validate_structural(doc.get("structural_mismatch"), ctx, expected_reviewer)
 
@@ -530,6 +544,53 @@ def _recompute_action(d: dict, max_rounds: int, current_round: int,
     d["rule_matched"] = rule_matched
     d["rationale"] = rationale
     return d
+
+
+def _load_optional_critique(run_dir: str, reviewer: str,
+                            current_round: int) -> tuple[dict | None, list[dict]]:
+    """Phase 21 ζ: load an optional, script-written critique.
+
+    Absent → (None, []). Schema failure → (None, [HIGH
+    cross_model_critic_invalid]). UNAVAILABLE → (doc, [MEDIUM
+    cross_model_critic_unavailable]), HIGH once the critic has been
+    unavailable for `_CROSS_MODEL_UNAVAILABLE_HIGH_AFTER` consecutive
+    rounds (from the file's own availability_history). An UNAVAILABLE
+    doc still contributes its carried-forward open blockers.
+    """
+    path = os.path.join(run_dir, FILENAMES[reviewer])
+    if not os.path.exists(path):
+        return None, []
+    try:
+        doc = validate_critique(path, reviewer, current_round)
+    except SchemaError as e:
+        return None, [{
+            "kind": "cross_model_critic_invalid", "severity": "HIGH",
+            "stage": "CRITIQUE",
+            "claim": (f"{FILENAMES[reviewer]} failed the critique schema: {e}. "
+                      f"It is written by scripts/cross_model_critic.py; re-run "
+                      f"the script for round {current_round} (do not hand-edit)."),
+        }]
+    if doc.get("verdict") != "UNAVAILABLE":
+        return doc, []
+    streak = 0
+    hist = [h for h in (doc.get("availability_history") or [])
+            if isinstance(h, dict) and isinstance(h.get("round"), int)]
+    hist.sort(key=lambda h: h["round"])
+    if not hist or hist[-1]["round"] != current_round:
+        hist.append({"round": current_round, "status": "UNAVAILABLE"})
+    for h in reversed(hist):
+        if h.get("status") != "UNAVAILABLE":
+            break
+        streak += 1
+    sev = "HIGH" if streak >= _CROSS_MODEL_UNAVAILABLE_HIGH_AFTER else "MEDIUM"
+    return doc, [{
+        "kind": "cross_model_critic_unavailable", "severity": sev,
+        "stage": "CRITIQUE",
+        "claim": (f"Cross-model critic unavailable for {streak} consecutive "
+                  f"round(s): {doc.get('unavailable_reason')}. Its prior open "
+                  f"blockers stay open un-rechecked. Fix the Codex CLI "
+                  f"(install / `codex login`) or run without --cross-model."),
+    }]
 
 
 def decide(critiques: dict[str, dict], max_rounds: int,
@@ -4699,7 +4760,8 @@ def _check_persistent_medium_escalation(run_dir: str,
     # HIGH if (round_n - first_seen_round) >= threshold.
     for reviewer_yaml in ("critique_methods.yaml", "critique_domain.yaml",
                           "critique_presentation.yaml",
-                          "critique_redteam.yaml"):
+                          "critique_redteam.yaml",
+                          "critique_crossmodel.yaml"):
         path = os.path.join(run_dir, reviewer_yaml)
         if not os.path.exists(path):
             continue
@@ -8317,6 +8379,87 @@ def _run_self_test() -> int:
                            f"E8 mutant {name} at exhaustion is non-"
                            f"declarable → RUN_FAILED; got {action}")
 
+    # --- Phase 21 ζ: optional cross-model critique (XM1-XM6) ---
+    import cross_model_critic as _xm
+
+    def _xm_doc(round_n, status, new=(), history=None, reason="codex exited 1"):
+        prior = {"round": round_n - 1, "blockers": [],
+                 "availability_history": history or []}
+        res = {"status": status, "reason": reason, "duration_s": 1.0,
+               "payload": {"summary": "s",
+                           "structural_mismatch": {"detected": False,
+                                                   "description": "",
+                                                   "evidence_files": []},
+                           "new_blockers": list(new), "prior_rechecks": []}}
+        return _xm.build_doc(prior, round_n, res, model="test-model",
+                             codex_version="t", question="q")
+
+    with tempfile.TemporaryDirectory() as _root:
+        pc = os.path.join(_root, "pc")
+        try:
+            _pc.build(pc, round_n=2)
+            xm_built = True
+        except Exception as e:  # noqa: BLE001
+            xm_built = False
+            ok(False, f"XM: fixture failed to build: {type(e).__name__}: {e}")
+        if xm_built:
+            # XM1: absent → no finding.
+            ok(_load_optional_critique(pc, "critique-crossmodel", 2) == (None, []),
+               "XM1: absent cross-model critique → no finding")
+
+            def _xm_case(name, doc=None, raw=None):
+                md = os.path.join(_root, name)
+                _shutil.copytree(pc, md)
+                path = os.path.join(md, "critique_crossmodel.yaml")
+                if raw is not None:
+                    with open(path, "w") as f:
+                        f.write(raw)
+                else:
+                    _xm.write_outputs(md, doc)
+                return md
+
+            # XM2: valid PASS → honest run still ACCEPTs.
+            md = _xm_case("xm_pass", _xm_doc(2, "ok"))
+            rc, action, open_ = _cli_pc(md, 2, True)
+            ok(rc == 0 and action == "ACCEPT",
+               f"XM2: valid PASS cross-model critique keeps ACCEPT; got {rc} {action} {open_}")
+            # XM3: open HIGH X- blocker counts like any critic's.
+            md = _xm_case("xm_high", _xm_doc(2, "ok", new=[
+                {"severity": "HIGH", "category": "METHODS", "target_stage": "MODEL",
+                 "claim": "benefit uses total population", "evidence": "model.py:12",
+                 "fix_requires": "use eligible population"}]))
+            rc, action, open_ = _cli_pc(md, 2, True)
+            ok(action == "PATCH_OR_RETHINK" and "critique_blocker" in open_,
+               f"XM3: open HIGH X- blocker must block; got {action} {open_}")
+            # XM4: UNAVAILABLE once → MEDIUM, ACCEPT still possible.
+            d4 = _xm_doc(2, "unavailable")
+            md = _xm_case("xm_unavail", d4)
+            _, v4 = _load_optional_critique(md, "critique-crossmodel", 2)
+            ok([(v["kind"], v["severity"]) for v in v4]
+               == [("cross_model_critic_unavailable", "MEDIUM")],
+               f"XM4: one unavailable round → MEDIUM; got {v4}")
+            rc, action, open_ = _cli_pc(md, 2, True)
+            ok(rc == 0 and action == "ACCEPT",
+               f"XM4: MEDIUM unavailability must not block; got {action} {open_}")
+            # XM5: unavailable 3 consecutive rounds → HIGH.
+            d5 = _xm_doc(2, "unavailable", history=[
+                {"round": 0, "status": "UNAVAILABLE"},
+                {"round": 1, "status": "UNAVAILABLE"}])
+            md = _xm_case("xm_unavail3", d5)
+            _, v5 = _load_optional_critique(md, "critique-crossmodel", 2)
+            ok([(v["kind"], v["severity"]) for v in v5]
+               == [("cross_model_critic_unavailable", "HIGH")],
+               f"XM5: 3 consecutive unavailable rounds → HIGH; got {v5}")
+            rc, action, open_ = _cli_pc(md, 2, True)
+            ok(action != "ACCEPT" and "cross_model_critic_unavailable" in open_,
+               f"XM5: HIGH unavailability blocks; got {action} {open_}")
+            # XM6: invalid file → HIGH finding, not exit 3.
+            md = _xm_case("xm_invalid", raw="reviewer: critique-crossmodel\nround: 2\n")
+            rc, action, open_ = _cli_pc(md, 2, True)
+            ok(rc != 3 and action != "ACCEPT" and "cross_model_critic_invalid" in open_,
+               f"XM6: invalid cross-model YAML → HIGH, not schema exit 3; "
+               f"got rc={rc} {action} {open_}")
+
     # --- Summary ---
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)
@@ -8427,6 +8570,15 @@ def main() -> int:
                                                     args.current_round)
         except SchemaError as e:
             schema_errors.append(str(e))
+    # Phase 21 ζ: the cross-model critique is script-written, so a schema
+    # failure is a HIGH finding (not exit 3 → "spawn an agent to fix it").
+    crossmodel_violations = []
+    for reviewer in OPTIONAL_REVIEWERS:
+        doc, viols = _load_optional_critique(args.run_dir, reviewer,
+                                             args.current_round)
+        if doc is not None:
+            critiques[reviewer] = doc
+        crossmodel_violations.extend(viols)
 
     if schema_errors:
         print("SCHEMA ERRORS (fix these before proceeding):", file=sys.stderr)
@@ -8510,6 +8662,7 @@ def main() -> int:
                     f"in the next round; otherwise re-spawn red-team."
                 ),
             })
+        rigor_violations.extend(crossmodel_violations)
         if rigor_violations:
             decision = _incorporate_rigor_violations(
                 decision, rigor_violations,

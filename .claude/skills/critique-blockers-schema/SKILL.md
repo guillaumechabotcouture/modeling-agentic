@@ -18,11 +18,20 @@ Free-form prose critiques let the lead drift into premature ACCEPT. The YAML
 sibling lets the gate be mechanical: if any HIGH blocker is unresolved or any
 critique flags `structural_mismatch`, the writer cannot be spawned.
 
-Three files, one per critique agent:
+One file per critique agent:
 
 - `{run_dir}/critique_methods.yaml`       — ID prefix **M-**
 - `{run_dir}/critique_domain.yaml`        — ID prefix **D-**
 - `{run_dir}/critique_presentation.yaml`  — ID prefix **P-**
+- `{run_dir}/critique_redteam.yaml`       — ID prefix **R-**
+- `{run_dir}/critique_crossmodel.yaml`    — ID prefix **X-** (optional,
+  Phase 21 ζ). Written by `scripts/cross_model_critic.py` (Codex CLI,
+  a different model family), never by an agent: the script assigns ids,
+  preserves `first_seen_round`, and builds `carried_forward`. It may
+  carry `verdict: UNAVAILABLE` (+ `unavailable_reason`) when Codex is
+  down; the validator then reports MEDIUM `cross_model_critic_unavailable`
+  (HIGH after 3 consecutive rounds) and keeps prior open X- blockers open.
+  Its HIGH blockers and `structural_mismatch` count like any critic's.
 
 Each YAML is a sibling to the existing markdown file. Keep the markdown as
 today — prose is still where reviewers do their reasoning. The YAML is the
@@ -151,6 +160,9 @@ modeler work around the gap instead of fixing it.
    - critique-methods       → `M-`
    - critique-domain        → `D-`
    - critique-presentation  → `P-`
+   - critique-redteam       → `R-`
+   - critique-crossmodel    → `X-` (assigned by the script; `X-000` is
+     reserved for "cross-model output invalid")
 
 2. **First round** (`round: 1`): assign IDs in write order, starting at
    `M-001`, `D-001`, `P-001`. Three-digit zero-padded. Do not re-use IDs

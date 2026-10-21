@@ -147,7 +147,8 @@ Before opening a PR, every command below must report
 for f in main.py \
   scripts/allocation_robustness.py scripts/benchmark_match.py \
   scripts/cloud_batch.py scripts/coherence_audit.py \
-  scripts/compare_models.py scripts/effect_size_registry.py \
+  scripts/compare_models.py scripts/cross_model_critic.py \
+  scripts/effect_size_registry.py \
   scripts/effort_floors.py scripts/eligibility_probe.py \
   scripts/figure_validator.py scripts/identifiability.py \
   scripts/identifiability_a_priori.py scripts/numeric_consistency.py \
