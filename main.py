@@ -269,6 +269,9 @@ async def run(question: str, max_rounds: int, max_sessions: int,
             system_prompt=lead_system,
             agents=agents,
             model="claude-opus-5-5",  # A/B baseline: pin only, no Phase 21 changes
+            # A/B infra parity with Phase 21 ι: SDK stream buffer 32 MiB
+            # (default 1 MiB killed B1's session 1 on 2026-10-21).
+            max_buffer_size=32 * 1024 * 1024,
             allowed_tools=["Agent", "Bash", "Read", "Write", "Glob", "Grep"],
             permission_mode="bypassPermissions",
             setting_sources=["project"],
