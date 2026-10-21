@@ -227,6 +227,47 @@ def is_policy_block(error_str: str) -> bool:
     return "usage policy" in low or "acceptable use policy" in low
 
 
+_TERMINAL_STAGES = {"DONE", "COMPLETE", "COMPLETED", "FINISHED", "RUN_FAILED",
+                    "FAILED", "DECLARE_SCOPE", "ACCEPTED"}
+
+
+def pipeline_unfinished(run_path: str) -> str | None:
+    """Phase 21 θ: return a description of where the pipeline stopped if it
+    is clearly unfinished (no report.md and no terminal stage), else None.
+
+    A clean ResultMessage only means the lead ended its turn, not that the
+    pipeline finished; 2026-10-20_213310 ended "success" in round 1 while
+    waiting on background jobs.
+    """
+    if os.path.exists(os.path.join(run_path, "report.md")):
+        return None
+    stage, rnd = None, None
+    try:
+        import yaml
+        with open(os.path.join(run_path, "pipeline_state.yaml")) as f:
+            ps = yaml.safe_load(f) or {}
+        stage = str(ps.get("current_stage") or "").strip().upper() or None
+        rnd = ps.get("current_round")
+    except (OSError, ValueError, AttributeError, ImportError):
+        pass
+    except Exception:  # yaml.YAMLError without importing yaml at module scope
+        pass
+    if stage in _TERMINAL_STAGES:
+        return None
+    return f"stage {stage or 'unknown'}, round {rnd if rnd is not None else 'unknown'}"
+
+
+CONTINUE_PROMPT = (
+    "CONTINUE. Your previous turn ended while the pipeline was unfinished "
+    "({where}); the session closed and nothing ran in the meantime. Do not "
+    "summarize or wait for the user: there is no user in this loop. Check the "
+    "state of any jobs you started, then continue the pipeline from where you "
+    "are. Background execution (run_in_background) is disabled: run long jobs "
+    "with nohup inside a foreground command and poll with bounded loops. Do "
+    "not end your turn until the pipeline reaches a terminal state (report "
+    "written and final gate run, or RUN_FAILED).")
+
+
 def detect_current_round(run_path: str) -> int | None:
     """Highest `round:` across critique_*.yaml (the gate's own input),
     falling back to pipeline_state.yaml."""
@@ -519,7 +560,23 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                     pass
 
             if error_str is None and result_is_success(result):
-                session_outcome = "session_completed"
+                where = pipeline_unfinished(run_path)
+                if where and session_num < max_sessions:
+                    # Phase 21 θ: the lead stopped early; continue the same
+                    # conversation (options.resume = session_id) instead of
+                    # finalizing a half-finished run.
+                    print(f"\nLead ended its turn with the pipeline unfinished "
+                          f"({where}); continuing (session {session_num + 1}).",
+                          flush=True)
+                    with open(trace_path, "a") as tf:
+                        tf.write(json.dumps({"ts": datetime.now().isoformat(),
+                                             "type": "session_continue",
+                                             "session": session_num,
+                                             "where": where}) + "\n")
+                    lead_prompt = CONTINUE_PROMPT.format(where=where)
+                    continue
+                session_outcome = ("session_completed" if not where
+                                   else "max_sessions_reached")
                 break  # lead session finished; the final gate decides the status
 
             if error_str is None:
@@ -915,6 +972,28 @@ def _run_self_test() -> int:
     ok(enforcement.check_tool_use("Bash", {"command": "python3 scripts/cross_model_critic.py runs/x --round 2"},
                                   run_path, None, set(reg)) is None,
        "XM3 lead cannot run cross_model_critic.py")
+
+    # BG1 (Phase 21 θ): background execution denied for every agent.
+    for agent_t in (None, "modeler", "analyst"):
+        ok(enforcement.check_tool_use("Bash", {"command": "python3 x.py", "run_in_background": True},
+                                      run_path, agent_t, set(reg)) == enforcement.BACKGROUND_DENY_REASON,
+           f"BG1 background Bash allowed for {agent_t}")
+    ok(enforcement.check_tool_use("Bash", {"command": "ls"}, run_path, None, set(reg)) is None,
+       "BG1 foreground Bash wrongly denied")
+    # CT1 (Phase 21 θ): unfinished-pipeline detection drives continuation.
+    with tempfile.TemporaryDirectory() as td:
+        ok(pipeline_unfinished(td) is not None, "CT1 empty run dir not unfinished")
+        with open(os.path.join(td, "pipeline_state.yaml"), "w") as f:
+            f.write("current_stage: MODEL\ncurrent_round: 1\n")
+        ok("MODEL" in (pipeline_unfinished(td) or ""), "CT1 MODEL stage not unfinished")
+        with open(os.path.join(td, "pipeline_state.yaml"), "w") as f:
+            f.write("current_stage: RUN_FAILED\ncurrent_round: 8\n")
+        ok(pipeline_unfinished(td) is None, "CT1 RUN_FAILED treated as unfinished")
+        with open(os.path.join(td, "pipeline_state.yaml"), "w") as f:
+            f.write("current_stage: CRITIQUE\n")
+        open(os.path.join(td, "report.md"), "w").write("# r\n")
+        ok(pipeline_unfinished(td) is None, "CT1 report.md present treated as unfinished")
+    ok("{where}" in CONTINUE_PROMPT and "run_in_background" in CONTINUE_PROMPT, "CT1 continue prompt")
 
     # PF1 (Phase 21 α): preflight evaluation.
     exe = sys.executable

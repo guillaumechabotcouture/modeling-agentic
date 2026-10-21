@@ -251,6 +251,16 @@ def bash_reason(command: str, run_path: str, agent_type: str | None,
 # Hook entry point
 # ---------------------------------------------------------------------------
 
+BACKGROUND_DENY_REASON = (
+    "run_in_background is not supported in this pipeline: when you end your "
+    "turn to wait for a background job, the session closes and the pipeline "
+    "stops. Run the command in the foreground instead. For jobs longer than "
+    "the Bash timeout, start them with `nohup ... > <log> 2>&1 &` inside the "
+    "command and poll in the foreground with bounded loops, e.g. "
+    "`for i in $(seq 1 18); do grep -q DONE <log> && break; sleep 30; done; tail -5 <log>`, "
+    "repeating until the job finishes. Never end your turn while work is pending.")
+
+
 def check_tool_use(tool_name: str, tool_input: dict, run_path: str,
                    agent_type: str | None, registered_agents,
                    cwd: str | None = None) -> str | None:
@@ -260,6 +270,13 @@ def check_tool_use(tool_name: str, tool_input: dict, run_path: str,
     registry name otherwise.
     """
     tool_input = tool_input or {}
+    # Phase 21 θ: no background execution. With SDK 0.2.x a one-shot
+    # query() session closes once the agent ends its turn to "wait for the
+    # background job", so the pipeline silently stopped mid-round
+    # (2026-10-20_213310: lead backgrounded UQ + identifiability in round 1,
+    # the stream ended, the run finished with no critique and no report).
+    if tool_input.get("run_in_background") and tool_name in ("Bash", *_AGENT_TOOLS):
+        return (BACKGROUND_DENY_REASON)
     if tool_name in _WRITE_TOOLS:
         path = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
         if path:
