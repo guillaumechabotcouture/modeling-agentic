@@ -201,6 +201,7 @@ class RunVocabulary:
     universe: int | None = None
     outcome_nouns: list[str] = field(default_factory=lambda: list(_DEFAULT_OUTCOME_NOUNS))
     price_units: list[str] = field(default_factory=lambda: list(_DEFAULT_PRICE_UNITS))
+    budget: float | None = None   # the question's envelope (scenario guard)
 
     # -- derived regexes (built lazily) --
     def unit_re(self) -> re.Pattern:
@@ -419,6 +420,110 @@ def _is_table_row(doc_text: str, pos: int) -> bool:
     return line.startswith("|")
 
 
+# --------------------------------------------------------------------------- #
+# Phase 21 precision guards. The before/after retro on 18 historical runs
+# found 2/35 HIGH numeric_drift_extreme findings were real; the rest
+# compared a sentence against a quantity it did not assert ("1 of 12
+# perturbations" read as a package count, "NW + NE + NC receive 61.3%"
+# attributed to NC, a $200M-scenario sentence checked against the $320M
+# CSV, "SA-005" read as 5). A HIGH must only fire when the clause
+# unambiguously asserts the quantity the artifact holds; otherwise abstain.
+# --------------------------------------------------------------------------- #
+
+_CLAUSE_BREAK_RE = re.compile(r"\n|[.;!?](?=\s)|\|")
+
+# Clause words that move a number off the headline allocation: other
+# scenarios, uncertainty summaries, hypotheses, thresholds.
+_OFF_HEADLINE_RE = re.compile(
+    r"\b(?:scenarios?|sensitivity|perturb\w*|alternative|counterfactual|"
+    r"hypothetic\w*|if|would|could|upper|lower|UQ|draws?|mean|median|"
+    r"percentile|level\s*\d|pessimistic|optimistic|status\s+quo|uniform|"
+    r"predict\w*|expected|target|threshold|H\d{1,2}|hypothes\w*|"
+    r"prior\s+round|previous\s+round|round\s+\d|earlier)\b",
+    re.IGNORECASE)
+
+# Clause words marking a count as a subset rather than the allocated total.
+_SUBSET_RE = re.compile(
+    r"\b(?:remaining|only|eligible|covered|uncovered|matched|unmatched|"
+    r"missing|containing|subset|of\s+these|of\s+which|including|excluding|"
+    r"weighted|shift\w*|switch\w*|chang\w*|flip\w*|mov\w*|gain\w*|los[est]\w*|"
+    r"drop\w*|add\w*|new|additional|fewer|more|among|imputed|label(?:ed|led)?)\b",
+    re.IGNORECASE)
+
+# Narrower subset vocabulary for package counts ("Mix: 30 SIA, 20 MCV2"
+# is a package count; "7 IRS units unmatched" and "15 units shift" are not).
+_PACKAGE_SUBSET_RE = re.compile(
+    r"\b(?:remaining|matched|unmatched|missing|imputed|excluding|of\s+these|"
+    r"of\s+which|shift\w*|switch\w*|flip\w*|mov(?:e|es|ed|ing)\b|gain\w*|"
+    r"los[est]\w*|drop\w*|added|additional|new|fewer|more)\b",
+    re.IGNORECASE)
+
+# Immediately before a number: identifiers ("SA-005", "PM-003", "H1",
+# "round 3", "Level 0", "Table 2") and bounds ("> 40%", "up to 30").
+_ID_PREFIX_RE = re.compile(
+    r"(?:[A-Za-z][A-Za-z0-9]{0,6}[-_#.]|[A-Za-z]|§\s*|"
+    r"\b(?:round|level|thread|step|stage|phase|tier|fold|option|version|"
+    r"figure|fig|table|section|model|archetype|cluster|scenario|run|draw|"
+    r"iteration|item|question|criterion|blocker|priority|no)\.?\s+)\Z",
+    re.IGNORECASE)
+_BOUND_PREFIX_RE = re.compile(
+    r"(?:[<>≤≥~]|\bup\s+to|\bat\s+least|\bat\s+most|\bmore\s+than|"
+    r"\bless\s+than|\bfewer\s+than|\bover|\bunder|\bnearly|\babove|\bbelow)\s*\Z",
+    re.IGNORECASE)
+_FRACTION_SUFFIX_RE = re.compile(r"\s*(?:of|out\s+of|/|in)\s+\d", re.IGNORECASE)
+_DOLLAR_AMOUNT_RE = re.compile(
+    r"\$\s*(\d+(?:\.\d+)?)\s*(billion|bn|million|mn|[BMK])\b", re.IGNORECASE)
+
+
+def _clause_span(doc_text: str, start: int, end: int | None = None) -> tuple[int, int]:
+    """(start, end) offsets of the clause (sentence / line / table cell)
+    containing [start, end)."""
+    end = start if end is None else end
+    s = max(0, start - 400) if start > 400 else 0
+    for m in _CLAUSE_BREAK_RE.finditer(doc_text, max(0, start - 400), start):
+        s = m.end()
+    m = _CLAUSE_BREAK_RE.search(doc_text, end)
+    return s, (m.start() if m else len(doc_text))
+
+
+def _clause(doc_text: str, start: int, end: int | None = None) -> str:
+    """The clause (sentence / line / table cell) containing [start, end)."""
+    s, e = _clause_span(doc_text, start, end)
+    return doc_text[s:e]
+
+
+def _id_or_bound_adjacent(doc_text: str, start: int) -> bool:
+    """True when the number at `start` is part of an identifier or a bound."""
+    left = doc_text[max(0, start - 24):start]
+    return bool(_ID_PREFIX_RE.search(left) or _BOUND_PREFIX_RE.search(left))
+
+
+def _mentions_other_budget(clause: str, budget: float | None) -> bool:
+    """True when the clause names a dollar envelope other than the run's
+    budget (a different budget scenario). Amounts within 2% of the run
+    budget, and amounts too small to be an envelope, are ignored."""
+    if not budget:
+        return False
+    for m in _DOLLAR_AMOUNT_RE.finditer(clause):
+        v = float(m.group(1)) * _MAGNITUDE.get(m.group(2).lower(), 1.0)
+        if v >= 0.25 * budget and abs(v - budget) > 0.02 * budget:
+            return True
+    return False
+
+
+def _question_budget(run_dir: str) -> float | None:
+    """The budget envelope named in metadata.json's question, if any."""
+    try:
+        with open(os.path.join(run_dir, "metadata.json")) as f:
+            q = (json.load(f) or {}).get("question") or ""
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return None
+    m = _DOLLAR_AMOUNT_RE.search(q) if isinstance(q, str) else None
+    if not m:
+        return None
+    return float(m.group(1)) * _MAGNITUDE.get(m.group(2).lower(), 1.0)
+
+
 def _drift_pct(claimed: float, authoritative: float) -> float:
     """Relative drift |claimed - authoritative| / |authoritative|.
     Returns 0 if authoritative is 0 (caller must guard)."""
@@ -458,19 +563,37 @@ def _pick_col(rows: list[dict], names: tuple[str, ...]) -> str | None:
     return next((c for c in names if c in cols), None)
 
 
-def _resolve_alloc_path(run_dir: str) -> str | None:
-    """Resolution order (Phase 14 β, Phase 21 γ adds run root/data):
+# Allocation CSVs that are comparators, not the recommended allocation.
+_COMPARATOR_CSV_RE = re.compile(
+    r"status[_-]?quo|uniform|baseline|bau|counterfactual|universal", re.IGNORECASE)
+# A budget tag in a file name ("allocation_optimal_200M.csv").
+_CSV_BUDGET_TAG_RE = re.compile(r"(?<![A-Za-z0-9])(\d+(?:\.\d+)?)\s*([MBK])(?![A-Za-z])",
+                                re.IGNORECASE)
+
+
+def _resolve_alloc_path_ex(run_dir: str) -> tuple[str | None, str]:
+    """Resolve the headline allocation CSV. Returns (path, reason).
+
+    Order (Phase 14 β; Phase 21 γ adds run root/data; Phase 21 precision
+    pass adds scenario handling):
       1. sanity_schema `allocation.canonical_csv`
       2. models/allocation_result.csv (legacy convention)
-      3. first *allocation*.csv alphabetically under models/, run root,
-         data/ — preferring names containing "optim" (the headline)
+      3. *allocation*.csv under models/, run root, data/, excluding
+         comparators (status quo / uniform / baseline). If file names
+         carry budget tags, keep those matching the question's budget.
+         Prefer "optim" names, then the finest granularity (most rows).
+    When two or more candidates remain equally preferred and they are
+    budget- or method-tagged scenario variants, there is no way to know
+    which one the prose describes: return (None, "ambiguous") so checks
+    abstain instead of comparing a sentence to the wrong scenario
+    (2026-04-28_103105 checked $320M prose against the $200M CSV).
     """
     canonical = _load_canonical_alloc_path_from_schema(run_dir)
     if canonical and os.path.exists(canonical):
-        return canonical
+        return canonical, "canonical"
     legacy = os.path.join(run_dir, "models", "allocation_result.csv")
     if os.path.exists(legacy):
-        return legacy
+        return legacy, "legacy"
     cands: list[str] = []
     for d in (os.path.join(run_dir, "models"), run_dir,
               os.path.join(run_dir, "data")):
@@ -478,9 +601,31 @@ def _resolve_alloc_path(run_dir: str) -> str | None:
             cands += [os.path.join(d, e) for e in sorted(os.listdir(d))
                       if "allocation" in e and e.endswith(".csv")]
     if not cands:
-        return None
+        return None, "none"
+    cands = [c for c in cands
+             if not _COMPARATOR_CSV_RE.search(os.path.basename(c))] or cands
+    budget = _question_budget(run_dir)
+    tagged = {c: _CSV_BUDGET_TAG_RE.search(os.path.basename(c)) for c in cands}
+    if budget and any(tagged.values()):
+        def _val(m):
+            return float(m.group(1)) * _MAGNITUDE.get(m.group(2).lower(), 1.0)
+        match = [c for c in cands if tagged[c] and abs(_val(tagged[c]) - budget)
+                 <= 0.02 * budget]
+        cands = match or [c for c in cands if not tagged[c]] or cands
     optim = [c for c in cands if "optim" in os.path.basename(c)]
-    return (optim or cands)[0]
+    cands = optim or cands
+    sized = sorted(((len(_read_csv_rows(c)), c) for c in cands), reverse=True)
+    top = [c for n, c in sized if n == sized[0][0]]
+    if len(top) > 1 and any(tagged.get(c) for c in top):
+        return None, "ambiguous"
+    # Equal size, untagged: keep the deterministic directory order
+    # (models/ before run root before data/).
+    return (top[0] if len(top) == 1 else next(c for c in cands if c in top)), "inferred"
+
+
+def _resolve_alloc_path(run_dir: str) -> str | None:
+    """Back-compat wrapper: the headline allocation CSV path or None."""
+    return _resolve_alloc_path_ex(run_dir)[0]
 
 
 def _load_authoritative(run_dir: str) -> dict:
@@ -531,6 +676,7 @@ def _load_authoritative(run_dir: str) -> dict:
     eval_rows = _read_csv_rows(os.path.join(run_dir, "models",
                                             "package_evaluation.csv"))
     vocab = build_vocabulary(run_dir, alloc_rows=rows, extra_rows=eval_rows)
+    vocab.budget = _question_budget(run_dir)
     auth["vocab"] = vocab
     if rows:
         cost_col = _pick_col(rows, ("total_cost_usd", "cost_3yr", "cost_usd",
@@ -665,6 +811,13 @@ def _scan_unit_prices(doc_text: str, vocab: RunVocabulary
             continue
         unit = m.group(2).lower().replace(" ", "").replace("-", "")
         left = doc_text[max(0, m.start() - 25):m.start()]
+        # Phase 21 precision pass: in "$5.05/case in NW for PBO vs
+        # $8.41/case for standard nets" the second price's label is on
+        # its right; never let it inherit the left-hand comparison's.
+        cut = list(re.finditer(r"\bvs\.?|\bversus\b|\bcompared\s+(?:to|with)\b|"
+                               r"\bwhile\b|\bwhereas\b|\bthan\b", left, re.IGNORECASE))
+        if cut:
+            left = left[cut[-1].end():]
         right = doc_text[m.end():min(len(doc_text), m.end() + 30)]
         ctx = doc_text[max(0, m.start() - 60):min(len(doc_text), m.end() + 60)]
         out.append((val, unit, _entity_key(left, vocab), right, ctx))
@@ -710,6 +863,18 @@ def _normalize_package_token(tok: str) -> str:
     return re.sub(r"[\s\-+]+", "_", tok.strip().lower())
 
 
+def _off_headline(doc_text: str, start: int, end: int,
+                  vocab: RunVocabulary) -> bool:
+    """Phase 21 precision pass: True when the number at [start, end) is
+    an identifier / bound, or its clause is about another scenario, an
+    uncertainty summary, a hypothesis, or a different budget."""
+    if _id_or_bound_adjacent(doc_text, start):
+        return True
+    clause = _clause(doc_text, start, end)
+    return bool(_OFF_HEADLINE_RE.search(clause)
+                or _mentions_other_budget(clause, vocab.budget))
+
+
 def _scan_unit_counts(doc_text: str, vocab: RunVocabulary | None = None
                       ) -> list[tuple[int, str, str, str]]:
     """Find labeled allocation-unit counts that refer to the TOTAL
@@ -736,6 +901,9 @@ def _scan_unit_counts(doc_text: str, vocab: RunVocabulary | None = None
         seen_positions.add(m.start())
         if universe is not None and total == universe:
             continue  # "X of <universe>" is coverage/accuracy, not allocation
+        if _off_headline(doc_text, m.start(), m.end(), vocab) or \
+                _SUBSET_RE.search(_clause(doc_text, m.start(), m.end())):
+            continue
         left = doc_text[max(0, m.start() - 30):m.start()]
         right = doc_text[m.end():min(len(doc_text), m.end() + 30)]
         if _has_zone_qualifier(left + " " + right, vocab):
@@ -758,6 +926,15 @@ def _scan_unit_counts(doc_text: str, vocab: RunVocabulary | None = None
         left = doc_text[max(0, m.start() - 30):m.start()]
         right = doc_text[m.end():min(len(doc_text), m.end() + 30)]
         if _has_zone_qualifier(left + " " + right, vocab):
+            continue
+        # Phase 21 precision pass: a count is the allocated TOTAL only
+        # when its clause names no package, zone, subset word, other
+        # scenario, or possessive universe ("the country's 47 counties").
+        clause = _clause(doc_text, m.start(), m.end())
+        if (_off_headline(doc_text, m.start(), m.end(), vocab)
+                or _SUBSET_RE.search(clause)
+                or vocab.find_packages(clause) or vocab.has_zone(clause)
+                or re.search(r"['’]s\s*\Z", left)):
             continue
         lw, rw = left.lower(), right.lower()
         if universe is not None and (f"of {universe}" in rw[:12]):
@@ -819,6 +996,22 @@ def _scan_package_counts(doc_text: str, vocab: RunVocabulary | None = None
         left = doc_text[max(0, m.start() - 30):m.start()]
         right = doc_text[m.end() + pe:min(len(doc_text), m.end() + pe + 30)]
         if _has_zone_qualifier(left + " " + right, vocab):
+            continue
+        # Phase 21 precision pass: identifiers ("SA-001 PBO"), fractions,
+        # class words ("SMC-eligible", "SMC-containing"), per-zone or
+        # off-headline clauses are not package-assignment counts.
+        clause = _clause(doc_text, m.start(), m.end() + pe)
+        if (_off_headline(doc_text, m.start(), m.end() + pe, vocab)
+                or _FRACTION_SUFFIX_RE.match(doc_text, m.end(1))
+                or re.match(r"[-\s]?(?:eligible|containing|based|only)\b",
+                            doc_text[m.end() + pe:], re.IGNORECASE)
+                # "1 dual-AI archetype" counts analysis groups, not units.
+                or re.match(r"\s*(?:[\w-]+\s+)?(?:archetypes?|clusters?|strat(?:a|um)|"
+                            r"groups?|categor\w+|types?|scenarios?|options?|draws?|"
+                            r"perturbations?|runs?|levels?|tiers?|arms?)\b",
+                            doc_text[m.end() + pe:], re.IGNORECASE)
+                or _PACKAGE_SUBSET_RE.search(clause)
+                or vocab.has_zone(clause)):
             continue
         ctx = doc_text[max(0, m.start() - 60):min(len(doc_text), m.end() + 60)]
         out.append((n, pid, ctx))
@@ -958,7 +1151,19 @@ def _check_count_drift(run_dir: str, auth: dict,
                     continue
                 if any(tok in left_window.lower() for tok in non_headline):
                     continue
-                zone = _closest_zone(left_window, vocab, from_right=False)
+                # Phase 21 precision pass: the zone must come from the
+                # share's own clause, and a clause naming several zones
+                # ("NW + NE + NC receive 61.3%") is an aggregate, not a
+                # per-zone share.
+                clause = _clause(text, pos)
+                if _off_headline(text, pos, pos + 1, vocab):
+                    continue
+                if len({z for _s, _e, z in vocab.find_zones(clause)}) > 1:
+                    continue
+                cs = text.rfind(clause, max(0, pos - 400), pos + 1) \
+                    if clause else pos
+                left_clause = text[max(cs, pos - 40):pos] if cs >= 0 else left_window
+                zone = _closest_zone(left_clause, vocab, from_right=False)
                 if zone is None:
                     zone = _closest_zone(right_window, vocab, from_right=True,
                                          require_no_sentence_break=True)
@@ -1088,8 +1293,7 @@ def check_numeric_consistency(run_dir: str,
                 continue
             # "$X for <other package>" attributes the price to a
             # different entity than the label on the left.
-            if re.match(r"\s*(?:\)|,)?\s*for\s+(?:the\s+)?\w", right, re.I) \
-                    and vocab.find_packages(right[:30]):
+            if re.match(r"\s*(?:\)|,)?\s*for\s+(?:the\s+)?\w", right, re.I):
                 continue
             groups.setdefault((key, unit), []).append((val, ctx))
         for (key, unit), vals in groups.items():
@@ -1686,6 +1890,96 @@ def _run_self_test() -> int:
         v = check_numeric_consistency(d)
         ok(not any(x["kind"] == "same_doc_inconsistency" for x in v),
            f"T23: unit-acronym keys must not group, got {v}")
+
+    # ---- Phase 21 precision pass (before/after retro on 18 runs) ------ #
+    # Generic fixture: 98 districts on school_vax, 20 on routine_cov, two
+    # regions. Question budget $40M so other-budget sentences are known.
+    def _prec_run(d, text, fname="report.md", extra_csvs=None, question=None):
+        rows = ([{"district": f"a{i}", "zone": "Region A", "package": "school_vax",
+                  "cost_usd": 100_000} for i in range(98)]
+                + [{"district": f"b{i}", "zone": "Region B", "package": "routine_cov",
+                    "cost_usd": 1_100_000} for i in range(20)])
+        write_alloc(d, rows)
+        for name, rs in (extra_csvs or {}).items():
+            os.remove(os.path.join(d, "models", "allocation_result.csv"))
+            p_ = os.path.join(d, "models", name)
+            with open(p_, "w") as f:
+                f.write("district,zone,package,cost_usd\n")
+                for r in rs:
+                    f.write(f"{r['district']},{r['zone']},{r['package']},{r['cost_usd']}\n")
+        with open(os.path.join(d, "metadata.json"), "w") as f:
+            json.dump({"question": question or
+                       "Allocate a fixed $40M budget across districts."}, f)
+        with open(os.path.join(d, fname), "w") as f:
+            f.write(text)
+        return [x for x in check_numeric_consistency(d) if x["severity"] == "HIGH"]
+
+    # P1 (TP): a stated package count that the CSV contradicts still fires.
+    with tempfile.TemporaryDirectory() as d:
+        v = _prec_run(d, "Allocation summary: 142 school-vax districts and "
+                         "20 routine-cov districts.\n")
+        ok(any("school_vax" in x["claim"] and "142" in x["claim"] for x in v),
+           f"P1: 142 vs 98 package count must fire HIGH, got {v}")
+    # P2 (TP): a single-region budget share the CSV contradicts still fires
+    # (Region A = 9.8M / 31.8M = 30.8%).
+    with tempfile.TemporaryDirectory() as d:
+        v = _prec_run(d, "Region A receives 52% of the budget.\n")
+        ok(any("52.0% of budget" in x["claim"] for x in v),
+           f"P2: 52% vs 30.8% share must fire HIGH, got {v}")
+    # P3-P9 (FP patterns from the retro) must stay silent.
+    for tag, text in (
+        ("P3 fraction + identifier", "One perturbation (1 of 12 perturbations "
+         "flips the primary recommendation: SA-001 school-vax OR at upper CI).\n"),
+        ("P4 identifier", "Worst case: SA-005 routine-cov cost +10%.\n"),
+        ("P5 multi-region aggregate", "Region A + Region B receive 61.3% of the budget.\n"),
+        ("P6 other scenario", "Under the $200M scenario, 394 districts receive "
+         "routine-cov and 70% of budget goes to Region A.\n"),
+        ("P7 subset of total", "The remaining 400 districts receive routine coverage. "
+         "School-vax packages are allocated to 60 districts eligible for campaigns.\n"),
+        ("P8 hypothesis bound", "### H4: Optimal allocation directs >40% of budget "
+         "to Region A\n"),
+        ("P9 possessive universe", "We allocate across the country's 774 districts.\n"),
+        ("P10 analysis groups", "The allocation includes 1 school-vax archetype.\n"),
+    ):
+        with tempfile.TemporaryDirectory() as d:
+            v = _prec_run(d, text)
+            ok(not v, f"{tag}: must abstain, got {v}")
+    # P11: price label on the right ("for routine") is not attributed to the
+    # left-hand comparison's entity.
+    with tempfile.TemporaryDirectory() as d:
+        make_run_dir(d, pkg_eval_rows=[
+            {"archetype": "a", "zone": "Region A", "package": "school_vax",
+             "cost_per_case_averted": 5.05}])
+        with open(os.path.join(d, "results.md"), "w") as f:
+            f.write("Cheaper per case ($5.05/case in Region A for school-vax vs "
+                    "$8.41/case for routine coverage).\n")
+        v = [x for x in check_numeric_consistency(d) if x["severity"] == "HIGH"]
+        ok(not v, f"P11: right-labelled price must not be misattributed, got {v}")
+    # P12: several budget-tagged scenario CSVs that all match the question
+    # budget → ambiguous → abstain; exactly one match → that file is used.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        for name in ("allocation_optimal_40M.csv", "allocation_optimal_alt_40M.csv",
+                     "allocation_optimal_60M.csv"):
+            with open(os.path.join(d, "models", name), "w") as f:
+                f.write("district,zone,package,cost_usd\nd1,Region A,school_vax,1\n")
+        with open(os.path.join(d, "metadata.json"), "w") as f:
+            json.dump({"question": "Allocate a fixed $40M budget."}, f)
+        ok(_resolve_alloc_path_ex(d) == (None, "ambiguous"),
+           f"P12: tied scenario CSVs must abstain, got {_resolve_alloc_path_ex(d)}")
+        os.remove(os.path.join(d, "models", "allocation_optimal_alt_40M.csv"))
+        ok(os.path.basename(_resolve_alloc_path(d) or "") == "allocation_optimal_40M.csv",
+           f"P12: budget-matching CSV must be chosen, got {_resolve_alloc_path(d)}")
+    # P13: finest-granularity CSV wins over an aggregate one; comparators
+    # (uniform / status quo) are never the headline.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        for name, n in (("archetype_allocation.csv", 5), ("unit_allocation.csv", 50),
+                        ("allocation_uniform.csv", 80)):
+            with open(os.path.join(d, "models", name), "w") as f:
+                f.write("unit,package,cost_usd\n" + "".join(f"u{i},x,1\n" for i in range(n)))
+        ok(os.path.basename(_resolve_alloc_path(d) or "") == "unit_allocation.csv",
+           f"P13: expected unit_allocation.csv, got {_resolve_alloc_path(d)}")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)

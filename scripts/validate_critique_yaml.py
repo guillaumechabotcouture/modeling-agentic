@@ -176,6 +176,18 @@ _NON_DECLARABLE_KINDS = frozenset({
 })
 _NON_DECLARABLE_SUFFIXES = ("_invalid", "_unknown_verdict",
                             "_not_script_produced", "_stale")
+# Phase 21 (before/after controlled retro): a NaN / null / wrong-type
+# metric in a structured script output is a broken artifact, not a
+# limitation — fixing it is always possible, so it must not be
+# scope-declarable. decision_rule_malformed is excluded: it judges prose.
+_NON_DECLARABLE_KINDS = _NON_DECLARABLE_KINDS | frozenset({
+    "allocation_robustness_malformed",
+    "optimization_quality_malformed",
+    "plan_criteria_malformed",
+    "sensitivity_analysis_malformed",
+    "universal_coverage_malformed",
+    "within_zone_heterogeneity_malformed",
+})
 
 
 def _manifest_non_declarable_prefixes() -> tuple[str, ...]:

@@ -126,6 +126,60 @@ def _read_yaml_field(path: str, field: str) -> str | None:
     return str(cur) if cur is not None else None
 
 
+# Phase 21 precision pass. The before/after retro labelled 83 HIGH
+# label-coherence hits on 18 historical runs: 15 were real (prose
+# asserting a different verdict for the recommendation, e.g. results.md
+# "verdict: UNSTABLE" while the YAML says SENSITIVE). The rest matched the
+# bare English word: "ROBUST threshold = 0.70", "Spearman 0.983 (ROBUST)",
+# "geographic prioritization is robust", "verdict corrected from
+# UNSTABLE", "not a robust result". A mention now counts only when it
+# asserts a verdict about the recommendation.
+_LABEL_THRESHOLD_RE = re.compile(
+    r"threshold|cut-?off|criteri\w*|defin\w*|→|->|[<>≤≥]|=\s*\d", re.IGNORECASE)
+_LABEL_OTHER_METRIC_RE = re.compile(
+    r"spearman|\brho\b|rank\s+correlation|concordance|\bLOO\b|cross-?valid\w*|"
+    r"\bfolds?\b|\bUQ\b|\bdraws?\b|monte\s+carlo|\bCI\b|confidence\s+interval|"
+    r"effect\s+size", re.IGNORECASE)
+_LABEL_META_RE = re.compile(
+    r"corrected\s+from|changed\s+from|previously|still\s+(?:says|references|reads)|"
+    r"in\s+prose|instead\s+of|rather\s+than|was\s+(?:reported|labell?ed)|"
+    r"authoritative", re.IGNORECASE)
+_LABEL_SUBCLAIM_RE = re.compile(
+    r"geograph\w*|zone[- ]level|zonal|regional|qualitative|direction\w*|"
+    r"ranking|prioriti[sz]\w*|effect\s+size|finding", re.IGNORECASE)
+_LABEL_RECOMMENDATION_RE = re.compile(
+    r"recommend\w*|primary|dominan\w*|decision\s+rule|verdict|package", re.IGNORECASE)
+_LABEL_SENSITIVITY_CONTEXT_RE = re.compile(
+    r"sensitivity|perturb\w*|\bSA-?\d|with\s+respect\s+to|across\s+all", re.IGNORECASE)
+
+
+def _asserts_verdict(text: str, start: int, end: int) -> bool:
+    """True when the label mention at [start, end) asserts a sensitivity
+    verdict about the recommendation (see the precision note above)."""
+    clause = _nc._clause(text, start, end)
+    near = text[max(0, start - 30):min(len(text), end + 30)]
+    word = text[start:end]
+    if _LABEL_META_RE.search(clause):
+        return False
+    if word.isupper() and re.search(r"\bverdict\W{0,4}\Z", text[max(0, start - 15):start],
+                                    re.IGNORECASE):
+        return True  # "verdict: UNSTABLE" is an assertion whatever follows
+    if _LABEL_THRESHOLD_RE.search(near) or _LABEL_OTHER_METRIC_RE.search(clause):
+        return False
+    if re.search(r"\b(?:not|never|no\s+longer)\s+(?:a\s+|an\s+|as\s+)?\Z",
+                 text[max(0, start - 20):start], re.IGNORECASE):
+        return False
+    if _LABEL_SUBCLAIM_RE.search(clause) and not _LABEL_RECOMMENDATION_RE.search(clause):
+        return False
+    if word.isupper():
+        return True  # an ALL-CAPS verdict token
+    # Lower-case prose only counts as a predicate over sensitivity results:
+    # "the recommendation is robust across all tested perturbations".
+    return bool(_LABEL_SENSITIVITY_CONTEXT_RE.search(clause)
+                and re.search(r"\b(?:is|are|remains?|was|were|be|becomes?)\s+(?:\w+\s+){0,2}\Z",
+                              text[max(0, start - 40):start], re.IGNORECASE))
+
+
 def _audit_label_coherence(run_dir: str) -> list[dict]:
     """For each canonical (yaml, field) pair, scan prose files for
     mentions of OTHER allowed values. Each such mention is a drift.
@@ -159,6 +213,8 @@ def _audit_label_coherence(run_dir: str) -> list[dict]:
                         win_end = min(len(text), m.end() + 25)
                         window = text[win_start:win_end].lower()
                         if any(q in window for q in src["generic_use_qualifiers"]):
+                            continue
+                        if not _asserts_verdict(text, m.start(), m.end()):
                             continue
                         # Compute approximate line number for the location
                         # field. Cheap: count newlines up to the match.
@@ -258,11 +314,25 @@ def _scan_dollar_amount_with_package(doc_text: str,
     amount_re = re.compile(
         r"[^.|\n]{0,60}?\$\s*([\d.,]+)\s*(?:(M|million|K|k|thousand|B|billion)\b)?",
         re.IGNORECASE)
+    prev_end = -10
     for ps, pe, pid in vocab.find_packages(doc_text):
+        # Phase 21 precision pass: an alias directly continuing the
+        # previous package name ("dual-AI LLIN": the shared token "LLIN"
+        # is the base package's alias) is part of that name.
+        continues = ps - prev_end <= 2 and not doc_text[prev_end:ps].strip(" -")
+        prev_end = pe
+        if continues:
+            continue
         if _nc._joined_combination(doc_text, pe, vocab):
             continue  # "X+Y costs $…" names a combination, not package X
         m = amount_re.match(doc_text, pe)
         if m is None or re.search(r"\bif\b", m.group(0), re.IGNORECASE):
+            continue
+        # Phase 21 precision pass: the amount belongs to the nearest
+        # package before it — "dual-AI accounts for $293.6M and PBO …"
+        # must not attribute a later amount across another package.
+        between = doc_text[pe:m.start() + m.group(0).rfind("$")]
+        if vocab.find_packages(between):
             continue
         dollar_start = m.start() + m.group(0).rfind("$")
         try:
@@ -283,7 +353,12 @@ def _scan_dollar_amount_with_package(doc_text: str,
         ctx_start = max(0, ps - 80)
         ctx_end = min(len(doc_text), m.end() + 80)
         ctx = doc_text[ctx_start:ctx_end].replace("\n", " ")
-        if any(mk in ctx.lower() for mk in _HYPOTHETICAL_MARKERS):
+        # Phase 21 precision pass: hypothetical framing is read from the
+        # clause up to the amount plus a short tail ("$450M would be
+        # required"), not from a trailing justification 80 chars later.
+        _cs, _ce = _nc._clause_span(doc_text, ps, m.end())
+        frame = doc_text[_cs:min(_ce, m.end() + 30)].lower()
+        if any(mk in frame for mk in _HYPOTHETICAL_MARKERS):
             continue
         phrase = doc_text[dollar_start:min(len(doc_text), m.end() + 40)]
         if any(p.match(phrase) for p in _BUDGET_POOL_PATTERNS):
@@ -291,6 +366,24 @@ def _scan_dollar_amount_with_package(doc_text: str,
         if _PER_UNIT_SUFFIX_RE.match(doc_text, m.end()):
             continue
         if _nc._is_table_row(doc_text, ps):
+            continue
+        # Phase 21 precision pass: other scenarios / budgets, the run's
+        # own envelope, and money left unspent are not package costs.
+        # Only the clause text up to the amount decides: a trailing
+        # justification ("… because it is below the CE threshold") does
+        # not turn a stated cost into a hypothetical.
+        cs, _ce = _nc._clause_span(doc_text, ps, m.end())
+        lead = doc_text[cs:m.end()]
+        if (_nc._id_or_bound_adjacent(doc_text, dollar_start)
+                or _nc._OFF_HEADLINE_RE.search(lead)
+                # other envelopes named BEFORE the claimed amount ("At $60M,
+                # X would reach $20M"); the claim's own amount is not one.
+                or _nc._mentions_other_budget(doc_text[cs:dollar_start], vocab.budget)
+                or re.search(r"\b(?:unallocated|unspent|leav\w*|remain\w*|left\s+over|"
+                             r"saved|savings|headroom)\b",
+                             _nc._clause(doc_text, ps, m.end()), re.IGNORECASE)):
+            continue
+        if vocab.budget and abs(amt - vocab.budget) <= 0.02 * vocab.budget:
             continue
         out.append({
             "package_token": pid,
@@ -312,15 +405,22 @@ def _audit_cross_file_counts(run_dir: str) -> list[dict]:
     if rows is None or not rows:
         return violations
     vocab = _nc.build_vocabulary(run_dir, alloc_rows=rows)
+    vocab.budget = _nc._question_budget(run_dir)
 
     pkg_col = _nc._pick_col(rows, _PACKAGE_COLUMNS)
     pkg_counts: dict[str, int] = {}
     pkg_costs: dict[str, float] = {}
+    # Phase 21 precision pass: count only FUNDED units (cost > 0, or an
+    # allocated/funded flag). A CSV with neither signal is a candidate
+    # table (every unit's best package before the budget cut) — counting
+    # its rows compared "172 funded PBO+SMC LGAs" against 404 candidates.
+    has_cost = any(c in rows[0] for c in _COST_COLUMNS)
+    flag_col = next((c for c in ("allocated", "funded", "selected")
+                     if c in rows[0]), None)
     for r in rows:
         pkg = (r.get(pkg_col) or "").strip().lower() if pkg_col else ""
         if not pkg:
             continue
-        pkg_counts[pkg] = pkg_counts.get(pkg, 0) + 1
         cost = 0.0
         for col in _COST_COLUMNS:
             v = r.get(col)
@@ -330,7 +430,13 @@ def _audit_cross_file_counts(run_dir: str) -> list[dict]:
                     break
                 except (TypeError, ValueError):
                     continue
+        funded = (str(r.get(flag_col, "")).strip().lower() in ("true", "1", "yes")
+                  if flag_col else cost > 0)
+        if funded:
+            pkg_counts[pkg] = pkg_counts.get(pkg, 0) + 1
         pkg_costs[pkg] = pkg_costs.get(pkg, 0.0) + cost
+    if not (has_cost or flag_col):
+        pkg_counts = {}
 
     for prose_file in ("report.md", "decision_rule.md", "results.md"):
         ppath = os.path.join(run_dir, prose_file)
@@ -381,6 +487,8 @@ def _audit_cross_file_counts(run_dir: str) -> list[dict]:
             toks = _pkg_tokens(pkg_id)
             canonical_b = sum(c for k, c in pkg_costs.items()
                               if toks <= _pkg_tokens(k))
+            if canonical_a == 0 and canonical_b == 0:
+                continue  # package not funded: prose is a comparison/counterfactual
             drift_a = abs(amt - canonical_a) / max(canonical_a, 1)
             drift_b = abs(amt - canonical_b) / max(canonical_b, 1)
             if drift_a > _COUNT_DRIFT_THRESHOLD and \
@@ -1390,6 +1498,87 @@ def _self_test() -> int:
                     "$12M/40 under the uniform rule.\n")
         v = _audit_cross_file_counts(d)
         ok(not v, f"T27b: '$12M/40' is a per-unit share, got {v}")
+
+    # ---- Phase 21 precision pass (before/after retro on 18 runs) ------ #
+    def _label_run(d, verdict, text, fname="results.md"):
+        os.makedirs(os.path.join(d, "models"), exist_ok=True)
+        with open(os.path.join(d, "models", "sensitivity_analysis.yaml"), "w") as f:
+            yaml.safe_dump({"verdict": verdict, "load_bearing_parameters": []}, f)
+        with open(os.path.join(d, fname), "w") as f:
+            f.write(text)
+        return _audit_label_coherence(d)
+
+    # LP1/LP2 (TP): prose asserts a different verdict for the recommendation.
+    with tempfile.TemporaryDirectory() as d:
+        v = _label_run(d, "SENSITIVE", "The primary recommendation is ROBUST "
+                       "across all tested perturbations.\n")
+        ok(any(x["drifted_value"] == "ROBUST" for x in v), f"LP1 must fire, got {v}")
+    with tempfile.TemporaryDirectory() as d:
+        v = _label_run(d, "SENSITIVE", "Sensitivity verdict: UNSTABLE (two "
+                       "perturbations flip the package; 95% CI excludes zero).\n")
+        ok(any(x["drifted_value"] == "UNSTABLE" for x in v), f"LP2 must fire, got {v}")
+    with tempfile.TemporaryDirectory() as d:
+        v = _label_run(d, "UNSTABLE", "The school-vax recommendation is robust "
+                       "across all sensitivity perturbations.\n")
+        ok(any(x["drifted_value"] == "ROBUST" for x in v), f"LP3 must fire, got {v}")
+    # LN1-LN6 (FP patterns): thresholds, other metrics, sub-claims about
+    # another quantity, meta-text, negation, generic adjectives.
+    for tag, verdict, text in (
+        ("LN1 threshold", "SENSITIVE", "FRAGILE threshold = 0.40; ROBUST threshold = 0.70.\n"),
+        ("LN2 other metric", "SENSITIVE", "Worst-fold Spearman rho of 0.98 (ROBUST) "
+         "but concordance 76%.\n"),
+        ("LN3 sub-claim", "SENSITIVE", "Geographic prioritization (Region A first) is "
+         "robust across all parameter perturbations.\n"),
+        ("LN4 meta", "SENSITIVE", "The verdict was corrected from UNSTABLE to SENSITIVE "
+         "in the authoritative YAML.\n"),
+        ("LN5 negation", "SENSITIVE", "This is not a robust epidemiological result.\n"),
+        ("LN6 adjective", "SENSITIVE", "The effect size is robust (narrow CI: 0.25-0.29) "
+         "and the evidence base is the most robust finding here.\n"),
+    ):
+        with tempfile.TemporaryDirectory() as d:
+            v = _label_run(d, verdict, text)
+            ok(not v, f"{tag}: must not fire, got {v}")
+
+    # CP1 (TP) / CN1-CN4 (FP): package-cost claims against the CSV.
+    def _cost_run(d, text, rows=None, question="Allocate a fixed $40M budget."):
+        os.makedirs(os.path.join(d, "models"), exist_ok=True)
+        rows = rows or ([{"unit": f"a{i}", "zone": "Region A", "package": "school_vax",
+                          "cost_usd": 640_000} for i in range(13)]
+                        + [{"unit": f"b{i}", "zone": "Region B", "package": "routine_cov",
+                            "cost_usd": 1_000_000} for i in range(30)])
+        cols = list(rows[0].keys())
+        with open(os.path.join(d, "models", "allocation_result.csv"), "w") as f:
+            f.write(",".join(cols) + "\n")
+            for r in rows:
+                f.write(",".join(str(r[c]) for c in cols) + "\n")
+        with open(os.path.join(d, "metadata.json"), "w") as f:
+            json.dump({"question": question}, f)
+        with open(os.path.join(d, "decision_rule.md"), "w") as f:
+            f.write(text)
+        return [x for x in _audit_cross_file_counts(d) if x["severity"] == "HIGH"]
+
+    with tempfile.TemporaryDirectory() as d:
+        v = _cost_run(d, "One exception: unit a1 receives school-vax at a cost of "
+                         "$12.6M because its cost per case is below the CE threshold.\n")
+        ok(any("school_vax" in x["claim"] and "$12.6M" in x["claim"] for x in v),
+           f"CP1: $12.6M vs $8.3M school-vax cost must fire, got {v}")
+    for tag, text in (
+        ("CN1 run envelope", "School-vax entry at $40M is cost-effective.\n"),
+        ("CN2 unspent", "The optimizer selects zero routine-cov, leaving $9.0M unallocated.\n"),
+        ("CN3 other package between", "School-vax lags; routine-cov accounts for $30.0M.\n"),
+        ("CN4 other scenario", "At $60M, school-vax would reach $20.0M of spend.\n"),
+        ("CN6 multi-word name", "By package, routine-cov school accounts for $30.0M "
+         "and school-vax accounts for $8.3M.\n"),
+    ):
+        with tempfile.TemporaryDirectory() as d:
+            v = _cost_run(d, text)
+            ok(not v, f"{tag}: must not fire, got {v}")
+    # CN5: a candidate table (no cost / funded column) gives no count findings.
+    with tempfile.TemporaryDirectory() as d:
+        rows = [{"unit": f"u{i}", "package": "school_vax", "cost_per_unit": 10}
+                for i in range(40)]
+        v = _cost_run(d, "Allocation: 12 school-vax units.\n", rows=rows)
+        ok(not v, f"CN5: candidate table must not yield counts, got {v}")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)
