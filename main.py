@@ -167,6 +167,49 @@ def log_message(message, trace_file):
     trace_file.flush()
 
 
+# --- A/B infra parity with Phase 21 θ (copied verbatim) ---
+_TERMINAL_STAGES = {"DONE", "COMPLETE", "COMPLETED", "FINISHED", "RUN_FAILED",
+                    "FAILED", "DECLARE_SCOPE", "ACCEPTED"}
+
+
+def pipeline_unfinished(run_path: str) -> str | None:
+    """Phase 21 θ: return a description of where the pipeline stopped if it
+    is clearly unfinished (no report.md and no terminal stage), else None.
+
+    A clean ResultMessage only means the lead ended its turn, not that the
+    pipeline finished; 2026-10-20_213310 ended "success" in round 1 while
+    waiting on background jobs.
+    """
+    if os.path.exists(os.path.join(run_path, "report.md")):
+        return None
+    stage, rnd = None, None
+    try:
+        import yaml
+        with open(os.path.join(run_path, "pipeline_state.yaml")) as f:
+            ps = yaml.safe_load(f) or {}
+        stage = str(ps.get("current_stage") or "").strip().upper() or None
+        rnd = ps.get("current_round")
+    except (OSError, ValueError, AttributeError, ImportError):
+        pass
+    except Exception:  # yaml.YAMLError without importing yaml at module scope
+        pass
+    if stage in _TERMINAL_STAGES:
+        return None
+    return f"stage {stage or 'unknown'}, round {rnd if rnd is not None else 'unknown'}"
+
+
+CONTINUE_PROMPT = (
+    "CONTINUE. Your previous turn ended while the pipeline was unfinished "
+    "({where}); the session closed and nothing ran in the meantime. Do not "
+    "summarize or wait for the user: there is no user in this loop. Check the "
+    "state of any jobs you started, then continue the pipeline from where you "
+    "are. Background execution (run_in_background) is disabled: run long jobs "
+    "with nohup inside a foreground command and poll with bounded loops. Do "
+    "not end your turn until the pipeline reaches a terminal state (report "
+    "written and final gate run, or RUN_FAILED).")
+
+
+
 async def run(question: str, max_rounds: int, max_sessions: int,
               run_dir: str | None = None, run_path: str | None = None) -> None:
     """Run the modeling pipeline as a single lead agent session."""
@@ -243,6 +286,12 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                     session_id = getattr(message, "session_id", None)
 
             trace_file.close()
+            where = pipeline_unfinished(run_path)
+            if where and session_num < max_sessions:
+                print(f"\nLead ended its turn with the pipeline unfinished "
+                      f"({where}); continuing (session {session_num + 1}).", flush=True)
+                lead_prompt = CONTINUE_PROMPT.format(where=where)
+                continue
             terminal_status = "completed"
             break  # Pipeline completed successfully
 

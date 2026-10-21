@@ -960,6 +960,9 @@ def build_lead_prompt(question: str, run_dir: str, max_rounds: int,
 # Hooks
 # ---------------------------------------------------------------------------
 
+BACKGROUND_DENY_REASON = 'run_in_background is not supported in this pipeline: when you end your turn to wait for a background job, the session closes and the pipeline stops. Run the command in the foreground instead. For jobs longer than the Bash timeout, start them with `nohup ... > <log> 2>&1 &` inside the command and poll in the foreground with bounded loops, e.g. `for i in $(seq 1 18); do grep -q DONE <log> && break; sleep 30; done; tail -5 <log>`, repeating until the job finishes. Never end your turn while work is pending.'
+
+
 def create_hooks(run_path: str, trace_file, start_time: datetime):
     """Create hook config for the lead query() session."""
 
@@ -994,6 +997,13 @@ def create_hooks(run_path: str, trace_file, start_time: datetime):
         tool_input = input_data.get("tool_input", {})
         agent_id = input_data.get("agent_id", "lead")
         per_agent_tool_counts[agent_id] = per_agent_tool_counts.get(agent_id, 0) + 1
+        # A/B infra parity with Phase 21 θ (SDK 0.2.x closes the session when
+        # an agent waits on a background job). Identical text in both arms.
+        if (tool_input or {}).get("run_in_background") and tool_name in ("Bash", "Agent", "Task"):
+            print(f"[{agent_id:>12}] DENIED background {tool_name}", flush=True)
+            return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": BACKGROUND_DENY_REASON}}
         summary = _format_tool(tool_name, tool_input)
         elapsed = (datetime.now() - start_time).total_seconds()
         label = agent_id if agent_id != "lead" else "lead"
