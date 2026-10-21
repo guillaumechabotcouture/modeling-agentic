@@ -395,7 +395,7 @@ def write_harness_baseline(run_path: str) -> tuple[dict, dict | None]:
 
 async def run(question: str, max_rounds: int, max_sessions: int,
               run_dir: str | None = None, run_path: str | None = None,
-              allow_cloud: bool = False) -> str:
+              allow_cloud: bool = False, cross_model: bool = False) -> str:
     """Run the modeling pipeline as a single lead agent session.
 
     Returns the terminal status written to metadata.json.
@@ -410,7 +410,8 @@ async def run(question: str, max_rounds: int, max_sessions: int,
     print(f"Run: {run_dir_rel}/", flush=True)
     print(f"Question: {question}", flush=True)
     print(f"Max rounds: {max_rounds} | Max sessions: {max_sessions}"
-          f" | Cloud: {'on' if allow_cloud else 'off'}", flush=True)
+          f" | Cloud: {'on' if allow_cloud else 'off'}"
+          f" | Cross-model: {'on' if cross_model else 'off'}", flush=True)
 
     run_start = datetime.now()
     trace_path = os.path.join(run_path, "trace.jsonl")
@@ -424,7 +425,12 @@ async def run(question: str, max_rounds: int, max_sessions: int,
     lead_system = LEAD_SYSTEM_PROMPT.replace("{run_dir}", run_dir_rel).replace(
         "{max_rounds}", str(max_rounds)
     )
-    lead_prompt = build_lead_prompt(question, run_dir_rel, max_rounds, resume_context)
+    lead_prompt = build_lead_prompt(question, run_dir_rel, max_rounds, resume_context,
+                                    cross_model=cross_model)
+    prior_meta["cross_model"] = cross_model
+    prior_meta["models"] = {"deep": enforcement.MODEL_DEEP, "fast": enforcement.MODEL_FAST}
+    with open(metadata_path, "w") as f:
+        json.dump(prior_meta, f, indent=2)
     env_overrides = enforcement.filtered_env(dict(os.environ), allow_cloud)
 
     harness_before, harness_prior_diff = write_harness_baseline(run_path)
@@ -468,6 +474,7 @@ async def run(question: str, max_rounds: int, max_sessions: int,
             options = ClaudeAgentOptions(
                 system_prompt=lead_system,
                 agents=agents,
+                model=enforcement.MODEL_DEEP,
                 tools=LEAD_TOOLS,
                 allowed_tools=LEAD_TOOLS,
                 permission_mode="bypassPermissions",
@@ -560,7 +567,8 @@ async def run(question: str, max_rounds: int, max_sessions: int,
 
             # On retry, rebuild resume context from whatever files exist
             resume_context = build_resume_context(run_path)
-            lead_prompt = build_lead_prompt(question, run_dir_rel, max_rounds, resume_context)
+            lead_prompt = build_lead_prompt(question, run_dir_rel, max_rounds, resume_context,
+                                    cross_model=cross_model)
             print(f"Restarting pipeline (session {session_num + 1})...", flush=True)
     finally:
         status = finalize_run(
@@ -844,8 +852,23 @@ def _run_self_test() -> int:
     # V1: environment filtering
     env = {"ANTHROPIC_API_KEY": "a", "AZ_BATCH_ACCOUNT": "b", "OPENAI_API_KEY": "c", "PATH": "/bin"}
     ov = enforcement.filtered_env(env, allow_cloud=False)
-    ok(ov == {"AZ_BATCH_ACCOUNT": "", "OPENAI_API_KEY": ""}, f"V1 env filter: {ov}")
-    ok(enforcement.filtered_env(env, allow_cloud=True) == {}, "V1 cloud env stripped")
+    ok({k: v for k, v in ov.items() if k not in ("PATH", "VIRTUAL_ENV")}
+       == {"AZ_BATCH_ACCOUNT": "", "OPENAI_API_KEY": ""}, f"V1 env filter: {ov}")
+    ok("AZ_BATCH_ACCOUNT" not in enforcement.filtered_env(env, allow_cloud=True),
+       "V1 cloud creds kept with --cloud")
+    # V2 (Phase 21 α): agents' PATH starts with this interpreter's bin/,
+    # so bare `python3` is the harness venv even when it wasn't activated.
+    ok(ov["PATH"].split(os.pathsep)[0] == os.path.dirname(sys.executable)
+       and ov["PATH"].endswith("/bin"), f"V2 PATH not venv-first: {ov['PATH']}")
+    venv_ov = enforcement.interpreter_env({"PATH": "/usr/bin"},
+                                          os.path.join(REPO_ROOT, ".venv", "bin", "python3"))
+    ok(venv_ov.get("VIRTUAL_ENV") == os.path.join(REPO_ROOT, ".venv"),
+       f"V2 VIRTUAL_ENV not set for a venv interpreter: {venv_ov}")
+    # M1: every agent and the lead are pinned to explicit model IDs.
+    pinned = {enforcement.MODEL_DEEP, enforcement.MODEL_FAST}
+    reg = build_agents(question="q", run_dir="runs/x")
+    ok(all(d.model in pinned for d in reg.values()),
+       f"M1 unpinned agent models: {{n: d.model for n, d in reg.items()}}")
 
     # T1: harness hashing detects a modification
     with tempfile.TemporaryDirectory() as td:
@@ -881,6 +904,35 @@ def _run_self_test() -> int:
         g = run_final_gate(td, 5, validator=stub)
         ok(g and g["action"] is None and "boom" in g.get("error", ""), f"G1 crash handling: {g}")
 
+    # XM (Phase 21 ζ): cross-model step only when enabled; its outputs are
+    # write-protected; the lead may run the script.
+    ok("cross_model_critic.py runs/x --round" in build_lead_prompt("q", "runs/x", 5, "", cross_model=True)
+       and "cross_model_critic" not in build_lead_prompt("q", "runs/x", 5, ""),
+       "XM1 cross-model lead prompt gating")
+    ok(enforcement.check_tool_use("Write", {"file_path": f"{run_path}/critique_crossmodel.yaml"},
+                                  run_path, "critique-redteam", set(reg)) is not None,
+       "XM2 critique_crossmodel.yaml writable by an agent")
+    ok(enforcement.check_tool_use("Bash", {"command": "python3 scripts/cross_model_critic.py runs/x --round 2"},
+                                  run_path, None, set(reg)) is None,
+       "XM3 lead cannot run cross_model_critic.py")
+
+    # PF1 (Phase 21 α): preflight evaluation.
+    exe = sys.executable
+    good = f"PREFLIGHT_OK {exe}\nPREFLIGHT_OK {exe}"
+    ok(evaluate_preflight(good, {enforcement.MODEL_DEEP: {}}, False) == [],
+       "PF1 good preflight flagged")
+    ok(any("4.x" in p or "unexpected models" in p for p in
+           evaluate_preflight(good, {"claude-opus-4-6": {}}, False)),
+       "PF1 old model not flagged")
+    ok(evaluate_preflight(f"PREFLIGHT_OK {exe}", {enforcement.MODEL_DEEP: {}}, False),
+       "PF1 missing subagent probe not flagged")
+    ok(evaluate_preflight("PREFLIGHT_OK /usr/bin/python3\nPREFLIGHT_OK /usr/bin/python3",
+                          {enforcement.MODEL_DEEP: {}}, False),
+       "PF1 system python not flagged")
+    ok(evaluate_preflight(good, {}, False), "PF1 empty model_usage not flagged")
+    ok(evaluate_preflight(good, {enforcement.MODEL_DEEP: {}, "claude-haiku-5-5": {}}, False) == [],
+       "PF1 CLI-internal haiku wrongly flagged")
+
     if failures:
         print("SELF-TEST FAILURES:", file=sys.stderr)
         for f_ in failures:
@@ -888,6 +940,102 @@ def _run_self_test() -> int:
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+# Phase 21 α: preflight. Every self-test mocks the SDK, so nothing
+# exercised the real CLI / model / PATH until a multi-hour run was already
+# spending money. 2026-10-20_150152 ran six hours on 4.x-era models (the
+# bundled CLI's alias table) with a system-Python PATH that made the
+# modeler give up on the requested framework. This ~1-minute check runs a
+# real lead + a real registered-style subagent and verifies both.
+PREFLIGHT_IMPORTS = ("laser.core", "laser.generic", "starsim", "yaml",
+                     "numpy", "scipy")
+
+
+def preflight_command() -> str:
+    mods = ", ".join(PREFLIGHT_IMPORTS)
+    return (f"python3 -c \"import sys, {mods}; "
+            f"print('PREFLIGHT_OK', sys.executable)\"")
+
+
+def evaluate_preflight(text: str, model_usage: dict | None,
+                       is_error: bool) -> list[str]:
+    """Return problems found (empty list = pass). Pure, so it is self-tested."""
+    problems = []
+    if is_error:
+        problems.append("preflight session ended with an error result")
+    hits = re.findall(r"PREFLIGHT_OK\s+(\S+)", text or "")
+    want = os.path.realpath(sys.executable)
+    if len(hits) < 2:
+        problems.append(
+            f"expected the import probe to succeed in both the lead and the "
+            f"subagent (saw {len(hits)} PREFLIGHT_OK line(s)); a framework "
+            f"import failed or python3 is not the harness interpreter")
+    bad = sorted({h for h in hits if os.path.realpath(h) != want})
+    if bad:
+        problems.append(f"agents' python3 is {bad}, not the harness interpreter {want}")
+    used = set((model_usage or {}).keys())
+    if not used:
+        problems.append("ResultMessage.model_usage is empty; cannot verify models")
+    else:
+        # The CLI itself uses a small Haiku model for internal chores
+        # (Bash command summaries, titles); no pipeline agent runs on it.
+        unexpected = sorted(m for m in used
+                            if not m.startswith((enforcement.MODEL_DEEP,
+                                                 enforcement.MODEL_FAST,
+                                                 "claude-haiku-")))
+        if unexpected:
+            problems.append(f"unexpected models used: {unexpected} "
+                            f"(pinned: {enforcement.MODEL_DEEP}, {enforcement.MODEL_FAST})")
+        if not any(m.startswith(enforcement.MODEL_DEEP) for m in used):
+            problems.append(f"{enforcement.MODEL_DEEP} was not used")
+    return problems
+
+
+async def run_preflight(allow_cloud: bool = False) -> dict:
+    from claude_agent_sdk import AgentDefinition
+    cmd = preflight_command()
+    probe = AgentDefinition(
+        description="Preflight probe: runs one shell command and reports its output.",
+        prompt="Run exactly the shell command you are given with Bash and "
+               "reply with its full output verbatim. Do nothing else.",
+        tools=["Bash"], model=enforcement.MODEL_DEEP, maxTurns=4)
+    options = ClaudeAgentOptions(
+        system_prompt="You are a harness preflight check. Follow instructions literally.",
+        model=enforcement.MODEL_DEEP,
+        agents={"preflight-probe": probe},
+        tools=["Bash", "Agent"], allowed_tools=["Bash", "Agent"],
+        permission_mode="bypassPermissions", setting_sources=[],
+        cwd=REPO_ROOT, env=enforcement.filtered_env(dict(os.environ), allow_cloud),
+        max_turns=8)
+    prompt = (f"1. Run this with Bash and copy its output verbatim:\n{cmd}\n"
+              f"2. Spawn the `preflight-probe` agent and give it exactly the same "
+              f"command. 3. Reply with both outputs verbatim, one per line.")
+    texts, result = [], None
+    async for m in query(prompt=prompt, options=options):
+        if isinstance(m, AssistantMessage):
+            for b in m.content:
+                if hasattr(b, "text"):
+                    texts.append(b.text)
+        elif isinstance(m, ResultMessage):
+            result = m
+            if getattr(m, "result", None):
+                texts.append(m.result)
+    usage = getattr(result, "model_usage", None) if result else None
+    problems = evaluate_preflight("\n".join(texts), usage,
+                                  bool(result is None or result.is_error))
+    return {"ok": not problems, "problems": problems,
+            "model_usage": usage,
+            "cost_usd": getattr(result, "total_cost_usd", None) if result else None,
+            "sdk_version": _sdk_version()}
+
+
+def _sdk_version() -> str | None:
+    try:
+        from importlib.metadata import version
+        return version("claude-agent-sdk")
+    except Exception:
+        return None
 
 
 def main() -> int:
@@ -904,12 +1052,36 @@ def main() -> int:
     parser.add_argument("--cloud", action="store_true",
                         help="Pass cloud credentials (AZ_*/AZURE_*) to agents so UQ "
                              "can run on Azure Batch. Off by default (Phase 21 α).")
+    parser.add_argument("--cross-model", action="store_true",
+                        help="Add the gpt-6.1-sol cross-model critic (Codex CLI) to "
+                             "every STAGE 6. Sends run artifacts to OpenAI.")
     parser.add_argument("--self-test", action="store_true",
                         help="Run inline self-tests (no API calls) and exit")
+    parser.add_argument("--preflight-only", action="store_true",
+                        help="Run the ~1-minute live preflight (real CLI, models, "
+                             "PATH, framework imports) and exit")
+    parser.add_argument("--skip-preflight", action="store_true",
+                        help="Skip the live preflight before a run (not recommended)")
     args = parser.parse_args()
 
     if args.self_test:
         return _run_self_test()
+    if args.preflight_only or not args.skip_preflight:
+        pf = asyncio.run(run_preflight(allow_cloud=args.cloud))
+        print(f"Preflight: {'OK' if pf['ok'] else 'FAILED'} | models="
+              f"{sorted((pf.get('model_usage') or {}).keys())} | sdk={pf['sdk_version']}"
+              f" | cost=${pf.get('cost_usd') or 0:.3f}", flush=True)
+        for p in pf["problems"]:
+            print(f"  PREFLIGHT PROBLEM: {p}", flush=True)
+        if args.cross_model:
+            cm = subprocess.run(["codex", "login", "status"], capture_output=True, text=True,
+                                env={**os.environ, **enforcement.filtered_env(dict(os.environ), args.cloud)})
+            cm_ok = cm.returncode == 0 and "logged in" in (cm.stdout + cm.stderr).lower()
+            print(f"  cross-model: codex {'OK' if cm_ok else 'NOT AVAILABLE'}"
+                  f" ({(cm.stdout + cm.stderr).strip()[:80]})", flush=True)
+            pf["ok"] = pf["ok"] and cm_ok
+        if args.preflight_only or not pf["ok"]:
+            return 0 if pf["ok"] else 3
     if args.max_sessions < 1 or args.max_rounds < 1:
         parser.error("--max-sessions and --max-rounds must be >= 1")
 
@@ -932,13 +1104,14 @@ def main() -> int:
 
         run_dir = os.path.basename(run_path)
         coro = run(question, args.max_rounds, args.max_sessions,
-                   run_dir=run_dir, run_path=run_path, allow_cloud=args.cloud)
+                   run_dir=run_dir, run_path=run_path, allow_cloud=args.cloud,
+                   cross_model=args.cross_model)
     else:
         if not args.question:
             print("Error: question is required (or use --resume)")
             return 1
         coro = run(args.question, args.max_rounds, args.max_sessions,
-                   allow_cloud=args.cloud)
+                   allow_cloud=args.cloud, cross_model=args.cross_model)
     try:
         status = asyncio.run(coro)
     except KeyboardInterrupt:

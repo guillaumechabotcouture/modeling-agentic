@@ -4,7 +4,7 @@
 # Cloud execution extras live in requirements-cloud.txt.
 
 # --- Harness (main.py, agents/, scripts/) ---
-claude-agent-sdk==0.1.56
+claude-agent-sdk==0.2.169   # bundles CLI 2.1.305; must know the pinned MODEL_* ids (agents/enforcement.py)
 python-dotenv==1.2.2
 PyYAML==6.0.3
 Pillow==12.2.0          # agents/__init__.py figure checks

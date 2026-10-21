@@ -59,6 +59,9 @@ SCRIPT_OUTPUTS = (
     "effort_floors_report.yaml",
     "sanity_report.yaml",
     "validator_history.jsonl",       # Phase 21 β round-over-round memory
+    "critique_crossmodel.yaml",      # Phase 21 ζ: scripts/cross_model_critic.py
+    "critique_crossmodel.yaml.tmp",
+    "critique_crossmodel.md",
     "models/eligibility_probe.yaml",  # scripts/eligibility_probe.py
     "report.md",          # produced by scripts/render_claims.py
     # Written by main.py itself (plain Python, not a tool call). The
@@ -339,6 +342,18 @@ def harness_changed(diff: dict[str, list[str]]) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
+
+# Phase 21 α: pinned model IDs. The bare "opus"/"sonnet" aliases are
+# resolved by whatever CLI the SDK bundles; SDK 0.1.56's CLI (2.1.92)
+# resolved them to the 4.x family, so runs silently used older models
+# than intended and metadata could not say which. Bump these together
+# with claude-agent-sdk in requirements.txt.
+MODEL_DEEP = "claude-opus-5-5"     # synthesis, modeling, adversarial critique
+MODEL_FAST = "claude-sonnet-5-5"   # data wrangling, presentation critique
+
+# ---------------------------------------------------------------------------
 # Environment
 # ---------------------------------------------------------------------------
 
@@ -349,6 +364,29 @@ def filtered_env(environ: dict[str, str], allow_cloud: bool) -> dict[str, str]:
     removed, only overridden. Cloud credentials are blanked when cloud
     execution is off; downstream code treats empty as unset.
     """
-    if allow_cloud:
-        return {}
-    return {k: "" for k in environ if k.startswith(CLOUD_ENV_PREFIXES)}
+    overrides = interpreter_env(environ)
+    if not allow_cloud:
+        overrides.update({k: "" for k in environ if k.startswith(CLOUD_ENV_PREFIXES)})
+    return overrides
+
+
+def interpreter_env(environ: dict[str, str],
+                    executable: str | None = None) -> dict[str, str]:
+    """Phase 21 α: put this interpreter's bin/ first on the agents' PATH.
+
+    Agents call bare `python3` / `pip`. When main.py was launched as
+    `.venv/bin/python3 main.py` without activating the venv, those
+    resolved to the system interpreter: `pip install` failed with
+    externally-managed-environment and the modeler concluded the
+    requested framework (LASER) was "not installed" and silently swapped
+    it for scipy (2026-10-20_150152). Derive the venv from sys.executable
+    so the agents always see the interpreter that runs the harness.
+    """
+    import sys
+    exe = executable or sys.executable
+    bin_dir = os.path.dirname(exe)
+    prefix = os.path.dirname(bin_dir)
+    out = {"PATH": bin_dir + os.pathsep + environ.get("PATH", "")}
+    if os.path.isfile(os.path.join(prefix, "pyvenv.cfg")):
+        out["VIRTUAL_ENV"] = prefix
+    return out

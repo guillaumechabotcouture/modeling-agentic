@@ -237,7 +237,7 @@ def _registry() -> dict[str, AgentDefinition]:
             description=planner.DESCRIPTION,
             prompt=planner.SYSTEM_PROMPT,
             tools=planner.TOOLS,
-            model="opus",
+            model=enforcement.MODEL_DEEP,
             maxTurns=80,
             skills=["semantic-scholar-lookup", "asta-literature-search",
                     "pdf-text-extraction", "investigation-threads",
@@ -256,14 +256,14 @@ def _registry() -> dict[str, AgentDefinition]:
             description=data.DESCRIPTION,
             prompt=data.SYSTEM_PROMPT,
             tools=data.TOOLS,
-            model="sonnet",
+            model=enforcement.MODEL_FAST,
             maxTurns=60,
         ),
         "modeler": AgentDefinition(
             description=modeler.DESCRIPTION,
             prompt=modeler.SYSTEM_PROMPT,
             tools=modeler.TOOLS,
-            model="opus",
+            model=enforcement.MODEL_DEEP,
             maxTurns=150,
             skills=["modeling-strategy", "laser-spatial-disease-modeling",
                     "epi-model-parametrization", "malaria-modeling",
@@ -316,7 +316,7 @@ def _registry() -> dict[str, AgentDefinition]:
             description=analyst.DESCRIPTION,
             prompt=analyst.SYSTEM_PROMPT,
             tools=analyst.TOOLS,
-            model="opus",
+            model=enforcement.MODEL_DEEP,
             maxTurns=40,
             skills=["investigation-threads", "malaria-modeling",
                     "basic_epi_modeling", "surveillance"],
@@ -325,7 +325,7 @@ def _registry() -> dict[str, AgentDefinition]:
             description=critique_methods.DESCRIPTION,
             prompt=critique_methods.SYSTEM_PROMPT,
             tools=critique_methods.TOOLS,
-            model="opus",
+            model=enforcement.MODEL_DEEP,
             maxTurns=35,  # increased: now does parameter provenance checks with WebSearch
             skills=["malaria-modeling", "model-validation",
                     "parameter-estimation"],
@@ -334,7 +334,7 @@ def _registry() -> dict[str, AgentDefinition]:
             description=critique_domain.DESCRIPTION,
             prompt=critique_domain.SYSTEM_PROMPT,
             tools=critique_domain.TOOLS,
-            model="opus",
+            model=enforcement.MODEL_DEEP,
             maxTurns=50,  # increased after malaria run ran_to_cap at 39/40
             skills=["investigation-threads", "model-fitness", "malaria-modeling",
                     "vectors", "vaccination"],
@@ -348,7 +348,7 @@ def _registry() -> dict[str, AgentDefinition]:
             description=critique_premortem.DESCRIPTION,
             prompt=critique_premortem.SYSTEM_PROMPT,
             tools=critique_premortem.TOOLS,
-            model="opus",  # adversarial roleplay strength on a clean slate
+            model=enforcement.MODEL_DEEP,  # adversarial roleplay strength on a clean slate
             maxTurns=30,
             skills=["pre-mortem-domain", "adversarial-redteam",
                     "model-fitness", "modeling-strategy",
@@ -359,14 +359,14 @@ def _registry() -> dict[str, AgentDefinition]:
             description=critique_presentation.DESCRIPTION,
             prompt=critique_presentation.SYSTEM_PROMPT,
             tools=critique_presentation.TOOLS,
-            model="sonnet",
+            model=enforcement.MODEL_FAST,
             maxTurns=40,  # bumped 25→30 post-measles, 30→40 post-malaria (30/30 ran_to_cap in round 2)
         ),
         "critique-redteam": AgentDefinition(
             description=red_team.DESCRIPTION,
             prompt=red_team.SYSTEM_PROMPT,
             tools=red_team.TOOLS,
-            model="opus",  # adversarial judgment + WebFetch-heavy research
+            model=enforcement.MODEL_DEEP,  # adversarial judgment + WebFetch-heavy research
             maxTurns=50,
             skills=["adversarial-redteam", "critique-blockers-schema",
                     "effect-size-priors"],
@@ -381,7 +381,7 @@ def _registry() -> dict[str, AgentDefinition]:
             description=critique_sufficiency.DESCRIPTION,
             prompt=critique_sufficiency.SYSTEM_PROMPT,
             tools=critique_sufficiency.TOOLS,
-            model="opus",  # claim-strength judgment benefits from opus
+            model=enforcement.MODEL_DEEP,  # claim-strength judgment benefits from opus
             maxTurns=30,
             skills=["evidence-sufficiency", "critique-blockers-schema",
                     "effect-size-priors"],
@@ -390,7 +390,7 @@ def _registry() -> dict[str, AgentDefinition]:
             description=writer.DESCRIPTION,
             prompt=writer.SYSTEM_PROMPT,
             tools=writer.TOOLS,
-            model="opus",  # needs to synthesize the most complex output
+            model=enforcement.MODEL_DEEP,  # needs to synthesize the most complex output
             maxTurns=60,
             skills=["investigation-threads"],
         ),
@@ -1129,14 +1129,30 @@ LEAD_SYSTEM_PROMPT = (LEAD_SYSTEM_PROMPT
                       .replace("__UQ_DRAW_FLOORS__", render_uq_draw_floors()))
 
 
+CROSS_MODEL_STAGE6 = """
+CROSS-MODEL CRITIC (enabled for this run). In STAGE 6 of every round, in
+parallel with the critique agents, run via Bash (in the background; it
+takes ~5-10 min, wait for it before STAGE 7):
+    python3 scripts/cross_model_critic.py {run_dir} --round <N>
+It is an independent reviewer from a different model family (gpt-6.1-sol)
+and writes critique_crossmodel.yaml itself. Do not redirect its output into
+the run dir and never edit critique_crossmodel.*; to refresh it, re-run the
+script. Route X- blockers to the owning agent exactly like M-/D-/P-/R-.
+"""
+
+
 def build_lead_prompt(question: str, run_dir: str, max_rounds: int,
-                      resume_context: str = "") -> str:
+                      resume_context: str = "", cross_model: bool = False) -> str:
     """Build the user-facing prompt for the lead agent."""
     prompt = (
         f"Research question: {question}\n\n"
         f"Run directory: {run_dir}\n"
         f"Max critique-revision rounds: {max_rounds}\n"
     )
+    if cross_model:
+        # Phase 21 ζ: gpt-6.1-sol found eligible-population errors that
+        # five same-family reviewers missed.
+        prompt += CROSS_MODEL_STAGE6.replace("{run_dir}", run_dir)
     if resume_context:
         # Phase 21 α: the resume context names the stage to continue
         # from; appending "Start with STAGE 1" contradicted it.

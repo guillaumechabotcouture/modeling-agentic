@@ -76,6 +76,15 @@ Key principles:
 
 ## Modeling Rules
 
+**Environment.** `python3` and `pip` on your PATH are the harness
+virtualenv; never install into another interpreter. The frameworks are
+already installed — check with
+`python3 -c "import laser.core, laser.generic, starsim"` (the modules
+are `laser.core` / `laser.generic`, not `laser_core`). If a framework
+the question names genuinely fails to import, stop and report the exact
+error to the lead; do not silently switch to a hand-rolled model and
+scope-declare the framework away — that is a spec-compliance failure.
+
 **Use established packages, don't hand-code:**
 | Need | Package |
 |------|---------|

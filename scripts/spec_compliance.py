@@ -51,6 +51,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 from typing import Optional
 
 
@@ -79,6 +80,28 @@ _FRAMEWORK_PATTERNS = [
     (r"\busing\s+(?:the\s+)?EMOD(?:\s+framework)?\b", "emod"),
     (r"\bimplement(?:ed)?\s+in\s+EMOD\b", "emod"),
 ]
+
+# Phase 21: disjunctive framework requirements, e.g. "(LASER or
+# Starsim)" or "using LASER or Starsim". Recorded as one any-of entry
+# "laser|starsim"; the model must run at least one of them. The pre-21
+# patterns only matched single-framework phrasing, so a run asked for
+# "(LASER or Starsim)" could ship a hand-rolled scipy model unflagged
+# (2026-10-20_150152).
+_FRAMEWORK_NAMES = {"starsim": "starsim", "laser": "laser",
+                    "stisim": "stisim", "emod": "emod"}
+_FRAMEWORK_ANYOF = re.compile(
+    r"\b(starsim|laser|stisim|emod)\s*(?:,\s*|\s+or\s+|\s*/\s*)"
+    r"(?:(starsim|laser|stisim|emod)\s*(?:,\s*|\s+or\s+|\s*/\s*))?"
+    r"(starsim|laser|stisim|emod)\b",
+    re.IGNORECASE,
+)
+# A disjunction only counts as a requirement when phrased as one: inside
+# parentheses, or after using / with / in / built on.
+_ANYOF_CONTEXT = re.compile(
+    r"(?:\(\s*|\busing\s+(?:the\s+)?|\bwith\s+|\bin\s+|\bbuilt\s+on\s+)$",
+    re.IGNORECASE,
+)
+
 
 # Approach positive indicators.
 _APPROACH_PATTERNS = [
@@ -177,9 +200,21 @@ def detect_required_spec(question: str) -> dict:
         archetype_spec: int | None
     """
     frameworks: list[str] = []
+    anyof_members: set[str] = set()
+    for m in _FRAMEWORK_ANYOF.finditer(question):
+        if not _ANYOF_CONTEXT.search(question[:m.start()]):
+            continue
+        names = sorted({_FRAMEWORK_NAMES[g.lower()] for g in m.groups() if g})
+        if len(names) >= 2:
+            key = "|".join(names)
+            if key not in frameworks:
+                frameworks.append(key)
+            anyof_members.update(names)
     for pattern, name in _FRAMEWORK_PATTERNS:
         if re.search(pattern, question, re.IGNORECASE):
-            if name not in frameworks:
+            # "using LASER or Starsim" also matches the single-framework
+            # "using LASER" pattern; the any-of entry already covers it.
+            if name not in frameworks and name not in anyof_members:
                 frameworks.append(name)
 
     approaches: list[str] = []
@@ -251,13 +286,17 @@ def detect_required_spec(question: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def _read_models_code(run_dir: str) -> dict[str, str]:
-    """Return {relative_path: source} for all .py files under run_dir/models/."""
-    models_dir = os.path.join(run_dir, "models")
-    if not os.path.isdir(models_dir):
-        return {}
+    """Return {relative_path: source} for model code in the run.
+
+    Phase 21: scans run_dir/*.py as well as run_dir/models/**. Modelers do
+    not always put code under models/ (2026-10-20_150152 wrote
+    model_core.py at the run root), and a framework check that only looks
+    in models/ passes vacuously when that directory has no code.
+    """
     out: dict[str, str] = {}
-    for path in sorted(glob.glob(os.path.join(models_dir, "**", "*.py"),
-                                 recursive=True)):
+    paths = glob.glob(os.path.join(run_dir, "*.py")) + glob.glob(
+        os.path.join(run_dir, "models", "**", "*.py"), recursive=True)
+    for path in sorted(set(paths)):
         if "__pycache__" in path:
             continue
         try:
@@ -1075,6 +1114,20 @@ def check_spec_compliance(required: dict, run_dir: str,
     code_by_file = _read_models_code(run_dir)
 
     for fw in required.get("frameworks", []):
+        if "|" in fw:
+            # Any-of requirement: compliant if any member framework is used.
+            member_vs = [_check_framework(m, code_by_file) for m in fw.split("|")]
+            if all(mv is not None for mv in member_vs):
+                violations.append({
+                    "kind": "framework_missing",
+                    "required": fw.replace("|", " or "),
+                    "severity": "HIGH",
+                    "evidence": "Question requires one of "
+                                f"{fw.replace('|', ' / ')}; none is imported "
+                                "and run in the model code. "
+                                + " | ".join(mv["evidence"] for mv in member_vs),
+                })
+            continue
         v = _check_framework(fw, code_by_file)
         if v is not None:
             violations.append(v)
@@ -1139,6 +1192,29 @@ def _run_self_test() -> int:
        f"q1: 774 LGAs, got {r1['spatial_units']}")
     ok(r1["archetype_spec"] == 22,
        f"q1: 22 archetypes, got {r1['archetype_spec']}")
+
+    # Phase 21: disjunctive requirement + run-root model code.
+    q1b = ("Build a spatial measles transmission model across 47 counties "
+           "(LASER or Starsim) and allocate a fixed $40M budget.")
+    r1b = detect_required_spec(q1b)
+    ok(r1b["frameworks"] == ["laser|starsim"],
+       f"q1b: any-of framework, got {r1b['frameworks']}")
+    ok(detect_required_spec("Model TB using LASER or Starsim.")["frameworks"]
+       == ["laser|starsim"], "q1c: 'using X or Y' any-of")
+    ok(not detect_required_spec(
+        "Benchmark against published LASER or Starsim analyses.")["frameworks"],
+       "q1d: bare disjunctive mention is not a requirement")
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(td, "model_core.py"), "w") as f:
+            f.write("import numpy as np\nfrom scipy.integrate import solve_ivp\n")
+        vs = check_spec_compliance(r1b, td)["violations"]
+        ok(any(v["kind"] == "framework_missing" and "laser or starsim" in v["required"]
+               for v in vs), f"q1b: scipy-only run-root model must fail any-of: {vs}")
+        with open(os.path.join(td, "model_core.py"), "w") as f:
+            f.write("import laser.core\nfrom laser.generic import Model\n")
+        vs = check_spec_compliance(r1b, td)["violations"]
+        ok(not any(v["kind"] == "framework_missing" for v in vs),
+           f"q1b: LASER at run root satisfies any-of: {vs}")
 
     q2 = "Fit a simple SIR model of influenza transmission."
     r2 = detect_required_spec(q2)
