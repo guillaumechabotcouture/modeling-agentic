@@ -517,6 +517,7 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                 system_prompt=lead_system,
                 agents=agents,
                 model=enforcement.MODEL_DEEP,
+                max_buffer_size=enforcement.MAX_BUFFER_SIZE,
                 tools=LEAD_TOOLS,
                 allowed_tools=LEAD_TOOLS,
                 permission_mode="bypassPermissions",
@@ -996,6 +997,15 @@ def _run_self_test() -> int:
         ok(pipeline_unfinished(td) is None, "CT1 report.md present treated as unfinished")
     ok("{where}" in CONTINUE_PROMPT and "run_in_background" in CONTINUE_PROMPT, "CT1 continue prompt")
 
+    # BUF1 (Phase 21 ι): every ClaudeAgentOptions in main.py raises the
+    # SDK stream buffer above the 1 MiB default.
+    import ast as _ast
+    _calls = [n for n in _ast.walk(_ast.parse(open(os.path.abspath(__file__)).read()))
+              if isinstance(n, _ast.Call) and getattr(n.func, "id", "") == "ClaudeAgentOptions"]
+    ok(_calls and all(any(k.arg == "max_buffer_size" for k in c.keywords) for c in _calls),
+       "BUF1 a ClaudeAgentOptions(...) call lacks max_buffer_size")
+    ok(enforcement.MAX_BUFFER_SIZE > 1024 * 1024, "BUF1 buffer not raised")
+
     # PF1 (Phase 21 α): preflight evaluation.
     exe = sys.executable
     good = f"PREFLIGHT_OK {exe}\nPREFLIGHT_OK {exe}"
@@ -1087,6 +1097,7 @@ async def run_preflight(allow_cloud: bool = False) -> dict:
     options = ClaudeAgentOptions(
         system_prompt="You are a harness preflight check. Follow instructions literally.",
         model=enforcement.MODEL_DEEP,
+        max_buffer_size=enforcement.MAX_BUFFER_SIZE,
         agents={"preflight-probe": probe},
         tools=["Bash", "Agent"], allowed_tools=["Bash", "Agent"],
         permission_mode="bypassPermissions", setting_sources=[],

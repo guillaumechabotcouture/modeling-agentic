@@ -370,6 +370,11 @@ def harness_changed(diff: dict[str, list[str]]) -> bool:
 MODEL_DEEP = "claude-opus-5-5"     # synthesis, modeling, adversarial critique
 MODEL_FAST = "claude-sonnet-5-5"   # data wrangling, presentation critique
 
+# Phase 21 ι: SDK stream buffer. The default (1 MiB) killed A/B run B1's
+# session 1 on 2026-10-21 ("JSON message exceeded maximum buffer size of
+# 1048576 bytes") when one tool result exceeded it. Identical in both A/B arms.
+MAX_BUFFER_SIZE = 32 * 1024 * 1024
+
 # ---------------------------------------------------------------------------
 # Environment
 # ---------------------------------------------------------------------------
