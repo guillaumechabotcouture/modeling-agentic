@@ -21,6 +21,10 @@ A variant YAML:
     wall_timeout_s: 3600
     tools: [Read, Write, Bash, Skill]   # optional: override the stage agent's tools
     env: {KEY: value}               # optional: extra env vars for the agent session
+    tool_output_cap: {bash_chars: 6000, read_lines: 300}   # optional (E2): cap tool output added to context
+    compaction: {window_tokens: 150000}                    # optional (E2): CLI auto-compact window
+    fresh_context_every: 20         # optional (E2): segments of <=N turns, fresh session + handoff
+    effort: medium                  # optional (E2): stage agent reasoning effort (low|medium|high|max)
 
 Each case = (fixture, variant, seed) runs in its own workspace under
 <repo>/runs/_replay/<batch>/<variant>/<fixture>-s<seed>/ with the fixture's
@@ -118,23 +122,69 @@ def stage_agent_def(stage: str, question: str, run_dir: str, variant: dict):
         changes["maxTurns"] = int(variant["max_turns"])
     if isinstance(variant.get("tools"), list):
         changes["tools"] = list(variant["tools"])
+    if variant.get("effort"):                       # E2: retained thinking is a large share of history
+        changes["effort"] = variant["effort"]
     return dataclasses.replace(d, **changes) if changes else d
 
 
 # --------------------------------------------------------------------------- agent runners
 
 async def sdk_runner(stage, fixture_dir, run_dir, variant, telemetry_rows) -> dict:
-    """Real run through the Claude Agent SDK."""
-    from claude_agent_sdk import (query, ClaudeAgentOptions, AssistantMessage, ResultMessage,
-                                  SystemMessage)
-    from agents import create_hooks, enforcement
+    """Real run through the Claude Agent SDK.
+
+    Optional history-growth levers (E2; default off, see agents/output_caps.py):
+      tool_output_cap: {bash_chars: N, read_lines: M}
+      compaction: {window_tokens: N}
+      fresh_context_every: N   run the stage as segments of at most N turns, each a
+                               fresh session continued via a deterministic handoff
+    """
     question = json.load(open(os.path.join(run_dir, "metadata.json"))).get("question", "")
     task = open(os.path.join(fixture_dir, "spawn_prompt.md")).read().replace("{run_dir}", run_dir)
-    agent = STAGES[stage]["agent"]
     adef = stage_agent_def(stage, question, run_dir, variant)
+    seg_n = int(variant.get("fresh_context_every") or 0)
+    if not seg_n:
+        return await _sdk_session(stage, run_dir, variant, adef, task, float(variant["budget_usd"]),
+                                  telemetry_rows)
+    from agents import output_caps
+    total_turns = int(adef.maxTurns or variant.get("max_turns") or 60)
+    budget_left = float(variant["budget_usd"])
+    t_start = time.time()
+    task0 = task + output_caps.WORKLOG_INSTRUCTION.replace("{run_dir}", run_dir)
+    used, seg, segments, last = 0, 1, [], {}
+    while used < total_turns and budget_left > 0.05:
+        n = min(seg_n, total_turns - used)
+        if seg == 1:
+            prompt = task0
+        else:
+            wl = os.path.join(run_dir, output_caps.WORKLOG_REL)
+            prompt = output_caps.build_handoff(
+                task0, open(wl, errors="replace").read() if os.path.exists(wl) else "",
+                output_caps.written_files(run_dir, t_start), seg, used, total_turns)
+        before = len(telemetry_rows)
+        last = await _sdk_session(stage, run_dir, variant, dataclasses.replace(adef, maxTurns=n),
+                                  prompt, budget_left, telemetry_rows)
+        seg_turns = sum(1 for r in telemetry_rows[before:] if r["agent"] != "lead")
+        cost = last.get("cost_usd") or 0.0
+        budget_left -= cost
+        segments.append({"segment": seg, "turns": seg_turns, "cost_usd": cost, "subtype": last.get("subtype")})
+        used += seg_turns
+        if seg_turns < n or last.get("is_error") or seg_turns == 0:
+            break                       # the agent finished (or failed) before its turn cap
+        seg += 1
+    total_cost = sum(x["cost_usd"] for x in segments)
+    return {**last, "cost_usd": total_cost, "num_turns": used, "segments": segments}
+
+
+async def _sdk_session(stage, run_dir, variant, adef, task, budget_usd, telemetry_rows) -> dict:
+    from claude_agent_sdk import (query, ClaudeAgentOptions, AssistantMessage, ResultMessage,
+                                  SystemMessage)
+    from agents import create_hooks, enforcement, output_caps
+    agent = STAGES[stage]["agent"]
     trace = open(os.path.join(os.path.dirname(run_dir), "trace.jsonl"), "a")
     hooks = create_hooks(run_dir, trace, datetime.now(), registered_agents={agent},
                          max_turns={agent: adef.maxTurns})
+    if variant.get("tool_output_cap"):
+        hooks = output_caps.wrap_hooks(hooks, variant["tool_output_cap"], run_dir)
     # The session tool set caps every agent's tools, so the lead must carry the
     # union of its own and the stage agent's (as main.py's LEAD_TOOLS does);
     # its prompt still restricts it to one spawn. add_dirs lets the CLI's file
@@ -146,8 +196,9 @@ async def sdk_runner(stage, fixture_dir, run_dir, variant, telemetry_rows) -> di
         allowed_tools=session_tools, add_dirs=[os.path.dirname(run_dir)],
         permission_mode="bypassPermissions", setting_sources=["project"], hooks=hooks, cwd=REPO,
         env={**enforcement.filtered_env(dict(os.environ), False),
+             **output_caps.compaction_env(variant.get("compaction")),
              **{str(k): str(v) for k, v in (variant.get("env") or {}).items()}},
-        max_budget_usd=float(variant["budget_usd"]), max_buffer_size=enforcement.MAX_BUFFER_SIZE)
+        max_budget_usd=float(budget_usd), max_buffer_size=enforcement.MAX_BUFFER_SIZE)
     seen, result, session_id = set(), None, None
     try:
         async for m in query(prompt=LEAD_PROMPT.format(agent=agent, task=task), options=opts):
@@ -496,6 +547,54 @@ def _self_test() -> int:
         ok(installed["workspace"].startswith(cb) and installed["cloud"]["worker"] == "w1"
            and os.path.exists(os.path.join(installed["workspace"], "case.json")), "C6 installed in local layout")
         ok(installed["result"]["subtype"] == "dry" and installed["telemetry"]["cost_usd"] == 0.0, "C6 dry agent")
+    # S4 (E2): effort override reaches the stage AgentDefinition; absent = unchanged.
+    d_eff = stage_agent_def("MODEL", "q", "runs/x", {"id": "e", "effort": "medium"})
+    d_def = stage_agent_def("MODEL", "q", "runs/x", {"id": "d"})
+    ok(d_eff.effort == "medium" and d_def.effort == stage_agent_def("MODEL", "q", "runs/x", {}).effort,
+       f"S4 effort override: {d_eff.effort} / {d_def.effort}")
+
+    # S1-S3 (E2): fresh_context_every segments the stage with a deterministic
+    # handoff; stops early when the agent finishes; default path = 1 session.
+    import agents.output_caps as _oc
+    calls = []
+    async def fake_session(stage, run_dir, variant, adef, task, budget, rows):
+        calls.append({"turns": adef.maxTurns, "task": task, "budget": budget})
+        k = len(calls)
+        if k == 1:
+            os.makedirs(os.path.join(run_dir, "models"), exist_ok=True)
+            open(os.path.join(run_dir, _oc.WORKLOG_REL), "w").write("built model_core.py; next: calibrate")
+            open(os.path.join(run_dir, "models", "model_core.py"), "w").write("x = 1\n")
+        n_t = adef.maxTurns if k < 3 else 3            # third segment finishes early
+        for _ in range(n_t):
+            rows.append({"agent": "modeler", "model": "m", "ts": 0, "input": 1, "cache_read": 0,
+                         "cache_write": 0, "output": 1, "tool": "Bash"})
+        return {"session_id": f"s{k}", "subtype": "success", "is_error": False, "cost_usd": 1.0, "num_turns": n_t}
+    _orig_session, _orig_def = globals()["_sdk_session"], globals()["stage_agent_def"]
+    globals()["_sdk_session"] = fake_session
+    globals()["stage_agent_def"] = lambda st, q, rd, v: dataclasses.replace(
+        __import__("claude_agent_sdk").AgentDefinition(description="d", prompt="p"), maxTurns=50)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            fx = os.path.join(td, "FX"); run = os.path.join(td, "ws", "run")
+            os.makedirs(fx); os.makedirs(run)
+            open(os.path.join(fx, "spawn_prompt.md"), "w").write("Do the MODEL stage in {run_dir}.")
+            json.dump({"question": "q"}, open(os.path.join(run, "metadata.json"), "w"))
+            rows = []
+            res = asyncio.run(sdk_runner("MODEL", fx, run, {"id": "v", "budget_usd": 10, "fresh_context_every": 20}, rows))
+            ok([c["turns"] for c in calls] == [20, 20, 10], f"S1 segment turn caps: {[c['turns'] for c in calls]}")
+            ok(res["num_turns"] == 43 and res["cost_usd"] == 3.0 and len(res["segments"]) == 3,
+               f"S1 totals: {res.get('num_turns')} {res.get('cost_usd')}")
+            ok("Working log (required)" in calls[0]["task"] and "CONTINUATION, segment 2" in calls[1]["task"]
+               and "built model_core.py" in calls[1]["task"] and "models/model_core.py" in calls[1]["task"],
+               "S2 handoff carries worklog + written files")
+            ok(calls[1]["budget"] == 9.0 and calls[2]["budget"] == 8.0, "S2 budget decremented per segment")
+            calls.clear()
+            res = asyncio.run(sdk_runner("MODEL", fx, run, {"id": "v", "budget_usd": 10}, []))
+            ok(len(calls) == 1 and calls[0]["task"] == "Do the MODEL stage in " + run + "." and "segments" not in res,
+               "S3 default path is one unmodified session")
+    finally:
+        globals()["_sdk_session"], globals()["stage_agent_def"] = _orig_session, _orig_def
+
     if failures:
         print("SELF-TEST FAILURES:", *failures, sep="\n  - "); return 1
     print("OK: all self-test cases passed.")
