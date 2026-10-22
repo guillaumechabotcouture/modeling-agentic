@@ -44,3 +44,23 @@ If it works, the refined variant becomes the base for E2 (history-growth levers)
 
 - **n = 6 with one seed:** this is a mechanism check, not a quality-equivalence test. The powered quality test is E3, run to stage completion.
 - **Selection effect on floor counts:** more drafted artifacts means more floors can be evaluated and violated. The pass *rate* is reported alongside counts.
+
+## Results (2026-10-22; 6/6 collected, sha256-verified; cluster shut down)
+
+| Criterion | Result | Pass |
+|---|---|---|
+| ≤1/6 cases with a HIGH floor violation | 1/6 (E1 variant 4/6, control 0/6) | ✓ |
+| no floor violated in >1 case | `shortcut_markers_in_model_code` (MEDIUM) in 2 cases | ✗ (strict reading) |
+| efficiency within 10% of the E1 variant | start 34K vs 32K; input 10.5M vs 11.1M; cost $6.40 vs $7.31 | ✓ |
+
+**Outcome: inconclusive.**
+
+**Confound.** Artifact progress fell to a mean of 0.17, vs 0.50 for the E1 variant and 0.38 for the control, with all 6 fixtures ≤ 0.29. The drop in HIGH violations may partly reflect fewer drafted artifacts, which means fewer floors are evaluable. The likely mechanism is that explicit floor instructions shift effort within the 60-turn cap toward calibration bookkeeping.
+
+**Method lesson.** Progress measured at a fixed turn cap has twice produced results that can't be attributed cleanly. Compliance and progress trade off against the cap.
+
+**Next:**
+- Run MODEL replays to stage completion under a dollar cap. Outcomes: cost-to-completion, plus compliance and quality at completion. This folds into E2's design.
+- Packet follow-up: keep scratch and exploratory scripts outside `models/` (the shortcut-scanner scope).
+
+**Spend:** about $38.
