@@ -291,6 +291,30 @@ async def deterministic_critic(run_dir: str, variant: dict) -> dict:
             "num_turns": 0, "duration_s": round(time.time() - t0, 1)}
 
 
+_CROSSMODEL_OUTPUTS = ("critique_crossmodel.yaml", "critique_crossmodel.yaml.tmp", "critique_crossmodel.md")
+
+
+def _tree_hashes(root: str) -> dict:
+    """sha256 per file under root (the critic's own outputs excluded)."""
+    import hashlib
+    out = {}
+    for dp, _, files in os.walk(root):
+        for fn in files:
+            if fn in _CROSSMODEL_OUTPUTS:
+                continue
+            p = os.path.join(dp, fn)
+            try:
+                with open(p, "rb") as f:
+                    out[os.path.relpath(p, root)] = hashlib.sha256(f.read()).hexdigest()
+            except OSError:
+                pass
+    return out
+
+
+def _tree_diff(a: dict, b: dict) -> list:
+    return sorted({k for k in a.keys() | b.keys() if a.get(k) != b.get(k)})
+
+
 async def crossmodel_critic(run_dir: str, variant: dict) -> dict:
     """E5 arm: scripts/cross_model_critic.py (Codex, gpt-6.1-sol) as a subprocess.
     Needs a logged-in `codex` on PATH (local machine, or a VM with the Codex
@@ -298,14 +322,19 @@ async def crossmodel_critic(run_dir: str, variant: dict) -> dict:
     detections. OpenAI cost is not visible here (cost_usd = None)."""
     import subprocess
     t0 = time.time()
+    before = _tree_hashes(run_dir)
     cmd = [sys.executable, os.path.join(HERE, "cross_model_critic.py"), run_dir, "--round", "1",
            "--timeout-s", str(int(variant.get("wall_timeout_s", 1800)))]
     if variant.get("model"):
         cmd += ["--model", variant["model"]]
     proc = await asyncio.to_thread(subprocess.run, cmd, cwd=REPO, capture_output=True, text=True,
                                    timeout=float(variant.get("wall_timeout_s", 1800)) + 120)
-    return {"session_id": None, "subtype": "crossmodel", "is_error": proc.returncode != 0, "cost_usd": None,
-            "num_turns": 0, "duration_s": round(time.time() - t0, 1), "stderr_tail": proc.stderr[-400:]}
+    changed = _tree_diff(before, _tree_hashes(run_dir))
+    return {"session_id": None, "subtype": "crossmodel",
+            "is_error": proc.returncode != 0 or bool(changed), "cost_usd": None,
+            "num_turns": 0, "duration_s": round(time.time() - t0, 1), "stderr_tail": proc.stderr[-400:],
+            "integrity_violation": changed[:20],
+            "sandbox": os.environ.get("CROSS_MODEL_SANDBOX", "read-only")}
 
 
 async def dry_runner(stage, fixture_dir, run_dir, variant, telemetry_rows) -> dict:
@@ -630,6 +659,48 @@ def _self_test() -> int:
         ok(installed["workspace"].startswith(cb) and installed["cloud"]["worker"] == "w1"
            and os.path.exists(os.path.join(installed["workspace"], "case.json")), "C6 installed in local layout")
         ok(installed["result"]["subtype"] == "dry" and installed["telemetry"]["cost_usd"] == 0.0, "C6 dry agent")
+    # X1-X3 (E5 crossmodel on Coiled): codex setup mocked, key never persisted,
+    # and only crossmodel cases are planned to receive the OpenAI key.
+    import replay_coiled as rcx
+    px = rcx.plan_cases(["/f/F1"], [{"id": "methods", "budget_usd": 1}, {"id": "crossmodel", "agent": "crossmodel",
+                                                                          "budget_usd": 0}], 1)
+    ok([c["needs_codex"] for c in px] == [False, True], f"X1 only crossmodel needs codex: {px}")
+    with tempfile.TemporaryDirectory() as tdx:
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tz:
+            for name in ("bin/codex", "bin/codex-code-mode-host", "codex-path/rg", "codex-resources/bwrap",
+                         "codex-resources/voice/bin/codex-voice-host"):
+                data = b"#!/bin/sh\necho codex\n"; ti = tarfile.TarInfo(name); ti.size = len(data)
+                tz.addfile(ti, io.BytesIO(data))
+        calls = []
+        class _R:
+            def __init__(self, rc=0, out=""): self.returncode, self.stdout, self.stderr = rc, out, ""
+        def fake_run(cmd, **kw):
+            calls.append((cmd[1:], kw.get("input"))); return _R(0, "Successfully logged in" if "login" in cmd else "codex-cli 0.163.0")
+        envx = {"PATH": "/usr/bin"}
+        info = rcx.setup_codex(envx, rcx.Redacted("sk-test-SECRET"), home=tdx, download=lambda u: buf.getvalue(), run=fake_run)
+        ok(info["installed"] and info["login_rc"] == 0
+           and envx["PATH"].startswith(os.path.join(tdx, ".local", "codex", "bin"))
+           and info["helpers"] == ["bin/codex-code-mode-host", "codex-path/rg", "codex-resources/bwrap"]
+           and not os.path.exists(os.path.join(tdx, ".local", "codex", "codex-resources", "voice")),
+           f"X2 codex package + helpers installed (voice skipped), logged in, on PATH: {info}")
+        ok(any(c[0][:2] == ["login", "--with-api-key"] and c[1] == "sk-test-SECRET" for c in calls)
+           and "sk-test-SECRET" not in json.dumps(info) and 'gpt-6.1-sol' in open(os.path.join(tdx, ".codex", "config.toml")).read(),
+           "X2 key only on stdin, never in the record; config written")
+        bad = rcx.setup_codex({"PATH": ""}, rcx.Redacted("k"), home=tdx, download=lambda u: (_ for _ in ()).throw(OSError("offline")))
+        ok(bad["installed"] is False and "offline" in bad.get("error", ""), "X3 failed setup recorded, never raised")
+
+    with tempfile.TemporaryDirectory() as tdy:
+        open(os.path.join(tdy, "a.csv"), "w").write("x")
+        h0 = _tree_hashes(tdy)
+        open(os.path.join(tdy, "critique_crossmodel.yaml"), "w").write("ok")
+        ok(_tree_diff(h0, _tree_hashes(tdy)) == [], "X4 critic outputs excluded from integrity check")
+        open(os.path.join(tdy, "a.csv"), "w").write("tampered")
+        ok(_tree_diff(h0, _tree_hashes(tdy)) == ["a.csv"], "X4 modified input detected")
+        leak = os.path.join(tdy, "critique_crossmodel.md"); open(leak, "w").write("key sk-proj-ABCDEFGHIJKLMNOP end")
+        hits = rcx.redact_secrets([leak, os.path.join(tdy, "a.csv")], ["sk-proj-ABCDEFGHIJKLMNOP"])
+        ok(hits == ["critique_crossmodel.md"] and "sk-proj" not in open(leak).read(), f"X5 secret redacted: {hits}")
+
     # S4 (E2): effort override reaches the stage AgentDefinition; absent = unchanged.
     d_eff = stage_agent_def("MODEL", "q", "runs/x", {"id": "e", "effort": "medium"})
     d_def = stage_agent_def("MODEL", "q", "runs/x", {"id": "d"})
@@ -785,7 +856,13 @@ def main() -> int:
         key = None if a.dry_agent else os.environ.get("ANTHROPIC_API_KEY")
         if not a.dry_agent and not key:
             raise SystemExit("ANTHROPIC_API_KEY must be set in the launching shell for --backend coiled")
-        replay_coiled.launch(planned, variants, REPO, batch, a.cluster_name, a.workers, key, a.dry_agent)
+        okey = None
+        if any(c.get("needs_codex") for c in planned) and not a.dry_agent:
+            okey = os.environ.get("OPENAI_API_KEY")
+            if not okey:
+                raise SystemExit("OPENAI_API_KEY must be set in the launching shell for crossmodel arms")
+        replay_coiled.launch(planned, variants, REPO, batch, a.cluster_name, a.workers, key, a.dry_agent,
+                             openai_key=okey)
         print(f"launched; collect with: replay.py collect --batch {batch} --watch")
         return 0
     cases = asyncio.run(run_batch(a.stage, fixtures, variants, batch, a.seeds, LocalBackend(a.concurrency),

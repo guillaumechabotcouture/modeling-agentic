@@ -69,10 +69,13 @@ TARGET_STAGES = ["PLAN", "DATA", "MODEL", "ANALYZE", "WRITE"]
 OUTPUT_SCHEMA: dict = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["summary", "structural_mismatch", "new_blockers",
+    "required": ["summary", "files_reviewed", "structural_mismatch", "new_blockers",
                  "prior_rechecks"],
     "properties": {
         "summary": {"type": "string"},
+        # Fail-closed (Phase 21 ζ fix): the critic must say what it read; a
+        # review that opened no files is UNAVAILABLE, never PASS.
+        "files_reviewed": {"type": "array", "items": {"type": "string"}},
         "structural_mismatch": {
             "type": "object",
             "additionalProperties": False,
@@ -123,6 +126,10 @@ than the agents that built this modeling run. Your job is to find errors
 that same-family critics tend to miss. Work ONLY inside the current
 directory (the run directory). Do NOT read `.env`, anything in a parent
 directory, or anything outside this directory. Do not modify files.
+
+In `files_reviewed`, list every file you actually opened (relative paths).
+If you could not open files (tool errors, sandbox denials), say so in the
+summary and return `files_reviewed: []`; do not claim a clean review.
 
 Review, clean-slate: plan.md, the model code (*.py here and under models/),
 models/*.yaml, uncertainty_report.yaml, models/claims_ledger.yaml, any
@@ -237,7 +244,14 @@ def run_codex(run_dir: str, prompt: str, model: str, timeout_s: int,
         out_path = os.path.join(td, "last_message.json")
         with open(schema_path, "w") as f:
             json.dump(OUTPUT_SCHEMA, f)
-        cmd = [codex, "exec", "-s", "read-only", "-C", os.path.abspath(run_dir),
+        # Default read-only. Coiled containers can't run Codex's Linux sandbox
+        # (bwrap needs network namespaces), so the replay harness sets
+        # CROSS_MODEL_SANDBOX=danger-full-access on disposable VMs only, and
+        # enforces integrity itself (workspace hashed before/after the review).
+        sandbox = os.environ.get("CROSS_MODEL_SANDBOX", "read-only")
+        if sandbox not in ("read-only", "workspace-write", "danger-full-access"):
+            sandbox = "read-only"
+        cmd = [codex, "exec", "-s", sandbox, "-C", os.path.abspath(run_dir),
                "-m", model, "--output-schema", schema_path, "-o", out_path,
                "--skip-git-repo-check", "--ephemeral", "-"]
         t0 = time.time()
@@ -310,6 +324,27 @@ def _norm_blocker(b: Any) -> dict | None:
         "evidence": str(b.get("evidence") or "").strip() or "(no evidence given)",
         "fix_requires": str(b.get("fix_requires") or "").strip() or "PATCH",
     }
+
+
+def _require_review(run_dir: str, result: dict) -> dict:
+    """Fail closed when the critic reviewed nothing.
+
+    On Coiled, a broken codex sandbox made every tool call fail; the model
+    still returned a schema-valid payload with no blockers, which became
+    verdict PASS — an empty review indistinguishable from a clean one.
+    Require at least one listed file that exists in the run directory.
+    """
+    if result.get("status") != "ok":
+        return result
+    listed = [str(f) for f in (result.get("payload") or {}).get("files_reviewed") or []]
+    real = [f for f in listed
+            if os.path.isfile(os.path.join(run_dir, f.lstrip("./")))
+            or os.path.isfile(f)]
+    if not real:
+        return {**result, "status": "unavailable",
+                "reason": ("critic reviewed no files" if not listed else
+                           f"none of the {len(listed)} files the critic listed exist in the run dir")}
+    return result
 
 
 def build_doc(prior: dict, current_round: int, result: dict, *,
@@ -498,6 +533,7 @@ def run(run_dir: str, current_round: int, model: str = DEFAULT_MODEL,
                           model, timeout_s, codex, runner)
         if retry["status"] != "unparseable":
             result = retry
+    result = _require_review(run_dir, result)
     version = None if result["status"] == "unavailable" and "not found" in str(
         result.get("reason")) else _codex_version(codex, runner)
     doc = build_doc(prior, current_round, result, model=model,
@@ -541,8 +577,8 @@ def _run_self_test() -> int:
         runner.calls = calls
         return runner
 
-    def good_payload(new=None, rechecks=None, structural=False):
-        return {"summary": "two issues",
+    def good_payload(new=None, rechecks=None, structural=False, files=("plan.md",)):
+        return {"summary": "two issues", "files_reviewed": list(files),
                 "structural_mismatch": {"detected": structural,
                                         "description": "wrong question" if structural else "",
                                         "evidence_files": ["model.py"] if structural else []},
@@ -558,6 +594,18 @@ def _run_self_test() -> int:
     with tempfile.TemporaryDirectory() as d:
         with open(os.path.join(d, "metadata.json"), "w") as f:
             json.dump({"question": "Allocate a fixed budget across districts"}, f)
+        with open(os.path.join(d, "plan.md"), "w") as f:
+            f.write("# plan\n")
+
+        # T0 (fail-closed): a schema-valid payload that reviewed nothing must
+        # be UNAVAILABLE, not PASS; so must one listing only nonexistent files.
+        for files, why in (((), "reviewed no files"), (("ghost.py",), "none of the 1 files")):
+            sub = os.path.join(d, f"t0_{len(files)}"); os.makedirs(sub)
+            res = run(sub, 1, runner=fake_runner([good_payload(new=[], files=files)]))
+            with open(os.path.join(sub, "critique_crossmodel.yaml")) as f:
+                t0 = yaml.safe_load(f)
+            ok(res["verdict"] == "UNAVAILABLE" and why in (t0.get("unavailable_reason") or ""),
+               f"T0 empty review must be UNAVAILABLE ({why}): {res}, {t0.get('unavailable_reason')}")
 
         # T1: round 1 success → schema-valid, X-001/X-002, REVISE, sandbox flags.
         r = fake_runner([good_payload()])

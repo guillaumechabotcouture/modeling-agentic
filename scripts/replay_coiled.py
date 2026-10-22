@@ -38,6 +38,13 @@ REMOTE_BASE = "/tmp/rc"
 CHUNK = 8 * 2**20
 RUNNING_STATES = ("running", "ready", "pending", "starting", "queued", "provisioning")
 ASSIGN_FILE = "coiled_assignments.json"
+CODEX_VERSION = "0.163.0"          # same CLI as the laptop; gpt-6.1-sol via ~/.codex/config.toml
+# Coiled containers can't create network namespaces, so Codex's default Linux
+# sandbox (bwrap) fails every command ("bwrap: loopback: Failed RTM_NEWADDR:
+# Operation not permitted") and the critic silently reviews nothing. Landlock
+# needs no namespaces; the verification smoke below fails loudly if it doesn't work.
+CODEX_CONFIG = ('model = "gpt-6.1-sol"\nmodel_reasoning_effort = "xhigh"\n'
+                '[features]\nuse_legacy_landlock = true\n')
 
 
 class Redacted:
@@ -51,6 +58,85 @@ class Redacted:
     def __repr__(self):
         return "<redacted>"
     __str__ = __repr__
+
+
+def needs_codex(variant: dict) -> bool:
+    """Only the E5 cross-model arm runs Codex; only its cases receive the OpenAI key."""
+    return (variant or {}).get("agent") == "crossmodel"
+
+
+def _download(url: str) -> bytes:
+    import urllib.request
+    return urllib.request.urlopen(url, timeout=120).read()
+
+
+CODEX_PACKAGE_KEEP = ("bin/", "codex-path/", "codex-resources/bwrap", "codex-package.json")
+
+
+def setup_codex(env: dict, openai_key: "Redacted", home: str | None = None,
+                download=_download, run=subprocess.run, smoke: bool = False) -> dict:
+    """Install the Codex CLI on this VM and log it in with the OpenAI key.
+
+    Uses the official `codex-package` tarball (bin/codex + bin/codex-code-mode-host,
+    codex-path/rg, codex-resources/bwrap), extracting only those members and
+    keeping the package layout. The bare `codex-*-linux-musl` binary is not
+    enough: without codex-code-mode-host every tool call fails, and the critic
+    then "reviews" nothing (observed 2026-10-22: verdict PASS, 0 files read).
+    Config: ~/.codex/config.toml; login: `codex login --with-api-key` with the
+    key on stdin. Mutates env["PATH"]. The returned record never contains the
+    key. Never raises.
+    """
+    home = home or os.path.expanduser("~")
+    info = {"version": CODEX_VERSION, "installed": False, "login_rc": None}
+    try:
+        arch = "x86_64" if os.uname().machine in ("x86_64", "amd64") else "aarch64"
+        url = (f"https://github.com/openai/codex/releases/download/rust-v{CODEX_VERSION}/"
+               f"codex-package-{arch}-unknown-linux-musl.tar.gz")
+        pkg = os.path.join(home, ".local", "codex")
+        os.makedirs(pkg, exist_ok=True)
+        with tarfile.open(fileobj=io.BytesIO(download(url)), mode="r:gz") as t:
+            members = [m for m in t.getmembers()
+                       if m.name.lstrip("./").startswith(CODEX_PACKAGE_KEEP) and ".." not in m.name]
+            t.extractall(pkg, members=members)
+        exe = os.path.join(pkg, "bin", "codex")
+        for p_ in (exe, os.path.join(pkg, "bin", "codex-code-mode-host"),
+                   os.path.join(pkg, "codex-path", "rg"), os.path.join(pkg, "codex-resources", "bwrap")):
+            if os.path.exists(p_):
+                os.chmod(p_, 0o755)
+        info["helpers"] = sorted(n for n in ("bin/codex-code-mode-host", "codex-path/rg", "codex-resources/bwrap")
+                                 if os.path.exists(os.path.join(pkg, n)))
+        if not os.path.exists(exe):
+            raise FileNotFoundError("bin/codex missing from codex-package")
+        info["installed"] = True
+        env["PATH"] = os.pathsep.join([os.path.join(pkg, "bin"), os.path.join(pkg, "codex-path"),
+                                       env.get("PATH", "")])
+        os.makedirs(os.path.join(home, ".codex"), exist_ok=True)
+        with open(os.path.join(home, ".codex", "config.toml"), "w") as f:
+            f.write(CODEX_CONFIG)
+        r = run([exe, "login", "--with-api-key"], input=openai_key.get(), text=True,
+                capture_output=True, env=env, timeout=120)
+        info["login_rc"] = r.returncode
+        out = (r.stdout or "") + (r.stderr or "")
+        info["login_msg"] = out.replace(openai_key.get() or "\0", "<redacted>").strip()[:160]
+        v = run([exe, "--version"], text=True, capture_output=True, env=env, timeout=60)
+        info["cli"] = (v.stdout or "").strip()[:60]
+        if smoke and r.returncode == 0:
+            # Must exercise a real tool call: "reply OK" passed while tools were broken.
+            probe = os.path.join(home, ".codex", "smoke_dir")
+            os.makedirs(probe, exist_ok=True)
+            for n_ in ("a.txt", "b.txt", "c.txt"):
+                open(os.path.join(probe, n_), "w").write(n_)
+            # Same sandbox mode the critic uses on the VM (bwrap can't run in the container).
+            sm = run([exe, "exec", "--skip-git-repo-check", "-s", "danger-full-access", "-C", probe,
+                      "Use a shell command to count the files in the current directory. "
+                      "Reply with only the number."],
+                     text=True, capture_output=True, env=env, timeout=300)
+            info["smoke_rc"] = sm.returncode
+            info["smoke_out"] = (sm.stdout or "").strip()[-40:]
+            info["smoke_tools_ok"] = sm.returncode == 0 and (sm.stdout or "").strip().endswith("3")
+    except Exception as e:  # noqa: BLE001 - persist, never raise
+        info["error"] = f"{type(e).__name__}: {e}"[:300]
+    return info
 
 
 # --------------------------------------------------------------------------- packaging (local)
@@ -116,7 +202,8 @@ def write_batch_json(batch_dir: str, cases: list) -> None:
 def plan_cases(fixture_dirs, variants, seeds):
     return [{"key": case_key(v["id"], os.path.basename(os.path.normpath(f)), s),
              "fixture_dir": f, "fixture_id": os.path.basename(os.path.normpath(f)),
-             "variant_id": v["id"], "seed": s, "budget_usd": float(v["budget_usd"])}
+             "variant_id": v["id"], "seed": s, "budget_usd": float(v["budget_usd"]),
+             "needs_codex": needs_codex(v), "codex_smoke": bool(v.get("codex_smoke"))}
             for f in fixture_dirs for v in variants for s in range(seeds)]
 
 
@@ -155,8 +242,30 @@ def _pip_freeze():
         return [f"<unavailable: {e}>"]
 
 
+def redact_secrets(paths: list, secrets: list) -> list:
+    """Scan files about to leave the VM for secret strings; redact in place.
+    Returns the relative names of files that contained one (never the secret)."""
+    hits = []
+    secrets = [x for x in secrets if x and len(x) >= 12]
+    for p in paths:
+        try:
+            if not os.path.isfile(p) or os.path.getsize(p) > 200 * 2**20:
+                continue
+            data = open(p, "rb").read()
+        except OSError:
+            continue
+        new = data
+        for sec in secrets:
+            new = new.replace(sec.encode(), b"<redacted>")
+        if new != data:
+            open(p, "wb").write(new)
+            hits.append(os.path.basename(p))
+    return hits
+
+
 def remote_case(case: dict, code: bytes, fixture: bytes, variants: bytes,
-                anthropic_key: "Redacted", dry_agent: bool = False, base: str = REMOTE_BASE) -> dict:
+                anthropic_key: "Redacted", dry_agent: bool = False, base: str = REMOTE_BASE,
+                openai_key: "Redacted | None" = None) -> dict:
     """Run one replay case on this machine. Never raises: failures are
     persisted to result.json so `collect`/`status` report them."""
     import shutil
@@ -193,6 +302,10 @@ def remote_case(case: dict, code: bytes, fixture: bytes, variants: bytes,
         env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "/usr/bin:/bin")
         if anthropic_key is not None and anthropic_key.get():
             env["ANTHROPIC_API_KEY"] = anthropic_key.get()
+        if case.get("needs_codex") and openai_key is not None and openai_key.get() and not dry_agent:
+            # OPENAI_* stays stripped from env: codex authenticates from ~/.codex/auth.json.
+            meta["codex"] = setup_codex(env, openai_key, smoke=bool(case.get("codex_smoke")))
+            env["CROSS_MODEL_SANDBOX"] = "danger-full-access"   # disposable VM; integrity enforced by replay
         cmd = [sys.executable, os.path.join(repo, "scripts", "replay.py"), "case",
                "--fixture", fixture_dir, "--variant", os.path.join(root, "variants", f"{case['variant_id']}.yaml"),
                "--seed", str(case["seed"]), "--out", batch] + (["--dry-agent"] if dry_agent else [])
@@ -220,6 +333,8 @@ def remote_case(case: dict, code: bytes, fixture: bytes, variants: bytes,
             for p in glob.glob(os.path.expanduser(f"~/.claude/projects/*/{sid}*")):
                 entries.append((p, os.path.join(case["variant_id"], f"{case['fixture_id']}-s{case['seed']}",
                                                 "claude_session", os.path.basename(p))))
+        secrets = [k.get() for k in (anthropic_key, openai_key) if k is not None and k.get()]
+        meta["secret_hits"] = redact_secrets([p for p, _ in entries], secrets)
         blob = tar_bytes(entries)
         open(os.path.join(root, "result.tar.gz"), "wb").write(blob)
         meta.update(status=(case_json or {}).get("status", "no_case_json"), exit_code=proc.returncode,
@@ -287,7 +402,7 @@ def create_or_attach(name, n_workers, workspace=WORKSPACE):
 
 
 def launch(cases, variants, repo, batch_dir, cluster_name, workers, anthropic_key, dry_agent=False,
-           workspace=WORKSPACE, log=print):
+           workspace=WORKSPACE, log=print, openai_key=None):
     from distributed import fire_and_forget
     n = max(1, min(workers or len(cases), len(cases)))
     code, code_info = code_tarball(repo)
@@ -312,8 +427,10 @@ def launch(cases, variants, repo, batch_dir, cluster_name, workers, anthropic_ke
             log(f"  scatter {c['fixture_id']} ({len(blob) >> 20} MB) -> {w}")
             fx[c["fixture_id"]] = client.scatter(blob, workers=[w], broadcast=False)
         spec = {k: c[k] for k in ("key", "fixture_id", "variant_id", "seed")}
+        spec.update(needs_codex=bool(c.get("needs_codex")), codex_smoke=bool(c.get("codex_smoke")))
+        okey = Redacted(openai_key if c.get("needs_codex") else None)
         fut = client.submit(remote_case, spec, scattered[w]["code"], fx[c["fixture_id"]],
-                            scattered[w]["variants"], Redacted(anthropic_key), dry_agent,
+                            scattered[w]["variants"], Redacted(anthropic_key), dry_agent, REMOTE_BASE, okey,
                             workers=[w], allow_other_workers=False, pure=False, key=f"replay-{c['key']}")
         fire_and_forget(fut)
         record["cases"][c["key"]] = {"worker": w, **spec, "budget_usd": c["budget_usd"]}
@@ -380,7 +497,7 @@ def install_result(batch_dir, case_rec, meta, tar_path):
                                  "seed": case_rec["seed"], "status": meta.get("status", "error"),
                                  "result": {"error": meta.get("error")}, "telemetry": {}, "scores": {}, "flat": {}})
     case["workspace"] = ws
-    case["cloud"] = {k: meta.get(k) for k in ("hostname", "duration_s", "exit_code", "error", "skipped_inputs",
+    case["cloud"] = {k: meta.get(k) for k in ("codex", "secret_hits", "hostname", "duration_s", "exit_code", "error", "skipped_inputs",
                                               "files", "size", "sha256", "pip_freeze")}
     case["cloud"]["worker"] = case_rec["worker"]
     json.dump(case, open(cj, "w"), indent=1, default=str)
