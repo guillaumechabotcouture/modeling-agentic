@@ -76,12 +76,14 @@ Loss MUST be pointwise: evaluate residuals at exactly the given params; never op
 (re-optimizing loss raises LossFunctionReoptimizesError). Unidentified parameters used in policy outputs = HIGH:
 fix via priors, tying, or fixing at defaults. Lead runs `scripts/identifiability.py` → identifiability.yaml.""",
     "calibration_result": """\
-Write from the optimizer's actual output whenever ANY parameter is fitted (missing = HIGH non-declarable):
+Write this exact YAML file whenever ANY parameter is fitted, even if your own code also writes JSON/logs
+(missing = HIGH non-declarable):
 ```yaml
 method: nelder-mead            # optimizer
 loss: negative log-likelihood
-n_restarts: 3                  # independent starts, same convergence criterion
-n_iterations: 500
+n_restarts: 3                  # independent starts actually run, same convergence criterion
+n_iterations: 3000             # per-restart iteration BUDGET you configured (maxiter), not iterations-to-converge
+iterations_used: [412, 388, 455]   # optional: actual iterations per restart
 held_out_fold: {indices: [3, 11], loss: 0.042}   # targets excluded from fit, then scored; non-empty
 best_loss: 0.031
 restart_losses: [0.031, 0.033, 0.031]
@@ -126,7 +128,8 @@ sensitivity:
 verdict: BOUNDED   # max impact_loss_pct <10 BOUNDED | 10–25 INCONCLUSIVE | >25 UNBOUNDED (optimizer re-run)
 ```""",
     "sensitivity_analysis": """\
-Draft after the first optimizer pass (≥2 parameters, 1 value each), then expand. Re-run the FULL optimizer per value.
+Draft after the first optimizer pass, then expand. EVERY parameter entry needs ≥2 perturbations from the
+first draft (the floor takes the minimum across entries). Re-run the FULL optimizer per value.
 ```yaml
 load_bearing_parameters:          # ≥5 for full coverage
   - id: SA-001
@@ -230,6 +233,56 @@ def floors():
     return _load(FLOORS).get("floors") or []
 
 
+_TRIGGER_TEXT = {
+    "always": "always",
+    "uq_present": "when `uncertainty_report.yaml` exists",
+    "cloud_uq_present": "when UQ ran on the cloud backend",
+    "sensitivity_present": "when `models/sensitivity_analysis.yaml` exists",
+    "calibration_present": "when `models/calibration_result.yaml` exists",
+    "calibration_evidence": ("whenever ANY parameter is fitted (i.e. `models/identifiability.yaml`, a "
+                             "`model_comparison.yaml` model with `k_params` > 0, or any `models/*calibrat*` file exists)"),
+}
+
+
+def _shortcut_rules() -> str:
+    """Generated from scripts/effort_floors.py so the packet cannot drift from the scan."""
+    import sys
+    sys.path.insert(0, os.path.join(REPO, "scripts"))
+    import effort_floors as ef  # noqa: E402
+    lits = ", ".join(f"{k}<{v}" for k, v in ef._SHORTCUT_LITERAL_NAMES.items())
+    benign = "/".join(sorted(ef._BENIGN_PASS_EXCEPTIONS))
+    return (f"any `.py` under `models/` (incl. exploratory/robustness scripts) containing: a literal or "
+            f"constant below its floor ({lits}); a `# TODO|FIXME|HACK|XXX|SHORTCUT` comment; or "
+            f"`except ...: pass` (except {benign}). Each is one finding; ≥3 findings = HIGH. Put scratch "
+            f"experiments outside `models/` or use the floor values.")
+
+
+def floor_instruction(f: dict) -> str:
+    """One actionable line per floor, generated from effort_floors.yaml."""
+    fields = [x.strip() for x in str(f["field"]).split("|")]
+    sev = f"{f['severity']}{'' if f.get('scope_declarable') else ', not declarable'}"
+    when = _TRIGGER_TEXT.get(f.get("triggered_by"), f.get("triggered_by"))
+    art, m = f["artifact"], f["minimum"]
+    probe = f.get("probe")
+    if probe == "artifact_present":
+        what = f"write `{art}` (exact path, YAML)"
+    elif probe == "yaml_field":
+        what = f"`{art}` field {' (or) '.join(f'`{x}`' for x in fields)} ≥ {m}"
+        if f.get("subtract_field"):
+            what += f" after subtracting `{f['subtract_field']}`"
+    elif probe == "yaml_field_list_length" and "[*]" in fields[0]:
+        head, tail = fields[0].split("[*]", 1)
+        what = (f"`{art}`: EVERY item of `{head.rstrip('.')}` needs `{tail.lstrip('.')}` with ≥ {m} entries "
+                f"(minimum across items is checked)")
+    elif probe == "yaml_field_list_length":
+        what = f"`{art}` field `{fields[0]}` must be a list with ≥ {m} entries"
+    elif probe == "ast_shortcut_scan":
+        what = _shortcut_rules()
+    else:
+        what = f"`{art}` `{fields[0]}` ≥ {m}"
+    return f"- `{f['id']}` ({sev}; {when}): {what.rstrip(".")}."
+
+
 def _cond(flag):
     return {"allocation": "if an allocation is produced",
             "aggregation": "if calibration units / allocation units < 0.1"}.get(flag, "always")
@@ -244,14 +297,9 @@ def build_packet(stage="model", question="", applicable=None) -> str:
     for a in arts:
         lines.append(f"| `{a['id']}` | `{a['path']}` | {_cond(a['_flag'])} | r{a.get('first_draft_round')}→"
                      f"r{a.get('finalize_round')} | {'yes' if a.get('scope_declarable') else '**NO**'} |")
-    lines += ["", "### Effort floors (enforced from round 2; NO = not scope-declarable)",
-              "| floor | artifact | field | min | sev | declarable |", "|---|---|---|---|---|---|"]
-    for f in floors():
-        field = " or ".join(f"`{x}`" for x in str(f["field"]).split("|"))
-        lines.append(f"| `{f['id']}` | `{f['artifact']}` | {field} | {f['minimum']} | {f['severity']} | "
-                     f"{'yes' if f.get('scope_declarable') else 'NO'} |")
-    lines += ["Shortcut literals (n_draws=10, maxiter=10, n_trials=5, n_replicates=1), TODO/FIXME/HACK and bare "
-              "`except: pass` in models/ are flagged; ≥3 = HIGH.", "", "### Schemas"]
+    lines += ["", "### Effort floors — do each of these (checked from round 2)"]
+    lines += [floor_instruction(f) for f in floors()]
+    lines += ["", "### Schemas"]
     for a in arts:
         card = ARTIFACT_SCHEMAS.get(a["id"])
         if card:
@@ -271,9 +319,28 @@ def _self_test() -> int:
     for i in ids:
         ok(f"`{i}`" in p, f"packet missing artifact id {i}")
         ok(i in ARTIFACT_SCHEMAS or i in ("benchmark_targets",), f"no schema card for {i}")
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(REPO, "scripts"))
+    import effort_floors as _ef
     for f in floors():
-        ok(f"`{f['id']}`" in p, f"packet missing floor {f['id']}")
-        ok(f"| {f['minimum']} |" in p, f"packet missing floor minimum {f['minimum']} for {f['id']}")
+        line = next((l for l in p.splitlines() if l.startswith(f"- `{f['id']}`")), None)
+        ok(line is not None, f"packet missing instruction for floor {f['id']}")
+        if not line:
+            continue
+        if f.get("probe") != "ast_shortcut_scan":
+            ok(f"`{f['artifact']}" in line, f"floor {f['id']}: instruction does not name {f['artifact']}")
+        for fld in str(f["field"]).split("|"):
+            for part in [x.strip(".") for x in fld.strip().split("[*]") if x.strip(".") and fld.strip() not in ("-", "model_files")]:
+                ok(part in line, f"floor {f['id']}: instruction does not name probed field {part!r}")
+        if f.get("probe") in ("yaml_field", "yaml_field_list_length"):
+            ok(f"≥ {f['minimum']}" in line, f"floor {f['id']}: minimum {f['minimum']} missing")
+        ok(f["severity"] in line, f"floor {f['id']}: severity missing")
+        ok(("not declarable" in line) == (not f.get("scope_declarable")), f"floor {f['id']}: declarability wrong")
+    sc = next(l for l in p.splitlines() if l.startswith("- `shortcut_markers_in_model_code`"))
+    for k, v in _ef._SHORTCUT_LITERAL_NAMES.items():
+        ok(f"{k}<{v}" in sc, f"shortcut rule missing {k}<{v}")
+    ok("1 value each" not in p, "sensitivity card still contradicts the perturbation floor")
+    ok("iteration BUDGET" in p and "even if your own code also writes JSON" in p, "calibration_result card gaps")
     toks = len(p) / 4
     ok(toks <= 6000, f"packet ~{toks:.0f} tokens > 6000 budget")
     ok(not re.search(r"\b(malaria|nigeria|lgas?|smc|llin|pfpr|measles|kenya)\b", p, re.I),
