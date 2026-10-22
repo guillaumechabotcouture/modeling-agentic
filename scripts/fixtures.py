@@ -466,6 +466,143 @@ def build_one(label: str, run_dir: str, out_root: str, utc: bool,
     return meta
 
 
+# --------------------------------------------------------------------------- CRITIQUE stage (E5)
+
+CRITIC_AGENTS = ("critique-methods", "critique-domain", "critique-presentation", "critique-redteam")
+# What a critic reads at critique time: the run state after MODEL/ANALYZE, before
+# WRITE. Harness bookkeeping, earlier critiques (they would hand the replayed
+# critic its answers), gate/script audit outputs and the post-WRITE report are out.
+CRIT_EXCLUDE_NAMES = {
+    "trace.jsonl", "harness_manifest.json", "pipeline_state.yaml", "progress.md",
+    "final_gate.json", "final_gate_stderr.txt", "validator_history.jsonl", "metadata.json",
+    "report.md", "report.unrendered.md", "report.snapshot.md", "run.log",
+}
+CRIT_EXCLUDE_PREFIXES = ("critique_", "scope_declaration", "coherence_audit", "writer_qa",
+                         "effort_floors_report", "benchmark_match", "archive_", "__pycache__",
+                         "claude_projects", "_replay")
+CRIT_CORE = {"plan.md", "hypotheses.md", "success_criteria.yaml", "threads.yaml", "citations.md",
+             "data_quality.md", "data_provenance.md", "pre_mortem.yaml", "modeling_strategy.md",
+             "results.md", "decision_rule.md", "figure_rationale.md", "uncertainty_report.yaml",
+             "identifiability.yaml", "model_comparison_formal.yaml", "sensitivity_analysis.yaml"}
+CRIT_TEXT_EXT = (".py", ".yaml", ".yml", ".json", ".md", ".csv", ".txt")
+CRIT_TEXT_CAP = 5 * 2**20
+CRIT_FIG_CAP = 1 * 2**20
+CRITIQUE_PROMPT = ("This is critique round 1. Research question: {question}\n"
+                   "Run directory: {run_dir}\n"
+                   "Review the run as it stands (plan, data, models, analysis results) per your "
+                   "system prompt and write your critique markdown and critique YAML into the run "
+                   "directory. There are no prior critique rounds (carried_forward must be []).")
+
+
+def _crit_excluded(rel: str) -> bool:
+    base = os.path.basename(rel)
+    parts = rel.split(os.sep)
+    if base in CRIT_EXCLUDE_NAMES or base.endswith(".pyc"):
+        return True
+    return any(base.startswith(p) or parts[0].startswith(p) for p in CRIT_EXCLUDE_PREFIXES)
+
+
+def _crit_core(rel: str, size: int) -> bool:
+    base = os.path.basename(rel)
+    if rel in CRIT_CORE or (base in CRIT_CORE and rel.count(os.sep) <= 1):
+        return True
+    if "allocation" in base.lower() and base.endswith(".csv"):
+        return size <= CRIT_TEXT_CAP
+    if rel.startswith("models" + os.sep) and base.endswith(CRIT_TEXT_EXT):
+        return size <= CRIT_TEXT_CAP                      # model code and rigor artifacts
+    if os.sep not in rel and base.endswith(".py"):
+        return size <= CRIT_TEXT_CAP                      # model code at the run root
+    return False
+
+
+def build_critique(label: str, run_dir: str, out_root: str, transcripts_root: str | None = None,
+                   budget_mb: float = DEFAULT_BUDGET_MB) -> dict:
+    """CRITIQUE-stage fixture: the state a round-1 critic reads, evidence-based.
+
+    Rules: core (CRIT_CORE docs, model code, models/ artifacts, allocation CSVs),
+    transcript (any critic agent named the file in the source run), processed
+    (processed-data tables <= 10 MB), figure (figures <= 1 MB, for the
+    presentation critic). Everything else is excluded with hash + reason."""
+    run_dir = os.path.normpath(run_dir)
+    dest = os.path.join(out_root, label)
+    inputs = os.path.join(dest, "inputs")
+    if os.path.exists(dest):
+        shutil.rmtree(dest)
+    os.makedirs(inputs)
+    cands = []
+    for root, dirs, fnames in os.walk(run_dir):
+        dirs[:] = [d for d in dirs if not _crit_excluded(os.path.relpath(os.path.join(root, d), run_dir))]
+        for fn in fnames:
+            src = os.path.join(root, fn)
+            rel = os.path.relpath(src, run_dir)
+            if _crit_excluded(rel):
+                continue
+            cands.append((rel, src, os.path.getsize(src)))
+    sess = session_dirs(run_dir, transcripts_root)
+    texts, ev_source = [], "none"
+    for agent in CRITIC_AGENTS:
+        t, src_kind = stage_texts(run_dir, sess, agent)
+        texts += t
+        if src_kind != "none":
+            ev_source = src_kind if ev_source in ("none", "trace") else ev_source
+    t_hits = match_refs(texts, [c[0] for c in cands], allow_dirs=False)
+    evidence = {}
+    for rel, src, size in cands:
+        rules = []
+        if _crit_core(rel, size):
+            rules.append("core")
+        # Binary model outputs (.npz/.pkl/...) a critic globbed or loaded once are
+        # admitted only when small: CB1's critics globbed models/out/*.npz and
+        # pulled in ~45 MB of lattice arrays no critic actually inspects.
+        if rel in t_hits and (rel.endswith(CRIT_TEXT_EXT + (".png", ".svg", ".pdf"))
+                              or size <= CRIT_FIG_CAP):
+            rules.append("transcript")
+        if _processed(rel) and size <= PROCESSED_FILE_CAP:
+            rules.append("processed")
+        if rel.split(os.sep)[0] == "figures" and size <= CRIT_FIG_CAP:
+            rules.append("figure")
+        evidence[rel] = rules
+    order = ("core", "transcript", "processed", "figure")
+    budget = budget_mb * 2**20
+    chosen, excluded, used = [], [], 0
+    for rel, src, size in sorted((c for c in cands if evidence[c[0]]),
+                                 key=lambda c: (min(order.index(r) for r in evidence[c[0]]), c[2])):
+        if used + size > budget:
+            excluded.append({"relpath": rel, "bytes": size, "sha256": _sha(src), "original": src,
+                             "reason": "over_budget", "rules": evidence[rel]})
+            continue
+        chosen.append((rel, src, size)); used += size
+    for rel, src, size in cands:
+        if not evidence[rel]:
+            excluded.append({"relpath": rel, "bytes": size, "sha256": _sha(src), "original": src,
+                             "reason": "no_evidence"})
+    files = {}
+    for rel, src, size in chosen:
+        dst = os.path.join(inputs, rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+        files[rel] = {"sha256": _sha(dst), "bytes": size}
+    q = _question(run_dir)
+    json.dump({"question": q, "fixture": label}, open(os.path.join(inputs, "metadata.json"), "w"), indent=1)
+    open(os.path.join(dest, "spawn_prompt.md"), "w").write(CRITIQUE_PROMPT.replace("{question}", q))
+    ql = q.lower()
+    disease = next((d for d in ("malaria", "measles", "tuberculosis", "hiv", "polio", "cholera") if d in ql), "other")
+    meta = {
+        "id": label, "stage": "CRITIQUE", "source_run": run_dir, "question": q, "disease": disease,
+        "allocation": bool(re.search(r"allocat|budget", ql)), "strata": [disease, "critique"],
+        "n_files": len(files), "bytes": sum(f["bytes"] for f in files.values()),
+        "spawn_prompt_source": "critique_template", "mode": "evidence", "budget_mb": budget_mb,
+        "evidence_source": ev_source, "candidates": len(cands),
+        "excluded_bytes": sum(e["bytes"] for e in excluded),
+        "evidence": {r: v for r, v in evidence.items() if v and r in files},
+        "excluded": sorted(excluded, key=lambda e: -e["bytes"]),
+        "candidate_files": sorted(c[0] for c in cands), "files": files,
+        "created": datetime.now().isoformat(timespec="seconds"),
+    }
+    yaml.safe_dump(meta, open(os.path.join(dest, "fixture.yaml"), "w"), sort_keys=False)
+    return meta
+
+
 def check(fixture_dir: str) -> dict:
     """Every input the source run's code references (rule b, recomputed now)
     must be in the fixture, or excluded as over_budget (deliberate, restorable)."""
@@ -624,6 +761,7 @@ def main() -> int:
     ap.add_argument("--out")
     ap.add_argument("--mode", choices=["evidence", "full"], default="evidence")
     ap.add_argument("--budget-mb", type=float, default=DEFAULT_BUDGET_MB)
+    ap.add_argument("--stage", choices=["model", "critique"], default="model")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
     if a.self_test:
@@ -646,6 +784,11 @@ def main() -> int:
         utc = rest.endswith("@utc")
         run = rest[:-4] if utc else rest
         tr = os.path.join(os.path.dirname(os.path.dirname(os.path.normpath(run))), "claude_projects")
+        if a.stage == "critique":
+            m = build_critique(label, run, a.out, tr if os.path.isdir(tr) else None, budget_mb=a.budget_mb)
+            print(f"{label}: {m['n_files']} files, {m['bytes']/2**20:.1f} MB (excluded {len(m['excluded'])} "
+                  f"files, {m['excluded_bytes']/2**20:.1f} MB), evidence={m['evidence_source']}")
+            continue
         m = build_one(label, run, a.out, utc, tr if os.path.isdir(tr) else None,
                       mode=a.mode, budget_mb=a.budget_mb)
         print(f"{label}: {m['n_files']} files, {m['bytes']/2**20:.1f} MB "

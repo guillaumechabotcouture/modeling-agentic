@@ -122,8 +122,51 @@ def score_model(run_dir, question: str | None = None) -> dict:
     return out
 
 
+CRITIQUE_FILES = {"critique-methods": "critique_methods.yaml", "critique-domain": "critique_domain.yaml",
+                  "critique-presentation": "critique_presentation.yaml",
+                  "critique-redteam": "critique_redteam.yaml", "crossmodel": "critique_crossmodel.yaml",
+                  "deterministic": "critique_deterministic.yaml"}
+
+
+def critique_blockers(run_dir: str, agent: str) -> tuple[list[dict], dict]:
+    """Blockers an arm produced in run_dir (parsed leniently; schema checked separately)."""
+    p = os.path.join(run_dir, CRITIQUE_FILES.get(agent, f"critique_{agent}.yaml"))
+    if not os.path.exists(p):
+        return [], {"file": os.path.basename(p), "exists": False}
+    try:
+        doc = yaml.safe_load(open(p)) or {}
+    except yaml.YAMLError as e:
+        return [], {"file": os.path.basename(p), "exists": True, "parse_error": str(e)[:200]}
+    bl = [b for b in (doc.get("blockers") or []) if isinstance(b, dict)]
+    return bl, {"file": os.path.basename(p), "exists": True, "verdict": doc.get("verdict"),
+                "structural": bool((doc.get("structural_mismatch") or {}).get("detected"))}
+
+
+def score_critique(run_dir: str, agent: str) -> dict:
+    """CRITIQUE-stage output summary (E5). Defect detection itself needs the
+    answer keys and is computed by scripts/score_critiques.py, not here."""
+    bl, info = critique_blockers(run_dir, agent)
+    sev = {}
+    for b in bl:
+        sev[str(b.get("severity", "?")).upper()] = sev.get(str(b.get("severity", "?")).upper(), 0) + 1
+    schema = {}
+    if agent.startswith("critique-") and info.get("exists"):
+        try:
+            import validate_critique_yaml as V
+            V.validate_critique(os.path.join(run_dir, info["file"]), agent, 1)
+            schema = {"schema_ok": True}
+        except Exception as e:  # noqa: BLE001
+            schema = {"schema_ok": False, "schema_error": str(e)[:200]}
+    return {"critique": {**info, "n_blockers": len(bl), "by_severity": sev, **schema}}
+
+
 def flatten(scores: dict) -> dict:
     """Numeric view used by replay_compare (higher is better unless noted)."""
+    if "critique" in scores:
+        c = scores["critique"]
+        return {"n_blockers": c.get("n_blockers"), "n_high": (c.get("by_severity") or {}).get("HIGH", 0),
+                "critique_written": float(bool(c.get("exists"))),
+                "schema_ok": None if "schema_ok" not in c else float(c["schema_ok"])}
     a = scores.get("artifacts") or {}
     e = scores.get("effort_floors") or {}
     f = scores.get("framework") or {}

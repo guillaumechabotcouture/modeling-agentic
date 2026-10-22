@@ -1,0 +1,6 @@
+id: crossmodel
+stage: CRITIQUE
+agent: crossmodel
+budget_usd: 0
+wall_timeout_s: 1800
+# Codex (gpt-6.1-sol, configured model). Needs a logged-in codex on PATH; OpenAI cost not tracked here.

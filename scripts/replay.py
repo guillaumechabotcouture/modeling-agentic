@@ -64,7 +64,18 @@ import stage_scorers  # noqa: E402
 from telemetry import RATIOS  # noqa: E402
 
 LINK_MIN_BYTES = 1 * 2**20
-STAGES = {"MODEL": {"agent": "modeler", "score": stage_scorers.score_model}}
+STAGES = {"MODEL": {"agent": "modeler", "score": stage_scorers.score_model},
+          # E5: one critic per variant (`agent:` in the variant YAML) — a pipeline critic
+          # agent, `deterministic` (validators only, no LLM) or `crossmodel` (Codex).
+          "CRITIQUE": {"agent": None, "score": stage_scorers.score_critique}}
+NON_LLM_CRITICS = ("deterministic", "crossmodel")
+
+
+def stage_agent_name(stage: str, variant: dict) -> str:
+    name = variant.get("agent") or STAGES[stage]["agent"]
+    if not name:
+        raise ValueError(f"stage {stage} needs `agent:` in the variant YAML")
+    return name
 
 LEAD_PROMPT = ("You are a replay harness. Spawn the `{agent}` subagent exactly once with the task "
                "below, verbatim, and wait for it to finish. Do not do any work yourself, do not "
@@ -110,7 +121,7 @@ def load_variant(path: str) -> dict:
 def stage_agent_def(stage: str, question: str, run_dir: str, variant: dict):
     from agents import build_agents
     defs = build_agents(question=question, run_dir=run_dir)
-    d = defs[STAGES[stage]["agent"]]
+    d = defs[stage_agent_name(stage, variant)]
     changes = {}
     if variant.get("model"):
         changes["model"] = variant["model"]
@@ -140,6 +151,9 @@ async def sdk_runner(stage, fixture_dir, run_dir, variant, telemetry_rows) -> di
     """
     question = json.load(open(os.path.join(run_dir, "metadata.json"))).get("question", "")
     task = open(os.path.join(fixture_dir, "spawn_prompt.md")).read().replace("{run_dir}", run_dir)
+    if stage == "CRITIQUE" and stage_agent_name(stage, variant) in NON_LLM_CRITICS:
+        fn = deterministic_critic if stage_agent_name(stage, variant) == "deterministic" else crossmodel_critic
+        return await fn(run_dir, variant)
     adef = stage_agent_def(stage, question, run_dir, variant)
     seg_n = int(variant.get("fresh_context_every") or 0)
     if not seg_n:
@@ -179,7 +193,7 @@ async def _sdk_session(stage, run_dir, variant, adef, task, budget_usd, telemetr
     from claude_agent_sdk import (query, ClaudeAgentOptions, AssistantMessage, ResultMessage,
                                   SystemMessage)
     from agents import create_hooks, enforcement, output_caps
-    agent = STAGES[stage]["agent"]
+    agent = stage_agent_name(stage, variant)
     trace = open(os.path.join(os.path.dirname(run_dir), "trace.jsonl"), "a")
     hooks = create_hooks(run_dir, trace, datetime.now(), registered_agents={agent},
                          max_turns={agent: adef.maxTurns})
@@ -228,6 +242,72 @@ async def _sdk_session(stage, run_dir, variant, adef, task, budget_usd, telemetr
             "num_turns": getattr(result, "num_turns", None)}
 
 
+_STUB_REVIEWERS = ("critique-methods", "critique-domain", "critique-presentation", "critique-redteam")
+
+
+async def deterministic_critic(run_dir: str, variant: dict) -> dict:
+    """E5 arm: the mechanical gate alone (no LLM). Writes empty PASS stubs for
+    the four critics so the validator runs, collects every finding it raises
+    (unresolved HIGHs, accept blockers, rigor violations of any severity),
+    removes the stubs, and records the findings as critique_deterministic.yaml."""
+    import subprocess
+    stubs = []
+    for r in _STUB_REVIEWERS:
+        p = os.path.join(run_dir, f"critique_{r.split('-', 1)[1]}.yaml")
+        yaml.safe_dump({"reviewer": r, "round": 1, "verdict": "PASS",
+                        "structural_mismatch": {"detected": False}, "blockers": [], "carried_forward": []},
+                       open(p, "w"), sort_keys=False)
+        stubs.append(p)
+    t0 = time.time()
+    cmd = [sys.executable, os.path.join(HERE, "validate_critique_yaml.py"), run_dir, "--max-rounds", "8",
+           "--current-round", "1", "--spec-compliance", "--parameter-registry", "--rigor-artifacts",
+           "--json", "--no-history"]
+    proc = await asyncio.to_thread(subprocess.run, cmd, cwd=REPO, capture_output=True, text=True,
+                                   timeout=float(variant.get("wall_timeout_s", 900)))
+    for p in stubs:
+        os.remove(p)
+    out = proc.stdout.strip()
+    try:
+        dec = json.loads(out[out.index("{"):])
+    except (ValueError, json.JSONDecodeError):
+        dec = {"error": (proc.stderr or out)[-500:]}
+    findings = [("HIGH", b) for b in dec.get("unresolved_high") or []] + \
+               [("HIGH", b) for b in dec.get("accept_blockers") or []] + \
+               [(str(v.get("severity", "MEDIUM")).upper(), v) for v in dec.get("rigor_violations") or []]
+    seen, blockers = set(), []
+    for sev, f in findings:
+        key = (f.get("kind"), f.get("claim"))
+        if key in seen:
+            continue
+        seen.add(key)
+        blockers.append({"id": f"DET-{len(blockers) + 1:03d}", "severity": sev if sev in ("HIGH", "MEDIUM", "LOW") else "MEDIUM",
+                         "kind": f.get("kind"), "claim": str(f.get("claim") or f.get("kind") or ""),
+                         "evidence": json.dumps({k: v for k, v in f.items() if k not in ("claim",)}, default=str)[:2000]})
+    yaml.safe_dump({"reviewer": "deterministic", "round": 1, "action": dec.get("action"),
+                    "validator_exit": proc.returncode, "blockers": blockers,
+                    **({"error": dec["error"]} if "error" in dec else {})},
+                   open(os.path.join(run_dir, "critique_deterministic.yaml"), "w"), sort_keys=False)
+    return {"session_id": None, "subtype": "deterministic", "is_error": "error" in dec, "cost_usd": 0.0,
+            "num_turns": 0, "duration_s": round(time.time() - t0, 1)}
+
+
+async def crossmodel_critic(run_dir: str, variant: dict) -> dict:
+    """E5 arm: scripts/cross_model_critic.py (Codex, gpt-6.1-sol) as a subprocess.
+    Needs a logged-in `codex` on PATH (local machine, or a VM with the Codex
+    setup); otherwise the critic writes verdict UNAVAILABLE, which scores as 0
+    detections. OpenAI cost is not visible here (cost_usd = None)."""
+    import subprocess
+    t0 = time.time()
+    cmd = [sys.executable, os.path.join(HERE, "cross_model_critic.py"), run_dir, "--round", "1",
+           "--timeout-s", str(int(variant.get("wall_timeout_s", 1800)))]
+    if variant.get("model"):
+        cmd += ["--model", variant["model"]]
+    proc = await asyncio.to_thread(subprocess.run, cmd, cwd=REPO, capture_output=True, text=True,
+                                   timeout=float(variant.get("wall_timeout_s", 1800)) + 120)
+    return {"session_id": None, "subtype": "crossmodel", "is_error": proc.returncode != 0, "cost_usd": None,
+            "num_turns": 0, "duration_s": round(time.time() - t0, 1), "stderr_tail": proc.stderr[-400:]}
+
+
 async def dry_runner(stage, fixture_dir, run_dir, variant, telemetry_rows) -> dict:
     """--dry-agent: no LLM call; scorers run on the fixture as-is. Used to test
     the plumbing (workspace, scoring, packaging, cloud ship/collect) for free."""
@@ -256,6 +336,7 @@ def _subagent_rows_from_transcripts(session_id, rows):
 # --------------------------------------------------------------------------- one case
 
 async def run_case(stage, fixture_dir, variant, batch_dir, seed, runner=sdk_runner) -> dict:
+    stage = variant.get("stage", stage)          # E5 critic variants carry `stage: CRITIQUE`
     fid = os.path.basename(os.path.normpath(fixture_dir))
     ws = os.path.join(batch_dir, variant["id"], f"{fid}-s{seed}")
     run_dir = make_workspace(fixture_dir, ws)
@@ -281,7 +362,9 @@ async def run_case(stage, fixture_dir, variant, batch_dir, seed, runner=sdk_runn
     if res.get("subtype") == "error_max_budget_usd" or "budget" in str(res.get("subtype", "")):
         status = "budget_stop"
     stage_rows = [r for r in rows if r["agent"] != "lead"]
-    scores = stage_scorers.score_model(run_dir) if stage == "MODEL" else {}
+    scores = (stage_scorers.score_model(run_dir) if stage == "MODEL" else
+              stage_scorers.score_critique(run_dir, stage_agent_name(stage, variant)) if stage == "CRITIQUE"
+              else {})
     case = {
         "fixture": fid, "variant": variant["id"], "seed": seed, "stage": stage, "status": status,
         "result": {k: v for k, v in res.items() if k != "model_usage"},
@@ -594,6 +677,45 @@ def _self_test() -> int:
                "S3 default path is one unmodified session")
     finally:
         globals()["_sdk_session"], globals()["stage_agent_def"] = _orig_session, _orig_def
+
+    # K1-K4 (E5): CRITIQUE stage — agent from the variant, deterministic arm,
+    # stub LLM critic scored, stage taken from the variant YAML.
+    with tempfile.TemporaryDirectory() as td:
+        fx = os.path.join(td, "CF__p1")
+        os.makedirs(os.path.join(fx, "inputs"))
+        json.dump({"question": "Allocate a vaccination budget across districts"},
+                  open(os.path.join(fx, "inputs", "metadata.json"), "w"))
+        open(os.path.join(fx, "inputs", "results.md"), "w").write("# Results\n")
+        open(os.path.join(fx, "spawn_prompt.md"), "w").write("This is critique round 1. Run directory: {run_dir}")
+        ok(stage_agent_name("CRITIQUE", {"agent": "critique-methods"}) == "critique-methods", "K1 agent from variant")
+        try:
+            stage_agent_name("CRITIQUE", {})
+            ok(False, "K1 missing agent must raise")
+        except ValueError:
+            pass
+        det = {"id": "det", "stage": "CRITIQUE", "agent": "deterministic", "budget_usd": 0, "wall_timeout_s": 300}
+        c = asyncio.run(run_case("MODEL", fx, det, os.path.join(td, "b"), 0))
+        run = os.path.join(c["workspace"], "run")
+        doc = yaml.safe_load(open(os.path.join(run, "critique_deterministic.yaml")))
+        ok(c["stage"] == "CRITIQUE" and c["status"] == "ok" and isinstance(doc.get("blockers"), list),
+           f"K2 deterministic arm ran (stage from variant): {c['status']} {doc.keys() if doc else None}")
+        ok(not any(os.path.exists(os.path.join(run, f"critique_{r.split('-', 1)[1]}.yaml")) for r in _STUB_REVIEWERS),
+           "K3 deterministic arm removes its PASS stubs")
+
+        async def stub_critic(stage, fixture_dir, run_dir, variant, rows):
+            yaml.safe_dump({"reviewer": "critique-methods", "round": 1, "verdict": "REVISE",
+                            "structural_mismatch": {"detected": False}, "carried_forward": [],
+                            "blockers": [{"id": "M-001", "severity": "HIGH", "category": "METHODS",
+                                          "target_stage": "MODEL", "first_seen_round": 1,
+                                          "claim": "uncertainty_report.yaml interval is zero-width",
+                                          "evidence": "ci_low == ci_high", "fix_requires": "rerun UQ",
+                                          "resolved": False}]},
+                           open(os.path.join(run_dir, "critique_methods.yaml"), "w"), sort_keys=False)
+            return {"session_id": None, "subtype": "success", "is_error": False, "cost_usd": 0.5}
+        cm = {"id": "m", "stage": "CRITIQUE", "agent": "critique-methods", "budget_usd": 1, "wall_timeout_s": 60}
+        c2 = asyncio.run(run_case("MODEL", fx, cm, os.path.join(td, "b"), 0, runner=stub_critic))
+        ok(c2["flat"].get("n_blockers") == 1 and c2["flat"].get("n_high") == 1 and c2["flat"].get("schema_ok") == 1.0,
+           f"K4 critic output scored: {c2['flat']}")
 
     if failures:
         print("SELF-TEST FAILURES:", *failures, sep="\n  - "); return 1

@@ -1,0 +1,5 @@
+id: deterministic
+stage: CRITIQUE
+agent: deterministic
+budget_usd: 0
+wall_timeout_s: 900

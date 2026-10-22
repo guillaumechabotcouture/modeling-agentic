@@ -1,0 +1,6 @@
+id: redteam
+stage: CRITIQUE
+agent: critique-redteam
+max_turns: 40
+budget_usd: 6
+wall_timeout_s: 1800
