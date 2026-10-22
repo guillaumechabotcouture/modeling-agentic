@@ -50,3 +50,34 @@ Otherwise, report and iterate. With n = 6 pairs this is a screening test: a "pas
 
 - A 60-turn / $20 cap measures *early-stage progress*, not complete MODEL output quality. A complete-stage comparison follows once the compute service lands (v2 §3.2).
 - Fixture fidelity limits are as documented in `scripts/fixtures.py`: some spawn prompts are synthesized, and some historical fixtures lack `pre_mortem.yaml`.
+
+## Results (2026-10-22; 12/12 cases collected, sha256-verified)
+
+**Decision: NOT ADOPTED under the pre-registered rule.** It's a screening result; follow-up is E1b.
+
+| Criterion | Result | Pass |
+|---|---|---|
+| Δ artifact_rate 95% CI lower bound ≥ −0.10 | Δ +0.12, CI [−0.31, +0.50] (n = 6) | ✗ inconclusive (underpowered) |
+| No framework-compliance regression | 6/6 OK in both arms | ✓ |
+| Cost per turn −40% | $0.166 → $0.122 (−26%) | ✗ |
+
+**Efficiency:**
+- Start context 186K → 32K tokens (−82%).
+- Input tokens per case −43%, CI [−8.6M, −8.0M].
+- Cost per case $9.93 → $7.31, CI on the difference [−$4.56, −$0.70].
+- The rest of the cost is conversation-history growth: the start-context saving × 60 turns accounts for the whole input-token reduction.
+
+**Quality signals** (n = 6, not significant): compare_models CLEAN 0.50 vs 0.17; artifacts drafted higher; eligibility findings similar.
+
+**Concern:** HIGH effort-floor violations in the variant in 4/6 cases (control 0/6).
+- Part of this is a selection effect: the variant drafted more artifacts, with 24 floor checks evaluated vs 21.
+- But `calibration_result_missing` (both measles cases) and `sensitivity_min_perturbation_points` point to packet gaps. The full prompt instructs these explicitly; the packet only lists them as floors.
+
+**Spend:** about $100 of API cost, against a $240 cap.
+
+**Deviations:**
+- The first auto-collector crashed, because status tasks queued behind single-threaded workers. Fixed to use `client.run`; no data lost.
+- One variant case (HIST_235631) ended by wall timeout, after a late start caused by fixture upload.
+- Fixtures were the pre-slimming versions (3.2 GB total, mostly unused raw files). The inputs the modeler used were identical across arms, so this doesn't bias the comparison.
+
+Full table: `E1_results_table.md`.

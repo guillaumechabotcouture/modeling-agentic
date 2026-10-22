@@ -102,6 +102,17 @@ def variants_bundle(variants: list[dict]) -> bytes:
         return tar_bytes([(os.path.join(td, n), n) for n in sorted(os.listdir(td))])
 
 
+def write_batch_json(batch_dir: str, cases: list) -> None:
+    """batch.json = {"preflight": <launch preflight record or None>, "cases": [...]}."""
+    pf = None
+    try:
+        pf = json.load(open(os.path.join(batch_dir, "preflight.json")))
+    except (OSError, ValueError):
+        pass
+    json.dump({"preflight": pf, "cases": cases}, open(os.path.join(batch_dir, "batch.json"), "w"),
+              indent=1, default=str)
+
+
 def plan_cases(fixture_dirs, variants, seeds):
     return [{"key": case_key(v["id"], os.path.basename(os.path.normpath(f)), s),
              "fixture_dir": f, "fixture_id": os.path.basename(os.path.normpath(f)),
@@ -338,8 +349,10 @@ def _download(client, worker, key, size, sha, dest):
         while have < size:
             for attempt in range(6):
                 try:
-                    b = client.submit(remote_chunk, key, have, CHUNK, workers=[worker],
-                                      allow_other_workers=False, pure=False).result(timeout=300)
+                    # client.run executes on the worker's event loop, not its single task
+                    # thread (which may be busy running another case) — a submitted task
+                    # would queue behind it and time out.
+                    b = client.run(remote_chunk, key, have, CHUNK, workers=[worker]).get(worker)
                     break
                 except Exception:
                     if attempt == 5:
@@ -385,8 +398,7 @@ def collect(batch_dir, cluster_name=None, watch=False, interval_s=60, log=print)
         pending = [k for k in rec["cases"] if not os.path.exists(os.path.join(done_dir, k))]
         for k in pending:
             cr = rec["cases"][k]
-            m = client.submit(remote_meta, k, workers=[cr["worker"]], allow_other_workers=False,
-                              pure=False).result(timeout=600)
+            m = client.run(remote_meta, k, workers=[cr["worker"]]).get(cr["worker"])
             if m["state"] != "done":
                 log(f"  {k}: {m['state']}")
                 continue
@@ -405,7 +417,7 @@ def collect(batch_dir, cluster_name=None, watch=False, interval_s=60, log=print)
             for k, cr in rec["cases"].items():
                 cj = os.path.join(batch_dir, cr["variant_id"], f"{cr['fixture_id']}-s{cr['seed']}", "case.json")
                 cases.append(json.load(open(cj)))
-            json.dump(cases, open(os.path.join(batch_dir, "batch.json"), "w"), indent=1, default=str)
+            write_batch_json(batch_dir, cases)
             log(f"all {len(cases)} cases collected -> {batch_dir}/batch.json")
             if watch:
                 cluster.shutdown()
@@ -421,8 +433,7 @@ def status(batch_dir, cluster_name=None, log=print):
     client = attach(cluster_name or rec["cluster"], rec.get("workspace", WORKSPACE)).get_client()
     out = {}
     for k, cr in rec["cases"].items():
-        m = client.submit(remote_meta, k, workers=[cr["worker"]], allow_other_workers=False,
-                          pure=False).result(timeout=600)
+        m = client.run(remote_meta, k, workers=[cr["worker"]]).get(cr["worker"])
         out[k] = m.get("state")
         log(f"  {k}: {m.get('state')} {m.get('status', '')} {m.get('log_bytes', '')}")
     return out

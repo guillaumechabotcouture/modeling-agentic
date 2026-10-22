@@ -97,6 +97,7 @@ def load_variant(path: str) -> dict:
     v.setdefault("id", os.path.splitext(os.path.basename(path))[0])
     v.setdefault("budget_usd", 25.0)
     v.setdefault("wall_timeout_s", 3600)
+    v.setdefault("path", os.path.abspath(path))       # for payload accounting in preflight
     if v.get("prompt_file") and not os.path.isabs(v["prompt_file"]):
         v["prompt_file"] = os.path.join(os.path.dirname(os.path.abspath(path)), v["prompt_file"])
     return v
@@ -269,8 +270,95 @@ async def run_batch(stage, fixture_dirs, variants, batch_dir, seeds=1, backend=N
     jobs = [backend.submit(lambda f=f, v=v, s=s: run_case(stage, f, v, batch_dir, s, runner))
             for f in fixture_dirs for v in variants for s in range(seeds)]
     cases = await asyncio.gather(*jobs)
-    json.dump(cases, open(os.path.join(batch_dir, "batch.json"), "w"), indent=1, default=str)
+    import replay_coiled
+    replay_coiled.write_batch_json(batch_dir, cases)
     return cases
+
+
+# --------------------------------------------------------------------------- preflight
+
+def _dir_bytes(path: str) -> int:
+    total = 0
+    for root, _, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
+
+def _code_bytes(repo: str) -> int:
+    import subprocess
+    try:
+        files = subprocess.check_output(["git", "-C", repo, "ls-files", "-co", "--exclude-standard"],
+                                        text=True).split("\n")
+    except (OSError, subprocess.CalledProcessError):
+        return 0
+    return sum(os.path.getsize(os.path.join(repo, f)) for f in files
+               if f and os.path.isfile(os.path.join(repo, f)))
+
+
+def preflight(planned: list, variants: list, backend: str, workers: int | None, repo: str = REPO,
+              max_fixture_mb: float = 50, max_upload_gb: float = 1.0, upload_mbps: float = 10.0,
+              allow_large: str | None = None, out: str | None = None) -> dict:
+    """Size/time/cost review before a launch. Refuses oversized payloads unless
+    `allow_large` carries a reason. Prompted by a launch that shipped ~2.7 GB of
+    fixtures (incl. a 472 MB raster the stage never read) with no review."""
+    fx_bytes = {}
+    for c in planned:
+        fx_bytes.setdefault(c["fixture_id"], _dir_bytes(c["fixture_dir"]))
+    var_bytes = 0
+    for v in variants:
+        if v.get("path") and os.path.exists(v["path"]):
+            var_bytes += os.path.getsize(v["path"])
+        if v.get("prompt_file") and os.path.exists(v["prompt_file"]):
+            var_bytes += os.path.getsize(v["prompt_file"])
+    code = _code_bytes(repo) if backend == "coiled" else 0
+    n_workers = min(workers or len(planned), len(planned)) if planned else 0
+    per_case = {c["key"]: fx_bytes[c["fixture_id"]] + (code + var_bytes if backend == "coiled" else 0)
+                for c in planned}
+    upload = (sum(fx_bytes[c["fixture_id"]] for c in planned) + code * n_workers + var_bytes * len(planned)
+              if backend == "coiled" else 0)
+    caps = {v["id"]: {k: v.get(k) for k in ("max_turns", "budget_usd", "wall_timeout_s", "model")}
+            for v in variants}
+    violations = [f"fixture {f} is {b / 2**20:.1f} MB > --max-fixture-mb {max_fixture_mb}"
+                  for f, b in sorted(fx_bytes.items()) if b > max_fixture_mb * 2**20]
+    if upload > max_upload_gb * 2**30:
+        violations.append(f"total upload {upload / 2**30:.2f} GB > --max-upload-gb {max_upload_gb}")
+    rec = {"backend": backend, "cases": len(planned), "workers": n_workers,
+           "fixture_mb": {f: round(b / 2**20, 2) for f, b in sorted(fx_bytes.items())},
+           "code_mb": round(code / 2**20, 2), "variants_kb": round(var_bytes / 1024, 1),
+           "per_case_mb": {k: round(b / 2**20, 2) for k, b in per_case.items()},
+           "upload_mb": round(upload / 2**20, 1),
+           "upload_eta_min": round(upload / (upload_mbps * 2**20) / 60, 1) if upload else 0.0,
+           "upload_mbps_assumed": upload_mbps, "caps": caps,
+           "total_budget_usd": round(sum(c["budget_usd"] for c in planned), 2),
+           "limits": {"max_fixture_mb": max_fixture_mb, "max_upload_gb": max_upload_gb},
+           "violations": violations, "override_reason": allow_large if violations else None,
+           "refused": bool(violations) and not allow_large,
+           "at": datetime.now().isoformat(timespec="seconds")}
+    lines = [f"PREFLIGHT  backend={backend}  cases={len(planned)}  workers={n_workers}"]
+    for f, mb in rec["fixture_mb"].items():
+        lines.append(f"  fixture {f:18} {mb:9.2f} MB")
+    lines.append(f"  code {rec['code_mb']} MB per worker, variants {rec['variants_kb']} KB")
+    lines.append(f"  upload total {rec['upload_mb']} MB, ~{rec['upload_eta_min']} min at {upload_mbps} MB/s")
+    for vid, cp in caps.items():
+        lines.append(f"  variant {vid:18} turns<={cp['max_turns']} budget<=${cp['budget_usd']} "
+                     f"wall<={cp['wall_timeout_s']}s model={cp['model']}")
+    lines.append(f"  total spend cap ${rec['total_budget_usd']}")
+    for v in violations:
+        lines.append(f"  VIOLATION: {v}")
+    if violations:
+        lines.append(f"  OVERRIDE: {allow_large}" if allow_large else
+                     "  REFUSED: pass --allow-large \"<reason>\" to launch anyway")
+    print("\n".join(lines))
+    if out:
+        os.makedirs(out, exist_ok=True)
+        json.dump(rec, open(os.path.join(out, "preflight.json"), "w"), indent=1)
+    if rec["refused"]:
+        raise SystemExit("preflight refused the launch: " + "; ".join(violations))
+    return rec
 
 
 # --------------------------------------------------------------------------- self-test
@@ -319,6 +407,32 @@ def _self_test() -> int:
         rates = {x["variant"]: x["flat"]["artifact_rate"] for x in cases}
         ok(rates["better"] > rates["base"], f"R6 variants differ: {rates}")
         ok(os.path.exists(os.path.join(batch, "batch.json")), "R7 batch.json written")
+        bj = json.load(open(os.path.join(batch, "batch.json")))
+        ok(isinstance(bj, dict) and len(bj["cases"]) == 4, "R7b batch.json carries cases (and preflight)")
+        # P1-P4: launch preflight
+        import replay_coiled as _rc
+        plan = _rc.plan_cases([os.path.join(td, "fx", "F1")], variants, 1)
+        import contextlib
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            pf = preflight(plan, variants, "local", None, max_fixture_mb=50, out=os.path.join(td, "pf_ok"))
+        ok(not pf["violations"] and "PREFLIGHT" in buf.getvalue() and pf["total_budget_usd"] == 2.0,
+           f"P1 clean preflight: {pf['violations']}")
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                preflight(plan, variants, "coiled", 2, max_fixture_mb=0.5, out=os.path.join(td, "pf_bad"))
+            ok(False, "P2 oversized fixture not refused")
+        except SystemExit as e:
+            ok("max-fixture-mb" in str(e), f"P2 refusal message: {e}")
+        ok(json.load(open(os.path.join(td, "pf_bad", "preflight.json")))["refused"] is True, "P3 refusal recorded")
+        with contextlib.redirect_stdout(io.StringIO()):
+            pf2 = preflight(plan, variants, "coiled", 2, max_fixture_mb=0.5, allow_large="needs the raster",
+                            out=os.path.join(td, "pf_over"))
+        ok(pf2["override_reason"] == "needs the raster" and not pf2["refused"] and pf2["upload_mb"] > 0
+           and pf2["code_mb"] > 0, "P4 override recorded with reason; coiled upload counted")
+        bdir = os.path.join(td, "pf_over")
+        _rc.write_batch_json(bdir, [])
+        ok(json.load(open(os.path.join(bdir, "batch.json")))["preflight"]["override_reason"] == "needs the raster",
+           "P5 batch.json carries the preflight record")
 
         async def boom(*a):
             raise RuntimeError("agent crashed")
@@ -395,6 +509,10 @@ def main() -> int:
     ap.add_argument("--cluster-name")
     ap.add_argument("--workers", type=int)
     ap.add_argument("--max-total-usd", type=float)
+    ap.add_argument("--max-fixture-mb", type=float, default=50)
+    ap.add_argument("--max-upload-gb", type=float, default=1.0)
+    ap.add_argument("--upload-mbps", type=float, default=10.0)
+    ap.add_argument("--allow-large", metavar="REASON")
     ap.add_argument("--dry-agent", action="store_true")
     ap.add_argument("--batch")
     ap.add_argument("--watch", action="store_true")
@@ -437,6 +555,9 @@ def main() -> int:
     planned = replay_coiled.plan_cases(fixtures, variants, a.seeds)
     total = replay_coiled.check_total_budget(planned, a.max_total_usd)
     print(f"{len(planned)} cases, max spend ${total:.2f}")
+    preflight(planned, variants, a.backend, a.workers, max_fixture_mb=a.max_fixture_mb,
+              max_upload_gb=a.max_upload_gb, upload_mbps=a.upload_mbps,
+              allow_large=a.allow_large, out=batch)
     if a.backend == "coiled":
         if not a.cluster_name:
             raise SystemExit("--cluster-name is required for --backend coiled")
