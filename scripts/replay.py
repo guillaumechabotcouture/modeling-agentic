@@ -3,7 +3,13 @@
 
     python3 scripts/replay.py run --fixtures <root> --variants a.yaml b.yaml \
         [--only F1 F2] [--seeds 1] [--concurrency 2] [--out <batch_dir>] [--stage MODEL]
-    python3 scripts/replay.py --self-test        # stubbed agent, no API calls
+    python3 scripts/replay.py run --backend coiled --cluster-name NAME --workers N \
+        --fixtures <root> --variants a.yaml b.yaml [--max-total-usd 300] [--dry-agent]
+    python3 scripts/replay.py collect --batch <batch_dir> [--watch]   # pull cloud results
+    python3 scripts/replay.py status --batch <batch_dir>
+    python3 scripts/replay.py shutdown --cluster-name NAME
+    python3 scripts/replay.py case --fixture F --variant v.yaml --seed 0 --out <batch_dir>  # one case (used on VMs)
+    python3 scripts/replay.py --self-test        # stubbed agent, no API calls, Coiled mocked
 
 A variant YAML:
     id: baseline-prompt
@@ -13,6 +19,8 @@ A variant YAML:
     max_turns: 150                  # optional
     budget_usd: 25                  # hard stop (CLI --max-budget-usd)
     wall_timeout_s: 3600
+    tools: [Read, Write, Bash, Skill]   # optional: override the stage agent's tools
+    env: {KEY: value}               # optional: extra env vars for the agent session
 
 Each case = (fixture, variant, seed) runs in its own workspace under
 <repo>/runs/_replay/<batch>/<variant>/<fixture>-s<seed>/ with the fixture's
@@ -39,6 +47,9 @@ import time
 from datetime import datetime
 
 import yaml
+import hashlib
+import io
+import tarfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -104,6 +115,8 @@ def stage_agent_def(stage: str, question: str, run_dir: str, variant: dict):
         changes["skills"] = variant["skills"]
     if variant.get("max_turns"):
         changes["maxTurns"] = int(variant["max_turns"])
+    if isinstance(variant.get("tools"), list):
+        changes["tools"] = list(variant["tools"])
     return dataclasses.replace(d, **changes) if changes else d
 
 
@@ -131,7 +144,8 @@ async def sdk_runner(stage, fixture_dir, run_dir, variant, telemetry_rows) -> di
         model=enforcement.MODEL_FAST, agents={agent: adef}, tools=session_tools,
         allowed_tools=session_tools, add_dirs=[os.path.dirname(run_dir)],
         permission_mode="bypassPermissions", setting_sources=["project"], hooks=hooks, cwd=REPO,
-        env=enforcement.filtered_env(dict(os.environ), False),
+        env={**enforcement.filtered_env(dict(os.environ), False),
+             **{str(k): str(v) for k, v in (variant.get("env") or {}).items()}},
         max_budget_usd=float(variant["budget_usd"]), max_buffer_size=enforcement.MAX_BUFFER_SIZE)
     seen, result, session_id = set(), None, None
     try:
@@ -160,6 +174,13 @@ async def sdk_runner(stage, fixture_dir, run_dir, variant, telemetry_rows) -> di
             "cost_usd": getattr(result, "total_cost_usd", None),
             "model_usage": getattr(result, "model_usage", None),
             "num_turns": getattr(result, "num_turns", None)}
+
+
+async def dry_runner(stage, fixture_dir, run_dir, variant, telemetry_rows) -> dict:
+    """--dry-agent: no LLM call; scorers run on the fixture as-is. Used to test
+    the plumbing (workspace, scoring, packaging, cloud ship/collect) for free."""
+    await asyncio.sleep(0)
+    return {"session_id": None, "subtype": "dry", "is_error": False, "cost_usd": 0.0, "num_turns": 0}
 
 
 def _subagent_rows_from_transcripts(session_id, rows):
@@ -238,20 +259,9 @@ class LocalBackend:
             return await coro_factory()
 
 
-class CoiledBackend:
-    """Interface stub (not wired). Intended pattern, proven in the Phase 21 A/B
-    (scratchpad/coiled_run/ab_cluster.py): one named cluster with
-    shutdown_on_close=False; scatter the fixture tarball to a pinned worker,
-    fire_and_forget a task that runs `run_case` there and writes case.json +
-    workspace tarball to local disk (or the project storage account once it
-    exists); a collector fetches results in checksum-verified chunks; attach
-    only to a running cluster (coiled.Cluster(name=...) silently creates one)."""
-
-    def __init__(self, cluster_name: str, workspace: str = "idm-coiled-idmad-r2"):
-        self.cluster_name, self.workspace = cluster_name, workspace
-
-    async def submit(self, coro_factory):
-        raise NotImplementedError("Coiled backend not wired yet; use LocalBackend")
+# The Coiled backend is fire-and-forget (see scripts/replay_coiled.py): `run
+# --backend coiled` launches and returns; `collect` installs results into the
+# same batch layout as LocalBackend, so replay_compare.py is backend-agnostic.
 
 
 async def run_batch(stage, fixture_dirs, variants, batch_dir, seeds=1, backend=None, runner=sdk_runner):
@@ -314,10 +324,64 @@ def _self_test() -> int:
             raise RuntimeError("agent crashed")
         bad = asyncio.run(run_case("MODEL", os.path.join(td, "fx", "F1"), variants[0], batch, 9, runner=boom))
         ok(bad["status"] == "error" and "crashed" in bad["result"]["error"], "R8 crash recorded per case")
+        # V1: a variant's `tools` lands on the stage AgentDefinition itself (and so
+        # on both backends, which share run_case); control keeps the defaults.
+        from agents import build_agents
+        default_tools = list(build_agents(question="q", run_dir="runs/x")["modeler"].tools or [])
+        e1 = os.path.join(REPO, "experiments", "E1_context_diet")
+        vpath, cpath = os.path.join(e1, "variant.yaml"), os.path.join(e1, "control.yaml")
+        if not (os.path.exists(vpath) and os.path.exists(cpath)):
+            vpath, cpath = os.path.join(vdir, "e1v.yaml"), os.path.join(vdir, "e1c.yaml")
+            yaml.safe_dump({"id": "e1v", "skills": [], "tools": ["Bash", "Write", "Edit", "Read", "Glob", "Grep", "Skill"]},
+                           open(vpath, "w"))
+            yaml.safe_dump({"id": "e1c"}, open(cpath, "w"))
+        dv = stage_agent_def("MODEL", "q", "runs/x", load_variant(vpath))
+        dc = stage_agent_def("MODEL", "q", "runs/x", load_variant(cpath))
+        ok("Skill" in (dv.tools or []), f"V1 variant tools lack Skill: {dv.tools}")
+        ok(list(dc.tools or []) == default_tools, f"V1 control tools changed: {dc.tools} vs {default_tools}")
+        ok("Skill" in ({"Agent", "Skill"} | set(dv.tools or [])), "V1 session tools include Skill")
+
+        # C1-C6: Coiled backend logic, exercised locally with Coiled/Dask mocked out.
+        import replay_coiled as rcoil
+        cases_plan = rcoil.plan_cases([os.path.join(td, "fx", "F1")], variants, 2)
+        ok(len(cases_plan) == 4 and len({c["key"] for c in cases_plan}) == 4, "C1 plan_cases unique keys")
         try:
-            asyncio.run(CoiledBackend("x").submit(lambda: None)); ok(False, "R9 coiled stub should raise")
-        except NotImplementedError:
+            rcoil.check_total_budget(cases_plan, 3.0); ok(False, "C2 budget cap not enforced")
+        except SystemExit:
             pass
+        ok(rcoil.check_total_budget(cases_plan, 10.0) == 4.0, "C2 budget total")
+        asg = rcoil.assign_workers(cases_plan, ["w2", "w1"])
+        ok(sorted(set(asg.values())) == ["w1", "w2"] and list(asg.values()).count("w1") == 2, f"C3 round-robin: {asg}")
+        pf = os.path.join(vdir, "p.md"); open(pf, "w").write("PROMPT {run_dir}")
+        vb = rcoil.variants_bundle([dict(variants[0], prompt_file=pf)])
+        names = tarfile.open(fileobj=io.BytesIO(vb), mode="r:gz").getnames()
+        ok(sorted(names) == ["base.prompt.md", "base.yaml"], f"C4 variant bundle: {names}")
+        ok(repr(rcoil.Redacted("sk-secret")) == "<redacted>" and "sk-secret" not in str(rcoil.Redacted("sk-secret")),
+           "C5 Redacted never prints the secret")
+        # C6: the full remote case on this machine (dry agent), then install into a batch.
+        code, info = rcoil.code_tarball(REPO)
+        spec = {k: cases_plan[0][k] for k in ("key", "fixture_id", "variant_id", "seed")}
+        rbase = os.path.join(td, "remote")
+        meta = rcoil.remote_case(spec, code, rcoil.fixture_tarball(os.path.join(td, "fx", "F1")),
+                                 rcoil.variants_bundle(variants), rcoil.Redacted(None), True, base=rbase)
+        meta2 = rcoil.remote_case(spec, code, rcoil.fixture_tarball(os.path.join(td, "fx", "F1")),
+                                  rcoil.variants_bundle(variants), rcoil.Redacted(None), True, base=rbase)
+        ok(meta2.get("status") == "ok", f"C7 re-running a case on the same worker is idempotent: {meta2.get('error')}")
+        full = rcoil.remote_meta(spec["key"], base=rbase)
+        ok(full["state"] == "done" and full["status"] == "ok" and full["size"] > 0,
+           f"C6 remote dry case ok: {meta.get('status')} {meta.get('error')}")
+        ok(full.get("skipped_inputs", 0) >= 1, "C6 unchanged fixture inputs not shipped back")
+        tar_local = os.path.join(td, "dl.tar.gz")
+        with open(tar_local, "wb") as f:
+            off = 0
+            while off < full["size"]:
+                b = rcoil.remote_chunk(spec["key"], off, 1000, base=rbase); f.write(b); off += len(b)
+        ok(hashlib.sha256(open(tar_local, "rb").read()).hexdigest() == full["sha256"], "C6 chunked fetch verifies")
+        cb = os.path.join(td, "cloudbatch")
+        installed = rcoil.install_result(cb, {**spec, "worker": "w1"}, full, tar_local)
+        ok(installed["workspace"].startswith(cb) and installed["cloud"]["worker"] == "w1"
+           and os.path.exists(os.path.join(installed["workspace"], "case.json")), "C6 installed in local layout")
+        ok(installed["result"]["subtype"] == "dry" and installed["telemetry"]["cost_usd"] == 0.0, "C6 dry agent")
     if failures:
         print("SELF-TEST FAILURES:", *failures, sep="\n  - "); return 1
     print("OK: all self-test cases passed.")
@@ -326,7 +390,17 @@ def _self_test() -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", nargs="?", choices=["run"])
+    ap.add_argument("cmd", nargs="?", choices=["run", "case", "collect", "status", "shutdown"])
+    ap.add_argument("--backend", choices=["local", "coiled"], default="local")
+    ap.add_argument("--cluster-name")
+    ap.add_argument("--workers", type=int)
+    ap.add_argument("--max-total-usd", type=float)
+    ap.add_argument("--dry-agent", action="store_true")
+    ap.add_argument("--batch")
+    ap.add_argument("--watch", action="store_true")
+    ap.add_argument("--fixture")
+    ap.add_argument("--variant")
+    ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--fixtures")
     ap.add_argument("--variants", nargs="+")
     ap.add_argument("--only", nargs="*")
@@ -338,6 +412,20 @@ def main() -> int:
     a = ap.parse_args()
     if a.self_test:
         return _self_test()
+    runner = dry_runner if a.dry_agent else sdk_runner
+    if a.cmd == "case":                     # one case; what the Coiled VM executes
+        case = asyncio.run(run_case(a.stage, a.fixture, load_variant(a.variant), a.out, a.seed, runner))
+        print(json.dumps({k: case[k] for k in ("fixture", "variant", "seed", "status")}))
+        return 0
+    if a.cmd in ("collect", "status"):
+        import replay_coiled
+        (replay_coiled.collect(a.batch, a.cluster_name, watch=a.watch) if a.cmd == "collect"
+         else replay_coiled.status(a.batch, a.cluster_name))
+        return 0
+    if a.cmd == "shutdown":
+        import replay_coiled
+        replay_coiled.shutdown(a.cluster_name)
+        return 0
     fixtures = sorted(os.path.join(a.fixtures, d) for d in os.listdir(a.fixtures)
                       if os.path.exists(os.path.join(a.fixtures, d, "fixture.yaml")))
     if a.only:
@@ -345,7 +433,21 @@ def main() -> int:
     variants = [load_variant(p) for p in a.variants]
     batch = a.out or os.path.join(REPO, "runs", "_replay", datetime.now().strftime("%Y%m%d_%H%M%S"))
     os.makedirs(batch, exist_ok=True)
-    cases = asyncio.run(run_batch(a.stage, fixtures, variants, batch, a.seeds, LocalBackend(a.concurrency)))
+    import replay_coiled
+    planned = replay_coiled.plan_cases(fixtures, variants, a.seeds)
+    total = replay_coiled.check_total_budget(planned, a.max_total_usd)
+    print(f"{len(planned)} cases, max spend ${total:.2f}")
+    if a.backend == "coiled":
+        if not a.cluster_name:
+            raise SystemExit("--cluster-name is required for --backend coiled")
+        key = None if a.dry_agent else os.environ.get("ANTHROPIC_API_KEY")
+        if not a.dry_agent and not key:
+            raise SystemExit("ANTHROPIC_API_KEY must be set in the launching shell for --backend coiled")
+        replay_coiled.launch(planned, variants, REPO, batch, a.cluster_name, a.workers, key, a.dry_agent)
+        print(f"launched; collect with: replay.py collect --batch {batch} --watch")
+        return 0
+    cases = asyncio.run(run_batch(a.stage, fixtures, variants, batch, a.seeds, LocalBackend(a.concurrency),
+                                  runner=runner))
     for c in cases:
         t = c["telemetry"]
         print(f"{c['variant']:20} {c['fixture']:18} s{c['seed']} {c['status']:12} "
