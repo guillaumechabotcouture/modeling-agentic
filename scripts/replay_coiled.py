@@ -216,9 +216,22 @@ def check_total_budget(cases, max_total_usd):
 
 
 def assign_workers(cases, workers):
-    """Round-robin cases onto workers (each worker runs one case at a time)."""
+    """Fixture-affine assignment: every case sharing a fixture runs on the same
+    worker, so the fixture is uploaded once (round-robin spread E5's 5 arms of
+    each variant over 5 workers -> 5 uploads each, 1.9 GB). Fixture groups go
+    to the least-loaded worker (by case count), largest groups first."""
     ws = sorted(workers)
-    return {c["key"]: ws[i % len(ws)] for i, c in enumerate(cases)}
+    groups = {}
+    for c in cases:
+        groups.setdefault(c["fixture_id"], []).append(c)
+    load = {w: 0 for w in ws}
+    assign = {}
+    for fid, grp in sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        w = min(ws, key=lambda x: (load[x], x))
+        for c in grp:
+            assign[c["key"]] = w
+        load[w] += len(grp)
+    return assign
 
 
 # --------------------------------------------------------------------------- remote (runs on the VM)

@@ -481,8 +481,13 @@ def preflight(planned: list, variants: list, backend: str, workers: int | None, 
     n_workers = min(workers or len(planned), len(planned)) if planned else 0
     per_case = {c["key"]: fx_bytes[c["fixture_id"]] + (code + var_bytes if backend == "coiled" else 0)
                 for c in planned}
-    upload = (sum(fx_bytes[c["fixture_id"]] for c in planned) + code * n_workers + var_bytes * len(planned)
-              if backend == "coiled" else 0)
+    if backend == "coiled" and planned:
+        import replay_coiled as _rc   # same assignment the launcher will use
+        asg = _rc.assign_workers(planned, [f"w{i:03d}" for i in range(n_workers)])
+        pairs = {(asg[c["key"]], c["fixture_id"]) for c in planned}
+        upload = sum(fx_bytes[f] for _, f in pairs) + code * n_workers + var_bytes * len(planned)
+    else:
+        upload = 0
     caps = {v["id"]: {k: v.get(k) for k in ("max_turns", "budget_usd", "wall_timeout_s", "model")}
             for v in variants}
     violations = [f"fixture {f} is {b / 2**20:.1f} MB > --max-fixture-mb {max_fixture_mb}"
@@ -628,7 +633,17 @@ def _self_test() -> int:
             pass
         ok(rcoil.check_total_budget(cases_plan, 10.0) == 4.0, "C2 budget total")
         asg = rcoil.assign_workers(cases_plan, ["w2", "w1"])
-        ok(sorted(set(asg.values())) == ["w1", "w2"] and list(asg.values()).count("w1") == 2, f"C3 round-robin: {asg}")
+        by_fx = {}
+        for c in cases_plan:
+            by_fx.setdefault(c["fixture_id"], set()).add(asg[c["key"]])
+        ok(all(len(ws) == 1 for ws in by_fx.values()), f"C3 fixture-affine: {asg}")
+        ok(len(set(asg.values())) == 1, f"C3 single fixture stays on one worker: {asg}")
+        multi = [dict(c, key=f"{c['key']}_{fx}", fixture_id=fx) for fx in ("A", "B", "C", "D")
+                 for c in cases_plan[:2]]
+        asg2 = rcoil.assign_workers(multi, ["w1", "w2"])
+        loads = {w: list(asg2.values()).count(w) for w in ("w1", "w2")}
+        ok(all(len({asg2[c["key"]] for c in multi if c["fixture_id"] == fx}) == 1 for fx in "ABCD")
+           and loads == {"w1": 4, "w2": 4}, f"C3 multi-fixture affine + balanced: {loads}")
         pf = os.path.join(vdir, "p.md"); open(pf, "w").write("PROMPT {run_dir}")
         vb = rcoil.variants_bundle([dict(variants[0], prompt_file=pf)])
         names = tarfile.open(fileobj=io.BytesIO(vb), mode="r:gz").getnames()
