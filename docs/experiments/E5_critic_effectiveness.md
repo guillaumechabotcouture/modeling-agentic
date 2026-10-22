@@ -1,4 +1,4 @@
-# E5: Critic effectiveness via planted defects (DRAFT — not yet registered)
+# E5: Critic effectiveness via planted defects (REGISTERED 2026-10-22, before any LLM-arm case ran)
 
 **Drafted:** 2026-10-22. **Follows:** E1/E1b (`E1_context_diet.md`, `E1b_packet_gap_fix.md`). **Roadmap:** `ROADMAP.md` row E5.
 
@@ -130,10 +130,20 @@ The $2–4 per invocation comes from E1/T1 critic telemetry. Wall time is about 
 - **Natural defects in fixtures** add noise and can mask plants. For example, CH235631 already has zero-width CIs and renamed verdicts, so those classes weren't planted there. All fixtures produce 27–90 deterministic findings even when clean, mostly missing Phase-21 artifacts, so critics face a noisy baseline.
 - **Some classes rarely plant.** double_counting (0) and benefit_total_population (1) rarely have a realistic generic target, so code-level classes are under-represented.
 - **Historical fixtures are core-only.** They have no transcript evidence, so their file selection is the core list. Critics may lack files they would have read.
-- **crossmodel runs locally only** for now. It needs codex and OpenAI auth on the Coiled VM.
+- **crossmodel on Coiled:** codex runs with a full-access sandbox on the VM, because the container can't run its OS sandbox. Workspace integrity is enforced by a before/after hash; a review that reads no files is UNAVAILABLE (commit b6ff936).
 - **Local session environment.** Runs launched from inside a Claude Code session inherit `CLAUDE_CODE_*` env vars, which deny network Bash. Strip them, as the smoke command does, or use Coiled.
 - **Single seed and round-1 only.** carried_forward dynamics and multi-round behaviour are out of scope.
 
+## Execution (registered)
+
+- **Code:** run from a clean worktree at the registering commit.
+- **Backend:** Coiled, 24 workers (8 vCPU each), cases queued about 5 per worker.
+- **Cases:** 5 LLM arms × 24 variants = 120. The deterministic arm was already run ($0).
+- **Caps:** batch $600; per-case caps as listed in Arms.
+- **Collection:** `collect --watch` runs until all are collected, then shuts the cluster down.
+- **Matcher:** frozen at the registering commit.
+- **Answer keys:** `_truth/` is never shipped to VMs.
+
 ## Results
 
-*(to be filled after registration and run)*
+*(to be filled after the run)*
