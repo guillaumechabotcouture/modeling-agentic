@@ -144,6 +144,11 @@ The $2–4 per invocation comes from E1/T1 critic telemetry. Wall time is about 
 - **Matcher:** frozen at the registering commit.
 - **Answer keys:** `_truth/` is never shipped to VMs.
 
+**Pre-launch deviation (infra only, before any case ran):**
+- **What happened:** the first launch attempt planned 0 cases (a zsh word-splitting error in my launch command). The second was refused by preflight: round-robin assignment uploaded each fixture 5×, 1.92 GB.
+- **What changed:** worker assignment is now fixture-affine (commit 67ef501). Arms, matcher, fixtures and answer keys are unchanged.
+- **Launch commit:** the commit that adds this note.
+
 ## Results
 
 *(to be filled after the run)*
