@@ -245,7 +245,7 @@ class ArtifactIntegrity:
             if scripts and background:
                 with self._lock:
                     self.grants.append({"scripts": set(scripts), "seen_dead": False, "armed": False,
-                                        "launch_id": tool_use_id,
+                                        "launch_id": tool_use_id, "t": time.monotonic(),
                                         "paths": {o for sc in scripts for o in SCRIPT_PRODUCES[sc]}})
         with self._lock:
             self.inflight[tool_use_id or f"anon-{len(self.inflight)}"] = intent
@@ -295,7 +295,10 @@ class ArtifactIntegrity:
         keep = []
         for g in self.grants:
             if not g["armed"] and g.get("launch_id") != getattr(self, "_posting", None):
-                keep.append(g)           # only the launching call's own post-hook arms it
+                # Only the launching call's own post-hook arms it; if that
+                # post-hook never comes, the grant expires like an intent.
+                if time.monotonic() - g.get("t", 0) < INTENT_TTL_S:
+                    keep.append(g)
                 continue
             if not g["armed"]:
                 # The launching call's own scan. Alive → the grant covers its

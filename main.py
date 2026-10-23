@@ -560,6 +560,12 @@ async def run(question: str, max_rounds: int, max_sessions: int,
     # by an allowed in-flight tool call (see agents/integrity.py).
     integrity = ArtifactIntegrity(run_path)
     budget = load_budget_ledger(run_path)
+    if not budget["sessions"] and prior_meta.get("session_results"):
+        # Run started before the ledger existed: carry its recorded spend over
+        # rather than granting a fresh allowance (Codex review, PR #15).
+        budget["sessions"].append({"session": 0, "session_id": None,
+                                   "total_cost_usd": conversation_cost(prior_meta["session_results"]) or 0,
+                                   "source": "migrated from metadata.json session_results"})
 
     # Phase 21 α: on --resume, continue the saved conversation instead of
     # starting a fresh one (session_id used to be captured only from a
@@ -1101,6 +1107,20 @@ def _run_self_test() -> int:
         alive2["v"] = set()
         w("uncertainty_report.yaml", "n: final after exit\n")
         ok(ig6e.on_post("poll") == [], "IC6g only the launching call's post-hook judges its grant")
+        # IC6h (Codex r4): popd -n keeps the cwd; an unarmed grant expires
+        ok(harness_scripts_run(f"cd /tmp; pushd {REPO_ROOT}; popd -n; python3 scripts/coherence_audit.py {td}",
+                               cwd=REPO_ROOT)[0] == ["coherence_audit.py"],
+           "IC6h popd -n does not change directory")
+        import agents.integrity as _ig
+        ig6h = ArtifactIntegrity(td, process_check=lambda: set())
+        ig6h.on_pre("L2", "Bash", {"command": f"nohup python3 scripts/propagate_uncertainty.py {td} &"}, "modeler")
+        for g in ig6h.grants:
+            g["t"] -= _ig.INTENT_TTL_S + 1
+        for i in ig6h.inflight.values():
+            i["t"] -= _ig.INTENT_TTL_S + 1
+        w("uncertainty_report.yaml", "n: forged after a lost post-hook\n")
+        ok(any(e["file"] == "uncertainty_report.yaml" for e in ig6h.final_check()),
+           "IC6i an unarmed grant whose post-hook never came expires")
         # IC7: a tool whose PostToolUse never came still explains its output at finalize
         ig7 = ArtifactIntegrity(td, process_check=lambda: set())
         ig7.on_pre("c7", "Bash", {"command": f"python3 scripts/coherence_audit.py {td}; false"}, "lead-ish")

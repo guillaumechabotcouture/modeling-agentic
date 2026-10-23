@@ -317,13 +317,20 @@ def iter_segments_with_cwd(command: str, cwd: str | None = None
             continue
         body = tok.strip()
         out.append((body, cur))
-        head = (_tokens(body) or [""])[0]
+        toks = _tokens(body) or [""]
+        head, no_cd = toks[0], "-n" in toks[1:]
         if head == "popd":
-            cur = dirs.pop() if dirs else None
+            # `popd -n` drops a stack entry without changing directory.
+            top = dirs.pop() if dirs else None
+            if not no_cd:
+                cur = top
             continue
         before = cur
         is_cd, new = _cd_target(body, cur)
         if is_cd:
+            if head == "pushd" and no_cd:
+                dirs.append(new)         # `pushd -n` adds to the stack only
+                continue
             if head == "pushd":
                 dirs.append(before)
             cur = new
