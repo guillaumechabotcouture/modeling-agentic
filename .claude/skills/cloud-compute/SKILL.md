@@ -1,17 +1,41 @@
 ---
 name: cloud-compute
 description: >-
-  Cloud execution of model runs, UQ propagation, calibration, multi-structural
-  LOO-CV, and sensitivity analysis via Azure Batch (primary) or AKS/Dask
-  (escalation), using scripts/cloud_batch.py and
-  scripts/propagate_uncertainty.py. Covers pool sizing, low-priority vs
-  dedicated nodes, the cost model and budget guard, quotas, and mandatory pool
-  teardown. Trigger phrases include "azure batch", "cloud compute", "spot
-  instance", "cost control", "distributed calibration", "parallel UQ", "AKS
-  escalation".
+  Parallel execution of model evaluations (UQ draws, calibration grids and
+  trial batches, scenario sweeps, LOO-CV folds, sensitivity points). Primary:
+  `scripts/compute.py map`, which fans a batch out over the run's Coiled
+  compute workers (local process pool elsewhere). Legacy, opt-in: Azure Batch
+  via scripts/cloud_batch.py (`--cloud`). Trigger phrases include "parallel",
+  "calibration grid", "batch of runs", "parallel UQ", "distributed
+  calibration", "cloud compute", "speed up", "too slow".
 ---
 
-# Cloud Compute via Azure Batch (primary)
+# Parallel model evaluations: the compute service (primary)
+
+`scripts/compute.py map` runs one function over many parameter sets:
+
+```bash
+python3 scripts/compute.py map {run_dir} --fn models/<module>.py::<fn> \
+    --inputs {run_dir}/models/<batch>_inputs.jsonl --out {run_dir}/models/<batch>_results.jsonl
+```
+
+- `<fn>(params: dict) -> dict` evaluates ONE parameter set. Keep it
+  deterministic given its params (put seeds in the params).
+- **Where it runs.** On Coiled, the launcher gives each run compute workers and
+  sets `MA_COMPUTE_SCHEDULER`; each worker runs its share across all of its
+  cores. Elsewhere, it uses a local process pool.
+- **What workers see.** The run's `models/` and `data/` (and the repo's
+  `scripts/`) are unpacked at the same absolute paths. Files over 100 MB are
+  left out and listed in `<out>.summary.json`; pass what the function needs as
+  params, or keep inputs small.
+- **Memory-heavy models:** set `MA_COMPUTE_PROCS_PER_WORKER` (default: cores − 1).
+- **Results and accounting.** Results come back in input order; a failing row
+  fails alone. Core-seconds are recorded in `models/compute_ledger.json`
+  against a run-wide cap.
+- **Iterative calibration:** batch it. Ask K trials, evaluate them with one
+  `map` call, tell K.
+
+# Legacy: Cloud Compute via Azure Batch (opt-in, `--cloud`)
 
 ## What this skill chose and why
 

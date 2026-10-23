@@ -249,7 +249,8 @@ def propagate(run_dir: str, n_draws: int = 200, seed: int = 42,
               cloud_vm_size: str = "Standard_A2_v2",   # Free Trial-safe
               cloud_max_nodes: int = 2,                 # 2 × A2_v2 = 4 vCPUs
               cloud_use_low_priority: bool = False,
-              cloud_budget_usd_cap: float = 5.0) -> dict:
+              cloud_budget_usd_cap: float = 5.0,
+              parallel: bool = False) -> dict:
     """Sample N draws from registered priors, run outcome_fn, aggregate.
 
     If `cloud=True`, each draw runs as an Azure Batch task on a pool of
@@ -305,6 +306,20 @@ def propagate(run_dir: str, n_draws: int = 200, seed: int = 42,
             verbose=verbose,
         )
         outs = cloud_results
+    elif parallel or os.environ.get("MA_COMPUTE_SCHEDULER"):
+        # Phase 24 α: fan the draws out through scripts/compute.py (dask on
+        # Coiled when the launcher provides a scheduler, else a local pool).
+        compute = _import_sibling_module("compute")
+        spec = outcome_fn_spec or "models/outcome_fn.py::outcome_fn"
+        if "::" not in spec:
+            spec += "::outcome_fn"
+        rows, csum = compute.map_fn(run_dir, spec, params_list)
+        if verbose:
+            print(f"  compute: {csum.get('backend')} x{csum.get('workers')}, "
+                  f"{csum.get('wall_s')}s wall", file=sys.stderr)
+        outs = [r["result"] if r["ok"] else
+                {"_error": {"draw": r["i"], "exception": r.get("error", "").split(":")[0],
+                            "message": r.get("error", "")[:200]}} for r in rows]
     else:
         outcome_fn = load_outcome_fn(run_dir, outcome_fn_spec)
         outs = []
@@ -424,7 +439,8 @@ def propagate(run_dir: str, n_draws: int = 200, seed: int = 42,
         # Phase 21 δ: effort floors read these, not n_draws alone —
         # n_draws is what was requested; n_successful is what the CIs
         # are built from.
-        "backend": "cloud" if cloud else "local",
+        "backend": ("cloud" if cloud else "compute" if (parallel or os.environ.get("MA_COMPUTE_SCHEDULER"))
+                    else "local"),
         "n_draws": n_draws,
         "n_draws_requested": n_draws,
         "n_successful": len(outs) - n_failed,
@@ -537,6 +553,12 @@ parameters:
         ok(report["degenerate_outputs"] == [] and
            report["parameter_samples"]["irs_effect"]["std"] > 0,
            "P21-2: healthy run has no degenerate outputs and nonzero std")
+        # P24-1 (Phase 24 α): the compute-service path gives the same answer.
+        par = propagate(run_dir, n_draws=200, seed=42, parallel=True)
+        ok(par["backend"] == "compute"
+           and abs(par["scalar_outputs"]["dalys_averted"]["mean"] - ci["mean"]) < 1e-6
+           and par["scalar_outputs"]["dalys_averted"]["ci_low"] == ci["ci_low"],
+           f"P24-1: parallel propagation matches serial; got {par['backend']}")
 
         # P21-3: outcome_fn that ignores params → zero-width CI flagged
         # degenerate with the "ignores params" diagnostic; NaN draws are
@@ -633,6 +655,9 @@ def main() -> int:
     p.add_argument("--self-test", action="store_true")
     p.add_argument("--json", action="store_true",
                    help="Emit report to stdout as JSON (in addition to YAML file)")
+    p.add_argument("--parallel", action="store_true",
+                   help="Fan draws out via scripts/compute.py (automatic when "
+                        "MA_COMPUTE_SCHEDULER is set, i.e. on Coiled)")
     p.add_argument("--cloud", action="store_true",
                    help="Run draws as Azure Batch tasks (distributed). "
                         "Requires AZ_* env vars and provisioned Batch/Storage "
@@ -672,7 +697,8 @@ def main() -> int:
                            cloud_vm_size=args.cloud_vm_size,
                            cloud_max_nodes=args.cloud_max_nodes,
                            cloud_use_low_priority=args.cloud_low_priority,
-                           cloud_budget_usd_cap=args.cloud_budget_usd)
+                           cloud_budget_usd_cap=args.cloud_budget_usd,
+                           parallel=args.parallel)
     except ValueError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 3

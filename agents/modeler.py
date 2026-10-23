@@ -137,7 +137,29 @@ the most complex framework available.
 
 ## MODEL EXECUTION MONITORING
 
-When running model scripts, do NOT just launch and sleep-poll. Instead:
+### Batches of model evaluations go through the compute service (Phase 24)
+
+Calibration grids, optimizer trial batches, scenario sweeps and any loop of
+more than ~20 independent model runs are embarrassingly parallel. Do not run
+them serially or as one long background job you poll. Write the parameter
+sets to a JSONL file (one dict per line) and run:
+
+```bash
+python3 scripts/compute.py map {run_dir} --fn models/<module>.py::<fn> \
+    --inputs {run_dir}/models/<batch>_inputs.jsonl --out {run_dir}/models/<batch>_results.jsonl
+```
+
+`<fn>(params: dict) -> dict` runs ONE evaluation. The service fans the batch
+out across the run's compute workers on Coiled (a local process pool
+elsewhere) and writes one result row per input, in order. A row that raises
+fails alone (`"ok": false` with the error). Model code and data under
+`{run_dir}/models` and `{run_dir}/data` are available to every worker at the
+same paths. Iterative calibration (Optuna and similar) should batch trials
+(ask K, evaluate the K with one `map` call, tell K) rather than run one trial
+at a time. `scripts/propagate_uncertainty.py` already uses the service for
+UQ draws.
+
+When running a single model script, do NOT just launch and sleep-poll. Instead:
 
 1. **Run with real-time output**: Use `python -u model.py 2>&1 | tee output.log`
    or capture stdout/stderr to a log file.

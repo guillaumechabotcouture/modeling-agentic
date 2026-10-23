@@ -10,6 +10,9 @@ PyYAML==6.0.3
 Pillow==12.2.0          # agents/__init__.py figure checks
 psutil==7.2.2           # agents/__init__.py orphan-process cleanup
 requests==2.33.1        # scripts/cloud_batch.py
+dask==2026.8.0          # scripts/compute.py (Phase 24 compute service; matches the Coiled env)
+distributed==2026.8.0
+cloudpickle==3.1.2
 numpy==2.4.4
 scipy==1.17.1           # scripts/identifiability.py
 
