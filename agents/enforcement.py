@@ -274,6 +274,12 @@ def _shell_tokens(command: str) -> list[str]:
         if c in ("'", '"'):
             quote = c; buf.append(c); i += 1
             continue
+        if c == "#" and (not buf or buf[-1].isspace()):
+            # A comment runs to end of line; its quotes and words are not
+            # syntax and must not authorize anything (Codex review, PR #15).
+            j = command.find("\n", i)
+            i = n if j < 0 else j
+            continue
         if command.startswith(("&&", "||"), i):
             flush(); i += 2
             continue

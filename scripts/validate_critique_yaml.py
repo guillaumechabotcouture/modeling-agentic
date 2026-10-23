@@ -1655,9 +1655,10 @@ def _check_artifact_integrity(run_dir: str) -> list[dict]:
             doc = json.load(f)
         if not isinstance(doc, dict) or doc.get("producer") != "agents/integrity.py":
             raise ValueError("missing or wrong producer stamp")
-        events = doc.get("violations") or []
-        if not isinstance(events, list):
-            raise ValueError("`violations` is not a list")
+        events = doc.get("violations")
+        if not isinstance(events, list) or not all(isinstance(e, dict) for e in events):
+            # Missing, null, {} or [null] is a malformed record, not "clean".
+            raise ValueError("`violations` must be a list of event objects")
     except (OSError, ValueError) as e:
         return [{"kind": "artifact_integrity_invalid", "severity": "HIGH", "stage": "GATE",
                  "scope_declarable": False,
@@ -8571,6 +8572,11 @@ def _run_self_test() -> int:
             json.dump({"producer": "someone", "violations": []}, f)
         ok([x["kind"] for x in _check_artifact_integrity(d)] == ["artifact_integrity_invalid"],
            "AI3: wrong producer → invalid")
+        for bad in ({}, {"violations": None}, {"violations": {}}, {"violations": [None]}):
+            with open(os.path.join(d, "artifact_integrity.json"), "w") as f:
+                json.dump({"producer": "agents/integrity.py", **bad}, f)
+            ok([x["kind"] for x in _check_artifact_integrity(d)] == ["artifact_integrity_invalid"],
+               f"AI4: malformed violations {bad} → invalid, not clean")
 
     # E7c (Copilot review): calibration_result is required only with fitting
     # evidence; an unreadable model comparison still counts (fail closed).
