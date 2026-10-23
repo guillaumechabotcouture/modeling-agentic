@@ -205,6 +205,41 @@ def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: lis
     return [{**row, "i": chunk[k][0]} for k, row in enumerate(rows)]
 
 
+def export_worker_env(tls_dir: str) -> dict:
+    """Call INSIDE a dask worker task (the launcher's run job). Returns the
+    env a subprocess needs to reach this cluster: the scheduler address and,
+    for TLS clusters such as Coiled, the worker's own client credentials
+    written to files only this user can read."""
+    from distributed import get_worker
+    w = get_worker()
+    env = {"MA_COMPUTE_SCHEDULER": w.scheduler.address}
+    sec = getattr(w, "security", None)
+    if sec is not None and getattr(sec, "require_encryption", False):
+        os.makedirs(tls_dir, mode=0o700, exist_ok=True)
+        for attr, fn in (("tls_ca_file", "ca.pem"), ("tls_client_cert", "cert.pem"),
+                         ("tls_client_key", "key.pem")):
+            v = getattr(sec, attr, None)
+            if not v:
+                continue
+            dest = os.path.join(tls_dir, fn)
+            data = v if str(v).lstrip().startswith("-----BEGIN") else open(v).read()
+            fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(data)
+        env["MA_COMPUTE_TLS_DIR"] = tls_dir
+    return env
+
+
+def _security():
+    d = os.environ.get("MA_COMPUTE_TLS_DIR")
+    if not d:
+        return None
+    from distributed.security import Security
+    pem = lambda n: (lambda p: p if os.path.exists(p) else None)(os.path.join(d, n))  # noqa: E731
+    return Security(tls_ca_file=pem("ca.pem"), tls_client_cert=pem("cert.pem"),
+                    tls_client_key=pem("key.pem"), require_encryption=True)
+
+
 def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, timeout_s=None):
     import cloudpickle
     from distributed import Client, as_completed
@@ -213,7 +248,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, timeou
     exclude = {w.strip() for w in os.environ.get("MA_COMPUTE_EXCLUDE_WORKERS", "").split(",") if w.strip()}
     run_dir = os.path.realpath(run_dir)
     bundle, binfo = make_bundle(run_dir)
-    with Client(addr, timeout="60s") as c:
+    with Client(addr, timeout="60s", security=_security()) as c:
         workers = [w for w in c.scheduler_info()["workers"] if w not in exclude]
         if max_workers:
             workers = workers[:max_workers]
