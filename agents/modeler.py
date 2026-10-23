@@ -529,7 +529,7 @@ blocking, non-declarable `artifact_integrity_violation` until the producer
 is re-run and rewrites the file. If a producer is too slow, make
 `outcome_fn` faster (e.g. an emulator of the full model) instead of writing
 the report yourself. For long producer runs, launch with
-`nohup python3 scripts/<producer>.py {run_dir} > models/<producer>.log 2>&1 &`
+`nohup python3 scripts/<producer>.py {run_dir} > {run_dir}/models/<producer>.log 2>&1 &`
 inside one Bash call and poll it in the foreground with a bounded loop;
 `run_in_background` is not available.
 
