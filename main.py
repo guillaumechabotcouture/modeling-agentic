@@ -51,7 +51,17 @@ SUCCESS_STATUSES = {"completed", "completed_with_report_restored"}
 # Pipeline finished and wrote a report, but the final gate did not ACCEPT.
 PARTIAL_STATUSES = {"completed_scope_declared", "completed_gate_not_accepted",
                     "completed_gate_error", "completed_gate_not_run",
-                    "completed_no_report", "run_failed"}
+                    "completed_no_report", "run_failed", "budget_exhausted"}
+
+
+def remaining_budget(cap: float | None, records: list[dict]) -> float | None:
+    """Dollars left under a run-wide cap, summed over every session so far
+    (including earlier invocations of a resumed run). None = no cap."""
+    if cap is None:
+        return None
+    spent = sum(r.get("total_cost_usd") or 0 for r in records
+                if isinstance(r.get("total_cost_usd"), (int, float)))
+    return round(cap - spent, 4)
 
 
 def slugify(text: str, max_len: int = 40) -> str:
@@ -444,7 +454,7 @@ def write_harness_baseline(run_path: str) -> tuple[dict, dict | None]:
 async def run(question: str, max_rounds: int, max_sessions: int,
               run_dir: str | None = None, run_path: str | None = None,
               allow_cloud: bool = False, cross_model: bool = False,
-              methods_critic: bool = False) -> str:
+              methods_critic: bool = False, max_budget_usd: float | None = None) -> str:
     """Run the modeling pipeline as a single lead agent session.
 
     Returns the terminal status written to metadata.json.
@@ -528,6 +538,13 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                                  max_turns={n: d.maxTurns for n, d in agents.items()},
                                  integrity=integrity)
 
+            # Run-wide dollar cap across sessions (and earlier invocations).
+            left = remaining_budget(max_budget_usd,
+                                    (prior_meta.get("session_results") or []) + session_records)
+            if left is not None and left <= 0:
+                print(f"Budget cap ${max_budget_usd:.0f} reached; stopping.", flush=True)
+                session_outcome = "budget_exhausted"
+                break
             options = ClaudeAgentOptions(
                 system_prompt=lead_system,
                 agents=agents,
@@ -541,6 +558,8 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                 cwd=REPO_ROOT,
                 env=env_overrides,
             )
+            if left is not None:
+                options.max_budget_usd = left
             if session_id:
                 options.resume = session_id
 
@@ -576,6 +595,10 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                 except OSError:
                     pass
 
+            if result is not None and "budget" in str(getattr(result, "subtype", "")):
+                print(f"Budget cap ${max_budget_usd} reached during session {session_num}.", flush=True)
+                session_outcome = "budget_exhausted"
+                break
             if error_str is None and result_is_success(result):
                 where = pipeline_unfinished(run_path)
                 if where and session_num < max_sessions:
@@ -714,7 +737,8 @@ def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
               flush=True)
 
     gate = None
-    if run_gate and session_outcome == "session_completed":
+    # A budget stop is still gated: the report shows what the money bought.
+    if run_gate and session_outcome in ("session_completed", "budget_exhausted"):
         print("\nRunning final STAGE 7 gate...", flush=True)
         gate = run_final_gate(run_path, max_rounds)
 
@@ -1249,6 +1273,14 @@ def _run_self_test() -> int:
         ok(m["question"] == "Use Starsim within a $10M budget." and m["decision_year"] == 2027
            and m["restored_fields"]["question"] == "weakened",
            "CR5 protected metadata restored (before the gate), planner fields kept")
+    # BG1 (Phase 23 β): run-wide budget cap.
+    ok(remaining_budget(None, [{"total_cost_usd": 5}]) is None
+       and remaining_budget(300, [{"total_cost_usd": 120.5}, {"total_cost_usd": None},
+                                  {"total_cost_usd": 79.5}]) == 100
+       and remaining_budget(300, [{"total_cost_usd": 310}]) == -10
+       and determine_status("budget_exhausted", {"action": "PATCH_OR_RETHINK"}, True, False, None)
+       == "budget_exhausted" and exit_code_for("budget_exhausted") == 2,
+       "BG1 remaining budget sums sessions; budget stop is a partial status (exit 2)")
     # CS1 (Phase 22 γ): the ledger is built by a script; agents write the spec.
     ok(enforcement.check_tool_use("Write", {"file_path": f"{run_path}/models/claims_ledger.yaml"},
                                   run_path, "analyst", set()) is not None
@@ -1447,6 +1479,10 @@ def main() -> int:
     parser.add_argument("--cross-model", action="store_true",
                         help="Add the gpt-6.1-sol cross-model critic (Codex CLI) to "
                              "every STAGE 6. Sends run artifacts to OpenAI.")
+    parser.add_argument("--max-budget-usd", type=float, default=None,
+                        help="Hard dollar cap for the whole run (all sessions, including "
+                             "earlier invocations of a resumed run). Stops with status "
+                             "budget_exhausted; the final gate still runs.")
     parser.add_argument("--methods-critic", action="store_true",
                         help="Add critique-methods to every STAGE 6. Off by default: in E5 "
                              "it caught no planted defect the other critics missed.")
@@ -1500,14 +1536,15 @@ def main() -> int:
         run_dir = os.path.basename(run_path)
         coro = run(question, args.max_rounds, args.max_sessions,
                    run_dir=run_dir, run_path=run_path, allow_cloud=args.cloud,
-                   cross_model=args.cross_model, methods_critic=args.methods_critic)
+                   cross_model=args.cross_model, methods_critic=args.methods_critic,
+                   max_budget_usd=args.max_budget_usd)
     else:
         if not args.question:
             print("Error: question is required (or use --resume)")
             return 1
         coro = run(args.question, args.max_rounds, args.max_sessions,
                    allow_cloud=args.cloud, cross_model=args.cross_model,
-                   methods_critic=args.methods_critic)
+                   methods_critic=args.methods_critic, max_budget_usd=args.max_budget_usd)
     try:
         status = asyncio.run(coro)
     except KeyboardInterrupt:

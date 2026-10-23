@@ -96,7 +96,7 @@ the live attachment picture.
 | Exit | Statuses |
 |------|----------|
 | 0    | `completed`, `completed_with_report_restored` |
-| 2    | `completed_scope_declared`, `completed_gate_not_accepted`, `completed_gate_error`, `completed_gate_not_run`, `completed_no_report`, `run_failed` |
+| 2    | `completed_scope_declared`, `completed_gate_not_accepted`, `completed_gate_error`, `completed_gate_not_run`, `completed_no_report`, `run_failed`, `budget_exhausted` |
 | 1    | `harness_tampered`, `artifact_tampered`, errors |
 | 130  | `interrupted` |
 
