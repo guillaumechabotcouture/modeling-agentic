@@ -1053,6 +1053,11 @@ def _run_self_test() -> int:
            and harness_scripts_run("nohup bash -o pipefail -c 'python3 scripts/propagate_uncertainty.py runs/x' &")
            == (["propagate_uncertainty.py"], True),
            "IC1d a producer inside sh -c / bash -c is recognized (E7); a mention is not")
+        ok(harness_scripts_run(f"(cd {REPO_ROOT} && timeout 600 python3 scripts/identifiability.py runs/x)")[0]
+           == ["identifiability.py"]
+           and harness_scripts_run("timeout --signal=KILL 30m nice -n 5 python3 scripts/compare_models.py runs/x")[0]
+           == ["compare_models.py"],
+           "IC1e producers behind timeout/nice wrappers are recognized (E7 attempt 4)")
         ig.on_pre("c1", "Bash", {"command": 'p=u.yaml; printf f > "$p"; # scripts/propagate_uncertainty.py'}, "modeler")
         w("uncertainty_report.yaml", "n: forged\n")
         ok(len(ig.on_post("c1")) == 1, "IC1b comment mention doesn't authorize a forged output")

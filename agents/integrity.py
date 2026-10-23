@@ -76,7 +76,10 @@ SCRIPT_PRODUCES: dict[str, tuple[str, ...]] = {
     "render_claims.py": ("report.md", "models/claims_ledger.yaml", "claims_ledger.yaml"),
 }
 _SCRIPTS_DIR = os.path.realpath(os.path.join(enforcement.REPO_ROOT, "scripts"))
-_WRAPPERS = {"nohup", "env", "time", "nice", "command", "exec", "sudo", "stdbuf"}
+# Commands that run their arguments as a command. `timeout 600 python3 …`
+# (seen in E7) hid the producer from the check.
+_WRAPPERS = {"nohup", "env", "time", "nice", "ionice", "command", "exec", "sudo", "stdbuf",
+             "timeout", "gtimeout", "chrt", "taskset", "setsid", "unbuffer"}
 _CRITIQUE_PATTERNS = ("critique_*.yaml", "critique_*.md")
 # A tool whose PostToolUse never arrives (an error path) must not keep
 # sanctioning changes: intents expire (Bash's own timeout is 10 min).
@@ -122,7 +125,7 @@ def harness_scripts_run(command: str, cwd: str | None = None, _depth: int = 0
         except ValueError:
             continue
         while toks and (re.match(r"^\w+=", toks[0]) or os.path.basename(toks[0]) in _WRAPPERS
-                        or re.fullmatch(r"-\w+|\d+[smh]?", toks[0])):
+                        or re.fullmatch(r"-[\w-]+(=\S+)?|\d+(\.\d+)?[smhd]?", toks[0])):
             if os.path.basename(toks[0]) == "nohup":
                 background = True
             toks = toks[1:]
