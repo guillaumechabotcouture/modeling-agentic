@@ -96,7 +96,7 @@ except ImportError:
 MANIFEST_REL = os.path.join("models", "eligibility_manifest.yaml")
 REPORT_REL = os.path.join("models", "eligibility_probe.yaml")
 PRODUCER = "scripts/eligibility_probe.py"
-VERDICTS = ("PASS", "FAIL", "ABSENT")
+VERDICTS = ("PASS", "FAIL", "ABSENT", "NOT_APPLICABLE")
 
 DEFAULTS = {"tolerance": 0.05, "total_scale": 2.0,
             "total_tolerance": 0.10, "eligible_scale": 0.5}
@@ -205,6 +205,19 @@ def probe(run_dir: str) -> dict:
         return {"verdict": "FAIL", "interventions": {}, "findings": [_finding(
             "eligibility_manifest_invalid", "HIGH",
             f"{MANIFEST_REL} unreadable: {e}")]}
+    # A run whose interventions all reach the whole population has no
+    # eligible subgroup to probe (Copilot review of PR #14). It must say so
+    # explicitly, with a reason, and list no interventions; anything else
+    # is validated as a normal manifest.
+    if isinstance(m, dict) and m.get("targeted_interventions") == "none":
+        why = str(m.get("no_targeted_justification") or "").strip()
+        if why and not m.get("interventions"):
+            return {"verdict": "NOT_APPLICABLE", "findings": [], "interventions": {},
+                    "justification": why}
+        return {"verdict": "FAIL", "interventions": {}, "findings": [_finding(
+            "eligibility_manifest_invalid", "HIGH",
+            f"{MANIFEST_REL}: `targeted_interventions: none` needs a non-empty "
+            f"`no_targeted_justification` and no `interventions` list")]}
     errs = _validate_manifest(m)
     if errs:
         return {"verdict": "FAIL", "interventions": {}, "findings": [_finding(
@@ -476,6 +489,25 @@ interventions:
     r8 = run_case("def outcome_fn(p):\n    return {'cases_averted': 0.0}\n")
     ok(("eligibility_insensitive", "MEDIUM") in kinds(r8),
        f"S8: zero marginal benefit → MEDIUM; got {kinds(r8)}")
+
+    # S9 (Copilot review): whole-population-only runs declare it explicitly;
+    # the declaration needs a reason and may not list interventions.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        mp = os.path.join(d, MANIFEST_REL)
+        for body, want in (
+                ("targeted_interventions: none\nno_targeted_justification: every "
+                 "intervention is delivered to the whole population\n", "NOT_APPLICABLE"),
+                ("targeted_interventions: none\n", "FAIL"),
+                ("targeted_interventions: none\nno_targeted_justification: x\n"
+                 "interventions: [{name: a}]\n", "FAIL")):
+            with open(mp, "w") as f:
+                f.write(body)
+            got = probe(d)["verdict"]
+            ok(got == want, f"S9: {body!r} → {got}, want {want}")
+        with open(mp, "w") as f:
+            f.write("targeted_interventions: none\nno_targeted_justification: whole population\n")
+        ok(check(d, require=True) == [], "S9b: valid declaration satisfies require=True")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)

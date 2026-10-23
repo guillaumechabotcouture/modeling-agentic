@@ -58,6 +58,22 @@ The outcome function must be deterministic and must read population
 sizes from its inputs (not from module-level constants) so the probe can
 perturb them.
 
+### No targeted interventions
+
+If every intervention in the run is delivered to the whole population, there
+is no eligible subgroup to probe. Say so explicitly instead of inventing
+duplicate population inputs:
+
+```yaml
+targeted_interventions: none
+no_targeted_justification: "<why each intervention reaches the whole population>"
+```
+
+List no `interventions` in that case. The probe reports `NOT_APPLICABLE`. A
+missing justification, or a declaration that also lists interventions, is
+HIGH `eligibility_manifest_invalid`. Reviewers will check the claim against
+the model.
+
 ## What the probe checks
 
 `python3 scripts/eligibility_probe.py <run_dir>` computes the marginal
