@@ -167,7 +167,6 @@ def protected_reason(path: str, run_path: str, agent_type: str | None,
 # Bash heuristics
 # ---------------------------------------------------------------------------
 
-_SEGMENT_SPLIT = re.compile(r"\|\||&&|;|\||\n")
 _REDIRECT = re.compile(r"(?:\d|&)?>>?\s*([^\s;&|<>]+)")
 _PY_WRITE = re.compile(
     r"""open\(\s*(?:f?['"])([^'"]+)['"]\s*,\s*['"][wax+]"""
@@ -242,24 +241,53 @@ def _cd_target(segment: str, cur: str | None) -> tuple[bool, str | None]:
     return True, os.path.normpath(os.path.join(cur, dest))
 
 
-def _unquoted(text: str) -> str:
-    """`text` with quoted spans removed, so `echo ')'` does not close a
-    subshell (Codex re-review of PR #14)."""
-    out, quote, i = [], None, 0
-    while i < len(text):
-        ch = text[i]
-        if ch == "\\" and quote != "'":
-            i += 2                       # POSIX: backslash escapes the next char
-            continue                     # (not inside single quotes)
+def _shell_tokens(command: str) -> list[str]:
+    """Split a command into simple-command segments and `(` / `)` markers.
+
+    One quote- and escape-aware scan: separators (`&&`, `||`, `;`, `|`,
+    `&`, newline) and parentheses inside quotes or after a backslash are
+    text, not syntax. Splitting and quote handling must agree, or a quoted
+    `;` or `)` desynchronises subshell tracking (Codex reviews of PR #14).
+    `&` adjacent to `>`/`<` is part of a redirection (`2>&1`, `&>`).
+    """
+    toks: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    i, n = 0, len(command)
+
+    def flush():
+        if "".join(buf).strip():
+            toks.append("".join(buf))
+        buf.clear()
+    while i < n:
+        c = command[i]
+        if c == "\\" and quote != "'":
+            buf.append(command[i:i + 2]); i += 2
+            continue
         if quote:
-            if ch == quote:
+            buf.append(c)
+            if c == quote:
                 quote = None
-        elif ch in ("'", '"'):
-            quote = ch
-        else:
-            out.append(ch)
-        i += 1
-    return "".join(out)
+            i += 1
+            continue
+        if c in ("'", '"'):
+            quote = c; buf.append(c); i += 1
+            continue
+        if command.startswith(("&&", "||"), i):
+            flush(); i += 2
+            continue
+        if c == "&" and ((i > 0 and command[i - 1] in "<>") or (i + 1 < n and command[i + 1] in "<>")):
+            buf.append(c); i += 1
+            continue
+        if c in ";|&\n":
+            flush(); i += 1
+            continue
+        if c in "()":
+            flush(); toks.append(c); i += 1
+            continue
+        buf.append(c); i += 1
+    flush()
+    return toks
 
 
 def bash_write_targets_cwd(command: str, cwd: str | None = None
@@ -273,21 +301,22 @@ def bash_write_targets_cwd(command: str, cwd: str | None = None
     """
     out: list[tuple[str, str | None]] = []
     cur: str | None = cwd or REPO_ROOT
-    stack: list[str | None] = []          # cwd saved at each `(` (subshell)
-    for segment in _SEGMENT_SPLIT.split(command):
-        body = segment.strip()
-        while body.startswith(("(", "{")):
-            stack.append(cur)             # `( … )` / `$( … )`: cd inside does not leak
-            body = body[1:].lstrip()
+    stack: list[str | None] = []          # cwd saved at each `(` (subshell, `$(`)
+    for tok in _shell_tokens(command):
+        if tok == "(":
+            stack.append(cur)             # a cd inside ( … ) does not leak
+            continue
+        if tok == ")":
+            if stack:
+                cur = stack.pop()
+            continue
+        body = tok.strip()
         # Redirections on the segment itself apply in the cwd before any cd
         # in it (`cd /tmp > x` truncates x where we stand).
         out.extend((t, cur) for t in _segment_targets(body))
         is_cd, new = _cd_target(body, cur)
         if is_cd:
             cur = new
-        for _ in range(_unquoted(segment).count(")") if stack else 0):
-            if stack:
-                cur = stack.pop()
     return out
 
 
@@ -296,8 +325,15 @@ def bash_write_targets(command: str) -> list[str]:
 
     Heuristic, not a shell parser. It covers the forms observed in past
     runs (redirection, tee, sed -i, cp/mv/rm, git checkout/restore, and
-    python one-liners with open(..., 'w')). Anything it misses is caught
-    after the fact by the harness hash in main.py.
+    python one-liners with open(..., 'w')). Anything it misses in harness
+    code is caught after the fact by the harness hash in main.py.
+
+    Known limitation (Codex review of PR #14): run-directory artifacts are
+    NOT hashed, and these forms still evade the heuristic — variable
+    expansion (`p=…; echo > "$p"`), nested shells (`bash -c "cd …; …"`), a
+    `cd` that never runs (`false && cd x`) or runs in a pipeline, and
+    backslash-escaped filenames. The structural fix is an integrity record
+    of protected run artifacts checked before the gate (tracked follow-up).
     """
     return [t for t, _ in bash_write_targets_cwd(command)]
 

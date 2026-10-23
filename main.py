@@ -1008,6 +1008,7 @@ def _run_self_test() -> int:
        "MC1 methods critic lead prompt gating")
     # CR1-CR4 (Codex review of PR #14): `cd` is tracked; Grep/Glob can't read .env.
     rp_rel = os.path.relpath(run_path, REPO_ROOT)
+    rp_cd = f"cd {rp_rel}"
     ok(enforcement.check_tool_use("Bash", {"command": f"cd {rp_rel} && echo forged > critique_domain.yaml"},
                                   run_path, None, set()) is not None,
        "CR1 cd into the run dir then write a protected file is denied")
@@ -1055,6 +1056,13 @@ def _run_self_test() -> int:
     ok(enforcement.check_tool_use("Bash", {"command": f"cd {rp_rel} && (cd /tmp && echo \\\"); echo forged > critique_domain.yaml"},
                                   run_path, None, set()) is not None,
        "CR12 an escaped quote does not hide the subshell close")
+    for cmd in (f'({rp_cd} && echo "a;\\" )" && echo forged > critique_domain.yaml; true)',
+                f'({rp_cd} && echo "a;)b" && echo forged > critique_domain.yaml; true)'):
+        ok(enforcement.check_tool_use("Bash", {"command": cmd}, run_path, None, set()) is not None,
+           f"CR13 quoted separators/parens don't desync subshell tracking: {cmd}")
+    ok(enforcement.check_tool_use("Bash", {"command": "cd models && python3 fit.py > fit.log 2>&1 && echo done"},
+                                  run_path, "modeler", set()) is None,
+       "CR14 ordinary redirects (2>&1) still allowed")
     # CR5 (Codex review of PR #14): the gate must see the original question.
     with tempfile.TemporaryDirectory() as td:
         mp = os.path.join(td, "metadata.json")
