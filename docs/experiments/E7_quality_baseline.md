@@ -1,6 +1,6 @@
 # E7: Answer quality on the standard question (pre-registered)
 
-**Registered:** 2026-10-23, before either run started. **Owner approval:** 2 runs, $600 total cap; blinded expert scoring by the owner.
+**Registered:** 2026-10-23, before either run started. **Owner approval:** 2 runs, $900 total cap (amended from $600 before launch; see Amendments); blinded expert scoring by the owner.
 
 ## Question
 
@@ -16,7 +16,7 @@ This is a quality baseline, not an A/B adoption test. It measures where the ship
 
 - **Arms:** R1 and R2. Both use the same code (the `main` merge commit after PR #15) and the same question, with independent sessions.
 - **Backend:** IDM Coiled, default workspace. Each run gets its own VM with a clean environment.
-- **Settings:** `--max-rounds 8 --max-sessions 5 --max-budget-usd 300` per run. The total cap is $600; the cap stops a run with status `budget_exhausted`, and the final gate still runs.
+- **Settings:** `--max-rounds 8 --max-sessions 5 --max-budget-usd 450` per run. The total cap is $900; the cap stops a run with status `budget_exhausted`, and the final gate still runs.
 - **Disabled:** the cross-model critic and the methods critic (the shipped defaults).
 - **Comparator:** `runs/2026-05-03_235631` (pre-Phase-21 code). It was ACCEPTed at the time and fails today's gate with 46 HIGH findings. It is not re-run.
 
@@ -63,3 +63,11 @@ This is a quality baseline, not an A/B adoption test. It measures where the ship
 - **One question and one disease:** results are about this question.
 - **The comparator** ran on different models and SDK, and under the old gates.
 - **The rubric** is the owner's quality criteria as understood here. The owner may revise the anchors before scoring, but not after seeing the scores.
+
+## Amendments (before any run started)
+
+- **2026-10-23, budget $300 → $450 per run ($900 total), approved by the owner.**
+  - **Trigger:** the SDK reports cumulative cost for a resumed conversation, and run metadata had summed sessions. Previous multi-session runs therefore cost about half what was recorded: the A/B run T1 cost $316, not $609, and another A/B run $428, not $771.
+  - **Why the cap moved:** at $300 a full run would likely be stopped before finishing, and E7 asks about a finished answer.
+  - **Unchanged:** the arms, rubric and decision rules.
+
