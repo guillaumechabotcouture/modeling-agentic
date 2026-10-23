@@ -168,6 +168,17 @@ def validate_within_zone_heterogeneity(yaml_path: str) -> dict:
                         f"sensitivity[{i}].impact_loss_pct must be a finite "
                         f"number (got {p['impact_loss_pct']!r})")
 
+        # One quantity across all rows (Copilot review of PR #14): a baseline
+        # in cases and a perturbation in deaths are not comparable, and the
+        # verdict would rest on an impact_loss_pct with no common basis.
+        rows = [p for p in perturbations if isinstance(p, dict)]
+        common = set(_OUTCOME_KEYS)
+        for p in rows:
+            common &= {k for k in _OUTCOME_KEYS if k in p}
+        if rows and not common and not errors:
+            errors.append("baseline and perturbations share no outcome field "
+                          f"(each row must report the same one of {list(_OUTCOME_KEYS)})")
+
     if errors:
         return {"verdict": "MALFORMED", "computed_verdict": None,
                 "reported_verdict": data.get("verdict"),
@@ -344,6 +355,20 @@ def _run_self_test() -> int:
                 "verdict: BOUNDED\n")
         ok(validate_within_zone_heterogeneity(f7)["verdict"] == "BOUNDED",
            "W7b: generic outcome_averted must validate")
+        with open(f7, "w") as f:
+            f.write(
+                "calibration_units: 4\n"
+                "allocation_units: 120\n"
+                "modeled_uniform_per_unit: true\n"
+                "sensitivity:\n"
+                "  - perturbation: baseline\n"
+                "    cases_averted: 1000\n"
+                "  - perturbation: spread\n"
+                "    deaths_averted: 950\n"
+                "    impact_loss_pct: 5.0\n"
+                "verdict: BOUNDED\n")
+        ok(validate_within_zone_heterogeneity(f7)["verdict"] == "MALFORMED",
+           "W7d: mixed outcome quantities across rows must be MALFORMED")
         with open(f7, "w") as f:
             f.write("- not\n- a mapping\n")
         ok(validate_within_zone_heterogeneity(f7)["verdict"] == "MALFORMED",

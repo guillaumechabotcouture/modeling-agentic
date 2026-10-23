@@ -331,8 +331,9 @@ def bash_write_targets(command: str) -> list[str]:
     Known limitation (Codex review of PR #14): run-directory artifacts are
     NOT hashed, and these forms still evade the heuristic — variable
     expansion (`p=…; echo > "$p"`), nested shells (`bash -c "cd …; …"`), a
-    `cd` that never runs (`false && cd x`) or runs in a pipeline, and
-    backslash-escaped filenames. The structural fix is an integrity record
+    `cd` that never runs (`false && cd x`) or runs in a pipeline,
+    backslash-escaped filenames, quotes inside `#` comments, and process
+    substitution (`tee >(…) <protected>`). The structural fix is an integrity record
     of protected run artifacts checked before the gate (tracked follow-up).
     """
     return [t for t, _ in bash_write_targets_cwd(command)]
