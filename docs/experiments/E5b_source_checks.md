@@ -48,3 +48,49 @@ Both arms run `replay.py --stage CRITIQUE` with the `deterministic` variant, eac
 - **Same generator and fixtures:** see Variants above.
 - **The checks were designed after reading the seed-7 instances.** This is the reason for E5b.
 - **Deterministic arm only:** the effect on union recall with LLM critics is inferred, not measured.
+
+## Results (2026-10-22; 54 variants × 2 arms, local, $0)
+
+**Variants.** Seed 11 planted 139 defects. 47 were identical to seed-7 defects, because some classes have few possible targets per fixture. They are excluded as registered, leaving **92 held-out defects**. Within seed 11, some defects repeat across variants of the same fixture; distinct counts are shown.
+
+| Class | Held-out (distinct) | Baseline `72abe68` | New `5357991` | New 95% CI | Lost |
+|---|---|---|---|---|---|
+| data_vintage | 16 (12) | 0/16 | **10/16** | 0.39–0.81 | 0 |
+| ledger_mismatch | 13 (13) | 0/13 | **6/13** | 0.23–0.71 | 0 |
+| unit_error | 11 (8) | 0/11 | **2/11** | 0.05–0.48 | 0 |
+| zero_width_ci | 12 | 3/12 | 4/12 | | 0 |
+| ci_inverted | 8 | 4/8 | 4/8 | | 0 |
+| citation_mismatch | 18 | 0/18 | 0/18 | | 0 |
+| prose_stale_number | 12 | 0/12 | 0/12 | | 0 |
+| benefit_total_population | 2 | 0/2 | 0/2 | | 0 |
+
+budget_overspend, renamed_verdict and sensitivity_contradiction had no held-out instances: all of theirs repeated seed 7.
+
+**Registered decision rules:**
+1. **Gap filled (recall ≥ 0.5):**
+   - data_vintage **passes** (0.63).
+   - ledger_mismatch **fails** (0.46).
+   - unit_error **fails** (0.18).
+2. **No regression:** **passes.** No class lost a paired detection.
+3. **Noise:**
+   - Spurious-match rate is 0.014 vs 0.000 (≤ +0.02): **passes.**
+   - New HIGH findings per clean fixture average **24.0** (limit 1): **fails.**
+4. **No tuning:** the checks are not changed on these variants. The failing classes go to the structural fix.
+
+**Diagnosis (post hoc; it explains the verdicts and does not change them):**
+- **Ledger misses are mostly the matcher.**
+  - 5 of the 7 uncredited plants *were* flagged with the right claim id and planted value (`sens_n_flips` 21 vs 15, `rm_n_scenarios`, `sa_n_params_r6`, `package_count`, `ex_n_wide`). The frozen matcher can't credit one- or two-digit values, because of its ≥3-character rule.
+  - The other 2 were flagged as having an unresolvable source field, which is not a mismatch.
+  - Read by gate output, 11 of 13 plants were flagged, 9 of them as wrong values.
+- **The "noise" is real, unplanted defects.** All 24 new HIGHs per clean fixture are ledger-provenance findings that the round-1 early return had hidden.
+  - Example: in CB1, 110 of 286 checkable claims contradict their source (`base_n_lgas_smc` 150 in the ledger vs 208 in `allocation_scenarios.yaml`).
+  - Cause: the ledger was built at 07:01, and the scenarios were rewritten at 10:07 without rebuilding it.
+  - By E5's definition (an unplanted finding on a clean variant) these count as noise. In substance they are true positives.
+- **Unit misses have no reference to check against.** The missed columns have no `_lo`/`_hi` pair, no matching-key partner table, and no value quoted in a data document. Their names don't imply a bound. A heuristic can't see a ×100 change without some reference.
+
+**What follows:**
+- Both failing classes point to the same structural fix:
+  - **Ledger:** code fills in ledger values from each claim's `source_field` and rebuilds them when a source changes, so a stale or mistyped ledger can't exist.
+  - **Units:** the data stage declares each column's unit and plausible range at write time.
+- The data_vintage check is kept (MEDIUM).
+- The ungated ledger check is kept. Its findings are real, and the structural fix removes their cause.
