@@ -269,3 +269,6 @@ Red-team vs each other critic, counting defects caught by one arm and missed by 
 - **Lower-bound caveat:** the matcher is still lexical, so LLM recall here remains a lower bound.
 
 **Exploratory (post hoc, not pre-registered):** validators re-run at round 3 instead of round 1 reach 14/54 (+1 ledger_mismatch). The round-1 reproduction matched the original 13/54 exactly. Round gating is not the main reason for the validator gaps. Why the provenance check catches only 1/5 planted ledger mismatches needs a focused look.
+
+**Caveat found later (2026-10-22, Phase 22 ε):** building the CI regression eval showed that the lexical matcher under-credits *structured gate* findings, as well as LLM prose. On the synthetic positive control, the gates caught planted zero-width/inverted CIs, ledger edits and unit changes (`ci_degenerate`, `claims_ledger_stale`, `data_schema_out_of_range`), but the matcher missed them. Three causes: the planted value is a short integer or a long float, or the specific term is the column/claim name the matcher excludes as a location key. The deterministic arm's recall here is therefore likely an underestimate, which would raise its unique counts. Re-scoring the deterministic arm by finding kind (as `scripts/regression_eval.py` does) is a follow-up before E5 numbers are cited externally.
+

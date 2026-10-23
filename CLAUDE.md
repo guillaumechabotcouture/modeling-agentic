@@ -168,6 +168,7 @@ for f in main.py \
 done
 python3 scripts/validate_skill_attachments.py      # frontmatter + phantoms
 python3 scripts/lib/expert_priors.py --validate    # priors corroboration
+python3 scripts/regression_eval.py                 # planted-defect regression eval (CI)
 ```
 
 Install with `pip install -r requirements.txt` (pinned; add

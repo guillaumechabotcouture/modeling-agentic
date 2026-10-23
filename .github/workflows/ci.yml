@@ -1,0 +1,56 @@
+# Self-tests + planted-defect regression eval on every pull request.
+# No secrets: nothing here calls a model API or cloud service.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # A project venv, as in local use: main.py's self-test checks that
+      # agents get the venv interpreter first on PATH.
+      - name: Install
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -r requirements.txt
+
+      - name: Self-tests (every script with --self-test)
+        run: |
+          fail=0
+          for f in main.py $(git ls-files 'scripts/*.py' 'scripts/lib/*.py'); do
+            case "$f" in */__init__.py) continue;; esac
+            grep -q -- '--self-test' "$f" || continue
+            echo "::group::$f"
+            if ! .venv/bin/python "$f" --self-test; then echo "::error file=$f::self-test failed"; fail=1; fi
+            echo "::endgroup::"
+          done
+          exit $fail
+
+      - name: Skill attachments and expert priors
+        run: |
+          .venv/bin/python scripts/validate_skill_attachments.py
+          .venv/bin/python scripts/lib/expert_priors.py --validate
+
+      - name: Planted-defect regression eval (deterministic gates)
+        run: .venv/bin/python scripts/regression_eval.py
