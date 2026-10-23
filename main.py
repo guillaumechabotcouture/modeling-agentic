@@ -54,6 +54,65 @@ PARTIAL_STATUSES = {"completed_scope_declared", "completed_gate_not_accepted",
                     "completed_no_report", "run_failed", "budget_exhausted"}
 
 
+BUDGET_LEDGER = "budget_ledger.json"
+
+
+def load_budget_ledger(run_path: str) -> dict:
+    """The harness-owned spend record (agents may not write it; the
+    integrity record watches it). Not metadata.json: the planner may edit
+    that file (Codex review of PR #15)."""
+    try:
+        with open(os.path.join(run_path, BUDGET_LEDGER)) as f:
+            d = json.load(f)
+        if isinstance(d, dict) and isinstance(d.get("sessions"), list):
+            return d
+    except (OSError, ValueError):
+        pass
+    return {"sessions": []}
+
+
+def charge_session(ledger: dict, session: int, result, allowance: float | None) -> dict:
+    """Record one session's spend. A session that ended without a cost
+    (disconnect, crash) is charged its whole remaining allowance: the cap
+    errs toward stopping, never toward overspending (Codex review, PR #15)."""
+    cost = getattr(result, "total_cost_usd", None) if result is not None else None
+    if isinstance(cost, (int, float)):
+        # The SDK reports CUMULATIVE cost for a resumed conversation (same
+        # session_id; verified 2026-10-23): charge only the increase.
+        sid = getattr(result, "session_id", None)
+        prev = max((e.get("reported_usd") or 0 for e in ledger.get("sessions", [])
+                    if sid and e.get("session_id") == sid), default=0)
+        entry = {"session": session, "session_id": sid, "reported_usd": round(cost, 4),
+                 "total_cost_usd": round(max(cost - prev, 0), 4), "source": "result"}
+    else:
+        entry = {"session": session, "total_cost_usd": round(allowance or 0, 4),
+                 "source": "unreconciled: charged the full remaining allowance"}
+    ledger.setdefault("sessions", []).append(entry)
+    return ledger
+
+
+def conversation_cost(records: list[dict]) -> float | None:
+    """True spend from per-session results: the reported cost is cumulative
+    within a conversation (session_id), so take each conversation's maximum
+    and sum across conversations. Summing sessions over-counted resumed runs."""
+    by_sid: dict = {}
+    for i, r in enumerate(records):
+        c = r.get("total_cost_usd")
+        if isinstance(c, (int, float)):
+            k = r.get("session_id") or f"_nosid{i}"
+            by_sid[k] = max(by_sid.get(k, 0), c)
+    return round(sum(by_sid.values()), 4) if by_sid else None
+
+
+def write_budget_ledger(run_path: str, ledger: dict, cap: float | None, integrity=None) -> None:
+    ledger = {**ledger, "cap_usd": cap,
+              "spent_usd": round(sum(e.get("total_cost_usd") or 0 for e in ledger["sessions"]), 4)}
+    with open(os.path.join(run_path, BUDGET_LEDGER), "w") as f:
+        json.dump(ledger, f, indent=2)
+    if integrity is not None:
+        integrity.harness_wrote(BUDGET_LEDGER)
+
+
 def remaining_budget(cap: float | None, records: list[dict]) -> float | None:
     """Dollars left under a run-wide cap, summed over every session so far
     (including earlier invocations of a resumed run). None = no cap."""
@@ -500,6 +559,7 @@ async def run(question: str, max_rounds: int, max_sessions: int,
     # Phase 23 α: hash protected run artifacts; every change must be explained
     # by an allowed in-flight tool call (see agents/integrity.py).
     integrity = ArtifactIntegrity(run_path)
+    budget = load_budget_ledger(run_path)
 
     # Phase 21 α: on --resume, continue the saved conversation instead of
     # starting a fresh one (session_id used to be captured only from a
@@ -538,9 +598,9 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                                  max_turns={n: d.maxTurns for n, d in agents.items()},
                                  integrity=integrity)
 
-            # Run-wide dollar cap across sessions (and earlier invocations).
-            left = remaining_budget(max_budget_usd,
-                                    (prior_meta.get("session_results") or []) + session_records)
+            # Run-wide dollar cap across sessions (and earlier invocations),
+            # from the harness-owned ledger.
+            left = remaining_budget(max_budget_usd, budget["sessions"])
             if left is not None and left <= 0:
                 print(f"Budget cap ${max_budget_usd:.0f} reached; stopping.", flush=True)
                 session_outcome = "budget_exhausted"
@@ -590,6 +650,8 @@ async def run(question: str, max_rounds: int, max_sessions: int,
             finally:
                 if result is not None:
                     session_records.append({"session": session_num, **result_summary(result)})
+                charge_session(budget, session_num, result, left)
+                write_budget_ledger(run_path, budget, max_budget_usd, integrity)
                 try:
                     trace_file.close()
                 except OSError:
@@ -771,9 +833,7 @@ def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
         meta["artifact_integrity_violations"] = len(integrity.events)
     if session_records:
         meta.setdefault("session_results", []).extend(session_records)
-    costs = [r.get("total_cost_usd") for r in meta.get("session_results", [])
-             if isinstance(r.get("total_cost_usd"), (int, float))]
-    meta["total_cost_usd"] = round(sum(costs), 4) if costs else None
+    meta["total_cost_usd"] = conversation_cost(meta.get("session_results", []))
     if enforcement.harness_changed(harness_diff):
         meta["harness_diff"] = harness_diff
     if harness_prior_diff and enforcement.harness_changed(harness_prior_diff):
@@ -1024,6 +1084,23 @@ def _run_self_test() -> int:
            == ["coherence_audit.py"]
            and harness_scripts_run("cd $X && python3 scripts/coherence_audit.py r", cwd=td)[0] == [],
            "IC6d script resolution follows cd; unknown cd authorizes nothing")
+        # IC6e (Codex r3): pushd/popd tracked; a concurrent tool's scan can't drop a grant
+        ok(harness_scripts_run(f"pushd /tmp; popd; python3 scripts/coherence_audit.py {td}",
+                               cwd=REPO_ROOT)[0] == ["coherence_audit.py"],
+           "IC6e popd restores the directory for script resolution")
+        ok(enforcement.check_tool_use("Bash", {"command": f"pushd /tmp; popd; echo x > {os.path.relpath(run_path, REPO_ROOT)}/critique_domain.yaml"},
+                                      run_path, None, set()) is not None,
+           "IC6f popd restores the directory for the write check")
+        alive2 = {"v": set()}
+        ig6e = ArtifactIntegrity(td, process_check=lambda: alive2["v"])
+        ig6e.on_pre("L", "Bash", {"command": f"nohup python3 scripts/propagate_uncertainty.py {td} &"}, "modeler")
+        ig6e.on_pre("R", "Read", {"file_path": f"{td}/x"}, "modeler")
+        ig6e.on_post("R")              # concurrent Read finishes before the producer starts
+        alive2["v"] = {"propagate_uncertainty.py"}
+        ig6e.on_post("L")              # launch's own post: alive → grant kept
+        alive2["v"] = set()
+        w("uncertainty_report.yaml", "n: final after exit\n")
+        ok(ig6e.on_post("poll") == [], "IC6g only the launching call's post-hook judges its grant")
         # IC7: a tool whose PostToolUse never came still explains its output at finalize
         ig7 = ArtifactIntegrity(td, process_check=lambda: set())
         ig7.on_pre("c7", "Bash", {"command": f"python3 scripts/coherence_audit.py {td}; false"}, "lead-ish")
@@ -1281,6 +1358,30 @@ def _run_self_test() -> int:
        and determine_status("budget_exhausted", {"action": "PATCH_OR_RETHINK"}, True, False, None)
        == "budget_exhausted" and exit_code_for("budget_exhausted") == 2,
        "BG1 remaining budget sums sessions; budget stop is a partial status (exit 2)")
+    # BG2 (Codex, PR #15): an unreconciled session is charged its whole
+    # allowance; the ledger is harness-owned and survives a resume.
+    with tempfile.TemporaryDirectory() as td:
+        R = lambda c, sid="s1": type("R", (), {"total_cost_usd": c, "session_id": sid})()
+        led0 = {"sessions": []}
+        charge_session(led0, 1, R(4.0), 10.0)
+        charge_session(led0, 2, R(6.5), 6.0)       # resumed: cumulative 6.5 → charge 2.5
+        ok(remaining_budget(10.0, led0["sessions"]) == 3.5,
+           f"BG2a resumed session charged the increase only: {led0}")
+        ok(conversation_cost([{"total_cost_usd": 4.0, "session_id": "a"},
+                              {"total_cost_usd": 6.5, "session_id": "a"},
+                              {"total_cost_usd": 1.0, "session_id": "b"}]) == 7.5,
+           "BG2b run cost = max per conversation, summed across conversations")
+        led = load_budget_ledger(td)
+        charge_session(led, 1, R(4.0), 5.0)
+        charge_session(led, 2, None, remaining_budget(5.0, led["sessions"]))
+        write_budget_ledger(td, led, 5.0)
+        again = load_budget_ledger(td)
+        ok(remaining_budget(5.0, again["sessions"]) == 0 and again["spent_usd"] == 5.0
+           and again["sessions"][1]["source"].startswith("unreconciled"),
+           f"BG2 disconnect charged in full; ledger reloads: {again}")
+        ok(enforcement.check_tool_use("Write", {"file_path": f"{td}/budget_ledger.json"},
+                                      td, "planner", set()) is not None,
+           "BG3 agents may not write the budget ledger")
     # CS1 (Phase 22 γ): the ledger is built by a script; agents write the spec.
     ok(enforcement.check_tool_use("Write", {"file_path": f"{run_path}/models/claims_ledger.yaml"},
                                   run_path, "analyst", set()) is not None
