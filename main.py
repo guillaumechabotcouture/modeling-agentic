@@ -563,9 +563,18 @@ async def run(question: str, max_rounds: int, max_sessions: int,
     if not budget["sessions"] and prior_meta.get("session_results"):
         # Run started before the ledger existed: carry its recorded spend over
         # rather than granting a fresh allowance (Codex review, PR #15).
-        budget["sessions"].append({"session": 0, "session_id": None,
-                                   "total_cost_usd": conversation_cost(prior_meta["session_results"]) or 0,
-                                   "source": "migrated from metadata.json session_results"})
+        # One entry per conversation, carrying its cumulative cost as
+        # reported_usd so a resumed session is charged only the increase.
+        per_sid: dict = {}
+        for i, r in enumerate(prior_meta["session_results"]):
+            c = r.get("total_cost_usd")
+            if isinstance(c, (int, float)):
+                k = r.get("session_id") or f"_nosid{i}"
+                per_sid[k] = max(per_sid.get(k, 0), c)
+        for k, c in per_sid.items():
+            budget["sessions"].append({"session": 0, "session_id": None if k.startswith("_nosid") else k,
+                                       "reported_usd": round(c, 4), "total_cost_usd": round(c, 4),
+                                       "source": "migrated from metadata.json session_results"})
 
     # Phase 21 α: on --resume, continue the saved conversation instead of
     # starting a fresh one (session_id used to be captured only from a
@@ -1399,6 +1408,11 @@ def _run_self_test() -> int:
         ok(remaining_budget(5.0, again["sessions"]) == 0 and again["spent_usd"] == 5.0
            and again["sessions"][1]["source"].startswith("unreconciled"),
            f"BG2 disconnect charged in full; ledger reloads: {again}")
+        mig = {"sessions": [{"session": 0, "session_id": "s1", "reported_usd": 4.0,
+                             "total_cost_usd": 4.0, "source": "migrated"}]}
+        charge_session(mig, 1, R(6.0), 6.0)
+        ok(remaining_budget(10.0, mig["sessions"]) == 4.0,
+           f"BG2c migrated spend + resumed cumulative result is not double-counted: {mig}")
         ok(enforcement.check_tool_use("Write", {"file_path": f"{td}/budget_ledger.json"},
                                       td, "planner", set()) is not None,
            "BG3 agents may not write the budget ledger")
