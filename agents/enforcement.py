@@ -253,12 +253,21 @@ def bash_write_targets_cwd(command: str, cwd: str | None = None
     """
     out: list[tuple[str, str | None]] = []
     cur: str | None = cwd or REPO_ROOT
+    stack: list[str | None] = []          # cwd saved at each `(` (subshell)
     for segment in _SEGMENT_SPLIT.split(command):
-        is_cd, new = _cd_target(segment, cur)
+        body = segment.strip()
+        while body.startswith(("(", "{")):
+            stack.append(cur)             # `( … )` / `$( … )`: cd inside does not leak
+            body = body[1:].lstrip()
+        # Redirections on the segment itself apply in the cwd before any cd
+        # in it (`cd /tmp > x` truncates x where we stand).
+        out.extend((t, cur) for t in _segment_targets(body))
+        is_cd, new = _cd_target(body, cur)
         if is_cd:
             cur = new
-            continue
-        out.extend((t, cur) for t in _segment_targets(segment))
+        for _ in range(segment.count(")") if stack else 0):
+            if stack:
+                cur = stack.pop()
     return out
 
 
@@ -280,12 +289,18 @@ def bash_reason(command: str, run_path: str, agent_type: str | None,
         return ("credential files (.env) are not accessible to agents; cloud "
                 "credentials are provided in the environment when --cloud is set")
     for target, tcwd in bash_write_targets_cwd(command, cwd):
-        # Unknown cwd after `cd $X`: a relative target could be anywhere,
-        # so check it as if relative to the run dir and to the repo root.
-        bases = [tcwd] if tcwd is not None else [run_path, REPO_ROOT]
-        for base in bases:
-            path = base if target in (".", "./") else target
-            reason = protected_reason(path, run_path, agent_type, base)
+        if tcwd is not None or os.path.isabs(os.path.expanduser(target.strip("'\""))):
+            candidates = [(target, tcwd)]
+        else:
+            # Unknown cwd after `cd $X`: a relative target (even `../x`) could
+            # land anywhere in the run, so check its file name in every run
+            # directory a protected file lives in, and at the repo root.
+            name = os.path.basename(os.path.normpath(target)) or target
+            candidates = [(name, d) for d in (run_path, os.path.join(run_path, "models"))]
+            candidates += [(target, REPO_ROOT), (target, run_path)]
+        for path, base in candidates:
+            p = base if path in (".", "./") else path
+            reason = protected_reason(p, run_path, agent_type, base)
             if reason:
                 return f"command writes to {target}: {reason}"
     return None

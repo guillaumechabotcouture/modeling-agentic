@@ -654,9 +654,13 @@ def _restore_protected_meta(metadata_path: str, original_meta: dict) -> None:
     try:
         with open(metadata_path) as f:
             meta = json.load(f)
+        if not isinstance(meta, dict):
+            raise ValueError("metadata.json is not an object")
     except (OSError, ValueError):
-        return
-    changed = False
+        # Missing or corrupted: rebuild it from the originals rather than
+        # let finalization write a metadata.json without the question.
+        meta = {"restored_fields": {"_metadata_unreadable": True}}
+    changed = not os.path.exists(metadata_path) or "_metadata_unreadable" in meta.get("restored_fields", {})
     for key in _PROTECTED_META:
         if key in original_meta and meta.get(key) != original_meta[key]:
             meta.setdefault("restored_fields", {})[key] = meta.get(key)
@@ -1019,6 +1023,26 @@ def _run_self_test() -> int:
                                       run_path, "analyst", set()) is None
        and enforcement.check_tool_use("Glob", {"pattern": "**/*"}, run_path, "analyst", set()) is None,
        "CR4 Grep on .env denied; ordinary Grep and Glob allowed")
+    # CR6-CR8 (Codex re-review): cd-segment redirects, subshell cd, ../ after unknown cd.
+    ok(enforcement.check_tool_use("Bash", {"command": f"cd /tmp > {rp_rel}/critique_domain.yaml"},
+                                  run_path, None, set()) is not None,
+       "CR6 redirect on a cd segment is checked before the cd")
+    ok(enforcement.check_tool_use("Bash", {"command": f"(cd /tmp); echo forged > {rp_rel}/critique_domain.yaml"},
+                                  run_path, None, set()) is not None
+       and enforcement.check_tool_use("Bash", {"command": "(cd /tmp && echo ok > x.txt); echo hi"},
+                                      run_path, None, set()) is None,
+       "CR7 a subshell cd does not leak into later segments")
+    ok(enforcement.check_tool_use("Bash", {"command": 'cd "$RUN" && echo forged > ../critique_domain.yaml'},
+                                  run_path, None, set()) is not None,
+       "CR8 ../ target after an unknown cd is checked by file name")
+    with tempfile.TemporaryDirectory() as td:
+        mp = os.path.join(td, "metadata.json")
+        with open(mp, "w") as f:
+            f.write("{corrupt")
+        _restore_protected_meta(mp, {"question": "Q", "run_dir": "r"})
+        m = json.load(open(mp))
+        ok(m.get("question") == "Q" and m.get("run_dir") == "r",
+           "CR9 corrupted metadata.json is rebuilt with the protected fields")
     # CR5 (Codex review of PR #14): the gate must see the original question.
     with tempfile.TemporaryDirectory() as td:
         mp = os.path.join(td, "metadata.json")
