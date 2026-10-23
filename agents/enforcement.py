@@ -74,6 +74,8 @@ SCRIPT_OUTPUTS = (
     "trace.jsonl",
     "final_gate.json",
     "final_gate_stderr.txt",
+    "artifact_integrity.json",   # Phase 23 α: written by agents/integrity.py only
+    "budget_ledger.json",        # Phase 23 β: run-wide spend, written by main.py only
 )
 
 # Files the lead may not write directly: it must re-spawn the owning
@@ -273,6 +275,12 @@ def _shell_tokens(command: str) -> list[str]:
         if c in ("'", '"'):
             quote = c; buf.append(c); i += 1
             continue
+        if c == "#" and (not buf or buf[-1].isspace()):
+            # A comment runs to end of line; its quotes and words are not
+            # syntax and must not authorize anything (Codex review, PR #15).
+            j = command.find("\n", i)
+            i = n if j < 0 else j
+            continue
         if command.startswith(("&&", "||"), i):
             flush(); i += 2
             continue
@@ -290,6 +298,45 @@ def _shell_tokens(command: str) -> list[str]:
     return toks
 
 
+def iter_segments_with_cwd(command: str, cwd: str | None = None
+                           ) -> list[tuple[str, str | None]]:
+    """(segment, cwd before it) for every simple command, tracking `( … )`
+    subshells, `cd`, and the `pushd`/`popd` stack (Codex review, PR #15).
+    cwd None = unknown (after `cd $X`, or `popd` on an empty stack)."""
+    out: list[tuple[str, str | None]] = []
+    cur: str | None = cwd or REPO_ROOT
+    sub: list[tuple[str | None, list]] = []     # (cwd, dirstack) at each `(`
+    dirs: list[str | None] = []
+    for tok in _shell_tokens(command):
+        if tok == "(":
+            sub.append((cur, list(dirs)))
+            continue
+        if tok == ")":
+            if sub:
+                cur, dirs = sub.pop()
+            continue
+        body = tok.strip()
+        out.append((body, cur))
+        toks = _tokens(body) or [""]
+        head, no_cd = toks[0], "-n" in toks[1:]
+        if head == "popd":
+            # `popd -n` drops a stack entry without changing directory.
+            top = dirs.pop() if dirs else None
+            if not no_cd:
+                cur = top
+            continue
+        before = cur
+        is_cd, new = _cd_target(body, cur)
+        if is_cd:
+            if head == "pushd" and no_cd:
+                dirs.append(new)         # `pushd -n` adds to the stack only
+                continue
+            if head == "pushd":
+                dirs.append(before)
+            cur = new
+    return out
+
+
 def bash_write_targets_cwd(command: str, cwd: str | None = None
                            ) -> list[tuple[str, str | None]]:
     """(path, cwd it is relative to) for every path a command writes.
@@ -300,23 +347,9 @@ def bash_write_targets_cwd(command: str, cwd: str | None = None
     None and callers must treat relative targets conservatively.
     """
     out: list[tuple[str, str | None]] = []
-    cur: str | None = cwd or REPO_ROOT
-    stack: list[str | None] = []          # cwd saved at each `(` (subshell, `$(`)
-    for tok in _shell_tokens(command):
-        if tok == "(":
-            stack.append(cur)             # a cd inside ( … ) does not leak
-            continue
-        if tok == ")":
-            if stack:
-                cur = stack.pop()
-            continue
-        body = tok.strip()
-        # Redirections on the segment itself apply in the cwd before any cd
-        # in it (`cd /tmp > x` truncates x where we stand).
+    # Redirections on a cd segment apply in the cwd before it (`cd /tmp > x`).
+    for body, cur in iter_segments_with_cwd(command, cwd):
         out.extend((t, cur) for t in _segment_targets(body))
-        is_cd, new = _cd_target(body, cur)
-        if is_cd:
-            cur = new
     return out
 
 
@@ -328,13 +361,14 @@ def bash_write_targets(command: str) -> list[str]:
     python one-liners with open(..., 'w')). Anything it misses in harness
     code is caught after the fact by the harness hash in main.py.
 
-    Known limitation (Codex review of PR #14): run-directory artifacts are
-    NOT hashed, and these forms still evade the heuristic — variable
+    Known limitation (Codex review of PR #14): these forms still evade the
+    heuristic — variable
     expansion (`p=…; echo > "$p"`), nested shells (`bash -c "cd …; …"`), a
     `cd` that never runs (`false && cd x`) or runs in a pipeline,
     backslash-escaped filenames, quotes inside `#` comments, and process
-    substitution (`tee >(…) <protected>`). The structural fix is an integrity record
-    of protected run artifacts checked before the gate (tracked follow-up).
+substitution (`tee >(…) <protected>`). They are caught after the
+    fact by agents/integrity.py (Phase 23 α), which hashes protected run
+    artifacts and flags any change no allowed in-flight call explains.
     """
     return [t for t, _ in bash_write_targets_cwd(command)]
 

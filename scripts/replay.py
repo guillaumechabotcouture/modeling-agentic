@@ -195,8 +195,10 @@ async def _sdk_session(stage, run_dir, variant, adef, task, budget_usd, telemetr
     from agents import create_hooks, enforcement, output_caps
     agent = stage_agent_name(stage, variant)
     trace = open(os.path.join(os.path.dirname(run_dir), "trace.jsonl"), "a")
+    from agents.integrity import ArtifactIntegrity
+    integrity = ArtifactIntegrity(run_dir)     # Phase 23 α: measured per case too
     hooks = create_hooks(run_dir, trace, datetime.now(), registered_agents={agent},
-                         max_turns={agent: adef.maxTurns})
+                         max_turns={agent: adef.maxTurns}, integrity=integrity)
     if variant.get("tool_output_cap"):
         hooks = output_caps.wrap_hooks(hooks, variant["tool_output_cap"], run_dir)
     # The session tool set caps every agent's tools, so the lead must carry the
@@ -235,11 +237,14 @@ async def _sdk_session(stage, run_dir, variant, adef, task, budget_usd, telemetr
                 result = m
     finally:
         trace.close()
+        integrity.final_check()
     return {"session_id": session_id,
             "subtype": getattr(result, "subtype", None), "is_error": getattr(result, "is_error", None),
             "cost_usd": getattr(result, "total_cost_usd", None),
             "model_usage": getattr(result, "model_usage", None),
-            "num_turns": getattr(result, "num_turns", None)}
+            "num_turns": getattr(result, "num_turns", None),
+            "integrity_violations": len(integrity.events),
+            "integrity_unmatched_intents": integrity.unmatched_intents}
 
 
 _STUB_REVIEWERS = ("critique-methods", "critique-domain", "critique-presentation", "critique-redteam")

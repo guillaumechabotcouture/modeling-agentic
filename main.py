@@ -33,6 +33,7 @@ from agents import (
     LEAD_SYSTEM_PROMPT,
 )
 from agents import enforcement
+from agents.integrity import ArtifactIntegrity
 
 REPO_ROOT = enforcement.REPO_ROOT
 VALIDATOR = os.path.join(REPO_ROOT, "scripts", "validate_critique_yaml.py")
@@ -50,7 +51,76 @@ SUCCESS_STATUSES = {"completed", "completed_with_report_restored"}
 # Pipeline finished and wrote a report, but the final gate did not ACCEPT.
 PARTIAL_STATUSES = {"completed_scope_declared", "completed_gate_not_accepted",
                     "completed_gate_error", "completed_gate_not_run",
-                    "completed_no_report", "run_failed"}
+                    "completed_no_report", "run_failed", "budget_exhausted"}
+
+
+BUDGET_LEDGER = "budget_ledger.json"
+
+
+def load_budget_ledger(run_path: str) -> dict:
+    """The harness-owned spend record (agents may not write it; the
+    integrity record watches it). Not metadata.json: the planner may edit
+    that file (Codex review of PR #15)."""
+    try:
+        with open(os.path.join(run_path, BUDGET_LEDGER)) as f:
+            d = json.load(f)
+        if isinstance(d, dict) and isinstance(d.get("sessions"), list):
+            return d
+    except (OSError, ValueError):
+        pass
+    return {"sessions": []}
+
+
+def charge_session(ledger: dict, session: int, result, allowance: float | None) -> dict:
+    """Record one session's spend. A session that ended without a cost
+    (disconnect, crash) is charged its whole remaining allowance: the cap
+    errs toward stopping, never toward overspending (Codex review, PR #15)."""
+    cost = getattr(result, "total_cost_usd", None) if result is not None else None
+    if isinstance(cost, (int, float)):
+        # The SDK reports CUMULATIVE cost for a resumed conversation (same
+        # session_id; verified 2026-10-23): charge only the increase.
+        sid = getattr(result, "session_id", None)
+        prev = max((e.get("reported_usd") or 0 for e in ledger.get("sessions", [])
+                    if sid and e.get("session_id") == sid), default=0)
+        entry = {"session": session, "session_id": sid, "reported_usd": round(cost, 4),
+                 "total_cost_usd": round(max(cost - prev, 0), 4), "source": "result"}
+    else:
+        entry = {"session": session, "total_cost_usd": round(allowance or 0, 4),
+                 "source": "unreconciled: charged the full remaining allowance"}
+    ledger.setdefault("sessions", []).append(entry)
+    return ledger
+
+
+def conversation_cost(records: list[dict]) -> float | None:
+    """True spend from per-session results: the reported cost is cumulative
+    within a conversation (session_id), so take each conversation's maximum
+    and sum across conversations. Summing sessions over-counted resumed runs."""
+    by_sid: dict = {}
+    for i, r in enumerate(records):
+        c = r.get("total_cost_usd")
+        if isinstance(c, (int, float)):
+            k = r.get("session_id") or f"_nosid{i}"
+            by_sid[k] = max(by_sid.get(k, 0), c)
+    return round(sum(by_sid.values()), 4) if by_sid else None
+
+
+def write_budget_ledger(run_path: str, ledger: dict, cap: float | None, integrity=None) -> None:
+    ledger = {**ledger, "cap_usd": cap,
+              "spent_usd": round(sum(e.get("total_cost_usd") or 0 for e in ledger["sessions"]), 4)}
+    with open(os.path.join(run_path, BUDGET_LEDGER), "w") as f:
+        json.dump(ledger, f, indent=2)
+    if integrity is not None:
+        integrity.harness_wrote(BUDGET_LEDGER)
+
+
+def remaining_budget(cap: float | None, records: list[dict]) -> float | None:
+    """Dollars left under a run-wide cap, summed over every session so far
+    (including earlier invocations of a resumed run). None = no cap."""
+    if cap is None:
+        return None
+    spent = sum(r.get("total_cost_usd") or 0 for r in records
+                if isinstance(r.get("total_cost_usd"), (int, float)))
+    return round(cap - spent, 4)
 
 
 def slugify(text: str, max_len: int = 40) -> str:
@@ -355,7 +425,8 @@ def run_final_gate(run_path: str, max_rounds: int,
 
 
 def determine_status(session_outcome: str, gate: dict | None, has_report: bool,
-                     report_restored: bool, harness_diff: dict | None) -> str:
+                     report_restored: bool, harness_diff: dict | None,
+                     integrity_violations: int = 0) -> str:
     """Single source of truth for metadata.json["status"].
 
     Phase 11 Commit η (F1) introduced status discrimination; Phase 21 α
@@ -365,6 +436,10 @@ def determine_status(session_outcome: str, gate: dict | None, has_report: bool,
     """
     if harness_diff and enforcement.harness_changed(harness_diff):
         return "harness_tampered"
+    if integrity_violations:
+        # Phase 23 α: decided from the harness's in-memory record, so a
+        # report file an agent made unwritable cannot hide it.
+        return "artifact_tampered"
     if session_outcome != "session_completed":
         return session_outcome
     action = (gate or {}).get("action")
@@ -438,7 +513,7 @@ def write_harness_baseline(run_path: str) -> tuple[dict, dict | None]:
 async def run(question: str, max_rounds: int, max_sessions: int,
               run_dir: str | None = None, run_path: str | None = None,
               allow_cloud: bool = False, cross_model: bool = False,
-              methods_critic: bool = False) -> str:
+              methods_critic: bool = False, max_budget_usd: float | None = None) -> str:
     """Run the modeling pipeline as a single lead agent session.
 
     Returns the terminal status written to metadata.json.
@@ -481,6 +556,25 @@ async def run(question: str, max_rounds: int, max_sessions: int,
     env_overrides = enforcement.filtered_env(dict(os.environ), allow_cloud)
 
     harness_before, harness_prior_diff = write_harness_baseline(run_path)
+    # Phase 23 α: hash protected run artifacts; every change must be explained
+    # by an allowed in-flight tool call (see agents/integrity.py).
+    integrity = ArtifactIntegrity(run_path)
+    budget = load_budget_ledger(run_path)
+    if not budget["sessions"] and prior_meta.get("session_results"):
+        # Run started before the ledger existed: carry its recorded spend over
+        # rather than granting a fresh allowance (Codex review, PR #15).
+        # One entry per conversation, carrying its cumulative cost as
+        # reported_usd so a resumed session is charged only the increase.
+        per_sid: dict = {}
+        for i, r in enumerate(prior_meta["session_results"]):
+            c = r.get("total_cost_usd")
+            if isinstance(c, (int, float)):
+                k = r.get("session_id") or f"_nosid{i}"
+                per_sid[k] = max(per_sid.get(k, 0), c)
+        for k, c in per_sid.items():
+            budget["sessions"].append({"session": 0, "session_id": None if k.startswith("_nosid") else k,
+                                       "reported_usd": round(c, 4), "total_cost_usd": round(c, 4),
+                                       "source": "migrated from metadata.json session_results"})
 
     # Phase 21 α: on --resume, continue the saved conversation instead of
     # starting a fresh one (session_id used to be captured only from a
@@ -516,8 +610,16 @@ async def run(question: str, max_rounds: int, max_sessions: int,
             # failed to write.
             hooks = create_hooks(run_path, trace_file, run_start,
                                  registered_agents=set(agents.keys()),
-                                 max_turns={n: d.maxTurns for n, d in agents.items()})
+                                 max_turns={n: d.maxTurns for n, d in agents.items()},
+                                 integrity=integrity)
 
+            # Run-wide dollar cap across sessions (and earlier invocations),
+            # from the harness-owned ledger.
+            left = remaining_budget(max_budget_usd, budget["sessions"])
+            if left is not None and left <= 0:
+                print(f"Budget cap ${max_budget_usd:.0f} reached; stopping.", flush=True)
+                session_outcome = "budget_exhausted"
+                break
             options = ClaudeAgentOptions(
                 system_prompt=lead_system,
                 agents=agents,
@@ -531,6 +633,8 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                 cwd=REPO_ROOT,
                 env=env_overrides,
             )
+            if left is not None:
+                options.max_budget_usd = left
             if session_id:
                 options.resume = session_id
 
@@ -561,11 +665,17 @@ async def run(question: str, max_rounds: int, max_sessions: int,
             finally:
                 if result is not None:
                     session_records.append({"session": session_num, **result_summary(result)})
+                charge_session(budget, session_num, result, left)
+                write_budget_ledger(run_path, budget, max_budget_usd, integrity)
                 try:
                     trace_file.close()
                 except OSError:
                     pass
 
+            if result is not None and "budget" in str(getattr(result, "subtype", "")):
+                print(f"Budget cap ${max_budget_usd} reached during session {session_num}.", flush=True)
+                session_outcome = "budget_exhausted"
+                break
             if error_str is None and result_is_success(result):
                 where = pipeline_unfinished(run_path)
                 if where and session_num < max_sessions:
@@ -640,14 +750,16 @@ async def run(question: str, max_rounds: int, max_sessions: int,
             run_path, run_dir_rel, run_start, max_rounds, session_outcome,
             session_num, session_id, session_records, harness_before,
             harness_prior_diff, run_gate=not interrupted,
-            original_meta=prior_meta)
+            original_meta=prior_meta, integrity=integrity)
     return status
 
 
-_PROTECTED_META = ("question", "started", "run_dir")
+# methods_critic / cross_model decide which critiques the validator requires
+# (Codex review of PR #15: flipping methods_critic dropped a requirement).
+_PROTECTED_META = ("question", "started", "run_dir", "methods_critic", "cross_model")
 
 
-def _restore_protected_meta(metadata_path: str, original_meta: dict) -> None:
+def _restore_protected_meta(metadata_path: str, original_meta: dict) -> bool:
     """The planner may add decision_year to metadata.json; it may not change
     the question spec-compliance is checked against. Put protected fields
     back (recording what was there) and rewrite the file."""
@@ -671,31 +783,46 @@ def _restore_protected_meta(metadata_path: str, original_meta: dict) -> None:
     if changed:
         with open(metadata_path, "w") as f:
             json.dump(meta, f, indent=2)
+    return changed
 
 
 def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
                  session_num, session_id, session_records, harness_before,
                  harness_prior_diff, run_gate: bool = True,
-                 original_meta: dict | None = None) -> str:
+                 original_meta: dict | None = None, integrity=None) -> str:
     """Restore report if needed, run the final gate, check the harness
     hash, and write metadata.json. Runs in a `finally`, so it executes on
     Ctrl-C and on unexpected exceptions too."""
     original_meta = original_meta or {}
+    # Last integrity scan FIRST: pending tool changes are judged against the
+    # previous baseline before the harness writes anything (Copilot, PR #15).
+    if integrity is not None:
+        integrity.final_check()
     report_restored = restore_report_if_missing(run_path)
+    if report_restored and integrity is not None:
+        integrity.harness_wrote("report.md")
     has_report = os.path.exists(os.path.join(run_path, "report.md"))
     # Restore the protected fields BEFORE the gate: the validator reads the
     # question from metadata.json (Codex review of PR #14: a planner edit to
     # the question would otherwise be gated, then silently undone).
-    _restore_protected_meta(os.path.join(run_path, "metadata.json"), original_meta)
+    if _restore_protected_meta(os.path.join(run_path, "metadata.json"), original_meta) \
+            and integrity is not None:
+        integrity.harness_wrote("metadata.json")
+    if integrity is not None and integrity.events:
+        print(f"[INTEGRITY] {len(integrity.events)} unexplained change(s) to protected "
+              f"run artifacts; see {os.path.join(run_dir_rel, 'artifact_integrity.json')}",
+              flush=True)
 
     gate = None
-    if run_gate and session_outcome == "session_completed":
+    # A budget stop is still gated: the report shows what the money bought.
+    if run_gate and session_outcome in ("session_completed", "budget_exhausted"):
         print("\nRunning final STAGE 7 gate...", flush=True)
         gate = run_final_gate(run_path, max_rounds)
 
     harness_diff = enforcement.diff_harness(harness_before, enforcement.hash_harness())
     status = determine_status(session_outcome, gate, has_report,
-                              report_restored, harness_diff)
+                              report_restored, harness_diff,
+                              integrity_violations=len(integrity.events) if integrity else 0)
 
     elapsed = (datetime.now() - run_start).total_seconds()
     metadata_path = os.path.join(run_path, "metadata.json")
@@ -717,11 +844,11 @@ def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
     meta["has_report"] = has_report
     meta["report_restored"] = report_restored
     meta["final_gate"] = gate
+    if integrity is not None:
+        meta["artifact_integrity_violations"] = len(integrity.events)
     if session_records:
         meta.setdefault("session_results", []).extend(session_records)
-    costs = [r.get("total_cost_usd") for r in meta.get("session_results", [])
-             if isinstance(r.get("total_cost_usd"), (int, float))]
-    meta["total_cost_usd"] = round(sum(costs), 4) if costs else None
+    meta["total_cost_usd"] = conversation_cost(meta.get("session_results", []))
     if enforcement.harness_changed(harness_diff):
         meta["harness_diff"] = harness_diff
     if harness_prior_diff and enforcement.harness_changed(harness_prior_diff):
@@ -742,6 +869,9 @@ def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
         print(f"  Cost: ${meta['total_cost_usd']:.2f}", flush=True)
     if status == "harness_tampered":
         print(f"  HARNESS CHANGED DURING RUN: {harness_diff}", flush=True)
+    if status == "artifact_tampered":
+        print(f"  PROTECTED RUN ARTIFACTS CHANGED OUTSIDE THEIR WRITERS: "
+              f"{[e['file'] for e in integrity.events]}", flush=True)
     print(f"  Results: {run_dir_rel}/", flush=True)
     print(f"{'='*60}", flush=True)
     return status
@@ -844,6 +974,182 @@ def _run_self_test() -> int:
     ok(deny("Read", {"file_path": os.path.join(REPO_ROOT, ".env")}), "E7: Read .env allowed")
     ok(not deny("Read", {"file_path": os.path.join(REPO_ROOT, "scripts/x.py")}),
        "E7: Read scripts denied")
+
+    # IN1-IN7 (Phase 23 α): integrity record of protected run artifacts.
+    from agents.integrity import ArtifactIntegrity, REPORT_NAME
+    with tempfile.TemporaryDirectory() as td:
+        def w(rel, text):
+            os.makedirs(os.path.dirname(os.path.join(td, rel)), exist_ok=True)
+            open(os.path.join(td, rel), "w").write(text)
+        w("critique_domain.yaml", "verdict: REVISE\n")
+        w("uncertainty_report.yaml", "n_draws: 200\n")
+        ig = ArtifactIntegrity(td, process_check=lambda: set())
+        # IN1: the lead's plain Bash rewrites a critique → violation
+        ig.on_pre("b1", "Bash", {"command": "printf x > \"$P\""}, None)
+        w("critique_domain.yaml", "verdict: PASS\n")
+        ok([e["file"] for e in ig.on_post("b1")] == ["critique_domain.yaml"],
+           f"IN1 lead rewrite of a critique flagged: {ig.events}")
+        # IN2: the critic's own Write (or its Bash) → explained
+        ig.on_pre("w1", "Write", {"file_path": f"{td}/critique_domain.yaml"}, "critique-domain")
+        w("critique_domain.yaml", "verdict: REVISE\nblockers: []\n")
+        ok(ig.on_post("w1") == [], "IN2 critic's own write explained")
+        # IN3: a harness script run explains a script output
+        ig.on_pre("b2", "Bash", {"command": f"python3 scripts/propagate_uncertainty.py {td}"}, "modeler")
+        w("uncertainty_report.yaml", "n_draws: 400\n")
+        ok(ig.on_post("b2") == [], "IN3 harness script explains its output")
+        # IN4: a non-script Bash editing a script output → violation, unless a
+        # background harness process is alive
+        ig.on_pre("b3", "Bash", {"command": "p=uncertainty_report.yaml; sed -i '' s/400/40/ $p"}, "modeler")
+        w("uncertainty_report.yaml", "n_draws: 40\n")
+        ok([e["file"] for e in ig.on_post("b3")] == ["uncertainty_report.yaml"],
+           "IN4 variable-expansion edit of a script output flagged")
+        ig2 = ArtifactIntegrity(td, process_check=lambda: {"propagate_uncertainty.py"})
+        w("uncertainty_report.yaml", "n_draws: 800\n")
+        ok(ig2.final_check() == [], "IN4b a live background harness script explains it")
+        # IN5: editing the integrity report itself is a violation
+        w(REPORT_NAME, '{"producer": "agents/integrity.py", "violations": []}')
+        ok(any(e["file"] == REPORT_NAME for e in ig2.final_check()), "IN5 report tamper flagged")
+        # IN6: a resumed run keeps earlier violations
+        ok(len(ArtifactIntegrity(td, process_check=lambda: set()).events) >= 1,
+           "IN6 violations survive a restart")
+        # IN7: hooks feed the record (allowed calls only)
+        trace = open(os.path.join(td, "trace.jsonl"), "w")
+        ig3 = ArtifactIntegrity(td, process_check=lambda: set())
+        n0 = len(ig3.events)
+        hk = agents_pkg.create_hooks(td, trace, datetime.now(), registered_agents=reg, integrity=ig3)
+        pre_i, post_i = hk["PreToolUse"][0].hooks[0], hk["PostToolUse"][0].hooks[0]
+        asyncio.run(pre_i({"tool_name": "Bash", "tool_input": {"command": "true"}}, "h1", None))
+        w("critique_domain.yaml", "verdict: ACCEPT\n")
+        asyncio.run(post_i({"tool_name": "Bash", "tool_input": {"command": "true"}}, "h1", None))
+        ok(len(ig3.events) == n0 + 1 and ig3.events[-1]["file"] == "critique_domain.yaml",
+           f"IN7 hooks record a lead change to a critique: {ig3.events[n0:]}")
+        trace.close()
+    # IC1-IC7 (Codex review of PR #15).
+    from agents.integrity import harness_scripts_run
+    with tempfile.TemporaryDirectory() as td:
+        def w(rel, text):
+            os.makedirs(os.path.dirname(os.path.join(td, rel)), exist_ok=True)
+            open(os.path.join(td, rel), "w").write(text)
+        w("uncertainty_report.yaml", "n: 1\n"); w("critique_domain.yaml", "v: 1\n")
+        w("metadata.json", '{"question": "Q", "methods_critic": true}')
+        ig = ArtifactIntegrity(td, process_check=lambda: set())
+        # IC1: a comment or string mentioning a script authorizes nothing
+        ok(harness_scripts_run('p=x; printf f > "$p"; # scripts/compare_models.py')[0] == []
+           and harness_scripts_run('echo "python3 scripts/compare_models.py"')[0] == []
+           and harness_scripts_run("cd /tmp && python3 /other/repo/scripts/compare_models.py x")[0] == []
+           and harness_scripts_run("nohup .venv/bin/python3 scripts/propagate_uncertainty.py runs/x &")
+           == (["propagate_uncertainty.py"], True),
+           "IC1 only an executed harness script counts")
+        ig.on_pre("c1", "Bash", {"command": 'p=u.yaml; printf f > "$p"; # scripts/propagate_uncertainty.py'}, "modeler")
+        w("uncertainty_report.yaml", "n: forged\n")
+        ok(len(ig.on_post("c1")) == 1, "IC1b comment mention doesn't authorize a forged output")
+        # IC1c: a script authorizes only its own outputs, never critiques
+        ig.on_pre("c2", "Bash", {"command": "python3 scripts/compare_models.py runs/x"}, None)
+        w("critique_domain.yaml", "v: forged\n")
+        ok([e["file"] for e in ig.on_post("c2")] == ["critique_domain.yaml"],
+           "IC1c a harness script doesn't authorize critique changes")
+        # IC2: metadata.json is watched; the planner's edit is fine, the lead's is not
+        ig.on_pre("c3", "Write", {"file_path": f"{td}/metadata.json"}, "planner")
+        w("metadata.json", '{"question": "Q", "methods_critic": true, "decision_year": 2027}')
+        ok(ig.on_post("c3") == [], "IC2 planner metadata edit explained")
+        ig.on_pre("c4", "Bash", {"command": 'p=metadata.json; printf x > "$p"'}, None)
+        w("metadata.json", '{"question": "Q", "methods_critic": false}')
+        ok([e["file"] for e in ig.on_post("c4")] == ["metadata.json"], "IC2b lead metadata edit flagged")
+        mp = os.path.join(td, "metadata.json")
+        _restore_protected_meta(mp, {"question": "Q", "methods_critic": True})
+        ok(json.load(open(mp))["methods_critic"] is True, "IC2c methods_critic restored before the gate")
+        # IC3: a read-only report doesn't freeze the record; status blocks regardless
+        os.chmod(os.path.join(td, REPORT_NAME), 0o444)
+        w("uncertainty_report.yaml", "n: forged again\n")
+        ig.final_check()
+        rep = json.load(open(os.path.join(td, REPORT_NAME)))
+        ok(len(rep["violations"]) == len(ig.events) >= 3,
+           f"IC3 report rewritten despite chmod 444 ({len(rep['violations'])} vs {len(ig.events)})")
+        ok(determine_status("session_completed", {"action": "ACCEPT"}, True, False, None,
+                            integrity_violations=1) == "artifact_tampered"
+           and exit_code_for("artifact_tampered") == 1, "IC3b violations block via status, exit 1")
+        # IC5: the writer's allowed Bash write to report.md is explained
+        ig5 = ArtifactIntegrity(td, process_check=lambda: set())
+        ig5.on_pre("c5", "Bash", {"command": f"printf draft > {td}/report.md"}, "writer")
+        w("report.md", "draft\n")
+        ok(ig5.on_post("c5") == [], "IC5 writer carve-out covers its Bash too")
+        # IC6: a background script that finishes between hooks is still explained once
+        alive = {"v": {"propagate_uncertainty.py"}}
+        ig5._process_check = lambda: alive["v"]
+        ig5.on_pre("c6", "Bash", {"command": f"nohup python3 scripts/propagate_uncertainty.py {td} > log 2>&1 &"}, "modeler")
+        ig5.on_post("c6")            # launch scan: seen alive → grant kept
+        alive["v"] = set()           # it then finishes before the next hook
+        w("uncertainty_report.yaml", "n: final\n")
+        ok(ig5.on_post("poll") == [], "IC6 background grant explains the output after the process ended")
+        w("uncertainty_report.yaml", "n: forged later\n")
+        ig5.on_post("poll2")
+        ok(any(e["file"] == "uncertainty_report.yaml" for e in ig5.events),
+           "IC6b the grant expires once the process has been seen finished")
+        # IC6c (Codex): a background launch that never ran grants nothing
+        ig6 = ArtifactIntegrity(td, process_check=lambda: set())
+        ig6.on_pre("c6c", "Bash", {"command": f"true || nohup python3 scripts/propagate_uncertainty.py {td} &"}, "modeler")
+        ig6.on_post("c6c")
+        ig6.on_pre("c6d", "Bash", {"command": 'p=uncertainty_report.yaml; printf x > "$p"'}, "modeler")
+        w("uncertainty_report.yaml", "n: forged via dead grant\n")
+        ok([e["file"] for e in ig6.on_post("c6d")] == ["uncertainty_report.yaml"],
+           "IC6c a never-started background launch leaves no grant")
+        # IC6d (Codex): `cd <repo> && python3 scripts/x.py` from another cwd is recognized;
+        # a sibling run's process does not count
+        ok(harness_scripts_run(f"cd {REPO_ROOT} && python3 scripts/coherence_audit.py {td}", cwd=td)[0]
+           == ["coherence_audit.py"]
+           and harness_scripts_run("cd $X && python3 scripts/coherence_audit.py r", cwd=td)[0] == [],
+           "IC6d script resolution follows cd; unknown cd authorizes nothing")
+        # IC6e (Codex r3): pushd/popd tracked; a concurrent tool's scan can't drop a grant
+        ok(harness_scripts_run(f"pushd /tmp; popd; python3 scripts/coherence_audit.py {td}",
+                               cwd=REPO_ROOT)[0] == ["coherence_audit.py"],
+           "IC6e popd restores the directory for script resolution")
+        ok(enforcement.check_tool_use("Bash", {"command": f"pushd /tmp; popd; echo x > {os.path.relpath(run_path, REPO_ROOT)}/critique_domain.yaml"},
+                                      run_path, None, set()) is not None,
+           "IC6f popd restores the directory for the write check")
+        alive2 = {"v": set()}
+        ig6e = ArtifactIntegrity(td, process_check=lambda: alive2["v"])
+        ig6e.on_pre("L", "Bash", {"command": f"nohup python3 scripts/propagate_uncertainty.py {td} &"}, "modeler")
+        ig6e.on_pre("R", "Read", {"file_path": f"{td}/x"}, "modeler")
+        ig6e.on_post("R")              # concurrent Read finishes before the producer starts
+        alive2["v"] = {"propagate_uncertainty.py"}
+        ig6e.on_post("L")              # launch's own post: alive → grant kept
+        alive2["v"] = set()
+        w("uncertainty_report.yaml", "n: final after exit\n")
+        ok(ig6e.on_post("poll") == [], "IC6g only the launching call's post-hook judges its grant")
+        # IC6h (Codex r4): popd -n keeps the cwd; an unarmed grant expires
+        ok(harness_scripts_run(f"cd /tmp; pushd {REPO_ROOT}; popd -n; python3 scripts/coherence_audit.py {td}",
+                               cwd=REPO_ROOT)[0] == ["coherence_audit.py"],
+           "IC6h popd -n does not change directory")
+        import agents.integrity as _ig
+        ig6h = ArtifactIntegrity(td, process_check=lambda: set())
+        ig6h.on_pre("L2", "Bash", {"command": f"nohup python3 scripts/propagate_uncertainty.py {td} &"}, "modeler")
+        for g in ig6h.grants:
+            g["t"] -= _ig.INTENT_TTL_S + 1
+        for i in ig6h.inflight.values():
+            i["t"] -= _ig.INTENT_TTL_S + 1
+        w("uncertainty_report.yaml", "n: forged after a lost post-hook\n")
+        ok(any(e["file"] == "uncertainty_report.yaml" for e in ig6h.final_check()),
+           "IC6i an unarmed grant whose post-hook never came expires")
+        # IC7: a tool whose PostToolUse never came still explains its output at finalize
+        ig7 = ArtifactIntegrity(td, process_check=lambda: set())
+        ig7.on_pre("c7", "Bash", {"command": f"python3 scripts/coherence_audit.py {td}; false"}, "lead-ish")
+        w("coherence_audit.yaml", "ok: true\n")
+        ok(ig7.final_check() == [], "IC7 final scan runs before in-flight intents are cleared")
+        # IC8 (Copilot): the cross-model critique is script-owned, not critic-owned
+        w("critique_crossmodel.yaml", "v: 1\n")
+        ig8 = ArtifactIntegrity(td, process_check=lambda: set())
+        ig8.on_pre("c8", "Bash", {"command": 'p=critique_crossmodel.yaml; printf x > "$p"'}, "critique-redteam")
+        w("critique_crossmodel.yaml", "v: forged\n")
+        ok([e["file"] for e in ig8.on_post("c8")] == ["critique_crossmodel.yaml"],
+           "IC8 a critic can't rewrite the script-owned cross-model critique")
+        # IC9 (Copilot): a malformed record on resume is evidence, not a fresh start
+        open(os.path.join(td, REPORT_NAME), "w").write("{truncated")
+        ig9 = ArtifactIntegrity(td, process_check=lambda: set())
+        ok(ig9.events and ig9.events[0]["change"] == "invalid_at_start",
+           "IC9 unreadable integrity record on resume becomes a violation")
+    ok(enforcement.check_tool_use("Write", {"file_path": f"{run_path}/artifact_integrity.json"},
+                                  run_path, "analyst", set()) is not None,
+       "IN8 no agent may write artifact_integrity.json")
 
     # H1: hook returns the SDK deny shape and allows benign calls
     with tempfile.TemporaryDirectory() as td:
@@ -1073,6 +1379,43 @@ def _run_self_test() -> int:
         ok(m["question"] == "Use Starsim within a $10M budget." and m["decision_year"] == 2027
            and m["restored_fields"]["question"] == "weakened",
            "CR5 protected metadata restored (before the gate), planner fields kept")
+    # BG1 (Phase 23 β): run-wide budget cap.
+    ok(remaining_budget(None, [{"total_cost_usd": 5}]) is None
+       and remaining_budget(300, [{"total_cost_usd": 120.5}, {"total_cost_usd": None},
+                                  {"total_cost_usd": 79.5}]) == 100
+       and remaining_budget(300, [{"total_cost_usd": 310}]) == -10
+       and determine_status("budget_exhausted", {"action": "PATCH_OR_RETHINK"}, True, False, None)
+       == "budget_exhausted" and exit_code_for("budget_exhausted") == 2,
+       "BG1 remaining budget sums sessions; budget stop is a partial status (exit 2)")
+    # BG2 (Codex, PR #15): an unreconciled session is charged its whole
+    # allowance; the ledger is harness-owned and survives a resume.
+    with tempfile.TemporaryDirectory() as td:
+        R = lambda c, sid="s1": type("R", (), {"total_cost_usd": c, "session_id": sid})()
+        led0 = {"sessions": []}
+        charge_session(led0, 1, R(4.0), 10.0)
+        charge_session(led0, 2, R(6.5), 6.0)       # resumed: cumulative 6.5 → charge 2.5
+        ok(remaining_budget(10.0, led0["sessions"]) == 3.5,
+           f"BG2a resumed session charged the increase only: {led0}")
+        ok(conversation_cost([{"total_cost_usd": 4.0, "session_id": "a"},
+                              {"total_cost_usd": 6.5, "session_id": "a"},
+                              {"total_cost_usd": 1.0, "session_id": "b"}]) == 7.5,
+           "BG2b run cost = max per conversation, summed across conversations")
+        led = load_budget_ledger(td)
+        charge_session(led, 1, R(4.0), 5.0)
+        charge_session(led, 2, None, remaining_budget(5.0, led["sessions"]))
+        write_budget_ledger(td, led, 5.0)
+        again = load_budget_ledger(td)
+        ok(remaining_budget(5.0, again["sessions"]) == 0 and again["spent_usd"] == 5.0
+           and again["sessions"][1]["source"].startswith("unreconciled"),
+           f"BG2 disconnect charged in full; ledger reloads: {again}")
+        mig = {"sessions": [{"session": 0, "session_id": "s1", "reported_usd": 4.0,
+                             "total_cost_usd": 4.0, "source": "migrated"}]}
+        charge_session(mig, 1, R(6.0), 6.0)
+        ok(remaining_budget(10.0, mig["sessions"]) == 4.0,
+           f"BG2c migrated spend + resumed cumulative result is not double-counted: {mig}")
+        ok(enforcement.check_tool_use("Write", {"file_path": f"{td}/budget_ledger.json"},
+                                      td, "planner", set()) is not None,
+           "BG3 agents may not write the budget ledger")
     # CS1 (Phase 22 γ): the ledger is built by a script; agents write the spec.
     ok(enforcement.check_tool_use("Write", {"file_path": f"{run_path}/models/claims_ledger.yaml"},
                                   run_path, "analyst", set()) is not None
@@ -1271,6 +1614,10 @@ def main() -> int:
     parser.add_argument("--cross-model", action="store_true",
                         help="Add the gpt-6.1-sol cross-model critic (Codex CLI) to "
                              "every STAGE 6. Sends run artifacts to OpenAI.")
+    parser.add_argument("--max-budget-usd", type=float, default=None,
+                        help="Hard dollar cap for the whole run (all sessions, including "
+                             "earlier invocations of a resumed run). Stops with status "
+                             "budget_exhausted; the final gate still runs.")
     parser.add_argument("--methods-critic", action="store_true",
                         help="Add critique-methods to every STAGE 6. Off by default: in E5 "
                              "it caught no planted defect the other critics missed.")
@@ -1324,14 +1671,15 @@ def main() -> int:
         run_dir = os.path.basename(run_path)
         coro = run(question, args.max_rounds, args.max_sessions,
                    run_dir=run_dir, run_path=run_path, allow_cloud=args.cloud,
-                   cross_model=args.cross_model, methods_critic=args.methods_critic)
+                   cross_model=args.cross_model, methods_critic=args.methods_critic,
+                   max_budget_usd=args.max_budget_usd)
     else:
         if not args.question:
             print("Error: question is required (or use --resume)")
             return 1
         coro = run(args.question, args.max_rounds, args.max_sessions,
                    allow_cloud=args.cloud, cross_model=args.cross_model,
-                   methods_critic=args.methods_critic)
+                   methods_critic=args.methods_critic, max_budget_usd=args.max_budget_usd)
     try:
         status = asyncio.run(coro)
     except KeyboardInterrupt:

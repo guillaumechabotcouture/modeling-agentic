@@ -63,7 +63,7 @@ rigor checks between rounds.
 | Goal                                  | Read first                                                    |
 |---------------------------------------|---------------------------------------------------------------|
 | Understand the lead loop              | `main.py` + `agents/__init__.py` (`_registry()`, `build_lead_prompt()`, `create_hooks()`) |
-| Understand what agents may touch      | `agents/enforcement.py` (PreToolUse denies, harness hashing, env filtering) |
+| Understand what agents may touch      | `agents/enforcement.py` (PreToolUse denies, harness hashing, env filtering) and `agents/integrity.py` (hash record of protected run artifacts) |
 | Add or modify a rigor gate            | `scripts/validate_critique_yaml.py` (`_check_*` fns) and any standalone validator under `scripts/`; shared loaders in `scripts/lib/` |
 | Tweak the modeler agent's behavior    | `agents/modeler.py` SYSTEM_PROMPT (~950 lines rendered; § 4 rigor contracts, timeline rendered from the manifest) |
 | Add a new skill                       | Create `.claude/skills/<name>/SKILL.md` with `name`/`description` frontmatter, attach in `agents/__init__.py`, run `python3 scripts/validate_skill_attachments.py` |
@@ -96,8 +96,8 @@ the live attachment picture.
 | Exit | Statuses |
 |------|----------|
 | 0    | `completed`, `completed_with_report_restored` |
-| 2    | `completed_scope_declared`, `completed_gate_not_accepted`, `completed_gate_error`, `completed_gate_not_run`, `completed_no_report`, `run_failed` |
-| 1    | `harness_tampered`, errors |
+| 2    | `completed_scope_declared`, `completed_gate_not_accepted`, `completed_gate_error`, `completed_gate_not_run`, `completed_no_report`, `run_failed`, `budget_exhausted` |
+| 1    | `harness_tampered`, `artifact_tampered`, errors |
 | 130  | `interrupted` |
 
 Cloud credentials (`AZ_*` / `AZURE_*`) are stripped from the agent

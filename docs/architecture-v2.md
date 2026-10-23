@@ -14,6 +14,8 @@
 python3 scripts/telemetry.py <session_dir> --lead <lead.jsonl> --run-dir <run> --out turns.csv
 ```
 
+> **Correction (2026-10-23).** Run-level dollar totals recorded before PR #15 overstate multi-session runs. The SDK reports cumulative cost for a resumed conversation, and `metadata.json` summed sessions. T1's true cost was **$316**, not the recorded $609, and another A/B run's was $428, not $771. Token counts from `scripts/telemetry.py`, which de-duplicates transcripts, are unaffected. Dollar figures taken from the recorded totals below (and the "$600 / 13 h" shorthand) should be read as about 2× too high. The conclusion that cost is dominated by context re-reading is unchanged.
+
 | Finding | Evidence |
 |---|---|
 | Cost is context re-reading, not generation | T1 (recorded): 916M cache-read + 59M cache-write input tokens vs 5.7M output; Opus 5.5 = $592 of $609 |
