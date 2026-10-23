@@ -509,6 +509,30 @@ archetypes and the plan specifies N archetypes, you MUST either:
 After calibration, produce three additional artifacts that feed the
 STAGE 5b mechanical rigor checks:
 
+### Gate outputs come only from their producer scripts (Phase 23)
+
+You write the INPUTS the gate scripts read (`models/outcome_fn.py`,
+`models/model_comparison.yaml`, `models/identifiability.yaml`,
+`models/eligibility_manifest.yaml`, …). The gate's OUTPUTS are written only
+by the producer scripts, never by your own code, even with the same math:
+
+| Output | Producer |
+|---|---|
+| `uncertainty_report.yaml` | `python3 scripts/propagate_uncertainty.py {run_dir}` |
+| `identifiability.yaml` | `python3 scripts/identifiability.py {run_dir}` |
+| `model_comparison_formal.yaml` | `python3 scripts/compare_models.py {run_dir}` |
+| `models/eligibility_probe.yaml` | `python3 scripts/eligibility_probe.py {run_dir}` |
+| `models/claims_ledger.yaml` | `python3 scripts/build_claims_ledger.py {run_dir}` |
+
+The harness hashes these files. A change made outside its producer is a
+blocking, non-declarable `artifact_integrity_violation` until the producer
+is re-run and rewrites the file. If a producer is too slow, make
+`outcome_fn` faster (e.g. an emulator of the full model) instead of writing
+the report yourself. For long producer runs, launch with
+`nohup python3 scripts/<producer>.py {run_dir} > {run_dir}/models/<producer>.log 2>&1 &`
+inside one Bash call and poll it in the foreground with a bounded loop;
+`run_in_background` is not available.
+
 ### Rigor artifact timeline (Phase 9 Commit τ — draft early, iterate)
 
 Rigor artifacts are NOT one-shot round-8 gate-checks. The 0013 run's
