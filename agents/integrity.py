@@ -131,15 +131,25 @@ def harness_scripts_run(command: str, cwd: str | None = None, _depth: int = 0
             # the producer runs inside the shell string — but only when -c
             # (or a cluster like -lc) comes before any script operand or `--`;
             # in `bash /dev/null -c '…'` the string never runs (Codex, PR #17).
-            cmd_str = None
-            for j, t in enumerate(toks[1:], 1):
-                if t == "--" or not t.startswith("-"):
+            cmd_str, noexec, j = None, False, 1
+            while j < len(toks):
+                t = toks[j]
+                if t in ("-o", "+o", "-O", "+O"):
+                    noexec = noexec or (j + 1 < len(toks) and toks[j + 1] == "noexec")
+                    j += 2                   # option with an operand (`-o pipefail`)
+                    continue
+                if t == "--" or not t.startswith(("-", "+")):
                     break
-                # only a cluster of real single-letter shell options (e/l/u/x/i/o…);
-                # `-Zc` makes bash exit without running the string (Codex, PR #17).
-                if re.fullmatch(r"-[eluxivnfaBHP]*c[eluxivnfaBHP]*", t):
+                if t.startswith("-") and not t.startswith("--") and "n" in t[1:]:
+                    noexec = True            # `-n`: syntax check only, nothing runs
+                # only a cluster of real single-letter shell options; `-Zc` makes
+                # bash exit without running the string (Codex, PR #17).
+                if re.fullmatch(r"-[eluxivfaBHP]*c[eluxivfaBHP]*", t):
                     cmd_str = toks[j + 1] if j + 1 < len(toks) else None
                     break
+                j += 1
+            if noexec:
+                cmd_str = None
             if cmd_str is not None:
                 inner, bg = harness_scripts_run(cmd_str, base, _depth + 1)
                 found += inner
