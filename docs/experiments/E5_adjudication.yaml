@@ -1,0 +1,27 @@
+# Manual adjudication of E5 matcher calls (first pass by Claude 2026-10-22,
+# per the owner's instruction; the owner may override any entry).
+# Applied by score_critiques.py --adjudications after automatic matching.
+overrides:
+  - arm: methods
+    variant: CM213310__p3
+    defect_index: 3
+    detected: false
+    reason: >-
+      A1. The critic noticed results.md says "clean" while model_comparison_formal.yaml
+      says validated_with_notes, but told the report to ADOPT the invented verdict.
+      It treated the tampered value as truth, so this is not a detection of the plant.
+  - arm: methods
+    variant: CH161312__p1
+    defect_index: 1
+    detected: true
+    reason: >-
+      A2. M-010 states results.md "calls the verdict both robust and unstable",
+      identifying the planted ROBUST claim against sensitivity_analysis.yaml.
+  - arm: domain
+    variant: CH235631__p3
+    defect_index: 1
+    detected: true
+    reason: >-
+      A5. D-005 says "the c10 header says 2018 but the paper is 2024", which is the
+      planted Thwing year change named by citation key. The year-anchoring rule
+      (matcher v2) can't credit it because the blocker doesn't name Thwing.

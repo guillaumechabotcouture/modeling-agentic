@@ -7,9 +7,9 @@ Every experiment is pre-registered in this directory before it runs. Stage exper
 | ID | Question | Status | Notes |
 |---|---|---|---|
 | E1 | Context diet: contract packet vs 28 preloaded skills (MODEL) | **done**: not adopted | start context −82%, input tokens −43%, cost −26%; quality underpowered; packet gaps found |
-| E1b | Packet gap fix: every effort floor as an explicit instruction | **running** | rule: ≤1/6 cases with a HIGH floor violation |
+| E1b | Packet gap fix: every effort floor as an explicit instruction | **done**: inconclusive | HIGH floor violations 4/6 → 1/6, but progress fell (cap confound) |
 | E2 | History growth: tool-output cap, fresh-context handoff, reasoning effort | ready to pre-register after E1b | tool output is only ~16% of re-reads; retained reasoning and whole-file reads dominate |
-| **E5** | **Critic effectiveness: which critics catch which planted defects, at what cost and noise** | **building** | first of the structural experiments; reuses fixtures; ≥40 planted instances per arm |
+| **E5** | **Critic effectiveness: which critics catch which planted defects, at what cost and noise** | **done** (matcher v2) | union 0.74; red-team alone 0.61; methods adds 0 unique (save ~$45/round); domain kept (unique 0.074); gaps: data_vintage, ledger_mismatch, unit_error |
 | **E4** | **Decomposed MODEL stage: spec → code → harness job → interpret, as fresh typed calls, vs the monolithic modeler** | design | needs the compute-service job runner (v2 §3.2) in minimal form |
 | **E6** | **Expert checkpoints: ~15-min human review of plan + model spec vs none** | design | outcome: downstream defects and rework; uses the owner's time sparingly |
 | E3 | Powered quality test at stage completion, with blinded expert sample | after E2/E4 | validates the design we will keep, not an intermediate one |

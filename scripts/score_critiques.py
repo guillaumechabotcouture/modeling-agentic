@@ -78,6 +78,18 @@ def _identifier_like(k: str) -> bool:
     return len(k) >= 6 and bool(re.search(r"[_\d.\-:]", k)) or len(k) >= 12
 
 
+def _distinctive_value(t: str) -> bool:
+    """Planted values are evidence when quoted. v1 applied _identifier_like
+    (>= 6 chars + a digit/symbol) to them too, so '2,078', '2017' or '1.55'
+    could never count; the E5 audit found three real detections lost that way
+    (matcher revision v2, 2026-10-22)."""
+    return (bool(re.search(r"\d", t)) and len(t.replace(",", "")) >= 3) or _identifier_like(t)
+
+
+# Class vocabulary added in matcher v2 (audit A4: "breaches the budget").
+EXTRA_GENERIC = {"budget_overspend": ["breach"]}
+
+
 def location_keys(defect: dict) -> list[str]:
     loc = str(defect.get("location") or "")
     keys = []
@@ -115,6 +127,21 @@ def _renderings(t) -> list[str]:
 REQUIRE_SPECIFIC = {"prose_stale_number", "citation_mismatch", "data_vintage", "ledger_mismatch"}
 
 
+# A year is common in citations.md and data_provenance.md: "Protopopoff 2018"
+# matched a planted "Thwing ... 2018" on a clean variant (v2 rescore, both
+# domain and methods). A bare year counts only next to the entry's name, as a
+# whole word; names under 3 chars ("ID", "JA") can't anchor, so the year stands.
+_YEAR = re.compile(r"(19|20)\d\d")
+
+
+def _anchor_years(defect: dict, text: str, spec: list) -> list:
+    names = [str(t).lower() for t in defect["terms"]["specific"] if not _YEAR.fullmatch(str(t))]
+    if not names or all(len(n) < 3 for n in names):
+        return spec
+    named = any(re.search(rf"\b{re.escape(n)}\b", text) for n in names if len(n) >= 3)
+    return [t for t in spec if named or not _YEAR.fullmatch(str(t))]
+
+
 def match(defect: dict, text: str) -> dict | None:
     """Return the match reasons, or None. Terms that merely restate the cited
     file (its basename, or a substring of its path) don't count as evidence."""
@@ -127,9 +154,10 @@ def match(defect: dict, text: str) -> dict | None:
         return None
     spec = [t for t in defect["terms"]["specific"]
             if any(r in text for r in _renderings(t)) and str(t).lower() not in paths
-            and str(t).lower() not in keys and _identifier_like(str(t))]
-    gen = [t for t in defect["terms"]["generic"]
+            and str(t).lower() not in keys and _distinctive_value(str(t))]
+    gen = [t for t in list(defect["terms"]["generic"]) + EXTRA_GENERIC.get(defect.get("class"), [])
            if str(t).lower() in text and str(t).lower() not in paths]
+    spec = _anchor_years(defect, text, spec)
     if spec or (len(gen) >= 2 and defect.get("class") not in REQUIRE_SPECIFIC):
         return {"cites": cites, "specific": spec, "generic": gen}
     return None
@@ -163,7 +191,18 @@ def _run_dir(case):
     return d if os.path.isdir(d) else os.path.join(case.get("workspace", ""), "run")
 
 
-def score(batch: str, truth_dir: str, audit_frac: float = 0.2, seed: int = 1) -> dict:
+def load_adjudications(path: str | None) -> dict:
+    """{(arm, variant, defect_index): (detected, reason)} from a reviewed YAML."""
+    if not path:
+        return {}
+    doc = yaml.safe_load(open(path)) or {}
+    return {(o["arm"], o["variant"], int(o["defect_index"])): (bool(o["detected"]), o.get("reason", ""))
+            for o in doc.get("overrides") or []}
+
+
+def score(batch: str, truth_dir: str, audit_frac: float = 0.2, seed: int = 1,
+          adjudications: str | None = None) -> dict:
+    adj = load_adjudications(adjudications)
     truth = {os.path.basename(p)[:-5]: yaml.safe_load(open(p)) for p in glob.glob(os.path.join(truth_dir, "*.yaml"))}
     cases = load_cases(batch)
     arms: dict[str, dict] = {}
@@ -196,22 +235,26 @@ def score(batch: str, truth_dir: str, audit_frac: float = 0.2, seed: int = 1) ->
             A["clean_texts"][src] = texts
             continue
         matched_idx = set()
-        for d in tr["defects"]:
+        for di, d in enumerate(tr["defects"], 1):
             hit = None
             for i, tx in enumerate(texts):
                 r = match(d, tx)
                 if r:
                     hit = (i, r); matched_idx.add(i); break
             prose_hit = match(d, prose) if prose else None
+            auto = hit is not None
+            over = adj.get((arm, fid, di))
             row = {"defect_id": d["defect_id"], "class": d["class"], "severity": d["severity"],
-                   "fixture": fid, "source": src, "detected": hit is not None,
+                   "fixture": fid, "source": src, "detected": over[0] if over else auto,
+                   "auto_detected": auto, "adjudicated": bool(over),
                    "prose_detected": prose_hit is not None,
                    "reasons": hit[1] if hit else None, "blocker_id": blockers[hit[0]].get("id") if hit else None}
             A["rows"].append(row)
             audit.append({"arm": arm, **row, "description": d["description"],
                           "blocker_text": (texts[hit[0]][:600] if hit else None)})
         A["planted_unmatched"].setdefault(src, []).append(len(blockers) - len(matched_idx))
-    report = {"arms": {}, "n_cases": len(cases)}
+    report = {"arms": {}, "n_cases": len(cases),
+              "rows": {arm: A["rows"] for arm, A in arms.items()}}
     for arm, A in arms.items():
         rows = A["rows"]
         k, n = sum(r["detected"] for r in rows), len(rows)
@@ -270,6 +313,31 @@ def to_markdown(rep: dict) -> str:
 
 
 def _self_test() -> int:
+    _fails = []
+    # V2 matcher: short planted values are evidence; adjudications override.
+    d = {"class": "prose_stale_number", "file": "results.md", "location": "line 11",
+         "terms": {"specific": ["2,078", "2078"], "generic": ["stale", "mismatch"]}}
+    if not match(d, "results.md:11 reports $2,078 per death, ratio gives 2,535"):
+        _fails.append("V2a short planted number not credited")
+    if match(d, "results.md has many numbers but none planted here"):
+        _fails.append("V2b no-value blocker wrongly credited (REQUIRE_SPECIFIC)")
+    dy = {"class": "citation_mismatch", "file": "citations.md", "location": "line 14",
+          "terms": {"specific": ["ID", "2017"], "generic": ["citation", "year"]}}
+    if not match(dy, "citations.md c1 lists 'ozodiegwu id et al. 2017'. the paper is 2023"):
+        _fails.append("V2c planted year not credited")
+    db = {"class": "budget_overspend", "file": "alloc.csv", "location": "column cost",
+          "terms": {"specific": ["alloc.csv", "1.55"], "generic": ["budget", "exceed"]}}
+    if not match(db, "summing alloc.csv breaches the budget"):
+        _fails.append("V2d 'breach' vocabulary missing")
+    dt = {"class": "citation_mismatch", "file": "citations.md", "location": "line 77",
+          "terms": {"specific": ["Thwing", "2018"], "generic": ["citation", "year"]}}
+    if match(dt, "citations.md: pbo or 0.40 (protopopoff 2018) applied vs no net"):
+        _fails.append("V2e year of a different entry credited")
+    if not match(dt, "citations.md: thwing is dated 2018, the paper is 2024"):
+        _fails.append("V2f named, dated entry not credited")
+    if _fails:
+        print("SELF-TEST FAILURES:", *_fails, sep="\n  - ")
+        return 1
     failures = []
     def ok(c, m):
         if not c: failures.append(m)
@@ -335,11 +403,12 @@ def main() -> int:
     ap.add_argument("--out")
     ap.add_argument("--audit-frac", type=float, default=0.2)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--adjudications", help="reviewed overrides YAML (see docs/experiments/E5_adjudication.yaml)")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
     if a.self_test:
         return _self_test()
-    rep = score(a.batch, a.truth, a.audit_frac, a.seed)
+    rep = score(a.batch, a.truth, a.audit_frac, a.seed, adjudications=a.adjudications)
     out = a.out or a.batch
     os.makedirs(out, exist_ok=True)
     json.dump(rep, open(os.path.join(out, "e5_scores.json"), "w"), indent=1, default=str)

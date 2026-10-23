@@ -149,7 +149,11 @@ The $2–4 per invocation comes from E1/T1 critic telemetry. Wall time is about 
 - **What changed:** worker assignment is now fixture-affine (commit 67ef501). Arms, matcher, fixtures and answer keys are unchanged.
 - **Launch commit:** the commit that adds this note.
 
-## Results (2026-10-22): PRELIMINARY until the matcher audit is done
+## Results (2026-10-22)
+
+Two scorings are reported. **v1** is the matcher frozen at the registering commit. **v2** is the matcher revised after the audit (see *Matcher revision* below). Conclusions use v2. v1 is kept so the effect of the revision is visible.
+
+### v1 (registered matcher)
 
 **Run:** 120/120 LLM-arm cases ok, collected and sha256-verified; cluster shut down. Anthropic spend $172.85 (red-team $64.95, domain $52.99, methods $44.67, presentation $10.25); cross-model spend is on OpenAI. The deterministic arm was run during the build with unchanged validator code.
 
@@ -177,7 +181,7 @@ The $2–4 per invocation comes from E1/T1 critic telemetry. Wall time is about 
 
 **Never detected by any arm:** ledger_mismatch 5, citation_mismatch 5, data_vintage 5, unit_error 3, zero_width_ci 2, prose_stale_number 2.
 
-**Pre-registered decision rules:**
+**Pre-registered decision rules (v1, superseded by v2 below):**
 1. **Retire/merge.**
    - Domain meets all three conditions (unique 0.037, CI upper 0.125, noise Δ +1.22): **merge candidate**.
    - Methods has unique 0/54 (CI upper 0.066), but its noise Δ is −0.33, so it fails the noise condition by the letter. It is redundant in practice.
@@ -186,6 +190,82 @@ The $2–4 per invocation comes from E1/T1 critic telemetry. Wall time is about 
 3. **Fill gaps** (union recall < 0.5): citation_mismatch, data_vintage, ledger_mismatch, unit_error. All four require checking a claim against its source or data rather than reading prose, which argues for deterministic cross-checks.
 4. **Cross-model:** unique 1/54 < 0.10, so it **stays opt-in**.
 
-**Exploratory (post hoc, not pre-registered):** validators re-run at round 3 instead of round 1 reach 14/54 (+1 ledger_mismatch). The round-1 reproduction matched the original 13/54 exactly. Round gating is not the main reason for the validator gaps. Why the provenance check catches only 1/5 planted ledger mismatches needs a focused look.
+### Matcher revision (v2)
 
-**Outstanding:** human audit of the matcher sample (`E5_audit_sample.md`). If disagreement exceeds 10%, the matcher is revised and the analysis re-run before these conclusions stand.
+**Deviation (logged).** The first-pass audit of `E5_audit_sample.md` (Claude, on the owner's instruction) found the v1 matcher was systematically under-crediting LLM critics. The owner approved revising the matcher and re-scoring every case at $0; no case was re-run. I couldn't recover the exact first-pass disagreement rate, so this is logged as an owner-approved deviation rather than one triggered by the >10% clause.
+
+**What changed in `scripts/score_critiques.py`:**
+1. **Short planted values count.** v1 only credited specific terms that looked like identifiers (≥6 chars plus a digit or symbol), so planted values like "2,078", "2017" and "1.55" could never match. v2 credits any value with a digit and ≥3 characters, or an identifier.
+2. **Years need the entry's name.** v2's first rescore matched "Protopopoff 2018" against a planted "Thwing … 2018", in clean variants and planted ones alike. A year now counts only if the blocker also names the entry as a whole word. Names under 3 characters ("ID", "JA", "RF") can't anchor, so for those the year still stands alone.
+3. **Vocabulary.** "breach" was added for budget_overspend.
+4. **Adjudications.** `E5_adjudication.yaml` overrides the automatic call where the matcher can't decide, with the reason recorded and an `adjudicated` flag on the row:
+   - **A1** (methods, CM213310__p3#3) → *not* detected. The critic adopted the invented verdict as true.
+   - **A2** (methods, CH161312__p1#1) → detected. "calls the verdict both robust and unstable".
+   - **A5** (domain, CH235631__p3#1) → detected. It names the entry by citation key ("c10 header says 2018 but the paper is 2024").
+
+   A3 was judged not a catch, and A4 is now matched automatically. All of these are Claude's first-pass calls, and the owner may reverse any of them.
+
+**Checks.** Self-tests V2a–V2f pass. Spurious-match rates on clean variants equal v1's in every arm (deterministic 0.000, red-team 0.019, domain 0.037, presentation 0.037, cross-model 0.037, methods 0.074). The deterministic arm is unchanged (13/54).
+
+### v2 results (used for decisions)
+
+**Union of all 6 arms:** 40/54 = 0.74 (95% CI 0.61–0.84), up from 0.59 in v1. Decision-critical defects: 11/16, unchanged.
+
+| Arm | Recall v2 (v1) | Unique v2 (v1) | Unique 95% CI | Noise Δ | Cost | $/detection |
+|---|---|---|---|---|---|---|
+| deterministic | 13/54 (13) | 5 (4) | 0.040–0.199 | +0.06 | $0 | 0 |
+| red-team | 24/54 (18) | 4 (2) | 0.029–0.176 | −4.22 | $64.95 | 2.71 |
+| methods | 12/54 (11) | 0 (0) | 0.000–0.066 | −0.39 | $44.67 | 3.72 |
+| domain | 12/54 (8) | 4 (2) | 0.029–0.176 | +1.06 | $52.99 | 4.42 |
+| presentation | 9/54 (9) | 1 (1) | 0.003–0.098 | −0.11 | $10.25 | 1.14 |
+| cross-model | 14/54 (12) | 1 (1) | 0.003–0.098 | +0.72 | (OpenAI) | — |
+
+Red-team vs each other critic, counting defects caught by one arm and missed by the other (red-team-only vs other-only): methods 14 vs 2, domain 17 vs 5, presentation 17 vs 2, cross-model 16 vs 6.
+
+**Best union by number of LLM critics** (validators always included):
+
+| LLM critics | Union v2 (v1) | Arms | Cost |
+|---|---|---|---|
+| 0 | 0.24 (0.24) | deterministic only | $0 |
+| 1 | 0.61 (0.50) | + red-team | $65 |
+| 2 | 0.70 (0.56) | + domain | $118 |
+| 3 | 0.72 (0.57) | + cross-model | $118 |
+| 4 | 0.74 (0.59) | + presentation | $128 |
+| 5 | 0.74 (0.59) | + methods | $173 |
+
+**Union recall by class:**
+
+| Class | v2 union recall |
+|---|---|
+| budget_overspend | 7/7 |
+| renamed_verdict | 5/5 |
+| sensitivity_contradiction | 6/6 |
+| ci_inverted | 4/4 |
+| benefit_total_population | 1/1 |
+| prose_stale_number | 6/7 |
+| citation_mismatch | 5/6 |
+| zero_width_ci | 2/4 |
+| data_vintage | 2/5 |
+| unit_error | 1/4 |
+| ledger_mismatch | 1/5 |
+
+**Pre-registered decision rules, v2 (changes from v1 in bold):**
+1. **Retire/merge.**
+   - **Domain is no longer a merge candidate.** Its unique recall is 4/54 = 0.074 (≥ 0.05) and the CI upper bound is 0.176 (≥ 0.15). This reverses v1. Its 4 unique catches are 3 citation_mismatch (one via adjudication A5) and 1 sensitivity_contradiction. The result is fragile. Without A5 it is 3/54 = 0.056 with CI upper 0.151, which still passes but only just. If citation checks move into code, most of domain's unique value goes with them.
+   - Methods: unique 0/54 (CI upper 0.066), but noise Δ −0.39, so it fails the noise condition by the letter. Unchanged from v1. It is redundant in practice: adding it to the other five arms gains nothing for $45.
+   - Presentation: unique 0.019 and CI upper 0.098, but noise Δ −0.11, so it is kept by the letter.
+   - Red-team is kept. Its unique catches are 2 data_vintage, 1 budget_overspend and 1 ledger_mismatch.
+   - Cross-model technically meets all three retire conditions (unique 0.019, CI upper 0.098, noise +0.72). It is already opt-in, so nothing changes.
+2. **Move into code** (deterministic recall ≥ 0.8): budget_overspend (6/7) and renamed_verdict (5/5). Unchanged from v1.
+3. **Fill gaps** (union recall < 0.5): **data_vintage (2/5), ledger_mismatch (1/5), unit_error (1/4).**
+   - **citation_mismatch leaves the gap list** (5/6, v1 0/6).
+   - zero_width_ci is at 2/4 = 0.50, on the threshold, so not a gap by the letter.
+4. **Cross-model:** unique 1/54 < 0.10, so it **stays opt-in**. Unchanged from v1.
+
+**Interpretation.**
+- Red-team alone gets 0.61. Adding domain gets 0.70 for $118, which is 68% of the full-panel cost.
+- Methods adds nothing that another arm misses, so it is the clearest saving: about $45 per round, 26% of LLM critic spend.
+- The remaining gap classes all require checking a value against its source or data (ledger vs artifact, units vs data, data year vs decision year). That argues for deterministic cross-checks rather than more prompting.
+- **Lower-bound caveat:** the matcher is still lexical, so LLM recall here remains a lower bound.
+
+**Exploratory (post hoc, not pre-registered):** validators re-run at round 3 instead of round 1 reach 14/54 (+1 ledger_mismatch). The round-1 reproduction matched the original 13/54 exactly. Round gating is not the main reason for the validator gaps. Why the provenance check catches only 1/5 planted ledger mismatches needs a focused look.
