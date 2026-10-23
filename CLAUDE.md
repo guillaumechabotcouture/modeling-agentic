@@ -75,7 +75,7 @@ rigor checks between rounds.
 The registry in `agents/__init__.py` (`_registry()`) is the source of
 truth for agents, models, tools, `maxTurns`, and skills. Current
 agents: `planner`, `data-agent`, `modeler`, `analyst`,
-`critique-methods`, `critique-domain`, `critique-premortem`,
+`critique-methods` (opt-in, `--methods-critic`), `critique-domain`, `critique-premortem`,
 `critique-presentation`, `critique-redteam`, `critique-sufficiency`,
 `writer`. The lead may only spawn these registered types; built-in
 types such as `general-purpose` are denied.
@@ -155,6 +155,7 @@ for f in main.py \
   scripts/optimization_quality.py scripts/plan_criteria.py \
   scripts/propagate_uncertainty.py scripts/render_claims.py \
   scripts/sanity_checks.py scripts/sensitivity_analysis.py \
+  scripts/source_checks.py \
   scripts/spec_compliance.py scripts/validate_critique_yaml.py \
   scripts/validate_skill_attachments.py \
   scripts/within_zone_sensitivity.py scripts/writer_qa.py \

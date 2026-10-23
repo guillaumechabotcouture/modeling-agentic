@@ -162,6 +162,7 @@ _NON_DECLARABLE_KINDS = frozenset({
     "pre_model_decorative_undocumented",
     "claim_source_unresolved",
     "claim_source_mismatch",
+    "claim_value_not_in_source",
     "claim_ci_unsourced",
     "claim_ci_mismatch",
     "ci_degenerate",
@@ -247,6 +248,18 @@ REVIEWERS = ("critique-methods", "critique-domain", "critique-presentation",
 # Codex CLI). Included only when its YAML exists; written by the script,
 # never by an agent, so it may carry verdict UNAVAILABLE.
 OPTIONAL_REVIEWERS = ("critique-crossmodel",)
+# E5: critique-methods is opt-in (main.py --methods-critic). Its YAML is
+# required only when metadata.json records `methods_critic: true`; when
+# present it is always validated.
+OPT_IN_AGENT_REVIEWERS = {"critique-methods": "methods_critic"}
+
+
+def _opt_in_requested(run_dir: str, reviewer: str) -> bool:
+    try:
+        with open(os.path.join(run_dir, "metadata.json")) as f:
+            return bool(json.load(f).get(OPT_IN_AGENT_REVIEWERS[reviewer]))
+    except (OSError, ValueError, AttributeError):
+        return False
 PREFIXES = {"critique-methods": "M-", "critique-domain": "D-",
             "critique-presentation": "P-", "critique-redteam": "R-",
             "critique-crossmodel": "X-"}
@@ -1759,6 +1772,10 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None,
     violations += G(lambda rd: _load_sibling("numeric_consistency")
                     .check_numeric_consistency(rd), run_dir,
                     check_name="numeric_consistency")
+    # E5 follow-up: unit and data-vintage source checks (data vs itself and
+    # vs the run's own data documents; no domain vocabulary).
+    violations += G(lambda rd: _load_sibling("source_checks").check_sources(rd),
+                    run_dir, check_name="source_checks")
     # Phase 10 Commit ψ: allocation-gate coordinator (optimization_quality,
     # daly, allocation_robustness, universal_coverage, sensitivity_analysis;
     # round-aware MEDIUM consolidation).
@@ -3621,20 +3638,22 @@ def _check_claims_ledger_present(run_dir: str,
       claims_ledger_invalid      HIGH (yaml malformed or schema violation)
       claims_ledger_ci_violated  HIGH (ci_low > value or ci_high < value)
 
-    Round gating: round_n=None or round 1 → silent (drafting window).
-    Round 2 → MEDIUM if absent. Round ≥ 3 → HIGH if absent.
+    Round gating applies to ABSENCE only: round_n=None or round 1 → a
+    missing ledger is silent (drafting window); round 2 → MEDIUM; round
+    ≥ 3 → HIGH. A ledger that exists is always schema- and provenance-
+    checked: a wrong number is wrong at round 1 too (E5: the round-1
+    gate silenced 5/5 planted ledger mismatches it would have caught).
 
     The ledger is NOT scope-declarable (Phase 18 α contract): the
     writer cannot produce a clean report without it, so the modeler
     must produce one or scope-declare ABSENCE-OF-WRITER (no report).
     """
-    if round_n is None or round_n < 2:
-        return []
-
     yaml_path = artifact_path("claims_ledger", run_dir)
     out: list[dict] = []
 
     if not os.path.exists(yaml_path):
+        if round_n is None or round_n < 2:
+            return []
         severity = "HIGH" if round_n >= _CLAIMS_LEDGER_REQUIRED_FROM_ROUND \
             else "MEDIUM"
         out.append({
@@ -3692,7 +3711,7 @@ def _check_claims_ledger_present(run_dir: str,
     # logic fired HIGH unconditionally regardless of round.
     if not claims:
         empty_severity = "HIGH" \
-            if round_n >= _CLAIMS_LEDGER_REQUIRED_FROM_ROUND else "MEDIUM"
+            if (round_n or 0) >= _CLAIMS_LEDGER_REQUIRED_FROM_ROUND else "MEDIUM"
         out.append({
             "kind": "claims_ledger_invalid",
             "severity": empty_severity,
@@ -3730,6 +3749,9 @@ def _ledger_provenance_violations(ledger_path: str, run_dir: str) -> list[dict]:
     for kind, fs in by_kind.items():
         out.extend(fs[:_PROVENANCE_PER_KIND_CAP])
         if len(fs) > _PROVENANCE_PER_KIND_CAP:
+            # Name every overflowed claim: a count alone hid planted
+            # mismatches behind natural ones in E5.
+            rest = "; ".join(f["claim"][:160] for f in fs[_PROVENANCE_PER_KIND_CAP:])
             out.append({
                 "kind": kind,
                 "severity": "HIGH",
@@ -3738,9 +3760,7 @@ def _ledger_provenance_violations(ledger_path: str, run_dir: str) -> list[dict]:
                 "claim": (f"{len(fs) - _PROVENANCE_PER_KIND_CAP} additional "
                           f"{kind} finding(s) in models/claims_ledger.yaml "
                           f"({res['n_checked']} checked, {res['n_external']} "
-                          f"external, {res['n_total']} total). Run "
-                          f"`python3 scripts/lib/provenance.py {{run_dir}}` "
-                          f"for the full list."),
+                          f"external, {res['n_total']} total): {rest}"),
             })
     return out
 
@@ -7462,6 +7482,12 @@ def _run_self_test() -> int:
                    and is_non_declarable(x["kind"], x.get("scope_declarable"))
                    for x in v),
            f"CL7: provenance mismatches must be HIGH non-declarable, got {kinds}")
+        # CL8 (E5): an existing ledger is checked in the drafting window too;
+        # only absence is round-gated.
+        for rn in (1, None):
+            v = _check_claims_ledger_present(_d, round_n=rn)
+            ok(sorted(x["kind"] for x in v) == kinds,
+               f"CL8: round {rn} must still check an existing ledger, got {v}")
 
     with _tempfile.TemporaryDirectory() as _d:
         # CL5: CI bounds violated → HIGH claims_ledger_ci_violated
@@ -8213,6 +8239,18 @@ def _run_self_test() -> int:
         ok(rc == 1 and out.get("action") == "PATCH_OR_RETHINK",
            f"E1: empty schema-valid run at r1 must not ACCEPT, got {rc} "
            f"{out.get('action')} {out.get('_stderr', '')}")
+        # EM1/EM2 (E5): critique_methods.yaml is required only when the run
+        # opted in (metadata methods_critic: true).
+        os.remove(os.path.join(d, FILENAMES["critique-methods"]))
+        rc, out = _cli(d, 1)
+        ok(rc == 1 and out.get("action") == "PATCH_OR_RETHINK",
+           f"EM1: methods off + no methods YAML is not a schema error, got {rc} "
+           f"{out.get('_stderr', '')}")
+        with open(os.path.join(d, "metadata.json"), "w") as f:
+            json.dump({"question": "Estimate the impact of a campaign.",
+                       "methods_critic": True}, f)
+        rc, out = _cli(d, 1)
+        ok(rc == 3, f"EM2: methods on + no methods YAML must be a schema error, got {rc}")
         _fixture(d, 8)
         rc, out = _cli(d, 8)
         ok(out.get("action") == "RUN_FAILED",
@@ -8576,6 +8614,9 @@ def main() -> int:
         path = os.path.join(args.run_dir, FILENAMES[reviewer])
         if reviewer == "critique-redteam" and not os.path.exists(path):
             critique_redteam_missing = True
+            continue
+        if reviewer in OPT_IN_AGENT_REVIEWERS and not os.path.exists(path) \
+                and not _opt_in_requested(args.run_dir, reviewer):
             continue
         try:
             critiques[reviewer] = validate_critique(path, reviewer,

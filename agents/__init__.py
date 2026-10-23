@@ -649,11 +649,12 @@ After all checks pass (or the modeler explicitly scope-declares any
 flagged issues that are declarable), proceed to STAGE 6 CRITIQUE.
 
 ### STAGE 6: CRITIQUE (PARALLEL)
-Spawn ALL FOUR critique agents simultaneously in a SINGLE response:
-- critique-methods
+Spawn ALL THREE critique agents simultaneously in a SINGLE response:
 - critique-domain
 - critique-presentation
 - critique-redteam  (adversarial — see the adversarial-redteam skill)
+(critique-methods joins them only when this run's prompt says so; E5
+found it caught no planted defect the others missed.)
 
 Do NOT use background: true. Spawn them in the foreground so you
 receive their results directly before moving to Stage 7.
@@ -665,13 +666,13 @@ Each critique agent writes TWO files:
 - `critique_{name}.yaml` — machine-readable blocker manifest (see the
   `critique-blockers-schema` skill for the required schema)
 
-The fourth agent (critique-redteam) is adversarial: its job is to find
-what the other three would miss — cross-file numeric discrepancies,
+The red-team agent (critique-redteam) is adversarial: its job is to find
+what the other critics would miss — cross-file numeric discrepancies,
 aggregate claims that exceed external totals, methodological fidelity
 gaps vs cited prior work, data-vintage vs decision-year mismatches, and
 hidden operational assumptions. It uses prefix `R-` for blocker IDs and
 has the same architectural-veto authority (may set
-`structural_mismatch.detected: true`) as methods and domain.
+`structural_mismatch.detected: true`) as domain (and methods, when on).
 
 #### Spawn-prompt template (MANDATORY)
 
@@ -692,18 +693,18 @@ MEDIUM blocker from round 1 (still_present true or false with
 resolved_evidence). See the critique-blockers-schema skill.
 ```
 
-Wait for all four to complete.
+Wait for all of them to complete.
 
 ### STAGE 7: MECHANICAL DECISION GATE
 
 The STAGE 7 decision is NOT a free judgment call. You compute it
-mechanically from the four critique YAML files. You do not get to
+mechanically from the critique YAML files. You do not get to
 override the rules with prose reasoning.
 
 #### Step 1: Run the validator
 
-After the four critique YAMLs exist (methods, domain, presentation,
-redteam), invoke the validator via Bash with ALL THREE gate flags:
+After the critique YAMLs exist (domain, presentation, redteam, plus
+methods when enabled), invoke the validator via Bash with ALL THREE gate flags:
 
 ```bash
 python3 scripts/validate_critique_yaml.py {run_dir} \\
@@ -726,7 +727,7 @@ backstops that catch what the critique agents miss:
   UNIDENTIFIED_PARAMETERS, or missing prerequisites.
 
 The validator will:
-- Schema-check all four YAML files. Exit code 3 = schema error;
+- Schema-check every critique YAML file. Exit code 3 = schema error;
   instruct the offending critique agent to re-write the YAML before
   you proceed. Do NOT hand-edit critique YAMLs.
 - Compute `unresolved_high`, `structural_mismatch`, `rounds_remaining`.
@@ -1141,14 +1142,26 @@ script. Route X- blockers to the owning agent exactly like M-/D-/P-/R-.
 """
 
 
+METHODS_STAGE6 = """
+METHODS CRITIC (enabled for this run). In STAGE 6 of every round, also
+spawn critique-methods in the same response as the other critique agents
+(same spawn-prompt template). It writes critique_methods.yaml (prefix M-);
+the validator requires that file for this run.
+"""
+
+
 def build_lead_prompt(question: str, run_dir: str, max_rounds: int,
-                      resume_context: str = "", cross_model: bool = False) -> str:
+                      resume_context: str = "", cross_model: bool = False,
+                      methods_critic: bool = False) -> str:
     """Build the user-facing prompt for the lead agent."""
     prompt = (
         f"Research question: {question}\n\n"
         f"Run directory: {run_dir}\n"
         f"Max critique-revision rounds: {max_rounds}\n"
     )
+    if methods_critic:
+        # E5: opt-in; 0/54 planted defects caught only by methods (~$45/round).
+        prompt += METHODS_STAGE6
     if cross_model:
         # Phase 21 ζ: gpt-6.1-sol found eligible-population errors that
         # five same-family reviewers missed.

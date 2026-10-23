@@ -437,7 +437,8 @@ def write_harness_baseline(run_path: str) -> tuple[dict, dict | None]:
 
 async def run(question: str, max_rounds: int, max_sessions: int,
               run_dir: str | None = None, run_path: str | None = None,
-              allow_cloud: bool = False, cross_model: bool = False) -> str:
+              allow_cloud: bool = False, cross_model: bool = False,
+              methods_critic: bool = False) -> str:
     """Run the modeling pipeline as a single lead agent session.
 
     Returns the terminal status written to metadata.json.
@@ -453,13 +454,16 @@ async def run(question: str, max_rounds: int, max_sessions: int,
     print(f"Question: {question}", flush=True)
     print(f"Max rounds: {max_rounds} | Max sessions: {max_sessions}"
           f" | Cloud: {'on' if allow_cloud else 'off'}"
-          f" | Cross-model: {'on' if cross_model else 'off'}", flush=True)
+          f" | Cross-model: {'on' if cross_model else 'off'}"
+          f" | Methods critic: {'on' if methods_critic else 'off'}", flush=True)
 
     run_start = datetime.now()
     trace_path = os.path.join(run_path, "trace.jsonl")
     metadata_path = os.path.join(run_path, "metadata.json")
     with open(metadata_path) as f:
         prior_meta = json.load(f)
+    # A resumed run keeps its critic set: the validator's requirements follow it.
+    methods_critic = methods_critic or bool(prior_meta.get("methods_critic"))
 
     # Build the agent registry and lead prompt
     agents = build_agents(question=question, run_dir=run_dir_rel)
@@ -468,8 +472,9 @@ async def run(question: str, max_rounds: int, max_sessions: int,
         "{max_rounds}", str(max_rounds)
     )
     lead_prompt = build_lead_prompt(question, run_dir_rel, max_rounds, resume_context,
-                                    cross_model=cross_model)
+                                    cross_model=cross_model, methods_critic=methods_critic)
     prior_meta["cross_model"] = cross_model
+    prior_meta["methods_critic"] = methods_critic  # validator requires its YAML iff True
     prior_meta["models"] = {"deep": enforcement.MODEL_DEEP, "fast": enforcement.MODEL_FAST}
     with open(metadata_path, "w") as f:
         json.dump(prior_meta, f, indent=2)
@@ -627,7 +632,8 @@ async def run(question: str, max_rounds: int, max_sessions: int,
             # On retry, rebuild resume context from whatever files exist
             resume_context = build_resume_context(run_path)
             lead_prompt = build_lead_prompt(question, run_dir_rel, max_rounds, resume_context,
-                                    cross_model=cross_model)
+                                            cross_model=cross_model,
+                                            methods_critic=methods_critic)
             print(f"Restarting pipeline (session {session_num + 1})...", flush=True)
     finally:
         status = finalize_run(
@@ -968,6 +974,11 @@ def _run_self_test() -> int:
     ok("cross_model_critic.py runs/x --round" in build_lead_prompt("q", "runs/x", 5, "", cross_model=True)
        and "cross_model_critic" not in build_lead_prompt("q", "runs/x", 5, ""),
        "XM1 cross-model lead prompt gating")
+    # MC1 (E5): critique-methods is spawned only when the run opts in.
+    ok("METHODS CRITIC (enabled" in build_lead_prompt("q", "runs/x", 5, "", methods_critic=True)
+       and "METHODS CRITIC" not in build_lead_prompt("q", "runs/x", 5, "")
+       and "Spawn ALL THREE critique agents" in LEAD_SYSTEM_PROMPT,
+       "MC1 methods critic lead prompt gating")
     ok(enforcement.check_tool_use("Write", {"file_path": f"{run_path}/critique_crossmodel.yaml"},
                                   run_path, "critique-redteam", set(reg)) is not None,
        "XM2 critique_crossmodel.yaml writable by an agent")
@@ -1158,6 +1169,9 @@ def main() -> int:
     parser.add_argument("--cross-model", action="store_true",
                         help="Add the gpt-6.1-sol cross-model critic (Codex CLI) to "
                              "every STAGE 6. Sends run artifacts to OpenAI.")
+    parser.add_argument("--methods-critic", action="store_true",
+                        help="Add critique-methods to every STAGE 6. Off by default: in E5 "
+                             "it caught no planted defect the other critics missed.")
     parser.add_argument("--self-test", action="store_true",
                         help="Run inline self-tests (no API calls) and exit")
     parser.add_argument("--preflight-only", action="store_true",
@@ -1208,13 +1222,14 @@ def main() -> int:
         run_dir = os.path.basename(run_path)
         coro = run(question, args.max_rounds, args.max_sessions,
                    run_dir=run_dir, run_path=run_path, allow_cloud=args.cloud,
-                   cross_model=args.cross_model)
+                   cross_model=args.cross_model, methods_critic=args.methods_critic)
     else:
         if not args.question:
             print("Error: question is required (or use --resume)")
             return 1
         coro = run(args.question, args.max_rounds, args.max_sessions,
-                   allow_cloud=args.cloud, cross_model=args.cross_model)
+                   allow_cloud=args.cloud, cross_model=args.cross_model,
+                   methods_critic=args.methods_critic)
     try:
         status = asyncio.run(coro)
     except KeyboardInterrupt:

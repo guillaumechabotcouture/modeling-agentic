@@ -15,6 +15,8 @@ compares the resolved value (and CI) to the ledger:
 
   claim_source_unresolved  HIGH  artifact missing, or field cannot be resolved
   claim_source_mismatch    HIGH  resolved value differs from ledger value
+  claim_value_not_in_source HIGH field unresolvable and the value appears
+                                nowhere in the cited artifact
   claim_ci_unsourced       HIGH  ledger carries a CI with no resolvable CI source
   claim_ci_mismatch        HIGH  ledger CI differs from the source CI
 
@@ -81,7 +83,6 @@ _CSV_FILTER_PREFIX_RE = re.compile(
 _CSV_FILTER_SUFFIX_RE = re.compile(
     r"^(?P<rest>.+?)\s+where\s+(?P<fcol>[\w ]+?)\s*==?\s*"
     r"(?P<fval>'[^']*'|\"[^\"]*\"|\S+)\s*$")
-_PATH_SEG_RE = re.compile(r"([^.\[\]]+)|\[(-?\d+)\]")
 
 _MISSING = object()
 
@@ -94,40 +95,88 @@ class _Unresolved(Exception):
 # Resolution
 # --------------------------------------------------------------------------- #
 
-def _parse_path(path: str) -> list:
-    segs: list = []
-    pos = 0
-    path = path.strip()
-    while pos < len(path):
-        if path[pos] == ".":
-            pos += 1
-            continue
-        m = _PATH_SEG_RE.match(path, pos)
-        if not m:
-            raise _Unresolved(f"cannot parse field path {path!r}")
-        if m.group(1) is not None:
-            segs.append(m.group(1).strip())
-        else:
-            segs.append(int(m.group(2)))
-        pos = m.end()
-    if not segs:
-        raise _Unresolved("empty field path")
-    return segs
+_SELECTOR_RE = re.compile(r"\[\s*(?:(-?\d+)|([\w.\-]+)\s*=\s*(['\"]?)(.*?)\3)\s*\]")
 
 
 def resolve_dotpath(doc: Any, path: str) -> Any:
-    """Resolve `a.b[0].c` against nested dicts/lists. Raises _Unresolved."""
-    cur = doc
-    for seg in _parse_path(path):
-        if isinstance(seg, int):
-            if not isinstance(cur, list) or not -len(cur) <= seg < len(cur):
-                raise _Unresolved(f"index [{seg}] out of range in {path!r}")
-            cur = cur[seg]
-        else:
-            if not isinstance(cur, dict) or seg not in cur:
-                raise _Unresolved(f"key {seg!r} not found in {path!r}")
-            cur = cur[seg]
+    """Resolve `a.b[0].c` against nested dicts/lists. Raises _Unresolved.
+
+    Keys may themselves contain dots (`cost_3.60.n` with key `cost_3.60`):
+    at each mapping the longest key that prefixes the remaining path wins.
+    A list may be indexed by position (`[0]`) or selected by a field
+    (`results[id=foo].observed`; quotes around the value are optional).
+    """
+    cur, rest = doc, path.strip()
+    if not rest:
+        raise _Unresolved("empty field path")
+    while rest:
+        if rest[0] == ".":
+            rest = rest[1:]
+            continue
+        if rest[0] == "[":
+            m = _SELECTOR_RE.match(rest)
+            if not m or not isinstance(cur, list):
+                raise _Unresolved(f"bad selector at {rest!r} in {path!r}")
+            if m.group(1) is not None:
+                i = int(m.group(1))
+                if not -len(cur) <= i < len(cur):
+                    raise _Unresolved(f"index [{i}] out of range in {path!r}")
+                cur = cur[i]
+            else:
+                k, v = m.group(2), m.group(4)
+                hits = [e for e in cur if isinstance(e, dict) and str(e.get(k)) == v]
+                if len(hits) != 1:
+                    raise _Unresolved(f"selector [{k}={v}] matched {len(hits)} "
+                                      f"elements in {path!r}")
+                cur = hits[0]
+            rest = rest[m.end():]
+            continue
+        if not isinstance(cur, dict):
+            raise _Unresolved(f"{rest!r} applied to a non-mapping in {path!r}")
+        keys = [str(k) for k in cur
+                if rest == str(k) or rest.startswith(str(k) + ".")
+                or rest.startswith(str(k) + "[")]
+        if not keys:
+            raise _Unresolved(f"key {rest.split('.')[0].split('[')[0]!r} "
+                              f"not found in {path!r}")
+        k = max(keys, key=len)
+        cur = cur[next(x for x in cur if str(x) == k)]
+        rest = rest[len(k):]
     return cur
+
+
+def _numeric_leaves(x: Any, out: list) -> list:
+    if isinstance(x, dict):
+        for v in x.values():
+            _numeric_leaves(v, out)
+    elif isinstance(x, (list, tuple)):
+        for v in x:
+            _numeric_leaves(v, out)
+    elif _num(x) is not None:
+        out.append(_num(x))
+    return out
+
+
+def value_in_artifact(path: str, value: Any, claim_kind: str = "",
+                      rel_tol: float = DEFAULT_REL_TOL) -> Optional[bool]:
+    """Does the claimed number appear anywhere in the artifact? None when
+    the value isn't numeric or the file can't be scanned."""
+    if _num(value) is None:
+        return None
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        if os.path.getsize(path) > 50 * 1024 * 1024:
+            return None
+        if ext in (".yaml", ".yml", ".json"):
+            nums = _numeric_leaves(_load_structured(path), [])
+        elif ext == ".csv":
+            with open(path, encoding="utf-8", newline="") as f:
+                nums = [n for row in csv.reader(f) for n in map(_num, row) if n is not None]
+        else:
+            return None
+    except (OSError, UnicodeDecodeError, yaml.YAMLError, ValueError, csv.Error):
+        return None
+    return any(values_match(value, n, claim_kind, rel_tol) for n in nums)
 
 
 def _load_structured(path: str) -> Any:
@@ -246,13 +295,15 @@ def _split_point_ci(resolved: Any, doc: Any, field: str
                 break
         return point, _ci_from_mapping(resolved)
     # Leaf: look for CI siblings when the path ends in a point key.
-    segs = _parse_path(field)
-    if isinstance(segs[-1], str) and segs[-1] in _POINT_KEYS and len(segs) > 1:
-        parent = doc
-        for s in segs[:-1]:
-            parent = parent[s]
-        if isinstance(parent, dict):
-            return resolved, _ci_from_mapping(parent)
+    for k in _POINT_KEYS:
+        if field.endswith("." + k):
+            try:
+                parent = resolve_dotpath(doc, field[:-len(k) - 1])
+            except _Unresolved:
+                break
+            if isinstance(parent, dict):
+                return resolved, _ci_from_mapping(parent)
+            break
     return resolved, None
 
 
@@ -382,10 +433,21 @@ def check_ledger_provenance(ledger: Any, run_dir: str,
             else:
                 raise _Unresolved(f"unsupported source type {ext!r}")
         except _Unresolved as e:
-            findings.append(_f(
-                "claim_source_unresolved",
-                f"[{cid}] source_field {field!r} in `{src}` cannot be "
-                f"resolved: {e}. Use a machine-resolvable field path."))
+            # The path can't be followed, but the number can still be looked
+            # for: a value absent from its whole cited artifact is a
+            # mismatch, not just an unverifiable claim.
+            found = value_in_artifact(path, c.get("value"), kind, rel_tol)
+            if found is False:
+                findings.append(_f(
+                    "claim_value_not_in_source",
+                    f"[{cid}] ledger value {c.get('value')!r} appears nowhere in "
+                    f"`{src}` (source_field {field!r} cannot be resolved: {e}). "
+                    f"Correct the value or cite the artifact that holds it."))
+            else:
+                findings.append(_f(
+                    "claim_source_unresolved",
+                    f"[{cid}] source_field {field!r} in `{src}` cannot be "
+                    f"resolved: {e}. Use a machine-resolvable field path."))
             continue
         except (OSError, UnicodeDecodeError, yaml.YAMLError, ValueError,
                 SyntaxError, csv.Error) as e:
@@ -486,11 +548,28 @@ def _self_test() -> int:
                  "source_field": "scalar_outputs.total_cost"})
         ok(kinds(r) == [], f"P3 mapping node + rounding tolerance ({kinds(r)})")
 
-        # P4: free-text source_field → unresolved.
-        r = run({"id": "c4", "claim_kind": "scalar", "value": 1,
+        # P4: free-text source_field, value present in the file → unresolved.
+        r = run({"id": "c4", "claim_kind": "scalar", "value": 0.2,
                  "source_artifact": "models/sens.yaml",
                  "source_field": "zone-level Pearson correlation"})
-        ok(kinds(r) == ["claim_source_unresolved"], "P4 prose field unresolved")
+        ok(kinds(r) == ["claim_source_unresolved"], f"P4 prose field unresolved ({kinds(r)})")
+        # P4b: free-text field, value nowhere in the file → not-in-source.
+        r = run({"id": "c4b", "claim_kind": "scalar", "value": 0.37,
+                 "source_artifact": "models/sens.yaml",
+                 "source_field": "zone-level Pearson correlation"})
+        ok(kinds(r) == ["claim_value_not_in_source"], f"P4b value absent from source ({kinds(r)})")
+        # P4c: keys with dots and [key=value] selectors resolve (E5 ledger plants).
+        with open(os.path.join(d, "models", "scen.yaml"), "w") as f:
+            yaml.safe_dump({"cost_3.60": {"n_changed": 248},
+                            "results": [{"id": "a", "observed": 47.1}, {"id": "b", "observed": 9}]}, f)
+        r = run({"id": "c4c", "value": 340, "source_artifact": "models/scen.yaml",
+                 "source_field": "cost_3.60.n_changed"},
+                {"id": "c4d", "value": 47.1, "source_artifact": "models/scen.yaml",
+                 "source_field": "results[id=a].observed"},
+                {"id": "c4e", "value": 9, "source_artifact": "models/scen.yaml",
+                 "source_field": "results[id='b'].observed"})
+        ok(kinds(r) == ["claim_source_mismatch"] and "c4c" in r["findings"][0]["claim"],
+           f"P4c dotted key + selectors resolve ({kinds(r)})")
 
         # P5: missing artifact → unresolved.
         r = run({"id": "c5", "claim_kind": "scalar", "value": 1,
