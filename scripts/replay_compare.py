@@ -138,7 +138,14 @@ def main() -> int:
     a = ap.parse_args()
     if a.self_test:
         return _self_test()
-    md = to_markdown(compare(load_cases(a.batch_dir), a.a, a.b))
+    if not (a.batch_dir and a.a and a.b):
+        ap.error("batch_dir, --a and --b are required")
+    res = compare(load_cases(a.batch_dir), a.a, a.b)
+    if res["n_pairs"] == 0:
+        # A typo'd variant id must not overwrite a report with an empty analysis.
+        print(f"ERROR: no paired cases for {a.a!r} vs {a.b!r} in {a.batch_dir}", file=sys.stderr)
+        return 2
+    md = to_markdown(res)
     if a.out:
         open(a.out, "w").write(md)
     print(md)

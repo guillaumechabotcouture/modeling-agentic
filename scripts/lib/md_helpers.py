@@ -138,6 +138,23 @@ def _strip_limitations_and_scope(text: str) -> str:
     return "".join(out_parts)
 
 
+def split_frontmatter(text: str) -> tuple[str | None, str | None]:
+    """(yaml_text, None) for a leading `---` … `---` block, else (None, reason).
+
+    One rule shared by the skill validator and every runtime reader, so a
+    header the validator accepts is one the agents can read (Copilot review
+    of PR #14): the first line is exactly `---`, and the block ends at the
+    first later line that is exactly `---` (an indented `---` inside a
+    block scalar is content, not the delimiter)."""
+    lines = text.split("\n")
+    if not lines or lines[0].rstrip("\r") != "---":
+        return None, "no frontmatter (file must start with a '---' line)"
+    for i in range(1, len(lines)):
+        if lines[i].rstrip("\r") == "---":
+            return "\n".join(lines[1:i]), None
+    return None, "frontmatter is not closed by a '---' line"
+
+
 def _self_test() -> int:
     failures: list[str] = []
 
@@ -151,6 +168,11 @@ def _self_test() -> int:
        "T2: citation year stripped")
     t = _parse_md_tables("| a | b |\n|---|---|\n| x | 1 |\n")
     ok(len(t) == 1 and t[0]["rows"][0]["cells"] == ["1"], f"T3: table parse {t}")
+    ok(split_frontmatter("---\nname: a\n---\nbody") == ("name: a", None), "F1: plain frontmatter")
+    ok(split_frontmatter(" ---\nname: a\n---\n")[0] is None, "F2: indented opener rejected")
+    ok(split_frontmatter("---\ndescription: |\n  a\n  ---\n  b\n---\n")[0]
+       == "description: |\n  a\n  ---\n  b", "F3: indented --- inside a block scalar is content")
+    ok(split_frontmatter("---\nname: a\n")[0] is None, "F4: unclosed rejected")
     s = _strip_limitations_and_scope("# R\nkeep\n## Limitations\ndrop\n## Next\nkeep2\n")
     ok("drop" not in s and "keep2" in s, f"T4: limitations stripped: {s!r}")
     if failures:

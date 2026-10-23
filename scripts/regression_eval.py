@@ -129,7 +129,14 @@ def run_eval(seeds=SEEDS) -> dict:
 
 
 def compare(res: dict, base: dict) -> list[str]:
+    det = base.get("detected") if isinstance(base, dict) else None
+    if not isinstance(det, dict) or not any(v is True for v in det.values()):
+        # An empty baseline would compare nothing and report "no regressions".
+        return ["INVALID BASELINE: no detected: true entries; regenerate with --update-baseline"]
     probs = []
+    missing = sorted(k for k in det if k not in res["detected"])
+    if missing:
+        probs.append(f"REGRESSION: baseline defects no longer planted/scored {missing[:5]}")
     for k, was in (base.get("detected") or {}).items():
         if was and not res["detected"].get(k):
             probs.append(f"REGRESSION: {k} was caught, now missed")
@@ -145,10 +152,14 @@ def _self_test() -> int:
     fails = []
     base = {"detected": {"a": True, "b": False}, "clean_high": []}
     ok = lambda c, m: None if c else fails.append(m)
+    ok(any("INVALID BASELINE" in p for p in compare({"detected": {}, "clean_high": [], "spurious": []}, {})),
+       "R0 empty baseline is invalid, not a pass")
     ok(compare({"detected": {"a": True, "b": False}, "clean_high": [], "spurious": []}, base) == [],
        "R1 identical → pass")
     ok(compare({"detected": {"a": True, "b": True}, "clean_high": [], "spurious": []}, base) == [],
        "R2 new catch is not a failure")
+    ok(any("no longer planted" in p for p in compare({"detected": {"a": True}, "clean_high": [], "spurious": []}, base)),
+       "R2b a baseline defect that is no longer scored fails")
     ok(any("REGRESSION: a" in p for p in compare({"detected": {"a": False}, "clean_high": [], "spurious": []}, base)),
        "R3 lost catch fails")
     ok(any("clean run gained" in p for p in compare({"detected": {"a": True}, "clean_high": ["x"], "spurious": []}, base)),
@@ -190,7 +201,11 @@ def main() -> int:
     if not os.path.exists(BASELINE):
         print(f"no baseline at {os.path.relpath(BASELINE, REPO)}; run with --update-baseline")
         return 2
-    base = yaml.safe_load(open(BASELINE)) or {}
+    try:
+        base = yaml.safe_load(open(BASELINE)) or {}
+    except yaml.YAMLError as e:
+        print(f"INVALID BASELINE: {e}")
+        return 2
     new = sorted(k for k, v in res["detected"].items() if v and not (base.get("detected") or {}).get(k))
     if new:
         print(f"newly caught (adopt with --update-baseline): {new}")

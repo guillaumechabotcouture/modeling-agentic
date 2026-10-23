@@ -15,6 +15,10 @@ from agents import (
     writer,
 )
 from agents import enforcement
+import sys  # noqa: E402
+_SCRIPTS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
+if _SCRIPTS not in sys.path:
+    sys.path.insert(0, _SCRIPTS)  # lib.md_helpers (shared frontmatter rule)
 
 MAX_FIGURE_PIXELS = 10_000_000  # 10MP -- anything larger is likely a bug
 
@@ -54,12 +58,13 @@ def _skill_description(name: str) -> str:
             text = f.read()
     except OSError:
         return ""
-    m = re.match(r"^---\n(.*?)\n---", text, re.S)
-    if not m:
+    from lib.md_helpers import split_frontmatter   # same rule as the validator
+    block, _ = split_frontmatter(text)
+    if block is None:
         return ""
     try:
         import yaml
-        fm = yaml.safe_load(m.group(1)) or {}
+        fm = yaml.safe_load(block) or {}
     except Exception:
         return ""
     return str(fm.get("description") or "") if isinstance(fm, dict) else ""

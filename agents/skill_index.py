@@ -16,6 +16,9 @@ import re
 import sys
 
 import yaml
+_SCRIPTS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
+if _SCRIPTS not in sys.path:
+    sys.path.insert(0, _SCRIPTS)  # lib.md_helpers (shared frontmatter rule)
 
 REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 SKILLS = os.path.join(REPO, ".claude", "skills")
@@ -30,11 +33,12 @@ HEADER = ("## Skills (load on demand)\n"
 
 def _frontmatter(path):
     text = open(path, errors="replace").read()
-    m = re.match(r"^---\n(.*?)\n---", text, re.S)
-    if not m:
+    from lib.md_helpers import split_frontmatter   # same rule as the validator
+    block, _ = split_frontmatter(text)
+    if block is None:
         return {}
     try:
-        return yaml.safe_load(m.group(1)) or {}
+        return yaml.safe_load(block) or {}
     except yaml.YAMLError:
         return {}
 

@@ -213,15 +213,12 @@ def check_frontmatter(skill_md_path: str) -> str | None:
             text = f.read()
     except (OSError, UnicodeDecodeError) as e:
         return f"unreadable: {e}"
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != "---":
-        return "no frontmatter (file must start with a '---' line)"
+    from lib.md_helpers import split_frontmatter   # the runtime readers' rule
+    block, why = split_frontmatter(text)
+    if block is None:
+        return why
     try:
-        close = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
-    except StopIteration:
-        return "frontmatter is not closed by a '---' line"
-    try:
-        meta = yaml.safe_load("\n".join(lines[1:close]))
+        meta = yaml.safe_load(block)
     except yaml.YAMLError as e:
         first = str(e).splitlines()[0] if str(e) else type(e).__name__
         return f"frontmatter is not valid YAML ({first}); quote the description or use '>-'"
