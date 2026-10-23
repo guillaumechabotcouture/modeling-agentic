@@ -659,7 +659,7 @@ async def run(question: str, max_rounds: int, max_sessions: int,
 _PROTECTED_META = ("question", "started", "run_dir", "methods_critic", "cross_model")
 
 
-def _restore_protected_meta(metadata_path: str, original_meta: dict) -> None:
+def _restore_protected_meta(metadata_path: str, original_meta: dict) -> bool:
     """The planner may add decision_year to metadata.json; it may not change
     the question spec-compliance is checked against. Put protected fields
     back (recording what was there) and rewrite the file."""
@@ -683,6 +683,7 @@ def _restore_protected_meta(metadata_path: str, original_meta: dict) -> None:
     if changed:
         with open(metadata_path, "w") as f:
             json.dump(meta, f, indent=2)
+    return changed
 
 
 def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
@@ -693,6 +694,10 @@ def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
     hash, and write metadata.json. Runs in a `finally`, so it executes on
     Ctrl-C and on unexpected exceptions too."""
     original_meta = original_meta or {}
+    # Last integrity scan FIRST: pending tool changes are judged against the
+    # previous baseline before the harness writes anything (Copilot, PR #15).
+    if integrity is not None:
+        integrity.final_check()
     report_restored = restore_report_if_missing(run_path)
     if report_restored and integrity is not None:
         integrity.harness_wrote("report.md")
@@ -700,12 +705,9 @@ def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
     # Restore the protected fields BEFORE the gate: the validator reads the
     # question from metadata.json (Codex review of PR #14: a planner edit to
     # the question would otherwise be gated, then silently undone).
-    _restore_protected_meta(os.path.join(run_path, "metadata.json"), original_meta)
-    if integrity is not None:
+    if _restore_protected_meta(os.path.join(run_path, "metadata.json"), original_meta) \
+            and integrity is not None:
         integrity.harness_wrote("metadata.json")
-    # Last integrity scan before the gate reads artifact_integrity.json.
-    if integrity is not None:
-        integrity.final_check()
     if integrity is not None and integrity.events:
         print(f"[INTEGRITY] {len(integrity.events)} unexplained change(s) to protected "
               f"run artifacts; see {os.path.join(run_dir_rel, 'artifact_integrity.json')}",

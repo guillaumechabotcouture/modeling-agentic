@@ -19,6 +19,15 @@ itself protected — and the final gate turns each into a non-declarable HIGH.
 
 This detects after the fact rather than blocking, but it does not depend on
 how the change was made.
+
+Known limits (PR #15 reviews):
+  - Permission is decided before a call runs. In
+    `false && python3 scripts/x.py; <rewrite x's output>` the producer never
+    runs, yet the call holds x's output permission. The structural fix is
+    harness-controlled producers: the harness runs gate scripts itself (as
+    in-process tools) and denies agents running them via Bash.
+  - A lead change made while a subagent's call is in flight is explained for
+    agent-owned critique files.
 """
 from __future__ import annotations
 
@@ -154,10 +163,20 @@ def _live_harness_scripts(run_path: str) -> set[str]:
                 return any(a == r or a.startswith(r + "/") for r in (run_abs, run_rel))
             if not argv or not any(_is_this_run(a) for a in argv):
                 continue
-            for a in argv[1:]:
-                real = os.path.realpath(os.path.join(p.info.get("cwd") or enforcement.REPO_ROOT, a))
-                if os.path.dirname(real) == _SCRIPTS_DIR and os.path.basename(real) in SCRIPT_PRODUCES:
-                    out.add(os.path.basename(real))
+            # The interpreter must be RUNNING the producer: argv[0] is a
+            # Python interpreter and its script argument (the first one, no
+            # -c/-m) is the producer — not any argument (Copilot, PR #15).
+            if not re.fullmatch(r"python[\d.]*", os.path.basename(argv[0])):
+                continue
+            rest = argv[1:]
+            while rest and rest[0].startswith("-") and rest[0] not in ("-c", "-m"):
+                rest = rest[1:]
+            if not rest or rest[0] in ("-c", "-m"):
+                continue
+            real = os.path.realpath(os.path.join(p.info.get("cwd") or enforcement.REPO_ROOT, rest[0]))
+            if os.path.dirname(real) == _SCRIPTS_DIR and os.path.basename(real) in SCRIPT_PRODUCES \
+                    and any(_is_this_run(a) for a in rest[1:]):
+                out.add(os.path.basename(real))
     except Exception:  # noqa: BLE001 — a failed scan must not crash the hook
         return out
     return out
