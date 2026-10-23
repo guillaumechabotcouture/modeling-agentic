@@ -74,6 +74,7 @@ SCRIPT_OUTPUTS = (
     "trace.jsonl",
     "final_gate.json",
     "final_gate_stderr.txt",
+    "artifact_integrity.json",   # Phase 23 α: written by agents/integrity.py only
 )
 
 # Files the lead may not write directly: it must re-spawn the owning
@@ -328,13 +329,14 @@ def bash_write_targets(command: str) -> list[str]:
     python one-liners with open(..., 'w')). Anything it misses in harness
     code is caught after the fact by the harness hash in main.py.
 
-    Known limitation (Codex review of PR #14): run-directory artifacts are
-    NOT hashed, and these forms still evade the heuristic — variable
+    Known limitation (Codex review of PR #14): these forms still evade the
+    heuristic — variable
     expansion (`p=…; echo > "$p"`), nested shells (`bash -c "cd …; …"`), a
     `cd` that never runs (`false && cd x`) or runs in a pipeline,
     backslash-escaped filenames, quotes inside `#` comments, and process
-    substitution (`tee >(…) <protected>`). The structural fix is an integrity record
-    of protected run artifacts checked before the gate (tracked follow-up).
+substitution (`tee >(…) <protected>`). They are caught after the
+    fact by agents/integrity.py (Phase 23 α), which hashes protected run
+    artifacts and flags any change no allowed in-flight call explains.
     """
     return [t for t, _ in bash_write_targets_cwd(command)]
 

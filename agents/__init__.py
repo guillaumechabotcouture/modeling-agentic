@@ -1216,7 +1216,8 @@ def snapshot_report(run_path: str, state: dict) -> bool:
 
 
 def create_hooks(run_path: str, trace_file, start_time: datetime,
-                 registered_agents=None, max_turns: dict[str, int] | None = None):
+                 registered_agents=None, max_turns: dict[str, int] | None = None,
+                 integrity=None):
     """Create hook config for the lead query() session.
 
     Phase 21 α: PreToolUse also enforces file ownership and the agent
@@ -1294,6 +1295,10 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
         _safe_write(trace_file, record)  # a closed trace must not disable enforcement
         if deny_reason:
             return enforcement.deny_output(deny_reason)
+        if integrity is not None:
+            # Phase 23 α: record what this allowed call may change.
+            integrity.on_pre(tool_use_id, tool_name, tool_input, agent_type,
+                             cwd=input_data.get("cwd"))
         return {}
 
     async def post_tool_hook(input_data, tool_use_id, context):
@@ -1312,6 +1317,11 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
                     if fname.endswith(".png"):
                         _check_figure_size(os.path.join(fig_dir, fname), agent_id)
         snapshot_report(run_path, snapshot_state)
+        if integrity is not None:
+            for ev in integrity.on_post(tool_use_id):
+                print(f"[INTEGRITY] unexplained {ev['change']} of {ev['file']} "
+                      f"(in flight: {ev['in_flight'] or 'nothing'})", flush=True)
+                _safe_write(trace_file, {"ts": ev["ts"], "type": "integrity_violation", **ev})
         return {}
 
     async def subagent_start_hook(input_data, tool_use_id, context):

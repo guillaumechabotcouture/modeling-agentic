@@ -33,6 +33,7 @@ from agents import (
     LEAD_SYSTEM_PROMPT,
 )
 from agents import enforcement
+from agents.integrity import ArtifactIntegrity
 
 REPO_ROOT = enforcement.REPO_ROOT
 VALIDATOR = os.path.join(REPO_ROOT, "scripts", "validate_critique_yaml.py")
@@ -481,6 +482,9 @@ async def run(question: str, max_rounds: int, max_sessions: int,
     env_overrides = enforcement.filtered_env(dict(os.environ), allow_cloud)
 
     harness_before, harness_prior_diff = write_harness_baseline(run_path)
+    # Phase 23 α: hash protected run artifacts; every change must be explained
+    # by an allowed in-flight tool call (see agents/integrity.py).
+    integrity = ArtifactIntegrity(run_path)
 
     # Phase 21 α: on --resume, continue the saved conversation instead of
     # starting a fresh one (session_id used to be captured only from a
@@ -516,7 +520,8 @@ async def run(question: str, max_rounds: int, max_sessions: int,
             # failed to write.
             hooks = create_hooks(run_path, trace_file, run_start,
                                  registered_agents=set(agents.keys()),
-                                 max_turns={n: d.maxTurns for n, d in agents.items()})
+                                 max_turns={n: d.maxTurns for n, d in agents.items()},
+                                 integrity=integrity)
 
             options = ClaudeAgentOptions(
                 system_prompt=lead_system,
@@ -640,7 +645,7 @@ async def run(question: str, max_rounds: int, max_sessions: int,
             run_path, run_dir_rel, run_start, max_rounds, session_outcome,
             session_num, session_id, session_records, harness_before,
             harness_prior_diff, run_gate=not interrupted,
-            original_meta=prior_meta)
+            original_meta=prior_meta, integrity=integrity)
     return status
 
 
@@ -676,17 +681,26 @@ def _restore_protected_meta(metadata_path: str, original_meta: dict) -> None:
 def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
                  session_num, session_id, session_records, harness_before,
                  harness_prior_diff, run_gate: bool = True,
-                 original_meta: dict | None = None) -> str:
+                 original_meta: dict | None = None, integrity=None) -> str:
     """Restore report if needed, run the final gate, check the harness
     hash, and write metadata.json. Runs in a `finally`, so it executes on
     Ctrl-C and on unexpected exceptions too."""
     original_meta = original_meta or {}
     report_restored = restore_report_if_missing(run_path)
+    if report_restored and integrity is not None:
+        integrity.harness_wrote("report.md")
     has_report = os.path.exists(os.path.join(run_path, "report.md"))
     # Restore the protected fields BEFORE the gate: the validator reads the
     # question from metadata.json (Codex review of PR #14: a planner edit to
     # the question would otherwise be gated, then silently undone).
     _restore_protected_meta(os.path.join(run_path, "metadata.json"), original_meta)
+    # Last integrity scan before the gate reads artifact_integrity.json.
+    if integrity is not None:
+        integrity.final_check()
+    if integrity is not None and integrity.events:
+        print(f"[INTEGRITY] {len(integrity.events)} unexplained change(s) to protected "
+              f"run artifacts; see {os.path.join(run_dir_rel, 'artifact_integrity.json')}",
+              flush=True)
 
     gate = None
     if run_gate and session_outcome == "session_completed":
@@ -717,6 +731,8 @@ def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
     meta["has_report"] = has_report
     meta["report_restored"] = report_restored
     meta["final_gate"] = gate
+    if integrity is not None:
+        meta["artifact_integrity_violations"] = len(integrity.events)
     if session_records:
         meta.setdefault("session_results", []).extend(session_records)
     costs = [r.get("total_cost_usd") for r in meta.get("session_results", [])
@@ -844,6 +860,59 @@ def _run_self_test() -> int:
     ok(deny("Read", {"file_path": os.path.join(REPO_ROOT, ".env")}), "E7: Read .env allowed")
     ok(not deny("Read", {"file_path": os.path.join(REPO_ROOT, "scripts/x.py")}),
        "E7: Read scripts denied")
+
+    # IN1-IN7 (Phase 23 α): integrity record of protected run artifacts.
+    from agents.integrity import ArtifactIntegrity, REPORT_NAME
+    with tempfile.TemporaryDirectory() as td:
+        def w(rel, text):
+            os.makedirs(os.path.dirname(os.path.join(td, rel)), exist_ok=True)
+            open(os.path.join(td, rel), "w").write(text)
+        w("critique_domain.yaml", "verdict: REVISE\n")
+        w("uncertainty_report.yaml", "n_draws: 200\n")
+        ig = ArtifactIntegrity(td, process_check=lambda: False)
+        # IN1: the lead's plain Bash rewrites a critique → violation
+        ig.on_pre("b1", "Bash", {"command": "printf x > \"$P\""}, None)
+        w("critique_domain.yaml", "verdict: PASS\n")
+        ok([e["file"] for e in ig.on_post("b1")] == ["critique_domain.yaml"],
+           f"IN1 lead rewrite of a critique flagged: {ig.events}")
+        # IN2: the critic's own Write (or its Bash) → explained
+        ig.on_pre("w1", "Write", {"file_path": f"{td}/critique_domain.yaml"}, "critique-domain")
+        w("critique_domain.yaml", "verdict: REVISE\nblockers: []\n")
+        ok(ig.on_post("w1") == [], "IN2 critic's own write explained")
+        # IN3: a harness script run explains a script output
+        ig.on_pre("b2", "Bash", {"command": f"python3 scripts/propagate_uncertainty.py {td}"}, "modeler")
+        w("uncertainty_report.yaml", "n_draws: 400\n")
+        ok(ig.on_post("b2") == [], "IN3 harness script explains its output")
+        # IN4: a non-script Bash editing a script output → violation, unless a
+        # background harness process is alive
+        ig.on_pre("b3", "Bash", {"command": "p=uncertainty_report.yaml; sed -i '' s/400/40/ $p"}, "modeler")
+        w("uncertainty_report.yaml", "n_draws: 40\n")
+        ok([e["file"] for e in ig.on_post("b3")] == ["uncertainty_report.yaml"],
+           "IN4 variable-expansion edit of a script output flagged")
+        ig2 = ArtifactIntegrity(td, process_check=lambda: True)
+        w("uncertainty_report.yaml", "n_draws: 800\n")
+        ok(ig2.final_check() == [], "IN4b a live background harness script explains it")
+        # IN5: editing the integrity report itself is a violation
+        w(REPORT_NAME, '{"producer": "agents/integrity.py", "violations": []}')
+        ok(any(e["file"] == REPORT_NAME for e in ig2.final_check()), "IN5 report tamper flagged")
+        # IN6: a resumed run keeps earlier violations
+        ok(len(ArtifactIntegrity(td, process_check=lambda: False).events) >= 1,
+           "IN6 violations survive a restart")
+        # IN7: hooks feed the record (allowed calls only)
+        trace = open(os.path.join(td, "trace.jsonl"), "w")
+        ig3 = ArtifactIntegrity(td, process_check=lambda: False)
+        n0 = len(ig3.events)
+        hk = agents_pkg.create_hooks(td, trace, datetime.now(), registered_agents=reg, integrity=ig3)
+        pre_i, post_i = hk["PreToolUse"][0].hooks[0], hk["PostToolUse"][0].hooks[0]
+        asyncio.run(pre_i({"tool_name": "Bash", "tool_input": {"command": "true"}}, "h1", None))
+        w("critique_domain.yaml", "verdict: ACCEPT\n")
+        asyncio.run(post_i({"tool_name": "Bash", "tool_input": {"command": "true"}}, "h1", None))
+        ok(len(ig3.events) == n0 + 1 and ig3.events[-1]["file"] == "critique_domain.yaml",
+           f"IN7 hooks record a lead change to a critique: {ig3.events[n0:]}")
+        trace.close()
+    ok(enforcement.check_tool_use("Write", {"file_path": f"{run_path}/artifact_integrity.json"},
+                                  run_path, "analyst", set()) is not None,
+       "IN8 no agent may write artifact_integrity.json")
 
     # H1: hook returns the SDK deny shape and allows benign calls
     with tempfile.TemporaryDirectory() as td:

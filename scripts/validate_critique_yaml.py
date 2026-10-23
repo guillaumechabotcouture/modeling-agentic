@@ -163,6 +163,7 @@ _NON_DECLARABLE_KINDS = frozenset({
     "claim_source_unresolved",
     "claim_source_mismatch",
     "claim_value_not_in_source",
+    "artifact_integrity_violation",
     "claim_ci_unsourced",
     "claim_ci_mismatch",
     "ci_degenerate",
@@ -1639,6 +1640,35 @@ def _allocation_present(run_dir: str) -> bool:
         artifact_path("decision_rule", run_dir))
 
 
+def _check_artifact_integrity(run_dir: str) -> list[dict]:
+    """Phase 23 α: `artifact_integrity.json` is written by the harness
+    (agents/integrity.py) during a pipeline run. Each violation — a change
+    to a protected run artifact that no allowed in-flight tool call
+    explains — is HIGH and not scope-declarable: the evidence the gate
+    grades was altered outside its sanctioned writer. Absent file (replays,
+    fixtures, pre-23 runs): nothing to check."""
+    path = os.path.join(run_dir, "artifact_integrity.json")
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path) as f:
+            doc = json.load(f)
+        if not isinstance(doc, dict) or doc.get("producer") != "agents/integrity.py":
+            raise ValueError("missing or wrong producer stamp")
+        events = doc.get("violations") or []
+        if not isinstance(events, list):
+            raise ValueError("`violations` is not a list")
+    except (OSError, ValueError) as e:
+        return [{"kind": "artifact_integrity_invalid", "severity": "HIGH", "stage": "GATE",
+                 "scope_declarable": False,
+                 "claim": f"artifact_integrity.json is unreadable or not harness-written ({e})."}]
+    items = [f"{e.get('change')} {e.get('file')} (detected {e.get('detected')}, in flight: "
+             f"{', '.join(e.get('in_flight') or []) or 'nothing'})"
+             for e in events if isinstance(e, dict)]
+    return _capped("artifact_integrity_violation", items,
+                   "Protected run artifact changed outside its sanctioned writer: ", stage="GATE")
+
+
 def _parameters_fitted(run_dir: str) -> bool:
     """Evidence that the run fitted parameters (Copilot review of PR #14):
     an identifiability manifest, a model comparison with any k_params > 0,
@@ -1813,6 +1843,8 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None,
     violations += G(lambda rd: _load_sibling("numeric_consistency")
                     .check_numeric_consistency(rd), run_dir,
                     check_name="numeric_consistency")
+    # Phase 23 α: unexplained changes to protected run artifacts.
+    violations += G(_check_artifact_integrity, run_dir)
     # Phase 22 δ: data CSVs checked against their declared units/ranges.
     violations += G(lambda rd: _load_sibling("data_schema").check(rd, round_n),
                     run_dir, check_name="data_schema")
@@ -8523,6 +8555,22 @@ def _run_self_test() -> int:
         ok("report" not in req and "report" in
            {v["artifact"] for v in _check_required_artifacts(d, post_write=True)},
            "E7b: report.md required only in post-write mode")
+
+    # AI1-AI3 (Phase 23 α): harness integrity record → non-declarable HIGHs.
+    with tempfile.TemporaryDirectory() as d:
+        ok(_check_artifact_integrity(d) == [], "AI1: absent record → nothing")
+        with open(os.path.join(d, "artifact_integrity.json"), "w") as f:
+            json.dump({"producer": "agents/integrity.py", "violations": [
+                {"file": "critique_domain.yaml", "change": "modified", "detected": "final",
+                 "in_flight": []}]}, f)
+        v = _check_artifact_integrity(d)
+        ok([x["kind"] for x in v] == ["artifact_integrity_violation"]
+           and is_non_declarable(v[0]["kind"], v[0].get("scope_declarable")),
+           f"AI2: violation → HIGH non-declarable, got {v}")
+        with open(os.path.join(d, "artifact_integrity.json"), "w") as f:
+            json.dump({"producer": "someone", "violations": []}, f)
+        ok([x["kind"] for x in _check_artifact_integrity(d)] == ["artifact_integrity_invalid"],
+           "AI3: wrong producer → invalid")
 
     # E7c (Copilot review): calibration_result is required only with fitting
     # evidence; an unreadable model comparison still counts (fail closed).
