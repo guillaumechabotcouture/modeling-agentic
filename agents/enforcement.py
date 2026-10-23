@@ -245,8 +245,12 @@ def _cd_target(segment: str, cur: str | None) -> tuple[bool, str | None]:
 def _unquoted(text: str) -> str:
     """`text` with quoted spans removed, so `echo ')'` does not close a
     subshell (Codex re-review of PR #14)."""
-    out, quote = [], None
-    for ch in text:
+    out, quote, i = [], None, 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and quote != "'":
+            i += 2                       # POSIX: backslash escapes the next char
+            continue                     # (not inside single quotes)
         if quote:
             if ch == quote:
                 quote = None
@@ -254,6 +258,7 @@ def _unquoted(text: str) -> str:
             quote = ch
         else:
             out.append(ch)
+        i += 1
     return "".join(out)
 
 

@@ -1052,6 +1052,9 @@ def _run_self_test() -> int:
     ok(enforcement.check_tool_use("Bash", {"command": f"(cd {rp_rel} && echo ')' && echo forged > critique_domain.yaml; true)"},
                                   run_path, None, set()) is not None,
        "CR11 a quoted ) does not close the subshell")
+    ok(enforcement.check_tool_use("Bash", {"command": f"cd {rp_rel} && (cd /tmp && echo \\\"); echo forged > critique_domain.yaml"},
+                                  run_path, None, set()) is not None,
+       "CR12 an escaped quote does not hide the subshell close")
     # CR5 (Codex review of PR #14): the gate must see the original question.
     with tempfile.TemporaryDirectory() as td:
         mp = os.path.join(td, "metadata.json")
