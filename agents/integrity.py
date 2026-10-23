@@ -103,7 +103,11 @@ def _protected_patterns() -> list[str]:
     return pats + list(_CRITIQUE_PATTERNS)
 
 
-def harness_scripts_run(command: str, cwd: str | None = None) -> tuple[list[str], bool]:
+_SHELLS = {"sh", "bash", "zsh", "dash"}
+
+
+def harness_scripts_run(command: str, cwd: str | None = None, _depth: int = 0
+                        ) -> tuple[list[str], bool]:
     """Harness scripts a Bash command actually EXECUTES (a Python interpreter
     whose script argument resolves into the repo's scripts/ directory), and
     whether it backgrounds them. Mentions in comments, strings or other
@@ -122,6 +126,35 @@ def harness_scripts_run(command: str, cwd: str | None = None) -> tuple[list[str]
             if os.path.basename(toks[0]) == "nohup":
                 background = True
             toks = toks[1:]
+        if toks and os.path.basename(toks[0]) in _SHELLS and _depth < 3:
+            # `nohup sh -c "python3 scripts/x.py …; echo DONE" &` (seen in E7):
+            # the producer runs inside the shell string — but only when -c
+            # (or a cluster like -lc) comes before any script operand or `--`;
+            # in `bash /dev/null -c '…'` the string never runs (Codex, PR #17).
+            cmd_str, noexec, j = None, False, 1
+            while j < len(toks):
+                t = toks[j]
+                if t in ("-o", "+o", "-O", "+O"):
+                    noexec = noexec or (j + 1 < len(toks) and toks[j + 1] == "noexec")
+                    j += 2                   # option with an operand (`-o pipefail`)
+                    continue
+                if t == "--" or not t.startswith(("-", "+")):
+                    break
+                if t.startswith("-") and not t.startswith("--") and "n" in t[1:]:
+                    noexec = True            # `-n`: syntax check only, nothing runs
+                # only a cluster of real single-letter shell options; `-Zc` makes
+                # bash exit without running the string (Codex, PR #17).
+                if re.fullmatch(r"-[eluxivfaBHP]*c[eluxivfaBHP]*", t):
+                    cmd_str = toks[j + 1] if j + 1 < len(toks) else None
+                    break
+                j += 1
+            if noexec:
+                cmd_str = None
+            if cmd_str is not None:
+                inner, bg = harness_scripts_run(cmd_str, base, _depth + 1)
+                found += inner
+                background = background or bg
+            continue
         if len(toks) < 2 or not re.fullmatch(r"python[\d.]*", os.path.basename(toks[0])):
             continue
         script = next((t for t in toks[1:] if not t.startswith("-")), None)
