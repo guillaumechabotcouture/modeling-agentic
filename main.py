@@ -1041,6 +1041,11 @@ def _run_self_test() -> int:
            and harness_scripts_run("nohup .venv/bin/python3 scripts/propagate_uncertainty.py runs/x &")
            == (["propagate_uncertainty.py"], True),
            "IC1 only an executed harness script counts")
+        ok(harness_scripts_run('R=runs/x && nohup sh -c "python3 scripts/propagate_uncertainty.py $R --n-draws 225; '
+                               'echo UQDONE exit=\\$?" > $R/uq_run.log 2>&1 &')
+           == (["propagate_uncertainty.py"], True)
+           and harness_scripts_run("bash -c 'echo scripts/compare_models.py'")[0] == [],
+           "IC1d a producer inside sh -c / bash -c is recognized (E7); a mention is not")
         ig.on_pre("c1", "Bash", {"command": 'p=u.yaml; printf f > "$p"; # scripts/propagate_uncertainty.py'}, "modeler")
         w("uncertainty_report.yaml", "n: forged\n")
         ok(len(ig.on_post("c1")) == 1, "IC1b comment mention doesn't authorize a forged output")

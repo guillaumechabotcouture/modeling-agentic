@@ -103,7 +103,11 @@ def _protected_patterns() -> list[str]:
     return pats + list(_CRITIQUE_PATTERNS)
 
 
-def harness_scripts_run(command: str, cwd: str | None = None) -> tuple[list[str], bool]:
+_SHELLS = {"sh", "bash", "zsh", "dash"}
+
+
+def harness_scripts_run(command: str, cwd: str | None = None, _depth: int = 0
+                        ) -> tuple[list[str], bool]:
     """Harness scripts a Bash command actually EXECUTES (a Python interpreter
     whose script argument resolves into the repo's scripts/ directory), and
     whether it backgrounds them. Mentions in comments, strings or other
@@ -122,6 +126,13 @@ def harness_scripts_run(command: str, cwd: str | None = None) -> tuple[list[str]
             if os.path.basename(toks[0]) == "nohup":
                 background = True
             toks = toks[1:]
+        if toks and os.path.basename(toks[0]) in _SHELLS and "-c" in toks[1:-1] and _depth < 3:
+            # `nohup sh -c "python3 scripts/x.py …; echo DONE" &` (seen in E7):
+            # the producer runs inside the shell string.
+            inner, bg = harness_scripts_run(toks[toks.index("-c") + 1], base, _depth + 1)
+            found += inner
+            background = background or bg
+            continue
         if len(toks) < 2 or not re.fullmatch(r"python[\d.]*", os.path.basename(toks[0])):
             continue
         script = next((t for t in toks[1:] if not t.startswith("-")), None)
