@@ -210,16 +210,19 @@ class ArtifactIntegrity:
                                 "ts": datetime.now().isoformat(timespec="seconds"),
                                 "in_flight": []}]
         self.hashes = self._scan()
+        self._mtimes = dict(self._mtimes_now)
         self._write_report()
 
     # -- scanning ---------------------------------------------------------
     def _scan(self) -> dict[str, str | None]:
         out = {}
+        self._mtimes_now = {}
         for pat in _protected_patterns():
             for p in glob.glob(os.path.join(self.run_path, pat)):
                 if os.path.isfile(p):
                     rel = os.path.relpath(p, self.run_path).replace(os.sep, "/")
                     out[rel] = _sha(p)
+                    self._mtimes_now[rel] = os.stat(p).st_mtime_ns
         rp = os.path.join(self.run_path, REPORT_NAME)
         if os.path.exists(rp):
             out[REPORT_NAME] = _sha(rp)
@@ -329,9 +332,22 @@ class ArtifactIntegrity:
         for rel in sorted(set(cur) | set(self.hashes)):
             if rel == REPORT_NAME:
                 continue
-            if cur.get(rel) == self.hashes.get(rel):
-                continue
             in_flight = sorted({f"{i['agent'] or 'lead'}:{i['tool']}" for i in self.inflight.values()})
+            if cur.get(rel) == self.hashes.get(rel):
+                # Same bytes, but rewritten (mtime moved) by a sanctioned
+                # producer: a deterministic regeneration still resolves an
+                # open violation (Codex review, PR #16). A skipped producer
+                # (`false && …`) doesn't touch the file, so it can't.
+                touched = self._mtimes_now.get(rel) != getattr(self, "_mtimes", {}).get(rel)
+                if touched and rel in cur and any(e.get("file") == rel and e.get("open", True)
+                                                  for e in self.events) and self._explained(rel, live):
+                    for ev in self.events:
+                        if ev.get("file") == rel and ev.get("open", True):
+                            ev["open"] = False
+                            ev["resolved"] = {"ts": datetime.now().isoformat(timespec="seconds"),
+                                              "by": in_flight, "identical_bytes": True}
+                            resolved = True
+                continue
             if not self._explained(rel, live):
                 ev = {"file": rel, "change": ("deleted" if rel not in cur else
                                               "created" if rel not in self.hashes else "modified"),
@@ -355,6 +371,7 @@ class ArtifactIntegrity:
                                "ts": datetime.now().isoformat(timespec="seconds"),
                                "in_flight": [], "open": True, "resolvable": False})
         self.hashes = cur
+        self._mtimes = dict(self._mtimes_now)
         if new_events or resolved:
             self.events.extend(new_events)
             self._write_report()

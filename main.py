@@ -1171,6 +1171,23 @@ def _run_self_test() -> int:
         igr.on_post("m3")
         ok(any(e["file"] == REPORT_NAME and e.get("open") for e in igr.events),
            "IR3 tampering with the integrity record itself is never resolved")
+        # IR4/IR5 (Codex, PR #16): an identical-bytes producer rewrite resolves;
+        # a skipped producer (file untouched) does not.
+        w("models/eligibility_probe.yaml", "verdict: NOT_APPLICABLE\n")      # agent copy
+        igr.on_pre("e1", "Bash", {"command": "cp x models/eligibility_probe.yaml"}, "modeler")
+        igr.on_post("e1")
+        ok(any(e["file"] == "models/eligibility_probe.yaml" and e.get("open") for e in igr.events),
+           "IR4a copied gate output opens a violation")
+        igr.on_pre("e2", "Bash", {"command": f"false && python3 scripts/eligibility_probe.py {td}"}, "modeler")
+        igr.on_post("e2")
+        ok(any(e["file"] == "models/eligibility_probe.yaml" and e.get("open") for e in igr.events),
+           "IR4b a skipped producer (file untouched) does not resolve it")
+        import time as _t; _t.sleep(0.01)
+        igr.on_pre("e3", "Bash", {"command": f"python3 scripts/eligibility_probe.py {td}"}, "modeler")
+        w("models/eligibility_probe.yaml", "verdict: NOT_APPLICABLE\n")      # identical bytes, rewritten
+        igr.on_post("e3")
+        ok(not any(e["file"] == "models/eligibility_probe.yaml" and e.get("open") for e in igr.events),
+           "IR5 an identical-bytes producer rewrite resolves it")
     ok(enforcement.check_tool_use("Write", {"file_path": f"{run_path}/artifact_integrity.json"},
                                   run_path, "analyst", set()) is not None,
        "IN8 no agent may write artifact_integrity.json")
