@@ -71,3 +71,19 @@ This is a quality baseline, not an A/B adoption test. It measures where the ship
   - **Why the cap moved:** at $300 a full run would likely be stopped before finishing, and E7 asks about a finished answer.
   - **Unchanged:** the arms, rubric and decision rules.
 
+## Deviations during execution (logged before any quality data was seen)
+
+1. **Attempt 1 (2026-10-23 05:23 UTC) was stopped by the Anthropic account's monthly usage limit.**
+   - Both runs reached MODEL round 1 (R1 $27.11, R2 $34.80) before every API call failed ("You have reached your specified API usage limits"). They ended `max_sessions_reached` with no report.
+   - After the owner restored access, both were resumed from their files (fresh lead session; file-based resume context), on the same code `7fbad16`.
+2. **Attempt 2 (resume, 17:15 UTC) was paused after ~50 min.**
+   - R2b's integrity record flagged two genuine contract breaches: the modeler's own scripts wrote the gate outputs `identifiability.yaml` (`models/run_calibration.py`) and `models/eligibility_probe.yaml` (`models/run_uq.py`, a self-written stand-in for `scripts/propagate_uncertainty.py`).
+   - Under `7fbad16` such violations are permanent, so the run could never reach ACCEPT. Both runs were interrupted (SIGINT, state kept).
+   - **Fix (Phase 23 γ):** a violation resolves when the producer script later rewrites the file. Resolved violations stay visible as MEDIUM advisories. The modeler and lead prompts now state that gate outputs come only from their producers.
+3. **Budget-ledger reconciliation.**
+   - The interrupted sessions produced no SDK cost, so the ledger had charged each its whole remaining allowance.
+   - Their spend was instead estimated from the collected CLI transcripts: per-model $/weighted-token was fitted on 96 E5 cases (median error 10%). Estimates: R1b $12.56, R2b $16.59.
+   - The estimates were entered with a 20% margin ($15.07, $19.91), labelled as operator reconciliation.
+
+Arms, rubric and decision rules are unchanged. The next resume (attempt 3) runs on the merge commit that contains the fix. Rule 1 (invalid if integrity violations) applies to *open* violations at the end of the run.
+

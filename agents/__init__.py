@@ -702,6 +702,13 @@ Wait for all of them to complete.
 
 ### STAGE 7: MECHANICAL DECISION GATE
 
+If the validator reports `artifact_integrity_violation` for a file, that
+gate output was written outside its producer script. The fix is to re-run
+its producer (`python3 scripts/<producer>.py {run_dir}`, or ask the owning
+specialist to), which rewrites the file and resolves the violation. Never
+edit the file or `artifact_integrity.json`.
+
+
 The STAGE 7 decision is NOT a free judgment call. You compute it
 mechanically from the critique YAML files. You do not get to
 override the rules with prose reasoning.

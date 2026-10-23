@@ -808,8 +808,8 @@ def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
     if _restore_protected_meta(os.path.join(run_path, "metadata.json"), original_meta) \
             and integrity is not None:
         integrity.harness_wrote("metadata.json")
-    if integrity is not None and integrity.events:
-        print(f"[INTEGRITY] {len(integrity.events)} unexplained change(s) to protected "
+    if integrity is not None and integrity.open_events:
+        print(f"[INTEGRITY] {len(integrity.open_events)} unresolved change(s) to protected "
               f"run artifacts; see {os.path.join(run_dir_rel, 'artifact_integrity.json')}",
               flush=True)
 
@@ -822,7 +822,7 @@ def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
     harness_diff = enforcement.diff_harness(harness_before, enforcement.hash_harness())
     status = determine_status(session_outcome, gate, has_report,
                               report_restored, harness_diff,
-                              integrity_violations=len(integrity.events) if integrity else 0)
+                              integrity_violations=len(integrity.open_events) if integrity else 0)
 
     elapsed = (datetime.now() - run_start).total_seconds()
     metadata_path = os.path.join(run_path, "metadata.json")
@@ -845,7 +845,8 @@ def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
     meta["report_restored"] = report_restored
     meta["final_gate"] = gate
     if integrity is not None:
-        meta["artifact_integrity_violations"] = len(integrity.events)
+        meta["artifact_integrity_violations"] = len(integrity.open_events)
+        meta["artifact_integrity_resolved"] = len(integrity.events) - len(integrity.open_events)
     if session_records:
         meta.setdefault("session_results", []).extend(session_records)
     meta["total_cost_usd"] = conversation_cost(meta.get("session_results", []))
@@ -871,7 +872,7 @@ def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
         print(f"  HARNESS CHANGED DURING RUN: {harness_diff}", flush=True)
     if status == "artifact_tampered":
         print(f"  PROTECTED RUN ARTIFACTS CHANGED OUTSIDE THEIR WRITERS: "
-              f"{[e['file'] for e in integrity.events]}", flush=True)
+              f"{[e['file'] for e in integrity.open_events]}", flush=True)
     print(f"  Results: {run_dir_rel}/", flush=True)
     print(f"{'='*60}", flush=True)
     return status
@@ -1147,6 +1148,29 @@ def _run_self_test() -> int:
         ig9 = ArtifactIntegrity(td, process_check=lambda: set())
         ok(ig9.events and ig9.events[0]["change"] == "invalid_at_start",
            "IC9 unreadable integrity record on resume becomes a violation")
+    # IR1-IR3 (E7 resume): a violation resolves when the producer rewrites the file.
+    with tempfile.TemporaryDirectory() as td:
+        def w(rel, text):
+            os.makedirs(os.path.dirname(os.path.join(td, rel)), exist_ok=True)
+            open(os.path.join(td, rel), "w").write(text)
+        igr = ArtifactIntegrity(td, process_check=lambda: set())
+        igr.on_pre("m1", "Bash", {"command": "python3 models/run_calibration.py"}, "modeler")
+        w("identifiability.yaml", "verdict: CLEAN  # hand-written by an agent script\n")
+        igr.on_post("m1")
+        ok(len(igr.open_events) == 1, "IR1 agent-script write of a gate output opens a violation")
+        igr.on_pre("m2", "Bash", {"command": f"python3 scripts/identifiability.py {td}"}, "modeler")
+        w("identifiability.yaml", "producer: scripts/identifiability.py\nverdict: CLEAN\n")
+        igr.on_post("m2")
+        ok(igr.open_events == [] and igr.events[0].get("resolved")
+           and determine_status("session_completed", {"action": "ACCEPT"}, True, False, None,
+                                integrity_violations=len(igr.open_events)) == "completed",
+           f"IR2 producer rewrite resolves it; the run is not tampered: {igr.events}")
+        w(REPORT_NAME, '{"producer": "agents/integrity.py", "violations": []}')
+        igr.final_check()
+        igr.on_pre("m3", "Bash", {"command": f"python3 scripts/identifiability.py {td}"}, "modeler")
+        igr.on_post("m3")
+        ok(any(e["file"] == REPORT_NAME and e.get("open") for e in igr.events),
+           "IR3 tampering with the integrity record itself is never resolved")
     ok(enforcement.check_tool_use("Write", {"file_path": f"{run_path}/artifact_integrity.json"},
                                   run_path, "analyst", set()) is not None,
        "IN8 no agent may write artifact_integrity.json")

@@ -18,7 +18,11 @@ written to `artifact_integrity.json` — by the harness, never by a tool, and
 itself protected — and the final gate turns each into a non-declarable HIGH.
 
 This detects after the fact rather than blocking, but it does not depend on
-how the change was made.
+how the change was made. A violation is resolved when a later sanctioned
+write (its producer script, or the owning critic) replaces the file: the
+gate cares whether the CURRENT content is producer-written. Resolved
+violations stay in the record as advisories; tampering with the record
+itself is never resolvable.
 
 Known limits (PR #15 reviews):
   - Permission is decided before a call runs. In
@@ -201,8 +205,8 @@ class ArtifactIntegrity:
                     raise ValueError("unstamped or malformed")
                 self.events = list(ev)
             except (OSError, ValueError, AttributeError) as e:
-                self.events = [{"file": REPORT_NAME, "change": "invalid_at_start",
-                                "detected": "start", "detail": str(e)[:200],
+                self.events = [{"file": REPORT_NAME, "change": "invalid_at_start", "open": True,
+                                "resolvable": False, "detected": "start", "detail": str(e)[:200],
                                 "ts": datetime.now().isoformat(timespec="seconds"),
                                 "in_flight": []}]
         self.hashes = self._scan()
@@ -321,28 +325,44 @@ class ArtifactIntegrity:
         cur = self._scan()
         live = self._refresh_grants()
         new_events = []
+        resolved = False
         for rel in sorted(set(cur) | set(self.hashes)):
             if rel == REPORT_NAME:
                 continue
             if cur.get(rel) == self.hashes.get(rel):
                 continue
+            in_flight = sorted({f"{i['agent'] or 'lead'}:{i['tool']}" for i in self.inflight.values()})
             if not self._explained(rel, live):
                 ev = {"file": rel, "change": ("deleted" if rel not in cur else
                                               "created" if rel not in self.hashes else "modified"),
                       "detected": where, "ts": datetime.now().isoformat(timespec="seconds"),
-                      "in_flight": sorted({f"{i['agent'] or 'lead'}:{i['tool']}"
-                                           for i in self.inflight.values()})}
+                      "in_flight": in_flight, "open": True}
                 new_events.append(ev)
-        # The report itself: only this object writes it.
+            elif rel in cur:
+                # A sanctioned write (its producer script, or the owning
+                # critic) replaced the file: what the gate grades is now
+                # producer-written again, so earlier violations on it are
+                # resolved — kept visible, no longer blocking.
+                for ev in self.events:
+                    if ev.get("file") == rel and ev.get("open", True):
+                        ev["open"] = False
+                        ev["resolved"] = {"ts": datetime.now().isoformat(timespec="seconds"),
+                                          "by": in_flight}
+                        resolved = True
+        # The report itself: only this object writes it (never resolvable).
         if cur.get(REPORT_NAME) != self.hashes.get(REPORT_NAME):
             new_events.append({"file": REPORT_NAME, "change": "modified", "detected": where,
                                "ts": datetime.now().isoformat(timespec="seconds"),
-                               "in_flight": []})
+                               "in_flight": [], "open": True, "resolvable": False})
         self.hashes = cur
-        if new_events:
+        if new_events or resolved:
             self.events.extend(new_events)
             self._write_report()
         return new_events
+
+    @property
+    def open_events(self) -> list[dict]:
+        return [e for e in self.events if e.get("open", True)]
 
     def _write_report(self) -> None:
         p = os.path.join(self.run_path, REPORT_NAME)
@@ -353,6 +373,7 @@ class ArtifactIntegrity:
                 json.dump({"producer": "agents/integrity.py",
                            "protected_patterns": _protected_patterns(),
                            "unmatched_intents": self.unmatched_intents,
+                           "open_violations": len(self.open_events),
                            "violations": self.events}, f, indent=2)
         except OSError:
             self.report_ok = False       # finalize blocks on in-memory events anyway
