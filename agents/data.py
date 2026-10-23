@@ -126,6 +126,26 @@ document all datasets needed for the modeling task.
      - [value 2] → verified against [PMCID] abstract: "[exact quote]" ✓
    ```
 
+8b. **Declare units: write {run_dir}/data/data_schema.yaml** for every CSV
+   you write outside data/raw/ (raw downloads may be declared too). For
+   each column give its `kind` (proportion | percent | rate | count |
+   currency | continuous | year | id | categorical), its `unit` in words,
+   `per` for rates, and a plausible `range: [lo, hi]` taken from the
+   source (not the widest legal range — a tight range is what catches a
+   ×100 unit slip). Example:
+   ```yaml
+   files:
+     data/processed/unit_table.csv:
+       columns:
+         unit_name:  {kind: id}
+         prevalence: {kind: proportion, unit: "fraction, all ages", range: [0, 0.9]}
+         incidence:  {kind: rate, unit: "cases per 1,000 person-years", per: 1000, range: [0, 800]}
+   ```
+   Then run `python3 scripts/data_schema.py {run_dir}` and fix every HIGH:
+   a value outside its declared range is a unit change, a processing
+   error, or a wrong declaration. One column name must mean one unit
+   across all files. The modeler reads this file for units.
+
 9. **Distinguish raw data from compiled parameters:**
    - Raw datasets (downloaded from APIs): should be large (1000+ rows),
      contain time series or survey microdata

@@ -37,7 +37,7 @@ _MANIFEST_PATH = os.path.normpath(
 )
 
 _VALID_STAGES = frozenset(
-    {"pre_model", "model", "analyze", "allocation", "write"})
+    {"data", "pre_model", "model", "analyze", "allocation", "write"})
 _VALID_TRIGGERS = frozenset({"always", "allocation", "aggregation_ratio_lt_0.1"})
 
 

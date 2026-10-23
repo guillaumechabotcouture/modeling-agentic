@@ -17,7 +17,7 @@
 #   path               filename relative to run_dir
 #   first_draft_round  earliest round the modeler must produce a draft
 #   finalize_round     round by which the artifact must be final
-#   stage              pre_model | model | analyze | allocation | write
+#   stage              data | pre_model | model | analyze | allocation | write
 #   skill              skill name in .claude/skills/ that explains the contract
 #   triggered_by       always | allocation | aggregation_ratio_lt_0.1
 #   scope_declarable   may the modeler scope-declare instead of producing it?
@@ -46,6 +46,22 @@
 #                      (with a justification; counts against the budget).
 
 artifacts:
+  - id: data_schema
+    path: data/data_schema.yaml
+    first_draft_round: 1
+    finalize_round: 3
+    stage: data
+    skill: model-validation
+    triggered_by: always
+    scope_declarable: false
+    required_for_accept: never   # presence is round-gated by scripts/data_schema.py
+    description: |
+      **DATA-stage artifact** (Phase 22 δ). The data agent declares every
+      processed data CSV column's kind (proportion, percent, rate, count, …),
+      unit and plausible range; `scripts/data_schema.py` checks the data
+      against it. Read it for units before using any data column.
+      Out-of-range values and unit conflicts are HIGH, not scope-declarable.
+
   - id: identifiability_a_priori
     path: models/identifiability_a_priori.yaml
     first_draft_round: 1

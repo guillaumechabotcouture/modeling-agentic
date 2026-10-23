@@ -302,6 +302,15 @@ def build(run_dir: str, round_n: int = 2) -> dict:
         obs = kids * rate * _TRUE_RATE_SCALE * math.exp(_TRUE_SLOPE * acc) * noise
         lines.append(f"{name},{pop},{kids},{rate},{acc},{round(obs)}")
     _w(run_dir, "data/districts.csv", "\n".join(lines) + "\n")
+    _w(run_dir, "data/data_schema.yaml", {"files": {"data/districts.csv": {"columns": {
+        "district": {"kind": "id"},
+        "total_population": {"kind": "count", "unit": "persons", "range": [50000, 2000000]},
+        "eligible_children": {"kind": "count", "unit": "children under 5", "range": [5000, 300000]},
+        "baseline_rate": {"kind": "proportion", "unit": "annual cases per eligible child",
+                          "range": [0.0, 0.3]},
+        "access_index": {"kind": "continuous", "unit": "standardized index", "range": [-3, 3]},
+        "observed_cases": {"kind": "count", "unit": "cases per year", "range": [0, 100000]},
+    }}}})
 
     # --- calibrate (fit with placeholder constants, then write final code) ---
     _w(run_dir, "models/model.py", _MODEL_PY.format(rate_scale=1.0, slope=0.0))

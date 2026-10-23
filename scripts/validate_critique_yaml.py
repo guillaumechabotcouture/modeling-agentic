@@ -1772,6 +1772,9 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None,
     violations += G(lambda rd: _load_sibling("numeric_consistency")
                     .check_numeric_consistency(rd), run_dir,
                     check_name="numeric_consistency")
+    # Phase 22 δ: data CSVs checked against their declared units/ranges.
+    violations += G(lambda rd: _load_sibling("data_schema").check(rd, round_n),
+                    run_dir, check_name="data_schema")
     # E5 follow-up: unit and data-vintage source checks (data vs itself and
     # vs the run's own data documents; no domain vocabulary).
     violations += G(lambda rd: _load_sibling("source_checks").check_sources(rd),
@@ -8519,7 +8522,23 @@ def _run_self_test() -> int:
                             c["value"] = round(c["value"] * 1.10, 1)
                 _edit_yaml(os.path.join(md, "models", "claims_ledger.yaml"), fn)
 
+            def _unit_x100(md):
+                # Phase 22 δ: the E5 unit plant — a rate column ×100.
+                p = os.path.join(md, "data", "districts.csv")
+                with open(p) as f:
+                    rows = f.read().splitlines()
+                hdr = rows[0].split(",")
+                j = hdr.index("baseline_rate")
+                out = [rows[0]]
+                for r in rows[1:]:
+                    c = r.split(",")
+                    c[j] = f"{float(c[j]) * 100:g}"
+                    out.append(",".join(c))
+                with open(p, "w") as f:
+                    f.write("\n".join(out) + "\n")
+
             for name, mutate, expect in (
+                    ("unit_x100", _unit_x100, "data_schema_out_of_range"),
                     ("zero_width_ci", _zero_width, "ci_degenerate"),
                     ("renamed_verdict", _renamed_verdict,
                      "model_comparison_formal_unknown_verdict"),

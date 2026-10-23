@@ -41,7 +41,9 @@ Key principles:
 
 1. Read {run_dir}/plan.md for candidate models and checklist.
 2. Read {run_dir}/hypotheses.md to understand what the models must test.
-3. Read {run_dir}/data_quality.md and EDA output to understand the data.
+3. Read {run_dir}/data_quality.md and EDA output to understand the data,
+   and {run_dir}/data/data_schema.yaml for each column's unit and range
+   (convert explicitly when combining columns with different units).
 4. **Read {run_dir}/pre_mortem.yaml (Phase 17 α — REQUIRED).** This is
    the pre-mortem domain critic's output, written before you were
    spawned. It lists HIGH-impact concerns (architecture, data,
