@@ -272,3 +272,18 @@ Red-team vs each other critic, counting defects caught by one arm and missed by 
 
 **Caveat found later (2026-10-22, Phase 22 ε):** building the CI regression eval showed that the lexical matcher under-credits *structured gate* findings, as well as LLM prose. On the synthetic positive control, the gates caught planted zero-width/inverted CIs, ledger edits and unit changes (`ci_degenerate`, `claims_ledger_stale`, `data_schema_out_of_range`), but the matcher missed them. Three causes: the planted value is a short integer or a long float, or the specific term is the column/claim name the matcher excludes as a location key. The deterministic arm's recall here is therefore likely an underestimate, which would raise its unique counts. Re-scoring the deterministic arm by finding kind (as `scripts/regression_eval.py` does) is a follow-up before E5 numbers are cited externally.
 
+**Re-score done (2026-10-23; post hoc, $0).** Each deterministic finding was re-scored by finding kind plus an anchor. A finding counts if all three hold:
+1. its kind is expected for the defect's class (`regression_eval.EXPECTED_KINDS`);
+2. it names the defect's file, column or claim id;
+3. the identical finding does not also appear on the clean variant.
+
+The third condition was needed: without it, two natural `numeric_drift_extreme` findings on `results.md` matched planted prose numbers and also fired on clean inputs.
+
+| | Lexical v2 | Kind + anchor (∪ v2) |
+|---|---|---|
+| deterministic recall | 13/54 | 14/54 (+1 inverted CI, `ci_degenerate`) |
+| deterministic unique | 5 | 5 |
+| union of all arms | 40/54 | 40/54 |
+
+The other arms' unique counts are unchanged. **No E5 decision changes.** The caveat above overstated the effect for real fixtures: the under-crediting is large on the synthetic positive control (where the regression eval uses kind matching) but small here.
+
