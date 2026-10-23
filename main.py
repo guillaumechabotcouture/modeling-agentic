@@ -1044,7 +1044,9 @@ def _run_self_test() -> int:
         ok(harness_scripts_run('R=runs/x && nohup sh -c "python3 scripts/propagate_uncertainty.py $R --n-draws 225; '
                                'echo UQDONE exit=\\$?" > $R/uq_run.log 2>&1 &')
            == (["propagate_uncertainty.py"], True)
-           and harness_scripts_run("bash -c 'echo scripts/compare_models.py'")[0] == [],
+           and harness_scripts_run("bash -c 'echo scripts/compare_models.py'")[0] == []
+           and harness_scripts_run("bash /dev/null -c 'python3 scripts/propagate_uncertainty.py runs/x'")[0] == []
+           and harness_scripts_run("bash -lc 'python3 scripts/compare_models.py runs/x'")[0] == ["compare_models.py"],
            "IC1d a producer inside sh -c / bash -c is recognized (E7); a mention is not")
         ig.on_pre("c1", "Bash", {"command": 'p=u.yaml; printf f > "$p"; # scripts/propagate_uncertainty.py'}, "modeler")
         w("uncertainty_report.yaml", "n: forged\n")

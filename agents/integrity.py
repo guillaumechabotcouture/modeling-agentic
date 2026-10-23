@@ -126,12 +126,22 @@ def harness_scripts_run(command: str, cwd: str | None = None, _depth: int = 0
             if os.path.basename(toks[0]) == "nohup":
                 background = True
             toks = toks[1:]
-        if toks and os.path.basename(toks[0]) in _SHELLS and "-c" in toks[1:-1] and _depth < 3:
+        if toks and os.path.basename(toks[0]) in _SHELLS and _depth < 3:
             # `nohup sh -c "python3 scripts/x.py …; echo DONE" &` (seen in E7):
-            # the producer runs inside the shell string.
-            inner, bg = harness_scripts_run(toks[toks.index("-c") + 1], base, _depth + 1)
-            found += inner
-            background = background or bg
+            # the producer runs inside the shell string — but only when -c
+            # (or a cluster like -lc) comes before any script operand or `--`;
+            # in `bash /dev/null -c '…'` the string never runs (Codex, PR #17).
+            cmd_str = None
+            for j, t in enumerate(toks[1:], 1):
+                if t == "--" or not t.startswith("-"):
+                    break
+                if not t.startswith("--") and "c" in t[1:]:
+                    cmd_str = toks[j + 1] if j + 1 < len(toks) else None
+                    break
+            if cmd_str is not None:
+                inner, bg = harness_scripts_run(cmd_str, base, _depth + 1)
+                found += inner
+                background = background or bg
             continue
         if len(toks) < 2 or not re.fullmatch(r"python[\d.]*", os.path.basename(toks[0])):
             continue
