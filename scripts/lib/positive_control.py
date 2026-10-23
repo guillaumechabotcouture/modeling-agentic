@@ -281,6 +281,16 @@ def _critique(reviewer: str, prefix: str, round_n: int) -> dict:
 # Builder
 # --------------------------------------------------------------------------- #
 
+def _builder():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "build_claims_ledger",
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "build_claims_ledger.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def build(run_dir: str, round_n: int = 2) -> dict:
     """Populate `run_dir` with an honest, complete run. Returns a small
     summary dict (funded districts, totals) for assertions."""
@@ -624,37 +634,36 @@ def build(run_dir: str, round_n: int = 2) -> dict:
 
     # --- claims ledger + report (rendered by render_claims) ----------------
     so = uq["scalar_outputs"]
-    _w(run_dir, "models/claims_ledger.yaml", {"claims": [
-        {"id": "dalys_total", "claim_kind": "scalar",
-         "value": round(so["total_dalys_averted"]["mean"], 1),
-         "units": "DALYs_per_year",
-         "ci_low": round(so["total_dalys_averted"]["ci_low"], 1),
-         "ci_high": round(so["total_dalys_averted"]["ci_high"], 1),
+    # Phase 22 γ: the analyst writes the spec (no values); the ledger is built.
+    _w(run_dir, "models/claims_spec.yaml", {"claims": [
+        {"id": "dalys_total", "claim_kind": "scalar", "units": "DALYs_per_year",
          "source_artifact": "uncertainty_report.yaml",
          "source_field": "scalar_outputs.total_dalys_averted.mean",
          "causal_label": "MODEL_ESTIMATE", "confidence": "MEDIUM"},
-        {"id": "spend", "claim_kind": "currency", "value": round(spent, 2),
-         "units": "USD",
+        {"id": "spend", "claim_kind": "currency", "units": "USD",
          "source_artifact": "models/allocation.csv",
          "source_field": "cost.sum() where allocated=True",
          "causal_label": "BY_CONSTRUCTION", "confidence": "HIGH"},
-        {"id": "budget", "claim_kind": "currency", "value": mod.BUDGET,
+        {"id": "budget", "claim_kind": "currency",
          "units": "USD", "source_artifact": "models/model_outputs.yaml",
          "source_field": "budget",
          "causal_label": "BY_CONSTRUCTION", "confidence": "HIGH"},
-        {"id": "n_funded", "claim_kind": "count", "value": len(funded),
+        {"id": "n_funded", "claim_kind": "count",
          "units": "districts", "source_artifact": "models/model_outputs.yaml",
          "source_field": "n_funded",
          "causal_label": "BY_CONSTRUCTION", "confidence": "HIGH"},
-        {"id": "n_units", "claim_kind": "count", "value": n,
+        {"id": "n_units", "claim_kind": "count",
          "units": "districts", "source_artifact": "models/model_outputs.yaml",
          "source_field": "n_units",
          "causal_label": "BY_CONSTRUCTION", "confidence": "HIGH"},
-        {"id": "sens_verdict", "claim_kind": "label", "value": sens_verdict,
+        {"id": "sens_verdict", "claim_kind": "label",
          "source_artifact": "models/sensitivity_analysis.yaml",
          "source_field": "verdict",
          "causal_label": "MODEL_ESTIMATE", "confidence": "MEDIUM"},
     ]})
+    _, spec_errors = _builder().write(run_dir)
+    if spec_errors:
+        raise RuntimeError(f"positive-control claims spec invalid: {spec_errors}")
     _w(run_dir, "report.md", textwrap.dedent("""\
         # District vaccination campaign allocation
 

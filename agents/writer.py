@@ -88,8 +88,9 @@ For EACH dataset (from data_quality.md):
 
 ## Claim References (Phase 18 α — REQUIRED)
 
-The analyst produces `models/claims_ledger.yaml` with every quantitative
-or categorical claim that may appear in the report. **You MUST reference
+`models/claims_ledger.yaml` holds every quantitative or categorical claim
+that may appear in the report (built by a script from the analyst's
+`models/claims_spec.yaml`; each value is read from its source artifact). **You MUST reference
 each such claim by its ID using `[CLAIM:claim_id]` syntax** — the
 post-write `scripts/render_claims.py` substitutes the ID with the
 formatted value. Do NOT write literal numbers, percentages, currency
@@ -133,7 +134,7 @@ Do NOT add the number directly to the report. Instead:
 2. Re-read `models/claims_ledger.yaml` to confirm it's truly absent.
 3. If absent: emit a TODO comment in `report.md` noting the missing
    claim ID, and continue drafting the rest. The lead will route the
-   missing-claim list back to the analyst for ledger amendment.
+   missing-claim list back to the analyst to add to the claims spec.
 
 ## CRITICAL: Presentation Standards
 - Every figure MUST be embedded using markdown image syntax:

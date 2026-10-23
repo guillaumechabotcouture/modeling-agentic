@@ -63,6 +63,8 @@ SCRIPT_OUTPUTS = (
     "critique_crossmodel.yaml.tmp",
     "critique_crossmodel.md",
     "models/eligibility_probe.yaml",  # scripts/eligibility_probe.py
+    "models/claims_ledger.yaml",      # Phase 22 γ: scripts/build_claims_ledger.py
+    "claims_ledger.yaml",
     "report.md",          # produced by scripts/render_claims.py
     # Written by main.py itself (plain Python, not a tool call). The
     # validator reads the research question from metadata.json, so an

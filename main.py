@@ -979,6 +979,14 @@ def _run_self_test() -> int:
        and "METHODS CRITIC" not in build_lead_prompt("q", "runs/x", 5, "")
        and "Spawn ALL THREE critique agents" in LEAD_SYSTEM_PROMPT,
        "MC1 methods critic lead prompt gating")
+    # CS1 (Phase 22 γ): the ledger is built by a script; agents write the spec.
+    ok(enforcement.check_tool_use("Write", {"file_path": f"{run_path}/models/claims_ledger.yaml"},
+                                  run_path, "analyst", set()) is not None
+       and enforcement.check_tool_use("Write", {"file_path": f"{run_path}/models/claims_spec.yaml"},
+                                      run_path, "analyst", set()) is None
+       and enforcement.check_tool_use("Bash", {"command": f"python3 scripts/build_claims_ledger.py {run_path}"},
+                                      run_path, "analyst", set()) is None,
+       "CS1 claims ledger script-produced; spec writable; builder runnable")
     ok(enforcement.check_tool_use("Write", {"file_path": f"{run_path}/critique_crossmodel.yaml"},
                                   run_path, "critique-redteam", set(reg)) is not None,
        "XM2 critique_crossmodel.yaml writable by an agent")

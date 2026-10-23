@@ -49,9 +49,14 @@ deeper.
      (the validator's `_check_claims_ledger_present` enforces this,
      but you should sanity-check semantically: is `value` actually
      near the center of `[ci_low, ci_high]`, or suspiciously off?)
-   - `source_field` references resolve in the named `source_artifact`.
-     E.g., a claim citing `uncertainty_report.yaml::scalar_outputs.X.mean`
-     — open that yaml and confirm the path exists and the value matches.
+   - **Each claim points at the right quantity.** Since Phase 22 γ the
+     values are read from `source_artifact::source_field` by a script
+     (`models/claims_spec.yaml` → `scripts/build_claims_ledger.py`), so a
+     value can no longer be mistyped — but it can be read from the wrong
+     field: the base scenario instead of the optimized one, all-ages
+     instead of the eligible group, a draft artifact instead of the final
+     one. Compare each headline claim's `related_text` with the field it
+     cites, and open the artifact when they could disagree.
    - `causal_label` is honest: a claim sourced from
      `external` literature should be `BY_CONSTRUCTION`, not `CAUSAL`;
      a claim from a calibrated model output should be `PROXY` or

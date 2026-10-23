@@ -2,8 +2,8 @@
 
 The writer drafts `report.md` using `[CLAIM:claim_id]` references for
 every numeric / percentage / currency / count / verdict-label / citation
-claim. This script reads `models/claims_ledger.yaml` (produced by the
-analyst), looks up each referenced claim, formats it, and substitutes
+claim. This script reads `models/claims_ledger.yaml`, looks up each
+referenced claim, formats it, and substitutes
 the rendered string back into `report.md`. Free prose is preserved.
 
 Why this exists
@@ -13,6 +13,10 @@ survived to ACCEPT (R-019 verdict mismatch, R-020 LGA count drift,
 $197M cost conflation). The coherence auditor catches drift after
 the fact; the claims ledger PREVENTS drift structurally — the writer
 cannot re-narrate a number that doesn't exist in the ledger.
+
+Phase 22 γ: when `models/claims_spec.yaml` exists, the ledger is first
+rebuilt from it (scripts/build_claims_ledger.py), so every rendered
+number is read from its source artifact at render time.
 
 Usage
 -----
@@ -345,6 +349,16 @@ def render_text(text: str, claims: dict[str, dict]) -> tuple[str, list[str]]:
     return new_text, unresolved
 
 
+def _builder():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "build_claims_ledger", os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                            "build_claims_ledger.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def render_run(run_dir: str) -> dict:
     """Render report.md in-place using the run's claims ledger.
 
@@ -361,7 +375,8 @@ def render_run(run_dir: str) -> dict:
     if not os.path.exists(report_path):
         return {"ok": False, "error": f"report.md not found at {report_path}",
                 "n_refs": 0, "n_unresolved": 0, "unresolved_ids": []}
-    if not os.path.exists(ledger_path):
+    if not os.path.exists(ledger_path) and not os.path.exists(
+            os.path.join(run_dir, "models", "claims_spec.yaml")):
         return {"ok": False,
                 "error": f"claims_ledger.yaml not found at {ledger_path}",
                 "n_refs": 0, "n_unresolved": 0, "unresolved_ids": []}
@@ -378,6 +393,11 @@ def render_run(run_dir: str) -> dict:
                 "unresolved_ids": [], "snapshot_path": None,
                 "report_path": report_path}
 
+    if os.path.exists(os.path.join(run_dir, "models", "claims_spec.yaml")):
+        _, spec_errors = _builder().write(run_dir)
+        if spec_errors:
+            return {"ok": False, "error": "claims_spec.yaml: " + "; ".join(spec_errors[:5]),
+                    "n_refs": n_refs, "n_unresolved": 0, "unresolved_ids": []}
     claims = load_claims(ledger_path)
 
     # Snapshot the writer's draft before substitution.
@@ -658,6 +678,26 @@ def _self_test() -> int:
             ok(f.read() == draft, "T16: report.md must stay the draft")
         with open(os.path.join(d, "report.unrendered.md")) as f:
             ok(f.read() == draft, "T16: snapshot must stay the draft")
+
+    # T17 (Phase 22 γ): with a claims spec, the rendered number comes from
+    # the source artifact, even when a stale ledger file says otherwise.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "models", "out.yaml"), "w") as f:
+            yaml.safe_dump({"n_units": 208}, f)
+        with open(os.path.join(d, "models", "claims_spec.yaml"), "w") as f:
+            yaml.safe_dump({"claims": [{"id": "n", "claim_kind": "count",
+                                        "source_artifact": "models/out.yaml",
+                                        "source_field": "n_units"}]}, f)
+        with open(os.path.join(d, "models", "claims_ledger.yaml"), "w") as f:
+            yaml.safe_dump({"claims": [{"id": "n", "claim_kind": "count", "value": 150}]}, f)
+        with open(os.path.join(d, "report.md"), "w") as f:
+            f.write("We fund [CLAIM:n] units.\n")
+        r = render_run(d)
+        with open(os.path.join(d, "report.md")) as f:
+            body = f.read()
+        ok(r["ok"] and "208" in body and "150" not in body,
+           f"T17: spec-built ledger wins over a stale file ({r}, {body!r})")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)

@@ -3651,6 +3651,22 @@ def _check_claims_ledger_present(run_dir: str,
     yaml_path = artifact_path("claims_ledger", run_dir)
     out: list[dict] = []
 
+    # Phase 22 γ: with a claims spec the ledger is derived, not written —
+    # rebuild it and compare instead of trusting the file.
+    if os.path.exists(os.path.join(run_dir, "models", "claims_spec.yaml")):
+        return _claims_spec_violations(run_dir, yaml_path)
+
+    if os.path.exists(yaml_path) and round_n is not None and round_n >= 2:
+        out.append({
+            "kind": "claims_spec_missing",
+            "severity": "MEDIUM",
+            "stage": "ANALYZE",
+            "claim": ("`models/claims_ledger.yaml` was written by hand: there is no "
+                      "`models/claims_spec.yaml`. Write the spec (claims without "
+                      "values) and run `python3 scripts/build_claims_ledger.py "
+                      "{run_dir}` so every number is read from its source artifact."),
+        })
+
     if not os.path.exists(yaml_path):
         if round_n is None or round_n < 2:
             return []
@@ -3727,6 +3743,61 @@ def _check_claims_ledger_present(run_dir: str,
 
 
 _PROVENANCE_PER_KIND_CAP = 5
+
+
+def _capped(kind: str, items: list[str], claim_head: str, stage: str = "ANALYZE") -> list[dict]:
+    """One HIGH per item up to the cap, then one HIGH naming the rest."""
+    out = [{"kind": kind, "severity": "HIGH", "stage": stage, "scope_declarable": False,
+            "claim": f"{claim_head}{it}"} for it in items[:_PROVENANCE_PER_KIND_CAP]]
+    if len(items) > _PROVENANCE_PER_KIND_CAP:
+        out.append({"kind": kind, "severity": "HIGH", "stage": stage, "scope_declarable": False,
+                    "claim": (f"{len(items) - _PROVENANCE_PER_KIND_CAP} more: "
+                              + "; ".join(i[:160] for i in items[_PROVENANCE_PER_KIND_CAP:]))})
+    return out
+
+
+def _claims_spec_violations(run_dir: str, ledger_path: str) -> list[dict]:
+    """Phase 22 γ: build the ledger from models/claims_spec.yaml.
+
+      claims_spec_invalid      HIGH  spec unparseable, duplicate ids, a typed
+                                     value on a model-derived claim
+      claim_source_unresolved  HIGH  a claim whose number is in no artifact
+      claims_ledger_stale      HIGH  the ledger file differs from a fresh
+                                     build (sources re-run, or hand-edited)
+    All non-declarable: the fix is always to correct the spec or re-run
+    scripts/build_claims_ledger.py.
+    """
+    builder = _load_sibling("build_claims_ledger")
+    doc, errors = builder.build(run_dir)
+    out = _capped("claims_spec_invalid", errors, "models/claims_spec.yaml: ")
+    if doc is None:
+        return out
+    out += _capped("claim_source_unresolved",
+                   [f"[{u['id']}] {u['reason']}" for u in doc["unresolved"]], "")
+    if not doc["claims"] and not doc["unresolved"]:
+        out.append({"kind": "claims_ledger_invalid", "severity": "HIGH", "stage": "ANALYZE",
+                    "claim": "models/claims_spec.yaml lists zero claims."})
+        return out
+    run = f"Run `python3 scripts/build_claims_ledger.py {{run_dir}}`."
+    if not os.path.exists(ledger_path):
+        out.append({"kind": "claims_ledger_stale", "severity": "HIGH", "stage": "ANALYZE",
+                    "scope_declarable": False,
+                    "claim": f"models/claims_spec.yaml exists but the ledger was never built. {run}"})
+        return out
+    try:
+        with open(ledger_path, encoding="utf-8") as f:
+            on_disk = yaml.safe_load(f)
+    except (OSError, yaml.YAMLError) as e:
+        on_disk = f"unreadable: {e}"
+    probs = builder.compare(on_disk, doc)
+    if probs:
+        out.append({"kind": "claims_ledger_stale", "severity": "HIGH", "stage": "ANALYZE",
+                    "scope_declarable": False,
+                    "claim": (f"models/claims_ledger.yaml differs from a fresh build "
+                              f"({len(probs)} difference(s): {'; '.join(probs[:10])}). "
+                              f"Sources changed after the build, or the file was "
+                              f"edited. {run}")})
+    return out
 
 
 def _ledger_provenance_violations(ledger_path: str, run_dir: str) -> list[dict]:
@@ -7466,7 +7537,9 @@ def _run_self_test() -> int:
             _yaml.safe_dump({"verdict": "ROBUST", "total": {
                 "mean": 100, "ci_low": 80, "ci_high": 120}}, f)
         v = _check_claims_ledger_present(_d, round_n=3)
-        ok(v == [], f"CL4: well-formed sourced ledger should be silent, got {v}")
+        ok([x["kind"] for x in v] == ["claims_spec_missing"]
+           and v[0]["severity"] == "MEDIUM",
+           f"CL4: well-formed hand-written ledger → only the spec advisory, got {v}")
 
         # CL7 (Phase 21 β): ledger value contradicts its cited artifact
         # (235631 class) → HIGH claim_source_mismatch / claim_ci_mismatch,
@@ -7474,7 +7547,8 @@ def _run_self_test() -> int:
         with open(os.path.join(_d, "models", "out.yaml"), "w") as f:
             _yaml.safe_dump({"verdict": "SENSITIVE", "total": {
                 "mean": 100, "ci_low": 100, "ci_high": 100}}, f)
-        v = _check_claims_ledger_present(_d, round_n=3)
+        v = [x for x in _check_claims_ledger_present(_d, round_n=3)
+             if x["kind"] != "claims_spec_missing"]
         kinds = sorted(x["kind"] for x in v)
         ok(kinds == ["claim_ci_mismatch", "claim_ci_mismatch",
                      "claim_source_mismatch"]
@@ -7488,6 +7562,39 @@ def _run_self_test() -> int:
             v = _check_claims_ledger_present(_d, round_n=rn)
             ok(sorted(x["kind"] for x in v) == kinds,
                f"CL8: round {rn} must still check an existing ledger, got {v}")
+        # CL9-CL12 (Phase 22 γ): with a claims spec the ledger is rebuilt and
+        # compared, never trusted.
+        _spec = {"claims": [
+            {"id": "a", "claim_kind": "scalar", "source_artifact": "models/out.yaml",
+             "source_field": "total.mean"},
+            {"id": "b", "claim_kind": "label", "source_artifact": "models/out.yaml",
+             "source_field": "verdict"}]}
+        with open(os.path.join(_d, "models", "claims_spec.yaml"), "w") as f:
+            _yaml.safe_dump(_spec, f)
+        v = _check_claims_ledger_present(_d, round_n=3)
+        ok([x["kind"] for x in v] == ["claims_ledger_stale"],
+           f"CL9: hand-written ledger vs spec build → stale, got {v}")
+        _builder = _load_sibling("build_claims_ledger")
+        _builder.write(_d)
+        v = _check_claims_ledger_present(_d, round_n=1)
+        ok(v == [], f"CL10: freshly built ledger is silent, got {v}")
+        with open(os.path.join(_d, "models", "out.yaml"), "w") as f:
+            _yaml.safe_dump({"verdict": "ROBUST", "total": {
+                "mean": 140, "ci_low": 100, "ci_high": 180}}, f)
+        v = _check_claims_ledger_present(_d, round_n=1)
+        ok([x["kind"] for x in v] == ["claims_ledger_stale"]
+           and is_non_declarable(v[0]["kind"], v[0].get("scope_declarable")),
+           f"CL11: source re-run after build → stale, non-declarable, got {v}")
+        _spec["claims"][0]["value"] = 140
+        _spec["claims"].append({"id": "c", "claim_kind": "scalar",
+                                "source_artifact": "models/out.yaml",
+                                "source_field": "weighted average by zone"})
+        with open(os.path.join(_d, "models", "claims_spec.yaml"), "w") as f:
+            _yaml.safe_dump(_spec, f)
+        _builder.write(_d)
+        kinds12 = sorted(x["kind"] for x in _check_claims_ledger_present(_d, round_n=1))
+        ok(kinds12 == ["claim_source_unresolved", "claims_spec_invalid"],
+           f"CL12: typed value + unresolvable field, got {kinds12}")
 
     with _tempfile.TemporaryDirectory() as _d:
         # CL5: CI bounds violated → HIGH claims_ledger_ci_violated
@@ -8416,7 +8523,7 @@ def _run_self_test() -> int:
                     ("zero_width_ci", _zero_width, "ci_degenerate"),
                     ("renamed_verdict", _renamed_verdict,
                      "model_comparison_formal_unknown_verdict"),
-                    ("ledger_off_10pct", _ledger_off, "claim_source_mismatch")):
+                    ("ledger_off_10pct", _ledger_off, "claims_ledger_stale")):
                 md = _mutant(name, mutate)
                 for cur in (2, 8):
                     _pc.set_round(md, cur)

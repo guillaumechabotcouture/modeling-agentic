@@ -366,6 +366,71 @@ def _f(kind: str, claim: str) -> dict:
             "claim": claim, "scope_declarable": False}
 
 
+class ClaimUnresolved(Exception):
+    """A claim's source cannot be resolved. `path` is the artifact when it
+    exists (so callers can still search it), else None."""
+
+    def __init__(self, msg: str, path: Optional[str] = None):
+        super().__init__(msg)
+        self.path = path
+
+
+def resolve_claim(c: dict, run_dir: str, cache: Optional[dict] = None
+                  ) -> tuple[Any, Optional[tuple[Any, Any]]]:
+    """Resolve one non-external claim to (point, (ci_low, ci_high) | None).
+
+    Shared by check_ledger_provenance (verify a hand-written ledger) and
+    scripts/build_claims_ledger.py (derive the ledger from a spec, so the
+    numbers are never typed by an agent). Raises ClaimUnresolved.
+    """
+    cache = {} if cache is None else cache
+    src, field = c.get("source_artifact"), c.get("source_field")
+    if not src or field in (None, ""):
+        raise ClaimUnresolved(
+            "has no source_artifact/source_field; every model-derived claim "
+            "must cite the artifact field that holds it (or `source_artifact: "
+            "external` for literature values).")
+    path = _resolve_artifact_path(run_dir, str(src))
+    if path is None:
+        raise ClaimUnresolved(f"source_artifact `{src}` does not exist in the run.")
+    field = str(field)
+    try:
+        ext = os.path.splitext(path)[1].lower()
+        if ext in (".yaml", ".yml", ".json"):
+            if path not in cache:
+                cache[path] = _load_structured(path)
+            doc = cache[path]
+            resolved = resolve_dotpath(doc, field)
+            point, ci = _split_point_ci(resolved, doc, field)
+            ci_field = c.get("ci_source_field")
+            if ci_field:
+                node = resolve_dotpath(doc, str(ci_field))
+                if isinstance(node, dict):
+                    ci = _ci_from_mapping(node)
+                elif isinstance(node, (list, tuple)) and len(node) == 2:
+                    ci = (node[0], node[1])
+                else:
+                    raise _Unresolved(f"ci_source_field {ci_field!r} is not a CI")
+        elif ext == ".csv":
+            point, ci = _csv_aggregate(path, field), None
+        elif ext == ".py":
+            point, ci = _py_constant(path, field), None
+        else:
+            raise _Unresolved(f"unsupported source type {ext!r}")
+    except _Unresolved as e:
+        raise ClaimUnresolved(
+            f"source_field {field!r} in `{src}` cannot be resolved: {e}. "
+            f"Use a machine-resolvable field path.", path) from None
+    except (OSError, UnicodeDecodeError, yaml.YAMLError, ValueError,
+            SyntaxError, csv.Error) as e:
+        raise ClaimUnresolved(f"`{src}` could not be read: {type(e).__name__}: {e}") from None
+    if point is _MISSING:
+        raise ClaimUnresolved(
+            f"`{src}::{field}` is a mapping with no {'/'.join(_POINT_KEYS)} key "
+            f"to compare against.", path)
+    return point, ci
+
+
 def check_ledger_provenance(ledger: Any, run_dir: str,
                             rel_tol: float = DEFAULT_REL_TOL,
                             abs_tol: float = DEFAULT_ABS_TOL) -> dict:
@@ -394,75 +459,24 @@ def check_ledger_provenance(ledger: Any, run_dir: str,
         if is_external(src):
             n_external += 1
             continue
-        if not src or field in (None, ""):
-            findings.append(_f(
-                "claim_source_unresolved",
-                f"[{cid}] has no source_artifact/source_field; every model-"
-                f"derived claim must cite the artifact field that holds it "
-                f"(or `source_artifact: external` for literature values)."))
-            continue
-        path = _resolve_artifact_path(run_dir, str(src))
-        if path is None:
-            findings.append(_f(
-                "claim_source_unresolved",
-                f"[{cid}] source_artifact `{src}` does not exist in the run."))
-            continue
-        field = str(field)
         try:
-            ext = os.path.splitext(path)[1].lower()
-            if ext in (".yaml", ".yml", ".json"):
-                if path not in cache:
-                    cache[path] = _load_structured(path)
-                doc = cache[path]
-                resolved = resolve_dotpath(doc, field)
-                point, ci = _split_point_ci(resolved, doc, field)
-                ci_field = c.get("ci_source_field")
-                if ci_field:
-                    node = resolve_dotpath(doc, str(ci_field))
-                    if isinstance(node, dict):
-                        ci = _ci_from_mapping(node)
-                    elif isinstance(node, (list, tuple)) and len(node) == 2:
-                        ci = (node[0], node[1])
-                    else:
-                        raise _Unresolved(
-                            f"ci_source_field {ci_field!r} is not a CI")
-            elif ext == ".csv":
-                point, ci = _csv_aggregate(path, field), None
-            elif ext == ".py":
-                point, ci = _py_constant(path, field), None
-            else:
-                raise _Unresolved(f"unsupported source type {ext!r}")
-        except _Unresolved as e:
+            point, ci = resolve_claim(c, run_dir, cache)
+        except ClaimUnresolved as e:
             # The path can't be followed, but the number can still be looked
             # for: a value absent from its whole cited artifact is a
             # mismatch, not just an unverifiable claim.
-            found = value_in_artifact(path, c.get("value"), kind, rel_tol)
+            found = value_in_artifact(e.path, c.get("value"), kind, rel_tol) if e.path else None
             if found is False:
                 findings.append(_f(
                     "claim_value_not_in_source",
                     f"[{cid}] ledger value {c.get('value')!r} appears nowhere in "
-                    f"`{src}` (source_field {field!r} cannot be resolved: {e}). "
-                    f"Correct the value or cite the artifact that holds it."))
+                    f"`{src}` ({e}). Correct the value or cite the artifact that "
+                    f"holds it."))
             else:
-                findings.append(_f(
-                    "claim_source_unresolved",
-                    f"[{cid}] source_field {field!r} in `{src}` cannot be "
-                    f"resolved: {e}. Use a machine-resolvable field path."))
-            continue
-        except (OSError, UnicodeDecodeError, yaml.YAMLError, ValueError,
-                SyntaxError, csv.Error) as e:
-            findings.append(_f(
-                "claim_source_unresolved",
-                f"[{cid}] `{src}` could not be read: {type(e).__name__}: {e}"))
+                findings.append(_f("claim_source_unresolved", f"[{cid}] {e}"))
             continue
 
         n_checked += 1
-        if point is _MISSING:
-            findings.append(_f(
-                "claim_source_unresolved",
-                f"[{cid}] `{src}::{field}` is a mapping with no "
-                f"{'/'.join(_POINT_KEYS)} key to compare against."))
-            continue
         if not values_match(c.get("value"), point, kind, rel_tol, abs_tol):
             findings.append(_f(
                 "claim_source_mismatch",

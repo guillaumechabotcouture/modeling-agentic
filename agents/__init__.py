@@ -925,8 +925,9 @@ After report.md is written and BEFORE writer-QA / coherence audit, run:
 python3 scripts/render_claims.py {run_dir}
 ```
 
-This reads `{run_dir}/models/claims_ledger.yaml` (produced by the
-analyst at STAGE 5) and substitutes every `[CLAIM:claim_id]` reference
+This rebuilds `{run_dir}/models/claims_ledger.yaml` from the analyst's
+`models/claims_spec.yaml` (values read from the source artifacts) and
+substitutes every `[CLAIM:claim_id]` reference
 in `report.md` with the rendered value (e.g., `7.47M (95% CI: 5.14M-
 10.42M)` for a scalar with CI; `52.5%` for a percentage; `ROBUST` for
 a verdict label). The writer's draft is preserved as
