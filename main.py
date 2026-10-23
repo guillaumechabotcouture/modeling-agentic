@@ -973,14 +973,31 @@ def _run_self_test() -> int:
         w("report.md", "draft\n")
         ok(ig5.on_post("c5") == [], "IC5 writer carve-out covers its Bash too")
         # IC6: a background script that finishes between hooks is still explained once
+        alive = {"v": {"propagate_uncertainty.py"}}
+        ig5._process_check = lambda: alive["v"]
         ig5.on_pre("c6", "Bash", {"command": f"nohup python3 scripts/propagate_uncertainty.py {td} > log 2>&1 &"}, "modeler")
-        ig5.on_post("c6")
+        ig5.on_post("c6")            # launch scan: seen alive → grant kept
+        alive["v"] = set()           # it then finishes before the next hook
         w("uncertainty_report.yaml", "n: final\n")
         ok(ig5.on_post("poll") == [], "IC6 background grant explains the output after the process ended")
         w("uncertainty_report.yaml", "n: forged later\n")
         ig5.on_post("poll2")
         ok(any(e["file"] == "uncertainty_report.yaml" for e in ig5.events),
            "IC6b the grant expires once the process has been seen finished")
+        # IC6c (Codex): a background launch that never ran grants nothing
+        ig6 = ArtifactIntegrity(td, process_check=lambda: set())
+        ig6.on_pre("c6c", "Bash", {"command": f"true || nohup python3 scripts/propagate_uncertainty.py {td} &"}, "modeler")
+        ig6.on_post("c6c")
+        ig6.on_pre("c6d", "Bash", {"command": 'p=uncertainty_report.yaml; printf x > "$p"'}, "modeler")
+        w("uncertainty_report.yaml", "n: forged via dead grant\n")
+        ok([e["file"] for e in ig6.on_post("c6d")] == ["uncertainty_report.yaml"],
+           "IC6c a never-started background launch leaves no grant")
+        # IC6d (Codex): `cd <repo> && python3 scripts/x.py` from another cwd is recognized;
+        # a sibling run's process does not count
+        ok(harness_scripts_run(f"cd {REPO_ROOT} && python3 scripts/coherence_audit.py {td}", cwd=td)[0]
+           == ["coherence_audit.py"]
+           and harness_scripts_run("cd $X && python3 scripts/coherence_audit.py r", cwd=td)[0] == [],
+           "IC6d script resolution follows cd; unknown cd authorizes nothing")
         # IC7: a tool whose PostToolUse never came still explains its output at finalize
         ig7 = ArtifactIntegrity(td, process_check=lambda: set())
         ig7.on_pre("c7", "Bash", {"command": f"python3 scripts/coherence_audit.py {td}; false"}, "lead-ish")

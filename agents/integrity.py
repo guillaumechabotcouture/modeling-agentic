@@ -97,9 +97,18 @@ def harness_scripts_run(command: str, cwd: str | None = None) -> tuple[list[str]
     arguments do not count (Codex review of PR #15)."""
     import shlex
     found, background = [], False
-    base = cwd or enforcement.REPO_ROOT
+    base: str | None = cwd or enforcement.REPO_ROOT
+    stack: list[str | None] = []
     for seg in enforcement._shell_tokens(command):
-        if seg in ("(", ")"):
+        if seg == "(":
+            stack.append(base)
+            continue
+        if seg == ")":
+            base = stack.pop() if stack else base
+            continue
+        is_cd, new = enforcement._cd_target(seg, base)
+        if is_cd:
+            base = new                   # None: unknown destination
             continue
         try:
             toks = shlex.split(seg)
@@ -115,7 +124,10 @@ def harness_scripts_run(command: str, cwd: str | None = None) -> tuple[list[str]
         script = next((t for t in toks[1:] if not t.startswith("-")), None)
         if not script:
             continue
-        real = os.path.realpath(os.path.join(base, os.path.expanduser(script)))
+        script = os.path.expanduser(script)
+        if base is None and not os.path.isabs(script):
+            continue                     # relative script after `cd $X`: can't resolve
+        real = os.path.realpath(os.path.join(base or "", script))
         if os.path.dirname(real) == _SCRIPTS_DIR and os.path.basename(real) in SCRIPT_PRODUCES:
             found.append(os.path.basename(real))
     if re.search(r"(?<![&>|])&(?![&>])\s*(?:$|[;\n)])", command):
@@ -137,8 +149,10 @@ def _live_harness_scripts(run_path: str) -> set[str]:
     try:
         for p in psutil.process_iter(["cmdline", "cwd"]):
             argv = p.info.get("cmdline") or []
-            if not argv or not any(run_abs in a or a.rstrip("/") == run_rel or run_rel + "/" in a
-                                   for a in argv):
+            def _is_this_run(a: str) -> bool:
+                a = a.rstrip("/")
+                return any(a == r or a.startswith(r + "/") for r in (run_abs, run_rel))
+            if not argv or not any(_is_this_run(a) for a in argv):
                 continue
             for a in argv[1:]:
                 real = os.path.realpath(os.path.join(p.info.get("cwd") or enforcement.REPO_ROOT, a))
@@ -265,8 +279,13 @@ class ArtifactIntegrity:
         keep = []
         for g in self.grants:
             if not g["armed"]:
-                g["armed"] = True        # the launching call's own scan: too early to judge
-                keep.append(g)
+                # The launching call's own scan. Alive → the grant covers its
+                # later writes. Not alive → it never ran (`true || nohup … &`)
+                # or already finished, and its writes so far were covered by
+                # the launching call's intent: drop the grant (Codex, PR #15).
+                g["armed"] = True
+                if g["scripts"] & live:
+                    keep.append(g)
             elif g["scripts"] & live:
                 g["seen_dead"] = False
                 keep.append(g)
