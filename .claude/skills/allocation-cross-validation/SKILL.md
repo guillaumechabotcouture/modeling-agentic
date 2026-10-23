@@ -1,13 +1,12 @@
 ---
 name: allocation-cross-validation
-description: Phase 6 Commit κ requirement. When a model produces an
-  allocation, the allocation rule itself must be cross-validated
-  under spatial holdout — not just the underlying calibration. A
-  k-fold leave-one-archetype-out test answers "would my optimizer's
-  recommended package for archetype A change if I had calibrated on
-  the other 21 archetypes only?" Without this test, the optimization
-  may have over-fit to specific in-sample EIRs. Trigger phrases
-  include "allocation cross-validation", "leave-one-archetype-out",
+description: >-
+  Required when a model produces an allocation: the allocation rule itself
+  must be cross-validated under holdout, not just the calibration. A
+  leave-one-unit-out (or leave-one-archetype-out) test asks whether the
+  recommended intervention for a unit changes when that unit is excluded from
+  calibration; without it the optimizer may over-fit in-sample values. Trigger
+  phrases include "allocation cross-validation", "leave-one-archetype-out",
   "allocation generalizes", "allocation robustness", "spatial holdout".
 ---
 
@@ -16,18 +15,19 @@ description: Phase 6 Commit κ requirement. When a model produces an
 ## Why allocation CV is different from calibration CV
 
 Calibration cross-validation (LOO via `compare_models.py`) answers:
-"How well does my MODEL predict held-out PfPR / cases?" Allocation
+"How well does my MODEL predict held-out prevalence / cases / coverage?" Allocation
 cross-validation answers a different question: "How well does my
 OPTIMIZER's recommended allocation rule generalize to held-out
 spatial units?" These are not the same.
 
 A model can have great calibration generalization (low LOO RMSE on
-PfPR) but produce a brittle allocation rule that flips package
-choices when individual archetypes are removed. This happens when:
-- The optimizer is sensitive to small EIR differences near package-
-  switching thresholds
+the calibration target) but produce a brittle allocation rule that
+flips package choices when individual units or archetypes are removed.
+This happens when:
+- The optimizer is sensitive to small differences in a calibrated
+  transmission parameter near package-switching thresholds
 - Greedy ordering depends on the exact set of available units
-- Budget cliffs interact with archetype heterogeneity
+- Budget cliffs interact with between-unit heterogeneity
 
 A senior modeler always tests both. The Phase 6 Commit κ gate
 enforces the allocation CV.
@@ -35,18 +35,18 @@ enforces the allocation CV.
 ## The required artifact: `models/allocation_robustness.yaml`
 
 ```yaml
-holdout_method: leave-one-archetype-out  # or leave-one-state-out, k-fold, etc.
+holdout_method: leave-one-archetype-out  # or leave-one-region-out, k-fold, etc.
 n_folds: 22                              # or whatever the K is
 
 metrics:
-  # Rank correlation between full-sample LGA-level allocation budget
+  # Rank correlation between full-sample unit-level allocation budget
   # and the held-out fold's predicted allocation. Spearman or Pearson.
   rank_correlation_mean: 0.87
   rank_correlation_worst_fold: 0.78
 
   # Cases-averted at the held-out budget under the allocation predicted
   # from the n-k fold, vs. the optimal allocation for the held-out
-  # archetype. Percentage gap, mean and worst-fold.
+  # unit(s). Percentage gap, mean and worst-fold.
   cases_averted_gap_pct_mean: 4.3
   cases_averted_gap_pct_worst_fold: 8.5
 
@@ -87,8 +87,8 @@ def allocation_cross_validate(model, units, n_folds=None, k_holdout=1):
     for fold_units in iter_holdout_folds(units, n_folds, k_holdout):
         train_units = [u for u in units if u not in fold_units]
 
-        # Re-calibrate on train (or hold calibrated EIRs fixed if the
-        # design is "test allocation overfit to in-sample EIRs").
+        # Re-calibrate on train (or hold calibrated parameters fixed if
+        # the design is "test allocation overfit to in-sample values").
         train_calib = model.calibrate(train_units)
 
         # Run optimizer on train + held-out budget allocation.
@@ -102,11 +102,11 @@ def allocation_cross_validate(model, units, n_folds=None, k_holdout=1):
             metrics["rule_concordance_pct"].append(
                 100 * int(train_pkg == full_pkg))
 
-        # Rank correlation of LGA-level budget under the two allocations.
-        train_budget_per_lga = aggregate_budget(train_allocation, fold_units)
-        full_budget_per_lga = aggregate_budget(full_allocation, fold_units)
+        # Rank correlation of unit-level budget under the two allocations.
+        train_budget_per_unit = aggregate_budget(train_allocation, fold_units)
+        full_budget_per_unit = aggregate_budget(full_allocation, fold_units)
         metrics["rank_corr"].append(
-            spearmanr(train_budget_per_lga, full_budget_per_lga))
+            spearmanr(train_budget_per_unit, full_budget_per_unit))
 
         # Cases averted gap: train's allocation applied to held-out
         # vs full-sample's allocation for held-out.
@@ -123,21 +123,23 @@ def allocation_cross_validate(model, units, n_folds=None, k_holdout=1):
 | Strategy | When to use | Folds |
 |---|---|---|
 | `leave-one-archetype-out` | Few large archetypes (≤30) | n_archetypes |
-| `leave-one-state-out` | Want to test geographic generalization | n_states |
+| `leave-one-region-out` | Want to test geographic generalization (states, provinces) | n_regions |
 | `leave-one-zone-out` | Coarse spatial test (5-7 zones) | n_zones (small) |
 | `k-fold-by-archetype` | Many archetypes (>50) — k=5 or 10 | k |
 | `spatial-block-cv` | Test against contiguous blocks (geographic block CV) | k blocks |
 
-For Nigeria 22-archetype malaria: `leave-one-archetype-out` with
-n_folds=22 is the natural choice. Each fold trains on 21
-archetypes, predicts the 22nd, and measures the rule's package
-choice for that 22nd archetype.
+With, say, 22 archetypes, `leave-one-archetype-out` with n_folds=22
+is the natural choice. Each fold trains on 21 archetypes, predicts
+the 22nd, and measures the rule's package choice for that 22nd
+archetype. With fine-grained units and no archetypes (e.g., 300
+districts), use spatial-block CV so neighbouring units cannot leak
+information across folds.
 
-## Worked example: 0912's expected behavior
+## Worked example: 0912's expected behavior (national malaria allocation)
 
-For the 22-archetype Nigeria GC7 setup:
+For a 22-archetype national malaria setup:
 - Calibration uses 8 partial-pooling regression coefficients
-- Decision rule has 3 features (SMC eligibility, PfPR, resistance)
+- Decision rule has 3 features (SMC eligibility, parasite prevalence, insecticide resistance)
 - Optimization is greedy marginal CE
 
 Leave-one-archetype-out CV would likely show:
@@ -150,7 +152,7 @@ Leave-one-archetype-out CV would likely show:
 - Verdict: ROBUST or borderline-FRAGILE
 
 A FRAGILE or UNSTABLE verdict would suggest: rebuild the model with
-regularization (e.g., shrink rare-archetype EIRs toward zone mean),
+regularization (e.g., shrink rare-archetype transmission parameters toward the zone mean),
 or scope-declare the recommendation as applicable only to the
 in-sample 22 archetypes (not extrapolatable to additional archetypes).
 
@@ -160,7 +162,7 @@ in-sample 22 archetypes (not extrapolatable to additional archetypes).
    does the former; this is the latter. Both are needed.
 
 2. **Holding the calibration fixed across folds.** Some designs hold
-   calibrated EIRs fixed and only re-run the optimizer on n-k units.
+   calibrated parameters fixed and only re-run the optimizer on n-k units.
    That tests OPTIMIZER overfit but not CALIBRATION overfit. State
    explicitly which design you used in the YAML notes.
 
@@ -171,6 +173,6 @@ in-sample 22 archetypes (not extrapolatable to additional archetypes).
    if 21 of 22 archetypes generalize but archetype #22 has 50%
    concordance, the rule has a sharp boundary somewhere.
 
-5. **Wrong holdout level.** If your decision rule classifies LGAs but
-   your CV holds out states, you're testing rule generalization to
-   states (intermediate aggregation) — be explicit in the YAML.
+5. **Wrong holdout level.** If your decision rule classifies districts
+   but your CV holds out provinces, you're testing rule generalization
+   to provinces (intermediate aggregation) — be explicit in the YAML.

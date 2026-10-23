@@ -1,14 +1,13 @@
 ---
 name: model-fitness
-description: Framework for evaluating whether a model is fit for its stated
-  purpose and intended audience. Covers audience-specific requirements,
-  structural gap detection, the "simpler question" test, and Level
-  escalation criteria. Use when deciding whether to accept a model,
-  escalate complexity, or declare scope. Complements modeling-strategy
-  (which covers model selection) by focusing on post-build evaluation.
-  Trigger phrases include "fit for purpose", "is this model good enough",
-  "should we accept", "audience requirements", "structural gap",
-  "escalate complexity", "Level 2", "does this answer the question".
+description: >-
+  Framework for judging whether a model is fit for its stated purpose and
+  audience: audience-specific requirements, structural gap detection, the
+  simpler-question test, and complexity escalation criteria. Use when deciding
+  whether to accept a model, escalate complexity, or declare scope. Trigger
+  phrases include "fit for purpose", "is this model good enough", "should we
+  accept", "structural gap", "escalate complexity", "does this answer the
+  question".
 ---
 
 # Model Fitness Evaluation
@@ -51,8 +50,9 @@ which geographies.
 
 **Disqualifying gaps**:
 - No mortality/DALY computation when the proposal is framed in DALYs
-- Cannot evaluate an intervention in the proposal (e.g., SMC without
-  age structure, vaccines without immunity waning)
+- Cannot evaluate an intervention in the proposal (e.g., an
+  age-targeted intervention without age structure, vaccines without
+  immunity waning)
 - Coarser geographic resolution than the funding decision requires
 - No comparison to the model the country used in their own plan
 
@@ -113,13 +113,18 @@ matters for the decision, regardless of how well it's implemented.
 
 For each decision the model is supposed to inform:
 
-1. **List the options** being compared (e.g., ITN vs SMC vs IRS allocation)
+1. **List the options** being compared (e.g., bednets vs seasonal
+   chemoprevention vs indoor spraying; or HPV vaccination vs screening)
 2. **For each pair of options**: what mechanism makes them different?
-   - ITN vs SMC: ITN protects all ages via reduced biting; SMC protects
-     children 3-59mo via chemoprophylaxis → **age structure** differentiates
-   - ITN vs IRS: both reduce transmission but at different costs and
-     durations → **no age structure needed**, cost-effectiveness comparison
-     is valid without it
+   - Malaria bednets vs seasonal chemoprevention: nets protect all ages
+     via reduced biting; chemoprevention protects children 3-59 months
+     → **age structure** differentiates
+   - Bednets vs indoor spraying: both reduce transmission but at
+     different costs and durations → **no age structure needed**
+   - HPV vaccination vs cervical screening: vaccination prevents
+     infection in adolescents with benefits decades later; screening
+     detects lesions in adult women now → **age structure and long time
+     horizon** differentiate
 3. **Does the model capture that differentiating mechanism?**
    - If yes → the comparison is structurally valid
    - If no → the comparison is structurally invalid, regardless of metrics
@@ -132,10 +137,10 @@ Are they the same question?
 Common downgrades:
 | Asked | Actually answers | Missing |
 |-------|-----------------|---------|
-| "Optimize allocation of ITN+IRS+SMC+MDA" | "Optimize allocation of ITN+IRS" | Age structure for SMC, transient dynamics for MDA |
+| "Optimize allocation of A+B+C+D" (e.g., four interventions) | "Optimize allocation of A+B" | Age structure for the age-targeted one, transient dynamics for a mass campaign |
 | "Cost per DALY averted" | "Cost per case averted" | Mortality module with age-specific CFR |
 | "Subnational targeting" | "Zone-level allocation" | Sub-zonal resolution |
-| "Compare to NMSP" | "Independent optimization" | Ability to represent NMSP scenarios |
+| "Compare to the national strategic plan" | "Independent optimization" | Ability to represent the plan's scenarios |
 | "Project impact to 2030" | "Equilibrium at 2021" | Time-varying dynamics, demographic projections |
 
 If the model answers a simpler question → this is a structural gap,
@@ -174,8 +179,9 @@ a completed Level N to Level N+1.
 - A key intervention comparison is structurally invalid
 - The audience would reject the model structure before examining results
 - Critique identifies the same structural gap from multiple angles
-  (e.g., "no age structure" shows up as: can't evaluate SMC, can't
-  compute DALYs, can't compare to NMSP)
+  (e.g., "no age structure" shows up as: can't evaluate the
+  age-targeted intervention, can't compute DALYs, can't compare to the
+  national strategic plan)
 
 ### How to Escalate
 
@@ -241,7 +247,7 @@ unfit if it can't compare the interventions the audience cares about.
 
 ### "The critique items are individually patchable"
 Multiple patchable items that all trace to the same structural gap
-are NOT patchable — they're symptoms. Fixing the ITN cost, adding a
+are NOT patchable — they're symptoms. Fixing one intervention's cost, adding a
 post-hoc DALY layer, and adjusting the budget framing are all patches
 around the same gap: the model lacks age structure for a question that
 requires it.
@@ -249,14 +255,14 @@ requires it.
 ### "We declared scope so it's fine"
 Scope declaration is appropriate when the model answers its question
 but the question has a boundary. It's NOT appropriate when the model
-can't answer its own stated question. "This model allocates ITN and IRS
-but not SMC" is a scope declaration. "This model allocates all four
+can't answer its own stated question. "This model allocates
+interventions A and B but not C" is a scope declaration. "This model allocates all four
 interventions but can't properly evaluate one of them" is a structural gap.
 
 ### "Level 1 is good enough for now"
 Level 1 IS good enough when the audience is internal decision support
 or rapid analysis. Level 1 is NOT good enough when the audience is a
-Global Fund proposal or a Lancet paper. Match the level to the audience,
+funding proposal (Global Fund, Gavi) or a Lancet paper. Match the level to the audience,
 not to your time budget.
 
 ---
@@ -278,7 +284,7 @@ Examples of obvious failures that indicate structural model problems:
 - Zero allocation to an intervention WHO recommends for this setting
 - Cost per DALY 100x outside the published range for an intervention
 - The optimal portfolio ignores a dimension the question specifically
-  asks about (e.g., "allocate across ITN, IRS, and SMC" but SMC gets 0%)
+  asks about (e.g., "allocate across A, B, and C" but C gets 0%)
 
 ### Cost-Effectiveness Benchmark Table
 
@@ -301,7 +307,7 @@ For geographic optimization, verify:
 - No area is completely zeroed out unless it has near-zero baseline
   burden
 - The allocation pattern is explainable in terms of burden, cost, and
-  intervention effectiveness -- not model artifacts (EIR cap, step-
+  intervention effectiveness -- not model artifacts (a capped transmission parameter, step-
   function thresholds, equilibrium saturation)
 
 ### Convergent Structural Critique

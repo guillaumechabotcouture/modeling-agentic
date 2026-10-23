@@ -51,6 +51,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 from typing import Optional
 
 
@@ -79,6 +80,28 @@ _FRAMEWORK_PATTERNS = [
     (r"\busing\s+(?:the\s+)?EMOD(?:\s+framework)?\b", "emod"),
     (r"\bimplement(?:ed)?\s+in\s+EMOD\b", "emod"),
 ]
+
+# Phase 21: disjunctive framework requirements, e.g. "(LASER or
+# Starsim)" or "using LASER or Starsim". Recorded as one any-of entry
+# "laser|starsim"; the model must run at least one of them. The pre-21
+# patterns only matched single-framework phrasing, so a run asked for
+# "(LASER or Starsim)" could ship a hand-rolled scipy model unflagged
+# (2026-10-20_150152).
+_FRAMEWORK_NAMES = {"starsim": "starsim", "laser": "laser",
+                    "stisim": "stisim", "emod": "emod"}
+_FRAMEWORK_ANYOF = re.compile(
+    r"\b(starsim|laser|stisim|emod)\s*(?:,\s*|\s+or\s+|\s*/\s*)"
+    r"(?:(starsim|laser|stisim|emod)\s*(?:,\s*|\s+or\s+|\s*/\s*))?"
+    r"(starsim|laser|stisim|emod)\b",
+    re.IGNORECASE,
+)
+# A disjunction only counts as a requirement when phrased as one: inside
+# parentheses, or after using / with / in / built on.
+_ANYOF_CONTEXT = re.compile(
+    r"(?:\(\s*|\busing\s+(?:the\s+)?|\bwith\s+|\bin\s+|\bbuilt\s+on\s+)$",
+    re.IGNORECASE,
+)
+
 
 # Approach positive indicators.
 _APPROACH_PATTERNS = [
@@ -177,9 +200,21 @@ def detect_required_spec(question: str) -> dict:
         archetype_spec: int | None
     """
     frameworks: list[str] = []
+    anyof_members: set[str] = set()
+    for m in _FRAMEWORK_ANYOF.finditer(question):
+        if not _ANYOF_CONTEXT.search(question[:m.start()]):
+            continue
+        names = sorted({_FRAMEWORK_NAMES[g.lower()] for g in m.groups() if g})
+        if len(names) >= 2:
+            key = "|".join(names)
+            if key not in frameworks:
+                frameworks.append(key)
+            anyof_members.update(names)
     for pattern, name in _FRAMEWORK_PATTERNS:
         if re.search(pattern, question, re.IGNORECASE):
-            if name not in frameworks:
+            # "using LASER or Starsim" also matches the single-framework
+            # "using LASER" pattern; the any-of entry already covers it.
+            if name not in frameworks and name not in anyof_members:
                 frameworks.append(name)
 
     approaches: list[str] = []
@@ -251,13 +286,17 @@ def detect_required_spec(question: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def _read_models_code(run_dir: str) -> dict[str, str]:
-    """Return {relative_path: source} for all .py files under run_dir/models/."""
-    models_dir = os.path.join(run_dir, "models")
-    if not os.path.isdir(models_dir):
-        return {}
+    """Return {relative_path: source} for model code in the run.
+
+    Phase 21: scans run_dir/*.py as well as run_dir/models/**. Modelers do
+    not always put code under models/ (2026-10-20_150152 wrote
+    model_core.py at the run root), and a framework check that only looks
+    in models/ passes vacuously when that directory has no code.
+    """
     out: dict[str, str] = {}
-    for path in sorted(glob.glob(os.path.join(models_dir, "**", "*.py"),
-                                 recursive=True)):
+    paths = glob.glob(os.path.join(run_dir, "*.py")) + glob.glob(
+        os.path.join(run_dir, "models", "**", "*.py"), recursive=True)
+    for path in sorted(set(paths)):
         if "__pycache__" in path:
             continue
         try:
@@ -524,15 +563,61 @@ _COST_COLUMN_CANDIDATES = ("cost", "total_cost", "budget", "price",
 
 
 def _find_allocation_csvs(run_dir: str) -> list[str]:
-    """Return CSV paths that look like allocation outputs."""
+    """Return CSV paths that look like allocation outputs.
+
+    Phase 21 γ: `models/` is searched too (most runs write allocations
+    there, so the budget check was silently skipped), and a sanity-schema
+    `allocation.canonical_csv` pointer, when declared, is the only file
+    considered.
+    """
+    canonical = _canonical_allocation_csv(run_dir)
+    if canonical is not None:
+        return [canonical]
     candidates = []
     for pattern in ("*allocation*.csv", "*budget*.csv",
                     "*optimization*.csv", "optimizer*.csv"):
-        candidates.extend(glob.glob(os.path.join(run_dir, pattern)))
-        candidates.extend(glob.glob(os.path.join(run_dir, "data", pattern)))
+        for sub in ("", "data", "models"):
+            candidates.extend(sorted(glob.glob(
+                os.path.join(run_dir, sub, pattern))))
     # Deduplicate preserving order.
     seen = set()
     return [p for p in candidates if not (p in seen or seen.add(p))]
+
+
+def _canonical_allocation_csv(run_dir: str) -> Optional[str]:
+    path = os.path.join(run_dir, "models", "sanity_schema.yaml")
+    if not os.path.exists(path):
+        return None
+    try:
+        import yaml
+        with open(path) as f:
+            doc = yaml.safe_load(f) or {}
+    except Exception:  # noqa: BLE001 — optional pointer; fall back to discovery
+        return None
+    sec = doc.get("allocation") if isinstance(doc, dict) else None
+    rel = sec.get("canonical_csv") if isinstance(sec, dict) else None
+    if isinstance(rel, str):
+        p = os.path.join(run_dir, rel)
+        if os.path.exists(p):
+            return p
+    return None
+
+
+# A filename that names a budget scenario ("allocation_400M.csv",
+# "budget_1.2B.csv") belongs to a sensitivity scenario at that budget,
+# not the headline envelope.
+_FILENAME_BUDGET_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([mbk])(?![a-z])",
+                                 re.IGNORECASE)
+
+# Overspend tolerance (rounding, unit-cost uncertainty).
+_BUDGET_OVERSPEND_TOLERANCE = 0.02
+
+
+def _filename_budget(path: str) -> Optional[float]:
+    m = _FILENAME_BUDGET_RE.search(os.path.basename(path))
+    if not m:
+        return None
+    return float(m.group(1)) * _BUDGET_SUFFIX_MULT[m.group(2).lower()]
 
 
 def _sum_cost_column(csv_path: str) -> tuple[Optional[float], Optional[str]]:
@@ -588,29 +673,71 @@ def _sum_cost_column(csv_path: str) -> tuple[Optional[float], Optional[str]]:
 
 def _check_budget(budget_envelope: float, budget_raw: str,
                   run_dir: str) -> Optional[dict]:
+    """First budget violation (back-compat wrapper)."""
+    out = _check_budget_all(budget_envelope, budget_raw, run_dir)
+    return out[0] if out else None
+
+
+def _check_budget_all(budget_envelope: float, budget_raw: str,
+                      run_dir: str) -> list[dict]:
+    """Phase 21 γ: the envelope is a ceiling as well as a floor. An
+    allocation spending more than the stated budget (beyond a 2%
+    tolerance) is HIGH `budget_exceeded`; under 80% is HIGH
+    `budget_underutilized` (Phase 3)."""
     csvs = _find_allocation_csvs(run_dir)
     if not csvs:
         # No allocation CSV → can't check. This is not a violation; it may
         # be that the question names a budget but no optimization step
         # produced a CSV artifact yet.
-        return None
+        return []
 
-    # Pick the largest (by cost sum) allocation we find.
-    best: tuple[Optional[float], Optional[str], Optional[str]] = (None, None, None)
+    totals: list[tuple[float, str, str]] = []
     for path in csvs:
         total, col = _sum_cost_column(path)
-        if total is not None and (best[0] is None or total > best[0]):
-            best = (total, col, path)
+        if total is not None:
+            totals.append((total, col, path))
+    if not totals:
+        return []
 
-    total, col, path = best
-    if total is None:
-        return None
+    out: list[dict] = []
+    # Overspend: any headline-envelope CSV above the envelope. Scenario
+    # files named for a different budget are excluded — unless the file
+    # is the declared canonical CSV, or every candidate is so named
+    # (renaming the headline file must not hide an overspend).
+    def _scenario_named(path: str) -> bool:
+        fb = _filename_budget(path)
+        return fb is not None and abs(fb - budget_envelope) / budget_envelope > 0.01
 
+    pinned = _canonical_allocation_csv(run_dir) is not None
+    headline = [t for t in totals if pinned or not _scenario_named(t[2])]
+    for total, col, path in (headline or totals):
+        utilization = total / budget_envelope
+        if utilization > 1 + _BUDGET_OVERSPEND_TOLERANCE:
+            out.append({
+                "kind": "budget_exceeded",
+                "required": budget_raw,
+                "severity": "HIGH",
+                "required_budget": budget_envelope,
+                "actual_spend": total,
+                "utilization": utilization,
+                "evidence": (
+                    f"sum({col}) from {os.path.relpath(path, run_dir)} = "
+                    f"${total:,.0f} = {utilization:.1%} of {budget_raw} "
+                    f"envelope (${budget_envelope:,.0f}). An allocation "
+                    f"that spends more than the stated budget is not "
+                    f"implementable; the optimizer's budget constraint is "
+                    f"missing or not binding."
+                ),
+            })
+            break
+
+    # Underspend: the largest allocation found (Phase 3 rule).
+    total, col, path = max(totals, key=lambda t: t[0])
     utilization = total / budget_envelope
     if utilization >= 0.80:
-        return None  # compliant
+        return out
 
-    return {
+    out.append({
         "kind": "budget_underutilized",
         "required": budget_raw,
         "severity": "HIGH",
@@ -624,7 +751,8 @@ def _check_budget(budget_envelope: float, budget_raw: str,
             "An optimizer that leaves >20% of the stated budget "
             "unallocated is an artifact, not a finding."
         ),
-    }
+    })
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -660,7 +788,10 @@ def _parse_data_sections(data_quality_md: str) -> list[dict]:
     # Skip the first section if it's the document title (no dataset name).
     for i, hdr in enumerate(headers):
         name = hdr.group("name").strip()
-        if name.lower().startswith("nigeria malaria") or "assessment" in name.lower():
+        # Document-title headers ("<Country> <Disease> Data Quality
+        # Assessment") are not dataset sections.
+        nl = name.lower()
+        if "assessment" in nl or "data quality" in nl or "overview" in nl:
             continue
         start = hdr.end()
         end = headers[i + 1].start() if i + 1 < len(headers) else len(data_quality_md)
@@ -884,7 +1015,7 @@ def _check_archetype_aggregation(archetype_spec: int, spatial_n: Optional[int],
     # Check for an error-bound statement in markdown artifacts.
     bound_keywords = ("within_archetype_error", "within-archetype error",
                       "aggregation error", "archetype variance",
-                      "within-archetype PfPR variance")
+                      "within-archetype prevalence variance")
     bound_found = False
     for md_name in ("model_comparison.md", "results.md",
                     "modeling_strategy.md"):
@@ -937,7 +1068,7 @@ def _check_archetype_aggregation(archetype_spec: int, spatial_n: Optional[int],
                 f"Structured bound documented "
                 f"(**Within-archetype error**: {structured_bound_value}{structured_bound_unit}) "
                 f"but exceeds 20{structured_bound_unit} threshold — within-archetype "
-                f"heterogeneity is too large to defend LGA-level guidance."
+                f"heterogeneity is too large to defend unit-level guidance."
             )
         else:
             # Bound is documented and tight enough — no blocker.
@@ -951,7 +1082,7 @@ def _check_archetype_aggregation(archetype_spec: int, spatial_n: Optional[int],
             f"No structured within-archetype error bound found. "
             f"{ratio:.1f}× reduction from {archetype_spec} → {k_used} "
             f"archetypes requires an explicit `**Within-archetype error**: "
-            f"<value>pp` line in modeling_strategy.md before LGA-level "
+            f"<value>pp` line in modeling_strategy.md before unit-level "
             f"guidance is defensible."
         )
 
@@ -983,6 +1114,20 @@ def check_spec_compliance(required: dict, run_dir: str,
     code_by_file = _read_models_code(run_dir)
 
     for fw in required.get("frameworks", []):
+        if "|" in fw:
+            # Any-of requirement: compliant if any member framework is used.
+            member_vs = [_check_framework(m, code_by_file) for m in fw.split("|")]
+            if all(mv is not None for mv in member_vs):
+                violations.append({
+                    "kind": "framework_missing",
+                    "required": fw.replace("|", " or "),
+                    "severity": "HIGH",
+                    "evidence": "Question requires one of "
+                                f"{fw.replace('|', ' / ')}; none is imported "
+                                "and run in the model code. "
+                                + " | ".join(mv["evidence"] for mv in member_vs),
+                })
+            continue
         v = _check_framework(fw, code_by_file)
         if v is not None:
             violations.append(v)
@@ -994,10 +1139,8 @@ def check_spec_compliance(required: dict, run_dir: str,
 
     budget = required.get("budget_envelope")
     if budget is not None:
-        v = _check_budget(budget, required.get("budget_raw") or f"${budget:,.0f}",
-                          run_dir)
-        if v is not None:
-            violations.append(v)
+        violations.extend(_check_budget_all(
+            budget, required.get("budget_raw") or f"${budget:,.0f}", run_dir))
 
     arch = required.get("archetype_spec")
     if arch is not None:
@@ -1049,6 +1192,29 @@ def _run_self_test() -> int:
        f"q1: 774 LGAs, got {r1['spatial_units']}")
     ok(r1["archetype_spec"] == 22,
        f"q1: 22 archetypes, got {r1['archetype_spec']}")
+
+    # Phase 21: disjunctive requirement + run-root model code.
+    q1b = ("Build a spatial measles transmission model across 47 counties "
+           "(LASER or Starsim) and allocate a fixed $40M budget.")
+    r1b = detect_required_spec(q1b)
+    ok(r1b["frameworks"] == ["laser|starsim"],
+       f"q1b: any-of framework, got {r1b['frameworks']}")
+    ok(detect_required_spec("Model TB using LASER or Starsim.")["frameworks"]
+       == ["laser|starsim"], "q1c: 'using X or Y' any-of")
+    ok(not detect_required_spec(
+        "Benchmark against published LASER or Starsim analyses.")["frameworks"],
+       "q1d: bare disjunctive mention is not a requirement")
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(td, "model_core.py"), "w") as f:
+            f.write("import numpy as np\nfrom scipy.integrate import solve_ivp\n")
+        vs = check_spec_compliance(r1b, td)["violations"]
+        ok(any(v["kind"] == "framework_missing" and "laser or starsim" in v["required"]
+               for v in vs), f"q1b: scipy-only run-root model must fail any-of: {vs}")
+        with open(os.path.join(td, "model_core.py"), "w") as f:
+            f.write("import laser.core\nfrom laser.generic import Model\n")
+        vs = check_spec_compliance(r1b, td)["violations"]
+        ok(not any(v["kind"] == "framework_missing" for v in vs),
+           f"q1b: LASER at run root satisfies any-of: {vs}")
 
     q2 = "Fit a simple SIR model of influenza transmission."
     r2 = detect_required_spec(q2)
@@ -1218,6 +1384,9 @@ def _run_self_test() -> int:
         kinds_e = {v["kind"] for v in ve["violations"]}
         ok("budget_underutilized" not in kinds_e,
            f"E: $290M of $320M = 90.6% should NOT trigger, got {kinds_e}")
+        ok("budget_exceeded" not in kinds_e,
+           f"E: $290M of $320M must not be an overspend, got {kinds_e}")
+
 
         # --- Phase 3 Commit B: data vintage ---
 
@@ -1314,6 +1483,50 @@ def _run_self_test() -> int:
            "M: fallback to metadata.started year")
 
     # --- Summary ---
+    # Phase 21 γ: overspend, models/ discovery, scenario filenames,
+    # canonical_csv.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        req = {"frameworks": [], "approaches": [],
+               "budget_envelope": 320e6, "budget_raw": "$320M",
+               "spatial_units": None, "archetype_spec": None}
+        # E2: $640M against $320M in models/ → HIGH budget_exceeded.
+        with open(os.path.join(d, "models", "allocation_optimized.csv"), "w") as f:
+            f.write("district,cost\nA,400000000\nB,240000000\n")
+        kinds = {v["kind"] for v in check_spec_compliance(req, d)["violations"]}
+        ok("budget_exceeded" in kinds,
+           f"E2: $640M of $320M in models/ must fire budget_exceeded, got {kinds}")
+        # E3: a scenario file named for a larger budget is not an overspend.
+        os.remove(os.path.join(d, "models", "allocation_optimized.csv"))
+        with open(os.path.join(d, "models", "allocation_optimized.csv"), "w") as f:
+            f.write("district,cost\nA,200000000\nB,115000000\n")
+        with open(os.path.join(d, "models", "allocation_400M.csv"), "w") as f:
+            f.write("district,cost\nA,250000000\nB,150000000\n")
+        kinds = {v["kind"] for v in check_spec_compliance(req, d)["violations"]}
+        ok("budget_exceeded" not in kinds,
+           f"E3: allocation_400M.csv is a scenario, not an overspend, got {kinds}")
+        # E4: canonical_csv pins the checked file.
+        with open(os.path.join(d, "models", "sanity_schema.yaml"), "w") as f:
+            f.write("allocation:\n  canonical_csv: models/allocation_400M.csv\n")
+        kinds = {v["kind"] for v in check_spec_compliance(req, d)["violations"]}
+        ok("budget_exceeded" in kinds,
+           f"E4: a canonical file is never exempt by its name, got {kinds}")
+        # E4c: only scenario-named files present → still checked.
+        os.remove(os.path.join(d, "models", "sanity_schema.yaml"))
+        os.remove(os.path.join(d, "models", "allocation_optimized.csv"))
+        kinds = {v["kind"] for v in check_spec_compliance(req, d)["violations"]}
+        ok("budget_exceeded" in kinds,
+           f"E4c: all-scenario-named files must not escape, got {kinds}")
+        with open(os.path.join(d, "models", "sanity_schema.yaml"), "w") as f:
+            f.write("allocation:\n  canonical_csv: models/allocation_optimized.csv\n")
+        with open(os.path.join(d, "models", "allocation_400M.csv"), "w") as f:
+            f.write("district,cost\nA,250000000\nB,150000000\n")
+        with open(os.path.join(d, "models", "allocation_optimized.csv"), "w") as f:
+            f.write("district,cost\nA,300000000\nB,60000000\n")
+        kinds = {v["kind"] for v in check_spec_compliance(req, d)["violations"]}
+        ok("budget_exceeded" in kinds,
+           f"E4b: canonical $360M of $320M must fire, got {kinds}")
+
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)
         for f in failures:

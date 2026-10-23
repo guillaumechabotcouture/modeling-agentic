@@ -1,6 +1,15 @@
 # Skills Index
 
-45 skills attached per-agent in `agents/__init__.py`. Each skill is a directory with a `SKILL.md` that declares its name/description frontmatter and the guidance body.
+56 skills live here; agents attach them in `agents/__init__.py`
+(`_registry()`). Each skill is a directory with a `SKILL.md` that opens
+with YAML frontmatter (`name` matching the directory, `description`)
+followed by the guidance body. `python3 scripts/validate_skill_attachments.py`
+fails on phantom attachments and on missing or malformed frontmatter;
+add `--show-orphans` to list skills no agent attaches.
+
+Process and rigor skills must stay disease-agnostic: domain specifics
+belong in the disease skills (e.g. `malaria-modeling/`) and in
+`.claude/orchestration/expert_priors.yaml`.
 
 ## Pipeline rigor (STAGE 6 + STAGE 7 backstops)
 
@@ -10,16 +19,28 @@ These skills support the mechanical gates and adversarial review.
 - **critique-blockers-schema/** — Required schema for `critique_*.yaml`: blocker IDs, severities, `target_stage`, categories, `structural_mismatch`, and how the validator computes `unresolved_high` from them.
 - **spec-compliance-rules/** — Rules 1–6: framework (Starsim/LASER/stisim/EMOD) verification, approach (ABM vs ODE), budget envelope utilization, archetype K<N with `**Within-archetype error**` bound, data vintage (`**Vintage**: YYYY`), methodological vintage.
 - **effect-size-priors/** — Parameter Registry YAML schema in `citations.md`; kind-weighted severities (OR/RR/efficacy/cost_usd/proportion); `@registry:NAME` tagging convention; tagging coverage check (registry → code direction) to catch the R-022 "registered-but-not-propagated" class.
-- **uncertainty-quantification/** — `outcome_fn(params) -> dict` contract; 200-draw Monte Carlo propagation via `propagate_uncertainty.py`; surrogate-emulator pattern when the full model is slow.
+- **uncertainty-quantification/** — `outcome_fn(params) -> dict` contract; Monte Carlo propagation via `propagate_uncertainty.py` with draw floors from `effort_floors.yaml`; zero-width intervals are defects; surrogate-emulator pattern when the full model is slow.
 - **multi-structural-comparison/** — ≥3 candidate structures (null/simple/full); LOO-CV vs training RMSE; DEGENERATE_FIT_DETECTED pattern.
-- **identifiability-analysis/** — Fisher SE diagonal + profile-likelihood scans; ridge-trapped parameters as HIGH blockers; resolution via partial pooling, tied parameters, or scope declaration.
-- **decision-rule-extraction/** — Required when allocation CSV is produced: `decision_rule.md` schema (tabular / tree / prose-with-exceptions / non-compressible) with `accuracy_vs_optimizer` and exceptions list. Prevents shipping 774-row tables without a defensible rule.
+- **identifiability-analysis/** — Full-Hessian Fisher SE, eigen ridge check, and re-optimized profile likelihood on an NLL-scaled loss (`loss_type`); ridge-trapped parameters as HIGH blockers; resolution via partial pooling, tied parameters, or scope declaration.
+- **pre-model-identifiability-arithmetic/** — PRE-MODEL `identifiability_a_priori.yaml`: fitted parameters vs independent targets; a necessary, not sufficient, check.
+- **pre-mortem-domain/** — PRE-MODEL `pre_mortem.yaml` from the clean-slate pre-mortem critic; feasibility, data-vintage, and blind-spot concerns.
+- **sanity-schema/** — Disease-agnostic structural sanity manifest (`models/sanity_schema.yaml`) for mass balance, share closure, counterfactual ratios.
+- **eligible-population-consistency/** — Each targeted intervention's benefit and cost must use the same eligible population; behavioral probe via `scripts/eligibility_probe.py`.
+- **benchmark-locked-acceptance/** — `models/benchmark_targets.yaml` acceptance bands checked by `benchmark_match.py`; one HIGH per drifted target.
+- **evidence-sufficiency/** — Post-WRITE sufficiency critic: OVERCLAIMED / ADEQUATE / UNDERCLAIMED per claim against effort and benchmark evidence.
+- **sensitivity-analysis-remediation/** — Interpreting ROBUST / SENSITIVE / UNSTABLE sensitivity verdicts and remediation paths.
+- **allocation-cross-validation/** — Holdout cross-validation of the allocation rule itself (`models/allocation_robustness.yaml`).
+- **ecological-fallacy-quantification/** — Bounding impact loss when calibration units are much coarser than allocation units (`models/within_zone_heterogeneity.yaml`).
+- **optimizer-method-selection/** — Benchmarking the allocation optimizer against ILP / annealing / restarts (`models/optimization_quality.yaml`).
+- **daly-weighted-analysis/** — DALYs averted alongside cases averted; multi-disease anchor tables; discounting conventions.
+- **decision-rule-extraction/** — Required when allocation CSV is produced: `decision_rule.md` schema (tabular / tree / prose-with-exceptions / non-compressible) with `accuracy_vs_optimizer` and exceptions list. Prevents shipping hundreds-of-rows tables without a defensible rule.
 
 ## Modeling strategy & evaluation
 
 - **modeling-strategy/** — Level 0/1/2 progression; AIC/BIC thresholds; when to add complexity.
 - **modeling-fundamentals/** — Model classes, when to use each, common pitfalls.
 - **model-fitness/** — Fit-for-purpose gate: audience, mechanism test, simpler-question test.
+- **mechanistic-vs-hybrid-architecture/** — When to use full-mechanistic, hybrid (calibrated baseline + published effect multipliers), or analytical models for allocation.
 - **model-validation/** — Out-of-sample validation, holdout designs, cross-validation.
 - **investigation-threads/** — `threads.yaml` structure; hypothesis → data → model → figure → finding chains.
 
@@ -62,6 +83,6 @@ These skills support the mechanical gates and adversarial review.
 ## Infrastructure
 
 - **modelops-calabaria/** — Calibration infrastructure; scaling calibration runs.
-- **cloud-compute/** — Azure Batch for slow `outcome_fn` evaluations; pool types (dedicated Standard_D4s_v5 vs free-trial Standard_A2_v2); budget guards; auto-teardown.
+- **cloud-compute/** — Azure Batch for slow `outcome_fn` evaluations; pool types (dedicated Standard_D4s_v5 vs free-trial Standard_A2_v2); budget guards; mandatory try/finally pool teardown.
 - **sciris-utilities/** — `sciris` utilities (odict, save/load, plotting helpers).
 - **epi-model-parametrization/** — Finding published parameter values; parameter provenance.

@@ -1,19 +1,14 @@
 ---
 name: uncertainty-quantification
-description: Contract for STAGE 5b UNCERTAINTY. Modeler exposes an outcome_fn
-  in models/outcome_fn.py that takes sampled parameter values (from the
-  effect-size priors registry) and returns decision outputs as a dict. The
-  UQ script samples N draws from each registered parameter's prior, runs
-  outcome_fn once per draw, and aggregates per-output 95% credible intervals
-  into uncertainty_report.yaml. Scalar outputs (DALYs, costs, burden) get CIs;
-  categorical outputs (per-archetype package choice, per-LGA assignment) get
-  stability distributions. The writer must report these posterior-derived CIs
-  as the primary uncertainty claim — NOT an ensemble ±X% perturbation. The
-  gate blocks ACCEPT without uncertainty_report.yaml. Use when writing
-  outcome_fn, interpreting posterior CIs, or deciding whether to use cloud
-  compute (see cloud-compute skill). Trigger phrases include "uncertainty
-  quantification", "UQ", "propagate priors", "outcome_fn", "posterior CI",
-  "credible interval", "ensemble uncertainty".
+description: >-
+  Contract for STAGE 5b UNCERTAINTY. The modeler exposes
+  `models/outcome_fn.py`; propagate_uncertainty.py samples the registered
+  parameter priors, runs outcome_fn per draw, and writes per-output 95%
+  intervals to uncertainty_report.yaml. Draw-count floors come from
+  .claude/orchestration/effort_floors.yaml; a zero-width interval with
+  uncertain inputs is a defect. The writer reports these intervals, not ad-hoc
+  ±X%. Trigger phrases include "uncertainty quantification", "UQ", "propagate
+  priors", "outcome_fn", "credible interval".
 ---
 
 # Uncertainty Quantification via Prior Propagation
@@ -195,8 +190,8 @@ width; computational replicate width misleads them into over-confidence.
 `categorical_outputs` gives you per-category stability. Interpretation:
 
 - **dominance > 0.95**: robust decision. Report as a confident
-  recommendation ("PBO-ITN dominates in this archetype in 96% of posterior
-  draws").
+  recommendation ("package B dominates in this archetype in 96% of
+  posterior draws").
 - **0.70 < dominance < 0.95**: moderately robust. Report as "likely
   optimal but contingent on parameter values in the published-CI range."
 - **dominance < 0.70**: policy choice is uncertain. The report must
@@ -214,8 +209,9 @@ See the `cloud-compute` skill for the decision rule.  Quick version:
 - **outcome_fn 2–60s/call**: run locally if you can wait 30 min–3 hr,
   otherwise use cloud.
 - **outcome_fn > 60s/call**: MUST use cloud, OR build a surrogate.
-- **>1000 draws needed** (e.g., for per-LGA stability in 774 units,
-  not per-archetype): use cloud.
+- **>1000 draws needed** (e.g., stability of a per-unit choice across
+  hundreds of fine-grained allocation units rather than a handful of
+  archetypes): use cloud.
 
 ## Gate behavior
 
@@ -225,8 +221,20 @@ The STAGE 7 validator blocks ACCEPT if:
 - `uncertainty_report.yaml` has `n_errors > n_draws / 4` (outcome_fn
   raised on >25% of draws — the surrogate is broken or misspecified).
 
+Draw-count floors are NOT set here. The single source of truth is
+`.claude/orchestration/effort_floors.yaml` (`uq_min_draws_local`,
+`uq_min_draws_cloud`); read the current minimums there. At the time of
+writing they are 200 draws for local runs (HIGH, not scope-declarable)
+and 1000 for cloud runs. The floor counts draws that SUCCEEDED, not
+draws requested, so failed or NaN draws do not count toward it.
+
+A scalar output whose interval has zero width (ci_low == ci_high) while
+any sampled input is uncertain means the draws never reached the
+outcome (parameters not wired through, a cached result, or a constant
+return). Treat it as a broken UQ run and fix it; do not report that
+interval, and never substitute an interval from elsewhere.
+
 MEDIUM blockers fire if:
-- `n_draws < 100` (insufficient for stable 2.5–97.5 percentiles).
 - Any scalar output's CI width > 3× its mean (suggests the priors
   dominate the data — modeler may need to tighten priors to
   data-consistent posteriors via MCMC, a Phase 3 job).
@@ -243,8 +251,9 @@ audit-visible in git history.
 ## Minimal policy on correlated priors
 
 The current implementation samples each registered parameter
-independently. In reality some parameters are correlated (e.g., IRS and
-ITN efficacy share pyrethroid susceptibility mechanics). If you know a
+independently. In reality some parameters are correlated (e.g., two
+vector-control products that share an insecticide-resistance mechanism,
+or vaccine efficacy and waning rate estimated from the same trial). If you know a
 correlation exists and matters:
 
 1. Document it in `citations.md` `## Parameter Registry` as a `correlations:`

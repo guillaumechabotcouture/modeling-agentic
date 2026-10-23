@@ -4,11 +4,11 @@ Phase 12 Commit γ — ecological-fallacy / within-zone heterogeneity
 sensitivity analysis.
 
 When a model calibrates to k zones but allocates to n>>k spatial
-units (Nigeria: 6 zones → 774 LGAs in the 104914 run), within-zone
-PfPR variation is invisible to the optimizer. results.md
-acknowledges this as a one-line caveat but doesn't bound the
-impact. A reviewer asking "is this a 5% impact loss or 25%?" gets
-no answer.
+units (the 104914 run: 6 zones → 774 districts), within-zone variation
+in the driving quantity (prevalence, incidence, coverage, …) is
+invisible to the optimizer. results.md acknowledged this as a one-line
+caveat but didn't bound the impact. A reviewer asking "is this a 5%
+impact loss or 25%?" got no answer.
 
 This script defines and validates the
 `models/within_zone_heterogeneity.yaml` artifact:
@@ -16,18 +16,18 @@ This script defines and validates the
 ```yaml
 calibration_units: 6
 allocation_units: 774
-within_unit_value_range: {min: 0.059, max: 0.773, metric: PfPR}
+within_unit_value_range: {min: 0.059, max: 0.773, metric: prevalence}
 modeled_uniform_per_unit: true
 sensitivity:
-  - perturbation: lga_pfpr_uniform_within_zone (baseline)
-    cases_averted: 54700000
-  - perturbation: lga_pfpr_normal_within_zone (sd from data)
-    cases_averted: 49000000
+  - perturbation: unit_value_uniform_within_zone (baseline)
+    outcome_averted: 54700000      # `cases_averted` accepted (legacy)
+  - perturbation: unit_value_normal_within_zone (sd from data)
+    outcome_averted: 49000000
     impact_loss_pct: 10.4
 verdict: BOUNDED   # <10%, INCONCLUSIVE 10-25%, UNBOUNDED >25%
 notes: |
-  Per-LGA PfPR distributed Normal(zone_mean, sd_observed); optimizer
-  re-run; cases-averted reduction is the impact loss bound.
+  Per-unit value distributed Normal(zone_mean, sd_observed); optimizer
+  re-run; the reduction in outcome averted is the impact loss bound.
 ```
 
 Verdict thresholds (worst-case impact_loss_pct across perturbations):
@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 
@@ -55,6 +56,12 @@ except ImportError:
 
 
 VALID_VERDICTS = {"BOUNDED", "INCONCLUSIVE", "UNBOUNDED"}
+# Closed verdict vocabulary (read by validate_critique_yaml.py).
+VERDICTS = ("BOUNDED", "INCONCLUSIVE", "UNBOUNDED", "MALFORMED", "MISSING")
+# Phase 21 γ: the outcome field is named for the run's outcome; the
+# original `cases_averted` stays accepted.
+_OUTCOME_KEYS = ("outcome_averted", "cases_averted", "infections_averted",
+                 "deaths_averted", "dalys_averted", "objective")
 BOUNDED_THRESHOLD = 10.0      # impact_loss_pct < 10% → BOUNDED
 INCONCLUSIVE_THRESHOLD = 25.0  # 10-25% → INCONCLUSIVE; >25% → UNBOUNDED
 
@@ -75,6 +82,10 @@ def _compute_verdict(perturbations: list[dict]) -> tuple[str, dict]:
             loss = float(loss)
         except (TypeError, ValueError):
             continue
+        if not math.isfinite(loss):
+            # Phase 21 γ: abs(nan) > worst is False, so a NaN loss used
+            # to leave worst at 0 → BOUNDED.
+            return "MALFORMED", {"worst_loss_pct": None, "n_perturbations": n}
         n += 1
         if abs(loss) > worst:
             worst = abs(loss)
@@ -113,6 +124,11 @@ def validate_within_zone_heterogeneity(yaml_path: str) -> dict:
                 "reported_verdict": None,
                 "errors": [f"YAML parse error: {e}"], "summary": {}}
 
+    if not isinstance(data, dict):
+        return {"verdict": "MALFORMED", "computed_verdict": None,
+                "reported_verdict": None,
+                "errors": ["top-level must be a mapping"], "summary": {}}
+
     errors: list[str] = []
     for required in ("calibration_units", "allocation_units",
                      "modeled_uniform_per_unit", "sensitivity"):
@@ -138,15 +154,30 @@ def validate_within_zone_heterogeneity(yaml_path: str) -> dict:
                 continue
             if "perturbation" not in p:
                 errors.append(f"sensitivity[{i}] missing 'perturbation' label")
-            if "cases_averted" not in p:
-                errors.append(f"sensitivity[{i}] missing 'cases_averted'")
+            if not any(k in p for k in _OUTCOME_KEYS):
+                errors.append(f"sensitivity[{i}] missing an outcome field "
+                              f"(one of {list(_OUTCOME_KEYS)})")
             if "impact_loss_pct" in p:
                 try:
-                    float(p["impact_loss_pct"])
+                    lv = float(p["impact_loss_pct"])
+                    if not math.isfinite(lv) or isinstance(
+                            p["impact_loss_pct"], bool):
+                        raise ValueError
                 except (TypeError, ValueError):
                     errors.append(
-                        f"sensitivity[{i}].impact_loss_pct must be numeric "
-                        f"(got {p['impact_loss_pct']!r})")
+                        f"sensitivity[{i}].impact_loss_pct must be a finite "
+                        f"number (got {p['impact_loss_pct']!r})")
+
+        # One quantity across all rows (Copilot review of PR #14): a baseline
+        # in cases and a perturbation in deaths are not comparable, and the
+        # verdict would rest on an impact_loss_pct with no common basis.
+        rows = [p for p in perturbations if isinstance(p, dict)]
+        common = set(_OUTCOME_KEYS)
+        for p in rows:
+            common &= {k for k in _OUTCOME_KEYS if k in p}
+        if rows and not common and not errors:
+            errors.append("baseline and perturbations share no outcome field "
+                          f"(each row must report the same one of {list(_OUTCOME_KEYS)})")
 
     if errors:
         return {"verdict": "MALFORMED", "computed_verdict": None,
@@ -290,6 +321,58 @@ def _run_self_test() -> int:
            f"got {r6}")
         ok(r6["computed_verdict"] == "UNBOUNDED",
            f"W6: computed_verdict should still be UNBOUNDED, got {r6}")
+
+        # W7 (Phase 21 γ): NaN / inf / boolean loss is MALFORMED, never
+        # BOUNDED; a generic `outcome_averted` field is accepted.
+        for bad in (".nan", ".inf", "true"):
+            f7 = os.path.join(d, "w7.yaml")
+            with open(f7, "w") as f:
+                f.write(
+                    "calibration_units: 4\n"
+                    "allocation_units: 120\n"
+                    "modeled_uniform_per_unit: true\n"
+                    "sensitivity:\n"
+                    "  - perturbation: baseline\n"
+                    "    outcome_averted: 1000\n"
+                    "  - perturbation: spread\n"
+                    "    outcome_averted: 900\n"
+                    f"    impact_loss_pct: {bad}\n"
+                    "verdict: BOUNDED\n")
+            r7 = validate_within_zone_heterogeneity(f7)
+            ok(r7["verdict"] == "MALFORMED",
+               f"W7: impact_loss_pct {bad} must be MALFORMED, got {r7}")
+        with open(f7, "w") as f:
+            f.write(
+                "calibration_units: 4\n"
+                "allocation_units: 120\n"
+                "modeled_uniform_per_unit: true\n"
+                "sensitivity:\n"
+                "  - perturbation: baseline\n"
+                "    outcome_averted: 1000\n"
+                "  - perturbation: spread\n"
+                "    outcome_averted: 950\n"
+                "    impact_loss_pct: 5.0\n"
+                "verdict: BOUNDED\n")
+        ok(validate_within_zone_heterogeneity(f7)["verdict"] == "BOUNDED",
+           "W7b: generic outcome_averted must validate")
+        with open(f7, "w") as f:
+            f.write(
+                "calibration_units: 4\n"
+                "allocation_units: 120\n"
+                "modeled_uniform_per_unit: true\n"
+                "sensitivity:\n"
+                "  - perturbation: baseline\n"
+                "    cases_averted: 1000\n"
+                "  - perturbation: spread\n"
+                "    deaths_averted: 950\n"
+                "    impact_loss_pct: 5.0\n"
+                "verdict: BOUNDED\n")
+        ok(validate_within_zone_heterogeneity(f7)["verdict"] == "MALFORMED",
+           "W7d: mixed outcome quantities across rows must be MALFORMED")
+        with open(f7, "w") as f:
+            f.write("- not\n- a mapping\n")
+        ok(validate_within_zone_heterogeneity(f7)["verdict"] == "MALFORMED",
+           "W7c: top-level list must be MALFORMED, not crash")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)

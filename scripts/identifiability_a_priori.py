@@ -20,13 +20,13 @@ stage: pre_model
 round_drafted: 1
 
 calibration_targets:
-  - source: NMIS 2021 zone PfPR
+  - source: national survey, zone-level prevalence
     n_independent: 6
-    derivation: "6 zones × 1 PfPR measurement each"
+    derivation: "6 zones × 1 prevalence measurement each"
 total_independent_targets: 6
 
 proposed_parameters:
-  - name: ext_foi_per_archetype
+  - name: force_of_infection_per_archetype
     count: 20
     fitted: true
     prior_constraint: weak
@@ -43,7 +43,7 @@ architecture_implication: |
 resolution:
   decision: tie_params_by_ecotype
   details: |
-    Reduce ext_foi from 20 archetype-specific to 5 ecotype-specific.
+    Reduce force of infection from 20 archetype-specific to 5 grouped.
     New ratio 5/6 = 0.83, verdict IDENTIFIABLE.
 ```
 
@@ -57,8 +57,20 @@ decisions: reduce_params, add_calibration_targets,
 downgrade_to_analytical, accept_decorative (with details), or
 tie_params_by_ecotype (or any other named tying scheme).
 
+Phase 21 δ — honesty + post-model cross-check:
+- A ratio < 1 is a NECESSARY condition for identifiability, not a
+  sufficient one (a 2-parameter model fit to 100 targets can still have
+  a β/γ ridge). Results carry `necessary_condition_only: true`; the
+  post-hoc identifiability.py analysis remains the real test.
+- `cross_check_counts(run_dir)` compares the declared counts with what
+  the built model actually has (models/identifiability.yaml parameter
+  list, models/model_comparison.yaml k_params / n_targets) and emits
+  `a_priori_count_mismatch` findings. A strategy-time file claiming
+  17 fitted / 37 targets for a model that ships with k=22 against
+  n=22 targets should not keep its IDENTIFIABLE verdict.
+
 Usage:
-    python3 scripts/identifiability_a_priori.py <run_dir>
+    python3 scripts/identifiability_a_priori.py <run_dir> [--cross-check]
     python3 scripts/identifiability_a_priori.py --self-test
 """
 
@@ -77,6 +89,10 @@ except ImportError:
 
 
 VALID_VERDICTS = {"IDENTIFIABLE", "MARGINAL", "OVER_SATURATED"}
+# Phase 21 δ: closed vocabulary of validate_identifiability_a_priori()
+# result verdicts (file verdicts plus the two failure states).
+VERDICTS = ("IDENTIFIABLE", "MARGINAL", "OVER_SATURATED", "MALFORMED", "MISSING")
+_VERDICT_RANK = {"IDENTIFIABLE": 0, "MARGINAL": 1, "OVER_SATURATED": 2}
 IDENTIFIABLE_THRESHOLD = 1.0   # ratio < 1.0 → IDENTIFIABLE
 MARGINAL_THRESHOLD = 3.0       # 1.0-3.0 → MARGINAL; >3.0 → OVER_SATURATED
 
@@ -218,7 +234,105 @@ def validate_identifiability_a_priori(yaml_path: str) -> dict:
                     "summary": summary}
 
     return {"verdict": computed, "computed_verdict": computed,
-            "reported_verdict": reported, "errors": [], "summary": summary}
+            "reported_verdict": reported, "errors": [], "summary": summary,
+            # Phase 21 δ: ratio < 1 is necessary, not sufficient.
+            "necessary_condition_only": True}
+
+
+def _load_yaml(path: str):
+    try:
+        with open(path) as f:
+            return yaml.safe_load(f)
+    except (OSError, yaml.YAMLError):
+        return None
+
+
+def _post_model_counts(run_dir: str) -> dict:
+    """Collect fitted-parameter and target counts from post-model
+    artifacts. Each source is reported separately so the finding can say
+    where the disagreement comes from."""
+    out: dict = {"fitted": {}, "targets": {}}
+    ident = _load_yaml(os.path.join(run_dir, "models", "identifiability.yaml"))
+    if isinstance(ident, dict):
+        params = ident.get("parameters")
+        if isinstance(params, list) and params:
+            out["fitted"]["models/identifiability.yaml parameters[]"] = len(params)
+        for key in ("n_fitted", "n_params"):
+            if isinstance(ident.get(key), int):
+                out["fitted"][f"models/identifiability.yaml {key}"] = ident[key]
+        if isinstance(ident.get("n_targets"), int):
+            out["targets"]["models/identifiability.yaml n_targets"] = ident["n_targets"]
+        if isinstance(ident.get("n_obs"), int):
+            out["targets"]["models/identifiability.yaml n_obs"] = ident["n_obs"]
+    mc = _load_yaml(os.path.join(run_dir, "models", "model_comparison.yaml"))
+    if isinstance(mc, dict):
+        if isinstance(mc.get("n_targets"), int):
+            out["targets"]["models/model_comparison.yaml n_targets"] = mc["n_targets"]
+        models = mc.get("models")
+        if isinstance(models, list):
+            ks = {}
+            for m in models:
+                if isinstance(m, dict) and isinstance(m.get("k_params"), (int, float)):
+                    ks[str(m.get("name", "?"))] = int(m["k_params"])
+            primary = mc.get("selected_model") or mc.get("primary_model")
+            if primary and str(primary) in ks:
+                out["fitted"][f"models/model_comparison.yaml k_params[{primary}]"] = ks[str(primary)]
+            elif ks:
+                name = max(ks, key=ks.get)
+                out["fitted"][f"models/model_comparison.yaml max k_params ({name})"] = ks[name]
+    return out
+
+
+def cross_check_counts(run_dir: str) -> list[dict]:
+    """Phase 21 δ: compare the a-priori declared counts against the built
+    model. Returns validator-shaped findings:
+
+      a_priori_count_mismatch  HIGH   recomputed verdict (using the
+                                      post-model counts) is worse than
+                                      the declared verdict
+      a_priori_count_mismatch  MEDIUM counts differ but the verdict band
+                                      is unchanged
+
+    Returns [] when the a-priori file or all post-model sources are
+    absent (other checks own those cases)."""
+    ap_path = os.path.join(run_dir, "models", "identifiability_a_priori.yaml")
+    ap = _load_yaml(ap_path)
+    if not isinstance(ap, dict):
+        return []
+    try:
+        d_fit = int(ap.get("total_fitted_parameters"))
+        d_tgt = int(ap.get("total_independent_targets"))
+    except (TypeError, ValueError):
+        return []
+    if d_tgt <= 0:
+        return []
+    counts = _post_model_counts(run_dir)
+    if not counts["fitted"] and not counts["targets"]:
+        return []
+    a_fit = max(counts["fitted"].values()) if counts["fitted"] else d_fit
+    a_tgt = min(counts["targets"].values()) if counts["targets"] else d_tgt
+    if a_fit == d_fit and a_tgt == d_tgt:
+        return []
+    declared_verdict = _compute_verdict(d_fit / d_tgt)
+    actual_verdict = (_compute_verdict(a_fit / a_tgt) if a_tgt > 0
+                      else "OVER_SATURATED")
+    worse = _VERDICT_RANK[actual_verdict] > _VERDICT_RANK[declared_verdict]
+    srcs = "; ".join(f"{k}={v}" for k, v in
+                     list(counts["fitted"].items()) + list(counts["targets"].items()))
+    return [{
+        "kind": "a_priori_count_mismatch",
+        "severity": "HIGH" if worse else "MEDIUM",
+        "claim": (f"identifiability_a_priori.yaml declares {d_fit} fitted / "
+                  f"{d_tgt} targets ({declared_verdict}); the built model has "
+                  f"{a_fit} fitted / {a_tgt} targets "
+                  f"(ratio {a_fit / a_tgt if a_tgt else float('inf'):.2f}, "
+                  f"{actual_verdict}). Sources: {srcs}. Update the a-priori "
+                  f"artifact to the real architecture or change the model."),
+        "declared": {"fitted": d_fit, "targets": d_tgt,
+                     "verdict": declared_verdict},
+        "actual": {"fitted": a_fit, "targets": a_tgt,
+                   "verdict": actual_verdict},
+    }]
 
 
 def _run_self_test() -> int:
@@ -340,6 +454,34 @@ def _run_self_test() -> int:
            f"W7: accept_decorative without details should be MALFORMED, "
            f"got {r7}")
 
+        # W8 (Phase 21 δ): passing results carry necessary_condition_only.
+        ok(r1.get("necessary_condition_only") is True,
+           f"W8: IDENTIFIABLE must be marked necessary_condition_only; got {r1}")
+
+    # W9-W11 (Phase 21 δ): post-model count cross-check.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "models", "identifiability_a_priori.yaml"), "w") as f:
+            f.write("total_independent_targets: 37\n"
+                    "total_fitted_parameters: 17\nverdict: IDENTIFIABLE\n")
+        ok(cross_check_counts(d) == [], "W9: no post-model artifacts → []")
+        with open(os.path.join(d, "models", "model_comparison.yaml"), "w") as f:
+            f.write("n_targets: 22\nmodels:\n"
+                    "  - {name: null, k_params: 1}\n"
+                    "  - {name: full, k_params: 22}\n")
+        f10 = cross_check_counts(d)
+        ok(len(f10) == 1 and f10[0]["kind"] == "a_priori_count_mismatch"
+           and f10[0]["severity"] == "HIGH"
+           and f10[0]["actual"]["verdict"] == "MARGINAL",
+           f"W10: 17/37 declared vs k=22/n=22 built → HIGH; got {f10}")
+        with open(os.path.join(d, "models", "model_comparison.yaml"), "w") as f:
+            f.write("n_targets: 37\nmodels:\n"
+                    "  - {name: null, k_params: 1}\n"
+                    "  - {name: full, k_params: 18}\n")
+        f11 = cross_check_counts(d)
+        ok(len(f11) == 1 and f11[0]["severity"] == "MEDIUM",
+           f"W11: count drift within same verdict band → MEDIUM; got {f11}")
+
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)
         for f in failures:
@@ -354,12 +496,18 @@ def main() -> int:
     p.add_argument("run_dir", nargs="?")
     p.add_argument("--self-test", action="store_true")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--cross-check", action="store_true",
+                   help="Phase 21 δ: compare declared counts with the built model")
     args = p.parse_args()
 
     if args.self_test:
         return _run_self_test()
     if not args.run_dir:
         p.error("run_dir required (or use --self-test)")
+    if args.cross_check:
+        findings = cross_check_counts(args.run_dir)
+        print(json.dumps(findings, indent=2))
+        return 1 if any(f["severity"] == "HIGH" for f in findings) else 0
 
     yaml_path = os.path.join(args.run_dir, "models",
                              "identifiability_a_priori.yaml")

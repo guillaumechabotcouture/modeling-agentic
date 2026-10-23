@@ -1,3 +1,14 @@
+---
+name: modeling-fundamentals
+description: >-
+  Core workflow for building any mathematical or statistical model: define the
+  question and decision, choose the outcome and unit of analysis, state
+  assumptions, pick the simplest adequate structure, then fit, validate, and
+  communicate uncertainty. Use when starting a model for any research
+  question. Trigger phrases include "build a model", "modeling workflow",
+  "model assumptions", "where do I start".
+---
+
 # Mathematical Modeling Fundamentals
 
 ## When to use this skill

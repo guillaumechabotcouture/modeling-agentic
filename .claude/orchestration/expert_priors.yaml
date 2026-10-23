@@ -34,6 +34,26 @@ auto_validation:
   max_age_days_low: 1825      # LOW every 5 years
   warn_on_unverified_doi: true
 
+# Disease / programme-area vocabulary (data, not code). Used to infer a
+# prior's domain when `applies_when.domain_any` is not declared: a prior
+# whose id + claim names exactly one area is gated to questions naming that
+# area. An explicit `domain_any` always wins. Add a new disease area here.
+domain_vocabulary:
+  malaria: [malaria, plasmodium, falciparum, vivax]
+  tuberculosis: [tuberculosis, tb, mdr-tb]
+  hiv: [hiv, aids, antiretroviral, prep]
+  measles: [measles, rubella, mcv1, mcv2]
+  polio: [polio, poliovirus, opv, ipv, nopv2]
+  cholera: [cholera]
+  dengue: [dengue, arbovirus]
+  influenza: [influenza, flu]
+  covid: [covid, sars-cov-2]
+  ntd: [schistosomiasis, trachoma, onchocerciasis, lymphatic filariasis, helminth]
+  hpv: [hpv, cervical cancer]
+  pneumococcal: [pneumococcal, pcv]
+  rotavirus: [rotavirus]
+  meningitis: [meningitis, menafrivac]
+
 # Schema (per prior):
 #   id                       stable identifier referenced by validators
 #   kind                     external_fact | data_vintage | methodological_standard | policy_caveat
@@ -62,6 +82,10 @@ priors:
   # ------------------------------------------------------------------- #
 
   - id: nigeria_malaria_total_burden_dalys
+    # Phase 21 ε: 12.8M is a GBD 2021 figure and was not re-verified.
+    # Check against the newest GBD round (GBD 2023) before the
+    # 2027-04-29 revalidation date; update canonical_value and
+    # acknowledgment_hints together.
     kind: external_fact
     severity_if_unaddressed: HIGH
     claim: |
@@ -72,6 +96,7 @@ priors:
     canonical_value: 12_800_000
     units: dalys_per_year
     applies_when:
+      domain_any: ["malaria"]   # Phase 21: gate to malaria questions
       keywords_all: ["nigeria"]
       keywords_any: ["malaria", "daly", "burden"]
     acknowledgment_hints: ["12.8M", "12.83M", "GBD 2021", "DALY burden"]
@@ -117,58 +142,89 @@ priors:
 
   - id: pbo_llin_global_supply_ceiling
     kind: external_fact
-    severity_if_unaddressed: HIGH
+    severity_if_unaddressed: MEDIUM
     claim: |
-      Global LLIN procurement (all types) is ~28-32M nets/yr (UNICEF
-      Supply Annual Reports 2022-2023). Universal PBO LLIN at 80%
-      coverage for Nigeria's ~205M population requires ~30M PBO nets/yr
-      alone — essentially the entire global LLIN supply for one country.
-      Recommendations of universal PBO without supply-chain caveat are
-      not implementable.
-    canonical_value: 30_000_000
-    units: nets_per_year
+      Global ITN supply is on the order of 190-230M nets/yr (manufacturer
+      deliveries ~229M in 2020; >190M distributed by national programmes
+      in 2022, ~180M of them in sub-Saharan Africa). PBO nets were ~58%
+      (~113M) of 2023 deliveries to sub-Saharan Africa. Universal
+      coverage for Nigeria (~233M people, 1 net per 1.8 people, 3-year
+      replacement) needs ~43M nets/yr, i.e. roughly a fifth of global
+      ITN supply and over a third of current PBO deliveries to the
+      region. A recommendation of universal PBO (or dual-AI) coverage for
+      one large country must state the procurement assumption and phase
+      or mix products; it is a supply-feasibility caveat, not an
+      impossibility. NOTE: the ~28-41M nets/yr figures in UNICEF LLIN
+      market updates are UNICEF's own procurement only, not global
+      supply (an earlier version of this prior conflated the two).
+    canonical_value: 190_000_000
+    units: itns_distributed_globally_per_year
     applies_when:
+      domain_any: ["malaria"]   # Phase 21: gate to malaria questions
       keywords_all: ["nigeria"]
       keywords_any: ["pbo", "llin", "bednet", "itn"]
     acknowledgment_hints:
-      ["procurement", "supply", "UNICEF", "feasibility", "global supply"]
+      ["procurement", "supply", "feasibility", "global supply",
+       "phased", "product mix"]
     rationale: |
       Found in 2026-04-29_161312 critique-redteam (R-007). Persisted
       unaddressed to ACCEPT — the report recommended universal PBO at
       80% with no procurement feasibility section. Invisible to the
       rigor stack (gates check internal consistency, not real-world
-      supply chains) but the first thing a Global Fund or PMI reviewer
-      flags.
-    last_literature_check: 2026-04-29
+      supply chains) but an early reviewer question. Corrected in
+      Phase 21 ε after web verification: the original claim used a
+      UNICEF-only procurement number as the global ceiling, overstating
+      the constraint by roughly 6-7×, so severity was lowered to MEDIUM.
+    last_literature_check: 2026-10-20
     literature_corroboration:
       - source_type: report
-        citation: "UNICEF Supply Division. LLIN Market and Supply Update October 2022."
-        doi_or_pmid: null
-        year: 2022
-        relevance: primary
-        found_via: bootstrap
-        excerpt: |
-          Total global LLIN procurement: ~28M (2022). PBO share grown
-          since 2017 but remains < 50% of total LLIN procurement.
-      - source_type: report
-        citation: "UNICEF Supply Division. LLIN Market and Supply Update 2023."
+        citation: "Alliance for Malaria Prevention / IFRC press release on the 2023 World Malaria Report: 3 billion mosquito nets shipped since 2004 (Nov 2023). https://www.ifrc.org/press-release/3-billion-mosquito-nets-shipped-prevent-malaria"
         doi_or_pmid: null
         year: 2023
-        relevance: corroborating
-        found_via: bootstrap
+        relevance: primary
+        found_via: websearch
         excerpt: |
-          2023 global LLIN procurement: ~32M nets, with PBO and dual-AI
-          shares both growing.
-      - source_type: paper
-        citation: "Bertozzi-Villa A et al. Nature Communications 2021. (LLIN coverage modeling for sub-Saharan Africa)"
-        doi_or_pmid: "10.1038/s41467-021-23707-7"
+          In 2022 more than 190 million ITNs were distributed globally by
+          National Malaria Programmes in endemic countries; 180 million of
+          these in sub-Saharan Africa.
+      - source_type: report
+        citation: "RBM Partnership to End Malaria, current level of coverage (manufacturer delivery data). https://endmalaria.org/current-level-coverage"
+        doi_or_pmid: null
         year: 2021
-        relevance: supporting
-        found_via: bootstrap
+        relevance: corroborating
+        found_via: websearch
         excerpt: |
-          Coverage modeling assumes 1.8 persons per net and 3-year
-          functional life — the standard arithmetic underlying the
-          procurement ceiling estimate.
+          Manufacturers delivered about 229 million ITNs to malaria-endemic
+          countries in 2020, ~91% to sub-Saharan Africa.
+      - source_type: report
+        citation: "Messenger L. The impact of next-generation LLINs (RBM VCWG presentation, 2024), citing AMP net-mapping data. https://endmalaria.org/sites/default/files/15_Louisa%20Messenger%20(University%20of%20Nevada)-The%20Impact%20of%20Next-Generation%20Long-Lasting%20Insecticidal%20Nets%20on.pdf"
+        doi_or_pmid: null
+        year: 2024
+        relevance: supporting
+        found_via: websearch
+        excerpt: |
+          58% of ITNs (112.6 million) delivered to sub-Saharan Africa in
+          2023 were PBO-ITNs. (Conference slide; confirm against the World
+          Malaria Report before quoting.)
+      - source_type: report
+        citation: "UNICEF Supply Division. LLIN Market and Supply Update, October 2022. https://www.unicef.org/supply/media/13951/file/LLIN-Market-and-Supply-UpdateOctober-2022.pdf"
+        doi_or_pmid: null
+        year: 2022
+        relevance: contextual
+        found_via: websearch
+        excerpt: |
+          UNICEF-procured volumes (~41M nets in 2021; ~32M forecast for
+          2023). These are UNICEF's own procurement, a minority share of
+          global supply; do not use as a global ceiling.
+      - source_type: report
+        citation: "UN DESA World Population Prospects 2024: Nigeria mid-2024 population ~232.7M."
+        doi_or_pmid: null
+        year: 2024
+        relevance: contextual
+        found_via: websearch
+        excerpt: |
+          Used for the ~43M nets/yr universal-coverage arithmetic
+          (233M / 1.8 / 3 years).
     found_in_runs:
       - 2026-04-29_161312_build-an-agent-based-model-of-malaria-tr
 
@@ -184,6 +240,7 @@ priors:
     canonical_value: 320_000_000
     units: usd_total
     applies_when:
+      domain_any: ["malaria"]   # Phase 21: gate to malaria questions
       keywords_all: ["nigeria", "global fund"]
       keywords_any: ["gc7", "$320m", "320 million", "malaria budget"]
     acknowledgment_hints:
@@ -225,6 +282,7 @@ priors:
     canonical_value: [8.0, 12.0]
     units: usd_per_person_per_year
     applies_when:
+      domain_any: ["malaria"]   # Phase 21: gate to malaria questions
       keywords_any: ["irs", "indoor residual spraying"]
       decision_year_min: 2024
     acknowledgment_hints: ["$8", "$10", "$12", "PMI", "operational cost"]
@@ -278,6 +336,7 @@ priors:
       OR=0.44 unmodified for a 2024+ decision overstates standard-LLIN
       effectiveness vs PBO/dual-AI alternatives.
     applies_when:
+      domain_any: ["malaria"]   # Phase 21: gate to malaria questions
       keywords_any: ["standard llin", "llin or=0.44", "yang 2018"]
       decision_year_min: 2022
     acknowledgment_hints:
@@ -328,6 +387,7 @@ priors:
       changed, climate has shifted. Archetype-level parameters may
       misrepresent current LGA transmission.
     applies_when:
+      domain_any: ["malaria"]   # Phase 21: gate to malaria questions
       keywords_all: ["nigeria"]
       keywords_any: ["hbhi", "archetype", "ozodiegwu"]
       decision_year_min: 2022
@@ -360,56 +420,60 @@ priors:
           framework subsequently used by Ozodiegwu 2023.
 
   - id: map_pfpr_api_authentication_required
-    kind: data_vintage
-    severity_if_unaddressed: HIGH
+    # id kept for stability (referenced by past runs and self-tests); the
+    # claim was corrected in Phase 21 ε — see rationale.
+    kind: policy_caveat
+    severity_if_unaddressed: MEDIUM
     claim: |
-      The Malaria Atlas Project (MAP) PfPR raster dataset has required
-      API authentication since approximately 2024. Modelers without
-      authenticated access cannot use LGA-level MAP rasters and must
-      rely on zone-mean proxies. If the analysis CLAIMS to use MAP-
-      derived LGA PfPR but cannot access the API, this must be flagged
-      explicitly as a synthetic-proxy substitution.
+      If an analysis claims to use Malaria Atlas Project (MAP) modeled
+      PfPR rasters at sub-national (e.g., LGA) resolution, it must show
+      the rasters were actually retrieved and aggregated (file, version,
+      aggregation method). Values synthesized from zone means (e.g.,
+      zone mean + random noise) carry no independent sub-national signal
+      and must be labeled as a synthetic proxy, not as MAP data. MAP
+      data are distributed openly via the malariaAtlas R package and MAP
+      geoserver; a failed download in a sandbox is not evidence that the
+      data are unavailable.
     applies_when:
+      domain_any: ["malaria"]   # Phase 21: gate to malaria questions
       keywords_any: ["map raster", "pfpr raster", "malaria atlas",
                      "lga pfpr", "lga-level pfpr"]
       decision_year_min: 2024
     acknowledgment_hints:
-      ["MAP raster", "API authentication", "synthetic proxy",
-       "synthetic LGA PfPR", "zone mean", "MAP API unavailable"]
+      ["MAP raster", "synthetic proxy", "synthetic LGA PfPR",
+       "zone mean", "malariaAtlas", "raster version"]
     rationale: |
       Found in 2026-04-29_161312 (R-009, Limitation #2). The 161312 run
       synthesized LGA PfPR as zone-mean + N(0,0.035) noise — zero
-      independent LGA-level signal.
-    last_literature_check: 2026-04-29
+      independent LGA-level signal — and attributed the gap to MAP
+      requiring API authentication. Phase 21 ε web check found no
+      evidence of an authentication requirement (the malariaAtlas
+      package documents open download of rasters); the original
+      "authentication since 2024" claim and its two bootstrap tool
+      citations could not be verified and were removed. Severity lowered
+      to MEDIUM accordingly.
+    last_literature_check: 2026-10-20
     literature_corroboration:
       - source_type: tool
-        citation: "Malaria Atlas Project portal (https://malariaatlas.org). Authentication policy effective 2024."
+        citation: "malariaAtlas R package README (CRAN / malaria-atlas-project r-universe, v1.6-1.7). https://rdrr.io/cran/malariaAtlas/f/README.md"
         doi_or_pmid: null
-        year: 2024
+        year: 2025
         relevance: primary
-        found_via: bootstrap
+        found_via: websearch
         excerpt: |
-          Raster downloads now require registered API key; legacy direct-
-          download endpoints deprecated.
-      - source_type: tool
-        citation: "malariaAtlas R package CHANGELOG (CRAN 2024 release notes)."
-        doi_or_pmid: null
-        year: 2024
+          Downloads publicly available parasite-rate survey points,
+          vector occurrence points, and modeled raster surfaces from the
+          MAP servers; no API key is documented.
+      - source_type: paper
+        citation: "Weiss DJ et al. Mapping the global prevalence, incidence, and mortality of Plasmodium falciparum, 2000-17. Lancet 2019."
+        doi_or_pmid: "10.1016/S0140-6736(19)31097-9"
+        year: 2019
         relevance: corroborating
         found_via: bootstrap
         excerpt: |
-          Package documentation now references MAP API key requirement
-          for all raster pulls.
-      - source_type: paper
-        citation: "Weiss DJ et al. Mapping the global prevalence of P. falciparum. Lancet 2019."
-        doi_or_pmid: "10.1016/S0140-6736(19)31097-9"
-        year: 2019
-        relevance: contextual
-        found_via: bootstrap
-        excerpt: |
-          MAP raster product reference paper — the dataset reports
-          modeled PfPR with covariate-driven within-region variation
-          that is NOT recoverable from zone-mean substitutions.
+          MAP raster product reference paper — modeled PfPR with
+          covariate-driven within-region variation that is NOT
+          recoverable from zone-mean substitutions.
 
   # ------------------------------------------------------------------- #
   # Methodological standards
@@ -467,6 +531,7 @@ priors:
       empirical combined-effect study, test sub-additive sensitivity,
       or scope-declare the multiplicative-independence assumption.
     applies_when:
+      domain_any: ["malaria"]   # Phase 21: gate to malaria questions
       keywords_all: ["irs"]
       keywords_any: ["pbo", "llin", "bednet"]
     acknowledgment_hints:

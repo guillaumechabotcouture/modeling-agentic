@@ -1,13 +1,13 @@
 ---
 name: modelops-calabaria
-description: Use for model calibration, parameter optimization, scenario
-  simulation, and scaling to cloud via the modelops-calabaria framework.
-  Covers structured parameter spaces, Sobol/grid sampling, Optuna ask/tell
-  optimization, scenario management, and cloud deployment. Works with any
-  BaseModel-wrapped simulation (LASER, starsim, or custom). Trigger phrases
-  include "calibrate model", "parameter sweep", "Sobol sampling", "Optuna",
-  "modelops", "calabaria", "run scenarios", "parameter optimization",
-  "structured calibration", "cloud scaling", "distributed calibration".
+description: >-
+  Model calibration, parameter sweeps, and scenario runs with the
+  modelops-calabaria framework: structured parameter spaces, Sobol/grid
+  sampling, Optuna ask/tell optimization, scenario management, and cloud
+  scaling for any BaseModel-wrapped simulation (LASER, Starsim, custom).
+  Trigger phrases include "calibrate model", "parameter sweep", "Sobol
+  sampling", "Optuna", "modelops", "calabaria", "run scenarios", "distributed
+  calibration".
 ---
 
 # Model Calibration and Optimization with modelops-calabaria

@@ -1,21 +1,14 @@
 ---
 name: adversarial-redteam
-description: Contract for the critique-redteam agent — a skeptical adversary
-  whose job is to find what the other three critique agents (methods, domain,
-  presentation) missed. Five duties: cross-file numeric audit (every number
-  in the report must trace to a source and match); external sanity check
-  (aggregate claims must not exceed published national/global totals without
-  justification); methodological fidelity audit (implementation must actually
-  match the cited prior work's method, not a cargo-cult of its vocabulary);
-  data-vintage vs decision-year mismatch (calibration inputs must not be >5
-  years stale relative to the decision year); hidden-assumption audit (what
-  operational reality the model does NOT capture and how it affects policy).
-  Red-team uses the same blocker-schema YAML contract as the other critiques
-  with prefix R-, and CAN set structural_mismatch.detected=true. Use when
-  writing critique_redteam.{md,yaml} or when the STAGE 7 gate processes the
-  4th critique agent's output. Trigger phrases include "red team", "adversarial
-  review", "cross-file audit", "data vintage", "external sanity", "methodological
-  fidelity", "hidden assumption".
+description: >-
+  Contract for the critique-redteam agent, a skeptical adversary that finds
+  what the methods, domain, and presentation critics missed. Duties:
+  claims-ledger consistency, external sanity of aggregate claims,
+  methodological fidelity to cited work, data-vintage vs decision-year
+  mismatch, and hidden operational assumptions. Uses the blocker-schema YAML
+  with prefix R-. Trigger phrases include "red team", "adversarial review",
+  "data vintage", "external sanity", "methodological fidelity", "hidden
+  assumption".
 ---
 
 # Adversarial Red-Team Critic
@@ -27,8 +20,8 @@ The three existing critique agents (methods, domain, presentation) cover:
 - Causal claims and literature consistency (domain)
 - Figures, tables, captions, writing quality (presentation)
 
-They do NOT cover the adversarial perimeter. The malaria Nigeria run post-
-mortem surfaced **three show-stoppers and five material issues that none of
+They do NOT cover the adversarial perimeter. The post-mortem of an early
+national allocation run surfaced **three show-stoppers and five material issues that none of
 the three critiques flagged**, despite all three passing the round-3 ACCEPT.
 A skeptical reviewer at a WHO technical working group, a Gates Foundation
 program review, or a Lancet review panel would catch them.
@@ -46,16 +39,17 @@ looking for the most powerful grounds to do so. You are not here to be
 balanced, to congratulate the modeler, or to acknowledge what went well.
 You are here to find what's wrong.
 
-Specifically: a public health decision-maker (WHO, Global Fund, Gates
-Foundation) must be able to defend every quantitative claim in the report
-under hostile questioning. Your job is to anticipate the hostile questioner.
+Specifically: a public health decision-maker (a ministry of health, WHO,
+Global Fund, Gavi, a foundation) must be able to defend every quantitative
+claim in the report under hostile questioning. Your job is to anticipate the hostile questioner.
 
 Do NOT soften language. Do NOT say "it would be helpful if..." or "consider
 also..." or "a minor improvement could be...". Say things like:
 
 - "The allocation is wrong. Cost values in code are 3× below their source CSV."
-- "The 80,000 deaths-averted claim exceeds WHO's Nigeria total by >40%. The
-  PfPR→incidence chain is unvalidated."
+- "The 80,000 deaths-averted claim exceeds the country's total recorded
+  deaths from this cause by >40%. The prevalence→incidence chain is
+  unvalidated."
 - "Calibration targets are dated October 2010. The decision year is 2024.
   The counterfactual is 14 years stale and every DALY-averted number is
   wrong for the decision year."
@@ -74,12 +68,12 @@ also..." or "a minor improvement could be...". Say things like:
    `\$\d+` for dollar signs.
 2. For each, determine where it SHOULD come from: code, `citations.md`,
    a CSV in `data/`, a model output (e.g., `model_comparison.md`,
-   `results.md`, `lga_allocation.csv`).
+   `results.md`, `allocation.csv`).
 3. Verify the number exists at the expected source. Flag when it doesn't.
-4. **The specific pattern from the malaria probe**: intervention cost
-   values hardcoded in code (e.g., `$2/net`) disagreed by 3-4× with the
-   values in `data/intervention_costs.csv` ($7.50/net). Neither critique
-   agent opened both files at once. Always cross-check code vs CSVs.
+4. **A recurring pattern**: unit costs hardcoded in model code (e.g.,
+   `$2` per commodity unit) disagreed by 3-4× with the delivered-cost
+   values in `data/intervention_costs.csv`. Neither critique agent opened
+   both files at once. Always cross-check code vs CSVs.
 5. Where the `effect-size-priors` registry exists: verify every report
    number that comes from a registered parameter matches the registry's
    `value`.
@@ -95,12 +89,12 @@ also..." or "a minor improvement could be...". Say things like:
 **Example blocker text** (what you'd write):
 
 ```
-R-001: Cost values in level3_interventions.py:180-191 are 3-4× below the
-source CSV data/intervention_costs.csv. Code uses $2.00/net (standard),
-$2.50/net (PBO), $3.00/net (dual-AI). CSV reports mid values of $7.50,
-$10.00, $12.50. The $320M envelope therefore buys 3-4× more intervention
-than reality would fund. Every DALY-averted number in the report is
-scaled by the wrong cost basis.
+R-001: Cost per fully-immunized child in models/campaign_costs.py:180-191
+is $0.80 (vaccine price only). The source CSV data/intervention_costs.csv
+gives a delivered cost of $2.60 per dose once operational and cold-chain
+costs are included. The budget envelope therefore buys ~3× more coverage
+than it would fund in practice. Every DALY-averted number in the report
+is scaled by the wrong cost basis.
 ```
 
 ### Duty 2: External sanity check
@@ -113,17 +107,20 @@ without explicit justification.
 1. Identify every aggregate quantitative claim: "X deaths averted", "Y
    cases prevented", "Z% reduction in burden", "$B budget impact".
 2. For each, WebSearch the relevant published total:
-   - Deaths: WHO World Malaria Report, IHME GBD
-   - Cases: WHO WMR, national malaria control program annual reports
-   - Budget: Global Fund disbursements, PMI funding, donor reports
-   - Country-specific burden: WMR country profile
+   - Deaths and cases: IHME GBD, the relevant WHO disease report (e.g.,
+     World Malaria Report, Global TB Report, UNAIDS estimates, WHO/UNICEF
+     immunization coverage estimates), national program annual reports
+   - Budget: funder disbursement data (Global Fund, Gavi, PEPFAR, PMI,
+     domestic budget lines), donor reports
+   - Country-specific burden: the country profile in the same reports
 3. Compute the ratio of claim to published total.
 4. Flag if claim > 50% of published total without explicit modeling
    justification.
 5. Flag if claim exceeds published total outright.
-6. Flag any allocation that implies procurement volumes exceeding national
-   capacity (e.g., distributing N nets per year where N is beyond
-   historical procurement records).
+6. Flag any allocation that implies procurement or delivery volumes
+   exceeding national capacity (e.g., N doses, kits, or commodity units
+   per year where N is beyond historical procurement records or global
+   supply).
 
 **Severity**:
 - Claim exceeds published national/global total → HIGH (HARD_BLOCKER).
@@ -134,18 +131,19 @@ without explicit justification.
 **Example blocker text**:
 
 ```
-R-003: Report claims 80,000 U5 deaths averted per year (Table 7). This is
-43.5% of Nigeria's total malaria mortality per WHO WMR 2024 (184,800
-deaths/year). Scott 2017 (citation C7) puts maximum avertable deaths at
-~84,000 over FIVE YEARS with optimized allocation — this model claims ~5×
-that rate per year. The PfPR→incidence multiplier (x2.5) and CFR chain
-producing this number are unvalidated against external totals.
+R-003: Report claims 52,000 TB deaths averted per year (Table 7). The WHO
+Global TB Report estimate cited as C4 puts the country's total annual TB
+deaths at ~110,000, so the claim is ~47% of all TB mortality from one
+budget line. The published optimization cited as C7 puts maximum
+avertable deaths at a fraction of this over FIVE YEARS. The
+notification→incidence multiplier and case-fatality chain producing this
+number are unvalidated against external totals.
 ```
 
 ### Duty 3: Methodological fidelity audit
 
 **What**: when the implementation cites a prior work ("using the approach
-from Ozodiegwu 2023", "following Griffin 2010", etc.), the implementation
+from [Author YYYY]", "following [Author YYYY]", etc.), the implementation
 must actually match what the prior work did — not borrow its vocabulary
 while doing something else.
 
@@ -156,24 +154,21 @@ while doing something else.
 2. For each cited prior work, WebFetch the paper's methods section (or
    WebSearch for a publicly-available summary if the paper is paywalled).
 3. Compare the prior work's methodology against this analysis's
-   implementation. Specific axes: unit of analysis (per-LGA vs
-   per-archetype), model type (ABM vs compartmental vs regression),
+   implementation. Specific axes: unit of analysis (per-district vs
+   per-cluster/archetype), model type (ABM vs compartmental vs regression),
    calibration targets, intervention representation, outcome metrics.
 4. Flag any material divergence. "Material" means: the divergence
    affects the policy conclusions or the generalizability claims.
-5. **The specific pattern from the malaria probe**: Ozodiegwu 2023
-   simulates at per-LGA level with 22 archetypes as a clustering input.
-   This analysis collapses to 22 per-archetype simulations and applies
-   uniform per-archetype policy to all LGAs in an archetype. The
-   implementation inherits per-archetype covariates from a single
-   "representative state" per archetype. Oke-Ero spans 12 states but
-   inherits only Kwara's kdr/rainfall/zone. This is NOT what Ozodiegwu
-   did. Claiming "following Ozodiegwu 2023" while doing this is a
-   fidelity violation.
+5. **A recurring pattern**: the cited work simulates every fine-grained
+   unit (district, county) and uses clusters/archetypes only as a
+   grouping input. The analysis instead runs one simulation per cluster,
+   takes covariates from a single "representative" member, and copies
+   that cluster's policy to every unit in it. Claiming "following
+   [Author YYYY]" while doing this is a fidelity violation.
 
 **Severity**:
-- Method divergence on the unit-of-analysis axis (e.g., per-LGA vs
-  per-archetype) when the question asks for the finer grain → HIGH
+- Method divergence on the unit-of-analysis axis (e.g., per-district vs
+  per-cluster) when the question asks for the finer grain → HIGH
   (may warrant structural_mismatch: true).
 - Method divergence on model type when the question names a specific
   framework → HIGH.
@@ -184,17 +179,16 @@ while doing something else.
 **Example blocker text**:
 
 ```
-R-005: The analysis claims to "use the archetype approach from Ozodiegwu
-et al. 2023" (plan.md §Modeling Strategy, results.md §Methods). Ozodiegwu
-2023 simulates at per-LGA level with archetypes as a clustering INPUT;
-per-LGA simulation gives per-LGA policy. This analysis inverts that:
-simulations are per-archetype only, and every LGA in an archetype
-inherits uniform covariates from a single "representative state" (see
-models/level2_archetype_starsim.py:100-113). Oke-Ero spans 12 states but
-inherits only Kwara; Darazo is labeled NE but has LGAs in Zamfara (NW);
-Takali is recommended dual-AI based on Kano's kdr when only 2 of its 13
-LGAs are in Kano. The "774-LGA resolution" claim is a labeling artifact.
-This is a fidelity violation, not a methodological refinement.
+R-005: The analysis claims to "use the district-cluster approach from
+[Author YYYY]" (plan.md §Modeling Strategy, results.md §Methods). That
+work fits an HIV incidence model per district with cluster membership as
+a covariate; per-district fitting gives per-district policy. This
+analysis inverts that: it fits one model per cluster, and every district
+in a cluster inherits the covariates of a single "representative"
+district (see models/cluster_model.py:100-113). Cluster C3 spans five
+provinces but inherits only one province's ART coverage and testing
+rate. The "district-level resolution" claim is a labeling artifact. This
+is a fidelity violation, not a methodological refinement.
 ```
 
 ### Duty 4: Data-vintage vs decision-year mismatch
@@ -216,10 +210,10 @@ stale is a likely HIGH blocker.
 6. Flag:
    - Gap > 10 years on a primary calibration target: HIGH.
    - Gap > 5 years on intervention efficacy when the intervention
-     landscape has changed (e.g., net type shifts 2018→2024): HIGH.
+     landscape has changed (e.g., a new product generation or regimen): HIGH.
    - Gap > 5 years on cost data (procurement markets shift): MEDIUM.
    - Gap > 10 years on any input that affects the counterfactual: HIGH.
-7. **The specific pattern from the malaria probe**: calibration targets
+7. **Worked example (malaria allocation run)**: calibration targets
    dated `01OCT10/01NOV10` in `data/PfPr_archetype_10_v2.csv`. The
    question asks for a GC7 submission (2024 decision). Gap = 14 years.
    The counterfactual PfPR is pre-ITN-scale-up, so the "incremental
@@ -261,18 +255,18 @@ requires? Implicit assumptions are where policy-ready analyses fail.
    - Procurement lead time and funding cycles
    - Political geography and implementer capacity
    - Intervention fatigue, compliance, behavioral response
-   - Within-archetype heterogeneity (for spatial aggregation)
+   - Within-cluster heterogeneity (for spatial aggregation)
    - Intra-year seasonal mismatches (when interventions are annual but
      effects are seasonal)
    - Interaction effects between interventions (when applied singly vs
      combined)
 3. For each absent mechanism that would materially affect the policy
    conclusion, flag with the policy impact.
-4. **The specific pattern from the malaria probe**: the model assumes
-   100% delivery, no stock-outs, no intervention fatigue, and uniform
-   implementation. Real GC7 rollout has ~70-85% delivery of intended
-   coverage. If the model computes policy at 80% nominal coverage,
-   actual field coverage is 56-68%.
+4. **A recurring pattern**: the model assumes 100% delivery, no
+   stock-outs, no fatigue, and uniform implementation. Campaign-delivered
+   interventions routinely reach well below nominal targets; if the model
+   computes policy at 80% nominal coverage and field delivery is 70-85% of
+   intended, actual coverage is 56-68%.
 
 **Severity**:
 - Absent mechanism changes the policy RANKING (not just the magnitude)
@@ -286,16 +280,17 @@ requires? Implicit assumptions are where policy-ready analyses fail.
 **Example blocker text**:
 
 ```
-R-009: The allocation model assumes 100% delivery at 80% nominal
-coverage; it does not model stock-outs, procurement lead times,
-delivery leakage, or intervention fatigue. Real GC7 rollout in Nigeria
-runs 65-80% of intended coverage per PMI/NMEP operational reviews. The
-policy recommendation "allocate PBO to these 377 LGAs at 80% coverage"
-is therefore not directly actionable — it needs a delivery-efficiency
-layer. The allocation itself is still approximately right, but the
-DALYs-averted magnitudes are overstated by ~25-35%. §Limitations
-acknowledges this in one sentence; the abstract and Table 7 headline
-numbers do not carry the caveat.
+R-009: The measles campaign model assumes 95% coverage reached uniformly
+in every district; it does not model stock-outs, cold-chain failure,
+missed hard-to-reach communities, or the correlated missedness that
+leaves zero-dose children unreached campaign after campaign. The
+post-campaign coverage survey cited as C9 reports substantially lower
+and heterogeneous coverage. The recommendation "run campaigns in these
+120 districts at 95% coverage" is therefore not directly actionable — it
+needs a delivery-efficiency layer. The ranking may survive, but
+outbreaks-averted magnitudes are overstated. §Limitations acknowledges
+this in one sentence; the abstract and headline table do not carry the
+caveat.
 ```
 
 ## How red-team differs from the other critique agents

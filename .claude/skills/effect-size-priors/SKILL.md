@@ -1,19 +1,14 @@
 ---
 name: effect-size-priors
-description: Machine-readable contract for parameter provenance. Every load-bearing
-  numerical constant in model code that is sourced from the literature (intervention
-  effect sizes, odds ratios, efficacies, cost figures, calibration targets) must
-  have a registry entry in citations.md under a `## Parameter Registry` section.
-  Each entry records the point estimate, 95% CI, distribution kind (odds_ratio /
-  relative_risk / efficacy / coverage / cost_usd / …), linked source [CNN], the
-  subgroup the value applies to, and code_refs at file:line level. The registry
-  enables three mechanical checks in the STAGE 7 gate: (a) OR-used-as-RR conflation
-  detection; (b) code value vs registry value mismatch; (c) subgroup misapplication
-  (overall estimate used for a subgroup context). Use when writing or reviewing
-  citations.md, when adding a literature-sourced parameter to model code, or when
-  the gate's `--parameter-registry` flag is firing. Trigger phrases include
-  "parameter provenance", "odds ratio", "effect size", "citations registry",
-  "OR RR conflation", "@registry".
+description: >-
+  Machine-readable contract for parameter provenance. Every literature-sourced
+  load-bearing constant in model code (effect sizes, odds ratios, efficacies,
+  costs, calibration targets) needs an entry in the citations.md Parameter
+  Registry with point estimate, 95% CI, distribution kind, source, subgroup,
+  and code_refs. Enables mechanical checks for OR-used-as-RR, code-vs-registry
+  mismatch, and subgroup misapplication. Trigger phrases include "parameter
+  provenance", "odds ratio", "effect size", "citations registry", "OR RR
+  conflation", "@registry".
 ---
 
 # Effect-Size Priors: Parameter Registry

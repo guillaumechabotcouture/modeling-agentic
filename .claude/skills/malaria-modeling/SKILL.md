@@ -1,14 +1,13 @@
 ---
 name: malaria-modeling
-description: Disease-specific modeling guide for P. falciparum malaria.
-  Covers transmission dynamics, intervention mechanisms, known modeling
-  pitfalls, calibration targets, cost-effectiveness benchmarks, and
-  published benchmark models. Use when the research question involves
-  malaria incidence, prevalence, transmission, interventions, or resource
-  allocation. Trigger phrases include "malaria", "PfPR", "ITN", "bednet",
-  "IRS", "indoor residual spraying", "SMC", "seasonal malaria
-  chemoprevention", "MDA", "mass drug administration", "Global Fund
-  malaria", "malaria resource allocation", "malaria optimization".
+description: >-
+  Disease-specific guide for P. falciparum malaria: transmission dynamics,
+  intervention mechanisms (ITN, IRS, SMC, vaccines, case management), modeling
+  pitfalls, calibration targets, cost-effectiveness benchmarks, and published
+  benchmark models. Trigger phrases include "malaria", "PfPR", "ITN",
+  "bednet", "IRS", "SMC", "seasonal malaria chemoprevention", "R21", "RTS,S",
+  "malaria vaccine", "MDA", "Global Fund malaria", "malaria resource
+  allocation".
 ---
 
 # Malaria (P. falciparum) Modeling Guide
@@ -90,6 +89,16 @@ population. Without age structure, the model cannot:
 **Rule:** A model without age structure CANNOT evaluate SMC and should
 not include SMC as an optimization variable. Minimum age groups for
 SMC evaluation: 0-5y, 5-14y, 15+. Preferred: 0-5m, 6-59m, 5-14y, 15+.
+
+**Denominator rule (observed failure, 2026-05-03 run):** SMC's cases
+averted must be computed on the eligible children (3-59 months, in
+SMC-eligible areas, during the SMC season), the same population its
+cost is charged for. That run applied the SMC incidence-rate ratio to
+the whole population while charging cost per eligible child, so SMC
+was credited with averting adult cases and its value was inflated.
+The same rule applies to every age- or group-targeted intervention
+(vaccines, IPTp, PMC); see the `eligible-population-consistency`
+skill.
 
 ### Pitfall 4: ITN Effectiveness Is Context-Dependent
 
@@ -206,6 +215,16 @@ Common causes of out-of-range cost-effectiveness:
   during active window. Must be modeled with explicit seasonality and
   age structure -- cannot be represented in equilibrium.
 
+- **Malaria vaccines (RTS,S/AS01, R21/Matrix-M):** WHO-recommended
+  for children in endemic areas (RTS,S 2021, R21 2023); 4-dose
+  schedule starting around 5 months of age, delivered through routine
+  immunization (seasonal or age-based). Protects vaccinated children
+  only and wanes, so model it as an age-targeted, waning reduction in
+  clinical incidence for the vaccinated cohort, not as an all-age
+  transmission effect. Nigeria began R21 introduction in December 2024
+  (Kebbi and Bayelsa states); vaccine allocation questions must use
+  the eligible birth cohort as the denominator.
+
 - **Treatment/case management:** Reduce infectious duration (faster
   clearance with ACT) and prevent mortality. Coverage varies by
   treatment-seeking behavior and health system access.
@@ -283,7 +302,13 @@ proceed to optimization with wrong intervention effects:
 ### Epidemiology
 - National PfPR (microscopy, 6-59m): 22.6% (NMIS 2021)
 - Zone range: 14.2% (South West) to 33.5% (North West), 2.4-fold variation
-- WHO 2023 estimates: 68M cases, 184,800 deaths, 299/1000 incidence
+- WHO estimates for 2023 (published in World Malaria Report 2024):
+  68M cases, 184,800 deaths, 299/1000 incidence. World Malaria Report
+  2025 (Dec 2025) has 2024 estimates; secondary reports give ~68.5M
+  cases and ~185,000 deaths for Nigeria (unverified against the report
+  itself; check the annex tables before using).
+- Population: ~233M (UN World Population Prospects 2024, mid-2024).
+  Older figures of ~205M are stale.
 - Dominant vectors: An. gambiae s.s. (indoor), An. arabiensis (outdoor)
 - Pyrethroid resistance: widespread, especially North West and North Central
 
@@ -294,9 +319,15 @@ proceed to optimization with wrong intervention effects:
 - Zone-level is minimum for resource allocation; state-level preferred
 
 ### Key Policy Context
-- Global Fund GC7 (2024-2026): ~$993M total (HIV+TB+malaria); malaria
-  component estimated ~$320M (not publicly disaggregated)
+- Global Fund GC7 (grant cycle 2024-2026): ~$993M total
+  (HIV+TB+malaria); malaria component estimated ~$320M (not publicly
+  disaggregated). GC7 ends in 2026; questions about later decisions
+  should be framed against the next replenishment / GC8 allocation,
+  whose amounts must be looked up rather than assumed.
 - Nigeria's GC7 request includes SMC expansion to 404 LGAs (from ~80)
+- Malaria vaccine (R21) introduction began December 2024 in Kebbi and
+  Bayelsa, with ~1M initial doses (Gavi-supported plus government
+  co-procurement)
 - WHO 2024 guidelines recommend PBO/dual-AI nets for resistance areas
 - NW zone: highest burden, ~25% of population. ANY credible resource
   allocation should invest in NW.
@@ -306,8 +337,8 @@ proceed to optimization with wrong intervention effects:
 |--------|-------|--------|------|
 | Zone PfPR (6 zones) | 14.2-33.5% | NMIS 2021 (MIS41) | Primary calibration |
 | National PfPR | 22.6% (microscopy) | NMIS 2021 | Validation |
-| Case incidence | 299/1000 | WHO WMR 2024 | Validation |
-| Total deaths | 184,800 | WHO WMR 2024 | Validation |
+| Case incidence | 299/1000 | WHO WMR 2024 (2023 estimates) | Validation |
+| Total deaths | 184,800 | WHO WMR 2024 (2023 estimates) | Validation |
 | Mean EIR | 13.6 ib/p/yr | Awolola et al. 2009 | Validation (range check) |
 | ITN usage (under-5) | 41% national | NMIS 2021 | Baseline coverage |
 | R0 estimate | ~2.24 | Amadi et al. 2022 | Validation (order of magnitude) |

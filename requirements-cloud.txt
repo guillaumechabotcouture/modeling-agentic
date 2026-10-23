@@ -1,0 +1,14 @@
+# Optional cloud-execution extras for scripts/cloud_batch.py and
+# scripts/propagate_uncertainty.py --cloud (Azure Batch). Install on top
+# of requirements.txt:
+#   pip install -r requirements.txt -r requirements-cloud.txt
+# Pinned to the versions validated in the project .venv on 2026-10-20.
+azure-batch==14.2.0
+azure-identity==1.25.3
+azure-storage-blob==12.28.0
+
+# modelops-calabaria (BaseModel wrappers in
+# .claude/skills/laser-spatial-disease-modeling/scripts/laser_basemodel.py)
+# is not on PyPI under a confirmed name and is not installed in the
+# validated .venv; install it from its source repository if you use the
+# calabaria workflow.

@@ -229,7 +229,8 @@ def _from_dict(d: dict) -> ExpertPrior:
     aw = d["applies_when"]
     if not isinstance(aw, dict):
         raise ValueError("applies_when must be a mapping")
-    for key in ("keywords_all", "keywords_any"):
+    for key in ("keywords_all", "keywords_any", "domain_any",
+                "keywords_none"):
         if key in aw and not (
             isinstance(aw[key], list)
             and all(isinstance(x, str) for x in aw[key])
@@ -312,17 +313,94 @@ def prior(id_: str) -> ExpertPrior:
 # --------------------------------------------------------------------------- #
 
 
+_KW_CACHE: dict[str, re.Pattern] = {}
+
+# Phase 21 γ: a prior's domain is inferred when `applies_when.domain_any` is
+# not declared. The disease/programme-area vocabulary is data: it lives in
+# expert_priors.yaml `domain_vocabulary:` (Copilot review of PR #14), not
+# here. A prior whose id + claim names exactly one area is gated to
+# questions naming that area; an explicit `domain_any` always wins. This
+# keeps a country-keyed prior written for one disease off another
+# disease's question.
+_vocab_cache: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {}
+
+
+def domain_vocabulary(manifest_path: str | None = None) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    path = manifest_path or _MANIFEST_PATH
+    if path not in _vocab_cache:
+        try:
+            with open(path) as f:
+                raw = (yaml.safe_load(f) or {}).get("domain_vocabulary") or {}
+        except (OSError, yaml.YAMLError):
+            raw = {}
+        _vocab_cache[path] = tuple(
+            (str(k), tuple(str(x).lower() for x in (v or [])))
+            for k, v in raw.items() if isinstance(v, list))
+    return _vocab_cache[path]
+
+
+def _inferred_domain(p: "ExpertPrior") -> list[str]:
+    text = f"{p.id.replace('_', ' ')} {p.claim}".lower()
+    hits = [(canon, syns) for canon, syns in domain_vocabulary()
+            if any(_kw_in(s_, text) for s_ in syns)]
+    if len(hits) == 1:
+        return list(hits[0][1])
+    return []
+
+
+def _kw_in(kw: str, text_lower: str) -> bool:
+    """Phase 21 γ: word-boundary keyword match (plural-tolerant).
+
+    Plain substring matching made "irs" match "first" and "itn" match
+    "transmitting", attaching intervention-specific priors to unrelated
+    questions. Boundaries apply only on alphanumeric keyword edges, so
+    keywords like "$320m" or "or=0." still match as written.
+    """
+    k = kw.lower().strip()
+    if not k:
+        return False
+    rx = _KW_CACHE.get(k)
+    if rx is None:
+        pre = r"(?<![a-z0-9])" if k[0].isalnum() else ""
+        post = r"(?:e?s)?(?![a-z0-9])" if k[-1].isalpha() else (
+            r"(?![a-z0-9])" if k[-1].isalnum() else "")
+        rx = re.compile(pre + re.escape(k) + post)
+        _KW_CACHE[k] = rx
+    return bool(rx.search(text_lower))
+
+
 def _matches(p: ExpertPrior, question_lower: str,
              decision_year: int | None) -> bool:
+    """applies_when semantics:
+      keywords_all   every keyword must appear
+      keywords_any   at least one must appear
+      domain_any     Phase 21 γ: at least one domain term (disease /
+                     programme area) must appear — keeps a country- or
+                     intervention-keyed prior from attaching to a
+                     different disease's question. When absent, inferred
+                     from the prior's id + claim (`_inferred_domain`);
+                     `domain_any: []` opts out (cross-disease prior).
+      keywords_none  Phase 21 γ: none may appear
+      decision_year_min / _max
+    """
     aw = p.applies_when
     keywords_all = aw.get("keywords_all") or []
     keywords_any = aw.get("keywords_any") or []
+    domain_any = aw.get("domain_any")
+    if domain_any is None:
+        domain_any = _inferred_domain(p)
+    keywords_none = aw.get("keywords_none") or []
     for kw in keywords_all:
-        if kw.lower() not in question_lower:
+        if not _kw_in(kw, question_lower):
             return False
     if keywords_any:
-        if not any(kw.lower() in question_lower for kw in keywords_any):
+        if not any(_kw_in(kw, question_lower) for kw in keywords_any):
             return False
+    if domain_any:
+        if not any(_kw_in(kw, question_lower) for kw in domain_any):
+            return False
+    if any(_kw_in(kw, question_lower) for kw in keywords_none):
+        return False
     y_min = aw.get("decision_year_min")
     y_max = aw.get("decision_year_max")
     if decision_year is not None:
@@ -925,6 +1003,43 @@ def _self_test() -> int:
                 ok(any(c.relevance == "primary"
                        for c in p.literature_corroboration),
                    f"T10: real prior {p.id!r} has no primary source")
+
+    # T-P21 (Phase 21 γ): word-boundary + domain gating, exercised on
+    # in-memory priors so the test does not depend on registry content.
+    def _mk(pid: str, claim: str, aw: dict) -> ExpertPrior:
+        return _from_dict({"id": pid, "kind": "external_fact",
+                           "severity_if_unaddressed": "HIGH", "claim": claim,
+                           "rationale": "r", "applies_when": aw})
+
+    irs = _mk("irs_cost", "Spray rounds cost $8-12 per structure.",
+              {"keywords_any": ["irs"]})
+    ok(not _matches(irs, "where should we run the first campaign?", None),
+       "T-P21a: 'irs' must not match inside 'first'")
+    ok(_matches(irs, "should we fund irs in the north?", None),
+       "T-P21a: 'irs' must match as a word")
+    burden = _mk("country_malaria_dalys", "Malaria DALY burden is 12.8M.",
+                 {"keywords_all": ["nigeria"], "keywords_any": ["burden"]})
+    ok(not _matches(burden, "what is the tb burden in nigeria?", None),
+       "T-P21b: a malaria prior must not match a TB question")
+    ok(_matches(burden, "what is the malaria burden in nigeria?", None),
+       "T-P21b: the malaria question still matches")
+    cross = _mk("delivery", "Delivery efficiency for malaria, HIV and TB.",
+                {"keywords_any": ["campaign"], "domain_any": []})
+    ok(_matches(cross, "kenya measles campaign targeting", None),
+       "T-P21c: explicit domain_any: [] opts out of inference")
+    excl = _mk("x", "Generic.", {"keywords_any": ["vaccine"],
+                                 "keywords_none": ["veterinary"]})
+    ok(not _matches(excl, "veterinary vaccine stock", None),
+       "T-P21d: keywords_none excludes")
+    plural = _mk("nets", "Net supply.", {"keywords_any": ["bednet"]})
+    ok(_matches(plural, "how many bednets per household?", None),
+       "T-P21e: plural forms match")
+    # Real registry: non-malaria questions draw no malaria-domain prior.
+    for q in ("Where should Kenya run measles campaigns first next year?",
+              "What is the TB burden in Nigeria by district?"):
+        hits = [p_.id for p_ in matching_priors(q, 2026)
+                if "malaria" in _inferred_domain(p_)]
+        ok(not hits, f"T-P21f: {q!r} matched malaria priors {hits}")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)

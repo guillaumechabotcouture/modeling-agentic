@@ -1,0 +1,6 @@
+id: presentation
+stage: CRITIQUE
+agent: critique-presentation
+max_turns: 40
+budget_usd: 6
+wall_timeout_s: 1800

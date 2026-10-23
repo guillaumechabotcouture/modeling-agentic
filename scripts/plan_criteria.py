@@ -14,8 +14,8 @@ Phase 7 μ requires the planner to ALSO emit a structured
 
     hard_blockers:
       - id: HB-001
-        criterion: "Model reproduces NMIS 2021 zone PfPR within ±3 pp"
-        metric: zone_pfpr_rmse_pp
+        criterion: "Model reproduces survey zone prevalence within ±3 pp"
+        metric: zone_prevalence_rmse_pp
         threshold: 3.0
         operator: "<="
         artifact: model_comparison_formal.yaml
@@ -23,12 +23,12 @@ Phase 7 μ requires the planner to ALSO emit a structured
 
     minimum_bar:
       - id: MB-001
-        criterion: "Cross-validation against malariasimulation"
-        metric: malariasimulation_comparison_done
+        criterion: "Cross-validation against a published reference model"
+        metric: reference_model_comparison_done
         threshold: 1
         operator: "=="
         artifact: model_comparison_formal.yaml
-        artifact_field: malariasimulation_comparison_done
+        artifact_field: reference_model_comparison_done
 
     targets:
       - ...

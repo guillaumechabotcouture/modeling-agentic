@@ -68,6 +68,10 @@ VALID_PREFIXES = {
 DEFAULT_GAP_THRESHOLD_PCT = 10.0  # MEDIUM blocker if exceeded
 
 
+# Closed verdict vocabulary (read by validate_critique_yaml.py).
+VERDICTS = ("CLEAN", "GAP_TOO_LARGE", "NO_BENCHMARK", "MALFORMED", "MISSING")
+
+
 def _normalize_method(name: str) -> str:
     """Match `name` against VALID_METHODS or VALID_PREFIXES. Returns the
     matched canonical prefix or the input unchanged if recognized.
@@ -81,6 +85,15 @@ def _normalize_method(name: str) -> str:
         if name_l.startswith(prefix):
             return prefix
     return ""
+
+
+def _is_finite_number(v) -> bool:
+    """Phase 21 γ: NaN/inf/bool objectives used to pass the isinstance
+    check; `max()` over a NaN then produced an arbitrary "best" and a
+    NaN gap that compared False against the threshold → CLEAN."""
+    import math
+    return (isinstance(v, (int, float)) and not isinstance(v, bool)
+            and math.isfinite(v))
 
 
 def validate_optimization_quality(yaml_path: str) -> dict:
@@ -100,6 +113,11 @@ def validate_optimization_quality(yaml_path: str) -> dict:
                 "errors": [f"YAML parse error: {e}"],
                 "primary": None, "best": None}
 
+    if not isinstance(data, dict):
+        return {"verdict": "MALFORMED", "gap_pct": None,
+                "errors": ["top-level must be a mapping"],
+                "primary": None, "best": None}
+
     errors: list[str] = []
     primary_method = data.get("primary_method")
     if not _normalize_method(primary_method or ""):
@@ -109,9 +127,9 @@ def validate_optimization_quality(yaml_path: str) -> dict:
             f"{sorted(VALID_PREFIXES)}."
         )
     primary_obj = data.get("primary_objective")
-    if not isinstance(primary_obj, (int, float)):
+    if not _is_finite_number(primary_obj):
         errors.append(
-            f"primary_objective must be numeric, got {type(primary_obj).__name__}"
+            f"primary_objective must be a finite number, got {primary_obj!r}"
         )
 
     benchmarks = data.get("benchmark_methods") or []
@@ -132,10 +150,10 @@ def validate_optimization_quality(yaml_path: str) -> dict:
             errors.append(
                 f"benchmark_methods[{i}].method {b_method!r} not recognized")
             continue
-        if not isinstance(b_obj, (int, float)):
+        if not _is_finite_number(b_obj):
             errors.append(
-                f"benchmark_methods[{i}].objective must be numeric, "
-                f"got {type(b_obj).__name__}")
+                f"benchmark_methods[{i}].objective must be a finite number, "
+                f"got {b_obj!r}")
             continue
         valid_benchmarks.append({
             "method": b_method,
@@ -154,9 +172,16 @@ def validate_optimization_quality(yaml_path: str) -> dict:
     ]
     best_method, best_obj = max(all_objs, key=lambda x: x[1])
     if best_obj <= 0:
-        gap_pct = 0.0  # all-zero objectives degenerate; no useful gap
-    else:
-        gap_pct = 100.0 * (best_obj - float(primary_obj)) / best_obj
+        # Phase 21 γ: all-non-positive objectives (nothing averted by
+        # any method) used to report gap 0 → CLEAN.
+        return {"verdict": "MALFORMED", "gap_pct": None,
+                "errors": [f"best objective {best_obj} is not positive; "
+                           f"objectives must be the maximized outcome "
+                           f"(e.g. outcome averted)"],
+                "primary": {"method": primary_method,
+                            "objective": float(primary_obj)},
+                "best": {"method": best_method, "objective": best_obj}}
+    gap_pct = 100.0 * (best_obj - float(primary_obj)) / best_obj
 
     verdict = "GAP_TOO_LARGE" if gap_pct > DEFAULT_GAP_THRESHOLD_PCT else "CLEAN"
 
@@ -258,6 +283,21 @@ def _run_self_test() -> int:
         r6 = validate_optimization_quality(f6)
         ok(r6["verdict"] == "CLEAN",
            f"T6: prefix-matched method names should validate, got {r6}")
+
+        # T7 (Phase 21 γ): NaN / inf / boolean objectives and all-zero
+        # objectives are MALFORMED, never CLEAN.
+        for prim, bench in ((".nan", "100"), ("100", ".nan"),
+                            (".inf", "100"), ("true", "100"), ("0", "0")):
+            f7 = os.path.join(d, "t7.yaml")
+            with open(f7, "w") as f:
+                f.write("primary_method: greedy\n"
+                        f"primary_objective: {prim}\n"
+                        "benchmark_methods:\n"
+                        "  - method: ilp\n"
+                        f"    objective: {bench}\n")
+            r7 = validate_optimization_quality(f7)
+            ok(r7["verdict"] == "MALFORMED",
+               f"T7: primary={prim} bench={bench} must be MALFORMED, got {r7}")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)

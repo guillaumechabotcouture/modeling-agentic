@@ -1,6 +1,13 @@
 ---
 name: pre-model-identifiability-arithmetic
-description: Phase 15 α — required PRE-MODEL artifact `models/identifiability_a_priori.yaml`. Before committing to a model architecture, count free fitted parameters vs independent calibration targets. Verdict IDENTIFIABLE (ratio < 1), MARGINAL (1-3), or OVER_SATURATED (> 3). The 224202 run shipped a HYBRID ABM with 40 fitted params / 6 zone targets (6.67× ratio); post-hoc identifiability flagged 3 unidentified params and the modeler scope-declared. This skill prevents that failure mode by requiring 30 seconds of arithmetic at strategy time. Trigger phrases include "identifiability", "parameter count", "calibration targets", "over-saturated", "ridge-trapped", "decorative ABM", "saturated fit", "model is more complex than data supports".
+description: >-
+  Required PRE-MODEL artifact `models/identifiability_a_priori.yaml`: before
+  committing to an architecture, count free fitted parameters vs independent
+  calibration targets (ratio < 1 IDENTIFIABLE, 1-3 MARGINAL, > 3
+  OVER_SATURATED). A low ratio is necessary, not sufficient; post-hoc
+  identifiability still applies. Trigger phrases include "parameter count",
+  "calibration targets", "over-saturated", "ridge-trapped", "decorative ABM",
+  "model is more complex than data supports".
 type: rigor-remediation
 ---
 
@@ -58,9 +65,9 @@ stage: pre_model
 round_drafted: 1
 
 calibration_targets:
-  - source: NMIS 2021 zone PfPR
-    n_independent: 6                # 6 zones × 1 PfPR measurement each
-    derivation: "6 zones × 1 PfPR measurement each"
+  - source: national TB prevalence survey, regional estimates
+    n_independent: 6                # 6 regions × 1 prevalence estimate each
+    derivation: "6 regions × 1 prevalence estimate each"
 total_independent_targets: 6        # sum of n_independent across sources
 
 proposed_parameters:                # documentation only — the validator
@@ -69,17 +76,17 @@ proposed_parameters:                # documentation only — the validator
                                     # work; if its sums disagree with the
                                     # totals, fix the totals (the validator
                                     # trusts the scalar fields).
-  - name: ext_foi_per_archetype
-    count: 20                       # 20 archetypes × 1 ext_foi each
+  - name: beta_per_district_cluster
+    count: 20                       # 20 clusters × 1 transmission rate each
     fitted: true
     prior_constraint: weak          # weak | strong | none | literature
-  - name: dur_immune_per_archetype
+  - name: case_detection_rate_per_cluster
     count: 20
     fitted: true
     prior_constraint: none
-  - name: standard_llin_or
+  - name: treatment_success_rate
     count: 1
-    fitted: false                   # fixed from Yang 2018; not counted
+    fitted: false                   # fixed from program data; not counted
     prior_constraint: literature
 
 total_fitted_parameters: 40         # ENFORCED — validator reads this scalar
@@ -90,14 +97,15 @@ verdict: OVER_SATURATED             # IDENTIFIABLE | MARGINAL | OVER_SATURATED
 
 architecture_implication: |
   Under HYBRID architecture (intervention effects from literature,
-  baseline PfPR from calibration), the calibration round-trips NMIS
-  PfPR through 40 unidentifiable knobs. ABM is decorative.
+  baseline prevalence from calibration), the calibration round-trips
+  6 survey estimates through 40 unidentifiable knobs. The ABM is
+  decorative.
 
 resolution:                         # required when verdict != IDENTIFIABLE
-  decision: tie_params_by_ecotype
+  decision: tie_params_by_region
   details: |
-    Reduce ext_foi from 20 archetype-specific to 5 ecotype-specific
-    values. Drop dur_immune as free parameter. New count: 5 fitted
+    Tie beta to the 5 regions that have survey estimates; fix case
+    detection from notification/prevalence ratios. New count: 5 fitted
     / 6 targets = 0.83. Verdict IDENTIFIABLE.
 ```
 
@@ -110,16 +118,16 @@ Verdict thresholds:
 
 **Independent calibration targets** = independent measurements only.
 
-- Zone-mean PfPR from NMIS counts as **1 target per zone** (6 for Nigeria's 6 zones)
-- LGA-level synthetic disaggregations from zone means are NOT independent (they're derived; they don't add information)
-- A national-level WHO incidence anchor counts as 1 target if it's used as an independent constraint
+- A zone- or region-level survey estimate counts as **1 target per zone** (e.g., 6 targets for 6 survey zones)
+- District-level synthetic disaggregations of zone means (or modeled rasters fitted to the same survey) are NOT independent — they're derived and don't add information
+- A national-level incidence anchor (e.g., a WHO or GBD estimate) counts as 1 target if it's used as an independent constraint
 - Multiple years of the same survey can count as N targets if the model uses time-varying calibration
 
 **Free fitted parameters** = parameters the optimizer adjusts to match data.
 
 - Parameters fixed from literature (`fitted: false`) do NOT count
 - Parameters with strong informative priors count as ~0.5 (Bayesian regularization adds virtual data)
-- Parameters tied across groups count as 1 per group, not 1 per archetype
+- Parameters tied across groups count as 1 per group, not 1 per member unit
 - Tunable architectural choices (e.g., compartment count) count if the modeler actively varies them
 
 ## Resolution decisions when verdict ≠ IDENTIFIABLE
@@ -130,10 +138,10 @@ Tie parameters across groups. Best for retaining ABM mechanism diversity.
 
 ```yaml
 resolution:
-  decision: tie_params_by_ecotype
+  decision: tie_params_by_region
   details: |
-    20 archetype-specific ext_foi → 5 ecotype-specific (NW/NE/NC/S/coastal).
-    Each ecotype's archetypes share one ext_foi. Ratio: 5/6 = 0.83 → IDENTIFIABLE.
+    20 cluster-specific transmission rates → 5 region-specific values.
+    Each region's clusters share one rate. Ratio: 5/6 = 0.83 → IDENTIFIABLE.
 ```
 
 ### (b) add_calibration_targets
@@ -144,24 +152,24 @@ Add independent data. Hardest path because it requires actual new data.
 resolution:
   decision: add_calibration_targets
   details: |
-    Add state-level PfPR from MIS 2018 (37 states, independent of NMIS 2021).
-    Add WHO WMR 2024 incidence anchor (1 target).
+    Add province-level estimates from an earlier, independent survey
+    round (37 provinces). Add a national WHO incidence anchor (1 target).
     New target count: 6 + 37 + 1 = 44. Ratio: 40/44 = 0.91 → IDENTIFIABLE.
 ```
 
 ### (c) downgrade_to_analytical
 
 Drop the ABM entirely. Use the analytical model:
-`PfPR_post = PfPR_baseline × OR_intervention × programmatic_factor`.
+`outcome_post = outcome_baseline × RR_intervention × programmatic_factor`.
 
 ```yaml
 resolution:
   decision: downgrade_to_analytical
   details: |
-    Drop the Starsim ABM. Use NMIS PfPR directly with literature
-    multipliers (Yang OR=0.44, Protopopoff OR=0.40). No calibration
-    step needed; no fitted parameters. Predictions are equivalent
-    to what the ABM would have produced anyway, more transparent.
+    Drop the ABM. Use the survey estimates directly with literature
+    effect multipliers from the registry. No calibration step needed;
+    no fitted parameters. Predictions are equivalent to what the ABM
+    would have produced anyway, and more transparent.
 ```
 
 ### (d) accept_decorative
@@ -175,14 +183,15 @@ resolution:
     [100-300 word justification required. Acceptable justifications:
     age-structured immunity dynamics that the analytical model
     cannot represent; projection beyond calibration window where
-    transmission dynamics matter; nonlinear PfPR-EIR saturation
-    that literature OR multipliers don't capture. If you can't
+    transmission dynamics matter; nonlinear saturation between
+    transmission intensity and prevalence that literature multipliers
+    don't capture. If you can't
     articulate one of these, choose (a)/(b)/(c) instead.]
 ```
 
 The validator REQUIRES details text when decision is `accept_decorative`. Empty details fires HIGH `pre_model_decorative_undocumented`.
 
-## Worked example: 224202 retro
+## Worked example: 224202 retro (national malaria allocation)
 
 The Phase 14 RESUME run (224202) shipped:
 
@@ -226,17 +235,35 @@ adding 1 calibration target for that parameter.
 
 ```yaml
 proposed_parameters:
-  - name: ext_foi_per_archetype
+  - name: beta_per_district_cluster
     count: 20
     fitted: true
-    prior_constraint: strong       # narrow prior (e.g., from EMOD)
+    prior_constraint: strong       # narrow prior (e.g., from an external calibration)
 
 # When prior_constraint == 'strong', count this as 0.5 fitted
 # parameter (one virtual data point cancels half the free parameter).
 # 20 strong-prior fitted = 10 effective fitted. New ratio: 10/6 = 1.67 → MARGINAL.
 ```
 
-This is acceptable when the prior is genuinely informative (e.g., from EMOD calibration on an external Nigeria dataset). Document the prior source in `prior_constraint_source` field.
+This is acceptable when the prior is genuinely informative (e.g., from a published calibration on an independent dataset for the same setting). Document the prior source in `prior_constraint_source` field.
+
+## The arithmetic is necessary, not sufficient
+
+A ratio below 1 does NOT prove the parameters are identifiable. Two
+parameters can be jointly unidentifiable (only their product or
+ratio is constrained) even when targets outnumber parameters, and
+targets that are near-copies of each other add less information than
+their count suggests. The 235631 run declared 17 fitted parameters
+against 37 targets (IDENTIFIABLE); the model it actually built fitted
+22 parameters to 22 targets, and post-hoc analysis found every one of
+them unidentified. Two rules follow:
+
+- The totals in this artifact must describe the model you actually
+  build. If the architecture changes, update the artifact; the
+  post-hoc identifiability and model-comparison artifacts will be
+  compared against it.
+- Post-hoc identifiability (`identifiability-analysis`) is still
+  required and is the binding check.
 
 ## Related skills
 

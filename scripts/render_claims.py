@@ -2,8 +2,8 @@
 
 The writer drafts `report.md` using `[CLAIM:claim_id]` references for
 every numeric / percentage / currency / count / verdict-label / citation
-claim. This script reads `models/claims_ledger.yaml` (produced by the
-analyst), looks up each referenced claim, formats it, and substitutes
+claim. This script reads `models/claims_ledger.yaml`, looks up each
+referenced claim, formats it, and substitutes
 the rendered string back into `report.md`. Free prose is preserved.
 
 Why this exists
@@ -13,6 +13,10 @@ survived to ACCEPT (R-019 verdict mismatch, R-020 LGA count drift,
 $197M cost conflation). The coherence auditor catches drift after
 the fact; the claims ledger PREVENTS drift structurally — the writer
 cannot re-narrate a number that doesn't exist in the ledger.
+
+Phase 22 γ: when `models/claims_spec.yaml` exists, the ledger is first
+rebuilt from it (scripts/build_claims_ledger.py), so every rendered
+number is read from its source artifact at render time.
 
 Usage
 -----
@@ -30,6 +34,12 @@ Exit codes
 - 1: one or more references unresolved (typo'd claim ID, missing
      ledger). report.md is left in writer's-draft form; details
      printed to stderr.
+
+Phase 21 γ: report.md is genuinely left untouched on unresolved
+references (it previously received a partial render, which a re-run
+then copied over report.unrendered.md, losing the writer's draft).
+Claim ids may contain `.` and `-`; any `[CLAIM:...]`-shaped token that
+does not resolve — malformed id included — is reported as unresolved.
 """
 from __future__ import annotations
 
@@ -42,8 +52,16 @@ from typing import Any
 
 import yaml
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from lib.text_spans import code_spans, in_spans  # noqa: E402
 
-_CLAIM_REF_RE = re.compile(r"\[CLAIM:([A-Za-z0-9_]+)\]")
+# Phase 21 γ: ids may use `.` and `-` (e.g. `cases-averted`, `h2.verdict`);
+# the old `[A-Za-z0-9_]+` pattern left such tokens raw AND uncounted.
+_CLAIM_ID_CHARS = r"A-Za-z0-9_.\-"
+_CLAIM_ID_RE = re.compile(rf"[{_CLAIM_ID_CHARS}]+")
+# Any `[CLAIM:...]`-shaped token (single line). Tokens whose payload is
+# not a well-formed id are unresolved by construction.
+_CLAIM_REF_RE = re.compile(r"\[CLAIM:([^\]\n]*)\]")
 
 # Kinds whose claims must carry a non-null `value`. Citation kinds are
 # always required to have a value (the citation string); the other
@@ -55,33 +73,59 @@ _VALUE_REQUIRED_KINDS = frozenset({
 })
 
 
+# Phase 21 γ: shared with coherence_audit.py via scripts/lib/text_spans.py.
 def _fenced_or_inline_code_spans(text: str) -> list[tuple[int, int]]:
-    """Return spans of fenced code blocks (``` / ~~~) and inline code
-    (backtick-delimited) in `text`. Used to skip `[CLAIM:id]` references
-    that appear inside documentation/examples of the syntax itself."""
-    spans: list[tuple[int, int]] = []
-    # Fenced blocks: pair up consecutive fence markers on their own lines.
-    fence_pat = re.compile(r"^(?:```|~~~)", re.MULTILINE)
-    starts = [m.start() for m in fence_pat.finditer(text)]
-    for i in range(0, len(starts) - 1, 2):
-        # Find end-of-line for the closing fence so we include the
-        # entire fenced region.
-        end_idx = text.find("\n", starts[i + 1])
-        if end_idx == -1:
-            end_idx = len(text)
-        spans.append((starts[i], end_idx + 1))
-    # Inline code: `...` on a single line (avoid spanning newlines).
-    inline_pat = re.compile(r"`[^`\n]+`")
-    for m in inline_pat.finditer(text):
-        if not any(s <= m.start() < e for s, e in spans):
-            spans.append((m.start(), m.end()))
-    return spans
+    return code_spans(text, inline=True)
 
 
 def _in_protected_span(spans: list[tuple[int, int]], pos: int) -> bool:
-    return any(s <= pos < e for s, e in spans)
+    return in_spans(spans, pos)
 
 # ----- Magnitude helpers ------------------------------------------------ #
+
+
+_SUFFIXES = ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K"))
+
+
+def _strip_zeros(s: str) -> str:
+    return s.rstrip("0").rstrip(".") if "." in s else s
+
+
+def _scaled(v: float, decimals: int) -> str:
+    """Scale `v` to a B/M/K suffix with `decimals` places.
+
+    Phase 21 γ: the suffix is chosen AFTER rounding, so 999,600 renders
+    as 1M rather than 1000K (and 999,999,999 as 1B, not 1000M).
+    """
+    av = abs(v)
+    for i, (div, suf) in enumerate(_SUFFIXES):
+        if av >= div:
+            body = f"{v / div:.{decimals}f}"
+            if abs(float(body)) >= 1000 and i > 0:
+                up_div, up_suf = _SUFFIXES[i - 1]
+                return _strip_zeros(f"{v / up_div:.{decimals}f}") + up_suf
+            return _strip_zeros(body) + suf
+    # Below 1,000: rounding can still carry into the K band.
+    if round(av, decimals) >= 1000:
+        return _strip_zeros(f"{v / 1000:.{decimals}f}") + "K"
+    return ""
+
+
+def _small(v: float, decimals: int) -> str:
+    """Render |v| < 1000 without losing small magnitudes.
+
+    Phase 21 γ: 0.0005 rendered as "0" under fixed decimals; values whose
+    fixed-decimal rendering would drop all significant digits keep two
+    significant figures instead.
+    """
+    if float(v).is_integer():
+        return str(int(v))
+    fixed = _strip_zeros(f"{v:.{decimals}f}")
+    if fixed not in ("0", "-0"):
+        return fixed
+    import math
+    digits = max(decimals, -int(math.floor(math.log10(abs(v)))) + 1)
+    return _strip_zeros(f"{v:.{digits}f}")
 
 
 def _format_magnitude(v: float, decimals: int = 2) -> str:
@@ -95,28 +139,34 @@ def _format_magnitude(v: float, decimals: int = 2) -> str:
     '2.3B'
     >>> _format_magnitude(63)
     '63'
+    >>> _format_magnitude(0.0005)
+    '0.0005'
     """
-    av = abs(v)
-    if av >= 1_000_000_000:
-        return f"{v / 1_000_000_000:.{decimals}f}".rstrip("0").rstrip(".") + "B"
-    if av >= 1_000_000:
-        return f"{v / 1_000_000:.{decimals}f}".rstrip("0").rstrip(".") + "M"
-    if av >= 1_000:
-        return f"{v / 1_000:.{decimals}f}".rstrip("0").rstrip(".") + "K"
-    if isinstance(v, float) and not v.is_integer():
-        return f"{v:.{decimals}f}".rstrip("0").rstrip(".")
-    return str(int(v))
+    return _scaled(v, decimals) or _small(v, decimals)
 
 
 def _format_currency(v: float, decimals: int = 1) -> str:
-    """Render a currency value with $ prefix and magnitude suffix."""
-    if abs(v) >= 1_000_000_000:
-        return f"${v / 1_000_000_000:.{decimals}f}".rstrip("0").rstrip(".") + "B"
-    if abs(v) >= 1_000_000:
-        return f"${v / 1_000_000:.{decimals}f}".rstrip("0").rstrip(".") + "M"
-    if abs(v) >= 1_000:
-        return f"${v / 1_000:.0f}K"
-    return f"${v:.0f}"
+    """Render a currency value with $ prefix and magnitude suffix.
+
+    Phase 21 γ: sub-$1,000 non-integer amounts keep cents ($0.85, not $1);
+    thousands keep one decimal ($1.2K, not $1K).
+    """
+    sign = "-" if v < 0 else ""
+    av = abs(v)
+    scaled = _scaled(av, decimals)
+    if scaled:
+        return f"{sign}${scaled}"
+    if float(av).is_integer():
+        return f"{sign}${int(av)}"
+    return f"{sign}${av:.2f}"
+
+
+def _format_interval(lo: str, hi: str, lo_num: float, hi_num: float) -> str:
+    """Phase 21 γ: `lo-hi` is ambiguous when a bound is negative
+    ("-5-3"); use "lo to hi" then."""
+    if lo_num < 0 or hi_num < 0:
+        return f"{lo} to {hi}"
+    return f"{lo}-{hi}"
 
 
 # ----- Per-kind renderers ----------------------------------------------- #
@@ -137,29 +187,33 @@ def render_claim(claim: dict) -> str:
     ci_high = claim.get("ci_high")
     has_ci = ci_low is not None and ci_high is not None
 
+    def _ci(fmt) -> str:
+        lo, hi = float(ci_low), float(ci_high)
+        return f" (95% CI: {_format_interval(fmt(lo), fmt(hi), lo, hi)})"
+
+    def _pct(x: float) -> str:
+        return f"{x:.1f}%".replace(".0%", "%")
+
     if kind == "scalar":
         body = _format_magnitude(float(val))
         if has_ci:
-            body += (f" (95% CI: {_format_magnitude(float(ci_low))}"
-                     f"-{_format_magnitude(float(ci_high))})")
+            body += _ci(_format_magnitude)
         return body
 
     if kind == "count":
-        return str(int(val))
+        # Phase 21 γ: round, don't truncate (12.7 → 13).
+        return str(int(round(float(val))))
 
     if kind == "percentage":
-        body = f"{float(val):.1f}%".replace(".0%", "%")
+        body = _pct(float(val))
         if has_ci:
-            lo = f"{float(ci_low):.1f}%".replace(".0%", "%")
-            hi = f"{float(ci_high):.1f}%".replace(".0%", "%")
-            body += f" (95% CI: {lo}-{hi})"
+            body += _ci(_pct)
         return body
 
     if kind == "currency":
         body = _format_currency(float(val))
         if has_ci:
-            body += (f" (95% CI: {_format_currency(float(ci_low))}"
-                     f"-{_format_currency(float(ci_high))})")
+            body += _ci(_format_currency)
         return body
 
     if kind == "label":
@@ -179,6 +233,7 @@ def render_claim(claim: dict) -> str:
 _VALID_KINDS = frozenset({
     "scalar", "count", "label", "percentage", "currency", "citation",
 })
+_NUMERIC_KINDS = frozenset({"scalar", "count", "percentage", "currency"})
 
 
 def load_claims(ledger_path: str) -> dict[str, dict]:
@@ -202,6 +257,12 @@ def load_claims(ledger_path: str) -> dict[str, dict]:
         cid = c.get("id")
         if not isinstance(cid, str) or not cid:
             raise ValueError(f"{ledger_path}: claims[{i}] missing string `id`")
+        # Phase 21 γ: an id the reference syntax cannot express can never
+        # be rendered; reject it here instead of leaving raw tokens.
+        if not _CLAIM_ID_RE.fullmatch(cid):
+            raise ValueError(
+                f"{ledger_path}: claims[{i}] id {cid!r} must match "
+                f"[{_CLAIM_ID_CHARS}]+")
         if cid in out:
             raise ValueError(f"{ledger_path}: duplicate claim id {cid!r}")
         kind = c.get("claim_kind")
@@ -218,11 +279,33 @@ def load_claims(ledger_path: str) -> dict[str, dict]:
             raise ValueError(
                 f"{ledger_path}: claims[{i}] {cid!r} of kind {kind!r} "
                 f"must have a non-null `value` field")
-        # CI consistency
-        if kind in ("scalar", "percentage"):
-            v = c.get("value")
+        v = c.get("value")
+        # Phase 21 γ: YAML coerces `yes`/`no`/`true` to booleans; a label
+        # claim must be the verdict string itself, and numeric kinds must
+        # be numbers (render_claim would otherwise crash or print "TRUE").
+        if isinstance(v, bool):
+            raise ValueError(
+                f"{ledger_path}: claims[{i}] {cid!r} value is a YAML "
+                f"boolean ({v!r}); quote it if it is a label")
+        if kind in _NUMERIC_KINDS and v is not None:
+            try:
+                fv_check = float(v)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"{ledger_path}: claims[{i}] {cid!r} of kind {kind!r} "
+                    f"has non-numeric value {v!r}")
+            if fv_check != fv_check or fv_check in (float("inf"),
+                                                    float("-inf")):
+                raise ValueError(
+                    f"{ledger_path}: claims[{i}] {cid!r} value is not finite")
+        # CI consistency (Phase 21 γ: currency and count too)
+        if kind in _NUMERIC_KINDS:
             lo = c.get("ci_low")
             hi = c.get("ci_high")
+            if (lo is None) != (hi is None):
+                raise ValueError(
+                    f"{ledger_path}: claims[{i}] {cid!r} declares only one "
+                    f"CI bound")
             if lo is not None and hi is not None and v is not None:
                 try:
                     fv, flo, fhi = float(v), float(lo), float(hi)
@@ -255,15 +338,25 @@ def render_text(text: str, claims: dict[str, dict]) -> tuple[str, list[str]]:
     def _sub(m: re.Match) -> str:
         if _in_protected_span(protected, m.start()):
             return m.group(0)
-        cid = m.group(1)
-        c = claims.get(cid)
+        cid = m.group(1).strip()
+        c = claims.get(cid) if _CLAIM_ID_RE.fullmatch(cid or "") else None
         if c is None:
-            unresolved.append(cid)
+            unresolved.append(cid or "<empty>")
             return m.group(0)  # leave reference intact
         return render_claim(c)
 
     new_text = _CLAIM_REF_RE.sub(_sub, text)
     return new_text, unresolved
+
+
+def _builder():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "build_claims_ledger", os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                            "build_claims_ledger.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def render_run(run_dir: str) -> dict:
@@ -282,7 +375,8 @@ def render_run(run_dir: str) -> dict:
     if not os.path.exists(report_path):
         return {"ok": False, "error": f"report.md not found at {report_path}",
                 "n_refs": 0, "n_unresolved": 0, "unresolved_ids": []}
-    if not os.path.exists(ledger_path):
+    if not os.path.exists(ledger_path) and not os.path.exists(
+            os.path.join(run_dir, "models", "claims_spec.yaml")):
         return {"ok": False,
                 "error": f"claims_ledger.yaml not found at {ledger_path}",
                 "n_refs": 0, "n_unresolved": 0, "unresolved_ids": []}
@@ -290,13 +384,20 @@ def render_run(run_dir: str) -> dict:
     with open(report_path) as f:
         text = f.read()
 
-    n_refs = len(_CLAIM_REF_RE.findall(text))
+    protected = _fenced_or_inline_code_spans(text)
+    n_refs = sum(1 for m in _CLAIM_REF_RE.finditer(text)
+                 if not _in_protected_span(protected, m.start()))
     if n_refs == 0:
         # No references; nothing to do
         return {"ok": True, "n_refs": 0, "n_unresolved": 0,
                 "unresolved_ids": [], "snapshot_path": None,
                 "report_path": report_path}
 
+    if os.path.exists(os.path.join(run_dir, "models", "claims_spec.yaml")):
+        _, spec_errors = _builder().write(run_dir)
+        if spec_errors:
+            return {"ok": False, "error": "claims_spec.yaml: " + "; ".join(spec_errors[:5]),
+                    "n_refs": n_refs, "n_unresolved": 0, "unresolved_ids": []}
     claims = load_claims(ledger_path)
 
     # Snapshot the writer's draft before substitution.
@@ -306,10 +407,10 @@ def render_run(run_dir: str) -> dict:
     new_text, unresolved = render_text(text, claims)
 
     if unresolved:
-        # Partial render still written so the lead can see what landed.
-        # Caller (CLI / agent) can decide whether to halt or escalate.
-        with open(report_path, "w") as f:
-            f.write(new_text)
+        # Phase 21 γ: leave report.md as the writer's draft (as the module
+        # docstring always promised). Writing the partial render here
+        # meant a second invocation snapshotted half-rendered text over
+        # report.unrendered.md, destroying the draft.
         return {"ok": False, "n_refs": n_refs,
                 "n_unresolved": len(set(unresolved)),
                 "unresolved_ids": sorted(set(unresolved)),
@@ -498,6 +599,105 @@ def _self_test() -> int:
        f"T11 inline-code reference must be preserved: {new_text!r}")
     ok(new_text.count("100") == 1,
        f"T11 only one substitution should occur: {new_text!r}")
+
+    # ---- Phase 21 γ ---------------------------------------------------- #
+
+    # T12: hyphen / dot ids render; malformed or empty tokens are
+    # unresolved rather than silently left raw.
+    claims_t12 = {
+        "cases-averted": {"id": "cases-averted", "claim_kind": "count",
+                          "value": 4120},
+        "h2.verdict": {"id": "h2.verdict", "claim_kind": "label",
+                       "value": "supported"},
+    }
+    new_text, un = render_text(
+        "Averts [CLAIM:cases-averted] cases; H2 is [CLAIM:h2.verdict]. "
+        "Bad: [CLAIM:has space] and [CLAIM:].", claims_t12)
+    ok("Averts 4120 cases" in new_text and "H2 is SUPPORTED" in new_text,
+       f"T12 hyphen/dot ids must render: {new_text!r}")
+    ok(sorted(un) == ["<empty>", "has space"],
+       f"T12 malformed tokens must be unresolved: {un}")
+
+    # T13: precision-preserving formatting.
+    cases_t13 = [
+        ({"claim_kind": "scalar", "value": 0.0005}, "0.0005"),
+        ({"claim_kind": "scalar", "value": 999_999}, "1M"),
+        ({"claim_kind": "currency", "value": 999_600}, "$999.6K"),
+        ({"claim_kind": "currency", "value": 999_960}, "$1M"),
+        ({"claim_kind": "currency", "value": 999_999_999}, "$1B"),
+        ({"claim_kind": "currency", "value": 0.85}, "$0.85"),
+        ({"claim_kind": "currency", "value": 1_234}, "$1.2K"),
+        ({"claim_kind": "currency", "value": 12.8e6}, "$12.8M"),
+        ({"claim_kind": "currency", "value": -2.5e6}, "-$2.5M"),
+        ({"claim_kind": "count", "value": 12.7}, "13"),
+    ]
+    for c, want in cases_t13:
+        got = render_claim({"id": "x", **c})
+        ok(got == want, f"T13 {c} → {got!r}, want {want!r}")
+
+    # T14: negative CI uses "to" separator, not "-5-3".
+    got = render_claim({"id": "x", "claim_kind": "scalar", "value": -1,
+                        "ci_low": -5, "ci_high": 3})
+    ok(got == "-1 (95% CI: -5 to 3)", f"T14 negative CI: {got!r}")
+
+    # T15: ledger validation — currency CI bounds, booleans, non-numeric,
+    # one-sided CI, ids the syntax cannot express.
+    bad_ledgers = {
+        "currency_ci": {"id": "c", "claim_kind": "currency", "value": 5e6,
+                        "ci_low": 9e6, "ci_high": 1e6},
+        "bool_label": {"id": "l", "claim_kind": "label", "value": True},
+        "str_scalar": {"id": "s", "claim_kind": "scalar", "value": "~0.3"},
+        "one_sided": {"id": "o", "claim_kind": "scalar", "value": 1,
+                      "ci_low": 0},
+        "bad_id": {"id": "has space", "claim_kind": "scalar", "value": 1},
+    }
+    for label, entry in bad_ledgers.items():
+        with tempfile.TemporaryDirectory() as d:
+            lp = os.path.join(d, "claims_ledger.yaml")
+            with open(lp, "w") as f:
+                yaml.safe_dump({"claims": [entry]}, f)
+            try:
+                load_claims(lp)
+                ok(False, f"T15 {label}: should have raised")
+            except ValueError:
+                pass
+
+    # T16: unresolved references leave report.md untouched, and a re-run
+    # does not overwrite the snapshot with half-rendered text.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "models", "claims_ledger.yaml"), "w") as f:
+            yaml.safe_dump({"claims": [
+                {"id": "a", "claim_kind": "scalar", "value": 100}]}, f)
+        draft = "Got [CLAIM:a] and [CLAIM:b_typo].\n"
+        with open(os.path.join(d, "report.md"), "w") as f:
+            f.write(draft)
+        render_run(d)
+        render_run(d)
+        with open(os.path.join(d, "report.md")) as f:
+            ok(f.read() == draft, "T16: report.md must stay the draft")
+        with open(os.path.join(d, "report.unrendered.md")) as f:
+            ok(f.read() == draft, "T16: snapshot must stay the draft")
+
+    # T17 (Phase 22 γ): with a claims spec, the rendered number comes from
+    # the source artifact, even when a stale ledger file says otherwise.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "models", "out.yaml"), "w") as f:
+            yaml.safe_dump({"n_units": 208}, f)
+        with open(os.path.join(d, "models", "claims_spec.yaml"), "w") as f:
+            yaml.safe_dump({"claims": [{"id": "n", "claim_kind": "count",
+                                        "source_artifact": "models/out.yaml",
+                                        "source_field": "n_units"}]}, f)
+        with open(os.path.join(d, "models", "claims_ledger.yaml"), "w") as f:
+            yaml.safe_dump({"claims": [{"id": "n", "claim_kind": "count", "value": 150}]}, f)
+        with open(os.path.join(d, "report.md"), "w") as f:
+            f.write("We fund [CLAIM:n] units.\n")
+        r = render_run(d)
+        with open(os.path.join(d, "report.md")) as f:
+            body = f.read()
+        ok(r["ok"] and "208" in body and "150" not in body,
+           f"T17: spec-built ledger wins over a stale file ({r}, {body!r})")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)

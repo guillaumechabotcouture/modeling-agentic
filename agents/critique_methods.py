@@ -42,7 +42,8 @@ code that is NOT in the registry):
    paper report an odds ratio, a relative risk, a hazard ratio, or an
    incidence rate ratio?** Misclassification is a HIGH hard-blocker —
    OR and RR are not interchangeable when outcome prevalence is high
-   (>~10%). At PfPR 40%, OR=0.35 corresponds to RR≈0.47, not 0.35.
+   (>~10%). For example, at 40% baseline prevalence OR=0.35
+   corresponds to RR≈0.47, not 0.35.
 4. Is the `subgroup` specification tight enough? An overall estimate
    applied to a conditional context (e.g., RR at ≥80% coverage applied
    to all coverage levels) is a HIGH hard-blocker.

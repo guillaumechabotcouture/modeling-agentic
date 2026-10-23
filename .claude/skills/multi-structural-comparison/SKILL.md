@@ -1,16 +1,13 @@
 ---
 name: multi-structural-comparison
-description: Contract for multi-structural model comparison. Modeler must
-  produce ≥3 candidate model structures (null, simple, full) and a manifest
-  at models/model_comparison.yaml listing each model's k_params, predictions,
-  and (where possible) leave-one-out predictions. The compare_models.py tool
-  computes RMSE, LOO-CV RMSE, AIC, BIC; flags AIC-vs-LOO divergence; and
-  specifically flags DEGENERATE FIT — the "AIC lies" pattern where saturated
-  k ≥ n/2 gives near-zero training RMSE but LOO-RMSE equals the null model's.
-  Use when writing the manifest, interpreting model_comparison_formal.yaml,
-  or justifying a choice between candidate models. Trigger phrases include
-  "multi-structural", "model comparison", "AIC", "BIC", "LOO-CV", "saturated
-  fit", "degenerate fit", "candidate structures".
+description: >-
+  Contract for comparing at least three candidate structures (null, simple,
+  full) via `models/model_comparison.yaml` (k_params, predictions,
+  leave-one-out predictions). compare_models.py computes RMSE, LOO-CV RMSE,
+  AIC, BIC and flags DEGENERATE FIT, where saturated k >= n/2 gives near-zero
+  training error but LOO error no better than the null. Trigger phrases
+  include "multi-structural", "model comparison", "AIC", "BIC", "LOO-CV",
+  "saturated fit", "degenerate fit", "candidate structures".
 ---
 
 # Multi-Structural Model Comparison
@@ -70,7 +67,7 @@ Every run must produce:
 
      - name: full
        k_params: 23
-       description: "SEIR compartmental surrogate for the archetype ABM"
+       description: "SEIR compartmental surrogate for the cluster-level ABM"
        predictions: [...]
        loo_predictions: [...]
    ```
@@ -139,7 +136,8 @@ options:
    shrinks per-unit estimates toward a global mean. This effectively
    reduces k_params.
 2. **Remove excess DOF**: tie redundant parameters (e.g., if you have
-   22 EIRs and all cluster into 4 archetypes, fit 4 EIRs not 22).
+   22 per-unit transmission rates and they cluster into 4 groups, fit
+   4 rates, not 22).
 3. **Honest scope declaration**: acknowledge the model's predictions
    for held-out units are no better than the null. This is real
    science — the data simply doesn't identify the structure — and

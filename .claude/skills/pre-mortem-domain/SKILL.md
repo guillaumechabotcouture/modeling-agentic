@@ -1,6 +1,14 @@
 ---
 name: pre-mortem-domain
-description: Phase 17 α — required PRE-MODEL artifact `pre_mortem.yaml`, produced by the critique-premortem agent on a clean slate (only plan.md, hypotheses.md, success_criteria.yaml, the question, and matching expert priors). Catches HIGH-impact concerns — feasibility, supply-chain, vintage, blind spots — that would be expensive to fix once MODEL has built. The modeler must address each HIGH in `modeling_strategy.md § Pre-mortem Responses` before STAGE 7 ACCEPT. Trigger phrases include "pre-mortem", "what would go wrong", "domain blind spot", "feasibility", "procurement constraint", "expert prior".
+description: >-
+  Required PRE-MODEL artifact `pre_mortem.yaml`, produced by the
+  critique-premortem agent from a clean slate (plan, hypotheses, success
+  criteria, question, matching expert priors). Surfaces HIGH-impact
+  feasibility, supply, data-vintage, and blind-spot concerns before MODEL
+  builds; the modeler answers each HIGH in `modeling_strategy.md § Pre-mortem
+  Responses`. Trigger phrases include "pre-mortem", "what would go wrong",
+  "domain blind spot", "feasibility", "procurement constraint", "expert
+  prior".
 type: rigor-remediation
 ---
 
@@ -10,10 +18,10 @@ type: rigor-remediation
 
 The detection ratchet (Phases 1-16) caught failure modes inside a
 finished run. But experts and external reviewers keep raising the
-same domain concerns across runs — Nigeria's GBD 2021 DALY
-denominator, global PBO LLIN supply ceiling, MAP API
-authentication, multiplicative PBO+IRS independence, etc. Each was
-re-discovered per run.
+same domain concerns across runs — the country's total burden
+denominator, global commodity supply ceilings, data-access
+authentication, the assumption that combined interventions act
+independently, etc. Each was re-discovered per run.
 
 Phase 17 α inserts a **pre-mortem domain critic** (the
 `critique-premortem` agent) into the PRE-MODEL window — alongside
@@ -44,35 +52,34 @@ triggers as follows:
 ```yaml
 generated_at: 2026-05-03T10:00:00Z
 agent: critique-premortem
-question_first_60_chars: "Build an agent-based model of malaria transmission"
-matching_prior_ids:
-  - nigeria_malaria_total_burden_dalys
-  - pbo_llin_global_supply_ceiling
-  - gc7_malaria_budget_disaggregation
-  # ... (matched against expert_priors.yaml's applies_when)
+question_first_60_chars: "Optimize allocation of a TB case-finding budget across di"
+matching_prior_ids: []      # ids from expert_priors.yaml whose applies_when
+                            # matched this question (empty if none match)
 
 concerns:
   - id: PM-001
     severity: HIGH
     category: FEASIBILITY     # ARCHITECTURE | DATA | FEASIBILITY | BLIND_SPOT | EXPERT_PRIOR
     concern: |
-      Plan recommends universal PBO LLIN at 80% coverage for ~205M
-      population without procurement feasibility section.
+      Plan recommends community active case-finding with chest X-ray
+      and CAD in 300 districts in year 1 without a capacity or
+      procurement section.
     what_could_go_wrong: |
-      ~30M PBO nets/yr required for Nigeria alone. Global LLIN
-      procurement is ~30M/yr (UNICEF 2022); PBO share is < 50%.
-      Recommendation as written would consume the entire global PBO
-      LLIN supply for one country. Reviewers (Global Fund, PMI) will
-      reject without a supply-chain caveat or phased roll-out.
+      The recommendation implies hundreds of digital X-ray units,
+      trained radiographers, and confirmatory molecular tests at a
+      volume far above current national capacity and above what the
+      supplier can deliver in one procurement cycle. Reviewers will
+      reject it without a phased roll-out or a capacity constraint in
+      the optimizer.
     suggested_check: |
-      Add a §Procurement Feasibility section to results.md citing
-      UNICEF Supply Annual Report and discuss either (a) phased
-      coverage, (b) mixed PBO + dual-AI portfolio, or (c) an
-      explicit scope-declaration of the supply constraint.
+      Add a §Delivery Feasibility section citing current device counts,
+      lab capacity, and procurement lead times, and either (a) phase
+      coverage, (b) add a capacity constraint to the optimizer, or
+      (c) scope-declare the constraint explicitly.
     evidence_files:
       - "plan.md:§Allocation"
-      - "expert_prior:pbo_llin_global_supply_ceiling"
-    addressed_in: null
+    addressed_in: null        # must point at a real section heading in
+                              # modeling_strategy.md once addressed
 
   # ... up to 8 concerns total
 

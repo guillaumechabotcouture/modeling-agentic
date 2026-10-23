@@ -1,3 +1,15 @@
+---
+name: model-validation
+description: >-
+  Strategies for validating a fitted model: train/test and held-out splits,
+  cross-validation (including spatial and temporal holdout), posterior
+  predictive checks, residual diagnostics, and comparison against benchmarks.
+  Use when evaluating model quality, comparing models, or setting up a
+  validation procedure. Trigger phrases include "validate model", "held-out",
+  "cross-validation", "out-of-sample", "posterior predictive check",
+  "residuals".
+---
+
 # Model Validation Strategies
 
 ## When to use this skill

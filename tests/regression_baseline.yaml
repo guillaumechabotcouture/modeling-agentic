@@ -1,0 +1,16 @@
+# Written by `python3 scripts/regression_eval.py --update-baseline`.
+# A detected: true entry may only flip to false with a stated reason in the PR.
+detected:
+  s11:budget_overspend:column cost: true
+  s11:ci_inverted:vaccine_efficacy.ci_low: false
+  s11:ledger_mismatch:claims[n_funded].value: true
+  s11:renamed_verdict:verdict: true
+  s11:unit_error:column baseline_rate: true
+  s11:zero_width_ci:cost_per_child.ci_low/ci_high: false
+  s7:budget_overspend:column cost: true
+  s7:ci_inverted:vaccine_efficacy.ci_low: false
+  s7:ledger_mismatch:claims[n_funded].value: true
+  s7:renamed_verdict:verdict: true
+  s7:unit_error:column baseline_rate: true
+  s7:zero_width_ci:vaccine_efficacy.ci_low/ci_high: false
+clean_high: []

@@ -119,9 +119,14 @@ except ImportError:
 
 
 # Module-level regexes — compiled once, scanned per text (not per check).
+# Phase 21 γ: the magnitude suffix must end at a word boundary and the
+# single letters are case-sensitive — "12 months" is not 12M, "5 Malaria"
+# not 5M, "3 key" not 3,000 (each previously "matched" any target).
+# The number must not end where another digit or a decimal/thousands
+# continuation follows: otherwise "1000mg" backtracks to match 100 and
+# "0.45pp" to match 0.4 (Copilot review of PR #14).
 _NUMERIC_TOKEN_RE = re.compile(
-    r"(\d+(?:\.\d+)?)\s*(M|million|k|thousand)?",
-    re.IGNORECASE,
+    r"(?<![\d.,])(\d+(?:\.\d+)?)(?!\d|[.,]\d)\s*((?i:million|thousand)|M|[kK])?(?![A-Za-z])",
 )
 _NUMERIC_COMMA_RE = re.compile(r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?)")
 
@@ -136,11 +141,20 @@ _FORMULA_ALLOWED_NODES = (
 )
 
 
+_MAX_FORMULA_EXPONENT = 16
+
+
 def _safe_eval_formula(formula: str, vars_: dict) -> float:
     """Evaluate a constants-only arithmetic expression. Allowed:
     +, -, *, /, //, %, **, parens, and references to keys in vars_.
     Disallowed: function calls, attributes, subscripts, comparisons,
-    booleans, anything else. Raises ValueError on invalid input."""
+    booleans, anything else. Raises ValueError on invalid input.
+
+    Phase 21 γ: division by zero, overflow, non-finite results, and
+    exponents beyond ±16 (``10**10**10`` would hang the gate) raise
+    ValueError — which callers turn into a failed check — instead of an
+    uncaught exception that crashed the validator.
+    """
     try:
         tree = ast.parse(formula, mode="eval")
     except SyntaxError as e:
@@ -187,10 +201,28 @@ def _safe_eval_formula(formula: str, vars_: dict) -> float:
             if isinstance(op, ast.Mod):
                 return l % r
             if isinstance(op, ast.Pow):
-                return l ** r
+                if abs(r) > _MAX_FORMULA_EXPONENT:
+                    raise ValueError(
+                        f"formula {formula!r}: exponent {r} exceeds "
+                        f"±{_MAX_FORMULA_EXPONENT}")
+                return float(l) ** r
         raise ValueError(f"unhandled node {type(n).__name__}")
 
-    return float(ev(tree))
+    import math
+    try:
+        result = float(ev(tree))
+    except ZeroDivisionError:
+        raise ValueError(f"formula {formula!r} divides by zero "
+                         f"(vars: {vars_})")
+    except OverflowError:
+        raise ValueError(f"formula {formula!r} overflows")
+    except TypeError:
+        raise ValueError(f"formula {formula!r} evaluates to a complex "
+                         f"value (fractional power of a negative number)")
+    if isinstance(result, complex) or not math.isfinite(result):
+        raise ValueError(f"formula {formula!r} evaluates to a non-finite "
+                         f"value ({result})")
+    return result
 
 
 def _check_mass_balance(schema: dict) -> list[dict]:
@@ -1052,6 +1084,40 @@ def _run_self_test() -> int:
         ok(all(c["passed"] for c in r["checks"]
                if c["id"] == "universe_completeness"),
            f"W-universe-over: declared < CSV should PASS, got {r}")
+
+    # ---- Phase 21 γ ---------------------------------------------------- #
+
+    # X1: division by zero / overflow / huge exponents / complex powers
+    # become failed checks, never an uncaught exception.
+    for formula, consts in (("primary / zero", {"zero": 0}),
+                            ("primary * 10 ** 10 ** 10", {}),
+                            ("neg ** 0.5", {"neg": -4}),
+                            ("primary ** 400", {})):
+        schema = {"derived_consistency": [{
+            "primary": "doses", "derived": "cost", "primary_value": 10.0,
+            "derived_actual": 5.0, "formula": formula, "constants": consts}]}
+        try:
+            res = _check_derived_consistency(schema)
+            ok(len(res) == 1 and res[0]["passed"] is False
+               and "eval error" in res[0]["claim"],
+               f"X1 {formula!r}: expected failed check, got {res}")
+        except Exception as e:  # noqa: BLE001 — the point of the test
+            ok(False, f"X1 {formula!r}: raised {type(e).__name__}: {e}")
+
+    # X2: magnitude suffixes need a word boundary and case match.
+    for text, target, want in (("Over 12 months of follow-up", 12e6, False),
+                               ("5 Malaria Consortium sites", 5e6, False),
+                               ("3 key districts", 3000, False),
+                               ("averts 12M infections", 12e6, True),
+                               ("averts 12 million infections", 12e6, True),
+                               ("about 3k sites", 3000, True),
+                               ("a 1,234 total", 234, False),
+                               # Copilot review: no backtracking into a shorter number
+                               ("dose 1000mg", 100, False),
+                               ("gap 0.45pp", 0.4, False),
+                               ("bound 100.", 100, True)):
+        got = _text_contains_value(text, target)
+        ok(got is want, f"X2 {text!r} ~ {target}: got {got}, want {want}")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)

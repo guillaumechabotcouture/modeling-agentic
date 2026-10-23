@@ -1,15 +1,13 @@
 ---
 name: laser-spatial-disease-modeling
-description: This skill should be used for building spatial disease transmission
-  models using the LASER (Light Agent Spatial modeling for ERadication) framework
-  (v1.0.0+). This skill is appropriate when the user asks to model disease spread
-  across geographic populations, simulate SEIR-type diseases with spatial coupling,
-  set up gravity-model migration networks, wrap LASER models as BaseModel for
-  calabaria calibration, or reproduce spatial epidemiological phenomena like
-  traveling waves and critical community size. Trigger phrases include "LASER model",
-  "spatial disease model", "gravity model transmission", "SEIR spatial simulation",
-  "wavelet phase analysis", "critical community size", "build SEIR model",
-  "wrap model as BaseModel", or "LASER BaseModel".
+description: >-
+  Build spatial disease transmission models with the LASER framework
+  (v1.0.0+): SEIR-type dynamics with spatial coupling, gravity-model migration
+  networks, BaseModel wrappers for calabaria calibration, and phenomena like
+  traveling waves and critical community size. Trigger phrases include "LASER
+  model", "spatial disease model", "gravity model transmission", "SEIR spatial
+  simulation", "wavelet phase analysis", "critical community size", "LASER
+  BaseModel".
 ---
 
 # Spatial Disease Transmission Modeling with LASER
@@ -55,9 +53,10 @@ If `season.mean() != 1.0`, the effective transmission rate is systematically hig
 
 **After building ANY component, verify it. After running ANY simulation, verify outputs.**
 
-Implement these 5 automated checks inline in your `models/` directory
-(prior bundled `scripts/verification_checks.py` was never shipped — see
-`runs/*/models/` for working examples that build and call them):
+Run these automated checks after every build. Reference implementations
+ship with this skill in `.claude/skills/laser-spatial-disease-modeling/scripts/verification_checks.py`
+(`verify_model_health(model)` runs all of them); copy it into your
+`models/` directory and adapt it rather than re-implementing:
 
 - `check_population_trajectory()` — catches wrong birthrate units
 - `check_compartment_nonnegativity()` — catches depletion bugs
@@ -327,9 +326,9 @@ RoutineImmunizationEx(model, coverage_fn, dose_timing)
 
 #### Option B: VaccinationCampaign (custom, simpler API)
 
-Define inline in your `models/` directory (no bundled
-`custom_components.py` — implement the class yourself; see
-`runs/*/models/` for prior working implementations). Supports
+A reference implementation ships with this skill in
+`.claude/skills/laser-spatial-disease-modeling/scripts/custom_components.py`;
+copy it into your `models/` directory and adapt it. Supports
 correlated missedness for hard-to-reach populations:
 
 ```python
@@ -434,7 +433,7 @@ class MyComponent:
 - `on_birth(istart, iend, tick)`: Initialize per-agent properties for newborns
 - Always update node-level counts (`nodes.S`, `nodes.R`) when changing agent states
 
-For working reference implementations of `Importation`, `VaccinationCampaign`, and `SeasonalTransmission`, see prior runs under `runs/*/models/`.
+Reference implementations of `Importation`, `VaccinationCampaign`, and `SeasonalTransmission` ship with this skill in `scripts/custom_components.py`.
 
 ---
 
@@ -484,7 +483,7 @@ class MySpatialSEIR(BaseModel):
         ...
 ```
 
-For a disease-agnostic `SpatialSEIRModel(BaseModel)` template, see prior runs under `runs/*/models/` and adapt the component list, parameter ranges, and output extractors for your disease.
+For a disease-agnostic `SpatialSEIRModel(BaseModel)` template, start from this skill's `scripts/laser_basemodel.py` and adapt the component list, parameter ranges, and output extractors for your disease.
 
 **Next step:** Use the `modelops-calabaria` skill for calibration workflow (Sobol sweeps, Optuna optimization, scenario analysis).
 
@@ -621,7 +620,7 @@ plt.xlabel("Day"); plt.ylabel("R/N"); plt.show()
 - **`references/laser_api_reference.md`** — Complete LASER v1.0.0 API documentation (Model, LaserFrame, PropertySet, all component variants, vital dynamics, migration models, distributions)
 - **`references/wavelet_analysis.md`** — Wavelet transform functions, phase difference computation, and traveling wave detection workflow
 
-For working **example implementations** of `Importation`, `VaccinationCampaign`, `SeasonalTransmission`, `verify_model_health`, the calibration metrics (CCS logistic fitting, wavelet phase scoring, `compute_calibration_loss`), and a `SpatialSEIRModel(BaseModel)` template, see prior runs under `runs/*/models/`. These are not bundled with this skill — implement them inline in your own `models/` directory, copying the patterns from a prior run that solved a similar disease.
+For working **example implementations** of `Importation`, `VaccinationCampaign`, `SeasonalTransmission`, `verify_model_health`, the calibration metrics (CCS logistic fitting, wavelet phase scoring, `compute_calibration_loss`), and a `SpatialSEIRModel(BaseModel)` template, see this skill's `scripts/` directory: `custom_components.py`, `verification_checks.py`, `calibration_metrics.py`, and `laser_basemodel.py`. Copy what you need into your own `models/` directory and adapt it. (`runs/` is gitignored, so prior runs are not a reliable source of examples.)
 
 ---
 

@@ -21,6 +21,7 @@ validator_stderr_*.txt
 .claude/scheduled_tasks.lock
 
 # Local scratch experiments and one-off reports at repo root
-benchmark/
-experiments/
+/benchmark/
+/experiments/*
+!/experiments/E[0-9]*_*/
 /*.pdf

@@ -1,35 +1,37 @@
 ---
 name: decision-rule-extraction
-description: Required rigor artifact when a run produces an allocation
-  CSV (LGA-level, district-level, geography-level budget/intervention
-  assignment). Instead of shipping a 774-row table that no human can
-  defend, the modeler must also ship a `decision_rule.md` that states
-  the rule a program officer will use (or declare the allocation
-  non-compressible with justification). The STAGE 7 validator blocks
-  HIGH when `*allocation*.csv` exists without a validated
-  `decision_rule.md`. Trigger phrases include "decision rule",
-  "allocation rule", "774 rows no rule", "what is the rule", "how do I
-  defend this allocation", "per-LGA choices".
+description: >-
+  Required rigor artifact when a run produces an allocation CSV (any
+  geography- or unit-level budget/intervention assignment). Instead of
+  shipping a table of hundreds of rows no one can defend, the modeler ships
+  `decision_rule.md` stating the rule a program officer will apply, or
+  declares the allocation non-compressible with justification. The validator
+  blocks HIGH when `*allocation*.csv` exists without a valid rule. Trigger
+  phrases include "decision rule", "allocation rule", "what is the rule", "how
+  do I defend this allocation", "per-unit choices".
 ---
 
 # Decision Rule Extraction
 
 ## Why this exists
 
-Across three malaria runs, the pipeline produced an `lga_allocation.csv`
-— 774 rows mapping each Nigerian LGA to an intervention package. In
-each case, a Global Fund program officer asked the same reasonable
-question: **"What is the rule? How do I defend per-LGA choices?"** —
-and there was no answer. Critique agents did not catch it because a
+Across three national malaria-allocation runs, the pipeline produced
+an allocation CSV — 774 rows mapping each district to an intervention
+package. In each case, a program officer asked the same reasonable
+question: **"What is the rule? How do I defend per-district choices?"**
+— and there was no answer. Critique agents did not catch it because a
 tabular allocation looks normal in a paper. But for the end user of
-the model, a 774-row table without an articulated rule is an
-optimizer dump, not a policy recommendation.
+the model, a several-hundred-row table without an articulated rule is
+an optimizer dump, not a policy recommendation. The same holds for any
+disease and any allocation unit (districts, facilities, schools,
+campaign rounds).
 
 A decision rule is the compact statement — a table, a short tree, a
 prose paragraph — that a program officer can carry into a meeting.
-"Every LGA in archetype A3 with PfPR > 0.2 gets ITN+IRS+SMC; A1-A2
-LGAs get ITN+SMC; everything else ITN only." That is an artifact the
-NMEP can implement. A spreadsheet of 774 rows is not.
+"Every district in stratum S3 with burden above threshold T gets
+package C; S1-S2 districts get package B; everything else package A."
+That is an artifact a national program can implement. A spreadsheet of
+several hundred rows is not.
 
 ## When the rule is required
 
@@ -61,8 +63,8 @@ List every feature the rule uses. Each line:
   range (if numeric) or categories (if categorical).
 
 Example:
-- `archetype`: lga_archetypes.csv, categorical, {A1,A2,...,A6}
-- `PfPR`: map_pfpr.csv, numeric, [0.02, 0.78]
+- `stratum`: unit_strata.csv, categorical, {S1,S2,...,S6}
+- `incidence_per_100k`: notifications.csv, numeric, [12, 640]
 - `access_to_care`: dhs.csv, numeric, [0.12, 0.94]
 
 ## Rule (required)
@@ -80,15 +82,15 @@ The rule itself. Format depends on `rule_type`:
   the optimizer's choice. Float in [0, 1]. Required even for
   `non-compressible` (will be ≤ 0.X).
 - `exceptions_count`: integer, count of rows where the rule disagrees.
-- `exceptions_list`: list of LGA/unit identifiers where the rule
+- `exceptions_list`: list of allocation-unit identifiers where the rule
   disagrees. Required if `exceptions_count > 0`.
 
 ## Justification (required iff rule_type=non-compressible)
 
 If no compact rule achieves ≥ 90% accuracy and the optimizer's choices
-truly depend on LGA-specific detail, explain why. A legitimate
+truly depend on unit-specific detail, explain why. A legitimate
 non-compressibility argument references: (1) interaction terms too
-complex to summarize, (2) LGA-specific constraints from stakeholder
+complex to summarize, (2) unit-specific constraints from stakeholder
 consultation, (3) optimizer exploiting numerical near-ties. A program
 officer must still be able to read this section and understand why
 they can't answer "what's the rule?" with a short statement.
@@ -101,8 +103,8 @@ they can't answer "what's the rule?" with a short statement.
    `allocated_package`, etc.) and the feature columns.
 
 2. **Try the simple cases first**:
-   - Does a single feature predict the decision? (e.g., archetype alone)
-   - Does a 2-feature table (archetype × PfPR bucket) predict it?
+   - Does a single feature predict the decision? (e.g., stratum alone)
+   - Does a 2-feature table (stratum × burden bucket) predict it?
    - Do the decision column's values cluster by a threshold rule on a
      continuous feature?
 
@@ -117,7 +119,7 @@ they can't answer "what's the rule?" with a short statement.
      (and argue it honestly in the Justification section).
 
 5. **Do NOT fabricate a rule** — if the allocation is genuinely
-   optimizer-driven with per-LGA heterogeneity, say so. The gate
+   optimizer-driven with per-unit heterogeneity, say so. The gate
    accepts `non-compressible` with a real justification. It does NOT
    accept a fake 60%-accuracy "rule" presented as if it were the real
    policy.
@@ -137,32 +139,32 @@ headings. Violations:
 ## Forbidden patterns: self-referential rule nodes
 
 A rule node's question must be answerable from **input features alone**
-(archetype, PfPR, population, geographic zone, a concrete CE-cutoff
+(stratum, burden or coverage metric, population, geographic zone, a concrete CE-cutoff
 value like `> $20/case`). It must NOT be answerable only after running
 the optimizer. The following patterns are mechanically rejected (γ
 check):
 
-❌ "Is the LGA in the funded set?" — funded set is the optimizer's
+❌ "Is the district in the funded set?" — funded set is the optimizer's
    output. A program officer can't apply this without running the
    model.
 
-❌ "Is the LGA cost-effective enough to fund at $107M/yr?" — same
+❌ "Is the district cost-effective enough to fund at $107M/yr?" — same
    problem. The "cost-effective enough" threshold is implicit in the
    optimizer's ranking; it's not a value the rule states.
 
-❌ "Was the LGA ranked by the optimizer?" — output, not input.
+❌ "Was the district ranked by the optimizer?" — output, not input.
 
-❌ "Is PfPR ≥ 15% AND budget remaining?" — "budget remaining" is the
+❌ "Is incidence ≥ 150/100k AND budget remaining?" — "budget remaining" is the
    optimizer's output state, not an input. A program officer can't
    evaluate this without re-running the optimizer.
 
-❌ "Is the LGA cost-effective enough to fund AND budget available?" —
+❌ "Is the district cost-effective enough to fund AND budget available?" —
    compound self-reference; both clauses fail the input-only test.
 
-✅ "Is PfPR > 25%?" — input feature with a stated cutoff.
+✅ "Is incidence > 250/100k?" — input feature with a stated cutoff.
 
-✅ "Is the LGA in the SMC-eligible northern zones (NW, NE, NC)?" —
-   geographic input from the archetype table.
+✅ "Is the district in the zones eligible for the seasonal campaign
+   (Z1, Z2, Z3)?" — geographic input from the strata table.
 
 ✅ "Is cases-averted-per-dollar > $20/case?" — concrete CE cutoff
    value the rule itself states. (Compute the cutoff value during
@@ -192,23 +194,25 @@ rule_type: tabular
 
 # Decision Rule
 
+Illustrative TB case-finding allocation across districts:
+
 ## Features
-- `archetype`: lga_archetypes.csv, categorical, {A1..A6}
-- `pfpr_u5`: map_pfpr.csv, numeric, [0.02, 0.78]
+- `setting`: district_strata.csv, categorical, {urban, peri-urban, rural}
+- `est_incidence_per_100k`: who_tb_estimates.csv, numeric, [40, 620]
 
 ## Rule
 
-| archetype     | PfPR<0.2        | PfPR 0.2-0.4   | PfPR≥0.4          |
-|---------------|------------------|-----------------|--------------------|
-| A1-A2 (stable) | ITN only        | ITN+SMC         | ITN+SMC+ACT        |
-| A3-A4 (seasonal) | ITN+SMC       | ITN+IRS+SMC     | ITN+IRS+SMC+ACT    |
-| A5-A6 (epidemic) | ITN          | ITN+IRS         | ITN+IRS+SMC        |
+| setting      | incidence<150        | incidence 150-300       | incidence≥300                    |
+|--------------|----------------------|-------------------------|----------------------------------|
+| urban        | passive case-finding | + facility screening    | + community ACF + CXR vans       |
+| peri-urban   | passive case-finding | + facility screening    | + community ACF                  |
+| rural        | passive case-finding | passive + contact tracing | + facility screening + contact tracing |
 
 ## Validation
 
 - `accuracy_vs_optimizer`: 0.94
-- `exceptions_count`: 45
-- `exceptions_list`: [Borno-Maiduguri, Yobe-Damaturu, ...]
+- `exceptions_count`: 19
+- `exceptions_list`: [district-041, district-117, ...]
 ```
 
 ## Example — non-compressible (legitimate)
@@ -236,10 +240,10 @@ See Justification below.
 ## Justification
 
 The allocation is driven by strong interaction between stockout risk,
-stakeholder pre-commitment (11 LGAs with SMC already committed in GC6
-Q4 residual), and a near-tie in the optimizer's score between
-ITN+IRS+SMC and ITN+SMC for most A3 LGAs. A tabular rule with
-≥90% accuracy would require > 20 cells. The per-LGA allocation is
-tracked in `lga_allocation.csv`; program officers should use the CSV
-with explicit per-LGA consultation, not a compact rule.
+stakeholder pre-commitment (11 districts with a package already
+committed under the previous grant), and a near-tie in the optimizer's
+score between packages C and B for most S3 districts. A tabular rule
+with ≥90% accuracy would require > 20 cells. The per-district
+allocation is tracked in `allocation.csv`; program officers should use
+the CSV with explicit per-district consultation, not a compact rule.
 ```

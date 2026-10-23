@@ -21,10 +21,10 @@ and make scientific judgments.
 3. Read {run_dir}/modeling_strategy.md (progression from simple to complex).
 4. Read all model output: {run_dir}/model_comparison.md, model code, stdout.
 5. Read all figures + {run_dir}/figure_rationale.md.
-6. **Produce {run_dir}/models/claims_ledger.yaml BEFORE writing results.md** —
-   see the Claims Ledger section below. Every quantitative or categorical
-   claim that will appear in your `results.md` (and the writer's
-   `report.md`) must be registered in the ledger first.
+6. **Write {run_dir}/models/claims_spec.yaml and build the ledger BEFORE
+   writing results.md** — see the Claims Ledger section below. Every
+   quantitative or categorical claim that will appear in your `results.md`
+   (and the writer's `report.md`) must be registered first.
 
 ## THREAD UPDATES
 
@@ -92,28 +92,37 @@ With computed answers including uncertainty ranges.
 ### Limitations
 Specific, not generic. Each limitation should name what it affects.
 
-## Claims Ledger (Phase 18 α — REQUIRED before results.md)
+## Claims Ledger (Phase 18 α; spec-built since Phase 22 γ — REQUIRED before results.md)
 
-You must produce `{run_dir}/models/claims_ledger.yaml` listing every
-quantitative or categorical claim that will appear in your `results.md`
-or the writer's `report.md`. The writer is bound to reference your
-ledger entries by ID using `[CLAIM:claim_id]` syntax — narrative prose
-may use the references inline, and `scripts/render_claims.py`
-substitutes them at write-time. **The writer cannot introduce numbers
-or labels that are not in the ledger.** This is the structural fix for
-the paraphrase-drift class (R-019, R-020, $197M conflation).
+Every quantitative or categorical claim that will appear in your
+`results.md` or the writer's `report.md` is registered once. The writer
+references claims by ID using `[CLAIM:claim_id]` syntax, and
+`scripts/render_claims.py` substitutes the values at write-time. **The
+writer cannot introduce numbers or labels that are not registered.**
 
-### What goes in the ledger
+**You do not type the numbers.** You write `{run_dir}/models/claims_spec.yaml`:
+each claim says *where* its number lives (`source_artifact` +
+`source_field`), never what it is. Then run:
+
+```bash
+python3 scripts/build_claims_ledger.py {run_dir}
+```
+
+It reads each value (and CI) from the cited artifact and writes
+`models/claims_ledger.yaml`. That file is script-produced: you cannot
+write it, and the validator and render_claims rebuild it from the spec
+every time, so it cannot drift from the artifacts.
+
+### What goes in the spec
 - Every scalar with CI (DALYs averted, cost-effectiveness, RMSE, …)
-- Every count (LGAs allocated to package X, archetypes calibrated, …)
-- Every percentage / share (NW budget share, package coverage, …)
-- Every currency figure ($320M total, $122.4M IRS Phase 2, …)
+- Every count (units allocated to package X, archetypes calibrated, …)
+- Every percentage / share (a region's budget share, package coverage, …)
+- Every currency figure (total budget, cost of one package line, …)
 - Every verdict label (sensitivity ROBUST/SENSITIVE/UNSTABLE,
   hypothesis SUPPORTED/REFUTED/INCONCLUSIVE, …)
-- Every external-fact citation (GBD 2021 12.8M, UNICEF supply
-  ceiling, …) — values you cite from priors or literature
+- Every external-fact citation (a burden estimate, a supply ceiling, …)
 
-### What does NOT go in the ledger
+### What does NOT go in the spec
 - Free prose (sentences without numbers/labels)
 - Section headers, paragraph structure
 - Generic methodology language
@@ -121,68 +130,76 @@ the paraphrase-drift class (R-019, R-020, $197M conflation).
 ### Schema (one entry per claim)
 
 ```yaml
-generated_at: <ISO 8601>
 claims:
   - id: dalys_optimized_mean              # stable; writer references this
     claim_kind: scalar                    # scalar | count | label | percentage | currency | citation
-    value: 7467997
     units: dalys_per_year                 # required for scalar/currency
-    ci_low: 5140000                       # optional, for scalar/percentage
-    ci_high: 10420000
     source_artifact: uncertainty_report.yaml
-    source_field: scalar_outputs.total_dalys_averted_optimized.mean
+    source_field: scalar_outputs.total_dalys_averted_optimized.mean   # CI read from sibling ci_low/ci_high
     causal_label: PROXY                   # CAUSAL | ASSOCIATIONAL | PROXY | BY_CONSTRUCTION
     confidence: HIGH                      # HIGH | MEDIUM | LOW
     related_text: "DALYs averted under optimized allocation"
 
-  - id: nw_share_pct
+  - id: region_a_share_pct
     claim_kind: percentage
-    value: 52.5
-    source_artifact: allocation_optimized.csv
-    source_field: "filter zone='North West'.cost_usd.sum() / total"
+    source_artifact: models/allocation_summary.yaml
+    source_field: shares_by_region.region_a.pct
     causal_label: BY_CONSTRUCTION
     confidence: HIGH
 
   - id: sensitivity_verdict
     claim_kind: label
-    value: ROBUST
     allowed_values: [ROBUST, SENSITIVE, UNSTABLE]
     source_artifact: models/sensitivity_analysis.yaml
     source_field: verdict
     causal_label: BY_CONSTRUCTION
     confidence: HIGH
 
-  - id: gbd_2021_nigeria_burden
+  - id: national_burden                   # external: the ONLY kind that carries a value
     claim_kind: scalar
     value: 12800000
     units: dalys_per_year
     source_artifact: external
-    source_field: "GBD 2021 Malaria Collaborators (PMC11914637); 6017/100k * 213M pop"
-    causal_label: BY_CONSTRUCTION
-    confidence: HIGH
-
-  - id: total_budget
-    claim_kind: currency
-    value: 320000000
-    units: usd
-    source_artifact: plan.md
-    source_field: "Global Fund GC7 malaria component (working estimate)"
+    source_field: "GBD <round> estimate for the disease and country (cite PMID)"
     causal_label: BY_CONSTRUCTION
     confidence: HIGH
 ```
 
-### Internal consistency requirement
+Rules the builder enforces (violations block the gate, not
+scope-declarable):
+- A model-derived claim (any non-external source) must NOT carry
+  `value`, `ci_low` or `ci_high`. Typing them is a spec error.
+- A claim whose field cannot be resolved is left out of the ledger, so it
+  cannot be cited. **If a number is not in any artifact yet (a derived
+  ratio, a zone average, a count of changed units), compute it in code
+  and write it to an artifact (e.g. `models/derived_claims.yaml`), then
+  point the claim at that field.** Never point at prose.
+- External claims (`external` / `literature`, or a programme input in
+  `plan.md`) keep their value in the spec, with the citation in
+  `source_field`. Use them only for literature or programme inputs,
+  never for model outputs.
 
-For scalar/percentage claims with CIs: `ci_low <= value <= ci_high`.
-The validator will reject ledgers where this is violated.
+### Field grammar
+- YAML/JSON: dot path with list indices (`scalar_outputs.total_cost.mean`,
+  `folds[0].rmse`), list selectors (`results[id=dual_ai].observed`), and
+  keys that contain dots (`cost_3.60.n_changed`). If the path ends in
+  `mean`/`median`/`value`, sibling `ci_low`/`ci_high` supply the CI; or
+  give `ci_source_field` explicitly.
+- CSV: `<column>.<agg>()` (sum, mean, median, min, max, count, nunique)
+  or `len()`, with one optional filter: `cost_usd.sum() where region='A'`.
+- `.py`: a module-level constant name.
+
+### Pointing at the right field
+Values can no longer be mistyped; the remaining failure is a claim that
+points at the wrong quantity (the base scenario instead of the optimized
+one, the all-ages field instead of under-5). Check each pointer against
+`related_text` before you build. The red-team critic audits this.
 
 ### Round behavior
-
-Round 1 is the drafting window — the ledger MAY be partial. By round
-3 the ledger must cover every quantitative claim that appears in
-`results.md`. The validator's `_check_claims_ledger_present` enforces
-this. The coherence auditor's `ledger_binding` duty checks every
-number/label in `report.md` against the ledger at write time.
+Round 1 is the drafting window: the spec MAY be partial. By round 3 it
+must cover every quantitative claim in `results.md`. Re-run the builder
+whenever a source artifact changes; render_claims and the validator
+rebuild it anyway and flag a stale file.
 """
 
 

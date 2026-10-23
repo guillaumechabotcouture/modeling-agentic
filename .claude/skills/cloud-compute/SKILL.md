@@ -1,15 +1,14 @@
 ---
 name: cloud-compute
-description: Cloud execution of models, calibration, and rigor workloads via
-  Azure Batch (primary) or AKS/Dask (escalation). Covers five workload classes —
-  single-model runs, UQ propagation, Optuna calibration, multi-structural
-  LOO-CV, sensitivity analysis — and how each maps to Batch pool+tasks with
-  low-priority (spot) nodes. Cost model, quota expectations for Free Trial
-  vs Pay-As-You-Go, and teardown discipline. Use when the modeler is deciding
-  whether to go cloud, configuring a Batch pool, or escalating from Batch to
-  AKS/Dask. Trigger phrases include "azure batch", "cloud compute", "low
-  priority", "spot instance", "cost control", "distributed calibration",
-  "cloud calibration", "parallel UQ", "AKS escalation".
+description: >-
+  Cloud execution of model runs, UQ propagation, calibration, multi-structural
+  LOO-CV, and sensitivity analysis via Azure Batch (primary) or AKS/Dask
+  (escalation), using scripts/cloud_batch.py and
+  scripts/propagate_uncertainty.py. Covers pool sizing, low-priority vs
+  dedicated nodes, the cost model and budget guard, quotas, and mandatory pool
+  teardown. Trigger phrases include "azure batch", "cloud compute", "spot
+  instance", "cost control", "distributed calibration", "parallel UQ", "AKS
+  escalation".
 ---
 
 # Cloud Compute via Azure Batch (primary)
@@ -173,8 +172,8 @@ task_ids = runner.submit_function_tasks(
 # 3. Wait for tasks to complete, collect outputs.
 results = runner.wait_and_collect("uq-run-2026-04-24")
 
-# 4. Teardown.
-runner.delete_pool("uq-pool")   # or set auto_delete=True when creating
+# 4. Teardown. Wrap steps 1-3 in try/finally so this runs on error too.
+runner.delete_pool("uq-pool")
 ```
 
 The wrapper handles:
@@ -182,7 +181,9 @@ The wrapper handles:
 - Serialization of function + args to JSON (pickle fallback)
 - Output collection from Blob storage
 - Budget guard (estimates cost from pool size × duration before submission)
-- Graceful teardown on success OR exception
+
+It does NOT tear the pool down for you: the caller owns teardown (see
+"Teardown discipline" below).
 
 ### Budget guard (pre-flight check)
 
@@ -249,7 +250,10 @@ aggregates.
 
 ### Calibration (Optuna on Batch)
 
-`scripts/batch_calibrate.py` is the entry point. Architecture:
+There is no dedicated cloud-calibration script in the repo yet; build
+it on `BatchRunner.submit_function_tasks` from `scripts/cloud_batch.py`
+(UQ uses the same wrapper via `scripts/propagate_uncertainty.py --cloud`).
+Architecture:
 
 - Master (local): Optuna study with SQLite or Azure PostgreSQL
   storage.
@@ -299,8 +303,13 @@ HOWEVER:
 - **A PostgreSQL instance** for Optuna shared storage costs ~$0.017/hr
   continuously ($12/month). Delete when not actively calibrating.
 
-`BatchRunner` supports `auto_delete=True` at pool creation which
-deletes the pool when the job completes. Use it.
+Do not rely on `PoolSpec.auto_delete` to clean up. Any code that
+creates a pool must delete it in a `finally:` block
+(`runner.delete_pool(name)`), so a timeout, budget rejection, or
+exception cannot leave dedicated nodes billing. Only delete pools your
+own invocation created; a pre-existing shared pool is not yours to
+remove. Also set a per-task wall-clock limit so a hung task cannot hold
+a node indefinitely.
 
 ## Security notes
 

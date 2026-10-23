@@ -1,6 +1,14 @@
 ---
 name: sanity-schema
-description: Phase 13 α — required disease-agnostic structural sanity manifest. Modeler writes `models/sanity_schema.yaml` declaring abstract slots (outcome name, baseline reservoir, exposure unit, shares, derived-consistency formulas, composite-dimension windows, structural-uncertainty bounds, outlier sniff). `scripts/sanity_checks.py` runs eight generic checks that don't know what disease/topic the run is about. Internal-only — no comparison against external literature; only structural relationships that hold in any optimization-under-budget problem. Trigger phrases include "sanity check", "gut check", "scale plausibility", "internal consistency", "mass balance", "share closure", "counterfactual ratio".
+description: >-
+  Required disease-agnostic structural sanity manifest
+  `models/sanity_schema.yaml` declaring abstract slots (outcome, baseline
+  reservoir, exposure unit, shares, derived-consistency formulas,
+  structural-uncertainty bounds, outlier sniff). scripts/sanity_checks.py runs
+  generic internal checks (mass balance, share closure, counterfactual ratios)
+  that hold for any optimization-under-budget problem. Trigger phrases include
+  "sanity check", "gut check", "scale plausibility", "internal consistency",
+  "mass balance", "share closure".
 type: rigor-remediation
 ---
 
@@ -53,6 +61,13 @@ exposure:
   years: 3                         # default 1 if absent
 
 allocation:
+  unit_noun: district              # Phase 21 γ: optional; what an allocation unit
+                                    # is called in prose (county, facility, …).
+                                    # Or `unit_nouns: [district, county]`.
+  package_aliases:                 # optional; CSV package id -> prose names
+    school_vax: ["school-based", "school campaign"]
+  zone_aliases:                    # optional; CSV zone value -> prose names
+    coastal: ["Coastal belt"]
   units_total: 774                 # Phase 14 α: enforced — cross-checked against
                                     # allocation CSV row count; MEDIUM
                                     # `universe_completeness` fires when CSV has
@@ -68,11 +83,11 @@ shares:                            # every share-set must close to its target
   - name: zone_budget
     sums_to: 1.0
     tol: 0.005
-    values: {NW: 0.781, NC: 0.108, NE: 0.111}
+    values: {zone_1: 0.781, zone_2: 0.108, zone_3: 0.111}
   - name: package_cost
     sums_to: 1.0
     tol: 0.005
-    values: {dual_ai: 0.78, pbo: 0.18, smc: 0.04}
+    values: {package_a: 0.78, package_b: 0.18, package_c: 0.04}
 
 counterfactual:
   name: null_model
@@ -166,11 +181,11 @@ declarations:
   - id: SCOPE-G
     sanity_check_acknowledged: [counterfactual_ratio]
     rationale: |
-      The null model is "no GC7 intervention at all" — neither
-      maintained 50% LLIN coverage nor existing SMC. This is the
-      Global Fund's standard counterfactual for new-money decisions,
-      and it produces a 19.9× ratio that exceeds our 100× cap. The
-      ratio is informative, not pathological.
+      The null model is "no new-grant intervention at all" — not even
+      maintaining existing coverage. This is the funder's standard
+      counterfactual for new-money decisions, and it produces a 140×
+      ratio that exceeds our 100× cap. The ratio is informative, not
+      pathological.
 ```
 
 Or globally for the run:
@@ -183,7 +198,7 @@ The acknowledgment must be in scope_declaration.yaml. A free-text
 note in the report.md is not sufficient — the validator only reads
 the structured YAML.
 
-## Worked example — Phase 12 RESUME run (190855)
+## Worked example — Phase 12 RESUME run (190855, national malaria allocation)
 
 Headline: 8.39M DALYs averted, baseline 16.6M, on 32M people in 123
 NW/NE/NC LGAs at 0.5 cases/person/yr × 3 years.
@@ -204,7 +219,7 @@ shares:
   - name: zone_budget
     sums_to: 1.0
     tol: 0.005
-    values: {NW: 0.781, NC: 0.108, NE: 0.111}
+    values: {zone_1: 0.781, zone_2: 0.108, zone_3: 0.111}
 counterfactual:
   averted: 421_000
   optimized_vs_null_acceptable: [1.5, 100]
