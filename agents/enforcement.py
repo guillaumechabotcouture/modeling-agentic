@@ -242,6 +242,21 @@ def _cd_target(segment: str, cur: str | None) -> tuple[bool, str | None]:
     return True, os.path.normpath(os.path.join(cur, dest))
 
 
+def _unquoted(text: str) -> str:
+    """`text` with quoted spans removed, so `echo ')'` does not close a
+    subshell (Codex re-review of PR #14)."""
+    out, quote = [], None
+    for ch in text:
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def bash_write_targets_cwd(command: str, cwd: str | None = None
                            ) -> list[tuple[str, str | None]]:
     """(path, cwd it is relative to) for every path a command writes.
@@ -265,7 +280,7 @@ def bash_write_targets_cwd(command: str, cwd: str | None = None
         is_cd, new = _cd_target(body, cur)
         if is_cd:
             cur = new
-        for _ in range(segment.count(")") if stack else 0):
+        for _ in range(_unquoted(segment).count(")") if stack else 0):
             if stack:
                 cur = stack.pop()
     return out

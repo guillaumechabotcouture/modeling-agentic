@@ -660,10 +660,12 @@ def _restore_protected_meta(metadata_path: str, original_meta: dict) -> None:
         # Missing or corrupted: rebuild it from the originals rather than
         # let finalization write a metadata.json without the question.
         meta = {"restored_fields": {"_metadata_unreadable": True}}
-    changed = not os.path.exists(metadata_path) or "_metadata_unreadable" in meta.get("restored_fields", {})
+    if not isinstance(meta.get("restored_fields"), dict):
+        meta["restored_fields"] = {}      # null / wrong type must not crash finalization
+    changed = not os.path.exists(metadata_path) or "_metadata_unreadable" in meta["restored_fields"]
     for key in _PROTECTED_META:
         if key in original_meta and meta.get(key) != original_meta[key]:
-            meta.setdefault("restored_fields", {})[key] = meta.get(key)
+            meta["restored_fields"][key] = meta.get(key)
             meta[key] = original_meta[key]
             changed = True
     if changed:
@@ -1043,6 +1045,13 @@ def _run_self_test() -> int:
         m = json.load(open(mp))
         ok(m.get("question") == "Q" and m.get("run_dir") == "r",
            "CR9 corrupted metadata.json is rebuilt with the protected fields")
+        with open(mp, "w") as f:
+            json.dump({"question": "Q", "run_dir": "r", "restored_fields": None}, f)
+        _restore_protected_meta(mp, {"question": "Q", "run_dir": "r"})
+        ok(json.load(open(mp))["question"] == "Q", "CR10 restored_fields: null does not crash")
+    ok(enforcement.check_tool_use("Bash", {"command": f"(cd {rp_rel} && echo ')' && echo forged > critique_domain.yaml; true)"},
+                                  run_path, None, set()) is not None,
+       "CR11 a quoted ) does not close the subshell")
     # CR5 (Codex review of PR #14): the gate must see the original question.
     with tempfile.TemporaryDirectory() as td:
         mp = os.path.join(td, "metadata.json")
