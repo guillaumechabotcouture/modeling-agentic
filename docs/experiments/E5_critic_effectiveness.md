@@ -149,6 +149,43 @@ The $2–4 per invocation comes from E1/T1 critic telemetry. Wall time is about 
 - **What changed:** worker assignment is now fixture-affine (commit 67ef501). Arms, matcher, fixtures and answer keys are unchanged.
 - **Launch commit:** the commit that adds this note.
 
-## Results
+## Results (2026-10-22): PRELIMINARY until the matcher audit is done
 
-*(to be filled after the run)*
+**Run:** 120/120 LLM-arm cases ok, collected and sha256-verified; cluster shut down. Anthropic spend $172.85 (red-team $64.95, domain $52.99, methods $44.67, presentation $10.25); cross-model spend is on OpenAI. The deterministic arm was run during the build with unchanged validator code.
+
+**Union of all 6 arms:** 32/54 = 0.59 (95% CI 0.46–0.71). Decision-critical defects: 11/16.
+
+| Arm | Recall | Unique (no other arm) | Cost | $/detection |
+|---|---|---|---|---|
+| deterministic | 13/54 | 4 | $0 | 0 |
+| red-team | 18/54 | 2 | $64.95 | 3.61 |
+| methods | 11/54 | 0 | $44.67 | 4.06 |
+| domain | 8/54 | 2 | $52.99 | 6.62 |
+| presentation | 9/54 | 1 | $10.25 | 1.14 |
+| cross-model | 12/54 | 1 | (OpenAI) | — |
+
+**Best union by number of LLM critics** (validators always included):
+
+| LLM critics | Union | Arms | Cost |
+|---|---|---|---|
+| 0 | 0.24 | deterministic only | $0 |
+| 1 | 0.50 | + red-team | $65 |
+| 2 | 0.56 | + domain | $118 |
+| 3 | 0.57 | + presentation | $128 |
+| 4 | 0.59 | + cross-model | $128 |
+| 5 | 0.59 | + methods | $173 |
+
+**Never detected by any arm:** ledger_mismatch 5, citation_mismatch 5, data_vintage 5, unit_error 3, zero_width_ci 2, prose_stale_number 2.
+
+**Pre-registered decision rules:**
+1. **Retire/merge.**
+   - Domain meets all three conditions (unique 0.037, CI upper 0.125, noise Δ +1.22): **merge candidate**.
+   - Methods has unique 0/54 (CI upper 0.066), but its noise Δ is −0.33, so it fails the noise condition by the letter. It is redundant in practice.
+   - Red-team and presentation are kept.
+2. **Move into code** (deterministic recall ≥ 0.8): budget_overspend (6/7) and renamed_verdict (5/5) come off LLM critic duties.
+3. **Fill gaps** (union recall < 0.5): citation_mismatch, data_vintage, ledger_mismatch, unit_error. All four require checking a claim against its source or data rather than reading prose, which argues for deterministic cross-checks.
+4. **Cross-model:** unique 1/54 < 0.10, so it **stays opt-in**.
+
+**Exploratory (post hoc, not pre-registered):** validators re-run at round 3 instead of round 1 reach 14/54 (+1 ledger_mismatch). The round-1 reproduction matched the original 13/54 exactly. Round gating is not the main reason for the validator gaps. Why the provenance check catches only 1/5 planted ledger mismatches needs a focused look.
+
+**Outstanding:** human audit of the matcher sample (`E5_audit_sample.md`). If disagreement exceeds 10%, the matcher is revised and the analysis re-run before these conclusions stand.
