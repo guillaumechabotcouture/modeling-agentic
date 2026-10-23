@@ -81,6 +81,9 @@ def main(batch):
         tot.update(r["reread"]); tot_cnt.update(r["count"]); tot_sum += r["sum_ctx"]; tot_tool += r["tool_tokens"]
         for rr, tok, k, inp in r["big"][:2]:
             print(f"     top: {k:22} {tok/1e3:6.1f}K tok × later turns = {rr/1e6:5.2f}M re-read  {inp}")
+    if tot_sum == 0:
+        print("\nNo modeler API turns found in this batch (nothing collected, or every case failed).")
+        return
     s = sum(tot.values()) or 1
     print(f"\nTool-result re-read volume by category (all modeler sessions); share of all context tokens = {100*s/tot_sum:.0f}%")
     for k, v in tot.most_common():

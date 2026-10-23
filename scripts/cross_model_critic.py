@@ -337,9 +337,14 @@ def _require_review(run_dir: str, result: dict) -> dict:
     if result.get("status") != "ok":
         return result
     listed = [str(f) for f in (result.get("payload") or {}).get("files_reviewed") or []]
-    real = [f for f in listed
-            if os.path.isfile(os.path.join(run_dir, f.lstrip("./")))
-            or os.path.isfile(f)]
+    root = os.path.realpath(run_dir)
+
+    def _in_run(f: str) -> bool:
+        # Only files inside the run dir count: `/etc/hosts` or `../x` is not
+        # a review of this run (Codex review of PR #14).
+        p = os.path.realpath(f if os.path.isabs(f) else os.path.join(run_dir, f))
+        return os.path.isfile(p) and os.path.commonpath([root, p]) == root
+    real = [f for f in listed if _in_run(f)]
     if not real:
         return {**result, "status": "unavailable",
                 "reason": ("critic reviewed no files" if not listed else
@@ -599,8 +604,10 @@ def _run_self_test() -> int:
 
         # T0 (fail-closed): a schema-valid payload that reviewed nothing must
         # be UNAVAILABLE, not PASS; so must one listing only nonexistent files.
-        for files, why in (((), "reviewed no files"), (("ghost.py",), "none of the 1 files")):
-            sub = os.path.join(d, f"t0_{len(files)}"); os.makedirs(sub)
+        open(os.path.join(d, "outside.txt"), "w").write("x")
+        for i, (files, why) in enumerate((((), "reviewed no files"), (("ghost.py",), "none of the 1 files"),
+                                          (("/etc/hosts", "../outside.txt"), "none of the 2 files"))):
+            sub = os.path.join(d, f"t0_{i}"); os.makedirs(sub)
             res = run(sub, 1, runner=fake_runner([good_payload(new=[], files=files)]))
             with open(os.path.join(sub, "critique_crossmodel.yaml")) as f:
                 t0 = yaml.safe_load(f)

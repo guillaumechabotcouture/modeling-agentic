@@ -348,6 +348,9 @@ def remote_case(case: dict, code: bytes, fixture: bytes, variants: bytes,
                                                 "claude_session", os.path.basename(p))))
         secrets = [k.get() for k in (anthropic_key, openai_key) if k is not None and k.get()]
         meta["secret_hits"] = redact_secrets([p for p, _ in entries], secrets)
+        # Re-read after redaction: the copy loaded above predates it and is
+        # embedded in result.json, which collect prefers.
+        case_json = json.load(open(cj)) if os.path.exists(cj) else None
         blob = tar_bytes(entries)
         open(os.path.join(root, "result.tar.gz"), "wb").write(blob)
         meta.update(status=(case_json or {}).get("status", "no_case_json"), exit_code=proc.returncode,
@@ -359,7 +362,12 @@ def remote_case(case: dict, code: bytes, fixture: bytes, variants: bytes,
             open(os.path.join(root, "result.tar.gz"), "wb").write(b"")
     meta.update(duration_s=round(time.time() - t0, 1), pip_freeze=_pip_freeze(),
                 hostname=os.uname().nodename)
-    json.dump(meta, open(out_meta, "w"), indent=1, default=str)
+    text = json.dumps(meta, indent=1, default=str)
+    for sec in (k.get() for k in (anthropic_key, openai_key) if k is not None and k.get()):
+        if len(sec) >= 12:                       # same rule as redact_secrets
+            text = text.replace(sec, "<redacted>")   # error/traceback strings too
+    open(out_meta, "w").write(text)
+    meta = json.loads(text)
     return {k: v for k, v in meta.items() if k not in ("pip_freeze", "case", "traceback")}
 
 

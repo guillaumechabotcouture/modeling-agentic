@@ -271,6 +271,14 @@ async def deterministic_critic(run_dir: str, variant: dict) -> dict:
         dec = json.loads(out[out.index("{"):])
     except (ValueError, json.JSONDecodeError):
         dec = {"error": (proc.stderr or out)[-500:]}
+    # A schema error (exit 3), VALIDATOR_ERROR (exit 4) or a missing action
+    # is a failed evaluation, not an empty review (Codex review of PR #14).
+    failed = ("error" in dec or bool(dec.get("schema_errors"))
+              or dec.get("action") in (None, "VALIDATOR_ERROR")
+              or proc.returncode not in (0, 1))
+    if failed and "error" not in dec:
+        dec["error"] = (f"validator exit {proc.returncode}, action {dec.get('action')!r}, "
+                        f"schema_errors {dec.get('schema_errors')!r}")[:500]
     findings = [("HIGH", b) for b in dec.get("unresolved_high") or []] + \
                [("HIGH", b) for b in dec.get("accept_blockers") or []] + \
                [(str(v.get("severity", "MEDIUM")).upper(), v) for v in dec.get("rigor_violations") or []]
@@ -287,7 +295,7 @@ async def deterministic_critic(run_dir: str, variant: dict) -> dict:
                     "validator_exit": proc.returncode, "blockers": blockers,
                     **({"error": dec["error"]} if "error" in dec else {})},
                    open(os.path.join(run_dir, "critique_deterministic.yaml"), "w"), sort_keys=False)
-    return {"session_id": None, "subtype": "deterministic", "is_error": "error" in dec, "cost_usd": 0.0,
+    return {"session_id": None, "subtype": "deterministic", "is_error": failed, "cost_usd": 0.0,
             "num_turns": 0, "duration_s": round(time.time() - t0, 1)}
 
 
@@ -390,6 +398,10 @@ async def run_case(stage, fixture_dir, variant, batch_dir, seed, runner=sdk_runn
             w = csv.DictWriter(f, fieldnames=list(rows[0].keys())); w.writeheader(); w.writerows(rows)
     if res.get("subtype") == "error_max_budget_usd" or "budget" in str(res.get("subtype", "")):
         status = "budget_stop"
+    elif status == "ok" and res.get("subtype") == "error_max_turns":
+        status = "turn_cap"      # the stage's designed stop; still a completed case
+    elif status == "ok" and res.get("is_error"):
+        status = "error"         # e.g. cross-model integrity violation
     stage_rows = [r for r in rows if r["agent"] != "lead"]
     scores = (stage_scorers.score_model(run_dir) if stage == "MODEL" else
               stage_scorers.score_critique(run_dir, stage_agent_name(stage, variant)) if stage == "CRITIQUE"
@@ -606,6 +618,16 @@ def _self_test() -> int:
             raise RuntimeError("agent crashed")
         bad = asyncio.run(run_case("MODEL", os.path.join(td, "fx", "F1"), variants[0], batch, 9, runner=boom))
         ok(bad["status"] == "error" and "crashed" in bad["result"]["error"], "R8 crash recorded per case")
+
+        async def flagged(*a):
+            return {"session_id": None, "subtype": "crossmodel", "is_error": True, "cost_usd": None}
+
+        async def capped(*a):
+            return {"session_id": None, "subtype": "error_max_turns", "is_error": True, "cost_usd": 1.0}
+        r9 = asyncio.run(run_case("MODEL", os.path.join(td, "fx", "F1"), variants[0], batch, 10, runner=flagged))
+        r10 = asyncio.run(run_case("MODEL", os.path.join(td, "fx", "F1"), variants[0], batch, 11, runner=capped))
+        ok(r9["status"] == "error" and r10["status"] == "turn_cap",
+           f"R9 runner is_error → error; turn cap → turn_cap ({r9['status']}, {r10['status']})")
         # V1: a variant's `tools` lands on the stage AgentDefinition itself (and so
         # on both backends, which share run_case); control keeps the defaults.
         from agents import build_agents
@@ -772,6 +794,8 @@ def _self_test() -> int:
         json.dump({"question": "Allocate a vaccination budget across districts"},
                   open(os.path.join(fx, "inputs", "metadata.json"), "w"))
         open(os.path.join(fx, "inputs", "results.md"), "w").write("# Results\n")
+        open(os.path.join(fx, "inputs", "citations.md"), "w").write(
+            "# Citations\n\n## Parameter Registry\n\n```yaml\nparameters: []\n```\n")
         open(os.path.join(fx, "spawn_prompt.md"), "w").write("This is critique round 1. Run directory: {run_dir}")
         ok(stage_agent_name("CRITIQUE", {"agent": "critique-methods"}) == "critique-methods", "K1 agent from variant")
         try:
@@ -787,6 +811,10 @@ def _self_test() -> int:
            f"K2 deterministic arm ran (stage from variant): {c['status']} {doc.keys() if doc else None}")
         ok(not any(os.path.exists(os.path.join(run, f"critique_{r.split('-', 1)[1]}.yaml")) for r in _STUB_REVIEWERS),
            "K3 deterministic arm removes its PASS stubs")
+        # K3b (Codex review): a validator that cannot run is an error, not an empty review.
+        os.remove(os.path.join(fx, "inputs", "citations.md"))
+        c2 = asyncio.run(run_case("MODEL", fx, det, os.path.join(td, "b2"), 0))
+        ok(c2["status"] == "error", f"K3b validator failure recorded as error, got {c2['status']}")
 
         async def stub_critic(stage, fixture_dir, run_dir, variant, rows):
             yaml.safe_dump({"reviewer": "critique-methods", "round": 1, "verdict": "REVISE",

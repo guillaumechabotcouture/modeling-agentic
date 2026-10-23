@@ -270,9 +270,14 @@ def _py_constant(path: str, name: str) -> Any:
 
 
 def _resolve_artifact_path(run_dir: str, source_artifact: str) -> Optional[str]:
+    """The cited path; else, only where the two can name the same artifact
+    (a bare filename, or run root <-> models/), its sibling. A missing
+    `data/results.yaml` must not resolve to an unrelated `models/results.yaml`."""
     cand = [os.path.join(run_dir, source_artifact)]
     base = os.path.basename(source_artifact)
-    cand += [os.path.join(run_dir, base), os.path.join(run_dir, "models", base)]
+    parent = os.path.dirname(os.path.normpath(source_artifact))
+    if parent in ("", ".", "models"):
+        cand += [os.path.join(run_dir, base), os.path.join(run_dir, "models", base)]
     for c in cand:
         if os.path.isfile(c):
             return c
@@ -572,6 +577,11 @@ def _self_test() -> int:
                  "source_artifact": "models/sens.yaml",
                  "source_field": "zone-level Pearson correlation"})
         ok(kinds(r) == ["claim_value_not_in_source"], f"P4b value absent from source ({kinds(r)})")
+        # P4d (Codex review): no basename fallback across unrelated directories.
+        os.makedirs(os.path.join(d, "data"), exist_ok=True)
+        r = run({"id": "c4f", "claim_kind": "label", "value": "SENSITIVE",
+                 "source_artifact": "data/sens.yaml", "source_field": "verdict"})
+        ok(kinds(r) == ["claim_source_unresolved"], f"P4d data/ path not aliased to models/ ({kinds(r)})")
         # P4c: keys with dots and [key=value] selectors resolve (E5 ledger plants).
         with open(os.path.join(d, "models", "scen.yaml"), "w") as f:
             yaml.safe_dump({"cost_3.60": {"n_changed": 248},

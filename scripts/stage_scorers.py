@@ -184,7 +184,7 @@ def flatten(scores: dict) -> dict:
 
 
 LOWER_IS_BETTER = {"effort_high_violations", "eligibility_high", "cost_usd", "wall_s",
-                   "turns", "input_tokens"}
+                   "turns", "input_tokens", "start_context"}
 
 
 def _self_test() -> int:

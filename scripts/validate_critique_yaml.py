@@ -254,12 +254,16 @@ OPTIONAL_REVIEWERS = ("critique-crossmodel",)
 OPT_IN_AGENT_REVIEWERS = {"critique-methods": "methods_critic"}
 
 
-def _opt_in_requested(run_dir: str, reviewer: str) -> bool:
+def _meta_flag(run_dir: str, key: str) -> bool:
     try:
         with open(os.path.join(run_dir, "metadata.json")) as f:
-            return bool(json.load(f).get(OPT_IN_AGENT_REVIEWERS[reviewer]))
+            return bool(json.load(f).get(key))
     except (OSError, ValueError, AttributeError):
         return False
+
+
+def _opt_in_requested(run_dir: str, reviewer: str) -> bool:
+    return _meta_flag(run_dir, OPT_IN_AGENT_REVIEWERS[reviewer])
 PREFIXES = {"critique-methods": "M-", "critique-domain": "D-",
             "critique-presentation": "P-", "critique-redteam": "R-",
             "critique-crossmodel": "X-"}
@@ -584,6 +588,16 @@ def _load_optional_critique(run_dir: str, reviewer: str,
     """
     path = os.path.join(run_dir, FILENAMES[reviewer])
     if not os.path.exists(path):
+        if _meta_flag(run_dir, "cross_model"):
+            # Requested for this run but never written: the lead skipped it.
+            return None, [{
+                "kind": "cross_model_critic_missing", "severity": "HIGH",
+                "stage": "CRITIQUE", "scope_declarable": False,
+                "claim": (f"This run was started with --cross-model but "
+                          f"{FILENAMES[reviewer]} does not exist. Run "
+                          f"`python3 scripts/cross_model_critic.py {{run_dir}} "
+                          f"--round {current_round}` in STAGE 6."),
+            }]
         return None, []
     try:
         doc = validate_critique(path, reviewer, current_round)
@@ -1625,6 +1639,34 @@ def _allocation_present(run_dir: str) -> bool:
         artifact_path("decision_rule", run_dir))
 
 
+def _parameters_fitted(run_dir: str) -> bool:
+    """Evidence that the run fitted parameters (Copilot review of PR #14):
+    an identifiability manifest, a model comparison with any k_params > 0,
+    or a calibration output — the effort-floor trigger's test. A comparison
+    listing only k_params: 0 models (analytical, unfitted) is not fitting.
+    Fail closed: a model comparison that can't be read counts as fitting."""
+    if _load_sibling("effort_floors")._calibration_evidence(run_dir):
+        return True
+    p = artifact_path("model_comparison", run_dir)
+    if not os.path.exists(p):
+        return False
+    try:
+        with open(p) as f:
+            doc = yaml.safe_load(f)
+    except (OSError, yaml.YAMLError):
+        return True
+    models = doc.get("models") if isinstance(doc, dict) else None
+    if not isinstance(models, list):
+        return True
+    for m in models:
+        try:
+            if not isinstance(m, dict) or int(m.get("k_params") or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            return True
+    return False
+
+
 def _check_required_artifacts(run_dir: str, post_write: bool = False
                               ) -> list[dict]:
     """Phase 21 β: required artifacts gate ACCEPT at EVERY round.
@@ -1641,8 +1683,7 @@ def _check_required_artifacts(run_dir: str, post_write: bool = False
     allocation = _allocation_present(run_dir)
     pair = _detect_calibration_allocation_ratio(run_dir)
     aggregation = bool(pair) and pair[0] / pair[1] < _ECOLOGICAL_AGGREGATION_THRESHOLD
-    fitted = any(os.path.exists(artifact_path(i, run_dir))
-                 for i in ("identifiability", "model_comparison"))
+    fitted = _parameters_fitted(run_dir)
     applies = {"always": True, "allocation": allocation,
                "aggregation": aggregation, "fitted_parameters": fitted,
                "post_write": post_write, "never": False}
@@ -3781,6 +3822,21 @@ def _claims_spec_violations(run_dir: str, ledger_path: str) -> list[dict]:
         out.append({"kind": "claims_ledger_invalid", "severity": "HIGH", "stage": "ANALYZE",
                     "claim": "models/claims_spec.yaml lists zero claims."})
         return out
+    # The built ledger must pass the same schema the renderer enforces
+    # (CI bounds, kinds, ids): external claims carry spec-typed values.
+    import tempfile as _tf
+    with _tf.NamedTemporaryFile("w", suffix=".yaml", delete=False) as tmp:
+        yaml.safe_dump(doc, tmp)
+    try:
+        _load_sibling("render_claims").load_claims(tmp.name)
+    except (ValueError, FileNotFoundError) as e:
+        msg = str(e).replace(tmp.name, "built claims ledger")
+        out.append({"kind": "claims_ledger_ci_violated" if "CI bounds" in msg
+                    else "claims_ledger_invalid", "severity": "HIGH", "stage": "ANALYZE",
+                    "scope_declarable": False,
+                    "claim": f"models/claims_spec.yaml builds a ledger that fails validation: {msg}"})
+    finally:
+        os.unlink(tmp.name)
     run = f"Run `python3 scripts/build_claims_ledger.py {{run_dir}}`."
     if not os.path.exists(ledger_path):
         out.append({"kind": "claims_ledger_stale", "severity": "HIGH", "stage": "ANALYZE",
@@ -4840,6 +4896,10 @@ def _check_persistent_medium_escalation(run_dir: str,
 
     for kind, rounds_seen in rounds_with_kind.items():
         threshold = _VALIDATOR_KIND_ESCALATION_THRESHOLDS[kind]
+        # A MEDIUM resolved this round is not persisting, however long its
+        # history (Codex review of PR #14).
+        if current_kinds is not None and kind not in current_kinds:
+            continue
         if len(rounds_seen) >= threshold:
             sorted_rounds = sorted(rounds_seen)
             out.append({
@@ -7598,6 +7658,17 @@ def _run_self_test() -> int:
         kinds12 = sorted(x["kind"] for x in _check_claims_ledger_present(_d, round_n=1))
         ok(kinds12 == ["claim_source_unresolved", "claims_spec_invalid"],
            f"CL12: typed value + unresolvable field, got {kinds12}")
+        # CL13 (Codex review): an external claim with an inverted CI fails the
+        # same schema check as a hand-written ledger.
+        with open(os.path.join(_d, "models", "claims_spec.yaml"), "w") as f:
+            _yaml.safe_dump({"claims": [{"id": "ext", "claim_kind": "scalar", "value": 10,
+                                         "ci_low": 20, "ci_high": 5, "units": "x",
+                                         "source_artifact": "external",
+                                         "source_field": "Author 2020"}]}, f)
+        _builder.write(_d)
+        kinds13 = [x["kind"] for x in _check_claims_ledger_present(_d, round_n=1)]
+        ok("claims_ledger_ci_violated" in kinds13 or "claims_ledger_invalid" in kinds13,
+           f"CL13: inverted external CI caught on the spec path, got {kinds13}")
 
     with _tempfile.TemporaryDirectory() as _d:
         # CL5: CI bounds violated → HIGH claims_ledger_ci_violated
@@ -8236,6 +8307,9 @@ def _run_self_test() -> int:
         if _fn.endswith("validate_critique_yaml.py"):
             _a = _txt.index("_VALIDATOR_KIND_ESCALATION_THRESHOLDS = {")
             _txt = _txt[:_a] + _txt[_txt.index("}", _a):]
+        # Kind names quoted in self-test assertions are not emitters (Codex
+        # review of PR #14): drop each top-level self-test function.
+        _txt = re.sub(r"(?ms)^def _?(?:run_)?self_test\b.*?(?=^def |^if __name__|\Z)", "", _txt)
         _src += _txt
     try:
         with open(os.path.join(_scripts_dir, "..", ".claude", "orchestration",
@@ -8267,6 +8341,9 @@ def _run_self_test() -> int:
         ok(any(x["kind"] == "plan_criterion_not_tested_persistent"
                and x["severity"] == "HIGH" for x in v),
            f"H2: 3 rounds of plan_criterion_not_tested → HIGH, got {v}")
+        v = _check_persistent_medium_escalation(d, round_n=3, current_kinds=set())
+        ok(not any(x["kind"] == "plan_criterion_not_tested_persistent" for x in v),
+           f"H2b: resolved this round → no persistent HIGH despite history, got {v}")
         vs = [{"kind": "plan_criterion_not_tested"}, {"kind": "new_kind"}]
         _annotate_first_seen(d, vs)
         ok(vs[0].get("first_seen_round") == 1 and "first_seen_round" not in vs[1],
@@ -8447,6 +8524,20 @@ def _run_self_test() -> int:
            {v["artifact"] for v in _check_required_artifacts(d, post_write=True)},
            "E7b: report.md required only in post-write mode")
 
+    # E7c (Copilot review): calibration_result is required only with fitting
+    # evidence; an unreadable model comparison still counts (fail closed).
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        mc = artifact_path("model_comparison", d)
+        os.makedirs(os.path.dirname(mc), exist_ok=True)
+        for content, want in (("models:\n- {name: analytic, k_params: 0}\n", False),
+                              ("models:\n- {name: null, k_params: 0}\n- {name: seir, k_params: 4}\n", True),
+                              ("models: [unclosed\n", True)):
+            with open(mc, "w") as f:
+                f.write(content)
+            got = "calibration_result" in {v["artifact"] for v in _check_required_artifacts(d)}
+            ok(got == want, f"E7c: calibration_result required={got} for {content!r}, want {want}")
+
     # --- Phase 21 β: E8 POSITIVE CONTROL ---
     # A gate that blocks everything passes every negative test above. E8
     # builds a complete, honest, non-malaria run (generic vaccination
@@ -8582,6 +8673,17 @@ def _run_self_test() -> int:
             # XM1: absent → no finding.
             ok(_load_optional_critique(pc, "critique-crossmodel", 2) == (None, []),
                "XM1: absent cross-model critique → no finding")
+            # XM1b: absent but requested (metadata cross_model: true) → HIGH.
+            _mp = os.path.join(pc, "metadata.json")
+            _m0 = open(_mp).read()
+            with open(_mp, "w") as f:
+                json.dump({**json.loads(_m0), "cross_model": True}, f)
+            _, _v = _load_optional_critique(pc, "critique-crossmodel", 2)
+            ok([x["kind"] for x in _v] == ["cross_model_critic_missing"]
+               and _v[0]["severity"] == "HIGH",
+               f"XM1b: requested but missing cross-model critique → HIGH, got {_v}")
+            with open(_mp, "w") as f:
+                f.write(_m0)
 
             def _xm_case(name, doc=None, raw=None):
                 md = os.path.join(_root, name)

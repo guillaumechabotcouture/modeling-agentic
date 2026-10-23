@@ -25,6 +25,7 @@ sys.path.insert(0, HERE)
 from stage_scorers import LOWER_IS_BETTER  # noqa: E402
 
 TELEMETRY_METRICS = ["cost_usd", "wall_s", "turns", "input_tokens", "start_context"]
+MIN_PAIRS = 3
 
 
 def load_cases(batch_dir: str) -> list[dict]:
@@ -35,7 +36,7 @@ def _metrics(case: dict) -> dict:
     m = dict(case.get("flat") or {})
     for k in TELEMETRY_METRICS:
         m[k] = (case.get("telemetry") or {}).get(k)
-    m["completed_ok"] = float(case.get("status") == "ok")
+    m["completed_ok"] = float(case.get("status") in ("ok", "turn_cap"))
     return m
 
 
@@ -59,10 +60,13 @@ def compare(cases: list[dict], a: str, b: str) -> dict:
         if not vals:
             continue
         d = [y - x for x, y in vals]
-        lo, hi = bootstrap_ci(d) if len(d) > 1 else (d[0], d[0])
+        # Fewer than MIN_PAIRS pairs give no estimate of between-pair
+        # variability: report the CI as unavailable, never as conclusive.
+        ci = bootstrap_ci(d) if len(d) >= MIN_PAIRS else None
         mean_d = sum(d) / len(d)
         better = (mean_d < 0) if k in LOWER_IS_BETTER else (mean_d > 0)
-        sig = (hi < 0 or lo > 0)
+        sig = ci is not None and (ci[1] < 0 or ci[0] > 0)
+        lo, hi = ci if ci is not None else (None, None)
         rows.append({"metric": k, "n": len(vals), "mean_a": sum(x for x, _ in vals) / len(vals),
                      "mean_b": sum(y for _, y in vals) / len(vals), "delta": mean_d, "ci": (lo, hi),
                      "b_better": better if mean_d != 0 else None, "ci_excludes_0": sig})
@@ -75,11 +79,16 @@ def to_markdown(res: dict) -> str:
            "| Metric | n | A | B | Δ (B−A) | 95% CI | B better? |", "|---|---|---|---|---|---|---|"]
     for r in res["rows"]:
         arrow = "" if r["b_better"] is None else ("yes" if r["b_better"] else "no")
-        if r["b_better"] is not None and not r["ci_excludes_0"]:
-            arrow += " (CI spans 0)"
         lo, hi = r["ci"]
+        if lo is None:
+            arrow += f" (n < {MIN_PAIRS}, no CI)" if arrow else ""
+            ci_txt = "n/a"
+        else:
+            if r["b_better"] is not None and not r["ci_excludes_0"]:
+                arrow += " (CI spans 0)"
+            ci_txt = f"[{lo:+.3g}, {hi:+.3g}]"
         out.append(f"| {r['metric']}{' ↓' if r['metric'] in LOWER_IS_BETTER else ''} | {r['n']} | "
-                   f"{r['mean_a']:.3g} | {r['mean_b']:.3g} | {r['delta']:+.3g} | [{lo:+.3g}, {hi:+.3g}] | {arrow} |")
+                   f"{r['mean_a']:.3g} | {r['mean_b']:.3g} | {r['delta']:+.3g} | {ci_txt} | {arrow} |")
     out.append("")
     out.append("↓ = lower is better.")
     return "\n".join(out)
@@ -105,6 +114,11 @@ def _self_test() -> int:
     ok(r["wall_s"]["b_better"] is None, "C4 zero delta has no direction")
     md = to_markdown(res)
     ok("| cost_usd ↓ |" in md and "4 paired cases" in md, "C5 markdown")
+    ok(r["start_context"]["b_better"] and "| start_context ↓ |" in md, "C5b start_context lower is better")
+    one = compare(cases[:2], "A", "B")
+    r1 = {x["metric"]: x for x in one["rows"]}
+    ok(r1["cost_usd"]["ci"] == (None, None) and not r1["cost_usd"]["ci_excludes_0"]
+       and "n/a" in to_markdown(one), "C5c one pair → no CI, never conclusive")
     with tempfile.TemporaryDirectory() as td:
         for c in cases[:4]:
             d = os.path.join(td, c["variant"], f"{c['fixture']}-s0"); os.makedirs(d)

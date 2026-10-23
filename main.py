@@ -644,6 +644,29 @@ async def run(question: str, max_rounds: int, max_sessions: int,
     return status
 
 
+_PROTECTED_META = ("question", "started", "run_dir")
+
+
+def _restore_protected_meta(metadata_path: str, original_meta: dict) -> None:
+    """The planner may add decision_year to metadata.json; it may not change
+    the question spec-compliance is checked against. Put protected fields
+    back (recording what was there) and rewrite the file."""
+    try:
+        with open(metadata_path) as f:
+            meta = json.load(f)
+    except (OSError, ValueError):
+        return
+    changed = False
+    for key in _PROTECTED_META:
+        if key in original_meta and meta.get(key) != original_meta[key]:
+            meta.setdefault("restored_fields", {})[key] = meta.get(key)
+            meta[key] = original_meta[key]
+            changed = True
+    if changed:
+        with open(metadata_path, "w") as f:
+            json.dump(meta, f, indent=2)
+
+
 def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
                  session_num, session_id, session_records, harness_before,
                  harness_prior_diff, run_gate: bool = True,
@@ -654,6 +677,10 @@ def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
     original_meta = original_meta or {}
     report_restored = restore_report_if_missing(run_path)
     has_report = os.path.exists(os.path.join(run_path, "report.md"))
+    # Restore the protected fields BEFORE the gate: the validator reads the
+    # question from metadata.json (Codex review of PR #14: a planner edit to
+    # the question would otherwise be gated, then silently undone).
+    _restore_protected_meta(os.path.join(run_path, "metadata.json"), original_meta)
 
     gate = None
     if run_gate and session_outcome == "session_completed":
@@ -676,12 +703,6 @@ def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
     # `status` is the authoritative discriminator; see determine_status()
     # for the values. Automation should consult `status` (or the process
     # exit code), not the presence of `completed`.
-    # The planner may add decision_year to metadata.json; it may not
-    # change the question spec-compliance was checked against.
-    for key in ("question", "started", "run_dir"):
-        if key in original_meta and meta.get(key) != original_meta[key]:
-            meta.setdefault("restored_fields", {})[key] = meta.get(key)
-            meta[key] = original_meta[key]
     meta["completed"] = datetime.now().isoformat()
     meta["status"] = status
     meta["session_outcome"] = session_outcome
@@ -979,6 +1000,35 @@ def _run_self_test() -> int:
        and "METHODS CRITIC" not in build_lead_prompt("q", "runs/x", 5, "")
        and "Spawn ALL THREE critique agents" in LEAD_SYSTEM_PROMPT,
        "MC1 methods critic lead prompt gating")
+    # CR1-CR4 (Codex review of PR #14): `cd` is tracked; Grep/Glob can't read .env.
+    rp_rel = os.path.relpath(run_path, REPO_ROOT)
+    ok(enforcement.check_tool_use("Bash", {"command": f"cd {rp_rel} && echo forged > critique_domain.yaml"},
+                                  run_path, None, set()) is not None,
+       "CR1 cd into the run dir then write a protected file is denied")
+    ok(enforcement.check_tool_use("Bash", {"command": "cd $RUN && echo x > critique_domain.yaml"},
+                                  run_path, None, set()) is not None,
+       "CR2 cd to an unknown dir: relative protected write is denied conservatively")
+    ok(enforcement.check_tool_use("Bash", {"command": f"cd {rp_rel} && echo ok > notes.txt"},
+                                  run_path, None, set()) is None,
+       "CR3 cd then an ordinary write stays allowed")
+    ok(enforcement.check_tool_use("Grep", {"path": os.path.join(REPO_ROOT, ".env"), "pattern": ".*"},
+                                  run_path, "analyst", set()) is not None
+       and enforcement.check_tool_use("Grep", {"path": REPO_ROOT, "glob": ".env*", "pattern": "KEY"},
+                                      run_path, "analyst", set()) is not None
+       and enforcement.check_tool_use("Grep", {"path": run_path, "glob": "*.py", "pattern": "x"},
+                                      run_path, "analyst", set()) is None
+       and enforcement.check_tool_use("Glob", {"pattern": "**/*"}, run_path, "analyst", set()) is None,
+       "CR4 Grep on .env denied; ordinary Grep and Glob allowed")
+    # CR5 (Codex review of PR #14): the gate must see the original question.
+    with tempfile.TemporaryDirectory() as td:
+        mp = os.path.join(td, "metadata.json")
+        with open(mp, "w") as f:
+            json.dump({"question": "weakened", "decision_year": 2027}, f)
+        _restore_protected_meta(mp, {"question": "Use Starsim within a $10M budget."})
+        m = json.load(open(mp))
+        ok(m["question"] == "Use Starsim within a $10M budget." and m["decision_year"] == 2027
+           and m["restored_fields"]["question"] == "weakened",
+           "CR5 protected metadata restored (before the gate), planner fields kept")
     # CS1 (Phase 22 γ): the ledger is built by a script; agents write the spec.
     ok(enforcement.check_tool_use("Write", {"file_path": f"{run_path}/models/claims_ledger.yaml"},
                                   run_path, "analyst", set()) is not None

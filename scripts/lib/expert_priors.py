@@ -315,34 +315,33 @@ def prior(id_: str) -> ExpertPrior:
 
 _KW_CACHE: dict[str, re.Pattern] = {}
 
-# Phase 21 γ: disease/programme-area vocabulary used to infer a prior's
-# domain when `applies_when.domain_any` is not declared. Each entry is
-# (canonical, [synonyms]). A prior whose id + claim names exactly one
-# area is gated to questions naming that area; an explicit `domain_any`
-# always wins. This keeps a country-keyed prior ("nigeria" + "burden")
-# written for one disease off another disease's question.
-_DOMAIN_TERMS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("malaria", ("malaria", "plasmodium", "falciparum", "vivax")),
-    ("tuberculosis", ("tuberculosis", "tb", "mdr-tb")),
-    ("hiv", ("hiv", "aids", "antiretroviral", "prep")),
-    ("measles", ("measles", "rubella", "mcv1", "mcv2")),
-    ("polio", ("polio", "poliovirus", "opv", "ipv", "nopv2")),
-    ("cholera", ("cholera",)),
-    ("dengue", ("dengue", "arbovirus")),
-    ("influenza", ("influenza", "flu")),
-    ("covid", ("covid", "sars-cov-2")),
-    ("ntd", ("schistosomiasis", "trachoma", "onchocerciasis",
-             "lymphatic filariasis", "helminth")),
-    ("hpv", ("hpv", "cervical cancer")),
-    ("pneumococcal", ("pneumococcal", "pcv")),
-    ("rotavirus", ("rotavirus",)),
-    ("meningitis", ("meningitis", "menafrivac")),
-)
+# Phase 21 γ: a prior's domain is inferred when `applies_when.domain_any` is
+# not declared. The disease/programme-area vocabulary is data: it lives in
+# expert_priors.yaml `domain_vocabulary:` (Copilot review of PR #14), not
+# here. A prior whose id + claim names exactly one area is gated to
+# questions naming that area; an explicit `domain_any` always wins. This
+# keeps a country-keyed prior written for one disease off another
+# disease's question.
+_vocab_cache: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {}
+
+
+def domain_vocabulary(manifest_path: str | None = None) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    path = manifest_path or _MANIFEST_PATH
+    if path not in _vocab_cache:
+        try:
+            with open(path) as f:
+                raw = (yaml.safe_load(f) or {}).get("domain_vocabulary") or {}
+        except (OSError, yaml.YAMLError):
+            raw = {}
+        _vocab_cache[path] = tuple(
+            (str(k), tuple(str(x).lower() for x in (v or [])))
+            for k, v in raw.items() if isinstance(v, list))
+    return _vocab_cache[path]
 
 
 def _inferred_domain(p: "ExpertPrior") -> list[str]:
     text = f"{p.id.replace('_', ' ')} {p.claim}".lower()
-    hits = [(canon, syns) for canon, syns in _DOMAIN_TERMS
+    hits = [(canon, syns) for canon, syns in domain_vocabulary()
             if any(_kw_in(s_, text) for s_ in syns)]
     if len(hits) == 1:
         return list(hits[0][1])

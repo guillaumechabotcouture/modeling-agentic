@@ -34,6 +34,26 @@ auto_validation:
   max_age_days_low: 1825      # LOW every 5 years
   warn_on_unverified_doi: true
 
+# Disease / programme-area vocabulary (data, not code). Used to infer a
+# prior's domain when `applies_when.domain_any` is not declared: a prior
+# whose id + claim names exactly one area is gated to questions naming that
+# area. An explicit `domain_any` always wins. Add a new disease area here.
+domain_vocabulary:
+  malaria: [malaria, plasmodium, falciparum, vivax]
+  tuberculosis: [tuberculosis, tb, mdr-tb]
+  hiv: [hiv, aids, antiretroviral, prep]
+  measles: [measles, rubella, mcv1, mcv2]
+  polio: [polio, poliovirus, opv, ipv, nopv2]
+  cholera: [cholera]
+  dengue: [dengue, arbovirus]
+  influenza: [influenza, flu]
+  covid: [covid, sars-cov-2]
+  ntd: [schistosomiasis, trachoma, onchocerciasis, lymphatic filariasis, helminth]
+  hpv: [hpv, cervical cancer]
+  pneumococcal: [pneumococcal, pcv]
+  rotavirus: [rotavirus]
+  meningitis: [meningitis, menafrivac]
+
 # Schema (per prior):
 #   id                       stable identifier referenced by validators
 #   kind                     external_fact | data_vintage | methodological_standard | policy_caveat

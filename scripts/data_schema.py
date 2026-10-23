@@ -32,6 +32,7 @@ Findings (validator `_check_data_schema`):
   data_schema_invalid          HIGH  unparseable; unknown kind; numeric kind without
                                      range; range outside what the kind allows
   data_schema_out_of_range     HIGH  declared column has values outside its range
+  data_schema_malformed_rows   HIGH  rows with the wrong number of fields (unchecked)
   data_schema_unit_conflict    HIGH  same column name declared with different
                                      kind/unit/per in two files
   data_schema_undeclared       MEDIUM processed/top-level data CSVs or columns
@@ -102,13 +103,16 @@ def _read(path: str):
         rd = csv.reader(f)
         hdr = [h.strip() for h in (next(rd, None) or [])]
         cols = {h: [] for h in hdr}
+        bad_rows = []
         for i, row in enumerate(rd):
             if i >= MAX_ROWS:
                 break
             if len(row) == len(hdr):
                 for h, v in zip(hdr, row):
                     cols[h].append(v.strip())
-    return hdr, cols
+            elif any(x.strip() for x in row):
+                bad_rows.append(i + 2)            # 1-based, after the header
+    return hdr, cols, bad_rows
 
 
 def _validate_decl(fname: str, col: str, d) -> list[str]:
@@ -171,7 +175,13 @@ def check(run_dir: str, round_n: int | None = None) -> list[dict]:
         t = _read(fpath)
         if t is None:
             continue
-        hdr, cols = t
+        hdr, cols, bad_rows = t
+        if bad_rows:
+            # A row the parser can't align is unchecked data: fail closed.
+            out.append(_f("data_schema_malformed_rows", "HIGH",
+                          f"`{fname}`: {len(bad_rows)} row(s) do not have {len(hdr)} fields "
+                          f"(lines {bad_rows[:10]}); their values cannot be checked against "
+                          f"`{SCHEMA_REL}`. Fix the quoting or the row.", fname))
         good = {}
         for col, d in cols_decl.items():
             e = _validate_decl(fname, col, d)
@@ -285,6 +295,9 @@ def _self_test() -> int:
         ok(sorted((f["kind"], f["severity"]) for f in fs) == [
             ("data_schema_stale_entry", "MEDIUM"), ("data_schema_undeclared", "MEDIUM"),
             ("data_schema_undeclared", "MEDIUM")], f"D7 undeclared/stale: {fs}")
+        # D7b (Codex review): a ragged row hiding an out-of-range value is reported
+        w("data/processed/units.csv", "unit,prev,inc_per_1000,pop\nA,0.25,120,50000\nB,25,90,80000,x\n")
+        ok("data_schema_malformed_rows" in kinds(check(d, 3)), f"D7b ragged row: {check(d, 3)}")
         # D8: HIGH findings are not scope-declarable
         w("data/processed/units.csv", "unit,prev,inc_per_1000,pop\nA,25,120,50000\n")
         ok(all(f.get("scope_declarable") is False for f in check(d, 3) if f["severity"] == "HIGH"),

@@ -192,6 +192,76 @@ def _tokens(segment: str) -> list[str]:
         return segment.split()
 
 
+def _segment_targets(segment: str) -> list[str]:
+    """Paths one shell segment writes to (no cwd handling)."""
+    targets: list[str] = [m.group(1) for m in _REDIRECT.finditer(segment)
+                          if m.group(1) not in ("/dev/null", "&1", "&2")]
+    for m in _PY_WRITE.finditer(segment):
+        targets.append(m.group(1) or m.group(2))
+    toks = _tokens(segment.strip().lstrip("({").strip())
+    # Skip leading env assignments / sudo / command wrappers.
+    while toks and (re.match(r"^\w+=", toks[0]) or toks[0] in ("sudo", "command", "env")):
+        toks = toks[1:]
+    if not toks:
+        return targets
+    cmd = os.path.basename(toks[0])
+    args = [t for t in toks[1:] if not t.startswith("-")]
+    if cmd == "tee":
+        targets.extend(args)
+    elif cmd in _DESTRUCTIVE_ALL_ARGS:
+        targets.extend(args)
+    elif cmd in _DEST_LAST_ARG and args:
+        targets.append(args[-1])
+        if cmd == "mv":
+            targets.extend(args[:-1])  # moving a file away also removes it
+    elif cmd in _INPLACE and any(t.startswith("-i") or t == "--in-place"
+                                 or (t.startswith("-") and "i" in t[1:] and cmd == "perl")
+                                 for t in toks[1:]):
+        targets.extend(args[1:] if args else [])
+    elif cmd == "git" and len(toks) > 1 and toks[1] in _GIT_WRITE:
+        path_args = [t for t in toks[2:] if not t.startswith("-") and t != "--"]
+        targets.extend(path_args or ["."])
+    return targets
+
+
+def _cd_target(segment: str, cur: str | None) -> tuple[bool, str | None]:
+    """(is_cd, new_cwd). new_cwd is None when the destination can't be
+    known statically (`cd $X`, `cd -`, `cd` with a glob)."""
+    toks = _tokens(segment.strip().lstrip("({").strip())
+    if not toks or toks[0] not in ("cd", "pushd"):
+        return False, cur
+    args = [t for t in toks[1:] if not t.startswith("-") or t == "-"]
+    dest = args[0] if args else "~"
+    dest = os.path.expanduser(dest)
+    if dest == "-" or any(c in dest for c in "$`*?["):
+        return True, None
+    if os.path.isabs(dest):
+        return True, os.path.normpath(dest)
+    if cur is None:
+        return True, None  # relative to an unknown directory is unknown
+    return True, os.path.normpath(os.path.join(cur, dest))
+
+
+def bash_write_targets_cwd(command: str, cwd: str | None = None
+                           ) -> list[tuple[str, str | None]]:
+    """(path, cwd it is relative to) for every path a command writes.
+
+    Tracks `cd` / `pushd` across `&&`, `;`, `|` and newlines, so
+    `cd runs/x && echo forged > critique_domain.yaml` resolves inside the
+    run directory. After a `cd` whose destination is unknown, the cwd is
+    None and callers must treat relative targets conservatively.
+    """
+    out: list[tuple[str, str | None]] = []
+    cur: str | None = cwd or REPO_ROOT
+    for segment in _SEGMENT_SPLIT.split(command):
+        is_cd, new = _cd_target(segment, cur)
+        if is_cd:
+            cur = new
+            continue
+        out.extend((t, cur) for t in _segment_targets(segment))
+    return out
+
+
 def bash_write_targets(command: str) -> list[str]:
     """Best-effort list of paths a shell command writes to.
 
@@ -200,38 +270,7 @@ def bash_write_targets(command: str) -> list[str]:
     python one-liners with open(..., 'w')). Anything it misses is caught
     after the fact by the harness hash in main.py.
     """
-    targets: list[str] = []
-    targets.extend(m.group(1) for m in _REDIRECT.finditer(command)
-                   if m.group(1) not in ("/dev/null", "&1", "&2"))
-    for m in _PY_WRITE.finditer(command):
-        targets.append(m.group(1) or m.group(2))
-    for segment in _SEGMENT_SPLIT.split(command):
-        toks = _tokens(segment.strip())
-        if not toks:
-            continue
-        # Skip leading env assignments / sudo / command wrappers.
-        while toks and (re.match(r"^\w+=", toks[0]) or toks[0] in ("sudo", "command", "env")):
-            toks = toks[1:]
-        if not toks:
-            continue
-        cmd = os.path.basename(toks[0])
-        args = [t for t in toks[1:] if not t.startswith("-")]
-        if cmd == "tee":
-            targets.extend(args)
-        elif cmd in _DESTRUCTIVE_ALL_ARGS:
-            targets.extend(args)
-        elif cmd in _DEST_LAST_ARG and args:
-            targets.append(args[-1])
-            if cmd == "mv":
-                targets.extend(args[:-1])  # moving a file away also removes it
-        elif cmd in _INPLACE and any(t.startswith("-i") or t == "--in-place"
-                                     or (t.startswith("-") and "i" in t[1:] and cmd == "perl")
-                                     for t in toks[1:]):
-            targets.extend(args[1:] if args else [])
-        elif cmd == "git" and len(toks) > 1 and toks[1] in _GIT_WRITE:
-            path_args = [t for t in toks[2:] if not t.startswith("-") and t != "--"]
-            targets.extend(path_args or ["."])
-    return targets
+    return [t for t, _ in bash_write_targets_cwd(command)]
 
 
 def bash_reason(command: str, run_path: str, agent_type: str | None,
@@ -240,12 +279,15 @@ def bash_reason(command: str, run_path: str, agent_type: str | None,
     if _ENV_REF.search(command):
         return ("credential files (.env) are not accessible to agents; cloud "
                 "credentials are provided in the environment when --cloud is set")
-    for target in bash_write_targets(command):
-        if target in (".", "./"):
-            target = cwd or REPO_ROOT
-        reason = protected_reason(target, run_path, agent_type, cwd)
-        if reason:
-            return f"command writes to {target}: {reason}"
+    for target, tcwd in bash_write_targets_cwd(command, cwd):
+        # Unknown cwd after `cd $X`: a relative target could be anywhere,
+        # so check it as if relative to the run dir and to the repo root.
+        bases = [tcwd] if tcwd is not None else [run_path, REPO_ROOT]
+        for base in bases:
+            path = base if target in (".", "./") else target
+            reason = protected_reason(path, run_path, agent_type, base)
+            if reason:
+                return f"command writes to {target}: {reason}"
     return None
 
 
@@ -284,10 +326,14 @@ def check_tool_use(tool_name: str, tool_input: dict, run_path: str,
         if path:
             return protected_reason(path, run_path, agent_type, cwd)
         return None
-    if tool_name == "Read":
-        path = tool_input.get("file_path") or ""
-        if path and is_env_file(path, cwd):
-            return "credential files (.env) are not accessible to agents"
+    if tool_name in ("Read", "Grep"):
+        # Grep reads file contents too: a .env search path, or a glob that
+        # names .env, exposes credentials as surely as Read. (Glob returns
+        # names only, so it is not restricted.)
+        for key in ("file_path", "path", "glob"):
+            val = str(tool_input.get(key) or "")
+            if val and (is_env_file(val, cwd) or ".env" in val):
+                return "credential files (.env) are not accessible to agents"
         return None
     if tool_name == "Bash":
         return bash_reason(tool_input.get("command") or "", run_path,

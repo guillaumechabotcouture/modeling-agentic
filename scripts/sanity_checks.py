@@ -122,8 +122,11 @@ except ImportError:
 # Phase 21 γ: the magnitude suffix must end at a word boundary and the
 # single letters are case-sensitive — "12 months" is not 12M, "5 Malaria"
 # not 5M, "3 key" not 3,000 (each previously "matched" any target).
+# The number must not end where another digit or a decimal/thousands
+# continuation follows: otherwise "1000mg" backtracks to match 100 and
+# "0.45pp" to match 0.4 (Copilot review of PR #14).
 _NUMERIC_TOKEN_RE = re.compile(
-    r"(?<![\d.,])(\d+(?:\.\d+)?)\s*((?i:million|thousand)|M|[kK])?(?![A-Za-z])",
+    r"(?<![\d.,])(\d+(?:\.\d+)?)(?!\d|[.,]\d)\s*((?i:million|thousand)|M|[kK])?(?![A-Za-z])",
 )
 _NUMERIC_COMMA_RE = re.compile(r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?)")
 
@@ -1108,7 +1111,11 @@ def _run_self_test() -> int:
                                ("averts 12M infections", 12e6, True),
                                ("averts 12 million infections", 12e6, True),
                                ("about 3k sites", 3000, True),
-                               ("a 1,234 total", 234, False)):
+                               ("a 1,234 total", 234, False),
+                               # Copilot review: no backtracking into a shorter number
+                               ("dose 1000mg", 100, False),
+                               ("gap 0.45pp", 0.4, False),
+                               ("bound 100.", 100, True)):
         got = _text_contains_value(text, target)
         ok(got is want, f"X2 {text!r} ~ {target}: got {got}, want {want}")
 
