@@ -135,7 +135,9 @@ def harness_scripts_run(command: str, cwd: str | None = None, _depth: int = 0
             for j, t in enumerate(toks[1:], 1):
                 if t == "--" or not t.startswith("-"):
                     break
-                if not t.startswith("--") and "c" in t[1:]:
+                # only a cluster of real single-letter shell options (e/l/u/x/i/o…);
+                # `-Zc` makes bash exit without running the string (Codex, PR #17).
+                if re.fullmatch(r"-[eluxivnfaBHP]*c[eluxivnfaBHP]*", t):
                     cmd_str = toks[j + 1] if j + 1 < len(toks) else None
                     break
             if cmd_str is not None:
