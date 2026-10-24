@@ -311,7 +311,7 @@ def _no_symlink_path(path: str) -> bool:
 
 def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: list,
                  deadline: float | None = None, procs: int | None = None,
-                 chunk_allowance_s: float | None = None, call_id: str | None = None):
+                 chunk_allowance_s: float | None = None, call_id: str | None = None, repo: str | None = None):
     """Runs on a dask worker. Under a machine-wide lock: make sure the files on
     disk are exactly THIS bundle (another call's bundle may have replaced them:
     its extra files are removed and no stale bytecode survives), then evaluate
@@ -383,7 +383,9 @@ def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: lis
         with tempfile.TemporaryDirectory() as td:
             inp, out = os.path.join(td, "in.json"), os.path.join(td, "out.jsonl")
             json.dump([p for _, p in chunk], open(inp, "w"))
-            script = os.path.join(REPO, "scripts", "compute.py")
+            # The caller's repo (the bundle unpacks its scripts/ there); this
+            # module's own location on a worker is wherever dask uploaded it.
+            script = os.path.join(repo or REPO, "scripts", "compute.py")
             # Model code gets no credentials the worker may hold (cloud, model
             # APIs, the cluster's TLS files): same rule as agents/enforcement.py.
             env = {k: v for k, v in os.environ.items()
@@ -544,6 +546,9 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
     call_id = uuid.uuid4().hex
     progress = {} if progress is None else progress
     with Client(addr, timeout="60s", security=_security()) as c:
+        # Dask pickles functions by reference when it can, so the scheduler and
+        # workers must be able to import this module: ship it to them.
+        c.upload_file(os.path.abspath(__file__))
         winfo = c.scheduler_info()["workers"]
         workers = [w for w in winfo if w not in exclude]
         if max_workers:
@@ -575,11 +580,12 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
             # charged), rather than through dask retries, which would hide it.
             f = c.submit(_remote_task, bfut, binfo["sha256"], run_dir, fn_spec, ch, deadline,
                          int(env_procs) if env_procs else None,     # None: the worker uses its own core count
-                         share, call_id, workers=workers, allow_other_workers=False, pure=False)
+                         share, call_id, REPO, workers=workers, allow_other_workers=False, pure=False)
             futs[f] = (ch, attempt)
             held[f] = share or 0.0
+            started[f] = time.time()
             return f
-        futs, queue = {}, [(ch, 0) for ch in chunks]
+        futs, queue, started, errors = {}, [(ch, 0) for ch in chunks], {}, {}
         pending, rows, stop, lost = set(), [], None, 0
         try:
             while queue or pending:
@@ -608,15 +614,18 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                     except Exception as e:  # noqa: BLE001 — a lost worker fails only its chunk
                         # Its work is unknown: charge the share it was allowed
                         # (chunks enforce their share), or estimate it at the end.
+                        # charged as busy since submission, never above its share
+                        busy = (time.time() - started.get(f, time.time())) * cores_per_slot
                         if f_share:
-                            progress["core_s"] += f_share
+                            progress["core_s"] += min(f_share, busy)
                         else:
                             lost += 1
+                        msg = f"chunk failed: {type(e).__name__}: {e}"[:500]
+                        errors.update({i: msg for i, _ in ch})
                         if attempt == 0 and (deadline is None or time.time() < deadline):
                             queue.insert(0, (ch, 1))
                             continue
-                        rows += [{"i": i, "ok": False, "error": f"chunk failed: {type(e).__name__}: {e}"[:500]}
-                                 for i, _ in ch]
+                        rows += [{"i": i, "ok": False, "error": errors[i]} for i, _ in ch]
                 if (pending or queue) and allowance_s is not None and progress["core_s"] >= allowance_s:
                     stop = CAP_STOP
                     break
@@ -636,6 +645,8 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
             except Exception:  # noqa: BLE001
                 gone = list(workers)
             progress["gone_workers"] = len(gone)
+    done_i = {r["i"] for r in rows}
+    rows += [{"i": i, "ok": False, "error": msg} for i, msg in errors.items() if i not in done_i]   # keep the real error
     return rows, {"backend": "dask", "workers": len(workers), "slots": slots, "cores_per_slot": cores_per_slot,
                   "core_s": progress["core_s"], "stopped": stop,
                   "unknown_chunks": lost + len(pending) + len(gone), "bundle": binfo}
@@ -1149,6 +1160,51 @@ def _self_test() -> int:
                     os.environ.pop("MA_COMPUTE_SCHEDULER", None)
                     os.environ.pop("MA_COMPUTE_EXCLUDE_WORKERS", None)
                     os.environ.pop("MA_COMPUTE_PROCS_PER_WORKER", None)
+        # C33: a scheduler and worker started outside this repo cannot import
+        # this module (as on Coiled); the task must still run.
+        try:
+            import distributed  # noqa: F401
+        except ImportError:
+            pass
+        else:
+            iso = tempfile.mkdtemp(prefix="ma_iso_")
+            sf = os.path.join(iso, "sched.json")
+            envi = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH",)}
+            dask_cli = os.path.join(os.path.dirname(sys.executable), "dask")
+            procs_ = [_sp.Popen([dask_cli, "scheduler", "--scheduler-file", sf,
+                                 "--host", "127.0.0.1", "--port", "0", "--no-dashboard"], cwd=iso, env=envi,
+                                stdout=_sp.DEVNULL, stderr=open(os.path.join(iso, "sched.err"), "w"))]
+            try:
+                end = time.time() + 60
+                while not os.path.exists(sf) and time.time() < end:
+                    time.sleep(0.2)
+                time.sleep(1.0)       # the file is written just before the scheduler listens
+                procs_.append(_sp.Popen([dask_cli, "worker", "--scheduler-file", sf,
+                                         "--nthreads", "1", "--no-dashboard"], cwd=iso, env=envi,
+                                        stdout=_sp.DEVNULL, stderr=_sp.DEVNULL))
+                os.environ["MA_COMPUTE_SCHEDULER"] = json.load(open(sf))["address"]
+                from distributed import Client as _C
+                with _C(os.environ["MA_COMPUTE_SCHEDULER"]) as cc:
+                    cc.wait_for_workers(1, timeout=60)
+                # Imported as a module, as propagate_uncertainty.py does (run as
+                # __main__, dask would ship the functions by value and hide this).
+                code = ("import json, sys; sys.path.insert(0, %r); import compute; "
+                        "rows, s = compute.map_fn(%r, 'models/fn.py::f', [{'x': 0}, {'x': 1}, {'x': 2}], ledger=False); "
+                        "print(json.dumps([r.get('result') or r.get('error') for r in rows]))") % (HERE, d)
+                r = _sp.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=300,
+                            env=dict(os.environ, PYTHONPATH=""))
+                got = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.stderr[-500:]
+                ok(got == json.dumps([{"y": 0.0}, {"y": 3.0}, {"y": 6.0}]),
+                   f"C33 runs on a cluster that cannot import this module: {got}")
+            except Exception:
+                print(open(os.path.join(iso, "sched.err")).read()[-3000:])
+                raise
+            finally:
+                os.environ.pop("MA_COMPUTE_SCHEDULER", None)
+                for pr in procs_:
+                    pr.terminate()
+                for pr in procs_:
+                    pr.wait(10)
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
         return 1
