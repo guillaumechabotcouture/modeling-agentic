@@ -141,8 +141,9 @@ def _local_init(run_dir: str, fn_spec: str):
 
 def _local_chunk(chunk):
     global _LOCAL_INIT_S
-    init_s, _LOCAL_INIT_S = _LOCAL_INIT_S, 0.0
-    return {"rows": [_call(_LOCAL_FN, i, params) for i, params in chunk], "init_s": init_s}
+    init_s, _LOCAL_INIT_S = _LOCAL_INIT_S, None
+    return {"rows": [_call(_LOCAL_FN, i, params) for i, params in chunk], "init_s": init_s or 0.0,
+            "first": init_s is not None}
 
 
 def _chunks(items: list, n_chunks: int) -> list:
@@ -208,7 +209,7 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
     ex = cf.ProcessPoolExecutor(max_workers=n, mp_context=mp.get_context("spawn"),
                                 initializer=_local_init, initargs=(run_dir, fn_spec))
     futs = {ex.submit(_local_chunk, ch): ch for ch in chunks}
-    pending, rows, stop, lost, pids = set(futs), [], None, 0, set()
+    pending, rows, stop, lost, pids, inits = set(futs), [], None, 0, set(), []
     try:
         while pending:
             pids |= set((getattr(ex, "_processes", None) or {}).keys())
@@ -222,6 +223,8 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
                     got = f.result()
                     rows += got["rows"]
                     progress["core_s"] += _known_core_s(got["rows"]) + got["init_s"]
+                    if got.get("first"):
+                        inits.append(got["init_s"])
                 except Exception as e:  # noqa: BLE001 — a crashed process fails only its chunk
                     lost += 1
                     rows += [{"i": i, "ok": False, "error": f"chunk failed: {type(e).__name__}: {e}"[:500]}
@@ -237,6 +240,9 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
             _kill_groups(pids - live, grace_s=0, direct=False)
         ex.shutdown(wait=True, cancel_futures=True)
         _kill_groups(pids, grace_s=0, direct=False)   # leftovers the model spawned (pool already reaped)
+    # Processes that loaded the model but never reported a chunk: charge each
+    # the longest load time seen.
+    progress["core_s"] += max(0, len(pids) - len(inits)) * max(inits, default=0.0)
     return rows, {"backend": "local", "workers": n, "slots": n, "cores_per_slot": 1, "core_s": progress["core_s"],
                   "stopped": stop, "unknown_chunks": lost + len(pending)}
 
@@ -349,6 +355,9 @@ def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: lis
                     pyc = os.path.join(d, "__pycache__")
                     if not os.path.islink(pyc):
                         shutil.rmtree(pyc, ignore_errors=True)
+                for m in members:
+                    if os.path.islink("/" + m):      # extraction would write through it
+                        os.unlink("/" + m)
                 tf.extractall("/", filter="data")
                 os.makedirs(run_dir, exist_ok=True)
                 json.dump({"sha": sha, "members": members}, open(current, "w"))
@@ -570,13 +579,18 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                     break
                 for f in done:
                     ch, attempt = futs[f]
-                    held.pop(f, None)
+                    f_share = held.pop(f, None)
                     try:
                         got = f.result()
                         rows += got["rows"]
                         progress["core_s"] += float(got["core_s"])
                     except Exception as e:  # noqa: BLE001 — a lost worker fails only its chunk
-                        lost += 1
+                        # Its work is unknown: charge the share it was allowed
+                        # (chunks enforce their share), or estimate it at the end.
+                        if f_share:
+                            progress["core_s"] += f_share
+                        else:
+                            lost += 1
                         if attempt == 0 and (deadline is None or time.time() < deadline):
                             queue.insert(0, (ch, 1))
                             continue
@@ -1023,6 +1037,32 @@ def _self_test() -> int:
         open(os.path.join(d, "models", "heavy.py"), "w").write("import time\ntime.sleep(1.0)\ndef f(p):\n    return 1\n")
         rows, s = map_fn(d, "models/heavy.py::f", [{}] * 2, backend="local", max_workers=1)
         ok(rows[0]["ok"] and s["task_core_s"] >= 0.9, f"C28 model load time is charged: {s}")
+        rows, s = map_fn(d, "models/heavy.py::f", [{}] * 3, backend="local", max_workers=3)
+        ok(s["task_core_s"] >= 2.7, f"C28b every process's model load is charged, chunk or not: {s}")
+        ld = os.path.realpath(os.path.join(d, "leaf")); os.makedirs(os.path.join(ld, "models")); os.makedirs(os.path.join(ld, "data"))
+        open(os.path.join(ld, "models", "v.py"), "w").write("def v(p):\n    return 1\n")
+        open(os.path.join(ld, "data", "input.csv"), "w").write("bundle\n")
+        bl_, il_ = make_bundle(ld)
+        victim = os.path.join(d, "victim_run"); os.makedirs(os.path.join(victim, "data"))
+        open(os.path.join(victim, "metadata.json"), "w").write("{}")
+        open(os.path.join(victim, "data", "input.csv"), "w").write("live\n")
+        os.remove(os.path.join(ld, "data", "input.csv"))
+        os.symlink(os.path.join(victim, "data", "input.csv"), os.path.join(ld, "data", "input.csv"))
+        _remote_task(bl_, il_["sha256"], ld, "models/v.py::v", [(0, {})], procs=1)
+        ok(open(os.path.join(victim, "data", "input.csv")).read() == "live\n"
+           and not os.path.islink(os.path.join(ld, "data", "input.csv")),
+           "C30 staging never writes through a symlinked file")
+        open(os.path.join(d, "models", "envq.py"), "w").write(
+            "import os\ndef f(p):\n    return [os.environ.get('MA_COMPUTE_GATE'), os.environ.get('MA_COMPUTE_CANCEL')]\n")
+        ed = os.path.join(d, "envgate"); os.makedirs(ed)
+        inp = os.path.join(ed, "in.json"); json.dump([{}], open(inp, "w")); out = os.path.join(ed, "out.jsonl")
+        pe = _sp.Popen([sys.executable, os.path.abspath(__file__), "map", d, "--fn", "models/envq.py::f", "--inputs", inp,
+                        "--out", out, "--backend", "local", "--no-ledger"],
+                       env=dict(os.environ, MA_COMPUTE_GATE=os.path.join(ed, "{pid}"), MA_COMPUTE_CANCEL=os.path.join(ed, "cancel")))
+        open(os.path.join(ed, str(pe.pid)), "w").write("1")
+        pe.wait(60)
+        got = json.loads(open(out).readline())["result"] if os.path.exists(out) else "no output"
+        ok(got == [None, None], f"C31 the registration gate is not inherited by the model: {got}")
         gdir = os.path.join(d, "gate"); os.makedirs(gdir)
         open(os.path.join(gdir, "cancel"), "w").write("1")
         inp = os.path.join(gdir, "in.json"); json.dump([{"x": 1}], open(inp, "w"))
@@ -1100,6 +1140,8 @@ def main() -> int:
             time.sleep(0.02)
         if os.path.exists(os.environ.get("MA_COMPUTE_CANCEL", "/nonexistent")):
             return 3          # cancelled before any work; the parent labels the rows
+    for k in ("MA_COMPUTE_GATE", "MA_COMPUTE_CANCEL"):
+        os.environ.pop(k, None)           # never inherited by the model's own subprocesses
     if a.cmd != "map" or not (a.run_dir and a.fn and a.inputs and a.out):
         ap.error("usage: compute.py map <run_dir> --fn <path.py>::<fn> --inputs <jsonl> --out <jsonl>")
     rows, summary = map_fn(a.run_dir, a.fn, _read_inputs(a.inputs), a.backend, a.max_workers,
