@@ -1,0 +1,9 @@
+# E8 compute: same modeler; batches go to the shared Coiled compute workers (--compute-workers 6).
+id: compute
+model: claude-opus-5-5
+skills: default
+max_turns: 150
+budget_usd: 40
+wall_timeout_s: 14400
+compute: true
+env: {MA_COMPUTE_MAX_CORE_HOURS: "50"}
