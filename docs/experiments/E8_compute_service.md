@@ -62,3 +62,15 @@ Using the same prompt in both arms isolates where the simulations run. It does n
 - **Not a whole run.** The MODEL stage only; other stages and RETHINK rounds are not measured.
 - **Shared compute pool.** Concurrent compute-arm cases compete for the 6 compute workers, as runs would in practice.
 - **Uneven benefit.** Fixtures whose models are cheap gain little. The paired design shows this per fixture.
+
+## Amendments (before any case ran)
+
+- **2026-10-24, launch layout.** The registered single-cluster command would place both arms of a fixture on one case VM, one after the other (fixture-affine assignment). That doubles wall time to about 8 h, and the two arms would not run under the same conditions at the same time.
+  - **New layout:** the arms run at the same time on two clusters with identical case VMs (8 vCPU, 32 GiB).
+    - control: `e8-control-gcc`, 6 workers.
+    - compute: `e8-compute-gcc`, 6 case workers plus 6 compute workers.
+  - **Unchanged:** fixtures, variants, caps, outcomes and decision rule.
+  - **Code:** `main` at `073ffa5` (PR #19 and #20).
+  - **Real-model check before launch:**
+    - **Agreement:** measles run 2026-10-20_213310, 8 draws on Coiled compute workers versus serial on the laptop. 135 outputs; maximum relative difference 4e-12 (floating point); package versions identical.
+    - **Speed:** 96 draws took 141 s on 3 × 8-vCPU workers.
