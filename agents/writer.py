@@ -43,7 +43,11 @@ rationale. Use the "Key finding" and "Use in report" fields to write
 informative captions. A figure without a documented rationale should
 be moved to the appendix or omitted.
 
-## Write {run_dir}/report.md with these sections:
+## Write your draft to {run_dir}/manuscript.md with these sections:
+
+(Save it as `manuscript.md`, never `report.md`: the CLI blocks subagents from
+writing files named REPORT*/SUMMARY*/FINDINGS*/ANALYSIS*.md, and
+`scripts/render_claims.py` builds `report.md` from your draft.)
 
 **1. Introduction**
 - Research question and why it matters

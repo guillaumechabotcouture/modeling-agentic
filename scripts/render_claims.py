@@ -371,9 +371,13 @@ def render_run(run_dir: str) -> dict:
     snapshot_path, report_path}.
     """
     report_path = os.path.join(run_dir, "report.md")
+    # Phase 25: the writer drafts manuscript.md (the CLI blocks subagents
+    # from writing REPORT*.md); this script writes report.md from it.
+    draft_path = os.path.join(run_dir, "manuscript.md")
+    source_path = draft_path if os.path.exists(draft_path) else report_path
     ledger_path = os.path.join(run_dir, "models", "claims_ledger.yaml")
-    if not os.path.exists(report_path):
-        return {"ok": False, "error": f"report.md not found at {report_path}",
+    if not os.path.exists(source_path):
+        return {"ok": False, "error": f"neither manuscript.md nor report.md found in {run_dir}",
                 "n_refs": 0, "n_unresolved": 0, "unresolved_ids": []}
     if not os.path.exists(ledger_path) and not os.path.exists(
             os.path.join(run_dir, "models", "claims_spec.yaml")):
@@ -381,14 +385,20 @@ def render_run(run_dir: str) -> dict:
                 "error": f"claims_ledger.yaml not found at {ledger_path}",
                 "n_refs": 0, "n_unresolved": 0, "unresolved_ids": []}
 
-    with open(report_path) as f:
+    with open(source_path) as f:
         text = f.read()
+
+    def _write_report(body):
+        with open(report_path, "w") as f:
+            f.write(body)
 
     protected = _fenced_or_inline_code_spans(text)
     n_refs = sum(1 for m in _CLAIM_REF_RE.finditer(text)
                  if not _in_protected_span(protected, m.start()))
     if n_refs == 0:
-        # No references; nothing to do
+        # No references: the draft is the report
+        if source_path != report_path:
+            _write_report(text)
         return {"ok": True, "n_refs": 0, "n_unresolved": 0,
                 "unresolved_ids": [], "snapshot_path": None,
                 "report_path": report_path}
@@ -402,7 +412,7 @@ def render_run(run_dir: str) -> dict:
 
     # Snapshot the writer's draft before substitution.
     snapshot_path = os.path.join(run_dir, "report.unrendered.md")
-    shutil.copy2(report_path, snapshot_path)
+    shutil.copy2(source_path, snapshot_path)
 
     new_text, unresolved = render_text(text, claims)
 
@@ -411,14 +421,15 @@ def render_run(run_dir: str) -> dict:
         # docstring always promised). Writing the partial render here
         # meant a second invocation snapshotted half-rendered text over
         # report.unrendered.md, destroying the draft.
+        if source_path != report_path:
+            _write_report(text)        # report.md = the unrendered draft, as before
         return {"ok": False, "n_refs": n_refs,
                 "n_unresolved": len(set(unresolved)),
                 "unresolved_ids": sorted(set(unresolved)),
                 "snapshot_path": snapshot_path,
                 "report_path": report_path}
 
-    with open(report_path, "w") as f:
-        f.write(new_text)
+    _write_report(new_text)
     return {"ok": True, "n_refs": n_refs, "n_unresolved": 0,
             "unresolved_ids": [], "snapshot_path": snapshot_path,
             "report_path": report_path}
@@ -543,6 +554,24 @@ def _self_test() -> int:
         # snapshot present
         ok(os.path.exists(os.path.join(d, "report.unrendered.md")),
            "T7: report.unrendered.md snapshot must exist after render")
+
+    # T7b (Phase 25): the writer's draft is manuscript.md; report.md is built from it
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "models", "claims_ledger.yaml"), "w") as f:
+            yaml.safe_dump({"claims": [{"id": "dalys", "claim_kind": "scalar", "value": 7467997}]}, f)
+        with open(os.path.join(d, "manuscript.md"), "w") as f:
+            f.write("# Report\n\nAverts [CLAIM:dalys] DALYs.\n")
+        result = render_run(d)
+        rendered = open(os.path.join(d, "report.md")).read() if os.path.exists(os.path.join(d, "report.md")) else ""
+        ok(result["ok"] and "7.47M" in rendered and "[CLAIM:" not in rendered
+           and "[CLAIM:dalys]" in open(os.path.join(d, "report.unrendered.md")).read(),
+           f"T7b report.md rendered from manuscript.md: {result}")
+        os.remove(os.path.join(d, "report.md"))
+        with open(os.path.join(d, "manuscript.md"), "w") as f:
+            f.write("# Report\n\nNo claim references here.\n")
+        render_run(d)
+        ok(os.path.exists(os.path.join(d, "report.md")), "T7b a draft without references still becomes report.md")
 
     # T8: render_run reports unresolved references gracefully
     with tempfile.TemporaryDirectory() as d:
