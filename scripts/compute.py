@@ -129,7 +129,9 @@ def _local_init(run_dir: str, fn_spec: str):
     global _LOCAL_FN
     # Own process group: whatever the model spawns (an external simulator)
     # is killed with this process. A child that starts its own session escapes.
-    os.setpgrp()
+    # Inside a remote chunk the whole chunk is already one group (killed as one).
+    if not os.environ.get("MA_COMPUTE_IN_CHUNK"):
+        os.setpgrp()
     os.chdir(run_dir)
     _LOCAL_FN = load_fn(run_dir, fn_spec)
 
@@ -155,32 +157,38 @@ def _budget_deadline(deadline, allowance_s, cores):
     return (b, CAP_STOP) if deadline is None or b < deadline else (deadline, "timed out")
 
 
-def _killpg(pgid, sig):
-    try:
-        os.killpg(pgid, sig)
-    except (ProcessLookupError, PermissionError):
-        pass
+def _killpg(pgid, sig, direct=False):
+    """Signal the group; with direct=True also the process itself (a pool
+    worker stopped before _local_init has not made its group yet). Only pass
+    direct=True for a process not yet reaped: a reaped pid can be reused."""
+    for kill in (os.killpg, os.kill) if direct else (os.killpg,):
+        try:
+            kill(pgid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
 
 
-def _kill_groups(pids, grace_s=2.0):
+def _kill_groups(pids, grace_s=2.0, direct=True):
     """SIGTERM every pool process group, then SIGKILL whatever is left once
     one shared grace period ends (a model may trap SIGTERM)."""
     import signal
     for pid in pids:
-        _killpg(pid, signal.SIGTERM)
+        _killpg(pid, signal.SIGTERM, direct)
     end = time.time() + grace_s
-    while time.time() < end and any(_group_alive(p) for p in pids):
+    while time.time() < end and any(_group_alive(p, direct) for p in pids):
         time.sleep(0.05)
     for pid in pids:
-        _killpg(pid, signal.SIGKILL)
+        _killpg(pid, signal.SIGKILL, direct)
 
 
-def _group_alive(pgid) -> bool:
-    try:
-        os.killpg(pgid, 0)
-        return True
-    except (ProcessLookupError, PermissionError):
-        return False
+def _group_alive(pgid, direct=False) -> bool:
+    for probe in (os.killpg, os.kill) if direct else (os.killpg,):
+        try:
+            probe(pgid, 0)
+            return True
+        except (ProcessLookupError, PermissionError):
+            pass
+    return False
 
 
 def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s=None, progress=None):
@@ -217,11 +225,13 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
                 stop = CAP_STOP
                 break
     finally:
-        pids |= set((getattr(ex, "_processes", None) or {}).keys())
+        live = set((getattr(ex, "_processes", None) or {}).keys())   # not yet reaped
+        pids |= live
         if pending:
-            _kill_groups(pids)
+            _kill_groups(live)
+            _kill_groups(pids - live, grace_s=0, direct=False)
         ex.shutdown(wait=True, cancel_futures=True)
-        _kill_groups(pids, grace_s=0)    # leftovers the model spawned and left running
+        _kill_groups(pids, grace_s=0, direct=False)   # leftovers the model spawned (pool already reaped)
     return rows, {"backend": "local", "workers": n, "slots": n, "cores_per_slot": 1, "core_s": progress["core_s"],
                   "stopped": stop, "unknown_chunks": lost + len(pending)}
 
@@ -346,6 +356,7 @@ def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: lis
             script = os.path.join(REPO, "scripts", "compute.py")
             env = {k: v for k, v in os.environ.items() if not k.startswith("MA_COMPUTE_SCHEDULER")}
             env["PYTHONDONTWRITEBYTECODE"] = "1"     # bytecode never outlives its bundle
+            env["MA_COMPUTE_IN_CHUNK"] = "1"
             cmd = [sys.executable, script, "map", run_dir, "--fn", fn_spec, "--inputs", inp,
                    "--out", out, "--backend", "local", "--max-workers", str(procs), "--no-ledger"]
             if chunk_allowance_s is not None:
@@ -362,21 +373,31 @@ def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: lis
                 hard = b if hard is None else min(hard, b)
             # Own session: on a hard stop or a cancel the chunk is signalled as a
             # group; its SIGTERM handler kills its pool's groups.
-            proc = subprocess.Popen(cmd, cwd=run_dir, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    text=True, start_new_session=True)
+            # Output to a file, not a pipe: a stray grandchild holding the pipe
+            # open must not keep this wait from returning.
+            errf = open(os.path.join(td, "chunk.err"), "w+")
+            proc = subprocess.Popen(cmd, cwd=run_dir, env=env, stdout=subprocess.DEVNULL, stderr=errf,
+                                    start_new_session=True)
             pidf = os.path.join(calls, str(proc.pid))
             open(pidf, "w").write(str(proc.pid))
+            # _cancel_call writes its mark, then scans pids; this side writes its
+            # pid, then checks the mark: one of the two always sees the other.
+            if os.path.exists(os.path.join(calls, "cancel")):
+                _stop_chunk(proc.pid, grace_s=0)
             try:
-                _, err = proc.communicate(timeout=hard)
+                proc.wait(timeout=hard)
             except subprocess.TimeoutExpired:
                 _stop_chunk(proc.pid)
-                proc.communicate()
+                proc.wait()
                 return failed("timed out (chunk subprocess killed)")
             finally:
+                _killpg(proc.pid, signal.SIGKILL)   # anything left in the chunk's group
                 try:
                     os.unlink(pidf)
                 except OSError:
                     pass
+            errf.seek(0)
+            err = errf.read()
             if not os.path.exists(out):
                 return failed(f"chunk subprocess failed (rc {proc.returncode}): {(err or '')[-800:]}")
             rows = [json.loads(l) for l in open(out) if l.strip()]
@@ -391,7 +412,7 @@ def _stop_chunk(pid: int, grace_s: float = 5.0):
     """SIGTERM a chunk subprocess's group (its handler kills its pool), then
     SIGKILL the group after the grace period."""
     import signal
-    _killpg(pid, signal.SIGTERM)
+    _killpg(pid, signal.SIGTERM)       # group only: the chunk is its session leader
     end = time.time() + grace_s
     while time.time() < end and _group_alive(pid):
         time.sleep(0.1)
@@ -489,18 +510,40 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
         chunks = _chunks(list(enumerate(inputs)), len(workers) * chunks_per_worker)
         slots = max(1, min(len(workers), len(chunks)))   # _remote_task runs one chunk at a time per VM
         progress.update(slots=slots, cores_per_slot=cores_per_slot, core_s=0.0)
-        share = None if allowance_s is None else allowance_s / slots
         bfut = c.scatter(bundle, workers=workers, broadcast=True)
 
-        def submit(ch):
+        # At most `slots` chunks are out at once. Each gets a share of what is
+        # left of the allowance after charges and the shares of chunks still
+        # out, so the chunks together can never exceed the allowance.
+        held = {}                                   # future -> its share
+
+        def submit(ch, attempt):
+            share = None
+            if allowance_s is not None:
+                free = allowance_s - progress["core_s"] - sum(held.values())
+                share = free / max(1, slots - len(held))
+                if share <= 0:
+                    return None
             # A lost chunk is resubmitted once here (and the lost attempt
             # charged), rather than through dask retries, which would hide it.
-            return c.submit(_remote_task, bfut, binfo["sha256"], run_dir, fn_spec, ch, deadline, cores_per_slot,
-                            share, call_id, workers=workers, allow_other_workers=False, pure=False)
-        futs = {submit(ch): (ch, 0) for ch in chunks}
-        pending, rows, stop, lost = set(futs), [], None, 0
+            f = c.submit(_remote_task, bfut, binfo["sha256"], run_dir, fn_spec, ch, deadline, cores_per_slot,
+                         share, call_id, workers=workers, allow_other_workers=False, pure=False)
+            futs[f] = (ch, attempt)
+            held[f] = share or 0.0
+            return f
+        futs, queue = {}, [(ch, 0) for ch in chunks]
+        pending, rows, stop, lost = set(), [], None, 0
         try:
-            while pending:
+            while queue or pending:
+                while queue and len(pending) < slots:
+                    f = submit(*queue[0])
+                    if f is None:
+                        break
+                    queue.pop(0)
+                    pending.add(f)
+                if not pending:
+                    stop = CAP_STOP
+                    break
                 left = None if deadline is None else max(0.0, deadline - time.time())
                 try:
                     done, pending = wait(pending, timeout=left, return_when="FIRST_COMPLETED")
@@ -509,6 +552,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                     break
                 for f in done:
                     ch, attempt = futs[f]
+                    held.pop(f, None)
                     try:
                         got = f.result()
                         rows += got["rows"]
@@ -516,13 +560,11 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                     except Exception as e:  # noqa: BLE001 — a lost worker fails only its chunk
                         lost += 1
                         if attempt == 0 and (deadline is None or time.time() < deadline):
-                            g = submit(ch)
-                            futs[g] = (ch, 1)
-                            pending.add(g)
+                            queue.insert(0, (ch, 1))
                             continue
                         rows += [{"i": i, "ok": False, "error": f"chunk failed: {type(e).__name__}: {e}"[:500]}
                                  for i, _ in ch]
-                if pending and allowance_s is not None and progress["core_s"] >= allowance_s:
+                if (pending or queue) and allowance_s is not None and progress["core_s"] >= allowance_s:
                     stop = CAP_STOP
                     break
         finally:
@@ -769,6 +811,10 @@ def _self_test() -> int:
         rows, s = map_fn(d, "models/slow.py::sleep", [{"s": 5}] * 4, backend="local", max_workers=2, timeout_s=1.0)
         ok(time.time() - t0 < 4.5 and all(r["error"] == "timed out" for r in rows) and s["stopped"] == "timed out",
            f"C10 local timeout bounds the call ({time.time() - t0:.1f}s): {s}")
+        t0 = time.time()
+        rows, s = map_fn(d, "models/slow.py::sleep", [{"s": 3}] * 2, backend="local", max_workers=2, timeout_s=1e-6)
+        ok(time.time() - t0 < 2.5 and all(not r["ok"] for r in rows),
+           f"C10b a stop during pool startup does not wait for the model ({time.time() - t0:.2f}s)")
         cwd = os.getcwd()
         try:
             os.chdir(os.path.dirname(d))
@@ -974,9 +1020,14 @@ def _self_test() -> int:
                     used = {r.get("worker") for r in rows}
                     ok(s["workers"] == 1 and all(r["ok"] for r in rows) and w0 not in used and None not in used,
                        f"C9 no task ran on the excluded run worker: {used}")
+                    os.environ["MA_COMPUTE_PROCS_PER_WORKER"] = "1"
+                    rows, s = map_fn(d, "models/slow.py::sleep", [{"s": 1.5}] * 4, max_core_hours=2.0 / 3600)
+                    ok(s["n_ok"] == 1 and s["task_core_s"] <= 2.6 and s["stopped"] == CAP_STOP,
+                       f"C27 later chunks get only what is left of the allowance: {s}")
                 finally:
                     os.environ.pop("MA_COMPUTE_SCHEDULER", None)
                     os.environ.pop("MA_COMPUTE_EXCLUDE_WORKERS", None)
+                    os.environ.pop("MA_COMPUTE_PROCS_PER_WORKER", None)
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
         return 1
