@@ -538,7 +538,7 @@ def install_result(batch_dir, case_rec, meta, tar_path):
                                  "seed": case_rec["seed"], "status": meta.get("status", "error"),
                                  "result": {"error": meta.get("error")}, "telemetry": {}, "scores": {}, "flat": {}})
     case["workspace"] = ws
-    case["cloud"] = {k: meta.get(k) for k in ("codex", "secret_hits", "hostname", "duration_s", "exit_code", "error", "skipped_inputs",
+    case["cloud"] = {k: meta.get(k) for k in ("codex", "compute", "secret_hits", "hostname", "duration_s", "exit_code", "error", "skipped_inputs",
                                               "files", "size", "sha256", "pip_freeze")}
     case["cloud"]["worker"] = case_rec["worker"]
     json.dump(case, open(cj, "w"), indent=1, default=str)

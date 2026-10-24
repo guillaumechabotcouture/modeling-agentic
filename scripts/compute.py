@@ -332,7 +332,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
             raise RuntimeError("no compute workers available (all are excluded run workers)")
         env_procs = os.environ.get("MA_COMPUTE_PROCS_PER_WORKER")
         cpus = c.run(os.cpu_count, workers=workers)
-        procs = {w: int(env_procs) if env_procs else max(1, (cpus.get(w) or 2) - 1) for w in workers}
+        procs = {w: int(env_procs) if env_procs else (cpus.get(w) or 1) for w in workers}   # compute VMs run nothing else
         slots = len(workers)          # _remote_task runs one chunk at a time per VM
         cores_per_slot = max(procs.values())
         deadline, why = _budget_deadline(deadline, allowance_s, slots * cores_per_slot)
