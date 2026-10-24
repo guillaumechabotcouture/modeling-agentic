@@ -314,6 +314,12 @@ def propagate(run_dir: str, n_draws: int = 200, seed: int = 42,
         spec = outcome_fn_spec or "models/outcome_fn.py::outcome_fn"
         if "::" not in spec:
             spec += "::outcome_fn"
+        # Same lookup as load_outcome_fn: run-relative, then repo-relative.
+        src, _, fname = spec.partition("::")
+        if not os.path.isabs(src):
+            cand = os.path.join(run_dir, src)
+            src = os.path.abspath(cand if os.path.exists(cand) or not os.path.exists(src) else src)
+        spec = f"{src}::{fname}"
         rows, csum = compute.map_fn(run_dir, spec, params_list)
         compute_cloud = csum.get("backend") == "dask"
         if verbose:
@@ -563,6 +569,16 @@ parameters:
            and abs(par["scalar_outputs"]["dalys_averted"]["mean"] - ci["mean"]) < 1e-6
            and par["scalar_outputs"]["dalys_averted"]["ci_low"] == ci["ci_low"],
            f"P24-1: parallel propagation matches serial; got {par['backend']}")
+        cwd = os.getcwd()
+        try:
+            os.chdir(os.path.dirname(run_dir))
+            rel = os.path.basename(run_dir)
+            par2 = propagate(rel, n_draws=200, seed=42, parallel=True,
+                             outcome_fn_spec=os.path.join(rel, "models", "outcome_fn.py") + "::outcome_fn")
+        finally:
+            os.chdir(cwd)
+        ok(par2["n_failed"] == 0 and abs(par2["scalar_outputs"]["dalys_averted"]["mean"] - ci["mean"]) < 1e-6,
+           f"P24-2: parallel keeps the repo-relative outcome_fn fallback; got n_failed={par2.get('n_failed')}")
 
         # P21-3: outcome_fn that ignores params → zero-width CI flagged
         # degenerate with the "ignores params" diagnostic; NaN draws are

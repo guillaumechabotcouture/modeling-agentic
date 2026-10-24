@@ -209,7 +209,9 @@ def make_bundle(run_dir: str, max_file_mb: float = DEFAULT_MAX_FILE_MB) -> tuple
     run_dir = os.path.realpath(run_dir)
     skipped, n = [], 0
     buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as t:
+    # dereference: symlinked inputs are stored as files (workers extract with
+    # the "data" filter, which rejects absolute links).
+    with tarfile.open(fileobj=buf, mode="w:gz", dereference=True) as t:
         for root in (os.path.join(run_dir, "models"), os.path.join(run_dir, "data"), os.path.join(REPO, "scripts")):
             for dp, dirs, files in os.walk(root):
                 dirs[:] = [d for d in dirs if d not in ("__pycache__", ".git", "_truth")]
@@ -620,7 +622,11 @@ def _self_test() -> int:
             ok(False, "C6 max-tasks must refuse")
         except ValueError:
             pass
+        os.symlink(os.path.join(d, "data", "scale.txt"), os.path.join(d, "data", "link.txt"))
         b, info = make_bundle(d)
+        lk = [m for m in tarfile.open(fileobj=io.BytesIO(b)).getmembers() if m.name.endswith("data/link.txt")]
+        ok(lk and lk[0].isfile(), "C7b a symlinked input is bundled as a file")
+        os.remove(os.path.join(d, "data", "link.txt"))
         names = tarfile.open(fileobj=io.BytesIO(b)).getnames()
         ok(any(n.endswith("models/fn.py") and not n.startswith("/") for n in names)
            and any(n.endswith("scripts/compute.py") for n in names), f"C7 bundle has models/ and scripts/: {info}")
