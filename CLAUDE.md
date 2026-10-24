@@ -148,7 +148,8 @@ for f in main.py \
   scripts/allocation_robustness.py scripts/benchmark_match.py \
   scripts/build_claims_ledger.py scripts/data_schema.py \
   scripts/cloud_batch.py scripts/coherence_audit.py \
-  scripts/compare_models.py scripts/cross_model_critic.py \
+  scripts/compare_models.py scripts/compute.py \
+  scripts/cross_model_critic.py \
   scripts/effect_size_registry.py \
   scripts/effort_floors.py scripts/eligibility_probe.py \
   scripts/figure_validator.py scripts/identifiability.py \

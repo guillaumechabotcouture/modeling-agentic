@@ -203,7 +203,8 @@ def plan_cases(fixture_dirs, variants, seeds):
     return [{"key": case_key(v["id"], os.path.basename(os.path.normpath(f)), s),
              "fixture_dir": f, "fixture_id": os.path.basename(os.path.normpath(f)),
              "variant_id": v["id"], "seed": s, "budget_usd": float(v["budget_usd"]),
-             "needs_codex": needs_codex(v), "codex_smoke": bool(v.get("codex_smoke"))}
+             "needs_codex": needs_codex(v), "codex_smoke": bool(v.get("codex_smoke")),
+             "compute": bool(v.get("compute"))}
             for f in fixture_dirs for v in variants for s in range(seeds)]
 
 
@@ -253,6 +254,17 @@ def _pip_freeze():
         return sorted(f"{d.metadata['Name']}=={d.version}" for d in distributions() if d.metadata["Name"])
     except Exception as e:  # noqa: BLE001
         return [f"<unavailable: {e}>"]
+
+
+def tls_key_secrets(tls_dir: str) -> list:
+    """The exported TLS private key as redactable strings: the whole PEM and
+    each base64 line, so a key printed in pieces is still caught."""
+    try:
+        pem = open(os.path.join(tls_dir, "key.pem")).read()
+    except OSError:
+        return []
+    lines = [l.strip() for l in pem.splitlines() if l.strip() and not l.startswith("-----")]
+    return [pem.strip()] + [l for l in lines if len(l) >= 12]
 
 
 def redact_secrets(paths: list, secrets: list) -> list:
@@ -319,6 +331,17 @@ def remote_case(case: dict, code: bytes, fixture: bytes, variants: bytes,
             # OPENAI_* stays stripped from env: codex authenticates from ~/.codex/auth.json.
             meta["codex"] = setup_codex(env, openai_key, smoke=bool(case.get("codex_smoke")))
             env["CROSS_MODEL_SANDBOX"] = "danger-full-access"   # disposable VM; integrity enforced by replay
+        if case.get("compute"):
+            # Phase 24: the case's agent reaches the compute workers through this
+            # worker's scheduler connection; credentials stay outside the packaged workspace.
+            import importlib.util
+            spec_ = importlib.util.spec_from_file_location("ma_compute", os.path.join(repo, "scripts", "compute.py"))
+            mod = importlib.util.module_from_spec(spec_)
+            spec_.loader.exec_module(mod)
+            env.update(mod.export_worker_env(os.path.join(root, ".tls")))
+            env["MA_COMPUTE_EXCLUDE_WORKERS"] = ",".join(case.get("exclude_workers") or [])
+            meta["compute"] = {"scheduler": bool(env.get("MA_COMPUTE_SCHEDULER")),
+                               "tls": bool(env.get("MA_COMPUTE_TLS_DIR"))}
         cmd = [sys.executable, os.path.join(repo, "scripts", "replay.py"), "case",
                "--fixture", fixture_dir, "--variant", os.path.join(root, "variants", f"{case['variant_id']}.yaml"),
                "--seed", str(case["seed"]), "--out", batch] + (["--dry-agent"] if dry_agent else [])
@@ -347,6 +370,7 @@ def remote_case(case: dict, code: bytes, fixture: bytes, variants: bytes,
                 entries.append((p, os.path.join(case["variant_id"], f"{case['fixture_id']}-s{case['seed']}",
                                                 "claude_session", os.path.basename(p))))
         secrets = [k.get() for k in (anthropic_key, openai_key) if k is not None and k.get()]
+        secrets += tls_key_secrets(os.path.join(root, ".tls"))
         meta["secret_hits"] = redact_secrets([p for p, _ in entries], secrets)
         # Re-read after redaction: the copy loaded above predates it and is
         # embedded in result.json, which collect prefers.
@@ -363,10 +387,12 @@ def remote_case(case: dict, code: bytes, fixture: bytes, variants: bytes,
     meta.update(duration_s=round(time.time() - t0, 1), pip_freeze=_pip_freeze(),
                 hostname=os.uname().nodename)
     text = json.dumps(meta, indent=1, default=str)
-    for sec in (k.get() for k in (anthropic_key, openai_key) if k is not None and k.get()):
+    for sec in [k.get() for k in (anthropic_key, openai_key) if k is not None and k.get()] + \
+            tls_key_secrets(os.path.join(root, ".tls")):
         if len(sec) >= 12:                       # same rule as redact_secrets
             text = text.replace(sec, "<redacted>")   # error/traceback strings too
     open(out_meta, "w").write(text)
+    shutil.rmtree(os.path.join(root, ".tls"), ignore_errors=True)
     meta = json.loads(text)
     return {k: v for k, v in meta.items() if k not in ("pip_freeze", "case", "traceback")}
 
@@ -423,22 +449,30 @@ def create_or_attach(name, n_workers, workspace=WORKSPACE):
 
 
 def launch(cases, variants, repo, batch_dir, cluster_name, workers, anthropic_key, dry_agent=False,
-           workspace=WORKSPACE, log=print, openai_key=None):
+           workspace=WORKSPACE, log=print, openai_key=None, compute_workers=0):
+    """compute_workers: extra workers that run no case, only compute-service
+    batches from cases whose variant sets `compute: true` (Phase 24)."""
     from distributed import fire_and_forget
     n = max(1, min(workers or len(cases), len(cases)))
+    if any(c.get("compute") for c in cases) and not compute_workers:
+        raise SystemExit("a variant sets compute: true but --compute-workers is 0")
     code, code_info = code_tarball(repo)
     vbundle = variants_bundle(variants)
     log(f"code {code_info} ({len(code) >> 20} MB); variants {len(vbundle) >> 10} KB; {len(cases)} cases on {n} workers")
-    cluster = create_or_attach(cluster_name, n, workspace)
+    cluster = create_or_attach(cluster_name, n + compute_workers, workspace)
     client = cluster.get_client()
-    client.wait_for_workers(n, timeout=1800)
+    if len(client.scheduler_info()["workers"]) < n + compute_workers:
+        cluster.scale(n + compute_workers)       # an attached cluster may be smaller
+    client.wait_for_workers(n + compute_workers, timeout=1800)
     client.upload_file(os.path.abspath(__file__))
-    assign = assign_workers(cases, list(client.scheduler_info()["workers"])[:n])
+    case_workers = sorted(client.scheduler_info()["workers"])[:n]
+    assign = assign_workers(cases, case_workers)
     scattered = {}
     for w in sorted(set(assign.values())):
         code_f, vb_f = client.scatter([code, vbundle], workers=[w], broadcast=False)
         scattered[w] = {"code": code_f, "variants": vb_f, "fixtures": {}}
     record = {"cluster": cluster_name, "workspace": workspace, "code": code_info,
+              "compute_workers": compute_workers,
               "dry_agent": dry_agent, "launched": time.strftime("%F %T"), "cases": {}}
     for c in cases:
         w = assign[c["key"]]
@@ -448,7 +482,8 @@ def launch(cases, variants, repo, batch_dir, cluster_name, workers, anthropic_ke
             log(f"  scatter {c['fixture_id']} ({len(blob) >> 20} MB) -> {w}")
             fx[c["fixture_id"]] = client.scatter(blob, workers=[w], broadcast=False)
         spec = {k: c[k] for k in ("key", "fixture_id", "variant_id", "seed")}
-        spec.update(needs_codex=bool(c.get("needs_codex")), codex_smoke=bool(c.get("codex_smoke")))
+        spec.update(needs_codex=bool(c.get("needs_codex")), codex_smoke=bool(c.get("codex_smoke")),
+                    compute=bool(c.get("compute")), exclude_workers=case_workers)
         okey = Redacted(openai_key if c.get("needs_codex") else None)
         fut = client.submit(remote_case, spec, scattered[w]["code"], fx[c["fixture_id"]],
                             scattered[w]["variants"], Redacted(anthropic_key), dry_agent, REMOTE_BASE, okey,
@@ -518,7 +553,7 @@ def install_result(batch_dir, case_rec, meta, tar_path):
                                  "seed": case_rec["seed"], "status": meta.get("status", "error"),
                                  "result": {"error": meta.get("error")}, "telemetry": {}, "scores": {}, "flat": {}})
     case["workspace"] = ws
-    case["cloud"] = {k: meta.get(k) for k in ("codex", "secret_hits", "hostname", "duration_s", "exit_code", "error", "skipped_inputs",
+    case["cloud"] = {k: meta.get(k) for k in ("codex", "compute", "secret_hits", "hostname", "duration_s", "exit_code", "error", "skipped_inputs",
                                               "files", "size", "sha256", "pip_freeze")}
     case["cloud"]["worker"] = case_rec["worker"]
     json.dump(case, open(cj, "w"), indent=1, default=str)
