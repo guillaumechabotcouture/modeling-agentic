@@ -74,3 +74,6 @@ Using the same prompt in both arms isolates where the simulations run. It does n
   - **Real-model check before launch:**
     - **Agreement:** measles run 2026-10-20_213310, 8 draws on Coiled compute workers versus serial on the laptop. 135 outputs; maximum relative difference 4e-12 (floating point); package versions identical.
     - **Speed:** 96 draws took 141 s on 3 × 8-vCPU workers.
+- **2026-10-24, deviations at launch (logged before any result was seen).**
+  - **Compute VMs:** the compute cluster reached 11 of 12 VMs within 30 minutes, probably the workspace's capacity or quota limit while E7 and the control arm were running. The compute arm therefore ran with **5 compute VMs, not 6** (6 case VMs + 5).
+  - **Start times:** the arms started about 35 minutes apart (control `20261023_230401`, compute `20261023_233913`). They overlap for most of their run time.
