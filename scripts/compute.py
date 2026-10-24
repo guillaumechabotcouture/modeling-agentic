@@ -123,10 +123,12 @@ def _call(fn, i: int, params: dict) -> dict:
 # --------------------------------------------------------------------------- #
 
 _LOCAL_FN = None
+_LOCAL_INIT_S = 0.0      # model load time in this pool process, charged with its first chunk
 
 
 def _local_init(run_dir: str, fn_spec: str):
-    global _LOCAL_FN
+    global _LOCAL_FN, _LOCAL_INIT_S
+    t0 = time.time()
     # Own process group: whatever the model spawns (an external simulator)
     # is killed with this process. A child that starts its own session escapes.
     # Inside a remote chunk the whole chunk is already one group (killed as one).
@@ -134,10 +136,13 @@ def _local_init(run_dir: str, fn_spec: str):
         os.setpgrp()
     os.chdir(run_dir)
     _LOCAL_FN = load_fn(run_dir, fn_spec)
+    _LOCAL_INIT_S = time.time() - t0
 
 
 def _local_chunk(chunk):
-    return [_call(_LOCAL_FN, i, params) for i, params in chunk]
+    global _LOCAL_INIT_S
+    init_s, _LOCAL_INIT_S = _LOCAL_INIT_S, 0.0
+    return {"rows": [_call(_LOCAL_FN, i, params) for i, params in chunk], "init_s": init_s}
 
 
 def _chunks(items: list, n_chunks: int) -> list:
@@ -215,8 +220,8 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
             for f in done:
                 try:
                     got = f.result()
-                    rows += got
-                    progress["core_s"] += _known_core_s(got)
+                    rows += got["rows"]
+                    progress["core_s"] += _known_core_s(got["rows"]) + got["init_s"]
                 except Exception as e:  # noqa: BLE001 — a crashed process fails only its chunk
                     lost += 1
                     rows += [{"i": i, "ok": False, "error": f"chunk failed: {type(e).__name__}: {e}"[:500]}
@@ -357,6 +362,7 @@ def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: lis
             env = {k: v for k, v in os.environ.items() if not k.startswith("MA_COMPUTE_SCHEDULER")}
             env["PYTHONDONTWRITEBYTECODE"] = "1"     # bytecode never outlives its bundle
             env["MA_COMPUTE_IN_CHUNK"] = "1"
+            cancel_mark = os.path.join(calls, "cancel")
             cmd = [sys.executable, script, "map", run_dir, "--fn", fn_spec, "--inputs", inp,
                    "--out", out, "--backend", "local", "--max-workers", str(procs), "--no-ledger"]
             if chunk_allowance_s is not None:
@@ -376,10 +382,16 @@ def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: lis
             # Output to a file, not a pipe: a stray grandchild holding the pipe
             # open must not keep this wait from returning.
             errf = open(os.path.join(td, "chunk.err"), "w+")
+            # The chunk does no work until it is registered (MA_COMPUTE_GATE) and
+            # then re-checks the cancel mark itself, so once _cancel_call returns
+            # no chunk of that call can start working.
+            env["MA_COMPUTE_GATE"] = os.path.join(calls, "{pid}")
+            env["MA_COMPUTE_CANCEL"] = cancel_mark
             proc = subprocess.Popen(cmd, cwd=run_dir, env=env, stdout=subprocess.DEVNULL, stderr=errf,
                                     start_new_session=True)
             pidf = os.path.join(calls, str(proc.pid))
-            open(pidf, "w").write(str(proc.pid))
+            open(pidf + ".tmp", "w").write(str(proc.pid))
+            os.replace(pidf + ".tmp", pidf)
             # _cancel_call writes its mark, then scans pids; this side writes its
             # pid, then checks the mark: one of the two always sees the other.
             if os.path.exists(os.path.join(calls, "cancel")):
@@ -399,6 +411,8 @@ def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: lis
             errf.seek(0)
             err = errf.read()
             if not os.path.exists(out):
+                if os.path.exists(cancel_mark):
+                    return failed("cancelled")
                 return failed(f"chunk subprocess failed (rc {proc.returncode}): {(err or '')[-800:]}")
             rows = [json.loads(l) for l in open(out) if l.strip()]
             try:
@@ -417,6 +431,9 @@ def _stop_chunk(pid: int, grace_s: float = 5.0):
     while time.time() < end and _group_alive(pid):
         time.sleep(0.1)
     _killpg(pid, signal.SIGKILL)
+    end = time.time() + 5
+    while time.time() < end and _group_alive(pid):   # SIGKILL is not instant; confirm
+        time.sleep(0.05)
 
 
 def _cancel_call(call_id: str) -> int:
@@ -526,7 +543,8 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                     return None
             # A lost chunk is resubmitted once here (and the lost attempt
             # charged), rather than through dask retries, which would hide it.
-            f = c.submit(_remote_task, bfut, binfo["sha256"], run_dir, fn_spec, ch, deadline, cores_per_slot,
+            f = c.submit(_remote_task, bfut, binfo["sha256"], run_dir, fn_spec, ch, deadline,
+                         int(env_procs) if env_procs else None,     # None: the worker uses its own core count
                          share, call_id, workers=workers, allow_other_workers=False, pure=False)
             futs[f] = (ch, attempt)
             held[f] = share or 0.0
@@ -1002,6 +1020,20 @@ def _self_test() -> int:
         later = _remote_task(bc_, ic_["sha256"], cdir, "models/slow.py::sleep", [(0, {"s": 60})], procs=1, call_id=cid)
         ok(n_stopped == 1 and not th.is_alive() and not res["r"]["rows"][0]["ok"]
            and later["rows"][0]["error"] == "cancelled", f"C26 cancel stops running and queued chunks: {n_stopped}, {res}")
+        open(os.path.join(d, "models", "heavy.py"), "w").write("import time\ntime.sleep(1.0)\ndef f(p):\n    return 1\n")
+        rows, s = map_fn(d, "models/heavy.py::f", [{}] * 2, backend="local", max_workers=1)
+        ok(rows[0]["ok"] and s["task_core_s"] >= 0.9, f"C28 model load time is charged: {s}")
+        gdir = os.path.join(d, "gate"); os.makedirs(gdir)
+        open(os.path.join(gdir, "cancel"), "w").write("1")
+        inp = os.path.join(gdir, "in.json"); json.dump([{"x": 1}], open(inp, "w"))
+        out = os.path.join(gdir, "out.jsonl")
+        envg = dict(os.environ, MA_COMPUTE_GATE=os.path.join(gdir, "{pid}"), MA_COMPUTE_CANCEL=os.path.join(gdir, "cancel"))
+        pg = _sp.Popen([sys.executable, os.path.abspath(__file__), "map", d, "--fn", "models/fn.py::f", "--inputs", inp,
+                        "--out", out, "--backend", "local", "--no-ledger"], env=envg)
+        time.sleep(0.5)
+        ok(pg.poll() is None and not os.path.exists(out), "C29 a chunk does no work before it is registered")
+        open(os.path.join(gdir, str(pg.pid)), "w").write(str(pg.pid))
+        ok(pg.wait(30) == 3 and not os.path.exists(out), "C29 a chunk registered after a cancel exits without working")
         # C8: dask backend against a local cluster, when distributed is installed
         try:
             from distributed import LocalCluster
@@ -1058,6 +1090,16 @@ def main() -> int:
     def _on_term(*_):
         raise KeyboardInterrupt      # unwinds map_fn: the pool's groups are killed
     signal.signal(signal.SIGTERM, _on_term)
+    gate = os.environ.get("MA_COMPUTE_GATE")
+    if gate:
+        gate = gate.replace("{pid}", str(os.getpid()))
+        end = time.time() + 60
+        while not os.path.exists(gate):
+            if time.time() > end:
+                return 3
+            time.sleep(0.02)
+        if os.path.exists(os.environ.get("MA_COMPUTE_CANCEL", "/nonexistent")):
+            return 3          # cancelled before any work; the parent labels the rows
     if a.cmd != "map" or not (a.run_dir and a.fn and a.inputs and a.out):
         ap.error("usage: compute.py map <run_dir> --fn <path.py>::<fn> --inputs <jsonl> --out <jsonl>")
     rows, summary = map_fn(a.run_dir, a.fn, _read_inputs(a.inputs), a.backend, a.max_workers,
