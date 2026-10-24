@@ -320,7 +320,13 @@ def propagate(run_dir: str, n_draws: int = 200, seed: int = 42,
             cand = os.path.join(run_dir, src)
             src = os.path.abspath(cand if os.path.exists(cand) or not os.path.exists(src) else src)
         spec = f"{src}::{fname}"
-        rows, csum = compute.map_fn(run_dir, spec, params_list)
+        # Workers receive only the run's models/ and data/ and the repo's
+        # scripts/; a source elsewhere runs on this machine instead.
+        rd = os.path.realpath(run_dir)
+        bundled = any(os.path.realpath(src).startswith(os.path.join(root, ""))
+                      for root in (os.path.join(rd, "models"), os.path.join(rd, "data"),
+                                   os.path.join(compute.REPO, "scripts")))
+        rows, csum = compute.map_fn(run_dir, spec, params_list, backend="auto" if bundled else "local")
         compute_cloud = csum.get("backend") == "dask"
         if verbose:
             print(f"  compute: {csum.get('backend')} x{csum.get('workers')}, "

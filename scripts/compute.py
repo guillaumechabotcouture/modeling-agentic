@@ -123,11 +123,12 @@ def _call(fn, i: int, params: dict) -> dict:
 # --------------------------------------------------------------------------- #
 
 _LOCAL_FN = None
-_LOCAL_INIT_S = 0.0      # model load time in this pool process, charged with its first chunk
 
 
-def _local_init(run_dir: str, fn_spec: str):
-    global _LOCAL_FN, _LOCAL_INIT_S
+def _local_init(run_dir: str, fn_spec: str, init_dir: str | None = None):
+    """Pool initializer. Each process records its model load time in
+    `init_dir`, so loads are charged even in processes that get no chunk."""
+    global _LOCAL_FN
     t0 = time.time()
     # Own process group: whatever the model spawns (an external simulator)
     # is killed with this process. A child that starts its own session escapes.
@@ -135,15 +136,15 @@ def _local_init(run_dir: str, fn_spec: str):
     if not os.environ.get("MA_COMPUTE_IN_CHUNK"):
         os.setpgrp()
     os.chdir(run_dir)
-    _LOCAL_FN = load_fn(run_dir, fn_spec)
-    _LOCAL_INIT_S = time.time() - t0
+    try:
+        _LOCAL_FN = load_fn(run_dir, fn_spec)
+    finally:
+        if init_dir:
+            open(os.path.join(init_dir, str(os.getpid())), "w").write(str(time.time() - t0))
 
 
 def _local_chunk(chunk):
-    global _LOCAL_INIT_S
-    init_s, _LOCAL_INIT_S = _LOCAL_INIT_S, None
-    return {"rows": [_call(_LOCAL_FN, i, params) for i, params in chunk], "init_s": init_s or 0.0,
-            "first": init_s is not None}
+    return [_call(_LOCAL_FN, i, params) for i, params in chunk]
 
 
 def _chunks(items: list, n_chunks: int) -> list:
@@ -206,10 +207,12 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
     progress.update(slots=n, cores_per_slot=1, core_s=0.0)
     chunks = _chunks(list(enumerate(inputs)), n * 8)
     deadline, why = _budget_deadline(deadline, allowance_s, n)
+    import tempfile
+    init_dir = tempfile.TemporaryDirectory(prefix="ma_compute_init_")
     ex = cf.ProcessPoolExecutor(max_workers=n, mp_context=mp.get_context("spawn"),
-                                initializer=_local_init, initargs=(run_dir, fn_spec))
+                                initializer=_local_init, initargs=(run_dir, fn_spec, init_dir.name))
     futs = {ex.submit(_local_chunk, ch): ch for ch in chunks}
-    pending, rows, stop, lost, pids, inits = set(futs), [], None, 0, set(), []
+    pending, rows, stop, lost, pids = set(futs), [], None, 0, set()
     try:
         while pending:
             pids |= set((getattr(ex, "_processes", None) or {}).keys())
@@ -221,10 +224,8 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
             for f in done:
                 try:
                     got = f.result()
-                    rows += got["rows"]
-                    progress["core_s"] += _known_core_s(got["rows"]) + got["init_s"]
-                    if got.get("first"):
-                        inits.append(got["init_s"])
+                    rows += got
+                    progress["core_s"] += _known_core_s(got)
                 except Exception as e:  # noqa: BLE001 — a crashed process fails only its chunk
                     lost += 1
                     rows += [{"i": i, "ok": False, "error": f"chunk failed: {type(e).__name__}: {e}"[:500]}
@@ -240,9 +241,14 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
             _kill_groups(pids - live, grace_s=0, direct=False)
         ex.shutdown(wait=True, cancel_futures=True)
         _kill_groups(pids, grace_s=0, direct=False)   # leftovers the model spawned (pool already reaped)
-    # Processes that loaded the model but never reported a chunk: charge each
-    # the longest load time seen.
-    progress["core_s"] += max(0, len(pids) - len(inits)) * max(inits, default=0.0)
+    # Model load time of every pool process (a process still loading when it
+    # was killed is covered by the unfinished-chunk estimate).
+    for name in os.listdir(init_dir.name):
+        try:
+            progress["core_s"] += float(open(os.path.join(init_dir.name, name)).read())
+        except (OSError, ValueError):
+            pass
+    init_dir.cleanup()
     return rows, {"backend": "local", "workers": n, "slots": n, "cores_per_slot": 1, "core_s": progress["core_s"],
                   "stopped": stop, "unknown_chunks": lost + len(pending)}
 
@@ -261,7 +267,13 @@ def make_bundle(run_dir: str, max_file_mb: float = DEFAULT_MAX_FILE_MB) -> tuple
     # the "data" filter, which rejects absolute links).
     with tarfile.open(fileobj=buf, mode="w:gz", dereference=True) as t:
         for root in (os.path.join(run_dir, "models"), os.path.join(run_dir, "data"), os.path.join(REPO, "scripts")):
-            for dp, dirs, files in os.walk(root):
+            seen = set()
+            for dp, dirs, files in os.walk(root, followlinks=True):
+                real = os.path.realpath(dp)
+                if real in seen:              # a symlink loop, or a dir reached twice
+                    dirs[:] = []
+                    continue
+                seen.add(real)
                 dirs[:] = [d for d in dirs if d not in ("__pycache__", ".git", "_truth")]
                 for fn in files:
                     p = os.path.join(dp, fn)
@@ -368,12 +380,17 @@ def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: lis
             inp, out = os.path.join(td, "in.json"), os.path.join(td, "out.jsonl")
             json.dump([p for _, p in chunk], open(inp, "w"))
             script = os.path.join(REPO, "scripts", "compute.py")
-            env = {k: v for k, v in os.environ.items() if not k.startswith("MA_COMPUTE_SCHEDULER")}
+            # Model code gets no credentials the worker may hold (cloud, model
+            # APIs, the cluster's TLS files): same rule as agents/enforcement.py.
+            env = {k: v for k, v in os.environ.items()
+                   if not k.startswith(("MA_COMPUTE_SCHEDULER", "MA_COMPUTE_TLS", "AZ_", "AZURE_", "AWS_", "GOOGLE_",
+                                        "GCP_", "OPENAI_", "ANTHROPIC_", "CLAUDE", "COILED_", "DASK_"))}
             env["PYTHONDONTWRITEBYTECODE"] = "1"     # bytecode never outlives its bundle
             env["MA_COMPUTE_IN_CHUNK"] = "1"
             cancel_mark = os.path.join(calls, "cancel")
             cmd = [sys.executable, script, "map", run_dir, "--fn", fn_spec, "--inputs", inp,
-                   "--out", out, "--backend", "local", "--max-workers", str(procs), "--no-ledger"]
+                   "--out", out, "--backend", "local", "--max-workers", str(procs), "--no-ledger",
+                   "--max-tasks", str(max(1, len(chunk)))]   # the caller already enforced its limit
             if chunk_allowance_s is not None:
                 cmd += ["--max-core-hours", f"{chunk_allowance_s / 3600:.6f}"]
             left = None
@@ -1039,6 +1056,28 @@ def _self_test() -> int:
         ok(rows[0]["ok"] and s["task_core_s"] >= 0.9, f"C28 model load time is charged: {s}")
         rows, s = map_fn(d, "models/heavy.py::f", [{}] * 3, backend="local", max_workers=3)
         ok(s["task_core_s"] >= 2.7, f"C28b every process's model load is charged, chunk or not: {s}")
+        ev = os.path.realpath(os.path.join(d, "envf")); os.makedirs(os.path.join(ev, "models"))
+        open(os.path.join(ev, "models", "e.py"), "w").write(
+            "import os\ndef f(p):\n    return [os.environ.get(k) for k in ('AZURE_SELFTEST', 'ANTHROPIC_API_KEY', 'OK_VAR')]\n")
+        be_, ie_ = make_bundle(ev)
+        saved = {k: os.environ.get(k) for k in ("AZURE_SELFTEST", "ANTHROPIC_API_KEY", "OK_VAR")}
+        os.environ.update(AZURE_SELFTEST="secret-a", ANTHROPIC_API_KEY="secret-b", OK_VAR="kept")
+        try:
+            r = _remote_task(be_, ie_["sha256"], ev, "models/e.py::f", [(0, {})], procs=1)["rows"][0]
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        ok(r.get("result") == [None, None, "kept"], f"C32 model code on a worker gets no credentials: {r}")
+        dl = os.path.join(d, "dlink"); os.makedirs(os.path.join(dl, "models"))
+        ext = os.path.join(d, "ext_data"); os.makedirs(ext); open(os.path.join(ext, "t.csv"), "w").write("1\n")
+        os.symlink(ext, os.path.join(dl, "data"))
+        os.symlink(os.path.join(dl, "data"), os.path.join(ext, "loop"))      # a cycle
+        bd_, idd = make_bundle(dl)
+        names_ = tarfile.open(fileobj=io.BytesIO(bd_)).getnames()
+        ok(any(n.endswith("dlink/data/t.csv") for n in names_), f"C7c a symlinked data dir is bundled (cycle-safe): {idd}")
         ld = os.path.realpath(os.path.join(d, "leaf")); os.makedirs(os.path.join(ld, "models")); os.makedirs(os.path.join(ld, "data"))
         open(os.path.join(ld, "models", "v.py"), "w").write("def v(p):\n    return 1\n")
         open(os.path.join(ld, "data", "input.csv"), "w").write("bundle\n")
