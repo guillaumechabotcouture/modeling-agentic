@@ -30,9 +30,11 @@ Backends (auto-selected):
          paths, so model code with absolute paths works unchanged.
   local  otherwise: a process pool on this machine (cores - 1).
 
-Guardrails: --max-tasks (default 20,000) per call, and a run-wide core-hour
-cap (MA_COMPUTE_MAX_CORE_HOURS, default 200) tracked in
-`{run_dir}/models/compute_ledger.json`. A function that raises fails only its
+Guardrails: --max-tasks (default 20,000) per call; a per-call allowance
+(--max-core-hours, default MA_COMPUTE_CALL_CORE_HOURS = 50) and a run-wide
+cap (MA_COMPUTE_MAX_CORE_HOURS, default 200), both in core-hours and tracked
+in `{run_dir}/models/compute_ledger.json`. A batch stops when its allowance
+is used; --timeout-s stops it at a wall-clock limit. A function that raises fails only its
 own row. Files over --max-file-mb (default 100) are left out of the bundle
 and listed in the summary.
 
@@ -144,11 +146,26 @@ def _budget_deadline(deadline, allowance_s, cores):
     return (b, CAP_STOP) if deadline is None or b < deadline else (deadline, "timed out")
 
 
-def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s=None):
+def _kill_pool(ex):
+    """SIGTERM the pool's processes, then SIGKILL any that ignore it, so
+    shutdown() cannot hang on a model that traps signals."""
+    procs = list((getattr(ex, "_processes", None) or {}).values())
+    for proc in procs:
+        proc.terminate()
+    for proc in procs:
+        proc.join(2)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(2)
+
+
+def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s=None, progress=None):
     """Always a fresh spawn pool, even for one worker: the model's sibling
     modules and its chdir never leak into the caller or across runs."""
     import multiprocessing as mp
+    progress = {} if progress is None else progress
     n = max(1, min(max_workers or max(1, (os.cpu_count() or 2) - 1), len(inputs) or 1))
+    progress.update(slots=n, cores_per_slot=1, core_s=0.0)
     chunks = _chunks(list(enumerate(inputs)), n * 8)
     deadline, why = _budget_deadline(deadline, allowance_s, n)
     ex = cf.ProcessPoolExecutor(max_workers=n, mp_context=mp.get_context("spawn"),
@@ -164,20 +181,21 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
                 break
             for f in done:
                 try:
-                    rows += f.result()
+                    got = f.result()
+                    rows += got
+                    progress["core_s"] += _known_core_s(got)
                 except Exception as e:  # noqa: BLE001 — a crashed process fails only its chunk
                     lost += 1
                     rows += [{"i": i, "ok": False, "error": f"chunk failed: {type(e).__name__}: {e}"[:500]}
                              for i, _ in futs[f]]
-            if pending and allowance_s is not None and _known_core_s(rows) >= allowance_s:
+            if pending and allowance_s is not None and progress["core_s"] >= allowance_s:
                 stop = CAP_STOP
                 break
     finally:
         if pending:
-            for proc in list((getattr(ex, "_processes", None) or {}).values()):
-                proc.terminate()
+            _kill_pool(ex)
         ex.shutdown(wait=True, cancel_futures=True)
-    return rows, {"backend": "local", "workers": n, "slots": n, "cores_per_slot": 1,
+    return rows, {"backend": "local", "workers": n, "slots": n, "cores_per_slot": 1, "core_s": progress["core_s"],
                   "stopped": stop, "unknown_chunks": lost + len(pending)}
 
 
@@ -214,10 +232,12 @@ def make_bundle(run_dir: str, max_file_mb: float = DEFAULT_MAX_FILE_MB) -> tuple
 def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: list,
                  deadline: float | None = None, procs: int | None = None):
     """Runs on a dask worker. Under a machine-wide lock: make sure the files on
-    disk are THIS bundle (another call's bundle may have replaced them), then
-    evaluate the chunk. The live run directory (has metadata.json) is never
-    overwritten: there the model runs against the run's own files."""
-    import fcntl, io, json, os, subprocess, sys, tarfile, tempfile, time  # noqa: E401 — pickled by value
+    disk are exactly THIS bundle (another call's bundle may have replaced them:
+    its extra files are removed and no stale bytecode survives), then evaluate
+    the chunk. The live run directory (has metadata.json) is never touched:
+    there the model runs against the run's own files. Returns the rows and the
+    core-seconds the chunk used, including work in crashed processes."""
+    import fcntl, io, json, os, shutil, signal, subprocess, sys, tarfile, tempfile, time  # noqa: E401 — pickled by value
     try:
         from distributed import get_worker
         waddr = get_worker().address
@@ -230,18 +250,30 @@ def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: lis
     t0 = time.time()
 
     def failed(msg):
-        each = round((time.time() - t0) * procs / max(1, len(chunk)), 3)
-        return [{"i": i, "ok": False, "error": msg[:500], "seconds": each, "seconds_estimated": True,
-                 "worker": waddr} for i, _ in chunk]
+        return {"rows": [{"i": i, "ok": False, "error": msg[:500], "worker": waddr} for i, _ in chunk],
+                "core_s": round((time.time() - t0) * procs, 3)}
 
     with open(lock, "w") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
         live = os.path.exists(os.path.join(run_dir, "metadata.json"))
         current = os.path.join(run_dir, ".ma_compute_bundle")
-        if not live and (not os.path.exists(current) or open(current).read() != sha):
-            tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz").extractall("/", filter="data")
+        try:
+            prev = json.load(open(current))
+        except (OSError, ValueError):
+            prev = {}
+        if not live and prev.get("sha") != sha:
+            tf = tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz")
+            members = [m.name for m in tf.getmembers() if m.isfile()]
+            for old in set(prev.get("members") or []) - set(members):
+                try:
+                    os.unlink("/" + old)
+                except OSError:
+                    pass
+            for d in {os.path.dirname("/" + m) for m in members}:
+                shutil.rmtree(os.path.join(d, "__pycache__"), ignore_errors=True)
+            tf.extractall("/", filter="data")
             os.makedirs(run_dir, exist_ok=True)
-            open(current, "w").write(sha)
+            json.dump({"sha": sha, "members": members}, open(current, "w"))
         # dask workers are daemonic (no multiprocessing children), so the chunk
         # runs in a subprocess using this module's local backend across the VM's
         # cores. MA_COMPUTE_PROCS_PER_WORKER caps processes for memory-heavy models.
@@ -250,23 +282,34 @@ def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: lis
             json.dump([p for _, p in chunk], open(inp, "w"))
             script = os.path.join(REPO, "scripts", "compute.py")
             env = {k: v for k, v in os.environ.items() if not k.startswith("MA_COMPUTE_SCHEDULER")}
+            env["PYTHONDONTWRITEBYTECODE"] = "1"     # bytecode never outlives its bundle
             cmd = [sys.executable, script, "map", run_dir, "--fn", fn_spec, "--inputs", inp,
                    "--out", out, "--backend", "local", "--max-workers", str(procs), "--no-ledger"]
             left = None
             if deadline is not None:
                 left = deadline - time.time()
                 if left <= 0:
-                    return [{"i": i, "ok": False, "error": "timed out", "worker": waddr} for i, _ in chunk]
+                    return {"rows": [{"i": i, "ok": False, "error": "timed out", "worker": waddr} for i, _ in chunk],
+                            "core_s": 0.0}
                 cmd += ["--timeout-s", f"{left:.1f}"]
+            # Own process group: on a hard timeout the whole tree (the chunk's
+            # pool and anything the model spawned) is killed.
+            proc = subprocess.Popen(cmd, cwd=run_dir, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, start_new_session=True)
             try:
-                r = subprocess.run(cmd, cwd=run_dir, env=env, capture_output=True, text=True,
-                                   timeout=None if left is None else left + 60)
+                _, err = proc.communicate(timeout=None if left is None else left + 60)
             except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.communicate()
                 return failed("timed out (chunk subprocess killed)")
             if not os.path.exists(out):
-                return failed(f"chunk subprocess failed (rc {r.returncode}): {r.stderr[-800:]}")
+                return failed(f"chunk subprocess failed (rc {proc.returncode}): {(err or '')[-800:]}")
             rows = [json.loads(l) for l in open(out) if l.strip()]
-    return [{**row, "i": chunk[k][0], "worker": waddr} for k, row in enumerate(rows)]
+            try:
+                core_s = float(json.load(open(out + ".summary.json"))["task_core_s"])
+            except (OSError, ValueError, KeyError, TypeError):
+                core_s = (time.time() - t0) * procs    # no summary: charge the chunk as fully busy
+    return {"rows": [{**row, "i": chunk[k][0], "worker": waddr} for k, row in enumerate(rows)], "core_s": core_s}
 
 
 def export_worker_env(tls_dir: str, worker=None) -> dict:
@@ -316,7 +359,8 @@ def _security():
                     tls_client_key=pem("key.pem"), require_encryption=True)
 
 
-def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadline=None, allowance_s=None):
+def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadline=None, allowance_s=None,
+              progress=None):
     import cloudpickle
     from distributed import Client, wait
     cloudpickle.register_pickle_by_value(sys.modules[__name__])
@@ -335,12 +379,17 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
         procs = {w: int(env_procs) if env_procs else (cpus.get(w) or 1) for w in workers}   # compute VMs run nothing else
         slots = len(workers)          # _remote_task runs one chunk at a time per VM
         cores_per_slot = max(procs.values())
+        progress = {} if progress is None else progress
+        progress.update(slots=slots, cores_per_slot=cores_per_slot, core_s=0.0)
         deadline, why = _budget_deadline(deadline, allowance_s, slots * cores_per_slot)
         bfut = c.scatter(bundle, workers=workers, broadcast=True)
         chunks = _chunks(list(enumerate(inputs)), len(workers) * chunks_per_worker)
-        futs = {c.submit(_remote_task, bfut, binfo["sha256"], run_dir, fn_spec, ch, deadline, cores_per_slot,
-                         workers=workers, allow_other_workers=False, pure=False, retries=1): ch
-                for ch in chunks}
+        def submit(ch):
+            # No dask retries: a failed attempt's work would go uncharged. A lost
+            # chunk is resubmitted once here, and the lost attempt is charged.
+            return c.submit(_remote_task, bfut, binfo["sha256"], run_dir, fn_spec, ch, deadline, cores_per_slot,
+                            workers=workers, allow_other_workers=False, pure=False)
+        futs = {submit(ch): (ch, 0) for ch in chunks}
         pending, rows, stop, lost = set(futs), [], None, 0
         while pending:
             left = None if deadline is None else max(0.0, deadline - time.time())
@@ -350,19 +399,27 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                 stop = why
                 break
             for f in done:
+                ch, attempt = futs[f]
                 try:
-                    rows += f.result()
+                    got = f.result()
+                    rows += got["rows"]
+                    progress["core_s"] += float(got["core_s"])
                 except Exception as e:  # noqa: BLE001 — a lost worker fails only its chunk
                     lost += 1
+                    if attempt == 0 and (deadline is None or time.time() < deadline):
+                        g = submit(ch)
+                        futs[g] = (ch, 1)
+                        pending.add(g)
+                        continue
                     rows += [{"i": i, "ok": False, "error": f"chunk failed: {type(e).__name__}: {e}"[:500]}
-                             for i, _ in futs[f]]
-            if pending and allowance_s is not None and _known_core_s(rows) >= allowance_s:
+                             for i, _ in ch]
+            if pending and allowance_s is not None and progress["core_s"] >= allowance_s:
                 stop = CAP_STOP
                 break
         for f in pending:
             f.cancel()   # running chunks stop themselves at `deadline` (their subprocess timeout)
     return rows, {"backend": "dask", "workers": len(workers), "slots": slots, "cores_per_slot": cores_per_slot,
-                  "stopped": stop, "unknown_chunks": lost + len(pending), "bundle": binfo}
+                  "core_s": progress["core_s"], "stopped": stop, "unknown_chunks": lost + len(pending), "bundle": binfo}
 
 
 # --------------------------------------------------------------------------- #
@@ -412,8 +469,9 @@ class _LedgerLock:
 
 
 def _live_reservations(led) -> float:
-    """Core-seconds held by calls still running on this host (a crashed
-    call's reservation is dropped once its process is gone)."""
+    """Core-seconds held by calls still running on this host. A call whose
+    process is gone without settling (killed caller) is charged its whole
+    reservation: its remote chunks may still be running up to that allowance."""
     host, total = os.uname().nodename, 0.0
     for rid, r in list(led["reservations"].items()):
         alive = r.get("host") != host
@@ -427,6 +485,9 @@ def _live_reservations(led) -> float:
             total += float(r.get("core_s") or 0)
         else:
             del led["reservations"][rid]
+            led["core_seconds"] = round(led["core_seconds"] + float(r.get("core_s") or 0), 1)
+            led["calls"].append({"fn": r.get("fn"), "stopped": "caller died; charged its reservation",
+                                 "task_core_s": r.get("core_s"), "ts": time.strftime("%FT%T")})
     return total
 
 
@@ -435,9 +496,10 @@ def map_fn(run_dir: str, fn_spec: str, inputs: list, backend: str = "auto",
            timeout_s: float | None = None, ledger: bool = True,
            max_core_hours: float | None = None) -> tuple[list[dict], dict]:
     """Evaluate fn over inputs. Under the ledger, the call first reserves its
-    allowance (the run's remaining core-hours, or `max_core_hours` if
-    smaller) and stops when it is used up; unfinished rows fail with
-    "stopped: compute cap reached" or "timed out"."""
+    allowance (`max_core_hours`, default MA_COMPUTE_CALL_CORE_HOURS = 50,
+    never more than the run has left) and stops when it is used up;
+    unfinished rows fail with "stopped: compute cap reached" or "timed out".
+    A call that is interrupted is charged an upper bound of what it used."""
     run_dir = os.path.realpath(run_dir)
     if len(inputs) > max_tasks:
         raise ValueError(f"{len(inputs)} tasks exceeds --max-tasks {max_tasks}")
@@ -452,7 +514,9 @@ def map_fn(run_dir: str, fn_spec: str, inputs: list, backend: str = "auto",
                     f"run compute cap reached: {led['core_seconds'] / 3600:.1f} used"
                     + (f" + {held / 3600:.1f} held by running calls" if held else "")
                     + f" of {cap_s / 3600:g} core-hours")
-            allowance_s = remaining if max_core_hours is None else min(remaining, max_core_hours * 3600)
+            per_call = max_core_hours if max_core_hours is not None else \
+                float(os.environ.get("MA_COMPUTE_CALL_CORE_HOURS", "50"))
+            allowance_s = min(remaining, per_call * 3600)
             rid = f"{os.uname().nodename}:{os.getpid()}:{time.time():.6f}"
             led["reservations"][rid] = {"core_s": allowance_s, "pid": os.getpid(),
                                         "host": os.uname().nodename, "fn": fn_spec}
@@ -460,11 +524,14 @@ def map_fn(run_dir: str, fn_spec: str, inputs: list, backend: str = "auto",
         backend = "dask" if os.environ.get("MA_COMPUTE_SCHEDULER") else "local"
     t0 = time.time()
     deadline = t0 + timeout_s if timeout_s else None
+    progress = {}
     try:
         if backend == "dask":
-            rows, info = _map_dask(run_dir, fn_spec, inputs, max_workers, deadline=deadline, allowance_s=allowance_s)
+            rows, info = _map_dask(run_dir, fn_spec, inputs, max_workers, deadline=deadline,
+                                   allowance_s=allowance_s, progress=progress)
         else:
-            rows, info = _map_local(run_dir, fn_spec, inputs, max_workers, deadline=deadline, allowance_s=allowance_s)
+            rows, info = _map_local(run_dir, fn_spec, inputs, max_workers, deadline=deadline,
+                                    allowance_s=allowance_s, progress=progress)
         done = {r["i"] for r in rows}
         why = info.get("stopped") or "timed out"
         rows += [{"i": i, "ok": False, "error": why} for i in range(len(inputs)) if i not in done]
@@ -473,11 +540,19 @@ def map_fn(run_dir: str, fn_spec: str, inputs: list, backend: str = "auto",
         # Chunks whose work is unaccounted for (lost worker, killed at the
         # deadline) are charged as busy for the whole call: over-, never under-charged.
         est = min(info.pop("unknown_chunks"), info["slots"]) * wall * info["cores_per_slot"]
-        core_s = _known_core_s(rows) + est
-    except BaseException:
+        core_s = info.pop("core_s") + est
+    except BaseException as e:
         if rid:
+            # Interrupted mid-batch: charge every slot as busy since the start
+            # (capped at the reservation), never zero.
+            used = progress.get("core_s", 0.0) + progress.get("slots", 0) * progress.get("cores_per_slot", 0) \
+                * (time.time() - t0)
+            used = min(allowance_s, used)
             with _LedgerLock(run_dir) as led:
                 led["reservations"].pop(rid, None)
+                led["core_seconds"] = round(led["core_seconds"] + used, 1)
+                led["calls"].append({"fn": fn_spec, "backend": backend, "task_core_s": round(used, 1),
+                                     "stopped": f"interrupted: {type(e).__name__}", "ts": time.strftime("%FT%T")})
         raise
     summary = {**{k: v for k, v in info.items() if k not in ("slots", "cores_per_slot")},
                "n": len(rows), "n_ok": sum(r["ok"] for r in rows),
@@ -616,15 +691,67 @@ def _self_test() -> int:
             ok(False, "C15b a truncated ledger must refuse, not reset the budget")
         except RuntimeError:
             pass
-        vd = os.path.join(d, "ver"); os.makedirs(os.path.join(vd, "models"))
-        vfile = os.path.join(vd, "models", "v.py")
-        open(vfile, "w").write("def v(p):\n    return 'A'\n")
-        ba, ia = make_bundle(vd)
-        open(vfile, "w").write("def v(p):\n    return 'BB'\n")
-        bb, ib = make_bundle(vd)
-        got = [_remote_task(b_, i_["sha256"], os.path.realpath(vd), "models/v.py::v", [(0, {})], procs=1)[0].get("result")
-               for b_, i_ in ((ba, ia), (bb, ib), (ba, ia))]
-        ok(got == ["A", "BB", "A"], f"C16 a chunk runs its own bundle's code, not the last one unpacked: {got}")
+        vd = os.path.realpath(os.path.join(d, "ver")); os.makedirs(os.path.join(vd, "models"))
+        vfile, hfile = os.path.join(vd, "models", "v.py"), os.path.join(vd, "models", "oldhelper.py")
+
+        def stage(body, helper):
+            # same length, same mtime: only a fresh compile tells A from B
+            open(vfile, "w").write(body); os.utime(vfile, (1_700_000_000, 1_700_000_000))
+            if helper:
+                open(hfile, "w").write("X = 73\n")
+            elif os.path.exists(hfile):
+                os.remove(hfile)
+            return make_bundle(vd)
+        ba, ia = stage("def v(p):\n    return 'A'\n", True)
+        bb, ib = stage("def v(p):\n    return 'B'\n", False)
+        bc, ic = stage("def v(p):\n    import oldhelper\n    return oldhelper.X\n", False)
+
+        def remote(b_, i_):
+            return _remote_task(b_, i_["sha256"], vd, "models/v.py::v", [(0, {})], procs=1)
+        got = [remote(b_, i_)["rows"][0].get("result") for b_, i_ in ((ba, ia), (bb, ib), (ba, ia), (bb, ib))]
+        ok(got == ["A", "B", "A", "B"], f"C16 a chunk runs its own bundle's code (same size+mtime): {got}")
+        remote(ba, ia)
+        r = remote(bc, ic)["rows"][0]
+        ok(not r["ok"] and "oldhelper" in r.get("error", ""),
+           f"C16b a file absent from the bundle is gone, not left over from an earlier one: {r}")
+        open(vfile, "w").write("import os\ndef v(p):\n    os._exit(3)\n")
+        bd, id_ = make_bundle(vd)
+        r = remote(bd, id_)
+        ok(not r["rows"][0]["ok"] and r["core_s"] > 0, f"C21 a remote chunk whose process crashed is charged: {r}")
+        open(os.path.join(d, "models", "stubborn.py"), "w").write(
+            "import signal, time\ndef f(p):\n    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "    t = time.time()\n    while time.time() - t < 60: pass\n")
+        t0 = time.time()
+        rows, s = map_fn(d, "models/stubborn.py::f", [{}] * 2, backend="local", max_workers=2, timeout_s=1.0)
+        ok(time.time() - t0 < 10 and all(r["error"] == "timed out" for r in rows),
+           f"C18 a model ignoring SIGTERM still stops at the timeout ({time.time() - t0:.1f}s)")
+        rd2 = os.path.join(d, "abort"); os.makedirs(os.path.join(rd2, "models"))
+        real = globals()["_map_local"]
+
+        def boom(*a, progress=None, **k):
+            progress.update(slots=2, cores_per_slot=1, core_s=1.0)
+            time.sleep(0.5)
+            raise KeyboardInterrupt
+        globals()["_map_local"] = boom
+        try:
+            map_fn(rd2, "models/fn.py::f", [{"x": 1}], backend="local")
+            ok(False, "C19 interrupt must propagate")
+        except KeyboardInterrupt:
+            pass
+        finally:
+            globals()["_map_local"] = real
+        led = json.load(open(os.path.join(rd2, LEDGER_REL)))
+        ok(led["core_seconds"] >= 1.9 and not led["reservations"] and "interrupted" in led["calls"][-1]["stopped"],
+           f"C19 an interrupted call is charged an upper bound, not zero: {led}")
+        import subprocess as _sp
+        dead = _sp.Popen([sys.executable, "-c", "pass"]); dead.wait()
+        led["reservations"] = {"x": {"core_s": 500.0, "pid": dead.pid, "host": os.uname().nodename, "fn": "f"}}
+        json.dump(led, open(os.path.join(rd2, LEDGER_REL), "w"))
+        before = led["core_seconds"]
+        map_fn(rd2, "models/fn.py::f", [], backend="local")
+        led = json.load(open(os.path.join(rd2, LEDGER_REL)))
+        ok(led["core_seconds"] >= before + 500 and not led["reservations"],
+           f"C20 a dead caller's reservation is charged, not dropped: {led['core_seconds']} vs {before}")
         class _Sec:
             tls_ca_file = os.path.join(d, "w_ca.pem"); tls_client_cert = None; tls_client_key = None
             tls_worker_cert = os.path.join(d, "w_cert.pem"); tls_worker_key = os.path.join(d, "w_key.pem")
@@ -681,6 +808,8 @@ def main() -> int:
     ap.add_argument("--max-workers", type=int)
     ap.add_argument("--max-tasks", type=int, default=DEFAULT_MAX_TASKS)
     ap.add_argument("--timeout-s", type=float)
+    ap.add_argument("--max-core-hours", type=float,
+                    help="this call's allowance (default MA_COMPUTE_CALL_CORE_HOURS=50, within the run cap)")
     ap.add_argument("--no-ledger", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
@@ -689,7 +818,7 @@ def main() -> int:
     if a.cmd != "map" or not (a.run_dir and a.fn and a.inputs and a.out):
         ap.error("usage: compute.py map <run_dir> --fn <path.py>::<fn> --inputs <jsonl> --out <jsonl>")
     rows, summary = map_fn(a.run_dir, a.fn, _read_inputs(a.inputs), a.backend, a.max_workers,
-                           a.max_tasks, a.timeout_s, ledger=not a.no_ledger)
+                           a.max_tasks, a.timeout_s, ledger=not a.no_ledger, max_core_hours=a.max_core_hours)
     with open(a.out, "w") as f:
         for r in rows:
             f.write(json.dumps(r) + "\n")

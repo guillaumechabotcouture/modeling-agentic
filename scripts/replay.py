@@ -683,6 +683,13 @@ def _self_test() -> int:
         vb = rcoil.variants_bundle([dict(variants[0], prompt_file=pf)])
         names = tarfile.open(fileobj=io.BytesIO(vb), mode="r:gz").getnames()
         ok(sorted(names) == ["base.prompt.md", "base.yaml"], f"C4 variant bundle: {names}")
+        tdir = os.path.join(td, "tlsx"); os.makedirs(tdir)
+        body = ["MIIEvQIBADANBgkqhkiG9w0BAQEFAASC", "BKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj"]
+        open(os.path.join(tdir, "key.pem"), "w").write("-----BEGIN PRIVATE KEY-----\n" + "\n".join(body)
+                                                       + "\n-----END PRIVATE KEY-----\n")
+        leak = os.path.join(td, "diag.txt"); open(leak, "w").write("debug: " + body[1] + "\n")
+        hits = rcoil.redact_secrets([leak], rcoil.tls_key_secrets(tdir))
+        ok(hits and body[1] not in open(leak).read(), f"C5b an exported TLS key line is redacted: {hits}")
         ok(repr(rcoil.Redacted("sk-secret")) == "<redacted>" and "sk-secret" not in str(rcoil.Redacted("sk-secret")),
            "C5 Redacted never prints the secret")
         # C6: the full remote case on this machine (dry agent), then install into a batch.

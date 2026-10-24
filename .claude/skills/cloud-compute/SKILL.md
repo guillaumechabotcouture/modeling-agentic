@@ -28,10 +28,13 @@ python3 scripts/compute.py map {run_dir} --fn models/<module>.py::<fn> \
   `scripts/`) are unpacked at the same absolute paths. Files over 100 MB are
   left out and listed in `<out>.summary.json`; pass what the function needs as
   params, or keep inputs small.
-- **Memory-heavy models:** set `MA_COMPUTE_PROCS_PER_WORKER` (default: cores − 1).
+- **Memory-heavy models:** set `MA_COMPUTE_PROCS_PER_WORKER` (default: all of a compute VM's cores).
 - **Results and accounting.** Results come back in input order; a failing row
-  fails alone. Core-seconds are recorded in `models/compute_ledger.json`
-  against a run-wide cap.
+  fails alone. Core-seconds are recorded in `models/compute_ledger.json`.
+  Each call has an allowance (`--max-core-hours`, default 50) within the
+  run-wide cap; rows not reached when it runs out fail with
+  `stopped: compute cap reached`. Split a larger study into several calls,
+  or raise `--max-core-hours` for one call.
 - **Iterative calibration:** batch it. Ask K trials, evaluate them with one
   `map` call, tell K.
 
