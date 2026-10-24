@@ -296,6 +296,7 @@ def propagate(run_dir: str, n_draws: int = 200, seed: int = 42,
     categorical_results: dict[str, list[str]] = {}
     errors: list[dict] = []
 
+    compute_cloud = False
     if cloud:
         cloud_results = _propagate_cloud(
             run_dir, params_list, outcome_fn_spec,
@@ -314,6 +315,7 @@ def propagate(run_dir: str, n_draws: int = 200, seed: int = 42,
         if "::" not in spec:
             spec += "::outcome_fn"
         rows, csum = compute.map_fn(run_dir, spec, params_list)
+        compute_cloud = csum.get("backend") == "dask"
         if verbose:
             print(f"  compute: {csum.get('backend')} x{csum.get('workers')}, "
                   f"{csum.get('wall_s')}s wall", file=sys.stderr)
@@ -439,8 +441,10 @@ def propagate(run_dir: str, n_draws: int = 200, seed: int = 42,
         # Phase 21 δ: effort floors read these, not n_draws alone —
         # n_draws is what was requested; n_successful is what the CIs
         # are built from.
-        "backend": ("cloud" if cloud else "compute" if (parallel or os.environ.get("MA_COMPUTE_SCHEDULER"))
-                    else "local"),
+        # Draws on a cluster are cloud execution for the effort floors
+        # (cloud_uq_present), whichever service ran them.
+        "backend": ("cloud" if cloud or compute_cloud else
+                    "compute" if (parallel or os.environ.get("MA_COMPUTE_SCHEDULER")) else "local"),
         "n_draws": n_draws,
         "n_draws_requested": n_draws,
         "n_successful": len(outs) - n_failed,

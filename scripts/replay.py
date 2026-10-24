@@ -23,6 +23,7 @@ A variant YAML:
     env: {KEY: value}               # optional: extra env vars for the agent session
     tool_output_cap: {bash_chars: 6000, read_lines: 300}   # optional (E2): cap tool output added to context
     compaction: {window_tokens: 150000}                    # optional (E2): CLI auto-compact window
+    compute: true                   # optional (Phase 24): coiled cases get the compute service (--compute-workers)
     fresh_context_every: 20         # optional (E2): segments of <=N turns, fresh session + handoff
     effort: medium                  # optional (E2): stage agent reasoning effort (low|medium|high|max)
 
@@ -671,6 +672,13 @@ def _self_test() -> int:
         loads = {w: list(asg2.values()).count(w) for w in ("w1", "w2")}
         ok(all(len({asg2[c["key"]] for c in multi if c["fixture_id"] == fx}) == 1 for fx in "ABCD")
            and loads == {"w1": 4, "w2": 4}, f"C3 multi-fixture affine + balanced: {loads}")
+        cp = rcoil.plan_cases([os.path.join(td, "fx", "F1")], [dict(variants[0], compute=True)], 1)
+        ok(cp[0]["compute"] is True and cases_plan[0]["compute"] is False, "C3b plan_cases carries compute")
+        try:
+            rcoil.launch(cp, variants, REPO, td, "never-created", 1, None, compute_workers=0)
+            ok(False, "C3b compute variant without compute workers launched")
+        except SystemExit:
+            pass
         pf = os.path.join(vdir, "p.md"); open(pf, "w").write("PROMPT {run_dir}")
         vb = rcoil.variants_bundle([dict(variants[0], prompt_file=pf)])
         names = tarfile.open(fileobj=io.BytesIO(vb), mode="r:gz").getnames()
@@ -848,6 +856,8 @@ def main() -> int:
     ap.add_argument("--backend", choices=["local", "coiled"], default="local")
     ap.add_argument("--cluster-name")
     ap.add_argument("--workers", type=int)
+    ap.add_argument("--compute-workers", type=int, default=0,
+                    help="coiled: extra workers for compute-service batches (variants with compute: true)")
     ap.add_argument("--max-total-usd", type=float)
     ap.add_argument("--max-fixture-mb", type=float, default=50)
     ap.add_argument("--max-upload-gb", type=float, default=1.0)
@@ -910,7 +920,7 @@ def main() -> int:
             if not okey:
                 raise SystemExit("OPENAI_API_KEY must be set in the launching shell for crossmodel arms")
         replay_coiled.launch(planned, variants, REPO, batch, a.cluster_name, a.workers, key, a.dry_agent,
-                             openai_key=okey)
+                             openai_key=okey, compute_workers=a.compute_workers)
         print(f"launched; collect with: replay.py collect --batch {batch} --watch")
         return 0
     cases = asyncio.run(run_batch(a.stage, fixtures, variants, batch, a.seeds, LocalBackend(a.concurrency),
