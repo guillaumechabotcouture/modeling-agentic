@@ -77,3 +77,10 @@ Using the same prompt in both arms isolates where the simulations run. It does n
 - **2026-10-24, deviations at launch (logged before any result was seen).**
   - **Compute VMs:** the compute cluster reached 11 of 12 VMs within 30 minutes, probably the workspace's capacity or quota limit while E7 and the control arm were running. The compute arm therefore ran with **5 compute VMs, not 6** (6 case VMs + 5).
   - **Start times:** the arms started about 35 minutes apart (control `20261023_230401`, compute `20261023_233913`). They overlap for most of their run time.
+
+## Outcome of this attempt: results lost (2026-10-24)
+
+- **What happened.** All 12 cases ran on Coiled. Results were collected from the workers by processes on the operator's laptop, and the laptop slept from about 06:45 to 15:08 UTC.
+- **Effect.** Both clusters idled out (stopped 11:09 and 12:09 UTC), and Coiled deleted their VMs and disks before collection. No case output survived: no wall times, costs or artifacts. **No E8 result exists.** LLM spend for the attempt is unknown here; at most $480 (the caps).
+- **Operator error.** On waking, a status script attached to the clusters by name without the attach-only guard. Coiled created two empty clusters, which were stopped within minutes.
+- **Before re-running.** Each case must upload its result to the `modelingagentic` storage account when it finishes, so collection no longer depends on the laptop. Until then, the cluster idle timeout must cover the operator's absence.
