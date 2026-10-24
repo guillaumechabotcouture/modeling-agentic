@@ -34,7 +34,13 @@ Guardrails: --max-tasks (default 20,000) per call; a per-call allowance
 (--max-core-hours, default MA_COMPUTE_CALL_CORE_HOURS = 50) and a run-wide
 cap (MA_COMPUTE_MAX_CORE_HOURS, default 200), both in core-hours and tracked
 in `{run_dir}/models/compute_ledger.json`. A batch stops when its allowance
-is used; --timeout-s stops it at a wall-clock limit. A function that raises fails only its
+is used; --timeout-s stops it at a wall-clock limit.
+
+Known limits: a process the model starts in its own session (setsid,
+daemonizing) escapes the kill on a stop. Work redone by dask after a worker
+dies is not seen directly; a worker that vanishes during a call is charged as
+busy for the whole call instead. Remote chunks the client cannot confirm
+stopped are charged the call's whole allowance. A function that raises fails only its
 own row. Files over --max-file-mb (default 100) are left out of the bundle
 and listed in the summary.
 
@@ -121,6 +127,9 @@ _LOCAL_FN = None
 
 def _local_init(run_dir: str, fn_spec: str):
     global _LOCAL_FN
+    # Own process group: whatever the model spawns (an external simulator)
+    # is killed with this process. A child that starts its own session escapes.
+    os.setpgrp()
     os.chdir(run_dir)
     _LOCAL_FN = load_fn(run_dir, fn_spec)
 
@@ -146,17 +155,32 @@ def _budget_deadline(deadline, allowance_s, cores):
     return (b, CAP_STOP) if deadline is None or b < deadline else (deadline, "timed out")
 
 
-def _kill_pool(ex):
-    """SIGTERM the pool's processes, then SIGKILL any that ignore it, so
-    shutdown() cannot hang on a model that traps signals."""
-    procs = list((getattr(ex, "_processes", None) or {}).values())
-    for proc in procs:
-        proc.terminate()
-    for proc in procs:
-        proc.join(2)
-        if proc.is_alive():
-            proc.kill()
-            proc.join(2)
+def _killpg(pgid, sig):
+    try:
+        os.killpg(pgid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _kill_groups(pids, grace_s=2.0):
+    """SIGTERM every pool process group, then SIGKILL whatever is left once
+    one shared grace period ends (a model may trap SIGTERM)."""
+    import signal
+    for pid in pids:
+        _killpg(pid, signal.SIGTERM)
+    end = time.time() + grace_s
+    while time.time() < end and any(_group_alive(p) for p in pids):
+        time.sleep(0.05)
+    for pid in pids:
+        _killpg(pid, signal.SIGKILL)
+
+
+def _group_alive(pgid) -> bool:
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
 
 
 def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s=None, progress=None):
@@ -171,9 +195,10 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
     ex = cf.ProcessPoolExecutor(max_workers=n, mp_context=mp.get_context("spawn"),
                                 initializer=_local_init, initargs=(run_dir, fn_spec))
     futs = {ex.submit(_local_chunk, ch): ch for ch in chunks}
-    pending, rows, stop, lost = set(futs), [], None, 0
+    pending, rows, stop, lost, pids = set(futs), [], None, 0, set()
     try:
         while pending:
+            pids |= set((getattr(ex, "_processes", None) or {}).keys())
             left = None if deadline is None else max(0.0, deadline - time.time())
             done, pending = cf.wait(pending, timeout=left, return_when=cf.FIRST_COMPLETED)
             if not done:
@@ -192,9 +217,11 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
                 stop = CAP_STOP
                 break
     finally:
+        pids |= set((getattr(ex, "_processes", None) or {}).keys())
         if pending:
-            _kill_pool(ex)
+            _kill_groups(pids)
         ex.shutdown(wait=True, cancel_futures=True)
+        _kill_groups(pids, grace_s=0)    # leftovers the model spawned and left running
     return rows, {"backend": "local", "workers": n, "slots": n, "cores_per_slot": 1, "core_s": progress["core_s"],
                   "stopped": stop, "unknown_chunks": lost + len(pending)}
 
@@ -231,14 +258,32 @@ def make_bundle(run_dir: str, max_file_mb: float = DEFAULT_MAX_FILE_MB) -> tuple
                   "sha256": hashlib.sha256(data).hexdigest()}
 
 
+_CALLS_DIR = "ma_compute_calls"     # under the temp dir: running-chunk pids and cancel marks per call
+
+
+def _no_symlink_path(path: str) -> bool:
+    """True if no existing component of `path` is a symlink (so writing or
+    deleting there cannot be redirected into another directory)."""
+    p = os.path.normpath(path)
+    while p not in ("/", ""):
+        if os.path.islink(p):
+            return False
+        p = os.path.dirname(p)
+    return True
+
+
 def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: list,
-                 deadline: float | None = None, procs: int | None = None):
+                 deadline: float | None = None, procs: int | None = None,
+                 chunk_allowance_s: float | None = None, call_id: str | None = None):
     """Runs on a dask worker. Under a machine-wide lock: make sure the files on
     disk are exactly THIS bundle (another call's bundle may have replaced them:
     its extra files are removed and no stale bytecode survives), then evaluate
     the chunk. The live run directory (has metadata.json) is never touched:
-    there the model runs against the run's own files. Returns the rows and the
-    core-seconds the chunk used, including work in crashed processes."""
+    there the model runs against the run's own files, and no path through a
+    symlink is written or deleted. The chunk stops at `deadline` (wall clock)
+    or once it has used `chunk_allowance_s` core-seconds, counted from when it
+    starts running, not while it queues. Returns the rows and the core-seconds
+    used, including work in crashed processes."""
     import fcntl, io, json, os, shutil, signal, subprocess, sys, tarfile, tempfile, time  # noqa: E401 — pickled by value
     try:
         from distributed import get_worker
@@ -248,34 +293,50 @@ def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: lis
     # One machine-wide lock: one chunk at a time per VM (each chunk already uses
     # its cores), and no bundle is replaced while a chunk is reading it.
     lock = os.path.join(tempfile.gettempdir(), "ma_compute.lock")
-    procs = procs or int(os.environ.get("MA_COMPUTE_PROCS_PER_WORKER") or max(1, (os.cpu_count() or 2) - 1))
-    t0 = time.time()
+    procs = procs or int(os.environ.get("MA_COMPUTE_PROCS_PER_WORKER") or os.cpu_count() or 1)
+    calls = os.path.join(tempfile.gettempdir(), _CALLS_DIR, call_id or "none")
+    os.makedirs(calls, exist_ok=True)
 
-    def failed(msg):
-        return {"rows": [{"i": i, "ok": False, "error": msg[:500], "worker": waddr} for i, _ in chunk],
-                "core_s": round((time.time() - t0) * procs, 3)}
+    def rows_with(msg):
+        return [{"i": i, "ok": False, "error": msg[:500], "worker": waddr} for i, _ in chunk]
 
     with open(lock, "w") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
+        t0 = time.time()
+
+        def failed(msg):
+            return {"rows": rows_with(msg), "core_s": round((time.time() - t0) * procs, 3)}
+        if os.path.exists(os.path.join(calls, "cancel")):
+            return {"rows": rows_with("cancelled"), "core_s": 0.0}
         live = os.path.exists(os.path.join(run_dir, "metadata.json"))
-        current = os.path.join(run_dir, ".ma_compute_bundle")
-        try:
-            prev = json.load(open(current))
-        except (OSError, ValueError):
-            prev = {}
-        if not live and prev.get("sha") != sha:
+        if not live:
             tf = tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz")
             members = [m.name for m in tf.getmembers() if m.isfile()]
-            for old in set(prev.get("members") or []) - set(members):
-                try:
-                    os.unlink("/" + old)
-                except OSError:
-                    pass
-            for d in {os.path.dirname("/" + m) for m in members}:
-                shutil.rmtree(os.path.join(d, "__pycache__"), ignore_errors=True)
-            tf.extractall("/", filter="data")
-            os.makedirs(run_dir, exist_ok=True)
-            json.dump({"sha": sha, "members": members}, open(current, "w"))
+            dirs = {os.path.dirname("/" + m) for m in members} | {run_dir}
+            if not all(_no_symlink_path(d) for d in dirs):
+                return failed("refusing to stage the bundle: a target directory is a symlink")
+            if any(os.path.exists(os.path.join(d, "metadata.json")) for d in dirs if d.startswith(run_dir)):
+                return failed("refusing to stage the bundle over a live run directory")
+            current = os.path.join(run_dir, ".ma_compute_bundle")
+            try:
+                prev = json.load(open(current))
+            except (OSError, ValueError):
+                prev = {}
+            if prev.get("sha") != sha:
+                for old in set(prev.get("members") or []) - set(members):
+                    path = "/" + old
+                    if _no_symlink_path(os.path.dirname(path)) and not os.path.islink(path):
+                        try:
+                            os.unlink(path)
+                        except OSError:
+                            pass
+                for d in dirs:
+                    pyc = os.path.join(d, "__pycache__")
+                    if not os.path.islink(pyc):
+                        shutil.rmtree(pyc, ignore_errors=True)
+                tf.extractall("/", filter="data")
+                os.makedirs(run_dir, exist_ok=True)
+                json.dump({"sha": sha, "members": members}, open(current, "w"))
         # dask workers are daemonic (no multiprocessing children), so the chunk
         # runs in a subprocess using this module's local backend across the VM's
         # cores. MA_COMPUTE_PROCS_PER_WORKER caps processes for memory-heavy models.
@@ -287,23 +348,35 @@ def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: lis
             env["PYTHONDONTWRITEBYTECODE"] = "1"     # bytecode never outlives its bundle
             cmd = [sys.executable, script, "map", run_dir, "--fn", fn_spec, "--inputs", inp,
                    "--out", out, "--backend", "local", "--max-workers", str(procs), "--no-ledger"]
+            if chunk_allowance_s is not None:
+                cmd += ["--max-core-hours", f"{chunk_allowance_s / 3600:.6f}"]
             left = None
             if deadline is not None:
                 left = deadline - time.time()
                 if left <= 0:
-                    return {"rows": [{"i": i, "ok": False, "error": "timed out", "worker": waddr} for i, _ in chunk],
-                            "core_s": 0.0}
+                    return {"rows": rows_with("timed out"), "core_s": 0.0}
                 cmd += ["--timeout-s", f"{left:.1f}"]
-            # Own process group: on a hard timeout the whole tree (the chunk's
-            # pool and anything the model spawned) is killed.
+            hard = None if left is None else left + 60
+            if chunk_allowance_s is not None:
+                b = chunk_allowance_s / max(1, min(procs, len(chunk))) + 60
+                hard = b if hard is None else min(hard, b)
+            # Own session: on a hard stop or a cancel the chunk is signalled as a
+            # group; its SIGTERM handler kills its pool's groups.
             proc = subprocess.Popen(cmd, cwd=run_dir, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                     text=True, start_new_session=True)
+            pidf = os.path.join(calls, str(proc.pid))
+            open(pidf, "w").write(str(proc.pid))
             try:
-                _, err = proc.communicate(timeout=None if left is None else left + 60)
+                _, err = proc.communicate(timeout=hard)
             except subprocess.TimeoutExpired:
-                os.killpg(proc.pid, signal.SIGKILL)
+                _stop_chunk(proc.pid)
                 proc.communicate()
                 return failed("timed out (chunk subprocess killed)")
+            finally:
+                try:
+                    os.unlink(pidf)
+                except OSError:
+                    pass
             if not os.path.exists(out):
                 return failed(f"chunk subprocess failed (rc {proc.returncode}): {(err or '')[-800:]}")
             rows = [json.loads(l) for l in open(out) if l.strip()]
@@ -312,6 +385,32 @@ def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: lis
             except (OSError, ValueError, KeyError, TypeError):
                 core_s = (time.time() - t0) * procs    # no summary: charge the chunk as fully busy
     return {"rows": [{**row, "i": chunk[k][0], "worker": waddr} for k, row in enumerate(rows)], "core_s": core_s}
+
+
+def _stop_chunk(pid: int, grace_s: float = 5.0):
+    """SIGTERM a chunk subprocess's group (its handler kills its pool), then
+    SIGKILL the group after the grace period."""
+    import signal
+    _killpg(pid, signal.SIGTERM)
+    end = time.time() + grace_s
+    while time.time() < end and _group_alive(pid):
+        time.sleep(0.1)
+    _killpg(pid, signal.SIGKILL)
+
+
+def _cancel_call(call_id: str) -> int:
+    """On a worker (client.run): stop this call's running chunks and keep its
+    queued ones from starting. Returns how many chunks were stopped."""
+    import tempfile
+    calls = os.path.join(tempfile.gettempdir(), _CALLS_DIR, call_id)
+    os.makedirs(calls, exist_ok=True)
+    open(os.path.join(calls, "cancel"), "w").write(str(time.time()))
+    n = 0
+    for name in os.listdir(calls):
+        if name.isdigit():
+            _stop_chunk(int(name))
+            n += 1
+    return n
 
 
 def export_worker_env(tls_dir: str, worker=None) -> dict:
@@ -363,12 +462,19 @@ def _security():
 
 def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadline=None, allowance_s=None,
               progress=None):
+    """The allowance is split over the chunks that can run at once; each chunk
+    enforces its share from when it starts (queueing behind other calls on a
+    shared pool does not count). Whenever the call ends with chunks still
+    out (cap, timeout, interrupt), those chunks are stopped on the workers."""
+    import uuid
     import cloudpickle
     from distributed import Client, wait
     cloudpickle.register_pickle_by_value(sys.modules[__name__])
     addr = os.environ["MA_COMPUTE_SCHEDULER"]
     exclude = {w.strip() for w in os.environ.get("MA_COMPUTE_EXCLUDE_WORKERS", "").split(",") if w.strip()}
     bundle, binfo = make_bundle(run_dir)
+    call_id = uuid.uuid4().hex
+    progress = {} if progress is None else progress
     with Client(addr, timeout="60s", security=_security()) as c:
         winfo = c.scheduler_info()["workers"]
         workers = [w for w in winfo if w not in exclude]
@@ -379,49 +485,65 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
         env_procs = os.environ.get("MA_COMPUTE_PROCS_PER_WORKER")
         cpus = c.run(os.cpu_count, workers=workers)
         procs = {w: int(env_procs) if env_procs else (cpus.get(w) or 1) for w in workers}   # compute VMs run nothing else
-        slots = len(workers)          # _remote_task runs one chunk at a time per VM
         cores_per_slot = max(procs.values())
-        progress = {} if progress is None else progress
-        progress.update(slots=slots, cores_per_slot=cores_per_slot, core_s=0.0)
-        deadline, why = _budget_deadline(deadline, allowance_s, slots * cores_per_slot)
-        bfut = c.scatter(bundle, workers=workers, broadcast=True)
         chunks = _chunks(list(enumerate(inputs)), len(workers) * chunks_per_worker)
+        slots = max(1, min(len(workers), len(chunks)))   # _remote_task runs one chunk at a time per VM
+        progress.update(slots=slots, cores_per_slot=cores_per_slot, core_s=0.0)
+        share = None if allowance_s is None else allowance_s / slots
+        bfut = c.scatter(bundle, workers=workers, broadcast=True)
+
         def submit(ch):
-            # No dask retries: a failed attempt's work would go uncharged. A lost
-            # chunk is resubmitted once here, and the lost attempt is charged.
+            # A lost chunk is resubmitted once here (and the lost attempt
+            # charged), rather than through dask retries, which would hide it.
             return c.submit(_remote_task, bfut, binfo["sha256"], run_dir, fn_spec, ch, deadline, cores_per_slot,
-                            workers=workers, allow_other_workers=False, pure=False)
+                            share, call_id, workers=workers, allow_other_workers=False, pure=False)
         futs = {submit(ch): (ch, 0) for ch in chunks}
         pending, rows, stop, lost = set(futs), [], None, 0
-        while pending:
-            left = None if deadline is None else max(0.0, deadline - time.time())
-            try:
-                done, pending = wait(pending, timeout=left, return_when="FIRST_COMPLETED")
-            except TimeoutError:
-                stop = why
-                break
-            for f in done:
-                ch, attempt = futs[f]
+        try:
+            while pending:
+                left = None if deadline is None else max(0.0, deadline - time.time())
                 try:
-                    got = f.result()
-                    rows += got["rows"]
-                    progress["core_s"] += float(got["core_s"])
-                except Exception as e:  # noqa: BLE001 — a lost worker fails only its chunk
-                    lost += 1
-                    if attempt == 0 and (deadline is None or time.time() < deadline):
-                        g = submit(ch)
-                        futs[g] = (ch, 1)
-                        pending.add(g)
-                        continue
-                    rows += [{"i": i, "ok": False, "error": f"chunk failed: {type(e).__name__}: {e}"[:500]}
-                             for i, _ in ch]
-            if pending and allowance_s is not None and progress["core_s"] >= allowance_s:
-                stop = CAP_STOP
-                break
-        for f in pending:
-            f.cancel()   # running chunks stop themselves at `deadline` (their subprocess timeout)
+                    done, pending = wait(pending, timeout=left, return_when="FIRST_COMPLETED")
+                except TimeoutError:
+                    stop = "timed out"
+                    break
+                for f in done:
+                    ch, attempt = futs[f]
+                    try:
+                        got = f.result()
+                        rows += got["rows"]
+                        progress["core_s"] += float(got["core_s"])
+                    except Exception as e:  # noqa: BLE001 — a lost worker fails only its chunk
+                        lost += 1
+                        if attempt == 0 and (deadline is None or time.time() < deadline):
+                            g = submit(ch)
+                            futs[g] = (ch, 1)
+                            pending.add(g)
+                            continue
+                        rows += [{"i": i, "ok": False, "error": f"chunk failed: {type(e).__name__}: {e}"[:500]}
+                                 for i, _ in ch]
+                if pending and allowance_s is not None and progress["core_s"] >= allowance_s:
+                    stop = CAP_STOP
+                    break
+        finally:
+            if pending:
+                for f in pending:
+                    f.cancel()
+                try:
+                    c.run(_cancel_call, call_id, workers=workers)
+                except Exception:  # noqa: BLE001 — cannot confirm the remote stop
+                    progress["remote_unconfirmed"] = True
+            # The scheduler silently reruns tasks from a worker that died; that
+            # attempt's work is invisible here, so a vanished worker is charged
+            # as busy for the whole call.
+            try:
+                gone = [w for w in workers if w not in c.scheduler_info()["workers"]]
+            except Exception:  # noqa: BLE001
+                gone = list(workers)
+            progress["gone_workers"] = len(gone)
     return rows, {"backend": "dask", "workers": len(workers), "slots": slots, "cores_per_slot": cores_per_slot,
-                  "core_s": progress["core_s"], "stopped": stop, "unknown_chunks": lost + len(pending), "bundle": binfo}
+                  "core_s": progress["core_s"], "stopped": stop,
+                  "unknown_chunks": lost + len(pending) + len(gone), "bundle": binfo}
 
 
 # --------------------------------------------------------------------------- #
@@ -505,7 +627,7 @@ def map_fn(run_dir: str, fn_spec: str, inputs: list, backend: str = "auto",
     run_dir = os.path.realpath(run_dir)
     if len(inputs) > max_tasks:
         raise ValueError(f"{len(inputs)} tasks exceeds --max-tasks {max_tasks}")
-    allowance_s, rid = None, None
+    allowance_s, rid = (None if max_core_hours is None else max_core_hours * 3600), None
     if ledger:
         cap_s = float(os.environ.get("MA_COMPUTE_MAX_CORE_HOURS", "200")) * 3600
         with _LedgerLock(run_dir) as led:
@@ -543,13 +665,17 @@ def map_fn(run_dir: str, fn_spec: str, inputs: list, backend: str = "auto",
         # deadline) are charged as busy for the whole call: over-, never under-charged.
         est = min(info.pop("unknown_chunks"), info["slots"]) * wall * info["cores_per_slot"]
         core_s = info.pop("core_s") + est
+        if progress.get("remote_unconfirmed") and allowance_s is not None:
+            core_s = max(core_s, allowance_s)    # stopped chunks not confirmed: charge the allowance
     except BaseException as e:
         if rid:
             # Interrupted mid-batch: charge every slot as busy since the start
             # (capped at the reservation), never zero.
             used = progress.get("core_s", 0.0) + progress.get("slots", 0) * progress.get("cores_per_slot", 0) \
                 * (time.time() - t0)
-            used = min(allowance_s, used)
+            # Remote chunks that could not be confirmed stopped may run on up
+            # to the call's allowance: charge all of it.
+            used = allowance_s if progress.get("remote_unconfirmed") else min(allowance_s, used)
             with _LedgerLock(run_dir) as led:
                 led["reservations"].pop(rid, None)
                 led["core_seconds"] = round(led["core_seconds"] + used, 1)
@@ -583,6 +709,8 @@ def _read_inputs(path: str) -> list:
 # --------------------------------------------------------------------------- #
 
 def _self_test() -> int:
+    import shutil
+    import subprocess as _sp
     import tempfile
     fails = []
 
@@ -775,6 +903,59 @@ def _self_test() -> int:
            and "w_key.pem" in open(os.path.join(tdir, "key.pem")).read()
            and "w_cert.pem" in open(os.path.join(tdir, "cert.pem")).read(),
            "C17 worker credentials exported 0600 in a 0700 dir, replacing an existing world-readable key")
+        t0 = time.time()
+        rows, s = map_fn(d, "models/stubborn.py::f", [{}] * 4, backend="local", max_workers=4, timeout_s=1.0)
+        ok(time.time() - t0 < 5, f"C22 stubborn processes are killed together, not one by one ({time.time() - t0:.1f}s)")
+        open(os.path.join(d, "models", "spawner.py"), "w").write(
+            "import subprocess\ndef f(p):\n    return subprocess.Popen(['sleep', '60']).pid\n")
+        rows, _ = map_fn(d, "models/spawner.py::f", [{}], backend="local")
+        time.sleep(0.3)
+        try:
+            os.kill(rows[0]["result"], 0)
+            alive = not open(f"/proc/{rows[0]['result']}/stat").read().split()[2] == "Z" if os.path.exists("/proc") else \
+                _sp.run(["ps", "-o", "stat=", "-p", str(rows[0]["result"])], capture_output=True, text=True).stdout.strip()[:1] not in ("", "Z")
+        except ProcessLookupError:
+            alive = False
+        ok(rows[0]["ok"] and not alive, f"C23 a process the model left running is killed with the batch: {rows[0]}")
+        sd = os.path.realpath(os.path.join(d, "stage")); os.makedirs(os.path.join(sd, "models")); os.makedirs(os.path.join(sd, "data"))
+        open(os.path.join(sd, "models", "v.py"), "w").write("def v(p):\n    return 1\n")
+        open(os.path.join(sd, "data", "source.csv"), "w").write("a\n")
+        b1, i1 = make_bundle(sd)
+        os.remove(os.path.join(sd, "data", "source.csv"))
+        b2, i2 = make_bundle(sd)
+        _remote_task(b1, i1["sha256"], sd, "models/v.py::v", [(0, {})], procs=1)
+        livedir = os.path.join(d, "live_run"); os.makedirs(os.path.join(livedir, "data"))
+        open(os.path.join(livedir, "metadata.json"), "w").write("{}")
+        open(os.path.join(livedir, "data", "source.csv"), "w").write("live\n")
+        shutil.rmtree(os.path.join(sd, "data")); os.symlink(os.path.join(livedir, "data"), os.path.join(sd, "data"))
+        r = _remote_task(b2, i2["sha256"], sd, "models/v.py::v", [(0, {})], procs=1)
+        ok(os.path.exists(os.path.join(livedir, "data", "source.csv")),
+           f"C24 staging never deletes through a symlink: {r['rows'][0]}")
+        bl, il = make_bundle(livedir)   # a bundle whose target dirs run through the symlink
+        os.makedirs(os.path.join(sd, "data", "x"), exist_ok=True)
+        open(os.path.join(sd, "data", "x", "f.txt"), "w").write("1")
+        b3, i3 = make_bundle(sd)
+        r = _remote_task(b3, i3["sha256"], sd, "models/v.py::v", [(0, {})], procs=1)
+        ok(not r["rows"][0]["ok"] and "symlink" in r["rows"][0]["error"],
+           f"C24b staging refuses to write through a symlinked directory: {r['rows'][0]}")
+        cdir = os.path.realpath(os.path.join(d, "cap")); os.makedirs(os.path.join(cdir, "models"))
+        open(os.path.join(cdir, "models", "slow.py"), "w").write(open(os.path.join(d, "models", "slow.py")).read())
+        bc_, ic_ = make_bundle(cdir)
+        t0 = time.time()
+        r = _remote_task(bc_, ic_["sha256"], cdir, "models/slow.py::burn", [(k, {"s": 0.4}) for k in range(20)],
+                         procs=1, chunk_allowance_s=1.0)
+        ok(time.time() - t0 < 8 and any(x.get("error") == CAP_STOP for x in r["rows"]) and r["core_s"] < 3,
+           f"C25 a remote chunk enforces its allowance share: core_s={r['core_s']}")
+        import threading as _th
+        import uuid as _uuid
+        res, cid = {}, "selftest-" + _uuid.uuid4().hex
+        th = _th.Thread(target=lambda: res.update(r=_remote_task(bc_, ic_["sha256"], cdir, "models/slow.py::sleep",
+                                                                 [(0, {"s": 60})], procs=1, call_id=cid)))
+        th.start(); time.sleep(1.5)
+        t0 = time.time(); n_stopped = _cancel_call(cid); th.join(15)
+        later = _remote_task(bc_, ic_["sha256"], cdir, "models/slow.py::sleep", [(0, {"s": 60})], procs=1, call_id=cid)
+        ok(n_stopped == 1 and not th.is_alive() and not res["r"]["rows"][0]["ok"]
+           and later["rows"][0]["error"] == "cancelled", f"C26 cancel stops running and queued chunks: {n_stopped}, {res}")
         # C8: dask backend against a local cluster, when distributed is installed
         try:
             from distributed import LocalCluster
@@ -821,6 +1002,11 @@ def main() -> int:
     a = ap.parse_args()
     if a.self_test:
         return _self_test()
+    import signal
+
+    def _on_term(*_):
+        raise KeyboardInterrupt      # unwinds map_fn: the pool's groups are killed
+    signal.signal(signal.SIGTERM, _on_term)
     if a.cmd != "map" or not (a.run_dir and a.fn and a.inputs and a.out):
         ap.error("usage: compute.py map <run_dir> --fn <path.py>::<fn> --inputs <jsonl> --out <jsonl>")
     rows, summary = map_fn(a.run_dir, a.fn, _read_inputs(a.inputs), a.backend, a.max_workers,
