@@ -267,14 +267,18 @@ def make_bundle(run_dir: str, max_file_mb: float = DEFAULT_MAX_FILE_MB) -> tuple
     # the "data" filter, which rejects absolute links).
     with tarfile.open(fileobj=buf, mode="w:gz", dereference=True) as t:
         for root in (os.path.join(run_dir, "models"), os.path.join(run_dir, "data"), os.path.join(REPO, "scripts")):
-            seen = set()
+            # Follow symlinked dirs; stop only at a loop (a dir that is its own
+            # ancestor). Two names for one dir are both bundled: models use either.
+            ancestors = {root: frozenset()}
             for dp, dirs, files in os.walk(root, followlinks=True):
                 real = os.path.realpath(dp)
-                if real in seen:              # a symlink loop, or a dir reached twice
+                anc = ancestors.pop(dp, frozenset())
+                if real in anc:
                     dirs[:] = []
                     continue
-                seen.add(real)
                 dirs[:] = [d for d in dirs if d not in ("__pycache__", ".git", "_truth")]
+                for d in dirs:
+                    ancestors[os.path.join(dp, d)] = anc | {real}
                 for fn in files:
                     p = os.path.join(dp, fn)
                     try:
@@ -1078,6 +1082,12 @@ def _self_test() -> int:
         bd_, idd = make_bundle(dl)
         names_ = tarfile.open(fileobj=io.BytesIO(bd_)).getnames()
         ok(any(n.endswith("dlink/data/t.csv") for n in names_), f"C7c a symlinked data dir is bundled (cycle-safe): {idd}")
+        al = os.path.join(d, "alias"); os.makedirs(os.path.join(al, "data", "real")); os.makedirs(os.path.join(al, "models"))
+        open(os.path.join(al, "data", "real", "value.txt"), "w").write("73\n")
+        os.symlink(os.path.join(al, "data", "real"), os.path.join(al, "data", "a_alias"))
+        na = tarfile.open(fileobj=io.BytesIO(make_bundle(al)[0])).getnames()
+        ok(any(n.endswith("data/real/value.txt") for n in na) and any(n.endswith("data/a_alias/value.txt") for n in na),
+           f"C7d both names of an aliased dir are bundled: {[n for n in na if 'value' in n]}")
         ld = os.path.realpath(os.path.join(d, "leaf")); os.makedirs(os.path.join(ld, "models")); os.makedirs(os.path.join(ld, "data"))
         open(os.path.join(ld, "models", "v.py"), "w").write("def v(p):\n    return 1\n")
         open(os.path.join(ld, "data", "input.csv"), "w").write("bundle\n")
