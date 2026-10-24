@@ -214,15 +214,22 @@ def export_worker_env(tls_dir: str) -> dict:
     w = get_worker()
     env = {"MA_COMPUTE_SCHEDULER": w.scheduler.address}
     sec = getattr(w, "security", None)
-    if sec is not None and getattr(sec, "require_encryption", False):
+    # Coiled workers hold only worker credentials (tls_client_* unset); the
+    # scheduler accepts them from a client too, so fall back to them.
+    creds = {}
+    if sec is not None:
+        creds = {
+            "ca.pem": getattr(sec, "tls_ca_file", None),
+            "cert.pem": getattr(sec, "tls_client_cert", None) or getattr(sec, "tls_worker_cert", None),
+            "key.pem": getattr(sec, "tls_client_key", None) or getattr(sec, "tls_worker_key", None),
+        }
+    if any(creds.values()):
         os.makedirs(tls_dir, mode=0o700, exist_ok=True)
-        for attr, fn in (("tls_ca_file", "ca.pem"), ("tls_client_cert", "cert.pem"),
-                         ("tls_client_key", "key.pem")):
-            v = getattr(sec, attr, None)
+        for fn, v in creds.items():
             if not v:
                 continue
             dest = os.path.join(tls_dir, fn)
-            data = v if str(v).lstrip().startswith("-----BEGIN") else open(v).read()
+            data = v if str(v).lstrip().startswith("-----BEGIN") else open(os.path.abspath(v)).read()
             fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w") as f:
                 f.write(data)
