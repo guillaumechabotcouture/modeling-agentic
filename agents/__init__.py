@@ -808,11 +808,15 @@ The validator has already decided for you. Your job is to carry it out:
   the primary instruction. Reference modeling strategy Level
   progression where appropriate.
 
-- **RUN_FAILED**: structural mismatch AND no rounds remaining. Write
-  `RUN_FAILED` at the top of progress.md with the structural mismatch
-  description. Do NOT spawn the writer. End the pipeline. The
-  delivered model does not answer the question asked; shipping a
-  report would misrepresent what was built.
+- **RUN_FAILED**: no rounds remaining and blocking findings stand. Write
+  `RUN_FAILED` at the top of progress.md with the blocking findings.
+  Then spawn the writer for a **not-accepted report** (Phase 29: every
+  run ends with a report, so its failure can be studied). Tell the writer:
+  the report's first section is "Status: not accepted by the final gate",
+  listing each unresolved blocking finding from the latest critique and
+  validator output in plain words; the model is presented as what was
+  built and why it fell short, never as a recommendation; the allocation,
+  if any, is labelled illustrative. Run the render step, then end.
 
 - **PATCH_OR_RETHINK**: HIGH blockers remain and rounds are left. You
   choose PATCH vs RETHINK using the heuristics below. ACCEPT is

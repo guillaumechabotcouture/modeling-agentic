@@ -163,6 +163,14 @@ def write_budget_ledger(run_path: str, ledger: dict, cap: float | None, integrit
         integrity.harness_wrote(BUDGET_LEDGER)
 
 
+def writeup_reserve(cap: float | None) -> float:
+    """Phase 29: dollars held back from the modeling sessions so the final
+    write-up can always run (8% of the cap, at least $10, at most half)."""
+    if cap is None:
+        return 0.0
+    return round(min(max(0.08 * cap, 10.0), 0.5 * cap), 2)
+
+
 def remaining_budget(cap: float | None, records: list[dict]) -> float | None:
     """Dollars left under a run-wide cap, summed over every session so far
     (including earlier invocations of a resumed run). None = no cap."""
@@ -699,8 +707,11 @@ async def run(question: str, max_rounds: int, max_sessions: int,
             # Run-wide dollar cap across sessions (and earlier invocations),
             # from the harness-owned ledger.
             left = remaining_budget(max_budget_usd, budget["sessions"])
+            if left is not None:
+                left = round(left - writeup_reserve(max_budget_usd), 4)   # kept for the final write-up
             if left is not None and left <= 0:
-                print(f"Budget cap ${max_budget_usd:.0f} reached; stopping.", flush=True)
+                print(f"Budget cap ${max_budget_usd:.0f} reached (less the write-up reserve); "
+                      f"stopping modeling.", flush=True)
                 session_outcome = "budget_exhausted"
                 break
             options = ClaudeAgentOptions(
@@ -839,6 +850,12 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                                             cross_model=cross_model,
                                             methods_critic=methods_critic)
             print(f"Restarting pipeline (session {session_num + 1})...", flush=True)
+        # Phase 29: every run ends with a report, so failures can be studied.
+        if not interrupted and not os.path.exists(os.path.join(run_path, "report.md")) \
+                and not os.path.exists(os.path.join(run_path, "manuscript.md")):
+            live_state.session = session_num + 1
+            await final_writeup(run_path, run_dir_rel, question, max_rounds, budget,
+                                max_budget_usd, session_num + 1, session_outcome, integrity)
     finally:
         heartbeat.stop()          # last status + checkpoint before the final gate and storage
         status = finalize_run(
@@ -911,7 +928,7 @@ def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
 
     gate = None
     # A budget stop is still gated: the report shows what the money bought.
-    if run_gate and session_outcome in ("session_completed", "budget_exhausted"):
+    if run_gate:          # Phase 29: also after max_sessions / crashes: the verdict is evidence
         print("\nRunning final STAGE 7 gate...", flush=True)
         gate = run_final_gate(run_path, max_rounds)
 
@@ -1755,6 +1772,33 @@ def _run_self_test() -> int:
        "ST1 nothing is stored when no account is configured")
     shutil.rmtree(_sr, ignore_errors=True)
 
+    # WU (Phase 29): every run ends with a report.
+    ok(writeup_reserve(450.0) == 36.0 and writeup_reserve(8.0) == 4.0 and writeup_reserve(None) == 0.0,
+       "WU1 write-up reserve: 8% (min $10, at most half the cap)")
+    _wd = tempfile.mkdtemp()
+    os.makedirs(os.path.join(_wd, "models"))
+    json.dump({"question": "q"}, open(os.path.join(_wd, "metadata.json"), "w"))
+    _seen = {}
+
+    async def _fq_w(prompt, options):
+        _seen["prompt"], _seen["budget"], _seen["agents"] = prompt, options.max_budget_usd, sorted(options.agents)
+        open(os.path.join(_wd, WRITER_DRAFT), "w").write("# Status: not accepted\n")
+        yield ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+                            num_turns=2, session_id="w1", total_cost_usd=3.5)
+    _bud = {"sessions": [{"session": 1, "total_cost_usd": 420.0}]}
+    _info = asyncio.run(final_writeup(_wd, _wd, "q", 8, _bud, 450.0, 2, "max_sessions_reached", query_fn=_fq_w))
+    ok(_info.get("ran") and _info.get("manuscript") and _seen.get("agents") == ["writer"]
+       and abs((_seen.get("budget") or 0) - 30.0) < 1e-6 and "Status: not accepted" in _seen.get("prompt", ""),
+       f"WU2 the write-up spawns only the writer, uses what is left (incl. the reserve), states the verdict: {_info} {_seen.get('budget')}")
+    ok(_bud["sessions"][-1]["source"] == "final write-up" and _bud["sessions"][-1]["total_cost_usd"] == 3.5,
+       f"WU3 the write-up is charged to the ledger: {_bud['sessions'][-1]}")
+    ok(json.load(open(os.path.join(_wd, "metadata.json"))).get("final_writeup", {}).get("ran") is True,
+       "WU4 the write-up outcome is recorded in metadata.json")
+    _bud2 = {"sessions": [{"session": 1, "total_cost_usd": 450.0}]}
+    ok(asyncio.run(final_writeup(_wd, _wd, "q", 8, _bud2, 450.0, 2, "budget_exhausted", query_fn=_fq_w))
+       .get("skipped"), "WU5 no budget left: the write-up is skipped and says so")
+    shutil.rmtree(_wd, ignore_errors=True)
+
     # OB (Phase 29): live status, resources, checkpoints.
     from agents import observability as _ob
     for _f in _ob.self_test():
@@ -2033,6 +2077,77 @@ async def _probe_subagent_write(allow_cloud: bool, attempts: int = 2) -> tuple[b
         if wrote:
             return True, "\n".join(log), cost
     return False, "\n".join(log), cost
+
+
+WRITEUP_PROMPT = """The modeling sessions have ended (outcome: {outcome}) without a report.
+Spawn the `writer` agent exactly once for run directory {run_dir}. Tell it:
+
+- This is the run's final write-up. The final gate's verdict is in
+  {run_dir}/final_gate.json (action: {action}; unresolved blocking findings:
+  {n_high}). If the action is not ACCEPT, the report's first section is
+  "Status: not accepted by the final gate": the verdict and each unresolved
+  blocking finding in plain words. The model is then presented as what was
+  built and where it fell short, never as a recommendation; any allocation
+  is labelled illustrative.
+- Write the draft to {run_dir}/manuscript.md from the artifacts that exist
+  (plan, data, models, results, critiques). Missing pieces are stated as
+  missing, not invented.
+
+Do nothing else; the harness renders report.md afterwards."""
+
+
+async def final_writeup(run_path, run_dir_rel, question, max_rounds, budget, cap, session_num,
+                        outcome, integrity=None, query_fn=None) -> dict:
+    """Phase 29: when the modeling sessions end without a report (final-round
+    RUN_FAILED, budget, sessions, crash), run the final gate and one writer
+    session paid from the write-up reserve, so every run leaves a report that
+    states its verdict. Never raises into finalize."""
+    info = {"ran": False}
+    try:
+        gate = run_final_gate(run_path, max_rounds) or {}
+        n_high = len(gate.get("unresolved_high") or []) if isinstance(gate.get("unresolved_high"), list) \
+            else gate.get("n_unresolved_high")
+        left = remaining_budget(cap, budget["sessions"])
+        if left is not None and left <= 0:
+            info.update(skipped="no budget left for the write-up")
+            return info
+        agents = {"writer": build_agents(question=question, run_dir=run_dir_rel)["writer"]}
+        trace = open(os.path.join(run_path, "trace.jsonl"), "a")
+        hooks = create_hooks(run_path, trace, datetime.now(), registered_agents={"writer"},
+                             max_turns={"writer": agents["writer"].maxTurns}, integrity=integrity)
+        options = ClaudeAgentOptions(
+            system_prompt="You are the harness's final write-up step. Follow the instructions literally.",
+            agents=agents, model=(smoke_settings() or {}).get("model", enforcement.MODEL_DEEP),
+            max_buffer_size=enforcement.MAX_BUFFER_SIZE, tools=LEAD_TOOLS, allowed_tools=LEAD_TOOLS,
+            permission_mode="bypassPermissions", setting_sources=["project"], hooks=hooks,
+            cwd=REPO_ROOT, env=enforcement.filtered_env(dict(os.environ), False), max_turns=8)
+        if left is not None:
+            options.max_budget_usd = left
+        prompt = WRITEUP_PROMPT.format(outcome=outcome, run_dir=run_dir_rel,
+                                       action=gate.get("action") or gate.get("error") or "not run",
+                                       n_high=n_high if n_high is not None else "unknown")
+        print(f"\nFINAL WRITE-UP (gate: {gate.get('action')}; budget left ${left})", flush=True)
+        result = None
+        async for m in (query_fn or query)(prompt=prompt, options=options):
+            log_message(m, trace)
+            if isinstance(m, ResultMessage):
+                result = m
+        charge_session(budget, session_num, result, left, session_id=getattr(result, "session_id", None),
+                       elapsed_s=None, source="final write-up")
+        write_budget_ledger(run_path, budget, cap, integrity)
+        info.update(ran=True, gate_action=gate.get("action"),
+                    manuscript=os.path.exists(os.path.join(run_path, "manuscript.md")))
+    except Exception as e:  # noqa: BLE001 — finalize still runs; the gap is recorded
+        info.update(error=f"{type(e).__name__}: {e}"[:300])
+        print(f"[ERROR] final write-up failed: {info['error']}", flush=True)
+    try:
+        mp = os.path.join(run_path, "metadata.json")
+        meta = json.load(open(mp))
+        meta["final_writeup"] = info
+        json.dump(meta, open(mp, "w"), indent=2)
+    except (OSError, ValueError):
+        pass
+    return info
 
 
 def _sdk_version() -> str | None:
