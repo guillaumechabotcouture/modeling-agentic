@@ -93,7 +93,11 @@ async def reconcile_conversation_cost(options, session_id: str, timeout_s: float
     async def go():
         async for m in qf(prompt=RECONCILE_PROMPT, options=probe):
             if isinstance(m, ResultMessage):
-                return m
+                # The read-back turn itself costs something: an error result or a
+                # zero cost means the conversation was not actually resumed.
+                ok_ = (not m.is_error and isinstance(m.total_cost_usd, (int, float))
+                       and m.total_cost_usd > 0 and (m.session_id in (None, session_id)))
+                return m if ok_ else None
         return None
     try:
         return await asyncio.wait_for(go(), timeout_s)
@@ -1615,6 +1619,12 @@ def _run_self_test() -> int:
         ok(_r is not None and _r.total_cost_usd == 62.5, f"CR18 read-back resumes the conversation tool-less: {_r}")
         ok(asyncio.run(reconcile_conversation_cost(_opts, "s1", query_fn=_fq_fail)) is None,
            "CR18 an unreadable cost returns None (then the allowance is charged)")
+
+        async def _fq_zero(prompt, options):
+            yield ResultMessage(subtype="error_during_execution", duration_ms=1, duration_api_ms=0,
+                                is_error=True, num_turns=0, session_id="s1", total_cost_usd=0.0)
+        ok(asyncio.run(reconcile_conversation_cost(_opts, "s1", query_fn=_fq_zero)) is None,
+           "CR18 an error or zero-cost read-back is not a cost reading (crash smoke 5 read back $0.00)")
         write_budget_ledger(td, led, 5.0)
         again = load_budget_ledger(td)
         ok(remaining_budget(5.0, again["sessions"]) == 0 and again["spent_usd"] == 5.0
