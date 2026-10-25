@@ -484,8 +484,11 @@ def restore_report_if_missing(run_path: str) -> bool:
         # Phase 25: the writer's draft exists but the render step never ran.
         # Build report.md from it (render_claims falls back to the draft
         # itself when references cannot be resolved).
-        r = subprocess.run([sys.executable, os.path.join(REPO_ROOT, "scripts", "render_claims.py"), run_path],
-                           capture_output=True, text=True, timeout=600)
+        try:
+            r = subprocess.run([sys.executable, os.path.join(REPO_ROOT, "scripts", "render_claims.py"), run_path],
+                               capture_output=True, text=True, timeout=600)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            r = subprocess.CompletedProcess([], 1, "", f"{type(e).__name__}: {e}")
         if os.path.exists(report_path):
             print("[WARNING] report.md was missing at run end; rendered from manuscript.md.",
                   file=sys.stderr, flush=True)
@@ -1544,7 +1547,8 @@ def _run_self_test() -> int:
     # REPORT*/SUMMARY*/FINDINGS*/ANALYSIS*.md. E7 lost two full runs to it
     # (the writer was told to write report.md). No agent prompt may instruct
     # a Write to such a name.
-    _blocked = re.compile(r"(?i)^\s*(?:#+\s*)?(?:write|save)\b[^\n]*?\b((?:report|summary|findings|analysis)[\w.-]*\.md)\b")
+    _blocked = re.compile(r"(?i)\b(?:write|writes|save|emit|edit|add|insert|append|update|put|create)\b"
+                          r"[^\n]*?\b((?:report|summary|findings|analysis)[\w.-]*\.md)\b")
     from agents import build_agents as _ba
     _bad = []
     for _name, _d in _ba(question="malaria smoke", run_dir="runs/x").items():
@@ -1560,6 +1564,55 @@ def _run_self_test() -> int:
                                                     sdk_version="0.2.174", sdk_pinned="0.2.169")),
        "WD4 preflight must fail when the installed SDK differs from the pinned one")
     ok(pinned_sdk_version() is not None, "WD4 requirements.txt pins claude-agent-sdk")
+    # WD5 (Codex, PR #21): a render that times out still ends with report.md.
+    _rd5 = tempfile.mkdtemp()
+    open(os.path.join(_rd5, WRITER_DRAFT), "w").write("# Draft\n")
+    _real_run = subprocess.run
+
+    def _timeout_run(*a, **k):
+        raise subprocess.TimeoutExpired(a[0] if a else "render", 600)
+    subprocess.run = _timeout_run
+    try:
+        ok(restore_report_if_missing(_rd5) and os.path.exists(os.path.join(_rd5, "report.md")),
+           "WD5 a render timeout must still leave report.md (copied draft)")
+    except subprocess.TimeoutExpired:
+        ok(False, "WD5 a render timeout escaped finalize")
+    finally:
+        subprocess.run = _real_run
+        shutil.rmtree(_rd5, ignore_errors=True)
+
+    # WD6 (Codex, PR #21): the write probe passes only on a SUCCESSFUL Write
+    # issued inside the subagent, never on a refused one plus a lead Write.
+    from claude_agent_sdk import ToolUseBlock as _TU, ToolResultBlock as _TR
+
+    def _fake_query(child_error, lead_writes):
+        async def q(prompt, options):
+            path = re.search(r"file path: (\S+?)\. ", prompt).group(1)
+            yield AssistantMessage(content=[_TU("w1", "Write", {"file_path": path, "content": "PREFLIGHT_WRITE"})],
+                                   model="m", parent_tool_use_id="a1")
+            if not child_error:
+                open(path, "w").write("PREFLIGHT_WRITE")
+            yield UserMessage(content=[_TR("w1", "refused" if child_error else "ok", is_error=child_error)],
+                              parent_tool_use_id="a1")
+            if lead_writes:
+                yield AssistantMessage(content=[_TU("w2", "Write", {"file_path": path, "content": "PREFLIGHT_WRITE"})],
+                                       model="m")
+                open(path, "w").write("PREFLIGHT_WRITE")
+                yield UserMessage(content=[_TR("w2", "ok", is_error=False)])
+            yield ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+                                num_turns=1, session_id="s", total_cost_usd=0.0)
+        return q
+    _real_query = globals()["query"]
+    try:
+        globals()["query"] = _fake_query(child_error=True, lead_writes=True)
+        _w, _log, _ = asyncio.run(_probe_subagent_write(False))
+        ok(not _w, "WD6 a refused subagent Write followed by the lead's Write must fail the probe")
+        globals()["query"] = _fake_query(child_error=False, lead_writes=False)
+        _w, _log, _ = asyncio.run(_probe_subagent_write(False))
+        ok(_w, f"WD6 a successful subagent Write must pass the probe: {_log[-200:]}")
+    finally:
+        globals()["query"] = _real_query
+
     _rd = tempfile.mkdtemp()
     open(os.path.join(_rd, WRITER_DRAFT), "w").write("# Draft\n\nNo references.\n")
     ok(restore_report_if_missing(_rd) and os.path.exists(os.path.join(_rd, "report.md")),
@@ -1747,24 +1800,37 @@ async def _probe_subagent_write(allow_cloud: bool, attempts: int = 2) -> tuple[b
             agents={"write-probe": probe}, tools=LEAD_TOOLS, allowed_tools=LEAD_TOOLS,
             permission_mode="bypassPermissions", setting_sources=[], cwd=REPO_ROOT,
             env=enforcement.filtered_env(dict(os.environ), allow_cloud), max_turns=4)
-        by_subagent = False
+        by_subagent, sub_ids, lead_wrote, write_ok = False, set(), False, False
         async for m in query(prompt=f"Spawn the `write-probe` agent and give it this file path: {wpath}. "
                                     f"Do not write anything yourself. Reply with what it reported.",
                              options=options):
-            if isinstance(m, AssistantMessage) and getattr(m, "parent_tool_use_id", None):
-                # Only a Write issued inside the subagent counts, not the lead's own.
+            if isinstance(m, AssistantMessage):
                 for b in m.content:
-                    if getattr(b, "name", None) == "Write" and \
-                            os.path.realpath(str((getattr(b, "input", None) or {}).get("file_path", ""))) == os.path.realpath(wpath):
-                        by_subagent = True
+                    if getattr(b, "name", None) != "Write":
+                        continue
+                    if getattr(m, "parent_tool_use_id", None):
+                        # A Write issued inside the subagent...
+                        if os.path.realpath(str((getattr(b, "input", None) or {}).get("file_path", ""))) \
+                                == os.path.realpath(wpath):
+                            by_subagent = True
+                            sub_ids.add(getattr(b, "id", None))
+                    else:
+                        lead_wrote = True        # ...not the lead's own
             if isinstance(m, UserMessage) and isinstance(m.content, list):
+                for b in m.content:
+                    # ...and its result must not be an error (a refused Write).
+                    if getattr(b, "tool_use_id", None) in sub_ids and not getattr(b, "is_error", False):
+                        write_ok = True
                 for b in m.content:
                     c = getattr(b, "content", None)
                     log.append(c if isinstance(c, str) else json.dumps(c, default=str)[:500])
             elif isinstance(m, ResultMessage):
                 cost += m.total_cost_usd or 0
                 log.append(f"[attempt {attempt + 1}] result: {(m.result or '')[:300]}")
-        wrote = by_subagent and os.path.exists(wpath) and "PREFLIGHT_WRITE" in open(wpath).read()
+        wrote = (by_subagent and write_ok and not lead_wrote
+                 and os.path.exists(wpath) and "PREFLIGHT_WRITE" in open(wpath).read())
+        if lead_wrote:
+            log.append(f"[attempt {attempt + 1}] the lead used Write itself; not a subagent test")
         if not by_subagent and os.path.exists(wpath):
             log.append(f"[attempt {attempt + 1}] the file was written, but not by the subagent")
         shutil.rmtree(wdir, ignore_errors=True)

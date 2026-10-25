@@ -124,8 +124,8 @@ claims must reference the ledger.
 
 ### What gets caught
 
-The coherence auditor's `ledger_binding` duty (Phase 18 β) scans your
-finished `report.md` for any numeric, percentage, currency, or verdict
+The coherence auditor's `ledger_binding` duty (Phase 18 β) scans the
+finished `report.md` (rendered from your `manuscript.md`) for any numeric, percentage, currency, or verdict
 label that is NOT covered by a `[CLAIM:id]` reference and is not in the
 ledger. Each such drift is a HIGH violation. The structural fix
 eliminates the entire R-019 / R-020 / $197M-conflation class — your
@@ -136,7 +136,7 @@ prose cannot drift if it is not free to re-narrate.
 Do NOT add the number directly to the report. Instead:
 1. Stop drafting that sentence.
 2. Re-read `models/claims_ledger.yaml` to confirm it's truly absent.
-3. If absent: emit a TODO comment in `report.md` noting the missing
+3. If absent: emit a TODO comment in `manuscript.md` noting the missing
    claim ID, and continue drafting the rest. The lead will route the
    missing-claim list back to the analyst to add to the claims spec.
 
