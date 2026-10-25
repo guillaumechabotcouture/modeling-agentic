@@ -76,6 +76,10 @@ def load_budget_ledger(run_path: str) -> dict:
 # fitted on 96 E5 cases (median error 10%). Unknown models get the highest rate.
 USD_PER_WEIGHTED_TOKEN = {"claude-opus-5-5": 4.131e-6, "claude-sonnet-5-5": 3.08e-6}
 ESTIMATE_MARGIN = 1.2
+# No transcript to estimate from: an upper bound from the session's duration.
+# ~2x the highest hourly spend observed (E7 runs averaged ~$25-30/h); the SDK
+# already stops any session at the remaining allowance (options.max_budget_usd).
+MAX_USD_PER_HOUR = 60.0
 
 
 def estimate_session_cost(since: datetime, projects_dir: str | None = None) -> float | None:
@@ -121,7 +125,8 @@ def estimate_session_cost(since: datetime, projects_dir: str | None = None) -> f
 
 
 def charge_session(ledger: dict, session: int, result, allowance: float | None,
-                   estimate: float | None = None, session_id: str | None = None) -> dict:
+                   estimate: float | None = None, session_id: str | None = None,
+                   elapsed_s: float | None = None) -> dict:
     """Record one session's spend. A session that ended without a cost
     (disconnect, crash) is charged its transcript-based estimate (+20%), so a
     crash does not end the run (E7 attempt 5: a $62 session was charged the
@@ -143,6 +148,12 @@ def charge_session(ledger: dict, session: int, result, allowance: float | None,
         entry = {"session": session, "session_id": session_id,
                  "total_cost_usd": round(charged, 4), "estimated_usd": estimate,
                  "source": "estimated from the CLI transcripts (+20%); the session ended without a cost"}
+    elif isinstance(elapsed_s, (int, float)):
+        bound = max(elapsed_s, 0) / 3600 * MAX_USD_PER_HOUR
+        charged = bound if allowance is None else min(bound, allowance)
+        entry = {"session": session, "session_id": session_id, "total_cost_usd": round(charged, 4),
+                 "source": f"upper bound: {elapsed_s:.0f}s at ${MAX_USD_PER_HOUR:.0f}/h "
+                           "(no cost report and no transcript)"}
     else:
         entry = {"session": session, "total_cost_usd": round(allowance or 0, 4),
                  "source": "unreconciled: charged the full remaining allowance"}
@@ -753,7 +764,8 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                     session_records.append({"session": session_num, **result_summary(result)})
                 charge_session(budget, session_num, result, left,
                                estimate=None if result is not None else estimate_session_cost(session_started),
-                               session_id=session_id)
+                               session_id=session_id,
+                               elapsed_s=(datetime.now().astimezone() - session_started).total_seconds())
                 write_budget_ledger(run_path, budget, max_budget_usd, integrity)
                 try:
                     trace_file.close()
@@ -1605,8 +1617,15 @@ def _run_self_test() -> int:
         ok(abs(sum(e["total_cost_usd"] for e in _lc4["sessions"]) - 74.4) < 1e-6,
            f"CR17 a report below the estimate never refunds (conservative): {_lc4}")
         _lc2 = {"sessions": []}
-        charge_session(_lc2, 1, None, 450.0, estimate=None)
-        ok(remaining_budget(450.0, _lc2["sessions"]) <= 0, "CR15 no estimate: the whole allowance (fail closed)")
+        charge_session(_lc2, 1, None, 8.0, estimate=None, elapsed_s=6.0)
+        ok(_lc2["sessions"][0]["total_cost_usd"] < 0.2 and remaining_budget(8.0, _lc2["sessions"]) > 7.5,
+           f"CR18 no transcript: a duration bound, not the whole allowance (crash smoke 3): {_lc2}")
+        _lc5 = {"sessions": []}
+        charge_session(_lc5, 1, None, 100.0, estimate=None, elapsed_s=3 * 3600)
+        ok(_lc5["sessions"][0]["total_cost_usd"] == 100.0, "CR18 the bound never exceeds the allowance")
+        _lc6 = {"sessions": []}
+        charge_session(_lc6, 1, None, 450.0)
+        ok(remaining_budget(450.0, _lc6["sessions"]) <= 0, "CR18 nothing known at all: the whole allowance")
         _pd = tempfile.mkdtemp()
         os.makedirs(os.path.join(_pd, "k", "sess", "subagents"))
         _t0 = datetime.now().astimezone()
