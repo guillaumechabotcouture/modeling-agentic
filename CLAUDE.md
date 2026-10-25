@@ -157,7 +157,8 @@ for f in main.py \
   scripts/optimization_quality.py scripts/plan_criteria.py \
   scripts/propagate_uncertainty.py scripts/render_claims.py \
   scripts/results_store.py \
-  scripts/sanity_checks.py scripts/sensitivity_analysis.py \
+  scripts/sanity_checks.py scripts/sdk_scenarios.py \
+  scripts/sensitivity_analysis.py \
   scripts/source_checks.py \
   scripts/spec_compliance.py scripts/validate_critique_yaml.py \
   scripts/validate_skill_attachments.py \

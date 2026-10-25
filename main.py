@@ -72,19 +72,68 @@ def load_budget_ledger(run_path: str) -> dict:
     return {"sessions": []}
 
 
-def charge_session(ledger: dict, session: int, result, allowance: float | None) -> dict:
-    """Record one session's spend. A session that ended without a cost
-    (disconnect, crash) is charged its whole remaining allowance: the cap
-    errs toward stopping, never toward overspending (Codex review, PR #15)."""
+# Phase 28: a session that dies before starting its conversation (no session
+# id: no API call yet) is charged an upper bound from its duration, ~2x the
+# highest hourly spend observed (E7 runs averaged ~$25-30/h).
+MAX_USD_PER_HOUR = 60.0
+RECONCILE_PROMPT = ("The previous session was interrupted by a crash. Reply with the single word OK "
+                    "and do nothing else; the harness is reading this conversation's cost.")
+
+
+async def reconcile_conversation_cost(options, session_id: str, timeout_s: float = 300, query_fn=None):
+    """After a crash, the conversation's true cumulative cost: resume it for
+    one tool-less turn; the SDK reports cumulative cost for a resumed
+    conversation (verified 2026-10-23, crash smokes 2026-10-25). Returns the
+    ResultMessage, or None if it cannot be read (API down, timeout)."""
+    import dataclasses
+    probe = dataclasses.replace(options, resume=session_id, max_turns=1, tools=[], allowed_tools=[],
+                                agents={}, hooks=None, max_budget_usd=None)
+    qf = query_fn or query
+
+    async def go():
+        async for m in qf(prompt=RECONCILE_PROMPT, options=probe):
+            if isinstance(m, ResultMessage):
+                # The read-back turn itself costs something: an error result or a
+                # zero cost means the conversation was not actually resumed.
+                ok_ = (not m.is_error and isinstance(m.total_cost_usd, (int, float))
+                       and m.total_cost_usd > 0 and (m.session_id in (None, session_id)))
+                return m if ok_ else None
+        return None
+    try:
+        return await asyncio.wait_for(go(), timeout_s)
+    except Exception:  # noqa: BLE001 — unknown cost: the caller charges the allowance
+        return None
+
+
+def charge_session(ledger: dict, session: int, result, allowance: float | None,
+                   session_id: str | None = None, elapsed_s: float | None = None,
+                   source: str = "result") -> dict:
+    """Record one session's spend.
+    - A cost report (the session's own, or after a crash the cumulative cost
+      read back by resuming the conversation): charged exactly.
+    - Crashed before its conversation started (no session id, so no API
+      call): an upper bound from its duration.
+    - Otherwise (cost unreadable): the whole remaining allowance, so the cap
+      can never be exceeded (Codex reviews, PR #15 and #23).
+    E7 attempt 5: a ~$62 crashed session was charged the whole $450 and the
+    run stopped; reading the true cost back lets the run continue."""
     cost = getattr(result, "total_cost_usd", None) if result is not None else None
     if isinstance(cost, (int, float)):
         # The SDK reports CUMULATIVE cost for a resumed conversation (same
         # session_id; verified 2026-10-23): charge only the increase.
         sid = getattr(result, "session_id", None)
-        prev = max((e.get("reported_usd") or 0 for e in ledger.get("sessions", [])
-                    if sid and e.get("session_id") == sid), default=0)
+        # Everything already charged to this conversation, including a crashed
+        # session's read-back: each report adds only its increase.
+        prev = sum(e.get("total_cost_usd") or 0 for e in ledger.get("sessions", [])
+                   if sid and e.get("session_id") == sid)
         entry = {"session": session, "session_id": sid, "reported_usd": round(cost, 4),
-                 "total_cost_usd": round(max(cost - prev, 0), 4), "source": "result"}
+                 "total_cost_usd": round(max(cost - prev, 0), 4), "source": source}
+    elif session_id is None and isinstance(elapsed_s, (int, float)):
+        bound = max(elapsed_s, 0) / 3600 * MAX_USD_PER_HOUR
+        charged = bound if allowance is None else min(bound, allowance)
+        entry = {"session": session, "session_id": session_id, "total_cost_usd": round(charged, 4),
+                 "source": f"upper bound: {elapsed_s:.0f}s at ${MAX_USD_PER_HOUR:.0f}/h "
+                           "(crashed before its conversation started)"}
     else:
         entry = {"session": session, "total_cost_usd": round(allowance or 0, 4),
                  "source": "unreconciled: charged the full remaining allowance"}
@@ -667,6 +716,7 @@ async def run(question: str, max_rounds: int, max_sessions: int,
 
             result = None
             error_str = None
+            session_started = datetime.now().astimezone()
             try:
                 cleanup_orphaned_claude_processes()
 
@@ -692,7 +742,16 @@ async def run(question: str, max_rounds: int, max_sessions: int,
             finally:
                 if result is not None:
                     session_records.append({"session": session_num, **result_summary(result)})
-                charge_session(budget, session_num, result, left)
+                charged_from, source = result, "result"
+                if result is None and session_id and not interrupted:
+                    charged_from = await reconcile_conversation_cost(options, session_id)
+                    source = "reconciled: cumulative cost read back after a crash"
+                    print(f"[budget] session {session_num} ended without a cost; read back "
+                          f"{'$%.4f cumulative' % charged_from.total_cost_usd if charged_from and charged_from.total_cost_usd is not None else 'nothing (charging the allowance)'}",
+                          flush=True)
+                charge_session(budget, session_num, charged_from, left, session_id=session_id,
+                               elapsed_s=(datetime.now().astimezone() - session_started).total_seconds(),
+                               source=source)
                 write_budget_ledger(run_path, budget, max_budget_usd, integrity)
                 try:
                     trace_file.close()
@@ -1523,6 +1582,49 @@ def _run_self_test() -> int:
         led = load_budget_ledger(td)
         charge_session(led, 1, R(4.0), 5.0)
         charge_session(led, 2, None, remaining_budget(5.0, led["sessions"]))
+        # CR15-CR18 (Phase 28): crashed sessions.
+        class _R2:
+            def __init__(self, c, sid):
+                self.total_cost_usd, self.session_id = c, sid
+        _lc = {"sessions": []}
+        charge_session(_lc, 1, _R2(62.0, "s1"), 450.0, session_id="s1", source="reconciled")
+        ok(_lc["sessions"][0]["total_cost_usd"] == 62.0 and remaining_budget(450.0, _lc["sessions"]) > 380,
+           f"CR15 a crashed session is charged its read-back cost, not the cap: {_lc}")
+        charge_session(_lc, 2, _R2(100.0, "s1"), 388.0)
+        ok(abs(sum(e["total_cost_usd"] for e in _lc["sessions"]) - 100.0) < 1e-6,
+           f"CR16 the next cumulative report adds only the increase: {_lc}")
+        _lc2 = {"sessions": []}
+        charge_session(_lc2, 1, None, 8.0, session_id=None, elapsed_s=6.0)
+        ok(_lc2["sessions"][0]["total_cost_usd"] < 0.2 and remaining_budget(8.0, _lc2["sessions"]) > 7.5,
+           f"CR17 crashed before its conversation started: a duration bound: {_lc2}")
+        _lc5 = {"sessions": []}
+        charge_session(_lc5, 1, None, 100.0, session_id=None, elapsed_s=3 * 3600)
+        ok(_lc5["sessions"][0]["total_cost_usd"] == 100.0, "CR17 the bound never exceeds the allowance")
+        _lc6 = {"sessions": []}
+        charge_session(_lc6, 1, None, 450.0, session_id="s1", elapsed_s=60.0)
+        ok(remaining_budget(450.0, _lc6["sessions"]) <= 0,
+           "CR18 a started conversation whose cost cannot be read is charged the whole allowance (cap holds)")
+
+        async def _fq_ok(prompt, options):
+            assert options.resume == "s1" and options.max_turns == 1 and options.tools == []
+            yield ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+                                num_turns=1, session_id="s1", total_cost_usd=62.5)
+
+        async def _fq_fail(prompt, options):
+            raise RuntimeError("api down")
+            yield  # pragma: no cover
+        _opts = ClaudeAgentOptions(model="m", tools=["Bash"], allowed_tools=["Bash"], max_turns=50,
+                                   max_buffer_size=enforcement.MAX_BUFFER_SIZE)
+        _r = asyncio.run(reconcile_conversation_cost(_opts, "s1", query_fn=_fq_ok))
+        ok(_r is not None and _r.total_cost_usd == 62.5, f"CR18 read-back resumes the conversation tool-less: {_r}")
+        ok(asyncio.run(reconcile_conversation_cost(_opts, "s1", query_fn=_fq_fail)) is None,
+           "CR18 an unreadable cost returns None (then the allowance is charged)")
+
+        async def _fq_zero(prompt, options):
+            yield ResultMessage(subtype="error_during_execution", duration_ms=1, duration_api_ms=0,
+                                is_error=True, num_turns=0, session_id="s1", total_cost_usd=0.0)
+        ok(asyncio.run(reconcile_conversation_cost(_opts, "s1", query_fn=_fq_zero)) is None,
+           "CR18 an error or zero-cost read-back is not a cost reading (crash smoke 5 read back $0.00)")
         write_budget_ledger(td, led, 5.0)
         again = load_budget_ledger(td)
         ok(remaining_budget(5.0, again["sessions"]) == 0 and again["spent_usd"] == 5.0
