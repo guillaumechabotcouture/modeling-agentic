@@ -1556,6 +1556,10 @@ def _run_self_test() -> int:
     ok(evaluate_preflight(good_pf := f"PREFLIGHT_OK {sys.executable}\nPREFLIGHT_OK {sys.executable}",
                           {enforcement.MODEL_DEEP: {}}, False, subagent_wrote=False),
        "WD2 preflight must fail when the subagent cannot Write the writer's draft")
+    ok(any("pinned" in p for p in evaluate_preflight(good_pf, {enforcement.MODEL_DEEP: {}}, False,
+                                                    sdk_version="0.2.174", sdk_pinned="0.2.169")),
+       "WD4 preflight must fail when the installed SDK differs from the pinned one")
+    ok(pinned_sdk_version() is not None, "WD4 requirements.txt pins claude-agent-sdk")
     _rd = tempfile.mkdtemp()
     open(os.path.join(_rd, WRITER_DRAFT), "w").write("# Draft\n\nNo references.\n")
     ok(restore_report_if_missing(_rd) and os.path.exists(os.path.join(_rd, "report.md")),
@@ -1609,12 +1613,29 @@ def preflight_command() -> str:
             f"print('PREFLIGHT_OK', sys.executable)\"")
 
 
+def pinned_sdk_version() -> str | None:
+    """claude-agent-sdk version pinned in requirements.txt."""
+    try:
+        for line in open(os.path.join(REPO_ROOT, "requirements.txt")):
+            m = re.match(r"\s*claude-agent-sdk==([\w.]+)", line)
+            if m:
+                return m.group(1)
+    except OSError:
+        pass
+    return None
+
+
 def evaluate_preflight(text: str, model_usage: dict | None,
-                       is_error: bool, subagent_wrote: bool | None = None) -> list[str]:
+                       is_error: bool, subagent_wrote: bool | None = None,
+                       sdk_version: str | None = None, sdk_pinned: str | None = None) -> list[str]:
     """Return problems found (empty list = pass). Pure, so it is self-tested.
     subagent_wrote: whether the probe subagent's Write of the writer's draft
     file name landed on disk (Phase 25; None = not checked)."""
     problems = []
+    if sdk_pinned and sdk_version and sdk_version != sdk_pinned:
+        # The bundled CLI changes behaviour between versions (Phase 25: a
+        # subagent Write rule cost two full E7 runs); test what is pinned.
+        problems.append(f"claude-agent-sdk {sdk_version} installed, {sdk_pinned} pinned in requirements.txt")
     if subagent_wrote is False:
         problems.append(f"a subagent could not Write {WRITER_DRAFT} (the writer's draft); "
                         f"the WRITE stage would fail")
@@ -1698,7 +1719,8 @@ async def run_preflight(allow_cloud: bool = False) -> dict:
     wrote = os.path.exists(wpath) and "PREFLIGHT_WRITE" in open(wpath).read()
     shutil.rmtree(wdir, ignore_errors=True)
     problems = evaluate_preflight("\n".join(texts), usage,
-                                  bool(result is None or result.is_error), subagent_wrote=wrote)
+                                  bool(result is None or result.is_error), subagent_wrote=wrote,
+                                  sdk_version=_sdk_version(), sdk_pinned=pinned_sdk_version())
     return {"ok": not problems, "problems": problems,
             "model_usage": usage,
             "cost_usd": getattr(result, "total_cost_usd", None) if result else None,
