@@ -609,6 +609,12 @@ async def run(question: str, max_rounds: int, max_sessions: int,
           f" | Methods critic: {'on' if methods_critic else 'off'}", flush=True)
 
     run_start = datetime.now()
+    # Phase 29: live status, resource samples and storage checkpoints.
+    from agents import observability
+    live_state = observability.LiveState()
+    heartbeat = observability.Heartbeat(run_path, live_state, run_start,
+                                        uploader=observability.storage_uploader(run_path))
+    heartbeat.start()
     trace_path = os.path.join(run_path, "trace.jsonl")
     metadata_path = os.path.join(run_path, "metadata.json")
     with open(metadata_path) as f:
@@ -668,6 +674,7 @@ async def run(question: str, max_rounds: int, max_sessions: int,
 
     try:
         for session_num in range(1, max_sessions + 1):
+            live_state.session = session_num
             print(f"\n{'#'*60}", flush=True)
             print(f"SESSION {session_num}/{max_sessions}", flush=True)
             print(f"{'#'*60}", flush=True)
@@ -722,6 +729,7 @@ async def run(question: str, max_rounds: int, max_sessions: int,
 
                 async for message in query(prompt=lead_prompt, options=options):
                     log_message(message, trace_file)
+                    live_state.on_message(message)
                     if (isinstance(message, SystemMessage)
                             and message.subtype == "init"):
                         session_id = (message.data or {}).get("session_id") or session_id
@@ -832,6 +840,7 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                                             methods_critic=methods_critic)
             print(f"Restarting pipeline (session {session_num + 1})...", flush=True)
     finally:
+        heartbeat.stop()          # last status + checkpoint before the final gate and storage
         status = finalize_run(
             run_path, run_dir_rel, run_start, max_rounds, session_outcome,
             session_num, session_id, session_records, harness_before,
@@ -1745,6 +1754,11 @@ def _run_self_test() -> int:
     ok(store_run_results(_run) is None or os.environ.get("MA_STORAGE_ACCOUNT"),
        "ST1 nothing is stored when no account is configured")
     shutil.rmtree(_sr, ignore_errors=True)
+
+    # OB (Phase 29): live status, resources, checkpoints.
+    from agents import observability as _ob
+    for _f in _ob.self_test():
+        ok(False, _f)
 
     # WD5 (Codex, PR #21): a render that times out still ends with report.md.
     _rd5 = tempfile.mkdtemp()
