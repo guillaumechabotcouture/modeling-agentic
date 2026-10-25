@@ -141,9 +141,16 @@ def calibrate_costs(rows, run_dir=None):
     if run_dir:
         try:
             meta = json.load(open(os.path.join(run_dir, "metadata.json")))
-            for s in meta.get("session_results") or []:
+            # Costs are CUMULATIVE within a resumed conversation (same
+            # session_id): take each conversation's maximum per model, then sum
+            # across conversations (summing sessions over-counted; Codex, Phase 29).
+            by_conv = collections.defaultdict(collections.Counter)
+            for i, s in enumerate(meta.get("session_results") or []):
+                conv = s.get("session_id") or f"_nosid{i}"
                 for model, mu in (s.get("model_usage") or {}).items():
-                    recorded[model] += mu.get("costUSD") or 0
+                    by_conv[conv][model] = max(by_conv[conv][model], mu.get("costUSD") or 0)
+            for c in by_conv.values():
+                recorded.update(c)
         except (OSError, ValueError):
             pass
     weight = collections.Counter()
@@ -213,6 +220,13 @@ def _self_test() -> int:
         ok(abs(sum(r["cost_usd"] for r in rows) - 10.0) < 1e-6 and rec == {"claude-opus-5-5": 10.0},
            "T5 calibrated costs sum to recorded total")
         ok(mod[1]["cost_usd"] > rows[0]["cost_usd"], "T6 bigger context costs more")
+        json.dump({"session_results": [
+            {"session_id": "c1", "model_usage": {"claude-opus-5-5": {"costUSD": 100.0}}},
+            {"session_id": "c1", "model_usage": {"claude-opus-5-5": {"costUSD": 150.0}}},
+            {"session_id": "c2", "model_usage": {"claude-opus-5-5": {"costUSD": 20.0}}}]},
+            open(os.path.join(rd, "metadata.json"), "w"))
+        ok(calibrate_costs(rows, rd) == {"claude-opus-5-5": 170.0},
+           "T5b a resumed conversation counts once (100 then 150 cumulative = 150), plus other conversations")
         ok("MODEL" in summarize(rows) and "TOTAL turns=3" in summarize(rows), "T7 summary")
     if failures:
         print("SELF-TEST FAILURES:", *failures, sep="\n  - ")
