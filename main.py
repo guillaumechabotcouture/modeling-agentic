@@ -747,7 +747,7 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                     charged_from = await reconcile_conversation_cost(options, session_id)
                     source = "reconciled: cumulative cost read back after a crash"
                     print(f"[budget] session {session_num} ended without a cost; read back "
-                          f"{'$%.2f cumulative' % charged_from.total_cost_usd if charged_from and charged_from.total_cost_usd is not None else 'nothing (charging the allowance)'}",
+                          f"{'$%.4f cumulative' % charged_from.total_cost_usd if charged_from and charged_from.total_cost_usd is not None else 'nothing (charging the allowance)'}",
                           flush=True)
                 charge_session(budget, session_num, charged_from, left, session_id=session_id,
                                elapsed_s=(datetime.now().astimezone() - session_started).total_seconds(),
