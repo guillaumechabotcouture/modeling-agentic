@@ -72,10 +72,61 @@ def load_budget_ledger(run_path: str) -> dict:
     return {"sessions": []}
 
 
-def charge_session(ledger: dict, session: int, result, allowance: float | None) -> dict:
+# Phase 28: $ per weighted token (scripts/telemetry.py RATIOS weighting),
+# fitted on 96 E5 cases (median error 10%). Unknown models get the highest rate.
+USD_PER_WEIGHTED_TOKEN = {"claude-opus-5-5": 4.131e-6, "claude-sonnet-5-5": 3.08e-6}
+ESTIMATE_MARGIN = 1.2
+
+
+def estimate_session_cost(since: datetime, projects_dir: str | None = None) -> float | None:
+    """Estimated cost of the conversation turns recorded since `since`, from
+    the CLI's own transcripts (each message once; +20% margin). None when no
+    transcript turns are found: the caller then falls back to the allowance."""
+    import glob as _glob
+    projects_dir = projects_dir or os.path.expanduser("~/.claude/projects")
+    ratios = {"input_tokens": 1.0, "cache_read_input_tokens": 0.1,
+              "cache_creation_input_tokens": 1.25, "output_tokens": 5.0}
+    top = max(USD_PER_WEIGHTED_TOKEN.values())
+    seen, usd = set(), 0.0
+    since_s = since.timestamp()
+    for path in _glob.glob(os.path.join(projects_dir, "**", "*.jsonl"), recursive=True):
+        try:
+            if os.path.getmtime(path) < since_s:
+                continue
+            fh = open(path, errors="replace")
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                if '"usage"' not in line:
+                    continue
+                try:
+                    j = json.loads(line)
+                except ValueError:
+                    continue
+                m = j.get("message") or {}
+                u, mid = m.get("usage"), m.get("id")
+                ts = j.get("timestamp")
+                if not u or not mid or mid in seen or not ts:
+                    continue
+                try:
+                    if datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp() < since_s:
+                        continue
+                except ValueError:
+                    continue
+                seen.add(mid)
+                w = sum(float(u.get(k) or 0) * r for k, r in ratios.items())
+                usd += w * USD_PER_WEIGHTED_TOKEN.get(m.get("model"), top)
+    return round(usd * ESTIMATE_MARGIN, 4) if seen else None
+
+
+def charge_session(ledger: dict, session: int, result, allowance: float | None,
+                   estimate: float | None = None) -> dict:
     """Record one session's spend. A session that ended without a cost
-    (disconnect, crash) is charged its whole remaining allowance: the cap
-    errs toward stopping, never toward overspending (Codex review, PR #15)."""
+    (disconnect, crash) is charged its transcript-based estimate (+20%), so a
+    crash does not end the run (E7 attempt 5: a $62 session was charged the
+    whole $450 allowance and the run stopped). Only when no estimate exists
+    is it charged the whole remaining allowance (Codex review, PR #15)."""
     cost = getattr(result, "total_cost_usd", None) if result is not None else None
     if isinstance(cost, (int, float)):
         # The SDK reports CUMULATIVE cost for a resumed conversation (same
@@ -85,6 +136,10 @@ def charge_session(ledger: dict, session: int, result, allowance: float | None) 
                     if sid and e.get("session_id") == sid), default=0)
         entry = {"session": session, "session_id": sid, "reported_usd": round(cost, 4),
                  "total_cost_usd": round(max(cost - prev, 0), 4), "source": "result"}
+    elif isinstance(estimate, (int, float)):
+        charged = estimate if allowance is None else min(estimate, allowance)
+        entry = {"session": session, "total_cost_usd": round(charged, 4), "estimated_usd": estimate,
+                 "source": "estimated from the CLI transcripts (+20%); the session ended without a cost"}
     else:
         entry = {"session": session, "total_cost_usd": round(allowance or 0, 4),
                  "source": "unreconciled: charged the full remaining allowance"}
@@ -667,6 +722,7 @@ async def run(question: str, max_rounds: int, max_sessions: int,
 
             result = None
             error_str = None
+            session_started = datetime.now().astimezone()
             try:
                 cleanup_orphaned_claude_processes()
 
@@ -692,7 +748,8 @@ async def run(question: str, max_rounds: int, max_sessions: int,
             finally:
                 if result is not None:
                     session_records.append({"session": session_num, **result_summary(result)})
-                charge_session(budget, session_num, result, left)
+                charge_session(budget, session_num, result, left,
+                               estimate=None if result is not None else estimate_session_cost(session_started))
                 write_budget_ledger(run_path, budget, max_budget_usd, integrity)
                 try:
                     trace_file.close()
@@ -1523,6 +1580,32 @@ def _run_self_test() -> int:
         led = load_budget_ledger(td)
         charge_session(led, 1, R(4.0), 5.0)
         charge_session(led, 2, None, remaining_budget(5.0, led["sessions"]))
+        # CR15 (Phase 28): a crashed session with transcripts is charged its
+        # estimate, so the run continues; without transcripts, the allowance.
+        _lc = {"sessions": []}
+        charge_session(_lc, 1, None, 450.0, estimate=74.4)
+        ok(_lc["sessions"][0]["total_cost_usd"] == 74.4 and remaining_budget(450.0, _lc["sessions"]) > 300,
+           f"CR15 a crashed session is charged its estimate, not the cap: {_lc}")
+        _lc2 = {"sessions": []}
+        charge_session(_lc2, 1, None, 450.0, estimate=None)
+        ok(remaining_budget(450.0, _lc2["sessions"]) <= 0, "CR15 no estimate: the whole allowance (fail closed)")
+        _pd = tempfile.mkdtemp()
+        os.makedirs(os.path.join(_pd, "k", "sess", "subagents"))
+        _t0 = datetime.now().astimezone()
+        _now = _t0.isoformat()
+        with open(os.path.join(_pd, "k", "sess", "subagents", "a.jsonl"), "w") as _f:
+            for _mid in ("m1", "m1", "m2"):      # m1 repeated (one line per content block)
+                _f.write(json.dumps({"timestamp": _now, "message": {"id": _mid, "model": "claude-opus-5-5",
+                                     "usage": {"input_tokens": 0, "cache_read_input_tokens": 1_000_000,
+                                               "cache_creation_input_tokens": 0, "output_tokens": 0}}}) + "\n")
+            _f.write(json.dumps({"timestamp": "2020-01-01T00:00:00Z", "message": {
+                "id": "old", "model": "claude-opus-5-5", "usage": {"cache_read_input_tokens": 10**9}}}) + "\n")
+        _est = estimate_session_cost(_t0 - __import__("datetime").timedelta(seconds=5), projects_dir=_pd)
+        _want = 2 * 1_000_000 * 0.1 * 4.131e-6 * 1.2
+        ok(_est is not None and abs(_est - _want) < 1e-3,
+           f"CR16 estimate: each message once, older turns excluded, +20%: {_est} vs {_want}")
+        ok(estimate_session_cost(_t0, projects_dir=tempfile.mkdtemp()) is None,
+           "CR16 no transcripts: no estimate")
         write_budget_ledger(td, led, 5.0)
         again = load_budget_ledger(td)
         ok(remaining_budget(5.0, again["sessions"]) == 0 and again["spent_usd"] == 5.0
