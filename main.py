@@ -121,7 +121,7 @@ def estimate_session_cost(since: datetime, projects_dir: str | None = None) -> f
 
 
 def charge_session(ledger: dict, session: int, result, allowance: float | None,
-                   estimate: float | None = None) -> dict:
+                   estimate: float | None = None, session_id: str | None = None) -> dict:
     """Record one session's spend. A session that ended without a cost
     (disconnect, crash) is charged its transcript-based estimate (+20%), so a
     crash does not end the run (E7 attempt 5: a $62 session was charged the
@@ -132,13 +132,16 @@ def charge_session(ledger: dict, session: int, result, allowance: float | None,
         # The SDK reports CUMULATIVE cost for a resumed conversation (same
         # session_id; verified 2026-10-23): charge only the increase.
         sid = getattr(result, "session_id", None)
-        prev = max((e.get("reported_usd") or 0 for e in ledger.get("sessions", [])
-                    if sid and e.get("session_id") == sid), default=0)
+        # Everything already charged to this conversation, including a crashed
+        # session's estimate: the cumulative report replaces it, not adds to it.
+        prev = sum(e.get("total_cost_usd") or 0 for e in ledger.get("sessions", [])
+                   if sid and e.get("session_id") == sid)
         entry = {"session": session, "session_id": sid, "reported_usd": round(cost, 4),
                  "total_cost_usd": round(max(cost - prev, 0), 4), "source": "result"}
     elif isinstance(estimate, (int, float)):
         charged = estimate if allowance is None else min(estimate, allowance)
-        entry = {"session": session, "total_cost_usd": round(charged, 4), "estimated_usd": estimate,
+        entry = {"session": session, "session_id": session_id,
+                 "total_cost_usd": round(charged, 4), "estimated_usd": estimate,
                  "source": "estimated from the CLI transcripts (+20%); the session ended without a cost"}
     else:
         entry = {"session": session, "total_cost_usd": round(allowance or 0, 4),
@@ -749,7 +752,8 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                 if result is not None:
                     session_records.append({"session": session_num, **result_summary(result)})
                 charge_session(budget, session_num, result, left,
-                               estimate=None if result is not None else estimate_session_cost(session_started))
+                               estimate=None if result is not None else estimate_session_cost(session_started),
+                               session_id=session_id)
                 write_budget_ledger(run_path, budget, max_budget_usd, integrity)
                 try:
                     trace_file.close()
@@ -1586,6 +1590,20 @@ def _run_self_test() -> int:
         charge_session(_lc, 1, None, 450.0, estimate=74.4)
         ok(_lc["sessions"][0]["total_cost_usd"] == 74.4 and remaining_budget(450.0, _lc["sessions"]) > 300,
            f"CR15 a crashed session is charged its estimate, not the cap: {_lc}")
+        # CR17: the resumed conversation's cumulative report replaces the estimate.
+        class _R2:
+            def __init__(self, c, sid):
+                self.total_cost_usd, self.session_id = c, sid
+        _lc3 = {"sessions": []}
+        charge_session(_lc3, 1, None, 450.0, estimate=74.4, session_id="s1")
+        charge_session(_lc3, 2, _R2(100.0, "s1"), 375.6)
+        _tot = sum(e["total_cost_usd"] for e in _lc3["sessions"])
+        ok(abs(_tot - 100.0) < 1e-6, f"CR17 estimate + cumulative report = the cumulative report, not both: {_lc3}")
+        _lc4 = {"sessions": []}
+        charge_session(_lc4, 1, None, 450.0, estimate=74.4, session_id="s1")
+        charge_session(_lc4, 2, _R2(62.0, "s1"), 375.6)
+        ok(abs(sum(e["total_cost_usd"] for e in _lc4["sessions"]) - 74.4) < 1e-6,
+           f"CR17 a report below the estimate never refunds (conservative): {_lc4}")
         _lc2 = {"sessions": []}
         charge_session(_lc2, 1, None, 450.0, estimate=None)
         ok(remaining_budget(450.0, _lc2["sessions"]) <= 0, "CR15 no estimate: the whole allowance (fail closed)")
