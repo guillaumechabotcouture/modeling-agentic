@@ -1743,12 +1743,20 @@ async def _probe_subagent_write(allow_cloud: bool, attempts: int = 2) -> tuple[b
         options = ClaudeAgentOptions(
             system_prompt="You are a harness preflight check. Follow instructions literally.",
             model=enforcement.MODEL_DEEP, max_buffer_size=enforcement.MAX_BUFFER_SIZE,
-            agents={"write-probe": probe}, tools=["Agent"], allowed_tools=["Agent"],
+            # The lead's real tool list: a subagent only gets tools its parent has.
+            agents={"write-probe": probe}, tools=LEAD_TOOLS, allowed_tools=LEAD_TOOLS,
             permission_mode="bypassPermissions", setting_sources=[], cwd=REPO_ROOT,
             env=enforcement.filtered_env(dict(os.environ), allow_cloud), max_turns=4)
+        by_subagent = False
         async for m in query(prompt=f"Spawn the `write-probe` agent and give it this file path: {wpath}. "
                                     f"Do not write anything yourself. Reply with what it reported.",
                              options=options):
+            if isinstance(m, AssistantMessage) and getattr(m, "parent_tool_use_id", None):
+                # Only a Write issued inside the subagent counts, not the lead's own.
+                for b in m.content:
+                    if getattr(b, "name", None) == "Write" and \
+                            os.path.realpath(str((getattr(b, "input", None) or {}).get("file_path", ""))) == os.path.realpath(wpath):
+                        by_subagent = True
             if isinstance(m, UserMessage) and isinstance(m.content, list):
                 for b in m.content:
                     c = getattr(b, "content", None)
@@ -1756,7 +1764,9 @@ async def _probe_subagent_write(allow_cloud: bool, attempts: int = 2) -> tuple[b
             elif isinstance(m, ResultMessage):
                 cost += m.total_cost_usd or 0
                 log.append(f"[attempt {attempt + 1}] result: {(m.result or '')[:300]}")
-        wrote = os.path.exists(wpath) and "PREFLIGHT_WRITE" in open(wpath).read()
+        wrote = by_subagent and os.path.exists(wpath) and "PREFLIGHT_WRITE" in open(wpath).read()
+        if not by_subagent and os.path.exists(wpath):
+            log.append(f"[attempt {attempt + 1}] the file was written, but not by the subagent")
         shutil.rmtree(wdir, ignore_errors=True)
         if wrote:
             return True, "\n".join(log), cost
