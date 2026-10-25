@@ -910,32 +910,39 @@ def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
 
 
 def store_run_results(run_path: str, service=None) -> str | None:
-    """Phase 26: when $MA_STORAGE_ACCOUNT is set (cloud runs), upload the
-    finished run directory to outputs/runs/<run name>.tar.gz, so the result
-    never depends on someone collecting it from the VM. Never fatal."""
-    account = os.environ.get("MA_STORAGE_ACCOUNT")
+    """Phase 26: when a storage account is configured ($MA_STORAGE_ACCOUNT or
+    $COILED_STORAGE_ACCOUNT), upload the finished run directory to
+    outputs/<prefix>/<run name>.tar.gz so the result never depends on someone
+    collecting it from the VM. Answer keys and credential files are left out
+    and API keys redacted. The outcome is recorded in metadata.json
+    (`stored` / `store_error`); a failure is loud but never fatal."""
+    sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
+    import results_store
+    account = results_store.configured_account()
     if not account and service is None:
         return None
-    import io as _io
-    import tarfile as _tf
-    sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
+    name = os.path.basename(os.path.normpath(run_path))
+    blob, err = None, None
     try:
-        import results_store
-        name = os.path.basename(os.path.normpath(run_path))
-        buf = _io.BytesIO()
-        with _tf.open(fileobj=buf, mode="w:gz") as t:
-            t.add(run_path, arcname=name,
-                  filter=lambda ti: None if "/_truth" in ti.name or ti.name.endswith(".env") else ti)
+        secrets = [os.environ.get(k, "") for k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")]
+        data, skipped = results_store.archive_dir(run_path, name, secrets)
         tmp = os.path.join(os.path.dirname(os.path.normpath(run_path)), f".{name}.store.tar.gz")
         with open(tmp, "wb") as f:
-            f.write(buf.getvalue())
+            f.write(data)
         blob = f"outputs/{os.environ.get('MA_STORAGE_PREFIX', 'runs')}/{name}.tar.gz"
-        results_store.upload(tmp, blob, account, service=service)
+        results_store.upload_retry(tmp, blob, account, service=service)
         os.remove(tmp)
-        return blob
     except Exception as e:  # noqa: BLE001 — the local copy remains; say so loudly
-        print(f"[ERROR] could not store run results: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
-        return None
+        blob, err = None, f"{type(e).__name__}: {e}"[:500]
+        print(f"[ERROR] RUN RESULTS NOT STORED (only the VM copy exists): {err}", file=sys.stderr, flush=True)
+    try:
+        mp = os.path.join(run_path, "metadata.json")
+        meta = json.load(open(mp)) if os.path.exists(mp) else {}
+        meta.update({"stored": blob, "store_error": err})
+        json.dump(meta, open(mp, "w"), indent=2)
+    except (OSError, ValueError):
+        pass
+    return blob
 
 
 # ---------------------------------------------------------------------------
@@ -1612,13 +1619,27 @@ def _run_self_test() -> int:
     os.makedirs(os.path.join(_run, "_truth"))
     open(os.path.join(_run, "report.md"), "w").write("r")
     open(os.path.join(_run, "_truth", "answers.yaml"), "w").write("secret")
+    open(os.path.join(_run, ".env.local"), "w").write("TOKEN=x")
+    open(os.path.join(_run, "trace.jsonl"), "w").write("key sk-ant-TESTSECRET12345 leaked\n")
+    _saved_key = os.environ.get("ANTHROPIC_API_KEY")
+    os.environ["ANTHROPIC_API_KEY"] = "sk-ant-TESTSECRET12345"
     _fs = _FS()
     _blob = store_run_results(_run, service=_fs)
     import io as _io2, tarfile as _tf2
     _names = _tf2.open(fileobj=_io2.BytesIO(_fs.st.get(("outputs", "runs/2026-10-24_000000_x.tar.gz"), b"")),
                        mode="r:gz").getnames() if _blob else []
-    ok(_blob and any(n.endswith("report.md") for n in _names) and not any("_truth" in n for n in _names),
-       f"ST1 run stored without _truth/: {_names}")
+    if _saved_key is None:
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+    else:
+        os.environ["ANTHROPIC_API_KEY"] = _saved_key
+    _tr = _tf2.open(fileobj=_io2.BytesIO(_fs.st.get(("outputs", "runs/2026-10-24_000000_x.tar.gz"), b"")), mode="r:gz") \
+        if _blob else None
+    _trace = _tr.extractfile("2026-10-24_000000_x/trace.jsonl").read() if _tr else b""
+    ok(_blob and any(n.endswith("report.md") for n in _names) and not any("_truth" in n or ".env" in n for n in _names)
+       and b"TESTSECRET" not in _trace,
+       f"ST1 run stored without _truth/ or .env*, API keys redacted: {_names}")
+    ok(json.load(open(os.path.join(_run, "metadata.json"))).get("stored") == _blob,
+       "ST1 metadata.json records where the run was stored")
     ok(store_run_results(_run) is None or os.environ.get("MA_STORAGE_ACCOUNT"),
        "ST1 nothing is stored when no account is configured")
     shutil.rmtree(_sr, ignore_errors=True)

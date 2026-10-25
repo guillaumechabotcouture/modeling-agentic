@@ -288,6 +288,15 @@ def redact_secrets(paths: list, secrets: list) -> list:
     return hits
 
 
+def _sensitive(rel: str) -> bool:
+    """Same rule as scripts/results_store.is_sensitive_path (kept inline: this
+    module runs on workers before the repo is unpacked)."""
+    import re
+    parts = [x for x in rel.replace("\\", "/").split("/") if x]
+    return any(x.startswith("_truth") for x in parts) or bool(parts and re.match(
+        r"(?i)^(\.env.*|.*\.(pem|key|p12|pfx)|.*credential.*|.*secret.*|id_rsa.*|\.netrc|\.npmrc|\.pypirc)$", parts[-1]))
+
+
 def remote_case(case: dict, code: bytes, fixture: bytes, variants: bytes,
                 anthropic_key: "Redacted", dry_agent: bool = False, base: str = REMOTE_BASE,
                 openai_key: "Redacted | None" = None) -> dict:
@@ -360,6 +369,9 @@ def remote_case(case: dict, code: bytes, fixture: bytes, variants: bytes,
                 if rel.startswith("run" + os.sep) and _unchanged_input(p, inputs, rel[len("run") + 1:]):
                     skipped += 1
                     continue
+                if _sensitive(rel):          # answer keys, .env*, key files: never leave the VM
+                    skipped += 1
+                    continue
                 entries.append((p, os.path.join(case["variant_id"], f"{case['fixture_id']}-s{case['seed']}", rel)))
         entries.append((os.path.join(root, "case.log"), os.path.join(
             case["variant_id"], f"{case['fixture_id']}-s{case['seed']}", "cloud_case.log")))
@@ -391,11 +403,10 @@ def remote_case(case: dict, code: bytes, fixture: bytes, variants: bytes,
             tls_key_secrets(os.path.join(root, ".tls")):
         if len(sec) >= 12:                       # same rule as redact_secrets
             text = text.replace(sec, "<redacted>")   # error/traceback strings too
-    open(out_meta, "w").write(text)
     shutil.rmtree(os.path.join(root, ".tls"), ignore_errors=True)
-    meta = json.loads(text)
-    # Phase 26: the case stores its own result (tarball, then metadata) so
-    # collection never depends on the operator's laptop or the VM surviving.
+    # Phase 26: the case stores its own result (tarball, then metadata) BEFORE
+    # result.json — the "done" marker — appears, so collection can never see
+    # the case finished, and shut the cluster down, while an upload is running.
     store = case.get("store") or {}
     if store.get("account"):
         try:
@@ -405,11 +416,18 @@ def remote_case(case: dict, code: bytes, fixture: bytes, variants: bytes,
             rs = importlib.util.module_from_spec(sp)
             sp.loader.exec_module(rs)
             base = f"outputs/{store['prefix']}/{case['key']}"
-            rs.upload(os.path.join(root, "result.tar.gz"), f"{base}/result.tar.gz", store["account"])
-            rs.upload(out_meta, f"{base}/result.json", store["account"])
-            open(os.path.join(root, "stored"), "w").write(base)
-        except Exception as e:  # noqa: BLE001 — the local copy still exists; collect reports it
-            open(os.path.join(root, "store_error"), "w").write(f"{type(e).__name__}: {e}"[:500])
+            rs.upload_retry(os.path.join(root, "result.tar.gz"), f"{base}/result.tar.gz", store["account"])
+            open(out_meta + ".upload", "w").write(text)
+            rs.upload_retry(out_meta + ".upload", f"{base}/result.json", store["account"])
+            os.remove(out_meta + ".upload")
+            stored = {"stored": base}
+        except Exception as e:  # noqa: BLE001 — the local copy still exists; collect reports it loudly
+            stored = {"stored": None, "store_error": f"{type(e).__name__}: {e}"[:500]}
+        meta_obj = json.loads(text)
+        meta_obj.update(stored)
+        text = json.dumps(meta_obj, indent=1, default=str)
+    open(out_meta, "w").write(text)
+    meta = json.loads(text)
     return {k: v for k, v in meta.items() if k not in ("pip_freeze", "case", "traceback")}
 
 
@@ -468,9 +486,10 @@ def launch(cases, variants, repo, batch_dir, cluster_name, workers, anthropic_ke
            workspace=WORKSPACE, log=print, openai_key=None, compute_workers=0):
     """compute_workers: extra workers that run no case, only compute-service
     batches from cases whose variant sets `compute: true` (Phase 24)."""
+    import uuid
     from distributed import fire_and_forget
     store = {"account": os.environ.get("MA_STORAGE_ACCOUNT"),
-             "prefix": f"replay/{os.path.basename(os.path.normpath(batch_dir))}"}
+             "prefix": f"replay/{os.path.basename(os.path.normpath(batch_dir))}-{uuid.uuid4().hex[:8]}"}
     if not store["account"] and not dry_agent:
         raise SystemExit("MA_STORAGE_ACCOUNT is not set: cases must store their own results "
                          "(Phase 26; E8 was lost to laptop-only collection)")
@@ -603,7 +622,7 @@ def collect_from_store(batch_dir, rec, done_dir, log=print, service=None):
             missing.append(f"{k} ({type(e).__name__})")
             continue
         meta = json.load(open(meta_p))
-        if meta.get("sha256") and got["sha256"] != meta["sha256"] and got["bytes"]:
+        if meta.get("sha256") and got["sha256"] != meta["sha256"]:
             missing.append(f"{k} (sha mismatch)")
             continue
         case = install_result(batch_dir, cr, meta, tar_p)
@@ -652,6 +671,8 @@ def collect(batch_dir, cluster_name=None, watch=False, interval_s=60, log=print)
                 open(tmp, "wb").close()
             case = install_result(batch_dir, cr, m, tmp)
             os.remove(tmp)
+            if (rec.get("store") or {}).get("account") and not m.get("stored"):
+                log(f"  WARNING {k}: NOT in durable storage ({m.get('store_error')}); this local copy is the only one")
             open(os.path.join(done_dir, k), "w").write(m.get("sha256") or "")
             log(f"  {k}: collected ({case.get('status')}, {m.get('size', 0) >> 10} KB, sha256 verified)")
         remaining = [k for k in rec["cases"] if not os.path.exists(os.path.join(done_dir, k))]
