@@ -25,7 +25,9 @@ from datetime import datetime
 STATUS_FILE = "status.json"
 RESOURCES_FILE = "resources.jsonl"
 # $ per weighted token, same weighting as scripts/telemetry.py (fitted on 96 E5 cases)
-USD_PER_WEIGHTED_TOKEN = {"claude-opus-5-5": 4.131e-6, "claude-sonnet-5-5": 3.08e-6}
+USD_PER_WEIGHTED_TOKEN = {"claude-opus-5-5": 4.131e-6, "claude-sonnet-5-5": 3.08e-6,
+                          # not fitted (no Haiku cases): ~1/4 of the Opus rate; smoke runs only
+                          "claude-haiku-5-5": 1.0e-6}
 RATIOS = {"input_tokens": 1.0, "cache_read_input_tokens": 0.1,
           "cache_creation_input_tokens": 1.25, "output_tokens": 5.0}
 STAGE_OF = {"planner": "PLAN", "data-agent": "DATA", "critique-premortem": "PRE_MORTEM",
@@ -47,6 +49,10 @@ class LiveState:
         self.last_event_ts = None
         self.est_usd = 0.0
         self._seen_msgs: set = set()
+        # Stage-boundary snapshots: the run's state the moment a stage is
+        # launched, i.e. exactly what that stage will read (replay fixtures).
+        self.snapshot_requests: list[str] = []
+        self.wake = threading.Event()
 
     def on_message(self, message) -> None:
         from claude_agent_sdk import AssistantMessage, UserMessage
@@ -68,6 +74,9 @@ class LiveState:
                         self.active_agents[getattr(b, "id", "")] = agent
                         self.last_agent = agent
                         self.last_event = f"spawned {agent}"
+                        if agent in STAGE_OF and not getattr(message, "parent_tool_use_id", None):
+                            self.snapshot_requests.append(agent)
+                            self.wake.set()
                     elif name:
                         self.last_event = f"{name}"
             elif isinstance(message, UserMessage) and isinstance(message.content, list):
@@ -150,6 +159,7 @@ class Heartbeat(threading.Thread):
         self.uploader = uploader          # callable(local_path, blob_suffix) or None
         self.last_checkpoint = time.time()
         self.errors = 0
+        self.snapshots = 0
 
     def beat(self) -> dict:
         status = build_status(self.run_path, self.state, self.run_start)
@@ -184,15 +194,52 @@ class Heartbeat(threading.Thread):
         os.remove(tmp)
         self.last_checkpoint = time.time()
 
-    def run(self) -> None:
-        while not self.stop_event.wait(self.interval_s):
+    def snapshot(self, agent: str) -> None:
+        """Archive the run as it is when `agent`'s stage starts; upload as
+        snapshots/NNN_<stage>_<agent>.tar.gz (a replay fixture)."""
+        if not self.uploader:
+            return
+        import results_store
+        self.snapshots += 1
+        name = os.path.basename(os.path.normpath(self.run_path))
+        secrets = [os.environ.get(k, "") for k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")]
+        data, _ = results_store.archive_dir(self.run_path, name, secrets)
+        tmp = os.path.join(os.path.dirname(os.path.normpath(self.run_path)), f".{name}.snapshot.tar.gz")
+        with open(tmp, "wb") as f:
+            f.write(data)
+        self.uploader(tmp, f"snapshots/{self.snapshots:03d}_{STAGE_OF.get(agent, 'X')}_{agent}.tar.gz")
+        os.remove(tmp)
+
+    def _drain_snapshots(self) -> None:
+        while True:
+            with self.state.lock:
+                if not self.state.snapshot_requests:
+                    self.state.wake.clear()
+                    return
+                agent = self.state.snapshot_requests.pop(0)
             try:
-                self.beat()
-            except Exception:  # noqa: BLE001 — visibility must never break the run
+                self.snapshot(agent)
+            except Exception:  # noqa: BLE001
                 self.errors += 1
+
+    def run(self) -> None:
+        next_beat = time.time() + self.interval_s
+        while not self.stop_event.is_set():
+            # wake early for a stage snapshot, otherwise every interval
+            self.state.wake.wait(max(0.0, next_beat - time.time()))
+            if self.stop_event.is_set():
+                break
+            self._drain_snapshots()
+            if time.time() >= next_beat:
+                next_beat = time.time() + self.interval_s
+                try:
+                    self.beat()
+                except Exception:  # noqa: BLE001 — visibility must never break the run
+                    self.errors += 1
 
     def stop(self) -> None:
         self.stop_event.set()
+        self.state.wake.set()
         try:
             self.beat()
             self.checkpoint()
@@ -261,6 +308,22 @@ def self_test() -> list[str]:
             r = json.loads(open(os.path.join(d, RESOURCES_FILE)).readline())
             if not (0 <= r["mem_used_pct"] <= 100 and r["top"]):
                 fails.append(f"OB7 a resource sample has memory and the largest processes: {r}")
+
+        st2 = LiveState()
+        up2 = []
+        hb3 = Heartbeat(d, st2, datetime.now(), interval_s=30, uploader=lambda p, sfx: up2.append(sfx))
+        hb3.start()
+        st2.on_message(AssistantMessage(content=[ToolUseBlock("a9", "Agent", {"subagent_type": "modeler"})],
+                                        model="claude-opus-5-5", message_id="m9"))
+        st2.on_message(AssistantMessage(content=[ToolUseBlock("a10", "Agent", {"subagent_type": "writer"})],
+                                        model="claude-opus-5-5", message_id="m10", parent_tool_use_id="x"))
+        t_end = time.time() + 5
+        while time.time() < t_end and not any("snapshots/" in u for u in up2):
+            time.sleep(0.05)
+        hb3.stop_event.set(); st2.wake.set(); hb3.join(5)
+        snaps = [u for u in up2 if u.startswith("snapshots/")]
+        if snaps != ["snapshots/001_MODEL_modeler.tar.gz"]:
+            fails.append(f"OB9 a stage launched by the lead is snapshotted at once (not nested spawns): {up2}")
 
         def boom(*_):
             raise OSError("storage down")
