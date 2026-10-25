@@ -218,6 +218,17 @@ def _check_figure_size(path: str, stage_name: str) -> None:
 # Agent registry
 # ---------------------------------------------------------------------------
 
+def smoke_settings() -> dict | None:
+    """Phase 25 pre-launch smoke: MA_SMOKE_MODEL runs every agent (and the
+    lead) on a cheap model with a small turn cap, so the WHOLE pipeline,
+    through the writer saving its draft and the final gate, can be
+    exercised in minutes for a few dollars before any paid run."""
+    model = os.environ.get("MA_SMOKE_MODEL")
+    if not model:
+        return None
+    return {"model": model, "max_turns": int(os.environ.get("MA_SMOKE_MAX_TURNS", "12"))}
+
+
 def build_agents(question: str = "", run_dir: str | None = None
                  ) -> dict[str, AgentDefinition]:
     """Return all subagent definitions for the lead session.
@@ -228,7 +239,11 @@ def build_agents(question: str = "", run_dir: str | None = None
     prompt was substituted, so subagents saw a literal `{run_dir}`).
     """
     agents = _registry()
+    smoke = smoke_settings()
     for name, d in agents.items():
+        if smoke:
+            d.model = smoke["model"]
+            d.maxTurns = min(d.maxTurns or smoke["max_turns"], smoke["max_turns"])
         if d.skills:
             d.skills = select_skills(d.skills, question)
         if run_dir:
@@ -927,11 +942,13 @@ next STAGE 6.
 
 ### STAGE 8: WRITE
 Spawn the "writer" agent. Tell it the run directory.
-Wait for completion. Verify {run_dir}/report.md exists.
+Wait for completion. Verify {run_dir}/manuscript.md exists (the writer's
+draft; the CLI does not let subagents write report.md). The render step
+below builds report.md from it.
 
 #### STAGE 8.1: RENDER CLAIM REFERENCES (Phase 18 α — REQUIRED)
 
-After report.md is written and BEFORE writer-QA / coherence audit, run:
+After manuscript.md is written and BEFORE writer-QA / coherence audit, run:
 
 ```bash
 python3 scripts/render_claims.py {run_dir}
@@ -971,7 +988,7 @@ This writes `{run_dir}/writer_qa_report.yaml` with one of three verdicts:
   "Fix these specific text-figure inconsistencies and stale numbers.
   Start from report.unrendered.md (the draft that still carries the
   [CLAIM:id] references), apply the fixes, and write the revised draft
-  to report.md. Keep every number as a [CLAIM:id] reference." The
+  to manuscript.md. Keep every number as a [CLAIM:id] reference." The
   writer has no Bash, so YOU then re-run `render_claims.py`,
   `writer_qa.py`, and the coherence audit and confirm CLEAN.
 

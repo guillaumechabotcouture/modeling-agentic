@@ -88,7 +88,9 @@ LEAD_PROTECTED = (
     "models/**",
 )
 
-# Narrow carve-outs from SCRIPT_OUTPUTS: the writer drafts report.md
+# Narrow carve-outs from SCRIPT_OUTPUTS: the writer drafts manuscript.md (the CLI
+# blocks subagent Writes to report.md; render_claims.py builds it) — the
+# report.md carve-out is kept for the harness-era writer revision path;
 # before render_claims runs; the planner records `decision_year` in
 # metadata.json (main.py restores the original question at run end, so
 # the carve-out cannot rewrite what spec-compliance checks against).

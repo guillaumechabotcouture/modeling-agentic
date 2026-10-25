@@ -31,6 +31,7 @@ from agents import (
     create_hooks,
     cleanup_orphaned_claude_processes,
     LEAD_SYSTEM_PROMPT,
+    smoke_settings,
 )
 from agents import enforcement
 from agents.integrity import ArtifactIntegrity
@@ -477,7 +478,33 @@ def restore_report_if_missing(run_path: str) -> bool:
     reported for a missing report.)"""
     report_path = os.path.join(run_path, "report.md")
     snapshot_path = os.path.join(run_path, "report.snapshot.md")
-    if os.path.exists(report_path) or not os.path.exists(snapshot_path):
+    if os.path.exists(report_path):
+        return False
+    if os.path.exists(os.path.join(run_path, "manuscript.md")):
+        # Phase 25: the writer's draft exists but the render step never ran.
+        # Build report.md from it (render_claims falls back to the draft
+        # itself when references cannot be resolved).
+        try:
+            r = subprocess.run([sys.executable, os.path.join(REPO_ROOT, "scripts", "render_claims.py"), run_path],
+                               capture_output=True, text=True, timeout=600)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            r = subprocess.CompletedProcess([], 1, "", f"{type(e).__name__}: {e}")
+        if os.path.exists(report_path):
+            print("[WARNING] report.md was missing at run end; rendered from manuscript.md.",
+                  file=sys.stderr, flush=True)
+            return True
+        # Rendering failed (e.g. no claims ledger): the draft itself is the
+        # report; writer QA and the gate then judge it as written.
+        try:
+            shutil.copyfile(os.path.join(run_path, "manuscript.md"), report_path)
+            print(f"[WARNING] report.md was missing at run end; rendering failed "
+                  f"({(r.stdout + r.stderr).strip()[-300:]}); copied manuscript.md.",
+                  file=sys.stderr, flush=True)
+            return True
+        except OSError as e:
+            print(f"[ERROR] report.md missing; copying manuscript.md failed: {e}",
+                  file=sys.stderr, flush=True)
+    if not os.path.exists(snapshot_path):
         return False
     try:
         shutil.copyfile(snapshot_path, report_path)
@@ -623,7 +650,7 @@ async def run(question: str, max_rounds: int, max_sessions: int,
             options = ClaudeAgentOptions(
                 system_prompt=lead_system,
                 agents=agents,
-                model=enforcement.MODEL_DEEP,
+                model=(smoke_settings() or {}).get("model", enforcement.MODEL_DEEP),
                 max_buffer_size=enforcement.MAX_BUFFER_SIZE,
                 tools=LEAD_TOOLS,
                 allowed_tools=LEAD_TOOLS,
@@ -800,7 +827,8 @@ def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
         integrity.final_check()
     report_restored = restore_report_if_missing(run_path)
     if report_restored and integrity is not None:
-        integrity.harness_wrote("report.md")
+        for rel in ("report.md", "report.unrendered.md", "models/claims_ledger.yaml", "claims_ledger.yaml"):
+            integrity.harness_wrote(rel)
     has_report = os.path.exists(os.path.join(run_path, "report.md"))
     # Restore the protected fields BEFORE the gate: the validator reads the
     # question from metadata.json (Codex review of PR #14: a planner edit to
@@ -1515,6 +1543,82 @@ def _run_self_test() -> int:
        "BUF1 a ClaudeAgentOptions(...) call lacks max_buffer_size")
     ok(enforcement.MAX_BUFFER_SIZE > 1024 * 1024, "BUF1 buffer not raised")
 
+    # WD1 (Phase 25): the bundled CLI refuses Write by a subagent to
+    # REPORT*/SUMMARY*/FINDINGS*/ANALYSIS*.md. E7 lost two full runs to it
+    # (the writer was told to write report.md). No agent prompt may instruct
+    # a Write to such a name.
+    _blocked = re.compile(r"(?i)\b(?:write|writes|save|emit|edit|add|insert|append|update|put|create)\b"
+                          r"[^\n]*?\b((?:report|summary|findings|analysis)[\w.-]*\.md)\b")
+    from agents import build_agents as _ba
+    _bad = []
+    for _name, _d in _ba(question="malaria smoke", run_dir="runs/x").items():
+        for _line in (_d.prompt or "").splitlines():
+            _m = _blocked.search(_line)
+            if _m and not re.search(r"(?i)\bnever\b|\bnot\b", _line):
+                _bad.append(f"{_name}: {_line.strip()[:90]}")
+    ok(not _bad, f"WD1 a subagent is told to Write a file the CLI blocks: {_bad[:3]}")
+    ok(evaluate_preflight(good_pf := f"PREFLIGHT_OK {sys.executable}\nPREFLIGHT_OK {sys.executable}",
+                          {enforcement.MODEL_DEEP: {}}, False, subagent_wrote=False),
+       "WD2 preflight must fail when the subagent cannot Write the writer's draft")
+    ok(any("pinned" in p for p in evaluate_preflight(good_pf, {enforcement.MODEL_DEEP: {}}, False,
+                                                    sdk_version="0.2.174", sdk_pinned="0.2.169")),
+       "WD4 preflight must fail when the installed SDK differs from the pinned one")
+    ok(pinned_sdk_version() is not None, "WD4 requirements.txt pins claude-agent-sdk")
+    # WD5 (Codex, PR #21): a render that times out still ends with report.md.
+    _rd5 = tempfile.mkdtemp()
+    open(os.path.join(_rd5, WRITER_DRAFT), "w").write("# Draft\n")
+    _real_run = subprocess.run
+
+    def _timeout_run(*a, **k):
+        raise subprocess.TimeoutExpired(a[0] if a else "render", 600)
+    subprocess.run = _timeout_run
+    try:
+        ok(restore_report_if_missing(_rd5) and os.path.exists(os.path.join(_rd5, "report.md")),
+           "WD5 a render timeout must still leave report.md (copied draft)")
+    except subprocess.TimeoutExpired:
+        ok(False, "WD5 a render timeout escaped finalize")
+    finally:
+        subprocess.run = _real_run
+        shutil.rmtree(_rd5, ignore_errors=True)
+
+    # WD6 (Codex, PR #21): the write probe passes only on a SUCCESSFUL Write
+    # issued inside the subagent, never on a refused one plus a lead Write.
+    from claude_agent_sdk import ToolUseBlock as _TU, ToolResultBlock as _TR
+
+    def _fake_query(child_error, lead_writes):
+        async def q(prompt, options):
+            path = re.search(r"file path: (\S+?)\. ", prompt).group(1)
+            yield AssistantMessage(content=[_TU("w1", "Write", {"file_path": path, "content": "PREFLIGHT_WRITE"})],
+                                   model="m", parent_tool_use_id="a1")
+            if not child_error:
+                open(path, "w").write("PREFLIGHT_WRITE")
+            yield UserMessage(content=[_TR("w1", "refused" if child_error else "ok", is_error=child_error)],
+                              parent_tool_use_id="a1")
+            if lead_writes:
+                yield AssistantMessage(content=[_TU("w2", "Write", {"file_path": path, "content": "PREFLIGHT_WRITE"})],
+                                       model="m")
+                open(path, "w").write("PREFLIGHT_WRITE")
+                yield UserMessage(content=[_TR("w2", "ok", is_error=False)])
+            yield ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+                                num_turns=1, session_id="s", total_cost_usd=0.0)
+        return q
+    _real_query = globals()["query"]
+    try:
+        globals()["query"] = _fake_query(child_error=True, lead_writes=True)
+        _w, _log, _ = asyncio.run(_probe_subagent_write(False))
+        ok(not _w, "WD6 a refused subagent Write followed by the lead's Write must fail the probe")
+        globals()["query"] = _fake_query(child_error=False, lead_writes=False)
+        _w, _log, _ = asyncio.run(_probe_subagent_write(False))
+        ok(_w, f"WD6 a successful subagent Write must pass the probe: {_log[-200:]}")
+    finally:
+        globals()["query"] = _real_query
+
+    _rd = tempfile.mkdtemp()
+    open(os.path.join(_rd, WRITER_DRAFT), "w").write("# Draft\n\nNo references.\n")
+    ok(restore_report_if_missing(_rd) and os.path.exists(os.path.join(_rd, "report.md")),
+       "WD3 finalize builds report.md from manuscript.md when the render step never ran")
+    shutil.rmtree(_rd, ignore_errors=True)
+
     # PF1 (Phase 21 α): preflight evaluation.
     exe = sys.executable
     good = f"PREFLIGHT_OK {exe}\nPREFLIGHT_OK {exe}"
@@ -1553,16 +1657,41 @@ PREFLIGHT_IMPORTS = ("laser.core", "laser.generic", "starsim", "yaml",
                      "numpy", "scipy")
 
 
+WRITER_DRAFT = "manuscript.md"   # agents/writer.py writes this; render_claims.py builds report.md
+
+
 def preflight_command() -> str:
     mods = ", ".join(PREFLIGHT_IMPORTS)
     return (f"python3 -c \"import sys, {mods}; "
             f"print('PREFLIGHT_OK', sys.executable)\"")
 
 
+def pinned_sdk_version() -> str | None:
+    """claude-agent-sdk version pinned in requirements.txt."""
+    try:
+        for line in open(os.path.join(REPO_ROOT, "requirements.txt")):
+            m = re.match(r"\s*claude-agent-sdk==([\w.]+)", line)
+            if m:
+                return m.group(1)
+    except OSError:
+        pass
+    return None
+
+
 def evaluate_preflight(text: str, model_usage: dict | None,
-                       is_error: bool) -> list[str]:
-    """Return problems found (empty list = pass). Pure, so it is self-tested."""
+                       is_error: bool, subagent_wrote: bool | None = None,
+                       sdk_version: str | None = None, sdk_pinned: str | None = None) -> list[str]:
+    """Return problems found (empty list = pass). Pure, so it is self-tested.
+    subagent_wrote: whether the probe subagent's Write of the writer's draft
+    file name landed on disk (Phase 25; None = not checked)."""
     problems = []
+    if sdk_pinned and sdk_version and sdk_version != sdk_pinned:
+        # The bundled CLI changes behaviour between versions (Phase 25: a
+        # subagent Write rule cost two full E7 runs); test what is pinned.
+        problems.append(f"claude-agent-sdk {sdk_version} installed, {sdk_pinned} pinned in requirements.txt")
+    if subagent_wrote is False:
+        problems.append(f"a subagent could not Write {WRITER_DRAFT} (the writer's draft); "
+                        f"the WRITE stage would fail")
     if is_error:
         problems.append("preflight session ended with an error result")
     # Absolute paths only: the model's prose can say "PREFLIGHT_OK line"
@@ -1614,7 +1743,8 @@ async def run_preflight(allow_cloud: bool = False) -> dict:
         max_turns=8)
     prompt = (f"1. Run this with Bash and copy its output verbatim:\n{cmd}\n"
               f"2. Spawn the `preflight-probe` agent and give it exactly the same "
-              f"command. 3. Reply with both outputs verbatim, one per line.")
+              f"command. "
+              f"3. Reply with both outputs verbatim, one per line.")
     texts, result = [], None
     async for m in query(prompt=prompt, options=options):
         if isinstance(m, AssistantMessage):
@@ -1634,12 +1764,79 @@ async def run_preflight(allow_cloud: bool = False) -> dict:
             if getattr(m, "result", None):
                 texts.append(m.result)
     usage = getattr(result, "model_usage", None) if result else None
+    wrote, write_log, write_cost = await _probe_subagent_write(allow_cloud)
     problems = evaluate_preflight("\n".join(texts), usage,
-                                  bool(result is None or result.is_error))
+                                  bool(result is None or result.is_error), subagent_wrote=wrote,
+                                  sdk_version=_sdk_version(), sdk_pinned=pinned_sdk_version())
+    cost = getattr(result, "total_cost_usd", None) if result else None
     return {"ok": not problems, "problems": problems,
             "model_usage": usage,
-            "cost_usd": getattr(result, "total_cost_usd", None) if result else None,
-            "sdk_version": _sdk_version()}
+            "cost_usd": (cost or 0) + (write_cost or 0),
+            "sdk_version": _sdk_version(),
+            "write_probe": None if wrote else write_log[-1500:]}
+
+
+async def _probe_subagent_write(allow_cloud: bool, attempts: int = 2) -> tuple[bool, str, float]:
+    """A subagent must be able to Write the writer's draft file name with the
+    Write tool, as the writer does (Phase 25: the bundled CLI blocks some
+    names for subagents). One job per probe, retried once, so a model that
+    skips the step is not mistaken for a block; the tool results are kept
+    for the log."""
+    import tempfile
+    from claude_agent_sdk import AgentDefinition
+    log, cost = [], 0.0
+    for attempt in range(attempts):
+        wdir = tempfile.mkdtemp(prefix="ma_preflight_")
+        wpath = os.path.join(wdir, WRITER_DRAFT)
+        probe = AgentDefinition(
+            description="Preflight write probe: saves one file with the Write tool.",
+            prompt="Use the Write tool to save the exact text PREFLIGHT_WRITE to the file "
+                   "path you are given. Then reply with the tool's result verbatim.",
+            tools=["Write"], model=enforcement.MODEL_DEEP, maxTurns=3)
+        options = ClaudeAgentOptions(
+            system_prompt="You are a harness preflight check. Follow instructions literally.",
+            model=enforcement.MODEL_DEEP, max_buffer_size=enforcement.MAX_BUFFER_SIZE,
+            # The lead's real tool list: a subagent only gets tools its parent has.
+            agents={"write-probe": probe}, tools=LEAD_TOOLS, allowed_tools=LEAD_TOOLS,
+            permission_mode="bypassPermissions", setting_sources=[], cwd=REPO_ROOT,
+            env=enforcement.filtered_env(dict(os.environ), allow_cloud), max_turns=4)
+        by_subagent, sub_ids, lead_wrote, write_ok = False, set(), False, False
+        async for m in query(prompt=f"Spawn the `write-probe` agent and give it this file path: {wpath}. "
+                                    f"Do not write anything yourself. Reply with what it reported.",
+                             options=options):
+            if isinstance(m, AssistantMessage):
+                for b in m.content:
+                    if getattr(b, "name", None) != "Write":
+                        continue
+                    if getattr(m, "parent_tool_use_id", None):
+                        # A Write issued inside the subagent...
+                        if os.path.realpath(str((getattr(b, "input", None) or {}).get("file_path", ""))) \
+                                == os.path.realpath(wpath):
+                            by_subagent = True
+                            sub_ids.add(getattr(b, "id", None))
+                    else:
+                        lead_wrote = True        # ...not the lead's own
+            if isinstance(m, UserMessage) and isinstance(m.content, list):
+                for b in m.content:
+                    # ...and its result must not be an error (a refused Write).
+                    if getattr(b, "tool_use_id", None) in sub_ids and not getattr(b, "is_error", False):
+                        write_ok = True
+                for b in m.content:
+                    c = getattr(b, "content", None)
+                    log.append(c if isinstance(c, str) else json.dumps(c, default=str)[:500])
+            elif isinstance(m, ResultMessage):
+                cost += m.total_cost_usd or 0
+                log.append(f"[attempt {attempt + 1}] result: {(m.result or '')[:300]}")
+        wrote = (by_subagent and write_ok and not lead_wrote
+                 and os.path.exists(wpath) and "PREFLIGHT_WRITE" in open(wpath).read())
+        if lead_wrote:
+            log.append(f"[attempt {attempt + 1}] the lead used Write itself; not a subagent test")
+        if not by_subagent and os.path.exists(wpath):
+            log.append(f"[attempt {attempt + 1}] the file was written, but not by the subagent")
+        shutil.rmtree(wdir, ignore_errors=True)
+        if wrote:
+            return True, "\n".join(log), cost
+    return False, "\n".join(log), cost
 
 
 def _sdk_version() -> str | None:
@@ -1692,6 +1889,8 @@ def main() -> int:
               f" | cost=${pf.get('cost_usd') or 0:.3f}", flush=True)
         for p in pf["problems"]:
             print(f"  PREFLIGHT PROBLEM: {p}", flush=True)
+        if pf.get("write_probe"):
+            print("  write probe log (last lines):\n    " + pf["write_probe"].replace("\n", "\n    "), flush=True)
         if args.cross_model:
             cm = subprocess.run(["codex", "login", "status"], capture_output=True, text=True,
                                 env={**os.environ, **enforcement.filtered_env(dict(os.environ), args.cloud)})
