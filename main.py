@@ -987,6 +987,21 @@ def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
         print(f"  PROTECTED RUN ARTIFACTS CHANGED OUTSIDE THEIR WRITERS: "
               f"{[e['file'] for e in integrity.open_events]}", flush=True)
     print(f"  Results: {run_dir_rel}/", flush=True)
+    # Phase 29: the run's post-mortem (autopsy.md / autopsy.json), before storage
+    # so it travels with the results; plus one row in the cross-run register.
+    try:
+        sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
+        import run_autopsy
+        _a = run_autopsy.write(run_path)
+        print(f"  Autopsy: primary layer {_a.get('primary_layer') or 'none (accepted)'}", flush=True)
+        _row = run_autopsy.register_row(_a)
+        import results_store
+        if results_store.configured_account():
+            _rp = os.path.join(run_path, "register_row.json")
+            json.dump(_row, open(_rp, "w"), indent=1, default=str)
+            results_store.upload_retry(_rp, f"outputs/register/{_a['run']}.json", attempts=2)
+    except Exception as e:  # noqa: BLE001 — never block finalize
+        print(f"[WARNING] autopsy/register failed: {type(e).__name__}: {e}", flush=True)
     stored = store_run_results(run_path)
     if stored:
         print(f"  Stored: {stored}", flush=True)
