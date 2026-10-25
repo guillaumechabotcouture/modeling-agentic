@@ -1677,25 +1677,20 @@ async def run_preflight(allow_cloud: bool = False) -> dict:
     probe = AgentDefinition(
         description="Preflight probe: runs one shell command and reports its output.",
         prompt="Run exactly the shell command you are given with Bash and "
-               "reply with its full output verbatim. If you are also given a file "
-               "path, save the text PREFLIGHT_WRITE to it with the Write tool. "
-               "Do nothing else.",
-        tools=["Bash", "Write"], model=enforcement.MODEL_DEEP, maxTurns=6)
-    import tempfile
-    wdir = tempfile.mkdtemp(prefix="ma_preflight_")
-    wpath = os.path.join(wdir, WRITER_DRAFT)
+               "reply with its full output verbatim. Do nothing else.",
+        tools=["Bash"], model=enforcement.MODEL_DEEP, maxTurns=4)
     options = ClaudeAgentOptions(
         system_prompt="You are a harness preflight check. Follow instructions literally.",
         model=enforcement.MODEL_DEEP,
         max_buffer_size=enforcement.MAX_BUFFER_SIZE,
         agents={"preflight-probe": probe},
-        tools=["Bash", "Agent"], allowed_tools=["Bash", "Agent", "Write"],
+        tools=["Bash", "Agent"], allowed_tools=["Bash", "Agent"],
         permission_mode="bypassPermissions", setting_sources=[],
         cwd=REPO_ROOT, env=enforcement.filtered_env(dict(os.environ), allow_cloud),
         max_turns=8)
     prompt = (f"1. Run this with Bash and copy its output verbatim:\n{cmd}\n"
               f"2. Spawn the `preflight-probe` agent and give it exactly the same "
-              f"command, and the file path {wpath} to Write. "
+              f"command. "
               f"3. Reply with both outputs verbatim, one per line.")
     texts, result = [], None
     async for m in query(prompt=prompt, options=options):
@@ -1716,15 +1711,56 @@ async def run_preflight(allow_cloud: bool = False) -> dict:
             if getattr(m, "result", None):
                 texts.append(m.result)
     usage = getattr(result, "model_usage", None) if result else None
-    wrote = os.path.exists(wpath) and "PREFLIGHT_WRITE" in open(wpath).read()
-    shutil.rmtree(wdir, ignore_errors=True)
+    wrote, write_log, write_cost = await _probe_subagent_write(allow_cloud)
     problems = evaluate_preflight("\n".join(texts), usage,
                                   bool(result is None or result.is_error), subagent_wrote=wrote,
                                   sdk_version=_sdk_version(), sdk_pinned=pinned_sdk_version())
+    cost = getattr(result, "total_cost_usd", None) if result else None
     return {"ok": not problems, "problems": problems,
             "model_usage": usage,
-            "cost_usd": getattr(result, "total_cost_usd", None) if result else None,
-            "sdk_version": _sdk_version()}
+            "cost_usd": (cost or 0) + (write_cost or 0),
+            "sdk_version": _sdk_version(),
+            "write_probe": None if wrote else write_log[-1500:]}
+
+
+async def _probe_subagent_write(allow_cloud: bool, attempts: int = 2) -> tuple[bool, str, float]:
+    """A subagent must be able to Write the writer's draft file name with the
+    Write tool, as the writer does (Phase 25: the bundled CLI blocks some
+    names for subagents). One job per probe, retried once, so a model that
+    skips the step is not mistaken for a block; the tool results are kept
+    for the log."""
+    import tempfile
+    from claude_agent_sdk import AgentDefinition
+    log, cost = [], 0.0
+    for attempt in range(attempts):
+        wdir = tempfile.mkdtemp(prefix="ma_preflight_")
+        wpath = os.path.join(wdir, WRITER_DRAFT)
+        probe = AgentDefinition(
+            description="Preflight write probe: saves one file with the Write tool.",
+            prompt="Use the Write tool to save the exact text PREFLIGHT_WRITE to the file "
+                   "path you are given. Then reply with the tool's result verbatim.",
+            tools=["Write"], model=enforcement.MODEL_DEEP, maxTurns=3)
+        options = ClaudeAgentOptions(
+            system_prompt="You are a harness preflight check. Follow instructions literally.",
+            model=enforcement.MODEL_DEEP, max_buffer_size=enforcement.MAX_BUFFER_SIZE,
+            agents={"write-probe": probe}, tools=["Agent"], allowed_tools=["Agent"],
+            permission_mode="bypassPermissions", setting_sources=[], cwd=REPO_ROOT,
+            env=enforcement.filtered_env(dict(os.environ), allow_cloud), max_turns=4)
+        async for m in query(prompt=f"Spawn the `write-probe` agent and give it this file path: {wpath}. "
+                                    f"Do not write anything yourself. Reply with what it reported.",
+                             options=options):
+            if isinstance(m, UserMessage) and isinstance(m.content, list):
+                for b in m.content:
+                    c = getattr(b, "content", None)
+                    log.append(c if isinstance(c, str) else json.dumps(c, default=str)[:500])
+            elif isinstance(m, ResultMessage):
+                cost += m.total_cost_usd or 0
+                log.append(f"[attempt {attempt + 1}] result: {(m.result or '')[:300]}")
+        wrote = os.path.exists(wpath) and "PREFLIGHT_WRITE" in open(wpath).read()
+        shutil.rmtree(wdir, ignore_errors=True)
+        if wrote:
+            return True, "\n".join(log), cost
+    return False, "\n".join(log), cost
 
 
 def _sdk_version() -> str | None:
@@ -1777,6 +1813,8 @@ def main() -> int:
               f" | cost=${pf.get('cost_usd') or 0:.3f}", flush=True)
         for p in pf["problems"]:
             print(f"  PREFLIGHT PROBLEM: {p}", flush=True)
+        if pf.get("write_probe"):
+            print("  write probe log (last lines):\n    " + pf["write_probe"].replace("\n", "\n    "), flush=True)
         if args.cross_model:
             cm = subprocess.run(["codex", "login", "status"], capture_output=True, text=True,
                                 env={**os.environ, **enforcement.filtered_env(dict(os.environ), args.cloud)})
