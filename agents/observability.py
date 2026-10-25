@@ -176,6 +176,8 @@ class Heartbeat(threading.Thread):
         os.replace(tmp, os.path.join(self.run_path, STATUS_FILE))
         if self.uploader:
             self.uploader(os.path.join(self.run_path, STATUS_FILE), "status.json")
+            if os.path.exists(os.path.join(self.run_path, RESOURCES_FILE)):
+                self.uploader(os.path.join(self.run_path, RESOURCES_FILE), RESOURCES_FILE)   # full history
             if time.time() - self.last_checkpoint >= self.checkpoint_s:
                 self.checkpoint()
         return status
@@ -192,6 +194,16 @@ class Heartbeat(threading.Thread):
             f.write(data)
         self.uploader(tmp, "checkpoint.tar.gz")
         os.remove(tmp)
+        # The CLI transcripts (every LLM message and tool call) live outside the
+        # run dir; checkpoint them too so a lost VM does not lose them (Codex).
+        tdir = os.environ.get("MA_TRANSCRIPTS_DIR") or os.path.expanduser("~/.claude/projects")
+        if os.path.isdir(tdir):
+            tdata, _ = results_store.archive_dir(tdir, "transcripts", secrets)
+            ttmp = tmp.replace(".checkpoint.", ".transcripts.")
+            with open(ttmp, "wb") as f:
+                f.write(tdata)
+            self.uploader(ttmp, "transcripts.tar.gz")
+            os.remove(ttmp)
         self.last_checkpoint = time.time()
 
     def snapshot(self, agent: str) -> None:
@@ -237,14 +249,26 @@ class Heartbeat(threading.Thread):
                 except Exception:  # noqa: BLE001 — visibility must never break the run
                     self.errors += 1
 
-    def stop(self) -> None:
+    def stop(self, timeout_s: float = 180) -> None:
+        """Stop the thread, then drain queued stage snapshots and write a last
+        beat + checkpoint, all within `timeout_s` so storage can never block
+        finalize (Codex, Phase 29)."""
         self.stop_event.set()
         self.state.wake.set()
-        try:
-            self.beat()
-            self.checkpoint()
-        except Exception:  # noqa: BLE001
-            self.errors += 1
+        self.join(5)
+
+        def last():
+            try:
+                self._drain_snapshots()
+                self.beat()
+                self.checkpoint()
+            except Exception:  # noqa: BLE001
+                self.errors += 1
+        t = threading.Thread(target=last, daemon=True, name="ma-heartbeat-final")
+        t.start()
+        t.join(timeout_s)
+        if t.is_alive():
+            self.errors += 1          # left running in the background; finalize proceeds
 
 
 def storage_uploader(run_path: str):
@@ -268,6 +292,21 @@ def self_test() -> list[str]:
     import tempfile
     from claude_agent_sdk import AssistantMessage, ToolUseBlock, ToolResultBlock, UserMessage
     fails = []
+    saved_tdir = os.environ.get("MA_TRANSCRIPTS_DIR")
+    tdir = tempfile.mkdtemp()                       # never archive the operator's own transcripts
+    os.environ["MA_TRANSCRIPTS_DIR"] = tdir
+    try:
+        return _self_test_body(fails)
+    finally:
+        if saved_tdir is None:
+            os.environ.pop("MA_TRANSCRIPTS_DIR", None)
+        else:
+            os.environ["MA_TRANSCRIPTS_DIR"] = saved_tdir
+
+
+def _self_test_body(fails: list[str]) -> list[str]:
+    import tempfile
+    from claude_agent_sdk import AssistantMessage, ToolUseBlock, ToolResultBlock, UserMessage
     with tempfile.TemporaryDirectory() as d:
         st = LiveState()
         st.on_message(AssistantMessage(content=[ToolUseBlock("a1", "Agent", {"subagent_type": "modeler"})],
@@ -303,7 +342,8 @@ def self_test() -> list[str]:
         if sys_path_ok:
             if not os.path.exists(os.path.join(d, STATUS_FILE)) or not os.path.exists(os.path.join(d, RESOURCES_FILE)):
                 fails.append("OB5 status.json and resources.jsonl are written")
-            if ("status.json", True) not in uploaded or ("checkpoint.tar.gz", True) not in uploaded:
+            if ("status.json", True) not in uploaded or ("checkpoint.tar.gz", True) not in uploaded \
+                    or ("transcripts.tar.gz", True) not in uploaded or ("resources.jsonl", True) not in uploaded:
                 fails.append(f"OB6 status and checkpoint are uploaded: {uploaded}")
             r = json.loads(open(os.path.join(d, RESOURCES_FILE)).readline())
             if not (0 <= r["mem_used_pct"] <= 100 and r["top"]):

@@ -575,6 +575,31 @@ def restore_report_if_missing(run_path: str) -> bool:
     return True
 
 
+VERDICT_BANNER_MARK = "<!-- harness: final gate verdict -->"
+
+
+def add_verdict_banner(run_path: str, gate: dict | None) -> bool:
+    """If the final gate did not ACCEPT, make sure report.md opens with the
+    verdict (a report written before the final rejection would otherwise
+    read as accepted). Harness-written and labelled as such; idempotent."""
+    rp = os.path.join(run_path, "report.md")
+    action = (gate or {}).get("action")
+    if not os.path.exists(rp) or action == "ACCEPT":
+        return False
+    body = open(rp).read()
+    if VERDICT_BANNER_MARK in body:
+        return False
+    n = gate.get("unresolved_high")
+    n = len(n) if isinstance(n, list) else gate.get("n_unresolved_high")
+    banner = (f"{VERDICT_BANNER_MARK}\n> **Status: not accepted by the final gate** "
+              f"(verdict: {action or gate.get('error') or 'not run'}"
+              + (f"; {n} unresolved blocking finding(s)" if n is not None else "")
+              + "; see `final_gate.json`). Added by the harness after the report was written: "
+              "read the findings below as what was built, not as a recommendation.\n\n")
+    open(rp, "w").write(banner + body)
+    return True
+
+
 def write_harness_baseline(run_path: str) -> tuple[dict, dict | None]:
     """Hash the harness into <run>/harness_manifest.json. On resume, also
     return the diff against the previous invocation's baseline (operator
@@ -855,9 +880,10 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                 and not os.path.exists(os.path.join(run_path, "manuscript.md")):
             live_state.session = session_num + 1
             await final_writeup(run_path, run_dir_rel, question, max_rounds, budget,
-                                max_budget_usd, session_num + 1, session_outcome, integrity)
+                                max_budget_usd, session_num + 1, session_outcome, integrity,
+                                live_state=live_state)
     finally:
-        heartbeat.stop()          # last status + checkpoint before the final gate and storage
+        heartbeat.stop(timeout_s=180)   # last status + checkpoint; never blocks finalize longer
         status = finalize_run(
             run_path, run_dir_rel, run_start, max_rounds, session_outcome,
             session_num, session_id, session_records, harness_before,
@@ -931,6 +957,12 @@ def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
     if run_gate:          # Phase 29: also after max_sessions / crashes: the verdict is evidence
         print("\nRunning final STAGE 7 gate...", flush=True)
         gate = run_final_gate(run_path, max_rounds)
+        if gate is None:
+            # No critique round was reached: record that explicitly (Codex, Phase 29).
+            gate = {"action": None, "error": "no critique round was reached; nothing to gate",
+                    "ran_at": datetime.now().isoformat()}
+            json.dump(gate, open(os.path.join(run_path, "final_gate.json"), "w"), indent=2)
+        add_verdict_banner(run_path, gate)
 
     harness_diff = enforcement.diff_harness(harness_before, enforcement.hash_harness())
     status = determine_status(session_outcome, gate, has_report,
@@ -1814,6 +1846,40 @@ def _run_self_test() -> int:
        .get("skipped"), "WU5 no budget left: the write-up is skipped and says so")
     shutil.rmtree(_wd, ignore_errors=True)
 
+    # WU6-WU9 (Codex, Phase 29 review)
+    _bd = tempfile.mkdtemp()
+    open(os.path.join(_bd, "report.md"), "w").write("# Report\nWe recommend X.\n")
+    ok(add_verdict_banner(_bd, {"action": "RUN_FAILED", "unresolved_high": [1, 2]})
+       and open(os.path.join(_bd, "report.md")).read().startswith(VERDICT_BANNER_MARK)
+       and not add_verdict_banner(_bd, {"action": "RUN_FAILED"}),
+       "WU6 a report written before a rejection gets the verdict banner once")
+    ok(not add_verdict_banner(_bd, {"action": "ACCEPT"}), "WU6 an accepted report is untouched")
+    shutil.rmtree(_bd, ignore_errors=True)
+    _cd = tempfile.mkdtemp()
+    json.dump({"question": "q"}, open(os.path.join(_cd, "metadata.json"), "w"))
+
+    async def _fq_crash(prompt, options):
+        if options.resume:          # the read-back
+            yield ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+                                num_turns=1, session_id="w9", total_cost_usd=20.0)
+            return
+        yield SystemMessage(subtype="init", data={"session_id": "w9"})
+        raise RuntimeError("Command failed with exit code -9")
+    _bud3 = {"sessions": [{"session": 1, "total_cost_usd": 414.0}]}
+    _i = asyncio.run(final_writeup(_cd, _cd, "q", 8, _bud3, 450.0, 2, "max_sessions_reached",
+                                   query_fn=_fq_crash))
+    ok(_bud3["sessions"][-1]["total_cost_usd"] == 20.0 and "crashed" in _bud3["sessions"][-1]["source"]
+       and _i.get("writer_error"), f"WU7 a crashed write-up is charged (read back), not skipped: {_bud3['sessions'][-1]}")
+
+    class _Ig:
+        def __init__(self): self.w = set()
+        def harness_wrote(self, rel): self.w.add(rel)
+    _ig = _Ig()
+    _harness_wrote_gate_outputs(_ig)
+    ok({"validator_history.jsonl", "metadata.json", "final_gate.json"} <= _ig.w,
+       f"WU8 the write-up's gate and metadata writes are registered as harness writes: {_ig.w}")
+    shutil.rmtree(_cd, ignore_errors=True)
+
     # OB (Phase 29): live status, resources, checkpoints.
     from agents import observability as _ob
     for _f in _ob.self_test():
@@ -2111,8 +2177,19 @@ Spawn the `writer` agent exactly once for run directory {run_dir}. Tell it:
 Do nothing else; the harness renders report.md afterwards."""
 
 
+def _harness_wrote_gate_outputs(integrity) -> None:
+    """The validator (run by the harness) rewrites its own outputs: record them
+    as harness writes so they are not flagged as tampering (Codex, Phase 29)."""
+    if integrity is None:
+        return
+    from agents.integrity import SCRIPT_PRODUCES
+    for rel in set(SCRIPT_PRODUCES.get("validate_critique_yaml.py", ())) | {
+            "final_gate.json", "final_gate_stderr.txt", "metadata.json", BUDGET_LEDGER}:
+        integrity.harness_wrote(rel)
+
+
 async def final_writeup(run_path, run_dir_rel, question, max_rounds, budget, cap, session_num,
-                        outcome, integrity=None, query_fn=None) -> dict:
+                        outcome, integrity=None, query_fn=None, live_state=None) -> dict:
     """Phase 29: when the modeling sessions end without a report (final-round
     RUN_FAILED, budget, sessions, crash), run the final gate and one writer
     session paid from the write-up reserve, so every run leaves a report that
@@ -2120,6 +2197,7 @@ async def final_writeup(run_path, run_dir_rel, question, max_rounds, budget, cap
     info = {"ran": False}
     try:
         gate = run_final_gate(run_path, max_rounds) or {}
+        _harness_wrote_gate_outputs(integrity)
         n_high = len(gate.get("unresolved_high") or []) if isinstance(gate.get("unresolved_high"), list) \
             else gate.get("n_unresolved_high")
         left = remaining_budget(cap, budget["sessions"])
@@ -2142,14 +2220,27 @@ async def final_writeup(run_path, run_dir_rel, question, max_rounds, budget, cap
                                        action=gate.get("action") or gate.get("error") or "not run",
                                        n_high=n_high if n_high is not None else "unknown")
         print(f"\nFINAL WRITE-UP (gate: {gate.get('action')}; budget left ${left})", flush=True)
-        result = None
-        async for m in (query_fn or query)(prompt=prompt, options=options):
-            log_message(m, trace)
-            if isinstance(m, ResultMessage):
-                result = m
-        charge_session(budget, session_num, result, left, session_id=getattr(result, "session_id", None),
-                       elapsed_s=None, source="final write-up")
+        result, sid, err = None, None, None
+        try:
+            async for m in (query_fn or query)(prompt=prompt, options=options):
+                log_message(m, trace)
+                if live_state is not None:
+                    live_state.on_message(m)         # stage snapshot of the writer, live status
+                if isinstance(m, SystemMessage) and m.subtype == "init":
+                    sid = (m.data or {}).get("session_id") or sid
+                elif isinstance(m, ResultMessage):
+                    result, sid = m, m.session_id or sid
+        except Exception as e:  # noqa: BLE001 — still charged below, then recorded
+            err = f"{type(e).__name__}: {e}"[:300]
+        source = "final write-up"
+        if result is None and sid:
+            result = await reconcile_conversation_cost(options, sid, query_fn=query_fn)
+            source = "final write-up (crashed; cost read back)"
+        # unreadable cost: the whole remaining allowance (cap holds)
+        charge_session(budget, session_num, result, left, session_id=sid, elapsed_s=None, source=source)
         write_budget_ledger(run_path, budget, cap, integrity)
+        if err:
+            info["writer_error"] = err
         info.update(ran=True, gate_action=gate.get("action"),
                     manuscript=os.path.exists(os.path.join(run_path, "manuscript.md")))
     except Exception as e:  # noqa: BLE001 — finalize still runs; the gap is recorded
@@ -2160,6 +2251,7 @@ async def final_writeup(run_path, run_dir_rel, question, max_rounds, budget, cap
         meta = json.load(open(mp))
         meta["final_writeup"] = info
         json.dump(meta, open(mp, "w"), indent=2)
+        _harness_wrote_gate_outputs(integrity)
     except (OSError, ValueError):
         pass
     return info
