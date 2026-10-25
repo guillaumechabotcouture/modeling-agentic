@@ -87,3 +87,39 @@ This is a quality baseline, not an A/B adoption test. It measures where the ship
 
 Arms, rubric and decision rules are unchanged. The next resume (attempt 3) runs on the merge commit that contains the fix. Rule 1 (invalid if integrity violations) applies to *open* violations at the end of the run.
 
+
+## Attempts 3–5 and the attempt-6 amendment (2026-10-25, before attempt 6 launched)
+
+### What happened in attempts 3–5 (no quality data was seen)
+
+**Attempt 3–4** (2 runs, ~$698 by the ledger):
+- Both runs completed 8 review rounds and reached DECLARE_SCOPE.
+- Neither produced a report. The Claude CLI bundled with the pinned SDK refuses a subagent's Write to `REPORT*.md`, and the writer was told to write `report.md`.
+- Fixed in PR #21: the writer drafts `manuscript.md`, `report.md` is built from it, and the preflight checks a real subagent write.
+
+**Attempt 5** (1 run, ~$62 actually used; the ledger showed $450):
+- After 2.9 h the session's CLI process and the modeler's own simulation grid were SIGKILLed together, which points to VM memory exhaustion (32 GiB). This is not confirmed: there was no kernel-log access.
+- The PR #15 budget rule then charged the crashed session its whole allowance, so the run stopped instead of resuming.
+- Fixed in PR #23: after a crash the harness reads the conversation's true cumulative cost back. The VM for attempt 6 is 64 GiB.
+- The result was stored to `outputs/runs/e7r5/` (PR #22).
+
+### Attempt 6: design changes (owner-approved)
+
+1. **One run, not two (owner, 2026-10-25):**
+   - **Why:** the first full run since the fixes; limit the loss if a new failure appears.
+   - **Consequence:** the R1–R2 spread (the only variance estimate) is not available. A second run is decided on this run's result.
+2. **Integrity flags do not by themselves invalidate scoring (owner, 2026-10-25).**
+   - **Why:** the integrity detector (`agents/integrity.py`) has known false positives. It infers which shell command wrote a file, and it flagged `identifiability.yaml` in attempts 4 and 5. Its replacement (gate outputs re-produced by the harness) is not merged yet.
+   - **What changes:** open integrity violations are reported with the scores and shown to all raters. They no longer exclude the run under Decision rule 1.
+3. **Unchanged:**
+   - **Run settings:** the question, rubric, raters, blinding and comparator; `--max-rounds 8 --max-sessions 5 --max-budget-usd 450`. The SDK's per-session cap can overshoot by one turn (measured), so the run can end slightly above $450.
+   - **Code:** `main` at `696e5c8`, on a 64 GiB Coiled VM (8 vCPU).
+   - **Results:** stored by the VM itself to `outputs/runs/e7r6/`, with the CLI transcripts (for the per-stage cost and time split).
+4. **Not measured here:** the compute service. Nothing makes the modeler use it, and attempt 5 ran its grid serially. This run is a speed and cost baseline without it.
+
+### What the result will change (stated before launch)
+
+- **No `report.md`:** an engineering failure. Diagnose it from the stored run; no scoring.
+- **A report, and any owner score below 3:** those dimensions become the next work items, in order of how far below 3 they are (existing rule 3).
+- **A report, and every owner score at least 3 with a mean of at least 3.5:** "fit as an expert first draft" for this question. The next step is a second run to estimate variance before any claim of reliability.
+- **In every case:** report the dollars and hours per report, with the per-stage split, as the baseline for the compute-service and leaner-stage experiments.
