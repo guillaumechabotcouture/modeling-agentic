@@ -902,8 +902,40 @@ def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
         print(f"  PROTECTED RUN ARTIFACTS CHANGED OUTSIDE THEIR WRITERS: "
               f"{[e['file'] for e in integrity.open_events]}", flush=True)
     print(f"  Results: {run_dir_rel}/", flush=True)
+    stored = store_run_results(run_path)
+    if stored:
+        print(f"  Stored: {stored}", flush=True)
     print(f"{'='*60}", flush=True)
     return status
+
+
+def store_run_results(run_path: str, service=None) -> str | None:
+    """Phase 26: when $MA_STORAGE_ACCOUNT is set (cloud runs), upload the
+    finished run directory to outputs/runs/<run name>.tar.gz, so the result
+    never depends on someone collecting it from the VM. Never fatal."""
+    account = os.environ.get("MA_STORAGE_ACCOUNT")
+    if not account and service is None:
+        return None
+    import io as _io
+    import tarfile as _tf
+    sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
+    try:
+        import results_store
+        name = os.path.basename(os.path.normpath(run_path))
+        buf = _io.BytesIO()
+        with _tf.open(fileobj=buf, mode="w:gz") as t:
+            t.add(run_path, arcname=name,
+                  filter=lambda ti: None if "/_truth" in ti.name or ti.name.endswith(".env") else ti)
+        tmp = os.path.join(os.path.dirname(os.path.normpath(run_path)), f".{name}.store.tar.gz")
+        with open(tmp, "wb") as f:
+            f.write(buf.getvalue())
+        blob = f"outputs/{os.environ.get('MA_STORAGE_PREFIX', 'runs')}/{name}.tar.gz"
+        results_store.upload(tmp, blob, account, service=service)
+        os.remove(tmp)
+        return blob
+    except Exception as e:  # noqa: BLE001 — the local copy remains; say so loudly
+        print(f"[ERROR] could not store run results: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1564,6 +1596,33 @@ def _run_self_test() -> int:
                                                     sdk_version="0.2.174", sdk_pinned="0.2.169")),
        "WD4 preflight must fail when the installed SDK differs from the pinned one")
     ok(pinned_sdk_version() is not None, "WD4 requirements.txt pins claude-agent-sdk")
+    # ST1 (Phase 26): a finished run uploads itself (never _truth/), when configured.
+    class _FB:
+        def __init__(self, st, k): self.st, self.k = st, k
+        def upload_blob(self, data, overwrite=False): self.st[self.k] = bytes(data)
+        def download_blob(self):
+            v = self.st[self.k]
+            return type("D", (), {"readall": lambda _s: v})()
+
+    class _FS:
+        def __init__(self): self.st = {}
+        def get_blob_client(self, c, n): return _FB(self.st, (c, n))
+    _sr = tempfile.mkdtemp()
+    _run = os.path.join(_sr, "2026-10-24_000000_x")
+    os.makedirs(os.path.join(_run, "_truth"))
+    open(os.path.join(_run, "report.md"), "w").write("r")
+    open(os.path.join(_run, "_truth", "answers.yaml"), "w").write("secret")
+    _fs = _FS()
+    _blob = store_run_results(_run, service=_fs)
+    import io as _io2, tarfile as _tf2
+    _names = _tf2.open(fileobj=_io2.BytesIO(_fs.st.get(("outputs", "runs/2026-10-24_000000_x.tar.gz"), b"")),
+                       mode="r:gz").getnames() if _blob else []
+    ok(_blob and any(n.endswith("report.md") for n in _names) and not any("_truth" in n for n in _names),
+       f"ST1 run stored without _truth/: {_names}")
+    ok(store_run_results(_run) is None or os.environ.get("MA_STORAGE_ACCOUNT"),
+       "ST1 nothing is stored when no account is configured")
+    shutil.rmtree(_sr, ignore_errors=True)
+
     # WD5 (Codex, PR #21): a render that times out still ends with report.md.
     _rd5 = tempfile.mkdtemp()
     open(os.path.join(_rd5, WRITER_DRAFT), "w").write("# Draft\n")

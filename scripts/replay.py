@@ -690,6 +690,40 @@ def _self_test() -> int:
         leak = os.path.join(td, "diag.txt"); open(leak, "w").write("debug: " + body[1] + "\n")
         hits = rcoil.redact_secrets([leak], rcoil.tls_key_secrets(tdir))
         ok(hits and body[1] not in open(leak).read(), f"C5b an exported TLS key line is redacted: {hits}")
+        # C6 (Phase 26): with the cluster gone, collect gets each case from storage.
+        import hashlib as _hl
+        st = {}
+
+        class _B:
+            def __init__(self, k): self.k = k
+            def upload_blob(self, data, overwrite=False): st[self.k] = bytes(data)
+            def download_blob(self):
+                if self.k not in st:
+                    raise FileNotFoundError(self.k)
+                v = st[self.k]
+                return type("D", (), {"readall": lambda _s: v})()
+
+        class _S:
+            def get_blob_client(self, c, n): return _B((c, n))
+        bd = os.path.join(td, "store_batch"); os.makedirs(bd)
+        tb = io.BytesIO()
+        with tarfile.open(fileobj=tb, mode="w:gz") as t:
+            body = json.dumps({"fixture": "F1", "variant": "base", "seed": 0, "status": "completed",
+                               "telemetry": {"wall_s": 5}}).encode()
+            ti = tarfile.TarInfo("base/F1-s0/case.json"); ti.size = len(body); t.addfile(ti, io.BytesIO(body))
+        tbytes = tb.getvalue()
+        st[("outputs", "replay/b1/k1/result.tar.gz")] = tbytes
+        st[("outputs", "replay/b1/k1/result.json")] = json.dumps({"status": "completed",
+                                                                  "sha256": _hl.sha256(tbytes).hexdigest()}).encode()
+        rec = {"store": {"account": "acct", "prefix": "replay/b1"},
+               "cases": {"k1": {"variant_id": "base", "fixture_id": "F1", "seed": 0, "worker": "w"},
+                         "k2": {"variant_id": "base", "fixture_id": "F2", "seed": 0, "worker": "w"}}}
+        dd = os.path.join(bd, ".collected"); os.makedirs(dd)
+        got = rcoil.collect_from_store(bd, rec, dd, log=lambda *_: None, service=_S())
+        ok(got is None and os.path.exists(os.path.join(dd, "k1")) and not os.path.exists(os.path.join(dd, "k2")),
+           "C6 a stored case is collected; an unstored one is reported missing, not faked")
+        ok(json.load(open(os.path.join(bd, "base", "F1-s0", "case.json")))["telemetry"]["wall_s"] == 5,
+           "C6 the stored case's results are installed locally")
         ok(repr(rcoil.Redacted("sk-secret")) == "<redacted>" and "sk-secret" not in str(rcoil.Redacted("sk-secret")),
            "C5 Redacted never prints the secret")
         # C6: the full remote case on this machine (dry agent), then install into a batch.
