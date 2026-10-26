@@ -49,3 +49,17 @@
 {"by": "maintainer", "date": "2026-10-26T03:15", "lesson": "L025", "note": "round 5: P-004, P-007 (pending-WRITE) escalated to HIGH", "result": "recurred", "run": "e7a6_2026-10-26_031522"}
 {"by": "maintainer", "date": "2026-10-26T03:15", "lesson": "L026", "note": "round 5: figure_staleness_detected, numeric_drift_extreme, ci_degenerate", "result": "recurred", "run": "e7a6_2026-10-26_031522"}
 {"by": "maintainer", "date": "2026-10-26T03:15", "lesson": "L027", "note": "round 5 R-009: M5 passes dAIC -10.33 vs -10 only with the anchor slope at k=0", "result": "recurred", "run": "e7a6_2026-10-26_031522"}
+{"by": "auto", "date": "2026-10-26T03:15:22", "lesson": "L003", "note": "not raised in any gate round", "result": "absent", "run": "e7a6_2026-10-26_031522"}
+{"by": "auto", "date": "2026-10-26T03:15:22", "lesson": "L004", "note": "raised by the gate earlier, cleared by the end: ['claims_ledger_invalid']", "result": "caught", "run": "e7a6_2026-10-26_031522"}
+{"by": "auto", "date": "2026-10-26T03:15:22", "lesson": "L005", "note": "raised by the gate earlier, cleared by the end: ['pre_mortem_high_unaddressed']", "result": "caught", "run": "e7a6_2026-10-26_031522"}
+{"by": "auto", "date": "2026-10-26T03:15:22", "lesson": "L006", "note": "not raised in any gate round", "result": "absent", "run": "e7a6_2026-10-26_031522"}
+{"by": "auto", "date": "2026-10-26T03:15:22", "lesson": "L007", "note": "not raised in any gate round", "result": "absent", "run": "e7a6_2026-10-26_031522"}
+{"by": "auto", "date": "2026-10-26T03:15:22", "lesson": "L008", "note": "raised by the gate earlier, cleared by the end: ['unit_doc_scale_mismatch']", "result": "caught", "run": "e7a6_2026-10-26_031522"}
+{"by": "auto", "date": "2026-10-26T03:15:22", "lesson": "L009", "note": "no matching autopsy reason", "result": "absent", "run": "e7a6_2026-10-26_031522"}
+{"by": "auto", "date": "2026-10-26T03:15:22", "lesson": "L010", "note": "no matching autopsy reason", "result": "absent", "run": "e7a6_2026-10-26_031522"}
+{"by": "auto", "date": "2026-10-26T03:15:22", "lesson": "L011", "note": "no matching autopsy reason", "result": "absent", "run": "e7a6_2026-10-26_031522"}
+{"by": "auto", "date": "2026-10-26T03:15:22", "lesson": "L012", "note": "peak memory 99.9%", "result": "recurred", "run": "e7a6_2026-10-26_031522"}
+{"by": "auto", "date": "2026-10-26T03:15:22", "lesson": "L014", "note": "present", "result": "absent", "run": "e7a6_2026-10-26_031522"}
+{"by": "auto", "date": "2026-10-26T03:15:22", "lesson": "L026", "note": "in the last gate round: ['ci_degenerate']", "result": "recurred", "run": "e7a6_2026-10-26_031522"}
+{"by": "auto", "date": "2026-10-26T03:15:22", "lesson": "L028", "note": "no matching autopsy reason", "result": "absent", "run": "e7a6_2026-10-26_031522"}
+{"by": "maintainer", "date": "2026-10-26T03:15", "lesson": "L028", "note": "lead stopped after round 6 of 8 with ~$54 of modeling budget left (one round ~$50-60); not detected automatically because the lead stopped before the cap", "result": "recurred", "run": "e7a6_2026-10-26_031522"}
