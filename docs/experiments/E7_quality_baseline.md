@@ -123,3 +123,21 @@ Arms, rubric and decision rules are unchanged. The next resume (attempt 3) runs 
 - **A report, and any owner score below 3:** those dimensions become the next work items, in order of how far below 3 they are (existing rule 3).
 - **A report, and every owner score at least 3 with a mean of at least 3.5:** "fit as an expert first draft" for this question. The next step is a second run to estimate variance before any claim of reliability.
 - **In every case:** report the dollars and hours per report, with the per-stage split, as the baseline for the compute-service and leaner-stage experiments.
+
+### Attempt 6: second amendment (2026-10-26, before launch; owner decisions A and B)
+
+- **A. Every run ends with a report.**
+  - **Reserve:** 8% of the cap ($36 of $450) is held back for writing.
+  - **When there is no report:** if the sessions end without one, the harness runs the final gate and a writer session. The report opens with the gate's verdict.
+  - **A final-round RUN_FAILED** now produces a report marked not accepted.
+  - **Scoring a not-accepted report:** the rubric is applied as written. The verdict is shown to the raters and reported with the scores.
+- **B. Simulation batches run on 4 separate compute VMs** (8 vCPU each) through the compute service. The agent's VM (64 GiB) runs no compute-service work.
+  - **Consequence for the cost and time figures:** this run's figures are a baseline with the compute service available, not without it.
+  - **Unchanged:** whether the modeler uses the compute service is up to the modeler. The autopsy reports its use.
+- **Also recorded with the run:**
+  - live status and resource history;
+  - stage-boundary snapshots (replay fixtures);
+  - 30-minute checkpoints including the CLI transcripts;
+  - `autopsy.md` with the failure layer;
+  - a cross-run register row.
+- **Pre-launch smoke on the launch code passed:** preflight, the pipeline's own report, the final gate and storage.
