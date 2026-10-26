@@ -685,6 +685,10 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                         else:
                             lost += 1
                         msg = f"chunk failed: {type(e).__name__}: {e}"[:500]
+                        progress.setdefault("chunks", []).append(
+                            {"n": len(ch), "attempt": attempt, "error": msg[:200],
+                             "core_s": round(min(f_share, busy), 1) if f_share else None,
+                             "wall_s": round(time.time() - started.get(f, time.time()), 1)})
                         errors.update({i: msg for i, _ in ch})
                         if attempt == 0 and (deadline is None or time.time() < deadline):
                             queue.insert(0, (ch, 1))
@@ -878,14 +882,17 @@ def map_fn(run_dir: str, fn_spec: str, inputs: list, backend: str = "auto",
     summary = {**{k: v for k, v in info.items() if k not in ("slots", "cores_per_slot")},
                "n": len(rows), "n_ok": sum(r["ok"] for r in rows),
                "n_failed": sum(not r["ok"] for r in rows), "wall_s": round(wall, 1),
-               "task_core_s": round(core_s, 1), "estimated_core_s": round(est, 1)}
+               "task_core_s": round(core_s, 1), "estimated_core_s": round(est, 1),
+               # what the model calls themselves took: a charge far above it points at
+               # retried or unconfirmed chunks (see "chunks")
+               "model_s": round(_known_core_s(rows), 1)}
     if not ledger:
         return rows, summary
     with _LedgerLock(run_dir) as led:
         led["reservations"].pop(rid, None)
         led["core_seconds"] = round(led["core_seconds"] + core_s, 1)
         led["calls"].append({k: summary.get(k) for k in ("backend", "workers", "n", "n_failed", "wall_s",
-                                                         "task_core_s", "estimated_core_s", "stopped")}
+                                                         "task_core_s", "estimated_core_s", "model_s", "stopped")}
                             | {"fn": fn_spec, "ts": time.strftime("%FT%T")})
     return rows, summary
 
