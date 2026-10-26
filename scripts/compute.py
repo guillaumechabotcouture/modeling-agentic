@@ -507,6 +507,16 @@ class ComputeTagPlugin(_WorkerPlugin):
         return None
 
 
+# Launcher settings for an autoscaling pool (Coiled check, Phase 30). Coiled's
+# adapt adds VMs only when queued work exceeds `target_duration` (default 3 min),
+# and dask counts each worker thread as a parallel slot although a compute VM
+# runs one chunk at a time on all its cores: with the defaults the pool stayed
+# at 1 VM for a 45-min batch. Use as coiled.Cluster(worker_options=WORKER_OPTIONS)
+# and cluster.adapt(..., **ADAPT_OPTIONS).
+WORKER_OPTIONS = {"nthreads": 1}
+ADAPT_OPTIONS = {"target_duration": "20s"}
+
+
 def register_compute_tags(client, exclude: list[str] | tuple = (), resource: str = "compute") -> None:
     """Tag compute workers on an autoscaling cluster. Uploads this module first
     (as a worker plugin, so workers that join later get it too): the plugin is
