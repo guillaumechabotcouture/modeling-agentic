@@ -27,6 +27,8 @@ Scenarios:
                         session end and what cost does it report?
   hook_context          (Phase 31) do PostToolUse notes reach the model: the
                         turn warning to a subagent, the budget note to the lead?
+  cache_ttl             (Phase 31) are the lead's and a subagent's cache writes
+                        1-hour (CLAUDE_CODE_*PROMPT_CACHE_TTL from cache_env)?
 """
 from __future__ import annotations
 
@@ -50,6 +52,7 @@ def _options(**kw):
     from agents import enforcement
     base = dict(model=MODEL, tools=["Bash"], allowed_tools=["Bash"], permission_mode="bypassPermissions",
                 setting_sources=[], cwd=REPO, max_turns=6, max_buffer_size=enforcement.MAX_BUFFER_SIZE,
+                settings=enforcement.SESSION_SETTINGS,
                 env=enforcement.filtered_env(dict(os.environ), False),
                 system_prompt="You are a test fixture. Follow instructions literally and briefly.")
     base.update(kw)
@@ -188,8 +191,38 @@ async def hook_context(query_fn=None):
             "events": ev[-6:]}
 
 
+async def cache_ttl(query_fn=None):
+    """Phase 31: do the lead's and a subagent's cache writes use the 1-hour
+    TTL (enforcement.cache_env)? Read from the CLI transcripts, which record
+    usage.cache_creation.ephemeral_1h_input_tokens per request."""
+    import glob
+    from claude_agent_sdk import AgentDefinition
+    worker = AgentDefinition(description="Test worker", tools=["Bash"], model="haiku", maxTurns=3,
+                             prompt="Run `echo hi` once with the Bash tool, then reply DONE.")
+    opts = _options(tools=["Agent", "Bash"], allowed_tools=["Agent", "Bash"], agents={"worker": worker},
+                    system_prompt="You are a test fixture. Do not use Bash yourself. Spawn the worker agent once "
+                                  "with the task 'start', then reply OK.")
+    sid, result, err, _, ev = await _converse("Begin.", opts, query_fn=query_fn)
+    found = {"lead": {"1h": 0, "5m": 0}, "subagent": {"1h": 0, "5m": 0}}
+    for path in glob.glob(os.path.expanduser(f"~/.claude/projects/*/{sid}.jsonl")) + \
+            glob.glob(os.path.expanduser(f"~/.claude/projects/*/{sid}/subagents/*.jsonl")):
+        who = "subagent" if "/subagents/" in path else "lead"
+        for line in open(path, errors="replace"):
+            try:
+                cc = ((json.loads(line).get("message") or {}).get("usage") or {}).get("cache_creation") or {}
+            except (ValueError, AttributeError):
+                continue
+            found[who]["1h"] += cc.get("ephemeral_1h_input_tokens") or 0
+            found[who]["5m"] += cc.get("ephemeral_5m_input_tokens") or 0
+    return {"result": _summ(result), "error": err, "cache_writes": found,
+            "env": {k: (opts.env or {}).get(k) for k in ("CLAUDE_CODE_PROMPT_CACHE_TTL", "CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL")},
+            "lead_1h": found["lead"]["1h"] > 0 and found["lead"]["5m"] == 0,
+            "subagent_1h": found["subagent"]["1h"] > 0 and found["subagent"]["5m"] == 0}
+
+
 SCENARIOS = {"resume_cumulative": resume_cumulative, "readback_after_crash": readback_after_crash,
-             "crash_before_init": crash_before_init, "budget_cap": budget_cap, "hook_context": hook_context}
+             "crash_before_init": crash_before_init, "budget_cap": budget_cap, "hook_context": hook_context,
+             "cache_ttl": cache_ttl}
 
 
 def run(names: list[str]) -> dict:

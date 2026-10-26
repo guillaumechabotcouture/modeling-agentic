@@ -215,7 +215,8 @@ async def _sdk_session(stage, run_dir, variant, adef, task, budget_usd, telemetr
         env={**enforcement.filtered_env(dict(os.environ), False),
              **output_caps.compaction_env(variant.get("compaction")),
              **{str(k): str(v) for k, v in (variant.get("env") or {}).items()}},
-        max_budget_usd=float(budget_usd), max_buffer_size=enforcement.MAX_BUFFER_SIZE)
+        max_budget_usd=float(budget_usd), max_buffer_size=enforcement.MAX_BUFFER_SIZE,
+        settings=enforcement.SESSION_SETTINGS)
     seen, result, session_id = set(), None, None
     try:
         async for m in query(prompt=LEAD_PROMPT.format(agent=agent, task=task), options=opts):

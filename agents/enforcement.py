@@ -541,14 +541,35 @@ MAX_BUFFER_SIZE = 32 * 1024 * 1024
 # Environment
 # ---------------------------------------------------------------------------
 
+# Phase 31: the prompt cache lives 1 hour instead of 5 minutes, for the lead
+# and for subagents. E7 attempt 6: 44% of the measured spend was the cache
+# being re-written after 5-60 min waits (the lead waiting on subagents, the
+# modeler on simulations); replayed on that run, 1 h writes would have cut
+# cache spend from $300 to about $186. MA_PROMPT_CACHE_TTL=5m restores the
+# default for comparison.
+def cache_env(environ: dict[str, str]) -> dict[str, str]:
+    ttl = environ.get("MA_PROMPT_CACHE_TTL", "1h")
+    if ttl not in ("1h", "5m"):
+        ttl = "1h"
+    return {"CLAUDE_CODE_PROMPT_CACHE_TTL": ttl, "CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL": ttl}
+
+
+# Session settings for every pipeline session: with a 1 h cache the CLI may
+# compact a long idle conversation, which could drop the lead's instructions;
+# off until compaction is tested on its own.
+SESSION_SETTINGS = '{"idleCompaction": false}'
+
+
 def filtered_env(environ: dict[str, str], allow_cloud: bool) -> dict[str, str]:
     """Overrides for ClaudeAgentOptions.env.
 
     The SDK merges os.environ with options.env, so variables cannot be
     removed, only overridden. Cloud credentials are blanked when cloud
-    execution is off; downstream code treats empty as unset.
+    execution is off; downstream code treats empty as unset. Phase 31:
+    also sets the prompt-cache TTL (cache_env).
     """
     overrides = interpreter_env(environ)
+    overrides.update(cache_env(environ))
     if not allow_cloud:
         overrides.update({k: "" for k in environ if k.startswith(CLOUD_ENV_PREFIXES)})
     return overrides

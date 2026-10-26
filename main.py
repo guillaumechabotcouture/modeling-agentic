@@ -755,7 +755,7 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                 system_prompt=lead_system,
                 agents=agents,
                 model=(smoke_settings() or {}).get("model", enforcement.MODEL_DEEP),
-                max_buffer_size=enforcement.MAX_BUFFER_SIZE,
+                max_buffer_size=enforcement.MAX_BUFFER_SIZE, settings=enforcement.SESSION_SETTINGS,
                 tools=LEAD_TOOLS,
                 allowed_tools=LEAD_TOOLS,
                 permission_mode="bypassPermissions",
@@ -1574,8 +1574,11 @@ def _run_self_test() -> int:
     # V1: environment filtering
     env = {"ANTHROPIC_API_KEY": "a", "AZ_BATCH_ACCOUNT": "b", "OPENAI_API_KEY": "c", "PATH": "/bin"}
     ov = enforcement.filtered_env(env, allow_cloud=False)
-    ok({k: v for k, v in ov.items() if k not in ("PATH", "VIRTUAL_ENV")}
+    ok({k: v for k, v in ov.items() if k not in ("PATH", "VIRTUAL_ENV") and "CACHE_TTL" not in k}
        == {"AZ_BATCH_ACCOUNT": "", "OPENAI_API_KEY": ""}, f"V1 env filter: {ov}")
+    ok(ov.get("CLAUDE_CODE_PROMPT_CACHE_TTL") == "1h" and ov.get("CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL") == "1h"
+       and enforcement.filtered_env({**env, "MA_PROMPT_CACHE_TTL": "5m"}, False)["CLAUDE_CODE_PROMPT_CACHE_TTL"] == "5m",
+       f"V1b (Phase 31) 1-hour prompt cache for the lead and subagents, 5m on request: {ov}")
     ok("AZ_BATCH_ACCOUNT" not in enforcement.filtered_env(env, allow_cloud=True),
        "V1 cloud creds kept with --cloud")
     # V2 (Phase 21 α): agents' PATH starts with this interpreter's bin/,
@@ -1827,6 +1830,8 @@ def _run_self_test() -> int:
               if isinstance(n, _ast.Call) and getattr(n.func, "id", "") == "ClaudeAgentOptions"]
     ok(_calls and all(any(k.arg == "max_buffer_size" for k in c.keywords) for c in _calls),
        "BUF1 a ClaudeAgentOptions(...) call lacks max_buffer_size")
+    ok(all(any(k.arg == "settings" for k in c.keywords) for c in _calls if any(k.arg == "env" for k in c.keywords)),
+       "BUF1b (Phase 31) a pipeline ClaudeAgentOptions(...) call lacks settings=SESSION_SETTINGS (idle compaction off)")
     ok(enforcement.MAX_BUFFER_SIZE > 1024 * 1024, "BUF1 buffer not raised")
 
     # WD1 (Phase 25): the bundled CLI refuses Write by a subagent to
@@ -2128,7 +2133,7 @@ async def run_preflight(allow_cloud: bool = False) -> dict:
     options = ClaudeAgentOptions(
         system_prompt="You are a harness preflight check. Follow instructions literally.",
         model=enforcement.MODEL_DEEP,
-        max_buffer_size=enforcement.MAX_BUFFER_SIZE,
+        max_buffer_size=enforcement.MAX_BUFFER_SIZE, settings=enforcement.SESSION_SETTINGS,
         agents={"preflight-probe": probe},
         tools=["Bash", "Agent"], allowed_tools=["Bash", "Agent"],
         permission_mode="bypassPermissions", setting_sources=[],
@@ -2188,7 +2193,7 @@ async def _probe_subagent_write(allow_cloud: bool, attempts: int = 2) -> tuple[b
             tools=["Write"], model=enforcement.MODEL_DEEP, maxTurns=3)
         options = ClaudeAgentOptions(
             system_prompt="You are a harness preflight check. Follow instructions literally.",
-            model=enforcement.MODEL_DEEP, max_buffer_size=enforcement.MAX_BUFFER_SIZE,
+            model=enforcement.MODEL_DEEP, max_buffer_size=enforcement.MAX_BUFFER_SIZE, settings=enforcement.SESSION_SETTINGS,
             # The lead's real tool list: a subagent only gets tools its parent has.
             agents={"write-probe": probe}, tools=LEAD_TOOLS, allowed_tools=LEAD_TOOLS,
             permission_mode="bypassPermissions", setting_sources=[], cwd=REPO_ROOT,
@@ -2284,7 +2289,7 @@ async def final_writeup(run_path, run_dir_rel, question, max_rounds, budget, cap
         options = ClaudeAgentOptions(
             system_prompt="You are the harness's final write-up step. Follow the instructions literally.",
             agents=agents, model=(smoke_settings() or {}).get("model", enforcement.MODEL_DEEP),
-            max_buffer_size=enforcement.MAX_BUFFER_SIZE, tools=LEAD_TOOLS, allowed_tools=LEAD_TOOLS,
+            max_buffer_size=enforcement.MAX_BUFFER_SIZE, settings=enforcement.SESSION_SETTINGS, tools=LEAD_TOOLS, allowed_tools=LEAD_TOOLS,
             permission_mode="bypassPermissions", setting_sources=["project"], hooks=hooks,
             cwd=REPO_ROOT, env=enforcement.filtered_env(dict(os.environ), False), max_turns=8)
         if left is not None:
