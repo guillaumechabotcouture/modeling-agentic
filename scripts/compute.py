@@ -447,11 +447,14 @@ def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: lis
                     return failed("cancelled")
                 return failed(f"chunk subprocess failed (rc {proc.returncode}): {(err or '')[-800:]}")
             rows = [json.loads(l) for l in open(out) if l.strip()]
+            csum = None
             try:
-                core_s = float(json.load(open(out + ".summary.json"))["task_core_s"])
+                csum = json.load(open(out + ".summary.json"))
+                core_s = float(csum["task_core_s"])
             except (OSError, ValueError, KeyError, TypeError):
                 core_s = (time.time() - t0) * procs    # no summary: charge the chunk as fully busy
-    return {"rows": [{**row, "i": chunk[k][0], "worker": waddr} for k, row in enumerate(rows)], "core_s": core_s}
+    return {"rows": [{**row, "i": chunk[k][0], "worker": waddr} for k, row in enumerate(rows)], "core_s": core_s,
+            "summary": csum if isinstance(csum, dict) else None, "stderr_tail": (err or "")[-300:]}
 
 
 def _stop_chunk(pid: int, grace_s: float = 5.0):
@@ -665,6 +668,13 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                         got = f.result()
                         rows += got["rows"]
                         progress["core_s"] += float(got["core_s"])
+                        progress.setdefault("chunks", []).append(
+                            {"n": len(ch), "core_s": round(float(got["core_s"]), 1),
+                             "task_s": round(_known_core_s(got["rows"]), 1),
+                             "wall_s": round(time.time() - started.get(f, time.time()), 1),
+                             "worker": (got["rows"][0].get("worker") if got["rows"] else None),
+                             "chunk_summary": {k: v for k, v in (got.get("summary") or {}).items() if k != "bundle"},
+                             "stderr_tail": got.get("stderr_tail") or ""})
                     except Exception as e:  # noqa: BLE001 — a lost worker fails only its chunk
                         # Its work is unknown: charge the share it was allowed
                         # (chunks enforce their share), or estimate it at the end.
@@ -722,7 +732,8 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
     return rows, {"backend": "dask", "workers": len(workers), "pool_target": pool, "slots": slots,
                   "cores_per_slot": cores_per_slot,
                   "core_s": progress["core_s"], "stopped": stop,
-                  "unknown_chunks": lost + len(pending) + len(gone), "bundle": binfo}
+                  "unknown_chunks": lost + len(pending) + len(gone), "bundle": binfo,
+                  "chunks": progress.get("chunks", [])}
 
 
 # --------------------------------------------------------------------------- #
