@@ -483,6 +483,30 @@ def _cancel_call(call_id: str) -> int:
     return n
 
 
+try:
+    from distributed.diagnostics.plugin import WorkerPlugin as _WorkerPlugin
+except ImportError:          # local backend only
+    _WorkerPlugin = object
+
+
+class ComputeTagPlugin(_WorkerPlugin):
+    """Phase 30: tag every worker that joins the cluster with the compute
+    resource, except the run's own workers, so an autoscaling pool works with
+    resource-restricted tasks. Register with client.register_plugin(...)."""
+
+    name = "ma-compute-tag"
+
+    def __init__(self, resource: str = "compute", exclude: list[str] | tuple = ()):
+        self.resource, self.exclude = resource, set(exclude)
+
+    async def setup(self, worker):
+        if worker.address not in self.exclude:
+            await worker.set_resources(**{self.resource: 1})
+
+    def teardown(self, worker):
+        return None
+
+
 def export_worker_env(tls_dir: str, worker=None) -> dict:
     """Call INSIDE a dask worker task (the launcher's run job). Returns the
     env a subprocess needs to reach this cluster: the scheduler address and,
@@ -550,19 +574,30 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
         # workers must be able to import this module: ship it to them.
         c.upload_file(os.path.abspath(__file__))
         winfo = c.scheduler_info()["workers"]
-        workers = [w for w in winfo if w not in exclude]
-        if max_workers:
-            workers = workers[:max_workers]
-        if not workers:
-            raise RuntimeError("no compute workers available (all are excluded run workers)")
+        # Phase 30: on an autoscaling pool, compute workers carry a resource tag
+        # (ComputeTagPlugin) and tasks ask for it, so VMs that join mid-batch get
+        # work and the run's own VM (untagged) never does.
+        res = os.environ.get("MA_COMPUTE_RESOURCE")
+        target = int(os.environ.get("MA_COMPUTE_TARGET_WORKERS") or 0)
+        if res:
+            workers = [w for w in winfo if w not in exclude and res in (winfo[w].get("resources") or {})]
+        else:
+            workers = [w for w in winfo if w not in exclude]
+            if max_workers:
+                workers = workers[:max_workers]
+            if not workers:
+                raise RuntimeError("no compute workers available (all are excluded run workers)")
         env_procs = os.environ.get("MA_COMPUTE_PROCS_PER_WORKER")
-        cpus = c.run(os.cpu_count, workers=workers)
+        cpus = c.run(os.cpu_count, workers=workers) if workers else {}
         procs = {w: int(env_procs) if env_procs else (cpus.get(w) or 1) for w in workers}   # compute VMs run nothing else
-        cores_per_slot = max(procs.values())
-        chunks = _chunks(list(enumerate(inputs)), len(workers) * chunks_per_worker)
-        slots = max(1, min(len(workers), len(chunks)))   # _remote_task runs one chunk at a time per VM
+        cores_per_slot = max(procs.values()) if procs else int(env_procs or os.environ.get("MA_COMPUTE_CORES_PER_WORKER") or 8)
+        pool = max(len(workers), target if res else 0, 1)        # the pool the batch may grow into
+        chunks = _chunks(list(enumerate(inputs)), pool * chunks_per_worker)
+        slots = max(1, min(pool, len(chunks)))   # _remote_task runs one chunk at a time per VM
         progress.update(slots=slots, cores_per_slot=cores_per_slot, core_s=0.0)
-        bfut = c.scatter(bundle, workers=workers, broadcast=True)
+        bfut = (c.scatter(bundle, broadcast=False, hash=False) if res
+                else c.scatter(bundle, workers=workers, broadcast=True))
+        placement = ({"resources": {res: 1}} if res else {"workers": workers, "allow_other_workers": False})
 
         # At most `slots` chunks are out at once. Each gets a share of what is
         # left of the allowance after charges and the shares of chunks still
@@ -580,7 +615,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
             # charged), rather than through dask retries, which would hide it.
             f = c.submit(_remote_task, bfut, binfo["sha256"], run_dir, fn_spec, ch, deadline,
                          int(env_procs) if env_procs else None,     # None: the worker uses its own core count
-                         share, call_id, REPO, workers=workers, allow_other_workers=False, pure=False)
+                         share, call_id, REPO, pure=False, **placement)
             futs[f] = (ch, attempt)
             held[f] = share or 0.0
             started[f] = time.time()
@@ -634,20 +669,22 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                 for f in pending:
                     f.cancel()
                 try:
-                    c.run(_cancel_call, call_id, workers=workers)
+                    c.run(_cancel_call, call_id, workers=[w for w in c.scheduler_info()["workers"] if w not in exclude])
                 except Exception:  # noqa: BLE001 — cannot confirm the remote stop
                     progress["remote_unconfirmed"] = True
             # The scheduler silently reruns tasks from a worker that died; that
             # attempt's work is invisible here, so a vanished worker is charged
             # as busy for the whole call.
+            # On an autoscaling pool, scale-down only retires idle workers: no lost work.
             try:
-                gone = [w for w in workers if w not in c.scheduler_info()["workers"]]
+                gone = [] if res else [w for w in workers if w not in c.scheduler_info()["workers"]]
             except Exception:  # noqa: BLE001
-                gone = list(workers)
+                gone = [] if res else list(workers)
             progress["gone_workers"] = len(gone)
     done_i = {r["i"] for r in rows}
     rows += [{"i": i, "ok": False, "error": msg} for i, msg in errors.items() if i not in done_i]   # keep the real error
-    return rows, {"backend": "dask", "workers": len(workers), "slots": slots, "cores_per_slot": cores_per_slot,
+    return rows, {"backend": "dask", "workers": len(workers), "pool_target": pool, "slots": slots,
+                  "cores_per_slot": cores_per_slot,
                   "core_s": progress["core_s"], "stopped": stop,
                   "unknown_chunks": lost + len(pending) + len(gone), "bundle": binfo}
 
@@ -1156,6 +1193,33 @@ def _self_test() -> int:
                     rows, s = map_fn(d, "models/slow.py::sleep", [{"s": 1.5}] * 4, max_core_hours=2.0 / 3600)
                     ok(s["n_ok"] == 1 and s["task_core_s"] <= 2.6 and s["stopped"] == CAP_STOP,
                        f"C27 later chunks get only what is left of the allowance: {s}")
+                    # C34 (Phase 30): autoscaling pool. Untagged run worker; a worker
+                    # added mid-batch must get work through the resource tag.
+                    os.environ.pop("MA_COMPUTE_EXCLUDE_WORKERS", None)
+                    from distributed import Client as _C2
+                    import threading as _th2
+                    with _C2(lc.scheduler_address) as _cc:
+                        _cc.register_plugin(ComputeTagPlugin("compute", exclude=[w0]))
+                    os.environ.update(MA_COMPUTE_RESOURCE="compute", MA_COMPUTE_TARGET_WORKERS="3",
+                                      MA_COMPUTE_PROCS_PER_WORKER="1")
+                    open(os.path.join(d, "models", "slowf.py"), "w").write(
+                        "import time\ndef f(p):\n    time.sleep(0.4)\n    return p['x']\n")
+                    box = {}
+                    th = _th2.Thread(target=lambda: box.update(r=map_fn(d, "models/slowf.py::f",
+                                                                         [{"x": k} for k in range(60)], ledger=False)))
+                    th.start()
+                    time.sleep(2.0)
+                    lc.scale(3)                       # a new worker joins mid-batch
+                    th.join(120)
+                    rows2, s2 = box.get("r", ([], {}))
+                    used2 = {r.get("worker") for r in rows2}
+                    new_ws = set(lc.scheduler_info["workers"]) - {w0} - set(list(lc.scheduler_info["workers"])[:2])
+                    ok(len(rows2) == 60 and all(r["ok"] for r in rows2) and w0 not in used2,
+                       f"C34 tagged pool: every task done, none on the untagged run worker: {used2} {s2}")
+                    ok(len(used2) >= 2 and s2.get("pool_target") == 3,
+                       f"C34 a worker that joined mid-batch got work (pool target 3): {used2} {s2.get('pool_target')}")
+                    for k in ("MA_COMPUTE_RESOURCE", "MA_COMPUTE_TARGET_WORKERS"):
+                        os.environ.pop(k, None)
                 finally:
                     os.environ.pop("MA_COMPUTE_SCHEDULER", None)
                     os.environ.pop("MA_COMPUTE_EXCLUDE_WORKERS", None)
