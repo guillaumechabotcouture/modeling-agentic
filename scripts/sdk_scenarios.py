@@ -172,8 +172,11 @@ async def hook_context(query_fn=None):
         prompt=("Run `echo step N` with the Bash tool for N = 1, 2, 3, ... up to 11, ONE call per turn. "
                 "If any tool result contains text starting with [harness], stop at once and reply with "
                 "HARNESS-SEEN followed by the first six words after [harness]."))
-    opts = _options(tools=["Agent"], allowed_tools=["Agent"], agents={"worker": worker}, hooks=hooks, max_turns=8,
-                    system_prompt=("You are a test fixture. Spawn the worker agent once with the task 'start'. "
+    # A subagent may only use tools its parent has, so the lead gets Bash too (told not to use it).
+    opts = _options(tools=["Agent", "Bash"], allowed_tools=["Agent", "Bash"], agents={"worker": worker}, hooks=hooks,
+                    max_turns=8,
+                    system_prompt=("You are a test fixture. Do not use Bash yourself. "
+                                   "Spawn the worker agent once with the task 'start'. "
                                    "When it returns, repeat its last line verbatim. If any tool result you received "
                                    "contains text starting with [harness] Budget, also end your reply with BUDGET-SEEN."))
     sid, result, err, _, ev = await _converse("Begin.", opts, query_fn=query_fn)
