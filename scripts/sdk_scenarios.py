@@ -25,6 +25,8 @@ Scenarios:
   crash_before_init     SIGKILL the CLI before it reports a session id
   budget_cap            max_budget_usd far below one turn's cost: how does the
                         session end and what cost does it report?
+  hook_context          (Phase 31) do PostToolUse notes reach the model: the
+                        turn warning to a subagent, the budget note to the lead?
 """
 from __future__ import annotations
 
@@ -153,8 +155,38 @@ async def budget_cap(query_fn=None):
     return {"result": _summ(result), "error": err, "events": ev}
 
 
+async def hook_context(query_fn=None):
+    """Phase 31: do the harness's PostToolUse notes reach the model? A lead
+    spawns one subagent with a 12-turn cap that runs Bash repeatedly; the
+    subagent should see the turn warning, and the lead the budget note."""
+    import tempfile
+    from datetime import datetime
+    from claude_agent_sdk import AgentDefinition
+    from agents import create_hooks
+    run = tempfile.mkdtemp(prefix="ma_hookctx_")
+    trace = open(os.path.join(run, "trace.jsonl"), "a")
+    hooks = create_hooks(run, trace, datetime.now(), registered_agents={"worker"}, max_turns={"worker": 12},
+                         budget_status=lambda: {"spent": 1.0, "cap": 10.0, "reserve": 1.0})
+    worker = AgentDefinition(
+        description="Test worker", tools=["Bash"], model="haiku", maxTurns=12,
+        prompt=("Run `echo step N` with the Bash tool for N = 1, 2, 3, ... up to 11, ONE call per turn. "
+                "If any tool result contains text starting with [harness], stop at once and reply with "
+                "HARNESS-SEEN followed by the first six words after [harness]."))
+    opts = _options(tools=["Agent"], allowed_tools=["Agent"], agents={"worker": worker}, hooks=hooks, max_turns=8,
+                    system_prompt=("You are a test fixture. Spawn the worker agent once with the task 'start'. "
+                                   "When it returns, repeat its last line verbatim. If any tool result you received "
+                                   "contains text starting with [harness] Budget, also end your reply with BUDGET-SEEN."))
+    sid, result, err, _, ev = await _converse("Begin.", opts, query_fn=query_fn)
+    trace.close()
+    text = (getattr(result, "result", None) or "") if result else ""
+    warned = sum(1 for line in open(os.path.join(run, "trace.jsonl")) if '"turn_warning"' in line)
+    return {"result": _summ(result), "error": err, "text": text[-300:], "turn_warnings_issued": warned,
+            "subagent_saw_warning": "HARNESS-SEEN" in text, "lead_saw_budget": "BUDGET-SEEN" in text,
+            "events": ev[-6:]}
+
+
 SCENARIOS = {"resume_cumulative": resume_cumulative, "readback_after_crash": readback_after_crash,
-             "crash_before_init": crash_before_init, "budget_cap": budget_cap}
+             "crash_before_init": crash_before_init, "budget_cap": budget_cap, "hook_context": hook_context}
 
 
 def run(names: list[str]) -> dict:

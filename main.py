@@ -705,6 +705,17 @@ async def run(question: str, max_rounds: int, max_sessions: int,
     session_records: list[dict] = []
     interrupted = False
 
+    # Phase 31: the lead sees the dollar cap. Spend = the ledger at process
+    # start (earlier invocations) + this process's live estimate.
+    _spent_before = (max_budget_usd - remaining_budget(max_budget_usd, budget["sessions"])
+                     if max_budget_usd else 0.0)
+
+    def _budget_status():
+        if not max_budget_usd:
+            return None
+        return {"spent": _spent_before + float(live_state.est_usd or 0), "cap": max_budget_usd,
+                "reserve": writeup_reserve(max_budget_usd)}
+
     try:
         for session_num in range(1, max_sessions + 1):
             live_state.session = session_num
@@ -727,7 +738,8 @@ async def run(question: str, max_rounds: int, max_sessions: int,
             hooks = create_hooks(run_path, trace_file, run_start,
                                  registered_agents=set(agents.keys()),
                                  max_turns={n: d.maxTurns for n, d in agents.items()},
-                                 integrity=integrity)
+                                 integrity=integrity, max_rounds=max_rounds,
+                                 budget_status=_budget_status)
 
             # Run-wide dollar cap across sessions (and earlier invocations),
             # from the harness-owned ledger.
@@ -1230,6 +1242,59 @@ def _run_self_test() -> int:
         asyncio.run(post_i({"tool_name": "Bash", "tool_input": {"command": "true"}}, "h1", None))
         ok(len(ig3.events) == n0 + 1 and ig3.events[-1]["file"] == "critique_domain.yaml",
            f"IN7 hooks record a lead change to a critique: {ig3.events[n0:]}")
+        # TW1-TW3 (Phase 31): a subagent is warned before its turn limit, once per level
+        hk2 = agents_pkg.create_hooks(td, trace, datetime.now(), registered_agents=reg, max_turns={"modeler": 20})
+        pre2, post2, start2 = (hk2["PreToolUse"][0].hooks[0], hk2["PostToolUse"][0].hooks[0],
+                               hk2["SubagentStart"][0].hooks[0])
+        asyncio.run(start2({"agent_id": "m1", "agent_type": "modeler"}, None, None))
+        got = []
+        for k in range(20):
+            call = {"tool_name": "Read", "tool_input": {"file_path": "x"}, "agent_id": "m1", "agent_type": "modeler"}
+            asyncio.run(pre2(call, f"t{k}", None))
+            r = asyncio.run(post2(call, f"t{k}", None))
+            got.append((k + 1, (r.get("hookSpecificOutput") or {}).get("additionalContext")))
+        warned = [(n, m) for n, m in got if m]
+        ok([n for n, _ in warned] == [16, 17] and "Start writing" in warned[0][1] and "NOW" in warned[1][1],
+           f"TW1 early warning (85% of the cap, at least 4 turns before it) and a final one 3 turns before, "
+           f"once each: {[n for n, _ in warned]}")
+        r = asyncio.run(post2({"tool_name": "Read", "tool_input": {}}, "tl", None))
+        ok(r == {}, f"TW2 the lead is never warned: {r}")
+        ok(sum(1 for l in open(os.path.join(td, "trace.jsonl")) if '"turn_warning"' in l) == 2,
+           "TW3 each warning is recorded in the trace")
+        # WH1-WH6 (Phase 31): the first write-up waits for the gate; the lead sees its budget
+        from agents import writer_hold_reason, budget_note
+        st = {"spent": 200.0, "cap": 450.0, "reserve": 36.0}
+        hist = os.path.join(td, "validator_history.jsonl")
+
+        def gates(*acts):
+            open(hist, "w").write("".join(json.dumps({"round": k + 1, "action": a}) + "\n" for k, a in enumerate(acts)))
+        gates("PATCH_OR_RETHINK", "PATCH_OR_RETHINK")
+        ok(writer_hold_reason(td, st, 8) is not None, "WH1 writer held after PATCH with budget for another round")
+        ok(writer_hold_reason(td, st, 2) is None, "WH2 writer allowed in the final round")
+        ok(writer_hold_reason(td, {"spent": 380.0, "cap": 450.0, "reserve": 36.0}, 8) is None,
+           "WH3 writer allowed when less than one round of budget is left")
+        gates("PATCH_OR_RETHINK", "DECLARE_SCOPE")
+        ok(writer_hold_reason(td, st, 8) is None, "WH4 writer allowed after DECLARE_SCOPE")
+        gates("PATCH_OR_RETHINK")
+        open(os.path.join(td, "manuscript.md"), "w").write("draft")
+        ok(writer_hold_reason(td, st, 8) is None, "WH5 revisions of an existing draft are allowed")
+        os.remove(os.path.join(td, "manuscript.md"))
+        note = budget_note(st, 2)
+        ok(note and "$200 of $450" in note and "$214 for modeling" in note and "2.1 more review round" in note,
+           f"WH6 budget note: spent, reserve, rounds left at the average pace: {note}")
+        hk3 = agents_pkg.create_hooks(td, trace, datetime.now(), registered_agents=reg, max_rounds=8,
+                                      budget_status=lambda: st)
+        pre3, post3 = hk3["PreToolUse"][0].hooks[0], hk3["PostToolUse"][0].hooks[0]
+        spawn = {"tool_name": "Agent", "tool_input": {"subagent_type": "writer", "description": "write", "prompt": "x"}}
+        r = asyncio.run(pre3(spawn, "w1", None))
+        ok("write-up waits for the gate" in json.dumps(r), f"WH7 the hook refuses an early writer spawn: {r}")
+        r = asyncio.run(post3({"tool_name": "Agent", "tool_input": {"subagent_type": "modeler"}}, "w2", None))
+        ok("Budget: about $200" in json.dumps(r), f"WH8 the lead gets the budget note when a subagent returns: {r}")
+        hk4 = agents_pkg.create_hooks(td, trace, datetime.now(), registered_agents=reg, max_rounds=8,
+                                      budget_status=lambda: st, hold_writer=False)
+        r = asyncio.run(hk4["PreToolUse"][0].hooks[0](spawn, "w3", None))
+        ok("write-up waits" not in json.dumps(r), f"WH9 the harness's own write-up is never held: {r}")
+        os.remove(hist)
         trace.close()
     # IC1-IC7 (Codex review of PR #15).
     from agents.integrity import harness_scripts_run
@@ -2214,7 +2279,8 @@ async def final_writeup(run_path, run_dir_rel, question, max_rounds, budget, cap
         agents = {"writer": build_agents(question=question, run_dir=run_dir_rel)["writer"]}
         trace = open(os.path.join(run_path, "trace.jsonl"), "a")
         hooks = create_hooks(run_path, trace, datetime.now(), registered_agents={"writer"},
-                             max_turns={"writer": agents["writer"].maxTurns}, integrity=integrity)
+                             max_turns={"writer": agents["writer"].maxTurns}, integrity=integrity,
+                             hold_writer=False)   # the harness's own write-up is never held
         options = ClaudeAgentOptions(
             system_prompt="You are the harness's final write-up step. Follow the instructions literally.",
             agents=agents, model=(smoke_settings() or {}).get("model", enforcement.MODEL_DEEP),

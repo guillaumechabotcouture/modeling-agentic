@@ -4460,6 +4460,21 @@ def _check_scope_declaration_budget(run_dir: str,
 
     out: list[dict] = []
 
+    # Phase 31: an honored raise is the run choosing to leave more unmodeled;
+    # it is allowed, but the reviewer should see it and the reason (LOW: it
+    # never blocks and never escalates).
+    if cap > _SCOPE_DECLARATION_DEFAULT_CAP:
+        out.append({
+            "kind": "scope_declaration_cap_raised",
+            "severity": "LOW",
+            "stage": "GATE",
+            "claim": (
+                f"The run raised its scope-declaration cap from "
+                f"{_SCOPE_DECLARATION_DEFAULT_CAP} to {cap} ({len(declared)} declared). "
+                f"Reason given: \"{overage_justification[:300]}\""
+            ),
+        })
+
     if cap_override_diagnostic:
         out.append({
             "kind": "scope_declaration_cap_override_rejected",
@@ -4968,6 +4983,11 @@ def _check_persistent_medium_escalation(run_dir: str,
     # Walk each critique YAML's blockers list. For MEDIUM blockers
     # with first_seen_round set and resolved != True, escalate to
     # HIGH if (round_n - first_seen_round) >= threshold.
+    # Phase 31: a blocker aimed at the write-up (target_stage WRITE) cannot
+    # be fixed before the write-up exists, so it does not escalate until
+    # then (E7 attempt 6: two such findings became HIGH in round 5 and the
+    # lead ran the writer mid-round to clear them).
+    written = any(os.path.exists(os.path.join(run_dir, f)) for f in ("report.md", "manuscript.md"))
     for reviewer_yaml in ("critique_methods.yaml", "critique_domain.yaml",
                           "critique_presentation.yaml",
                           "critique_redteam.yaml",
@@ -4987,6 +5007,8 @@ def _check_persistent_medium_escalation(run_dir: str,
             if severity != "MEDIUM":
                 continue
             if blocker.get("resolved") is True:
+                continue
+            if not written and str(blocker.get("target_stage") or "").upper() == "WRITE":
                 continue
             first_seen = blocker.get("first_seen_round")
             if first_seen is None:
@@ -7097,6 +7119,29 @@ def _run_self_test() -> int:
         ok(not any(v["kind"] == "P-005_persistent" for v in ve5),
            f"E5: resolved blocker should NOT escalate, got {ve5}")
 
+    # E5b (Phase 31): a WRITE-stage blocker does not escalate before the
+    # write-up exists; it does once a manuscript exists.
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "critique_presentation.yaml"), "w") as f:
+            f.write(
+                "reviewer: critique-presentation\n"
+                "round: 5\n"
+                "blockers:\n"
+                "  - id: P-004\n"
+                "    severity: MEDIUM\n"
+                "    target_stage: WRITE\n"
+                "    first_seen_round: 1\n"
+                "    claim: no reader-facing Data section (pending WRITE)\n"
+                "    resolved: false\n"
+            )
+        ve5b = _check_persistent_medium_escalation(d, round_n=5)
+        ok(not any(v["kind"] == "P-004_persistent" for v in ve5b),
+           f"E5b: WRITE-stage blocker escalated before any write-up exists: {ve5b}")
+        open(os.path.join(d, "manuscript.md"), "w").write("# draft\n")
+        ve5c = _check_persistent_medium_escalation(d, round_n=5)
+        ok(any(v["kind"] == "P-004_persistent" for v in ve5c),
+           f"E5c: WRITE-stage blocker escalates once a manuscript exists: {ve5c}")
+
     # E6: critique-blocker MEDIUM persistence below threshold → silent.
     # first_seen=4, round=6 → persisted only 2 rounds; threshold 4.
     with tempfile.TemporaryDirectory() as d:
@@ -7923,6 +7968,10 @@ def _run_self_test() -> int:
         v = _check_scope_declaration_budget(_d, round_n=2)
         ok(not any(x["kind"] == "scope_declaration_budget_exceeded" for x in v),
            f"SB5: cap=5 with justification must allow 5 declarations, got {v}")
+        raised = [x for x in v if x["kind"] == "scope_declaration_cap_raised"]
+        ok(len(raised) == 1 and raised[0]["severity"] == "LOW"
+           and "five scope cuts" in raised[0]["claim"],
+           f"SB5b (Phase 31): an honored cap raise is reported LOW with its reason, got {v}")
 
     with _tempfile.TemporaryDirectory() as _d:
         # SB6: cap=5 WITHOUT justification → override not honored, HIGH fires

@@ -881,8 +881,8 @@ The validator has already decided for you. Your job is to carry it out:
       the issue may live where the critique didn't expect. For a
       MODEL blocker that's failed twice, re-spawn ANALYZE with the
       blocker text reframed as "the analysis assumes X, but the
-      model doesn't support X" or re-spawn WRITE with "the report
-      claims Y, but the underlying model produces Z". Document the
+      model doesn't support X" or, once a draft exists, re-spawn WRITE
+      with "the report claims Y, but the underlying model produces Z". Document the
       cross-stage move in progress.md.
 
     - **HYPOTHESES / CITATIONS** category, attempts >= 2 → re-spawn
@@ -943,6 +943,13 @@ After deciding, if not ACCEPTing, go back to the stage named by the
 unresolved blockers' `target_stage` (PLAN, DATA, MODEL, ANALYZE, or
 WRITE) and continue from there. Increment the round counter before the
 next STAGE 6.
+
+The first write-up waits for the gate: the harness refuses a writer spawn
+while the latest action is PATCH_OR_RETHINK and the budget covers another
+review round, until a draft exists. Blockers with `target_stage: WRITE`
+neither block nor escalate before a write-up exists; carry them to STAGE 8.
+After each subagent returns, the harness tells you the budget spent and the
+review rounds it still covers; plan the remaining work to fit.
 
 ### STAGE 8: WRITE
 Spawn the "writer" agent. Tell it the run directory.
@@ -1243,9 +1250,68 @@ def snapshot_report(run_path: str, state: dict) -> bool:
     return True
 
 
+WRITE_ALLOWED_AFTER = ("ACCEPT", "DECLARE_SCOPE", "RUN_FAILED")
+
+
+def _gate_rounds(run_path: str) -> list[dict]:
+    rows = []
+    try:
+        for line in open(os.path.join(run_path, "validator_history.jsonl"), errors="replace"):
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(r, dict):
+                rows.append(r)
+    except OSError:
+        pass
+    return rows
+
+
+def budget_note(status: dict | None, n_rounds: int) -> str | None:
+    """Phase 31: the lead's view of the dollar cap (E7 attempt 6 spent its
+    last round on a writing loop without knowing the budget was nearly gone)."""
+    if not status or not status.get("cap"):
+        return None
+    spent, cap, reserve = status["spent"], status["cap"], status["reserve"]
+    left = cap - reserve - spent
+    line = (f"[harness] Budget: about ${spent:.0f} of ${cap:.0f} spent (estimate); ${reserve:.0f} is held for "
+            f"the final write-up, leaving about ${max(left, 0):.0f} for modeling")
+    if n_rounds:
+        per = spent / n_rounds
+        line += (f", about {max(left, 0) / per:.1f} more review round(s) at the ${per:.0f} per round "
+                 f"average so far ({n_rounds} gate round(s))")
+    return line + ". Plan the remaining work to fit; if the budget runs out the harness writes the report."
+
+
+def writer_hold_reason(run_path: str, status: dict | None, max_rounds: int | None) -> str | None:
+    """Phase 31: the first write-up waits for the gate. Returns why a writer
+    spawn is refused now, or None. Allowed after ACCEPT / DECLARE_SCOPE /
+    RUN_FAILED, in the final round, when less than one more round of budget
+    is left, or once a draft exists (revisions)."""
+    if any(os.path.exists(os.path.join(run_path, f)) for f in ("manuscript.md", "report.md")):
+        return None
+    rows = _gate_rounds(run_path)
+    last = rows[-1] if rows else {}
+    if str(last.get("action") or "") in WRITE_ALLOWED_AFTER:
+        return None
+    rnd = max((int(r.get("round") or 0) for r in rows), default=0)
+    if max_rounds and rnd >= max_rounds:
+        return None
+    if status and status.get("cap") and rows:
+        left = status["cap"] - status["reserve"] - status["spent"]
+        if left < status["spent"] / max(1, len({r.get("round") for r in rows})):
+            return None
+    return ("The write-up waits for the gate: the latest gate action is "
+            f"{last.get('action') or 'none yet'}, and the budget covers another review round. "
+            "Fix the blocking findings, re-run the critiques and the gate; spawn the writer after ACCEPT, "
+            "DECLARE_SCOPE or RUN_FAILED. Findings aimed at the write-up do not block or escalate before it exists.")
+
+
 def create_hooks(run_path: str, trace_file, start_time: datetime,
                  registered_agents=None, max_turns: dict[str, int] | None = None,
-                 integrity=None):
+                 integrity=None, budget_status=None, max_rounds: int | None = None,
+                 hold_writer: bool = True):
     """Create hook config for the lead query() session.
 
     Phase 21 α: PreToolUse also enforces file ownership and the agent
@@ -1256,6 +1322,7 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
 
     tool_count = 0
     per_agent_tool_counts: dict[str, int] = {}
+    turn_warned: dict[str, set] = {}
     agent_types: dict[str, str] = {}
     snapshot_state: dict = {}
     if registered_agents is None:
@@ -1306,6 +1373,9 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
         deny_reason = enforcement.check_tool_use(
             tool_name, tool_input, run_path, agent_type, registered_agents,
             cwd=input_data.get("cwd"))
+        if (not deny_reason and hold_writer and agent_id == "lead" and tool_name in ("Agent", "Task")
+                and tool_input.get("subagent_type") == "writer"):
+            deny_reason = writer_hold_reason(run_path, _status(), max_rounds)
         status = "DENIED" if deny_reason else ""
         print(f"[{label:>12} {elapsed:6.0f}s | #{tool_count}] {status} {summary}".replace("]  ", "] "),
               flush=True)
@@ -1350,7 +1420,46 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
                 print(f"[INTEGRITY] unexplained {ev['change']} of {ev['file']} "
                       f"(in flight: {ev['in_flight'] or 'nothing'})", flush=True)
                 _safe_write(trace_file, {"ts": ev["ts"], "type": "integrity_violation", **ev})
+        if agent_id == "lead" and tool_name in ("Agent", "Task"):
+            note = budget_note(_status(), len({r.get("round") for r in _gate_rounds(run_path)}))
+            if note:
+                return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": note}}
+        warning = turn_warning(agent_id)
+        if warning:
+            return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": warning}}
         return {}
+
+    def _status():
+        try:
+            return budget_status() if budget_status else None
+        except Exception:  # noqa: BLE001 — a status error must not break a tool call
+            return None
+
+    def turn_warning(agent_id: str) -> str | None:
+        """Phase 31: tell a subagent before its turn limit cuts it off, so it
+        saves its outputs (E7 attempt 6: 6 of 47 spawns hit the limit; the red
+        team's first session ended with no output). Tool calls are counted, a
+        slight over-count of turns, so the warning comes early, never late."""
+        if agent_id == "lead":
+            return None
+        cap = max_turns.get(agent_types.get(agent_id, ""))
+        used = per_agent_tool_counts.get(agent_id, 0)
+        if not cap or cap < 10:
+            return None
+        left = cap - used
+        done = turn_warned.setdefault(agent_id, set())
+        level = ("early" if used >= min(int(cap * 0.85), cap - 4) and "early" not in done
+                 else "final" if left <= 3 and "final" not in done else None)
+        if level is None:
+            return None
+        turn_warned[agent_id].add(level)
+        _safe_write(trace_file, {"ts": datetime.now().isoformat(), "type": "turn_warning", "agent_id": agent_id,
+                                 "agent_type": agent_types.get(agent_id), "used": used, "cap": cap})
+        if level == "final":
+            return (f"[harness] About {max(left, 0)} turns left of your {cap}. Your session will be cut off at the "
+                    "limit. Write your required output files NOW, then stop; summarise what is unfinished in them.")
+        return (f"[harness] You have used about {used} of your {cap} turns. Start writing your required output "
+                "files now; a session cut off at the limit loses whatever is not saved to disk.")
 
     async def subagent_start_hook(input_data, tool_use_id, context):
         agent_id = input_data.get("agent_id", "?")

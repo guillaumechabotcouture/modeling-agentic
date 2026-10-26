@@ -461,9 +461,9 @@ lessons:
     were escalated to HIGH for persisting across rounds, inflating the round-5
     gate from 1 to 10 HIGH alongside genuine findings.
   change:
-    status: open
-    where: [scripts/validate_critique_yaml.py round-aware escalation; critique-blockers-schema skill]
-    refs: []
+    status: in_progress
+    where: [scripts/validate_critique_yaml.py (WRITE-stage blockers do not escalate before a write-up exists), lead prompt]
+    refs: [Phase 31 β (branch lessons-ledger)]
   test:
     how: [expert]
     review: Were any HIGH findings before the WRITE stage about a document that did not yet exist?
@@ -514,9 +514,9 @@ lessons:
     reserve allows about 7 rounds, not the 8 configured; the run is expected
     to stop on its budget mid-loop rather than by the gate.
   change:
-    status: open
-    where: [run launch checklist (budget >= rounds x observed round cost + reserve), main.py preflight]
-    refs: []
+    status: in_progress
+    where: [agents/__init__.py budget note to the lead after each subagent; writer held while the budget covers another round]
+    refs: [Phase 31 β (branch lessons-ledger)]
   test:
     how: [auto]
     detect: {autopsy_why: ["the run stopped on its budget cap"]}
