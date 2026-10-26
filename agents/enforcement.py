@@ -80,7 +80,14 @@ SCRIPT_OUTPUTS = (
     "final_gate_stderr.txt",
     "artifact_integrity.json",   # Phase 23 α: written by agents/integrity.py only
     "budget_ledger.json",        # Phase 23 β: run-wide spend, written by main.py only
+    "open_problems.json",        # Phase 32 α: written by the gate
+    "open_problems.md",
+    "open_problems.json.tmp",
+    "open_problems.md.tmp",
 )
+
+# Phase 32 α: the lead's round plan; no specialist may rewrite it.
+LEAD_ONLY = ("round_plan.yaml",)
 
 # Files the lead may not write directly: it must re-spawn the owning
 # agent. critique_* belong to the critique agents; models/** to the
@@ -88,6 +95,7 @@ SCRIPT_OUTPUTS = (
 LEAD_PROTECTED = (
     "critique_*.yaml",
     "critique_*.md",
+    "fix_check_*.yaml",   # Phase 32 β: written by the critics
     "models/*",
     "models/**",
 )
@@ -167,6 +175,8 @@ def protected_reason(path: str, run_path: str, agent_type: str | None,
             return None
         return (f"{rel} is produced by a pipeline script; re-run the script "
                 f"instead of writing it by hand")
+    if agent_type is not None and _matches(rel, LEAD_ONLY):
+        return f"{rel} is the lead's round plan; only the lead writes it"
     if agent_type is None and _matches(rel, LEAD_PROTECTED):
         return (f"{rel} is owned by a specialist agent; the lead must "
                 f"re-spawn the owning agent rather than edit it")

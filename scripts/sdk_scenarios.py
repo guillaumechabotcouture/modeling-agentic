@@ -29,6 +29,11 @@ Scenarios:
                         turn warning to a subagent, the budget note to the lead?
   cache_ttl             (Phase 31) are the lead's and a subagent's cache writes
                         1-hour (CLAUDE_CODE_*PROMPT_CACHE_TTL from cache_env)?
+  round_plan            (Phase 32) does a real lead write a valid round plan
+                        when the harness refuses work without one, hand each
+                        planned fix to its agent, get a critic's fix check
+                        (real fix-check prompt), send the unfixed item back
+                        once, and only then run the full critique?
 """
 from __future__ import annotations
 
@@ -43,6 +48,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 sys.path.insert(0, REPO)
+sys.path.insert(0, HERE)
 
 MODEL = os.environ.get("SCENARIO_MODEL", "claude-haiku-5-5")
 
@@ -220,9 +226,79 @@ async def cache_ttl(query_fn=None):
             "subagent_1h": found["subagent"]["1h"] > 0 and found["subagent"]["5m"] == 0}
 
 
+async def round_plan(query_fn=None):
+    """Phase 32: the open-problem list, round plan and fix check with real
+    models. The lead gets a short version of its STAGE 7 instructions and the
+    real hooks; the critic gets the real fix-check note. The critic is told to
+    find R-005 only partly fixed, so the lead must send it back once."""
+    import tempfile
+    from datetime import datetime
+    from claude_agent_sdk import AgentDefinition
+    from agents import create_hooks
+    import open_problems as op
+    run = tempfile.mkdtemp(prefix="ma_roundplan_")
+    open(os.path.join(run, "validator_history.jsonl"), "w").write(
+        "".join(json.dumps({"round": r, "action": "PATCH_OR_RETHINK", "findings": []}) + "\n" for r in (1, 2)))
+    doc = {"round": 2, "max_rounds": 8, "items": [
+        {"id": "ci_degenerate", "source": "rigor-artifacts", "severity": "HIGH", "target_stage": "MODEL",
+         "first_seen_round": 1, "blocks_in": 0, "scope_declarable": False, "fix_check": False,
+         "claim": "total_cost_usd 95% CI is zero width after 230 draws", "fix_requires": "", "status": ""},
+        {"id": "R-005", "source": "critique-redteam", "severity": "MEDIUM", "target_stage": "ANALYZE",
+         "first_seen_round": 1, "blocks_in": 1, "scope_declarable": True, "fix_check": True,
+         "claim": "Headline reports 64M cases averted with no qualifier for the 0.8 re-anchoring",
+         "fix_requires": "Carry the re-anchored cases range into the Summary", "status": "Narrowed, still present."},
+        {"id": "R-017", "source": "critique-redteam", "severity": "MEDIUM", "target_stage": "DATA",
+         "first_seen_round": 2, "blocks_in": 2, "scope_declarable": True, "fix_check": True,
+         "claim": "No SMC funder map; the funder is charged for all SMC",
+         "fix_requires": "Obtain the SMC funder split by state (no such public dataset exists)", "status": ""}]}
+    op.write(run, doc)
+    trace = open(os.path.join(run, "trace.jsonl"), "a")
+    hooks = create_hooks(run, trace, datetime.now(), registered_agents={"modeler", "analyst", "critique-redteam"},
+                         budget_status=lambda: {"spent": 10.0, "cap": 100.0, "reserve": 5.0}, max_rounds=8)
+    worker = lambda who: AgentDefinition(  # noqa: E731
+        description=f"Test {who}", tools=["Bash"], model="haiku", maxTurns=3,
+        prompt=f"You are the {who} in a test. Do not use tools. Reply 'DONE:' followed by the finding ids named in "
+               "your task.")
+    critic = AgentDefinition(
+        description="Test red-team critic", tools=["Read", "Write"], model="haiku", maxTurns=6,
+        prompt=("You are critique-redteam in a test. Full critique: reply CRITIQUE-DONE without tools. "
+                "Fix check for this test: R-005 is only partly fixed (evidence: 'the Summary still has no cases "
+                f"qualifier'); every other id is fixed; no new problems. Run directory: {run}" + op.FIX_CHECK_NOTE))
+    lead_rules = (
+        f"You are the lead of a modeling pipeline in a test. Run directory: {run}. The round-2 gate has just run. "
+        "Read open_problems.md there. Then: (1) write round_plan.yaml in the run directory with `round: 2` and "
+        "`items:` giving every id an action: fix or rethink with stage (PLAN, DATA, MODEL, ANALYZE, WRITE), "
+        "declare with a reason (cannot be fixed with the data available), after_write (WRITE findings only), or "
+        "defer with a reason (not for findings blocking now or at the next gate). (2) Spawn each stage agent "
+        "(MODEL -> modeler, ANALYZE -> analyst) naming its ids. (3) Spawn critique-redteam with a prompt "
+        "beginning `This is a fix check after round 2.` listing its fix ids. (4) Send anything not fixed back to "
+        "its agent once, naming the id and quoting the critic's evidence. (5) Spawn critique-redteam with a prompt "
+        "beginning `This is critique round 3.` If the harness refuses a call, read the reason, fix it and go on. "
+        "Finish with the word FINISHED.")
+    opts = _options(tools=["Agent", "Read", "Write", "Bash"], allowed_tools=["Agent", "Read", "Write", "Bash"],
+                    agents={"modeler": worker("modeler"), "analyst": worker("analyst"), "critique-redteam": critic},
+                    hooks=hooks, max_turns=30, system_prompt=lead_rules)
+    sid, result, err, _, ev = await _converse("Begin.", opts, query_fn=query_fn)
+    trace.close()
+    spawns = []
+    for line in open(os.path.join(run, "trace.jsonl")):
+        r = json.loads(line)
+        if r.get("subagent_type"):
+            spawns.append({"to": r["subagent_type"], "mentions": r.get("mentions"),
+                           "denied": (r.get("denied") or "")[:140] or None})
+    plan = open(os.path.join(run, op.PLAN_FILE)).read() if os.path.exists(os.path.join(run, op.PLAN_FILE)) else None
+    fc = os.path.join(run, op.fix_check_name(2, "critique-redteam"))
+    missing, redo = op.check_fix_checks(run)
+    full = [s for s in spawns if s["to"] == "critique-redteam" and not s["denied"]]
+    return {"result": _summ(result), "error": err, "run": run, "plan_errors": op.check_plan(run), "plan": plan,
+            "fix_check_written": os.path.exists(fc), "fix_check_missing": missing, "redo": redo,
+            "spawns": spawns, "full_critique_allowed": len(full) >= 2,
+            "denials": sum(1 for s in spawns if s["denied"]), "text": ((result and result.result) or "")[-200:]}
+
+
 SCENARIOS = {"resume_cumulative": resume_cumulative, "readback_after_crash": readback_after_crash,
              "crash_before_init": crash_before_init, "budget_cap": budget_cap, "hook_context": hook_context,
-             "cache_ttl": cache_ttl}
+             "cache_ttl": cache_ttl, "round_plan": round_plan}
 
 
 def run(names: list[str]) -> dict:

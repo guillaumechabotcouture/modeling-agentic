@@ -3530,6 +3530,32 @@ def _append_validator_history(run_dir: str, round_n: int, decision: dict,
               file=sys.stderr)
 
 
+def _write_open_problems(run_dir: str, round_n: int, max_rounds: int,
+                         critiques: dict, decision: dict) -> str | None:
+    """Phase 32 α: open_problems.json/.md after every in-round gate run, for
+    the lead's round_plan.yaml. Returns a line for stderr. A failure here is
+    reported, never fatal to the gate decision."""
+    try:
+        import open_problems
+        hist = _load_validator_history(run_dir)
+        kind_rounds: dict[str, int] = {}
+        for kinds in hist.values():
+            for k in kinds:
+                kind_rounds[k] = kind_rounds.get(k, 0) + 1
+        doc = open_problems.build(
+            run_dir, round_n, max_rounds, critiques, decision, kind_rounds,
+            _VALIDATOR_KIND_ESCALATION_THRESHOLDS,
+            _CRITIQUE_BLOCKER_ESCALATION_THRESHOLD)
+        open_problems.write(run_dir, doc)
+    except Exception as e:  # noqa: BLE001
+        return f"WARNING: open_problems.json not written: {e}"
+    n = len(doc["items"])
+    soon = sum(1 for i in doc["items"] if i["blocks_in"] == 1)
+    return (f"Open problems: {n} ({soon} become blocking at the next gate). "
+            f"See open_problems.md; write round_plan.yaml (round: {round_n}) "
+            f"before the next round's work.")
+
+
 def _annotate_first_seen(run_dir: str, violations: list[dict]) -> None:
     """Phase 21 β: give each rigor violation the earliest round its kind
     appeared in validator history, so persisting rigor HIGHs look stuck
@@ -9103,8 +9129,14 @@ def main() -> int:
     if not args.no_history:
         _append_validator_history(args.run_dir, args.current_round, decision,
                                   args.post_write)
+    open_note = None
+    if not args.no_history and not args.post_write:
+        open_note = _write_open_problems(args.run_dir, args.current_round,
+                                         args.max_rounds, critiques, decision)
     print(render_text(decision, args.current_round, args.max_rounds),
           file=sys.stderr)
+    if open_note:
+        print(open_note, file=sys.stderr)
     if args.json:
         print(json.dumps(decision, indent=2))
     # Exit 0 on ACCEPT, 1 on any other action, so Bash callers can branch

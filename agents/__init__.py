@@ -19,6 +19,7 @@ import sys  # noqa: E402
 _SCRIPTS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
 if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)  # lib.md_helpers (shared frontmatter rule)
+import open_problems  # noqa: E402  (Phase 32: open-problem list, round plan, fix checks)
 
 MAX_FIGURE_PIXELS = 10_000_000  # 10MP -- anything larger is likely a bug
 
@@ -343,7 +344,7 @@ def _registry() -> dict[str, AgentDefinition]:
         ),
         "critique-methods": AgentDefinition(
             description=critique_methods.DESCRIPTION,
-            prompt=critique_methods.SYSTEM_PROMPT,
+            prompt=critique_methods.SYSTEM_PROMPT + open_problems.FIX_CHECK_NOTE,
             tools=critique_methods.TOOLS,
             model=enforcement.MODEL_DEEP,
             maxTurns=35,  # increased: now does parameter provenance checks with WebSearch
@@ -352,7 +353,7 @@ def _registry() -> dict[str, AgentDefinition]:
         ),
         "critique-domain": AgentDefinition(
             description=critique_domain.DESCRIPTION,
-            prompt=critique_domain.SYSTEM_PROMPT,
+            prompt=critique_domain.SYSTEM_PROMPT + open_problems.FIX_CHECK_NOTE,
             tools=critique_domain.TOOLS,
             model=enforcement.MODEL_DEEP,
             maxTurns=50,  # increased after malaria run ran_to_cap at 39/40
@@ -377,14 +378,14 @@ def _registry() -> dict[str, AgentDefinition]:
         ),
         "critique-presentation": AgentDefinition(
             description=critique_presentation.DESCRIPTION,
-            prompt=critique_presentation.SYSTEM_PROMPT,
+            prompt=critique_presentation.SYSTEM_PROMPT + open_problems.FIX_CHECK_NOTE,
             tools=critique_presentation.TOOLS,
             model=enforcement.MODEL_FAST,
             maxTurns=40,  # bumped 25→30 post-measles, 30→40 post-malaria (30/30 ran_to_cap in round 2)
         ),
         "critique-redteam": AgentDefinition(
             description=red_team.DESCRIPTION,
-            prompt=red_team.SYSTEM_PROMPT,
+            prompt=red_team.SYSTEM_PROMPT + open_problems.FIX_CHECK_NOTE,
             tools=red_team.TOOLS,
             model=enforcement.MODEL_DEEP,  # adversarial judgment + WebFetch-heavy research
             maxTurns=50,
@@ -798,6 +799,41 @@ section to `{run_dir}/progress.md` containing:
 
 This is your audit trail. Future resumes read it.
 
+#### Step 2b: Plan every open problem (Phase 32)
+
+After a PATCH_OR_RETHINK or RETHINK_STRUCTURAL gate, the gate has written
+`open_problems.md`: every open HIGH and MEDIUM finding, soonest-blocking
+first, with how many rounds each MEDIUM has before it becomes blocking.
+Before the next round's work, write `{run_dir}/round_plan.yaml`:
+
+```yaml
+round: <N>            # the gate round just run
+items:
+  R-005: {action: fix, stage: ANALYZE}
+  R-008: {action: rethink, stage: MODEL}
+  R-017: {action: declare, reason: "<why it cannot be fixed with the data or tools available>"}
+  P-007: {action: after_write}
+  D-023: {action: defer, reason: "<why not this round>"}
+  "REG-*": {action: fix, stage: MODEL}
+```
+
+Every id needs an action: `fix` or `rethink` (with the stage that does it),
+`declare` (cannot be fixed in this run; goes in scope_declaration.yaml),
+`after_write` (write-up findings only), or `defer` (with a reason; not for
+blocking findings or ones that block at the next gate). Patterns such as
+`REG-*` are allowed for gate findings only; critic findings are listed by id.
+Moderate findings count: a MEDIUM left alone for four rounds becomes
+blocking, and several reaching that point together sank an earlier run.
+Decide early which findings cannot be fixed with what is available and
+declare them in round 1 or 2, while the scope-declaration allowance is free,
+so the rounds go to what can be fixed.
+
+The harness enforces this: planner, data-agent, modeler and analyst spawns
+are refused until the plan covers the latest list, and the round's critique
+is refused until every `fix` / `rethink` id has been named in a spawn prompt
+to its stage's agent (PLAN planner, DATA data-agent, MODEL modeler, ANALYZE
+analyst, WRITE writer).
+
 #### Step 3: Execute the action
 
 The validator has already decided for you. Your job is to carry it out:
@@ -826,7 +862,8 @@ The validator has already decided for you. Your job is to carry it out:
     category is HARD_BLOCKER, METHODS, CAUSAL, HYPOTHESES, CITATIONS,
     or PRESENTATION, AND none of the PATCH→RETHINK escalation triggers
     below apply. Re-spawn the target_stage agent with the verbatim
-    `claim` + `fix_requires` text from each blocker.
+    `claim` + `fix_requires` text from each blocker, and every MEDIUM your
+    round plan marks `fix` for that stage, each named by id.
 
   * **Parallelism in PATCH (Phase 5 Commit η)** — when this PATCH
     round's blockers span MULTIPLE target_stages (e.g., some target
@@ -943,6 +980,21 @@ After deciding, if not ACCEPTing, go back to the stage named by the
 unresolved blockers' `target_stage` (PLAN, DATA, MODEL, ANALYZE, or
 WRITE) and continue from there. Increment the round counter before the
 next STAGE 6.
+
+#### Fix check before the next full critique (Phase 32)
+
+When the fixes for round N are done, and before the next STAGE 6, spawn
+each critic that raised a planned `fix` / `rethink` item in fix-check mode,
+in parallel, with a prompt beginning `This is a fix check after round N.`
+and listing only its ids. Each re-checks those items and what the fix
+changed, and writes `fix_check_rN_<critic>.yaml` (verdict fixed / partly /
+not_fixed per id, plus any new problem the fix caused). This is a short
+session; it exists so a fix that misses, or breaks something else, is caught
+while the round can still correct it. Send each item not fixed, and each new
+HIGH problem, back to its stage's agent once, naming the id and quoting the
+critic's evidence; then run the full STAGE 6 critique. The harness refuses
+the full critique until the fix checks exist and that one return trip has
+been made; it skips both when the budget cannot cover another round.
 
 The first write-up waits for the gate: the harness refuses a writer spawn
 while the latest action is PATCH_OR_RETHINK and the budget covers another
@@ -1308,6 +1360,94 @@ def writer_hold_reason(run_path: str, status: dict | None, max_rounds: int | Non
             "DECLARE_SCOPE or RUN_FAILED. Findings aimed at the write-up do not block or escalate before it exists.")
 
 
+PLAN_AGENTS = ("planner", "data-agent", "modeler", "analyst")
+_PLAN_ACTIONS = ("PATCH_OR_RETHINK", "RETHINK_STRUCTURAL")
+
+
+def _budget_tight(status: dict | None, rows: list[dict]) -> bool:
+    """Less than one more review round of budget left (at the average so far)."""
+    if not status or not status.get("cap") or not rows:
+        return False
+    left = status["cap"] - status["reserve"] - status["spent"]
+    return left < status["spent"] / max(1, len({r.get("round") for r in rows}))
+
+
+def _plan_required(run_path: str) -> dict | None:
+    """Phase 32: the open-problem list the next round's work must plan for,
+    or None (no gate yet, gate not asking for work, or a stale list)."""
+    rows = [r for r in _gate_rounds(run_path) if not r.get("post_write")]
+    if not rows or str(rows[-1].get("action") or "") not in _PLAN_ACTIONS:
+        return None
+    doc = open_problems.load_open(run_path)
+    if doc is None or int(doc.get("round") or -1) != int(rows[-1].get("round") or -2):
+        return None
+    return doc
+
+
+def _lead_spawns_since(run_path: str, since: float) -> list[tuple[str, set]]:
+    """(subagent_type, ids named in its prompt) for lead spawns after `since`
+    (an mtime), read back from trace.jsonl so a resumed session sees them."""
+    out = []
+    try:
+        for line in open(os.path.join(run_path, "trace.jsonl"), errors="replace"):
+            if '"mentions"' not in line:
+                continue
+            try:
+                r = json.loads(line)
+                if datetime.fromisoformat(r["ts"]).timestamp() >= since and not r.get("denied"):
+                    out.append((r.get("subagent_type"), set(r.get("mentions") or ())))
+            except (ValueError, KeyError, TypeError):
+                continue
+    except OSError:
+        pass
+    return out
+
+
+def plan_hold_reason(run_path: str) -> str | None:
+    """Phase 32 α: work for the next round waits for round_plan.yaml."""
+    doc = _plan_required(run_path)
+    if doc is None:
+        return None
+    errors = open_problems.check_plan(run_path)
+    if not errors:
+        return None
+    return (f"Before the next round's work, write {open_problems.PLAN_FILE} (round: {doc['round']}) giving every "
+            f"open problem in open_problems.md an action. Not yet: " + "; ".join(errors)[:1500])
+
+
+def critique_hold_reason(run_path: str, status: dict | None) -> str | None:
+    """Phase 32 α/β: the round's full critique waits until every planned
+    fix went to its stage's agent, the critics checked their fixes, and what
+    was not fixed went back once. Skipped when the budget cannot cover it."""
+    doc = _plan_required(run_path)
+    if doc is None or _budget_tight(status, _gate_rounds(run_path)):
+        return None
+    errors = open_problems.check_plan(run_path)
+    if errors:
+        return plan_hold_reason(run_path)
+    plan_path = os.path.join(run_path, open_problems.PLAN_FILE)
+    missing = open_problems.unsent(open_problems.planned_work(run_path),
+                                   _lead_spawns_since(run_path, os.path.getmtime(plan_path)))
+    if missing:
+        return ("The round's critique waits until every planned fix has been handed to the agent that does it. "
+                "Not yet named in a spawn prompt: " + ", ".join(missing)[:1200])
+    absent, redo = open_problems.check_fix_checks(run_path)
+    if absent:
+        return ("Before the round's full critique, ask each critic to check its own planned fixes: spawn it with "
+                f"a prompt beginning `This is a fix check after round {doc['round']}.` listing its ids. Missing: "
+                + "; ".join(absent)[:1200])
+    if redo:
+        since = open_problems.fix_check_mtime(run_path) or 0
+        later = _lead_spawns_since(run_path, since)
+        left = [f"{i} -> {agent}" for agent, ids in redo.items() for i in ids
+                if not any(a == agent and i in got for a, got in later)]
+        if left:
+            return ("The fix checks found items not fixed or new problems the fixes caused. Send each back to its "
+                    "agent once (name the id and quote the critic's evidence), then run the full critique: "
+                    + ", ".join(left)[:1200])
+    return None
+
+
 def create_hooks(run_path: str, trace_file, start_time: datetime,
                  registered_agents=None, max_turns: dict[str, int] | None = None,
                  integrity=None, budget_status=None, max_rounds: int | None = None,
@@ -1373,9 +1513,15 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
         deny_reason = enforcement.check_tool_use(
             tool_name, tool_input, run_path, agent_type, registered_agents,
             cwd=input_data.get("cwd"))
-        if (not deny_reason and hold_writer and agent_id == "lead" and tool_name in ("Agent", "Task")
-                and tool_input.get("subagent_type") == "writer"):
+        spawn = agent_id == "lead" and tool_name in ("Agent", "Task")
+        sub = tool_input.get("subagent_type") if spawn else None
+        if not deny_reason and hold_writer and sub == "writer":
             deny_reason = writer_hold_reason(run_path, _status(), max_rounds)
+        if not deny_reason and hold_writer and sub in PLAN_AGENTS:
+            deny_reason = plan_hold_reason(run_path)
+        if (not deny_reason and hold_writer and str(sub or "").startswith("critique-")
+                and str(tool_input.get("prompt") or "").lstrip().startswith("This is critique round")):
+            deny_reason = critique_hold_reason(run_path, _status())
         status = "DENIED" if deny_reason else ""
         print(f"[{label:>12} {elapsed:6.0f}s | #{tool_count}] {status} {summary}".replace("]  ", "] "),
               flush=True)
@@ -1388,6 +1534,9 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
             "tool": tool_name,
             "summary": summary,
         }
+        if spawn:
+            record["subagent_type"] = sub
+            record["mentions"] = open_problems.mentions(str(tool_input.get("prompt") or ""), run_path)
         if deny_reason:
             record["denied"] = deny_reason
         _safe_write(trace_file, record)  # a closed trace must not disable enforcement

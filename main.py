@@ -1294,6 +1294,57 @@ def _run_self_test() -> int:
                                       budget_status=lambda: st, hold_writer=False)
         r = asyncio.run(hk4["PreToolUse"][0].hooks[0](spawn, "w3", None))
         ok("write-up waits" not in json.dumps(r), f"WH9 the harness's own write-up is never held: {r}")
+        # RP1-RP10 (Phase 32): work waits for the round plan; the critique waits for the
+        # planned fixes, the critics' fix checks and one return trip for what was not fixed
+        import time
+        from agents import critique_hold_reason
+        gates("PATCH_OR_RETHINK", "PATCH_OR_RETHINK")
+        json.dump({"round": 2, "items": [
+            {"id": "R-005", "source": "critique-redteam", "severity": "MEDIUM", "target_stage": "ANALYZE",
+             "blocks_in": 1, "fix_check": True, "scope_declarable": True},
+            {"id": "RIG-001", "source": "rigor-artifacts", "severity": "HIGH", "target_stage": "MODEL",
+             "blocks_in": 0, "fix_check": False, "scope_declarable": False}]},
+            open(os.path.join(td, "open_problems.json"), "w"))
+
+        def spawn_as(sub, prompt):
+            return asyncio.run(pre3({"tool_name": "Agent", "tool_input": {
+                "subagent_type": sub, "description": "d", "prompt": prompt}}, "s", None))
+        r = spawn_as("modeler", "Fix RIG-001.")
+        ok("round_plan.yaml" in json.dumps(r) and "does not exist" in json.dumps(r),
+           f"RP1 modeler refused before the round plan exists: {r}")
+        time.sleep(0.02)
+        open(os.path.join(td, "round_plan.yaml"), "w").write(
+            "round: 2\nitems:\n  R-005: {action: fix, stage: ANALYZE}\n  RIG-001: {action: fix, stage: MODEL}\n")
+        time.sleep(0.02)
+        ok(spawn_as("modeler", "Fix RIG-001 (zero-width interval).") == {}, "RP2 modeler allowed once the plan is complete")
+        r = spawn_as("critique-redteam", "This is critique round 3. ...")
+        ok("R-005 -> analyst" in json.dumps(r), f"RP3 critique refused while a planned fix was never handed over: {r}")
+        ok(spawn_as("analyst", "Fix R-005: qualify the cases figure.") == {}, "RP4 analyst spawn allowed")
+        r = spawn_as("critique-redteam", "This is critique round 3. ...")
+        ok("fix check" in json.dumps(r) and "fix_check_r2_redteam.yaml" in json.dumps(r),
+           f"RP5 critique refused until the critic checks its fixes: {r}")
+        ok(critique_hold_reason(td, {"spent": 380.0, "cap": 450.0, "reserve": 36.0}) is None,
+           "RP6 no fix check required when the budget cannot cover another round")
+        ok(spawn_as("critique-redteam", "This is a fix check after round 2. Check R-005.") == {},
+           "RP7 a fix-check spawn is allowed")
+        time.sleep(0.02)
+        open(os.path.join(td, "fix_check_r2_redteam.yaml"), "w").write(
+            "round: 2\nreviewer: critique-redteam\nchecks:\n  - {id: R-005, verdict: partly, evidence: still no qualifier}\n")
+        time.sleep(0.02)
+        r = spawn_as("critique-redteam", "This is critique round 3. ...")
+        ok("R-005 -> analyst" in json.dumps(r) and "back to its agent once" in json.dumps(r),
+           f"RP8 an item not fixed goes back once before the full critique: {r}")
+        spawn_as("analyst", "R-005 is only partly fixed: the critic says still no qualifier.")
+        ok(spawn_as("critique-redteam", "This is critique round 3. ...") == {},
+           "RP9 full critique allowed after the one return trip")
+        from agents.enforcement import protected_reason
+        ok(protected_reason(os.path.join(td, "round_plan.yaml"), td, "modeler") is not None
+           and protected_reason(os.path.join(td, "round_plan.yaml"), td, None) is None
+           and protected_reason(os.path.join(td, "fix_check_r2_redteam.yaml"), td, None) is not None
+           and protected_reason(os.path.join(td, "open_problems.json"), td, "critique-redteam") is not None,
+           "RP10 only the lead writes the plan, only critics write fix checks, only the gate writes the list")
+        for f in ("open_problems.json", "round_plan.yaml", "fix_check_r2_redteam.yaml"):
+            os.remove(os.path.join(td, f))
         os.remove(hist)
         trace.close()
     # IC1-IC7 (Codex review of PR #15).
