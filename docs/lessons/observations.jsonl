@@ -41,3 +41,11 @@
 {"by": "maintainer", "date": "2026-10-26T03:15", "lesson": "L020", "note": "source run (provisional, 14:51 UTC checkpoint)", "result": "recurred", "run": "e7a6_2026-10-26_031522"}
 {"by": "maintainer", "date": "2026-10-26T03:15", "lesson": "L021", "note": "source run (provisional, 14:51 UTC checkpoint)", "result": "recurred", "run": "e7a6_2026-10-26_031522"}
 {"by": "maintainer", "date": "2026-10-26T03:15", "lesson": "L019", "note": "source run: resistance, campaign lists and funder split not obtained", "result": "recurred", "run": "e7a6_2026-10-26_031522"}
+{"by": "maintainer", "date": "2026-10-26T15:20", "lesson": "L022", "note": "pool stayed at 1 compute VM; 240 tasks in 2681 s", "result": "recurred", "run": "autoscale-check3"}
+{"by": "maintainer", "date": "2026-10-26T18:00", "lesson": "L022", "note": "pool grew to 6 compute VMs; batch 572 s (with a70f825 settings)", "result": "absent", "run": "autoscale-check6"}
+{"by": "maintainer", "date": "2026-10-26T17:13", "lesson": "L023", "note": "62,403 core-s charged for 4,800 s of model work (checks 3 and 4 alike)", "result": "recurred", "run": "autoscale-check5"}
+{"by": "maintainer", "date": "2026-10-26T18:00", "lesson": "L023", "note": "4,800 core-s charged for 4,800 s", "result": "absent", "run": "autoscale-check6"}
+{"by": "maintainer", "date": "2026-10-26T17:13", "lesson": "L024", "note": "only totals: over-charge and idle tail unattributable", "result": "recurred", "run": "autoscale-check5"}
+{"by": "maintainer", "date": "2026-10-26T03:15", "lesson": "L025", "note": "round 5: P-004, P-007 (pending-WRITE) escalated to HIGH", "result": "recurred", "run": "e7a6_2026-10-26_031522"}
+{"by": "maintainer", "date": "2026-10-26T03:15", "lesson": "L026", "note": "round 5: figure_staleness_detected, numeric_drift_extreme, ci_degenerate", "result": "recurred", "run": "e7a6_2026-10-26_031522"}
+{"by": "maintainer", "date": "2026-10-26T03:15", "lesson": "L027", "note": "round 5 R-009: M5 passes dAIC -10.33 vs -10 only with the anchor slope at k=0", "result": "recurred", "run": "e7a6_2026-10-26_031522"}

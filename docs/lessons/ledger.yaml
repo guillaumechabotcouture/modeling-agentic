@@ -396,3 +396,127 @@ lessons:
   test:
     how: [expert]
     review: Is the recommendation stated at the level where it is stable (class or rule), with unit-level detail marked as indicative?
+
+# --- Compute checks and E7 attempt 6 rounds 4-5 (2026-10-26) ---------------
+- id: L022
+  title: Autoscaling pool that does not grow
+  source: {kind: run_failure, ref: Coiled autoscaling check 3, date: 2026-10-26, by: pipeline maintainers}
+  layer: infrastructure
+  applies_when: []
+  finding: >-
+    Coiled's adapt adds VMs only when queued work exceeds 3 minutes, and dask
+    counted each VM's 4 threads as parallel slots although a compute VM runs
+    one chunk at a time on all its cores. The pool stayed at 1 compute VM and
+    a 240-task batch took 45 minutes.
+  change:
+    status: in_progress
+    where: [scripts/compute.py WORKER_OPTIONS (one thread) and ADAPT_OPTIONS (20 s target), launchers]
+    refs: [Phase 30 (branch phase-30-autoscale-compute, a70f825)]
+  test:
+    how: [expert]
+    review: During the run's largest batch, did the compute pool grow toward its maximum, and did it shrink when idle?
+
+- id: L023
+  title: Compute ledger over-charges a batch about 13 times, intermittently
+  source: {kind: run_failure, ref: Coiled autoscaling checks 3-5, date: 2026-10-26, by: pipeline maintainers}
+  layer: harness
+  applies_when: []
+  finding: >-
+    Three checks booked about 62,400 core-seconds for 4,800 seconds of model
+    work; a fourth with the same logic booked exactly 4,800. Not reproduced on
+    a laptop or a single Linux VM. Suspected, not confirmed: a retried chunk
+    charged from submission (including VM boot) at a fallback of 8 cores.
+  change:
+    status: in_progress
+    where: [scripts/compute.py per-chunk record incl. failed attempts; model_s next to the charge]
+    refs: [Phase 30 (branch phase-30-autoscale-compute, c1b3953)]
+  test:
+    how: [expert]
+    review: In models/compute_ledger.json, is each call's task_core_s within 1.5x of its model_s? If not, which chunks in the call summary explain it?
+
+- id: L024
+  title: Compute batches reported only totals
+  source: {kind: run_failure, ref: Coiled autoscaling checks 3-6, date: 2026-10-26, by: pipeline maintainers}
+  layer: harness
+  applies_when: []
+  finding: >-
+    With only batch totals, an over-charge and a 15-minute idle tail could
+    not be attributed; three paid checks were spent guessing before a
+    per-chunk record was added.
+  change:
+    status: in_progress
+    where: [scripts/compute.py batch summary "chunks" and model_s]
+    refs: [Phase 30 (branch phase-30-autoscale-compute, 2c11a17, c1b3953)]
+  test:
+    how: [expert]
+    review: Could the run's compute anomalies (slow batches, high charges, failures) be explained from the stored summaries alone?
+
+- id: L025
+  title: Report-stage findings escalated before the report exists
+  source: {kind: run_failure, ref: E7 attempt 6 round 5, date: 2026-10-26, by: pipeline maintainers}
+  layer: harness
+  applies_when: []
+  finding: >-
+    Two presentation findings the critic marked pending-WRITE (no report yet)
+    were escalated to HIGH for persisting across rounds, inflating the round-5
+    gate from 1 to 10 HIGH alongside genuine findings.
+  change:
+    status: open
+    where: [scripts/validate_critique_yaml.py round-aware escalation; critique-blockers-schema skill]
+    refs: []
+  test:
+    how: [expert]
+    review: Were any HIGH findings before the WRITE stage about a document that did not yet exist?
+
+- id: L026
+  title: Patches that leave dependent outputs stale
+  source: {kind: run_failure, ref: E7 attempt 6 round 5, date: 2026-10-26, by: pipeline maintainers}
+  layer: agent_behaviour
+  applies_when: []
+  finding: >-
+    Model changes in round 5 were not followed by regenerating figures,
+    uncertainty intervals and quoted numbers (stale figures, a degenerate
+    interval, numbers that disagree across files). Same class as the
+    self-contradicting artifacts in the Phase 17 review.
+  change:
+    status: open
+    where: [modeler and analyst prompts (regenerate downstream after a patch), candidate dependency rebuild]
+    refs: []
+  test:
+    how: [gate]
+    detect: {gate_kinds: [figure_staleness_detected, numeric_drift_extreme, ci_degenerate]}
+
+- id: L027
+  title: Model-selection rule met by how parameters are counted
+  source: {kind: expert_review, ref: E7 attempt 6 round 5 (red-team R-009, R-034), date: 2026-10-26, by: pipeline maintainers with Claude reviewer}
+  layer: model_quality
+  applies_when: []
+  finding: >-
+    The deliverable switched to a structure whose AIC advantage (-10.33
+    against a -10 rule) holds only because a parameter estimated from the
+    data was counted as fixed (k = 0), and the requested comparison of
+    allocations between the earlier structures was never run.
+  change:
+    status: open
+    where: [multi-structural-comparison skill (data-derived parameters count), compare_models.py]
+    refs: []
+  test:
+    how: [expert]
+    review: Does every structure's parameter count include values estimated from the calibration data, and does the choice survive counting them?
+
+- id: L028
+  title: Round cap and budget cap not sized to each other
+  source: {kind: run_failure, ref: E7 attempt 6, date: 2026-10-26, by: pipeline maintainers}
+  layer: harness
+  applies_when: []
+  finding: >-
+    Review rounds cost about $50 each, so a $450 cap with an 8% write-up
+    reserve allows about 7 rounds, not the 8 configured; the run is expected
+    to stop on its budget mid-loop rather than by the gate.
+  change:
+    status: open
+    where: [run launch checklist (budget >= rounds x observed round cost + reserve), main.py preflight]
+    refs: []
+  test:
+    how: [auto]
+    detect: {autopsy_why: ["the run stopped on its budget cap"]}
