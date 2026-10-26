@@ -153,7 +153,8 @@ for f in main.py \
   scripts/effect_size_registry.py \
   scripts/effort_floors.py scripts/eligibility_probe.py \
   scripts/figure_validator.py scripts/identifiability.py \
-  scripts/identifiability_a_priori.py scripts/numeric_consistency.py \
+  scripts/identifiability_a_priori.py scripts/lessons.py \
+  scripts/numeric_consistency.py \
   scripts/optimization_quality.py scripts/plan_criteria.py \
   scripts/propagate_uncertainty.py scripts/render_claims.py \
   scripts/results_store.py scripts/run_autopsy.py \

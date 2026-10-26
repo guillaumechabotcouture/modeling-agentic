@@ -1027,6 +1027,11 @@ def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
         _a = run_autopsy.write(run_path)
         print(f"  Autopsy: primary layer {_a.get('primary_layer') or 'none (accepted)'}", flush=True)
         _row = run_autopsy.register_row(_a)
+        # Lessons ledger: known error classes that came back, plus this run's
+        # expert checklist (lessons_check.md).
+        import lessons
+        _row["lessons"] = lessons.register_fields(run_path)
+        print(f"  Lessons: {_row['lessons']}", flush=True)
         import results_store
         if results_store.configured_account():
             _rp = os.path.join(run_path, "register_row.json")
@@ -1105,6 +1110,8 @@ def _run_self_test() -> int:
            f"E1: Write scripts/ allowed for {at}")
         ok(deny("Edit", {"file_path": "agents/modeler.py"}, at),
            f"E1: Edit agents/ allowed for {at}")
+        ok(deny("Write", {"file_path": os.path.join(REPO_ROOT, "docs/lessons/observations.jsonl")}, at),
+           f"E1: Write to the lessons ledger allowed for {at}")
         ok(deny("Edit", {"file_path": os.path.join(REPO_ROOT, ".claude/orchestration/effort_floors.yaml")}, at),
            f"E1: Edit .claude/ allowed for {at}")
         ok(deny("Write", {"file_path": os.path.join(REPO_ROOT, "main.py")}, at),

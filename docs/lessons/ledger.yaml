@@ -1,0 +1,398 @@
+# Lessons ledger: what expert review and run post-mortems taught us, what we
+# changed, and how we will know it worked. See docs/lessons/README.md.
+#
+# Hand-edited. Observations (did the error come back in a later run?) go to
+# docs/lessons/observations.jsonl via `scripts/lessons.py record`, never here.
+#
+# Fields (validated by `python3 scripts/lessons.py validate`):
+#   id            L###, never reused
+#   title         one line
+#   source        kind: expert_review | deep_review | experiment | run_failure | owner_question
+#                 ref: run directory, experiment or document
+#                 date: YYYY-MM-DD, the review date if known, else the run's date
+#                 by: a role, never a name
+#   layer         infrastructure | harness | agent_behaviour | model_quality | data | domain_knowledge
+#   applies_when  question keywords (any match, case-insensitive); [] = every question
+#   finding       what went wrong, in plain words
+#   change        status: open | in_progress | changed | verified | retired
+#                 where: files or components changed (or to change); refs: phases, PRs, commits
+#                 date: when the change shipped (merge time, UTC, "YYYY-MM-DDTHH:MM" when a run
+#                       on the same day must fall on the right side; required from `changed` on)
+#   test          how we will know: auto | gate | replay | regression | expert (one or more)
+#                 detect: optional automatic recurrence signals, any of
+#                   gate_kinds: [finding kinds]   (in a round = caught; in the last round = shipped)
+#                   autopsy_why: [substrings of run_autopsy failure reasons]
+#                   peak_mem_pct_over: number
+#                   file_absent: [run-relative paths]
+#                 review: the question an expert answers when there is no automatic signal
+version: 1
+lessons:
+
+# --- Expert review of the first malaria run (2026-04-08_2128) ---------------
+- id: L001
+  title: A multi-disease grant total used as a single-disease budget
+  source: {kind: expert_review, ref: runs/2026-04-08_2128, date: 2026-04-08, by: owner (domain expert)}
+  layer: domain_knowledge
+  applies_when: []
+  finding: >-
+    A $993M grant covering HIV, TB and malaria was treated as the malaria
+    budget, and every budget figure inherited the error. No critic checked
+    what the figure covered.
+  change:
+    status: changed
+    where: [.claude/orchestration/expert_priors.yaml (grant disaggregation prior)]
+    refs: [Phase 17 γ]
+    date: 2026-05-03
+  test:
+    how: [expert]
+    review: Is every budget or funding figure scoped to the disease, period and geography the question asks about?
+
+- id: L002
+  title: Citations with confabulated lead authors
+  source: {kind: expert_review, ref: runs/2026-04-08_2128, date: 2026-04-08, by: owner (domain expert)}
+  layer: agent_behaviour
+  applies_when: []
+  finding: >-
+    Three citations named the wrong lead author ("Liu et al. 2022" was Zhou
+    et al.; "Garner et al. 2024" was Schneider et al.). No agent checks
+    authorship against a bibliographic source.
+  change:
+    status: open
+    where: [critique-domain prompt; semantic-scholar-lookup skill]
+    refs: []
+  test:
+    how: [expert]
+    review: Spot-check 10 citations against Semantic Scholar. How many have the wrong lead author, year or title?
+
+- id: L003
+  title: Effect sizes taken from the wrong subgroup or the wrong measure
+  source: {kind: expert_review, ref: runs/2026-04-08_2128, date: 2026-04-08, by: owner (domain expert)}
+  layer: model_quality
+  applies_when: []
+  finding: >-
+    The overall IRS odds ratio (0.35) was used where the coverage-specific
+    value (0.27 at >=80%) applied, and a subgroup-specific incidence rate
+    ratio was used as a general relative risk.
+  change:
+    status: changed
+    where: [scripts/effect_size_registry.py, effect-size-priors skill, expert_priors.yaml (OR-to-RR prior)]
+    refs: [Phase 17 γ, effect-size registry]
+    date: 2026-05-03
+  test:
+    how: [gate, expert]
+    detect: {gate_kinds: [or_rr_conflation, registry_value_mismatch, param_unregistered]}
+    review: For the three most load-bearing effect sizes, does the value match the source's subgroup, measure and table?
+
+# --- Deep review of 2026-04-29_161312 (behind Phase 17-18) ------------------
+- id: L004
+  title: Numbers re-narrated differently across files
+  source: {kind: deep_review, ref: runs/2026-04-29_161312, date: 2026-04-29, by: owner with Claude and Codex reviewers}
+  layer: agent_behaviour
+  applies_when: []
+  finding: >-
+    The same quantity appeared with different values or labels in different
+    files (the $197M conflation), and the report was accepted.
+  change:
+    status: changed
+    where: [models/claims_ledger.yaml contract, scripts/render_claims.py, scripts/lib/provenance.py]
+    refs: [Phase 18, Phase 22 α]
+    date: 2026-05-12
+  test:
+    how: [gate, regression]
+    detect: {gate_kinds: [claims_ledger_invalid, claim_value_not_in_source, claims_ledger_stale]}
+
+- id: L005
+  title: Recommendations that ignore real-world supply and procurement limits
+  source: {kind: deep_review, ref: runs/2026-04-29_161312, date: 2026-04-29, by: owner with Claude and Codex reviewers}
+  layer: domain_knowledge
+  applies_when: []
+  finding: >-
+    The accepted allocation assumed quantities of a product beyond its global
+    supply and ignored procurement timing.
+  change:
+    status: changed
+    where: [critique-premortem agent, pre-mortem-domain skill, expert_priors.yaml]
+    refs: [Phase 17 α, γ]
+    date: 2026-05-03
+  test:
+    how: [gate, expert]
+    detect: {gate_kinds: [pre_mortem_high_unaddressed, pre_mortem_missing]}
+    review: Is each recommended intervention feasible at the recommended scale, given supply, procurement and delivery timing?
+
+# --- Deep review of 2026-05-03_235631 (behind Phase 21) ---------------------
+- id: L006
+  title: Gates trusted self-reported artifacts and renamed verdicts
+  source: {kind: deep_review, ref: runs/2026-05-03_235631, date: 2026-05-03, by: owner with Claude and Codex reviewers}
+  layer: harness
+  applies_when: []
+  finding: >-
+    The report was accepted with a headline 95% interval from a ledger entry
+    that contradicted a zero-width uncertainty report, and with verdicts
+    renamed by hand (DEGENERATE_FIT_ACKNOWLEDGED).
+  change:
+    status: changed
+    where: [agents/enforcement.py, agents/integrity.py, fail-closed validators]
+    refs: [Phase 21, Phase 23]
+    date: 2026-10-22
+  test:
+    how: [gate, regression]
+    detect: {gate_kinds: [artifact_integrity_violation, writer_qa_unknown_verdict, critique_sufficiency_unknown_verdict, uq_output_nonfinite]}
+
+- id: L007
+  title: A targeted intervention's benefit credited to the whole population
+  source: {kind: deep_review, ref: runs/2026-05-03_235631, date: 2026-05-03, by: owner with Claude and Codex reviewers}
+  layer: model_quality
+  applies_when: []
+  finding: >-
+    The benefit of an under-5 intervention was computed on the total
+    population while its cost was charged for children only.
+  change:
+    status: changed
+    where: [scripts/eligibility_probe.py, eligible-population-consistency skill]
+    refs: [Phase 21]
+    date: 2026-10-22
+  test:
+    how: [gate]
+    detect: {gate_kinds: [eligibility_benefit_scales_with_total, eligibility_benefit_without_eligible, eligibility_manifest_missing]}
+
+# --- Experiment E5: planted defects in frozen critique inputs ----------------
+- id: L008
+  title: Unit and data-vintage errors pass every critic
+  source: {kind: experiment, ref: docs/experiments/E5_critic_effectiveness.md, date: 2026-10-22, by: pipeline maintainers}
+  layer: agent_behaviour
+  applies_when: []
+  finding: >-
+    Of 54 planted defects, unit errors and data-vintage errors were caught
+    less than half the time by all critics and gates combined. In the
+    synthetic regression set, inverted and zero-width intervals are still
+    not caught (tests/regression_baseline.yaml).
+  change:
+    status: changed
+    where: [scripts/source_checks.py, scripts/regression_eval.py]
+    refs: [Phase 22]
+    date: 2026-10-22
+  test:
+    how: [gate, regression]
+    detect: {gate_kinds: [unit_scale_mismatch, unit_doc_scale_mismatch, unit_bound_order_violated, data_vintage_conflict]}
+
+# --- Run failures, E7 and E8 (2026-10) ---------------------------------------
+- id: L009
+  title: The writer could not save its report
+  source: {kind: run_failure, ref: E7 attempts 3-4, date: 2026-10-24, by: pipeline maintainers}
+  layer: harness
+  applies_when: []
+  finding: >-
+    The bundled CLI refuses subagent writes to REPORT*.md, so two runs
+    (~$698) ended with no report.
+  change:
+    status: changed
+    where: [writer drafts manuscript.md, render_claims.py builds report.md, preflight write probe]
+    refs: [Phase 25, "PR #21"]
+    date: "2026-10-25T03:49"
+  test:
+    how: [auto]
+    detect: {autopsy_why: ["writer's save was refused"]}
+
+- id: L010
+  title: Results lost when the laptop slept
+  source: {kind: run_failure, ref: E8, date: 2026-10-24, by: pipeline maintainers}
+  layer: infrastructure
+  applies_when: []
+  finding: >-
+    E8 collected results from a laptop; it slept, the clusters idled out and
+    every case was lost.
+  change:
+    status: changed
+    where: [scripts/results_store.py, replay cases and runs store themselves]
+    refs: [Phase 26, "PR #22"]
+    date: "2026-10-25T04:47"
+  test:
+    how: [auto]
+    detect: {autopsy_why: ["results not stored"]}
+
+- id: L011
+  title: A crashed session was charged the whole budget
+  source: {kind: run_failure, ref: E7 attempt 5, date: 2026-10-25, by: pipeline maintainers}
+  layer: harness
+  applies_when: []
+  finding: >-
+    After a SIGKILL the fail-safe charged the crashed session the whole $450
+    allowance (~$62 used), so the run stopped.
+  change:
+    status: changed
+    where: [main.py cost read-back after a crash, scripts/sdk_scenarios.py]
+    refs: [Phase 28, "PR #23"]
+    date: "2026-10-25T20:23"
+  test:
+    how: [auto]
+    detect: {autopsy_why: ["charged its whole allowance"]}
+
+- id: L012
+  title: Simulations run on the agent's own VM
+  source: {kind: run_failure, ref: E7 attempts 4-6, date: 2026-10-26, by: pipeline maintainers}
+  layer: agent_behaviour
+  applies_when: []
+  finding: >-
+    The modeler ran simulation batches on its own VM (2.4-12.5 h in attempts
+    4-5; the grid and scenarios in attempt 6 after the compute cap was hit),
+    exhausting memory (attempt 5 killed; attempt 6 at 99.9%).
+  change:
+    status: in_progress
+    where: [scripts/compute.py (Phase 24), modeler prompt (never run a batch locally), cap message]
+    refs: [Phase 24, Phase 30 (branch phase-30-autoscale-compute)]
+  test:
+    how: [auto]
+    detect: {autopsy_why: ["without using the compute service"], peak_mem_pct_over: 95}
+
+- id: L013
+  title: Stopped compute batches charged as if each had the whole pool
+  source: {kind: run_failure, ref: E7 attempt 6, date: 2026-10-26, by: pipeline maintainers}
+  layer: harness
+  applies_when: []
+  finding: >-
+    Three concurrent grid calls timed out; each was charged the whole 4-VM
+    pool, booking ~65 real core-hours as 282 and exhausting the 200
+    core-hour cap.
+  change:
+    status: in_progress
+    where: [scripts/compute.py (charge what stopped chunks used; self-test C35)]
+    refs: [Phase 30 (branch phase-30-autoscale-compute)]
+  test:
+    how: [regression, expert]
+    review: Does models/compute_ledger.json agree with the core-hours the compute VMs actually ran (Coiled usage)?
+
+- id: L014
+  title: Runs that end without a report
+  source: {kind: run_failure, ref: E7 attempts 3-5, date: 2026-10-25, by: pipeline maintainers}
+  layer: harness
+  applies_when: []
+  finding: >-
+    Runs that crashed or ran out of sessions left no report, so their cost
+    taught us little.
+  change:
+    status: changed
+    where: [main.py final write-up reserve, verdict banner, run autopsy]
+    refs: [Phase 29, "PR #25"]
+    date: "2026-10-26T03:09"
+  test:
+    how: [auto]
+    detect: {file_absent: [report.md]}
+
+# --- Review of E7 attempt 6 (provisional, 14:51 UTC checkpoint) ---------------
+- id: L015
+  title: A ported disease model not validated against its reference implementation
+  source: {kind: expert_review, ref: E7 attempt 6, date: 2026-10-26, by: owner (domain expert) with Claude reviewer}
+  layer: model_quality
+  applies_when: []
+  finding: >-
+    The modeler re-implemented a published model in another framework and
+    calibrated it without first showing that it reproduces the reference
+    (e.g. the transmission-to-prevalence relationship and age pattern).
+  change:
+    status: open
+    where: [modeler prompt § rigor contracts, rigor_artifacts.yaml (candidate artifact), E9 plan check]
+    refs: []
+  test:
+    how: [expert, replay]
+    review: Before calibration, did the run show that the ported model reproduces its reference on at least two published relationships?
+
+- id: L016
+  title: Package comparisons not separated from simulation noise
+  source: {kind: expert_review, ref: E7 attempt 6, date: 2026-10-26, by: owner (domain expert) with Claude reviewer}
+  layer: model_quality
+  applies_when: []
+  finding: >-
+    Scenario runs for different intervention packages used independent
+    random streams, and the run did not show that package differences
+    exceed the noise between random seeds before optimising.
+  change:
+    status: open
+    where: [modeler prompt (common random numbers), candidate check on scenario outputs]
+    refs: []
+  test:
+    how: [expert, replay]
+    review: Do scenario comparisons share random numbers (or a common burned-in state), and are the differences larger than the noise between seeds?
+
+- id: L017
+  title: The same data used as a covariate and as a calibration target
+  source: {kind: expert_review, ref: E7 attempt 6, date: 2026-10-26, by: owner (domain expert) with Claude reviewer}
+  layer: model_quality
+  applies_when: []
+  finding: >-
+    One candidate structure used a survey's prevalence as a covariate and
+    was then scored against the same survey, so its fit was not evidence.
+    The lead flagged it; no gate did.
+  change:
+    status: open
+    where: [data declaration contract (target vs covariate roles), candidate structural check]
+    refs: []
+  test:
+    how: [expert, replay]
+    review: Is any calibration or validation target also an input to the model that is scored against it?
+
+- id: L018
+  title: Headline impact not checked against the total disease burden
+  source: {kind: expert_review, ref: E7 attempt 6, date: 2026-10-26, by: owner (domain expert) with Claude reviewer}
+  layer: model_quality
+  applies_when: []
+  finding: >-
+    The provisional headline (14.28M DALYs averted over 2024-26 for $320M)
+    is about 40% of the national burden, implausibly large; an expert prior
+    on the national burden exists but nothing compared the two.
+  change:
+    status: open
+    where: [scripts/sanity_checks.py (counterfactual ratio vs burden prior), expert_priors.yaml]
+    refs: []
+  test:
+    how: [expert]
+    review: Is the headline impact a plausible share of the total burden and of what comparable programmes achieved?
+
+- id: L019
+  title: Decision-critical data the run could not obtain
+  source: {kind: expert_review, ref: E7 attempt 6, date: 2026-10-26, by: owner (domain expert) with Claude reviewer}
+  layer: data
+  applies_when: [malaria]
+  finding: >-
+    No unit-level insecticide resistance (WHO Malaria Threats Map), no actual
+    2021-24 chemoprevention unit lists or net campaign timing, and no split
+    of units by funder (one funder covers 309 of 774 units).
+  change:
+    status: open
+    where: [malaria-modeling skill (data sources), curated data catalogue]
+    refs: []
+  test:
+    how: [expert]
+    review: Did the run obtain resistance, campaign-history and funder-split data, or say plainly how their absence limits the recommendation?
+
+- id: L020
+  title: Calibration by fixed grid and point estimate
+  source: {kind: owner_question, ref: E7 attempt 6, date: 2026-10-26, by: owner (domain expert) with Claude reviewer}
+  layer: model_quality
+  applies_when: []
+  finding: >-
+    Calibration used a full-factorial grid, an emulator whose error was
+    ignored and a single optimum instead of a posterior, with no
+    calibration library.
+  change:
+    status: open
+    where: [modeler prompt, modelops-calabaria skill; side-by-side test on the stored attempt-6 grid]
+    refs: []
+  test:
+    how: [replay, expert]
+    review: Does calibration use an adaptive design, account for emulator error and report a posterior (or justify not doing so)?
+
+- id: L021
+  title: Unit-level allocation that does not hold up to resampling
+  source: {kind: expert_review, ref: E7 attempt 6, date: 2026-10-26, by: owner (domain expert) with Claude reviewer}
+  layer: model_quality
+  applies_when: []
+  finding: >-
+    Only 1% of units kept the same package across resamples (17% at the
+    class level), yet the run reports a unit-level allocation.
+  change:
+    status: open
+    where: [decision-rule-extraction skill, allocation_robustness.py thresholds]
+    refs: []
+  test:
+    how: [expert]
+    review: Is the recommendation stated at the level where it is stable (class or rule), with unit-level detail marked as indicative?

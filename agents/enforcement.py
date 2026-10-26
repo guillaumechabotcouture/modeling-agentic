@@ -35,6 +35,10 @@ REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 HARNESS_DIRS = ("scripts", "agents", ".claude")
 HARNESS_FILES = ("main.py", "CLAUDE.md", "CHANGELOG.md", "requirements.txt",
                  "requirements-cloud.txt")
+# Phase 31: the lessons ledger records expert findings about the agents' own
+# work, so agents may not edit it. Read-only but not hashed: observations are
+# appended while runs are live.
+PROTECTED_REPO_DIRS = ("docs/lessons",)
 
 # Subtrees hashed for tamper evidence. `.claude/` as a whole also holds
 # lock files and local settings that change legitimately, so only the
@@ -123,6 +127,8 @@ def is_harness_path(path: str, cwd: str | None = None) -> bool:
         return False
     if rel in HARNESS_FILES:
         return True
+    if any(rel == d or rel.startswith(d + os.sep) for d in PROTECTED_REPO_DIRS):
+        return True
     first = rel.split(os.sep, 1)[0]
     return first in HARNESS_DIRS
 
@@ -152,7 +158,7 @@ def protected_reason(path: str, run_path: str, agent_type: str | None,
         return "credential files (.env) are not accessible to agents"
     if is_harness_path(path, cwd):
         return ("harness code/config (scripts/, agents/, .claude/, main.py, "
-                "CLAUDE.md) is read-only during a run")
+                "CLAUDE.md, docs/lessons/) is read-only during a run")
     rel = _run_rel(path, run_path, cwd)
     if rel is None:
         return None
