@@ -156,12 +156,12 @@ for f in main.py \
   scripts/identifiability_a_priori.py scripts/numeric_consistency.py \
   scripts/optimization_quality.py scripts/plan_criteria.py \
   scripts/propagate_uncertainty.py scripts/render_claims.py \
-  scripts/results_store.py \
+  scripts/results_store.py scripts/run_autopsy.py \
   scripts/sanity_checks.py scripts/sdk_scenarios.py \
   scripts/sensitivity_analysis.py \
   scripts/source_checks.py \
   scripts/spec_compliance.py scripts/validate_critique_yaml.py \
-  scripts/validate_skill_attachments.py \
+  scripts/validate_skill_attachments.py scripts/watch_run.py \
   scripts/within_zone_sensitivity.py scripts/writer_qa.py \
   scripts/lib/expert_priors.py scripts/lib/md_helpers.py \
   scripts/lib/positive_control.py scripts/lib/provenance.py \

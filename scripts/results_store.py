@@ -109,6 +109,15 @@ def upload(path: str, blob: str, account: str | None = None, service=None) -> di
     return {"blob": blob, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
 
 
+def list_blobs(prefix: str, account: str | None = None, service=None) -> list[dict]:
+    """Blobs under <container>/<path prefix>: [{name, last_modified, size}]."""
+    container, _, name_prefix = prefix.partition("/")
+    svc = service or _service(account)
+    cc = svc.get_container_client(container)
+    return [{"name": f"{container}/{b.name}", "last_modified": b.last_modified, "size": b.size}
+            for b in cc.list_blobs(name_starts_with=name_prefix)]
+
+
 def download(blob: str, path: str, account: str | None = None, service=None) -> dict:
     container, name = _split(blob)
     svc = service or _service(account)
