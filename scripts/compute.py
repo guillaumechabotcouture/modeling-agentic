@@ -507,6 +507,15 @@ class ComputeTagPlugin(_WorkerPlugin):
         return None
 
 
+def register_compute_tags(client, exclude: list[str] | tuple = (), resource: str = "compute") -> None:
+    """Tag compute workers on an autoscaling cluster. Uploads this module first
+    (as a worker plugin, so workers that join later get it too): the plugin is
+    pickled by reference to `compute`, which cluster workers cannot otherwise
+    import (Coiled check, Phase 30; same class of bug as PR #20)."""
+    client.upload_file(os.path.abspath(__file__))
+    client.register_plugin(ComputeTagPlugin(resource, exclude=list(exclude)), name=ComputeTagPlugin.name)
+
+
 def export_worker_env(tls_dir: str, worker=None) -> dict:
     """Call INSIDE a dask worker task (the launcher's run job). Returns the
     env a subprocess needs to reach this cluster: the scheduler address and,
@@ -1191,7 +1200,9 @@ def _self_test() -> int:
                        f"C9 no task ran on the excluded run worker: {used}")
                     os.environ["MA_COMPUTE_PROCS_PER_WORKER"] = "1"
                     rows, s = map_fn(d, "models/slow.py::sleep", [{"s": 1.5}] * 4, max_core_hours=2.0 / 3600)
-                    ok(s["n_ok"] == 1 and s["task_core_s"] <= 2.6 and s["stopped"] == CAP_STOP,
+                    # Not "exactly 1 done": model load time is charged too (Phase 29), so
+                    # timing varies; the property is that the batch stops at the cap.
+                    ok(s["n_ok"] < 4 and s["task_core_s"] <= 2.6 and s["stopped"] == CAP_STOP,
                        f"C27 later chunks get only what is left of the allowance: {s}")
                     # C34 (Phase 30): autoscaling pool. Untagged run worker; a worker
                     # added mid-batch must get work through the resource tag.
@@ -1255,11 +1266,24 @@ def _self_test() -> int:
                 code = ("import json, sys; sys.path.insert(0, %r); import compute; "
                         "rows, s = compute.map_fn(%r, 'models/fn.py::f', [{'x': 0}, {'x': 1}, {'x': 2}], ledger=False); "
                         "print(json.dumps([r.get('result') or r.get('error') for r in rows]))") % (HERE, d)
+                code_tag = ("import json, os, sys; sys.path.insert(0, %r); import compute; "
+                            "from distributed import Client; "
+                            "c = Client(os.environ['MA_COMPUTE_SCHEDULER']); compute.register_compute_tags(c, exclude=[]); "
+                            "os.environ.update(MA_COMPUTE_RESOURCE='compute', MA_COMPUTE_TARGET_WORKERS='1'); "
+                            "rows, s = compute.map_fn(%r, 'models/fn.py::f', [{'x': 0}, {'x': 1}], ledger=False); "
+                            "print(json.dumps([r.get('result') or r.get('error') for r in rows]))") % (HERE, d)
+                # C33b first, on a worker that has never received this module
+                r2 = _sp.run([sys.executable, "-c", code_tag], capture_output=True, text=True, timeout=300,
+                             env=dict(os.environ, PYTHONPATH=""))
+                got2 = r2.stdout.strip().splitlines()[-1] if r2.stdout.strip() else r2.stderr[-400:]
+                ok(got2 == json.dumps([{"y": 0.0}, {"y": 3.0}]),
+                   f"C33b the compute-tag plugin works on a cluster that cannot import this module: {got2}")
                 r = _sp.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=300,
                             env=dict(os.environ, PYTHONPATH=""))
                 got = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.stderr[-500:]
                 ok(got == json.dumps([{"y": 0.0}, {"y": 3.0}, {"y": 6.0}]),
                    f"C33 runs on a cluster that cannot import this module: {got}")
+
             except Exception:
                 print(open(os.path.join(iso, "sched.err")).read()[-3000:])
                 raise
