@@ -675,12 +675,29 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                     break
         finally:
             if pending:
-                for f in pending:
-                    f.cancel()
+                # Stop the call's running chunks (and keep queued ones from starting),
+                # THEN collect what they report: a stopped chunk returns the core-seconds
+                # it actually used, a chunk that never started returns 0. Only chunks
+                # that report nothing are estimated (E7 attempt 6: three concurrent
+                # timed-out calls were each charged the whole pool, ~65 real core-hours
+                # booked as 282, and the run cap stopped all further compute).
                 try:
                     c.run(_cancel_call, call_id, workers=[w for w in c.scheduler_info()["workers"] if w not in exclude])
                 except Exception:  # noqa: BLE001 — cannot confirm the remote stop
                     progress["remote_unconfirmed"] = True
+                try:
+                    wait(pending, timeout=float(os.environ.get("MA_COMPUTE_SETTLE_S", "120")))
+                except TimeoutError:
+                    pass
+                for f in list(pending):
+                    if f.done():
+                        try:
+                            progress["core_s"] += float(f.result()["core_s"])
+                        except Exception:  # noqa: BLE001 — a failed settle stays unknown
+                            continue
+                        pending.discard(f)
+                for f in pending:
+                    f.cancel()
             # The scheduler silently reruns tasks from a worker that died; that
             # attempt's work is invisible here, so a vanished worker is charged
             # as busy for the whole call.
@@ -789,7 +806,10 @@ def map_fn(run_dir: str, fn_spec: str, inputs: list, backend: str = "auto",
                 raise RuntimeError(
                     f"run compute cap reached: {led['core_seconds'] / 3600:.1f} used"
                     + (f" + {held / 3600:.1f} held by running calls" if held else "")
-                    + f" of {cap_s / 3600:g} core-hours")
+                    + f" of {cap_s / 3600:g} core-hours. Do NOT run these simulations on this VM "
+                      "instead (it is the agent's machine: memory exhaustion kills the run). Report the "
+                      "cap to the lead, reduce the batch (fewer draws/points), or ask for a higher "
+                      "MA_COMPUTE_MAX_CORE_HOURS.")
             per_call = max_core_hours if max_core_hours is not None else \
                 float(os.environ.get("MA_COMPUTE_CALL_CORE_HOURS", "50"))
             allowance_s = min(remaining, per_call * 3600)
@@ -1204,6 +1224,16 @@ def _self_test() -> int:
                     # timing varies; the property is that the batch stops at the cap.
                     ok(s["n_ok"] < 4 and s["task_core_s"] <= 2.6 and s["stopped"] == CAP_STOP,
                        f"C27 later chunks get only what is left of the allowance: {s}")
+                    # C35 (Phase 30): a timed-out batch is charged what actually ran, not the pool.
+                    os.environ["MA_COMPUTE_PROCS_PER_WORKER"] = "1"
+                    os.environ["MA_COMPUTE_EXCLUDE_WORKERS"] = w0
+                    t0c = time.time()
+                    rows3, s3 = map_fn(d, "models/slow.py::sleep", [{"s": 1.0}] * 40, timeout_s=2.5, ledger=False)
+                    wall3 = time.time() - t0c
+                    ok(s3["stopped"] == "timed out" and s3["estimated_core_s"] == 0
+                       and s3["task_core_s"] <= 1 * wall3 + 1.0 and sum(r["ok"] for r in rows3) < 40,
+                       f"C35 stopped chunks report their real use, queued ones nothing (no whole-pool estimate): {s3} wall {wall3:.1f}")
+                    os.environ.pop("MA_COMPUTE_EXCLUDE_WORKERS", None)
                     # C34 (Phase 30): autoscaling pool. Untagged run worker; a worker
                     # added mid-batch must get work through the resource tag.
                     os.environ.pop("MA_COMPUTE_EXCLUDE_WORKERS", None)
