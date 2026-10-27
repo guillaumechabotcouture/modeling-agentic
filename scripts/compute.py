@@ -366,7 +366,9 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
         nonlocal deadline, why
         if allowance_s is not None:
             busy = max(cap, len(running))     # a shrinking pool still runs its in-flight inputs
-            deadline, why = _budget_deadline(user_deadline, max(0.0, allowance_s - progress["core_s"]), busy)
+            now = time.time()
+            used = progress["core_s"] + sum(now - t for _, t in running.values())   # in flight counts too
+            deadline, why = _budget_deadline(user_deadline, max(0.0, allowance_s - used), busy)
     ex = new_pool(cap)
     try:
         while todo or running:
@@ -1207,15 +1209,23 @@ def code_fingerprint(run_dir: str, fn_spec: str, exclude=()) -> str:
     fn_file = path if os.path.isabs(path) else os.path.join(run_dir, path)
     skip = {os.path.realpath(x) for x in exclude}
     files = {fn_file}
+    links = []
     for root in (os.path.join(run_dir, "models"), os.path.join(run_dir, "data"), os.path.join(REPO, "scripts")):
-        seen = set()
+        # Every path a model can use is walked, aliases included (each under its
+        # own name); only a loop (a dir that is its own ancestor) stops the walk.
+        ancestors = {root: frozenset()}
         for dp, dirs, fns in os.walk(root, followlinks=True):
             real = os.path.realpath(dp)
-            if real in seen:
+            anc = ancestors.pop(dp, frozenset())
+            if real in anc:
                 dirs[:] = []
                 continue
-            seen.add(real)
             dirs[:] = sorted(d for d in dirs if d not in ("__pycache__", ".git", "_truth"))
+            for d in dirs:
+                ancestors[os.path.join(dp, d)] = anc | {real}
+            for x in dirs + sorted(fns):
+                if os.path.islink(os.path.join(dp, x)):
+                    links.append(f"{os.path.join(dp, x)}->{os.readlink(os.path.join(dp, x))}")
             names = set(fns)
             for fn in fns:
                 is_output = fn + ".summary.json" in names     # another call's results file, any extension
@@ -1223,6 +1233,8 @@ def code_fingerprint(run_dir: str, fn_spec: str, exclude=()) -> str:
                                       or fn.startswith("compute_ledger.json")):
                     continue          # logs, figures, summaries, the ledger
                 files.add(os.path.join(dp, fn))
+    for ln in sorted(links):
+        h.update(b"link:" + ln.encode() + b"\0")
     for f in sorted(files):
         if os.path.realpath(f) in skip:
             continue
@@ -2060,7 +2072,15 @@ def _self_test_p35(ok) -> None:
                 el = time.time() - t0
         finally:
             pass
-        ok(s["stopped"] == CAP_STOP and el < 3.0,
+        sd2 = os.path.join(d, "data", "sl")
+        for nm, v in (("a", "1"), ("b", "2")):
+            os.makedirs(os.path.join(sd2, nm), exist_ok=True)
+            open(os.path.join(sd2, nm, "value.csv"), "w").write(v)
+        os.symlink("a", os.path.join(sd2, "current"))
+        fps = code_fingerprint(d, "models/draw.py::f")
+        os.remove(os.path.join(sd2, "current")); os.symlink("b", os.path.join(sd2, "current"))
+        ok(code_fingerprint(d, "models/draw.py::f") != fps, "P35-32 retargeting a symlinked data dir changes the fingerprint")
+        ok(s["stopped"] == CAP_STOP and el < 2.2,
            f"P35-31 a shrinking pool's allowance stop counts the inputs still running ({el:.1f}s): {s.get('stopped')}")
 
 
