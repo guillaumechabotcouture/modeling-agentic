@@ -463,7 +463,8 @@ async def brief_signoff(query_fn=None):
               for l in open(os.path.join(run, "trace.jsonl")) if '"subagent_type"' in l]
     return {"first": _summ(r1), "second": _summ(r2), "errors": [err1, err2], "brief_status_before_signoff": status_before,
             "lead_stopped_for_signoff": "AWAITING_SIGNOFF" in t1, "data_refused_before_signoff":
-            ("data-agent", True) in spawns, "data_ran_after_signoff": spawns[-1:] == [("data-agent", False)],
+            ("data-agent", True) in spawns, "data_ran_after_signoff": ("data-agent", False) in spawns[spawns.index(("data-agent", True)) + 1:]
+            if ("data-agent", True) in spawns else False,
             "spawns": spawns, "text1": t1[-160:], "text2": t2[-160:]}
 
 
