@@ -42,13 +42,18 @@ def events(prev: dict | None, cur: dict, now: datetime, alerted: set) -> list[st
         out.append(f"gate round {g.get('round')}: {g.get('action')} ({g.get('high')} HIGH, {g.get('medium')} MEDIUM)")
     led = cur.get("ledger") or {}
     cap = led.get("cap_usd")
-    spent = max(float(led.get("spent_usd") or 0), float(cur.get("est_spend_this_process_usd") or 0))
+    charged = float(led.get("spent_usd") or 0)
+    live = float(cur.get("est_spend_this_process_usd") or 0)
+    spent = max(charged, live)
     if cap:
         for frac in (0.5, 0.8, 1.0):
             key = f"spend{frac}"
             if spent >= frac * cap and key not in alerted:
                 alerted.add(key)
-                out.append(f"SPEND {int(frac * 100)}% of cap: ~${spent:.0f} of ${cap:.0f}")
+                # Say which number crossed: the ledger (sessions charged) or the
+                # live estimate for the running session (runs ~14% high).
+                out.append(f"SPEND {int(frac * 100)}% of cap: ledger ${charged:.0f}, live estimate ${live:.0f} "
+                           f"(this session), cap ${cap:.0f}")
     mem = (cur.get("resources") or {}).get("mem_used_pct")
     if mem is not None and mem >= MEM_ALERT and "mem" not in alerted:
         alerted.add("mem")

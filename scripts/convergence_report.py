@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""Does the loop converge? Per-round measures for one run (E7 attempt 7 pre-registration).
+
+    python3 scripts/convergence_report.py <run_dir> [--json]
+    python3 scripts/convergence_report.py --self-test
+
+Reads only run files: validator_history.jsonl (gate decisions), critique_*.yaml
+(findings by first round and resolution), done_when_registry.json (finding
+tests), trace.jsonl (holds and their reasons), models/compute_ledger.json and
+budget_ledger.json. Works on a finished run or a live one (on its VM).
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import glob
+import json
+import os
+import sys
+import tempfile
+
+import yaml
+
+CRITIC_FILES = ("critique_methods.yaml", "critique_domain.yaml", "critique_presentation.yaml",
+                "critique_redteam.yaml")
+HOLD_KINDS = (("round plan", "write round_plan.yaml"), ("plan changed", "stays that way this round"),
+              ("plan handed out", "handed to the agent that does it"), ("fix check", "fix check after round"),
+              ("send back", "back to its agent once"), ("still working", "still working"),
+              ("sign-off", "AWAITING_SIGNOFF"), ("writer", "write-up waits"),
+              ("critic prompt", "prompt with one of"), ("list missing", "missing or stale"))
+
+
+def _jsonl(path):
+    try:
+        with open(path, errors="replace") as f:
+            for line in f:
+                try:
+                    yield json.loads(line)
+                except ValueError:
+                    continue
+    except OSError:
+        return
+
+
+def _json(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def report(run_dir: str) -> dict:
+    out: dict = {"run_dir": run_dir}
+    # Gates: open blocking findings per in-round gate (last run of each round).
+    gates = {}
+    for r in _jsonl(os.path.join(run_dir, "validator_history.jsonl")):
+        if r.get("post_write"):
+            continue
+        gates[r.get("round")] = {"action": r.get("action"),
+                                 "open_blocking": len(r.get("findings") or [])}   # the gate's recorded findings
+    out["gates"] = {k: gates[k] for k in sorted(gates, key=lambda x: (x is None, x))}
+    # Findings: arrivals per round, resolution, rounds to resolve.
+    arrivals, closed, ages, still_open = collections.Counter(), 0, [], []
+    for f in CRITIC_FILES:
+        try:
+            doc = yaml.safe_load(open(os.path.join(run_dir, f))) or {}
+        except (OSError, yaml.YAMLError):
+            continue
+        for b in doc.get("blockers") or []:
+            if not isinstance(b, dict) or b.get("severity") not in ("HIGH", "MEDIUM"):
+                continue
+            first = b.get("first_seen_round")
+            arrivals[first] += 1
+            if b.get("resolved") is True:
+                closed += 1
+                if isinstance(b.get("resolved_in_round"), int) and isinstance(first, int):
+                    ages.append(b["resolved_in_round"] - first)
+            else:
+                still_open.append(str(b.get("id")))
+    out["new_findings_by_round"] = {k: arrivals[k] for k in sorted(arrivals, key=lambda x: (x is None, x))}
+    out["findings_resolved"] = closed
+    out["findings_open"] = len(still_open)
+    out["median_rounds_to_resolve"] = sorted(ages)[len(ages) // 2] if ages else None
+    # Finding tests.
+    tests = (_json(os.path.join(run_dir, "done_when_registry.json"), {}) or {}).get("tests") or {}
+    kinds = collections.Counter()
+    for t in tests.values():
+        dw = t.get("done_when") if isinstance(t, dict) else None
+        lst = dw if isinstance(dw, list) else [dw] if isinstance(dw, dict) else []
+        j = sum(1 for c in lst if isinstance(c, dict) and "judgement" in c)
+        kinds["judgement" if j and j == len(lst) else "mixed" if j else "runnable"] += 1
+    hist_last = {k: (t.get("history") or [[None, None]])[-1][1] for k, t in tests.items() if isinstance(t, dict)}
+    out["tests"] = {"registered": len(tests), "by_kind": dict(kinds),
+                    "passed_once": sum(1 for t in tests.values() if isinstance(t, dict) and t.get("passed_round")),
+                    "passing_now": sum(1 for v in hist_last.values() if v is True),
+                    "regressed_now": sum(1 for k, t in tests.items() if isinstance(t, dict) and t.get("passed_round")
+                                         and hist_last.get(k) is False),
+                    "withdrawn": sum(1 for t in tests.values() if isinstance(t, dict) and t.get("withdrawn"))}
+    # Holds that fired.
+    holds = collections.Counter()
+    for r in _jsonl(os.path.join(run_dir, "trace.jsonl")):
+        reason = r.get("denied")
+        if not reason:
+            continue
+        holds[next((name for name, key in HOLD_KINDS if key in reason), "other")] += 1
+    out["refusals"] = dict(holds.most_common())
+    # Compute.
+    led = _json(os.path.join(run_dir, "models", "compute_ledger.json"), {}) or {}
+    calls = led.get("calls") or []
+    unrun = sum(int(c.get("n_failed") or 0) for c in calls if c.get("stopped"))
+    total = sum(int(c.get("n") or 0) for c in calls)
+    out["compute"] = {"calls": len(calls), "core_hours": round(float(led.get("core_seconds") or 0) / 3600, 1),
+                      "stopped_calls": sum(1 for c in calls if c.get("stopped")),
+                      "unrun_share": round(unrun / total, 3) if total else None,
+                      "last_call": calls[-1].get("ts") if calls else None}
+    bl = _json(os.path.join(run_dir, "budget_ledger.json"), {}) or {}
+    out["spend_usd"] = bl.get("spent_usd")
+    out["cap_usd"] = bl.get("cap_usd")
+    return out
+
+
+def render(r: dict) -> str:
+    lines = [f"# Convergence report: {os.path.basename(os.path.normpath(r['run_dir']))}", ""]
+    lines.append("Gate findings recorded per round (validator history): " + ", ".join(f"r{k} {v['open_blocking']} ({v['action']})"
+                                                      for k, v in r["gates"].items()) or "none")
+    lines.append("New HIGH/MEDIUM by first round: " + ", ".join(f"r{k} {v}" for k, v in r["new_findings_by_round"].items()))
+    lines.append(f"Findings resolved {r['findings_resolved']}, open {r['findings_open']}, median rounds to "
+                 f"resolve {r['median_rounds_to_resolve']}")
+    t = r["tests"]
+    lines.append(f"Tests: {t['registered']} registered {t['by_kind']}; passed once {t['passed_once']}, passing now "
+                 f"{t['passing_now']}, regressed now {t['regressed_now']}, withdrawn {t['withdrawn']}")
+    lines.append("Refusals: " + (", ".join(f"{k} {v}" for k, v in r["refusals"].items()) or "none"))
+    c = r["compute"]
+    lines.append(f"Compute: {c['calls']} calls, {c['core_hours']} core-hours, {c['stopped_calls']} stopped, "
+                 f"unrun share {c['unrun_share']}, last call {c['last_call']}")
+    lines.append(f"Spend: ${r['spend_usd']} of ${r['cap_usd']}")
+    return "\n".join(lines) + "\n"
+
+
+def _self_test() -> int:
+    fails = []
+
+    def ok(c, m):
+        if not c:
+            fails.append(m)
+
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "validator_history.jsonl"), "w") as f:
+            for rnd, n in ((1, 5), (2, 3), (2, 2)):
+                f.write(json.dumps({"round": rnd, "action": "PATCH_OR_RETHINK", "findings": list(range(n))}) + "\n")
+            f.write(json.dumps({"round": 2, "action": "ACCEPT", "post_write": True, "findings": []}) + "\n")
+        yaml.safe_dump({"blockers": [
+            {"id": "R-1", "severity": "HIGH", "first_seen_round": 1, "resolved": True, "resolved_in_round": 2},
+            {"id": "R-2", "severity": "MEDIUM", "first_seen_round": 2, "resolved": False},
+            {"id": "R-3", "severity": "LOW", "first_seen_round": 2, "resolved": False}]},
+            open(os.path.join(d, "critique_redteam.yaml"), "w"))
+        json.dump({"tests": {"R-1": {"done_when": {"file": "a", "exists": True}, "passed_round": 2,
+                                     "history": [[1, False], [2, True]]},
+                             "R-2": {"done_when": [{"file": "a", "exists": True}, {"judgement": "x"}],
+                                     "passed_round": None, "history": [[2, None]]},
+                             "R-9": {"done_when": {"judgement": "y"}, "passed_round": 1, "history": [[2, False]],
+                                     "withdrawn": {"round": 2}}}}, open(os.path.join(d, "done_when_registry.json"), "w"))
+        with open(os.path.join(d, "trace.jsonl"), "w") as f:
+            f.write(json.dumps({"denied": "Before the next round's work, write round_plan.yaml (round: 1)"}) + "\n")
+            f.write(json.dumps({"denied": "critique-redteam reviews finished work, and these agents are still working"}) + "\n")
+            f.write("bad\n")
+        json.dump({"core_seconds": 7200, "calls": [{"n": 10, "n_failed": 4, "stopped": "timed out", "ts": "t1"},
+                                                   {"n": 10, "n_failed": 0, "stopped": None, "ts": "t2"}]},
+                  open(os.path.join(d, "models", "compute_ledger.json"), "w"))
+        json.dump({"spent_usd": 12.5, "cap_usd": 450}, open(os.path.join(d, "budget_ledger.json"), "w"))
+        r = report(d)
+        ok(r["gates"] == {1: {"action": "PATCH_OR_RETHINK", "open_blocking": 5},
+                          2: {"action": "PATCH_OR_RETHINK", "open_blocking": 2}},
+           f"CV1 last in-round gate per round; post-write excluded: {r['gates']}")
+        ok(r["new_findings_by_round"] == {1: 1, 2: 1} and r["findings_resolved"] == 1 and r["findings_open"] == 1
+           and r["median_rounds_to_resolve"] == 1, f"CV2 HIGH/MEDIUM arrivals and resolution: {r}")
+        ok(r["tests"]["registered"] == 3 and r["tests"]["by_kind"] == {"runnable": 1, "mixed": 1, "judgement": 1}
+           and r["tests"]["passing_now"] == 1 and r["tests"]["regressed_now"] == 1 and r["tests"]["withdrawn"] == 1,
+           f"CV3 tests by kind and state: {r['tests']}")
+        ok(r["refusals"] == {"round plan": 1, "still working": 1}, f"CV4 refusals by hold: {r['refusals']}")
+        ok(r["compute"]["unrun_share"] == 0.2 and r["compute"]["core_hours"] == 2.0 and r["compute"]["stopped_calls"] == 1,
+           f"CV5 compute: {r['compute']}")
+        ok("r1 5" in render(r) and "Spend: $12.5 of $450" in render(r), "CV6 rendering")
+        ok(report(os.path.join(d, "nope"))["gates"] == {}, "CV7 an empty or missing run reports nothing, not a crash")
+    if fails:
+        print("SELF-TEST FAILURES:")
+        for f in fails:
+            print("  -", f)
+        return 1
+    print("OK: all self-test cases passed.")
+    return 0
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("run_dir", nargs="?")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--self-test", action="store_true")
+    a = ap.parse_args(argv)
+    if a.self_test:
+        return _self_test()
+    if not a.run_dir:
+        ap.error("run_dir required")
+    r = report(a.run_dir)
+    print(json.dumps(r, indent=1, default=str) if a.json else render(r))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

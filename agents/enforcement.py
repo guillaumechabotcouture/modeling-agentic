@@ -35,6 +35,10 @@ REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 HARNESS_DIRS = ("scripts", "agents", ".claude")
 HARNESS_FILES = ("main.py", "CLAUDE.md", "CHANGELOG.md", "requirements.txt",
                  "requirements-cloud.txt")
+# Phase 31: the lessons ledger records expert findings about the agents' own
+# work, so agents may not edit it. Read-only but not hashed: observations are
+# appended while runs are live.
+PROTECTED_REPO_DIRS = ("docs/lessons",)
 
 # Subtrees hashed for tamper evidence. `.claude/` as a whole also holds
 # lock files and local settings that change legitimately, so only the
@@ -76,7 +80,26 @@ SCRIPT_OUTPUTS = (
     "final_gate_stderr.txt",
     "artifact_integrity.json",   # Phase 23 α: written by agents/integrity.py only
     "budget_ledger.json",        # Phase 23 β: run-wide spend, written by main.py only
+    "open_problems.json",        # Phase 32 α: written by the gate
+    "open_problems.md",
+    "open_problems.json.tmp",
+    "open_problems.md.tmp",
+    "decision_brief.signoff.json",   # Phase 33 α: scripts/decision_brief.py sign
+    "decision_brief.signed/*",       # the signed copies, for restoring a changed file
+    "acceptance_lock.json",          # Phase 33 α: written by the gate
+    "done_when_registry.json",       # Phase 34: frozen finding tests, written by the gate
+    "done_when_registry.json.tmp",
+    "round_plan.frozen.json",        # Phase 32 γ: the plan as handed out, written by the hook
+    "round_plan.frozen.json.tmp",
 )
+
+# Phase 33 α (Gemini review): frozen once decision_brief.signoff.json exists.
+SIGNED_FILES = ("decision_brief.yaml", "success_criteria.yaml")
+
+# Files only one writer may change (None = the lead). Phase 32 α: the round
+# plan; Phase 33 α: the decision brief (planner) and its amendments (lead).
+OWNED_BY = {"round_plan.yaml": {None}, "brief_amendments.yaml": {None},
+            "decision_brief.yaml": {"planner"}}
 
 # Files the lead may not write directly: it must re-spawn the owning
 # agent. critique_* belong to the critique agents; models/** to the
@@ -84,6 +107,7 @@ SCRIPT_OUTPUTS = (
 LEAD_PROTECTED = (
     "critique_*.yaml",
     "critique_*.md",
+    "fix_check_*.yaml",   # Phase 32 β: written by the critics
     "models/*",
     "models/**",
 )
@@ -123,6 +147,14 @@ def is_harness_path(path: str, cwd: str | None = None) -> bool:
         return False
     if rel in HARNESS_FILES:
         return True
+    # Gemini review: a parent of a protected directory reaches it too. (The
+    # repo root itself is not listed: a relative `.` after an unknown `cd` is
+    # checked against the root, and `cp x .` in a run directory is routine;
+    # whole-repo git reverts are caught by the harness hash in main.py.)
+    if rel != "." and any(d.startswith(rel + os.sep) for d in PROTECTED_REPO_DIRS):
+        return True
+    if any(rel == d or rel.startswith(d + os.sep) for d in PROTECTED_REPO_DIRS):
+        return True
     first = rel.split(os.sep, 1)[0]
     return first in HARNESS_DIRS
 
@@ -152,7 +184,7 @@ def protected_reason(path: str, run_path: str, agent_type: str | None,
         return "credential files (.env) are not accessible to agents"
     if is_harness_path(path, cwd):
         return ("harness code/config (scripts/, agents/, .claude/, main.py, "
-                "CLAUDE.md) is read-only during a run")
+                "CLAUDE.md, docs/lessons/) is read-only during a run")
     rel = _run_rel(path, run_path, cwd)
     if rel is None:
         return None
@@ -161,6 +193,22 @@ def protected_reason(path: str, run_path: str, agent_type: str | None,
             return None
         return (f"{rel} is produced by a pipeline script; re-run the script "
                 f"instead of writing it by hand")
+    # Codex review (Phases 31-34): critique and fix-check files belong to the
+    # critic that wrote them; another specialist must not write a verdict.
+    if agent_type is not None and _matches(rel, ("critique_*.yaml", "critique_*.md")) \
+            and not str(agent_type).startswith("critique-"):
+        return f"{rel} is written only by the critics"
+    m = re.fullmatch(r"fix_check_r\d+_([a-z]+)\.yaml", rel)
+    if m and agent_type is not None and agent_type != f"critique-{m.group(1)}":
+        return f"{rel} is written only by critique-{m.group(1)}"
+    if rel in SIGNED_FILES and os.path.exists(os.path.join(run_path, "decision_brief.signoff.json")):
+        # Gemini review: once signed these are frozen for everyone; framing
+        # changes go in brief_amendments.yaml (the lead), not the files.
+        return (f"{rel} was signed by the owner and is frozen; record framing changes in "
+                "brief_amendments.yaml")
+    if rel in OWNED_BY and agent_type not in OWNED_BY[rel]:
+        who = ", ".join("the lead" if w is None else w for w in OWNED_BY[rel])
+        return f"{rel} is written only by {who}"
     if agent_type is None and _matches(rel, LEAD_PROTECTED):
         return (f"{rel} is owned by a specialist agent; the lead must "
                 f"re-spawn the owning agent rather than edit it")
@@ -378,6 +426,9 @@ substitution (`tee >(…) <protected>`). They are caught after the
 def bash_reason(command: str, run_path: str, agent_type: str | None,
                 cwd: str | None = None) -> str | None:
     """Deny reason for a Bash command, or None."""
+    if _CHMOD.search(command) and _HARNESS_WORDS.search(command):
+        return ("harness code/config (scripts/, agents/, .claude/, main.py, CLAUDE.md) is read-only during a "
+                "run; changing its permissions is not allowed")
     if _ENV_REF.search(command):
         return ("credential files (.env) are not accessible to agents; cloud "
                 "credentials are provided in the environment when --cloud is set")
@@ -472,6 +523,56 @@ def deny_output(reason: str) -> dict:
 # Tamper evidence
 # ---------------------------------------------------------------------------
 
+def _harness_paths(repo_root: str = REPO_ROOT):
+    for d in HASHED_DIRS:
+        for dirpath, dirnames, filenames in os.walk(os.path.join(repo_root, d)):
+            dirnames[:] = sorted(x for x in dirnames if x not in _HASH_SKIP_DIRS)
+            for fname in sorted(filenames):
+                if not fname.endswith(_HASH_SKIP_SUFFIXES) and fname != ".DS_Store":
+                    yield os.path.join(dirpath, fname)
+    for fname in HASHED_FILES:
+        p = os.path.join(repo_root, fname)
+        if os.path.isfile(p):
+            yield p
+
+
+def lock_harness(repo_root: str = REPO_ROOT) -> dict[str, int]:
+    """Make every hashed harness file read-only for the run; returns the
+    original modes for unlock_harness. The 2026-10-27 smoke's modeler edited
+    scripts/effect_size_registry.py through a Python heredoc with a variable
+    path, which the shell heuristics cannot see; the harness hash then voided
+    the run. A read-only file fails the write at once, and the agent sees why."""
+    modes = {}
+    paths = list(_harness_paths(repo_root))
+    # Their directories too (Codex review): with a writable directory a file can
+    # still be replaced (write a temp file, os.replace it over the original).
+    dirs = set()
+    for d in HASHED_DIRS:
+        for dirpath, dirnames, _ in os.walk(os.path.join(repo_root, d)):
+            dirnames[:] = [x for x in dirnames if x not in _HASH_SKIP_DIRS]
+            dirs.add(dirpath)
+    for p in paths + sorted(dirs, reverse=True):
+        try:
+            m = os.stat(p).st_mode
+            os.chmod(p, m & ~0o222)
+            modes[p] = m
+        except OSError:
+            continue
+    return modes
+
+
+def unlock_harness(modes: dict[str, int]) -> None:
+    for p, m in (modes or {}).items():
+        try:
+            os.chmod(p, m)
+        except OSError:
+            continue
+
+
+_CHMOD = re.compile(r"\b(chmod|chattr|chown|chflags)\b|os\.chmod|\.chmod\(")
+_HARNESS_WORDS = re.compile(r"(?:^|[\s/'\"=])(?:scripts|agents|\.claude)(?:/|\b)|\bmain\.py\b|\bCLAUDE\.md\b|\brequirements\.txt\b")
+
+
 def hash_harness(repo_root: str = REPO_ROOT) -> dict[str, str]:
     """sha256 of every hashed harness file, keyed by repo-relative path."""
     out: dict[str, str] = {}
@@ -535,14 +636,35 @@ MAX_BUFFER_SIZE = 32 * 1024 * 1024
 # Environment
 # ---------------------------------------------------------------------------
 
+# Phase 31: the prompt cache lives 1 hour instead of 5 minutes, for the lead
+# and for subagents. E7 attempt 6: 44% of the measured spend was the cache
+# being re-written after 5-60 min waits (the lead waiting on subagents, the
+# modeler on simulations); replayed on that run, 1 h writes would have cut
+# cache spend from $300 to about $186. MA_PROMPT_CACHE_TTL=5m restores the
+# default for comparison.
+def cache_env(environ: dict[str, str]) -> dict[str, str]:
+    ttl = environ.get("MA_PROMPT_CACHE_TTL", "1h")
+    if ttl not in ("1h", "5m"):
+        ttl = "1h"
+    return {"CLAUDE_CODE_PROMPT_CACHE_TTL": ttl, "CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL": ttl}
+
+
+# Session settings for every pipeline session: with a 1 h cache the CLI may
+# compact a long idle conversation, which could drop the lead's instructions;
+# off until compaction is tested on its own.
+SESSION_SETTINGS = '{"idleCompaction": false}'
+
+
 def filtered_env(environ: dict[str, str], allow_cloud: bool) -> dict[str, str]:
     """Overrides for ClaudeAgentOptions.env.
 
     The SDK merges os.environ with options.env, so variables cannot be
     removed, only overridden. Cloud credentials are blanked when cloud
-    execution is off; downstream code treats empty as unset.
+    execution is off; downstream code treats empty as unset. Phase 31:
+    also sets the prompt-cache TTL (cache_env).
     """
     overrides = interpreter_env(environ)
+    overrides.update(cache_env(environ))
     if not allow_cloud:
         overrides.update({k: "" for k in environ if k.startswith(CLOUD_ENV_PREFIXES)})
     return overrides

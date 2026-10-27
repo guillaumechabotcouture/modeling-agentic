@@ -159,6 +159,14 @@ same paths. Iterative calibration (Optuna and similar) should batch trials
 at a time. `scripts/propagate_uncertainty.py` already uses the service for
 UQ draws.
 
+Size a batch before launching it: run a pilot of 5-10 inputs first, time one
+evaluation, and set `--timeout-s` from (inputs x seconds per evaluation /
+compute cores) with a margin; a timed-out batch leaves its unfinished rows
+empty. **Never run a batch on this machine instead** (your own python loop,
+a local pool, a background script): this VM runs the agent, and filling its
+memory kills the run. If the service refuses with "run compute cap reached",
+reduce the batch (fewer grid points or draws) or report the cap to the lead.
+
 When running a single model script, do NOT just launch and sleep-poll. Instead:
 
 1. **Run with real-time output**: Use `python -u model.py 2>&1 | tee output.log`

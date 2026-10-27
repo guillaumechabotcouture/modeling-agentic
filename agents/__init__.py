@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import time
 from datetime import datetime
 
 from claude_agent_sdk import AgentDefinition, HookMatcher
@@ -19,6 +20,9 @@ import sys  # noqa: E402
 _SCRIPTS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
 if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)  # lib.md_helpers (shared frontmatter rule)
+import open_problems  # noqa: E402  (Phase 32: open-problem list, round plan, fix checks)
+import decision_brief  # noqa: E402  (Phase 33: the signed decision brief)
+import done_when  # noqa: E402  (Phase 34: a test for every finding)
 
 MAX_FIGURE_PIXELS = 10_000_000  # 10MP -- anything larger is likely a bug
 
@@ -251,6 +255,19 @@ def build_agents(question: str = "", run_dir: str | None = None
     return agents
 
 
+WRITER_BRIEF_NOTE = """
+
+## The decision brief (Phase 33)
+
+Open the report's first section by restating the signed decision brief in
+plain words (decision_brief.yaml and decision_brief.signoff.json): the
+decision, what the report answers and at what resolution, what is out of
+scope, and the owner's answers to its open questions. If brief_amendments.yaml
+exists, list each amendment and its reason there too. Answer each A* item
+of the brief, at its stated resolution, before anything else.
+"""
+
+
 def _registry() -> dict[str, AgentDefinition]:
     return {
         "planner": AgentDefinition(
@@ -281,7 +298,7 @@ def _registry() -> dict[str, AgentDefinition]:
         ),
         "modeler": AgentDefinition(
             description=modeler.DESCRIPTION,
-            prompt=modeler.SYSTEM_PROMPT,
+            prompt=modeler.SYSTEM_PROMPT + done_when.WORKER_NOTE,
             tools=modeler.TOOLS,
             model=enforcement.MODEL_DEEP,
             maxTurns=150,
@@ -334,7 +351,7 @@ def _registry() -> dict[str, AgentDefinition]:
         ),
         "analyst": AgentDefinition(
             description=analyst.DESCRIPTION,
-            prompt=analyst.SYSTEM_PROMPT,
+            prompt=analyst.SYSTEM_PROMPT + done_when.WORKER_NOTE,
             tools=analyst.TOOLS,
             model=enforcement.MODEL_DEEP,
             maxTurns=40,
@@ -343,7 +360,8 @@ def _registry() -> dict[str, AgentDefinition]:
         ),
         "critique-methods": AgentDefinition(
             description=critique_methods.DESCRIPTION,
-            prompt=critique_methods.SYSTEM_PROMPT,
+            prompt=critique_methods.SYSTEM_PROMPT + open_problems.FIX_CHECK_NOTE + decision_brief.CRITIC_NOTE
+                   + done_when.CRITIC_NOTE,
             tools=critique_methods.TOOLS,
             model=enforcement.MODEL_DEEP,
             maxTurns=35,  # increased: now does parameter provenance checks with WebSearch
@@ -352,7 +370,8 @@ def _registry() -> dict[str, AgentDefinition]:
         ),
         "critique-domain": AgentDefinition(
             description=critique_domain.DESCRIPTION,
-            prompt=critique_domain.SYSTEM_PROMPT,
+            prompt=critique_domain.SYSTEM_PROMPT + open_problems.FIX_CHECK_NOTE + decision_brief.CRITIC_NOTE
+                   + done_when.CRITIC_NOTE,
             tools=critique_domain.TOOLS,
             model=enforcement.MODEL_DEEP,
             maxTurns=50,  # increased after malaria run ran_to_cap at 39/40
@@ -377,14 +396,16 @@ def _registry() -> dict[str, AgentDefinition]:
         ),
         "critique-presentation": AgentDefinition(
             description=critique_presentation.DESCRIPTION,
-            prompt=critique_presentation.SYSTEM_PROMPT,
+            prompt=critique_presentation.SYSTEM_PROMPT + open_problems.FIX_CHECK_NOTE + decision_brief.CRITIC_NOTE
+                   + done_when.CRITIC_NOTE,
             tools=critique_presentation.TOOLS,
             model=enforcement.MODEL_FAST,
             maxTurns=40,  # bumped 25→30 post-measles, 30→40 post-malaria (30/30 ran_to_cap in round 2)
         ),
         "critique-redteam": AgentDefinition(
             description=red_team.DESCRIPTION,
-            prompt=red_team.SYSTEM_PROMPT,
+            prompt=red_team.SYSTEM_PROMPT + open_problems.FIX_CHECK_NOTE + decision_brief.CRITIC_NOTE
+                   + done_when.CRITIC_NOTE,
             tools=red_team.TOOLS,
             model=enforcement.MODEL_DEEP,  # adversarial judgment + WebFetch-heavy research
             maxTurns=50,
@@ -408,7 +429,7 @@ def _registry() -> dict[str, AgentDefinition]:
         ),
         "writer": AgentDefinition(
             description=writer.DESCRIPTION,
-            prompt=writer.SYSTEM_PROMPT,
+            prompt=writer.SYSTEM_PROMPT + WRITER_BRIEF_NOTE,
             tools=writer.TOOLS,
             model=enforcement.MODEL_DEEP,  # needs to synthesize the most complex output
             maxTurns=60,
@@ -459,8 +480,24 @@ Wait for completion. Then read {run_dir}/plan.md and verify it has:
 - Candidate models (baseline, standard, advanced)
 - Testable hypotheses
 - threads.yaml
+- decision_brief.yaml (Phase 33): what the answer must deliver
 
 If critical sections are missing, re-spawn planner with specific feedback.
+
+#### STAGE 1.5: SIGN-OFF OF THE DECISION BRIEF (Phase 33)
+`decision_brief.yaml` is the target the whole run is judged against: the
+decision and who makes it, what the report must answer and at what
+resolution, the objective, constraints, accounting conventions, what is out
+of scope, the acceptance criteria, and open questions for the owner. Check
+that it is faithful to the question and that its open questions are the
+framing choices that matter. Nothing but planning runs until it is signed;
+the harness says whether the owner signs (end your turn with
+AWAITING_SIGNOFF and you are resumed with the owner's answers) or you do.
+After sign-off the brief and success_criteria.yaml are frozen and the
+benchmark bands are locked when the gate first sees them; record framing
+changes you discover in `brief_amendments.yaml` (`amendments:` list of
+{id: AM-1, item: <A/C/K/OS/Q id>, change, reason}); acceptance criteria
+cannot be changed in-run. Pass the owner's answers to every specialist.
 
 ### STAGE 2: DATA
 Spawn the "data-agent" agent. Tell it the run directory (which has plan.md).
@@ -701,7 +738,10 @@ pass MUST begin with the literal line `This is critique round N.` where
 N is the current round number (starting at 1). Without this line the
 critique agent falls back to round 1 and emits a YAML with `round: 1`
 regardless of the actual round, which the validator will reject with a
-schema error and cost you a revision cycle.
+schema error and cost you a revision cycle. The harness refuses methods,
+domain, presentation and red-team spawns that start any other way, except
+`This is a fix check after round N.` (Step 2b) and `This is a repair of
+<file>.` (fix only that file's format, for example a schema error).
 
 Example spawn-prompt opening for round 2+:
 
@@ -798,6 +838,50 @@ section to `{run_dir}/progress.md` containing:
 
 This is your audit trail. Future resumes read it.
 
+#### Step 2b: Plan every open problem (Phase 32)
+
+After a PATCH_OR_RETHINK or RETHINK_STRUCTURAL gate, the gate has written
+`open_problems.md`: every open HIGH and MEDIUM finding, soonest-blocking
+first, with how many rounds each MEDIUM has before it becomes blocking.
+Before the next round's work, write `{run_dir}/round_plan.yaml`:
+
+```yaml
+round: <N>            # the gate round just run
+items:
+  R-005: {action: fix, stage: ANALYZE}
+  R-008: {action: rethink, stage: MODEL}
+  R-017: {action: declare, reason: "<why it cannot be fixed with the data or tools available>"}
+  P-007: {action: after_write}
+  D-023: {action: defer, reason: "<why not this round>"}
+  "REG-*": {action: fix, stage: MODEL}
+```
+
+Every id needs an action: `fix` or `rethink` (with the stage that does it),
+`declare` (cannot be fixed in this run; goes in scope_declaration.yaml),
+`after_write` (write-up findings only), or `defer` (with a reason; not for
+blocking findings or ones that block at the next gate). Patterns such as
+`REG-*` are allowed for gate findings only; critic findings are listed by id.
+Moderate findings count: a MEDIUM left alone for four rounds becomes
+blocking, and several reaching that point together sank an earlier run.
+Decide early which findings cannot be fixed with what is available and
+declare them in round 1 or 2, while the scope-declaration allowance is free,
+so the rounds go to what can be fixed.
+
+The harness enforces this: planner, data-agent, modeler and analyst spawns
+are refused until the plan covers the latest list, and the round's critique
+is refused until every `fix` / `rethink` id has been named in a spawn prompt
+to its stage's agent (PLAN planner, DATA data-agent, MODEL modeler, ANALYZE
+analyst, WRITE writer). Once that work is handed out, the actions in the
+plan are fixed for the round (you may add items a gate rerun lists, not
+change these): a fix that did not work stays open, and the next gate lists
+it again for the next round's plan. Each critic finding carries a `done_when`
+test (shown in open_problems.md): the gate closes a finding when its test
+passes and reopens it if a later change breaks it, so tell each agent to run
+`python3 scripts/done_when.py check {run_dir} <IDs>` before it returns.
+Agents run in the background, so critics
+and the writer are refused while a planner, data-agent, modeler or analyst
+is still working; wait for each result before spawning them.
+
 #### Step 3: Execute the action
 
 The validator has already decided for you. Your job is to carry it out:
@@ -826,7 +910,8 @@ The validator has already decided for you. Your job is to carry it out:
     category is HARD_BLOCKER, METHODS, CAUSAL, HYPOTHESES, CITATIONS,
     or PRESENTATION, AND none of the PATCH→RETHINK escalation triggers
     below apply. Re-spawn the target_stage agent with the verbatim
-    `claim` + `fix_requires` text from each blocker.
+    `claim` + `fix_requires` text from each blocker, and every MEDIUM your
+    round plan marks `fix` for that stage, each named by id.
 
   * **Parallelism in PATCH (Phase 5 Commit η)** — when this PATCH
     round's blockers span MULTIPLE target_stages (e.g., some target
@@ -881,8 +966,8 @@ The validator has already decided for you. Your job is to carry it out:
       the issue may live where the critique didn't expect. For a
       MODEL blocker that's failed twice, re-spawn ANALYZE with the
       blocker text reframed as "the analysis assumes X, but the
-      model doesn't support X" or re-spawn WRITE with "the report
-      claims Y, but the underlying model produces Z". Document the
+      model doesn't support X" or, once a draft exists, re-spawn WRITE
+      with "the report claims Y, but the underlying model produces Z". Document the
       cross-stage move in progress.md.
 
     - **HYPOTHESES / CITATIONS** category, attempts >= 2 → re-spawn
@@ -943,6 +1028,28 @@ After deciding, if not ACCEPTing, go back to the stage named by the
 unresolved blockers' `target_stage` (PLAN, DATA, MODEL, ANALYZE, or
 WRITE) and continue from there. Increment the round counter before the
 next STAGE 6.
+
+#### Fix check before the next full critique (Phase 32)
+
+When the fixes for round N are done, and before the next STAGE 6, spawn
+each critic that raised a planned `fix` / `rethink` item in fix-check mode,
+in parallel, with a prompt beginning `This is a fix check after round N.`
+and listing only its ids. Each re-checks those items and what the fix
+changed, and writes `fix_check_rN_<critic>.yaml` (verdict fixed / partly /
+not_fixed per id, plus any new problem the fix caused). This is a short
+session; it exists so a fix that misses, or breaks something else, is caught
+while the round can still correct it. Send each item not fixed, and each new
+HIGH problem, back to its stage's agent once, naming the id and quoting the
+critic's evidence; then run the full STAGE 6 critique. The harness refuses
+the full critique until the fix checks exist and that one return trip has
+been made; it skips both when the budget cannot cover another round.
+
+The first write-up waits for the gate: the harness refuses a writer spawn
+while the latest action is PATCH_OR_RETHINK and the budget covers another
+review round, until a draft exists. Blockers with `target_stage: WRITE`
+neither block nor escalate before a write-up exists; carry them to STAGE 8.
+After each subagent returns, the harness tells you the budget spent and the
+review rounds it still covers; plan the remaining work to fit.
 
 ### STAGE 8: WRITE
 Spawn the "writer" agent. Tell it the run directory.
@@ -1243,9 +1350,257 @@ def snapshot_report(run_path: str, state: dict) -> bool:
     return True
 
 
+WRITE_ALLOWED_AFTER = ("ACCEPT", "DECLARE_SCOPE", "RUN_FAILED")
+
+
+def _gate_rounds(run_path: str) -> list[dict]:
+    rows = []
+    try:
+        for line in open(os.path.join(run_path, "validator_history.jsonl"), errors="replace"):
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(r, dict):
+                rows.append(r)
+    except OSError:
+        pass
+    return rows
+
+
+def budget_note(status: dict | None, n_rounds: int) -> str | None:
+    """Phase 31: the lead's view of the dollar cap (E7 attempt 6 spent its
+    last round on a writing loop without knowing the budget was nearly gone)."""
+    if not status or not status.get("cap"):
+        return None
+    spent, cap, reserve = status["spent"], status["cap"], status["reserve"]
+    left = cap - reserve - spent
+    line = (f"[harness] Budget: about ${spent:.0f} of ${cap:.0f} spent (estimate); ${reserve:.0f} is held for "
+            f"the final write-up, leaving about ${max(left, 0):.0f} for modeling")
+    if n_rounds:
+        per = spent / n_rounds
+        line += (f", about {max(left, 0) / per:.1f} more review round(s) at the ${per:.0f} per round "
+                 f"average so far ({n_rounds} gate round(s))")
+    return line + ". Plan the remaining work to fit; if the budget runs out the harness writes the report."
+
+
+def writer_hold_reason(run_path: str, status: dict | None, max_rounds: int | None) -> str | None:
+    """Phase 31: the first write-up waits for the gate. Returns why a writer
+    spawn is refused now, or None. Allowed after ACCEPT / DECLARE_SCOPE /
+    RUN_FAILED, in the final round, when less than one more round of budget
+    is left, or once a draft exists (revisions)."""
+    if any(os.path.exists(os.path.join(run_path, f)) for f in ("manuscript.md", "report.md")):
+        return None
+    rows = _gate_rounds(run_path)
+    last = rows[-1] if rows else {}
+    if str(last.get("action") or "") in WRITE_ALLOWED_AFTER:
+        return None
+    rnd = max((int(r.get("round") or 0) for r in rows), default=0)
+    if max_rounds and rnd >= max_rounds:
+        return None
+    if status and status.get("cap") and rows:
+        left = status["cap"] - status["reserve"] - status["spent"]
+        if left < status["spent"] / max(1, len({r.get("round") for r in rows})):
+            return None
+    return ("The write-up waits for the gate: the latest gate action is "
+            f"{last.get('action') or 'none yet'}, and the budget covers another review round. "
+            "Fix the blocking findings, re-run the critiques and the gate; spawn the writer after ACCEPT, "
+            "DECLARE_SCOPE or RUN_FAILED. Findings aimed at the write-up do not block or escalate before it exists.")
+
+
+PLAN_AGENTS = ("planner", "data-agent", "modeler", "analyst")
+CRITIC_PROMPT_HEADS = ("This is critique round", "This is a fix check", "This is a repair of")
+_PLAN_ACTIONS = ("PATCH_OR_RETHINK", "RETHINK_STRUCTURAL")
+
+
+def _budget_tight(status: dict | None, rows: list[dict]) -> bool:
+    """Less than one more review round of budget left (at the average so far)."""
+    if not status or not status.get("cap") or not rows:
+        return False
+    left = status["cap"] - status["reserve"] - status["spent"]
+    return left < status["spent"] / max(1, len({r.get("round") for r in rows}))
+
+
+def _plan_required(run_path: str) -> dict | None:
+    """Phase 32: the open-problem list the next round's work must plan for,
+    or None (no gate yet, gate not asking for work, or a stale list)."""
+    rows = [r for r in _gate_rounds(run_path) if not r.get("post_write")]
+    if not rows or str(rows[-1].get("action") or "") not in _PLAN_ACTIONS:
+        return None
+    doc = open_problems.load_open(run_path)
+    if doc is None or int(doc.get("round") or -1) != int(rows[-1].get("round") or -2):
+        return None
+    return doc
+
+
+def _lead_spawns_since(run_path: str, since: float, with_time: bool = False) -> list[tuple]:
+    """(subagent_type, ids named in its prompt) for lead spawns after `since`
+    (an mtime), read back from trace.jsonl so a resumed session sees them."""
+    out = []
+    try:
+        for line in open(os.path.join(run_path, "trace.jsonl"), errors="replace"):
+            if '"mentions"' not in line:
+                continue
+            try:
+                r = json.loads(line)
+                t = datetime.fromisoformat(r["ts"]).timestamp()
+                if t >= since and not r.get("denied"):
+                    out.append((r.get("subagent_type"), set(r.get("mentions") or ()))
+                               + ((t,) if with_time else ()))
+            except (ValueError, KeyError, TypeError):
+                continue
+    except OSError:
+        pass
+    return out
+
+
+def _list_missing(run_path: str) -> str | None:
+    """Codex review: the gate asked for a plan but its open-problem list is
+    missing or older than that gate run: refuse rather than wave work through."""
+    rows = [r for r in _gate_rounds(run_path) if not r.get("post_write")]
+    if not rows or str(rows[-1].get("action") or "") not in _PLAN_ACTIONS:
+        return None
+    if _plan_required(run_path) is not None:
+        return None
+    n = rows[-1].get("round")
+    return (f"The round {n} gate asked for more work, but {open_problems.OPEN_JSON} for round {n} is missing or "
+            f"stale. Re-run the gate for round {n} (scripts/validate_critique_yaml.py with --current-round {n}) "
+            "so it writes the open-problem list, then plan it.")
+
+
+def plan_hold_reason(run_path: str) -> str | None:
+    """Phase 32 α: work for the next round waits for round_plan.yaml."""
+    doc = _plan_required(run_path)
+    if doc is None:
+        return _list_missing(run_path)
+    errors = open_problems.check_plan(run_path)
+    if not errors:
+        return None
+    return (f"Before the next round's work, write {open_problems.PLAN_FILE} (round: {doc['round']}) giving every "
+            f"open problem in open_problems.md an action. Not yet: " + "; ".join(errors)[:1500])
+
+
+def critique_hold_reason(run_path: str, status: dict | None) -> str | None:
+    """Phase 32 α/β: the round's full critique waits until every planned
+    fix went to its stage's agent, the critics checked their fixes, and what
+    was not fixed went back once. Skipped when the budget cannot cover it."""
+    doc = _plan_required(run_path)
+    if _budget_tight(status, _gate_rounds(run_path)):
+        return None
+    if doc is None:
+        return _list_missing(run_path)
+    errors = open_problems.check_plan(run_path)
+    if errors:
+        return plan_hold_reason(run_path)
+    plan_path = os.path.join(run_path, open_problems.PLAN_FILE)
+    missing = open_problems.unsent(open_problems.planned_work(run_path),
+                                   _lead_spawns_since(run_path, open_problems.round_start(run_path)))
+    if missing:
+        return ("The round's critique waits until every planned fix has been handed to the agent that does it. "
+                "Not yet named in a spawn prompt: " + ", ".join(missing)[:1200])
+    absent, redo = open_problems.check_fix_checks(run_path)
+    if absent:
+        return ("Before the round's full critique, ask each critic to check its own planned fixes: spawn it with "
+                f"a prompt beginning `This is a fix check after round {doc['round']}.` listing its ids. Missing: "
+                + "; ".join(absent)[:1200])
+    if redo:
+        since = open_problems.redo_since(run_path)
+        start = min(since.values(), default=open_problems.fix_check_mtime(run_path) or 0)
+        later = [(a, got, t) for a, got, t in _lead_spawns_since(run_path, start, with_time=True)]
+        left = [f"{i} -> {agent}" for agent, ids in redo.items() for i in ids
+                if not any(a == agent and i in got and t >= since.get(i, start) for a, got, t in later)]
+        if left:
+            return ("The fix checks found items not fixed or new problems the fixes caused. Send each back to its "
+                    "agent once (name the id and quote the critic's evidence), then run the full critique: "
+                    + ", ".join(left)[:1200])
+    return None
+
+
+_SPAWN_START_GRACE_S = 120
+
+
+def _trace_since(run_path: str, since: float):
+    try:
+        for line in open(os.path.join(run_path, "trace.jsonl"), errors="replace"):
+            try:
+                r = json.loads(line)
+                if datetime.fromisoformat(r["ts"]).timestamp() >= since:
+                    yield r
+            except (ValueError, KeyError, TypeError):
+                continue
+    except OSError:
+        return
+
+
+def work_running(run_path: str, since: float, kinds=PLAN_AGENTS, now: float | None = None) -> list[str]:
+    """Phase 32 γ: work agents launched since `since` (this session) that have
+    not finished. The CLI launches agents in the background ("Async agent
+    launched"), so the lead can ask a critic to review work still being done.
+    An agent cut off at its turn limit logs a task_notification and no
+    subagent_stop (E7 attempt 6: 5 of 57), so either counts as finished. A
+    spawn not yet started counts for a short grace period, since the critic
+    may be spawned in the same message."""
+    now = time.time() if now is None else now
+    started, done, spawned, starts = {}, set(), {}, {}
+    for r in _trace_since(run_path, since):
+        t = r.get("type")
+        if t == "subagent_start" and r.get("agent_type") in kinds:
+            started[r.get("agent_id")] = (r["agent_type"], r["ts"][11:19])
+            starts[r["agent_type"]] = starts.get(r["agent_type"], 0) + 1
+        elif t == "subagent_stop":
+            done.add(r.get("agent_id"))
+        elif t in ("task_notification", "task_updated"):   # task_updated: terminal statuses only (main.py)
+            done.add(r.get("task_id"))
+        elif r.get("subagent_type") in kinds and r.get("agent") == "lead" and not r.get("denied"):
+            spawned.setdefault(r["subagent_type"], []).append(datetime.fromisoformat(r["ts"]).timestamp())
+    out = [f"{k} (since {ts})" for a, (k, ts) in started.items() if a not in done]
+    for k, times in spawned.items():
+        out += [f"{k} (launching)" for t in sorted(times)[starts.get(k, 0):] if t >= now - _SPAWN_START_GRACE_S]
+    return out
+
+
+def review_wait_reason(run_path: str, sub: str | None, since: float) -> str | None:
+    """Phase 32 γ: critics and the writer review finished work only. The
+    pre-mortem reviews the plan, so it waits for the planner alone."""
+    sub = str(sub or "")
+    if not (sub.startswith("critique-") or sub == "writer"):
+        return None
+    busy = work_running(run_path, since, ("planner",) if sub == "critique-premortem" else PLAN_AGENTS)
+    if not busy:
+        return None
+    return (f"{sub} reviews finished work, and these agents are still working: {', '.join(busy)[:600]}. Wait "
+            f"for their results (each comes back to you when it finishes), then spawn {sub}.")
+
+
+def signoff_hold_reason(run_path: str, mode: str | None, run_dir_rel: str = "{run_dir}") -> str | None:
+    """Phase 33 α: nothing but planning happens before the decision brief is
+    signed (owner mode: the owner signs and the harness resumes the lead;
+    lead mode, for unattended test runs: the lead signs with its reason)."""
+    if mode not in ("owner", "lead"):
+        return None
+    st = decision_brief.status(run_path)
+    if st == "signed":
+        return None
+    if st == "changed":
+        return (f"{decision_brief.BRIEF} or {decision_brief.CRITERIA} changed after sign-off. They are frozen: run "
+                f"`python3 scripts/decision_brief.py restore {run_dir_rel}` to put the signed versions back, and "
+                f"record framing changes in {decision_brief.AMENDMENTS}.")
+    if st in ("absent", "invalid"):
+        errs = "; ".join(decision_brief.load_brief(run_path)[1])[:900]
+        return (f"Before any other work the planner writes {decision_brief.BRIEF} (what the answer must deliver; see "
+                f"STAGE 1). Re-spawn the planner with these problems: {errs}")
+    if mode == "owner":
+        return ("The decision brief is ready and waits for the owner's sign-off. Do not start other work. End your "
+                "turn now with the line AWAITING_SIGNOFF; the harness resumes you with the owner's answers.")
+    return ("Review the decision brief against the question, then sign it: python3 scripts/decision_brief.py sign "
+            f"{run_dir_rel} --by lead --accept-proposed --note \"<why it is an adequate target>\" (or answer the "
+            "open questions with --answers <file>).")
+
+
 def create_hooks(run_path: str, trace_file, start_time: datetime,
                  registered_agents=None, max_turns: dict[str, int] | None = None,
-                 integrity=None):
+                 integrity=None, budget_status=None, max_rounds: int | None = None,
+                 hold_writer: bool = True, signoff: str | None = None):
     """Create hook config for the lead query() session.
 
     Phase 21 α: PreToolUse also enforces file ownership and the agent
@@ -1256,8 +1611,10 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
 
     tool_count = 0
     per_agent_tool_counts: dict[str, int] = {}
+    turn_warned: dict[str, set] = {}
     agent_types: dict[str, str] = {}
     snapshot_state: dict = {}
+    session_t0 = time.time()   # Phase 32 γ: background agents end with their session
     if registered_agents is None:
         registered_agents = set(_registry().keys())
     registered_agents = set(registered_agents)
@@ -1306,6 +1663,36 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
         deny_reason = enforcement.check_tool_use(
             tool_name, tool_input, run_path, agent_type, registered_agents,
             cwd=input_data.get("cwd"))
+        spawn = agent_id == "lead" and tool_name in ("Agent", "Task")
+        sub = tool_input.get("subagent_type") if spawn else None
+        if not deny_reason and spawn and sub != "planner":
+            deny_reason = signoff_hold_reason(run_path, signoff, run_path)
+        if (not deny_reason and signoff == "owner" and tool_name == "Bash"
+                and re.search(r"decision_brief\.py\b.*\bsign\b", str(tool_input.get("command") or ""), re.S)):
+            deny_reason = "The owner signs the decision brief in this run; agents cannot sign it."
+        if not deny_reason and spawn:
+            deny_reason = review_wait_reason(run_path, sub, session_t0)
+        if not deny_reason and hold_writer and sub == "writer":
+            deny_reason = writer_hold_reason(run_path, _status(), max_rounds)
+        if not deny_reason and hold_writer and sub in PLAN_AGENTS:
+            deny_reason = plan_hold_reason(run_path)
+        head = str(tool_input.get("prompt") or "").lstrip()
+        if not deny_reason and hold_writer and sub in open_problems.FIX_CHECK_CRITICS \
+                and not head.startswith(CRITIC_PROMPT_HEADS):
+            # Codex review: the round's holds keyed on one phrase, so a reworded
+            # full critique skipped them. Every critic spawn now says what it is.
+            deny_reason = (f"Start a {sub} prompt with one of: `This is critique round N.` (the round's "
+                           "review), `This is a fix check after round N.` (check planned fixes), or "
+                           "`This is a repair of <file>.` (fix only that file's format, no new review).")
+        if not deny_reason and hold_writer and sub in open_problems.FIX_CHECK_CRITICS \
+                and head.startswith("This is critique round"):
+            deny_reason = critique_hold_reason(run_path, _status())
+        if not deny_reason and hold_writer and sub in PLAN_AGENTS and _plan_required(run_path) is not None:
+            try:   # Phase 32 γ: the round's actions are fixed once work is handed out
+                if open_problems.freeze(run_path) and integrity is not None:
+                    integrity.harness_wrote(open_problems.FROZEN_FILE)
+            except OSError:
+                pass
         status = "DENIED" if deny_reason else ""
         print(f"[{label:>12} {elapsed:6.0f}s | #{tool_count}] {status} {summary}".replace("]  ", "] "),
               flush=True)
@@ -1318,6 +1705,14 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
             "tool": tool_name,
             "summary": summary,
         }
+        if spawn:
+            record["subagent_type"] = sub
+            if str(sub or "").startswith("critique-"):
+                head = str(tool_input.get("prompt") or "").lstrip()
+                record["critique_kind"] = ("full" if head.startswith("This is critique round")
+                                           else "fix_check" if head.startswith("This is a fix check")
+                                           else "repair" if head.startswith("This is a repair of") else "other")
+            record["mentions"] = open_problems.mentions(str(tool_input.get("prompt") or ""), run_path)
         if deny_reason:
             record["denied"] = deny_reason
         _safe_write(trace_file, record)  # a closed trace must not disable enforcement
@@ -1350,7 +1745,46 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
                 print(f"[INTEGRITY] unexplained {ev['change']} of {ev['file']} "
                       f"(in flight: {ev['in_flight'] or 'nothing'})", flush=True)
                 _safe_write(trace_file, {"ts": ev["ts"], "type": "integrity_violation", **ev})
+        if agent_id == "lead" and tool_name in ("Agent", "Task"):
+            note = budget_note(_status(), len({r.get("round") for r in _gate_rounds(run_path)}))
+            if note:
+                return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": note}}
+        warning = turn_warning(agent_id)
+        if warning:
+            return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": warning}}
         return {}
+
+    def _status():
+        try:
+            return budget_status() if budget_status else None
+        except Exception:  # noqa: BLE001 — a status error must not break a tool call
+            return None
+
+    def turn_warning(agent_id: str) -> str | None:
+        """Phase 31: tell a subagent before its turn limit cuts it off, so it
+        saves its outputs (E7 attempt 6: 6 of 47 spawns hit the limit; the red
+        team's first session ended with no output). Tool calls are counted, a
+        slight over-count of turns, so the warning comes early, never late."""
+        if agent_id == "lead":
+            return None
+        cap = max_turns.get(agent_types.get(agent_id, ""))
+        used = per_agent_tool_counts.get(agent_id, 0)
+        if not cap or cap < 10:
+            return None
+        left = cap - used
+        done = turn_warned.setdefault(agent_id, set())
+        level = ("early" if used >= min(int(cap * 0.85), cap - 4) and "early" not in done
+                 else "final" if left <= 3 and "final" not in done else None)
+        if level is None:
+            return None
+        turn_warned[agent_id].add(level)
+        _safe_write(trace_file, {"ts": datetime.now().isoformat(), "type": "turn_warning", "agent_id": agent_id,
+                                 "agent_type": agent_types.get(agent_id), "used": used, "cap": cap})
+        if level == "final":
+            return (f"[harness] About {max(left, 0)} turns left of your {cap}. Your session will be cut off at the "
+                    "limit. Write your required output files NOW, then stop; summarise what is unfinished in them.")
+        return (f"[harness] You have used about {used} of your {cap} turns. Start writing your required output "
+                "files now; a session cut off at the limit loses whatever is not saved to disk.")
 
     async def subagent_start_hook(input_data, tool_use_id, context):
         agent_id = input_data.get("agent_id", "?")

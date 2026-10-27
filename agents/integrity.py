@@ -68,7 +68,14 @@ SCRIPT_PRODUCES: dict[str, tuple[str, ...]] = {
     "sanity_checks.py": ("sanity_report.yaml",),
     "validate_critique_yaml.py": ("validator_history.jsonl", "coherence_audit.yaml",
                                   "writer_qa_report.yaml", "effort_floors_report.yaml",
-                                  "benchmark_match.yaml"),
+                                  "benchmark_match.yaml",
+                                  # Phases 32-34 (Codex review): the gate's open-problem
+                                  # list, acceptance lock and finding-test registry.
+                                  "open_problems.json", "open_problems.md", "open_problems.json.tmp",
+                                  "open_problems.md.tmp", "acceptance_lock.json",
+                                  "done_when_registry.json", "done_when_registry.json.tmp"),
+    "decision_brief.py": ("decision_brief.signoff.json", "decision_brief.yaml", "success_criteria.yaml",
+                          "decision_brief.signed/decision_brief.yaml", "decision_brief.signed/success_criteria.yaml"),
     "cross_model_critic.py": ("critique_crossmodel.yaml", "critique_crossmodel.yaml.tmp",
                               "critique_crossmodel.md"),
     "eligibility_probe.py": ("models/eligibility_probe.yaml",),
@@ -321,8 +328,8 @@ class ArtifactIntegrity:
         intents = [i for i in self.inflight.values() if now - i["t"] < INTENT_TTL_S]
         if any(rel in i["paths"] for i in intents):
             return True          # its own Write/Edit, carve-out, or harness script
-        if _is_critique(rel) and any(i["agent"] is not None for i in intents):
-            return True          # critics own their files; only the lead is barred
+        if _is_critique(rel) and any(str(i["agent"] or "").startswith("critique-") for i in intents):
+            return True          # critics own their files
         if any(rel in g["paths"] for g in self.grants):
             return True          # a background harness script launched for this run
         return any(rel in SCRIPT_PRODUCES.get(sc, ()) for sc in live)

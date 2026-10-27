@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -25,6 +26,10 @@ from claude_agent_sdk import (
     TaskProgressMessage,
     TaskNotificationMessage,
 )
+try:   # Phase 32 γ (Codex review): a background task can end with only an update
+    from claude_agent_sdk import TaskUpdatedMessage
+except ImportError:  # older SDKs
+    TaskUpdatedMessage = ()
 from agents import (
     build_agents,
     build_lead_prompt,
@@ -52,7 +57,8 @@ SUCCESS_STATUSES = {"completed", "completed_with_report_restored"}
 # Pipeline finished and wrote a report, but the final gate did not ACCEPT.
 PARTIAL_STATUSES = {"completed_scope_declared", "completed_gate_not_accepted",
                     "completed_gate_error", "completed_gate_not_run",
-                    "completed_no_report", "run_failed", "budget_exhausted"}
+                    "completed_no_report", "run_failed", "budget_exhausted",
+                    "awaiting_signoff"}   # Phase 33: resumable with --resume once signed
 
 
 BUDGET_LEDGER = "budget_ledger.json"
@@ -103,6 +109,32 @@ async def reconcile_conversation_cost(options, session_id: str, timeout_s: float
         return await asyncio.wait_for(go(), timeout_s)
     except Exception:  # noqa: BLE001 — unknown cost: the caller charges the allowance
         return None
+
+
+_HARNESS_LOCK: dict = {}   # Phase 34 ε: modes of the harness files locked for this run (finalize_run restores them)
+TRANSCRIPT_MARGIN = 1.05   # Phase 34 δ: E7 attempt 6, transcript estimate +0.25% vs reported
+
+
+async def crashed_session_cost(options, session_id: str, attempts: int = 3, delay_s: float = 20.0,
+                               query_fn=None, transcript_root: str | None = None):
+    """Phase 34 δ: a crashed session's cumulative cost. Read it back by
+    resuming the conversation (retried: the 2026-10-27 smoke's single try
+    returned nothing, a second scenario's worked), else estimate it from the
+    CLI transcripts (+5%). Returns (result-like or None, source)."""
+    from types import SimpleNamespace
+    for i in range(attempts):
+        r = await reconcile_conversation_cost(options, session_id, query_fn=query_fn)
+        if r is not None:
+            return r, "reconciled: cumulative cost read back after a crash"
+        if i + 1 < attempts:
+            await asyncio.sleep(delay_s)
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "lib"))
+    import transcript_cost
+    est = transcript_cost.conversation_cost(session_id, transcript_root)
+    if est is None:
+        return None, "result"
+    return (SimpleNamespace(total_cost_usd=round(est * TRANSCRIPT_MARGIN, 4), session_id=session_id),
+            f"estimated from the CLI transcripts (+{TRANSCRIPT_MARGIN - 1:.0%}); read-back failed")
 
 
 def charge_session(ledger: dict, session: int, result, allowance: float | None,
@@ -267,6 +299,9 @@ def build_resume_context(run_path: str) -> str:
     )
 
 
+TERMINAL_TASK_STATUSES = ("completed", "failed", "killed", "stopped", "cancelled", "canceled", "error")
+
+
 def log_message(message, trace_file):
     """Log a message from the lead session to console and trace."""
     if isinstance(message, TaskStartedMessage):
@@ -277,6 +312,10 @@ def log_message(message, trace_file):
             "task_id": message.task_id,
             "description": message.description,
         }) + "\n")
+    elif TaskUpdatedMessage and isinstance(message, TaskUpdatedMessage):
+        if str(message.status or "").lower() in TERMINAL_TASK_STATUSES:
+            trace_file.write(json.dumps({"ts": datetime.now().isoformat(), "type": "task_updated",
+                                         "task_id": message.task_id, "status": message.status}) + "\n")
     elif isinstance(message, TaskProgressMessage):
         tool = message.last_tool_name or ""
         if tool:
@@ -395,6 +434,46 @@ CONTINUE_PROMPT = (
     "with nohup inside a foreground command and poll with bounded loops. Do "
     "not end your turn until the pipeline reaches a terminal state (report "
     "written and final gate run, or RUN_FAILED).")
+
+
+SIGNOFF_PROMPT = (
+    "CONTINUE. The owner has signed the decision brief.\n{text}\n"
+    "Continue the pipeline from STAGE 2 (DATA): tell the planner to carry the owner's answers into plan.md "
+    "if they change it, and pass them to every specialist. Do not end your turn until the pipeline reaches a "
+    "terminal state.")
+
+
+async def wait_for_signoff(run_path: str, run_dir_rel: str, hours: float, poll_s: float = 30.0,
+                           integrity=None) -> bool:
+    """Phase 33 α: the run waits for the owner to sign the decision brief.
+    True once signed; False when the wait times out (status awaiting_signoff,
+    resumable with --resume after signing)."""
+    import decision_brief
+    md = os.path.join(run_path, "decision_brief.md")
+    try:
+        open(md, "w").write(decision_brief.render_md(run_path))
+    except OSError:
+        pass
+    print(f"\n{'='*60}\nWAITING FOR THE OWNER TO SIGN THE DECISION BRIEF\n"
+          f"  Read:  {run_dir_rel}/decision_brief.md\n"
+          f"  Sign:  python3 scripts/decision_brief.py sign {run_dir_rel} --answers <answers.yaml> "
+          f"[--note \"...\"]   (or --accept-proposed)\n"
+          f"  Waiting up to {hours:g} h.\n{'='*60}", flush=True)
+    with open(os.path.join(run_path, "trace.jsonl"), "a") as tf:
+        tf.write(json.dumps({"ts": datetime.now().isoformat(), "type": "awaiting_signoff"}) + "\n")
+    deadline = time.time() + hours * 3600
+    while time.time() < deadline:
+        if decision_brief.status(run_path) == "signed":
+            if integrity is not None:   # the owner signed outside any tool call
+                integrity.harness_wrote(decision_brief.SIGNOFF)
+                for f in decision_brief.FROZEN_AT_SIGNOFF:   # and the signed copies it kept
+                    integrity.harness_wrote(f"{decision_brief.SIGNED_DIR}/{f}")
+            with open(os.path.join(run_path, "trace.jsonl"), "a") as tf:
+                tf.write(json.dumps({"ts": datetime.now().isoformat(), "type": "signed_off"}) + "\n")
+            print("Decision brief signed; resuming the lead.", flush=True)
+            return True
+        await asyncio.sleep(poll_s)
+    return decision_brief.status(run_path) == "signed"
 
 
 def detect_current_round(run_path: str) -> int | None:
@@ -622,7 +701,8 @@ def write_harness_baseline(run_path: str) -> tuple[dict, dict | None]:
 async def run(question: str, max_rounds: int, max_sessions: int,
               run_dir: str | None = None, run_path: str | None = None,
               allow_cloud: bool = False, cross_model: bool = False,
-              methods_critic: bool = False, max_budget_usd: float | None = None) -> str:
+              methods_critic: bool = False, max_budget_usd: float | None = None,
+              signoff: str = "owner", signoff_hours: float = 24.0) -> str:
     """Run the modeling pipeline as a single lead agent session.
 
     Returns the terminal status written to metadata.json.
@@ -669,8 +749,18 @@ async def run(question: str, max_rounds: int, max_sessions: int,
     with open(metadata_path, "w") as f:
         json.dump(prior_meta, f, indent=2)
     env_overrides = enforcement.filtered_env(dict(os.environ), allow_cloud)
+    env_overrides["MA_SIGNOFF_MODE"] = signoff   # Phase 33: decision_brief.py sign checks it
+    # The harness's own gate runs (run_final_gate) read the mode too: with
+    # --signoff none an unsigned brief is not a finding (Codex review).
+    os.environ["MA_SIGNOFF_MODE"] = signoff
+    import decision_brief
+    if resume_context and decision_brief.is_signed(run_path):
+        lead_prompt += "\n" + decision_brief.signoff_text(run_path) + "\n"
 
     harness_before, harness_prior_diff = write_harness_baseline(run_path)
+    import atexit
+    _HARNESS_LOCK.update(enforcement.lock_harness())   # read-only on disk for the run; restored at exit
+    atexit.register(enforcement.unlock_harness, _HARNESS_LOCK)
     # Phase 23 α: hash protected run artifacts; every change must be explained
     # by an allowed in-flight tool call (see agents/integrity.py).
     integrity = ArtifactIntegrity(run_path)
@@ -704,9 +794,25 @@ async def run(question: str, max_rounds: int, max_sessions: int,
     session_num = 0
     session_records: list[dict] = []
     interrupted = False
+    paused = False          # Phase 33: waiting for the owner's sign-off timed out
+    signoff_waits = 0       # a sign-off wait does not use up a session
+
+    # Phase 31: the lead sees the dollar cap. Spend = the ledger at process
+    # start (earlier invocations) + this process's live estimate.
+    _spent_before = (max_budget_usd - remaining_budget(max_budget_usd, budget["sessions"])
+                     if max_budget_usd else 0.0)
+
+    def _budget_status():
+        if not max_budget_usd:
+            return None
+        return {"spent": _spent_before + float(live_state.est_usd or 0), "cap": max_budget_usd,
+                "reserve": writeup_reserve(max_budget_usd)}
 
     try:
-        for session_num in range(1, max_sessions + 1):
+        for session_num in range(1, max_sessions + 2):
+            if session_num - signoff_waits > max_sessions:
+                session_outcome = "max_sessions_reached"
+                break
             live_state.session = session_num
             print(f"\n{'#'*60}", flush=True)
             print(f"SESSION {session_num}/{max_sessions}", flush=True)
@@ -727,7 +833,9 @@ async def run(question: str, max_rounds: int, max_sessions: int,
             hooks = create_hooks(run_path, trace_file, run_start,
                                  registered_agents=set(agents.keys()),
                                  max_turns={n: d.maxTurns for n, d in agents.items()},
-                                 integrity=integrity)
+                                 integrity=integrity, max_rounds=max_rounds,
+                                 budget_status=_budget_status,
+                                 signoff=signoff if signoff in ("owner", "lead") else None)
 
             # Run-wide dollar cap across sessions (and earlier invocations),
             # from the harness-owned ledger.
@@ -743,7 +851,7 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                 system_prompt=lead_system,
                 agents=agents,
                 model=(smoke_settings() or {}).get("model", enforcement.MODEL_DEEP),
-                max_buffer_size=enforcement.MAX_BUFFER_SIZE,
+                max_buffer_size=enforcement.MAX_BUFFER_SIZE, settings=enforcement.SESSION_SETTINGS,
                 tools=LEAD_TOOLS,
                 allowed_tools=LEAD_TOOLS,
                 permission_mode="bypassPermissions",
@@ -788,10 +896,9 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                     session_records.append({"session": session_num, **result_summary(result)})
                 charged_from, source = result, "result"
                 if result is None and session_id and not interrupted:
-                    charged_from = await reconcile_conversation_cost(options, session_id)
-                    source = "reconciled: cumulative cost read back after a crash"
-                    print(f"[budget] session {session_num} ended without a cost; read back "
-                          f"{'$%.4f cumulative' % charged_from.total_cost_usd if charged_from and charged_from.total_cost_usd is not None else 'nothing (charging the allowance)'}",
+                    charged_from, source = await crashed_session_cost(options, session_id)
+                    print(f"[budget] session {session_num} ended without a cost: "
+                          f"{'$%.4f cumulative, %s' % (charged_from.total_cost_usd, source) if charged_from is not None else 'no read-back and no transcript (charging the allowance)'}",
                           flush=True)
                 charge_session(budget, session_num, charged_from, left, session_id=session_id,
                                elapsed_s=(datetime.now().astimezone() - session_started).total_seconds(),
@@ -807,8 +914,17 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                 session_outcome = "budget_exhausted"
                 break
             if error_str is None and result_is_success(result):
+                if signoff == "owner" and decision_brief.status(run_path) == "awaiting":
+                    # Phase 33 α: the lead stopped for the owner's sign-off.
+                    if not await wait_for_signoff(run_path, run_dir_rel, signoff_hours, integrity=integrity):
+                        print("Sign-off wait timed out; resume with --resume after signing.", flush=True)
+                        session_outcome, paused = "awaiting_signoff", True
+                        break
+                    signoff_waits += 1
+                    lead_prompt = SIGNOFF_PROMPT.format(text=decision_brief.signoff_text(run_path))
+                    continue
                 where = pipeline_unfinished(run_path)
-                if where and session_num < max_sessions:
+                if where and session_num - signoff_waits < max_sessions:
                     # Phase 21 θ: the lead stopped early; continue the same
                     # conversation (options.resume = session_id) instead of
                     # finalizing a half-finished run.
@@ -847,7 +963,7 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                 session_outcome = "policy_blocked"
                 break
 
-            if session_num >= max_sessions:
+            if session_num - signoff_waits >= max_sessions:
                 print("Max sessions reached.", flush=True)
                 session_outcome = "max_sessions_reached"
                 break
@@ -876,7 +992,7 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                                             methods_critic=methods_critic)
             print(f"Restarting pipeline (session {session_num + 1})...", flush=True)
         # Phase 29: every run ends with a report, so failures can be studied.
-        if not interrupted and not os.path.exists(os.path.join(run_path, "report.md")) \
+        if not interrupted and not paused and not os.path.exists(os.path.join(run_path, "report.md")) \
                 and not os.path.exists(os.path.join(run_path, "manuscript.md")):
             live_state.session = session_num + 1
             await final_writeup(run_path, run_dir_rel, question, max_rounds, budget,
@@ -887,7 +1003,7 @@ async def run(question: str, max_rounds: int, max_sessions: int,
         status = finalize_run(
             run_path, run_dir_rel, run_start, max_rounds, session_outcome,
             session_num, session_id, session_records, harness_before,
-            harness_prior_diff, run_gate=not interrupted,
+            harness_prior_diff, run_gate=not interrupted and not paused,
             original_meta=prior_meta, integrity=integrity)
     return status
 
@@ -965,6 +1081,7 @@ def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
         add_verdict_banner(run_path, gate)
 
     harness_diff = enforcement.diff_harness(harness_before, enforcement.hash_harness())
+    enforcement.unlock_harness(_HARNESS_LOCK)
     status = determine_status(session_outcome, gate, has_report,
                               report_restored, harness_diff,
                               integrity_violations=len(integrity.open_events) if integrity else 0)
@@ -1027,6 +1144,11 @@ def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
         _a = run_autopsy.write(run_path)
         print(f"  Autopsy: primary layer {_a.get('primary_layer') or 'none (accepted)'}", flush=True)
         _row = run_autopsy.register_row(_a)
+        # Lessons ledger: known error classes that came back, plus this run's
+        # expert checklist (lessons_check.md).
+        import lessons
+        _row["lessons"] = lessons.register_fields(run_path)
+        print(f"  Lessons: {_row['lessons']}", flush=True)
         import results_store
         if results_store.configured_account():
             _rp = os.path.join(run_path, "register_row.json")
@@ -1105,6 +1227,8 @@ def _run_self_test() -> int:
            f"E1: Write scripts/ allowed for {at}")
         ok(deny("Edit", {"file_path": "agents/modeler.py"}, at),
            f"E1: Edit agents/ allowed for {at}")
+        ok(deny("Write", {"file_path": os.path.join(REPO_ROOT, "docs/lessons/observations.jsonl")}, at),
+           f"E1: Write to the lessons ledger allowed for {at}")
         ok(deny("Edit", {"file_path": os.path.join(REPO_ROOT, ".claude/orchestration/effort_floors.yaml")}, at),
            f"E1: Edit .claude/ allowed for {at}")
         ok(deny("Write", {"file_path": os.path.join(REPO_ROOT, "main.py")}, at),
@@ -1223,6 +1347,219 @@ def _run_self_test() -> int:
         asyncio.run(post_i({"tool_name": "Bash", "tool_input": {"command": "true"}}, "h1", None))
         ok(len(ig3.events) == n0 + 1 and ig3.events[-1]["file"] == "critique_domain.yaml",
            f"IN7 hooks record a lead change to a critique: {ig3.events[n0:]}")
+        # TW1-TW3 (Phase 31): a subagent is warned before its turn limit, once per level
+        hk2 = agents_pkg.create_hooks(td, trace, datetime.now(), registered_agents=reg, max_turns={"modeler": 20})
+        pre2, post2, start2 = (hk2["PreToolUse"][0].hooks[0], hk2["PostToolUse"][0].hooks[0],
+                               hk2["SubagentStart"][0].hooks[0])
+        asyncio.run(start2({"agent_id": "m1", "agent_type": "modeler"}, None, None))
+        got = []
+        for k in range(20):
+            call = {"tool_name": "Read", "tool_input": {"file_path": "x"}, "agent_id": "m1", "agent_type": "modeler"}
+            asyncio.run(pre2(call, f"t{k}", None))
+            r = asyncio.run(post2(call, f"t{k}", None))
+            got.append((k + 1, (r.get("hookSpecificOutput") or {}).get("additionalContext")))
+        warned = [(n, m) for n, m in got if m]
+        ok([n for n, _ in warned] == [16, 17] and "Start writing" in warned[0][1] and "NOW" in warned[1][1],
+           f"TW1 early warning (85% of the cap, at least 4 turns before it) and a final one 3 turns before, "
+           f"once each: {[n for n, _ in warned]}")
+        r = asyncio.run(post2({"tool_name": "Read", "tool_input": {}}, "tl", None))
+        ok(r == {}, f"TW2 the lead is never warned: {r}")
+        ok(sum(1 for l in open(os.path.join(td, "trace.jsonl")) if '"turn_warning"' in l) == 2,
+           "TW3 each warning is recorded in the trace")
+        # WH1-WH6 (Phase 31): the first write-up waits for the gate; the lead sees its budget
+        from agents import writer_hold_reason, budget_note
+        st = {"spent": 200.0, "cap": 450.0, "reserve": 36.0}
+        hist = os.path.join(td, "validator_history.jsonl")
+
+        def gates(*acts):
+            open(hist, "w").write("".join(json.dumps({"round": k + 1, "action": a}) + "\n" for k, a in enumerate(acts)))
+        gates("PATCH_OR_RETHINK", "PATCH_OR_RETHINK")
+        ok(writer_hold_reason(td, st, 8) is not None, "WH1 writer held after PATCH with budget for another round")
+        ok(writer_hold_reason(td, st, 2) is None, "WH2 writer allowed in the final round")
+        ok(writer_hold_reason(td, {"spent": 380.0, "cap": 450.0, "reserve": 36.0}, 8) is None,
+           "WH3 writer allowed when less than one round of budget is left")
+        gates("PATCH_OR_RETHINK", "DECLARE_SCOPE")
+        ok(writer_hold_reason(td, st, 8) is None, "WH4 writer allowed after DECLARE_SCOPE")
+        gates("PATCH_OR_RETHINK")
+        open(os.path.join(td, "manuscript.md"), "w").write("draft")
+        ok(writer_hold_reason(td, st, 8) is None, "WH5 revisions of an existing draft are allowed")
+        os.remove(os.path.join(td, "manuscript.md"))
+        note = budget_note(st, 2)
+        ok(note and "$200 of $450" in note and "$214 for modeling" in note and "2.1 more review round" in note,
+           f"WH6 budget note: spent, reserve, rounds left at the average pace: {note}")
+        hk3 = agents_pkg.create_hooks(td, trace, datetime.now(), registered_agents=reg, max_rounds=8,
+                                      budget_status=lambda: st)
+        pre3, post3 = hk3["PreToolUse"][0].hooks[0], hk3["PostToolUse"][0].hooks[0]
+        spawn = {"tool_name": "Agent", "tool_input": {"subagent_type": "writer", "description": "write", "prompt": "x"}}
+        r = asyncio.run(pre3(spawn, "w1", None))
+        ok("write-up waits for the gate" in json.dumps(r), f"WH7 the hook refuses an early writer spawn: {r}")
+        r = asyncio.run(post3({"tool_name": "Agent", "tool_input": {"subagent_type": "modeler"}}, "w2", None))
+        ok("Budget: about $200" in json.dumps(r), f"WH8 the lead gets the budget note when a subagent returns: {r}")
+        hk4 = agents_pkg.create_hooks(td, trace, datetime.now(), registered_agents=reg, max_rounds=8,
+                                      budget_status=lambda: st, hold_writer=False)
+        r = asyncio.run(hk4["PreToolUse"][0].hooks[0](spawn, "w3", None))
+        ok("write-up waits" not in json.dumps(r), f"WH9 the harness's own write-up is never held: {r}")
+        # RP1-RP10 (Phase 32): work waits for the round plan; the critique waits for the
+        # planned fixes, the critics' fix checks and one return trip for what was not fixed
+        import time
+        from agents import critique_hold_reason
+        from open_problems import check_plan as open_problems_check
+        gates("PATCH_OR_RETHINK", "PATCH_OR_RETHINK")
+        json.dump({"round": 2, "items": [
+            {"id": "R-005", "source": "critique-redteam", "severity": "MEDIUM", "target_stage": "ANALYZE",
+             "blocks_in": 1, "fix_check": True, "scope_declarable": True},
+            {"id": "RIG-001", "source": "rigor-artifacts", "severity": "HIGH", "target_stage": "MODEL",
+             "blocks_in": 0, "fix_check": False, "scope_declarable": False}]},
+            open(os.path.join(td, "open_problems.json"), "w"))
+
+        start3, stop3 = hk3["SubagentStart"][0].hooks[0], hk3["SubagentStop"][0].hooks[0]
+
+        def spawn_as(sub, prompt, finish=True):
+            r = asyncio.run(pre3({"tool_name": "Agent", "tool_input": {
+                "subagent_type": sub, "description": "d", "prompt": prompt}}, "s", None))
+            if r == {} and finish:   # the spawned agent runs and returns
+                aid = f"a{time.time_ns()}"
+                asyncio.run(start3({"agent_id": aid, "agent_type": sub}, None, None))
+                asyncio.run(stop3({"agent_id": aid, "agent_type": sub}, None, None))
+            return r
+        r = spawn_as("modeler", "Fix RIG-001.")
+        ok("round_plan.yaml" in json.dumps(r) and "does not exist" in json.dumps(r),
+           f"RP1 modeler refused before the round plan exists: {r}")
+        time.sleep(0.02)
+        open(os.path.join(td, "round_plan.yaml"), "w").write(
+            "round: 2\nitems:\n  R-005: {action: fix, stage: ANALYZE}\n  RIG-001: {action: fix, stage: MODEL}\n")
+        time.sleep(0.02)
+        ok(spawn_as("modeler", "Fix RIG-001 (zero-width interval).") == {}, "RP2 modeler allowed once the plan is complete")
+        r = spawn_as("critique-redteam", "This is critique round 3. ...")
+        ok("R-005 -> analyst" in json.dumps(r), f"RP3 critique refused while a planned fix was never handed over: {r}")
+        ok(spawn_as("analyst", "Fix R-005: qualify the cases figure.") == {}, "RP4 analyst spawn allowed")
+        r = spawn_as("critique-redteam", "This is critique round 3. ...")
+        ok("fix check" in json.dumps(r) and "fix_check_r2_redteam.yaml" in json.dumps(r),
+           f"RP5 critique refused until the critic checks its fixes: {r}")
+        ok(critique_hold_reason(td, {"spent": 380.0, "cap": 450.0, "reserve": 36.0}) is None,
+           "RP6 no fix check required when the budget cannot cover another round")
+        ok(spawn_as("critique-redteam", "This is a fix check after round 2. Check R-005.") == {},
+           "RP7 a fix-check spawn is allowed")
+        time.sleep(0.02)
+        open(os.path.join(td, "fix_check_r2_redteam.yaml"), "w").write(
+            "round: 2\nreviewer: critique-redteam\nchecks:\n  - {id: R-005, verdict: partly, evidence: still no qualifier}\n")
+        time.sleep(0.02)
+        r = spawn_as("critique-redteam", "This is critique round 3. ...")
+        ok("R-005 -> analyst" in json.dumps(r) and "back to its agent once" in json.dumps(r),
+           f"RP8 an item not fixed goes back once before the full critique: {r}")
+        spawn_as("analyst", "R-005 is only partly fixed: the critic says still no qualifier.")
+        ok(spawn_as("critique-redteam", "This is critique round 3. ...") == {},
+           "RP9 full critique allowed after the one return trip")
+        # RP11-RP16 (Phase 32 γ): the plan is fixed once its work is handed out; reviews wait
+        # for work agents still running in the background
+        def lead_tool(name, inp):
+            return json.dumps(asyncio.run(pre3({"tool_name": name, "tool_input": inp}, "t", None)))
+        plan_p, t_rp = os.path.join(td, "round_plan.yaml"), time.time()
+        ok(os.path.exists(os.path.join(td, "round_plan.frozen.json")), "RP11a the actions were recorded at hand-out")
+        _plan_txt = open(plan_p).read()
+        open(plan_p, "w").write("round: 2\nitems:\n  R-005: {action: declare, reason: 'cannot be fixed with the data at hand'}\n"
+                                "  RIG-001: {action: fix, stage: MODEL}\n")
+        r = json.dumps(spawn_as("critique-redteam", "This is critique round 3. ..."))
+        ok("R-005: was planned as fix (ANALYZE)" in r and "stays that way" in r,
+           f"RP11 a rewrite that changes a handed-out action (indirect writes included) holds the round: {r}")
+        json.dump({"round": 2, "items": [
+            {"id": "R-005", "source": "critique-redteam", "severity": "MEDIUM", "target_stage": "ANALYZE",
+             "blocks_in": 1, "fix_check": True, "scope_declarable": True},
+            {"id": "RIG-001", "source": "rigor-artifacts", "severity": "HIGH", "target_stage": "MODEL",
+             "blocks_in": 0, "fix_check": False, "scope_declarable": False},
+            {"id": "R-044", "source": "critique-redteam", "severity": "HIGH", "target_stage": "MODEL",
+             "blocks_in": 0, "fix_check": False, "scope_declarable": True}]},
+            open(os.path.join(td, "open_problems.json"), "w"))
+        open(plan_p, "w").write(_plan_txt + "  R-044: {action: fix, stage: MODEL}\n")
+        ok(open_problems_check(td) == [],
+           f"RP12 a same-round gate rerun's new item can be added to a handed-out plan: {open_problems_check(td)}")
+        r = json.dumps(spawn_as("critique-domain", "Please review everything again for round 3."))
+        ok("Start a critique-domain prompt with one of" in r, f"RP12b a critic spawn must say what it is: {r}")
+        ok(spawn_as("critique-domain", "This is a repair of critique_domain.yaml: fix the schema error.") == {},
+           "RP12c a repair spawn is allowed and is not a review")
+        spawn_as("modeler", "Fix R-044.")
+        ok(spawn_as("modeler", "Re-check RIG-001.", finish=False) == {}, "RP13a modeler spawn allowed")
+        r = json.dumps(spawn_as("critique-redteam", "This is critique round 3. ..."))
+        ok("still working: modeler (launching)" in r, f"RP13 a critic waits for a modeler not yet started: {r}")
+        asyncio.run(start3({"agent_id": "a-run", "agent_type": "modeler"}, None, None))
+        r = json.dumps(spawn_as("writer", "Write the report."))
+        ok("still working: modeler (since" in r, f"RP14 the writer waits for a running modeler: {r}")
+        ok(spawn_as("critique-premortem", "Pre-mortem the plan.") == {}, "RP15 the pre-mortem waits for the planner only")
+        trace.write(json.dumps({"ts": datetime.now().isoformat(), "type": "task_notification",
+                                "task_id": "a-run", "status": "completed"}) + "\n")
+        trace.flush()
+        ok(spawn_as("critique-redteam", "This is critique round 3. ...") == {},
+           "RP16 an agent cut off at its turn limit (task_notification, no stop) counts as finished")
+        from agents import work_running
+        ok(work_running(td, t_rp, now=time.time() + 3600) == [],
+           "RP16b a spawn that never started stops counting after the grace period")
+        from agents import plan_hold_reason
+        os.remove(os.path.join(td, "open_problems.json"))
+        ok("missing or stale" in (plan_hold_reason(td) or ""),
+           "RP17 the gate asked for work but its open-problem list is missing: work waits (fail closed)")
+        json.dump({"round": 2, "items": []}, open(os.path.join(td, "open_problems.json"), "w"))
+        from agents.enforcement import protected_reason
+        ok(protected_reason(os.path.join(td, "round_plan.yaml"), td, "modeler") is not None
+           and protected_reason(os.path.join(td, "round_plan.yaml"), td, None) is None
+           and protected_reason(os.path.join(td, "fix_check_r2_redteam.yaml"), td, None) is not None
+           and protected_reason(os.path.join(td, "open_problems.json"), td, "critique-redteam") is not None
+           and protected_reason(os.path.join(td, "fix_check_r2_redteam.yaml"), td, "modeler") is not None
+           and protected_reason(os.path.join(td, "fix_check_r2_redteam.yaml"), td, "critique-domain") is not None
+           and protected_reason(os.path.join(td, "fix_check_r2_redteam.yaml"), td, "critique-redteam") is None
+           and protected_reason(os.path.join(td, "critique_domain.yaml"), td, "analyst") is not None
+           and protected_reason(os.path.join(td, "round_plan.frozen.json"), td, None) is not None,
+           "RP10 only the lead writes the plan, only critics write fix checks, only the gate writes the list")
+        for f in ("open_problems.json", "round_plan.yaml", "fix_check_r2_redteam.yaml", "round_plan.frozen.json"):
+            os.remove(os.path.join(td, f))
+        gates()   # no gate history left for the sign-off tests below
+        # SO1-SO8 (Phase 33): nothing but planning before the decision brief is signed
+        import yaml as _y
+        import decision_brief as _db
+        from agents import signoff_hold_reason
+        ok("planner writes decision_brief.yaml" in (signoff_hold_reason(td, "owner") or ""),
+           "SO1 no brief: re-spawn the planner")
+        _y.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(td, "success_criteria.yaml"), "w"))
+        _y.safe_dump({"question": "q", "decision": "d", "decision_maker": "m", "objective": "o",
+                      "answers": [{"id": "A1", "statement": "s", "resolution": "district"}],
+                      "acceptance": ["HB-001"]}, open(os.path.join(td, "decision_brief.yaml"), "w"))
+        ok("AWAITING_SIGNOFF" in (signoff_hold_reason(td, "owner") or "")
+           and "--by lead" in (signoff_hold_reason(td, "lead") or "") and signoff_hold_reason(td, None) is None,
+           "SO2 a ready brief: owner mode waits, lead mode signs, no mode does nothing")
+        hk5 = agents_pkg.create_hooks(td, trace, datetime.now(), registered_agents=reg, signoff="owner")
+        pre5 = hk5["PreToolUse"][0].hooks[0]
+
+        def call5(tool, inp):
+            return json.dumps(asyncio.run(pre5({"tool_name": tool, "tool_input": inp}, "so", None)))
+        ok("AWAITING_SIGNOFF" in call5("Agent", {"subagent_type": "data-agent", "prompt": "x"})
+           and "deny" not in call5("Agent", {"subagent_type": "planner", "prompt": "fix the brief"}),
+           "SO3 data work refused before sign-off; the planner may still revise the brief")
+        ok("agents cannot sign" in call5("Bash", {"command": f"python3 scripts/decision_brief.py sign {td} --by owner"}),
+           "SO4 in owner mode no agent can sign")
+        hk6 = agents_pkg.create_hooks(td, trace, datetime.now(), registered_agents=reg, signoff="lead")
+        r6 = json.dumps(asyncio.run(hk6["PreToolUse"][0].hooks[0](
+            {"tool_name": "Bash", "tool_input": {"command": f"python3 scripts/decision_brief.py sign {td} --by lead"}},
+            "so6", None)))
+        ok("agents cannot sign" not in r6, "SO5 in lead mode the lead signs")
+        ok(asyncio.run(wait_for_signoff(td, "runs/x", hours=0.00001, poll_s=0.01)) is False,
+           "SO6 an unsigned wait times out")
+        _db.sign(td, "owner")
+        ok(asyncio.run(wait_for_signoff(td, "runs/x", hours=1, poll_s=0.01)) is True
+           and signoff_hold_reason(td, "owner") is None
+           and "deny" not in call5("Agent", {"subagent_type": "data-agent", "prompt": "x"}),
+           "SO7 signed: the wait ends and work proceeds")
+        open(os.path.join(td, "success_criteria.yaml"), "a").write("# moved\n")
+        ok("frozen" in (signoff_hold_reason(td, "owner") or "") and "decision_brief.py restore" in
+           (signoff_hold_reason(td, "owner") or ""), "SO8 criteria edited after sign-off: work stops until restored")
+        from agents.enforcement import protected_reason as _pr, is_harness_path as _ihp, REPO_ROOT as _RR
+        ok(_pr(os.path.join(td, "decision_brief.yaml"), td, "planner") is not None
+           and _pr(os.path.join(td, "success_criteria.yaml"), td, None) is not None
+           and not _ihp(_RR) and _ihp(os.path.join(_RR, "docs")),
+           "SO10 once signed the brief and criteria are frozen for every agent; docs/ (parent of docs/lessons) is harness")
+        ok(exit_code_for("awaiting_signoff") == 2, "SO9 a paused run exits 2 (resumable)")
+        for f in ("success_criteria.yaml", "decision_brief.yaml", "decision_brief.signoff.json", "decision_brief.md"):
+            if os.path.exists(os.path.join(td, f)):
+                os.remove(os.path.join(td, f))
+        os.remove(hist)
         trace.close()
     # IC1-IC7 (Codex review of PR #15).
     from agents.integrity import harness_scripts_run
@@ -1502,8 +1839,11 @@ def _run_self_test() -> int:
     # V1: environment filtering
     env = {"ANTHROPIC_API_KEY": "a", "AZ_BATCH_ACCOUNT": "b", "OPENAI_API_KEY": "c", "PATH": "/bin"}
     ov = enforcement.filtered_env(env, allow_cloud=False)
-    ok({k: v for k, v in ov.items() if k not in ("PATH", "VIRTUAL_ENV")}
+    ok({k: v for k, v in ov.items() if k not in ("PATH", "VIRTUAL_ENV") and "CACHE_TTL" not in k}
        == {"AZ_BATCH_ACCOUNT": "", "OPENAI_API_KEY": ""}, f"V1 env filter: {ov}")
+    ok(ov.get("CLAUDE_CODE_PROMPT_CACHE_TTL") == "1h" and ov.get("CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL") == "1h"
+       and enforcement.filtered_env({**env, "MA_PROMPT_CACHE_TTL": "5m"}, False)["CLAUDE_CODE_PROMPT_CACHE_TTL"] == "5m",
+       f"V1b (Phase 31) 1-hour prompt cache for the lead and subagents, 5m on request: {ov}")
     ok("AZ_BATCH_ACCOUNT" not in enforcement.filtered_env(env, allow_cloud=True),
        "V1 cloud creds kept with --cloud")
     # V2 (Phase 21 α): agents' PATH starts with this interpreter's bin/,
@@ -1526,6 +1866,31 @@ def _run_self_test() -> int:
         p = os.path.join(td, "scripts", "a.py")
         with open(p, "w") as f:
             f.write("x = 1\n")
+        # HL1-HL2: harness files are read-only during a run, and chmod on them is denied
+        os.makedirs(os.path.join(td, "scripts"), exist_ok=True)
+        _hp = os.path.join(td, "scripts", "x.py")
+        open(_hp, "w").write("x = 1\n")
+        _modes = enforcement.lock_harness(td)
+        try:
+            open(_hp, "w").write("x = 2\n")
+            _wrote = True
+        except PermissionError:
+            _wrote = os.geteuid() == 0   # root ignores file modes; the hash still catches it
+        try:
+            open(os.path.join(td, "scripts", "y.tmp"), "w").write("y")
+            os.replace(os.path.join(td, "scripts", "y.tmp"), _hp)
+            _replaced = os.geteuid() != 0
+        except PermissionError:
+            _replaced = False
+        enforcement.unlock_harness(_modes)
+        ok(not _wrote and not _replaced and _hp in _modes and os.access(_hp, os.W_OK)
+           and os.access(os.path.join(td, "scripts"), os.W_OK),
+           "HL1 a locked harness file cannot be written or replaced; unlock restores it")
+        ok(enforcement.bash_reason("chmod u+w scripts/effect_size_registry.py", td, "modeler") is not None
+           and enforcement.bash_reason("python3 -c \"import os; os.chmod('agents/x.py', 0o644)\"", td, "modeler") is not None
+           and enforcement.bash_reason("chmod +x runs/r1/models/run.sh", td, "modeler") is None,
+           "HL2 changing harness permissions is denied; run files are not affected")
+        os.remove(_hp)
         before = enforcement.hash_harness(td)
         ok(not enforcement.harness_changed(enforcement.diff_harness(before, enforcement.hash_harness(td))),
            "T1 clean tree flagged")
@@ -1698,6 +2063,29 @@ def _run_self_test() -> int:
                                 is_error=True, num_turns=0, session_id="s1", total_cost_usd=0.0)
         ok(asyncio.run(reconcile_conversation_cost(_opts, "s1", query_fn=_fq_zero)) is None,
            "CR18 an error or zero-cost read-back is not a cost reading (crash smoke 5 read back $0.00)")
+        # CR19 (Phase 34 δ): the read-back is retried, then the transcripts give the cost.
+        _tr_root = os.path.join(td, "projects")
+        os.makedirs(os.path.join(_tr_root, "-tmp-x"), exist_ok=True)
+        with open(os.path.join(_tr_root, "-tmp-x", "s1.jsonl"), "w") as _f:
+            _f.write(json.dumps({"type": "assistant", "message": {"id": "m1", "model": "claude-opus-5-5",
+                                                                   "usage": {"input_tokens": 500_000}}}) + "\n")
+        _calls = []
+
+        async def _fq_count(prompt, options):
+            _calls.append(1)
+            async for m in _fq_fail(prompt, options):
+                yield m
+        _c, _src = asyncio.run(crashed_session_cost(_opts, "s1", attempts=3, delay_s=0, query_fn=_fq_count,
+                                                    transcript_root=_tr_root))
+        ok(len(_calls) == 3 and _c is not None and abs(_c.total_cost_usd - 2.1) < 1e-9
+           and _src.startswith("estimated from the CLI transcripts"),
+           f"CR19 three read-back tries, then the transcript estimate (+5%): {len(_calls)} {_c} {_src}")
+        _c2, _ = asyncio.run(crashed_session_cost(_opts, "s9", attempts=1, delay_s=0, query_fn=_fq_fail,
+                                                  transcript_root=_tr_root))
+        _c3, _src3 = asyncio.run(crashed_session_cost(_opts, "s1", attempts=3, delay_s=0, query_fn=_fq_ok,
+                                                      transcript_root=_tr_root))
+        ok(_c2 is None and _c3.total_cost_usd == 62.5 and _src3.startswith("reconciled"),
+           "CR19b no transcript -> None (allowance charged); a working read-back is used first")
         write_budget_ledger(td, led, 5.0)
         again = load_budget_ledger(td)
         ok(remaining_budget(5.0, again["sessions"]) == 0 and again["spent_usd"] == 5.0
@@ -1755,6 +2143,8 @@ def _run_self_test() -> int:
               if isinstance(n, _ast.Call) and getattr(n.func, "id", "") == "ClaudeAgentOptions"]
     ok(_calls and all(any(k.arg == "max_buffer_size" for k in c.keywords) for c in _calls),
        "BUF1 a ClaudeAgentOptions(...) call lacks max_buffer_size")
+    ok(all(any(k.arg == "settings" for k in c.keywords) for c in _calls if any(k.arg == "env" for k in c.keywords)),
+       "BUF1b (Phase 31) a pipeline ClaudeAgentOptions(...) call lacks settings=SESSION_SETTINGS (idle compaction off)")
     ok(enforcement.MAX_BUFFER_SIZE > 1024 * 1024, "BUF1 buffer not raised")
 
     # WD1 (Phase 25): the bundled CLI refuses Write by a subagent to
@@ -2056,7 +2446,7 @@ async def run_preflight(allow_cloud: bool = False) -> dict:
     options = ClaudeAgentOptions(
         system_prompt="You are a harness preflight check. Follow instructions literally.",
         model=enforcement.MODEL_DEEP,
-        max_buffer_size=enforcement.MAX_BUFFER_SIZE,
+        max_buffer_size=enforcement.MAX_BUFFER_SIZE, settings=enforcement.SESSION_SETTINGS,
         agents={"preflight-probe": probe},
         tools=["Bash", "Agent"], allowed_tools=["Bash", "Agent"],
         permission_mode="bypassPermissions", setting_sources=[],
@@ -2116,7 +2506,7 @@ async def _probe_subagent_write(allow_cloud: bool, attempts: int = 2) -> tuple[b
             tools=["Write"], model=enforcement.MODEL_DEEP, maxTurns=3)
         options = ClaudeAgentOptions(
             system_prompt="You are a harness preflight check. Follow instructions literally.",
-            model=enforcement.MODEL_DEEP, max_buffer_size=enforcement.MAX_BUFFER_SIZE,
+            model=enforcement.MODEL_DEEP, max_buffer_size=enforcement.MAX_BUFFER_SIZE, settings=enforcement.SESSION_SETTINGS,
             # The lead's real tool list: a subagent only gets tools its parent has.
             agents={"write-probe": probe}, tools=LEAD_TOOLS, allowed_tools=LEAD_TOOLS,
             permission_mode="bypassPermissions", setting_sources=[], cwd=REPO_ROOT,
@@ -2207,11 +2597,12 @@ async def final_writeup(run_path, run_dir_rel, question, max_rounds, budget, cap
         agents = {"writer": build_agents(question=question, run_dir=run_dir_rel)["writer"]}
         trace = open(os.path.join(run_path, "trace.jsonl"), "a")
         hooks = create_hooks(run_path, trace, datetime.now(), registered_agents={"writer"},
-                             max_turns={"writer": agents["writer"].maxTurns}, integrity=integrity)
+                             max_turns={"writer": agents["writer"].maxTurns}, integrity=integrity,
+                             hold_writer=False)   # the harness's own write-up is never held
         options = ClaudeAgentOptions(
             system_prompt="You are the harness's final write-up step. Follow the instructions literally.",
             agents=agents, model=(smoke_settings() or {}).get("model", enforcement.MODEL_DEEP),
-            max_buffer_size=enforcement.MAX_BUFFER_SIZE, tools=LEAD_TOOLS, allowed_tools=LEAD_TOOLS,
+            max_buffer_size=enforcement.MAX_BUFFER_SIZE, settings=enforcement.SESSION_SETTINGS, tools=LEAD_TOOLS, allowed_tools=LEAD_TOOLS,
             permission_mode="bypassPermissions", setting_sources=["project"], hooks=hooks,
             cwd=REPO_ROOT, env=enforcement.filtered_env(dict(os.environ), False), max_turns=8)
         if left is not None:
@@ -2289,6 +2680,11 @@ def main() -> int:
     parser.add_argument("--methods-critic", action="store_true",
                         help="Add critique-methods to every STAGE 6. Off by default: in E5 "
                              "it caught no planted defect the other critics missed.")
+    parser.add_argument("--signoff", choices=["owner", "lead", "none"], default="owner",
+                        help="Who signs the decision brief before compute (Phase 33): the owner "
+                             "(default; the run waits), the lead (unattended test runs), or none")
+    parser.add_argument("--signoff-hours", type=float, default=24.0,
+                        help="How long an owner sign-off wait lasts before the run pauses (resumable)")
     parser.add_argument("--self-test", action="store_true",
                         help="Run inline self-tests (no API calls) and exit")
     parser.add_argument("--preflight-only", action="store_true",
@@ -2342,14 +2738,16 @@ def main() -> int:
         coro = run(question, args.max_rounds, args.max_sessions,
                    run_dir=run_dir, run_path=run_path, allow_cloud=args.cloud,
                    cross_model=args.cross_model, methods_critic=args.methods_critic,
-                   max_budget_usd=args.max_budget_usd)
+                   max_budget_usd=args.max_budget_usd,
+                   signoff=args.signoff, signoff_hours=args.signoff_hours)
     else:
         if not args.question:
             print("Error: question is required (or use --resume)")
             return 1
         coro = run(args.question, args.max_rounds, args.max_sessions,
                    allow_cloud=args.cloud, cross_model=args.cross_model,
-                   methods_critic=args.methods_critic, max_budget_usd=args.max_budget_usd)
+                   methods_critic=args.methods_critic, max_budget_usd=args.max_budget_usd,
+                   signoff=args.signoff, signoff_hours=args.signoff_hours)
     try:
         status = asyncio.run(coro)
     except KeyboardInterrupt:

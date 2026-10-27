@@ -1,0 +1,65 @@
+{"by": "auto", "date": "2026-10-23T05:23:40", "lesson": "L003", "note": "not raised in any gate round", "result": "absent", "run": "e7a34-R1d_2026-10-23_052340"}
+{"by": "auto", "date": "2026-10-23T05:23:40", "lesson": "L004", "note": "raised by the gate earlier, cleared by the end: ['claims_ledger_invalid', 'claims_ledger_stale']", "result": "caught", "run": "e7a34-R1d_2026-10-23_052340"}
+{"by": "auto", "date": "2026-10-23T05:23:40", "lesson": "L005", "note": "raised by the gate earlier, cleared by the end: ['pre_mortem_high_unaddressed']", "result": "caught", "run": "e7a34-R1d_2026-10-23_052340"}
+{"by": "auto", "date": "2026-10-23T05:23:40", "lesson": "L006", "note": "not raised in any gate round", "result": "absent", "run": "e7a34-R1d_2026-10-23_052340"}
+{"by": "auto", "date": "2026-10-23T05:23:40", "lesson": "L007", "note": "not raised in any gate round", "result": "absent", "run": "e7a34-R1d_2026-10-23_052340"}
+{"by": "auto", "date": "2026-10-23T05:23:40", "lesson": "L008", "note": "raised by the gate earlier, cleared by the end: ['data_vintage_conflict']", "result": "caught", "run": "e7a34-R1d_2026-10-23_052340"}
+{"by": "auto", "date": "2026-10-23T05:23:40", "lesson": "L009", "note": "the writer's save was refused 3 time(s) (CLI rule on REPORT*.md for subagents)", "result": "recurred", "run": "e7a34-R1d_2026-10-23_052340"}
+{"by": "auto", "date": "2026-10-23T05:23:40", "lesson": "L010", "note": "no matching autopsy reason", "result": "absent", "run": "e7a34-R1d_2026-10-23_052340"}
+{"by": "auto", "date": "2026-10-23T05:23:40", "lesson": "L011", "note": "no matching autopsy reason", "result": "absent", "run": "e7a34-R1d_2026-10-23_052340"}
+{"by": "auto", "date": "2026-10-23T05:23:40", "lesson": "L012", "note": "the modeler worked 12.5 h without using the compute service", "result": "recurred", "run": "e7a34-R1d_2026-10-23_052340"}
+{"by": "auto", "date": "2026-10-23T05:23:40", "lesson": "L014", "note": "missing: ['report.md']", "result": "recurred", "run": "e7a34-R1d_2026-10-23_052340"}
+{"by": "auto", "date": "2026-10-23T05:23:40", "lesson": "L003", "note": "not raised in any gate round", "result": "absent", "run": "e7a34-R2d_2026-10-23_052340"}
+{"by": "auto", "date": "2026-10-23T05:23:40", "lesson": "L004", "note": "not raised in any gate round", "result": "absent", "run": "e7a34-R2d_2026-10-23_052340"}
+{"by": "auto", "date": "2026-10-23T05:23:40", "lesson": "L005", "note": "not raised in any gate round", "result": "absent", "run": "e7a34-R2d_2026-10-23_052340"}
+{"by": "auto", "date": "2026-10-23T05:23:40", "lesson": "L006", "note": "raised by the gate earlier, cleared by the end: ['artifact_integrity_violation']", "result": "caught", "run": "e7a34-R2d_2026-10-23_052340"}
+{"by": "auto", "date": "2026-10-23T05:23:40", "lesson": "L007", "note": "not raised in any gate round", "result": "absent", "run": "e7a34-R2d_2026-10-23_052340"}
+{"by": "auto", "date": "2026-10-23T05:23:40", "lesson": "L008", "note": "not raised in any gate round", "result": "absent", "run": "e7a34-R2d_2026-10-23_052340"}
+{"by": "auto", "date": "2026-10-23T05:23:40", "lesson": "L009", "note": "the writer's save was refused 6 time(s) (CLI rule on REPORT*.md for subagents)", "result": "recurred", "run": "e7a34-R2d_2026-10-23_052340"}
+{"by": "auto", "date": "2026-10-23T05:23:40", "lesson": "L010", "note": "no matching autopsy reason", "result": "absent", "run": "e7a34-R2d_2026-10-23_052340"}
+{"by": "auto", "date": "2026-10-23T05:23:40", "lesson": "L011", "note": "no matching autopsy reason", "result": "absent", "run": "e7a34-R2d_2026-10-23_052340"}
+{"by": "auto", "date": "2026-10-23T05:23:40", "lesson": "L012", "note": "the modeler worked 10.1 h without using the compute service", "result": "recurred", "run": "e7a34-R2d_2026-10-23_052340"}
+{"by": "auto", "date": "2026-10-23T05:23:40", "lesson": "L014", "note": "missing: ['report.md']", "result": "recurred", "run": "e7a34-R2d_2026-10-23_052340"}
+{"by": "auto", "date": "2026-10-25T05:53:05", "lesson": "L009", "note": "no matching autopsy reason", "result": "absent", "run": "e7a5_2026-10-25_055305"}
+{"by": "auto", "date": "2026-10-25T05:53:05", "lesson": "L010", "note": "no matching autopsy reason", "result": "absent", "run": "e7a5_2026-10-25_055305"}
+{"by": "auto", "date": "2026-10-25T05:53:05", "lesson": "L011", "note": "a session was charged its whole allowance (cost unknown)", "result": "recurred", "run": "e7a5_2026-10-25_055305"}
+{"by": "auto", "date": "2026-10-25T05:53:05", "lesson": "L012", "note": "the modeler worked 2.4 h without using the compute service", "result": "recurred", "run": "e7a5_2026-10-25_055305"}
+{"by": "auto", "date": "2026-10-25T05:53:05", "lesson": "L014", "note": "missing: ['report.md']", "result": "recurred", "run": "e7a5_2026-10-25_055305"}
+{"by": "expert", "date": "2026-04-08", "lesson": "L001", "note": "source run: multi-disease grant total used as the malaria budget", "result": "recurred", "run": "malaria_2026-04-08_2128"}
+{"by": "expert", "date": "2026-04-08", "lesson": "L002", "note": "source run: 3 wrong lead authors", "result": "recurred", "run": "malaria_2026-04-08_2128"}
+{"by": "expert", "date": "2026-04-08", "lesson": "L003", "note": "source run: overall IRS OR used for >=80% coverage; subgroup IRR as general RR", "result": "recurred", "run": "malaria_2026-04-08_2128"}
+{"by": "expert", "date": "2026-04-29", "lesson": "L004", "note": "source run: $197M conflation accepted", "result": "recurred", "run": "malaria_2026-04-29_161312"}
+{"by": "expert", "date": "2026-04-29", "lesson": "L005", "note": "source run: supply ceiling ignored", "result": "recurred", "run": "malaria_2026-04-29_161312"}
+{"by": "expert", "date": "2026-05-03", "lesson": "L006", "note": "source run: CI contradicted zero-width UQ; renamed verdicts", "result": "recurred", "run": "malaria_2026-05-03_235631"}
+{"by": "expert", "date": "2026-05-03", "lesson": "L007", "note": "source run: under-5 benefit on whole population", "result": "recurred", "run": "malaria_2026-05-03_235631"}
+{"by": "maintainer", "date": "2026-10-26T03:15", "lesson": "L012", "note": "grid and scenarios run on the agent VM after the compute cap was hit; memory 99.9% at 08:56 UTC", "result": "recurred", "run": "e7a6_2026-10-26_031522"}
+{"by": "maintainer", "date": "2026-10-26T03:15", "lesson": "L013", "note": "~65 real core-hours booked as 282 by three timed-out concurrent calls", "result": "recurred", "run": "e7a6_2026-10-26_031522"}
+{"by": "maintainer", "date": "2026-10-26T03:15", "lesson": "L015", "note": "source run (provisional, 14:51 UTC checkpoint)", "result": "recurred", "run": "e7a6_2026-10-26_031522"}
+{"by": "maintainer", "date": "2026-10-26T03:15", "lesson": "L016", "note": "source run (provisional, 14:51 UTC checkpoint)", "result": "recurred", "run": "e7a6_2026-10-26_031522"}
+{"by": "maintainer", "date": "2026-10-26T03:15", "lesson": "L017", "note": "source run (provisional, 14:51 UTC checkpoint)", "result": "recurred", "run": "e7a6_2026-10-26_031522"}
+{"by": "maintainer", "date": "2026-10-26T03:15", "lesson": "L018", "note": "source run (provisional, 14:51 UTC checkpoint)", "result": "recurred", "run": "e7a6_2026-10-26_031522"}
+{"by": "maintainer", "date": "2026-10-26T03:15", "lesson": "L020", "note": "source run (provisional, 14:51 UTC checkpoint)", "result": "recurred", "run": "e7a6_2026-10-26_031522"}
+{"by": "maintainer", "date": "2026-10-26T03:15", "lesson": "L021", "note": "source run (provisional, 14:51 UTC checkpoint)", "result": "recurred", "run": "e7a6_2026-10-26_031522"}
+{"by": "maintainer", "date": "2026-10-26T03:15", "lesson": "L019", "note": "source run: resistance, campaign lists and funder split not obtained", "result": "recurred", "run": "e7a6_2026-10-26_031522"}
+{"by": "maintainer", "date": "2026-10-26T15:20", "lesson": "L022", "note": "pool stayed at 1 compute VM; 240 tasks in 2681 s", "result": "recurred", "run": "autoscale-check3"}
+{"by": "maintainer", "date": "2026-10-26T18:00", "lesson": "L022", "note": "pool grew to 6 compute VMs; batch 572 s (with a70f825 settings)", "result": "absent", "run": "autoscale-check6"}
+{"by": "maintainer", "date": "2026-10-26T17:13", "lesson": "L023", "note": "62,403 core-s charged for 4,800 s of model work (checks 3 and 4 alike)", "result": "recurred", "run": "autoscale-check5"}
+{"by": "maintainer", "date": "2026-10-26T18:00", "lesson": "L023", "note": "4,800 core-s charged for 4,800 s", "result": "absent", "run": "autoscale-check6"}
+{"by": "maintainer", "date": "2026-10-26T17:13", "lesson": "L024", "note": "only totals: over-charge and idle tail unattributable", "result": "recurred", "run": "autoscale-check5"}
+{"by": "maintainer", "date": "2026-10-26T03:15", "lesson": "L025", "note": "round 5: P-004, P-007 (pending-WRITE) escalated to HIGH", "result": "recurred", "run": "e7a6_2026-10-26_031522"}
+{"by": "maintainer", "date": "2026-10-26T03:15", "lesson": "L026", "note": "round 5: figure_staleness_detected, numeric_drift_extreme, ci_degenerate", "result": "recurred", "run": "e7a6_2026-10-26_031522"}
+{"by": "maintainer", "date": "2026-10-26T03:15", "lesson": "L027", "note": "round 5 R-009: M5 passes dAIC -10.33 vs -10 only with the anchor slope at k=0", "result": "recurred", "run": "e7a6_2026-10-26_031522"}
+{"by": "auto", "date": "2026-10-26T03:15:22", "lesson": "L003", "note": "not raised in any gate round", "result": "absent", "run": "e7a6_2026-10-26_031522"}
+{"by": "auto", "date": "2026-10-26T03:15:22", "lesson": "L004", "note": "raised by the gate earlier, cleared by the end: ['claims_ledger_invalid']", "result": "caught", "run": "e7a6_2026-10-26_031522"}
+{"by": "auto", "date": "2026-10-26T03:15:22", "lesson": "L005", "note": "raised by the gate earlier, cleared by the end: ['pre_mortem_high_unaddressed']", "result": "caught", "run": "e7a6_2026-10-26_031522"}
+{"by": "auto", "date": "2026-10-26T03:15:22", "lesson": "L006", "note": "not raised in any gate round", "result": "absent", "run": "e7a6_2026-10-26_031522"}
+{"by": "auto", "date": "2026-10-26T03:15:22", "lesson": "L007", "note": "not raised in any gate round", "result": "absent", "run": "e7a6_2026-10-26_031522"}
+{"by": "auto", "date": "2026-10-26T03:15:22", "lesson": "L008", "note": "raised by the gate earlier, cleared by the end: ['unit_doc_scale_mismatch']", "result": "caught", "run": "e7a6_2026-10-26_031522"}
+{"by": "auto", "date": "2026-10-26T03:15:22", "lesson": "L009", "note": "no matching autopsy reason", "result": "absent", "run": "e7a6_2026-10-26_031522"}
+{"by": "auto", "date": "2026-10-26T03:15:22", "lesson": "L010", "note": "no matching autopsy reason", "result": "absent", "run": "e7a6_2026-10-26_031522"}
+{"by": "auto", "date": "2026-10-26T03:15:22", "lesson": "L011", "note": "no matching autopsy reason", "result": "absent", "run": "e7a6_2026-10-26_031522"}
+{"by": "auto", "date": "2026-10-26T03:15:22", "lesson": "L012", "note": "peak memory 99.9%", "result": "recurred", "run": "e7a6_2026-10-26_031522"}
+{"by": "auto", "date": "2026-10-26T03:15:22", "lesson": "L014", "note": "present", "result": "absent", "run": "e7a6_2026-10-26_031522"}
+{"by": "auto", "date": "2026-10-26T03:15:22", "lesson": "L026", "note": "in the last gate round: ['ci_degenerate']", "result": "recurred", "run": "e7a6_2026-10-26_031522"}
+{"by": "auto", "date": "2026-10-26T03:15:22", "lesson": "L028", "note": "no matching autopsy reason", "result": "absent", "run": "e7a6_2026-10-26_031522"}
+{"by": "maintainer", "date": "2026-10-26T03:15", "lesson": "L028", "note": "lead stopped after round 6 of 8 with ~$54 of modeling budget left (one round ~$50-60); not detected automatically because the lead stopped before the cap", "result": "recurred", "run": "e7a6_2026-10-26_031522"}

@@ -148,12 +148,13 @@ for f in main.py \
   scripts/allocation_robustness.py scripts/benchmark_match.py \
   scripts/build_claims_ledger.py scripts/data_schema.py \
   scripts/cloud_batch.py scripts/coherence_audit.py \
-  scripts/compare_models.py scripts/compute.py \
-  scripts/cross_model_critic.py \
+  scripts/compare_models.py scripts/compute.py scripts/convergence_report.py \
+  scripts/cross_model_critic.py scripts/decision_brief.py scripts/done_when.py \
   scripts/effect_size_registry.py \
   scripts/effort_floors.py scripts/eligibility_probe.py \
   scripts/figure_validator.py scripts/identifiability.py \
-  scripts/identifiability_a_priori.py scripts/numeric_consistency.py \
+  scripts/identifiability_a_priori.py scripts/lessons.py \
+  scripts/numeric_consistency.py scripts/open_problems.py \
   scripts/optimization_quality.py scripts/plan_criteria.py \
   scripts/propagate_uncertainty.py scripts/render_claims.py \
   scripts/results_store.py scripts/run_autopsy.py \
@@ -166,7 +167,7 @@ for f in main.py \
   scripts/lib/expert_priors.py scripts/lib/md_helpers.py \
   scripts/lib/positive_control.py scripts/lib/provenance.py \
   scripts/lib/rigor_artifacts.py scripts/lib/safe_io.py \
-  scripts/lib/text_spans.py; do
+  scripts/lib/text_spans.py scripts/lib/transcript_cost.py; do
   echo "== $f"; python3 "$f" --self-test || echo "FAILED: $f"
 done
 python3 scripts/validate_skill_attachments.py      # frontmatter + phantoms
@@ -184,12 +185,16 @@ one domain:
 ```bash
 source .venv/bin/activate
 nohup python3 main.py "<research question>" \
-  --max-rounds 8 --max-sessions 5 \
+  --max-rounds 8 --max-sessions 5 --signoff owner \
   > run_phaseN.log 2>&1 &
 ```
 
 The run produces `runs/<timestamp>_<question>/` with all artifacts and
 `final_gate.json` (the post-run validator decision).
+
+After the plan, the run waits for the owner to sign the decision brief
+(`python3 scripts/decision_brief.py show|sign <run_dir>`); use
+`--signoff lead` for unattended test runs.
 
 ## Pointers to deeper docs
 

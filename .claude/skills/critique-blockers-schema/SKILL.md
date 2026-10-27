@@ -64,6 +64,9 @@ blockers:
     severity: HIGH               # HIGH | MEDIUM | LOW
     category: HARD_BLOCKER       # see category list below
     target_stage: MODEL          # PLAN | DATA | MODEL | ANALYZE | WRITE
+    brief_item: A1               # decision_brief.yaml id it threatens (A/C/K/OS/Q or an
+                                 # acceptance id), GAP (the brief does not settle it), or
+                                 # NONE (a note for the next run; does not block)
     first_seen_round: 1
     claim: >
       Primary model performs worse than baseline
@@ -74,6 +77,12 @@ blockers:
       state-space formulation) OR explicit scope declaration that this
       model is not skilled vs baseline and results should be read as
       exploratory only.
+    done_when:                   # Phase 34: the test that decides "fixed" (HIGH/MEDIUM)
+      - {file: models/model_comparison.yaml, key: primary.skill_score, op: ">", value: 0}
+      # or {file, contains|lacks: <regex>}, {file, exists: true},
+      # or done_when: {judgement: "<what would show it is fixed>"}.
+      # Frozen once the gate has seen it; passing it resolves the finding,
+      # and it is re-run every round (scripts/done_when.py).
     resolved: false
     # When resolved=true, the following are REQUIRED:
     # resolved_in_round: 2

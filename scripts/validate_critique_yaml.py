@@ -1824,7 +1824,7 @@ def _check_a_priori_counts(run_dir: str,
 
 
 def _check_rigor_artifacts(run_dir: str, round_n: int | None = None,
-                           post_write: bool = False) -> list[dict]:
+                           post_write: bool = False, extra: list[dict] | None = None) -> list[dict]:
     """Run every rigor check. Returns a list of violations.
 
     Phase 21 β: every check runs through `run_guarded`, so an exception
@@ -1849,6 +1849,8 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None,
     violations += G(_check_writer_qa, run_dir, post_write=post_write)
     # Phase 7 Commit μ: plan-promised criteria enforcement.
     violations += G(_check_plan_criteria, run_dir)
+    # Phase 33 α: the signed decision brief and frozen acceptance criteria.
+    violations += G(_check_decision_brief, run_dir)
     # Phase 9 Commit ρ: write-time figure validator + provenance check.
     violations += G(_check_figure_validator, run_dir)
     # Phase 12 Commit α: cross-file numeric consistency check.
@@ -1894,6 +1896,9 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None,
     violations += G(_check_sufficiency_critic, run_dir, round_n=round_n)
     # Phase 21 β/δ: eligible-population behavioral probe.
     violations += G(_check_eligibility_probe, run_dir, round_n=round_n)
+    # Phase 34: done_when findings computed by the caller, added before the
+    # escalation so their persistence counts (Codex review).
+    violations += list(extra or [])
     # Phase 12 Commit β: round-aware escalation of persisting MEDIUMs
     # (history-backed since Phase 21 β).
     if round_n is not None:
@@ -3476,6 +3481,8 @@ _VALIDATOR_KIND_ESCALATION_THRESHOLDS = {
     # Phase 21 β: MEDIUMs observed to persist to the final round of real
     # runs without ever blocking.
     "plan_criterion_not_tested": 3,
+    # Phase 34: findings left without a done_when test for 3 rounds.
+    "critique_done_when_missing": 3,
     "benchmark_targets_missing": 2,
     "pre_model_over_saturated_with_commitment": 2,
     "weakly_identified_parameters": 3,
@@ -3528,6 +3535,126 @@ def _append_validator_history(run_dir: str, round_n: int, decision: dict,
     except OSError as e:
         print(f"WARNING: could not append validator history: {e}",
               file=sys.stderr)
+
+
+def _check_decision_brief(run_dir: str) -> list[dict]:
+    """Phase 33 α: unsigned brief, or acceptance criteria changed after
+    sign-off / lock (HIGH, non-declarable); invalid amendments (MEDIUM)."""
+    import decision_brief
+    critiques = {}
+    for reviewer in decision_brief.SCOPED_CRITICS:
+        path = os.path.join(run_dir, reviewer.replace("-", "_") + ".yaml")
+        try:
+            critiques[reviewer] = yaml.safe_load(open(path)) or {}
+        except (OSError, yaml.YAMLError):
+            continue
+    return decision_brief.gate_findings(run_dir) + decision_brief.tie_findings(critiques, run_dir)
+
+
+def _apply_brief_scope(decision: dict, critiques: dict, run_dir: str,
+                       max_rounds: int, current_round: int) -> dict:
+    """Phase 33 α: once the brief is signed, a critic finding the critic tied
+    to NONE (`brief_item: NONE`) neither blocks nor escalates; it is listed as
+    `outside_brief`, a note for the next run. Missing or unknown ties still
+    block (decision_brief.tie_findings)."""
+    import decision_brief
+    outside = decision_brief.scope_filter(critiques, run_dir)
+    if not outside:
+        return decision
+    decision["unresolved_high"] = [
+        b for b in decision.get("unresolved_high") or []
+        if not (b.get("kind") == "critique_blocker" and str(b.get("id")) in outside)]
+    decision["outside_brief"] = sorted(outside)
+    _drop_attempts(decision, outside)
+    return _recompute_action(decision, max_rounds, current_round)
+
+
+def _drop_attempts(decision: dict, ids) -> None:
+    """Gemini review: findings closed by their test or put outside the brief
+    no longer count toward the stuck-blocker escalation."""
+    ids = {str(i) for i in ids}
+    att = {k: v for k, v in (decision.get("blocker_attempts") or {}).items() if str(k) not in ids}
+    decision["blocker_attempts"] = att
+    decision["escalation_required"] = any(
+        info.get("severity") == "HIGH" and info.get("patch_attempts", 0) >= _ESCALATION_HIGH_THRESHOLD
+        for info in att.values())
+
+
+def _defer_write_findings(decision: dict, run_dir: str, max_rounds: int, current_round: int) -> dict:
+    """Codex review (Phases 31-34): a HIGH critic finding aimed at the write-up
+    cannot be fixed before a draft exists, and the writer waits for the gate,
+    so before the first draft it is listed as `after_write`, not blocking.
+    The post-write gate blocks on it as usual."""
+    if any(os.path.exists(os.path.join(run_dir, f)) for f in ("report.md", "manuscript.md")):
+        return decision
+    later = [b for b in decision.get("unresolved_high") or []
+             if b.get("kind") == "critique_blocker" and str(b.get("target_stage") or "").upper() == "WRITE"]
+    if not later:
+        return decision
+    decision["unresolved_high"] = [b for b in decision["unresolved_high"] if b not in later]
+    decision["after_write"] = sorted(str(b.get("id")) for b in later)
+    return _recompute_action(decision, max_rounds, current_round)
+
+
+def _apply_done_when(decision: dict, critiques: dict, run_dir: str, max_rounds: int,
+                     current_round: int, record: bool = True) -> tuple[dict, dict | None]:
+    """Phase 34: a critic finding whose done_when test passes is resolved,
+    whatever the critic's `resolved`; tests that passed are re-run every gate
+    (regressions and missing tests come back as rigor findings via
+    done_when.gate_findings). A failure here is reported, never fatal."""
+    try:
+        import done_when
+        res = done_when.run(run_dir, critiques, current_round, record=record,
+                            exclude=decision.get("outside_brief") or ())
+    except Exception as e:  # noqa: BLE001 — fail closed: a HIGH finding via gate_findings
+        decision["done_when_error"] = f"{type(e).__name__}: {e}"
+        return decision, {"error": decision["done_when_error"]}
+    decision["done_when_status"] = res["status"]
+    if not res["resolved"]:
+        return decision, res
+    passed = set(res["resolved"])
+    decision["unresolved_high"] = [
+        b for b in decision.get("unresolved_high") or []
+        if not (b.get("kind") == "critique_blocker" and str(b.get("id")) in passed)]
+    decision["resolved_by_test"] = sorted(passed)
+    _drop_attempts(decision, passed)
+    return _recompute_action(decision, max_rounds, current_round), res
+
+
+def _passing_tests(run_dir: str, round_n) -> set:
+    """Phase 34: ids whose done_when test passes now (read-only)."""
+    try:
+        import done_when
+        return set(done_when.run(run_dir, done_when._load_critiques(run_dir), int(round_n or 0),
+                                 record=False)["resolved"])
+    except Exception:  # noqa: BLE001 — escalation must not depend on it
+        return set()
+
+
+def _write_open_problems(run_dir: str, round_n: int, max_rounds: int,
+                         critiques: dict, decision: dict) -> str | None:
+    """Phase 32 α: open_problems.json/.md after every in-round gate run, for
+    the lead's round_plan.yaml. Returns a line for stderr. A failure here is
+    reported, never fatal to the gate decision."""
+    try:
+        import open_problems
+        hist = _load_validator_history(run_dir)
+        kind_rounds: dict[str, int] = {}
+        for kinds in hist.values():
+            for k in kinds:
+                kind_rounds[k] = kind_rounds.get(k, 0) + 1
+        doc = open_problems.build(
+            run_dir, round_n, max_rounds, critiques, decision, kind_rounds,
+            _VALIDATOR_KIND_ESCALATION_THRESHOLDS,
+            _CRITIQUE_BLOCKER_ESCALATION_THRESHOLD)
+        open_problems.write(run_dir, doc)
+    except Exception as e:  # noqa: BLE001
+        return f"WARNING: open_problems.json not written: {e}"
+    n = len(doc["items"])
+    soon = sum(1 for i in doc["items"] if i["blocks_in"] == 1)
+    return (f"Open problems: {n} ({soon} become blocking at the next gate). "
+            f"See open_problems.md; write round_plan.yaml (round: {round_n}) "
+            f"before the next round's work.")
 
 
 def _annotate_first_seen(run_dir: str, violations: list[dict]) -> None:
@@ -4460,6 +4587,21 @@ def _check_scope_declaration_budget(run_dir: str,
 
     out: list[dict] = []
 
+    # Phase 31: an honored raise is the run choosing to leave more unmodeled;
+    # it is allowed, but the reviewer should see it and the reason (LOW: it
+    # never blocks and never escalates).
+    if cap > _SCOPE_DECLARATION_DEFAULT_CAP:
+        out.append({
+            "kind": "scope_declaration_cap_raised",
+            "severity": "LOW",
+            "stage": "GATE",
+            "claim": (
+                f"The run raised its scope-declaration cap from "
+                f"{_SCOPE_DECLARATION_DEFAULT_CAP} to {cap} ({len(declared)} declared). "
+                f"Reason given: \"{overage_justification[:300]}\""
+            ),
+        })
+
     if cap_override_diagnostic:
         out.append({
             "kind": "scope_declaration_cap_override_rejected",
@@ -4968,6 +5110,15 @@ def _check_persistent_medium_escalation(run_dir: str,
     # Walk each critique YAML's blockers list. For MEDIUM blockers
     # with first_seen_round set and resolved != True, escalate to
     # HIGH if (round_n - first_seen_round) >= threshold.
+    # Phase 31: a blocker aimed at the write-up (target_stage WRITE) cannot
+    # be fixed before the write-up exists, so it does not escalate until
+    # then (E7 attempt 6: two such findings became HIGH in round 5 and the
+    # lead ran the writer mid-round to clear them).
+    written = any(os.path.exists(os.path.join(run_dir, f)) for f in ("report.md", "manuscript.md"))
+    # Phase 33 α: after sign-off, findings tied to no brief item do not escalate.
+    import decision_brief
+    brief_ids = decision_brief.item_ids(run_dir) if decision_brief.is_signed(run_dir) else None
+    passing = _passing_tests(run_dir, round_n)
     for reviewer_yaml in ("critique_methods.yaml", "critique_domain.yaml",
                           "critique_presentation.yaml",
                           "critique_redteam.yaml",
@@ -4987,6 +5138,13 @@ def _check_persistent_medium_escalation(run_dir: str,
             if severity != "MEDIUM":
                 continue
             if blocker.get("resolved") is True:
+                continue
+            if not written and str(blocker.get("target_stage") or "").upper() == "WRITE":
+                continue
+            if (brief_ids is not None and reviewer_yaml != "critique_crossmodel.yaml"
+                    and str(blocker.get("brief_item") or "").strip().upper() == "NONE"):
+                continue
+            if str(blocker.get("id")) in passing:   # Phase 34: its test passes
                 continue
             first_seen = blocker.get("first_seen_round")
             if first_seen is None:
@@ -5358,7 +5516,7 @@ def _incorporate_rigor_violations(decision: dict, violations: list[dict],
             continue
         entries.append({
             "category": "METHODS",
-            "target_stage": "MODEL",
+            "target_stage": v.get("target_stage") or "MODEL",   # e.g. a done_when regression's own stage
             "first_seen_round": v.get("first_seen_round", current_round),
             "claim": f"{v.get('stage', '?')}/{v['kind']}: {v.get('claim', '')}",
             "kind": v["kind"],
@@ -5478,6 +5636,8 @@ def render_text(decision: dict, current_round: int, max_rounds: int) -> str:
                      f"since round {b['first_seen_round']})"
                      f"{' [NOT scope-declarable]' if is_non_declarable(b.get('kind'), b.get('scope_declarable')) and b.get('kind') != 'critique_blocker' else ''}"
                      f": {b['claim'][:100]}")
+    if decision.get("resolved_by_test"):   # Phase 34
+        lines.append(f"  resolved by their done_when tests: {', '.join(decision['resolved_by_test'])}")
     accept_blockers = decision.get("accept_blockers") or []
     if accept_blockers:
         lines.append(f"  accept_blockers (required artifacts missing): "
@@ -7097,6 +7257,118 @@ def _run_self_test() -> int:
         ok(not any(v["kind"] == "P-005_persistent" for v in ve5),
            f"E5: resolved blocker should NOT escalate, got {ve5}")
 
+    # E5b (Phase 31): a WRITE-stage blocker does not escalate before the
+    # write-up exists; it does once a manuscript exists.
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "critique_presentation.yaml"), "w") as f:
+            f.write(
+                "reviewer: critique-presentation\n"
+                "round: 5\n"
+                "blockers:\n"
+                "  - id: P-004\n"
+                "    severity: MEDIUM\n"
+                "    target_stage: WRITE\n"
+                "    first_seen_round: 1\n"
+                "    claim: no reader-facing Data section (pending WRITE)\n"
+                "    resolved: false\n"
+            )
+        ve5b = _check_persistent_medium_escalation(d, round_n=5)
+        ok(not any(v["kind"] == "P-004_persistent" for v in ve5b),
+           f"E5b: WRITE-stage blocker escalated before any write-up exists: {ve5b}")
+        open(os.path.join(d, "manuscript.md"), "w").write("# draft\n")
+        ve5c = _check_persistent_medium_escalation(d, round_n=5)
+        ok(any(v["kind"] == "P-004_persistent" for v in ve5c),
+           f"E5c: WRITE-stage blocker escalates once a manuscript exists: {ve5c}")
+
+    # BS1-BS3 (Phase 33): once the decision brief is signed, a critic finding
+    # tied to no brief item neither blocks nor escalates; a tied one does both.
+    with tempfile.TemporaryDirectory() as d:
+        import decision_brief as _db
+        yaml.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d, "success_criteria.yaml"), "w"))
+        yaml.safe_dump({"question": "q", "decision": "d", "decision_maker": "m", "objective": "o",
+                        "answers": [{"id": "A1", "statement": "s", "resolution": "district"}],
+                        "acceptance": ["HB-001"]}, open(os.path.join(d, "decision_brief.yaml"), "w"))
+        _db.sign(d, "owner")
+        yaml.safe_dump({"reviewer": "critique-redteam", "round": 5, "blockers": [
+            {"id": "R-001", "severity": "MEDIUM", "target_stage": "MODEL", "first_seen_round": 1,
+             "claim": "tied", "resolved": False, "brief_item": "A1"},
+            {"id": "R-002", "severity": "MEDIUM", "target_stage": "MODEL", "first_seen_round": 1,
+             "claim": "untied", "resolved": False, "brief_item": "NONE"}]}, open(os.path.join(d, "critique_redteam.yaml"), "w"))
+        kinds = {v["kind"] for v in _check_persistent_medium_escalation(d, round_n=5)}
+        ok("R-001_persistent" in kinds and "R-002_persistent" not in kinds,
+           f"BS1: only the finding tied to the brief escalates: {kinds}")
+        crit = {"critique-redteam": {"blockers": [
+            {"id": "R-003", "severity": "HIGH", "target_stage": "MODEL", "category": "METHODS",
+             "first_seen_round": 5, "claim": "untied", "resolved": False, "brief_item": "NONE"},
+            {"id": "R-004", "severity": "HIGH", "target_stage": "MODEL", "category": "METHODS",
+             "first_seen_round": 5, "claim": "tied", "resolved": False, "brief_item": "HB-001"}],
+            "carried_forward": [], "structural_mismatch": {"detected": False}}}
+        dec = _apply_brief_scope(decide(crit, 8, 5), crit, d, 8, 5)
+        ok([b["id"] for b in dec["unresolved_high"]] == ["R-004"] and dec["outside_brief"] == ["R-003"],
+           f"BS2: untied HIGH leaves unresolved_high: {dec}")
+        ok(any(v["kind"] == "acceptance_criteria_changed" for v in (
+            open(os.path.join(d, "success_criteria.yaml"), "a").write("# edited\n") and _check_decision_brief(d))),
+           "BS3: criteria edited after sign-off is a gate finding")
+
+    # DG1-DG4 (Phase 34): a finding whose done_when test passes is resolved at
+    # the gate and does not escalate; a test that passed and breaks comes back
+    # as a HIGH gate finding; runnable tests need no critic fix check.
+    with tempfile.TemporaryDirectory() as d:
+        import done_when as _dw
+        import open_problems as _op
+        json.dump({"ci95": [10, 20]}, open(os.path.join(d, "out.json"), "w"))
+        test = {"file": "out.json", "key": "ci95", "op": "width_gt", "value": 0}
+        crit = {"critique-redteam": {"blockers": [
+            {"id": "R-001", "severity": "HIGH", "target_stage": "MODEL", "category": "METHODS",
+             "first_seen_round": 2, "claim": "zero CI", "resolved": False, "done_when": test},
+            {"id": "R-002", "severity": "HIGH", "target_stage": "MODEL", "category": "METHODS",
+             "first_seen_round": 2, "claim": "judged", "resolved": False,
+             "done_when": {"judgement": "the critic reads the caveat"}},
+            {"id": "R-004", "severity": "HIGH", "target_stage": "ANALYZE", "category": "METHODS",
+             "first_seen_round": 2, "claim": "no table", "resolved": False,
+             "done_when": {"file": "table.csv", "exists": True}}],
+            "carried_forward": [], "structural_mismatch": {"detected": False}}}
+        dec, res = _apply_done_when(decide(crit, 8, 3), crit, d, 8, 3)
+        ok([b["id"] for b in dec["unresolved_high"]] == ["R-002", "R-004"] and dec["resolved_by_test"] == ["R-001"],
+           f"DG1: the passing test resolves R-001, the judged one stays open: {dec['unresolved_high']}")
+        doc = _op.build(d, 3, 8, crit, dec, {}, {}, 4)
+        items = {i["id"]: i for i in doc["items"]}
+        ok("R-001" not in items and items["R-002"]["fix_check"] is True and items["R-004"]["fix_check"] is False
+           and "table.csv missing" in items["R-004"]["test"] and doc["resolved_by_test"] == ["R-001"],
+           f"DG2: the list drops what passed; only judged items need a critic fix check: {items}")
+        yaml.safe_dump({"reviewer": "critique-redteam", "round": 7, "blockers": [
+            {"id": "R-003", "severity": "MEDIUM", "target_stage": "MODEL", "first_seen_round": 1,
+             "claim": "passes", "resolved": False, "done_when": test}]}, open(os.path.join(d, "critique_redteam.yaml"), "w"))
+        kinds = {v["kind"] for v in _check_persistent_medium_escalation(d, round_n=7)}
+        ok("R-003_persistent" not in kinds, f"DG3: a MEDIUM whose test passes does not escalate: {kinds}")
+        json.dump({"ci95": [15, 15]}, open(os.path.join(d, "out.json"), "w"))
+        crit["critique-redteam"]["blockers"][0]["resolved"] = True
+        dec, res = _apply_done_when(decide(crit, 8, 4), crit, d, 8, 4)
+        dec = _incorporate_rigor_violations(dec, _dw.gate_findings(res), 8, 4)
+        reg = [b for b in dec["unresolved_high"] if b.get("kind") == "done_when_regressed"]
+        ok(len(reg) == 1 and "R-001" in reg[0]["claim"] and "round 3" in reg[0]["claim"]
+           and dec["action"] != "ACCEPT", f"DG4: a broken test reopens as a HIGH gate finding: {dec['unresolved_high']}")
+        for rnd in (1, 2):
+            _append_validator_history(d, rnd, {"action": "PATCH_OR_RETHINK", "rigor_violations": [
+                {"kind": "critique_done_when_missing", "severity": "MEDIUM", "stage": "CRITIQUE"}]}, False)
+        miss = _dw.gate_findings({"missing": {"critique-redteam": ["R-009"]}})
+        kinds = {v.get("kind") for v in _check_rigor_artifacts(d, round_n=3, extra=miss)}
+        ok("critique_done_when_missing_persistent" in kinds,
+           f"DG5: untested findings for 3 rounds escalate through the production path: {sorted(kinds)[:12]}")
+        bad = _incorporate_rigor_violations(decide(crit, 8, 5), _dw.gate_findings({"error": "KeyError: x"}), 8, 5)
+        ok(any(b.get("kind") == "done_when_unavailable" for b in bad["unresolved_high"]) and bad["action"] != "ACCEPT",
+           "DG6: a crashed test evaluation is a HIGH finding (fail closed)")
+        wcrit = {"critique-presentation": {"blockers": [
+            {"id": "P-001", "severity": "HIGH", "target_stage": "WRITE", "category": "PRESENTATION",
+             "first_seen_round": 1, "claim": "no captions", "resolved": False}],
+            "carried_forward": [], "structural_mismatch": {"detected": False}}}
+        pre = _defer_write_findings(decide(wcrit, 8, 2), d, 8, 2)
+        open(os.path.join(d, "manuscript.md"), "w").write("draft")
+        post = _defer_write_findings(decide(wcrit, 8, 2), d, 8, 2)
+        ok(pre["action"] == "ACCEPT" and pre["after_write"] == ["P-001"]
+           and [b["id"] for b in post["unresolved_high"]] == ["P-001"],
+           f"DG7: a HIGH write-up finding waits for the first draft, then blocks: {pre['action']} {post['action']}")
+
     # E6: critique-blocker MEDIUM persistence below threshold → silent.
     # first_seen=4, round=6 → persisted only 2 rounds; threshold 4.
     with tempfile.TemporaryDirectory() as d:
@@ -7923,6 +8195,10 @@ def _run_self_test() -> int:
         v = _check_scope_declaration_budget(_d, round_n=2)
         ok(not any(x["kind"] == "scope_declaration_budget_exceeded" for x in v),
            f"SB5: cap=5 with justification must allow 5 declarations, got {v}")
+        raised = [x for x in v if x["kind"] == "scope_declaration_cap_raised"]
+        ok(len(raised) == 1 and raised[0]["severity"] == "LOW"
+           and "five scope cuts" in raised[0]["claim"],
+           f"SB5b (Phase 31): an honored cap raise is reported LOW with its reason, got {v}")
 
     with _tempfile.TemporaryDirectory() as _d:
         # SB6: cap=5 WITHOUT justification → override not honored, HIGH fires
@@ -8942,6 +9218,11 @@ def main() -> int:
         return 3
 
     decision = decide(critiques, args.max_rounds, args.current_round)
+    decision = _apply_brief_scope(decision, critiques, args.run_dir,
+                                  args.max_rounds, args.current_round)
+    decision, dw_result = _apply_done_when(decision, critiques, args.run_dir, args.max_rounds,
+                                           args.current_round, record=not args.no_history)
+    decision = _defer_write_findings(decision, args.run_dir, args.max_rounds, args.current_round)
 
     if args.spec_compliance:
         spec_module = _load_spec_compliance()
@@ -8989,9 +9270,11 @@ def main() -> int:
         # (see agents/__init__.py around line 392); previously this
         # call site dropped it on the floor and the new ψ behavior
         # was unreachable from production.
+        import done_when
         rigor_violations = _check_rigor_artifacts(
             args.run_dir, round_n=args.current_round,
             post_write=args.post_write,
+            extra=done_when.gate_findings(dw_result or {}),
         )
         # Phase 11 Commit υ (F3): missing critique_redteam.yaml is a
         # MEDIUM violation now, not a silent skip. The lead is required
@@ -9054,8 +9337,14 @@ def main() -> int:
     if not args.no_history:
         _append_validator_history(args.run_dir, args.current_round, decision,
                                   args.post_write)
+    open_note = None
+    if not args.no_history and not args.post_write:
+        open_note = _write_open_problems(args.run_dir, args.current_round,
+                                         args.max_rounds, critiques, decision)
     print(render_text(decision, args.current_round, args.max_rounds),
           file=sys.stderr)
+    if open_note:
+        print(open_note, file=sys.stderr)
     if args.json:
         print(json.dumps(decision, indent=2))
     # Exit 0 on ACCEPT, 1 on any other action, so Bash callers can branch
