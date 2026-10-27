@@ -2010,7 +2010,6 @@ def _self_test_p35(ok) -> None:
                   open(dup + ".summary.json", "w"))
         ok(any("dup.jsonl" in f["claim"] for f in gate_findings(d)),
            "P35-25 a file's own ok rows never hide its failed rows")
-        up = os.path.join(d, "models", "draws.jsonl")
         fpa = code_fingerprint(d, "models/draw.py::f", exclude=(dout,))
         fpb = code_fingerprint(d, "models/draw.py::f")
         ok(fpa != fpb, "P35-26 another call's results file is part of the fingerprint (a model may read it)")
