@@ -41,7 +41,7 @@ COMPUTE_ENV = {"MA_COMPUTE_RESOURCE": "compute", "MA_COMPUTE_TARGET_WORKERS": st
                "MA_COMPUTE_MAX_CORE_HOURS": "1500", "MA_COMPUTE_CALL_CORE_HOURS": "400"}
 OUT = os.path.join(SCRATCH, "e7r7_cloud")
 TREE = os.path.expanduser("~/modeling-agentic-launch")
-FLAGS = ["--max-budget-usd", "450", "--signoff", "owner", "--signoff-hours", "24"]   # run_job_impl adds --max-rounds 8 --max-sessions 5
+FLAGS = ["--max-budget-usd", "600", "--signoff", "owner", "--signoff-hours", "24"]   # run_job_impl adds --max-rounds 8 --max-sessions 5
 ARMS = {"R": {"tree": TREE, "flags": FLAGS, "openai": False}}
 STATE = os.path.join(OUT, "assignments.json")
 QUESTION_FILE = os.path.join(SCRATCH, "e7_question.txt")

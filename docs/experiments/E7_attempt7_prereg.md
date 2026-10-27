@@ -42,7 +42,7 @@ they held, critic tests by kind (runnable / judgement / mixed), withdrawn tests,
 - **After the round-2 gate** (≈ 8 h): report measures 1-4 so far. Stop the run if a hold has kept
   work blocked for more than 1 h with no agent able to clear it, or if more than a third of open
   findings are blocked only by tests the critic itself considers fixed (unmet tests).
-- Budget: the run stops at its cap like any run; reaching it is an outcome, not a failure of the test.
+- Budget: cap $600 (owner, 2026-10-26). The run stops at its cap like any run; reaching it is an outcome, not a failure of the test.
 
 ## Decision use
 
@@ -59,6 +59,6 @@ by design (fixes for MEDIUMs, fix checks, return trips).
 
 ## Owner decisions before launch
 
-Budget cap; launch time (the run waits for the owner's sign-off about 40 minutes in); constraints or
+Launch time (the run waits for the owner's sign-off about 40 minutes in); constraints or
 data to add at sign-off (proposed: primary sources for decision-driving inputs; cost multipliers on
 the same eligible population as the benefit; out of scope up front for data known to be unavailable).
