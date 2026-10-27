@@ -77,6 +77,12 @@ blockers:
       state-space formulation) OR explicit scope declaration that this
       model is not skilled vs baseline and results should be read as
       exploratory only.
+    done_when:                   # Phase 34: the test that decides "fixed" (HIGH/MEDIUM)
+      - {file: models/model_comparison.yaml, key: primary.skill_score, op: ">", value: 0}
+      # or {file, contains|lacks: <regex>}, {file, exists: true},
+      # or done_when: {judgement: "<what would show it is fixed>"}.
+      # Frozen once the gate has seen it; passing it resolves the finding,
+      # and it is re-run every round (scripts/done_when.py).
     resolved: false
     # When resolved=true, the following are REQUIRED:
     # resolved_in_round: 2

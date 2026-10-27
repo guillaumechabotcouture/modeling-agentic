@@ -22,6 +22,7 @@ if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)  # lib.md_helpers (shared frontmatter rule)
 import open_problems  # noqa: E402  (Phase 32: open-problem list, round plan, fix checks)
 import decision_brief  # noqa: E402  (Phase 33: the signed decision brief)
+import done_when  # noqa: E402  (Phase 34: a test for every finding)
 
 MAX_FIGURE_PIXELS = 10_000_000  # 10MP -- anything larger is likely a bug
 
@@ -297,7 +298,7 @@ def _registry() -> dict[str, AgentDefinition]:
         ),
         "modeler": AgentDefinition(
             description=modeler.DESCRIPTION,
-            prompt=modeler.SYSTEM_PROMPT,
+            prompt=modeler.SYSTEM_PROMPT + done_when.WORKER_NOTE,
             tools=modeler.TOOLS,
             model=enforcement.MODEL_DEEP,
             maxTurns=150,
@@ -350,7 +351,7 @@ def _registry() -> dict[str, AgentDefinition]:
         ),
         "analyst": AgentDefinition(
             description=analyst.DESCRIPTION,
-            prompt=analyst.SYSTEM_PROMPT,
+            prompt=analyst.SYSTEM_PROMPT + done_when.WORKER_NOTE,
             tools=analyst.TOOLS,
             model=enforcement.MODEL_DEEP,
             maxTurns=40,
@@ -359,7 +360,8 @@ def _registry() -> dict[str, AgentDefinition]:
         ),
         "critique-methods": AgentDefinition(
             description=critique_methods.DESCRIPTION,
-            prompt=critique_methods.SYSTEM_PROMPT + open_problems.FIX_CHECK_NOTE + decision_brief.CRITIC_NOTE,
+            prompt=critique_methods.SYSTEM_PROMPT + open_problems.FIX_CHECK_NOTE + decision_brief.CRITIC_NOTE
+                   + done_when.CRITIC_NOTE,
             tools=critique_methods.TOOLS,
             model=enforcement.MODEL_DEEP,
             maxTurns=35,  # increased: now does parameter provenance checks with WebSearch
@@ -368,7 +370,8 @@ def _registry() -> dict[str, AgentDefinition]:
         ),
         "critique-domain": AgentDefinition(
             description=critique_domain.DESCRIPTION,
-            prompt=critique_domain.SYSTEM_PROMPT + open_problems.FIX_CHECK_NOTE + decision_brief.CRITIC_NOTE,
+            prompt=critique_domain.SYSTEM_PROMPT + open_problems.FIX_CHECK_NOTE + decision_brief.CRITIC_NOTE
+                   + done_when.CRITIC_NOTE,
             tools=critique_domain.TOOLS,
             model=enforcement.MODEL_DEEP,
             maxTurns=50,  # increased after malaria run ran_to_cap at 39/40
@@ -393,14 +396,16 @@ def _registry() -> dict[str, AgentDefinition]:
         ),
         "critique-presentation": AgentDefinition(
             description=critique_presentation.DESCRIPTION,
-            prompt=critique_presentation.SYSTEM_PROMPT + open_problems.FIX_CHECK_NOTE + decision_brief.CRITIC_NOTE,
+            prompt=critique_presentation.SYSTEM_PROMPT + open_problems.FIX_CHECK_NOTE + decision_brief.CRITIC_NOTE
+                   + done_when.CRITIC_NOTE,
             tools=critique_presentation.TOOLS,
             model=enforcement.MODEL_FAST,
             maxTurns=40,  # bumped 25→30 post-measles, 30→40 post-malaria (30/30 ran_to_cap in round 2)
         ),
         "critique-redteam": AgentDefinition(
             description=red_team.DESCRIPTION,
-            prompt=red_team.SYSTEM_PROMPT + open_problems.FIX_CHECK_NOTE + decision_brief.CRITIC_NOTE,
+            prompt=red_team.SYSTEM_PROMPT + open_problems.FIX_CHECK_NOTE + decision_brief.CRITIC_NOTE
+                   + done_when.CRITIC_NOTE,
             tools=red_team.TOOLS,
             model=enforcement.MODEL_DEEP,  # adversarial judgment + WebFetch-heavy research
             maxTurns=50,
@@ -865,7 +870,11 @@ is refused until every `fix` / `rethink` id has been named in a spawn prompt
 to its stage's agent (PLAN planner, DATA data-agent, MODEL modeler, ANALYZE
 analyst, WRITE writer). Once that work is handed out the plan is fixed for
 the round: a fix that did not work stays open, and the next gate lists it
-again for the next round's plan. Agents run in the background, so critics
+again for the next round's plan. Each critic finding carries a `done_when`
+test (shown in open_problems.md): the gate closes a finding when its test
+passes and reopens it if a later change breaks it, so tell each agent to run
+`python3 scripts/done_when.py check {run_dir} <IDs>` before it returns.
+Agents run in the background, so critics
 and the writer are refused while a planner, data-agent, modeler or analyst
 is still working; wait for each result before spawning them.
 

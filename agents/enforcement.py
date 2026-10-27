@@ -86,6 +86,8 @@ SCRIPT_OUTPUTS = (
     "open_problems.md.tmp",
     "decision_brief.signoff.json",   # Phase 33 α: scripts/decision_brief.py sign
     "acceptance_lock.json",          # Phase 33 α: written by the gate
+    "done_when_registry.json",       # Phase 34: frozen finding tests, written by the gate
+    ".dw_*.tmp",
 )
 
 # Files only one writer may change (None = the lead). Phase 32 α: the round

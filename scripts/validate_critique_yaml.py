@@ -3478,6 +3478,8 @@ _VALIDATOR_KIND_ESCALATION_THRESHOLDS = {
     # Phase 21 β: MEDIUMs observed to persist to the final round of real
     # runs without ever blocking.
     "plan_criterion_not_tested": 3,
+    # Phase 34: findings left without a done_when test for 3 rounds.
+    "critique_done_when_missing": 3,
     "benchmark_targets_missing": 2,
     "pre_model_over_saturated_with_commitment": 2,
     "weakly_identified_parameters": 3,
@@ -3561,6 +3563,39 @@ def _apply_brief_scope(decision: dict, critiques: dict, run_dir: str,
         if not (b.get("kind") == "critique_blocker" and str(b.get("id")) in outside)]
     decision["outside_brief"] = sorted(outside)
     return _recompute_action(decision, max_rounds, current_round)
+
+
+def _apply_done_when(decision: dict, critiques: dict, run_dir: str, max_rounds: int,
+                     current_round: int, record: bool = True) -> tuple[dict, dict | None]:
+    """Phase 34: a critic finding whose done_when test passes is resolved,
+    whatever the critic's `resolved`; tests that passed are re-run every gate
+    (regressions and missing tests come back as rigor findings via
+    done_when.gate_findings). A failure here is reported, never fatal."""
+    try:
+        import done_when
+        res = done_when.run(run_dir, critiques, current_round, record=record)
+    except Exception as e:  # noqa: BLE001
+        decision["done_when_error"] = f"{type(e).__name__}: {e}"
+        return decision, None
+    decision["done_when_status"] = res["status"]
+    if not res["resolved"]:
+        return decision, res
+    passed = set(res["resolved"])
+    decision["unresolved_high"] = [
+        b for b in decision.get("unresolved_high") or []
+        if not (b.get("kind") == "critique_blocker" and str(b.get("id")) in passed)]
+    decision["resolved_by_test"] = sorted(passed)
+    return _recompute_action(decision, max_rounds, current_round), res
+
+
+def _passing_tests(run_dir: str, round_n) -> set:
+    """Phase 34: ids whose done_when test passes now (read-only)."""
+    try:
+        import done_when
+        return set(done_when.run(run_dir, done_when._load_critiques(run_dir), int(round_n or 0),
+                                 record=False)["resolved"])
+    except Exception:  # noqa: BLE001 — escalation must not depend on it
+        return set()
 
 
 def _write_open_problems(run_dir: str, round_n: int, max_rounds: int,
@@ -5050,6 +5085,7 @@ def _check_persistent_medium_escalation(run_dir: str,
     # Phase 33 α: after sign-off, findings tied to no brief item do not escalate.
     import decision_brief
     brief_ids = decision_brief.item_ids(run_dir) if decision_brief.is_signed(run_dir) else None
+    passing = _passing_tests(run_dir, round_n)
     for reviewer_yaml in ("critique_methods.yaml", "critique_domain.yaml",
                           "critique_presentation.yaml",
                           "critique_redteam.yaml",
@@ -5074,6 +5110,8 @@ def _check_persistent_medium_escalation(run_dir: str,
                 continue
             if (brief_ids is not None and reviewer_yaml != "critique_crossmodel.yaml"
                     and str(blocker.get("brief_item") or "").strip().upper() == "NONE"):
+                continue
+            if str(blocker.get("id")) in passing:   # Phase 34: its test passes
                 continue
             first_seen = blocker.get("first_seen_round")
             if first_seen is None:
@@ -5565,6 +5603,8 @@ def render_text(decision: dict, current_round: int, max_rounds: int) -> str:
                      f"since round {b['first_seen_round']})"
                      f"{' [NOT scope-declarable]' if is_non_declarable(b.get('kind'), b.get('scope_declarable')) and b.get('kind') != 'critique_blocker' else ''}"
                      f": {b['claim'][:100]}")
+    if decision.get("resolved_by_test"):   # Phase 34
+        lines.append(f"  resolved by their done_when tests: {', '.join(decision['resolved_by_test'])}")
     accept_blockers = decision.get("accept_blockers") or []
     if accept_blockers:
         lines.append(f"  accept_blockers (required artifacts missing): "
@@ -7236,6 +7276,45 @@ def _run_self_test() -> int:
         ok(any(v["kind"] == "acceptance_criteria_changed" for v in (
             open(os.path.join(d, "success_criteria.yaml"), "a").write("# edited\n") and _check_decision_brief(d))),
            "BS3: criteria edited after sign-off is a gate finding")
+
+    # DG1-DG4 (Phase 34): a finding whose done_when test passes is resolved at
+    # the gate and does not escalate; a test that passed and breaks comes back
+    # as a HIGH gate finding; runnable tests need no critic fix check.
+    with tempfile.TemporaryDirectory() as d:
+        import done_when as _dw
+        import open_problems as _op
+        json.dump({"ci95": [10, 20]}, open(os.path.join(d, "out.json"), "w"))
+        test = {"file": "out.json", "key": "ci95", "op": "width_gt", "value": 0}
+        crit = {"critique-redteam": {"blockers": [
+            {"id": "R-001", "severity": "HIGH", "target_stage": "MODEL", "category": "METHODS",
+             "first_seen_round": 2, "claim": "zero CI", "resolved": False, "done_when": test},
+            {"id": "R-002", "severity": "HIGH", "target_stage": "MODEL", "category": "METHODS",
+             "first_seen_round": 2, "claim": "judged", "resolved": False,
+             "done_when": {"judgement": "the critic reads the caveat"}},
+            {"id": "R-004", "severity": "HIGH", "target_stage": "ANALYZE", "category": "METHODS",
+             "first_seen_round": 2, "claim": "no table", "resolved": False,
+             "done_when": {"file": "table.csv", "exists": True}}],
+            "carried_forward": [], "structural_mismatch": {"detected": False}}}
+        dec, res = _apply_done_when(decide(crit, 8, 3), crit, d, 8, 3)
+        ok([b["id"] for b in dec["unresolved_high"]] == ["R-002", "R-004"] and dec["resolved_by_test"] == ["R-001"],
+           f"DG1: the passing test resolves R-001, the judged one stays open: {dec['unresolved_high']}")
+        doc = _op.build(d, 3, 8, crit, dec, {}, {}, 4)
+        items = {i["id"]: i for i in doc["items"]}
+        ok("R-001" not in items and items["R-002"]["fix_check"] is True and items["R-004"]["fix_check"] is False
+           and "table.csv missing" in items["R-004"]["test"] and doc["resolved_by_test"] == ["R-001"],
+           f"DG2: the list drops what passed; only judged items need a critic fix check: {items}")
+        yaml.safe_dump({"reviewer": "critique-redteam", "round": 7, "blockers": [
+            {"id": "R-003", "severity": "MEDIUM", "target_stage": "MODEL", "first_seen_round": 1,
+             "claim": "passes", "resolved": False, "done_when": test}]}, open(os.path.join(d, "critique_redteam.yaml"), "w"))
+        kinds = {v["kind"] for v in _check_persistent_medium_escalation(d, round_n=7)}
+        ok("R-003_persistent" not in kinds, f"DG3: a MEDIUM whose test passes does not escalate: {kinds}")
+        json.dump({"ci95": [15, 15]}, open(os.path.join(d, "out.json"), "w"))
+        crit["critique-redteam"]["blockers"][0]["resolved"] = True
+        dec, res = _apply_done_when(decide(crit, 8, 4), crit, d, 8, 4)
+        dec = _incorporate_rigor_violations(dec, _dw.gate_findings(res), 8, 4)
+        reg = [b for b in dec["unresolved_high"] if b.get("kind") == "done_when_regressed"]
+        ok(len(reg) == 1 and "R-001" in reg[0]["claim"] and "round 3" in reg[0]["claim"]
+           and dec["action"] != "ACCEPT", f"DG4: a broken test reopens as a HIGH gate finding: {dec['unresolved_high']}")
 
     # E6: critique-blocker MEDIUM persistence below threshold → silent.
     # first_seen=4, round=6 → persisted only 2 rounds; threshold 4.
@@ -9088,6 +9167,8 @@ def main() -> int:
     decision = decide(critiques, args.max_rounds, args.current_round)
     decision = _apply_brief_scope(decision, critiques, args.run_dir,
                                   args.max_rounds, args.current_round)
+    decision, dw_result = _apply_done_when(decision, critiques, args.run_dir, args.max_rounds,
+                                           args.current_round, record=not args.no_history)
 
     if args.spec_compliance:
         spec_module = _load_spec_compliance()
@@ -9162,6 +9243,9 @@ def main() -> int:
                 ),
             })
         rigor_violations.extend(crossmodel_violations)
+        if dw_result is not None:   # Phase 34: regressions (HIGH), untested findings (MEDIUM)
+            import done_when
+            rigor_violations.extend(done_when.gate_findings(dw_result))
         if rigor_violations:
             decision = _incorporate_rigor_violations(
                 decision, rigor_violations,

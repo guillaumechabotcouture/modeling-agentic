@@ -38,6 +38,9 @@ Scenarios:
                         sign-off when the hook refuses work, end its turn with
                         AWAITING_SIGNOFF, and continue once resumed with the
                         owner's answers?
+  done_when_tests       (Phase 34) does the real red-team critic (its prompt
+                        and model, web off) write done_when tests that are
+                        valid, fail on planted problems and pass once fixed?
 """
 from __future__ import annotations
 
@@ -343,6 +346,75 @@ async def round_plan(query_fn=None):
             "tool_results": [e[2] for e in ev if e[0] == "tool_result"][:12]}
 
 
+async def done_when_tests(query_fn=None):
+    """Phase 34: does the real red-team critic (its own prompt and model) write
+    done_when tests that are valid, fail on the planted problems, and pass
+    once those are fixed? Web tools are off to keep it cheap."""
+    import tempfile
+    import yaml
+    from agents import enforcement, red_team
+    import decision_brief as db
+    import done_when as dw
+    import open_problems as op
+    run = tempfile.mkdtemp(prefix="ma_donewhen_")
+    os.makedirs(os.path.join(run, "models"))
+    open(os.path.join(run, "plan.md"), "w").write(
+        "# Plan\nQuestion: which intervention package should each of 4 districts get?\n"
+        "Budget envelope: $100M total (hard cap). Outcome: cases averted, with 95% intervals.\n"
+        "Packages: P1 nets; P2 nets + SMC; P3 nets + IRS.\n")
+    json.dump({"total_cost_usd": {"mean": 98.0, "ci95": [98.0, 98.0], "draws": 230},
+               "cases_averted_m": {"mean": 64.0, "ci95": [51.0, 77.0]}},
+              open(os.path.join(run, "models", "uq_summary.json"), "w"), indent=1)
+    open(os.path.join(run, "models", "allocation.csv"), "w").write(
+        "district,package,cost_musd\nA,P2,31\nB,P2,29\nC,P3,27\nD,P1,24\n")
+    open(os.path.join(run, "results.md"), "w").write(
+        "# Results\nThe allocation (models/allocation.csv) averts 64M cases (95% CI 51-77M) for $98M "
+        "(95% CI $98-98M over 230 draws).\n")
+    open(os.path.join(run, "summary.md"), "w").write(
+        "# Summary\nThe recommended allocation averts 64M cases and stays within the $100M budget.\n")
+    prompt = (red_team.SYSTEM_PROMPT + op.FIX_CHECK_NOTE + db.CRITIC_NOTE + dw.CRITIC_NOTE).replace("{run_dir}", run)
+    opts = _options(model=os.environ.get("SCENARIO_CRITIC_MODEL", enforcement.MODEL_DEEP),
+                    tools=["Read", "Write", "Bash", "Glob", "Grep"],
+                    allowed_tools=["Read", "Write", "Bash", "Glob", "Grep"], max_turns=30, system_prompt=prompt,
+                    cwd=run)
+    task = (f"This is critique round 1. Run directory: {run}. This is a small test run: review plan.md, "
+            "results.md, summary.md and models/. Planted issues may include a zero-width cost interval, a "
+            "Summary that drops the cases interval, and a cost total close to the cap with no interval. Write "
+            f"{run}/critique_redteam.yaml (reviewer: critique-redteam, round: 1, verdict, blockers, "
+            "carried_forward: [], structural_mismatch: {detected: false}). No decision_brief.yaml exists, so "
+            "use brief_item: GAP. Keep it to the real problems.")
+    sid, result, err, _, ev = await _converse(task, opts, query_fn=query_fn)
+    path = os.path.join(run, "critique_redteam.yaml")
+    try:
+        doc = yaml.safe_load(open(path)) or {}
+    except (OSError, yaml.YAMLError) as e:
+        return {"result": _summ(result), "error": err or f"no critique: {e}"}
+    found = [b for b in doc.get("blockers") or [] if isinstance(b, dict) and b.get("severity") in ("HIGH", "MEDIUM")]
+    before = {b["id"]: dw.evaluate(b.get("done_when"), run) for b in found}
+    # The planted fixes: a real interval, the interval in the Summary.
+    j = json.load(open(os.path.join(run, "models", "uq_summary.json")))
+    j["total_cost_usd"]["ci95"] = [91.0, 104.0]
+    json.dump(j, open(os.path.join(run, "models", "uq_summary.json"), "w"), indent=1)
+    open(os.path.join(run, "results.md"), "w").write(
+        "# Results\nThe allocation (models/allocation.csv) averts 64M cases (95% CI 51-77M) for $98M "
+        "(95% CI $91-104M over 230 draws); the upper bound exceeds the $100M cap in 38% of draws.\n")
+    open(os.path.join(run, "summary.md"), "w").write(
+        "# Summary\nThe recommended allocation averts 64M cases (95% CI 51-77M) for $98M (95% CI $91-104M); "
+        "in 38% of draws it would exceed the $100M budget.\n")
+    after = {b["id"]: dw.evaluate(b.get("done_when"), run) for b in found}
+    rows = [{"id": b["id"], "severity": b["severity"], "claim": str(b.get("claim"))[:160],
+             "done_when": b.get("done_when"), "problems": dw.problems(b.get("done_when")) if b.get("done_when") else ["missing"],
+             "mechanical": dw.mechanical(b.get("done_when")),
+             "before": before[b["id"]][0], "after": after[b["id"]][0], "after_detail": after[b["id"]][1][:200]}
+            for b in found]
+    mech = [r for r in rows if r["mechanical"]]
+    return {"result": _summ(result), "error": err, "run": run, "findings": len(rows),
+            "with_valid_test": sum(1 for r in rows if not r["problems"]), "mechanical": len(mech),
+            "fail_before": sum(1 for r in mech if r["before"] is False),
+            "pass_after_fix": sum(1 for r in mech if r["after"] is True),
+            "trivial_pass_before": [r["id"] for r in mech if r["before"] is True], "rows": rows}
+
+
 async def brief_signoff(query_fn=None):
     """Phase 33: the sign-off pause with a real lead. A planner stand-in writes
     a valid brief; the lead must stop (owner mode), then continue after the
@@ -397,7 +469,8 @@ async def brief_signoff(query_fn=None):
 
 SCENARIOS = {"resume_cumulative": resume_cumulative, "readback_after_crash": readback_after_crash,
              "crash_before_init": crash_before_init, "budget_cap": budget_cap, "hook_context": hook_context,
-             "cache_ttl": cache_ttl, "round_plan": round_plan, "brief_signoff": brief_signoff}
+             "cache_ttl": cache_ttl, "round_plan": round_plan, "brief_signoff": brief_signoff,
+             "done_when_tests": done_when_tests}
 
 
 def run(names: list[str]) -> dict:

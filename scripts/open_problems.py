@@ -131,6 +131,8 @@ def build(run_dir: str, round_n: int, max_rounds: int, critiques: dict,
     written = any(os.path.exists(os.path.join(run_dir, f)) for f in ("report.md", "manuscript.md"))
     items: dict[str, dict] = {}
     outside = set((decision or {}).get("outside_brief") or ())  # Phase 33: notes, not work
+    outside |= set((decision or {}).get("resolved_by_test") or ())  # Phase 34: its test passes
+    tests = (decision or {}).get("done_when_status") or {}
     for reviewer, doc in (critiques or {}).items():
         notes = {e.get("id"): e.get("notes") for e in (doc or {}).get("carried_forward") or []
                  if isinstance(e, dict)}
@@ -152,9 +154,11 @@ def build(run_dir: str, round_n: int, max_rounds: int, critiques: dict,
                 "id": b["id"], "source": reviewer, "severity": sev, "target_stage": stage,
                 "category": b.get("category"), "first_seen_round": first,
                 "blocks_in": blocks_in, "scope_declarable": True,
-                "fix_check": reviewer in FIX_CHECK_CRITICS,
+                # Phase 34: a runnable test is checked by the gate, not by a critic.
+                "fix_check": reviewer in FIX_CHECK_CRITICS and not (tests.get(b["id"]) or {}).get("mechanical"),
                 "claim": _short(b.get("claim")), "fix_requires": _short(b.get("fix_requires")),
                 "status": _short(notes.get(b["id"]), 200),
+                "test": _short((tests.get(b["id"]) or {}).get("detail") or "no done_when test", 200),
             }
     # Gate findings are grouped by kind (one item per kind, its RIG/REG/OBJ ids
     # listed), so 26 stale figures are one thing to plan, not 26.
@@ -209,7 +213,8 @@ def build(run_dir: str, round_n: int, max_rounds: int, critiques: dict,
     order = sorted(items.values(), key=lambda i: (
         99 if i["blocks_in"] is None else i["blocks_in"], i["severity"] != "HIGH", i["id"]))
     return {"round": round_n, "max_rounds": max_rounds, "generated_by": "scripts/open_problems.py",
-            "items": order, "outside_brief": sorted(outside)}
+            "items": order, "outside_brief": sorted(set((decision or {}).get("outside_brief") or ())),
+            "resolved_by_test": sorted((decision or {}).get("resolved_by_test") or ())}
 
 
 def render_md(doc: dict) -> str:
@@ -226,15 +231,20 @@ def render_md(doc: dict) -> str:
            "be fixed: declaring in round 1-2 keeps the rounds for what can.", "",
            *([f"Outside the decision brief (notes for the next run, not work for this one): "
               f"{', '.join(doc['outside_brief'])}.", ""] if doc.get("outside_brief") else []),
-           "| id | from | severity | stage | open since | blocks in | latest status | fix needs |",
-           "|---|---|---|---|---|---|---|---|"]
+           *([f"Closed by their done_when tests this gate: {', '.join(doc['resolved_by_test'])}.", ""]
+             if doc.get("resolved_by_test") else []),
+           "Each critic finding's `done_when` test is shown as it stands now; it is fixed when the test "
+           "passes (`python3 scripts/done_when.py check <run_dir> <ID>`).", "",
+           "| id | from | severity | stage | open since | blocks in | latest status | fix needs | test now |",
+           "|---|---|---|---|---|---|---|---|---|"]
     for i in items:
         b = "now" if i["blocks_in"] == 0 else ("after write-up" if i["blocks_in"] is None
                                                else f"{i['blocks_in']} round(s)")
         cell = lambda s: str(s or "").replace("|", "/")  # noqa: E731
         out.append(f"| {i['id']} | {i['source']} | {i['severity']} | {i['target_stage']} | "
                    f"{'r' + str(i['first_seen_round']) if i.get('first_seen_round') else '-'} | {b} | "
-                   f"{cell(i.get('status') or i['claim'])} | {cell(i.get('fix_requires'))} |")
+                   f"{cell(i.get('status') or i['claim'])} | {cell(i.get('fix_requires'))} | "
+                   f"{cell(i.get('test') or '-')} |")
     return "\n".join(out) + "\n"
 
 
