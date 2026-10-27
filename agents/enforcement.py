@@ -590,8 +590,12 @@ def _harness_chmod(command: str, cwd: str | None = None) -> bool:
     if not mentions:
         return False
     old_rule = bool(_HARNESS_WORDS.search(command))
+    segs = iter_segments_with_cwd(command, cwd)
+    # Any directory change makes a relative operand's directory uncertain (a
+    # `cd` may never run, `false && cd x`): relative operands then get the old rule.
+    moves = any((_tokens(sg) or [""])[0] in ("cd", "pushd", "popd") for sg, _ in segs)
     plain = 0
-    for seg, scwd in iter_segments_with_cwd(command, cwd):
+    for seg, scwd in segs:
         if not _CHMOD.search(seg):
             continue
         toks = _tokens(seg.strip().lstrip("({").strip())
@@ -607,12 +611,11 @@ def _harness_chmod(command: str, cwd: str | None = None) -> bool:
             if any(c in op for c in "$`*?[{~"):
                 return old_rule           # expansion or glob: cannot know the target
             rel_op = not os.path.isabs(os.path.expanduser(op.strip("'\"")))
+            if rel_op and moves:
+                return old_rule           # the command changes directory: the old rule
             if rel_op and _HARNESS_WORDS.search(" " + op):
-                return True               # names harness code (a tracked `cd` may never have run)
-            # A relative operand is placed against every directory the shell may
-            # be in: the tracked one (a `cd` that never runs, `false && cd x`,
-            # cannot be told apart), the call's own cwd and the repo root.
-            bases = {scwd, cwd, REPO_ROOT} if rel_op else {None}
+                return True               # names harness code
+            bases = {cwd or REPO_ROOT} if rel_op else {None}
             for b in bases:
                 if is_harness_path(op, b) or \
                         os.path.relpath(REPO_ROOT, _abspath(op, b)).split(os.sep)[0] != "..":
