@@ -1107,12 +1107,15 @@ def _live_reservations(led) -> float:
 def map_fn(run_dir: str, fn_spec: str, inputs: list, backend: str = "auto",
            max_workers: int | None = None, max_tasks: int = DEFAULT_MAX_TASKS,
            timeout_s: float | None = None, ledger: bool = True,
-           max_core_hours: float | None = None, prior_ok: int = 0) -> tuple[list[dict], dict]:
+           max_core_hours: float | None = None, prior_ok: int = 0, purpose: str | None = None,
+           out: str | None = None) -> tuple[list[dict], dict]:
     """Evaluate fn over inputs. Under the ledger, the call first reserves its
     allowance (`max_core_hours`, default MA_COMPUTE_CALL_CORE_HOURS = 50,
     never more than the run has left) and stops when it is used up;
     unfinished rows fail with "stopped: compute cap reached" or "timed out".
-    A call that is interrupted is charged an upper bound of what it used."""
+    A call that is interrupted is charged an upper bound of what it used.
+    `purpose` (the finding IDs or plan item the batch serves) and `out` are
+    recorded with the call, so core-hours can be reported per finding."""
     run_dir = os.path.realpath(run_dir)
     if len(inputs) > max_tasks:
         raise ValueError(f"{len(inputs)} tasks exceeds --max-tasks {max_tasks}")
@@ -1175,6 +1178,7 @@ def map_fn(run_dir: str, fn_spec: str, inputs: list, backend: str = "auto",
                 led["reservations"].pop(rid, None)
                 led["core_seconds"] = round(led["core_seconds"] + used, 1)
                 led["calls"].append({"fn": fn_spec, "backend": backend, "task_core_s": round(used, 1),
+                                     "n": len(inputs), "n_failed": len(inputs), "purpose": purpose, "out": out,
                                      "stopped": f"interrupted: {type(e).__name__}", "ts": time.strftime("%FT%T")})
         raise
     failed_by = {}
@@ -1196,7 +1200,7 @@ def map_fn(run_dir: str, fn_spec: str, inputs: list, backend: str = "auto",
         led["calls"].append({k: summary.get(k) for k in ("backend", "workers", "n", "n_failed", "failed_by_kind",
                                                          "wall_s", "task_core_s", "estimated_core_s", "model_s",
                                                          "stopped", "breaks", "procs_final", "peak_mb")}
-                            | {"fn": fn_spec, "ts": time.strftime("%FT%T")})
+                            | {"fn": fn_spec, "purpose": purpose, "out": out, "ts": time.strftime("%FT%T")})
         if summary.get("peak_mb"):
             led.setdefault("mem_profile", {})[fn_spec] = {"peak_mb": summary["peak_mb"], "ts": time.strftime("%FT%T")}
     return rows, summary
@@ -1298,6 +1302,7 @@ def run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dict
     function, same code and data, same params) are kept and only the rest is
     computed, so rerunning a stopped or partly failed batch completes it.
     Writes --out and its summary; returns (rows, summary)."""
+    rel_out = os.path.relpath(os.path.realpath(out), os.path.realpath(run_dir))
     fp = code_fingerprint(run_dir, fn_spec, exclude=(out, out + ".tmp", out + ".summary.json",
                                                      out + ".summary.json.tmp"))
     keys = input_keys(inputs)
@@ -1305,7 +1310,7 @@ def run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dict
     todo = [k for k, key in enumerate(keys) if key not in old]
     if todo:
         new_rows, summary = map_fn(run_dir, fn_spec, [inputs[k] for k in todo],
-                                   prior_ok=len(inputs) - len(todo), **kw)
+                                   prior_ok=len(inputs) - len(todo), out=rel_out, **kw)
     else:
         new_rows, summary = [], {"n": 0, "n_ok": 0, "n_failed": 0, "failed_by_kind": {}, "wall_s": 0.0,
                                  "task_core_s": 0.0, "stopped": None}
@@ -1322,7 +1327,7 @@ def run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dict
     summary = {**summary, "n": len(rows), "n_ok": sum(r["ok"] for r in rows),
                "n_failed": sum(not r["ok"] for r in rows), "failed_by_kind": failed_by,
                "computed": len(todo), "reused": len(rows) - len(todo),
-               "fn": fn_spec, "code_fp": fp, "out": os.path.relpath(os.path.realpath(out), os.path.realpath(run_dir))}
+               "fn": fn_spec, "code_fp": fp, "out": rel_out, "purpose": kw.get("purpose")}
     tmp = out + ".tmp"
     with open(tmp, "w") as f:
         for r in rows:
@@ -1884,11 +1889,54 @@ def _self_test() -> int:
                 for pr in procs_:
                     pr.wait(10)
     _self_test_p35(ok)
+    _self_test_p37(ok)
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_p37(ok) -> None:
+    """Phase 37: each batch records what it is for."""
+    import subprocess as _sp
+    import tempfile
+    global _map_local
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        open(os.path.join(d, "models", "fn.py"), "w").write("def f(p):\n    return {'y': p['x'] * 2}\n")
+        inp = os.path.join(d, "models", "in.jsonl")
+        open(inp, "w").write("".join(json.dumps({"x": k}) + "\n" for k in range(3)))
+        out = os.path.join(d, "models", "out.jsonl")
+        base = [sys.executable, os.path.abspath(__file__), "map", d, "--fn", "models/fn.py::f", "--inputs", inp,
+                "--out", out, "--backend", "local", "--max-workers", "1"]
+        env = {k: v for k, v in os.environ.items() if k != "MA_COMPUTE_SCHEDULER"}
+        r = _sp.run(base + ["--purpose", "  "], capture_output=True, text=True, env=env, timeout=120)
+        ok(r.returncode == 2 and "--purpose is required" in r.stderr and not os.path.exists(out)
+           and not os.path.exists(os.path.join(d, LEDGER_REL)),
+           f"P37-1 a batch without a purpose is refused before any work: {r.returncode} {r.stderr[-200:]}")
+        r = _sp.run(base + ["--purpose", "D-019, R-021"], capture_output=True, text=True, env=env, timeout=120)
+        led = json.load(open(os.path.join(d, LEDGER_REL))) if os.path.exists(os.path.join(d, LEDGER_REL)) else {}
+        call = (led.get("calls") or [{}])[-1]
+        summ = json.load(open(out + ".summary.json")) if os.path.exists(out + ".summary.json") else {}
+        ok(r.returncode == 0 and call.get("purpose") == "D-019, R-021" and call.get("out") == "models/out.jsonl"
+           and summ.get("purpose") == "D-019, R-021",
+           f"P37-2 the purpose and results file are recorded with the call and its summary: {call} {r.stderr[-300:]}")
+        saved = _map_local
+
+        def _boom(*a, **k):
+            raise KeyboardInterrupt
+        _map_local = _boom
+        try:
+            map_fn(d, "models/fn.py::f", [{"x": 1}, {"x": 2}], backend="local", purpose="P-009", out="models/o2.jsonl")
+        except KeyboardInterrupt:
+            pass
+        finally:
+            _map_local = saved
+        call = json.load(open(os.path.join(d, LEDGER_REL)))["calls"][-1]
+        ok(call.get("purpose") == "P-009" and call.get("n") == 2 and call.get("n_failed") == 2
+           and str(call.get("stopped", "")).startswith("interrupted"),
+           f"P37-3 an interrupted call keeps its purpose and counts its rows as failed: {call}")
 
 
 def _self_test_p35(ok) -> None:
@@ -2122,6 +2170,9 @@ def main() -> int:
     ap.add_argument("--timeout-s", type=float)
     ap.add_argument("--max-core-hours", type=float,
                     help="this call's allowance (default MA_COMPUTE_CALL_CORE_HOURS=50, within the run cap)")
+    ap.add_argument("--purpose",
+                    help="what this batch is for: the finding IDs it addresses (e.g. 'D-019, R-021') or the "
+                         "plan item (e.g. 'plan: impact library'); recorded in the compute ledger")
     ap.add_argument("--fresh", action="store_true",
                     help="recompute every row (default: keep rows of an earlier run of the same command and code)")
     ap.add_argument("--no-ledger", action="store_true", help=argparse.SUPPRESS)
@@ -2147,7 +2198,11 @@ def main() -> int:
     for k in ("MA_COMPUTE_GATE", "MA_COMPUTE_CANCEL"):
         os.environ.pop(k, None)           # never inherited by the model's own subprocesses
     if a.cmd != "map" or not (a.run_dir and a.fn and a.inputs and a.out):
-        ap.error("usage: compute.py map <run_dir> --fn <path.py>::<fn> --inputs <jsonl> --out <jsonl>")
+        ap.error("usage: compute.py map <run_dir> --fn <path.py>::<fn> --inputs <jsonl> --out <jsonl> --purpose <ids>")
+    if not a.no_ledger and not (a.purpose or "").strip():
+        ap.error("--purpose is required: name the finding IDs this batch addresses (e.g. --purpose 'D-019') "
+                 "or the plan item it serves (e.g. --purpose 'plan: impact library'). It is recorded with the "
+                 "batch's core-hours in models/compute_ledger.json.")
     if a.no_ledger:   # a remote chunk: plain map, no reuse (the caller already chose the rows)
         rows, summary = map_fn(a.run_dir, a.fn, _read_inputs(a.inputs), a.backend, a.max_workers,
                                a.max_tasks, a.timeout_s, ledger=False, max_core_hours=a.max_core_hours)
@@ -2158,7 +2213,7 @@ def main() -> int:
     else:
         rows, summary = run_map(a.run_dir, a.fn, _read_inputs(a.inputs), a.out, fresh=a.fresh,
                                 backend=a.backend, max_workers=a.max_workers, max_tasks=a.max_tasks,
-                                timeout_s=a.timeout_s, max_core_hours=a.max_core_hours)
+                                timeout_s=a.timeout_s, max_core_hours=a.max_core_hours, purpose=a.purpose.strip())
     print(json.dumps({k: v for k, v in summary.items() if k not in ("bundle", "chunks")}))
     return 0 if summary["n_failed"] == 0 else 1
 

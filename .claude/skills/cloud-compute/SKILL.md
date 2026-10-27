@@ -16,8 +16,15 @@ description: >-
 
 ```bash
 python3 scripts/compute.py map {run_dir} --fn models/<module>.py::<fn> \
-    --inputs {run_dir}/models/<batch>_inputs.jsonl --out {run_dir}/models/<batch>_results.jsonl
+    --inputs {run_dir}/models/<batch>_inputs.jsonl --out {run_dir}/models/<batch>_results.jsonl \
+    --purpose "<finding IDs, or 'plan: <item>'>"
 ```
+
+- **`--purpose` is required.** Name the critique finding IDs the batch
+  addresses (`"D-019, R-021"`) or the plan item it serves
+  (`"plan: calibration grid"`). It is stored with the call in
+  `models/compute_ledger.json`, and `scripts/convergence_report.py` reports
+  core-hours per purpose and per finding, with the share lost to failed rows.
 
 - `<fn>(params: dict) -> dict` evaluates ONE parameter set. Keep it
   deterministic given its params (put seeds in the params).

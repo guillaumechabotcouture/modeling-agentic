@@ -16,6 +16,7 @@ import collections
 import glob
 import json
 import os
+import re
 import sys
 import tempfile
 
@@ -23,6 +24,7 @@ import yaml
 
 CRITIC_FILES = ("critique_methods.yaml", "critique_domain.yaml", "critique_presentation.yaml",
                 "critique_redteam.yaml")
+FINDING_ID = re.compile(r"\b[A-Z]{1,4}-\d{1,4}\b")
 HOLD_KINDS = (("round plan", "write round_plan.yaml"), ("plan changed", "stays that way this round"),
               ("plan handed out", "handed to the agent that does it"), ("fix check", "fix check after round"),
               ("send back", "back to its agent once"), ("still working", "still working"),
@@ -61,7 +63,7 @@ def report(run_dir: str) -> dict:
                                  "open_blocking": len(r.get("findings") or [])}   # the gate's recorded findings
     out["gates"] = {k: gates[k] for k in sorted(gates, key=lambda x: (x is None, x))}
     # Findings: arrivals per round, resolution, rounds to resolve.
-    arrivals, closed, ages, still_open = collections.Counter(), 0, [], []
+    arrivals, closed, ages, still_open, state = collections.Counter(), 0, [], [], {}
     for f in CRITIC_FILES:
         try:
             doc = yaml.safe_load(open(os.path.join(run_dir, f))) or {}
@@ -72,6 +74,7 @@ def report(run_dir: str) -> dict:
                 continue
             first = b.get("first_seen_round")
             arrivals[first] += 1
+            state[str(b.get("id"))] = b.get("resolved_in_round") if b.get("resolved") is True else None
             if b.get("resolved") is True:
                 closed += 1
                 if isinstance(b.get("resolved_in_round"), int) and isinstance(first, int):
@@ -122,11 +125,40 @@ def report(run_dir: str) -> dict:
                       "unrun_share": round(unrun / total, 3) if total else None,
                       "failed_share": round(failed / total, 3) if total else None,
                       "failed_by_kind": dict(by_kind), "pool_breaks": sum(int(c.get("breaks") or 0) for c in calls),
-                      "last_call": calls[-1].get("ts") if calls else None}
+                      "last_call": calls[-1].get("ts") if calls else None,
+                      **_compute_by_purpose(calls, state)}
     bl = _json(os.path.join(run_dir, "budget_ledger.json"), {}) or {}
     out["spend_usd"] = bl.get("spent_usd")
     out["cap_usd"] = bl.get("cap_usd")
     return out
+
+
+def _compute_by_purpose(calls, state) -> dict:
+    """Phase 37: what the compute bought. Core-hours per stated purpose, the
+    share lost to failed rows (estimated pro rata: every failed row is charged
+    its call's mean cost, including rows stopped before they started, so the
+    loss is over- rather than under-stated), and per finding ID named in a purpose whether that
+    finding has since been resolved. Batches before Phase 37 are 'unstated'."""
+    by, per_id = {}, {}
+    for c in calls:
+        p = str(c.get("purpose") or "").strip() or "unstated"
+        n, nf = int(c.get("n") or 0), int(c.get("n_failed") or 0)
+        h = float(c.get("task_core_s") or 0) / 3600
+        e = by.setdefault(p, {"calls": 0, "core_hours": 0.0, "lost_core_hours": 0.0, "rows": 0, "failed": 0})
+        e["calls"] += 1
+        e["core_hours"] += h
+        e["lost_core_hours"] += h * nf / n if n else h
+        e["rows"] += n
+        e["failed"] += nf
+        ids = sorted(set(FINDING_ID.findall(p)))
+        for i in ids:      # a batch serving several findings is split evenly between them
+            per_id[i] = per_id.get(i, 0.0) + h / len(ids)
+    for e in by.values():
+        e["core_hours"], e["lost_core_hours"] = round(e["core_hours"], 1), round(e["lost_core_hours"], 1)
+    findings = {i: {"core_hours": round(h, 1), "resolved_in_round": state.get(i),
+                    "known": i in state} for i, h in sorted(per_id.items(), key=lambda kv: -kv[1])}
+    return {"by_purpose": dict(sorted(by.items(), key=lambda kv: -kv[1]["core_hours"])), "by_finding": findings,
+            "lost_core_hours": round(sum(e["lost_core_hours"] for e in by.values()), 1)}
 
 
 def render(r: dict) -> str:
@@ -144,6 +176,16 @@ def render(r: dict) -> str:
     lines.append(f"Compute: {c['calls']} calls, {c['core_hours']} core-hours, {c['stopped_calls']} stopped, "
                  f"unrun share {c['unrun_share']}, failed share {c['failed_share']} {c['failed_by_kind']}, "
                  f"pool breaks healed {c['pool_breaks']}, last call {c['last_call']}")
+    if c.get("by_purpose"):
+        lines.append(f"Compute by purpose (core-hours, of which lost to failed rows, est.; {c['lost_core_hours']} lost in all):")
+        for p, e in c["by_purpose"].items():
+            lines.append(f"  - {p}: {e['core_hours']} ({e['lost_core_hours']} lost), {e['calls']} calls, "
+                         f"{e['failed']}/{e['rows']} rows failed")
+    if c.get("by_finding"):
+        lines.append("Compute by finding: " + ", ".join(
+            f"{i} {e['core_hours']} h " + (f"(resolved r{e['resolved_in_round']})" if e["resolved_in_round"] is not None
+                                           else "(open)" if e["known"] else "(not in critiques)")
+            for i, e in c["by_finding"].items()))
     lines.append(f"Spend: ${r['spend_usd']} of ${r['cap_usd']}")
     return "\n".join(lines) + "\n"
 
@@ -179,6 +221,9 @@ def _self_test() -> int:
         json.dump({"core_seconds": 7200, "calls": [{"n": 10, "n_failed": 4, "stopped": "timed out", "ts": "t1"},
                                                    {"n": 10, "n_failed": 0, "stopped": None, "ts": "t2"}]},
                   open(os.path.join(d, "models", "compute_ledger.json"), "w"))
+        r0 = report(d)
+        ok(list(r0["compute"]["by_purpose"]) == ["unstated"] and r0["compute"]["by_finding"] == {},
+           f"CV8 batches without a purpose are reported as unstated: {r0['compute']}")
         json.dump({"spent_usd": 12.5, "cap_usd": 450}, open(os.path.join(d, "budget_ledger.json"), "w"))
         r = report(d)
         ok(r["gates"] == {1: {"action": "PATCH_OR_RETHINK", "open_blocking": 5},
@@ -195,6 +240,27 @@ def _self_test() -> int:
            f"CV5 compute: {r['compute']}")
         ok("r1 5" in render(r) and "Spend: $12.5 of $450" in render(r), "CV6 rendering")
         ok(report(os.path.join(d, "nope"))["gates"] == {}, "CV7 an empty or missing run reports nothing, not a crash")
+        json.dump({"core_seconds": 7200, "calls": [
+            {"n": 10, "n_failed": 4, "stopped": "timed out", "ts": "t1", "task_core_s": 3600,
+             "failed_by_kind": {"stopped": 4}, "purpose": "plan: impact library"},
+            {"n": 10, "n_failed": 5, "stopped": None, "ts": "t2", "task_core_s": 3600,
+             "failed_by_kind": {"infra": 5}, "purpose": "R-1, R-2"},
+            {"n": 10, "n_failed": 0, "stopped": None, "ts": "t3", "task_core_s": 1800, "purpose": "R-1 retry"},
+            {"n": 4, "n_failed": 4, "stopped": "interrupted: KeyboardInterrupt", "ts": "t4", "task_core_s": 360,
+             "purpose": "Z-9"}]},
+                  open(os.path.join(d, "models", "compute_ledger.json"), "w"))
+        r2 = report(d)
+        bp, bf = r2["compute"]["by_purpose"], r2["compute"]["by_finding"]
+        ok(bp["plan: impact library"]["lost_core_hours"] == 0.4 and bp["R-1, R-2"]["lost_core_hours"] == 0.5
+           and bp["Z-9"]["lost_core_hours"] == 0.1 and r2["compute"]["lost_core_hours"] == 1.0
+           and list(bp)[0] == "plan: impact library",
+           f"CV9 failed rows are charged pro rata, whatever their kind; largest purpose first: {bp}")
+        ok(bf["R-1"] == {"core_hours": 1.0, "resolved_in_round": 2, "known": True}
+           and bf["R-2"] == {"core_hours": 0.5, "resolved_in_round": None, "known": True}
+           and bf["Z-9"]["known"] is False,
+           f"CV10 core-hours per finding, split across the findings a batch names, joined to resolution: {bf}")
+        ok("R-1 1.0 h (resolved r2)" in render(r2) and "Z-9 0.1 h (not in critiques)" in render(r2),
+           f"CV11 rendering by finding: {render(r2)}")
     if fails:
         print("SELF-TEST FAILURES:")
         for f in fails:

@@ -146,8 +146,16 @@ sets to a JSONL file (one dict per line) and run:
 
 ```bash
 python3 scripts/compute.py map {run_dir} --fn models/<module>.py::<fn> \
-    --inputs {run_dir}/models/<batch>_inputs.jsonl --out {run_dir}/models/<batch>_results.jsonl
+    --inputs {run_dir}/models/<batch>_inputs.jsonl --out {run_dir}/models/<batch>_results.jsonl \
+    --purpose "<finding IDs, e.g. D-019>"
 ```
+
+`--purpose` names what the batch is for: the critique finding IDs it
+addresses, or the plan item for first-round work (`"plan: impact library"`).
+It is recorded with the batch's core-hours, and the run's convergence report
+shows core-hours per finding. Before a large batch, check that it can move the
+finding: if the open question is an evidence or assumption choice, more
+simulation will not resolve it.
 
 `<fn>(params: dict) -> dict` runs ONE evaluation. The service fans the batch
 out across the run's compute workers on Coiled (a local process pool
