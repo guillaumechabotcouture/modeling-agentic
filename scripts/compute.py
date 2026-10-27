@@ -318,7 +318,7 @@ def _group_alive(pgid, direct=False) -> bool:
 
 
 def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s=None, progress=None,
-               peak_mb=None):
+               peak_mb=None, prior_ok=0):
     """Always a fresh spawn pool, even for one worker: the model's sibling
     modules and its chdir never leak into the caller or across runs.
 
@@ -357,7 +357,9 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
     todo = list(enumerate(inputs))
     running, rows, stop, lost, pids, breaks, seen_peak = {}, [], None, 0, set(), 0, 0.0
     alone = {}                                     # input -> times its process died with the pool at one process
-    prior_ok = int(os.environ.get("MA_COMPUTE_PRIOR_OK") or 0)   # successes elsewhere in the batch (dask chunks)
+    shrink = False
+    # successes elsewhere in the batch (other dask chunks, rows reused on resume)
+    prior_ok = int(prior_ok or 0) + int(os.environ.get("MA_COMPUTE_PRIOR_OK") or 0)
 
     def rebudget():
         # Fewer processes burn the allowance more slowly: move the cap's wall-clock stop.
@@ -368,8 +370,12 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
     try:
         while todo or running:
             broke = False
+            if shrink and not running:            # idle processes keep their memory: rebuild at the new size
+                ex.shutdown(wait=True)
+                _kill_groups(pids, grace_s=0, direct=False)
+                ex, shrink = new_pool(cap), False
             try:
-                while todo and len(running) < cap:
+                while todo and len(running) < cap and not shrink:
                     f = ex.submit(_local_chunk, [todo[0]])
                     running[f] = (todo.pop(0), time.time())
             except BrokenProcessPool:             # a process died between a result and the next submission
@@ -439,9 +445,10 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
                     todo = [it for it, _ in crashed] + todo
                     cap = max(1, cap // 2)
                 rebudget()
-                ex = new_pool(cap)
+                ex, shrink = new_pool(cap), False
             if seen_peak and _mem_slots(seen_peak, avail, n) < cap:
                 cap = _mem_slots(seen_peak, avail, n)
+                shrink = True                     # drain, then rebuild the pool at `cap` processes
                 rebudget()
             if todo or running:
                 reason = _breaker(rows, prior_ok=prior_ok)
@@ -632,7 +639,7 @@ def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: lis
                 cmd += ["--timeout-s", f"{left:.1f}"]
             hard = None if left is None else left + 60
             if chunk_allowance_s is not None:
-                b = chunk_allowance_s / max(1, min(procs, len(chunk))) + 60
+                b = chunk_allowance_s + 60     # backstop only: memory may leave a single process running
                 hard = b if hard is None else min(hard, b)
             # Own session: on a hard stop or a cancel the chunk is signalled as a
             # group; its SIGTERM handler kills its pool's groups.
@@ -802,7 +809,7 @@ def _security():
 
 
 def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadline=None, allowance_s=None,
-              progress=None, peak_mb=None):
+              progress=None, peak_mb=None, prior_ok=0):
     """The allowance is split over the chunks that can run at once; each chunk
     enforces its share from when it starts (queueing behind other calls on a
     shared pool does not count). Whenever the call ends with chunks still
@@ -873,7 +880,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
             # charged), rather than through dask retries, which would hide it.
             f = c.submit(_remote_task, bfut, binfo["sha256"], run_dir, fn_spec, ch, deadline,
                          procs_for(override), share, call_id, REPO, learned["peak"],
-                         sum(1 for r in rows if r.get("ok")), pure=False, **placement)
+                         prior_ok + sum(1 for r in rows if r.get("ok")), pure=False, **placement)
             futs[f] = (ch, attempt, procs_for(override))
             held[f] = share or 0.0
             started[f] = time.time()
@@ -921,6 +928,14 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                                 {"n": len(ch), "attempt": attempt, "error": got["rows"][0]["error"][:200],
                                  "core_s": round(float(got["core_s"]), 1), "retried_with_procs": learned["procs"]})
                             continue
+                        tail = [r for r in got["rows"] if r.get("kind") == STOPPED
+                                and str(r.get("error", "")).startswith("stopped: the same model error")]
+                        if tail and attempt == 0 and _breaker(rows + got["rows"], prior_ok=prior_ok) is None:
+                            # The chunk saw only its own rows: the batch as a whole does not
+                            # confirm the repeat, so its stopped inputs run again (once).
+                            got["rows"] = [r for r in got["rows"] if r not in tail]
+                            ids = {r["i"] for r in tail}
+                            queue.append(([it for it in ch if it[0] in ids], 1, used))
                         rows += got["rows"]
                         progress["core_s"] += float(got["core_s"])
                         progress.setdefault("chunks", []).append(
@@ -950,7 +965,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                             continue
                         rows += [{"i": i, "ok": False, "kind": INFRA, "error": errors[i]} for i, _ in ch]
                 if (pending or queue) and not stop:
-                    stop = _breaker(rows)
+                    stop = _breaker(rows, prior_ok=prior_ok)
                     if stop:
                         break
                 if (pending or queue) and allowance_s is not None and progress["core_s"] >= allowance_s:
@@ -1072,7 +1087,7 @@ def _live_reservations(led) -> float:
 def map_fn(run_dir: str, fn_spec: str, inputs: list, backend: str = "auto",
            max_workers: int | None = None, max_tasks: int = DEFAULT_MAX_TASKS,
            timeout_s: float | None = None, ledger: bool = True,
-           max_core_hours: float | None = None) -> tuple[list[dict], dict]:
+           max_core_hours: float | None = None, prior_ok: int = 0) -> tuple[list[dict], dict]:
     """Evaluate fn over inputs. Under the ledger, the call first reserves its
     allowance (`max_core_hours`, default MA_COMPUTE_CALL_CORE_HOURS = 50,
     never more than the run has left) and stops when it is used up;
@@ -1112,10 +1127,10 @@ def map_fn(run_dir: str, fn_spec: str, inputs: list, backend: str = "auto",
     try:
         if backend == "dask":
             rows, info = _map_dask(run_dir, fn_spec, inputs, max_workers, deadline=deadline,
-                                   allowance_s=allowance_s, progress=progress, peak_mb=hint)
+                                   allowance_s=allowance_s, progress=progress, peak_mb=hint, prior_ok=prior_ok)
         else:
             rows, info = _map_local(run_dir, fn_spec, inputs, max_workers, deadline=deadline,
-                                    allowance_s=allowance_s, progress=progress, peak_mb=hint)
+                                    allowance_s=allowance_s, progress=progress, peak_mb=hint, prior_ok=prior_ok)
         done = {r["i"] for r in rows}
         why = info.get("stopped") or "timed out"
         rows += [{"i": i, "ok": False, "kind": STOPPED, "error": why} for i in range(len(inputs)) if i not in done]
@@ -1176,12 +1191,14 @@ _FP_SKIP_EXT = (".log", ".out", ".err", ".png", ".pdf", ".svg", ".jpg", ".jpeg",
 _FP_HASH_MB = 64           # files up to this size are fingerprinted by content, larger ones by size and mtime
 
 
-def code_fingerprint(run_dir: str, fn_spec: str, exclude=()) -> str:
+def code_fingerprint(run_dir: str, fn_spec: str, exclude=(), outputs: bool = True) -> str:
     """What a result depends on besides its params: every file under the run's
     models/ and data/ (following symlinked directories) and the repo's
-    scripts/, except logs, figures and compute outputs (results files with a
-    summary, the ledger); files up to 64 MB by content, larger ones by size
-    and mtime. Any change and earlier rows are not reused."""
+    scripts/, except logs, figures, summaries, the ledger and this call's own
+    results file (`exclude`); files up to 64 MB by content, larger ones by
+    size and mtime. Any change and earlier rows are not reused. With
+    outputs=False, other calls' results files are left out too (the gate
+    compares calls by their sources only)."""
     run_dir = os.path.realpath(run_dir)
     h = hashlib.sha256()
     path = fn_spec.partition("::")[0]
@@ -1199,8 +1216,9 @@ def code_fingerprint(run_dir: str, fn_spec: str, exclude=()) -> str:
             dirs[:] = sorted(d for d in dirs if d not in ("__pycache__", ".git", "_truth"))
             names = set(fns)
             for fn in fns:
-                if fn.endswith(_FP_SKIP_EXT) or fn.endswith(".summary.json") or fn + ".summary.json" in names \
-                        or fn.startswith("compute_ledger.json"):
+                if fn.endswith(_FP_SKIP_EXT) or fn.endswith(".summary.json") or fn.startswith("compute_ledger.json"):
+                    continue          # other calls' results files ARE included: a model may read them
+                if not outputs and fn + ".summary.json" in names:
                     continue
                 files.add(os.path.join(dp, fn))
     for f in sorted(files):
@@ -1251,12 +1269,13 @@ def run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dict
     function, same code and data, same params) are kept and only the rest is
     computed, so rerunning a stopped or partly failed batch completes it.
     Writes --out and its summary; returns (rows, summary)."""
-    fp = code_fingerprint(run_dir, fn_spec, exclude=(out,))
+    fp = code_fingerprint(run_dir, fn_spec, exclude=(out, out + ".tmp"))
     keys = input_keys(inputs)
     old = {} if fresh else _reusable(out, fn_spec, fp)
     todo = [k for k, key in enumerate(keys) if key not in old]
     if todo:
-        new_rows, summary = map_fn(run_dir, fn_spec, [inputs[k] for k in todo], **kw)
+        new_rows, summary = map_fn(run_dir, fn_spec, [inputs[k] for k in todo],
+                                   prior_ok=len(inputs) - len(todo), **kw)
     else:
         new_rows, summary = [], {"n": 0, "n_ok": 0, "n_failed": 0, "failed_by_kind": {}, "wall_s": 0.0,
                                  "task_core_s": 0.0, "stopped": None}
@@ -1273,7 +1292,8 @@ def run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dict
     summary = {**summary, "n": len(rows), "n_ok": sum(r["ok"] for r in rows),
                "n_failed": sum(not r["ok"] for r in rows), "failed_by_kind": failed_by,
                "computed": len(todo), "reused": len(rows) - len(todo),
-               "fn": fn_spec, "code_fp": fp, "out": os.path.relpath(os.path.realpath(out), os.path.realpath(run_dir))}
+               "fn": fn_spec, "code_fp": fp,
+               "src_fp": code_fingerprint(run_dir, fn_spec, exclude=(out, out + ".tmp"), outputs=False), "out": os.path.relpath(os.path.realpath(out), os.path.realpath(run_dir))}
     tmp = out + ".tmp"
     with open(tmp, "w") as f:
         for r in rows:
@@ -1288,7 +1308,8 @@ def gate_findings(run_dir: str) -> list[dict]:
     """Phase 35: results files under models/ with rows that have no result
     (failed, or missing from the file against its summary's count). A failed
     row counts as recovered when a newer results file of the same function
-    and the same code fingerprint has an ok row for the same params; a file
+    and the same sources (code and data, `src_fp`) has an ok row for the same
+    params; a file
     is superseded when a newer file of the same function has ok rows for all
     its params. HIGH when more than 5% of a file's rows are unrecovered (or
     the file is missing or unreadable), MEDIUM otherwise."""
@@ -1311,10 +1332,10 @@ def gate_findings(run_dir: str) -> list[dict]:
             found.append((out, s, None, f"unreadable ({e})"))
             continue
         found.append((out, s, rows, None))
-    files = []                            # (path, fn, code_fp, mtime, ok keys, all keys)
+    files = []                            # (path, fn, src_fp, mtime, ok keys, all keys)
     for out, s, rows, _ in found:
         if rows is not None:
-            files.append((out, s.get("fn"), s.get("code_fp"), os.path.getmtime(out),
+            files.append((out, s.get("fn"), s.get("src_fp"), os.path.getmtime(out),
                           {r.get("key") for r in rows if r.get("ok") and r.get("key")},
                           {r.get("key") for r in rows if r.get("key")}))
     findings = []
@@ -1327,12 +1348,12 @@ def gate_findings(run_dir: str) -> list[dict]:
             continue
         mt = os.path.getmtime(out)
         mine = {r.get("key") for r in rows if r.get("key")}
-        if mine and len(mine) == len(rows) and any(
+        if mine and len(mine) == len(rows) and len(rows) >= int(s.get("n") or 0) and any(
                 o != out and fn == s.get("fn") and t >= mt and mine <= ok
                 for o, fn, _fp, t, ok, _all in files):
             continue                      # superseded by a newer complete file
         recovered = set().union(*[ok for o, fn, fp, t, ok, _all in files
-                                  if o != out and fn == s.get("fn") and t >= mt and fp and fp == s.get("code_fp")]
+                                  if o != out and fn == s.get("fn") and t >= mt and fp and fp == s.get("src_fp")]
                                 or [set()])
         n = max(len(rows), int(s.get("n") or 0))
         absent = n - len(rows)
@@ -1985,10 +2006,41 @@ def _self_test_p35(ok) -> None:
         with open(dup, "w") as f:
             f.write(json.dumps({"i": 0, "ok": True, "key": "z#0", "result": 1}) + "\n")
             f.write(json.dumps({"i": 1, "ok": False, "key": "z#1", "kind": "model", "error": "x"}) + "\n")
-        json.dump({"n": 2, "n_failed": 1, "task_core_s": 1, "fn": "models/t.py::f", "code_fp": "c"},
+        json.dump({"n": 2, "n_failed": 1, "task_core_s": 1, "fn": "models/t.py::f", "src_fp": "c"},
                   open(dup + ".summary.json", "w"))
         ok(any("dup.jsonl" in f["claim"] for f in gate_findings(d)),
            "P35-25 a file's own ok rows never hide its failed rows")
+        up = os.path.join(d, "models", "draws.jsonl")
+        fpa = code_fingerprint(d, "models/draw.py::f", exclude=(dout,))
+        fpb = code_fingerprint(d, "models/draw.py::f")
+        ok(fpa != fpb, "P35-26 another call's results file is part of the fingerprint (a model may read it)")
+        open(os.path.join(d, "models", "brk.py"), "w").write(
+            "def f(p):\n    if p['x'] >= 100:\n        raise ValueError('persistent')\n    return {'x': p['x']}\n")
+        bo = os.path.join(d, "models", "brk.jsonl")
+        run_map(d, "models/brk.py::f", [{"x": k} for k in range(100)], bo, backend="local", max_workers=1)
+        rows, s = run_map(d, "models/brk.py::f", [{"x": k} for k in range(110)], bo, backend="local", max_workers=1)
+        ok(not s.get("stopped") and s["failed_by_kind"] == {"model": 10},
+           f"P35-27 rows reused on resume count as successes for the breaker: {s.get('stopped')} {s['failed_by_kind']}")
+        tr2 = os.path.join(d, "models", "partial.jsonl")
+        open(tr2, "w").write(json.dumps({"i": 0, "ok": True, "key": "q#0", "result": 1}) + "\n")
+        json.dump({"n": 100, "n_failed": 0, "task_core_s": 1, "fn": "models/q.py::f"}, open(tr2 + ".summary.json", "w"))
+        time.sleep(0.05)
+        nw = os.path.join(d, "models", "partial_new.jsonl")
+        open(nw, "w").write(json.dumps({"i": 0, "ok": True, "key": "q#0", "result": 1}) + "\n")
+        json.dump({"n": 1, "n_failed": 0, "task_core_s": 1, "fn": "models/q.py::f"}, open(nw + ".summary.json", "w"))
+        ok(any("partial.jsonl" in f["claim"] and "99 of 100" in f["claim"] for f in gate_findings(d)),
+           "P35-28 a truncated file is not superseded by a newer file holding only its few rows")
+        rows, s = map_fn(d, "models/oom.py::big", [{"mb": 300}] * 6, backend="local", max_workers=4)
+        os.environ["MA_COMPUTE_PEAK_MB"] = "1"
+        try:
+            import unittest.mock as _m
+            with _m.patch(__name__ + "._avail_mb", return_value=900.0):
+                rows, s = map_fn(d, "models/oom.py::big", [{"mb": 300}] * 6, backend="local", max_workers=4,
+                                 ledger=False)
+        finally:
+            del os.environ["MA_COMPUTE_PEAK_MB"]
+        ok(s["n_failed"] == 0 and s["procs_final"] < 4,
+           f"P35-29 concurrency falls to what measured memory allows, the pool shrinks with it: {s}")
 
 
 def main() -> int:
