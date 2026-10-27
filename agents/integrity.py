@@ -32,6 +32,11 @@ Known limits (PR #15 reviews):
     in-process tools) and denies agents running them via Bash.
   - A lead change made while a subagent's call is in flight is explained for
     agent-owned critique files.
+  - Phase 36 process watch: while a producer runs on this run (and until it
+    is seen finished once), changes to its outputs are explained whoever
+    makes them, as for background grants; a Python started with a
+    sitecustomize on PYTHONPATH runs other code inside a producer process,
+    as an env assignment before a typed producer command already could.
 """
 from __future__ import annotations
 
@@ -265,7 +270,7 @@ def _live_harness_scripts(run_path: str) -> set[str]:
             # The interpreter must be RUNNING the producer: argv[0] is a
             # Python interpreter and its script argument (the first one, no
             # -c/-m) is the producer — not any argument (Copilot, PR #15).
-            if not re.fullmatch(r"python[\d.]*", os.path.basename(argv[0])):
+            if not re.fullmatch(r"python[\d.]*", os.path.basename(argv[0]), re.IGNORECASE):
                 continue
             rest = argv[1:]
             while rest and rest[0].startswith("-") and rest[0] not in ("-c", "-m"):
@@ -313,6 +318,52 @@ class ArtifactIntegrity:
         self.hashes = self._scan()
         self._mtimes = dict(self._mtimes_now)
         self._write_report()
+
+    # -- process watch (Phase 36) -----------------------------------------
+    # E7 attempt 7: the modeler ran the producer scripts from its own shell
+    # script (`bash models/run_all_r2.sh`, itself started by a waiting driver
+    # script), so no command line named them and every output they wrote
+    # became an unexplained, non-declarable HIGH. A producer is now credited
+    # by what is RUNNING, not by what was typed: a background sampler records
+    # each producer process it sees alive on this run (the same test as
+    # `_live_harness_scripts`: a Python interpreter running the repo's
+    # read-only script with this run's directory in its arguments), and that
+    # explains its outputs until it has been seen finished once. A producer
+    # that starts and ends between two samples is not seen (its output is then
+    # reported as before; rerunning the producer directly resolves it).
+    def start_watch(self, interval_s: float = 0.25) -> None:
+        if getattr(self, "_watch", None) is not None:
+            return
+        self._stop_watch = threading.Event()
+
+        def loop():
+            while not self._stop_watch.wait(interval_s):
+                self.observe()
+        self._watch = threading.Thread(target=loop, name="integrity-watch", daemon=True)
+        self._watch.start()
+
+    def stop_watch(self) -> None:
+        if getattr(self, "_watch", None) is not None:
+            self._stop_watch.set()
+            self._watch.join(timeout=5)
+            self._watch = None
+
+    def observe(self) -> None:
+        """One sample: a grant for each producer seen running on this run."""
+        try:
+            live = set(self._process_check() or ())
+        except Exception:  # noqa: BLE001 — a failed sample must not stop the watch
+            return
+        with self._lock:
+            for sc in live:
+                if sc not in SCRIPT_PRODUCES:
+                    continue
+                g = next((g for g in self.grants if g.get("observed") and sc in g["scripts"]), None)
+                if g is not None:
+                    g["seen_dead"] = False
+                else:
+                    self.grants.append({"scripts": {sc}, "seen_dead": False, "armed": True, "observed": True,
+                                        "t": time.monotonic(), "paths": set(SCRIPT_PRODUCES[sc])})
 
     # -- scanning ---------------------------------------------------------
     def _scan(self) -> dict[str, str | None]:

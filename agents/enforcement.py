@@ -426,7 +426,7 @@ substitution (`tee >(…) <protected>`). They are caught after the
 def bash_reason(command: str, run_path: str, agent_type: str | None,
                 cwd: str | None = None) -> str | None:
     """Deny reason for a Bash command, or None."""
-    if _CHMOD.search(command) and _HARNESS_WORDS.search(command):
+    if _harness_chmod(command, cwd):
         return ("harness code/config (scripts/, agents/, .claude/, main.py, CLAUDE.md) is read-only during a "
                 "run; changing its permissions is not allowed")
     if _ENV_REF.search(command):
@@ -571,6 +571,52 @@ def unlock_harness(modes: dict[str, int]) -> None:
 
 _CHMOD = re.compile(r"\b(chmod|chattr|chown|chflags)\b|os\.chmod|\.chmod\(")
 _HARNESS_WORDS = re.compile(r"(?:^|[\s/'\"=])(?:scripts|agents|\.claude)(?:/|\b)|\bmain\.py\b|\bCLAUDE\.md\b|\brequirements\.txt\b")
+_CHMOD_CMDS = {"chmod", "chattr", "chown", "chflags"}
+_PY_CHMOD = re.compile(r"os\.chmod|\.chmod\(|os\.chown|\.chown\(")
+_CMD_WRAPPERS = {"sudo", "env", "nohup", "command", "exec", "time", "nice", "stdbuf", "timeout"}
+
+
+def _harness_chmod(command: str, cwd: str | None = None) -> bool:
+    """A permission change aimed at harness code (Phase 36). Before, any
+    command mentioning chmod and a harness word anywhere was denied: E7
+    attempt 7's modeler was refused `chmod +x models/run_all.sh` because the
+    same command wrote a script that runs `python3 scripts/...`. Now:
+      - a chmod-family command is denied when one of its operands is a
+        harness path, the repo root or a parent of it (or, after an unknown
+        `cd`, an operand naming a harness directory);
+      - chmod run by another command (`find -exec`, `xargs`) is denied when
+        the same line names harness code;
+      - Python's os.chmod / .chmod( is denied when the same line names it.
+    Harness files are also read-only on disk and hashed for the run."""
+    for line in command.splitlines():
+        if _PY_CHMOD.search(line) and _HARNESS_WORDS.search(line):
+            return True
+    lines = command.splitlines() or [command]
+    for seg, scwd in iter_segments_with_cwd(command, cwd):
+        toks = _tokens(seg.strip().lstrip("({").strip())
+        while toks and (re.match(r"^\w+=", toks[0]) or os.path.basename(toks[0]) in _CMD_WRAPPERS
+                        or re.fullmatch(r"-\w+|\d+(\.\d+)?[smhd]?", toks[0])):
+            toks = toks[1:]
+        if not toks:
+            continue
+        names = [os.path.basename(t) for t in toks]
+        if names[0] in _CHMOD_CMDS:
+            for op in toks[1:]:
+                if op.startswith(("-", "+", "=")) or re.fullmatch(r"[0-7]{3,4}|[ugoa]*[+=-][rwxXst]*(,[ugoa]*[+=-][rwxXst]*)*", op):
+                    continue
+                if scwd is None and not os.path.isabs(os.path.expanduser(op.strip("'\""))):
+                    if _HARNESS_WORDS.search(" " + op):
+                        return True
+                    continue
+                if is_harness_path(op, scwd):
+                    return True
+                if os.path.relpath(REPO_ROOT, _abspath(op, scwd)).split(os.sep)[0] != "..":
+                    return True          # the repo root or a parent of it (`chmod -R u+w .` at the root)
+        elif any(n in _CHMOD_CMDS for n in names[1:]):
+            line = next((l for l in lines if seg.strip() and seg.strip() in l), command)
+            if _HARNESS_WORDS.search(line) or _HARNESS_WORDS.search(command if line == command else line):
+                return True
+    return False
 
 
 def hash_harness(repo_root: str = REPO_ROOT) -> dict[str, str]:

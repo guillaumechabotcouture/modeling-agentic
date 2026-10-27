@@ -764,6 +764,7 @@ async def run(question: str, max_rounds: int, max_sessions: int,
     # Phase 23 α: hash protected run artifacts; every change must be explained
     # by an allowed in-flight tool call (see agents/integrity.py).
     integrity = ArtifactIntegrity(run_path)
+    integrity.start_watch()     # Phase 36: producers credited by what runs, not by what was typed
     budget = load_budget_ledger(run_path)
     if not budget["sessions"] and prior_meta.get("session_results"):
         # Run started before the ledger existed: carry its recorded spend over
@@ -1052,6 +1053,7 @@ def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
     # previous baseline before the harness writes anything (Copilot, PR #15).
     if integrity is not None:
         integrity.final_check()
+        integrity.stop_watch()
     report_restored = restore_report_if_missing(run_path)
     if report_restored and integrity is not None:
         for rel in ("report.md", "report.unrendered.md", "models/claims_ledger.yaml", "claims_ledger.yaml"):
@@ -1333,6 +1335,32 @@ def _run_self_test() -> int:
         # IN5: editing the integrity report itself is a violation
         w(REPORT_NAME, '{"producer": "agents/integrity.py", "violations": []}')
         ok(any(e["file"] == REPORT_NAME for e in ig2.final_check()), "IN5 report tamper flagged")
+        # IN8 (Phase 36): a producer run from the agent's own shell script is
+        # credited by the process watch; tampering after it ends is not.
+        with tempfile.TemporaryDirectory() as td8:
+            open(os.path.join(td8, "identifiability.yaml"), "w").write("a: 1\n")
+            alive = set()
+            ig8 = ArtifactIntegrity(td8, process_check=lambda: set(alive))
+            ig8.on_pre("s1", "Bash", {"command": "bash models/run_all.sh"}, "modeler")
+            alive.add("identifiability.py"); ig8.observe()
+            open(os.path.join(td8, "identifiability.yaml"), "w").write("a: 2\n")
+            alive.clear()
+            ok(ig8.on_post("s1") == [], f"IN8 a producer started by the agent's script is credited: {ig8.events}")
+            ig8.on_pre("s2", "Bash", {"command": "true"}, "modeler")
+            ok(ig8.on_post("s2") == [], "IN8b the grant ends once the producer is seen finished")
+            ig8.on_pre("s3", "Bash", {"command": "p=identifiability.yaml; echo 'a: 3' > $p"}, "modeler")
+            open(os.path.join(td8, "identifiability.yaml"), "w").write("a: 3\n")
+            ok([e["file"] for e in ig8.on_post("s3")] == ["identifiability.yaml"],
+               "IN8c a change after the producer has finished is still flagged")
+            ig9 = ArtifactIntegrity(td8, process_check=lambda: set(alive))
+            ig9.on_pre("s4", "Bash", {"command": "bash models/run_all.sh"}, "modeler")
+            open(os.path.join(td8, "identifiability.yaml"), "w").write("a: 4\n")
+            ok([e["file"] for e in ig9.on_post("s4")] == ["identifiability.yaml"],
+               "IN8d without a producer seen running, the change is flagged (control)")
+            alive.add("identifiability.py")
+            import time as _t8
+            ig9.start_watch(0.05); _t8.sleep(0.3); ig9.stop_watch()
+            ok(any(g.get("observed") for g in ig9.grants), "IN8e the background watch samples producers")
         # IN6: a resumed run keeps earlier violations
         ok(len(ArtifactIntegrity(td, process_check=lambda: set()).events) >= 1,
            "IN6 violations survive a restart")
@@ -1904,6 +1932,17 @@ def _run_self_test() -> int:
            and enforcement.bash_reason("python3 -c \"import os; os.chmod('agents/x.py', 0o644)\"", td, "modeler") is not None
            and enforcement.bash_reason("chmod +x runs/r1/models/run.sh", td, "modeler") is None,
            "HL2 changing harness permissions is denied; run files are not affected")
+        _R = enforcement.REPO_ROOT
+        _hl3 = {
+            "cat > models/x.sh <<EOF\npython3 scripts/compute.py map . --fn f\nEOF\nchmod +x models/x.sh": None,
+            "chmod +x models/run_all.sh && nohup bash models/run_all.sh > m.log 2>&1 &": None,
+            "chmod +x /tmp/r/models/x.sh; python3 scripts/compute.py map .": None,
+            "chmod -R u+w .": "deny", "chmod -R u+w " + _R + "/..": "deny",
+            "find scripts -name '*.py' -exec chmod u+w {} +": "deny", "ls scripts/*.py | xargs chmod u+w": "deny",
+            "sudo chmod 644 agents/enforcement.py": "deny", "cd $X && chmod u+w scripts/a.py": "deny",
+            "chmod u+w " + _R + "/scripts/compute.py": "deny"}
+        _got = {c: ("deny" if enforcement.bash_reason(c, td, "modeler") else None) for c in _hl3}
+        ok(_got == _hl3, f"HL3 chmod is denied only when aimed at harness code: {[c for c in _hl3 if _got[c] != _hl3[c]]}")
         os.remove(_hp)
         before = enforcement.hash_harness(td)
         ok(not enforcement.harness_changed(enforcement.diff_harness(before, enforcement.hash_harness(td))),
