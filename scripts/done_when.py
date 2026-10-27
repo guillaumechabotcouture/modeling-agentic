@@ -88,7 +88,7 @@ pass. For text, match the numbers or a short label, never a phrase:
 
 ```yaml
 # good: the interval's numbers appear in the Summary
-- {file: summary.md, contains: "51\\D{1,4}77"}
+- {file: summary.md, contains: "1\\.8\\D{1,4}2\\.6"}
 # good: a value in an output file
 - {file: models/uq_summary.json, key: p_exceed_cap, op: ">", value: 0}
 # bad: passes only for one way of writing it ("cases averted" vs "averts ... cases")
