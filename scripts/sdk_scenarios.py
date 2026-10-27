@@ -163,6 +163,34 @@ async def readback_after_crash(query_fn=None, kill_fn=None, delay_s=20):
             "events": ev}
 
 
+async def readback_after_agent_crash(query_fn=None, kill_fn=None):
+    """The 2026-10-27 pipeline smoke: session 1 was killed 6 s in, while the
+    planner ran in the background, and the cost read-back returned nothing.
+    Same crash with a background subagent running."""
+    import main
+    from claude_agent_sdk import AgentDefinition
+    worker = AgentDefinition(description="Test worker", tools=["Bash"], model="haiku", maxTurns=3,
+                             prompt="Run `sleep 90` with Bash, then reply DONE.")
+    opts = _options(tools=["Agent", "Bash"], allowed_tools=["Agent", "Bash"], agents={"worker": worker},
+                    max_turns=6, system_prompt="You are a test lead. Spawn the worker agent once, then wait for it.")
+    seen = {}
+
+    def when(ev, t):      # a few seconds after the spawn: the subagent is running
+        if ev and ev[0] == "assistant" and "Agent" in (ev[2] or []):
+            seen.setdefault("t", t)
+        return "t" in seen and t - seen["t"] >= 4
+    sid, result, err, killed, ev = await _converse("Begin.", opts, kill_when=when, query_fn=query_fn,
+                                                   kill_fn=kill_fn)
+    if killed is None and "t" in seen and query_fn is None:   # the stream went quiet: kill on a timer
+        await asyncio.sleep(1)
+    plain = _options()
+    now = await main.reconcile_conversation_cost(opts, sid, query_fn=query_fn) if sid else None
+    raw_now = await _raw_readback(opts, sid, query_fn) if sid else None
+    plain_now = await main.reconcile_conversation_cost(plain, sid, query_fn=query_fn) if sid else None
+    return {"session_id": sid, "killed": killed, "crash_error": err, "readback_now": _summ(now),
+            "readback_now_raw": raw_now, "readback_plain_options": _summ(plain_now), "events": ev[-8:]}
+
+
 async def _raw_readback(opts, sid, query_fn=None):
     """What the read-back query actually returned, before the harness's checks."""
     import dataclasses
@@ -471,7 +499,7 @@ async def brief_signoff(query_fn=None):
 SCENARIOS = {"resume_cumulative": resume_cumulative, "readback_after_crash": readback_after_crash,
              "crash_before_init": crash_before_init, "budget_cap": budget_cap, "hook_context": hook_context,
              "cache_ttl": cache_ttl, "round_plan": round_plan, "brief_signoff": brief_signoff,
-             "done_when_tests": done_when_tests}
+             "done_when_tests": done_when_tests, "readback_after_agent_crash": readback_after_agent_crash}
 
 
 def run(names: list[str]) -> dict:
