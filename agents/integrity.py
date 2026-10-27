@@ -83,7 +83,7 @@ SCRIPT_PRODUCES: dict[str, tuple[str, ...]] = {
     "render_claims.py": ("report.md", "models/claims_ledger.yaml", "claims_ledger.yaml"),
 }
 _SCRIPTS_DIR = os.path.realpath(os.path.join(enforcement.REPO_ROOT, "scripts"))
-_WRAPPERS = {"nohup", "env", "time", "nice", "command", "exec", "sudo", "stdbuf"}
+_WRAPPERS = {"nohup", "env", "time", "nice", "command", "exec", "sudo", "stdbuf", "timeout"}
 _CRITIQUE_PATTERNS = ("critique_*.yaml", "critique_*.md")
 # A tool whose PostToolUse never arrives (an error path) must not keep
 # sanctioning changes: intents expire (Bash's own timeout is 10 min).

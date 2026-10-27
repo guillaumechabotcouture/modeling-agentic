@@ -354,6 +354,12 @@ def gate_findings(run_dir: str) -> list[dict]:
         lock[BENCHMARKS] = {"sha256": bt, "locked_at": _dt.datetime.now(_dt.timezone.utc).isoformat()}
         with open(lock_path, "w", encoding="utf-8") as f:
             json.dump(lock | {"producer": "scripts/decision_brief.py"}, f, indent=1)
+    elif BENCHMARKS in lock and bt == lock[BENCHMARKS].get("sha256"):
+        # Rewritten (same content) by every gate run, like the gate's other
+        # outputs: a first write the integrity record could not attribute (e.g. a
+        # wrapper it does not parse) is then resolved by the next attributed one.
+        with open(lock_path, "w", encoding="utf-8") as f:
+            json.dump(lock, f, indent=1)
     elif BENCHMARKS in lock and bt != lock[BENCHMARKS].get("sha256"):
         high("acceptance_criteria_changed",
              f"{BENCHMARKS} changed after it was locked ({lock[BENCHMARKS].get('locked_at')}). Benchmark bands "
@@ -441,6 +447,12 @@ def _run_self_test() -> int:
         ok(gate_findings(d) == [], f"DB8: signed, unchanged: {gate_findings(d)}")
         w(BENCHMARKS, {"benchmarks": [{"id": "B1", "band": [1, 2]}]})
         ok(gate_findings(d) == [] and os.path.exists(os.path.join(d, LOCK)), "DB9: benchmarks locked on first sight")
+        _lk = os.path.join(d, LOCK)
+        _before = open(_lk).read()
+        os.utime(_lk, (1, 1))
+        gate_findings(d)
+        ok(open(_lk).read() == _before and os.path.getmtime(_lk) > 1,
+           "DB9b every gate run rewrites the lock unchanged (so a later attributed run clears an unattributed first write)")
         w(BENCHMARKS, {"benchmarks": [{"id": "B1", "band": [0, 5]}]})
         ok(any(f["kind"] == "acceptance_criteria_changed" and BENCHMARKS in f["claim"] for f in gate_findings(d)),
            "DB10: widened benchmark band is caught")

@@ -1571,6 +1571,8 @@ def _run_self_test() -> int:
         w("metadata.json", '{"question": "Q", "methods_critic": true}')
         ig = ArtifactIntegrity(td, process_check=lambda: set())
         # IC1: a comment or string mentioning a script authorizes nothing
+        ok(harness_scripts_run(f"timeout 600 python3 {REPO_ROOT}/scripts/validate_critique_yaml.py runs/x")[0]
+           == ["validate_critique_yaml.py"], "IG-timeout: a `timeout N` wrapper still runs the harness script")
         ok(harness_scripts_run('p=x; printf f > "$p"; # scripts/compare_models.py')[0] == []
            and harness_scripts_run('echo "python3 scripts/compare_models.py"')[0] == []
            and harness_scripts_run("cd /tmp && python3 /other/repo/scripts/compare_models.py x")[0] == []
