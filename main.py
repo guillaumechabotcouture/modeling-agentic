@@ -1574,10 +1574,13 @@ def _run_self_test() -> int:
         _v = f"{REPO_ROOT}/scripts/validate_critique_yaml.py runs/x"
         _tf = [harness_scripts_run(f"timeout {o} python3 {_v}")[0] for o in
                ("600", "1.5m", "-k 5 600", "--signal TERM 600", "-s TERM 10s", "--kill-after=5 --preserve-status 600")]
+        _neg = [harness_scripts_run(f"timeout {o} python3 {_v}")[0] for o in
+                ("-k 5", "", "invalid", "--help 600", "-- -v 600", "600 X=1", "-k nonsense 600", "--signal 9x 600")]
         ok(all(x == ["validate_critique_yaml.py"] for x in _tf)
-           and harness_scripts_run(f"timeout -k 5 python3 {_v}")[0] == []
-           and harness_scripts_run(f"timeout python3 {_v}")[0] == [],
-           f"IG-timeout: timeout's options and duration are skipped; with no valid duration nothing runs: {_tf}")
+           and harness_scripts_run(f"timeout -- 600 python3 {_v}")[0] == ["validate_critique_yaml.py"]
+           and harness_scripts_run(f"timeout 1e2 python3 {_v}")[0] == ["validate_critique_yaml.py"]
+           and all(x == [] for x in _neg),
+           f"IG-timeout: known options and a valid duration are skipped; anything else credits nothing: {_tf} {_neg}")
         ok(harness_scripts_run('p=x; printf f > "$p"; # scripts/compare_models.py')[0] == []
            and harness_scripts_run('echo "python3 scripts/compare_models.py"')[0] == []
            and harness_scripts_run("cd /tmp && python3 /other/repo/scripts/compare_models.py x")[0] == []

@@ -84,22 +84,40 @@ SCRIPT_PRODUCES: dict[str, tuple[str, ...]] = {
 }
 _SCRIPTS_DIR = os.path.realpath(os.path.join(enforcement.REPO_ROOT, "scripts"))
 _WRAPPERS = {"nohup", "env", "time", "nice", "command", "exec", "sudo", "stdbuf"}
-_TIMEOUT_OPTS_WITH_ARG = {"-k", "--kill-after", "-s", "--signal"}
-_DURATION = re.compile(r"\d+(\.\d+)?[smhd]?")
+_DURATION = re.compile(r"(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?[smhd]?")
+_SIGNAL = re.compile(r"(SIG)?[A-Z][A-Z0-9]*|\d+")
 
 
 def _skip_timeout(toks: list[str]) -> list[str] | None:
-    """`timeout [OPTION] DURATION COMMAND...`: the command after timeout's own
-    options and its duration, or None when there is no valid duration (then
-    nothing after it runs as a command). Attempt-7 smoke: a critic ran the gate
-    as `timeout 600 python3 scripts/validate_critique_yaml.py ...`."""
+    """`timeout [OPTION] DURATION COMMAND...` -> COMMAND..., or None.
+
+    Conservative (Codex review of PR #27): only options it fully understands
+    (--preserve-status, --foreground, -v/--verbose, -k/--kill-after DUR,
+    -s/--signal SIG, `--`) with valid arguments; anything else, or no valid
+    duration, returns None, so nothing is credited as run. An uncredited
+    harness run only leaves an integrity event; a wrongly credited one would
+    authorize writes. Attempt-7 smoke: a critic ran the gate as
+    `timeout 600 python3 scripts/validate_critique_yaml.py ...`."""
     j = 1
-    while j < len(toks) and toks[j].startswith("-"):
+    while j < len(toks):
         t = toks[j]
-        if t in _TIMEOUT_OPTS_WITH_ARG:
+        if t == "--":
+            j += 1
+            break
+        if t in ("--preserve-status", "--foreground", "-v", "--verbose"):
+            j += 1
+        elif t in ("-k", "--kill-after") and j + 1 < len(toks) and _DURATION.fullmatch(toks[j + 1]):
             j += 2
+        elif t in ("-s", "--signal") and j + 1 < len(toks) and _SIGNAL.fullmatch(toks[j + 1]):
+            j += 2
+        elif t.startswith("--kill-after=") and _DURATION.fullmatch(t.split("=", 1)[1]):
+            j += 1
+        elif t.startswith("--signal=") and _SIGNAL.fullmatch(t.split("=", 1)[1]):
+            j += 1
+        elif t.startswith("-"):
+            return None          # an option we do not model (--help, clusters, abbreviations)
         else:
-            j += 1          # --preserve-status, --foreground, -v, --kill-after=5, --signal=TERM
+            break
     if j >= len(toks) or not _DURATION.fullmatch(toks[j]):
         return None
     return toks[j + 1:]
@@ -154,7 +172,7 @@ def harness_scripts_run(command: str, cwd: str | None = None, _depth: int = 0
                 background = True
             if os.path.basename(toks[0]) == "timeout":
                 toks = _skip_timeout(toks) or []
-                continue
+                break            # timeout runs its COMMAND as is: no further wrappers or assignments
             toks = toks[1:]
         if toks and os.path.basename(toks[0]) in _SHELLS and _depth < 3:
             # `nohup sh -c "python3 scripts/x.py …; echo DONE" &` (seen in E7):
