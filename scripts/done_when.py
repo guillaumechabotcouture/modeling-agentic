@@ -83,7 +83,17 @@ rows: none}`; total cost within the cap: `{file: allocation.csv, column: cost,
 agg: sum, op: "<=", value: 100}`).
 Paths are relative to the run
 directory. Prefer numbers and structure in output files over wording in
-prose, which changes. When no runnable test fits, write
+prose, which changes: a fix that says the same thing in other words must
+pass. For text, match the numbers or a short label, never a phrase:
+
+```yaml
+# good: the interval's numbers appear in the Summary
+- {file: summary.md, contains: "51\\D{1,4}77"}
+# good: a value in an output file
+- {file: models/uq_summary.json, key: p_exceed_cap, op: ">", value: 0}
+# bad: passes only for one way of writing it ("cases averted" vs "averts ... cases")
+- {file: summary.md, contains: "cases averted[^\\n]*\\d+-\\d+"}
+``` When no runnable test fits, write
 `done_when: {judgement: "<what would show it is fixed>"}`; when runnable checks
 are necessary but not enough, list them with one judgement entry.
 
