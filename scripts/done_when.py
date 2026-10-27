@@ -280,7 +280,9 @@ def evaluate(dw, run_dir: str) -> tuple[bool | None, str]:
     judged = [c for c in checks if "judgement" in c]
     details = []
     for c in [c for c in checks if "judgement" not in c]:
-        rel = _in_run(_safe_rel(c["file"]), run_dir)
+        rel = _safe_rel(_in_run(_safe_rel(c["file"]), run_dir))   # re-checked after the prefix is stripped
+        if rel is None:
+            return None, f"invalid: {c['file']!r} is not a run file"
         try:
             if "exists" in c:
                 ok = os.path.exists(os.path.join(run_dir, rel)) == bool(c["exists"])
@@ -543,6 +545,8 @@ def _self_test() -> int:
         ok(evaluate({"file": f"runs/{name}/out.json", "exists": True}, d)[0] is True
            and evaluate({"file": f"{name}/out.json", "exists": True}, d)[0] is True,
            "DW4b a path written from the repo root (runs/<run>/...) reads the run's file")
+        ok(evaluate({"file": f"runs/{name}/_truth/x", "exists": True}, d)[0] is None,
+           "DW4c the repo-root prefix cannot reach _truth/")
         # DW5-DW8: evaluation
         ok(evaluate(ci, d)[0] is False and evaluate(rng, d)[0] is False, "DW5 both fail on the broken files")
         json.dump({"total_cost_usd": {"ci95": [371.0, 455.0]}, "n": 230}, open(os.path.join(d, "out.json"), "w"))

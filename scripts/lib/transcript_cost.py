@@ -82,7 +82,10 @@ def conversation_cost(session_id: str, root: str | None = None) -> float | None:
     if not leads:
         return None
     subs = glob.glob(os.path.join(root, "*", session_id, "subagents", "*.jsonl"))
-    return sum(file_cost(p)[0] for p in leads + subs)
+    costs = [file_cost(p) for p in leads + subs]
+    if not sum(n for _, n in costs):
+        return None   # nothing readable: not a $0 estimate (Codex review)
+    return sum(c for c, _ in costs)
 
 
 def _self_test() -> int:
@@ -113,6 +116,9 @@ def _self_test() -> int:
             f.write(turn("m5", "claude-haiku-5-5", inp=200_000))                # long prompt: $0.10
         c = conversation_cost("s1", root)
         ok(c is not None and abs(c - 11.31) < 1e-9, f"TC1 lead + subagents, deduplicated, per-model prices: {c}")
+        with open(os.path.join(proj, "s2.jsonl"), "w") as f:
+            f.write("truncated garbage\n")
+        ok(conversation_cost("s2", root) is None, "TC2b a transcript with no readable usage is not a $0 estimate")
         ok(conversation_cost("nope", root) is None and conversation_cost("", root) is None,
            "TC2 no transcript -> None (the caller falls back)")
         ok(abs(file_cost(os.path.join(proj, "s1.jsonl"))[0] - 10.0) < 1e-9

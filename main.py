@@ -111,6 +111,7 @@ async def reconcile_conversation_cost(options, session_id: str, timeout_s: float
         return None
 
 
+_HARNESS_LOCK: dict = {}   # Phase 34 ε: modes of the harness files locked for this run (finalize_run restores them)
 TRANSCRIPT_MARGIN = 1.05   # Phase 34 δ: E7 attempt 6, transcript estimate +0.25% vs reported
 
 
@@ -758,8 +759,8 @@ async def run(question: str, max_rounds: int, max_sessions: int,
 
     harness_before, harness_prior_diff = write_harness_baseline(run_path)
     import atexit
-    _locked = enforcement.lock_harness()   # read-only on disk for the run; restored at exit
-    atexit.register(enforcement.unlock_harness, _locked)
+    _HARNESS_LOCK.update(enforcement.lock_harness())   # read-only on disk for the run; restored at exit
+    atexit.register(enforcement.unlock_harness, _HARNESS_LOCK)
     # Phase 23 α: hash protected run artifacts; every change must be explained
     # by an allowed in-flight tool call (see agents/integrity.py).
     integrity = ArtifactIntegrity(run_path)
@@ -1080,7 +1081,7 @@ def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
         add_verdict_banner(run_path, gate)
 
     harness_diff = enforcement.diff_harness(harness_before, enforcement.hash_harness())
-    enforcement.unlock_harness(_locked)
+    enforcement.unlock_harness(_HARNESS_LOCK)
     status = determine_status(session_outcome, gate, has_report,
                               report_restored, harness_diff,
                               integrity_violations=len(integrity.open_events) if integrity else 0)
@@ -1875,8 +1876,16 @@ def _run_self_test() -> int:
             _wrote = True
         except PermissionError:
             _wrote = os.geteuid() == 0   # root ignores file modes; the hash still catches it
+        try:
+            open(os.path.join(td, "scripts", "y.tmp"), "w").write("y")
+            os.replace(os.path.join(td, "scripts", "y.tmp"), _hp)
+            _replaced = os.geteuid() != 0
+        except PermissionError:
+            _replaced = False
         enforcement.unlock_harness(_modes)
-        ok(not _wrote and _hp in _modes and os.access(_hp, os.W_OK), "HL1 a locked harness file cannot be written; unlock restores it")
+        ok(not _wrote and not _replaced and _hp in _modes and os.access(_hp, os.W_OK)
+           and os.access(os.path.join(td, "scripts"), os.W_OK),
+           "HL1 a locked harness file cannot be written or replaced; unlock restores it")
         ok(enforcement.bash_reason("chmod u+w scripts/effect_size_registry.py", td, "modeler") is not None
            and enforcement.bash_reason("python3 -c \"import os; os.chmod('agents/x.py', 0o644)\"", td, "modeler") is not None
            and enforcement.bash_reason("chmod +x runs/r1/models/run.sh", td, "modeler") is None,

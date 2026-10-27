@@ -543,7 +543,15 @@ def lock_harness(repo_root: str = REPO_ROOT) -> dict[str, int]:
     path, which the shell heuristics cannot see; the harness hash then voided
     the run. A read-only file fails the write at once, and the agent sees why."""
     modes = {}
-    for p in _harness_paths(repo_root):
+    paths = list(_harness_paths(repo_root))
+    # Their directories too (Codex review): with a writable directory a file can
+    # still be replaced (write a temp file, os.replace it over the original).
+    dirs = set()
+    for d in HASHED_DIRS:
+        for dirpath, dirnames, _ in os.walk(os.path.join(repo_root, d)):
+            dirnames[:] = [x for x in dirnames if x not in _HASH_SKIP_DIRS]
+            dirs.add(dirpath)
+    for p in paths + sorted(dirs, reverse=True):
         try:
             m = os.stat(p).st_mode
             os.chmod(p, m & ~0o222)
