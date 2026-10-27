@@ -349,12 +349,17 @@ class ArtifactIntegrity:
             self._watch = None
 
     def observe(self) -> None:
-        """One sample: a grant for each producer seen running on this run."""
+        """One sample: a grant for each producer seen running on this run. A
+        sample taken before a check that ran meanwhile is discarded: that
+        check may already have seen the producer finish (Codex review)."""
+        seq = getattr(self, "_check_seq", 0)
         try:
             live = set(self._process_check() or ())
         except Exception:  # noqa: BLE001 — a failed sample must not stop the watch
             return
         with self._lock:
+            if getattr(self, "_check_seq", 0) != seq:
+                return
             for sc in live:
                 if sc not in SCRIPT_PRODUCES:
                     continue
@@ -477,6 +482,7 @@ class ArtifactIntegrity:
         return live
 
     def _check(self, where: str) -> list[dict]:
+        self._check_seq = getattr(self, "_check_seq", 0) + 1
         cur = self._scan()
         live = self._refresh_grants()
         new_events = []

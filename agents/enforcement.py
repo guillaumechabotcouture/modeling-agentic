@@ -577,47 +577,42 @@ _CMD_WRAPPERS = {"sudo", "env", "nohup", "command", "exec", "time", "nice", "std
 
 
 def _harness_chmod(command: str, cwd: str | None = None) -> bool:
-    """A permission change aimed at harness code (Phase 36). Before, any
-    command mentioning chmod and a harness word anywhere was denied: E7
-    attempt 7's modeler was refused `chmod +x models/run_all.sh` because the
-    same command wrote a script that runs `python3 scripts/...`. Now:
-      - a chmod-family command is denied when one of its operands is a
-        harness path, the repo root or a parent of it (or, after an unknown
-        `cd`, an operand naming a harness directory);
-      - chmod run by another command (`find -exec`, `xargs`) is denied when
-        the same line names harness code;
-      - Python's os.chmod / .chmod( is denied when the same line names it.
-    Harness files are also read-only on disk and hashed for the run."""
-    for line in command.splitlines():
-        if _PY_CHMOD.search(line) and _HARNESS_WORDS.search(line):
-            return True
-    lines = command.splitlines() or [command]
+    """A permission change that may reach harness code (Phase 36). The rule
+    stays the old one (a chmod-family word and a harness word anywhere in the
+    command) with one exception: when EVERY chmod-family mention is a plain
+    top-level chmod/chattr/chown/chflags command whose operands all resolve
+    outside the harness, the command is allowed. E7 attempt 7's modeler was
+    refused `chmod +x models/run_all.sh` because the same command wrote a
+    script that runs `python3 scripts/...`. Anything else (a nested shell
+    string, Python os.chmod, find -exec, xargs) keeps the old rule. Harness
+    files are also read-only on disk and hashed for the run."""
+    mentions = len(_CHMOD.findall(command))
+    if not mentions:
+        return False
+    old_rule = bool(_HARNESS_WORDS.search(command))
+    plain = 0
     for seg, scwd in iter_segments_with_cwd(command, cwd):
+        if not _CHMOD.search(seg):
+            continue
         toks = _tokens(seg.strip().lstrip("({").strip())
         while toks and (re.match(r"^\w+=", toks[0]) or os.path.basename(toks[0]) in _CMD_WRAPPERS
                         or re.fullmatch(r"-\w+|\d+(\.\d+)?[smhd]?", toks[0])):
             toks = toks[1:]
-        if not toks:
-            continue
-        names = [os.path.basename(t) for t in toks]
-        if names[0] in _CHMOD_CMDS:
-            for op in toks[1:]:
-                if op.startswith(("-", "+", "=")) or re.fullmatch(r"[0-7]{3,4}|[ugoa]*[+=-][rwxXst]*(,[ugoa]*[+=-][rwxXst]*)*", op):
-                    continue
-                if scwd is None and not os.path.isabs(os.path.expanduser(op.strip("'\""))):
-                    if _HARNESS_WORDS.search(" " + op):
-                        return True
-                    continue
-                if is_harness_path(op, scwd):
-                    return True
-                if os.path.relpath(REPO_ROOT, _abspath(op, scwd)).split(os.sep)[0] != "..":
-                    return True          # the repo root or a parent of it (`chmod -R u+w .` at the root)
-        elif any(n in _CHMOD_CMDS for n in names[1:]):
-            line = next((l for l in lines if seg.strip() and seg.strip() in l), command)
-            if _HARNESS_WORDS.search(line) or _HARNESS_WORDS.search(command if line == command else line):
-                return True
-    return False
-
+        if not toks or os.path.basename(toks[0]) not in _CHMOD_CMDS or len(_CHMOD.findall(seg)) != 1:
+            return old_rule               # chmod inside another command: the old rule
+        for op in toks[1:]:
+            if op.startswith(("-", "+", "=")) or re.fullmatch(
+                    r"[0-7]{3,4}|[ugoa]*[+=-][rwxXst]*(,[ugoa]*[+=-][rwxXst]*)*", op):
+                continue
+            if scwd is None and not os.path.isabs(os.path.expanduser(op.strip("'\""))):
+                return old_rule           # unknown cwd: cannot place a relative operand
+            if any(c in op for c in "$`*?[{~"):
+                return old_rule           # expansion or glob: cannot know the target
+            if is_harness_path(op, scwd) or \
+                    os.path.relpath(REPO_ROOT, _abspath(op, scwd)).split(os.sep)[0] != "..":
+                return True               # harness code, the repo root, or a parent of it
+        plain += 1
+    return plain != mentions and old_rule  # a mention not accounted for as a plain run-file chmod
 
 def hash_harness(repo_root: str = REPO_ROOT) -> dict[str, str]:
     """sha256 of every hashed harness file, keyed by repo-relative path."""

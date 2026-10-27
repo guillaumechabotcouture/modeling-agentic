@@ -1361,6 +1361,15 @@ def _run_self_test() -> int:
             import time as _t8
             ig9.start_watch(0.05); _t8.sleep(0.3); ig9.stop_watch()
             ok(any(g.get("observed") for g in ig9.grants), "IN8e the background watch samples producers")
+            ig10 = ArtifactIntegrity(td8, process_check=lambda: set(alive))
+            alive.add("identifiability.py")
+            _orig = ig10._process_check
+            def _slow():
+                got = _orig(); ig10._check(where="post_tool"); return got   # a check runs mid-sample
+            ig10._process_check = _slow
+            ig10.observe()
+            ok(not any(g.get("observed") for g in ig10.grants),
+               "IN8f a sample taken before a check that ran meanwhile is discarded")
         # IN6: a resumed run keeps earlier violations
         ok(len(ArtifactIntegrity(td, process_check=lambda: set()).events) >= 1,
            "IN6 violations survive a restart")
@@ -1940,7 +1949,10 @@ def _run_self_test() -> int:
             "chmod -R u+w .": "deny", "chmod -R u+w " + _R + "/..": "deny",
             "find scripts -name '*.py' -exec chmod u+w {} +": "deny", "ls scripts/*.py | xargs chmod u+w": "deny",
             "sudo chmod 644 agents/enforcement.py": "deny", "cd $X && chmod u+w scripts/a.py": "deny",
-            "chmod u+w " + _R + "/scripts/compute.py": "deny"}
+            "chmod u+w " + _R + "/scripts/compute.py": "deny",
+            "bash -c 'chmod u+w scripts/identifiability.py'": "deny",
+            "python3 - <<EOF\nimport os\nos.chmod(\n    'scripts/identifiability.py', 0o644)\nEOF": "deny",
+            "chmod u+w $D/x.py; echo scripts": "deny"}
         _got = {c: ("deny" if enforcement.bash_reason(c, td, "modeler") else None) for c in _hl3}
         ok(_got == _hl3, f"HL3 chmod is denied only when aimed at harness code: {[c for c in _hl3 if _got[c] != _hl3[c]]}")
         os.remove(_hp)
