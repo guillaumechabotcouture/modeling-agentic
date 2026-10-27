@@ -757,6 +757,9 @@ async def run(question: str, max_rounds: int, max_sessions: int,
         lead_prompt += "\n" + decision_brief.signoff_text(run_path) + "\n"
 
     harness_before, harness_prior_diff = write_harness_baseline(run_path)
+    import atexit
+    _locked = enforcement.lock_harness()   # read-only on disk for the run; restored at exit
+    atexit.register(enforcement.unlock_harness, _locked)
     # Phase 23 α: hash protected run artifacts; every change must be explained
     # by an allowed in-flight tool call (see agents/integrity.py).
     integrity = ArtifactIntegrity(run_path)
@@ -1077,6 +1080,7 @@ def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
         add_verdict_banner(run_path, gate)
 
     harness_diff = enforcement.diff_harness(harness_before, enforcement.hash_harness())
+    enforcement.unlock_harness(_locked)
     status = determine_status(session_outcome, gate, has_report,
                               report_restored, harness_diff,
                               integrity_violations=len(integrity.open_events) if integrity else 0)
@@ -1861,6 +1865,23 @@ def _run_self_test() -> int:
         p = os.path.join(td, "scripts", "a.py")
         with open(p, "w") as f:
             f.write("x = 1\n")
+        # HL1-HL2: harness files are read-only during a run, and chmod on them is denied
+        os.makedirs(os.path.join(td, "scripts"), exist_ok=True)
+        _hp = os.path.join(td, "scripts", "x.py")
+        open(_hp, "w").write("x = 1\n")
+        _modes = enforcement.lock_harness(td)
+        try:
+            open(_hp, "w").write("x = 2\n")
+            _wrote = True
+        except PermissionError:
+            _wrote = os.geteuid() == 0   # root ignores file modes; the hash still catches it
+        enforcement.unlock_harness(_modes)
+        ok(not _wrote and _hp in _modes and os.access(_hp, os.W_OK), "HL1 a locked harness file cannot be written; unlock restores it")
+        ok(enforcement.bash_reason("chmod u+w scripts/effect_size_registry.py", td, "modeler") is not None
+           and enforcement.bash_reason("python3 -c \"import os; os.chmod('agents/x.py', 0o644)\"", td, "modeler") is not None
+           and enforcement.bash_reason("chmod +x runs/r1/models/run.sh", td, "modeler") is None,
+           "HL2 changing harness permissions is denied; run files are not affected")
+        os.remove(_hp)
         before = enforcement.hash_harness(td)
         ok(not enforcement.harness_changed(enforcement.diff_harness(before, enforcement.hash_harness(td))),
            "T1 clean tree flagged")

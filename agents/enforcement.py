@@ -426,6 +426,9 @@ substitution (`tee >(…) <protected>`). They are caught after the
 def bash_reason(command: str, run_path: str, agent_type: str | None,
                 cwd: str | None = None) -> str | None:
     """Deny reason for a Bash command, or None."""
+    if _CHMOD.search(command) and _HARNESS_WORDS.search(command):
+        return ("harness code/config (scripts/, agents/, .claude/, main.py, CLAUDE.md) is read-only during a "
+                "run; changing its permissions is not allowed")
     if _ENV_REF.search(command):
         return ("credential files (.env) are not accessible to agents; cloud "
                 "credentials are provided in the environment when --cloud is set")
@@ -519,6 +522,48 @@ def deny_output(reason: str) -> dict:
 # ---------------------------------------------------------------------------
 # Tamper evidence
 # ---------------------------------------------------------------------------
+
+def _harness_paths(repo_root: str = REPO_ROOT):
+    for d in HASHED_DIRS:
+        for dirpath, dirnames, filenames in os.walk(os.path.join(repo_root, d)):
+            dirnames[:] = sorted(x for x in dirnames if x not in _HASH_SKIP_DIRS)
+            for fname in sorted(filenames):
+                if not fname.endswith(_HASH_SKIP_SUFFIXES) and fname != ".DS_Store":
+                    yield os.path.join(dirpath, fname)
+    for fname in HASHED_FILES:
+        p = os.path.join(repo_root, fname)
+        if os.path.isfile(p):
+            yield p
+
+
+def lock_harness(repo_root: str = REPO_ROOT) -> dict[str, int]:
+    """Make every hashed harness file read-only for the run; returns the
+    original modes for unlock_harness. The 2026-10-27 smoke's modeler edited
+    scripts/effect_size_registry.py through a Python heredoc with a variable
+    path, which the shell heuristics cannot see; the harness hash then voided
+    the run. A read-only file fails the write at once, and the agent sees why."""
+    modes = {}
+    for p in _harness_paths(repo_root):
+        try:
+            m = os.stat(p).st_mode
+            os.chmod(p, m & ~0o222)
+            modes[p] = m
+        except OSError:
+            continue
+    return modes
+
+
+def unlock_harness(modes: dict[str, int]) -> None:
+    for p, m in (modes or {}).items():
+        try:
+            os.chmod(p, m)
+        except OSError:
+            continue
+
+
+_CHMOD = re.compile(r"\b(chmod|chattr|chown|chflags)\b|os\.chmod|\.chmod\(")
+_HARNESS_WORDS = re.compile(r"(?:^|[\s/'\"=])(?:scripts|agents|\.claude)(?:/|\b)|\bmain\.py\b|\bCLAUDE\.md\b|\brequirements\.txt\b")
+
 
 def hash_harness(repo_root: str = REPO_ROOT) -> dict[str, str]:
     """sha256 of every hashed harness file, keyed by repo-relative path."""
