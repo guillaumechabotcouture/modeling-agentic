@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import time
 from datetime import datetime
 
 from claude_agent_sdk import AgentDefinition, HookMatcher
@@ -862,7 +863,11 @@ The harness enforces this: planner, data-agent, modeler and analyst spawns
 are refused until the plan covers the latest list, and the round's critique
 is refused until every `fix` / `rethink` id has been named in a spawn prompt
 to its stage's agent (PLAN planner, DATA data-agent, MODEL modeler, ANALYZE
-analyst, WRITE writer).
+analyst, WRITE writer). Once that work is handed out the plan is fixed for
+the round: a fix that did not work stays open, and the next gate lists it
+again for the next round's plan. Agents run in the background, so critics
+and the writer are refused while a planner, data-agent, modeler or analyst
+is still working; wait for each result before spawning them.
 
 #### Step 3: Execute the action
 
@@ -1478,6 +1483,84 @@ def critique_hold_reason(run_path: str, status: dict | None) -> str | None:
     return None
 
 
+_SPAWN_START_GRACE_S = 120
+
+
+def _trace_since(run_path: str, since: float):
+    try:
+        for line in open(os.path.join(run_path, "trace.jsonl"), errors="replace"):
+            try:
+                r = json.loads(line)
+                if datetime.fromisoformat(r["ts"]).timestamp() >= since:
+                    yield r
+            except (ValueError, KeyError, TypeError):
+                continue
+    except OSError:
+        return
+
+
+def work_running(run_path: str, since: float, kinds=PLAN_AGENTS, now: float | None = None) -> list[str]:
+    """Phase 32 γ: work agents launched since `since` (this session) that have
+    not finished. The CLI launches agents in the background ("Async agent
+    launched"), so the lead can ask a critic to review work still being done.
+    An agent cut off at its turn limit logs a task_notification and no
+    subagent_stop (E7 attempt 6: 5 of 57), so either counts as finished. A
+    spawn not yet started counts for a short grace period, since the critic
+    may be spawned in the same message."""
+    now = time.time() if now is None else now
+    started, done, spawned, starts = {}, set(), {}, {}
+    for r in _trace_since(run_path, since):
+        t = r.get("type")
+        if t == "subagent_start" and r.get("agent_type") in kinds:
+            started[r.get("agent_id")] = (r["agent_type"], r["ts"][11:19])
+            starts[r["agent_type"]] = starts.get(r["agent_type"], 0) + 1
+        elif t == "subagent_stop":
+            done.add(r.get("agent_id"))
+        elif t == "task_notification":
+            done.add(r.get("task_id"))
+        elif r.get("subagent_type") in kinds and r.get("agent") == "lead" and not r.get("denied"):
+            spawned.setdefault(r["subagent_type"], []).append(datetime.fromisoformat(r["ts"]).timestamp())
+    out = [f"{k} (since {ts})" for a, (k, ts) in started.items() if a not in done]
+    for k, times in spawned.items():
+        out += [f"{k} (launching)" for t in sorted(times)[starts.get(k, 0):] if t >= now - _SPAWN_START_GRACE_S]
+    return out
+
+
+def review_wait_reason(run_path: str, sub: str | None, since: float) -> str | None:
+    """Phase 32 γ: critics and the writer review finished work only. The
+    pre-mortem reviews the plan, so it waits for the planner alone."""
+    sub = str(sub or "")
+    if not (sub.startswith("critique-") or sub == "writer"):
+        return None
+    busy = work_running(run_path, since, ("planner",) if sub == "critique-premortem" else PLAN_AGENTS)
+    if not busy:
+        return None
+    return (f"{sub} reviews finished work, and these agents are still working: {', '.join(busy)[:600]}. Wait "
+            f"for their results (each comes back to you when it finishes), then spawn {sub}.")
+
+
+def plan_frozen_reason(run_path: str) -> str | None:
+    """Phase 32 γ: the round plan is fixed once its work has been handed out.
+    A lead that rewrote it afterwards turned an unfixed item into 'declare'
+    (real-SDK check, 2026-10-26). A change of action waits for the next
+    gate's open-problem list and the next round's plan."""
+    doc = open_problems.load_open(run_path)
+    path = os.path.join(run_path, open_problems.PLAN_FILE)
+    if doc is None or not os.path.exists(path):
+        return None
+    plan, err = open_problems._plan(run_path)
+    if err or str((plan or {}).get("round")) != str(doc.get("round")):
+        return None
+    ids = {w["id"] for w in open_problems.planned_work(run_path)}
+    sent = sorted({i for a, got in _lead_spawns_since(run_path, os.path.getmtime(path))
+                   if a in PLAN_AGENTS for i in got & ids})
+    if not sent:
+        return None
+    return (f"{open_problems.PLAN_FILE} for round {doc['round']} is fixed: its work has been handed out "
+            f"({', '.join(sent)[:300]}). Leave it as it is. A fix that did not work stays open; the next gate lists "
+            "it again, and the next round's plan can give it another action.")
+
+
 def signoff_hold_reason(run_path: str, mode: str | None, run_dir_rel: str = "{run_dir}") -> str | None:
     """Phase 33 α: nothing but planning happens before the decision brief is
     signed (owner mode: the owner signs and the harness resumes the lead;
@@ -1519,6 +1602,7 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
     turn_warned: dict[str, set] = {}
     agent_types: dict[str, str] = {}
     snapshot_state: dict = {}
+    session_t0 = time.time()   # Phase 32 γ: background agents end with their session
     if registered_agents is None:
         registered_agents = set(_registry().keys())
     registered_agents = set(registered_agents)
@@ -1547,6 +1631,15 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
                     f"{input_data.get('description', '')}")
         return name
 
+    def _writes_plan(tool_name, tool_input, cwd):
+        if tool_name in ("Write", "Edit", "MultiEdit"):
+            targets = [str(tool_input.get("file_path") or "")]
+        elif tool_name == "Bash":
+            targets = [t for t, _ in enforcement.bash_write_targets_cwd(str(tool_input.get("command") or ""), cwd)]
+        else:
+            return False
+        return any(os.path.basename(t.strip("'\"")) == open_problems.PLAN_FILE for t in targets)
+
     async def pre_tool_hook(input_data, tool_use_id, context):
         nonlocal tool_count
         tool_count += 1
@@ -1574,6 +1667,10 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
         if (not deny_reason and signoff == "owner" and tool_name == "Bash"
                 and re.search(r"decision_brief\.py\s+sign\b", str(tool_input.get("command") or ""))):
             deny_reason = "The owner signs the decision brief in this run; agents cannot sign it."
+        if not deny_reason and spawn:
+            deny_reason = review_wait_reason(run_path, sub, session_t0)
+        if not deny_reason and agent_id == "lead" and _writes_plan(tool_name, tool_input, input_data.get("cwd")):
+            deny_reason = plan_frozen_reason(run_path)
         if not deny_reason and hold_writer and sub == "writer":
             deny_reason = writer_hold_reason(run_path, _status(), max_rounds)
         if not deny_reason and hold_writer and sub in PLAN_AGENTS:

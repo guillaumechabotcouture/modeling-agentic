@@ -263,19 +263,32 @@ async def round_plan(query_fn=None):
          "claim": "No SMC funder map; the funder is charged for all SMC",
          "fix_requires": "Obtain the SMC funder split by state (no such public dataset exists)", "status": ""}]}
     op.write(run, doc)
+    # Real artifacts, so the critic judges content: the interval is zero width
+    # and the Summary has no qualifier on the cases figure.
+    json.dump({"total_cost_usd": {"mean": 412.0, "ci95": [412.0, 412.0], "draws": 230}},
+              open(os.path.join(run, "model_output.json"), "w"))
+    open(os.path.join(run, "summary.md"), "w").write("# Summary\nThe package averts 64M cases over five years.\n")
     trace = open(os.path.join(run, "trace.jsonl"), "a")
     hooks = create_hooks(run, trace, datetime.now(), registered_agents={"modeler", "analyst", "critique-redteam"},
                          budget_status=lambda: {"spent": 10.0, "cap": 100.0, "reserve": 5.0}, max_rounds=8)
+    steps = {
+        "modeler": (f"run with Bash: python3 -c \"import json; p='{run}/model_output.json'; d=json.load(open(p)); "
+                    "d['total_cost_usd']['ci95']=[371.0, 455.0]; json.dump(d, open(p, 'w'))\""),
+        "analyst": (f"if your task quotes a critic's evidence, run with Bash: sed -i 's/64M cases/64M cases "
+                    f"(re-anchored range 51-77M)/' {run}/summary.md ; otherwise this test's first attempt is "
+                    f"deliberately incomplete: run sed -i 's/64M cases/64M (re-anchored) cases/' {run}/summary.md"),
+    }
     worker = lambda who: AgentDefinition(  # noqa: E731
-        description=f"Test {who}", tools=["Bash"], model="haiku", maxTurns=3,
-        prompt=f"You are the {who} in a test; the fix itself is simulated. For each finding id named in your task, "
-               f"run with Bash: echo '<id> fixed by {who}' >> {run}/fixes.log . Then reply 'DONE:' followed by "
-               "those ids and one line saying the change was made.")
+        description=f"Test {who}", tools=["Bash"], model="haiku", maxTurns=4,
+        prompt=f"You are the {who} in a test. To make your fix, {steps[who]} . Then append one line "
+               f"'<ids> {who}' to {run}/fixes.log and reply 'DONE:' followed by the ids in your task.")
     critic = AgentDefinition(
-        description="Test red-team critic", tools=["Read", "Write"], model="haiku", maxTurns=6,
-        prompt=("You are critique-redteam in a test. Full critique: reply CRITIQUE-DONE without tools. "
-                "Fix check for this test: R-005 is only partly fixed (evidence: 'the Summary still has no cases "
-                f"qualifier'); every other id is fixed; no new problems. Run directory: {run}" + op.FIX_CHECK_NOTE))
+        description="Test red-team critic", tools=["Read", "Write"], model="haiku", maxTurns=8,
+        prompt=("You are critique-redteam in a test. Full critique: reply CRITIQUE-DONE without writing files. "
+                "Fix check: judge from the files only. ci_degenerate is fixed when model_output.json gives "
+                "total_cost_usd.ci95 a width above zero. R-005 is fixed when summary.md states the re-anchored "
+                "cases range as numbers; a bare '(re-anchored)' label is only partly fixed. No new problems. "
+                f"Run directory: {run}" + op.FIX_CHECK_NOTE))
     lead_rules = (
         f"You are the lead of a modeling pipeline in a test. Run directory: {run}. The round-2 gate has just run. "
         "Read open_problems.md there. Then: (1) write round_plan.yaml in the run directory with `round: 2` and "
@@ -309,6 +322,10 @@ async def round_plan(query_fn=None):
             "fix_check_file": open(fc).read()[:1500] if os.path.exists(fc) else None,
             "denials": sum(1 for s in spawns if s["denied"]), "text": ((result and result.result) or "")[-200:],
             "fixes_log": open(fixes).read() if os.path.exists(fixes) else None,
+            "summary_md": open(os.path.join(run, "summary.md")).read(),
+            "model_output": open(os.path.join(run, "model_output.json")).read(),
+            "refusals": [f"{r.get('summary', '')[:60]} :: {r['denied'][:140]}"
+                         for r in map(json.loads, open(os.path.join(run, "trace.jsonl"))) if r.get("denied")],
             "tool_results": [e[2] for e in ev if e[0] == "tool_result"][:12]}
 
 

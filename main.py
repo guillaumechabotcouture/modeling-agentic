@@ -1363,9 +1363,16 @@ def _run_self_test() -> int:
              "blocks_in": 0, "fix_check": False, "scope_declarable": False}]},
             open(os.path.join(td, "open_problems.json"), "w"))
 
-        def spawn_as(sub, prompt):
-            return asyncio.run(pre3({"tool_name": "Agent", "tool_input": {
+        start3, stop3 = hk3["SubagentStart"][0].hooks[0], hk3["SubagentStop"][0].hooks[0]
+
+        def spawn_as(sub, prompt, finish=True):
+            r = asyncio.run(pre3({"tool_name": "Agent", "tool_input": {
                 "subagent_type": sub, "description": "d", "prompt": prompt}}, "s", None))
+            if r == {} and finish:   # the spawned agent runs and returns
+                aid = f"a{time.time_ns()}"
+                asyncio.run(start3({"agent_id": aid, "agent_type": sub}, None, None))
+                asyncio.run(stop3({"agent_id": aid, "agent_type": sub}, None, None))
+            return r
         r = spawn_as("modeler", "Fix RIG-001.")
         ok("round_plan.yaml" in json.dumps(r) and "does not exist" in json.dumps(r),
            f"RP1 modeler refused before the round plan exists: {r}")
@@ -1394,6 +1401,30 @@ def _run_self_test() -> int:
         spawn_as("analyst", "R-005 is only partly fixed: the critic says still no qualifier.")
         ok(spawn_as("critique-redteam", "This is critique round 3. ...") == {},
            "RP9 full critique allowed after the one return trip")
+        # RP11-RP16 (Phase 32 γ): the plan is fixed once its work is handed out; reviews wait
+        # for work agents still running in the background
+        def lead_tool(name, inp):
+            return json.dumps(asyncio.run(pre3({"tool_name": name, "tool_input": inp}, "t", None)))
+        plan_p, t_rp = os.path.join(td, "round_plan.yaml"), time.time()
+        r = lead_tool("Write", {"file_path": plan_p, "content": "round: 2\nitems: {}\n"})
+        ok("is fixed" in r and "R-005" in r, f"RP11 the lead cannot rewrite the plan once its work is out: {r}")
+        r = lead_tool("Bash", {"command": f"cd {td} && cat > round_plan.yaml <<'E'\nround: 2\nE"})
+        ok("is fixed" in r, f"RP12 nor through Bash: {r}")
+        ok(spawn_as("modeler", "Re-check RIG-001.", finish=False) == {}, "RP13a modeler spawn allowed")
+        r = json.dumps(spawn_as("critique-redteam", "This is critique round 3. ..."))
+        ok("still working: modeler (launching)" in r, f"RP13 a critic waits for a modeler not yet started: {r}")
+        asyncio.run(start3({"agent_id": "a-run", "agent_type": "modeler"}, None, None))
+        r = json.dumps(spawn_as("writer", "Write the report."))
+        ok("still working: modeler (since" in r, f"RP14 the writer waits for a running modeler: {r}")
+        ok(spawn_as("critique-premortem", "Pre-mortem the plan.") == {}, "RP15 the pre-mortem waits for the planner only")
+        trace.write(json.dumps({"ts": datetime.now().isoformat(), "type": "task_notification",
+                                "task_id": "a-run", "status": "completed"}) + "\n")
+        trace.flush()
+        ok(spawn_as("critique-redteam", "This is critique round 3. ...") == {},
+           "RP16 an agent cut off at its turn limit (task_notification, no stop) counts as finished")
+        from agents import work_running
+        ok(work_running(td, t_rp, now=time.time() + 3600) == [],
+           "RP16b a spawn that never started stops counting after the grace period")
         from agents.enforcement import protected_reason
         ok(protected_reason(os.path.join(td, "round_plan.yaml"), td, "modeler") is not None
            and protected_reason(os.path.join(td, "round_plan.yaml"), td, None) is None
