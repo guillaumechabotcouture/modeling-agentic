@@ -167,7 +167,7 @@ for f in main.py \
   scripts/lib/expert_priors.py scripts/lib/md_helpers.py \
   scripts/lib/positive_control.py scripts/lib/provenance.py \
   scripts/lib/rigor_artifacts.py scripts/lib/safe_io.py \
-  scripts/lib/text_spans.py; do
+  scripts/lib/text_spans.py scripts/lib/transcript_cost.py; do
   echo "== $f"; python3 "$f" --self-test || echo "FAILED: $f"
 done
 python3 scripts/validate_skill_attachments.py      # frontmatter + phantoms

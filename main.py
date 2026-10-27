@@ -107,6 +107,31 @@ async def reconcile_conversation_cost(options, session_id: str, timeout_s: float
         return None
 
 
+TRANSCRIPT_MARGIN = 1.05   # Phase 34 δ: E7 attempt 6, transcript estimate +0.25% vs reported
+
+
+async def crashed_session_cost(options, session_id: str, attempts: int = 3, delay_s: float = 20.0,
+                               query_fn=None, transcript_root: str | None = None):
+    """Phase 34 δ: a crashed session's cumulative cost. Read it back by
+    resuming the conversation (retried: the 2026-10-27 smoke's single try
+    returned nothing, a second scenario's worked), else estimate it from the
+    CLI transcripts (+5%). Returns (result-like or None, source)."""
+    from types import SimpleNamespace
+    for i in range(attempts):
+        r = await reconcile_conversation_cost(options, session_id, query_fn=query_fn)
+        if r is not None:
+            return r, "reconciled: cumulative cost read back after a crash"
+        if i + 1 < attempts:
+            await asyncio.sleep(delay_s)
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "lib"))
+    import transcript_cost
+    est = transcript_cost.conversation_cost(session_id, transcript_root)
+    if est is None:
+        return None, "result"
+    return (SimpleNamespace(total_cost_usd=round(est * TRANSCRIPT_MARGIN, 4), session_id=session_id),
+            f"estimated from the CLI transcripts (+{TRANSCRIPT_MARGIN - 1:.0%}); read-back failed")
+
+
 def charge_session(ledger: dict, session: int, result, allowance: float | None,
                    session_id: str | None = None, elapsed_s: float | None = None,
                    source: str = "result") -> dict:
@@ -848,10 +873,9 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                     session_records.append({"session": session_num, **result_summary(result)})
                 charged_from, source = result, "result"
                 if result is None and session_id and not interrupted:
-                    charged_from = await reconcile_conversation_cost(options, session_id)
-                    source = "reconciled: cumulative cost read back after a crash"
-                    print(f"[budget] session {session_num} ended without a cost; read back "
-                          f"{'$%.4f cumulative' % charged_from.total_cost_usd if charged_from and charged_from.total_cost_usd is not None else 'nothing (charging the allowance)'}",
+                    charged_from, source = await crashed_session_cost(options, session_id)
+                    print(f"[budget] session {session_num} ended without a cost: "
+                          f"{'$%.4f cumulative, %s' % (charged_from.total_cost_usd, source) if charged_from is not None else 'no read-back and no transcript (charging the allowance)'}",
                           flush=True)
                 charge_session(budget, session_num, charged_from, left, session_id=session_id,
                                elapsed_s=(datetime.now().astimezone() - session_started).total_seconds(),
@@ -1953,6 +1977,29 @@ def _run_self_test() -> int:
                                 is_error=True, num_turns=0, session_id="s1", total_cost_usd=0.0)
         ok(asyncio.run(reconcile_conversation_cost(_opts, "s1", query_fn=_fq_zero)) is None,
            "CR18 an error or zero-cost read-back is not a cost reading (crash smoke 5 read back $0.00)")
+        # CR19 (Phase 34 δ): the read-back is retried, then the transcripts give the cost.
+        _tr_root = os.path.join(td, "projects")
+        os.makedirs(os.path.join(_tr_root, "-tmp-x"), exist_ok=True)
+        with open(os.path.join(_tr_root, "-tmp-x", "s1.jsonl"), "w") as _f:
+            _f.write(json.dumps({"type": "assistant", "message": {"id": "m1", "model": "claude-opus-5-5",
+                                                                   "usage": {"input_tokens": 500_000}}}) + "\n")
+        _calls = []
+
+        async def _fq_count(prompt, options):
+            _calls.append(1)
+            async for m in _fq_fail(prompt, options):
+                yield m
+        _c, _src = asyncio.run(crashed_session_cost(_opts, "s1", attempts=3, delay_s=0, query_fn=_fq_count,
+                                                    transcript_root=_tr_root))
+        ok(len(_calls) == 3 and _c is not None and abs(_c.total_cost_usd - 2.1) < 1e-9
+           and _src.startswith("estimated from the CLI transcripts"),
+           f"CR19 three read-back tries, then the transcript estimate (+5%): {len(_calls)} {_c} {_src}")
+        _c2, _ = asyncio.run(crashed_session_cost(_opts, "s9", attempts=1, delay_s=0, query_fn=_fq_fail,
+                                                  transcript_root=_tr_root))
+        _c3, _src3 = asyncio.run(crashed_session_cost(_opts, "s1", attempts=3, delay_s=0, query_fn=_fq_ok,
+                                                      transcript_root=_tr_root))
+        ok(_c2 is None and _c3.total_cost_usd == 62.5 and _src3.startswith("reconciled"),
+           "CR19b no transcript -> None (allowance charged); a working read-back is used first")
         write_budget_ledger(td, led, 5.0)
         again = load_budget_ledger(td)
         ok(remaining_budget(5.0, again["sessions"]) == 0 and again["spent_usd"] == 5.0
