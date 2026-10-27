@@ -361,13 +361,24 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
     # successes elsewhere in the batch (other dask chunks, rows reused on resume)
     prior_ok = int(prior_ok or 0) + int(os.environ.get("MA_COMPUTE_PRIOR_OK") or 0)
 
+    def init_core_s():
+        # Model load time already spent by pool processes (added to core_s at the end).
+        t = 0.0
+        for name in os.listdir(init_dir.name):
+            if not name.endswith(".err"):
+                try:
+                    t += float(open(os.path.join(init_dir.name, name)).read())
+                except (OSError, ValueError):
+                    pass
+        return t
+
     def rebudget():
         # Fewer processes burn the allowance more slowly: move the cap's wall-clock stop.
         nonlocal deadline, why
         if allowance_s is not None:
             busy = max(cap, len(running))     # a shrinking pool still runs its in-flight inputs
             now = time.time()
-            used = progress["core_s"] + sum(now - t for _, t in running.values())   # in flight counts too
+            used = progress["core_s"] + init_core_s() + sum(now - t for _, t in running.values())   # in flight, loads
             deadline, why = _budget_deadline(user_deadline, max(0.0, allowance_s - used), busy)
     ex = new_pool(cap)
     try:
@@ -459,7 +470,7 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
                 if reason:
                     stop = reason
                     break
-            if (todo or running) and allowance_s is not None and progress["core_s"] >= allowance_s:
+            if (todo or running) and allowance_s is not None and progress["core_s"] + init_core_s() >= allowance_s:
                 stop = CAP_STOP
                 break
     finally:
