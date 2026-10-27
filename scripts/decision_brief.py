@@ -20,6 +20,9 @@ The planner writes `decision_brief.yaml` with plan.md:
     constraints:        - {id: C1, text: "..."}
     accounting:         - {id: K1, text: "<how benefits and costs are counted>"}
     out_of_scope:       - {id: OS1, text: "...", reason: "..."}
+    comparators:        # what impact is measured against; exactly one primary
+      - {id: CF1, role: primary, text: "<what happens without the plan>"}
+      - {id: CF2, role: sensitivity, text: "..."}
     acceptance: [HB-001, MB-002, ...]   # ids in success_criteria.yaml
     open_questions:     - {id: Q1, question: "...", proposed: "<proposed answer>"}
 
@@ -31,6 +34,13 @@ the first time the gate sees it. Any later change is a HIGH, non-declarable
 `acceptance_criteria_changed`. Framing changes the run discovers go in
 `brief_amendments.yaml` (lead-written, shown in the report); acceptance
 criteria cannot be amended in-run.
+
+Phase 38: the comparator is part of the brief. E7 attempt 7's round-1 headline
+was measured against "every net withdrawn"; the critics' largest finding was
+that comparator, and fixing it rebuilt the simulation library (279
+core-hours, about 4 hours). Each comparator says what happens in each unit
+without the plan: other funders' and routine activity, and how coverage
+evolves over the window. One is primary; the others are sensitivities.
 
 Critics tie each HIGH / MEDIUM finding to the brief item it threatens
 (`brief_item:`), or GAP when the brief does not settle something the decision
@@ -59,7 +69,9 @@ CRITERIA, BENCHMARKS = "success_criteria.yaml", "models/benchmark_targets.yaml"
 FROZEN_AT_SIGNOFF = (BRIEF, CRITERIA)
 SCOPED_CRITICS = ("critique-domain", "critique-presentation", "critique-redteam", "critique-methods")
 GAP, NONE = "GAP", "NONE"
-_LISTS = {"answers": "A", "constraints": "C", "accounting": "K", "out_of_scope": "OS", "open_questions": "Q"}
+_LISTS = {"answers": "A", "constraints": "C", "accounting": "K", "out_of_scope": "OS", "comparators": "CF",
+          "open_questions": "Q"}
+COMPARATOR_ROLES = ("primary", "sensitivity")
 _TEXT = ("question", "decision", "decision_maker", "objective")
 FRAMING_PREFIXES = tuple(_LISTS.values())
 
@@ -70,7 +82,8 @@ CRITIC_NOTE = """
 `decision_brief.yaml` (signed before compute) says what this analysis must
 deliver: the decision, the answers and the resolution they are published at
 (A*), constraints (C*), accounting conventions (K*), what is out of scope
-(OS*), and the acceptance criteria (ids from success_criteria.yaml). Judge
+(OS*), what impact is measured against (CF*: one primary comparator, the
+others sensitivities), and the acceptance criteria (ids from success_criteria.yaml). Judge
 the work against it. Give every HIGH or MEDIUM blocker a `brief_item:` field:
 the id it threatens, or `GAP` when the brief does not settle something the
 decision depends on (say in the claim what the brief should settle), or
@@ -128,6 +141,12 @@ def validate(doc: dict, run_dir: str) -> list[str]:
             continue
         if key in ("answers",) and not items:
             errors.append("answers: at least one answer the report must give")
+        if key == "comparators":
+            prim = [it for it in items if isinstance(it, dict) and it.get("role") == "primary"]
+            if len(prim) != 1:
+                errors.append("comparators: exactly one primary comparator (what happens without the plan: other "
+                              "funders' and routine activity, and how coverage evolves over the window); "
+                              f"found {len(prim)}")
         for it in items:
             iid = str((it or {}).get("id") or "") if isinstance(it, dict) else ""
             if not re.fullmatch(rf"{prefix}\d+", iid):
@@ -143,6 +162,8 @@ def validate(doc: dict, run_dir: str) -> list[str]:
                 errors.append(f"{iid}: resolution is empty (the unit results are published at)")
             if key == "out_of_scope" and not str(it.get("reason") or "").strip():
                 errors.append(f"{iid}: reason is empty")
+            if key == "comparators" and it.get("role") not in COMPARATOR_ROLES:
+                errors.append(f"{iid}: role must be one of {', '.join(COMPARATOR_ROLES)}")
             if key == "open_questions" and not str(it.get("proposed") or "").strip():
                 errors.append(f"{iid}: proposed answer is empty")
     acc = doc.get("acceptance") or []
@@ -232,7 +253,7 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
 
 
 def _amendments_ok_ids(ids) -> bool:
-    return all(re.fullmatch(r"(?:OS|[ACKQ])\d+", str(i)) for i in ids)
+    return all(re.fullmatch(r"(?:OS|CF|[ACKQ])\d+", str(i)) for i in ids)
 
 
 def restore(run_dir: str) -> list[str]:
@@ -275,6 +296,7 @@ def render_md(run_dir: str) -> str:
            f"**Objective:** {doc.get('objective')}", ""]
     titles = {"answers": "What the report must answer", "constraints": "Constraints",
               "accounting": "Accounting conventions", "out_of_scope": "Out of scope",
+              "comparators": "Compared with (what happens without the plan)",
               "open_questions": "Open questions for the owner"}
     for key, title in titles.items():
         items = [it for it in doc.get(key) or [] if isinstance(it, dict)]
@@ -288,6 +310,8 @@ def render_md(run_dir: str) -> str:
                 out.append(f"- **{it['id']}** {it.get('text')}: {it.get('reason')}")
             elif key == "open_questions":
                 out.append(f"- **{it['id']}** {it.get('question')}  \n  Proposed: {it.get('proposed')}")
+            elif key == "comparators":
+                out.append(f"- **{it['id']}** ({it.get('role')}) {it.get('text')}")
             else:
                 out.append(f"- **{it['id']}** {it.get('text')}")
         out.append("")
@@ -315,7 +339,7 @@ def _amendments(run_dir: str) -> tuple[list[dict], list[str]]:
             continue
         item, aid = str(am.get("item") or ""), am.get("id") or "?"
         if not _amendments_ok_ids([item]):
-            errors.append(f"{aid}: only framing items (A, C, K, OS, Q ids) can be amended in-run, not {item or '?'}")
+            errors.append(f"{aid}: only framing items (A, C, K, OS, CF, Q ids) can be amended in-run, not {item or '?'}")
         elif len(str(am.get("reason") or "").strip()) < 20 or not str(am.get("change") or "").strip():
             errors.append(f"{aid}: needs `change` and a `reason`")
         else:
@@ -394,7 +418,7 @@ def tie_findings(critiques: dict, run_dir: str) -> list[dict]:
             bad.setdefault(reviewer, []).append(f"{b.get('id')} ({tie or 'missing'})")
     return [{"kind": "critique_brief_item_invalid", "severity": "MEDIUM", "stage": "CRITIQUE",
              "claim": (f"{r}: findings not tied to a decision-brief item: {', '.join(v)}. They still block. "
-                       "Re-spawn the critic to give each a brief_item (an A/C/K/OS/Q or acceptance id, GAP, "
+                       "Re-spawn the critic to give each a brief_item (an A/C/K/OS/CF/Q or acceptance id, GAP, "
                        "or NONE).")} for r, v in bad.items()]
 
 
@@ -415,6 +439,8 @@ def _run_self_test() -> int:
         "constraints": [{"id": "C1", "text": "Total cost at most the envelope"}],
         "accounting": [{"id": "K1", "text": "Benefits counted within the grant window"}],
         "out_of_scope": [{"id": "OS1", "text": "Other diseases", "reason": "single-disease grant"}],
+        "comparators": [{"id": "CF1", "role": "primary", "text": "Current coverage kept by routine channels"},
+                        {"id": "CF2", "role": "sensitivity", "text": "No replacement of current coverage"}],
         "acceptance": ["HB-001"],
         "open_questions": [{"id": "Q1", "question": "Is continuity a constraint?", "proposed": "No"}],
     }
@@ -427,7 +453,19 @@ def _run_self_test() -> int:
         errs = load_brief(d)[1]
         ok(status(d) == "invalid" and any("HB-009" in e for e in errs) and any("resolution" in e for e in errs),
            f"DB2: invalid brief: {errs}")
+        w(BRIEF, {k: v for k, v in brief.items() if k != "comparators"})
+        errs = load_brief(d)[1]
+        ok(status(d) == "invalid" and any("exactly one primary comparator" in e for e in errs),
+           f"DB2b (Phase 38): a brief without a comparator cannot be signed: {errs}")
+        w(BRIEF, {**brief, "comparators": [{"id": "CF1", "role": "primary", "text": "a"},
+                                           {"id": "CF2", "role": "primary", "text": "b"},
+                                           {"id": "CF3", "role": "main", "text": "c"}, {"id": "CF4", "role": "sensitivity"}]})
+        errs = load_brief(d)[1]
+        ok(any("found 2" in e for e in errs) and any("CF3: role" in e for e in errs) and any("CF4: text" in e for e in errs),
+           f"DB2c (Phase 38): one primary, known roles, each comparator described: {errs}")
         w(BRIEF, brief)
+        ok(_amendments_ok_ids(["CF2"]) and "Compared with" in render_md(d) and "CF1" in item_ids(d),
+           "DB2d (Phase 38): comparators are amendable, rendered and tie targets")
         ok(status(d) == "awaiting", "DB3: valid, not signed")
         ok(any(f["kind"] == "decision_brief_not_signed" for f in gate_findings(d)), "DB4: unsigned brief at the gate")
         try:
@@ -493,6 +531,7 @@ def _run_self_test() -> int:
         yaml.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d, CRITERIA), "w"))
         yaml.safe_dump({"question": "q", "decision": "d", "decision_maker": "m", "objective": "o",
                         "answers": [{"id": "A1", "statement": "s", "resolution": "district"}],
+                        "comparators": [{"id": "CF1", "role": "primary", "text": "status quo"}],
                         "acceptance": ["HB-001"]}, open(os.path.join(d, BRIEF), "w"))
         sign(d, "owner", accept_proposed=True)
         open(os.path.join(d, BRIEF), "a").write("# edited\n")

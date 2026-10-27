@@ -261,8 +261,9 @@ WRITER_BRIEF_NOTE = """
 
 Open the report's first section by restating the signed decision brief in
 plain words (decision_brief.yaml and decision_brief.signoff.json): the
-decision, what the report answers and at what resolution, what is out of
-scope, and the owner's answers to its open questions. If brief_amendments.yaml
+decision, what the report answers and at what resolution, what impact is
+measured against (the primary comparator), what is out of scope, and the
+owner's answers to its open questions. If brief_amendments.yaml
 exists, list each amendment and its reason there too. Answer each A* item
 of the brief, at its stated resolution, before anything else.
 """
@@ -488,15 +489,17 @@ If critical sections are missing, re-spawn planner with specific feedback.
 `decision_brief.yaml` is the target the whole run is judged against: the
 decision and who makes it, what the report must answer and at what
 resolution, the objective, constraints, accounting conventions, what is out
-of scope, the acceptance criteria, and open questions for the owner. Check
-that it is faithful to the question and that its open questions are the
-framing choices that matter. Nothing but planning runs until it is signed;
+of scope, what impact is measured against (comparators: one primary, the
+others sensitivities), the acceptance criteria, and open questions for the
+owner. Check that it is faithful to the question, that the primary
+comparator describes what actually happens without the plan, and that its
+open questions are the framing choices that matter. Nothing but planning runs until it is signed;
 the harness says whether the owner signs (end your turn with
 AWAITING_SIGNOFF and you are resumed with the owner's answers) or you do.
 After sign-off the brief and success_criteria.yaml are frozen and the
 benchmark bands are locked when the gate first sees them; record framing
 changes you discover in `brief_amendments.yaml` (`amendments:` list of
-{id: AM-1, item: <A/C/K/OS/Q id>, change, reason}); acceptance criteria
+{id: AM-1, item: <A/C/K/OS/CF/Q id>, change, reason}); acceptance criteria
 cannot be changed in-run. Pass the owner's answers to every specialist.
 
 ### STAGE 2: DATA
