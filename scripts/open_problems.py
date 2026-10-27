@@ -191,7 +191,8 @@ def build(run_dir: str, round_n: int, max_rounds: int, critiques: dict,
         items[iid] = {
             "id": iid, "source": "gate", "severity": "HIGH", "kind": a.get("kind"),
             "target_stage": str(a.get("target_stage") or a.get("stage") or "MODEL").upper(),
-            "first_seen_round": round_n, "blocks_in": 0, "scope_declarable": False,
+            "first_seen_round": round_n, "blocks_in": 0,
+            "scope_declarable": a.get("scope_declarable") is True,   # as the gate decided (Gemini review)
             "fix_check": False, "claim": _short(a.get("claim") or a.get("artifact")),
             "fix_requires": "", "status": "",
         }
@@ -347,6 +348,10 @@ def check_plan(run_dir: str) -> list[str]:
             errors.append(f"{i['id']}: action {act!r} is not one of {', '.join(ACTIONS)}")
         elif act in WORK_ACTIONS and stage not in STAGES:
             errors.append(f"{i['id']}: {act} needs stage: one of {', '.join(STAGES)}")
+        elif act in WORK_ACTIONS and stage == "WRITE" and not _written(run_dir):
+            # Gemini review: the writer waits for the gate, so a WRITE fix before
+            # the first draft could never be handed out.
+            errors.append(f"{i['id']}: there is no write-up yet, so plan it as after_write")
         elif act in ("declare", "defer") and len(reason.strip()) < MIN_REASON:
             errors.append(f"{i['id']}: {act} needs a reason")
         elif act == "after_write" and i["target_stage"] != "WRITE":
@@ -514,8 +519,41 @@ def check_fix_checks(run_dir: str) -> tuple[list[str], dict[str, list[str]]]:
         for p in news:
             if p.get("severity") == "HIGH":
                 stage = str(p.get("target_stage") or "MODEL").upper()
-                redo.setdefault(STAGE_AGENT.get(stage, "modeler"), []).append(str(p.get("id") or "new problem"))
+                pid = str(p.get("id") or "")
+                # Gemini review: a new problem with no trackable id, or one for a
+                # write-up that does not exist yet, could never count as sent back
+                # (and the writer waits for the gate): the full critique and the
+                # next gate take it up instead.
+                if not re.fullmatch(r"[A-Z]{1,4}-\d{2,4}", pid) or (stage == "WRITE" and not _written(run_dir)):
+                    continue
+                redo.setdefault(STAGE_AGENT.get(stage, "modeler"), []).append(pid)
     return missing, redo
+
+
+def redo_since(run_dir: str) -> dict[str, float]:
+    """Gemini review: each item to send back counts spawns after its own
+    critic's fix check, not after the latest of all critics' checks."""
+    doc = load_open(run_dir)
+    out: dict[str, float] = {}
+    if doc is None:
+        return out
+    for f in os.listdir(run_dir):
+        if not (f.startswith(f"fix_check_r{doc['round']}_") and f.endswith(".yaml")):
+            continue
+        path = os.path.join(run_dir, f)
+        try:
+            fc = _load_yaml(path) or {}
+            ids = list(_checks(fc)) + [str(p.get("id")) for p in (fc.get("new_problems") or [])
+                                       if isinstance(p, dict) and p.get("id")]
+        except (yaml.YAMLError, OSError, AttributeError, TypeError):
+            continue
+        for i in ids:
+            out[i] = os.path.getmtime(path)
+    return out
+
+
+def _written(run_dir: str) -> bool:
+    return any(os.path.exists(os.path.join(run_dir, f)) for f in ("report.md", "manuscript.md"))
 
 
 def fix_check_mtime(run_dir: str) -> float | None:

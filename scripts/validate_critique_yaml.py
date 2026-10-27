@@ -3565,7 +3565,19 @@ def _apply_brief_scope(decision: dict, critiques: dict, run_dir: str,
         b for b in decision.get("unresolved_high") or []
         if not (b.get("kind") == "critique_blocker" and str(b.get("id")) in outside)]
     decision["outside_brief"] = sorted(outside)
+    _drop_attempts(decision, outside)
     return _recompute_action(decision, max_rounds, current_round)
+
+
+def _drop_attempts(decision: dict, ids) -> None:
+    """Gemini review: findings closed by their test or put outside the brief
+    no longer count toward the stuck-blocker escalation."""
+    ids = {str(i) for i in ids}
+    att = {k: v for k, v in (decision.get("blocker_attempts") or {}).items() if str(k) not in ids}
+    decision["blocker_attempts"] = att
+    decision["escalation_required"] = any(
+        info.get("severity") == "HIGH" and info.get("patch_attempts", 0) >= _ESCALATION_HIGH_THRESHOLD
+        for info in att.values())
 
 
 def _defer_write_findings(decision: dict, run_dir: str, max_rounds: int, current_round: int) -> dict:
@@ -3605,6 +3617,7 @@ def _apply_done_when(decision: dict, critiques: dict, run_dir: str, max_rounds: 
         b for b in decision.get("unresolved_high") or []
         if not (b.get("kind") == "critique_blocker" and str(b.get("id")) in passed)]
     decision["resolved_by_test"] = sorted(passed)
+    _drop_attempts(decision, passed)
     return _recompute_action(decision, max_rounds, current_round), res
 
 
@@ -5503,7 +5516,7 @@ def _incorporate_rigor_violations(decision: dict, violations: list[dict],
             continue
         entries.append({
             "category": "METHODS",
-            "target_stage": "MODEL",
+            "target_stage": v.get("target_stage") or "MODEL",   # e.g. a done_when regression's own stage
             "first_seen_round": v.get("first_seen_round", current_round),
             "claim": f"{v.get('stage', '?')}/{v['kind']}: {v.get('claim', '')}",
             "kind": v["kind"],

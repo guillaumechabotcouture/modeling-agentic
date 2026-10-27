@@ -46,6 +46,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 
@@ -53,6 +54,7 @@ import yaml
 
 BRIEF, SIGNOFF, LOCK, AMENDMENTS = ("decision_brief.yaml", "decision_brief.signoff.json",
                                     "acceptance_lock.json", "brief_amendments.yaml")
+SIGNED_DIR = "decision_brief.signed"   # copies of the frozen files as signed (Gemini review)
 CRITERIA, BENCHMARKS = "success_criteria.yaml", "models/benchmark_targets.yaml"
 FROZEN_AT_SIGNOFF = (BRIEF, CRITERIA)
 SCOPED_CRITICS = ("critique-domain", "critique-presentation", "critique-redteam", "critique-methods")
@@ -185,9 +187,9 @@ def _signoff(run_dir: str) -> dict | None:
 def status(run_dir: str) -> str:
     """absent | invalid | awaiting | changed | signed."""
     doc, errors = load_brief(run_dir)
-    if doc is None and errors and "does not exist" in errors[0]:
-        return "absent"
     so = _signoff(run_dir)
+    if doc is None and errors and "does not exist" in errors[0] and so is None:
+        return "absent"   # (a brief deleted after sign-off is "changed", Gemini review)
     if so is not None:
         changed = [f for f in FROZEN_AT_SIGNOFF if _sha(os.path.join(run_dir, f)) != so.get("sha256", {}).get(f)]
         return "changed" if changed else "signed"
@@ -218,9 +220,33 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
         "sha256": {f: _sha(os.path.join(run_dir, f)) for f in FROZEN_AT_SIGNOFF},
         "producer": "scripts/decision_brief.py",
     }
+    # Gemini review: keep the signed versions, so a changed file can be restored.
+    os.makedirs(os.path.join(run_dir, SIGNED_DIR), exist_ok=True)
+    for f in FROZEN_AT_SIGNOFF:
+        src = os.path.join(run_dir, f)
+        if os.path.exists(src):
+            shutil.copyfile(src, os.path.join(run_dir, SIGNED_DIR, f))
     with open(os.path.join(run_dir, SIGNOFF), "w", encoding="utf-8") as f:
         json.dump(record, f, indent=1)
     return record
+
+
+def _amendments_ok_ids(ids) -> bool:
+    return all(re.fullmatch(r"(?:OS|[ACKQ])\d+", str(i)) for i in ids)
+
+
+def restore(run_dir: str) -> list[str]:
+    """Copy the signed versions back over frozen files that changed."""
+    so = _signoff(run_dir)
+    if so is None:
+        return []
+    done = []
+    for f in FROZEN_AT_SIGNOFF:
+        saved = os.path.join(run_dir, SIGNED_DIR, f)
+        if os.path.exists(saved) and _sha(os.path.join(run_dir, f)) != (so.get("sha256") or {}).get(f):
+            shutil.copyfile(saved, os.path.join(run_dir, f))
+            done.append(f)
+    return done
 
 
 def signoff_text(run_dir: str) -> str | None:
@@ -288,7 +314,7 @@ def _amendments(run_dir: str) -> tuple[list[dict], list[str]]:
             errors.append(f"{AMENDMENTS}: an entry is not a mapping")
             continue
         item, aid = str(am.get("item") or ""), am.get("id") or "?"
-        if not item.startswith(FRAMING_PREFIXES):
+        if not _amendments_ok_ids([item]):
             errors.append(f"{aid}: only framing items (A, C, K, OS, Q ids) can be amended in-run, not {item or '?'}")
         elif len(str(am.get("reason") or "").strip()) < 20 or not str(am.get("change") or "").strip():
             errors.append(f"{aid}: needs `change` and a `reason`")
@@ -464,11 +490,27 @@ def _run_self_test() -> int:
             owner_kinds = [f["kind"] for f in gate_findings(d)]
         finally:
             os.environ.pop("MA_SIGNOFF_MODE", None) if old_mode is None else os.environ.update(MA_SIGNOFF_MODE=old_mode)
+        yaml.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d, CRITERIA), "w"))
+        yaml.safe_dump({"question": "q", "decision": "d", "decision_maker": "m", "objective": "o",
+                        "answers": [{"id": "A1", "statement": "s", "resolution": "district"}],
+                        "acceptance": ["HB-001"]}, open(os.path.join(d, BRIEF), "w"))
+        sign(d, "owner", accept_proposed=True)
+        open(os.path.join(d, BRIEF), "a").write("# edited\n")
+        st_changed = status(d)
+        restored = restore(d)
+        os.remove(os.path.join(d, BRIEF))
+        st_deleted = status(d)
+        restore(d)
+        ok(st_changed == "changed" and restored == [BRIEF] and st_deleted == "changed" and status(d) == "signed",
+           f"DB20: a changed or deleted signed file is restored from the signed copy: {st_changed} {st_deleted}")
+        ok(_amendments_ok_ids(["A1", "OS2", "Q10"]) and not _amendments_ok_ids(["Apple", "A", "OSX"]),
+           "DB21: amendment ids must be A/C/K/Q/OS plus a number")
         ok("decision_brief_not_signed" not in none_kinds and "decision_brief_not_signed" in owner_kinds,
            f"DB18: an unsigned brief is a finding unless the run asked for no sign-off: {none_kinds} {owner_kinds}")
+        before = _sha(os.path.join(d, SIGNOFF))
         r = subprocess.run([sys.executable, os.path.abspath(__file__), "--by", "owner", "sign", d, "--accept-proposed"],
                            env=dict(os.environ, MA_SIGNOFF_MODE="owner"), capture_output=True, text=True)
-        ok(r.returncode != 0 and "agents cannot sign" in r.stderr and not is_signed(d),
+        ok(r.returncode != 0 and "agents cannot sign" in r.stderr and _sha(os.path.join(d, SIGNOFF)) == before,
            f"DB19: in owner mode the agents' environment cannot sign, flags in any order: {r.stderr[:200]}")
     if fails:
         print("FAIL:", *fails, sep="\n  ")
@@ -479,7 +521,7 @@ def _run_self_test() -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Decision brief: show, sign, check")
-    ap.add_argument("cmd", nargs="?", choices=["show", "sign", "status"])
+    ap.add_argument("cmd", nargs="?", choices=["show", "sign", "status", "restore"])
     ap.add_argument("run_dir", nargs="?")
     ap.add_argument("--by", default="owner")
     ap.add_argument("--answers", help="YAML mapping Q-id -> answer")
@@ -498,6 +540,10 @@ def main() -> int:
     if a.cmd == "status":
         print(status(a.run_dir))
         return 0
+    if a.cmd == "restore":
+        done = restore(a.run_dir)
+        print(f"Restored the signed {', '.join(done)}." if done else "Nothing to restore.")
+        return 0 if status(a.run_dir) in ("signed", "absent") else 1
     if os.environ.get("MA_SIGNOFF_MODE") == "owner":
         # Set only in the agents' environment (main.py): the owner signs from
         # a shell of their own (Codex review: `--by owner` alone was enough).

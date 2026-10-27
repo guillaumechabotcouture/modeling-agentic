@@ -1541,7 +1541,13 @@ def _run_self_test() -> int:
            and "deny" not in call5("Agent", {"subagent_type": "data-agent", "prompt": "x"}),
            "SO7 signed: the wait ends and work proceeds")
         open(os.path.join(td, "success_criteria.yaml"), "a").write("# moved\n")
-        ok("frozen" in (signoff_hold_reason(td, "owner") or ""), "SO8 criteria edited after sign-off: work stops")
+        ok("frozen" in (signoff_hold_reason(td, "owner") or "") and "decision_brief.py restore" in
+           (signoff_hold_reason(td, "owner") or ""), "SO8 criteria edited after sign-off: work stops until restored")
+        from agents.enforcement import protected_reason as _pr, is_harness_path as _ihp, REPO_ROOT as _RR
+        ok(_pr(os.path.join(td, "decision_brief.yaml"), td, "planner") is not None
+           and _pr(os.path.join(td, "success_criteria.yaml"), td, None) is not None
+           and not _ihp(_RR) and _ihp(os.path.join(_RR, "docs")),
+           "SO10 once signed the brief and criteria are frozen for every agent; docs/ (parent of docs/lessons) is harness")
         ok(exit_code_for("awaiting_signoff") == 2, "SO9 a paused run exits 2 (resumable)")
         for f in ("success_criteria.yaml", "decision_brief.yaml", "decision_brief.signoff.json", "decision_brief.md"):
             if os.path.exists(os.path.join(td, f)):

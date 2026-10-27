@@ -153,13 +153,29 @@ def problems(dw) -> list[str]:
             out.append(f"{c.get('file')}: agg must be sum, mean, min, max or count")
         if forms[0] == "column" and not isinstance(c.get("where") or {}, dict):
             out.append(f"{c.get('file')}: where must map column names to values")
-        if forms[0] == "column" and "min_rows" in c and not (isinstance(c["min_rows"], int) and c["min_rows"] > 0):
+        if forms[0] == "column" and "min_rows" in c and not (
+                isinstance(c["min_rows"], int) and not isinstance(c["min_rows"], bool) and c["min_rows"] > 0):
             out.append(f"{c.get('file')}: min_rows must be a positive whole number")
         if forms[0] in ("contains", "lacks"):
+            if not isinstance(c[forms[0]], str) or not c[forms[0]].strip():
+                out.append(f"{c.get('file')}: {forms[0]} needs a non-empty regex")   # "" matches everything
+                continue
             try:
                 re.compile(str(c[forms[0]]))
             except re.error as e:
                 out.append(f"{c.get('file')}: bad regex: {e}")
+        if forms[0] == "exists" and not isinstance(c["exists"], bool):
+            out.append(f"{c.get('file')}: exists must be true or false")
+        if forms[0] in ("key", "column") and not str(c.get(forms[0]) or "").strip():
+            out.append(f"{c.get('file')}: {forms[0]} must name a {'value' if forms[0] == 'key' else 'column'}")
+        if forms[0] in ("key", "column") and "value" not in c:
+            out.append(f"{c.get('file')}: give the value to compare with")
+        if forms[0] in ("key", "column") and c.get("op") in ("<", "<=", ">", ">=", "width_gt") \
+                and not _is_number(c.get("value")):
+            out.append(f"{c.get('file')}: {c.get('op')} needs a number as value")
+        if forms[0] in ("key", "column") and c.get("op") == "between" and isinstance(c.get("value"), list) \
+                and not all(_is_number(x) for x in c["value"]):
+            out.append(f"{c.get('file')}: between needs two numbers")
         if forms[0] in ("key", "column"):
             op = c.get("op")
             if op not in OPS:
@@ -201,6 +217,10 @@ def _lookup(doc, key: str):
     return cur
 
 
+def _is_number(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
 def _cell(v: str):
     """A CSV cell as a number when it reads as one, else the stripped text."""
     try:
@@ -217,7 +237,12 @@ def _num(x):
 
 def _compare(v, op: str, want) -> bool:
     if op == "==":
-        return v == want or (not isinstance(v, (str, bool)) and _num(v) == _num(want))
+        if v == want:
+            return True
+        try:   # 1 == 1.0 and "1" (a CSV cell) == 1; anything else is simply unequal
+            return _num(v) == _num(want)
+        except (TypeError, ValueError):
+            return False
     if op == "!=":
         return not _compare(v, "==", want)
     if op == "in":
@@ -528,6 +553,17 @@ def _self_test() -> int:
            and evaluate(col(op="==", value="IRS", rows="all", where={"cost": 9}), d)[0] is False
            and problems({"file": "a.csv", "column": "x", "op": "matches", "value": "("}) != []
            and problems(col(op="==", value=1, rows="most")), "DW7b CSV column forms: none / any / all, missing column")
+        bad2 = [problems({"file": "a.md", "contains": ""}), problems({"file": "a.md", "lacks": None}),
+                problems({"file": "a.md", "exists": "yes"}), problems({"file": "a.json", "key": "", "op": "==", "value": 1}),
+                problems({"file": "a.json", "key": "x", "op": ">"}), problems({"file": "a.json", "key": "x", "op": ">", "value": "big"}),
+                problems({"file": "a.csv", "column": "c", "op": "==", "value": 1, "min_rows": True}),
+                problems({"file": "a.json", "key": "x", "op": "between", "value": ["a", 2]})]
+        ok(all(bad2), f"DW3b empty regex, non-boolean exists, empty key, missing or non-numeric values, boolean min_rows: {bad2}")
+        json.dump({"pair": [1, 2], "name": "P5", "n": 3}, open(os.path.join(d, "v.json"), "w"))
+        ok(evaluate({"file": "v.json", "key": "pair", "op": "!=", "value": [1, 3]}, d)[0] is True
+           and evaluate({"file": "v.json", "key": "name", "op": "!=", "value": 5}, d)[0] is True
+           and evaluate({"file": "v.json", "key": "n", "op": "==", "value": 3.0}, d)[0] is True,
+           "DW7f == / != on lists, strings and numbers do not raise")
         ok(evaluate(col(column="cost", agg="sum", op="<=", value=31), d)[0] is True
            and evaluate(col(column="cost", agg="sum", op="<=", value=30), d)[0] is False
            and evaluate(col(column="cost", agg="max", op="==", value=12), d)[0] is True

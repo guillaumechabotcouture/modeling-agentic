@@ -85,12 +85,16 @@ SCRIPT_OUTPUTS = (
     "open_problems.json.tmp",
     "open_problems.md.tmp",
     "decision_brief.signoff.json",   # Phase 33 α: scripts/decision_brief.py sign
+    "decision_brief.signed/*",       # the signed copies, for restoring a changed file
     "acceptance_lock.json",          # Phase 33 α: written by the gate
     "done_when_registry.json",       # Phase 34: frozen finding tests, written by the gate
     "done_when_registry.json.tmp",
     "round_plan.frozen.json",        # Phase 32 γ: the plan as handed out, written by the hook
     "round_plan.frozen.json.tmp",
 )
+
+# Phase 33 α (Gemini review): frozen once decision_brief.signoff.json exists.
+SIGNED_FILES = ("decision_brief.yaml", "success_criteria.yaml")
 
 # Files only one writer may change (None = the lead). Phase 32 α: the round
 # plan; Phase 33 α: the decision brief (planner) and its amendments (lead).
@@ -143,6 +147,12 @@ def is_harness_path(path: str, cwd: str | None = None) -> bool:
         return False
     if rel in HARNESS_FILES:
         return True
+    # Gemini review: a parent of a protected directory reaches it too. (The
+    # repo root itself is not listed: a relative `.` after an unknown `cd` is
+    # checked against the root, and `cp x .` in a run directory is routine;
+    # whole-repo git reverts are caught by the harness hash in main.py.)
+    if rel != "." and any(d.startswith(rel + os.sep) for d in PROTECTED_REPO_DIRS):
+        return True
     if any(rel == d or rel.startswith(d + os.sep) for d in PROTECTED_REPO_DIRS):
         return True
     first = rel.split(os.sep, 1)[0]
@@ -191,6 +201,11 @@ def protected_reason(path: str, run_path: str, agent_type: str | None,
     m = re.fullmatch(r"fix_check_r\d+_([a-z]+)\.yaml", rel)
     if m and agent_type is not None and agent_type != f"critique-{m.group(1)}":
         return f"{rel} is written only by critique-{m.group(1)}"
+    if rel in SIGNED_FILES and os.path.exists(os.path.join(run_path, "decision_brief.signoff.json")):
+        # Gemini review: once signed these are frozen for everyone; framing
+        # changes go in brief_amendments.yaml (the lead), not the files.
+        return (f"{rel} was signed by the owner and is frozen; record framing changes in "
+                "brief_amendments.yaml")
     if rel in OWNED_BY and agent_type not in OWNED_BY[rel]:
         who = ", ".join("the lead" if w is None else w for w in OWNED_BY[rel])
         return f"{rel} is written only by {who}"

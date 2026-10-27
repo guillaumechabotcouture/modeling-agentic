@@ -1433,7 +1433,7 @@ def _plan_required(run_path: str) -> dict | None:
     return doc
 
 
-def _lead_spawns_since(run_path: str, since: float) -> list[tuple[str, set]]:
+def _lead_spawns_since(run_path: str, since: float, with_time: bool = False) -> list[tuple]:
     """(subagent_type, ids named in its prompt) for lead spawns after `since`
     (an mtime), read back from trace.jsonl so a resumed session sees them."""
     out = []
@@ -1443,8 +1443,10 @@ def _lead_spawns_since(run_path: str, since: float) -> list[tuple[str, set]]:
                 continue
             try:
                 r = json.loads(line)
-                if datetime.fromisoformat(r["ts"]).timestamp() >= since and not r.get("denied"):
-                    out.append((r.get("subagent_type"), set(r.get("mentions") or ())))
+                t = datetime.fromisoformat(r["ts"]).timestamp()
+                if t >= since and not r.get("denied"):
+                    out.append((r.get("subagent_type"), set(r.get("mentions") or ()))
+                               + ((t,) if with_time else ()))
             except (ValueError, KeyError, TypeError):
                 continue
     except OSError:
@@ -1502,10 +1504,11 @@ def critique_hold_reason(run_path: str, status: dict | None) -> str | None:
                 f"a prompt beginning `This is a fix check after round {doc['round']}.` listing its ids. Missing: "
                 + "; ".join(absent)[:1200])
     if redo:
-        since = open_problems.fix_check_mtime(run_path) or 0
-        later = _lead_spawns_since(run_path, since)
+        since = open_problems.redo_since(run_path)
+        start = min(since.values(), default=open_problems.fix_check_mtime(run_path) or 0)
+        later = [(a, got, t) for a, got, t in _lead_spawns_since(run_path, start, with_time=True)]
         left = [f"{i} -> {agent}" for agent, ids in redo.items() for i in ids
-                if not any(a == agent and i in got for a, got in later)]
+                if not any(a == agent and i in got and t >= since.get(i, start) for a, got, t in later)]
         if left:
             return ("The fix checks found items not fixed or new problems the fixes caused. Send each back to its "
                     "agent once (name the id and quote the critic's evidence), then run the full critique: "
@@ -1579,8 +1582,9 @@ def signoff_hold_reason(run_path: str, mode: str | None, run_dir_rel: str = "{ru
     if st == "signed":
         return None
     if st == "changed":
-        return (f"{decision_brief.BRIEF} or {decision_brief.CRITERIA} changed after sign-off. They are frozen: have "
-                f"the planner restore the signed version, and record framing changes in {decision_brief.AMENDMENTS}.")
+        return (f"{decision_brief.BRIEF} or {decision_brief.CRITERIA} changed after sign-off. They are frozen: run "
+                f"`python3 scripts/decision_brief.py restore {run_dir_rel}` to put the signed versions back, and "
+                f"record framing changes in {decision_brief.AMENDMENTS}.")
     if st in ("absent", "invalid"):
         errs = "; ".join(decision_brief.load_brief(run_path)[1])[:900]
         return (f"Before any other work the planner writes {decision_brief.BRIEF} (what the answer must deliver; see "
