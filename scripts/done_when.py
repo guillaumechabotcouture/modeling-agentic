@@ -20,8 +20,10 @@ Forms (a list means all must pass):
         width_gt (a [lo, hi] pair, hi - lo > value)
     {file: x.csv, column, op, value, rows: all | any | none}   every / some / no row passes
     {file: x.csv, column, op, value, min_rows: N}               at least N rows pass
-        (either may add where: {column: value} to test only the matching rows)
-    {judgement: "<what would show it is fixed>"}   no runnable test fits
+    {file: x.csv, column, agg: sum | mean | min | max | count, op, value}
+        (any CSV form may add where: {column: value} to test only the matching rows)
+    {judgement: "<what would show it is fixed>"}   no runnable test fits; in a list
+        with runnable checks, those must pass and a critic decides the rest
 
 α  The test is frozen when the gate first sees it valid (a critic cannot move
    the target; one who thinks a test too weak raises a new finding with a new
@@ -72,12 +74,15 @@ Forms (a list means all must pass): `{file, exists: true}`;
 `{file, key: a.b.0, op, value}` on a JSON or YAML file, with op one of
 `== != < <= > >= between in matches width_gt`; `{file: x.csv, column, op, value,
 rows: all | any | none}` or `min_rows: N`, optionally `where: {column: value}`,
-for a CSV column (e.g. no row with package IRS:
-`{file: allocation.csv, column: package, op: matches, value: IRS, rows: none}`).
+or `agg: sum | mean | min | max | count`, for a CSV column (e.g. no row with
+package IRS: `{file: allocation.csv, column: package, op: matches, value: IRS,
+rows: none}`; total cost within the cap: `{file: allocation.csv, column: cost,
+agg: sum, op: "<=", value: 100}`).
 Paths are relative to the run
 directory. Prefer numbers and structure in output files over wording in
 prose, which changes. When no runnable test fits, write
-`done_when: {judgement: "<what would show it is fixed>"}`.
+`done_when: {judgement: "<what would show it is fixed>"}`; when runnable checks
+are necessary but not enough, list them with one judgement entry.
 
 The test is fixed once the gate has seen it: a finding whose test passes is
 resolved, and tests that passed are re-run every round, so a later change
@@ -127,8 +132,8 @@ def problems(dw) -> list[str]:
     out = []
     for c in checks:
         if "judgement" in c:
-            if len(checks) > 1 or not str(c.get("judgement") or "").strip():
-                out.append("judgement must be the only entry and say what would show the fix")
+            if not str(c.get("judgement") or "").strip() or sum("judgement" in x for x in checks) > 1:
+                out.append("give one judgement entry that says what would show the fix")
             continue
         if _safe_rel(c.get("file")) is None:
             out.append(f"file must be a path inside the run directory: {c.get('file')!r}")
@@ -139,6 +144,8 @@ def problems(dw) -> list[str]:
             continue
         if forms[0] == "column" and c.get("rows", "all") not in ("all", "any", "none"):
             out.append(f"{c.get('file')}: rows must be all, any or none")
+        if forms[0] == "column" and c.get("agg") not in (None, "sum", "mean", "min", "max", "count"):
+            out.append(f"{c.get('file')}: agg must be sum, mean, min, max or count")
         if forms[0] == "column" and not isinstance(c.get("where") or {}, dict):
             out.append(f"{c.get('file')}: where must map column names to values")
         if forms[0] == "column" and "min_rows" in c and not (isinstance(c["min_rows"], int) and c["min_rows"] > 0):
@@ -229,10 +236,9 @@ def evaluate(dw, run_dir: str) -> tuple[bool | None, str]:
     if bad:
         return None, "invalid: " + "; ".join(bad)
     checks = _as_list(dw)
-    if "judgement" in checks[0]:
-        return None, "judgement: " + str(checks[0]["judgement"])[:200]
+    judged = [c for c in checks if "judgement" in c]
     details = []
-    for c in checks:
+    for c in [c for c in checks if "judgement" not in c]:
         rel = _safe_rel(c["file"])
         try:
             if "exists" in c:
@@ -255,6 +261,18 @@ def evaluate(dw, run_dir: str) -> tuple[bool | None, str]:
                     if wk not in rows[0]:
                         raise KeyError(f"no column {wk!r}")
                     rows = [r for r in rows if _compare(_cell(r[wk]), "==", wv)]
+                if c.get("agg"):
+                    vals = [_cell(r[c["column"]]) for r in rows]
+                    nums = [_num(v) for v in vals if v != ""]
+                    agg = {"sum": sum(nums), "mean": sum(nums) / len(nums) if nums else float("nan"),
+                           "min": min(nums, default=float("nan")), "max": max(nums, default=float("nan")),
+                           "count": len(rows)}[c["agg"]]
+                    ok = _compare(agg, c["op"], c.get("value"))
+                    d = f"{rel}: {c['agg']}({c['column']}) = {agg:g} ({c['op']} {c.get('value')})"
+                    details.append(("pass " if ok else "FAIL ") + d)
+                    if not ok:
+                        return False, "; ".join(details)
+                    continue
                 hits = [_compare(_cell(r[c["column"]]), c["op"], c.get("value")) for r in rows]
                 mode = c.get("rows", "all")
                 if "min_rows" in c:
@@ -274,6 +292,8 @@ def evaluate(dw, run_dir: str) -> tuple[bool | None, str]:
         details.append(("pass " if ok else "FAIL ") + d)
         if not ok:
             return False, "; ".join(details)
+    if judged:   # the runnable parts are necessary; a critic decides the rest
+        return None, "; ".join(details + ["judgement: " + str(judged[0]["judgement"])[:200]])
     return True, "; ".join(details)
 
 
@@ -425,7 +445,8 @@ def _self_test() -> int:
                problems({"file": "a.json", "key": "x", "op": "~"}), problems({"file": "a.md", "contains": "("}),
                problems({"file": "a.md"}), problems([]), problems("x"),
                problems([{"judgement": "x"}, ci])]
-        ok(all(bad), f"DW3 unsafe paths, bad ops/regex, no form, empty and mixed judgement are invalid: {bad}")
+        ok(all(bad[:-1]) and bad[-1] == [] and problems([{"judgement": "a"}, {"judgement": "b"}]),
+           f"DW3 unsafe paths, bad ops/regex, no form, empty or two judgements are invalid: {bad}")
         ok(evaluate({"file": "_truth/x", "exists": True}, d)[0] is None, "DW4 _truth is never read")
         # DW5-DW8: evaluation
         ok(evaluate(ci, d)[0] is False and evaluate(rng, d)[0] is False, "DW5 both fail on the broken files")
@@ -452,6 +473,15 @@ def _self_test() -> int:
            and evaluate(col(op="==", value="IRS", rows="all", where={"cost": 9}), d)[0] is False
            and problems({"file": "a.csv", "column": "x", "op": "matches", "value": "("}) != []
            and problems(col(op="==", value=1, rows="most")), "DW7b CSV column forms: none / any / all, missing column")
+        ok(evaluate(col(column="cost", agg="sum", op="<=", value=31), d)[0] is True
+           and evaluate(col(column="cost", agg="sum", op="<=", value=30), d)[0] is False
+           and evaluate(col(column="cost", agg="max", op="==", value=12), d)[0] is True
+           and evaluate(col(column="cost", agg="count", op="==", value=1, where={"package": "IRS"}), d)[0] is True
+           and problems(col(column="cost", agg="median", op="<", value=1)), "DW7c CSV aggregates")
+        mixed = [{"file": "alloc.csv", "exists": True}, {"judgement": "the critic reads the caveat"}]
+        ok(evaluate(mixed, d)[0] is None and not mechanical(mixed)
+           and evaluate([{"file": "nope.csv", "exists": True}, {"judgement": "x"}], d)[0] is False,
+           "DW7d runnable checks with a judgement: necessary, not sufficient")
         p, det = evaluate({"file": "out.json", "key": "missing.key", "op": "==", "value": 1}, d)
         ok(p is False and "KeyError" in det, f"DW8 a missing key fails, it does not raise: {det}")
         # DW9-DW14: registry, freezing, resolution, regression, missing tests
