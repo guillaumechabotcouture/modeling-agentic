@@ -98,7 +98,9 @@ class _Signals:
         if not t.isascii():          # GNU parses signal operands as ASCII only
             return False
         if re.fullmatch(r"[0-9]+", t):
-            return 1 <= int(t) < cls._sig.NSIG   # this platform's bound
+            # only numbers with a signal name here (glibc reserves 32-33 unnamed;
+            # older coreutils reject numbers without a name)
+            return int(t) in {int(x) for x in cls._sig.Signals}
         u = t.upper()
         return (u[3:] if u.startswith("SIG") else u) in cls.NAMES
 
