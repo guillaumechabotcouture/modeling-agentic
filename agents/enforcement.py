@@ -426,9 +426,13 @@ substitution (`tee >(…) <protected>`). They are caught after the
 def bash_reason(command: str, run_path: str, agent_type: str | None,
                 cwd: str | None = None) -> str | None:
     """Deny reason for a Bash command, or None."""
-    if _harness_chmod(command, cwd):
+    if _CHMOD.search(command) and _HARNESS_WORDS.search(command):
+        # Phase 36: kept command-wide (narrowing it to chmod operands was bypassed
+        # five ways in review); the message says how to chmod a run file.
         return ("harness code/config (scripts/, agents/, .claude/, main.py, CLAUDE.md) is read-only during a "
-                "run; changing its permissions is not allowed")
+                "run; changing its permissions is not allowed. A command is refused when it both changes "
+                "permissions and names harness code anywhere. To make your own run file executable, run "
+                "`chmod +x <run-file>` as a separate command that names no harness path, then run the rest.")
     if _ENV_REF.search(command):
         return ("credential files (.env) are not accessible to agents; cloud "
                 "credentials are provided in the environment when --cloud is set")
@@ -571,58 +575,7 @@ def unlock_harness(modes: dict[str, int]) -> None:
 
 _CHMOD = re.compile(r"\b(chmod|chattr|chown|chflags)\b|os\.chmod|\.chmod\(")
 _HARNESS_WORDS = re.compile(r"(?:^|[\s/'\"=])(?:scripts|agents|\.claude)(?:/|\b)|\bmain\.py\b|\bCLAUDE\.md\b|\brequirements\.txt\b")
-_CHMOD_CMDS = {"chmod", "chattr", "chown", "chflags"}
-_PY_CHMOD = re.compile(r"os\.chmod|\.chmod\(|os\.chown|\.chown\(")
-_CMD_WRAPPERS = {"sudo", "env", "nohup", "command", "exec", "time", "nice", "stdbuf", "timeout"}
 
-
-def _harness_chmod(command: str, cwd: str | None = None) -> bool:
-    """A permission change that may reach harness code (Phase 36). The rule
-    stays the old one (a chmod-family word and a harness word anywhere in the
-    command) with one exception: when EVERY chmod-family mention is a plain
-    top-level chmod/chattr/chown/chflags command whose operands all resolve
-    outside the harness, the command is allowed. E7 attempt 7's modeler was
-    refused `chmod +x models/run_all.sh` because the same command wrote a
-    script that runs `python3 scripts/...`. Anything else (a nested shell
-    string, Python os.chmod, find -exec, xargs) keeps the old rule. Harness
-    files are also read-only on disk and hashed for the run."""
-    mentions = len(_CHMOD.findall(command))
-    if not mentions:
-        return False
-    old_rule = bool(_HARNESS_WORDS.search(command))
-    segs = iter_segments_with_cwd(command, cwd)
-    # Any directory change makes a relative operand's directory uncertain (a
-    # `cd` may never run, `false && cd x`): relative operands then get the old rule.
-    # Any mention counts (`command cd`, `builtin cd`, `X=1 cd`, `eval cd`): no parsing to get wrong.
-    moves = bool(re.search(r"(?<![\w.-])(cd|pushd|popd|chdir)(?![\w.-])", command))
-    plain = 0
-    for seg, scwd in segs:
-        if not _CHMOD.search(seg):
-            continue
-        toks = _tokens(seg.strip().lstrip("({").strip())
-        while toks and (re.match(r"^\w+=", toks[0]) or os.path.basename(toks[0]) in _CMD_WRAPPERS
-                        or re.fullmatch(r"-\w+|\d+(\.\d+)?[smhd]?", toks[0])):
-            toks = toks[1:]
-        if not toks or os.path.basename(toks[0]) not in _CHMOD_CMDS or len(_CHMOD.findall(seg)) != 1:
-            return old_rule               # chmod inside another command: the old rule
-        for op in toks[1:]:
-            if op.startswith(("-", "+", "=")) or re.fullmatch(
-                    r"[0-7]{3,4}|[ugoa]*[+=-][rwxXst]*(,[ugoa]*[+=-][rwxXst]*)*", op):
-                continue
-            if any(c in op for c in "$`*?[{~"):
-                return old_rule           # expansion or glob: cannot know the target
-            rel_op = not os.path.isabs(os.path.expanduser(op.strip("'\"")))
-            if rel_op and moves:
-                return old_rule           # the command changes directory: the old rule
-            if rel_op and _HARNESS_WORDS.search(" " + op):
-                return True               # names harness code
-            bases = {cwd or REPO_ROOT} if rel_op else {None}
-            for b in bases:
-                if is_harness_path(op, b) or \
-                        os.path.relpath(REPO_ROOT, _abspath(op, b)).split(os.sep)[0] != "..":
-                    return True           # harness code, the repo root, or a parent of it
-        plain += 1
-    return plain != mentions and old_rule  # a mention not accounted for as a plain run-file chmod
 
 def hash_harness(repo_root: str = REPO_ROOT) -> dict[str, str]:
     """sha256 of every hashed harness file, keyed by repo-relative path."""
