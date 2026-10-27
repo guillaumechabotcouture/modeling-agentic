@@ -380,6 +380,31 @@ def unsent(work: list[dict], spawns: list[tuple[str, set]]) -> list[str]:
 # β: fix checks (written by the critics)
 # ---------------------------------------------------------------------------
 
+def _verdict(v) -> str | None:
+    """fixed | partly | not_fixed from the ways a critic writes it."""
+    t = re.sub(r"[\s\-]+", "_", str(v or "").strip().lower())
+    t = {"partial": "partly", "partially": "partly", "partially_fixed": "partly", "partly_fixed": "partly",
+         "notfixed": "not_fixed", "unfixed": "not_fixed", "unresolved": "not_fixed", "open": "not_fixed",
+         "resolved": "fixed", "done": "fixed"}.get(t, t)
+    return t if t in VERDICTS else None
+
+
+def _checks(fc) -> dict[str, dict]:
+    """{id: {verdict, evidence}} from a list of entries, an id -> entry
+    mapping, or an id -> verdict mapping (Haiku wrote the latter forms in the
+    first real-SDK check)."""
+    raw = fc.get("checks") if isinstance(fc, dict) else None
+    out: dict[str, dict] = {}
+    if isinstance(raw, list):
+        for c in raw:
+            if isinstance(c, dict) and c.get("id"):
+                out[str(c["id"])] = c
+    elif isinstance(raw, dict):
+        for k, v in raw.items():
+            out[str(k)] = v if isinstance(v, dict) else {"verdict": v}
+    return out
+
+
 def check_fix_checks(run_dir: str) -> tuple[list[str], dict[str, list[str]]]:
     """(missing, redo). `missing` names critics whose fix check is absent,
     stale (older than the plan), unparseable or incomplete. `redo` maps a
@@ -402,17 +427,22 @@ def check_fix_checks(run_dir: str) -> tuple[list[str], dict[str, list[str]]]:
             continue
         try:
             fc = _load_yaml(path) or {}
-            checks = {c["id"]: c for c in fc.get("checks") or [] if isinstance(c, dict) and c.get("id")}
-            news = [p for p in fc.get("new_problems") or [] if isinstance(p, dict)]
+            checks = _checks(fc)
+            news = [p for p in (fc.get("new_problems") or []) if isinstance(p, dict)] \
+                if isinstance(fc, dict) else []
         except (yaml.YAMLError, OSError, AttributeError, TypeError) as e:
             missing.append(f"{critic}: {os.path.basename(path)} does not parse ({_short(e, 80)})")
             continue
-        bad = [w["id"] for w in ws if (checks.get(w["id"]) or {}).get("verdict") not in VERDICTS]
+        bad = [w["id"] for w in ws if _verdict((checks.get(w["id"]) or {}).get("verdict")) is None]
         if bad:
-            missing.append(f"{critic}: no fixed/partly/not_fixed verdict for {', '.join(bad)}")
+            found = "; ".join(f"{i}: {'no entry' if i not in checks else repr(checks[i].get('verdict'))}"
+                              for i in bad)
+            missing.append(f"{critic}: {os.path.basename(path)} needs `checks:` entries `- {{id: <id>, verdict: "
+                           f"fixed | partly | not_fixed, evidence: ...}}`; found {found} "
+                           f"(ids present: {', '.join(checks) or 'none'})")
             continue
         for w in ws:
-            if checks[w["id"]]["verdict"] != "fixed":
+            if _verdict(checks[w["id"]].get("verdict")) != "fixed":
                 redo.setdefault(w["agent"], []).append(w["id"])
         for p in news:
             if p.get("severity") == "HIGH":
@@ -544,7 +574,7 @@ def _run_self_test() -> int:
             yaml.safe_dump({"round": 5, "reviewer": "critique-redteam",
                             "checks": [{"id": "R-005", "verdict": "fixed"}, {"id": "R-008", "verdict": "partly"}]}, f)
         missing, _ = check_fix_checks(d)
-        ok(missing and "no fixed/partly/not_fixed verdict for R-035" in missing[0], "FC2: incomplete fix check")
+        ok(missing and "R-035: no entry" in missing[0], f"FC2: incomplete fix check says what it found: {missing}")
         with open(fc, "w") as f:
             yaml.safe_dump({"round": 5, "reviewer": "critique-redteam",
                             "checks": [{"id": "R-005", "verdict": "fixed"}, {"id": "R-008", "verdict": "partly"},
@@ -553,6 +583,12 @@ def _run_self_test() -> int:
                                              {"id": "R-042", "severity": "MEDIUM", "target_stage": "ANALYZE"}]}, f)
         missing, redo = check_fix_checks(d)
         ok(missing == [] and redo == {"modeler": ["R-008", "R-041"]}, f"FC3: redo {redo} missing {missing}")
+        with open(fc, "w") as f:
+            yaml.safe_dump({"round": 5, "checks": {"R-005": "Fixed", "R-008": {"verdict": "partially fixed"},
+                                                   "R-035": "not fixed"}}, f)
+        missing, redo = check_fix_checks(d)
+        ok(missing == [] and redo == {"modeler": ["R-008"], "data-agent": ["R-035"]},
+           f"FC3b: mapping forms and verdict spellings are read: {missing} {redo}")
         os.utime(fc, (1, 1))
         ok(check_fix_checks(d)[0], "FC4: fix check older than the plan is stale")
         with open(fc, "w") as f:

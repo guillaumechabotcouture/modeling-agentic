@@ -288,15 +288,16 @@ async def round_plan(query_fn=None):
     for line in open(os.path.join(run, "trace.jsonl")):
         r = json.loads(line)
         if r.get("subagent_type"):
-            spawns.append({"to": r["subagent_type"], "mentions": r.get("mentions"),
-                           "denied": (r.get("denied") or "")[:140] or None})
+            spawns.append({"to": r["subagent_type"], "kind": r.get("critique_kind"), "mentions": r.get("mentions"),
+                           "denied": (r.get("denied") or "")[:300] or None})
     plan = open(os.path.join(run, op.PLAN_FILE)).read() if os.path.exists(os.path.join(run, op.PLAN_FILE)) else None
     fc = os.path.join(run, op.fix_check_name(2, "critique-redteam"))
     missing, redo = op.check_fix_checks(run)
-    full = [s for s in spawns if s["to"] == "critique-redteam" and not s["denied"]]
+    full = [s for s in spawns if s["kind"] == "full" and not s["denied"]]
     return {"result": _summ(result), "error": err, "run": run, "plan_errors": op.check_plan(run), "plan": plan,
             "fix_check_written": os.path.exists(fc), "fix_check_missing": missing, "redo": redo,
-            "spawns": spawns, "full_critique_allowed": len(full) >= 2,
+            "spawns": spawns, "full_critique_allowed": len(full) >= 1,
+            "fix_check_file": open(fc).read()[:1500] if os.path.exists(fc) else None,
             "denials": sum(1 for s in spawns if s["denied"]), "text": ((result and result.result) or "")[-200:]}
 
 

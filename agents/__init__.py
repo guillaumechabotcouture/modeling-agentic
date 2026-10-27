@@ -1595,6 +1595,10 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
         }
         if spawn:
             record["subagent_type"] = sub
+            if str(sub or "").startswith("critique-"):
+                head = str(tool_input.get("prompt") or "").lstrip()
+                record["critique_kind"] = ("full" if head.startswith("This is critique round")
+                                           else "fix_check" if head.startswith("This is a fix check") else "other")
             record["mentions"] = open_problems.mentions(str(tool_input.get("prompt") or ""), run_path)
         if deny_reason:
             record["denied"] = deny_reason
