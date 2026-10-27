@@ -88,7 +88,7 @@ def _summ(m) -> dict | None:
 async def _converse(prompt, options, kill_when=None, query_fn=None, kill_fn=None):
     """Run one query; optionally SIGKILL the CLI when kill_when(event, t)
     returns True. Returns (session_id, result, error, killed, events)."""
-    from claude_agent_sdk import AssistantMessage, ResultMessage, SystemMessage
+    from claude_agent_sdk import AssistantMessage, ResultMessage, SystemMessage, UserMessage
     if query_fn is None:
         from claude_agent_sdk import query as query_fn
     kill_fn = kill_fn or (lambda: [os.kill(p, signal.SIGKILL) or p for p in _cli_pids()])
@@ -102,6 +102,13 @@ async def _converse(prompt, options, kill_when=None, query_fn=None, kill_fn=None
             elif isinstance(m, AssistantMessage):
                 tools = [getattr(b, "name", None) for b in m.content if getattr(b, "name", None)]
                 events.append(("assistant", round(t, 1), tools))
+            elif isinstance(m, UserMessage) and isinstance(m.content, list):
+                # What a tool (including a subagent) handed back, so a stalled
+                # scenario shows what the lead saw.
+                for b in m.content:
+                    if getattr(b, "tool_use_id", None):
+                        c = b.content if isinstance(b.content, str) else json.dumps(b.content, default=str)
+                        events.append(("tool_result", round(t, 1), (c or "")[:300]))
             elif isinstance(m, ResultMessage):
                 result = m
                 sid = m.session_id or sid
@@ -261,8 +268,9 @@ async def round_plan(query_fn=None):
                          budget_status=lambda: {"spent": 10.0, "cap": 100.0, "reserve": 5.0}, max_rounds=8)
     worker = lambda who: AgentDefinition(  # noqa: E731
         description=f"Test {who}", tools=["Bash"], model="haiku", maxTurns=3,
-        prompt=f"You are the {who} in a test. Do not use tools. Reply 'DONE:' followed by the finding ids named in "
-               "your task.")
+        prompt=f"You are the {who} in a test; the fix itself is simulated. For each finding id named in your task, "
+               f"run with Bash: echo '<id> fixed by {who}' >> {run}/fixes.log . Then reply 'DONE:' followed by "
+               "those ids and one line saying the change was made.")
     critic = AgentDefinition(
         description="Test red-team critic", tools=["Read", "Write"], model="haiku", maxTurns=6,
         prompt=("You are critique-redteam in a test. Full critique: reply CRITIQUE-DONE without tools. "
@@ -284,6 +292,7 @@ async def round_plan(query_fn=None):
                     hooks=hooks, max_turns=30, system_prompt=lead_rules)
     sid, result, err, _, ev = await _converse("Begin.", opts, query_fn=query_fn)
     trace.close()
+    fixes = os.path.join(run, "fixes.log")
     spawns = []
     for line in open(os.path.join(run, "trace.jsonl")):
         r = json.loads(line)
@@ -298,7 +307,9 @@ async def round_plan(query_fn=None):
             "fix_check_written": os.path.exists(fc), "fix_check_missing": missing, "redo": redo,
             "spawns": spawns, "full_critique_allowed": len(full) >= 1,
             "fix_check_file": open(fc).read()[:1500] if os.path.exists(fc) else None,
-            "denials": sum(1 for s in spawns if s["denied"]), "text": ((result and result.result) or "")[-200:]}
+            "denials": sum(1 for s in spawns if s["denied"]), "text": ((result and result.result) or "")[-200:],
+            "fixes_log": open(fixes).read() if os.path.exists(fixes) else None,
+            "tool_results": [e[2] for e in ev if e[0] == "tool_result"][:12]}
 
 
 async def brief_signoff(query_fn=None):
