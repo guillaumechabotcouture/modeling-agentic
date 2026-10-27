@@ -84,6 +84,63 @@ SCRIPT_PRODUCES: dict[str, tuple[str, ...]] = {
 }
 _SCRIPTS_DIR = os.path.realpath(os.path.join(enforcement.REPO_ROOT, "scripts"))
 _WRAPPERS = {"nohup", "env", "time", "nice", "command", "exec", "sudo", "stdbuf"}
+_DURATION = re.compile(r"([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?[smhd]?", re.ASCII)
+
+
+class _Signals:
+    """Signal names timeout accepts (with or without SIG, any case) and 1-64."""
+    import signal as _sig
+    NAMES = {n[3:] for n in dir(_sig) if n.startswith("SIG") and not n.startswith("SIG_")}
+
+    @classmethod
+    def fullmatch(cls, t: str) -> bool:
+        t = str(t)
+        if not t.isascii():          # GNU parses signal operands as ASCII only
+            return False
+        if re.fullmatch(r"[0-9]+", t):
+            # only numbers with a signal name here (glibc reserves 32-33 unnamed;
+            # older coreutils reject numbers without a name)
+            return int(t) in {int(x) for x in cls._sig.Signals}
+        u = t.upper()
+        return (u[3:] if u.startswith("SIG") else u) in cls.NAMES
+
+
+_SIGNAL = _Signals
+
+
+def _skip_timeout(toks: list[str]) -> list[str] | None:
+    """`timeout [OPTION] DURATION COMMAND...` -> COMMAND..., or None.
+
+    Conservative (Codex review of PR #27): only options it fully understands
+    (--preserve-status, --foreground, -v/--verbose, -k/--kill-after DUR,
+    -s/--signal SIG, `--`) with valid arguments; anything else, or no valid
+    duration, returns None, so nothing is credited as run. An uncredited
+    harness run only leaves an integrity event; a wrongly credited one would
+    authorize writes. Attempt-7 smoke: a critic ran the gate as
+    `timeout 600 python3 scripts/validate_critique_yaml.py ...`."""
+    j = 1
+    while j < len(toks):
+        t = toks[j]
+        if t == "--":
+            j += 1
+            break
+        if t in ("--preserve-status", "--foreground", "-v", "--verbose"):
+            j += 1
+        elif t in ("-k", "--kill-after") and j + 1 < len(toks) and _DURATION.fullmatch(toks[j + 1]):
+            j += 2
+        elif t in ("-s", "--signal") and j + 1 < len(toks) and _SIGNAL.fullmatch(toks[j + 1]):
+            j += 2
+        elif t.startswith("--kill-after=") and _DURATION.fullmatch(t.split("=", 1)[1]):
+            j += 1
+        elif t.startswith("--signal=") and _SIGNAL.fullmatch(t.split("=", 1)[1]):
+            j += 1
+        elif t.startswith("-"):
+            return None          # an option we do not model (--help, clusters, abbreviations)
+        else:
+            break
+    if j >= len(toks) or not _DURATION.fullmatch(toks[j]):
+        return None
+    return toks[j + 1:]
 _CRITIQUE_PATTERNS = ("critique_*.yaml", "critique_*.md")
 # A tool whose PostToolUse never arrives (an error path) must not keep
 # sanctioning changes: intents expire (Bash's own timeout is 10 min).
@@ -129,9 +186,13 @@ def harness_scripts_run(command: str, cwd: str | None = None, _depth: int = 0
         except ValueError:
             continue
         while toks and (re.match(r"^\w+=", toks[0]) or os.path.basename(toks[0]) in _WRAPPERS
+                        or os.path.basename(toks[0]) == "timeout"
                         or re.fullmatch(r"-\w+|\d+[smh]?", toks[0])):
             if os.path.basename(toks[0]) == "nohup":
                 background = True
+            if os.path.basename(toks[0]) == "timeout":
+                toks = _skip_timeout(toks) or []
+                break            # timeout runs its COMMAND as is: no further wrappers or assignments
             toks = toks[1:]
         if toks and os.path.basename(toks[0]) in _SHELLS and _depth < 3:
             # `nohup sh -c "python3 scripts/x.py …; echo DONE" &` (seen in E7):

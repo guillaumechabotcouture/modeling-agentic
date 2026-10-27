@@ -1571,6 +1571,20 @@ def _run_self_test() -> int:
         w("metadata.json", '{"question": "Q", "methods_critic": true}')
         ig = ArtifactIntegrity(td, process_check=lambda: set())
         # IC1: a comment or string mentioning a script authorizes nothing
+        _v = f"{REPO_ROOT}/scripts/validate_critique_yaml.py runs/x"
+        _tf = [harness_scripts_run(f"timeout {o} python3 {_v}")[0] for o in
+               ("600", "1.5m", "-k 5 600", "--signal TERM 600", "-s TERM 10s", "--kill-after=5 --preserve-status 600")]
+        _neg = [harness_scripts_run(f"timeout {o} python3 {_v}")[0] for o in
+                ("-k 5", "", "invalid", "--help 600", "-- -v 600", "600 X=1", "-k nonsense 600", "--signal 9x 600",
+                 "--signal NOTASIGNAL 600", "\u0661\u0660", "-k \u0661 600", "-s 99 600", "-s \u017ftop 600", "-s 0 600",
+                 f"-s {__import__('signal').NSIG} 600")]
+        ok(all(x == ["validate_critique_yaml.py"] for x in _tf)
+           and harness_scripts_run(f"timeout -- 600 python3 {_v}")[0] == ["validate_critique_yaml.py"]
+           and harness_scripts_run(f"timeout 1e2 python3 {_v}")[0] == ["validate_critique_yaml.py"]
+           and harness_scripts_run(f"timeout -s KILL 600 python3 {_v}")[0] == ["validate_critique_yaml.py"]
+           and harness_scripts_run(f"timeout --signal=sigterm 600 python3 {_v}")[0] == ["validate_critique_yaml.py"]
+           and all(x == [] for x in _neg),
+           f"IG-timeout: known options and a valid duration are skipped; anything else credits nothing: {_tf} {_neg}")
         ok(harness_scripts_run('p=x; printf f > "$p"; # scripts/compare_models.py')[0] == []
            and harness_scripts_run('echo "python3 scripts/compare_models.py"')[0] == []
            and harness_scripts_run("cd /tmp && python3 /other/repo/scripts/compare_models.py x")[0] == []
