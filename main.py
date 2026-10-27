@@ -764,6 +764,7 @@ async def run(question: str, max_rounds: int, max_sessions: int,
     # Phase 23 α: hash protected run artifacts; every change must be explained
     # by an allowed in-flight tool call (see agents/integrity.py).
     integrity = ArtifactIntegrity(run_path)
+    integrity.start_watch()     # Phase 36: producers credited by what runs, not by what was typed
     budget = load_budget_ledger(run_path)
     if not budget["sessions"] and prior_meta.get("session_results"):
         # Run started before the ledger existed: carry its recorded spend over
@@ -1052,6 +1053,7 @@ def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
     # previous baseline before the harness writes anything (Copilot, PR #15).
     if integrity is not None:
         integrity.final_check()
+        integrity.stop_watch()
     report_restored = restore_report_if_missing(run_path)
     if report_restored and integrity is not None:
         for rel in ("report.md", "report.unrendered.md", "models/claims_ledger.yaml", "claims_ledger.yaml"):
@@ -1333,6 +1335,52 @@ def _run_self_test() -> int:
         # IN5: editing the integrity report itself is a violation
         w(REPORT_NAME, '{"producer": "agents/integrity.py", "violations": []}')
         ok(any(e["file"] == REPORT_NAME for e in ig2.final_check()), "IN5 report tamper flagged")
+        # IN8 (Phase 36): a producer run from the agent's own shell script is
+        # credited by the process watch; tampering after it ends is not.
+        with tempfile.TemporaryDirectory() as td8:
+            open(os.path.join(td8, "identifiability.yaml"), "w").write("a: 1\n")
+            alive = set()
+            ig8 = ArtifactIntegrity(td8, process_check=lambda: set(alive))
+            ig8.on_pre("s1", "Bash", {"command": "bash models/run_all.sh"}, "modeler")
+            alive.add("identifiability.py"); ig8.observe()
+            open(os.path.join(td8, "identifiability.yaml"), "w").write("a: 2\n")
+            alive.clear()
+            ok(ig8.on_post("s1") == [], f"IN8 a producer started by the agent's script is credited: {ig8.events}")
+            ig8.on_pre("s2", "Bash", {"command": "true"}, "modeler")
+            ok(ig8.on_post("s2") == [], "IN8b the grant ends once the producer is seen finished")
+            ig8.on_pre("s3", "Bash", {"command": "p=identifiability.yaml; echo 'a: 3' > $p"}, "modeler")
+            open(os.path.join(td8, "identifiability.yaml"), "w").write("a: 3\n")
+            ok([e["file"] for e in ig8.on_post("s3")] == ["identifiability.yaml"],
+               "IN8c a change after the producer has finished is still flagged")
+            ig9 = ArtifactIntegrity(td8, process_check=lambda: set(alive))
+            ig9.on_pre("s4", "Bash", {"command": "bash models/run_all.sh"}, "modeler")
+            open(os.path.join(td8, "identifiability.yaml"), "w").write("a: 4\n")
+            ok([e["file"] for e in ig9.on_post("s4")] == ["identifiability.yaml"],
+               "IN8d without a producer seen running, the change is flagged (control)")
+            alive.add("identifiability.py")
+            import time as _t8
+            ig9.start_watch(0.05); _t8.sleep(0.3); ig9.stop_watch()
+            ok(any(g.get("observed") for g in ig9.grants), "IN8e the background watch samples producers")
+            ig10 = ArtifactIntegrity(td8, process_check=lambda: set(alive))
+            alive.add("identifiability.py")
+            _orig = ig10._process_check
+            def _slow():
+                got = _orig(); ig10._check(where="post_tool"); return got   # a check runs mid-sample
+            ig10._process_check = _slow
+            ig10.observe()
+            ok(not any(g.get("observed") for g in ig10.grants),
+               "IN8f a sample taken before a check that ran meanwhile is discarded")
+            ig11 = ArtifactIntegrity(td8, process_check=lambda: set(alive))
+            _seq_mid = ig11._check_seq
+            ig11._check(where="post_tool")       # a check that began before the sample and ends after it
+            ig11._check_seq = _seq_mid + 1       # as if sampled mid-check
+            _orig11 = ig11._process_check
+            def _mid():
+                got = _orig11(); ig11._check_seq += 1; return got   # the check ends while sampling
+            ig11._process_check = _mid
+            ig11.observe()
+            ok(not any(g.get("observed") for g in ig11.grants),
+               "IN8g a sample overlapping the end of a check is discarded")
         # IN6: a resumed run keeps earlier violations
         ok(len(ArtifactIntegrity(td, process_check=lambda: set()).events) >= 1,
            "IN6 violations survive a restart")
@@ -1904,6 +1952,10 @@ def _run_self_test() -> int:
            and enforcement.bash_reason("python3 -c \"import os; os.chmod('agents/x.py', 0o644)\"", td, "modeler") is not None
            and enforcement.bash_reason("chmod +x runs/r1/models/run.sh", td, "modeler") is None,
            "HL2 changing harness permissions is denied; run files are not affected")
+        _hl3 = enforcement.bash_reason("cat > models/x.sh <<EOF\npython3 scripts/compute.py map .\nEOF\nchmod +x models/x.sh",
+                                       td, "modeler") or ""
+        ok("separate command" in _hl3 and enforcement.bash_reason("chmod +x models/x.sh", td, "modeler") is None,
+           "HL3 a refused chmod says how to chmod a run file; a separate chmod of a run file is allowed")
         os.remove(_hp)
         before = enforcement.hash_harness(td)
         ok(not enforcement.harness_changed(enforcement.diff_harness(before, enforcement.hash_harness(td))),

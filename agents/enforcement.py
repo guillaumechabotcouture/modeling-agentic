@@ -427,8 +427,12 @@ def bash_reason(command: str, run_path: str, agent_type: str | None,
                 cwd: str | None = None) -> str | None:
     """Deny reason for a Bash command, or None."""
     if _CHMOD.search(command) and _HARNESS_WORDS.search(command):
+        # Phase 36: kept command-wide (narrowing it to chmod operands was bypassed
+        # five ways in review); the message says how to chmod a run file.
         return ("harness code/config (scripts/, agents/, .claude/, main.py, CLAUDE.md) is read-only during a "
-                "run; changing its permissions is not allowed")
+                "run; changing its permissions is not allowed. A command is refused when it both changes "
+                "permissions and names harness code anywhere. To make your own run file executable, run "
+                "`chmod +x <run-file>` as a separate command that names no harness path, then run the rest.")
     if _ENV_REF.search(command):
         return ("credential files (.env) are not accessible to agents; cloud "
                 "credentials are provided in the environment when --cloud is set")

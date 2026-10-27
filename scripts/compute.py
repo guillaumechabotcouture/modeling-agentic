@@ -2083,7 +2083,7 @@ def _self_test_p35(ok) -> None:
         try:
             with _m.patch(__name__ + "._avail_mb", return_value=60.0):   # one ~70 MB process: no hint, 4 at start
                 t0 = time.time()
-                rows, s = map_fn(d, "models/var.py::f", [{"s": 0.2}] + [{"s": 4.0}] * 3 + [{"s": 4.0}] * 4,
+                rows, s = map_fn(d, "models/var.py::f", [{"s": 0.2}] + [{"s": 8.0}] * 3 + [{"s": 8.0}] * 4,
                                  backend="local", max_workers=4, max_core_hours=4 / 3600)
                 el = time.time() - t0
         finally:
@@ -2105,7 +2105,7 @@ def _self_test_p35(ok) -> None:
         fps = code_fingerprint(d, "models/draw.py::f")
         os.remove(os.path.join(sd2, "current")); os.symlink("b", os.path.join(sd2, "current"))
         ok(code_fingerprint(d, "models/draw.py::f") != fps, "P35-32 retargeting a symlinked data dir changes the fingerprint")
-        ok(s["stopped"] == CAP_STOP and el < 2.2,
+        ok(s["stopped"] == CAP_STOP and el < 5.0,   # without the fix: about 8 s
            f"P35-31 a shrinking pool's allowance stop counts the inputs still running ({el:.1f}s): {s.get('stopped')}")
 
 
