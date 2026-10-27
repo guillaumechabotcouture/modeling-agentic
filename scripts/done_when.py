@@ -129,6 +129,17 @@ def _safe_rel(path) -> str | None:
     return norm
 
 
+def _in_run(rel: str, run_dir: str) -> str:
+    """Critics often write paths as the lead sees them, from the repo root
+    (`runs/<run>/models/x.csv`; E7 attempt 6 cited code that way): strip the
+    run directory's own prefix so the test reads the run's file."""
+    name = os.path.basename(os.path.normpath(run_dir))
+    for prefix in (os.path.join("runs", name) + os.sep, name + os.sep):
+        if name and rel.startswith(prefix):
+            return rel[len(prefix):]
+    return rel
+
+
 def problems(dw) -> list[str]:
     """Why `dw` is not a valid done_when (empty list = valid)."""
     checks = _as_list(dw)
@@ -269,7 +280,7 @@ def evaluate(dw, run_dir: str) -> tuple[bool | None, str]:
     judged = [c for c in checks if "judgement" in c]
     details = []
     for c in [c for c in checks if "judgement" not in c]:
-        rel = _safe_rel(c["file"])
+        rel = _in_run(_safe_rel(c["file"]), run_dir)
         try:
             if "exists" in c:
                 ok = os.path.exists(os.path.join(run_dir, rel)) == bool(c["exists"])
@@ -528,6 +539,10 @@ def _self_test() -> int:
         ok(all(bad[:-1]) and bad[-1] == [] and problems([{"judgement": "a"}, {"judgement": "b"}]),
            f"DW3 unsafe paths, bad ops/regex, no form, empty or two judgements are invalid: {bad}")
         ok(evaluate({"file": "_truth/x", "exists": True}, d)[0] is None, "DW4 _truth is never read")
+        name = os.path.basename(d)
+        ok(evaluate({"file": f"runs/{name}/out.json", "exists": True}, d)[0] is True
+           and evaluate({"file": f"{name}/out.json", "exists": True}, d)[0] is True,
+           "DW4b a path written from the repo root (runs/<run>/...) reads the run's file")
         # DW5-DW8: evaluation
         ok(evaluate(ci, d)[0] is False and evaluate(rng, d)[0] is False, "DW5 both fail on the broken files")
         json.dump({"total_cost_usd": {"ci95": [371.0, 455.0]}, "n": 230}, open(os.path.join(d, "out.json"), "w"))

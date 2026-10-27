@@ -465,6 +465,8 @@ async def wait_for_signoff(run_path: str, run_dir_rel: str, hours: float, poll_s
         if decision_brief.status(run_path) == "signed":
             if integrity is not None:   # the owner signed outside any tool call
                 integrity.harness_wrote(decision_brief.SIGNOFF)
+                for f in decision_brief.FROZEN_AT_SIGNOFF:   # and the signed copies it kept
+                    integrity.harness_wrote(f"{decision_brief.SIGNED_DIR}/{f}")
             with open(os.path.join(run_path, "trace.jsonl"), "a") as tf:
                 tf.write(json.dumps({"ts": datetime.now().isoformat(), "type": "signed_off"}) + "\n")
             print("Decision brief signed; resuming the lead.", flush=True)
