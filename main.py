@@ -1967,7 +1967,10 @@ def _run_self_test() -> int:
             "false && cd /tmp; chmod u+w scripts/identifiability.py": "deny",
             "false && cd /tmp; chmod u+w agents": "deny",
             "cd scripts; false && cd /tmp; chmod u+w identifiability.py": "deny",
-            "cd /tmp/r/models && chmod +x run.sh": None}
+            "cd /tmp/r/models && chmod +x run.sh": None,
+            "command cd " + _R + "/scripts && chmod u+w identifiability.py": "deny",
+            "builtin cd scripts; chmod u+w identifiability.py": "deny",
+            "X=1 cd scripts; chmod u+w identifiability.py": "deny"}
         _got = {c: ("deny" if enforcement.bash_reason(c, td, "modeler") else None) for c in _hl3}
         ok(_got == _hl3, f"HL3 chmod is denied only when aimed at harness code: {[c for c in _hl3 if _got[c] != _hl3[c]]}")
         os.remove(_hp)

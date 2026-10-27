@@ -593,7 +593,8 @@ def _harness_chmod(command: str, cwd: str | None = None) -> bool:
     segs = iter_segments_with_cwd(command, cwd)
     # Any directory change makes a relative operand's directory uncertain (a
     # `cd` may never run, `false && cd x`): relative operands then get the old rule.
-    moves = any((_tokens(sg) or [""])[0] in ("cd", "pushd", "popd") for sg, _ in segs)
+    # Any mention counts (`command cd`, `builtin cd`, `X=1 cd`, `eval cd`): no parsing to get wrong.
+    moves = bool(re.search(r"(?<![\w.-])(cd|pushd|popd|chdir)(?![\w.-])", command))
     plain = 0
     for seg, scwd in segs:
         if not _CHMOD.search(seg):
