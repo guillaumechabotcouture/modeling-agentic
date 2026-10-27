@@ -307,7 +307,9 @@ def gate_findings(run_dir: str) -> list[dict]:
         out.append({"kind": kind, "severity": "HIGH", "stage": "PLAN", "scope_declarable": False,
                     "claim": claim})
     so = _signoff(run_dir)
-    if so is None:
+    if so is None and os.environ.get("MA_SIGNOFF_MODE") == "none":
+        pass   # the run was started with --signoff none: no sign-off was asked for
+    elif so is None:
         high("decision_brief_not_signed", f"{BRIEF} exists but was never signed; work ran without an "
              "agreed target.")
     else:
@@ -448,6 +450,26 @@ def _run_self_test() -> int:
     with tempfile.TemporaryDirectory() as d:
         ok(scope_filter({"critique-redteam": {"blockers": [{"id": "R-1", "severity": "HIGH"}]}}, d) == set(),
            "DB17: before sign-off nothing is filtered")
+        # DB18-DB19 (Codex review): --signoff none asks for no signature; in
+        # owner mode no agent can sign, whatever the argument order.
+        import subprocess
+        yaml.safe_dump({"question": "q", "decision": "d", "decision_maker": "m", "objective": "o",
+                        "answers": [{"id": "A1", "statement": "s", "resolution": "district"}]},
+                       open(os.path.join(d, BRIEF), "w"))
+        old_mode = os.environ.get("MA_SIGNOFF_MODE")
+        try:
+            os.environ["MA_SIGNOFF_MODE"] = "none"
+            none_kinds = [f["kind"] for f in gate_findings(d)]
+            os.environ["MA_SIGNOFF_MODE"] = "owner"
+            owner_kinds = [f["kind"] for f in gate_findings(d)]
+        finally:
+            os.environ.pop("MA_SIGNOFF_MODE", None) if old_mode is None else os.environ.update(MA_SIGNOFF_MODE=old_mode)
+        ok("decision_brief_not_signed" not in none_kinds and "decision_brief_not_signed" in owner_kinds,
+           f"DB18: an unsigned brief is a finding unless the run asked for no sign-off: {none_kinds} {owner_kinds}")
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), "--by", "owner", "sign", d, "--accept-proposed"],
+                           env=dict(os.environ, MA_SIGNOFF_MODE="owner"), capture_output=True, text=True)
+        ok(r.returncode != 0 and "agents cannot sign" in r.stderr and not is_signed(d),
+           f"DB19: in owner mode the agents' environment cannot sign, flags in any order: {r.stderr[:200]}")
     if fails:
         print("FAIL:", *fails, sep="\n  ")
         return 1
@@ -476,6 +498,11 @@ def main() -> int:
     if a.cmd == "status":
         print(status(a.run_dir))
         return 0
+    if os.environ.get("MA_SIGNOFF_MODE") == "owner":
+        # Set only in the agents' environment (main.py): the owner signs from
+        # a shell of their own (Codex review: `--by owner` alone was enough).
+        print("This run needs the owner's sign-off; agents cannot sign it.", file=sys.stderr)
+        return 1
     if a.by != "owner" and os.environ.get("MA_SIGNOFF_MODE") != "lead":
         print("This run needs the owner's sign-off; the lead cannot sign it.", file=sys.stderr)
         return 1

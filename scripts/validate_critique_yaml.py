@@ -1824,7 +1824,7 @@ def _check_a_priori_counts(run_dir: str,
 
 
 def _check_rigor_artifacts(run_dir: str, round_n: int | None = None,
-                           post_write: bool = False) -> list[dict]:
+                           post_write: bool = False, extra: list[dict] | None = None) -> list[dict]:
     """Run every rigor check. Returns a list of violations.
 
     Phase 21 β: every check runs through `run_guarded`, so an exception
@@ -1896,6 +1896,9 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None,
     violations += G(_check_sufficiency_critic, run_dir, round_n=round_n)
     # Phase 21 β/δ: eligible-population behavioral probe.
     violations += G(_check_eligibility_probe, run_dir, round_n=round_n)
+    # Phase 34: done_when findings computed by the caller, added before the
+    # escalation so their persistence counts (Codex review).
+    violations += list(extra or [])
     # Phase 12 Commit β: round-aware escalation of persisting MEDIUMs
     # (history-backed since Phase 21 β).
     if round_n is not None:
@@ -3565,6 +3568,22 @@ def _apply_brief_scope(decision: dict, critiques: dict, run_dir: str,
     return _recompute_action(decision, max_rounds, current_round)
 
 
+def _defer_write_findings(decision: dict, run_dir: str, max_rounds: int, current_round: int) -> dict:
+    """Codex review (Phases 31-34): a HIGH critic finding aimed at the write-up
+    cannot be fixed before a draft exists, and the writer waits for the gate,
+    so before the first draft it is listed as `after_write`, not blocking.
+    The post-write gate blocks on it as usual."""
+    if any(os.path.exists(os.path.join(run_dir, f)) for f in ("report.md", "manuscript.md")):
+        return decision
+    later = [b for b in decision.get("unresolved_high") or []
+             if b.get("kind") == "critique_blocker" and str(b.get("target_stage") or "").upper() == "WRITE"]
+    if not later:
+        return decision
+    decision["unresolved_high"] = [b for b in decision["unresolved_high"] if b not in later]
+    decision["after_write"] = sorted(str(b.get("id")) for b in later)
+    return _recompute_action(decision, max_rounds, current_round)
+
+
 def _apply_done_when(decision: dict, critiques: dict, run_dir: str, max_rounds: int,
                      current_round: int, record: bool = True) -> tuple[dict, dict | None]:
     """Phase 34: a critic finding whose done_when test passes is resolved,
@@ -3573,10 +3592,11 @@ def _apply_done_when(decision: dict, critiques: dict, run_dir: str, max_rounds: 
     done_when.gate_findings). A failure here is reported, never fatal."""
     try:
         import done_when
-        res = done_when.run(run_dir, critiques, current_round, record=record)
-    except Exception as e:  # noqa: BLE001
+        res = done_when.run(run_dir, critiques, current_round, record=record,
+                            exclude=decision.get("outside_brief") or ())
+    except Exception as e:  # noqa: BLE001 — fail closed: a HIGH finding via gate_findings
         decision["done_when_error"] = f"{type(e).__name__}: {e}"
-        return decision, None
+        return decision, {"error": decision["done_when_error"]}
     decision["done_when_status"] = res["status"]
     if not res["resolved"]:
         return decision, res
@@ -7315,6 +7335,26 @@ def _run_self_test() -> int:
         reg = [b for b in dec["unresolved_high"] if b.get("kind") == "done_when_regressed"]
         ok(len(reg) == 1 and "R-001" in reg[0]["claim"] and "round 3" in reg[0]["claim"]
            and dec["action"] != "ACCEPT", f"DG4: a broken test reopens as a HIGH gate finding: {dec['unresolved_high']}")
+        for rnd in (1, 2):
+            _append_validator_history(d, rnd, {"action": "PATCH_OR_RETHINK", "rigor_violations": [
+                {"kind": "critique_done_when_missing", "severity": "MEDIUM", "stage": "CRITIQUE"}]}, False)
+        miss = _dw.gate_findings({"missing": {"critique-redteam": ["R-009"]}})
+        kinds = {v.get("kind") for v in _check_rigor_artifacts(d, round_n=3, extra=miss)}
+        ok("critique_done_when_missing_persistent" in kinds,
+           f"DG5: untested findings for 3 rounds escalate through the production path: {sorted(kinds)[:12]}")
+        bad = _incorporate_rigor_violations(decide(crit, 8, 5), _dw.gate_findings({"error": "KeyError: x"}), 8, 5)
+        ok(any(b.get("kind") == "done_when_unavailable" for b in bad["unresolved_high"]) and bad["action"] != "ACCEPT",
+           "DG6: a crashed test evaluation is a HIGH finding (fail closed)")
+        wcrit = {"critique-presentation": {"blockers": [
+            {"id": "P-001", "severity": "HIGH", "target_stage": "WRITE", "category": "PRESENTATION",
+             "first_seen_round": 1, "claim": "no captions", "resolved": False}],
+            "carried_forward": [], "structural_mismatch": {"detected": False}}}
+        pre = _defer_write_findings(decide(wcrit, 8, 2), d, 8, 2)
+        open(os.path.join(d, "manuscript.md"), "w").write("draft")
+        post = _defer_write_findings(decide(wcrit, 8, 2), d, 8, 2)
+        ok(pre["action"] == "ACCEPT" and pre["after_write"] == ["P-001"]
+           and [b["id"] for b in post["unresolved_high"]] == ["P-001"],
+           f"DG7: a HIGH write-up finding waits for the first draft, then blocks: {pre['action']} {post['action']}")
 
     # E6: critique-blocker MEDIUM persistence below threshold → silent.
     # first_seen=4, round=6 → persisted only 2 rounds; threshold 4.
@@ -9169,6 +9209,7 @@ def main() -> int:
                                   args.max_rounds, args.current_round)
     decision, dw_result = _apply_done_when(decision, critiques, args.run_dir, args.max_rounds,
                                            args.current_round, record=not args.no_history)
+    decision = _defer_write_findings(decision, args.run_dir, args.max_rounds, args.current_round)
 
     if args.spec_compliance:
         spec_module = _load_spec_compliance()
@@ -9216,9 +9257,11 @@ def main() -> int:
         # (see agents/__init__.py around line 392); previously this
         # call site dropped it on the floor and the new ψ behavior
         # was unreachable from production.
+        import done_when
         rigor_violations = _check_rigor_artifacts(
             args.run_dir, round_n=args.current_round,
             post_write=args.post_write,
+            extra=done_when.gate_findings(dw_result or {}),
         )
         # Phase 11 Commit υ (F3): missing critique_redteam.yaml is a
         # MEDIUM violation now, not a silent skip. The lead is required
@@ -9243,9 +9286,6 @@ def main() -> int:
                 ),
             })
         rigor_violations.extend(crossmodel_violations)
-        if dw_result is not None:   # Phase 34: regressions (HIGH), untested findings (MEDIUM)
-            import done_when
-            rigor_violations.extend(done_when.gate_findings(dw_result))
         if rigor_violations:
             decision = _incorporate_rigor_violations(
                 decision, rigor_violations,

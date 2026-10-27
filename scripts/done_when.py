@@ -32,8 +32,11 @@ Forms (a list means all must pass):
    blocks, and adds one MEDIUM per critic naming the ids.
 β  Every test that has passed is re-run at every gate (done_when_registry.json,
    written only by the gate). One that fails again reopens its finding as a
-   HIGH `done_when_regressed`, naming the round it passed. Critics need no fix
-   check for items with a runnable test: the harness checks them.
+   HIGH `done_when_regressed`, naming the round it passed. A finding the
+   critic resolves while its runnable test fails is `done_when_unmet` (its own
+   severity) until the test passes or the critic withdraws it
+   (`done_when_withdrawn: <reason>`). Critics need no fix check for items with
+   a runnable test: the harness checks them.
 
 Agents check their own work before returning:
 
@@ -87,7 +90,9 @@ are necessary but not enough, list them with one judgement entry.
 The test is fixed once the gate has seen it: a finding whose test passes is
 resolved, and tests that passed are re-run every round, so a later change
 that breaks one reopens it. Do not keep a finding open with a new
-requirement; raise a new finding (new id, its own test). Run
+requirement; raise a new finding (new id, its own test). A finding you mark
+resolved while its test still fails stays blocking; if the test itself was
+wrong, add `done_when_withdrawn: "<why>"` to the finding. Run
 `python3 scripts/done_when.py check <run_dir>` to see which tests pass now.
 """
 
@@ -261,12 +266,18 @@ def evaluate(dw, run_dir: str) -> tuple[bool | None, str]:
                     if wk not in rows[0]:
                         raise KeyError(f"no column {wk!r}")
                     rows = [r for r in rows if _compare(_cell(r[wk]), "==", wv)]
+                if not rows:   # a filter that keeps nothing tests nothing
+                    raise ValueError(f"no rows match where {c.get('where')}")
                 if c.get("agg"):
-                    vals = [_cell(r[c["column"]]) for r in rows]
-                    nums = [_num(v) for v in vals if v != ""]
-                    agg = {"sum": sum(nums), "mean": sum(nums) / len(nums) if nums else float("nan"),
-                           "min": min(nums, default=float("nan")), "max": max(nums, default=float("nan")),
-                           "count": len(rows)}[c["agg"]]
+                    if c["agg"] == "count":
+                        agg = len(rows)
+                    else:
+                        vals = [_cell(r[c["column"]]) for r in rows]
+                        if any(v == "" for v in vals):   # a blank cell is missing output, not zero
+                            raise ValueError(f"{sum(v == '' for v in vals)} blank {c['column']!r} value(s)")
+                        nums = [_num(v) for v in vals]
+                        agg = {"sum": sum(nums), "mean": sum(nums) / len(nums),
+                               "min": min(nums), "max": max(nums)}[c["agg"]]
                     ok = _compare(agg, c["op"], c.get("value"))
                     d = f"{rel}: {c['agg']}({c['column']}) = {agg:g} ({c['op']} {c.get('value')})"
                     details.append(("pass " if ok else "FAIL ") + d)
@@ -319,22 +330,32 @@ def _blockers(critiques: dict):
                 yield reviewer, b
 
 
-def run(run_dir: str, critiques: dict, round_n: int, record: bool = True) -> dict:
+def run(run_dir: str, critiques: dict, round_n: int, record: bool = True, exclude=()) -> dict:
     """Evaluate every test (frozen ones from the registry, new valid ones from
-    the critiques) and, when `record`, save the registry. Returns
+    the critiques) and, when `record`, save the registry. `exclude`: ids the
+    gate does not count (outside the decision brief). Returns
     {resolved: [ids whose test passes while the critic has them open],
-     regressed: [{id, severity, reviewer, passed_round, detail, claim}],
-     missing: {reviewer: [ids with no valid test]},
+     regressed: [tests that passed at an earlier gate run and fail now],
+     unmet: [findings a critic resolved whose runnable test fails and never passed],
+     missing: {reviewer: [ids with no valid test]}, invalid: [registry ids that cannot be read],
      status: {id: {passes, detail, mechanical, frozen_round}}}."""
     reg = load_registry(run_dir)
     tests = reg["tests"]
+    exclude = {str(x) for x in exclude or ()}
     missing: dict[str, list] = {}
-    open_ids = set()
+    open_ids, closed_ids = set(), set()
     for reviewer, b in _blockers(critiques):
         bid = str(b["id"])
-        if b.get("resolved") is not True:
-            open_ids.add(bid)
+        if bid in exclude:
+            continue
+        (closed_ids if b.get("resolved") is True else open_ids).add(bid)
         if bid in tests:
+            t = tests[bid]
+            # A critic may withdraw a frozen test, with its reason: a visible,
+            # counted change of target, never a silent one.
+            why = str(b.get("done_when_withdrawn") or "").strip()
+            if why and isinstance(t, dict) and not t.get("withdrawn"):
+                t["withdrawn"] = {"round": round_n, "reason": why[:300]}
             continue  # frozen: later edits to the critic's test are ignored
         dw = b.get("done_when")
         if dw is None or problems(dw):
@@ -344,43 +365,77 @@ def run(run_dir: str, critiques: dict, round_n: int, record: bool = True) -> dic
         tests[bid] = {"reviewer": reviewer, "severity": b["severity"], "claim": str(b.get("claim") or "")[:200],
                       "target_stage": str(b.get("target_stage") or "").upper(), "done_when": dw,
                       "frozen_round": round_n, "passed_round": None, "history": []}
-    resolved, regressed, status = [], [], {}
+        why = str(b.get("done_when_withdrawn") or "").strip()
+        if why:
+            tests[bid]["withdrawn"] = {"round": round_n, "reason": why[:300]}
+    resolved, regressed, unmet, invalid, status = [], [], [], [], {}
     for bid, t in tests.items():
+        if bid in exclude:
+            continue
+        if not isinstance(t, dict) or "done_when" not in t or not isinstance(t.get("history", []), list):
+            invalid.append(bid)   # fail closed: a frozen test that cannot be read is a finding
+            continue
+        if t.get("withdrawn"):
+            status[bid] = {"passes": None, "detail": f"withdrawn in round {t['withdrawn'].get('round')}: "
+                                                     f"{t['withdrawn'].get('reason')}", "mechanical": False,
+                           "frozen_round": t.get("frozen_round")}
+            continue
         passes, detail = evaluate(t["done_when"], run_dir)
         status[bid] = {"passes": passes, "detail": detail, "mechanical": mechanical(t["done_when"]),
                        "frozen_round": t.get("frozen_round")}
+        entry = {"id": bid, "severity": t.get("severity") or "HIGH", "reviewer": t.get("reviewer"),
+                 "passed_round": t.get("passed_round"), "detail": detail, "claim": t.get("claim") or "",
+                 "target_stage": t.get("target_stage") or "MODEL"}
         if passes is True:
             if bid in open_ids:
                 resolved.append(bid)
             if t.get("passed_round") is None:
                 t["passed_round"] = round_n
-        elif passes is False and t.get("passed_round") is not None and t["passed_round"] < round_n:
-            regressed.append({"id": bid, "severity": t["severity"], "reviewer": t["reviewer"],
-                              "passed_round": t["passed_round"], "detail": detail, "claim": t["claim"],
-                              "target_stage": t.get("target_stage") or "MODEL"})
-        hist = [h for h in t.get("history") or [] if h[0] != round_n]
-        t["history"] = hist + [[round_n, passes]]
+        elif passes is False and t.get("passed_round") is not None:
+            regressed.append(entry)   # any earlier gate run, the same round included
+        elif passes is False and bid in closed_ids:
+            unmet.append(entry)
+        t["history"] = [h for h in t.get("history") or [] if h[0] != round_n] + [[round_n, passes]]
     if record:
         _save(run_dir, reg)
-    return {"resolved": sorted(resolved), "regressed": regressed, "missing": missing, "status": status}
+    return {"resolved": sorted(resolved), "regressed": regressed, "unmet": unmet, "missing": missing,
+            "invalid": sorted(invalid), "status": status}
 
 
 def _save(run_dir: str, reg: dict) -> None:
-    fd, tmp = tempfile.mkstemp(dir=run_dir, prefix=".dw_", suffix=".tmp")
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
+    tmp = os.path.join(run_dir, REGISTRY + ".tmp")   # a fixed name the integrity record knows
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(reg, f, indent=1, default=str)
     os.replace(tmp, os.path.join(run_dir, REGISTRY))
 
 
 def gate_findings(result: dict) -> list[dict]:
-    """Regressions (HIGH) and missing tests (MEDIUM, one per critic)."""
+    """Regressions (HIGH), unmet tests (their severity), an unreadable
+    registry or a crashed evaluation (HIGH), missing tests (MEDIUM, one per
+    critic)."""
     out = []
+    if result.get("error"):
+        out.append({"kind": "done_when_unavailable", "severity": "HIGH", "stage": "CRITIQUE",
+                    "target_stage": "CRITIQUE", "scope_declarable": True,
+                    "claim": f"The done_when tests could not be evaluated ({result['error'][:200]}); "
+                             "no finding can be closed or checked for regressions by its test."})
     for r in result.get("regressed") or []:
         out.append({"kind": "done_when_regressed", "severity": "HIGH", "id": r["id"],
                     "target_stage": r["target_stage"], "stage": r["target_stage"], "scope_declarable": True,
                     "claim": (f"{r['id']} ({r['reviewer']}) passed its done_when test in round {r['passed_round']} "
                               f"and fails now: {r['detail'][:300]}. Something changed since; restore the fix. "
                               f"Finding: {r['claim'][:150]}")})
+    for r in result.get("unmet") or []:
+        out.append({"kind": "done_when_unmet", "severity": r["severity"], "id": r["id"],
+                    "target_stage": r["target_stage"], "stage": r["target_stage"], "scope_declarable": True,
+                    "claim": (f"{r['id']} ({r['reviewer']}) is marked resolved but its done_when test fails: "
+                              f"{r['detail'][:300]}. Fix it so the test passes, or the critic withdraws the test "
+                              f"(`done_when_withdrawn: <reason>`). Finding: {r['claim'][:150]}")})
+    if result.get("invalid"):
+        out.append({"kind": "done_when_registry_invalid", "severity": "HIGH", "stage": "CRITIQUE",
+                    "target_stage": "CRITIQUE", "scope_declarable": True,
+                    "claim": (f"done_when_registry.json has unreadable tests ({', '.join(result['invalid'][:10])}); "
+                              "the gate cannot check those findings.")})
     for reviewer, ids in sorted((result.get("missing") or {}).items()):
         out.append({"kind": "critique_done_when_missing", "severity": "MEDIUM", "stage": "CRITIQUE",
                     "target_stage": "CRITIQUE",
@@ -477,7 +532,12 @@ def _self_test() -> int:
            and evaluate(col(column="cost", agg="sum", op="<=", value=30), d)[0] is False
            and evaluate(col(column="cost", agg="max", op="==", value=12), d)[0] is True
            and evaluate(col(column="cost", agg="count", op="==", value=1, where={"package": "IRS"}), d)[0] is True
-           and problems(col(column="cost", agg="median", op="<", value=1)), "DW7c CSV aggregates")
+           and problems(col(column="cost", agg="median", op="<", value=1))
+           and evaluate(col(agg="count", op="==", value=1, where={"package": "IRS"}), d)[0] is True
+           and evaluate(col(op="==", value="P3", where={"unit": "zz"}), d)[0] is False, "DW7c CSV aggregates")
+        open(os.path.join(d, "blank.csv"), "w").write("unit,cost\na,\nb,\n")
+        ok(evaluate({"file": "blank.csv", "column": "cost", "agg": "sum", "op": "<=", "value": 100}, d)[0] is False,
+           "DW7e blank cells fail a numeric aggregate (missing output is not zero)")
         mixed = [{"file": "alloc.csv", "exists": True}, {"judgement": "the critic reads the caveat"}]
         ok(evaluate(mixed, d)[0] is None and not mechanical(mixed)
            and evaluate([{"file": "nope.csv", "exists": True}, {"judgement": "x"}], d)[0] is False,
@@ -517,8 +577,38 @@ def _self_test() -> int:
         ok(any(x["kind"] == "critique_done_when_missing" and "R-006" in x["claim"] and x["severity"] == "MEDIUM"
                for x in g), "DW14 one MEDIUM per critic names the untested ids")
         ok("X-001" not in json.dumps(r5), "DW15 the cross-model critic (a script) is not asked for tests")
-        r6 = run(d, crit, 7, record=False)
-        ok(load_registry(d)["tests"]["M-001"]["history"][-1][0] == 6 and r6["regressed"],
+        # DW19-DW22 (Codex review): same-round regression, unmet tests, withdrawal, bad registry
+        json.dump({"total_cost_usd": {"ci95": [371.0, 455.0]}}, open(os.path.join(d, "out.json"), "w"))
+        run(d, crit, 6)
+        json.dump({"total_cost_usd": {"ci95": [400.0, 400.0]}}, open(os.path.join(d, "out.json"), "w"))
+        ok([x["id"] for x in run(d, crit, 6, record=False)["regressed"]] == ["M-001"],
+           "DW19 a test that passed earlier in the same round and fails now is a regression")
+        crit["critique-redteam"]["blockers"].append(
+            {"id": "R-007", "severity": "HIGH", "resolved": True, "claim": "said fixed",
+             "done_when": {"file": "never.csv", "exists": True}})
+        r7 = run(d, crit, 6, record=False)
+        ok([x["id"] for x in r7["unmet"]] == ["R-007"]
+           and any(g["kind"] == "done_when_unmet" and g["severity"] == "HIGH" for g in gate_findings(r7)),
+           f"DW20 resolved by the critic while its runnable test fails: blocking at its severity: {r7['unmet']}")
+        crit["critique-redteam"]["blockers"][-1]["done_when_withdrawn"] = "the file is not needed for the fix"
+        r8 = run(d, crit, 7)
+        ok(not r8["unmet"] and "withdrawn in round 7" in r8["status"]["R-007"]["detail"]
+           and load_registry(d)["tests"]["R-007"]["withdrawn"]["round"] == 7,
+           "DW21 a critic's withdrawal is recorded, with its round and reason")
+        ok(not run(d, crit, 7, record=False, exclude={"R-007", "M-001"})["regressed"],
+           "DW22 findings outside the brief are neither registered nor reopened")
+        reg_bad = load_registry(d)
+        reg_bad["tests"]["Z-1"] = {}
+        _save(d, reg_bad)
+        rb = run(d, crit, 7, record=False)
+        ok(rb["invalid"] == ["Z-1"] and any(g["kind"] == "done_when_registry_invalid" for g in gate_findings(rb)),
+           "DW23 an unreadable registry entry is a HIGH finding, not skipped")
+        del reg_bad["tests"]["Z-1"]
+        _save(d, reg_bad)
+        json.dump({"total_cost_usd": {"ci95": [400.0, 400.0]}}, open(os.path.join(d, "out.json"), "w"))
+        before = json.dumps(load_registry(d), sort_keys=True)
+        r6 = run(d, crit, 9, record=False)
+        ok(json.dumps(load_registry(d), sort_keys=True) == before and r6["regressed"],
            "DW16 record=False evaluates without saving")
         st = r6["status"]
         ok(st["M-001"]["mechanical"] and st["M-001"]["passes"] is False, f"DW17 status per test: {st}")

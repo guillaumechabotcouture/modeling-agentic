@@ -87,7 +87,9 @@ SCRIPT_OUTPUTS = (
     "decision_brief.signoff.json",   # Phase 33 α: scripts/decision_brief.py sign
     "acceptance_lock.json",          # Phase 33 α: written by the gate
     "done_when_registry.json",       # Phase 34: frozen finding tests, written by the gate
-    ".dw_*.tmp",
+    "done_when_registry.json.tmp",
+    "round_plan.frozen.json",        # Phase 32 γ: the plan as handed out, written by the hook
+    "round_plan.frozen.json.tmp",
 )
 
 # Files only one writer may change (None = the lead). Phase 32 α: the round
@@ -181,6 +183,14 @@ def protected_reason(path: str, run_path: str, agent_type: str | None,
             return None
         return (f"{rel} is produced by a pipeline script; re-run the script "
                 f"instead of writing it by hand")
+    # Codex review (Phases 31-34): critique and fix-check files belong to the
+    # critic that wrote them; another specialist must not write a verdict.
+    if agent_type is not None and _matches(rel, ("critique_*.yaml", "critique_*.md")) \
+            and not str(agent_type).startswith("critique-"):
+        return f"{rel} is written only by the critics"
+    m = re.fullmatch(r"fix_check_r\d+_([a-z]+)\.yaml", rel)
+    if m and agent_type is not None and agent_type != f"critique-{m.group(1)}":
+        return f"{rel} is written only by critique-{m.group(1)}"
     if rel in OWNED_BY and agent_type not in OWNED_BY[rel]:
         who = ", ".join("the lead" if w is None else w for w in OWNED_BY[rel])
         return f"{rel} is written only by {who}"

@@ -89,14 +89,19 @@ def _summ(m) -> dict | None:
             "num_turns": getattr(m, "num_turns", None)}
 
 
+def main_terminal():
+    from main import TERMINAL_TASK_STATUSES
+    return TERMINAL_TASK_STATUSES
+
+
 async def _converse(prompt, options, kill_when=None, query_fn=None, kill_fn=None, trace=None):
     """Run one query; optionally SIGKILL the CLI when kill_when(event, t)
     returns True. Returns (session_id, result, error, killed, events)."""
     from claude_agent_sdk import AssistantMessage, ResultMessage, SystemMessage, UserMessage
     try:
-        from claude_agent_sdk import TaskNotificationMessage
+        from claude_agent_sdk import TaskNotificationMessage, TaskUpdatedMessage
     except ImportError:  # older SDKs
-        TaskNotificationMessage = ()
+        TaskNotificationMessage = TaskUpdatedMessage = ()
     if query_fn is None:
         from claude_agent_sdk import query as query_fn
     kill_fn = kill_fn or (lambda: [os.kill(p, signal.SIGKILL) or p for p in _cli_pids()])
@@ -110,6 +115,11 @@ async def _converse(prompt, options, kill_when=None, query_fn=None, kill_fn=None
                 events.append(("task_notification", round(t, 1), m.task_id))
                 if trace is not None:
                     trace.write(json.dumps({"ts": datetime.now().isoformat(), "type": "task_notification",
+                                            "task_id": m.task_id, "status": m.status}) + "\n")
+                    trace.flush()
+            elif TaskUpdatedMessage and isinstance(m, TaskUpdatedMessage):
+                if trace is not None and str(m.status or "").lower() in main_terminal():
+                    trace.write(json.dumps({"ts": datetime.now().isoformat(), "type": "task_updated",
                                             "task_id": m.task_id, "status": m.status}) + "\n")
                     trace.flush()
             elif isinstance(m, SystemMessage) and m.subtype == "init":

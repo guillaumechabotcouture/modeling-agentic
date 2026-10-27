@@ -738,7 +738,10 @@ pass MUST begin with the literal line `This is critique round N.` where
 N is the current round number (starting at 1). Without this line the
 critique agent falls back to round 1 and emits a YAML with `round: 1`
 regardless of the actual round, which the validator will reject with a
-schema error and cost you a revision cycle.
+schema error and cost you a revision cycle. The harness refuses methods,
+domain, presentation and red-team spawns that start any other way, except
+`This is a fix check after round N.` (Step 2b) and `This is a repair of
+<file>.` (fix only that file's format, for example a schema error).
 
 Example spawn-prompt opening for round 2+:
 
@@ -868,9 +871,10 @@ The harness enforces this: planner, data-agent, modeler and analyst spawns
 are refused until the plan covers the latest list, and the round's critique
 is refused until every `fix` / `rethink` id has been named in a spawn prompt
 to its stage's agent (PLAN planner, DATA data-agent, MODEL modeler, ANALYZE
-analyst, WRITE writer). Once that work is handed out the plan is fixed for
-the round: a fix that did not work stays open, and the next gate lists it
-again for the next round's plan. Each critic finding carries a `done_when`
+analyst, WRITE writer). Once that work is handed out, the actions in the
+plan are fixed for the round (you may add items a gate rerun lists, not
+change these): a fix that did not work stays open, and the next gate lists
+it again for the next round's plan. Each critic finding carries a `done_when`
 test (shown in open_problems.md): the gate closes a finding when its test
 passes and reopens it if a later change breaks it, so tell each agent to run
 `python3 scripts/done_when.py check {run_dir} <IDs>` before it returns.
@@ -1405,6 +1409,7 @@ def writer_hold_reason(run_path: str, status: dict | None, max_rounds: int | Non
 
 
 PLAN_AGENTS = ("planner", "data-agent", "modeler", "analyst")
+CRITIC_PROMPT_HEADS = ("This is critique round", "This is a fix check", "This is a repair of")
 _PLAN_ACTIONS = ("PATCH_OR_RETHINK", "RETHINK_STRUCTURAL")
 
 
@@ -1447,11 +1452,25 @@ def _lead_spawns_since(run_path: str, since: float) -> list[tuple[str, set]]:
     return out
 
 
+def _list_missing(run_path: str) -> str | None:
+    """Codex review: the gate asked for a plan but its open-problem list is
+    missing or older than that gate run: refuse rather than wave work through."""
+    rows = [r for r in _gate_rounds(run_path) if not r.get("post_write")]
+    if not rows or str(rows[-1].get("action") or "") not in _PLAN_ACTIONS:
+        return None
+    if _plan_required(run_path) is not None:
+        return None
+    n = rows[-1].get("round")
+    return (f"The round {n} gate asked for more work, but {open_problems.OPEN_JSON} for round {n} is missing or "
+            f"stale. Re-run the gate for round {n} (scripts/validate_critique_yaml.py with --current-round {n}) "
+            "so it writes the open-problem list, then plan it.")
+
+
 def plan_hold_reason(run_path: str) -> str | None:
     """Phase 32 α: work for the next round waits for round_plan.yaml."""
     doc = _plan_required(run_path)
     if doc is None:
-        return None
+        return _list_missing(run_path)
     errors = open_problems.check_plan(run_path)
     if not errors:
         return None
@@ -1464,14 +1483,16 @@ def critique_hold_reason(run_path: str, status: dict | None) -> str | None:
     fix went to its stage's agent, the critics checked their fixes, and what
     was not fixed went back once. Skipped when the budget cannot cover it."""
     doc = _plan_required(run_path)
-    if doc is None or _budget_tight(status, _gate_rounds(run_path)):
+    if _budget_tight(status, _gate_rounds(run_path)):
         return None
+    if doc is None:
+        return _list_missing(run_path)
     errors = open_problems.check_plan(run_path)
     if errors:
         return plan_hold_reason(run_path)
     plan_path = os.path.join(run_path, open_problems.PLAN_FILE)
     missing = open_problems.unsent(open_problems.planned_work(run_path),
-                                   _lead_spawns_since(run_path, os.path.getmtime(plan_path)))
+                                   _lead_spawns_since(run_path, open_problems.round_start(run_path)))
     if missing:
         return ("The round's critique waits until every planned fix has been handed to the agent that does it. "
                 "Not yet named in a spawn prompt: " + ", ".join(missing)[:1200])
@@ -1525,7 +1546,7 @@ def work_running(run_path: str, since: float, kinds=PLAN_AGENTS, now: float | No
             starts[r["agent_type"]] = starts.get(r["agent_type"], 0) + 1
         elif t == "subagent_stop":
             done.add(r.get("agent_id"))
-        elif t == "task_notification":
+        elif t in ("task_notification", "task_updated"):   # task_updated: terminal statuses only (main.py)
             done.add(r.get("task_id"))
         elif r.get("subagent_type") in kinds and r.get("agent") == "lead" and not r.get("denied"):
             spawned.setdefault(r["subagent_type"], []).append(datetime.fromisoformat(r["ts"]).timestamp())
@@ -1546,28 +1567,6 @@ def review_wait_reason(run_path: str, sub: str | None, since: float) -> str | No
         return None
     return (f"{sub} reviews finished work, and these agents are still working: {', '.join(busy)[:600]}. Wait "
             f"for their results (each comes back to you when it finishes), then spawn {sub}.")
-
-
-def plan_frozen_reason(run_path: str) -> str | None:
-    """Phase 32 γ: the round plan is fixed once its work has been handed out.
-    A lead that rewrote it afterwards turned an unfixed item into 'declare'
-    (real-SDK check, 2026-10-26). A change of action waits for the next
-    gate's open-problem list and the next round's plan."""
-    doc = open_problems.load_open(run_path)
-    path = os.path.join(run_path, open_problems.PLAN_FILE)
-    if doc is None or not os.path.exists(path):
-        return None
-    plan, err = open_problems._plan(run_path)
-    if err or str((plan or {}).get("round")) != str(doc.get("round")):
-        return None
-    ids = {w["id"] for w in open_problems.planned_work(run_path)}
-    sent = sorted({i for a, got in _lead_spawns_since(run_path, os.path.getmtime(path))
-                   if a in PLAN_AGENTS for i in got & ids})
-    if not sent:
-        return None
-    return (f"{open_problems.PLAN_FILE} for round {doc['round']} is fixed: its work has been handed out "
-            f"({', '.join(sent)[:300]}). Leave it as it is. A fix that did not work stays open; the next gate lists "
-            "it again, and the next round's plan can give it another action.")
 
 
 def signoff_hold_reason(run_path: str, mode: str | None, run_dir_rel: str = "{run_dir}") -> str | None:
@@ -1640,15 +1639,6 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
                     f"{input_data.get('description', '')}")
         return name
 
-    def _writes_plan(tool_name, tool_input, cwd):
-        if tool_name in ("Write", "Edit", "MultiEdit"):
-            targets = [str(tool_input.get("file_path") or "")]
-        elif tool_name == "Bash":
-            targets = [t for t, _ in enforcement.bash_write_targets_cwd(str(tool_input.get("command") or ""), cwd)]
-        else:
-            return False
-        return any(os.path.basename(t.strip("'\"")) == open_problems.PLAN_FILE for t in targets)
-
     async def pre_tool_hook(input_data, tool_use_id, context):
         nonlocal tool_count
         tool_count += 1
@@ -1674,19 +1664,31 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
         if not deny_reason and spawn and sub != "planner":
             deny_reason = signoff_hold_reason(run_path, signoff, run_path)
         if (not deny_reason and signoff == "owner" and tool_name == "Bash"
-                and re.search(r"decision_brief\.py\s+sign\b", str(tool_input.get("command") or ""))):
+                and re.search(r"decision_brief\.py\b.*\bsign\b", str(tool_input.get("command") or ""), re.S)):
             deny_reason = "The owner signs the decision brief in this run; agents cannot sign it."
         if not deny_reason and spawn:
             deny_reason = review_wait_reason(run_path, sub, session_t0)
-        if not deny_reason and agent_id == "lead" and _writes_plan(tool_name, tool_input, input_data.get("cwd")):
-            deny_reason = plan_frozen_reason(run_path)
         if not deny_reason and hold_writer and sub == "writer":
             deny_reason = writer_hold_reason(run_path, _status(), max_rounds)
         if not deny_reason and hold_writer and sub in PLAN_AGENTS:
             deny_reason = plan_hold_reason(run_path)
-        if (not deny_reason and hold_writer and str(sub or "").startswith("critique-")
-                and str(tool_input.get("prompt") or "").lstrip().startswith("This is critique round")):
+        head = str(tool_input.get("prompt") or "").lstrip()
+        if not deny_reason and hold_writer and sub in open_problems.FIX_CHECK_CRITICS \
+                and not head.startswith(CRITIC_PROMPT_HEADS):
+            # Codex review: the round's holds keyed on one phrase, so a reworded
+            # full critique skipped them. Every critic spawn now says what it is.
+            deny_reason = (f"Start a {sub} prompt with one of: `This is critique round N.` (the round's "
+                           "review), `This is a fix check after round N.` (check planned fixes), or "
+                           "`This is a repair of <file>.` (fix only that file's format, no new review).")
+        if not deny_reason and hold_writer and sub in open_problems.FIX_CHECK_CRITICS \
+                and head.startswith("This is critique round"):
             deny_reason = critique_hold_reason(run_path, _status())
+        if not deny_reason and hold_writer and sub in PLAN_AGENTS and _plan_required(run_path) is not None:
+            try:   # Phase 32 γ: the round's actions are fixed once work is handed out
+                if open_problems.freeze(run_path) and integrity is not None:
+                    integrity.harness_wrote(open_problems.FROZEN_FILE)
+            except OSError:
+                pass
         status = "DENIED" if deny_reason else ""
         print(f"[{label:>12} {elapsed:6.0f}s | #{tool_count}] {status} {summary}".replace("]  ", "] "),
               flush=True)
@@ -1704,7 +1706,8 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
             if str(sub or "").startswith("critique-"):
                 head = str(tool_input.get("prompt") or "").lstrip()
                 record["critique_kind"] = ("full" if head.startswith("This is critique round")
-                                           else "fix_check" if head.startswith("This is a fix check") else "other")
+                                           else "fix_check" if head.startswith("This is a fix check")
+                                           else "repair" if head.startswith("This is a repair of") else "other")
             record["mentions"] = open_problems.mentions(str(tool_input.get("prompt") or ""), run_path)
         if deny_reason:
             record["denied"] = deny_reason

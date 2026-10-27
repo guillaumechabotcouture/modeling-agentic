@@ -61,6 +61,7 @@ FIX_CHECK_CRITICS = ("critique-domain", "critique-presentation",
                      "critique-redteam", "critique-methods")
 VERDICTS = ("fixed", "partly", "not_fixed")
 OPEN_JSON, OPEN_MD, PLAN_FILE = "open_problems.json", "open_problems.md", "round_plan.yaml"
+FROZEN_FILE = "round_plan.frozen.json"   # Phase 32 γ: the actions as handed out (written by the hook)
 MIN_REASON = 20
 
 FIX_CHECK_NOTE = """
@@ -144,10 +145,10 @@ def build(run_dir: str, round_n: int, max_rounds: int, critiques: dict,
                 continue
             first = _int(b.get("first_seen_round"), round_n)
             stage = str(b.get("target_stage") or "").upper()
-            if sev == "HIGH":
+            if stage == "WRITE" and not written:
+                blocks_in = None  # nothing to fix before a write-up exists (HIGH included)
+            elif sev == "HIGH":
                 blocks_in = 0
-            elif stage == "WRITE" and not written:
-                blocks_in = None  # does not escalate before a write-up exists
             else:
                 blocks_in = max(0, blocker_threshold - (round_n - first))
             items[b["id"]] = {
@@ -324,6 +325,18 @@ def check_plan(run_dir: str) -> list[str]:
     missing = [i["id"] for i in doc["items"] if i["id"] not in resolved]
     if missing:
         errors.append("no action for: " + ", ".join(missing))
+    frozen = load_frozen(run_dir)
+    if frozen is not None and _int(frozen.get("round")) == doc["round"]:
+        for iid, was in (frozen.get("items") or {}).items():
+            if iid not in resolved:
+                continue
+            e = resolved[iid][1]
+            e = e if isinstance(e, dict) else {"action": e}
+            now = {"action": e.get("action"), "stage": str(e.get("stage") or "").upper() or None}
+            if now != was:
+                errors.append(f"{iid}: was planned as {was['action']}{' (' + was['stage'] + ')' if was.get('stage') else ''} "
+                              f"when the round's work was handed out; it stays that way this round (a fix that "
+                              f"did not work stays open for the next round's plan)")
     for i in doc["items"]:
         if i["id"] not in resolved:
             continue
@@ -343,6 +356,50 @@ def check_plan(run_dir: str) -> list[str]:
         elif act == "declare" and not i.get("scope_declarable", True):
             errors.append(f"{i['id']}: cannot be scope-declared ({i.get('kind')}); it has to be fixed")
     return errors
+
+
+def load_frozen(run_dir: str) -> dict | None:
+    try:
+        with open(os.path.join(run_dir, FROZEN_FILE), encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) and isinstance(d.get("items"), dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def round_start(run_dir: str) -> float:
+    """When this round's work began: the hand-out snapshot for the current
+    list's round, else the plan's last change. Adding an item to the plan
+    later does not make earlier hand-outs and fix checks count for nothing."""
+    doc = load_open(run_dir)
+    fz = load_frozen(run_dir)
+    if doc is not None and fz is not None and _int(fz.get("round")) == doc["round"]:
+        return os.path.getmtime(os.path.join(run_dir, FROZEN_FILE))
+    return os.path.getmtime(os.path.join(run_dir, PLAN_FILE))
+
+
+def freeze(run_dir: str) -> bool:
+    """Phase 32 γ: record each item's action and stage when the round's work
+    is first handed out. Later the plan may add items (a same-round gate rerun
+    can list new ones) but not change these (check_plan). Returns True when a
+    snapshot was written."""
+    doc = load_open(run_dir)
+    plan, err = _plan(run_dir)
+    if doc is None or err or check_plan(run_dir):
+        return False
+    old = load_frozen(run_dir)
+    if old is not None and _int(old.get("round")) == doc["round"]:
+        return False
+    resolved, _ = _resolve(doc, plan)
+    items = {}
+    for iid, (_, e) in resolved.items():
+        e = e if isinstance(e, dict) else {"action": e}
+        items[iid] = {"action": e.get("action"), "stage": str(e.get("stage") or "").upper() or None}
+    tmp = os.path.join(run_dir, FROZEN_FILE + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"round": doc["round"], "items": items}, f, indent=1)
+    os.replace(tmp, os.path.join(run_dir, FROZEN_FILE))
+    return True
 
 
 def planned_work(run_dir: str) -> list[dict]:
@@ -424,7 +481,7 @@ def check_fix_checks(run_dir: str) -> tuple[list[str], dict[str, list[str]]]:
     work = [w for w in planned_work(run_dir) if w["fix_check"]]
     if doc is None or not work:
         return [], {}
-    plan_mtime = os.path.getmtime(os.path.join(run_dir, PLAN_FILE))
+    plan_mtime = round_start(run_dir)
     missing, redo = [], {}
     by_critic: dict[str, list[dict]] = {}
     for w in work:

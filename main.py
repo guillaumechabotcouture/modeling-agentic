@@ -26,6 +26,10 @@ from claude_agent_sdk import (
     TaskProgressMessage,
     TaskNotificationMessage,
 )
+try:   # Phase 32 γ (Codex review): a background task can end with only an update
+    from claude_agent_sdk import TaskUpdatedMessage
+except ImportError:  # older SDKs
+    TaskUpdatedMessage = ()
 from agents import (
     build_agents,
     build_lead_prompt,
@@ -294,6 +298,9 @@ def build_resume_context(run_path: str) -> str:
     )
 
 
+TERMINAL_TASK_STATUSES = ("completed", "failed", "killed", "stopped", "cancelled", "canceled", "error")
+
+
 def log_message(message, trace_file):
     """Log a message from the lead session to console and trace."""
     if isinstance(message, TaskStartedMessage):
@@ -304,6 +311,10 @@ def log_message(message, trace_file):
             "task_id": message.task_id,
             "description": message.description,
         }) + "\n")
+    elif TaskUpdatedMessage and isinstance(message, TaskUpdatedMessage):
+        if str(message.status or "").lower() in TERMINAL_TASK_STATUSES:
+            trace_file.write(json.dumps({"ts": datetime.now().isoformat(), "type": "task_updated",
+                                         "task_id": message.task_id, "status": message.status}) + "\n")
     elif isinstance(message, TaskProgressMessage):
         tool = message.last_tool_name or ""
         if tool:
@@ -431,7 +442,8 @@ SIGNOFF_PROMPT = (
     "terminal state.")
 
 
-async def wait_for_signoff(run_path: str, run_dir_rel: str, hours: float, poll_s: float = 30.0) -> bool:
+async def wait_for_signoff(run_path: str, run_dir_rel: str, hours: float, poll_s: float = 30.0,
+                           integrity=None) -> bool:
     """Phase 33 α: the run waits for the owner to sign the decision brief.
     True once signed; False when the wait times out (status awaiting_signoff,
     resumable with --resume after signing)."""
@@ -451,6 +463,8 @@ async def wait_for_signoff(run_path: str, run_dir_rel: str, hours: float, poll_s
     deadline = time.time() + hours * 3600
     while time.time() < deadline:
         if decision_brief.status(run_path) == "signed":
+            if integrity is not None:   # the owner signed outside any tool call
+                integrity.harness_wrote(decision_brief.SIGNOFF)
             with open(os.path.join(run_path, "trace.jsonl"), "a") as tf:
                 tf.write(json.dumps({"ts": datetime.now().isoformat(), "type": "signed_off"}) + "\n")
             print("Decision brief signed; resuming the lead.", flush=True)
@@ -733,6 +747,9 @@ async def run(question: str, max_rounds: int, max_sessions: int,
         json.dump(prior_meta, f, indent=2)
     env_overrides = enforcement.filtered_env(dict(os.environ), allow_cloud)
     env_overrides["MA_SIGNOFF_MODE"] = signoff   # Phase 33: decision_brief.py sign checks it
+    # The harness's own gate runs (run_final_gate) read the mode too: with
+    # --signoff none an unsigned brief is not a finding (Codex review).
+    os.environ["MA_SIGNOFF_MODE"] = signoff
     import decision_brief
     if resume_context and decision_brief.is_signed(run_path):
         lead_prompt += "\n" + decision_brief.signoff_text(run_path) + "\n"
@@ -893,7 +910,7 @@ async def run(question: str, max_rounds: int, max_sessions: int,
             if error_str is None and result_is_success(result):
                 if signoff == "owner" and decision_brief.status(run_path) == "awaiting":
                     # Phase 33 α: the lead stopped for the owner's sign-off.
-                    if not await wait_for_signoff(run_path, run_dir_rel, signoff_hours):
+                    if not await wait_for_signoff(run_path, run_dir_rel, signoff_hours, integrity=integrity):
                         print("Sign-off wait timed out; resume with --resume after signing.", flush=True)
                         session_outcome, paused = "awaiting_signoff", True
                         break
@@ -1379,6 +1396,7 @@ def _run_self_test() -> int:
         # planned fixes, the critics' fix checks and one return trip for what was not fixed
         import time
         from agents import critique_hold_reason
+        from open_problems import check_plan as open_problems_check
         gates("PATCH_OR_RETHINK", "PATCH_OR_RETHINK")
         json.dump({"round": 2, "items": [
             {"id": "R-005", "source": "critique-redteam", "severity": "MEDIUM", "target_stage": "ANALYZE",
@@ -1430,10 +1448,29 @@ def _run_self_test() -> int:
         def lead_tool(name, inp):
             return json.dumps(asyncio.run(pre3({"tool_name": name, "tool_input": inp}, "t", None)))
         plan_p, t_rp = os.path.join(td, "round_plan.yaml"), time.time()
-        r = lead_tool("Write", {"file_path": plan_p, "content": "round: 2\nitems: {}\n"})
-        ok("is fixed" in r and "R-005" in r, f"RP11 the lead cannot rewrite the plan once its work is out: {r}")
-        r = lead_tool("Bash", {"command": f"cd {td} && cat > round_plan.yaml <<'E'\nround: 2\nE"})
-        ok("is fixed" in r, f"RP12 nor through Bash: {r}")
+        ok(os.path.exists(os.path.join(td, "round_plan.frozen.json")), "RP11a the actions were recorded at hand-out")
+        _plan_txt = open(plan_p).read()
+        open(plan_p, "w").write("round: 2\nitems:\n  R-005: {action: declare, reason: 'cannot be fixed with the data at hand'}\n"
+                                "  RIG-001: {action: fix, stage: MODEL}\n")
+        r = json.dumps(spawn_as("critique-redteam", "This is critique round 3. ..."))
+        ok("R-005: was planned as fix (ANALYZE)" in r and "stays that way" in r,
+           f"RP11 a rewrite that changes a handed-out action (indirect writes included) holds the round: {r}")
+        json.dump({"round": 2, "items": [
+            {"id": "R-005", "source": "critique-redteam", "severity": "MEDIUM", "target_stage": "ANALYZE",
+             "blocks_in": 1, "fix_check": True, "scope_declarable": True},
+            {"id": "RIG-001", "source": "rigor-artifacts", "severity": "HIGH", "target_stage": "MODEL",
+             "blocks_in": 0, "fix_check": False, "scope_declarable": False},
+            {"id": "R-044", "source": "critique-redteam", "severity": "HIGH", "target_stage": "MODEL",
+             "blocks_in": 0, "fix_check": False, "scope_declarable": True}]},
+            open(os.path.join(td, "open_problems.json"), "w"))
+        open(plan_p, "w").write(_plan_txt + "  R-044: {action: fix, stage: MODEL}\n")
+        ok(open_problems_check(td) == [],
+           f"RP12 a same-round gate rerun's new item can be added to a handed-out plan: {open_problems_check(td)}")
+        r = json.dumps(spawn_as("critique-domain", "Please review everything again for round 3."))
+        ok("Start a critique-domain prompt with one of" in r, f"RP12b a critic spawn must say what it is: {r}")
+        ok(spawn_as("critique-domain", "This is a repair of critique_domain.yaml: fix the schema error.") == {},
+           "RP12c a repair spawn is allowed and is not a review")
+        spawn_as("modeler", "Fix R-044.")
         ok(spawn_as("modeler", "Re-check RIG-001.", finish=False) == {}, "RP13a modeler spawn allowed")
         r = json.dumps(spawn_as("critique-redteam", "This is critique round 3. ..."))
         ok("still working: modeler (launching)" in r, f"RP13 a critic waits for a modeler not yet started: {r}")
@@ -1449,14 +1486,25 @@ def _run_self_test() -> int:
         from agents import work_running
         ok(work_running(td, t_rp, now=time.time() + 3600) == [],
            "RP16b a spawn that never started stops counting after the grace period")
+        from agents import plan_hold_reason
+        os.remove(os.path.join(td, "open_problems.json"))
+        ok("missing or stale" in (plan_hold_reason(td) or ""),
+           "RP17 the gate asked for work but its open-problem list is missing: work waits (fail closed)")
+        json.dump({"round": 2, "items": []}, open(os.path.join(td, "open_problems.json"), "w"))
         from agents.enforcement import protected_reason
         ok(protected_reason(os.path.join(td, "round_plan.yaml"), td, "modeler") is not None
            and protected_reason(os.path.join(td, "round_plan.yaml"), td, None) is None
            and protected_reason(os.path.join(td, "fix_check_r2_redteam.yaml"), td, None) is not None
-           and protected_reason(os.path.join(td, "open_problems.json"), td, "critique-redteam") is not None,
+           and protected_reason(os.path.join(td, "open_problems.json"), td, "critique-redteam") is not None
+           and protected_reason(os.path.join(td, "fix_check_r2_redteam.yaml"), td, "modeler") is not None
+           and protected_reason(os.path.join(td, "fix_check_r2_redteam.yaml"), td, "critique-domain") is not None
+           and protected_reason(os.path.join(td, "fix_check_r2_redteam.yaml"), td, "critique-redteam") is None
+           and protected_reason(os.path.join(td, "critique_domain.yaml"), td, "analyst") is not None
+           and protected_reason(os.path.join(td, "round_plan.frozen.json"), td, None) is not None,
            "RP10 only the lead writes the plan, only critics write fix checks, only the gate writes the list")
-        for f in ("open_problems.json", "round_plan.yaml", "fix_check_r2_redteam.yaml"):
+        for f in ("open_problems.json", "round_plan.yaml", "fix_check_r2_redteam.yaml", "round_plan.frozen.json"):
             os.remove(os.path.join(td, f))
+        gates()   # no gate history left for the sign-off tests below
         # SO1-SO8 (Phase 33): nothing but planning before the decision brief is signed
         import yaml as _y
         import decision_brief as _db
