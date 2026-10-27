@@ -146,6 +146,7 @@ def _call(fn, i: int, params: dict) -> dict:
 # with half as many processes. A batch whose rows keep failing with the SAME
 # model error stops early instead of running to the end.
 MODEL, INFRA, STOPPED = "model", "infra", "stopped"
+TAIL = 2                   # attempt marker: a chunk's breaker-stopped inputs rerun without the chunk breaker
 BREAKER_MIN = 8            # same model error at least this often, and on half the finished rows
 MEM_HEADROOM = 1.2         # a process may grow 20% past the largest peak seen
 MEM_USABLE = 0.85          # share of the memory available at start that the pool may use
@@ -358,6 +359,7 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
     running, rows, stop, lost, pids, breaks, seen_peak = {}, [], None, 0, set(), 0, 0.0
     alone = {}                                     # input -> times its process died with the pool at one process
     shrink = False
+    pool_pids = set()                              # processes of the current pool
     # successes elsewhere in the batch (other dask chunks, rows reused on resume)
     prior_ok = int(prior_ok or 0) + int(os.environ.get("MA_COMPUTE_PRIOR_OK") or 0)
 
@@ -387,7 +389,7 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
             if shrink and not running:            # idle processes keep their memory: rebuild at the new size
                 ex.shutdown(wait=True)
                 _kill_groups(pids, grace_s=0, direct=False)
-                ex, shrink = new_pool(cap), False
+                ex, shrink, pool_pids = new_pool(cap), False, set()
                 rebudget()
             try:
                 while todo and len(running) < cap and not shrink:
@@ -395,7 +397,8 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
                     running[f] = (todo.pop(0), time.time())
             except BrokenProcessPool:             # a process died between a result and the next submission
                 broke = True
-            pids |= set((getattr(ex, "_processes", None) or {}).keys())
+            pool_pids |= set((getattr(ex, "_processes", None) or {}).keys())
+            pids |= pool_pids
             crashed = []
             if not broke:
                 left = None if deadline is None else max(0.0, deadline - time.time())
@@ -432,8 +435,16 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
                 running.clear()
                 breaks += 1
                 now = time.time()
-                progress["core_s"] += sum(now - t for _, t in crashed)   # their partial work: charged, not lost
                 live = set((getattr(ex, "_processes", None) or {}).keys())
+                # Their partial work is charged, not lost; less the dead pool's load time,
+                # which is counted from init_dir (it overlaps the first inputs' elapsed time).
+                loads = 0.0
+                for pid in pool_pids | live:
+                    try:
+                        loads += float(open(os.path.join(init_dir.name, str(pid))).read())
+                    except (OSError, ValueError):
+                        pass
+                progress["core_s"] += max(0.0, sum(now - t for _, t in crashed) - loads)
                 pids |= live
                 _kill_groups(live, grace_s=0.5)
                 ex.shutdown(wait=True, cancel_futures=True)
@@ -460,7 +471,7 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
                     todo = [it for it, _ in crashed] + todo
                     cap = max(1, cap // 2)
                 rebudget()
-                ex, shrink = new_pool(cap), False
+                ex, shrink, pool_pids = new_pool(cap), False, set()
             if seen_peak and _mem_slots(seen_peak, avail, n) < cap:
                 cap = _mem_slots(seen_peak, avail, n)
                 shrink = True                     # drain, then rebuild the pool at `cap` processes
@@ -897,7 +908,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
             # charged), rather than through dask retries, which would hide it.
             f = c.submit(_remote_task, bfut, binfo["sha256"], run_dir, fn_spec, ch, deadline,
                          procs_for(override), share, call_id, REPO, learned["peak"],
-                         prior_ok + sum(1 for r in rows if r.get("ok")), attempt == 0, pure=False, **placement)
+                         prior_ok + sum(1 for r in rows if r.get("ok")), attempt != TAIL, pure=False, **placement)
             futs[f] = (ch, attempt, procs_for(override))
             held[f] = share or 0.0
             started[f] = time.time()
@@ -952,7 +963,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                             # confirm the repeat, so its stopped inputs run again (once).
                             got["rows"] = [r for r in got["rows"] if r not in tail]
                             ids = {r["i"] for r in tail}
-                            queue.append(([it for it in ch if it[0] in ids], 1, used))
+                            queue.append(([it for it in ch if it[0] in ids], TAIL, used))
                         rows += got["rows"]
                         progress["core_s"] += float(got["core_s"])
                         progress.setdefault("chunks", []).append(
@@ -1211,8 +1222,8 @@ _FP_HASH_MB = 64           # files up to this size are fingerprinted by content,
 def code_fingerprint(run_dir: str, fn_spec: str, exclude=()) -> str:
     """What a result depends on besides its params: every file under the run's
     models/ and data/ (following symlinked directories) and the repo's
-    scripts/, except logs, figures, summaries, the ledger and this call's own
-    results file (`exclude`); files up to 64 MB by content, larger ones by
+    scripts/, except (outside data/) logs, figures, summaries, the ledger, and
+    this call's own results file (`exclude`); files up to 64 MB by content, larger ones by
     size and mtime. Any change and earlier rows are not reused."""
     run_dir = os.path.realpath(run_dir)
     h = hashlib.sha256()
@@ -1238,11 +1249,12 @@ def code_fingerprint(run_dir: str, fn_spec: str, exclude=()) -> str:
                 if os.path.islink(os.path.join(dp, x)):
                     links.append(f"{os.path.join(dp, x)}->{os.readlink(os.path.join(dp, x))}")
             names = set(fns)
+            in_data = root == os.path.join(run_dir, "data")
             for fn in fns:
                 is_output = fn + ".summary.json" in names     # another call's results file, any extension
-                if not is_output and (fn.endswith(_FP_SKIP_EXT) or fn.endswith(".summary.json")
-                                      or fn.startswith("compute_ledger.json")):
-                    continue          # logs, figures, summaries, the ledger
+                if not in_data and not is_output and (fn.endswith(_FP_SKIP_EXT) or fn.endswith(".summary.json")
+                                                      or fn.startswith("compute_ledger.json")):
+                    continue          # logs, figures, summaries, the ledger (never skipped under data/)
                 files.add(os.path.join(dp, fn))
     for ln in sorted(links):
         h.update(b"link:" + ln.encode() + b"\0")
@@ -2083,6 +2095,11 @@ def _self_test_p35(ok) -> None:
                 el = time.time() - t0
         finally:
             pass
+        bo2 = os.path.join(d, "data", "baseline.out")
+        open(bo2, "w").write("1")
+        fpo = code_fingerprint(d, "models/draw.py::f")
+        open(bo2, "w").write("2")
+        ok(code_fingerprint(d, "models/draw.py::f") != fpo, "P35-34 every file under data/ counts, whatever its extension")
         sd2 = os.path.join(d, "data", "sl")
         for nm, v in (("a", "1"), ("b", "2")):
             os.makedirs(os.path.join(sd2, nm), exist_ok=True)
