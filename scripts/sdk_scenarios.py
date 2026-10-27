@@ -48,6 +48,7 @@ import os
 import signal
 import sys
 import time
+from datetime import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -85,10 +86,14 @@ def _summ(m) -> dict | None:
             "num_turns": getattr(m, "num_turns", None)}
 
 
-async def _converse(prompt, options, kill_when=None, query_fn=None, kill_fn=None):
+async def _converse(prompt, options, kill_when=None, query_fn=None, kill_fn=None, trace=None):
     """Run one query; optionally SIGKILL the CLI when kill_when(event, t)
     returns True. Returns (session_id, result, error, killed, events)."""
     from claude_agent_sdk import AssistantMessage, ResultMessage, SystemMessage, UserMessage
+    try:
+        from claude_agent_sdk import TaskNotificationMessage
+    except ImportError:  # older SDKs
+        TaskNotificationMessage = ()
     if query_fn is None:
         from claude_agent_sdk import query as query_fn
     kill_fn = kill_fn or (lambda: [os.kill(p, signal.SIGKILL) or p for p in _cli_pids()])
@@ -96,7 +101,15 @@ async def _converse(prompt, options, kill_when=None, query_fn=None, kill_fn=None
     try:
         async for m in query_fn(prompt=prompt, options=options):
             t = time.time() - t0
-            if isinstance(m, SystemMessage) and m.subtype == "init":
+            if TaskNotificationMessage and isinstance(m, TaskNotificationMessage):
+                # As main.py records it: the only end-of-agent signal for an agent
+                # cut off at its turn limit (no SubagentStop), which the hooks read.
+                events.append(("task_notification", round(t, 1), m.task_id))
+                if trace is not None:
+                    trace.write(json.dumps({"ts": datetime.now().isoformat(), "type": "task_notification",
+                                            "task_id": m.task_id, "status": m.status}) + "\n")
+                    trace.flush()
+            elif isinstance(m, SystemMessage) and m.subtype == "init":
                 sid = (m.data or {}).get("session_id") or sid
                 events.append(("init", round(t, 1)))
             elif isinstance(m, AssistantMessage):
@@ -280,7 +293,8 @@ async def round_plan(query_fn=None):
     }
     worker = lambda who: AgentDefinition(  # noqa: E731
         description=f"Test {who}", tools=["Bash"], model="haiku", maxTurns=4,
-        prompt=f"You are the {who} in a test. To make your fix, {steps[who]} . Then append one line "
+        prompt=f"You are the {who} in a test. Do not read or look for any files. To make your fix, {steps[who]} . "
+               f"Then append one line "
                f"'<ids> {who}' to {run}/fixes.log and reply 'DONE:' followed by the ids in your task.")
     critic = AgentDefinition(
         description="Test red-team critic", tools=["Read", "Write"], model="haiku", maxTurns=8,
@@ -303,7 +317,7 @@ async def round_plan(query_fn=None):
     opts = _options(tools=["Agent", "Read", "Write", "Bash"], allowed_tools=["Agent", "Read", "Write", "Bash"],
                     agents={"modeler": worker("modeler"), "analyst": worker("analyst"), "critique-redteam": critic},
                     hooks=hooks, max_turns=30, system_prompt=lead_rules)
-    sid, result, err, _, ev = await _converse("Begin.", opts, query_fn=query_fn)
+    sid, result, err, _, ev = await _converse("Begin.", opts, query_fn=query_fn, trace=trace)
     trace.close()
     fixes = os.path.join(run, "fixes.log")
     spawns = []
