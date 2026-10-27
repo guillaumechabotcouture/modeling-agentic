@@ -35,7 +35,8 @@ from ab_coiled import SCRATCH, code_tarball, read_env_keys  # noqa: E402
 WORKSPACE = "idm-coiled-idmad-r2"
 CLUSTER_NAME = "e7r7-quality-gcc"
 LABELS = ["R1"]
-COMPUTE_START = 4        # compute VMs at launch and the pool's floor (attempt 6's fixed size); autoscales to COMPUTE_MAX
+COMPUTE_START = 1        # compute VMs at launch and the pool's floor: batches always progress (8 cores) even if the
+                         # keeper stops; idle VMs cost money, the pool grows to COMPUTE_MAX in ~1 min when work queues
 COMPUTE_MAX = 24         # 8-core VMs: 192 cores (E7 attempt 6 had 4 fixed VMs; its grid timed out half-done)
 COMPUTE_ENV = {"MA_COMPUTE_RESOURCE": "compute", "MA_COMPUTE_TARGET_WORKERS": str(COMPUTE_MAX),
                "MA_COMPUTE_MAX_CORE_HOURS": "1500", "MA_COMPUTE_CALL_CORE_HOURS": "400"}
