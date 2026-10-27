@@ -180,14 +180,35 @@ def _mem_slots(peak_mb, avail_mb, cap: int) -> int:
     return max(1, min(cap, int(MEM_USABLE * avail_mb / (peak_mb * MEM_HEADROOM))))
 
 
+def _kill_chunk_group_others() -> None:
+    """Inside a remote chunk (one process group for the chunk, its pool and
+    whatever the models started): kill every member except this process.
+    Called between pools, so only what the dead pool left behind is hit."""
+    if not os.environ.get("MA_COMPUTE_IN_CHUNK"):
+        return                                    # locally each pool process leads its own group
+    try:
+        import psutil
+    except ImportError:
+        return
+    import signal
+    me, grp = os.getpid(), os.getpgrp()
+    for proc in psutil.process_iter():
+        try:
+            if proc.pid != me and os.getpgid(proc.pid) == grp:
+                os.kill(proc.pid, signal.SIGKILL)
+        except (psutil.Error, OSError):
+            pass
+
+
 def _err_key(row) -> str:
     import re
     return re.sub(r"\d+", "N", str(row.get("error") or ""))[:80]
 
 
-def _breaker(rows, min_n: int | None = None) -> str | None:
+def _breaker(rows, min_n: int | None = None, prior_ok: int = 0) -> str | None:
     """A stop reason when one model error repeats: at least `min_n` rows and at
-    least half of the finished rows (ok or model-failed). Otherwise None."""
+    least half of the finished rows (ok or model-failed, plus `prior_ok`
+    successes the caller saw elsewhere in the batch). Otherwise None."""
     min_n = int(os.environ.get("MA_COMPUTE_BREAKER_MIN", BREAKER_MIN)) if min_n is None else min_n
     if min_n <= 0:
         return None
@@ -199,9 +220,9 @@ def _breaker(rows, min_n: int | None = None) -> str | None:
     if not counts:
         return None
     key, c = max(counts.items(), key=lambda kv: kv[1])
-    if c >= min_n and 2 * c >= len(finished):
+    if c >= min_n and 2 * c >= len(finished) + prior_ok:
         err = next(r["error"] for r in finished if not r.get("ok") and _err_key(r) == key)
-        return f"stopped: the same model error on {c} of {len(finished)} finished rows: {err[:300]}"
+        return f"stopped: the same model error on {c} of {len(finished) + prior_ok} finished rows: {err[:300]}"
     return None
 
 
@@ -305,18 +326,19 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
     running when a process dies are known. A broken pool is rebuilt with half
     as many processes and those inputs are rerun (not failed). `cap` also falls
     to what the measured peak memory per process (or the `peak_mb` hint)
-    allows, and never rises again within the call. An input whose process
-    dies while it runs alone is retried once, alone; a second death fails it
-    as a model error."""
+    allows, and never rises again within the call (the allowance's wall-clock
+    stop moves with it). An input whose process dies when the pool has one
+    process is retried once; a second death fails it as a model error."""
     import multiprocessing as mp
     import tempfile
     progress = {} if progress is None else progress
     n = max(1, min(max_workers or max(1, (os.cpu_count() or 2) - 1), len(inputs) or 1))
     progress.update(slots=n, cores_per_slot=1, core_s=0.0)
-    deadline, why = _budget_deadline(deadline, allowance_s, n)
+    user_deadline = deadline
     avail = _avail_mb()
     peak = float(peak_mb or os.environ.get("MA_COMPUTE_PEAK_MB") or 0) or None
     cap = _mem_slots(peak, avail, n)
+    deadline, why = _budget_deadline(user_deadline, allowance_s, cap)
     init_dir = tempfile.TemporaryDirectory(prefix="ma_compute_init_")
 
     def new_pool(k):
@@ -334,36 +356,49 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
 
     todo = list(enumerate(inputs))
     running, rows, stop, lost, pids, breaks, seen_peak = {}, [], None, 0, set(), 0, 0.0
-    alone = {}                                     # input -> times its process died running alone
+    alone = {}                                     # input -> times its process died with the pool at one process
+    prior_ok = int(os.environ.get("MA_COMPUTE_PRIOR_OK") or 0)   # successes elsewhere in the batch (dask chunks)
+
+    def rebudget():
+        # Fewer processes burn the allowance more slowly: move the cap's wall-clock stop.
+        nonlocal deadline, why
+        if allowance_s is not None:
+            deadline, why = _budget_deadline(user_deadline, max(0.0, allowance_s - progress["core_s"]), cap)
     ex = new_pool(cap)
     try:
         while todo or running:
-            while todo and len(running) < cap:
-                item = todo.pop(0)
-                running[ex.submit(_local_chunk, [item])] = (item, time.time())
+            broke = False
+            try:
+                while todo and len(running) < cap:
+                    f = ex.submit(_local_chunk, [todo[0]])
+                    running[f] = (todo.pop(0), time.time())
+            except BrokenProcessPool:             # a process died between a result and the next submission
+                broke = True
             pids |= set((getattr(ex, "_processes", None) or {}).keys())
-            left = None if deadline is None else max(0.0, deadline - time.time())
-            done, _ = cf.wait(set(running), timeout=left, return_when=cf.FIRST_COMPLETED)
-            if not done:
-                stop = why
-                break
             crashed = []
-            for f in done:
-                item, t_sub = running.pop(f)
-                try:
-                    got = f.result()
-                except BrokenProcessPool:
-                    crashed.append((item, t_sub))
-                    continue
-                except Exception as e:  # noqa: BLE001 — e.g. an unpicklable result fails only its row
-                    lost += 1
-                    rows.append({"i": item[0], "ok": False, "kind": INFRA,
-                                 "error": f"chunk failed: {type(e).__name__}: {e}"[:500]})
-                    continue
-                rows += got
-                progress["core_s"] += _known_core_s(got)
-                seen_peak = max([seen_peak] + [r.get("peak_mb") or 0 for r in got])
-            if crashed:
+            if not broke:
+                left = None if deadline is None else max(0.0, deadline - time.time())
+                done, _ = cf.wait(set(running), timeout=left, return_when=cf.FIRST_COMPLETED)
+                if not done:
+                    stop = why
+                    break
+                for f in done:
+                    item, t_sub = running.pop(f)
+                    try:
+                        got = f.result()
+                    except BrokenProcessPool:
+                        crashed.append((item, t_sub))
+                        broke = True
+                        continue
+                    except Exception as e:  # noqa: BLE001 — e.g. an unpicklable result fails only its row
+                        lost += 1
+                        rows.append({"i": item[0], "ok": False, "kind": INFRA,
+                                     "error": f"chunk failed: {type(e).__name__}: {e}"[:500]})
+                        continue
+                    rows += got
+                    progress["core_s"] += _known_core_s(got)
+                    seen_peak = max([seen_peak] + [r.get("peak_mb") or 0 for r in got])
+            if broke:
                 # Every input still in flight dies with the pool: collect them all.
                 cf.wait(set(running), timeout=30)
                 for f, (item, t_sub) in list(running.items()):
@@ -382,29 +417,34 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
                 _kill_groups(live, grace_s=0.5)
                 ex.shutdown(wait=True, cancel_futures=True)
                 _kill_groups(pids, grace_s=0, direct=False)
+                _kill_chunk_group_others()        # what the dead pool's models started (inside a remote chunk)
                 err = load_error()
                 if err:
                     stop = f"stopped: the model failed to load: {err}"
                     rows += [{"i": it[0], "ok": False, "kind": MODEL, "error": f"the model failed to load: {err}"[:500]}
                              for it, _ in crashed]
                     break
-                if len(crashed) == 1 and alone.get(crashed[0][0][0], 0) == 0:
-                    alone[crashed[0][0][0]] = 1            # once could be the machine: one retry, still alone
-                    todo.insert(0, crashed[0][0])
-                elif len(crashed) == 1:
-                    (i, _), _t = crashed[0]
-                    rows.append({"i": i, "ok": False, "kind": MODEL,
-                                 "error": ("the process died twice running this input alone (out of memory or a crash "
-                                           f"in native code); about {avail or 0:.0f} MB was available to the pool, "
-                                           f"the largest process peak seen was {seen_peak:.0f} MB")})
+                crashed.sort(key=lambda c: c[0][0])
+                if cap == 1 and len(crashed) == 1:
+                    i = crashed[0][0][0]
+                    alone[i] = alone.get(i, 0) + 1
+                    if alone[i] >= 2:
+                        rows.append({"i": i, "ok": False, "kind": MODEL,
+                                     "error": ("the process died twice running this input alone (out of memory or a "
+                                               f"crash in native code); about {avail or 0:.0f} MB was available to the "
+                                               f"pool, the largest process peak seen was {seen_peak:.0f} MB")})
+                    else:
+                        todo.insert(0, crashed[0][0])     # once could be the machine: one retry, still alone
                 else:
-                    todo = [it for it, _ in sorted(crashed, key=lambda c: c[0][0])] + todo
-                    cap = max(1, len(crashed) // 2)
+                    todo = [it for it, _ in crashed] + todo
+                    cap = max(1, cap // 2)
+                rebudget()
                 ex = new_pool(cap)
-            if seen_peak:
-                cap = min(cap, _mem_slots(seen_peak, avail, n))
+            if seen_peak and _mem_slots(seen_peak, avail, n) < cap:
+                cap = _mem_slots(seen_peak, avail, n)
+                rebudget()
             if todo or running:
-                reason = _breaker(rows)
+                reason = _breaker(rows, prior_ok=prior_ok)
                 if reason:
                     stop = reason
                     break
@@ -493,7 +533,7 @@ def _no_symlink_path(path: str) -> bool:
 def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: list,
                  deadline: float | None = None, procs: int | None = None,
                  chunk_allowance_s: float | None = None, call_id: str | None = None, repo: str | None = None,
-                 peak_mb: float | None = None):
+                 peak_mb: float | None = None, prior_ok: int = 0):
     """Runs on a dask worker. Under a machine-wide lock: make sure the files on
     disk are exactly THIS bundle (another call's bundle may have replaced them:
     its extra files are removed and no stale bytecode survives), then evaluate
@@ -577,6 +617,7 @@ def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: lis
             env["MA_COMPUTE_IN_CHUNK"] = "1"
             if peak_mb:
                 env["MA_COMPUTE_PEAK_MB"] = str(peak_mb)    # Phase 35: start at a concurrency that fits
+            env["MA_COMPUTE_PRIOR_OK"] = str(int(prior_ok or 0))   # the chunk's breaker sees the batch's successes
             cancel_mark = os.path.join(calls, "cancel")
             cmd = [sys.executable, script, "map", run_dir, "--fn", fn_spec, "--inputs", inp,
                    "--out", out, "--backend", "local", "--max-workers", str(procs), "--no-ledger",
@@ -831,7 +872,8 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
             # A lost chunk is resubmitted once here (and the lost attempt
             # charged), rather than through dask retries, which would hide it.
             f = c.submit(_remote_task, bfut, binfo["sha256"], run_dir, fn_spec, ch, deadline,
-                         procs_for(override), share, call_id, REPO, learned["peak"], pure=False, **placement)
+                         procs_for(override), share, call_id, REPO, learned["peak"],
+                         sum(1 for r in rows if r.get("ok")), pure=False, **placement)
             futs[f] = (ch, attempt, procs_for(override))
             held[f] = share or 0.0
             started[f] = time.time()
@@ -1130,33 +1172,66 @@ def input_key(params) -> str:
     return hashlib.sha1(json.dumps(params, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
-def code_fingerprint(run_dir: str, fn_spec: str) -> str:
-    """What a result depends on besides its params: every .py under the run's
-    models/ (and the function's own file), and the run's data/ files by
-    path, size and mtime. Any change and earlier rows are not reused."""
+_FP_SKIP_EXT = (".log", ".out", ".err", ".png", ".pdf", ".svg", ".jpg", ".jpeg", ".tmp", ".lock", ".pyc")
+_FP_HASH_MB = 64           # files up to this size are fingerprinted by content, larger ones by size and mtime
+
+
+def code_fingerprint(run_dir: str, fn_spec: str, exclude=()) -> str:
+    """What a result depends on besides its params: every file under the run's
+    models/ and data/ (following symlinked directories) and the repo's
+    scripts/, except logs, figures and compute outputs (results files with a
+    summary, the ledger); files up to 64 MB by content, larger ones by size
+    and mtime. Any change and earlier rows are not reused."""
     run_dir = os.path.realpath(run_dir)
     h = hashlib.sha256()
     path = fn_spec.partition("::")[0]
     fn_file = path if os.path.isabs(path) else os.path.join(run_dir, path)
-    files = {os.path.realpath(fn_file)}
-    for root, ext in ((os.path.join(run_dir, "models"), ".py"), (os.path.join(run_dir, "data"), None)):
-        for dp, dirs, fns in os.walk(root):
+    skip = {os.path.realpath(x) for x in exclude}
+    files = {fn_file}
+    for root in (os.path.join(run_dir, "models"), os.path.join(run_dir, "data"), os.path.join(REPO, "scripts")):
+        seen = set()
+        for dp, dirs, fns in os.walk(root, followlinks=True):
+            real = os.path.realpath(dp)
+            if real in seen:
+                dirs[:] = []
+                continue
+            seen.add(real)
             dirs[:] = sorted(d for d in dirs if d not in ("__pycache__", ".git", "_truth"))
+            names = set(fns)
             for fn in fns:
-                if ext is None or fn.endswith(ext):
-                    files.add(os.path.join(dp, fn))
+                if fn.endswith(_FP_SKIP_EXT) or fn.endswith(".summary.json") or fn + ".summary.json" in names \
+                        or fn.startswith("compute_ledger.json"):
+                    continue
+                files.add(os.path.join(dp, fn))
     for f in sorted(files):
+        if os.path.realpath(f) in skip:
+            continue
         try:
             st = os.stat(f)
         except OSError:
             continue
-        h.update(os.path.relpath(f, run_dir).encode() + b"\0")
-        if f.endswith(".py"):
-            h.update(open(f, "rb").read())
+        rel = os.path.relpath(f, run_dir) if f.startswith(run_dir) else "repo:" + os.path.relpath(f, REPO)
+        h.update(rel.encode() + b"\0")
+        if st.st_size <= _FP_HASH_MB * 2**20:
+            with open(f, "rb") as fh:
+                for block in iter(lambda: fh.read(2**20), b""):
+                    h.update(block)
         else:
             h.update(f"{st.st_size}:{st.st_mtime_ns}".encode())
         h.update(b"\0")
     return h.hexdigest()[:20]
+
+
+def input_keys(inputs) -> list[str]:
+    """One key per input: its params' hash and its occurrence among equal
+    params, so repeated identical params (independent stochastic draws) stay
+    separate rows."""
+    seen, keys = {}, []
+    for p in inputs:
+        k = input_key(p)
+        seen[k] = seen.get(k, 0) + 1
+        keys.append(f"{k}#{seen[k] - 1}")
+    return keys
 
 
 def _reusable(out: str, fn_spec: str, fp: str) -> dict:
@@ -1176,8 +1251,8 @@ def run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dict
     function, same code and data, same params) are kept and only the rest is
     computed, so rerunning a stopped or partly failed batch completes it.
     Writes --out and its summary; returns (rows, summary)."""
-    fp = code_fingerprint(run_dir, fn_spec)
-    keys = [input_key(p) for p in inputs]
+    fp = code_fingerprint(run_dir, fn_spec, exclude=(out,))
+    keys = input_keys(inputs)
     old = {} if fresh else _reusable(out, fn_spec, fp)
     todo = [k for k, key in enumerate(keys) if key not in old]
     if todo:
@@ -1210,10 +1285,13 @@ def run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dict
 
 
 def gate_findings(run_dir: str) -> list[dict]:
-    """Phase 35: results files under models/ with rows that have no result.
-    A failed row counts as recovered when a newer results file of the same
-    function has an ok row for the same params. HIGH when more than 5% of a
-    file's rows are unrecovered, MEDIUM otherwise."""
+    """Phase 35: results files under models/ with rows that have no result
+    (failed, or missing from the file against its summary's count). A failed
+    row counts as recovered when a newer results file of the same function
+    and the same code fingerprint has an ok row for the same params; a file
+    is superseded when a newer file of the same function has ok rows for all
+    its params. HIGH when more than 5% of a file's rows are unrecovered (or
+    the file is missing or unreadable), MEDIUM otherwise."""
     import glob as _glob
     found = []
     for sp in _glob.glob(os.path.join(run_dir, "models", "**", "*.summary.json"), recursive=True):
@@ -1225,6 +1303,7 @@ def gate_findings(run_dir: str) -> list[dict]:
             continue                       # not a compute summary
         out = sp[: -len(".summary.json")]
         if not os.path.exists(out):
+            found.append((out, s, None, "missing (its summary is there)"))
             continue
         try:
             rows = [json.loads(l) for l in open(out) if l.strip()]
@@ -1232,11 +1311,12 @@ def gate_findings(run_dir: str) -> list[dict]:
             found.append((out, s, None, f"unreadable ({e})"))
             continue
         found.append((out, s, rows, None))
-    ok_keys = {}                          # fn -> [(mtime, set of ok keys)]
+    files = []                            # (path, fn, code_fp, mtime, ok keys, all keys)
     for out, s, rows, _ in found:
-        if rows:
-            ok_keys.setdefault(s.get("fn"), []).append(
-                (os.path.getmtime(out), {r.get("key") for r in rows if r.get("ok") and r.get("key")}))
+        if rows is not None:
+            files.append((out, s.get("fn"), s.get("code_fp"), os.path.getmtime(out),
+                          {r.get("key") for r in rows if r.get("ok") and r.get("key")},
+                          {r.get("key") for r in rows if r.get("key")}))
     findings = []
     for out, s, rows, bad in sorted(found, key=lambda x: x[0]):
         rel = os.path.relpath(out, run_dir)
@@ -1246,21 +1326,34 @@ def gate_findings(run_dir: str) -> list[dict]:
                              "claim": f"{rel}: results file is {bad}; its rows cannot be checked."})
             continue
         mt = os.path.getmtime(out)
-        later = set().union(*[k for t, k in ok_keys.get(s.get("fn"), []) if t >= mt] or [set()])
-        failed = [r for r in rows if not r.get("ok")]
-        left = [r for r in failed if not (r.get("key") and r["key"] in later)]
-        if not left:
+        mine = {r.get("key") for r in rows if r.get("key")}
+        if mine and len(mine) == len(rows) and any(
+                o != out and fn == s.get("fn") and t >= mt and mine <= ok
+                for o, fn, _fp, t, ok, _all in files):
+            continue                      # superseded by a newer complete file
+        recovered = set().union(*[ok for o, fn, fp, t, ok, _all in files
+                                  if o != out and fn == s.get("fn") and t >= mt and fp and fp == s.get("code_fp")]
+                                or [set()])
+        n = max(len(rows), int(s.get("n") or 0))
+        absent = n - len(rows)
+        left = [r for r in rows if not r.get("ok") and not (r.get("key") and r["key"] in recovered)]
+        if not left and not absent:
             continue
         kinds = {}
         for r in left:
             kinds[r.get("kind") or MODEL] = kinds.get(r.get("kind") or MODEL, 0) + 1
-        top = max(left, key=lambda r: sum(_err_key(x) == _err_key(r) for x in left))
-        share = len(left) / max(1, len(rows))
+        if absent:
+            kinds["absent from the file"] = absent
+        eg = ""
+        if left:
+            top = max(left, key=lambda r: sum(_err_key(x) == _err_key(r) for x in left))
+            eg = f"; e.g. {str(top.get('error'))[:160]}"
+        u = len(left) + absent
         findings.append({
-            "kind": "compute_results_incomplete", "severity": "HIGH" if share > 0.05 else "MEDIUM",
+            "kind": "compute_results_incomplete", "severity": "HIGH" if u / max(1, n) > 0.05 else "MEDIUM",
             "stage": "MODEL", "target_stage": "MODEL", "scope_declarable": True,
-            "claim": (f"{rel}: {len(left)} of {len(rows)} rows have no result "
-                      f"({', '.join(f'{v} {k}' for k, v in sorted(kinds.items()))}; e.g. {str(top.get('error'))[:160]}). "
+            "claim": (f"{rel}: {u} of {n} rows have no result "
+                      f"({', '.join(f'{v} {k}' for k, v in sorted(kinds.items()))}{eg}). "
                       "Rerun the same compute.py map command: it computes only the missing rows, and machine "
                       "failures are retried automatically. Rows failing in the model itself need a model fix, or "
                       "an explicit exclusion justified in the write-up.")})
@@ -1814,10 +1907,12 @@ def _self_test_p35(ok) -> None:
         open(os.path.join(d, "models", "flaky.py"), "w").write(
             "import os\n"
             "def f(p):\n"
-            "    if p['x'] in (2, 5) and os.path.exists(os.path.join(os.path.dirname(__file__), 'FAIL')):\n"
+            "    if p['x'] in (2, 5) and os.path.exists(os.path.join(os.path.dirname(__file__), '..', 'ctl', 'FAIL')):\n"
             "        raise RuntimeError('transient')\n"
             "    return {'y': p['x'] * 2}\n")
-        open(os.path.join(d, "models", "FAIL"), "w").close()
+        os.makedirs(os.path.join(d, "ctl"))      # outside models/ and data/: not part of the fingerprint
+        FAIL = os.path.join(d, "ctl", "FAIL")
+        open(FAIL, "w").close()
         out = os.path.join(d, "models", "flaky_results.jsonl")
         ins = [{"x": k} for k in range(8)]
         rows, s = run_map(d, "models/flaky.py::f", ins, out, backend="local", max_workers=2)
@@ -1825,7 +1920,7 @@ def _self_test_p35(ok) -> None:
         g = gate_findings(d)
         ok(len(g) == 1 and g[0]["severity"] == "HIGH" and "2 of 8" in g[0]["claim"],
            f"P35-9 the gate reports a results file with missing rows: {g}")
-        os.remove(os.path.join(d, "models", "FAIL"))
+        os.remove(FAIL)
         rows, s = run_map(d, "models/flaky.py::f", ins, out, backend="local", max_workers=2)
         ok(s["n_failed"] == 0 and s["computed"] == 2 and s["reused"] == 6 and [r["result"]["y"] for r in rows]
            == [0, 2, 4, 6, 8, 10, 12, 14], f"P35-10 a rerun computes only the missing rows: {s}")
@@ -1839,11 +1934,11 @@ def _self_test_p35(ok) -> None:
         rows, s = run_map(d, "models/flaky.py::f", ins, out, fresh=True, backend="local", max_workers=2)
         ok(s["computed"] == 8, f"P35-14 --fresh recomputes everything: {s}")
         # a failed attempt file covered by a newer file of the same function
-        open(os.path.join(d, "models", "FAIL"), "w").close()
+        open(FAIL, "w").close()
         a1 = os.path.join(d, "models", "lib_attempt1.jsonl")
         run_map(d, "models/flaky.py::f", ins, a1, backend="local", max_workers=2)
         ok(any("lib_attempt1" in f["claim"] for f in gate_findings(d)), "P35-15 an attempt file with gaps is reported")
-        os.remove(os.path.join(d, "models", "FAIL"))
+        os.remove(FAIL)
         time.sleep(0.05)
         run_map(d, "models/flaky.py::f", [ins[2], ins[5]], os.path.join(d, "models", "lib_retry.jsonl"),
                 backend="local", max_workers=2)
@@ -1855,6 +1950,45 @@ def _self_test_p35(ok) -> None:
            "P35-17 an unreadable results file fails closed")
         ok(_breaker([{"ok": False, "kind": INFRA, "error": "e"}] * 20) is None,
            "P35-18 machine failures never trip the model-error breaker")
+        errs = [{"ok": False, "kind": MODEL, "error": "ValueError: x"}] * 8
+        ok(_breaker(errs) and _breaker(errs, prior_ok=300) is None,
+           "P35-19 a chunk's breaker counts the batch's successes elsewhere")
+        open(os.path.join(d, "models", "draw.py"), "w").write(
+            "import random\ndef f(p):\n    return {'u': random.random()}\n")
+        dout = os.path.join(d, "models", "draws.jsonl")
+        rows, s = run_map(d, "models/draw.py::f", [{}] * 5, dout, backend="local", max_workers=2)
+        rows2, s2 = run_map(d, "models/draw.py::f", [{}] * 6, dout, backend="local", max_workers=2)
+        us = [r["result"]["u"] for r in rows2]
+        ok(len(set(us)) == 6 and s2["computed"] == 1 and us[:5] == [r["result"]["u"] for r in rows],
+           f"P35-20 identical params are separate draws, kept and reused one for one: {s2.get('computed')}")
+        os.makedirs(os.path.join(d, "data"), exist_ok=True)
+        dfile = os.path.join(d, "data", "tbl.csv")
+        open(dfile, "w").write("a\n1\n"); os.utime(dfile, (1_700_000_000, 1_700_000_000))
+        fp1 = code_fingerprint(d, "models/draw.py::f")
+        open(dfile, "w").write("a\n2\n"); os.utime(dfile, (1_700_000_000, 1_700_000_000))
+        ok(code_fingerprint(d, "models/draw.py::f") != fp1,
+           "P35-21 same-size data with the same mtime but new content changes the fingerprint")
+        open(os.path.join(d, "models", "run.log"), "w").write("progress\n")
+        fp2 = code_fingerprint(d, "models/draw.py::f")
+        open(os.path.join(d, "models", "run.log"), "a").write("more\n")
+        ok(code_fingerprint(d, "models/draw.py::f") == fp2, "P35-22 logs do not change the fingerprint")
+        tr = os.path.join(d, "models", "trunc.jsonl")
+        open(tr, "w").write(json.dumps({"i": 0, "ok": True, "key": "a#0", "result": 1}) + "\n")
+        json.dump({"n": 100, "n_failed": 0, "task_core_s": 1, "fn": "models/t.py::f"}, open(tr + ".summary.json", "w"))
+        ok(any("trunc.jsonl" in f["claim"] and "99 of 100" in f["claim"] and f["severity"] == "HIGH"
+               for f in gate_findings(d)), f"P35-23 rows absent from a file count: {gate_findings(d)}")
+        os.remove(tr)
+        ok(any("trunc.jsonl" in f["claim"] and "missing" in f["claim"] for f in gate_findings(d)),
+           "P35-24 a results file missing behind its summary is reported")
+        os.remove(tr + ".summary.json")
+        dup = os.path.join(d, "models", "dup.jsonl")
+        with open(dup, "w") as f:
+            f.write(json.dumps({"i": 0, "ok": True, "key": "z#0", "result": 1}) + "\n")
+            f.write(json.dumps({"i": 1, "ok": False, "key": "z#1", "kind": "model", "error": "x"}) + "\n")
+        json.dump({"n": 2, "n_failed": 1, "task_core_s": 1, "fn": "models/t.py::f", "code_fp": "c"},
+                  open(dup + ".summary.json", "w"))
+        ok(any("dup.jsonl" in f["claim"] for f in gate_findings(d)),
+           "P35-25 a file's own ok rows never hide its failed rows")
 
 
 def main() -> int:
