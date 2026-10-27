@@ -149,7 +149,7 @@ for f in main.py \
   scripts/build_claims_ledger.py scripts/data_schema.py \
   scripts/cloud_batch.py scripts/coherence_audit.py \
   scripts/compare_models.py scripts/compute.py \
-  scripts/cross_model_critic.py \
+  scripts/cross_model_critic.py scripts/decision_brief.py \
   scripts/effect_size_registry.py \
   scripts/effort_floors.py scripts/eligibility_probe.py \
   scripts/figure_validator.py scripts/identifiability.py \
@@ -185,12 +185,16 @@ one domain:
 ```bash
 source .venv/bin/activate
 nohup python3 main.py "<research question>" \
-  --max-rounds 8 --max-sessions 5 \
+  --max-rounds 8 --max-sessions 5 --signoff owner \
   > run_phaseN.log 2>&1 &
 ```
 
 The run produces `runs/<timestamp>_<question>/` with all artifacts and
 `final_gate.json` (the post-run validator decision).
+
+After the plan, the run waits for the owner to sign the decision brief
+(`python3 scripts/decision_brief.py show|sign <run_dir>`); use
+`--signoff lead` for unattended test runs.
 
 ## Pointers to deeper docs
 

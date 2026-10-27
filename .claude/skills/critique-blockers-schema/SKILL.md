@@ -64,6 +64,9 @@ blockers:
     severity: HIGH               # HIGH | MEDIUM | LOW
     category: HARD_BLOCKER       # see category list below
     target_stage: MODEL          # PLAN | DATA | MODEL | ANALYZE | WRITE
+    brief_item: A1               # decision_brief.yaml id it threatens (A/C/K/OS/Q or an
+                                 # acceptance id), GAP (the brief does not settle it), or
+                                 # NONE (a note for the next run; does not block)
     first_seen_round: 1
     claim: >
       Primary model performs worse than baseline

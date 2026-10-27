@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -52,7 +53,8 @@ SUCCESS_STATUSES = {"completed", "completed_with_report_restored"}
 # Pipeline finished and wrote a report, but the final gate did not ACCEPT.
 PARTIAL_STATUSES = {"completed_scope_declared", "completed_gate_not_accepted",
                     "completed_gate_error", "completed_gate_not_run",
-                    "completed_no_report", "run_failed", "budget_exhausted"}
+                    "completed_no_report", "run_failed", "budget_exhausted",
+                    "awaiting_signoff"}   # Phase 33: resumable with --resume once signed
 
 
 BUDGET_LEDGER = "budget_ledger.json"
@@ -397,6 +399,41 @@ CONTINUE_PROMPT = (
     "written and final gate run, or RUN_FAILED).")
 
 
+SIGNOFF_PROMPT = (
+    "CONTINUE. The owner has signed the decision brief.\n{text}\n"
+    "Continue the pipeline from STAGE 2 (DATA): tell the planner to carry the owner's answers into plan.md "
+    "if they change it, and pass them to every specialist. Do not end your turn until the pipeline reaches a "
+    "terminal state.")
+
+
+async def wait_for_signoff(run_path: str, run_dir_rel: str, hours: float, poll_s: float = 30.0) -> bool:
+    """Phase 33 α: the run waits for the owner to sign the decision brief.
+    True once signed; False when the wait times out (status awaiting_signoff,
+    resumable with --resume after signing)."""
+    import decision_brief
+    md = os.path.join(run_path, "decision_brief.md")
+    try:
+        open(md, "w").write(decision_brief.render_md(run_path))
+    except OSError:
+        pass
+    print(f"\n{'='*60}\nWAITING FOR THE OWNER TO SIGN THE DECISION BRIEF\n"
+          f"  Read:  {run_dir_rel}/decision_brief.md\n"
+          f"  Sign:  python3 scripts/decision_brief.py sign {run_dir_rel} --answers <answers.yaml> "
+          f"[--note \"...\"]   (or --accept-proposed)\n"
+          f"  Waiting up to {hours:g} h.\n{'='*60}", flush=True)
+    with open(os.path.join(run_path, "trace.jsonl"), "a") as tf:
+        tf.write(json.dumps({"ts": datetime.now().isoformat(), "type": "awaiting_signoff"}) + "\n")
+    deadline = time.time() + hours * 3600
+    while time.time() < deadline:
+        if decision_brief.status(run_path) == "signed":
+            with open(os.path.join(run_path, "trace.jsonl"), "a") as tf:
+                tf.write(json.dumps({"ts": datetime.now().isoformat(), "type": "signed_off"}) + "\n")
+            print("Decision brief signed; resuming the lead.", flush=True)
+            return True
+        await asyncio.sleep(poll_s)
+    return decision_brief.status(run_path) == "signed"
+
+
 def detect_current_round(run_path: str) -> int | None:
     """Highest `round:` across critique_*.yaml (the gate's own input),
     falling back to pipeline_state.yaml."""
@@ -622,7 +659,8 @@ def write_harness_baseline(run_path: str) -> tuple[dict, dict | None]:
 async def run(question: str, max_rounds: int, max_sessions: int,
               run_dir: str | None = None, run_path: str | None = None,
               allow_cloud: bool = False, cross_model: bool = False,
-              methods_critic: bool = False, max_budget_usd: float | None = None) -> str:
+              methods_critic: bool = False, max_budget_usd: float | None = None,
+              signoff: str = "owner", signoff_hours: float = 24.0) -> str:
     """Run the modeling pipeline as a single lead agent session.
 
     Returns the terminal status written to metadata.json.
@@ -669,6 +707,10 @@ async def run(question: str, max_rounds: int, max_sessions: int,
     with open(metadata_path, "w") as f:
         json.dump(prior_meta, f, indent=2)
     env_overrides = enforcement.filtered_env(dict(os.environ), allow_cloud)
+    env_overrides["MA_SIGNOFF_MODE"] = signoff   # Phase 33: decision_brief.py sign checks it
+    import decision_brief
+    if resume_context and decision_brief.is_signed(run_path):
+        lead_prompt += "\n" + decision_brief.signoff_text(run_path) + "\n"
 
     harness_before, harness_prior_diff = write_harness_baseline(run_path)
     # Phase 23 α: hash protected run artifacts; every change must be explained
@@ -704,6 +746,8 @@ async def run(question: str, max_rounds: int, max_sessions: int,
     session_num = 0
     session_records: list[dict] = []
     interrupted = False
+    paused = False          # Phase 33: waiting for the owner's sign-off timed out
+    signoff_waits = 0       # a sign-off wait does not use up a session
 
     # Phase 31: the lead sees the dollar cap. Spend = the ledger at process
     # start (earlier invocations) + this process's live estimate.
@@ -717,7 +761,10 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                 "reserve": writeup_reserve(max_budget_usd)}
 
     try:
-        for session_num in range(1, max_sessions + 1):
+        for session_num in range(1, max_sessions + 2):
+            if session_num - signoff_waits > max_sessions:
+                session_outcome = "max_sessions_reached"
+                break
             live_state.session = session_num
             print(f"\n{'#'*60}", flush=True)
             print(f"SESSION {session_num}/{max_sessions}", flush=True)
@@ -739,7 +786,8 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                                  registered_agents=set(agents.keys()),
                                  max_turns={n: d.maxTurns for n, d in agents.items()},
                                  integrity=integrity, max_rounds=max_rounds,
-                                 budget_status=_budget_status)
+                                 budget_status=_budget_status,
+                                 signoff=signoff if signoff in ("owner", "lead") else None)
 
             # Run-wide dollar cap across sessions (and earlier invocations),
             # from the harness-owned ledger.
@@ -819,8 +867,17 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                 session_outcome = "budget_exhausted"
                 break
             if error_str is None and result_is_success(result):
+                if signoff == "owner" and decision_brief.status(run_path) == "awaiting":
+                    # Phase 33 α: the lead stopped for the owner's sign-off.
+                    if not await wait_for_signoff(run_path, run_dir_rel, signoff_hours):
+                        print("Sign-off wait timed out; resume with --resume after signing.", flush=True)
+                        session_outcome, paused = "awaiting_signoff", True
+                        break
+                    signoff_waits += 1
+                    lead_prompt = SIGNOFF_PROMPT.format(text=decision_brief.signoff_text(run_path))
+                    continue
                 where = pipeline_unfinished(run_path)
-                if where and session_num < max_sessions:
+                if where and session_num - signoff_waits < max_sessions:
                     # Phase 21 θ: the lead stopped early; continue the same
                     # conversation (options.resume = session_id) instead of
                     # finalizing a half-finished run.
@@ -859,7 +916,7 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                 session_outcome = "policy_blocked"
                 break
 
-            if session_num >= max_sessions:
+            if session_num - signoff_waits >= max_sessions:
                 print("Max sessions reached.", flush=True)
                 session_outcome = "max_sessions_reached"
                 break
@@ -888,7 +945,7 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                                             methods_critic=methods_critic)
             print(f"Restarting pipeline (session {session_num + 1})...", flush=True)
         # Phase 29: every run ends with a report, so failures can be studied.
-        if not interrupted and not os.path.exists(os.path.join(run_path, "report.md")) \
+        if not interrupted and not paused and not os.path.exists(os.path.join(run_path, "report.md")) \
                 and not os.path.exists(os.path.join(run_path, "manuscript.md")):
             live_state.session = session_num + 1
             await final_writeup(run_path, run_dir_rel, question, max_rounds, budget,
@@ -899,7 +956,7 @@ async def run(question: str, max_rounds: int, max_sessions: int,
         status = finalize_run(
             run_path, run_dir_rel, run_start, max_rounds, session_outcome,
             session_num, session_id, session_records, harness_before,
-            harness_prior_diff, run_gate=not interrupted,
+            harness_prior_diff, run_gate=not interrupted and not paused,
             original_meta=prior_meta, integrity=integrity)
     return status
 
@@ -1345,6 +1402,47 @@ def _run_self_test() -> int:
            "RP10 only the lead writes the plan, only critics write fix checks, only the gate writes the list")
         for f in ("open_problems.json", "round_plan.yaml", "fix_check_r2_redteam.yaml"):
             os.remove(os.path.join(td, f))
+        # SO1-SO8 (Phase 33): nothing but planning before the decision brief is signed
+        import yaml as _y
+        import decision_brief as _db
+        from agents import signoff_hold_reason
+        ok("planner writes decision_brief.yaml" in (signoff_hold_reason(td, "owner") or ""),
+           "SO1 no brief: re-spawn the planner")
+        _y.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(td, "success_criteria.yaml"), "w"))
+        _y.safe_dump({"question": "q", "decision": "d", "decision_maker": "m", "objective": "o",
+                      "answers": [{"id": "A1", "statement": "s", "resolution": "district"}],
+                      "acceptance": ["HB-001"]}, open(os.path.join(td, "decision_brief.yaml"), "w"))
+        ok("AWAITING_SIGNOFF" in (signoff_hold_reason(td, "owner") or "")
+           and "--by lead" in (signoff_hold_reason(td, "lead") or "") and signoff_hold_reason(td, None) is None,
+           "SO2 a ready brief: owner mode waits, lead mode signs, no mode does nothing")
+        hk5 = agents_pkg.create_hooks(td, trace, datetime.now(), registered_agents=reg, signoff="owner")
+        pre5 = hk5["PreToolUse"][0].hooks[0]
+
+        def call5(tool, inp):
+            return json.dumps(asyncio.run(pre5({"tool_name": tool, "tool_input": inp}, "so", None)))
+        ok("AWAITING_SIGNOFF" in call5("Agent", {"subagent_type": "data-agent", "prompt": "x"})
+           and "deny" not in call5("Agent", {"subagent_type": "planner", "prompt": "fix the brief"}),
+           "SO3 data work refused before sign-off; the planner may still revise the brief")
+        ok("agents cannot sign" in call5("Bash", {"command": f"python3 scripts/decision_brief.py sign {td} --by owner"}),
+           "SO4 in owner mode no agent can sign")
+        hk6 = agents_pkg.create_hooks(td, trace, datetime.now(), registered_agents=reg, signoff="lead")
+        r6 = json.dumps(asyncio.run(hk6["PreToolUse"][0].hooks[0](
+            {"tool_name": "Bash", "tool_input": {"command": f"python3 scripts/decision_brief.py sign {td} --by lead"}},
+            "so6", None)))
+        ok("agents cannot sign" not in r6, "SO5 in lead mode the lead signs")
+        ok(asyncio.run(wait_for_signoff(td, "runs/x", hours=0.00001, poll_s=0.01)) is False,
+           "SO6 an unsigned wait times out")
+        _db.sign(td, "owner")
+        ok(asyncio.run(wait_for_signoff(td, "runs/x", hours=1, poll_s=0.01)) is True
+           and signoff_hold_reason(td, "owner") is None
+           and "deny" not in call5("Agent", {"subagent_type": "data-agent", "prompt": "x"}),
+           "SO7 signed: the wait ends and work proceeds")
+        open(os.path.join(td, "success_criteria.yaml"), "a").write("# moved\n")
+        ok("frozen" in (signoff_hold_reason(td, "owner") or ""), "SO8 criteria edited after sign-off: work stops")
+        ok(exit_code_for("awaiting_signoff") == 2, "SO9 a paused run exits 2 (resumable)")
+        for f in ("success_criteria.yaml", "decision_brief.yaml", "decision_brief.signoff.json", "decision_brief.md"):
+            if os.path.exists(os.path.join(td, f)):
+                os.remove(os.path.join(td, f))
         os.remove(hist)
         trace.close()
     # IC1-IC7 (Codex review of PR #15).
@@ -2418,6 +2516,11 @@ def main() -> int:
     parser.add_argument("--methods-critic", action="store_true",
                         help="Add critique-methods to every STAGE 6. Off by default: in E5 "
                              "it caught no planted defect the other critics missed.")
+    parser.add_argument("--signoff", choices=["owner", "lead", "none"], default="owner",
+                        help="Who signs the decision brief before compute (Phase 33): the owner "
+                             "(default; the run waits), the lead (unattended test runs), or none")
+    parser.add_argument("--signoff-hours", type=float, default=24.0,
+                        help="How long an owner sign-off wait lasts before the run pauses (resumable)")
     parser.add_argument("--self-test", action="store_true",
                         help="Run inline self-tests (no API calls) and exit")
     parser.add_argument("--preflight-only", action="store_true",
@@ -2471,14 +2574,16 @@ def main() -> int:
         coro = run(question, args.max_rounds, args.max_sessions,
                    run_dir=run_dir, run_path=run_path, allow_cloud=args.cloud,
                    cross_model=args.cross_model, methods_critic=args.methods_critic,
-                   max_budget_usd=args.max_budget_usd)
+                   max_budget_usd=args.max_budget_usd,
+                   signoff=args.signoff, signoff_hours=args.signoff_hours)
     else:
         if not args.question:
             print("Error: question is required (or use --resume)")
             return 1
         coro = run(args.question, args.max_rounds, args.max_sessions,
                    allow_cloud=args.cloud, cross_model=args.cross_model,
-                   methods_critic=args.methods_critic, max_budget_usd=args.max_budget_usd)
+                   methods_critic=args.methods_critic, max_budget_usd=args.max_budget_usd,
+                   signoff=args.signoff, signoff_hours=args.signoff_hours)
     try:
         status = asyncio.run(coro)
     except KeyboardInterrupt:

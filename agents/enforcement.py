@@ -84,10 +84,14 @@ SCRIPT_OUTPUTS = (
     "open_problems.md",
     "open_problems.json.tmp",
     "open_problems.md.tmp",
+    "decision_brief.signoff.json",   # Phase 33 α: scripts/decision_brief.py sign
+    "acceptance_lock.json",          # Phase 33 α: written by the gate
 )
 
-# Phase 32 α: the lead's round plan; no specialist may rewrite it.
-LEAD_ONLY = ("round_plan.yaml",)
+# Files only one writer may change (None = the lead). Phase 32 α: the round
+# plan; Phase 33 α: the decision brief (planner) and its amendments (lead).
+OWNED_BY = {"round_plan.yaml": {None}, "brief_amendments.yaml": {None},
+            "decision_brief.yaml": {"planner"}}
 
 # Files the lead may not write directly: it must re-spawn the owning
 # agent. critique_* belong to the critique agents; models/** to the
@@ -175,8 +179,9 @@ def protected_reason(path: str, run_path: str, agent_type: str | None,
             return None
         return (f"{rel} is produced by a pipeline script; re-run the script "
                 f"instead of writing it by hand")
-    if agent_type is not None and _matches(rel, LEAD_ONLY):
-        return f"{rel} is the lead's round plan; only the lead writes it"
+    if rel in OWNED_BY and agent_type not in OWNED_BY[rel]:
+        who = ", ".join("the lead" if w is None else w for w in OWNED_BY[rel])
+        return f"{rel} is written only by {who}"
     if agent_type is None and _matches(rel, LEAD_PROTECTED):
         return (f"{rel} is owned by a specialist agent; the lead must "
                 f"re-spawn the owning agent rather than edit it")

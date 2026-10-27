@@ -34,6 +34,10 @@ Scenarios:
                         planned fix to its agent, get a critic's fix check
                         (real fix-check prompt), send the unfixed item back
                         once, and only then run the full critique?
+  brief_signoff         (Phase 33) does a real lead stop for the owner's
+                        sign-off when the hook refuses work, end its turn with
+                        AWAITING_SIGNOFF, and continue once resumed with the
+                        owner's answers?
 """
 from __future__ import annotations
 
@@ -296,9 +300,61 @@ async def round_plan(query_fn=None):
             "denials": sum(1 for s in spawns if s["denied"]), "text": ((result and result.result) or "")[-200:]}
 
 
+async def brief_signoff(query_fn=None):
+    """Phase 33: the sign-off pause with a real lead. A planner stand-in writes
+    a valid brief; the lead must stop (owner mode), then continue after the
+    harness signs and resumes it with main.SIGNOFF_PROMPT."""
+    import tempfile
+    import yaml
+    from datetime import datetime
+    from claude_agent_sdk import AgentDefinition
+    from agents import create_hooks
+    import decision_brief as db
+    from main import SIGNOFF_PROMPT
+    run = tempfile.mkdtemp(prefix="ma_signoff_")
+    yaml.safe_dump({"hard_blockers": [{"id": "HB-001", "criterion": "cost within envelope"}]},
+                   open(os.path.join(run, "success_criteria.yaml"), "w"))
+    brief = {"question": "How should a programme allocate its budget across districts?",
+             "decision": "Package per district", "decision_maker": "Programme manager",
+             "answers": [{"id": "A1", "statement": "Package per district", "resolution": "district"}],
+             "objective": "Maximise DALYs averted", "acceptance": ["HB-001"],
+             "open_questions": [{"id": "Q1", "question": "Is continuity a constraint?", "proposed": "No"}]}
+    brief_path = os.path.join(run, "decision_brief.yaml")
+    trace = open(os.path.join(run, "trace.jsonl"), "a")
+    hooks = create_hooks(run, trace, datetime.now(), registered_agents={"planner", "data-agent"}, signoff="owner")
+    planner = AgentDefinition(description="Test planner", tools=["Bash"], model="haiku", maxTurns=4,
+                              prompt=f"Run exactly: cat > {brief_path} <<'B'\n{yaml.safe_dump(brief)}B\nthen reply PLANNED.")
+    data = AgentDefinition(description="Test data agent", tools=["Bash"], model="haiku", maxTurns=2,
+                           prompt="Do not use tools. Reply DATA-DONE.")
+    rules = ("You are the lead of a modeling pipeline in a test. STAGE 1: spawn the planner. STAGE 2: spawn the "
+             "data-agent. If the harness refuses a call, read its reason and do exactly what it says. When the "
+             "data-agent has returned, finish with the word FINISHED.")
+    opts = _options(tools=["Agent", "Bash"], allowed_tools=["Agent", "Bash"],
+                    agents={"planner": planner, "data-agent": data}, hooks=hooks, max_turns=12, system_prompt=rules)
+    sid, r1, err1, _, ev1 = await _converse("Begin.", opts, query_fn=query_fn)
+    t1 = (getattr(r1, "result", None) or "") if r1 else ""
+    status_before = db.status(run)
+    signed = None
+    if status_before == "awaiting":
+        signed = db.sign(run, "owner", {"Q1": "Yes: keep districts covered now"})
+    opts2 = _options(tools=["Agent", "Bash"], allowed_tools=["Agent", "Bash"],
+                     agents={"planner": planner, "data-agent": data}, hooks=hooks, max_turns=8,
+                     system_prompt=rules, resume=sid)
+    _, r2, err2, _, ev2 = await _converse(SIGNOFF_PROMPT.format(text=db.signoff_text(run)), opts2,
+                                          query_fn=query_fn)
+    trace.close()
+    t2 = (getattr(r2, "result", None) or "") if r2 else ""
+    spawns = [(json.loads(l).get("subagent_type"), bool(json.loads(l).get("denied")))
+              for l in open(os.path.join(run, "trace.jsonl")) if '"subagent_type"' in l]
+    return {"first": _summ(r1), "second": _summ(r2), "errors": [err1, err2], "brief_status_before_signoff": status_before,
+            "lead_stopped_for_signoff": "AWAITING_SIGNOFF" in t1, "data_refused_before_signoff":
+            ("data-agent", True) in spawns, "data_ran_after_signoff": spawns[-1:] == [("data-agent", False)],
+            "spawns": spawns, "text1": t1[-160:], "text2": t2[-160:]}
+
+
 SCENARIOS = {"resume_cumulative": resume_cumulative, "readback_after_crash": readback_after_crash,
              "crash_before_init": crash_before_init, "budget_cap": budget_cap, "hook_context": hook_context,
-             "cache_ttl": cache_ttl, "round_plan": round_plan}
+             "cache_ttl": cache_ttl, "round_plan": round_plan, "brief_signoff": brief_signoff}
 
 
 def run(names: list[str]) -> dict:

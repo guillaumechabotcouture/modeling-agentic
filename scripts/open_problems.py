@@ -130,11 +130,12 @@ def build(run_dir: str, round_n: int, max_rounds: int, critiques: dict,
     rounds it has appeared in (this one included)."""
     written = any(os.path.exists(os.path.join(run_dir, f)) for f in ("report.md", "manuscript.md"))
     items: dict[str, dict] = {}
+    outside = set((decision or {}).get("outside_brief") or ())  # Phase 33: notes, not work
     for reviewer, doc in (critiques or {}).items():
         notes = {e.get("id"): e.get("notes") for e in (doc or {}).get("carried_forward") or []
                  if isinstance(e, dict)}
         for b in (doc or {}).get("blockers") or []:
-            if not isinstance(b, dict) or b.get("resolved") is True:
+            if not isinstance(b, dict) or b.get("resolved") is True or str(b.get("id")) in outside:
                 continue
             sev = b.get("severity")
             if sev not in ("HIGH", "MEDIUM"):
@@ -208,7 +209,7 @@ def build(run_dir: str, round_n: int, max_rounds: int, critiques: dict,
     order = sorted(items.values(), key=lambda i: (
         99 if i["blocks_in"] is None else i["blocks_in"], i["severity"] != "HIGH", i["id"]))
     return {"round": round_n, "max_rounds": max_rounds, "generated_by": "scripts/open_problems.py",
-            "items": order}
+            "items": order, "outside_brief": sorted(outside)}
 
 
 def render_md(doc: dict) -> str:
@@ -223,6 +224,8 @@ def render_md(doc: dict) -> str:
            "or tools available; with the reason), after_write (write-up items only), or defer (with the "
            "reason; not for blocking items or ones that block at the next gate). Decide early what cannot "
            "be fixed: declaring in round 1-2 keeps the rounds for what can.", "",
+           *([f"Outside the decision brief (notes for the next run, not work for this one): "
+              f"{', '.join(doc['outside_brief'])}.", ""] if doc.get("outside_brief") else []),
            "| id | from | severity | stage | open since | blocks in | latest status | fix needs |",
            "|---|---|---|---|---|---|---|---|"]
     for i in items:

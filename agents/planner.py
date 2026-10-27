@@ -223,6 +223,40 @@ After the literature review, also produce:
 
 9. **Modeling Checklist**.
 
+## DECISION BRIEF (Phase 33)
+
+Also write `{run_dir}/decision_brief.yaml`: what the answer must deliver,
+in the decision-maker's terms rather than the modeler's. It is signed before
+any data or modeling work starts and then frozen; every critic judges the
+work against it, so it is the run's target. Keep it to one page:
+
+```yaml
+question: "<the research question, verbatim>"
+decision: "<the decision this analysis informs, one or two sentences>"
+decision_maker: "<who makes it: a role, e.g. national programme manager>"
+answers:            # what the report must answer, and the unit it is published at
+  - {id: A1, statement: "<e.g. which package each district should receive>", resolution: "<district>"}
+objective: "<what is maximised or minimised, and what else is valued>"
+constraints:
+  - {id: C1, text: "<e.g. total cost within the stated envelope>"}
+accounting:         # how numbers are counted
+  - {id: K1, text: "<benefit window; lifetime vs in-window; financial vs economic cost; discounting>"}
+out_of_scope:
+  - {id: OS1, text: "<what this run will not answer>", reason: "<why>"}
+acceptance: [HB-001, HB-002, MB-001]   # ids from success_criteria.yaml
+open_questions:     # framing choices the owner settles at sign-off
+  - {id: Q1, question: "<e.g. is continuity of current coverage a constraint or a value?>",
+     proposed: "<your proposed answer and why>"}
+```
+
+Settle in the brief what would otherwise be argued every round: the
+resolution the data can support for the answer, how the budget and the
+population in the question are to be read, which accounting is primary, and
+what counts as out of scope. Where the question leaves a choice that changes
+the answer, put it in `open_questions` with your proposed answer; do not
+decide it silently. Do not put modeling method in the brief (that is
+plan.md); put what the decision-maker needs.
+
 ## INVESTIGATION THREADS
 
 After writing plan.md, also write {run_dir}/threads.yaml — the investigation

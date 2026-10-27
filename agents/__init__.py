@@ -20,6 +20,7 @@ _SCRIPTS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)  # lib.md_helpers (shared frontmatter rule)
 import open_problems  # noqa: E402  (Phase 32: open-problem list, round plan, fix checks)
+import decision_brief  # noqa: E402  (Phase 33: the signed decision brief)
 
 MAX_FIGURE_PIXELS = 10_000_000  # 10MP -- anything larger is likely a bug
 
@@ -252,6 +253,19 @@ def build_agents(question: str = "", run_dir: str | None = None
     return agents
 
 
+WRITER_BRIEF_NOTE = """
+
+## The decision brief (Phase 33)
+
+Open the report's first section by restating the signed decision brief in
+plain words (decision_brief.yaml and decision_brief.signoff.json): the
+decision, what the report answers and at what resolution, what is out of
+scope, and the owner's answers to its open questions. If brief_amendments.yaml
+exists, list each amendment and its reason there too. Answer each A* item
+of the brief, at its stated resolution, before anything else.
+"""
+
+
 def _registry() -> dict[str, AgentDefinition]:
     return {
         "planner": AgentDefinition(
@@ -344,7 +358,7 @@ def _registry() -> dict[str, AgentDefinition]:
         ),
         "critique-methods": AgentDefinition(
             description=critique_methods.DESCRIPTION,
-            prompt=critique_methods.SYSTEM_PROMPT + open_problems.FIX_CHECK_NOTE,
+            prompt=critique_methods.SYSTEM_PROMPT + open_problems.FIX_CHECK_NOTE + decision_brief.CRITIC_NOTE,
             tools=critique_methods.TOOLS,
             model=enforcement.MODEL_DEEP,
             maxTurns=35,  # increased: now does parameter provenance checks with WebSearch
@@ -353,7 +367,7 @@ def _registry() -> dict[str, AgentDefinition]:
         ),
         "critique-domain": AgentDefinition(
             description=critique_domain.DESCRIPTION,
-            prompt=critique_domain.SYSTEM_PROMPT + open_problems.FIX_CHECK_NOTE,
+            prompt=critique_domain.SYSTEM_PROMPT + open_problems.FIX_CHECK_NOTE + decision_brief.CRITIC_NOTE,
             tools=critique_domain.TOOLS,
             model=enforcement.MODEL_DEEP,
             maxTurns=50,  # increased after malaria run ran_to_cap at 39/40
@@ -378,14 +392,14 @@ def _registry() -> dict[str, AgentDefinition]:
         ),
         "critique-presentation": AgentDefinition(
             description=critique_presentation.DESCRIPTION,
-            prompt=critique_presentation.SYSTEM_PROMPT + open_problems.FIX_CHECK_NOTE,
+            prompt=critique_presentation.SYSTEM_PROMPT + open_problems.FIX_CHECK_NOTE + decision_brief.CRITIC_NOTE,
             tools=critique_presentation.TOOLS,
             model=enforcement.MODEL_FAST,
             maxTurns=40,  # bumped 25→30 post-measles, 30→40 post-malaria (30/30 ran_to_cap in round 2)
         ),
         "critique-redteam": AgentDefinition(
             description=red_team.DESCRIPTION,
-            prompt=red_team.SYSTEM_PROMPT + open_problems.FIX_CHECK_NOTE,
+            prompt=red_team.SYSTEM_PROMPT + open_problems.FIX_CHECK_NOTE + decision_brief.CRITIC_NOTE,
             tools=red_team.TOOLS,
             model=enforcement.MODEL_DEEP,  # adversarial judgment + WebFetch-heavy research
             maxTurns=50,
@@ -409,7 +423,7 @@ def _registry() -> dict[str, AgentDefinition]:
         ),
         "writer": AgentDefinition(
             description=writer.DESCRIPTION,
-            prompt=writer.SYSTEM_PROMPT,
+            prompt=writer.SYSTEM_PROMPT + WRITER_BRIEF_NOTE,
             tools=writer.TOOLS,
             model=enforcement.MODEL_DEEP,  # needs to synthesize the most complex output
             maxTurns=60,
@@ -460,8 +474,24 @@ Wait for completion. Then read {run_dir}/plan.md and verify it has:
 - Candidate models (baseline, standard, advanced)
 - Testable hypotheses
 - threads.yaml
+- decision_brief.yaml (Phase 33): what the answer must deliver
 
 If critical sections are missing, re-spawn planner with specific feedback.
+
+#### STAGE 1.5: SIGN-OFF OF THE DECISION BRIEF (Phase 33)
+`decision_brief.yaml` is the target the whole run is judged against: the
+decision and who makes it, what the report must answer and at what
+resolution, the objective, constraints, accounting conventions, what is out
+of scope, the acceptance criteria, and open questions for the owner. Check
+that it is faithful to the question and that its open questions are the
+framing choices that matter. Nothing but planning runs until it is signed;
+the harness says whether the owner signs (end your turn with
+AWAITING_SIGNOFF and you are resumed with the owner's answers) or you do.
+After sign-off the brief and success_criteria.yaml are frozen and the
+benchmark bands are locked when the gate first sees them; record framing
+changes you discover in `brief_amendments.yaml` (`amendments:` list of
+{id: AM-1, item: <A/C/K/OS/Q id>, change, reason}); acceptance criteria
+cannot be changed in-run. Pass the owner's answers to every specialist.
 
 ### STAGE 2: DATA
 Spawn the "data-agent" agent. Tell it the run directory (which has plan.md).
@@ -1448,10 +1478,34 @@ def critique_hold_reason(run_path: str, status: dict | None) -> str | None:
     return None
 
 
+def signoff_hold_reason(run_path: str, mode: str | None, run_dir_rel: str = "{run_dir}") -> str | None:
+    """Phase 33 α: nothing but planning happens before the decision brief is
+    signed (owner mode: the owner signs and the harness resumes the lead;
+    lead mode, for unattended test runs: the lead signs with its reason)."""
+    if mode not in ("owner", "lead"):
+        return None
+    st = decision_brief.status(run_path)
+    if st == "signed":
+        return None
+    if st == "changed":
+        return (f"{decision_brief.BRIEF} or {decision_brief.CRITERIA} changed after sign-off. They are frozen: have "
+                f"the planner restore the signed version, and record framing changes in {decision_brief.AMENDMENTS}.")
+    if st in ("absent", "invalid"):
+        errs = "; ".join(decision_brief.load_brief(run_path)[1])[:900]
+        return (f"Before any other work the planner writes {decision_brief.BRIEF} (what the answer must deliver; see "
+                f"STAGE 1). Re-spawn the planner with these problems: {errs}")
+    if mode == "owner":
+        return ("The decision brief is ready and waits for the owner's sign-off. Do not start other work. End your "
+                "turn now with the line AWAITING_SIGNOFF; the harness resumes you with the owner's answers.")
+    return ("Review the decision brief against the question, then sign it: python3 scripts/decision_brief.py sign "
+            f"{run_dir_rel} --by lead --accept-proposed --note \"<why it is an adequate target>\" (or answer the "
+            "open questions with --answers <file>).")
+
+
 def create_hooks(run_path: str, trace_file, start_time: datetime,
                  registered_agents=None, max_turns: dict[str, int] | None = None,
                  integrity=None, budget_status=None, max_rounds: int | None = None,
-                 hold_writer: bool = True):
+                 hold_writer: bool = True, signoff: str | None = None):
     """Create hook config for the lead query() session.
 
     Phase 21 α: PreToolUse also enforces file ownership and the agent
@@ -1515,6 +1569,11 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
             cwd=input_data.get("cwd"))
         spawn = agent_id == "lead" and tool_name in ("Agent", "Task")
         sub = tool_input.get("subagent_type") if spawn else None
+        if not deny_reason and spawn and sub != "planner":
+            deny_reason = signoff_hold_reason(run_path, signoff, run_path)
+        if (not deny_reason and signoff == "owner" and tool_name == "Bash"
+                and re.search(r"decision_brief\.py\s+sign\b", str(tool_input.get("command") or ""))):
+            deny_reason = "The owner signs the decision brief in this run; agents cannot sign it."
         if not deny_reason and hold_writer and sub == "writer":
             deny_reason = writer_hold_reason(run_path, _status(), max_rounds)
         if not deny_reason and hold_writer and sub in PLAN_AGENTS:

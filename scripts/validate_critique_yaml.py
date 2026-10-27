@@ -1849,6 +1849,8 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None,
     violations += G(_check_writer_qa, run_dir, post_write=post_write)
     # Phase 7 Commit μ: plan-promised criteria enforcement.
     violations += G(_check_plan_criteria, run_dir)
+    # Phase 33 α: the signed decision brief and frozen acceptance criteria.
+    violations += G(_check_decision_brief, run_dir)
     # Phase 9 Commit ρ: write-time figure validator + provenance check.
     violations += G(_check_figure_validator, run_dir)
     # Phase 12 Commit α: cross-file numeric consistency check.
@@ -3530,6 +3532,37 @@ def _append_validator_history(run_dir: str, round_n: int, decision: dict,
               file=sys.stderr)
 
 
+def _check_decision_brief(run_dir: str) -> list[dict]:
+    """Phase 33 α: unsigned brief, or acceptance criteria changed after
+    sign-off / lock (HIGH, non-declarable); invalid amendments (MEDIUM)."""
+    import decision_brief
+    critiques = {}
+    for reviewer in decision_brief.SCOPED_CRITICS:
+        path = os.path.join(run_dir, reviewer.replace("-", "_") + ".yaml")
+        try:
+            critiques[reviewer] = yaml.safe_load(open(path)) or {}
+        except (OSError, yaml.YAMLError):
+            continue
+    return decision_brief.gate_findings(run_dir) + decision_brief.tie_findings(critiques, run_dir)
+
+
+def _apply_brief_scope(decision: dict, critiques: dict, run_dir: str,
+                       max_rounds: int, current_round: int) -> dict:
+    """Phase 33 α: once the brief is signed, a critic finding the critic tied
+    to NONE (`brief_item: NONE`) neither blocks nor escalates; it is listed as
+    `outside_brief`, a note for the next run. Missing or unknown ties still
+    block (decision_brief.tie_findings)."""
+    import decision_brief
+    outside = decision_brief.scope_filter(critiques, run_dir)
+    if not outside:
+        return decision
+    decision["unresolved_high"] = [
+        b for b in decision.get("unresolved_high") or []
+        if not (b.get("kind") == "critique_blocker" and str(b.get("id")) in outside)]
+    decision["outside_brief"] = sorted(outside)
+    return _recompute_action(decision, max_rounds, current_round)
+
+
 def _write_open_problems(run_dir: str, round_n: int, max_rounds: int,
                          critiques: dict, decision: dict) -> str | None:
     """Phase 32 α: open_problems.json/.md after every in-round gate run, for
@@ -5014,6 +5047,9 @@ def _check_persistent_medium_escalation(run_dir: str,
     # then (E7 attempt 6: two such findings became HIGH in round 5 and the
     # lead ran the writer mid-round to clear them).
     written = any(os.path.exists(os.path.join(run_dir, f)) for f in ("report.md", "manuscript.md"))
+    # Phase 33 α: after sign-off, findings tied to no brief item do not escalate.
+    import decision_brief
+    brief_ids = decision_brief.item_ids(run_dir) if decision_brief.is_signed(run_dir) else None
     for reviewer_yaml in ("critique_methods.yaml", "critique_domain.yaml",
                           "critique_presentation.yaml",
                           "critique_redteam.yaml",
@@ -5035,6 +5071,9 @@ def _check_persistent_medium_escalation(run_dir: str,
             if blocker.get("resolved") is True:
                 continue
             if not written and str(blocker.get("target_stage") or "").upper() == "WRITE":
+                continue
+            if (brief_ids is not None and reviewer_yaml != "critique_crossmodel.yaml"
+                    and str(blocker.get("brief_item") or "").strip().upper() == "NONE"):
                 continue
             first_seen = blocker.get("first_seen_round")
             if first_seen is None:
@@ -7168,6 +7207,36 @@ def _run_self_test() -> int:
         ok(any(v["kind"] == "P-004_persistent" for v in ve5c),
            f"E5c: WRITE-stage blocker escalates once a manuscript exists: {ve5c}")
 
+    # BS1-BS3 (Phase 33): once the decision brief is signed, a critic finding
+    # tied to no brief item neither blocks nor escalates; a tied one does both.
+    with tempfile.TemporaryDirectory() as d:
+        import decision_brief as _db
+        yaml.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d, "success_criteria.yaml"), "w"))
+        yaml.safe_dump({"question": "q", "decision": "d", "decision_maker": "m", "objective": "o",
+                        "answers": [{"id": "A1", "statement": "s", "resolution": "district"}],
+                        "acceptance": ["HB-001"]}, open(os.path.join(d, "decision_brief.yaml"), "w"))
+        _db.sign(d, "owner")
+        yaml.safe_dump({"reviewer": "critique-redteam", "round": 5, "blockers": [
+            {"id": "R-001", "severity": "MEDIUM", "target_stage": "MODEL", "first_seen_round": 1,
+             "claim": "tied", "resolved": False, "brief_item": "A1"},
+            {"id": "R-002", "severity": "MEDIUM", "target_stage": "MODEL", "first_seen_round": 1,
+             "claim": "untied", "resolved": False, "brief_item": "NONE"}]}, open(os.path.join(d, "critique_redteam.yaml"), "w"))
+        kinds = {v["kind"] for v in _check_persistent_medium_escalation(d, round_n=5)}
+        ok("R-001_persistent" in kinds and "R-002_persistent" not in kinds,
+           f"BS1: only the finding tied to the brief escalates: {kinds}")
+        crit = {"critique-redteam": {"blockers": [
+            {"id": "R-003", "severity": "HIGH", "target_stage": "MODEL", "category": "METHODS",
+             "first_seen_round": 5, "claim": "untied", "resolved": False, "brief_item": "NONE"},
+            {"id": "R-004", "severity": "HIGH", "target_stage": "MODEL", "category": "METHODS",
+             "first_seen_round": 5, "claim": "tied", "resolved": False, "brief_item": "HB-001"}],
+            "carried_forward": [], "structural_mismatch": {"detected": False}}}
+        dec = _apply_brief_scope(decide(crit, 8, 5), crit, d, 8, 5)
+        ok([b["id"] for b in dec["unresolved_high"]] == ["R-004"] and dec["outside_brief"] == ["R-003"],
+           f"BS2: untied HIGH leaves unresolved_high: {dec}")
+        ok(any(v["kind"] == "acceptance_criteria_changed" for v in (
+            open(os.path.join(d, "success_criteria.yaml"), "a").write("# edited\n") and _check_decision_brief(d))),
+           "BS3: criteria edited after sign-off is a gate finding")
+
     # E6: critique-blocker MEDIUM persistence below threshold → silent.
     # first_seen=4, round=6 → persisted only 2 rounds; threshold 4.
     with tempfile.TemporaryDirectory() as d:
@@ -9017,6 +9086,8 @@ def main() -> int:
         return 3
 
     decision = decide(critiques, args.max_rounds, args.current_round)
+    decision = _apply_brief_scope(decision, critiques, args.run_dir,
+                                  args.max_rounds, args.current_round)
 
     if args.spec_compliance:
         spec_module = _load_spec_compliance()
