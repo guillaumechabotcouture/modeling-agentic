@@ -243,6 +243,9 @@ accounting:         # how numbers are counted
   - {id: K1, text: "<benefit window; lifetime vs in-window; financial vs economic cost; discounting>"}
 out_of_scope:
   - {id: OS1, text: "<what this run will not answer>", reason: "<why>"}
+comparators:        # what impact is measured against; exactly one primary
+  - {id: CF1, role: primary, text: "<what happens in each unit without the plan>"}
+  - {id: CF2, role: sensitivity, text: "<an alternative status quo>"}
 acceptance: [HB-001, HB-002, MB-001]   # ids from success_criteria.yaml
 open_questions:     # framing choices the owner settles at sign-off
   - {id: Q1, question: "<e.g. is continuity of current coverage a constraint or a value?>",
@@ -251,8 +254,17 @@ open_questions:     # framing choices the owner settles at sign-off
 
 Settle in the brief what would otherwise be argued every round: the
 resolution the data can support for the answer, how the budget and the
-population in the question are to be read, which accounting is primary, and
-what counts as out of scope. Where the question leaves a choice that changes
+population in the question are to be read, which accounting is primary,
+what the impact is measured against, and what counts as out of scope.
+
+The primary comparator is what happens in each unit if the plan is not
+funded: the activity of other funders and routine delivery channels that is
+already scheduled or documented, and how current coverage evolves over the
+window (maintained, decaying, replaced). Do not use "the intervention is
+withdrawn" or "nothing is delivered" as the primary unless that is what
+would happen; it inflates every impact and allocation gain. Cite the source
+for how the status quo evolves; where it is uncertain, put the alternatives
+as sensitivity comparators and the choice in `open_questions`. Where the question leaves a choice that changes
 the answer, put it in `open_questions` with your proposed answer; do not
 decide it silently. Do not put modeling method in the brief (that is
 plan.md); put what the decision-maker needs.

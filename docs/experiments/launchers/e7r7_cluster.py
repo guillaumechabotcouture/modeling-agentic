@@ -80,7 +80,7 @@ def get_cluster(create: bool):
     if create:
         sys.path.insert(0, os.path.join(TREE, "scripts"))
         import compute
-        kw.update(n_workers=len(LABELS) + COMPUTE_START, worker_cpu=8, worker_memory="64 GiB",
+        kw.update(n_workers=len(LABELS) + COMPUTE_START, worker_vm_types=compute.WORKER_VM_TYPES,
                   worker_disk_size=100, idle_timeout="12 hours", worker_options=compute.WORKER_OPTIONS,
                   environ={"MA_STORAGE_ACCOUNT": "modelingagentic", "MA_STORAGE_PREFIX": "_checks/e7r7-smoke" if SMOKE else "runs/e7r7",
                            **COMPUTE_ENV},

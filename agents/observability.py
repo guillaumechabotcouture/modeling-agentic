@@ -48,6 +48,7 @@ class LiveState:
         self.last_event = None
         self.last_event_ts = None
         self.est_usd = 0.0
+        self.spent_before_usd = 0.0   # Phase 38: ledger spend of earlier invocations, set by main.py
         self._seen_msgs: set = set()
         # Stage-boundary snapshots: the run's state the moment a stage is
         # launched, i.e. exactly what that stage will read (replay fixtures).
@@ -139,7 +140,10 @@ def build_status(run_path: str, state: LiveState, run_start: datetime, extra: di
         live = {"session": state.session, "active_agents": sorted(set(state.active_agents.values())),
                 "last_agent": state.last_agent, "stage": STAGE_OF.get(state.last_agent or "", None),
                 "last_event": state.last_event, "last_event_ts": state.last_event_ts,
-                "est_spend_this_process_usd": round(state.est_usd, 2)}
+                "est_spend_this_process_usd": round(state.est_usd, 2),
+                # Phase 38: the ledger is written when a session ends, so mid-session it
+                # shows only finished sessions (E7 attempt 7: $6.64 while ~$154 was spent).
+                "est_spend_run_total_usd": round(state.spent_before_usd + state.est_usd, 2)}
     return {"heartbeat": datetime.now().astimezone().isoformat(timespec="seconds"),
             "elapsed_min": round((datetime.now() - run_start).total_seconds() / 60, 1),
             **live, "gate": _gate(run_path), "ledger": _ledger(run_path), **(extra or {})}
@@ -319,6 +323,10 @@ def _self_test_body(fails: list[str]) -> list[str]:
             fails.append(f"OB1 the active agent and stage come from the stream: {s}")
         if abs(s["est_spend_this_process_usd"] - round(1_000_000 * 0.1 * 4.131e-6, 2)) > 0.01:
             fails.append(f"OB2 live cost counts each message once: {s}")
+        st.spent_before_usd = 10.0
+        if abs(build_status(d, st, datetime.now())["est_spend_run_total_usd"] - (10.0 + st.est_usd)) > 0.01:
+            fails.append("OB2b the run total adds earlier invocations' ledger spend to this process's estimate")
+        st.spent_before_usd = 0.0
         st.on_message(UserMessage(content=[ToolResultBlock("a1", "done")]))
         if build_status(d, st, datetime.now())["active_agents"] != []:
             fails.append("OB3 a finished subagent is no longer active")
