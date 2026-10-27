@@ -296,6 +296,7 @@ class ArtifactIntegrity:
         self._lock = threading.Lock()
         self._process_check = process_check or (lambda: _live_harness_scripts(run_path))
         self.grants: list[dict] = []     # background harness scripts launched
+        self._check_seq = 0              # bumped at the start and end of every check (process watch)
         self.report_ok = True
         # A resumed run keeps the violations already recorded. Only a MISSING
         # record is a fresh start: an unreadable, unstamped or malformed one
@@ -352,13 +353,13 @@ class ArtifactIntegrity:
         """One sample: a grant for each producer seen running on this run. A
         sample taken before a check that ran meanwhile is discarded: that
         check may already have seen the producer finish (Codex review)."""
-        seq = getattr(self, "_check_seq", 0)
+        seq = self._check_seq
         try:
             live = set(self._process_check() or ())
         except Exception:  # noqa: BLE001 — a failed sample must not stop the watch
             return
         with self._lock:
-            if getattr(self, "_check_seq", 0) != seq:
+            if self._check_seq != seq:
                 return
             for sc in live:
                 if sc not in SCRIPT_PRODUCES:
@@ -482,7 +483,7 @@ class ArtifactIntegrity:
         return live
 
     def _check(self, where: str) -> list[dict]:
-        self._check_seq = getattr(self, "_check_seq", 0) + 1
+        self._check_seq += 1
         cur = self._scan()
         live = self._refresh_grants()
         new_events = []
@@ -533,6 +534,7 @@ class ArtifactIntegrity:
         if new_events or resolved:
             self.events.extend(new_events)
             self._write_report()
+        self._check_seq += 1      # again at the end: a sample overlapping any part of a check is stale
         return new_events
 
     @property

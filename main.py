@@ -1370,6 +1370,17 @@ def _run_self_test() -> int:
             ig10.observe()
             ok(not any(g.get("observed") for g in ig10.grants),
                "IN8f a sample taken before a check that ran meanwhile is discarded")
+            ig11 = ArtifactIntegrity(td8, process_check=lambda: set(alive))
+            _seq_mid = ig11._check_seq
+            ig11._check(where="post_tool")       # a check that began before the sample and ends after it
+            ig11._check_seq = _seq_mid + 1       # as if sampled mid-check
+            _orig11 = ig11._process_check
+            def _mid():
+                got = _orig11(); ig11._check_seq += 1; return got   # the check ends while sampling
+            ig11._process_check = _mid
+            ig11.observe()
+            ok(not any(g.get("observed") for g in ig11.grants),
+               "IN8g a sample overlapping the end of a check is discarded")
         # IN6: a resumed run keeps earlier violations
         ok(len(ArtifactIntegrity(td, process_check=lambda: set()).events) >= 1,
            "IN6 violations survive a restart")
@@ -1952,7 +1963,9 @@ def _run_self_test() -> int:
             "chmod u+w " + _R + "/scripts/compute.py": "deny",
             "bash -c 'chmod u+w scripts/identifiability.py'": "deny",
             "python3 - <<EOF\nimport os\nos.chmod(\n    'scripts/identifiability.py', 0o644)\nEOF": "deny",
-            "chmod u+w $D/x.py; echo scripts": "deny"}
+            "chmod u+w $D/x.py; echo scripts": "deny",
+            "false && cd /tmp; chmod u+w scripts/identifiability.py": "deny",
+            "false && cd /tmp; chmod u+w agents": "deny"}
         _got = {c: ("deny" if enforcement.bash_reason(c, td, "modeler") else None) for c in _hl3}
         ok(_got == _hl3, f"HL3 chmod is denied only when aimed at harness code: {[c for c in _hl3 if _got[c] != _hl3[c]]}")
         os.remove(_hp)

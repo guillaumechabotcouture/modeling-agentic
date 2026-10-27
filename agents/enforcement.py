@@ -604,13 +604,19 @@ def _harness_chmod(command: str, cwd: str | None = None) -> bool:
             if op.startswith(("-", "+", "=")) or re.fullmatch(
                     r"[0-7]{3,4}|[ugoa]*[+=-][rwxXst]*(,[ugoa]*[+=-][rwxXst]*)*", op):
                 continue
-            if scwd is None and not os.path.isabs(os.path.expanduser(op.strip("'\""))):
-                return old_rule           # unknown cwd: cannot place a relative operand
             if any(c in op for c in "$`*?[{~"):
                 return old_rule           # expansion or glob: cannot know the target
-            if is_harness_path(op, scwd) or \
-                    os.path.relpath(REPO_ROOT, _abspath(op, scwd)).split(os.sep)[0] != "..":
-                return True               # harness code, the repo root, or a parent of it
+            rel_op = not os.path.isabs(os.path.expanduser(op.strip("'\"")))
+            if rel_op and _HARNESS_WORDS.search(" " + op):
+                return True               # names harness code (a tracked `cd` may never have run)
+            # A relative operand is placed against every directory the shell may
+            # be in: the tracked one (a `cd` that never runs, `false && cd x`,
+            # cannot be told apart), the call's own cwd and the repo root.
+            bases = {scwd, cwd, REPO_ROOT} if rel_op else {None}
+            for b in bases:
+                if is_harness_path(op, b) or \
+                        os.path.relpath(REPO_ROOT, _abspath(op, b)).split(os.sep)[0] != "..":
+                    return True           # harness code, the repo root, or a parent of it
         plain += 1
     return plain != mentions and old_rule  # a mention not accounted for as a plain run-file chmod
 
