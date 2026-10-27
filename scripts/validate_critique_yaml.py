@@ -1896,6 +1896,10 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None,
     violations += G(_check_sufficiency_critic, run_dir, round_n=round_n)
     # Phase 21 β/δ: eligible-population behavioral probe.
     violations += G(_check_eligibility_probe, run_dir, round_n=round_n)
+    # Phase 35: results files with rows that have no result (failed or never
+    # run), unless a newer file of the same function recovered them.
+    violations += G(lambda rd: _load_sibling("compute").gate_findings(rd),
+                    run_dir, check_name="compute_results")
     # Phase 34: done_when findings computed by the caller, added before the
     # escalation so their persistence counts (Codex review).
     violations += list(extra or [])
@@ -7368,6 +7372,16 @@ def _run_self_test() -> int:
         ok(pre["action"] == "ACCEPT" and pre["after_write"] == ["P-001"]
            and [b["id"] for b in post["unresolved_high"]] == ["P-001"],
            f"DG7: a HIGH write-up finding waits for the first draft, then blocks: {pre['action']} {post['action']}")
+        os.makedirs(os.path.join(d, "models"), exist_ok=True)
+        with open(os.path.join(d, "models", "lib_results.jsonl"), "w") as f:
+            for k in range(10):
+                f.write(json.dumps({"i": k, "ok": k > 3, "key": f"k{k}", "kind": "infra",
+                                    "error": None if k > 3 else "chunk failed: BrokenProcessPool"}) + "\n")
+        json.dump({"n": 10, "n_failed": 4, "task_core_s": 9.0, "fn": "models/lib.py::run"},
+                  open(os.path.join(d, "models", "lib_results.jsonl.summary.json"), "w"))
+        cv = [v for v in _check_rigor_artifacts(d, round_n=3) if v.get("kind") == "compute_results_incomplete"]
+        ok(len(cv) == 1 and cv[0]["severity"] == "HIGH" and "4 of 10" in cv[0]["claim"],
+           f"DG8: a results file with failed rows is a HIGH gate finding through the production path: {cv}")
 
     # E6: critique-blocker MEDIUM persistence below threshold → silent.
     # first_seen=4, round=6 → persisted only 2 rounds; threshold 4.

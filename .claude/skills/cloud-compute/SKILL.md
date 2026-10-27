@@ -28,7 +28,20 @@ python3 scripts/compute.py map {run_dir} --fn models/<module>.py::<fn> \
   `scripts/`) are unpacked at the same absolute paths. Files over 100 MB are
   left out and listed in `<out>.summary.json`; pass what the function needs as
   params, or keep inputs small.
-- **Memory-heavy models:** set `MA_COMPUTE_PROCS_PER_WORKER` (default: all of a compute VM's cores).
+- **Memory and failures are handled by the service.** It measures each
+  process's peak memory and runs as many processes per VM as fit (starting
+  from the function's last measured peak, in `models/compute_ledger.json`).
+  A process that dies (out of memory) or a lost VM: its inputs are rerun at
+  lower concurrency. An input that kills its process even when run alone
+  fails as a model error. The same model error repeating stops the batch
+  early. `MA_COMPUTE_PROCS_PER_WORKER` remains as an upper limit, rarely needed.
+- **Completing a batch:** rerun the same command. Rows already computed with
+  the same code, data and params are kept; only missing or failed rows run
+  (`--fresh` recomputes everything). No retry or merge scripts.
+- **Failure kinds** in each failed row: `model` (the model raised or cannot
+  run alone), `infra` (the machine failed after retries), `stopped` (cap,
+  timeout, or the repeated-error stop). Results files with rows that have no
+  result are a gate finding (`compute_results_incomplete`).
 - **Results and accounting.** Results come back in input order; a failing row
   fails alone. Core-seconds are recorded in `models/compute_ledger.json`.
   Each call has an allowance (`--max-core-hours`, default 50) within the

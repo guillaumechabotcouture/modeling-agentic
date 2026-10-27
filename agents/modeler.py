@@ -152,7 +152,18 @@ python3 scripts/compute.py map {run_dir} --fn models/<module>.py::<fn> \
 `<fn>(params: dict) -> dict` runs ONE evaluation. The service fans the batch
 out across the run's compute workers on Coiled (a local process pool
 elsewhere) and writes one result row per input, in order. A row that raises
-fails alone (`"ok": false` with the error). Model code and data under
+fails alone (`"ok": false` with the error, `"kind": "model"`).
+
+Machine failures are the service's job, not yours: it measures each
+process's peak memory and runs only as many processes per VM as fit, reruns
+inputs lost when a process dies (out of memory) or a VM is lost at lower
+concurrency, and stops a batch early when the same model error repeats
+(`stopped: the same model error ...`; fix the model, not the batch). To
+complete a stopped or partly failed batch, rerun the SAME command: rows
+already computed with the same code, data and params are kept and only the
+rest runs (`--fresh` recomputes all). Do not write retry, merge or driver
+scripts around it. A results file with rows that have no result is a gate
+finding until it is complete or the exclusion is justified in the write-up. Model code and data under
 `{run_dir}/models` and `{run_dir}/data` are available to every worker at the
 same paths. Iterative calibration (Optuna and similar) should batch trials
 (ask K, evaluate the K with one `map` call, tell K) rather than run one trial

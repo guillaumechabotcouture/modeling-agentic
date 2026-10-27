@@ -36,6 +36,15 @@ cap (MA_COMPUTE_MAX_CORE_HOURS, default 200), both in core-hours and tracked
 in `{run_dir}/models/compute_ledger.json`. A batch stops when its allowance
 is used; --timeout-s stops it at a wall-clock limit.
 
+Phase 35, failures handled by the service (no agent troubleshooting):
+memory is measured per process and concurrency lowered to fit; a process
+death (out of memory) or a lost VM reruns the affected inputs at lower
+concurrency; a model error repeating on most rows stops the batch early.
+Failed rows carry `kind`: model | infra | stopped. The CLI reuses rows of an
+earlier run of the same command (same function, code, data and params), so
+rerunning completes a stopped or partly failed batch (`--fresh` disables).
+`gate_findings(run_dir)` reports results files with rows that have no result.
+
 Known limits: a process the model starts in its own session (setsid,
 daemonizing) escapes the kill on a stop. Work redone by dask after a worker
 dies is not seen directly; a worker that vanishes during a call is charged as
@@ -52,6 +61,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+from concurrent.futures.process import BrokenProcessPool
 import hashlib
 import importlib.util
 import io
@@ -114,8 +124,85 @@ def _call(fn, i: int, params: dict) -> dict:
     try:
         return {"i": i, "ok": True, "result": _jsonable(fn(params)), "seconds": round(time.time() - t0, 3)}
     except Exception as e:  # noqa: BLE001 — one failing row must not kill the batch
-        return {"i": i, "ok": False, "error": f"{type(e).__name__}: {e}"[:500],
+        return {"i": i, "ok": False, "kind": MODEL, "error": f"{type(e).__name__}: {e}"[:500],
                 "trace": traceback.format_exc()[-1500:], "seconds": round(time.time() - t0, 3)}
+
+
+# --------------------------------------------------------------------------- #
+# Phase 35: failures the service handles itself
+# --------------------------------------------------------------------------- #
+# E7 attempt 7: a VM running 8 simulations at once ran out of memory; one dead
+# process broke the whole process pool, so every simulation queued on that VM
+# failed with it (1,544 of 1,920 rows, 2.9 h, 305 core-hours), and nothing
+# stopped the batch. Failed rows now carry a kind:
+#   model   the model raised, or its process died running that input ALONE
+#           (needs more memory than the VM has, or crashes in native code):
+#           only the model's author can fix these
+#   infra   the machine failed (a pool broken by another process, a lost VM):
+#           retried here at lower concurrency, never left to the agent
+#   stopped cap, timeout, cancel, or the repeated-error breaker
+# Memory is measured per process (peak RSS) and concurrency is lowered so the
+# measured peak fits the VM; after a broken pool the in-flight inputs are rerun
+# with half as many processes. A batch whose rows keep failing with the SAME
+# model error stops early instead of running to the end.
+MODEL, INFRA, STOPPED = "model", "infra", "stopped"
+BREAKER_MIN = 8            # same model error at least this often, and on half the finished rows
+MEM_HEADROOM = 1.2         # a process may grow 20% past the largest peak seen
+MEM_USABLE = 0.85          # share of the memory available at start that the pool may use
+
+
+def _peak_mb() -> float:
+    """Peak resident memory of this process plus its largest finished child, in MB."""
+    import resource
+    unit = 1 / 2**20 if sys.platform == "darwin" else 1 / 1024     # ru_maxrss: bytes on macOS, KiB on Linux
+    return round((resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                  + resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss) * unit, 1)
+
+
+def _avail_mb() -> float | None:
+    """Memory available to new processes now (Linux MemAvailable; elsewhere half of RAM)."""
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) / 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**20 / 2
+    except (ValueError, OSError, AttributeError):
+        return None
+
+
+def _mem_slots(peak_mb, avail_mb, cap: int) -> int:
+    """Processes that fit: the measured peak (with headroom) into the usable memory, at most `cap`."""
+    if not peak_mb or not avail_mb:
+        return cap
+    return max(1, min(cap, int(MEM_USABLE * avail_mb / (peak_mb * MEM_HEADROOM))))
+
+
+def _err_key(row) -> str:
+    import re
+    return re.sub(r"\d+", "N", str(row.get("error") or ""))[:80]
+
+
+def _breaker(rows, min_n: int | None = None) -> str | None:
+    """A stop reason when one model error repeats: at least `min_n` rows and at
+    least half of the finished rows (ok or model-failed). Otherwise None."""
+    min_n = int(os.environ.get("MA_COMPUTE_BREAKER_MIN", BREAKER_MIN)) if min_n is None else min_n
+    if min_n <= 0:
+        return None
+    finished = [r for r in rows if r.get("ok") or r.get("kind") == MODEL]
+    counts = {}
+    for r in finished:
+        if not r.get("ok"):
+            counts[_err_key(r)] = counts.get(_err_key(r), 0) + 1
+    if not counts:
+        return None
+    key, c = max(counts.items(), key=lambda kv: kv[1])
+    if c >= min_n and 2 * c >= len(finished):
+        err = next(r["error"] for r in finished if not r.get("ok") and _err_key(r) == key)
+        return f"stopped: the same model error on {c} of {len(finished)} finished rows: {err[:300]}"
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -127,7 +214,9 @@ _LOCAL_FN = None
 
 def _local_init(run_dir: str, fn_spec: str, init_dir: str | None = None):
     """Pool initializer. Each process records its model load time in
-    `init_dir`, so loads are charged even in processes that get no chunk."""
+    `init_dir`, so loads are charged even in processes that get no chunk; a
+    load that raises is recorded there too (`<pid>.err`), so a pool that breaks
+    at start is reported as the model's load error, not as a crash."""
     global _LOCAL_FN
     t0 = time.time()
     # Own process group: whatever the model spawns (an external simulator)
@@ -138,13 +227,22 @@ def _local_init(run_dir: str, fn_spec: str, init_dir: str | None = None):
     os.chdir(run_dir)
     try:
         _LOCAL_FN = load_fn(run_dir, fn_spec)
+    except BaseException as e:
+        if init_dir:
+            open(os.path.join(init_dir, f"{os.getpid()}.err"), "w").write(f"{type(e).__name__}: {e}"[:500])
+        raise
     finally:
         if init_dir:
             open(os.path.join(init_dir, str(os.getpid())), "w").write(str(time.time() - t0))
 
 
 def _local_chunk(chunk):
-    return [_call(_LOCAL_FN, i, params) for i, params in chunk]
+    out = []
+    for i, params in chunk:
+        row = _call(_LOCAL_FN, i, params)
+        row["peak_mb"] = _peak_mb()
+        out.append(row)
+    return out
 
 
 def _chunks(items: list, n_chunks: int) -> list:
@@ -198,45 +296,125 @@ def _group_alive(pgid, direct=False) -> bool:
     return False
 
 
-def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s=None, progress=None):
+def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s=None, progress=None,
+               peak_mb=None):
     """Always a fresh spawn pool, even for one worker: the model's sibling
-    modules and its chdir never leak into the caller or across runs."""
+    modules and its chdir never leak into the caller or across runs.
+
+    Phase 35: one input per submission, at most `cap` in flight, so the inputs
+    running when a process dies are known. A broken pool is rebuilt with half
+    as many processes and those inputs are rerun (not failed). `cap` also falls
+    to what the measured peak memory per process (or the `peak_mb` hint)
+    allows, and never rises again within the call. An input whose process
+    dies while it runs alone is retried once, alone; a second death fails it
+    as a model error."""
     import multiprocessing as mp
+    import tempfile
     progress = {} if progress is None else progress
     n = max(1, min(max_workers or max(1, (os.cpu_count() or 2) - 1), len(inputs) or 1))
     progress.update(slots=n, cores_per_slot=1, core_s=0.0)
-    chunks = _chunks(list(enumerate(inputs)), n * 8)
     deadline, why = _budget_deadline(deadline, allowance_s, n)
-    import tempfile
+    avail = _avail_mb()
+    peak = float(peak_mb or os.environ.get("MA_COMPUTE_PEAK_MB") or 0) or None
+    cap = _mem_slots(peak, avail, n)
     init_dir = tempfile.TemporaryDirectory(prefix="ma_compute_init_")
-    ex = cf.ProcessPoolExecutor(max_workers=n, mp_context=mp.get_context("spawn"),
-                                initializer=_local_init, initargs=(run_dir, fn_spec, init_dir.name))
-    futs = {ex.submit(_local_chunk, ch): ch for ch in chunks}
-    pending, rows, stop, lost, pids = set(futs), [], None, 0, set()
+
+    def new_pool(k):
+        return cf.ProcessPoolExecutor(max_workers=k, mp_context=mp.get_context("spawn"),
+                                      initializer=_local_init, initargs=(run_dir, fn_spec, init_dir.name))
+
+    def load_error():
+        for name in os.listdir(init_dir.name):
+            if name.endswith(".err"):
+                try:
+                    return open(os.path.join(init_dir.name, name)).read()
+                except OSError:
+                    return "unreadable"
+        return None
+
+    todo = list(enumerate(inputs))
+    running, rows, stop, lost, pids, breaks, seen_peak = {}, [], None, 0, set(), 0, 0.0
+    alone = {}                                     # input -> times its process died running alone
+    ex = new_pool(cap)
     try:
-        while pending:
+        while todo or running:
+            while todo and len(running) < cap:
+                item = todo.pop(0)
+                running[ex.submit(_local_chunk, [item])] = (item, time.time())
             pids |= set((getattr(ex, "_processes", None) or {}).keys())
             left = None if deadline is None else max(0.0, deadline - time.time())
-            done, pending = cf.wait(pending, timeout=left, return_when=cf.FIRST_COMPLETED)
+            done, _ = cf.wait(set(running), timeout=left, return_when=cf.FIRST_COMPLETED)
             if not done:
                 stop = why
                 break
+            crashed = []
             for f in done:
+                item, t_sub = running.pop(f)
                 try:
                     got = f.result()
-                    rows += got
-                    progress["core_s"] += _known_core_s(got)
-                except Exception as e:  # noqa: BLE001 — a crashed process fails only its chunk
+                except BrokenProcessPool:
+                    crashed.append((item, t_sub))
+                    continue
+                except Exception as e:  # noqa: BLE001 — e.g. an unpicklable result fails only its row
                     lost += 1
-                    rows += [{"i": i, "ok": False, "error": f"chunk failed: {type(e).__name__}: {e}"[:500]}
-                             for i, _ in futs[f]]
-            if pending and allowance_s is not None and progress["core_s"] >= allowance_s:
+                    rows.append({"i": item[0], "ok": False, "kind": INFRA,
+                                 "error": f"chunk failed: {type(e).__name__}: {e}"[:500]})
+                    continue
+                rows += got
+                progress["core_s"] += _known_core_s(got)
+                seen_peak = max([seen_peak] + [r.get("peak_mb") or 0 for r in got])
+            if crashed:
+                # Every input still in flight dies with the pool: collect them all.
+                cf.wait(set(running), timeout=30)
+                for f, (item, t_sub) in list(running.items()):
+                    try:
+                        got = f.result(timeout=0)
+                        rows += got
+                        progress["core_s"] += _known_core_s(got)
+                    except Exception:  # noqa: BLE001 — broken with the pool
+                        crashed.append((item, t_sub))
+                running.clear()
+                breaks += 1
+                now = time.time()
+                progress["core_s"] += sum(now - t for _, t in crashed)   # their partial work: charged, not lost
+                live = set((getattr(ex, "_processes", None) or {}).keys())
+                pids |= live
+                _kill_groups(live, grace_s=0.5)
+                ex.shutdown(wait=True, cancel_futures=True)
+                _kill_groups(pids, grace_s=0, direct=False)
+                err = load_error()
+                if err:
+                    stop = f"stopped: the model failed to load: {err}"
+                    rows += [{"i": it[0], "ok": False, "kind": MODEL, "error": f"the model failed to load: {err}"[:500]}
+                             for it, _ in crashed]
+                    break
+                if len(crashed) == 1 and alone.get(crashed[0][0][0], 0) == 0:
+                    alone[crashed[0][0][0]] = 1            # once could be the machine: one retry, still alone
+                    todo.insert(0, crashed[0][0])
+                elif len(crashed) == 1:
+                    (i, _), _t = crashed[0]
+                    rows.append({"i": i, "ok": False, "kind": MODEL,
+                                 "error": ("the process died twice running this input alone (out of memory or a crash "
+                                           f"in native code); about {avail or 0:.0f} MB was available to the pool, "
+                                           f"the largest process peak seen was {seen_peak:.0f} MB")})
+                else:
+                    todo = [it for it, _ in sorted(crashed, key=lambda c: c[0][0])] + todo
+                    cap = max(1, len(crashed) // 2)
+                ex = new_pool(cap)
+            if seen_peak:
+                cap = min(cap, _mem_slots(seen_peak, avail, n))
+            if todo or running:
+                reason = _breaker(rows)
+                if reason:
+                    stop = reason
+                    break
+            if (todo or running) and allowance_s is not None and progress["core_s"] >= allowance_s:
                 stop = CAP_STOP
                 break
     finally:
         live = set((getattr(ex, "_processes", None) or {}).keys())   # not yet reaped
         pids |= live
-        if pending:
+        if running:
             _kill_groups(live)
             _kill_groups(pids - live, grace_s=0, direct=False)
         ex.shutdown(wait=True, cancel_futures=True)
@@ -244,13 +422,16 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
     # Model load time of every pool process (a process still loading when it
     # was killed is covered by the unfinished-chunk estimate).
     for name in os.listdir(init_dir.name):
+        if name.endswith(".err"):
+            continue
         try:
             progress["core_s"] += float(open(os.path.join(init_dir.name, name)).read())
         except (OSError, ValueError):
             pass
     init_dir.cleanup()
     return rows, {"backend": "local", "workers": n, "slots": n, "cores_per_slot": 1, "core_s": progress["core_s"],
-                  "stopped": stop, "unknown_chunks": lost + len(pending)}
+                  "stopped": stop, "unknown_chunks": lost + len(running), "breaks": breaks, "procs_final": cap,
+                  "peak_mb": round(seen_peak, 1) or None}
 
 
 # --------------------------------------------------------------------------- #
@@ -311,7 +492,8 @@ def _no_symlink_path(path: str) -> bool:
 
 def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: list,
                  deadline: float | None = None, procs: int | None = None,
-                 chunk_allowance_s: float | None = None, call_id: str | None = None, repo: str | None = None):
+                 chunk_allowance_s: float | None = None, call_id: str | None = None, repo: str | None = None,
+                 peak_mb: float | None = None):
     """Runs on a dask worker. Under a machine-wide lock: make sure the files on
     disk are exactly THIS bundle (another call's bundle may have replaced them:
     its extra files are removed and no stale bytecode survives), then evaluate
@@ -334,15 +516,15 @@ def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: lis
     calls = os.path.join(tempfile.gettempdir(), _CALLS_DIR, call_id or "none")
     os.makedirs(calls, exist_ok=True)
 
-    def rows_with(msg):
-        return [{"i": i, "ok": False, "error": msg[:500], "worker": waddr} for i, _ in chunk]
+    def rows_with(msg, kind="stopped"):
+        return [{"i": i, "ok": False, "kind": kind, "error": msg[:500], "worker": waddr} for i, _ in chunk]
 
     with open(lock, "w") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
         t0 = time.time()
 
-        def failed(msg):
-            return {"rows": rows_with(msg), "core_s": round((time.time() - t0) * procs, 3)}
+        def failed(msg, kind="stopped"):
+            return {"rows": rows_with(msg, kind), "core_s": round((time.time() - t0) * procs, 3)}
         if os.path.exists(os.path.join(calls, "cancel")):
             return {"rows": rows_with("cancelled"), "core_s": 0.0}
         live = os.path.exists(os.path.join(run_dir, "metadata.json"))
@@ -351,9 +533,9 @@ def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: lis
             members = [m.name for m in tf.getmembers() if m.isfile()]
             dirs = {os.path.dirname("/" + m) for m in members} | {run_dir}
             if not all(_no_symlink_path(d) for d in dirs):
-                return failed("refusing to stage the bundle: a target directory is a symlink")
+                return failed("refusing to stage the bundle: a target directory is a symlink", "model")
             if any(os.path.exists(os.path.join(d, "metadata.json")) for d in dirs if d.startswith(run_dir)):
-                return failed("refusing to stage the bundle over a live run directory")
+                return failed("refusing to stage the bundle over a live run directory", "model")
             current = os.path.join(run_dir, ".ma_compute_bundle")
             try:
                 prev = json.load(open(current))
@@ -393,6 +575,8 @@ def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: lis
                                         "GCP_", "OPENAI_", "ANTHROPIC_", "CLAUDE", "COILED_", "DASK_"))}
             env["PYTHONDONTWRITEBYTECODE"] = "1"     # bytecode never outlives its bundle
             env["MA_COMPUTE_IN_CHUNK"] = "1"
+            if peak_mb:
+                env["MA_COMPUTE_PEAK_MB"] = str(peak_mb)    # Phase 35: start at a concurrency that fits
             cancel_mark = os.path.join(calls, "cancel")
             cmd = [sys.executable, script, "map", run_dir, "--fn", fn_spec, "--inputs", inp,
                    "--out", out, "--backend", "local", "--max-workers", str(procs), "--no-ledger",
@@ -445,7 +629,7 @@ def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: lis
             if not os.path.exists(out):
                 if os.path.exists(cancel_mark):
                     return failed("cancelled")
-                return failed(f"chunk subprocess failed (rc {proc.returncode}): {(err or '')[-800:]}")
+                return failed(f"chunk subprocess failed (rc {proc.returncode}): {(err or '')[-800:]}", "infra")
             rows = [json.loads(l) for l in open(out) if l.strip()]
             csum = None
             try:
@@ -577,11 +761,17 @@ def _security():
 
 
 def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadline=None, allowance_s=None,
-              progress=None):
+              progress=None, peak_mb=None):
     """The allowance is split over the chunks that can run at once; each chunk
     enforces its share from when it starts (queueing behind other calls on a
     shared pool does not count). Whenever the call ends with chunks still
-    out (cap, timeout, interrupt), those chunks are stopped on the workers."""
+    out (cap, timeout, interrupt), those chunks are stopped on the workers.
+
+    Phase 35: what one chunk learns about memory (its pool broke, or its
+    measured peak allowed fewer processes) sets the processes for every chunk
+    submitted after it. A chunk lost with its VM, or whose subprocess died, is
+    resubmitted once with half the processes. A model error repeating across
+    chunks stops the call (`_breaker`)."""
     import uuid
     import cloudpickle
     from distributed import Client, wait
@@ -625,8 +815,13 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
         # left of the allowance after charges and the shares of chunks still
         # out, so the chunks together can never exceed the allowance.
         held = {}                                   # future -> its share
+        learned = {"procs": None, "peak": peak_mb}
 
-        def submit(ch, attempt):
+        def procs_for(override=None):
+            p = [int(x) for x in (env_procs, learned["procs"], override) if x]
+            return min(p) if p else None            # None: the worker uses its own core count
+
+        def submit(ch, attempt, override=None):
             share = None
             if allowance_s is not None:
                 free = allowance_s - progress["core_s"] - sum(held.values())
@@ -636,13 +831,15 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
             # A lost chunk is resubmitted once here (and the lost attempt
             # charged), rather than through dask retries, which would hide it.
             f = c.submit(_remote_task, bfut, binfo["sha256"], run_dir, fn_spec, ch, deadline,
-                         int(env_procs) if env_procs else None,     # None: the worker uses its own core count
-                         share, call_id, REPO, pure=False, **placement)
-            futs[f] = (ch, attempt)
+                         procs_for(override), share, call_id, REPO, learned["peak"], pure=False, **placement)
+            futs[f] = (ch, attempt, procs_for(override))
             held[f] = share or 0.0
             started[f] = time.time()
             return f
-        futs, queue, started, errors = {}, [(ch, 0) for ch in chunks], {}, {}
+        futs, queue, started, errors = {}, [(ch, 0, None) for ch in chunks], {}, {}
+
+        def halved(used, worker=None):
+            return max(1, int(used or cpus.get(worker) or cores_per_slot) // 2)
         pending, rows, stop, lost = set(), [], None, 0
         try:
             while queue or pending:
@@ -662,10 +859,26 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                     stop = "timed out"
                     break
                 for f in done:
-                    ch, attempt = futs[f]
+                    ch, attempt, used = futs[f]
                     f_share = held.pop(f, None)
                     try:
                         got = f.result()
+                        csum = got.get("summary") or {}
+                        wk = got["rows"][0].get("worker") if got["rows"] else None
+                        if csum.get("peak_mb"):
+                            learned["peak"] = max(learned["peak"] or 0, float(csum["peak_mb"]))
+                        pf = csum.get("procs_final")
+                        if pf and (csum.get("breaks") or pf < int(csum.get("workers") or pf)):
+                            learned["procs"] = min(learned["procs"] or pf, int(pf))
+                        died = got["rows"] and all(r.get("kind") == INFRA for r in got["rows"])
+                        if died and attempt == 0 and (deadline is None or time.time() < deadline):
+                            progress["core_s"] += float(got["core_s"])
+                            learned["procs"] = min(learned["procs"] or 10**6, halved(used, wk))
+                            queue.insert(0, (ch, 1, learned["procs"]))
+                            progress.setdefault("chunks", []).append(
+                                {"n": len(ch), "attempt": attempt, "error": got["rows"][0]["error"][:200],
+                                 "core_s": round(float(got["core_s"]), 1), "retried_with_procs": learned["procs"]})
+                            continue
                         rows += got["rows"]
                         progress["core_s"] += float(got["core_s"])
                         progress.setdefault("chunks", []).append(
@@ -691,9 +904,13 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                              "wall_s": round(time.time() - started.get(f, time.time()), 1)})
                         errors.update({i: msg for i, _ in ch})
                         if attempt == 0 and (deadline is None or time.time() < deadline):
-                            queue.insert(0, (ch, 1))
+                            queue.insert(0, (ch, 1, halved(used)))
                             continue
-                        rows += [{"i": i, "ok": False, "error": errors[i]} for i, _ in ch]
+                        rows += [{"i": i, "ok": False, "kind": INFRA, "error": errors[i]} for i, _ in ch]
+                if (pending or queue) and not stop:
+                    stop = _breaker(rows)
+                    if stop:
+                        break
                 if (pending or queue) and allowance_s is not None and progress["core_s"] >= allowance_s:
                     stop = CAP_STOP
                     break
@@ -732,12 +949,13 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                 gone = [] if res else list(workers)
             progress["gone_workers"] = len(gone)
     done_i = {r["i"] for r in rows}
-    rows += [{"i": i, "ok": False, "error": msg} for i, msg in errors.items() if i not in done_i]   # keep the real error
+    rows += [{"i": i, "ok": False, "kind": INFRA, "error": msg} for i, msg in errors.items() if i not in done_i]   # keep the real error
     return rows, {"backend": "dask", "workers": len(workers), "pool_target": pool, "slots": slots,
                   "cores_per_slot": cores_per_slot,
                   "core_s": progress["core_s"], "stopped": stop,
                   "unknown_chunks": lost + len(pending) + len(gone), "bundle": binfo,
-                  "chunks": progress.get("chunks", [])}
+                  "chunks": progress.get("chunks", []), "procs_final": learned["procs"],
+                  "peak_mb": learned["peak"]}
 
 
 # --------------------------------------------------------------------------- #
@@ -821,7 +1039,7 @@ def map_fn(run_dir: str, fn_spec: str, inputs: list, backend: str = "auto",
     run_dir = os.path.realpath(run_dir)
     if len(inputs) > max_tasks:
         raise ValueError(f"{len(inputs)} tasks exceeds --max-tasks {max_tasks}")
-    allowance_s, rid = (None if max_core_hours is None else max_core_hours * 3600), None
+    allowance_s, rid, hint = (None if max_core_hours is None else max_core_hours * 3600), None, None
     if ledger:
         cap_s = float(os.environ.get("MA_COMPUTE_MAX_CORE_HOURS", "200")) * 3600
         with _LedgerLock(run_dir) as led:
@@ -841,6 +1059,9 @@ def map_fn(run_dir: str, fn_spec: str, inputs: list, backend: str = "auto",
             rid = f"{os.uname().nodename}:{os.getpid()}:{time.time():.6f}"
             led["reservations"][rid] = {"core_s": allowance_s, "pid": os.getpid(),
                                         "host": os.uname().nodename, "fn": fn_spec}
+            # Phase 35: the last measured peak memory of this function starts the
+            # call at a concurrency that fits, instead of rediscovering it by crashing.
+            hint = ((led.get("mem_profile") or {}).get(fn_spec) or {}).get("peak_mb")
     if backend == "auto":
         backend = "dask" if os.environ.get("MA_COMPUTE_SCHEDULER") else "local"
     t0 = time.time()
@@ -849,13 +1070,13 @@ def map_fn(run_dir: str, fn_spec: str, inputs: list, backend: str = "auto",
     try:
         if backend == "dask":
             rows, info = _map_dask(run_dir, fn_spec, inputs, max_workers, deadline=deadline,
-                                   allowance_s=allowance_s, progress=progress)
+                                   allowance_s=allowance_s, progress=progress, peak_mb=hint)
         else:
             rows, info = _map_local(run_dir, fn_spec, inputs, max_workers, deadline=deadline,
-                                    allowance_s=allowance_s, progress=progress)
+                                    allowance_s=allowance_s, progress=progress, peak_mb=hint)
         done = {r["i"] for r in rows}
         why = info.get("stopped") or "timed out"
-        rows += [{"i": i, "ok": False, "error": why} for i in range(len(inputs)) if i not in done]
+        rows += [{"i": i, "ok": False, "kind": STOPPED, "error": why} for i in range(len(inputs)) if i not in done]
         rows.sort(key=lambda r: r["i"])
         wall = time.time() - t0
         # Chunks whose work is unaccounted for (lost worker, killed at the
@@ -879,9 +1100,13 @@ def map_fn(run_dir: str, fn_spec: str, inputs: list, backend: str = "auto",
                 led["calls"].append({"fn": fn_spec, "backend": backend, "task_core_s": round(used, 1),
                                      "stopped": f"interrupted: {type(e).__name__}", "ts": time.strftime("%FT%T")})
         raise
+    failed_by = {}
+    for r in rows:
+        if not r["ok"]:
+            failed_by[r.get("kind") or MODEL] = failed_by.get(r.get("kind") or MODEL, 0) + 1
     summary = {**{k: v for k, v in info.items() if k not in ("slots", "cores_per_slot")},
                "n": len(rows), "n_ok": sum(r["ok"] for r in rows),
-               "n_failed": sum(not r["ok"] for r in rows), "wall_s": round(wall, 1),
+               "n_failed": sum(not r["ok"] for r in rows), "failed_by_kind": failed_by, "wall_s": round(wall, 1),
                "task_core_s": round(core_s, 1), "estimated_core_s": round(est, 1),
                # what the model calls themselves took: a charge far above it points at
                # retried or unconfirmed chunks (see "chunks")
@@ -891,10 +1116,155 @@ def map_fn(run_dir: str, fn_spec: str, inputs: list, backend: str = "auto",
     with _LedgerLock(run_dir) as led:
         led["reservations"].pop(rid, None)
         led["core_seconds"] = round(led["core_seconds"] + core_s, 1)
-        led["calls"].append({k: summary.get(k) for k in ("backend", "workers", "n", "n_failed", "wall_s",
-                                                         "task_core_s", "estimated_core_s", "model_s", "stopped")}
+        led["calls"].append({k: summary.get(k) for k in ("backend", "workers", "n", "n_failed", "failed_by_kind",
+                                                         "wall_s", "task_core_s", "estimated_core_s", "model_s",
+                                                         "stopped", "breaks", "procs_final", "peak_mb")}
                             | {"fn": fn_spec, "ts": time.strftime("%FT%T")})
+        if summary.get("peak_mb"):
+            led.setdefault("mem_profile", {})[fn_spec] = {"peak_mb": summary["peak_mb"], "ts": time.strftime("%FT%T")}
     return rows, summary
+
+
+def input_key(params) -> str:
+    """Stable key of one parameter set (order of dict keys does not matter)."""
+    return hashlib.sha1(json.dumps(params, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def code_fingerprint(run_dir: str, fn_spec: str) -> str:
+    """What a result depends on besides its params: every .py under the run's
+    models/ (and the function's own file), and the run's data/ files by
+    path, size and mtime. Any change and earlier rows are not reused."""
+    run_dir = os.path.realpath(run_dir)
+    h = hashlib.sha256()
+    path = fn_spec.partition("::")[0]
+    fn_file = path if os.path.isabs(path) else os.path.join(run_dir, path)
+    files = {os.path.realpath(fn_file)}
+    for root, ext in ((os.path.join(run_dir, "models"), ".py"), (os.path.join(run_dir, "data"), None)):
+        for dp, dirs, fns in os.walk(root):
+            dirs[:] = sorted(d for d in dirs if d not in ("__pycache__", ".git", "_truth"))
+            for fn in fns:
+                if ext is None or fn.endswith(ext):
+                    files.add(os.path.join(dp, fn))
+    for f in sorted(files):
+        try:
+            st = os.stat(f)
+        except OSError:
+            continue
+        h.update(os.path.relpath(f, run_dir).encode() + b"\0")
+        if f.endswith(".py"):
+            h.update(open(f, "rb").read())
+        else:
+            h.update(f"{st.st_size}:{st.st_mtime_ns}".encode())
+        h.update(b"\0")
+    return h.hexdigest()[:20]
+
+
+def _reusable(out: str, fn_spec: str, fp: str) -> dict:
+    """key -> ok row from an earlier --out of the same function and code."""
+    try:
+        prev = json.load(open(out + ".summary.json"))
+        if prev.get("fn") != fn_spec or prev.get("code_fp") != fp:
+            return {}
+        rows = [json.loads(l) for l in open(out) if l.strip()]
+    except (OSError, ValueError):
+        return {}
+    return {r["key"]: r for r in rows if isinstance(r, dict) and r.get("ok") and r.get("key")}
+
+
+def run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dict], dict]:
+    """The CLI's `map`: rows of an earlier run of the same command (same
+    function, same code and data, same params) are kept and only the rest is
+    computed, so rerunning a stopped or partly failed batch completes it.
+    Writes --out and its summary; returns (rows, summary)."""
+    fp = code_fingerprint(run_dir, fn_spec)
+    keys = [input_key(p) for p in inputs]
+    old = {} if fresh else _reusable(out, fn_spec, fp)
+    todo = [k for k, key in enumerate(keys) if key not in old]
+    if todo:
+        new_rows, summary = map_fn(run_dir, fn_spec, [inputs[k] for k in todo], **kw)
+    else:
+        new_rows, summary = [], {"n": 0, "n_ok": 0, "n_failed": 0, "failed_by_kind": {}, "wall_s": 0.0,
+                                 "task_core_s": 0.0, "stopped": None}
+    by_pos = dict(zip(todo, new_rows))
+    rows = []
+    for k, key in enumerate(keys):
+        r = dict(by_pos[k]) if k in by_pos else {**old[key], "reused": True}
+        r["i"], r["key"] = k, key
+        rows.append(r)
+    failed_by = {}
+    for r in rows:
+        if not r["ok"]:
+            failed_by[r.get("kind") or MODEL] = failed_by.get(r.get("kind") or MODEL, 0) + 1
+    summary = {**summary, "n": len(rows), "n_ok": sum(r["ok"] for r in rows),
+               "n_failed": sum(not r["ok"] for r in rows), "failed_by_kind": failed_by,
+               "computed": len(todo), "reused": len(rows) - len(todo),
+               "fn": fn_spec, "code_fp": fp, "out": os.path.relpath(os.path.realpath(out), os.path.realpath(run_dir))}
+    tmp = out + ".tmp"
+    with open(tmp, "w") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+    os.replace(tmp, out)
+    json.dump(summary, open(out + ".summary.json.tmp", "w"), indent=1)
+    os.replace(out + ".summary.json.tmp", out + ".summary.json")
+    return rows, summary
+
+
+def gate_findings(run_dir: str) -> list[dict]:
+    """Phase 35: results files under models/ with rows that have no result.
+    A failed row counts as recovered when a newer results file of the same
+    function has an ok row for the same params. HIGH when more than 5% of a
+    file's rows are unrecovered, MEDIUM otherwise."""
+    import glob as _glob
+    found = []
+    for sp in _glob.glob(os.path.join(run_dir, "models", "**", "*.summary.json"), recursive=True):
+        try:
+            s = json.load(open(sp))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(s, dict) or "n_failed" not in s or "task_core_s" not in s:
+            continue                       # not a compute summary
+        out = sp[: -len(".summary.json")]
+        if not os.path.exists(out):
+            continue
+        try:
+            rows = [json.loads(l) for l in open(out) if l.strip()]
+        except (OSError, ValueError) as e:
+            found.append((out, s, None, f"unreadable ({e})"))
+            continue
+        found.append((out, s, rows, None))
+    ok_keys = {}                          # fn -> [(mtime, set of ok keys)]
+    for out, s, rows, _ in found:
+        if rows:
+            ok_keys.setdefault(s.get("fn"), []).append(
+                (os.path.getmtime(out), {r.get("key") for r in rows if r.get("ok") and r.get("key")}))
+    findings = []
+    for out, s, rows, bad in sorted(found, key=lambda x: x[0]):
+        rel = os.path.relpath(out, run_dir)
+        if bad:
+            findings.append({"kind": "compute_results_incomplete", "severity": "HIGH", "stage": "MODEL",
+                             "target_stage": "MODEL", "scope_declarable": True,
+                             "claim": f"{rel}: results file is {bad}; its rows cannot be checked."})
+            continue
+        mt = os.path.getmtime(out)
+        later = set().union(*[k for t, k in ok_keys.get(s.get("fn"), []) if t >= mt] or [set()])
+        failed = [r for r in rows if not r.get("ok")]
+        left = [r for r in failed if not (r.get("key") and r["key"] in later)]
+        if not left:
+            continue
+        kinds = {}
+        for r in left:
+            kinds[r.get("kind") or MODEL] = kinds.get(r.get("kind") or MODEL, 0) + 1
+        top = max(left, key=lambda r: sum(_err_key(x) == _err_key(r) for x in left))
+        share = len(left) / max(1, len(rows))
+        findings.append({
+            "kind": "compute_results_incomplete", "severity": "HIGH" if share > 0.05 else "MEDIUM",
+            "stage": "MODEL", "target_stage": "MODEL", "scope_declarable": True,
+            "claim": (f"{rel}: {len(left)} of {len(rows)} rows have no result "
+                      f"({', '.join(f'{v} {k}' for k, v in sorted(kinds.items()))}; e.g. {str(top.get('error'))[:160]}). "
+                      "Rerun the same compute.py map command: it computes only the missing rows, and machine "
+                      "failures are retried automatically. Rows failing in the model itself need a model fix, or "
+                      "an explicit exclusion justified in the write-up.")})
+    return findings
 
 
 def _read_inputs(path: str) -> list:
@@ -1018,8 +1388,8 @@ def _self_test() -> int:
                and any(r.get("error") == CAP_STOP for r in rows), f"C14 the cap stops a batch midway: {s}")
             os.environ["MA_COMPUTE_MAX_CORE_HOURS"] = "200"
             rows, s = map_fn(rd, "models/slow.py::die", [{}] * 2, backend="local", max_workers=1)
-            ok(s["n_failed"] == 2 and s["estimated_core_s"] > 0 and s["task_core_s"] > 0,
-               f"C15 a crashed chunk is still charged: {s}")
+            ok(s["n_failed"] == 2 and s["task_core_s"] > 0 and s["failed_by_kind"] == {"model": 2},
+               f"C15 a crashed process is still charged, and an input that kills its process alone is a model error: {s}")
         finally:
             del os.environ["MA_COMPUTE_MAX_CORE_HOURS"]
         bad = os.path.join(d, "badled"); os.makedirs(os.path.join(bad, "models"))
@@ -1341,6 +1711,35 @@ def _self_test() -> int:
                 got = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.stderr[-500:]
                 ok(got == json.dumps([{"y": 0.0}, {"y": 3.0}, {"y": 6.0}]),
                    f"C33 runs on a cluster that cannot import this module: {got}")
+                # P35-D: on the dask path a pool broken inside a chunk heals there, and
+                # a repeated model error stops the whole call.
+                open(os.path.join(d, "models", "p35d.py"), "w").write(
+                    "import os, time\n"
+                    "def f(p):\n"
+                    "    if p.get('crash') and os.environ.get('MA_COMPUTE_SELFTEST_ONCE') is None:\n"
+                    "        flag = os.path.join(p['dir'], str(p['x']))\n"
+                    "        if not os.path.exists(flag):\n"
+                    "            open(flag, 'w').close(); os._exit(9)\n"
+                    "    time.sleep(0.2)\n"
+                    "    return {'x': p['x']}\n"
+                    "def raises(p):\n    raise ValueError('diverged')\n")
+                flags = tempfile.mkdtemp(prefix="ma_p35d_")
+                code_d = ("import json, sys; sys.path.insert(0, %r); import compute; "
+                          "ins = [{'x': k, 'dir': %r, 'crash': k in (2, 9)} for k in range(12)]; "
+                          "rows, s = compute.map_fn(%r, 'models/p35d.py::f', ins, ledger=False, max_workers=1); "
+                          "r2, s2 = compute.map_fn(%r, 'models/p35d.py::raises', [{}] * 40, ledger=False, max_workers=1); "
+                          "print(json.dumps([s['n_failed'], [r['result']['x'] for r in rows if r['ok']], "
+                          "s2['stopped'] or '', s2['failed_by_kind']]))") % (HERE, flags, d, d)
+                r3 = _sp.run([sys.executable, "-c", code_d], capture_output=True, text=True, timeout=300,
+                             env=dict(os.environ, PYTHONPATH="", MA_COMPUTE_PROCS_PER_WORKER="2"))
+                try:
+                    nf, xs, stop2, kinds2 = json.loads(r3.stdout.strip().splitlines()[-1])
+                except (ValueError, IndexError):
+                    nf, xs, stop2, kinds2 = None, None, "", {}
+                ok(nf == 0 and xs == list(range(12)),
+                   f"P35-D1 a process death inside a dask chunk is healed in the chunk: {r3.stdout[-300:]} {r3.stderr[-300:]}")
+                ok("same model error" in stop2 and kinds2.get("stopped", 0) > 0,
+                   f"P35-D2 a repeated model error stops a dask call: {stop2} {kinds2}")
 
             except Exception:
                 print(open(os.path.join(iso, "sched.err")).read()[-3000:])
@@ -1351,11 +1750,111 @@ def _self_test() -> int:
                     pr.terminate()
                 for pr in procs_:
                     pr.wait(10)
+    _self_test_p35(ok)
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_p35(ok) -> None:
+    """Phase 35: a broken pool heals, memory sets concurrency, repeated model
+    errors stop a batch, reruns complete only missing rows, the gate sees gaps."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        d = os.path.realpath(d)
+        os.makedirs(os.path.join(d, "models"))
+        # "oom": an input with crash=True kills its process when 2+ run at once
+        # (a file per running input stands in for memory pressure); alone it is fine.
+        open(os.path.join(d, "models", "oom.py"), "w").write(
+            "import os, time, glob\n"
+            "def f(p):\n"
+            "    me = os.path.join(p['dir'], str(os.getpid()))\n"
+            "    open(me, 'w').close()\n"
+            "    try:\n"
+            "        time.sleep(0.3)\n"
+            "        def alive(f):\n"
+            "            try:\n                os.kill(int(os.path.basename(f)), 0); return True\n"
+            "            except OSError:\n                return False\n"
+            "        if p.get('crash') and sum(map(alive, glob.glob(os.path.join(p['dir'], '*')))) > 1:\n"
+            "            os._exit(9)\n"
+            "        return {'x': p['x']}\n"
+            "    finally:\n"
+            "        os.path.exists(me) and os.remove(me)\n"
+            "def always(p):\n    os._exit(9)\n"
+            "def raises(p):\n    raise ValueError(f\"no convergence at x={p['x']}\")\n"
+            "def some(p):\n    if p['x'] % 10 == 0:\n        raise ValueError('bad draw')\n    return {'x': p['x']}\n"
+            "def big(p):\n    b = bytearray(p['mb'] * 2**20)\n    return {'n': len(b)}\n")
+        busy = os.path.join(d, "busy"); os.makedirs(busy)
+        inputs = [{"x": k, "dir": busy, "crash": k in (3, 11)} for k in range(16)]
+        rows, s = map_fn(d, "models/oom.py::f", inputs, backend="local", max_workers=4)
+        ok(s["n_failed"] == 0 and [r["result"]["x"] for r in rows] == list(range(16)) and s["breaks"] >= 1
+           and s["procs_final"] < 4,
+           f"P35-1 a pool broken by one process reruns its in-flight inputs at lower concurrency, none lost: {s}")
+        rows, s = map_fn(d, "models/oom.py::always", [{"x": k} for k in range(3)], backend="local", max_workers=2)
+        ok(s["failed_by_kind"] == {"model": 3} and all("alone" in r["error"] for r in rows),
+           f"P35-2 an input that kills its process alone fails as a model error: {s}")
+        t0 = time.time()
+        rows, s = map_fn(d, "models/oom.py::raises", [{"x": k} for k in range(200)], backend="local", max_workers=2)
+        ok(s["stopped"] and "same model error" in s["stopped"] and s["failed_by_kind"].get("model", 0) < 40
+           and s["failed_by_kind"].get("stopped", 0) > 150 and time.time() - t0 < 30,
+           f"P35-3 a repeated model error stops the batch early: {s.get('stopped')} {s['failed_by_kind']}")
+        rows, s = map_fn(d, "models/oom.py::some", [{"x": k} for k in range(60)], backend="local", max_workers=2)
+        ok(not s["stopped"] and s["n_failed"] == 6, f"P35-4 a minority of failing draws does not trip the breaker: {s}")
+        rows, s = map_fn(d, "models/oom.py::big", [{"mb": 200}] * 4, backend="local", max_workers=4)
+        ok(s["peak_mb"] and s["peak_mb"] >= 200, f"P35-5 peak memory per process is measured: {s}")
+        ok(_mem_slots(5000, 64000, 8) == 8, "P35-6a ample memory keeps every core")
+        ok(_mem_slots(9000, 64000, 8) == 5 and _mem_slots(60000, 64000, 8) == 1 and _mem_slots(None, 64000, 8) == 8,
+           f"P35-6 concurrency fits the measured peak: {_mem_slots(9000, 64000, 8)}")
+        led = json.load(open(os.path.join(d, LEDGER_REL)))
+        ok((led.get("mem_profile") or {}).get("models/oom.py::big", {}).get("peak_mb", 0) >= 200,
+           f"P35-7 the ledger keeps each function's last peak as the next call's starting point: {led.get('mem_profile')}")
+        # resume: a partly failed batch rerun computes only the missing rows
+        open(os.path.join(d, "models", "flaky.py"), "w").write(
+            "import os\n"
+            "def f(p):\n"
+            "    if p['x'] in (2, 5) and os.path.exists(os.path.join(os.path.dirname(__file__), 'FAIL')):\n"
+            "        raise RuntimeError('transient')\n"
+            "    return {'y': p['x'] * 2}\n")
+        open(os.path.join(d, "models", "FAIL"), "w").close()
+        out = os.path.join(d, "models", "flaky_results.jsonl")
+        ins = [{"x": k} for k in range(8)]
+        rows, s = run_map(d, "models/flaky.py::f", ins, out, backend="local", max_workers=2)
+        ok(s["n_failed"] == 2 and s["computed"] == 8, f"P35-8 first run: two rows fail: {s}")
+        g = gate_findings(d)
+        ok(len(g) == 1 and g[0]["severity"] == "HIGH" and "2 of 8" in g[0]["claim"],
+           f"P35-9 the gate reports a results file with missing rows: {g}")
+        os.remove(os.path.join(d, "models", "FAIL"))
+        rows, s = run_map(d, "models/flaky.py::f", ins, out, backend="local", max_workers=2)
+        ok(s["n_failed"] == 0 and s["computed"] == 2 and s["reused"] == 6 and [r["result"]["y"] for r in rows]
+           == [0, 2, 4, 6, 8, 10, 12, 14], f"P35-10 a rerun computes only the missing rows: {s}")
+        ok(gate_findings(d) == [], f"P35-11 a completed file clears the gate: {gate_findings(d)}")
+        open(os.path.join(d, "models", "flaky.py"), "a").write("# changed\n")
+        rows, s = run_map(d, "models/flaky.py::f", ins, out, backend="local", max_workers=2)
+        ok(s["computed"] == 8, f"P35-12 changed model code: nothing is reused: {s}")
+        rows, s = run_map(d, "models/flaky.py::f", ins[::-1] + [{"x": 99}], out, backend="local", max_workers=2)
+        ok(s["computed"] == 1 and rows[0]["result"] == {"y": 14} and rows[0]["i"] == 0,
+           f"P35-13 reuse is by params, not position: {s}")
+        rows, s = run_map(d, "models/flaky.py::f", ins, out, fresh=True, backend="local", max_workers=2)
+        ok(s["computed"] == 8, f"P35-14 --fresh recomputes everything: {s}")
+        # a failed attempt file covered by a newer file of the same function
+        open(os.path.join(d, "models", "FAIL"), "w").close()
+        a1 = os.path.join(d, "models", "lib_attempt1.jsonl")
+        run_map(d, "models/flaky.py::f", ins, a1, backend="local", max_workers=2)
+        ok(any("lib_attempt1" in f["claim"] for f in gate_findings(d)), "P35-15 an attempt file with gaps is reported")
+        os.remove(os.path.join(d, "models", "FAIL"))
+        time.sleep(0.05)
+        run_map(d, "models/flaky.py::f", [ins[2], ins[5]], os.path.join(d, "models", "lib_retry.jsonl"),
+                backend="local", max_workers=2)
+        ok(not any("lib_attempt1" in f["claim"] for f in gate_findings(d)),
+           f"P35-16 failed rows recovered in a newer file of the same function are not reported: {gate_findings(d)}")
+        open(os.path.join(d, "models", "x.jsonl"), "w").write("{not json\n")
+        json.dump({"n_failed": 0, "task_core_s": 1}, open(os.path.join(d, "models", "x.jsonl.summary.json"), "w"))
+        ok(any("x.jsonl" in f["claim"] and f["severity"] == "HIGH" for f in gate_findings(d)),
+           "P35-17 an unreadable results file fails closed")
+        ok(_breaker([{"ok": False, "kind": INFRA, "error": "e"}] * 20) is None,
+           "P35-18 machine failures never trip the model-error breaker")
 
 
 def main() -> int:
@@ -1371,6 +1870,8 @@ def main() -> int:
     ap.add_argument("--timeout-s", type=float)
     ap.add_argument("--max-core-hours", type=float,
                     help="this call's allowance (default MA_COMPUTE_CALL_CORE_HOURS=50, within the run cap)")
+    ap.add_argument("--fresh", action="store_true",
+                    help="recompute every row (default: keep rows of an earlier run of the same command and code)")
     ap.add_argument("--no-ledger", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
@@ -1395,13 +1896,18 @@ def main() -> int:
         os.environ.pop(k, None)           # never inherited by the model's own subprocesses
     if a.cmd != "map" or not (a.run_dir and a.fn and a.inputs and a.out):
         ap.error("usage: compute.py map <run_dir> --fn <path.py>::<fn> --inputs <jsonl> --out <jsonl>")
-    rows, summary = map_fn(a.run_dir, a.fn, _read_inputs(a.inputs), a.backend, a.max_workers,
-                           a.max_tasks, a.timeout_s, ledger=not a.no_ledger, max_core_hours=a.max_core_hours)
-    with open(a.out, "w") as f:
-        for r in rows:
-            f.write(json.dumps(r) + "\n")
-    json.dump(summary, open(a.out + ".summary.json", "w"), indent=1)
-    print(json.dumps({k: v for k, v in summary.items() if k != "bundle"}))
+    if a.no_ledger:   # a remote chunk: plain map, no reuse (the caller already chose the rows)
+        rows, summary = map_fn(a.run_dir, a.fn, _read_inputs(a.inputs), a.backend, a.max_workers,
+                               a.max_tasks, a.timeout_s, ledger=False, max_core_hours=a.max_core_hours)
+        with open(a.out, "w") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+        json.dump(summary, open(a.out + ".summary.json", "w"), indent=1)
+    else:
+        rows, summary = run_map(a.run_dir, a.fn, _read_inputs(a.inputs), a.out, fresh=a.fresh,
+                                backend=a.backend, max_workers=a.max_workers, max_tasks=a.max_tasks,
+                                timeout_s=a.timeout_s, max_core_hours=a.max_core_hours)
+    print(json.dumps({k: v for k, v in summary.items() if k not in ("bundle", "chunks")}))
     return 0 if summary["n_failed"] == 0 else 1
 
 
