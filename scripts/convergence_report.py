@@ -110,9 +110,18 @@ def report(run_dir: str) -> dict:
     calls = led.get("calls") or []
     unrun = sum(int(c.get("n_failed") or 0) for c in calls if c.get("stopped"))
     total = sum(int(c.get("n") or 0) for c in calls)
+    # Phase 35: every failed row counts, not only rows of stopped calls (E7
+    # attempt 7: 1,544 of 1,920 rows failed in a call that was not stopped and
+    # the report showed an unrun share of 0.0).
+    failed = sum(int(c.get("n_failed") or 0) for c in calls)
+    by_kind = collections.Counter()
+    for c in calls:
+        by_kind.update(c.get("failed_by_kind") or {})
     out["compute"] = {"calls": len(calls), "core_hours": round(float(led.get("core_seconds") or 0) / 3600, 1),
                       "stopped_calls": sum(1 for c in calls if c.get("stopped")),
                       "unrun_share": round(unrun / total, 3) if total else None,
+                      "failed_share": round(failed / total, 3) if total else None,
+                      "failed_by_kind": dict(by_kind), "pool_breaks": sum(int(c.get("breaks") or 0) for c in calls),
                       "last_call": calls[-1].get("ts") if calls else None}
     bl = _json(os.path.join(run_dir, "budget_ledger.json"), {}) or {}
     out["spend_usd"] = bl.get("spent_usd")
@@ -133,7 +142,8 @@ def render(r: dict) -> str:
     lines.append("Refusals: " + (", ".join(f"{k} {v}" for k, v in r["refusals"].items()) or "none"))
     c = r["compute"]
     lines.append(f"Compute: {c['calls']} calls, {c['core_hours']} core-hours, {c['stopped_calls']} stopped, "
-                 f"unrun share {c['unrun_share']}, last call {c['last_call']}")
+                 f"unrun share {c['unrun_share']}, failed share {c['failed_share']} {c['failed_by_kind']}, "
+                 f"pool breaks healed {c['pool_breaks']}, last call {c['last_call']}")
     lines.append(f"Spend: ${r['spend_usd']} of ${r['cap_usd']}")
     return "\n".join(lines) + "\n"
 
@@ -180,7 +190,8 @@ def _self_test() -> int:
            and r["tests"]["passing_now"] == 1 and r["tests"]["regressed_now"] == 1 and r["tests"]["withdrawn"] == 1,
            f"CV3 tests by kind and state: {r['tests']}")
         ok(r["refusals"] == {"round plan": 1, "still working": 1}, f"CV4 refusals by hold: {r['refusals']}")
-        ok(r["compute"]["unrun_share"] == 0.2 and r["compute"]["core_hours"] == 2.0 and r["compute"]["stopped_calls"] == 1,
+        ok(r["compute"]["unrun_share"] == 0.2 and r["compute"]["core_hours"] == 2.0 and r["compute"]["stopped_calls"] == 1
+           and r["compute"]["failed_share"] == 0.2,
            f"CV5 compute: {r['compute']}")
         ok("r1 5" in render(r) and "Spend: $12.5 of $450" in render(r), "CV6 rendering")
         ok(report(os.path.join(d, "nope"))["gates"] == {}, "CV7 an empty or missing run reports nothing, not a crash")
