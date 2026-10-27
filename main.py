@@ -1576,7 +1576,8 @@ def _run_self_test() -> int:
                ("600", "1.5m", "-k 5 600", "--signal TERM 600", "-s TERM 10s", "--kill-after=5 --preserve-status 600")]
         _neg = [harness_scripts_run(f"timeout {o} python3 {_v}")[0] for o in
                 ("-k 5", "", "invalid", "--help 600", "-- -v 600", "600 X=1", "-k nonsense 600", "--signal 9x 600",
-                 "--signal NOTASIGNAL 600", "\u0661\u0660", "-k \u0661 600", "-s 99 600")]
+                 "--signal NOTASIGNAL 600", "\u0661\u0660", "-k \u0661 600", "-s 99 600", "-s \u017ftop 600",
+                 f"-s {__import__('signal').NSIG} 600")]
         ok(all(x == ["validate_critique_yaml.py"] for x in _tf)
            and harness_scripts_run(f"timeout -- 600 python3 {_v}")[0] == ["validate_critique_yaml.py"]
            and harness_scripts_run(f"timeout 1e2 python3 {_v}")[0] == ["validate_critique_yaml.py"]

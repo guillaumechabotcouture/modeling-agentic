@@ -95,8 +95,10 @@ class _Signals:
     @classmethod
     def fullmatch(cls, t: str) -> bool:
         t = str(t)
-        if re.fullmatch(r"[0-9]+", t, re.ASCII):
-            return 1 <= int(t) <= 64
+        if not t.isascii():          # GNU parses signal operands as ASCII only
+            return False
+        if re.fullmatch(r"[0-9]+", t):
+            return 1 <= int(t) < cls._sig.NSIG   # this platform's bound
         u = t.upper()
         return (u[3:] if u.startswith("SIG") else u) in cls.NAMES
 
