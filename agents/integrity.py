@@ -83,7 +83,26 @@ SCRIPT_PRODUCES: dict[str, tuple[str, ...]] = {
     "render_claims.py": ("report.md", "models/claims_ledger.yaml", "claims_ledger.yaml"),
 }
 _SCRIPTS_DIR = os.path.realpath(os.path.join(enforcement.REPO_ROOT, "scripts"))
-_WRAPPERS = {"nohup", "env", "time", "nice", "command", "exec", "sudo", "stdbuf", "timeout"}
+_WRAPPERS = {"nohup", "env", "time", "nice", "command", "exec", "sudo", "stdbuf"}
+_TIMEOUT_OPTS_WITH_ARG = {"-k", "--kill-after", "-s", "--signal"}
+_DURATION = re.compile(r"\d+(\.\d+)?[smhd]?")
+
+
+def _skip_timeout(toks: list[str]) -> list[str] | None:
+    """`timeout [OPTION] DURATION COMMAND...`: the command after timeout's own
+    options and its duration, or None when there is no valid duration (then
+    nothing after it runs as a command). Attempt-7 smoke: a critic ran the gate
+    as `timeout 600 python3 scripts/validate_critique_yaml.py ...`."""
+    j = 1
+    while j < len(toks) and toks[j].startswith("-"):
+        t = toks[j]
+        if t in _TIMEOUT_OPTS_WITH_ARG:
+            j += 2
+        else:
+            j += 1          # --preserve-status, --foreground, -v, --kill-after=5, --signal=TERM
+    if j >= len(toks) or not _DURATION.fullmatch(toks[j]):
+        return None
+    return toks[j + 1:]
 _CRITIQUE_PATTERNS = ("critique_*.yaml", "critique_*.md")
 # A tool whose PostToolUse never arrives (an error path) must not keep
 # sanctioning changes: intents expire (Bash's own timeout is 10 min).
@@ -129,9 +148,13 @@ def harness_scripts_run(command: str, cwd: str | None = None, _depth: int = 0
         except ValueError:
             continue
         while toks and (re.match(r"^\w+=", toks[0]) or os.path.basename(toks[0]) in _WRAPPERS
+                        or os.path.basename(toks[0]) == "timeout"
                         or re.fullmatch(r"-\w+|\d+[smh]?", toks[0])):
             if os.path.basename(toks[0]) == "nohup":
                 background = True
+            if os.path.basename(toks[0]) == "timeout":
+                toks = _skip_timeout(toks) or []
+                continue
             toks = toks[1:]
         if toks and os.path.basename(toks[0]) in _SHELLS and _depth < 3:
             # `nohup sh -c "python3 scripts/x.py …; echo DONE" &` (seen in E7):
