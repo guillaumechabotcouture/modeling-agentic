@@ -359,7 +359,6 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
     running, rows, stop, lost, pids, breaks, seen_peak = {}, [], None, 0, set(), 0, 0.0
     alone = {}                                     # input -> times its process died with the pool at one process
     shrink = False
-    pool_pids = set()                              # processes of the current pool
     # successes elsewhere in the batch (other dask chunks, rows reused on resume)
     prior_ok = int(prior_ok or 0) + int(os.environ.get("MA_COMPUTE_PRIOR_OK") or 0)
 
@@ -389,7 +388,7 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
             if shrink and not running:            # idle processes keep their memory: rebuild at the new size
                 ex.shutdown(wait=True)
                 _kill_groups(pids, grace_s=0, direct=False)
-                ex, shrink, pool_pids = new_pool(cap), False, set()
+                ex, shrink = new_pool(cap), False
                 rebudget()
             try:
                 while todo and len(running) < cap and not shrink:
@@ -397,8 +396,7 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
                     running[f] = (todo.pop(0), time.time())
             except BrokenProcessPool:             # a process died between a result and the next submission
                 broke = True
-            pool_pids |= set((getattr(ex, "_processes", None) or {}).keys())
-            pids |= pool_pids
+            pids |= set((getattr(ex, "_processes", None) or {}).keys())
             crashed = []
             if not broke:
                 left = None if deadline is None else max(0.0, deadline - time.time())
@@ -436,15 +434,9 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
                 breaks += 1
                 now = time.time()
                 live = set((getattr(ex, "_processes", None) or {}).keys())
-                # Their partial work is charged, not lost; less the dead pool's load time,
-                # which is counted from init_dir (it overlaps the first inputs' elapsed time).
-                loads = 0.0
-                for pid in pool_pids | live:
-                    try:
-                        loads += float(open(os.path.join(init_dir.name, str(pid))).read())
-                    except (OSError, ValueError):
-                        pass
-                progress["core_s"] += max(0.0, sum(now - t for _, t in crashed) - loads)
+                # Their partial work is charged in full, not lost. It may overlap load time
+                # also counted from init_dir: the ledger may overcharge, never undercharge.
+                progress["core_s"] += sum(now - t for _, t in crashed)
                 pids |= live
                 _kill_groups(live, grace_s=0.5)
                 ex.shutdown(wait=True, cancel_futures=True)
@@ -471,7 +463,7 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
                     todo = [it for it, _ in crashed] + todo
                     cap = max(1, cap // 2)
                 rebudget()
-                ex, shrink, pool_pids = new_pool(cap), False, set()
+                ex, shrink = new_pool(cap), False
             if seen_peak and _mem_slots(seen_peak, avail, n) < cap:
                 cap = _mem_slots(seen_peak, avail, n)
                 shrink = True                     # drain, then rebuild the pool at `cap` processes
@@ -958,7 +950,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                             continue
                         tail = [r for r in got["rows"] if r.get("kind") == STOPPED
                                 and str(r.get("error", "")).startswith("stopped: the same model error")]
-                        if tail and attempt == 0 and _breaker(rows + got["rows"], prior_ok=prior_ok) is None:
+                        if tail and attempt != TAIL and _breaker(rows + got["rows"], prior_ok=prior_ok) is None:
                             # The chunk saw only its own rows: the batch as a whole does not
                             # confirm the repeat, so its stopped inputs run again (once).
                             got["rows"] = [r for r in got["rows"] if r not in tail]
@@ -1306,7 +1298,8 @@ def run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dict
     function, same code and data, same params) are kept and only the rest is
     computed, so rerunning a stopped or partly failed batch completes it.
     Writes --out and its summary; returns (rows, summary)."""
-    fp = code_fingerprint(run_dir, fn_spec, exclude=(out, out + ".tmp"))
+    fp = code_fingerprint(run_dir, fn_spec, exclude=(out, out + ".tmp", out + ".summary.json",
+                                                     out + ".summary.json.tmp"))
     keys = input_keys(inputs)
     old = {} if fresh else _reusable(out, fn_spec, fp)
     todo = [k for k, key in enumerate(keys) if key not in old]
@@ -2100,6 +2093,10 @@ def _self_test_p35(ok) -> None:
         fpo = code_fingerprint(d, "models/draw.py::f")
         open(bo2, "w").write("2")
         ok(code_fingerprint(d, "models/draw.py::f") != fpo, "P35-34 every file under data/ counts, whatever its extension")
+        dres = os.path.join(d, "data", "res.jsonl")
+        run_map(d, "models/brk.py::f", [{"x": k} for k in range(5)], dres, backend="local", max_workers=1)
+        _r, s35 = run_map(d, "models/brk.py::f", [{"x": k} for k in range(5)], dres, backend="local", max_workers=1)
+        ok(s35["computed"] == 0, f"P35-35 a results file under data/ resumes (its own summary is not a dependency): {s35}")
         sd2 = os.path.join(d, "data", "sl")
         for nm, v in (("a", "1"), ("b", "2")):
             os.makedirs(os.path.join(sd2, nm), exist_ok=True)
