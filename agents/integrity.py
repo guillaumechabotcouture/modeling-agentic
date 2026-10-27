@@ -84,8 +84,24 @@ SCRIPT_PRODUCES: dict[str, tuple[str, ...]] = {
 }
 _SCRIPTS_DIR = os.path.realpath(os.path.join(enforcement.REPO_ROOT, "scripts"))
 _WRAPPERS = {"nohup", "env", "time", "nice", "command", "exec", "sudo", "stdbuf"}
-_DURATION = re.compile(r"(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?[smhd]?")
-_SIGNAL = re.compile(r"(SIG)?[A-Z][A-Z0-9]*|\d+")
+_DURATION = re.compile(r"([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?[smhd]?", re.ASCII)
+
+
+class _Signals:
+    """Signal names timeout accepts (with or without SIG, any case) and 1-64."""
+    import signal as _sig
+    NAMES = {n[3:] for n in dir(_sig) if n.startswith("SIG") and not n.startswith("SIG_")}
+
+    @classmethod
+    def fullmatch(cls, t: str) -> bool:
+        t = str(t)
+        if re.fullmatch(r"[0-9]+", t, re.ASCII):
+            return 1 <= int(t) <= 64
+        u = t.upper()
+        return (u[3:] if u.startswith("SIG") else u) in cls.NAMES
+
+
+_SIGNAL = _Signals
 
 
 def _skip_timeout(toks: list[str]) -> list[str] | None:
