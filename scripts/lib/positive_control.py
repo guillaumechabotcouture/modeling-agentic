@@ -438,14 +438,15 @@ def build(run_dir: str, round_n: int = 2) -> dict:
     # --- allocation, optimizer benchmark, universal coverage ---------------
     cands, funded = mod.allocate()
     by_name = {c["district"]: c for c in cands}
-    alloc_lines = ["district,package,allocated,cost,cases_averted,dalys_averted"]
+    alloc_lines = ["district,package,allocated,cost,cases_averted,dalys_averted,dalys_baseline"]
     for r in rows:
         c = by_name[r["district"]]
         on = r["district"] in funded
         alloc_lines.append(
             f"{r['district']},{'campaign' if on else 'none'},{on},"
             f"{c['cost'] if on else 0.0},{c['cases_averted'] if on else 0.0},"
-            f"{c['dalys_averted'] if on else 0.0}")
+            f"{c['dalys_averted'] if on else 0.0},"
+            f"{r['eligible_children'] * mod.incidence_per_child(r) * mod.DALYS_PER_CASE}")
     _w(run_dir, "models/allocation.csv", "\n".join(alloc_lines) + "\n")
     # Phase 38 β: the campaign's effect against no campaign, computed by the harness
     # from evaluate_unit on the funded districts and held to the trial efficacy.
@@ -455,11 +456,13 @@ def build(run_dir: str, round_n: int = 2) -> dict:
         "unit_fn": "models/model.py::evaluate_unit", "call_style": "dict",
         "allocation_csv": "models/allocation.csv", "unit_column": "district", "package_column": "package",
         "benefit_column": "dalys_averted", "units_csv": "models/units.csv", "package_input": "package",
-        "benefit_output": "dalys_averted", "burden_output": "dalys",
-        "effects": [{"id": "E1", "intervention": "vaccination campaign", "registry": "vaccine_efficacy",
-                     "trial_comparator": "unvaccinated (placebo arm)", "trial_use": 1.0, "comparator_id": "CF1",
-                     "comparator_delivers": "no campaign: no vaccination in the district",
-                     "on_package": "campaign", "off_package": "none", "model_use": mod.COVERAGE}]})
+        "benefit_output": "dalys_averted", "burden_output": "dalys", "comparator_package": "none",
+        "baseline_column": "dalys_baseline", "headline_claim": "dalys_det",
+        "packages": {"none": [], "campaign": ["vaccination"]},
+        "effects": [{"id": "E1", "intervention": "vaccination campaign", "component": "vaccination",
+                     "registry": "vaccine_efficacy", "trial_comparator": "unvaccinated (placebo arm)", "trial_use": 1.0,
+                     "comparator_id": "CF1", "comparator_delivers": "no campaign: no vaccination in the district",
+                     "model_use": mod.COVERAGE}]})
     spent = sum(by_name[d]["cost"] for d in funded)
     dalys = sum(by_name[d]["dalys_averted"] for d in funded)
     cases = sum(by_name[d]["cases_averted"] for d in funded)
@@ -662,6 +665,10 @@ def build(run_dir: str, round_n: int = 2) -> dict:
         {"id": "dalys_total", "claim_kind": "scalar", "units": "DALYs_per_year",
          "source_artifact": "uncertainty_report.yaml",
          "source_field": "scalar_outputs.total_dalys_averted.mean",
+         "causal_label": "MODEL_ESTIMATE", "confidence": "MEDIUM"},
+        {"id": "dalys_det", "claim_kind": "scalar", "units": "DALYs_per_year",
+         "source_artifact": "models/allocation.csv",
+         "source_field": "dalys_averted.sum() where allocated=True",
          "causal_label": "MODEL_ESTIMATE", "confidence": "MEDIUM"},
         {"id": "spend", "claim_kind": "currency", "units": "USD",
          "source_artifact": "models/allocation.csv",
