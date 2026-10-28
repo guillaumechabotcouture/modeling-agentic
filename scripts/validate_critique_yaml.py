@@ -1969,6 +1969,10 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None,
     # run), unless a newer file of the same function recovered them.
     violations += G(lambda rd: _load_sibling("compute").gate_findings(rd),
                     run_dir, check_name="compute_results")
+    # Phase 38 β: each intervention's effect against the primary comparator is
+    # held to the trial evidence for that comparison.
+    violations += G(lambda rd: _load_sibling("effect_concordance").gate_findings(rd),
+                    run_dir, check_name="effect_concordance")
     # Phase 34: done_when findings computed by the caller, added before the
     # escalation so their persistence counts (Codex review).
     violations += list(extra or [])
