@@ -119,7 +119,10 @@ def _enforcement():
 def _reserved_patterns() -> tuple[str, ...]:
     """Files another owner writes: the harness and gate scripts, the critics, this runner."""
     try:
-        outs = tuple(_enforcement().SCRIPT_OUTPUTS)
+        enf = _enforcement()
+        # Also the signed decision brief and the single-owner files (planner / lead):
+        # a harness pipeline run must not write them and mark them harness-written.
+        outs = tuple(enf.SCRIPT_OUTPUTS) + tuple(enf.SIGNED_FILES) + tuple(enf.OWNED_BY)
     except Exception:  # noqa: BLE001 — fail closed: the families we know
         outs = ("report.md", "metadata.json", "artifact_integrity.json", "final_gate.json", "*.yaml")
     return outs + ("critique_*.yaml", "critique_*.md", "fix_check_*.yaml", SPEC) + OWN_FILES
@@ -1178,6 +1181,10 @@ def _self_test() -> int:
     e3 = errs_of([dict(three[0], outputs=["models/pipeline_state.json"])])
     ok(all(any("owned elsewhere" in x for x in ee) for ee in (e, e2, e3)),
        f"PV10 outputs owned by the harness, gate or runner are refused: {e} {e2} {e3}")
+    e = [errs_of([dict(three[0], outputs=[o])]) for o in
+         ("decision_brief.yaml", "success_criteria.yaml", "round_plan.yaml", "brief_amendments.yaml")]
+    ok(all(any("owned elsewhere" in x for x in ee) for ee in e),
+       f"PV10b (real-check) the signed brief and single-owner files are refused as outputs: {e}")
     e = errs_of([{"id": "lib", "run": "compute: models/lib.py::f", "inputs": [], "outputs": ["models/r.jsonl"]}])
     ok(any("inputs_jsonl" in x for x in e) and any("purpose" in x for x in e),
        f"PV11 a compute step needs inputs_jsonl, out and purpose: {e}")
