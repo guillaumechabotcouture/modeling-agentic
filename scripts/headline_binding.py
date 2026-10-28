@@ -37,8 +37,10 @@ names propagate_uncertainty samples), then requires:
    `allocation_csv` to be the one the package choice is compared with;
 4. when uncertainty_report.yaml exists, that it was produced by this function
    from this code: propagate_uncertainty records the function and the sha256
-   of its source and of every run module it imports, so a report from
-   `--outcome-fn <another function>` or from code edited since fails.
+   of every Python file under models/ (and of any other run module it
+   imports), so a report from `--outcome-fn <another function>` or from code
+   edited since fails. Both run the code from source, never a cached .pyc.
+   Data or configuration files the model reads are not fingerprinted.
 
 A mismatch, a missing claim, an outcome_fn that raises or returns no dict, or
 an unreadable manifest/registry is HIGH `headline_binding_failed`, not
@@ -189,18 +191,20 @@ def evaluate(run_dir: str) -> tuple[list[str], dict]:
     params, why = _point_params(run_dir)
     if params is None:
         return errors + [f"cannot evaluate outcome_fn at the registry point estimates: {why}"], {}
-    try:
-        fn, fp = _load_fn(run_dir)
-    except Exception as e:  # noqa: BLE001 — fail closed
-        return errors + [f"cannot load {OUTCOME_FN_SPEC}: {type(e).__name__}: {str(e)[:200]}"], {}
+    # Load and run from source, never a cached .pyc, so the code run is the code hashed.
+    with _sibling("propagate_uncertainty").no_cached_bytecode():
+        try:
+            fn, fp = _load_fn(run_dir)
+        except Exception as e:  # noqa: BLE001 — fail closed
+            return errors + [f"cannot load {OUTCOME_FN_SPEC}: {type(e).__name__}: {str(e)[:200]}"], {}
+        try:
+            res = fn(dict(params))
+        except Exception as e:  # noqa: BLE001 — fail closed
+            return errors + [f"outcome_fn raised at the registry point estimates: {type(e).__name__}: "
+                             f"{str(e)[:200]}"], {}
     why_uq = _uq_mismatch(run_dir, fp)
     if why_uq:
         errors.append(why_uq)
-    try:
-        res = fn(dict(params))
-    except Exception as e:  # noqa: BLE001 — fail closed
-        return errors + [f"outcome_fn raised at the registry point estimates: {type(e).__name__}: "
-                         f"{str(e)[:200]}"], {}
     if not isinstance(res, dict):
         return errors + [f"outcome_fn returned {type(res).__name__}, not a dict"], {}
     info: dict = {"params": params, "outputs": {}, "claims": {}}
@@ -412,6 +416,30 @@ def _self_test() -> int:
         f = gate_findings(d)
         ok(any("was produced by models/decoy.py" in x["claim"] for x in f),
            f"HB18 a report from `--outcome-fn <another function>` fails: {f}")
+        # A module imported lazily, inside the function, is fingerprinted too.
+        fn(_HONEST.replace("    e, c =", "    import helper\n    e, c =").replace("0.1 * e", "helper.SCALE * e"))
+        report()
+        ok(gate_findings(d) == [], f"HB20 a lazily imported module: the honest report passes: {gate_findings(d)}")
+        open(os.path.join(d, "models", "helper.py"), "w").write("SCALE = 0.2  # edited\n")
+        ok(any("changed since" in x["claim"] for x in gate_findings(d)),
+           "HB20b (Codex) a lazily imported module edited after the report fails")
+        open(os.path.join(d, "models", "helper.py"), "w").write("SCALE = 0.1\n")
+        # A stale .pyc (same size, same mtime) is not what runs: the source is.
+        sys.dont_write_bytecode = False
+        hp = os.path.join(d, "models", "helper.py")
+        open(hp, "w").write("SCALE = 0.9\n")
+        st = os.stat(hp)
+        sys.modules.pop("helper", None)
+        sys.path.insert(0, os.path.join(d, "models"))
+        import importlib
+        importlib.import_module("helper")          # writes a .pyc of SCALE = 0.9
+        sys.modules.pop("helper", None)
+        open(hp, "w").write("SCALE = 0.1\n")
+        os.utime(hp, ns=(st.st_atime_ns, st.st_mtime_ns))   # the cache now looks current
+        sys.dont_write_bytecode = True
+        report()
+        ok(gate_findings(d) == [], f"HB21 (Codex) a stale .pyc is not executed in place of the source: "
+                                   f"{gate_findings(d)}")
         yaml.safe_dump({"producer": "scripts/propagate_uncertainty.py"}, open(uq, "w"))
         ok(any("does not record which outcome_fn" in x["claim"] for x in gate_findings(d)),
            "HB19 a report without the fingerprint fails closed")
