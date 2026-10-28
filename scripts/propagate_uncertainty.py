@@ -237,6 +237,33 @@ def load_outcome_fn(run_dir: str, spec: Optional[str]) -> Callable[[dict], dict]
     return fn
 
 
+def load_outcome_fn_fingerprinted(run_dir: str, spec: Optional[str]):
+    """(fn, fingerprint). S2: the fingerprint names the function and hashes its
+    source file and every module under run_dir it imports at load time, so
+    scripts/headline_binding.py can check that the function it binds to the
+    report is the one that produced uncertainty_report.yaml. Modules already
+    imported from run_dir are dropped first so the imports are this run's."""
+    import hashlib
+    rd = os.path.realpath(run_dir)
+    under = lambda f: bool(f) and os.path.realpath(f).startswith(os.path.join(rd, ""))  # noqa: E731
+    for k, m in list(sys.modules.items()):
+        if under(getattr(m, "__file__", None)):
+            sys.modules.pop(k, None)
+    before = set(sys.modules)
+    fn = load_outcome_fn(run_dir, spec)
+    files = {os.path.realpath(sys.modules[k].__file__) for k in set(sys.modules) - before
+             if under(getattr(sys.modules[k], "__file__", None))}
+    rel, _, name = (spec or "models/outcome_fn.py::outcome_fn").partition("::")
+    src = os.path.join(run_dir, rel)
+    src = os.path.realpath(src if os.path.exists(src) else rel)   # load_outcome_fn's lookup
+    files.add(src)
+    sources = {}
+    for f in sorted(files):
+        with open(f, "rb") as fh:
+            sources[os.path.relpath(f, rd)] = hashlib.sha256(fh.read()).hexdigest()
+    return fn, {"file": os.path.relpath(src, rd), "function": name or "outcome_fn", "sources": sources}
+
+
 # ---------------------------------------------------------------------------
 # Propagation
 # ---------------------------------------------------------------------------
@@ -275,6 +302,13 @@ def propagate(run_dir: str, n_draws: int = 200, seed: int = 42,
             "section. UQ propagation requires at least one registered "
             "parameter with CI bounds. See the `effect-size-priors` skill."
         )
+
+    # S2: record which code produced the report (scripts/headline_binding.py
+    # checks it is the function bound to the report's headline).
+    try:
+        fp_fn, fingerprint = load_outcome_fn_fingerprinted(run_dir, outcome_fn_spec)
+    except Exception as e:  # noqa: BLE001 — the load below raises the usual error
+        fp_fn, fingerprint = None, {"error": f"{type(e).__name__}: {str(e)[:200]}"}
 
     rng = random.Random(seed)
     # Pre-sample all N draws per parameter. Independent priors — later
@@ -336,7 +370,7 @@ def propagate(run_dir: str, n_draws: int = 200, seed: int = 42,
                 {"_error": {"draw": r["i"], "exception": r.get("error", "").split(":")[0],
                             "message": r.get("error", "")[:200]}} for r in rows]
     else:
-        outcome_fn = load_outcome_fn(run_dir, outcome_fn_spec)
+        outcome_fn = fp_fn or load_outcome_fn(run_dir, outcome_fn_spec)
         outs = []
         for i, p in enumerate(params_list):
             try:
@@ -451,6 +485,7 @@ def propagate(run_dir: str, n_draws: int = 200, seed: int = 42,
     n_failed = len(errors)
     return {
         "producer": "scripts/propagate_uncertainty.py",
+        "outcome_fn_fingerprint": fingerprint,
         # Phase 21 δ: effort floors read these, not n_draws alone —
         # n_draws is what was requested; n_successful is what the CIs
         # are built from.

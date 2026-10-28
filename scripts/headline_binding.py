@@ -34,7 +34,11 @@ names propagate_uncertainty samples), then requires:
    package column in every row, with no choices for units the CSV lacks;
 3. when models/effect_concordance.yaml exists, its `headline_claim` (the claim
    the allocation is bound to) to be among the bound claims, and its
-   `allocation_csv` to be the one the package choice is compared with.
+   `allocation_csv` to be the one the package choice is compared with;
+4. when uncertainty_report.yaml exists, that it was produced by this function
+   from this code: propagate_uncertainty records the function and the sha256
+   of its source and of every run module it imports, so a report from
+   `--outcome-fn <another function>` or from code edited since fails.
 
 A mismatch, a missing claim, an outcome_fn that raises or returns no dict, or
 an unreadable manifest/registry is HIGH `headline_binding_failed`, not
@@ -100,14 +104,44 @@ def _point_params(run_dir: str) -> tuple[dict | None, str]:
 
 
 def _load_fn(run_dir: str):
-    """Load outcome_fn fresh from this run's models/ (no module cached from another run)."""
+    """(fn, fingerprint): outcome_fn loaded fresh from this run (no module cached
+    from another run), with the source hashes propagate_uncertainty records."""
     models = os.path.realpath(os.path.join(run_dir, "models"))
     for stem in {os.path.splitext(os.path.basename(p))[0] for p in glob.glob(os.path.join(models, "*.py"))}:
         sys.modules.pop(stem, None)
     if models in sys.path:
         sys.path.remove(models)
     sys.path.insert(0, models)
-    return _sibling("propagate_uncertainty").load_outcome_fn(run_dir, OUTCOME_FN_SPEC)
+    return _sibling("propagate_uncertainty").load_outcome_fn_fingerprinted(run_dir, OUTCOME_FN_SPEC)
+
+
+def _uq_mismatch(run_dir: str, fp: dict) -> str | None:
+    """Why uncertainty_report.yaml was not produced by this outcome_fn, or None.
+    No report yet: nothing to compare (the UQ check reports a missing report)."""
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    from lib.rigor_artifacts import produced_path
+    p = produced_path("outcome_fn", run_dir)
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p) as f:
+            doc = yaml.safe_load(f)
+    except (OSError, yaml.YAMLError) as e:
+        return f"uncertainty_report.yaml cannot be read ({type(e).__name__})"
+    rec = doc.get("outcome_fn_fingerprint") if isinstance(doc, dict) else None
+    if not isinstance(rec, dict) or not isinstance(rec.get("sources"), dict):
+        return ("uncertainty_report.yaml does not record which outcome_fn produced it; re-run "
+                "scripts/propagate_uncertainty.py so the binding can check it is this function")
+    if (rec.get("file"), rec.get("function")) != (fp["file"], fp["function"]):
+        return (f"uncertainty_report.yaml was produced by {rec.get('file')}::{rec.get('function')}, not "
+                f"{OUTCOME_FN_SPEC}: the intervals are not those of the function bound to the report")
+    if rec["sources"] != fp["sources"]:
+        changed = sorted(k for k in set(rec["sources"]) | set(fp["sources"])
+                         if rec["sources"].get(k) != fp["sources"].get(k))
+        return (f"outcome_fn's code changed since uncertainty_report.yaml was produced ({', '.join(changed[:5])}); "
+                "re-run scripts/propagate_uncertainty.py so the intervals are those of the bound function")
+    return None
 
 
 def _read_yaml(run_dir: str, rel: str):
@@ -156,9 +190,12 @@ def evaluate(run_dir: str) -> tuple[list[str], dict]:
     if params is None:
         return errors + [f"cannot evaluate outcome_fn at the registry point estimates: {why}"], {}
     try:
-        fn = _load_fn(run_dir)
+        fn, fp = _load_fn(run_dir)
     except Exception as e:  # noqa: BLE001 — fail closed
         return errors + [f"cannot load {OUTCOME_FN_SPEC}: {type(e).__name__}: {str(e)[:200]}"], {}
+    why_uq = _uq_mismatch(run_dir, fp)
+    if why_uq:
+        errors.append(why_uq)
     try:
         res = fn(dict(params))
     except Exception as e:  # noqa: BLE001 — fail closed
@@ -353,6 +390,32 @@ def _self_test() -> int:
         yaml.safe_dump({"outputs": {}}, open(os.path.join(d, PATH), "w"))
         ok(any("`outputs:`" in x["claim"] for x in gate_findings(d)), "HB14 an empty outputs map fails closed")
         put()
+        # The uncertainty report must come from this function and this code.
+        pu = _sibling("propagate_uncertainty")
+        uq = os.path.join(d, "uncertainty_report.yaml")
+
+        def report(spec="models/outcome_fn.py::outcome_fn"):
+            _fn, fp = pu.load_outcome_fn_fingerprinted(d, spec)
+            yaml.safe_dump({"producer": "scripts/propagate_uncertainty.py", "outcome_fn_fingerprint": fp},
+                           open(uq, "w"))
+        open(os.path.join(d, "models", "helper.py"), "w").write("SCALE = 0.1\n")
+        fn(_HONEST.replace("0.1 * e", "helper.SCALE * e").replace("POP =", "import helper\nPOP ="))
+        report()
+        ok(gate_findings(d) == [], f"HB16 a report from this function and code passes: {gate_findings(d)}")
+        open(os.path.join(d, "models", "helper.py"), "w").write("SCALE = 0.1  # edited\n")
+        f = gate_findings(d)
+        ok(any("changed since" in x["claim"] and "helper.py" in x["claim"] for x in f),
+           f"HB17 an imported module edited after the report fails: {f}")
+        open(os.path.join(d, "models", "decoy.py"), "w").write(
+            "def outcome_fn(params):\n    return {'dalys': params['efficacy'] * 1e6}\n")
+        report("models/decoy.py::outcome_fn")
+        f = gate_findings(d)
+        ok(any("was produced by models/decoy.py" in x["claim"] for x in f),
+           f"HB18 a report from `--outcome-fn <another function>` fails: {f}")
+        yaml.safe_dump({"producer": "scripts/propagate_uncertainty.py"}, open(uq, "w"))
+        ok(any("does not record which outcome_fn" in x["claim"] for x in gate_findings(d)),
+           "HB19 a report without the fingerprint fails closed")
+        os.remove(uq)
         os.remove(os.path.join(d, "models", "outcome_fn.py"))
         ok(any("cannot load" in x["claim"] for x in gate_findings(d)), "HB15 a missing outcome_fn fails closed")
     if fails:
