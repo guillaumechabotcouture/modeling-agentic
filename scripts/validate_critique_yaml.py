@@ -497,6 +497,8 @@ def _recompute_action(d: dict, max_rounds: int, current_round: int,
     functions (and the copies had drifted). Rules:
 
       1  structural mismatch            → RETHINK_STRUCTURAL / RUN_FAILED
+      3a every outstanding item declared at this gate and the last,
+         none from a critic, all declarable → DECLARE_SCOPE (rounds left)
       2  HIGH or accept-blocker, rounds → PATCH_OR_RETHINK
       5  exhausted, any non-declarable  → RUN_FAILED
       3  exhausted, all declarable      → DECLARE_SCOPE
@@ -531,6 +533,18 @@ def _recompute_action(d: dict, max_rounds: int, current_round: int,
                 f"not answer the question. Do NOT spawn writer."
             )
         rule_matched = 1
+    elif outstanding and rounds_remaining > 0 and _declared_early(outstanding, d):
+        # Phase 39: a run whose only outstanding items are gate findings it
+        # declared (with a justification) at this gate and the previous one
+        # finishes now. E7 attempt 7 carried three such findings (two locked
+        # benchmarks, an unstable sensitivity result) through every round, so it
+        # could not finish before the last round however its modeling went.
+        action = "DECLARE_SCOPE"
+        rationale = (
+            f"{len(outstanding)} outstanding item(s), all declared in scope_declaration.yaml at this gate "
+            f"and the previous one, none from a critic; {rounds_remaining} round(s) left are not needed. "
+            f"Write the report with each declaration verbatim in Limitations. DECLARE_SCOPE is NOT ACCEPT.")
+        rule_matched = "3a"
     elif outstanding and rounds_remaining > 0:
         action = "PATCH_OR_RETHINK"
         parts = []
@@ -574,6 +588,61 @@ def _recompute_action(d: dict, max_rounds: int, current_round: int,
     d["rule_matched"] = rule_matched
     d["rationale"] = rationale
     return d
+
+
+# Gate kinds that carry a critic's finding under another name: never declared away early.
+_CRITIC_DERIVED_PREFIXES = ("done_when_", "critique_", "claim_overclaimed", "sufficiency", "crossmodel")
+
+
+def _declared_early(outstanding: list[dict], d: dict) -> bool:
+    """Phase 39 rule 3a: every outstanding item is a declarable gate finding
+    that scope_declaration.yaml declares, by kind, now and at the previous
+    gate. Never with a required artifact missing, a critic's blocker, or a
+    critic's finding carried under a gate kind (persistence escalation, a
+    regressed or unmet finding test, the sufficiency critic). Gate ids
+    (RIG-001...) are renumbered every run, so only the kind is matched."""
+    now, prev = set(d.get("declared") or ()), set(d.get("declared_prev") or ())
+    if not now or not prev or d.get("accept_blockers"):
+        return False
+    for b in outstanding:
+        kind = str(b.get("kind") or "")
+        if (kind.endswith("_persistent") or kind.startswith(_CRITIC_DERIVED_PREFIXES)
+                or str(b.get("source") or b.get("reviewer") or "").startswith("critique")):
+            return False
+        if is_non_declarable(kind, b.get("scope_declarable")):
+            return False
+        if not (kind in now and kind in prev):
+            return False
+    return True
+
+
+def _declared_ids(run_dir: str) -> list[str]:
+    """Blocker ids / finding kinds that scope_declaration.yaml declares with a
+    justification (structured fields only: prose mentions do not declare)."""
+    _doc, entries, _f = _load_scope_declarations(run_dir)
+    out: set[str] = set()
+    for e in entries:
+        if _entry_has_justification(e):
+            out |= _entry_declared_ids(e, structured_only=True)
+    return sorted(out)
+
+
+def _previous_declared(run_dir: str, current_round: int) -> list[str]:
+    """What the last in-round gate before this round recorded as declared."""
+    prev = None
+    try:
+        with open(os.path.join(run_dir, _VALIDATOR_HISTORY_FILE), encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if (isinstance(rec, dict) and not rec.get("post_write") and isinstance(rec.get("round"), int)
+                        and rec["round"] < current_round):
+                    prev = rec
+    except OSError:
+        return []
+    return list((prev or {}).get("declared") or [])
 
 
 def _load_optional_critique(run_dir: str, reviewer: str,
@@ -3528,6 +3597,7 @@ def _append_validator_history(run_dir: str, round_n: int, decision: dict,
         "post_write": post_write,
         "at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
         "action": decision.get("action"),
+        "declared": list(decision.get("declared") or []),
         "findings": [{"kind": v.get("kind"), "severity": v.get("severity"),
                       "stage": v.get("stage")}
                      for v in (decision.get("rigor_violations") or [])],
@@ -5716,6 +5786,53 @@ def _run_self_test() -> int:
     def ok(cond: bool, label: str) -> None:
         if not cond:
             failures.append(label)
+
+    # --- Phase 39: early DECLARE_SCOPE when only long-declared gate findings remain ---
+    bd = {"kind": "benchmark_drift", "id": "RIG-001", "severity": "HIGH", "scope_declarable": True}
+    sa = {"kind": "sensitivity_analysis_unstable", "id": "RIG-002", "severity": "HIGH", "scope_declarable": True}
+    cb = {"kind": "critique_blocker", "id": "D-014", "severity": "HIGH", "scope_declarable": True}
+    both = ["benchmark_drift", "sensitivity_analysis_unstable"]
+
+    def act(items, now, prev, cur=5):
+        return _recompute_action({"unresolved_high": items, "declared": now, "declared_prev": prev}, 8, cur)
+    r = act([bd, sa], both, both)
+    ok(r["action"] == "DECLARE_SCOPE" and r["rule_matched"] == "3a",
+       f"EF1 only gate findings declared at this gate and the last: finish now ({r['action']})")
+    ok(act([bd, sa], both, ["benchmark_drift"])["action"] == "PATCH_OR_RETHINK",
+       "EF2 a declaration new at this gate waits one round")
+    ok(act([bd, sa, cb], both + ["D-014"], both + ["D-014"])["action"] == "PATCH_OR_RETHINK",
+       "EF3 a critic's blocker is never declared away early")
+    ok(act([bd, {**sa, "kind": "P-007_persistent"}], both + ["P-007_persistent"],
+           both + ["P-007_persistent"])["action"] == "PATCH_OR_RETHINK",
+       "EF4 a critic finding escalated for persistence is not declared away early")
+    ok(act([bd, {**sa, "scope_declarable": False}], both, both)["action"] == "PATCH_OR_RETHINK",
+       "EF5 a non-declarable finding blocks the early finish")
+    ok(act([], both, both)["action"] == "ACCEPT", "EF6 nothing outstanding is still ACCEPT")
+    for k in ("done_when_regressed", "claim_overclaimed", "done_when_unmet"):
+        ok(act([bd, {**sa, "kind": k}], both + [k], both + [k])["action"] == "PATCH_OR_RETHINK",
+           f"EF10 (Codex) a critic finding carried as {k} is not declared away early")
+    ok(_recompute_action({"unresolved_high": [bd], "accept_blockers": [{"kind": "required_artifact_missing",
+                          "scope_declarable": True}], "declared": both + ["required_artifact_missing"],
+                          "declared_prev": both + ["required_artifact_missing"]}, 8, 5)["action"] == "PATCH_OR_RETHINK",
+       "EF11 (Codex) no early finish while a required artifact is missing")
+    ok(act([{**bd, "kind": "benchmark_computed_missing", "id": "RIG-001"}], ["RIG-001"], ["RIG-001"])["action"]
+       == "PATCH_OR_RETHINK", "EF12 (Codex) renumbered gate ids never match a declaration; only kinds do")
+    ok(act([bd, sa], both, both, cur=8)["action"] == "DECLARE_SCOPE" and act([bd, sa], both, both, cur=8)["rule_matched"] == 3,
+       "EF7 in the last round the existing rule 3 applies")
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, _VALIDATOR_HISTORY_FILE), "w") as f:
+            f.write(json.dumps({"round": 3, "action": "PATCH_OR_RETHINK", "declared": ["a"]}) + "\n")
+            f.write(json.dumps({"round": 4, "action": "PATCH_OR_RETHINK", "declared": ["a", "b"]}) + "\n")
+            f.write(json.dumps({"round": 4, "post_write": True, "declared": []}) + "\n")
+            f.write(json.dumps({"round": 5, "action": "PATCH_OR_RETHINK", "declared": ["z"]}) + "\n")
+        ok(_previous_declared(d, 5) == ["a", "b"], f"EF8 the last in-round gate before this round: {_previous_declared(d, 5)}")
+        yaml.safe_dump({"declarations": [
+            {"id": "SD-1", "blocker_id": "benchmark_drift", "why_unresolved": "locked target"},
+            {"id": "SD-2", "blocker_id": "sensitivity_analysis_unstable"},
+            {"id": "SD-3", "claim": "mentions benchmark_computed_missing and R-021 in prose only"}]},
+            open(os.path.join(d, "scope_declaration.yaml"), "w"))
+        ok(_declared_ids(d) == ["benchmark_drift"],
+           f"EF9 only structured, justified declarations count: {_declared_ids(d)}")
 
     # --- Phase 4 Commit α: zero-width CI detector ---
     with tempfile.TemporaryDirectory() as d:
@@ -9233,6 +9350,9 @@ def main() -> int:
         return 3
 
     decision = decide(critiques, args.max_rounds, args.current_round)
+    # Phase 39: what is declared now and at the previous gate (rule 3a).
+    decision["declared"] = _declared_ids(args.run_dir)
+    decision["declared_prev"] = _previous_declared(args.run_dir, args.current_round)
     decision = _apply_brief_scope(decision, critiques, args.run_dir,
                                   args.max_rounds, args.current_round)
     decision, dw_result = _apply_done_when(decision, critiques, args.run_dir, args.max_rounds,
