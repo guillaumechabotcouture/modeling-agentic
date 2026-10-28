@@ -988,8 +988,15 @@ The validator has already decided for you. Your job is to carry it out:
     `scope_declaration.yaml`. Do not spawn the same target_stage
     agent with the same fix instructions a fourth time.
 
-- **DECLARE_SCOPE**: HIGH blockers remain and rounds exhausted.
-  Before spawning the writer, you MUST write
+- **DECLARE_SCOPE**: HIGH blockers remain and rounds exhausted, or
+  (Phase 39) every outstanding item is a gate finding that
+  `scope_declaration.yaml` declared at this gate and the previous one,
+  with no critic blocker open: the remaining rounds would not change
+  them, so the run goes to the write-up now. Declare a gate finding as
+  soon as you know iteration cannot close it (a locked target you
+  believe is wrong, a real instability in the answer): it then stops
+  holding the run open one round later. Critic findings are never
+  declared away early. Before spawning the writer, you MUST write
   `{run_dir}/scope_declaration.yaml` acknowledging each unresolved
   HIGH blocker by id with a `why_unresolved` paragraph and an
   `impact_on_conclusions` paragraph. Then include in the writer spawn
@@ -1018,7 +1025,8 @@ You cannot:
   your spawn prompt).
 - ACCEPT while `unresolved_high` is non-empty.
 - DECLARE_SCOPE while `structural_mismatch` is true.
-- DECLARE_SCOPE while rounds remain.
+- DECLARE_SCOPE while rounds remain, unless the validator itself
+  returned it (rule 3a).
 - Overrule the validator's action with prose. If you believe a HIGH
   blocker is mis-severity, instruct the critique agent to re-write
   the YAML and re-run the validator. Do not paper over it.
@@ -1183,7 +1191,7 @@ sufficiency critic) run AFTER the STAGE 7 decision, so their HIGHs only
 count if the validator runs again. After all of them are done, re-run
 the full STAGE 7 validator command (same flags, same round number) and
 record it in progress.md under `## Final gate`. If the action is not
-ACCEPT (or DECLARE_SCOPE at rounds exhausted), treat it exactly like a
+ACCEPT (or DECLARE_SCOPE from the validator), treat it exactly like a
 STAGE 7 result: route the blockers to their target_stage and iterate
 while rounds remain. main.py also re-runs this gate itself when the
 session ends and records the result in metadata.json; a report without
@@ -1219,7 +1227,8 @@ than letting the report ship.
   diagnostics. Retry ONCE with adjusted instructions. If it fails again,
   log the failure in progress.md and continue to STAGE 6/7: the missing
   output will surface as blockers and the validator decides the action
-  (DECLARE_SCOPE is only available once rounds are exhausted).
+  (DECLARE_SCOPE comes only from the validator: at rounds exhausted, or
+  when only long-declared gate findings remain).
 - Never retry a failed agent more than once per round.
 """
 
