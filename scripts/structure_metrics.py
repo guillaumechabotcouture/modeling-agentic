@@ -80,9 +80,26 @@ def _defs(tree):
     (self-test fakes, closures) are not part of a file's surface."""
     for n in tree.body:
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            yield n
+            yield n.name, n
         elif isinstance(n, ast.ClassDef):
-            yield from (m for m in n.body if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)))
+            yield from ((f"{n.name}.{m.name}", m) for m in n.body if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)))
+
+
+def _parses_yaml(tree) -> bool:
+    """A call to yaml.safe_load / yaml.load / yaml.safe_load_all (not text that mentions one)."""
+    return any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+               and n.func.attr in ("safe_load", "load", "safe_load_all", "load_all")
+               and isinstance(n.func.value, ast.Name) and n.func.value.id == "yaml" for n in ast.walk(tree))
+
+
+def _imports_lib(tree) -> bool:
+    """An import of scripts/lib (`from lib ...`, `import lib.x`, `scripts.lib`), anywhere in the file."""
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ImportFrom) and n.module and (n.module == "lib" or n.module.startswith(("lib.", "scripts.lib"))):
+            return True
+        if isinstance(n, ast.Import) and any(a.name == "lib" or a.name.startswith(("lib.", "scripts.lib")) for a in n.names):
+            return True
+    return False
 
 
 def measure(files: dict[str, str], git_cwd: str | None = ".") -> dict:
@@ -101,24 +118,25 @@ def measure(files: dict[str, str], git_cwd: str | None = ".") -> dict:
             tree = ast.parse(src)
         except SyntaxError:
             continue
-        if any(isinstance(n, ast.FunctionDef) and n.name == "gate_findings" for n in tree.body):
+        if any(isinstance(n, ast.FunctionDef) and n.name == "gate_findings" and n.args.args
+               and n.args.args[0].arg == "run_dir" for n in tree.body):
             interface.append(path)
-        for node in _defs(tree):
+        for qual, node in _defs(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 h = _body_hash(node)
                 if h:
-                    by_hash.setdefault(h, set()).add((path, node.name))
+                    by_hash.setdefault(h, set()).add((path, qual))
                 if not node.name.startswith("__") and node.name not in ("main", "_self_test", "_run_self_test") \
-                        and node.name not in INTERFACE:
+                        and node.name not in INTERFACE and "." not in qual:
                     by_name.setdefault(node.name, set()).add(path)
         if a in ("scripts/", "scripts/lib/") and not path.endswith("__init__.py"):
             scripts.append(path)
             if "--self-test" in src:
                 tested.append(path)
             if a == "scripts/":
-                if "yaml.safe_load" in src or "yaml.load(" in src:
+                if _parses_yaml(tree):
                     own_yaml.append(path)
-                if "from lib" in src or "import lib." in src or "scripts.lib" in src:
+                if _imports_lib(tree):
                     lib_users.append(path)
     dups = sorted(([sorted(v) for v in by_hash.values() if len({p for p, _ in v}) > 1]), key=lambda g: -len(g))
     shared = sorted(((k, sorted(v)) for k, v in by_name.items() if len(v) >= 3), key=lambda kv: -len(kv[1]))
@@ -195,7 +213,7 @@ def _self_test() -> int:
     body = "    x = 1\n    y = 2\n    z = x + y\n    w = z * 2\n    return w\n"
     files = {
         "scripts/a.py": f'import yaml\nC = yaml.safe_load("a: 1")\ndef f(p):\n    """doc a"""\n{body}def main():\n    pass\n# --self-test\n',
-        "scripts/b.py": f"from lib import safe_io\ndef g(p):\n{body}def gate_findings(d):\n    return []\n"
+        "scripts/b.py": f"from lib import safe_io\ndef g(p):\n{body}def gate_findings(run_dir):\n    return []\n"
                         "def _self_test():\n    def boom():\n        pass\n",
         "scripts/c.py": "def tiny(p):\n    return p\n",
         "scripts/lib/x.py": "def h(q):\n" + body + "# --self-test\n",
@@ -211,6 +229,16 @@ def _self_test() -> int:
     ok(m["self_tested"] == round(2 / 4, 3), "SM4 self-test share over scripts/ and scripts/lib/")
     ok(m["big_files"] == [("agents/z.py", BIG + 1)], "SM5 a file over the size line is listed")
     ok(m["gate_interface"] == 1, "SM8 a module-level gate_findings counts as the check interface")
+    m3 = measure({"scripts/p.py": "# yaml.safe_load(x)\n# from lib import safe_io\nS = 'import lib.x'\n"
+                                  "def gate_findings(result):\n    return []\n",
+                  "scripts/q.py": "def f():\n    import yaml\n    from lib.safe_io import x\n    return yaml.safe_load('a')\n",
+                  "scripts/r.py": "class A:\n    def f(self):\n" + body.replace("    ", "        ") +
+                                  "class B:\n    def f(self):\n" + body.replace("    ", "        "),
+                  "scripts/s.py": "class C:\n    def f(self):\n" + body.replace("    ", "        ")}, git_cwd=None)
+    ok(m3["own_yaml"] == 1 and m3["lib_users"] == 1,
+       f"SM10 comments and strings are not YAML parsing or lib imports; a nested import is: {m3['own_yaml']} {m3['lib_users']}")
+    ok(m3["gate_interface"] == 0, "SM11 gate_findings(result) is not the gate_findings(run_dir) interface")
+    ok(m3["duplicate_fns"]["copies"] == 3, f"SM12 same-named methods in two classes of one file are two copies: {m3['duplicate_fns']}")
     m2 = measure({**files, "scripts/d.py": "def _self_test():\n    def boom():\n        pass\n",
                   "scripts/e.py": "def _self_test():\n    def boom():\n        pass\n"}, git_cwd=None)
     ok(m2["shared_names"]["count"] == 0, f"SM9 nested self-test fakes are not shared helpers: {m2['shared_names']}")

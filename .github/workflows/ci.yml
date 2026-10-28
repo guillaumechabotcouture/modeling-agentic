@@ -61,5 +61,6 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          git fetch -q origin main
-          python3 scripts/structure_metrics.py --ref origin/main --against HEAD | tee -a "$GITHUB_STEP_SUMMARY"
+          # HEAD is the PR's merge commit (or the pushed main commit): its first
+          # parent is the base it was built on, which a later merge to main does not move.
+          python3 scripts/structure_metrics.py --ref HEAD^1 --against HEAD | tee -a "$GITHUB_STEP_SUMMARY"
