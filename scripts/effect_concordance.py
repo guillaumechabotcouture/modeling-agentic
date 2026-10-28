@@ -17,12 +17,20 @@ fix was a cap added after the library had been run. The modeler writes
         intervention: "<package component>"
         registry: <name in the citations.md Parameter Registry>   # trial effect, with its CI
         trial_comparator: "<what the trial's control arm received>"
-        trial_use: 0.8          # use / coverage in the trial's intervention arm (default 1)
+        trial_use: 0.8          # use / coverage in the trial's intervention arm (required)
         comparator_id: CF1      # decision-brief comparator the model effect is measured against
         comparator_delivers: "<what CF1 already delivers in these units, for this intervention>"
         units: "<the units and period measured, e.g. units receiving only this component, covered season>"
         model_ratio: 0.62       # outcome under the plan / outcome under the comparator, in those units
-        model_use: 0.63         # use / coverage the model attains there
+        model_use: 0.63         # use / coverage the model attains there (required)
+    not_bounding:               # every other trial-effect registry entry, with why it bounds no allocated effect
+      - {registry: <name>, reason: "<e.g. a hut-trial mortality input to the mechanism; not allocated>"}
+
+Every registry entry whose kind is a trial effect (relative risk, rate ratio,
+hazard ratio, ratio, efficacy, odds ratio) is either checked under `effects`
+or listed under `not_bounding` with a reason, so an allocated intervention
+cannot be left out. Effects are measured against the brief's primary
+comparator.
 
 The registry effect must be the trial comparison that matches what the
 comparator already delivers (e.g. a new product against the product the
@@ -46,6 +54,7 @@ PATH = os.path.join("models", "effect_concordance.yaml")
 TOL = 0.10
 RATIO_KINDS = ("relative_risk", "incidence_rate_ratio", "hazard_ratio", "ratio")
 REDUCTION_KINDS = ("efficacy",)
+TRIAL_KINDS = RATIO_KINDS + REDUCTION_KINDS + ("odds_ratio",)
 
 
 def _max_reduction(entry):
@@ -67,7 +76,7 @@ def _max_reduction(entry):
     return None, (f"has kind {kind or '(none)'}; the trial effect must be one of "
                   f"{', '.join(RATIO_KINDS + REDUCTION_KINDS)}")
 _REQ = ("id", "intervention", "registry", "trial_comparator", "comparator_id", "comparator_delivers", "units",
-        "model_ratio")
+        "model_ratio", "model_use", "trial_use")
 
 
 def _registry(run_dir: str) -> dict:
@@ -81,7 +90,9 @@ def _registry(run_dir: str) -> dict:
 
 
 def _comparator_ids(run_dir: str) -> set[str] | None:
-    """CF ids of the decision brief, or None when the brief has none (older runs)."""
+    """The decision brief's primary CF id(s), or None when the brief has no
+    comparators (older runs). Effects are measured against the primary: a
+    sensitivity comparator (e.g. "nothing delivered") is the lenient one."""
     try:
         doc = yaml.safe_load(open(os.path.join(run_dir, "decision_brief.yaml"))) or {}
     except (OSError, yaml.YAMLError):
@@ -89,7 +100,7 @@ def _comparator_ids(run_dir: str) -> set[str] | None:
     cfs = doc.get("comparators") if isinstance(doc, dict) else None
     if not isinstance(cfs, list) or not cfs:
         return None
-    return {str(c.get("id")) for c in cfs if isinstance(c, dict)}
+    return {str(c.get("id")) for c in cfs if isinstance(c, dict) and c.get("role") == "primary"}
 
 
 def _num(x):
@@ -109,6 +120,20 @@ def evaluate(run_dir: str) -> tuple[list[dict], list[str]]:
     if not isinstance(effects, list) or not effects:
         return [], [f"{PATH}: expected a non-empty `effects:` list"]
     reg, cfs, rows, errors = _registry(run_dir), _comparator_ids(run_dir), [], []
+    listed = {str(e.get("registry")) for e in effects if isinstance(e, dict)}
+    nb = doc.get("not_bounding") or []
+    if not isinstance(nb, list):
+        errors.append(f"{PATH}: `not_bounding:` must be a list")
+        nb = []
+    for x in nb:
+        if not isinstance(x, dict) or not str(x.get("registry") or "").strip() or len(str(x.get("reason") or "").strip()) < 10:
+            errors.append(f"{PATH}: each not_bounding entry needs `registry` and a `reason`")
+            continue
+        listed.add(str(x["registry"]))
+    unlisted = sorted(n for n, r in reg.items() if str(r.get("kind") or "") in TRIAL_KINDS and n not in listed)
+    if unlisted:
+        errors.append(f"{PATH}: trial-effect registry entries neither checked under `effects` nor listed under "
+                      f"`not_bounding` with a reason: {', '.join(unlisted)}")
     for e in effects:
         if not isinstance(e, dict):
             errors.append(f"{PATH}: an entry is not a mapping")
@@ -119,8 +144,8 @@ def evaluate(run_dir: str) -> tuple[list[dict], list[str]]:
             errors.append(f"{eid}: missing {', '.join(missing)}")
             continue
         if cfs is not None and str(e["comparator_id"]) not in cfs:
-            errors.append(f"{eid}: comparator_id {e['comparator_id']} is not a decision-brief comparator "
-                          f"({', '.join(sorted(cfs))})")
+            errors.append(f"{eid}: comparator_id {e['comparator_id']} is not the decision brief's primary "
+                          f"comparator ({', '.join(sorted(cfs)) or 'none marked primary'})")
             continue
         r = reg.get(str(e["registry"]))
         if r is None:
@@ -130,7 +155,7 @@ def evaluate(run_dir: str) -> tuple[list[dict], list[str]]:
         if trial_max is None:
             errors.append(f"{eid}: registry entry {e['registry']} {trial_point}")
             continue
-        mr, mu, tu = _num(e.get("model_ratio")), _num(e.get("model_use", 1.0)), _num(e.get("trial_use", 1.0))
+        mr, mu, tu = _num(e.get("model_ratio")), _num(e.get("model_use")), _num(e.get("trial_use"))
         if mr is None or mr <= 0 or mu is None or not 0 < mu <= 1 or tu is None or not 0 < tu <= 1:
             errors.append(f"{eid}: model_ratio must be > 0 and model_use, trial_use in (0, 1]")
             continue
@@ -190,9 +215,14 @@ def _self_test() -> int:
                 "trial_comparator": "old nets", "comparator_id": "CF1", "comparator_delivers": "old nets at 2023 use",
                 "units": "new-net-only units, covered season", "trial_use": 0.9}
 
-        def put(*effects):
-            yaml.safe_dump({"effects": list(effects)}, open(os.path.join(d, PATH), "w"))
         # E7 attempt 7, R-021: 0.168 (83% reduction) at use 0.63 vs a trial bound of 55% x 0.63/0.9 = 38.5%.
+        def put(*effects, nb=(("bad_ratio", "a count, not an effect"), ("vx_eff", "not in this package"),
+                              ("newnet_vs_oldnet_irr", "not in this package"),
+                              ("or_eff", "odds ratio kept for reference"))):
+            yaml.safe_dump({"effects": list(effects), "not_bounding": [{"registry": n, "reason": r} for n, r in nb
+                                                                        if n not in {e.get("registry") for e in effects}]},
+                           open(os.path.join(d, PATH), "w"))
+        base["model_use"] = 0.63
         put({**base, "model_ratio": 0.168, "model_use": 0.63})
         f = gate_findings(d)
         ok(len(f) == 1 and f[0]["kind"] == "effect_exceeds_trial_evidence" and "83%" in f[0]["claim"]
@@ -223,6 +253,18 @@ def _self_test() -> int:
            f"EC10 an efficacy is bounded by its upper CI, scaled to use: {f}")
         put({**base, "registry": "or_eff", "model_ratio": 0.9})
         ok("odds ratio" in gate_findings(d)[0]["claim"], "EC11 an odds ratio must be converted first")
+        put({**base, "model_ratio": 0.9}, nb=())
+        ok(any("neither checked" in x["claim"] and "vx_eff" in x["claim"] for x in gate_findings(d)),
+           "EC12 (Codex P1) a trial-effect registry entry left out of the file fails closed")
+        yaml.safe_dump({"comparators": [{"id": "CF1", "role": "primary", "text": "old nets kept"},
+                                        {"id": "CF2", "role": "sensitivity", "text": "no nets"}]},
+                       open(os.path.join(d, "decision_brief.yaml"), "w"))
+        put({**base, "comparator_id": "CF2", "model_ratio": 0.9})
+        ok(any("primary" in x["claim"] for x in gate_findings(d)),
+           "EC13 (Codex P1) a sensitivity comparator cannot replace the primary")
+        put({k: v for k, v in base.items() if k != "model_use"} | {"model_ratio": 0.45})
+        ok(any("missing model_use" in x["claim"] for x in gate_findings(d)),
+           "EC14 (Codex P1) attained use is required, not defaulted to 1")
         os.remove(os.path.join(d, "decision_brief.yaml"))
         put({**base, "comparator_id": "CF7", "model_ratio": 0.66, "model_use": 0.63})
         ok(gate_findings(d) == [], "EC9 a run whose brief has no comparators does not check the comparator id")

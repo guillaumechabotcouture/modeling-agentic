@@ -131,7 +131,15 @@ deeper.
    "2%" — the only way to catch this kind of inconsistency is to view
    the figure. Open at least the calibration plot, the allocation
    map, and every hypothesis-verdict figure (`h*_*.png`).
-8. `{run_dir}/critique_methods.yaml`, `critique_domain.yaml`,
+8. `{run_dir}/models/effect_concordance.yaml` (Phase 38 β): the gate checks
+   each modeled effect against the trial effect it names, but cannot tell
+   whether that trial compared the same things. For each entry, check that
+   `trial_comparator` (the trial's control arm) matches `comparator_delivers`
+   (what the run's primary comparator already gives those units), e.g. a
+   new net type against the nets the comparator keeps, not against no nets.
+   Also check that `model_use` is the use reached in `units`. A mismatch is
+   a HIGH METHODS finding.
+9. `{run_dir}/critique_methods.yaml`, `critique_domain.yaml`,
    `critique_presentation.yaml` (when they exist — they run in
    parallel with you) — on round ≥ 2, also your prior round's
    `critique_redteam.yaml`.
