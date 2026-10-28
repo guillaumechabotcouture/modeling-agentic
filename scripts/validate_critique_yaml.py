@@ -590,25 +590,28 @@ def _recompute_action(d: dict, max_rounds: int, current_round: int,
     return d
 
 
-def _item_keys(b: dict) -> set[str]:
-    return {str(b.get(k)) for k in ("id", "kind", "blocker_id") if b.get(k)}
+# Gate kinds that carry a critic's finding under another name: never declared away early.
+_CRITIC_DERIVED_PREFIXES = ("done_when_", "critique_", "claim_overclaimed", "sufficiency", "crossmodel")
 
 
 def _declared_early(outstanding: list[dict], d: dict) -> bool:
     """Phase 39 rule 3a: every outstanding item is a declarable gate finding
-    (not a critic's blocker, nor a critic MEDIUM escalated for persistence)
-    that scope_declaration.yaml declares now and declared at the previous gate."""
+    that scope_declaration.yaml declares, by kind, now and at the previous
+    gate. Never with a required artifact missing, a critic's blocker, or a
+    critic's finding carried under a gate kind (persistence escalation, a
+    regressed or unmet finding test, the sufficiency critic). Gate ids
+    (RIG-001...) are renumbered every run, so only the kind is matched."""
     now, prev = set(d.get("declared") or ()), set(d.get("declared_prev") or ())
-    if not now or not prev:
+    if not now or not prev or d.get("accept_blockers"):
         return False
     for b in outstanding:
         kind = str(b.get("kind") or "")
-        if kind == "critique_blocker" or kind.endswith("_persistent") or str(b.get("source") or "").startswith("critique"):
+        if (kind.endswith("_persistent") or kind.startswith(_CRITIC_DERIVED_PREFIXES)
+                or str(b.get("source") or b.get("reviewer") or "").startswith("critique")):
             return False
         if is_non_declarable(kind, b.get("scope_declarable")):
             return False
-        keys = _item_keys(b)
-        if not (keys & now and keys & prev):
+        if not (kind in now and kind in prev):
             return False
     return True
 
@@ -5805,6 +5808,15 @@ def _run_self_test() -> int:
     ok(act([bd, {**sa, "scope_declarable": False}], both, both)["action"] == "PATCH_OR_RETHINK",
        "EF5 a non-declarable finding blocks the early finish")
     ok(act([], both, both)["action"] == "ACCEPT", "EF6 nothing outstanding is still ACCEPT")
+    for k in ("done_when_regressed", "claim_overclaimed", "done_when_unmet"):
+        ok(act([bd, {**sa, "kind": k}], both + [k], both + [k])["action"] == "PATCH_OR_RETHINK",
+           f"EF10 (Codex) a critic finding carried as {k} is not declared away early")
+    ok(_recompute_action({"unresolved_high": [bd], "accept_blockers": [{"kind": "required_artifact_missing",
+                          "scope_declarable": True}], "declared": both + ["required_artifact_missing"],
+                          "declared_prev": both + ["required_artifact_missing"]}, 8, 5)["action"] == "PATCH_OR_RETHINK",
+       "EF11 (Codex) no early finish while a required artifact is missing")
+    ok(act([{**bd, "kind": "benchmark_computed_missing", "id": "RIG-001"}], ["RIG-001"], ["RIG-001"])["action"]
+       == "PATCH_OR_RETHINK", "EF12 (Codex) renumbered gate ids never match a declaration; only kinds do")
     ok(act([bd, sa], both, both, cur=8)["action"] == "DECLARE_SCOPE" and act([bd, sa], both, both, cur=8)["rule_matched"] == 3,
        "EF7 in the last round the existing rule 3 applies")
     with tempfile.TemporaryDirectory() as d:
