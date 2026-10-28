@@ -1954,18 +1954,23 @@ def _self_test_p35(ok) -> None:
         os.makedirs(os.path.join(d, "models"))
         # "oom": an input with crash=True kills its process when 2+ run at once
         # (a file per running input stands in for memory pressure); alone it is fine.
+        # It waits up to 5 s for a neighbour before deciding it is alone: on a slow
+        # runner the pool's processes start one by one, and a fixed 0.3 s check let
+        # the input run alone, so no pool broke (CI failures, 2026-10-27).
         open(os.path.join(d, "models", "oom.py"), "w").write(
             "import os, time, glob\n"
             "def f(p):\n"
             "    me = os.path.join(p['dir'], str(os.getpid()))\n"
             "    open(me, 'w').close()\n"
             "    try:\n"
-            "        time.sleep(0.3)\n"
             "        def alive(f):\n"
             "            try:\n                os.kill(int(os.path.basename(f)), 0); return True\n"
             "            except OSError:\n                return False\n"
-            "        if p.get('crash') and sum(map(alive, glob.glob(os.path.join(p['dir'], '*')))) > 1:\n"
-            "            os._exit(9)\n"
+            "        end = time.time() + (5.0 if p.get('crash') else 0.3)\n"
+            "        while time.time() < end:\n"
+            "            if p.get('crash') and sum(map(alive, glob.glob(os.path.join(p['dir'], '*')))) > 1:\n"
+            "                os._exit(9)\n"
+            "            time.sleep(0.02)\n"
             "        return {'x': p['x']}\n"
             "    finally:\n"
             "        os.path.exists(me) and os.remove(me)\n"
