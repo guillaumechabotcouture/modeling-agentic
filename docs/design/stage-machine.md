@@ -118,12 +118,61 @@ GATE → fix planner orders the open findings → for each task, in order:
 - scenario and package composition;
 - uncertainty plumbing, figures, per-round drivers and the claims spec.
 
-Rewritten each run, this machinery carries new bugs each time. Critics spent rounds catching them: the SMC drug double count, case-management reach, number drift, stale figures. The inventory (`a7_models_inventory`, step T0 below) measures this split.
+Rewritten each run, this machinery carries new bugs each time. Critics spent rounds catching them: the SMC drug double count, case-management reach, number drift, stale figures.
+
+**Inventory of attempt 7's `models/` (step T0, done 2026-10-27).** 6,894 lines of code in 59 files:
+
+| Class | Lines | Share | Examples |
+|---|---|---|---|
+| Generic machinery for this problem type | 1,558 | 23% | optimizer, pipeline, library builder, robustness, sensitivity, decision rule, artifacts, gain PSA, figures |
+| Disease-specific, reusable across runs | 1,785 | 26% | the malaria ABM, programme mechanics, library cell, archetypes, trial cap, costs, LGA outcomes |
+| This run only | 2,076 | 30% | calibration mapping, scenarios, per-round patches, analyst-derived claims |
+| Scratch or per-round duplicates | 1,475 | 21% | 9 near-identical chain scripts, 5 per-round claim scripts, copied figure scripts |
+
+Generic code is also embedded inside the other classes (cost matrices, price-year conversion, fixed-plan PSA and value-of-information plumbing, comparators, paired gain). Counting it, the generic share is about a third. Most critic findings landed on that generic plumbing, not on the disease model. `costs.py` was the most finding-dense file: R-024, R-026, R-031, D-019, D-020, R-039 and more.
+
+Beyond the code, the claims ledger has 961 claims, most of them sourced from analyst-written per-round YAML. Most of the repo's own checkers (optimization quality, sensitivity, allocation robustness, model comparison) only check YAML the modeler wrote by hand.
 
 **Templates by problem type, not by disease.** Examples: "budget allocation across units", "calibrate and project", "decision rule". A template is:
 - **A spec schema.** A machine-readable question spec: units, interventions and packages, unit costs, budget, comparators (from the signed brief), outcomes and their accounting (window, discounting, DALY weights), calibration targets and benchmarks. The planner drafts it, the owner signs it with the brief, and the harness validates it.
 - **A pipeline of tested steps.** Data load and schema; library or scenario composition through the compute service; calibration; binding; uncertainty; sensitivity; optimizer and its benchmark; cross-validation; decision rule; figures; claims. Each step is a toolkit module with unit tests and a reference case, configured from the spec.
 - **Contracts for the run's own model.** The model the LLM writes plugs in through fixed functions: `outcome_fn`, `evaluate_unit`, `loss` and, for library models, a cell runner. Everything around the model comes from the toolkit.
+
+**First template, "budget allocation across units": toolkit modules.** Ranked by findings caused and rewrites, times ease of extraction:
+
+| Module | Interface (sketch) | Extracted from (attempt 7) | Absorbs or replaces |
+|---|---|---|---|
+| `alloc.costs` | `CostItem(value, basis, price_year, ci, fixed/variable)`; `cost_matrix(packages, units)` with a breakdown by component | `costs.py`, `lga_outcomes.cost_table`, `pipeline._component_spend` | the cost half of the eligibility probe; price-year checks |
+| `alloc.scenarios` + results store | declarative scenarios `{overrides, masks, budget, objective}` writing one hashed results table | `scenarios*.py`, `r4_patch.py` | per-round scenario scripts; number drift |
+| `alloc.uncertainty` | `make_outcome_fn(...)`: fixed-plan intervals, value of information, P(cost > budget), gain intervals, branch mixtures | `outcome_fn.py`, `gain_psa.py` | builds on `propagate_uncertainty.py`, `compute.py` |
+| `alloc.comparators` | business as usual, rule-ranked, as-delivered, restricted geography; paired gain | `pipeline.rule_based`, `scenarios_r3` | hand-built comparator tables |
+| `alloc.packages` | components × levels, eligibility, other-funder footprints, locks giving `feasible[L,P]` | `lga_outcomes.packages`, `optimize.feasible_mask` | the component table of the effect check |
+| `alloc.optimize` | `solve(benefit, cost, feasible, budget, constraints, method)`; ILP, greedy and brute force; writes its own quality report | `optimize.py` | `optimization_quality.py` becomes a pure checker |
+| `alloc.robustness` | perturb and re-solve; leave-one-group-out; near ties | `sensitivity.py`, `robustness.py` | self-reported sensitivity and leave-one-out YAML |
+| `alloc.decision_rule` | `fit_rule(features, choice)` giving the tree, leaves and agreement | `decision_rule.py` | `decision_rule.md` accuracy typed in by hand |
+| `alloc.report` | standard figure set and a claims spec generated from the results schema | `model_figures*.py`, `finalize.py` | per-round figure and claim scripts |
+| `alloc.driver` + emulator | the stage DAG of `pipeline.yaml`; library builder (cells × branches × seeds, common random numbers, fork-isolated branches) | `lib_build.py`, `library.py` | the 9 chain scripts |
+
+**Spec fields the template needs.** These are what attempt 7's modeler had to encode by hand:
+- **Units:** id, nesting, funder, population by age band; the calibration level versus the allocation level.
+- **Components:** levels, target population, eligibility rule, reach, timing, delivery efficiency.
+- **Packages:** the set of packages, one per unit.
+- **Costs:** value, basis, price year and conversion rule, fixed or variable, years, CI, branches.
+- **Budget:** the envelope and alternatives, the window and the currency year.
+- **Decision date and history:** the decision date and the history to lock.
+- **Comparators:** from the brief.
+- **Constraints:** caps and continuity floors.
+- **Objective and outcomes:** DALYs, cases or deaths, disability weights, discounting.
+- **Calibration targets:** survey, age band, diagnostic, n, holdouts.
+- **Trial effect evidence:** comparator, endpoint, population.
+- **Uncertainty and robustness:** settings.
+- **Decision-rule features.**
+
+**Planted-truth test for the template.** A synthetic world of 40 units in 4 groups, with two components:
+- C1 is universal, with relative risk 0.6.
+- C2 is targeted to an eligible subgroup, with relative risk 0.4.
+
+The test has a known optimal allocation and planted traps: the eligibility denominator, a 2015 price year, a duplicated drug cost line and two locked units. The toolkit must recover the allocation exactly and catch every trap. It must also recover the planted decision rule and show the sensitivity flip at the analytic break-even point.
 
 **Where the toolkit lives.** In the repo as `toolkit/<template>/`, versioned, with tests in CI. Disease mechanics that are reusable across runs of one disease live beside it (for example `toolkit/diseases/malaria/`, behind the same contracts). They are gated by the existing `applies_when` keywords, so gate logic stays disease-agnostic.
 
@@ -155,7 +204,8 @@ Each step ships as its own PR. Each is checked on a replay or a short real run a
 | Step | Builds | Metric to pass |
 |---|---|---|
 | T0 | Inventory of attempt 7's `models/`: reusable machinery vs disease-specific vs question-specific vs superseded; proposed allocation toolkit and spec fields | Each file classified; lines of code by class; toolkit modules mapped to the files they come from (started 2026-10-27) |
-| T1 | Allocation spec schema plus the first toolkit modules, extracted from attempt 7 and the existing `scripts/` (optimizer and benchmark, cost and package composition, uncertainty, sensitivity), each with unit tests | Planted-truth allocation recovered by the toolkit alone; attempt 7's allocation reproduced from its spec and model within 1% |
+| T1 | Allocation spec schema plus `alloc.costs` and `alloc.packages` (the most finding-dense code), then `alloc.optimize`; each with unit tests and the planted-truth test | Planted-truth costs and allocation recovered by the toolkit alone, every planted trap caught; attempt 7's cost matrix reproduced from its spec within 1% |
+| T2 | `alloc.scenarios` with the results store, `alloc.uncertainty`, `alloc.comparators`, `alloc.robustness` | Attempt 7's headline and uncertainty interval reproduced from spec plus model within 1%; sensitivity computed, not self-reported |
 | S1 | `pipeline.yaml` schema plus harness runner (incremental, owned outputs); producers and figures first (generalises Phase 39 β) | On attempt 7's copy: one changed input reruns exactly its downstream steps; zero stale artifacts at the gate |
 | S2 | Binding of `outcome_fn` to the headline (inventory #1) | Attempt 7: bound within 1%; a decoy fails |
 | S3 | Fix loop plus `impact_ledger.jsonl`; one finding per modeler task, scoped brief | Replay of attempt 7's round 4 → 5 fixes as single tasks: each has a ledger row; total cost ≤ that round's |
