@@ -26,8 +26,9 @@ STATUS_FILE = "status.json"
 RESOURCES_FILE = "resources.jsonl"
 # $ per weighted token, same weighting as scripts/telemetry.py (fitted on 96 E5 cases)
 USD_PER_WEIGHTED_TOKEN = {"claude-opus-5-5": 4.131e-6, "claude-sonnet-5-5": 3.08e-6,
-                          # not fitted (no Haiku cases): ~1/4 of the Opus rate; smoke runs only
-                          "claude-haiku-5-5": 1.0e-6}
+                          # fitted on one smoke run (2026-10-27, Phase 40 smoke: $1.96 reported vs
+                          # $3.71 estimated at the earlier 1.0e-6); smoke runs only
+                          "claude-haiku-5-5": 0.53e-6}
 RATIOS = {"input_tokens": 1.0, "cache_read_input_tokens": 0.1,
           "cache_creation_input_tokens": 1.25, "output_tokens": 5.0}
 STAGE_OF = {"planner": "PLAN", "data-agent": "DATA", "critique-premortem": "PRE_MORTEM",
@@ -164,9 +165,34 @@ class Heartbeat(threading.Thread):
         self.last_checkpoint = time.time()
         self.errors = 0
         self.snapshots = 0
+        # Phase 40: archives and uploads run on their own worker, one at a time, so a
+        # slow checkpoint never delays the status beat (E7 attempt 7: the beat
+        # stopped for ~45 min while a checkpoint of a large run directory uploaded).
+        self._io_lock = threading.Lock()
+        self._io_thread = None
+        self.last_beat = None
+
+    def _io(self, fn, *args) -> bool:
+        """Run an archive/upload job in the background unless one is already running."""
+        with self._io_lock:
+            if self._io_thread is not None and self._io_thread.is_alive():
+                return False
+
+            def job():
+                try:
+                    fn(*args)
+                except Exception:  # noqa: BLE001
+                    self.errors += 1
+            self._io_thread = threading.Thread(target=job, daemon=True, name="ma-heartbeat-io")
+            self._io_thread.start()
+            return True
 
     def beat(self) -> dict:
         status = build_status(self.run_path, self.state, self.run_start)
+        now = time.time()
+        status["beat_gap_s"] = None if self.last_beat is None else round(now - self.last_beat, 1)
+        status["upload_busy"] = bool(self._io_thread is not None and self._io_thread.is_alive())
+        self.last_beat = now
         try:
             res = resource_sample(self.run_path)
             status["resources"] = {k: res[k] for k in ("mem_used_pct", "mem_avail_gb", "cpu_pct", "disk")}
@@ -183,7 +209,7 @@ class Heartbeat(threading.Thread):
             if os.path.exists(os.path.join(self.run_path, RESOURCES_FILE)):
                 self.uploader(os.path.join(self.run_path, RESOURCES_FILE), RESOURCES_FILE)   # full history
             if time.time() - self.last_checkpoint >= self.checkpoint_s:
-                self.checkpoint()
+                self._io(self.checkpoint)
         return status
 
     def checkpoint(self) -> None:
@@ -233,10 +259,15 @@ class Heartbeat(threading.Thread):
                     self.state.wake.clear()
                     return
                 agent = self.state.snapshot_requests.pop(0)
-            try:
-                self.snapshot(agent)
-            except Exception:  # noqa: BLE001
-                self.errors += 1
+            # Snapshot on the upload worker; if one is still running, wait for it here
+            # (snapshots are stage fixtures and must not be dropped), never in beat().
+            while not self._io(self.snapshot, agent):
+                if self.stop_event.wait(1.0):
+                    try:
+                        self.snapshot(agent)
+                    except Exception:  # noqa: BLE001
+                        self.errors += 1
+                    break
 
     def run(self) -> None:
         next_beat = time.time() + self.interval_s
@@ -263,7 +294,11 @@ class Heartbeat(threading.Thread):
 
         def last():
             try:
+                if self._io_thread is not None:
+                    self._io_thread.join(max(1.0, timeout_s / 2))
                 self._drain_snapshots()
+                if self._io_thread is not None:
+                    self._io_thread.join(max(1.0, timeout_s / 4))
                 self.beat()
                 self.checkpoint()
             except Exception:  # noqa: BLE001
@@ -344,6 +379,8 @@ def _self_test_body(fails: list[str]) -> list[str]:
             import sys as _s
             _s.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
             hb.beat()
+            if hb._io_thread is not None:
+                hb._io_thread.join(30)          # Phase 40: the checkpoint uploads on its own worker
         except Exception as e:  # noqa: BLE001
             sys_path_ok = False
             fails.append(f"OB5 a beat writes status/resources and uploads: {e}")
@@ -356,6 +393,24 @@ def _self_test_body(fails: list[str]) -> list[str]:
             r = json.loads(open(os.path.join(d, RESOURCES_FILE)).readline())
             if not (0 <= r["mem_used_pct"] <= 100 and r["top"]):
                 fails.append(f"OB7 a resource sample has memory and the largest processes: {r}")
+
+        # Phase 40: a slow checkpoint upload never delays a beat, and runs one at a time.
+        slow_calls = []
+
+        def slow(p, sfx):
+            slow_calls.append(sfx)
+            if sfx == "checkpoint.tar.gz":
+                time.sleep(1.5)
+        hbs = Heartbeat(d, LiveState(), datetime.now(), interval_s=30, checkpoint_s=0, uploader=slow)
+        t0 = time.time()
+        s1 = hbs.beat()
+        s2 = hbs.beat()
+        fast = time.time() - t0
+        if not (fast < 1.0 and s2.get("upload_busy") is True and s2.get("beat_gap_s") is not None):
+            fails.append(f"OB5b a beat returns while a checkpoint uploads ({fast:.2f}s; {s2.get('upload_busy')})")
+        hbs._io_thread.join(10)
+        if slow_calls.count("checkpoint.tar.gz") != 1:
+            fails.append(f"OB5c one checkpoint upload at a time: {slow_calls}")
 
         st2 = LiveState()
         up2 = []

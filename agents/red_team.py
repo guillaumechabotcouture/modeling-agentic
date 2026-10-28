@@ -141,7 +141,10 @@ deeper.
    `burden_output` covers the period the intervention covers, and that no
    entry under `not_bounding` is the effect of an intervention the
    allocation funds. A mismatch or such an exemption is a HIGH METHODS
-   finding.
+   finding. If the file says `no_trial_effects`, check the reason: an
+   intervention whose effect size comes from trials or meta-analyses (an
+   efficacy, a risk ratio) has a trial effect, even if the model uses it as
+   an input. Challenge any such exemption as a HIGH METHODS finding.
 9. `{run_dir}/critique_methods.yaml`, `critique_domain.yaml`,
    `critique_presentation.yaml` (when they exist — they run in
    parallel with you) — on round ≥ 2, also your prior round's
