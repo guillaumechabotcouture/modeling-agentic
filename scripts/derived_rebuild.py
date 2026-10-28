@@ -20,7 +20,9 @@ before the final gate. Figures stay a modeling tool every round; nobody
 spends a round regenerating them.
 
 It never marks files as written by the harness: a figure script that rewrites
-a protected artifact is still reported by the integrity record.
+a protected artifact is still reported by the integrity record. Scripts run
+without cloud credentials (as agents do without --cloud), each in its own
+process group, within a total time budget below the CLI's hook deadline.
 """
 from __future__ import annotations
 
@@ -28,6 +30,7 @@ import argparse
 import glob
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -37,7 +40,27 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import figure_validator as fv  # noqa: E402
 
 REPORT = os.path.join("figures", "rebuild_report.json")
-SCRIPT_TIMEOUT_S = 900
+SCRIPT_TIMEOUT_S = 300
+HOOK_BUDGET_S = 420        # the CLI abandons a hook after 600 s; stop well before it
+
+
+def _cloud_prefixes() -> tuple[str, ...]:
+    """The credential prefixes agents' environments are stripped of (agents/enforcement.py)."""
+    import importlib.util
+    p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "agents", "enforcement.py")
+    try:
+        spec = importlib.util.spec_from_file_location("_ma_enforcement", p)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return tuple(mod.CLOUD_ENV_PREFIXES)
+    except Exception:  # noqa: BLE001 — fail closed: strip the known families
+        return ("AZ_", "AZURE_", "OPENAI_", "AWS_", "GOOGLE_")
+
+
+def script_env(environ=None) -> dict:
+    env = dict(os.environ if environ is None else environ)
+    pre = _cloud_prefixes()
+    return {k: v for k, v in env.items() if not k.startswith(pre)}
 
 
 def _sidecars(run_dir: str) -> list[tuple[str, dict]]:
@@ -74,7 +97,7 @@ def stale_scripts(run_dir: str) -> tuple[list[str], dict[str, list[str]], list[d
             # run-relative tail when that file exists.
             tail = script.split(os.path.basename(os.path.normpath(run_dir)) + os.sep, 1)
             cand = os.path.join(run_dir, tail[1]) if len(tail) == 2 else None
-            if cand and os.path.isfile(cand):
+            if cand and os.path.isfile(cand) and _inside(cand, run_dir):
                 script = cand
             else:
                 skipped.append({"figure": rel, "why": f"generator script outside the run directory: {script}"})
@@ -89,19 +112,40 @@ def stale_scripts(run_dir: str) -> tuple[list[str], dict[str, list[str]], list[d
     return order, figs, skipped
 
 
-def rebuild(run_dir: str, timeout_s: float = SCRIPT_TIMEOUT_S, python: str | None = None) -> dict:
+def _run(cmd, cwd, timeout_s, env):
+    """Run in its own process group; on timeout the whole group is killed, so
+    nothing keeps writing after the rebuild returns."""
+    p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                         text=True, env=env, start_new_session=True)
+    try:
+        _out, err = p.communicate(timeout=timeout_s)
+        return p.returncode, (err or "")[-600:]
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        p.communicate()
+        return None, f"timed out after {timeout_s:.0f}s (process group killed)"
+
+
+def rebuild(run_dir: str, timeout_s: float = SCRIPT_TIMEOUT_S, python: str | None = None,
+            budget_s: float | None = None) -> dict:
     run_dir = os.path.realpath(run_dir)
     t0 = time.time()
     order, figs, skipped = stale_scripts(run_dir)
+    env = script_env()
     runs = []
     for script in order:
         s0 = time.time()
+        left = None if budget_s is None else budget_s - (s0 - t0)
+        if left is not None and left < 5:
+            runs.append({"script": os.path.relpath(script, run_dir), "figures": figs[script], "returncode": None,
+                         "seconds": 0.0, "stderr_tail": "not started: rebuild time budget used"})
+            continue
         try:
-            p = subprocess.run([python or sys.executable, script], cwd=run_dir, capture_output=True, text=True,
-                               timeout=timeout_s, stdin=subprocess.DEVNULL)
-            rc, err = p.returncode, (p.stderr or "")[-600:]
-        except subprocess.TimeoutExpired:
-            rc, err = None, f"timed out after {timeout_s:.0f}s"
+            rc, err = _run([python or sys.executable, script], run_dir,
+                           timeout_s if left is None else min(timeout_s, left), env)
         except OSError as e:
             rc, err = None, f"{type(e).__name__}: {e}"
         runs.append({"script": os.path.relpath(script, run_dir), "figures": figs[script], "returncode": rc,
@@ -174,6 +218,34 @@ def _self_test() -> int:
         rep = rebuild(d)
         ok(rep["runs"] == [] and rep["skipped"] and "outside the run directory" in rep["skipped"][0]["why"],
            f"DR5 a script outside the run directory is not run: {rep}")
+        # A symlink inside the run directory pointing outside it: not run.
+        outside = tempfile.mkdtemp()
+        open(os.path.join(outside, "evil.py"), "w").write("open('PWNED', 'w').write('x')\n")
+        os.symlink(os.path.join(outside, "evil.py"), os.path.join(d, "models", "link.py"))
+        json.dump({**sc, "generator_script": os.path.join(d, "models", "link.py")},
+                  open(os.path.join(d, "figures", "a.png.provenance.json"), "w"))
+        rep = rebuild(d)
+        ok(rep["runs"] == [] and not os.path.exists(os.path.join(d, "PWNED")),
+           f"DR5b (Codex) a symlink to a script outside the run directory is not run: {rep}")
+        other_ln = os.path.join("/tmp/ab/R1/runs", os.path.basename(d), "models", "link.py")
+        json.dump({**sc, "generator_script": other_ln}, open(os.path.join(d, "figures", "a.png.provenance.json"), "w"))
+        rep = rebuild(d)
+        ok(rep["runs"] == [], f"DR5c (Codex) re-anchoring checks containment too: {rep}")
+        # Environment: no cloud credentials; a slow script's process group is killed.
+        ok("AZURE_CLIENT_SECRET" not in script_env({"AZURE_CLIENT_SECRET": "s", "HOME": "/h"})
+           and script_env({"HOME": "/h"})["HOME"] == "/h", "DR7 (Codex) scripts run without cloud credentials")
+        open(os.path.join(d, "models", "slow.py"), "w").write(
+            "import subprocess, sys, time\nsubprocess.Popen([sys.executable, '-c', "
+            "'import time, os; time.sleep(3); open(\"CHILD_RAN\", \"w\").write(\"x\")'])\ntime.sleep(60)\n")
+        json.dump({**sc, "generator_script": os.path.join(d, "models", "slow.py")},
+                  open(os.path.join(d, "figures", "a.png.provenance.json"), "w"))
+        t1 = time.time()
+        rep = rebuild(d, timeout_s=1.0)
+        time.sleep(3.5)
+        ok(rep["runs"][0]["returncode"] is None and time.time() - t1 < 10 and not os.path.exists(os.path.join(d, "CHILD_RAN")),
+           f"DR8 (Codex) a timed-out script's whole process group is killed: {rep}")
+        rep = rebuild(d, timeout_s=1.0, budget_s=0)
+        ok("budget" in rep["runs"][0].get("stderr_tail", ""), f"DR9 nothing starts once the time budget is used: {rep}")
         # Recorded on another machine: re-anchored on this run directory.
         other = os.path.join("/tmp/ab/R1/runs", os.path.basename(d), "models", "figs.py")
         json.dump({**sc, "generator_script": other}, open(os.path.join(d, "figures", "a.png.provenance.json"), "w"))

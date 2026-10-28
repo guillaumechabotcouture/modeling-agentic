@@ -1838,7 +1838,8 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
         if agent_type in REBUILD_AFTER:
             try:
                 import asyncio
-                rep = await asyncio.to_thread(derived_rebuild.rebuild, run_path)
+                rep = await asyncio.to_thread(derived_rebuild.rebuild, run_path,
+                                              budget_s=derived_rebuild.HOOK_BUDGET_S)
                 line = derived_rebuild.summary_line(rep)
                 print(f"[REBUILD] {line}", flush=True)
                 _safe_write(trace_file, {"ts": datetime.now().isoformat(), "type": "derived_rebuild",

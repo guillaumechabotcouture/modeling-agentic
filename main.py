@@ -1062,6 +1062,10 @@ def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
     original_meta = original_meta or {}
     # Last integrity scan FIRST: pending tool changes are judged against the
     # previous baseline before the harness writes anything (Copilot, PR #15).
+    # Phase 39 β (Codex): regenerate stale figures while the integrity watch is
+    # still on, so anything a figure script changes is judged by the final scan.
+    if run_gate:
+        _rebuild_derived(run_path)
     if integrity is not None:
         integrity.final_check()
         integrity.stop_watch()
@@ -1084,7 +1088,6 @@ def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
     gate = None
     # A budget stop is still gated: the report shows what the money bought.
     if run_gate:          # Phase 29: also after max_sessions / crashes: the verdict is evidence
-        _rebuild_derived(run_path)
         print("\nRunning final STAGE 7 gate...", flush=True)
         gate = run_final_gate(run_path, max_rounds)
         if gate is None:
