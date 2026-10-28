@@ -295,7 +295,8 @@ def evaluate(run_dir: str) -> tuple[list[dict], list[str], dict]:
         rel = abs(got - want) / max(abs(want), 1e-12)
         n = len(recs)
         ok_b = len(bad_b) <= BIND_TOL * n and rel <= BIND_TOL
-        ok_r = len(bad_r) <= BIND_TOL * n
+        rm_tot = sum(r[3] for r in recs)
+        ok_r = len(bad_r) <= BIND_TOL * n and abs(rm_tot - got) <= BIND_TOL * max(abs(got), 1e-12)
         ok_0 = len(bad_0) <= BIND_TOL * n and abs(b_got - b_want) <= BIND_TOL * max(abs(b_want), 1e-12)
         binding = {"units": n, "unit_fn_total": round(got, 6), "allocation_total": round(want, 6),
                    "rel_diff": round(rel, 6), "units_off": len(bad_b), "burden_mismatch_units": len(bad_r),
@@ -311,7 +312,8 @@ def evaluate(run_dir: str) -> tuple[list[dict], list[str], dict]:
         if not ok_r:
             return [], errors + [f"{burd} is not the outcome the allocation counts: in {len(bad_r)} of {n} units, "
                                  f"{burd}({cmp_pkg}) - {burd}(allocated package) differs from {bo} by more than "
-                                 f"{BIND_TOL:.0%} (e.g. {', '.join(bad_r[:5])})."], binding
+                                 f"{BIND_TOL:.0%} (e.g. {', '.join(bad_r[:5])}); summed {rm_tot:.6g} removed vs "
+                                 f"{got:.6g} benefit."], binding
     except Exception as e:  # noqa: BLE001
         return [], errors + [f"binding failed: {type(e).__name__}: {str(e)[:200]}"], binding
     # 2. Effects: in every allocated unit whose package contains the component, the package against
@@ -373,6 +375,38 @@ def evaluate(run_dir: str) -> tuple[list[dict], list[str], dict]:
                      "model_ratio": round(mr, 4), "model_use": mu, "trial_use": tu,
                      "model_reduction": round(1 - mr, 4), "max_reduction": round(bound, 4),
                      "exceeds": (1 - mr) > bound * (1 + TOL) + 1e-9})
+    # Bundles: a package with two or more checked components is held to their combined trial bound,
+    # so components cannot mask each other (each is otherwise measured on top of the others).
+    bnd = {r["component"]: r["max_reduction"] for r in rows}
+    reg_of = {str(e.get("component")): str(e.get("registry")) for e in effects if isinstance(e, dict)}
+    for pk in sorted({str(a.get(pc)) for a in alloc}):
+        inside = sorted(comps[pk] & set(bnd))
+        if len(inside) < 2:
+            continue
+        rest = comps[pk] - set(inside)
+        if rest not in by_set:
+            errors.append(f"bundle {pk}: no package in `packages:` is {pk} without {', '.join(inside)}; add it so the "
+                          "harness can bound the bundle")
+            continue
+        us = [str(a.get(uc)) for a in alloc if str(a.get(pc)) == pk]
+        try:
+            on = sum(num(out(u, pk), burd, u) for u in us)
+            off = sum(num(out(u, by_set[rest]), burd, u) for u in us)
+        except Exception as ex:  # noqa: BLE001
+            errors.append(f"bundle {pk}: unit_fn failed: {type(ex).__name__}: {str(ex)[:150]}")
+            continue
+        if off <= 0:
+            continue
+        keep = 1.0
+        for c in inside:
+            keep *= 1 - bnd[c]
+        rows.append({"id": f"bundle {pk}", "intervention": " + ".join(inside), "component": "+".join(inside),
+                     "registry": ", ".join(reg_of[c] for c in inside), "trial_reduction": None,
+                     "trial_max_reduction": round(1 - keep, 4), "trial_comparator": "each component's trial",
+                     "comparator_id": "", "comparator_delivers": by_set[rest], "units": len(us), "packages": [pk],
+                     "model_ratio": round(on / off, 4), "model_use": None, "trial_use": None,
+                     "model_reduction": round(1 - on / off, 4), "max_reduction": round(1 - keep, 4),
+                     "exceeds": (1 - on / off) > (1 - keep) * (1 + TOL) + 1e-9})
     hv, why = _ledger_value(run_dir, str(doc["headline_claim"]))
     if why == "no ledger":
         binding["deliverable_unverified"] = True
@@ -404,9 +438,13 @@ def gate_findings(run_dir: str) -> list[dict]:
                           f"whose package includes {r['component']} ({', '.join(r['packages'])[:120]}), each against "
                           f"the same package without it ({r['comparator_id']}: {r['comparator_delivers']}): a "
                           f"{r['model_reduction']:.0%} burden reduction. The trial evidence ({r['registry']}: "
-                          f"{r['trial_reduction']:.0%} reduction, at most {r['trial_max_reduction']:.0%} within its CI, "
-                          f"vs {r['trial_comparator']}) supports at most {r['max_reduction']:.0%} at the model's use "
-                          f"({r['model_use']} vs {r['trial_use']}). Bring the effect within the evidence (constrain it "
+                          + (f"{r['trial_reduction']:.0%} reduction, at most {r['trial_max_reduction']:.0%} within its CI, "
+                             f"vs {r['trial_comparator']}) supports at most {r['max_reduction']:.0%} at the model's use "
+                             f"({r['model_use']} vs {r['trial_use']}). "
+                             if r["trial_reduction"] is not None else
+                             f"each component's bound, combined) supports at most {r['max_reduction']:.0%} for the "
+                             "bundle. ")
+                          + "Bring the effect within the evidence (constrain it "
                           "to the trial effect, fix the comparator or the composition), or say in the write-up why "
                           "the trial does not bound it.")})
     return out
@@ -491,7 +529,8 @@ def _self_test() -> int:
         # new vs old: (1-0.63)/(1-0.27) -> 49% in "new" units, similar in "new_smc" vs "smc"; bound 55%.
         put([e_new, e_smc])
         rows, errs, b = evaluate(d)
-        ok(errs == [] and b["bound"] and b["units"] == 8 and {r["id"]: r["units"] for r in rows} == {"E1": 4, "E2": 3}
+        ok(errs == [] and b["bound"] and b["units"] == 8
+           and {r["id"]: r["units"] for r in rows if r["id"].startswith("E")} == {"E1": 4, "E2": 3}
            and not any(r["exceeds"] for r in rows) and gate_findings(d) == [],
            f"EC2 effects computed per component over every unit whose package includes it: {rows} {errs} {b}")
         # The lenient comparator: the same products measured against nothing, held to a new-vs-old trial.
@@ -543,7 +582,8 @@ def _self_test() -> int:
         alloc(lambda i: "new_smc" if i < 4 else "old"); ledger()
         put([e_new, e_smc])
         rows, errs, _b = evaluate(d)
-        ok(errs == [] and {r["id"]: r["packages"] for r in rows} == {"E1": ["new_smc"], "E2": ["new_smc"]},
+        ok(errs == [] and {r["id"]: r["packages"] for r in rows if r["id"].startswith("E")}
+           == {"E1": ["new_smc"], "E2": ["new_smc"]},
            f"EC8 (Codex) a component allocated only inside a bundle is checked in the bundle: {rows} {errs}")
         put([e_new, e_smc], packages={"old": [], "new_smc": ["new_product", "smc"]})
         ok(any("same without it" in x["claim"] for x in gate_findings(d)),
@@ -565,6 +605,42 @@ def _self_test() -> int:
         ok(any("odds ratio" in x["claim"] for x in gate_findings(d)), "EC12 an odds ratio must be converted first")
         put([{k: v for k, v in e_new.items() if k != "model_use"}, e_smc])
         ok(any("missing model_use" in x["claim"] for x in gate_findings(d)), "EC13 attained use is required")
+        # (Codex) Bundles: components that each look small on top of the other cannot hide a large bundle effect.
+        # Against the comparator: A alone 80%, B alone 80%, A+B 81%; each marginal is ~5%, but the bundle's
+        # 81% exceeds the combined bound 1 - (1 - 0.55)(1 - 0.30) = 68.5%.
+        open(os.path.join(d, "models", "mk.py"), "w").write(
+            "R = {'old': 0.0, 'new': 0.8, 'smc': 0.8, 'new_smc': 0.81}\n"
+            "def unit(inp):\n    b = float(inp['pop']) * float(inp['rate'])\n"
+            "    return {'dalys': b * (1 - R[inp['package']]), 'dalys_averted': b * R[inp['package']]}\n")
+        with open(os.path.join(d, "models", "alloc.csv"), "w") as f:
+            f.write("unit,package,dalys_averted,dalys_baseline\n")
+            for i in range(8):
+                b = (1000 + 100 * i) * 0.2
+                f.write(f"u{i},{'new_smc' if i < 4 else 'old'},{b * (0.81 if i < 4 else 0)},{b}\n")
+        ledger()
+        put([e_new, e_smc], unit_fn="models/mk.py::unit")
+        f = gate_findings(d)
+        ok(any(x["claim"].startswith("bundle new_smc") and "for the bundle" in x["claim"] for x in f),
+           f"EC16 (Codex) a bundle is held to its components' combined trial bound: {f}")
+        # (Codex) Total burden removed must equal total benefit even when one large unit is the only one off.
+        with open(os.path.join(d, "models", "units.csv"), "w") as fu:
+            fu.write("unit,pop,rate,use\n" + "".join(f"u{i},{1000 + (100000 if i == 0 else 0)},0.2,0.9\n" for i in range(60)))
+        open(os.path.join(d, "models", "one.py"), "w").write(
+            "def unit(inp):\n    b = float(inp['pop']) * float(inp['rate'])\n"
+            "    red = {'old': 0.0, 'new': 0.3}[inp['package']]\n"
+            "    big = float(inp['pop']) > 50000 and inp['package'] == 'new'\n"
+            "    return {'dalys': b * (1 - red), 'dalys_averted': b * (0.9 if big else red)}\n")
+        with open(os.path.join(d, "models", "alloc.csv"), "w") as f:
+            f.write("unit,package,dalys_averted,dalys_baseline\n")
+            for i in range(60):
+                b = (1000 + (100000 if i == 0 else 0)) * 0.2
+                f.write(f"u{i},new,{b * (0.9 if i == 0 else 0.3)},{b}\n")
+        ledger()
+        put([e_new], unit_fn="models/one.py::unit", packages={"old": [], "new": ["new_product"]},
+            nbl=nb + [{"registry": "smc_irr", "reason": "no SMC in this test world"}])
+        f = gate_findings(d)
+        ok(any("summed" in x["claim"] and "removed vs" in x["claim"] for x in f),
+           f"EC17 (Codex) one large unit whose benefit is not burden removed fails the total check: {f}")
         open(os.path.join(d, PATH), "w").write("effects: [\n")
         ok(gate_findings(d)[0]["kind"] == "effect_concordance_invalid", "EC14 an unparseable file fails closed")
         os.remove(os.path.join(d, PATH)); os.makedirs(os.path.join(d, PATH))
