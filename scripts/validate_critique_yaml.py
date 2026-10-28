@@ -3591,8 +3591,9 @@ def _defer_write_findings(decision: dict, run_dir: str, max_rounds: int, current
     The post-write gate blocks on it as usual."""
     if any(os.path.exists(os.path.join(run_dir, f)) for f in ("report.md", "manuscript.md")):
         return decision
+    # Phase 39 α: presentation polish (category PRESENTATION) waits for the draft too.
     later = [b for b in decision.get("unresolved_high") or []
-             if b.get("kind") == "critique_blocker" and str(b.get("target_stage") or "").upper() == "WRITE"]
+             if b.get("kind") == "critique_blocker" and _load_sibling("open_problems").after_write_item(b)]
     if not later:
         return decision
     decision["unresolved_high"] = [b for b in decision["unresolved_high"] if b not in later]
@@ -5143,7 +5144,7 @@ def _check_persistent_medium_escalation(run_dir: str,
                 continue
             if blocker.get("resolved") is True:
                 continue
-            if not written and str(blocker.get("target_stage") or "").upper() == "WRITE":
+            if not written and _load_sibling("open_problems").after_write_item(blocker):
                 continue
             if (brief_ids is not None and reviewer_yaml != "critique_crossmodel.yaml"
                     and str(blocker.get("brief_item") or "").strip().upper() == "NONE"):
@@ -5716,6 +5717,18 @@ def _run_self_test() -> int:
     def ok(cond: bool, label: str) -> None:
         if not cond:
             failures.append(label)
+
+    # --- Phase 39 α: presentation polish waits for the first draft ---
+    with tempfile.TemporaryDirectory() as d:
+        pres = {"kind": "critique_blocker", "id": "P-003", "category": "PRESENTATION", "target_stage": "ANALYZE",
+                "severity": "HIGH", "scope_declarable": True}
+        hard = {**pres, "id": "P-004", "category": "HARD_BLOCKER"}
+        r = _defer_write_findings({"unresolved_high": [pres, hard]}, d, 8, 3)
+        ok(r["after_write"] == ["P-003"] and [b["id"] for b in r["unresolved_high"]] == ["P-004"],
+           f"PP1 a PRESENTATION finding waits for the draft; a HARD_BLOCKER from the same critic still blocks: {r}")
+        open(os.path.join(d, "manuscript.md"), "w").write("draft")
+        r = _defer_write_findings({"unresolved_high": [pres, hard]}, d, 8, 3)
+        ok(len(r["unresolved_high"]) == 2, "PP2 once a draft exists presentation findings block as before")
 
     # --- Phase 4 Commit α: zero-width CI detector ---
     with tempfile.TemporaryDirectory() as d:
@@ -9209,6 +9222,9 @@ def main() -> int:
         if reviewer in OPT_IN_AGENT_REVIEWERS and not os.path.exists(path) \
                 and not _opt_in_requested(args.run_dir, reviewer):
             continue
+        if reviewer == "critique-presentation" and not any(
+                os.path.exists(os.path.join(args.run_dir, f)) for f in ("report.md", "manuscript.md")):
+            continue   # Phase 39 α: the presentation critic reviews the first draft, not each round
         try:
             critiques[reviewer] = validate_critique(path, reviewer,
                                                     args.current_round)
