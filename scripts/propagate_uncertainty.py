@@ -62,6 +62,7 @@ Exit:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
 import json
 import math
@@ -237,6 +238,54 @@ def load_outcome_fn(run_dir: str, spec: Optional[str]) -> Callable[[dict], dict]
     return fn
 
 
+@contextlib.contextmanager
+def no_cached_bytecode():
+    """Run model code from its source, never from a cached .pyc: a same-size
+    edit within the cache's timestamp resolution would otherwise execute old
+    code while the fingerprint hashes the new source (Codex review of S2)."""
+    prev = (sys.dont_write_bytecode, sys.pycache_prefix)
+    # A prefix directory that is never created: no cached bytecode is found,
+    # and none is written.
+    sys.dont_write_bytecode = True
+    sys.pycache_prefix = os.path.join(os.path.realpath(os.sep), "nonexistent-ma-pycache", str(os.getpid()))
+    try:
+        yield
+    finally:
+        sys.dont_write_bytecode, sys.pycache_prefix = prev
+
+
+def load_outcome_fn_fingerprinted(run_dir: str, spec: Optional[str]):
+    """(fn, fingerprint). S2: the fingerprint names the function and hashes
+    every Python file under the run's models/ plus any other run module it
+    imports at load time, so scripts/headline_binding.py can check that the
+    function it binds to the report is the code that produced
+    uncertainty_report.yaml (whether a module is imported lazily or not).
+    Modules already imported from run_dir are dropped first so the imports are
+    this run's. Call it, and the function, inside no_cached_bytecode()."""
+    import hashlib
+    rd = os.path.realpath(run_dir)
+    under = lambda f: bool(f) and os.path.realpath(f).startswith(os.path.join(rd, ""))  # noqa: E731
+    for k, m in list(sys.modules.items()):
+        if under(getattr(m, "__file__", None)):
+            sys.modules.pop(k, None)
+    before = set(sys.modules)
+    fn = load_outcome_fn(run_dir, spec)
+    files = {os.path.realpath(sys.modules[k].__file__) for k in set(sys.modules) - before
+             if under(getattr(sys.modules[k], "__file__", None))}
+    for dp, dns, fns in os.walk(os.path.join(rd, "models")):
+        dns[:] = [x for x in dns if x != "__pycache__"]
+        files.update(os.path.join(dp, f) for f in fns if f.endswith(".py"))
+    rel, _, name = (spec or "models/outcome_fn.py::outcome_fn").partition("::")
+    src = os.path.join(run_dir, rel)
+    src = os.path.realpath(src if os.path.exists(src) else rel)   # load_outcome_fn's lookup
+    files.add(src)
+    sources = {}
+    for f in sorted(files):
+        with open(f, "rb") as fh:
+            sources[os.path.relpath(f, rd)] = hashlib.sha256(fh.read()).hexdigest()
+    return fn, {"file": os.path.relpath(src, rd), "function": name or "outcome_fn", "sources": sources}
+
+
 # ---------------------------------------------------------------------------
 # Propagation
 # ---------------------------------------------------------------------------
@@ -275,6 +324,13 @@ def propagate(run_dir: str, n_draws: int = 200, seed: int = 42,
             "section. UQ propagation requires at least one registered "
             "parameter with CI bounds. See the `effect-size-priors` skill."
         )
+
+    # S2: record which code produced the report (scripts/headline_binding.py
+    # checks it is the function bound to the report's headline).
+    try:
+        fp_fn, fingerprint = load_outcome_fn_fingerprinted(run_dir, outcome_fn_spec)
+    except Exception as e:  # noqa: BLE001 — the load below raises the usual error
+        fp_fn, fingerprint = None, {"error": f"{type(e).__name__}: {str(e)[:200]}"}
 
     rng = random.Random(seed)
     # Pre-sample all N draws per parameter. Independent priors — later
@@ -336,7 +392,7 @@ def propagate(run_dir: str, n_draws: int = 200, seed: int = 42,
                 {"_error": {"draw": r["i"], "exception": r.get("error", "").split(":")[0],
                             "message": r.get("error", "")[:200]}} for r in rows]
     else:
-        outcome_fn = load_outcome_fn(run_dir, outcome_fn_spec)
+        outcome_fn = fp_fn or load_outcome_fn(run_dir, outcome_fn_spec)
         outs = []
         for i, p in enumerate(params_list):
             try:
@@ -451,6 +507,7 @@ def propagate(run_dir: str, n_draws: int = 200, seed: int = 42,
     n_failed = len(errors)
     return {
         "producer": "scripts/propagate_uncertainty.py",
+        "outcome_fn_fingerprint": fingerprint,
         # Phase 21 δ: effort floors read these, not n_draws alone —
         # n_draws is what was requested; n_successful is what the CIs
         # are built from.
@@ -715,17 +772,18 @@ def main() -> int:
         return 2
 
     try:
-        report = propagate(args.run_dir, n_draws=args.n_draws,
-                           seed=args.seed,
-                           outcome_fn_spec=args.outcome_fn,
-                           verbose=args.verbose,
-                           cloud=args.cloud,
-                           cloud_pool_name=args.cloud_pool_name,
-                           cloud_vm_size=args.cloud_vm_size,
-                           cloud_max_nodes=args.cloud_max_nodes,
-                           cloud_use_low_priority=args.cloud_low_priority,
-                           cloud_budget_usd_cap=args.cloud_budget_usd,
-                           parallel=args.parallel)
+        with no_cached_bytecode():
+            report = propagate(args.run_dir, n_draws=args.n_draws,
+                               seed=args.seed,
+                               outcome_fn_spec=args.outcome_fn,
+                               verbose=args.verbose,
+                               cloud=args.cloud,
+                               cloud_pool_name=args.cloud_pool_name,
+                               cloud_vm_size=args.cloud_vm_size,
+                               cloud_max_nodes=args.cloud_max_nodes,
+                               cloud_use_low_priority=args.cloud_low_priority,
+                               cloud_budget_usd_cap=args.cloud_budget_usd,
+                               parallel=args.parallel)
     except ValueError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 3

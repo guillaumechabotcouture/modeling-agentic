@@ -1973,6 +1973,11 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None,
     # held to the trial evidence for that comparison.
     violations += G(lambda rd: _load_sibling("effect_concordance").gate_findings(rd),
                     run_dir, check_name="effect_concordance")
+    # S2: the outcome_fn the uncertainty harness runs reproduces the report's
+    # headline claims (and the allocation's package choice) at the registry
+    # point estimates, so a decoy fails before any harness-computed check.
+    violations += G(lambda rd: _load_sibling("headline_binding").gate_findings(rd),
+                    run_dir, check_name="headline_binding")
     # Phase 34: done_when findings computed by the caller, added before the
     # escalation so their persistence counts (Codex review).
     violations += list(extra or [])
