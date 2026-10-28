@@ -151,6 +151,7 @@ for f in main.py \
   scripts/compare_models.py scripts/compute.py scripts/convergence_report.py \
   scripts/cross_model_critic.py scripts/decision_brief.py scripts/done_when.py \
   scripts/effect_size_registry.py \
+  scripts/effect_concordance.py \
   scripts/effort_floors.py scripts/eligibility_probe.py \
   scripts/figure_validator.py scripts/identifiability.py \
   scripts/identifiability_a_priori.py scripts/lessons.py \

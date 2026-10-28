@@ -239,6 +239,26 @@ compartmental/scalar. The spec-compliance heuristic recognizes
 and `ss.Sim(...)` as unambiguous ABM signals — any one of these makes
 the ABM-vs-ODE counting heuristic stand down.
 
+## Effects held to trial evidence, whatever the architecture (Phase 38 β)
+
+E7 attempt 7 built a full agent-based model because the question asked for
+one. Every single-trial benchmark passed, but the plan's dual-AI net effect
+against the run's comparator was an 83% burden reduction in covered seasons.
+The pooled trials of dual-AI against the pyrethroid nets that comparator
+kept support at most about 35% at the model's attained use. The fix, a cap
+added after the library had run, came in round 2.
+
+`models/effect_concordance.yaml` (format in `scripts/effect_concordance.py`)
+makes this a check from the first allocation. Per intervention, record the
+model's outcome ratio under the plan vs the decision brief's primary
+comparator, in units receiving only that intervention, plus the registry
+effect for the trial comparison that matches what the comparator already
+delivers. The gate holds the modeled reduction to the trial's largest
+plausible reduction, scaled to attained use. Compute it on the pilot before
+a large batch. When it fails, the hybrid pattern above is the usual fix: keep
+the mechanistic model for baseline transmission and constrain the
+intervention effect to the trial.
+
 ## Related skills
 
 - `modeling-strategy` — purpose-driven complexity. This skill tells you "which complexity"; use modeling-strategy to decide "how much".

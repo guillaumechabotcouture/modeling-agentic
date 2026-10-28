@@ -926,6 +926,17 @@ def intervention_effect(intervention, p0):
 ```
 
 Reserve full-mechanistic for transmission research, not allocation.
+Whatever the architecture, write `models/effect_concordance.yaml` with your
+first allocation (Phase 38 β; format in `scripts/effect_concordance.py`).
+For each intervention with a trial effect in the registry, give the model's
+outcome ratio under the plan vs the decision brief's primary comparator, in
+units that receive only that intervention, and name the registry effect for
+the trial comparison that matches what the comparator already delivers (a
+new product against the product the comparator keeps, not against nothing).
+The gate holds the modeled reduction to the trial's. Check it on the pilot,
+before a large library batch: an agent-based model whose combined effect
+exceeds the trials is the failure this architecture section exists to stop.
+
 See `mechanistic-vs-hybrid-architecture` skill for the decision tree
 and worked example of the 1935 4-round evolution.
 

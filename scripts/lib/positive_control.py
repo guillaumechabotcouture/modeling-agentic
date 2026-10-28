@@ -446,6 +446,13 @@ def build(run_dir: str, round_n: int = 2) -> dict:
             f"{c['cost'] if on else 0.0},{c['cases_averted'] if on else 0.0},"
             f"{c['dalys_averted'] if on else 0.0}")
     _w(run_dir, "models/allocation.csv", "\n".join(alloc_lines) + "\n")
+    # Phase 38 β: the campaign's effect against no campaign, held to the trial efficacy.
+    _w(run_dir, "models/effect_concordance.yaml", {"effects": [{
+        "id": "E1", "intervention": "vaccination campaign", "registry": "vaccine_efficacy",
+        "trial_comparator": "unvaccinated (placebo arm)", "trial_use": 1.0, "comparator_id": "CF1",
+        "comparator_delivers": "no campaign: no vaccination in the district",
+        "units": "funded districts, campaign year",
+        "model_ratio": round(1 - mod.VACCINE_EFFICACY * mod.COVERAGE, 4), "model_use": mod.COVERAGE}]})
     spent = sum(by_name[d]["cost"] for d in funded)
     dalys = sum(by_name[d]["dalys_averted"] for d in funded)
     cases = sum(by_name[d]["cases_averted"] for d in funded)
