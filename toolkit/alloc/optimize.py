@@ -190,12 +190,41 @@ def _scale(*xs) -> float:
     return m if m > 0 else 1.0
 
 
+def _cost_scale(opts, b0) -> float:
+    """Scale of the budget constraint: the budget and the cheapest possible spend, never an outlier option's
+    cost (Codex review 2: a 1e9 option must not loosen a budget of 1)."""
+    return _scale(b0, sum(min(abs(x[2]) for x in o) for o in opts.values()))
+
+
+def _cap_scale(opts, k, mx) -> float:
+    return _scale(mx, sum(min(x[3][k] for x in o) for o in opts.values()))
+
+
 def _limits(opts, caps, b0):
-    """(budget limit, [cap limits]) with tolerances relative to each constraint's own scale."""
-    cs = _scale(b0, *(x[2] for o in opts.values() for x in o))
-    cl = [float(cp["max"]) + BUDGET_RTOL * _scale(float(cp["max"]), *(x[3][k] for o in opts.values() for x in o))
-          for k, cp in enumerate(caps)]
-    return b0 + BUDGET_RTOL * cs, cl
+    """(budget limit, [cap limits]) with tolerances relative to each constraint's own limit."""
+    return (b0 + BUDGET_RTOL * _cost_scale(opts, b0),
+            [float(cp["max"]) + BUDGET_RTOL * _cap_scale(opts, k, float(cp["max"])) for k, cp in enumerate(caps)])
+
+
+def drop_impossible(opts, blim, cmax) -> tuple[dict, int]:
+    """Drop options that cannot be part of any feasible allocation: their own cost (or cap use) plus the
+    cheapest choice in every other unit already exceeds the limit."""
+    K = len(cmax)
+    mc = {u: min(x[2] for x in o) for u, o in opts.items()}
+    mw = {u: [min(x[3][k] for x in o) for k in range(K)] for u, o in opts.items()}
+    tc, tw = sum(mc.values()), [sum(mw[u][k] for u in opts) for k in range(K)]
+    out, n = {}, 0
+    for u, o in opts.items():
+        keep = [x for x in o if tc - mc[u] + x[2] <= blim
+                and all(tw[k] - mw[u][k] + x[3][k] <= cmax[k] for k in range(K))]
+        n += len(o) - len(keep)
+        out[u] = keep
+    return out, n
+
+
+def _baseline(opts) -> float:
+    """The benefit every allocation gets anyway (each unit's least benefit); gains are measured above it."""
+    return sum(min(x[1] for x in o) for o in opts.values())
 
 
 def check(choice, benefit, cost, feasible, budget, caps=None) -> list[str]:
@@ -212,11 +241,10 @@ def check(choice, benefit, cost, feasible, budget, caps=None) -> list[str]:
             continue
         tot += hit[0][2]
         use = [a + b for a, b in zip(use, hit[0][3])]
-    cs = _scale(b0, *(x[2] for o in opts.values() for x in o))
-    if tot > b0 + CHECK_RTOL * cs:
+    if tot > b0 + CHECK_RTOL * _scale(b0, tot):
         errs.append(f"cost {tot:,.4f} exceeds the budget {b0:,.4f}")
     for k, (n, cp, x) in enumerate(zip(names, caps, use)):
-        if x > float(cp["max"]) + CHECK_RTOL * _scale(float(cp["max"]), *(y[3][k] for o in opts.values() for y in o)):
+        if x > float(cp["max"]) + CHECK_RTOL * _scale(float(cp["max"]), x):
             errs.append(f"cap {n}: use {x:g} exceeds {cp['max']:g}")
     return errs
 
@@ -240,16 +268,20 @@ def _ilp(us, opts, caps, names, blim, cmax, time_limit):
     prob = pulp.LpProblem("alloc", pulp.LpMaximize)
     x = {(i, j): pulp.LpVariable(f"x_{i}_{j}", cat="Binary") for i, u in enumerate(us) for j in range(len(opts[u]))}
     # Coefficients normalised to O(1): CBC's tolerances are absolute, so raw objectives of 1e-9 or 1e9 would
-    # let it call a suboptimal allocation optimal (Codex review 1).
-    bs = _scale(*(x[1] for o in opts.values() for x in o))
-    cs = _scale(blim, *(x[2] for o in opts.values() for x in o))
-    prob += pulp.lpSum((opts[u][j][1] / bs) * x[i, j] for i, u in enumerate(us) for j in range(len(opts[u])))
+    # let it call a suboptimal allocation optimal (Codex review 1). The objective is each unit's gain over its
+    # least-benefit option, so a large benefit every allocation gets anyway (a locked unit) cannot swamp the
+    # gains being optimised (Codex review 2); constraints are scaled by their own limit, not by outlier options.
+    base = {u: min(y[1] for y in opts[u]) for u in us}
+    bs = _scale(*(y[1] - base[u] for u in us for y in opts[u]))
+    cs = _cost_scale(opts, blim)
+    prob += pulp.lpSum(((opts[u][j][1] - base[u]) / bs) * x[i, j]
+                       for i, u in enumerate(us) for j in range(len(opts[u])))
     for i, u in enumerate(us):
         prob += pulp.lpSum(x[i, j] for j in range(len(opts[u]))) == 1
     prob += pulp.lpSum((opts[u][j][2] / cs) * x[i, j]
                        for i, u in enumerate(us) for j in range(len(opts[u]))) <= blim / cs
     for k, cp in enumerate(caps):
-        ws = _scale(cmax[k], *(x[3][k] for o in opts.values() for x in o))
+        ws = _cap_scale(opts, k, cmax[k])
         terms = [(opts[u][j][3][k] / ws) * x[i, j] for i, u in enumerate(us) for j in range(len(opts[u]))
                  if opts[u][j][3][k]]
         if terms:
@@ -383,15 +415,22 @@ def solve(benefit, cost, feasible, budget, caps=None, method="ilp", time_limit=3
     if method not in METHOD_NAMES:
         raise ValueError(f"method must be one of {', '.join(METHOD_NAMES)}")
     us, opts, caps, names, b0 = _prepare(benefit, cost, feasible, budget, caps)
+    base = _baseline(opts)
     opts, npruned = prune(opts)
     blim, cmax = _limits(opts, caps, b0)
-    if method == "ilp":
+    opts, nimp = drop_impossible(opts, blim, cmax)
+    if any(not o for o in opts.values()):
+        r = _result(method, us, opts, None, "infeasible" if method in EXACT else "no_feasible_found", time.time(),
+                    names, bound=None)
+    elif method == "ilp":
         r = _ilp(us, opts, caps, names, blim, cmax, time_limit)
     elif method == "greedy":
         r = _greedy(us, opts, caps, names, blim, cmax)
     else:
         r = _brute(us, opts, caps, names, blim, cmax, brute_limit)
     r["n_pruned_dominated"] = npruned
+    r["n_impossible"] = nimp
+    r["baseline"] = base
     r["search_space"] = search_space(opts)
     if r["choice"] is not None:
         bad = check(r["choice"], benefit, cost, feasible, budget, caps)
@@ -400,8 +439,11 @@ def solve(benefit, cost, feasible, budget, caps=None, method="ilp", time_limit=3
     return r
 
 
-def _better(a: float, b: float) -> bool:
-    return a > b + BEAT_RTOL * max(abs(a), abs(b))
+def _better(a: float, b: float, base: float = 0.0) -> bool:
+    """a beats b, comparing gains above the common baseline (so a large fixed benefit cannot hide a
+    disagreement), with room for the rounding of the baseline itself."""
+    ga, gb = a - base, b - base
+    return ga > gb + BEAT_RTOL * max(abs(ga), abs(gb)) + 1e-12 * abs(base)
 
 
 def assert_consistent(results: dict, primary: str) -> None:
@@ -420,13 +462,14 @@ def assert_consistent(results: dict, primary: str) -> None:
                 raise OptimizerError(f"{m} reports infeasible but another method found a feasible allocation")
             continue
         for e, re in exact.items():
-            if e != m and _better(r["objective"], re["objective"]):
+            if e != m and _better(r["objective"], re["objective"], re.get("baseline", 0.0)):
                 raise OptimizerError(f"{m} ({r['objective']:.6g}) beats the exact method {e} "
                                      f"({re['objective']:.6g}): a solver defect, not a footnote")
     g = results.get("greedy")
     if g and g.get("bound") is not None and g["objective"] is not None and exact:
         opt = max(r["objective"] for r in exact.values())
-        if opt - g["objective"] > g["bound"] + BEAT_RTOL * abs(opt):
+        base = g.get("baseline", 0.0)
+        if opt - g["objective"] > g["bound"] + BEAT_RTOL * abs(opt - base) + 1e-12 * abs(base):
             raise OptimizerError(f"greedy is {opt - g['objective']:.6g} below the optimum, outside its bound "
                                  f"{g['bound']:.6g}: a greedy defect")
 
@@ -484,6 +527,8 @@ def benchmark(benefit, cost, feasible, budget, caps=None, primary="ilp", methods
         notes.append("Greedy with caps: no a-priori bound; heuristic only.")
     for m, why in skipped.items():
         notes.append(f"{METHOD_NAMES[m]} not run: {why}.")
+    notes.append("gap_pct is relative to the total objective; gain_gap_pct is relative to the gain above "
+                 "baseline_objective (the benefit every allocation gets, e.g. from locked units).")
     if best <= 0:
         notes.append(f"The best objective is {best:g} (nothing gained at this budget): gap_pct is undefined, and "
                      "scripts/optimization_quality.py reports such a file as MALFORMED.")
@@ -499,6 +544,9 @@ def benchmark(benefit, cost, feasible, budget, caps=None, primary="ilp", methods
                                "cost": float(r["cost"])}
                               for m, r in res.items() if m != primary and r["objective"] is not None],
         "gap_pct": 100.0 * (best - p["objective"]) / best if best > 0 else None,
+        "baseline_objective": float(p["baseline"]),
+        "gain_gap_pct": (100.0 * (best - p["objective"]) / (best - p["baseline"])
+                         if best - p["baseline"] > 0 else None),
         "constraints": [{"name": n, "max": float(cp["max"]), "use": float(p["cap_use"][n])}
                         for n, cp in zip(names, caps)],
         "n_units": len(us),
@@ -714,6 +762,27 @@ def _self_test() -> int:
                f"TC28 (Codex) objectives of scale {scale:g} are optimised exactly by every method: {rs}")
             rb = benchmark(tb, tc, tf, 1.0)
             ok(rb["gap_pct"] == 0.0, f"TC29 ... and the benchmark agrees at scale {scale:g}")
+        # Codex round 2: an outlier option must not loosen the budget or a cap
+        tb = {"a": {"none": 0.0, "small": 1.0, "huge": 2.0}}
+        tf = {"a": {"none": True, "small": True, "huge": True}}
+        for m in ("ilp", "greedy", "brute"):
+            r1 = solve(tb, {"a": {"none": 0.0, "small": 2.0, "huge": 1e9}}, tf, 1.0, caps=[], method=m)
+            r2 = solve(tb, {"a": {"none": 0.0, "small": 0.0, "huge": 0.0}}, tf, 1.0, method=m,
+                       caps=[{"name": "k", "max": 0, "weights": {"a": {"none": 0.0, "small": 1.0, "huge": 1e9}}}])
+            ok(r1["choice"] == {"a": "none"} and r2["choice"] == {"a": "none"},
+               f"TC31 (Codex r2, {m}) an outlier option's cost or cap use does not widen the tolerance")
+        ok(check({"a": "small"}, tb, {"a": {"none": 0.0, "small": 2.0, "huge": 1e9}}, tf, 1.0, caps=[]) != [],
+           "TC32 (Codex r2) the independent check rejects the overspend")
+        # Codex round 2: a large benefit every allocation gets (a locked unit) must not hide a wrong optimum
+        tb = {"L": {"lock": 1e9}, "A": {"none": 0.0, "x": 26.0}, "B": {"none": 0.0, "x": 23.0}}
+        tc = {"L": {"lock": 0.0}, "A": {"none": 0.0, "x": 7.0}, "B": {"none": 0.0, "x": 6.0}}
+        tf = {u: {p: True for p in ps} for u, ps in tb.items()}
+        rs = {m: solve(tb, tc, tf, 8.0, method=m)["choice"] for m in EXACT}   # greedy takes B (higher ratio)
+        ok(all(c["A"] == "x" and c["B"] == "none" for c in rs.values()),
+           f"TC33 (Codex r2) a large fixed benefit does not swamp the gains being optimised: {rs}")
+        ok(_better(1e9 + 26, 1e9 + 23, 1e9), "TC34 ... and a disagreement above a large baseline is detected")
+        rb = benchmark(tb, tc, tf, 8.0)
+        ok(rb["gain_gap_pct"] == 0.0 and rb["baseline_objective"] == 1e9, "TC35 the gain-relative gap is reported")
         # Codex review 3: a budget that buys nothing gives an undefined gap, said so, and no crash
         rz = benchmark({"a": {"none": 0.0, "x": 1.0}}, {"a": {"none": 0.0, "x": 1.0}},
                        {"a": {"none": True, "x": True}}, 0.0, out=os.path.join(d, "z.yaml"))
