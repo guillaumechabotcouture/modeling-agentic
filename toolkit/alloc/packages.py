@@ -202,7 +202,7 @@ def validate(spec: dict, units: list[dict]) -> list[str]:
             errs.append(f"caps.{c}: give max_units and/or max_quantity")
             continue
         for k in ("max_units", "max_quantity"):
-            if k in cap and not ((_float(cap[k]) is not None) and cap[k] >= 0):
+            if k in cap and not ((_float(cap[k]) is not None) and _float(cap[k]) >= 0):   # YAML reads 1e6 as a string
                 errs.append(f"caps.{c}.{k}: must be a number >= 0")
         if "max_quantity" in cap:
             q = cap.get("quantity")
@@ -363,6 +363,10 @@ def _self_test() -> int:
        "TC20 a cap the locks already exceed fails")
     ok("give max_units" in errs_of({**spec, "caps": {"c2": {}}}, units), "TC21 a cap with no limit fails")
     ok("needs `quantity`" in errs_of({**spec, "caps": {"c2": {"max_quantity": 3}}}, units), "TC22 a quantity cap needs its quantity")
+    f = feasibility({**spec, "caps": {"c1": {"max_quantity": "1e6", "quantity": "total"}}}, units)
+    ok(f["caps"][0]["max"] == 1e6, "TC24 (Codex) a cap written 1e6, which YAML reads as a string, is parsed")
+    ok("must be a number" in errs_of({**spec, "caps": {"c1": {"max_units": "lots"}}}, units),
+       "TC25 a non-numeric cap fails")
     ok("no feasible package" in errs_of({**spec, "packages": {"only_c2": ["c2"]}}, units),
        "TC23 a unit left with no feasible package fails")
     if fails:

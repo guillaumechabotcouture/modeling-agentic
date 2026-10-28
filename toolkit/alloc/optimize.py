@@ -183,6 +183,21 @@ def prune(opts: dict) -> tuple[dict, int]:
     return out, n
 
 
+def _scale(*xs) -> float:
+    """The magnitude tolerances are relative to (no absolute floor of 1, so tiny objectives or costs are not
+    swamped); 1.0 only when every value is zero."""
+    m = max((abs(x) for x in xs), default=0.0)
+    return m if m > 0 else 1.0
+
+
+def _limits(opts, caps, b0):
+    """(budget limit, [cap limits]) with tolerances relative to each constraint's own scale."""
+    cs = _scale(b0, *(x[2] for o in opts.values() for x in o))
+    cl = [float(cp["max"]) + BUDGET_RTOL * _scale(float(cp["max"]), *(x[3][k] for o in opts.values() for x in o))
+          for k, cp in enumerate(caps)]
+    return b0 + BUDGET_RTOL * cs, cl
+
+
 def check(choice, benefit, cost, feasible, budget, caps=None) -> list[str]:
     """Independent check of an allocation: one feasible package per unit, within budget and caps."""
     us, opts, caps, names, b0 = _prepare(benefit, cost, feasible, budget, caps)
@@ -197,10 +212,11 @@ def check(choice, benefit, cost, feasible, budget, caps=None) -> list[str]:
             continue
         tot += hit[0][2]
         use = [a + b for a, b in zip(use, hit[0][3])]
-    if tot > b0 + CHECK_RTOL * max(1.0, abs(b0)):
+    cs = _scale(b0, *(x[2] for o in opts.values() for x in o))
+    if tot > b0 + CHECK_RTOL * cs:
         errs.append(f"cost {tot:,.4f} exceeds the budget {b0:,.4f}")
-    for n, cp, x in zip(names, caps, use):
-        if x > float(cp["max"]) + CHECK_RTOL * max(1.0, abs(float(cp["max"]))):
+    for k, (n, cp, x) in enumerate(zip(names, caps, use)):
+        if x > float(cp["max"]) + CHECK_RTOL * _scale(float(cp["max"]), *(y[3][k] for o in opts.values() for y in o)):
             errs.append(f"cap {n}: use {x:g} exceeds {cp['max']:g}")
     return errs
 
@@ -216,21 +232,28 @@ def _result(method, us, opts, choice, status, t0, names, **extra):
     return r
 
 
-def _ilp(us, opts, caps, names, budget, tol, time_limit):
+def _ilp(us, opts, caps, names, blim, cmax, time_limit):
     pulp = _pulp()
     if pulp is None:
         raise ImportError("method ilp needs PuLP (requirements.txt pins PuLP==3.3.0)")
     t0 = time.time()
     prob = pulp.LpProblem("alloc", pulp.LpMaximize)
     x = {(i, j): pulp.LpVariable(f"x_{i}_{j}", cat="Binary") for i, u in enumerate(us) for j in range(len(opts[u]))}
-    prob += pulp.lpSum(opts[u][j][1] * x[i, j] for i, u in enumerate(us) for j in range(len(opts[u])))
+    # Coefficients normalised to O(1): CBC's tolerances are absolute, so raw objectives of 1e-9 or 1e9 would
+    # let it call a suboptimal allocation optimal (Codex review 1).
+    bs = _scale(*(x[1] for o in opts.values() for x in o))
+    cs = _scale(blim, *(x[2] for o in opts.values() for x in o))
+    prob += pulp.lpSum((opts[u][j][1] / bs) * x[i, j] for i, u in enumerate(us) for j in range(len(opts[u])))
     for i, u in enumerate(us):
         prob += pulp.lpSum(x[i, j] for j in range(len(opts[u]))) == 1
-    prob += pulp.lpSum(opts[u][j][2] * x[i, j] for i, u in enumerate(us) for j in range(len(opts[u]))) <= budget + tol
+    prob += pulp.lpSum((opts[u][j][2] / cs) * x[i, j]
+                       for i, u in enumerate(us) for j in range(len(opts[u]))) <= blim / cs
     for k, cp in enumerate(caps):
-        terms = [opts[u][j][3][k] * x[i, j] for i, u in enumerate(us) for j in range(len(opts[u])) if opts[u][j][3][k]]
+        ws = _scale(cmax[k], *(x[3][k] for o in opts.values() for x in o))
+        terms = [(opts[u][j][3][k] / ws) * x[i, j] for i, u in enumerate(us) for j in range(len(opts[u]))
+                 if opts[u][j][3][k]]
         if terms:
-            prob += pulp.lpSum(terms) <= float(cp["max"]) + BUDGET_RTOL * max(1.0, abs(float(cp["max"])))
+            prob += pulp.lpSum(terms) <= cmax[k] / ws
     prob.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=time_limit, gapRel=0.0, gapAbs=0.0))
     sol = prob.sol_status
     if sol == pulp.LpSolutionInfeasible or prob.status == pulp.LpStatusInfeasible:
@@ -266,14 +289,13 @@ def _hull(o, start):
     return hull
 
 
-def _greedy(us, opts, caps, names, budget, tol):
+def _greedy(us, opts, caps, names, blim, cmax):
     t0 = time.time()
-    cmax = [float(cp["max"]) + BUDGET_RTOL * max(1.0, abs(float(cp["max"]))) for cp in caps]
     pos = {u: min(range(len(opts[u])), key=lambda j: (opts[u][j][2], -opts[u][j][1], sum(opts[u][j][3])))
            for u in us}
     spent = sum(opts[u][pos[u]][2] for u in us)
     use = [sum(opts[u][pos[u]][3][k] for u in us) for k in range(len(caps))]
-    if spent > budget + tol or any(x > m for x, m in zip(use, cmax)):
+    if spent > blim or any(x > m for x, m in zip(use, cmax)):
         return _result("greedy", us, opts, None, "no_feasible_found", t0, names, bound=None)
     hulls = {u: _hull(opts[u], pos[u]) for u in us}
     steps = []
@@ -291,7 +313,7 @@ def _greedy(us, opts, caps, names, budget, tol):
             continue
         a, b = opts[u][hulls[u][k - 1]], opts[u][hulls[u][k]]
         nu = [x + (wb - wa) for x, wa, wb in zip(use, a[3], b[3])]
-        if spent + (b[2] - a[2]) <= budget + tol and all(x <= m for x, m in zip(nu, cmax)):
+        if spent + (b[2] - a[2]) <= blim and all(x <= m for x, m in zip(nu, cmax)):
             at[u], spent, use = k, spent + (b[2] - a[2]), nu
     cur = {u: hulls[u][at[u]] for u in us}
     while True:     # best affordable single-unit change (any feasible package), until none improves
@@ -300,10 +322,10 @@ def _greedy(us, opts, caps, names, budget, tol):
             a = opts[u][cur[u]]
             for j, b in enumerate(opts[u]):
                 g = b[1] - a[1]
-                if g <= 1e-12 * max(1.0, abs(a[1])):
+                if g <= 1e-12 * max(abs(a[1]), abs(b[1])):
                     continue
                 nu = [x + (wb - wa) for x, wa, wb in zip(use, a[3], b[3])]
-                if spent + (b[2] - a[2]) <= budget + tol and all(x <= m for x, m in zip(nu, cmax)):
+                if spent + (b[2] - a[2]) <= blim and all(x <= m for x, m in zip(nu, cmax)):
                     if best is None or g > best[0]:
                         best = (g, u, j, nu)
         if best is None:
@@ -322,12 +344,11 @@ def search_space(opts: dict) -> int:
     return n
 
 
-def _brute(us, opts, caps, names, budget, tol, limit):
+def _brute(us, opts, caps, names, blim, cmax, limit):
     t0 = time.time()
     if search_space(opts) > limit:
         raise ValueError(f"brute: search space {search_space(opts):.3g} exceeds brute_limit {limit:.3g}")
     n, K = len(us), len(caps)
-    cmax = [float(cp["max"]) + BUDGET_RTOL * max(1.0, abs(float(cp["max"]))) for cp in caps]
     o = [sorted(opts[u], key=lambda x: -x[1]) for u in us]
     smin_c = [0.0] * (n + 1)
     smax_b = [0.0] * (n + 1)
@@ -340,7 +361,7 @@ def _brute(us, opts, caps, names, budget, tol, limit):
     pick = [None] * n
 
     def dfs(i, c, b, w):
-        if c + smin_c[i] > budget + tol or any(w[k] + smin_w[i][k] > cmax[k] for k in range(K)):
+        if c + smin_c[i] > blim or any(w[k] + smin_w[i][k] > cmax[k] for k in range(K)):
             return
         if b + smax_b[i] <= best[0]:
             return
@@ -363,13 +384,13 @@ def solve(benefit, cost, feasible, budget, caps=None, method="ilp", time_limit=3
         raise ValueError(f"method must be one of {', '.join(METHOD_NAMES)}")
     us, opts, caps, names, b0 = _prepare(benefit, cost, feasible, budget, caps)
     opts, npruned = prune(opts)
-    tol = BUDGET_RTOL * max(1.0, abs(b0))
+    blim, cmax = _limits(opts, caps, b0)
     if method == "ilp":
-        r = _ilp(us, opts, caps, names, b0, tol, time_limit)
+        r = _ilp(us, opts, caps, names, blim, cmax, time_limit)
     elif method == "greedy":
-        r = _greedy(us, opts, caps, names, b0, tol)
+        r = _greedy(us, opts, caps, names, blim, cmax)
     else:
-        r = _brute(us, opts, caps, names, b0, tol, brute_limit)
+        r = _brute(us, opts, caps, names, blim, cmax, brute_limit)
     r["n_pruned_dominated"] = npruned
     r["search_space"] = search_space(opts)
     if r["choice"] is not None:
@@ -380,7 +401,7 @@ def solve(benefit, cost, feasible, budget, caps=None, method="ilp", time_limit=3
 
 
 def _better(a: float, b: float) -> bool:
-    return a > b + BEAT_RTOL * max(1.0, abs(a), abs(b))
+    return a > b + BEAT_RTOL * max(abs(a), abs(b))
 
 
 def assert_consistent(results: dict, primary: str) -> None:
@@ -405,7 +426,7 @@ def assert_consistent(results: dict, primary: str) -> None:
     g = results.get("greedy")
     if g and g.get("bound") is not None and g["objective"] is not None and exact:
         opt = max(r["objective"] for r in exact.values())
-        if opt - g["objective"] > g["bound"] + BEAT_RTOL * max(1.0, abs(opt)):
+        if opt - g["objective"] > g["bound"] + BEAT_RTOL * abs(opt):
             raise OptimizerError(f"greedy is {opt - g['objective']:.6g} below the optimum, outside its bound "
                                  f"{g['bound']:.6g}: a greedy defect")
 
@@ -463,6 +484,9 @@ def benchmark(benefit, cost, feasible, budget, caps=None, primary="ilp", methods
         notes.append("Greedy with caps: no a-priori bound; heuristic only.")
     for m, why in skipped.items():
         notes.append(f"{METHOD_NAMES[m]} not run: {why}.")
+    if best <= 0:
+        notes.append(f"The best objective is {best:g} (nothing gained at this budget): gap_pct is undefined, and "
+                     "scripts/optimization_quality.py reports such a file as MALFORMED.")
     report = {
         "primary_method": METHOD_NAMES[primary],
         "primary_objective": float(p["objective"]),
@@ -680,6 +704,22 @@ def _self_test() -> int:
         ok(vg["verdict"] in ("CLEAN", "GAP_TOO_LARGE") and abs(vg["gap_pct"] - rg["gap_pct"]) < 1e-9
            and rg["primary_objective"] <= max(b["objective"] for b in rg["benchmark_methods"]),
            f"TC27 a greedy primary is reported with its true gap to the exact methods: {vg}")
+        # Codex review 1: tiny (or huge) objectives must not fall inside a solver's absolute tolerance
+        for scale in (1e-9, 1e9):
+            tb = {"a": {"none": 0.0, "x": 1.0 * scale}, "b": {"none": 0.0, "x": 2.0 * scale}}
+            tc = {"a": {"none": 0.0, "x": 1.0}, "b": {"none": 0.0, "x": 1.0}}
+            tf = {u: {"none": True, "x": True} for u in tb}
+            rs = {m: solve(tb, tc, tf, 1.0, method=m)["choice"] for m in ("ilp", "greedy", "brute")}
+            ok(all(c == {"a": "none", "b": "x"} for c in rs.values()),
+               f"TC28 (Codex) objectives of scale {scale:g} are optimised exactly by every method: {rs}")
+            rb = benchmark(tb, tc, tf, 1.0)
+            ok(rb["gap_pct"] == 0.0, f"TC29 ... and the benchmark agrees at scale {scale:g}")
+        # Codex review 3: a budget that buys nothing gives an undefined gap, said so, and no crash
+        rz = benchmark({"a": {"none": 0.0, "x": 1.0}}, {"a": {"none": 0.0, "x": 1.0}},
+                       {"a": {"none": True, "x": True}}, 0.0, out=os.path.join(d, "z.yaml"))
+        ok(rz["gap_pct"] is None and "gap_pct is undefined" in rz["notes"]
+           and oq.validate_optimization_quality(os.path.join(d, "z.yaml"))["verdict"] == "MALFORMED",
+           "TC30 (Codex) a zero best objective: gap undefined, noted, and the checker fails closed")
     if fails:
         print("SELF-TEST FAILURES:")
         for m in fails:
@@ -723,7 +763,8 @@ def main(argv=None) -> int:
         print(f"ERROR: {type(e).__name__}: {e}")
         return 1
     print(f"{rep['primary_method']}: {rep['primary_objective']:,.4g} at cost {rep['primary_cost']:,.0f} "
-          f"(budget {rep['budget']:,.0f}); gap {rep['gap_pct']:.4g}%; status {rep['primary_status']}")
+          f"(budget {rep['budget']:,.0f}); gap "
+          f"{'n/a' if rep['gap_pct'] is None else format(rep['gap_pct'], '.4g') + '%'}; status {rep['primary_status']}")
     if rep["path"]:
         print(f"wrote {rep['path']}")
     return 0
