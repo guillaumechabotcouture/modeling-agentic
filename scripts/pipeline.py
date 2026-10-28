@@ -843,9 +843,16 @@ def scratch(run_dir: str, step_id: str, python: str | None = None, keep: bool = 
     """Run one step in a temporary copy of the run dir. Nothing in the run dir changes."""
     run_dir = os.path.realpath(run_dir)
     before = _stat_tree(run_dir)
-    dst = os.path.realpath(tempfile.mkdtemp(prefix="pipeline_scratch_"))
-    copy = os.path.join(dst, os.path.basename(run_dir))
-    shutil.copytree(run_dir, copy, symlinks=True)
+    # The copy is a hidden sibling of the run dir, so a run script that reaches the repo by
+    # a path relative to its run (E7 attempt 7: `<run>/../../scripts` for figure_validator)
+    # resolves it from the copy as from the run. Falls back to the system temp dir.
+    try:
+        dst = os.path.realpath(tempfile.mkdtemp(prefix=f".{os.path.basename(run_dir)}.scratch_",
+                                                dir=os.path.dirname(run_dir)))
+    except OSError:
+        dst = os.path.realpath(tempfile.mkdtemp(prefix="pipeline_scratch_"))
+    copy = dst
+    shutil.copytree(run_dir, copy, symlinks=True, dirs_exist_ok=True)
     # A symlink in the copy that points back into the real run dir would let the step
     # write there: re-point it at the same place in the copy.
     for dp, dirs, fns in os.walk(copy):
@@ -1085,7 +1092,7 @@ def _self_test() -> int:
         ok(open(os.path.join(rep["scratch_dir"], "models/b.out")).read() == "scratch"
            and open(os.path.join(d, "models/b.out")).read() != "scratch",
            "PL18 scratch outputs land in the copy only")
-        shutil.rmtree(os.path.dirname(rep["scratch_dir"]), ignore_errors=True)
+        shutil.rmtree(rep["scratch_dir"], ignore_errors=True)
         os.symlink(os.path.join(d, "models"), os.path.join(d, "models_link"))
         w(d, "models/b.py", "open('models_link/b.out', 'w').write('via-link')\n")
         before = _tree_hash(d)
@@ -1118,6 +1125,23 @@ def _self_test() -> int:
         ok(_tree_hash(d) == before and rep["ok"], f"PL25 (Codex r2) scratch never writes through a symlinked manifest: {rep}")
         os.remove(os.path.join(d, SPEC))
         os.replace(os.path.join(d, "pipeline_source.yaml"), os.path.join(d, SPEC))
+
+    # Real-check (E7 attempt 7): run code reaches the repo relative to the run dir
+    # (`<run>/../../scripts/figure_validator.py`); a scratch copy must resolve it too.
+    with tempfile.TemporaryDirectory() as top:
+        top = os.path.realpath(top)
+        d = os.path.join(top, "runs", "r1")
+        w(top, "scripts/tool.py", "K = 5\n")
+        w(d, "models/a.py", "import os, sys\nsys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname("
+                            "os.path.dirname(os.path.abspath(__file__)))), '..', 'scripts'))\n"
+                            "import tool\nopen('models/a.out', 'w').write(str(tool.K))\n")
+        spec(d, [{"id": "a", "run": f"{py} models/a.py", "inputs": [], "outputs": ["models/a.out"]}])
+        ok(run(d)["ok"], "PL26a fixture: the step runs in the run dir")
+        before = _tree_hash(d)
+        rep = scratch(d, "a", keep=False)
+        ok(rep["ok"] and _tree_hash(d) == before and not os.path.exists(rep["scratch_dir"])
+           and os.listdir(os.path.join(top, "runs")) == ["r1"],
+           f"PL26 a scratch copy resolves paths relative to the run's place (and is removed): {rep.get('steps')}")
 
     # Validation fails closed.
     def errs_of(steps, extra=None):
