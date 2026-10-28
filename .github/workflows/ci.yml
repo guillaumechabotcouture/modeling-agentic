@@ -38,7 +38,7 @@ jobs:
       - name: Self-tests (every script with --self-test)
         run: |
           fail=0
-          for f in main.py $(git ls-files 'scripts/*.py' 'scripts/lib/*.py' 'toolkit/**/*.py'); do
+          for f in main.py $(git ls-files 'scripts/*.py' 'scripts/lib/*.py' 'toolkit/**/*.py' 'cloud/*.py'); do
             case "$f" in */__init__.py) continue;; esac
             grep -q -- '--self-test' "$f" || continue
             echo "::group::$f"
