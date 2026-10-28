@@ -20,6 +20,8 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # structure metrics compare with main and read merged-PR history
 
       - uses: actions/setup-python@v5
         with:
@@ -54,3 +56,10 @@ jobs:
 
       - name: Planted-defect regression eval (deterministic gates)
         run: .venv/bin/python scripts/regression_eval.py
+
+      - name: Structure metrics against main (information only)
+        if: always()
+        continue-on-error: true
+        run: |
+          git fetch -q origin main
+          python3 scripts/structure_metrics.py --ref origin/main --against HEAD | tee -a "$GITHUB_STEP_SUMMARY"
