@@ -52,9 +52,10 @@ Validation (fail closed, before computing):
 - unknown components and missing population fields;
 - an index price rule without index entries for its price year and the base year;
 - two items of one component whose `includes` overlap (a double count);
-- per_eligible and per_reached items charged on a population other than the
-  component's own eligible population, so a targeted intervention cannot be
-  costed on everyone;
+- for a targeted component (one with an eligible population), any
+  population-based cost charged on another population, whatever its basis,
+  unless the item gives `charged_beyond_eligible: <reason>`; so a targeted
+  intervention cannot be costed on everyone;
 - a packaged component with no cost item, unless it declares
   `cost_free: <reason>`;
 - a package with two components of one group.
@@ -175,6 +176,13 @@ def validate(spec: dict, unit_fields: set[str] | None = None) -> list[str]:
             errs.append(f"cost_items.{iid}: per_reached needs components.{c}.reach_share")
         if basis in ("per_person", "per_commodity") and it.get("population", "total") not in pops:
             errs.append(f"cost_items.{iid}: population {it.get('population')} is not in units.populations")
+        if (basis in ("per_person", "per_commodity") and cd.get("eligible")
+                and it.get("population", "total") != cd["eligible"]
+                and len(str(it.get("charged_beyond_eligible") or "").strip()) < 10):
+            errs.append(f"cost_items.{iid}: {c} reaches {cd['eligible']} but this {basis} cost is charged on "
+                        f"{it.get('population', 'total')}; charge it on {cd['eligible']}, or give "
+                        "`charged_beyond_eligible: <reason>` for a cost that genuinely covers more people "
+                        "(e.g. community-wide mobilisation)")
         if basis == "per_commodity" and not (_num(it.get("people_per_commodity")) or 0) > 0:
             errs.append(f"cost_items.{iid}: per_commodity needs people_per_commodity > 0")
         for k in ("times", "years", "share"):
@@ -302,6 +310,15 @@ def _self_test() -> int:
     ok(any("components.c2: no cost item" in e for e in validate(free)), "TC10 an allocated component with no cost fails")
     ok(validate({**free, "components": {"c1": {}, "c2": {"eligible": "eligible", "cost_free": "donated"}}}) == [],
        "TC11 ... unless it is declared cost-free with a reason")
+    for b in ("per_person", "per_commodity"):
+        sneaky = {**spec, "cost_items": [spec["cost_items"][0],
+                                         {**spec["cost_items"][1], "basis": b, "people_per_commodity": 1.0}]}
+        ok(any("is charged on total" in e for e in validate(sneaky)),
+           f"TC19 (Codex) a targeted component's {b} cost on the whole population fails")
+        ok(validate({**sneaky, "cost_items": [sneaky["cost_items"][0],
+                                              {**sneaky["cost_items"][1],
+                                               "charged_beyond_eligible": "community mobilisation for everyone"}]}) == [],
+           f"TC20 ... unless it says why the cost covers more people ({b})")
     reach = {**spec, "cost_items": [spec["cost_items"][0], {**spec["cost_items"][1], "basis": "per_reached"}]}
     ok(any("reach_share" in e for e in validate(reach)), "TC12 per_reached needs the component's reach share")
     reach["components"] = {"c1": {}, "c2": {"eligible": "eligible", "reach_share": 0.5}}
