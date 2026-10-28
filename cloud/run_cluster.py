@@ -15,7 +15,7 @@ Lifecycle. Each run is pinned to its own agent VM and submitted with
 fire_and_forget, so it keeps running when this process exits. A finished run
 uploads its directory (main.py reads every upload back), its transcripts and
 its result record to storage; the last run of the launch then shuts the
-cluster down, and the keeper VM exits when the cluster stops and idles out.
+cluster down, and the keeper exits when the cluster stops and shuts its own VM down.
 If an upload fails, the agent VM holds the results on disk and stays busy
 (up to 24 h) until `collect` fetches them, after which `collect` shuts the
 cluster down. Nothing waits on a laptop: E7 attempt 7 sat idle 9.5 h after

@@ -164,6 +164,16 @@ def verify_attached(cl, expected_id):
 
 
 def keeper_task(token, name, workspace, lo, hi, hours, adapt_options, cluster_id=None):
+    """Run the keeper, then stop the keeper's own cluster: once the run cluster
+    has stopped there is nothing to hold, and an idle keeper VM is waste."""
+    try:
+        return _keeper_loop(token, name, workspace, lo, hi, hours, adapt_options, cluster_id)
+    finally:
+        from distributed import get_client
+        get_client().shutdown()
+
+
+def _keeper_loop(token, name, workspace, lo, hi, hours, adapt_options, cluster_id=None):
     """On the keeper VM: hold the run cluster's adaptive scaling (dask's Adaptive
     loop lives in the process that calls adapt). Attach-only, to the cluster id
     the launch created; reconnects after a dropped connection; exits when that
