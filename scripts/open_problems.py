@@ -54,6 +54,17 @@ STAGES = ("PLAN", "DATA", "MODEL", "ANALYZE", "WRITE")
 STAGE_AGENT = {"PLAN": "planner", "DATA": "data-agent", "MODEL": "modeler",
                "ANALYZE": "analyst", "WRITE": "writer"}
 ACTIONS = ("fix", "rethink", "declare", "after_write", "defer")
+
+
+def after_write_item(b: dict) -> bool:
+    """Phase 39 α: findings that wait for the first draft. Those aimed at the
+    write-up (target_stage WRITE), and presentation polish (category
+    PRESENTATION: captions, styling, figure-text wording). E7 attempt 7 spent
+    critic, analyst and gate time on them every round while the model they
+    describe was still changing. Figures themselves stay current every round
+    (the harness regenerates them, Phase 39 β) and remain a modeling tool."""
+    return (str(b.get("target_stage") or "").upper() == "WRITE"
+            or str(b.get("category") or "").upper() == "PRESENTATION")
 WORK_ACTIONS = ("fix", "rethink")
 # Critics the lead can spawn for a fix check (cross-model is a script;
 # sufficiency runs after the write-up).
@@ -145,8 +156,8 @@ def build(run_dir: str, round_n: int, max_rounds: int, critiques: dict,
                 continue
             first = _int(b.get("first_seen_round"), round_n)
             stage = str(b.get("target_stage") or "").upper()
-            if stage == "WRITE" and not written:
-                blocks_in = None  # nothing to fix before a write-up exists (HIGH included)
+            if after_write_item(b) and not written:
+                blocks_in = None  # waits for the first draft (HIGH included)
             elif sev == "HIGH":
                 blocks_in = 0
             else:
@@ -354,8 +365,9 @@ def check_plan(run_dir: str) -> list[str]:
             errors.append(f"{i['id']}: there is no write-up yet, so plan it as after_write")
         elif act in ("declare", "defer") and len(reason.strip()) < MIN_REASON:
             errors.append(f"{i['id']}: {act} needs a reason")
-        elif act == "after_write" and i["target_stage"] != "WRITE":
-            errors.append(f"{i['id']}: after_write is only for write-up findings (this one is {i['target_stage']})")
+        elif act == "after_write" and not after_write_item(i):
+            errors.append(f"{i['id']}: after_write is only for write-up and presentation findings "
+                          f"(this one is {i['target_stage']}, {i.get('category')})")
         elif act == "defer" and (i["blocks_in"] is not None and i["blocks_in"] <= 1):
             errors.append(f"{i['id']}: cannot be deferred: it is blocking now or blocks at the next gate")
         elif act == "declare" and not i.get("scope_declarable", True):
@@ -617,6 +629,12 @@ def _run_self_test() -> int:
            "OP2: MEDIUM first seen r2 at r5 blocks in 1 round; carried-forward note kept")
         ok(by["R-008"]["blocks_in"] == 0, "OP3: an escalated MEDIUM (its _persistent gate item) is blocking now")
         ok(by["P-007"]["blocks_in"] is None, "OP4: write-up finding does not escalate before a draft exists")
+        pres = {"id": "P-009", "severity": "HIGH", "target_stage": "ANALYZE", "category": "PRESENTATION"}
+        doc_p = build(d, 5, 8, {"critique-presentation": crit([{**pres, "first_seen_round": 2, "claim": "caption"}])},
+                      {"unresolved_high": []}, {}, {}, 4)
+        ok(doc_p["items"][0]["blocks_in"] is None and after_write_item(pres)
+           and not after_write_item({**pres, "category": "METHODS"}),
+           "OP4b (Phase 39 α): presentation polish waits for the draft, like write-up findings")
         ok(by["weakly_identified_parameters"]["blocks_in"] == 1, "OP5: validator kind seen 2 of 3 rounds")
         ok(by["ci_degenerate"]["scope_declarable"] is False and not by["X-001"]["fix_check"],
            "OP6: non-declarable gate item; cross-model findings need no spawned fix check")
