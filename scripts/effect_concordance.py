@@ -104,16 +104,19 @@ def _comparator_ids(run_dir: str) -> set[str] | None:
 
 
 def _num(x):
-    return float(x) if isinstance(x, (int, float)) and not isinstance(x, bool) else None
+    import math
+    return float(x) if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) else None
 
 
 def evaluate(run_dir: str) -> tuple[list[dict], list[str]]:
     """(rows, errors). A row has the effect's numbers, its bound and whether it exceeds it."""
     p = os.path.join(run_dir, PATH)
+    if not os.path.lexists(p):
+        return [], []     # absent: the rigor manifest reports it when an allocation exists
     try:
         doc = yaml.safe_load(open(p))
-    except OSError:
-        return [], []
+    except OSError as e:
+        return [], [f"{PATH} cannot be read ({type(e).__name__})"]
     except yaml.YAMLError as e:
         return [], [f"{PATH} does not parse: {str(e)[:150]}"]
     effects = doc.get("effects") if isinstance(doc, dict) else None
@@ -268,6 +271,10 @@ def _self_test() -> int:
         os.remove(os.path.join(d, "decision_brief.yaml"))
         put({**base, "comparator_id": "CF7", "model_ratio": 0.66, "model_use": 0.63})
         ok(gate_findings(d) == [], "EC9 a run whose brief has no comparators does not check the comparator id")
+        put({**base, "model_ratio": float("nan")})
+        ok(any("model_ratio" in x["claim"] for x in gate_findings(d)), "EC15 (Codex) a NaN ratio fails closed")
+        os.remove(os.path.join(d, PATH)); os.makedirs(os.path.join(d, PATH))
+        ok(any("cannot be read" in x["claim"] for x in gate_findings(d)), "EC16 (Codex) an unreadable path fails closed")
     if fails:
         print("SELF-TEST FAILURES:")
         for f in fails:

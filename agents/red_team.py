@@ -137,8 +137,10 @@ deeper.
    `trial_comparator` (the trial's control arm) matches `comparator_delivers`
    (what the run's primary comparator already gives those units), e.g. a
    new net type against the nets the comparator keeps, not against no nets.
-   Also check that `model_use` is the use reached in `units`. A mismatch is
-   a HIGH METHODS finding.
+   Also check that `model_use` is the use reached in `units`, and that no
+   entry under `not_bounding` is the effect of an intervention the
+   allocation funds. A mismatch or such an exemption is a HIGH METHODS
+   finding.
 9. `{run_dir}/critique_methods.yaml`, `critique_domain.yaml`,
    `critique_presentation.yaml` (when they exist — they run in
    parallel with you) — on round ≥ 2, also your prior round's
