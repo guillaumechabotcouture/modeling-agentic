@@ -5,16 +5,20 @@
     python e7r7_cluster.py sign <answers.yaml> [note]   # sign it as the owner (answers: Q-id -> answer)
     python e7r7_cluster.py report          # convergence measures so far (findings, tests, holds, compute, spend)
     python e7r7_cluster.py status          # run state (running / done / missing)
-    python e7r7_cluster.py collect         # pull the finished run dir
-    python e7r7_cluster.py shutdown        # stop the cluster once collected
+    python e7r7_cluster.py collect         # pull the finished run dir (from storage once the cluster has stopped)
+    python e7r7_cluster.py shutdown        # stop the cluster by hand (normally it stops itself)
 
 The run pauses after planning until the owner signs (--signoff owner, up to
 24 h); `sign` runs scripts/decision_brief.py sign on the run's VM.
 Compute autoscales only while pool_keeper.py holds the loop (see `launch`).
 
 Each run is pinned to its own worker and submitted with fire_and_forget, so
-it keeps running if this process exits or the connection drops. Results are
-written to the worker's local disk and fetched later by a pinned task.
+it keeps running if this process exits or the connection drops. A finished
+run uploads itself to storage (main.py reads every upload back); once every
+run's directory, transcripts and result record are stored, the last run to
+finish shuts the cluster down (E7 attempt 7 sat idle for 9.5 h waiting for
+`collect`). If any upload fails, the results stay on the worker's disk and
+the VM stays busy (up to 24 h) until `collect` fetches them.
 Workspace: idm-coiled-idmad-r2 (default, non-sensitive, Foundation Azure).
 """
 from __future__ import annotations
@@ -53,7 +57,8 @@ if SMOKE:   # the same launcher end to end on a tiny question: Haiku agents, a s
                        MA_COMPUTE_CALL_CORE_HOURS="10", MA_SMOKE_MODEL="claude-haiku-5-5", MA_SMOKE_MAX_TURNS="14")
     OUT = os.path.join(SCRATCH, "e7r7_smoke")
     TREE = os.path.expanduser(os.environ.get("SMOKE_TREE", "~/modeling-agentic-lessons"))
-    FLAGS = ["--max-budget-usd", "9", "--max-rounds", "2", "--signoff", "owner", "--signoff-hours", "2"]
+    FLAGS = ["--max-budget-usd", "9", "--max-rounds", "2", "--signoff", os.environ.get("E7R7_SMOKE_SIGNOFF", "owner"),
+             "--signoff-hours", "2"]   # E7R7_SMOKE_SIGNOFF=lead: unattended smoke
     ARMS = {"S": {"tree": TREE, "flags": FLAGS, "openai": False}}
     STATE = os.path.join(OUT, "assignments.json")
     QUESTION_FILE = os.path.join(OUT, "question.txt")
@@ -77,11 +82,13 @@ def get_cluster(create: bool):
     if not create:
         _require_running(CLUSTER_NAME, WORKSPACE)
     kw = dict(name=CLUSTER_NAME, workspace=WORKSPACE, shutdown_on_close=False)
+    if not create:
+        kw["wait_for_workers"] = False   # attaching must not wait for the launch-time worker count
     if create:
         sys.path.insert(0, os.path.join(TREE, "scripts"))
         import compute
         kw.update(n_workers=len(LABELS) + COMPUTE_START, worker_vm_types=compute.WORKER_VM_TYPES,
-                  worker_disk_size=100, idle_timeout="12 hours", worker_options=compute.WORKER_OPTIONS,
+                  worker_disk_size=100, idle_timeout="1 hour", worker_options=compute.WORKER_OPTIONS,
                   environ={"MA_STORAGE_ACCOUNT": "modelingagentic", "MA_STORAGE_PREFIX": "_checks/e7r7-smoke" if SMOKE else "runs/e7r7",
                            **COMPUTE_ENV},
                   spot_policy="on-demand", scheduler_cpu=2)
@@ -100,6 +107,8 @@ def run_to_disk(label, code, question, flags, anthropic_key, openai_key):
     the result to local disk instead of returning it."""
     import json, os, re, subprocess, sys, io, tarfile, tempfile
     from ab_coiled import run_job_impl
+    import time as _t0
+    started = _t0.time()
     td = tempfile.mkdtemp()
     tarfile.open(fileobj=io.BytesIO(code), mode="r:gz").extractall(td)
     pins = [l.split("#")[0].strip() for l in open(os.path.join(td, "requirements.txt"))
@@ -127,17 +136,55 @@ def run_to_disk(label, code, question, flags, anthropic_key, openai_key):
     except Exception as e:  # noqa: BLE001 — the run result itself is already stored by main.py
         res["transcripts_store_error"] = f"{type(e).__name__}: {e}"[:300]
     d = f"/tmp/ab/{label}"
+    tarball = res.pop("tarball")
     with open(f"{d}/result.tar.gz", "wb") as f:
-        f.write(res.pop("tarball"))
+        f.write(tarball)
+    res["run_stored"] = _run_stored(tarball)
     with open(f"{d}/result.json", "w") as f:
         json.dump(res, f)
-    # Stay busy until `collect` has the results (Codex review): an idle agent VM
-    # is the one an autoscaling pool retires first, with the results on its disk.
+    prefix, account = os.environ.get("MA_STORAGE_PREFIX", "runs"), os.environ.get("MA_STORAGE_ACCOUNT")
+    if res["run_stored"] and res.get("transcripts_stored"):
+        try:
+            results_store.upload_retry(f"{d}/result.json", f"outputs/{prefix}/result_{label}.json", account)
+            open(f"{d}/collected", "w").write("stored")
+            if _all_stored(results_store, prefix, account, started):
+                from distributed import get_client
+                print(f"{label}: every run is in storage; shutting the cluster down", flush=True)
+                get_client().shutdown()
+            return res
+        except Exception as e:  # noqa: BLE001 — fall back to holding the results for `collect`
+            res["result_store_error"] = f"{type(e).__name__}: {e}"[:300]
+    # Not everything is in storage: stay busy until `collect` has the results
+    # (Codex review): an idle agent VM is the one an autoscaling pool retires
+    # first, with the results on its disk.
     import time as _t
     t_end = _t.time() + 24 * 3600
     while _t.time() < t_end and not os.path.exists(f"{d}/collected"):
         _t.sleep(30)
     return {k: v for k, v in res.items()}
+
+
+def _run_stored(tarball):
+    """The blob main.py recorded in metadata.json after a verified upload, or None."""
+    import io, json, tarfile
+    try:
+        with tarfile.open(fileobj=io.BytesIO(tarball), mode="r:gz") as t:
+            for m in t.getmembers():
+                if m.name.endswith("/metadata.json") and m.name.count("/") == 2:   # runs/<run>/metadata.json
+                    meta = json.load(t.extractfile(m))
+                    return meta.get("stored") if not meta.get("store_error") else None
+    except (tarfile.TarError, ValueError, OSError):
+        return None
+    return None
+
+
+def _all_stored(results_store, prefix, account, since):
+    """Every label's result record is in storage and newer than this run's
+    start, so a record left by an earlier launch under the same prefix does
+    not count (the last run to finish stops the cluster)."""
+    fresh = {b["name"] for b in results_store.list_blobs(f"outputs/{prefix}/result_", account)
+             if b["last_modified"].timestamp() >= since - 3600}
+    return all(f"outputs/{prefix}/result_{lb}.json" in fresh for lb in LABELS)
 
 
 def _mark_collected(label):
@@ -267,8 +314,39 @@ def _pinned(client, label, assign):
     return on_worker(client, fetch, label, worker=assign[label]["worker"])
 
 
+def _collect_from_storage():
+    """The cluster has stopped: fetch each run's record and directory from storage."""
+    sys.path.insert(0, os.path.join(TREE, "scripts"))
+    import results_store
+    prefix = ("_checks/e7r7-smoke" if SMOKE else "runs/e7r7")
+    for label in LABELS:
+        dest = os.path.join(OUT, label)
+        if os.path.exists(os.path.join(dest, "result.json")):
+            print(f"{label}: already collected"); continue
+        os.makedirs(dest, exist_ok=True)
+        rj = os.path.join(OUT, f"{label}.result.json")
+        results_store.download(f"outputs/{prefix}/result_{label}.json", rj, "modelingagentic")
+        meta = json.load(open(rj))
+        tgz = os.path.join(OUT, f"{label}.run.tar.gz")
+        results_store.download(meta["run_stored"], tgz, "modelingagentic")
+        os.makedirs(os.path.join(dest, "runs"), exist_ok=True)
+        tarfile.open(tgz, mode="r:gz").extractall(os.path.join(dest, "runs"), filter="data")
+        json.dump(meta, open(os.path.join(dest, "result.json"), "w"), indent=1)
+        print(f"{label}: done exit={meta['exit_code']} {meta['duration_s']}s -> {dest} (from {meta['run_stored']})")
+
+
+def _cluster_running():
+    cs = coiled.list_clusters(workspace=WORKSPACE)
+    items = cs if isinstance(cs, list) else list(cs.values())
+    return any(c.get("name") == CLUSTER_NAME and
+               (c.get("current_state", {}).get("state") if isinstance(c.get("current_state"), dict)
+                else c.get("current_state")) in ("running", "ready", "pending", "starting", "scaling") for c in items)
+
+
 def status(collect=False):
     assign = json.load(open(STATE))
+    if collect and not _cluster_running():
+        return _collect_from_storage()
     cluster = get_cluster(create=False)
     client = cluster.get_client()
     for label in LABELS:
