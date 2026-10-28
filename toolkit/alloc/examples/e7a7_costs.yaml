@@ -1,0 +1,42 @@
+# E7 attempt 7 (Nigeria, GF GC7 malaria envelope, round 6) cost spec, as reproduced by toolkit/alloc/costs.py:
+# 754 of 754 LGAs without case management match the run's own cost_usd within 1% (total $314,970,323 vs
+# $314,970,306; CSV rounding). Values are the run's models/costs.py constants; the formulas are the toolkit's.
+# Case management (variable cost per extra treated case) needs model outputs and is not covered yet.
+units:
+  csv: models/ec_units.csv
+  id: lga_id
+  populations: {total: pop, smc_eligible: smc_pop}
+components:
+  net_pyr: {group: net}
+  net_pbo: {group: net}
+  net_dual: {group: net}
+  irs: {}
+  smc: {eligible: smc_eligible}
+packages: {generate: true}
+prices:
+  base_year: "2024"
+  index_name: US CPI-U annual average
+  index: {"2010-12": 224.2, "2015": 237.0, "2017-18": 248.1, "2018-19": 253.4, "2021": 271.0, "2022": 292.7, "2024": 313.7}
+  local:            # Turner et al. 2019 method 3 for naira-denominated service costs
+    currency: NGN
+    exchange_rate: {"2021": 401.2, "2022": 426.0, "2024": 1479.0}
+    index: {"2021": 354.3, "2022": 421.1, "2024": 699.4}
+cost_items:
+  - {id: net_pyr_commodity, component: net_pyr, value: 2.21, price_year: "2026", price_rule: as_published,
+     basis: per_commodity, people_per_commodity: 1.8, includes: [net]}
+  - {id: net_pbo_commodity, component: net_pbo, value: 2.54, price_year: "2026", price_rule: as_published,
+     basis: per_commodity, people_per_commodity: 1.8, includes: [net]}
+  - {id: net_dual_commodity, component: net_dual, value: 3.04, price_year: "2026", price_rule: as_published,
+     basis: per_commodity, people_per_commodity: 1.8, includes: [net]}
+  - {id: net_pyr_delivery, component: net_pyr, value: 0.66, price_year: "2022", price_rule: local_index,
+     basis: per_commodity, people_per_commodity: 1.8, includes: [delivery]}
+  - {id: net_pbo_delivery, component: net_pbo, value: 0.66, price_year: "2022", price_rule: local_index,
+     basis: per_commodity, people_per_commodity: 1.8, includes: [delivery]}
+  - {id: net_dual_delivery, component: net_dual, value: 0.66, price_year: "2022", price_rule: local_index,
+     basis: per_commodity, people_per_commodity: 1.8, includes: [delivery]}
+  - {id: irs, component: irs, value: 8.26, price_year: "2017-18", price_rule: index, basis: per_person,
+     share: 0.8, years: 3, includes: [insecticide, spraying]}
+  - {id: smc_drug, component: smc, value: 0.26, price_year: "2026", price_rule: as_published, basis: per_eligible,
+     times: 4, years: 3, includes: [drug]}
+  - {id: smc_delivery, component: smc, value: 0.68, price_year: "2021", price_rule: local_index, basis: per_eligible,
+     times: 4, years: 3, includes: [delivery]}
