@@ -4,7 +4,7 @@
 - a declared build pipeline per run;
 - small fixes whose impact is measured one at a time;
 - gate inputs computed by the harness instead of written by agents;
-- (§3.6) a reusable, tested toolkit by problem type, so each run configures and extends tools instead of rewriting them, and the toolset improves and is reused more with every run.
+- (§3.5) a reusable, tested toolkit by problem type, so each run configures and extends tools instead of rewriting them, and the toolset improves and is reused more with every run.
 
 ## 1. Why (measured on E7 attempts 6 and 7)
 
@@ -111,7 +111,7 @@ GATE → fix planner orders the open findings → for each task, in order:
 - **Cheaper.** An agent's context is one finding plus the files it touches, not a whole round's backlog. Critics run once per loop rather than after every change. Fixes whose tests are mechanical need no critic at all.
 - **Regressions are caught at the step that causes them.** A fix that breaks an earlier test, or opens a new finding, shows up in its own ledger row rather than at the next gate.
 
-### 3.6 Toolkit and templates: configure and extend, don't rewrite
+### 3.5 Toolkit and templates: configure and extend, don't rewrite
 
 **The problem.** Attempt 7's modeler wrote 111 files under `models/`. Most are not the malaria model. They are generic machinery that every allocation question needs:
 - an optimizer and cost accounting;
@@ -138,7 +138,7 @@ Rewritten each run, this machinery carries new bugs each time. Critics spent rou
 
 **Novel models stay possible.** Templates fix the steps around the model, not the model. A question that fits no template runs as today, with its custom steps declared in `pipeline.yaml`, and is the first candidate for a new template.
 
-### 3.5 What stays LLM judgement
+### 3.6 What stays LLM judgement
 
 - **Framing:** the brief, comparators, out of scope, and the open questions for the owner.
 - **Model design and code:** architecture choice and every code edit.
