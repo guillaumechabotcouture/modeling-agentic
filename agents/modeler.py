@@ -937,7 +937,10 @@ effect numbers: the harness evaluates your per-unit function (the one the
 eligibility probe uses), checks that it reproduces the allocation CSV, and
 computes each effect over the units the allocation gives it. Expose a
 burden output over the period the intervention covers (a whole-window
-output dilutes it).
+output dilutes it). If no intervention's effect comes from a trial (it is a
+model assumption), write `effects: []` with `no_trial_effects: <reason>`
+and every trial-kind registry entry under `not_bounding`; the critics
+review that reason.
 The gate holds the modeled reduction to the trial's. Check it on the pilot,
 before a large library batch: an agent-based model whose combined effect
 exceeds the trials is the failure this architecture section exists to stop.
