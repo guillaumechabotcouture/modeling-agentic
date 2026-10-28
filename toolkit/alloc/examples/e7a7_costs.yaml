@@ -1,17 +1,19 @@
-# E7 attempt 7 (Nigeria, GF GC7 malaria envelope, round 6) cost spec, as reproduced by toolkit/alloc/costs.py:
-# 754 of 754 LGAs without case management match the run's own cost_usd within 1% (total $314,970,323 vs
-# $314,970,306; CSV rounding). Values are the run's models/costs.py constants; the formulas are the toolkit's.
-# Case management (variable cost per extra treated case) needs model outputs and is not covered yet.
+# E7 attempt 7 (Nigeria, GF GC7 malaria envelope, round 8) cost spec, as reproduced by toolkit/alloc/costs.py:
+# all 774 LGAs match the run's own cost_usd within 1%, and the total ($319,998,877.64) equals the run's
+# headline cost claim det_cost. Values are the run's models/costs.py constants; the formulas are the toolkit's.
+# Case management's variable cost uses the model's treated-cases output (per_outcome, incremental): pass
+# outcome=<fn(unit, package) -> {"treated": ...}> to cost_matrix.
 units:
   csv: models/ec_units.csv
   id: lga_id
-  populations: {total: pop, smc_eligible: smc_pop}
+  populations: {total: pop, smc_eligible: smc_pop, u5: u5_pop}
 components:
   net_pyr: {group: net}
   net_pbo: {group: net}
   net_dual: {group: net}
   irs: {}
   smc: {eligible: smc_eligible}
+  cm: {eligible: u5, reach_share: 0.54}
 packages: {generate: true}
 prices:
   base_year: "2024"
@@ -40,3 +42,11 @@ cost_items:
      times: 4, years: 3, includes: [drug]}
   - {id: smc_delivery, component: smc, value: 0.68, price_year: "2021", price_rule: local_index, basis: per_eligible,
      times: 4, years: 3, includes: [delivery]}
+  - {id: cm_programme, component: cm, value: 5.50, price_year: "2010-12", price_rule: index, basis: per_reached,
+     years: 3, includes: [cm_programme]}
+  - {id: cm_case, component: cm, value: 4.34, price_year: "2018-19", price_rule: index, basis: per_outcome,
+     outcome: treated, incremental: true, includes: [treatment]}
+  - {id: cm_rdt, component: cm, value: 0.2618, price_year: "2026", price_rule: as_published, basis: per_outcome,
+     outcome: treated, incremental: true, times: 1.0, includes: [test_commodity]}
+  - {id: cm_rdt_staff, component: cm, value: 0.50, price_year: "2024", price_rule: as_published, basis: per_outcome,
+     outcome: treated, incremental: true, times: 1.0, includes: [test_staff]}
