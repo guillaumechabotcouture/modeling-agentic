@@ -93,7 +93,7 @@ def stale_scripts(run_dir: str) -> tuple[list[str], dict[str, list[str]], list[d
             continue
         script = sc.get("generator_script")
         rel = os.path.relpath(png, run_dir)
-        if any(pipeline.fnmatch.fnmatchcase(rel.replace(os.sep, "/"), p) for p in owned):
+        if any(pipeline.path_match(rel.replace(os.sep, "/"), p) for p in owned):
             # Its writer is a declared step: only the harness pipeline run may rewrite it.
             skipped.append({"figure": rel, "why": f"a declared output of {pipeline.SPEC}: rebuilt by the pipeline run"})
             continue

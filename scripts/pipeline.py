@@ -162,19 +162,20 @@ def _matches(run_dir: str, pat: str) -> list[str]:
     return sorted(out)
 
 
+def path_match(rel: str, pat: str) -> bool:
+    """One matcher for scanning, ownership, grants and retirement: at least everything
+    `glob(recursive=True)` would match (fnmatch's `*` also crosses `/`; `**/` may also
+    match nothing, as in glob), so ownership is never narrower than the scan (Codex)."""
+    return fnmatch.fnmatchcase(rel, pat) or ("**/" in pat and fnmatch.fnmatchcase(rel, pat.replace("**/", "")))
+
+
 def _literal_ends(pat: str) -> tuple[str, str]:
-    """The literal text before the first and after the last wildcard (`*`, `?`, `[...]`)."""
+    """The literal text before the first wildcard and after the last one. A pattern with
+    a character class has no trusted literal suffix (classes can hold `*`, `?`, `]`)."""
     m = list(_GLOB.finditer(pat))
     if not m:
         return pat, pat
-    tail = pat[m[-1].start():]
-    if tail.startswith("["):
-        close = tail.find("]", 2)
-        tail = tail[close + 1:] if close > 0 else ""
-    else:
-        tail = tail[1:]
-    if _GLOB.search(tail):     # a `[` inside the last class: no literal suffix we trust
-        tail = ""
+    tail = "" if ("[" in pat or "]" in pat) else pat[m[-1].start() + 1:]
     return pat[:m[0].start()], tail
 
 
@@ -182,7 +183,7 @@ def _overlap(a: str, b: str, run_dir: str | None = None) -> bool:
     """Two declared paths/globs CAN name the same file. Conservative (sound): they are
     disjoint only when their literal prefixes or literal suffixes cannot agree, so
     `critique_a*.y*` overlaps `critique_*.yaml` (Codex review)."""
-    if a == b or fnmatch.fnmatchcase(a, b) or fnmatch.fnmatchcase(b, a):
+    if a == b or path_match(a, b) or path_match(b, a):
         return True
     if run_dir and set(_matches(run_dir, a)) & set(_matches(run_dir, b)):
         return True
@@ -340,7 +341,7 @@ def load(run_dir: str) -> tuple[list[dict], list[str]]:
             if not isinstance(o, str):
                 continue
             bad = [r for r in reserved if _overlap(o, r)] + \
-                  [m for m in _matches(run_dir, o) if any(fnmatch.fnmatchcase(m, r) for r in reserved)]
+                  [m for m in _matches(run_dir, o) if any(path_match(m, r) for r in reserved)]
             if bad:
                 errs.append(f"{where}: output {o!r} is owned elsewhere ({', '.join(sorted(set(bad))[:3])}); "
                             "pipeline steps may not write harness, gate or critique files")
@@ -438,11 +439,22 @@ def _local_imports(py: str, run_dir: str, seen: set) -> None:
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             names.update(a.name for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level:
+            # `from ..common import K`: resolved against the importing file's package (Codex).
+            base = os.path.dirname(py)
+            for _ in range(node.level - 1):
+                base = os.path.dirname(base)
+            rel_names = ([node.module] + [f"{node.module}.{a.name}" for a in node.names]) if node.module \
+                else [a.name for a in node.names]
+            for n in rel_names:
+                for cand in _module_files(n, [base], run_dir):
+                    _local_imports(cand, run_dir, seen)
+            init = os.path.join(base, "__init__.py")
+            if os.path.isfile(init) and _inside(init, run_dir):
+                _local_imports(os.path.realpath(init), run_dir, seen)
         elif isinstance(node, ast.ImportFrom) and node.module:
             names.add(node.module)
             names.update(f"{node.module}.{a.name}" for a in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.level:
-            names.update(a.name for a in node.names)
     roots = [os.path.dirname(py), os.path.join(run_dir, "models"), run_dir]
     for name in names:
         for cand in _module_files(name, roots, run_dir):
@@ -642,7 +654,7 @@ def _run_one(step: dict, run_dir: str, timeout_s: float, python: str | None, rec
     review). The one exception is a compute step's results file whose bytes are what
     the harness last recorded: the compute service reuses its rows by code fingerprint."""
     fp = fingerprint(step, run_dir)
-    row = {"returncode": None, "seconds": 0.0, "ok": False, "written": [], "removed": []}
+    row = {"returncode": None, "seconds": 0.0, "ok": False, "written": [], "removed": [], "fingerprint": fp}
     if fp["missing_inputs"]:
         row["error"] = f"inputs missing: {', '.join(fp['missing_inputs'])}"
         return row
@@ -675,7 +687,10 @@ def _run_one(step: dict, run_dir: str, timeout_s: float, python: str | None, rec
         row["error"] = err
         return row
     problems = [f"{pat}: not produced" for pat in step_outputs(step)
-                if not any(fnmatch.fnmatchcase(r, pat) for r in row["written"])]
+                if not any(path_match(r, pat) for r in row["written"])]
+    if fingerprint(step, run_dir)["key"] != fp["key"]:
+        # Its inputs or code changed while it ran: the outputs may hold the old values (Codex).
+        problems.append("inputs or code changed while the step ran; rerun")
     if problems:
         row["ok"] = False
         row["error"] = "declared outputs: " + "; ".join(problems)
@@ -724,9 +739,9 @@ def run(run_dir: str, budget_s: float | None = None, integrity=None, python: str
     reserved = _reserved_patterns()
     retired = sorted({rel for rec in state["steps"].values() if isinstance(rec, dict)
                       for rel in (rec.get("outputs") or {})
-                      if isinstance(rel, str) and not any(fnmatch.fnmatchcase(rel, o) for o in declared)
+                      if isinstance(rel, str) and not any(path_match(rel, o) for o in declared)
                       and _check_path(rel, run_dir, "") is None
-                      and not any(fnmatch.fnmatchcase(rel, r) for r in reserved)})
+                      and not any(path_match(rel, r) for r in reserved)})
     grant = [o for s in steps if s["id"] in todo for o in step_outputs(s)] + list(OWN_FILES) + retired
     ctx = integrity.harness_pipeline(grant) if integrity is not None else nullcontext()
     with ctx:
@@ -760,10 +775,10 @@ def run(run_dir: str, budget_s: float | None = None, integrity=None, python: str
                 tmo = float(s.get("timeout_s") or DEFAULT_TIMEOUT_S)
                 res = _run_one(s, run_dir, tmo if left is None else min(tmo, left), python,
                                state["steps"].get(s["id"]))
+                fp = res.pop("fingerprint", None) or fingerprint(s, run_dir)
                 row.update(res, status="ok" if res["ok"] else "failed")
                 produced += res["written"] + res["removed"]
                 if res["ok"]:
-                    fp = fingerprint(s, run_dir)
                     state["steps"][s["id"]] = {"ok": True, "key": fp["key"], "inputs": fp["inputs"],
                                                "code": fp["code"], "outputs": output_hashes(s, run_dir),
                                                "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
@@ -789,7 +804,7 @@ def _finish(run_dir, report, t0, integrity, produced, by_id=None):
         # wrote this time: never other files (that would accept an agent's edit).
         reserved = [r for r in _reserved_patterns() if r not in OWN_FILES]
         for rel in sorted(set(produced)):
-            if any(fnmatch.fnmatchcase(rel, r) for r in reserved):
+            if any(path_match(rel, r) for r in reserved):
                 continue          # never accept a file another owner holds, whatever wrote it
             integrity.harness_wrote(rel)
 
@@ -805,13 +820,19 @@ def harness_build(run_dir: str, integrity, budget_s: float | None = None) -> dic
 
 
 def _stat_tree(d: str) -> dict:
-    out = {}
-    for dp, dirs, fns in os.walk(d):
+    """(size, mtime) of every file reachable from the run dir, through symlinks too."""
+    out, seen = {}, set()
+    for dp, dirs, fns in os.walk(d, followlinks=True):
+        real = os.path.realpath(dp)
+        if real in seen:
+            dirs[:] = []
+            continue
+        seen.add(real)
         dirs[:] = [x for x in dirs if x != "__pycache__"]
         for fn in fns:
             p = os.path.join(dp, fn)
             try:
-                st = os.lstat(p)
+                st = os.stat(p)
                 out[os.path.relpath(p, d)] = (st.st_size, st.st_mtime_ns)
             except OSError:
                 pass
@@ -821,6 +842,7 @@ def _stat_tree(d: str) -> dict:
 def scratch(run_dir: str, step_id: str, python: str | None = None, keep: bool = True) -> dict:
     """Run one step in a temporary copy of the run dir. Nothing in the run dir changes."""
     run_dir = os.path.realpath(run_dir)
+    before = _stat_tree(run_dir)
     dst = os.path.realpath(tempfile.mkdtemp(prefix="pipeline_scratch_"))
     copy = os.path.join(dst, os.path.basename(run_dir))
     shutil.copytree(run_dir, copy, symlinks=True)
@@ -835,15 +857,22 @@ def scratch(run_dir: str, step_id: str, python: str | None = None, keep: bool = 
                     os.remove(p)
                     os.symlink(os.path.join(copy, os.path.relpath(tgt, run_dir)), p)
     # Commands naming the real run dir by absolute path run the copy's files instead.
+    # The copy's manifest is materialised as its own file first, so editing it can never
+    # write through a symlink (Codex review).
     sp = os.path.join(copy, SPEC)
     try:
         txt = open(sp).read()
-        if run_dir in txt:
-            with open(sp, "w") as f:
-                f.write(txt.replace(run_dir, copy))
-    except OSError:
-        pass
-    before = _stat_tree(run_dir)
+        if os.path.islink(os.path.join(copy, "models")):
+            real_models = os.path.realpath(os.path.join(copy, "models"))
+            os.remove(os.path.join(copy, "models"))
+            shutil.copytree(real_models, os.path.join(copy, "models"), symlinks=True)
+        if os.path.lexists(sp):
+            os.remove(sp)
+        with open(sp, "w") as f:
+            f.write(txt.replace(run_dir, copy))
+    except OSError as e:
+        return {"ok": False, "errors": [f"scratch copy: could not prepare {SPEC}: {e}"], "steps": [],
+                "plan": [], "scratch_dir": copy}
     rep = run(copy, python=python, only=step_id, force=True)
     rep["scratch_dir"] = copy
     # No portable write sandbox: a step that still writes the real run dir (an absolute
@@ -860,6 +889,31 @@ def scratch(run_dir: str, step_id: str, python: str | None = None, keep: bool = 
     if not keep:
         shutil.rmtree(dst, ignore_errors=True)
     return rep
+
+
+def gate_findings(run_dir: str) -> list[dict]:
+    """STAGE 7: a run that declares a pipeline must have it built. Invalid, or any step
+    stale (never built, failed, skipped, out of budget, or changed since), is a HIGH,
+    not scope-declarable: the gate would otherwise grade outputs older than their
+    inputs (Codex review)."""
+    run_dir = os.path.realpath(run_dir)
+    if not os.path.exists(os.path.join(run_dir, SPEC)):
+        return []
+    steps, errs = load(run_dir)
+    base = {"severity": "HIGH", "stage": "MODEL", "target_stage": "MODEL", "scope_declarable": False}
+    if errs:
+        return [{**base, "kind": "pipeline_invalid", "claim": f"{SPEC} does not validate: " + "; ".join(errs[:5])}]
+    try:
+        stale = plan(run_dir, steps)
+    except Exception as e:  # noqa: BLE001 — fail closed
+        return [{**base, "kind": "pipeline_unreadable", "claim": f"{SPEC}: could not plan: {type(e).__name__}: {e}"}]
+    if not stale:
+        return []
+    return [{**base, "kind": "pipeline_outputs_stale",
+             "claim": f"{len(stale)} step(s) of {SPEC} are not built from current inputs: "
+                      + "; ".join(f"{p['id']} ({p['why']})" for p in stale[:8])
+                      + ". The harness rebuilds them; fix the failing step (try it with "
+                        "`scripts/pipeline.py run <run_dir> <step> --scratch`)."}]
 
 
 def summary_line(rep: dict) -> str:
@@ -1054,6 +1108,16 @@ def _self_test() -> int:
         rep = scratch(d, "b", keep=False)
         ok(not rep["ok"] and "models/b.out" in rep.get("real_run_changed", []),
            f"PL22 a scratch step that still writes the real run dir is reported and fails: {rep.get('errors')}")
+        # (Codex r2) A manifest that is a symlink back into the run dir is not edited through.
+        w(d, "models/b.py", "open('models/b.out', 'w').write('7')\n")
+        spec(d, [three[0], dict(three[1], run=f"{py} {d}/models/b.py"), three[2]])
+        os.replace(os.path.join(d, SPEC), os.path.join(d, "pipeline_source.yaml"))
+        os.symlink(os.path.join(d, "pipeline_source.yaml"), os.path.join(d, SPEC))
+        before = _tree_hash(d)
+        rep = scratch(d, "b", keep=False)
+        ok(_tree_hash(d) == before and rep["ok"], f"PL25 (Codex r2) scratch never writes through a symlinked manifest: {rep}")
+        os.remove(os.path.join(d, SPEC))
+        os.replace(os.path.join(d, "pipeline_source.yaml"), os.path.join(d, SPEC))
 
     # Validation fails closed.
     def errs_of(steps, extra=None):
@@ -1106,6 +1170,42 @@ def _self_test() -> int:
     ok(any("same file" in x for x in e), f"PV15 glob outputs that can overlap are refused: {e}")
     ok(not _overlap("figures/*.png", "figures/*.csv") and not _overlap("figures/*.png", "report.md"),
        "PV16 provably disjoint globs do not overlap")
+    e = errs_of([dict(three[0], outputs=["critique_[ab].y[a?l]ml"])])
+    ok(any("owned elsewhere" in x for x in e), f"PV17 (Codex r2) a character-class glob over a critique file is refused: {e}")
+    ok(path_match("models/a.csv", "models/**/*.csv") and path_match("models/x/a.csv", "models/**/*.csv"),
+       "PV18 (Codex r2) `**/` matches zero or more directories, as glob does")
+
+    # Gate findings, input changed mid-run, relative imports.
+    with tempfile.TemporaryDirectory() as d:
+        d = os.path.realpath(d)
+        fixture(d)
+        g0 = gate_findings(d)
+        run(d)
+        g1 = gate_findings(d)
+        w(d, "data/x.csv", "3\n")
+        g2 = gate_findings(d)
+        ok([g["kind"] for g in g0] == ["pipeline_outputs_stale"] and g1 == []
+           and [g["kind"] for g in g2] == ["pipeline_outputs_stale"] and g2[0]["severity"] == "HIGH"
+           and not g2[0]["scope_declarable"],
+           f"PG1 (Codex r2) the gate blocks on an unbuilt or stale pipeline: {g0} {g1} {g2}")
+        w(d, SPEC, "steps: [")
+        ok([g["kind"] for g in gate_findings(d)] == ["pipeline_invalid"], "PG2 an invalid pipeline is a gate finding")
+        fixture(d)
+        run(d)
+        w(d, "models/a.py", "import helper\nv = open('data/x.csv').read()\nopen('data/x.csv', 'w').write('9\\n')\n"
+                            "open('models/a.out', 'w').write(str(int(v) + helper.K))\n")
+        rep = run(d)
+        ok(rep["steps"][0]["status"] == "failed" and "changed while" in rep["steps"][0]["error"]
+           and "a" in [p["id"] for p in plan(d)],
+           f"PL23 (Codex r2) a step whose inputs change while it runs is not recorded as current: {rep['steps'][:1]}")
+        w(d, "models/pkg/__init__.py", "")
+        w(d, "models/pkg/common.py", "K = 1\n")
+        w(d, "models/pkg/sub/__init__.py", "")
+        w(d, "models/pkg/sub/run.py", "from ..common import K\nopen('models/r.out', 'w').write(str(K))\n")
+        spec(d, [{"id": "r", "run": f"{py} -m models.pkg.sub.run", "inputs": [], "outputs": ["models/r.out"]}])
+        run(d)
+        w(d, "models/pkg/common.py", "K = 2\n")
+        ok([p["id"] for p in plan(d)] == ["r"], f"PL24 (Codex r2) parent-relative imports are hashed: {plan(d)}")
 
     # A compute step goes through the compute service with its purpose.
     with tempfile.TemporaryDirectory() as d:
@@ -1207,6 +1307,14 @@ def _self_test() -> int:
                and [p["id"] for p in plan(d)][-1:] == ["x"],
                f"PO9 a file declared after it exists is baselined (and its step is stale); later edits are flagged: "
                f"{new} {new2}")
+            spec(d, three[:1] + [{"id": "x", "run": "true", "inputs": [], "outputs": ["models/**/*.csv"]}])
+            ig.on_pre("t10", "Write", {"file_path": os.path.join(d, SPEC)}, "modeler", cwd=d)
+            ig.on_post("t10")
+            ig.on_pre("t11", "Write", {"file_path": os.path.join(d, "models/rec.csv")}, "modeler", cwd=d)
+            w(d, "models/rec.csv", "agent")
+            new = ig.on_post("t11")
+            ok([x["file"] for x in new] == ["models/rec.csv"],
+               f"PO10 (Codex r2) a Write to a file a recursive glob output names is flagged: {new}")
     if fails:
         print("SELF-TEST FAILURES:")
         for f in fails:

@@ -1973,6 +1973,9 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None,
     # held to the trial evidence for that comparison.
     violations += G(lambda rd: _load_sibling("effect_concordance").gate_findings(rd),
                     run_dir, check_name="effect_concordance")
+    # S1: a declared pipeline (models/pipeline.yaml) must be built from current inputs.
+    violations += G(lambda rd: _load_sibling("pipeline").gate_findings(rd),
+                    run_dir, check_name="pipeline_build")
     # Phase 34: done_when findings computed by the caller, added before the
     # escalation so their persistence counts (Codex review).
     violations += list(extra or [])

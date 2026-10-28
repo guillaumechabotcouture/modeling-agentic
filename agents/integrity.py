@@ -429,7 +429,8 @@ class ArtifactIntegrity:
     def _pipeline_owned(self, rel: str) -> bool:
         mod = _pipeline()
         own = tuple(mod.OWN_FILES) if mod is not None else ()
-        return rel in own or any(fnmatch.fnmatchcase(rel, p) for p in self.pipeline_patterns)
+        return rel in own or any(mod.path_match(rel, p) if mod is not None else fnmatch.fnmatchcase(rel, p)
+                                 for p in self.pipeline_patterns)
 
     def _scan(self) -> dict[str, str | None]:
         out = {}
@@ -542,7 +543,8 @@ class ArtifactIntegrity:
             return True          # its own Write/Edit, carve-out, or harness script
         if _is_critique(rel) and any(str(i["agent"] or "").startswith("critique-") for i in intents):
             return True          # critics own their files
-        if any(rel in g["paths"] or any(fnmatch.fnmatchcase(rel, p) for p in g.get("patterns", ()))
+        pm = getattr(_pipeline(), "path_match", fnmatch.fnmatchcase)
+        if any(rel in g["paths"] or any(pm(rel, p) for p in g.get("patterns", ()))
                for g in self.grants):
             return True          # a background harness script, or the harness pipeline run
         return any(rel in SCRIPT_PRODUCES.get(sc, ()) for sc in live)
