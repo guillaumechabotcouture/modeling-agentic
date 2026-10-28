@@ -162,11 +162,38 @@ def _matches(run_dir: str, pat: str) -> list[str]:
     return sorted(out)
 
 
+def _literal_ends(pat: str) -> tuple[str, str]:
+    """The literal text before the first and after the last wildcard (`*`, `?`, `[...]`)."""
+    m = list(_GLOB.finditer(pat))
+    if not m:
+        return pat, pat
+    tail = pat[m[-1].start():]
+    if tail.startswith("["):
+        close = tail.find("]", 2)
+        tail = tail[close + 1:] if close > 0 else ""
+    else:
+        tail = tail[1:]
+    if _GLOB.search(tail):     # a `[` inside the last class: no literal suffix we trust
+        tail = ""
+    return pat[:m[0].start()], tail
+
+
 def _overlap(a: str, b: str, run_dir: str | None = None) -> bool:
-    """Two declared paths/globs can name the same file."""
+    """Two declared paths/globs CAN name the same file. Conservative (sound): they are
+    disjoint only when their literal prefixes or literal suffixes cannot agree, so
+    `critique_a*.y*` overlaps `critique_*.yaml` (Codex review)."""
     if a == b or fnmatch.fnmatchcase(a, b) or fnmatch.fnmatchcase(b, a):
         return True
-    return bool(run_dir) and bool(set(_matches(run_dir, a)) & set(_matches(run_dir, b)))
+    if run_dir and set(_matches(run_dir, a)) & set(_matches(run_dir, b)):
+        return True
+    if not (_GLOB.search(a) or _GLOB.search(b)):
+        return False               # two different literal paths
+    (pa, sa), (pb, sb) = _literal_ends(a), _literal_ends(b)
+    if not (pa.startswith(pb) or pb.startswith(pa)):
+        return False
+    if not (sa.endswith(sb) or sb.endswith(sa)):
+        return False
+    return True
 
 
 def _compute_fn(step: dict) -> str | None:
@@ -207,7 +234,8 @@ def _check_path(p, run_dir: str, what: str) -> str | None:
     parts = p.replace("\\", "/").split("/")
     if ".." in parts:
         return f"{what}: {p!r} leaves the run directory"
-    if os.path.normpath(p) != p.rstrip("/") and not p.startswith("./"):
+    if os.path.normpath(p) != p or "\\" in p:
+        # Canonical paths only: ownership checks compare declared text (Codex: `././report.md`).
         return f"{what}: {p!r} is not a normalized path (write it as {os.path.normpath(p)!r})"
     # The deepest non-glob parent, and every existing match, must resolve inside the run dir (symlinks).
     fixed = []
@@ -231,9 +259,6 @@ def _normalize(step: dict) -> dict:
     for k in ("inputs", "outputs"):
         if isinstance(s.get(k), str):
             s[k] = [s[k]]
-    for k in ("inputs", "outputs"):
-        if isinstance(s.get(k), list):
-            s[k] = [x[2:] if isinstance(x, str) and x.startswith("./") else x for x in s[k]]
     return s
 
 
@@ -388,6 +413,8 @@ def declared_outputs(run_dir: str) -> list[str]:
         if not isinstance(st.get("outputs"), list):
             st["outputs"] = []
         for o in step_outputs(st):
+            if isinstance(o, str) and o.strip() and not os.path.isabs(o):
+                o = os.path.normpath(o).replace(os.sep, "/")   # protect what the path names
             if isinstance(o, str) and o.strip() and _check_path(o, run_dir, "") is None \
                     and not any(_overlap(o, r) for r in reserved) and o not in pats:
                 pats.append(o)
@@ -418,11 +445,25 @@ def _local_imports(py: str, run_dir: str, seen: set) -> None:
             names.update(a.name for a in node.names)
     roots = [os.path.dirname(py), os.path.join(run_dir, "models"), run_dir]
     for name in names:
-        rel = name.replace(".", os.sep)
-        for root in roots:
-            for cand in (os.path.join(root, rel + ".py"), os.path.join(root, rel, "__init__.py")):
-                if os.path.isfile(cand) and _inside(cand, run_dir):
-                    _local_imports(os.path.realpath(cand), run_dir, seen)
+        for cand in _module_files(name, roots, run_dir):
+            _local_imports(cand, run_dir, seen)
+
+
+def _module_files(name: str, roots: list[str], run_dir: str) -> list[str]:
+    """Run-local files importing `a.b.c` executes: the module (or package __init__ /
+    __main__) and every package __init__.py along the way (Codex review)."""
+    out = []
+    parts = name.split(".")
+    for root in roots:
+        for k in range(1, len(parts) + 1):
+            init = os.path.join(root, *parts[:k], "__init__.py")
+            if os.path.isfile(init) and _inside(init, run_dir):
+                out.append(os.path.realpath(init))
+        rel = os.path.join(*parts)
+        for cand in (os.path.join(root, rel + ".py"), os.path.join(root, rel, "__main__.py")):
+            if os.path.isfile(cand) and _inside(cand, run_dir):
+                out.append(os.path.realpath(cand))
+    return out
 
 
 def code_files(step: dict, run_dir: str) -> list[str]:
@@ -438,7 +479,13 @@ def code_files(step: dict, run_dir: str) -> list[str]:
         except ValueError:
             toks = step["run"].split()
     named, py = set(), set()
-    for t in toks:
+    for j, t in enumerate(toks):
+        if t == "-m" and j + 1 < len(toks):
+            # `python -m models.worker`: the module (run from the run dir) and its imports.
+            for cand in _module_files(toks[j + 1], [run_dir], run_dir):
+                named.add(cand)
+                _local_imports(cand, run_dir, py)
+            continue
         if not t or t.startswith("-"):
             continue
         t = t.split("=", 1)[1] if re.match(r"^\w+=", t) else t
@@ -519,14 +566,14 @@ def _why_stale(step: dict, run_dir: str, rec: dict | None) -> str | None:
     return None
 
 
-def plan(run_dir: str, steps: list[dict] | None = None) -> list[dict]:
+def plan(run_dir: str, steps: list[dict] | None = None, state: dict | None = None) -> list[dict]:
     """Steps to rerun, in run order: [{id, why}]. Raises ValueError if the pipeline is invalid."""
     run_dir = os.path.realpath(run_dir)
     if steps is None:
         steps, errs = load(run_dir)
         if errs:
             raise ValueError("; ".join(errs))
-    state = _load_state(run_dir)["steps"]
+    state = (state if state is not None else _load_state(run_dir))["steps"]
     stale: dict[str, str] = {}
     for s in steps:
         up = [d for d in s["_deps"] if d in stale]
@@ -586,40 +633,49 @@ def _snapshot(step: dict, run_dir: str) -> dict:
     return snap
 
 
-def _run_one(step: dict, run_dir: str, timeout_s: float, python: str | None) -> dict:
-    """Run a step and check what it wrote. Returns its report row (without bookkeeping)."""
+def _run_one(step: dict, run_dir: str, timeout_s: float, python: str | None, rec: dict | None = None) -> dict:
+    """Clear the step's existing outputs, run it, and check it wrote every declared output.
+
+    Outputs are removed first (like `make clean` for this step), so only files this
+    execution creates count as written: a `touch` cannot pass an old or hand-edited file
+    off as current, and a file a glob output no longer produces does not linger (Codex
+    review). The one exception is a compute step's results file whose bytes are what
+    the harness last recorded: the compute service reuses its rows by code fingerprint."""
     fp = fingerprint(step, run_dir)
+    row = {"returncode": None, "seconds": 0.0, "ok": False, "written": [], "removed": []}
     if fp["missing_inputs"]:
-        return {"returncode": None, "seconds": 0.0, "ok": False,
-                "error": f"inputs missing: {', '.join(fp['missing_inputs'])}", "written": [], "removed": []}
+        row["error"] = f"inputs missing: {', '.join(fp['missing_inputs'])}"
+        return row
+    trusted = (rec or {}).get("outputs") if isinstance(rec, dict) and rec.get("ok") else {}
+    keep = set()
+    if _compute_fn(step):
+        for rel in (step["out"], step["out"] + ".summary.json"):
+            if isinstance(trusted, dict) and rel in trusted and _sha(os.path.join(run_dir, rel)) == trusted[rel]:
+                keep.add(rel)
     before = _snapshot(step, run_dir)
+    for rel in sorted(before):
+        if rel in keep:
+            continue
+        try:
+            os.remove(os.path.join(run_dir, rel))
+            row["removed"].append(rel)
+        except OSError as e:
+            row["error"] = f"could not clear old output {rel}: {e}"
+            return row
     s0 = time.time()
     try:
         rc, err = _exec_step(step, run_dir, timeout_s, python)
     except OSError as e:
         rc, err = None, f"{type(e).__name__}: {e}"
-    row = {"returncode": rc, "seconds": round(time.time() - s0, 1), "ok": rc == 0, "written": [], "removed": []}
+    row.update(returncode=rc, seconds=round(time.time() - s0, 1), ok=rc == 0)
     after = _snapshot(step, run_dir)
-    row["written"] = sorted(r for r, m in after.items() if before.get(r) != m)
+    row["written"] = sorted(r for r, m in after.items() if r not in keep or before.get(r) != m)
+    row["removed"] = sorted(set(row["removed"]) - set(after))
     if rc != 0:
         row["error"] = err
         return row
-    problems = []
-    for pat in step_outputs(step):
-        hits = [r for r in after if fnmatch.fnmatchcase(r, pat) or r == pat]
-        fresh = [r for r in hits if r in row["written"]]
-        if not fresh:
-            problems.append(f"{pat}: not written by this run" if hits else f"{pat}: not produced")
-        elif _GLOB.search(pat):
-            # Files matching a glob output that this run did not rewrite are leftovers of an
-            # earlier version of the step: removed, so no stale file passes as current.
-            for r in hits:
-                if r not in row["written"]:
-                    try:
-                        os.remove(os.path.join(run_dir, r))
-                        row["removed"].append(r)
-                    except OSError as e:
-                        problems.append(f"{r}: stale leftover could not be removed ({e})")
+    problems = [f"{pat}: not produced" for pat in step_outputs(step)
+                if not any(fnmatch.fnmatchcase(r, pat) for r in row["written"])]
     if problems:
         row["ok"] = False
         row["error"] = "declared outputs: " + "; ".join(problems)
@@ -642,22 +698,52 @@ def run(run_dir: str, budget_s: float | None = None, integrity=None, python: str
     if errs:
         _finish(run_dir, report, t0, integrity, [])
         return report
+    state = _load_state(run_dir)
+    if integrity is not None:
+        # The state file is protected; if an agent changed it, its records are not the
+        # harness's and are dropped, so every step is rebuilt (Codex review: a forged
+        # record would otherwise survive an unrelated rebuild that rewrites the file).
+        integrity.check_now()
+        if integrity.is_open(STATE.replace(os.sep, "/")):
+            state = {"steps": {}}
+            report["state_distrusted"] = True
     if only is not None:
         if only not in {s["id"] for s in steps}:
             report.update(errors=[f"no step {only!r}"], ok=False)
             _finish(run_dir, report, t0, integrity, [])
             return report
-        report["plan"] = [{"id": only, "why": "requested"}] if force else [p for p in plan(run_dir, steps) if p["id"] == only]
+        report["plan"] = [{"id": only, "why": "requested"}] if force else \
+            [p for p in plan(run_dir, steps, state) if p["id"] == only]
     else:
-        report["plan"] = plan(run_dir, steps)
+        report["plan"] = plan(run_dir, steps, state)
     todo = {p["id"] for p in report["plan"]}
     by_id = {s["id"]: s for s in steps}
-    grant = [o for s in steps if s["id"] in todo for o in step_outputs(s)] + list(OWN_FILES)
+    # Files a step wrote earlier that no current declaration names any more (an output
+    # renamed, a step removed): removed, so nothing reads a retired result as current.
+    declared = [o for s in steps for o in step_outputs(s)]
+    reserved = _reserved_patterns()
+    retired = sorted({rel for rec in state["steps"].values() if isinstance(rec, dict)
+                      for rel in (rec.get("outputs") or {})
+                      if isinstance(rel, str) and not any(fnmatch.fnmatchcase(rel, o) for o in declared)
+                      and _check_path(rel, run_dir, "") is None
+                      and not any(fnmatch.fnmatchcase(rel, r) for r in reserved)})
+    grant = [o for s in steps if s["id"] in todo for o in step_outputs(s)] + list(OWN_FILES) + retired
     ctx = integrity.harness_pipeline(grant) if integrity is not None else nullcontext()
     with ctx:
-        state = _load_state(run_dir)
         failed: set[str] = set()
         produced: list[str] = []
+        for rel in retired:
+            try:
+                if os.path.isfile(os.path.join(run_dir, rel)):
+                    os.remove(os.path.join(run_dir, rel))
+                    produced.append(rel)
+            except OSError:
+                pass
+        report["retired"] = [r for r in retired if r in produced]
+        state["steps"] = {k: v for k, v in state["steps"].items() if k in by_id}
+        for rec in state["steps"].values():
+            if isinstance(rec, dict) and isinstance(rec.get("outputs"), dict):
+                rec["outputs"] = {k: v for k, v in rec["outputs"].items() if k not in retired}
         for s in steps:
             if s["id"] not in todo:
                 continue
@@ -672,9 +758,10 @@ def run(run_dir: str, budget_s: float | None = None, integrity=None, python: str
                 failed.add(s["id"])
             else:
                 tmo = float(s.get("timeout_s") or DEFAULT_TIMEOUT_S)
-                res = _run_one(s, run_dir, tmo if left is None else min(tmo, left), python)
+                res = _run_one(s, run_dir, tmo if left is None else min(tmo, left), python,
+                               state["steps"].get(s["id"]))
                 row.update(res, status="ok" if res["ok"] else "failed")
-                produced += res["written"]
+                produced += res["written"] + res["removed"]
                 if res["ok"]:
                     fp = fingerprint(s, run_dir)
                     state["steps"][s["id"]] = {"ok": True, "key": fp["key"], "inputs": fp["inputs"],
@@ -700,7 +787,10 @@ def _finish(run_dir, report, t0, integrity, produced, by_id=None):
     if integrity is not None:
         # Only the files the steps that ran wrote, and the runner's own records it
         # wrote this time: never other files (that would accept an agent's edit).
+        reserved = [r for r in _reserved_patterns() if r not in OWN_FILES]
         for rel in sorted(set(produced)):
+            if any(fnmatch.fnmatchcase(rel, r) for r in reserved):
+                continue          # never accept a file another owner holds, whatever wrote it
             integrity.harness_wrote(rel)
 
 
@@ -712,6 +802,20 @@ def harness_build(run_dir: str, integrity, budget_s: float | None = None) -> dic
     if integrity is None:
         raise ValueError("harness_build needs the run's ArtifactIntegrity")
     return run(run_dir, budget_s=budget_s, integrity=integrity)
+
+
+def _stat_tree(d: str) -> dict:
+    out = {}
+    for dp, dirs, fns in os.walk(d):
+        dirs[:] = [x for x in dirs if x != "__pycache__"]
+        for fn in fns:
+            p = os.path.join(dp, fn)
+            try:
+                st = os.lstat(p)
+                out[os.path.relpath(p, d)] = (st.st_size, st.st_mtime_ns)
+            except OSError:
+                pass
+    return out
 
 
 def scratch(run_dir: str, step_id: str, python: str | None = None, keep: bool = True) -> dict:
@@ -730,8 +834,29 @@ def scratch(run_dir: str, step_id: str, python: str | None = None, keep: bool = 
                 if tgt == run_dir or tgt.startswith(run_dir + os.sep):
                     os.remove(p)
                     os.symlink(os.path.join(copy, os.path.relpath(tgt, run_dir)), p)
+    # Commands naming the real run dir by absolute path run the copy's files instead.
+    sp = os.path.join(copy, SPEC)
+    try:
+        txt = open(sp).read()
+        if run_dir in txt:
+            with open(sp, "w") as f:
+                f.write(txt.replace(run_dir, copy))
+    except OSError:
+        pass
+    before = _stat_tree(run_dir)
     rep = run(copy, python=python, only=step_id, force=True)
     rep["scratch_dir"] = copy
+    # No portable write sandbox: a step that still writes the real run dir (an absolute
+    # path in its code) is reported and fails; the integrity record flags owned files.
+    after = _stat_tree(run_dir)
+    live = {"trace.jsonl", "artifact_integrity.json", "budget_ledger.json", "harness_manifest.json"}
+    changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k)
+                     and k not in live and not k.endswith(".log"))   # written by the live harness meanwhile
+    if changed:
+        rep["ok"] = False
+        rep["real_run_changed"] = changed
+        rep.setdefault("errors", []).append(
+            f"the scratch run changed the real run directory: {', '.join(changed[:10])}")
     if not keep:
         shutil.rmtree(dst, ignore_errors=True)
     return rep
@@ -845,9 +970,42 @@ def _self_test() -> int:
         # A step that exits 0 without writing its declared output fails.
         w(d, "models/b.py", "pass\n")
         rep = run(d)
-        ok(rep["steps"][0]["status"] == "failed" and "not written" in rep["steps"][0]["error"],
+        ok(rep["steps"][0]["status"] == "failed" and "not produced" in rep["steps"][0]["error"],
            f"PL13 a step that leaves its declared output unwritten fails: {rep['steps']}")
         w(d, "models/b.py", "open('models/b.out', 'w').write('7')\n")
+        run(d)
+        # (Codex) `touch` cannot pass a hand-edited output off as freshly built.
+        w(d, "models/b.out", "hand")
+        w(d, "models/b.py", "import pathlib\npathlib.Path('models/b.out').touch()\n")
+        rep = run(d)
+        ok(open(os.path.join(d, "models/b.out")).read() == "",
+           f"PL13b (Codex) old outputs are cleared before a step runs, so touch does not launder them: {rep['steps']}")
+        w(d, "models/b.py", "open('models/b.out', 'w').write('7')\n")
+        run(d)
+        # (Codex) A renamed output: the retired file is removed.
+        spec(d, [three[0], dict(three[1], outputs=["models/b2.out"]), dict(three[2], inputs=["models/b2.out"])])
+        w(d, "models/b.py", "open('models/b2.out', 'w').write('7')\n")
+        rep = run(d)
+        ok(not os.path.exists(os.path.join(d, "models/b.out")) and rep.get("retired") == ["models/b.out"]
+           and [r["status"] for r in rep["steps"]] == ["ok", "failed"],
+           f"PL13c (Codex) an output no declaration names any more is removed (its old reader fails loudly): "
+           f"{rep.get('retired')} {rep['steps']}")
+        spec(d, three)
+        w(d, "models/b.py", "open('models/b.out', 'w').write('7')\n")
+        run(d)
+        # (Codex) `python -m` entry points and package __init__ files are code.
+        w(d, "models/pkg/__init__.py", "K = 1\n")
+        w(d, "models/pkg/mod.py", "V = 1\n")
+        w(d, "models/mrun.py", "import models.pkg.mod\nopen('models/m.out', 'w').write('m')\n")
+        spec(d, three + [{"id": "m", "run": f"{py} -m models.mrun", "inputs": [], "outputs": ["models/m.out"]}])
+        run(d)
+        w(d, "models/mrun.py", "import models.pkg.mod\nopen('models/m.out', 'w').write('m2')\n")
+        p1 = [p["id"] for p in plan(d)]
+        run(d)
+        w(d, "models/pkg/__init__.py", "K = 2\n")
+        p2 = [p["id"] for p in plan(d)]
+        ok(p1 == ["m"] and p2 == ["m"], f"PL13d (Codex) -m modules and package __init__ files are hashed: {p1} {p2}")
+        spec(d, three)
         run(d)
         # Budget, timeout and environment.
         w(d, "data/x.csv", "5\n")
@@ -886,6 +1044,16 @@ def _self_test() -> int:
         ok(r.returncode == 0 and "b" in r.stdout and "changed" in r.stdout, f"PL20 --dry-run prints the plan: {r.stdout}{r.stderr}")
         r = subprocess.run([sys.executable, os.path.abspath(__file__), "run", d, "b"], capture_output=True, text=True)
         ok(r.returncode == 2, "PL20b a single step outside scratch mode is refused")
+        # (Codex) A command naming the real run dir by absolute path runs the copy's file.
+        w(d, "models/b.py", "import os\nopen(os.path.join(os.path.dirname(__file__), 'b.out'), 'w').write('abs')\n")
+        spec(d, [three[0], dict(three[1], run=f"{py} {d}/models/b.py"), three[2]])
+        before = _tree_hash(d)
+        rep = scratch(d, "b", keep=False)
+        ok(rep["ok"] and _tree_hash(d) == before, f"PL21 (Codex) scratch rebases absolute run-dir paths: {rep}")
+        w(d, "models/b.py", f"open({os.path.join(d, 'models', 'b.out')!r}, 'w').write('abs')\n")
+        rep = scratch(d, "b", keep=False)
+        ok(not rep["ok"] and "models/b.out" in rep.get("real_run_changed", []),
+           f"PL22 a scratch step that still writes the real run dir is reported and fails: {rep.get('errors')}")
 
     # Validation fails closed.
     def errs_of(steps, extra=None):
@@ -928,6 +1096,16 @@ def _self_test() -> int:
     with tempfile.TemporaryDirectory() as d:
         w(d, SPEC, "steps:\n  - id: lib\n    run: compute: models/lib.py::f\n")
         ok(load(d)[1] and "does not parse" in load(d)[1][0], "PV12 unparseable YAML fails closed")
+    e = errs_of([dict(three[0], outputs=["critique_a*.y*"])])
+    ok(any("owned elsewhere" in x for x in e), f"PV13 (Codex) a glob that can match a critique file is refused: {e}")
+    e = errs_of([dict(three[0], outputs=["././report.md"])])
+    e2 = errs_of([dict(three[0], outputs=["./models/a.out"])])
+    ok(any("normalized" in x for x in e) and any("normalized" in x for x in e2),
+       f"PV14 (Codex) non-canonical paths are refused: {e} {e2}")
+    e = errs_of([three[0], dict(three[1], outputs=["models/a*.o*"])])
+    ok(any("same file" in x for x in e), f"PV15 glob outputs that can overlap are refused: {e}")
+    ok(not _overlap("figures/*.png", "figures/*.csv") and not _overlap("figures/*.png", "report.md"),
+       "PV16 provably disjoint globs do not overlap")
 
     # A compute step goes through the compute service with its purpose.
     with tempfile.TemporaryDirectory() as d:
@@ -986,8 +1164,22 @@ def _self_test() -> int:
             ok([x["file"] for x in new] == ["models/pipeline_state.json"],
                f"PO5 the runner's state file is protected: {new}")
             rep = harness_build(d, ig)
-            ok(rep["ok"] and not ig.open_events,
-               f"PO6 the harness run rewrites the hand-edited outputs and resolves the violations: {ig.open_events}")
+            ok(rep["ok"] and not ig.open_events and rep.get("state_distrusted")
+               and [r["id"] for r in rep["steps"]] == ["a", "b", "c"],
+               f"PO6 the harness run distrusts an edited state file, rebuilds everything and resolves the "
+               f"violations: {ig.open_events} {rep.get('state_distrusted')}")
+            # (Codex) A forged state record (inputs changed, output not rebuilt) is not laundered
+            # by an unrelated rebuild: the edit is seen and every step reruns.
+            w(d, "data/y.csv", "30\n")
+            stt = json.load(open(os.path.join(d, STATE)))
+            stt["steps"]["b"]["key"] = fingerprint(next(s for s in load(d)[0] if s["id"] == "b"), d)["key"]
+            stt["steps"]["b"]["inputs"]["data/y.csv"] = _sha(os.path.join(d, "data/y.csv"))
+            w(d, STATE, json.dumps(stt))
+            w(d, "data/x.csv", "2\n")
+            rep = harness_build(d, ig)
+            ok(rep.get("state_distrusted") and "b" in [r["id"] for r in rep["steps"]]
+               and open(os.path.join(d, "models/b.out")).read() == "33",
+               f"PO6b (Codex) a forged state record is dropped, not laundered: {rep['steps']}")
             # An undeclared protected file a step writes is still flagged.
             w(d, "models/c.py", open(os.path.join(d, "models/c.py")).read() + "open('report.md', 'w').write('x')\n")
             harness_build(d, ig)

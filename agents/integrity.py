@@ -496,6 +496,14 @@ class ArtifactIntegrity:
         with self._lock:
             self.hashes[rel] = _sha(os.path.join(self.run_path, rel))
 
+    def check_now(self) -> list[dict]:
+        """S1: judge pending changes now (before the harness pipeline run trusts its state)."""
+        with self._lock:
+            return self._check(where="pipeline_start")
+
+    def is_open(self, rel: str) -> bool:
+        return any(e.get("file") == rel and e.get("open", True) for e in self.events)
+
     @contextmanager
     def harness_pipeline(self, patterns):
         """S1: the harness's pipeline run is writing `patterns` (the declared outputs of
