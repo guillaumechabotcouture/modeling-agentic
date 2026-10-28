@@ -137,7 +137,8 @@ deeper.
    `trial_comparator` (the trial's control arm) matches `comparator_delivers`
    (what the run's primary comparator already gives those units), e.g. a
    new net type against the nets the comparator keeps, not against no nets.
-   Also check that `model_use` is the use reached in `units`, and that no
+   Also check that `model_use` is the use the model reaches there, that
+   `burden_output` covers the period the intervention covers, and that no
    entry under `not_bounding` is the effect of an intervention the
    allocation funds. A mismatch or such an exemption is a HIGH METHODS
    finding.

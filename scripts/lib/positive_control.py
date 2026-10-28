@@ -117,8 +117,9 @@ def evaluate_unit(inputs, efficacy=VACCINE_EFFICACY,
     else:
         cases = 0.0
         cost = 0.0
+    burden = eligible * incidence * dalys_per_case
     return {{"cases_averted": cases, "dalys_averted": cases * dalys_per_case,
-            "cost": cost}}
+            "dalys": burden - cases * dalys_per_case, "cost": cost}}
 
 
 def candidates(efficacy=VACCINE_EFFICACY, cost_per_child=COST_PER_CHILD,
@@ -446,13 +447,19 @@ def build(run_dir: str, round_n: int = 2) -> dict:
             f"{c['cost'] if on else 0.0},{c['cases_averted'] if on else 0.0},"
             f"{c['dalys_averted'] if on else 0.0}")
     _w(run_dir, "models/allocation.csv", "\n".join(alloc_lines) + "\n")
-    # Phase 38 β: the campaign's effect against no campaign, held to the trial efficacy.
-    _w(run_dir, "models/effect_concordance.yaml", {"effects": [{
-        "id": "E1", "intervention": "vaccination campaign", "registry": "vaccine_efficacy",
-        "trial_comparator": "unvaccinated (placebo arm)", "trial_use": 1.0, "comparator_id": "CF1",
-        "comparator_delivers": "no campaign: no vaccination in the district",
-        "units": "funded districts, campaign year",
-        "model_ratio": round(1 - mod.VACCINE_EFFICACY * mod.COVERAGE, 4), "model_use": mod.COVERAGE}]})
+    # Phase 38 β: the campaign's effect against no campaign, computed by the harness
+    # from evaluate_unit on the funded districts and held to the trial efficacy.
+    _w(run_dir, "models/units.csv", "district,eligible_children,incidence_per_child\n" + "".join(
+        f"{r['district']},{r['eligible_children']},{mod.incidence_per_child(r)}\n" for r in rows))
+    _w(run_dir, "models/effect_concordance.yaml", {
+        "unit_fn": "models/model.py::evaluate_unit", "call_style": "dict",
+        "allocation_csv": "models/allocation.csv", "unit_column": "district", "package_column": "package",
+        "benefit_column": "dalys_averted", "units_csv": "models/units.csv", "package_input": "package",
+        "benefit_output": "dalys_averted", "burden_output": "dalys",
+        "effects": [{"id": "E1", "intervention": "vaccination campaign", "registry": "vaccine_efficacy",
+                     "trial_comparator": "unvaccinated (placebo arm)", "trial_use": 1.0, "comparator_id": "CF1",
+                     "comparator_delivers": "no campaign: no vaccination in the district",
+                     "on_package": "campaign", "off_package": "none", "model_use": mod.COVERAGE}]})
     spent = sum(by_name[d]["cost"] for d in funded)
     dalys = sum(by_name[d]["dalys_averted"] for d in funded)
     cases = sum(by_name[d]["cases_averted"] for d in funded)

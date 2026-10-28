@@ -928,11 +928,16 @@ def intervention_effect(intervention, p0):
 Reserve full-mechanistic for transmission research, not allocation.
 Whatever the architecture, write `models/effect_concordance.yaml` with your
 first allocation (Phase 38 β; format in `scripts/effect_concordance.py`).
-For each intervention with a trial effect in the registry, give the model's
-outcome ratio under the plan vs the decision brief's primary comparator, in
-units that receive only that intervention, and name the registry effect for
-the trial comparison that matches what the comparator already delivers (a
-new product against the product the comparator keeps, not against nothing).
+For each intervention with a trial effect in the registry, name the
+packages to compare (what the brief's primary comparator delivers, and that
+plus this intervention) and the registry effect for the trial comparison
+that matches what the comparator already delivers (a new product against
+the product the comparator keeps, not against nothing). You write no
+effect numbers: the harness evaluates your per-unit function (the one the
+eligibility probe uses), checks that it reproduces the allocation CSV, and
+computes each effect over the units the allocation gives it. Expose a
+burden output over the period the intervention covers (a whole-window
+output dilutes it).
 The gate holds the modeled reduction to the trial's. Check it on the pilot,
 before a large library batch: an agent-based model whose combined effect
 exceeds the trials is the failure this architecture section exists to stop.

@@ -249,11 +249,12 @@ kept support at most about 35% at the model's attained use. The fix, a cap
 added after the library had run, came in round 2.
 
 `models/effect_concordance.yaml` (format in `scripts/effect_concordance.py`)
-makes this a check from the first allocation. Per intervention, record the
-model's outcome ratio under the plan vs the decision brief's primary
-comparator, in units receiving only that intervention, plus the registry
-effect for the trial comparison that matches what the comparator already
-delivers. The gate holds the modeled reduction to the trial's largest
+makes this a check from the first allocation. Per intervention, name the
+packages to compare (what the primary comparator delivers, and that plus
+the intervention) and the registry effect for the matching trial
+comparison. The harness, not the modeler, computes the effect: it checks
+that the per-unit function reproduces the allocation, then evaluates it
+over the units the allocation funds. The gate holds the modeled reduction to the trial's largest
 plausible reduction, scaled to attained use. Compute it on the pilot before
 a large batch. When it fails, the hybrid pattern above is the usual fix: keep
 the mechanistic model for baseline transmission and constrain the
