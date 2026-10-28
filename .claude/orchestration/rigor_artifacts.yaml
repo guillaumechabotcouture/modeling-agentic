@@ -162,6 +162,21 @@ artifacts:
       `scripts/effect_concordance.py` holds the modeled reduction to the
       trial's lower-CI reduction scaled to attained use (HIGH if exceeded).
 
+  - id: headline_binding
+    path: models/headline_binding.yaml
+    first_draft_round: 1
+    finalize_round: 2
+    stage: allocation
+    skill: uncertainty-quantification
+    triggered_by: allocation
+    scope_declarable: true
+    description: |
+      **With the first allocation** (S2). Map each `outcome_fn` output to the
+      claims-ledger claim it reproduces (headline totals, e.g. benefit and
+      cost) and, if it returns one, its per-unit package choice to the
+      allocation CSV. `scripts/headline_binding.py` evaluates outcome_fn at the
+      registry point estimates; any mismatch over 1% is HIGH, not declarable.
+
   - id: allocation_robustness
     path: models/allocation_robustness.yaml
     first_draft_round: 3
