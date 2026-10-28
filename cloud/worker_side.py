@@ -85,22 +85,25 @@ def run_stored(tarball):
     return None
 
 
-def all_stored(store, prefix, account, labels, since):
-    """Every label's result record is in storage and newer than this launch,
-    so a record an earlier launch left under the same prefix does not count."""
-    fresh = {b["name"] for b in store.list_blobs(f"outputs/{prefix}/result_", account)
-             if b["last_modified"].timestamp() >= since - 3600}
-    return all(f"outputs/{prefix}/result_{lb}.json" in fresh for lb in labels)
+def record_blob(prefix, launch_id, label):
+    """Result records live under the launch that wrote them, so a record an
+    earlier launch left under the same prefix never counts for this one."""
+    return f"outputs/{prefix}/launch_{launch_id}/result_{label}.json"
 
 
-def run_to_disk(label, code, question, flags, anthropic_key, openai_key, labels, prefix, account,
+def all_stored(store, prefix, account, labels, launch_id):
+    """Every label of this launch has its result record in storage."""
+    have = {b["name"] for b in store.list_blobs(f"outputs/{prefix}/launch_{launch_id}/", account)}
+    return all(record_blob(prefix, launch_id, lb) in have for lb in labels)
+
+
+def run_to_disk(label, code, question, flags, anthropic_key, openai_key, labels, prefix, account, launch_id,
                 max_rounds=8, max_sessions=5, shutdown_when_stored=True):
     """The agent VM's task: run, store the run, its transcripts and its result
     record, then (last run of the launch) shut the cluster down. If any upload
     failed, hold the results on disk and stay busy until `collect` takes them:
     an idle VM is the one an autoscaling pool retires first."""
     import io, json, os, re, subprocess, sys, tarfile, tempfile, time
-    started = time.time()
     td = tempfile.mkdtemp()
     tarfile.open(fileobj=io.BytesIO(code), mode="r:gz").extractall(td)
     pins = [ln.split("#")[0].strip() for ln in open(os.path.join(td, "requirements.txt"))
@@ -129,9 +132,9 @@ def run_to_disk(label, code, question, flags, anthropic_key, openai_key, labels,
     json.dump(res, open(f"{d}/result.json", "w"))
     if res["run_stored"] and res.get("transcripts_stored"):
         try:
-            results_store.upload_retry(f"{d}/result.json", f"outputs/{prefix}/result_{label}.json", account)
+            results_store.upload_retry(f"{d}/result.json", record_blob(prefix, launch_id, label), account)
             open(f"{d}/collected", "w").write("stored")
-            if shutdown_when_stored and all_stored(results_store, prefix, account, labels, started):
+            if shutdown_when_stored and all_stored(results_store, prefix, account, labels, launch_id):
                 from distributed import get_client
                 print(f"{label}: every run of this launch is in storage; shutting the cluster down", flush=True)
                 get_client().shutdown()

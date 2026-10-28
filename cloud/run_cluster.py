@@ -167,11 +167,11 @@ def code_tarball(cfg) -> tuple[bytes, str]:
 
 # ---- commands ---------------------------------------------------------------------------
 
-def _submit(cfg, client, label, worker, code, question, keys):
+def _submit(cfg, client, label, worker, code, question, keys, launch_id):
     from distributed import fire_and_forget
     fut = client.submit(ws.run_to_disk, label, code, question, list(cfg.flags), keys["ANTHROPIC_API_KEY"],
                         keys.get("OPENAI_API_KEY") if cfg.cross_model else None, list(cfg.labels),
-                        cfg.storage_prefix, cfg.storage_account, cfg.max_rounds, cfg.max_sessions,
+                        cfg.storage_prefix, cfg.storage_account, launch_id, cfg.max_rounds, cfg.max_sessions,
                         workers=[worker], allow_other_workers=False, pure=False,
                         key=f"run-{label}-{int(time.time())}")
     fire_and_forget(fut)
@@ -198,10 +198,11 @@ def launch(cfg):
     client.upload_file(os.path.join(HERE, "worker_side.py"))
     workers = sorted(client.scheduler_info()["workers"])[:len(cfg.labels)]
     compute.register_compute_tags(client, exclude=workers)   # the agent VMs never take compute tasks
+    launch_id = time.strftime("%Y%m%d-%H%M%S")
     assign = {}
     for label, w in zip(cfg.labels, workers):
-        _submit(cfg, client, label, w, code, question, keys)
-        assign[label] = {"worker": w, "commit": commit, "submitted": time.strftime("%F %T")}
+        _submit(cfg, client, label, w, code, question, keys, launch_id)
+        assign[label] = {"worker": w, "commit": commit, "submitted": time.strftime("%F %T"), "launch_id": launch_id}
         print(f"fired {label} -> {w} @ {commit}", flush=True)
     json.dump(assign, open(cfg.state_file, "w"), indent=1)
     time.sleep(10)
@@ -248,11 +249,11 @@ def status(cfg):
                   f"stored={r.get('run_stored')}")
 
 
-def collect_from_storage(cfg, store, label):
-    """One label from storage: the result record, then the run directory it names."""
+def collect_from_storage(cfg, store, label, launch_id):
+    """One label from storage: this launch's result record, then the run directory it names."""
     dest = os.path.join(cfg.out_dir, label)
     rj = os.path.join(cfg.out_dir, f"{label}.result.json")
-    store.download(f"outputs/{cfg.storage_prefix}/result_{label}.json", rj, cfg.storage_account)
+    store.download(ws.record_blob(cfg.storage_prefix, launch_id, label), rj, cfg.storage_account)
     meta = json.load(open(rj))
     if not meta.get("run_stored"):
         raise SystemExit(f"{label}: the result record names no stored run")
@@ -294,14 +295,15 @@ def collect(cfg):
     import results_store
     os.makedirs(cfg.out_dir, exist_ok=True)
     running = is_running(cfg.name)
-    client = assign = None
-    pending = []
+    if not os.path.exists(cfg.state_file):
+        raise SystemExit(f"no {cfg.state_file}: this machine did not launch {cfg.name}")
+    assign, client, pending = json.load(open(cfg.state_file)), None, []
     for label in cfg.labels:
         if os.path.exists(os.path.join(cfg.out_dir, label, "result.json")):
             print(f"{label}: already collected")
             continue
         try:
-            meta = collect_from_storage(cfg, results_store, label)
+            meta = collect_from_storage(cfg, results_store, label, assign[label]["launch_id"])
             print(f"{label}: exit={meta['exit_code']} {meta['duration_s']}s -> {cfg.out_dir}/{label} (from storage)")
             continue
         except Exception as e:  # noqa: BLE001 — not (yet) in storage
@@ -309,7 +311,7 @@ def collect(cfg):
                 print(f"{label}: not in storage ({type(e).__name__}) and the cluster has stopped")
                 continue
         if client is None:
-            client, assign = attach(cfg.name).get_client(), json.load(open(cfg.state_file))
+            client = attach(cfg.name).get_client()
         w = assign[label]["worker"]
         if _on_worker(client, ws.fetch_meta, label, worker=w)["state"] != "done":
             print(f"{label}: still running")
@@ -341,10 +343,18 @@ def shutdown(cfg):
 def relaunch(cfg, label):
     """Re-fire one run on its pinned agent VM (e.g. after a preflight-only fix)."""
     assign = json.load(open(cfg.state_file))
+    sys.path.insert(0, os.path.join(cfg.tree, "scripts"))
+    import results_store
+    launch_id = assign[label]["launch_id"]
+    names = {b["name"] for b in results_store.list_blobs(f"outputs/{cfg.storage_prefix}/launch_{launch_id}/",
+                                                          cfg.storage_account)}
+    if ws.record_blob(cfg.storage_prefix, launch_id, label) in names:
+        raise SystemExit(f"{label} is already stored in this launch; collect it instead of relaunching")
     code, commit = code_tarball(cfg)
     client = attach(cfg.name).get_client()
     client.upload_file(os.path.join(HERE, "worker_side.py"))
-    _submit(cfg, client, label, assign[label]["worker"], code, open(cfg.question_file).read().strip(), read_keys())
+    _submit(cfg, client, label, assign[label]["worker"], code, open(cfg.question_file).read().strip(), read_keys(),
+            launch_id)
     assign[label].update(commit=commit, submitted=time.strftime("%F %T"), relaunched=True)
     json.dump(assign, open(cfg.state_file, "w"), indent=1)
     print(f"re-fired {label} -> {assign[label]['worker']} @ {commit}")
@@ -403,11 +413,13 @@ def _self_test() -> int:
             open(path, "wb").write(self.files[blob])
 
     p, labels = "runs/x", ["R1", "R2"]
-    r1, r2 = f"outputs/{p}/result_R1.json", f"outputs/{p}/result_R2.json"
-    ok(not ws.all_stored(Store([(r1, now)]), p, None, labels, now - 60), "RC5 one run of two stored: keep running")
-    ok(ws.all_stored(Store([(r1, now), (r2, now)]), p, None, labels, now - 60), "RC6 both stored: shut down")
-    ok(not ws.all_stored(Store([(r1, now), (r2, now - 3 * 86400)]), p, None, labels, now - 60),
-       "RC7 a record from an earlier launch does not count")
+    r1, r2 = ws.record_blob(p, "L2", "R1"), ws.record_blob(p, "L2", "R2")
+    ok(not ws.all_stored(Store([(r1, now)]), p, None, labels, "L2"), "RC5 one run of two stored: keep running")
+    ok(ws.all_stored(Store([(r1, now), (r2, now)]), p, None, labels, "L2"), "RC6 both stored: shut down")
+    ok(not ws.all_stored(Store([(ws.record_blob(p, "L1", "R1"), now - 60), (r2, now)]), p, None, labels, "L2"),
+       "RC7 a record an earlier launch wrote minutes ago does not count")
+    ok(not ws.all_stored(Store([(f"outputs/{p}/result_R1.json", now), (r2, now)]), p, None, labels, "L2"),
+       "RC7b a record outside any launch folder does not count")
 
     listing = [{"name": "a", "current_state": {"state": "stopped"}}, {"name": "a", "current_state": {"state": "ready"}},
                {"name": "b", "current_state": "Stopping"}, {"name": "c", "current_state": None}]
@@ -427,15 +439,22 @@ def _self_test() -> int:
                 ok(True, f"RC11 rejects {why}")
         run = tb({"r/metadata.json": b"{}", "r/report.md": b"# report"})
         rec = json.dumps({"exit_code": 0, "duration_s": 5, "run_stored": "outputs/runs/t/r.tar.gz"}).encode()
-        st = Store(files={"outputs/runs/t/result_R1.json": rec, "outputs/runs/t/r.tar.gz": run})
-        m = collect_from_storage(cfg, st, "R1")
+        st = Store(files={ws.record_blob("runs/t", "L2", "R1"): rec, "outputs/runs/t/r.tar.gz": run})
+        m = collect_from_storage(cfg, st, "R1", "L2")
         ok(m["exit_code"] == 0 and open(os.path.join(d, "R1", "runs", "r", "report.md")).read() == "# report",
            "RC12 collect from storage unpacks the stored run directory")
         try:
-            collect_from_storage(cfg, Store(files={"outputs/runs/t/result_R1.json": b'{"run_stored": null}'}), "R1")
+            collect_from_storage(cfg, Store(files={ws.record_blob("runs/t", "L2", "R1"): b'{"run_stored": null}'}),
+                                 "R1", "L2")
             ok(False, "RC13 a record naming no stored run fails")
         except SystemExit:
             ok(True, "RC13 a record naming no stored run fails")
+        try:
+            collect_from_storage(cfg, Store(files={ws.record_blob("runs/t", "L1", "R1"): rec,
+                                                   "outputs/runs/t/r.tar.gz": run}), "R1", "L2")
+            ok(False, "RC13b an earlier launch's record is not collected for this launch")
+        except FileNotFoundError:
+            ok(True, "RC13b an earlier launch's record is not collected for this launch")
         cf = os.path.join(d, "c.py")
         open(cf, "w").write("from run_cluster import RunConfig\nCONFIG = RunConfig(name='z', question_file='q')\n")
         ok(load_config(cf).name == "z", "RC14 a config file loads")
