@@ -197,6 +197,15 @@ The test has a known optimal allocation and planted traps: the eligibility denom
 
 Critics judge computed facts. They read the impact ledger, harness reports and figures, not the modeler's self-description.
 
+### 3.7 Interfaces and maintainability
+
+The design above adds code; it stays maintainable only if each piece has one home and one interface. Four rules, each measured by `scripts/structure_metrics.py` (CI writes its report, as changes against main, on every PR):
+
+- **One check interface.** Every harness-computed check is a module with `gate_findings(run_dir) -> list[finding]` in the common finding shape (kind, severity, claim, target stage, whether scope can be declared). The gate only collects findings. Existing `_check_*` functions in `validate_critique_yaml.py` move out to their own modules when they are next changed, never in a bulk move. Metric: checks on the interface ↑ (5 at `51f7d5e`); the gate file's share of `scripts/` ↓ (23%).
+- **Shared loaders that fail closed.** Reading a run's YAML, CSV and claims ledger goes through `scripts/lib`, which returns a finding for a missing, unparsable or wrong-typed input, so each check does not re-implement failing closed. Metric: scripts parsing YAML themselves ↓ (37), scripts using `scripts/lib` ↑ (11), duplicate function groups ↓ (6; three are `md_helpers` functions still copied in the gate).
+- **One launcher library.** Cloud runs go through `cloud/run_cluster.py` with a short config per attempt in `cloud/configs/`; the cluster stops itself once every run is stored. Per-attempt copies of cluster scripts (18, with the cluster-state check repeated in 16 files) are no longer made. Metric: new launcher code per attempt is a config of about 20 lines.
+- **`main.py` split by concern** as part of S4: the stage machine, storage, rebuilds and finishing become separate modules. Metric: files over 1,500 lines ↓ (5); median files changed per PR stays low (5).
+
 ## 4. Migration: small steps, each tested on its own
 
 Each step ships as its own PR. Each is checked on a replay or a short real run against a stated metric before the next starts.
@@ -207,11 +216,14 @@ Each step ships as its own PR. Each is checked on a replay or a short real run a
 | T1 | Allocation spec schema plus `alloc.costs` and `alloc.packages` (the most finding-dense code), then `alloc.optimize`; each with unit tests and the planted-truth test | Planted-truth costs and allocation recovered by the toolkit alone, every planted trap caught; attempt 7's cost matrix reproduced from its spec within 1% |
 | T2 | `alloc.scenarios` with the results store, `alloc.uncertainty`, `alloc.comparators`, `alloc.robustness` | Attempt 7's headline and uncertainty interval reproduced from spec plus model within 1%; sensitivity computed, not self-reported |
 | S1 | `pipeline.yaml` schema plus harness runner (incremental, owned outputs); producers and figures first (generalises Phase 39 β) | On attempt 7's copy: one changed input reruns exactly its downstream steps; zero stale artifacts at the gate |
-| S2 | Binding of `outcome_fn` to the headline (inventory #1) | Attempt 7: bound within 1%; a decoy fails |
+| S2 | Binding of `outcome_fn` to the headline (inventory #1) | Attempt 7: bound within 0.1%; a decoy and a branch variant fail (merged, #42) |
 | S3 | Fix loop plus `impact_ledger.jsonl`; one finding per modeler task, scoped brief | Replay of attempt 7's round 4 → 5 fixes as single tasks: each has a ledger row; total cost ≤ that round's |
 | S4 | State machine in `main.py` for the deterministic transitions; the lead becomes the fix planner | Golden-trace replays take the same gate actions; lead context per round ↓ (measured) |
 | S5 | Gate conversions #2–#5 (sensitivity, optimizer, calibration and leave-one-out, pointers) | Each: the self-reported field is no longer read; the retro on attempt 7 matches or explains |
 | S6 | Retire lead-prompt stages and the refusals S4 replaced | Prompt size ↓; no regressions in replays |
+| M0 | `scripts/structure_metrics.py` in CI (§3.7) | Baseline recorded; the report appears on every PR (#44) |
+| M1 | `cloud/` launcher library and configs; the cluster stops itself once runs are stored | Whole-path smoke: the cluster stops by itself after the run, `collect` fetches from storage |
+| M2 | Check interface and shared fail-closed loaders; first move: delete the gate's copies of `md_helpers` functions | Duplicate groups ↓; checks on the interface ↑; gate self-tests and regression eval unchanged |
 
 **Sequencing with what's open:** PRs #32, #34, #35 and #36 (trial check, figure rebuild, early finish, presentation deferral) land first. They are compatible with this design and become stage behaviour in S4. T0–T1 run alongside S1–S2. The toolkit's steps are what `pipeline.yaml` runs, and gate conversions #2–#5 become toolkit steps rather than separate scripts.
 
