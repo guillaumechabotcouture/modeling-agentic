@@ -146,6 +146,22 @@ artifacts:
       After your FIRST optimizer pass; 2 load-bearing parameters, one alternative
       value each. Expand perturbations and tighten verdicts in later rounds.
 
+  - id: effect_concordance
+    path: models/effect_concordance.yaml
+    first_draft_round: 1
+    finalize_round: 2
+    stage: allocation
+    skill: mechanistic-vs-hybrid-architecture
+    triggered_by: allocation
+    scope_declarable: true
+    description: |
+      **With the first allocation** (Phase 38 β). For each intervention with a
+      trial effect in the citations registry: the model's outcome ratio, plan
+      vs the brief's primary comparator, in units receiving only it, against
+      the trial comparison matching what the comparator already delivers.
+      `scripts/effect_concordance.py` holds the modeled reduction to the
+      trial's lower-CI reduction scaled to attained use (HIGH if exceeded).
+
   - id: allocation_robustness
     path: models/allocation_robustness.yaml
     first_draft_round: 3
