@@ -1,5 +1,9 @@
 # Coiled launchers (E7 attempt 7)
 
+**New runs use `cloud/run_cluster.py` with a config in `cloud/configs/`** (one library
+for launch, status, collect, shutdown and the keeper; the cluster stops itself once every
+run is stored). The scripts below are the record of how attempts up to 7 were launched.
+
 Versioned copies of the scripts that start and manage cloud runs, so they are reviewed with the
 harness. They run from `~/modeling-agentic-keep/coiled_run/` (they write their outputs next to it);
 keep the two copies identical when changing either.
