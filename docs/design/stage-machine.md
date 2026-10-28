@@ -1,6 +1,10 @@
 # Stage machine: code runs the pipeline, LLMs reason and edit code
 
-**Status:** design for review (2026-10-27). It makes `docs/architecture-v2.md` §3.1 (stage graph, Python orchestrator, migration step 5) concrete, and adds what E7 attempts 6 and 7 showed is missing: a declared build pipeline per run, small fixes whose impact is measured one at a time, and gate inputs computed by the harness instead of written by agents.
+**Status:** design for review (2026-10-27). It makes `docs/architecture-v2.md` §3.1 (stage graph, Python orchestrator, migration step 5) concrete, and adds what E7 attempts 6 and 7 showed is missing:
+- a declared build pipeline per run;
+- small fixes whose impact is measured one at a time;
+- gate inputs computed by the harness instead of written by agents;
+- (§3.6) a reusable, tested toolkit by problem type, so each run configures and extends tools instead of rewriting them, and the toolset improves and is reused more with every run.
 
 ## 1. Why (measured on E7 attempts 6 and 7)
 
@@ -18,6 +22,8 @@
 2. **LLMs own reasoning and code edits.** That covers framing, model design, choosing what to fix next, writing and editing code, interpreting results, critique, and prose.
 3. **One fix, one rebuild, one measurement.** A fix is a small change aimed at one finding. The harness rebuilds what it affects and records its impact before the next fix starts.
 4. **Agents return code or typed outputs, never hand-written numbers.**
+5. **Reuse before writing.** A run starts from the toolkit for its problem type and writes only what the toolkit lacks. What it writes that proves generic is promoted into the toolkit, with tests, after the run. So the next run starts further along.
+6. **Every LLM-caught error class becomes a deterministic check.** The share of findings that only an LLM catches should fall from run to run, and is measured.
 
 ## 3. Architecture
 
@@ -105,6 +111,33 @@ GATE → fix planner orders the open findings → for each task, in order:
 - **Cheaper.** An agent's context is one finding plus the files it touches, not a whole round's backlog. Critics run once per loop rather than after every change. Fixes whose tests are mechanical need no critic at all.
 - **Regressions are caught at the step that causes them.** A fix that breaks an earlier test, or opens a new finding, shows up in its own ledger row rather than at the next gate.
 
+### 3.6 Toolkit and templates: configure and extend, don't rewrite
+
+**The problem.** Attempt 7's modeler wrote 111 files under `models/`. Most are not the malaria model. They are generic machinery that every allocation question needs:
+- an optimizer and cost accounting;
+- scenario and package composition;
+- uncertainty plumbing, figures, per-round drivers and the claims spec.
+
+Rewritten each run, this machinery carries new bugs each time. Critics spent rounds catching them: the SMC drug double count, case-management reach, number drift, stale figures. The inventory (`a7_models_inventory`, step T0 below) measures this split.
+
+**Templates by problem type, not by disease.** Examples: "budget allocation across units", "calibrate and project", "decision rule". A template is:
+- **A spec schema.** A machine-readable question spec: units, interventions and packages, unit costs, budget, comparators (from the signed brief), outcomes and their accounting (window, discounting, DALY weights), calibration targets and benchmarks. The planner drafts it, the owner signs it with the brief, and the harness validates it.
+- **A pipeline of tested steps.** Data load and schema; library or scenario composition through the compute service; calibration; binding; uncertainty; sensitivity; optimizer and its benchmark; cross-validation; decision rule; figures; claims. Each step is a toolkit module with unit tests and a reference case, configured from the spec.
+- **Contracts for the run's own model.** The model the LLM writes plugs in through fixed functions: `outcome_fn`, `evaluate_unit`, `loss` and, for library models, a cell runner. Everything around the model comes from the toolkit.
+
+**Where the toolkit lives.** In the repo as `toolkit/<template>/`, versioned, with tests in CI. Disease mechanics that are reusable across runs of one disease live beside it (for example `toolkit/diseases/malaria/`, behind the same contracts). They are gated by the existing `applies_when` keywords, so gate logic stays disease-agnostic.
+
+**How the toolset improves over time:**
+- **Start:** the planner picks the template; the modeler configures it and writes only the model and any missing pieces.
+- **During the run:** a missing piece is written in the run under `models/ext/`, behind a declared interface.
+- **After the run (promotion):** each `models/ext/` piece is reviewed. Generic ones move into the toolkit with a unit test and a reference case, and get a CHANGELOG row. Its version is recorded in `run_state.json`, so a run's results trace to the exact toolkit version.
+- **Error classes:** each critic finding that a deterministic check could have caught gets that check added to the toolkit or the gate, as the comparator, trial-effect and figure-staleness findings did this session.
+- **Measured:** each run reports toolkit lines reused against lines written, and findings caught deterministically against findings caught by LLM. Both trends should improve from run to run.
+
+**Deterministic, end-to-end tests per template (no LLM).** A planted-truth case uses synthetic units with known effects and a known optimal allocation; the template's pipeline, given the spec and a reference model, must recover the answer. This runs in CI, so toolkit and harness changes are tested without a paid run. It follows the OmicsBench pattern: answer files plus deterministic graders.
+
+**Novel models stay possible.** Templates fix the steps around the model, not the model. A question that fits no template runs as today, with its custom steps declared in `pipeline.yaml`, and is the first candidate for a new template.
+
 ### 3.5 What stays LLM judgement
 
 - **Framing:** the brief, comparators, out of scope, and the open questions for the owner.
@@ -121,6 +154,8 @@ Each step ships as its own PR. Each is checked on a replay or a short real run a
 
 | Step | Builds | Metric to pass |
 |---|---|---|
+| T0 | Inventory of attempt 7's `models/`: reusable machinery vs disease-specific vs question-specific vs superseded; proposed allocation toolkit and spec fields | Each file classified; lines of code by class; toolkit modules mapped to the files they come from (started 2026-10-27) |
+| T1 | Allocation spec schema plus the first toolkit modules, extracted from attempt 7 and the existing `scripts/` (optimizer and benchmark, cost and package composition, uncertainty, sensitivity), each with unit tests | Planted-truth allocation recovered by the toolkit alone; attempt 7's allocation reproduced from its spec and model within 1% |
 | S1 | `pipeline.yaml` schema plus harness runner (incremental, owned outputs); producers and figures first (generalises Phase 39 β) | On attempt 7's copy: one changed input reruns exactly its downstream steps; zero stale artifacts at the gate |
 | S2 | Binding of `outcome_fn` to the headline (inventory #1) | Attempt 7: bound within 1%; a decoy fails |
 | S3 | Fix loop plus `impact_ledger.jsonl`; one finding per modeler task, scoped brief | Replay of attempt 7's round 4 → 5 fixes as single tasks: each has a ledger row; total cost ≤ that round's |
@@ -128,7 +163,7 @@ Each step ships as its own PR. Each is checked on a replay or a short real run a
 | S5 | Gate conversions #2–#5 (sensitivity, optimizer, calibration and leave-one-out, pointers) | Each: the self-reported field is no longer read; the retro on attempt 7 matches or explains |
 | S6 | Retire lead-prompt stages and the refusals S4 replaced | Prompt size ↓; no regressions in replays |
 
-**Sequencing with what's open:** PRs #32, #34, #35 and #36 (trial check, figure rebuild, early finish, presentation deferral) land first. They are compatible with this design and become stage behaviour in S4.
+**Sequencing with what's open:** PRs #32, #34, #35 and #36 (trial check, figure rebuild, early finish, presentation deferral) land first. They are compatible with this design and become stage behaviour in S4. T0–T1 run alongside S1–S2. The toolkit's steps are what `pipeline.yaml` runs, and gate conversions #2–#5 become toolkit steps rather than separate scripts.
 
 ## 5. Risks
 
@@ -143,3 +178,5 @@ Each step ships as its own PR. Each is checked on a replay or a short real run a
 2. **Lead model:** does the fix planner stay on the top model? Proposed: yes. It is short and decision-heavy; the savings come from dropping orchestration context.
 3. **Owned outputs:** may agents ever write pipeline outputs directly, for example in an emergency? Proposed: no. They use `--scratch`, then the harness run.
 4. **Where to start:** S1 (pipeline runner) or S3 (fix loop with the impact ledger)? Proposed: S1, because S3 needs a harness-run rebuild to measure anything.
+5. **Promotion review:** who approves moving a run's `models/ext/` code into the toolkit? Proposed: an agent drafts the promotion PR with tests after each run, and you approve it, like any other PR.
+6. **First template:** "budget allocation across units". Proposed: yes; E7 has two real instances of it to extract from and test against.
