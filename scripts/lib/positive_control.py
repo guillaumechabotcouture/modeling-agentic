@@ -666,10 +666,6 @@ def build(run_dir: str, round_n: int = 2) -> dict:
          "source_artifact": "uncertainty_report.yaml",
          "source_field": "scalar_outputs.total_dalys_averted.mean",
          "causal_label": "MODEL_ESTIMATE", "confidence": "MEDIUM"},
-        {"id": "dalys_det", "claim_kind": "scalar", "units": "DALYs_per_year",
-         "source_artifact": "models/allocation.csv",
-         "source_field": "dalys_averted.sum() where allocated=True",
-         "causal_label": "MODEL_ESTIMATE", "confidence": "MEDIUM"},
         {"id": "spend", "claim_kind": "currency", "units": "USD",
          "source_artifact": "models/allocation.csv",
          "source_field": "cost.sum() where allocated=True",
@@ -689,6 +685,11 @@ def build(run_dir: str, round_n: int = 2) -> dict:
         {"id": "sens_verdict", "claim_kind": "label",
          "source_artifact": "models/sensitivity_analysis.yaml",
          "source_field": "verdict",
+         "causal_label": "MODEL_ESTIMATE", "confidence": "MEDIUM"},
+        # Phase 38 β: last, so the planted-defect eval's claim order is unchanged.
+        {"id": "dalys_det", "claim_kind": "scalar", "units": "DALYs_per_year",
+         "source_artifact": "models/allocation.csv",
+         "source_field": "dalys_averted.sum() where allocated=True",
          "causal_label": "MODEL_ESTIMATE", "confidence": "MEDIUM"},
     ]})
     _, spec_errors = _builder().write(run_dir)
