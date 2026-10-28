@@ -42,6 +42,8 @@ sections of the template spec):
         price_rule: index                 # index: base-currency index; local_index: through the local currency
                                           # (source-year rate, local inflation, base-year rate); as_published
         basis: per_eligible               # per_person | per_eligible | per_reached | per_commodity | fixed
+                                          # | per_outcome (a model output: outcome: <name>, incremental:
+                                          #   true for the package minus the package without this component)
         times: 4                          # e.g. cycles per year
         years: 3                          # charged per year over the window (default 1: once)
         share: 1.0                        # share of the basis population charged (e.g. sprayed structures)
@@ -73,7 +75,7 @@ import tempfile
 
 import yaml
 
-BASES = ("per_person", "per_eligible", "per_reached", "per_commodity", "fixed")
+BASES = ("per_person", "per_eligible", "per_reached", "per_commodity", "fixed", "per_outcome")
 RULES = ("index", "local_index", "as_published")
 
 
@@ -183,6 +185,11 @@ def validate(spec: dict, unit_fields: set[str] | None = None) -> list[str]:
                         f"{it.get('population', 'total')}; charge it on {cd['eligible']}, or give "
                         "`charged_beyond_eligible: <reason>` for a cost that genuinely covers more people "
                         "(e.g. community-wide mobilisation)")
+        if basis == "per_outcome":
+            if not str(it.get("outcome") or "").strip():
+                errs.append(f"cost_items.{iid}: per_outcome needs `outcome: <model output name>`")
+            if it.get("population") is not None:
+                errs.append(f"cost_items.{iid}: per_outcome is charged on a model output, not a population")
         if basis == "per_commodity" and not (_num(it.get("people_per_commodity")) or 0) > 0:
             errs.append(f"cost_items.{iid}: per_commodity needs people_per_commodity > 0")
         for k in ("times", "years", "share"):
@@ -216,12 +223,31 @@ def _factor(it: dict, prices: dict) -> float:
     return idx[b] / idx[py]
 
 
-def item_cost(it: dict, unit: dict, spec: dict) -> float:
-    """One item's cost for one unit over the window, in base-year prices."""
+def item_cost(it: dict, unit: dict, spec: dict, package: str | None = None, outcome=None, pk=None) -> float:
+    """One item's cost for one unit over the window, in base-year prices. A per_outcome item
+    needs the package and `outcome(unit, package) -> {name: value}` (the run's model)."""
     comps, pops = spec["components"], spec["units"]["populations"]
     cd = comps[it["component"]] or {}
     basis = it["basis"]
-    if basis == "fixed":
+    if basis == "per_outcome":
+        if outcome is None or package is None:
+            raise ValueError(f"cost item {it['id']} is per_outcome: cost_matrix needs outcome=")
+        pk = pk or packages(spec)
+        v = _num(outcome(unit, package).get(it["outcome"]))
+        if v is None:
+            raise ValueError(f"outcome {it['outcome']} for unit {unit.get(spec['units']['id'])}, package {package} "
+                             "is not a number")
+        if it.get("incremental"):
+            without = pk[package] - {it["component"]}
+            base = next((n for n, cs in pk.items() if cs == without), None)
+            if base is None:
+                raise ValueError(f"cost item {it['id']}: no package is {package} without {it['component']}")
+            b = _num(outcome(unit, base).get(it["outcome"]))
+            if b is None:
+                raise ValueError(f"outcome {it['outcome']} for package {base} is not a number")
+            v = max(v - b, 0.0)
+        q = v
+    elif basis == "fixed":
         q = 1.0
     else:
         pop_name = cd["eligible"] if basis in ("per_eligible", "per_reached") else it.get("population", "total")
@@ -234,20 +260,37 @@ def item_cost(it: dict, unit: dict, spec: dict) -> float:
             * float(it.get("times", 1.0)) * float(it.get("years", 1.0)))
 
 
-def cost_matrix(spec: dict, units: list[dict]) -> dict:
-    """{unit_id: {package: {"total": $, "items": {item_id: $}}}} in base-year prices."""
+def cost_matrix(spec: dict, units: list[dict], outcome=None) -> dict:
+    """{unit_id: {package: {"total": $, "items": {item_id: $}}}} in base-year prices.
+    `outcome(unit_row, package) -> {name: value}` supplies model outputs for per_outcome items."""
     errs = validate(spec, set(units[0]) if units else None)
     if errs:
         raise ValueError("invalid cost spec: " + "; ".join(errs))
+    if outcome is None and any(it.get("basis") == "per_outcome" for it in spec["cost_items"]):
+        raise ValueError("the spec has per_outcome cost items: pass outcome=<function of (unit, package)>")
     uid = spec["units"]["id"]
     pk = packages(spec)
+    fixed_items = [it for it in spec["cost_items"] if it["basis"] != "per_outcome"]
+    out_items = [it for it in spec["cost_items"] if it["basis"] == "per_outcome"]
+    memo: dict = {}
+
+    def cached(u, p):
+        key = (str(u[uid]), p)
+        if key not in memo:
+            memo[key] = outcome(u, p)
+        return memo[key]
     out = {}
     for u in units:
-        per_item = {it["id"]: item_cost(it, u, spec) for it in spec["cost_items"]}
-        comp_of = {it["id"]: it["component"] for it in spec["cost_items"]}
-        out[str(u[uid])] = {name: {"total": sum(v for i, v in per_item.items() if comp_of[i] in cs),
-                                   "items": {i: v for i, v in per_item.items() if comp_of[i] in cs}}
-                            for name, cs in pk.items()}
+        per_item = {it["id"]: item_cost(it, u, spec) for it in fixed_items}
+        row = {}
+        for name, cs in pk.items():
+            items = {it["id"]: v for it in fixed_items for i_, v in [(it["id"], per_item[it["id"]])]
+                     if it["component"] in cs}
+            for it in out_items:
+                if it["component"] in cs:
+                    items[it["id"]] = item_cost(it, u, spec, name, cached, pk)
+            row[name] = {"total": sum(items.values()), "items": items}
+        out[str(u[uid])] = row
     return out
 
 
@@ -329,6 +372,24 @@ def _self_test() -> int:
     ok(any("more than one component of group net" in e for e in validate(grp)), "TC14 one component per group")
     ok("bad" not in packages({**grp, "packages": {"generate": True}}), "TC15 generated packages respect groups")
     ok(any("column elig" in e for e in validate(spec, {"id", "pop"})), "TC16 a population column missing from the units fails")
+    # per_outcome: a cost per extra case treated because of the component (a model output).
+    po = {**spec, "cost_items": spec["cost_items"] + [
+        {"id": "c2_per_case", "component": "c2", "value": 5.0, "price_year": 2024, "price_rule": "index",
+         "basis": "per_outcome", "outcome": "treated", "incremental": True, "includes": ["case_management"]}]}
+    treated = lambda u, p: {"treated": 100.0 + (30.0 if "c2" in packages(po)[p] else 0.0)  # noqa: E731
+                            + (10.0 if "c1" in packages(po)[p] else 0.0)}
+    ok(validate(po) == [], f"TC21 a per_outcome item is valid: {validate(po)}")
+    mo = cost_matrix(po, units, outcome=treated)
+    ok(abs(mo["u0"]["c2"]["items"]["c2_per_case"] - 5.0 * 30) < 1e-9
+       and abs(mo["u0"]["c1+c2"]["items"]["c2_per_case"] - 5.0 * 30) < 1e-9 and "c2_per_case" not in mo["u0"]["c1"]["items"],
+       f"TC22 an incremental per_outcome cost charges only the extra cases its component causes: {mo['u0']}")
+    try:
+        cost_matrix(po, units)
+        ok(False, "TC23 a per_outcome spec without an outcome function must refuse")
+    except ValueError as e:
+        ok("outcome=" in str(e), f"TC23 per_outcome needs outcome=: {e}")
+    ok(any("needs `outcome" in e for e in validate({**po, "cost_items": po["cost_items"][:-1] + [
+        {**po["cost_items"][-1], "outcome": ""}]})), "TC24 per_outcome names its output")
     loc = {**spec, "prices": {**spec["prices"], "local": {"currency": "NGN", "exchange_rate": {"2021": 401.2, "2024": 1479.0},
                                                        "index": {"2021": 354.3, "2024": 699.4}}},
            "cost_items": [spec["cost_items"][0], {**spec["cost_items"][1], "price_year": 2021, "price_rule": "local_index"}]}

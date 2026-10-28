@@ -206,8 +206,27 @@ def evaluate(run_dir: str) -> tuple[list[dict], list[str], dict]:
     if not isinstance(doc, dict):
         return [], [f"{PATH} must be a mapping"], {}
     effects = doc.get("effects")
+    reason = str(doc.get("no_trial_effects") or "").strip()
+    if reason and effects:
+        return [], [f"{PATH}: `no_trial_effects` and a non-empty `effects` list contradict each other"], {}
+    if reason and isinstance(effects, list) or (reason and effects is None):
+        # Phase 40 (smoke): the run's interventions have no trial-based effect to bound (their effects
+        # are model assumptions). Allowed only with a reason and with every trial-kind registry entry
+        # accounted for; reported as a MEDIUM note the red-team critic challenges, never silent.
+        if len(reason) < 20:
+            return [], [f"{PATH}: `no_trial_effects` needs a reason (at least a sentence)"], {}
+        reg = _registry(run_dir)
+        nb = doc.get("not_bounding") or []
+        listed = {str(x.get("registry")) for x in nb if isinstance(x, dict)
+                  and len(str(x.get("reason") or "").strip()) >= 10}
+        unlisted = sorted(n for n, r in reg.items() if str(r.get("kind") or "") in TRIAL_KINDS and n not in listed)
+        if unlisted:
+            return [], [f"{PATH}: `no_trial_effects` but trial-effect registry entries are not listed under "
+                        f"`not_bounding` with a reason: {', '.join(unlisted)}"], {}
+        return [], [], {"no_trial_effects": reason, "exempted": sorted(listed)}
     if not isinstance(effects, list) or not effects:
-        return [], [f"{PATH}: expected a non-empty `effects:` list"], {}
+        return [], [f"{PATH}: expected a non-empty `effects:` list, or `no_trial_effects: <reason>` when no "
+                    "intervention effect comes from a trial"], {}
     missing = [k for k in _TOP if not str(doc.get(k) or "").strip()]
     if missing:
         return [], [f"{PATH}: missing {', '.join(missing)}"], {}
@@ -424,6 +443,13 @@ def gate_findings(run_dir: str) -> list[dict]:
     rows, errors, b = evaluate(run_dir)
     out = [{"kind": "effect_concordance_invalid", "severity": "HIGH", "stage": "MODEL", "target_stage": "MODEL",
             "scope_declarable": False, "claim": f"{PATH}: {e}"} for e in errors]
+    if b.get("no_trial_effects"):
+        out.append({"kind": "effect_concordance_not_applicable", "severity": "MEDIUM", "stage": "MODEL",
+                    "target_stage": "MODEL", "scope_declarable": True,
+                    "claim": (f"{PATH}: no intervention effect is checked against trial evidence. Reason given: "
+                              f"{b['no_trial_effects'][:400]} Exempted registry entries: "
+                              f"{', '.join(b.get('exempted') or []) or 'none'}. The red-team critic checks whether any "
+                              "of them is in fact a trial effect of an allocated intervention.")})
     if b.get("deliverable_unverified"):
         out.append({"kind": "effect_concordance_unverified", "severity": "MEDIUM", "stage": "MODEL",
                     "target_stage": "ANALYZE", "scope_declarable": False,
@@ -641,6 +667,23 @@ def _self_test() -> int:
         f = gate_findings(d)
         ok(any("summed" in x["claim"] and "removed vs" in x["claim"] for x in f),
            f"EC17 (Codex) one large unit whose benefit is not burden removed fails the total check: {f}")
+        # Phase 40 (smoke): no trial effect applies. Allowed with a reason and full registry accounting.
+        all_nb = [{"registry": n, "reason": "a model assumption in this run"}
+                  for n in ("new_vs_old_irr", "smc_irr", "new_vs_none_irr", "some_or")]
+        yaml.safe_dump({"effects": [], "no_trial_effects": "The campaign effect is a transmission-model assumption.",
+                        "not_bounding": all_nb}, open(os.path.join(d, PATH), "w"))
+        f = gate_findings(d)
+        ok([x["kind"] for x in f] == ["effect_concordance_not_applicable"] and f[0]["severity"] == "MEDIUM"
+           and "smc_irr" in f[0]["claim"], f"EC18 no_trial_effects is a visible MEDIUM note, not a block: {f}")
+        yaml.safe_dump({"effects": [], "no_trial_effects": "The campaign effect is a model assumption.",
+                        "not_bounding": all_nb[:2]}, open(os.path.join(d, PATH), "w"))
+        ok(any("not listed under `not_bounding`" in x["claim"] for x in gate_findings(d)),
+           "EC19 no_trial_effects still requires every trial-effect registry entry to be accounted for")
+        yaml.safe_dump({"effects": [], "no_trial_effects": "short", "not_bounding": all_nb}, open(os.path.join(d, PATH), "w"))
+        ok(any("needs a reason" in x["claim"] for x in gate_findings(d)), "EC20 no_trial_effects needs a real reason")
+        yaml.safe_dump({"effects": [], "not_bounding": all_nb}, open(os.path.join(d, PATH), "w"))
+        ok(any("no_trial_effects: <reason>" in x["claim"] for x in gate_findings(d)),
+           "EC21 an empty effects list without a reason still fails, and says how to state none applies")
         open(os.path.join(d, PATH), "w").write("effects: [\n")
         ok(gate_findings(d)[0]["kind"] == "effect_concordance_invalid", "EC14 an unparseable file fails closed")
         os.remove(os.path.join(d, PATH)); os.makedirs(os.path.join(d, PATH))

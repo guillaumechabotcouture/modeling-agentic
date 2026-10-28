@@ -1976,6 +1976,11 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None,
     # S1: a declared pipeline (models/pipeline.yaml) must be built from current inputs.
     violations += G(lambda rd: _load_sibling("pipeline").gate_findings(rd),
                     run_dir, check_name="pipeline_build")
+    # S2: the outcome_fn the uncertainty harness runs reproduces the report's
+    # headline claims (and the allocation's package choice) at the registry
+    # point estimates, so a decoy fails before any harness-computed check.
+    violations += G(lambda rd: _load_sibling("headline_binding").gate_findings(rd),
+                    run_dir, check_name="headline_binding")
     # Phase 34: done_when findings computed by the caller, added before the
     # escalation so their persistence counts (Codex review).
     violations += list(extra or [])

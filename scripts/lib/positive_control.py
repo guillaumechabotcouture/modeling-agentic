@@ -167,10 +167,14 @@ def outcome_fn(params):
     cands, funded = model.allocate(efficacy=efficacy,
                                    cost_per_child=cost_per_child)
     chosen = [c for c in cands if c["district"] in funded]
-    return {
+    out = {
         "total_cases_averted": sum(c["cases_averted"] for c in chosen),
         "total_dalys_averted": sum(c["dalys_averted"] for c in chosen),
     }
+    # Per-district package choice (S2: bound to models/allocation.csv).
+    out.update({"package_" + c["district"]: ("campaign" if c["district"] in funded else "none")
+                for c in cands})
+    return out
 
 
 def loss(params):
@@ -463,6 +467,14 @@ def build(run_dir: str, round_n: int = 2) -> dict:
                      "registry": "vaccine_efficacy", "trial_comparator": "unvaccinated (placebo arm)", "trial_use": 1.0,
                      "comparator_id": "CF1", "comparator_delivers": "no campaign: no vaccination in the district",
                      "model_use": mod.COVERAGE}]})
+    # S2: the outcome_fn the uncertainty harness runs is the model behind the
+    # report's headline claim and the allocation's package choice. (No cost
+    # output: a new scalar in uncertainty_report.yaml would move the
+    # planted-defect eval's interval targets.)
+    _w(run_dir, "models/headline_binding.yaml", {
+        "outputs": {"total_dalys_averted": "dalys_det"},
+        "package_choice": {"allocation_csv": "models/allocation.csv", "unit_column": "district",
+                           "package_column": "package", "output_prefix": "package_"}})
     spent = sum(by_name[d]["cost"] for d in funded)
     dalys = sum(by_name[d]["dalys_averted"] for d in funded)
     cases = sum(by_name[d]["cases_averted"] for d in funded)

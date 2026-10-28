@@ -153,16 +153,16 @@ for f in main.py \
   scripts/effect_size_registry.py \
   scripts/effect_concordance.py \
   scripts/effort_floors.py scripts/eligibility_probe.py \
-  scripts/figure_validator.py scripts/identifiability.py \
+  scripts/figure_validator.py scripts/headline_binding.py scripts/identifiability.py \
   scripts/identifiability_a_priori.py scripts/lessons.py \
-  scripts/numeric_consistency.py scripts/open_problems.py \
+  scripts/numeric_consistency.py scripts/open_problems.py scripts/pipeline.py \
   scripts/optimization_quality.py scripts/plan_criteria.py \
   scripts/propagate_uncertainty.py scripts/render_claims.py \
   scripts/results_store.py scripts/run_autopsy.py \
   scripts/sanity_checks.py scripts/sdk_scenarios.py \
   scripts/sensitivity_analysis.py \
   scripts/source_checks.py \
-  scripts/spec_compliance.py scripts/validate_critique_yaml.py \
+  scripts/spec_compliance.py scripts/structure_metrics.py scripts/validate_critique_yaml.py \
   scripts/validate_skill_attachments.py scripts/watch_run.py \
   scripts/within_zone_sensitivity.py scripts/writer_qa.py \
   scripts/lib/expert_priors.py scripts/lib/md_helpers.py \

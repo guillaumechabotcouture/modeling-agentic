@@ -20,6 +20,8 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # structure metrics compare with main and read merged-PR history
 
       - uses: actions/setup-python@v5
         with:
@@ -38,7 +40,7 @@ jobs:
       - name: Self-tests (every script with --self-test)
         run: |
           fail=0
-          for f in main.py $(git ls-files 'scripts/*.py' 'scripts/lib/*.py' 'toolkit/**/*.py'); do
+          for f in main.py $(git ls-files 'scripts/*.py' 'scripts/lib/*.py' 'toolkit/**/*.py' 'cloud/*.py'); do
             case "$f" in */__init__.py) continue;; esac
             grep -q -- '--self-test' "$f" || continue
             echo "::group::$f"
@@ -54,3 +56,11 @@ jobs:
 
       - name: Planted-defect regression eval (deterministic gates)
         run: .venv/bin/python scripts/regression_eval.py
+
+      - name: Structure metrics against main (information only)
+        if: always()
+        continue-on-error: true
+        run: |
+          # HEAD is the PR's merge commit (or the pushed main commit): its first
+          # parent is the base it was built on, which a later merge to main does not move.
+          python3 scripts/structure_metrics.py --ref HEAD^1 --against HEAD | tee -a "$GITHUB_STEP_SUMMARY"
