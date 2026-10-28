@@ -117,12 +117,27 @@ def is_running(name: str, lister=None) -> bool:
     return any(s in _ATTACH for s in cluster_states(name, lister))
 
 
+def live_id(name: str, lister=None):
+    """Id of the live cluster with this name, or None."""
+    if lister is None:
+        import coiled
+        lister = lambda: coiled.list_clusters(workspace=WORKSPACE)  # noqa: E731
+    cs = lister()
+    items = cs if isinstance(cs, list) else list(cs.values())
+    ids = [c.get("id") for c in items if c.get("name") == name and ws.state_of(c) in _ATTACH]
+    return max(ids) if ids else None
+
+
 def attach(name: str):
-    """Attach to a live cluster; refuse rather than create one."""
+    """Attach to a live cluster; refuse rather than create one. The check and
+    the attach are not atomic, so the cluster we get must be the one we checked
+    (otherwise it is a new empty one: shut down and refused)."""
     import coiled
-    if not is_running(name):
+    cid = live_id(name)
+    if cid is None:
         raise SystemExit(f"cluster {name!r} is not running; refusing to create a new one")
-    return coiled.Cluster(name=name, workspace=WORKSPACE, shutdown_on_close=False, wait_for_workers=False)
+    cl = coiled.Cluster(name=name, workspace=WORKSPACE, shutdown_on_close=False, wait_for_workers=False)
+    return ws.verify_attached(cl, cid)
 
 
 def _compute(cfg):
@@ -202,17 +217,18 @@ def launch(cfg):
     assign = {}
     for label, w in zip(cfg.labels, workers):
         _submit(cfg, client, label, w, code, question, keys, launch_id)
-        assign[label] = {"worker": w, "commit": commit, "submitted": time.strftime("%F %T"), "launch_id": launch_id}
+        assign[label] = {"worker": w, "commit": commit, "submitted": time.strftime("%F %T"), "launch_id": launch_id,
+                         "cluster_id": cluster.cluster_id}
         print(f"fired {label} -> {w} @ {commit}", flush=True)
     json.dump(assign, open(cfg.state_file, "w"), indent=1)
     time.sleep(10)
     if cfg.keeper:
-        start_keeper(cfg, compute.ADAPT_OPTIONS)
+        start_keeper(cfg, compute.ADAPT_OPTIONS, cluster.cluster_id)
     print(f"launched {cfg.name}: results go to outputs/{cfg.storage_prefix}/; the cluster stops itself "
           "once every run is stored. Safe to disconnect.")
 
 
-def start_keeper(cfg, adapt_options):
+def start_keeper(cfg, adapt_options, cluster_id):
     import coiled
     import dask
     from distributed import fire_and_forget
@@ -225,7 +241,7 @@ def start_keeper(cfg, adapt_options):
     c.upload_file(os.path.join(HERE, "worker_side.py"))
     # The Coiled token goes in as a task argument (memory only, never an env var or a file).
     fut = c.submit(ws.keeper_task, dask.config.get("coiled.token"), cfg.name, WORKSPACE, lo, hi,
-                   cfg.keeper_hours, dict(adapt_options), pure=False, key=f"keeper-{cfg.name}")
+                   cfg.keeper_hours, dict(adapt_options), cluster_id, pure=False, key=f"keeper-{cfg.name}")
     fire_and_forget(fut)
     time.sleep(30)
     w = sorted(c.scheduler_info()["workers"])[0]
@@ -262,8 +278,34 @@ def collect_from_storage(cfg, store, label, launch_id):
     os.makedirs(os.path.join(dest, "runs"), exist_ok=True)
     with tarfile.open(tgz, mode="r:gz") as t:
         t.extractall(os.path.join(dest, "runs"), filter="data")
+    meta["launch_id"] = launch_id
     json.dump(meta, open(os.path.join(dest, "result.json"), "w"), indent=1)
     return meta
+
+
+def local_is_current(dest: str, launch_id: str) -> bool | None:
+    """True: dest holds this launch's collected run; False: an earlier launch's
+    (set aside before collecting); None: nothing collected yet."""
+    p = os.path.join(dest, "result.json")
+    if not os.path.exists(p):
+        return None
+    try:
+        return json.load(open(p)).get("launch_id") == launch_id
+    except (OSError, ValueError):
+        return False
+
+
+def relaunch_refusal(vm_state: str, stored: bool) -> str | None:
+    """Why a label may not be re-fired, or None. Only a run that is neither
+    running, nor finished on its VM, nor stored may be: re-firing wipes the
+    VM's work directory, which holds results whose upload failed."""
+    if stored:
+        return "already stored in this launch; collect it instead"
+    if vm_state == "running":
+        return "still running on its VM"
+    if vm_state == "done":
+        return "finished on its VM but not stored; collect it first"
+    return None
 
 
 def _download(client, label, worker, dest_file):
@@ -299,9 +341,13 @@ def collect(cfg):
         raise SystemExit(f"no {cfg.state_file}: this machine did not launch {cfg.name}")
     assign, client, pending = json.load(open(cfg.state_file)), None, []
     for label in cfg.labels:
-        if os.path.exists(os.path.join(cfg.out_dir, label, "result.json")):
+        dest = os.path.join(cfg.out_dir, label)
+        cur = local_is_current(dest, assign[label]["launch_id"])
+        if cur:
             print(f"{label}: already collected")
             continue
+        if cur is False:   # an earlier launch's copy: keep it, out of the way
+            os.rename(dest, f"{dest}.before_{assign[label]['launch_id']}_{int(time.time())}")
         try:
             meta = collect_from_storage(cfg, results_store, label, assign[label]["launch_id"])
             print(f"{label}: exit={meta['exit_code']} {meta['duration_s']}s -> {cfg.out_dir}/{label} (from storage)")
@@ -318,8 +364,9 @@ def collect(cfg):
             pending.append(label)
             continue
         tgz = os.path.join(cfg.out_dir, f"{label}.result.tar.gz")
+        if os.path.exists(tgz):
+            os.remove(tgz)   # a partial download may be from an earlier launch
         meta = _download(client, label, w, tgz)
-        dest = os.path.join(cfg.out_dir, label)
         os.makedirs(dest, exist_ok=True)
         with tarfile.open(tgz, mode="r:gz") as t:
             t.extractall(dest, filter="data")
@@ -348,10 +395,12 @@ def relaunch(cfg, label):
     launch_id = assign[label]["launch_id"]
     names = {b["name"] for b in results_store.list_blobs(f"outputs/{cfg.storage_prefix}/launch_{launch_id}/",
                                                           cfg.storage_account)}
-    if ws.record_blob(cfg.storage_prefix, launch_id, label) in names:
-        raise SystemExit(f"{label} is already stored in this launch; collect it instead of relaunching")
-    code, commit = code_tarball(cfg)
     client = attach(cfg.name).get_client()
+    why = relaunch_refusal(_on_worker(client, ws.fetch_meta, label, worker=assign[label]["worker"])["state"],
+                           ws.record_blob(cfg.storage_prefix, launch_id, label) in names)
+    if why:
+        raise SystemExit(f"{label}: {why}; not relaunching")
+    code, commit = code_tarball(cfg)
     client.upload_file(os.path.join(HERE, "worker_side.py"))
     _submit(cfg, client, label, assign[label]["worker"], code, open(cfg.question_file).read().strip(), read_keys(),
             launch_id)
@@ -427,6 +476,29 @@ def _self_test() -> int:
     ok(not is_running("b", lambda: listing) and not is_running("c", lambda: listing)
        and not is_running("zz", lambda: listing), "RC9 stopping / no state / absent are not attachable")
 
+    class FakeCluster:
+        def __init__(self, cid):
+            self.cluster_id, self.stopped = cid, False
+
+        def shutdown(self):
+            self.stopped = True
+
+    fc = FakeCluster(7)
+    ok(ws.verify_attached(fc, 7) is fc and not fc.stopped, "RC17 attaching to the checked cluster is kept")
+    fc = FakeCluster(8)
+    try:
+        ws.verify_attached(fc, 7)
+        ok(False, "RC18 a replacement cluster created by the attach is refused")
+    except SystemExit:
+        ok(fc.stopped, "RC18 a replacement cluster created by the attach is shut down and refused")
+    ok(live_id("a", lambda: [{"name": "a", "id": 3, "current_state": {"state": "stopped"}},
+                             {"name": "a", "id": 5, "current_state": {"state": "ready"}}]) == 5
+       and live_id("a", lambda: [{"name": "a", "id": 3, "current_state": {"state": "stopped"}}]) is None,
+       "RC19 the live id ignores stopped clusters of the same name")
+    ok(relaunch_refusal("missing", False) is None and relaunch_refusal("running", False)
+       and relaunch_refusal("done", False) and relaunch_refusal("missing", True),
+       "RC20 relaunch only when the run is neither running, finished on its VM, nor stored")
+
     with tempfile.TemporaryDirectory() as d:
         cfg = RunConfig(name="t", question_file="/dev/null", out_dir=d, labels=("R1",))
         ok(cfg.storage_prefix == "runs/t" and cfg.keeper_name == "t-keeper", "RC10 config defaults")
@@ -441,6 +513,9 @@ def _self_test() -> int:
         rec = json.dumps({"exit_code": 0, "duration_s": 5, "run_stored": "outputs/runs/t/r.tar.gz"}).encode()
         st = Store(files={ws.record_blob("runs/t", "L2", "R1"): rec, "outputs/runs/t/r.tar.gz": run})
         m = collect_from_storage(cfg, st, "R1", "L2")
+        ok(local_is_current(os.path.join(d, "R1"), "L2") is True and local_is_current(os.path.join(d, "R1"), "L3") is False
+           and local_is_current(os.path.join(d, "R9"), "L2") is None,
+           "RC21 a local copy counts as collected only for its own launch")
         ok(m["exit_code"] == 0 and open(os.path.join(d, "R1", "runs", "r", "report.md")).read() == "# report",
            "RC12 collect from storage unpacks the stored run directory")
         try:

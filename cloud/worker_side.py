@@ -123,12 +123,14 @@ def run_to_disk(label, code, question, flags, anthropic_key, openai_key, labels,
                                             [anthropic_key, openai_key or ""])
         open(f"{d}/transcripts.tar.gz", "wb").write(blob)
         res["transcripts_stored"] = results_store.upload_retry(
-            f"{d}/transcripts.tar.gz", f"outputs/{prefix}/transcripts_{label}.tar.gz", account)["blob"]
+            f"{d}/transcripts.tar.gz", f"outputs/{prefix}/launch_{launch_id}/transcripts_{label}.tar.gz",
+            account)["blob"]
     except Exception as e:  # noqa: BLE001
         res["transcripts_store_error"] = f"{type(e).__name__}: {e}"[:300]
     tarball = res.pop("tarball")
     open(f"{d}/result.tar.gz", "wb").write(tarball)
     res["run_stored"] = run_stored(tarball)
+    res["launch_id"] = launch_id
     json.dump(res, open(f"{d}/result.json", "w"))
     if res["run_stored"] and res.get("transcripts_stored"):
         try:
@@ -148,10 +150,24 @@ def run_to_disk(label, code, question, flags, anthropic_key, openai_key, labels,
     return res
 
 
-def keeper_task(token, name, workspace, lo, hi, hours, adapt_options):
+def verify_attached(cl, expected_id):
+    """coiled.Cluster(name=...) creates an empty cluster when the named one
+    stopped between the state check and the call. If the cluster we got is not
+    the one we checked, shut it down at once and refuse."""
+    got = getattr(cl, "cluster_id", None)
+    if expected_id is not None and got != expected_id:
+        try:
+            cl.shutdown()
+        finally:
+            raise SystemExit(f"cluster {expected_id} stopped while attaching; the new empty cluster {got} was shut down")
+    return cl
+
+
+def keeper_task(token, name, workspace, lo, hi, hours, adapt_options, cluster_id=None):
     """On the keeper VM: hold the run cluster's adaptive scaling (dask's Adaptive
-    loop lives in the process that calls adapt). Attach-only; reconnects after
-    a dropped connection; exits when the run cluster stops."""
+    loop lives in the process that calls adapt). Attach-only, to the cluster id
+    the launch created; reconnects after a dropped connection; exits when that
+    cluster stops, and never scales a replacement."""
     import contextlib, time
     import coiled
     import dask
@@ -160,7 +176,8 @@ def keeper_task(token, name, workspace, lo, hi, hours, adapt_options):
     def alive():
         cs = coiled.list_clusters(workspace=workspace)
         items = cs if isinstance(cs, list) else list(cs.values())
-        return any(c.get("name") == name and state_of(c) in LIVE_STATES for c in items)
+        return any(c.get("name") == name and state_of(c) in LIVE_STATES
+                   and (cluster_id is None or c.get("id") == cluster_id) for c in items)
 
     with open("/tmp/keeper.log", "a", buffering=1) as f, contextlib.redirect_stdout(f), contextlib.redirect_stderr(f):
         print(f"{time.strftime('%T')} keeper holding {name} {lo}..{hi}", flush=True)
@@ -171,6 +188,11 @@ def keeper_task(token, name, workspace, lo, hi, hours, adapt_options):
                     print(f"{time.strftime('%T')} {name} is not running; keeper exiting", flush=True)
                     return "keeper exited"
                 cl = coiled.Cluster(name=name, workspace=workspace, shutdown_on_close=False, wait_for_workers=False)
+                try:
+                    verify_attached(cl, cluster_id)
+                except SystemExit as e:
+                    print(f"{time.strftime('%T')} {e}; keeper exiting", flush=True)
+                    return "keeper exited"
                 cl.adapt(minimum=lo, maximum=hi, **adapt_options)
                 c = cl.get_client()
                 while time.time() < t_end:
