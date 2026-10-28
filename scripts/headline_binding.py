@@ -29,7 +29,8 @@ The harness evaluates outcome_fn ONCE at the registry point estimates (params
 = `value` of every entry in the citations.md Parameter Registry, the same
 names propagate_uncertainty samples), then requires:
 
-1. each declared output to equal its claims-ledger claim within 1%;
+1. each declared output to equal its claims-ledger claim within 0.1% (tight enough
+   that a branch variant of the model, typically 0.5-1% off, does not pass);
 2. when declared, the per-unit package choice to equal the allocation CSV's
    package column in every row, with no choices for units the CSV lacks;
 3. when models/effect_concordance.yaml exists, its `headline_claim` (the claim
@@ -65,7 +66,7 @@ import yaml
 HERE = os.path.dirname(os.path.abspath(__file__))
 PATH = os.path.join("models", "headline_binding.yaml")
 OUTCOME_FN_SPEC = "models/outcome_fn.py::outcome_fn"   # the function propagate_uncertainty runs
-TOL = 0.01
+TOL = 0.001
 _PC_KEYS = ("allocation_csv", "unit_column", "package_column", "output_prefix")
 
 
@@ -228,7 +229,7 @@ def evaluate(run_dir: str) -> tuple[list[str], dict]:
                           "models/claims_ledger.yaml")
         elif abs(v - cv) > TOL * max(abs(cv), 1e-12):
             errors.append(f"outcome_fn {key} at the registry point estimates is {v:.6g} but the report's claim {cid} "
-                          f"is {cv:.6g} ({abs(v - cv) / max(abs(cv), 1e-12):.1%} off, tolerance {TOL:.0%}): the "
+                          f"is {cv:.6g} ({abs(v - cv) / max(abs(cv), 1e-12):.1%} off, tolerance {TOL:.1%}): the "
                           "function the uncertainty harness runs is not the model behind the report")
     if pc is not None:
         pre, uc, pkc = str(pc["output_prefix"]), str(pc["unit_column"]), str(pc["package_column"])
@@ -341,8 +342,12 @@ def _self_test() -> int:
         ok(len(f) == 1 and f[0]["kind"] == "headline_binding_failed" and "det_dalys" in f[0]["claim"]
            and not f[0]["scope_declarable"] and f[0]["severity"] == "HIGH",
            f"HB3 a decoy outcome_fn (different totals) fails, HIGH, not declarable: {f}")
-        fn(_HONEST.replace("0.1 * e", "0.1005 * e"))
-        ok(gate_findings(d) == [], "HB3b a difference within 1% passes")
+        fn(_HONEST.replace("0.1 * e", "0.10005 * e"))
+        ok(gate_findings(d) == [], "HB3b a difference within 0.1% passes")
+        fn(_HONEST.replace("0.1 * e", "0.1008 * e"))
+        f = gate_findings(d)
+        ok(len(f) == 1 and "0.8% off" in f[0]["claim"] and "tolerance 0.1%" in f[0]["claim"],
+           f"HB3c a branch variant 0.8% off fails: {f}")
         fn(_HONEST)
         ledger(cost=None)
         f = gate_findings(d)
