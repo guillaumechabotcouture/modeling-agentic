@@ -38,6 +38,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import figure_validator as fv  # noqa: E402
+import pipeline  # noqa: E402  (S1: figures a pipeline step declares are rebuilt by the pipeline run)
 
 REPORT = os.path.join("figures", "rebuild_report.json")
 SCRIPT_TIMEOUT_S = 300
@@ -83,11 +84,19 @@ def _inside(path: str, root: str) -> bool:
 def stale_scripts(run_dir: str) -> tuple[list[str], dict[str, list[str]], list[dict]]:
     """(scripts to run in order, figures per script, figures that cannot be rebuilt)."""
     order, figs, skipped = [], {}, []
+    try:
+        owned = pipeline.declared_outputs(run_dir)
+    except Exception:  # noqa: BLE001 — fail closed: a pipeline we cannot read owns every figure
+        owned = ["*"] if os.path.exists(os.path.join(run_dir, pipeline.SPEC)) else []
     for png, sc in sorted(_sidecars(run_dir), key=lambda t: str(t[1].get("written_at_utc") or "")):
         if fv.check_staleness(png)["status"] != "stale":
             continue
         script = sc.get("generator_script")
         rel = os.path.relpath(png, run_dir)
+        if any(pipeline.path_match(rel.replace(os.sep, "/"), p) for p in owned):
+            # Its writer is a declared step: only the harness pipeline run may rewrite it.
+            skipped.append({"figure": rel, "why": f"a declared output of {pipeline.SPEC}: rebuilt by the pipeline run"})
+            continue
         if not script:
             skipped.append({"figure": rel, "why": "no generator script recorded"})
             continue
@@ -252,6 +261,15 @@ def _self_test() -> int:
         rep = rebuild(d)
         ok([x["script"] for x in rep["runs"]] == [os.path.join("models", "figs.py")] and rep["runs"][0]["returncode"] == 0,
            f"DR6 a sidecar from another machine is re-anchored by its run-relative path: {rep}")
+        # S1: a figure a pipeline step declares is the pipeline run's to rebuild.
+        json.dump(sc, open(os.path.join(d, "figures", "a.png.provenance.json"), "w"))
+        open(data, "w").write("x,y\n1,5\n")
+        open(os.path.join(d, "models", "pipeline.yaml"), "w").write(
+            "steps:\n  - id: figs\n    run: python3 models/figs.py\n    inputs: [models/out.csv]\n"
+            "    outputs: ['figures/*.png']\n")
+        rep = rebuild(d)
+        ok(rep["runs"] == [] and any("pipeline" in s["why"] for s in rep["skipped"]),
+           f"DR10 a figure declared in models/pipeline.yaml is left to the pipeline run: {rep}")
     if fails:
         print("SELF-TEST FAILURES:")
         for f in fails:

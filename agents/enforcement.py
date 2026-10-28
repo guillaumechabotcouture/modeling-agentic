@@ -91,6 +91,13 @@ SCRIPT_OUTPUTS = (
     "done_when_registry.json.tmp",
     "round_plan.frozen.json",        # Phase 32 γ: the plan as handed out, written by the hook
     "round_plan.frozen.json.tmp",
+    # S1: the pipeline runner's records, written by the harness run only
+    # (scripts/pipeline.py OWN_FILES). Declared outputs are protected by the
+    # integrity record from models/pipeline.yaml.
+    "models/pipeline_state.json",
+    "models/pipeline_state.json.tmp",
+    "models/pipeline_report.json",
+    "models/pipeline_report.json.tmp",
 )
 
 # Phase 33 α (Gemini review): frozen once decision_brief.signoff.json exists.

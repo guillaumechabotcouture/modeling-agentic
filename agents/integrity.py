@@ -37,6 +37,16 @@ Known limits (PR #15 reviews):
     makes them, as for background grants; a Python started with a
     sitecustomize on PYTHONPATH runs other code inside a producer process,
     as an env assignment before a typed producer command already could.
+
+S1 (docs/design/stage-machine.md §3.2): the outputs `models/pipeline.yaml`
+declares are protected too, and only the harness's pipeline run
+(scripts/pipeline.py `harness_build`) explains writes to them: it holds a
+grant for the outputs of the steps it runs (`harness_pipeline`) and marks
+what they wrote as harness-written. An agent's own Write/Edit of a declared
+output is not an explanation. Declarations are sticky for the life of this
+record (removing a step does not unprotect its files); files that already
+exist when first declared are baselined, as at start (the runner reruns a
+step that never ran, so the baseline is not what the gate reads).
 """
 from __future__ import annotations
 
@@ -48,6 +58,7 @@ import os
 import re
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime
 
 from agents import enforcement
@@ -165,6 +176,24 @@ def _is_critique(rel: str) -> bool:
     critique) follow script-output rules instead (Copilot review, PR #15)."""
     return (any(fnmatch.fnmatch(rel, p) for p in _CRITIQUE_PATTERNS)
             and rel not in enforcement.SCRIPT_OUTPUTS)
+
+
+_PIPELINE = []
+
+
+def _pipeline():
+    """scripts/pipeline.py, loaded by path once (None when it cannot load)."""
+    if not _PIPELINE:
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "_ma_pipeline", os.path.join(enforcement.REPO_ROOT, "scripts", "pipeline.py"))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            _PIPELINE.append(mod)
+        except Exception:  # noqa: BLE001
+            _PIPELINE.append(None)
+    return _PIPELINE[0]
 
 
 def _protected_patterns() -> list[str]:
@@ -298,6 +327,9 @@ class ArtifactIntegrity:
         self.grants: list[dict] = []     # background harness scripts launched
         self._check_seq = 0              # bumped at the start and end of every check (process watch)
         self.report_ok = True
+        self.pipeline_patterns: list[str] = []   # S1: declared pipeline outputs (sticky)
+        self._pipeline_sig = None
+        self._baseline: set[str] = set()
         # A resumed run keeps the violations already recorded. Only a MISSING
         # record is a fresh start: an unreadable, unstamped or malformed one
         # is itself evidence and becomes a violation (never silently reset).
@@ -372,11 +404,46 @@ class ArtifactIntegrity:
                                         "t": time.monotonic(), "paths": set(SCRIPT_PRODUCES[sc])})
 
     # -- scanning ---------------------------------------------------------
+    def _refresh_pipeline_patterns(self) -> list[str]:
+        """Add the outputs models/pipeline.yaml declares now; returns the new ones."""
+        sp = os.path.join(self.run_path, "models", "pipeline.yaml")
+        try:
+            st = os.stat(sp)
+            sig = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return []
+        if sig == self._pipeline_sig:
+            return []
+        mod = _pipeline()
+        if mod is None:
+            return []
+        try:
+            pats = mod.declared_outputs(self.run_path)
+        except Exception:  # noqa: BLE001 — keep what was declared before (sticky)
+            return []
+        self._pipeline_sig = sig
+        new = [p for p in pats if p not in self.pipeline_patterns]
+        self.pipeline_patterns.extend(new)
+        return new
+
+    def _pipeline_owned(self, rel: str) -> bool:
+        mod = _pipeline()
+        own = tuple(mod.OWN_FILES) if mod is not None else ()
+        return rel in own or any(mod.path_match(rel, p) if mod is not None else fnmatch.fnmatchcase(rel, p)
+                                 for p in self.pipeline_patterns)
+
     def _scan(self) -> dict[str, str | None]:
         out = {}
         self._mtimes_now = {}
-        for pat in _protected_patterns():
-            for p in glob.glob(os.path.join(self.run_path, pat)):
+        new_pats = self._refresh_pipeline_patterns()
+        self._baseline = set()
+        for pat in new_pats:
+            for p in glob.glob(os.path.join(self.run_path, pat), recursive=True):
+                rel = os.path.relpath(p, self.run_path).replace(os.sep, "/")
+                if os.path.isfile(p) and rel not in self.hashes:
+                    self._baseline.add(rel)
+        for pat in _protected_patterns() + self.pipeline_patterns:
+            for p in glob.glob(os.path.join(self.run_path, pat), recursive=True):
                 if os.path.isfile(p):
                     rel = os.path.relpath(p, self.run_path).replace(os.sep, "/")
                     out[rel] = _sha(p)
@@ -401,7 +468,8 @@ class ArtifactIntegrity:
             path = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
             if path:
                 rel = enforcement._run_rel(path, self.run_path, cwd)
-                if rel:
+                if rel and not self._pipeline_owned(rel):
+                    # S1: a declared pipeline output is written by the harness run only.
                     intent["paths"].add(rel)
         elif tool_name == "Bash":
             scripts, background = harness_scripts_run(tool_input.get("command") or "", cwd)
@@ -429,6 +497,33 @@ class ArtifactIntegrity:
         with self._lock:
             self.hashes[rel] = _sha(os.path.join(self.run_path, rel))
 
+    def check_now(self) -> list[dict]:
+        """S1: judge pending changes now (before the harness pipeline run trusts its state)."""
+        with self._lock:
+            return self._check(where="pipeline_start")
+
+    def is_open(self, rel: str) -> bool:
+        return any(e.get("file") == rel and e.get("open", True) for e in self.events)
+
+    @contextmanager
+    def harness_pipeline(self, patterns):
+        """S1: the harness's pipeline run is writing `patterns` (the declared outputs of
+        the steps it runs, and its own records). Changes to them are explained while it
+        runs; on exit the files are checked once more, so a hand edit it replaced is
+        resolved, then the grant ends."""
+        g = {"scripts": set(), "paths": set(), "patterns": tuple(patterns), "pipeline": True,
+             "armed": True, "seen_dead": False, "t": time.monotonic()}
+        with self._lock:
+            self.grants.append(g)
+        try:
+            yield
+        finally:
+            with self._lock:
+                try:
+                    self._check(where="pipeline_run")
+                finally:
+                    self.grants = [x for x in self.grants if x is not g]
+
     def final_check(self) -> list[dict]:
         with self._lock:
             # Intents whose PostToolUse never arrived (tool errors, or a
@@ -448,8 +543,10 @@ class ArtifactIntegrity:
             return True          # its own Write/Edit, carve-out, or harness script
         if _is_critique(rel) and any(str(i["agent"] or "").startswith("critique-") for i in intents):
             return True          # critics own their files
-        if any(rel in g["paths"] for g in self.grants):
-            return True          # a background harness script launched for this run
+        pm = getattr(_pipeline(), "path_match", fnmatch.fnmatchcase)
+        if any(rel in g["paths"] or any(pm(rel, p) for p in g.get("patterns", ()))
+               for g in self.grants):
+            return True          # a background harness script, or the harness pipeline run
         return any(rel in SCRIPT_PRODUCES.get(sc, ()) for sc in live)
 
     def _refresh_grants(self) -> set[str]:
@@ -459,6 +556,9 @@ class ArtifactIntegrity:
         live = set(self._process_check() or ())
         keep = []
         for g in self.grants:
+            if g.get("pipeline"):
+                keep.append(g)   # held by harness_pipeline until its run ends
+                continue
             if not g["armed"] and g.get("launch_id") != getattr(self, "_posting", None):
                 # Only the launching call's own post-hook arms it; if that
                 # post-hook never comes, the grant expires like an intent.
@@ -491,6 +591,8 @@ class ArtifactIntegrity:
         for rel in sorted(set(cur) | set(self.hashes)):
             if rel == REPORT_NAME:
                 continue
+            if rel in self._baseline:
+                continue         # S1: existed before it was declared a pipeline output
             in_flight = sorted({f"{i['agent'] or 'lead'}:{i['tool']}" for i in self.inflight.values()})
             if cur.get(rel) == self.hashes.get(rel):
                 # Same bytes, but rewritten (mtime moved) by a sanctioned
@@ -548,7 +650,7 @@ class ArtifactIntegrity:
                 os.chmod(p, 0o644)       # a chmod 444 must not freeze a clean report
             with open(p, "w") as f:
                 json.dump({"producer": "agents/integrity.py",
-                           "protected_patterns": _protected_patterns(),
+                           "protected_patterns": _protected_patterns() + self.pipeline_patterns,
                            "unmatched_intents": self.unmatched_intents,
                            "open_violations": len(self.open_events),
                            "violations": self.events}, f, indent=2)

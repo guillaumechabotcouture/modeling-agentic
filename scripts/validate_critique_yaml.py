@@ -1973,6 +1973,9 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None,
     # held to the trial evidence for that comparison.
     violations += G(lambda rd: _load_sibling("effect_concordance").gate_findings(rd),
                     run_dir, check_name="effect_concordance")
+    # S1: a declared pipeline (models/pipeline.yaml) must be built from current inputs.
+    violations += G(lambda rd: _load_sibling("pipeline").gate_findings(rd),
+                    run_dir, check_name="pipeline_build")
     # S2: the outcome_fn the uncertainty harness runs reproduces the report's
     # headline claims (and the allocation's package choice) at the registry
     # point estimates, so a decoy fails before any harness-computed check.
@@ -2220,18 +2223,24 @@ def _check_plan_criteria(run_dir: str) -> list[dict]:
 def _load_sibling(name: str):
     """Import scripts/<name>.py by path (no package install needed).
     Registered in sys.modules so dataclasses in the module resolve."""
-    if name in sys.modules and getattr(sys.modules[name], "__file__", "") \
-            .endswith(f"{name}.py"):
-        return sys.modules[name]
-    spec = importlib.util.spec_from_file_location(
-        name, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           f"{name}.py"))
+    path = os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), f"{name}.py"))
+    private = f"_ma_sibling_{name}"
+    for key in (name, private):
+        m = sys.modules.get(key)
+        if m is not None and os.path.realpath(getattr(m, "__file__", None) or "") == path:
+            return m
+    # A run's own module of the same name may already hold the plain name (E7
+    # attempt 7: models/pipeline.py, imported by the eligibility probe through
+    # the run's code); a suffix match returned it as scripts/pipeline.py. Never
+    # reuse it, and never replace it (the run's code imports it by that name).
+    key = private if name in sys.modules else name
+    spec = importlib.util.spec_from_file_location(key, path)
     mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
+    sys.modules[key] = mod
     try:
         spec.loader.exec_module(mod)
     except BaseException:
-        sys.modules.pop(name, None)
+        sys.modules.pop(key, None)
         raise
     return mod
 
@@ -9238,6 +9247,25 @@ def _run_self_test() -> int:
             ok(rc != 3 and action != "ACCEPT" and "cross_model_critic_invalid" in open_,
                f"XM6: invalid cross-model YAML → HIGH, not schema exit 3; "
                f"got rc={rc} {action} {open_}")
+
+    # LS1 (S1 real-check, E7 attempt 7): a run module named like a gate script
+    # (models/pipeline.py) already in sys.modules is neither returned nor replaced.
+    import types as _types
+    _saved = sys.modules.get("pipeline")
+    _fake = _types.ModuleType("pipeline")
+    _fake.__file__ = "/some/run/models/pipeline.py"
+    sys.modules["pipeline"] = _fake
+    try:
+        _m = _load_sibling("pipeline")
+        ok(hasattr(_m, "gate_findings") and sys.modules["pipeline"] is _fake
+           and _load_sibling("pipeline") is _m,
+           f"LS1: _load_sibling must load scripts/pipeline.py beside a run's pipeline module; "
+           f"got {getattr(_m, '__file__', None)}")
+    finally:
+        if _saved is None:
+            sys.modules.pop("pipeline", None)
+        else:
+            sys.modules["pipeline"] = _saved
 
     # --- Summary ---
     if failures:

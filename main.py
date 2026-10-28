@@ -501,11 +501,21 @@ def detect_current_round(run_path: str) -> int | None:
         return None
 
 
-def _rebuild_derived(run_path: str) -> None:
-    """Phase 39 β: regenerate stale figures before a final gate. Never raises."""
+PIPELINE_FINAL_BUDGET_S = 3600   # S1: the declared pipeline's rebuild before a final gate
+
+
+def _rebuild_derived(run_path: str, integrity=None) -> None:
+    """Phase 39 β: regenerate stale figures before a final gate; S1: first rebuild the
+    run's declared pipeline (models/pipeline.yaml) as the harness. Never raises."""
     try:
         sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
         import derived_rebuild
+        if integrity is not None and os.path.exists(os.path.join(run_path, derived_rebuild.pipeline.SPEC)):
+            try:
+                rep = derived_rebuild.pipeline.harness_build(run_path, integrity, PIPELINE_FINAL_BUDGET_S)
+                print("[PIPELINE] " + derived_rebuild.pipeline.summary_line(rep), flush=True)
+            except Exception as e:  # noqa: BLE001
+                print(f"[PIPELINE] failed: {type(e).__name__}: {e}", flush=True)
         print("[REBUILD] " + derived_rebuild.summary_line(derived_rebuild.rebuild(run_path)), flush=True)
     except Exception as e:  # noqa: BLE001
         print(f"[REBUILD] failed: {type(e).__name__}: {e}", flush=True)
@@ -1065,7 +1075,7 @@ def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
     # Phase 39 β (Codex): regenerate stale figures while the integrity watch is
     # still on, so anything a figure script changes is judged by the final scan.
     if run_gate:
-        _rebuild_derived(run_path)
+        _rebuild_derived(run_path, integrity)
     if integrity is not None:
         integrity.final_check()
         integrity.stop_watch()
@@ -2702,7 +2712,7 @@ async def final_writeup(run_path, run_dir_rel, question, max_rounds, budget, cap
     states its verdict. Never raises into finalize."""
     info = {"ran": False}
     try:
-        _rebuild_derived(run_path)
+        _rebuild_derived(run_path, integrity)
         gate = run_final_gate(run_path, max_rounds) or {}
         _harness_wrote_gate_outputs(integrity)
         n_high = len(gate.get("unresolved_high") or []) if isinstance(gate.get("unresolved_high"), list) \
