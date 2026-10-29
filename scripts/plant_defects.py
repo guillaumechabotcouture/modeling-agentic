@@ -619,11 +619,33 @@ def plant_tuned_without_transfer(root, rng, used):
     return None
 
 
+def plant_scenario_fitted(root, rng, used):
+    """Phase 43 α (B1): give a fitted parameter the scenario_assumption role."""
+    for p in _first(root, ["models/calibration_spec.yaml"]):
+        try:
+            doc = yaml.safe_load(_read(p))
+        except yaml.YAMLError:
+            continue
+        for e in (doc.get("parameters") if isinstance(doc, dict) else None) or []:
+            if isinstance(e, dict) and e.get("calibrated") is True and e.get("role") != "scenario_assumption":
+                name = str(e.get("name"))
+                e["role"] = "scenario_assumption"
+                _write(p, yaml.safe_dump(doc, sort_keys=False))
+                return {"class": "scenario_fitted", "file": _rel(root, p), "location": name,
+                        "severity": "major",
+                        "description": f"{_rel(root, p)}: fitted parameter `{name}` is declared a scenario "
+                                       "assumption (a future input fitted to historical data).",
+                        "terms": {"specific": [name, "scenario_assumption"],
+                                  "generic": ["scenario assumption", "fitted to historical", "calibrated",
+                                              "projection", "future input", "parameter role"]}}
+    return None
+
+
 PLANTERS = [plant_zero_width_ci, plant_ci_inverted, plant_ledger_mismatch, plant_prose_stale_number,
             plant_benefit_total_population, plant_renamed_verdict, plant_budget_overspend, plant_unit_error,
             plant_citation_mismatch, plant_sensitivity_contradiction, plant_double_counting, plant_data_vintage,
             plant_mechanism_untested, plant_prior_severity_below, plant_prose_closure, plant_unused_column,
-            plant_tuned_without_transfer]
+            plant_tuned_without_transfer, plant_scenario_fitted]
 CLASSES = [f.__name__[len("plant_"):] for f in PLANTERS]
 
 
@@ -737,6 +759,10 @@ def _mini_fixture(root):
     _write(os.path.join(inp, "data", "units.csv"), "unit,pop\nA,1\nB,2\nC,3\n")
     _write(os.path.join(inp, "models", "benchmark_targets.yaml"),
            "benchmarks:\n- id: B1\n  target_value: 1.0\n  computed_value: 1.0\n")
+    # Phase 43 α target.
+    _write(os.path.join(inp, "models", "calibration_spec.yaml"),
+           "parameters:\n- name: level\n  role: country_specific_uncertain\n  calibrated: true\n"
+           "  reason: differs by unit\n")
     yaml.safe_dump({"id": "F", "stage": "CRITIQUE", "files": {}}, open(os.path.join(root, "F", "fixture.yaml"), "w"))
     open(os.path.join(root, "F", "spawn_prompt.md"), "w").write("This is critique round 1. Run directory: {run_dir}")
     return os.path.join(root, "F")

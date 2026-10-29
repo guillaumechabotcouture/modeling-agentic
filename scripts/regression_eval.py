@@ -69,6 +69,8 @@ EXPECTED_KINDS = {
     "prose_closure": ("pre_mortem_closed_without_evidence",),
     "unused_column": ("data_columns_unread_summary",),
     "tuned_without_transfer": ("benchmark_transfer_missing",),
+    # Phase 43 α (B1).
+    "scenario_fitted": ("calibration_scenario_assumption_fitted",),
 }
 # On the positive control the planter's edit leaves `population` undefined,
 # so the gate sees a crash (eligibility_probe_error), not the defect.

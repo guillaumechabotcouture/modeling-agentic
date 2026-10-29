@@ -392,6 +392,25 @@ def build(run_dir: str, round_n: int = 2) -> dict:
             {"name": "slope", "point_estimate": sl,
              "lower_bound": -1.5, "upper_bound": 2.0}]})
     _run_script("identifiability.py", run_dir)
+    # Phase 43 α B1: parameter roles and target metadata.
+    _w(run_dir, "models/calibration_spec.yaml", {
+        "question": "Which districts should the campaign budget fund?",
+        "parameters": [
+            {"name": "rate_scale", "role": "country_specific_uncertain", "calibrated": True,
+             "reason": "baseline incidence level is poorly observed in this setting",
+             "bounds": [0.3, 4.0], "bounds_basis": "pragmatic"},
+            {"name": "slope", "role": "country_specific_uncertain", "calibrated": True,
+             "reason": "the access gradient differs by setting and drives the ranking",
+             "bounds": [-1.5, 2.0], "bounds_basis": "pragmatic"},
+            {"name": "vaccine_efficacy", "role": "fixed_literature", "calibrated": False,
+             "reason": "trial estimate transfers across settings (registry: vaccine_efficacy)"},
+            {"name": "coverage", "role": "scenario_assumption", "calibrated": False,
+             "reason": "the campaign's planned coverage is a scenario input"}],
+        "targets": [{
+            "id": "district_cases", "quantity": "reported annual cases", "population": "each district",
+            "age": "under 5", "time": "one annual count", "units": "cases per year",
+            "source": "district surveillance case counts", "uncertainty": "Poisson counting error",
+            "provenance": "observed", "n": n}]})
     _w(run_dir, "models/identifiability_a_priori.yaml", {
         "stage": "pre_model", "round_drafted": 1,
         "calibration_targets": [{

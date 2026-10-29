@@ -134,6 +134,29 @@ artifacts:
       Manifest with point estimates + bounds; loss function pointwise (see §3
       contract).
 
+  - id: calibration_spec
+    path: models/calibration_spec.yaml
+    first_draft_round: 1
+    finalize_round: 2
+    stage: model
+    skill: parameter-estimation
+    triggered_by: always
+    scope_declarable: false
+    required_for_accept: fitted_parameters
+    description: |
+      **Before the first fit** (Phase 43 α, B1; schema in
+      `scripts/calibration_spec.py`). Every candidate parameter gets one
+      `role` (data_informed, fixed_literature, country_specific_uncertain,
+      behavioural, tuning, scenario_assumption), `calibrated: true|false`
+      and a `reason`, including those considered and not calibrated;
+      `matches:` globs cover a group of fitted names. Every target records
+      quantity, population, age, time, units, source, uncertainty and
+      `provenance: observed|modelled_by_others`. HIGH if a fitted parameter
+      (from `models/identifiability.yaml`) is a scenario_assumption or has
+      no calibrated entry. Before widening a bound, check missing data,
+      missing mechanism, structural constraint, inconsistent targets and
+      mismatched target definition, and record them under `bound_changes`.
+
   - id: sensitivity_analysis
     path: models/sensitivity_analysis.yaml
     first_draft_round: 2
