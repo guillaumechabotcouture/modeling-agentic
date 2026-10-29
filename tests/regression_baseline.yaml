@@ -2,15 +2,27 @@
 # A detected: true entry may only flip to false with a stated reason in the PR.
 detected:
   s11:budget_overspend:column cost: true
-  s11:ci_inverted:vaccine_efficacy.ci_low: false
-  s11:ledger_mismatch:claims[n_funded].value: true
+  s11:ci_inverted:cost_per_child.ci_low: false
+  s11:ledger_mismatch:claims[dalys_det].value: true
+  s11:mechanism_untested:line 5: true
+  s11:prior_severity_below:PM-002: true
+  s11:prose_closure:PM-003: true
   s11:renamed_verdict:verdict: true
+  s11:scenario_fitted:rate_scale: true
+  s11:tuned_without_transfer:child_incidence_baseline: true
   s11:unit_error:column baseline_rate: true
-  s11:zero_width_ci:cost_per_child.ci_low/ci_high: false
+  s11:unused_column:column subgroup_share_unread: true
+  s11:zero_width_ci:scalar_outputs.ci_low/ci_high: true
   s7:budget_overspend:column cost: true
-  s7:ci_inverted:vaccine_efficacy.ci_low: false
+  s7:ci_inverted:scalar_outputs.ci_low: true
   s7:ledger_mismatch:claims[n_funded].value: true
+  s7:mechanism_untested:line 5: true
+  s7:prior_severity_below:PM-002: true
+  s7:prose_closure:PM-003: true
   s7:renamed_verdict:verdict: true
+  s7:scenario_fitted:rate_scale: true
+  s7:tuned_without_transfer:child_incidence_baseline: true
   s7:unit_error:column baseline_rate: true
-  s7:zero_width_ci:vaccine_efficacy.ci_low/ci_high: false
+  s7:unused_column:column subgroup_share_unread: true
+  s7:zero_width_ci:scalar_outputs.ci_low/ci_high: true
 clean_high: []

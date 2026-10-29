@@ -95,6 +95,11 @@ except ImportError:
     print("ERROR: pyyaml not installed.", file=sys.stderr)
     sys.exit(2)
 
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
+from lib.safe_io import sha256_file as _sha256_file  # noqa: E402
+
 
 # Chi-squared 95% CI for 1 DOF: 3.84. Profile-likelihood CI uses
 # -2 * (logL(profile) - logL(max)) < 3.84, equivalent to loss increase < 1.92.
@@ -662,15 +667,6 @@ def analyze(run_dir: str) -> dict:
         "status_counts": status_counts,
         "verdict": verdict,
     }
-
-
-def _sha256_file(path: str) -> Optional[str]:
-    import hashlib
-    try:
-        with open(path, "rb") as f:
-            return hashlib.sha256(f.read()).hexdigest()
-    except OSError:
-        return None
 
 
 def _run_self_test() -> int:

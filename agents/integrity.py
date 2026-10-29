@@ -73,6 +73,10 @@ REPORT_NAME = "artifact_integrity.json"
 # the harness records its own writes (harness_wrote).
 _HARNESS_WRITTEN = {"harness_manifest.json", "trace.jsonl",
                     "final_gate.json", "final_gate_stderr.txt", REPORT_NAME}
+# The gate's records main.py writes (run_final_gate): not scanned at start (a
+# resumed run's old copy is the harness's), but watched once the harness has
+# written them and said so (harness_wrote): only main.py writes them.
+_WATCH_ONCE_WRITTEN = {"final_gate.json", "final_gate_stderr.txt"}
 # Which protected outputs each harness script may write (measured: the
 # validator also rewrites four gate reports). A script authorizes only
 # these — never critique files, and never another script's output.
@@ -336,6 +340,7 @@ class ArtifactIntegrity:
         self._pipeline_now: tuple[list[str], list[str]] = ([], [])   # current (outputs, inputs)
         self._released: set[str] = set()
         self._baseline: set[str] = set()
+        self._harness_files: set[str] = set()   # _WATCH_ONCE_WRITTEN files the harness wrote
         # A resumed run keeps the violations already recorded. Only a MISSING
         # record is a fresh start: an unreadable, unstamped or malformed one
         # is itself evidence and becomes a violation (never silently reset).
@@ -474,10 +479,24 @@ class ArtifactIntegrity:
                     self._mtimes_now[rel] = os.stat(p).st_mtime_ns
                     if rel in was_released and rel not in self.hashes:
                         self._baseline.add(rel)    # declared an output again: baselined
+        for rel in self._harness_files:
+            p = os.path.join(self.run_path, rel)
+            if os.path.isfile(p) and rel not in out:
+                out[rel] = _sha(p)
+                self._mtimes_now[rel] = os.stat(p).st_mtime_ns
         rp = os.path.join(self.run_path, REPORT_NAME)
         if os.path.exists(rp):
             out[REPORT_NAME] = _sha(rp)
         return out
+
+    def _watched(self, rel: str) -> bool:
+        """Whether `_scan` hashes `rel` (the same patterns, released files excluded)."""
+        if rel == REPORT_NAME or rel in self._harness_files:
+            return True
+        if any(fnmatch.fnmatchcase(rel, p) for p in _protected_patterns()):
+            return True
+        pm = getattr(_pipeline(), "path_match", fnmatch.fnmatchcase)
+        return any(pm(rel, p) for p in self.pipeline_patterns) and not self._is_released(rel)
 
     # -- tool lifecycle ---------------------------------------------------
     def on_pre(self, tool_use_id: str, tool_name: str, tool_input: dict,
@@ -519,8 +538,22 @@ class ArtifactIntegrity:
 
     def harness_wrote(self, rel: str) -> None:
         """The harness itself (not a tool) wrote `rel`, e.g. restoring a
-        deleted report.md at finalize: accept the new content."""
+        deleted report.md at finalize: accept the new content.
+
+        Only for a file the scan watches. A hash recorded for a file `_scan`
+        never hashes made the next check see it as deleted (S1 smoke,
+        2026-10-29: `final_gate.json` and `final_gate_stderr.txt`, registered
+        by main.py's `_harness_wrote_gate_outputs` before the final write-up,
+        were reported "deleted" on the writer's first tool call, and the run
+        ended `artifact_tampered`). The gate's own records
+        (_WATCH_ONCE_WRITTEN) are watched from the harness's first write on,
+        so an agent changing or deleting them afterwards is still flagged."""
         with self._lock:
+            if rel in _WATCH_ONCE_WRITTEN:
+                self._harness_files.add(rel)
+            if not self._watched(rel):
+                self.hashes.pop(rel, None)
+                return
             self.hashes[rel] = _sha(os.path.join(self.run_path, rel))
 
     def check_now(self) -> list[dict]:

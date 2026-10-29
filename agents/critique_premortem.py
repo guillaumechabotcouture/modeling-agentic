@@ -81,7 +81,11 @@ For each matched prior, do ONE of:
   and the prior's `acknowledgment_hints` it satisfies).
 - **Promote it to a concern** if the plan misses it. Use the prior's
   `severity_if_unaddressed` as your `severity`. Cite at least one
-  corroborating source from the prior's `literature_corroboration`.
+  corroborating source from the prior's `literature_corroboration`, and
+  list `expert_prior:<prior_id>` in `evidence_files`. The gate holds a
+  concern that cites a prior to at least the prior's severity, so do not
+  grade it lower. A concern you raise that a prior covers cites that prior
+  the same way.
 - **Promote with strengthened framing** if the plan only weakly
   addresses it.
 

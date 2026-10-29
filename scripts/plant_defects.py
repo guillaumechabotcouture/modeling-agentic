@@ -470,9 +470,182 @@ def plant_data_vintage(root, rng, used):
     return None
 
 
+# --------------------------------------------------------------------------- Phase 42 γ classes
+# Each targets one generic rule (D1-D5): mechanism manifest, severity floor,
+# data-use audit, evidence for "addressed", transfer check.
+
+def plant_mechanism_untested(root, rng, used):
+    """Drop the sufficiency-test result from a simplified mechanism."""
+    for p in _first(root, ["models/mechanism_manifest.yaml"]):
+        lines = _read(p).split("\n")
+        for i, l in enumerate(lines):
+            m = re.match(r"^(\s*)sufficiency_test:\s*(\S.*)$", l)
+            if not m:
+                continue
+            ref = m.group(2).strip()
+            del lines[i]
+            _write(p, "\n".join(lines))
+            return {"class": "mechanism_untested", "file": _rel(root, p), "location": f"line {i + 1}",
+                    "severity": "major",
+                    "description": f"{_rel(root, p)}: the sufficiency-test result `{ref}` of a simplified "
+                                   "mechanism removed (simplification left untested).",
+                    "terms": {"specific": [ref, os.path.basename(ref)],
+                              "generic": ["sufficiency test", "simplified", "untested", "mechanism",
+                                          "simplification", "not tested"]}}
+    return None
+
+
+def _concern_blocks(lines):
+    """[(start, end, severity)] for `- id:` concern items in a pre_mortem.yaml."""
+    starts = [i for i, l in enumerate(lines) if re.match(r"^\s*-\s+id:\s*\S", l)]
+    out = []
+    for n, s in enumerate(starts):
+        e = starts[n + 1] if n + 1 < len(starts) else len(lines)
+        ms = [re.match(r"^\s*(?:-\s+)?severity:\s*['\"]?(\w+)", l) for l in lines[s:e]]
+        sev = next((m.group(1).upper() for m in ms if m), None)
+        out.append((s, e, sev))
+    return out
+
+
+def plant_prior_severity_below(root, rng, used):
+    """Make a LOW/MEDIUM concern cite a registry prior graded above it."""
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from lib import expert_priors as _ep
+        priors = sorted(_ep.load_priors(), key=lambda p: p.id)
+    except Exception:  # noqa: BLE001
+        return None
+    rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+    for p in _first(root, ["pre_mortem.yaml"]):
+        lines = _read(p).split("\n")
+        for s, e, sev in _concern_blocks(lines):
+            if sev not in ("LOW", "MEDIUM"):
+                continue
+            higher = [q for q in priors if rank.get(q.severity_if_unaddressed, 1) > rank[sev]]
+            if not higher or any("expert_prior:" in l for l in lines[s:e]):
+                continue
+            for i in range(s, e):
+                if re.match(r"^\s*evidence_files:\s*$", lines[i]) and i + 1 < e \
+                        and re.match(r"^\s*-\s+\S", lines[i + 1]):
+                    q = higher[0]
+                    indent = re.match(r"^(\s*-\s+)", lines[i + 1]).group(1)
+                    old = lines[i + 1].strip()
+                    lines[i + 1] = f"{indent}expert_prior:{q.id}"
+                    _write(p, "\n".join(lines))
+                    cid = lines[s].split("id:", 1)[1].strip()
+                    return {"class": "prior_severity_below", "file": _rel(root, p), "location": cid,
+                            "severity": "major",
+                            "description": f"{_rel(root, p)} {cid}: graded {sev} but now cites prior `{q.id}` "
+                                           f"({q.severity_if_unaddressed}) in place of `{old}`.",
+                            "terms": {"specific": [cid, q.id],
+                                      "generic": ["severity", "graded", "prior", "below", "downgraded",
+                                                  "under-graded"]}}
+    return None
+
+
+_SENS_HINT = re.compile(r"sensitivity|robust|plausible range|vary|varied", re.I)
+
+
+def plant_prose_closure(root, rng, used):
+    """Close a concern that asks for a sensitivity check with prose only."""
+    for p in _first(root, ["pre_mortem.yaml"]):
+        lines = _read(p).split("\n")
+        for s, e, sev in _concern_blocks(lines):
+            block = "\n".join(lines[s:e])
+            if not re.search(r"suggested_check:", block) or not _SENS_HINT.search(block):
+                continue
+            for i in range(s, e):
+                if not re.match(r"^\s*addressed_in:\s*$", lines[i]):
+                    continue
+                for j in range(i + 1, e):
+                    m = re.match(r"^\s*-\s+['\"]?([^'\"]+?)['\"]?\s*$", lines[j])
+                    if not m:
+                        break
+                    ref = m.group(1)
+                    if not re.search(r"\.(?:md|txt)\b", ref, re.I):
+                        del lines[j]
+                        _write(p, "\n".join(lines))
+                        cid = lines[s].split("id:", 1)[1].strip()
+                        return {"class": "prose_closure", "file": _rel(root, p), "location": cid,
+                                "severity": "major",
+                                "description": f"{_rel(root, p)} {cid}: the evidence artifact `{ref}` removed from "
+                                               "addressed_in; the sensitivity check is closed by prose only.",
+                                "terms": {"specific": [cid, ref],
+                                          "generic": ["addressed", "prose", "no artifact", "evidence",
+                                                      "sensitivity", "not run"]}}
+    return None
+
+
+def plant_unused_column(root, rng, used):
+    """Add a data column that no model code reads."""
+    taken = used.get("files", set()) if isinstance(used, dict) else set()
+    csvs = [p for p in _first(root, ["data/processed/*.csv"]) + _first(root, ["data/*.csv"])
+            if _rel(root, p) not in taken]
+    for p in csvs:
+        lines = _read(p).rstrip("\n").split("\n")
+        if len(lines) < 3 or '"' in lines[0]:
+            continue
+        col = "subgroup_share_unread"
+        lines = [lines[0] + "," + col] + [l + f",{0.2 + 0.05 * (k % 5):.2f}" if l else l
+                                          for k, l in enumerate(lines[1:])]
+        _write(p, "\n".join(lines) + "\n")
+        return {"class": "unused_column", "file": _rel(root, p), "location": f"column {col}", "severity": "major",
+                "description": f"{_rel(root, p)}: column `{col}` added that no model code reads.",
+                "terms": {"specific": [col], "generic": ["unused", "not read", "ignored", "data column",
+                                                         "never used", "collapsed"]}}
+    return None
+
+
+def plant_tuned_without_transfer(root, rng, used):
+    """Declare a benchmark tuned, without a transfer to the target setting."""
+    for p in _first(root, ["models/benchmark_targets.yaml"]):
+        s = _read(p)
+        if "transfer:" in s or "tuned_parameters:" in s:
+            continue
+        lines = s.split("\n")
+        for i, l in enumerate(lines):
+            m = re.match(r"^(\s*)-\s+id:\s*(\S+)", l)
+            if not m:
+                continue
+            lines.insert(i + 1, f"{m.group(1)}  tuned_parameters: [effect_scale]")
+            _write(p, "\n".join(lines))
+            return {"class": "tuned_without_transfer", "file": _rel(root, p), "location": m.group(2),
+                    "severity": "major",
+                    "description": f"{_rel(root, p)} {m.group(2)}: declared tuned (effect_scale) with no "
+                                   "transfer to the target setting's covariates.",
+                    "terms": {"specific": [m.group(2), "effect_scale"],
+                              "generic": ["tuned", "transfer", "target setting", "covariates", "benchmark site",
+                                          "external validity"]}}
+    return None
+
+
+def plant_scenario_fitted(root, rng, used):
+    """Phase 43 α (B1): give a fitted parameter the scenario_assumption role."""
+    for p in _first(root, ["models/calibration_spec.yaml"]):
+        try:
+            doc = yaml.safe_load(_read(p))
+        except yaml.YAMLError:
+            continue
+        for e in (doc.get("parameters") if isinstance(doc, dict) else None) or []:
+            if isinstance(e, dict) and e.get("calibrated") is True and e.get("role") != "scenario_assumption":
+                name = str(e.get("name"))
+                e["role"] = "scenario_assumption"
+                _write(p, yaml.safe_dump(doc, sort_keys=False))
+                return {"class": "scenario_fitted", "file": _rel(root, p), "location": name,
+                        "severity": "major",
+                        "description": f"{_rel(root, p)}: fitted parameter `{name}` is declared a scenario "
+                                       "assumption (a future input fitted to historical data).",
+                        "terms": {"specific": [name, "scenario_assumption"],
+                                  "generic": ["scenario assumption", "fitted to historical", "calibrated",
+                                              "projection", "future input", "parameter role"]}}
+    return None
+
+
 PLANTERS = [plant_zero_width_ci, plant_ci_inverted, plant_ledger_mismatch, plant_prose_stale_number,
             plant_benefit_total_population, plant_renamed_verdict, plant_budget_overspend, plant_unit_error,
-            plant_citation_mismatch, plant_sensitivity_contradiction, plant_double_counting, plant_data_vintage]
+            plant_citation_mismatch, plant_sensitivity_contradiction, plant_double_counting, plant_data_vintage,
+            plant_mechanism_untested, plant_prior_severity_below, plant_prose_closure, plant_unused_column,
+            plant_tuned_without_transfer, plant_scenario_fitted]
 CLASSES = [f.__name__[len("plant_"):] for f in PLANTERS]
 
 
@@ -574,6 +747,22 @@ def _mini_fixture(root):
            "unit,incidence_per_1000\n" + "\n".join(f"u{i},{10 + i}.5" for i in range(8)) + "\n")
     _write(os.path.join(inp, "citations.md"), "# Citations\n- Smith et al. (2019). A trial. The Lancet. doi:10/x\n")
     _write(os.path.join(inp, "data_provenance.md"), "# Provenance\nDHS survey 2021 state estimates were used.\n")
+    # Phase 42 γ targets.
+    _write(os.path.join(inp, "models", "mechanism_manifest.yaml"),
+           "mechanisms:\n- id: age_profile\n  status: simplified\n  assumption: one profile\n"
+           "  sufficiency_test: models/sufficiency_age.yaml\n")
+    _write(os.path.join(inp, "pre_mortem.yaml"),
+           "concerns:\n- id: PM-001\n  severity: LOW\n  concern: c\n"
+           "  suggested_check: Confirm robust to a plausible range.\n"
+           "  evidence_files:\n  - plan.md\n"
+           "  addressed_in:\n  - modeling_strategy.md § R\n  - models/sensitivity_analysis.yaml\n")
+    _write(os.path.join(inp, "data", "units.csv"), "unit,pop\nA,1\nB,2\nC,3\n")
+    _write(os.path.join(inp, "models", "benchmark_targets.yaml"),
+           "benchmarks:\n- id: B1\n  target_value: 1.0\n  computed_value: 1.0\n")
+    # Phase 43 α target.
+    _write(os.path.join(inp, "models", "calibration_spec.yaml"),
+           "parameters:\n- name: level\n  role: country_specific_uncertain\n  calibrated: true\n"
+           "  reason: differs by unit\n")
     yaml.safe_dump({"id": "F", "stage": "CRITIQUE", "files": {}}, open(os.path.join(root, "F", "fixture.yaml"), "w"))
     open(os.path.join(root, "F", "spawn_prompt.md"), "w").write("This is critique round 1. Run directory: {run_dir}")
     return os.path.join(root, "F")

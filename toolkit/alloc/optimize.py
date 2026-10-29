@@ -70,7 +70,15 @@ import time
 import yaml
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
+# Imported as toolkit.alloc.optimize (a run's model code), the siblings come from the
+# package, and sys.path is left alone: a run's own models/costs.py must not shadow them,
+# nor they it. Run as a script, they are imported from this directory.
+if __package__:
+    from . import costs, packages
+else:
+    sys.path.insert(0, HERE)
+    import costs  # noqa: E402
+    import packages  # noqa: E402
 
 METHOD_NAMES = {"ilp": "ilp_pulp", "greedy": "greedy", "brute": "brute_force"}   # optimization_quality.py vocabulary
 EXACT = ("ilp", "brute")
@@ -572,7 +580,6 @@ RR1, RR2 = 0.6, 0.4      # design §3.5: C1 universal (relative risk 0.6), C2 ta
 
 def _planted_world():
     """40 units in 4 groups; C1 universal, C2 targeted to an eligible subgroup; costs from toolkit/alloc/costs.py."""
-    import costs
     units = []
     for i in range(40):
         g, k = divmod(i, 10)
@@ -634,7 +641,6 @@ def _closed_form(benefit, cost, feas, k_steps):
 def _self_test() -> int:
     import tempfile
 
-    import packages
     fails = []
 
     def ok(c, m):
@@ -789,6 +795,22 @@ def _self_test() -> int:
         ok(rz["gap_pct"] is None and "gap_pct is undefined" in rz["notes"]
            and oq.validate_optimization_quality(os.path.join(d, "z.yaml"))["verdict"] == "MALFORMED",
            "TC30 (Codex) a zero best objective: gap undefined, noted, and the checker fails closed")
+        # Phase 42 ε: a run imports the toolkit as a package beside its own models/costs.py;
+        # neither may shadow the other (the bug: the toolkit's `import costs` returning the run's file).
+        import subprocess
+        decoy = os.path.join(d, "runmodels")
+        os.makedirs(decoy)
+        with open(os.path.join(decoy, "costs.py"), "w") as f:
+            f.write("DECOY = True\n")
+        code = ("import sys; sys.path.insert(0, sys.argv[1]); import costs; sys.path.insert(0, sys.argv[2]);"
+                "from toolkit.alloc import optimize, packages; import costs as again;"
+                "print(getattr(optimize.costs, 'DECOY', False), packages.costs is optimize.costs,"
+                " again is costs, optimize.HERE in sys.path, hasattr(optimize.costs, 'cost_matrix'))")
+        pr = subprocess.run([sys.executable, "-c", code, decoy, os.path.dirname(os.path.dirname(HERE))],
+                            capture_output=True, text=True, timeout=120)
+        ok(pr.stdout.split() == ["False", "True", "True", "False", "True"],
+           f"TC36 imported as toolkit.alloc beside a run's costs.py, neither shadows the other: "
+           f"{pr.stdout.strip()} {pr.stderr.strip()[-300:]}")
     if fails:
         print("SELF-TEST FAILURES:")
         for m in fails:
@@ -815,8 +837,6 @@ def main(argv=None) -> int:
         ap.error("spec, --benefit and --budget are required")
     import csv
 
-    import costs
-    import packages
     spec = yaml.safe_load(open(a.spec))
     units = costs.load_units(spec, os.path.dirname(os.path.abspath(a.spec)), a.units)
     try:

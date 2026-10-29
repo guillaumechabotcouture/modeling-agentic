@@ -435,7 +435,7 @@ Do NOT put everything in one giant file. Split into focused modules:
   model_core.py       # ODE/SEIR dynamics only (< 200 lines)
   model_calibrate.py   # Calibration logic (< 150 lines)
   model_scenarios.py   # Intervention scenarios (< 150 lines)
-  model_optimize.py    # Cost model + optimizer (< 200 lines)
+  model_optimize.py    # Allocation: toolkit/alloc on a cost/package spec (allocation-toolkit skill)
   model_figures.py     # ALL figure generation (< 300 lines)
   model_run.py         # Main entry point: imports above, runs everything
 ```
@@ -454,6 +454,21 @@ Write model code to the modules above. The entry point is {run_dir}/model_run.py
 Save figures to {run_dir}/figures/.
 Print structured metrics to stdout.
 Update {run_dir}/progress.md and {run_dir}/checklist.md.
+
+## BUILD PIPELINE — `{run_dir}/models/pipeline.yaml`
+
+Declare the run's build steps once (calibration, scenarios, allocation,
+figures) in `models/pipeline.yaml`; the schema is the docstring of
+`scripts/pipeline.py`. The harness builds the stale steps after your turn and
+before each gate, and only its build writes their outputs: once a step is
+declared, do not run its command yourself or write driver scripts around it.
+Try a step with `python3 scripts/pipeline.py run {run_dir} <step> --scratch`
+(it runs in a copy of the run; add `--keep` to inspect the copy), and check
+the file with `python3 scripts/pipeline.py validate {run_dir}`. Keep each
+ordinary step within the in-session build budget (`HOOK_BUDGET_S` in
+`scripts/derived_rebuild.py`); a long step, such as a large simulation grid,
+is a compute step (`run: "compute: models/<module>.py::<fn>"` with
+`inputs_jsonl`, `out` and `purpose`).
 
 ## PARAMETER REGISTRY (REQUIRED for literature-sourced constants)
 
@@ -663,6 +678,12 @@ runs `scripts/propagate_uncertainty.py`, which samples registered
 parameter priors (above) and aggregates per-output CIs. The draw-count
 floors are in the effort-floors table below.
 
+Run the propagation once per final model version of a round (calibration and
+`outcome_fn` settled), not after each edit. The report's fingerprint covers
+only the modules `outcome_fn` loads, so edits to figure scripts, pipeline
+steps or other model files do not make it stale. The convergence report
+counts uncertainty runs per round.
+
 `outcome_fn` must actually read the sampled parameters: a zero-width
 95% interval on any output while its inputs vary is a HIGH,
 non-scope-declarable `ci_degenerate` finding (Phase 21 β). If an output
@@ -841,6 +862,12 @@ The validator emits MEDIUM `daly_analysis_missing` if no DALY
 mention exists outside §Limitations / §Scope sections.
 
 ### 4a. Optimizer-quality benchmark (Phase 6 Commit θ — when allocation is produced)
+
+Declare costs and packages as a spec and use `toolkit.alloc.costs`,
+`packages` and `optimize` (the `allocation-toolkit` skill);
+`optimize.benchmark()` writes the file below. Extend the toolkit in
+`models/ext/` only for what it lacks, and record why in
+`models/toolkit_use.yaml` (checked by `scripts/alloc_toolkit_use.py`).
 
 If this run produces an allocation (decision_rule.md or
 *allocation*.csv), you MUST also produce

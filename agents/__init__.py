@@ -327,6 +327,9 @@ def _registry() -> dict[str, AgentDefinition]:
                     "allocation-cross-validation",
                     "decision-rule-extraction",
                     "optimizer-method-selection",
+                    # Phase 42 ε: costs, packages and the optimizer come
+                    # from toolkit/alloc (checked by alloc_toolkit_use.py).
+                    "allocation-toolkit",
                     "daly-weighted-analysis",
                     "mechanistic-vs-hybrid-architecture",
                     # Phase 10 Commit ω: remediation skill for SENSITIVE
@@ -495,8 +498,9 @@ resolution, the objective, constraints, accounting conventions, what is out
 of scope, what impact is measured against (comparators: one primary, the
 others sensitivities), the acceptance criteria, and open questions for the
 owner. Check that it is faithful to the question, that the primary
-comparator describes what actually happens without the plan, and that its
-open questions are the framing choices that matter. Nothing but planning runs until it is signed;
+comparator describes what actually happens without the plan, that its
+open questions are decisions that matter (facts are the planner's to find),
+and that the method assessment says why the requested framework fits. Nothing but planning runs until it is signed;
 the harness says whether the owner signs (end your turn with
 AWAITING_SIGNOFF and you are resumed with the owner's answers) or you do.
 After sign-off the brief and success_criteria.yaml are frozen and the
@@ -658,7 +662,9 @@ Draw-count floors are read from `.claude/orchestration/effort_floors.yaml`
 __UQ_DRAW_FLOORS__
 
 Requesting exactly the floor leaves no margin for failed draws: the
-floor applies to SUCCESSFUL draws, so request ~10% more.
+floor applies to SUCCESSFUL draws, so request ~10% more. Run it once per
+final model version of a round, not after each edit: its fingerprint covers
+only the modules `outcome_fn` loads.
 
 Reads registered parameter priors from `citations.md` (`## Parameter
 Registry` section, see effect-size-priors skill). With `--cloud`,
@@ -1750,6 +1756,19 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
             record["mentions"] = open_problems.mentions(str(tool_input.get("prompt") or ""), run_path)
         if deny_reason:
             record["denied"] = deny_reason
+        if tool_name == "Bash":
+            # Phase 42 ε: which harness scripts the call runs, with its full command
+            # (the summary is cut at 80 characters), so scripts/convergence_report.py
+            # can count uncertainty runs and gate runs per round.
+            try:
+                from agents.integrity import harness_scripts_run
+                cmd = str(tool_input.get("command") or "")
+                ran = harness_scripts_run(cmd, input_data.get("cwd"))[0]
+                if ran:
+                    record["scripts_run"] = ran
+                    record["command"] = cmd[:1000]
+            except Exception:  # noqa: BLE001 — bookkeeping must not break enforcement
+                pass
         _safe_write(trace_file, record)  # a closed trace must not disable enforcement
         if deny_reason:
             return enforcement.deny_output(deny_reason)

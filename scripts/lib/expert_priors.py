@@ -87,6 +87,19 @@ class Citation:
 
 
 @dataclass(frozen=True)
+class Mechanism:
+    """Phase 42 γ (D1): a mechanism a matched prior requires the model to
+    account for (modelled, fixed from a source, or simplified with a
+    sufficiency test). `when_data_columns_any` (optional) limits the
+    requirement to runs whose data (data/, data/raw/ included) has a column
+    whose name contains one of the strings (case-insensitive)."""
+    id: str
+    description: str
+    sufficiency_test: str
+    when_data_columns_any: tuple[str, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
 class ExpertPrior:
     id: str
     kind: str
@@ -103,6 +116,8 @@ class ExpertPrior:
     # Legacy single-source field for backwards compat with γ-era priors;
     # δ-era priors should populate literature_corroboration instead.
     source_citation_legacy: str | None = None
+    # Phase 42 γ (D1): mechanisms this prior requires when it matches.
+    requires_mechanism: tuple[Mechanism, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -283,6 +298,8 @@ def _from_dict(d: dict) -> ExpertPrior:
                      if c.get("excerpt") else None),
         ))
 
+    mechanisms = _parse_mechanisms(d.get("requires_mechanism"))
+
     return ExpertPrior(
         id=str(d["id"]),
         kind=kind,
@@ -298,7 +315,167 @@ def _from_dict(d: dict) -> ExpertPrior:
         found_in_runs=tuple(runs),
         source_citation_legacy=(str(d["source_citation"]).strip()
                                  if d.get("source_citation") else None),
+        requires_mechanism=mechanisms,
     )
+
+
+_MECH_ID_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+
+
+def _parse_mechanisms(raw: Any) -> tuple[Mechanism, ...]:
+    """Phase 42 γ (D1): `requires_mechanism:` is a mapping or a list of
+    mappings {id, description, sufficiency_test, when_data_columns_any?}."""
+    if raw is None:
+        return ()
+    items = [raw] if isinstance(raw, dict) else raw
+    if not isinstance(items, list):
+        raise ValueError("requires_mechanism must be a mapping or a list of mappings")
+    out: list[Mechanism] = []
+    for j, m in enumerate(items):
+        if not isinstance(m, dict):
+            raise ValueError(f"requires_mechanism[{j}] must be a mapping")
+        for k in ("id", "description", "sufficiency_test"):
+            if not isinstance(m.get(k), str) or not m[k].strip():
+                raise ValueError(f"requires_mechanism[{j}].{k} must be a non-empty string")
+        if not _MECH_ID_RE.match(m["id"]):
+            raise ValueError(f"requires_mechanism[{j}].id must be snake_case, got {m['id']!r}")
+        cols = m.get("when_data_columns_any") or []
+        if not isinstance(cols, list) or not all(isinstance(x, str) and x.strip() for x in cols):
+            raise ValueError(f"requires_mechanism[{j}].when_data_columns_any must be a list of strings")
+        unknown = set(m) - {"id", "description", "sufficiency_test", "when_data_columns_any"}
+        if unknown:
+            raise ValueError(f"requires_mechanism[{j}]: unknown field(s) {sorted(unknown)}")
+        out.append(Mechanism(id=m["id"], description=m["description"].strip(),
+                             sufficiency_test=m["sufficiency_test"].strip(),
+                             when_data_columns_any=tuple(x.strip() for x in cols)))
+    ids = [m.id for m in out]
+    if len(set(ids)) != len(ids):
+        raise ValueError("requires_mechanism ids must be unique within a prior")
+    return tuple(out)
+
+
+# --------------------------------------------------------------------------- #
+# Phase 42 γ: priors that apply to a run (question from metadata.json)
+# --------------------------------------------------------------------------- #
+
+_PRIOR_REF_RE = re.compile(r"expert_prior:\s*([A-Za-z0-9_\-]+)")
+
+
+def run_question(run_dir: str) -> tuple[str | None, int | None, str | None]:
+    """(question, decision_year, error) for a run. metadata.json is written by
+    main.py; absent → (None, None, None) (not a pipeline run). Present but
+    unreadable or without a question → error string (callers fail closed)."""
+    import json
+    path = os.path.join(run_dir, "metadata.json")
+    if not os.path.exists(path):
+        return None, None, None
+    try:
+        with open(path, encoding="utf-8") as f:
+            meta = json.load(f)
+    except (OSError, ValueError) as e:
+        return None, None, f"metadata.json unreadable: {e}"
+    if not isinstance(meta, dict):
+        return None, None, "metadata.json is not a mapping"
+    q = meta.get("question") or meta.get("research_question")
+    if not isinstance(q, str) or not q.strip():
+        return None, None, "metadata.json has no question"
+    year = None
+    try:
+        import importlib.util
+        sp = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "spec_compliance.py")
+        mod = sys.modules.get("_ma_spec_compliance_for_priors")
+        if mod is None:
+            spec = importlib.util.spec_from_file_location("_ma_spec_compliance_for_priors", sp)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            sys.modules["_ma_spec_compliance_for_priors"] = mod
+        year = mod.detect_decision_year(q, meta)
+    except Exception:  # noqa: BLE001 — the year only narrows matching
+        y = meta.get("decision_year")
+        year = int(y) if isinstance(y, int) else None
+    return q, year, None
+
+
+def cited_prior_ids(obj: Any, known: set[str]) -> set[str]:
+    """Prior ids a concern cites: `expert_prior:<id>` anywhere in its text or
+    lists, or a `prior_id` / `prior_ids` field. Only ids in `known` count."""
+    out: set[str] = set()
+
+    def walk(x: Any) -> None:
+        if isinstance(x, str):
+            out.update(m.group(1) for m in _PRIOR_REF_RE.finditer(x))
+        elif isinstance(x, dict):
+            for k, v in x.items():
+                if k in ("prior_id", "prior_ids", "expert_prior", "expert_prior_ids"):
+                    for v_ in (v if isinstance(v, list) else [v]):
+                        if isinstance(v_, str):
+                            out.add(v_.strip())
+                walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+    walk(obj)
+    return out & known
+
+
+def domain_matches(p: ExpertPrior, question_text: str, decision_year: int | None = None) -> bool:
+    """Phase 42 γ: the prior's disease / programme area (explicit `domain_any`,
+    else inferred from its id + claim) appears in the question, no
+    `keywords_none` term does, and the decision year is in range. A prior
+    with no domain (cross-disease) never matches by domain alone."""
+    aw = p.applies_when
+    dom = aw.get("domain_any")
+    if dom is None:
+        dom = _inferred_domain(p)
+    q = (question_text or "").lower()
+    if not dom or not any(_kw_in(k, q) for k in dom):
+        return False
+    if any(_kw_in(k, q) for k in (aw.get("keywords_none") or [])):
+        return False
+    if decision_year is not None:
+        if aw.get("decision_year_min") is not None and decision_year < aw["decision_year_min"]:
+            return False
+        if aw.get("decision_year_max") is not None and decision_year > aw["decision_year_max"]:
+            return False
+    return True
+
+
+def run_domain_priors(run_dir: str, priors: list[ExpertPrior] | None = None) -> list[ExpertPrior]:
+    """Priors whose domain matches the run question (`domain_matches`),
+    whether or not their keywords do."""
+    if priors is None:
+        priors = load_priors()
+    q, year, _err = run_question(run_dir)
+    return [p for p in priors if q and domain_matches(p, q, year)]
+
+
+def run_priors(run_dir: str, priors: list[ExpertPrior] | None = None
+               ) -> tuple[list[ExpertPrior], str | None]:
+    """Priors that apply to the run: those whose applies_when matches the
+    run question, plus those the run's pre_mortem.yaml cites
+    (`matching_prior_ids` or `expert_prior:<id>` in a concern).
+    Returns (priors, error)."""
+    if priors is None:
+        priors = load_priors()
+    by_id = {p.id: p for p in priors}
+    q, year, err = run_question(run_dir)
+    hit: dict[str, ExpertPrior] = {}
+    if q:
+        hit.update({p.id: p for p in matching_priors(q, year, priors)})
+    pm = os.path.join(run_dir, "pre_mortem.yaml")
+    if os.path.exists(pm):
+        try:
+            with open(pm, encoding="utf-8") as f:
+                doc = yaml.safe_load(f)
+        except (OSError, yaml.YAMLError):
+            doc = None   # the pre-mortem check reports the parse failure
+        if isinstance(doc, dict):
+            ids = cited_prior_ids(doc.get("concerns") or [], set(by_id))
+            listed = doc.get("matching_prior_ids") or []
+            if isinstance(listed, list):
+                ids |= {x for x in listed if isinstance(x, str) and x in by_id}
+            hit.update({i: by_id[i] for i in ids})
+    return [by_id[i] for i in by_id if i in hit], err
 
 
 def prior(id_: str) -> ExpertPrior:
@@ -1040,6 +1217,54 @@ def _self_test() -> int:
         hits = [p_.id for p_ in matching_priors(q, 2026)
                 if "malaria" in _inferred_domain(p_)]
         ok(not hits, f"T-P21f: {q!r} matched malaria priors {hits}")
+
+    # T-42γ: requires_mechanism parsing, prior citation, run_priors.
+    mp = _from_dict({"id": "m1", "kind": "methodological_standard",
+                     "severity_if_unaddressed": "HIGH", "claim": "c", "rationale": "r",
+                     "applies_when": {"keywords_any": ["widget"], "domain_any": []},
+                     "requires_mechanism": {"id": "sub_group_mix", "description": "d",
+                                            "sufficiency_test": "vary the mix",
+                                            "when_data_columns_any": ["mix_"]}})
+    ok(len(mp.requires_mechanism) == 1 and mp.requires_mechanism[0].id == "sub_group_mix"
+       and mp.requires_mechanism[0].when_data_columns_any == ("mix_",),
+       "T-42a: a single-mapping requires_mechanism parses")
+    for bad in ({"id": "x"}, [{"id": "Bad Id", "description": "d", "sufficiency_test": "t"}],
+                [{"id": "a", "description": "d", "sufficiency_test": "t", "extra": 1}], "text"):
+        try:
+            _from_dict({"id": "m2", "kind": "external_fact", "severity_if_unaddressed": "LOW",
+                        "claim": "c", "rationale": "r", "applies_when": {},
+                        "requires_mechanism": bad})
+            ok(False, f"T-42b: malformed requires_mechanism {bad!r} must be rejected")
+        except ValueError:
+            pass
+    ok(cited_prior_ids({"evidence_files": ["expert_prior:m1", "plan.md"], "prior_id": "zz"},
+                       {"m1", "zz", "other"}) == {"m1", "zz"},
+       "T-42c: cited_prior_ids reads expert_prior:<id> and prior_id")
+    import json as _json
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as _d:
+        ok(run_question(_d) == (None, None, None), "T-42d: no metadata.json → no question, no error")
+        with open(os.path.join(_d, "metadata.json"), "w") as f:
+            f.write("{not json")
+        ok(run_question(_d)[2], "T-42e: unreadable metadata.json is an error (fail closed)")
+        with open(os.path.join(_d, "metadata.json"), "w") as f:
+            _json.dump({"question": "Allocate widget budgets"}, f)
+        got, err = run_priors(_d, priors=[mp])
+        ok(err is None and [p_.id for p_ in got] == ["m1"], f"T-42f: run_priors matches the question, got {got}")
+        with open(os.path.join(_d, "metadata.json"), "w") as f:
+            _json.dump({"question": "Allocate gadget budgets"}, f)
+        ok(run_priors(_d, priors=[mp])[0] == [], "T-42g: non-matching question → no priors")
+        with open(os.path.join(_d, "pre_mortem.yaml"), "w") as f:
+            f.write("concerns:\n  - id: PM-001\n    evidence_files: ['expert_prior:m1']\n")
+        ok([p_.id for p_ in run_priors(_d, priors=[mp])[0]] == ["m1"],
+           "T-42h: a prior the pre-mortem cites applies to the run")
+    dp = _from_dict({"id": "dp", "kind": "methodological_standard", "severity_if_unaddressed": "HIGH",
+                     "claim": "c", "rationale": "r",
+                     "applies_when": {"keywords_any": ["nets"], "domain_any": ["widgetitis"]}})
+    ok(domain_matches(dp, "Allocate the widgetitis budget", None) and not _matches(dp, "allocate the widgetitis budget", None),
+       "T-42i: domain_matches ignores keywords but needs the domain")
+    ok(not domain_matches(dp, "Allocate the gadget budget", None), "T-42j: no domain, no match")
+    ok(not domain_matches(mp, "Allocate widget budgets", None), "T-42k: a cross-disease prior never matches by domain alone")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)

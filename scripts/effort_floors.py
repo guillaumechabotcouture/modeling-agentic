@@ -201,7 +201,8 @@ def _calibration_evidence(run_dir: str) -> str | None:
     if os.path.isdir(models_dir):
         for fname in sorted(os.listdir(models_dir)):
             low = fname.lower()
-            if "calibrat" in low and fname != "calibration_result.yaml" \
+            # Phase 43 α: the calibration spec declares intent, not a fit.
+            if "calibrat" in low and fname not in ("calibration_result.yaml", "calibration_spec.yaml") \
                     and not low.endswith(".py"):
                 return f"models/{fname}"
     return None

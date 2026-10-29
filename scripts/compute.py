@@ -26,7 +26,7 @@ Backends (auto-selected):
          Tasks go to the cluster's workers except those listed in
          MA_COMPUTE_EXCLUDE_WORKERS (the run VMs, whose single thread is busy
          with the run). The run's `models/`, `data/` and the repo's `scripts/`
-         are bundled once and unpacked on each worker at the SAME absolute
+         and `toolkit/` are bundled once and unpacked on each worker at the SAME absolute
          paths, so model code with absolute paths works unchanged.
   local  otherwise: a process pool on this machine (cores - 1).
 
@@ -95,6 +95,8 @@ import traceback
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
+# Repo code a run's model may import (Phase 42 ε: toolkit/, e.g. toolkit/alloc).
+REPO_CODE_DIRS = ("scripts", "toolkit")
 DEFAULT_MAX_TASKS = 20000
 DEFAULT_MAX_FILE_MB = 100
 LEDGER_REL = os.path.join("models", "compute_ledger.json")
@@ -556,7 +558,7 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
 # --------------------------------------------------------------------------- #
 
 def make_bundle(run_dir: str, max_file_mb: float = DEFAULT_MAX_FILE_MB) -> tuple[bytes, dict]:
-    """tar.gz of the run's models/ and data/ and the repo's scripts/, with
+    """tar.gz of the run's models/ and data/ and the repo's scripts/ and toolkit/, with
     ABSOLUTE member paths so workers recreate the same layout."""
     run_dir = os.path.realpath(run_dir)
     skipped, n = [], 0
@@ -564,7 +566,8 @@ def make_bundle(run_dir: str, max_file_mb: float = DEFAULT_MAX_FILE_MB) -> tuple
     # dereference: symlinked inputs are stored as files (workers extract with
     # the "data" filter, which rejects absolute links).
     with tarfile.open(fileobj=buf, mode="w:gz", dereference=True) as t:
-        for root in (os.path.join(run_dir, "models"), os.path.join(run_dir, "data"), os.path.join(REPO, "scripts")):
+        for root in (os.path.join(run_dir, "models"), os.path.join(run_dir, "data"),
+                 *(os.path.join(REPO, x) for x in REPO_CODE_DIRS)):
             # Follow symlinked dirs; stop only at a loop (a dir that is its own
             # ancestor). Two names for one dir are both bundled: models use either.
             ancestors = {root: frozenset()}
@@ -862,10 +865,14 @@ WORKER_OPTIONS = {"nthreads": 1}
 # Phase 38: compute VMs in priority order across Azure VM families with separate core
 # quotas (8 vCPU, 64 GiB each). E7 attempt 7: workers were refused for most of the run at
 # 344 of 350 standardEv5Family cores, a quota shared with the subscription's other users.
-# Coiled tries a list in order for availability; fallback on a quota error is not yet
-# observed (a 2026-10-27 test found Ev5 with room).
+# Coiled tries a list in order for availability but does not fall back on a quota refusal
+# (E7 attempt 8: refused at 348 of 350 standardESv5Family cores with this list); the
+# launcher's overflow pool covers that (cloud/run_cluster.py, Phase 42 β).
 WORKER_VM_TYPES = ["Standard_E8s_v5", "Standard_E8as_v5", "Standard_E8ds_v5"]
-ADAPT_OPTIONS = {"target_duration": "20s"}
+# Phase 42 β: an idle VM is retired after interval x wait_count = 10 min (dask's default is
+# 5 s x 24 = 2 min), so consecutive batches reuse VMs; attempt 8 created 734 VMs in 18 h.
+# cloud/run_cluster.py derives these from RunConfig.scale_down_after / adapt_interval.
+ADAPT_OPTIONS = {"target_duration": "20s", "interval": "15s", "wait_count": 40}
 
 
 def register_compute_tags(client, exclude: list[str] | tuple = (), resource: str = "compute") -> None:
@@ -1699,7 +1706,7 @@ _FP_HASH_MB = 64           # files up to this size are fingerprinted by content,
 def code_fingerprint(run_dir: str, fn_spec: str, exclude=()) -> str:
     """What a result depends on besides its params: every file under the run's
     models/ and data/ (following symlinked directories) and the repo's
-    scripts/, except (outside data/) logs, figures, summaries, the ledger, and
+    scripts/ and toolkit/, except (outside data/) logs, figures, summaries, the ledger, and
     this call's own results file (`exclude`), and any batch's partial rows or
     detached-job record; files up to 64 MB by content, larger ones by
     size and mtime. Any change and earlier rows are not reused."""
@@ -1710,7 +1717,8 @@ def code_fingerprint(run_dir: str, fn_spec: str, exclude=()) -> str:
     skip = {os.path.realpath(x) for x in exclude}
     files = {fn_file}
     links = []
-    for root in (os.path.join(run_dir, "models"), os.path.join(run_dir, "data"), os.path.join(REPO, "scripts")):
+    for root in (os.path.join(run_dir, "models"), os.path.join(run_dir, "data"),
+                 *(os.path.join(REPO, x) for x in REPO_CODE_DIRS)):
         # Every path a model can use is walked, aliases included (each under its
         # own name); only a loop (a dir that is its own ancestor) stops the walk.
         ancestors = {root: frozenset()}
@@ -2017,7 +2025,9 @@ def _self_test() -> int:
         os.remove(os.path.join(d, "data", "link.txt"))
         names = tarfile.open(fileobj=io.BytesIO(b)).getnames()
         ok(any(n.endswith("models/fn.py") and not n.startswith("/") for n in names)
-           and any(n.endswith("scripts/compute.py") for n in names), f"C7 bundle has models/ and scripts/: {info}")
+           and any(n.endswith("scripts/compute.py") for n in names)
+           and any(n.endswith("toolkit/alloc/costs.py") for n in names),
+           f"C7 bundle has models/, scripts/ and toolkit/ (a run model may import toolkit.alloc): {info}")
         open(os.path.join(d, "models", "slow.py"), "w").write(
             "import os, time\n"
             "def sleep(p):\n    time.sleep(p['s']); return {'ok': 1}\n"

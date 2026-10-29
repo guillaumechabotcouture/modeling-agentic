@@ -392,6 +392,25 @@ def build(run_dir: str, round_n: int = 2) -> dict:
             {"name": "slope", "point_estimate": sl,
              "lower_bound": -1.5, "upper_bound": 2.0}]})
     _run_script("identifiability.py", run_dir)
+    # Phase 43 α B1: parameter roles and target metadata.
+    _w(run_dir, "models/calibration_spec.yaml", {
+        "question": "Which districts should the campaign budget fund?",
+        "parameters": [
+            {"name": "rate_scale", "role": "country_specific_uncertain", "calibrated": True,
+             "reason": "baseline incidence level is poorly observed in this setting",
+             "bounds": [0.3, 4.0], "bounds_basis": "pragmatic"},
+            {"name": "slope", "role": "country_specific_uncertain", "calibrated": True,
+             "reason": "the access gradient differs by setting and drives the ranking",
+             "bounds": [-1.5, 2.0], "bounds_basis": "pragmatic"},
+            {"name": "vaccine_efficacy", "role": "fixed_literature", "calibrated": False,
+             "reason": "trial estimate transfers across settings (registry: vaccine_efficacy)"},
+            {"name": "coverage", "role": "scenario_assumption", "calibrated": False,
+             "reason": "the campaign's planned coverage is a scenario input"}],
+        "targets": [{
+            "id": "district_cases", "quantity": "reported annual cases", "population": "each district",
+            "age": "under 5", "time": "one annual count", "units": "cases per year",
+            "source": "district surveillance case counts", "uncertainty": "Poisson counting error",
+            "provenance": "observed", "n": n}]})
     _w(run_dir, "models/identifiability_a_priori.yaml", {
         "stage": "pre_model", "round_drafted": 1,
         "calibration_targets": [{
@@ -642,7 +661,31 @@ def build(run_dir: str, round_n: int = 2) -> dict:
         "concerns": [{
             "id": "PM-001", "severity": "HIGH", "category": "DATA",
             "concern": "Reported case counts may under-ascertain incidence.",
-            "addressed_in": "modeling_strategy.md § Pre-mortem Responses"}]})
+            "addressed_in": "modeling_strategy.md § Pre-mortem Responses"}, {
+            # Phase 42 γ: targets for the D2 / D4 planted defects.
+            "id": "PM-002", "severity": "MEDIUM", "category": "FEASIBILITY",
+            "concern": "Cold-chain capacity may limit campaign reach.",
+            "suggested_check": "Document cold-chain capacity per district.",
+            "evidence_files": ["plan.md"],
+            "addressed_in": "modeling_strategy.md § Pre-mortem Responses"}, {
+            "id": "PM-003", "severity": "LOW", "category": "BLIND_SPOT",
+            "concern": "The access gradient may be mis-specified.",
+            "suggested_check": "Confirm the funded set is robust to a plausible range of the access slope.",
+            "evidence_files": ["plan.md"],
+            "addressed_in": ["modeling_strategy.md § Pre-mortem Responses",
+                             "models/sensitivity_access_slope.yaml"]}]})
+    _w(run_dir, "models/sensitivity_access_slope.yaml", {
+        "addresses": ["PM-003"], "varied": "access slope over its calibrated 95% interval",
+        "funded_set_changes": False})
+    # Phase 42 γ D1: one simplified mechanism with a passed sufficiency test.
+    _w(run_dir, "models/sufficiency_age_profile.yaml", {
+        "varied": "under-five share of the eligible population, plus or minus 20% per district",
+        "criterion": "the funded set changes in more than 10% of districts",
+        "decision_changes": False, "share_units_changed": 0.0, "share_threshold": 0.1})
+    _w(run_dir, "models/mechanism_manifest.yaml", {"mechanisms": [{
+        "id": "district_age_profile", "status": "simplified",
+        "assumption": "one age profile for every district",
+        "sufficiency_test": "models/sufficiency_age_profile.yaml"}]})
     _w(run_dir, "modeling_strategy.md",
        "# Modeling strategy\n\n## Pre-mortem Responses\n\n"
        "PM-001: incidence is calibrated to counts with a fitted scale "
@@ -731,7 +774,9 @@ def build(run_dir: str, round_n: int = 2) -> dict:
         ## Limitations
 
         Incidence depends on the reporting completeness of surveillance
-        counts.
+        counts. Every district shares one age profile; the sufficiency
+        test in models/sufficiency_age_profile.yaml found that the funded
+        set does not change.
         """))
     _run_script("render_claims.py", run_dir)
 

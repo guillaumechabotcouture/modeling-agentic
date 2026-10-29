@@ -467,11 +467,12 @@ async def brief_signoff(query_fn=None):
     run = tempfile.mkdtemp(prefix="ma_signoff_")
     yaml.safe_dump({"hard_blockers": [{"id": "HB-001", "criterion": "cost within envelope"}]},
                    open(os.path.join(run, "success_criteria.yaml"), "w"))
-    brief = {"question": "How should a programme allocate its budget across districts?",
-             "decision": "Package per district", "decision_maker": "Programme manager",
-             "answers": [{"id": "A1", "statement": "Package per district", "resolution": "district"}],
-             "objective": "Maximise DALYs averted", "acceptance": ["HB-001"],
-             "open_questions": [{"id": "Q1", "question": "Is continuity a constraint?", "proposed": "No"}]}
+    brief = db.example_brief(question="How should a programme allocate its budget across districts?",
+                             decision="Package per district", decision_maker="Programme manager",
+                             answers=[{"id": "A1", "statement": "Package per district", "resolution": "district"}],
+                             objective="Maximise DALYs averted",
+                             open_questions=[{"id": "Q1", "question": "Is continuity a constraint?", "proposed": "No",
+                                              "basis": "decision"}])
     brief_path = os.path.join(run, "decision_brief.yaml")
     trace = open(os.path.join(run, "trace.jsonl"), "a")
     hooks = create_hooks(run, trace, datetime.now(), registered_agents={"planner", "data-agent"}, signoff="owner")
