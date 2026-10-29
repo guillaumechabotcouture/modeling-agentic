@@ -57,6 +57,13 @@ killed batch keeps them. `map --detach` runs the batch in its own session
 and returns at once; `compute.py status <out>` / `wait <out> --timeout-s S`
 follow it (exit 0 finished, 1 finished with failed rows, 3 still running,
 4 died or no job).
+A recorded pid (pool process, registered chunk) is signalled only while its
+current start token equals the saved one; otherwise it is left alone and the
+call charged in full. Start tokens come from /proc, else psutil, else `ps` (run
+in UTC and the C locale). Known limit: on a machine with neither /proc nor
+psutil, tokens saved by a build before this normalisation differ from the new
+ones for the same process, so a caller of that build still running across the
+upgrade may be taken for dead. Linux VMs read /proc and are unaffected.
 
 Known limits: a process the model starts in its own session (setsid,
 daemonizing) escapes the kill on a stop. Work redone by dask after a worker
@@ -755,18 +762,37 @@ def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: lis
             "summary": csum if isinstance(csum, dict) else None, "stderr_tail": (err or "")[-300:]}
 
 
-def _stop_chunk(pid: int, grace_s: float = 5.0):
+def _same_process(pid: int, token: str | None) -> bool:
+    """Is `pid` still the process recorded with start `token`? Only when its
+    current token is read and equal; unknown on either side is not."""
+    cur = _pid_start(pid)
+    return bool(token and cur and cur == token)
+
+
+def _stop_chunk(pid: int, grace_s: float = 5.0, token: str | None = None) -> bool:
     """SIGTERM a chunk subprocess's group (its handler kills its pool), then
-    SIGKILL the group after the grace period."""
+    SIGKILL the group after the grace period. Returns whether it is stopped.
+
+    `token`: a pid read from a registration (not our own unreaped child) is
+    signalled only while its current start token still equals this one,
+    checked before EVERY signal; once it no longer verifies, nothing more is
+    sent and a group still alive counts as not stopped (unconfirmed)."""
     import signal
+    if token is not None and not _same_process(pid, token):
+        return not (_pid_alive(pid) or _group_alive(pid))
     _killpg(pid, signal.SIGTERM)       # group only: the chunk is its session leader
     end = time.time() + grace_s
     while time.time() < end and _group_alive(pid):
         time.sleep(0.1)
+    if not _group_alive(pid):
+        return True
+    if token is not None and not _same_process(pid, token):
+        return False                   # identity lost during the grace period: not signalled again
     _killpg(pid, signal.SIGKILL)
     end = time.time() + 5
     while time.time() < end and _group_alive(pid):   # SIGKILL is not instant; confirm
         time.sleep(0.05)
+    return not _group_alive(pid)
 
 
 def _cancel_call(call_id: str) -> int:
@@ -782,16 +808,23 @@ def _cancel_call(call_id: str) -> int:
     n, unverified = 0, False
     for name in os.listdir(calls):
         if name.isdigit():
+            pid = int(name)
             try:
                 _, _, tok = open(os.path.join(calls, name)).read().partition(" ")
-            except OSError:
+            except FileNotFoundError:
                 continue                          # unregistered as we looked: the chunk has ended
-            tok, cur = tok.strip(), _pid_start(int(name))
+            except OSError:
+                unverified = True                 # cannot read who it is: not signalled
+                continue
+            tok, cur = tok.strip(), _pid_start(pid)
             if tok and cur and cur == tok:
-                _stop_chunk(int(name))
+                if not _stop_chunk(pid, token=tok):
+                    unverified = True
                 n += 1
-            elif not (tok and cur) and (_pid_alive(int(name)) or _group_alive(int(name))):
-                unverified = True
+            elif tok and cur and cur.split(":")[0] == tok.split(":")[0]:
+                continue                          # read the same way, different: pid reused, ours ended
+            elif _pid_alive(pid) or _group_alive(pid):
+                unverified = True                 # no token, unreadable, or read another way
     return -1 if unverified else n
 
 
@@ -2620,6 +2653,51 @@ def _self_test_p42(ok) -> None:
                f"P42-3d a pid recorded with token {saved!r} is not signalled ({stopped3d}, {how3d})")
         bystander.kill()
         bystander.wait()
+
+        # P42-3e (bug: _stop_chunk sent SIGKILL after the SIGTERM wait without
+        # re-checking identity): a chunk ignoring SIGTERM whose identity no longer
+        # verifies after the grace period is not SIGKILLed, and is reported unstopped.
+        stub = track(_sp.Popen([sys.executable, "-c", "import signal, time; "
+                                "signal.signal(signal.SIGTERM, signal.SIG_IGN); print('ready', flush=True); "
+                                "time.sleep(120)"], start_new_session=True, stdout=_sp.PIPE, text=True))
+        stub.stdout.readline()                    # its SIGTERM handler is installed
+        tok3e = _pid_start(stub.pid)
+        real_start, calls3e = _pid_start, []
+
+        def flaky_start(pid):                     # identity verifies once, then reads as another process
+            calls3e.append(pid)
+            return real_start(pid) if len(calls3e) == 1 else (tok3e or "x:") + "-reused"
+        globals()["_pid_start"] = flaky_start
+        try:
+            res3e = _stop_chunk(stub.pid, grace_s=0.3, token=tok3e)
+        finally:
+            globals()["_pid_start"] = real_start
+        ok(tok3e and res3e is False and stub.poll() is None,
+           f"P42-3e no SIGKILL once identity is lost during the grace period ({res3e}, alive {stub.poll() is None})")
+        # P42-3f (bug: _cancel_call skipped unreadable registrations and tokens read
+        # another way, reporting the call cancelled): both are unconfirmed (-1), not signalled.
+        import uuid as _uuid
+        for what in ("other kind", "unreadable"):
+            cid = "selftest-p42-" + _uuid.uuid4().hex
+            cdir_ = os.path.join(tempfile.gettempdir(), _CALLS_DIR, cid)
+            os.makedirs(cdir_)
+            reg = os.path.join(cdir_, str(stub.pid))
+            cur = _pid_start(stub.pid) or ""
+            other = "proc:1" if not cur.startswith("proc:") else "psutil:1.00"
+            open(reg, "w").write(f"{stub.pid} {other}")
+            if what == "unreadable":
+                os.chmod(reg, 0)
+            try:
+                got3f = _cancel_call(cid)
+            finally:
+                os.chmod(reg, 0o600)
+                import shutil as _sh
+                _sh.rmtree(cdir_, ignore_errors=True)
+            readable = what != "unreadable" or os.geteuid() != 0     # root reads a 000 file
+            ok(not readable or (got3f == -1 and stub.poll() is None),
+               f"P42-3f a registration with {what} token is unconfirmed and not signalled: {got3f}")
+        stub.kill()
+        stub.wait()
 
         # P42-2 (bug: a dead caller was charged its whole reservation): a zombie
         # caller with a progress record is charged its work, and released.
