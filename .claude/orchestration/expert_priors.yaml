@@ -74,6 +74,17 @@ domain_vocabulary:
 #       found_via            bootstrap | semantic_scholar | websearch | manual
 #       excerpt              optional supporting quote
 #   found_in_runs            run-dir basenames where the concern was raised
+#   requires_mechanism       Phase 42: optional; a list of mappings (one
+#                            mapping also accepted) naming mechanisms the
+#                            model must record in models/mechanism_manifest.yaml:
+#     - id                   stable snake_case id (the manifest key)
+#       description          what the model must represent
+#       sufficiency_test     what to vary, over what plausible range, and
+#                            what counts as a decision change
+#       when_data_columns_any  optional; case-insensitive substrings of
+#                            processed-data column names; the mechanism is
+#                            required only when some data CSV column
+#                            contains one
 
 priors:
 
@@ -622,3 +633,383 @@ priors:
         excerpt: |
           2017 Nigeria ITN campaign achieved ~70% household ownership
           target across surveyed states.
+
+  # ------------------------------------------------------------------- #
+  # Phase 42 δ: mechanism priors. Each carries `requires_mechanism`
+  # (schema above). The run records each listed mechanism in
+  # models/mechanism_manifest.yaml under the same `id`, as modelled,
+  # fixed, or simplified; a simplified mechanism carries the result
+  # of its sufficiency test. The severity makes the test required,
+  # not the feature: if the test shows no decision change, the
+  # simplification stands and the report cites the test.
+  # ------------------------------------------------------------------- #
+
+  - id: malaria_vector_bionomics_by_species
+    kind: methodological_standard
+    severity_if_unaddressed: HIGH
+    claim: |
+      Anopheles vector bionomics differ by species, so the effect of
+      ITNs and IRS depends on the local species mix. The
+      malariasimulation presets (R/vector_parameters.R) are, for
+      anthropophagy Q0, proportion of bites taken in bed φ_B
+      (phi_bednets), proportion taken indoors φ_I (phi_indoors) and
+      daily adult mortality μ (mum): An. gambiae s.s. 0.92 / 0.85 /
+      0.90 / 0.132; An. arabiensis 0.71 / 0.80 / 0.86 / 0.132;
+      An. funestus 0.94 / 0.78 / 0.87 / 0.112. A model that applies
+      one species' values everywhere overstates ITN and IRS impact
+      where the more zoophagic An. arabiensis dominates (Q0 0.71 vs
+      0.92). When the processed data carry species abundance by
+      unit, the single-vector simplification needs a sufficiency
+      test against species-weighted bionomics.
+    canonical_value:
+      gambiae:    {Q0: 0.92, phi_bednets: 0.85, phi_indoors: 0.90, mum: 0.132}
+      arabiensis: {Q0: 0.71, phi_bednets: 0.80, phi_indoors: 0.86, mum: 0.132}
+      funestus:   {Q0: 0.94, phi_bednets: 0.78, phi_indoors: 0.87, mum: 0.112}
+    units: "Q0, phi_* proportions; mum per day"
+    applies_when:
+      domain_any: ["malaria"]
+      keywords_any: ["itn", "llin", "bednet", "bed net", "nets",
+                     "insecticide-treated net", "pbo", "dual-ai",
+                     "dual ai", "chlorfenapyr", "irs",
+                     "indoor residual spraying", "vector control"]
+    requires_mechanism:
+      - id: vector_bionomics_by_species
+        description: |
+          Vector bionomics (Q0, φ_B, φ_I, μ) are set per allocation
+          unit from the unit's Anopheles species mix (separate
+          species, or abundance-weighted bionomics), not one
+          species' values applied to every unit. The ITN and IRS
+          effect is computed with those bionomics.
+        sufficiency_test: |
+          Run the model with the single-vector default and again with
+          species-weighted bionomics (the per-species values in
+          canonical_value, weighted by each unit's abundance), across
+          the units' observed abundance range. Recalibrate
+          transmission (e.g. baseline EIR or larval capacity) in the
+          species-weighted run so each unit reproduces the same
+          baseline prevalence. The simplification fails if the
+          recommended intervention package changes for more than the
+          share of units stated in advance in the manifest (default
+          10% of units or of population at risk), or if the headline
+          outcome moves outside its uncertainty interval.
+        when_data_columns_any: ["arabiensis", "gambiae", "funestus",
+                                "coluzzii", "species_abundance",
+                                "species_composition",
+                                "species_proportion", "vector_species"]
+    acknowledgment_hints:
+      ["species mix", "species composition", "species-weighted",
+       "An. arabiensis", "arabiensis", "vector bionomics",
+       "anthropophagy", "Sherrard-Smith 2019"]
+    rationale: |
+      In the 2026-10 attempt-8 run (Nigeria allocation), the processed
+      data held species abundance for every allocation unit, but no
+      model code read it; one set of bionomics was used everywhere.
+      North of 11°N (the highest-prevalence, core seasonal-
+      chemoprevention area) the population-weighted mix was about 67%
+      An. arabiensis, an effective Q0 of about 0.78 rather than 0.92.
+      Trial benchmarks still passed because vector-control strength
+      was tuned to trial sites with a different species mix. The
+      pre-mortem rated the concern LOW and it was closed without a
+      test (docs/design/improvement-plan.md, workstream D).
+    last_literature_check: 2026-10-29
+    literature_corroboration:
+      - source_type: tool
+        citation: "mrc-ide/malariasimulation, R/vector_parameters.R (gamb_params, arab_params, fun_params), commit 5bc90284bf893c2677762ab9a65abd5914d72e1e (2025-01-29). https://github.com/mrc-ide/malariasimulation/blob/5bc90284bf893c2677762ab9a65abd5914d72e1e/R/vector_parameters.R"
+        doi_or_pmid: null
+        year: 2025
+        relevance: primary
+        found_via: manual
+        excerpt: |
+          gamb_params: Q0 = .92, phi_bednets = .85, phi_indoors = .90,
+          mum = .132. arab_params: Q0 = .71, phi_bednets = .8,
+          phi_indoors = .86, mum = .132. fun_params: Q0 = .94,
+          phi_bednets = .78, phi_indoors = .87, mum = .112. Source
+          comments: phi values from Sherrard-Smith et al. 2019 PNAS;
+          Q0 estimated in Griffin et al. 2010 PLoS Med.
+      - source_type: paper
+        citation: "Sherrard-Smith E, Skarp JE, Beale AD, et al. Mosquito feeding behavior and how it influences residual malaria transmission across Africa. Proc Natl Acad Sci USA 2019;116(30):15086-15095."
+        doi_or_pmid: "10.1073/pnas.1820646116"
+        year: 2019
+        relevance: primary
+        found_via: manual
+        excerpt: |
+          (Abstract, PMID 31285346.) On average 79% of bites by the
+          major malaria vectors occur during the time when people are
+          in bed. ... Substantial spatial heterogeneity in mosquito
+          biting behavior between communities could contribute to
+          differences in effectiveness of malaria control across
+          Africa.
+      - source_type: paper
+        citation: "Griffin JT, Hollingsworth TD, Okell LC, et al. Reducing Plasmodium falciparum malaria transmission in Africa: a model-based evaluation of intervention strategies. PLoS Med 2010;7(8):e1000324."
+        doi_or_pmid: "10.1371/journal.pmed.1000324"
+        year: 2010
+        relevance: corroborating
+        found_via: manual
+        excerpt: |
+          (Abstract, PMID 20711482.) Model incorporating the three
+          major vector species (An. gambiae s.s., An. arabiensis, and
+          An. funestus). In the third moderate-transmission setting
+          (EIR = 46) with An. arabiensis prevailing, these
+          interventions are insufficient to reach this threshold.
+      - source_type: paper
+        citation: "Sinka ME, Bangs MJ, Manguin S, et al. The dominant Anopheles vectors of human malaria in Africa, Europe and the Middle East: occurrence data, distribution maps and bionomic précis. Parasit Vectors 2010;3:117."
+        doi_or_pmid: "10.1186/1756-3305-3-117"
+        year: 2010
+        relevance: supporting
+        found_via: manual
+        excerpt: |
+          (Abstract, PMID 21129198.) Predictive distribution maps for
+          An. arabiensis, An. funestus, An. gambiae and other dominant
+          vector species, presented alongside a bionomics summary for
+          each species relevant to its control.
+    found_in_runs: []
+
+  - id: malaria_resistance_to_net_efficacy_published_curve
+    kind: methodological_standard
+    severity_if_unaddressed: HIGH
+    claim: |
+      The effect of pyrethroid resistance on ITN efficacy (mosquito
+      mortality, deterrence, feeding inhibition), and how that differs
+      between pyrethroid-only and pyrethroid-PBO nets, should follow a
+      published relationship fitted to experimental hut trials and
+      discriminating-dose bioassays (Churcher et al. 2016 eLife; Nash
+      et al. 2021; Sherrard-Smith et al. 2022 Lancet Planet Health),
+      not an ad hoc scaling of a pooled effect size. Nash et al. 2021
+      describe the hut-outcome-to-bioassay relationship as highly
+      uncertain, so its credible range must be carried through to the
+      net-type choice.
+    applies_when:
+      domain_any: ["malaria"]
+      keywords_any: ["itn", "llin", "bednet", "bed net", "nets",
+                     "insecticide-treated net", "pbo", "dual-ai",
+                     "dual ai", "chlorfenapyr", "pyrethroid",
+                     "net type", "insecticide resistance"]
+    requires_mechanism:
+      - id: resistance_to_net_efficacy
+        description: |
+          Per-unit net efficacy parameters (killing, deterrence or
+          repellence, feeding inhibition, and their decay) are derived
+          from the unit's insecticide resistance through a published
+          hut-trial relationship, separately for each net type
+          compared.
+        sufficiency_test: |
+          Replace the model's resistance-to-efficacy mapping with the
+          published curve (Churcher 2016 / Nash 2021 /
+          Sherrard-Smith 2022 parameterisation) for each net type,
+          evaluated at the units' observed resistance values, and
+          again at the lower and upper ends of the curve's credible
+          interval. Recalibrate to the same baseline prevalence. The
+          model's mapping fails if the chosen net type changes for
+          more than the share of units stated in advance in the
+          manifest (default 10% of units or of population at risk),
+          or if the headline outcome moves outside its uncertainty
+          interval.
+        when_data_columns_any: ["pyrethroid", "insecticide",
+                                "bioassay", "kdr",
+                                "vector_resistance",
+                                "resistance_intensity",
+                                "phenotypic_resistance"]
+    acknowledgment_hints:
+      ["Churcher 2016", "Nash 2021", "Sherrard-Smith 2022",
+       "hut trial", "experimental hut", "bioassay mortality",
+       "resistance-efficacy", "resistance to efficacy"]
+    rationale: |
+      Net-type choice (pyrethroid-only vs PBO vs dual-AI) is a common
+      allocation decision, and its ranking turns on how efficacy falls
+      with resistance. A model that scales a pre-resistance pooled
+      odds ratio by an assumed factor can rank net types differently
+      from the published hut-trial fit, and calibration to prevalence
+      alone does not detect it. Complements
+      standard_llin_or_pre_resistance (data vintage of the pooled OR)
+      and the malaria-modeling skill, Pitfall 4.
+    last_literature_check: 2026-10-29
+    literature_corroboration:
+      - source_type: meta_analysis
+        citation: "Churcher TS, Lissenden N, Griffin JT, Worrall E, Ranson H. The impact of pyrethroid resistance on the efficacy and effectiveness of bednets for malaria control in Africa. eLife 2016;5:e16090."
+        doi_or_pmid: "10.7554/eLife.16090"
+        year: 2016
+        relevance: primary
+        found_via: manual
+        excerpt: |
+          (Abstract, PMID 27547988.) Meta-analyses of bioassay studies
+          and experimental hut trials are used to characterise how
+          pyrethroid resistance changes the efficacy of standard
+          bednets, and those containing the synergist piperonyl
+          butoxide (PBO) ... even low levels of resistance would
+          increase the incidence of malaria.
+      - source_type: meta_analysis
+        citation: "Nash RK, Lambert B, N'Guessan R, et al. Systematic review of the entomological impact of insecticide-treated nets evaluated using experimental hut trials in Africa. Curr Res Parasitol Vector Borne Dis 2021;1:100047."
+        doi_or_pmid: "10.1016/j.crpvbd.2021.100047"
+        year: 2021
+        relevance: corroborating
+        found_via: manual
+        excerpt: |
+          (Abstract, PMID 35284856.) As resistance rises, the
+          entomological efficacy of ITNs declines. ... The
+          relationship between EHT outcomes and the level of
+          resistance (as measured by discriminating dose bioassays) is
+          highly uncertain.
+      - source_type: paper
+        citation: "Sherrard-Smith E, Winskill P, Hamlet A, et al. Optimising the deployment of vector control tools against malaria: a data-informed modelling study. Lancet Planet Health 2022;6(2):e100-e109 (erratum e191)."
+        doi_or_pmid: "10.1016/S2542-5196(21)00296-5"
+        year: 2022
+        relevance: corroborating
+        found_via: manual
+        excerpt: |
+          (Abstract, PMID 35065707.) Published experimental hut trial
+          data used to characterise pyrethroid-only versus
+          pyrethroid-PBO ITNs and parameterise a transmission model
+          validated against RCTs in Tanzania and Uganda; the
+          additional benefit of PBO nets is highly variable and
+          depends on the setting.
+    found_in_runs: []
+
+  - id: measles_age_structured_mixing_and_maternal_immunity
+    kind: methodological_standard
+    severity_if_unaddressed: HIGH
+    claim: |
+      The effect of measles routine-schedule and campaign choices
+      (MCV1 age, campaign target age band, timing) depends on
+      age-structured contact patterns and on how long maternal
+      antibody protects infants. Contacts are strongly assortative by
+      age (Mossong et al. 2008; Prem et al. 2017 project matrices to
+      152 countries), and contact-adjusted immunity predicts outbreaks
+      better than a single herd-immunity threshold (Funk et al. 2019).
+      Maternal antibody can wane within months, earlier in infants of
+      vaccinated mothers (Leuridan et al. 2010: median 0.97 months vs
+      3.78 months for naturally immune mothers). A model with
+      homogeneous mixing or a fixed maternal-immunity period can
+      misplace the immunity gap the programme is choosing to close.
+    applies_when:
+      domain_any: ["measles", "mcv1", "mcv2"]
+      keywords_any: ["campaign", "sia", "supplementary immunization",
+                     "supplementary immunisation", "routine",
+                     "mcv1", "mcv2", "schedule", "target age",
+                     "age at vaccination", "catch-up", "follow-up",
+                     "outbreak response", "immunity gap"]
+    requires_mechanism:
+      - id: age_structured_contacts
+        description: |
+          Transmission uses an age-structured contact matrix for the
+          setting (a local survey, or a country-projected matrix such
+          as Prem et al.), not homogeneous mixing, so the force of
+          infection by age reflects who mixes with whom.
+        sufficiency_test: |
+          Run the model with homogeneous mixing and again with the
+          setting's projected age-structured matrix. Recalibrate each
+          to the same observed data (age distribution of cases, or
+          age-specific seroprevalence, and incidence). The
+          simplification fails if the recommended campaign target age
+          band or timing, or the routine-vs-campaign ranking, changes
+          for more than the share of units stated in advance in the
+          manifest (default 10% of units or of the target population),
+          or if the headline outcome moves outside its uncertainty
+          interval.
+      - id: maternal_antibody_waning
+        description: |
+          Infants are protected by maternal antibody for an
+          age-dependent period, after which they become susceptible
+          before MCV1. The duration is a parameter (by maternal
+          immunity source where known), not a fixed assumption
+          hidden in the age at which susceptibility starts.
+        sufficiency_test: |
+          Vary the mean duration of maternal protection over the
+          published range, from about 1 month (infants of vaccinated
+          mothers; Leuridan et al. 2010 median 0.97 months) to about
+          4 months (naturally immune mothers; median 3.78 months),
+          with the upper end extended to 6 months, by which over 95%
+          of infants in that study had lost maternal antibody.
+          Recalibrate to the same observed data. The fixed assumption
+          fails if the recommended MCV1 age, campaign lower age bound
+          or campaign timing changes for more than the share of units
+          stated in advance in the manifest (default 10%), or if the
+          headline outcome moves outside its uncertainty interval.
+    acknowledgment_hints:
+      ["contact matrix", "age-structured mixing", "POLYMOD",
+       "Prem 2017", "maternal antibod", "maternal immunity",
+       "Leuridan", "contact-adjusted immunity", "Funk 2019"]
+    rationale: |
+      Workstream D (docs/design/improvement-plan.md) names this as the
+      measles instance of the general pattern: the setting varies in a
+      way the data can capture (age-specific contacts and immunity)
+      and the model collapses it. Campaign target ages and MCV1 timing
+      are decisions about where the age-specific immunity gap lies; a
+      model without age-structured mixing and maternal waning cannot
+      place that gap, yet it can still match aggregate incidence.
+      Added for D8 so the mechanism rules have a non-malaria source.
+    last_literature_check: 2026-10-29
+    literature_corroboration:
+      - source_type: paper
+        citation: "Mossong J, Hens N, Jit M, et al. Social contacts and mixing patterns relevant to the spread of infectious diseases. PLoS Med 2008;5(3):e74."
+        doi_or_pmid: "10.1371/journal.pmed.0050074"
+        year: 2008
+        relevance: primary
+        found_via: manual
+        excerpt: |
+          (Abstract, PMID 18366252.) Although mixing patterns are
+          known to be crucial determinants for model outcome,
+          researchers often rely on a priori contact assumptions with
+          little or no empirical basis. ... Contact patterns were
+          highly assortative with age.
+      - source_type: paper
+        citation: "Funk S, Knapp JK, Lebo E, et al. Combining serological and contact data to derive target immunity levels for achieving and maintaining measles elimination. BMC Med 2019;17:180."
+        doi_or_pmid: "10.1186/s12916-019-1413-7"
+        year: 2019
+        relevance: primary
+        found_via: manual
+        excerpt: |
+          (Abstract, PMID 31551070.) Contact-adjusted immunity levels
+          predicted whether countries would experience outbreaks in
+          the following decade in about 70% of countries; 95% immunity
+          would have to be achieved by the age of five and maintained
+          across older age groups.
+      - source_type: paper
+        citation: "Prem K, Cook AR, Jit M. Projecting social contact matrices in 152 countries using contact surveys and demographic data. PLoS Comput Biol 2017;13(9):e1005697."
+        doi_or_pmid: "10.1371/journal.pcbi.1005697"
+        year: 2017
+        relevance: corroborating
+        found_via: manual
+        excerpt: |
+          (Abstract, PMID 28898249.) POLYMOD contact data projected to
+          144 other countries. Contacts are highly assortative with
+          age across all countries considered, but pronounced regional
+          differences in the age-specific contacts at home.
+      - source_type: paper
+        citation: "Leuridan E, Hens N, Hutse V, Ieven M, Aerts M, Van Damme P. Early waning of maternal measles antibodies in era of measles elimination: longitudinal study. BMJ 2010;340:c1626."
+        doi_or_pmid: "10.1136/bmj.c1626"
+        year: 2010
+        relevance: corroborating
+        found_via: manual
+        excerpt: |
+          (Abstract, PMID 20483946.) Presence of maternal antibodies
+          endured for a median of 2.61 months: 3.78 months for infants
+          of naturally infected women and 0.97 months for infants of
+          vaccinated women. At 6 months of age, more than 99% of
+          infants of vaccinated women and 95% of infants of naturally
+          immune women had lost maternal antibodies.
+      - source_type: meta_analysis
+        citation: "Guerra FM, Crowcroft NS, Friedman L, et al. Waning of measles maternal antibody in infants in measles elimination settings: a systematic literature review. Vaccine 2018;36(10):1248-1255."
+        doi_or_pmid: "10.1016/j.vaccine.2018.01.002"
+        year: 2018
+        relevance: supporting
+        found_via: manual
+        excerpt: |
+          (Abstract, PMID 29398276.) In elimination settings, where
+          most immunity is from immunization, maternal antibody levels
+          are lower, infant immunity wanes earlier, and the
+          susceptibility gap before infant immunization is wider. Note:
+          elimination settings only; durations in high-transmission
+          settings may be longer.
+      - source_type: report
+        citation: "WHO. Measles vaccines: WHO position paper, April 2017. Wkly Epidemiol Rec 2017;92(17):205-227."
+        doi_or_pmid: "PMID:28459148"
+        year: 2017
+        relevance: contextual
+        found_via: manual
+        excerpt: |
+          (Paraphrase; the full text was not re-read for this entry.)
+          The recommended age for MCV1 differs by transmission
+          setting (9 months where transmission continues, 12 months
+          where it is low), a choice driven by maternal-antibody
+          interference and infant risk.
+    found_in_runs: []

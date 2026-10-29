@@ -113,6 +113,21 @@ parameter depends on:
 **If the policy question involves net type selection or resistance
 scenarios:** model at least 2 net types with different efficacy profiles.
 
+**If the processed data carry Anopheles species abundance by unit:**
+a single-vector model is a simplification that needs a sufficiency
+test. Record `vector_bionomics_by_species` in
+`models/mechanism_manifest.yaml`. Either model the species mix, or
+keep one vector and run the test: compare species-weighted bionomics
+over the units' abundance range with the single-vector default,
+recalibrate both to the same baseline prevalence, and report whether
+the package choice or the headline changes. The per-species values,
+their sources and the decision-change criterion are in the
+`malaria_vector_bionomics_by_species` prior in
+`.claude/orchestration/expert_priors.yaml`; use those, not numbers
+restated here. When resistance data exist, the same applies to
+`resistance_to_net_efficacy` (prior
+`malaria_resistance_to_net_efficacy_published_curve`).
+
 **Key reference:** Protopopoff et al. 2018 (Lancet): PBO nets achieved
 44% lower malaria prevalence than standard LLINs after 2 years in a
 pyrethroid-resistance setting.
