@@ -247,6 +247,8 @@ def create_run_dir(question: str) -> str:
     metadata = {
         "question": question,
         "started": datetime.now().isoformat(),
+        # Phase 42 ε: trace times are naive local times; this is their zone.
+        "utc_offset_s": int(datetime.now().astimezone().utcoffset().total_seconds()),
         "run_dir": run_name,
     }
     with open(os.path.join(run_path, "metadata.json"), "x") as f:

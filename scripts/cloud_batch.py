@@ -126,9 +126,25 @@ class CostEstimate:
     note: str = ""
 
 
+def models_tarball(models_dir: str) -> io.BytesIO:
+    """models/ for worker-side import, with the repo's toolkit/ beside it (Phase 42 ε:
+    run code imports toolkit.alloc, finding the repo root as the first parent of its
+    file that holds toolkit/alloc; on a worker that is the task directory)."""
+    import tarfile
+    buf = io.BytesIO()
+    toolkit = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "toolkit")
+    skip = lambda ti: None if "__pycache__" in ti.name.split("/") else ti  # noqa: E731
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        tar.add(models_dir, arcname="models")
+        if os.path.isdir(toolkit):
+            tar.add(toolkit, arcname="toolkit", filter=skip)
+    return buf
+
+
 # ---------------------------------------------------------------------------
 # Cost estimation (pure, no SDK calls)
 # ---------------------------------------------------------------------------
+
 
 def estimate_cost(n_tasks: int, avg_task_seconds: float, vm_size: str,
                   max_nodes: int, low_priority: bool = True) -> CostEstimate:
@@ -617,10 +633,7 @@ class BatchRunner:
         if models_dir:
             if not os.path.isdir(models_dir):
                 raise FileNotFoundError(f"models_dir not a directory: {models_dir}")
-            import tarfile
-            tar_buf = io.BytesIO()
-            with tarfile.open(fileobj=tar_buf, mode="w:gz") as tar:
-                tar.add(models_dir, arcname="models")
+            tar_buf = models_tarball(models_dir)
             tar_blob = f"{job_id}/models.tar.gz"
             self._upload_blob(tar_blob, tar_buf.getvalue())
             models_sas = self._generate_sas_url(tar_blob, access="r")
@@ -1070,6 +1083,17 @@ def _run_offline_self_test() -> int:
             res = r.wait_and_collect(job, timeout_minutes=1, poll_seconds=0)
         ok(res and res[0].get("result") == 25,
            f"L8: flaky task.list retried; got {res}")
+    # L9 (Phase 42 ε): the worker archive carries toolkit/ beside models/, so the
+    # prescribed `from toolkit.alloc import ...` resolves in the task directory.
+    import tarfile as _tarfile
+    import tempfile as _tempfile
+    with _tempfile.TemporaryDirectory() as _d:
+        os.makedirs(os.path.join(_d, "models"))
+        open(os.path.join(_d, "models", "outcome_fn.py"), "w").write("x = 1\n")
+        _names = _tarfile.open(fileobj=io.BytesIO(models_tarball(os.path.join(_d, "models")).getvalue())).getnames()
+    ok("models/outcome_fn.py" in _names and "toolkit/alloc/costs.py" in _names
+       and not any("__pycache__" in n for n in _names),
+       f"L9: the worker archive has models/ and toolkit/: {sorted(_names)[:8]}")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)
