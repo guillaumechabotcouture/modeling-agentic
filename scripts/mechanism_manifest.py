@@ -191,6 +191,32 @@ def _load_manifest(run_dir: str) -> tuple[dict | None, list[dict], bool]:
     return entries, out, True
 
 
+def _defines(text: str, sym: str, is_py: bool) -> bool:
+    """`sym` (or the last part of a dotted name) is defined in the code: a
+    def / class / assignment target, not a comment or a string (Codex review)."""
+    name = sym.split(".")[-1]
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        return False
+    if is_py:
+        import ast
+        try:
+            tree = ast.parse(text)
+        except (SyntaxError, ValueError):
+            return False
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == name:
+                return True
+            targets = node.targets if isinstance(node, ast.Assign) else (
+                [node.target] if isinstance(node, (ast.AnnAssign, ast.AugAssign)) else [])
+            for t in targets:
+                for n in ast.walk(t):
+                    if (isinstance(n, ast.Name) and n.id == name) or (isinstance(n, ast.Attribute) and n.attr == name):
+                        return True
+        return False
+    return re.search(r"^\s*(?:function\s+" + re.escape(name) + r"\b|" + re.escape(name)
+                     + r"\s*(?:<-|=(?!=)))", text, re.M) is not None
+
+
 def _load_result(path: str):
     with open(path, encoding="utf-8") as f:
         text = f.read()
@@ -217,8 +243,7 @@ def _check_entry(run_dir: str, mid: str, e: dict, late: str, report: str | None)
             try:
                 with open(p, encoding="utf-8") as f:
                     text = f.read()
-                found = not sym.strip() or re.search(r"(?<![A-Za-z0-9_])" + re.escape(sym.strip())
-                                                     + r"(?![A-Za-z0-9_])", text) is not None
+                found = _defines(text, sym.strip(), p.lower().endswith(".py"))
             except (OSError, UnicodeDecodeError):
                 found = False
         if not found:
@@ -259,9 +284,9 @@ def _check_entry(run_dir: str, mid: str, e: dict, late: str, report: str | None)
             return out
         share, thr = _num(res.get("share_units_changed")), _num(res.get("share_threshold"))
         given = [k for k in ("share_units_changed", "share_threshold") if res.get(k) is not None]
-        if given and (share is None or thr is None):
+        if given and (share is None or thr is None or not 0 <= share <= 1 or not 0 <= thr <= 1):
             out.append(_f("mechanism_manifest_invalid", "HIGH",
-                          f"`{rel}`: share_units_changed and share_threshold must both be finite numbers when "
+                          f"`{rel}`: share_units_changed and share_threshold must both be fractions in [0, 1] when "
                           f"either is given (got {res.get('share_units_changed')!r}, {res.get('share_threshold')!r})."))
         if share is not None and thr is not None and (share > thr) != res["decision_changes"]:
             out.append(_f("mechanism_manifest_invalid", "HIGH",
@@ -381,6 +406,9 @@ def _self_test() -> int:
         w(d, "models/suff.yaml", {"varied": "mix", "criterion": "c", "decision_changes": False,
                                   "share_units_changed": 0.8, "share_threshold": "0.1"})
         ok("mechanism_manifest_invalid" in kinds(gate_findings(d, 2, P)), "MM7b a non-numeric threshold fails closed")
+        w(d, "models/suff.yaml", {"varied": "mix", "criterion": "c", "decision_changes": False,
+                                  "share_units_changed": 0.8, "share_threshold": 10})
+        ok("mechanism_manifest_invalid" in kinds(gate_findings(d, 2, P)), "MM7c a percentage threshold is invalid")
         w(d, "models/model.py", "def mix_effect(u):\n    return u\n")
         w(d, PATH, {"mechanisms": [{"id": "subgroup_mix", "status": "modelled",
                                     "code_ref": "models/model.py::mix_effect"}]})
@@ -388,7 +416,8 @@ def _self_test() -> int:
         w(d, PATH, {"mechanisms": [{"id": "subgroup_mix", "status": "modelled",
                                     "code_ref": "models/model.py::nope"}]})
         ok(kinds(gate_findings(d, 2, P)) == ["mechanism_ref_unresolved"], "MM9 unresolvable code_ref")
-        for bad in ("report.md", "models/model.py", "models/suff.yaml::varied"):
+        w(d, "models/stub.py", "# TODO: implement mix_effect\nX = 'mix_effect'\n")
+        for bad in ("report.md", "models/model.py", "models/suff.yaml::varied", "models/stub.py::mix_effect"):
             w(d, PATH, {"mechanisms": [{"id": "subgroup_mix", "status": "modelled", "code_ref": bad}]})
             ok(kinds(gate_findings(d, 2, P)) == ["mechanism_ref_unresolved"],
                f"MM9c code_ref {bad!r} (prose, no name, or not code) does not show the mechanism is modelled")

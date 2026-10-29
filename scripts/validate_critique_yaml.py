@@ -3890,9 +3890,12 @@ def _suggested_check_kind(concern: dict) -> str | None:
     return None
 
 
-def _evidence_artifacts(run_dir: str, ref: Any, allow_code: bool) -> list[str]:
+def _evidence_artifacts(run_dir: str, ref: Any, allow_code: bool, concern_id: str = "") -> list[str]:
     """Existing, non-empty, non-prose files inside run_dir that `addressed_in`
-    names (a string or a list; `path § section`, `path::name`, `path#x` ok)."""
+    names (a string or a list; `path § section`, `path::name`, `path#x` ok).
+    A results file must be text that names the concern it answers (e.g.
+    `addresses: [PM-008]`), so an unrelated input or configuration file does
+    not count (Codex review); code (data-use checks only) need not."""
     refs = ref if isinstance(ref, list) else [ref]
     root = os.path.realpath(run_dir)
     out = []
@@ -3912,6 +3915,15 @@ def _evidence_artifacts(run_dir: str, ref: Any, allow_code: bool) -> list[str]:
             if p.startswith(root + os.sep) and os.path.isfile(p) and os.path.getsize(p) > 0 \
                     and not _BOOKKEEPING_RE.match(os.path.basename(p)) \
                     and not os.path.relpath(p, root).startswith("data" + os.sep):
+                if ext not in _CODE_EXT:
+                    try:
+                        with open(p, encoding="utf-8") as f:
+                            body = f.read()
+                    except (OSError, UnicodeDecodeError):
+                        continue      # binary (a figure) or unreadable: cannot name the concern
+                    if not concern_id or not re.search(r"(?<![A-Za-z0-9])" + re.escape(concern_id)
+                                                       + r"(?![0-9])", body):
+                        continue
                 out.append(os.path.relpath(p, root))
     return out
 
@@ -4045,8 +4057,9 @@ def _check_premortem_addressed(run_dir: str,
         is_high = effective not in ("MEDIUM", "LOW")
         resolves = _addressed_in_resolves(run_dir, c.get("addressed_in"))
         if check_kind and cid not in declared_ids and (resolves or not is_high) and not \
-                _evidence_artifacts(run_dir, c.get("addressed_in"), allow_code=check_kind == "data_use"):
-            want = ("a results artifact (YAML/JSON/CSV/figure) from the sensitivity analysis"
+                _evidence_artifacts(run_dir, c.get("addressed_in"), allow_code=check_kind == "data_use",
+                                    concern_id=str(cid)):
+            want = (f"a results artifact (YAML/JSON/CSV) from the sensitivity analysis that names {cid}"
                     if check_kind == "sensitivity" else
                     "the model code that reads the data, or a results artifact that uses it")
             out.append({
@@ -8111,8 +8124,13 @@ def _run_self_test() -> int:
             ok("pre_mortem_high_unaddressed" in [x["kind"] for x in v],
                f"PF3: a floored LOW concern with no addressed_in is a HIGH unaddressed concern, got {v}")
             os.makedirs(os.path.join(_d, "models"))
+            with open(os.path.join(_d, "models", "unrelated.yaml"), "w") as f:
+                f.write("benchmarks:\n- id: B1\n  target_value: 0.6\n")
+            v = _pm42(addressed_in=["modeling_strategy.md § PM-001", "models/unrelated.yaml"])
+            ok([x["kind"] for x in v] == ["pre_mortem_closed_without_evidence"],
+               f"PF4a: a results file that does not name the concern is not its evidence, got {v}")
             with open(os.path.join(_d, "models", "mix_sensitivity.yaml"), "w") as f:
-                f.write("varied: mix 0.1-0.9\ndecision_changes: false\n")
+                f.write("addresses: [PM-001]\nvaried: mix 0.1-0.9\ndecision_changes: false\n")
             v = _pm42(evidence_files=["expert_prior:fixture_high_prior"], severity="HIGH",
                       addressed_in=["modeling_strategy.md § PM-001", "models/mix_sensitivity.yaml"])
             ok(v == [], f"PF4: an existing results artifact closes it (list addressed_in), got {v}")

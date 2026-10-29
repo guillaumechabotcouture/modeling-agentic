@@ -56,8 +56,9 @@ triggers as follows:
   `suggested_check` asks for a sensitivity or robustness analysis, or
   asks for data to be used, prose does not close it, at any severity.
   `addressed_in` (a string or a list) must also name an existing
-  artifact: a results file (YAML / JSON / CSV / figure), or for a data
-  use, the model code that reads the data. Otherwise the gate emits
+  artifact: a results file (YAML / JSON / CSV, outside data/) that names
+  the concern it answers (e.g. `addresses: [PM-008]`), or for a data use,
+  the model code that reads the data. Otherwise the gate emits
   `pre_mortem_closed_without_evidence`: HIGH for a HIGH concern at round
   2 or later, MEDIUM otherwise. A structured scope declaration also
   closes it.

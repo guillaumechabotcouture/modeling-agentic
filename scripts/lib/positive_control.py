@@ -654,7 +654,10 @@ def build(run_dir: str, round_n: int = 2) -> dict:
             "suggested_check": "Confirm the funded set is robust to a plausible range of the access slope.",
             "evidence_files": ["plan.md"],
             "addressed_in": ["modeling_strategy.md § Pre-mortem Responses",
-                             "models/sensitivity_analysis.yaml"]}]})
+                             "models/sensitivity_access_slope.yaml"]}]})
+    _w(run_dir, "models/sensitivity_access_slope.yaml", {
+        "addresses": ["PM-003"], "varied": "access slope over its calibrated 95% interval",
+        "funded_set_changes": False})
     # Phase 42 γ D1: one simplified mechanism with a passed sufficiency test.
     _w(run_dir, "models/sufficiency_age_profile.yaml", {
         "varied": "under-five share of the eligible population, plus or minus 20% per district",
