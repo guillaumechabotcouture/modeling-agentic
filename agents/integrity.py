@@ -46,7 +46,11 @@ what they wrote as harness-written. An agent's own Write/Edit of a declared
 output is not an explanation. Declarations are sticky for the life of this
 record (removing a step does not unprotect its files); files that already
 exist when first declared are baselined, as at start (the runner reruns a
-step that never ran, so the baseline is not what the gate reads).
+step that never ran, so the baseline is not what the gate reads). One
+exception: a file no current step declares as an output but a current step
+declares as an input is released (the runner keeps it as that step's input
+and no step claims to have built it); declared an output again, it is
+baselined and protected once more.
 """
 from __future__ import annotations
 
@@ -329,6 +333,8 @@ class ArtifactIntegrity:
         self.report_ok = True
         self.pipeline_patterns: list[str] = []   # S1: declared pipeline outputs (sticky)
         self._pipeline_sig = None
+        self._pipeline_now: tuple[list[str], list[str]] = ([], [])   # current (outputs, inputs)
+        self._released: set[str] = set()
         self._baseline: set[str] = set()
         # A resumed run keeps the violations already recorded. Only a MISSING
         # record is a fresh start: an unreadable, unstamped or malformed one
@@ -419,9 +425,11 @@ class ArtifactIntegrity:
             return []
         try:
             pats = mod.declared_outputs(self.run_path)
+            ins = mod.declared_inputs(self.run_path)
         except Exception:  # noqa: BLE001 — keep what was declared before (sticky)
             return []
         self._pipeline_sig = sig
+        self._pipeline_now = (list(pats), list(ins))
         new = [p for p in pats if p not in self.pipeline_patterns]
         self.pipeline_patterns.extend(new)
         return new
@@ -429,8 +437,17 @@ class ArtifactIntegrity:
     def _pipeline_owned(self, rel: str) -> bool:
         mod = _pipeline()
         own = tuple(mod.OWN_FILES) if mod is not None else ()
-        return rel in own or any(mod.path_match(rel, p) if mod is not None else fnmatch.fnmatchcase(rel, p)
-                                 for p in self.pipeline_patterns)
+        if rel in own:
+            return True
+        return any(mod.path_match(rel, p) if mod is not None else fnmatch.fnmatchcase(rel, p)
+                   for p in self.pipeline_patterns) and not self._is_released(rel)
+
+    def _is_released(self, rel: str) -> bool:
+        """A retired pipeline output a current step reads as an input (review #3)."""
+        mod = _pipeline()
+        pm = mod.path_match if mod is not None else fnmatch.fnmatchcase
+        outs, ins = self._pipeline_now
+        return any(pm(rel, p) for p in ins) and not any(pm(rel, p) for p in outs)
 
     def _scan(self) -> dict[str, str | None]:
         out = {}
@@ -442,12 +459,21 @@ class ArtifactIntegrity:
                 rel = os.path.relpath(p, self.run_path).replace(os.sep, "/")
                 if os.path.isfile(p) and rel not in self.hashes:
                     self._baseline.add(rel)
-        for pat in _protected_patterns() + self.pipeline_patterns:
+        was_released, self._released = self._released, set()
+        protected = _protected_patterns()
+        for pat in protected + self.pipeline_patterns:
             for p in glob.glob(os.path.join(self.run_path, pat), recursive=True):
                 if os.path.isfile(p):
                     rel = os.path.relpath(p, self.run_path).replace(os.sep, "/")
+                    if rel in out:
+                        continue          # a protected pattern (scanned first) holds it
+                    if pat not in protected and self._is_released(rel):
+                        self._released.add(rel)
+                        continue
                     out[rel] = _sha(p)
                     self._mtimes_now[rel] = os.stat(p).st_mtime_ns
+                    if rel in was_released and rel not in self.hashes:
+                        self._baseline.add(rel)    # declared an output again: baselined
         rp = os.path.join(self.run_path, REPORT_NAME)
         if os.path.exists(rp):
             out[REPORT_NAME] = _sha(rp)
@@ -591,8 +617,8 @@ class ArtifactIntegrity:
         for rel in sorted(set(cur) | set(self.hashes)):
             if rel == REPORT_NAME:
                 continue
-            if rel in self._baseline:
-                continue         # S1: existed before it was declared a pipeline output
+            if rel in self._baseline or rel in self._released:
+                continue         # S1: existed before it was declared a pipeline output, or released
             in_flight = sorted({f"{i['agent'] or 'lead'}:{i['tool']}" for i in self.inflight.values()})
             if cur.get(rel) == self.hashes.get(rel):
                 # Same bytes, but rewritten (mtime moved) by a sanctioned

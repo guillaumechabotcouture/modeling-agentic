@@ -38,7 +38,21 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import figure_validator as fv  # noqa: E402
-import pipeline  # noqa: E402  (S1: figures a pipeline step declares are rebuilt by the pipeline run)
+
+
+def _load_pipeline():
+    """scripts/pipeline.py by path under a private name. A plain `import pipeline` can
+    return a run's own models/pipeline.py already in sys.modules (E7 attempt 7; the
+    collision validate_critique_yaml._load_sibling was fixed for)."""
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pipeline.py")
+    spec = importlib.util.spec_from_file_location("_ma_derived_pipeline", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+pipeline = _load_pipeline()   # S1: figures a pipeline step declares are rebuilt by the pipeline run
 
 REPORT = os.path.join("figures", "rebuild_report.json")
 SCRIPT_TIMEOUT_S = 300
@@ -270,6 +284,24 @@ def _self_test() -> int:
         rep = rebuild(d)
         ok(rep["runs"] == [] and any("pipeline" in s["why"] for s in rep["skipped"]),
            f"DR10 a figure declared in models/pipeline.yaml is left to the pipeline run: {rep}")
+        # (pipeline review #5) An unparsable pipeline.yaml owns every figure; it does not hand
+        # them back to this rebuild.
+        open(os.path.join(d, "models", "pipeline.yaml"), "w").write("steps: [\n")
+        rep = rebuild(d)
+        ok(rep["runs"] == [] and any("pipeline" in s["why"] for s in rep["skipped"]),
+           f"DR11 (pipeline review #5) an unparsable models/pipeline.yaml keeps its figures from this rebuild: {rep}")
+    # (pipeline review) scripts/pipeline.py is loaded by path, not by a plain import that
+    # can resolve to a run's own models/pipeline.py.
+    with tempfile.TemporaryDirectory() as d:
+        open(os.path.join(d, "pipeline.py"), "w").write("SPEC = 'run-module'\n")
+        code = (f"import sys; sys.path.insert(0, {d!r}); import pipeline; "
+                f"sys.path.insert(0, {here!r}); import derived_rebuild as dr; "
+                "print(dr.pipeline.__file__, dr.pipeline.SPEC, sys.modules['pipeline'].SPEC)")
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=d)
+        ok(r.returncode == 0 and os.path.realpath(r.stdout.split()[0]) == os.path.realpath(os.path.join(here, "pipeline.py"))
+           and r.stdout.split()[1:] == ["models/pipeline.yaml", "run-module"],
+           f"DR12 (pipeline review) derived_rebuild loads scripts/pipeline.py by path beside a run's pipeline "
+           f"module: {r.stdout}{r.stderr[-300:]}")
     if fails:
         print("SELF-TEST FAILURES:")
         for f in fails:
