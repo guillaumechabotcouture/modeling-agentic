@@ -772,10 +772,14 @@ WORKER_OPTIONS = {"nthreads": 1}
 # Phase 38: compute VMs in priority order across Azure VM families with separate core
 # quotas (8 vCPU, 64 GiB each). E7 attempt 7: workers were refused for most of the run at
 # 344 of 350 standardEv5Family cores, a quota shared with the subscription's other users.
-# Coiled tries a list in order for availability; fallback on a quota error is not yet
-# observed (a 2026-10-27 test found Ev5 with room).
+# Coiled tries a list in order for availability but does not fall back on a quota refusal
+# (E7 attempt 8: refused at 348 of 350 standardESv5Family cores with this list); the
+# launcher's overflow pool covers that (cloud/run_cluster.py, Phase 42 β).
 WORKER_VM_TYPES = ["Standard_E8s_v5", "Standard_E8as_v5", "Standard_E8ds_v5"]
-ADAPT_OPTIONS = {"target_duration": "20s"}
+# Phase 42 β: an idle VM is retired after interval x wait_count = 10 min (dask's default is
+# 5 s x 24 = 2 min), so consecutive batches reuse VMs; attempt 8 created 734 VMs in 18 h.
+# cloud/run_cluster.py derives these from RunConfig.scale_down_after / adapt_interval.
+ADAPT_OPTIONS = {"target_duration": "20s", "interval": "15s", "wait_count": 40}
 
 
 def register_compute_tags(client, exclude: list[str] | tuple = (), resource: str = "compute") -> None:
