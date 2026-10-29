@@ -1406,6 +1406,34 @@ def _run_self_test() -> int:
             ig11.observe()
             ok(not any(g.get("observed") for g in ig11.grants),
                "IN8g a sample overlapping the end of a check is discarded")
+        # IN9 (S1 smoke 2026-10-29): the final write-up registers the gate's
+        # records as harness writes; the writer's next tool call must not see
+        # them "deleted" (they are not scanned at start). Once the harness has
+        # written them they are watched: an agent changing or deleting them is
+        # still flagged.
+        with tempfile.TemporaryDirectory() as td9:
+            def w9(rel, text):
+                open(os.path.join(td9, rel), "w").write(text)
+            w9("final_gate.json", '{"action": "RETHINK"}')
+            w9("final_gate_stderr.txt", "")
+            ig9b = ArtifactIntegrity(td9, process_check=lambda: set())
+            w9("final_gate.json", '{"action": "PATCH"}')      # run_final_gate (harness)
+            _harness_wrote_gate_outputs(ig9b)
+            ig9b.harness_wrote("report.unrendered.md")          # a file the scan never watches
+            ig9b.on_pre("r9", "Read", {"file_path": f"{td9}/final_gate.json"}, "writer")
+            ok(ig9b.on_post("r9") == [] and not ig9b.open_events,
+               f"IN9 harness-written gate records are not seen as deleted: {ig9b.events}")
+            w9("final_gate.json", '{"action": "ACCEPT"}')      # harness reruns the gate
+            _harness_wrote_gate_outputs(ig9b)
+            ok(ig9b.check_now() == [], "IN9b a later harness rewrite of the gate record is accepted")
+            ig9b.on_pre("b9", "Bash", {"command": "echo '{}' > final_gate.json"}, "writer")
+            w9("final_gate.json", '{"action": "ACCEPT", "n_unresolved_high": 0}')
+            ok([(e["file"], e["change"]) for e in ig9b.on_post("b9")] == [("final_gate.json", "modified")],
+               f"IN9c an agent's edit of the harness-written gate record is flagged: {ig9b.events}")
+            ig9b.on_pre("b10", "Bash", {"command": "rm final_gate_stderr.txt"}, "writer")
+            os.remove(os.path.join(td9, "final_gate_stderr.txt"))
+            ok([(e["file"], e["change"]) for e in ig9b.on_post("b10")] == [("final_gate_stderr.txt", "deleted")],
+               f"IN9d an agent's deletion of a harness-written gate record is flagged: {ig9b.events}")
         # IN6: a resumed run keeps earlier violations
         ok(len(ArtifactIntegrity(td, process_check=lambda: set()).events) >= 1,
            "IN6 violations survive a restart")
