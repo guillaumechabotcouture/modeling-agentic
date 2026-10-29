@@ -1982,7 +1982,15 @@ def _self_test() -> int:
                 out[tag] = str(e)
         os.environ["MA_COMPUTE_MAX_CORE_HOURS"] = "1"
         try:
-            ta = threading.Thread(target=call, args=("a",)); ta.start(); time.sleep(0.4)
+            ta = threading.Thread(target=call, args=("a",)); ta.start()
+            end = time.time() + 60                # readiness: a's reservation is in the ledger
+            while time.time() < end:
+                try:
+                    if json.load(open(os.path.join(rd, LEDGER_REL))).get("reservations"):
+                        break
+                except (OSError, ValueError):
+                    pass
+                time.sleep(0.01)
             call("b"); ta.join()
             ok(isinstance(out["a"], dict) and "held by running calls" in str(out["b"]),
                f"C13 a running call's reservation blocks a concurrent call: {out}")
@@ -2094,7 +2102,9 @@ def _self_test() -> int:
         open(os.path.join(d, "models", "spawner.py"), "w").write(
             "import subprocess\ndef f(p):\n    return subprocess.Popen(['sleep', '60']).pid\n")
         rows, _ = map_fn(d, "models/spawner.py::f", [{}], backend="local")
-        time.sleep(0.3)
+        end = time.time() + 10                    # a SIGKILL lands asynchronously: wait for it, bounded
+        while time.time() < end and _pid_alive(rows[0]["result"]):
+            time.sleep(0.02)
         try:
             os.kill(rows[0]["result"], 0)
             alive = not open(f"/proc/{rows[0]['result']}/stat").read().split()[2] == "Z" if os.path.exists("/proc") else \
@@ -2129,14 +2139,22 @@ def _self_test() -> int:
         t0 = time.time()
         r = _remote_task(bc_, ic_["sha256"], cdir, "models/slow.py::burn", [(k, {"s": 0.4}) for k in range(20)],
                          procs=1, chunk_allowance_s=1.0)
-        ok(time.time() - t0 < 8 and any(x.get("error") == CAP_STOP for x in r["rows"]) and r["core_s"] < 3,
+        # core_s and the cap-stopped rows show the share is enforced; the wall-clock
+        # limit only catches a hang (it was 8 s and failed on a loaded machine).
+        ok(time.time() - t0 < 30 and any(x.get("error") == CAP_STOP for x in r["rows"]) and r["core_s"] < 3,
            f"C25 a remote chunk enforces its allowance share: core_s={r['core_s']}")
         import threading as _th
         import uuid as _uuid
         res, cid = {}, "selftest-" + _uuid.uuid4().hex
         th = _th.Thread(target=lambda: res.update(r=_remote_task(bc_, ic_["sha256"], cdir, "models/slow.py::sleep",
                                                                  [(0, {"s": 60})], procs=1, call_id=cid)))
-        th.start(); time.sleep(1.5)
+        th.start()
+        # Readiness, not a fixed sleep (a loaded machine registered the chunk after 1.5 s):
+        # wait until the chunk has registered its pid for this call.
+        cdir_ = os.path.join(tempfile.gettempdir(), _CALLS_DIR, cid)
+        end = time.time() + 60
+        while time.time() < end and not any(n.isdigit() for n in (os.listdir(cdir_) if os.path.isdir(cdir_) else [])):
+            time.sleep(0.02)
         t0 = time.time(); n_stopped = _cancel_call(cid); th.join(15)
         later = _remote_task(bc_, ic_["sha256"], cdir, "models/slow.py::sleep", [(0, {"s": 60})], procs=1, call_id=cid)
         ok(n_stopped == 1 and not th.is_alive() and not res["r"]["rows"][0]["ok"]
@@ -2394,6 +2412,34 @@ def _self_test_p42(ok) -> None:
             time.sleep(0.05)
         return False
 
+    def gone(pid, limit=30):
+        """A SIGKILL is delivered asynchronously: wait until the process is dead
+        or defunct (not reaped: the settling call must see a zombie)."""
+        end = time.time() + limit
+        while _pid_alive(pid) and time.time() < end:
+            time.sleep(0.01)
+
+    def wait_ready(run_dir, done, limit=60, pids=True):
+        """Readiness, not a fixed sleep: the call's progress record shows `done`
+        finished tasks, work in flight, its pool pids recorded (`pids`), and was
+        written under 0.3 s ago. Tasks here take 1 s, so the next record (whose
+        pids are briefly incomplete while the pool starts processes) is still
+        about 0.7 s away: a kill now lands in a settled state."""
+        import glob as _g
+        end, last = time.time() + limit, None
+        while time.time() < end:
+            for f in _g.glob(os.path.join(run_dir, PROGRESS_DIR, "*.json")):
+                try:
+                    rec = json.load(open(f))
+                except (OSError, ValueError):
+                    continue
+                last = rec
+                if (int(rec.get("done_tasks") or 0) >= done and rec.get("out")
+                        and (rec.get("pids_complete") or not pids) and time.time() - float(rec["t"]) < 0.3):
+                    return True, rec
+            time.sleep(0.01)
+        return False, last
+
     with tempfile.TemporaryDirectory() as d:
         os.makedirs(os.path.join(d, "models"))
         open(os.path.join(d, "models", "slow.py"), "w").write(
@@ -2407,7 +2453,10 @@ def _self_test_p42(ok) -> None:
         # P42-1 (bug: os.kill(pid, 0) succeeds on a defunct process, so a zombie
         # caller's reservation was held forever): a real zombie child is dead.
         z = _sp.Popen([sys.executable, "-c", "pass"])
-        time.sleep(1.0)                           # exited, not reaped: a zombie
+        end = time.time() + 30                    # until it has exited (not reaped: a zombie)
+        while time.time() < end and (_proc_stat(z.pid) or ["?"])[0] != "Z" and _sp.run(
+                ["ps", "-o", "stat=", "-p", str(z.pid)], capture_output=True, text=True).stdout.strip()[:1] != "Z":
+            time.sleep(0.02)
         try:
             os.kill(z.pid, 0)
             kill_ok = True
@@ -2480,15 +2529,16 @@ def _self_test_p42(ok) -> None:
         os.remove(os.path.join(d, LEDGER_REL))
         t0 = time.time()
         p = _sp.Popen(cmd, env=env, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, start_new_session=True)
-        got = wait_rows(out + PARTIAL_EXT, 3)
+        got, rec5 = wait_ready(d, 4)
         os.killpg(p.pid, signal.SIGKILL)
         el = time.time() - t0
-        time.sleep(0.3)
+        gone(p.pid)
         map_fn(d, "models/slow.py::sleep", [], backend="local")
         led = ledger(d)
         c = (led["calls"] or [{}])[0]
+        ok(got, f"P42-5 setup: the batch never reached a settled state with 4 tasks done (last record {rec5})")
         ok(got and not led["reservations"] and "caller died; charged work done" in str(c.get("stopped"))
-           and 3.0 <= c["task_core_s"] <= 2 * el + 15 and c.get("purpose") == "P42",
+           and 4.0 <= c["task_core_s"] <= 2 * el + 15 and c.get("purpose") == "P42",
            f"P42-5 a killed caller is charged its work ({c.get('task_core_s')} core-s in {el:.1f}s), not 3,600: {c}")
         p.wait()
         r = _sp.run(cmd, env=env, capture_output=True, text=True, timeout=120)
@@ -2501,13 +2551,14 @@ def _self_test_p42(ok) -> None:
         os.remove(os.path.join(d, LEDGER_REL))
         t0 = time.time()
         p = _sp.Popen(cmd + ["--fresh"], env=env, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
-        wait_rows(out + PARTIAL_EXT, 2)
+        got, rec5c = wait_ready(d, 2)
         p.kill()
-        time.sleep(0.2)
+        gone(p.pid)
         map_fn(d, "models/slow.py::sleep", [], backend="local")
         el = time.time() - t0
         c = ledger(d)["calls"][0]
         p.wait()
+        ok(got, f"P42-5c setup: the batch never reached a settled state with 2 tasks done (last record {rec5c})")
         ok("pool processes stopped" in str(c.get("stopped")) and 2.0 <= c["task_core_s"] <= 2 * el + 15,
            f"P42-5c a killed caller's surviving pool is stopped and its work bounded ({el:.1f}s): {c}")
 
@@ -2528,7 +2579,11 @@ def _self_test_p42(ok) -> None:
         # status reports it running, wait reports it finished.
         for f in (out, out + ".summary.json"):
             os.remove(f)
-        wrapper = _sp.Popen(["/bin/sh", "-c", " ".join(_sp.list2cmdline([x]) for x in cmd + ["--detach"]) + "; sleep 60"],
+        # 8 tasks of 2 s on 2 processes, all recomputed: about 8 s, ample for the checks while it runs.
+        inp7 = os.path.join(d, "models", "in7.jsonl")
+        open(inp7, "w").write("".join(json.dumps({"s": 2.0, "k": k}) + "\n" for k in range(8)))
+        cmd7 = [x if x != inp else inp7 for x in cmd] + ["--fresh"]
+        wrapper = _sp.Popen(["/bin/sh", "-c", " ".join(_sp.list2cmdline([x]) for x in cmd7 + ["--detach"]) + "; sleep 60"],
                             env=env, stdout=_sp.PIPE, text=True, start_new_session=True)
         line = wrapper.stdout.readline()
         os.killpg(wrapper.pid, signal.SIGKILL)
@@ -2537,10 +2592,10 @@ def _self_test_p42(ok) -> None:
             det = json.loads(line)
         except ValueError:
             det = {}
-        second = _sp.run(cmd + ["--detach"], env=env, capture_output=True, text=True, timeout=60)
+        st = _sp.run([sys.executable, os.path.abspath(__file__), "status", out], env=env, capture_output=True, text=True)
+        second = _sp.run(cmd7 + ["--detach"], env=env, capture_output=True, text=True, timeout=60)
         ok(second.returncode == 4 and '"detached": false' in second.stdout,
            f"P42-7d a second batch on the same --out is refused while the first runs: {second.stdout[-200:]}")
-        st = _sp.run([sys.executable, os.path.abspath(__file__), "status", out], env=env, capture_output=True, text=True)
         w = _sp.run([sys.executable, os.path.abspath(__file__), "wait", out, "--timeout-s", "90"], env=env,
                     capture_output=True, text=True, timeout=150)
         try:
@@ -2575,7 +2630,7 @@ def _self_test_p42(ok) -> None:
                     MA_COMPUTE_TARGET_WORKERS="6", MA_COMPUTE_PROCS_PER_WORKER="1", MA_COMPUTE_SETTLE_S="30")
         t0 = time.time()
         p = _sp.Popen([sys.executable, "-c", code], env=envd, stdout=_sp.DEVNULL, stderr=_sp.PIPE, text=True)
-        time.sleep(8.0)
+        got8, rec8 = wait_ready(d, 1, limit=120, pids=False)   # a chunk finished, others in flight
         p.send_signal(signal.SIGINT)
         err = p.communicate(timeout=120)[1]
         el = time.time() - t0
@@ -2583,6 +2638,7 @@ def _self_test_p42(ok) -> None:
             c = ledger(d)["calls"][-1]
         except (OSError, ValueError, IndexError):
             c = {}
+        ok(got8, f"P42-8 setup: no dask chunk finished in time (last record {rec8}) {err[-300:]}")
         ok("charged work done" in str(c.get("stopped")) and 0 < c.get("task_core_s", 0) <= el + 5,
            f"P42-8 an interrupted dask call on 1 of 6 target workers is charged ~1 worker's time "
            f"({c.get('task_core_s')} core-s in {el:.1f}s; before: about 6 x elapsed): {c} {err[-300:]}")
