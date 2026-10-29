@@ -495,8 +495,9 @@ resolution, the objective, constraints, accounting conventions, what is out
 of scope, what impact is measured against (comparators: one primary, the
 others sensitivities), the acceptance criteria, and open questions for the
 owner. Check that it is faithful to the question, that the primary
-comparator describes what actually happens without the plan, and that its
-open questions are the framing choices that matter. Nothing but planning runs until it is signed;
+comparator describes what actually happens without the plan, that its
+open questions are decisions that matter (facts are the planner's to find),
+and that the method assessment says why the requested framework fits. Nothing but planning runs until it is signed;
 the harness says whether the owner signs (end your turn with
 AWAITING_SIGNOFF and you are resumed with the owner's answers) or you do.
 After sign-off the brief and success_criteria.yaml are frozen and the

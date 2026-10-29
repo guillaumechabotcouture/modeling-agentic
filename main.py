@@ -1626,10 +1626,7 @@ def _run_self_test() -> int:
         ok("planner writes decision_brief.yaml" in (signoff_hold_reason(td, "owner") or ""),
            "SO1 no brief: re-spawn the planner")
         _y.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(td, "success_criteria.yaml"), "w"))
-        _y.safe_dump({"question": "q", "decision": "d", "decision_maker": "m", "objective": "o",
-                      "answers": [{"id": "A1", "statement": "s", "resolution": "district"}],
-                      "comparators": [{"id": "CF1", "role": "primary", "text": "status quo"}],
-                      "acceptance": ["HB-001"]}, open(os.path.join(td, "decision_brief.yaml"), "w"))
+        _y.safe_dump(_db.example_brief(), open(os.path.join(td, "decision_brief.yaml"), "w"))
         ok("AWAITING_SIGNOFF" in (signoff_hold_reason(td, "owner") or "")
            and "--by lead" in (signoff_hold_reason(td, "lead") or "") and signoff_hold_reason(td, None) is None,
            "SO2 a ready brief: owner mode waits, lead mode signs, no mode does nothing")
