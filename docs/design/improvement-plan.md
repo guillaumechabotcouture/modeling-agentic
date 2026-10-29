@@ -47,10 +47,30 @@ Status: draft for review, 2026-10-28. It complements `stage-machine.md` (the arc
 | C2 | **If C1 shows large gains:** a v4 skill and a migration path for the modeler (v4 ships `docs/migration/v3_v4.md` and a migration script), behind a flag, tried on a smoke run first. | Whether attempt 9 or 10 uses v4. |
 | C3 | **Wait for the release** before making v4 the default. The branch is 469 commits ahead of main, and its own targets for agent runs are "at least slightly faster". | Pin a released version. |
 
+## Workstream D — domain mechanisms the model must cover (from the vector-bionomics miss)
+
+**What happened.**
+- Attempt 7's pre-mortem raised PM-008: net and IRS redundancy and residual outdoor transmission by *An. arabiensis* depend on the indoor and in-bed biting fractions. It pointed to the hbhi species-abundance file and asked for a robustness check.
+- It rated the concern **LOW**. The gate checks only HIGH concerns (`pre_mortem_high_unaddressed`), and the modeler closed it as "ADDRESSED. Unchanged" without the check.
+- Attempt 8 had the species abundance for every LGA in `lga_master_774.csv`, but no model code read it. It used one set of bionomics everywhere (Q0 0.92, φ_I 0.85, φ_B 0.80).
+- North of 11°N (216 LGAs, 63M people, the highest prevalence, the core SMC area), the population-weighted mix is 67% arabiensis. That gives an effective Q0 of about 0.78 (`malariasimulation` per-species values, from Sherrard-Smith 2019).
+- The trial benchmarks passed because vector-control strength was tuned to the Tanzanian and Benin trial sites, so nothing tested whether the mechanism transfers.
+
+**The pattern.** Domain knowledge reaches the model only as prose, and a self-graded severity decides whether anything checks it.
+
+| # | Change | Check | Metric |
+|---|---|---|---|
+| D1 | **Expert prior: vector bionomics by species** (Sherrard-Smith 2019 PNAS; Griffin 2010; `malariasimulation` defaults). Applies when the question is malaria with nets or IRS, and species data exist. | The pre-mortem raises it as HIGH, whatever the critic's own grading. | Raised in 100% of qualifying runs. |
+| D2 | **Mechanism manifest** `models/mechanism_manifest.yaml`. For each mechanism the priors require: modelled (with code reference), fixed (with source), or excluded (with a sensitivity result file). | Gate: HIGH if a required mechanism is missing, or excluded without a result file. | Required mechanisms covered. |
+| D3 | **Data-use audit.** Every processed data column is read by model code, or listed as unused with a reason. | Static scan of `models/` against `data/processed/` headers; MEDIUM per unexplained unused column. | Unused columns without a reason = 0 (attempt 8: species columns 56–58). |
+| D4 | **"Addressed" needs evidence.** A pre-mortem concern whose suggested check is a sensitivity analysis or a data use can only be closed by an artifact path that exists. This applies to concerns of any severity. | Pre-mortem validator. | Concerns closed by prose = 0. |
+| D5 | **Transfer check for tuned effects.** When effect strengths are tuned to trial sites, also report the effect under the target setting's context (species mix, resistance), with the difference stated. | Benchmark report field. | Present when tuning is used. |
+| D6 | **A maintained malaria vector module** in the toolkit: species-aware bionomics, larval stage optional, a published resistance-to-efficacy mapping. Promoted from the best run version and tested against `malariasimulation` on the EIR–prevalence curve and the trial arms. | Toolkit tests. | Runs use it instead of rewriting. |
+
 ## Order and checkpoints
 
 1. A1, A2, A3 (in progress), then A4 with a smoke run.
-2. B1 and B4 (calibration spec and diagnosis order), B2 and B3 (brief), each with a smoke run.
+2. D1–D4 (vector-bionomics prior, mechanism manifest, data-use audit, evidence for "addressed"), then B1 and B4 (calibration spec and diagnosis order), B2 and B3 (brief), each with a smoke run.
 3. C1 benchmark (no run spend; VM time only), alongside step 2.
 4. Attempt 9: same question, same settings. Compare with attempts 7 and 8 on findings by round, compute lost, spend, and headline basis.
 5. B5, B6, and the M2 structure work (`stage-machine.md` §3.7) between runs.
