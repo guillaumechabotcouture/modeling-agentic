@@ -221,7 +221,7 @@ def schema_version(doc: dict):
 
 
 def _filled(v) -> bool:
-    return bool(str(v or "").strip())
+    return isinstance(v, str) and bool(v.strip())
 
 
 def _validate_v2(doc: dict) -> list[str]:
@@ -234,7 +234,7 @@ def _validate_v2(doc: dict) -> list[str]:
             if not isinstance(it, dict):
                 continue
             iid, basis = it.get("id") or "?", it.get("basis")
-            if basis not in BASES:
+            if not isinstance(basis, str) or basis not in BASES:
                 errors.append(f"{iid}: basis must be one of {', '.join(BASES)}")
                 continue
             need = BASES[basis]
@@ -250,13 +250,13 @@ def _validate_v2(doc: dict) -> list[str]:
         return errors + ["method_assessment: missing (the analytical objective, and why the requested "
                          "framework fits; see the modeling-strategy skill)"]
     objs = ma.get("objective") if isinstance(ma.get("objective"), list) else [ma.get("objective")]
-    if not objs or any(o not in OBJECTIVES for o in objs):
+    if not objs or any(not isinstance(o, str) or o not in OBJECTIVES for o in objs):
         errors.append(f"method_assessment.objective: one or more of {', '.join(OBJECTIVES)}")
     for k in ("requested", "fit"):
         if not _filled(ma.get(k)):
             errors.append(f"method_assessment.{k}: empty" + (" (the framework the question names, or none)"
                                                                if k == "requested" else ""))
-    if "dynamic_mechanistic" in objs:
+    if "dynamic_mechanistic" in [o for o in objs if isinstance(o, str)]:
         if ma.get("representation") not in REPRESENTATIONS:
             errors.append(f"method_assessment.representation: one of {', '.join(REPRESENTATIONS)}")
         crit = ma.get("abm_criteria") if isinstance(ma.get("abm_criteria"), dict) else {}
@@ -268,7 +268,7 @@ def _validate_v2(doc: dict) -> list[str]:
             errors.append("method_assessment: agent-based with no criterion that needs it; say which one does, "
                           "or recommend a compartmental model (does_not_fit, with an owner question)")
         req = str(ma.get("requested") or "").lower()
-        asked = ("agent_based" if re.search(r"agent[- ]based|individual[- ]based|\babm\b", req) else
+        asked = ("agent_based" if re.search(r"agent[-_ ]based|individual[-_ ]based|\babm\b", req) else
                  "compartmental" if re.search(r"compartmental|\bode\b", req) else None)
         if asked and ma.get("representation") not in (asked, "hybrid") and ma.get("verdict") == "fits":
             errors.append(f"method_assessment: the question asks for {asked.replace('_', '-')} and the brief "
@@ -426,7 +426,7 @@ def _method_md(ma) -> list[str]:
         return []
     objs = ma.get("objective") if isinstance(ma.get("objective"), list) else [ma.get("objective")]
     out = ["## How the question will be answered",
-           "- **Kind of question:** " + "; and ".join(OBJECTIVES.get(o, str(o)) for o in objs) + ".",
+           "- **Kind of question:** " + "; and ".join(OBJECTIVES.get(o, str(o)) if isinstance(o, str) else str(o) for o in objs) + ".",
            f"- **Requested:** {ma.get('requested')}. {ma.get('fit')}"]
     crit = ma.get("abm_criteria") if isinstance(ma.get("abm_criteria"), dict) else {}
     if ma.get("representation"):
@@ -757,6 +757,10 @@ def _run_self_test() -> int:
            f"DB23: an unsigned brief must be schema 2: {e}")
         ok(any("not a known version" in x for x in errs_of(example_brief(schema_version=3))),
            "DB24: an unknown schema version fails closed")
+        e = errs_of(example_brief(method_assessment={**example_brief()["method_assessment"], "objective": [{"a": 1}]},
+                                  comparators=[{**example_brief()["comparators"][0], "basis": ["fact"]}]))
+        ok(any("objective: one or more" in x for x in e) and any("CF1: basis must be" in x for x in e)
+           and "Kind of question" in render_md(d), f"DB24b: malformed values are findings, not crashes: {e}")
         ma = example_brief()["method_assessment"]
         e = errs_of({k: v for k, v in example_brief().items() if k != "method_assessment"})
         ok(any(x.startswith("method_assessment: missing") for x in e), f"DB25: method_assessment required: {e}")
@@ -771,7 +775,13 @@ def _run_self_test() -> int:
         e = errs_of(example_brief(method_assessment={**ma, "representation": "agent_based"}))
         ok(any("no criterion that needs it" in x for x in e), f"DB28: agent-based needs a reason: {e}")
         e = errs_of(example_brief(method_assessment={**ma, "requested": "a Starsim agent-based model"}))
-        ok(any("not a silent switch" in x for x in e), f"DB29: a switch from the requested framework is flagged: {e}")
+        e2 = errs_of(example_brief(method_assessment={**ma, "requested": "agent_based"}))
+        ok(any("not a silent switch" in x for x in e) and any("not a silent switch" in x for x in e2),
+           f"DB29: a switch from the requested framework is flagged: {e} {e2}")
+        e = errs_of(example_brief(method_assessment={**ma, "fit": {"why": None}},
+                                  comparators=[{**example_brief()["comparators"][0], "source": [None]}]))
+        ok(any("fit: empty" in x for x in e) and any("CF1: a fact needs `source`" in x for x in e),
+           f"DB29b (Codex review): a non-text reason or source is not filled in: {e}")
         q6 = {"id": "Q6", "question": "Use a compartmental model instead?", "proposed": "Yes", "basis": "decision"}
         redirect = {**ma, "requested": "a Starsim agent-based model", "verdict": "does_not_fit"}
         e = errs_of(example_brief(method_assessment=redirect))
