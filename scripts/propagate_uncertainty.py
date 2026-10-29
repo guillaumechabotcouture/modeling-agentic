@@ -254,12 +254,28 @@ def no_cached_bytecode():
         sys.dont_write_bytecode, sys.pycache_prefix = prev
 
 
-def load_outcome_fn_fingerprinted(run_dir: str, spec: Optional[str]):
+def point_params(registry: dict) -> dict:
+    """{name: point value} of the registry's parameters with a finite `value`."""
+    import math
+    out = {}
+    for p in registry.get("parameters") or []:
+        try:
+            v = float(p.get("value"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if math.isfinite(v) and p.get("name"):
+            out[str(p["name"])] = v
+    return out
+
+
+def load_outcome_fn_fingerprinted(run_dir: str, spec: Optional[str], probe_params: Optional[dict] = None):
     """(fn, fingerprint). S2: the fingerprint names the function and hashes
-    every Python file under the run's models/ plus any other run module it
-    imports at load time, so scripts/headline_binding.py can check that the
-    function it binds to the report is the code that produced
-    uncertainty_report.yaml (whether a module is imported lazily or not).
+    the run modules it uses: those imported when it is loaded and, when
+    `probe_params` is given, those imported while it runs once at them (the
+    registry point estimates, which scripts/headline_binding.py also uses), so
+    lazy imports count. Other models/ files (figure scripts, pipeline steps)
+    are not the function's code and do not change the fingerprint. A module
+    imported only on a branch the probe call does not take is not hashed.
     Modules already imported from run_dir are dropped first so the imports are
     this run's. Call it, and the function, inside no_cached_bytecode()."""
     import hashlib
@@ -270,11 +286,13 @@ def load_outcome_fn_fingerprinted(run_dir: str, spec: Optional[str]):
             sys.modules.pop(k, None)
     before = set(sys.modules)
     fn = load_outcome_fn(run_dir, spec)
+    if probe_params is not None:
+        try:
+            fn(dict(probe_params))
+        except Exception:  # noqa: BLE001 — the caller reports a failing function
+            pass
     files = {os.path.realpath(sys.modules[k].__file__) for k in set(sys.modules) - before
              if under(getattr(sys.modules[k], "__file__", None))}
-    for dp, dns, fns in os.walk(os.path.join(rd, "models")):
-        dns[:] = [x for x in dns if x != "__pycache__"]
-        files.update(os.path.join(dp, f) for f in fns if f.endswith(".py"))
     rel, _, name = (spec or "models/outcome_fn.py::outcome_fn").partition("::")
     src = os.path.join(run_dir, rel)
     src = os.path.realpath(src if os.path.exists(src) else rel)   # load_outcome_fn's lookup
@@ -328,7 +346,7 @@ def propagate(run_dir: str, n_draws: int = 200, seed: int = 42,
     # S2: record which code produced the report (scripts/headline_binding.py
     # checks it is the function bound to the report's headline).
     try:
-        fp_fn, fingerprint = load_outcome_fn_fingerprinted(run_dir, outcome_fn_spec)
+        fp_fn, fingerprint = load_outcome_fn_fingerprinted(run_dir, outcome_fn_spec, point_params(registry))
     except Exception as e:  # noqa: BLE001 — the load below raises the usual error
         fp_fn, fingerprint = None, {"error": f"{type(e).__name__}: {str(e)[:200]}"}
 

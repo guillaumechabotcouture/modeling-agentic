@@ -58,6 +58,7 @@ import csv
 import glob
 import math
 import os
+import contextlib
 import sys
 import tempfile
 
@@ -106,16 +107,36 @@ def _point_params(run_dir: str) -> tuple[dict | None, str]:
     return out, ""
 
 
-def _load_fn(run_dir: str):
-    """(fn, fingerprint): outcome_fn loaded fresh from this run (no module cached
-    from another run), with the source hashes propagate_uncertainty records."""
+@contextlib.contextmanager
+def _run_imports(run_dir: str):
+    """While loading and calling outcome_fn, a plain `import x` in run code
+    resolves to the run's models/x.py: cached modules of those names (another
+    run's, or a gate module such as pipeline or compute) are set aside. After,
+    the run's modules and its path entry are removed and the set-aside modules
+    restored, so later imports in the gate process never resolve to run code."""
     models = os.path.realpath(os.path.join(run_dir, "models"))
+    saved_path, aside = list(sys.path), {}
     for stem in {os.path.splitext(os.path.basename(p))[0] for p in glob.glob(os.path.join(models, "*.py"))}:
-        sys.modules.pop(stem, None)
-    if models in sys.path:
-        sys.path.remove(models)
+        if stem in sys.modules:
+            aside[stem] = sys.modules.pop(stem)
     sys.path.insert(0, models)
-    return _sibling("propagate_uncertainty").load_outcome_fn_fingerprinted(run_dir, OUTCOME_FN_SPEC)
+    try:
+        yield
+    finally:
+        sys.path[:] = saved_path
+        for k, m in list(sys.modules.items()):
+            f = getattr(m, "__file__", None)
+            if f and os.path.realpath(f).startswith(os.path.join(models, "")):
+                sys.modules.pop(k, None)
+        for k, m in aside.items():
+            if not str(getattr(m, "__file__", "") or "").startswith(os.path.join(models, "")):
+                sys.modules[k] = m   # a gate module comes back; another run's module does not
+
+
+def _load_fn(run_dir: str, params: dict):
+    """(fn, fingerprint): outcome_fn loaded fresh from this run (call inside
+    _run_imports), with the source hashes propagate_uncertainty records."""
+    return _sibling("propagate_uncertainty").load_outcome_fn_fingerprinted(run_dir, OUTCOME_FN_SPEC, params)
 
 
 def _uq_mismatch(run_dir: str, fp: dict) -> str | None:
@@ -193,9 +214,9 @@ def evaluate(run_dir: str) -> tuple[list[str], dict]:
     if params is None:
         return errors + [f"cannot evaluate outcome_fn at the registry point estimates: {why}"], {}
     # Load and run from source, never a cached .pyc, so the code run is the code hashed.
-    with _sibling("propagate_uncertainty").no_cached_bytecode():
+    with _sibling("propagate_uncertainty").no_cached_bytecode(), _run_imports(run_dir):
         try:
-            fn, fp = _load_fn(run_dir)
+            fn, fp = _load_fn(run_dir, params)
         except Exception as e:  # noqa: BLE001 — fail closed
             return errors + [f"cannot load {OUTCOME_FN_SPEC}: {type(e).__name__}: {str(e)[:200]}"], {}
         try:
@@ -404,7 +425,8 @@ def _self_test() -> int:
         uq = os.path.join(d, "uncertainty_report.yaml")
 
         def report(spec="models/outcome_fn.py::outcome_fn"):
-            _fn, fp = pu.load_outcome_fn_fingerprinted(d, spec)
+            # as propagate_uncertainty does: probe the function at the registry point estimates
+            _fn, fp = pu.load_outcome_fn_fingerprinted(d, spec, _point_params(d)[0])
             yaml.safe_dump({"producer": "scripts/propagate_uncertainty.py", "outcome_fn_fingerprint": fp},
                            open(uq, "w"))
         open(os.path.join(d, "models", "helper.py"), "w").write("SCALE = 0.1\n")
@@ -445,6 +467,24 @@ def _self_test() -> int:
         report()
         ok(gate_findings(d) == [], f"HB21 (Codex) a stale .pyc is not executed in place of the source: "
                                    f"{gate_findings(d)}")
+        # Review: a models/ file the function does not use is not its code.
+        open(os.path.join(d, "models", "fig_tornado.py"), "w").write("import matplotlib\n")
+        ok(gate_findings(d) == [], f"HB22 a new unrelated models/ script does not stale the report: {gate_findings(d)}")
+        os.remove(os.path.join(d, "models", "fig_tornado.py"))
+        # Review: run modules named like gate modules never leak into the gate process.
+        import types
+        gate_mod = types.ModuleType("pipeline"); gate_mod.__file__ = os.path.join(HERE, "pipeline.py")
+        sys.modules["pipeline"] = gate_mod
+        open(os.path.join(d, "models", "pipeline.py"), "w").write("X = 1\n")
+        path_before = list(sys.path)
+        gate_findings(d)
+        models_dir = os.path.realpath(os.path.join(d, "models"))
+        leaked = [k for k, m in sys.modules.items()
+                  if str(getattr(m, "__file__", "") or "").startswith(models_dir + os.sep)]
+        ok(sys.modules.get("pipeline") is gate_mod and not leaked and sys.path == path_before,
+           f"HB23 the gate's own modules are restored and no run module or path stays loaded: {leaked}")
+        sys.modules.pop("pipeline", None)
+        os.remove(os.path.join(d, "models", "pipeline.py"))
         yaml.safe_dump({"producer": "scripts/propagate_uncertainty.py"}, open(uq, "w"))
         ok(any("does not record which outcome_fn" in x["claim"] for x in gate_findings(d)),
            "HB19 a report without the fingerprint fails closed")
