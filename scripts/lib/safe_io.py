@@ -34,6 +34,7 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import sys
@@ -180,6 +181,36 @@ def finite_number(x: Any) -> Optional[float]:
     return f if math.isfinite(f) else None
 
 
+# Phase 43 γ: two lenient readers that were copied verbatim across scripts
+# (coherence_audit / identifiability; lessons / run_autopsy). They are not
+# gate loaders: they return None / [] rather than findings, as before.
+
+def sha256_file(path: str) -> Optional[str]:
+    """Hex SHA-256 of the file's bytes, or None if it cannot be read."""
+    import hashlib
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def read_jsonl(path):
+    """Parsed JSON lines of `path`; unparsable lines are skipped and an
+    unreadable file gives []."""
+    out = []
+    try:
+        with open(path, errors="replace") as f:
+            for line in f:
+                try:
+                    out.append(json.loads(line))
+                except ValueError:
+                    continue
+    except OSError:
+        pass
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Self-test
 # --------------------------------------------------------------------------- #
@@ -273,6 +304,16 @@ def _self_test() -> int:
     ok(finite_number(float("inf")) is None, "S11c inf rejected")
     ok(finite_number(True) is None, "S11d bool rejected")
     ok(finite_number(None) is None, "S11e None rejected")
+
+    # S12: sha256_file / read_jsonl (lenient readers)
+    with tempfile.TemporaryDirectory() as d:
+        p = write(d, "a.txt", "abc")
+        ok(sha256_file(p) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+           "S12 sha256 of 'abc'")
+        ok(sha256_file(os.path.join(d, "missing")) is None, "S12b missing → None")
+        j = write(d, "a.jsonl", '{"a": 1}\nnot json\n[2]\n')
+        ok(read_jsonl(j) == [{"a": 1}, [2]], "S12c bad line skipped")
+        ok(read_jsonl(os.path.join(d, "missing")) == [], "S12d missing → []")
 
     if failures:
         print("FAIL:", file=sys.stderr)

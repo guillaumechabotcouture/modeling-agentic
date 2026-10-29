@@ -65,6 +65,13 @@ from typing import Any, Optional
 
 import yaml
 
+# Phase 43 γ: one copy of the finite-number coercion, in safe_io.
+try:
+    from .safe_io import finite_number as _num
+except ImportError:  # run as a script (--self-test): no parent package
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from lib.safe_io import finite_number as _num  # noqa: E402
+
 DEFAULT_REL_TOL = 0.01      # ledger values may be rounded to ~3 s.f.
 DEFAULT_ABS_TOL = 1e-9
 
@@ -327,16 +334,6 @@ def _ci_from_mapping(m: dict) -> Optional[tuple[Any, Any]]:
 # --------------------------------------------------------------------------- #
 # Comparison
 # --------------------------------------------------------------------------- #
-
-def _num(x: Any) -> Optional[float]:
-    if isinstance(x, bool):
-        return None
-    try:
-        f = float(x)
-    except (TypeError, ValueError):
-        return None
-    return f if math.isfinite(f) else None
-
 
 def _close(a: float, b: float, rel_tol: float, abs_tol: float) -> bool:
     return math.isclose(a, b, rel_tol=rel_tol, abs_tol=abs_tol)

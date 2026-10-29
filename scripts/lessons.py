@@ -37,6 +37,9 @@ from datetime import date
 import yaml
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if os.path.join(REPO, "scripts") not in sys.path:
+    sys.path.insert(0, os.path.join(REPO, "scripts"))
+from lib.safe_io import read_jsonl as _jsonl  # noqa: E402
 LEDGER = os.path.join(REPO, "docs", "lessons", "ledger.yaml")
 OBSERVATIONS = os.path.join(REPO, "docs", "lessons", "observations.jsonl")
 
@@ -137,20 +140,6 @@ def applies(lesson: dict, question: str | None) -> bool:
         return True
     q = (question or "").lower()
     return any(w.lower() in q for w in words)
-
-
-def _jsonl(path):
-    out = []
-    try:
-        with open(path, errors="replace") as f:
-            for line in f:
-                try:
-                    out.append(json.loads(line))
-                except ValueError:
-                    continue
-    except OSError:
-        pass
-    return out
 
 
 def _run_facts(run_dir: str) -> dict:

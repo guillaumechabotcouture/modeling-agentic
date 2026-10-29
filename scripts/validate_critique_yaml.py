@@ -61,6 +61,10 @@ from lib.rigor_artifacts import (  # noqa: E402
 # Phase 21 β: fail-closed loading + crash guard + ledger provenance.
 from lib.safe_io import finite_number, run_guarded, safe_load_mapping  # noqa: E402
 from lib import provenance as _provenance  # noqa: E402
+# Phase 43 γ: the Markdown table/number helpers live once, in lib.md_helpers.
+from lib.md_helpers import (  # noqa: E402
+    _HORIZON_RE, _extract_last_numeric, _parse_md_tables,
+    _strip_limitations_and_scope)
 
 
 # Phase 21 β: closed verdict vocabularies of each producing script. A
@@ -806,57 +810,6 @@ _COMPARATOR_HEADER_RE = re.compile(
     r"(?:Value|Estimate|Result|Finding)\b",
     re.IGNORECASE,
 )
-# Numeric with optional sign, comma thousands, decimal, scientific,
-# and SI suffix (k/K/m/M/b/B/t/T) or unit suffix ($, %).
-# Phase 5 fix: require at least one comma-group in the comma-form
-# alternative; the prior `(?:,\d{3})*` allowing zero comma-groups made
-# the engine match "201" then "5" separately for the input "2015".
-# The `\b...\b` boundaries prevent partial-match drift.
-_NUMERIC_TOKEN_RE = re.compile(
-    r"(?P<sign>[-+]?)\$?\s*"
-    r"(?P<num>\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)"
-    r"(?P<suffix>[kKmMbBtT]?)\b"
-)
-# Time-horizon suffix in cells like "/3yr", "/5 years", "/yr", "per year".
-_HORIZON_RE = re.compile(
-    r"/\s*(\d+)\s*(?:yr|year)|/\s*(?:yr|year)\b|per\s+year",
-    re.IGNORECASE,
-)
-
-
-def _extract_last_numeric(cell: str) -> Optional[float]:
-    """Extract the LAST numeric token from a cell string. Modelers
-    typically write the original then a parenthesized normalization
-    (e.g. `84,000/5yr (~50,400/3yr)`); the LAST token is the normalized
-    figure that should be used for cross-column comparison.
-
-    Phase 5 fixes:
-      - Strip horizon suffixes (`/3yr`, `/5 years`, `/yr`, `per year`)
-        BEFORE extracting numerics. Otherwise the regex picks up the
-        horizon's digit (e.g., "5" from "/5yr") as the last numeric.
-      - Strip parenthetical citations (`(Bhatt 2015)`, `(Author Year)`)
-        BEFORE extracting numerics. Citation years would otherwise be
-        picked up as the last numeric, replacing the actual quantity.
-        Normalization parentheticals like `(~50,400/3yr)` start with
-        non-letter characters (digit, ~, $) so they are NOT stripped.
-    """
-    stripped = _HORIZON_RE.sub("", cell)
-    # Strip `(Author Year)` style citations — paren content beginning
-    # with an alphabetic character. Keeps `(50,400/3yr)`, `($107M)`,
-    # `(~12%)` — anything starting with a digit/punctuation.
-    stripped = re.sub(r"\(\s*[A-Za-z][^)]*\)", "", stripped)
-    matches = list(_NUMERIC_TOKEN_RE.finditer(stripped))
-    if not matches:
-        return None
-    m = matches[-1]
-    raw = m.group("num").replace(",", "")
-    try:
-        value = float(raw)
-    except ValueError:
-        return None
-    suffix = (m.group("suffix") or "").lower()
-    multiplier = {"k": 1e3, "m": 1e6, "b": 1e9, "t": 1e12}.get(suffix, 1.0)
-    return value * multiplier
 
 
 def _extract_horizon_years(cell: str) -> Optional[float]:
@@ -877,45 +830,6 @@ def _extract_horizon_years(cell: str) -> Optional[float]:
         except ValueError:
             return None
     return 1.0  # `/yr` or `per year`
-
-
-def _parse_md_tables(text: str) -> list[dict]:
-    """Linear scan for Markdown tables. Returns a list of
-    {headers: [...], rows: [{label: str, cells: [...]}, ...]} dicts.
-    Linear scan, no backtracking."""
-    tables = []
-    lines = text.splitlines()
-    i = 0
-    while i < len(lines):
-        line = lines[i].rstrip()
-        if not (line.startswith("|") and line.endswith("|") and "|" in line[1:-1]):
-            i += 1
-            continue
-        # Possible table header. Need a separator line next.
-        if i + 1 >= len(lines):
-            i += 1
-            continue
-        sep = lines[i + 1].strip()
-        if not re.fullmatch(r"\|[\s:|-]+\|", sep):
-            i += 1
-            continue
-        # Parse header.
-        headers = [c.strip() for c in line.strip("|").split("|")]
-        rows = []
-        j = i + 2
-        while j < len(lines):
-            row_line = lines[j].rstrip()
-            if not (row_line.startswith("|") and row_line.endswith("|")):
-                break
-            cells = [c.strip() for c in row_line.strip("|").split("|")]
-            if len(cells) != len(headers):
-                break
-            rows.append({"label": cells[0], "cells": cells[1:]})
-            j += 1
-        if rows:
-            tables.append({"headers": headers, "rows": rows})
-        i = j
-    return tables
 
 
 def _check_comparator_efficiency(run_dir: str) -> list[dict]:
@@ -2472,46 +2386,6 @@ _DALY_MENTION_RE = re.compile(
     r"|life[-\s]year[s]?\s+lost|YLL|YLD)\b",
     re.IGNORECASE,
 )
-# Headers that signal "this is a Limitations / Scope acknowledgment
-# section, not the main analysis body". We strip these from the text
-# before checking for DALY engagement so a single throwaway DALY
-# acknowledgment in Limitations doesn't satisfy the gate.
-_LIMITATIONS_HEADER_RE = re.compile(
-    r"^#{1,4}\s+\d*\.?\s*"
-    r"(?:Limitations?|Scope\s+Declaration|Caveats?|"
-    r"Unresolved\s+(?:HIGH|Blockers?)|Known\s+Issues?)"
-    r"[^\n]*$",
-    re.MULTILINE | re.IGNORECASE,
-)
-
-
-def _strip_limitations_and_scope(text: str) -> str:
-    """Remove §Limitations / §Scope Declaration / §Caveats sections
-    so DALY mentions in those sections don't satisfy the
-    daly_analysis_missing check. Returns the text with each such
-    section sliced from header to next same-level (or higher)
-    section header. Linear scan."""
-    out_parts = []
-    last_end = 0
-    headers = list(_LIMITATIONS_HEADER_RE.finditer(text))
-    for m in headers:
-        # Determine the level (count of '#' at the header start).
-        hdr_text = m.group(0)
-        level = len(hdr_text) - len(hdr_text.lstrip("#"))
-        # Find the next header at this level or shallower (more
-        # important).
-        next_header_re = re.compile(
-            rf"^#{{1,{level}}}\s+",
-            re.MULTILINE,
-        )
-        section_end = len(text)
-        for next_m in next_header_re.finditer(text, m.end()):
-            section_end = next_m.start()
-            break
-        out_parts.append(text[last_end:m.start()])
-        last_end = section_end
-    out_parts.append(text[last_end:])
-    return "".join(out_parts)
 
 
 def _check_daly_when_allocation(run_dir: str) -> list[dict]:

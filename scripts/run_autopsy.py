@@ -32,6 +32,11 @@ import os
 import sys
 from datetime import datetime
 
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
+from lib.safe_io import read_jsonl as _jsonl  # noqa: E402
+
 
 def _json(path):
     try:
@@ -39,20 +44,6 @@ def _json(path):
             return json.load(f)
     except (OSError, ValueError):
         return None
-
-
-def _jsonl(path):
-    out = []
-    try:
-        with open(path, errors="replace") as f:
-            for line in f:
-                try:
-                    out.append(json.loads(line))
-                except ValueError:
-                    continue
-    except OSError:
-        pass
-    return out
 
 
 def _ts(s):
