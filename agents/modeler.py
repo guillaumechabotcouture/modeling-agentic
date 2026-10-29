@@ -150,6 +150,13 @@ python3 scripts/compute.py map {run_dir} --fn models/<module>.py::<fn> \
     --purpose "<finding IDs, e.g. D-019>"
 ```
 
+For a batch that may run longer than a few minutes, add `--detach`: the
+command returns at once and the batch runs on in its own session, so a tool
+timeout cannot kill it. Then run
+`python3 scripts/compute.py wait {run_dir}/models/<batch>_results.jsonl --timeout-s 540`
+and repeat it while it exits 3 (still running); exit 0 means finished (1:
+finished with failed rows, 4: the batch died; rerun the same map command).
+
 `--purpose` names what the batch is for: the critique finding IDs it
 addresses, or the plan item for first-round work (`"plan: impact library"`).
 It is recorded with the batch's core-hours, and the run's convergence report

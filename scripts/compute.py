@@ -45,6 +45,19 @@ earlier run of the same command (same function, code, data and params), so
 rerunning completes a stopped or partly failed batch (`--fresh` disables).
 `gate_findings(run_dir)` reports results files with rows that have no result.
 
+Phase 42 α, charging for work done: each ledgered call keeps a progress
+record (`{run_dir}/.compute_progress/`: core-seconds accounted for, chunks in
+flight with their share and start). A caller that dies without settling (an
+agent's tool timeout kills it; a defunct/zombie pid counts as dead) is
+charged that work plus a bound on its chunks still in flight, not its whole
+reservation; no readable record charges the reservation, and the ledger row
+says which. An interrupted call is charged what its stopped chunks reported.
+Rows are appended to `<out>.partial.jsonl` as they finish, so rerunning a
+killed batch keeps them. `map --detach` runs the batch in its own session
+and returns at once; `compute.py status <out>` / `wait <out> --timeout-s S`
+follow it (exit 0 finished, 1 finished with failed rows, 3 still running,
+4 died or no job).
+
 Known limits: a process the model starts in its own session (setsid,
 daemonizing) escapes the kill on a stop. Work redone by dask after a worker
 dies is not seen directly; a worker that vanishes during a call is charged as
@@ -54,7 +67,8 @@ own row. Files over --max-file-mb (default 100) are left out of the bundle
 and listed in the summary.
 
 Usage:
-    python3 scripts/compute.py map ...
+    python3 scripts/compute.py map ... [--detach]
+    python3 scripts/compute.py status|wait <out> [--timeout-s S]
     python3 scripts/compute.py --self-test
 """
 from __future__ import annotations
@@ -390,6 +404,11 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
                 _kill_groups(pids, grace_s=0, direct=False)
                 ex, shrink = new_pool(cap), False
                 rebudget()
+            now = time.time()
+            k = 0 if shrink else max(0, min(len(todo), cap - len(running)))
+            # Recorded before submitting, so a caller killed right after is charged for these too.
+            _note(progress, [{"n": 1, "started": t, "cores": 1} for _, t in running.values()]
+                  + [{"n": 1, "started": now, "cores": 1}] * k, extra_core_s=init_core_s())
             try:
                 while todo and len(running) < cap and not shrink:
                     f = ex.submit(_local_chunk, [todo[0]])
@@ -419,6 +438,7 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
                         continue
                     rows += got
                     progress["core_s"] += _known_core_s(got)
+                    _rows_done(progress, got)
                     seen_peak = max([seen_peak] + [r.get("peak_mb") or 0 for r in got])
             if broke:
                 # Every input still in flight dies with the pool: collect them all.
@@ -428,6 +448,7 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
                         got = f.result(timeout=0)
                         rows += got
                         progress["core_s"] += _known_core_s(got)
+                        _rows_done(progress, got)
                     except Exception:  # noqa: BLE001 — broken with the pool
                         crashed.append((item, t_sub))
                 running.clear()
@@ -479,11 +500,16 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
     finally:
         live = set((getattr(ex, "_processes", None) or {}).keys())   # not yet reaped
         pids |= live
+        # Phase 42 α: if this call is being interrupted, what it used is known:
+        # rows finished, model loads, and the inputs in flight (killed now).
+        t_end = time.time()
+        extra = sum(t_end - t for _, t in running.values()) + init_core_s()
         if running:
             _kill_groups(live)
             _kill_groups(pids - live, grace_s=0, direct=False)
         ex.shutdown(wait=True, cancel_futures=True)
         _kill_groups(pids, grace_s=0, direct=False)   # leftovers the model spawned (pool already reaped)
+        progress.update(settled=True, settled_extra_s=extra)
     # Model load time of every pool process (a process still loading when it
     # was killed is covered by the unfinished-chunk estimate).
     for name in os.listdir(init_dir.name):
@@ -854,6 +880,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
     exclude = {w.strip() for w in os.environ.get("MA_COMPUTE_EXCLUDE_WORKERS", "").split(",") if w.strip()}
     bundle, binfo = make_bundle(run_dir)
     call_id = uuid.uuid4().hex
+    t0_call = time.time()
     progress = {} if progress is None else progress
     with Client(addr, timeout="60s", security=_security()) as c:
         # Dask pickles functions by reference when it can, so the scheduler and
@@ -891,6 +918,10 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
         held = {}                                   # future -> its share
         learned = {"procs": None, "peak": peak_mb}
 
+        def inflight():
+            return [{"n": len(futs[f][0]), "share": held[f] or None, "started": started.get(f, time.time()),
+                     "cores": cores_per_slot} for f in held]
+
         def procs_for(override=None):
             p = [int(x) for x in (env_procs, learned["procs"], override) if x]
             return min(p) if p else None            # None: the worker uses its own core count
@@ -902,6 +933,9 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                 share = free / max(1, slots - len(held))
                 if share <= 0:
                     return None
+            # Recorded before submitting, so a caller killed right after is charged for it too.
+            _note(progress, inflight() + [{"n": len(ch), "share": share, "started": time.time(),
+                                           "cores": cores_per_slot}])
             # A lost chunk is resubmitted once here (and the lost attempt
             # charged), rather than through dask retries, which would hide it.
             f = c.submit(_remote_task, bfut, binfo["sha256"], run_dir, fn_spec, ch, deadline,
@@ -918,6 +952,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
         pending, rows, stop, lost = set(), [], None, 0
         try:
             while queue or pending:
+                _note(progress, inflight())
                 while queue and len(pending) < slots:
                     f = submit(*queue[0])
                     if f is None:
@@ -964,6 +999,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                             queue.append(([it for it in ch if it[0] in ids], TAIL, used))
                         rows += got["rows"]
                         progress["core_s"] += float(got["core_s"])
+                        _rows_done(progress, got["rows"], float(got["core_s"]))
                         progress.setdefault("chunks", []).append(
                             {"n": len(ch), "core_s": round(float(got["core_s"]), 1),
                              "task_s": round(_known_core_s(got["rows"]), 1),
@@ -1020,8 +1056,23 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                         except Exception:  # noqa: BLE001 — a failed settle stays unknown
                             continue
                         pending.discard(f)
+                        held.pop(f, None)
                 for f in pending:
                     f.cancel()
+            # Phase 42 α: if this call is being interrupted, the chunks not
+            # accounted for above (still out, or finished but not yet read) are
+            # bounded by their share and their time out, not the allowance.
+            t_end, extra = time.time(), 0.0
+            for f in list(held):
+                got_s = None
+                if f not in pending and f.done():
+                    try:
+                        got_s = float(f.result(timeout=0)["core_s"])
+                    except Exception:  # noqa: BLE001 — unknown: bounded below
+                        got_s = None
+                busy = (t_end - started.get(f, t0_call)) * cores_per_slot
+                extra += got_s if got_s is not None else (min(held[f], busy) if held[f] else busy)
+            progress.update(settled=True, settled_extra_s=extra)
             # The scheduler silently reruns tasks from a worker that died; that
             # attempt's work is invisible here, so a vanished worker is charged
             # as busy for the whole call.
@@ -1087,26 +1138,220 @@ class _LedgerLock:
         return False
 
 
+def _proc_stat(pid: int) -> list | None:
+    """Fields of /proc/<pid>/stat after the command name (Linux), or None."""
+    try:
+        with open(f"/proc/{int(pid)}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _pid_start(pid: int) -> str | None:
+    """When process `pid` started, as a token (None if unknown): a pid reused
+    by a later process has a different token."""
+    st = _proc_stat(pid)
+    if st and len(st) > 19:
+        return "proc:" + st[19]                   # field 22, starttime in clock ticks
+    try:
+        import psutil
+        return f"psutil:{psutil.Process(int(pid)).create_time():.2f}"
+    except Exception:  # noqa: BLE001 — no psutil, or the process is gone
+        return None
+
+
+def _pid_alive(pid, start: str | None = None) -> bool:
+    """Phase 42 α: is `pid` a running process? False when it is gone, when it
+    is defunct (a zombie: `os.kill(pid, 0)` succeeds on one; E7 attempt 8 held
+    a 400 core-hour reservation for 7+ hours on a zombie caller), or when its
+    start token differs from `start` (the pid was reused)."""
+    try:
+        pid = int(pid)
+        os.kill(pid, 0)
+    except PermissionError:
+        pass                                      # exists, owned by another user
+    except (OSError, ValueError, TypeError, OverflowError):
+        return False
+    st = _proc_stat(pid)
+    if st is not None:
+        state = st[0] if st else None
+    else:
+        state = None
+        try:
+            import psutil
+            try:
+                state = "Z" if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE else "R"
+            except psutil.NoSuchProcess:
+                return False
+            except psutil.Error:
+                state = None
+        except ImportError:
+            import subprocess
+            try:
+                out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True,
+                                     timeout=10).stdout.strip()
+                if not out:
+                    return False
+                state = out[:1]
+            except (OSError, subprocess.SubprocessError):
+                state = None                      # cannot tell: os.kill said it exists
+    if state in ("Z", "X", "x"):
+        return False
+    if start:
+        now = _pid_start(pid)
+        if now is not None and now.split(":")[0] == start.split(":")[0] and now != start:
+            return False
+    return True
+
+
+PROGRESS_DIR = ".compute_progress"    # under the run dir, outside models/ and data/ (not fingerprinted or bundled)
+
+
+def _note(progress: dict, out: list, extra_core_s: float = 0.0) -> None:
+    """Phase 42 α: persist what a ledgered call has done and what it has in
+    flight (`out`: [{"n": tasks, "share": core-s or None, "started": t,
+    "cores": cores}]), so a caller killed without settling (an agent's tool
+    timeout, SIGKILL) is charged for work done, not its whole reservation.
+    Written before new work is submitted. If a write fails the record is
+    removed, so settlement falls back to charging the reservation."""
+    path = progress.get("_file")
+    if not path:
+        return
+    rec = {"t": time.time(), "core_s": round(float(progress.get("core_s") or 0) + extra_core_s, 1),
+           "done_tasks": int(progress.get("done_tasks") or 0),
+           "max_task_core_s": round(float(progress.get("max_task_core_s") or 0), 2),
+           "remote_unconfirmed": bool(progress.get("remote_unconfirmed")), "out": out}
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(rec, f)
+        os.replace(tmp, path)
+    except (OSError, TypeError, ValueError):
+        progress["_file"] = None
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _task_seen(progress: dict, n: int, core_s: float) -> None:
+    """Record `n` finished tasks that took `core_s` (the per-task bound for work in flight)."""
+    if n > 0:
+        progress["done_tasks"] = int(progress.get("done_tasks") or 0) + n
+        progress["max_task_core_s"] = max(float(progress.get("max_task_core_s") or 0), float(core_s) / n)
+
+
+def _rows_done(progress: dict, rows: list, core_s: float | None = None) -> None:
+    """Finished rows: update the per-task bound and hand them to the row sink
+    (`<out>.partial.jsonl`). A failing sink is switched off, never the batch."""
+    timed = [r for r in rows if isinstance(r.get("seconds"), (int, float))]
+    if core_s is None:
+        _task_seen(progress, len(timed), _known_core_s(timed))
+    else:                                         # a chunk's total (overheads included) over the rows that ran
+        _task_seen(progress, len(timed) or len(rows), core_s)
+    sink = progress.get("_rows")
+    if sink and rows:
+        try:
+            sink(rows)
+        except Exception as e:  # noqa: BLE001
+            progress["_rows"] = None
+            print(f"[compute] partial results not written ({type(e).__name__}: {e}); the batch continues",
+                  file=sys.stderr, flush=True)
+
+
+def _history_task_core_s(led, fn) -> float | None:
+    """Twice the largest per-task core time of this function's earlier clean calls, or None."""
+    per = [float(c["task_core_s"]) / int(c["n"]) for c in led.get("calls", [])
+           if isinstance(c, dict) and c.get("fn") == fn and not c.get("stopped") and not c.get("n_failed")
+           and isinstance(c.get("n"), int) and c["n"] > 0 and isinstance(c.get("task_core_s"), (int, float))]
+    return 2 * max(per) if per else None
+
+
+def _settle_dead(led, r, now=None) -> tuple[float, str, dict]:
+    """Phase 42 α: what a caller that died without settling is charged, and why.
+
+    From its progress record: the core-seconds it had accounted for, plus for
+    each chunk (or input) still in flight, an upper bound on what it can use
+    after the caller died (its remote chunks may keep running): the least of
+    its share of the allowance, its cores x the time since it started, and
+    its tasks x the largest per-task core time seen in this call (else twice
+    that of this function's earlier clean calls), but never less than what it
+    had run when last recorded. Never more than the reservation. Fail closed:
+    no readable record (or remote chunks not confirmed stopped) charges the
+    whole reservation, as before."""
+    now = time.time() if now is None else now
+    held = float(r.get("core_s") or 0)
+    path = r.get("progress")
+    if not path:
+        return held, "caller died; no progress record (reserved before Phase 42); charged its reservation", {}
+    try:
+        p = json.load(open(path))
+        done = float(p["core_s"])
+        out = list(p.get("out") or [])
+        t_rec = float(p["t"])
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        return held, f"caller died; progress record unreadable ({type(e).__name__}); charged its reservation", {}
+    if p.get("remote_unconfirmed"):
+        return held, "caller died; remote chunks not confirmed stopped; charged its reservation", {}
+    seen = float(p.get("max_task_core_s") or 0)
+    per, src = (seen, "this call") if seen > 0 and int(p.get("done_tasks") or 0) > 0 else \
+        (_history_task_core_s(led, r.get("fn")), "2x earlier calls")
+    bound = 0.0
+    try:
+        for c in out:
+            cores, started = float(c.get("cores") or 1), float(c["started"])
+            ran = cores * max(0.0, t_rec - started)          # already used when last recorded
+            caps = [cores * max(0.0, now - started)]
+            if c.get("share"):
+                caps.append(float(c["share"]))
+            if per:
+                caps.append(max(ran, int(c.get("n") or 1) * per))
+            bound += min(caps)
+    except (KeyError, TypeError, ValueError) as e:
+        return held, f"caller died; progress record malformed ({type(e).__name__}); charged its reservation", {}
+    charge = min(held, done + bound)
+    why = (f"caller died; charged work done ({done:.0f} core-s) + in flight ({len(out)} chunks, "
+           f"<= {bound:.0f} core-s, per-task bound from {src if per else 'wall time and shares'}), "
+           f"not its reservation ({held:.0f} core-s)")
+    return charge, why, {"done_core_s": round(done, 1), "inflight_bound_core_s": round(bound, 1),
+                         "reserved_core_s": round(held, 1)}
+
+
+def _drop_progress(progress: dict) -> None:
+    path, progress["_file"] = progress.get("_file"), None
+    if path:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 def _live_reservations(led) -> float:
     """Core-seconds held by calls still running on this host. A call whose
-    process is gone without settling (killed caller) is charged its whole
-    reservation: its remote chunks may still be running up to that allowance."""
+    process is gone (or defunct) without settling is charged for its work
+    done and a bound on its chunks still in flight (`_settle_dead`)."""
     host, total = os.uname().nodename, 0.0
     for rid, r in list(led["reservations"].items()):
         alive = r.get("host") != host
         if r.get("host") == host:
             try:
-                os.kill(int(r["pid"]), 0)
-                alive = True
-            except (OSError, ValueError, KeyError):
+                alive = _pid_alive(int(r["pid"]), r.get("pid_start"))
+            except (ValueError, KeyError, TypeError):
                 alive = False
         if alive:
             total += float(r.get("core_s") or 0)
         else:
+            charge, why, parts = _settle_dead(led, r)
             del led["reservations"][rid]
-            led["core_seconds"] = round(led["core_seconds"] + float(r.get("core_s") or 0), 1)
-            led["calls"].append({"fn": r.get("fn"), "stopped": "caller died; charged its reservation",
-                                 "task_core_s": r.get("core_s"), "ts": time.strftime("%FT%T")})
+            led["core_seconds"] = round(led["core_seconds"] + charge, 1)
+            led["calls"].append({"fn": r.get("fn"), "backend": r.get("backend"), "n": r.get("n"),
+                                 "purpose": r.get("purpose"), "out": r.get("out"), "stopped": why,
+                                 "task_core_s": round(charge, 1), **parts, "ts": time.strftime("%FT%T")})
+            if r.get("progress"):
+                try:
+                    os.remove(r["progress"])
+                except OSError:
+                    pass
     return total
 
 
@@ -1114,18 +1359,28 @@ def map_fn(run_dir: str, fn_spec: str, inputs: list, backend: str = "auto",
            max_workers: int | None = None, max_tasks: int = DEFAULT_MAX_TASKS,
            timeout_s: float | None = None, ledger: bool = True,
            max_core_hours: float | None = None, prior_ok: int = 0, purpose: str | None = None,
-           out: str | None = None) -> tuple[list[dict], dict]:
+           out: str | None = None, on_rows=None) -> tuple[list[dict], dict]:
     """Evaluate fn over inputs. Under the ledger, the call first reserves its
     allowance (`max_core_hours`, default MA_COMPUTE_CALL_CORE_HOURS = 50,
     never more than the run has left) and stops when it is used up;
     unfinished rows fail with "stopped: compute cap reached" or "timed out".
     A call that is interrupted is charged an upper bound of what it used.
     `purpose` (the finding IDs or plan item the batch serves) and `out` are
-    recorded with the call, so core-hours can be reported per finding."""
+    recorded with the call, so core-hours can be reported per finding.
+
+    Phase 42 α: a ledgered call keeps a progress record (work done, chunks in
+    flight) under `{run_dir}/.compute_progress/`; if its process dies without
+    settling, the next call charges it from that record (`_settle_dead`). An
+    interrupted call whose chunks were all stopped and accounted for is
+    charged what they reported. `on_rows(rows)` receives rows as they finish
+    (the CLI writes them to `<out>.partial.jsonl`)."""
     run_dir = os.path.realpath(run_dir)
     if len(inputs) > max_tasks:
         raise ValueError(f"{len(inputs)} tasks exceeds --max-tasks {max_tasks}")
     allowance_s, rid, hint = (None if max_core_hours is None else max_core_hours * 3600), None, None
+    if backend == "auto":
+        backend = "dask" if os.environ.get("MA_COMPUTE_SCHEDULER") else "local"
+    progress = {"_rows": on_rows}
     if ledger:
         cap_s = float(os.environ.get("MA_COMPUTE_MAX_CORE_HOURS", "200")) * 3600
         with _LedgerLock(run_dir) as led:
@@ -1143,16 +1398,23 @@ def map_fn(run_dir: str, fn_spec: str, inputs: list, backend: str = "auto",
                 float(os.environ.get("MA_COMPUTE_CALL_CORE_HOURS", "50"))
             allowance_s = min(remaining, per_call * 3600)
             rid = f"{os.uname().nodename}:{os.getpid()}:{time.time():.6f}"
+            pfile = os.path.join(run_dir, PROGRESS_DIR, hashlib.sha1(rid.encode()).hexdigest()[:16] + ".json")
+            try:
+                os.makedirs(os.path.dirname(pfile), exist_ok=True)
+                progress["_file"] = pfile
+                _note(progress, [])
+            except OSError:
+                progress["_file"] = None
             led["reservations"][rid] = {"core_s": allowance_s, "pid": os.getpid(),
-                                        "host": os.uname().nodename, "fn": fn_spec}
+                                        "pid_start": _pid_start(os.getpid()),
+                                        "host": os.uname().nodename, "fn": fn_spec, "backend": backend,
+                                        "n": len(inputs), "purpose": purpose, "out": out,
+                                        "progress": progress.get("_file"), "started": round(time.time(), 1)}
             # Phase 35: the last measured peak memory of this function starts the
             # call at a concurrency that fits, instead of rediscovering it by crashing.
             hint = ((led.get("mem_profile") or {}).get(fn_spec) or {}).get("peak_mb")
-    if backend == "auto":
-        backend = "dask" if os.environ.get("MA_COMPUTE_SCHEDULER") else "local"
     t0 = time.time()
     deadline = t0 + timeout_s if timeout_s else None
-    progress = {}
     try:
         if backend == "dask":
             rows, info = _map_dask(run_dir, fn_spec, inputs, max_workers, deadline=deadline,
@@ -1173,19 +1435,29 @@ def map_fn(run_dir: str, fn_spec: str, inputs: list, backend: str = "auto",
             core_s = max(core_s, allowance_s)    # stopped chunks not confirmed: charge the allowance
     except BaseException as e:
         if rid:
-            # Interrupted mid-batch: charge every slot as busy since the start
-            # (capped at the reservation), never zero.
-            used = progress.get("core_s", 0.0) + progress.get("slots", 0) * progress.get("cores_per_slot", 0) \
-                * (time.time() - t0)
-            # Remote chunks that could not be confirmed stopped may run on up
-            # to the call's allowance: charge all of it.
-            used = allowance_s if progress.get("remote_unconfirmed") else min(allowance_s, used)
+            if progress.get("remote_unconfirmed"):
+                # Remote chunks that could not be confirmed stopped may run on up
+                # to the call's allowance: charge all of it.
+                used, how = allowance_s, "remote chunks not confirmed stopped; charged the allowance"
+            elif progress.get("settled"):
+                # Phase 42 α: the backend stopped every chunk and accounted for it
+                # (what finished, what stopped chunks reported, a bound for the rest).
+                used = min(allowance_s, progress.get("core_s", 0.0) + progress.get("settled_extra_s", 0.0))
+                how = "charged work done and what its stopped chunks reported"
+            else:
+                # Interrupted before the backend could settle: every slot busy
+                # since the start (capped at the reservation), never zero.
+                used = min(allowance_s, progress.get("core_s", 0.0) + progress.get("slots", 0)
+                           * progress.get("cores_per_slot", 0) * (time.time() - t0))
+                how = "not settled; charged every slot as busy since the start"
             with _LedgerLock(run_dir) as led:
                 led["reservations"].pop(rid, None)
                 led["core_seconds"] = round(led["core_seconds"] + used, 1)
                 led["calls"].append({"fn": fn_spec, "backend": backend, "task_core_s": round(used, 1),
                                      "n": len(inputs), "n_failed": len(inputs), "purpose": purpose, "out": out,
-                                     "stopped": f"interrupted: {type(e).__name__}", "ts": time.strftime("%FT%T")})
+                                     "stopped": f"interrupted: {type(e).__name__}; {how}",
+                                     "ts": time.strftime("%FT%T")})
+                _drop_progress(progress)
         raise
     failed_by = {}
     for r in rows:
@@ -1202,6 +1474,7 @@ def map_fn(run_dir: str, fn_spec: str, inputs: list, backend: str = "auto",
         return rows, summary
     with _LedgerLock(run_dir) as led:
         led["reservations"].pop(rid, None)
+        _drop_progress(progress)
         led["core_seconds"] = round(led["core_seconds"] + core_s, 1)
         led["calls"].append({k: summary.get(k) for k in ("backend", "workers", "n", "n_failed", "failed_by_kind",
                                                          "wall_s", "task_core_s", "estimated_core_s", "model_s",
@@ -1225,7 +1498,8 @@ def code_fingerprint(run_dir: str, fn_spec: str, exclude=()) -> str:
     """What a result depends on besides its params: every file under the run's
     models/ and data/ (following symlinked directories) and the repo's
     scripts/, except (outside data/) logs, figures, summaries, the ledger, and
-    this call's own results file (`exclude`); files up to 64 MB by content, larger ones by
+    this call's own results file (`exclude`), and any batch's partial rows or
+    detached-job record; files up to 64 MB by content, larger ones by
     size and mtime. Any change and earlier rows are not reused."""
     run_dir = os.path.realpath(run_dir)
     h = hashlib.sha256()
@@ -1255,6 +1529,7 @@ def code_fingerprint(run_dir: str, fn_spec: str, exclude=()) -> str:
             for fn in fns:
                 is_output = fn + ".summary.json" in names     # another call's results file, any extension
                 if not in_data and not is_output and (fn.endswith(_FP_SKIP_EXT) or fn.endswith(".summary.json")
+                                                      or fn.endswith((PARTIAL_EXT, JOB_EXT))
                                                       or fn.startswith("compute_ledger.json")):
                     continue          # logs, figures, summaries, the ledger (never skipped under data/)
                 files.add(os.path.join(dp, fn))
@@ -1291,16 +1566,35 @@ def input_keys(inputs) -> list[str]:
     return keys
 
 
+PARTIAL_EXT, JOB_EXT = ".partial.jsonl", ".job.json"
+
+
 def _reusable(out: str, fn_spec: str, fp: str) -> dict:
-    """key -> ok row from an earlier --out of the same function and code."""
+    """key -> ok row from an earlier --out of the same function and code, and
+    (Phase 42 α) from the rows an interrupted or killed run of it had written
+    to `<out>.partial.jsonl` (its first line names the function and code)."""
+    got = {}
     try:
         prev = json.load(open(out + ".summary.json"))
-        if prev.get("fn") != fn_spec or prev.get("code_fp") != fp:
-            return {}
-        rows = [json.loads(l) for l in open(out) if l.strip()]
+        if prev.get("fn") == fn_spec and prev.get("code_fp") == fp:
+            got.update({r["key"]: r for r in (json.loads(l) for l in open(out) if l.strip())
+                        if isinstance(r, dict) and r.get("ok") and r.get("key")})
     except (OSError, ValueError):
-        return {}
-    return {r["key"]: r for r in rows if isinstance(r, dict) and r.get("ok") and r.get("key")}
+        pass
+    try:
+        with open(out + PARTIAL_EXT) as f:
+            head = json.loads(f.readline() or "{}").get("_partial") or {}
+            if head.get("fn") == fn_spec and head.get("code_fp") == fp:
+                for line in f:
+                    try:
+                        r = json.loads(line)
+                    except ValueError:
+                        continue                  # a line torn by a kill mid-write
+                    if isinstance(r, dict) and r.get("ok") and r.get("key"):
+                        got.setdefault(r["key"], r)
+    except (OSError, ValueError, AttributeError):
+        pass
+    return got
 
 
 def run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dict], dict]:
@@ -1310,13 +1604,30 @@ def run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dict
     Writes --out and its summary; returns (rows, summary)."""
     rel_out = os.path.relpath(os.path.realpath(out), os.path.realpath(run_dir))
     fp = code_fingerprint(run_dir, fn_spec, exclude=(out, out + ".tmp", out + ".summary.json",
-                                                     out + ".summary.json.tmp"))
+                                                     out + ".summary.json.tmp", out + PARTIAL_EXT,
+                                                     out + JOB_EXT, out + ".log"))
     keys = input_keys(inputs)
     old = {} if fresh else _reusable(out, fn_spec, fp)
     todo = [k for k, key in enumerate(keys) if key not in old]
     if todo:
-        new_rows, summary = map_fn(run_dir, fn_spec, [inputs[k] for k in todo],
-                                   prior_ok=len(inputs) - len(todo), out=rel_out, **kw)
+        # Phase 42 α: rows are appended to <out>.partial.jsonl as they finish, so
+        # an interrupted or killed batch keeps them (rerunning reuses them).
+        part = open(out + PARTIAL_EXT, "w")
+        part.write(json.dumps({"_partial": {"fn": fn_spec, "code_fp": fp, "n": len(inputs)}}) + "\n")
+        for key, r in old.items():
+            part.write(json.dumps({**r, "key": key}) + "\n")
+        part.flush()
+
+        def sink(got):
+            for r in got:
+                if 0 <= r.get("i", -1) < len(todo):
+                    part.write(json.dumps({**r, "key": keys[todo[r["i"]]]}) + "\n")
+            part.flush()
+        try:
+            new_rows, summary = map_fn(run_dir, fn_spec, [inputs[k] for k in todo],
+                                       prior_ok=len(inputs) - len(todo), out=rel_out, on_rows=sink, **kw)
+        finally:
+            part.close()
     else:
         new_rows, summary = [], {"n": 0, "n_ok": 0, "n_failed": 0, "failed_by_kind": {}, "wall_s": 0.0,
                                  "task_core_s": 0.0, "stopped": None}
@@ -1341,6 +1652,10 @@ def run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dict
     os.replace(tmp, out)
     json.dump(summary, open(out + ".summary.json.tmp", "w"), indent=1)
     os.replace(out + ".summary.json.tmp", out + ".summary.json")
+    try:
+        os.remove(out + PARTIAL_EXT)
+    except OSError:
+        pass
     return rows, summary
 
 
@@ -1896,11 +2211,195 @@ def _self_test() -> int:
                     pr.wait(10)
     _self_test_p35(ok)
     _self_test_p37(ok)
+    _self_test_p42(ok)
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_p42(ok) -> None:
+    """Phase 42 α: callers that die or are interrupted are charged for work
+    done; zombies are dead; detached batches outlive their caller."""
+    import signal
+    import subprocess as _sp
+    import tempfile
+    env = {k: v for k, v in os.environ.items() if not k.startswith("MA_COMPUTE_")}
+    host = os.uname().nodename
+
+    def ledger(d):
+        return json.load(open(os.path.join(d, LEDGER_REL)))
+
+    def wait_rows(path, k, limit=60):
+        end = time.time() + limit
+        while time.time() < end:
+            try:
+                if sum(1 for _ in open(path)) - 1 >= k:
+                    return True
+            except OSError:
+                pass
+            time.sleep(0.05)
+        return False
+
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        open(os.path.join(d, "models", "slow.py"), "w").write(
+            "import time\ndef sleep(p):\n    time.sleep(p['s']); return {'k': p['k']}\n")
+        inp = os.path.join(d, "models", "in.jsonl")
+        open(inp, "w").write("".join(json.dumps({"s": 1.0, "k": k}) + "\n" for k in range(8)))
+        out = os.path.join(d, "models", "out.jsonl")
+        cmd = [sys.executable, os.path.abspath(__file__), "map", d, "--fn", "models/slow.py::sleep", "--inputs", inp,
+               "--out", out, "--backend", "local", "--max-workers", "2", "--max-core-hours", "1", "--purpose", "P42"]
+
+        # P42-1 (bug: os.kill(pid, 0) succeeds on a defunct process, so a zombie
+        # caller's reservation was held forever): a real zombie child is dead.
+        z = _sp.Popen([sys.executable, "-c", "pass"])
+        time.sleep(1.0)                           # exited, not reaped: a zombie
+        try:
+            os.kill(z.pid, 0)
+            kill_ok = True
+        except OSError:
+            kill_ok = False
+        ok(kill_ok and not _pid_alive(z.pid) and _pid_alive(os.getpid(), _pid_start(os.getpid())),
+           f"P42-1 a zombie is dead though os.kill(pid, 0) succeeds on it ({kill_ok}); this process is alive")
+        tok = _pid_start(os.getpid())
+        if tok:
+            ok(not _pid_alive(os.getpid(), tok + "9"), "P42-1b a reused pid (start token differs) is dead")
+        # P42-2 (bug: a dead caller was charged its whole reservation): a zombie
+        # caller with a progress record is charged its work, and released.
+        pf = os.path.join(d, "rec.json")
+        json.dump({"t": time.time(), "core_s": 100.0, "done_tasks": 10, "max_task_core_s": 10.0, "out": []}, open(pf, "w"))
+        os.makedirs(os.path.join(d, "models"), exist_ok=True)
+        json.dump({"core_seconds": 0.0, "calls": [], "reservations": {"z": {
+            "core_s": 1440000.0, "pid": z.pid, "host": host, "fn": "f", "progress": pf}}},
+            open(os.path.join(d, LEDGER_REL), "w"))
+        map_fn(d, "models/slow.py::sleep", [], backend="local")
+        led = ledger(d)
+        ok(not led["reservations"] and abs(led["core_seconds"] - 100.0) < 1e-6
+           and "charged work done" in led["calls"][0]["stopped"] and not os.path.exists(pf),
+           f"P42-2 a zombie caller is settled for its 100 core-s of work, not 1,440,000: {led}")
+        z.wait()
+        # P42-3 (bug: in-flight chunks were charged the allowance): bounds per chunk.
+        now = time.time()
+        rec = {"t": now - 30, "core_s": 100.0, "done_tasks": 20, "max_task_core_s": 3.0,
+               "out": [{"n": 10, "share": 5000.0, "started": now - 50, "cores": 4},     # ran 80 by the record: 80
+                       {"n": 2, "share": 20.0, "started": now - 40, "cores": 4}]}       # share caps it: 20
+        json.dump(rec, open(pf, "w"))
+        charge, why, _ = _settle_dead({"calls": []}, {"core_s": 9000.0, "progress": pf, "fn": "f"}, now=now)
+        ok(abs(charge - 200.0) < 1e-6 and "this call" in why,
+           f"P42-3 in-flight chunks bounded by share, time out and per-task time: {charge} ({why})")
+        rec.update(t=now - 100, done_tasks=0, max_task_core_s=0.0,
+                   out=[{"n": 10, "share": None, "started": now - 100, "cores": 4}])
+        json.dump(rec, open(pf, "w"))
+        hist = {"calls": [{"fn": "f", "n": 10, "n_failed": 0, "task_core_s": 30.0, "stopped": None}]}
+        charge, why, _ = _settle_dead(hist, {"core_s": 9000.0, "progress": pf, "fn": "f"}, now=now)
+        ok(abs(charge - 160.0) < 1e-6 and "2x earlier" in why,
+           f"P42-3b with no finished task, twice an earlier call's per-task time bounds it: {charge} ({why})")
+        # P42-4 fail closed (bug: an unreadable record must not hand out a discount).
+        for content, what in ((None, "no record"), ("{not json", "unreadable"),
+                              (json.dumps({**rec, "remote_unconfirmed": True}), "not confirmed")):
+            r = {"core_s": 9000.0, "fn": "f"}
+            if content is not None:
+                open(pf, "w").write(content)
+                r["progress"] = pf
+            charge, why, _ = _settle_dead(hist, r, now=now)
+            ok(charge == 9000.0 and "charged its reservation" in why,
+               f"P42-4 fail closed ({what}): the reservation is charged and the row says why: {charge} {why}")
+
+        # P42-5 a caller killed mid-batch (SIGKILL to its group, as a tool timeout
+        # does), left a zombie: the next call charges its work, not 3,600 core-s;
+        # rerunning the command keeps the rows it had finished.
+        os.remove(os.path.join(d, LEDGER_REL))
+        t0 = time.time()
+        p = _sp.Popen(cmd, env=env, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, start_new_session=True)
+        got = wait_rows(out + PARTIAL_EXT, 3)
+        os.killpg(p.pid, signal.SIGKILL)
+        el = time.time() - t0
+        time.sleep(0.3)
+        map_fn(d, "models/slow.py::sleep", [], backend="local")
+        led = ledger(d)
+        c = (led["calls"] or [{}])[0]
+        ok(got and not led["reservations"] and "caller died; charged work done" in str(c.get("stopped"))
+           and 3.0 <= c["task_core_s"] <= 2 * el + 15 and c.get("purpose") == "P42",
+           f"P42-5 a killed caller is charged its work ({c.get('task_core_s')} core-s in {el:.1f}s), not 3,600: {c}")
+        p.wait()
+        r = _sp.run(cmd, env=env, capture_output=True, text=True, timeout=120)
+        s = json.load(open(out + ".summary.json")) if os.path.exists(out + ".summary.json") else {}
+        ok(r.returncode == 0 and s.get("reused", 0) >= 3 and s.get("n_ok") == 8 and not os.path.exists(out + PARTIAL_EXT),
+           f"P42-5b rerunning after the kill keeps the rows finished before it: {s} {r.stderr[-300:]}")
+
+        # P42-6 an interrupted call (SIGTERM) is charged what ran, settled by the backend.
+        os.remove(os.path.join(d, LEDGER_REL))
+        t0 = time.time()
+        p = _sp.Popen(cmd + ["--fresh"], env=env, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+        wait_rows(out + PARTIAL_EXT, 2)
+        p.send_signal(signal.SIGTERM)
+        p.wait(60)
+        el = time.time() - t0
+        c = ledger(d)["calls"][-1]
+        ok("interrupted: KeyboardInterrupt; charged work done" in c["stopped"] and 2.0 <= c["task_core_s"] <= 2 * el + 15,
+           f"P42-6 an interrupted call is charged what ran ({c['task_core_s']} core-s in {el:.1f}s): {c}")
+
+        # P42-7 a detached batch outlives its caller (killed with its whole group);
+        # status reports it running, wait reports it finished.
+        for f in (out, out + ".summary.json"):
+            os.remove(f)
+        wrapper = _sp.Popen(["/bin/sh", "-c", " ".join(_sp.list2cmdline([x]) for x in cmd + ["--detach"]) + "; sleep 60"],
+                            env=env, stdout=_sp.PIPE, text=True, start_new_session=True)
+        line = wrapper.stdout.readline()
+        os.killpg(wrapper.pid, signal.SIGKILL)
+        wrapper.wait()
+        try:
+            det = json.loads(line)
+        except ValueError:
+            det = {}
+        st = _sp.run([sys.executable, os.path.abspath(__file__), "status", out], env=env, capture_output=True, text=True)
+        w = _sp.run([sys.executable, os.path.abspath(__file__), "wait", out, "--timeout-s", "90"], env=env,
+                    capture_output=True, text=True, timeout=150)
+        try:
+            ws = json.loads(w.stdout)
+        except ValueError:
+            ws = {}
+        ok(det.get("detached") and st.returncode == 3 and '"running"' in st.stdout,
+           f"P42-7 --detach returns at once and status reports the batch running: {line!r} {st.stdout[-200:]}")
+        ok(w.returncode == 0 and ws.get("state") == FINISHED and (ws.get("summary") or {}).get("n_ok") == 8,
+           f"P42-7b the detached batch finished after its caller's group was killed: {w.stdout[-300:]} {w.stderr[-200:]}")
+        ok(_sp.run([sys.executable, os.path.abspath(__file__), "status", os.path.join(d, "none.jsonl")],
+                   env=env, capture_output=True).returncode == 4, "P42-7c status of an unknown batch exits 4")
+
+    # P42-8 (dask): an interrupted call on a pool still scaling up is charged its
+    # chunks' reports, not every target slot as busy since the start.
+    try:
+        from distributed import LocalCluster
+    except ImportError:
+        print("  (P42-8 skipped: distributed not installed)")
+        return
+    with tempfile.TemporaryDirectory() as d, \
+            LocalCluster(n_workers=1, threads_per_worker=1, processes=True, dashboard_address=None) as lc:
+        os.makedirs(os.path.join(d, "models"))
+        open(os.path.join(d, "models", "slow.py"), "w").write(
+            "import time\ndef sleep(p):\n    time.sleep(p['s']); return {'k': p['k']}\n")
+        code = ("import json, os, sys; sys.path.insert(0, %r); import compute; "
+                "from distributed import Client; c = Client(os.environ['MA_COMPUTE_SCHEDULER']); "
+                "compute.register_compute_tags(c, exclude=[]); c.close(); "
+                "compute.map_fn(%r, 'models/slow.py::sleep', [{'s': 1.0, 'k': k} for k in range(80)], "
+                "max_core_hours=1.0, purpose='P42-8')") % (HERE, d)
+        envd = dict(env, MA_COMPUTE_SCHEDULER=lc.scheduler_address, MA_COMPUTE_RESOURCE="compute",
+                    MA_COMPUTE_TARGET_WORKERS="6", MA_COMPUTE_PROCS_PER_WORKER="1", MA_COMPUTE_SETTLE_S="30")
+        t0 = time.time()
+        p = _sp.Popen([sys.executable, "-c", code], env=envd, stdout=_sp.DEVNULL, stderr=_sp.PIPE, text=True)
+        time.sleep(8.0)
+        p.send_signal(signal.SIGINT)
+        err = p.communicate(timeout=120)[1]
+        el = time.time() - t0
+        try:
+            c = ledger(d)["calls"][-1]
+        except (OSError, ValueError, IndexError):
+            c = {}
+        ok("charged work done" in str(c.get("stopped")) and 0 < c.get("task_core_s", 0) <= el + 5,
+           f"P42-8 an interrupted dask call on 1 of 6 target workers is charged ~1 worker's time "
+           f"({c.get('task_core_s')} core-s in {el:.1f}s; before: about 6 x elapsed): {c} {err[-300:]}")
 
 
 def _self_test_p37(ok) -> None:
@@ -2168,10 +2667,76 @@ def _self_test_p35(ok) -> None:
            f"P35-31 a shrinking pool's allowance stop counts the inputs still running ({el:.1f}s): {s.get('stopped')}")
 
 
+RUNNING, FINISHED, DIED, NO_JOB = "running", "finished", "died", "no detached job"
+_STATUS_EXIT = {FINISHED: 0, RUNNING: 3, DIED: 4, NO_JOB: 4}
+
+
+def job_status(out: str) -> dict:
+    """Phase 42 α: state of the detached batch writing `out`: running,
+    finished (its summary was written after it started), died (gone without
+    a summary: rerun the same command; finished rows are kept), or no
+    detached job. Rows done are counted from `<out>.partial.jsonl`."""
+    try:
+        job = json.load(open(out + JOB_EXT))
+        pid, t0 = int(job["pid"]), float(job["started"])
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        return {"state": NO_JOB, "out": out, "error": f"{out + JOB_EXT}: {type(e).__name__}"}
+    st = {"out": out, "pid": pid, "n": job.get("n"), "elapsed_s": round(time.time() - t0, 1), "log": job.get("log")}
+    if _pid_alive(pid, job.get("pid_start")):
+        rows = 0
+        try:
+            with open(out + PARTIAL_EXT) as f:
+                rows = max(0, sum(1 for _ in f) - 1)
+        except OSError:
+            pass
+        return {"state": RUNNING, "rows_done": rows, **st}
+    try:
+        fresh = os.path.getmtime(out + ".summary.json") >= t0 - 1
+        summ = json.load(open(out + ".summary.json")) if fresh else None
+    except (OSError, ValueError):
+        summ = None
+    if isinstance(summ, dict):
+        return {"state": FINISHED, **st, "summary": {k: v for k, v in summ.items() if k not in ("bundle", "chunks")}}
+    tail = ""
+    try:
+        tail = open(job.get("log") or "").read()[-1500:]
+    except OSError:
+        pass
+    return {"state": DIED, **st, "log_tail": tail,
+            "next": "the batch stopped without finishing; read the log, then rerun the same map command "
+                    "(rows already finished are kept)"}
+
+
+def _detach(argv: list, out: str, n: int) -> int:
+    """Start this same `map` command in its own session (an agent's tool
+    timeout or a killed shell does not reach it) and return at once."""
+    import subprocess
+    st = job_status(out)
+    if st["state"] == RUNNING:
+        print(json.dumps({"detached": False, "error": "a detached batch is already writing this --out", **st}))
+        return 4
+    log = out + ".log"
+    t0 = time.time()
+    with open(log, "w") as lf:
+        p = subprocess.Popen([sys.executable, os.path.abspath(__file__)] + argv, stdin=subprocess.DEVNULL,
+                             stdout=lf, stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
+    job = {"pid": p.pid, "pid_start": _pid_start(p.pid), "started": t0, "n": n, "log": log, "argv": argv}
+    tmp = out + JOB_EXT + ".tmp"
+    json.dump(job, open(tmp, "w"), indent=1)
+    os.replace(tmp, out + JOB_EXT)
+    print(json.dumps({"detached": True, "pid": p.pid, "out": out, "log": log,
+                      "next": f"python3 scripts/compute.py wait {out} --timeout-s 540  "
+                              "(repeat while it exits 3 = still running)"}))
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Run a model function over many parameter sets")
-    ap.add_argument("cmd", nargs="?", choices=["map"])
-    ap.add_argument("run_dir", nargs="?")
+    ap.add_argument("cmd", nargs="?", choices=["map", "status", "wait"])
+    ap.add_argument("run_dir", nargs="?", help="map: the run directory; status/wait: the batch's --out file")
+    ap.add_argument("--detach", action="store_true",
+                    help="run the batch in its own session and return at once; follow it with "
+                         "`compute.py wait <out>` (an agent tool timeout cannot kill it)")
     ap.add_argument("--fn")
     ap.add_argument("--inputs")
     ap.add_argument("--out")
@@ -2191,6 +2756,19 @@ def main() -> int:
     a = ap.parse_args()
     if a.self_test:
         return _self_test()
+    if a.cmd in ("status", "wait"):
+        if not a.run_dir:
+            ap.error(f"usage: compute.py {a.cmd} <out.jsonl> [--timeout-s S]")
+        end = time.time() + (a.timeout_s if a.timeout_s is not None else 540)
+        st = job_status(a.run_dir)
+        while a.cmd == "wait" and st["state"] == RUNNING and time.time() < end:
+            time.sleep(min(5.0, max(0.1, end - time.time())))
+            st = job_status(a.run_dir)
+        print(json.dumps(st))
+        code = _STATUS_EXIT[st["state"]]
+        if st["state"] == FINISHED and (st.get("summary") or {}).get("n_failed"):
+            code = 1
+        return code
     import signal
 
     def _on_term(*_):
@@ -2214,6 +2792,10 @@ def main() -> int:
         ap.error("--purpose is required: name the finding IDs this batch addresses (e.g. --purpose 'D-019') "
                  "or the plan item it serves (e.g. --purpose 'plan: impact library'). It is recorded with the "
                  "batch's core-hours in models/compute_ledger.json.")
+    if a.detach:
+        if a.no_ledger:
+            ap.error("--detach is for ledgered batches")
+        return _detach([x for x in sys.argv[1:] if x != "--detach"], a.out, len(_read_inputs(a.inputs)))
     if a.no_ledger:   # a remote chunk: plain map, no reuse (the caller already chose the rows)
         rows, summary = map_fn(a.run_dir, a.fn, _read_inputs(a.inputs), a.backend, a.max_workers,
                                a.max_tasks, a.timeout_s, ledger=False, max_core_hours=a.max_core_hours)
