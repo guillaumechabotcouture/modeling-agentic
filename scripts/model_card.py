@@ -327,10 +327,18 @@ def _third_party_versions(run_dir: str) -> dict:
 def _unrecorded_run_modules(run_dir: str, sources: dict) -> list[str]:
     """Run modules loaded in this process that `sources` does not record, or whose bytes differ."""
     rd = os.path.realpath(run_dir)
+    ad = os.path.abspath(run_dir)
     out = []
     for m in list(sys.modules.values()):
         f = getattr(m, "__file__", None)
-        if not f or not os.path.realpath(f).startswith(os.path.join(rd, "")):
+        if not f:
+            continue
+        a = os.path.abspath(f)
+        if any(a.startswith(os.path.join(x, "")) for x in (ad, rd)) \
+                and not os.path.realpath(f).startswith(os.path.join(rd, "")):
+            out.append(f"{os.path.basename(a)} (a symlink to code outside the run)")
+            continue
+        if not os.path.realpath(f).startswith(os.path.join(rd, "")):
             continue
         rel = os.path.relpath(os.path.realpath(f), rd)
         if rel not in sources:
@@ -383,7 +391,7 @@ def _worker(job_path: str, out_path: str) -> int:
                 res["evals"][name] = rows
             # Codex review: a module imported only on a branch the queries take is not in the
             # recorded code; every run module loaded now must be recorded, with the same bytes.
-            exp = (job.get("expected_fingerprint") or {}).get("sources")
+            exp = (job.get("expected_fingerprint") or res.get("fingerprint") or {}).get("sources")
             if isinstance(exp, dict):
                 late = _unrecorded_run_modules(run_dir, exp)
                 if late:
@@ -715,6 +723,9 @@ def build(run_dir: str, evaluate: bool = True, timeout: float | None = DEFAULT_T
             fn_entry["loaded"] = False
             fn_entry["load_error"] = wres["load_error"]
             reasons.append(f"{spec} cannot be loaded: {wres['load_error']}")
+        elif wres.get("fingerprint_mismatch"):
+            fn_entry["loaded"] = False
+            reasons.append(wres["fingerprint_mismatch"])
         else:
             fn_entry.update({"loaded": True, "signature": wres.get("signature"), "doc": wres.get("doc"),
                              "load_seconds": wres.get("load_s"), "fingerprint": wres.get("fingerprint")})
@@ -990,6 +1001,17 @@ def _self_test() -> int:
         ok(os.path.exists(os.path.join(d, CARD)) and "## Valid domain" in open(os.path.join(d, CARD_MD)).read()
            and yaml.safe_load(open(os.path.join(d, CARD)))["status"] == "usable",
            f"MC9b card files written; got {c['status']} {c['not_usable_reasons']}")
+        # MC11: run code that is a symlink to code outside the run is not fingerprinted: not usable.
+        with tempfile.TemporaryDirectory() as ext:
+            open(os.path.join(ext, "helper.py"), "w").write("SCALE = 10.0\n")
+            os.remove(os.path.join(d, "models/helper.py"))
+            os.symlink(os.path.join(ext, "helper.py"), os.path.join(d, "models/helper.py"))
+            w("models/outcome_fn.py", _FN)
+            c = build(d)
+            ok(c["status"] == "not_usable" and any("symlink to code outside the run" in r for r in c["not_usable_reasons"]),
+               f"MC11 symlinked external code fails closed; got {c['not_usable_reasons']}")
+            os.remove(os.path.join(d, "models/helper.py"))
+            w("models/helper.py", "SCALE = 10.0\n")
         # MC10: a model that hangs is stopped and reported.
         w("models/outcome_fn.py", "import time\ndef outcome_fn(p):\n    time.sleep(30)\n")
         c = build(d, timeout=3)

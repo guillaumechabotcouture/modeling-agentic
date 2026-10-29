@@ -237,8 +237,10 @@ def ask(run_dir: str, settings: dict, budget=None, objective=None, draws: int | 
     # extrapolation: such draws are left out, and too many of them refuse the query.
     # Registry-prior ranges are 95% intervals: the prior's tails are the run's own draws.
     declared = {k: e for k, e in card["domain"]["parameters"].items() if e.get("source") == "model_domain"}
+    # Paired queries also evaluate the unchanged draws, so the set inputs must be inside there too.
     inside = [i for i, p in enumerate(plist) if all(declared[k]["min"] <= v <= declared[k]["max"]
-                                                     for k, v in p.items() if k in declared and k not in overrides)]
+                                                     for k, v in p.items()
+                                                     if k in declared and (paired or k not in overrides))]
     if plist and (len(plist) - len(inside)) / len(plist) > MAX_FAIL_SHARE:
         return {**res, "status": "refused", "reasons": [
             f"{len(plist) - len(inside)} of {len(plist)} registry draws fall outside the ranges the run declares it "
@@ -477,6 +479,11 @@ def _self_test() -> int:
         ok(r8["status"] == "answered" and 0 < r8["draws"]["n_outside_declared_domain"] <= 40
            and r8["outputs"]["scalar"]["benefit"]["whatif_interval"]["n"] == 200 - r8["draws"]["n_outside_declared_domain"],
            f"A8f draws outside the declared range are left out; got {r8.get('reasons')} {r8.get('draws')}")
+        w("models/model_domain.yaml", "parameters:\n  unit_cost: {min: 4.9, max: 5.1, basis: grid}\n")
+        mc.write(d)
+        ok(ask(d, {"unit_cost": 5.0}, draws=40)["status"] == "answered"
+           and ask(d, {"unit_cost": 5.0}, draws=40, paired=True)["status"] == "refused",
+           "A8f2 paired queries check the unchanged draws of a set input against its declared range")
         os.remove(os.path.join(d, "models/model_domain.yaml"))
         # A8g: the registry changed after the card: refused (its draws are not the card's).
         mc.write(d)

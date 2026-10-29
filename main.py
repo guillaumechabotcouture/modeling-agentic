@@ -1111,6 +1111,9 @@ def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
         add_verdict_banner(run_path, gate)
         # Phase 44 α (E1): the model card, from the gated artifacts, before storage.
         write_model_card(run_path, integrity)
+        # The card ran the run's code: put back protected metadata it may have changed
+        # (any change is already an integrity violation).
+        _restore_protected_meta(os.path.join(run_path, "metadata.json"), original_meta)
 
     harness_diff = enforcement.diff_harness(harness_before, enforcement.hash_harness())
     enforcement.unlock_harness(_HARNESS_LOCK)
@@ -1123,6 +1126,8 @@ def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
     try:
         with open(metadata_path) as f:
             meta = json.load(f)
+        if not isinstance(meta, dict):
+            raise ValueError("metadata.json is not an object")
     except (OSError, ValueError):
         meta = {}
     # Phase 11 Commit η (F1): `completed` is the timestamp the run loop
