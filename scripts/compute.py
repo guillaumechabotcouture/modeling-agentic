@@ -719,7 +719,8 @@ def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: lis
             proc = subprocess.Popen(cmd, cwd=run_dir, env=env, stdout=subprocess.DEVNULL, stderr=errf,
                                     start_new_session=True)
             pidf = os.path.join(calls, str(proc.pid))
-            open(pidf + ".tmp", "w").write(str(proc.pid))
+            # pid and start token: _cancel_call signals it only while both still match
+            open(pidf + ".tmp", "w").write(f"{proc.pid} {_pid_start(proc.pid) or ''}")
             os.replace(pidf + ".tmp", pidf)
             # _cancel_call writes its mark, then scans pids; this side writes its
             # pid, then checks the mark: one of the two always sees the other.
@@ -770,17 +771,28 @@ def _stop_chunk(pid: int, grace_s: float = 5.0):
 
 def _cancel_call(call_id: str) -> int:
     """On a worker (client.run): stop this call's running chunks and keep its
-    queued ones from starting. Returns how many chunks were stopped."""
+    queued ones from starting. Returns how many chunks were stopped, or -1 if
+    a registered chunk that may still run could not be identified (its start
+    token unknown or unreadable): it is not signalled, and the caller treats
+    the stop as unconfirmed."""
     import tempfile
     calls = os.path.join(tempfile.gettempdir(), _CALLS_DIR, call_id)
     os.makedirs(calls, exist_ok=True)
     open(os.path.join(calls, "cancel"), "w").write(str(time.time()))
-    n = 0
+    n, unverified = 0, False
     for name in os.listdir(calls):
         if name.isdigit():
-            _stop_chunk(int(name))
-            n += 1
-    return n
+            try:
+                _, _, tok = open(os.path.join(calls, name)).read().partition(" ")
+            except OSError:
+                continue                          # unregistered as we looked: the chunk has ended
+            tok, cur = tok.strip(), _pid_start(int(name))
+            if tok and cur and cur == tok:
+                _stop_chunk(int(name))
+                n += 1
+            elif not (tok and cur) and (_pid_alive(int(name)) or _group_alive(int(name))):
+                unverified = True
+    return -1 if unverified else n
 
 
 try:
@@ -1064,7 +1076,10 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                 # timed-out calls were each charged the whole pool, ~65 real core-hours
                 # booked as 282, and the run cap stopped all further compute).
                 try:
-                    c.run(_cancel_call, call_id, workers=[w for w in c.scheduler_info()["workers"] if w not in exclude])
+                    got_c = c.run(_cancel_call, call_id,
+                                  workers=[w for w in c.scheduler_info()["workers"] if w not in exclude])
+                    if any(v == -1 for v in (got_c or {}).values()):
+                        progress["remote_unconfirmed"] = True     # a chunk could not be identified
                 except Exception:  # noqa: BLE001 — cannot confirm the remote stop
                     progress["remote_unconfirmed"] = True
                 try:
@@ -1185,11 +1200,18 @@ def _pid_start(pid: int) -> str | None:
         pass
     except Exception:  # noqa: BLE001 — the process is gone
         return None
+    return _ps_start(pid)
+
+
+def _ps_start(pid: int) -> str | None:
+    """Start time from `ps` in a fixed environment (UTC, C locale), so callers
+    with different TZ or locale settings get the same token for one process."""
     import subprocess
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "TZ": "UTC", "LC_ALL": "C", "LANG": "C"}
     try:
         out = subprocess.run(["ps", "-o", "lstart=", "-p", str(int(pid))], capture_output=True, text=True,
-                             timeout=10).stdout.strip()
-        return "ps:" + out if out else None
+                             timeout=10, env=env).stdout.strip()
+        return "ps:" + " ".join(out.split()) if out else None
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
 
@@ -1412,23 +1434,25 @@ def _stop_orphans(p: dict, backend: str | None) -> tuple[bool, str]:
     if backend == "local" or p.get("pids") is not None:
         if not p.get("pids_complete"):
             return False, "killed while starting pool processes (pids not recorded)"
-        # Each local pool process leads its own group, and what the model starts
-        # joins it: the group is stopped even when its leader has already exited.
-        # A pid cannot be reused while its group exists, so a pid now held by a
-        # different process (other start token) means the group is gone.
-        left = []
+        # A signal goes only to a process whose CURRENT start token was read and
+        # equals the recorded one (each pool process leads its own group, which
+        # holds what the model started). Anything else that may still be ours (no
+        # recorded token, or the current one unreadable: e.g. a group whose leader
+        # exited) is never signalled: it is left unconfirmed and the call is
+        # charged in full. A pid now held by another process (both tokens read,
+        # different) means ours is gone, with its group: a pid is not reused while
+        # its group exists.
+        left, unverified = [], []
         for pid, tok in p.get("pids") or []:
             pid = int(pid)
             cur = _pid_start(pid)
-            if tok and cur and cur.split(":")[0] == tok.split(":")[0] and cur != tok:
-                continue
-            if not tok:                           # cannot tell ours from a reused pid: never kill, fail closed
-                if _pid_alive(pid) or _group_live(pid):
-                    left.append(pid)
-                continue
-            if _pid_alive(pid, tok) or _group_live(pid):
-                _killpg(pid, 9, direct=_pid_alive(pid, tok))
+            if tok and cur and cur == tok:
+                _killpg(pid, 9, direct=True)
                 left.append(pid)
+            elif tok and cur and cur.split(":")[0] == tok.split(":")[0]:
+                continue                          # read the same way, different: pid reused, ours gone
+            elif _pid_alive(pid) or _group_live(pid):
+                unverified.append(pid)
         end = time.time() + 5
         while left and time.time() < end:
             left = [x for x in left if _group_live(x) or _pid_alive(x)]
@@ -1436,6 +1460,8 @@ def _stop_orphans(p: dict, backend: str | None) -> tuple[bool, str]:
                 time.sleep(0.05)
         if left:
             return False, f"pool process groups {left} still alive"
+        if unverified:
+            return False, f"processes {unverified} could not be identified as this call's (not signalled)"
         return True, "pool processes stopped"
     call_id, addr = p.get("call_id"), os.environ.get("MA_COMPUTE_SCHEDULER")
     if not call_id or not addr:
@@ -1446,7 +1472,9 @@ def _stop_orphans(p: dict, backend: str | None) -> tuple[bool, str]:
         cloudpickle.register_pickle_by_value(sys.modules[__name__])
         exclude = {w.strip() for w in os.environ.get("MA_COMPUTE_EXCLUDE_WORKERS", "").split(",") if w.strip()}
         with Client(addr, timeout="30s", security=_security()) as c:
-            c.run(_cancel_call, call_id, workers=[w for w in c.scheduler_info()["workers"] if w not in exclude])
+            got = c.run(_cancel_call, call_id, workers=[w for w in c.scheduler_info()["workers"] if w not in exclude])
+        if any(v == -1 for v in (got or {}).values()):
+            return False, "a remote chunk could not be identified (not signalled)"
         return True, "remote chunks cancelled"
     except Exception as e:  # noqa: BLE001 — cannot confirm: bounded by shares
         return False, f"remote cancel failed ({type(e).__name__})"
@@ -1993,15 +2021,23 @@ def _self_test() -> int:
         open(os.path.join(rd, "models", "slow.py"), "w").write(open(os.path.join(d, "models", "slow.py")).read())
         out = {}
 
-        def call(tag, **kw):
+        def call(tag, fn="models/slow.py::sleep", params=None, **kw):
             try:
-                out[tag] = map_fn(rd, "models/slow.py::sleep", [{"s": 1.0}], backend="local", **kw)[1]
+                out[tag] = map_fn(rd, fn, [params or {"s": 1.0}], backend="local", **kw)[1]
             except RuntimeError as e:
                 out[tag] = str(e)
+        # a's task waits on a gate the test holds, so a's reservation is held
+        # for certain while b is checked (not for "about a second").
+        open(os.path.join(rd, "models", "gated13.py"), "w").write(
+            "import os, time\ndef f(p):\n    end = time.time() + 300\n"
+            "    while os.path.exists(p['gate']) and time.time() < end:\n        time.sleep(0.02)\n"
+            "    time.sleep(1.0)\n    return {'ok': 1}\n")     # 1 s of work after release, as before
+        gate13 = os.path.join(d, "gate13")
+        open(gate13, "w").close()
         os.environ["MA_COMPUTE_MAX_CORE_HOURS"] = "1"
         try:
-            ta = threading.Thread(target=call, args=("a",)); ta.start()
-            end = time.time() + 60                # readiness: a's reservation is in the ledger
+            ta = threading.Thread(target=call, args=("a", "models/gated13.py::f", {"gate": gate13})); ta.start()
+            end = time.time() + 60                # a's reservation is in the ledger
             while time.time() < end:
                 try:
                     if json.load(open(os.path.join(rd, LEDGER_REL))).get("reservations"):
@@ -2009,7 +2045,9 @@ def _self_test() -> int:
                 except (OSError, ValueError):
                     pass
                 time.sleep(0.01)
-            call("b"); ta.join()
+            call("b")
+            os.remove(gate13)                     # release a only after b's check
+            ta.join()
             ok(isinstance(out["a"], dict) and "held by running calls" in str(out["b"]),
                f"C13 a running call's reservation blocks a concurrent call: {out}")
             ts = [threading.Thread(target=call, args=(k,), kwargs={"max_core_hours": 0.1}) for k in ("c", "e")]
@@ -2437,15 +2475,16 @@ def _self_test_p42(ok) -> None:
         while _pid_alive(pid) and time.time() < end:
             time.sleep(0.01)
 
-    def wait_ready(run_dir, done, limit=60, pids=True, age=(0.0, 0.3)):
-        """Readiness, not a fixed sleep: the call's progress record shows `done`
-        finished tasks, work in flight, its pool pids recorded (`pids`), and was
-        written within `age` seconds (default under 0.3 s). Tasks here take 1 s, so the next record (whose
-        pids are briefly incomplete while the pool starts processes) is still
-        about 0.7 s away: a kill now lands in a settled state."""
+    def wait_ready(run_dir, done, limit=60, pids=True, gate=None, blocked=0):
+        """A state the test controls, not timing: the call's progress record
+        shows `done` finished tasks, work in flight and (`pids`) its pool pids
+        recorded; with a `gate`, also `blocked` tasks waiting on it. Gated tasks
+        cannot finish, so nothing more is submitted or recorded: the state is
+        frozen while the test kills."""
         import glob as _g
         end, last = time.time() + limit, None
         while time.time() < end:
+            held_n = len(_g.glob(gate + ".started.*")) if gate else 0
             for f in _g.glob(os.path.join(run_dir, PROGRESS_DIR, "*.json")):
                 try:
                     rec = json.load(open(f))
@@ -2453,15 +2492,32 @@ def _self_test_p42(ok) -> None:
                     continue
                 last = rec
                 seen_pids.extend(rec.get("pids") or [])
-                if (int(rec.get("done_tasks") or 0) >= done and rec.get("out")
-                        and (rec.get("pids_complete") or not pids) and age[0] <= time.time() - float(rec["t"]) < age[1]):
+                if (int(rec.get("done_tasks") or 0) >= done and rec.get("out") and held_n >= blocked
+                        and (rec.get("pids_complete") or not pids)):
                     return True, rec
             time.sleep(0.01)
         return False, last
 
+    GATED = ("import os, time\n"
+             "def f(p):\n"
+             "    if p.get('gate') and p['k'] >= p.get('free', 0):\n"
+             "        open(p['gate'] + '.started.%d' % p['k'], 'w').close()\n"
+             "        end = time.time() + 300\n"
+             "        while os.path.exists(p['gate']) and time.time() < end:\n"
+             "            time.sleep(0.02)\n"
+             "    time.sleep(p['s'])\n"
+             "    return {'k': p['k']}\n")
+
+    def gated_inputs(path, gate, n, free, s):
+        """Inputs k < free run freely; the rest wait while `gate` exists (it is created here)."""
+        open(gate, "w").close()
+        gates.append(gate)
+        open(path, "w").write("".join(json.dumps({"s": s, "k": k, "free": free, "gate": gate}) + "\n"
+                                      for k in range(n)))
+
     # Everything these tests start is stopped on the way out, pass or fail:
     # callers (`procs`), the pool processes their records named, detached jobs.
-    procs, seen_pids = [], []
+    procs, seen_pids, gates = [], [], []
 
     def track(p):
         procs.append(p)
@@ -2469,10 +2525,17 @@ def _self_test_p42(ok) -> None:
 
     def cleanup(run_dir):
         import glob as _g
+        for g in gates:                           # gated tasks return
+            try:
+                os.remove(g)
+            except OSError:
+                pass
+        gates.clear()
         for f in _g.glob(os.path.join(run_dir, "models", "*" + JOB_EXT)):
             try:
                 job = json.load(open(f))
-                if _pid_alive(job["pid"], job.get("pid_start")):
+                tok, cur = job.get("pid_start"), _pid_start(int(job["pid"]))
+                if tok and cur and tok == cur:    # signalled only when identified (pid reuse)
                     _killpg(int(job["pid"]), signal.SIGKILL, direct=True)
             except (OSError, ValueError, KeyError, TypeError):
                 pass
@@ -2533,6 +2596,31 @@ def _self_test_p42(ok) -> None:
         tok = _pid_start(os.getpid())
         if tok:
             ok(not _pid_alive(os.getpid(), tok + "9"), "P42-1b a reused pid (start token differs) is dead")
+        # P42-1c (bug: `ps lstart` depends on TZ and locale, so a caller with another
+        # TZ saw a live caller's token differ and settled it): the ps token is the
+        # same whatever the caller's TZ.
+        toks_tz = set()
+        for tz in ("UTC", "America/Los_Angeles", "Asia/Kolkata"):
+            r = _sp.run([sys.executable, "-c", "import sys; sys.path.insert(0, %r); import compute; "
+                         "print(compute._ps_start(%d))" % (HERE, os.getpid())],
+                        env=dict(env, TZ=tz, LC_ALL="fr_FR.UTF-8"), capture_output=True, text=True, timeout=60)
+            toks_tz.add(r.stdout.strip())
+        ok(len(toks_tz) == 1 and next(iter(toks_tz)).startswith("ps:") and next(iter(toks_tz)) == _ps_start(os.getpid()),
+           f"P42-1c the ps start token does not depend on the caller's TZ or locale: {toks_tz}")
+        # P42-3d (bug: a pid whose identity cannot be verified was signalled): a live
+        # process recorded with a different or no start token is never signalled,
+        # and the stop is unconfirmed (charged in full).
+        bystander = track(_sp.Popen([sys.executable, "-c", "import time; time.sleep(120)"], start_new_session=True))
+        end = time.time() + 30
+        while _pid_start(bystander.pid) is None and time.time() < end:
+            time.sleep(0.02)
+        for saved in ("psutil:1.00", "proc:1", "ps:Thu Jan  1 00:00:00 1970", None):
+            stopped3d, how3d = _stop_orphans({"pids": [[bystander.pid, saved]], "pids_complete": True}, "local")
+            ok(bystander.poll() is None and (saved is not None or not stopped3d),
+               f"P42-3d a pid recorded with token {saved!r} is not signalled ({stopped3d}, {how3d})")
+        bystander.kill()
+        bystander.wait()
+
         # P42-2 (bug: a dead caller was charged its whole reservation): a zombie
         # caller with a progress record is charged its work, and released.
         pf = os.path.join(d, "rec.json")
@@ -2589,66 +2677,84 @@ def _self_test_p42(ok) -> None:
             ok(charge == 9000.0 and "charged its reservation" in why,
                f"P42-4 fail closed ({what}): the reservation is charged and the row says why: {charge} {why}")
 
+        # P42-5..7 use gated tasks: tasks k >= free wait on a gate file the test
+        # holds, so the batch's state is frozen (nothing finishes, nothing more is
+        # submitted or recorded) while the test kills, interrupts or checks it.
+        open(os.path.join(d, "models", "gated.py"), "w").write(GATED)
+
+        def gcmd(inputs, *extra):
+            return [sys.executable, os.path.abspath(__file__), "map", d, "--fn", "models/gated.py::f",
+                    "--inputs", inputs, "--out", out, "--backend", "local", "--max-workers", "2",
+                    "--max-core-hours", "1", "--purpose", "P42", *extra]
+
         # P42-5 a caller killed mid-batch (SIGKILL to its group, as a tool timeout
         # does), left a zombie: the next call charges its work, not 3,600 core-s;
         # rerunning the command keeps the rows it had finished.
         os.remove(os.path.join(d, LEDGER_REL))
+        g5, in5 = os.path.join(d, "gate5"), os.path.join(d, "models", "in5.jsonl")
+        gated_inputs(in5, g5, 8, free=4, s=0.3)
         t0 = time.time()
-        p = track(_sp.Popen(cmd, env=env, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, start_new_session=True))
-        got, rec5 = wait_ready(d, 4)
+        p = track(_sp.Popen(gcmd(in5), env=env, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, start_new_session=True))
+        got, rec5 = wait_ready(d, 4, gate=g5, blocked=2)
         os.killpg(p.pid, signal.SIGKILL)
         el = time.time() - t0
         gone(p.pid)
         map_fn(d, "models/slow.py::sleep", [], backend="local")
         led = ledger(d)
         c = (led["calls"] or [{}])[0]
-        ok(got, f"P42-5 setup: the batch reached a settled state with 4 tasks done before the kill (last record {rec5})")
+        ok(got, f"P42-5 setup: 4 tasks done and 2 held at the gate before the kill (last record {rec5})")
         ok(got and not led["reservations"] and "caller died; charged work done" in str(c.get("stopped"))
-           and 4.0 <= c["task_core_s"] <= 2 * el + 15 and c.get("purpose") == "P42",
+           and 1.0 <= c["task_core_s"] <= 2 * el + 15 and c.get("purpose") == "P42",
            f"P42-5 a killed caller is charged its work ({c.get('task_core_s')} core-s in {el:.1f}s), not 3,600: {c}")
         p.wait()
-        r = _sp.run(cmd, env=env, capture_output=True, text=True, timeout=120)
+        os.remove(g5)
+        r = _sp.run(gcmd(in5), env=env, capture_output=True, text=True, timeout=120)
         s = json.load(open(out + ".summary.json")) if os.path.exists(out + ".summary.json") else {}
-        ok(r.returncode == 0 and s.get("reused", 0) >= 3 and s.get("n_ok") == 8 and not os.path.exists(out + PARTIAL_EXT),
+        ok(r.returncode == 0 and s.get("reused", 0) >= 4 and s.get("n_ok") == 8 and not os.path.exists(out + PARTIAL_EXT),
            f"P42-5b rerunning after the kill keeps the rows finished before it: {s} {r.stderr[-300:]}")
 
-        # P42-5c only the caller is killed: its pool processes live on, and the
-        # settling call stops them before bounding their work by time.
+        # P42-5c only the caller is killed: its pool processes live on (held at the
+        # gate), and the settling call stops them before bounding their work by time.
         os.remove(os.path.join(d, LEDGER_REL))
+        g5c, in5c = os.path.join(d, "gate5c"), os.path.join(d, "models", "in5c.jsonl")
+        gated_inputs(in5c, g5c, 8, free=2, s=0.3)
         t0 = time.time()
-        p = track(_sp.Popen(cmd + ["--fresh"], env=env, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL))
-        got, rec5c = wait_ready(d, 2)
+        p = track(_sp.Popen(gcmd(in5c), env=env, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL))
+        got, rec5c = wait_ready(d, 2, gate=g5c, blocked=2)
         p.kill()
         gone(p.pid)
         map_fn(d, "models/slow.py::sleep", [], backend="local")
         el = time.time() - t0
         c = ledger(d)["calls"][0]
         p.wait()
-        ok(got, f"P42-5c setup: the batch reached a settled state with 2 tasks done before the kill (last record {rec5c})")
-        ok("pool processes stopped" in str(c.get("stopped")) and 2.0 <= c["task_core_s"] <= 2 * el + 15,
+        ok(got, f"P42-5c setup: 2 tasks done and 2 held at the gate before the kill (last record {rec5c})")
+        ok("pool processes stopped" in str(c.get("stopped")) and 0.5 <= c["task_core_s"] <= 2 * el + 15,
            f"P42-5c a killed caller's surviving pool is stopped and its work bounded ({el:.1f}s): {c}")
 
         # P42-6 an interrupted call (SIGTERM) is charged what ran, settled by the backend.
         os.remove(os.path.join(d, LEDGER_REL))
-        os.remove(out + PARTIAL_EXT)               # left by P42-5c: wait for this call's own rows
+        g6, in6 = os.path.join(d, "gate6"), os.path.join(d, "models", "in6.jsonl")
+        gated_inputs(in6, g6, 8, free=2, s=0.3)
         t0 = time.time()
-        p = track(_sp.Popen(cmd + ["--fresh"], env=env, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL))
-        wait_rows(out + PARTIAL_EXT, 2)
+        p = track(_sp.Popen(gcmd(in6), env=env, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL))
+        got, rec6 = wait_ready(d, 2, gate=g6, blocked=2)
         p.send_signal(signal.SIGTERM)
         p.wait(60)
         el = time.time() - t0
         c = ledger(d)["calls"][-1]
-        ok("interrupted: KeyboardInterrupt; charged work done" in c["stopped"] and 2.0 <= c["task_core_s"] <= 2 * el + 15,
+        ok(got, f"P42-6 setup: 2 tasks done and 2 held at the gate before the interrupt (last record {rec6})")
+        ok("interrupted: KeyboardInterrupt; charged work done" in c["stopped"] and 0.5 <= c["task_core_s"] <= 2 * el + 15,
            f"P42-6 an interrupted call is charged what ran ({c['task_core_s']} core-s in {el:.1f}s): {c}")
 
         # P42-7 a detached batch outlives its caller (killed with its whole group);
-        # status reports it running, wait reports it finished.
+        # status reports it running and a second batch is refused while every
+        # task is held at the gate; once released, wait reports it finished.
         for f in (out, out + ".summary.json"):
-            os.remove(f)
-        # 8 tasks of 2 s on 2 processes, all recomputed: about 8 s, ample for the checks while it runs.
-        inp7 = os.path.join(d, "models", "in7.jsonl")
-        open(inp7, "w").write("".join(json.dumps({"s": 2.0, "k": k}) + "\n" for k in range(8)))
-        cmd7 = [x if x != inp else inp7 for x in cmd] + ["--fresh"]
+            if os.path.exists(f):
+                os.remove(f)
+        g7, in7 = os.path.join(d, "gate7"), os.path.join(d, "models", "in7.jsonl")
+        gated_inputs(in7, g7, 8, free=0, s=0.2)
+        cmd7 = gcmd(in7)
         wrapper = _sp.Popen(["/bin/sh", "-c", " ".join(_sp.list2cmdline([x]) for x in cmd7 + ["--detach"]) + "; sleep 60"],
                             env=env, stdout=_sp.PIPE, text=True, start_new_session=True)
         track(wrapper)
@@ -2661,6 +2767,7 @@ def _self_test_p42(ok) -> None:
             det = {}
         st = _sp.run([sys.executable, os.path.abspath(__file__), "status", out], env=env, capture_output=True, text=True)
         second = _sp.run(cmd7 + ["--detach"], env=env, capture_output=True, text=True, timeout=60)
+        os.remove(g7)                              # release the batch only after both checks ran
         ok(second.returncode == 4 and '"detached": false' in second.stdout,
            f"P42-7d a second batch on the same --out is refused while the first runs: {second.stdout[-200:]}")
         w = _sp.run([sys.executable, os.path.abspath(__file__), "wait", out, "--timeout-s", "90"], env=env,
@@ -2700,9 +2807,8 @@ def _self_test_p42(ok) -> None:
                     MA_COMPUTE_TARGET_WORKERS="6", MA_COMPUTE_PROCS_PER_WORKER="1", MA_COMPUTE_SETTLE_S="30")
         t0 = time.time()
         p = track(_sp.Popen([sys.executable, "-c", code], env=envd, stdout=_sp.DEVNULL, stderr=_sp.PIPE, text=True))
-        # A chunk finished and others are in flight; the record is 0.5-2 s old, so the
-        # caller is blocked waiting on its chunks when the interrupt arrives.
-        got8, rec8 = wait_ready(d, 1, limit=120, pids=False, age=(0.5, 2.0))
+        # State, not timing: a chunk has finished and others are in flight.
+        got8, rec8 = wait_ready(d, 1, limit=120, pids=False)
         p.send_signal(signal.SIGINT)
         err = p.communicate(timeout=120)[1]
         el = time.time() - t0
