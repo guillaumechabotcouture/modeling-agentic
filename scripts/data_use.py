@@ -38,7 +38,9 @@ Findings:
                               prior requires (scripts/mechanism_manifest.py),
                               unread, unless the manifest records the mechanism
                               as simplified or fixed (D1 then checks its test)
-  data_file_unused            MEDIUM  per file: processed data no model code opens
+  data_files_unused           MEDIUM  one per run: the processed data files no
+                              model code opens (size, column count); each is
+                              cleared by a `columns: ["*"]` exemption
   data_columns_unread_summary LOW     one per run: other unread columns in files
                               the model does read (counts per file, examples)
   data_use_invalid            MEDIUM  data_use.yaml unreadable / malformed entry
@@ -284,7 +286,7 @@ def audit(run_dir: str, priors=None) -> dict:
     """{'triggers': [{file, column, mechanism, prior}], 'unopened': [file],
         'unread': {file: [cols]} (opened files), 'total', 'read', 'exempt',
         'errors', 'unreadable', 'skipped'}"""
-    res = {"triggers": [], "unopened": [], "unread": {}, "read": 0, "total": 0, "exempt": 0,
+    res = {"triggers": [], "unopened": [], "ncols": {}, "unread": {}, "read": 0, "total": 0, "exempt": 0,
            "errors": [], "unreadable": {}, "skipped": False}
     if not code_files(run_dir):
         res["skipped"] = True
@@ -332,6 +334,7 @@ def audit(run_dir: str, priors=None) -> dict:
     # (2) files the model never opens, (3) other unread columns.
     for rel, cols in headers.items():
         res["total"] += len(cols)
+        res["ncols"][rel] = len(cols)
         if "*" in exempt.get(os.path.normpath(rel), set()):
             res["exempt"] += len(cols)
             continue
@@ -365,12 +368,20 @@ def gate_findings(run_dir: str, priors=None) -> list[dict]:
             "claim": (f"`{t['file']}` column `{t['column']}` is data for mechanism `{t['mechanism']}` (prior "
                       f"`{t['prior']}`), and no code under models/ reads it. Read it in the model, or record the "
                       f"mechanism as `simplified` with a sufficiency test in `models/mechanism_manifest.yaml`.")})
-    for rel in sorted(res["unopened"]):
+    if res["unopened"]:
+        def _desc(rel):
+            try:
+                kb = f"{os.path.getsize(os.path.join(run_dir, rel)) / 1024:.0f} KB"
+            except OSError:
+                kb = "size unknown"
+            return f"`{rel}` ({kb}, {res['ncols'].get(rel, 0)} columns)"
+        files = sorted(res["unopened"])
         out.append({
-            "kind": "data_file_unused", "severity": "MEDIUM", "stage": "MODEL", "target_stage": "MODEL",
-            "scope_declarable": True,
-            "claim": (f"`{rel}` is processed data that no code under models/ opens. Use it, or list it in "
-                      f"`{EXEMPT_PATH}` (`columns: [\"*\"]`) with a reason.")})
+            "kind": "data_files_unused", "severity": "MEDIUM", "stage": "MODEL", "target_stage": "MODEL",
+            "scope_declarable": True, "files": files,
+            "claim": (f"{len(files)} processed data file(s) that no code under models/ opens: "
+                      f"{'; '.join(_desc(r) for r in files)}. Use each, or list it in `{EXEMPT_PATH}` "
+                      f"(`columns: [\"*\"]`) with a reason.")})
     if res["unread"]:
         n = sum(len(v) for v in res["unread"].values())
         top = sorted(res["unread"].items(), key=lambda kv: -len(kv[1]))
@@ -431,8 +442,15 @@ def load(path=DATA):
 ''')
         v = gate_findings(d, P)
         un = audit(d, P)["unread"].get("data/processed/units.csv", [])
-        ok(kinds(v) == ["data_columns_unread_summary", "data_file_unused"],
-           f"DU1 no matched prior: an unopened file is MEDIUM, other unread columns one LOW summary, got {v}")
+        ok(kinds(v) == ["data_columns_unread_summary", "data_files_unused"],
+           f"DU1 no matched prior: unopened files are one MEDIUM, other unread columns one LOW summary, got {v}")
+        w(d, "data/processed/third_table.csv", "unit,z\nA,1\n")
+        v = gate_findings(d, P)
+        agg = [x for x in v if x["kind"] == "data_files_unused"]
+        ok(len(agg) == 1 and agg[0]["files"] == ["data/processed/extra_table.csv", "data/processed/third_table.csv"]
+           and "2 columns" in agg[0]["claim"],
+           f"DU1b all unopened files in a single MEDIUM per run, with their column counts, got {agg}")
+        os.remove(os.path.join(d, "data", "processed", "third_table.csv"))
         ok(sorted(un) == ["lat", "mix_a", "mix_b", "score_hist", "state"],
            f"DU2 docstring / comment / prose mentions do not count, f-strings do, got {un}")
         ok("ignored_col" not in str(v) and "raw.csv" not in str(v), "DU3 data/raw is not audited")
@@ -479,7 +497,7 @@ def load(path=DATA):
         w(d, "models/data_use.yaml", "not_read_by_model:\n  - file: data/processed/extra_table.csv\n"
                                      "    columns: ['*']\n    reason: ''\n")
         v = gate_findings(d, P)
-        ok("data_use_invalid" in kinds(v) and "data_file_unused" in kinds(v),
+        ok("data_use_invalid" in kinds(v) and "data_files_unused" in kinds(v),
            f"DU9 an exemption without a reason is invalid and exempts nothing, got {v}")
         w(d, "models/data_use.yaml", "not_read_by_model: [")
         ok("data_use_invalid" in kinds(gate_findings(d, P)), "DU10 unparseable data_use.yaml fails closed")

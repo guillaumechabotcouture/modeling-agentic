@@ -211,8 +211,9 @@ artifacts:
       **Data-use audit** (Phase 42 γ, D3). `scripts/data_use.py` reports, for
       data/processed/: a required mechanism's trigger columns (from the
       matched prior) that no code under models/ reads (MEDIUM each, unless
-      the mechanism is recorded as simplified or fixed); a data file no model
-      code opens (MEDIUM each); other unread columns (one LOW summary). List
+      the mechanism is recorded as simplified or fixed); data files no model
+      code opens (one MEDIUM per run listing them); other unread columns (one
+      LOW summary). List
       deliberate omissions here under `not_read_by_model: [{file, columns,
       reason}]` (`columns: ["*"]` for a whole file).
 
