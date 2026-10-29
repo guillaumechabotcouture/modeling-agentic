@@ -175,7 +175,7 @@ artifacts:
       claims-ledger claim it reproduces (headline totals, e.g. benefit and
       cost) and, if it returns one, its per-unit package choice to the
       allocation CSV. `scripts/headline_binding.py` evaluates outcome_fn at the
-      registry point estimates; any mismatch over 1% is HIGH, not declarable,
+      registry point estimates; any mismatch over 0.1% is HIGH, not declarable,
       and so is an uncertainty report produced by another function or older code.
 
   - id: allocation_robustness

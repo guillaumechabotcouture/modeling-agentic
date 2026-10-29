@@ -228,11 +228,33 @@ def launch(cfg):
           "once every run is stored. Safe to disconnect.")
 
 
+def keeper_wait(states: list[str]) -> str:
+    """What to do about an existing keeper cluster before starting a new one:
+    'start' (none live), 'stop' (an earlier launch's keeper is live), 'wait'
+    (one is stopping: attaching to a stopping cluster is never safe)."""
+    live = [s for s in states if s not in ("stopped", "error", "")]
+    if not live:
+        return "start"
+    return "wait" if all(s == "stopping" for s in live) else "stop"
+
+
 def start_keeper(cfg, adapt_options, cluster_id):
     import coiled
     import dask
     from distributed import fire_and_forget
     lo, hi = len(cfg.labels) + cfg.compute_start, len(cfg.labels) + cfg.compute_max
+    # An earlier launch's keeper (still polling, or stopping) must not be reused:
+    # its task would hold the old cluster id and exit, leaving this pool unscaled.
+    for _ in range(40):
+        act = keeper_wait(cluster_states(cfg.keeper_name))
+        if act == "start":
+            break
+        if act == "stop":
+            attach(cfg.keeper_name).shutdown()
+            print(f"{cfg.keeper_name}: an earlier keeper was running; shut it down")
+        time.sleep(15)
+    else:
+        raise SystemExit(f"{cfg.keeper_name} did not stop; start the keeper later (the pool keeps its floor)")
     kc = coiled.Cluster(name=cfg.keeper_name, workspace=WORKSPACE, n_workers=1, worker_cpu=2,
                         worker_memory="8 GiB", scheduler_cpu=2, spot_policy="on-demand",
                         idle_timeout="30 minutes", shutdown_on_close=False)
@@ -241,7 +263,8 @@ def start_keeper(cfg, adapt_options, cluster_id):
     c.upload_file(os.path.join(HERE, "worker_side.py"))
     # The Coiled token goes in as a task argument (memory only, never an env var or a file).
     fut = c.submit(ws.keeper_task, dask.config.get("coiled.token"), cfg.name, WORKSPACE, lo, hi,
-                   cfg.keeper_hours, dict(adapt_options), cluster_id, pure=False, key=f"keeper-{cfg.name}")
+                   cfg.keeper_hours, dict(adapt_options), cluster_id, pure=False,
+                   key=f"keeper-{cfg.name}-{cluster_id}")   # a new key per run cluster: never an old future
     fire_and_forget(fut)
     time.sleep(30)
     w = sorted(c.scheduler_info()["workers"])[0]
@@ -495,6 +518,10 @@ def _self_test() -> int:
                              {"name": "a", "id": 5, "current_state": {"state": "ready"}}]) == 5
        and live_id("a", lambda: [{"name": "a", "id": 3, "current_state": {"state": "stopped"}}]) is None,
        "RC19 the live id ignores stopped clusters of the same name")
+    ok(keeper_wait([]) == "start" and keeper_wait(["stopped", "stopped"]) == "start"
+       and keeper_wait(["stopped", "stopping"]) == "wait" and keeper_wait(["stopped", "ready"]) == "stop"
+       and keeper_wait(["stopping", "running"]) == "stop",
+       "RC22 a live or stopping keeper from an earlier launch is never reused")
     ok(relaunch_refusal("missing", False) is None and relaunch_refusal("running", False)
        and relaunch_refusal("done", False) and relaunch_refusal("missing", True),
        "RC20 relaunch only when the run is neither running, finished on its VM, nor stored")
