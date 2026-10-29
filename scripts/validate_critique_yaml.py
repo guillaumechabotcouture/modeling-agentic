@@ -3908,8 +3908,10 @@ def _evidence_artifacts(run_dir: str, ref: Any, allow_code: bool) -> list[str]:
             if ext in _PROSE_EXT or (ext in _CODE_EXT and not allow_code):
                 continue
             p = os.path.realpath(os.path.join(root, tok))
+            # Inputs under data/ are not evidence that a check ran (Codex review).
             if p.startswith(root + os.sep) and os.path.isfile(p) and os.path.getsize(p) > 0 \
-                    and not _BOOKKEEPING_RE.match(os.path.basename(p)):
+                    and not _BOOKKEEPING_RE.match(os.path.basename(p)) \
+                    and not os.path.relpath(p, root).startswith("data" + os.sep):
                 out.append(os.path.relpath(p, root))
     return out
 
@@ -8125,6 +8127,12 @@ def _run_self_test() -> int:
             ok([x["kind"] for x in v] == ["pre_mortem_closed_without_evidence"],
                f"PF5b: run bookkeeping (scope_declaration.yaml) is not evidence, got {v}")
             os.remove(os.path.join(_d, "scope_declaration.yaml"))
+            os.makedirs(os.path.join(_d, "data", "raw"))
+            with open(os.path.join(_d, "data", "raw", "mix.csv"), "w") as f:
+                f.write("unit,mix\nA,0.4\n")
+            v = _pm42(severity="HIGH", addressed_in="data/raw/mix.csv")
+            ok([x["kind"] for x in v] == ["pre_mortem_closed_without_evidence"] and v[0]["severity"] == "HIGH",
+               f"PF5c: input data is not evidence that the check ran, got {v}")
             with open(os.path.join(_d, "models", "model.py"), "w") as f:
                 f.write("def f(r):\n    return r['mix_a']\n")
             v = _pm42(suggested_check="Use the mix columns in data/processed/units.csv per unit.",

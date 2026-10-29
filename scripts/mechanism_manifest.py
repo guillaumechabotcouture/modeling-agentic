@@ -80,6 +80,7 @@ import yaml
 HERE = os.path.dirname(os.path.abspath(__file__))
 PATH = os.path.join("models", "mechanism_manifest.yaml")
 STATUSES = ("modelled", "fixed", "simplified")
+_CODE_EXT = (".py", ".r", ".jl", ".ipynb")
 
 
 def _lib():
@@ -205,9 +206,13 @@ def _check_entry(run_dir: str, mid: str, e: dict, late: str, report: str | None)
     st = e["status"]
     if st == "modelled":
         ref = e.get("code_ref")
-        fname, _, sym = (ref or "").partition("::")
+        fname, _, sym = (ref if isinstance(ref, str) else "").partition("::")
         p = _inside(run_dir, fname)
         found = False
+        # Code, and a named function / class / variable in it (prose or data
+        # files do not show a mechanism is modelled; Codex review).
+        if p is not None and not (p.lower().endswith(_CODE_EXT) and sym.strip()):
+            p = None
         if p is not None:
             try:
                 with open(p, encoding="utf-8") as f:
@@ -219,7 +224,8 @@ def _check_entry(run_dir: str, mid: str, e: dict, late: str, report: str | None)
         if not found:
             out.append(_f("mechanism_ref_unresolved", "HIGH",
                           f"`{PATH}`: mechanism `{mid}` is `modelled` but `code_ref: {ref!r}` does not name an "
-                          "existing run file (and, after `::`, a name in it)."))
+                          "existing code file of the run and, after `::`, a function or name defined in it "
+                          "(`models/<file>.py::<name>`)."))
     elif st == "fixed":
         if not isinstance(e.get("source"), str) or len(e["source"].strip()) < 3:
             out.append(_f("mechanism_ref_unresolved", "HIGH",
@@ -252,6 +258,11 @@ def _check_entry(run_dir: str, mid: str, e: dict, late: str, report: str | None)
                           "of units, or the headline beyond its uncertainty interval)."))
             return out
         share, thr = _num(res.get("share_units_changed")), _num(res.get("share_threshold"))
+        given = [k for k in ("share_units_changed", "share_threshold") if res.get(k) is not None]
+        if given and (share is None or thr is None):
+            out.append(_f("mechanism_manifest_invalid", "HIGH",
+                          f"`{rel}`: share_units_changed and share_threshold must both be finite numbers when "
+                          f"either is given (got {res.get('share_units_changed')!r}, {res.get('share_threshold')!r})."))
         if share is not None and thr is not None and (share > thr) != res["decision_changes"]:
             out.append(_f("mechanism_manifest_invalid", "HIGH",
                           f"`{rel}`: share_units_changed {share} vs share_threshold {thr} contradicts "
@@ -367,6 +378,9 @@ def _self_test() -> int:
         w(d, "models/suff.yaml", {"varied": "mix", "criterion": "c", "decision_changes": False,
                                   "share_units_changed": 0.3, "share_threshold": 0.1})
         ok("mechanism_manifest_invalid" in kinds(gate_findings(d, 2, P)), "MM7 a verdict contradicting its numbers")
+        w(d, "models/suff.yaml", {"varied": "mix", "criterion": "c", "decision_changes": False,
+                                  "share_units_changed": 0.8, "share_threshold": "0.1"})
+        ok("mechanism_manifest_invalid" in kinds(gate_findings(d, 2, P)), "MM7b a non-numeric threshold fails closed")
         w(d, "models/model.py", "def mix_effect(u):\n    return u\n")
         w(d, PATH, {"mechanisms": [{"id": "subgroup_mix", "status": "modelled",
                                     "code_ref": "models/model.py::mix_effect"}]})
@@ -374,6 +388,10 @@ def _self_test() -> int:
         w(d, PATH, {"mechanisms": [{"id": "subgroup_mix", "status": "modelled",
                                     "code_ref": "models/model.py::nope"}]})
         ok(kinds(gate_findings(d, 2, P)) == ["mechanism_ref_unresolved"], "MM9 unresolvable code_ref")
+        for bad in ("report.md", "models/model.py", "models/suff.yaml::varied"):
+            w(d, PATH, {"mechanisms": [{"id": "subgroup_mix", "status": "modelled", "code_ref": bad}]})
+            ok(kinds(gate_findings(d, 2, P)) == ["mechanism_ref_unresolved"],
+               f"MM9c code_ref {bad!r} (prose, no name, or not code) does not show the mechanism is modelled")
         w(d, PATH, {"mechanisms": [{"id": "subgroup_mix", "status": "modelled", "code_ref": "../../etc/passwd"}]})
         ok(kinds(gate_findings(d, 2, P)) == ["mechanism_ref_unresolved"], "MM9b a path outside the run")
         w(d, PATH, {"mechanisms": [{"id": "subgroup_mix", "status": "fixed", "source": "Registry: mix_share"}]})
