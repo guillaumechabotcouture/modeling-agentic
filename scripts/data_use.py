@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Phase 42 γ (D3): data-use audit. Every column of a processed data CSV is
-read by model code, or listed as not read with a reason.
+"""Phase 42 γ (D3): data-use audit. Processed data the model never reads is
+reported, with weight where it carries signal.
 
     python3 scripts/data_use.py <run_dir>
     python3 scripts/data_use.py --self-test
@@ -9,10 +9,13 @@ E7 attempt 8 had a per-unit data column set that described exactly the
 variation the model collapsed; no model code read it, and nothing noticed.
 This is a static scan, disease-agnostic:
 
-* Data: every CSV under data/ except data/raw/ (the files data_schema.py
-  checks), header row only.
-* Code: every .py file under models/ (recursively, no __pycache__). A column
-  counts as read when it appears in code as
+* Data: CSVs under data/processed/ (header row only); when a run has no
+  data/processed/, the CSVs directly under data/ outside data/raw/.
+  data/raw/ is the agents' working input and is scanned only for a required
+  mechanism's trigger columns that exist nowhere else.
+* Code: every .py file under models/ (recursively, no __pycache__). A file
+  counts as opened when its file name appears in a code string (a literal or
+  an f-string part). A column counts as read when it appears in code as
     - a string literal equal to the column name, or a short code-like string
       containing it as a token (`"a,b"`, `"x > 0 and y < 1"`; strings with
       prose, docstrings and comments do not count);
@@ -29,10 +32,17 @@ This is a static scan, disease-agnostic:
           columns: [hist_2000, hist_2005]     # or ["*"] for the whole file
           reason: "historical context, cited in the report only"
 
-Findings (one per data file, never per column, to keep the gate readable):
-  data_column_unused     MEDIUM  columns no model code reads and no reason given
-  data_use_invalid       MEDIUM  data_use.yaml unreadable / malformed entry
-  data_use_unreadable    MEDIUM  a data CSV whose header cannot be read
+Findings:
+  data_trigger_column_unused  MEDIUM  per column: a column named by the
+                              `when_data_columns_any` of a mechanism a matched
+                              prior requires (scripts/mechanism_manifest.py),
+                              unread, unless the manifest records the mechanism
+                              as simplified or fixed (D1 then checks its test)
+  data_file_unused            MEDIUM  per file: processed data no model code opens
+  data_columns_unread_summary LOW     one per run: other unread columns in files
+                              the model does read (counts per file, examples)
+  data_use_invalid            MEDIUM  data_use.yaml unreadable / malformed entry
+  data_use_unreadable         MEDIUM  a data CSV whose header cannot be read
 Nothing runs until models/ holds at least one .py file (no model yet).
 """
 from __future__ import annotations
@@ -49,7 +59,8 @@ import yaml
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 EXEMPT_PATH = os.path.join("models", "data_use.yaml")
-_LIST_CAP = 20
+_SUMMARY_FILES = 6
+_SUMMARY_EXAMPLES = 4
 _CODE_STR_MAX = 400
 
 
@@ -112,6 +123,14 @@ class _Refs:
         self.prefixes: set[str] = set()
         self.suffixes: set[str] = set()
         self.raw_texts: list[str] = []     # unparseable files
+        self.all_strings: list[str] = []   # every non-docstring literal / f-string part
+
+    def opens(self, rel: str) -> bool:
+        """The data file's name appears in a code string (or unparseable code)."""
+        base = os.path.basename(rel)
+        tok = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(base) + r"(?![A-Za-z0-9_])")
+        return any(tok.search(s) for s in self.all_strings) or any(p.fullmatch(base) for p in self.patterns) \
+            or any(tok.search(t) for t in self.raw_texts)
 
     def reads(self, col: str) -> bool:
         if col in self.exact:
@@ -188,6 +207,7 @@ def collect_refs(run_dir: str) -> _Refs:
                 for v in node.values:
                     if isinstance(v, ast.Constant) and isinstance(v.value, str):
                         fstring_parts.add(id(v))
+                        refs.all_strings.append(v.value)
                         parts.append(re.escape(v.value))
                         lit.append(v.value)
                     else:
@@ -201,6 +221,7 @@ def collect_refs(run_dir: str) -> _Refs:
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
                 if id(node) in skip or id(node) in fstring_parts:
                     continue
+                refs.all_strings.append(node.value)
                 _add_literal(refs, node.value)
             elif isinstance(node, ast.Attribute):
                 refs.exact.add(node.attr)
@@ -240,30 +261,88 @@ def _load_exemptions(run_dir: str) -> tuple[dict[str, set[str]], list[str]]:
     return out, errs
 
 
-def audit(run_dir: str) -> dict:
-    """{'unused': {file: [cols]}, 'read': n, 'total': n, 'errors': [..], 'exempt': n}"""
-    res = {"unused": {}, "read": 0, "total": 0, "exempt": 0, "errors": [], "unreadable": {}, "skipped": False}
+def audited_csvs(run_dir: str) -> list[str]:
+    """The modelling data: CSVs under data/processed/ when that directory has
+    any; otherwise the CSVs directly under data/ outside data/raw/ (older
+    layout). data/raw/ is the agents' working input, not a commitment."""
+    allc = data_csvs(run_dir)
+    proc = [r for r in allc if r.startswith(os.path.join("data", "processed") + os.sep)]
+    return proc or allc
+
+
+def _trigger_specs(run_dir: str, priors=None) -> tuple[list[tuple[str, object]], set[str]]:
+    """([(prior_id, Mechanism)] with trigger columns, mechanism ids the manifest
+    already accounts for as simplified or fixed)."""
+    mm = _sibling("mechanism_manifest")
+    req, _err = mm.required_mechanisms(run_dir, priors)   # the D1 check reports err
+    entries, _f, _exists = mm._load_manifest(run_dir)
+    accounted = {k for k, e in (entries or {}).items() if e.get("status") in ("simplified", "fixed")}
+    return [(p, m) for p, m in req if m.when_data_columns_any], accounted
+
+
+def audit(run_dir: str, priors=None) -> dict:
+    """{'triggers': [{file, column, mechanism, prior}], 'unopened': [file],
+        'unread': {file: [cols]} (opened files), 'total', 'read', 'exempt',
+        'errors', 'unreadable', 'skipped'}"""
+    res = {"triggers": [], "unopened": [], "unread": {}, "read": 0, "total": 0, "exempt": 0,
+           "errors": [], "unreadable": {}, "skipped": False}
     if not code_files(run_dir):
         res["skipped"] = True
         return res
-    headers, res["unreadable"] = processed_headers(run_dir)
     exempt, res["errors"] = _load_exemptions(run_dir)
     refs = collect_refs(run_dir)
-    for rel, cols in headers.items():
+    headers = {}
+    for rel in audited_csvs(run_dir):
+        try:
+            headers[rel] = read_header(os.path.join(run_dir, rel))
+        except (OSError, UnicodeDecodeError, ValueError, csv.Error) as e:
+            res["unreadable"][rel] = str(e)
+
+    def exempted(rel, c):
         ex = exempt.get(os.path.normpath(rel), set())
+        return "*" in ex or c in ex
+
+    # (1) Columns a required mechanism's prior names, unread by the model.
+    specs, accounted = _trigger_specs(run_dir, priors)
+    flagged: set[tuple[str, str]] = set()
+    raw_headers = None
+    for pid, m in specs:
+        if m.id in accounted:
+            continue          # simplified (with its test) or fixed: D1 checks it
+        subs = [s.lower() for s in m.when_data_columns_any]
+        hits = [(rel, c) for rel, cs in headers.items() for c in cs if any(s in c.lower() for s in subs)]
+        if not hits:          # trigger data only under data/raw/
+            if raw_headers is None:
+                raw_headers, _ = processed_headers(run_dir, include_raw=True)
+            hits = [(rel, c) for rel, cs in raw_headers.items() if rel not in headers
+                    for c in cs if any(s in c.lower() for s in subs)]
+        for rel, c in hits:
+            if (rel, c) in flagged or exempted(rel, c) or refs.reads(c):
+                continue
+            flagged.add((rel, c))
+            res["triggers"].append({"file": rel, "column": c, "mechanism": m.id, "prior": pid})
+
+    # (2) files the model never opens, (3) other unread columns.
+    for rel, cols in headers.items():
+        res["total"] += len(cols)
+        if "*" in exempt.get(os.path.normpath(rel), set()):
+            res["exempt"] += len(cols)
+            continue
+        if not refs.opens(rel):
+            res["unopened"].append(rel)
+            continue
         for c in cols:
-            res["total"] += 1
-            if "*" in ex or c in ex:
+            if exempted(rel, c):
                 res["exempt"] += 1
             elif refs.reads(c):
                 res["read"] += 1
-            else:
-                res["unused"].setdefault(rel, []).append(c)
+            elif (rel, c) not in flagged:
+                res["unread"].setdefault(rel, []).append(c)
     return res
 
 
-def gate_findings(run_dir: str) -> list[dict]:
-    res = audit(run_dir)
+def gate_findings(run_dir: str, priors=None) -> list[dict]:
+    res = audit(run_dir, priors)
     out = []
     for e in res["errors"]:
         out.append({"kind": "data_use_invalid", "severity": "MEDIUM", "stage": "MODEL", "target_stage": "MODEL",
@@ -272,16 +351,31 @@ def gate_findings(run_dir: str) -> list[dict]:
         out.append({"kind": "data_use_unreadable", "severity": "MEDIUM", "stage": "DATA", "target_stage": "DATA",
                     "scope_declarable": False,
                     "claim": f"`{rel}`: the header cannot be read ({err[:120]}), so the data-use audit cannot check it."})
-    for rel, cols in sorted(res["unused"].items()):
-        shown = ", ".join(f"`{c}`" for c in cols[:_LIST_CAP]) + (f" and {len(cols) - _LIST_CAP} more"
-                                                               if len(cols) > _LIST_CAP else "")
+    for t in res["triggers"]:
         out.append({
-            "kind": "data_column_unused", "severity": "MEDIUM", "stage": "MODEL", "target_stage": "MODEL",
-            "scope_declarable": True, "n_columns": len(cols),
-            "claim": (f"`{rel}`: {len(cols)} column(s) that no code under models/ reads: {shown}. Data the run "
-                      "assembled but the model ignores may hold variation the model collapses. Either read each "
-                      f"column in the model (or a sufficiency test), or list it in `{EXEMPT_PATH}` under "
-                      "`not_read_by_model:` with a reason.")})
+            "kind": "data_trigger_column_unused", "severity": "MEDIUM", "stage": "MODEL", "target_stage": "MODEL",
+            "scope_declarable": True, "mechanism_id": t["mechanism"], "prior_id": t["prior"],
+            "claim": (f"`{t['file']}` column `{t['column']}` is data for mechanism `{t['mechanism']}` (prior "
+                      f"`{t['prior']}`), and no code under models/ reads it. Read it in the model, or record the "
+                      f"mechanism as `simplified` with a sufficiency test in `models/mechanism_manifest.yaml`.")})
+    for rel in sorted(res["unopened"]):
+        out.append({
+            "kind": "data_file_unused", "severity": "MEDIUM", "stage": "MODEL", "target_stage": "MODEL",
+            "scope_declarable": True,
+            "claim": (f"`{rel}` is processed data that no code under models/ opens. Use it, or list it in "
+                      f"`{EXEMPT_PATH}` (`columns: [\"*\"]`) with a reason.")})
+    if res["unread"]:
+        n = sum(len(v) for v in res["unread"].values())
+        top = sorted(res["unread"].items(), key=lambda kv: -len(kv[1]))
+        parts = [f"`{rel}` {len(cols)} ({', '.join(cols[:_SUMMARY_EXAMPLES])}"
+                 f"{', ...' if len(cols) > _SUMMARY_EXAMPLES else ''})" for rel, cols in top[:_SUMMARY_FILES]]
+        more = f"; and {len(top) - _SUMMARY_FILES} more file(s)" if len(top) > _SUMMARY_FILES else ""
+        out.append({
+            "kind": "data_columns_unread_summary", "severity": "LOW", "stage": "MODEL", "target_stage": "MODEL",
+            "scope_declarable": True, "n_columns": n,
+            "claim": (f"{n} column(s) in data files the model reads are not read by any code under models/: "
+                      f"{'; '.join(parts)}{more}. Informational; check that none holds variation the model "
+                      "collapses.")})
     return out
 
 
@@ -300,15 +394,26 @@ def _self_test() -> int:
         with open(p, "w") as f:
             f.write(text)
 
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    from lib import expert_priors as ep
+    P = [ep._from_dict({
+        "id": "widget_mix", "kind": "methodological_standard", "severity_if_unaddressed": "HIGH",
+        "claim": "c", "rationale": "r", "applies_when": {"keywords_any": ["widget"], "domain_any": []},
+        "requires_mechanism": [{"id": "mix_by_group", "description": "d", "sufficiency_test": "t",
+                                "when_data_columns_any": ["mix_"]}]})]
+    kinds = lambda v: sorted(x["kind"] for x in v)
     with tempfile.TemporaryDirectory() as d:
         w(d, "data/processed/units.csv",
           "unit,pop,rate_2020,rate_2021,mix_a,mix_b,lat,score_hist,state\nA,1,2,3,4,5,6,7,8\n")
+        w(d, "data/processed/extra_table.csv", "unit,other\nA,1\n")
         w(d, "data/raw/raw.csv", "ignored_col\n1\n")
-        ok(gate_findings(d) == [], f"DU0 no model code yet → nothing, got {gate_findings(d)}")
+        ok(gate_findings(d, P) == [], f"DU0 no model code yet → nothing, got {gate_findings(d, P)}")
         w(d, "models/model.py", '''"""Model reads unit and pop. mix_a is described in this docstring only."""
-import csv
+import csv, os
+DATA = os.path.join("data", "processed", "units.csv")
 YEARS = (2020, 2021)
-def load(path):
+def load(path=DATA):
     rows = list(csv.DictReader(open(path)))
     # mix_b in a comment does not count
     for r in rows:
@@ -317,35 +422,65 @@ def load(path):
     print("Loaded the state table for the report and checked the score history today.")
     return {r["unit"]: r for r in rows}
 ''')
-        v = gate_findings(d)
-        un = audit(d)["unused"].get("data/processed/units.csv", [])
-        ok(len(v) == 1 and v[0]["kind"] == "data_column_unused" and v[0]["severity"] == "MEDIUM",
-           f"DU1 one MEDIUM finding per file, got {v}")
+        v = gate_findings(d, P)
+        un = audit(d, P)["unread"].get("data/processed/units.csv", [])
+        ok(kinds(v) == ["data_columns_unread_summary", "data_file_unused"],
+           f"DU1 no matched prior: an unopened file is MEDIUM, other unread columns one LOW summary, got {v}")
         ok(sorted(un) == ["lat", "mix_a", "mix_b", "score_hist", "state"],
            f"DU2 docstring / comment / prose mentions do not count, f-strings do, got {un}")
-        ok("ignored_col" not in str(v), "DU3 data/raw is not audited")
-        w(d, "models/extra.py", 'COLS = "lat,state"\nx = df.mix_a\ndf.assign(mix_b=1)\nP = "score_" + "x"\n')
-        ok(audit(d)["unused"] == {}, f"DU4 code-like lists, attributes, keywords and prefixes count, "
-                                     f"got {audit(d)['unused']}")
+        ok("ignored_col" not in str(v) and "raw.csv" not in str(v), "DU3 data/raw is not audited")
+        ok(next(x for x in v if x["kind"] == "data_columns_unread_summary")["severity"] == "LOW",
+           "DU3b the summary is LOW, never a per-file MEDIUM")
+        w(d, "metadata.json", '{"question": "Allocate the widget budget"}')
+        v = gate_findings(d, P)
+        trig = [x for x in v if x["kind"] == "data_trigger_column_unused"]
+        ok(sorted(x["claim"].split("column `")[1].split("`")[0] for x in trig) == ["mix_a", "mix_b"]
+           and all(x["severity"] == "MEDIUM" and x["mechanism_id"] == "mix_by_group" for x in trig),
+           f"DU4 a required mechanism's trigger columns unread: MEDIUM each, linked to the mechanism, got {v}")
+        ok("mix_a" not in str([x for x in v if x["kind"] == "data_columns_unread_summary"]),
+           "DU4b trigger columns are not repeated in the summary")
+        w(d, "models/mechanism_manifest.yaml", "mechanisms:\n- id: mix_by_group\n  status: simplified\n"
+                                               "  assumption: one mix\n  sufficiency_test: models/s.yaml\n")
+        ok(not any(x["kind"] == "data_trigger_column_unused" for x in gate_findings(d, P)),
+           "DU5 a mechanism recorded as simplified (D1 checks its test) is not re-flagged here")
+        os.remove(os.path.join(d, "models", "mechanism_manifest.yaml"))
+        w(d, "data/processed/units.csv", "unit,pop\nA,1\n")
+        w(d, "data/raw/src.csv", "unit,mix_raw\nA,1\n")
+        ok([x["claim"].split("`")[1] for x in gate_findings(d, P) if x["kind"] == "data_trigger_column_unused"]
+           == ["data/raw/src.csv"], "DU6 a trigger column only under data/raw/ is still flagged")
+        w(d, "data/processed/units.csv",
+          "unit,pop,rate_2020,rate_2021,mix_a,mix_b,lat,score_hist,state\nA,1,2,3,4,5,6,7,8\n")
+        os.remove(os.path.join(d, "data", "raw", "src.csv"))
+        w(d, "models/extra.py", 'COLS = "lat,state"\nx = df.mix_a\ndf.assign(mix_b=1)\nP = "score_" + "x"\n'
+                                'T = f"{DP}/extra_table.csv"\nO = "other"\n')
+        r = audit(d, P)
+        ok(r["unread"] == {} and r["unopened"] == [] and r["triggers"] == [],
+           f"DU7 code-like lists, attributes, keywords, prefixes and file names count, got {r}")
         os.remove(os.path.join(d, "models", "extra.py"))
-        w(d, "models/data_use.yaml", "not_read_by_model:\n  - file: data/processed/units.csv\n"
-                                     "    columns: [lat, state, mix_a, mix_b]\n"
-                                     "    reason: identifiers and reference columns for the report maps\n")
-        ok(audit(d)["unused"] == {"data/processed/units.csv": ["score_hist"]},
-           f"DU5 exempted columns with a reason are not flagged, got {audit(d)['unused']}")
-        w(d, "models/data_use.yaml", "not_read_by_model:\n  - file: data/processed/units.csv\n"
+        w(d, "models/data_use.yaml", "not_read_by_model:\n  - file: data/processed/extra_table.csv\n"
+                                     "    columns: ['*']\n    reason: lookup table kept for the report maps\n"
+                                     "  - file: data/processed/units.csv\n    columns: [mix_a, mix_b]\n"
+                                     "    reason: mix is out of scope; see the scope declaration\n")
+        v = gate_findings(d, P)
+        ok(kinds(v) == ["data_columns_unread_summary"], f"DU8 exemptions with a reason clear findings, got {v}")
+        w(d, "models/data_use.yaml", "not_read_by_model:\n  - file: data/processed/extra_table.csv\n"
                                      "    columns: ['*']\n    reason: ''\n")
-        v = gate_findings(d)
-        ok(any(x["kind"] == "data_use_invalid" for x in v) and any(x["kind"] == "data_column_unused" for x in v),
-           f"DU6 an exemption without a reason is invalid and exempts nothing, got {v}")
+        v = gate_findings(d, P)
+        ok("data_use_invalid" in kinds(v) and "data_file_unused" in kinds(v),
+           f"DU9 an exemption without a reason is invalid and exempts nothing, got {v}")
         w(d, "models/data_use.yaml", "not_read_by_model: [")
-        ok(any(x["kind"] == "data_use_invalid" for x in gate_findings(d)), "DU7 unparseable data_use.yaml fails closed")
+        ok("data_use_invalid" in kinds(gate_findings(d, P)), "DU10 unparseable data_use.yaml fails closed")
         os.remove(os.path.join(d, "models", "data_use.yaml"))
         w(d, "models/broken.py", "def f(:\n    return r['score_hist']\n")
-        ok("score_hist" not in audit(d)["unused"].get("data/processed/units.csv", []),
-           "DU8 an unparseable file is scanned as text")
-        w(d, "data/bad.csv", "")
-        ok(any(x["kind"] == "data_use_unreadable" for x in gate_findings(d)), "DU9 an empty CSV fails closed")
+        ok("score_hist" not in audit(d, P)["unread"].get("data/processed/units.csv", []),
+           "DU11 an unparseable file is scanned as text")
+        w(d, "data/processed/bad.csv", "")
+        ok("data_use_unreadable" in kinds(gate_findings(d, P)), "DU12 an empty CSV fails closed")
+    with tempfile.TemporaryDirectory() as d:
+        w(d, "data/units.csv", "unit,pop,hist\nA,1,2\n")
+        w(d, "models/m.py", "import pandas as pd\nU = pd.read_csv('data/units.csv')\nU['unit'], U['pop']\n")
+        ok(audit(d)["unread"] == {"data/units.csv": ["hist"]},
+           "DU13 without data/processed/, top-level data CSVs are the modelling data")
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
         return 1
@@ -366,13 +501,13 @@ def main(argv=None) -> int:
     if res["skipped"]:
         print("no .py files under models/: nothing to audit")
         return 0
-    n_un = sum(len(v) for v in res["unused"].values())
-    print(f"columns: {res['total']}  read: {res['read']}  exempt: {res['exempt']}  unused: {n_un}")
-    for rel, cols in sorted(res["unused"].items()):
-        print(f"  {rel}: {len(cols)} unused: {', '.join(cols)}")
-    for e in res["errors"]:
-        print("ERROR:", e)
-    return 1 if n_un or res["errors"] or res["unreadable"] else 0
+    v = gate_findings(a.run_dir)
+    n_un = sum(len(x) for x in res["unread"].values())
+    print(f"columns: {res['total']}  read: {res['read']}  exempt: {res['exempt']}  unread in opened files: {n_un}  "
+          f"unopened files: {len(res['unopened'])}  mechanism columns unread: {len(res['triggers'])}")
+    for x in v:
+        print(f"[{x['severity']}] {x['kind']}: {x['claim'][:300]}")
+    return 1 if any(x["severity"] in ("HIGH", "MEDIUM") for x in v) else 0
 
 
 if __name__ == "__main__":

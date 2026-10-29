@@ -67,7 +67,7 @@ EXPECTED_KINDS = {
     "mechanism_untested": ("mechanism_sufficiency_missing",),
     "prior_severity_below": ("pre_mortem_severity_below_prior",),
     "prose_closure": ("pre_mortem_closed_without_evidence",),
-    "unused_column": ("data_column_unused",),
+    "unused_column": ("data_columns_unread_summary",),
     "tuned_without_transfer": ("benchmark_transfer_missing",),
 }
 # On the positive control the planter's edit leaves `population` undefined,
