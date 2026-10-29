@@ -32,7 +32,8 @@ import shlex
 REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 
 # Harness code and configuration. No agent may write these.
-HARNESS_DIRS = ("scripts", "agents", ".claude")
+# Phase 42 ε: toolkit/ too; run model code imports it, so it is read-only and hashed like scripts/.
+HARNESS_DIRS = ("scripts", "agents", ".claude", "toolkit")
 HARNESS_FILES = ("main.py", "CLAUDE.md", "CHANGELOG.md", "requirements.txt",
                  "requirements-cloud.txt")
 # Phase 31: the lessons ledger records expert findings about the agents' own
@@ -43,7 +44,7 @@ PROTECTED_REPO_DIRS = ("docs/lessons",)
 # Subtrees hashed for tamper evidence. `.claude/` as a whole also holds
 # lock files and local settings that change legitimately, so only the
 # orchestration manifests and skills are hashed.
-HASHED_DIRS = ("scripts", "agents", ".claude/orchestration", ".claude/skills")
+HASHED_DIRS = ("scripts", "agents", ".claude/orchestration", ".claude/skills", "toolkit")
 HASHED_FILES = HARNESS_FILES
 _HASH_SKIP_DIRS = {"__pycache__", ".pytest_cache"}
 _HASH_SKIP_SUFFIXES = (".pyc", ".pyo")
@@ -190,7 +191,7 @@ def protected_reason(path: str, run_path: str, agent_type: str | None,
     if is_env_file(path, cwd):
         return "credential files (.env) are not accessible to agents"
     if is_harness_path(path, cwd):
-        return ("harness code/config (scripts/, agents/, .claude/, main.py, "
+        return ("harness code/config (scripts/, agents/, toolkit/, .claude/, main.py, "
                 "CLAUDE.md, docs/lessons/) is read-only during a run")
     rel = _run_rel(path, run_path, cwd)
     if rel is None:
@@ -436,7 +437,7 @@ def bash_reason(command: str, run_path: str, agent_type: str | None,
     if _CHMOD.search(command) and _HARNESS_WORDS.search(command):
         # Phase 36: kept command-wide (narrowing it to chmod operands was bypassed
         # five ways in review); the message says how to chmod a run file.
-        return ("harness code/config (scripts/, agents/, .claude/, main.py, CLAUDE.md) is read-only during a "
+        return ("harness code/config (scripts/, agents/, toolkit/, .claude/, main.py, CLAUDE.md) is read-only during a "
                 "run; changing its permissions is not allowed. A command is refused when it both changes "
                 "permissions and names harness code anywhere. To make your own run file executable, run "
                 "`chmod +x <run-file>` as a separate command that names no harness path, then run the rest.")
@@ -581,7 +582,7 @@ def unlock_harness(modes: dict[str, int]) -> None:
 
 
 _CHMOD = re.compile(r"\b(chmod|chattr|chown|chflags)\b|os\.chmod|\.chmod\(")
-_HARNESS_WORDS = re.compile(r"(?:^|[\s/'\"=])(?:scripts|agents|\.claude)(?:/|\b)|\bmain\.py\b|\bCLAUDE\.md\b|\brequirements\.txt\b")
+_HARNESS_WORDS = re.compile(r"(?:^|[\s/'\"=])(?:scripts|agents|toolkit|\.claude)(?:/|\b)|\bmain\.py\b|\bCLAUDE\.md\b|\brequirements\.txt\b")
 
 
 def hash_harness(repo_root: str = REPO_ROOT) -> dict[str, str]:

@@ -26,7 +26,7 @@ Backends (auto-selected):
          Tasks go to the cluster's workers except those listed in
          MA_COMPUTE_EXCLUDE_WORKERS (the run VMs, whose single thread is busy
          with the run). The run's `models/`, `data/` and the repo's `scripts/`
-         are bundled once and unpacked on each worker at the SAME absolute
+         and `toolkit/` are bundled once and unpacked on each worker at the SAME absolute
          paths, so model code with absolute paths works unchanged.
   local  otherwise: a process pool on this machine (cores - 1).
 
@@ -74,6 +74,8 @@ import traceback
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
+# Repo code a run's model may import (Phase 42 ε: toolkit/, e.g. toolkit/alloc).
+REPO_CODE_DIRS = ("scripts", "toolkit")
 DEFAULT_MAX_TASKS = 20000
 DEFAULT_MAX_FILE_MB = 100
 LEDGER_REL = os.path.join("models", "compute_ledger.json")
@@ -504,7 +506,7 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
 # --------------------------------------------------------------------------- #
 
 def make_bundle(run_dir: str, max_file_mb: float = DEFAULT_MAX_FILE_MB) -> tuple[bytes, dict]:
-    """tar.gz of the run's models/ and data/ and the repo's scripts/, with
+    """tar.gz of the run's models/ and data/ and the repo's scripts/ and toolkit/, with
     ABSOLUTE member paths so workers recreate the same layout."""
     run_dir = os.path.realpath(run_dir)
     skipped, n = [], 0
@@ -512,7 +514,8 @@ def make_bundle(run_dir: str, max_file_mb: float = DEFAULT_MAX_FILE_MB) -> tuple
     # dereference: symlinked inputs are stored as files (workers extract with
     # the "data" filter, which rejects absolute links).
     with tarfile.open(fileobj=buf, mode="w:gz", dereference=True) as t:
-        for root in (os.path.join(run_dir, "models"), os.path.join(run_dir, "data"), os.path.join(REPO, "scripts")):
+        for root in (os.path.join(run_dir, "models"), os.path.join(run_dir, "data"),
+                 *(os.path.join(REPO, x) for x in REPO_CODE_DIRS)):
             # Follow symlinked dirs; stop only at a loop (a dir that is its own
             # ancestor). Two names for one dir are both bundled: models use either.
             ancestors = {root: frozenset()}
@@ -1224,7 +1227,7 @@ _FP_HASH_MB = 64           # files up to this size are fingerprinted by content,
 def code_fingerprint(run_dir: str, fn_spec: str, exclude=()) -> str:
     """What a result depends on besides its params: every file under the run's
     models/ and data/ (following symlinked directories) and the repo's
-    scripts/, except (outside data/) logs, figures, summaries, the ledger, and
+    scripts/ and toolkit/, except (outside data/) logs, figures, summaries, the ledger, and
     this call's own results file (`exclude`); files up to 64 MB by content, larger ones by
     size and mtime. Any change and earlier rows are not reused."""
     run_dir = os.path.realpath(run_dir)
@@ -1234,7 +1237,8 @@ def code_fingerprint(run_dir: str, fn_spec: str, exclude=()) -> str:
     skip = {os.path.realpath(x) for x in exclude}
     files = {fn_file}
     links = []
-    for root in (os.path.join(run_dir, "models"), os.path.join(run_dir, "data"), os.path.join(REPO, "scripts")):
+    for root in (os.path.join(run_dir, "models"), os.path.join(run_dir, "data"),
+                 *(os.path.join(REPO, x) for x in REPO_CODE_DIRS)):
         # Every path a model can use is walked, aliases included (each under its
         # own name); only a loop (a dir that is its own ancestor) stops the walk.
         ancestors = {root: frozenset()}
@@ -1471,7 +1475,9 @@ def _self_test() -> int:
         os.remove(os.path.join(d, "data", "link.txt"))
         names = tarfile.open(fileobj=io.BytesIO(b)).getnames()
         ok(any(n.endswith("models/fn.py") and not n.startswith("/") for n in names)
-           and any(n.endswith("scripts/compute.py") for n in names), f"C7 bundle has models/ and scripts/: {info}")
+           and any(n.endswith("scripts/compute.py") for n in names)
+           and any(n.endswith("toolkit/alloc/costs.py") for n in names),
+           f"C7 bundle has models/, scripts/ and toolkit/ (a run model may import toolkit.alloc): {info}")
         open(os.path.join(d, "models", "slow.py"), "w").write(
             "import os, time\n"
             "def sleep(p):\n    time.sleep(p['s']); return {'ok': 1}\n"

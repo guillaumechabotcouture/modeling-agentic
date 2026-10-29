@@ -6,8 +6,17 @@
 
 Reads only run files: validator_history.jsonl (gate decisions), critique_*.yaml
 (findings by first round and resolution), done_when_registry.json (finding
-tests), trace.jsonl (holds and their reasons), models/compute_ledger.json and
-budget_ledger.json. Works on a finished run or a live one (on its VM).
+tests), trace.jsonl (holds and their reasons; uncertainty and gate runs),
+models/compute_ledger.json and budget_ledger.json. Works on a finished run or a
+live one (on its VM).
+
+Uncertainty runs per round (Phase 42 ε, improvement plan A8): each Bash call
+that runs scripts/propagate_uncertainty.py (not --self-test or --help, not
+refused) counts once, in the round of the next gate run
+(validate_critique_yaml.py --current-round N) after it; runs after the last
+gate are under "after". Traces from Phase 42 on record the full command
+(`scripts_run`, `command`); older ones only an 80-character summary, so their
+counts can miss calls whose script name was cut off.
 """
 from __future__ import annotations
 
@@ -108,6 +117,8 @@ def report(run_dir: str) -> dict:
             continue
         holds[next((name for name, key in HOLD_KINDS if key in reason), "other")] += 1
     out["refusals"] = dict(holds.most_common())
+    uq = uq_runs_by_round(run_dir)
+    out["uq_runs_by_round"], out["uq_rounds_from"] = uq["by_round"], uq["rounds_from"]
     # Compute.
     led = _json(os.path.join(run_dir, "models", "compute_ledger.json"), {}) or {}
     calls = led.get("calls") or []
@@ -131,6 +142,62 @@ def report(run_dir: str) -> dict:
     out["spend_usd"] = bl.get("spent_usd")
     out["cap_usd"] = bl.get("cap_usd")
     return out
+
+
+_ROUND_ARG = re.compile(r"--current-round[= ]+(\d+)")
+_NOT_A_RUN = re.compile(r"(?<![\w-])(--self-test|--help|-h)(?![\w-])")
+
+
+def _runs(rec: dict, script: str) -> str | None:
+    """The command when this trace record is an allowed Bash call that runs `script`."""
+    if rec.get("type") != "tool_use" or rec.get("tool") != "Bash" or rec.get("denied"):
+        return None
+    if "scripts_run" in rec:
+        return str(rec.get("command") or "") if script in (rec.get("scripts_run") or []) else None
+    # Traces before Phase 42: an 80-character summary; the script must be what Python runs
+    # (not a grep or sed of it).
+    s = str(rec.get("summary") or "")
+    return s if re.search(r"\bpython[\d.]*\s+(?:-u\s+)?\S*scripts/" + re.escape(script), s) else None
+
+
+def _epoch(ts) -> float | None:
+    """Seconds since the epoch; a naive trace time is the run machine's local time."""
+    import datetime as _dt
+    try:
+        return _dt.datetime.fromisoformat(str(ts)).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def uq_runs_by_round(run_dir: str) -> dict:
+    """{"by_round": {round: uncertainty runs}, "rounds_from": ...} (A8). A run counts in the
+    round of the next gate run after it: gate runs from the trace (Phase 42 records the
+    command and its --current-round), else from validator_history.jsonl times."""
+    uq, gates = [], []
+    for i, rec in enumerate(_jsonl(os.path.join(run_dir, "trace.jsonl"))):
+        c = _runs(rec, "propagate_uncertainty.py")
+        if c is not None and not _NOT_A_RUN.search(c):
+            uq.append((i, _epoch(rec.get("ts"))))
+        g = _runs(rec, "validate_critique_yaml.py")
+        m = _ROUND_ARG.search(g or "")
+        if m and not _NOT_A_RUN.search(g):
+            gates.append((i, int(m.group(1))))
+    source = "trace"
+    if not gates:
+        source = "validator_history"
+        for r in _jsonl(os.path.join(run_dir, "validator_history.jsonl")):
+            t = _epoch(r.get("at"))
+            if not r.get("post_write") and isinstance(r.get("round"), int) and t is not None:
+                gates.append((t, r["round"]))
+        gates.sort()
+        uq = [(t, t) for _i, t in uq if t is not None]
+    by = collections.Counter()
+    for pos, _t in uq:
+        by[next((rnd for gpos, rnd in gates if gpos >= pos), "after")] += 1
+    out = {k: by[k] for k in sorted(k for k in by if k != "after")}
+    if by.get("after"):
+        out["after"] = by["after"]
+    return {"by_round": out, "rounds_from": source if gates else None}
 
 
 def _compute_by_purpose(calls, state) -> dict:
@@ -172,6 +239,10 @@ def render(r: dict) -> str:
     lines.append(f"Tests: {t['registered']} registered {t['by_kind']}; passed once {t['passed_once']}, passing now "
                  f"{t['passing_now']}, regressed now {t['regressed_now']}, withdrawn {t['withdrawn']}")
     lines.append("Refusals: " + (", ".join(f"{k} {v}" for k, v in r["refusals"].items()) or "none"))
+    lines.append("Uncertainty runs by round: " + (", ".join(
+        f"{'r' + str(k) if k != 'after' else 'after the last gate'} {v}"
+        for k, v in r.get("uq_runs_by_round", {}).items()) or "none")
+        + (f" (rounds from {r['uq_rounds_from']})" if r.get("uq_rounds_from") else ""))
     c = r["compute"]
     lines.append(f"Compute: {c['calls']} calls, {c['core_hours']} core-hours, {c['stopped_calls']} stopped, "
                  f"unrun share {c['unrun_share']}, failed share {c['failed_share']} {c['failed_by_kind']}, "
@@ -218,6 +289,22 @@ def _self_test() -> int:
             f.write(json.dumps({"denied": "Before the next round's work, write round_plan.yaml (round: 1)"}) + "\n")
             f.write(json.dumps({"denied": "critique-redteam reviews finished work, and these agents are still working"}) + "\n")
             f.write("bad\n")
+            uq = "python3 scripts/propagate_uncertainty.py runs/x --n-draws 1100"
+            gate = "python3 scripts/validate_critique_yaml.py runs/x --max-rounds 8 --current-round {}"
+            for rec in (
+                    {"summary": "Bash: " + uq},                                     # pre-42: summary only
+                    {"summary": "Bash: " + gate.format(1)},
+                    {"scripts_run": ["propagate_uncertainty.py"], "command": uq},
+                    {"scripts_run": ["propagate_uncertainty.py"], "command": uq},
+                    {"scripts_run": ["propagate_uncertainty.py"], "command": uq, "denied": "no"},
+                    {"scripts_run": ["propagate_uncertainty.py"], "command": uq.replace("runs/x", "--self-test")},
+                    {"scripts_run": ["sanity_checks.py"], "command": "python3 scripts/sanity_checks.py runs/x"},
+                    {"scripts_run": ["validate_critique_yaml.py"], "command": gate.format(2)},
+                    {"scripts_run": ["propagate_uncertainty.py"], "command": uq},
+                    {"scripts_run": ["validate_critique_yaml.py"], "command": gate.format(2)},   # same-round rerun
+                    {"scripts_run": ["validate_critique_yaml.py"], "command": gate.format(3)},
+                    {"scripts_run": ["propagate_uncertainty.py"], "command": uq}):
+                f.write(json.dumps({"type": "tool_use", "tool": "Bash", **rec}) + "\n")
         json.dump({"core_seconds": 7200, "calls": [{"n": 10, "n_failed": 4, "stopped": "timed out", "ts": "t1"},
                                                    {"n": 10, "n_failed": 0, "stopped": None, "ts": "t2"}]},
                   open(os.path.join(d, "models", "compute_ledger.json"), "w"))
@@ -234,7 +321,11 @@ def _self_test() -> int:
         ok(r["tests"]["registered"] == 3 and r["tests"]["by_kind"] == {"runnable": 1, "mixed": 1, "judgement": 1}
            and r["tests"]["passing_now"] == 1 and r["tests"]["regressed_now"] == 1 and r["tests"]["withdrawn"] == 1,
            f"CV3 tests by kind and state: {r['tests']}")
-        ok(r["refusals"] == {"round plan": 1, "still working": 1}, f"CV4 refusals by hold: {r['refusals']}")
+        ok(r["refusals"] == {"round plan": 1, "still working": 1, "other": 1}, f"CV4 refusals by hold: {r['refusals']}")
+        ok(r["uq_runs_by_round"] == {1: 1, 2: 3, "after": 1} and "Uncertainty runs by round: r1 1, r2 3, "
+           "after the last gate 1" in render(r),
+           f"CV12 uncertainty runs counted in the round of the next gate; refused, self-test and other "
+           f"scripts not counted; a same-round gate rerun keeps its round: {r['uq_runs_by_round']}")
         ok(r["compute"]["unrun_share"] == 0.2 and r["compute"]["core_hours"] == 2.0 and r["compute"]["stopped_calls"] == 1
            and r["compute"]["failed_share"] == 0.2,
            f"CV5 compute: {r['compute']}")
@@ -261,6 +352,23 @@ def _self_test() -> int:
            f"CV10 core-hours per finding, split across the findings a batch names, joined to resolution: {bf}")
         ok("R-1 1.0 h (resolved r2)" in render(r2) and "Z-9 0.1 h (not in critiques)" in render(r2),
            f"CV11 rendering by finding: {render(r2)}")
+    # CV13: a trace from before Phase 42 (80-character summaries, gate rounds cut off) takes
+    # its rounds from validator_history times; a grep of the script is not a run.
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "validator_history.jsonl"), "w") as f:
+            for rnd, at in ((1, "2026-10-21T10:00:00+00:00"), (2, "2026-10-21T12:00:00+00:00")):
+                f.write(json.dumps({"round": rnd, "at": at, "action": "PATCH_OR_RETHINK", "findings": []}) + "\n")
+        with open(os.path.join(d, "trace.jsonl"), "w") as f:
+            for ts, summ in (("2026-10-21T09:00:00+00:00", "Bash: cd runs/x && python3 ../../scripts/propagate_uncertainty.py ."),
+                             ("2026-10-21T11:00:00+00:00", "Bash: grep -n def scripts/propagate_uncertainty.py"),
+                             ("2026-10-21T11:30:00+00:00", "Bash: python3 scripts/propagate_uncertainty.py runs/x --n"),
+                             ("2026-10-21T11:40:00+00:00", "Bash: python3 scripts/validate_critique_yaml.py runs/2026-10-20_2133"),
+                             ("2026-10-21T13:00:00+00:00", "Bash: nohup python3 -u scripts/propagate_uncertainty.py runs/x")):
+                f.write(json.dumps({"type": "tool_use", "tool": "Bash", "ts": ts, "summary": summ}) + "\n")
+        r3 = report(d)
+        ok(r3["uq_runs_by_round"] == {1: 1, 2: 1, "after": 1} and r3["uq_rounds_from"] == "validator_history"
+           and "(rounds from validator_history)" in render(r3),
+           f"CV13 an old trace is binned by validator-history times; a grep is not a run: {r3['uq_runs_by_round']}")
     if fails:
         print("SELF-TEST FAILURES:")
         for f in fails:

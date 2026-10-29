@@ -1981,6 +1981,10 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None,
     # point estimates, so a decoy fails before any harness-computed check.
     violations += G(lambda rd: _load_sibling("headline_binding").gate_findings(rd),
                     run_dir, check_name="headline_binding")
+    # Phase 42 ε: an allocation uses toolkit/alloc, or records why not (advisory).
+    violations += G(lambda rd: _load_sibling("alloc_toolkit_use").gate_findings(
+                        rd, allocation=_allocation_present(rd)),
+                    run_dir, check_name="alloc_toolkit_use")
     # Phase 34: done_when findings computed by the caller, added before the
     # escalation so their persistence counts (Codex review).
     violations += list(extra or [])
@@ -9247,6 +9251,15 @@ def _run_self_test() -> int:
             ok(rc != 3 and action != "ACCEPT" and "cross_model_critic_invalid" in open_,
                f"XM6: invalid cross-model YAML → HIGH, not schema exit 3; "
                f"got rc={rc} {action} {open_}")
+
+    # AT1 (Phase 42 ε): the gate runs the toolkit-use check on an allocation run, as an advisory.
+    with tempfile.TemporaryDirectory() as _td:
+        os.makedirs(os.path.join(_td, "models"))
+        with open(os.path.join(_td, "models", "allocation.csv"), "w") as _f:
+            _f.write("unit,package\n")
+        _at = [v for v in _check_rigor_artifacts(_td, round_n=2) if v.get("kind", "").startswith("alloc_toolkit")]
+        ok([(v["kind"], v["severity"]) for v in _at] == [("alloc_toolkit_not_used", "MEDIUM")],
+           f"AT1: an allocation run without the toolkit or a reason gets one advisory MEDIUM; got {_at}")
 
     # LS1 (S1 real-check, E7 attempt 7): a run module named like a gate script
     # (models/pipeline.py) already in sys.modules is neither returned nor replaced.

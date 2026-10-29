@@ -53,8 +53,11 @@ import sys
 
 import yaml
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import costs  # noqa: E402  (toolkit/alloc/costs.py)
+if __package__:            # imported as toolkit.alloc.packages (a run's model code)
+    from . import costs
+else:                      # run as a script: python3 toolkit/alloc/packages.py
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import costs  # noqa: E402  (toolkit/alloc/costs.py)
 
 TRUE = {"true", "1", "yes", "y", "t"}
 FALSE = {"false", "0", "no", "n", "f", ""}

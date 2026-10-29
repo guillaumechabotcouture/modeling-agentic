@@ -43,7 +43,7 @@ rigor checks between rounds.
              ▼
 ┌────────────────────────────────────────────────────────────────┐
 │  SKILLS  .claude/skills/                                       │
-│  56 SKILL.md files: process/rigor contracts (disease-agnostic),│
+│  57 SKILL.md files: process/rigor contracts (disease-agnostic),│
 │  epi fundamentals, frameworks (Starsim, LASER, stisim), and    │
 │  disease-specific skills (e.g. malaria-modeling).              │
 │  Attached to agents in agents/__init__.py.                     │
@@ -145,7 +145,7 @@ Before opening a PR, every command below must report
 
 ```bash
 for f in main.py \
-  scripts/allocation_robustness.py scripts/benchmark_match.py \
+  scripts/alloc_toolkit_use.py scripts/allocation_robustness.py scripts/benchmark_match.py \
   scripts/build_claims_ledger.py scripts/data_schema.py \
   scripts/cloud_batch.py scripts/coherence_audit.py \
   scripts/compare_models.py scripts/compute.py scripts/convergence_report.py \
@@ -168,7 +168,7 @@ for f in main.py \
   scripts/lib/expert_priors.py scripts/lib/md_helpers.py \
   scripts/lib/positive_control.py scripts/lib/provenance.py \
   scripts/lib/rigor_artifacts.py scripts/lib/safe_io.py \
-  toolkit/alloc/costs.py \
+  toolkit/alloc/costs.py toolkit/alloc/packages.py toolkit/alloc/optimize.py \
   scripts/lib/text_spans.py scripts/lib/transcript_cost.py; do
   echo "== $f"; python3 "$f" --self-test || echo "FAILED: $f"
 done
