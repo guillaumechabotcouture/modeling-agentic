@@ -489,3 +489,24 @@ artifacts:
       across every list in the file (Phase 21 β). `not_applicable:
       <artifact_id>` entries (with justification) exempt a scope-declarable
       artifact from the ACCEPT requirement and also count.
+
+  # ---- Phase 44 α -------------------------------------------------------------
+
+  - id: model_domain
+    path: models/model_domain.yaml
+    first_draft_round: 2
+    finalize_round: 8
+    stage: model
+    skill: uncertainty-quantification
+    triggered_by: always
+    scope_declarable: true
+    required_for_accept: never   # advisory: read by scripts/model_card.py and scripts/ask.py
+    description: |
+      **Advisory** (Phase 44 α). The range each outcome_fn input was simulated,
+      calibrated or fitted over (`parameters: {name: {min, max, basis}}`), the
+      per-unit covariate ranges (`covariates:`), an optional
+      `whatif_interface.arguments` mapping a budget or objective to an
+      outcome_fn params key, and `validation:` files (e.g. an emulator check).
+      The harness's model card uses it as the valid domain for later what-if
+      queries (`scripts/ask.py`); without it only the registry prior intervals
+      count. Declare only ranges the run actually covered.

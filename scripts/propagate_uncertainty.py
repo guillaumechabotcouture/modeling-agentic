@@ -308,6 +308,40 @@ def load_outcome_fn_fingerprinted(run_dir: str, spec: Optional[str], probe_param
 # Propagation
 # ---------------------------------------------------------------------------
 
+def draw_params(params: list, n_draws: int, seed: int) -> tuple[dict, list]:
+    """(per-parameter samples, per-draw params dicts): the registry draws.
+    Independent priors, sampled in registry order from one seeded stream, so
+    the same registry, n_draws and seed give the same draws (scripts/ask.py
+    regenerates a report's draws this way). A later enhancement would
+    support correlated priors (e.g. two intervention effects sharing a
+    common driver)."""
+    registry_module = _import_sibling_module("effect_size_registry")
+    rng = random.Random(seed)
+    per_param_samples: dict[str, list[float]] = {}
+    for p in params:
+        per_param_samples[p["name"]] = registry_module.sample_prior(p, n_draws, rng)
+    params_list = [{name: per_param_samples[name][i] for name in per_param_samples}
+                   for i in range(n_draws)]
+    return per_param_samples, params_list
+
+
+def parameter_summary(per_param_samples: dict) -> dict:
+    """The report's `parameter_samples:` block (mean, std, 2.5% / 97.5% order statistics)."""
+    out = {}
+    for name, samples in per_param_samples.items():
+        samples_sorted = sorted(samples)
+        n = len(samples_sorted)
+        if not n:
+            continue
+        out[name] = {
+            "mean": float(mean(samples)),
+            "std": float(pstdev(samples)) if n > 1 else 0.0,
+            "ci_low": float(samples_sorted[int(0.025 * n)]),
+            "ci_high": float(samples_sorted[min(n - 1, int(0.975 * n))]),
+        }
+    return out
+
+
 def propagate(run_dir: str, n_draws: int = 200, seed: int = 42,
               outcome_fn_spec: Optional[str] = None,
               verbose: bool = False,
@@ -350,21 +384,7 @@ def propagate(run_dir: str, n_draws: int = 200, seed: int = 42,
     except Exception as e:  # noqa: BLE001 — the load below raises the usual error
         fp_fn, fingerprint = None, {"error": f"{type(e).__name__}: {str(e)[:200]}"}
 
-    rng = random.Random(seed)
-    # Pre-sample all N draws per parameter. Independent priors — later
-    # enhancement would support correlated priors (e.g., IRS and ITN
-    # efficacy share a pyrethroid-mortality backbone).
-    per_param_samples: dict[str, list[float]] = {}
-    for p in params:
-        per_param_samples[p["name"]] = registry_module.sample_prior(
-            p, n_draws, rng
-        )
-
-    # Prepare the per-draw params list (same for local and cloud).
-    params_list = [
-        {name: per_param_samples[name][i] for name in per_param_samples}
-        for i in range(n_draws)
-    ]
+    per_param_samples, params_list = draw_params(params, n_draws, seed)
 
     scalar_results: dict[str, list[float]] = {}
     categorical_results: dict[str, list[str]] = {}
@@ -458,16 +478,7 @@ def propagate(run_dir: str, n_draws: int = 200, seed: int = 42,
 
     # Parameter sample summary (computed first: the degeneracy diagnostic
     # needs to know whether the sampler actually varied the inputs).
-    parameter_samples = {}
-    for name, samples in per_param_samples.items():
-        samples_sorted = sorted(samples)
-        n = len(samples_sorted)
-        parameter_samples[name] = {
-            "mean": float(mean(samples)),
-            "std": float(pstdev(samples)) if n > 1 else 0.0,
-            "ci_low": float(samples_sorted[int(0.025 * n)]),
-            "ci_high": float(samples_sorted[min(n - 1, int(0.975 * n))]),
-        }
+    parameter_samples = parameter_summary(per_param_samples)
     varied_params = [n for n, ps in parameter_samples.items() if ps["std"] > 0]
 
     # Aggregate scalars.

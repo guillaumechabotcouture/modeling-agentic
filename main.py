@@ -1108,6 +1108,8 @@ def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
                     "ran_at": datetime.now().isoformat()}
             json.dump(gate, open(os.path.join(run_path, "final_gate.json"), "w"), indent=2)
         add_verdict_banner(run_path, gate)
+        # Phase 44 α (E1): the model card, from the gated artifacts, before storage.
+        write_model_card(run_path, integrity)
 
     harness_diff = enforcement.diff_harness(harness_before, enforcement.hash_harness())
     enforcement.unlock_harness(_HARNESS_LOCK)
@@ -1192,6 +1194,36 @@ def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
     return status
 
 
+def _store_blob_name(run_path: str) -> str:
+    name = os.path.basename(os.path.normpath(run_path))
+    return f"outputs/{os.environ.get('MA_STORAGE_PREFIX', 'runs')}/{name}.tar.gz"
+
+
+def write_model_card(run_path: str, integrity=None, timeout: float | None = None) -> dict | None:
+    """Phase 44 α (E1): model_card.yaml / model_card.md, written by the harness
+    from the run's own artifacts (scripts/model_card.py; the model runs in a
+    separate process). Recorded as harness writes so the integrity record
+    accepts them. Never blocks finalize."""
+    card = None
+    try:
+        sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
+        import model_card
+        import results_store
+        card = model_card.write(
+            run_path, timeout=timeout or float(os.environ.get("MA_MODEL_CARD_TIMEOUT_S", model_card.DEFAULT_TIMEOUT_S)),
+            stored_blob=_store_blob_name(run_path) if results_store.configured_account() else None,
+            run_commit=model_card._git_head())
+        print(f"  Model card: {card['status']}"
+              + "".join(f"\n    - {r}" for r in card["not_usable_reasons"][:3]), flush=True)
+    except Exception as e:  # noqa: BLE001 — never block finalize
+        print(f"[WARNING] model card failed: {type(e).__name__}: {e}", flush=True)
+    if integrity is not None:
+        for rel in ("model_card.yaml", "model_card.md"):
+            if os.path.exists(os.path.join(run_path, rel)):
+                integrity.harness_wrote(rel)
+    return card
+
+
 def store_run_results(run_path: str, service=None) -> str | None:
     """Phase 26: when a storage account is configured ($MA_STORAGE_ACCOUNT or
     $COILED_STORAGE_ACCOUNT), upload the finished run directory to
@@ -1212,7 +1244,7 @@ def store_run_results(run_path: str, service=None) -> str | None:
         tmp = os.path.join(os.path.dirname(os.path.normpath(run_path)), f".{name}.store.tar.gz")
         with open(tmp, "wb") as f:
             f.write(data)
-        blob = f"outputs/{os.environ.get('MA_STORAGE_PREFIX', 'runs')}/{name}.tar.gz"
+        blob = _store_blob_name(run_path)
         results_store.upload_retry(tmp, blob, account, service=service)
         os.remove(tmp)
     except Exception as e:  # noqa: BLE001 — the local copy remains; say so loudly
@@ -2422,6 +2454,27 @@ def _run_self_test() -> int:
     ok({"validator_history.jsonl", "metadata.json", "final_gate.json"} <= _ig.w,
        f"WU8 the write-up's gate and metadata writes are registered as harness writes: {_ig.w}")
     shutil.rmtree(_cd, ignore_errors=True)
+
+    # MCARD (Phase 44 α): finalize writes the model card as a harness write; an
+    # agent's later edit of it is flagged.
+    from agents.integrity import ArtifactIntegrity as _AI
+    _mc = tempfile.mkdtemp()
+    os.makedirs(os.path.join(_mc, "models"))
+    open(os.path.join(_mc, "citations.md"), "w").write(
+        "## Parameter Registry\n\n```yaml\nparameters:\n- name: e\n  value: 0.5\n  ci_low: 0.4\n  ci_high: 0.6\n"
+        "  kind: efficacy\n  source: C1\n```\n")
+    open(os.path.join(_mc, "models", "outcome_fn.py"), "w").write("def outcome_fn(p):\n    return {'y': 2 * p['e']}\n")
+    _igm = _AI(_mc, process_check=lambda: set())
+    _card = write_model_card(_mc, _igm)
+    ok(_card and _card["status"] == "usable" and os.path.exists(os.path.join(_mc, "model_card.md"))
+       and _igm.check_now() == [] and not _igm.open_events,
+       f"MCARD1 finalize writes a usable card, accepted by the integrity record: "
+       f"{_card and _card['not_usable_reasons']} {_igm.open_events}")
+    _igm.on_pre("mc1", "Bash", {"command": "echo 'status: usable' > model_card.yaml"}, "writer")
+    open(os.path.join(_mc, "model_card.yaml"), "w").write("status: usable\n")
+    ok([(e["file"], e["change"]) for e in _igm.on_post("mc1")] == [("model_card.yaml", "modified")],
+       f"MCARD2 an agent's edit of the harness-written card is flagged: {_igm.events}")
+    shutil.rmtree(_mc, ignore_errors=True)
 
     # OB (Phase 29): live status, resources, checkpoints.
     from agents import observability as _ob
