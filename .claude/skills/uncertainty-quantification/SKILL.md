@@ -70,6 +70,12 @@ If the full model takes >5 minutes per invocation, 200 draws will take
    `{run_dir}/models/outcome_fn_calibration.md`. A surrogate with RMSE
    >10% of the mean output is suspect — either the grid is too sparse
    or the emulator is under-parameterized.
+5. Record the ranges the grid covered in `models/model_domain.yaml`
+   (schema and status in the rigor manifest, entry `model_domain`):
+   the harness's model card treats them as the valid domain for later
+   what-if queries on the finished run, and an emulator queried outside
+   its grid is extrapolating. List an emulator validation file under
+   `validation:` so the card reports it.
 
 ## Example outcome_fn (malaria-style allocation)
 

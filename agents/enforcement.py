@@ -99,6 +99,11 @@ SCRIPT_OUTPUTS = (
     "models/pipeline_state.json.tmp",
     "models/pipeline_report.json",
     "models/pipeline_report.json.tmp",
+    # Phase 44 α: the model card (main.py finalize, scripts/model_card.py) and
+    # the what-if query log (scripts/ask.py).
+    "model_card.yaml",
+    "model_card.md",
+    "whatif_log.jsonl",
 )
 
 # Phase 33 α (Gemini review): frozen once decision_brief.signoff.json exists.

@@ -54,7 +54,7 @@ rigor checks between rounds.
 │  RUNS  runs/<timestamp>_<question>/   (gitignored, local only) │
 │  Per-question output: data/, models/, figures/, plan.md,       │
 │  results.md, decision_rule.md, report.md, critique_*.yaml,     │
-│  scope_declaration.yaml, final_gate.json.                      │
+│  scope_declaration.yaml, final_gate.json, model_card.yaml.     │
 └────────────────────────────────────────────────────────────────┘
 ```
 
@@ -69,6 +69,7 @@ rigor checks between rounds.
 | Add a new skill                       | Create `.claude/skills/<name>/SKILL.md` with `name`/`description` frontmatter, attach in `agents/__init__.py`, run `python3 scripts/validate_skill_attachments.py` |
 | Trace a phase change                  | `CHANGELOG.md` (phase commit ledger and gate internals)       |
 | See what artifacts a run produces     | Any local `runs/<timestamp>_*/` directory. `runs/` is gitignored, so there is no checked-in example; run the pipeline or ask a maintainer for one. |
+| Reuse a finished run's model          | `<run>/model_card.md` (written at finalize by `scripts/model_card.py`), then `python3 scripts/ask.py <run> --set <input>=<value>` (refuses anything outside the card's valid domain) |
 
 ## Agents
 
@@ -145,8 +146,8 @@ Before opening a PR, every command below must report
 
 ```bash
 for f in main.py \
-  scripts/alloc_toolkit_use.py scripts/allocation_robustness.py scripts/benchmark_match.py \
-  scripts/benchmark_transfer.py \
+  scripts/alloc_toolkit_use.py scripts/allocation_robustness.py scripts/ask.py scripts/benchmark_match.py \
+  scripts/benchmark_transfer.py scripts/model_card.py \
   scripts/build_claims_ledger.py scripts/data_schema.py scripts/data_use.py \
   scripts/cloud_batch.py scripts/coherence_audit.py \
   scripts/compare_models.py scripts/compute.py scripts/convergence_report.py \

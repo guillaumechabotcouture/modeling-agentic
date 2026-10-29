@@ -72,11 +72,13 @@ REPORT_NAME = "artifact_integrity.json"
 # metadata.json is NOT here: the planner may edit it, so it is watched and
 # the harness records its own writes (harness_wrote).
 _HARNESS_WRITTEN = {"harness_manifest.json", "trace.jsonl",
-                    "final_gate.json", "final_gate_stderr.txt", REPORT_NAME}
-# The gate's records main.py writes (run_final_gate): not scanned at start (a
-# resumed run's old copy is the harness's), but watched once the harness has
-# written them and said so (harness_wrote): only main.py writes them.
-_WATCH_ONCE_WRITTEN = {"final_gate.json", "final_gate_stderr.txt"}
+                    "final_gate.json", "final_gate_stderr.txt", REPORT_NAME,
+                    "model_card.yaml", "model_card.md"}
+# The gate's records main.py writes (run_final_gate), and the model card it
+# writes at finalize (Phase 44 α): not scanned at start (a resumed run's old
+# copy is the harness's), but watched once the harness has written them and
+# said so (harness_wrote): only main.py writes them.
+_WATCH_ONCE_WRITTEN = {"final_gate.json", "final_gate_stderr.txt", "model_card.yaml", "model_card.md"}
 # Which protected outputs each harness script may write (measured: the
 # validator also rewrites four gate reports). A script authorizes only
 # these — never critique files, and never another script's output.
@@ -105,6 +107,8 @@ SCRIPT_PRODUCES: dict[str, tuple[str, ...]] = {
     "eligibility_probe.py": ("models/eligibility_probe.yaml",),
     "build_claims_ledger.py": ("models/claims_ledger.yaml", "claims_ledger.yaml"),
     "render_claims.py": ("report.md", "models/claims_ledger.yaml", "claims_ledger.yaml"),
+    "model_card.py": ("model_card.yaml", "model_card.md"),
+    "ask.py": ("whatif_log.jsonl",),
 }
 _SCRIPTS_DIR = os.path.realpath(os.path.join(enforcement.REPO_ROOT, "scripts"))
 _WRAPPERS = {"nohup", "env", "time", "nice", "command", "exec", "sudo", "stdbuf"}
@@ -582,6 +586,31 @@ class ArtifactIntegrity:
                     self._check(where="pipeline_run")
                 finally:
                     self.grants = [x for x in self.grants if x is not g]
+
+    @contextmanager
+    def harness_runs_code(self, where: str, allowed=()):
+        """Phase 44 α (Codex): the harness runs the run's own model code after the
+        final check (the model card at finalize). Any watched file that changes
+        meanwhile, other than `allowed` (the harness's own outputs, recorded with
+        harness_wrote), is an unresolvable violation."""
+        with self._lock:
+            before = self._scan()
+        try:
+            yield
+        finally:
+            with self._lock:
+                after = self._scan()
+                new = [{"file": rel, "change": ("deleted" if rel not in after else
+                                                "created" if rel not in before else "modified"),
+                        "detected": where, "ts": datetime.now().isoformat(timespec="seconds"),
+                        "in_flight": [], "open": True, "resolvable": False}
+                       for rel in sorted(set(before) | set(after))
+                       if before.get(rel) != after.get(rel) and rel not in allowed]
+                if new:
+                    self.events.extend(new)
+                    self._write_report()
+                if REPORT_NAME in self.hashes:
+                    self.hashes[REPORT_NAME] = _sha(os.path.join(self.run_path, REPORT_NAME))
 
     def final_check(self) -> list[dict]:
         with self._lock:
