@@ -227,7 +227,8 @@ def _filled(v) -> bool:
 def _validate_v2(doc: dict) -> list[str]:
     """Phase 43 β: method fit, and facts vs decisions."""
     errors = []
-    qs = {str(q.get("id")): q for q in doc.get("open_questions") or [] if isinstance(q, dict)}
+    oq = doc.get("open_questions")
+    qs = {str(q.get("id")): q for q in (oq if isinstance(oq, list) else []) if isinstance(q, dict)}
     for key in TAGGED:
         items = doc.get(key)
         for it in items if isinstance(items, list) else []:
@@ -263,7 +264,7 @@ def _validate_v2(doc: dict) -> list[str]:
         bad = [c for c in ABM_CRITERIA if not re.match(r"(?i)\s*(yes|no)\b\W*\w", str(crit.get(c) or ""))]
         if bad:
             errors.append(f"method_assessment.abm_criteria: give `yes: <why>` or `no: <why>` for {', '.join(bad)}")
-        elif (ma.get("representation") == "agent_based" and ma.get("verdict") == "fits"
+        elif (ma.get("representation") in ("agent_based", "hybrid") and ma.get("verdict") == "fits"
               and not any(re.match(r"(?i)\s*yes\b", str(crit[c])) for c in ABM_CRITERIA)):
             errors.append("method_assessment: agent-based with no criterion that needs it; say which one does, "
                           "or recommend a compartmental model (does_not_fit, with an owner question)")
@@ -773,7 +774,11 @@ def _run_self_test() -> int:
                                                                   for x in e),
            f"DB27: a mechanistic question says compartmental or agent-based, by every criterion: {e}")
         e = errs_of(example_brief(method_assessment={**ma, "representation": "agent_based"}))
-        ok(any("no criterion that needs it" in x for x in e), f"DB28: agent-based needs a reason: {e}")
+        e2 = errs_of(example_brief(method_assessment={**ma, "representation": "hybrid"}))
+        ok(any("no criterion that needs it" in x for x in e) and any("no criterion that needs it" in x for x in e2),
+           f"DB28: agent-based or hybrid needs a reason: {e} {e2}")
+        e = errs_of(example_brief(open_questions=7))
+        ok(any("open_questions: must be a list" in x for x in e), f"DB28b (Codex review): not a list, no crash: {e}")
         e = errs_of(example_brief(method_assessment={**ma, "requested": "a Starsim agent-based model"}))
         e2 = errs_of(example_brief(method_assessment={**ma, "requested": "agent_based"}))
         ok(any("not a silent switch" in x for x in e) and any("not a silent switch" in x for x in e2),
