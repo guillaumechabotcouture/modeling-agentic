@@ -25,6 +25,24 @@ This module covers the statistical methods used to connect infectious disease mo
 
 6. Quantify uncertainty around parameter estimates by constructing confidence intervals (frequentist) or credible intervals (Bayesian). Point estimates without uncertainty ranges are insufficient for decision-making.
 
+## Write the Calibration Spec Before the First Fit
+
+**Context:** A parameter being editable does not make it a calibration parameter. Many inputs should come straight from data or the literature, and a future intervention assumption must never be fitted to history. Targets (what the model must reproduce) and knobs (what may move to reproduce them) are separate lists, each entry with its justification. Adapted from the stisim.ai `calibration-strategy` skill. The artifact, its schema and its gate rules are in `.claude/orchestration/rigor_artifacts.yaml` (`calibration_spec`) and `scripts/calibration_spec.py`.
+
+**Steps:**
+
+1. Give every candidate parameter one role: `data_informed` (set from data; not fitted), `fixed_literature` (external evidence transfers; vary it in sensitivity analysis if needed), `country_specific_uncertain` (differs by setting, weakly observed; a reasonable knob), `behavioural` (a process the data shows only indirectly), `tuning` (maps a mechanism onto observed outcomes; state how to read it), `scenario_assumption` (a future or hypothetical input; never fitted). Record `calibrated: true|false` and the reason, including for parameters considered and left out.
+
+2. Record each target's quantity, population, age, calendar time, units, source, uncertainty, and whether it is observed or an estimate modelled by others (a modelled estimate is not an observation; say so and weight it accordingly).
+
+3. Start from the smallest defensible set of knobs. Each added knob needs a reason; a large search space lets unrelated parameters compensate for each other and hides misspecification.
+
+4. When a target cannot be fitted, diagnose before widening anything, in this order: missing or wrong input data; a missing mechanism; a structural constraint (one process limiting another); inconsistent targets; a target definition that does not match the model output (denominator, age group, period, units); and only then the bounds. Record each check under the parameter's `bound_changes`.
+
+5. A knob that runs to its bound and trades off against another is not identified by these targets. Fix it with a stated reason (role and `calibrated: false`), or add the data that separates them; do not widen its range to make the fit look free.
+
+6. Keep calibration (what is compatible with history) apart from projection and from sensitivity analysis: do not tune a parameter for a desired projection, and do not run a sensitivity analysis over a parameter that was itself fitted to the same data without saying so.
+
 ## Fit Models Using Least Squares
 
 **Context:** Least squares is the most intuitive fitting method. It requires no distributional assumptions about the data and works well when residuals are approximately symmetric and homoscedastic.

@@ -1899,6 +1899,10 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None,
     # or simplified with a sufficiency-test result.
     violations += G(lambda rd: _load_sibling("mechanism_manifest").gate_findings(rd, round_n),
                     run_dir, check_name="mechanism_manifest")
+    # Phase 43 α B1: fitted parameters carry a role in the calibration spec
+    # (never a scenario assumption); targets carry their metadata.
+    violations += G(lambda rd: _load_sibling("calibration_spec").gate_findings(rd, round_n),
+                    run_dir, check_name="calibration_spec")
     # Phase 42 γ D3: every processed data column is read by model code or
     # listed as not read, with a reason.
     violations += G(lambda rd: _load_sibling("data_use").gate_findings(rd),
@@ -8048,6 +8052,9 @@ def _run_self_test() -> int:
     _src42 = _inspect42.getsource(_check_rigor_artifacts)
     ok(all(f'_load_sibling("{m}")' in _src42 for m in ("mechanism_manifest", "data_use", "benchmark_transfer")),
        "PF11: mechanism_manifest, data_use and benchmark_transfer must run in _check_rigor_artifacts")
+    # PF12: Phase 43 α calibration spec is wired into the gate.
+    ok('_load_sibling("calibration_spec")' in _src42,
+       "PF12: calibration_spec must run in _check_rigor_artifacts")
 
     # --- Phase 17 β: coherence_audit integration tests (CA-prefix) ---
     with _tempfile.TemporaryDirectory() as _d:
