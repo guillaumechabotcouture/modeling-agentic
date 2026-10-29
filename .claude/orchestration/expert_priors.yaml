@@ -885,8 +885,10 @@ priors:
       keywords_any: ["campaign", "sia", "supplementary immunization",
                      "supplementary immunisation", "routine",
                      "mcv1", "mcv2", "schedule", "target age",
-                     "age at vaccination", "catch-up", "follow-up",
-                     "outbreak response", "immunity gap"]
+                     "age band", "age at vaccination", "catch-up",
+                     "catch up", "follow-up", "outbreak response",
+                     "immunity gap", "vaccine", "vaccination",
+                     "immunization", "immunisation", "dose"]
     requires_mechanism:
       - id: age_structured_contacts
         description: |
