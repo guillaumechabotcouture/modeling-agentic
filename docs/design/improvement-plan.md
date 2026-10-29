@@ -2,6 +2,22 @@
 
 Status: draft for review, 2026-10-28. It complements `stage-machine.md` (the architecture and migration steps S1–S6, T0–T2, M0–M2). Each item below is one small PR, checked on its own against the metric stated for it, in the order given.
 
+## Status (2026-10-29)
+
+Merged to main:
+- **A:** A1 compute charged for work done (#51); A2, A3 (#47, #48); A4 + A8 toolkit, pipeline and once-per-version UQ prompt (#50); A5–A7 cloud VM reuse, quota overflow and durable VM jobs (#53).
+- **B:** B1 calibration spec (#56); B2 + B3 method fit and fact/decision tags in the brief (#55).
+- **D:** D1–D5 generic rules (#52) and D6/D8 priors (#49); owner-specified simplifications (#58).
+- **M2:** removed duplicated helpers (#54).
+- **Integrity fixes found by the smokes:** #57 (final-gate false "deleted") and #59 (missing presentation critique after the harness write-up).
+
+Open:
+- A9 (stale data-stage figures) and A10 (session crash), both waiting for attempt 8's records;
+- B4, which needs S3; B5, B6;
+- C1–C3;
+- D7;
+- E1–E4 (E1/E2 in progress).
+
 ## Why
 
 - **stisim.ai** (`starsimhub/stisim/stisim/ai`, v0.1, 2026-09-23) is a Claude Code plugin of 14 skills for interactive STIsim/HIVsim research: grilling intake, method selection, calibration strategy, upstream-first extension, and meaningful tests. Its discipline is good, but nothing checks that the agent follows it. Our pipeline checks the work mechanically, but lacks several of the disciplines it teaches.
