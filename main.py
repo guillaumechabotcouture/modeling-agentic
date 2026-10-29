@@ -1,6 +1,7 @@
 """Modeling agent orchestrator -- single lead session with parallel subagents."""
 
 import asyncio
+import contextlib
 import argparse
 import glob
 import json
@@ -1205,14 +1206,21 @@ def write_model_card(run_path: str, integrity=None, timeout: float | None = None
     separate process). Recorded as harness writes so the integrity record
     accepts them. Never blocks finalize."""
     card = None
+    own = ("model_card.yaml", "model_card.md")
+    # The card runs the run's own code after the final integrity check: anything it
+    # changes in the run's watched files besides the card is a violation (Codex review).
+    guard = integrity.harness_runs_code("model_card", allowed=own) if integrity is not None \
+        else contextlib.nullcontext()
     try:
-        sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
-        import model_card
-        import results_store
-        card = model_card.write(
-            run_path, timeout=timeout or float(os.environ.get("MA_MODEL_CARD_TIMEOUT_S", model_card.DEFAULT_TIMEOUT_S)),
-            stored_blob=_store_blob_name(run_path) if results_store.configured_account() else None,
-            run_commit=model_card._git_head())
+        with guard:
+            sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
+            import model_card
+            import results_store
+            card = model_card.write(
+                run_path,
+                timeout=timeout or float(os.environ.get("MA_MODEL_CARD_TIMEOUT_S", model_card.DEFAULT_TIMEOUT_S)),
+                stored_blob=_store_blob_name(run_path) if results_store.configured_account() else None,
+                run_commit=model_card._git_head())
         print(f"  Model card: {card['status']}"
               + "".join(f"\n    - {r}" for r in card["not_usable_reasons"][:3]), flush=True)
     except Exception as e:  # noqa: BLE001 — never block finalize
@@ -2474,6 +2482,16 @@ def _run_self_test() -> int:
     open(os.path.join(_mc, "model_card.yaml"), "w").write("status: usable\n")
     ok([(e["file"], e["change"]) for e in _igm.on_post("mc1")] == [("model_card.yaml", "modified")],
        f"MCARD2 an agent's edit of the harness-written card is flagged: {_igm.events}")
+    # MCARD3: run code executed for the card that rewrites a protected file is a violation.
+    open(os.path.join(_mc, "uncertainty_report.yaml"), "w").write("n_draws: 1\n")
+    _igm3 = _AI(_mc, process_check=lambda: set())
+    open(os.path.join(_mc, "models", "outcome_fn.py"), "w").write(
+        "import os\ndef outcome_fn(p):\n"
+        "    open(os.path.join(os.path.dirname(__file__), '..', 'uncertainty_report.yaml'), 'w').write('x: 1')\n"
+        "    return {'y': 2 * p['e']}\n")
+    write_model_card(_mc, _igm3)
+    ok([e["file"] for e in _igm3.open_events if e["detected"] == "model_card"] == ["uncertainty_report.yaml"],
+       f"MCARD3 a protected file changed by the card's model run is flagged: {_igm3.events}")
     shutil.rmtree(_mc, ignore_errors=True)
 
     # OB (Phase 29): live status, resources, checkpoints.

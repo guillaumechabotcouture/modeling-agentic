@@ -190,28 +190,69 @@ def _draws(registry: list, report: dict | None, n: int | None, seed: int | None)
     return plist, info
 
 
+def saved_card(run_dir: str, mc) -> tuple[dict | None, str | None]:
+    """(the run's model_card.yaml, or None and why it cannot be used)."""
+    doc, err = mc._read_yaml(os.path.join(run_dir, mc.CARD))
+    if err or not isinstance(doc, dict):
+        return None, (err or f"the run has no {mc.CARD}: write it first with "
+                             f"`python3 scripts/model_card.py {run_dir}`")
+    if doc.get("producer") != "scripts/model_card.py" or doc.get("schema_version") != 1:
+        return None, f"{mc.CARD} was not written by scripts/model_card.py (schema 1)"
+    if doc.get("status") != "usable":
+        return None, (f"{mc.CARD} says the model is not usable: "
+                      + "; ".join(map(str, doc.get("not_usable_reasons") or ["no reason recorded"]))[:600])
+    if doc.get("inputs_digest") != mc.inputs_digest(run_dir):
+        changed = [k for k in mc.DIGEST_FILES
+                   if (doc.get("inputs_digest") or {}).get(k) != mc.inputs_digest(run_dir).get(k)]
+        return None, (f"{', '.join(changed) or 'the card inputs'} changed after {mc.CARD} was written: the card's "
+                      "domain and draws no longer describe this run (rewrite the card to re-check it)")
+    fp = ((doc.get("interface") or {}).get("functions") or [{}])[0].get("fingerprint")
+    if not isinstance(fp, dict) or not (fp.get("sources") or {}):
+        return None, f"{mc.CARD} records no code fingerprint for the interface"
+    return doc, None
+
+
 def ask(run_dir: str, settings: dict, budget=None, objective=None, draws: int | None = None,
         seed: int | None = None, paired: bool = False, timeout: float | None = 3600) -> dict:
     mc = _sibling("model_card")
-    card = mc.build(run_dir, evaluate=False)
-    res = {"run_id": card["provenance"]["run_id"], "request": {"set": settings, "budget": budget,
-                                                               "objective": objective, "draws": draws,
-                                                               "seed": seed, "paired": paired}}
+    now = mc.build(run_dir, evaluate=False)
+    res = {"run_id": now["provenance"]["run_id"], "request": {"set": settings, "budget": budget,
+                                                              "objective": objective, "draws": draws,
+                                                              "seed": seed, "paired": paired}}
+    card, why = saved_card(run_dir, mc)
+    if why:
+        return {**res, "status": "refused", "reasons": [why]}
+    # The saved card (written at finalize) is the contract: its domain and code fingerprint.
     overrides, reasons, checked = check_request(card, settings, budget, objective)
-    reasons = list(card["not_usable_reasons"]) + reasons
+    reasons = list(now["not_usable_reasons"]) + reasons
     if reasons:
         return {**res, "status": "refused", "reasons": reasons}
     registry, _ = mc.load_registry(run_dir)
     report, _ = mc._read_yaml(os.path.join(run_dir, "uncertainty_report.yaml"))
     report = report if isinstance(report, dict) else None
     plist, dinfo = _draws(registry, report, draws, seed)
+    if dinfo["source"] == "regenerated_not_matching":
+        return {**res, "status": "refused", "reasons": [dinfo["note"]]}
+    # A draw outside a range the run DECLARED it covered (model_domain) would be an
+    # extrapolation: such draws are left out, and too many of them refuse the query.
+    # Registry-prior ranges are 95% intervals: the prior's tails are the run's own draws.
+    declared = {k: e for k, e in card["domain"]["parameters"].items() if e.get("source") == "model_domain"}
+    inside = [i for i, p in enumerate(plist) if all(declared[k]["min"] <= v <= declared[k]["max"]
+                                                     for k, v in p.items() if k in declared and k not in overrides)]
+    if plist and (len(plist) - len(inside)) / len(plist) > MAX_FAIL_SHARE:
+        return {**res, "status": "refused", "reasons": [
+            f"{len(plist) - len(inside)} of {len(plist)} registry draws fall outside the ranges the run declares it "
+            f"covered ({', '.join(sorted(declared))}): the interval would be an extrapolation"]}
+    dinfo["n_outside_declared_domain"] = len(plist) - len(inside)
+    plist = [plist[i] for i in inside]
     point = mc.point_params(registry)
     q_point = {**point, **overrides}
     evals = {"base_point": [point], "query_point": [q_point], "query_draws": [{**p, **overrides} for p in plist]}
     if paired:
         evals["base_draws"] = plist
+    expected = card["interface"]["functions"][0]["fingerprint"]
     w = mc.run_worker(run_dir, {"spec": mc.OUTCOME_FN_SPEC, "point": point, "evals": evals,
-                                "expected_fingerprint": (report or {}).get("outcome_fn_fingerprint")}, timeout)
+                                "expected_fingerprint": expected}, timeout)
     res.update(settings_checked=checked, draws={**dinfo, "fixed_in_every_draw": sorted(overrides)},
                fingerprint=(w.get("fingerprint") or {}).get("sources"))
     if w.get("worker_error") or w.get("load_error"):
@@ -262,8 +303,11 @@ def render(r: dict, outputs: list[str] | None = None, limit: int = 20) -> str:
     src = {"stored": "the run's own registry draws (regenerated from uncertainty_report.yaml and checked)",
            "fresh": "fresh registry draws",
            "regenerated_not_matching": "registry draws that do NOT match uncertainty_report.yaml"}[d["source"]]
-    L.append(f"  draws: {d['n'] - d['n_failed']} of {d['n']} {src}, seed {d['seed']}; "
-             f"set inputs fixed in every draw" + (f"; {d['note']}" if d.get("note") else ""))
+    out_dom = d.get("n_outside_declared_domain") or 0
+    L.append(f"  draws: {d['n'] - out_dom - d['n_failed']} of {d['n']} {src}, seed {d['seed']}; "
+             f"set inputs fixed in every draw"
+             + (f"; {out_dom} left out (outside the declared domain)" if out_dom else "")
+             + (f"; {d['note']}" if d.get("note") else ""))
     sc = r["outputs"]["scalar"]
     keys = outputs or (list(r["headline"]) if r.get("headline") else list(sc))
     rows = [("output", "run point", "what-if point", "change", "what-if 95% interval", "run's interval")]
@@ -340,6 +384,11 @@ def _self_test() -> int:
         for m in [m for m in sys.modules if m in ("outcome_fn", "helper")]:
             del sys.modules[m]
         yaml.safe_dump(rep, open(os.path.join(d, "uncertainty_report.yaml"), "w"))
+        mc = _sibling("model_card")
+        # A0: no saved card, or a card that is not usable: refused.
+        r0 = ask(d, {"effect_rr": 0.7})
+        ok(r0["status"] == "refused" and "has no model_card.yaml" in r0["reasons"][0], f"A0 no card refused; got {r0}")
+        mc.write(d)
         # A1: an in-domain setting is answered at the point and over the run's own draws.
         r = ask(d, {"effect_rr": 0.7})
         b = r.get("outputs", {}).get("scalar", {}).get("benefit", {})
@@ -370,6 +419,10 @@ def _self_test() -> int:
                                       "whatif_interface:\n  arguments:\n    budget: {param: budget_total}\n"
                                       "    objective: {param: objective, choices: [benefit, deaths]}\n")
         r5 = ask(d, {}, budget=1500.0, draws=10)
+        ok(r5["status"] == "refused" and "changed after model_card.yaml was written" in r5["reasons"][0],
+           f"A5a a domain declared after the card does not count until the card is rewritten; got {r5}")
+        mc.write(d)
+        r5 = ask(d, {}, budget=1500.0, draws=10)
         b5 = r5.get("outputs", {}).get("scalar", {}).get("benefit", {})
         ok(r5["status"] == "answered" and abs(b5["whatif_point"] - 10 * 3 * 0.4) < 1e-9
            and r5["draws"]["source"] == "fresh" and r5["draws"]["n"] == 10
@@ -391,18 +444,50 @@ def _self_test() -> int:
         r8 = ask(d, {"effect_rr": 0.7})
         ok(r8["status"] == "refused" and any("changed since uncertainty_report.yaml" in x for x in r8["reasons"]),
            f"A8 stale code refused; got {r8}")
-        # A8b: every fingerprinted file is unchanged, but the function now imports a module the
-        # report's code did not: the worker's full fingerprint check refuses.
+        # A8b: a module imported only on the branch a query takes is not the recorded code.
         w("models/helper.py", "SCALE = 10.0\n")
-        stale = dict(rep, outcome_fn_fingerprint={**rep["outcome_fn_fingerprint"], "sources": {
-            k: v for k, v in rep["outcome_fn_fingerprint"]["sources"].items() if k != "models/helper.py"}})
-        yaml.safe_dump(stale, open(os.path.join(d, "uncertainty_report.yaml"), "w"))
-        r8 = ask(d, {"effect_rr": 0.7})
-        ok(r8["status"] == "refused" and "not the code behind uncertainty_report.yaml" in r8["reasons"][0],
-           f"A8b newly imported module refused by the worker; got {r8}")
-        # A9: a model that fails at the point is reported as failed, not answered.
         os.remove(os.path.join(d, "uncertainty_report.yaml"))
+        w("models/extra.py", "K = 1.0\n")
+        w("models/outcome_fn.py", _FN.replace("    b = params", "    if params['effect_rr'] > 0.65:\n"
+                                              "        import extra\n    b = params"))
+        mc.write(d)
+        ok(ask(d, {"effect_rr": 0.6}, draws=0)["status"] == "answered", "A8b0 the recorded branch is answered")
+        r8 = ask(d, {"effect_rr": 0.7}, draws=0)
+        ok(r8["status"] == "refused" and "models/extra.py (not recorded)" in r8["reasons"][0],
+           f"A8b a query-only import is refused; got {r8}")
+        # A8c: a card the harness marked not usable is refused, whatever the request.
+        w("models/outcome_fn.py", "def outcome_fn(p):\n    raise ValueError('broken')\n")
+        mc.write(d)
+        r8 = ask(d, {"effect_rr": 0.7})
+        ok(r8["status"] == "refused" and "says the model is not usable" in r8["reasons"][0], f"A8c; got {r8}")
+        # A8d: declared ranges: a registry point outside one makes the card not usable; draws
+        # outside one are left out, and too many of them refuse.
+        w("models/outcome_fn.py", _FN)
+        w("models/model_domain.yaml", "parameters:\n  unit_cost: {min: 5.5, max: 6.0, basis: grid}\n")
+        ok(any("lies outside its valid domain" in x for x in mc.build(d, evaluate=False)["not_usable_reasons"]),
+           "A8d a point estimate outside a declared range is not usable")
+        w("models/model_domain.yaml", "parameters:\n  unit_cost: {min: 4.9, max: 5.1, basis: grid}\n")
+        mc.write(d)
+        r8 = ask(d, {"effect_rr": 0.7}, draws=40)
+        ok(r8["status"] == "refused" and "fall outside the ranges the run declares" in r8["reasons"][0],
+           f"A8e draws outside the declared range refuse; got {r8}")
+        w("models/model_domain.yaml", "parameters:\n  unit_cost: {min: 3.0, max: 6.1, basis: grid}\n")
+        mc.write(d)
+        r8 = ask(d, {"effect_rr": 0.7}, draws=200)
+        ok(r8["status"] == "answered" and 0 < r8["draws"]["n_outside_declared_domain"] <= 40
+           and r8["outputs"]["scalar"]["benefit"]["whatif_interval"]["n"] == 200 - r8["draws"]["n_outside_declared_domain"],
+           f"A8f draws outside the declared range are left out; got {r8.get('reasons')} {r8.get('draws')}")
+        os.remove(os.path.join(d, "models/model_domain.yaml"))
+        # A8g: the registry changed after the card: refused (its draws are not the card's).
+        mc.write(d)
+        w("citations.md", _REG.replace("ci_high: 0.72", "ci_high: 0.95"))
+        r8 = ask(d, {"effect_rr": 0.9})
+        ok(r8["status"] == "refused" and "citations.md changed after model_card.yaml" in r8["reasons"][0],
+           f"A8g registry drift refused; got {r8}")
+        w("citations.md", _REG)
+        # A9: a model that fails at a query point is reported as failed, not answered.
         w("models/outcome_fn.py", _FN.replace("    b = params", "    assert params['effect_rr'] < 0.65\n    b = params"))
+        mc.write(d)
         r9 = ask(d, {"effect_rr": 0.7}, draws=5)
         ok(r9["status"] == "failed" and "AssertionError" in r9["reasons"][0], f"A9 failing model; got {r9}")
         # A10: the log records answered and refused queries; the text names the reason.

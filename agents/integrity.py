@@ -587,6 +587,31 @@ class ArtifactIntegrity:
                 finally:
                     self.grants = [x for x in self.grants if x is not g]
 
+    @contextmanager
+    def harness_runs_code(self, where: str, allowed=()):
+        """Phase 44 α (Codex): the harness runs the run's own model code after the
+        final check (the model card at finalize). Any watched file that changes
+        meanwhile, other than `allowed` (the harness's own outputs, recorded with
+        harness_wrote), is an unresolvable violation."""
+        with self._lock:
+            before = self._scan()
+        try:
+            yield
+        finally:
+            with self._lock:
+                after = self._scan()
+                new = [{"file": rel, "change": ("deleted" if rel not in after else
+                                                "created" if rel not in before else "modified"),
+                        "detected": where, "ts": datetime.now().isoformat(timespec="seconds"),
+                        "in_flight": [], "open": True, "resolvable": False}
+                       for rel in sorted(set(before) | set(after))
+                       if before.get(rel) != after.get(rel) and rel not in allowed]
+                if new:
+                    self.events.extend(new)
+                    self._write_report()
+                if REPORT_NAME in self.hashes:
+                    self.hashes[REPORT_NAME] = _sha(os.path.join(self.run_path, REPORT_NAME))
+
     def final_check(self) -> list[dict]:
         with self._lock:
             # Intents whose PostToolUse never arrived (tool errors, or a

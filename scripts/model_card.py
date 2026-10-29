@@ -232,6 +232,15 @@ def domain(registry: list[dict], md: dict | None) -> dict:
             f"no covariate ranges declared ({DOMAIN} absent or has no `covariates:`)"}
 
 
+DIGEST_FILES = ("citations.md", DOMAIN, "uncertainty_report.yaml")
+
+
+def inputs_digest(run_dir: str) -> dict:
+    """sha256 of the files that define the card's interface inputs, domain and draws
+    (None when absent). scripts/ask.py refuses a card whose digest no longer matches."""
+    return {rel: _sha(os.path.join(run_dir, rel)) for rel in DIGEST_FILES}
+
+
 def static_fingerprint_check(run_dir: str) -> tuple[bool | None, str | None]:
     """Do the source files uncertainty_report.yaml fingerprinted still hash the same?
     (None, why) when there is no report or no fingerprint. The worker's check also
@@ -315,6 +324,22 @@ def _third_party_versions(run_dir: str) -> dict:
     return dict(sorted(out.items()))
 
 
+def _unrecorded_run_modules(run_dir: str, sources: dict) -> list[str]:
+    """Run modules loaded in this process that `sources` does not record, or whose bytes differ."""
+    rd = os.path.realpath(run_dir)
+    out = []
+    for m in list(sys.modules.values()):
+        f = getattr(m, "__file__", None)
+        if not f or not os.path.realpath(f).startswith(os.path.join(rd, "")):
+            continue
+        rel = os.path.relpath(os.path.realpath(f), rd)
+        if rel not in sources:
+            out.append(f"{rel} (not recorded)")
+        elif _sha(os.path.realpath(f)) != sources[rel]:
+            out.append(f"{rel} (changed)")
+    return sorted(set(out))
+
+
 def _worker(job_path: str, out_path: str) -> int:
     """Run inside `python -I -B`: load the run's function(s) and evaluate the job's params lists."""
     with open(job_path) as f:
@@ -356,6 +381,16 @@ def _worker(job_path: str, out_path: str) -> int:
                         rows.append({"ok": False, "error": f"{type(e).__name__}: {str(e)[:300]}",
                                      "s": round(time.time() - t, 3)})
                 res["evals"][name] = rows
+            # Codex review: a module imported only on a branch the queries take is not in the
+            # recorded code; every run module loaded now must be recorded, with the same bytes.
+            exp = (job.get("expected_fingerprint") or {}).get("sources")
+            if isinstance(exp, dict):
+                late = _unrecorded_run_modules(run_dir, exp)
+                if late:
+                    res["fingerprint_mismatch"] = (
+                        "the evaluation ran model code that is not the recorded code: "
+                        + ", ".join(late[:5]))
+                    res["evals"] = {}
         unit = job.get("unit")
         if unit:
             ur = {"spec": unit["spec"]}
@@ -642,6 +677,11 @@ def build(run_dir: str, evaluate: bool = True, timeout: float | None = DEFAULT_T
         reasons.append("no interface input has an established range (no registry prior intervals and no "
                        f"{DOMAIN}): the valid domain cannot be established")
     point = point_params(registry or [])
+    for name, v in point.items():
+        e = dom["parameters"].get(name) or {}
+        if "min" in e and not e["min"] <= v <= e["max"]:
+            reasons.append(f"the registry point estimate {name} = {v:g} lies outside its valid domain "
+                           f"[{e['min']:g}, {e['max']:g}] ({e['source']}): the run's own headline is an extrapolation")
     spec = OUTCOME_FN_SPEC
     fn_entry: dict = {"spec": spec, "role": "outcome_fn: the function the uncertainty harness runs",
                       "call": "outcome_fn(params: dict) -> dict",
@@ -653,6 +693,11 @@ def build(run_dir: str, evaluate: bool = True, timeout: float | None = DEFAULT_T
         fn_entry["loaded"] = False
     report_doc, _ = _read_yaml(os.path.join(run_dir, "uncertainty_report.yaml"))
     report_fp = report_doc.get("outcome_fn_fingerprint") if isinstance(report_doc, dict) else None
+    if report_fp is not None and (not isinstance(report_fp, dict) or not isinstance(report_fp.get("sources"), dict)
+                                  or not report_fp["sources"]):
+        reasons.append("uncertainty_report.yaml's outcome_fn_fingerprint is malformed: which code produced the "
+                       "run's intervals cannot be checked")
+        report_fp = None
     static_ok, static_why = static_fingerprint_check(run_dir)
     fn_entry["matches_uncertainty_report"] = static_ok
     if static_ok is False:
@@ -689,6 +734,9 @@ def build(run_dir: str, evaluate: bool = True, timeout: float | None = DEFAULT_T
             fn_entry["matches_uncertainty_report"] = (None if report_fp is None else why is None)
             if why:
                 reasons.append(why)
+            if not ((wres.get("fingerprint") or {}).get("sources")):
+                reasons.append("the interface's source fingerprint could not be recorded, so later queries "
+                               "cannot check they run this code")
     else:
         fn_entry["checked"] = False
     functions = [fn_entry]
@@ -722,6 +770,7 @@ def build(run_dir: str, evaluate: bool = True, timeout: float | None = DEFAULT_T
     card = {
         "schema_version": 1,
         "producer": "scripts/model_card.py",
+        "inputs_digest": inputs_digest(run_dir),
         "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
         "status": "not_usable" if reasons else "usable",
         "not_usable_reasons": reasons,
@@ -912,6 +961,11 @@ def _self_test() -> int:
         ok(c["status"] == "not_usable" and any("changed since uncertainty_report.yaml" in r for r in c["not_usable_reasons"])
            and c["interface"]["functions"][0]["matches_uncertainty_report"] is False,
            f"MC6 stale model code fails closed; got {c['not_usable_reasons']}")
+        # MC6b: a malformed fingerprint is not read as "no fingerprint".
+        w("models/outcome_fn.py", _FN)
+        w("uncertainty_report.yaml", "n_draws: 10\noutcome_fn_fingerprint: {file: models/outcome_fn.py, sources: {}}\n")
+        ok(any("fingerprint is malformed" in r for r in build(d, evaluate=False)["not_usable_reasons"]),
+           "MC6b malformed report fingerprint fails closed")
         # MC7: no outcome_fn at all / unloadable module.
         w("uncertainty_report.yaml", "n_draws: 10\n")
         w("models/outcome_fn.py", "import does_not_exist_anywhere\n")
