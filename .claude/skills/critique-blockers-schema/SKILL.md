@@ -126,6 +126,19 @@ low-quality figures) are MEDIUM unless they break a required deliverable.
 
 **LOW** — polish, style, redundancy, non-blocking suggestions.
 
+**Severity floor from priors (Phase 42 γ).** A concern that matches an
+expert prior is graded at least at the prior's `severity_if_unaddressed`.
+Cite the prior as `expert_prior:<id>` (in `evidence_files`, or a
+`prior_id:` field). The pre-mortem validator enforces the floor
+(`pre_mortem_severity_below_prior`). For other critics it is a
+calibration rule, not yet a gate. A concern whose suggested check is a
+sensitivity analysis or a data use is closed only by an existing results
+artifact (or, for a data use, the code that reads the data), never by
+prose (`pre_mortem_closed_without_evidence`). The related model-side
+checks are `scripts/mechanism_manifest.py`, `scripts/data_use.py` and
+`scripts/benchmark_transfer.py`. Their artifacts and rules are listed in
+`.claude/orchestration/rigor_artifacts.yaml`.
+
 If you're unsure between HIGH and MEDIUM, the tiebreaker is:
 *would a peer reviewer at Lancet / PLOS Med reject the manuscript for
 this specific issue?* HIGH if yes, MEDIUM if they'd request a revision.

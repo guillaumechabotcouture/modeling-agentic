@@ -74,17 +74,23 @@ domain_vocabulary:
 #       found_via            bootstrap | semantic_scholar | websearch | manual
 #       excerpt              optional supporting quote
 #   found_in_runs            run-dir basenames where the concern was raised
-#   requires_mechanism       Phase 42: optional; a list of mappings (one
-#                            mapping also accepted) naming mechanisms the
-#                            model must record in models/mechanism_manifest.yaml:
-#     - id                   stable snake_case id (the manifest key)
+#   requires_mechanism       optional (Phase 42 γ, D1): mechanisms the model
+#                            must account for when this prior applies to a run
+#                            (applies_when matches, or the pre-mortem cites
+#                            `expert_prior:<id>`). A mapping or a list of:
+#     - id                   snake_case; the key in models/mechanism_manifest.yaml
 #       description          what the model must represent
-#       sufficiency_test     what to vary, over what plausible range, and
-#                            what counts as a decision change
-#       when_data_columns_any  optional; case-insensitive substrings of
-#                            processed-data column names; the mechanism is
-#                            required only when some data CSV column
-#                            contains one
+#       sufficiency_test     what to vary, over what plausible range, and what
+#                            counts as a decision change
+#       when_data_columns_any  optional: required only when a data CSV of the
+#                            run (data/, data/raw/ included) has a column whose
+#                            name contains one of these (case-insensitive)
+#                            A mechanism with when_data_columns_any is also
+#                            required when only the prior's domain (disease
+#                            area) matches the question, if the columns exist.
+#                            The run records each as modelled / fixed /
+#                            simplified (+ sufficiency-test result);
+#                            scripts/mechanism_manifest.py checks it.
 
 priors:
 
