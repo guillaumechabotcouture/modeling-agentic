@@ -92,13 +92,25 @@ Domain knowledge reaches the model only as prose, and a self-graded severity dec
 
 **Test of the split:** run D1–D5 on a smoke run for a non-malaria question, as CLAUDE.md asks (alternate disease areas). The rules must work on that run, and a scan of `scripts/` must find no disease names.
 
+## Workstream E — the finished run as a reusable asset
+
+**Why.** A finished run leaves a complete stored asset: data, model code, calibration, emulator, uncertainty draws, claims ledger and report. Attempt 8's model even has a working interface (`outcome_fn(params)`, `alloc_core.solve(U, budget=, objective=)`, `evaluate_unit`), and it answered the alternative envelopes with it. But the pipeline has no way to reuse a finished model: what-ifs are done by hand with no checks, `--resume` only finishes an interrupted run, and any follow-up question starts from scratch. Model code is not packaged, versioned, or described by its valid range (attempt 7: 23% generic, 26% malaria-reusable, 30% question-specific, 21% duplicates; attempt 8: a second, independent 2,728-line model for the same question).
+
+| # | Change | Check / metric |
+|---|---|---|
+| E1 | **Model card** written by the harness at the end of every run (`model_card.yaml` + a short `model_card.md`): the callable interface (functions, inputs, outputs), the valid domain (parameter and covariate ranges the model was simulated or calibrated over), validation results (trial benchmarks, held-out calibration, emulator accuracy), the uncertainty draws available, environment pins, and known limits (scope declarations, open findings). Built from artifacts the gate already reads; fails closed when an interface or the domain cannot be established. | Cards for attempts 7 and 8; every interface entry callable. |
+| E2 | **What-if queries without agents:** `ask <stored run> --set <param>=<value> ...` loads the stored model, checks the request is inside the card's valid domain (refuses outside it), runs the interface with the run's uncertainty draws, and returns the answer with intervals, recording the query. Deterministic, no model API calls. | Attempt 8: re-answer its own alternative envelopes and match them; an out-of-domain request is refused. |
+| E3 | **Follow-up runs:** `main.py --from <stored run> "<follow-up or feedback>"` starts from the stored model, data and declared pipeline; the planner writes a brief of what changes from the base (signed by the owner); the pipeline reruns only stale steps; critics and gates review the change; the report is an addendum. | One real follow-up on attempt 8 (e.g. a new envelope plus an SMC unit-cost change) at a fraction of a full run's cost. |
+| E4 | **Promotion into the toolkit:** after a run, an agent proposes moving its best reusable modules (e.g. a malaria vector-and-immunity module, D7) into the toolkit as a PR the owner approves, with tests from the run's validation. | Next same-area run starts from the toolkit module. |
+
 ## Order and checkpoints
 
 1. A1, A2, A3 (in progress), then A4 with a smoke run.
 2. D1–D5 (generic rules) with D6 (the first prior that uses them), then a non-malaria smoke run; then B1 and B4 (calibration spec and diagnosis order), B2 and B3 (brief), each with a smoke run.
 3. C1 benchmark (no run spend; VM time only), alongside step 2.
 4. Attempt 9: same question, same settings. Compare with attempts 7 and 8 on findings by round, compute lost, spend, and headline basis.
-5. B5, B6, and the M2 structure work (`stage-machine.md` §3.7) between runs.
+5. E1 and E2 (model card and what-if queries), so attempt 8's model is usable when it finishes; then E3 with one real follow-up on attempt 8; E4 after.
+6. B5, B6, and the M2 structure work (`stage-machine.md` §3.7) between runs.
 
 ## What stays as it is
 
