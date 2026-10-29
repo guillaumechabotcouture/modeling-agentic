@@ -34,6 +34,11 @@ must account for the mechanism in `models/mechanism_manifest.yaml`:
         status: simplified               # collapsed or left out
         assumption: "<what the model assumes instead>"
         sufficiency_test: models/sufficiency/<id>.yaml   # the result file
+      - id: <id>
+        status: simplified               # the owner fixed the model's form
+        assumption: "<what the model assumes instead>"
+        specified_by: question           # or: brief (the signed decision brief)
+        quote: "<the words of the question or brief that fix the form>"
 
 The result file (YAML or JSON) states the test and its verdict:
 
@@ -49,6 +54,13 @@ If the decision does not change, the simplification stands (the report should
 cite the test). If it does, the mechanism must be added: the entry may not
 stay `simplified`.
 
+When the owner's question or the signed brief itself fixes the model's form
+(e.g. "a simple deterministic SIR model"), the simplification is the owner's
+choice, not the modeler's: `specified_by` + a verbatim `quote` replace the
+sufficiency test. The quote must appear in the run question or the signed
+brief (whitespace- and case-insensitive), or the entry is invalid (HIGH). The
+report must still state the limitation (MEDIUM, scope-declarable, if not).
+
 Findings:
   mechanism_manifest_invalid       HIGH  unreadable / malformed manifest or entry
   mechanism_unaccounted            HIGH  a required mechanism has no entry
@@ -59,6 +71,10 @@ Findings:
   mechanism_simplification_rejected HIGH simplified although its test says the
                                          decision changes
   mechanism_test_not_cited         MEDIUM report.md does not cite the test
+  mechanism_scope_quote_unfound    HIGH  specified_by given, but the quote is not
+                                         in the run question / signed brief
+  mechanism_scope_not_stated       MEDIUM owner-specified simplification not stated
+                                         in report.md (scope-declarable)
   mechanism_priors_unavailable     MEDIUM the run question cannot be read, so the
                                          required set is unknown
 Never HIGH for leaving a feature out when its sufficiency test passed. None of
@@ -227,9 +243,63 @@ def _num(x):
     return float(x) if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) else None
 
 
+def _norm(t: str) -> str:
+    return " ".join(str(t).lower().split())
+
+
+def _owner_texts(run_dir: str) -> dict:
+    """{'question': text, 'brief': text} the owner wrote or signed (missing ones are '')."""
+    out = {"question": "", "brief": ""}
+    q, _, _ = _lib().run_question(run_dir)
+    out["question"] = q or ""
+    parts = []
+    for rel in ("decision_brief.yaml", "decision_brief.md"):
+        p = os.path.join(run_dir, rel)
+        if os.path.isfile(p):
+            try:
+                with open(p, encoding="utf-8") as f:
+                    parts.append(f.read())
+            except (OSError, UnicodeDecodeError):
+                pass
+    out["brief"] = "\n".join(parts)
+    return out
+
+
+def _check_scope(run_dir: str, mid: str, e: dict, report: str | None) -> list[dict] | None:
+    """Owner-specified simplification: None when the entry does not claim one."""
+    by = str(e.get("specified_by", "")).strip().lower()
+    if not by:
+        return None
+    out = []
+    quote = e.get("quote")
+    if by not in ("question", "brief"):
+        return [_f("mechanism_manifest_invalid", "HIGH",
+                   f"`{PATH}`: mechanism `{mid}` has specified_by {e.get('specified_by')!r}; use `question` or `brief`.")]
+    if not isinstance(e.get("assumption"), str) or not e["assumption"].strip():
+        out.append(_f("mechanism_manifest_invalid", "HIGH",
+                      f"`{PATH}`: mechanism `{mid}` is `simplified` but states no `assumption:`."))
+    texts = _owner_texts(run_dir)
+    q = _norm(quote) if isinstance(quote, str) else ""
+    if len(q.split()) < 3 or q not in _norm(texts[by]):
+        out.append(_f("mechanism_scope_quote_unfound", "HIGH",
+                      f"`{PATH}`: mechanism `{mid}` is simplified as specified by the {by}, but its `quote` "
+                      f"({str(quote)[:120]!r}) is not found verbatim (3+ words) in the run's {by}. Quote the words "
+                      "that fix the model's form, or give a sufficiency test instead."))
+    elif report is not None and mid not in report and q not in _norm(report):
+        out.append({**_f("mechanism_scope_not_stated", "MEDIUM",
+                         f"report.md does not state the owner-specified simplification of `{mid}` "
+                         f"({e.get('assumption', '')[:120]}). State it as a limitation of the requested model.", "WRITE"),
+                    "target_stage": "WRITE", "scope_declarable": True})
+    return out
+
+
 def _check_entry(run_dir: str, mid: str, e: dict, late: str, report: str | None) -> list[dict]:
     out = []
     st = e["status"]
+    if st == "simplified":
+        scoped = _check_scope(run_dir, mid, e, report)
+        if scoped is not None:
+            return scoped
     if st == "modelled":
         ref = e.get("code_ref")
         fname, _, sym = (ref if isinstance(ref, str) else "").partition("::")
@@ -450,6 +520,35 @@ def _self_test() -> int:
         ok(kinds(gate_findings(d, 2, P)) == ["mechanism_unaccounted"], "MM14 a prior the pre-mortem cites applies")
         w(d, "metadata.json", "{broken")
         ok("mechanism_priors_unavailable" in kinds(gate_findings(d, 2, P)), "MM15 unreadable question fails closed")
+    # Owner-specified simplification: the question (or signed brief) fixes the model's form.
+    with tempfile.TemporaryDirectory() as d:
+        w(d, "metadata.json", json.dumps({"question": "Using a simple deterministic widget model, allocate the "
+                                                      "widget budget across units"}))
+        w(d, "data/processed/units.csv", "unit,pop,mix_a\nA,1,0.4\n")
+        ent = {"id": "subgroup_mix", "status": "simplified", "assumption": "one mix for all units",
+               "specified_by": "question", "quote": "a  Simple deterministic WIDGET model"}
+        w(d, PATH, {"mechanisms": [ent]})
+        ok(gate_findings(d, 2, P) == [], f"MM16 a simplification the question specifies needs no test: "
+                                         f"{gate_findings(d, 2, P)}")
+        w(d, PATH, {"mechanisms": [dict(ent, quote="an agent-based widget model")]})
+        v = gate_findings(d, 2, P)
+        ok(kinds(v) == ["mechanism_scope_quote_unfound"] and v[0]["severity"] == "HIGH",
+           f"MM16b a quote not in the question is HIGH: {v}")
+        w(d, PATH, {"mechanisms": [dict(ent, quote="widget model")]})
+        ok(kinds(gate_findings(d, 2, P)) == ["mechanism_scope_quote_unfound"], "MM16c a quote of under 3 words is not enough")
+        w(d, PATH, {"mechanisms": [dict(ent, specified_by="modeler")]})
+        ok(kinds(gate_findings(d, 2, P)) == ["mechanism_manifest_invalid"], "MM16d specified_by must be question or brief")
+        w(d, PATH, {"mechanisms": [ent]})
+        w(d, "report.md", "# Report\nResults.\n")
+        v = gate_findings(d, 2, P)
+        ok(kinds(v) == ["mechanism_scope_not_stated"] and v[0]["scope_declarable"] and v[0]["severity"] == "MEDIUM",
+           f"MM16e the report must state the owner-specified limitation (MEDIUM, declarable): {v}")
+        w(d, "report.md", "# Report\nAs requested, a simple deterministic widget model: subgroup_mix is one mix.\n")
+        ok(gate_findings(d, 2, P) == [], "MM16f stated in the report: nothing")
+        os.remove(os.path.join(d, "report.md"))
+        w(d, "decision_brief.yaml", yaml.safe_dump({"decision": "Use one pooled subgroup mix for every unit."}))
+        w(d, PATH, {"mechanisms": [dict(ent, specified_by="brief", quote="one pooled subgroup mix")]})
+        ok(gate_findings(d, 2, P) == [], "MM16g the signed brief can specify the simplification")
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
         return 1

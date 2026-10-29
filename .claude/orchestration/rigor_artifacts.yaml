@@ -216,7 +216,10 @@ artifacts:
       question allows. For each listed mechanism record `modelled`
       (`code_ref: models/<file>.py::<name>`), `fixed` (`source:`), or
       `simplified` (`assumption:` + `sufficiency_test:` naming a result file
-      with `varied`, `criterion`, `decision_changes: true|false`). A missing
+      with `varied`, `criterion`, `decision_changes: true|false`). When the
+      question or signed brief itself fixes the model's form, use
+      `specified_by: question|brief` with a verbatim `quote:` instead of a test,
+      and state the limitation in the report. A missing
       entry, or a simplification without a result, is HIGH; a passed test
       lets the simplification stand (cite it in the report); a failed test
       means the mechanism is added next round.
