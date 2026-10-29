@@ -56,21 +56,40 @@ Status: draft for review, 2026-10-28. It complements `stage-machine.md` (the arc
 - North of 11°N (216 LGAs, 63M people, the highest prevalence, the core SMC area), the population-weighted mix is 67% arabiensis. That gives an effective Q0 of about 0.78 (`malariasimulation` per-species values, from Sherrard-Smith 2019).
 - The trial benchmarks passed because vector-control strength was tuned to the Tanzanian and Benin trial sites, so nothing tested whether the mechanism transfers.
 
-**The pattern.** Domain knowledge reaches the model only as prose, and a self-graded severity decides whether anything checks it.
+**The pattern, and it is not malaria-specific.** The target setting varies in a way the available data captures and the model collapses, and the model's effect parameters were tuned where the variation looks different. Examples elsewhere:
+- **TB:** household vs community transmission, or the drug-resistance mix by region.
+- **Measles:** age-specific contact patterns and how long maternal immunity lasts.
+- **HIV:** network and risk-group structure.
+- **Cholera:** water and sanitation access.
+
+Domain knowledge reaches the model only as prose, and a self-graded severity decides whether anything checks it.
+
+**Split by layer (CLAUDE.md: gate logic disease-agnostic; specifics in priors and skills gated by `applies_when`).** The gate gets generic rules. A disease contributes content (priors, optional toolkit modules) that those rules enforce.
+
+*Generic harness rules (`scripts/`, no disease names):*
 
 | # | Change | Check | Metric |
 |---|---|---|---|
-| D1 | **Expert prior: vector bionomics by species** (Sherrard-Smith 2019 PNAS; Griffin 2010; `malariasimulation` defaults). Applies when the question is malaria with nets or IRS, and species data exist. | The pre-mortem raises it as HIGH, whatever the critic's own grading. | Raised in 100% of qualifying runs. |
-| D2 | **Mechanism manifest** `models/mechanism_manifest.yaml`. For each mechanism the priors require: modelled (with code reference), fixed (with source), or excluded (with a sensitivity result file). | Gate: HIGH if a required mechanism is missing, or excluded without a result file. | Required mechanisms covered. |
-| D3 | **Data-use audit.** Every processed data column is read by model code, or listed as unused with a reason. | Static scan of `models/` against `data/processed/` headers; MEDIUM per unexplained unused column. | Unused columns without a reason = 0 (attempt 8: species columns 56–58). |
-| D4 | **"Addressed" needs evidence.** A pre-mortem concern whose suggested check is a sensitivity analysis or a data use can only be closed by an artifact path that exists. This applies to concerns of any severity. | Pre-mortem validator. | Concerns closed by prose = 0. |
-| D5 | **Transfer check for tuned effects.** When effect strengths are tuned to trial sites, also report the effect under the target setting's context (species mix, resistance), with the difference stated. | Benchmark report field. | Present when tuning is used. |
-| D6 | **A maintained malaria vector module** in the toolkit: species-aware bionomics, larval stage optional, a published resistance-to-efficacy mapping. Promoted from the best run version and tested against `malariasimulation` on the EIR–prevalence curve and the trial arms. | Toolkit tests. | Runs use it instead of rewriting. |
+| D1 | **Mechanism manifest** `models/mechanism_manifest.yaml`. For each mechanism that a matched expert prior marks as required: modelled (with code reference), fixed (with source), or excluded (with a sensitivity result file). | Gate: HIGH if a required mechanism is missing, or excluded without a result file. | Required mechanisms covered. |
+| D2 | **Severity floor from priors.** A pre-mortem or critic concern that matches a prior cannot be graded below the prior's severity. | Pre-mortem validator. | Matched concerns graded below their prior = 0. |
+| D3 | **Data-use audit.** Every processed data column is read by model code, or listed as unused with a reason. | Static scan of `models/` against `data/processed/` headers; MEDIUM per unexplained unused column. | Unused columns without a reason = 0 (attempt 8: 3 species columns). |
+| D4 | **"Addressed" needs evidence.** A concern whose suggested check is a sensitivity analysis or a data use can only be closed by an artifact path that exists, at any severity. | Pre-mortem validator. | Concerns closed by prose = 0. |
+| D5 | **Transfer check for tuned effects.** When effect strengths are tuned to benchmark sites, also report the effect under the target setting's covariates, with the difference stated. | Benchmark report field. | Present whenever tuning is used. |
+
+*Disease content (priors and toolkit; malaria is the first instance):*
+
+| # | Change | Where |
+|---|---|---|
+| D6 | Prior: vector bionomics vary by species (Sherrard-Smith 2019 PNAS; Griffin 2010; `malariasimulation` defaults); required mechanism when species data exist. `applies_when`: malaria with nets or IRS. | `.claude/orchestration/expert_priors.yaml` |
+| D7 | Optional species-aware vector module: larval stage optional, a published resistance-to-efficacy mapping. Tested against `malariasimulation` on the EIR–prevalence curve and the trial arms. | `toolkit/malaria/` |
+| D8 | The same audit for one other disease area's priors (for example TB or measles), so the generic rules have more than one source of required mechanisms. | `expert_priors.yaml` |
+
+**Test of the split:** run D1–D5 on a smoke run for a non-malaria question, as CLAUDE.md asks (alternate disease areas). The rules must work on that run, and a scan of `scripts/` must find no disease names.
 
 ## Order and checkpoints
 
 1. A1, A2, A3 (in progress), then A4 with a smoke run.
-2. D1–D4 (vector-bionomics prior, mechanism manifest, data-use audit, evidence for "addressed"), then B1 and B4 (calibration spec and diagnosis order), B2 and B3 (brief), each with a smoke run.
+2. D1–D5 (generic rules) with D6 (the first prior that uses them), then a non-malaria smoke run; then B1 and B4 (calibration spec and diagnosis order), B2 and B3 (brief), each with a smoke run.
 3. C1 benchmark (no run spend; VM time only), alongside step 2.
 4. Attempt 9: same question, same settings. Compare with attempts 7 and 8 on findings by round, compute lost, spend, and headline basis.
 5. B5, B6, and the M2 structure work (`stage-machine.md` §3.7) between runs.
