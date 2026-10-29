@@ -61,7 +61,7 @@ def _json(path, default=None):
         return default
 
 
-def report(run_dir: str) -> dict:
+def report(run_dir: str, trace_utc_offset_s: float | None = None) -> dict:
     out: dict = {"run_dir": run_dir}
     # Gates: open blocking findings per in-round gate (last run of each round).
     gates = {}
@@ -117,7 +117,7 @@ def report(run_dir: str) -> dict:
             continue
         holds[next((name for name, key in HOLD_KINDS if key in reason), "other")] += 1
     out["refusals"] = dict(holds.most_common())
-    uq = uq_runs_by_round(run_dir)
+    uq = uq_runs_by_round(run_dir, trace_utc_offset_s)
     out["uq_runs_by_round"], out["uq_rounds_from"] = uq["by_round"], uq["rounds_from"]
     # Compute.
     led = _json(os.path.join(run_dir, "models", "compute_ledger.json"), {}) or {}
@@ -160,24 +160,33 @@ def _runs(rec: dict, script: str) -> str | None:
     return s if re.search(r"\bpython[\d.]*\s+(?:-u\s+)?\S*scripts/" + re.escape(script), s) else None
 
 
-def _epoch(ts) -> float | None:
-    """Seconds since the epoch; a naive trace time is the run machine's local time."""
+def _epoch(ts, utc_offset_s=None) -> float | None:
+    """Seconds since the epoch. A naive time (the trace's) is in the run machine's zone:
+    `utc_offset_s` when known, else this machine's local zone."""
     import datetime as _dt
     try:
-        return _dt.datetime.fromisoformat(str(ts)).timestamp()
+        t = _dt.datetime.fromisoformat(str(ts))
     except (TypeError, ValueError):
         return None
+    if t.tzinfo is None and utc_offset_s is not None:
+        t = t.replace(tzinfo=_dt.timezone(_dt.timedelta(seconds=int(utc_offset_s))))
+    return t.timestamp()
 
 
-def uq_runs_by_round(run_dir: str) -> dict:
+def uq_runs_by_round(run_dir: str, trace_utc_offset_s=None) -> dict:
     """{"by_round": {round: uncertainty runs}, "rounds_from": ...} (A8). A run counts in the
     round of the next gate run after it: gate runs from the trace (Phase 42 records the
     command and its --current-round), else from validator_history.jsonl times."""
+    tz = trace_utc_offset_s
+    if tz is None:      # main.py records the run machine's zone from Phase 42 on
+        tz = (_json(os.path.join(run_dir, "metadata.json"), {}) or {}).get("utc_offset_s")
+    tz_known = isinstance(tz, (int, float)) and not isinstance(tz, bool)
+    tz = tz if tz_known else None
     uq, gates = [], []
     for i, rec in enumerate(_jsonl(os.path.join(run_dir, "trace.jsonl"))):
         c = _runs(rec, "propagate_uncertainty.py")
         if c is not None and not _NOT_A_RUN.search(c):
-            uq.append((i, _epoch(rec.get("ts"))))
+            uq.append((i, _epoch(rec.get("ts"), tz)))
         g = _runs(rec, "validate_critique_yaml.py")
         m = _ROUND_ARG.search(g or "")
         if m and not _NOT_A_RUN.search(g):
@@ -191,7 +200,8 @@ def uq_runs_by_round(run_dir: str) -> dict:
     # The trace's gate runs are used only when they cover every round the gate recorded
     # (Codex review: a trace spanning the Phase 42 change has some gate rounds cut off).
     if not gates or not {rnd for _t, rnd in hist} <= {rnd for _i, rnd in gates}:
-        source = "validator_history"
+        # Codex review: trace times are naive; without the run's zone this machine's is assumed.
+        source = "validator_history" + ("" if tz_known else ", trace times taken as this machine's local time")
         gates = sorted(hist)
         uq = [(t, t) for _i, t in uq if t is not None]
     by = collections.Counter()
@@ -362,18 +372,21 @@ def _self_test() -> int:
             for rnd, at in ((1, "2026-10-21T10:00:00+00:00"), (2, "2026-10-21T12:00:00+00:00")):
                 f.write(json.dumps({"round": rnd, "at": at, "action": "PATCH_OR_RETHINK", "findings": []}) + "\n")
         with open(os.path.join(d, "trace.jsonl"), "w") as f:
-            for ts, summ in (("2026-10-21T09:00:00+00:00", "Bash: cd runs/x && python3 ../../scripts/propagate_uncertainty.py ."),
-                             ("2026-10-21T11:00:00+00:00", "Bash: grep -n def scripts/propagate_uncertainty.py"),
-                             ("2026-10-21T11:30:00+00:00", "Bash: python3 scripts/propagate_uncertainty.py runs/x --n"),
-                             ("2026-10-21T11:40:00+00:00", "Bash: python3 scripts/validate_critique_yaml.py runs/2026-10-20_2133"),
-                             ("2026-10-21T13:00:00+00:00", "Bash: nohup python3 -u scripts/propagate_uncertainty.py runs/x")):
+            for ts, summ in (("2026-10-21T02:00:00", "Bash: cd runs/x && python3 ../../scripts/propagate_uncertainty.py ."),
+                             ("2026-10-21T04:00:00", "Bash: grep -n def scripts/propagate_uncertainty.py"),
+                             ("2026-10-21T04:30:00", "Bash: python3 scripts/propagate_uncertainty.py runs/x --n"),
+                             ("2026-10-21T04:40:00", "Bash: python3 scripts/validate_critique_yaml.py runs/2026-10-20_2133"),
+                             ("2026-10-21T06:00:00", "Bash: nohup python3 -u scripts/propagate_uncertainty.py runs/x")):
                 f.write(json.dumps({"type": "tool_use", "tool": "Bash", "ts": ts, "summary": summ}) + "\n")
+        json.dump({"utc_offset_s": -7 * 3600}, open(os.path.join(d, "metadata.json"), "w"))
         r3 = report(d)
+        ok(report(d, trace_utc_offset_s=0)["uq_runs_by_round"] == {1: 3},
+           "CV15 (Codex) naive trace times are read in the run machine's zone (metadata.json), not this one's")
         ok(r3["uq_runs_by_round"] == {1: 1, 2: 1, "after": 1} and r3["uq_rounds_from"] == "validator_history"
            and "(rounds from validator_history)" in render(r3),
            f"CV13 an old trace is binned by validator-history times; a grep is not a run: {r3['uq_runs_by_round']}")
         with open(os.path.join(d, "trace.jsonl"), "a") as f:   # a recorded gate run for round 1 only
-            f.write(json.dumps({"type": "tool_use", "tool": "Bash", "ts": "2026-10-21T13:30:00+00:00",
+            f.write(json.dumps({"type": "tool_use", "tool": "Bash", "ts": "2026-10-21T06:30:00",
                                 "scripts_run": ["validate_critique_yaml.py"],
                                 "command": "python3 scripts/validate_critique_yaml.py runs/x --current-round 1"}) + "\n")
         r4 = report(d)
@@ -393,12 +406,14 @@ def main(argv=None) -> int:
     ap.add_argument("run_dir", nargs="?")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--trace-utc-offset-h", type=float,
+                    help="the run machine's UTC offset, for traces from before metadata.json recorded it")
     a = ap.parse_args(argv)
     if a.self_test:
         return _self_test()
     if not a.run_dir:
         ap.error("run_dir required")
-    r = report(a.run_dir)
+    r = report(a.run_dir, None if a.trace_utc_offset_h is None else a.trace_utc_offset_h * 3600)
     print(json.dumps(r, indent=1, default=str) if a.json else render(r))
     return 0
 
