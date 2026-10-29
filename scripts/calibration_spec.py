@@ -102,6 +102,24 @@ DIAGNOSIS_ORDER = ("missing_data", "missing_mechanism", "structural_constraint",
                    "inconsistent_targets", "mismatched_target_definition")
 
 
+def _sibling(name: str):
+    """scripts/<name>.py by path, under a private module name."""
+    import importlib.util
+    key = f"_cs_p43_{name}"
+    if key in sys.modules:
+        return sys.modules[key]
+    spec = importlib.util.spec_from_file_location(key, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                                    f"{name}.py"))
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[key] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except BaseException:
+        sys.modules.pop(key, None)
+        raise
+    return mod
+
+
 def _f(kind, sev, claim):
     return {"kind": kind, "severity": sev, "stage": "MODEL", "target_stage": "MODEL",
             "scope_declarable": False, "claim": claim}
@@ -136,19 +154,22 @@ def _load_yaml(run_dir, rel):
         return None, f"`{rel}` cannot be parsed: {e}", True
 
 
-def _names(x) -> list[str]:
-    """Parameter names from a list of names / {name: ...} dicts, or a mapping's keys."""
+def _names(x) -> tuple[list[str], int]:
+    """(parameter names, unreadable entries) from a list of names / {name: ...}
+    dicts, or a mapping's keys. Anything else is unreadable (fail closed)."""
     if isinstance(x, dict):
-        return [str(k) for k in x]
-    if isinstance(x, list):
-        out = []
-        for e in x:
-            if isinstance(e, str) and e.strip():
-                out.append(e.strip())
-            elif isinstance(e, dict) and isinstance(e.get("name"), str) and e["name"].strip():
-                out.append(e["name"].strip())
-        return out
-    return []
+        return [str(k) for k in x], 0
+    if not isinstance(x, list):
+        return [], 1
+    out, bad = [], 0
+    for e in x:
+        if isinstance(e, str) and e.strip():
+            out.append(e.strip())
+        elif isinstance(e, dict) and isinstance(e.get("name"), str) and e["name"].strip():
+            out.append(e["name"].strip())
+        else:
+            bad += 1
+    return out, bad
 
 
 def fitted_parameters(run_dir: str) -> tuple[dict[str, tuple | None], list[str], bool]:
@@ -164,16 +185,25 @@ def fitted_parameters(run_dir: str) -> tuple[dict[str, tuple | None], list[str],
         if not isinstance(ps, list):
             errs.append(f"`{IDENT}` has no `parameters:` list.")
         else:
-            for e in ps:
+            for i, e in enumerate(ps):
                 if isinstance(e, dict) and isinstance(e.get("name"), str) and e["name"].strip():
                     fitted[e["name"].strip()] = _interval([e.get("lower_bound"), e.get("upper_bound")])
+                else:
+                    errs.append(f"`{IDENT}` parameters[{i}] has no `name:`.")
     doc, err, exists = _load_yaml(run_dir, CALRES)
     evidence |= exists
     if err:
         errs.append(err)
-    elif exists and isinstance(doc, dict):
+    elif exists and not isinstance(doc, dict):
+        errs.append(f"`{CALRES}` is not a mapping.")
+    elif exists:
         for key in ("parameters", "fitted_parameters"):
-            for n in _names(doc.get(key)):
+            if doc.get(key) is None:
+                continue
+            names, bad = _names(doc[key])
+            if bad:
+                errs.append(f"`{CALRES}` `{key}:` has {bad} entry(ies) without a readable parameter name.")
+            for n in names:
                 fitted.setdefault(n, None)
     return fitted, errs, evidence
 
@@ -406,7 +436,16 @@ def _self_test() -> int:
         w(d, CALRES, {"method": "nm", "best_loss": 1.0})
         ok(kinds(gate_findings(d, 2)) == ["calibration_fitted_set_unreadable"],
            "CS4c a calibration result naming no parameter fails closed")
+        w(d, IDENT, ident)
+        w(d, CALRES, {"parameters": ["level_1", {"future_coverage": 0.8}]})
+        w(d, PATH, good)
+        ok(kinds(gate_findings(d, 2)) == ["calibration_fitted_set_unreadable"],
+           "CS4d a calibration result entry without a readable name fails closed (Codex review)")
         os.remove(os.path.join(d, CALRES))
+        os.remove(os.path.join(d, IDENT))
+        ef = _sibling("effort_floors")
+        ok(ef._calibration_evidence(d) is None,
+           "CS4e a spec alone is not evidence of fitting (it would require itself; Codex review)")
         w(d, IDENT, ident)
         # target metadata
         s = spec()
