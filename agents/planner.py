@@ -231,25 +231,37 @@ any data or modeling work starts and then frozen; every critic judges the
 work against it, so it is the run's target. Keep it to one page:
 
 ```yaml
+schema_version: 2
 question: "<the research question, verbatim>"
 decision: "<the decision this analysis informs, one or two sentences>"
 decision_maker: "<who makes it: a role, e.g. national programme manager>"
 answers:            # what the report must answer, and the unit it is published at
   - {id: A1, statement: "<e.g. which package each district should receive>", resolution: "<district>"}
 objective: "<what is maximised or minimised, and what else is valued>"
-constraints:
-  - {id: C1, text: "<e.g. total cost within the stated envelope>"}
+constraints:        # every item below has a basis (see FACTS VS DECISIONS)
+  - {id: C1, text: "<e.g. total cost within the stated envelope>", basis: fact, source: "<where found>"}
 accounting:         # how numbers are counted
-  - {id: K1, text: "<benefit window; lifetime vs in-window; financial vs economic cost; discounting>"}
+  - {id: K1, text: "<benefit window; lifetime vs in-window; financial vs economic cost; discounting>",
+     basis: decision}
 out_of_scope:
-  - {id: OS1, text: "<what this run will not answer>", reason: "<why>"}
+  - {id: OS1, text: "<what this run will not answer>", reason: "<why>", basis: decision}
 comparators:        # what impact is measured against; exactly one primary
-  - {id: CF1, role: primary, text: "<what happens in each unit without the plan>"}
-  - {id: CF2, role: sensitivity, text: "<an alternative status quo>"}
+  - {id: CF1, role: primary, text: "<what happens in each unit without the plan>",
+     basis: blocked_on_evidence, evidence: "<what would settle it, and who finds it>"}
+  - {id: CF2, role: sensitivity, text: "<an alternative status quo>", basis: decision}
 acceptance: [HB-001, HB-002, MB-001]   # ids from success_criteria.yaml
-open_questions:     # framing choices the owner settles at sign-off
+open_questions:     # decisions the owner settles at sign-off
   - {id: Q1, question: "<e.g. is continuity of current coverage a constraint or a value?>",
-     proposed: "<your proposed answer and why>"}
+     proposed: "<your proposed answer and why>", basis: decision}
+method_assessment:  # see the modeling-strategy skill, section 0
+  objective: dynamic_mechanistic   # | description | association | structure | causal | forecasting
+  requested: "<the framework the question names, or none>"
+  fit: "<why that framework fits this decision, or why not>"
+  representation: agent_based      # compartmental | agent_based | hybrid (dynamic_mechanistic only)
+  abm_criteria:     # dynamic_mechanistic only; each "yes: <why>" or "no: <why>"
+    {individual_heterogeneity: "", correlated_characteristics: "", path_dependence: "",
+     explicit_networks: "", individual_targeting: "", emergent_effects: ""}
+  verdict: fits     # or does_not_fit, with alternative: "<method>" and owner_question: Q<n>
 ```
 
 Settle in the brief what would otherwise be argued every round: the
@@ -266,8 +278,17 @@ would happen; it inflates every impact and allocation gain. Cite the source
 for how the status quo evolves; where it is uncertain, put the alternatives
 as sensitivity comparators and the choice in `open_questions`. Where the question leaves a choice that changes
 the answer, put it in `open_questions` with your proposed answer; do not
-decide it silently. Do not put modeling method in the brief (that is
-plan.md); put what the decision-maker needs.
+decide it silently. Model details belong in plan.md; the brief carries only
+the method assessment.
+
+FACTS VS DECISIONS. Each tagged item is a `fact` you found (give the
+`source`), a `decision` for the owner, or `blocked_on_evidence` (say what
+would settle it). Look facts up yourself; open questions are decisions only.
+
+METHOD FIT. Classify the analytical objective and say why the requested
+framework fits. To recommend another method or model type, set
+`verdict: does_not_fit` and ask the owner in an open question; never switch
+silently.
 
 ## INVESTIGATION THREADS
 

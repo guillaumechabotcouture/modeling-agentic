@@ -7473,10 +7473,7 @@ def _run_self_test() -> int:
     with tempfile.TemporaryDirectory() as d:
         import decision_brief as _db
         yaml.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d, "success_criteria.yaml"), "w"))
-        yaml.safe_dump({"question": "q", "decision": "d", "decision_maker": "m", "objective": "o",
-                        "answers": [{"id": "A1", "statement": "s", "resolution": "district"}],
-                        "comparators": [{"id": "CF1", "role": "primary", "text": "status quo"}],
-                        "acceptance": ["HB-001"]}, open(os.path.join(d, "decision_brief.yaml"), "w"))
+        yaml.safe_dump(_db.example_brief(), open(os.path.join(d, "decision_brief.yaml"), "w"))
         _db.sign(d, "owner")
         yaml.safe_dump({"reviewer": "critique-redteam", "round": 5, "blockers": [
             {"id": "R-001", "severity": "MEDIUM", "target_stage": "MODEL", "first_seen_round": 1,

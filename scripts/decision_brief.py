@@ -42,6 +42,18 @@ core-hours, about 4 hours). Each comparator says what happens in each unit
 without the plan: other funders' and routine activity, and how coverage
 evolves over the window. One is primary; the others are sensitivities.
 
+Phase 43 β (schema_version 2, from stisim.ai's analysis-selector and
+analysis-intake): the brief records `method_assessment`, the analytical
+objective and why the requested framework fits (for a dynamic mechanistic
+question, compartmental vs agent-based by six criteria); a recommendation
+against the requested tool is an owner question, never a silent switch. Each
+constraint, accounting convention, out-of-scope item, comparator and open
+question has a `basis`: `fact` (with its `source`), `decision` (the owner's),
+or `blocked_on_evidence` (with the `evidence` that would settle it). Owner
+questions are decisions only. An unsigned brief must be schema 2; a brief
+signed under schema 1 (attempts 7 and 8) keeps its status and is shown as it
+was signed.
+
 Critics tie each HIGH / MEDIUM finding to the brief item it threatens
 (`brief_item:`), or GAP when the brief does not settle something the decision
 depends on, or NONE. Once the brief is signed, a NONE finding does not block
@@ -74,6 +86,23 @@ _LISTS = {"answers": "A", "constraints": "C", "accounting": "K", "out_of_scope":
 COMPARATOR_ROLES = ("primary", "sensitivity")
 _TEXT = ("question", "decision", "decision_maker", "objective")
 FRAMING_PREFIXES = tuple(_LISTS.values())
+SCHEMA = 2   # Phase 43 β: method_assessment and basis tags
+TAGGED = ("constraints", "accounting", "out_of_scope", "comparators", "open_questions")
+BASES = {"fact": "source", "decision": None, "blocked_on_evidence": "evidence"}   # basis -> field it needs
+OBJECTIVES = {"description": "describe or estimate the current situation",
+              "association": "find what predicts or is associated with an outcome",
+              "structure": "find groups or structure in the data",
+              "causal": "estimate the effect of a past intervention from observed data",
+              "forecasting": "forecast what happens next",
+              "dynamic_mechanistic": "project how interventions change transmission over time"}
+REPRESENTATIONS = ("compartmental", "agent_based", "hybrid")
+VERDICTS = ("fits", "does_not_fit")
+ABM_CRITERIA = {"individual_heterogeneity": "differences between individuals that persist over time",
+                "correlated_characteristics": "combinations of characteristics too many for compartments",
+                "path_dependence": "each person's own history",
+                "explicit_networks": "who is in contact with whom",
+                "individual_targeting": "targeting by individual characteristics",
+                "emergent_effects": "population effects that emerge from individual interactions"}
 
 CRITIC_NOTE = """
 
@@ -174,7 +203,94 @@ def validate(doc: dict, run_dir: str) -> list[str]:
         unknown = [str(a) for a in acc if str(a) not in known]
         if unknown:
             errors.append(f"acceptance: not in {CRITERIA}: {', '.join(unknown)}")
+    version = schema_version(doc)
+    if version not in (1, SCHEMA):
+        errors.append(f"schema_version: {doc.get('schema_version')!r} is not a known version (use {SCHEMA})")
+    elif version < SCHEMA and _signoff(run_dir) is None:
+        # Only a brief already signed under schema 1 is judged by it.
+        errors.append(f"schema_version: a new brief is schema {SCHEMA} (method_assessment, and a basis on each "
+                      f"{'/'.join(TAGGED)} item)")
+    if version == SCHEMA:
+        errors += _validate_v2(doc)
     return errors
+
+
+def schema_version(doc: dict):
+    v = doc.get("schema_version", 1)
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+
+def _filled(v) -> bool:
+    return isinstance(v, str) and bool(v.strip())
+
+
+def _validate_v2(doc: dict) -> list[str]:
+    """Phase 43 β: method fit, and facts vs decisions."""
+    errors = []
+    oq = doc.get("open_questions")
+    qs = {str(q.get("id")): q for q in (oq if isinstance(oq, list) else []) if isinstance(q, dict)}
+    for key in TAGGED:
+        items = doc.get(key)
+        for it in items if isinstance(items, list) else []:
+            if not isinstance(it, dict):
+                continue
+            iid, basis = it.get("id") or "?", it.get("basis")
+            if not isinstance(basis, str) or basis not in BASES:
+                errors.append(f"{iid}: basis must be one of {', '.join(BASES)}")
+                continue
+            need = BASES[basis]
+            if need and not _filled(it.get(need)):
+                errors.append(f"{iid}: a {basis} needs `{need}`" + (
+                    " (where it was found)" if basis == "fact" else " (what evidence would settle it, and who finds it)"))
+            if key == "open_questions" and basis != "decision":
+                errors.append(f"{iid}: owner questions are decisions only; a {basis} is for the planner to "
+                              + ("find and record with its source" if basis == "fact" else
+                                 "record on the item it affects, tagged blocked_on_evidence"))
+    ma = doc.get("method_assessment")
+    if not isinstance(ma, dict):
+        return errors + ["method_assessment: missing (the analytical objective, and why the requested "
+                         "framework fits; see the modeling-strategy skill)"]
+    objs = ma.get("objective") if isinstance(ma.get("objective"), list) else [ma.get("objective")]
+    if not objs or any(not isinstance(o, str) or o not in OBJECTIVES for o in objs):
+        errors.append(f"method_assessment.objective: one or more of {', '.join(OBJECTIVES)}")
+    for k in ("requested", "fit"):
+        if not _filled(ma.get(k)):
+            errors.append(f"method_assessment.{k}: empty" + (" (the framework the question names, or none)"
+                                                               if k == "requested" else ""))
+    if "dynamic_mechanistic" in [o for o in objs if isinstance(o, str)]:
+        if ma.get("representation") not in REPRESENTATIONS:
+            errors.append(f"method_assessment.representation: one of {', '.join(REPRESENTATIONS)}")
+        crit = ma.get("abm_criteria") if isinstance(ma.get("abm_criteria"), dict) else {}
+        bad = [c for c in ABM_CRITERIA if not re.match(r"(?i)\s*(yes|no)\b\W*\w", str(crit.get(c) or ""))]
+        if bad:
+            errors.append(f"method_assessment.abm_criteria: give `yes: <why>` or `no: <why>` for {', '.join(bad)}")
+        elif (ma.get("representation") in ("agent_based", "hybrid") and ma.get("verdict") == "fits"
+              and not any(re.match(r"(?i)\s*yes\b", str(crit[c])) for c in ABM_CRITERIA)):
+            errors.append("method_assessment: agent-based with no criterion that needs it; say which one does, "
+                          "or recommend a compartmental model (does_not_fit, with an owner question)")
+        req = str(ma.get("requested") or "").lower()
+        asked = ("agent_based" if re.search(r"agent[-_ ]based|individual[-_ ]based|\babm\b", req) else
+                 "compartmental" if re.search(r"compartmental|\bode\b", req) else None)
+        if asked and ma.get("representation") not in (asked, "hybrid") and ma.get("verdict") == "fits":
+            errors.append(f"method_assessment: the question asks for {asked.replace('_', '-')} and the brief "
+                          f"proposes {ma.get('representation')}; that is a recommendation against the requested "
+                          "framework (verdict does_not_fit, with an owner question), not a silent switch")
+    if ma.get("verdict") not in VERDICTS:
+        errors.append(f"method_assessment.verdict: one of {', '.join(VERDICTS)}")
+    elif ma.get("verdict") == "does_not_fit":
+        q = qs.get(str(ma.get("owner_question") or ""))
+        if not _filled(ma.get("alternative")):
+            errors.append("method_assessment.alternative: say which method you recommend instead")
+        if q is None or q.get("basis") != "decision":
+            errors.append("method_assessment.owner_question: a recommendation against the requested framework is "
+                          "the owner's decision; name the open question (a decision) that asks it")
+    return errors
+
+
+def blocked_items(doc: dict) -> list[dict]:
+    """Items still blocked on evidence (shown at sign-off and told to the lead)."""
+    return [it for key in TAGGED for it in (doc.get(key) if isinstance(doc.get(key), list) else [])
+            if isinstance(it, dict) and it.get("basis") == "blocked_on_evidence"]
 
 
 def item_ids(run_dir: str) -> set[str]:
@@ -239,6 +355,7 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
         "answers": {q["id"]: answers.get(q["id"], q.get("proposed")) for q in qs},
         "answer_source": {q["id"]: "given" if q["id"] in answers else "proposed accepted" for q in qs},
         "sha256": {f: _sha(os.path.join(run_dir, f)) for f in FROZEN_AT_SIGNOFF},
+        "schema_version": schema_version(doc),
         "producer": "scripts/decision_brief.py",
     }
     # Gemini review: keep the signed versions, so a changed file can be restored.
@@ -280,11 +397,53 @@ def signoff_text(run_dir: str) -> str | None:
         lines.append(f"Note: {so['note']}")
     for qid, ans in (so.get("answers") or {}).items():
         lines.append(f"- {qid}: {ans} ({(so.get('answer_source') or {}).get(qid, '')})")
+    doc, _ = load_brief(run_dir)
+    blocked = blocked_items(doc or {})
+    if blocked:
+        lines.append("Still waiting on evidence (have the data agent settle these; record any change in "
+                     f"{AMENDMENTS}): " + "; ".join(f"{it.get('id')}: {it.get('evidence')}" for it in blocked))
     lines.append(f"{BRIEF} and {CRITERIA} are now frozen; {BENCHMARKS} is locked when the gate first sees it. "
                  f"Record framing changes you discover in {AMENDMENTS} with the reason; acceptance criteria "
                  "cannot be amended in this run. Tell every specialist to work to the brief, and the planner "
                  "to carry the owner's answers into plan.md.")
     return "\n".join(lines)
+
+
+def _tag_md(it: dict) -> str:
+    """Compact basis tag for the owner (empty for a schema 1 item)."""
+    basis = it.get("basis")
+    if basis == "fact":
+        return f" *[fact: {it.get('source')}]*"
+    if basis == "decision":
+        return " *[decision]*"
+    if basis == "blocked_on_evidence":
+        return " *[waiting on evidence]*"
+    return ""
+
+
+def _method_md(ma) -> list[str]:
+    """method_assessment in plain words."""
+    if not isinstance(ma, dict):
+        return []
+    objs = ma.get("objective") if isinstance(ma.get("objective"), list) else [ma.get("objective")]
+    out = ["## How the question will be answered",
+           "- **Kind of question:** " + "; and ".join(OBJECTIVES.get(o, str(o)) if isinstance(o, str) else str(o) for o in objs) + ".",
+           f"- **Requested:** {ma.get('requested')}. {ma.get('fit')}"]
+    crit = ma.get("abm_criteria") if isinstance(ma.get("abm_criteria"), dict) else {}
+    if ma.get("representation"):
+        rep = str(ma.get("representation")).replace("_", "-")
+        yes = [f"{ABM_CRITERIA[c]} ({str(crit[c]).split(':', 1)[-1].strip()})" for c in ABM_CRITERIA
+               if re.match(r"(?i)\s*yes\b", str(crit.get(c) or ""))]
+        no = [ABM_CRITERIA[c] for c in ABM_CRITERIA if re.match(r"(?i)\s*no\b", str(crit.get(c) or ""))]
+        out.append(f"- **Model type:** {rep}. "
+                   + (f"The answer depends on {'; '.join(yes)}. " if yes else "No criterion needs individual agents. ")
+                   + (f"It does not depend on {', '.join(no)}." if no else ""))
+    if ma.get("verdict") == "does_not_fit":
+        out.append(f"- **Recommends against the requested framework:** {ma.get('alternative')} "
+                   f"The owner decides in {ma.get('owner_question')}.")
+    elif ma.get("verdict") == "fits":
+        out.append("- **Recommendation:** use the requested framework.")
+    return out + [""]
 
 
 def render_md(run_dir: str) -> str:
@@ -299,22 +458,33 @@ def render_md(run_dir: str) -> str:
               "comparators": "Compared with (what happens without the plan)",
               "open_questions": "Open questions for the owner"}
     for key, title in titles.items():
+        if key == "open_questions":
+            out += _method_md(doc.get("method_assessment"))
         items = [it for it in doc.get(key) or [] if isinstance(it, dict)]
         if not items:
             continue
         out.append(f"## {title}")
         for it in items:
+            tag = _tag_md(it) if key != "open_questions" else ""
             if key == "answers":
                 out.append(f"- **{it['id']}** {it.get('statement')} *(resolution: {it.get('resolution')})*")
             elif key == "out_of_scope":
-                out.append(f"- **{it['id']}** {it.get('text')}: {it.get('reason')}")
+                out.append(f"- **{it['id']}** {it.get('text')}: {it.get('reason')}{tag}")
             elif key == "open_questions":
                 out.append(f"- **{it['id']}** {it.get('question')}  \n  Proposed: {it.get('proposed')}")
             elif key == "comparators":
-                out.append(f"- **{it['id']}** ({it.get('role')}) {it.get('text')}")
+                out.append(f"- **{it['id']}** ({it.get('role')}) {it.get('text')}{tag}")
             else:
-                out.append(f"- **{it['id']}** {it.get('text')}")
+                out.append(f"- **{it['id']}** {it.get('text')}{tag}")
         out.append("")
+    blocked = blocked_items(doc)
+    if blocked:
+        out += ["## Still waiting on evidence",
+                "Signing accepts these as working assumptions. The data stage settles them; a change is recorded in "
+                f"{AMENDMENTS} and shown in the report.",
+                *[f"- **{it.get('id')}** needs {it.get('evidence')}" for it in blocked], ""]
+    if schema_version(doc) == 1:
+        out += ["*Brief schema 1 (before Phase 43): no method assessment or fact/decision tags.*", ""]
     out += ["## Acceptance criteria", ", ".join(str(a) for a in doc.get("acceptance") or []), ""]
     if errors:
         out += ["## Not ready to sign", *[f"- {e}" for e in errors], ""]
@@ -424,6 +594,22 @@ def tie_findings(critiques: dict, run_dir: str) -> list[dict]:
 
 # ---------------------------------------------------------------------------
 
+def example_brief(**over) -> dict:
+    """A minimal valid schema 2 brief, for self-tests here and in other scripts."""
+    doc = {
+        "schema_version": SCHEMA, "question": "q", "decision": "d", "decision_maker": "m", "objective": "o",
+        "answers": [{"id": "A1", "statement": "s", "resolution": "district"}],
+        "comparators": [{"id": "CF1", "role": "primary", "text": "status quo", "basis": "fact",
+                         "source": "programme plan"}],
+        "acceptance": ["HB-001"],
+        "method_assessment": {"objective": "dynamic_mechanistic", "requested": "none",
+                              "fit": "Impact depends on transmission over the window.",
+                              "representation": "compartmental", "verdict": "fits",
+                              "abm_criteria": {c: "no: district averages suffice" for c in ABM_CRITERIA}},
+    }
+    return {**doc, **over}
+
+
 def _run_self_test() -> int:
     fails = []
 
@@ -431,18 +617,30 @@ def _run_self_test() -> int:
         if not c:
             fails.append(m)
     brief = {
+        "schema_version": 2,
         "question": "How should the programme allocate its budget across districts?",
         "decision": "Which package each district receives in the next grant",
         "decision_maker": "National programme manager",
         "answers": [{"id": "A1", "statement": "Package per district", "resolution": "district"}],
         "objective": "Maximise DALYs averted within the envelope",
-        "constraints": [{"id": "C1", "text": "Total cost at most the envelope"}],
-        "accounting": [{"id": "K1", "text": "Benefits counted within the grant window"}],
-        "out_of_scope": [{"id": "OS1", "text": "Other diseases", "reason": "single-disease grant"}],
-        "comparators": [{"id": "CF1", "role": "primary", "text": "Current coverage kept by routine channels"},
-                        {"id": "CF2", "role": "sensitivity", "text": "No replacement of current coverage"}],
+        "constraints": [{"id": "C1", "text": "Total cost at most the envelope", "basis": "fact",
+                         "source": "grant allocation letter"}],
+        "accounting": [{"id": "K1", "text": "Benefits counted within the grant window", "basis": "decision"}],
+        "out_of_scope": [{"id": "OS1", "text": "Other diseases", "reason": "single-disease grant",
+                          "basis": "fact", "source": "the question"}],
+        "comparators": [{"id": "CF1", "role": "primary", "text": "Current coverage kept by routine channels",
+                         "basis": "blocked_on_evidence", "evidence": "the funder map per district (data agent)"},
+                        {"id": "CF2", "role": "sensitivity", "text": "No replacement of current coverage",
+                         "basis": "decision"}],
         "acceptance": ["HB-001"],
-        "open_questions": [{"id": "Q1", "question": "Is continuity a constraint?", "proposed": "No"}],
+        "open_questions": [{"id": "Q1", "question": "Is continuity a constraint?", "proposed": "No",
+                            "basis": "decision"}],
+        "method_assessment": {
+            "objective": "dynamic_mechanistic", "requested": "an agent-based model",
+            "fit": "Impact depends on transmission and on who is reached.", "representation": "agent_based",
+            "verdict": "fits",
+            "abm_criteria": {**{c: "no: district averages suffice" for c in ABM_CRITERIA},
+                             "individual_targeting": "yes: packages target children under five"}},
     }
     with tempfile.TemporaryDirectory() as d:
         w = lambda rel, obj: (os.makedirs(os.path.dirname(os.path.join(d, rel)) or d, exist_ok=True),  # noqa: E731
@@ -517,9 +715,7 @@ def _run_self_test() -> int:
         # DB18-DB19 (Codex review): --signoff none asks for no signature; in
         # owner mode no agent can sign, whatever the argument order.
         import subprocess
-        yaml.safe_dump({"question": "q", "decision": "d", "decision_maker": "m", "objective": "o",
-                        "answers": [{"id": "A1", "statement": "s", "resolution": "district"}]},
-                       open(os.path.join(d, BRIEF), "w"))
+        yaml.safe_dump(example_brief(comparators=[], acceptance=[]), open(os.path.join(d, BRIEF), "w"))
         old_mode = os.environ.get("MA_SIGNOFF_MODE")
         try:
             os.environ["MA_SIGNOFF_MODE"] = "none"
@@ -529,10 +725,7 @@ def _run_self_test() -> int:
         finally:
             os.environ.pop("MA_SIGNOFF_MODE", None) if old_mode is None else os.environ.update(MA_SIGNOFF_MODE=old_mode)
         yaml.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d, CRITERIA), "w"))
-        yaml.safe_dump({"question": "q", "decision": "d", "decision_maker": "m", "objective": "o",
-                        "answers": [{"id": "A1", "statement": "s", "resolution": "district"}],
-                        "comparators": [{"id": "CF1", "role": "primary", "text": "status quo"}],
-                        "acceptance": ["HB-001"]}, open(os.path.join(d, BRIEF), "w"))
+        yaml.safe_dump(example_brief(), open(os.path.join(d, BRIEF), "w"))
         sign(d, "owner", accept_proposed=True)
         open(os.path.join(d, BRIEF), "a").write("# edited\n")
         st_changed = status(d)
@@ -551,6 +744,87 @@ def _run_self_test() -> int:
                            env=dict(os.environ, MA_SIGNOFF_MODE="owner"), capture_output=True, text=True)
         ok(r.returncode != 0 and "agents cannot sign" in r.stderr and _sha(os.path.join(d, SIGNOFF)) == before,
            f"DB19: in owner mode the agents' environment cannot sign, flags in any order: {r.stderr[:200]}")
+    # DB22-DB33 (Phase 43 β): method fit, facts vs decisions, schema 1 compatibility.
+    with tempfile.TemporaryDirectory() as d:
+        yaml.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d, CRITERIA), "w"))
+
+        def errs_of(doc):
+            yaml.safe_dump(doc, open(os.path.join(d, BRIEF), "w"))
+            return load_brief(d)[1]
+        ok(errs_of(example_brief()) == [] and errs_of(brief) == [], f"DB22: valid schema 2 briefs: {errs_of(brief)}")
+        legacy = {k: v for k, v in example_brief().items() if k not in ("schema_version", "method_assessment")}
+        e = errs_of(legacy)
+        ok(status(d) == "invalid" and any("a new brief is schema 2" in x for x in e),
+           f"DB23: an unsigned brief must be schema 2: {e}")
+        ok(any("not a known version" in x for x in errs_of(example_brief(schema_version=3))),
+           "DB24: an unknown schema version fails closed")
+        e = errs_of(example_brief(method_assessment={**example_brief()["method_assessment"], "objective": [{"a": 1}]},
+                                  comparators=[{**example_brief()["comparators"][0], "basis": ["fact"]}]))
+        ok(any("objective: one or more" in x for x in e) and any("CF1: basis must be" in x for x in e)
+           and "Kind of question" in render_md(d), f"DB24b: malformed values are findings, not crashes: {e}")
+        ma = example_brief()["method_assessment"]
+        e = errs_of({k: v for k, v in example_brief().items() if k != "method_assessment"})
+        ok(any(x.startswith("method_assessment: missing") for x in e), f"DB25: method_assessment required: {e}")
+        e = errs_of(example_brief(method_assessment={**ma, "objective": "simulation", "fit": " ", "verdict": "ok"}))
+        ok(any("objective: one or more" in x for x in e) and any("fit: empty" in x for x in e)
+           and any("verdict: one of" in x for x in e), f"DB26: known objective and verdict, a reason it fits: {e}")
+        e = errs_of(example_brief(method_assessment={**ma, "representation": None,
+                                                     "abm_criteria": {"path_dependence": "maybe"}}))
+        ok(any("representation: one of" in x for x in e) and any("emergent_effects" in x and "path_dependence" in x
+                                                                  for x in e),
+           f"DB27: a mechanistic question says compartmental or agent-based, by every criterion: {e}")
+        e = errs_of(example_brief(method_assessment={**ma, "representation": "agent_based"}))
+        e2 = errs_of(example_brief(method_assessment={**ma, "representation": "hybrid"}))
+        ok(any("no criterion that needs it" in x for x in e) and any("no criterion that needs it" in x for x in e2),
+           f"DB28: agent-based or hybrid needs a reason: {e} {e2}")
+        e = errs_of(example_brief(open_questions=7))
+        ok(any("open_questions: must be a list" in x for x in e), f"DB28b (Codex review): not a list, no crash: {e}")
+        e = errs_of(example_brief(method_assessment={**ma, "requested": "a Starsim agent-based model"}))
+        e2 = errs_of(example_brief(method_assessment={**ma, "requested": "agent_based"}))
+        ok(any("not a silent switch" in x for x in e) and any("not a silent switch" in x for x in e2),
+           f"DB29: a switch from the requested framework is flagged: {e} {e2}")
+        e = errs_of(example_brief(method_assessment={**ma, "fit": {"why": None}},
+                                  comparators=[{**example_brief()["comparators"][0], "source": [None]}]))
+        ok(any("fit: empty" in x for x in e) and any("CF1: a fact needs `source`" in x for x in e),
+           f"DB29b (Codex review): a non-text reason or source is not filled in: {e}")
+        q6 = {"id": "Q6", "question": "Use a compartmental model instead?", "proposed": "Yes", "basis": "decision"}
+        redirect = {**ma, "requested": "a Starsim agent-based model", "verdict": "does_not_fit"}
+        e = errs_of(example_brief(method_assessment=redirect))
+        ok(any("alternative" in x for x in e) and any("owner_question" in x for x in e),
+           f"DB30: a recommendation against the tool needs an alternative and an owner question: {e}")
+        e = errs_of(example_brief(open_questions=[q6], method_assessment={
+            **redirect, "alternative": "An age-structured compartmental model.", "owner_question": "Q6"}))
+        ok(e == [] and "Recommends against the requested framework" in render_md(d) and "decides in Q6" in render_md(d),
+           f"DB30b: ... and is then valid, and shown to the owner: {e}")
+        cf = example_brief()["comparators"][0]
+        e = errs_of(example_brief(comparators=[{**cf, "basis": None}], constraints=[
+            {"id": "C1", "text": "t", "basis": "fact"}], accounting=[{"id": "K1", "text": "t", "basis": "blocked_on_evidence"}]))
+        ok(any(x.startswith("CF1: basis must be") for x in e) and any("C1: a fact needs `source`" in x for x in e)
+           and any("K1: a blocked_on_evidence needs `evidence`" in x for x in e),
+           f"DB31: every item tagged; a fact has a source; a blocked item says what evidence settles it: {e}")
+        e = errs_of(example_brief(open_questions=[{**q6, "basis": "fact", "source": "WHO"},
+                                                  {**q6, "id": "Q7", "basis": "blocked_on_evidence", "evidence": "x"}]))
+        ok(any("Q6: owner questions are decisions only" in x and "find" in x for x in e)
+           and any(x.startswith("Q7: owner questions are decisions only") for x in e),
+           f"DB32: an owner question that is a fact or waits on evidence is flagged: {e}")
+        errs_of(brief)
+        md = render_md(d)
+        ok("*[fact: grant allocation letter]*" in md and "**K1** Benefits counted within the grant window *[decision]*"
+           in md and "## Still waiting on evidence" in md and "CF1** needs the funder map" in md
+           and "How the question will be answered" in md and "targeting by individual characteristics" in md,
+           f"DB33: tags, method and items waiting on evidence are shown to the owner: {md}")
+        sign(d, "owner", {"Q1": "No"})
+        ok("Still waiting on evidence" in signoff_text(d) and "CF1" in signoff_text(d),
+           "DB33b: the lead is told what is still waiting on evidence")
+    with tempfile.TemporaryDirectory() as d:
+        # A brief signed under schema 1 (attempts 7 and 8) keeps its status and renders as signed.
+        yaml.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d, CRITERIA), "w"))
+        yaml.safe_dump(legacy, open(os.path.join(d, BRIEF), "w"))
+        json.dump({"signed_by": "owner", "sha256": {f: _sha(os.path.join(d, f)) for f in FROZEN_AT_SIGNOFF}},
+                  open(os.path.join(d, SIGNOFF), "w"))
+        ok(status(d) == "signed" and load_brief(d)[1] == [] and "Not ready" not in render_md(d)
+           and "schema 1" in render_md(d) and signoff_text(d),
+           f"DB34: a schema 1 brief signed before Phase 43 is still signed: {load_brief(d)[1]}")
     if fails:
         print("FAIL:", *fails, sep="\n  ")
         return 1
