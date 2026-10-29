@@ -2419,10 +2419,10 @@ def _self_test_p42(ok) -> None:
         while _pid_alive(pid) and time.time() < end:
             time.sleep(0.01)
 
-    def wait_ready(run_dir, done, limit=60, pids=True):
+    def wait_ready(run_dir, done, limit=60, pids=True, age=(0.0, 0.3)):
         """Readiness, not a fixed sleep: the call's progress record shows `done`
         finished tasks, work in flight, its pool pids recorded (`pids`), and was
-        written under 0.3 s ago. Tasks here take 1 s, so the next record (whose
+        written within `age` seconds (default under 0.3 s). Tasks here take 1 s, so the next record (whose
         pids are briefly incomplete while the pool starts processes) is still
         about 0.7 s away: a kill now lands in a settled state."""
         import glob as _g
@@ -2435,7 +2435,7 @@ def _self_test_p42(ok) -> None:
                     continue
                 last = rec
                 if (int(rec.get("done_tasks") or 0) >= done and rec.get("out")
-                        and (rec.get("pids_complete") or not pids) and time.time() - float(rec["t"]) < 0.3):
+                        and (rec.get("pids_complete") or not pids) and age[0] <= time.time() - float(rec["t"]) < age[1]):
                     return True, rec
             time.sleep(0.01)
         return False, last
@@ -2536,7 +2536,7 @@ def _self_test_p42(ok) -> None:
         map_fn(d, "models/slow.py::sleep", [], backend="local")
         led = ledger(d)
         c = (led["calls"] or [{}])[0]
-        ok(got, f"P42-5 setup: the batch never reached a settled state with 4 tasks done (last record {rec5})")
+        ok(got, f"P42-5 setup: the batch reached a settled state with 4 tasks done before the kill (last record {rec5})")
         ok(got and not led["reservations"] and "caller died; charged work done" in str(c.get("stopped"))
            and 4.0 <= c["task_core_s"] <= 2 * el + 15 and c.get("purpose") == "P42",
            f"P42-5 a killed caller is charged its work ({c.get('task_core_s')} core-s in {el:.1f}s), not 3,600: {c}")
@@ -2558,7 +2558,7 @@ def _self_test_p42(ok) -> None:
         el = time.time() - t0
         c = ledger(d)["calls"][0]
         p.wait()
-        ok(got, f"P42-5c setup: the batch never reached a settled state with 2 tasks done (last record {rec5c})")
+        ok(got, f"P42-5c setup: the batch reached a settled state with 2 tasks done before the kill (last record {rec5c})")
         ok("pool processes stopped" in str(c.get("stopped")) and 2.0 <= c["task_core_s"] <= 2 * el + 15,
            f"P42-5c a killed caller's surviving pool is stopped and its work bounded ({el:.1f}s): {c}")
 
@@ -2630,7 +2630,10 @@ def _self_test_p42(ok) -> None:
                     MA_COMPUTE_TARGET_WORKERS="6", MA_COMPUTE_PROCS_PER_WORKER="1", MA_COMPUTE_SETTLE_S="30")
         t0 = time.time()
         p = _sp.Popen([sys.executable, "-c", code], env=envd, stdout=_sp.DEVNULL, stderr=_sp.PIPE, text=True)
-        got8, rec8 = wait_ready(d, 1, limit=120, pids=False)   # a chunk finished, others in flight
+        # A chunk finished and others are in flight; the record is 0.5-2 s old, so the
+        # caller is blocked waiting on its chunks (an interrupt sent right after a record
+        # can land inside dask's submit and be lost: the batch then ran to completion).
+        got8, rec8 = wait_ready(d, 1, limit=120, pids=False, age=(0.5, 2.0))
         p.send_signal(signal.SIGINT)
         err = p.communicate(timeout=120)[1]
         el = time.time() - t0
@@ -2638,7 +2641,7 @@ def _self_test_p42(ok) -> None:
             c = ledger(d)["calls"][-1]
         except (OSError, ValueError, IndexError):
             c = {}
-        ok(got8, f"P42-8 setup: no dask chunk finished in time (last record {rec8}) {err[-300:]}")
+        ok(got8, f"P42-8 setup: a dask chunk finished before the interrupt (last record {rec8}) {err[-300:]}")
         ok("charged work done" in str(c.get("stopped")) and 0 < c.get("task_core_s", 0) <= el + 5,
            f"P42-8 an interrupted dask call on 1 of 6 target workers is charged ~1 worker's time "
            f"({c.get('task_core_s')} core-s in {el:.1f}s; before: about 6 x elapsed): {c} {err[-300:]}")
