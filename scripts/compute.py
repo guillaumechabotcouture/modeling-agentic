@@ -1181,7 +1181,16 @@ def _pid_start(pid: int) -> str | None:
     try:
         import psutil
         return f"psutil:{psutil.Process(int(pid)).create_time():.2f}"
-    except Exception:  # noqa: BLE001 — no psutil, or the process is gone
+    except ImportError:
+        pass
+    except Exception:  # noqa: BLE001 — the process is gone
+        return None
+    import subprocess
+    try:
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(int(pid))], capture_output=True, text=True,
+                             timeout=10).stdout.strip()
+        return "ps:" + out if out else None
+    except (OSError, ValueError, subprocess.SubprocessError):
         return None
 
 
@@ -1324,7 +1333,12 @@ def _settle_dead(led, r, now=None) -> tuple[float, str, dict]:
         return held, f"caller died; progress record unreadable ({type(e).__name__}); charged its reservation", {}
     if p.get("remote_unconfirmed"):
         return held, "caller died; remote chunks not confirmed stopped; charged its reservation", {}
-    stopped, how = (True, "nothing in flight") if not out else _stop_orphans(p, r.get("backend"))
+    if out:
+        stopped, how = _stop_orphans(p, r.get("backend"))
+    else:
+        stopped, how = True, "nothing in flight"
+        if p.get("pids"):
+            _stop_orphans(p, "local")         # idle pool processes outlive their caller: stop them too
     now = max(now, time.time()) if stopped and out else now
     bound = 0.0
     try:
@@ -1407,6 +1421,10 @@ def _stop_orphans(p: dict, backend: str | None) -> tuple[bool, str]:
             pid = int(pid)
             cur = _pid_start(pid)
             if tok and cur and cur.split(":")[0] == tok.split(":")[0] and cur != tok:
+                continue
+            if not tok:                           # cannot tell ours from a reused pid: never kill, fail closed
+                if _pid_alive(pid) or _group_live(pid):
+                    left.append(pid)
                 continue
             if _pid_alive(pid, tok) or _group_live(pid):
                 _killpg(pid, 9, direct=_pid_alive(pid, tok))
@@ -2434,13 +2452,61 @@ def _self_test_p42(ok) -> None:
                 except (OSError, ValueError):
                     continue
                 last = rec
+                seen_pids.extend(rec.get("pids") or [])
                 if (int(rec.get("done_tasks") or 0) >= done and rec.get("out")
                         and (rec.get("pids_complete") or not pids) and age[0] <= time.time() - float(rec["t"]) < age[1]):
                     return True, rec
             time.sleep(0.01)
         return False, last
 
-    with tempfile.TemporaryDirectory() as d:
+    # Everything these tests start is stopped on the way out, pass or fail:
+    # callers (`procs`), the pool processes their records named, detached jobs.
+    procs, seen_pids = [], []
+
+    def track(p):
+        procs.append(p)
+        return p
+
+    def cleanup(run_dir):
+        import glob as _g
+        for f in _g.glob(os.path.join(run_dir, "models", "*" + JOB_EXT)):
+            try:
+                job = json.load(open(f))
+                if _pid_alive(job["pid"], job.get("pid_start")):
+                    _killpg(int(job["pid"]), signal.SIGKILL, direct=True)
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+        for f in _g.glob(os.path.join(run_dir, PROGRESS_DIR, "*.json")):
+            try:
+                seen_pids.extend(json.load(open(f)).get("pids") or [])
+            except (OSError, ValueError, AttributeError):
+                pass
+        if seen_pids:
+            _stop_orphans({"pids": [list(x) for x in {tuple(x) for x in seen_pids}], "pids_complete": True}, "local")
+        for p in procs:
+            if p.poll() is None:
+                try:
+                    os.killpg(p.pid, signal.SIGKILL) if os.getpgid(p.pid) == p.pid else p.kill()
+                except OSError:
+                    pass
+            try:
+                p.wait(10)
+            except _sp.TimeoutExpired:
+                pass
+        procs.clear()
+        seen_pids.clear()
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def run_dir_cleaned():
+        with tempfile.TemporaryDirectory() as dd:
+            try:
+                yield dd
+            finally:
+                cleanup(dd)
+
+    with run_dir_cleaned() as d:
         os.makedirs(os.path.join(d, "models"))
         open(os.path.join(d, "models", "slow.py"), "w").write(
             "import time\ndef sleep(p):\n    time.sleep(p['s']); return {'k': p['k']}\n")
@@ -2497,7 +2563,7 @@ def _self_test_p42(ok) -> None:
            f"P42-3 unconfirmed remote chunks are charged their shares, the task-time estimate is only recorded: "
            f"{charge} ({why}) {parts}")
         # P42-3b a dead local caller's leftover pool process is killed, then bounded by its time out.
-        orphan = _sp.Popen([sys.executable, "-c", "import time; time.sleep(120)"], start_new_session=True)
+        orphan = track(_sp.Popen([sys.executable, "-c", "import time; time.sleep(120)"], start_new_session=True))
         time.sleep(0.3)
         rec = {"t": now, "core_s": 100.0, "out": [{"n": 1, "started": time.time() - 10, "cores": 1}],
                "pids": [[orphan.pid, _pid_start(orphan.pid)]], "pids_complete": True}
@@ -2528,7 +2594,7 @@ def _self_test_p42(ok) -> None:
         # rerunning the command keeps the rows it had finished.
         os.remove(os.path.join(d, LEDGER_REL))
         t0 = time.time()
-        p = _sp.Popen(cmd, env=env, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, start_new_session=True)
+        p = track(_sp.Popen(cmd, env=env, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, start_new_session=True))
         got, rec5 = wait_ready(d, 4)
         os.killpg(p.pid, signal.SIGKILL)
         el = time.time() - t0
@@ -2550,7 +2616,7 @@ def _self_test_p42(ok) -> None:
         # settling call stops them before bounding their work by time.
         os.remove(os.path.join(d, LEDGER_REL))
         t0 = time.time()
-        p = _sp.Popen(cmd + ["--fresh"], env=env, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+        p = track(_sp.Popen(cmd + ["--fresh"], env=env, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL))
         got, rec5c = wait_ready(d, 2)
         p.kill()
         gone(p.pid)
@@ -2566,7 +2632,7 @@ def _self_test_p42(ok) -> None:
         os.remove(os.path.join(d, LEDGER_REL))
         os.remove(out + PARTIAL_EXT)               # left by P42-5c: wait for this call's own rows
         t0 = time.time()
-        p = _sp.Popen(cmd + ["--fresh"], env=env, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+        p = track(_sp.Popen(cmd + ["--fresh"], env=env, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL))
         wait_rows(out + PARTIAL_EXT, 2)
         p.send_signal(signal.SIGTERM)
         p.wait(60)
@@ -2585,6 +2651,7 @@ def _self_test_p42(ok) -> None:
         cmd7 = [x if x != inp else inp7 for x in cmd] + ["--fresh"]
         wrapper = _sp.Popen(["/bin/sh", "-c", " ".join(_sp.list2cmdline([x]) for x in cmd7 + ["--detach"]) + "; sleep 60"],
                             env=env, stdout=_sp.PIPE, text=True, start_new_session=True)
+        track(wrapper)
         line = wrapper.stdout.readline()
         os.killpg(wrapper.pid, signal.SIGKILL)
         wrapper.wait()
@@ -2616,12 +2683,15 @@ def _self_test_p42(ok) -> None:
     except ImportError:
         print("  (P42-8 skipped: distributed not installed)")
         return
-    with tempfile.TemporaryDirectory() as d, \
+    with run_dir_cleaned() as d, \
             LocalCluster(n_workers=1, threads_per_worker=1, processes=True, dashboard_address=None) as lc:
         os.makedirs(os.path.join(d, "models"))
         open(os.path.join(d, "models", "slow.py"), "w").write(
             "import time\ndef sleep(p):\n    time.sleep(p['s']); return {'k': p['k']}\n")
-        code = ("import json, os, sys; sys.path.insert(0, %r); import compute; "
+        # SIGINT is restored to raise KeyboardInterrupt: a child of a background job
+        # (`cmd &`) inherits SIGINT ignored, and the interrupt was then lost.
+        code = ("import json, os, signal, sys; signal.signal(signal.SIGINT, signal.default_int_handler); "
+                "sys.path.insert(0, %r); import compute; "
                 "from distributed import Client; c = Client(os.environ['MA_COMPUTE_SCHEDULER']); "
                 "compute.register_compute_tags(c, exclude=[]); c.close(); "
                 "compute.map_fn(%r, 'models/slow.py::sleep', [{'s': 1.0, 'k': k} for k in range(80)], "
@@ -2629,10 +2699,9 @@ def _self_test_p42(ok) -> None:
         envd = dict(env, MA_COMPUTE_SCHEDULER=lc.scheduler_address, MA_COMPUTE_RESOURCE="compute",
                     MA_COMPUTE_TARGET_WORKERS="6", MA_COMPUTE_PROCS_PER_WORKER="1", MA_COMPUTE_SETTLE_S="30")
         t0 = time.time()
-        p = _sp.Popen([sys.executable, "-c", code], env=envd, stdout=_sp.DEVNULL, stderr=_sp.PIPE, text=True)
+        p = track(_sp.Popen([sys.executable, "-c", code], env=envd, stdout=_sp.DEVNULL, stderr=_sp.PIPE, text=True))
         # A chunk finished and others are in flight; the record is 0.5-2 s old, so the
-        # caller is blocked waiting on its chunks (an interrupt sent right after a record
-        # can land inside dask's submit and be lost: the batch then ran to completion).
+        # caller is blocked waiting on its chunks when the interrupt arrives.
         got8, rec8 = wait_ready(d, 1, limit=120, pids=False, age=(0.5, 2.0))
         p.send_signal(signal.SIGINT)
         err = p.communicate(timeout=120)[1]
