@@ -188,7 +188,7 @@ Python API exposed by the wrapper:
 from scripts.cloud_batch import BatchRunner
 
 runner = BatchRunner(
-    subscription_id="048cd8f6-c126-46f7-919c-a895e9a8e2cd",
+    subscription_id="<your-subscription-id>",
     batch_account="mymodelingruns",
     batch_account_url="https://mymodelingruns.eastus2.batch.azure.com",
     storage_account="mymodelingstorage",
@@ -249,7 +249,7 @@ estimate. Override with `--force` if you know what you're doing.
    ```
    If not on your personal sub:
    ```
-   az account set --subscription 048cd8f6-c126-46f7-919c-a895e9a8e2cd
+   az account set --subscription <your-subscription-id>
    ```
 
 2. **Provision the Batch account once per project** (one-time setup):
@@ -264,7 +264,7 @@ estimate. Override with `--force` if you know what you're doing.
 
 3. **Set environment variables** (so the wrapper picks them up):
    ```
-   export AZ_SUBSCRIPTION_ID=048cd8f6-c126-46f7-919c-a895e9a8e2cd
+   export AZ_SUBSCRIPTION_ID=<your-subscription-id>
    export AZ_RESOURCE_GROUP=modeling-agentic-rg
    export AZ_BATCH_ACCOUNT=mymodelingruns
    export AZ_STORAGE_ACCOUNT=mymodelingstorage
