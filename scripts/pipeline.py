@@ -4,7 +4,7 @@
     python3 scripts/pipeline.py validate <run_dir>
     python3 scripts/pipeline.py run <run_dir> --dry-run          # print the plan
     python3 scripts/pipeline.py run <run_dir> [--budget-s N]     # the harness run
-    python3 scripts/pipeline.py run <run_dir> <step> --scratch   # try one step in a copy
+    python3 scripts/pipeline.py run <run_dir> <step> --scratch [--keep]   # try one step in a copy
     python3 scripts/pipeline.py --self-test
 
 E7 attempt 7: the modeler wrote new driver scripts every round
@@ -35,21 +35,34 @@ compute step (`run: "compute: <path.py>::<fn>"`) also needs inputs_jsonl, out
 step's input that matches another step's output is an edge of the DAG.
 Validation fails closed: unknown keys, duplicate ids, an output claimed by two
 steps, a cycle (a step reading its own output included), a path outside the
-run directory, or an output the harness or a critic already owns.
+run directory, an output the harness or a critic already owns, or a `run`
+command the agents' own Bash hook would refuse (agents/enforcement.py
+`bash_reason`: the harness runs it with a shell, outside that hook).
 
 Incremental: a step is stale when it never ran, last failed, its definition
 changed, the hash of its inputs or code changed (code = every file named on
 its command line plus the run-local modules a Python script imports,
-recursively), or its outputs are missing or differ from what it last wrote
+recursively, except declared outputs of any step and the step's own declared
+inputs), or its outputs are missing or differ from what it last wrote
 (a hand edit). Everything downstream of a stale step is stale. Hashes are in
 `models/pipeline_state.json`; each run writes `models/pipeline_report.json`.
+
+A step runs with its old outputs moved aside. If it fails or is killed, what it
+wrote is removed and its previous outputs are put back (not a file that differs
+from the harness's record of the step, nor one with an open integrity
+violation); it stays stale. With a budget, a
+step whose last recorded runtime exceeds what is left is not started
+(`skipped_budget`), and stays stale with its outputs. A recorded output no step
+declares any more is deleted, unless a current step reads it as an input: then
+it is only dropped from the records (and released by the integrity record).
+Processes a step leaves in the background are killed when it ends.
 
 Owned outputs: declared outputs are protected artifacts
 (agents/integrity.py). Only the harness's run (`harness_build`, with the
 run's ArtifactIntegrity) may write them; it marks the outputs of the steps it
 ran as harness-written and nothing else. Agents try changes with `--scratch`:
 the step runs in a temporary copy of the run directory, and nothing in the
-run directory changes.
+run directory changes; the copy is removed afterwards unless `--keep`.
 
 Like scripts/derived_rebuild.py: commands run from the run directory, without
 cloud credentials, each in its own process group (killed on timeout), within
@@ -336,6 +349,10 @@ def load(run_dir: str) -> tuple[list[dict], list[str]]:
             for k in sorted(COMPUTE_KEYS):
                 if k in st:
                     errs.append(f"{where}: `{k}` is only for compute steps")
+            if isinstance(st.get("run"), str) and st["run"].strip():
+                e = _bash_refusal(st["run"], run_dir)
+                if e:
+                    errs.append(f"{where}: `run` {e}")
         for x in st["inputs"] + st["outputs"] + [st[k] for k in ("inputs_jsonl", "out") if isinstance(st.get(k), str)]:
             e = _check_path(x, run_dir, where)
             if e:
@@ -389,33 +406,78 @@ def load(run_dir: str) -> tuple[list[dict], list[str]]:
         if errs:
             return [], errs
     by_id = {s["id"]: s for s in steps}
+    all_outs = [o for s in steps for o in step_outputs(s)]
     out = []
     for sid in order:
         s = dict(by_id[sid])
         s["_deps"] = sorted(deps[sid])
+        s["_all_outputs"] = all_outs      # never hashed as code (review #1)
         out.append(s)
     return out, []
+
+
+def _bash_refusal(cmd: str, run_dir: str) -> str | None:
+    """Why the agents' own Bash hook would refuse this step command, or None.
+
+    The harness runs `run:` with a shell, outside the PreToolUse hook, so the same
+    rules (agents/enforcement.py `bash_reason`, as for the modeler, who writes the
+    pipeline) are applied here at validation time. Fails closed."""
+    try:
+        reason = _enforcement().bash_reason(cmd, run_dir, "modeler", cwd=run_dir)
+    except Exception as e:  # noqa: BLE001 — fail closed
+        return f"could not be checked against the agents' Bash rules ({type(e).__name__}: {e})"
+    return f"would be refused as an agent's Bash command: {reason}" if reason else None
+
+
+class PipelineUnreadable(ValueError):
+    """pipeline.yaml exists but cannot be read or parsed (callers must fail closed)."""
+
+
+def _lenient_steps(run_dir: str) -> list[dict]:
+    """The normalized step mappings of pipeline.yaml, without validation. No file: [].
+    A file that cannot be read or parsed raises PipelineUnreadable: an unreadable
+    pipeline is not a pipeline that declares nothing (review #5)."""
+    import yaml
+    p = os.path.join(run_dir, SPEC)
+    if not os.path.lexists(p):
+        return []
+    try:
+        with open(p) as f:
+            doc = yaml.safe_load(f)
+    except (OSError, yaml.YAMLError) as e:
+        raise PipelineUnreadable(f"{SPEC}: {type(e).__name__}: {str(e)[:200]}") from e
+    if doc is not None and not isinstance(doc, dict):
+        raise PipelineUnreadable(f"{SPEC} is not a mapping")
+    raw = doc.get("steps") if isinstance(doc, dict) else None
+    out = []
+    for st in raw if isinstance(raw, list) else []:
+        if isinstance(st, dict):
+            st = _normalize(st)
+            for k in ("inputs", "outputs"):
+                if not isinstance(st.get(k), list):
+                    st[k] = []
+            out.append(st)
+    return out
+
+
+def declared_inputs(run_dir: str) -> list[str]:
+    """Input paths/globs pipeline.yaml declares (lenient, as declared_outputs)."""
+    pats = []
+    for st in _lenient_steps(run_dir):
+        for i in step_inputs(st):
+            if isinstance(i, str) and i.strip() and i not in pats:
+                pats.append(i)
+    return pats
 
 
 def declared_outputs(run_dir: str) -> list[str]:
     """Output paths/globs pipeline.yaml declares, for the integrity record. Lenient on
     purpose (fail closed): a pipeline that does not validate still protects every
-    output it names inside the run dir, except files another owner already holds."""
-    import yaml
-    try:
-        with open(os.path.join(run_dir, SPEC)) as f:
-            doc = yaml.safe_load(f)
-    except (OSError, yaml.YAMLError):
-        return []
-    raw = doc.get("steps") if isinstance(doc, dict) else None
+    output it names inside the run dir, except files another owner already holds.
+    Raises PipelineUnreadable when the file exists but does not parse."""
     reserved = _reserved_patterns()
     pats = []
-    for st in raw if isinstance(raw, list) else []:
-        if not isinstance(st, dict):
-            continue
-        st = _normalize(st)
-        if not isinstance(st.get("outputs"), list):
-            st["outputs"] = []
+    for st in _lenient_steps(run_dir):
         for o in step_outputs(st):
             if isinstance(o, str) and o.strip() and not os.path.isabs(o):
                 o = os.path.normpath(o).replace(os.sep, "/")   # protect what the path names
@@ -511,7 +573,13 @@ def code_files(step: dict, run_dir: str) -> list[str]:
             named.add(p)
             if p.endswith(".py") and _inside(p, run_dir):
                 _local_imports(p, run_dir, py)
-    return sorted(named | py)
+    # Review #1: a declared output (of any step) is data the run writes, and the step's
+    # own declared inputs are hashed as inputs: neither is code. Otherwise `> out.csv` or
+    # `--out out.csv` changed the step's code key while it ran. Imports are still followed.
+    outs = list(step.get("_all_outputs") or step_outputs(step))
+    data = outs + step_inputs(step)
+    return sorted(p for p in named | py
+                  if not (_inside(p, run_dir) and any(path_match(_rel(p, run_dir), pat) for pat in data)))
 
 
 def _rel(p: str, run_dir: str) -> str:
@@ -608,6 +676,12 @@ def _run_cmd(cmd, cwd, timeout_s, env, shell=False):
                          text=True, env=env, start_new_session=True, shell=shell)
     try:
         _out, err = p.communicate(timeout=timeout_s)
+        # Review #4: a process the step left in the background (`cmd &`) would keep
+        # writing declared outputs after the step is recorded and its grant ends.
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except OSError:
+            pass
         return p.returncode, (err or "")[-800:]
     except subprocess.TimeoutExpired:
         try:
@@ -648,56 +722,145 @@ def _snapshot(step: dict, run_dir: str) -> dict:
     return snap
 
 
-def _run_one(step: dict, run_dir: str, timeout_s: float, python: str | None, rec: dict | None = None) -> dict:
-    """Clear the step's existing outputs, run it, and check it wrote every declared output.
+def _recover_aside(run_dir: str, dry: bool = False) -> list[str]:
+    """A harness process killed mid-step leaves the step's set-aside outputs in
+    `.pipeline_aside_*/<rel>`. Its state record was not updated, so putting back the
+    files whose place is empty returns the run to where it was before that step (only
+    files that were not suspect are ever set aside). `dry`: just list them."""
+    back = []
+    for d in glob.glob(os.path.join(run_dir, ".pipeline_aside_*")):
+        for dp, _dirs, fns in os.walk(d):
+            for fn in fns:
+                rel = os.path.relpath(os.path.join(dp, fn), d)
+                dst = os.path.join(run_dir, rel)
+                if os.path.lexists(dst) or not _inside(os.path.dirname(dst), run_dir):
+                    continue
+                if not dry:
+                    try:
+                        os.makedirs(os.path.dirname(dst), exist_ok=True)
+                        os.replace(os.path.join(dp, fn), dst)
+                    except OSError:
+                        continue
+                back.append(rel.replace(os.sep, "/"))
+        if not dry:
+            shutil.rmtree(d, ignore_errors=True)
+    return back
 
-    Outputs are removed first (like `make clean` for this step), so only files this
-    execution creates count as written: a `touch` cannot pass an old or hand-edited file
-    off as current, and a file a glob output no longer produces does not linger (Codex
-    review). The one exception is a compute step's results file whose bytes are what
-    the harness last recorded: the compute service reuses its rows by code fingerprint."""
+
+def _trusted_outputs(rec) -> dict:
+    """Output hashes the harness last recorded for a step (kept across a failed run)."""
+    out = rec.get("outputs") if isinstance(rec, dict) else None
+    return out if isinstance(out, dict) else {}
+
+
+def _run_one(step: dict, run_dir: str, timeout_s: float, python: str | None, rec: dict | None = None,
+             suspect=None) -> dict:
+    """Move the step's existing outputs aside, run it, and check it wrote every declared output.
+
+    The step runs with its outputs absent (like `make clean` for this step), so only files
+    this execution creates count as written: a `touch` cannot pass an old or hand-edited
+    file off as current, and a file a glob output no longer produces does not linger
+    (Codex review). The one exception is a compute step's results file whose bytes are
+    what the harness last recorded: the compute service reuses its rows by code
+    fingerprint (it stays in place; a copy is kept aside).
+
+    Review #2: if the step fails or is killed, what it wrote is removed and its previous
+    outputs are put back, so a failed rebuild never leaves the run with less than it had.
+    Not restored: when the harness has a record of the step's outputs, a file whose bytes
+    do not match it (a hand edit, or a leftover); and a file `suspect(rel)` names (an open
+    integrity violation), so a restore can never pass an edit off as harness-written.
+    Without a record (the first harness build of files the agents made) the files are
+    restored as they were. The step stays stale either way."""
     fp = fingerprint(step, run_dir)
-    row = {"returncode": None, "seconds": 0.0, "ok": False, "written": [], "removed": [], "fingerprint": fp}
+    row = {"returncode": None, "seconds": 0.0, "ok": False, "written": [], "removed": [], "restored": [],
+           "fingerprint": fp}
     if fp["missing_inputs"]:
         row["error"] = f"inputs missing: {', '.join(fp['missing_inputs'])}"
         return row
-    trusted = (rec or {}).get("outputs") if isinstance(rec, dict) and rec.get("ok") else {}
+    trusted = _trusted_outputs(rec)
     keep = set()
     if _compute_fn(step):
         for rel in (step["out"], step["out"] + ".summary.json"):
-            if isinstance(trusted, dict) and rel in trusted and _sha(os.path.join(run_dir, rel)) == trusted[rel]:
+            if rel in trusted and _sha(os.path.join(run_dir, rel)) == trusted[rel]:
                 keep.add(rel)
     before = _snapshot(step, run_dir)
-    for rel in sorted(before):
-        if rel in keep:
-            continue
-        try:
-            os.remove(os.path.join(run_dir, rel))
-            row["removed"].append(rel)
-        except OSError as e:
-            row["error"] = f"could not clear old output {rel}: {e}"
-            return row
-    s0 = time.time()
     try:
-        rc, err = _exec_step(step, run_dir, timeout_s, python)
+        aside = tempfile.mkdtemp(prefix=".pipeline_aside_", dir=run_dir)
     except OSError as e:
-        rc, err = None, f"{type(e).__name__}: {e}"
-    row.update(returncode=rc, seconds=round(time.time() - s0, 1), ok=rc == 0)
-    after = _snapshot(step, run_dir)
-    row["written"] = sorted(r for r, m in after.items() if r not in keep or before.get(r) != m)
-    row["removed"] = sorted(set(row["removed"]) - set(after))
-    if rc != 0:
-        row["error"] = err
+        row["error"] = f"could not set old outputs aside: {e}"
         return row
-    problems = [f"{pat}: not produced" for pat in step_outputs(step)
-                if not any(path_match(r, pat) for r in row["written"])]
-    if fingerprint(step, run_dir)["key"] != fp["key"]:
-        # Its inputs or code changed while it ran: the outputs may hold the old values (Codex).
-        problems.append("inputs or code changed while the step ran; rerun")
-    if problems:
-        row["ok"] = False
-        row["error"] = "declared outputs: " + "; ".join(problems)
-    return row
+    good: dict[str, str] = {}      # rel -> its copy aside (the files to restore on failure)
+
+    def restore() -> list[str]:
+        back = []
+        for rel in sorted(_snapshot(step, run_dir)):
+            try:
+                os.remove(os.path.join(run_dir, rel))          # what the failed run left
+            except OSError:
+                pass
+        for rel, src in sorted(good.items()):
+            dst = os.path.join(run_dir, rel)
+            try:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                os.replace(src, dst)
+                back.append(rel)
+            except OSError:
+                pass
+        return back
+
+    try:
+        for rel in sorted(before):
+            src = os.path.join(run_dir, rel)
+            kept = os.path.join(aside, rel)
+            is_good = (_sha(src) == trusted.get(rel) if trusted else True) \
+                and not (suspect is not None and suspect(rel))
+            try:
+                if rel in keep or is_good:
+                    os.makedirs(os.path.dirname(kept), exist_ok=True)
+                if rel in keep:
+                    shutil.copy2(src, kept)
+                    good[rel] = kept
+                    continue
+                if is_good:
+                    os.replace(src, kept)
+                    good[rel] = kept
+                else:
+                    os.remove(src)
+                row["removed"].append(rel)
+            except OSError as e:
+                row["error"] = f"could not clear old output {rel}: {e}"
+                row["restored"] = restore()
+                return row
+        s0 = time.time()
+        try:
+            rc, err = _exec_step(step, run_dir, timeout_s, python)
+        except OSError as e:
+            rc, err = None, f"{type(e).__name__}: {e}"
+        row.update(returncode=rc, seconds=round(time.time() - s0, 1), ok=rc == 0)
+        after = _snapshot(step, run_dir)
+        row["written"] = sorted(r for r, m in after.items() if r not in keep or before.get(r) != m)
+        row["removed"] = sorted(set(row["removed"]) - set(after))
+        if rc != 0:
+            row["error"] = err
+        else:
+            problems = [f"{pat}: not produced" for pat in step_outputs(step)
+                        if not any(path_match(r, pat) for r in row["written"])]
+            if fingerprint(step, run_dir)["key"] != fp["key"]:
+                # Its inputs or code changed while it ran: the outputs may hold the old values (Codex).
+                problems.append("inputs or code changed while the step ran; rerun")
+            if problems:
+                row["ok"] = False
+                row["error"] = "declared outputs: " + "; ".join(problems)
+        if not row["ok"]:
+            row["restored"] = restore()
+            # What changed on disk this run: the files it wrote and the ones it removed,
+            # except the restored files, which hold their previous bytes again.
+            now = set(_snapshot(step, run_dir))
+            row["removed"] = sorted((set(before) | set(row["written"])) - now)
+            row["written"] = sorted((set(row["written"]) & now) - set(row["restored"]))
+        return row
+    finally:
+        shutil.rmtree(aside, ignore_errors=True)
 
 
 def run(run_dir: str, budget_s: float | None = None, integrity=None, python: str | None = None,
@@ -714,7 +877,7 @@ def run(run_dir: str, budget_s: float | None = None, integrity=None, python: str
     steps, errs = load(run_dir)
     report = {"at": time.strftime("%Y-%m-%dT%H:%M:%S"), "errors": errs, "plan": [], "steps": [], "ok": not errs}
     if errs:
-        _finish(run_dir, report, t0, integrity, [])
+        _finish_granted(run_dir, report, t0, integrity)
         return report
     state = _load_state(run_dir)
     if integrity is not None:
@@ -728,7 +891,7 @@ def run(run_dir: str, budget_s: float | None = None, integrity=None, python: str
     if only is not None:
         if only not in {s["id"] for s in steps}:
             report.update(errors=[f"no step {only!r}"], ok=False)
-            _finish(run_dir, report, t0, integrity, [])
+            _finish_granted(run_dir, report, t0, integrity)
             return report
         report["plan"] = [{"id": only, "why": "requested"}] if force else \
             [p for p in plan(run_dir, steps, state) if p["id"] == only]
@@ -740,16 +903,25 @@ def run(run_dir: str, budget_s: float | None = None, integrity=None, python: str
     # renamed, a step removed): removed, so nothing reads a retired result as current.
     declared = [o for s in steps for o in step_outputs(s)]
     reserved = _reserved_patterns()
-    retired = sorted({rel for rec in state["steps"].values() if isinstance(rec, dict)
-                      for rel in (rec.get("outputs") or {})
-                      if isinstance(rel, str) and not any(path_match(rel, o) for o in declared)
-                      and _check_path(rel, run_dir, "") is None
-                      and not any(path_match(rel, r) for r in reserved)})
-    grant = [o for s in steps if s["id"] in todo for o in step_outputs(s)] + list(OWN_FILES) + retired
+    gone = sorted({rel for rec in state["steps"].values() if isinstance(rec, dict)
+                   for rel in (rec.get("outputs") or {})
+                   if isinstance(rel, str) and not any(path_match(rel, o) for o in declared)
+                   and _check_path(rel, run_dir, "") is None
+                   and not any(path_match(rel, r) for r in reserved)})
+    # Review #3: one a current step reads is kept; it only leaves the pipeline's records
+    # (and, in agents/integrity.py, its ownership: no step claims to produce it now).
+    reads = [i for s in steps for i in step_inputs(s)]
+    released = [rel for rel in gone if any(path_match(rel, i) for i in reads)]
+    retired = [rel for rel in gone if rel not in released]
+    recover = _recover_aside(run_dir, dry=True)
+    grant = [o for s in steps if s["id"] in todo for o in step_outputs(s)] + list(OWN_FILES) + retired + recover
     ctx = integrity.harness_pipeline(grant) if integrity is not None else nullcontext()
     with ctx:
         failed: set[str] = set()
         produced: list[str] = []
+        recovered = _recover_aside(run_dir)
+        if recovered:
+            report["recovered"] = recovered     # not marked harness-written: previous bytes
         for rel in retired:
             try:
                 if os.path.isfile(os.path.join(run_dir, rel)):
@@ -758,36 +930,51 @@ def run(run_dir: str, budget_s: float | None = None, integrity=None, python: str
             except OSError:
                 pass
         report["retired"] = [r for r in retired if r in produced]
+        if released:
+            report["released"] = released
         state["steps"] = {k: v for k, v in state["steps"].items() if k in by_id}
         for rec in state["steps"].values():
             if isinstance(rec, dict) and isinstance(rec.get("outputs"), dict):
-                rec["outputs"] = {k: v for k, v in rec["outputs"].items() if k not in retired}
+                rec["outputs"] = {k: v for k, v in rec["outputs"].items() if k not in gone}
         for s in steps:
             if s["id"] not in todo:
                 continue
             row = {"id": s["id"], "why": next(p["why"] for p in report["plan"] if p["id"] == s["id"])}
             up = [d for d in s["_deps"] if d in failed]
             left = None if budget_s is None else budget_s - (time.time() - t0)
+            rec = state["steps"].get(s["id"])
+            last = rec.get("seconds") if isinstance(rec, dict) else None
             if up:
-                row.update(status="skipped", error=f"upstream step failed: {', '.join(up)}")
+                row.update(status="skipped", error=f"upstream step not rebuilt: {', '.join(up)}")
                 failed.add(s["id"])
             elif left is not None and left < 5:
                 row.update(status="not_started", error="pipeline time budget used")
                 failed.add(s["id"])
+            elif left is not None and isinstance(last, (int, float)) and last > left:
+                # Review #2: it would be killed partway; leave it stale with its outputs.
+                row.update(status="skipped_budget",
+                           error=f"last run took {last:.0f}s; {left:.0f}s of the pipeline budget left")
+                failed.add(s["id"])
             else:
                 tmo = float(s.get("timeout_s") or DEFAULT_TIMEOUT_S)
-                res = _run_one(s, run_dir, tmo if left is None else min(tmo, left), python,
-                               state["steps"].get(s["id"]))
+                res = _run_one(s, run_dir, tmo if left is None else min(tmo, left), python, rec,
+                               suspect=integrity.is_open if integrity is not None else None)
                 fp = res.pop("fingerprint", None) or fingerprint(s, run_dir)
                 row.update(res, status="ok" if res["ok"] else "failed")
                 produced += res["written"] + res["removed"]
+                at = time.strftime("%Y-%m-%dT%H:%M:%S")
                 if res["ok"]:
                     state["steps"][s["id"]] = {"ok": True, "key": fp["key"], "inputs": fp["inputs"],
                                                "code": fp["code"], "outputs": output_hashes(s, run_dir),
-                                               "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+                                               "seconds": res["seconds"], "at": at}
                 else:
                     failed.add(s["id"])
-                    state["steps"][s["id"]] = {"ok": False, "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+                    # The restored files keep their recorded hashes (a later hand edit still
+                    # shows), and the runtime is kept for the budget check.
+                    prev = _trusted_outputs(rec)
+                    state["steps"][s["id"]] = {"ok": False, "at": at,
+                                               "seconds": max(res["seconds"], last or 0.0),
+                                               "outputs": {r: prev[r] for r in res["restored"] if r in prev}}
                 produced.append(_write_json(run_dir, STATE, state))
             report["steps"].append(row)
         report["ok"] = not failed
@@ -810,6 +997,14 @@ def _finish(run_dir, report, t0, integrity, produced, by_id=None):
             if any(path_match(rel, r) for r in reserved):
                 continue          # never accept a file another owner holds, whatever wrote it
             integrity.harness_wrote(rel)
+
+
+def _finish_granted(run_dir, report, t0, integrity):
+    """_finish for a run that stops early: its report is still written inside the
+    harness grant (the runner's own records), as on the normal path."""
+    ctx = integrity.harness_pipeline(list(OWN_FILES)) if integrity is not None else nullcontext()
+    with ctx:
+        _finish(run_dir, report, t0, integrity, [])
 
 
 def harness_build(run_dir: str, integrity, budget_s: float | None = None) -> dict:
@@ -842,8 +1037,10 @@ def _stat_tree(d: str) -> dict:
     return out
 
 
-def scratch(run_dir: str, step_id: str, python: str | None = None, keep: bool = True) -> dict:
-    """Run one step in a temporary copy of the run dir. Nothing in the run dir changes."""
+def scratch(run_dir: str, step_id: str, python: str | None = None, keep: bool = False) -> dict:
+    """Run one step in a temporary copy of the run dir. Nothing in the run dir changes.
+    The copy is removed afterwards unless `keep` (review #6: copies piled up).
+    `scratch_dir` names it either way; `scratch_kept` says whether it is still there."""
     run_dir = os.path.realpath(run_dir)
     before = _stat_tree(run_dir)
     # The copy is a hidden sibling of the run dir, so a run script that reaches the repo by
@@ -881,8 +1078,10 @@ def scratch(run_dir: str, step_id: str, python: str | None = None, keep: bool = 
         with open(sp, "w") as f:
             f.write(txt.replace(run_dir, copy))
     except OSError as e:
+        if not keep:
+            shutil.rmtree(dst, ignore_errors=True)
         return {"ok": False, "errors": [f"scratch copy: could not prepare {SPEC}: {e}"], "steps": [],
-                "plan": [], "scratch_dir": copy}
+                "plan": [], "scratch_dir": copy, "scratch_kept": keep}
     rep = run(copy, python=python, only=step_id, force=True)
     rep["scratch_dir"] = copy
     # No portable write sandbox: a step that still writes the real run dir (an absolute
@@ -898,6 +1097,7 @@ def scratch(run_dir: str, step_id: str, python: str | None = None, keep: bool = 
             f"the scratch run changed the real run directory: {', '.join(changed[:10])}")
     if not keep:
         shutil.rmtree(dst, ignore_errors=True)
+    rep["scratch_kept"] = keep
     return rep
 
 
@@ -984,6 +1184,12 @@ def _self_test() -> int:
         w(d, "models/c.py", "import os\nos.makedirs('figures', exist_ok=True)\n"
                             "open('figures/f1.png', 'w').write(open('models/b.out').read())\n")
         spec(d, three)
+
+    def rd(d, rel):
+        try:
+            return open(os.path.join(d, rel)).read()
+        except OSError:
+            return None
 
     def ids(rep, status="ok"):
         return [r["id"] for r in rep["steps"] if r.get("status") == status]
@@ -1091,7 +1297,7 @@ def _self_test() -> int:
         rep = scratch(d, "b", keep=False)
         ok(rep["ok"] and _tree_hash(d) == before and rep["scratch_dir"] != d,
            f"PL17 scratch mode leaves the run dir untouched: {summary_line(rep)}")
-        rep = scratch(d, "b")
+        rep = scratch(d, "b", keep=True)
         ok(open(os.path.join(rep["scratch_dir"], "models/b.out")).read() == "scratch"
            and open(os.path.join(d, "models/b.out")).read() != "scratch",
            "PL18 scratch outputs land in the copy only")
@@ -1145,6 +1351,128 @@ def _self_test() -> int:
         ok(rep["ok"] and _tree_hash(d) == before and not os.path.exists(rep["scratch_dir"])
            and os.listdir(os.path.join(top, "runs")) == ["r1"],
            f"PL26 a scratch copy resolves paths relative to the run's place (and is removed): {rep.get('steps')}")
+
+    # Review fixes (PR "Pipeline runner: review fixes").
+    with tempfile.TemporaryDirectory() as d:
+        d = os.path.realpath(d)
+        # (review #1) A step's own outputs named on its command line are not code.
+        w(d, "data/x.csv", "1\n")
+        w(d, "models/o.py", "print(open('data/x.csv').read().strip())\n")
+        w(d, "models/wr.py", "import sys\nopen(sys.argv[sys.argv.index('--out') + 1], 'w')"
+                             ".write(open('models/o.out').read())\n")
+        spec(d, [{"id": "o", "run": f"{py} models/o.py > models/o.out", "inputs": ["data/x.csv"],
+                  "outputs": ["models/o.out"]},
+                 {"id": "wr", "run": f"{py} models/wr.py --out models/alloc.csv", "inputs": ["models/o.out"],
+                  "outputs": ["models/alloc.csv"]}])
+        r1 = run(d)
+        w(d, "data/x.csv", "2\n")
+        r2 = run(d)
+        p2 = plan(d)
+        alloc = rd(d, "models/alloc.csv")
+        w(d, "models/o.py", "print(3)\n")
+        p3 = [p["id"] for p in plan(d)]
+        ok(r1["ok"] and r2["ok"] and ids(r2) == ["o", "wr"] and p2 == [] and alloc == "2\n" and p3 == ["o", "wr"],
+           f"PR1 (review #1) outputs named on a command line are not hashed as code; scripts still are: "
+           f"{r1['steps']} {r2['steps']} {p3}")
+    with tempfile.TemporaryDirectory() as d:
+        d = os.path.realpath(d)
+        fixture(d)
+        run(d)
+        good = rd(d, "models/b.out")
+        # (review #2) A step whose last runtime exceeds the remaining budget is not started.
+        stt = json.load(open(os.path.join(d, STATE)))
+        stt["steps"]["b"]["seconds"] = 999.0
+        w(d, STATE, json.dumps(stt))
+        w(d, "data/y.csv", "20\n")
+        rep = run(d, budget_s=60)
+        st = {r["id"]: r.get("status") for r in rep["steps"]}
+        ok(st == {"b": "skipped_budget", "c": "skipped"} and not rep["ok"]
+           and rd(d, "models/b.out") == good and [p["id"] for p in plan(d)] == ["b", "c"],
+           f"PR2 (review #2) a step that does not fit the budget is not started; its outputs stay: {rep['steps']}")
+        # (review #2) A failed or killed step's last good outputs are restored; it stays stale.
+        w(d, "models/b.py", "open('models/b.out', 'w').write('partial')\nraise SystemExit('boom')\n")
+        rep = run(d)
+        ok(rep["steps"][0]["status"] == "failed" and rd(d, "models/b.out") == good
+           and [p["id"] for p in plan(d)] == ["b", "c"],
+           f"PR3 (review #2) a failed step's previous outputs are restored and it stays stale: {rep['steps']}")
+        w(d, "models/b.py", "import time\nopen('models/b.out', 'w').write('partial')\ntime.sleep(30)\n")
+        spec(d, [three[0], dict(three[1], timeout_s=1), three[2]])
+        rep = run(d)
+        ok(rep["steps"][0]["returncode"] is None and rd(d, "models/b.out") == good,
+           f"PR4 (review #2) a killed step's previous outputs are restored: {rep['steps']}")
+        # Anti-laundering: a hand edit is not restored as a good output.
+        w(d, "models/b.out", "hand")
+        w(d, "models/b.py", "raise SystemExit(1)\n")
+        rep = run(d)
+        ok(not os.path.exists(os.path.join(d, "models/b.out")) and "b" in [p["id"] for p in plan(d)],
+           f"PR5 (review #2) a hand-edited output is not restored after a failed run: {rep['steps']}")
+        # Without a record (a first harness build of files the agents made), a failed
+        # step's existing outputs are restored as they were.
+        os.remove(os.path.join(d, STATE))
+        w(d, "models/b.out", "agent-made")
+        rep = run(d)
+        ok(rep["steps"][1]["status"] == "failed" and rd(d, "models/b.out") == "agent-made"
+           and rep["steps"][1].get("restored") == ["models/b.out"] and "b" in [p["id"] for p in plan(d)],
+           f"PR5c (review #2, real-check) a failed first build restores the outputs it found: {rep['steps']}")
+        # A harness killed mid-step left the set-aside outputs: the next run puts them back.
+        spec(d, three)
+        w(d, "models/b.py", "open('models/b.out', 'w').write('7')\n")
+        ok(run(d)["ok"], "PR5d fixture: rebuild")
+        good = rd(d, "models/b.out")
+        os.makedirs(os.path.join(d, ".pipeline_aside_crash", "models"))
+        os.replace(os.path.join(d, "models/b.out"), os.path.join(d, ".pipeline_aside_crash", "models", "b.out"))
+        w(d, "models/b.py", "raise SystemExit(1)\n")
+        rep = run(d)
+        ok(rep.get("recovered") == ["models/b.out"] and rd(d, "models/b.out") == good
+           and not os.path.exists(os.path.join(d, ".pipeline_aside_crash")),
+           f"PR5e (review #2) outputs a crashed harness run left aside are put back: {rep}")
+        w(d, "models/b.py", "open('models/b.out', 'w').write('7')\n")
+        ok(run(d)["ok"], "PR5b fixture: rebuild")
+        # (review #3) A retired output a current step reads is kept, not deleted.
+        spec(d, three[1:])
+        rep = run(d)
+        ok(os.path.exists(os.path.join(d, "models/a.out")) and rep.get("released") == ["models/a.out"]
+           and not rep.get("retired") and rep["ok"],
+           f"PR6 (review #3) a retired output a current step declares as input is kept: {rep}")
+        spec(d, three)
+        run(d)
+        # (review #4) A step command the agent's own Bash would be refused is invalid; background
+        # processes a step leaves behind are killed when it ends.
+        late = os.path.join(d, "models", "late.txt")
+        spec(d, [{"id": "z", "inputs": [], "outputs": ["models/z.out"],
+                  "run": f"({py} -c \"import time; time.sleep(2); open('models/late.txt', 'w').write('x')\") "
+                         f"> /dev/null 2>&1 & echo 1 > models/z.out"}])
+        rep = run(d)
+        time.sleep(3)
+        ok(rep["ok"] and not os.path.exists(late),
+           f"PR7 (review #4) a process a step leaves in the background is killed when the step ends: {rep['steps']}")
+        # (review #6) The CLI removes the scratch copy unless --keep.
+        fixture(d)
+        run(d)
+        parent = os.path.dirname(d)
+        sib = lambda: sorted(x for x in os.listdir(parent) if x.startswith(f".{os.path.basename(d)}.scratch_"))
+        s0 = sib()
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), "run", d, "b", "--scratch"],
+                           capture_output=True, text=True)
+        s1 = sib()
+        r2 = subprocess.run([sys.executable, os.path.abspath(__file__), "run", d, "b", "--scratch", "--keep"],
+                            capture_output=True, text=True)
+        kept = [x for x in sib() if x not in s1]
+        ok(r.returncode == 0 and s1 == s0 and r2.returncode == 0 and len(kept) == 1 and kept[0] in r2.stdout,
+           f"PR8 (review #6) a scratch copy is removed unless --keep, and printed when kept: "
+           f"{r.stdout}{r.stderr} {r2.stdout}{r2.stderr} {s0} {s1} {kept}")
+        for x in kept:
+            shutil.rmtree(os.path.join(parent, x), ignore_errors=True)
+        # (review #5) An unparsable pipeline.yaml is not "no outputs".
+        w(d, SPEC, "steps: [")
+        try:
+            declared_outputs(d)
+            raised = False
+        except ValueError:
+            raised = True
+        os.remove(os.path.join(d, SPEC))
+        ok(raised and declared_outputs(d) == [],
+           "PR9 (review #5) declared_outputs raises on an unparsable pipeline.yaml (and is [] without one)")
 
     # Validation fails closed.
     def errs_of(steps, extra=None):
@@ -1205,6 +1533,14 @@ def _self_test() -> int:
     ok(any("owned elsewhere" in x for x in e), f"PV17 (Codex r2) a character-class glob over a critique file is refused: {e}")
     ok(path_match("models/a.csv", "models/**/*.csv") and path_match("models/x/a.csv", "models/**/*.csv"),
        "PV18 (Codex r2) `**/` matches zero or more directories, as glob does")
+    bad_cmds = {"protected write": "echo x > critique_domain.yaml; echo 1 > models/a.out",
+                "credentials": "cat .env > models/a.out",
+                "harness chmod": "chmod +x scripts/pipeline.py; echo 1 > models/a.out"}
+    e = {k: errs_of([dict(three[0], run=v)]) for k, v in bad_cmds.items()}
+    e_ok = errs_of([dict(three[0], run=f"nohup {py} models/a.py > models/a.log 2>&1")])
+    ok(all(any("Bash" in x and "refused" in x for x in v) for v in e.values()) and e_ok == [],
+       f"PV19 (review #4) a step command the agents' Bash deny rules refuse is invalid; an allowed one loads: "
+       f"{e} {e_ok}")
 
     # Gate findings, input changed mid-run, relative imports.
     with tempfile.TemporaryDirectory() as d:
@@ -1346,6 +1682,66 @@ def _self_test() -> int:
             new = ig.on_post("t11")
             ok([x["file"] for x in new] == ["models/rec.csv"],
                f"PO10 (Codex r2) a Write to a file a recursive glob output names is flagged: {new}")
+        # (review #3) An output retired into another step's input leaves the pipeline's ownership.
+        with tempfile.TemporaryDirectory() as d:
+            d = os.path.realpath(d)
+            fixture(d)
+            ig = ArtifactIntegrity(d, process_check=lambda: set())
+            ok(harness_build(d, ig)["ok"], "PO11a fixture: build")
+            spec(d, three[1:])
+            ig.on_pre("u1", "Write", {"file_path": os.path.join(d, SPEC)}, "modeler", cwd=d)
+            ig.on_post("u1")
+            rep = harness_build(d, ig)
+            ig.on_pre("u2", "Write", {"file_path": os.path.join(d, "models/a.out")}, "modeler", cwd=d)
+            w(d, "models/a.out", "4")
+            new = ig.on_post("u2")
+            ok(rep["ok"] and new == [] and not ig.open_events and [p["id"] for p in plan(d)] == ["b", "c"],
+               f"PO11 (review #3) a retired output now read as an input is the agents' file again: "
+               f"{rep.get('released')} {new} {ig.open_events}")
+            spec(d, three)
+            ig.on_pre("u3", "Write", {"file_path": os.path.join(d, SPEC)}, "modeler", cwd=d)
+            new = ig.on_post("u3")
+            w(d, "models/a.out", "5")
+            ig.on_pre("u4", "Bash", {"command": "true"}, "modeler", cwd=d)
+            new2 = ig.on_post("u4")
+            ok(new == [] and [x["file"] for x in new2] == ["models/a.out"] and plan(d)[0]["id"] == "a",
+               f"PO12 (review #3) declared an output again, it is baselined and protected: {new} {new2}")
+        # (review #2) A failed rebuild never restores a file with an open violation (it would
+        # pass the edit off as harness-written), even without a pipeline record.
+        with tempfile.TemporaryDirectory() as d:
+            d = os.path.realpath(d)
+            fixture(d)
+            ig = ArtifactIntegrity(d, process_check=lambda: set())
+            ok(harness_build(d, ig)["ok"], "PO14a fixture: build")
+            os.remove(os.path.join(d, STATE))
+            ig.on_pre("x1", "Bash", {"command": "true"}, "modeler", cwd=d)
+            w(d, "models/b.out", "hand")
+            ig.on_post("x1")
+            w(d, "models/b.py", "raise SystemExit(1)\n")
+            ig.on_pre("x2", "Write", {"file_path": os.path.join(d, "models/b.py")}, "modeler", cwd=d)
+            ig.on_post("x2")
+            rep = harness_build(d, ig)
+            ok(rd(d, "models/b.out") is None and any(e["file"] == "models/b.out" for e in ig.open_events),
+               f"PO14 (review #2) a failed step does not restore an output with an open violation: "
+               f"{[r.get('restored') for r in rep['steps']]} {ig.open_events}")
+        # (review) An invalid pipeline's report is written inside the harness grant.
+
+        class _Probe(ArtifactIntegrity):
+            def harness_wrote(self, rel):
+                self._check(where="probe")      # a hook's check landing between write and accept
+                super().harness_wrote(rel)
+
+        with tempfile.TemporaryDirectory() as d:
+            d = os.path.realpath(d)
+            fixture(d)
+            ig = _Probe(d, process_check=lambda: set())
+            harness_build(d, ig)
+            w(d, SPEC, "steps: [")
+            ig.on_pre("v1", "Write", {"file_path": os.path.join(d, SPEC)}, "modeler", cwd=d)
+            ig.on_post("v1")
+            rep = harness_build(d, ig)
+            ok(rep["errors"] and not ig.open_events,
+               f"PO13 (review) an invalid pipeline's report is written inside the harness grant: {ig.open_events}")
     if fails:
         print("SELF-TEST FAILURES:")
         for f in fails:
@@ -1362,6 +1758,7 @@ def main(argv=None) -> int:
     ap.add_argument("step", nargs="?")
     ap.add_argument("--dry-run", action="store_true", help="print the steps that would rerun, and why")
     ap.add_argument("--scratch", action="store_true", help="run <step> in a temporary copy of the run dir")
+    ap.add_argument("--keep", action="store_true", help="with --scratch: keep the copy (its path is printed)")
     ap.add_argument("--budget-s", type=float)
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--self-test", action="store_true")
@@ -1377,8 +1774,10 @@ def main(argv=None) -> int:
     if a.scratch:
         if not a.step:
             ap.error("--scratch needs a step id")
-        rep = scratch(a.run_dir, a.step)
-        print(json.dumps(rep, indent=1) if a.json else summary_line(rep) + f"\nscratch copy: {rep['scratch_dir']}")
+        rep = scratch(a.run_dir, a.step, keep=a.keep)
+        where = (f"scratch copy kept: {rep['scratch_dir']}" if a.keep
+                 else "scratch copy removed (pass --keep to inspect it)")
+        print(json.dumps(rep, indent=1) if a.json else summary_line(rep) + "\n" + where)
         return 0 if rep["ok"] else 1
     if a.step:
         ap.error("running a single step writes only to a scratch copy: add --scratch")
