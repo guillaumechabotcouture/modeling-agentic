@@ -178,6 +178,42 @@ artifacts:
       registry point estimates; any mismatch over 0.1% is HIGH, not declarable,
       and so is an uncertainty report produced by another function or older code.
 
+  - id: mechanism_manifest
+    path: models/mechanism_manifest.yaml
+    first_draft_round: 1
+    finalize_round: 2
+    stage: model
+    skill: modeling-strategy
+    triggered_by: always
+    scope_declarable: false
+    required_for_accept: never   # required per mechanism by scripts/mechanism_manifest.py
+    description: |
+      **When a matched expert prior lists `requires_mechanism`** (Phase 42 γ,
+      D1; `mechanism_manifest.py` prints the list). Start as simple as the
+      question allows. For each listed mechanism record `modelled`
+      (`code_ref: models/<file>.py::<name>`), `fixed` (`source:`), or
+      `simplified` (`assumption:` + `sufficiency_test:` naming a result file
+      with `varied`, `criterion`, `decision_changes: true|false`). A missing
+      entry, or a simplification without a result, is HIGH; a passed test
+      lets the simplification stand (cite it in the report); a failed test
+      means the mechanism is added next round.
+
+  - id: data_use
+    path: models/data_use.yaml
+    first_draft_round: 2
+    finalize_round: 3
+    stage: model
+    skill: model-validation
+    triggered_by: always
+    scope_declarable: true
+    required_for_accept: never   # optional exemption list read by scripts/data_use.py
+    description: |
+      **Data-use audit** (Phase 42 γ, D3). Every column of a processed data
+      CSV (data/ except data/raw/) must be read by code under models/, or be
+      listed here under `not_read_by_model: [{file, columns, reason}]`.
+      `scripts/data_use.py` reports unexplained unused columns, one MEDIUM per
+      file. A column the model ignores may hold variation it collapses.
+
   - id: allocation_robustness
     path: models/allocation_robustness.yaml
     first_draft_round: 3
@@ -315,6 +351,11 @@ artifacts:
       ACCEPT unless scope-declared with literature-grounded
       justification. Scope-declarable because some questions imply
       novel populations where direct benchmarks don't exist.
+      Phase 42 γ (D5): a benchmark matched by adjusting parameters lists
+      them in `tuned_parameters:` and carries `transfer: {target_covariates,
+      effect_at_target, difference_stated}`, the same effect re-computed
+      under the target setting's covariates (`scripts/benchmark_transfer.py`,
+      MEDIUM if absent).
 
   # ---- Phase 21 β additions -------------------------------------------------
 

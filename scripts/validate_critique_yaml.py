@@ -1981,6 +1981,18 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None,
     # point estimates, so a decoy fails before any harness-computed check.
     violations += G(lambda rd: _load_sibling("headline_binding").gate_findings(rd),
                     run_dir, check_name="headline_binding")
+    # Phase 42 γ D1: mechanisms a matched prior requires are modelled, fixed,
+    # or simplified with a sufficiency-test result.
+    violations += G(lambda rd: _load_sibling("mechanism_manifest").gate_findings(rd, round_n),
+                    run_dir, check_name="mechanism_manifest")
+    # Phase 42 γ D3: every processed data column is read by model code or
+    # listed as not read, with a reason.
+    violations += G(lambda rd: _load_sibling("data_use").gate_findings(rd),
+                    run_dir, check_name="data_use")
+    # Phase 42 γ D5: effects tuned to benchmarks report a transfer to the
+    # target setting's covariates.
+    violations += G(lambda rd: _load_sibling("benchmark_transfer").gate_findings(rd),
+                    run_dir, check_name="benchmark_transfer")
     # Phase 34: done_when findings computed by the caller, added before the
     # escalation so their persistence counts (Codex review).
     violations += list(extra or [])
@@ -3801,6 +3813,8 @@ def _addressed_in_resolves(run_dir: str, ref: Any) -> bool:
     `modeling_strategy.md § Pre-mortem Responses` or
     `modeling_strategy.md#pre-mortem-pm-001`. Placeholders (TODO, TBD,
     N/A, ...) and references to files that do not exist do not count."""
+    if isinstance(ref, list):     # Phase 42 γ: a list resolves when any entry does
+        return any(_addressed_in_resolves(run_dir, r) for r in ref)
     if not isinstance(ref, str) or ref.strip().upper() in _PLACEHOLDER_REFS:
         return False
     m = re.match(r"^\s*([^§#:]+?)\s*(?:(§|#|:)\s*(.*))?$", ref)
@@ -3834,6 +3848,92 @@ def _addressed_in_resolves(run_dir: str, ref: Any) -> bool:
         or want in _slug(text)
 
 
+# ---------------------------------------------------------------------------
+# Phase 42 γ — D2 severity floor from priors, D4 evidence for "addressed"
+# ---------------------------------------------------------------------------
+_SEV_RANK = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+# A suggested check that asks for a sensitivity / robustness analysis. Narrow on
+# purpose: a bare "sensitivity" (e.g. a named scenario) does not count.
+_SUGGESTS_SENSITIVITY = re.compile(
+    r"\bsensitivity\s+(?:analys[ie]s|runs?|checks?|tests?|sweeps?|scenarios?)\b"
+    r"|\bone-way\s+sensitivity\b|\bsufficiency\s+test\b|\bscenario\s+analys[ie]s\b"
+    r"|\b(?:run|add|do|perform|include)\b[^.;]{0,30}\bsensitivit(?:y|ies)\b"
+    r"|\brobust(?:ness)?\s+(?:to|check|test|analys[ie]s)\b|\bplausible\s+range\b|\btornado\b"
+    r"|\bvar(?:y|ied|ying)\b[^.;]{0,80}\b(?:range|bounds?|between)\b", re.I)
+# A suggested check that asks for data to be used: a use-verb near a data file,
+# column or dataset, or a pointer saying the data file is available.
+_SUGGESTS_DATA_USE = re.compile(
+    r"\b(?:use|uses|using|read|reads|incorporate|include|load|ingest|join|merge|stratify|disaggregate)\b"
+    r"[^.;]{0,80}(?:\bdata/[\w./-]+|[\w./-]+\.(?:csv|parquet|xlsx)\b|\bcolumns?\b|\bdataset\b|\bdata\s+file\b)"
+    r"|[\w./-]+\.(?:csv|parquet|xlsx)\b[^.;]{0,20}\b(?:is|are)\s+(?:in|available|under)\b", re.I)
+_PROSE_EXT = (".md", ".markdown", ".txt", ".rst", ".html", ".htm", ".tex", ".docx", ".doc")
+_CODE_EXT = (".py", ".ipynb", ".r", ".jl", ".sh")
+# Run bookkeeping is not evidence that a check ran (a scope declaration closes a
+# concern only through its structured entry).
+_BOOKKEEPING_RE = re.compile(
+    r"^(?:pre_mortem|scope_declaration|success_criteria|threads|pipeline_state|round_plan|status|metadata"
+    r"|decision_brief|brief_amendments|data_use|mechanism_manifest)\.(?:ya?ml|json)$"
+    r"|^(?:critique_|fix_check_|validator_history|stage7_)", re.I)
+
+
+def _suggested_check_kind(concern: dict) -> str | None:
+    """'sensitivity', 'data_use' or None for a concern's suggested_check."""
+    text = concern.get("suggested_check")
+    if isinstance(text, list):
+        text = " ".join(str(x) for x in text)
+    if not isinstance(text, str) or not text.strip():
+        return None
+    if _SUGGESTS_SENSITIVITY.search(text):
+        return "sensitivity"
+    if _SUGGESTS_DATA_USE.search(text):
+        return "data_use"
+    return None
+
+
+def _evidence_artifacts(run_dir: str, ref: Any, allow_code: bool) -> list[str]:
+    """Existing, non-empty, non-prose files inside run_dir that `addressed_in`
+    names (a string or a list; `path § section`, `path::name`, `path#x` ok)."""
+    refs = ref if isinstance(ref, list) else [ref]
+    root = os.path.realpath(run_dir)
+    out = []
+    for r in refs:
+        if not isinstance(r, str):
+            continue
+        for tok in re.split(r"[\s;,]+", r):
+            tok = tok.strip("`'\"()[]<>")
+            tok = re.split(r"::|#|§", tok)[0].rstrip(":.")
+            if "." not in os.path.basename(tok):
+                continue
+            ext = os.path.splitext(tok)[1].lower()
+            if ext in _PROSE_EXT or (ext in _CODE_EXT and not allow_code):
+                continue
+            p = os.path.realpath(os.path.join(root, tok))
+            if p.startswith(root + os.sep) and os.path.isfile(p) and os.path.getsize(p) > 0 \
+                    and not _BOOKKEEPING_RE.match(os.path.basename(p)):
+                out.append(os.path.relpath(p, root))
+    return out
+
+
+def _prior_severity_floors(concerns: list) -> tuple[dict, str | None]:
+    """{index: (floor_severity, [prior ids])} for concerns citing a registry
+    prior (`expert_prior:<id>` or prior_id[s]); error when the registry fails."""
+    from lib import expert_priors as _ep
+    try:
+        priors = {p.id: p for p in _ep.load_priors()}
+    except (OSError, ValueError) as e:
+        return {}, str(e)
+    floors = {}
+    for i, c in enumerate(concerns):
+        if not isinstance(c, dict):
+            continue
+        ids = sorted(_ep.cited_prior_ids(c, set(priors)))
+        if not ids:
+            continue
+        top = max((priors[i_].severity_if_unaddressed for i_ in ids), key=lambda x: _SEV_RANK.get(x, 1))
+        floors[i] = (top, [i_ for i_ in ids if priors[i_].severity_if_unaddressed == top])
+    return floors, None
+
+
 def _check_premortem_addressed(run_dir: str,
                                 round_n: int | None = None
                                 ) -> list[dict]:
@@ -3843,6 +3943,14 @@ def _check_premortem_addressed(run_dir: str,
       pre_mortem_missing                MEDIUM @ r=1 (drafting), HIGH @ r≥2
       pre_mortem_invalid                HIGH (yaml MALFORMED)
       pre_mortem_high_unaddressed       MEDIUM @ r=1, HIGH @ r≥2 (per concern)
+      pre_mortem_severity_below_prior   MEDIUM (Phase 42 γ D2): a concern citing a
+                                        prior is graded below the prior; it is
+                                        treated at the prior's severity
+      pre_mortem_closed_without_evidence (Phase 42 γ D4) a concern whose
+                                        suggested_check asks for a sensitivity
+                                        analysis or a data use, closed without an
+                                        existing artifact path: HIGH concerns as
+                                        above, others MEDIUM
 
     Round gating: returns [] when round_n is None (caller has not
     supplied a round; defer). At round_n=1, missing-artifact and
@@ -3903,14 +4011,54 @@ def _check_premortem_addressed(run_dir: str,
             declared_ids.add(str(e["id"]))
 
     severity = "HIGH" if round_n >= _PRE_MORTEM_REQUIRED_FROM_ROUND else "MEDIUM"
-    for c in concerns:
+    # Phase 42 γ (D2): a concern citing a prior is graded at least at the
+    # prior's severity (so the check the prior asks for is required).
+    floors, prior_err = _prior_severity_floors(concerns)
+    if prior_err:
+        out.append({"kind": "pre_mortem_priors_unavailable", "severity": "MEDIUM", "stage": "PRE_MODEL",
+                    "claim": f"The expert-priors registry cannot be loaded ({prior_err[:200]}), so pre-mortem "
+                             "severities cannot be checked against their priors."})
+    for idx, c in enumerate(concerns):
         if not isinstance(c, dict):
             continue
-        # Phase 21 β: CRITICAL (and any unknown severity) is at least HIGH.
-        if str(c.get("severity", "")).strip().upper() in ("MEDIUM", "LOW"):
-            continue
         cid = c.get("id") or "PM-???"
-        if _addressed_in_resolves(run_dir, c.get("addressed_in")):
+        graded = str(c.get("severity", "")).strip().upper()
+        effective = graded
+        if idx in floors:
+            floor, pids = floors[idx]
+            if _SEV_RANK.get(graded, 2) < _SEV_RANK.get(floor, 1):
+                effective = floor
+                out.append({
+                    "kind": "pre_mortem_severity_below_prior", "severity": "MEDIUM", "stage": "PRE_MODEL",
+                    "scope_declarable": False,
+                    "claim": (f"Pre-mortem concern {cid} is graded {graded or '(none)'} but cites prior(s) "
+                              f"{', '.join(pids)} with severity {floor}. A concern that matches a prior cannot "
+                              f"be graded below it; {cid} is treated as {floor}, so the check it suggests is "
+                              "required."),
+                })
+        # D4: a concern whose suggested check is a sensitivity analysis or a
+        # data use is closed only by an existing artifact, at any severity.
+        check_kind = _suggested_check_kind(c)
+        # Phase 21 β: CRITICAL (and any unknown severity) is at least HIGH.
+        is_high = effective not in ("MEDIUM", "LOW")
+        resolves = _addressed_in_resolves(run_dir, c.get("addressed_in"))
+        if check_kind and cid not in declared_ids and (resolves or not is_high) and not \
+                _evidence_artifacts(run_dir, c.get("addressed_in"), allow_code=check_kind == "data_use"):
+            want = ("a results artifact (YAML/JSON/CSV/figure) from the sensitivity analysis"
+                    if check_kind == "sensitivity" else
+                    "the model code that reads the data, or a results artifact that uses it")
+            out.append({
+                "kind": "pre_mortem_closed_without_evidence",
+                "severity": severity if is_high else "MEDIUM", "stage": "PRE_MODEL",
+                "claim": (f"Pre-mortem concern {cid} ({effective or 'ungraded'}) suggests a "
+                          f"{'sensitivity analysis' if check_kind == 'sensitivity' else 'data use'}, and "
+                          f"`addressed_in: {c.get('addressed_in')!r}` names no existing artifact; prose does not "
+                          f"close it. Run the check and add {want} to `addressed_in` (a list is accepted), or "
+                          f"scope-declare {cid} with a justification."),
+            })
+        if not is_high:
+            continue
+        if resolves:
             continue
         if cid in declared_ids:
             continue
@@ -7927,6 +8075,82 @@ def _run_self_test() -> int:
         ok(any(x["kind"] == "pre_mortem_invalid"
                and x["severity"] == "HIGH" for x in v),
            f"PM6: malformed concerns: should fire HIGH pre_mortem_invalid, got {v}")
+
+    # --- Phase 42 γ: D2 severity floor, D4 evidence for "addressed" (PF-prefix) ---
+    from lib import expert_priors as _ep42
+    _saved_cache = _ep42._cache
+    _ep42._cache = [_ep42._from_dict({
+        "id": "fixture_high_prior", "kind": "methodological_standard",
+        "severity_if_unaddressed": "HIGH", "claim": "c", "rationale": "r",
+        "applies_when": {"keywords_any": ["widget"], "domain_any": []}})]
+    try:
+        with _tempfile.TemporaryDirectory() as _d:
+            with open(os.path.join(_d, "modeling_strategy.md"), "w") as f:
+                f.write("# S\n\n## PM-001\n\nUnchanged; the assumption is fine.\n")
+
+            def _pm42(**kw):
+                c = {"id": "PM-001", "severity": "LOW", "concern": "Subgroup mix collapsed.",
+                     "suggested_check": "Confirm the result is robust to a plausible range of the mix.",
+                     "addressed_in": "modeling_strategy.md § PM-001"}
+                c.update(kw)
+                with open(os.path.join(_d, "pre_mortem.yaml"), "w") as f:
+                    yaml.safe_dump({"concerns": [c]}, f)
+                return _check_premortem_addressed(_d, round_n=2)
+
+            v = _pm42()
+            ok([x["kind"] for x in v] == ["pre_mortem_closed_without_evidence"] and v[0]["severity"] == "MEDIUM",
+               f"PF1: a LOW concern suggesting a sensitivity check, closed by prose, stays open (MEDIUM), got {v}")
+            v = _pm42(evidence_files=["plan.md", "expert_prior:fixture_high_prior"])
+            ok(sorted(x["kind"] for x in v) == ["pre_mortem_closed_without_evidence",
+                                                "pre_mortem_severity_below_prior"]
+               and any(x["kind"] == "pre_mortem_closed_without_evidence" and x["severity"] == "HIGH" for x in v),
+               f"PF2: a concern citing a HIGH prior is floored to HIGH, so its prose closure is HIGH, got {v}")
+            v = _pm42(evidence_files=["expert_prior:fixture_high_prior"], addressed_in=None)
+            ok("pre_mortem_high_unaddressed" in [x["kind"] for x in v],
+               f"PF3: a floored LOW concern with no addressed_in is a HIGH unaddressed concern, got {v}")
+            os.makedirs(os.path.join(_d, "models"))
+            with open(os.path.join(_d, "models", "mix_sensitivity.yaml"), "w") as f:
+                f.write("varied: mix 0.1-0.9\ndecision_changes: false\n")
+            v = _pm42(evidence_files=["expert_prior:fixture_high_prior"], severity="HIGH",
+                      addressed_in=["modeling_strategy.md § PM-001", "models/mix_sensitivity.yaml"])
+            ok(v == [], f"PF4: an existing results artifact closes it (list addressed_in), got {v}")
+            v = _pm42(addressed_in="modeling_strategy.md § PM-001; models/mix_sensitivity.yaml")
+            ok(v == [], f"PF4b: an artifact named in a string addressed_in closes it, got {v}")
+            v = _pm42(addressed_in="models/missing_sensitivity.yaml")
+            ok([x["kind"] for x in v] == ["pre_mortem_closed_without_evidence"],
+               f"PF5: a path that does not exist does not close it, got {v}")
+            with open(os.path.join(_d, "scope_declaration.yaml"), "w") as f:
+                f.write("notes: PM-001 deferred\n")
+            v = _pm42(addressed_in="modeling_strategy.md § PM-001; scope_declaration.yaml SD-001")
+            ok([x["kind"] for x in v] == ["pre_mortem_closed_without_evidence"],
+               f"PF5b: run bookkeeping (scope_declaration.yaml) is not evidence, got {v}")
+            os.remove(os.path.join(_d, "scope_declaration.yaml"))
+            with open(os.path.join(_d, "models", "model.py"), "w") as f:
+                f.write("def f(r):\n    return r['mix_a']\n")
+            v = _pm42(suggested_check="Use the mix columns in data/processed/units.csv per unit.",
+                      addressed_in="models/model.py::f")
+            ok(v == [], f"PF6: a data-use check may be closed by the model code that reads the data, got {v}")
+            v = _pm42(addressed_in="models/model.py::f")
+            ok([x["kind"] for x in v] == ["pre_mortem_closed_without_evidence"],
+               f"PF7: a sensitivity check is not closed by code alone, got {v}")
+            v = _pm42(suggested_check="Keep the named sensitivity as signed; document the comparator.")
+            ok(v == [], f"PF8: a bare 'sensitivity' is not a request for a sensitivity analysis, got {v}")
+            v = _pm42(severity="MEDIUM", evidence_files=["expert_prior:unknown_prior_id"],
+                      suggested_check="Document the comparator.")
+            ok(v == [], f"PF9: an unknown prior id sets no floor, got {v}")
+            with open(os.path.join(_d, "scope_declaration.yaml"), "w") as f:
+                yaml.safe_dump({"declarations": [{"blocker_id": "PM-001",
+                                                  "justification": "The mix is out of scope for this question."}]}, f)
+            v = _pm42()
+            ok(not any(x["kind"] == "pre_mortem_closed_without_evidence" for x in v),
+               f"PF10: a structured scope declaration closes it, got {v}")
+    finally:
+        _ep42._cache = _saved_cache
+    # PF11: the three Phase 42 γ check modules are wired into the gate.
+    import inspect as _inspect42
+    _src42 = _inspect42.getsource(_check_rigor_artifacts)
+    ok(all(f'_load_sibling("{m}")' in _src42 for m in ("mechanism_manifest", "data_use", "benchmark_transfer")),
+       "PF11: mechanism_manifest, data_use and benchmark_transfer must run in _check_rigor_artifacts")
 
     # --- Phase 17 β: coherence_audit integration tests (CA-prefix) ---
     with _tempfile.TemporaryDirectory() as _d:
