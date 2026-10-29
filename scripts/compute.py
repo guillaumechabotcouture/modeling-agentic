@@ -413,7 +413,7 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
                     toks[pid] = _pid_start(pid)
                 _note(progress, [{"n": 1, "started": t, "cores": 1} for _, t in running.values()]
                       + ([] if complete else [{"n": 1, "started": now, "cores": 1}] * k),
-                      extra_core_s=init_core_s(), pids=[[p_, t_] for p_, t_ in toks.items()],
+                      extra_core_s=init_core_s() + progress.get("unreturned_s", 0.0), pids=[[p_, t_] for p_, t_ in toks.items()],
                       pids_complete=complete)
             # Recorded before submitting, so a caller killed right after is charged for these
             # too; the pool may start processes for them, so their pids are not yet known.
@@ -448,6 +448,8 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
                     except Exception as e:  # noqa: BLE001 — e.g. an unpicklable result fails only its row
                         running.pop(f)
                         lost += 1
+                        if progress.get("_file"):      # its time, in case this call never returns normally
+                            progress["unreturned_s"] = progress.get("unreturned_s", 0.0) + time.time() - t_sub
                         rows.append({"i": item[0], "ok": False, "kind": INFRA,
                                      "error": f"chunk failed: {type(e).__name__}: {e}"[:500]})
                         continue
@@ -518,13 +520,14 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
         pids |= live
         # Phase 42 α: if this call is being interrupted, what it used is known:
         # rows finished, model loads, and the inputs in flight (killed now).
-        t_end = time.time()
-        extra = sum(t_end - t for _, t in running.values()) + init_core_s()
+        in_flight = list(running.values())
         if running:
             _kill_groups(live)
             _kill_groups(pids - live, grace_s=0, direct=False)
         ex.shutdown(wait=True, cancel_futures=True)
         _kill_groups(pids, grace_s=0, direct=False)   # leftovers the model spawned (pool already reaped)
+        t_end = time.time()                           # after the stop: its grace period counts
+        extra = sum(t_end - t for _, t in in_flight) + init_core_s() + progress.get("unreturned_s", 0.0)
         progress.update(settled=True, settled_extra_s=extra)
     # Model load time of every pool process (a process still loading when it
     # was killed is covered by the unfinished-chunk estimate).
@@ -1092,7 +1095,8 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                     except Exception:  # noqa: BLE001 — unknown: bounded below
                         got_s = None
                 busy = (t_end - started.get(f, t0_call)) * cores_per_slot
-                extra += got_s if got_s is not None else (min(held[f], busy) if held[f] else busy)
+                cap_f = held[f] + cores_per_slot * SHARE_STOP_GRACE_S if held[f] else None
+                extra += got_s if got_s is not None else (min(cap_f, busy) if cap_f else busy)
             progress.update(settled=True, settled_extra_s=extra)
             # The scheduler silently reruns tasks from a worker that died; that
             # attempt's work is invisible here, so a vanished worker is charged
@@ -1225,7 +1229,8 @@ def _pid_alive(pid, start: str | None = None) -> bool:
     return True
 
 
-PROGRESS_DIR = ".compute_progress"    # under the run dir, outside models/ and data/ (not fingerprinted or bundled)
+SHARE_STOP_GRACE_S = 15.0            # a chunk's overrun past its share while it is stopped (grace periods)
+PROGRESS_DIR = ".compute_progress"   # under the run dir, outside models/ and data/ (not fingerprinted or bundled)
 
 
 def _note(progress: dict, out: list, extra_core_s: float = 0.0, **more) -> None:
@@ -1251,8 +1256,19 @@ def _note(progress: dict, out: list, extra_core_s: float = 0.0, **more) -> None:
         progress["_file"] = None
         try:
             os.remove(path)
-        except OSError:
+        except FileNotFoundError:
             pass
+        except OSError:
+            # A stale record left readable would settle a dead caller for too
+            # little: make its reservation drop the record, or stop the batch.
+            inval = progress.get("_invalidate")
+            try:
+                if not inval:
+                    raise RuntimeError("no ledger hook")
+                inval()
+            except Exception as e:  # noqa: BLE001
+                raise RuntimeError(f"compute progress record {path} can be neither updated nor removed "
+                                   f"({type(e).__name__}); stopping the batch") from e
 
 
 def _task_seen(progress: dict, n: int, core_s: float) -> None:
@@ -1298,7 +1314,7 @@ def _settle_dead(led, r, now=None) -> tuple[float, str, dict]:
     held = float(r.get("core_s") or 0)
     path = r.get("progress")
     if not path:
-        return held, "caller died; no progress record (reserved before Phase 42); charged its reservation", {}
+        return held, "caller died; no progress record (reserved before Phase 42, or it could not be kept); charged its reservation", {}
     try:
         p = json.load(open(path))
         done = float(p["core_s"])
@@ -1314,7 +1330,8 @@ def _settle_dead(led, r, now=None) -> tuple[float, str, dict]:
     try:
         for c in out:
             cores, started = float(c.get("cores") or 1), float(c["started"])
-            share = float(c["share"]) if c.get("share") else None
+            # A chunk stops at its share, plus the grace its stop allows (SIGTERM, then SIGKILL).
+            share = float(c["share"]) + cores * SHARE_STOP_GRACE_S if c.get("share") else None
             if stopped:
                 bound += min(cores * max(0.0, now - started), share if share is not None else float("inf"))
             elif share is not None:
@@ -1333,6 +1350,47 @@ def _settle_dead(led, r, now=None) -> tuple[float, str, dict]:
                          "reserved_core_s": round(held, 1)}
 
 
+def _group_live(pgid: int) -> bool:
+    """Does process group `pgid` have a member that is not defunct? Unknown counts as yes."""
+    try:
+        os.killpg(int(pgid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass                                      # macOS: also a group of zombies only; look at its members
+    except (OSError, ValueError):
+        return True
+    try:
+        import psutil
+        for pr in psutil.process_iter():
+            try:
+                if os.getpgid(pr.pid) != pgid:
+                    continue
+            except OSError:
+                continue                          # gone
+            try:
+                if pr.status() != psutil.STATUS_ZOMBIE:
+                    return True
+            except (psutil.ZombieProcess, psutil.NoSuchProcess):
+                continue
+            except psutil.Error:
+                return True                       # cannot tell: live
+        return False
+    except ImportError:
+        pass
+    import subprocess
+    try:
+        lines = subprocess.run(["ps", "-A", "-o", "pgid=,stat="], capture_output=True, text=True,
+                               timeout=10).stdout.splitlines()
+    except (OSError, subprocess.SubprocessError):
+        return True
+    for ln in lines:
+        parts = ln.split()
+        if len(parts) >= 2 and parts[0] == str(pgid) and not parts[1].startswith("Z"):
+            return True
+    return False
+
+
 def _stop_orphans(p: dict, backend: str | None) -> tuple[bool, str]:
     """Stop the work a dead caller left in flight. Local: kill its pool
     processes still alive (same start token). Dask: cancel its call on the
@@ -1340,18 +1398,26 @@ def _stop_orphans(p: dict, backend: str | None) -> tuple[bool, str]:
     if backend == "local" or p.get("pids") is not None:
         if not p.get("pids_complete"):
             return False, "killed while starting pool processes (pids not recorded)"
+        # Each local pool process leads its own group, and what the model starts
+        # joins it: the group is stopped even when its leader has already exited.
+        # A pid cannot be reused while its group exists, so a pid now held by a
+        # different process (other start token) means the group is gone.
         left = []
         for pid, tok in p.get("pids") or []:
-            if _pid_alive(pid, tok):
-                _killpg(int(pid), 9, direct=True)
-                left.append(int(pid))
+            pid = int(pid)
+            cur = _pid_start(pid)
+            if tok and cur and cur.split(":")[0] == tok.split(":")[0] and cur != tok:
+                continue
+            if _pid_alive(pid, tok) or _group_live(pid):
+                _killpg(pid, 9, direct=_pid_alive(pid, tok))
+                left.append(pid)
         end = time.time() + 5
         while left and time.time() < end:
-            left = [x for x in left if _pid_alive(x)]
+            left = [x for x in left if _group_live(x) or _pid_alive(x)]
             if left:
                 time.sleep(0.05)
         if left:
-            return False, f"pool processes {left} still alive"
+            return False, f"pool process groups {left} still alive"
         return True, "pool processes stopped"
     call_id, addr = p.get("call_id"), os.environ.get("MA_COMPUTE_SCHEDULER")
     if not call_id or not addr:
@@ -1464,6 +1530,12 @@ def map_fn(run_dir: str, fn_spec: str, inputs: list, backend: str = "auto",
             # Phase 35: the last measured peak memory of this function starts the
             # call at a concurrency that fits, instead of rediscovering it by crashing.
             hint = ((led.get("mem_profile") or {}).get(fn_spec) or {}).get("peak_mb")
+    if rid:
+        def _invalidate():
+            with _LedgerLock(run_dir) as led:
+                if rid in led["reservations"]:
+                    led["reservations"][rid]["progress"] = None      # settles in full if this caller dies
+        progress["_invalidate"] = _invalidate
     t0 = time.time()
     deadline = t0 + timeout_s if timeout_s else None
     try:
@@ -2372,7 +2444,7 @@ def _self_test_p42(ok) -> None:
         os.environ.pop("MA_COMPUTE_SCHEDULER", None)
         charge, why, parts = _settle_dead(hist, {"core_s": 9000.0, "progress": pf, "fn": "f", "backend": "dask"},
                                           now=now)
-        ok(abs(charge - 5120.0) < 1e-6 and "no scheduler" in why and parts.get("inflight_estimate_core_s") == 36.0,
+        ok(abs(charge - 5240.0) < 1e-6 and "no scheduler" in why and parts.get("inflight_estimate_core_s") == 36.0,
            f"P42-3 unconfirmed remote chunks are charged their shares, the task-time estimate is only recorded: "
            f"{charge} ({why}) {parts}")
         # P42-3b a dead local caller's leftover pool process is killed, then bounded by its time out.
