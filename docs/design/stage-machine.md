@@ -234,11 +234,11 @@ Each step ships as its own PR. Each is checked on a replay or a short real run a
 - **Many small tasks lose the big picture.** Mitigation: the fix planner sees the whole backlog, and a full critique runs after each loop.
 - **Pipeline runs get slow.** Mitigations: incremental rebuilds, the compute service for heavy steps, and `--scratch` for the agent's own iteration.
 
-## 6. Decisions for you
+## 6. Decisions (recorded 2026-10-29)
 
-1. **Fix-loop granularity:** strictly one finding per task, or allow a small group of findings in the same files? Proposed: one by default; the planner may group findings that share files.
-2. **Lead model:** does the fix planner stay on the top model? Proposed: yes. It is short and decision-heavy; the savings come from dropping orchestration context.
-3. **Owned outputs:** may agents ever write pipeline outputs directly, for example in an emergency? Proposed: no. They use `--scratch`, then the harness run.
-4. **Where to start:** S1 (pipeline runner) or S3 (fix loop with the impact ledger)? Proposed: S1, because S3 needs a harness-run rebuild to measure anything.
-5. **Promotion review:** who approves moving a run's `models/ext/` code into the toolkit? Proposed: an agent drafts the promotion PR with tests after each run, and you approve it, like any other PR.
-6. **First template:** "budget allocation across units". Proposed: yes; E7 has two real instances of it to extract from and test against.
+1. **Fix-loop granularity:** one finding per task by default; the planner may group findings that share files. *Decided by the owner, as proposed.*
+2. **Lead model:** the fix planner stays on the top model; the savings come from dropping orchestration context. *Decided by the owner, as proposed.*
+3. **Owned outputs:** agents never write pipeline outputs directly; they use `--scratch`, then the harness build. *Decided and implemented (#43, #48).*
+4. **Where to start:** S1 first. *Decided; S1 merged (#43, review fixes #48).*
+5. **Promotion review:** an agent drafts the promotion PR with tests after each run, and the owner approves it like any other PR. *Decided; planned as workstream E4 in `improvement-plan.md`.*
+6. **First template:** budget allocation across units. *Decided; `toolkit/alloc` (costs, packages, optimizer) merged (#38, #40, #41) and used by the modeler since #50.*
