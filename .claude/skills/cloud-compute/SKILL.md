@@ -42,6 +42,14 @@ python3 scripts/compute.py map {run_dir} --fn models/<module>.py::<fn> \
   lower concurrency. An input that kills its process even when run alone
   fails as a model error. The same model error repeating stops the batch
   early. `MA_COMPUTE_PROCS_PER_WORKER` remains as an upper limit, rarely needed.
+- **Long batches: `--detach`, then `wait`.** A batch that may run longer
+  than a few minutes should be started with `--detach`: it returns at once
+  and the batch runs in its own session, so a tool timeout cannot kill it.
+  Follow it with `python3 scripts/compute.py wait <out> --timeout-s 540`,
+  repeated while it exits 3 (still running); 0 finished, 1 finished with
+  failed rows, 4 died (rerun the same command). `status <out>` checks once.
+  A killed batch is charged for the work it did, and its finished rows are
+  kept for the rerun.
 - **Completing a batch:** rerun the same command. Rows already computed with
   the same code, data and params are kept; only missing or failed rows run
   (`--fresh` recomputes everything). No retry or merge scripts.
