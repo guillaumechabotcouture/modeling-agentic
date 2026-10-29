@@ -183,13 +183,16 @@ def uq_runs_by_round(run_dir: str) -> dict:
         if m and not _NOT_A_RUN.search(g):
             gates.append((i, int(m.group(1))))
     source = "trace"
-    if not gates:
+    hist = []
+    for r in _jsonl(os.path.join(run_dir, "validator_history.jsonl")):
+        t = _epoch(r.get("at"))
+        if not r.get("post_write") and isinstance(r.get("round"), int) and t is not None:
+            hist.append((t, r["round"]))
+    # The trace's gate runs are used only when they cover every round the gate recorded
+    # (Codex review: a trace spanning the Phase 42 change has some gate rounds cut off).
+    if not gates or not {rnd for _t, rnd in hist} <= {rnd for _i, rnd in gates}:
         source = "validator_history"
-        for r in _jsonl(os.path.join(run_dir, "validator_history.jsonl")):
-            t = _epoch(r.get("at"))
-            if not r.get("post_write") and isinstance(r.get("round"), int) and t is not None:
-                gates.append((t, r["round"]))
-        gates.sort()
+        gates = sorted(hist)
         uq = [(t, t) for _i, t in uq if t is not None]
     by = collections.Counter()
     for pos, _t in uq:
@@ -369,6 +372,13 @@ def _self_test() -> int:
         ok(r3["uq_runs_by_round"] == {1: 1, 2: 1, "after": 1} and r3["uq_rounds_from"] == "validator_history"
            and "(rounds from validator_history)" in render(r3),
            f"CV13 an old trace is binned by validator-history times; a grep is not a run: {r3['uq_runs_by_round']}")
+        with open(os.path.join(d, "trace.jsonl"), "a") as f:   # a recorded gate run for round 1 only
+            f.write(json.dumps({"type": "tool_use", "tool": "Bash", "ts": "2026-10-21T13:30:00+00:00",
+                                "scripts_run": ["validate_critique_yaml.py"],
+                                "command": "python3 scripts/validate_critique_yaml.py runs/x --current-round 1"}) + "\n")
+        r4 = report(d)
+        ok(r4["uq_runs_by_round"] == r3["uq_runs_by_round"] and r4["uq_rounds_from"] == "validator_history",
+           f"CV14 (Codex) trace gate runs that miss a recorded round are not used: {r4['uq_runs_by_round']}")
     if fails:
         print("SELF-TEST FAILURES:")
         for f in fails:
