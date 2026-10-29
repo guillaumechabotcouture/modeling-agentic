@@ -9052,6 +9052,20 @@ def _run_self_test() -> int:
                        "methods_critic": True}, f)
         rc, out = _cli(d, 1)
         ok(rc == 3, f"EM2: methods on + no methods YAML must be a schema error, got {rc}")
+        with open(os.path.join(d, "metadata.json"), "w") as f:
+            json.dump({"question": "Estimate the impact of a campaign."}, f)
+        # EP1: a draft with no presentation critique is a MEDIUM finding, not a schema error.
+        os.remove(os.path.join(d, FILENAMES["critique-presentation"]))
+        with open(os.path.join(d, "manuscript.md"), "w") as f:
+            f.write("# Draft\n")
+        rc, out = _cli(d, 1)
+        ok(rc != 3 and "critique_presentation_missing" in json.dumps(out),
+           f"EP1: draft + no presentation YAML → MEDIUM critique_presentation_missing, not exit 3; "
+           f"got {rc} {str(out)[:300]}")
+        os.remove(os.path.join(d, "manuscript.md"))
+        rc, out = _cli(d, 1)
+        ok(rc != 3 and "critique_presentation_missing" not in json.dumps(out),
+           f"EP2: before a draft, no presentation YAML is expected and silent; got {rc}")
         _fixture(d, 8)
         rc, out = _cli(d, 8)
         ok(out.get("action") == "RUN_FAILED",
@@ -9508,6 +9522,7 @@ def main() -> int:
     # ancient history; missing red-team today is a real signal that
     # the lead skipped one of its mandatory STAGE 6 critiques.
     critique_redteam_missing = False
+    critique_presentation_missing = False
     for reviewer in REVIEWERS:
         path = os.path.join(args.run_dir, FILENAMES[reviewer])
         if reviewer == "critique-redteam" and not os.path.exists(path):
@@ -9519,6 +9534,12 @@ def main() -> int:
         if reviewer == "critique-presentation" and not any(
                 os.path.exists(os.path.join(args.run_dir, f)) for f in ("report.md", "manuscript.md")):
             continue   # Phase 39 α: the presentation critic reviews the first draft, not each round
+        if reviewer == "critique-presentation" and not os.path.exists(path):
+            # A draft exists but the presentation critic has not reviewed it yet: the
+            # harness's own final write-up (round, budget or session limit) drafts after
+            # the last critique round. A finding, not a schema error that stops the gate.
+            critique_presentation_missing = True
+            continue
         try:
             critiques[reviewer] = validate_critique(path, reviewer,
                                                     args.current_round)
@@ -9624,6 +9645,19 @@ def main() -> int:
                     f"into this MEDIUM blocker. If this is a legacy "
                     f"resume from before red-team existed, scope-declare "
                     f"in the next round; otherwise re-spawn red-team."
+                ),
+            })
+        if critique_presentation_missing:
+            rigor_violations.append({
+                "kind": "critique_presentation_missing",
+                "severity": "MEDIUM",
+                "stage": "WRITE",
+                "target_stage": "WRITE",
+                "scope_declarable": True,
+                "claim": (
+                    "A draft exists but critique_presentation.yaml does not: the presentation "
+                    "critic has not reviewed it. When the run ends through the harness's final "
+                    "write-up this is expected; otherwise spawn critique-presentation on the draft."
                 ),
             })
         rigor_violations.extend(crossmodel_violations)
