@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Phase 21 γ — Markdown helpers shared by writer_qa.py.
+"""Phase 21 γ — Markdown helpers shared by writer_qa.py and the gate.
 
 `writer_qa.py` used to exec the entire 7,000-line
 validate_critique_yaml.py just to borrow these three helpers. They are
-pure functions over text, so they live here; the validator's copies
-are verbatim (see validate_critique_yaml.py `_extract_last_numeric`,
-`_parse_md_tables`, `_strip_limitations_and_scope`) and can import
-from here instead.
+pure functions over text, so they live here; since Phase 43 γ the
+validator imports them (and `_HORIZON_RE`) from here instead of
+keeping its own copies.
 """
 
 from __future__ import annotations

@@ -146,7 +146,8 @@ Before opening a PR, every command below must report
 ```bash
 for f in main.py \
   scripts/alloc_toolkit_use.py scripts/allocation_robustness.py scripts/benchmark_match.py \
-  scripts/build_claims_ledger.py scripts/data_schema.py \
+  scripts/benchmark_transfer.py \
+  scripts/build_claims_ledger.py scripts/data_schema.py scripts/data_use.py \
   scripts/cloud_batch.py scripts/coherence_audit.py \
   scripts/compare_models.py scripts/compute.py scripts/convergence_report.py \
   scripts/cross_model_critic.py scripts/decision_brief.py scripts/derived_rebuild.py scripts/done_when.py \
@@ -154,7 +155,8 @@ for f in main.py \
   scripts/effect_concordance.py \
   scripts/effort_floors.py scripts/eligibility_probe.py \
   scripts/figure_validator.py scripts/headline_binding.py scripts/identifiability.py \
-  scripts/identifiability_a_priori.py scripts/lessons.py \
+  scripts/identifiability_a_priori.py scripts/lessons.py scripts/mechanism_manifest.py \
+  scripts/calibration_spec.py \
   scripts/numeric_consistency.py scripts/open_problems.py scripts/pipeline.py \
   scripts/optimization_quality.py scripts/plan_criteria.py \
   scripts/propagate_uncertainty.py scripts/render_claims.py \

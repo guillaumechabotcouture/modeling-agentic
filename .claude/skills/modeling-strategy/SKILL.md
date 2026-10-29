@@ -12,6 +12,39 @@ description: >-
 
 # Modeling Strategy: Principled Complexity Management
 
+## 0. Method Fit Before Tool (decision brief `method_assessment`)
+
+Start from the question, not from the tool the question names (adapted from
+stisim.ai's `analysis-selector`). The planner records this in
+`decision_brief.yaml`; the brief validator checks it.
+
+| `objective` | The question asks to ... | Likely method |
+|---|---|---|
+| `description` | describe or estimate the current situation | descriptive statistics, survey analysis |
+| `association` | find what predicts an outcome | statistics or machine learning |
+| `structure` | find groups or structure in data | clustering, latent-variable models |
+| `causal` | estimate the effect of a past intervention from data | causal inference, study design |
+| `forecasting` | forecast what happens next | time series, unless the mechanism matters |
+| `dynamic_mechanistic` | project how interventions change transmission over time | transmission model |
+
+A compound question lists more than one objective. For a dynamic mechanistic
+question, compartmental is enough unless the answer depends on one of these
+(`abm_criteria`, each `yes: <why>` or `no: <why>`):
+
+- `individual_heterogeneity`: differences attached to the same person over time
+- `correlated_characteristics`: combinations too many for compartments
+- `path_dependence`: what happens next depends on that person's history
+- `explicit_networks`: who is in contact with whom, not average mixing
+- `individual_targeting`: interventions targeted by individual characteristics
+- `emergent_effects`: population effects that emerge from individual interactions
+
+"The system is complicated" is not a reason for agents; the criteria plus
+enough data to parameterise them are. If the requested framework does not
+fit (wrong objective, or a model type the criteria do not support), set
+`verdict: does_not_fit`, name the `alternative`, and ask the owner in an open
+question (`owner_question`). The owner decides; a recommendation against
+the tool is a useful result, not a failure.
+
 ## 1. Purpose-Driven Model Selection
 
 The model's purpose determines its appropriate complexity. Not every question

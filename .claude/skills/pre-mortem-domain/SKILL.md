@@ -46,6 +46,25 @@ triggers as follows:
   **scope-declarable** — pre-mortem concerns are domain heuristics,
   not arithmetic facts; the modeler may scope-declare with
   justification in `scope_declaration.yaml`).
+- Phase 42 γ, **severity floor**: a concern that cites a prior
+  (`expert_prior:<id>` in `evidence_files`, or `prior_id:`) is treated
+  at no less than the prior's `severity_if_unaddressed`. Grading it
+  lower adds MEDIUM `pre_mortem_severity_below_prior`, and the concern
+  is gated at the prior's severity. Always cite the prior a concern
+  comes from.
+- Phase 42 γ, **evidence for "addressed"**: when a concern's
+  `suggested_check` asks for a sensitivity or robustness analysis, or
+  asks for data to be used, prose does not close it, at any severity.
+  `addressed_in` (a string or a list) must also name an existing
+  artifact: a results file (YAML / JSON / CSV, outside data/) that names
+  the concern it answers (e.g. `addresses: [PM-008]`), or for a data use,
+  the model code that reads the data. Otherwise the gate emits
+  `pre_mortem_closed_without_evidence`: HIGH for a HIGH concern at round
+  2 or later, MEDIUM otherwise. A structured scope declaration also
+  closes it.
+- When a matched prior lists `requires_mechanism`, the modeler records
+  the mechanism in `models/mechanism_manifest.yaml`
+  (`scripts/mechanism_manifest.py`; see `rigor_artifacts.yaml`).
 
 ## The artifact schema
 
@@ -79,7 +98,11 @@ concerns:
     evidence_files:
       - "plan.md:§Allocation"
     addressed_in: null        # must point at a real section heading in
-                              # modeling_strategy.md once addressed
+                              # modeling_strategy.md once addressed; for a
+                              # sensitivity / data-use check, a list that also
+                              # names the result artifact, e.g.
+                              # [modeling_strategy.md § PM-001,
+                              #  models/sens_capacity.yaml]
 
   # ... up to 8 concerns total
 
@@ -104,8 +127,9 @@ preferably each MEDIUM). For each concern:
    `modeling_strategy.md` section (e.g.,
    `"modeling_strategy.md#pre-mortem-responses-pm-001"`).
 
-The validator does not parse the prose — it only checks that
-`addressed_in` is non-null. Prose quality is the
+The validator does not parse the prose. It checks that `addressed_in`
+resolves to an existing file or section and, for a sensitivity or
+data-use check, that it names an existing artifact. Prose quality is the
 `critique-domain` agent's territory at later rounds.
 
 ## The scope-declarable rule

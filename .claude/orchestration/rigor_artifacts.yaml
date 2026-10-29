@@ -134,6 +134,29 @@ artifacts:
       Manifest with point estimates + bounds; loss function pointwise (see §3
       contract).
 
+  - id: calibration_spec
+    path: models/calibration_spec.yaml
+    first_draft_round: 1
+    finalize_round: 2
+    stage: model
+    skill: parameter-estimation
+    triggered_by: always
+    scope_declarable: false
+    required_for_accept: fitted_parameters
+    description: |
+      **Before the first fit** (Phase 43 α, B1; schema in
+      `scripts/calibration_spec.py`). Every candidate parameter gets one
+      `role` (data_informed, fixed_literature, country_specific_uncertain,
+      behavioural, tuning, scenario_assumption), `calibrated: true|false`
+      and a `reason`, including those considered and not calibrated;
+      `matches:` globs cover a group of fitted names. Every target records
+      quantity, population, age, time, units, source, uncertainty and
+      `provenance: observed|modelled_by_others`. HIGH if a fitted parameter
+      (from `models/identifiability.yaml`) is a scenario_assumption or has
+      no calibrated entry. Before widening a bound, check missing data,
+      missing mechanism, structural constraint, inconsistent targets and
+      mismatched target definition, and record them under `bound_changes`.
+
   - id: sensitivity_analysis
     path: models/sensitivity_analysis.yaml
     first_draft_round: 2
@@ -177,6 +200,48 @@ artifacts:
       allocation CSV. `scripts/headline_binding.py` evaluates outcome_fn at the
       registry point estimates; any mismatch over 0.1% is HIGH, not declarable,
       and so is an uncertainty report produced by another function or older code.
+
+  - id: mechanism_manifest
+    path: models/mechanism_manifest.yaml
+    first_draft_round: 1
+    finalize_round: 2
+    stage: model
+    skill: modeling-strategy
+    triggered_by: always
+    scope_declarable: false
+    required_for_accept: never   # required per mechanism by scripts/mechanism_manifest.py
+    description: |
+      **When a matched expert prior lists `requires_mechanism`** (Phase 42 γ,
+      D1; `mechanism_manifest.py` prints the list). Start as simple as the
+      question allows. For each listed mechanism record `modelled`
+      (`code_ref: models/<file>.py::<name>`), `fixed` (`source:`), or
+      `simplified` (`assumption:` + `sufficiency_test:` naming a result file
+      with `varied`, `criterion`, `decision_changes: true|false`). When the
+      question or signed brief itself fixes the model's form, use
+      `specified_by: question|brief` with a verbatim `quote:` instead of a test,
+      and state the limitation in the report. A missing
+      entry, or a simplification without a result, is HIGH; a passed test
+      lets the simplification stand (cite it in the report); a failed test
+      means the mechanism is added next round.
+
+  - id: data_use
+    path: models/data_use.yaml
+    first_draft_round: 2
+    finalize_round: 3
+    stage: model
+    skill: model-validation
+    triggered_by: always
+    scope_declarable: true
+    required_for_accept: never   # optional exemption list read by scripts/data_use.py
+    description: |
+      **Data-use audit** (Phase 42 γ, D3). `scripts/data_use.py` reports, for
+      data/processed/: a required mechanism's trigger columns (from the
+      matched prior) that no code under models/ reads (MEDIUM each, unless
+      the mechanism is recorded as simplified or fixed); data files no model
+      code opens (one MEDIUM per run listing them); other unread columns (one
+      LOW summary). List
+      deliberate omissions here under `not_read_by_model: [{file, columns,
+      reason}]` (`columns: ["*"]` for a whole file).
 
   - id: allocation_robustness
     path: models/allocation_robustness.yaml
@@ -315,6 +380,11 @@ artifacts:
       ACCEPT unless scope-declared with literature-grounded
       justification. Scope-declarable because some questions imply
       novel populations where direct benchmarks don't exist.
+      Phase 42 γ (D5): a benchmark matched by adjusting parameters lists
+      them in `tuned_parameters:` and carries `transfer: {target_covariates,
+      effect_at_target, difference_stated}`, the same effect re-computed
+      under the target setting's covariates (`scripts/benchmark_transfer.py`,
+      MEDIUM if absent).
 
   # ---- Phase 21 β additions -------------------------------------------------
 

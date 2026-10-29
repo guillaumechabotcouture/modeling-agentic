@@ -56,6 +56,7 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _THIS_DIR)
 import numeric_consistency as _nc  # type: ignore  # noqa: E402
 from lib.text_spans import code_spans, in_spans  # noqa: E402
+from lib.safe_io import sha256_file as _sha256_or_none  # noqa: E402
 
 
 # Phase 21 γ: kept as thin wrappers (shared implementation in
@@ -1013,15 +1014,6 @@ def _audit_ledger_binding(run_dir: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
-
-
-def _sha256_or_none(path: str) -> str | None:
-    import hashlib
-    try:
-        with open(path, "rb") as f:
-            return hashlib.sha256(f.read()).hexdigest()
-    except OSError:
-        return None
 
 
 def audit_run(run_dir: str) -> dict:

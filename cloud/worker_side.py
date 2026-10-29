@@ -163,21 +163,224 @@ def verify_attached(cl, expected_id):
     return cl
 
 
-def keeper_task(token, name, workspace, lo, hi, hours, adapt_options, cluster_id=None):
-    """Run the keeper, then stop the keeper's own cluster: once the run cluster
-    has stopped there is nothing to hold, and an idle keeper VM is waste."""
+def keeper_task(token, name, workspace, lo, hi, hours, adapt_options, cluster_id=None, overflow=None):
+    """Run the keeper, then stop the keeper's own cluster (and the overflow
+    pool's): once the run cluster has stopped there is nothing to hold, and an
+    idle VM is waste."""
     try:
-        return _keeper_loop(token, name, workspace, lo, hi, hours, adapt_options, cluster_id)
+        return _keeper_loop(token, name, workspace, lo, hi, hours, adapt_options, cluster_id, overflow)
     finally:
+        if overflow and overflow.get("id"):
+            try:
+                import coiled
+                with coiled.Cloud(workspace=workspace) as cloud:
+                    cloud.delete_cluster(cluster_id=overflow["id"], workspace=workspace,
+                                         reason="run cluster stopped; keeper exiting")
+            except Exception:  # noqa: BLE001 — the overflow cluster's idle timeout is the backstop
+                pass
         from distributed import get_client
         get_client().shutdown()
 
 
-def _keeper_loop(token, name, workspace, lo, hi, hours, adapt_options, cluster_id=None):
+# ---- quota refusals and the overflow pool (Phase 42 β, A6) -------------------------------
+#
+# Coiled fixes a cluster's worker VM types when the cluster is created (scale-up takes only
+# a count) and, given a list, falls back to the next type on capacity errors but not on a
+# quota refusal: E7 attempts 7 and 8 were refused for hours at 344-348 of 350 cores of a
+# family quota shared with other users. A refusal shows up as a worker record in state
+# "error" whose reason carries Azure's OperationNotAllowed message. The keeper reads those,
+# and while refusals keep coming it grows a second Coiled cluster of another VM family (its
+# own quota) whose VMs each run one dask worker joined to the run cluster's scheduler: a
+# second worker group, which Coiled does not offer within one cluster.
+
+OVERFLOW_PREFIX = "ovf-"
+KEEPER_STATUS = "/tmp/keeper_status.json"
+
+
+def quota_refusal(reason):
+    """Azure's quota refusal parsed out of a Coiled worker state reason, or None.
+    The family is the quota's name (e.g. standardESv5Family), not the VM size."""
+    import re
+    r = str(reason or "")
+    if "OperationNotAllowed" not in r or "quota" not in r.lower():
+        return None
+    m = re.search(r"approved\s+(\w+)\s+Cores quota", r)
+    out = {"family": m.group(1) if m else "unknown"}
+    for key, pat in (("limit", r"Current Limit:\s*(\d+)"), ("usage", r"Current Usage:\s*(\d+)"),
+                     ("required", r"Additional Required:\s*(\d+)")):
+        mm = re.search(pat, r)
+        out[key] = int(mm.group(1)) if mm else None
+    return out
+
+
+def _epoch(iso):
+    import datetime as dt
+    if not iso:
+        return None
+    try:
+        return dt.datetime.fromisoformat(str(iso).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def quota_refusals(workers, seen=(), now=None):
+    """New quota refusals in a Coiled worker listing (one record per refused VM request),
+    oldest first: [{id, worker, at, family, limit, usage, required}]; ids in `seen` skipped."""
+    out = []
+    for w in workers or ():
+        st = w.get("current_state") or {}
+        if str(st.get("state", "")).lower() != "error" or w.get("id") in seen:
+            continue
+        q = quota_refusal(st.get("reason"))
+        if q:   # the state's own time; with none, the scan's (a refusal never reads as stale by default)
+            at = next((t for t in (_epoch(st.get(k)) for k in ("updated", "created")) if t), None) \
+                or _epoch(w.get("updated")) or (now if now is not None else __import__("time").time())
+            out.append({"id": w.get("id"), "worker": w.get("name"), "at": at, **q})
+    return sorted(out, key=lambda x: x["at"])
+
+
+def overflow_desired(target, n_primary, overflow_max, last_refusal_at, now, hold_s):
+    """Overflow VMs wanted: the pool's shortfall (adaptive target minus primary workers),
+    while the primary family was refused for quota within the last `hold_s` seconds."""
+    if not overflow_max or last_refusal_at is None or now - last_refusal_at > hold_s:
+        return 0
+    return max(0, min(int(overflow_max), int(target) - int(n_primary)))
+
+
+def overflow_plan(desired, planned, vms, idle_since, now, scale_down_s):
+    """One keeper step for the overflow pool.
+    vms: {coiled worker name: {"joined": its join task is running, "busy": its joined
+    worker has tasks on the run scheduler}}; planned: overflow VMs requested (booting too).
+    Returns {"scale_to", "join", "close", "idle_since"}: grow to `desired`, join VMs up to
+    it, and close only VMs idle for `scale_down_s` beyond it (never a busy one)."""
+    joined = [n for n in sorted(vms) if vms[n].get("joined")]
+    unjoined = [n for n in sorted(vms) if not vms[n].get("joined")]
+    join = unjoined[:max(0, desired - len(joined))]
+    idle = {}
+    for n in sorted(vms):
+        if n in join or (vms[n].get("joined") and vms[n].get("busy")):
+            continue
+        idle[n] = idle_since.get(n, now)
+    ripe = [n for n in unjoined + joined if n in idle and now - idle[n] >= scale_down_s]
+    close = ripe[:max(0, len(vms) - desired)]
+    return {"scale_to": desired if planned < desired else None, "join": join, "close": close,
+            "idle_since": {n: t for n, t in idle.items() if n not in close}}
+
+
+def join_task(sched_addr, cert, key, name, hours, resources="compute=1"):
+    """On an overflow VM: run one dask worker joined to the run cluster's scheduler until it
+    exits (retired, or the scheduler closed) or `hours` pass. The cluster's self-signed TLS
+    certificate is its own CA; it is written to files only this user can read and removed
+    on exit. Being a running task, this also keeps the overflow cluster from idling out."""
+    import os, shutil, subprocess, sys, tempfile, time
+    d = tempfile.mkdtemp(prefix="ovf_tls_")
+    os.chmod(d, 0o700)
+    paths = {}
+    for fn, data in (("cert.pem", cert), ("key.pem", key)):
+        fd = os.open(os.path.join(d, fn), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(data)
+        paths[fn] = os.path.join(d, fn)
+    log = open(os.path.join(tempfile.gettempdir(), f"{name}.log"), "a")
+    cmd = [sys.executable, "-m", "distributed.cli.dask_worker", sched_addr, "--name", name, "--nthreads", "1",
+           "--resources", resources, "--no-nanny", "--no-dashboard", "--tls-ca-file", paths["cert.pem"],
+           "--tls-cert", paths["cert.pem"], "--tls-key", paths["key.pem"]]
+    p = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
+    t_end = time.time() + hours * 3600
+    try:
+        while p.poll() is None and time.time() < t_end:
+            time.sleep(10)
+    finally:
+        if p.poll() is None:
+            p.terminate()
+            try:
+                p.wait(30)
+            except subprocess.TimeoutExpired:
+                p.kill()
+        shutil.rmtree(d, ignore_errors=True)
+        log.close()
+    return {"name": name, "rc": p.returncode}
+
+
+def _write_status(st):
+    import json, os
+    tmp = KEEPER_STATUS + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f, indent=1)
+    os.replace(tmp, KEEPER_STATUS)
+
+
+def keeper_status():
+    import json, os
+    return json.load(open(KEEPER_STATUS)) if os.path.exists(KEEPER_STATUS) else None
+
+
+def coiled_workers(workspace, cluster_id):
+    """Every worker record Coiled holds for a cluster, refused ones included (state, reason)."""
+    import coiled
+    with coiled.Cloud(workspace=workspace) as cloud:
+        return cloud._sync(cloud._depaginate_list, cloud._get_workers_page, cluster_id=cluster_id,
+                           workspace=workspace)
+
+
+class _Overflow:
+    """The keeper's handle on the overflow cluster (attach-only, by the id the launch created)."""
+
+    def __init__(self, spec, workspace):
+        self.spec, self.workspace, self.cl, self.c, self.idle_since = spec, workspace, None, None, {}
+
+    def attach(self):
+        import coiled
+        if self.cl is None:
+            self.cl = verify_attached(coiled.Cluster(name=self.spec["name"], workspace=self.workspace,
+                                                     shutdown_on_close=False, wait_for_workers=False),
+                                      self.spec["id"])
+            self.c = self.cl.get_client()
+        return self.cl, self.c
+
+    def step(self, run_client, run_cluster, target, n_primary, last_refusal_at, now):
+        from distributed import fire_and_forget
+        cl, c = self.attach()
+        desired = overflow_desired(target, n_primary, self.spec.get("max", 0), last_refusal_at, now,
+                                   self.spec.get("hold_s", 1800))
+        proc = c.processing()
+        run_proc = run_client.processing()
+        busy_joined = {str(w.get("name"))[len(OVERFLOW_PREFIX):]: bool(run_proc.get(a))
+                       for a, w in run_client.scheduler_info()["workers"].items()
+                       if str(w.get("name", "")).startswith(OVERFLOW_PREFIX)}
+        vms = {str(w.get("name")): {"addr": a, "joined": bool(proc.get(a)), "busy": busy_joined.get(str(w.get("name")), False)}
+               for a, w in c.scheduler_info()["workers"].items()}
+        cl.sync(cl._set_plan_requested)
+        plan = overflow_plan(desired, len(cl.plan), vms, self.idle_since, now, self.spec.get("scale_down_s", 1200))
+        self.idle_since = plan["idle_since"]
+        if plan["scale_to"] is not None:
+            cl.sync(cl.scale_up, plan["scale_to"], reason=f"quota fallback: {desired} overflow workers wanted")
+        if plan["join"]:
+            addr = self.spec.get("scheduler_address") or next(iter(run_client.run(
+                lambda dask_worker: dask_worker.scheduler.address).values()))
+            self.spec["scheduler_address"] = addr
+            sec = run_cluster.security
+            for nm in plan["join"]:
+                fut = c.submit(join_task, addr, sec.tls_scheduler_cert, sec.tls_scheduler_key,
+                               OVERFLOW_PREFIX + nm, self.spec.get("hours", 48), workers=[vms[nm]["addr"]],
+                               allow_other_workers=False, pure=False, key=f"join-{nm}-{int(now)}")
+                fire_and_forget(fut)
+        if plan["close"]:
+            joined_names = [OVERFLOW_PREFIX + n for n in plan["close"] if vms[n]["joined"]]
+            if joined_names:
+                run_client.retire_workers(names=joined_names, close_workers=True)
+            cl.sync(cl.scale_down, plan["close"], reason="overflow worker idle past the scale-down delay")
+        return {"desired": desired, "vms": len(vms), "joined": sum(v["joined"] for v in vms.values()),
+                "planned": len(cl.plan), **{k: plan[k] for k in ("scale_to", "join", "close")}}
+
+
+def _keeper_loop(token, name, workspace, lo, hi, hours, adapt_options, cluster_id=None, overflow=None, tick_s=60):
     """On the keeper VM: hold the run cluster's adaptive scaling (dask's Adaptive
     loop lives in the process that calls adapt). Attach-only, to the cluster id
     the launch created; reconnects after a dropped connection; exits when that
-    cluster stops, and never scales a replacement."""
+    cluster stops, and never scales a replacement. Each tick it also reads the
+    run cluster's quota refusals, drives the overflow pool, and writes a status
+    file that `run_cluster.py status` prints."""
     import contextlib, time
     import coiled
     import dask
@@ -189,8 +392,15 @@ def _keeper_loop(token, name, workspace, lo, hi, hours, adapt_options, cluster_i
         return any(c.get("name") == name and state_of(c) in LIVE_STATES
                    and (cluster_id is None or c.get("id") == cluster_id) for c in items)
 
+    ovf_spec = dict(overflow or {})
+    status = {"cluster": name, "cluster_id": cluster_id, "pool": [lo, hi], "adapt": adapt_options,
+              "primary_vm_types": ovf_spec.get("primary_vm_types"), "active": "primary",
+              "overflow": {k: ovf_spec.get(k) for k in ("name", "id", "max", "vm_types")} if ovf_spec else None,
+              "refusals": [], "refusal_count": 0, "last_refusal_at": None, "errors": []}
+    seen = set()
+    ovf = _Overflow(ovf_spec, workspace) if ovf_spec.get("id") else None
     with open("/tmp/keeper.log", "a", buffering=1) as f, contextlib.redirect_stdout(f), contextlib.redirect_stderr(f):
-        print(f"{time.strftime('%T')} keeper holding {name} {lo}..{hi}", flush=True)
+        print(f"{time.strftime('%T')} keeper holding {name} {lo}..{hi} {adapt_options}", flush=True)
         t_end = time.time() + hours * 3600
         while time.time() < t_end:
             try:
@@ -211,8 +421,38 @@ def _keeper_loop(token, name, workspace, lo, hi, hours, adapt_options, cluster_i
                             break
                     except Exception:  # noqa: BLE001 — an API hiccup is not a stop
                         pass
-                    print(f"{time.strftime('%T')} workers={len(c.scheduler_info()['workers'])}", flush=True)
-                    time.sleep(120)
+                    now = time.time()
+                    winfo = c.scheduler_info()["workers"]
+                    n_ovf = sum(str(w.get("name", "")).startswith(OVERFLOW_PREFIX) for w in winfo.values())
+                    status.update(updated=now, workers=len(winfo), primary_workers=len(winfo) - n_ovf,
+                                  overflow_workers=n_ovf)
+                    try:
+                        new = quota_refusals(coiled_workers(workspace, cluster_id), seen, now)
+                        for r in new:
+                            seen.add(r["id"])
+                            print(f"{time.strftime('%T')} quota refusal {r['family']} {r['usage']}/{r['limit']}",
+                                  flush=True)
+                        if new:
+                            status["refusals"] = (status["refusals"] + new)[-20:]
+                            status["refusal_count"] += len(new)
+                            status["last_refusal_at"] = max(status["last_refusal_at"] or 0, new[-1]["at"])
+                        status["refusal_scan"] = "ok"
+                    except Exception as e:  # noqa: BLE001 — visible in status, not silent
+                        status["refusal_scan"] = f"unavailable: {type(e).__name__}: {str(e)[:160]}"
+                    if ovf is not None:
+                        try:
+                            target = max(lo, min(hi, int(c.run_on_scheduler(
+                                lambda dask_scheduler: dask_scheduler.adaptive_target()))))
+                            step = ovf.step(c, cl, target, len(winfo) - n_ovf, status["last_refusal_at"], now)
+                            status.update(target=target, overflow_step=step,
+                                          active="primary+overflow" if step["vms"] or step["desired"] else "primary")
+                        except Exception as e:  # noqa: BLE001
+                            status["errors"] = (status["errors"] + [f"{time.strftime('%T')} overflow "
+                                                                    f"{type(e).__name__}: {str(e)[:200]}"])[-10:]
+                    _write_status(status)
+                    print(f"{time.strftime('%T')} workers={len(winfo)} (overflow {n_ovf}) "
+                          f"refusals={status['refusal_count']} active={status['active']}", flush=True)
+                    time.sleep(tick_s)
             except Exception as e:  # noqa: BLE001 — reconnect
                 print(f"{time.strftime('%T')} keeper error {type(e).__name__}: {str(e)[:200]}; retrying", flush=True)
                 time.sleep(60)
@@ -297,3 +537,214 @@ def report_side(label):
     r = subprocess.run([sys.executable, "scripts/convergence_report.py", rd], cwd=f"{WORK}/{label}",
                        capture_output=True, text=True, timeout=300)
     return r.stdout or r.stderr[-1500:]
+
+
+# ---- durable detached jobs on a VM (Phase 42 β, A7; driven by cloud/vm_job.py) ------------
+#
+# Coiled stops an idle cluster after `idle_timeout`, and "idle" is the dask scheduler's
+# view: no task queued, running or unrunnable. A job started with client.run (or a process
+# it spawned) is not a task, so on 2026-10-28 two detached jobs on the dev VM were stopped
+# mid-run and their outputs lost. Here the job runs inside a dask task submitted with
+# fire_and_forget, which keeps the scheduler busy for exactly the job's lifetime, and it
+# writes into $JOB_OUT, which `vm_job.py status` copies to the laptop on every poll.
+
+JOBS = "/tmp/ma_jobs"
+JOB_STALE_S = 300
+
+
+def _job_dir(job_id):
+    import os, re
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", str(job_id)) or str(job_id) in (".", ".."):
+        raise ValueError(f"bad job id {job_id!r}")
+    return os.path.join(JOBS, job_id)
+
+
+def _job_write(d, st):
+    import json, os
+    with open(os.path.join(d, "state.json.tmp"), "w") as f:
+        json.dump(st, f, indent=1)
+    os.replace(os.path.join(d, "state.json.tmp"), os.path.join(d, "state.json"))
+
+
+def _read_json(p):
+    import json
+    try:
+        return json.load(open(p))
+    except (OSError, ValueError):
+        return None
+
+
+JOB_QUEUED_STALE_S = 3600
+
+
+class _JobLock:
+    """Exclusive lock on one job's directory, so checking and changing its state is atomic."""
+
+    def __init__(self, d):
+        self.d = d
+
+    def __enter__(self):
+        import fcntl, os
+        os.makedirs(self.d, exist_ok=True)
+        self.f = open(os.path.join(self.d, ".lock"), "w")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        import fcntl
+        fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
+
+
+def job_queue(job_id):
+    """Called (client.run) just before the job's task is submitted: reserves the id with a
+    'queued' record holding a fresh token, so a poll between submit and start sees a pending
+    job, and a second submission of the same id is refused. Returns the token, or None."""
+    import os, time, uuid
+    d = _job_dir(job_id)
+    with _JobLock(d):
+        if job_view(_read_json(os.path.join(d, "state.json")), time.time())["state"] in ("running", "queued"):
+            return None
+        token = uuid.uuid4().hex
+        _job_write(d, {"job_id": job_id, "state": "queued", "token": token, "queued": time.time(),
+                       "heartbeat": time.time()})
+        return token
+
+
+def _beat_run(argv, log, d, st, timeout_s, heartbeat_s):
+    """A setup command, with the job's heartbeat kept up while it runs."""
+    import subprocess, time
+    p = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT)
+    t_end = time.time() + timeout_s
+    while p.poll() is None:
+        if time.time() > t_end:
+            p.kill()
+            break
+        st["heartbeat"] = time.time()
+        _job_write(d, st)
+        time.sleep(min(5, heartbeat_s))
+    return p.wait()
+
+
+def job_task(job_id, code, cmd, secrets=None, max_hours=24.0, setup_sdk=False, heartbeat_s=30, token=None):
+    """The job, as a dask task: claim the id (the 'queued' record with this submission's
+    token; with no token, an id that is neither queued nor running), unpack `code` (a
+    tar.gz, or None), run `cmd` (a shell string or an argv list) in it with JOB_OUT set,
+    heartbeat into state.json throughout, stop it after `max_hours`. Secrets go to the
+    job's environment only, never to a file. The state record is replaced, never removed."""
+    import io, os, re, shutil, signal, subprocess, sys, tarfile, time
+    d = _job_dir(job_id)
+    with _JobLock(d):
+        raw = _read_json(os.path.join(d, "state.json")) or {}
+        cur = job_view(raw or None, time.time())
+        if token is not None:
+            ok = cur["state"] == "queued" and raw.get("token") == token
+        else:
+            ok = cur["state"] not in ("running", "queued")
+        if not ok:
+            return {"job_id": job_id, "state": "refused", "why": f"the id is {cur['state']} under another submission"}
+        work, out = os.path.join(d, "work"), os.path.join(d, "out")
+        for sub in (work, out, os.path.join(d, "job.log")):
+            if os.path.isdir(sub):
+                shutil.rmtree(sub, ignore_errors=True)
+            elif os.path.exists(sub):
+                os.remove(sub)
+        os.makedirs(work)
+        os.makedirs(out)
+        t0 = time.time()
+        st = {"job_id": job_id, "state": "running", "started": t0, "heartbeat": t0, "max_hours": max_hours,
+              "cmd": cmd if isinstance(cmd, str) else " ".join(cmd), "token": token}
+        _job_write(d, st)
+    try:
+        if code:
+            tarfile.open(fileobj=io.BytesIO(code), mode="r:gz").extractall(work, filter="data")
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "OPENAI", "AZ_", "AZURE_"))}
+        env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "/usr/bin:/bin")
+        env.update(secrets or {})
+        env["JOB_OUT"] = out
+        with open(os.path.join(d, "job.log"), "ab", buffering=0) as log:
+            if setup_sdk and os.path.exists(os.path.join(work, "requirements.txt")):   # dev_vm.py's SDK pin
+                pins = [ln.split("#")[0].strip() for ln in open(os.path.join(work, "requirements.txt"))
+                        if re.match(r"\s*claude-agent-sdk==", ln)]
+                if pins:
+                    _beat_run([sys.executable, "-m", "pip", "install", "-q", *pins], log, d, st, 600, heartbeat_s)
+            p = subprocess.Popen(cmd, shell=isinstance(cmd, str), cwd=work, env=env, stdout=log,
+                                 stderr=subprocess.STDOUT, start_new_session=True)
+            st["pid"] = p.pid
+            t_end, beat = t0 + max_hours * 3600, 0.0
+            while p.poll() is None:
+                now = time.time()
+                if now > t_end:
+                    st["timed_out"] = True
+                    try:
+                        os.killpg(p.pid, signal.SIGTERM)
+                        p.wait(30)
+                    except (ProcessLookupError, subprocess.TimeoutExpired):
+                        try:
+                            os.killpg(p.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    break
+                if now - beat >= heartbeat_s:
+                    st["heartbeat"], beat = now, now
+                    _job_write(d, st)
+                time.sleep(min(5, heartbeat_s))
+            rc = p.wait()
+    except Exception as e:  # noqa: BLE001 — a job that cannot start is recorded, not lost
+        st.update(state="failed", error=f"{type(e).__name__}: {e}"[:500], ended=time.time(), heartbeat=time.time())
+        _job_write(d, st)
+        return st
+    st.update(state="timed_out" if st.get("timed_out") else ("done" if rc == 0 else "failed"), rc=rc,
+              ended=time.time(), duration_s=round(time.time() - t0), heartbeat=time.time())
+    _job_write(d, st)
+    return st
+
+
+def job_view(st, now, stale_s=JOB_STALE_S, queued_stale_s=JOB_QUEUED_STALE_S):
+    """The job's state as seen now: a 'running' record whose heartbeat stopped is 'lost'
+    (the VM restarted or the task was cancelled), as is a 'queued' one whose task has not
+    started within `queued_stale_s` (it may wait behind another job until then); no record
+    is 'missing'. The submission token is internal and not shown."""
+    if not isinstance(st, dict) or "state" not in st:
+        return {"state": "missing"}
+    v = {k: x for k, x in st.items() if k != "token"}
+    if v["state"] == "running" and now - float(v.get("heartbeat") or 0) > stale_s:
+        v["state"] = "lost"
+    if v["state"] == "queued" and now - float(v.get("queued") or 0) > queued_stale_s:
+        v["state"] = "lost"
+    return v
+
+
+def job_state(job_id):
+    """State, log tail, and the manifest of fetchable files ({rel: [size, mtime]})."""
+    import os, time
+    d = _job_dir(job_id)
+    st = job_view(_read_json(os.path.join(d, "state.json")), time.time())
+    files = {}
+    if os.path.exists(os.path.join(d, "job.log")):
+        s = os.stat(os.path.join(d, "job.log"))
+        files["job.log"] = [s.st_size, s.st_mtime]
+    for root, _, fns in os.walk(os.path.join(d, "out")):
+        for fn in fns:
+            p = os.path.join(root, fn)
+            if not os.path.islink(p):
+                s = os.stat(p)
+                files[os.path.relpath(p, d)] = [s.st_size, s.st_mtime]
+    tail = ""
+    if "job.log" in files:
+        with open(os.path.join(d, "job.log"), "rb") as f:
+            f.seek(max(0, files["job.log"][0] - 2000))
+            tail = f.read().decode("utf-8", "replace")
+    return {"state": st, "files": files, "log_tail": tail}
+
+
+def job_chunk(job_id, rel, offset, length):
+    """Bytes of one job file: job.log or a file under out/ (no links, no path escapes)."""
+    import os
+    d = os.path.realpath(_job_dir(job_id))
+    p = os.path.realpath(os.path.join(d, rel))
+    if not (rel == "job.log" or p.startswith(os.path.join(d, "out") + os.sep)) or os.path.islink(os.path.join(d, rel)):
+        raise ValueError(f"not a job output: {rel!r}")
+    with open(p, "rb") as f:
+        f.seek(offset)
+        return f.read(length)
