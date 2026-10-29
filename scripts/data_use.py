@@ -311,11 +311,18 @@ def audit(run_dir: str, priors=None) -> dict:
             continue          # simplified (with its test) or fixed: D1 checks it
         subs = [s.lower() for s in m.when_data_columns_any]
         hits = [(rel, c) for rel, cs in headers.items() for c in cs if any(s in c.lower() for s in subs)]
-        if not hits:          # trigger data only under data/raw/
-            if raw_headers is None:
-                raw_headers, _ = processed_headers(run_dir, include_raw=True)
-            hits = [(rel, c) for rel, cs in raw_headers.items() if rel not in headers
-                    for c in cs if any(s in c.lower() for s in subs)]
+        # Trigger columns that exist only under data/raw/ (by name), each one:
+        # a column dropped in processing is variation the model cannot see.
+        if raw_headers is None:
+            raw_headers, _ = processed_headers(run_dir, include_raw=True)
+        seen = {c for _r, c in hits}
+        for rel, cs in raw_headers.items():
+            if rel in headers:
+                continue
+            for c in cs:
+                if c not in seen and any(s in c.lower() for s in subs):
+                    seen.add(c)
+                    hits.append((rel, c))
         for rel, c in hits:
             if (rel, c) in flagged or exempted(rel, c) or refs.reads(c):
                 continue
@@ -450,6 +457,12 @@ def load(path=DATA):
            == ["data/raw/src.csv"], "DU6 a trigger column only under data/raw/ is still flagged")
         w(d, "data/processed/units.csv",
           "unit,pop,rate_2020,rate_2021,mix_a,mix_b,lat,score_hist,state\nA,1,2,3,4,5,6,7,8\n")
+        w(d, "models/reads_mix.py", "X = 'mix_a'\n")
+        w(d, "data/raw/src.csv", "unit,mix_a,mix_b\nA,1,2\n")
+        ok([x["claim"].split("column `")[1].split("`")[0] for x in gate_findings(d, P)
+            if x["kind"] == "data_trigger_column_unused"] == ["mix_b"],
+           "DU6b a raw-only trigger column is flagged even when another trigger column is processed and read")
+        os.remove(os.path.join(d, "models", "reads_mix.py"))
         os.remove(os.path.join(d, "data", "raw", "src.csv"))
         w(d, "models/extra.py", 'COLS = "lat,state"\nx = df.mix_a\ndf.assign(mix_b=1)\nP = "score_" + "x"\n'
                                 'T = f"{DP}/extra_table.csv"\nO = "other"\n')
