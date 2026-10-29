@@ -56,6 +56,10 @@ parameters is reported by the manifest (`required_artifact_missing`,
 
 Findings:
   calibration_spec_invalid               HIGH  unreadable / malformed spec or entry
+  calibration_spec_missing               HIGH  no spec, and the fit is recorded only
+                                               in calibration_result.yaml (outside
+                                               the manifest's fitted_parameters
+                                               trigger)
   calibration_fitted_set_unreadable      HIGH  the spec exists but no fitted
                                                parameter can be read from the
                                                run's calibration artifacts
@@ -321,7 +325,17 @@ def gate_findings(run_dir: str, round_n: int | None = None) -> list[dict]:
     late = "MEDIUM" if round_n is not None and round_n < 2 else "HIGH"
     entries, targets, _doc, out, exists = _load_spec(run_dir)
     if not exists:
-        return []               # required_artifact_missing (manifest) covers a fitting run
+        # required_artifact_missing (manifest, fitted_parameters) covers a run
+        # with an identifiability manifest or a fitted model comparison. A fit
+        # recorded only in calibration_result.yaml is not in that trigger, so
+        # report the missing spec here (Codex review).
+        fitted, _errs, _ev = fitted_parameters(run_dir)
+        if fitted and _sibling("effort_floors")._calibration_evidence(run_dir) is None \
+                and not os.path.exists(os.path.join(run_dir, "models", "model_comparison.yaml")):
+            return [_f("calibration_spec_missing", "HIGH",
+                       f"`{CALRES}` records fitted parameters ({', '.join(sorted(fitted)[:5])}) but `{PATH}` is "
+                       "absent. Give every candidate parameter a role and every target its metadata.")]
+        return []
     if entries is None:
         return out              # malformed: already HIGH
     fitted, errs, evidence = fitted_parameters(run_dir)
@@ -398,6 +412,13 @@ def _self_test() -> int:
         ok(gate_findings(d, 2) == [], "CS0 no spec and no calibration: nothing")
         w(d, IDENT, ident)
         ok(gate_findings(d, 2) == [], "CS0b no spec: the manifest's required_artifact_missing covers it, not here")
+        os.remove(os.path.join(d, IDENT))
+        w(d, CALRES, {"parameters": {"level_1": 2.0}})
+        v = gate_findings(d, 2)
+        ok(kinds(v) == ["calibration_spec_missing"] and v[0]["severity"] == "HIGH",
+           f"CS0c a fit recorded only in calibration_result.yaml still requires the spec (Codex review), got {v}")
+        os.remove(os.path.join(d, CALRES))
+        w(d, IDENT, ident)
         w(d, PATH, good)
         ok(gate_findings(d, 2) == [], f"CS1 a complete spec passes, got {gate_findings(d, 2)}")
         # scenario assumption fitted
