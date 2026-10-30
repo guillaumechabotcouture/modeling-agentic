@@ -197,7 +197,7 @@ List each one under `decision_layer:` in `models/mechanism_manifest.yaml`
 `scripts/mechanism_manifest.py` docstring). For each feature:
 
 1. Solve the decision **with and without** it, and record the result file
-   (`varied`, `criterion`, `decision_changes`), the same format as a
+   (`feature: <id>`, `varied`, `criterion`, `decision_changes`), the format of a
    simplified mechanism's sufficiency test. Use the criterion the brief or
    the mechanism tests use; do not pick one after seeing the result.
 2. If the decision does not change, remove the feature from the plan and the

@@ -240,7 +240,7 @@ artifacts:
       brief (`decision_layer: []` if none), each with `kind: decision_rule`,
       `description`, `in_recommended_plan`, `information_used`
       (`[{input, available: YYYY-MM}]`) and a `sufficiency_test` result
-      solving the decision with and without it (same format), or
+      solving the decision with and without it (same format, plus `feature: <id>`), or
       `specified_by: question|brief` with a verbatim `quote:`. A missing list
       or test is HIGH; so is a feature whose test shows no change and that
       stays in the plan (remove it, or keep it by a brief amendment naming
