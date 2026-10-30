@@ -654,10 +654,15 @@ def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: lis
         if os.path.exists(os.path.join(calls, "cancel")):
             return {"rows": rows_with("cancelled"), "core_s": 0.0}
         if token:
-            try:
-                os.close(os.open(os.path.join(calls, f"claim-{token}"), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
-            except FileExistsError:
+            won, owner = _claim(calls, token, "start")
+            if not won and owner == "revoke":
                 return {"rows": rows_with("revoked: moved to another worker"), "core_s": 0.0, "revoked": True}
+            if not won:
+                # An earlier attempt of this submission claimed its start (dask
+                # replayed the task after a worker restart): that work is unknown,
+                # so the caller treats the chunk as lost (charged, resubmitted once).
+                return {"rows": rows_with("an earlier attempt of this chunk started; its work is unconfirmed",
+                                          "infra"), "core_s": 0.0, "unconfirmed": True}
         live = os.path.exists(os.path.join(run_dir, "metadata.json"))
         if not live:
             tf = tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz")
@@ -776,19 +781,36 @@ def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: lis
             "summary": csum if isinstance(csum, dict) else None, "stderr_tail": (err or "")[-300:]}
 
 
+def _claim(calls: str, token: str, who: str) -> tuple[bool, str]:
+    """Claim a submission's start for `who` ("start" or "revoke"). Returns
+    (won, owner): owner is whoever holds the claim, as recorded in the claim
+    file. The file is written whole and then hard-linked into place, so the
+    link succeeds for exactly one side and a reader never sees it half written."""
+    import os, time  # noqa: E401 — pickled by value
+    os.makedirs(calls, exist_ok=True)
+    path = os.path.join(calls, f"claim-{token}")
+    tmp = f"{path}.{os.getpid()}.{time.monotonic_ns()}.tmp"
+    with open(tmp, "w") as fh:
+        fh.write(who)
+    try:
+        os.link(tmp, path)
+        return True, who
+    except FileExistsError:
+        with open(path) as fh:
+            return False, fh.read()
+    finally:
+        os.unlink(tmp)
+
+
 def _revoke_chunk(call_id: str, token: str) -> bool:
     """Runs on a worker (Phase 45 δ): claim a chunk's start so that it never
-    starts. True: revoked, it will do no work. False: the chunk claimed it
-    first (it is running or has run) and is left alone. The claim is an
-    O_EXCL file on the worker's disk, so exactly one side wins."""
+    starts. True: revoked, it does no work (asked again after a lost reply,
+    the answer is the same). False: the chunk claimed its start first and is
+    left alone. The claim is a file on the worker's disk; exactly one side wins."""
     import os, tempfile  # noqa: E401 — pickled by value
     calls = os.path.join(tempfile.gettempdir(), _CALLS_DIR, call_id)
-    os.makedirs(calls, exist_ok=True)
-    try:
-        os.close(os.open(os.path.join(calls, f"claim-{token}"), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
-    except FileExistsError:
-        return False
-    return True
+    won, owner = _claim(calls, token, "revoke")
+    return won or owner == "revoke"
 
 
 def _same_process(pid: int, token: str | None) -> bool:
@@ -1253,7 +1275,16 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                     try:
                         got = f.result()
                         if got.get("revoked"):
-                            continue                # placed again when it was revoked
+                            # Revoked, but the revoke's reply was lost (a revoke that
+                            # got its reply cancels the future, which never gets here):
+                            # nothing ran, so place it again.
+                            queue.insert(0, (ch, attempt, used))
+                            progress["moved"] = progress.get("moved", 0) + 1
+                            continue
+                        if got.get("unconfirmed"):
+                            chunk_lost(f, ch, attempt, used, f_share, got["rows"][0]["error"] if got["rows"]
+                                       else "an earlier attempt of this chunk started; its work is unconfirmed")
+                            continue
                         csum = got.get("summary") or {}
                         wk = got["rows"][0].get("worker") if got["rows"] else None
                         used_w.add(wk or pinned.get(f))
@@ -1361,6 +1392,14 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
             progress["gone_workers"] = len(gone)
     done_i = {r["i"] for r in rows}
     rows += [{"i": i, "ok": False, "kind": INFRA, "error": msg} for i, msg in errors.items() if i not in done_i]   # keep the real error
+    # Phase 45 δ: a call that was not stopped accounts for every input. One that
+    # is absent (dropped by the dispatcher, or a chunk returned fewer rows) fails
+    # loudly: an infra row and `invariant_violation` in the summary.
+    absent = [] if stop else sorted(set(range(len(inputs))) - {r["i"] for r in rows})
+    rows += [{"i": i, "ok": False, "kind": INFRA, "error": "input lost by the dispatcher (no result returned)"}
+             for i in absent]
+    if absent:
+        print(f"[compute] INVARIANT VIOLATED: {len(absent)} inputs returned no row", file=sys.stderr, flush=True)
     # "workers": the VMs that returned a chunk (Phase 45 δ), not those up at the start.
     return rows, {"backend": "dask", "workers": len(used_w), "workers_seen": len(seen_w),
                   "pool_target": pool, "slots": slots,
@@ -1368,6 +1407,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                   "core_s": progress["core_s"], "stopped": stop,
                   "unknown_chunks": lost + len(pending) + len(gone), "bundle": binfo,
                   "bundle_rescatters": progress.get("bundle_rescatters", 0), "moved": progress.get("moved", 0),
+                  "invariant_violation": (f"{len(absent)} inputs returned no row" if absent else None),
                   "chunks": progress.get("chunks", []), "procs_final": learned["procs"],
                   "peak_mb": learned["peak"]}
 
@@ -2698,6 +2738,7 @@ def _self_test_p45d(ok) -> None:
     pipeline task did), so the cluster's mean occupancy dwarfs any compute
     worker's queue and work stealing never moves chunks. Every wait is on an
     event (a file the model writes, a scheduler state), never a fixed sleep."""
+    global _remote_task
     import tempfile
     try:
         import dask
@@ -2962,6 +3003,64 @@ def _self_test_p45d(ok) -> None:
                     # The revoked first submission, released now, does no work.
                     ok(len([f_ for f_ in os.listdir(rd) if f_.startswith(f"span_{tag}_")]) == 1,
                        f"P45D-{9 if how == 'collision' else 10}b the revoked submission did no work")
+                # P45D-12/13: the start claim records who holds it. A revoke asked
+                # again gives the same answer; a replayed submission finds its own
+                # earlier start claim and reports unconfirmed work, never "revoked".
+                import uuid as uuid_
+                cid = uuid_.uuid4().hex
+                cdir = os.path.join(tempfile.gettempdir(), _CALLS_DIR, cid)
+                r1, r2 = _revoke_chunk(cid, "x"), _revoke_chunk(cid, "x")
+                c1 = _claim(cdir, "x", "start")
+                c2 = _claim(cdir, "y", "start")
+                r3, r4 = _revoke_chunk(cid, "y"), _revoke_chunk(cid, "y")
+                ok(r1 and r2 and c1 == (False, "revoke") and c2 == (True, "start") and not r3 and not r4,
+                   f"P45D-12 claim owner recorded; a repeated revoke keeps its answer: {r1, r2, c1, c2, r3, r4}")
+                b13, i13 = make_bundle(rd)
+                one = [(0, {"k": 0, "dir": rd, "tag": "g", "s": 0})]
+                _claim(cdir, "z", "start")              # an earlier attempt of submission z
+                g1 = _remote_task(b13, i13["sha256"], rd, "models/a16.py::f", one, procs=1, call_id=cid, token="z")
+                g2 = _remote_task(b13, i13["sha256"], rd, "models/a16.py::f", one, procs=1, call_id=cid, token="x")
+                ok(g1.get("unconfirmed") and not g1.get("revoked") and g2.get("revoked") and not g2.get("unconfirmed")
+                   and not os.path.exists(os.path.join(rd, "span_g_0")),
+                   f"P45D-13 a replay reports unconfirmed work, only a revoke claim reports revoked: {g1} {g2}")
+                # P45D-14..16: the client side, with a stand-in chunk task whose first
+                # call returns (14) "revoked" for a chunk the client never revoked (the
+                # revoke's reply was lost), (15) "unconfirmed", (16) no rows at all.
+                real_task = _remote_task
+
+                def first_then_real(kind, flag):
+                    def _remote_task_stub(bundle, sha, run_dir, fn_spec, chunk, *a, **k):
+                        import os as os_
+                        try:
+                            os_.close(os_.open(flag, os_.O_CREAT | os_.O_EXCL | os_.O_WRONLY))
+                        except FileExistsError:
+                            return real_task(bundle, sha, run_dir, fn_spec, chunk, *a, **k)
+                        if kind == "norows":
+                            return {"rows": [], "core_s": 0.0}
+                        return {"rows": [{"i": i, "ok": False, "kind": "infra", "error": kind} for i, _ in chunk],
+                                "core_s": 0.0, kind: True}
+                    return _remote_task_stub
+                outs = {}
+                try:
+                    for kind in ("revoked", "unconfirmed", "norows"):
+                        _remote_task = first_then_real(kind, os.path.join(rd, f"stub_{kind}"))
+                        outs[kind] = map_fn(rd, "models/a16.py::f",
+                                            [{"k": k, "dir": rd, "tag": f"h{kind}", "s": 0} for k in range(2)],
+                                            ledger=False)
+                finally:
+                    _remote_task = real_task
+                rv, sv = outs.get("revoked", ([], {}))
+                ok(len(rv) == 2 and all(r["ok"] for r in rv) and sv.get("moved") == 1 and not sv.get("invariant_violation"),
+                   f"P45D-14 a revoked result with no replacement is placed again, not dropped: {rv} {sv}")
+                ru, su = outs.get("unconfirmed", ([], {}))
+                lost_u = [c_ for c_ in su.get("chunks", []) if "unconfirmed" in str(c_.get("error"))]
+                ok(len(ru) == 2 and all(r["ok"] for r in ru) and len(lost_u) == 1 and lost_u[0]["attempt"] == 0
+                   and su.get("estimated_core_s", 0) > 0,
+                   f"P45D-15 unconfirmed work is a lost chunk: charged, resubmitted once: {ru} {su}")
+                rn, sn = outs.get("norows", ([], {}))
+                ok(len(rn) == 2 and sum(r["ok"] for r in rn) == 1 and sn.get("invariant_violation")
+                   and [r for r in rn if not r["ok"]][0]["kind"] == INFRA,
+                   f"P45D-16 an input that returned no row fails loudly: {rn} {sn}")
                 hog.cancel()
                 # P45D-11: a loss that uses the rest of the allowance ends the call at once
                 # (no worker free, so before this the loop slept with demand shown).
