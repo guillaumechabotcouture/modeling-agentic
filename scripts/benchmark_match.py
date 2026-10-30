@@ -66,6 +66,7 @@ from typing import Any
 import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from lib.safe_io import inside_dir  # noqa: E402
 from lib.text_spans import resolve_dotpath as _resolve_dotpath  # noqa: E402
 
 # Phase 21 γ: maximum multiplicative tolerance. A factor-10 band already
@@ -111,6 +112,8 @@ def _resolve_computed_field(run_dir: str, ref: str) -> tuple[float | None, str]:
         return None, f"computed_field must be 'path::dotted.key', got {ref!r}"
     rel, key = ref.split("::", 1)
     p = os.path.join(run_dir, rel)
+    if not inside_dir(run_dir, p):
+        return None, f"computed_field artifact {rel} resolves outside the run directory"
     if not os.path.exists(p):
         return None, f"computed_field artifact {rel} not found"
     try:
@@ -612,6 +615,20 @@ def _self_test() -> int:
                 "computed_field": "out.yaml::series.1.v"}]}, f)
         rep = evaluate(d)
         ok(rep["verdict"] == "PASS", f"T11c: indexed computed_field, got {rep}")
+    # T11d (Phase 45 β): a computed_field through a symlink out of the run is not read.
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as outside:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(outside, "out.yaml"), "w") as f:
+            yaml.safe_dump({"v": 7.0}, f)
+        os.symlink(outside, os.path.join(d, "ext"))
+        with open(os.path.join(d, "models", "benchmark_targets.yaml"), "w") as f:
+            yaml.safe_dump({"benchmarks": [{
+                "id": "b", "metric": "m", "target_value": 7,
+                "tolerance_factor": 1.2, "source": "s",
+                "computed_field": "ext/out.yaml::v"}]}, f)
+        rep = evaluate(d)
+        ok(rep["missing_computed"] == 1 and "outside the run" in rep["results"][0]["diagnostic"],
+           f"T11d: symlinked computed_field must not be read, got {rep}")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)

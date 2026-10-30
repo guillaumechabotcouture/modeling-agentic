@@ -39,22 +39,34 @@ blocks on drift).
 
 Requirements
 ------------
+* Scope of a verdict. In a sentence, only the clauses (split at `;`, "but",
+  ", while", outside brackets) that carry a pass verdict and state no failure;
+  paths and row names in other clauses are not the verdict's. A table row that
+  states both a pass and a failure is ambiguous and skipped.
 * A bound benchmark id must not be out of band in the harness's own evaluation
   (scripts/benchmark_match.py `evaluate`); a target it cannot score is already
   benchmark_match's finding. In any cited benchmark file that lists the id
   (a `benchmarks:`/`results:` list, or an `id: value` mapping under `computed:`)
-  the value must be computed and inside the band.
+  the value, resolved as benchmark_match resolves it (`computed_value`, else
+  `computed_field: <path>::<key>`), must be computed and inside the band.
 * A table row whose verdict is a pass must not also say the value was "not
   computed" / "not evaluated".
-* A cited CSV must have data rows. The row(s) the statement is about (a row
-  whose label has a word no other label has, appearing in the statement or in a
-  bound benchmark's metric) must hold a computed value: the column the statement
-  names (its header appears in the statement or metric) is not blank/NaN, and
-  the row has at least one non-zero number. With no row identifiable, the file
-  as a whole must hold one.
+* A cited CSV must have data rows. Columns are verdict columns (every filled
+  cell a pass/fail word), count columns (numeric, `n_*` / `*_count`), metric
+  columns (numeric) or text. The row(s) the statement is about (a text label
+  with a word no other label has, appearing in the scope or in a bound
+  benchmark's metric) must back it: a column the scope names (its header appears
+  there) holds a value (a verdict column: not a failing word; a numeric column:
+  not blank/NaN/non-finite; a count column: also not 0); with no column named,
+  the row's single verdict column is not failing, or its metric cells are not
+  all missing (a finite zero is a value). With no row identifiable, the file is
+  flagged only when every row is missing, and never when it has verdict columns.
 * A cited YAML/JSON must parse and not be empty; with `::key` the key must
   resolve to a non-empty, finite value that is not a failing verdict
   (FAIL, DRIFT, DISAGREE, ... or `false`).
+* Containment: every file read (prose, targets, cited files, computed_field
+  targets) must resolve, symlinks included, inside the run directory; one
+  that does not is never opened (MEDIUM).
 
 Findings
 --------
@@ -79,7 +91,7 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
-from lib.safe_io import finite_number, safe_load_mapping  # noqa: E402
+from lib.safe_io import finite_number, inside_dir, safe_load_mapping  # noqa: E402
 from lib.text_spans import code_spans, in_spans, resolve_dotpath  # noqa: E402
 
 PROSE = (("results.md", "ANALYZE"), ("decision_rule.md", "ANALYZE"), ("report.md", "WRITE"))
@@ -96,6 +108,12 @@ _HEADING_RE = re.compile(r"^#{1,6}\s")
 _SEP_RE = re.compile(r"^\|[\s:|-]+\|$")
 _SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z(*\[`])")
 _FAILING = {"FAIL", "FAILED", "DRIFT", "MALFORMED", "DISAGREE", "NOT_MET", "REFUTED"}
+_FAIL_CELLS = _FAILING | {"FAILS", "DISAGREES", "FALSE", "NO", "OUT_OF_BAND"}
+_PASS_CELLS = {"PASS", "PASSED", "PASSES", "AGREE", "AGREES", "MET", "OK", "TRUE", "YES", "HOLDS",
+               "IN_BAND", "WITHIN_BAND"}
+_NAN_CELLS = {"nan", "inf", "-inf", "na", "n/a", "none", "null"}
+_COUNT_RE = re.compile(r"^(?:n|num|count)(?:_|$)|_(?:n|count)$")
+_CLAUSE_BREAK_RE = re.compile(r";|\s+but\s+|,\s+(?:while|whereas)\s+")
 _ID_WINDOW = 40          # chars between a benchmark id and the verdict that follows it
 
 
@@ -175,15 +193,19 @@ def _bound_ids(stmt: str, ids: set[str], table: bool) -> list[str]:
 # --------------------------------------------------------------------------- artifacts
 
 def _resolve_cited(run_dir: str, rel: str) -> tuple[str | None, str]:
-    """(absolute path or None, why not)."""
+    """(absolute path or None, why not). A path that resolves outside the run
+    (`..`, absolute, or through a symlink) is never opened."""
     if os.path.isabs(rel) or ".." in rel.split("/"):
         return None, f"`{rel}` is outside the run directory"
     cands = [os.path.join(run_dir, rel)]
     if "/" not in rel:
         cands.append(os.path.join(run_dir, "models", rel))
     for c in cands:
-        if os.path.isfile(c):
-            return c, ""
+        if os.path.lexists(c):
+            if not inside_dir(run_dir, c):
+                return None, f"`{rel}` resolves outside the run directory (symlink)"
+            if os.path.isfile(c):
+                return c, ""
     return None, f"`{rel}` does not exist in the run"
 
 
@@ -209,8 +231,59 @@ def _load_cited(path: str, rel: str, cache: dict):
 
 
 def _cell_value(cell: str):
-    v = finite_number(cell.strip().replace(",", "")) if cell is not None else None
-    return v
+    return finite_number(cell.strip().replace(",", "")) if cell is not None else None
+
+
+def _vocab(cell: str) -> str:
+    return re.sub(r"\s+", "_", cell.strip().upper())
+
+
+def _col_kind(header: str, cells: list[str]) -> str:
+    """'verdict' (every filled cell is a pass/fail word), 'count' / 'metric'
+    (every filled cell is a number or a not-a-number token), else 'text'."""
+    filled = [c.strip() for c in cells if c.strip()]
+    if filled and all(_vocab(c) in _PASS_CELLS | _FAIL_CELLS for c in filled):
+        return "verdict"
+    if all(_cell_value(c) is not None or c.lower() in _NAN_CELLS for c in filled):
+        return "count" if _COUNT_RE.search(_snake(header).strip("_")) else "metric"
+    return "text"
+
+
+def _row_problem(rel: str, name: str, header: list, r: list, kinds: list, named: list) -> str | None:
+    """Why the row holds no computed value for what is cited, or None.
+    Missing = blank / NaN / non-finite; a finite zero is a value, except in a
+    count column the statement names (zero units: nothing was computed)."""
+    counts = ", ".join(f"{header[j]}={r[j].strip() or 'blank'}" for j, k in enumerate(kinds) if k == "count")
+    tail = f" ({counts})" if counts else ""
+    for j in named:
+        cell = r[j].strip()
+        if kinds[j] == "verdict":
+            if _vocab(cell) in _FAIL_CELLS:
+                return f"`{rel}` row '{name}' records `{header[j]}` = {cell}"
+            if not cell:
+                return f"`{rel}` row '{name}' has no recorded `{header[j]}`"
+        elif _cell_value(cell) is None:
+            return f"`{rel}` row '{name}' has no computed `{header[j]}` (cell is {cell or 'blank'!r}){tail}"
+        elif kinds[j] == "count" and _cell_value(cell) == 0:
+            return f"`{rel}` row '{name}' has `{header[j]}` = 0: nothing was computed for it"
+    if named:
+        return None
+    verdicts = [j for j, k in enumerate(kinds) if k == "verdict"]
+    if len(verdicts) == 1 and r[verdicts[0]].strip():
+        cell = r[verdicts[0]].strip()
+        return f"`{rel}` row '{name}' records `{header[verdicts[0]]}` = {cell}" if _vocab(cell) in _FAIL_CELLS else None
+    if verdicts:
+        return None           # several verdict columns: which one is cited is ambiguous
+    metrics = [j for j, k in enumerate(kinds) if k == "metric"]
+    if metrics:
+        if all(_cell_value(r[j]) is None for j in metrics):
+            cells = ", ".join(f"{header[j]}={r[j].strip() or 'blank'}" for j in metrics)
+            return f"`{rel}` row '{name}' holds no computed value ({cells}){tail}"
+        return None
+    cnt = [j for j, k in enumerate(kinds) if k == "count"]
+    if cnt and all(not _cell_value(r[j]) for j in cnt):
+        return f"`{rel}` row '{name}' holds no computed value{tail}"
+    return None
 
 
 def _csv_problems(rel: str, header: list, rows: list, context: str) -> list[str]:
@@ -220,15 +293,11 @@ def _csv_problems(rel: str, header: list, rows: list, context: str) -> list[str]
     rows = [r + [""] * (width - len(r)) for r in rows if any(c.strip() for c in r)]
     if not rows:
         return [f"`{rel}` has no data rows"]
-    label_col = next((j for j in range(width)
-                      if sum(_cell_value(r[j]) is None for r in rows) * 2 > len(rows)), None)
-
-    def has_value(r):
-        return any((v := _cell_value(r[j])) is not None and v != 0 for j in range(width) if j != label_col)
-
+    kinds = [_col_kind(header[j], [r[j] for r in rows]) for j in range(width)]
+    label_col = next((j for j, k in enumerate(kinds) if k == "text"), None)
     nctx = _snake(context)
-    cols = [j for j, h in enumerate(header) if j != label_col and len(_snake(h).strip("_")) >= 4
-            and _snake(h).strip("_") in nctx]
+    named = [j for j, h in enumerate(header) if kinds[j] != "text" and len(_snake(h).strip("_")) >= 4
+             and _snake(h).strip("_") in nctx]
     picked = []
     if label_col is not None:
         words = [_words(r[label_col]) for r in rows]
@@ -239,16 +308,15 @@ def _csv_problems(rel: str, header: list, rows: list, context: str) -> list[str]
             if (words[k] - others) & ctx_words or (len(full) >= 4 and full in nctx):
                 picked.append(r)
     if not picked:
-        return [] if any(has_value(r) for r in rows) else [f"`{rel}` holds no non-zero computed value in any row"]
+        if "verdict" in kinds:
+            return []         # which row's verdict is cited is ambiguous
+        probs = [_row_problem(rel, "", header, r, kinds, named) for r in rows]
+        return [f"`{rel}` holds no computed value in any row"] if all(probs) else []
     out = []
     for r in picked:
-        name = r[label_col]
-        for j in cols:
-            if _cell_value(r[j]) is None:
-                out.append(f"`{rel}` row '{name}' has no computed `{header[j]}` (cell is {r[j].strip() or 'blank'!r})")
-        if not cols and not has_value(r):
-            cells = ", ".join(f"{header[j]}={r[j].strip() or 'blank'}" for j in range(width) if j != label_col)
-            out.append(f"`{rel}` row '{name}' holds no computed value ({cells})")
+        p = _row_problem(rel, r[label_col], header, r, kinds, named)
+        if p:
+            out.append(p)
     return out
 
 
@@ -259,7 +327,7 @@ def _empty(v) -> bool:
 
 
 def _failing(v) -> bool:
-    return v is False or (isinstance(v, str) and v.strip().upper().replace(" ", "_") in _FAILING)
+    return v is False or (isinstance(v, str) and _vocab(v) in _FAIL_CELLS)
 
 
 def _bench_entries(doc) -> dict[str, dict]:
@@ -279,19 +347,27 @@ def _bench_entries(doc) -> dict[str, dict]:
     return out
 
 
-def _entry_problems(rel: str, e: dict, bm, gate_r: dict | None) -> list[str]:
+def _entry_problems(run_dir: str, rel: str, e: dict, bm, gate_r: dict | None) -> tuple[list[str], list[str]]:
+    """(high, medium) for one benchmark entry of a cited file. The value is
+    resolved as benchmark_match resolves it (`computed_value`, else
+    `computed_field: <path>::<key>`, contained in the run), or `observed`."""
     bid = e.get("id")
     if e.get("within_band") is False:
-        return [f"`{rel}` records {bid} outside its band (within_band: false)"]
-    raw = next((e[k] for k in ("computed_value", "observed") if k in e), None)
-    val = finite_number(raw)
-    if val is None:
-        return [f"`{rel}` has no computed value for {bid} ({raw!r})"]
+        return [f"`{rel}` records {bid} outside its band (within_band: false)"], []
+    if "computed_value" in e or "computed_field" in e:
+        val, diag = bm._resolve_observed(run_dir, e)
+        if val is None and "outside the run" in diag:
+            return [], [f"`{rel}`: {bid} {diag}"]
+    else:
+        val, diag = e.get("observed"), ""
+    v = finite_number(val)
+    if v is None:
+        return [f"`{rel}` has no computed value for {bid} ({diag or repr(val)})"], []
     lo, hi, _ = bm._band(e) if "target_value" in e else (
         (gate_r or {}).get("band_low"), (gate_r or {}).get("band_high"), "")
-    if finite_number(lo) is not None and finite_number(hi) is not None and not lo <= val <= hi:
-        return [f"`{rel}` has {bid} = {val:.4g}, outside its band [{lo:.4g}, {hi:.4g}]"]
-    return []
+    if finite_number(lo) is not None and finite_number(hi) is not None and not lo <= v <= hi:
+        return [f"`{rel}` has {bid} = {v:.4g}, outside its band [{lo:.4g}, {hi:.4g}]"], []
+    return [], []
 
 
 def _gate_problems(bid: str, r: dict) -> list[str]:
@@ -309,7 +385,43 @@ def _gate_problems(bid: str, r: dict) -> list[str]:
 
 # --------------------------------------------------------------------------- the check
 
-def _check_statement(run_dir, stmt, paths, table, gate, ids, cache, bm) -> tuple[list[str], list[str]]:
+def _clauses(stmt: str) -> list[str]:
+    """Split a sentence at `;`, ` but `, `, while `, `, whereas ` outside
+    brackets and backticks, so "(B1 in band; `x.csv`)" stays one clause."""
+    out, depth, tick, start, i = [], 0, False, 0, 0
+    while i < len(stmt):
+        ch = stmt[i]
+        if ch == "`":
+            tick = not tick
+        elif not tick and ch in "([":
+            depth += 1
+        elif not tick and ch in ")]":
+            depth = max(0, depth - 1)
+        elif not tick and depth == 0 and (m := _CLAUSE_BREAK_RE.match(stmt, i)):
+            out.append(stmt[start:i])
+            start = i = m.end()
+            continue
+        i += 1
+    out.append(stmt[start:])
+    return [c for c in out if c.strip()]
+
+
+def _pass_scope(stmt: str, inherited: list, table: bool) -> tuple[str, list] | None:
+    """(context, cited paths) the pass verdict is about, or None when the
+    association is ambiguous. A table row: the row and its heading's paths,
+    unless it also states a failure. A sentence: only the clauses that carry a
+    pass verdict and no failure; paths in other clauses are not the verdict's."""
+    if table:
+        if _FAIL_RE.search(stmt):
+            return None
+        return stmt, list(dict.fromkeys(_PATH_RE.findall(stmt) + list(inherited)))
+    clean = [c for c in _clauses(stmt) if _passes(c) and not _FAIL_RE.search(c)]
+    if not clean:
+        return None
+    return " ".join(clean), list(dict.fromkeys(p for c in clean for p in _PATH_RE.findall(c)))
+
+
+def _check_statement(run_dir, stmt, context, paths, table, gate, ids, cache, bm) -> tuple[list[str], list[str]]:
     """(high reasons, medium reasons) for one statement with a pass verdict."""
     high, med = [], []
     docs = []
@@ -332,12 +444,14 @@ def _check_statement(run_dir, stmt, paths, table, gate, ids, cache, bm) -> tuple
             metrics.append(str(gate[bid].get("metric") or ""))
     if table and bound and any(_NOT_COMPUTED_RE.match(c) for c in stmt.strip("|").split("|")):
         high.append("the row's own value cell says it was not computed")
-    plain = re.sub(r"`[^`]*`", " ", stmt)
+    plain = re.sub(r"`[^`]*`", " ", context)
     for rel, key, doc in docs:
         listed = _bench_entries(doc)
         entries = [listed[bid] for bid in bound if bid in listed]
         for e in entries:
-            high += _entry_problems(rel, e, bm, gate.get(str(e.get("id"))))
+            h, m = _entry_problems(run_dir, rel, e, bm, gate.get(str(e.get("id"))))
+            high += h
+            med += m
             metrics.append(str(e.get("metric") or ""))
         if entries:
             continue
@@ -357,13 +471,24 @@ def _check_statement(run_dir, stmt, paths, table, gate, ids, cache, bm) -> tuple
 def evaluate(run_dir: str) -> list[dict]:
     """One record per statement with a problem: file, line, statement, high, medium, stage."""
     bm = __import__("benchmark_match")
-    gate = {str(r.get("id")): r for r in bm.evaluate(run_dir).get("results") or []}
+    out = []
+    targets = os.path.join(run_dir, "models", "benchmark_targets.yaml")
+    if os.path.lexists(targets) and not inside_dir(run_dir, targets):
+        gate = {}
+        out.append({"file": "models/benchmark_targets.yaml", "line": 0, "statement": "", "stage": "ANALYZE",
+                    "high": [], "medium": ["models/benchmark_targets.yaml resolves outside the run directory "
+                                           "(symlink), so benchmark verdicts cannot be checked"]})
+    else:
+        gate = {str(r.get("id")): r for r in bm.evaluate(run_dir).get("results") or []}
     ids = set(gate)
     cache: dict = {}
-    out = []
     for name, stage in PROSE:
         p = os.path.join(run_dir, name)
-        if not os.path.isfile(p):
+        if not os.path.lexists(p):
+            continue
+        if not inside_dir(run_dir, p):
+            out.append({"file": name, "line": 0, "statement": "", "stage": stage, "high": [],
+                        "medium": [f"{name} resolves outside the run directory (symlink); not read"]})
             continue
         try:
             with open(p, encoding="utf-8") as f:
@@ -375,10 +500,13 @@ def evaluate(run_dir: str) -> list[dict]:
         for line_no, stmt, inherited, table in _statements(text):
             if not _passes(stmt):
                 continue
-            paths = list(dict.fromkeys(_PATH_RE.findall(stmt) + list(inherited)))
+            scope = _pass_scope(stmt, inherited, table)
+            if scope is None:
+                continue
+            context, paths = scope
             if not paths and not _bound_ids(stmt, ids, table):
                 continue
-            high, med = _check_statement(run_dir, stmt, paths, table, gate, ids, cache, bm)
+            high, med = _check_statement(run_dir, stmt, context, paths, table, gate, ids, cache, bm)
             if high or med:
                 out.append({"file": name, "line": line_no, "statement": stmt, "stage": stage,
                             "high": list(dict.fromkeys(high)), "medium": list(dict.fromkeys(med))})
@@ -437,14 +565,22 @@ def _self_test() -> int:
         if not c:
             fails.append(m)
 
-    def run(results: str, files: dict | None = None, targets: str | None = _TARGETS):
-        with tempfile.TemporaryDirectory() as d:
+    def run(results: str, files: dict | None = None, targets: str | None = _TARGETS,
+            outside: dict | None = None, links: dict | None = None):
+        """`outside` files go in a directory beside the run; `links` maps a run
+        path to a symlink target in that directory ('' = the directory itself)."""
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as ext:
             os.makedirs(os.path.join(d, "models"))
-            if targets is not None:
+            for rel, body in (outside or {}).items():
+                open(os.path.join(ext, rel), "w").write(body)
+            for rel, tgt in (links or {}).items():
+                os.symlink(os.path.join(ext, tgt) if tgt else ext, os.path.join(d, rel))
+            if targets is not None and not os.path.lexists(os.path.join(d, "models", "benchmark_targets.yaml")):
                 open(os.path.join(d, "models", "benchmark_targets.yaml"), "w").write(targets)
             for rel, body in (files or {}).items():
                 open(os.path.join(d, rel), "w").write(body)
-            open(os.path.join(d, "results.md"), "w").write(results)
+            if not os.path.lexists(os.path.join(d, "results.md")):
+                open(os.path.join(d, "results.md"), "w").write(results)
             return gate_findings(d)
 
     base = {"models/cea.csv": _CSV}
@@ -491,8 +627,9 @@ def _self_test() -> int:
     # V6: no identifiable row: a file with values passes, an all-empty file does not.
     f = run("The cost clause holds (`models/cea.csv`).\n", base)
     ok(f == [], f"V6a unidentified row with values elsewhere: {f}")
-    f = run("The cost clause holds (`models/z.csv`).\n", {"models/z.csv": "unit,value\na,\nb,0\n"})
-    ok(len(f) == 1 and f[0]["severity"] == "HIGH" and "no non-zero" in f[0]["claim"], f"V6b all-empty: {f}")
+    f = run("The cost clause holds (`models/z.csv`).\n", {"models/z.csv": "unit,value\na,\nb,nan\n"})
+    ok(len(f) == 1 and f[0]["severity"] == "HIGH" and "no computed value in any row" in f[0]["claim"],
+       f"V6b all-empty: {f}")
     # V7: with several ids, only the one the verdict follows is bound (B2 stated out of band).
     f = run("Cost is B1 in band; prevalence B2 out of band.\n")
     ok(f == [], f"V7 id binding: {f}")
@@ -510,6 +647,63 @@ def _self_test() -> int:
     f = run("## Benchmarks (`models/bc.yaml`)\n| ID | Verdict |\n|---|---|\n| B2 | AGREE |\n| B1 | AGREE |\n",
             {"models/bc.yaml": "computed:\n  B2: 0.21\n  B1: 900.0\n"}, targets=unscored)
     ok(len(f) == 1 and "B1 = 900" in f[0]["claim"] and "results.md:5" in f[0]["claim"], f"V9b computed mapping: {f}")
+
+    # Codex round 1 on #63 (C1-C5): each was a false HIGH or an unchecked read.
+    # C1: a cited file, a cited file's parent dir, a prose file or the targets file that is a
+    # symlink out of the run is never read: MEDIUM, and nothing from outside is checked.
+    f = run("The cost clause holds (`models/ext.csv`).\n", outside={"x.csv": "unit,value\na,\n"},
+            links={"models/ext.csv": "x.csv"})
+    ok(len(f) == 1 and f[0]["severity"] == "MEDIUM" and "symlink" in f[0]["claim"], f"C1a symlinked file: {f}")
+    f = run("The cost clause holds (`ext/x.csv`).\n", outside={"x.csv": "unit,value\na,\n"}, links={"ext": ""})
+    ok(len(f) == 1 and f[0]["severity"] == "MEDIUM" and "symlink" in f[0]["claim"], f"C1b symlinked dir: {f}")
+    f = run("", outside={"r.md": "The cost clause holds (`models/cea.csv`, chemoprevention).\n"},
+            links={"results.md": "r.md"}, files=base)
+    ok(len(f) == 1 and f[0]["severity"] == "MEDIUM" and "results.md resolves outside" in f[0]["claim"],
+       f"C1c symlinked prose file: {f}")
+    f = run("Prevalence is in band (B2).\n", outside={"t.yaml": _TARGETS},
+            links={"models/benchmark_targets.yaml": "t.yaml"})
+    ok(len(f) == 1 and f[0]["severity"] == "MEDIUM" and "benchmark_targets.yaml resolves outside" in f[0]["claim"],
+       f"C1d symlinked targets: {f}")
+    # C2: a cited benchmark entry with `computed_field:` is resolved through benchmark_match
+    # (in band: no finding), and a computed_field out of the run is MEDIUM, not read.
+    cf = ("benchmarks:\n- id: B1\n  metric: m\n  target_value: 40.0\n  tolerance_factor: 5.0\n"
+          "  computed_field: models/out.yaml::cost.v\n")
+    f = run("## B (`models/cf.yaml`)\n| ID | Verdict |\n|---|---|\n| B1 | AGREE |\n",
+            {"models/cf.yaml": cf, "models/out.yaml": "cost:\n  v: 35.0\n"})
+    ok(f == [], f"C2a computed_field resolved: {f}")
+    f = run("## B (`models/cf.yaml`)\n| ID | Verdict |\n|---|---|\n| B1 | AGREE |\n",
+            {"models/cf.yaml": cf.replace("models/out.yaml", "ext/out.yaml")},
+            outside={"out.yaml": "cost:\n  v: 35.0\n"}, links={"ext": ""})
+    ok(len(f) == 1 and f[0]["severity"] == "MEDIUM" and "outside the run" in f[0]["claim"],
+       f"C2b computed_field outside the run: {f}")
+    # C3: a finite zero is a computed value; zero is missing only in a count column the
+    # statement names. The attempt-8 shape (blank metric, count 0) still fails (V1).
+    zero = "check,bias,n_units\nalpha,0.0,12\nbeta,1.5,3\n"
+    f = run("The alpha bias check passes (`models/z.csv`).\n", {"models/z.csv": zero})
+    ok(f == [], f"C3a zero bias is a value: {f}")
+    f = run("The alpha check passes (`models/z.csv`).\n", {"models/z.csv": zero})
+    ok(f == [], f"C3b zero in an unnamed row: {f}")
+    f = run("The alpha check passes on n_units (`models/z.csv`).\n", {"models/z.csv": zero.replace(",12", ",0")})
+    ok(len(f) == 1 and "n_units` = 0" in f[0]["claim"], f"C3c named zero count: {f}")
+    # C4: a failure in another clause of the same sentence does not leak into the pass clause.
+    two = "intervention,cost\nAlpha,12.0\nBeta,\n"
+    f = run("Alpha passes (`models/two.csv`); Beta fails because its cost was not computed.\n",
+            {"models/two.csv": two})
+    ok(f == [], f"C4a other clause ignored: {f}")
+    f = run("Alpha passes (`models/two.csv`); Beta's cost was not computed.\n", {"models/two.csv": two})
+    ok(f == [], f"C4b row named only in a clause without the verdict: {f}")
+    f = run("Alpha passes but Beta fails (`models/two.csv`).\n", {"models/two.csv": two})
+    ok(f == [], f"C4c path in the failing clause: skipped as ambiguous: {f}")
+    f = run("Beta passes (`models/two.csv`); Alpha is fine.\n", {"models/two.csv": two})
+    ok(len(f) == 1 and "'Beta'" in f[0]["claim"], f"C4d the pass clause is still checked: {f}")
+    # C5: a categorical verdict column is read as a verdict, not as a missing number.
+    vc = "check,verdict\nalpha,PASS\nbeta,FAIL\n"
+    f = run("The alpha check passes (`models/v.csv`).\n", {"models/v.csv": vc})
+    ok(f == [], f"C5a verdict PASS supports: {f}")
+    f = run("The beta check passes (`models/v.csv`).\n", {"models/v.csv": vc})
+    ok(len(f) == 1 and f[0]["severity"] == "HIGH" and "= FAIL" in f[0]["claim"], f"C5b verdict FAIL contradicts: {f}")
+    f = run("The check passes (`models/v.csv`).\n", {"models/v.csv": vc})
+    ok(f == [], f"C5c no row identified, verdict column: ambiguous, skipped: {f}")
 
     if fails:
         print(f"FAIL: {len(fails)} case(s)", file=sys.stderr)
