@@ -1004,6 +1004,13 @@ The validator has already decided for you. Your job is to carry it out:
     `scope_declaration.yaml`. Do not spawn the same target_stage
     agent with the same fix instructions a fourth time.
 
+  * **Stalled findings (Phase 47 ε)** — when the validator output lists
+    `stalled_findings:`, those gate findings have not moved for the
+    number of rounds set in effort_floors.yaml. Plan a diagnosis, not
+    another patch: spawn the modeler to record one per finding in
+    `models/stall_diagnoses.yaml` (rigor manifest entry
+    `stall_diagnoses`), or declare the finding in scope_declaration.yaml.
+
 - **DECLARE_SCOPE**: HIGH blockers remain and rounds exhausted, or
   (Phase 39) every outstanding item is a gate finding that
   `scope_declaration.yaml` declared at this gate and the previous one,

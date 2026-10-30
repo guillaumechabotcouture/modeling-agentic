@@ -698,6 +698,10 @@ If a required rigor artifact genuinely does not apply to this question
 with a justification to `scope_declaration.yaml`; a missing required
 artifact otherwise blocks ACCEPT at every round.
 
+When the lead's spawn names a stalled finding (`finding_stalled_without_diagnosis`,
+Phase 47 ε), do not patch it again: diagnose it in `models/stall_diagnoses.yaml`
+(schema and cause-class order in the rigor manifest, entry `stall_diagnoses`).
+
 If the full model is too slow for the local draw floor (>2 hours total),
 build a surrogate (emulator on a sparse grid of full-model runs) and
 expose the surrogate via `outcome_fn`.

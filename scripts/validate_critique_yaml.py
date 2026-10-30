@@ -602,18 +602,28 @@ def _declared_early(outstanding: list[dict], d: dict) -> bool:
     gate. Never with a required artifact missing, a critic's blocker, or a
     critic's finding carried under a gate kind (persistence escalation, a
     regressed or unmet finding test, the sufficiency critic). Gate ids
-    (RIG-001...) are renumbered every run, so only the kind is matched."""
+    (RIG-001...) are renumbered every run, so only the kind is matched.
+    Phase 47 ε: a gate kind's `<kind>_persistent` counts as declared when it
+    and its base kind both are; a stalled finding without a diagnosis never."""
     now, prev = set(d.get("declared") or ()), set(d.get("declared_prev") or ())
     if not now or not prev or d.get("accept_blockers"):
         return False
     for b in outstanding:
         kind = str(b.get("kind") or "")
-        if (kind.endswith("_persistent") or kind.startswith(_CRITIC_DERIVED_PREFIXES)
+        # Phase 47 ε: a gate kind's own persistence escalation may be declared like
+        # its base kind (attempt 8 rounds 6-7); a critic blocker's (`D-014_persistent`) not.
+        gate_persistent = (kind.endswith("_persistent")
+                           and kind[:-len("_persistent")] in _VALIDATOR_KIND_ESCALATION_THRESHOLDS)
+        if ((kind.endswith("_persistent") and not gate_persistent)
+                or kind.endswith("_without_diagnosis") or kind.startswith(_CRITIC_DERIVED_PREFIXES)
                 or str(b.get("source") or b.get("reviewer") or "").startswith("critique")):
             return False
         if is_non_declarable(kind, b.get("scope_declarable")):
             return False
         if not (kind in now and kind in prev):
+            return False
+        base = kind[:-len("_persistent")] if gate_persistent else kind
+        if not (base in now and base in prev):
             return False
     return True
 
@@ -1444,6 +1454,10 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None,
         violations += G(_check_persistent_medium_escalation, run_dir,
                         round_n=round_n,
                         current_kinds={v.get("kind") for v in violations})
+    # Phase 47 ε (A17): a finding at N gates in a row needs a diagnosis or a declaration.
+    violations += G(lambda rd: _load_sibling("stall_rule").gate_findings(
+                        rd, round_n, violations, _declared_ids(rd), is_non_declarable),
+                    run_dir, check_name="stall_rule")
     _annotate_first_seen(run_dir, violations)
     return violations
 
@@ -3031,7 +3045,8 @@ def _append_validator_history(run_dir: str, round_n: int, decision: dict,
         "action": decision.get("action"),
         "declared": list(decision.get("declared") or []),
         "findings": [{"kind": v.get("kind"), "severity": v.get("severity"),
-                      "stage": v.get("stage")}
+                      "stage": v.get("stage"),
+                      **({"key": v["stall_key"]} if "stall_key" in v else {})}   # Phase 47 ε
                      for v in (decision.get("rigor_violations") or [])],
     }
     try:
@@ -5111,6 +5126,12 @@ def render_text(decision: dict, current_round: int, max_rounds: int) -> str:
         for v in rig:
             lines.append(f"    - [{v['severity']}] {v['stage']}/{v['kind']}: "
                          f"{v['claim'][:120]}")
+    stalled = decision.get("stalled_findings") or []
+    if stalled:   # Phase 47 ε (A17): plan a diagnosis for these, not another patch
+        lines.append(f"  stalled_findings: {len(stalled)} (diagnose in models/stall_diagnoses.yaml "
+                     f"or declare; do not patch again)")
+        for s in stalled:
+            lines.append(f"    - {s['finding']} ({s['severity']}, rounds {s['rounds'][0]}-{s['rounds'][-1]})")
     # Phase 5 ζ: surface stuck blockers so the lead can pick the right
     # escalation path (SCOPE_DECLARE_EARLY, CROSS_STAGE_ESCALATE, etc.).
     attempts = decision.get("blocker_attempts") or {}
@@ -5200,6 +5221,35 @@ def _run_self_test() -> int:
        "EF11 (Codex) no early finish while a required artifact is missing")
     ok(act([{**bd, "kind": "benchmark_computed_missing", "id": "RIG-001"}], ["RIG-001"], ["RIG-001"])["action"]
        == "PATCH_OR_RETHINK", "EF12 (Codex) renumbered gate ids never match a declaration; only kinds do")
+    # Phase 47 ε: attempt 8 rounds 6-7 (all five open HIGHs declared at both gates).
+    wp = {"kind": "weakly_identified_parameters_persistent", "id": "RIG-003", "severity": "HIGH"}
+    wbase = ["weakly_identified_parameters", "weakly_identified_parameters_persistent"]
+    r = act([bd, wp], both + wbase, both + wbase)
+    ok(r["action"] == "DECLARE_SCOPE" and r["rule_matched"] == "3a",
+       f"EF13 a gate kind's persistence escalation declared with its base kind: finish now ({r['action']})")
+    ok(act([bd, wp], both + wbase[1:], both + wbase[1:])["action"] == "PATCH_OR_RETHINK",
+       "EF13b ...not when only the escalation is declared")
+    st = {"kind": "finding_stalled_without_diagnosis", "id": "RIG-004", "severity": "HIGH", "scope_declarable": True}
+    ok(act([bd, st], both + [st["kind"]], both + [st["kind"]])["action"] == "PATCH_OR_RETHINK",
+       "EF14 a stalled finding without a diagnosis is never declared away early")
+    import inspect as _inspect47
+    _src47 = _inspect47.getsource(_check_rigor_artifacts)
+    ok('_load_sibling("stall_rule").gate_findings(' in _src47 and 'check_name="stall_rule"' in _src47
+       and _src47.index("stall_rule") > _src47.index("_check_persistent_medium_escalation"),
+       "SW1 stall_rule runs in _check_rigor_artifacts after the persistence escalation")
+    with tempfile.TemporaryDirectory() as d:
+        _append_validator_history(d, 2, {"action": "PATCH_OR_RETHINK", "rigor_violations": [
+            {"kind": "benchmark_drift", "severity": "HIGH", "stall_key": "B9"},
+            {"kind": "scope_declaration_cap_raised", "severity": "LOW"}]}, False)
+        rec = json.loads(open(os.path.join(d, _VALIDATOR_HISTORY_FILE)).read())
+        ok(rec["findings"][0].get("key") == "B9" and "key" not in rec["findings"][1],
+           f"SW2 the history records each tracked finding's key: {rec['findings']}")
+        txt = render_text({"unresolved_high": [], "structural_mismatch": False, "rounds_remaining": 2,
+                           "rule_matched": 2, "action": "PATCH_OR_RETHINK", "rationale": "x",
+                           "stalled_findings": [{"finding": "benchmark_drift:B9", "severity": "HIGH",
+                                                 "rounds": [3, 4, 5]}]}, 5, 8)
+        ok("stalled_findings: 1" in txt and "benchmark_drift:B9 (HIGH, rounds 3-5)" in txt,
+           f"SW3 the decision text lists stalled findings: {txt}")
     ok(act([bd, sa], both, both, cur=8)["action"] == "DECLARE_SCOPE" and act([bd, sa], both, both, cur=8)["rule_matched"] == 3,
        "EF7 in the last round the existing rule 3 applies")
     with tempfile.TemporaryDirectory() as d:
@@ -8601,6 +8651,8 @@ def main() -> int:
                 decision, rigor_violations,
                 args.max_rounds, args.current_round,
             )
+        decision["stalled_findings"] = [v["stall"] for v in rigor_violations   # Phase 47 ε
+                                        if isinstance(v.get("stall"), dict)]
 
     if args.parameter_registry:
         registry_module = _load_effect_size_registry()

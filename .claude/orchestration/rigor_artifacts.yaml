@@ -522,3 +522,26 @@ artifacts:
       The harness's model card uses it as the valid domain for later what-if
       queries (`scripts/ask.py`); without it only the registry prior intervals
       count. Declare only ranges the run actually covered.
+
+  # ---- Phase 47 ε -------------------------------------------------------------
+
+  - id: stall_diagnoses
+    path: models/stall_diagnoses.yaml
+    first_draft_round: 3
+    finalize_round: 8
+    stage: model
+    skill: modeling-strategy
+    triggered_by: always
+    scope_declarable: false
+    required_for_accept: never   # required per stalled finding by scripts/stall_rule.py
+    description: |
+      **When the gate lists a stalled finding** (Phase 47 ε, A17): one present at
+      `stall_rounds` consecutive gates (effort_floors.yaml). Do not patch it
+      again; diagnose it. Append under `diagnoses:` an entry with `finding:`
+      (the `kind:key` the gate printed), `round:`, `checks:` (each
+      `cause_class` once, in this order: missing_data, missing_mechanism,
+      structural_constraint, inconsistent_targets,
+      mismatched_target_definition, bounds; `test:` a file in the run the check
+      ran or wrote; `result:`), and `decision: fix` (with `change:`) or
+      `declare`. An entry lasts `stall_rounds` rounds. A missing test file
+      is HIGH, not declarable. A scope declaration of the finding also clears it.
