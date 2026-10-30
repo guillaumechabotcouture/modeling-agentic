@@ -15,6 +15,7 @@ Merged to main:
 
 In review (Phase 46, simplification with no change to gate output):
 - **α:** `scripts/gate_replay.py` replays the STAGE 7 validator on saved runs and diffs the findings; `agents/contract_packet.py` (unused, failing self-test) and five unused back-compat helpers removed.
+- **β:** the uncertainty-report, benchmark and comparator-efficiency checks moved from `validate_critique_yaml.py` (10,104 → 8,672 lines) into `scripts/uq_ci_quality.py`, `scripts/benchmark_gate.py` and `scripts/comparator_efficiency.py`, each with `gate_findings(run_dir)` and its own self-test (stacked on α).
 
 Before attempt 9:
 - A9 (stale data-stage figures), waiting for attempt 8's records; A10 (session crash) is investigated from the same records but does not hold the launch;

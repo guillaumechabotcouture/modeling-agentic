@@ -146,11 +146,11 @@ Before opening a PR, every command below must report
 
 ```bash
 for f in main.py \
-  scripts/alloc_toolkit_use.py scripts/allocation_robustness.py scripts/ask.py scripts/benchmark_match.py \
+  scripts/alloc_toolkit_use.py scripts/allocation_robustness.py scripts/ask.py scripts/benchmark_gate.py scripts/benchmark_match.py \
   scripts/benchmark_transfer.py scripts/model_card.py \
   scripts/build_claims_ledger.py scripts/data_schema.py scripts/data_use.py \
   scripts/cloud_batch.py scripts/coherence_audit.py \
-  scripts/compare_models.py scripts/compute.py scripts/convergence_report.py \
+  scripts/comparator_efficiency.py scripts/compare_models.py scripts/compute.py scripts/convergence_report.py \
   scripts/cross_model_critic.py scripts/decision_brief.py scripts/derived_rebuild.py scripts/done_when.py \
   scripts/effect_size_registry.py \
   scripts/effect_concordance.py \
@@ -167,7 +167,7 @@ for f in main.py \
   scripts/source_checks.py \
   scripts/spec_compliance.py scripts/structure_metrics.py scripts/validate_critique_yaml.py \
   scripts/verdict_binding.py \
-  scripts/validate_skill_attachments.py scripts/watch_run.py \
+  scripts/uq_ci_quality.py scripts/validate_skill_attachments.py scripts/watch_run.py \
   scripts/within_zone_sensitivity.py scripts/writer_qa.py \
   scripts/lib/expert_priors.py scripts/lib/md_helpers.py \
   scripts/lib/positive_control.py scripts/lib/provenance.py \

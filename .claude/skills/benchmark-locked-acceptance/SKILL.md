@@ -17,7 +17,7 @@ report will still ACCEPT because nothing computed the comparison.
 This skill turns the prose table into a structured YAML artifact
 (`models/benchmark_targets.yaml`) that `scripts/benchmark_match.py`
 diffs against the model's computed outputs and writes
-`benchmark_match.yaml`. The validator (`_check_benchmark_match`)
+`benchmark_match.yaml`. The validator (`scripts/benchmark_gate.py`)
 escalates DRIFT to HIGH after the model has had a round to settle.
 
 ## When to invoke
@@ -38,7 +38,7 @@ escalates DRIFT to HIGH after the model has had a round to settle.
   is listed as a stale copy in `benchmark_match.yaml`.
 - **Lead**, round 2+: run `python3 scripts/benchmark_match.py {run_dir}`
   after the modeler completes. Reads `benchmark_match.yaml` via
-  `_check_benchmark_match` in the validator.
+  `scripts/benchmark_gate.py` in the validator.
 
 ## Schema
 
