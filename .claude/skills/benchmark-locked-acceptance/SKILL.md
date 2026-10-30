@@ -27,9 +27,15 @@ escalates DRIFT to HIGH after the model has had a round to settle.
   `tolerance_factor` (or `tolerance_abs`), and `source` for each row.
   Leave `computed_value` and `computed_field` blank — the modeler
   fills them.
-- **Modeler**, round 1+: after each model run, set `computed_value`
-  on each benchmark target (or set `computed_field` to point at
-  another YAML the run produced).
+- **Modeler**, round 1+: after each model run, write the current
+  values to `models/benchmark_computed.yaml` (Phase 45 γ), one entry
+  per target id with `computed_value` (or `computed_field` pointing at
+  another YAML the run produced), or a `computed: {id: value}` mapping.
+  The gate locks `models/benchmark_targets.yaml` the first time it sees
+  it, so a value written there is frozen at that round; the computed
+  file is read instead, and a value it marks NaN/null is "not
+  computed", never in band. A different value still in the targets file
+  is listed as a stale copy in `benchmark_match.yaml`.
 - **Lead**, round 2+: run `python3 scripts/benchmark_match.py {run_dir}`
   after the modeler completes. Reads `benchmark_match.yaml` via
   `_check_benchmark_match` in the validator.

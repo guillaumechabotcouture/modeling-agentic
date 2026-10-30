@@ -383,9 +383,11 @@ artifacts:
       **Phase 19 γ.** Literature-anchored acceptance gate. Planner
       extracts the published-benchmarks table from plan.md into
       structured YAML: each target carries `target_value`,
-      `tolerance_factor` (or `tolerance_abs`), `source`. Modeler fills
-      `computed_value` (or `computed_field` pointer) after the model
-      run. `scripts/benchmark_match.py` writes `benchmark_match.yaml`
+      `tolerance_factor` (or `tolerance_abs`), `source`. The gate locks
+      it on first sight; after every model run the modeler writes the
+      current values (`computed_value` or `computed_field`) to
+      `models/benchmark_computed.yaml`, which wins over any copy in the
+      targets file (Phase 45 γ). `scripts/benchmark_match.py` writes `benchmark_match.yaml`
       with PASS/DRIFT/MALFORMED. Drift on > 1 of N benchmarks blocks
       ACCEPT unless scope-declared with literature-grounded
       justification. Scope-declarable because some questions imply
