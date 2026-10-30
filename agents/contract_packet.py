@@ -47,7 +47,9 @@ ARTIFACT_SCHEMAS = {
 returns {output_name: scalar | str}. MUST read every registered decision-critical parameter via
 `params.get('NAME', default)` (else HIGH `param_frozen_in_uq`). Zero-width 95% CI while inputs vary =
 HIGH non-declarable `ci_degenerate`; deterministic-by-design outputs go in
-`models/uq_declarations.yaml: deterministic_outputs: {output: "reason"}`. Surrogate/emulator path ⇒
+`models/uq_declarations.yaml: deterministic_outputs: {output: "reason"}`, constraint-fixed ones in
+`pinned_by_constraint: {output_or_family: {constraint: NAME, value: NUMBER}}` (draws must sit at value).
+Surrogate/emulator path ⇒
 `models/outcome_fn_calibration.md` with: architecture, ≥10 held-out full-model validation runs,
 per-output "RMSE", cross-validation error, extrapolation bounds (else HIGH `surrogate_uq_undocumented`).
 Lead runs `scripts/propagate_uncertainty.py` → `uncertainty_report.yaml` (do not write it).""",

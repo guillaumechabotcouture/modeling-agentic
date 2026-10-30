@@ -33,6 +33,15 @@ Output shape (uncertainty_report.yaml):
         ci_low: 5.45e6
         ci_high: 9.66e6
         n: 200
+      descoping_steps:      # zero in >= 50% of draws: also a rare event
+        mean: 0.16
+        ci_low: 0
+        ci_high: 0
+        n: 200
+        rare_event: true
+        p_nonzero: 0.02
+        p_nonzero_se: 0.0099
+        mean_if_nonzero: 8.0
       ...
     categorical_outputs:  # e.g., which package per archetype
       package_A1:
@@ -342,6 +351,34 @@ def parameter_summary(per_param_samples: dict) -> dict:
     return out
 
 
+# Phase 45 α (A12): an output that is exactly zero in at least this share
+# of draws is summarised as a rare event. At >= 50% zeros the median is
+# zero, and once the non-zero share falls below 2.5% both 95% bounds are
+# zero too, so the quantiles describe the zero mass rather than the event
+# (attempt 8: mean 0.16 with CI [0, 0]). The faithful summary is the event
+# probability, with its sampling error, and the size of the event when it
+# occurs. Reporting only: the gate does not relax `ci_degenerate` on these
+# fields (accepting P(output > 0) needs the per-draw values); it uses
+# p_nonzero to word the finding.
+RARE_EVENT_ZERO_FRACTION = 0.5
+
+
+def rare_event_summary(vals: list[float]) -> dict:
+    """p_nonzero, its binomial standard error and the conditional mean for
+    a zero-inflated output; {} when the output is not a rare event (fewer
+    than RARE_EVENT_ZERO_FRACTION zeros, or zero in every draw — the
+    latter is already a degenerate constant)."""
+    n = len(vals)
+    nonzero = [v for v in vals if v != 0.0]
+    if not n or not nonzero or (n - len(nonzero)) / n < RARE_EVENT_ZERO_FRACTION:
+        return {}
+    p = len(nonzero) / n
+    return {"rare_event": True,
+            "p_nonzero": p,
+            "p_nonzero_se": math.sqrt(p * (1.0 - p) / n),
+            "mean_if_nonzero": float(mean(nonzero))}
+
+
 def propagate(run_dir: str, n_draws: int = 200, seed: int = 42,
               outcome_fn_spec: Optional[str] = None,
               verbose: bool = False,
@@ -497,6 +534,7 @@ def propagate(run_dir: str, n_draws: int = 200, seed: int = 42,
             "n": n,
             "n_nonfinite": n_nonfinite.get(key, 0),
         }
+        entry.update(rare_event_summary(vals))
         # Phase 21 δ: a zero-width interval from uncertain inputs is a
         # defect, not a precise answer. Flag it with a diagnostic.
         scale = max(abs(entry["mean"]), 1e-300)
@@ -695,6 +733,30 @@ parameters:
            and nz["ci_low"] <= nz["median"] <= nz["ci_high"]
            and not nz.get("degenerate"),
            f"P21-4: NaN draws excluded + counted; got {nz}")
+
+        # P45-1 (Phase 45 α, A12): zero-inflated output → p_nonzero, its
+        # SE and the conditional mean; a mostly non-zero output and an
+        # all-zero output get no rare-event fields.
+        z = rare_event_summary([0.0] * 196 + [5.0, 7.0, 9.0, 11.0])
+        ok(z.get("rare_event") is True and abs(z["p_nonzero"] - 0.02) < 1e-12
+           and abs(z["p_nonzero_se"] - math.sqrt(0.02 * 0.98 / 200)) < 1e-12
+           and z["mean_if_nonzero"] == 8.0,
+           f"P45-1: rare-event fields; got {z}")
+        ok(rare_event_summary([0.0] * 40 + [1.0] * 60) == {}
+           and rare_event_summary([0.0] * 50) == {}
+           and rare_event_summary([0.0] * 50 + [2.0] * 50).get("p_nonzero") == 0.5,
+           "P45-2: <50% zeros or all-zero → no fields; exactly 50% → rare event")
+        with open(os.path.join(run_dir, "models", "outcome_fn.py"), "w") as f:
+            f.write("def outcome_fn(params):\n"
+                    "    x = params['irs_effect']\n"
+                    "    return {'cuts': 3.0 if x > 0.40 else 0.0, 'b': x}\n")
+        rep4 = propagate(run_dir, n_draws=200, seed=3)
+        cu = rep4["scalar_outputs"]["cuts"]
+        ok(cu.get("rare_event") is True and 0 < cu["p_nonzero"] < 0.5
+           and cu["mean_if_nonzero"] == 3.0
+           and "rare_event" not in rep4["scalar_outputs"]["b"]
+           and "cuts" not in rep4["degenerate_outputs"],
+           f"P45-3: propagate records rare-event fields; got {cu}")
 
         # P21-5: cloud path against the in-memory Azure fake — budget is
         # rejected before any pool is created; on success the created

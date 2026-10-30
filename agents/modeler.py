@@ -687,8 +687,11 @@ counts uncertainty runs per round.
 `outcome_fn` must actually read the sampled parameters: a zero-width
 95% interval on any output while its inputs vary is a HIGH,
 non-scope-declarable `ci_degenerate` finding (Phase 21 β). If an output
-is deterministic by design (e.g. a budget total), declare it in
-`models/uq_declarations.yaml` as `deterministic_outputs: {<output>: "<reason>"}`.
+is deterministic by design, declare it in `models/uq_declarations.yaml` as
+`deterministic_outputs: {<output>: "<reason>"}`; when a binding constraint fixes
+it (e.g. spend equals a budget envelope), declare
+`pinned_by_constraint: {<output or family>: {constraint: <name>, value: <number>}}`
+instead (schema in the rigor manifest, entry `outcome_fn`).
 
 If a required rigor artifact genuinely does not apply to this question
 (e.g. no allocation is produced), add `not_applicable: <artifact_id>`
