@@ -965,6 +965,7 @@ def _identifiability_report_violations(id_report: str,
             "kind": "unidentified_parameters",
             "severity": "HIGH",
             "stage": "IDENTIFIABILITY",
+            "key": unidentified,  # Phase 47 ε: instance key for scripts/stall_rule.py
             "claim": (f"identifiability analysis flagged "
                       f"{len(unidentified)} ridge-trapped "
                       f"parameter(s): {unidentified}. See "
@@ -989,6 +990,7 @@ def _identifiability_report_violations(id_report: str,
             "kind": "weakly_identified_parameters",
             "severity": "MEDIUM",
             "stage": "IDENTIFIABILITY",
+            "key": weak,  # Phase 47 ε: instance key for scripts/stall_rule.py
             "claim": (f"identifiability analysis flagged {len(weak)} weakly "
                       f"identified parameter(s): {weak}. Report their "
                       f"intervals as wide and avoid point-estimate claims "
@@ -1643,6 +1645,7 @@ def _check_plan_criteria(run_dir: str) -> list[dict]:
                 "kind": "plan_hard_blocker_failed",
                 "severity": "HIGH",
                 "stage": "PLAN_CRITERIA",
+                "key": entry["id"],  # Phase 47 ε: instance key for scripts/stall_rule.py
                 "claim": (
                     f"Hard blocker {entry['id']} FAILED: "
                     f"{entry['criterion']} ({entry['evidence']})"
@@ -1653,6 +1656,7 @@ def _check_plan_criteria(run_dir: str) -> list[dict]:
                 "kind": "plan_criterion_not_tested",
                 "severity": "MEDIUM",
                 "stage": "PLAN_CRITERIA",
+                "key": entry["id"],  # Phase 47 ε: instance key for scripts/stall_rule.py
                 "claim": (
                     f"Hard blocker {entry['id']} NOT_TESTED: "
                     f"{entry['criterion']} ({entry['evidence']}). "
@@ -1667,6 +1671,7 @@ def _check_plan_criteria(run_dir: str) -> list[dict]:
                 "kind": "plan_minimum_bar_failed",
                 "severity": "MEDIUM",
                 "stage": "PLAN_CRITERIA",
+                "key": entry["id"],  # Phase 47 ε: instance key for scripts/stall_rule.py
                 "claim": (
                     f"Minimum bar {entry['id']} FAILED: "
                     f"{entry['criterion']} ({entry['evidence']})"
@@ -1677,6 +1682,7 @@ def _check_plan_criteria(run_dir: str) -> list[dict]:
                 "kind": "plan_criterion_not_tested",
                 "severity": "MEDIUM",
                 "stage": "PLAN_CRITERIA",
+                "key": entry["id"],  # Phase 47 ε: instance key for scripts/stall_rule.py
                 "claim": (
                     f"Minimum bar {entry['id']} NOT_TESTED: "
                     f"{entry['criterion']} ({entry['evidence']}). "
@@ -1889,6 +1895,7 @@ def _check_allocation_robustness(run_dir: str) -> list[dict]:
             "kind": "allocation_unstable",
             "severity": "HIGH",
             "stage": "OPTIMIZATION",
+            "key": "allocation_robustness",  # Phase 47 ε: instance key for scripts/stall_rule.py
             "claim": (
                 f"Allocation cross-validation verdict: UNSTABLE. "
                 f"Worst-fold metrics fail even the FRAGILE band: rank "
@@ -1908,6 +1915,7 @@ def _check_allocation_robustness(run_dir: str) -> list[dict]:
             "kind": "allocation_fragile",
             "severity": "MEDIUM",
             "stage": "OPTIMIZATION",
+            "key": "allocation_robustness",  # Phase 47 ε: instance key for scripts/stall_rule.py
             "claim": (
                 f"Allocation cross-validation verdict: FRAGILE. "
                 f"Worst-fold metrics fall in the middle band: rank "
@@ -2172,6 +2180,7 @@ def _check_sensitivity_analysis(run_dir: str) -> list[dict]:
             "kind": "sensitivity_analysis_unstable",
             "severity": "HIGH",
             "stage": "OPTIMIZATION",
+            "key": "sensitivity_analysis",  # Phase 47 ε: instance key for scripts/stall_rule.py
             "claim": (
                 f"Sensitivity analysis verdict UNSTABLE: "
                 f"{s.get('flips', 0)} of {s.get('total_perturbations', 0)} "
@@ -2190,6 +2199,7 @@ def _check_sensitivity_analysis(run_dir: str) -> list[dict]:
             "kind": "sensitivity_analysis_sensitive",
             "severity": "MEDIUM",
             "stage": "OPTIMIZATION",
+            "key": "sensitivity_analysis",  # Phase 47 ε: instance key for scripts/stall_rule.py
             "claim": (
                 f"Sensitivity analysis verdict SENSITIVE: "
                 f"{s.get('flips', 0)} of {s.get('total_perturbations', 0)} "
@@ -2273,6 +2283,7 @@ def _check_figure_validator(run_dir: str) -> list[dict]:
                     "kind": "figure_staleness_detected",
                     "severity": "HIGH",
                     "stage": "ANALYZE",
+                    "key": f"figures/{entry}",  # Phase 47 ε: instance key for scripts/stall_rule.py
                     "claim": (
                         f"Figure {entry} was drawn from source data that "
                         f"has since changed. The recorded provenance "
@@ -2310,6 +2321,7 @@ def _check_figure_validator(run_dir: str) -> list[dict]:
                     "kind": "figure_validator_missing",
                     "severity": "MEDIUM",
                     "stage": "ANALYZE",
+                    "key": os.path.relpath(py, run_dir),  # Phase 47 ε: instance key for scripts/stall_rule.py
                     "claim": (
                         f"{os.path.relpath(py, run_dir)}:{idx + 1} calls "
                         f"savefig but no validate_figure(...) appears "
@@ -2690,6 +2702,7 @@ def _check_sanity_schema(run_dir: str,
             "kind": f"sanity_check_failed_{check_id}",
             "severity": "MEDIUM",
             "stage": "MODEL",
+            "key": check_id,  # Phase 47 ε: instance key for scripts/stall_rule.py
             "claim": (
                 f"Sanity check {check_id!r} failed: {c.get('claim', '')}. "
                 f"Either fix the underlying numbers/relationships in "
