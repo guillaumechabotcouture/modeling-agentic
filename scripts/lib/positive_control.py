@@ -685,7 +685,9 @@ def build(run_dir: str, round_n: int = 2) -> dict:
     _w(run_dir, "models/mechanism_manifest.yaml", {"mechanisms": [{
         "id": "district_age_profile", "status": "simplified",
         "assumption": "one age profile for every district",
-        "sufficiency_test": "models/sufficiency_age_profile.yaml"}]})
+        "sufficiency_test": "models/sufficiency_age_profile.yaml"}],
+        # Phase 47 γ D9: the plan adds no decision-layer feature beyond the brief.
+        "decision_layer": []})
     _w(run_dir, "modeling_strategy.md",
        "# Modeling strategy\n\n## Pre-mortem Responses\n\n"
        "PM-001: incidence is calibrated to counts with a fitted scale "

@@ -901,6 +901,20 @@ is absent, HIGH `optimization_quality_no_benchmark` if benchmark_methods
 is empty, and MEDIUM `optimization_quality_gap_too_large` if gap_pct
 exceeds 10%. See `optimizer-method-selection` skill.
 
+### 4h. Decision-layer features: show they change the recommendation (Phase 47 γ, D9)
+
+Start the decision layer as simple as the question and signed brief allow.
+Anything you add to the optimisation or the decision rule beyond them (a
+reserve, a descoping or contingency rule, a supply cap, a hedge, a
+threshold, a tolerance) goes under `decision_layer:` in
+`{run_dir}/models/mechanism_manifest.yaml` with a result file that solves
+the decision with and without it (schema: the `mechanism_manifest` row of
+the rigor artifact timeline below; how-to: the `decision-rule-extraction`
+skill). If the recommendation does not change, take the feature out. List
+the inputs each rule reads with the date each becomes available; a rule
+may use only what is known at its decision date. Write `decision_layer: []`
+when the plan adds nothing.
+
 ### 4e. Universal-coverage benchmark (Phase 7 Commit ν)
 
 When this run produces an allocation, you MUST also emit

@@ -16,13 +16,16 @@ Merged to main:
 In review (Phase 46, simplification with no change to gate output):
 - **α:** `scripts/gate_replay.py` replays the STAGE 7 validator on saved runs and diffs the findings; `agents/contract_packet.py` (unused, failing self-test) and five unused back-compat helpers removed.
 
+In review (Phase 47 γ):
+- **D9:** decision-layer features listed under `decision_layer:` in `models/mechanism_manifest.yaml`, each with a with/without sufficiency test (or `specified_by` the question or brief) and the dates of the information it reads. The list is required once the run has an allocation; the red-team and sufficiency critics name features missing from it.
+
 Before attempt 9:
 - A16 (compute places chunks on free workers itself, so VMs that join mid-batch get work);
 - A9 (stale data-stage figures), waiting for attempt 8's records; A10 (session crash) is investigated from the same records but does not hold the launch;
 - a pre-launch smoke on main, then owner sign-off on the brief.
 
 After attempt 9:
-- D9, D10 (decision-layer sufficiency, observed-vs-modelled inputs);
+- D10 (observed-vs-modelled inputs; D9 is in review above);
 - E3, E4; B4 (needs S3), B5, B6; C1–C3; D7;
 - smaller items: a gate-side P(output > 0) check from the per-draw values (A12 kept only the reporting); a pin or deterministic declaration can still exempt a frozen output with any reason (no weaker than before #62); attempt 8's B9 scope declaration rested on a stale benchmark value.
 
@@ -111,7 +114,7 @@ Domain knowledge reaches the model only as prose, and a self-graded severity dec
 | D3 | **Data-use audit.** Every processed data column is read by model code, or listed as unused with a reason. | Static scan of `models/` against `data/processed/` headers; MEDIUM per unexplained unused column. | Unused columns without a reason = 0 (attempt 8: 3 species columns). |
 | D4 | **"Addressed" needs evidence.** A concern whose suggested check is a sensitivity analysis or a data use can only be closed by an artifact path that exists, at any severity. | Pre-mortem validator. | Concerns closed by prose = 0. |
 | D5 | **Transfer check for tuned effects.** When effect strengths are tuned to benchmark sites, also report the effect under the target setting's covariates, with the difference stated. | Benchmark report field. | Present whenever tuning is used. |
-| D9 | **Sufficiency tests for decision-layer features too.** D1 covers mechanisms in the disease model, not rules added to the decision. Attempt 8 added a reserve ladder, descoping rules, supply caps and a minimax hedge in rounds 3–5; its own results showed the reserve's overrun tolerance never binds (0 of 1,100 draws at every rung, D-045), and the 2026 rule used information not available at decision time (R-045). A rule added to the decision records whether it changes the recommendation, and which information it uses at the decision date; if it changes nothing, it is removed. | Mechanism manifest extended to decision rules; gate as D1. | Decision-layer features kept without a test = 0. |
+| D9 | **Sufficiency tests for decision-layer features too.** D1 covers mechanisms in the disease model, not rules added to the decision. Attempt 8 added a reserve ladder, descoping rules, supply caps and a minimax hedge in rounds 3–5; its own results showed the reserve's overrun tolerance never binds (0 of 1,100 draws at every rung, D-045), and the 2026 rule used information not available at decision time (R-045). A rule added to the decision records whether it changes the recommendation, and which information it uses at the decision date; if it changes nothing, it is removed. | Phase 47 γ: `decision_layer:` in the mechanism manifest, required once the run has an allocation (`[]` = none beyond the brief). Gate as D1: HIGH for no list, an untested feature, or a feature whose test shows no change that stays in the plan (unless a brief amendment names it); MEDIUM for an input available after the decision date. An unlisted feature is left to the red-team and sufficiency critics. Retro: catches attempt 8's overrun tolerance once listed; the list itself is HIGH from round 2. | Decision-layer features kept without a test = 0. |
 | D10 | **Model inputs checked against observed counterparts.** D3 checks that data columns are used, not that model inputs agree with observed records the run already has. Attempt 8: Ogun's modelled net campaign is 1.93× the observed procurement (others 1.10–1.20×, R-047), and the observed procurement record contradicts the supply caps (R-046). Where an observed counterpart exists for a model input, report the ratio per unit and flag outliers. | Data-use audit field; MEDIUM per unexplained outlier. | Input/observed outliers found by critics but not by the audit = 0. |
 
 *Disease content (priors and toolkit; malaria is the first instance):*

@@ -219,7 +219,7 @@ artifacts:
     skill: modeling-strategy
     triggered_by: always
     scope_declarable: false
-    required_for_accept: never   # required per mechanism by scripts/mechanism_manifest.py
+    required_for_accept: never   # required per mechanism / allocation by scripts/mechanism_manifest.py
     description: |
       **When a matched expert prior lists `requires_mechanism`** (Phase 42 γ,
       D1; `mechanism_manifest.py` prints the list). Start as simple as the
@@ -233,6 +233,20 @@ artifacts:
       entry, or a simplification without a result, is HIGH; a passed test
       lets the simplification stand (cite it in the report); a failed test
       means the mechanism is added next round.
+      **Decision layer, whenever the run has an allocation** (Phase 47 γ, D9;
+      the `decision-rule-extraction` skill): list under `decision_layer:`
+      every rule, constraint, reserve, hedge, cap, threshold or contingency
+      the optimisation or decision rule adds beyond the question and signed
+      brief (`decision_layer: []` if none), each with `kind: decision_rule`,
+      `description`, `in_recommended_plan`, `information_used`
+      (`[{input, available: YYYY-MM}]`) and a `sufficiency_test` result
+      solving the decision with and without it (same format), or
+      `specified_by: question|brief` with a verbatim `quote:`. A missing list
+      or test is HIGH; so is a feature whose test shows no change and that
+      stays in the plan (remove it, or keep it by a brief amendment naming
+      it: `owner_amendment: AM-n`). An input available only after the
+      decision date (the brief's `decision_date`, else the decision year, or
+      the feature's own `decision_date`) is MEDIUM. None are declarable.
 
   - id: data_use
     path: models/data_use.yaml

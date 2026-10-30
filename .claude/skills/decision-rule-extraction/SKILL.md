@@ -177,6 +177,41 @@ admit a compact rule. The Justification section is exempt from the
 self-reference check, so referencing the optimizer is allowed there
 to honestly explain the non-compressibility.
 
+## Decision-layer features: show they change the recommendation (Phase 47 γ, D9)
+
+The decision-rule features above (the tree's inputs) are not what this
+section is about. A **decision-layer feature** is anything the run adds to
+the optimisation or the rule beyond what the question or signed brief
+specifies: a reserve, a contingency or descoping rule, a supply or
+capacity cap, a hedge (minimax, robust), a threshold, a tolerance.
+
+E7 attempt 8 added four in rounds 3-5. Its own results showed the
+reserve's overrun tolerance never bound (the smallest admissible reserve
+was $0), one rule read costs only known after its decision date, and the
+critics spent rounds 4-7 on them. The rule is parsimony: **show the feature
+changes the recommendation, or take it out.**
+
+List each one under `decision_layer:` in `models/mechanism_manifest.yaml`
+(schema and findings: the `mechanism_manifest` entry in
+`.claude/orchestration/rigor_artifacts.yaml` and the
+`scripts/mechanism_manifest.py` docstring). For each feature:
+
+1. Solve the decision **with and without** it, and record the result file
+   (`varied`, `criterion`, `decision_changes`), the same format as a
+   simplified mechanism's sufficiency test. Use the criterion the brief or
+   the mechanism tests use; do not pick one after seeing the result.
+2. If the decision does not change, remove the feature from the plan and the
+   rule, and keep the entry with `in_recommended_plan: false`. Keep it only
+   if the owner wants it, through a brief amendment that names it.
+3. List the inputs it reads under `information_used`, each with the date it
+   becomes available. A rule acting at a later decision point (a mid-grant
+   review) gets its own `decision_date`. It may read only what is known
+   then: forecasts, or the last observed values, not realised values.
+
+A feature the question or brief itself specifies (a budget envelope, an
+eligibility list) takes `specified_by` with a verbatim `quote` and needs no
+test. When the plan adds nothing, write `decision_layer: []`.
+
 ## Writer integration
 
 When `decision_rule.md` exists, the writer agent MUST embed it
