@@ -136,11 +136,13 @@ def _resolve_computed_field(run_dir: str, ref: str) -> tuple[float | None, str]:
     try:
         with open(p) as f:
             doc = yaml.safe_load(f) or {}
-    except (yaml.YAMLError, OSError, UnicodeDecodeError) as e:
+    except (yaml.YAMLError, OSError, UnicodeDecodeError, ValueError) as e:
         return None, f"could not parse {rel}: {e}"
     val = _resolve_dotpath(doc, key)
     if val is None:
         return None, f"key {key!r} absent in {rel}"
+    if isinstance(val, bool):
+        return None, f"value at {rel}::{key} is {val!r}, not a number"
     try:
         return float(val), ""
     except (TypeError, ValueError, OverflowError):
@@ -163,7 +165,7 @@ def _computed_values(run_dir: str) -> tuple[dict[str, tuple[float | None, str]] 
     try:
         with open(p, encoding="utf-8") as f:
             doc = yaml.safe_load(f)
-    except (yaml.YAMLError, OSError, UnicodeDecodeError) as e:
+    except (yaml.YAMLError, OSError, UnicodeDecodeError, ValueError) as e:
         return None, f"could not parse {COMPUTED_PATH}: {str(e)[:200]}"
     if not isinstance(doc, dict):
         return None, f"{COMPUTED_PATH}: top level must be a mapping"
@@ -201,7 +203,11 @@ def _finite_value(raw) -> tuple[float | None, str]:
     except (TypeError, ValueError, OverflowError):
         v = None
     if v is None or not math.isfinite(v):
-        shown = repr(raw) if len(repr(raw)) <= 40 else repr(raw)[:37] + "..."
+        try:
+            shown = repr(raw)
+        except ValueError:  # an integer past Python's digit limit
+            shown = "an integer too large to print"
+        shown = shown if len(shown) <= 40 else shown[:37] + "..."
         return None, f"computed value is {shown}"
     return v, ""
 
@@ -306,7 +312,7 @@ def evaluate(run_dir: str) -> dict:
     try:
         with open(path) as f:
             doc = yaml.safe_load(f) or {}
-    except (yaml.YAMLError, OSError) as e:
+    except (yaml.YAMLError, OSError, UnicodeDecodeError, ValueError) as e:
         return {
             "verdict": "MALFORMED",
             "error": f"could not parse {path}: {e}",
@@ -827,6 +833,25 @@ def _self_test() -> int:
             rep = {"verdict": f"raised {type(e).__name__}"}
         ok(rep["verdict"] in ("DRIFT", "MALFORMED") and not by(rep, "b")["within_band"],
            f"T12i {label}: a huge number must give a non-passing result, got {rep}")
+    # T12j: an integer past Python's digit limit (YAML raises ValueError while
+    # loading, or repr() does while printing) never raises.
+    huger = "9" * 5000
+    for label, text in (("decimal", f"computed:\n  b: {huger}\n"),
+                        ("hex", "computed:\n  b: 0x" + "f" * 4000 + "\n")):
+        try:
+            rep = fresh_case(text, targets=None)
+        except Exception as e:  # noqa: BLE001
+            rep = {"verdict": f"raised {type(e).__name__}"}
+        ok(rep["verdict"] in ("DRIFT", "MALFORMED"),
+           f"T12j {label}: a huge integer must not raise, got {rep.get('verdict')}")
+    # T12k: a boolean reached through computed_field is not the number 1.
+    with tempfile.TemporaryDirectory() as td:
+        os.makedirs(os.path.join(td, "models"))
+        with open(os.path.join(td, "models", "out.yaml"), "w") as f:
+            f.write("raw: true\n")
+        v, diag = _resolve_computed_field(td, "models/out.yaml::raw")
+        ok(v is None and "not a number" in diag,
+           f"T12k: a boolean computed_field must not resolve to a number, got {(v, diag)}")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)
