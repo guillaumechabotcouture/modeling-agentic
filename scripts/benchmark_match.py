@@ -119,7 +119,7 @@ def _resolve_computed_field(run_dir: str, ref: str) -> tuple[float | None, str]:
     try:
         with open(p) as f:
             doc = yaml.safe_load(f) or {}
-    except (yaml.YAMLError, OSError) as e:
+    except (yaml.YAMLError, OSError, UnicodeDecodeError) as e:
         return None, f"could not parse {rel}: {e}"
     val = _resolve_dotpath(doc, key)
     if val is None:

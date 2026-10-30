@@ -40,8 +40,9 @@ blocks on drift).
 Requirements
 ------------
 * Scope of a verdict. In a sentence, only the clauses (split at `;`, "but",
-  ", while", outside brackets) that carry a pass verdict and state no failure;
-  paths and row names in other clauses are not the verdict's. A table row that
+  ", while", outside brackets) that carry a pass verdict and state no failure,
+  each checked on its own (its paths, row names and benchmark ids; nothing is
+  pooled across clauses); other clauses contribute nothing. A table row that
   states both a pass and a failure is ambiguous and skipped.
 * A bound benchmark id must not be out of band in the harness's own evaluation
   (scripts/benchmark_match.py `evaluate`); a target it cannot score is already
@@ -281,7 +282,7 @@ def _row_problem(rel: str, name: str, header: list, r: list, kinds: list, named:
             return f"`{rel}` row '{name}' holds no computed value ({cells}){tail}"
         return None
     cnt = [j for j, k in enumerate(kinds) if k == "count"]
-    if cnt and all(not _cell_value(r[j]) for j in cnt):
+    if cnt and all(_cell_value(r[j]) is None for j in cnt):
         return f"`{rel}` row '{name}' holds no computed value{tail}"
     return None
 
@@ -356,7 +357,7 @@ def _entry_problems(run_dir: str, rel: str, e: dict, bm, gate_r: dict | None) ->
         return [f"`{rel}` records {bid} outside its band (within_band: false)"], []
     if "computed_value" in e or "computed_field" in e:
         val, diag = bm._resolve_observed(run_dir, e)
-        if val is None and "outside the run" in diag:
+        if val is None and ("outside the run" in diag or diag.startswith("could not parse")):
             return [], [f"`{rel}`: {bid} {diag}"]
     else:
         val, diag = e.get("observed"), ""
@@ -406,23 +407,22 @@ def _clauses(stmt: str) -> list[str]:
     return [c for c in out if c.strip()]
 
 
-def _pass_scope(stmt: str, inherited: list, table: bool) -> tuple[str, list] | None:
-    """(context, cited paths) the pass verdict is about, or None when the
-    association is ambiguous. A table row: the row and its heading's paths,
-    unless it also states a failure. A sentence: only the clauses that carry a
-    pass verdict and no failure; paths in other clauses are not the verdict's."""
+def _pass_units(stmt: str, inherited: list, table: bool) -> list[tuple[str, list]]:
+    """[(text, cited paths)]: the units a pass verdict is about, each checked on
+    its own (its paths, row context and benchmark ids; nothing pooled). A table
+    row is one unit with its heading's paths, unless it also states a failure
+    (ambiguous: none). A sentence gives one unit per clause that carries a pass
+    verdict and no failure; other clauses contribute nothing."""
     if table:
         if _FAIL_RE.search(stmt):
-            return None
-        return stmt, list(dict.fromkeys(_PATH_RE.findall(stmt) + list(inherited)))
-    clean = [c for c in _clauses(stmt) if _passes(c) and not _FAIL_RE.search(c)]
-    if not clean:
-        return None
-    return " ".join(clean), list(dict.fromkeys(p for c in clean for p in _PATH_RE.findall(c)))
+            return []
+        return [(stmt, list(dict.fromkeys(_PATH_RE.findall(stmt) + list(inherited))))]
+    return [(c, list(dict.fromkeys(_PATH_RE.findall(c)))) for c in _clauses(stmt)
+            if _passes(c) and not _FAIL_RE.search(c)]
 
 
-def _check_statement(run_dir, stmt, context, paths, table, gate, ids, cache, bm) -> tuple[list[str], list[str]]:
-    """(high reasons, medium reasons) for one statement with a pass verdict."""
+def _check_statement(run_dir, stmt, paths, table, gate, ids, cache, bm) -> tuple[list[str], list[str]]:
+    """(high reasons, medium reasons) for one unit (clause or table row) with a pass verdict."""
     high, med = [], []
     docs = []
     for rel, key in paths:
@@ -444,7 +444,7 @@ def _check_statement(run_dir, stmt, context, paths, table, gate, ids, cache, bm)
             metrics.append(str(gate[bid].get("metric") or ""))
     if table and bound and any(_NOT_COMPUTED_RE.match(c) for c in stmt.strip("|").split("|")):
         high.append("the row's own value cell says it was not computed")
-    plain = re.sub(r"`[^`]*`", " ", context)
+    plain = re.sub(r"`[^`]*`", " ", stmt)
     for rel, key, doc in docs:
         listed = _bench_entries(doc)
         entries = [listed[bid] for bid in bound if bid in listed]
@@ -479,7 +479,13 @@ def evaluate(run_dir: str) -> list[dict]:
                     "high": [], "medium": ["models/benchmark_targets.yaml resolves outside the run directory "
                                            "(symlink), so benchmark verdicts cannot be checked"]})
     else:
-        gate = {str(r.get("id")): r for r in bm.evaluate(run_dir).get("results") or []}
+        try:
+            gate = {str(r.get("id")): r for r in bm.evaluate(run_dir).get("results") or []}
+        except Exception as e:  # noqa: BLE001 — fail closed, never crash the gate
+            gate = {}
+            out.append({"file": "models/benchmark_targets.yaml", "line": 0, "statement": "", "stage": "ANALYZE",
+                        "high": [], "medium": [f"benchmark evaluation raised {type(e).__name__}: {str(e)[:120]}, "
+                                               "so benchmark verdicts cannot be checked"]})
     ids = set(gate)
     cache: dict = {}
     for name, stage in PROSE:
@@ -500,13 +506,16 @@ def evaluate(run_dir: str) -> list[dict]:
         for line_no, stmt, inherited, table in _statements(text):
             if not _passes(stmt):
                 continue
-            scope = _pass_scope(stmt, inherited, table)
-            if scope is None:
-                continue
-            context, paths = scope
-            if not paths and not _bound_ids(stmt, ids, table):
-                continue
-            high, med = _check_statement(run_dir, stmt, context, paths, table, gate, ids, cache, bm)
+            high, med = [], []
+            for unit, paths in _pass_units(stmt, inherited, table):
+                if not paths and not _bound_ids(unit, ids, table):
+                    continue
+                try:
+                    h, m = _check_statement(run_dir, unit, paths, table, gate, ids, cache, bm)
+                except Exception as e:  # noqa: BLE001 — fail closed, never crash the gate
+                    h, m = [], [f"the cited evidence could not be checked ({type(e).__name__}: {str(e)[:120]})"]
+                high += h
+                med += m
             if high or med:
                 out.append({"file": name, "line": line_no, "statement": stmt, "stage": stage,
                             "high": list(dict.fromkeys(high)), "medium": list(dict.fromkeys(med))})
@@ -704,6 +713,48 @@ def _self_test() -> int:
     ok(len(f) == 1 and f[0]["severity"] == "HIGH" and "= FAIL" in f[0]["claim"], f"C5b verdict FAIL contradicts: {f}")
     f = run("The check passes (`models/v.csv`).\n", {"models/v.csv": vc})
     ok(f == [], f"C5c no row identified, verdict column: ambiguous, skipped: {f}")
+
+    # Codex round 2 on #63 (D1-D4).
+    # D1: two pass clauses are checked separately; neither borrows the other's file or rows.
+    f = run("Alpha passes (`models/a.csv`); Beta passes (`models/b.csv`).\n",
+            {"models/a.csv": "unit,cost\nAlpha,12.0\nBeta,\n", "models/b.csv": "unit,cost\nBeta,9.0\nAlpha,\n"})
+    ok(f == [], f"D1a clauses do not share evidence: {f}")
+    f = run("Alpha passes (`models/a.csv`); Beta passes (`models/b.csv`).\n",
+            {"models/a.csv": "unit,cost\nAlpha,\nBeta,1.0\n", "models/b.csv": "unit,cost\nBeta,9.0\nAlpha,\n"})
+    ok(len(f) == 1 and "`models/a.csv` row 'Alpha'" in f[0]["claim"] and "b.csv" not in f[0]["claim"].split("Statement")[0],
+       f"D1b the failing clause alone is reported: {f}")
+    # D2: an id in an excluded failure clause is not bound (B2 is out of band in the targets).
+    f = run("B1 passes; B2 FAILS despite a previous PASS.\n")
+    ok(f == [], f"D2 id in a failure clause not bound: {f}")
+    # D3: an unnamed count column with a finite zero holds a value.
+    f = run("The alpha check passes (`models/e.csv`).\n", {"models/e.csv": "check,n_errors\nalpha,0\nbeta,2\n"})
+    ok(f == [], f"D3 zero in an unnamed count column: {f}")
+    # D4: an undecodable computed_field target is MEDIUM, not a crash or a HIGH.
+    cfu = ("benchmarks:\n- id: B1\n  metric: m\n  target_value: 40.0\n  tolerance_factor: 5.0\n"
+           "  computed_field: models/bin.yaml::v\n")
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        open(os.path.join(d, "models", "benchmark_targets.yaml"), "w").write(cfu)
+        open(os.path.join(d, "models", "bin.yaml"), "wb").write(b"v: \xff\xfe\x00bad")
+        open(os.path.join(d, "results.md"), "w").write(
+            "## B (`models/benchmark_targets.yaml`)\n| ID | Verdict |\n|---|---|\n| B1 | AGREE |\n")
+        try:
+            f = gate_findings(d)
+        except Exception as e:  # noqa: BLE001
+            f = [{"crash": repr(e)}]
+    ok(len(f) == 1 and f[0].get("severity") == "MEDIUM" and "could not parse" in f[0].get("claim", ""),
+       f"D4a undecodable computed_field: {f}")
+    # D4b: an unexpected exception inside a statement's check is a MEDIUM, never a raise.
+    orig = globals()["_csv_problems"]
+    globals()["_csv_problems"] = lambda *a: 1 / 0
+    try:
+        f = run("The bednet clause holds (`models/cea.csv`, bednets campaign).\n", base)
+    except Exception as e:  # noqa: BLE001
+        f = [{"crash": repr(e)}]
+    finally:
+        globals()["_csv_problems"] = orig
+    ok(len(f) == 1 and f[0].get("severity") == "MEDIUM" and "ZeroDivisionError" in f[0].get("claim", ""),
+       f"D4b unexpected error is MEDIUM: {f}")
 
     if fails:
         print(f"FAIL: {len(fails)} case(s)", file=sys.stderr)
