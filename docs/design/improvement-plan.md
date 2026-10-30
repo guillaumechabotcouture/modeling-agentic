@@ -13,6 +13,7 @@ Merged to main:
 
 Open:
 - A9 (stale data-stage figures) and A10 (session crash), both waiting for attempt 8's records;
+- A11–A13 (uncertainty-report findings from attempt 8's round 5);
 - B4, which needs S3; B5, B6;
 - C1–C3;
 - D7;
@@ -49,6 +50,9 @@ Open:
 | A8 | **Uncertainty reruns for binding only.** Attempt 8 ran the 1,100-draw UQ 9 times in rounds 2–3, several only to refresh the fingerprint. With #47's narrower fingerprint, count reruns whose only purpose is binding, and run UQ once per final model version. | UQ runs per round on attempt 9. |
 | A9 | **Stale figures still reaching the gate** (attempt 8: 6 in round 2, 1 in round 3) despite the automatic rebuild. Read `derived_rebuild`'s report from the run to see whether the generators failed, were not recognised, or were outside the rebuild budget. | Stale figures at the gate = 0. |
 | A10 | **Session crash in round 2** (attempt 8, about 07:00 UTC; recovered by cost reconciliation and a re-spawned modeler). Find the cause from the transcripts once the run is stored. | Cause identified; fix or an issue. |
+| A11 | **One degenerate-interval finding per output family, not per output.** Attempt 8's round 5 raised 64 HIGH `ci_degenerate` findings from one cause (a reserve-and-descoping layer repeated across 8 plan variants; 60 related outputs were declared, these 64 were not). Gate counts per round jumped 19 → 83, which misreads as divergence in the convergence report. Group by the output's base name and list the variants in one finding. | Attempt 8 round-5 report replays as about 8 grouped findings; the per-round count no longer tracks the number of plan variants. |
+| A12 | **Rare-event outputs reported as a probability, not a quantile interval.** For an output that is zero in most draws, the 95% quantile interval is [0, 0] while the mean is positive (attempt 8: mean 0.16, interval [0, 0] for 4 outputs). `propagate_uncertainty.py` reports P(output > 0) with its standard error for such outputs, and the gate checks that probability instead of the interval width. | Self-test with a zero-inflated output; the attempt 8 report no longer shows a mean outside its own interval. |
+| A13 | **Outputs pinned by a binding constraint need a declaration that names the constraint.** Total cost at the budget envelope and utilisation near 1 are flat by construction; a declaration naming the constraint (budget, cap) exempts them, a free-text reason does not. Outputs downstream of a rule that absorbs uncertainty (overrun, reserve used) are not exempt, since that is how the gate and the red-team critic (R-045) both found that the reserve analysis could not show a trade-off. | Attempt 8 round-5 replay: cost and utilisation outputs pass with a constraint declaration; overrun and reserve outputs still flag. |
 
 ## Workstream B — disciplines from stisim.ai, as checked artifacts
 
