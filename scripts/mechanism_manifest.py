@@ -521,11 +521,17 @@ def run_decision_date(run_dir: str) -> tuple[tuple | None, str]:
     return None, err or "decision_brief.yaml has no decision_date and metadata.json no decision_year"
 
 
-def _scalars(node) -> list[str]:
+def _scalars(node, _path: tuple = ()) -> list[str]:
+    """Scalar values of a parsed YAML document. A recursive alias raises ValueError,
+    which callers treat as an unreadable file (fail closed)."""
+    if isinstance(node, (dict, list)):
+        if id(node) in _path:
+            raise ValueError("recursive YAML alias")
+        _path = _path + (id(node),)
     if isinstance(node, dict):
-        return [s for k, v in node.items() for s in _scalars(k) + _scalars(v)]
+        return [s for k, v in node.items() for s in _scalars(k, _path) + _scalars(v, _path)]
     if isinstance(node, list):
-        return [s for v in node for s in _scalars(v)]
+        return [s for v in node for s in _scalars(v, _path)]
     return [str(node)] if isinstance(node, (str, int, float)) and not isinstance(node, bool) else []
 
 
@@ -561,7 +567,7 @@ def _amendment_names(run_dir: str, aid, fid: str) -> bool:
     for am in ok:
         if str(am.get("id", "")).strip() == aid.strip():
             text = f"{am.get('change', '')} {am.get('reason', '')}"
-            return re.search(r"(?<![A-Za-z0-9_-])" + re.escape(fid) + r"(?![A-Za-z0-9_-])", text, re.I) is not None
+            return re.search(r"(?<![A-Za-z0-9_.-])" + re.escape(fid) + r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9_])", text, re.I) is not None
     return False
 
 
@@ -972,12 +978,28 @@ def _self_test() -> int:
         w(d, "brief_amendments.yaml", {"amendments": [{"id": "AM-1", "item": "C1", "change": "keep `cap` in the plan",
                                                        "reason": "the owner wants the cap although it changes nothing"}]})
         ok(gate_findings(d, 2, []) == [], "DL12b the complete identifier keeps it")
+        w(d, "brief_amendments.yaml", {"amendments": [{"id": "AM-1", "item": "C1", "change": "keep cap.v2 in the plan",
+                                                       "reason": "the owner wants the second version"}]})
+        ok(kinds(gate_findings(d, 2, [])) == ["decision_feature_no_effect"],
+           "DL12c another id that extends this one (`cap.v2`) does not keep `cap`")
+        w(d, "brief_amendments.yaml", {"amendments": [{"id": "AM-1", "item": "C1", "change": "the plan keeps cap.",
+                                                       "reason": "the owner wants it although it changes nothing"}]})
+        ok(gate_findings(d, 2, []) == [], "DL12d a sentence-final period still ends the id")
         w(d, "decision_brief.yaml", "constraints:\n  - {id: C1, text: 'Respect the owner''s annual   cap on spend'}\n")
         bf = {"id": "annual_cap", "kind": "decision_rule", "description": "d", "specified_by": "brief",
               "quote": "respect the owner's annual cap", "information_used": []}
         w(d, PATH, {"decision_layer": [bf]})
         ok(gate_findings(d, 2, []) == [], f"DL13 a quote is matched against the decoded brief, not its YAML escaping: "
                                           f"{gate_findings(d, 2, [])}")
+        w(d, "decision_brief.yaml", "constraints:\n  - {id: C1, text: 'Respect the owner''s annual cap on spend'}\n"
+                                    "notes: &n [*n]\n")
+        try:
+            got13 = kinds(gate_findings(d, 2, []))
+        except RecursionError:
+            got13 = ["raised RecursionError"]
+        ok(got13 == ["decision_feature_quote_unfound"],
+           f"DL13b a recursive alias in the brief fails closed (quote not found), not a crash: {got13}")
+        w(d, "decision_brief.yaml", "constraints:\n  - {id: C1, text: 'Respect the owner''s annual   cap on spend'}\n")
         w(d, PATH, "decision_layer:\n  - id: annual_cap\n    decision_date: 2026-02-30\n")
         ok(kinds(gate_findings(d, 2, [])) == ["mechanism_manifest_invalid"],
            "DL14 an unquoted impossible date fails closed with a finding, not a crash")
