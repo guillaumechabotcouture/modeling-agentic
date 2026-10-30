@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import csv
 import importlib.util
+import math
 import os
 import re
 import sys
@@ -52,9 +53,13 @@ def _builder():
 # The provenance check accepts x or 100x for percentages, so it cannot see this.
 #
 # Rule. A `percentage` claim is flagged when all of these hold:
-#  1. its value v has 0 < v <= 1, so it would render as at most "1%";
+#  1. its value v has 0 < v <= 1, so it would render as at most "1%", and v is
+#     the source's own value (within 1%): a ledger value of 100 x the source
+#     is a conversion already made, and a source that does not resolve or
+#     disagrees otherwise is left to the provenance check;
 #  2. the quantity's own values lie in [0, 1], as a proportion's must: v, the
-#     claim's CI, and, for a statistic of one quantity (`x.mean`), every
+#     claim's CI, the CI the source gives (ci_low/ci_high, lo/hi, ci_95: [lo,
+#     hi], ...), and, for a statistic of one quantity (`x.mean`), every
 #     numeric statistic beside it (`x.ci_low`, `x.ci_high`, ...); for a CSV
 #     column, every value of the column. A negative bound or a bound above 1
 #     means the number is not a proportion (a percent change of 0.12 with a
@@ -117,6 +122,12 @@ def _inside(xs) -> int:
     return sum(1 for x in xs if 0 < x < 1)
 
 
+def _ci_nums(ci) -> list[float]:
+    if not isinstance(ci, (list, tuple)):
+        return []
+    return [x for x in (None if isinstance(e, bool) else P._num(e) for e in ci) if x is not None]
+
+
 def _scale_evidence(c: dict, v: float, run_dir: str, cache: dict) -> tuple[list[str], str] | None:
     """(evidence, quantity name) when the source says `c` (value v) is on the
     0-1 scale; None when it is named as a percent, is not a proportion, cannot
@@ -126,6 +137,17 @@ def _scale_evidence(c: dict, v: float, run_dir: str, cache: dict) -> tuple[list[
     if path is None or not field:
         return None
     own = [v] + [x for x in (P._num(c.get("ci_low")), P._num(c.get("ci_high"))) if x is not None]
+    # The source's own value: flag only when the ledger value is the source value. A
+    # ledger value of 100 x the source is a conversion already made (Codex P47B-1);
+    # any other mismatch, or a source that does not resolve, is the provenance check's.
+    try:
+        point, ci = P.resolve_claim(c, run_dir, cache)
+    except P.ClaimUnresolved:
+        return None
+    sv = None if isinstance(point, bool) else P._num(point)
+    if sv is None or not math.isclose(v, sv, rel_tol=0.01, abs_tol=1e-12):
+        return None
+    own += [sv] + _ci_nums(ci)
     ev: list[str] = []
     units = str(c.get("units") or "")
     if _PROP_UNITS.search(units) and not _PCT_UNITS.search(units):
@@ -150,6 +172,11 @@ def _scale_evidence(c: dict, v: float, run_dir: str, cache: dict) -> tuple[list[
             return (ev, qname) if ev and _unit(own) else None
         if stat:
             own += list(_num_items(qnode).values())
+        for node in (qnode, P.resolve_dotpath(doc, field) if not stat else None):
+            if isinstance(node, dict):
+                # CI arrays (ci_95: [lo, hi]) and named bounds, as provenance reads them (P47B-2).
+                own += _num_items(node).values() if node is not qnode else []
+                own += _ci_nums(P._ci_from_mapping(node))
         if not _unit(own):
             return None
         sib = {k: x for k, x in _num_items(parent).items() if k != qname}
@@ -356,6 +383,28 @@ def _self_test() -> int:
         w("models/claims_spec.yaml", {"claims": many})
         f = gate_findings(d)
         ok(len(f) == _SCALE_CAP + 1 and f[-1]["claim"].startswith("3 more"), f"U8 capped: {len(f)}")
+
+    # Codex round 1 (P47B-1, P47B-2).
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        yaml.safe_dump({
+            "a": {"gain_pct": 10.4, "p_small": 0.005, "p10": 0.587},
+            "g": {"gain_pct": 13.3,
+                  "within": {"mean": 0.12, "ci_95": [-0.2, 0.48]},
+                  "share": {"mean": 0.12, "ci_95": [0.05, 0.3]}},
+        }, open(os.path.join(d, "models", "s.yaml"), "w"))
+        mk = lambda cid, field, v: {"id": cid, "claim_kind": "percentage", "value": v,
+                                    "source_artifact": "models/s.yaml", "source_field": field}
+        got = {p["id"] for p in problems([
+            mk("converted", "a.p_small", 0.5),       # ledger 0.5% = 100 x source 0.005: converted
+            mk("as_source", "a.p_small", 0.005),     # ledger = source 0.005 beside *_pct > 1: flagged
+            mk("mismatch", "a.p10", 0.3),            # neither: the provenance check's finding
+            mk("ci_neg", "g.within.mean", 0.12),     # ci_95 crosses zero: a real 0.12%
+            mk("ci_unit", "g.share.mean", 0.12),     # ci_95 inside [0, 1]: a proportion
+            mk("unresolved", "a.nope", 0.4),
+        ], d)}
+        ok(got == {"as_source", "ci_unit"},
+           f"U9 (Codex P47B-1/2) a converted value and a CI array crossing zero are exempt: {sorted(got)}")
 
 
     if fails:
