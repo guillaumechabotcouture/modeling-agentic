@@ -240,6 +240,32 @@ outcome (parameters not wired through, a cached result, or a constant
 return). Treat it as a broken UQ run and fix it; do not report that
 interval, and never substitute an interval from elsewhere.
 
+Outputs that are fixed by design, and the gate's treatment of them:
+
+- **Fixed by construction** (e.g. a planned cost the plan sets): declare
+  it in `models/uq_declarations.yaml` under `deterministic_outputs:`
+  with a reason, and report it as a point estimate. The declaration
+  holds only while the reported summary is constant; an output whose
+  draws vary is judged as usual and the declaration is a finding.
+- **Held by a binding constraint** (e.g. spend equals the budget
+  envelope): declare `pinned_by_constraint:` with the constraint's name
+  and the value it fixes; the exemption holds only while the draws sit
+  at that value. The schema is in the rigor manifest
+  (`.claude/orchestration/rigor_artifacts.yaml`, entry `outcome_fn`).
+- **Downstream of a decision rule** (overrun, reserve used): no
+  exemption. A zero-width interval there usually means the rule sees
+  information it would not have in practice (e.g. the realised costs);
+  fix the rule rather than declare the output.
+- **Zero in most draws** (a rare event such as a cut that is triggered
+  only sometimes): `uncertainty_report.yaml` adds `p_nonzero`, its
+  standard error and `mean_if_nonzero`. Report those, not
+  mean [ci_low, ci_high]: a mean outside its own interval is a finding.
+  These fields do not exempt the output: a zero-width interval on it
+  still blocks and cannot be declared away.
+
+Findings are grouped by output family: outputs that share a name after
+a `<variant>__` prefix count as one finding that lists the variants.
+
 MEDIUM blockers fire if:
 - Any scalar output's CI width > 3× its mean (suggests the priors
   dominate the data — modeler may need to tighten priors to
