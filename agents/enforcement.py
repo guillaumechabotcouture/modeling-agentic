@@ -436,9 +436,148 @@ substitution (`tee >(…) <protected>`). They are caught after the
     return [t for t, _ in bash_write_targets_cwd(command)]
 
 
+# ---------------------------------------------------------------------------
+# Phase 47 δ (A10): no process selection by pattern
+# ---------------------------------------------------------------------------
+# E7 attempt 8, 2026-10-29T06:59-07:00: the modeler ran `pkill -f
+# "propagate_uncertainty.py"`, then `ps aux | grep "scripts/propagate_
+# uncertainty.py" | grep -v grep | awk '{print $2}' …` (piped to kill), and
+# the session died with exit 143 (SIGTERM). The pipeline's own Claude CLI
+# runs with the lead's system prompt on its command line, and that prompt
+# names the harness scripts, so any kill chosen by pattern can match the
+# session itself (or another agent's processes). Kills by a PID the agent
+# recorded, or by job spec, stay allowed.
+
+KILL_DENY_REASON = (
+    "stopping processes by name or pattern is not allowed (pkill, killall, "
+    "`kill $(pgrep ...)`, `ps ... | grep ... | xargs kill`, `kill -<sig> -<pgid>`, `kill 0`): the "
+    "pipeline's own session process carries the run's prompts, which name the harness scripts, on "
+    "its command line, so a pattern can match the session and end it (attempt 8 lost a session this "
+    "way). Stop a process by the PID you recorded: start it as `nohup ... > <log> 2>&1 & echo $! > "
+    "<run_dir>/models/<name>.pid`, then `kill $(cat <run_dir>/models/<name>.pid)` or `kill <pid>`; "
+    "`kill %1` works for a job of the same command. A detached compute batch: `python3 "
+    "scripts/compute.py status <out>` prints its `pid`, and `kill <pid>` stops it cleanly (its pool "
+    "is killed and the work done is charged); compute.py has no separate cancel command. A batch run "
+    "in the foreground stops at its `--timeout-s`.")
+KILL_SELF_REASON = (
+    "this PID is the pipeline's own process (the session's CLI, the harness that runs it, or one of "
+    "their parents); signalling it ends the session. Stop only processes you started, by the PID you "
+    "recorded with `echo $! > <run_dir>/models/<name>.pid`.")
+_KILL_BY_NAME = {"pkill", "killall", "killall5"}
+_PID_SOURCE = re.compile(r"\b(pgrep|pidof|ps|lsof)\b")
+_KILL_WRAPPERS = {"sudo", "env", "timeout", "nohup", "nice", "xargs", "command", "exec", "setsid",
+                  "stdbuf", "time", "!", "{", "do", "then", "else", "if", "while", "until"}
+_HEREDOC = re.compile(r"<<-?\s*\\?['\"]?(\w+)")
+
+
+def _kill_segments(command: str) -> list[tuple[str, bool]]:
+    """(segment, fed by a pipe), split on unquoted ; & && || | and newlines
+    outside $( … ). Heredoc bodies and comments are dropped as data."""
+    lines, delim = [], None
+    for line in command.split("\n"):
+        if delim is None:
+            lines.append(line)
+            m = _HEREDOC.search(line.replace("<<<", ""))
+            delim = m.group(1) if m else None
+        elif line.strip() == delim:
+            delim = None
+    text, out, buf, q, depth, piped, i = "\n".join(lines), [], [], None, 0, False, 0
+    while i < len(text):
+        c, step = text[i], 1
+        if c == "\\" and q != "'":
+            step = 2
+        elif q:
+            q = None if c == q else q
+        elif c in "'\"":
+            q = c
+        elif c == "#" and (not buf or buf[-1].isspace()):
+            j = text.find("\n", i)
+            i = len(text) if j < 0 else j
+            continue
+        elif text.startswith("$(", i) or (c == ")" and depth):
+            depth += 1 if c == "$" else -1
+        elif depth == 0 and c in ";&|\n":
+            out.append(("".join(buf), piped))
+            buf, piped = [], c == "|" and not text.startswith("||", i)
+            i += 2 if text.startswith(("&&", "||"), i) else 1
+            continue
+        buf.append(text[i:i + step]); i += step
+    return [(s.strip(), p) for s, p in out + [("".join(buf), piped)] if s.strip()]
+
+
+def _protected_pids() -> set[int]:
+    """The hook's process (main.py: SDK hooks run in-process), its parents,
+    and its direct children (the Claude CLI sessions)."""
+    pids = {os.getpid(), os.getppid()}
+    try:
+        import psutil
+        me = psutil.Process()
+        pids |= {p.pid for p in me.parents()} | {p.pid for p in me.children(recursive=False)}
+    except Exception:  # noqa: BLE001  (psutil missing or a process vanished)
+        pass
+    return pids - {0}
+
+
+def kill_reason(command: str) -> str | None:
+    """Deny reason when a Bash command stops processes chosen by name or
+    pattern, a whole process group, or the pipeline's own processes.
+
+    Non-goal: this catches accidental pattern kills in ordinary commands
+    (attempt 8's `pkill -f`); it is not evasion-proof. It never raises: on an
+    internal error the command is allowed and the error goes to stderr."""
+    if "kill" not in command and "fuser" not in command:
+        return None
+    try:
+        for seg, piped in _kill_segments(command):
+            if "kill" not in seg and "fuser" not in seg:
+                continue
+            toks, xargs = _tokens(seg), False
+            while toks:
+                t = os.path.basename(toks[0])
+                if re.match(r"\d*[<>]|&>|\w+=", toks[0]):          # redirection, assignment
+                    toks = toks[2:] if re.fullmatch(r"\d*[<>]+&?|&>", toks[0]) else toks[1:]
+                elif t == "command" and toks[1:2] in (["-v"], ["-V"]):
+                    toks = []                                    # a lookup, not a run
+                elif t in _KILL_WRAPPERS:
+                    xargs, toks = xargs or t == "xargs", toks[1:]
+                    while toks and toks[0].startswith("-") and toks[0] != "-":
+                        if toks.pop(0) in ("-u", "-n", "-s", "-k", "-I", "-P", "-L", "-d", "-a") and toks:
+                            toks.pop(0)
+                    toks = toks[1:] if t == "timeout" else toks  # its duration
+                else:
+                    break
+            head, args = (os.path.basename(toks[0]), toks[1:]) if toks else ("", [])
+            if head in _KILL_BY_NAME or (head == "fuser" and any(
+                    re.fullmatch(r"-[a-zA-Z]*k[a-zA-Z]*", a) for a in args)):
+                return KILL_DENY_REASON
+            if head != "kill" or args[:1] in (["-l"], ["-L"], ["--list"], ["--table"]):
+                continue
+            if xargs and piped:
+                return KILL_DENY_REASON                          # `ps … | grep … | xargs kill`
+            if args[:1] in (["-0"], ["-SIG0"]) or args[:2] in (["-s", "0"], ["-n", "0"]):
+                continue                                         # signal 0 only tests the PID
+            if any(_PID_SOURCE.search(a + b) for a, b in re.findall(r"\$\(([^)]*)|`([^`]*)", seg)):
+                return KILL_DENY_REASON
+            ops = args[2:] if args[:1] in (["-s"], ["-n"]) else (
+                args[1:] if args and args[0].startswith("-") and args[0] != "--" else args)
+            ops = [o for o in ops if o != "--"]
+            if any(re.fullmatch(r"-\d+|0", o) for o in ops):
+                return KILL_DENY_REASON                          # a process group, or every process
+            if any(o.isdigit() and len(o) < 12 and int(o) in _protected_pids() for o in ops):
+                return KILL_SELF_REASON
+        return None
+    except Exception as e:  # noqa: BLE001  (a false deny blocks real work)
+        print(f"[enforcement] kill_reason error, command allowed: {type(e).__name__}: {e}",
+              file=__import__("sys").stderr)
+        return None
+
+
 def bash_reason(command: str, run_path: str, agent_type: str | None,
                 cwd: str | None = None) -> str | None:
     """Deny reason for a Bash command, or None."""
+    reason = kill_reason(command)
+    if reason:
+        return reason
     if _CHMOD.search(command) and _HARNESS_WORDS.search(command):
         # Phase 36: kept command-wide (narrowing it to chmod operands was bypassed
         # five ways in review); the message says how to chmod a run file.
