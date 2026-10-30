@@ -353,6 +353,17 @@ Appropriate when:
 6. None of the above? → PATCH (default, but log reasoning)
 ```
 
+### DIAGNOSE (a gate finding that has not moved)
+
+When the gate lists a finding under `stalled_findings`, patching has already
+failed for several rounds. Find out why before changing anything: check the
+cause classes in order (missing data, missing mechanism, structural
+constraint, inconsistent targets, mismatched target definition, and only then
+the bounds), run a test for each one you check, and decide: a specific fix,
+or a declaration. Record it in `models/stall_diagnoses.yaml`; the schema, the
+round count and how long a diagnosis lasts are in the rigor manifest
+(entry `stall_diagnoses`) and `effort_floors.yaml`.
+
 ---
 
 ## 6. Scope Declaration

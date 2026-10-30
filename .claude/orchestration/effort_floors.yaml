@@ -43,6 +43,10 @@
 defaults:
   # Round at which floors begin enforcing. Earlier rounds emit advisories.
   enforce_from_round: 2
+  # Phase 47 ε (A17, scripts/stall_rule.py): a gate finding present at this
+  # many consecutive gates with no diagnosis in models/stall_diagnoses.yaml
+  # (and no scope declaration) becomes HIGH finding_stalled_without_diagnosis.
+  stall_rounds: 3
 
 floors:
   - id: uq_min_draws_local

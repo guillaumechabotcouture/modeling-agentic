@@ -210,6 +210,7 @@ def gate_findings(run_dir: str,
             "kind": "benchmark_drift",
             "severity": sev,
             "stage": "MODEL",
+            "key": rid,  # Phase 47 ε: instance key for scripts/stall_rule.py
             "claim": (
                 f"Benchmark `{rid}` ({r.get('metric', '?')}): observed "
                 f"{r.get('observed')} outside band [{r.get('band_low')}, "
@@ -240,6 +241,7 @@ def gate_findings(run_dir: str,
             "kind": "benchmark_computed_missing",
             "severity": sev,
             "stage": "MODEL",
+            "key": rid,  # Phase 47 ε: instance key for scripts/stall_rule.py
             "claim": (
                 f"Benchmark `{rid}` ({r.get('metric', '?')}): no computed "
                 f"value. Phase 19 γ — after the model run, record it in "
