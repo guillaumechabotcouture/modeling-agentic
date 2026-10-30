@@ -15,6 +15,7 @@ Merged to main:
 
 In review (Phase 46, simplification with no change to gate output):
 - **α:** `scripts/gate_replay.py` replays the STAGE 7 validator on saved runs and diffs the findings; `agents/contract_packet.py` (unused, failing self-test) and five unused back-compat helpers removed.
+- **β:** the uncertainty-report, benchmark and comparator-efficiency checks moved from `validate_critique_yaml.py` (10,104 → 8,672 lines) into `scripts/uq_ci_quality.py`, `scripts/benchmark_gate.py` and `scripts/comparator_efficiency.py`, each with `gate_findings(run_dir)` and its own self-test (stacked on α).
 
 In review (Phase 47 δ):
 - **A10:** the attempt 8 session crash was the modeler's own `pkill -f` / `ps | grep | kill` matching the session's command line; a PreToolUse rule now refuses kills chosen by pattern, and agents stop processes by recorded PID.
