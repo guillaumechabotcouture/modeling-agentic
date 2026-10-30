@@ -44,6 +44,9 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from lib.safe_io import safe_load_mapping  # noqa: E402
+
 REPO_DEFAULT = os.path.dirname(HERE)
 DEFAULT_MAX_ROUNDS = 8
 _TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?")
@@ -55,27 +58,18 @@ def detect_current_round(run_dir: str) -> tuple[int, str]:
     """main.py's detect_current_round (highest critique `round:`, then
     pipeline_state.yaml), with round 1 when neither says, so the rigor
     checks still replay on runs main.py would not gate."""
-    import yaml
     rounds = []
-    for path in glob.glob(os.path.join(run_dir, "critique_*.yaml")):
-        try:
-            with open(path) as f:
-                doc = yaml.safe_load(f)
-            r = doc.get("round") if isinstance(doc, dict) else None
-            if isinstance(r, int):
-                rounds.append(r)
-        except Exception:  # noqa: BLE001
-            continue
+    for path in sorted(glob.glob(os.path.join(run_dir, "critique_*.yaml"))):
+        doc, _ = safe_load_mapping(path, "critique")   # unreadable → skipped, as in main.py
+        r = (doc or {}).get("round")
+        if isinstance(r, int):
+            rounds.append(r)
     if rounds:
         return max(rounds), "critiques"
-    try:
-        with open(os.path.join(run_dir, "pipeline_state.yaml")) as f:
-            state = yaml.safe_load(f) or {}
-        r = state.get("current_round") if isinstance(state, dict) else None
-        if isinstance(r, int):
-            return r, "pipeline_state"
-    except Exception:  # noqa: BLE001
-        pass
+    state, _ = safe_load_mapping(os.path.join(run_dir, "pipeline_state.yaml"), "pipeline_state")
+    r = (state or {}).get("current_round")
+    if isinstance(r, int):
+        return r, "pipeline_state"
     return 1, "default"
 
 
