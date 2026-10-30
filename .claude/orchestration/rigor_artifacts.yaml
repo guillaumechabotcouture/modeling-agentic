@@ -107,7 +107,8 @@ artifacts:
       Calibration callable returning a single deterministic outcome dict; can be
       coarse. Surrogate path requires `models/outcome_fn_calibration.md`.
       An output fixed by design is declared in `models/uq_declarations.yaml`:
-      `deterministic_outputs: {output: "reason"}`, or, when a binding
+      `deterministic_outputs: {output: "reason"}` (exempt only while its
+      summary is constant), or, when a binding
       constraint fixes it, `pinned_by_constraint: {output_or_family:
       {constraint: <name>, value: <number>}}` (exempt only while its draws sit
       at that non-zero value; a family is the name after any `<variant>__`

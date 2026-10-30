@@ -1307,6 +1307,14 @@ def _uq_pinned_at(value: float, *points: float) -> bool:
                for x in points)
 
 
+def _uq_constant(mean: float, lo: float, hi: float) -> bool:
+    """Phase 45 α: mean and both 95% bounds equal within the degeneracy
+    threshold of the mean (absolute 1e-6 floor near zero) — what a
+    `deterministic_outputs` declaration must be true of to exempt."""
+    tol = max(1e-6, _CI_DEGENERATE_THRESHOLD * abs(mean))
+    return abs(lo - mean) <= tol and abs(hi - mean) <= tol
+
+
 def _uq_output_families(names: list[str]) -> dict[str, str]:
     """Phase 45 α (A11): output name → family name, so one defect repeated
     across plan variants is one finding.
@@ -1354,9 +1362,12 @@ def _check_uq_ci_quality(uq_report_path: str) -> list[dict]:
     zero-width outputs as MEDIUM while the report printed a wide CI for
     the same quantity. An output that is deterministic by design is
     exempted only by an explicit declaration (`_load_uq_declarations`):
-    `deterministic_outputs:` with a reason, per-output `deterministic: true`
-    + `deterministic_reason:`, or `pinned_by_constraint:` whose stated value
-    the output's mean and bounds actually sit at.
+    `deterministic_outputs:` with a reason, or per-output `deterministic:
+    true` + `deterministic_reason:` — exempt only while the summary is
+    constant (`_uq_constant`, and p_nonzero, if reported, is 0 or 1), else
+    MEDIUM `uq_declaration_contradicted` and the usual rules apply — or
+    `pinned_by_constraint:` whose stated value the output's mean and
+    bounds actually sit at.
 
     Phase 45 α: findings are grouped per output family
     (`_uq_output_families`) — one `ci_degenerate` per family, listing its
@@ -1396,6 +1407,7 @@ def _check_uq_ci_quality(uq_report_path: str) -> list[dict]:
     family_of = _uq_output_families([str(k) for k in report["scalar_outputs"]])
     degenerate_by_family: dict[str, list[tuple[str, str]]] = {}
     outside_by_family: dict[str, list[tuple[str, str]]] = {}
+    contradicted_by_family: dict[str, list[tuple[str, str]]] = {}
 
     for output_name, stats in report["scalar_outputs"].items():
         output_name = str(output_name)
@@ -1436,6 +1448,7 @@ def _check_uq_ci_quality(uq_report_path: str) -> list[dict]:
             continue
         mean_f, lo_f, hi_f = vals["mean"], vals["ci_low"], vals["ci_high"]
         rare = None
+        p = None
         if stats.get("p_nonzero") is not None:
             p = finite_number(stats.get("p_nonzero"))
             if p is None or not 0 <= p <= 1:
@@ -1467,7 +1480,15 @@ def _check_uq_ci_quality(uq_report_path: str) -> list[dict]:
         if output_name in declared or (
                 stats.get("deterministic") is True
                 and str(stats.get("deterministic_reason") or "").strip()):
-            continue
+            # Phase 45 α: a deterministic declaration exempts only an output
+            # whose summary is constant; one the draws contradict (attempt 8
+            # declared rare-event cuts "deterministic") is judged as usual.
+            if _uq_constant(mean_f, lo_f, hi_f) and p in (None, 0.0, 1.0):
+                continue
+            contradicted_by_family.setdefault(family, []).append((output_name, (
+                f"{output_name} mean {mean_f:.6g}, 95% CI "
+                f"[{lo_f:.6g}, {hi_f:.6g}]"
+                + (f", p_nonzero {p:.3g}" if p is not None else ""))))
         pin = pinned.get(output_name) or pinned.get(family)
         pin_note = ""
         if pin is not None:
@@ -1523,6 +1544,24 @@ def _check_uq_ci_quality(uq_report_path: str) -> list[dict]:
                 f"binding constraint and the value it fixes) and report "
                 f"it as a point estimate. Any interval quoted elsewhere "
                 f"for this output is unsupported."
+            ),
+        })
+    for family, items in contradicted_by_family.items():
+        outputs = [n for n, _ in items]
+        violations.append({
+            "kind": "uq_declaration_contradicted",
+            "severity": "MEDIUM",
+            "stage": "UQ",
+            "family": family,
+            "outputs": outputs,
+            "claim": (
+                f"{family}: declared deterministic in "
+                f"models/uq_declarations.yaml, but the draws vary in "
+                f"{len(outputs)} output(s) ({_uq_family_list(outputs)}). "
+                f"Example: {items[0][1]}. The declaration does not exempt "
+                f"them; they are judged by the width / rare-event rules. "
+                f"Remove the declaration, and report an output that is "
+                f"zero in most draws by its p_nonzero and mean_if_nonzero."
             ),
         })
     for family, items in outside_by_family.items():
@@ -6281,6 +6320,22 @@ def _run_self_test() -> int:
                for v in c4)
            and sum(v["kind"] == "ci_degenerate" for v in c4) == 3,
            f"C4: unparseable declarations fail closed; got {_kinds(c4)}")
+        _decl("deterministic_outputs:\n  fixed: 'set by the plan'\n"
+              "  cuts: 'zero at both percentiles'\n  wide: 'deterministic'\n")
+        d1 = _uq("uq_d1.yaml", "n_successful: 200\nscalar_outputs:\n"
+                 "  fixed:\n    mean: 7\n    ci_low: 7\n    ci_high: 7\n"
+                 "  cuts:\n    mean: 0.16\n    ci_low: 0\n    ci_high: 0\n"
+                 "  wide:\n    mean: 1\n    ci_low: 0\n    ci_high: 5\n"
+                 "    p_nonzero: 0.3\n")
+        ok(_kinds(d1) == ["ci_degenerate", "uq_declaration_contradicted",
+                          "uq_declaration_contradicted",
+                          "uq_mean_outside_ci"]
+           and {v["family"] for v in d1 if v["kind"] == "ci_degenerate"}
+           == {"cuts"}
+           and all(v["severity"] == "MEDIUM" for v in d1
+                   if v["kind"] == "uq_declaration_contradicted"),
+           f"D1: constant declared output exempt; declared outputs the "
+           f"draws contradict are judged as usual + MEDIUM; got {d1}")
         _decl(None)
 
     # --- Phase 21 β: closed verdict vocabularies + producer stamps ---
