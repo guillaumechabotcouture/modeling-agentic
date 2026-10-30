@@ -178,6 +178,10 @@ scope-declarable):
   `plan.md`) keep their value in the spec, with the citation in
   `source_field`. Use them only for literature or programme inputs,
   never for model outputs.
+- A `percentage` claim renders its value followed by "%", so its source field
+  must hold the percent (58.7), not the proportion (0.587). For a
+  proportion, write the percent to its own field from code (`*_pct`) and
+  cite that field.
 
 ### Field grammar
 - YAML/JSON: dot path with list indices (`scalar_outputs.total_cost.mean`,
