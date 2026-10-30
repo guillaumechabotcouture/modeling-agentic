@@ -181,6 +181,17 @@ def finite_number(x: Any) -> Optional[float]:
     return f if math.isfinite(f) else None
 
 
+def inside_dir(root: str, path: str) -> bool:
+    """True when `path`, with every symlink resolved, lies inside `root`
+    (also resolved). Checked before opening a file a run names, so a cited
+    path or a symlinked parent cannot make a gate read outside the run."""
+    try:
+        r, p = os.path.realpath(root), os.path.realpath(path)
+        return os.path.commonpath([r, p]) == r
+    except ValueError:      # different drives
+        return False
+
+
 # Phase 43 γ: two lenient readers that were copied verbatim across scripts
 # (coherence_audit / identifiability; lessons / run_autopsy). They are not
 # gate loaders: they return None / [] rather than findings, as before.
@@ -304,6 +315,14 @@ def _self_test() -> int:
     ok(finite_number(float("inf")) is None, "S11c inf rejected")
     ok(finite_number(True) is None, "S11d bool rejected")
     ok(finite_number(None) is None, "S11e None rejected")
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+        os.makedirs(os.path.join(d, "run", "models"))
+        os.symlink(out, os.path.join(d, "run", "linked"))
+        run = os.path.join(d, "run")
+        ok(inside_dir(run, os.path.join(run, "models", "x.csv")), "S12a plain path inside")
+        ok(not inside_dir(run, os.path.join(run, "linked", "x.csv")), "S12b symlinked parent escapes")
+        ok(not inside_dir(run, os.path.join(run, "..", "x.csv")), "S12c .. escapes")
+        ok(not inside_dir(run, run + "2/x"), "S12d sibling prefix is not inside")
 
     # S12: sha256_file / read_jsonl (lenient readers)
     with tempfile.TemporaryDirectory() as d:
