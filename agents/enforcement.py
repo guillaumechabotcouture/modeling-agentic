@@ -436,9 +436,464 @@ substitution (`tee >(…) <protected>`). They are caught after the
     return [t for t, _ in bash_write_targets_cwd(command)]
 
 
+# ---------------------------------------------------------------------------
+# Phase 47 δ (A10): no process selection by pattern
+# ---------------------------------------------------------------------------
+# E7 attempt 8, 2026-10-29T06:59-07:00: the modeler ran `pkill -f
+# "propagate_uncertainty.py"`, then `ps aux | grep "scripts/propagate_
+# uncertainty.py" | grep -v grep | awk '{print $2}' …` (piped to kill), and
+# the session died with exit 143 (SIGTERM). The pipeline's own Claude CLI
+# runs with the lead's system prompt on its command line, and that prompt
+# names the harness scripts, so any kill chosen by pattern can match the
+# session itself (or another agent's processes). Kills by a PID the agent
+# recorded, or by job spec, stay allowed.
+
+KILL_DENY_REASON = (
+    "stopping processes by name or pattern is not allowed (pkill, killall, "
+    "`kill $(pgrep ...)`, `ps ... | grep ... | xargs kill`, `kill -<sig> -<pgid>`, `kill 0`): the "
+    "pipeline's own session process carries the run's prompts, which name the harness scripts, on "
+    "its command line, so a pattern can match the session and end it (attempt 8 lost a session this "
+    "way). Stop a process by the PID you recorded: start it as `nohup ... > <log> 2>&1 & echo $! > "
+    "<run_dir>/models/<name>.pid`, then `kill $(cat <run_dir>/models/<name>.pid)` or `kill <pid>`; "
+    "`kill %1` works for a job of the same command. A detached compute batch: `python3 "
+    "scripts/compute.py status <out>` prints its `pid`, and `kill <pid>` stops it cleanly (its pool "
+    "is killed and the work done is charged); compute.py has no separate cancel command. A batch run "
+    "in the foreground stops at its `--timeout-s`.")
+KILL_SELF_REASON = (
+    "this PID is the pipeline's own process (the session's CLI, the harness that runs it, or one of "
+    "their parents); signalling it ends the session. Stop only processes you started, by the PID you "
+    "recorded with `echo $! > <run_dir>/models/<name>.pid`.")
+KILL_PARSE_REASON = (
+    "the command signals processes but could not be parsed, so which processes it selects cannot be "
+    "checked. Run the kill as its own simple command with literal PIDs (`kill <pid>`), or "
+    "`kill $(cat <pidfile>)` for a PID recorded at launch.")
+
+_KILL_BY_NAME = {"pkill", "killall", "killall5"}
+# Commands whose output lists processes chosen by name, pattern, port or file.
+_PID_SOURCES = {"pgrep", "pidof", "ps", "lsof", "fuser", "pstree", "pkill", "killall"}
+_KILL_SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
+_RESERVED = {"!", "{", "}", "if", "then", "else", "elif", "fi", "do", "done", "while",
+             "until", "time", "case", "esac", "in", "function"}
+_SUBST = "__MA_SUBST%d__"
+_SUBST_RE = re.compile(r"__MA_SUBST(\d+)__")
+_KILL_WORD = re.compile(r"(?<![\w.-])(?:kill|pkill|killall|killall5)(?![\w.-])")
+_VAR_RE = re.compile(r"\$\{?([A-Za-z_]\w*|!)")
+
+
+def _match_close(s: str, i: int) -> int:
+    """Index of the `)` closing a `$(` / `<(` whose body starts at `i`, or -1."""
+    depth, q, j = 1, None, i
+    while j < len(s):
+        c = s[j]
+        if c == "\\" and q != "'":
+            j += 2
+            continue
+        if q:
+            if c == q:
+                q = None
+        elif c in "'\"":
+            q = c
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return j
+        j += 1
+    return -1
+
+
+def _body_substs(body: str, substs: list[str]) -> None:
+    """Command substitutions in an unquoted heredoc body (they run)."""
+    i = 0
+    while i < len(body):
+        if body[i] == "\\":
+            i += 2
+            continue
+        if body.startswith("$(", i) and not body.startswith("$((", i):
+            j = _match_close(body, i + 2)
+            substs.append(body[i + 2:] if j < 0 else body[i + 2:j])
+            i = len(body) if j < 0 else j + 1
+            continue
+        if body[i] == "`":
+            j = body.find("`", i + 1)
+            substs.append(body[i + 1:] if j < 0 else body[i + 1:j])
+            i = len(body) if j < 0 else j + 1
+            continue
+        i += 1
+
+
+def _kill_parse(command: str) -> tuple[list[dict], list[str]]:
+    """Simple commands of `command` for the kill rule, and the commands run by
+    its substitutions.
+
+    One quote-aware scan, like `_shell_tokens`, plus what that splitter does
+    not need: `$(…)`, backticks and `<(…)` are cut out (their bodies run, so
+    they are returned for checking and replaced by a placeholder word), heredoc
+    bodies are attached to the command they feed instead of being read as
+    commands, and each segment records whether a pipe feeds it.
+    Segment: {"text", "piped", "pipe": pipeline id, "heredocs": [(body, quoted)]}.
+    """
+    segs: list[dict] = []
+    substs: list[str] = []
+    buf: list[str] = []
+    state = {"piped": False, "pipe": 0, "docs": []}
+    pending: list[tuple[str, bool, bool, list]] = []   # (delim, quoted, strip_tabs, docs list)
+    q: str | None = None
+    i, n = 0, len(command)
+
+    def flush(next_piped: bool) -> None:
+        text = "".join(buf).strip()
+        if text:
+            segs.append({"text": text, "piped": state["piped"], "pipe": state["pipe"],
+                         "heredocs": state["docs"]})
+            state["docs"] = []
+        buf.clear()
+        if not next_piped:
+            state["pipe"] += 1
+        state["piped"] = next_piped
+
+    def subst(inner: str) -> None:
+        buf.append(_SUBST % len(substs))
+        substs.append(inner)
+
+    while i < n:
+        c = command[i]
+        if c == "\\" and q != "'":
+            buf.append(command[i:i + 2]); i += 2
+            continue
+        if q == "'":
+            buf.append(c)
+            if c == "'":
+                q = None
+            i += 1
+            continue
+        if command.startswith("$(", i) or c == "`" or (q is None and command.startswith(("<(", ">("), i)):
+            if command.startswith("$((", i):            # arithmetic, not a command
+                j = _match_close(command, i + 2)
+                end = n if j < 0 else j + 1
+                buf.append(command[i:end]); i = end
+                continue
+            if c == "`":
+                j = command.find("`", i + 1)
+                subst(command[i + 1:] if j < 0 else command[i + 1:j])
+            else:
+                j = _match_close(command, i + 2)
+                subst(command[i + 2:] if j < 0 else command[i + 2:j])
+            i = n if j < 0 else j + 1
+            continue
+        if q == '"':
+            buf.append(c)
+            if c == '"':
+                q = None
+            i += 1
+            continue
+        if c in ("'", '"'):
+            q = c; buf.append(c); i += 1
+            continue
+        if c == "#" and (not buf or buf[-1].isspace()):
+            j = command.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if command.startswith("<<<", i):
+            buf.append("<<<"); i += 3
+            continue
+        if command.startswith("<<", i):
+            m = re.match(r"<<(-?)\s*(?:'([^']*)'|\"([^\"]*)\"|\\?([^\s;|&<>()]+))", command[i:])
+            if m:
+                delim = next(g for g in (m.group(2), m.group(3), m.group(4)) if g is not None)
+                pending.append((delim, m.group(4) is None, bool(m.group(1)), state["docs"]))
+                buf.append(m.group(0)); i += m.end()
+                continue
+        if command.startswith(("&&", "||"), i):
+            flush(False); i += 2
+            continue
+        if command.startswith("|&", i):
+            flush(True); i += 2
+            continue
+        if c == "&" and ((i > 0 and command[i - 1] in "<>") or (i + 1 < n and command[i + 1] in "<>")):
+            buf.append(c); i += 1
+            continue
+        if c == "|":
+            flush(True); i += 1
+            continue
+        if c in ";&()":
+            flush(False); i += 1
+            continue
+        if c == "\n":
+            flush(False); i += 1
+            for delim, quoted, strip, docs in pending:
+                lines = []
+                while i < n:
+                    j = command.find("\n", i)
+                    line = command[i:] if j < 0 else command[i:j]
+                    i = n if j < 0 else j + 1
+                    if (line.lstrip("\t") if strip else line) == delim:
+                        break
+                    lines.append(line)
+                body = "\n".join(lines)
+                docs.append((body, quoted))
+                if not quoted:
+                    _body_substs(body, substs)
+            pending.clear()
+            continue
+        buf.append(c); i += 1
+    flush(False)
+    return segs, substs
+
+
+def _strip_wrappers(toks: list[str]) -> tuple[list[str], bool, dict]:
+    """Drop reserved words, assignments and wrappers (sudo, env, nohup,
+    timeout, xargs, …) before the command they run. Returns (tokens,
+    run_by_xargs, assignments made before the command)."""
+    xargs, assigns = False, {}
+    with_arg = {"sudo": {"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U"},
+                "doas": {"-u", "-C"}, "env": {"-u", "-C", "-S"}, "nice": {"-n"},
+                "stdbuf": {"-i", "-o", "-e"}, "timeout": {"-s", "-k", "--signal", "--kill-after"},
+                "xargs": {"-I", "-n", "-P", "-L", "-d", "-a", "-E", "-s", "--max-args",
+                          "--max-procs", "--delimiter", "--arg-file", "--replace"}}
+    changed = True
+    while toks and changed:
+        changed = False
+        t = toks[0]
+        m = re.match(r"^([A-Za-z_]\w*)(?:\[[^\]]*\])?\+?=(.*)$", t, re.S)
+        if t in _RESERVED:
+            toks, changed = toks[1:], True
+            continue
+        if m:
+            assigns[m.group(1)] = m.group(2)
+            toks, changed = toks[1:], True
+            continue
+        head = os.path.basename(t)
+        if head in ("nohup", "command", "builtin", "exec", "setsid", "time", "sudo", "doas",
+                    "env", "nice", "stdbuf", "timeout", "xargs"):
+            xargs = xargs or head == "xargs"
+            j, opts = 1, with_arg.get(head, set())
+            while j < len(toks) and toks[j].startswith("-") and toks[j] != "-":
+                if toks[j] == "--":
+                    j += 1
+                    break
+                j += 2 if toks[j] in opts else 1
+            while head == "env" and j < len(toks) and re.match(r"^\w+=", toks[j]):
+                j += 1
+            if head == "timeout" and j < len(toks):
+                j += 1                                    # the duration
+            toks, changed = toks[j:], True
+    return toks, xargs, assigns
+
+
+def _seg_tokens(text: str) -> list[str] | None:
+    try:
+        return shlex.split(text, posix=True)
+    except ValueError:
+        return None
+
+
+def _tree_heads(command: str, depth: int = 0) -> set[str] | None:
+    """Every command name `command` runs, substitutions and `sh -c` strings
+    included; None when part of it cannot be parsed."""
+    if depth > 4:
+        return None
+    segs, substs = _kill_parse(command)
+    heads: set[str] = set()
+    for inner in substs:
+        sub = _tree_heads(inner, depth + 1)
+        if sub is None:
+            return None
+        heads |= sub
+    for seg in segs:
+        toks = _seg_tokens(seg["text"])
+        if toks is None:
+            return None
+        toks, _, _ = _strip_wrappers(toks)
+        if toks:
+            heads.add(os.path.basename(toks[0]))
+            inner = _shell_c_string(toks)
+            if inner:
+                sub = _tree_heads(inner, depth + 1)
+                if sub is None:
+                    return None
+                heads |= sub
+        for body, _ in seg["heredocs"]:
+            if toks and os.path.basename(toks[0]) in _KILL_SHELLS:
+                sub = _tree_heads(body, depth + 1)
+                if sub is None:
+                    return None
+                heads |= sub
+    return heads
+
+
+def _shell_c_string(toks: list[str]) -> str | None:
+    if not toks or os.path.basename(toks[0]) not in _KILL_SHELLS:
+        return None
+    for j, t in enumerate(toks[1:], 1):
+        if re.fullmatch(r"-[a-zA-Z]*c[a-zA-Z]*", t):
+            return toks[j + 1] if j + 1 < len(toks) else ""
+        if not t.startswith(("-", "+")):
+            return None
+    return None
+
+
+def _protected_pids() -> set[int]:
+    """PIDs a kill must never reach: the hook's own process (main.py: SDK
+    hooks are in-process callbacks), its parents (launcher, dask worker), and
+    its direct children (the Claude CLI sessions the SDK spawned). With psutil
+    absent, only this process and its parent are known."""
+    pids = {os.getpid(), os.getppid()}
+    try:
+        import psutil
+        me = psutil.Process()
+        pids |= {p.pid for p in me.parents()}
+        pids |= {p.pid for p in me.children(recursive=False)}
+    except Exception:  # noqa: BLE001  (psutil missing or a process vanished)
+        pass
+    pids.discard(0)
+    return pids
+
+
+def kill_reason(command: str, _depth: int = 0) -> str | None:
+    """Deny reason when `command` signals processes chosen by pattern, by
+    process group, or the pipeline's own processes; None otherwise.
+
+    Denied: pkill / killall (any wrapper: sudo, xargs, timeout, inside `$(…)`,
+    `sh -c`, or a heredoc fed to a shell); `fuser -k`; `xargs kill` fed by a
+    pipe or a substitution; `kill` whose PID comes from a substitution or a
+    variable that ran a process lister (pgrep, pidof, ps, lsof, …); `kill
+    -<pgid>`, `kill 0`, `kill -1`; a pipe into a shell or awk `system()` that
+    runs kill; `kill <pid>` of the session's own processes. Allowed: literal
+    PIDs, `%job`, `$!`, `kill -0` (a liveness check, no signal), `kill -l`,
+    `kill $(cat <pidfile>)`, and every mention that does not run (grep
+    patterns, echo, quoted heredoc bodies)."""
+    if _depth > 4:
+        return KILL_PARSE_REASON if _KILL_WORD.search(command) else None
+    if not _KILL_WORD.search(command) and "fuser" not in command:
+        return None
+    segs, substs = _kill_parse(command)
+    for inner in substs:
+        r = kill_reason(inner, _depth + 1)
+        if r:
+            return r
+
+    def lists_processes(inner: str) -> bool:
+        heads = _tree_heads(inner)
+        return heads is None or bool(heads & _PID_SOURCES)
+
+    # Variables set from a process listing in this command (V=$(pgrep x),
+    # `for V in $(…)`, `pgrep x | while read V`, `mapfile -t V < <(pgrep x)`).
+    tainted: set[str] = set()
+    assigned: list[str] = []
+    pipes_with_source: set[int] = set()
+    parsed = []
+    for seg in segs:
+        toks = _seg_tokens(seg["text"])
+        if toks is None:
+            if _KILL_WORD.search(seg["text"]):
+                return KILL_PARSE_REASON
+            parsed.append((seg, None, False))
+            continue
+        raw = toks
+        toks, xargs, assigns = _strip_wrappers(toks)
+        parsed.append((seg, toks, xargs))
+        assigned.extend(assigns.values())
+        for var, val in assigns.items():
+            if any(lists_processes(substs[int(k)]) for k in _SUBST_RE.findall(val)):
+                tainted.add(var)
+        head = os.path.basename(toks[0]) if toks else ""
+        if head in _PID_SOURCES:
+            pipes_with_source.add(seg["pipe"])
+        if raw and raw[0] == "for" and len(raw) > 3 and raw[2] == "in":
+            if any(lists_processes(substs[int(k)]) for t in raw[3:] for k in _SUBST_RE.findall(t)):
+                tainted.add(raw[1])
+        if head in ("read", "mapfile", "readarray"):
+            names = [t for t in toks[1:] if re.fullmatch(r"[A-Za-z_]\w*", t)]
+            fed = (seg["piped"] and seg["pipe"] in pipes_with_source) or any(
+                lists_processes(substs[int(k)]) for k in _SUBST_RE.findall(seg["text"]))
+            if fed:
+                tainted.update(names or ["REPLY", "MAPFILE"])
+
+    for seg, toks, xargs in parsed:
+        if not toks:
+            continue
+        head = os.path.basename(toks[0])
+        args = toks[1:]
+        if "$" in toks[0] or _SUBST_RE.search(toks[0]):
+            # A command name only known at run time (`$(echo pkill) -f x`, `$K -9 …`).
+            named = [toks[0]] + [substs[int(k)] for k in _SUBST_RE.findall(toks[0])] + assigned
+            if any(_KILL_WORD.search(x) for x in named):
+                return KILL_PARSE_REASON
+        if head in _KILL_BY_NAME:
+            return KILL_DENY_REASON
+        if head == "fuser" and any(re.fullmatch(r"-[a-zA-Z]*k[a-zA-Z]*", a) for a in args):
+            return KILL_DENY_REASON
+        if head in ("awk", "gawk", "mawk", "nawk") and any(
+                re.search(r"system\s*\(.*\bkill\b", a, re.S) for a in args):
+            return KILL_DENY_REASON
+        if head in _KILL_SHELLS:
+            inner = _shell_c_string(toks)
+            if inner:
+                r = kill_reason(inner, _depth + 1)
+                if r:
+                    return r
+            elif all(a.startswith(("-", "+")) or re.match(r"\d*[<>]|&>", a) for a in args):
+                for body, _ in seg["heredocs"]:       # the shell runs its stdin
+                    r = kill_reason(body, _depth + 1)
+                    if r:
+                        return r
+                if seg["piped"] and any(_KILL_WORD.search(s["text"]) for s, _, _ in parsed
+                                        if s["pipe"] == seg["pipe"] and s is not seg):
+                    return KILL_DENY_REASON           # `… | awk '{print "kill", $2}' | sh`
+            continue
+        if head != "kill":
+            continue
+        if xargs and (seg["piped"] or _SUBST_RE.search(seg["text"])):
+            return KILL_DENY_REASON
+        sig, ops, j, endopts = None, [], 0, False
+        while j < len(args):
+            a = args[j]
+            if not endopts and not ops:
+                if a == "--":
+                    endopts = True; j += 1
+                    continue
+                if a in ("-l", "-L", "--list", "--table"):
+                    return None
+                if a in ("-s", "-n", "--signal"):
+                    sig = args[j + 1] if j + 1 < len(args) else ""
+                    j += 2
+                    continue
+                if a.startswith("-") and sig is None:
+                    sig = a[1:]
+                    j += 1
+                    continue
+            ops.append(a); j += 1
+        if sig is not None and sig.upper().removeprefix("SIG") in ("0", "NULL"):
+            continue                                   # signal 0 only tests the PID
+        protected = None
+        for op in ops:
+            if op.startswith("%"):
+                continue
+            if re.fullmatch(r"-\d+", op) or op == "0":
+                return KILL_DENY_REASON                # a process group, or every process
+            if re.fullmatch(r"\d+", op):
+                if protected is None:
+                    protected = _protected_pids()
+                if int(op) in protected:
+                    return KILL_SELF_REASON
+                continue
+            for k in _SUBST_RE.findall(op):
+                if lists_processes(substs[int(k)]):
+                    return KILL_DENY_REASON
+            for var in _VAR_RE.findall(op):
+                if var in tainted:
+                    return KILL_DENY_REASON
+    return None
+
+
 def bash_reason(command: str, run_path: str, agent_type: str | None,
                 cwd: str | None = None) -> str | None:
     """Deny reason for a Bash command, or None."""
+    reason = kill_reason(command)
+    if reason:
+        return reason
     if _CHMOD.search(command) and _HARNESS_WORDS.search(command):
         # Phase 36: kept command-wide (narrowing it to chmod operands was bypassed
         # five ways in review); the message says how to chmod a run file.
