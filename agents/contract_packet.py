@@ -108,7 +108,9 @@ Benefit must be computed on the population the cost is charged for. `scripts/eli
 eligible→0 ⇒ benefit→0; eligible×k ⇒ benefit responds; total×m (eligible fixed) ⇒ benefit unchanged. HIGH on failure.""",
     "benchmark_targets": """\
 Planner creates `benchmarks: [{id, metric, target_value, units, tolerance_factor (≤10) | tolerance_abs, source}]`;
-modeler fills `computed_value` (or `computed_field: "file.yaml::dot.path"`) for every target after the run.
+the gate locks it on first sight. After every model run the modeler writes the current values to
+`models/benchmark_computed.yaml` (`benchmarks: [{id, computed_value | computed_field: "file.yaml::dot.path"}]`,
+or `computed: {id: value}`); NaN/null = not computed. These win over any copy in the targets file.
 `scripts/benchmark_match.py` → PASS | DRIFT | MALFORMED. Drift needs a literature-grounded scope declaration.""",
     "sanity_schema": """\
 Optional sections (each enables one generic check): `outcome: {name, unit, baseline_total, averted_point}`;

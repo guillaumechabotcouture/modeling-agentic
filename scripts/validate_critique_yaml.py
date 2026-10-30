@@ -5120,7 +5120,7 @@ def _check_benchmark_match(run_dir: str,
             "severity": sev,
             "stage": "MODEL",
             "claim": (
-                f"benchmark_targets.yaml is MALFORMED: "
+                f"benchmark inputs are MALFORMED: "
                 f"{rep.get('error', 'see benchmark_match.yaml')}. "
                 f"Phase 19 γ — fix the schema (each benchmark needs "
                 f"id, metric, target_value, tolerance_factor or "
@@ -5157,6 +5157,19 @@ def _check_benchmark_match(run_dir: str,
         if within is not True:
             drifted.append(r)
 
+    # Phase 45 γ: a frozen copy in the locked targets file that would have
+    # passed where the current computed value does not is named in the
+    # drift / not-computed finding it caused. Other stale copies stay in
+    # benchmark_match.yaml: the targets file is locked, so they cannot be
+    # removed, and they change no verdict.
+    stale = {str(x.get("id")): x for x in (rep.get("stale_copies") or [])
+             if isinstance(x, dict) and x.get("severity") == "HIGH"}
+
+    def _stale_note(rid) -> str:
+        x = stale.get(str(rid))
+        return (f" The locked models/benchmark_targets.yaml still holds {x.get('targets_value')}, which is in "
+                f"band; that copy is stale and is not used." if x else "")
+
     # Emit. Cap each list at 5 to avoid swamping the gate (Phase 10 ψ
     # consolidation pattern).
     for r in drifted[:5]:
@@ -5174,6 +5187,7 @@ def _check_benchmark_match(run_dir: str,
                 f"output does not match published reality. Refit, "
                 f"widen the tolerance with cited justification, or "
                 f"scope-declare with a literature-grounded reason."
+                + _stale_note(rid)
             ),
         })
     if len(drifted) > 5:
@@ -5196,11 +5210,12 @@ def _check_benchmark_match(run_dir: str,
             "severity": sev,
             "stage": "MODEL",
             "claim": (
-                f"Benchmark `{rid}` ({r.get('metric', '?')}): modeler "
-                f"set neither `computed_value` nor `computed_field`. "
-                f"Phase 19 γ — after the model run, fill the field so "
-                f"the comparison against {r.get('source', 'the source')} "
-                f"can fire. Diagnostic: {r.get('diagnostic', '')}"
+                f"Benchmark `{rid}` ({r.get('metric', '?')}): no computed "
+                f"value. Phase 19 γ — after the model run, record it in "
+                f"models/benchmark_computed.yaml (`computed_value` or "
+                f"`computed_field`) so the comparison against "
+                f"{r.get('source', 'the source')} can fire. Diagnostic: "
+                f"{r.get('diagnostic', '')}" + _stale_note(rid)
             ),
         })
 
@@ -9085,6 +9100,26 @@ def _run_self_test() -> int:
         # Phase 21 β: 5 itemized + 1 overflow summary, all HIGH.
         ok(len(drift) == 6 and all(x["severity"] == "HIGH" for x in drift),
            f"BM9: must cap at 5 + 1 HIGH overflow, got drift={len(drift)}")
+
+    with _tempfile.TemporaryDirectory() as _d:
+        # BM10 (Phase 45 γ): the current value in models/benchmark_computed.yaml
+        # wins over the locked targets file's copy. Not computed there (NaN)
+        # is HIGH benchmark_computed_missing naming the stale in-band copy; a
+        # stale copy that changes no verdict adds no finding.
+        os.makedirs(os.path.join(_d, "models"))
+        with open(os.path.join(_d, "models", "benchmark_targets.yaml"), "w") as f:
+            _yaml.safe_dump({"benchmarks": [
+                {"id": "b1", "metric": "x", "target_value": 400, "tolerance_factor": 2.0,
+                 "source": "WMR", "computed_value": 380},
+                {"id": "b2", "metric": "y", "target_value": 400, "tolerance_factor": 2.0,
+                 "source": "WMR", "computed_value": 390}]}, f)
+        with open(os.path.join(_d, "models", "benchmark_computed.yaml"), "w") as f:
+            f.write("benchmarks:\n- id: b1\n  computed_value: .nan\n- id: b2\n  computed_value: 410\n")
+        v = _check_benchmark_match(_d, round_n=2)
+        miss = [x for x in v if x["kind"] == "benchmark_computed_missing"]
+        ok(len(v) == 1 and len(miss) == 1 and miss[0]["severity"] == "HIGH" and "`b1`" in miss[0]["claim"]
+           and "still holds 380" in miss[0]["claim"],
+           f"BM10: NaN computed value must be HIGH not-computed naming the stale copy, got {v}")
 
     # --- Phase 19 δ: sufficiency-critic tests (SF-prefix) ---
     with _tempfile.TemporaryDirectory() as _d:
