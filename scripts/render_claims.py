@@ -359,6 +359,15 @@ def _builder():
     return mod
 
 
+def _claim_units():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "_ma_claim_units", os.path.join(os.path.dirname(os.path.abspath(__file__)), "claim_units.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def render_run(run_dir: str) -> dict:
     """Render report.md in-place using the run's claims ledger.
 
@@ -430,9 +439,19 @@ def render_run(run_dir: str) -> dict:
                 "report_path": report_path}
 
     _write_report(new_text)
+    # Phase 47 β (A18): percentage claims cited here whose source holds a
+    # proportion (rendered 100 times too small). Reported, not blocking: the
+    # gate raises them (claim_percentage_is_proportion).
+    try:
+        cited = {m.group(1).strip() for m in _CLAIM_REF_RE.finditer(text)}
+        scale = [p for p in _claim_units().problems(list(claims.values()), run_dir)
+                 if p["id"] in cited]
+    except Exception as e:  # noqa: BLE001 — a failed check must be visible, not silent
+        scale = [{"id": "?", "rendered": "?", "as_percent": "?",
+                  "evidence": [f"check failed: {type(e).__name__}: {e}"]}]
     return {"ok": True, "n_refs": n_refs, "n_unresolved": 0,
             "unresolved_ids": [], "snapshot_path": snapshot_path,
-            "report_path": report_path}
+            "report_path": report_path, "scale_problems": scale}
 
 
 # ----- Self-test --------------------------------------------------------- #
@@ -728,6 +747,25 @@ def _self_test() -> int:
         ok(r["ok"] and "208" in body and "150" not in body,
            f"T17: spec-built ledger wins over a stale file ({r}, {body!r})")
 
+    # T18 (Phase 47 β, A18): a cited percentage claim whose source holds a
+    # proportion is reported with the render (attempt 7, R-064: 0.587 -> "0.6%").
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        with open(os.path.join(d, "models", "out.yaml"), "w") as f:
+            yaml.safe_dump({"a": {"gain_pct": 10.4, "p10": 0.587, "small_pct": 0.5}}, f)
+        with open(os.path.join(d, "models", "claims_spec.yaml"), "w") as f:
+            yaml.safe_dump({"claims": [
+                {"id": "p", "claim_kind": "percentage", "source_artifact": "models/out.yaml",
+                 "source_field": "a.p10"},
+                {"id": "s", "claim_kind": "percentage", "source_artifact": "models/out.yaml",
+                 "source_field": "a.small_pct"}]}, f)
+        with open(os.path.join(d, "manuscript.md"), "w") as f:
+            f.write("P = [CLAIM:p]; change [CLAIM:s].\n")
+        r = render_run(d)
+        ok(r["ok"] and [p["id"] for p in r.get("scale_problems", [])] == ["p"]
+           and r["scale_problems"][0]["rendered"] == "0.6%",
+           f"T18: a proportion cited as a percentage is reported; a real 0.5% is not: {r}")
+
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)
         for f in failures:
@@ -759,6 +797,10 @@ def main() -> int:
 
     print(f"refs: {result['n_refs']}, unresolved: {result['n_unresolved']}",
           file=sys.stderr)
+    for p in result.get("scale_problems") or []:
+        print(f"WARNING [{p['id']}]: percentage claim rendered as {p['rendered']}, but its source "
+              f"holds a proportion ({p['as_percent']} meant): {'; '.join(p['evidence'])}",
+              file=sys.stderr)
     if result.get("unresolved_ids"):
         print(f"unresolved IDs:", file=sys.stderr)
         for cid in result["unresolved_ids"]:
