@@ -143,7 +143,7 @@ def _resolve_computed_field(run_dir: str, ref: str) -> tuple[float | None, str]:
         return None, f"key {key!r} absent in {rel}"
     try:
         return float(val), ""
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None, f"value at {rel}::{key} not numeric (got {val!r})"
 
 
@@ -172,24 +172,38 @@ def _computed_values(run_dir: str) -> tuple[dict[str, tuple[float | None, str]] 
     for e in entries if isinstance(entries, list) else []:
         if not isinstance(e, dict) or e.get("id") is None:
             continue
-        if "computed_value" in e or "computed_field" in e:
+        if "computed_value" in e:
+            # Present means this round's value, even null/NaN ("not computed"):
+            # a computed_field beside it is never consulted.
+            v, diag = _finite_value(e["computed_value"])
+        elif "computed_field" in e:
             v, diag = _resolve_observed(run_dir, e)
+            if v is not None and not math.isfinite(v):
+                v, diag = None, f"computed value is {v!r}"
         else:
             v, diag = None, "entry has no computed_value"
-        if v is not None and not math.isfinite(v):
-            v, diag = None, f"computed value is {v!r}"
         out[str(e["id"])] = (v, diag)
     computed = doc.get("computed")
     for k, raw in (computed.items() if isinstance(computed, dict) else []):
-        try:
-            v = float(raw)
-        except (TypeError, ValueError):
-            v = None
-        ok = v is not None and math.isfinite(v)
-        out.setdefault(str(k), (v if ok else None, "" if ok else f"computed value is {raw!r}"))
+        out.setdefault(str(k), _finite_value(raw))
     if entries is None and computed is None:
         return None, f"{COMPUTED_PATH} has neither `benchmarks:` nor `computed:`"
     return out, ""
+
+
+def _finite_value(raw) -> tuple[float | None, str]:
+    """(value, "") for a finite number, else (None, why): null, NaN, inf, text,
+    a bool, or a number too large for a float are all "not computed"."""
+    if isinstance(raw, bool):
+        return None, f"computed value is {raw!r}"
+    try:
+        v = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        v = None
+    if v is None or not math.isfinite(v):
+        shown = repr(raw) if len(repr(raw)) <= 40 else repr(raw)[:37] + "..."
+        return None, f"computed value is {shown}"
+    return v, ""
 
 
 def _resolve_observed(run_dir: str, target: dict) -> tuple[float | None, str]:
@@ -197,7 +211,7 @@ def _resolve_observed(run_dir: str, target: dict) -> tuple[float | None, str]:
     if "computed_value" in target and target["computed_value"] is not None:
         try:
             return float(target["computed_value"]), ""
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None, (f"computed_value not numeric: "
                           f"{target['computed_value']!r}")
     cf = target.get("computed_field")
@@ -211,7 +225,7 @@ def _band(target: dict) -> tuple[float | None, float | None, str]:
     """Return (low, high, diag). None on failure."""
     try:
         tv = float(target["target_value"])
-    except (KeyError, TypeError, ValueError) as e:
+    except (KeyError, TypeError, ValueError, OverflowError) as e:
         return None, None, f"target_value invalid: {e}"
     if not math.isfinite(tv):
         return None, None, f"target_value must be finite, got {tv!r}"
@@ -249,7 +263,7 @@ def _band(target: dict) -> tuple[float | None, float | None, str]:
                                     "tolerance_abs; band undefined")
             low = tv / f if tv >= 0 else tv * f
             high = tv * f if tv >= 0 else tv / f
-        except (TypeError, ValueError) as e:
+        except (TypeError, ValueError, OverflowError) as e:
             return None, None, f"tolerance_factor invalid: {e}"
     if abs_tol is not None:
         try:
@@ -269,7 +283,7 @@ def _band(target: dict) -> tuple[float | None, float | None, str]:
             # Intersection
             low = max(low, ab_low) if low is not None else ab_low
             high = min(high, ab_high) if high is not None else ab_high
-        except (TypeError, ValueError) as e:
+        except (TypeError, ValueError, OverflowError) as e:
             return None, None, f"tolerance_abs invalid: {e}"
     if low is None and high is None:
         return None, None, ("neither tolerance_factor nor tolerance_abs set; "
@@ -350,7 +364,7 @@ def evaluate(run_dir: str) -> dict:
         source = str(t.get("source") or "?")
         try:
             tv = float(t.get("target_value"))
-        except (TypeError, ValueError) as e:
+        except (TypeError, ValueError, OverflowError) as e:
             results.append(BenchResult(
                 id=tid, metric=metric, target_value=float("nan"),
                 observed=None, band_low=None, band_high=None,
@@ -787,6 +801,32 @@ def _self_test() -> int:
         rep = evaluate(d)
         ok(rep["verdict"] == "MALFORMED" and "outside the run" in rep.get("error", ""),
            f"T12g: symlinked computed file must not be read, got {rep}")
+    # T12h: an explicit `computed_value: null` (or NaN) is not computed; a computed_field
+    # beside it is not consulted, so a locked DRIFT cannot turn into a PASS through it.
+    drift_target = [{"id": "b", "metric": "m", "target_value": 100, "tolerance_abs": 10,
+                     "source": "s", "computed_value": 500.0}]
+    for null in ("null", ".nan"):
+        rep = fresh_case(f"benchmarks:\n- id: b\n  computed_value: {null}\n  computed_field: models/out.yaml::v\n",
+                         targets=drift_target)
+        ok(rep["verdict"] == "DRIFT" and by(rep, "b")["observed"] is None and rep["missing_computed"] == 1,
+           f"T12h {null}: explicit not-computed must not fall through to computed_field, got {rep}")
+    # T12i: a number too large for a float never raises; it is a non-passing result.
+    huge = "9" * 400
+    for label, text, targets in (
+            ("computed list", f"benchmarks:\n- id: b\n  computed_value: {huge}\n", None),
+            ("computed mapping", f"computed:\n  b: {huge}\n", None),
+            ("targets computed_value", None, [{"id": "b", "metric": "m", "target_value": 40,
+                                                "tolerance_factor": 5.0, "source": "s", "computed_value": int(huge)}]),
+            ("targets target_value", None, [{"id": "b", "metric": "m", "target_value": int(huge),
+                                              "tolerance_factor": 5.0, "source": "s", "computed_value": 35.0}]),
+            ("targets tolerance", None, [{"id": "b", "metric": "m", "target_value": 40,
+                                           "tolerance_abs": int(huge), "source": "s", "computed_value": 35.0}])):
+        try:
+            rep = fresh_case(text, targets=targets)
+        except Exception as e:  # noqa: BLE001
+            rep = {"verdict": f"raised {type(e).__name__}"}
+        ok(rep["verdict"] in ("DRIFT", "MALFORMED") and not by(rep, "b")["within_band"],
+           f"T12i {label}: a huge number must give a non-passing result, got {rep}")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)
