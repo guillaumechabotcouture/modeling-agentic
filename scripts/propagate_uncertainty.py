@@ -357,8 +357,9 @@ def parameter_summary(per_param_samples: dict) -> dict:
 # zero too, so the quantiles describe the zero mass rather than the event
 # (attempt 8: mean 0.16 with CI [0, 0]). The faithful summary is the event
 # probability, with its sampling error, and the size of the event when it
-# occurs. validate_critique_yaml.py keys its rare-event path on the same
-# boundary (`_RARE_EVENT_MAX_P_NONZERO`).
+# occurs. Reporting only: the gate does not relax `ci_degenerate` on these
+# fields (accepting P(output > 0) needs the per-draw values); it uses
+# p_nonzero to word the finding.
 RARE_EVENT_ZERO_FRACTION = 0.5
 
 

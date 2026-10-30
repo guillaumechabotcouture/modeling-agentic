@@ -1222,13 +1222,6 @@ def _check_surrogate_uq_documented(run_dir: str) -> list[dict]:
 # calibration targets (CI ~ 1e-7 of the target value). Looser would miss
 # them; tighter would flag legitimately well-constrained outputs.
 _CI_DEGENERATE_THRESHOLD = 0.005
-# Phase 45 α (A12): an output whose report entry carries `p_nonzero` at or
-# below this value (zero in >= 50% of draws) is judged as a rare event, on
-# p_nonzero, not on quantile width. Same boundary as
-# propagate_uncertainty.RARE_EVENT_ZERO_FRACTION; a p_nonzero above it is
-# ignored so a producer field cannot move an ordinary output off the
-# width rule.
-_RARE_EVENT_MAX_P_NONZERO = 0.5
 # Phase 45 α (A11): variants named in one family finding before "+N more".
 _UQ_FAMILY_LIST_CAP = 6
 
@@ -1328,26 +1321,6 @@ def _uq_output_families(names: list[str]) -> dict[str, str]:
     return out
 
 
-def _uq_rare_event_inconsistency(stats: dict, p: float, mean: float,
-                                 lo: float, hi: float) -> str:
-    """Phase 45 α: why rare-event metadata does not fit the summary, or ''.
-    With at least half the draws exactly zero, zero lies inside the 95%
-    interval and is the median; mean_if_nonzero, when given, must satisfy
-    mean == p_nonzero * mean_if_nonzero."""
-    tol = max(1e-6, _CI_DEGENERATE_THRESHOLD * abs(mean))
-    if not lo - tol <= 0 <= hi + tol:
-        return f"0 is outside the 95% CI [{lo:.6g}, {hi:.6g}]"
-    med = finite_number(stats.get("median"))
-    if stats.get("median") is not None and (med is None or abs(med) > tol):
-        return f"median {stats.get('median')!r} is not 0"
-    if stats.get("mean_if_nonzero") is not None:
-        mif = finite_number(stats.get("mean_if_nonzero"))
-        if mif is None or abs(mean - p * mif) > tol:
-            return (f"mean {mean:.6g} != p_nonzero x mean_if_nonzero "
-                    f"({stats.get('mean_if_nonzero')!r})")
-    return ""
-
-
 def _uq_family_list(outputs: list[str]) -> str:
     shown = ", ".join(outputs[:_UQ_FAMILY_LIST_CAP])
     more = len(outputs) - _UQ_FAMILY_LIST_CAP
@@ -1375,13 +1348,12 @@ def _check_uq_ci_quality(uq_report_path: str) -> list[dict]:
     Phase 45 α: findings are grouped per output family
     (`_uq_output_families`, the name after the last `__`) — one
     `ci_degenerate` per family, listing its degenerate variants. Inverted
-    bounds are degenerate before any exemption. A rare-event
-    output (`p_nonzero` <= 0.5, written by propagate_uncertainty.py) is
-    judged on p_nonzero, not on quantile width: degenerate only when
-    p_nonzero is 0 or 1 to within its binomial SE, i.e. whether the event
-    occurs never varies across draws. Rare-event metadata that does not fit
-    the summary (`_uq_rare_event_inconsistency`) is HIGH
-    `uncertainty_report_invalid` and the width rule applies.
+    bounds are degenerate before any exemption. The rare-event fields
+    propagate_uncertainty.py writes (`p_nonzero` ...) never relax the
+    width rule: summary fields cannot show that an event probability is
+    well estimated, which needs the per-draw values. A degenerate output
+    with 0 < p_nonzero < 1 stays HIGH, and its claim says to quote
+    P(output > 0) with its SE instead of a quantile interval.
     `uq_mean_outside_ci` (MEDIUM, per family) fires when a mean lies
     outside its own [ci_low, ci_high] — a summary that misreports a
     zero-inflated output.
@@ -1453,39 +1425,13 @@ def _check_uq_ci_quality(uq_report_path: str) -> list[dict]:
             })
             continue
         mean_f, lo_f, hi_f = vals["mean"], vals["ci_low"], vals["ci_high"]
-        rare = None
-        p = None
-        if stats.get("p_nonzero") is not None:
-            p = finite_number(stats.get("p_nonzero"))
-            if p is None or not 0 <= p <= 1:
-                violations.append({
-                    "kind": "uncertainty_report_invalid",
-                    "severity": "HIGH",
-                    "stage": "UQ",
-                    "scope_declarable": False,
-                    "claim": (f"scalar_outputs.{output_name}.p_nonzero must "
-                              f"be a probability, got "
-                              f"{stats.get('p_nonzero')!r}."),
-                })
-                continue
-            n_out = finite_number(stats.get("n")) or n_draws
-            if p <= _RARE_EVENT_MAX_P_NONZERO and n_out and n_out > 0:
-                bad = _uq_rare_event_inconsistency(stats, p, mean_f, lo_f, hi_f)
-                if bad:
-                    # Fall through to the width rule; the metadata itself
-                    # is a broken artifact.
-                    violations.append({
-                        "kind": "uncertainty_report_invalid",
-                        "severity": "HIGH",
-                        "stage": "UQ",
-                        "scope_declarable": False,
-                        "claim": (f"scalar_outputs.{output_name}: p_nonzero "
-                                  f"{p:.3g} is inconsistent with the summary "
-                                  f"({bad}); rare-event fields must come from "
-                                  f"the same draws as mean/ci_low/ci_high."),
-                    })
-                else:
-                    rare = (p, (p * (1 - p) / n_out) ** 0.5)
+        # Phase 45 α (A12): p_nonzero only shapes the message (and, below,
+        # keeps a deterministic declaration from exempting a varying
+        # output); it never exempts. A value that is not a probability is
+        # ignored.
+        p = finite_number(stats.get("p_nonzero"))
+        p = p if p is not None and 0 <= p <= 1 else None
+        rare = p is not None and 0 < p < 1
         # Phase 45 α (A12): a mean outside its own interval is a reporting
         # defect for any output (inverted bounds are ci_degenerate below).
         # The absolute floor absorbs float residue (a mean of 2e-9 over
@@ -1495,12 +1441,12 @@ def _check_uq_ci_quality(uq_report_path: str) -> list[dict]:
             outside_by_family.setdefault(family, []).append((output_name, (
                 f"{output_name} mean {mean_f:.6g} vs 95% CI "
                 f"[{lo_f:.6g}, {hi_f:.6g}]"
-                + (f", p_nonzero {rare[0]:.3g}" if rare else ""))))
+                + (f", p_nonzero {p:.3g}" if rare else ""))))
         if not multi_draw:
             continue  # effort floors own the n_draws minimum
         if lo_f > hi_f:
-            # Inverted bounds are a broken summary: no declaration, pin or
-            # rare-event reading can exempt them.
+            # Inverted bounds are a broken summary: no declaration or pin
+            # can exempt them.
             degenerate_by_family.setdefault(family, []).append((output_name, (
                 f"{output_name} 95% CI [{lo_f:.6g}, {hi_f:.6g}] is inverted "
                 f"(ci_low > ci_high)")))
@@ -1527,13 +1473,7 @@ def _check_uq_ci_quality(uq_report_path: str) -> list[dict]:
             pin_note = (f"; declared pinned_by_constraint {pin[0]} = "
                         f"{pin[1]:.6g}, but the output does not sit at it")
         width = hi_f - lo_f
-        if rare is not None:
-            p, se = rare
-            degenerate = p - se <= 0 or p + se >= 1
-            rel_txt = (f"a rare event: p_nonzero {p:.3g} (SE {se:.2g}) "
-                       f"{'does not vary' if degenerate else 'varies'} "
-                       f"across draws")
-        elif abs(mean_f) < 1e-9:
+        if abs(mean_f) < 1e-9:
             degenerate = width <= 0
             rel_txt = "zero width"
         else:
@@ -1545,6 +1485,15 @@ def _check_uq_ci_quality(uq_report_path: str) -> list[dict]:
             diag = str(stats.get("degenerate_diagnostic") or "").strip()
             if diag:
                 rel_txt += f"; producer diagnostic: {diag}"
+        if degenerate and rare:
+            n_out = finite_number(stats.get("n")) or n_draws
+            se_txt = (f", SE {(p * (1 - p) / n_out) ** 0.5:.2g}"
+                      if n_out and n_out > 0 else "")
+            rel_txt += (f". It is a rare event (P(output > 0) = {p:.3g}"
+                        f"{se_txt}): the report and prose must quote "
+                        f"P(output > 0) with its SE, and the size when it "
+                        f"occurs, instead of a quantile interval; it cannot "
+                        f"be declared away")
         if degenerate:
             degenerate_by_family.setdefault(family, []).append((output_name, (
                 f"{output_name} 95% CI [{lo_f:.6g}, {hi_f:.6g}] is "
@@ -1589,7 +1538,7 @@ def _check_uq_ci_quality(uq_report_path: str) -> list[dict]:
                 f"models/uq_declarations.yaml, but the draws vary in "
                 f"{len(outputs)} output(s) ({_uq_family_list(outputs)}). "
                 f"Example: {items[0][1]}. The declaration does not exempt "
-                f"them; they are judged by the width / rare-event rules. "
+                f"them; they are judged by the width rule. "
                 f"Remove the declaration, and report an output that is "
                 f"zero in most draws by its p_nonzero and mean_if_nonzero."
             ),
@@ -6319,44 +6268,30 @@ def _run_self_test() -> int:
         ok(sorted(v["family"] for v in i1 if v["kind"] == "ci_degenerate")
            == ["x", "y"] and all("inverted" in v["claim"] for v in i1
                                  if v["kind"] == "ci_degenerate"),
-           f"I1: inverted bounds are HIGH before a pin or the rare-event "
-           f"path; got {i1}")
+           f"I1: inverted bounds are HIGH even under a matching pin or "
+           f"with p_nonzero; got {i1}")
         _decl(None)
         r1 = _uq("uq_r1.yaml", "n_successful: 200\nscalar_outputs:\n"
                  "  x:\n    mean: 100\n    ci_low: 100\n    ci_high: 100\n"
                  "    n: 200\n    p_nonzero: 0.2\n")
-        ok(_kinds(r1) == ["ci_degenerate", "uncertainty_report_invalid"],
-           f"R1: p_nonzero with 0 outside the CI is invalid metadata and the "
-           f"width rule still fires; got {r1}")
-        r2 = _uq("uq_r2.yaml", "n_successful: 200\nscalar_outputs:\n"
-                 "  x:\n    mean: 0.16\n    median: 0\n    ci_low: 0\n"
-                 "    ci_high: 0\n    n: 200\n    p_nonzero: 0.02\n"
-                 "    mean_if_nonzero: 50\n")
-        ok("uncertainty_report_invalid" in _kinds(r2)
-           and "ci_degenerate" in _kinds(r2),
-           f"R2: mean != p_nonzero x mean_if_nonzero is invalid; got {r2}")
+        ok(_kinds(r1) == ["ci_degenerate"] and "P(output > 0)" in r1[0]["claim"],
+           f"R1: p_nonzero never relaxes the width rule; a degenerate rare "
+           f"event stays HIGH and says to quote P(output > 0); got {r1}")
         z1 = _uq("uq_z1.yaml", "n_successful: 200\nscalar_outputs:\n"
                  "  cuts:\n    mean: 0.16\n    ci_low: 0\n    ci_high: 0\n"
                  "    n: 200\n    p_nonzero: 0.02\n")
-        ok(_kinds(z1) == ["uq_mean_outside_ci"]
-           and z1[0]["severity"] == "MEDIUM",
-           f"Z1: rare event whose p_nonzero varies → not degenerate; mean "
-           f"outside [0, 0] → MEDIUM uq_mean_outside_ci; got {z1}")
+        ok(_kinds(z1) == ["ci_degenerate", "uq_mean_outside_ci"]
+           and all(v["severity"] == ("HIGH" if v["kind"] == "ci_degenerate"
+                                     else "MEDIUM") for v in z1),
+           f"Z1: zero-inflated output with CI [0, 0] → HIGH ci_degenerate + "
+           f"MEDIUM uq_mean_outside_ci; got {z1}")
         z2 = _uq("uq_z2.yaml", "n_successful: 200\nscalar_outputs:\n"
-                 "  cuts:\n    mean: 1\n    ci_low: 0\n    ci_high: 5\n"
-                 "    n: 200\n    p_nonzero: 0.0\n")
-        ok(_kinds(z2) == ["ci_degenerate"] and "does not vary" in z2[0]["claim"],
-           f"Z2: rare-event path judges on p_nonzero (never varies → "
-           f"degenerate) even with wide quantiles; got {z2}")
-        z3 = _uq("uq_z3.yaml", "scalar_outputs:\n  cuts:\n    mean: 1\n"
-                 "    ci_low: 0\n    ci_high: 5\n    p_nonzero: 1.5\n")
-        ok(_kinds(z3) == ["uncertainty_report_invalid"],
-           f"Z3: p_nonzero outside [0, 1] fails closed; got {z3}")
-        z4 = _uq("uq_z4.yaml", "scalar_outputs:\n  x:\n    mean: 3\n"
-                 "    ci_low: 3\n    ci_high: 3\n    p_nonzero: 0.9\n")
-        ok(_kinds(z4) == ["ci_degenerate"],
-           f"Z4: p_nonzero > 0.5 does not move an output off the width "
-           f"rule; got {z4}")
+                 "  cuts:\n    mean: 1.0\n    median: 2.0\n    ci_low: 0.0\n"
+                 "    ci_high: 2.0\n    n: 200\n    rare_event: true\n"
+                 "    p_nonzero: 0.5\n    p_nonzero_se: 0.0354\n"
+                 "    mean_if_nonzero: 2.0\n")
+        ok(z2 == [],
+           f"Z2: producer output at exactly 50% zeros is not invalid; got {z2}")
         _decl("pinned_by_constraint:\n  total:\n    constraint: budget\n"
               "    value: 320000000\n")
         c1 = _uq("uq_g1.yaml", fam_report)

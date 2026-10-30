@@ -260,6 +260,8 @@ Outputs that are fixed by design, and the gate's treatment of them:
   only sometimes): `uncertainty_report.yaml` adds `p_nonzero`, its
   standard error and `mean_if_nonzero`. Report those, not
   mean [ci_low, ci_high]: a mean outside its own interval is a finding.
+  These fields do not exempt the output: a zero-width interval on it
+  still blocks and cannot be declared away.
 
 Findings are grouped by output family: outputs that share a name after
 a `<variant>__` prefix count as one finding that lists the variants.

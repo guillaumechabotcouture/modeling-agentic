@@ -114,7 +114,8 @@ artifacts:
       at that non-zero value; a family is the name after any `<variant>__`
       prefix). Outputs downstream of a decision rule (overrun, reserve used)
       are not constraint-pinned. An output that is zero in most draws is
-      summarised by `p_nonzero` in the report.
+      summarised by `p_nonzero` in the report (quote P(output > 0) and its SE);
+      that field does not exempt a zero-width interval.
 
   - id: model_comparison
     path: models/model_comparison.yaml
