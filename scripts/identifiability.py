@@ -313,23 +313,6 @@ def fisher_analysis(loss_fn: Callable[[dict], float], point: dict[str, float],
             "condition_number": cond}
 
 
-def fisher_diagonal(loss_fn: Callable[[dict], float],
-                    point: dict[str, float],
-                    step_frac: float = 0.01) -> dict[str, Optional[float]]:
-    """Conditional SE (1/sqrt(F_ii), all other parameters held fixed).
-    Retained for reference only — Phase 21 δ: this ignores correlations
-    and must not be used for classification; see fisher_analysis()."""
-    f0 = loss_fn(point)
-    out = {}
-    for name, p0 in point.items():
-        h = max(abs(p0) * step_frac, 1e-6)
-        plus = dict(point); plus[name] = p0 + h
-        minus = dict(point); minus[name] = p0 - h
-        d2 = (loss_fn(plus) - 2 * f0 + loss_fn(minus)) / (h * h)
-        out[name] = None if d2 <= 1e-12 else 1.0 / math.sqrt(d2)
-    return out
-
-
 def assert_loss_fn_is_pointwise(loss_fn: Callable[[dict], float],
                                 point: dict[str, float],
                                 eps_frac: float = 0.05,
