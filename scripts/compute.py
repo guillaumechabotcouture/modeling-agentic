@@ -614,7 +614,8 @@ def _no_symlink_path(path: str) -> bool:
 def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: list,
                  deadline: float | None = None, procs: int | None = None,
                  chunk_allowance_s: float | None = None, call_id: str | None = None, repo: str | None = None,
-                 peak_mb: float | None = None, prior_ok: int = 0, chunk_breaker: bool = True):
+                 peak_mb: float | None = None, prior_ok: int = 0, chunk_breaker: bool = True,
+                 token: str | None = None):
     """Runs on a dask worker. Under a machine-wide lock: make sure the files on
     disk are exactly THIS bundle (another call's bundle may have replaced them:
     its extra files are removed and no stale bytecode survives), then evaluate
@@ -623,7 +624,11 @@ def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: lis
     symlink is written or deleted. The chunk stops at `deadline` (wall clock)
     or once it has used `chunk_allowance_s` core-seconds, counted from when it
     starts running, not while it queues. Returns the rows and the core-seconds
-    used, including work in crashed processes."""
+    used, including work in crashed processes.
+
+    Phase 45 δ: `token` names this submission. Under the lock, the chunk
+    claims it (an O_EXCL file) before any work; if `_revoke_chunk` claimed it
+    first, the chunk returns at once with no work done ("revoked")."""
     import fcntl, io, json, os, shutil, signal, subprocess, sys, tarfile, tempfile, time  # noqa: E401 — pickled by value
     try:
         from distributed import get_worker
@@ -648,6 +653,11 @@ def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: lis
             return {"rows": rows_with(msg, kind), "core_s": round((time.time() - t0) * procs, 3)}
         if os.path.exists(os.path.join(calls, "cancel")):
             return {"rows": rows_with("cancelled"), "core_s": 0.0}
+        if token:
+            try:
+                os.close(os.open(os.path.join(calls, f"claim-{token}"), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+            except FileExistsError:
+                return {"rows": rows_with("revoked: moved to another worker"), "core_s": 0.0, "revoked": True}
         live = os.path.exists(os.path.join(run_dir, "metadata.json"))
         if not live:
             tf = tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz")
@@ -764,6 +774,21 @@ def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: lis
                 core_s = (time.time() - t0) * procs    # no summary: charge the chunk as fully busy
     return {"rows": [{**row, "i": chunk[k][0], "worker": waddr} for k, row in enumerate(rows)], "core_s": core_s,
             "summary": csum if isinstance(csum, dict) else None, "stderr_tail": (err or "")[-300:]}
+
+
+def _revoke_chunk(call_id: str, token: str) -> bool:
+    """Runs on a worker (Phase 45 δ): claim a chunk's start so that it never
+    starts. True: revoked, it will do no work. False: the chunk claimed it
+    first (it is running or has run) and is left alone. The claim is an
+    O_EXCL file on the worker's disk, so exactly one side wins."""
+    import os, tempfile  # noqa: E401 — pickled by value
+    calls = os.path.join(tempfile.gettempdir(), _CALLS_DIR, call_id)
+    os.makedirs(calls, exist_ok=True)
+    try:
+        os.close(os.open(os.path.join(calls, f"claim-{token}"), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+    except FileExistsError:
+        return False
+    return True
 
 
 def _same_process(pid: int, token: str | None) -> bool:
@@ -974,7 +999,11 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
     mean occupancy so far that no compute worker counted as saturated, and
     24 queued chunks sat on one VM while 23 others idled. Work this call
     could run on more VMs is shown to the autoscaler as demand markers
-    (`_demand_marker`), never as real chunks queued on a busy worker."""
+    (`_demand_marker`), never as real chunks queued on a busy worker. A chunk
+    that has not claimed its start (`token`) on a worker that runs another
+    task or has stopped taking work is revoked (`_revoke_chunk`) and placed
+    again; a started chunk is never retried while it may be running."""
+    import random
     import uuid
     import cloudpickle
     from dask.utils import funcname
@@ -1023,6 +1052,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
         poll_s = float(os.environ.get("MA_COMPUTE_DISPATCH_S", "2"))
         fixed = set(workers)                        # the explicit list (no resource tag)
         pinned, used_w, seen_w, markers = {}, set(), set(workers), []
+        toks, claimed = {}, set()                   # submission tokens; chunks known to have started
 
         # At most `slots` chunks are out at once. Each gets a share of what is
         # left of the allowance after charges and the shares of chunks still
@@ -1051,12 +1081,13 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                                            "cores": cores_per_slot}], call_id=call_id)
             # A lost chunk is resubmitted once here (and the lost attempt
             # charged), rather than through dask retries, which would hide it.
+            tok_ = uuid.uuid4().hex                 # this submission's start claim
             f = c.submit(_remote_task, bfut, binfo["sha256"], run_dir, fn_spec, ch, deadline,
                          procs_for(override), share, call_id, REPO, learned["peak"],
-                         prior_ok + sum(1 for r in rows if r.get("ok")), attempt != TAIL, pure=False,
-                         workers=[worker], allow_other_workers=False, **restrict)
+                         prior_ok + sum(1 for r in rows if r.get("ok")), attempt != TAIL, tok_,
+                         pure=False, workers=[worker], allow_other_workers=False, **restrict)
             futs[f] = (ch, attempt, procs_for(override))
-            pinned[f] = worker
+            pinned[f], toks[f] = worker, tok_
             held[f] = share or 0.0
             started[f] = time.time()
             return f
@@ -1138,11 +1169,33 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                         f.cancel()
                         chunk_lost(f, ch, attempt, used, held.pop(f, None),
                                    f"chunk failed: its worker {pinned[f]} left the cluster")
+                    # A chunk that has not started on a worker that has stopped taking
+                    # work (closing, paused) or that runs something else (another call
+                    # picked the same idle worker from the same snapshot) is revoked
+                    # and placed again. Only a revoked chunk moves: one that claimed
+                    # its start is never retried while it may be running.
+                    for f in [f for f in pending if f not in claimed and pinned[f] in allw
+                              and (not allw[pinned[f]][2] or allw[pinned[f]][1] > 1)]:
+                        w_f = pinned[f]
+                        try:
+                            got_r = c.run(_revoke_chunk, call_id, toks[f], workers=[w_f]).get(w_f)
+                        except Exception:  # noqa: BLE001 — unknown: leave it; a loss is handled when seen
+                            continue
+                        if got_r is False:
+                            claimed.add(f)
+                        elif got_r is True:
+                            pending.discard(f)
+                            f.cancel()
+                            held.pop(f, None)
+                            ch, attempt, used = futs[f]
+                            queue.insert(0, (ch, attempt, used))
+                            progress["moved"] = progress.get("moved", 0) + 1
                     if not res and not ok_w and not pending:
                         stop = "no compute workers left"      # a fixed list cannot grow back
                         break
                     busy = {pinned[f] for f in pending}
                     free = [a for a, v in ok_w.items() if v[2] and not v[1] and a not in busy]
+                    random.shuffle(free)                    # two calls seldom pick the same worker
                     if free and queue and not held_b:
                         # The bundle's only copy left with a worker (scattered data
                         # cannot be recomputed): scatter it again, once per loss. The
@@ -1153,8 +1206,13 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                             progress["bundle_rescatters"] = progress.get("bundle_rescatters", 0) + 1
                         except Exception:  # noqa: BLE001 — chunks then fail and are charged as lost
                             pass
-                starved = False
-                while queue and free and len(pending) < slots:
+                # A loss above may have used the rest of the allowance: stop now
+                # rather than wait for a worker with demand still shown.
+                if (queue or pending) and allowance_s is not None and progress["core_s"] >= allowance_s:
+                    stop = CAP_STOP
+                    break
+                starved = allowance_s is not None and allowance_s - progress["core_s"] - sum(held.values()) <= 0
+                while queue and free and len(pending) < slots and not starved:
                     f = submit(*queue[0], worker=free.pop(0))
                     if f is None:
                         starved = True
@@ -1165,7 +1223,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                     demand(0 if starved else min(len(queue), max(0, pool - len(pending))))
                 left = None if deadline is None else max(0.0, deadline - time.time())
                 if not pending:
-                    if starved:
+                    if starved and queue:
                         stop = CAP_STOP
                         break
                     if not queue:
@@ -1194,6 +1252,8 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                     f_share = held.pop(f, None)
                     try:
                         got = f.result()
+                        if got.get("revoked"):
+                            continue                # placed again when it was revoked
                         csum = got.get("summary") or {}
                         wk = got["rows"][0].get("worker") if got["rows"] else None
                         used_w.add(wk or pinned.get(f))
@@ -1307,7 +1367,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                   "cores_per_slot": cores_per_slot,
                   "core_s": progress["core_s"], "stopped": stop,
                   "unknown_chunks": lost + len(pending) + len(gone), "bundle": binfo,
-                  "bundle_rescatters": progress.get("bundle_rescatters", 0),
+                  "bundle_rescatters": progress.get("bundle_rescatters", 0), "moved": progress.get("moved", 0),
                   "chunks": progress.get("chunks", []), "procs_final": learned["procs"],
                   "peak_mb": learned["peak"]}
 
@@ -2668,7 +2728,37 @@ def _self_test_p45d(ok) -> None:
                          for a, ws in s_.workers.items()},
                 "target": s_.adaptive_target("20s"), "occ": s_.total_occupancy,
                 "bundle": sorted({ws.address for ts in s_.tasks.values() if ts.prefix.name == "bytes"
-                                  for ws in (ts.who_has or ())})}
+                                  for ws in (ts.who_has or ())}),
+                "running": {a: getattr(ws.status, "name", "") == "running" for a, ws in s_.workers.items()},
+                "tagged": sorted(a for a, ws in s_.workers.items() if "compute" in (ws.resources or {})),
+                "nproc": {a: len(ws.processing) for a, ws in s_.workers.items()},
+                "bundle_keys": sorted(k for k, ts in s_.tasks.items() if ts.prefix.name == "bytes" and ts.who_has)}
+
+    def idle_thread(dask_worker=None):
+        return not dask_worker.state.executing
+
+    def pause(dask_worker=None):
+        """The worker stops taking new tasks, as a VM being retired does
+        (closing_gracefully: unlike `paused`, the memory monitor does not undo it)."""
+        from distributed.core import Status
+        dask_worker.status = Status.closing_gracefully
+
+    def unpause(dask_worker=None):
+        from distributed.core import Status
+        dask_worker.status = Status.running
+
+    def die():                                     # after replying: the worker process exits
+        import os as os_
+        import threading as th_
+        th_.Timer(0.2, os_._exit, (1,)).start()
+
+    def kill(cc_, addrs):
+        """Stop the workers taking work first, so no retry lands on a worker
+        about to die; then end their processes."""
+        cc_.run(pause, workers=sorted(addrs))
+        until(lambda: not any(cc_.run_on_scheduler(state)["running"].get(a) for a in addrs), 30)
+        cc_.run(die, workers=sorted(addrs))
+        until(lambda: not set(addrs) & set(cc_.run_on_scheduler(state)["proc"]), 30)
 
     def until(pred, limit=60.0):
         end = time.time() + limit
@@ -2775,13 +2865,7 @@ def _self_test_p45d(ok) -> None:
                 victim = until(lambda: next((a for a, n in cc.run_on_scheduler(state)["proc"].items() if n), None), 30)
                 holders = set(cc.run_on_scheduler(state)["bundle"])
                 dying = ({victim} | holders) - {w_run}
-
-                def die():                         # after replying: the worker process exits
-                    import os as os_
-                    import threading as th_
-                    th_.Timer(0.2, os_._exit, (1,)).start()
-                cc.run(die, workers=sorted(dying))
-                until(lambda: not dying & set(cc.run_on_scheduler(state)["proc"]), 30)
+                kill(cc, dying)
                 open(os.path.join(rd, "go2"), "w").close()
                 th2.join(120)
                 rows2, s2 = box2.get("r", ([], {}))
@@ -2809,8 +2893,7 @@ def _self_test_p45d(ok) -> None:
                 kept = until(lambda: (lambda b: b if set(b) - {victim3} else None)(cc.run_on_scheduler(state)["bundle"]),
                              30)
                 ok(kept is not None, f"P45D-8 setup: the bundle has a copy off the victim: {kept}")
-                cc.run(die, workers=[victim3])
-                until(lambda: victim3 not in cc.run_on_scheduler(state)["proc"], 30)
+                kill(cc, {victim3})
                 open(os.path.join(rd, "go3"), "w").close()
                 th3.join(120)
                 rows3, s3 = box3.get("r", ([], {}))
@@ -2820,7 +2903,109 @@ def _self_test_p45d(ok) -> None:
                    and "left the cluster" in lost3[0]["error"] and lost3[0]["worker"] == victim3
                    and s3.get("bundle_rescatters") == 0,
                    f"P45D-8 a pinned chunk whose worker left the scheduler is resubmitted elsewhere: {rows3} {s3}")
+                # P45D-9/10: a chunk pinned to a worker it cannot start on moves, and
+                # only while it has not started. Every compute worker's one-chunk lock
+                # is held by the test, so the chunk is submitted but cannot claim its
+                # start; then the others are released and its worker either gets a
+                # second task (another call picked it from the same snapshot) or stops
+                # taking work (closing gracefully).
+                import fcntl
+
+                def hold_locks():
+                    fs = {}
+                    for a in cc.run_on_scheduler(state)["tagged"]:
+                        d_ = os.path.join(tmpb, a.rsplit(":", 1)[-1])
+                        os.makedirs(d_, exist_ok=True)
+                        fh = open(os.path.join(d_, "ma_compute.lock"), "w")
+                        fcntl.flock(fh, fcntl.LOCK_EX)
+                        fs[a] = fh
+                    return fs
+
+                def blocker(path):
+                    import os as os_
+                    import time as t_
+                    while not os_.path.exists(path):
+                        t_.sleep(0.02)
+                    return 1
+                for tag, how in (("d", "collision"), ("e", "closing")):
+                    until(lambda: len(cc.run_on_scheduler(state)["tagged"]) >= 3, 60)
+                    locks = hold_locks()
+                    bx = {}
+                    thx = threading.Thread(target=call, args=(bx, [{"k": 0, "dir": rd, "tag": tag, "s": 0.1}]))
+                    thx.start()
+                    w_x = until(lambda: next((a for a, n in cc.run_on_scheduler(state)["proc"].items() if n), None), 30)
+                    for a, fh in locks.items():
+                        if a != w_x:
+                            fh.close()             # every other worker can run it now
+                    foreign = None
+                    if how == "collision":
+                        foreign = cc.submit(blocker, os.path.join(rd, f"release_{tag}"), workers=[w_x],
+                                            allow_other_workers=False, pure=False)
+                    else:
+                        cc.run(pause, workers=[w_x])
+                    thx.join(120)
+                    locks[w_x].close()
+                    open(os.path.join(rd, f"release_{tag}"), "w").close()
+                    if foreign is not None:
+                        foreign.result(timeout=60)
+                    else:
+                        cc.run(unpause, workers=[w_x])
+                    # the revoked submission has returned (its thread is free)
+                    until(lambda: cc.run(idle_thread, workers=[w_x]).get(w_x), 30)
+                    rx, sx = bx.get("r", ([], {}))
+                    ran = [f_ for f_ in os.listdir(rd) if f_.startswith(f"span_{tag}_")]
+                    ok(not thx.is_alive() and len(rx) == 1 and rx[0]["ok"] and rx[0].get("worker") != w_x
+                       and sx.get("moved", 0) >= 1 and len(ran) == 1 and not [c_ for c_ in sx.get("chunks", [])
+                                                                             if c_.get("error")],
+                       f"P45D-{9 if how == 'collision' else 10} an unstarted chunk on a worker it cannot start on "
+                       f"({how}) moves to another, and runs once: {rx} {sx}")
+                    # The revoked first submission, released now, does no work.
+                    ok(len([f_ for f_ in os.listdir(rd) if f_.startswith(f"span_{tag}_")]) == 1,
+                       f"P45D-{9 if how == 'collision' else 10}b the revoked submission did no work")
                 hog.cancel()
+                # P45D-11: a loss that uses the rest of the allowance ends the call at once
+                # (no worker free, so before this the loop slept with demand shown).
+                # Every compute worker but one runs a blocker; the chunk's worker then
+                # dies, and no new compute worker can join (the tag plugin is removed).
+                until(lambda: len(cc.run_on_scheduler(state)["tagged"]) >= 3, 60)
+                tagged = cc.run_on_scheduler(state)["tagged"]
+                stop_b = os.path.join(rd, "release_f")
+                blockers = [cc.submit(blocker, stop_b, workers=[a], allow_other_workers=False, pure=False,
+                                      resources={"compute": 1}) for a in tagged[1:]]
+                until(lambda: all(cc.run_on_scheduler(state)["nproc"].get(a) for a in tagged[1:]), 30)
+                os.environ["MA_COMPUTE_PROCS_PER_WORKER"] = "64"   # a loss is charged 64 cores x its time
+                bf = {}
+                thf = threading.Thread(target=lambda: bf.update(r=map_fn(
+                    rd, "models/a16.py::f", [{"k": 0, "dir": rd, "tag": "f", "wait": "go_f", "s": 0.1}],
+                    ledger=False, max_core_hours=30.0 / 3600)))
+                thf.start()
+                until(lambda: os.path.exists(os.path.join(rd, "started_f_0")))
+                # The run worker fetches a copy of the bundle, so the loss below is seen
+                # as the worker leaving (the path that skipped the allowance check),
+                # not as a cancelled chunk.
+                from distributed import Future
+                keep = [cc.submit(len, Future(k, client=cc), workers=[w_run], pure=False)
+                        for k in cc.run_on_scheduler(state)["bundle_keys"]]
+                until(lambda: w_run in cc.run_on_scheduler(state)["bundle"], 30)
+                # Share 30 core-s: the chunk itself would stop at 30 s; charged as a loss
+                # it is 64 cores x its time since submission, over 30 after 1 s.
+                t_f = time.time()
+                until(lambda: time.time() - t_f > 1.0, 5)
+                cc.unregister_worker_plugin(ComputeTagPlugin.name)
+                kill(cc, {tagged[0]})
+                thf.join(60)
+                os.environ["MA_COMPUTE_PROCS_PER_WORKER"] = "1"
+                rf, sf = bf.get("r", ([], {}))
+                left_f = cc.run_on_scheduler(state)
+                open(stop_b, "w").close()
+                open(os.path.join(rd, "go_f"), "w").close()
+                ok(not thf.is_alive() and sf.get("stopped") == CAP_STOP and left_f["unrunnable"] == 0,
+                   f"P45D-11 a loss that uses the allowance stops the call, with no demand left: "
+                   f"alive={thf.is_alive()} {sf.get('stopped')} {left_f['unrunnable']}")
+                ok(any("left the cluster" in str(c_.get("error")) for c_ in sf.get("chunks", [])),
+                   f"P45D-11b the loss was seen as the worker leaving: {sf.get('chunks')}")
+                for b_ in blockers + keep:
+                    b_.cancel()
             finally:
                 for k, v in saved.items():
                     if v is None:
