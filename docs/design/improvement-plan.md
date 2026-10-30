@@ -2,23 +2,25 @@
 
 Status: draft for review, 2026-10-28. It complements `stage-machine.md` (the architecture and migration steps S1–S6, T0–T2, M0–M2). Each item below is one small PR, checked on its own against the metric stated for it, in the order given.
 
-## Status (2026-10-29)
+## Status (2026-10-30)
 
 Merged to main:
-- **A:** A1 compute charged for work done (#51); A2, A3 (#47, #48); A4 + A8 toolkit, pipeline and once-per-version UQ prompt (#50); A5–A7 cloud VM reuse, quota overflow and durable VM jobs (#53).
+- **A:** A1 compute charged for work done (#51); A2, A3 (#47, #48); A4 + A8 toolkit, pipeline and once-per-version UQ prompt (#50); A5–A7 cloud VM reuse, quota overflow and durable VM jobs (#53); A11–A13 grouped uncertainty findings and declarations that must match the draws (#62); A14 pass/fail verdicts bound to computed checks (#63); A15 benchmark check reads current computed values (#65).
 - **B:** B1 calibration spec (#56); B2 + B3 method fit and fact/decision tags in the brief (#55).
 - **D:** D1–D5 generic rules (#52) and D6/D8 priors (#49); owner-specified simplifications (#58).
+- **E:** E1 model card and E2 what-if queries (#60).
 - **M2:** removed duplicated helpers (#54).
 - **Integrity fixes found by the smokes:** #57 (final-gate false "deleted") and #59 (missing presentation critique after the harness write-up).
+- **Attempt 9 config** (#64): attempt 8's question and settings, unchanged.
 
-Open:
-- A9 (stale data-stage figures) and A10 (session crash), both waiting for attempt 8's records;
-- A11–A15 (uncertainty-report findings, verdict binding, fresh benchmark values; A11–A13 merged in #62), before attempt 9;
-- D9, D10 (decision-layer sufficiency, observed-vs-modelled inputs), after attempt 9;
-- B4, which needs S3; B5, B6;
-- C1–C3;
-- D7;
-- E1–E4 (E1/E2 in progress).
+Before attempt 9:
+- A9 (stale data-stage figures), waiting for attempt 8's records; A10 (session crash) is investigated from the same records but does not hold the launch;
+- a pre-launch smoke on main, then owner sign-off on the brief.
+
+After attempt 9:
+- D9, D10 (decision-layer sufficiency, observed-vs-modelled inputs);
+- E3, E4; B4 (needs S3), B5, B6; C1–C3; D7;
+- smaller items: a gate-side P(output > 0) check from the per-draw values (A12 kept only the reporting); a pin or deterministic declaration can still exempt a frozen output with any reason (no weaker than before #62); `agents/contract_packet.py` is unused and its self-test fails (delete or wire in); attempt 8's B9 scope declaration rested on a stale benchmark value.
 
 ## Why
 
