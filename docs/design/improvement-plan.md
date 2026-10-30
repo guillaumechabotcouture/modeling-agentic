@@ -2,21 +2,25 @@
 
 Status: draft for review, 2026-10-28. It complements `stage-machine.md` (the architecture and migration steps S1–S6, T0–T2, M0–M2). Each item below is one small PR, checked on its own against the metric stated for it, in the order given.
 
-## Status (2026-10-29)
+## Status (2026-10-30)
 
 Merged to main:
-- **A:** A1 compute charged for work done (#51); A2, A3 (#47, #48); A4 + A8 toolkit, pipeline and once-per-version UQ prompt (#50); A5–A7 cloud VM reuse, quota overflow and durable VM jobs (#53).
+- **A:** A1 compute charged for work done (#51); A2, A3 (#47, #48); A4 + A8 toolkit, pipeline and once-per-version UQ prompt (#50); A5–A7 cloud VM reuse, quota overflow and durable VM jobs (#53); A11–A13 grouped uncertainty findings and declarations that must match the draws (#62); A14 pass/fail verdicts bound to computed checks (#63); A15 benchmark check reads current computed values (#65).
 - **B:** B1 calibration spec (#56); B2 + B3 method fit and fact/decision tags in the brief (#55).
 - **D:** D1–D5 generic rules (#52) and D6/D8 priors (#49); owner-specified simplifications (#58).
+- **E:** E1 model card and E2 what-if queries (#60).
 - **M2:** removed duplicated helpers (#54).
 - **Integrity fixes found by the smokes:** #57 (final-gate false "deleted") and #59 (missing presentation critique after the harness write-up).
+- **Attempt 9 config** (#64): attempt 8's question and settings, unchanged.
 
-Open:
-- A9 (stale data-stage figures) and A10 (session crash), both waiting for attempt 8's records;
-- B4, which needs S3; B5, B6;
-- C1–C3;
-- D7;
-- E1–E4 (E1/E2 in progress).
+Before attempt 9:
+- A9 (stale data-stage figures), waiting for attempt 8's records; A10 (session crash) is investigated from the same records but does not hold the launch;
+- a pre-launch smoke on main, then owner sign-off on the brief.
+
+After attempt 9:
+- D9, D10 (decision-layer sufficiency, observed-vs-modelled inputs);
+- E3, E4; B4 (needs S3), B5, B6; C1–C3; D7;
+- smaller items: a gate-side P(output > 0) check from the per-draw values (A12 kept only the reporting); a pin or deterministic declaration can still exempt a frozen output with any reason (no weaker than before #62); `agents/contract_packet.py` is unused and its self-test fails (delete or wire in); attempt 8's B9 scope declaration rested on a stale benchmark value.
 
 ## Why
 
@@ -49,6 +53,11 @@ Open:
 | A8 | **Uncertainty reruns for binding only.** Attempt 8 ran the 1,100-draw UQ 9 times in rounds 2–3, several only to refresh the fingerprint. With #47's narrower fingerprint, count reruns whose only purpose is binding, and run UQ once per final model version. | UQ runs per round on attempt 9. |
 | A9 | **Stale figures still reaching the gate** (attempt 8: 6 in round 2, 1 in round 3) despite the automatic rebuild. Read `derived_rebuild`'s report from the run to see whether the generators failed, were not recognised, or were outside the rebuild budget. | Stale figures at the gate = 0. |
 | A10 | **Session crash in round 2** (attempt 8, about 07:00 UTC; recovered by cost reconciliation and a re-spawned modeler). Find the cause from the transcripts once the run is stored. | Cause identified; fix or an issue. |
+| A11 | **One degenerate-interval finding per output family, not per output.** Attempt 8's round 5 raised 64 HIGH `ci_degenerate` findings from one cause (a reserve-and-descoping layer repeated across 8 plan variants; 60 related outputs were declared, these 64 were not). Gate counts per round jumped 19 → 83, which misreads as divergence in the convergence report. Group by the output's base name and list the variants in one finding. | Attempt 8 round-5 report replays as about 8 grouped findings; the per-round count no longer tracks the number of plan variants. |
+| A12 | **Rare-event outputs reported as a probability, not a quantile interval.** For an output that is zero in most draws, the 95% quantile interval is [0, 0] while the mean is positive (attempt 8: mean 0.16, interval [0, 0] for 4 outputs). `propagate_uncertainty.py` reports P(output > 0) with its standard error for such outputs, and the gate checks that probability instead of the interval width. | Self-test with a zero-inflated output; the attempt 8 report no longer shows a mean outside its own interval. |
+| A13 | **Outputs pinned by a binding constraint need a declaration that names the constraint.** Total cost at the budget envelope and utilisation near 1 are flat by construction; a declaration naming the constraint (budget, cap) exempts them, a free-text reason does not. Outputs downstream of a rule that absorbs uncertainty (overrun, reserve used) are not exempt, since that is how the gate and the red-team critic (R-045) both found that the reserve analysis could not show a trade-off. | Attempt 8 round-5 replay: cost and utilisation outputs pass with a constraint declaration; overrun and reserve outputs still flag. |
+| A14 | **Pass/fail verdicts bound to computed checks.** Attempt 8's round 4 removed allocation options; the cost-effectiveness rows for two interventions became empty (`n_lga = 0`), yet `results.md` still said "the cost-effectiveness clause holds (B17 in band)" while its own benchmark table said "not computed this round" (D-044, R-048, found by hand). A verdict in the prose that cites an artifact or benchmark id must be backed by a non-empty computed value there that agrees with it. | Attempt 8 retro: the B17 sentence is flagged; few or no other findings on attempts 7 and 8. |
+| A15 | **Benchmark check reads current computed values.** `models/benchmark_targets.yaml` is hash-locked after the gate first sees it, so the computed values the modeler was told to write there froze at round 1–2; attempts 7 and 8 both kept current values in an unread `models/benchmark_computed.yaml`. Attempt 8 therefore reported B17 in band (frozen 35.4) after it became uncomputed. The check now takes each value from `benchmark_computed.yaml` when it lists the id (null/NaN = not computed), and flags HIGH a frozen copy that would turn a failing benchmark into a pass. Done in #65. | Attempt 8 retro: B17 and B19 not computed, B23 drift (hidden by the frozen copy), B9 in band; attempt 7: B5, B15 drift, B16 in band. |
 
 ## Workstream B — disciplines from stisim.ai, as checked artifacts
 
@@ -97,6 +106,8 @@ Domain knowledge reaches the model only as prose, and a self-graded severity dec
 | D3 | **Data-use audit.** Every processed data column is read by model code, or listed as unused with a reason. | Static scan of `models/` against `data/processed/` headers; MEDIUM per unexplained unused column. | Unused columns without a reason = 0 (attempt 8: 3 species columns). |
 | D4 | **"Addressed" needs evidence.** A concern whose suggested check is a sensitivity analysis or a data use can only be closed by an artifact path that exists, at any severity. | Pre-mortem validator. | Concerns closed by prose = 0. |
 | D5 | **Transfer check for tuned effects.** When effect strengths are tuned to benchmark sites, also report the effect under the target setting's covariates, with the difference stated. | Benchmark report field. | Present whenever tuning is used. |
+| D9 | **Sufficiency tests for decision-layer features too.** D1 covers mechanisms in the disease model, not rules added to the decision. Attempt 8 added a reserve ladder, descoping rules, supply caps and a minimax hedge in rounds 3–5; its own results showed the reserve's overrun tolerance never binds (0 of 1,100 draws at every rung, D-045), and the 2026 rule used information not available at decision time (R-045). A rule added to the decision records whether it changes the recommendation, and which information it uses at the decision date; if it changes nothing, it is removed. | Mechanism manifest extended to decision rules; gate as D1. | Decision-layer features kept without a test = 0. |
+| D10 | **Model inputs checked against observed counterparts.** D3 checks that data columns are used, not that model inputs agree with observed records the run already has. Attempt 8: Ogun's modelled net campaign is 1.93× the observed procurement (others 1.10–1.20×, R-047), and the observed procurement record contradicts the supply caps (R-046). Where an observed counterpart exists for a model input, report the ratio per unit and flag outliers. | Data-use audit field; MEDIUM per unexplained outlier. | Input/observed outliers found by critics but not by the audit = 0. |
 
 *Disease content (priors and toolkit; malaria is the first instance):*
 
