@@ -25,8 +25,9 @@ Backends (auto-selected):
   dask   when MA_COMPUTE_SCHEDULER is set (the launcher sets it on Coiled).
          Tasks go to the cluster's workers except those listed in
          MA_COMPUTE_EXCLUDE_WORKERS (the run VMs, whose single thread is busy
-         with the run). The run's `models/`, `data/` and the repo's `scripts/`
-         and `toolkit/` are bundled once and unpacked on each worker at the SAME absolute
+         with the run). Each chunk is pinned to a free compute worker, so VMs
+         that join mid-batch get work at once (Phase 45 δ). The run's
+         `models/`, `data/` and the repo's `scripts/` and `toolkit/` are bundled once and unpacked on each worker at the SAME absolute
          paths, so model code with absolute paths works unchanged.
   local  otherwise: a process pool on this machine (cores - 1).
 
@@ -931,6 +932,27 @@ def _security():
                     tls_client_key=pem("key.pem"), require_encryption=True)
 
 
+# Phase 45 δ (A16): a demand marker asks for this resource, which no worker has,
+# so it waits in the scheduler's unrunnable set and never runs.
+DEMAND_RESOURCE = "ma-compute-demand"
+
+
+def _demand_marker():
+    """Never runs (see DEMAND_RESOURCE); it only shows the autoscaler queued work."""
+    return None
+
+
+def _sched_view(res=None, key=None, dask_scheduler=None) -> dict:
+    """Runs on the scheduler (Phase 45 δ): {"workers": {address: [carries the
+    resource tag, tasks processing there, accepting work]}, "held": whether
+    some worker still holds `key` (the scattered bundle)}."""
+    ts = dask_scheduler.tasks.get(key) if key is not None else None
+    return {"workers": {a: [res is None or res in (ws.resources or {}), len(ws.processing),
+                            getattr(ws.status, "name", str(ws.status)) == "running"]
+                        for a, ws in dask_scheduler.workers.items()},
+            "held": bool(ts is not None and ts.who_has)}
+
+
 def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadline=None, allowance_s=None,
               progress=None, peak_mb=None, prior_ok=0):
     """The allowance is split over the chunks that can run at once; each chunk
@@ -942,9 +964,20 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
     measured peak allowed fewer processes) sets the processes for every chunk
     submitted after it. A chunk lost with its VM, or whose subprocess died, is
     resubmitted once with half the processes. A model error repeating across
-    chunks stops the call (`_breaker`)."""
+    chunks stops the call (`_breaker`).
+
+    Phase 45 δ (A16): this loop places every chunk itself. Each chunk is
+    pinned to a compute worker that has nothing processing, and the worker
+    list is re-read every MA_COMPUTE_DISPATCH_S seconds, so a VM that joins
+    mid-batch gets a chunk at once. Dask's work stealing is not relied on:
+    E7 attempt 8's 34-hour pipeline task on the same scheduler inflated the
+    mean occupancy so far that no compute worker counted as saturated, and
+    24 queued chunks sat on one VM while 23 others idled. Work this call
+    could run on more VMs is shown to the autoscaler as demand markers
+    (`_demand_marker`), never as real chunks queued on a busy worker."""
     import uuid
     import cloudpickle
+    from dask.utils import funcname
     from distributed import Client, wait
     cloudpickle.register_pickle_by_value(sys.modules[__name__])
     addr = os.environ["MA_COMPUTE_SCHEDULER"]
@@ -979,9 +1012,17 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
         chunks = _chunks(list(enumerate(inputs)), pool * chunks_per_worker)
         slots = max(1, min(pool, len(chunks)))   # _remote_task runs one chunk at a time per VM
         progress.update(slots=slots, cores_per_slot=cores_per_slot, core_s=0.0)
+        # The bundle is scattered once; a worker that runs a chunk fetches it
+        # from a peer as a task dependency (no re-scatter per chunk).
         bfut = (c.scatter(bundle, broadcast=False, hash=False) if res
                 else c.scatter(bundle, workers=workers, broadcast=True))
-        placement = ({"resources": {res: 1}} if res else {"workers": workers, "allow_other_workers": False})
+        # Phase 45 δ: chunks are pinned to one free worker each (submit's `worker`).
+        # The resource is still asked for, so a chunk never shares a VM with
+        # another call's chunk that dask placed there.
+        restrict = {"resources": {res: 1}} if res else {}
+        poll_s = float(os.environ.get("MA_COMPUTE_DISPATCH_S", "2"))
+        fixed = set(workers)                        # the explicit list (no resource tag)
+        pinned, used_w, seen_w, markers = {}, set(), set(workers), []
 
         # At most `slots` chunks are out at once. Each gets a share of what is
         # left of the allowance after charges and the shares of chunks still
@@ -998,7 +1039,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
             p = [int(x) for x in (env_procs, learned["procs"], override) if x]
             return min(p) if p else None            # None: the worker uses its own core count
 
-        def submit(ch, attempt, override=None):
+        def submit(ch, attempt, override=None, worker=None):
             share = None
             if allowance_s is not None:
                 free = allowance_s - progress["core_s"] - sum(held.values())
@@ -1012,8 +1053,10 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
             # charged), rather than through dask retries, which would hide it.
             f = c.submit(_remote_task, bfut, binfo["sha256"], run_dir, fn_spec, ch, deadline,
                          procs_for(override), share, call_id, REPO, learned["peak"],
-                         prior_ok + sum(1 for r in rows if r.get("ok")), attempt != TAIL, pure=False, **placement)
+                         prior_ok + sum(1 for r in rows if r.get("ok")), attempt != TAIL, pure=False,
+                         workers=[worker], allow_other_workers=False, **restrict)
             futs[f] = (ch, attempt, procs_for(override))
+            pinned[f] = worker
             held[f] = share or 0.0
             started[f] = time.time()
             return f
@@ -1021,25 +1064,130 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
 
         def halved(used, worker=None):
             return max(1, int(used or cpus.get(worker) or cores_per_slot) // 2)
+
+        def chunk_lost(f, ch, attempt, used, f_share, msg):
+            """A chunk whose result is lost (its worker died or left, or the task
+            failed): charge it, then resubmit it once with half the processes."""
+            nonlocal lost
+            # Its work is unknown: charge the share it was allowed
+            # (chunks enforce their share), or estimate it at the end.
+            # charged as busy since submission, never above its share
+            busy = (time.time() - started.get(f, time.time())) * cores_per_slot
+            if f_share:
+                progress["core_s"] += min(f_share, busy)
+            else:
+                lost += 1
+            progress.setdefault("chunks", []).append(
+                {"n": len(ch), "attempt": attempt, "error": msg[:200], "worker": pinned.get(f),
+                 "core_s": round(min(f_share, busy), 1) if f_share else None,
+                 "wall_s": round(time.time() - started.get(f, time.time()), 1)})
+            errors.update({i: msg for i, _ in ch})
+            if attempt == 0 and (deadline is None or time.time() < deadline):
+                queue.insert(0, (ch, 1, halved(used)))
+                return
+            rows.extend({"i": i, "ok": False, "kind": INFRA, "error": errors[i]} for i, _ in ch)
+
+        def view():
+            """({address: [tagged, processing, accepting]} for the workers chunks
+            may go to, every worker the scheduler knows, whether the bundle is
+            still held), or None if unread."""
+            try:
+                v = c.run_on_scheduler(_sched_view, res, bfut.key)
+                allw = v["workers"]
+            except Exception:  # noqa: BLE001 — keep going on the last state; nothing is declared lost
+                return None
+            ok_w = {a: s for a, s in allw.items()
+                    if a not in exclude and (s[0] if res else a in fixed)}
+            return ok_w, allw, v["held"]
+
+        def demand(n):
+            """Keep `n` demand markers queued: the autoscaler counts them as tasks
+            waiting for a worker (as it did the queued chunks before Phase 45 δ).
+            Their key has the chunks' prefix, so they are weighted by the chunks'
+            measured duration; they never run, so they never change it."""
+            markers[:] = [m for m in markers if m.status == "pending"]
+            if len(markers) > n:
+                extra, markers[:] = markers[n:], markers[:n]
+                c.cancel(extra)
+            while len(markers) < n:
+                markers.append(c.submit(_demand_marker, key=f"{funcname(_remote_task)}-{uuid.uuid4().hex}",
+                                        resources={res: 1, DEMAND_RESOURCE: 1}, pure=False))
         pending, rows, stop, lost = set(), [], None, 0
         try:
             while queue or pending:
                 _note(progress, inflight(), call_id=call_id)
-                while queue and len(pending) < slots:
-                    f = submit(*queue[0])
+                got_v, free = view(), []
+                if got_v is not None:
+                    ok_w, allw, held_b = got_v
+                    for a in [a for a in ok_w if a not in seen_w]:       # joined since the call started
+                        seen_w.add(a)
+                        try:
+                            n_c = int(env_procs) if env_procs else int(c.run(os.cpu_count, workers=[a])[a] or 1)
+                        except Exception:  # noqa: BLE001 — not answering yet: assume the largest VM seen
+                            n_c = cores_per_slot
+                        cpus[a] = procs[a] = n_c
+                        cores_per_slot = max(cores_per_slot, n_c)         # charges bound its work too
+                        progress["cores_per_slot"] = cores_per_slot
+                    if res:
+                        slots = max(slots, min(len(chunks), len(ok_w)))   # VMs beyond the target may join
+                        progress["slots"] = slots
+                    # A pinned chunk whose worker has left can run nowhere else.
+                    for f in [f for f in pending if pinned[f] not in allw and not f.done()]:
+                        pending.discard(f)
+                        ch, attempt, used = futs[f]
+                        f.cancel()
+                        chunk_lost(f, ch, attempt, used, held.pop(f, None),
+                                   f"chunk failed: its worker {pinned[f]} left the cluster")
+                    if not res and not ok_w and not pending:
+                        stop = "no compute workers left"      # a fixed list cannot grow back
+                        break
+                    busy = {pinned[f] for f in pending}
+                    free = [a for a, v in ok_w.items() if v[2] and not v[1] and a not in busy]
+                    if free and queue and not held_b:
+                        # The bundle's only copy left with a worker (scattered data
+                        # cannot be recomputed): scatter it again, once per loss. The
+                        # scheduler's view is used, not the client's, which may not
+                        # have heard of the loss yet.
+                        try:
+                            bfut = c.scatter(bundle, workers=list(ok_w), broadcast=not res, hash=False)
+                            progress["bundle_rescatters"] = progress.get("bundle_rescatters", 0) + 1
+                        except Exception:  # noqa: BLE001 — chunks then fail and are charged as lost
+                            pass
+                starved = False
+                while queue and free and len(pending) < slots:
+                    f = submit(*queue[0], worker=free.pop(0))
                     if f is None:
+                        starved = True
                         break
                     queue.pop(0)
                     pending.add(f)
-                if not pending:
-                    stop = CAP_STOP
-                    break
+                if res:
+                    demand(0 if starved else min(len(queue), max(0, pool - len(pending))))
                 left = None if deadline is None else max(0.0, deadline - time.time())
+                if not pending:
+                    if starved:
+                        stop = CAP_STOP
+                        break
+                    if not queue:
+                        break
+                    if left == 0.0:               # no free worker before the deadline
+                        stop = "timed out"
+                        break
+                    time.sleep(poll_s if left is None else min(poll_s, left))
+                    continue
                 try:
-                    done, pending = wait(pending, timeout=left, return_when="FIRST_COMPLETED")
+                    done, pending = wait(pending, timeout=poll_s if left is None else min(poll_s, left),
+                                         return_when="FIRST_COMPLETED")
+                except cf.CancelledError:
+                    # dask cancelled a chunk (e.g. its bundle copy was lost): its
+                    # result() raises below and it goes through the lost-chunk path.
+                    done = {f for f in pending if f.done()}
+                    pending = pending - done
                 except TimeoutError:
-                    stop = "timed out"
-                    break
+                    if deadline is not None and time.time() >= deadline:
+                        stop = "timed out"
+                        break
+                    continue
                 for f in done:
                     ch, attempt, used = futs[f]
                     cur[0] = (f, held.get(f))     # an interrupt mid-processing leaves it charged in `finally`
@@ -1048,6 +1196,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                         got = f.result()
                         csum = got.get("summary") or {}
                         wk = got["rows"][0].get("worker") if got["rows"] else None
+                        used_w.add(wk or pinned.get(f))
                         if csum.get("peak_mb"):
                             learned["peak"] = max(learned["peak"] or 0, float(csum["peak_mb"]))
                         pf = csum.get("procs_final")
@@ -1081,24 +1230,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                              "chunk_summary": {k: v for k, v in (got.get("summary") or {}).items() if k != "bundle"},
                              "stderr_tail": got.get("stderr_tail") or ""})
                     except Exception as e:  # noqa: BLE001 — a lost worker fails only its chunk
-                        # Its work is unknown: charge the share it was allowed
-                        # (chunks enforce their share), or estimate it at the end.
-                        # charged as busy since submission, never above its share
-                        busy = (time.time() - started.get(f, time.time())) * cores_per_slot
-                        if f_share:
-                            progress["core_s"] += min(f_share, busy)
-                        else:
-                            lost += 1
-                        msg = f"chunk failed: {type(e).__name__}: {e}"[:500]
-                        progress.setdefault("chunks", []).append(
-                            {"n": len(ch), "attempt": attempt, "error": msg[:200],
-                             "core_s": round(min(f_share, busy), 1) if f_share else None,
-                             "wall_s": round(time.time() - started.get(f, time.time()), 1)})
-                        errors.update({i: msg for i, _ in ch})
-                        if attempt == 0 and (deadline is None or time.time() < deadline):
-                            queue.insert(0, (ch, 1, halved(used)))
-                            continue
-                        rows += [{"i": i, "ok": False, "kind": INFRA, "error": errors[i]} for i, _ in ch]
+                        chunk_lost(f, ch, attempt, used, f_share, f"chunk failed: {type(e).__name__}: {e}"[:500])
                 cur[0] = None
                 if (pending or queue) and not stop:
                     stop = _breaker(rows, prior_ok=prior_ok)
@@ -1108,6 +1240,11 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                     stop = CAP_STOP
                     break
         finally:
+            if markers:
+                try:
+                    c.cancel(markers)
+                except Exception:  # noqa: BLE001 — released with this client anyway
+                    pass
             if pending:
                 # Stop the call's running chunks (and keep queued ones from starting),
                 # THEN collect what they report: a stopped chunk returns the core-seconds
@@ -1124,7 +1261,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                     progress["remote_unconfirmed"] = True
                 try:
                     wait(pending, timeout=float(os.environ.get("MA_COMPUTE_SETTLE_S", "120")))
-                except TimeoutError:
+                except (TimeoutError, cf.CancelledError):
                     pass
                 for f in list(pending):
                     if f.done():
@@ -1164,10 +1301,13 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
             progress["gone_workers"] = len(gone)
     done_i = {r["i"] for r in rows}
     rows += [{"i": i, "ok": False, "kind": INFRA, "error": msg} for i, msg in errors.items() if i not in done_i]   # keep the real error
-    return rows, {"backend": "dask", "workers": len(workers), "pool_target": pool, "slots": slots,
+    # "workers": the VMs that returned a chunk (Phase 45 δ), not those up at the start.
+    return rows, {"backend": "dask", "workers": len(used_w), "workers_seen": len(seen_w),
+                  "pool_target": pool, "slots": slots,
                   "cores_per_slot": cores_per_slot,
                   "core_s": progress["core_s"], "stopped": stop,
                   "unknown_chunks": lost + len(pending) + len(gone), "bundle": binfo,
+                  "bundle_rescatters": progress.get("bundle_rescatters", 0),
                   "chunks": progress.get("chunks", []), "procs_final": learned["procs"],
                   "peak_mb": learned["peak"]}
 
@@ -2481,11 +2621,212 @@ def _self_test() -> int:
     _self_test_p35(ok)
     _self_test_p37(ok)
     _self_test_p42(ok)
+    _self_test_p45d(ok)
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_p45d(ok) -> None:
+    """Phase 45 δ (A16): the chunk loop places chunks on free workers itself.
+
+    E7 attempt 8 is emulated on a LocalCluster: an untagged run worker holds a
+    task the scheduler expects to take 68 hours (set through
+    `default-task-durations`, as the measured average of attempt 8's 34-hour
+    pipeline task did), so the cluster's mean occupancy dwarfs any compute
+    worker's queue and work stealing never moves chunks. Every wait is on an
+    event (a file the model writes, a scheduler state), never a fixed sleep."""
+    import tempfile
+    try:
+        import dask
+        from distributed import Client, LocalCluster, WorkerPlugin
+    except ImportError:
+        print("  (P45D skipped: distributed not installed)")
+        return
+
+    class OwnTmp(WorkerPlugin):
+        """_remote_task holds one machine-wide lock (one chunk per VM). Local
+        workers share a machine, so each gets its own temp dir, as a VM has."""
+        name = "ma-selftest-own-tmp"
+
+        def __init__(self, base):
+            self.base = base
+
+        def setup(self, worker):
+            import tempfile as tf_
+            d_ = os.path.join(self.base, worker.address.rsplit(":", 1)[-1])
+            os.makedirs(d_, exist_ok=True)
+            os.environ["TMPDIR"] = d_
+            tf_.tempdir = d_
+
+    def state(dask_scheduler=None):
+        s_ = dask_scheduler
+        return {"unrunnable": sum(1 for ts in s_.unrunnable if ts.prefix.name == "remote_task"),
+                "proc": {a: sum(1 for ts in ws.processing if ts.prefix.name == "remote_task")
+                         for a, ws in s_.workers.items()},
+                "target": s_.adaptive_target("20s"), "occ": s_.total_occupancy,
+                "bundle": sorted({ws.address for ts in s_.tasks.values() if ts.prefix.name == "bytes"
+                                  for ws in (ts.who_has or ())})}
+
+    def until(pred, limit=60.0):
+        end = time.time() + limit
+        while time.time() < end:
+            v = pred()
+            if v:
+                return v
+            time.sleep(0.05)
+        return None
+
+    keys = ("MA_COMPUTE_SCHEDULER", "MA_COMPUTE_RESOURCE", "MA_COMPUTE_TARGET_WORKERS", "MA_COMPUTE_PROCS_PER_WORKER",
+            "MA_COMPUTE_EXCLUDE_WORKERS", "MA_COMPUTE_DISPATCH_S")
+    saved = {k: os.environ.get(k) for k in keys}
+    import threading
+    with tempfile.TemporaryDirectory() as rd, tempfile.TemporaryDirectory() as tmpb, \
+            dask.config.set({"distributed.scheduler.default-task-durations": {"hog": "68h"},
+                             "distributed.scheduler.active-memory-manager.start": False}):
+        rd = os.path.realpath(rd)
+        os.makedirs(os.path.join(rd, "models"))
+        # A live run directory (metadata.json): chunks run against its files, so
+        # the local "VMs" never stage one bundle into one shared path at once.
+        open(os.path.join(rd, "metadata.json"), "w").write("{}")
+        open(os.path.join(rd, "models", "a16.py"), "w").write(
+            "import os, time\n"
+            "def f(p):\n"
+            "    d = p['dir']\n"
+            "    if p.get('wait'):\n"
+            "        open(os.path.join(d, 'started_%s_%d' % (p['tag'], p['k'])), 'w').close()\n"
+            "        while not os.path.exists(os.path.join(d, p['wait'])):\n"
+            "            time.sleep(0.02)\n"
+            "    t0 = time.time()\n"
+            "    time.sleep(p.get('s', 0))\n"
+            "    open(os.path.join(d, 'span_%s_%d' % (p['tag'], p['k'])), 'w').write('%f %f' % (t0, time.time()))\n"
+            "    return p['k']\n")
+        with LocalCluster(n_workers=1, threads_per_worker=1, processes=True, dashboard_address=None) as lc, \
+                Client(lc.scheduler_address) as cc:
+            w_run = list(lc.scheduler_info["workers"])[0]
+            try:
+                hog = cc.submit(time.sleep, 600, key=f"hog-{os.urandom(8).hex()}", workers=[w_run], pure=False)
+                cc.register_plugin(OwnTmp(tmpb))
+                cc.register_plugin(ComputeTagPlugin("compute", exclude=[w_run]))
+                lc.scale(2)
+                cc.wait_for_workers(2, timeout=60)
+                os.environ.update(MA_COMPUTE_SCHEDULER=lc.scheduler_address, MA_COMPUTE_RESOURCE="compute",
+                                  MA_COMPUTE_TARGET_WORKERS="4", MA_COMPUTE_PROCS_PER_WORKER="1",
+                                  MA_COMPUTE_EXCLUDE_WORKERS=w_run, MA_COMPUTE_DISPATCH_S="0.2")
+                # 8 chunks of one input each, 1.5 s each; all wait for `go`.
+                s_task = 1.5
+                ins = [{"k": k, "dir": rd, "tag": "a", "wait": "go", "s": s_task} for k in range(8)]
+                box, box2 = {}, {}
+
+                def call(b, ins_):
+                    try:
+                        b["r"] = map_fn(rd, "models/a16.py::f", ins_, ledger=False)
+                    except Exception as e:  # noqa: BLE001 — reported in the case's message
+                        b["r"] = ([], {"error": f"{type(e).__name__}: {e}"})
+                th = threading.Thread(target=call, args=(box, ins))
+                th.start()
+                started0 = until(lambda: os.path.exists(os.path.join(rd, "started_a_0")))
+                # One chunk runs on the one compute worker; the other 3 slots of the
+                # target show as unrunnable demand under the chunks' own prefix.
+                st = until(lambda: (lambda v: v if v["unrunnable"] == 3 else None)(cc.run_on_scheduler(state)), 30)
+                ok(started0 and st and st["target"] >= 4 and st["occ"] > 1e5
+                   and sum(st["proc"].values()) == 1,
+                   f"P45D-1 one chunk runs, 3 demand markers are visible to the autoscaler (target >= 4) under "
+                   f"inflated occupancy: {st}")
+                lc.scale(5)                        # 3 tagged workers join mid-batch
+                cc.wait_for_workers(5, timeout=60)
+                st2 = until(lambda: (lambda v: v if sum(1 for n in v["proc"].values() if n == 1) == 4
+                                     and v["unrunnable"] == 0 else None)(cc.run_on_scheduler(state)), 30)
+                ok(st2 is not None and not st2["proc"].get(w_run),
+                   f"P45D-2 each joining worker got a chunk at once and the demand markers were withdrawn: {st2}")
+                open(os.path.join(rd, "go"), "w").close()
+                th.join(120)
+                rows, s = box.get("r", ([], {}))
+                used = {r.get("worker") for r in rows}
+                spans = []
+                for k in range(8):
+                    try:
+                        spans.append(tuple(map(float, open(os.path.join(rd, f"span_a_{k}")).read().split())))
+                    except (OSError, ValueError):
+                        pass
+                wall = (max(e for _, e in spans) - min(b for b, _ in spans)) if len(spans) == 8 else None
+                serial = 8 * s_task
+                ok(len(rows) == 8 and all(r["ok"] for r in rows) and [r["result"] for r in rows] == list(range(8))
+                   and w_run not in used and len(used) >= 4 and s.get("workers") == len(used)
+                   and s.get("workers_seen") == 4,
+                   f"P45D-3 every chunk done on {len(used)} compute workers, none on the run worker, "
+                   f"and the ledger's worker count is the workers used: {used} {s}")
+                ok(wall is not None and wall < 0.6 * serial,
+                   f"P45D-4 the batch ran in parallel: {wall} s against {serial} s serial")
+                left = cc.run_on_scheduler(state)
+                ok(left["unrunnable"] == 0 and not any(left["proc"].values()),
+                   f"P45D-5 no demand marker or chunk outlives the call: {left}")
+                # A worker that dies under its pinned chunk: the chunk cannot run
+                # anywhere else, so the loop sees the worker gone, charges the chunk,
+                # and resubmits it once to another worker. The compute workers that
+                # hold the scattered bundle die too: when no copy is left (dask cannot
+                # recompute scattered data and cancels the chunk), it is scattered again.
+                ins2 = [{"k": 0, "dir": rd, "tag": "b", "wait": "go2", "s": 0.1}]
+                th2 = threading.Thread(target=call, args=(box2, ins2))
+                th2.start()
+                until(lambda: os.path.exists(os.path.join(rd, "started_b_0")))
+                victim = until(lambda: next((a for a, n in cc.run_on_scheduler(state)["proc"].items() if n), None), 30)
+                holders = set(cc.run_on_scheduler(state)["bundle"])
+                dying = ({victim} | holders) - {w_run}
+
+                def die():                         # after replying: the worker process exits
+                    import os as os_
+                    import threading as th_
+                    th_.Timer(0.2, os_._exit, (1,)).start()
+                cc.run(die, workers=sorted(dying))
+                until(lambda: not dying & set(cc.run_on_scheduler(state)["proc"]), 30)
+                open(os.path.join(rd, "go2"), "w").close()
+                th2.join(120)
+                rows2, s2 = box2.get("r", ([], {}))
+                lost = [ch for ch in s2.get("chunks", []) if ch.get("error")]
+                ok(len(rows2) == 1 and rows2[0]["ok"] and rows2[0].get("worker") not in dying
+                   and len(lost) == 1 and lost[0]["attempt"] == 0 and lost[0]["worker"] == victim
+                   and s2.get("estimated_core_s", 0) > 0,
+                   f"P45D-6 a chunk whose worker left is charged and resubmitted once elsewhere: {rows2} {s2}")
+                ok(s2.get("bundle_rescatters") == (0 if w_run in holders else 1),
+                   f"P45D-7 a bundle whose every copy was lost is scattered again (once): holders {holders}, "
+                   f"run worker {w_run}, {s2.get('bundle_rescatters')}")
+                # The same with the bundle kept: a second chunk runs on another worker
+                # first, which then holds a copy (the active memory manager is off
+                # here, so the copy stays); only the blocked chunk's worker dies, and
+                # the loop finds it gone from the scheduler.
+                ins3 = [{"k": 0, "dir": rd, "tag": "c", "wait": "go3", "s": 0.1},
+                        {"k": 1, "dir": rd, "tag": "c", "s": 0.1}]
+                box3 = {}
+                th3 = threading.Thread(target=call, args=(box3, ins3))
+                th3.start()
+                until(lambda: os.path.exists(os.path.join(rd, "started_c_0"))
+                      and os.path.exists(os.path.join(rd, "span_c_1")))
+                victim3 = until(lambda: (lambda pr: next(a for a, n in pr.items() if n) if sum(pr.values()) == 1
+                                         and len(box3) == 0 else None)(cc.run_on_scheduler(state)["proc"]), 30)
+                kept = until(lambda: (lambda b: b if set(b) - {victim3} else None)(cc.run_on_scheduler(state)["bundle"]),
+                             30)
+                ok(kept is not None, f"P45D-8 setup: the bundle has a copy off the victim: {kept}")
+                cc.run(die, workers=[victim3])
+                until(lambda: victim3 not in cc.run_on_scheduler(state)["proc"], 30)
+                open(os.path.join(rd, "go3"), "w").close()
+                th3.join(120)
+                rows3, s3 = box3.get("r", ([], {}))
+                lost3 = [ch for ch in s3.get("chunks", []) if ch.get("error")]
+                ok(len(rows3) == 2 and all(r["ok"] for r in rows3) and rows3[0].get("worker") != victim3
+                   and len(lost3) == 1
+                   and "left the cluster" in lost3[0]["error"] and lost3[0]["worker"] == victim3
+                   and s3.get("bundle_rescatters") == 0,
+                   f"P45D-8 a pinned chunk whose worker left the scheduler is resubmitted elsewhere: {rows3} {s3}")
+                hog.cancel()
+            finally:
+                for k, v in saved.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
 
 
 def _self_test_p42(ok) -> None:
