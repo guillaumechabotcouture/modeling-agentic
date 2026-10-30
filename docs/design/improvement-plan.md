@@ -13,7 +13,7 @@ Merged to main:
 
 Open:
 - A9 (stale data-stage figures) and A10 (session crash), both waiting for attempt 8's records;
-- A11–A14 (uncertainty-report findings and verdict binding, from attempt 8's rounds 4–5), before attempt 9;
+- A11–A15 (uncertainty-report findings, verdict binding, fresh benchmark values; A11–A13 merged in #62), before attempt 9;
 - D9, D10 (decision-layer sufficiency, observed-vs-modelled inputs), after attempt 9;
 - B4, which needs S3; B5, B6;
 - C1–C3;
@@ -55,6 +55,7 @@ Open:
 | A12 | **Rare-event outputs reported as a probability, not a quantile interval.** For an output that is zero in most draws, the 95% quantile interval is [0, 0] while the mean is positive (attempt 8: mean 0.16, interval [0, 0] for 4 outputs). `propagate_uncertainty.py` reports P(output > 0) with its standard error for such outputs, and the gate checks that probability instead of the interval width. | Self-test with a zero-inflated output; the attempt 8 report no longer shows a mean outside its own interval. |
 | A13 | **Outputs pinned by a binding constraint need a declaration that names the constraint.** Total cost at the budget envelope and utilisation near 1 are flat by construction; a declaration naming the constraint (budget, cap) exempts them, a free-text reason does not. Outputs downstream of a rule that absorbs uncertainty (overrun, reserve used) are not exempt, since that is how the gate and the red-team critic (R-045) both found that the reserve analysis could not show a trade-off. | Attempt 8 round-5 replay: cost and utilisation outputs pass with a constraint declaration; overrun and reserve outputs still flag. |
 | A14 | **Pass/fail verdicts bound to computed checks.** Attempt 8's round 4 removed allocation options; the cost-effectiveness rows for two interventions became empty (`n_lga = 0`), yet `results.md` still said "the cost-effectiveness clause holds (B17 in band)" while its own benchmark table said "not computed this round" (D-044, R-048, found by hand). A verdict in the prose that cites an artifact or benchmark id must be backed by a non-empty computed value there that agrees with it. | Attempt 8 retro: the B17 sentence is flagged; few or no other findings on attempts 7 and 8. |
+| A15 | **Benchmark check reads fresh computed values.** Attempt 8's `models/benchmark_targets.yaml` still held B17 = 35.4 after the round-4 change left it uncomputed (`.nan` in `models/benchmark_computed.yaml`), so `benchmark_match.yaml` reported B17 in band. Found by A14's retro. The benchmark check should take each computed value from the harness-computed file (or fail closed when it is missing), not from a copy in the targets file. | Attempt 8 retro: B17 reported as not computed, not in band. |
 
 ## Workstream B — disciplines from stisim.ai, as checked artifacts
 
