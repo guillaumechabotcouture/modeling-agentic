@@ -13,7 +13,6 @@ validator runs it with `run_guarded` under the name
 """
 from __future__ import annotations
 
-import argparse
 import os
 import re
 import sys
@@ -531,18 +530,8 @@ def _self_test() -> int:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("run_dir", nargs="?")
-    ap.add_argument("--self-test", action="store_true")
-    a = ap.parse_args(argv)
-    if a.self_test:
-        return _self_test()
-    if not a.run_dir:
-        ap.error("run_dir required")
-    v = gate_findings(a.run_dir)
-    for x in v:
-        print(f"[{x['severity']}] {x['kind']}: {x['claim'][:300]}")
-    return 1 if v else 0
+    from lib import gate_cli
+    return gate_cli.run(argv, __doc__, gate_findings, _self_test)
 
 
 if __name__ == "__main__":

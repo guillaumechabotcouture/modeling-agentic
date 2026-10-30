@@ -226,12 +226,6 @@ def _first_key(d):
     return next(iter(d.keys())) if d else None
 
 
-def _hello(name: str) -> str:
-    """Module-level hello function used by the live cloud self-test.
-    Must be importable by qualified name so workers can unpickle it."""
-    return f"hello {name}"
-
-
 # ---------------------------------------------------------------------------
 # Function-to-task serialization
 # ---------------------------------------------------------------------------

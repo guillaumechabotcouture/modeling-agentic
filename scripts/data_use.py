@@ -69,19 +69,10 @@ _CODE_STR_MAX = 400
 def _sibling(name: str):
     """scripts/<name>.py by path, under a private module name, so a run's own
     module of the same name (models/ on sys.path) is never picked up."""
-    import importlib.util
-    key = f"_ma_p42_{name}"
-    mod = sys.modules.get(key)
-    if mod is None:
-        spec = importlib.util.spec_from_file_location(key, os.path.join(HERE, f"{name}.py"))
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[key] = mod
-        try:
-            spec.loader.exec_module(mod)
-        except BaseException:
-            sys.modules.pop(key, None)
-            raise
-    return mod
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    from lib.siblings import load_private
+    return load_private(name, "_ma_p42_")
 
 
 def data_csvs(run_dir: str, include_raw: bool = False) -> list[str]:

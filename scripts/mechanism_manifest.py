@@ -135,7 +135,6 @@ check the plan and decision_rule.md for features missing from `decision_layer:`.
 """
 from __future__ import annotations
 
-import argparse
 import json
 import math
 import os
@@ -161,19 +160,10 @@ def _lib():
 def _sibling(name: str):
     """scripts/<name>.py by path, under a private module name, so a run's own
     module of the same name (models/ on sys.path) is never picked up."""
-    import importlib.util
-    key = f"_ma_p42_{name}"
-    mod = sys.modules.get(key)
-    if mod is None:
-        spec = importlib.util.spec_from_file_location(key, os.path.join(HERE, f"{name}.py"))
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[key] = mod
-        try:
-            spec.loader.exec_module(mod)
-        except BaseException:
-            sys.modules.pop(key, None)
-            raise
-    return mod
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    from lib.siblings import load_private
+    return load_private(name, "_ma_p42_")
 
 
 def _f(kind, sev, claim, stage="MODEL"):
@@ -1018,22 +1008,17 @@ def _self_test() -> int:
     return 0
 
 
-def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("run_dir", nargs="?")
-    ap.add_argument("--round", type=int, default=None)
-    ap.add_argument("--self-test", action="store_true")
-    a = ap.parse_args(argv)
-    if a.self_test:
-        return _self_test()
-    if not a.run_dir:
-        ap.error("run_dir required")
-    req, err = required_mechanisms(a.run_dir)
+def _print_required(run_dir: str) -> None:
+    req, err = required_mechanisms(run_dir)
     print(f"required mechanisms: {', '.join(f'{p}:{m.id}' for p, m in req) or 'none'}")
-    v = gate_findings(a.run_dir, a.round)
-    for x in v:
-        print(f"[{x['severity']}] {x['kind']}: {x['claim'][:300]}")
-    return 1 if any(x["severity"] == "HIGH" for x in v) else 0
+
+
+def main(argv=None) -> int:
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    from lib import gate_cli
+    return gate_cli.run(argv, __doc__, gate_findings, _self_test, fails=gate_cli.any_high,
+                        round_default=None, preamble=_print_required)
 
 
 if __name__ == "__main__":

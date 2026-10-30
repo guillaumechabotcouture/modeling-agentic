@@ -43,7 +43,6 @@ Exit 0 when every claim resolved, 1 otherwise, 2 on a missing/invalid spec.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import os
 import sys
 from datetime import datetime, timezone
@@ -53,19 +52,12 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lib import provenance as P  # noqa: E402
+from lib.safe_io import sha256_file as _sha  # noqa: E402
 
 PRODUCER = "scripts/build_claims_ledger.py"
 SPEC_REL = os.path.join("models", "claims_spec.yaml")
 LEDGER_REL = os.path.join("models", "claims_ledger.yaml")
 _VALUE_FIELDS = ("value", "ci_low", "ci_high")
-
-
-def _sha(path: str) -> str | None:
-    try:
-        with open(path, "rb") as f:
-            return hashlib.sha256(f.read()).hexdigest()
-    except OSError:
-        return None
 
 
 def _plain(x: Any) -> Any:
