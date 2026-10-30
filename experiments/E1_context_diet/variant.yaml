@@ -1,5 +1,6 @@
 # E1 variant: context diet — trimmed prompt + active contract packet + on-demand skill index,
-# no preloaded skills. Render first: python3 experiments/E1_context_diet/render_variant.py
+# no preloaded skills. modeler_contract.rendered.md is the frozen render; the renderer and
+# agents/contract_packet.py were removed in Phase 46 α (both are in the history before it).
 id: contract-packet
 model: claude-opus-5-5
 prompt_file: modeler_contract.rendered.md

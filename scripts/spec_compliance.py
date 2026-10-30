@@ -671,13 +671,6 @@ def _sum_cost_column(csv_path: str) -> tuple[Optional[float], Optional[str]]:
     return total, cost_col
 
 
-def _check_budget(budget_envelope: float, budget_raw: str,
-                  run_dir: str) -> Optional[dict]:
-    """First budget violation (back-compat wrapper)."""
-    out = _check_budget_all(budget_envelope, budget_raw, run_dir)
-    return out[0] if out else None
-
-
 def _check_budget_all(budget_envelope: float, budget_raw: str,
                       run_dir: str) -> list[dict]:
     """Phase 21 γ: the envelope is a ceiling as well as a floor. An

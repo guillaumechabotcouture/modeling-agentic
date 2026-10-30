@@ -856,13 +856,6 @@ def _scan_doc_averted(doc_text: str, vocab: RunVocabulary
     return out
 
 
-def _normalize_package_token(tok: str) -> str:
-    """Lower-case snake_case form of a prose package token. Phase 21 γ:
-    the intervention-specific alias table is gone; prose-to-package
-    mapping goes through `RunVocabulary.find_packages`."""
-    return re.sub(r"[\s\-+]+", "_", tok.strip().lower())
-
-
 def _off_headline(doc_text: str, start: int, end: int,
                   vocab: RunVocabulary) -> bool:
     """Phase 21 precision pass: True when the number at [start, end) is
@@ -955,13 +948,6 @@ def _scan_unit_counts(doc_text: str, vocab: RunVocabulary | None = None
                     ctx, "aggregate" if (has_left or has_right)
                     else "headline_candidate"))
     return out
-
-
-# Back-compat name (Phase 13 β callers).
-def _scan_lga_counts(doc_text: str, vocab: RunVocabulary | None = None
-                     ) -> list[tuple[int, str, str]]:
-    return [(n, ctx, conf) for n, _noun, ctx, conf
-            in _scan_unit_counts(doc_text, vocab)]
 
 
 def _scan_package_counts(doc_text: str, vocab: RunVocabulary | None = None

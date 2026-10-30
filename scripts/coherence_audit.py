@@ -762,17 +762,6 @@ def _bound_to_nearest(value: float, unit: float,
     return abs(nearest - value) < unit * (1 - 1e-9) or nearest == value
 
 
-def _within_proximity(value: float, bound_numeric_values,
-                      tolerance: float = 0.05) -> bool:
-    """Kept for API compatibility (Phase 18 δ). Phase 21 γ binding uses
-    `_bound_to_nearest` instead."""
-    for bv in bound_numeric_values or ():
-        denom = max(abs(value), abs(bv), 1.0)
-        if abs(value - bv) / denom <= tolerance:
-            return True
-    return False
-
-
 def _line_ctx(text: str, start: int, end: int, pad: int = 60) -> tuple[int, str]:
     line_no = text.count("\n", 0, start) + 1
     ctx = text[max(0, start - pad):min(len(text), end + pad)]

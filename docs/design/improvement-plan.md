@@ -13,6 +13,9 @@ Merged to main:
 - **Integrity fixes found by the smokes:** #57 (final-gate false "deleted") and #59 (missing presentation critique after the harness write-up).
 - **Attempt 9 config** (#64): attempt 8's question and settings, unchanged.
 
+In review (Phase 46, simplification with no change to gate output):
+- **α:** `scripts/gate_replay.py` replays the STAGE 7 validator on saved runs and diffs the findings; `agents/contract_packet.py` (unused, failing self-test) and five unused back-compat helpers removed.
+
 Before attempt 9:
 - A9 (stale data-stage figures), waiting for attempt 8's records; A10 (session crash) is investigated from the same records but does not hold the launch;
 - a pre-launch smoke on main, then owner sign-off on the brief.
@@ -20,7 +23,7 @@ Before attempt 9:
 After attempt 9:
 - D9, D10 (decision-layer sufficiency, observed-vs-modelled inputs);
 - E3, E4; B4 (needs S3), B5, B6; C1–C3; D7;
-- smaller items: a gate-side P(output > 0) check from the per-draw values (A12 kept only the reporting); a pin or deterministic declaration can still exempt a frozen output with any reason (no weaker than before #62); `agents/contract_packet.py` is unused and its self-test fails (delete or wire in); attempt 8's B9 scope declaration rested on a stale benchmark value.
+- smaller items: a gate-side P(output > 0) check from the per-draw values (A12 kept only the reporting); a pin or deterministic declaration can still exempt a frozen output with any reason (no weaker than before #62); attempt 8's B9 scope declaration rested on a stale benchmark value.
 
 ## Why
 
