@@ -2321,7 +2321,9 @@ def _check_figure_validator(run_dir: str) -> list[dict]:
                     "kind": "figure_validator_missing",
                     "severity": "MEDIUM",
                     "stage": "ANALYZE",
-                    "key": os.path.relpath(py, run_dir),  # Phase 47 ε: instance key for scripts/stall_rule.py
+                    # Phase 47 ε: instance key for scripts/stall_rule.py — the script plus the
+                    # savefig call's own text (not its line number, which shifts with edits).
+                    "key": f"{os.path.relpath(py, run_dir)}::{' '.join(ln.split())[:160]}",
                     "claim": (
                         f"{os.path.relpath(py, run_dir)}:{idx + 1} calls "
                         f"savefig but no validate_figure(...) appears "
@@ -6178,6 +6180,21 @@ def _run_self_test() -> int:
                and v["severity"] == "MEDIUM" for v in vf2),
            f"F2: savefig without validate_figure should fire MEDIUM, "
            f"got {vf2}")
+
+        # F2b (Phase 47 ε): two unvalidated savefig calls in one script carry
+        # distinct stall keys, and a line shift above a call keeps its key.
+        with open(os.path.join(models_dir, "model_figures.py"), "w") as f:
+            f.write("import matplotlib.pyplot as plt\n"
+                    "plt.savefig('figures/first.png')\n" + "x = 1\n" * 11 +
+                    "plt.savefig('figures/second.png')\n")
+        k1 = sorted(v["key"] for v in _check_figure_validator(d) if v["kind"] == "figure_validator_missing")
+        with open(os.path.join(models_dir, "model_figures.py"), "w") as f:
+            f.write("import matplotlib.pyplot as plt\n# a new comment line\n"
+                    "plt.savefig('figures/first.png')\n" + "x = 1\n" * 11 +
+                    "plt.savefig('figures/second.png')\n")
+        k2 = sorted(v["key"] for v in _check_figure_validator(d) if v["kind"] == "figure_validator_missing")
+        ok(len(k1) == 2 and len(set(k1)) == 2 and k1 == k2,
+           f"F2b: distinct, line-stable stall keys per savefig call, got {k1} then {k2}")
 
         # F3: same script with validate_figure within 10 lines → silent
         # (no provenance needed because no PNG actually exists; check 1
