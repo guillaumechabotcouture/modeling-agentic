@@ -19,14 +19,28 @@ analyst stage, so the analyst and the critics read current figures, and
 before the final gate. Figures stay a modeling tool every round; nobody
 spends a round regenerating them.
 
-It never marks files as written by the harness: a figure script that rewrites
-a protected artifact is still reported by the integrity record. Scripts run
+Phase 47 α (A9): a generator that redraws its PNG without calling
+`validate_figure` again leaves the sidecar's old source hashes, so the figure
+stayed stale after every rebuild (attempt 8's data-stage eda.py: rounds 1-5,
+`figure_staleness_detected` HIGH in rounds 2 and 4). After a script exits 0,
+the harness re-records the source hashes of each of its stale figures whose
+PNG the run rewrote (mtime or content changed against a snapshot taken
+before the run) and whose sidecar the script left unchanged, keeping the
+sidecar's other fields and marking it `provenance_by: derived_rebuild`. A
+figure stays stale when its PNG was not rewritten, its script failed, a
+recorded source is missing, or a recorded annotation no longer appears in
+the script.
+
+It marks as written by the harness only the sidecars it re-records itself: a
+figure script that rewrites a protected artifact is still reported by the
+integrity record. Scripts run
 without cloud credentials (as agents do without --cloud), each in its own
 process group, within a total time budget below the CLI's hook deadline.
 """
 from __future__ import annotations
 
 import argparse
+import datetime
 import glob
 import json
 import os
@@ -38,6 +52,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import figure_validator as fv  # noqa: E402
+from lib.safe_io import inside_dir  # noqa: E402
 
 
 def _load_pipeline():
@@ -95,6 +110,14 @@ def _inside(path: str, root: str) -> bool:
         return False
 
 
+def _stale_or_unreadable(png: str) -> bool:
+    """check_staleness, with a sidecar it cannot read counted as stale (fail closed)."""
+    try:
+        return fv.check_staleness(png)["status"] == "stale"
+    except Exception:  # noqa: BLE001 — malformed provenance: stale
+        return True
+
+
 def stale_scripts(run_dir: str) -> tuple[list[str], dict[str, list[str]], list[dict]]:
     """(scripts to run in order, figures per script, figures that cannot be rebuilt)."""
     order, figs, skipped = [], {}, []
@@ -103,7 +126,7 @@ def stale_scripts(run_dir: str) -> tuple[list[str], dict[str, list[str]], list[d
     except Exception:  # noqa: BLE001 — fail closed: a pipeline we cannot read owns every figure
         owned = ["*"] if os.path.exists(os.path.join(run_dir, pipeline.SPEC)) else []
     for png, sc in sorted(_sidecars(run_dir), key=lambda t: str(t[1].get("written_at_utc") or "")):
-        if fv.check_staleness(png)["status"] != "stale":
+        if not _stale_or_unreadable(png):
             continue
         script = sc.get("generator_script")
         rel = os.path.relpath(png, run_dir)
@@ -152,13 +175,171 @@ def _run(cmd, cwd, timeout_s, env):
         return None, f"timed out after {timeout_s:.0f}s (process group killed)"
 
 
+PROVENANCE_BY = "derived_rebuild"
+
+
+def _file_state(path: str) -> tuple | None:
+    """(mtime_ns, size, sha256) of a file, or None when it is missing or unreadable."""
+    try:
+        st = os.stat(path)
+        return (st.st_mtime_ns, st.st_size, fv._hash_file(path))
+    except OSError:
+        return None
+
+
+def _recorded_sources(sp: str) -> dict | None:
+    """The sidecar's recorded source paths -> current sha256, or None when unreadable."""
+    try:
+        with open(sp) as f:
+            sc = json.load(f)
+        srcs = sc.get("source_hashes") if isinstance(sc, dict) else None
+        if not isinstance(srcs, dict):
+            return None
+        return {str(p): fv._hash_file(str(p)) for p in srcs}
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _snapshot(run_dir: str, rels: list[str]) -> dict[str, dict]:
+    """Each figure's PNG, sidecar and recorded-source state, taken before its script runs."""
+    out = {}
+    for rel in rels:
+        png = os.path.join(run_dir, rel)
+        sp = fv._provenance_path(png)
+        out[rel] = {"png": _file_state(png), "sc": _file_state(sp), "src": _recorded_sources(sp)}
+    return out
+
+
+def _candidate(run_dir: str, rel: str, before: dict, script: str) -> tuple[dict | None, str | None]:
+    """A9, right after the figure's own script exited 0: (candidate, None) when the
+    sidecar may be re-recorded once every script has finished, else (None, why)."""
+    png = os.path.join(run_dir, rel)
+    sp = fv._provenance_path(png)
+    png_after, sc_after = _file_state(png), _file_state(sp)
+    if png_after is None:
+        return None, "PNG missing after its script ran"
+    pb = before["png"]
+    if pb is not None and png_after[0] == pb[0] and png_after[2] == pb[2]:
+        return None, "its script did not rewrite the PNG"
+    if sc_after is None or sc_after != before["sc"]:
+        return None, "its script rewrote or removed the sidecar itself"
+    try:
+        with open(sp) as f:
+            sc = json.load(f)
+    except (OSError, ValueError) as e:
+        return None, f"sidecar unreadable: {type(e).__name__}"
+    srcs = sc.get("source_hashes") if isinstance(sc, dict) else None
+    if not isinstance(srcs, dict) or not srcs:
+        return None, "sidecar records no sources"
+    missing = [p for p in srcs if not os.path.isfile(str(p))]
+    if missing:
+        return None, f"recorded source missing: {missing[0]}"
+    now = {str(p): fv._hash_file(str(p)) for p in srcs}
+    if before["src"] is None or now != before["src"]:
+        # It may have drawn from the old content and then rewritten its input.
+        return None, "a recorded source changed while its script ran"
+    ann = sc.get("expected_annotations")
+    if ann is not None and (not isinstance(ann, list) or not all(isinstance(a, str) for a in ann)):
+        return None, f"expected_annotations is not a list of strings: {ann!r}"[:200]
+    if ann:
+        # validate_figure's own annotation check, applied to the script that redrew it.
+        try:
+            with open(script) as f:
+                text = fv._strip_validate_figure_calls(f.read())
+        except OSError as e:
+            return None, f"generator script unreadable: {type(e).__name__}"
+        gone = [a for a in ann if a not in text]
+        if gone:
+            return None, f"recorded annotation no longer in its script: {gone[0]!r}"
+    return {"png": png_after, "sc": sc_after, "src": now, "doc": sc}, None
+
+
+def _commit(run_dir: str, rel: str, cand: dict, integrity=None) -> str | None:
+    """A9, after every script has finished: write the re-recorded sidecar if nothing
+    changed since the figure's own run. Returns None when written, else why not."""
+    png = os.path.join(run_dir, rel)
+    sp = fv._provenance_path(png)
+    tmp = sp + ".tmp"
+    if os.path.islink(png) or os.path.islink(sp):
+        return "PNG or sidecar is a symlink"
+    if not all(inside_dir(run_dir, p) for p in (png, sp, tmp)):
+        return "PNG, sidecar or temp file resolves outside the run directory"
+    if _file_state(png) != cand["png"]:
+        return "the PNG changed after its own script's run (a later script rewrote it)"
+    if _file_state(sp) != cand["sc"]:
+        return "the sidecar changed after its script's run"
+    if {p: fv._hash_file(p) for p in cand["src"]} != cand["src"]:
+        return "a recorded source changed after its script's run"
+    sc = dict(cand["doc"])
+    sc["source_hashes"] = dict(cand["src"])
+    sc["provenance_by"] = PROVENANCE_BY
+    sc["provenance_rerecorded_at_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    return _write_sidecar(run_dir, sp, sc, integrity)
+
+
+def _write_sidecar(run_dir: str, sp: str, sc: dict, integrity=None) -> str | None:
+    """Write a sidecar the harness built, inside the run only. None when written."""
+    tmp = sp + ".tmp"
+    if os.path.islink(sp) or not all(inside_dir(run_dir, p) for p in (sp, tmp)):
+        return "sidecar is a symlink or resolves outside the run directory"
+    try:
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
+        with os.fdopen(fd, "w") as f:
+            json.dump(sc, f, indent=2, sort_keys=True)
+        if not inside_dir(run_dir, sp) or os.path.islink(sp):
+            os.unlink(tmp)
+            return "sidecar resolves outside the run directory"
+        os.replace(tmp, sp)
+    except OSError as e:
+        return f"sidecar not writable: {type(e).__name__}"
+    if integrity is not None:
+        # The harness wrote this sidecar; the script left it unchanged (checked by the caller).
+        integrity.harness_wrote(os.path.relpath(sp, run_dir).replace(os.sep, "/"))
+    return None
+
+
+INVALIDATED = "invalidated:"
+
+
+def _invalidate(run_dir: str, rel: str, sc_state: tuple | None, reason: str, integrity=None) -> str | None:
+    """Codex round 2: the PNG was rewritten but not re-recorded, so the old sidecar no
+    longer describes it (and would read fresh if the inputs went back to the old
+    content). Replace each recorded hash with `invalidated:<reason>`, which no file
+    hashes to, so check_staleness reports it stale. Only when the sidecar is still the
+    one the run started with (a script's own rewrite is its record)."""
+    png = os.path.join(run_dir, rel)
+    sp = fv._provenance_path(png)
+    if os.path.islink(png) or not inside_dir(run_dir, png):
+        return "PNG is a symlink or resolves outside the run directory"
+    if sc_state is None or _file_state(sp) != sc_state:
+        return "the sidecar changed during the rebuild"
+    with open(sp) as f:
+        sc = json.load(f)
+    srcs = sc.get("source_hashes") if isinstance(sc, dict) else None
+    if not isinstance(srcs, dict) or not srcs:
+        return "sidecar records no sources"
+    tag = INVALIDATED + reason[:160]
+    sc["source_hashes"] = {str(p): tag for p in srcs}
+    sc["provenance_by"] = PROVENANCE_BY
+    sc["provenance_invalidated_at_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    sc["provenance_invalidated_reason"] = reason
+    return _write_sidecar(run_dir, sp, sc, integrity)
+
+
 def rebuild(run_dir: str, timeout_s: float = SCRIPT_TIMEOUT_S, python: str | None = None,
-            budget_s: float | None = None) -> dict:
+            budget_s: float | None = None, integrity=None) -> dict:
     run_dir = os.path.realpath(run_dir)
     t0 = time.time()
     order, figs, skipped = stale_scripts(run_dir)
     env = script_env()
-    runs = []
+    runs, rerecorded, not_rerecorded, candidates = [], [], [], {}
+    # Every scheduled figure's state before any script runs (for invalidation).
+    try:
+        initial = _snapshot(run_dir, [r for sc_ in order for r in figs[sc_]])
+    except Exception:  # noqa: BLE001
+        initial = {}
     for script in order:
         s0 = time.time()
         left = None if budget_s is None else budget_s - (s0 - t0)
@@ -166,6 +347,7 @@ def rebuild(run_dir: str, timeout_s: float = SCRIPT_TIMEOUT_S, python: str | Non
             runs.append({"script": os.path.relpath(script, run_dir), "figures": figs[script], "returncode": None,
                          "seconds": 0.0, "stderr_tail": "not started: rebuild time budget used"})
             continue
+        before = _snapshot(run_dir, figs[script])
         try:
             rc, err = _run([python or sys.executable, script], run_dir,
                            timeout_s if left is None else min(timeout_s, left), env)
@@ -173,9 +355,56 @@ def rebuild(run_dir: str, timeout_s: float = SCRIPT_TIMEOUT_S, python: str | Non
             rc, err = None, f"{type(e).__name__}: {e}"
         runs.append({"script": os.path.relpath(script, run_dir), "figures": figs[script], "returncode": rc,
                      "seconds": round(time.time() - s0, 1), **({"stderr_tail": err} if rc != 0 else {})})
-    still = [os.path.relpath(png, run_dir) for png, _ in _sidecars(run_dir) if fv.check_staleness(png)["status"] == "stale"]
+        if rc != 0:
+            continue
+        for rel in figs[script]:
+            # One figure's problem never stops the others or the remaining scripts.
+            try:
+                if fv.check_staleness(os.path.join(run_dir, rel))["status"] != "stale":
+                    continue
+                cand, why = _candidate(run_dir, rel, before[rel], script)
+            except Exception as e:  # noqa: BLE001
+                cand, why = None, f"provenance unreadable: {type(e).__name__}: {e}"[:200]
+            if cand is not None:
+                candidates[rel] = cand
+            else:
+                not_rerecorded.append({"figure": rel, "why": why})
+    # Deferred until every script has finished, so a later script that rewrites a
+    # figure (and then fails) cannot leave it marked fresh.
+    for rel, cand in candidates.items():
+        try:
+            why = _commit(run_dir, rel, cand, integrity)
+        except Exception as e:  # noqa: BLE001
+            why = f"sidecar not re-recorded: {type(e).__name__}: {e}"[:200]
+        if why is None:
+            rerecorded.append(rel)
+        else:
+            not_rerecorded.append({"figure": rel, "why": why})
+    # Codex round 2: a figure whose PNG was rewritten but not re-recorded gets an
+    # explicitly stale sidecar, with the reason.
+    reasons = {x["figure"]: x["why"] for x in not_rerecorded}
+    invalidated = []
+    for rel, b in initial.items():
+        if rel in rerecorded:
+            continue
+        try:
+            now = _file_state(os.path.join(run_dir, rel))
+            pb = b["png"]
+            if now is None or (pb is not None and now[0] == pb[0] and now[2] == pb[2]):
+                continue        # not rewritten: the old sidecar still describes the PNG
+            reason = reasons.get(rel) or "the PNG was rewritten by a script that did not exit 0"
+            err = _invalidate(run_dir, rel, b["sc"], reason, integrity)
+        except Exception as e:  # noqa: BLE001
+            err = f"{type(e).__name__}: {e}"[:200]
+        if err is None:
+            invalidated.append({"figure": rel, "why": reason})
+        elif rel not in reasons:
+            not_rerecorded.append({"figure": rel, "why": f"PNG rewritten; sidecar not invalidated: {err}"})
+    still = [os.path.relpath(png, run_dir) for png, _ in _sidecars(run_dir) if _stale_or_unreadable(png)]
     report = {"at": time.strftime("%Y-%m-%dT%H:%M:%S"), "seconds": round(time.time() - t0, 1), "runs": runs,
               "skipped": skipped, "still_stale": still,
+              "provenance_rerecorded": rerecorded, "provenance_not_rerecorded": not_rerecorded,
+              "provenance_invalidated": invalidated,
               "rebuilt": sorted({f for r in runs if r["returncode"] == 0 for f in r["figures"]} - set(still))}
     try:
         os.makedirs(os.path.join(run_dir, "figures"), exist_ok=True)
@@ -190,6 +419,8 @@ def summary_line(rep: dict) -> str:
     bad = [r for r in rep["runs"] if r["returncode"] != 0]
     return (f"derived rebuild: {len(rep['rebuilt'])} figures regenerated by {len(rep['runs']) - len(bad)} scripts"
             + (f"; {len(bad)} scripts failed ({', '.join(r['script'] for r in bad)})" if bad else "")
+            + (f"; provenance re-recorded by the harness for {len(rep['provenance_rerecorded'])}"
+               if rep.get("provenance_rerecorded") else "")
             + (f"; still stale: {', '.join(rep['still_stale'])}" if rep["still_stale"] else "")
             + f" [{rep['seconds']}s]")
 
@@ -290,6 +521,189 @@ def _self_test() -> int:
         rep = rebuild(d)
         ok(rep["runs"] == [] and any("pipeline" in s["why"] for s in rep["skipped"]),
            f"DR11 (pipeline review #5) an unparsable models/pipeline.yaml keeps its figures from this rebuild: {rep}")
+    # Phase 47 α (A9): generators that redraw a PNG without calling validate_figure again
+    # (attempt 8's eda.py). The harness re-records the sidecar only when the run rewrote
+    # the PNG, the script exited 0 and left the sidecar alone.
+    with tempfile.TemporaryDirectory() as d:
+        d = os.path.realpath(d)
+        os.makedirs(os.path.join(d, "models")); os.makedirs(os.path.join(d, "figures"))
+        data = os.path.join(d, "models", "out.csv")
+        png = os.path.join(d, "figures", "b.png")
+        sp = png + ".provenance.json"
+        open(data, "w").write("x,y\n1,2\n")
+        first = (f"import sys, os\nsys.path.insert(0, {here!r})\nimport figure_validator as fv\n"
+                 "d = os.getcwd()\n"
+                 "open(os.path.join(d, 'figures', 'b.png'), 'w').write(open(os.path.join(d, 'models', 'out.csv')).read())\n"
+                 "fv.validate_figure(os.path.join(d, 'figures', 'b.png'), [os.path.join(d, 'models', 'out.csv')],"
+                 " expected_annotations=['Cases by unit'])\n# title: Cases by unit\n")
+        open(os.path.join(d, "models", "eda.py"), "w").write(first)
+        r = subprocess.run([sys.executable, os.path.join(d, "models", "eda.py")], cwd=d, capture_output=True, text=True)
+        ok(r.returncode == 0 and os.path.exists(sp), f"DR13 fixture: the first draw writes a sidecar: {r.stderr[-300:]}")
+        # The script is then edited to save without validate_figure (eda.py's pre-fix shape).
+        redraw = ("import os\nd = os.getcwd()\n# title: Cases by unit\n"
+                  "open(os.path.join(d, 'figures', 'b.png'), 'w').write(open(os.path.join(d, 'models', 'out.csv')).read())\n")
+        open(os.path.join(d, "models", "eda.py"), "w").write(redraw)
+        sc0 = json.load(open(sp))
+
+        class _Rec:
+            def __init__(self):
+                self.w = []
+
+            def harness_wrote(self, rel):
+                self.w.append(rel)
+        rec = _Rec()
+        open(data, "w").write("x,y\n1,3\n")
+        rep = rebuild(d, integrity=rec)
+        sc1 = json.load(open(sp))
+        ok(rep["still_stale"] == [] and rep["rebuilt"] == ["figures/b.png"]
+           and rep["provenance_rerecorded"] == ["figures/b.png"] and fv.check_staleness(png)["status"] == "fresh"
+           and "provenance re-recorded by the harness for 1" in summary_line(rep),
+           f"DR13 a generator that saves without validate_figure is fresh after the rebuild: {rep}")
+        ok(sc1.get("provenance_by") == PROVENANCE_BY and sc1.get("provenance_rerecorded_at_utc")
+           and all(sc1.get(k) == sc0.get(k) for k in ("generator_script", "png_path", "expected_annotations",
+                                                       "written_at_utc", "expected_n_data_points")),
+           f"DR13b the re-recorded sidecar keeps its other fields and says the harness wrote it: {sc1}")
+        ok(rec.w == ["figures/b.png.provenance.json"], f"DR13c the integrity record is told the harness wrote it: {rec.w}")
+        # A generator that exits 0 without touching the PNG: the figure stays stale.
+        open(os.path.join(d, "models", "eda.py"), "w").write("print('nothing drawn')\n")
+        open(data, "w").write("x,y\n1,4\n")
+        rep = rebuild(d)
+        ok(rep["still_stale"] == ["figures/b.png"] and rep["provenance_rerecorded"] == []
+           and "did not rewrite" in rep["provenance_not_rerecorded"][0]["why"],
+           f"DR14 a generator that does not rewrite the PNG leaves it stale: {rep}")
+        # A generator that rewrites the PNG, then fails: stale.
+        open(os.path.join(d, "models", "eda.py"), "w").write(redraw + "raise SystemExit('boom')\n")
+        rep = rebuild(d)
+        ok(rep["still_stale"] == ["figures/b.png"] and rep["provenance_rerecorded"] == []
+           and rep["runs"][0]["returncode"] == 1, f"DR15 a failed generator leaves its figure stale: {rep}")
+        # A recorded annotation the script no longer draws: stale (validate_figure's own rule).
+        open(os.path.join(d, "models", "eda.py"), "w").write(redraw.replace("Cases by unit", "Deaths"))
+        rep = rebuild(d)
+        ok(rep["still_stale"] == ["figures/b.png"] and "annotation" in rep["provenance_not_rerecorded"][0]["why"],
+           f"DR16 a recorded annotation missing from the script keeps the figure stale: {rep}")
+        # A recorded source that no longer exists: stale.
+        open(os.path.join(d, "models", "eda.py"), "w").write(redraw.replace("models', 'out.csv", "models', 'gone.csv")
+                                                              .replace("open(os.path.join(d, 'models', 'gone.csv')).read()", "'x'"))
+        os.rename(data, data + ".bak")
+        rep = rebuild(d)
+        ok(rep["still_stale"] == ["figures/b.png"] and "source missing" in rep["provenance_not_rerecorded"][0]["why"],
+           f"DR17 a missing recorded source keeps the figure stale: {rep}")
+        os.rename(data + ".bak", data)
+        # A script that rewrites the sidecar itself is the script's record, not re-recorded by the harness.
+        open(os.path.join(d, "models", "eda.py"), "w").write(
+            redraw + f"import json\np = os.path.join(d, 'figures', 'b.png.provenance.json')\n"
+                     "s = json.load(open(p)); s['note'] = 'x'; json.dump(s, open(p, 'w'))\n")
+        rep = rebuild(d)
+        ok(rep["still_stale"] == ["figures/b.png"] and "sidecar itself" in rep["provenance_not_rerecorded"][0]["why"],
+           f"DR18 a script that rewrote its own sidecar is not overridden: {rep}")
+    # Phase 47 α Codex round 1 (P1s): sources rewritten during the run, a later script
+    # overwriting a promoted figure, symlinks, malformed annotations.
+    def _fig(d, name, src, ann=None):
+        """A first draw through validate_figure (writes the sidecar), then the script is
+        replaced by one that redraws the PNG without it. Returns the script path."""
+        s = os.path.join(d, "models", f"draw_{name}.py")
+        open(s, "w").write(
+            f"import sys, os\nsys.path.insert(0, {here!r})\nimport figure_validator as fv\nd = os.getcwd()\n"
+            f"open(os.path.join(d, 'figures', '{name}.png'), 'w').write(open({src!r}).read())\n"
+            f"fv.validate_figure(os.path.join(d, 'figures', '{name}.png'), [{src!r}])\n")
+        r = subprocess.run([sys.executable, s], cwd=d, capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        if ann is not None:
+            spf = os.path.join(d, "figures", f"{name}.png.provenance.json")
+            j = json.load(open(spf)); j["expected_annotations"] = ann; json.dump(j, open(spf, "w"))
+        return s
+
+    redraw_tpl = ("import os\nd = os.getcwd()\n"
+                  "open(os.path.join(d, 'figures', '{name}.png'), 'w').write(open({src!r}).read() + '{tag}')\n")
+    with tempfile.TemporaryDirectory() as d:
+        d = os.path.realpath(d)
+        os.makedirs(os.path.join(d, "models")); os.makedirs(os.path.join(d, "figures"))
+        src = os.path.join(d, "models", "src.csv")
+        open(src, "w").write("x\n1\n")
+        s = _fig(d, "r", src)
+        # DR19: reads its source, draws, then rewrites that source before exiting 0.
+        open(s, "w").write(redraw_tpl.format(name="r", src=src, tag="") + f"open({src!r}, 'a').write('9\\n')\n")
+        open(src, "a").write("2\n")
+        rep = rebuild(d)
+        ok(rep["still_stale"] == ["figures/r.png"] and rep["provenance_rerecorded"] == []
+           and "changed while its script ran" in rep["provenance_not_rerecorded"][0]["why"],
+           f"DR19 (Codex P1) a script that rewrites its own source is not certified fresh: {rep}")
+    with tempfile.TemporaryDirectory() as d:
+        d = os.path.realpath(d)
+        os.makedirs(os.path.join(d, "models")); os.makedirs(os.path.join(d, "figures"))
+        src = os.path.join(d, "models", "src.csv")
+        open(src, "w").write("x\n1\n")
+        sa = _fig(d, "a", src)
+        time.sleep(0.01)
+        sb = _fig(d, "b", src)
+        # DR20: A redraws a.png; B (run after A) overwrites a.png, then fails.
+        open(sa, "w").write(redraw_tpl.format(name="a", src=src, tag=""))
+        open(sb, "w").write(redraw_tpl.format(name="a", src=src, tag="B") + "raise SystemExit(3)\n")
+        open(src, "a").write("2\n")
+        rep = rebuild(d)
+        why = {x["figure"]: x["why"] for x in rep["provenance_not_rerecorded"]}
+        ok([r["returncode"] for r in rep["runs"]] == [0, 3] and "figures/a.png" in rep["still_stale"]
+           and "later script" in why.get("figures/a.png", ""),
+           f"DR20 (Codex P1) a figure a later failing script overwrote stays stale: {rep}")
+        # DR22: malformed expected_annotations on one figure: it stays stale with a reason,
+        # and the other script still runs and its figure is re-recorded.
+        spa = os.path.join(d, "figures", "a.png.provenance.json")
+        j = json.load(open(spa)); j["expected_annotations"] = 1; json.dump(j, open(spa, "w"))
+        open(sb, "w").write(redraw_tpl.format(name="b", src=src, tag=""))
+        open(src, "a").write("3\n")
+        rep = rebuild(d)
+        why = {x["figure"]: x["why"] for x in rep["provenance_not_rerecorded"]}
+        ok(rep["still_stale"] == ["figures/a.png"] and rep["provenance_rerecorded"] == ["figures/b.png"]
+           and "not a list of strings" in why.get("figures/a.png", ""),
+           f"DR22 (Codex P1) malformed annotations stay stale and stop nothing else: {rep}")
+    with tempfile.TemporaryDirectory() as d:
+        d = os.path.realpath(d)
+        os.makedirs(os.path.join(d, "models")); os.makedirs(os.path.join(d, "figures"))
+        src = os.path.join(d, "models", "src.csv")
+        open(src, "w").write("x\n1\n")          # V1: what both sidecars record
+        sa = _fig(d, "a", src)
+        time.sleep(0.01)
+        sb = _fig(d, "b", src)
+        # DR23 (Codex round 2): A redraws a.png from V2; B then restores the source to V1
+        # and fails. The refused figure must not read fresh against the restored input.
+        open(sa, "w").write(redraw_tpl.format(name="a", src=src, tag=""))
+        open(sb, "w").write(f"open({src!r}, 'w').write('x\\n1\\n')\nraise SystemExit(4)\n")
+        open(src, "w").write("x\n2\n")          # V2
+        rep = rebuild(d)
+        spa = json.load(open(os.path.join(d, "figures", "a.png.provenance.json")))
+        ok(open(src).read() == "x\n1\n" and "figures/a.png" in rep["still_stale"]
+           and [x["figure"] for x in rep["provenance_invalidated"]] == ["figures/a.png"]
+           and all(str(h).startswith(INVALIDATED) for h in spa["source_hashes"].values())
+           and spa.get("provenance_invalidated_reason"),
+           f"DR23 (Codex round 2) a refused redraw gets an explicitly stale sidecar: {rep} {spa}")
+        # The next rebuild can re-record it once its script redraws it cleanly.
+        open(sb, "w").write("pass\n")
+        rep = rebuild(d)
+        ok("figures/a.png" in rep["provenance_rerecorded"] and "figures/a.png" not in rep["still_stale"],
+           f"DR23b an invalidated sidecar is re-recorded by the next clean redraw: {rep}")
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+        d = os.path.realpath(d)
+        os.makedirs(os.path.join(d, "models")); os.makedirs(os.path.join(d, "figures"))
+        src = os.path.join(d, "models", "src.csv")
+        open(src, "w").write("x\n1\n")
+        s = _fig(d, "l", src)
+        # DR21: the PNG is a symlink to a file outside the run: no harness write.
+        png = os.path.join(d, "figures", "l.png")
+        os.replace(png, os.path.join(out, "l.png"))
+        os.symlink(os.path.join(out, "l.png"), png)
+        open(s, "w").write(redraw_tpl.format(name="l", src=src, tag=""))
+        open(src, "a").write("2\n")
+        rep = rebuild(d)
+        ok(rep["still_stale"] == ["figures/l.png"] and "symlink" in rep["provenance_not_rerecorded"][0]["why"],
+           f"DR21 (Codex P1) a symlinked PNG is not re-recorded: {rep}")
+        # DR21b: a symlinked sidecar pointing outside: refused, nothing written outside.
+        os.unlink(png); open(png, "w").write("x")
+        sp = png + ".provenance.json"
+        os.replace(sp, os.path.join(out, "l.json")); os.symlink(os.path.join(out, "l.json"), sp)
+        before_out = open(os.path.join(out, "l.json")).read()
+        rep = rebuild(d)
+        ok(rep["provenance_rerecorded"] == [] and open(os.path.join(out, "l.json")).read() == before_out,
+           f"DR21b (Codex P1) a symlinked sidecar is not written through: {rep}")
     # (pipeline review) scripts/pipeline.py is loaded by path, not by a plain import that
     # can resolve to a run's own models/pipeline.py.
     with tempfile.TemporaryDirectory() as d:

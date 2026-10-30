@@ -61,6 +61,9 @@ strength matches its evidence base.
 5. `{run_dir}/models/calibration_result.yaml` (if present) — restarts,
    held-out, iterations
 6. `{run_dir}/uncertainty_report.yaml` (if present) — n_draws, CI quality
+7. `{run_dir}/models/mechanism_manifest.yaml` `decision_layer:` and
+   `{run_dir}/decision_rule.md` (when the run has an allocation) — the
+   decision-layer features and their with/without tests
 
 If any input is absent, note it in your YAML's `inputs_missing` field
 and proceed with what's available. Do not block on missing inputs.
@@ -103,6 +106,19 @@ declaration. A pilot is a temporary scope, not a permanent one.
   X more than Scenario B") AND sensitivity_analysis.yaml shows the
   difference is within ±1 perturbation step (i.e., the ranking
   flips under one alternative parameter value).
+- **Recommended-plan claim** ("fund plan P", "hold a reserve of R", "cut
+  in this order") AND the plan applies a decision-layer feature (a rule,
+  constraint, reserve, hedge, cap, threshold or contingency added beyond
+  the question and the signed brief) that `decision_layer:` in
+  `models/mechanism_manifest.yaml` does not list. The gate cannot see an
+  unlisted feature; you can. Read decision_rule.md and the report's
+  recommendation section, and name each unlisted feature in `reason`, with
+  the file and line where the plan applies it. In-run brief amendments to
+  constraints (`brief_amendments.yaml`) are where such features often
+  enter. The `evidence_pointer` is the manifest; the
+  `suggested_restatement` says to list the feature with a with/without
+  test, or take it out. Do not re-judge listed features: the gate checks
+  their tests and dates.
 
 A claim is ADEQUATE when its strength is consistent with the evidence.
 Examples:

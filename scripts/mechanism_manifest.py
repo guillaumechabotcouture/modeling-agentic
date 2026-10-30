@@ -80,6 +80,58 @@ Findings:
 Never HIGH for leaving a feature out when its sufficiency test passed. None of
 these are scope-declarable: a mechanism the run cannot model is `simplified`
 with a test, or `fixed` with a source.
+
+Phase 47 γ (D9): decision-layer features. The same file has a sibling section
+for features of the decision layer: any rule, constraint, reserve, hedge, cap,
+threshold or contingency added to the optimisation or the decision rule beyond
+what the question or the signed brief specifies. E7 attempt 8 added a reserve
+ladder, descoping rules, supply caps and a minimax hedge in rounds 3-5; its own
+results showed the reserve's overrun tolerance never bound, and one rule read
+information not available at its decision date. The rule is parsimony: show
+the feature changes the recommendation, or take it out.
+
+    decision_layer:                  # required once the run has an allocation;
+      - id: price_reserve            #   `decision_layer: []` = none beyond the brief
+        kind: decision_rule
+        description: "<what the feature does>"
+        in_recommended_plan: true    # is it applied in the recommended plan?
+        sufficiency_test: models/sufficiency/price_reserve.yaml
+        information_used:            # every input the rule reads, and when it is known
+          - {input: "<input>", available: 2023-10}     # YYYY, YYYY-MM or YYYY-MM-DD
+        decision_date: 2026-01       # optional: when this rule acts (default: the
+                                     #   brief's `decision_date`, else metadata decision_year)
+      - id: <id>
+        kind: decision_rule
+        description: "..."
+        specified_by: brief          # or question: needs no test
+        quote: "<the words that specify it>"
+        information_used: []
+
+The result file has the D1 format plus the feature it belongs to: `feature:
+<id>`, `varied` (the with/without comparison, as text or `{with: ..., without:
+...}`), `criterion`, `decision_changes`. A feature whose test
+shows no change and that stays in the recommended plan must be removed, or
+kept by a brief amendment that names it (`owner_amendment: AM-n`; the
+amendment's change or reason names the feature id). Dates are compared at the
+coarser of the two precisions: an input available in 2027 is later than a 2026
+decision; one available in 2026 is not.
+
+  decision_layer_undeclared        HIGH  the run has an allocation and the manifest
+                                         has no `decision_layer:` list (MEDIUM at round 1)
+  decision_feature_invalid         HIGH  malformed entry (kind, description, plan flag,
+                                         information_used, dates, owner_amendment)
+  decision_feature_untested        HIGH  neither specified_by nor a usable result file
+                                         (MEDIUM at round 1)
+  decision_feature_quote_unfound   HIGH  specified_by given, quote not in question/brief
+  decision_feature_no_effect       HIGH  the test says the decision does not change, and
+                                         the feature is still in the recommended plan
+  decision_feature_future_information MEDIUM an input is available only after the
+                                         decision date
+  decision_layer_date_unknown      MEDIUM no decision date to check the inputs against
+None of these are scope-declarable: a future input is fixed by re-tagging it or
+by making the rule use what is known at the decision date. The gate cannot see
+a feature the manifest does not list; the red-team and sufficiency critics
+check the plan and decision_rule.md for features missing from `decision_layer:`.
 """
 from __future__ import annotations
 
@@ -175,20 +227,33 @@ def required_mechanisms(run_dir: str, priors=None) -> tuple[list[tuple[str, obje
     return out, err
 
 
-def _load_manifest(run_dir: str) -> tuple[dict | None, list[dict], bool]:
-    """(entries by id, findings, exists)."""
+def _read_doc(run_dir: str) -> tuple[dict | None, list[dict], bool]:
+    """(parsed manifest, findings, exists). A manifest that holds only a
+    `decision_layer:` list (no prior requires a mechanism) has no mechanisms."""
     path = os.path.join(run_dir, PATH)
     if not os.path.exists(path):
         return None, [], False
     try:
         with open(path, encoding="utf-8") as f:
             doc = yaml.safe_load(f)
-    except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
+    except (OSError, UnicodeDecodeError, ValueError, yaml.YAMLError) as e:
+        # ValueError: an impossible unquoted date (2026-02-30) fails in PyYAML's
+        # timestamp constructor, not its parser.
         return None, [_f("mechanism_manifest_invalid", "HIGH", f"`{PATH}` cannot be parsed: {e}")], True
+    if isinstance(doc, dict) and "mechanisms" not in doc and "decision_layer" in doc:
+        doc = dict(doc, mechanisms=[])
     if not isinstance(doc, dict) or not isinstance(doc.get("mechanisms"), list):
         return None, [_f("mechanism_manifest_invalid", "HIGH",
                          f"`{PATH}` must be a mapping with a `mechanisms:` list.")], True
-    entries, out = {}, []
+    return doc, [], True
+
+
+def _load_manifest(run_dir: str) -> tuple[dict | None, list[dict], bool]:
+    """(entries by id, findings, exists)."""
+    doc, out, exists = _read_doc(run_dir)
+    if doc is None:
+        return None, out, exists
+    entries = {}
     for i, e in enumerate(doc["mechanisms"]):
         if not isinstance(e, dict) or not isinstance(e.get("id"), str) or not e["id"].strip():
             out.append(_f("mechanism_manifest_invalid", "HIGH", f"`{PATH}` mechanisms[{i}] has no `id:`."))
@@ -265,6 +330,50 @@ def _owner_texts(run_dir: str) -> dict:
     return out
 
 
+def _quote_found(run_dir: str, by: str, quote) -> bool:
+    """The quote (3+ words) appears in the run's question or signed brief."""
+    q = _norm(quote) if isinstance(quote, str) else ""
+    return len(q.split()) >= 3 and q in _norm(_owner_texts(run_dir)[by])
+
+
+def _test_result(run_dir: str, rel) -> tuple[dict | None, str | None]:
+    """(result, problem) for a sufficiency-test result file named by `rel`."""
+    p = _inside(run_dir, rel) if isinstance(rel, str) else None
+    if p is None:
+        return None, f"names no existing result file (`sufficiency_test: {rel!r}`)"
+    try:
+        res = _load_result(p)
+    except (OSError, UnicodeDecodeError, ValueError, yaml.YAMLError) as exc:
+        return None, f"has a result file that cannot be parsed ({exc})"
+    if not isinstance(res, dict):
+        return None, "has a result file that is not a mapping"
+    if not isinstance(res.get("decision_changes"), bool):
+        return None, "has a result file without a `decision_changes: true|false` verdict"
+    if not res.get("varied") or not (isinstance(res.get("criterion"), str) and res["criterion"].strip()):
+        return None, "has a result file that does not state what was `varied` and the decision `criterion`"
+    return res, None
+
+
+def _result_conflicts(rel: str, res: dict, label: str, restated) -> list[dict]:
+    """A result whose share numbers or restated verdict contradict its verdict."""
+    out = []
+    share, thr = _num(res.get("share_units_changed")), _num(res.get("share_threshold"))
+    given = [k for k in ("share_units_changed", "share_threshold") if res.get(k) is not None]
+    if given and (share is None or thr is None or not 0 <= share <= 1 or not 0 <= thr <= 1):
+        out.append(_f("mechanism_manifest_invalid", "HIGH",
+                      f"`{rel}`: share_units_changed and share_threshold must both be fractions in [0, 1] when "
+                      f"either is given (got {res.get('share_units_changed')!r}, {res.get('share_threshold')!r})."))
+    if share is not None and thr is not None and (share > thr) != res["decision_changes"]:
+        out.append(_f("mechanism_manifest_invalid", "HIGH",
+                      f"`{rel}`: share_units_changed {share} vs share_threshold {thr} contradicts "
+                      f"decision_changes: {res['decision_changes']}."))
+    if isinstance(restated, bool) and restated != res["decision_changes"]:
+        out.append(_f("mechanism_manifest_invalid", "HIGH",
+                      f"`{PATH}`: {label} restates decision_changes: {restated}, but its "
+                      f"result file `{rel}` says {res['decision_changes']}."))
+    return out
+
+
 def _check_scope(run_dir: str, mid: str, e: dict, report: str | None) -> list[dict] | None:
     """Owner-specified simplification: None when the entry does not claim one."""
     by = str(e.get("specified_by", "")).strip().lower()
@@ -278,9 +387,8 @@ def _check_scope(run_dir: str, mid: str, e: dict, report: str | None) -> list[di
     if not isinstance(e.get("assumption"), str) or not e["assumption"].strip():
         out.append(_f("mechanism_manifest_invalid", "HIGH",
                       f"`{PATH}`: mechanism `{mid}` is `simplified` but states no `assumption:`."))
-    texts = _owner_texts(run_dir)
     q = _norm(quote) if isinstance(quote, str) else ""
-    if len(q.split()) < 3 or q not in _norm(texts[by]):
+    if not _quote_found(run_dir, by, quote):
         out.append(_f("mechanism_scope_quote_unfound", "HIGH",
                       f"`{PATH}`: mechanism `{mid}` is simplified as specified by the {by}, but its `quote` "
                       f"({str(quote)[:120]!r}) is not found verbatim (3+ words) in the run's {by}. Quote the words "
@@ -330,42 +438,14 @@ def _check_entry(run_dir: str, mid: str, e: dict, late: str, report: str | None)
             out.append(_f("mechanism_manifest_invalid", "HIGH",
                           f"`{PATH}`: mechanism `{mid}` is `simplified` but states no `assumption:`."))
         rel = e.get("sufficiency_test")
-        p = _inside(run_dir, rel) if isinstance(rel, str) else None
-        problem, res = None, None
-        if p is None:
-            problem = (f"names no existing result file (`sufficiency_test: {rel!r}`)")
-        else:
-            try:
-                res = _load_result(p)
-            except (OSError, UnicodeDecodeError, ValueError, yaml.YAMLError) as exc:
-                problem = f"has a result file that cannot be parsed ({exc})"
-            if problem is None:
-                if not isinstance(res, dict):
-                    problem = "has a result file that is not a mapping"
-                elif not isinstance(res.get("decision_changes"), bool):
-                    problem = "has a result file without a `decision_changes: true|false` verdict"
-                elif not res.get("varied") or not (isinstance(res.get("criterion"), str) and res["criterion"].strip()):
-                    problem = "has a result file that does not state what was `varied` and the decision `criterion`"
+        res, problem = _test_result(run_dir, rel)
         if problem:
             out.append(_f("mechanism_sufficiency_missing", late,
                           f"`{PATH}`: mechanism `{mid}` is `simplified` but {problem}. Vary the assumption over its "
                           "plausible range and record whether the decision changes (the package for a stated share "
                           "of units, or the headline beyond its uncertainty interval)."))
             return out
-        share, thr = _num(res.get("share_units_changed")), _num(res.get("share_threshold"))
-        given = [k for k in ("share_units_changed", "share_threshold") if res.get(k) is not None]
-        if given and (share is None or thr is None or not 0 <= share <= 1 or not 0 <= thr <= 1):
-            out.append(_f("mechanism_manifest_invalid", "HIGH",
-                          f"`{rel}`: share_units_changed and share_threshold must both be fractions in [0, 1] when "
-                          f"either is given (got {res.get('share_units_changed')!r}, {res.get('share_threshold')!r})."))
-        if share is not None and thr is not None and (share > thr) != res["decision_changes"]:
-            out.append(_f("mechanism_manifest_invalid", "HIGH",
-                          f"`{rel}`: share_units_changed {share} vs share_threshold {thr} contradicts "
-                          f"decision_changes: {res['decision_changes']}."))
-        if isinstance(e.get("decision_changes"), bool) and e["decision_changes"] != res["decision_changes"]:
-            out.append(_f("mechanism_manifest_invalid", "HIGH",
-                          f"`{PATH}`: mechanism `{mid}` restates decision_changes: {e['decision_changes']}, but its "
-                          f"result file `{rel}` says {res['decision_changes']}."))
+        out += _result_conflicts(rel, res, f"mechanism `{mid}`", e.get("decision_changes"))
         if res["decision_changes"]:
             out.append(_f("mechanism_simplification_rejected", "HIGH",
                           f"`{PATH}`: mechanism `{mid}` is `simplified`, but its sufficiency test (`{rel}`) finds that "
@@ -379,7 +459,241 @@ def _check_entry(run_dir: str, mid: str, e: dict, late: str, report: str | None)
     return out
 
 
-def gate_findings(run_dir: str, round_n: int | None = None, priors=None) -> list[dict]:
+# --------------------------------------------------------------------------- D9: decision layer
+
+_DATE_RE = re.compile(r"^(\d{4})(?:-(\d{1,2}))?(?:-(\d{1,2}))?$")
+_LAYER_HOWTO = (
+    "Each entry: `id`, `kind: decision_rule`, `description`, `in_recommended_plan: true|false`, "
+    "`sufficiency_test: models/sufficiency/<id>.yaml` (a result file with `feature: <id>`, `varied`: the "
+    "recommendation with and without the feature, `criterion`, `decision_changes: true|false`), and `information_used: [{input: ..., "
+    "available: YYYY-MM}]`. A feature the question or signed brief specifies takes `specified_by: question|brief` "
+    "and a verbatim `quote:` instead of the test.")
+
+
+def _date(v) -> tuple[int, ...] | None:
+    """(Y,), (Y, M) or (Y, M, D) from YYYY, YYYY-MM, YYYY-MM-DD or a YAML date."""
+    import datetime as dt
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, dt.date):
+        return (v.year, v.month, v.day)
+    if isinstance(v, int):
+        return (v,) if 1900 <= v <= 2200 else None
+    m = _DATE_RE.match(v.strip()) if isinstance(v, str) else None
+    if not m:
+        return None
+    parts = tuple(int(x) for x in m.groups() if x is not None)
+    try:
+        dt.date(parts[0], *(parts[1:] + (1,) * (3 - len(parts))))
+    except ValueError:            # month 13, 2026-02-30, ...
+        return None
+    return parts
+
+
+def _fmt(d: tuple) -> str:
+    return "-".join([str(d[0])] + [f"{x:02d}" for x in d[1:]])
+
+
+def _later(a: tuple, b: tuple) -> bool:
+    """`a` is after `b`, compared at the coarser of the two precisions."""
+    n = min(len(a), len(b))
+    return a[:n] > b[:n]
+
+
+def run_decision_date(run_dir: str) -> tuple[tuple | None, str]:
+    """(date, source) of the decision: decision_brief.yaml `decision_date`, else the
+    run's decision year (metadata.json). (None, reason) when neither is known."""
+    p = os.path.join(run_dir, "decision_brief.yaml")
+    if os.path.isfile(p):
+        try:
+            with open(p, encoding="utf-8") as f:
+                doc = yaml.safe_load(f)
+        except (OSError, UnicodeDecodeError, ValueError, yaml.YAMLError) as e:
+            return None, f"decision_brief.yaml cannot be read for its decision_date ({str(e)[:120]})"
+        if isinstance(doc, dict) and doc.get("decision_date") is not None:
+            d = _date(doc["decision_date"])
+            if d is None:
+                return None, f"decision_brief.yaml decision_date {doc['decision_date']!r} is not YYYY[-MM[-DD]]"
+            return d, "decision_brief.yaml decision_date"
+    _, year, err = _lib().run_question(run_dir)
+    if year:
+        return (int(year),), "the run's decision year (metadata.json)"
+    return None, err or "decision_brief.yaml has no decision_date and metadata.json no decision_year"
+
+
+def _scalars(node, _path: tuple = ()) -> list[str]:
+    """Scalar values of a parsed YAML document. A recursive alias raises ValueError,
+    which callers treat as an unreadable file (fail closed)."""
+    if isinstance(node, (dict, list)):
+        if id(node) in _path:
+            raise ValueError("recursive YAML alias")
+        _path = _path + (id(node),)
+    if isinstance(node, dict):
+        return [s for k, v in node.items() for s in _scalars(k, _path) + _scalars(v, _path)]
+    if isinstance(node, list):
+        return [s for v in node for s in _scalars(v, _path)]
+    return [str(node)] if isinstance(node, (str, int, float)) and not isinstance(node, bool) else []
+
+
+def _decoded_owner_text(run_dir: str, by: str) -> str:
+    """The question, or the brief as its readers see it: the decoded scalar values
+    of decision_brief.yaml (no YAML quoting or escapes) plus decision_brief.md."""
+    if by == "question":
+        return _owner_texts(run_dir)["question"]
+    parts = []
+    for rel in ("decision_brief.yaml", "decision_brief.md"):
+        p = os.path.join(run_dir, rel)
+        if not os.path.isfile(p):
+            continue
+        try:
+            with open(p, encoding="utf-8") as f:
+                text = f.read()
+            parts += _scalars(yaml.safe_load(text)) if rel.endswith(".yaml") else [text]
+        except (OSError, UnicodeDecodeError, ValueError, yaml.YAMLError):
+            continue
+    return "\n".join(parts)
+
+
+def _decision_quote_found(run_dir: str, by: str, quote) -> bool:
+    q = _norm(quote) if isinstance(quote, str) else ""
+    return len(q.split()) >= 3 and q in _norm(_decoded_owner_text(run_dir, by))
+
+
+def _amendment_names(run_dir: str, aid, fid: str) -> bool:
+    """brief_amendments.yaml has a valid amendment `aid` whose text names `fid`."""
+    if not isinstance(aid, str) or not aid.strip():
+        return False
+    ok, _errors = _sibling("decision_brief")._amendments(run_dir)
+    for am in ok:
+        if str(am.get("id", "")).strip() == aid.strip():
+            text = f"{am.get('change', '')} {am.get('reason', '')}"
+            return re.search(r"(?<![A-Za-z0-9_.-])" + re.escape(fid) + r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9_])", text, re.I) is not None
+    return False
+
+
+def decision_layer_findings(run_dir: str, round_n: int | None = None, allocation: bool | None = None) -> list[dict]:
+    """D9: every decision-layer feature beyond the question and brief changes the
+    recommendation, and reads only what is known at its decision date."""
+    late = "MEDIUM" if round_n is not None and round_n < 2 else "HIGH"
+    doc, bad, _exists = _read_doc(run_dir)
+    if bad:
+        return []              # reported by gate_findings as mechanism_manifest_invalid
+    if doc is None or "decision_layer" not in doc:
+        if allocation is None:
+            allocation = _sibling("alloc_toolkit_use").allocation_present(run_dir)
+        if not allocation:
+            return []
+        return [_f("decision_layer_undeclared", late,
+                   f"This run produces an allocation, and `{PATH}` has no `decision_layer:` list. Under "
+                   "`decision_layer:`, list every rule, constraint, reserve, hedge, cap, threshold or contingency "
+                   "that the optimisation or the decision rule adds beyond the question and the signed brief. "
+                   + _LAYER_HOWTO + " Write `decision_layer: []` if the plan adds nothing beyond them.")]
+    layer = doc["decision_layer"]
+    if not isinstance(layer, list):
+        return [_f("decision_feature_invalid", "HIGH", f"`{PATH}`: `decision_layer:` must be a list. " + _LAYER_HOWTO)]
+    out, seen = [], set()
+    run_date, date_src = None, None
+    for i, e in enumerate(layer):
+        if not isinstance(e, dict) or not isinstance(e.get("id"), str) or not e["id"].strip():
+            out.append(_f("decision_feature_invalid", "HIGH", f"`{PATH}` decision_layer[{i}] has no `id:`."))
+            continue
+        fid = e["id"].strip()
+        if fid in seen:
+            out.append(_f("decision_feature_invalid", "HIGH", f"`{PATH}`: decision feature `{fid}` is listed twice."))
+            continue
+        seen.add(fid)
+        by = str(e.get("specified_by") or "").strip().lower()
+        need = []
+        if str(e.get("kind", "")).strip() != "decision_rule":
+            need.append("`kind: decision_rule`")
+        if not (isinstance(e.get("description"), str) and e["description"].strip()):
+            need.append("a `description`")
+        if by and by not in ("question", "brief"):
+            need.append("`specified_by: question` or `brief`")
+        if not by and not isinstance(e.get("in_recommended_plan"), bool):
+            need.append("`in_recommended_plan: true|false`")
+        own_date = _date(e["decision_date"]) if e.get("decision_date") is not None else None
+        if e.get("decision_date") is not None and own_date is None:
+            need.append("a `decision_date` as YYYY, YYYY-MM or YYYY-MM-DD")
+        info, dated = e.get("information_used"), []
+        if not isinstance(info, list):
+            need.append("an `information_used:` list (`[]` if the rule reads no input)")
+        else:
+            for it in info:
+                d = _date(it.get("available")) if isinstance(it, dict) else None
+                if d is None or not (isinstance(it.get("input"), str) and it["input"].strip()):
+                    need.append(f"`input` and `available: YYYY[-MM[-DD]]` on information_used item {it!r:.80}")
+                else:
+                    dated.append((it["input"].strip(), d))
+        if need:
+            out.append(_f("decision_feature_invalid", "HIGH",
+                          f"`{PATH}`: decision feature `{fid}` needs " + "; ".join(need) + ". " + _LAYER_HOWTO))
+        if dated:
+            when = own_date
+            if when is None:
+                if date_src is None:
+                    run_date, date_src = run_decision_date(run_dir)
+                    if run_date is None:
+                        out.append(_f("decision_layer_date_unknown", "MEDIUM",
+                                      f"No decision date to check the decision features' information against "
+                                      f"({date_src}). Add `decision_date: YYYY-MM` to decision_brief.yaml, or a "
+                                      f"`decision_date` to each feature in `{PATH}`."))
+                when = run_date
+            late_inputs = [f"{n} (available {_fmt(d)})" for n, d in dated
+                           if when is not None and _later(d, when)]
+            if late_inputs:
+                at = _fmt(when)
+                out.append(_f("decision_feature_future_information", "MEDIUM",
+                              f"`{PATH}`: decision feature `{fid}` reads information available only after its decision "
+                              f"date {at}: {'; '.join(late_inputs)[:400]}. Make the rule use what is known at {at} (a "
+                              "forecast or the last observed value), or, if it acts at a later decision point, give "
+                              "the feature that `decision_date`."))
+        if by in ("question", "brief"):
+            if not _decision_quote_found(run_dir, by, e.get("quote")):
+                out.append(_f("decision_feature_quote_unfound", "HIGH",
+                              f"`{PATH}`: decision feature `{fid}` is specified by the {by}, but its `quote` "
+                              f"({str(e.get('quote'))[:120]!r}) is not found verbatim (3+ words) in the run's {by}. "
+                              "Quote the words that specify the feature, or give a sufficiency test instead."))
+            continue
+        rel = e.get("sufficiency_test")
+        res, problem = _test_result(run_dir, rel)
+        if problem:
+            out.append(_f("decision_feature_untested", late,
+                          f"`{PATH}`: decision feature `{fid}` is not specified by the question or brief, and it "
+                          f"{problem}. Solve the decision with and without the feature and record, in that file, "
+                          f"`feature: {fid}`, `varied` (with vs without), the `criterion` for a decision change (the package for a "
+                          "stated share of units, or the headline beyond its uncertainty interval) and "
+                          "`decision_changes: true|false`."))
+            continue
+        bad = []
+        if str(res.get("feature", "")).strip() != fid:
+            bad.append(f"`feature: {fid}` (it says {res.get('feature')!r}): a result file belongs to one feature")
+        var = res.get("varied")
+        if not ((isinstance(var, str) and var.strip()) or (
+                isinstance(var, dict) and all(isinstance(var.get(k), str) and var[k].strip()
+                                              for k in ("with", "without")))):
+            bad.append("`varied:` describing the with/without comparison, as text or as "
+                       f"`{{with: ..., without: ...}}` (got {var!r:.60})")
+        if bad:
+            out.append(_f("decision_feature_invalid", "HIGH",
+                          f"`{rel}`, the sufficiency test of decision feature `{fid}`, needs " + "; ".join(bad) + "."))
+            continue
+        out += _result_conflicts(rel, res, f"decision feature `{fid}`", e.get("decision_changes"))
+        if not res["decision_changes"] and e.get("in_recommended_plan") is True \
+                and not _amendment_names(run_dir, e.get("owner_amendment"), fid):
+            am = e.get("owner_amendment")
+            out.append(_f("decision_feature_no_effect", "HIGH",
+                          f"`{PATH}`: decision feature `{fid}` does not change the recommendation (`{rel}`: "
+                          "decision_changes: false), and it is still in the recommended plan. Remove it from the "
+                          "plan and the decision rule (then set `in_recommended_plan: false`), or keep it through "
+                          "a brief amendment in brief_amendments.yaml whose change or reason names "
+                          f"`{fid}`, cited as `owner_amendment: AM-n`"
+                          + (f" (`owner_amendment: {am!r}` is not a valid amendment naming `{fid}`)." if am else ".")))
+    return out
+
+
+def gate_findings(run_dir: str, round_n: int | None = None, priors=None,
+                  allocation: bool | None = None) -> list[dict]:
     late = "MEDIUM" if round_n is not None and round_n < 2 else "HIGH"
     out: list[dict] = []
     required, err = required_mechanisms(run_dir, priors)
@@ -408,7 +722,7 @@ def gate_findings(run_dir: str, round_n: int | None = None, priors=None) -> list
                           f"(assumption + sufficiency-test result). Sufficiency test: {m.sufficiency_test[:300]}"))
     for mid, e in entries.items():
         out += _check_entry(run_dir, mid, e, late, report)
-    return out
+    return out + decision_layer_findings(run_dir, round_n, allocation)
 
 
 # --------------------------------------------------------------------------- self-test
@@ -549,6 +863,154 @@ def _self_test() -> int:
         w(d, "decision_brief.yaml", yaml.safe_dump({"decision": "Use one pooled subgroup mix for every unit."}))
         w(d, PATH, {"mechanisms": [dict(ent, specified_by="brief", quote="one pooled subgroup mix")]})
         ok(gate_findings(d, 2, P) == [], "MM16g the signed brief can specify the simplification")
+    # Phase 47 γ (D9): decision-layer features.
+    with tempfile.TemporaryDirectory() as d:
+        w(d, "metadata.json", json.dumps({"question": "Allocate the gadget budget across units with a budget cap",
+                                          "decision_year": 2024}))
+        w(d, "decision_brief.yaml", yaml.safe_dump({"constraints": [{"id": "C1", "text": "Total cost at most the "
+                                                                     "stated envelope in every year."}]}))
+        ok(gate_findings(d, 2, []) == [], "DL0 no allocation and no manifest: nothing required")
+        w(d, "models/allocation_plan.csv", "unit,package\nA,x\n")
+        v = gate_findings(d, 2, [])
+        ok(kinds(v) == ["decision_layer_undeclared"] and v[0]["severity"] == "HIGH" and not v[0]["scope_declarable"]
+           and "decision_layer: []" in v[0]["claim"], f"DL1 an allocation with no decision_layer list → HIGH: {v}")
+        ok(gate_findings(d, 1, [])[0]["severity"] == "MEDIUM", "DL1b round 1 is the drafting window")
+        w(d, PATH, {"mechanisms": [], "decision_layer": []})
+        ok(gate_findings(d, 2, []) == [], "DL2 `decision_layer: []` declares nothing beyond the brief")
+        w(d, PATH, {"decision_layer": []})
+        ok(gate_findings(d, 2, []) == [], "DL2b a manifest with only decision_layer (no mechanisms) is valid")
+        feat = {"id": "price_reserve", "kind": "decision_rule", "description": "hold back a contingency reserve",
+                "in_recommended_plan": True, "sufficiency_test": "models/sufficiency/price_reserve.yaml",
+                "information_used": [{"input": "unit price list", "available": "2023-10"}]}
+        w(d, PATH, {"decision_layer": [{k: v for k, v in feat.items() if k != "sufficiency_test"}]})
+        v = gate_findings(d, 2, [])
+        ok(kinds(v) == ["decision_feature_untested"] and v[0]["severity"] == "HIGH",
+           f"DL3 a declared feature with no test result → HIGH: {v}")
+        w(d, PATH, {"decision_layer": [feat]})
+        w(d, "models/sufficiency/price_reserve.yaml", {"feature": "price_reserve", "varied": "the plan with and without the reserve",
+                                                       "criterion": "package changes in >5% of units",
+                                                       "decision_changes": False, "share_units_changed": 0.0,
+                                                       "share_threshold": 0.05})
+        v = gate_findings(d, 2, [])
+        ok(kinds(v) == ["decision_feature_no_effect"] and v[0]["severity"] == "HIGH" and not v[0]["scope_declarable"],
+           f"DL4 a feature whose test shows no change, still in the plan → HIGH: {v}")
+        w(d, PATH, {"decision_layer": [dict(feat, in_recommended_plan=False)]})
+        ok(gate_findings(d, 2, []) == [], "DL4b removed from the plan: the entry stays as the record, no finding")
+        w(d, "brief_amendments.yaml", {"amendments": [{"id": "AM-1", "item": "C1", "change": "keep price_reserve "
+                                       "in the plan", "reason": "owner wants the reserve although it changes nothing"}]})
+        w(d, PATH, {"decision_layer": [dict(feat, owner_amendment="AM-1")]})
+        ok(gate_findings(d, 2, []) == [], "DL4c kept by a brief amendment that names it")
+        w(d, PATH, {"decision_layer": [dict(feat, owner_amendment="AM-2")]})
+        ok(kinds(gate_findings(d, 2, [])) == ["decision_feature_no_effect"], "DL4d an unknown amendment does not keep it")
+        w(d, "models/sufficiency/price_reserve.yaml", {"feature": "price_reserve", "varied": "with and without", "criterion": "c",
+                                                       "decision_changes": True})
+        w(d, PATH, {"decision_layer": [feat]})
+        ok(gate_findings(d, 2, []) == [], f"DL5 a feature that changes the decision: none {gate_findings(d, 2, [])}")
+        w(d, PATH, {"decision_layer": [dict(feat, decision_changes=False)]})
+        ok(kinds(gate_findings(d, 2, [])) == ["mechanism_manifest_invalid"], "DL5b a restated verdict must match")
+        brief_feat = {"id": "annual_cap", "kind": "decision_rule", "description": "cost cap per year",
+                      "specified_by": "brief", "quote": "at most the stated envelope in every year",
+                      "information_used": []}
+        w(d, PATH, {"decision_layer": [brief_feat]})
+        ok(gate_findings(d, 2, []) == [], "DL6 a brief-specified feature needs no test")
+        w(d, PATH, {"decision_layer": [dict(brief_feat, quote="a cap the brief never mentions")]})
+        ok(kinds(gate_findings(d, 2, [])) == ["decision_feature_quote_unfound"], "DL6b its quote must be in the brief")
+        w(d, PATH, {"decision_layer": [dict(feat, information_used=[{"input": "realised year-3 costs",
+                                                                       "available": 2027}])]})
+        v = gate_findings(d, 2, [])
+        ok(kinds(v) == ["decision_feature_future_information"] and v[0]["severity"] == "MEDIUM"
+           and not v[0]["scope_declarable"], f"DL7 post-decision information → MEDIUM: {v}")
+        w(d, PATH, {"decision_layer": [dict(feat, decision_date="2027-06", information_used=[
+            {"input": "realised year-3 costs", "available": 2027}])]})
+        ok(gate_findings(d, 2, []) == [], "DL7b same year at the coarser precision is not later")
+        w(d, PATH, {"decision_layer": [dict(feat, information_used=[{"input": "survey", "available": 2024}])]})
+        ok(gate_findings(d, 2, []) == [], "DL7c available in the decision year is not later")
+        w(d, "decision_brief.yaml", yaml.safe_dump({"decision_date": "2023-06"}))
+        ok(kinds(gate_findings(d, 2, [])) == ["decision_feature_future_information"],
+           "DL7d the brief's decision_date takes precedence over the decision year")
+        w(d, "decision_brief.yaml", "{}\n")
+        w(d, "metadata.json", json.dumps({"question": "Allocate the gadget budget"}))
+        ok("decision_layer_date_unknown" in kinds(gate_findings(d, 2, [])), "DL7e no decision date: MEDIUM")
+        for bad in ({"decision_layer": {"price_reserve": feat}},
+                    {"decision_layer": [dict(feat, kind="mechanism")]},
+                    {"decision_layer": [{k: v for k, v in feat.items() if k != "information_used"}]},
+                    {"decision_layer": [dict(feat, information_used=[{"input": "prices", "available": "soon"}])]},
+                    {"decision_layer": [{k: v for k, v in feat.items() if k != "in_recommended_plan"}]},
+                    {"decision_layer": [feat, feat]}):
+            w(d, PATH, bad)
+            ok("decision_feature_invalid" in kinds(gate_findings(d, 2, [])), f"DL8 malformed entry fails closed: {bad}")
+        w(d, PATH, "decision_layer: [")
+        ok(kinds(gate_findings(d, 2, [])) == ["mechanism_manifest_invalid"], "DL9 unparseable manifest fails closed")
+        w(d, PATH, {"decision_layer": [feat]})
+        w(d, "models/sufficiency/price_reserve.yaml", "varied: [")
+        ok("decision_feature_untested" in kinds(gate_findings(d, 2, [])), "DL9b unparseable result fails closed")
+    # Codex round 1 on #71 (P1-1..5).
+    with tempfile.TemporaryDirectory() as d:
+        w(d, "metadata.json", json.dumps({"question": "Allocate the gadget budget", "decision_year": 2024}))
+        w(d, "models/allocation_plan.csv", "unit,package\nA,x\n")
+        res = {"feature": "price_reserve", "varied": "with and without the reserve", "criterion": "c",
+               "decision_changes": False}
+        feat = {"id": "price_reserve", "kind": "decision_rule", "description": "reserve", "in_recommended_plan": True,
+                "sufficiency_test": "models/sufficiency/price_reserve.yaml", "information_used": []}
+        w(d, "models/sufficiency/supply_cap.yaml", dict(res, feature="supply_cap", decision_changes=True))
+        w(d, PATH, {"decision_layer": [dict(feat, sufficiency_test="models/sufficiency/supply_cap.yaml")]})
+        v = gate_findings(d, 2, [])
+        ok(kinds(v) == ["decision_feature_invalid"] and "supply_cap" in v[0]["claim"],
+           f"DL10 a feature citing another feature's result file → HIGH invalid: {v}")
+        w(d, "models/sufficiency/price_reserve.yaml", {k: x for k, x in res.items() if k != "feature"})
+        w(d, PATH, {"decision_layer": [feat]})
+        ok(kinds(gate_findings(d, 2, [])) == ["decision_feature_invalid"], "DL10b a result file must name its feature")
+        for var in (True, 3, {"with": "plan A"}, ""):
+            w(d, "models/sufficiency/price_reserve.yaml", dict(res, varied=var))
+            ok(kinds(gate_findings(d, 2, [])) in (["decision_feature_invalid"], ["decision_feature_untested"]),
+               f"DL11 `varied: {var!r}` is not a with/without comparison")
+        w(d, "models/sufficiency/price_reserve.yaml", dict(res, varied={"with": "plan A", "without": "plan B"},
+                                                           decision_changes=True))
+        ok(gate_findings(d, 2, []) == [], "DL11b a structured {with, without} comparison is accepted")
+        w(d, "models/sufficiency/price_reserve.yaml", res)
+        cap = dict(feat, id="cap", owner_amendment="AM-1", sufficiency_test="models/sufficiency/cap.yaml")
+        w(d, "models/sufficiency/cap.yaml", dict(res, feature="cap"))
+        w(d, "brief_amendments.yaml", {"amendments": [{"id": "AM-1", "item": "C1", "change": "plan for capacity",
+                                                       "reason": "the owner asked for a capacity statement"}]})
+        w(d, PATH, {"decision_layer": [cap]})
+        ok(kinds(gate_findings(d, 2, [])) == ["decision_feature_no_effect"],
+           "DL12 an amendment matching the id only inside a word (`cap` in `capacity`) does not keep it")
+        w(d, "brief_amendments.yaml", {"amendments": [{"id": "AM-1", "item": "C1", "change": "keep `cap` in the plan",
+                                                       "reason": "the owner wants the cap although it changes nothing"}]})
+        ok(gate_findings(d, 2, []) == [], "DL12b the complete identifier keeps it")
+        w(d, "brief_amendments.yaml", {"amendments": [{"id": "AM-1", "item": "C1", "change": "keep cap.v2 in the plan",
+                                                       "reason": "the owner wants the second version"}]})
+        ok(kinds(gate_findings(d, 2, [])) == ["decision_feature_no_effect"],
+           "DL12c another id that extends this one (`cap.v2`) does not keep `cap`")
+        w(d, "brief_amendments.yaml", {"amendments": [{"id": "AM-1", "item": "C1", "change": "the plan keeps cap.",
+                                                       "reason": "the owner wants it although it changes nothing"}]})
+        ok(gate_findings(d, 2, []) == [], "DL12d a sentence-final period still ends the id")
+        w(d, "decision_brief.yaml", "constraints:\n  - {id: C1, text: 'Respect the owner''s annual   cap on spend'}\n")
+        bf = {"id": "annual_cap", "kind": "decision_rule", "description": "d", "specified_by": "brief",
+              "quote": "respect the owner's annual cap", "information_used": []}
+        w(d, PATH, {"decision_layer": [bf]})
+        ok(gate_findings(d, 2, []) == [], f"DL13 a quote is matched against the decoded brief, not its YAML escaping: "
+                                          f"{gate_findings(d, 2, [])}")
+        w(d, "decision_brief.yaml", "constraints:\n  - {id: C1, text: 'Respect the owner''s annual cap on spend'}\n"
+                                    "notes: &n [*n]\n")
+        try:
+            got13 = kinds(gate_findings(d, 2, []))
+        except RecursionError:
+            got13 = ["raised RecursionError"]
+        ok(got13 == ["decision_feature_quote_unfound"],
+           f"DL13b a recursive alias in the brief fails closed (quote not found), not a crash: {got13}")
+        w(d, "decision_brief.yaml", "constraints:\n  - {id: C1, text: 'Respect the owner''s annual   cap on spend'}\n")
+        w(d, PATH, "decision_layer:\n  - id: annual_cap\n    decision_date: 2026-02-30\n")
+        ok(kinds(gate_findings(d, 2, [])) == ["mechanism_manifest_invalid"],
+           "DL14 an unquoted impossible date fails closed with a finding, not a crash")
+        w(d, PATH, {"decision_layer": [dict(bf, decision_date="2026-02-30")]})
+        ok(kinds(gate_findings(d, 2, [])) == ["decision_feature_invalid"], "DL14b a quoted impossible date is invalid")
+        ok(_date("2024-02-29") == (2024, 2, 29) and _date("2026-13") is None, "DL14c calendar arithmetic")
+        w(d, "decision_brief.yaml", "decision_date: 2026-02-30\n")
+        w(d, PATH, {"decision_layer": [dict(feat, information_used=[{"input": "x", "available": 2020}])]})
+        w(d, "models/sufficiency/price_reserve.yaml", dict(res, decision_changes=True))
+        ok(kinds(gate_findings(d, 2, [])) == ["decision_layer_date_unknown"],
+           "DL14d an impossible date in the brief: no decision date (MEDIUM), not a crash")
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
         return 1
