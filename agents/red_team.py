@@ -145,7 +145,16 @@ deeper.
    intervention whose effect size comes from trials or meta-analyses (an
    efficacy, a risk ratio) has a trial effect, even if the model uses it as
    an input. Challenge any such exemption as a HIGH METHODS finding.
-9. `{run_dir}/critique_methods.yaml`, `critique_domain.yaml`,
+9. `{run_dir}/models/mechanism_manifest.yaml` `decision_layer:` (Phase 47 γ,
+   D9), when the run has an allocation. Every rule, constraint, reserve,
+   hedge, cap, threshold or contingency the optimisation or decision rule
+   adds beyond the question and signed brief must be listed there; the gate
+   checks the listed ones (with/without test, dates of the information
+   used) but cannot see an unlisted one. Compare decision_rule.md, the
+   optimizer code and in-run brief amendments to constraints with the list.
+   An unlisted feature in the recommended plan is a HIGH METHODS blocker
+   whose fix is: list it with a with/without test, or remove it.
+10. `{run_dir}/critique_methods.yaml`, `critique_domain.yaml`,
    `critique_presentation.yaml` (when they exist — they run in
    parallel with you) — on round ≥ 2, also your prior round's
    `critique_redteam.yaml`.
