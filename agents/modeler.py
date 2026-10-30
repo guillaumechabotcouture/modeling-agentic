@@ -603,6 +603,7 @@ the report yourself. For long producer runs, launch with
 `nohup python3 scripts/<producer>.py {run_dir} > {run_dir}/models/<producer>.log 2>&1 &`
 inside one Bash call and poll it in the foreground with a bounded loop;
 `run_in_background` is not available.
+Stop a process only by the PID you recorded when starting it (`... & echo $! > {run_dir}/models/<name>.pid`, then `kill <pid>`): kills chosen by pattern (pkill, killall, `kill $(pgrep ...)`, `ps | grep | xargs kill`) are refused because they can match the pipeline's own session.
 
 ### Rigor artifact timeline (Phase 9 Commit τ — draft early, iterate)
 
