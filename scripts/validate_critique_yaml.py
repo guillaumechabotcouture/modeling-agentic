@@ -1222,33 +1222,130 @@ def _check_surrogate_uq_documented(run_dir: str) -> list[dict]:
 # calibration targets (CI ~ 1e-7 of the target value). Looser would miss
 # them; tighter would flag legitimately well-constrained outputs.
 _CI_DEGENERATE_THRESHOLD = 0.005
+# Phase 45 α (A12): an output whose report entry carries `p_nonzero` at or
+# below this value (zero in >= 50% of draws) is judged as a rare event, on
+# p_nonzero, not on quantile width. Same boundary as
+# propagate_uncertainty.RARE_EVENT_ZERO_FRACTION; a p_nonzero above it is
+# ignored so a producer field cannot move an ordinary output off the
+# width rule.
+_RARE_EVENT_MAX_P_NONZERO = 0.5
+# Phase 45 α (A11): variants named in one family finding before "+N more".
+_UQ_FAMILY_LIST_CAP = 6
 
 
-def _load_uq_deterministic_declarations(run_dir: str) -> dict[str, str]:
-    """Phase 21 β: outputs the modeler declares deterministic by design
-    (e.g. total spend under a binding budget constraint), with a reason.
+def _uq_invalid_declaration(claim: str) -> dict:
+    return {"kind": "uq_declarations_invalid", "severity": "HIGH",
+            "stage": "UQ", "scope_declarable": False,
+            "claim": f"models/uq_declarations.yaml: {claim}"}
 
-    Read from `models/uq_declarations.yaml`:
-        deterministic_outputs:
-          total_cost: "Budget constraint binds; spend equals the envelope."
-    and from per-output `deterministic: true` + `deterministic_reason:` in
-    uncertainty_report.yaml. Entries without a non-empty reason are ignored.
+
+def _load_uq_declarations(run_dir: str) -> tuple[
+        dict[str, str], dict[str, tuple[str, float]], list[dict]]:
+    """Phase 21 β / Phase 45 α: outputs the modeler declares fixed by
+    design, read from `models/uq_declarations.yaml`:
+
+        deterministic_outputs:        # output name → reason
+          planned_cost: "Fixed by the plan; no sampled input enters it."
+        pinned_by_constraint:         # output name or family → constraint
+          total_cost:
+            constraint: budget_envelope
+            value: 320000000
+
+    Returns (deterministic, pinned, findings). A `deterministic_outputs`
+    entry without a non-empty reason is ignored (the output then flags).
+    A `pinned_by_constraint` entry needs a non-empty `constraint` and a
+    finite, non-zero `value`; it exempts an output only when the output's
+    mean and 95% bounds sit at that value (see `_uq_pinned_at`), so the
+    reason alone never exempts. An output pinned at zero is not held there
+    by a constraint — declare it deterministic with a reason, or report it
+    as a rare event. Fails closed: an unparseable file, a section that is
+    not a mapping, or a malformed pinned entry is HIGH
+    `uq_declarations_invalid` and the entry exempts nothing.
     """
-    out: dict[str, str] = {}
+    deterministic: dict[str, str] = {}
+    pinned: dict[str, tuple[str, float]] = {}
     path = os.path.join(run_dir, "models", "uq_declarations.yaml")
-    doc, _ = safe_load_mapping(path, "uq_declarations")
-    if doc:
-        decl = doc.get("deterministic_outputs")
-        if isinstance(decl, dict):
-            for k, v in decl.items():
-                if isinstance(v, str) and v.strip():
-                    out[str(k)] = v.strip()
+    doc, findings = safe_load_mapping(path, "uq_declarations", stage="UQ",
+                                      display_path="models/uq_declarations.yaml")
+    findings = [{**f, "scope_declarable": False} for f in findings]
+    if not doc:
+        return deterministic, pinned, findings
+    decl = doc.get("deterministic_outputs")
+    if isinstance(decl, dict):
+        for k, v in decl.items():
+            if isinstance(v, str) and v.strip():
+                deterministic[str(k)] = v.strip()
+    elif decl is not None:
+        findings.append(_uq_invalid_declaration(
+            f"`deterministic_outputs` must map output → reason, got "
+            f"{type(decl).__name__}."))
+    pins = doc.get("pinned_by_constraint")
+    if isinstance(pins, dict):
+        for k, v in pins.items():
+            spec = v if isinstance(v, dict) else {}
+            name = str(spec.get("constraint") or "").strip()
+            value = finite_number(spec.get("value"))
+            if not name or value is None or value == 0:
+                findings.append(_uq_invalid_declaration(
+                    f"`pinned_by_constraint.{k}` needs `constraint: <name>` "
+                    f"and a finite non-zero `value:` (the number the "
+                    f"constraint fixes the output at), got {v!r}. The entry "
+                    f"exempts nothing."))
+                continue
+            pinned[str(k)] = (name, value)
+    elif pins is not None:
+        findings.append(_uq_invalid_declaration(
+            f"`pinned_by_constraint` must map output or family → "
+            f"{{constraint, value}}, got {type(pins).__name__}."))
+    return deterministic, pinned, findings
+
+
+def _uq_pinned_at(value: float, *points: float) -> bool:
+    """Every point (mean, ci_low, ci_high) within the degeneracy threshold
+    of the declared constraint value, relative to the value."""
+    return all(abs(x - value) <= _CI_DEGENERATE_THRESHOLD * abs(value)
+               for x in points)
+
+
+def _uq_output_families(names: list[str]) -> dict[str, str]:
+    """Phase 45 α (A11): output name → family name, so one defect repeated
+    across plan variants is one finding.
+
+    1. A variant prefix is everything before the last `__`
+       (`planA__total_cost` → `total_cost`).
+    2. A leading `<token>_` is then also stripped when the token is an
+       `_`-separated part of some variant prefix in the same report AND the
+       remainder is itself the base name of another output
+       (`alt_total_cost` → `total_cost` when `x_alt__…` and `total_cost`
+       exist). Both conditions keep ordinary names (`net_cost`) intact.
+    Deterministic; a name matching neither rule is its own family.
+    """
+    bases: dict[str, str] = {}
+    tokens: set[str] = set()
+    for n in names:
+        prefix, sep, base = n.rpartition("__")
+        if sep and base and prefix:
+            bases[n] = base
+            tokens.update(t for t in prefix.split("_") if t)
+        else:
+            bases[n] = n
+    base_set = set(bases.values())
+    out = {}
+    for n, b in bases.items():
+        tok, sep, rest = b.partition("_")
+        out[n] = rest if sep and rest and tok in tokens and rest in base_set else b
     return out
 
 
+def _uq_family_list(outputs: list[str]) -> str:
+    shown = ", ".join(outputs[:_UQ_FAMILY_LIST_CAP])
+    more = len(outputs) - _UQ_FAMILY_LIST_CAP
+    return shown + (f", +{more} more" if more > 0 else "")
+
+
 def _check_uq_ci_quality(uq_report_path: str) -> list[dict]:
-    """Phase 4 Commit α / Phase 21 β: scan uncertainty_report.yaml for
-    degenerate and non-finite intervals.
+    """Phase 4 Commit α / Phase 21 β / Phase 45 α: scan
+    uncertainty_report.yaml for degenerate and non-finite intervals.
 
     `ci_degenerate` fires when an output's 95% CI relative width
     (ci_high - ci_low) / |mean| is below 0.5% (or the width is exactly 0)
@@ -1256,9 +1353,21 @@ def _check_uq_ci_quality(uq_report_path: str) -> list[dict]:
     HIGH and made it NOT scope-declarable: 2026-05-03_235631 shipped 9/9
     zero-width outputs as MEDIUM while the report printed a wide CI for
     the same quantity. An output that is deterministic by design is
-    exempted only by an explicit declaration with a reason
-    (models/uq_declarations.yaml `deterministic_outputs:` or per-output
-    `deterministic: true` + `deterministic_reason:`).
+    exempted only by an explicit declaration (`_load_uq_declarations`):
+    `deterministic_outputs:` with a reason, per-output `deterministic: true`
+    + `deterministic_reason:`, or `pinned_by_constraint:` whose stated value
+    the output's mean and bounds actually sit at.
+
+    Phase 45 α: findings are grouped per output family
+    (`_uq_output_families`) — one `ci_degenerate` per family, listing its
+    degenerate variants (attempt 8: 64 findings, 9 families). A rare-event
+    output (`p_nonzero` <= 0.5, written by propagate_uncertainty.py) is
+    judged on p_nonzero, not on quantile width: degenerate only when
+    p_nonzero is 0 or 1 to within its binomial SE, i.e. whether the event
+    occurs never varies across draws.
+    `uq_mean_outside_ci` (MEDIUM, per family) fires when a mean lies
+    outside its own [ci_low, ci_high] — a summary that misreports a
+    zero-inflated output.
 
     `uq_output_nonfinite` (HIGH) fires on NaN/inf mean or bounds; an
     unparseable / non-mapping report is `uncertainty_report_invalid` (HIGH).
@@ -1272,18 +1381,25 @@ def _check_uq_ci_quality(uq_report_path: str) -> list[dict]:
         return violations
 
     run_dir = os.path.dirname(uq_report_path)
-    declared = _load_uq_deterministic_declarations(run_dir)
+    declared, pinned, decl_findings = _load_uq_declarations(run_dir)
+    violations.extend(decl_findings)
     n_draws = finite_number(report.get("n_successful"))
     if n_draws is None:
         n_draws = finite_number(report.get("n_draws"))
     multi_draw = n_draws is None or n_draws > 1
+    n_txt = int(n_draws) if n_draws is not None else "?"
     # Phase 21 δ: propagate_uncertainty.py now lists degenerate outputs
     # itself; trust-but-verify — honor its list AND keep the width check
     # for reports that predate the field.
     flagged = report.get("degenerate_outputs")
     flagged = {str(x) for x in flagged} if isinstance(flagged, list) else set()
+    family_of = _uq_output_families([str(k) for k in report["scalar_outputs"]])
+    degenerate_by_family: dict[str, list[tuple[str, str]]] = {}
+    outside_by_family: dict[str, list[tuple[str, str]]] = {}
 
     for output_name, stats in report["scalar_outputs"].items():
+        output_name = str(output_name)
+        family = family_of[output_name]
         if not isinstance(stats, dict):
             violations.append({
                 "kind": "uncertainty_report_invalid",
@@ -1319,14 +1435,54 @@ def _check_uq_ci_quality(uq_report_path: str) -> list[dict]:
             })
             continue
         mean_f, lo_f, hi_f = vals["mean"], vals["ci_low"], vals["ci_high"]
+        rare = None
+        if stats.get("p_nonzero") is not None:
+            p = finite_number(stats.get("p_nonzero"))
+            if p is None or not 0 <= p <= 1:
+                violations.append({
+                    "kind": "uncertainty_report_invalid",
+                    "severity": "HIGH",
+                    "stage": "UQ",
+                    "scope_declarable": False,
+                    "claim": (f"scalar_outputs.{output_name}.p_nonzero must "
+                              f"be a probability, got "
+                              f"{stats.get('p_nonzero')!r}."),
+                })
+                continue
+            n_out = finite_number(stats.get("n")) or n_draws
+            if p <= _RARE_EVENT_MAX_P_NONZERO and n_out and n_out > 0:
+                rare = (p, (p * (1 - p) / n_out) ** 0.5)
+        # Phase 45 α (A12): a mean outside its own interval is a reporting
+        # defect for any output (inverted bounds are ci_degenerate below).
+        # The absolute floor absorbs float residue (a mean of 2e-9 over
+        # all-zero bounds is a summation artefact, not a reporting defect).
+        eps = max(1e-6, 1e-9 * max(abs(lo_f), abs(hi_f)))
+        if lo_f <= hi_f and not lo_f - eps <= mean_f <= hi_f + eps:
+            outside_by_family.setdefault(family, []).append((output_name, (
+                f"{output_name} mean {mean_f:.6g} vs 95% CI "
+                f"[{lo_f:.6g}, {hi_f:.6g}]"
+                + (f", p_nonzero {rare[0]:.3g}" if rare else ""))))
         if not multi_draw:
             continue  # effort floors own the n_draws minimum
         if output_name in declared or (
                 stats.get("deterministic") is True
                 and str(stats.get("deterministic_reason") or "").strip()):
             continue
+        pin = pinned.get(output_name) or pinned.get(family)
+        pin_note = ""
+        if pin is not None:
+            if _uq_pinned_at(pin[1], mean_f, lo_f, hi_f):
+                continue
+            pin_note = (f"; declared pinned_by_constraint {pin[0]} = "
+                        f"{pin[1]:.6g}, but the output does not sit at it")
         width = hi_f - lo_f
-        if abs(mean_f) < 1e-9:
+        if rare is not None:
+            p, se = rare
+            degenerate = p - se <= 0 or p + se >= 1
+            rel_txt = (f"a rare event: p_nonzero {p:.3g} (SE {se:.2g}) "
+                       f"{'does not vary' if degenerate else 'varies'} "
+                       f"across draws")
+        elif abs(mean_f) < 1e-9:
             degenerate = width <= 0
             rel_txt = "zero width"
         else:
@@ -1339,25 +1495,53 @@ def _check_uq_ci_quality(uq_report_path: str) -> list[dict]:
             if diag:
                 rel_txt += f"; producer diagnostic: {diag}"
         if degenerate:
-            violations.append({
-                "kind": "ci_degenerate",
-                "severity": "HIGH",
-                "stage": "UQ",
-                "scope_declarable": False,
-                "claim": (
-                    f"{output_name} 95% CI [{lo_f:.6g}, {hi_f:.6g}] is "
-                    f"{rel_txt} after "
-                    f"{int(n_draws) if n_draws is not None else '?'} draws. "
-                    f"Either the sampled parameters never reach this "
-                    f"output (frozen in outcome_fn, surrogate flattening, "
-                    f"parameters not wired through), or it is "
-                    f"deterministic by design — then declare it in "
-                    f"models/uq_declarations.yaml `deterministic_outputs:` "
-                    f"with a reason and report it as a point estimate. "
-                    f"Any interval quoted elsewhere for this output is "
-                    f"unsupported."
-                ),
-            })
+            degenerate_by_family.setdefault(family, []).append((output_name, (
+                f"{output_name} 95% CI [{lo_f:.6g}, {hi_f:.6g}] is "
+                f"{rel_txt}{pin_note}")))
+
+    for family, items in degenerate_by_family.items():
+        outputs = [n for n, _ in items]
+        example = next((d for _, d in items if "pinned_by_constraint" in d),
+                       items[0][1])
+        violations.append({
+            "kind": "ci_degenerate",
+            "severity": "HIGH",
+            "stage": "UQ",
+            "scope_declarable": False,
+            "family": family,
+            "outputs": outputs,
+            "claim": (
+                f"{family}: degenerate 95% CI in {len(outputs)} output(s) "
+                f"after {n_txt} draws ({_uq_family_list(outputs)}). "
+                f"Example: {example}. "
+                f"Either the sampled parameters never reach this "
+                f"output (frozen in outcome_fn, surrogate flattening, "
+                f"parameters not wired through), or it is "
+                f"deterministic by design — then declare it in "
+                f"models/uq_declarations.yaml (`deterministic_outputs:` "
+                f"with a reason, or `pinned_by_constraint:` with the "
+                f"binding constraint and the value it fixes) and report "
+                f"it as a point estimate. Any interval quoted elsewhere "
+                f"for this output is unsupported."
+            ),
+        })
+    for family, items in outside_by_family.items():
+        outputs = [n for n, _ in items]
+        violations.append({
+            "kind": "uq_mean_outside_ci",
+            "severity": "MEDIUM",
+            "stage": "UQ",
+            "family": family,
+            "outputs": outputs,
+            "claim": (
+                f"{family}: the mean lies outside its own 95% CI in "
+                f"{len(outputs)} output(s) ({_uq_family_list(outputs)}). "
+                f"Example: {items[0][1]}. Quoting mean [ci_low, ci_high] "
+                f"for such an output misreports it. For an output that is "
+                f"zero in most draws, report its p_nonzero and "
+                f"mean_if_nonzero from uncertainty_report.yaml instead."
+            ),
+        })
     return violations
 
 
@@ -6009,6 +6193,95 @@ def _run_self_test() -> int:
                                "    ci_high: 5\n")
         ok(any(v["kind"] == "ci_degenerate" for v in v10),
            f"A10: producer-flagged degenerate output fires, got {v10}")
+
+        # Phase 45 α (A11-A13): family grouping, rare events, pinned outputs.
+        def _decl(text):
+            os.makedirs(os.path.join(d, "models"), exist_ok=True)
+            pth = os.path.join(d, "models", "uq_declarations.yaml")
+            if text is None:
+                if os.path.exists(pth):
+                    os.remove(pth)
+                return
+            with open(pth, "w") as f:
+                f.write(text)
+
+        def _kinds(vs):
+            return sorted(v["kind"] for v in vs)
+        pinned_cost = ("    mean: 320000000\n    ci_low: 319987000\n"
+                       "    ci_high: 320000000\n    n: 200\n")
+        fam_report = ("n_successful: 200\nscalar_outputs:\n"
+                      + "".join(f"  {n}:\n{pinned_cost}" for n in (
+                          "total", "planA__total", "planB_alt__total",
+                          "alt_total"))
+                      + "  net_cost:\n    mean: 5\n    ci_low: 5\n"
+                        "    ci_high: 5\n"
+                        "  planA__overrun:\n    mean: 0\n    ci_low: 0\n"
+                        "    ci_high: 0\n")
+        _decl(None)
+        g1 = _uq("uq_g1.yaml", fam_report)
+        fams = {v["family"]: v["outputs"] for v in g1
+                if v["kind"] == "ci_degenerate"}
+        ok(fams == {"total": ["total", "planA__total", "planB_alt__total",
+                              "alt_total"],
+                    "net_cost": ["net_cost"], "overrun": ["planA__overrun"]}
+           and all(v["severity"] == "HIGH" and v["scope_declarable"] is False
+                   for v in g1),
+           f"G1: one HIGH finding per family (prefix + scenario token), "
+           f"net_cost kept apart; got {fams}")
+        ok(_uq_output_families(["net_cost", "cost"]) ==
+           {"net_cost": "net_cost", "cost": "cost"},
+           "G2: a leading token not used in any variant prefix is not stripped")
+        z1 = _uq("uq_z1.yaml", "n_successful: 200\nscalar_outputs:\n"
+                 "  cuts:\n    mean: 0.16\n    ci_low: 0\n    ci_high: 0\n"
+                 "    n: 200\n    p_nonzero: 0.02\n")
+        ok(_kinds(z1) == ["uq_mean_outside_ci"]
+           and z1[0]["severity"] == "MEDIUM",
+           f"Z1: rare event whose p_nonzero varies → not degenerate; mean "
+           f"outside [0, 0] → MEDIUM uq_mean_outside_ci; got {z1}")
+        z2 = _uq("uq_z2.yaml", "n_successful: 200\nscalar_outputs:\n"
+                 "  cuts:\n    mean: 1\n    ci_low: 0\n    ci_high: 5\n"
+                 "    n: 200\n    p_nonzero: 0.0\n")
+        ok(_kinds(z2) == ["ci_degenerate"] and "does not vary" in z2[0]["claim"],
+           f"Z2: rare-event path judges on p_nonzero (never varies → "
+           f"degenerate) even with wide quantiles; got {z2}")
+        z3 = _uq("uq_z3.yaml", "scalar_outputs:\n  cuts:\n    mean: 1\n"
+                 "    ci_low: 0\n    ci_high: 5\n    p_nonzero: 1.5\n")
+        ok(_kinds(z3) == ["uncertainty_report_invalid"],
+           f"Z3: p_nonzero outside [0, 1] fails closed; got {z3}")
+        z4 = _uq("uq_z4.yaml", "scalar_outputs:\n  x:\n    mean: 3\n"
+                 "    ci_low: 3\n    ci_high: 3\n    p_nonzero: 0.9\n")
+        ok(_kinds(z4) == ["ci_degenerate"],
+           f"Z4: p_nonzero > 0.5 does not move an output off the width "
+           f"rule; got {z4}")
+        _decl("pinned_by_constraint:\n  total:\n    constraint: budget\n"
+              "    value: 320000000\n")
+        c1 = _uq("uq_g1.yaml", fam_report)
+        ok({v.get("family") for v in c1} == {"net_cost", "overrun"},
+           f"C1: family pinned at its stated constraint value is exempt; "
+           f"overrun (downstream of the rule) still flags; got {c1}")
+        _decl("pinned_by_constraint:\n  total:\n    constraint: budget\n"
+              "    value: 300000000\n")
+        c2 = _uq("uq_g1.yaml", fam_report)
+        ok(any(v.get("family") == "total" and "does not sit at it" in v["claim"]
+               for v in c2),
+           f"C2: declared value the draws do not sit at → still flagged; "
+           f"got {c2}")
+        _decl("pinned_by_constraint:\n  total: 'budget binds'\n"
+              "  net_cost:\n    constraint: cap\n    value: 0\n")
+        c3 = _uq("uq_g1.yaml", fam_report)
+        ok(_kinds(c3).count("uq_declarations_invalid") == 2
+           and {v.get("family") for v in c3 if v["kind"] == "ci_degenerate"}
+           == {"total", "net_cost", "overrun"},
+           f"C3: free-text or zero-value pin is invalid and exempts "
+           f"nothing; got {_kinds(c3)}")
+        _decl("pinned_by_constraint: [total\n")
+        c4 = _uq("uq_g1.yaml", fam_report)
+        ok(any(v["kind"] == "uq_declarations_invalid" and v["severity"] == "HIGH"
+               and is_non_declarable(v["kind"], v.get("scope_declarable"))
+               for v in c4)
+           and sum(v["kind"] == "ci_degenerate" for v in c4) == 3,
+           f"C4: unparseable declarations fail closed; got {_kinds(c4)}")
+        _decl(None)
 
     # --- Phase 21 β: closed verdict vocabularies + producer stamps ---
     with tempfile.TemporaryDirectory() as d:
