@@ -1906,12 +1906,14 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
             try:
                 import asyncio
                 rep = await asyncio.to_thread(derived_rebuild.rebuild, run_path,
-                                              budget_s=max(0.0, derived_rebuild.HOOK_BUDGET_S - used))
+                                              budget_s=max(0.0, derived_rebuild.HOOK_BUDGET_S - used),
+                                              integrity=integrity)
                 line = derived_rebuild.summary_line(rep)
                 print(f"[REBUILD] {line}", flush=True)
                 _safe_write(trace_file, {"ts": datetime.now().isoformat(), "type": "derived_rebuild",
                                          "after": agent_type, "summary": line,
                                          "rebuilt": len(rep["rebuilt"]), "still_stale": rep["still_stale"],
+                                         "provenance_rerecorded": rep.get("provenance_rerecorded", []),
                                          "failed": [r["script"] for r in rep["runs"] if r["returncode"] != 0]})
             except Exception as e:  # noqa: BLE001 — a rebuild failure must not end the session
                 print(f"[REBUILD] failed: {type(e).__name__}: {e}", flush=True)

@@ -519,7 +519,8 @@ def _rebuild_derived(run_path: str, integrity=None) -> None:
                 print("[PIPELINE] " + derived_rebuild.pipeline.summary_line(rep), flush=True)
             except Exception as e:  # noqa: BLE001
                 print(f"[PIPELINE] failed: {type(e).__name__}: {e}", flush=True)
-        print("[REBUILD] " + derived_rebuild.summary_line(derived_rebuild.rebuild(run_path)), flush=True)
+        print("[REBUILD] " + derived_rebuild.summary_line(derived_rebuild.rebuild(run_path, integrity=integrity)),
+              flush=True)
     except Exception as e:  # noqa: BLE001
         print(f"[REBUILD] failed: {type(e).__name__}: {e}", flush=True)
 
