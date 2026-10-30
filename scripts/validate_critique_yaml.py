@@ -1317,32 +1317,35 @@ def _uq_constant(mean: float, lo: float, hi: float) -> bool:
 
 def _uq_output_families(names: list[str]) -> dict[str, str]:
     """Phase 45 α (A11): output name → family name, so one defect repeated
-    across plan variants is one finding.
-
-    1. A variant prefix is everything before the last `__`
-       (`planA__total_cost` → `total_cost`).
-    2. A leading `<token>_` is then also stripped when the token is an
-       `_`-separated part of some variant prefix in the same report AND the
-       remainder is itself the base name of another output
-       (`alt_total_cost` → `total_cost` when `x_alt__…` and `total_cost`
-       exist). Both conditions keep ordinary names (`net_cost`) intact.
-    Deterministic; a name matching neither rule is its own family.
-    """
-    bases: dict[str, str] = {}
-    tokens: set[str] = set()
+    across plan variants is one finding. The family is the name after the
+    last `__` (`planA__total_cost` → `total_cost`); a name without `__` is
+    its own family. Nothing else is inferred: `alt_total_cost` and
+    `total_cost` stay separate families."""
+    out = {}
     for n in names:
         prefix, sep, base = n.rpartition("__")
-        if sep and base and prefix:
-            bases[n] = base
-            tokens.update(t for t in prefix.split("_") if t)
-        else:
-            bases[n] = n
-    base_set = set(bases.values())
-    out = {}
-    for n, b in bases.items():
-        tok, sep, rest = b.partition("_")
-        out[n] = rest if sep and rest and tok in tokens and rest in base_set else b
+        out[n] = base if sep and base and prefix else n
     return out
+
+
+def _uq_rare_event_inconsistency(stats: dict, p: float, mean: float,
+                                 lo: float, hi: float) -> str:
+    """Phase 45 α: why rare-event metadata does not fit the summary, or ''.
+    With at least half the draws exactly zero, zero lies inside the 95%
+    interval and is the median; mean_if_nonzero, when given, must satisfy
+    mean == p_nonzero * mean_if_nonzero."""
+    tol = max(1e-6, _CI_DEGENERATE_THRESHOLD * abs(mean))
+    if not lo - tol <= 0 <= hi + tol:
+        return f"0 is outside the 95% CI [{lo:.6g}, {hi:.6g}]"
+    med = finite_number(stats.get("median"))
+    if stats.get("median") is not None and (med is None or abs(med) > tol):
+        return f"median {stats.get('median')!r} is not 0"
+    if stats.get("mean_if_nonzero") is not None:
+        mif = finite_number(stats.get("mean_if_nonzero"))
+        if mif is None or abs(mean - p * mif) > tol:
+            return (f"mean {mean:.6g} != p_nonzero x mean_if_nonzero "
+                    f"({stats.get('mean_if_nonzero')!r})")
+    return ""
 
 
 def _uq_family_list(outputs: list[str]) -> str:
@@ -1370,12 +1373,15 @@ def _check_uq_ci_quality(uq_report_path: str) -> list[dict]:
     bounds actually sit at.
 
     Phase 45 α: findings are grouped per output family
-    (`_uq_output_families`) — one `ci_degenerate` per family, listing its
-    degenerate variants (attempt 8: 64 findings, 9 families). A rare-event
+    (`_uq_output_families`, the name after the last `__`) — one
+    `ci_degenerate` per family, listing its degenerate variants. Inverted
+    bounds are degenerate before any exemption. A rare-event
     output (`p_nonzero` <= 0.5, written by propagate_uncertainty.py) is
     judged on p_nonzero, not on quantile width: degenerate only when
     p_nonzero is 0 or 1 to within its binomial SE, i.e. whether the event
-    occurs never varies across draws.
+    occurs never varies across draws. Rare-event metadata that does not fit
+    the summary (`_uq_rare_event_inconsistency`) is HIGH
+    `uncertainty_report_invalid` and the width rule applies.
     `uq_mean_outside_ci` (MEDIUM, per family) fires when a mean lies
     outside its own [ci_low, ci_high] — a summary that misreports a
     zero-inflated output.
@@ -1464,7 +1470,22 @@ def _check_uq_ci_quality(uq_report_path: str) -> list[dict]:
                 continue
             n_out = finite_number(stats.get("n")) or n_draws
             if p <= _RARE_EVENT_MAX_P_NONZERO and n_out and n_out > 0:
-                rare = (p, (p * (1 - p) / n_out) ** 0.5)
+                bad = _uq_rare_event_inconsistency(stats, p, mean_f, lo_f, hi_f)
+                if bad:
+                    # Fall through to the width rule; the metadata itself
+                    # is a broken artifact.
+                    violations.append({
+                        "kind": "uncertainty_report_invalid",
+                        "severity": "HIGH",
+                        "stage": "UQ",
+                        "scope_declarable": False,
+                        "claim": (f"scalar_outputs.{output_name}: p_nonzero "
+                                  f"{p:.3g} is inconsistent with the summary "
+                                  f"({bad}); rare-event fields must come from "
+                                  f"the same draws as mean/ci_low/ci_high."),
+                    })
+                else:
+                    rare = (p, (p * (1 - p) / n_out) ** 0.5)
         # Phase 45 α (A12): a mean outside its own interval is a reporting
         # defect for any output (inverted bounds are ci_degenerate below).
         # The absolute floor absorbs float residue (a mean of 2e-9 over
@@ -1477,6 +1498,13 @@ def _check_uq_ci_quality(uq_report_path: str) -> list[dict]:
                 + (f", p_nonzero {rare[0]:.3g}" if rare else ""))))
         if not multi_draw:
             continue  # effort floors own the n_draws minimum
+        if lo_f > hi_f:
+            # Inverted bounds are a broken summary: no declaration, pin or
+            # rare-event reading can exempt them.
+            degenerate_by_family.setdefault(family, []).append((output_name, (
+                f"{output_name} 95% CI [{lo_f:.6g}, {hi_f:.6g}] is inverted "
+                f"(ci_low > ci_high)")))
+            continue
         if output_name in declared or (
                 stats.get("deterministic") is True
                 and str(stats.get("deterministic_reason") or "").strip()):
@@ -1489,6 +1517,8 @@ def _check_uq_ci_quality(uq_report_path: str) -> list[dict]:
                 f"{output_name} mean {mean_f:.6g}, 95% CI "
                 f"[{lo_f:.6g}, {hi_f:.6g}]"
                 + (f", p_nonzero {p:.3g}" if p is not None else ""))))
+        # Exact output name, or the exact `__` family base the declaration
+        # names; never a family inferred any other way.
         pin = pinned.get(output_name) or pinned.get(family)
         pin_note = ""
         if pin is not None:
@@ -6260,16 +6290,51 @@ def _run_self_test() -> int:
         g1 = _uq("uq_g1.yaml", fam_report)
         fams = {v["family"]: v["outputs"] for v in g1
                 if v["kind"] == "ci_degenerate"}
-        ok(fams == {"total": ["total", "planA__total", "planB_alt__total",
-                              "alt_total"],
+        ok(fams == {"total": ["total", "planA__total", "planB_alt__total"],
+                    "alt_total": ["alt_total"],
                     "net_cost": ["net_cost"], "overrun": ["planA__overrun"]}
            and all(v["severity"] == "HIGH" and v["scope_declarable"] is False
                    for v in g1),
-           f"G1: one HIGH finding per family (prefix + scenario token), "
-           f"net_cost kept apart; got {fams}")
-        ok(_uq_output_families(["net_cost", "cost"]) ==
-           {"net_cost": "net_cost", "cost": "cost"},
-           "G2: a leading token not used in any variant prefix is not stripped")
+           f"G1: one HIGH finding per `__` family; no leading-token "
+           f"inference; got {fams}")
+        ok(_uq_output_families(["cost", "net_cost", "plan_net__benefit"]) ==
+           {"cost": "cost", "net_cost": "net_cost",
+            "plan_net__benefit": "benefit"},
+           "G2: net_cost never joins family cost")
+        _decl("pinned_by_constraint:\n  cost:\n    constraint: budget\n"
+              "    value: 10\n")
+        g3 = _uq("uq_g3.yaml", "n_successful: 200\nscalar_outputs:\n"
+                 "  cost:\n    mean: 10\n    ci_low: 10\n    ci_high: 10\n"
+                 "  net_cost:\n    mean: 4\n    ci_low: 4\n    ci_high: 4\n"
+                 "  plan_net__benefit:\n    mean: 1\n    ci_low: 0\n"
+                 "    ci_high: 2\n")
+        ok([v.get("family") for v in g3] == ["net_cost"],
+           f"G3: a pin on cost does not exempt a frozen net_cost; got {g3}")
+        _decl("pinned_by_constraint:\n  x:\n    constraint: budget\n"
+              "    value: 100\n")
+        i1 = _uq("uq_i1.yaml", "n_successful: 200\nscalar_outputs:\n"
+                 "  x:\n    mean: 100\n    ci_low: 100.1\n    ci_high: 99.9\n"
+                 "  y:\n    mean: 0.16\n    ci_low: 1\n    ci_high: 0\n"
+                 "    n: 200\n    p_nonzero: 0.02\n")
+        ok(sorted(v["family"] for v in i1 if v["kind"] == "ci_degenerate")
+           == ["x", "y"] and all("inverted" in v["claim"] for v in i1
+                                 if v["kind"] == "ci_degenerate"),
+           f"I1: inverted bounds are HIGH before a pin or the rare-event "
+           f"path; got {i1}")
+        _decl(None)
+        r1 = _uq("uq_r1.yaml", "n_successful: 200\nscalar_outputs:\n"
+                 "  x:\n    mean: 100\n    ci_low: 100\n    ci_high: 100\n"
+                 "    n: 200\n    p_nonzero: 0.2\n")
+        ok(_kinds(r1) == ["ci_degenerate", "uncertainty_report_invalid"],
+           f"R1: p_nonzero with 0 outside the CI is invalid metadata and the "
+           f"width rule still fires; got {r1}")
+        r2 = _uq("uq_r2.yaml", "n_successful: 200\nscalar_outputs:\n"
+                 "  x:\n    mean: 0.16\n    median: 0\n    ci_low: 0\n"
+                 "    ci_high: 0\n    n: 200\n    p_nonzero: 0.02\n"
+                 "    mean_if_nonzero: 50\n")
+        ok("uncertainty_report_invalid" in _kinds(r2)
+           and "ci_degenerate" in _kinds(r2),
+           f"R2: mean != p_nonzero x mean_if_nonzero is invalid; got {r2}")
         z1 = _uq("uq_z1.yaml", "n_successful: 200\nscalar_outputs:\n"
                  "  cuts:\n    mean: 0.16\n    ci_low: 0\n    ci_high: 0\n"
                  "    n: 200\n    p_nonzero: 0.02\n")
@@ -6295,7 +6360,8 @@ def _run_self_test() -> int:
         _decl("pinned_by_constraint:\n  total:\n    constraint: budget\n"
               "    value: 320000000\n")
         c1 = _uq("uq_g1.yaml", fam_report)
-        ok({v.get("family") for v in c1} == {"net_cost", "overrun"},
+        ok({v.get("family") for v in c1} == {"net_cost", "overrun",
+                                             "alt_total"},
            f"C1: family pinned at its stated constraint value is exempt; "
            f"overrun (downstream of the rule) still flags; got {c1}")
         _decl("pinned_by_constraint:\n  total:\n    constraint: budget\n"
@@ -6310,7 +6376,7 @@ def _run_self_test() -> int:
         c3 = _uq("uq_g1.yaml", fam_report)
         ok(_kinds(c3).count("uq_declarations_invalid") == 2
            and {v.get("family") for v in c3 if v["kind"] == "ci_degenerate"}
-           == {"total", "net_cost", "overrun"},
+           == {"total", "alt_total", "net_cost", "overrun"},
            f"C3: free-text or zero-value pin is invalid and exempts "
            f"nothing; got {_kinds(c3)}")
         _decl("pinned_by_constraint: [total\n")
@@ -6318,7 +6384,7 @@ def _run_self_test() -> int:
         ok(any(v["kind"] == "uq_declarations_invalid" and v["severity"] == "HIGH"
                and is_non_declarable(v["kind"], v.get("scope_declarable"))
                for v in c4)
-           and sum(v["kind"] == "ci_degenerate" for v in c4) == 3,
+           and sum(v["kind"] == "ci_degenerate" for v in c4) == 4,
            f"C4: unparseable declarations fail closed; got {_kinds(c4)}")
         _decl("deterministic_outputs:\n  fixed: 'set by the plan'\n"
               "  cuts: 'zero at both percentiles'\n  wide: 'deterministic'\n")
