@@ -2319,6 +2319,72 @@ def _run_self_test() -> int:
            f"BG1 background Bash allowed for {agent_t}")
     ok(enforcement.check_tool_use("Bash", {"command": "ls"}, run_path, None, set(reg)) is None,
        "BG1 foreground Bash wrongly denied")
+    # KL1 (Phase 47 δ, A10): no process selection by pattern. Attempt 8's two
+    # commands (the second is cut in the trace after `awk '{print $2`; completed
+    # here with the pipe to kill it was feeding) ended the session with SIGTERM.
+    kill_denied = [
+        # the attempt 8 and attempt 7 retro denials (trace summaries, cut at 80 characters)
+        "pkill -f propagate_uncertainty.py; cd /tmp/ab/R1/runs/2026-10-28_200327_build-an",
+        'pkill -f "loo2_inputs.jsonl" ; sleep 1; ps aux | grep compute.py | grep -v grep ',
+        'pkill -f "propagate_uncertainty.py" ; sleep 1; ps aux | grep propagate_uncertain',
+        'pkill -f rnp_pilot.py; pkill -f "cbc"; cd /tmp/ab/R1/runs/2026-10-28_200327_buil',
+        'pkill -INT -f "r034_solve_ladder_inputs" ; sleep 8; pgrep -f r034_solve_ladder_i',
+        'pkill -f "compute.py map . --fn models/library.py::run_cell" ; sleep 3; ps aux |',
+        'pkill -f run_all_r2.sh; pkill -f "model_figures\\|finalize.py\\|propagate_uncertai',
+        "pkill -f run_all_r2.sh; pkill -f eligibility_probe; pkill -f propagate_uncertain",
+        # attempt 8's second command, completed with the kill it was feeding
+        "ps aux | grep \"scripts/propagate_uncertainty.py\" | grep -v grep | awk '{print $2}' | xargs kill",
+        "ps aux | grep \"scripts/propagate_uncertainty.py\" | grep -v grep | awk '{print $2}' | xargs -r kill -9",
+        "killall python3", "sudo pkill -9 -f x", "timeout 5 pkill -f x", "/usr/bin/pkill x", "2>/dev/null pkill x",
+        "nohup env A=1 pkill x", "kill -l; pkill -f x", "kill $(pgrep -f x)", 'kill -9 "$(pgrep -f x)"',
+        "kill `pgrep -f x`", "kill $(pidof python3)", "kill $(lsof -t -i:8787)",
+        "kill $(ps aux | grep x | awk '{print $2}')", "pgrep -f x | xargs kill", "pgrep -f x | xargs -I{} kill -9 {}",
+        "kill -9 -1234", "kill -TERM -- -1234", "kill 0", "kill -9 -1", "fuser -k 8080/tcp",
+    ]
+    for c in kill_denied:
+        ok(enforcement.check_tool_use("Bash", {"command": c}, run_path, "modeler", set(reg)) is not None,
+           f"KL1 pattern-based kill allowed: {c!r}")
+    ok(enforcement.bash_reason("pkill -f x", run_path, "modeler") == enforcement.KILL_DENY_REASON
+       and "compute.py status" in enforcement.KILL_DENY_REASON and "echo $!" in enforcement.KILL_DENY_REASON,
+       "KL1 deny reason does not name the stop paths")
+    kill_allowed = [
+        "kill 12345", "kill -TERM 12345 12346", "kill -9 12345", "kill %1", "kill -l", "grep -n pkill notes.md",
+        "cat <<'EOF' > notes.md\nnever pkill -f x\nkill $(pgrep y)\nEOF", "echo pkill", 'echo "pkill -f x"',
+        "cat <<\\EOF > /tmp/notes.txt\n$(pkill -f x)\nEOF", "command -v pkill >/dev/null && echo installed",
+        'GREP=grep; PATTERN=pkill; "$GREP" "$PATTERN" notes.md', "type pkill; which killall",
+        "kill $(cat runs/x/models/uq.pid)", "kill \"$(cat /tmp/solve_pid)\"", "python3 a.py & kill $!",
+        "nohup python3 a.py > a.log 2>&1 & echo $! > a.pid", "kill 84468 2>/dev/null",
+        "P=$(cat /tmp/solve_pid); for i in $(seq 1 40); do kill -0 $P 2>/dev/null || break; sleep 15; done",
+        "kill -0 $(pgrep -f x)", "kill $(cat a.pid); sleep 2; ps aux | grep model_run | grep -v grep",
+        "kill 420782; sleep 1; pgrep -af \"python3 -u robust_net_plan\"", "pgrep -f x >/dev/null || echo done",
+        "ls; # pkill -f x", "sed -n '/kill/p' f.txt", "python3 -c \"print('pkill')\"", "git log --grep=kill",
+    ]
+    for c in kill_allowed:
+        ok(enforcement.check_tool_use("Bash", {"command": c}, run_path, "modeler", set(reg)) is None,
+           f"KL1 harmless command denied: {c!r}")
+    # KL3: odd input never raises (a false deny blocks real work; errors allow).
+    for c in ("kill __MA_SUBST0__", "kill " + "9" * 5000, "kill 'unbalanced", 'kill "$(pgrep', "kill `",
+              "kill $(" * 2000, "x" * 1_000_000 + "; kill 1 2", "pkill \\", "\x00kill\x00", "kill -s", "xargs kill"):
+        try:
+            enforcement.kill_reason(c)
+        except Exception as e:  # noqa: BLE001
+            failures.append(f"KL3 kill_reason raised {type(e).__name__} on {c[:40]!r}")
+    ok(enforcement.kill_reason("kill __MA_SUBST0__") is None, "KL3 placeholder-looking PID denied")
+    # KL2: a literal PID of the harness, its parent, or a session CLI it spawned.
+    import subprocess as _sp
+    child = _sp.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        for pid in (os.getpid(), os.getppid()):
+            ok(enforcement.kill_reason(f"kill -9 {pid}") == enforcement.KILL_SELF_REASON,
+               f"KL2 kill of the harness's own pid {pid} allowed")
+        try:
+            import psutil  # noqa: F401
+            ok(enforcement.kill_reason(f"kill {child.pid}") == enforcement.KILL_SELF_REASON,
+               "KL2 kill of a process the harness spawned (the session CLI) allowed")
+        except ImportError:
+            pass
+    finally:
+        child.kill(); child.wait()
     # CT1 (Phase 21 θ): unfinished-pipeline detection drives continuation.
     with tempfile.TemporaryDirectory() as td:
         ok(pipeline_unfinished(td) is not None, "CT1 empty run dir not unfinished")

@@ -17,6 +17,7 @@ document all datasets needed for the modeling task.
 
 2. **Download ALL available datasets in parallel** using multiple Bash calls
    in the same response. Save to {run_dir}/data/.
+   Stop a process only by the PID you recorded when starting it (`... & echo $! > {run_dir}/data/<name>.pid`, then `kill <pid>`): kills chosen by pattern (pkill, killall, `kill $(pgrep ...)`, `ps | grep | xargs kill`) are refused because they can match the pipeline's own session.
 
 3. **Seek data diversity**: multiple geographies, time periods, collection
    methods. A model validated on diverse data is more credible.
