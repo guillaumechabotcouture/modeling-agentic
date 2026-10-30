@@ -103,12 +103,25 @@ def _prop_named(name: str) -> bool:
     return any(t in _PROP_TOKENS or re.fullmatch(r"p\d+", t) for t in _tokens(name))
 
 
+def _snum(x: Any) -> float | None:
+    """A finite number, None for a non-number; a number too large to convert
+    (an OverflowError) is +inf, so it counts as outside [0, 1] (Codex round 2)."""
+    if isinstance(x, bool):
+        return None
+    try:
+        return P._num(x)
+    except OverflowError:
+        return math.inf
+    except (ValueError, TypeError):
+        return None
+
+
 def _num_items(node: Any) -> dict[str, float]:
     if not isinstance(node, dict):
         return {}
     out = {}
     for k, v in node.items():
-        n = None if isinstance(v, bool) else P._num(v)
+        n = _snum(v)
         if n is not None:
             out[str(k)] = n
     return out
@@ -125,7 +138,7 @@ def _inside(xs) -> int:
 def _ci_nums(ci) -> list[float]:
     if not isinstance(ci, (list, tuple)):
         return []
-    return [x for x in (None if isinstance(e, bool) else P._num(e) for e in ci) if x is not None]
+    return [x for x in (_snum(e) for e in ci) if x is not None]
 
 
 def _scale_evidence(c: dict, v: float, run_dir: str, cache: dict) -> tuple[list[str], str] | None:
@@ -136,7 +149,7 @@ def _scale_evidence(c: dict, v: float, run_dir: str, cache: dict) -> tuple[list[
     path = P._resolve_artifact_path(run_dir, src)
     if path is None or not field:
         return None
-    own = [v] + [x for x in (P._num(c.get("ci_low")), P._num(c.get("ci_high"))) if x is not None]
+    own = [v] + [x for x in (_snum(c.get("ci_low")), _snum(c.get("ci_high"))) if x is not None]
     # The source's own value: flag only when the ledger value is the source value. A
     # ledger value of 100 x the source is a conversion already made (Codex P47B-1);
     # any other mismatch, or a source that does not resolve, is the provenance check's.
@@ -144,7 +157,7 @@ def _scale_evidence(c: dict, v: float, run_dir: str, cache: dict) -> tuple[list[
         point, ci = P.resolve_claim(c, run_dir, cache)
     except P.ClaimUnresolved:
         return None
-    sv = None if isinstance(point, bool) else P._num(point)
+    sv = _snum(point)
     if sv is None or not math.isclose(v, sv, rel_tol=0.01, abs_tol=1e-12):
         return None
     own += [sv] + _ci_nums(ci)
@@ -170,12 +183,11 @@ def _scale_evidence(c: dict, v: float, run_dir: str, cache: dict) -> tuple[list[
             parent = (P.resolve_dotpath(doc, ppath) if ppath else doc) if ppath is not None else None
         except (P._Unresolved, OSError, ValueError, UnicodeDecodeError, yaml.YAMLError):
             return (ev, qname) if ev and _unit(own) else None
-        if stat:
-            own += list(_num_items(qnode).values())
+        # Only the resolved point (above) and recognised CI endpoints (ci_low/ci_high,
+        # lo/hi, ci_95: [lo, hi], ... as provenance reads them; P47B-2) are the
+        # quantity's own values, not other numbers beside it such as `n: 1000`.
         for node in (qnode, P.resolve_dotpath(doc, field) if not stat else None):
             if isinstance(node, dict):
-                # CI arrays (ci_95: [lo, hi]) and named bounds, as provenance reads them (P47B-2).
-                own += _num_items(node).values() if node is not qnode else []
                 own += _ci_nums(P._ci_from_mapping(node))
         if not _unit(own):
             return None
@@ -225,10 +237,17 @@ def problems(claims: list, run_dir: str) -> list[dict]:
             continue
         if P.is_external(c.get("source_artifact")):
             continue
-        v = None if isinstance(c.get("value"), bool) else P._num(c.get("value"))
+        v = _snum(c.get("value"))
         if v is None or not 0 < v <= 1:
             continue
-        found = _scale_evidence(c, v, run_dir, cache)
+        try:
+            found = _scale_evidence(c, v, run_dir, cache)
+        except Exception as e:  # noqa: BLE001 - one bad claim never stops the rest
+            out.append({"id": c.get("id"), "value": v, "unchecked": True,
+                        "rendered": "?", "as_percent": "?", "name_hint": False,
+                        "evidence": [f"could not be checked: {type(e).__name__}: {e}"[:200]],
+                        "source": f"{c.get('source_artifact')}::{c.get('source_field')}"})
+            continue
         if not found:
             continue
         ev, qname = found
@@ -277,6 +296,13 @@ def gate_findings(run_dir: str) -> list[dict]:
     cited = _cited_ids(run_dir)
     out = []
     for p in probs:
+        if p.get("unchecked"):
+            # Fail closed: a claim this check could not read is reported, not passed.
+            out.append({"kind": "claim_percentage_unchecked", "severity": "MEDIUM", "stage": "ANALYZE",
+                        "scope_declarable": False,
+                        "claim": f"[{p['id']}] percentage claim from `{p['source']}` "
+                                 f"{p['evidence'][0]}"})
+            continue
         sev = "HIGH" if p["id"] in cited else "MEDIUM"
         out.append({
             "kind": "claim_percentage_is_proportion", "severity": sev, "stage": "ANALYZE",
@@ -405,6 +431,39 @@ def _self_test() -> int:
         ], d)}
         ok(got == {"as_source", "ci_unit"},
            f"U9 (Codex P47B-1/2) a converted value and a CI array crossing zero are exempt: {sorted(got)}")
+
+    # Codex round 2: metadata beside the statistic; endpoints too large to convert.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        yaml.safe_dump({"g": {"gain_pct": 13.3,
+                              "share": {"mean": 0.12, "ci_low": 0.05, "ci_high": 0.3, "n": 1000},
+                              "huge": {"mean": 0.12, "ci_95": [-(10 ** 400), 0.3]}}},
+                       open(os.path.join(d, "models", "s.yaml"), "w"))
+        mk = lambda cid, field, v, **kw: {"id": cid, "claim_kind": "percentage", "value": v,
+                                          "source_artifact": "models/s.yaml", "source_field": field, **kw}
+        claims = [mk("with_n", "g.share.mean", 0.12),
+                  mk("huge_src", "g.huge.mean", 0.12),
+                  mk("huge_claim", "g.share.mean", 0.12, ci_low=-(10 ** 400), ci_high=0.3),
+                  mk("after", "g.share.mean", 0.12)]
+        try:
+            got = {p["id"]: p for p in problems(claims, d)}
+        except Exception as e:  # noqa: BLE001
+            got = {"raised": str(e)}
+        ok(set(got) == {"with_n", "after"} and not any(p.get("unchecked") for p in got.values()),
+           f"U10 (Codex round 2) `n: 1000` beside the statistic does not hide a proportion; an "
+           f"overflowing endpoint counts as outside [0, 1] and stops nothing: {sorted(got)}")
+        # A claim that raises inside the check is reported (MEDIUM), and the others still run.
+        claims2 = [{"id": "bad", "claim_kind": "percentage", "value": 0.5,
+                    "source_artifact": "models/s.yaml", "source_field": object()}, mk("after", "g.share.mean", 0.12)]
+        real = P.resolve_claim
+        P.resolve_claim = lambda c, *a, **k: (_ for _ in ()).throw(RuntimeError("boom")) \
+            if c["id"] == "bad" else real(c, *a, **k)
+        try:
+            got2 = {p["id"]: p for p in problems(claims2, d)}
+        finally:
+            P.resolve_claim = real
+        ok(got2.get("bad", {}).get("unchecked") and "after" in got2 and not got2["after"].get("unchecked"),
+           f"U11 (Codex round 2) one failing claim is reported unchecked and the rest are checked: {got2}")
 
 
     if fails:
