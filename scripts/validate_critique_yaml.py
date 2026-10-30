@@ -1447,6 +1447,9 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None,
     # Phase 45 β (A14): a pass verdict in the prose is backed by the artifact it cites.
     violations += G(lambda rd: _load_sibling("verdict_binding").gate_findings(rd),
                     run_dir, check_name="verdict_binding")
+    # Phase 47 β (A18): a percentage claim whose source holds a proportion.
+    violations += G(lambda rd: _load_sibling("claim_units").gate_findings(rd),
+                    run_dir, check_name="claim_units")
     # Phase 34: done_when findings computed by the caller, added before the
     # escalation so their persistence counts (Codex review).
     violations += list(extra or [])
