@@ -1450,12 +1450,10 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None,
     violations += G(lambda rd: _load_sibling("stall_rule").gate_findings(
                         rd, round_n, violations, _declared_ids(rd), is_non_declarable),
                     run_dir, check_name="stall_rule")
-    # Phase 49 γ (A22): declarations covering a HIGH finding are named in the
-    # executive summary (after the escalation, so `<kind>_persistent` counts).
-    violations += G(lambda rd: _load_sibling("summary_caveats").gate_findings(
-                        rd, violations, _load_scope_declarations(rd)[1],
-                        lambda e: _entry_declared_ids(e, structured_only=True)),
-                    run_dir, check_name="summary_caveats")
+    # Phase 49 γ (A22): the declared limits are in the executive summary as the
+    # harness rendered them from scope_declaration.yaml (positional token check).
+    violations += G(lambda rd: _load_sibling("declared_limits").gate_findings(rd),
+                    run_dir, check_name="declared_limits")
     _annotate_first_seen(run_dir, violations)
     return violations
 
@@ -4653,6 +4651,18 @@ def _run_self_test() -> int:
        "SW1 stall_rule runs in _check_rigor_artifacts after the persistence escalation")
     ok('_load_sibling("presentation_pass").gate_findings(' in _src47,
        "PP-W1 presentation_pass runs in _check_rigor_artifacts")
+    ok('_load_sibling("declared_limits").gate_findings(' in _src47,
+       "DL-W1 declared_limits runs in _check_rigor_artifacts")
+    with tempfile.TemporaryDirectory() as d:
+        # Phase 49 γ: declarations and no [DECLARED_LIMITS] token: a HIGH accept blocker,
+        # declarable, through the validator's own declaration loader.
+        yaml.safe_dump({"declarations": [{"id": "SD-9", "blocker_ids": ["allocation_unstable"],
+                                          "why_unresolved": "w"}]}, open(os.path.join(d, "scope_declaration.yaml"), "w"))
+        open(os.path.join(d, "manuscript.md"), "w").write("# T\n\n## Executive summary\n\nFund.\n\n## 1. Intro\n")
+        _f = [v for v in _check_rigor_artifacts(d) if v.get("kind") == "declared_limits_not_rendered"]
+        ok(len(_f) == 1 and _f[0]["severity"] == "HIGH" and _f[0]["accept_blocker"]
+           and not is_non_declarable(_f[0]["kind"], _f[0]["scope_declarable"]),
+           f"DL-W2 declarations without the rendered block: HIGH accept blocker, declarable: {_f}")
     with tempfile.TemporaryDirectory() as d:
         # Phase 49 δ (Codex): a draft no recorded presentation review covers blocks ACCEPT at
         # every round; at exhaustion the run is DECLARE_SCOPE listing it, not RUN_FAILED.

@@ -52,16 +52,14 @@ writing files named REPORT*/SUMMARY*/FINDINGS*/ANALYSIS*.md, and
 **Executive summary** (`## Executive summary`, before §1; after the
 harness's status line when there is one)
 - The decision, the recommendation and its headline impact, in plain words
-- When `{run_dir}/scope_declaration.yaml` exists, end the summary with a
-  short block headed **What this does not establish**: one line per
-  declaration, in plain words, with its id in brackets (e.g. "(SD-007)").
-  When the declaration cites a `decision_test:` file, give its measured
-  effect on the recommendation as a [CLAIM:id] reference to a claim whose
-  source is that file (a TODO for the lead if the ledger has none). The
-  declarations still go verbatim in §Limitations; this block is how a
-  reader of the summary alone learns what the recommendation does not
-  rest on. The gate checks it (`declared_limit_not_in_summary`, HIGH,
-  not declarable; which findings count is set by the gate, not here).
+- When `{run_dir}/scope_declaration.yaml` exists, end the summary with the
+  placeholder `[DECLARED_LIMITS]` on its own line, exactly once, before §1
+  (not inside a comment or code block). `scripts/render_claims.py` replaces it
+  with a "What this does not establish" block it generates from the
+  declarations and their decision tests (id, the limit, its measured effect
+  on the recommendation). Do not type the declarations or their effects in
+  the summary yourself; they still go verbatim in §Limitations. The gate
+  checks the placeholder and the rendered block (`declared_limits_not_rendered`).
 
 **1. Introduction**
 - Research question and why it matters

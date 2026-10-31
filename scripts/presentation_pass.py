@@ -153,6 +153,18 @@ def pending(run_dir: str) -> dict:
                 continue
             items.append({"id": str(b["id"]), "claim": str(b.get("claim") or "").strip(),
                           "fix_requires": str(b.get("fix_requires") or "").strip()})
+    # Phase 49 γ (A22): a missing or misplaced [DECLARED_LIMITS] token is the writer's
+    # to fix, so the pass hands it over with the presentation items.
+    try:
+        from lib.siblings import load_private
+        dl = load_private("declared_limits", "_ma_presentation_pass_").problems(run_dir)
+    except (FileNotFoundError, ImportError, AttributeError):
+        dl = []
+    if dl:
+        items.append({"id": "declared_limits", "claim": "; ".join(dl),
+                      "fix_requires": ("Put the placeholder [DECLARED_LIMITS] on its own line, once, at the end of "
+                                       "the executive summary (before section 1, not in a comment or code block). "
+                                       "Do not type the declarations there; the render writes them.")})
     out["items"] = items
     if not items and state == "ok":
         out["reason"] = "no open HIGH presentation item for the writer, and the review covers the draft"
@@ -244,6 +256,12 @@ def _self_test() -> int:
         f = gate_findings(d)[0]
         ok(f["scope_declarable"] is True and f["stage"] == "WRITE",
            "PP12 declarable, so a run ending with it is DECLARE_SCOPE (never ACCEPT), not RUN_FAILED")
+        yaml.safe_dump({"declarations": [{"id": "SD-1", "blocker_id": "x", "claim": "c", "why_unresolved": "w"}]},
+                       open(os.path.join(d, "scope_declaration.yaml"), "w"))
+        p = pending(d)
+        ok([i["id"] for i in p["items"]] == ["declared_limits"]
+           and "[DECLARED_LIMITS]" in p["items"][0]["fix_requires"],
+           f"PP13 (Phase 49 γ) a missing declared-limits token is handed to the writer by the pass: {p['items']}")
     finally:
         shutil.rmtree(d, ignore_errors=True)
     if fails:

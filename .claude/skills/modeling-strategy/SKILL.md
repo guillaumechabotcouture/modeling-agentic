@@ -395,16 +395,16 @@ it's scientific integrity.
 
 ### Where declarations appear in the report
 
-A declaration that covers a HIGH finding is a limit on the recommendation,
-so a reader of the executive summary alone must see it. The summary ends
-with a short **What this does not establish** block: one plain-words line
-per declaration with its id (e.g. "(SD-007)"). When the declaration cites
-a with/without decision test (`decision_test:`), the line states the
-test's measured effect on the recommendation through a `[CLAIM:id]` whose
-source is the test's result file, so the analyst adds that claim to
-`models/claims_spec.yaml`. The full declaration still goes verbatim in
-§Limitations. The gate's `declared_limit_not_in_summary` finding (HIGH,
-not declarable) checks this; which findings count is set by the gate.
+A declaration is a limit on the recommendation, so a reader of the
+executive summary alone must see it. The writer puts the placeholder
+`[DECLARED_LIMITS]` once in the executive summary; `scripts/render_claims.py`
+replaces it with a "What this does not establish" block generated from
+`scope_declaration.yaml`: each declaration's id, its claim, and its measured
+effect on the recommendation from its `decision_test` (or "untested",
+"exempt: <reason>", "invalid test"). Write each declaration's `claim` as one
+plain sentence a decision-maker can read, since it is printed as written.
+The full declaration still goes verbatim in §Limitations. The gate's
+`declared_limits_not_rendered` finding checks the placeholder and the block.
 
 ---
 

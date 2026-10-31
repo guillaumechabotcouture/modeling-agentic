@@ -359,6 +359,11 @@ def _builder():
     return mod
 
 
+def _declared_limits():
+    from lib.siblings import load_private
+    return load_private("declared_limits", "_ma_render_claims_")
+
+
 def _claim_units():
     import importlib.util
     spec = importlib.util.spec_from_file_location(
@@ -398,6 +403,9 @@ def render_run(run_dir: str) -> dict:
         text = f.read()
 
     def _write_report(body):
+        # Phase 49 γ (A22): the harness writes the declared limits in place of the
+        # writer's [DECLARED_LIMITS] token (scripts/declared_limits.py).
+        body = _declared_limits().expand(run_dir, body)
         with open(report_path, "w") as f:
             f.write(body)
 
@@ -591,6 +599,19 @@ def _self_test() -> int:
             f.write("# Report\n\nNo claim references here.\n")
         render_run(d)
         ok(os.path.exists(os.path.join(d, "report.md")), "T7b a draft without references still becomes report.md")
+        # T7c (Phase 49 γ, A22): the [DECLARED_LIMITS] token becomes the harness-written block.
+        with open(os.path.join(d, "scope_declaration.yaml"), "w") as f:
+            yaml.safe_dump({"declarations": [{"id": "SD-007", "blocker_id": "allocation_unstable",
+                                              "claim": "Allocation unstable out of sample.",
+                                              "why_unresolved": "w"}]}, f)
+        with open(os.path.join(d, "manuscript.md"), "w") as f:
+            f.write("# Report\n\n## Executive summary\n\nAverts [CLAIM:dalys] DALYs.\n\n[DECLARED_LIMITS]\n\n"
+                    "## 1. Introduction\n\n```\n[DECLARED_LIMITS]\n```\n")
+        render_run(d)
+        rendered = open(os.path.join(d, "report.md")).read()
+        ok("**SD-007**: Allocation unstable out of sample." in rendered and "7.47M" in rendered
+           and rendered.count("[DECLARED_LIMITS]") == 1 and "[DECLARED_LIMITS]" in rendered.split("```")[1],
+           f"T7c the token is replaced by the declared-limits block (not inside code): {rendered[:600]}")
 
     # T8: render_run reports unresolved references gracefully
     with tempfile.TemporaryDirectory() as d:
