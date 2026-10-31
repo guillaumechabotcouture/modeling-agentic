@@ -517,6 +517,9 @@ Spawn the `writer` agent exactly once for run directory {run_dir}. Tell it:
   blocking finding in plain words. The model is then presented as what was
   built and where it fell short, never as a recommendation; any allocation
   is labelled illustrative.
+- After that comes the executive summary. When scope_declaration.yaml exists,
+  it ends with a "What this does not establish" block naming each declaration
+  by id (see the writer's instructions).
 - Write the draft to {run_dir}/manuscript.md from the artifacts that exist
   (plan, data, models, results, critiques). Missing pieces are stated as
   missing, not invented.

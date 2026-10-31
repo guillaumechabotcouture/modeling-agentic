@@ -1446,6 +1446,12 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None,
     violations += G(lambda rd: _load_sibling("stall_rule").gate_findings(
                         rd, round_n, violations, _declared_ids(rd), is_non_declarable),
                     run_dir, check_name="stall_rule")
+    # Phase 49 γ (A22): declarations covering a HIGH finding are named in the
+    # executive summary (after the escalation, so `<kind>_persistent` counts).
+    violations += G(lambda rd: _load_sibling("summary_caveats").gate_findings(
+                        rd, violations, _load_scope_declarations(rd)[1],
+                        lambda e: _entry_declared_ids(e, structured_only=True)),
+                    run_dir, check_name="summary_caveats")
     _annotate_first_seen(run_dir, violations)
     return violations
 
@@ -4641,6 +4647,21 @@ def _run_self_test() -> int:
     ok('_load_sibling("stall_rule").gate_findings(' in _src47 and 'check_name="stall_rule"' in _src47
        and _src47.index("stall_rule") > _src47.index("_check_persistent_medium_escalation"),
        "SW1 stall_rule runs in _check_rigor_artifacts after the persistence escalation")
+    ok('_load_sibling("summary_caveats").gate_findings(' in _src47
+       and _src47.index("summary_caveats") > _src47.index("_check_persistent_medium_escalation"),
+       "SC-W1 summary_caveats runs in _check_rigor_artifacts after the persistence escalation")
+    with tempfile.TemporaryDirectory() as d:
+        # Phase 49 γ: the validator's own declaration normalizer feeds summary_caveats.
+        yaml.safe_dump({"declarations": [{"id": "SD-9", "blocker_ids": ["allocation_unstable"],
+                                          "why_unresolved": "w"}]}, open(os.path.join(d, "scope_declaration.yaml"), "w"))
+        open(os.path.join(d, "manuscript.md"), "w").write("# T\n\n## Executive summary\n\nFund.\n\n## 1. Intro\n")
+        _sc = _load_sibling("summary_caveats")
+        _cur = [{"kind": "allocation_unstable", "severity": "HIGH"}]
+        _f = _sc.gate_findings(d, _cur, _load_scope_declarations(d)[1],
+                               lambda e: _entry_declared_ids(e, structured_only=True))
+        ok([x["kind"] for x in _f] == ["declared_limit_not_in_summary"] and is_non_declarable(
+            _f[0]["kind"], _f[0]["scope_declarable"]),
+           f"SC-W2 an unnamed declaration of a HIGH is a non-declarable WRITE finding: {_f}")
     with tempfile.TemporaryDirectory() as d:
         _append_validator_history(d, 2, {"action": "PATCH_OR_RETHINK", "rigor_violations": [
             {"kind": "benchmark_drift", "severity": "HIGH", "stall_key": "B9"},

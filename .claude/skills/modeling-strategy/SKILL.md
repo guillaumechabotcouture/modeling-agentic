@@ -393,6 +393,19 @@ it's scientific integrity.
   via calabaria cloud would enable longitudinal validation"
 ```
 
+### Where declarations appear in the report
+
+A declaration that covers a HIGH finding is a limit on the recommendation,
+so a reader of the executive summary alone must see it. The summary ends
+with a short **What this does not establish** block: one plain-words line
+per declaration with its id (e.g. "(SD-007)"). When the declaration cites
+a with/without decision test (`decision_test:`), the line states the
+test's measured effect on the recommendation through a `[CLAIM:id]` whose
+source is the test's result file, so the analyst adds that claim to
+`models/claims_spec.yaml`. The full declaration still goes verbatim in
+§Limitations. The gate's `declared_limit_not_in_summary` finding (HIGH,
+not declarable) checks this; which findings count is set by the gate.
+
 ---
 
 ## References

@@ -49,6 +49,20 @@ be moved to the appendix or omitted.
 writing files named REPORT*/SUMMARY*/FINDINGS*/ANALYSIS*.md, and
 `scripts/render_claims.py` builds `report.md` from your draft.)
 
+**Executive summary** (`## Executive summary`, before §1; after the
+harness's status line when there is one)
+- The decision, the recommendation and its headline impact, in plain words
+- When `{run_dir}/scope_declaration.yaml` exists, end the summary with a
+  short block headed **What this does not establish**: one line per
+  declaration, in plain words, with its id in brackets (e.g. "(SD-007)").
+  When the declaration cites a `decision_test:` file, give its measured
+  effect on the recommendation as a [CLAIM:id] reference to a claim whose
+  source is that file (a TODO for the lead if the ledger has none). The
+  declarations still go verbatim in §Limitations; this block is how a
+  reader of the summary alone learns what the recommendation does not
+  rest on. The gate checks it (`declared_limit_not_in_summary`, HIGH,
+  not declarable; which findings count is set by the gate, not here).
+
 **1. Introduction**
 - Research question and why it matters
 - Literature context (from plan.md)
