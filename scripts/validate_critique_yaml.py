@@ -1433,6 +1433,10 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None,
     # Phase 47 β (A18): a percentage claim whose source holds a proportion.
     violations += G(lambda rd: _load_sibling("claim_units").gate_findings(rd),
                     run_dir, check_name="claim_units")
+    # Phase 49 δ (A23): a draft changed after the presentation critique, with its
+    # writer HIGHs still open, has not been re-checked.
+    violations += G(lambda rd: _load_sibling("presentation_pass").gate_findings(rd),
+                    run_dir, check_name="presentation_pass")
     # Phase 34: done_when findings computed by the caller, added before the
     # escalation so their persistence counts (Codex review).
     violations += list(extra or [])
@@ -4641,6 +4645,22 @@ def _run_self_test() -> int:
     ok('_load_sibling("stall_rule").gate_findings(' in _src47 and 'check_name="stall_rule"' in _src47
        and _src47.index("stall_rule") > _src47.index("_check_persistent_medium_escalation"),
        "SW1 stall_rule runs in _check_rigor_artifacts after the persistence escalation")
+    ok('_load_sibling("presentation_pass").gate_findings(' in _src47,
+       "PP-W1 presentation_pass runs in _check_rigor_artifacts")
+    with tempfile.TemporaryDirectory() as d:
+        # Phase 49 δ (Codex): a draft no recorded presentation review covers blocks ACCEPT at
+        # every round; at exhaustion the run is DECLARE_SCOPE listing it, not RUN_FAILED.
+        yaml.safe_dump({"reviewer": "critique-presentation", "round": 8, "blockers": []},
+                       open(os.path.join(d, "critique_presentation.yaml"), "w"))
+        open(os.path.join(d, "manuscript.md"), "w").write("# Draft\n")
+        _f = [v for v in _check_rigor_artifacts(d) if v.get("kind", "").startswith("presentation_review_")]
+        ok(len(_f) == 1 and _f[0]["kind"] == "presentation_review_missing" and _f[0]["severity"] == "HIGH"
+           and _f[0]["accept_blocker"], f"PP-W2 a draft no review covers is a HIGH accept blocker: {_f}")
+        _dpp = _incorporate_rigor_violations({"unresolved_high": [], "accept_blockers": []}, _f, 8, 8)
+        ok(_dpp["action"] == "DECLARE_SCOPE" and _dpp["accept_blockers"],
+           f"PP-W3 at the last round it is DECLARE_SCOPE (listed), never ACCEPT nor RUN_FAILED: {_dpp.get('action')}")
+        _dpp = _incorporate_rigor_violations({"unresolved_high": [], "accept_blockers": []}, _f, 8, 5)
+        ok(_dpp["action"] == "PATCH_OR_RETHINK", f"PP-W4 with rounds left ACCEPT is refused: {_dpp.get('action')}")
     with tempfile.TemporaryDirectory() as d:
         _append_validator_history(d, 2, {"action": "PATCH_OR_RETHINK", "rigor_violations": [
             {"kind": "benchmark_drift", "severity": "HIGH", "stall_key": "B9"},
