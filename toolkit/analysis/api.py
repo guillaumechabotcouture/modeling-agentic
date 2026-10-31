@@ -72,7 +72,7 @@ def pipeline_steps(spec_path: str, run_dir: str) -> list[dict]:
     # uncertainty_report.yaml and models/claims_ledger.yaml are written too, but S1 reserves them for their
     # registered producers (agents/enforcement.py); the manifest (and the contract checks) track them instead.
     outs = ["analysis/manifest.json", spec["deliverable"]["allocation_file"], "results.md"]
-    return [{"id": "analyze", "cmd": f"python3 {os.path.join(ROOT, 'toolkit', 'analysis', 'run.py')} {run_dir} "
+    return [{"id": "analyze", "cmd": f"{sys.executable} {os.path.join(ROOT, 'toolkit', 'analysis', 'run.py')} {run_dir} "
                                      f"--spec {os.path.relpath(spec_path, run_dir)}",
              "inputs": deps, "outputs": outs, "produced_by": "harness"}]
 
@@ -112,6 +112,7 @@ def _self_test() -> int:
         st = pipeline_steps(p, d)
         ok(st and st[0]["outputs"][0] == "analysis/manifest.json" and "decision_spec.yaml" in st[0]["inputs"],
            f"AP2 pipeline steps name their inputs and outputs: {st}")
+        ok(st[0]["cmd"].startswith(sys.executable + " "), f"AP7 the step runs with the harness interpreter: {st[0]['cmd'][:60]}")
         ok(gate_findings(d) and gate_findings(d)[0]["kind"] == "analysis_contract_missing",
            "AP3 gate_findings before the analysis ran: missing (fail closed)")
         try:
