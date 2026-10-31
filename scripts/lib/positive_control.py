@@ -789,6 +789,7 @@ def build(run_dir: str, round_n: int = 2) -> dict:
             ("critique-presentation", "P-", "critique_presentation.yaml"),
             ("critique-redteam", "R-", "critique_redteam.yaml")):
         _w(run_dir, fname, _critique(rev, prefix, round_n))
+    _record_presentation_review(run_dir)
     _w(run_dir, "critique_sufficiency.yaml", {
         "claim_verdicts": [
             {"claim_id": cid, "verdict": "ADEQUATE",
@@ -809,6 +810,15 @@ def set_round(run_dir: str, round_n: int) -> None:
             ("critique-presentation", "P-", "critique_presentation.yaml"),
             ("critique-redteam", "R-", "critique_redteam.yaml")):
         _w(run_dir, fname, _critique(rev, prefix, round_n))
+    _record_presentation_review(run_dir)
+
+
+def _record_presentation_review(run_dir: str) -> None:
+    """Phase 49 δ: the harness records which draft the presentation critic read
+    (agents/hooks.py); the honest run's critic read the current draft."""
+    from lib.siblings import load_private
+    pp = load_private("presentation_pass", "_ma_positive_control_")
+    pp.record_review(run_dir, dict(pp.snapshot(run_dir), critique_sha_before=None))
 
 
 def _self_test() -> int:

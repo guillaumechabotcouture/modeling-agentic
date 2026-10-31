@@ -86,11 +86,19 @@ SCRIPT_OUTPUTS = (
     "open_problems.json.tmp",
     "open_problems.md.tmp",
     "decision_brief.signoff.json",   # Phase 33 α: scripts/decision_brief.py sign
+    "scope_signoff.json",            # Phase 49 β: scripts/scope_signoff.py sign
+    "scope_signoff_request.json",    # Phase 49 β: written by the gate
+    "scope_signoff_request.json.tmp",
+    "scope_signoff_ledger.json",     # Phase 49 β: the harness's record of the answers (main.py)
     "decision_brief.signed/*",       # the signed copies, for restoring a changed file
     "acceptance_lock.json",          # Phase 33 α: written by the gate
     "done_when_registry.json",       # Phase 34: frozen finding tests, written by the gate
     "done_when_registry.json.tmp",
     "round_plan.frozen.json",        # Phase 32 γ: the plan as handed out, written by the hook
+    "presentation_review.json",      # Phase 49 δ: which draft each presentation review read (hook)
+    "presentation_review.json.tmp",
+    "presentation_review/*",         # Phase 49 δ: the snapshot each presentation review read
+    "presentation_review/**",
     "round_plan.frozen.json.tmp",
     # S1: the pipeline runner's records, written by the harness run only
     # (scripts/pipeline.py OWN_FILES). Declared outputs are protected by the

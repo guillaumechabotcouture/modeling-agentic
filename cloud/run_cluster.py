@@ -4,7 +4,9 @@
     python cloud/run_cluster.py <config.py> status            # running / done per run, cluster and keeper state
     python cloud/run_cluster.py <config.py> collect           # fetch finished runs (from storage once stopped)
     python cloud/run_cluster.py <config.py> brief|report      # decision brief / convergence measures of a live run
-    python cloud/run_cluster.py <config.py> sign <answers.yaml> [note]
+    python cloud/run_cluster.py <config.py> health [--loop] [--interval S] [--log PATH] [--thresholds YAML]
+                                                              # anomalies of a live run (cloud/run_health.py)
+    python cloud/run_cluster.py <config.py> sign <answers.yaml> [note]   # the brief, or pending scope declarations
     python cloud/run_cluster.py <config.py> relaunch <label>
     python cloud/run_cluster.py <config.py> shutdown          # cluster, overflow pool and keeper, by hand
     python cloud/run_cluster.py <config.py> report-cost [--ledger PATH]... [--start ISO] [--end ISO]
@@ -765,6 +767,137 @@ def _side(cfg, fn, *args, label=None):
     return _on_worker(attach(cfg.name).get_client(), fn, label, *args, worker=assign[label]["worker"])
 
 
+def health_snapshots(cfg, client, assign: dict, now: float | None = None) -> dict:
+    """Phase 51 γ: {label: snapshot} for run_health.Monitor, read from a live
+    cluster (attach-only; the caller passes the client). The scheduler view
+    runs on the scheduler and the file view on each run's agent VM; both are
+    sent by value, so runs launched before this code have them too. What
+    cannot be read becomes a `monitor_error` entry, never a quiet snapshot."""
+    import run_health as rh
+    try:
+        import cloudpickle
+        cloudpickle.register_pickle_by_value(rh)
+    except ImportError:
+        pass
+    now = time.time() if now is None else now
+    res = (cfg.compute_env or {}).get("MA_COMPUTE_RESOURCE", rh.RESOURCE)
+    errors = []
+    try:
+        sched = client.run_on_scheduler(rh.scheduler_view, res)
+    except Exception as e:  # noqa: BLE001 — reported as a monitor error
+        sched, errors = None, [f"scheduler view: {type(e).__name__}: {rh.clip(e, 160)}"]
+    out = {}
+    for label in cfg.labels:
+        errs = list(errors)
+        try:
+            files = _on_worker(client, rh.run_files_view, label, worker=assign[label]["worker"])
+        except Exception as e:  # noqa: BLE001
+            files = {}
+            errs.append(f"run files: {type(e).__name__}: {rh.clip(e, 160)}")
+        errs += list(files.get("errors") or [])
+        out[label] = {**files, "at": now, "scheduler": sched, "input_errors": errs}
+    return out
+
+
+def connect_existing(name: str, lister=None, security_fn=None, client_cls=None):
+    """A Client on the live cluster `name`, or None. Built from the cluster's
+    scheduler address and TLS security as the Coiled API reports them, then a
+    plain distributed.Client: nothing on this path can create a cluster
+    (a coiled Cluster opened by name on a cluster that has just stopped makes a new
+    one). A cluster that is gone, or stops between the list and the connect,
+    gives None."""
+    cid = live_id(name, lister)
+    if cid is None:
+        return None
+    if security_fn is None:
+        def security_fn(cluster_id):
+            from coiled.v2.core import CloudV2
+            with CloudV2() as cloud:
+                return cloud.security(cluster_id, workspace=WORKSPACE)
+    try:
+        sec, info = security_fn(cid)
+    except RuntimeError:            # the scheduler is no longer in the started state
+        return None
+    if client_cls is None:
+        from distributed import Client as client_cls
+    return client_cls(info["address_to_use"], security=sec, timeout="60s")
+
+
+def health(cfg, args, connect_fn=None, sleep=time.sleep) -> int:
+    """`health`: check a live run once, or every `--interval` s with `--loop`,
+    appending new alerts to the log (default <out_dir>/health.log) and stdout.
+    It connects with connect_existing, which cannot create a cluster; a
+    cluster that is not running is reported and that poll skipped. A poll
+    that cannot read something (assignments.json, a run file, the scheduler)
+    logs a monitor_error and the next poll tries again: the loop never ends
+    on a transient read. Every line goes through run_health.redact."""
+    import argparse
+    import run_health as rh
+    ap = argparse.ArgumentParser(prog="run_cluster.py <config> health")
+    ap.add_argument("--loop", action="store_true")
+    ap.add_argument("--interval", type=float, default=300.0)
+    ap.add_argument("--log", default=os.path.join(cfg.out_dir, "health.log"))
+    ap.add_argument("--thresholds", default=rh.THRESHOLDS)
+    ap.add_argument("--max-polls", type=int, default=0, help=argparse.SUPPRESS)
+    a = ap.parse_args(args)
+    connect_fn = connect_fn or connect_existing
+    thresholds = rh.load_thresholds(a.thresholds)
+    monitors = {label: rh.Monitor(thresholds) for label in cfg.labels}
+    seen_poll_errors: set = set()
+    polls = 0
+
+    def poll_error(what: str, e: Exception) -> None:
+        now = time.time()
+        key = f"poll:{what}:{type(e).__name__}"
+        alert = {"rule": "monitor_error", "key": key, "at": now, "at_iso": rh._iso(now),
+                 "message": f"could not read {what}: {type(e).__name__}: {rh.clip(e, 200)} (retrying next poll)"}
+        if key not in seen_poll_errors:
+            seen_poll_errors.add(key)
+            rh.log_alerts([alert], a.log)
+        else:
+            print(rh.format_alert(alert))
+
+    while True:
+        client = None
+        try:
+            client = connect_fn(cfg.name)
+            if client is None:
+                print(rh.redact(f"cluster {cfg.name}: not running; poll skipped"))
+            else:
+                try:
+                    with open(cfg.state_file, encoding="utf-8") as f:
+                        assign = json.load(f)
+                    if not isinstance(assign, dict):
+                        raise ValueError("not a mapping")
+                except (OSError, ValueError) as e:
+                    poll_error(os.path.basename(cfg.state_file), e)
+                    assign = None
+                for label, snap in (health_snapshots(cfg, client, assign).items() if assign is not None else ()):
+                    alerts = monitors[label].check(snap)
+                    for err in snap.get("input_errors") or []:
+                        key = f"input:{err}"
+                        if key not in monitors[label].seen:
+                            monitors[label].seen.add(key)
+                            alerts.append({"rule": "monitor_error", "key": key, "at": snap["at"],
+                                           "at_iso": rh._iso(snap["at"]), "message": f"could not read {err}"})
+                    rh.log_alerts(alerts, a.log, label)
+                    if not alerts and not a.loop:
+                        print(f"{label}: no anomalies ({len(snap.get('trace') or [])} trace events read)")
+        except Exception as e:  # noqa: BLE001 — one failed poll must not end the watch
+            poll_error("the cluster", e)
+        finally:
+            close = getattr(client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # noqa: BLE001
+                    pass
+        polls += 1
+        if not a.loop or (a.max_polls and polls >= a.max_polls):
+            return 0
+        sleep(a.interval)
+
+
 # ---- self-test --------------------------------------------------------------------------
 
 E7R7_REFUSAL = ("Instance Stopped: Failed to create VM -- (OperationNotAllowed) Operation could not be completed as "
@@ -885,6 +1018,156 @@ def _self_test_42b(ok, RunConfig) -> None:
     ok("primary+overflow" in kl and "quota refusals: 4; last 2 min ago: standardESv5Family 348/350" in kl
        and "updated 30s ago" in kl, f"RC33c status prints the active family and the refusals: {kl}")
     ok("none yet" in keeper_lines(None)[0], "RC33d status says when the keeper has written no status yet")
+
+
+def _self_test_51c(ok) -> None:
+    """Phase 51 γ: the `health` command on a fake cluster (no Coiled, no network)."""
+    import contextlib
+    import io
+    import tempfile
+    import types
+    import run_health as rh
+
+    class FakeWS:
+        def __init__(self, tagged, processing):
+            self.resources = {"compute": 1} if tagged else {}
+            self.processing = set(range(processing))
+            self.status = types.SimpleNamespace(name="running")
+
+    sched = types.SimpleNamespace(
+        workers={"agent": FakeWS(False, 1), "c0": FakeWS(True, 24), "c1": FakeWS(True, 0)},
+        unrunnable=[types.SimpleNamespace(resource_restrictions={"compute": 1}),
+                    types.SimpleNamespace(resource_restrictions={"compute": 1, rh.DEMAND_RESOURCE: 1})])
+    with tempfile.TemporaryDirectory() as d:
+        rd = os.path.join(d, "work", "R1", "runs", "2026-10-28_x")
+        os.makedirs(os.path.join(rd, "models"))
+        old = "2026-10-29T06:00:00"
+        with open(os.path.join(rd, "trace.jsonl"), "w") as f:
+            f.write(json.dumps({"ts": old, "type": "tool_use"}) + "\n" + "{torn line\n"
+                    + json.dumps({"ts": "2026-10-29T07:00:25", "type": "session_error", "session": 2,
+                                  "error": "exit code 143"}) + "\n")
+        with open(os.path.join(rd, "status.json"), "w") as f:
+            json.dump({"heartbeat": old + "+00:00", "gate": {"round": 2}}, f)
+        work = os.path.join(d, "work")
+
+        class FakeClient:
+            calls = []
+
+            def run_on_scheduler(self, fn, *a):
+                self.calls.append("scheduler")
+                return fn(*a, dask_scheduler=sched)
+
+            def run(self, fn, *a, workers, **kw):
+                self.calls.append(("run", workers))
+                return {workers[0]: fn(*a, work=work)}
+
+        client = FakeClient()
+        cfg = RunConfig(name="h", question_file="q", out_dir=os.path.join(d, "out"))
+        os.makedirs(cfg.out_dir)
+        with open(cfg.state_file, "w") as f:
+            json.dump({"R1": {"worker": "agent"}}, f)
+        snaps = health_snapshots(cfg, client, json.load(open(cfg.state_file)), now=rh._epoch("2026-10-29T08:00:00"))
+        s = snaps["R1"]
+        ok(s["scheduler"]["unrunnable_compute"] == 1 and s["scheduler"]["workers"]["c0"]["processing"] == 24
+           and not s["scheduler"]["workers"]["agent"]["compute"],
+           "RC51c-1 the scheduler view counts compute tasks unrunnable (not demand markers) and tags")
+        ok(len(s["trace"]) == 2 and any("unparseable" in e for e in s["input_errors"]),
+           "RC51c-2 the run-file view reads the trace and reports a torn line instead of dropping it")
+        alerts = rh.Monitor(rh.load_thresholds()).check(s)
+        ok(sorted({a["rule"] for a in alerts}) == ["session_error", "stall"],
+           f"RC51c-3 a live snapshot raises session_error and stall ({sorted(a['rule'] for a in alerts)})")
+        connected = []
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = health(cfg, ["--loop", "--interval", "0", "--max-polls", "2"],
+                        connect_fn=lambda n: connected.append(n) or client, sleep=lambda s: None)
+        log = open(os.path.join(cfg.out_dir, "health.log")).read()
+        ok(rc == 0 and connected == ["h", "h"] and log.count("HEALTH session_error") == 1
+           and "HEALTH monitor_error: could not read trace.jsonl: unparseable line" in log,
+           "RC51c-4 health --loop logs each alert once across polls, input errors included")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = health(cfg, ["--loop", "--interval", "0", "--max-polls", "3"], connect_fn=lambda n: None,
+                        sleep=lambda s: None)
+        ok(rc == 0 and buf.getvalue().count("not running; poll skipped") == 3,
+           "RC51c-5 a cluster that is not running is reported and the poll skipped, every poll")
+
+        # Codex round 1, P1-1: health connects through a path that cannot create a
+        # cluster (Coiled API security + a plain distributed Client), even in a stop race.
+        class NoCreate(types.ModuleType):
+            def __getattr__(self, k):
+                raise AssertionError(f"health touched coiled.{k}")
+        saved = sys.modules.get("coiled")
+        sys.modules["coiled"] = NoCreate("coiled")
+        made = []
+
+        def boom(*a, **k):
+            raise AssertionError("must not be called")
+        try:
+            got = connect_existing("h", lister=lambda: [{"name": "h", "id": 7, "current_state": {"state": "running"}}],
+                                   security_fn=lambda cid: ("SEC", {"address_to_use": f"tls://10.0.0.{cid}:8786"}),
+                                   client_cls=lambda addr, **kw: made.append((addr, kw.get("security"))) or "CLIENT")
+            ok(got == "CLIENT" and made == [("tls://10.0.0.7:8786", "SEC")],
+               "RC51c-7 connect_existing opens a plain Client on the live cluster's scheduler with its security")
+
+            def stopping(cid):
+                raise RuntimeError("Cannot get security info for cluster 7, scheduler state is stopping")
+            gone = connect_existing("h", lister=lambda: [{"name": "h", "id": 7, "current_state": {"state": "stopping"}}],
+                                    security_fn=boom, client_cls=boom)
+            race = connect_existing("h", lister=lambda: [{"name": "h", "id": 7, "current_state": {"state": "running"}}],
+                                    security_fn=stopping, client_cls=boom)
+            ok(gone is None and race is None,
+               "RC51c-8 a stopped cluster, or one stopping between list and connect, gives None, never a new one")
+        finally:
+            if saved is None:
+                sys.modules.pop("coiled", None)
+            else:
+                sys.modules["coiled"] = saved
+        import inspect as _inspect
+        src = _inspect.getsource(health) + _inspect.getsource(health_snapshots) + _inspect.getsource(connect_existing)
+        ok("coiled.Cluster(" not in src and "attach(" not in src, "RC51c-9 health never calls coiled.Cluster or attach")
+
+        # Codex round 1, P1-2: transient read errors are logged and retried, never fatal.
+        os.remove(cfg.state_file)
+        polls = []
+
+        def flaky(n):
+            polls.append(n)
+            if len(polls) == 2:
+                with open(cfg.state_file, "w") as f:
+                    f.write("{torn")
+            if len(polls) == 3:
+                with open(cfg.state_file, "w") as f:
+                    json.dump({"R1": {"worker": "agent"}}, f)
+            return client
+        open(os.path.join(cfg.out_dir, "health.log"), "w").close()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = health(cfg, ["--loop", "--interval", "0", "--max-polls", "3"], connect_fn=flaky,
+                        sleep=lambda s: None)
+        log = open(os.path.join(cfg.out_dir, "health.log")).read()
+        ok(rc == 0 and len(polls) == 3 and "FileNotFoundError" in log and "JSONDecodeError" in log
+           and "HEALTH session_error" in log,
+           "RC51c-10 a missing then torn assignments.json is a monitor error; the loop retries and recovers")
+        os.remove(os.path.join(rd, "status.json"))
+        with open(os.path.join(rd, "trace.jsonl"), "wb") as f:
+            f.write(b"\xff\xfe not text\n")
+        s3 = health_snapshots(cfg, client, {"R1": {"worker": "agent"}})["R1"]
+        ok(s3["status"] is None and s3["input_errors"], "RC51c-11 an unreadable or vanished run file is an input error")
+
+        class Broken(FakeClient):
+            def run_on_scheduler(self, fn, *a):
+                raise OSError("scheduler gone")
+        s2 = health_snapshots(cfg, Broken(), {"R1": {"worker": "agent"}})["R1"]
+        ok(s2["scheduler"] is None and any("scheduler gone" in e for e in s2["input_errors"]),
+           "RC51c-6 an unreadable scheduler is an input error, not a quiet snapshot")
+
+        class Leaky(FakeClient):
+            def run_on_scheduler(self, fn, *a):
+                raise OSError("x" * 140 + "token=" + "sk-ant-api03-LEAKLEAKLEAKLEAK" + " tail")
+        s4 = health_snapshots(cfg, Leaky(), {"R1": {"worker": "agent"}})["R1"]
+        ok(not any("sk-ant" in e or "LEAK" in e for e in s4["input_errors"]),
+           f"RC51c-12 a scheduler error is redacted before it is truncated ({s4['input_errors'][0][-40:]})")
 
 
 def _self_test() -> int:
@@ -1030,6 +1313,7 @@ def _self_test() -> int:
         except SystemExit:
             ok(True, "RC15 a config without CONFIG is refused")
     _self_test_42b(ok, RunConfig)
+    _self_test_51c(ok)
     for f in sorted(os.listdir(os.path.join(HERE, "configs"))):
         if f.endswith(".py") and not f.startswith("_"):   # _*.py: shared helpers (configs/_eval.py)
             try:
@@ -1072,6 +1356,8 @@ def main(argv) -> int:
         print(r.get("brief_md") or "(no decision_brief.md yet)")
     elif cmd == "report":
         print(_side(cfg, ws.report_side))
+    elif cmd == "health":
+        return health(cfg, rest)
     elif cmd == "sign":
         r = _side(cfg, ws.sign_side, open(rest[0]).read(), " ".join(rest[1:]))
         print(r["out"])

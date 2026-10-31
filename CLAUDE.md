@@ -67,7 +67,7 @@ rigor checks between rounds.
 | Add or modify a rigor gate            | `scripts/validate_critique_yaml.py` (`_check_*` fns) and any standalone validator under `scripts/`; shared loaders in `scripts/lib/` |
 | Tweak the modeler agent's behavior    | `agents/modeler.py` SYSTEM_PROMPT (~950 lines rendered; § 4 rigor contracts, timeline rendered from the manifest) |
 | Add a new skill                       | Create `.claude/skills/<name>/SKILL.md` with `name`/`description` frontmatter, attach in `agents/__init__.py`, run `python3 scripts/validate_skill_attachments.py` |
-| Trace a phase change                  | `CHANGELOG.md` (phase commit ledger and gate internals)       |
+| Trace a phase change                  | `CHANGELOG.md` (phase commit ledger and gate internals); `changes/` for merged phases not yet folded in |
 | See what artifacts a run produces     | Any local `runs/<timestamp>_*/` directory. `runs/` is gitignored, so there is no checked-in example; run the pipeline or ask a maintainer for one. |
 | Reuse a finished run's model          | `<run>/model_card.md` (written at finalize by `scripts/model_card.py`), then `python3 scripts/ask.py <run> --set <input>=<value>` (refuses anything outside the card's valid domain) |
 
@@ -97,9 +97,14 @@ the live attachment picture.
 | Exit | Statuses |
 |------|----------|
 | 0    | `completed`, `completed_with_report_restored` |
-| 2    | `completed_scope_declared`, `completed_gate_not_accepted`, `completed_gate_error`, `completed_gate_not_run`, `completed_no_report`, `run_failed`, `budget_exhausted` |
+| 2    | `completed_scope_declared`, `completed_gate_not_accepted`, `completed_gate_error`, `completed_gate_not_run`, `completed_no_report`, `run_failed`, `budget_exhausted`, `awaiting_signoff`, `awaiting_scope_signoff`, `completed_scope_declined` |
 | 1    | `harness_tampered`, `artifact_tampered`, errors |
 | 130  | `interrupted` |
+
+`awaiting_signoff` (the decision brief) and `awaiting_scope_signoff` (Phase 49
+β: declarations of findings that bear on the primary decision) are resumable
+with `--resume` once signed; `completed_scope_declined` means the owner
+declined such a declaration and no rounds were left to fix it.
 
 Cloud credentials (`AZ_*` / `AZURE_*`) are stripped from the agent
 environment unless `main.py --cloud` is passed.
@@ -107,7 +112,8 @@ environment unless `main.py --cloud` is passed.
 ## Phase history
 
 The phase commit ledger (Phases 2-21) and contributor-level gate
-internals live in `CHANGELOG.md`. Add a row there for every phase.
+internals live in `CHANGELOG.md`. New rows arrive through change
+fragments (see Conventions).
 
 ## Conventions
 
@@ -121,6 +127,15 @@ internals live in `CHANGELOG.md`. Add a row there for every phase.
 - **Greek-letter commits**: each phase ships ≤4-5 Greek-letter
   sub-commits (α, β, γ …), often squash-merged as one PR. The letter
   is reused as a reference in code comments and skills.
+- **Change fragments, not ledger edits**: a PR does not edit the
+  phase ledger table in `CHANGELOG.md` or the Status section of
+  `docs/design/improvement-plan.md`. It adds one new file,
+  `changes/<branch>.md`, holding the ledger row and an optional Status
+  line (format in `changes/README.md`). A maintainer folds the
+  fragments in at release with `python3 scripts/assemble_changes.py
+  --write` and commits the result. CI (`assemble_changes.py
+  --check-pr`) fails a PR that edits either region other than as that
+  exact fold.
 - **Fail closed**: a gate that cannot read, parse, or recognize its
   input (missing file, wrong type, unknown verdict string) must emit a
   finding, not return an empty list.
@@ -153,15 +168,18 @@ for f in main.py \
   scripts/comparator_efficiency.py scripts/compare_models.py scripts/compute.py scripts/convergence_report.py \
   scripts/cross_model_critic.py scripts/decision_brief.py scripts/derived_rebuild.py scripts/done_when.py \
   scripts/effect_size_registry.py \
+  scripts/assemble_changes.py \
   scripts/effect_concordance.py \
   scripts/effort_floors.py scripts/eligibility_probe.py \
   scripts/figure_validator.py scripts/gate_replay.py scripts/headline_binding.py scripts/identifiability.py \
   scripts/identifiability_a_priori.py scripts/lessons.py scripts/mechanism_manifest.py \
   scripts/calibration_spec.py \
+  scripts/gate_fuzz.py \
   scripts/numeric_consistency.py scripts/open_problems.py scripts/pipeline.py \
   scripts/optimization_quality.py scripts/plan_criteria.py \
   scripts/propagate_uncertainty.py scripts/render_claims.py \
   scripts/results_store.py scripts/run_autopsy.py \
+  cloud/run_health.py \
   scripts/sanity_checks.py scripts/sdk_scenarios.py \
   scripts/sensitivity_analysis.py \
   scripts/source_checks.py scripts/stall_rule.py \
@@ -173,12 +191,14 @@ for f in main.py \
   scripts/lib/positive_control.py scripts/lib/provenance.py \
   scripts/lib/rigor_artifacts.py scripts/lib/safe_io.py \
   toolkit/alloc/costs.py toolkit/alloc/packages.py toolkit/alloc/optimize.py \
-  scripts/lib/text_spans.py scripts/lib/transcript_cost.py; do
+  scripts/lib/text_spans.py scripts/lib/transcript_cost.py \
+  scripts/declaration_tests.py scripts/lib/scope_declarations.py scripts/scope_signoff.py; do
   echo "== $f"; python3 "$f" --self-test || echo "FAILED: $f"
 done
 python3 scripts/validate_skill_attachments.py      # frontmatter + phantoms
 python3 scripts/lib/expert_priors.py --validate    # priors corroboration
 python3 scripts/regression_eval.py                 # planted-defect regression eval (CI)
+python3 scripts/gate_fuzz.py                       # bad-input fuzz over every gate_findings check (CI)
 ```
 
 Install with `pip install -r requirements.txt` (pinned; add
