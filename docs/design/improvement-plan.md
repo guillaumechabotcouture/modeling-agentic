@@ -30,6 +30,8 @@ In review (Phase 48, simplification before attempt 9, with no change to gate out
 - **γ:** `main.py` split by concern (3,057 → 2,077 lines): session plumbing, budget, preflight and run finishing moved to `agents/run_session.py`, `run_budget.py`, `run_preflight.py` and `run_finish.py`; `main.py` keeps the CLI and the session loop and re-exports every moved name (stacked on β).
 - **δ:** `agents/__init__.py` (1,934 → 453 lines) keeps the registry; the lead prompt and the hooks moved to `agents/lead_prompt.py` and `agents/hooks.py`, re-exported by the package (stacked on γ).
 
+In review (Phase 50 α, workstream F below): the eval suite, `scripts/eval_suite.py` with five synthetic questions and deterministic graders, to measure the stage-machine steps S3–S6. No cloud run yet; the owner reviews the generating models and rubric weights first.
+
 Before attempt 9:
 - A16 (compute places chunks on free workers itself, so VMs that join mid-batch get work): merged (Phase 45 δ, #66);
 - A9 (stale data-stage figures): merged (Phase 47 α, #69);
@@ -152,6 +154,21 @@ Domain knowledge reaches the model only as prose, and a self-graded severity dec
 | E2 | **What-if queries without agents:** `ask <stored run> --set <param>=<value> ...` loads the stored model, checks the request is inside the card's valid domain (refuses outside it), runs the interface with the run's uncertainty draws, and returns the answer with intervals, recording the query. Deterministic, no model API calls. | Attempt 8: re-answer its own alternative envelopes and match them; an out-of-domain request is refused. |
 | E3 | **Follow-up runs:** `main.py --from <stored run> "<follow-up or feedback>"` starts from the stored model, data and declared pipeline; the planner writes a brief of what changes from the base (signed by the owner); the pipeline reruns only stale steps; critics and gates review the change; the report is an addendum. | One real follow-up on attempt 8 (e.g. a new envelope plus an SMC unit-cost change) at a fraction of a full run's cost. |
 | E4 | **Promotion into the toolkit:** after a run, an agent proposes moving its best reusable modules (e.g. a malaria vector-and-immunity module, D7) into the toolkit as a PR the owner approves, with tests from the run's validation. | Next same-area run starts from the toolkit module. |
+
+## Workstream F — an eval suite to measure each change (owner decision, 2026-10-30)
+
+**Why.** We have judged the harness by single runs of about US$500 on one question (attempts 7–8). One run is one sample, and two smoke runs on the same small question differed by a whole round. The stage-machine steps S3–S6 each change how every run is driven, so each needs a measurement: answer quality against a known-good answer, rounds to converge, dollars and wall time. The planted-defect test (`regression_eval.py`) checks the gates. It does not score the answer.
+
+**Design.** Five small planted-truth questions on synthetic data, each with a seeded generator, a hidden answer key and a deterministic grader, modelled on OmicsBench (subtask DAG, JSON answer, gated mode, failure-mode taxonomy). Each run is capped at US$35 and 3 rounds and should take under an hour. What each question tests and how it is scored is in the protected design note (`docs/design/eval-suite.md`). That note, like `evals/`, is never shipped to agents, and eval questions run only from a sanitized workspace.
+
+| # | Change | Check / metric | Status |
+|---|---|---|---|
+| F1 | **Suite and graders:** `scripts/eval_suite.py` (`generate`, `run`, `grade`, `report`, A/B comparison), five questions in `evals/` with inputs in `data/evals/`, one launcher config per question (`cloud/configs/eval_*.py`), failure taxonomy `evals/taxonomy.yaml`. The answer keys are kept out of the launch tarball and the harness manifest. | Self-tests: generators deterministic, perfect answer 1.00 and planted wrong answer 0.00 on every question, no hidden file in `git archive HEAD` or the manifest, no shipped text signalling an answer, eval runs only from a sanitized workspace, feasibility before credit, replicates and input hashes from the launch record (L1–L7, R1–R5, RC50). | In review (Phase 50 α) |
+| F2 | **Owner review** of the generating models' plausibility, the rubric weights and tolerances, and the mechanism wording the graders accept. | Owner sign-off on `eval-suite.md` §7; rubric changes in one PR. | Open: owner |
+| F3 | **Baseline on main:** the suite at 2 replicates per question. | `suite_scores.json` for main; about US$200–350 of model spend plus VM credits; replicate spread per question. | After F2 |
+| F4 | **Acceptance measure for S3–S6:** each step runs the suite on its branch (`EVAL_TREE`, `EVAL_TAG`) and reports quality, rounds, dollars and hours against the F3 baseline. | `eval_suite.py report <main> <branch>`; a step merges only with no question worse beyond the replicate spread. | Planned, with S3 |
+| F5 | **Replicate count:** 3 replicates on two questions to size the noise, so F4's "beyond the spread" rule has a basis. | Spread per question; a recommended replicate count. | Planned, with F3 |
+| F6 | Optional: a small real-data subset question with a rubric for expert scoring (no synthetic truth). | Owner-scored rubric beside the deterministic score. | Not started |
 
 ## Order and checkpoints
 

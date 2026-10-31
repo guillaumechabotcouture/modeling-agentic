@@ -1,0 +1,61 @@
+# Rubric for eval question measles_campaign (Phase 50 α). Weights and tolerances are
+# proposals for the owner's review.
+question: measles_campaign
+title: Measles catch-up campaign targeting (districts and age range) under a budget
+disease_area: measles
+decision: campaign option per district (none, ages 1-4, ages 1-9)
+tests: [immunity profile from serology vs administrative coverage, age structure, threshold dynamics, budgeted optimisation]
+config: cloud/configs/eval_measles_campaign.py
+
+allocation:
+  kind: categorical
+  files: [allocation_optimized.csv, models/allocation_optimized.csv, "allocation_*.csv", "models/allocation_*.csv"]
+  unit_column: [district, unit]
+  package_column: [package, option, recommended_package]
+  value_column: [cases_averted]
+  aliases: {"A": "A_1to4", "1-4": "A_1to4", "ages 1-4": "A_1to4", "B": "B_1to9", "1-9": "B_1to9",
+            "ages 1-9": "B_1to9", "no campaign": "none"}
+
+text_files: [report.md, results.md, decision_rule.md, scope_declaration.yaml, models/mechanism_manifest.yaml]
+
+subtasks:
+  - {id: data, depends_on: []}
+  - {id: effects, depends_on: [data]}
+  - {id: optimize, depends_on: [effects]}
+  - {id: uncertainty, depends_on: [effects]}
+
+checks:
+  - {id: inputs, type: inputs_referenced, subtask: data, weight: 0.05, pass: 0.99}
+  - {id: unit_estimates, type: unit_value_accuracy, subtask: effects, weight: 0.10, pass: 0.6, rel_tol: 0.35}
+  - id: mechanism
+    type: text_mentions
+    subtask: effects
+    weight: 0.15
+    failure: mechanism_not_reported
+    window: 500
+    groups:
+      - 'immunity gap|immunity (is )?(lower|below)|susceptib\w* (pocket|cohort|gap)|gap in (immunity|protection)|under-?immun|missed cohort|over-?report|overstat|overestimat|administrative coverage (is|was) (too high|inflated|unreliable)|serosurvey (shows|reveals|indicates)|discrepan'
+      - '\bM0?3\b|\bM0?7\b|\bM10\b'
+    units: {names: [M03, M07, M10], min: 2}
+  - {id: concordance, type: allocation_concordance, subtask: optimize, weight: 0.20, pass: 0.85}
+  - {id: plan_value, type: allocation_value, subtask: optimize, weight: 0.20, pass_ratio: 0.97, floor: 0.75}
+  - {id: headline, type: headline_accuracy, subtask: uncertainty, weight: 0.15, headline: total_cases_averted,
+     outputs: [total_cases_averted, '.*cases_averted.*'], rel_tol: 0.20}
+  - {id: interval, type: interval_coverage, subtask: uncertainty, weight: 0.15, headline: total_cases_averted,
+     outputs: [total_cases_averted, '.*cases_averted.*'], max_rel_width: 1.5}
+
+penalties:
+  false_confidence_accept: {below: 0.6, value: 0.3}
+  confident_wrong_interval: {max_rel_width: 0.25, value: 0.1}
+
+self_test:
+  perfect_text: >-
+    Inputs used: districts.csv, routine_coverage_admin.csv and serosurvey_2025.csv. The serosurvey shows an
+    immunity gap in M03, M07 and M10 that the administrative coverage does not: children born 2020-2022 are
+    far less immune than reported, so those districts get the 1-9 year campaign.
+  wrong_text: >-
+    Inputs used: districts.csv, routine_coverage_admin.csv and serosurvey_2025.csv. Immunity follows routine
+    coverage; the lowest-coverage districts get the campaign.
+
+# Words that signal this question's planted answer (self-test R1).
+leak_keywords: [immunity gap, "M03", "M07", "M10", born 2020, administrative coverage]

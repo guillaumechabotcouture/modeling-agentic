@@ -1,0 +1,62 @@
+# Rubric for eval question malaria_alloc (Phase 50 α). Weights and tolerances are
+# proposals for the owner's review. The grader is scripts/eval_suite.py; the truth is
+# evals/malaria_alloc/_truth/truth.json, written by generate.py.
+question: malaria_alloc
+title: Malaria intervention packages across 10 districts under a budget
+disease_area: malaria
+decision: one package per district (multiple-choice knapsack)
+tests: [effect estimation from programme history, intervention interaction (ITN x IRS), budgeted optimisation, uncertainty]
+config: cloud/configs/eval_malaria_alloc.py
+
+allocation:
+  kind: categorical
+  files: [allocation_optimized.csv, models/allocation_optimized.csv, "allocation_*.csv", "models/allocation_*.csv"]
+  unit_column: [district, unit]
+  package_column: [package, recommended_package]
+  value_column: [cases_averted]
+  aliases: {"ITNs": "ITN", "nets": "ITN", "no intervention": "none", "status quo": "none"}
+
+text_files: [report.md, results.md, decision_rule.md, scope_declaration.yaml, models/mechanism_manifest.yaml]
+
+subtasks:
+  - {id: data, depends_on: []}
+  - {id: effects, depends_on: [data]}
+  - {id: optimize, depends_on: [effects]}
+  - {id: uncertainty, depends_on: [effects]}
+
+checks:
+  - {id: inputs, type: inputs_referenced, subtask: data, weight: 0.05, pass: 0.99}
+  - {id: unit_estimates, type: unit_value_accuracy, subtask: effects, weight: 0.10, pass: 0.7, rel_tol: 0.25}
+  - id: mechanism
+    type: text_mentions
+    subtask: effects
+    weight: 0.15
+    failure: mechanism_not_reported
+    window: 400
+    groups:
+      - '\b(itns?|nets?|llins?)\b'
+      - '\birs\b|indoor residual'
+      - 'redundan|overlap|sub-?additiv|less than (multiplicative|additive)|not multiplicative|non-?multiplicative|interaction|antagonis|diminishing|little (added|additional|extra|incremental)|small (added|additional|incremental)|adds? (only|little)'
+  - {id: concordance, type: allocation_concordance, subtask: optimize, weight: 0.20, pass: 0.8}
+  - {id: plan_value, type: allocation_value, subtask: optimize, weight: 0.20, pass_ratio: 0.98, floor: 0.85}
+  - {id: headline, type: headline_accuracy, subtask: uncertainty, weight: 0.15, headline: total_cases_averted,
+     outputs: [total_cases_averted, '.*cases_averted.*'], rel_tol: 0.10}
+  - {id: interval, type: interval_coverage, subtask: uncertainty, weight: 0.15, headline: total_cases_averted,
+     outputs: [total_cases_averted, '.*cases_averted.*'], max_rel_width: 0.6}
+
+penalties:
+  false_confidence_accept: {below: 0.6, value: 0.3}
+  confident_wrong_interval: {max_rel_width: 0.25, value: 0.1}
+
+self_test:
+  perfect_text: >-
+    Inputs used: districts.csv, programme_history.csv and unit_costs.csv. The programme history shows
+    that IRS adds little on top of ITNs: the ITN+IRS rate ratio (0.55) is far above the multiplicative
+    prediction, so the two are largely redundant and IRS is not funded where nets are given.
+  wrong_text: >-
+    Inputs used: districts.csv, programme_history.csv and unit_costs.csv. Effects were combined
+    multiplicatively, and spraying is added in the highest-burden districts.
+
+# Words that signal this question's planted answer. A shipped file (anything agents can
+# read) must never put one next to a mention of the suite (self-test R1).
+leak_keywords: [redundan, "ITN+IRS", "ITN x IRS", "IRS adds", multiplicative]

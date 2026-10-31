@@ -25,3 +25,6 @@ validator_stderr_*.txt
 /experiments/*
 !/experiments/E[0-9]*_*/
 /*.pdf
+
+# Phase 50 α: eval answer keys are regenerated from the seeded generators, never committed
+/evals/*/_truth/

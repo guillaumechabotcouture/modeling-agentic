@@ -1,0 +1,60 @@
+# Rubric for eval question tb_acf (Phase 50 α). Weights and tolerances are proposals
+# for the owner's review.
+question: tb_acf
+title: TB active case-finding algorithm per district under a budget
+disease_area: tuberculosis
+decision: screening algorithm per district (none, symptom screen, chest X-ray)
+tests: [district-specific yields from screening records, subclinical TB, pooling vs heterogeneity, budgeted optimisation]
+config: cloud/configs/eval_tb_acf.py
+
+allocation:
+  kind: categorical
+  files: [allocation_optimized.csv, models/allocation_optimized.csv, "allocation_*.csv", "models/allocation_*.csv"]
+  unit_column: [district, unit]
+  package_column: [package, algorithm, recommended_package]
+  value_column: [cases_detected]
+  aliases: {"symptom": "SYM", "symptom screening": "SYM", "chest x-ray": "CXR", "x-ray": "CXR"}
+
+text_files: [report.md, results.md, decision_rule.md, scope_declaration.yaml, models/mechanism_manifest.yaml]
+
+subtasks:
+  - {id: data, depends_on: []}
+  - {id: effects, depends_on: [data]}
+  - {id: optimize, depends_on: [effects]}
+  - {id: uncertainty, depends_on: [effects]}
+
+checks:
+  - {id: inputs, type: inputs_referenced, subtask: data, weight: 0.05, pass: 0.99}
+  - {id: unit_estimates, type: unit_value_accuracy, subtask: effects, weight: 0.10, pass: 0.7, rel_tol: 0.25}
+  - id: mechanism
+    type: text_mentions
+    subtask: effects
+    weight: 0.15
+    failure: mechanism_not_reported
+    window: 500
+    groups:
+      - 'subclinical|asymptomatic|without symptoms|no symptoms|symptom screen\w* (misses|miss|finds few|has low)|low symptom|yield ratio (differs|varies)|cxr.{0,40}(much )?(higher|greater|larger) (yield|gain)'
+      - '\bT0?2\b|\bT0?5\b|\bT0?8\b'
+    units: {names: [T02, T05, T08], min: 2}
+  - {id: concordance, type: allocation_concordance, subtask: optimize, weight: 0.20, pass: 0.8}
+  - {id: plan_value, type: allocation_value, subtask: optimize, weight: 0.20, pass_ratio: 0.98, floor: 0.85}
+  - {id: headline, type: headline_accuracy, subtask: uncertainty, weight: 0.15, headline: total_cases_detected,
+     outputs: [total_cases_detected, '.*cases_detected.*'], rel_tol: 0.10}
+  - {id: interval, type: interval_coverage, subtask: uncertainty, weight: 0.15, headline: total_cases_detected,
+     outputs: [total_cases_detected, '.*cases_detected.*'], max_rel_width: 0.5}
+
+penalties:
+  false_confidence_accept: {below: 0.6, value: 0.3}
+  confident_wrong_interval: {max_rel_width: 0.1, value: 0.1}
+
+self_test:
+  perfect_text: >-
+    Inputs used: districts.csv, acf_records_2022_2025.csv, algorithm_costs.csv and national_reference_yields.csv.
+    In T02, T05 and T08 most prevalent TB is subclinical, so symptom screening misses most cases there and the
+    CXR yield is several times the SYM yield; the national reference ratio does not apply to them.
+  wrong_text: >-
+    Inputs used: districts.csv, acf_records_2022_2025.csv, algorithm_costs.csv and national_reference_yields.csv.
+    One CXR/SYM yield ratio was pooled across districts to reduce noise.
+
+# Words that signal this question's planted answer (self-test R1).
+leak_keywords: [subclinical, "T02", "T05", "T08", yield ratio, pooled]

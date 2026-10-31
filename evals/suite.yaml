@@ -1,0 +1,14 @@
+# Eval suite manifest (Phase 50 α). Order is the report order. Each question has
+# evals/<q>/{question.txt, generate.py, rubric.yaml}, inputs in data/evals/<q>/ and a
+# launcher config cloud/configs/eval_<q>.py. Nothing under evals/ is shipped to agents.
+version: 1
+questions:
+  - malaria_alloc
+  - measles_campaign
+  - tb_acf
+  - flu_vaccine
+  - dengue_outbreak
+# Per-run model spend is capped by the config (--max-budget-usd 35); compute VMs are
+# billed separately (cloud/run_cluster.py report-cost).
+expected_cost_usd_per_question: [20, 35]
+expected_wall_hours_per_question: 1.0
