@@ -209,13 +209,30 @@ def merged_spec(run_dir: str) -> dict:
             for q in parts[:-1]:
                 cur = cur.setdefault(q, {})
             cur[parts[-1]] = v
-    try:
-        eng = json.load(open(os.path.join(run_dir, ENGINE_CHOICE))).get("engine")
-    except (OSError, ValueError):
-        eng = None
-    if eng and not spec.get("engine"):
+    eng = engine_choice_ref(run_dir)
+    auto = spec.get("engine") in (None, "auto") or (isinstance(spec.get("engine"), dict) and spec["engine"].get("auto"))
+    if eng and auto:                      # an explicit engine in the signed spec wins
         spec["engine"] = eng
     return _abs_spec(spec, run_dir)
+
+
+def engine_choice_record(ref: str, why: str, candidates: list, cross_check=None, config=None) -> dict:
+    """engine_choice.json, the format agreed with workstream B: the harness writes it; a spec
+    with `engine: auto` takes its engine from it."""
+    rec = {"engine": {"ref": ref, "config": config or {}}, "why": why, "candidates": candidates}
+    if cross_check is not None:
+        rec["cross_check"] = cross_check
+    return rec
+
+
+def engine_choice_ref(run_dir: str) -> str | None:
+    try:
+        e = json.load(open(os.path.join(run_dir, ENGINE_CHOICE))).get("engine")
+    except (OSError, ValueError):
+        return None
+    if isinstance(e, dict):
+        return e.get("ref")
+    return e if isinstance(e, str) else None
 
 
 def load_spec(path: str) -> dict:
@@ -368,11 +385,30 @@ class _ToolkitApi:
 
     def __init__(self, api):
         self.api = api
-        self.validate = api.validate
         self.headline = api.headline
         self.gate_findings = api.gate_findings
-        self.eligible_engines = eligible_engines
         self.cross_check = cross_check
+        # B's computational settings (incl. analysis.workers); its validate(path) refuses others.
+        try:
+            from toolkit.spec import schema
+            self.settings_paths = tuple(".".join(p) for p in sorted(schema.SETTINGS_PATHS))
+        except ImportError:
+            self.settings_paths = SETTINGS_PATHS
+
+    def validate(self, spec, base=None) -> list[str]:
+        """B's validate raises on some refusals (a bad settings leaf: schema.SpecError); the
+        machine needs a list of problems, so any exception is one (fail closed)."""
+        try:
+            return list(self.api.validate(spec, base) if base is not None else self.api.validate(spec))
+        except Exception as e:  # noqa: BLE001
+            return [f"spec validation failed: {type(e).__name__}: {e}"]
+
+    def eligible_engines(self, spec, engines=None):
+        """The filter in B's vocabulary when B exposes engine_needs(spec); otherwise ours."""
+        en = getattr(self.api, "engine_needs", None)
+        if en is not None:
+            spec = dict(spec, engine_needs=en(spec))
+        return eligible_engines(spec, engines)
 
     def pipeline_steps(self, spec_path, run_dir):
         out = []
@@ -390,10 +426,16 @@ def backend(prefer: str = "auto"):
     if prefer in ("auto", "toolkit"):
         try:
             from toolkit.analysis import api
-            return _ToolkitApi(api)
+            from toolkit.spec import schema
         except ImportError:
             if prefer == "toolkit":
                 raise
+        else:
+            # The machine chooses the engine after SIGN, so the signed spec says `engine: auto`
+            # and the engine comes from engine_choice.json (agreed with B; B's schema marks it
+            # ENGINE_AUTO). Without it every v2 run would fail at CONFIGURE: keep the spike adapter.
+            if getattr(schema, "ENGINE_AUTO", False) or prefer == "toolkit":
+                return _ToolkitApi(api)
     return sys.modules[__name__]
 
 
@@ -545,6 +587,38 @@ def _self_test() -> int:
     st = _ToolkitApi(fake).pipeline_steps("s", "d")
     ok(st == [{"id": "analyze", "run": "python3 x.py", "inputs": [], "outputs": []}],
        f"B14 workstream B's step (cmd, produced_by) becomes an S1 step (run) {st}")
+    fake.engine_needs = lambda spec: {"components": {"a": [1]}, "outputs": ["dalys"]}
+    rows = _ToolkitApi(fake).eligible_engines({}, [("toolkit.engines.contract:ToyEngine", None)])
+    ok(rows[0]["eligible"], "B19 with B's engine_needs the filter uses B's vocabulary")
+    with tempfile.TemporaryDirectory() as d:
+        json.dump(engine_choice_record("x.y:Z", "w", []), open(os.path.join(d, ENGINE_CHOICE), "w"))
+        ok(engine_choice_ref(d) == "x.y:Z", "B20 engine_choice.json in the agreed format ({engine: {ref, config}})")
+
+    def boom(spec, base=None):
+        raise ValueError("analysis_settings.yaml: constraints.envelope_usd is not a computational setting")
+    fake.validate = boom
+    v = _ToolkitApi(fake).validate("x/decision_spec.yaml")
+    ok(len(v) == 1 and "not a computational setting" in v[0], f"B21 B's raising validate becomes a problem list {v}")
+    import types
+    saved = {k: sys.modules.get(k) for k in ("toolkit.analysis", "toolkit.analysis.api", "toolkit.spec", "toolkit.spec.schema")}
+    try:
+        for k in saved:
+            sys.modules[k] = types.ModuleType(k)
+        sys.modules["toolkit.analysis"].api = fake
+        sys.modules["toolkit.analysis.api"] = fake
+        sys.modules["toolkit.spec"].schema = sys.modules["toolkit.spec.schema"]
+        sys.modules["toolkit.spec.schema"].SETTINGS_PATHS = frozenset({("uncertainty", "draws")})
+        no_auto = backend()
+        sys.modules["toolkit.spec.schema"].ENGINE_AUTO = True
+        with_auto = backend()
+    finally:
+        for k, mod in saved.items():
+            if mod is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = mod
+    ok(no_auto is sys.modules[__name__] and isinstance(with_auto, _ToolkitApi),
+       "B22 B's API is used only once its schema takes `engine: auto` from engine_choice.json")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -553,4 +627,8 @@ def _self_test() -> int:
 
 
 if __name__ == "__main__":
+    # Pipeline steps run with at most 2 BLAS threads per process: oversubscribed BLAS threads
+    # stalled toy analyses for an hour on a loaded laptop (workstream B measured 8.6 min -> 42 s).
+    for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        os.environ.setdefault(_v, "2")
     sys.exit(main())

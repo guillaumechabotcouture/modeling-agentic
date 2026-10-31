@@ -226,3 +226,22 @@ Each fix was first reproduced by a failing self-test case, then fixed.
 | 5 | Fix tasks could edit `decision_spec.yaml` | The owner signs the whole file (sha256, as workstream B does). Fixes edit `analysis_settings.yaml`, which may hold only `uncertainty.draws`, `uncertainty.seed`, `emulator.points`, `emulator.seed` (B's `schema.SETTINGS_PATHS` in the spike's vocabulary). The engine the harness chose is in `engine_choice.json`, so the spec stays as signed. After each fix the harness checks the spec hash and the settings file; a violation is undone before anything is rebuilt | T19, F13, B15–B17 |
 | 6 | The deliverable path was not validated | `deliverable_problems`: relative, inside the run directory, no symlink on the way, not a harness-, gate- or critic-owned file; otherwise nothing is written and a non-declarable HIGH `deliverable_path_invalid` is raised | T29 |
 | 7 | The golden traces exercised the legacy wrapper only | Check D runs the machine's v2 GATE state on each copy, fed the harness findings the stored gate recorded, against the stored action and rule; `run` exits 1 on any mismatch or missing decision; a mutation test (v2 gate replaced by ACCEPT) must fail | G7–G9 |
+
+## 10. Engine choice with workstream B's schema (agreed 2026-10-31)
+
+- The signed `decision_spec.yaml` may say `engine: auto` (optionally `{auto: true, candidates: [...]}`).
+  An explicit engine in the spec wins.
+- The harness's ENGINE_CHOICE writes `engine_choice.json`:
+  `{"engine": {"ref", "config"}, "why", "candidates": [{ref, eligible, why_not}], "cross_check"}`.
+  Agents never write it.
+- B's `schema.load` takes the engine from that file when the spec says auto (fail closed if it is
+  missing or not among the candidates); the manifest and each artifact's envelope record its sha256
+  beside `spec_sha256`, and a later change is `analysis_contract_stale`. B may expose
+  `api.engine_needs(spec)` so the eligibility filter speaks B's vocabulary.
+- **Not built yet on B's side** (PR #89 is in review; B asked the coordinator where to put it).
+  Until B's schema marks `ENGINE_AUTO`, `analysis_backend.backend()` keeps the spike adapter, so a
+  v2 run never fails at CONFIGURE for want of an engine in the signed spec.
+- Checked against PR #89 at 491ce7b: its analyze step loads in the S1 runner with no errors; its
+  settings paths (including `analysis.workers`) are used through `validate(path)`; its raising
+  `validate` (SpecError on a bad settings leaf) is turned into a problem list; its new finding kinds
+  flow through the ledger unchanged.

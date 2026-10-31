@@ -592,7 +592,7 @@ class Machine:
             pick, why = eligible[0]["ref"], f"harness: the pick {pick!r} is not eligible; first eligible engine"
         else:
             why = (res.output or {}).get("why", "")
-        rec.update(engine=pick, why=why)
+        rec.update(AB.engine_choice_record(pick, why, rows))
         if self.cross and len(eligible) > 1:
             try:
                 rec["cross_check"] = self.backend.cross_check(
@@ -924,7 +924,8 @@ def _self_test() -> int:
         ok(led["D-001"].status == "fixed" and os.path.exists(os.path.join(d, "allocation_optimized.csv"))
            and "Numbers (rendered by the harness)" in open(os.path.join(d, "report.md")).read(),
            "T13 the ledger closes the finding; report and deliverable are rendered by the harness")
-        ok(json.load(open(os.path.join(d, "engine_choice.json")))["engine"].endswith("ToyEngine")
+        ok(json.load(open(os.path.join(d, "engine_choice.json")))["engine"]["ref"].endswith("ToyEngine")
+           and AB.engine_choice_ref(d).endswith("ToyEngine") and "candidates" in json.load(open(os.path.join(d, AB.ENGINE_CHOICE)))
            and load_state(d).engine.endswith("ToyEngine"), "T14 the engine choice is automatic and recorded")
         ok(json.load(open(os.path.join(d, "metadata.json")))["status"] == "completed", "T15 metadata.json carries the status")
 
