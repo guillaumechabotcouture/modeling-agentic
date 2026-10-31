@@ -57,6 +57,12 @@ jobs:
       - name: Planted-defect regression eval (deterministic gates)
         run: .venv/bin/python scripts/regression_eval.py
 
+      # Every gate_findings(run_dir) check against every bad-input class; known
+      # failures are listed in tests/gate_fuzz_expected.yaml.
+      - name: Gate fuzz (bad input never crashes a check or makes it pass)
+        timeout-minutes: 3
+        run: .venv/bin/python scripts/gate_fuzz.py
+
       - name: Structure metrics against main (information only)
         if: always()
         continue-on-error: true
