@@ -364,6 +364,18 @@ def _result_conflicts(rel: str, res: dict, label: str, restated) -> list[dict]:
     return out
 
 
+def load_test_result(run_dir: str, rel) -> tuple[dict | None, list[str]]:
+    """Phase 49 α: the D1/D9 result-file loader for other checks (a scope
+    declaration's decision test). (result, []) when the file is usable, else
+    (None, problems): missing, unparseable, no verdict, no `varied` or
+    `criterion`, or share numbers that contradict the verdict."""
+    res, problem = _test_result(run_dir, rel)
+    if problem:
+        return None, [problem]
+    conflicts = [f["claim"] for f in _result_conflicts(str(rel), res, "", None)]
+    return (None, conflicts) if conflicts else (res, [])
+
+
 def _check_scope(run_dir: str, mid: str, e: dict, report: str | None) -> list[dict] | None:
     """Owner-specified simplification: None when the entry does not claim one."""
     by = str(e.get("specified_by", "")).strip().lower()
@@ -559,6 +571,11 @@ def _amendment_names(run_dir: str, aid, fid: str) -> bool:
             text = f"{am.get('change', '')} {am.get('reason', '')}"
             return re.search(r"(?<![A-Za-z0-9_.-])" + re.escape(fid) + r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9_])", text, re.I) is not None
     return False
+
+
+# Phase 49 α: the owner-text checks, shared with scripts/declaration_tests.py.
+owner_quote_found = _decision_quote_found
+amendment_names = _amendment_names
 
 
 def decision_layer_findings(run_dir: str, round_n: int | None = None, allocation: bool | None = None) -> list[dict]:

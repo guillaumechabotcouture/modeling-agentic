@@ -341,6 +341,9 @@ Appropriate when:
 - Some hypotheses are untestable with available data/model
 - A structural limitation exists that can't be resolved in this iteration
 - The model is fit for its primary purpose even if not for everything
+- and, for a HIGH gate finding, a decision test shows the recommendation
+  does not change when the finding's quantity is set to its target
+  (Phase 49 α; rigor manifest entry `decision_tests`, and `model-fitness`)
 
 ### Decision Heuristic
 
@@ -363,6 +366,8 @@ the bounds), run a test for each one you check, and decide: a specific fix,
 or a declaration. Record it in `models/stall_diagnoses.yaml`; the schema, the
 round count and how long a diagnosis lasts are in the rigor manifest
 (entry `stall_diagnoses`) and `effort_floors.yaml`.
+A declaration needs the same decision test as a scope declaration (entry
+`decision_tests`).
 
 ---
 

@@ -66,6 +66,11 @@ from lib.md_helpers import _strip_limitations_and_scope  # noqa: E402
 # Phase 48 β: the sibling-script loader lives in lib.siblings (shared with the
 # check modules moved out of this file); same rules, same module objects.
 from lib.siblings import load_sibling as _load_sibling  # noqa: E402
+# Phase 49 α: the scope-declaration normalizer (Phase 21 β) lives in
+# lib.scope_declarations, shared with scripts/declaration_tests.py.
+from lib.scope_declarations import (  # noqa: E402
+    CRITIC_DERIVED_PREFIXES as _CRITIC_DERIVED_PREFIXES, load as _load_scope_declarations,
+    entry_declared_ids as _entry_declared_ids, entry_has_justification as _entry_has_justification)
 
 
 # Phase 21 β: closed verdict vocabularies of each producing script. A
@@ -180,6 +185,11 @@ _NON_DECLARABLE_KINDS = frozenset({
     "eligibility_benefit_scales_with_total",
     "eligibility_probe_error",
     "a_priori_count_mismatch",
+    # Phase 49 α: a declared HIGH finding without a usable decision test, or
+    # one whose test shows the decision changes.
+    "scope_declaration_untested",
+    "scope_declaration_test_invalid",
+    "declared_finding_changes_decision",
 })
 _NON_DECLARABLE_SUFFIXES = ("_invalid", "_unknown_verdict",
                             "_not_script_produced", "_stale")
@@ -595,8 +605,8 @@ def _recompute_action(d: dict, max_rounds: int, current_round: int,
     return d
 
 
-# Gate kinds that carry a critic's finding under another name: never declared away early.
-_CRITIC_DERIVED_PREFIXES = ("done_when_", "critique_", "claim_overclaimed", "sufficiency", "crossmodel")
+# Gate kinds that carry a critic's finding under another name (never declared
+# away early): _CRITIC_DERIVED_PREFIXES, from lib.scope_declarations.
 
 
 def _declared_early(outstanding: list[dict], d: dict) -> bool:
@@ -1446,6 +1456,8 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None,
         violations += G(_check_persistent_medium_escalation, run_dir,
                         round_n=round_n,
                         current_kinds={v.get("kind") for v in violations})
+    # Phase 49 α (A20): the decision-test check runs in main() over every gate finding
+    # (spec-compliance, rigor, registry) once assembled: _apply_declaration_tests.
     # Phase 47 ε (A17): a finding at N gates in a row needs a diagnosis or a declaration.
     violations += G(lambda rd: _load_sibling("stall_rule").gate_findings(
                         rd, round_n, violations, _declared_ids(rd), is_non_declarable),
@@ -1466,6 +1478,23 @@ _UNIVERSAL_COVERAGE_FIELDS = (
     ("universal_coverage_dalys_averted_estimate", ()),
     ("efficiency_pct", ("gc7_efficiency_pct",)),
 )
+
+
+def _apply_declaration_tests(decision: dict, run_dir: str, spec_v: list, rigor_v: list, reg_v: list,
+                             max_rounds: int, current_round: int, post_write: bool = False) -> dict:
+    """Phase 49 α (A20): a scope declaration of a HIGH gate finding needs a decision
+    test (scripts/declaration_tests.py). Run over every gate finding (Codex review:
+    spec-compliance and registry HIGHs reach rule 3a too), keeping each one's
+    identity: a registry finding is named by its parameter. The findings join the
+    rigor blockers (not declarable), and the decision is recomputed."""
+    found = [v if v.get("key") or str(v.get("name") or "-") == "-" else dict(v, key=v["name"])
+             for v in list(spec_v or []) + list(rigor_v or []) + list(reg_v or []) if isinstance(v, dict)]
+    dt = run_guarded(lambda: _load_sibling("declaration_tests").gate_findings(
+        run_dir, current_round, found, post_write=post_write, non_declarable=is_non_declarable),
+        check_name="declaration_tests")
+    if not dt:
+        return decision
+    return _incorporate_rigor_violations(decision, list(rigor_v or []) + dt, max_rounds, current_round)
 
 
 def _check_universal_coverage(run_dir: str) -> list[dict]:
@@ -3472,94 +3501,8 @@ def _check_coherence_audit(run_dir: str, post_write: bool = False) -> list[dict]
     return out
 
 
-# ---------------------------------------------------------------------------
-# Phase 21 β — scope_declaration.yaml normalization
-# ---------------------------------------------------------------------------
-#
-# Real runs used at least eight different top-level keys for their
-# declarations (`declarations`, `scope_declarations`, `unresolved_blockers`,
-# `unresolved_high_blockers`, `acknowledged_limitations`, ...), referenced
-# blockers via `blocker_id`, lists of ids, or ids embedded in prose, and
-# marked some entries `status: RESOLVED`. The Phase 19 β budget counted only
-# `declarations:` entries with `id`/`claim`, so any other shape burned zero
-# budget; the pre-mortem check accepted any substring anywhere in the file.
-# One normalizer now feeds both.
-
-_BLOCKER_ID_RE = re.compile(r"\b[A-Z][A-Z0-9]{0,5}-\d{2,4}\b")
-_STRUCTURED_ID_FIELDS = ("blocker_id", "blocker_ids", "blockers", "covers",
-                         "concern_id", "concern_ids", "ids", "acknowledges",
-                         "blocker")
-_JUSTIFICATION_FIELDS = ("why_unresolved", "justification", "rationale",
-                         "claim", "reason", "impact_on_conclusions",
-                         "description")
-_NON_DECLARATION_KEYS = frozenset({"budget", "version", "run_dir",
-                                   "generated_at", "declared_at"})
-
-
-def _load_scope_declarations(run_dir: str
-                             ) -> tuple[Optional[dict], list[dict], list[dict]]:
-    """Return (doc, entries, findings) for scope_declaration.yaml.
-
-    `entries` is every mapping found in any top-level list (except the
-    `budget` block and metadata keys), plus any top-level mapping value
-    that itself looks like a declaration (has an id field). Entries with
-    `status: RESOLVED` are dropped — they declare nothing.
-    """
-    path = artifact_path("scope_declaration", run_dir)
-    doc, findings = safe_load_mapping(path, "scope_declaration", stage="GATE",
-                                      display_path="scope_declaration.yaml")
-    if doc is None:
-        return None, [], findings
-    entries: list[dict] = []
-    for key, val in doc.items():
-        if key in _NON_DECLARATION_KEYS:
-            continue
-        items = val if isinstance(val, list) else (
-            [dict(val, id=val.get("id", key))]
-            if isinstance(val, dict) else [])
-        for e in items:
-            if isinstance(e, dict):
-                if str(e.get("status") or "").strip().upper() == "RESOLVED":
-                    continue
-                entries.append(e)
-            elif isinstance(e, str) and e.strip():
-                entries.append({"claim": e})
-            else:
-                entries.append({})
-    return doc, entries, findings
-
-
-def _strings_in(obj: Any) -> list[str]:
-    if isinstance(obj, str):
-        return [obj]
-    if isinstance(obj, dict):
-        return [s for v in obj.values() for s in _strings_in(v)]
-    if isinstance(obj, list):
-        return [s for v in obj for s in _strings_in(v)]
-    return []
-
-
-def _entry_declared_ids(entry: dict, structured_only: bool) -> set[str]:
-    """Blocker ids an entry declares. Structured fields always count;
-    with structured_only=False, ids mentioned anywhere in the entry's
-    text count too (one entry listing 20 ids declares 20 blockers).
-    The entry's own `id` (e.g. SD-001) is not a blocker reference unless
-    it is the only identifier present."""
-    ids: set[str] = set()
-    for f in _STRUCTURED_ID_FIELDS:
-        v = entry.get(f)
-        for x in (v if isinstance(v, list) else [v]):
-            if isinstance(x, (str, int)) and str(x).strip():
-                ids.add(str(x).strip())
-    if not structured_only:
-        own = str(entry.get("id") or "")
-        for txt in _strings_in({k: v for k, v in entry.items() if k != "id"}):
-            ids.update(m for m in _BLOCKER_ID_RE.findall(txt) if m != own)
-    return ids
-
-
-def _entry_has_justification(entry: dict) -> bool:
-    return any(str(entry.get(f) or "").strip() for f in _JUSTIFICATION_FIELDS)
+# Phase 21 β scope_declaration.yaml normalization: moved to
+# scripts/lib/scope_declarations.py (Phase 49 α), imported at the top.
 
 
 # Phase 19 β — scope-declaration budget cap. Default is 3 declarations
@@ -4692,6 +4635,35 @@ def _run_self_test() -> int:
            f"SW3 the decision text lists stalled findings: {txt}")
     ok(act([bd, sa], both, both, cur=8)["action"] == "DECLARE_SCOPE" and act([bd, sa], both, both, cur=8)["rule_matched"] == 3,
        "EF7 in the last round the existing rule 3 applies")
+    # Phase 49 α: an untested declaration blocks rule 3a, and rule 3 at exhaustion.
+    ut = {"kind": "scope_declaration_untested", "id": "RIG-009", "severity": "HIGH",
+          "scope_declarable": not is_non_declarable("scope_declaration_untested")}
+    ok(act([bd, sa, ut], both, both)["action"] == "PATCH_OR_RETHINK"
+       and act([bd, sa, ut], both, both, cur=8)["action"] == "RUN_FAILED",
+       "DT-V1 an untested declaration: no early DECLARE_SCOPE, RUN_FAILED at exhaustion")
+    # DT-V3 (Codex P1): a registry or spec-compliance HIGH declared at two gates in a row is held to
+    # the decision test too; rule 3a must not fire on it untested.
+    with tempfile.TemporaryDirectory() as d:
+        yaml.safe_dump({"declarations": [{"id": "SD-9", "blocker_id": "cost_crosscheck_mismatch",
+                                          "why_unresolved": "x"}]}, open(os.path.join(d, "scope_declaration.yaml"), "w"))
+        reg = [{"kind": "cost_crosscheck_mismatch", "severity": "HIGH", "stage": "REGISTRY", "name": "itn_cost",
+                "claim": "cost differs"}]
+        dec = incorporate_registry_violations({"unresolved_high": [], "declared": ["cost_crosscheck_mismatch"],
+                                               "declared_prev": ["cost_crosscheck_mismatch"]}, reg, 8, 5)
+        ok(dec["action"] == "DECLARE_SCOPE", f"DT-V3a precondition: rule 3a fires without the check ({dec['action']})")
+        dec = _apply_declaration_tests(dec, d, [], [], reg, 8, 5, post_write=False)
+        ok(dec["action"] == "PATCH_OR_RETHINK"
+           and any(b.get("kind") == "scope_declaration_untested" for b in dec["unresolved_high"]),
+           f"DT-V3 the untested registry declaration blocks rule 3a: {dec['action']}")
+    with tempfile.TemporaryDirectory() as d:
+        yaml.safe_dump({"declarations": [{"id": "SD-7", "blocker_id": "allocation_unstable", "why_unresolved": "x"}]},
+                       open(os.path.join(d, "scope_declaration.yaml"), "w"))
+        _v49 = [{"kind": "allocation_unstable", "severity": "HIGH", "stage": "OPTIMIZATION",
+                 "key": "allocation_robustness", "claim": "UNSTABLE"}]
+        _f49 = _load_sibling("declaration_tests").gate_findings(d, 5, _v49, non_declarable=is_non_declarable)
+        ok([x["kind"] for x in _f49] == ["scope_declaration_untested"]
+           and is_non_declarable(_f49[0]["kind"], _f49[0]["scope_declarable"]),
+           f"DT-V2 the wired check flags the untested declaration, not declarable: {_f49}")
     with tempfile.TemporaryDirectory() as d:
         with open(os.path.join(d, _VALIDATOR_HISTORY_FILE), "w") as f:
             f.write(json.dumps({"round": 3, "action": "PATCH_OR_RETHINK", "declared": ["a"]}) + "\n")
@@ -7704,6 +7676,7 @@ def main() -> int:
                                            args.current_round, record=not args.no_history)
     decision = _defer_write_findings(decision, args.run_dir, args.max_rounds, args.current_round)
 
+    spec_violations, rigor_violations, reg_violations = [], [], []   # Phase 49 α
     if args.spec_compliance:
         spec_module = _load_spec_compliance()
         if spec_module is None:
@@ -7827,6 +7800,11 @@ def main() -> int:
         decision = incorporate_registry_violations(
             decision, reg_violations, args.max_rounds, args.current_round,
         )
+
+    # Phase 49 α (A20): every gate finding, once assembled, against the declarations.
+    decision = _apply_declaration_tests(decision, args.run_dir, spec_violations, rigor_violations,
+                                        reg_violations, args.max_rounds, args.current_round,
+                                        post_write=args.post_write)
 
     decision["post_write"] = bool(args.post_write)
     if not args.no_history:
