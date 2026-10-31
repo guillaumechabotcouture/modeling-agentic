@@ -93,6 +93,8 @@ SCRIPT_OUTPUTS = (
     "round_plan.frozen.json",        # Phase 32 γ: the plan as handed out, written by the hook
     "presentation_review.json",      # Phase 49 δ: which draft each presentation review read (hook)
     "presentation_review.json.tmp",
+    "presentation_review/*",         # Phase 49 δ: the snapshot each presentation review read
+    "presentation_review/**",
     "round_plan.frozen.json.tmp",
     # S1: the pipeline runner's records, written by the harness run only
     # (scripts/pipeline.py OWN_FILES). Declared outputs are protected by the

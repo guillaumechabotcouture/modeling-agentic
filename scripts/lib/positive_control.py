@@ -817,7 +817,8 @@ def _record_presentation_review(run_dir: str) -> None:
     """Phase 49 δ: the harness records which draft the presentation critic read
     (agents/hooks.py); the honest run's critic read the current draft."""
     from lib.siblings import load_private
-    load_private("presentation_pass", "_ma_positive_control_").record_review(run_dir, None)
+    pp = load_private("presentation_pass", "_ma_positive_control_")
+    pp.record_review(run_dir, dict(pp.snapshot(run_dir), critique_sha_before=None))
 
 
 def _self_test() -> int:

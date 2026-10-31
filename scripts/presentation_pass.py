@@ -86,16 +86,53 @@ def critique_ok(run_dir: str) -> tuple[bool, str]:
     return True, ""
 
 
-def record_review(run_dir: str, critique_sha_before: Optional[str]) -> dict:
-    """The harness records, when a critique-presentation spawn returns, which
-    draft it reviewed (sha256) and whether it produced a usable critique: the
-    YAML must parse and must have been rewritten by this spawn."""
-    rel = draft_file(run_dir)
+REVIEWED_FILES = ("manuscript.md", "report.md")   # what the critic is told to read
+SNAP_DIR = "presentation_review"                  # harness-written, protected
+
+
+def snapshot(run_dir: str) -> dict:
+    """Codex (Phase 49 δ, round 2): the harness copies the files the critic reads
+    into presentation_review/<key>/ (read-only) before the review starts, and
+    the critic is pointed at the copy. The hashes are taken here, at snapshot
+    time, so a writer edit or a re-render during the review cannot be credited
+    to it. Returns {"snapshot", "files": {rel: sha|None}, "critique_sha_before"}."""
+    files = {rel: _sha(os.path.join(run_dir, rel)) for rel in REVIEWED_FILES}
+    key = hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()[:16]
+    rel_dir = f"{SNAP_DIR}/{key}"
+    dest = os.path.join(run_dir, rel_dir)
+    os.makedirs(dest, exist_ok=True)
+    copied = []
+    for rel, sha in files.items():
+        if sha is None:
+            continue
+        out = os.path.join(dest, rel)
+        if not os.path.exists(out):
+            with open(os.path.join(run_dir, rel), "rb") as src, open(out, "wb") as dst:
+                dst.write(src.read())
+            os.chmod(out, 0o444)
+        copied.append(f"{rel_dir}/{rel}")
+    return {"snapshot": rel_dir, "files": files, "copied": copied,
+            "critique_sha_before": _sha(os.path.join(run_dir, CRITIQUE))}
+
+
+def snapshot_note(run_dir_rel: str, snap: dict) -> str:
+    """What the hook appends to the critic's prompt."""
+    names = [rel for rel, sha in snap["files"].items() if sha]
+    return ("\n\n[harness] Review ONLY this snapshot of the draft, taken when this review started: "
+            + ", ".join(f"{run_dir_rel}/{snap['snapshot']}/{n}" for n in names)
+            + ". Do not read the live manuscript.md or report.md; write critique_presentation.yaml and "
+            "critique_presentation.md in the run directory as usual.")
+
+
+def record_review(run_dir: str, before: dict) -> dict:
+    """When a full critique-presentation review returns: which snapshot it read
+    (the hashes captured at snapshot time) and whether it produced a usable
+    critique (parseable, and rewritten by this spawn)."""
     after = _sha(os.path.join(run_dir, CRITIQUE))
     ok, reason = critique_ok(run_dir)
-    if ok and after == critique_sha_before:
+    if ok and after == before.get("critique_sha_before"):
         ok, reason = False, "critique_presentation.yaml was not rewritten by this review"
-    rec = {"draft": rel, "draft_sha": _sha(os.path.join(run_dir, rel)) if rel else None,
+    rec = {"snapshot": before.get("snapshot"), "files": before.get("files") or {},
            "critique_sha": after, "ok": ok, "reason": reason,
            "at": datetime.now(timezone.utc).isoformat()}
     tmp = os.path.join(run_dir, REVIEW + ".tmp")
@@ -106,23 +143,26 @@ def record_review(run_dir: str, critique_sha_before: Optional[str]) -> dict:
 
 
 def review_state(run_dir: str) -> tuple[str, str]:
-    """("no_draft" | "ok" | "missing" | "failed" | "stale", detail)."""
-    rel = draft_file(run_dir)
-    if rel is None:
+    """("no_draft" | "ok" | "missing" | "failed" | "stale", detail). Ok only when
+    the recorded snapshot hashes of BOTH manuscript.md and report.md equal the
+    delivered files (a missing file must be missing in both)."""
+    if draft_file(run_dir) is None:
         return "no_draft", ""
     try:
         with open(os.path.join(run_dir, REVIEW)) as f:
             rec = json.load(f)
-        if not isinstance(rec, dict):
-            raise ValueError("not a mapping")
+        if not isinstance(rec, dict) or not isinstance(rec.get("files"), dict):
+            raise ValueError("not a review record")
     except FileNotFoundError:
         return "missing", "no presentation review has been recorded for this run's draft"
     except (OSError, ValueError) as e:
         return "failed", f"{REVIEW} is unreadable ({e})"
     if not rec.get("ok"):
         return "failed", f"the last presentation review did not produce a usable critique ({rec.get('reason')})"
-    if rec.get("draft") != rel or rec.get("draft_sha") != _sha(os.path.join(run_dir, rel)):
-        return "stale", f"the last presentation review covered another version of the draft ({rec.get('at')})"
+    for rel in REVIEWED_FILES:
+        if rec["files"].get(rel) != _sha(os.path.join(run_dir, rel)):
+            return "stale", (f"{rel} changed after the snapshot the last presentation review read "
+                             f"({rec.get('snapshot')}, {rec.get('at')})")
     return "ok", ""
 
 
@@ -223,34 +263,54 @@ def _self_test() -> int:
                                  "still_present": False},
                                 {"id": "P-010", "severity": "HIGH", "claim": "old, still there",
                                  "still_present": True}]}
-        before = _sha(os.path.join(d, CRITIQUE))
+        before = snapshot(d)
         yaml.safe_dump(crit, open(os.path.join(d, CRITIQUE), "w"))
         rec = record_review(d, before)
         p = pending(d)
-        ok(rec["ok"] and p["review"] == "ok" and kinds(d) == [],
-           f"PP4 a successful review of the current draft is recorded and accepted: {rec} {p}")
+        snap_copy = os.path.join(d, before["snapshot"], DRAFT)
+        ok(rec["ok"] and p["review"] == "ok" and kinds(d) == [] and os.path.exists(snap_copy)
+           and not os.access(snap_copy, os.W_OK),
+           f"PP4 a successful review of the snapshot is recorded and accepted; the copy is read-only: {rec} {p}")
         ok([i["id"] for i in p["items"]] == ["P-001", "P-002", "P-010"] and p["round"] == 8,
            f"PP5 open writer HIGHs only (not MEDIUM, MODEL-targeted, resolved, or no longer present): {p}")
         # Codex P1-2: the writer revises after the review and the critic never re-runs.
         open(os.path.join(d, DRAFT), "w").write("# Draft, revised\n")
         ok(kinds(d) == ["presentation_review_stale"] and pending(d)["review"] == "stale",
            f"PP6 (Codex P1-2) the draft changed after the review: stale, blocks ACCEPT: {kinds(d)}")
+        # Codex round 2: the writer edits the draft WHILE the critic reviews: the record
+        # carries the hashes taken at snapshot time, so the review covers the old text.
+        before = snapshot(d)
+        open(os.path.join(d, DRAFT), "w").write("# Draft, edited during the review\n")
+        yaml.safe_dump(dict(crit, verdict="REVISE"), open(os.path.join(d, CRITIQUE), "w"))
+        record_review(d, before)
+        ok(kinds(d) == ["presentation_review_stale"],
+           f"PP6b (Codex round 2) a writer edit during the review leaves the review stale: {kinds(d)}")
         # Codex P1-2: the critic crashes (its YAML is not rewritten).
-        rec = record_review(d, _sha(os.path.join(d, CRITIQUE)))
+        rec = record_review(d, snapshot(d))
         ok(not rec["ok"] and kinds(d) == ["presentation_review_failed"],
            f"PP7 (Codex P1-2) a review that did not rewrite the critique failed, blocks ACCEPT: {rec}")
+        before = snapshot(d)
         open(os.path.join(d, CRITIQUE), "w").write("blockers: [unclosed\n")
-        rec = record_review(d, None)
+        rec = record_review(d, before)
         ok(not rec["ok"] and kinds(d) == ["presentation_review_failed"],
            f"PP8 an unparseable critique is a failed review: {rec}")
         crit["blockers"] = [dict(b, resolved=True) for b in crit["blockers"]]
         crit["carried_forward"] = []
+        before = snapshot(d)
         yaml.safe_dump(crit, open(os.path.join(d, CRITIQUE), "w"))
-        record_review(d, None)
+        record_review(d, before)
         ok(pending(d)["items"] == [] and pending(d)["reason"] and kinds(d) == [],
            "PP9 the re-review closes them: nothing pending, no finding")
-        open(os.path.join(d, "report.md"), "w").write("# Rendered\n")
-        ok(kinds(d) == [], "PP10 re-rendering report.md from the same draft keeps the review current")
+        # Codex round 2: report.md is rendered (or re-rendered by the harness fallback)
+        # after the review: the delivered report is not the one reviewed.
+        open(os.path.join(d, "report.md"), "w").write("# Rendered after the review\n")
+        ok(kinds(d) == ["presentation_review_stale"],
+           "PP10 (Codex round 2) report.md changed after the review (e.g. the fallback render): stale")
+        before = snapshot(d)
+        yaml.safe_dump(dict(crit, round=9), open(os.path.join(d, CRITIQUE), "w"))
+        record_review(d, before)
+        ok(kinds(d) == [] and sorted(json.load(open(os.path.join(d, REVIEW)))["files"]) == list(sorted(REVIEWED_FILES)),
+           "PP10b a review of both files, unchanged since, is current; both hashes recorded")
         open(os.path.join(d, REVIEW), "w").write("{not json")
         ok(kinds(d) == ["presentation_review_failed"], "PP11 an unreadable review record fails closed")
         f = gate_findings(d)[0]
