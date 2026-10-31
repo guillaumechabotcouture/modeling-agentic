@@ -611,8 +611,8 @@ PRESENTATION_FIX_PROMPT = """The modeling sessions have ended. {situation}
 For run directory {run_dir}, do exactly these steps, then stop:
 {writer_step}{n0}. Run `python3 scripts/render_claims.py {run_dir}`.
 {n1}. Spawn `critique-presentation` with a prompt that begins
-   `This is critique round {round}.` Ask it to review {run_dir}/report.md
-   (the draft is {run_dir}/manuscript.md), carry every earlier blocker
+   `This is critique round {round}.` Ask it to review the draft (the harness
+   points it at a read-only snapshot of report.md and manuscript.md), carry every earlier blocker
    forward (still_present true or false, with resolved_evidence), and
    rewrite critique_presentation.yaml and critique_presentation.md.
 

@@ -1850,7 +1850,7 @@ def _run_self_test() -> int:
     async def _fq_p(prompt, options):
         _pseen["calls"] += 1
         _pseen["prompt"], _pseen["budget"], _pseen["agents"] = prompt, options.max_budget_usd, sorted(options.agents)
-        _before = _pp._sha(os.path.join(_pd, "critique_presentation.yaml"))
+        _before = _pp.snapshot(_pd)          # what the hook does when the critic's spawn starts
         _yaml_pf.safe_dump(dict(_crit, blockers=[dict(b, resolved=True) for b in _crit["blockers"]]),
                            open(os.path.join(_pd, "critique_presentation.yaml"), "w"))
         _pp.record_review(_pd, _before)      # what the hook records when the critic's spawn returns
@@ -1875,7 +1875,7 @@ def _run_self_test() -> int:
     json.dump({"question": "q"}, open(os.path.join(_pd, "metadata.json"), "w"))
     open(os.path.join(_pd, "manuscript.md"), "w").write("# Draft\n")
     _yaml_pf.safe_dump(dict(_crit, blockers=_crit["blockers"][1:]), open(os.path.join(_pd, "critique_presentation.yaml"), "w"))
-    _pp.record_review(_pd, None)
+    _pp.record_review(_pd, dict(_pp.snapshot(_pd), critique_sha_before=None))
     _pi = asyncio.run(presentation_fix_pass(_pd, _pd, "q", _pbud, 600.0, 4, query_fn=_fq_p))
     ok(_pseen["calls"] == 1 and not _pi.get("ran") and "presentation_fix_pass" not in json.load(
         open(os.path.join(_pd, "metadata.json"))), f"PF5 reviewed draft, nothing for the writer: no session: {_pi}")
@@ -1960,26 +1960,56 @@ def _run_self_test() -> int:
        f"PF9 the fallback render runs under a harness grant and records report.md: {_igp.grants} {_igp.wrote}")
     shutil.rmtree(_pd, ignore_errors=True)
 
-    # PF10 (Codex P1-2): the hook records which draft a presentation review read.
+    # PF10 (Codex P1-2, round 2): a full review spawn is snapshotted and pointed at the
+    # snapshot; the record holds the hashes taken then.
     _pd = tempfile.mkdtemp()
     open(os.path.join(_pd, "manuscript.md"), "w").write("# Draft\n")
+    open(os.path.join(_pd, "report.md"), "w").write("# Draft (rendered)\n")
     _hkp = agents_pkg.create_hooks(_pd, open(os.path.join(_pd, "trace.jsonl"), "a"), datetime.now(),
                                    registered_agents=reg, max_rounds=8, hold_writer=False)
-    _spawn = {"tool_name": "Agent", "tool_input": {"subagent_type": "critique-presentation",
-                                                   "description": "review", "prompt": "This is critique round 8."}}
-    asyncio.run(_hkp["PreToolUse"][0].hooks[0](_spawn, "pr1", None))
+    _pre, _post = _hkp["PreToolUse"][0].hooks[0], _hkp["PostToolUse"][0].hooks[0]
+
+    def _spawn_p(prompt):
+        return {"tool_name": "Agent", "tool_input": {"subagent_type": "critique-presentation",
+                                                     "description": "review", "prompt": prompt}}
+    _r = asyncio.run(_pre(_spawn_p("This is critique round 8."), "pr1", None))
+    _upd = ((_r or {}).get("hookSpecificOutput") or {}).get("updatedInput") or {}
+    ok("presentation_review/" in _upd.get("prompt", "") and "Do not read the live" in _upd.get("prompt", ""),
+       f"PF10 the critic's prompt points at the snapshot: {_r}")
     _yaml_pf.safe_dump(_crit, open(os.path.join(_pd, "critique_presentation.yaml"), "w"))
-    asyncio.run(_hkp["PostToolUse"][0].hooks[0](_spawn, "pr1", None))
+    asyncio.run(_post(_spawn_p("This is critique round 8."), "pr1", None))
     _rec = json.load(open(os.path.join(_pd, _pp.REVIEW)))
-    ok(_rec.get("ok") and _rec.get("draft") == "manuscript.md" and _pp.review_state(_pd)[0] == "ok",
-       f"PF10 the hook records the reviewed draft's hash when the critic returns: {_rec}")
-    asyncio.run(_hkp["PreToolUse"][0].hooks[0](_spawn, "pr2", None))
-    asyncio.run(_hkp["PostToolUse"][0].hooks[0](_spawn, "pr2", None))
-    ok(_pp.review_state(_pd)[0] == "failed",
-       "PF10b a critic spawn that returns without rewriting its critique is a failed review")
+    ok(_rec.get("ok") and set(_rec.get("files") or {}) == {"manuscript.md", "report.md"}
+       and _pp.review_state(_pd)[0] == "ok", f"PF10a both files' snapshot hashes recorded, current: {_rec}")
+    # Concurrent writer edit during the review: stale.
+    asyncio.run(_pre(_spawn_p("This is critique round 8."), "pr2", None))
+    open(os.path.join(_pd, "manuscript.md"), "w").write("# Draft, edited while the critic read\n")
+    _yaml_pf.safe_dump(dict(_crit, verdict="REVISE"), open(os.path.join(_pd, "critique_presentation.yaml"), "w"))
+    asyncio.run(_post(_spawn_p("This is critique round 8."), "pr2", None))
+    ok(_pp.review_state(_pd)[0] == "stale",
+       f"PF10b (Codex round 2) a writer edit during the review leaves it stale: {_pp.review_state(_pd)}")
+    # A clean review, then the fallback render rewrites report.md: stale.
+    asyncio.run(_pre(_spawn_p("This is critique round 8."), "pr3", None))
+    _yaml_pf.safe_dump(dict(_crit, verdict="PASS"), open(os.path.join(_pd, "critique_presentation.yaml"), "w"))
+    asyncio.run(_post(_spawn_p("This is critique round 8."), "pr3", None))
+    _ok_before = _pp.review_state(_pd)[0]
+    open(os.path.join(_pd, "report.md"), "w").write("# Rendered again by the fallback\n")
+    ok(_ok_before == "ok" and _pp.review_state(_pd)[0] == "stale",
+       f"PF10c (Codex round 2) report.md changed by a render after the review: stale ({_ok_before})")
+    # A repair-only spawn neither creates nor refreshes the record.
+    _rec_before = open(os.path.join(_pd, _pp.REVIEW)).read()
+    _r = asyncio.run(_pre(_spawn_p("This is a repair of critique_presentation.yaml."), "pr4", None))
+    _yaml_pf.safe_dump(dict(_crit, verdict="REVISE", round=8), open(os.path.join(_pd, "critique_presentation.yaml"), "w"))
+    asyncio.run(_post(_spawn_p("This is a repair of critique_presentation.yaml."), "pr4", None))
+    ok(open(os.path.join(_pd, _pp.REVIEW)).read() == _rec_before and _pp.review_state(_pd)[0] == "stale"
+       and "updatedInput" not in json.dumps(_r or {}),
+       "PF10d (Codex round 2) a repair-only spawn does not create or refresh the review record")
     ok(enforcement.check_tool_use("Write", {"file_path": os.path.join(run_path, _pp.REVIEW), "content": "{}"},
-                                  run_path, "critique-presentation", reg) is not None,
-       "PF10c agents cannot write the review record")
+                                  run_path, "critique-presentation", reg) is not None
+       and enforcement.check_tool_use("Write", {"file_path": os.path.join(run_path, "presentation_review/x/report.md"),
+                                                "content": "x"}, run_path, "writer", reg) is not None,
+       "PF10e agents cannot write the review record or the snapshot")
+    shutil.rmtree(_pd, ignore_errors=True)
     shutil.rmtree(_pd, ignore_errors=True)
 
     # WU6-WU9 (Codex, Phase 29 review)

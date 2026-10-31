@@ -478,13 +478,30 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
         _safe_write(trace_file, record)  # a closed trace must not disable enforcement
         if deny_reason:
             return enforcement.deny_output(deny_reason)
-        if spawn and sub == "critique-presentation" and tool_use_id:
-            review_before[tool_use_id] = presentation_pass._sha(
-                os.path.join(run_path, presentation_pass.CRITIQUE))
+        updated = None
+        if spawn and sub == "critique-presentation" and tool_use_id \
+                and head.startswith("This is critique round") and presentation_pass.draft_file(run_path):
+            # Phase 49 δ (Codex round 2): only a full review is a review (a repair or a
+            # fix check never creates or refreshes the record). The harness snapshots
+            # the files the critic reads, read-only, records their hashes now, and
+            # points the critic at the snapshot.
+            try:
+                snap = presentation_pass.snapshot(run_path)
+                review_before[tool_use_id] = snap
+                if integrity is not None:
+                    for rel in snap["copied"]:
+                        integrity.harness_wrote(rel)
+                updated = dict(tool_input, prompt=str(tool_input.get("prompt") or "")
+                               + presentation_pass.snapshot_note(run_path, snap))
+            except OSError:
+                pass
         if integrity is not None:
             # Phase 23 α: record what this allowed call may change.
             integrity.on_pre(tool_use_id, tool_name, tool_input, agent_type,
                              cwd=input_data.get("cwd"))
+        if updated is not None:
+            return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow",
+                                           "updatedInput": updated}}
         return {}
 
     async def post_tool_hook(input_data, tool_use_id, context):
