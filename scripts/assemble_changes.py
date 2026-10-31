@@ -117,7 +117,9 @@ def fragment_paths(paths, where: str = "") -> list[str]:
 
 
 def _same_entry(a: dict, b: dict) -> bool:
-    return all(a[k] == b[k] for k in ("phase", "commit", "status_group", "changelog", "status"))
+    """Same ledger row (phase, commit, Changelog text); the optional Status
+    metadata does not change what would be folded into the ledger twice."""
+    return all(a[k] == b[k] for k in ("phase", "commit", "changelog"))
 
 
 def parse_fragment(text: str, name: str = "fragment") -> dict:
@@ -346,14 +348,23 @@ def _git_z(root: str, *args: str) -> list[str]:
     return [t.decode("utf-8", "surrogateescape") for t in out.split(b"\0") if t]
 
 
-def _fragments_at(root: str, ref: str) -> dict[str, dict]:
-    """{path: parsed fragment} for every fragment in the tree at `ref`."""
+def _fragments_at(root: str, ref: str) -> tuple[dict[str, dict], list[str]]:
+    """({path: parsed fragment}, [errors]) for every fragment in the tree at
+    `ref`. One malformed fragment is an error, never a reason to skip the rest."""
     names = _git_z(root, "ls-tree", "-r", "-z", "--name-only", ref, "--", CHANGES_DIR)
-    out = {}
-    for p in fragment_paths(names, f" at {ref}"):
-        b = _show_bytes(root, ref, p)
-        out[p] = parse_fragment(_decode(b or b"", p), p)
-    return out
+    out, errors = {}, []
+    try:
+        paths = fragment_paths(names, f" at {ref}")
+    except FragmentError as e:
+        errors.append(str(e))
+        paths = [p for p in names if p.startswith(CHANGES_DIR + "/") and p.endswith(".md")
+                 and "/" not in p[len(CHANGES_DIR) + 1:] and not p.upper().endswith("/README.MD")]
+    for p in paths:
+        try:
+            out[p] = parse_fragment(_decode(_show_bytes(root, ref, p) or b"", p), p)
+        except FragmentError as e:
+            errors.append(str(e))
+    return out, errors
 
 
 def check_pr(root: str, base: str) -> list[str]:
@@ -386,10 +397,8 @@ def check_pr(root: str, base: str) -> list[str]:
     # A folded entry must leave the queue: the same entry still present at HEAD
     # under any name (a rename or copy of the consumed fragment) would fold twice.
     if gone:
-        try:
-            queued = _fragments_at(root, "HEAD")
-        except FragmentError:
-            queued = {}          # already reported above, through the changed paths
+        queued, qerrs = _fragments_at(root, "HEAD")
+        problems += [f"queued fragment {e}" for e in qerrs if not any(e.startswith(p) for p in added)]
         for g in gone:
             for p, q in queued.items():
                 if _same_entry(g, q):
@@ -644,6 +653,36 @@ def _self_test() -> int:
         git("commit", "-qm", "fold, but the entry stays queued under a new name")
         ok(any("still queued" in x for x in _safe_check(td)),
            "CF19 a folded fragment that survives under a new name (rename/copy) fails")
+
+        # Codex round 2: the survivor is the same ledger row with different Status metadata.
+        git("checkout", "-q", "main")
+        git("checkout", "-q", "-b", "renamed-survivor-meta")
+        assemble(td, write=True)
+        put("changes/phase49a-meta.md", _frag(49, "α", "**Declarations.** Row A.", "Another group",
+                                             ["- **α:** other wording."]))
+        git("add", "-A")
+        git("commit", "-qm", "fold, entry kept with new status metadata")
+        ok(any("still queued" in x for x in _safe_check(td)),
+           "CF25 a folded row kept under a new name with other Status metadata still fails (ledger identity)")
+
+        # Codex round 2: a malformed fragment already on the base must not empty the queue silently.
+        git("checkout", "-q", "main")
+        put("changes/zz-broken-on-main.md", "no header\n")
+        git("add", "-A")
+        git("commit", "-qm", "a malformed fragment pushed to main")
+        git("checkout", "-q", "-b", "fold-with-broken-queue")
+        put("changes/phase49a-copy.md", frag_a)
+        os.remove(os.path.join(td, "changes", "phase49a.md"))
+        put(CHANGELOG, fold_changelog(_read(os.path.join(td, CHANGELOG)), [parse_fragment(frag_a, "x")]))
+        put(PLAN, fold_plan(_read(os.path.join(td, PLAN)), [parse_fragment(frag_a, "x")]))
+        git("add", "-A")
+        git("commit", "-qm", "fold by hand, entry copied, broken fragment untouched")
+        pr = _safe_check(td)
+        ok(any("zz-broken-on-main.md" in x for x in pr) and any("still queued" in x for x in pr),
+           f"CF26 an unchanged malformed fragment is reported and the rest of the queue still checked ({pr})")
+        git("checkout", "-q", "main")
+        os.remove(os.path.join(td, "changes", "zz-broken-on-main.md"))
+        git("commit", "-qam", "remove the malformed fragment")
 
         git("checkout", "-q", "main")
         git("checkout", "-q", "-b", "nested")
