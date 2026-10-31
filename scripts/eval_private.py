@@ -88,7 +88,10 @@ class AzureStore:
         self.rs = results_store
 
     def upload(self, path, blob):
-        self.rs.upload_retry(path, blob)
+        try:
+            self.rs.upload_retry(path, blob)
+        except Exception as e:  # noqa: BLE001 — expired credentials, exhausted retries
+            raise BundleError("storage_error", f"upload of {blob}: {type(e).__name__}: {e}") from e
 
     def download(self, blob, path):
         try:
@@ -260,11 +263,21 @@ def fetch(dest, key, store, pin) -> dict:
         man = json.loads(got["manifest.json"])
     except ValueError as e:
         raise BundleError("bundle_unreadable", "manifest.json is not JSON") from e
+    if not isinstance(man, dict):
+        raise BundleError("bundle_unreadable", "manifest.json is not a JSON object")
     actual = _sha(got["bundle.enc"])
-    if not isinstance(man, dict) or not (actual == man.get("bundle_sha256") == pin["bundle_sha256"]):
-        mh = str(man.get("bundle_sha256") if isinstance(man, dict) else None)
+    if not (actual == man.get("bundle_sha256") == pin["bundle_sha256"]):
+        mh = str(man.get("bundle_sha256"))
         raise BundleError("bundle_hash_mismatch",
                           f"ciphertext {actual[:12]}, manifest {mh[:12]}, pin {str(pin['bundle_sha256'])[:12]}")
+    # every other manifest field is determined by the pin and the ciphertext
+    expect = {"schema": 1, "version": pin.get("version"), "bundle_bytes": len(got["bundle.enc"])}
+    bad = [k for k, v in expect.items() if man.get(k) != v or type(man.get(k)) is not int]
+    if pin["prefix"] != f"{BLOB_ROOT}/v{pin.get('version')}":
+        bad.append("prefix")
+    bad += [k for k in ("questions", "legacy") if not isinstance(man.get(k), dict)]
+    if bad:
+        raise BundleError("bundle_hash_mismatch", f"manifest fields disagree with the pin or the ciphertext: {bad}")
     plain = decrypt(got["bundle.enc"], key if key is not None else keychain_key())
     try:
         unpack(plain, dest)
@@ -291,11 +304,37 @@ def opened(src: str | None = None, store=None, pin=None, key=None):
         raise BundleError("bundle_not_pinned", "no evals/private.yaml naming the bundle (run publish)")
     store = store or default_store()
     td = tempfile.mkdtemp(prefix="eval_private_")
+    with _unwind_on_termination():
+        try:
+            fetch(td, key, store, pin)
+            yield td
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+
+@contextlib.contextmanager
+def _unwind_on_termination():
+    """SIGTERM and SIGHUP end Python without running `finally` blocks; while the bundle
+    is open they raise SystemExit instead, so the decrypted directory is deleted. The
+    previous handlers are restored afterwards. (SIGKILL cannot be caught.)"""
+    import signal
+    import threading
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def _exit(signum, frame):
+        raise SystemExit(128 + signum)
+    saved = {}
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            saved[sig] = signal.signal(sig, _exit)
     try:
-        fetch(td, key, store, pin)
-        yield td
+        yield
     finally:
-        shutil.rmtree(td, ignore_errors=True)
+        for sig, h in saved.items():
+            signal.signal(sig, h)
 
 
 def _self_test() -> int:
@@ -394,8 +433,54 @@ def _self_test() -> int:
                 tmp = root
                 ok(os.path.isfile(os.path.join(root, "toy", "_truth", "truth.json")), "E6b the bundle opens")
             ok(not os.path.exists(tmp), "E6c the decrypted temporary directory is deleted afterwards")
+            # E7 (Codex round 3): every manifest field is checked against the pin and the
+            # ciphertext before decryption; a malformed manifest is a finding, not a KeyError
+            mpath = os.path.join(store_root, pin["prefix"], "manifest.json")
+            good_man = open(mpath).read()
+            for name, edit in (("version", lambda m: m.update(version=999)), ("schema", lambda m: m.update(schema=999)),
+                               ("bundle_bytes", lambda m: m.update(bundle_bytes=0)),
+                               ("no version", lambda m: m.pop("version")), ("questions", lambda m: m.update(questions=[])),
+                               ("not a dict", None)):
+                m = json.loads(good_man)
+                if edit:
+                    edit(m)
+                with open(mpath, "w") as f:
+                    json.dump(m if edit else [1, 2], f)
+                d = os.path.join(td, f"d7_{name.replace(' ', '_')}")
+                try:
+                    fetch(d, key, store, pin)
+                    ok(False, f"E7 a manifest with a changed {name} is accepted")
+                except BundleError as e:
+                    ok(e.code in ("bundle_hash_mismatch", "bundle_unreadable"), f"E7 {name}: {e.code}")
+                    ok(not os.path.exists(d) or not os.listdir(d), f"E7 {name}: nothing decrypted")
+                except Exception as e:  # noqa: BLE001
+                    ok(False, f"E7 {name}: crashed with {type(e).__name__}: {e}")
+            with open(mpath, "w") as f:
+                f.write(good_man)
+            # E8: an upload failure (expired credentials, exhausted retries) is a finding
+            az = object.__new__(AzureStore)
+
+            class _RS:
+                def upload_retry(self, path, blob):
+                    raise RuntimeError("upload of x failed after 3 attempts")
+            az.rs = _RS()
+            expect_error("storage_error", lambda: az.upload(os.path.join(src, "toy", "rubric.yaml"), "outputs/x"),
+                         "E8 an upload failure fails closed")
+            # E9: SIGTERM while the bundle is open still deletes the decrypted directory
+            import signal
+            import time
+            code = ("import sys, time; sys.path.insert(0, %r); import eval_private as ep\n"
+                    "with ep.opened(None, store=ep.LocalStore(%r), pin=%r, key=%r) as r:\n"
+                    "    print(r, flush=True); time.sleep(60)\n") % (HERE, store_root, pin, key)
+            p = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+            opened_dir = p.stdout.readline().strip()
+            p.send_signal(signal.SIGTERM)
+            p.wait(timeout=30)
+            time.sleep(0.2)
+            ok(opened_dir and not os.path.exists(opened_dir),
+               f"E9 SIGTERM still deletes the decrypted directory: {opened_dir} exists={os.path.exists(opened_dir)}")
         except (NotImplementedError, AttributeError, TypeError) as e:
-            ok(False, f"E1-E6 not implemented: {type(e).__name__}: {e}")
+            ok(False, f"E1-E9 not implemented: {type(e).__name__}: {e}")
     if fails:
         for f in fails:
             print("FAIL:", f, file=sys.stderr)

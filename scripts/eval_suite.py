@@ -93,11 +93,41 @@ def suite_questions(evals_dir=EVALS) -> list[str]:
 _ACTIVE_PRIVATE: list[str] = []
 
 
+def private_problems(root, questions) -> list[str]:
+    """What a hidden tree lacks: each question's generator, readable rubric and answer
+    key, and each legacy key's rubric and truth."""
+    probs = []
+
+    def need(rel, kind):
+        p = os.path.join(root, rel)
+        if not os.path.isfile(p):
+            probs.append(f"{rel} is missing")
+            return
+        try:
+            v = _yaml(p) if kind == "yaml" else (_read_json(p) if kind == "json" else True)
+        except (OSError, yaml.YAMLError):
+            v = None
+        if not isinstance(v, (dict, bool)):
+            probs.append(f"{rel} is not a readable {kind} mapping")
+    for q in questions:
+        need(os.path.join(q, "generate.py"), "file")
+        need(os.path.join(q, "rubric.yaml"), "yaml")
+        need(os.path.join(q, "_truth", "truth.json"), "json")
+    leg = os.path.join(root, "legacy")
+    for name in sorted(os.listdir(leg)) if os.path.isdir(leg) else []:
+        need(os.path.join("legacy", name, "rubric.yaml"), "yaml")
+        need(os.path.join("legacy", name, "_truth", "truth.json"), "json")
+    return probs
+
+
 @contextlib.contextmanager
-def use_private(src=None):
+def use_private(src=None, questions=None):
     """Open the hidden tree (`src`, a local plaintext copy, or the pinned bundle) for
-    the duration of the block."""
+    the duration of the block; an incomplete tree is refused (bundle_incomplete)."""
     with eval_private.opened(src) as root:
+        probs = private_problems(root, suite_questions() if questions is None else questions)
+        if probs:
+            raise eval_private.BundleError("bundle_incomplete", "; ".join(probs[:5]))
         _ACTIVE_PRIVATE.append(root)
         try:
             yield root
@@ -114,7 +144,14 @@ def private_root(private_dir=None) -> str:
 
 
 def load_rubric(q, private_dir=None) -> dict:
-    return _yaml(os.path.join(private_root(private_dir), q, "rubric.yaml"))
+    p = os.path.join(private_root(private_dir), q, "rubric.yaml")
+    try:
+        r = _yaml(p)
+    except (OSError, yaml.YAMLError) as e:
+        raise eval_private.BundleError("bundle_incomplete", f"{q}/rubric.yaml: {type(e).__name__}") from e
+    if not isinstance(r, dict):
+        raise eval_private.BundleError("bundle_incomplete", f"{q}/rubric.yaml is not a mapping")
+    return r
 
 
 def load_taxonomy(evals_dir=EVALS) -> dict:
@@ -123,6 +160,8 @@ def load_taxonomy(evals_dir=EVALS) -> dict:
 
 def load_generator(q, private_dir=None):
     path = os.path.join(private_root(private_dir), q, "generate.py")
+    if not os.path.isfile(path):
+        raise eval_private.BundleError("bundle_incomplete", f"{q}/generate.py is missing")
     spec = importlib.util.spec_from_file_location(f"_evalgen_{q}", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -191,18 +230,25 @@ def truth_candidates(q, private_dir=None) -> list[tuple[str, dict, dict]]:
     return out
 
 
-def _input_copies(run_dir, q, names) -> dict:
-    """sha256 of the run's own copies of the question's input files (data/<name>,
-    data/evals/<q>/<name> or <name> in the run directory)."""
-    out = {}
+def _input_copies(run_dir, q, names) -> tuple[dict, list[str]]:
+    """({name: sha256}, [names whose copies disagree]) over every copy of the question's
+    input files in the run directory (data/<name>, data/evals/<q>/<name>, <name>)."""
+    out, conflicts = {}, []
     for n in names:
+        hashes = set()
         for p in (os.path.join(run_dir, "data", n), os.path.join(run_dir, "data", "evals", q, n),
                   os.path.join(run_dir, n)):
             if os.path.isfile(p):
                 with open(p, "rb") as f:
-                    out[n] = hashlib.sha256(f.read()).hexdigest()
-                break
-    return out
+                    hashes.add(hashlib.sha256(f.read()).hexdigest())
+        if len(hashes) > 1:
+            conflicts.append(n)
+        elif hashes:
+            out[n] = hashes.pop()
+    return out, conflicts
+
+
+INPUTS_CONTRADICT = "refuse: "
 
 
 def select_truth(q, run_dir, launch, verify_inputs, private_dir=None) -> tuple[str, dict, dict, str]:
@@ -211,7 +257,8 @@ def select_truth(q, run_dir, launch, verify_inputs, private_dir=None) -> tuple[s
     Verified: the key whose input hashes equal the launch record's (none matches: the
     current key, which input_hash_problem then refuses). Unverified: the key that agrees
     with the most of the run's own input copies and with none against it; with no copies,
-    the current key."""
+    the current key. Copies that disagree with each other or match no key are a
+    contradiction: `how` then starts with INPUTS_CONTRADICT and grade_run refuses."""
     cands = truth_candidates(q, private_dir)
     if not cands:
         root = private_root(private_dir)
@@ -227,7 +274,9 @@ def select_truth(q, run_dir, launch, verify_inputs, private_dir=None) -> tuple[s
                     return (*c, "launch record")
         return (*current, "no key matches the launch record")
     names = sorted({n for c in cands for n in (c[2].get("inputs_sha256") or {})})
-    seen = _input_copies(run_dir, q, names)
+    seen, conflicts = _input_copies(run_dir, q, names)
+    if conflicts:
+        return (*current, f"{INPUTS_CONTRADICT}the run holds differing copies of {conflicts}")
     best, best_n = None, 0
     for c in cands:
         want = c[2].get("inputs_sha256") or {}
@@ -237,7 +286,9 @@ def select_truth(q, run_dir, launch, verify_inputs, private_dir=None) -> tuple[s
             best, best_n = c, agree
     if best is not None:
         return (*best, f"{best_n} input copies in the run")
-    return (*current, "no input copies in the run match a key" if seen else "no input copies in the run")
+    if seen:
+        return (*current, f"{INPUTS_CONTRADICT}the run's copies of {sorted(seen)} match no answer key")
+    return (*current, "no input copies in the run")
 
 
 # ---- answer extraction ------------------------------------------------------------------
@@ -613,19 +664,20 @@ def score_check(check, answer, truth, texts, records, input_names) -> dict:
             tol = check.get("rel_tol", 0.15)
             s = 1.0 if rel <= tol else _clamp(1 - (rel - tol) / (2 * tol))
             return _result(check, s, rel <= tol, [] if rel <= tol else ["headline_off"],
-                           f"{h['output']}={h['point']:.4g} vs truth {tv:.4g} ({basis}); rel err {rel:.3f}")
+                           f"{h['output']}={h['point']:.4g}: {'within' if rel <= tol else 'outside'} the "
+                           f"{tol:.0%} tolerance ({basis} target; the target is not reported)")
         lo, hi = h["ci_low"], h["ci_high"]
         if lo is None or hi is None:
             return _result(check, 0, False, ["interval_misses_truth"], "no interval")
         width = (hi - lo) / abs(tv) if tv else math.inf
         if not lo <= tv <= hi:
             return _result(check, 0, False, ["interval_misses_truth"],
-                           f"[{lo:.4g}, {hi:.4g}] excludes {tv:.4g}; rel width {width:.3f}", ) | {"rel_width": width,
-                                                                                                    "covers": False}
+                           f"[{lo:.4g}, {hi:.4g}] excludes the target") | {"rel_width": width, "covers": False}
         if width > check.get("max_rel_width", 1.0):
             return _result(check, 0.5, False, ["interval_uninformative"],
-                           f"covers but rel width {width:.3f}") | {"rel_width": width, "covers": True}
-        return _result(check, 1.0, True, [], f"[{lo:.4g}, {hi:.4g}] covers {tv:.4g}; rel width {width:.3f}") | {
+                           f"covers the target but is wider than {check.get('max_rel_width', 1.0):g} of it") | {
+                               "rel_width": width, "covers": True}
+        return _result(check, 1.0, True, [], f"[{lo:.4g}, {hi:.4g}] covers the target") | {
             "rel_width": width, "covers": True}
     if t == "text_mentions":
         ok, why = _mentions(texts, check.get("groups"), check.get("window", 300), check.get("units"))
@@ -639,7 +691,8 @@ def score_check(check, answer, truth, texts, records, input_names) -> dict:
             lo, hi = h["ci_low"], h["ci_high"]
             ratio = hi / lo if lo > 0 else math.inf
             honest = lo <= tv <= hi and ratio >= check.get("min_ratio", 3.0)
-            note = f"interval [{lo:.4g}, {hi:.4g}] (ratio {ratio:.2f}) vs truth {tv:.4g}"
+            note = (f"interval [{lo:.4g}, {hi:.4g}] (ratio {ratio:.2f}) "
+                    f"{'covers' if lo <= tv <= hi else 'excludes'} the target")
         elif h and h.get("point") is not None:
             honest, note = False, f"point {h['point']:.4g} with no interval"
         if not declared:
@@ -719,6 +772,8 @@ def score(answer, rubric, truth, texts, records, input_names, taxonomy=None) -> 
             if r["type"] == "scope_honesty" and "false_precision" in r["failures"]:
                 penalties.append({"id": f"confident_wrong_interval:{r['id']}", "value": cwi.get("value", 0.1)})
     p_total = sum(p["value"] for p in penalties)
+    for r in results:   # the width relative to the target, with the run's own bounds, gives the target away
+        r.pop("rel_width", None)
     classified = classify(failures, results, taxonomy)
     order = [x["id"] for x in (taxonomy or {}).get("layers", [])]
     layers = [f["layer"] for f in classified if f.get("layer") in order]
@@ -784,11 +839,14 @@ def grade_run(q, run_dir, private_dir=None, data_dir=DATA, truth=None, launch=No
     out.update(run_dir=os.path.abspath(run_dir), answer=answer, truth_seed=truth.get("seed"), truth_key=key,
                truth_selected_by=how, inputs_sha256=truth.get("inputs_sha256"), inputs_verified=verify_inputs,
                grader="scripts/eval_suite.py", schema_version=1)
-    if verify_inputs:
+    prob = None
+    if how.startswith(INPUTS_CONTRADICT):
+        prob = ("inputs_mismatch", how[len(INPUTS_CONTRADICT):])
+    elif verify_inputs:
         prob = input_hash_problem(q, truth, launch)
-        if prob:   # refuse: a score against the wrong answer key means nothing
-            out.update(quality=0.0, quality_gated=0.0, refused=prob[1], primary_layer="INFRA")
-            out["failures"].insert(0, {"code": prob[0], "check": None, "layer": "INFRA", "detail": prob[1]})
+    if prob:   # refuse: a score against the wrong answer key means nothing
+        out.update(quality=0.0, quality_gated=0.0, refused=prob[1], primary_layer="INFRA")
+        out["failures"].insert(0, {"code": prob[0], "check": None, "layer": "INFRA", "detail": prob[1]})
     return out
 
 
@@ -1110,15 +1168,31 @@ def main(argv=None) -> int:
         return 1
 
 
-def _outside_repo(path) -> bool:
-    return os.path.commonpath([os.path.abspath(path), REPO]) != REPO
+def _inside_checkout(path) -> bool:
+    """True when `path` (symlinks resolved, even if it does not exist yet) lies in any git
+    checkout or worktree: this repository or another one. Plaintext answer keys must never
+    sit where `git add` could pick them up."""
+    p = os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+    repo = os.path.realpath(REPO)
+    if os.path.commonpath([p, repo]) == repo:
+        return True
+    while True:
+        if os.path.exists(os.path.join(p, ".git")):
+            return True
+        parent = os.path.dirname(p)
+        if parent == p:
+            return False
+        p = parent
 
 
 def _run_command(ap, args, private) -> int:
+    if private and _inside_checkout(private):
+        print(f"refusing: {private} is inside a git checkout; keep the plaintext hidden half outside any checkout")
+        return 2
     if args.cmd == "fetch":
         dest = os.path.abspath(args.dest)
-        if not _outside_repo(dest):
-            print(f"refusing: {dest} is inside the repository; decrypt the hidden half outside any checkout")
+        if _inside_checkout(dest):
+            print(f"refusing: {dest} is inside a git checkout; decrypt the hidden half outside any checkout")
             return 2
         if os.path.exists(dest) and os.listdir(dest):
             print(f"refusing: {dest} is not empty")
@@ -1129,9 +1203,6 @@ def _run_command(ap, args, private) -> int:
         return 0
     if args.cmd == "publish":
         src = os.path.abspath(args.private_dir)
-        if not _outside_repo(src):
-            print(f"refusing: {src} is inside the repository; keep the plaintext hidden half outside any checkout")
-            return 2
         pin = eval_private.read_pin() or {}
         version = args.version or int(pin.get("version", 0)) + 1
         with use_private(src):   # every current answer key must match the committed inputs
@@ -1393,7 +1464,9 @@ def _self_test(with_private=False, private_dir=None) -> int:
         ok("+0.30" in txt and "3.0→2.0" in txt and "30→22" in txt, f"S11 comparison table: {txt}")
         ok("| toy | 1 | 0.50 |" in report(sa), f"S11b single table: {report(sa)}")
         for name, fn in (("S12", _test_s12_repo_tree), ("S13", _test_s13_truth_by_hashes),
-                         ("S14", _test_s14_grade_fails_closed)):
+                         ("S14", _test_s14_grade_fails_closed), ("S15", _test_s15_no_truth_in_details),
+                         ("S16", _test_s16_conflicting_copies), ("S17", _test_s17_plaintext_not_in_checkout),
+                         ("S18", _test_s18_incomplete_bundle)):
             try:
                 fn(ok, os.path.join(td, name))
             except (Exception, SystemExit) as e:  # noqa: BLE001 — a missing piece is a failed case
@@ -1494,6 +1567,99 @@ def _test_s14_grade_fails_closed(ok, td):
     codes = [f.get("code") for f in s.get("failures", [])]
     ok(rc != 0 and s.get("quality") == 0.0 and "answer_key_unavailable" in codes and "REFUSED" in buf.getvalue(),
        f"S14 grade without the bundle refuses with a finding: rc {rc} {codes} {buf.getvalue()[:200]!r}")
+
+
+def _test_s15_no_truth_in_details(ok, td):
+    """Codex round 3 P1: a check's detail (printed and saved in scores.json) never states
+    the hidden target, so a wrong answer does not reveal the right one."""
+    truth = {"seed": 1, "inputs_sha256": {"a.csv": "x"},
+             "headlines": {"h": {"basis": "fixed", "value": 1234.567}}}
+    rubric = {"question": "t", "text_files": ["report.md"],
+              "subtasks": [{"id": "u", "depends_on": []}],
+              "checks": [{"id": "acc", "type": "headline_accuracy", "subtask": "u", "weight": 0.4, "headline": "h"},
+                         {"id": "int", "type": "interval_coverage", "subtask": "u", "weight": 0.3, "headline": "h"},
+                         {"id": "sco", "type": "scope_honesty", "subtask": "u", "weight": 0.3, "headline": "h",
+                          "groups": ["x"]}]}
+    texts = []
+    for pt, lo, hi in ((2000.0, 1900.0, 2100.0), (1230.0, 1200.0, 1300.0)):
+        ans = {"process": {"has_metadata": True}, "allocation": {"status": "not_applicable"},
+               "headlines": {"h": {"output": "h", "point": pt, "ci_low": lo, "ci_high": hi}}}
+        s = score(ans, rubric, truth, "x", "", [], None)
+        texts.append(json.dumps(s))
+    leaked = [t for t in texts if re.search(r"123[45]\b|1234\.5", t)]
+    ok(not leaked, f"S15 no detail states the hidden target: {leaked[:1]}")
+
+
+def _test_s16_conflicting_copies(ok, td):
+    """Codex round 3 P1: two copies of one input file with different contents in an
+    unverified run are a contradiction: refused, not resolved by whichever is found first."""
+    import eval_private
+    rubric, truth = _toy()
+    old = b"legacy inputs\n"
+    legacy = dict(truth, question="toy", seed=0, inputs_sha256={"a.csv": hashlib.sha256(old).hexdigest()})
+    cur = dict(truth, question="toy", inputs_sha256={"a.csv": hashlib.sha256(b"current\n").hexdigest()})
+    priv = os.path.join(td, "priv")
+    eval_private._write_private(priv, "toy", rubric, cur)
+    eval_private._write_private(os.path.join(priv, "legacy", "toy_0"), None, rubric, legacy)
+    run = os.path.join(td, "run")
+    build_fixture(run, rubric, truth, "perfect")
+    os.makedirs(os.path.join(run, "data", "evals", "toy"))
+    with open(os.path.join(run, "data", "a.csv"), "wb") as f:
+        f.write(old)
+    with open(os.path.join(run, "data", "evals", "toy", "a.csv"), "wb") as f:
+        f.write(b"current\n")
+    s = grade_run("toy", run, private_dir=priv, verify_inputs=False)
+    ok(s["quality"] == 0.0 and s.get("refused") and any(f["code"] == "inputs_mismatch" for f in s["failures"]),
+       f"S16 conflicting input copies are refused: {s.get('truth_key')} {s['quality']} {s.get('refused')}")
+
+
+def _test_s17_plaintext_not_in_checkout(ok, td):
+    """Codex round 3 P1: fetch and publish refuse a plaintext directory inside any git
+    checkout (this one, another one, or through a symlink)."""
+    other = os.path.join(td, "other_checkout")
+    os.makedirs(os.path.join(other, ".git"))
+    link = os.path.join(td, "link_to_repo")
+    os.symlink(REPO, link)
+    for p in (os.path.join(REPO, "x_plain"), os.path.join(other, "sub", "plain"), os.path.join(link, "plain")):
+        ok(_inside_checkout(p), f"S17 {p} is inside a checkout")
+    ok(not _inside_checkout(os.path.join(td, "plain")), "S17b a plain temporary directory is not")
+    import contextlib
+    import io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = main(["fetch", os.path.join(link, "plain")])
+    ok(rc != 0 and not os.path.exists(os.path.join(REPO, "plain")), f"S17c fetch through a symlink refuses: {rc}")
+
+
+def _test_s18_incomplete_bundle(ok, td):
+    """Codex round 3 P1: a hidden tree missing a question's rubric, generator or answer
+    key is refused before publish and when opened; a missing file is a finding, not a crash."""
+    import eval_private
+    rubric, truth = _toy()
+    priv = os.path.join(td, "priv")
+    eval_private._write_private(priv, "toy", rubric, dict(truth, question="toy"))
+    os.remove(os.path.join(priv, "toy", "rubric.yaml"))
+    probs = private_problems(priv, ["toy"])
+    ok(any("rubric.yaml" in p for p in probs) and any("generate.py" in p for p in probs),
+       f"S18 an incomplete hidden tree is reported: {probs}")
+    try:
+        load_rubric("toy", priv)
+        ok(False, "S18b a missing rubric must raise a finding")
+    except eval_private.BundleError as e:
+        ok(e.code == "bundle_incomplete", f"S18b code {e.code}")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"S18b crashed: {type(e).__name__}")
+    saved = eval_private.default_store
+    called = []
+    eval_private.default_store = lambda: called.append(1)
+    import contextlib
+    import io
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = main(["publish", "--private-dir", priv])
+    finally:
+        eval_private.default_store = saved
+    ok(rc != 0 and not called, f"S18c publish refuses an incomplete tree before touching storage: {rc} {called}")
 
 
 def _archive_of(repo) -> bytes:
