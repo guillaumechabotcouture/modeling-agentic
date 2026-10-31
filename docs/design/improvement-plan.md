@@ -171,17 +171,16 @@ Domain knowledge reaches the model only as prose, and a self-graded severity dec
 
 **Why.** We have judged the harness by single runs of about US$500 on one question (attempts 7–8). One run is one sample, and two smoke runs on the same small question differed by a whole round. The stage-machine steps S3–S6 each change how every run is driven, so each needs a measurement: answer quality against a known-good answer, rounds to converge, dollars and wall time. The planted-defect test (`regression_eval.py`) checks the gates. It does not score the answer.
 
-**Design.** Five small planted-truth questions on synthetic data, each with a seeded generator, a hidden answer key and a deterministic grader, modelled on OmicsBench (subtask DAG, JSON answer, gated mode, failure-mode taxonomy). Each run is capped at US$35 and 3 rounds and should take under an hour. What each question tests and how it is scored is in the protected design note (`docs/design/eval-suite.md`). That note, like `evals/`, is never shipped to agents, and eval questions run only on the cloud launcher.
+**Design.** Five small planted-truth questions on synthetic data, each with a seeded generator, a hidden answer key and a deterministic grader, modelled on OmicsBench (subtask DAG, JSON answer, gated mode, failure-mode taxonomy). Each run is capped at US$35 and 3 rounds and should take under an hour. What each question tests and how it is scored is in the design note, which is part of the hidden half: the generators, rubrics, answer keys and design note are one encrypted bundle in the IDM Coiled storage account, with the key only in the maintainer's keychain (`evals/README.md`). The public repository keeps the question texts and the synthetic inputs, and eval questions run only on the cloud launcher.
 
 | # | Change | Check / metric | Status |
 |---|---|---|---|
 | F1 | **Suite and graders:** `scripts/eval_suite.py` (`generate`, `run`, `grade`, `report`, A/B comparison), five questions in `evals/` with inputs in `data/evals/`, one launcher config per question (`cloud/configs/eval_*.py`), failure taxonomy `evals/taxonomy.yaml`. The answer keys are kept out of the launch tarball and the harness manifest. | Self-tests: generators deterministic, perfect answer 1.00 and planted wrong answer 0.00 on every question, no hidden file in `git archive HEAD` or the manifest, no shipped text signalling an answer, eval runs only on an isolated cloud worker, feasibility before credit, replicates and input hashes from the launch record (L1–L7, R1–R5, RC50). | In review (Phase 50 α) |
-| F2 | **Owner review** of the generating models' plausibility, the rubric weights and tolerances, and the mechanism wording the graders accept. | Owner sign-off on `eval-suite.md` §7; rubric changes in one PR. | Open: owner |
+| F2 | **Owner review** of the generating models' plausibility, the rubric weights and tolerances, and the mechanism wording the graders accept. | Owner sign-off on the design note §7 (in the bundle); rubric changes in one PR. | Open: owner |
 | F3 | **Baseline on main:** the suite at 2 replicates per question. | `suite_scores.json` for main; about US$200–350 of model spend plus VM credits; replicate spread per question. | After F2 |
 | F4 | **Acceptance measure for S3–S6:** each step runs the suite on its branch (`EVAL_TREE`, `EVAL_TAG`) and reports quality, rounds, dollars and hours against the F3 baseline. | `eval_suite.py report <main> <branch>`; a step merges only with no question worse beyond the replicate spread. | Planned, with S3 |
 | F5 | **Replicate count:** 3 replicates on two questions to size the noise, so F4's "beyond the spread" rule has a basis. | Spread per question; a recommended replicate count. | Planned, with F3 |
 | F6 | Optional: a small real-data subset question with a rubric for expert scoring (no synthetic truth). | Owner-scored rubric beside the deterministic score. | Not started |
-
 
 ## Order and checkpoints
 

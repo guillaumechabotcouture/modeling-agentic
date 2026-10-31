@@ -3,24 +3,35 @@
 
 A harness change is judged by four numbers per run: answer quality (graded against a
 known-good answer), rounds to converge, dollars and wall time. Each question in
-`evals/suite.yaml` has a seeded generator that writes synthetic inputs to
-`data/evals/<q>/` (shipped) and the answer key to `evals/<q>/_truth/truth.json` (never
-shipped), a rubric (`evals/<q>/rubric.yaml`) and a launcher config
-(`cloud/configs/eval_<q>.py`). This script is disease-agnostic: every question-specific
-fact is in the rubric and the truth file.
+`evals/suite.yaml` has a public text (`evals/<q>/question.txt`), synthetic inputs in
+`data/evals/<q>/` (shipped) and a launcher config (`cloud/configs/eval_<q>.py`). Its
+seeded generator, rubric and answer key are the hidden half: an encrypted bundle in the
+project storage account (scripts/eval_private.py, evals/README.md), opened into a
+temporary directory that each command deletes when it ends. This script is
+disease-agnostic: every question-specific fact is in the rubric and the truth file.
 
-    python3 scripts/eval_suite.py generate [--check] [q ...]
-        write inputs and answer keys; --check regenerates into a temp dir and fails if
-        the committed inputs differ (the generators are deterministic)
+    python3 scripts/eval_suite.py grade <q> <run_dir> [--out scores.json] [--gated]
+    python3 scripts/eval_suite.py grade --root <dir> [--out suite_scores.json]
+        <dir>/<q>/<label>/runs/<run>/ as `collect` writes it (~/modeling-agentic-keep/evals/<tag>);
+        the answer key is the one whose input hashes match the run's
     python3 scripts/eval_suite.py run [--tag T] [--reps N] [--execute] [q ...]
         preflight (inputs current, nothing hidden in the launch tarball), then print the
         launch commands; --execute runs them (each launch costs up to the US$35 cap)
-    python3 scripts/eval_suite.py grade <q> <run_dir> [--out scores.json] [--gated]
-    python3 scripts/eval_suite.py grade --root <dir> [--out suite_scores.json]
-        <dir>/<q>/<label>/runs/<run>/ as `collect` writes it (~/modeling-agentic-keep/evals/<tag>)
     python3 scripts/eval_suite.py report <suite_scores.json> [<other suite_scores.json>]
         a table; with two files, B against A per question
-    python3 scripts/eval_suite.py --self-test
+    python3 scripts/eval_suite.py --self-test [--with-private]
+        engine tests; --with-private also runs the bundle's question-specific tests
+  maintainer, on the laptop that holds the key (macOS keychain):
+    python3 scripts/eval_suite.py fetch <dir>
+        decrypt the bundle into <dir> to edit it (plaintext: delete <dir> afterwards)
+    python3 scripts/eval_suite.py generate [--check] --private-dir <dir> [q ...]
+        write data/evals/<q>/ and <dir>/<q>/_truth/; --check (bundle or <dir>) fails if
+        the committed inputs differ (the generators are deterministic)
+    python3 scripts/eval_suite.py publish --private-dir <dir> [--new-key]
+        encrypt <dir> as the next bundle version, upload it and write evals/private.yaml
+
+Commands that need the hidden half take `--private-dir <dir>` to use a local plaintext
+copy instead of the bundle.
 
 Grading has two steps, so every score can be audited: `extract_answer` turns the run's
 artifacts into a JSON answer (allocation, headline values and intervals, gate action,
@@ -33,6 +44,7 @@ layer most likely at fault; `primary_layer` is the most upstream one.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import glob
 import hashlib
@@ -53,7 +65,9 @@ REPO = os.path.dirname(HERE)
 EVALS = os.path.join(REPO, "evals")
 DATA = os.path.join(REPO, "data", "evals")
 sys.path.insert(0, os.path.join(HERE, "lib"))
+sys.path.insert(0, HERE)
 import eval_paths  # noqa: E402
+import eval_private  # noqa: E402
 
 DEFAULT_TEXT_FILES = ("report.md", "results.md", "decision_rule.md", "scope_declaration.yaml")
 MAX_TEXT_BYTES = 2_000_000
@@ -73,16 +87,42 @@ def suite_questions(evals_dir=EVALS) -> list[str]:
     return list(_yaml(os.path.join(evals_dir, "suite.yaml"))["questions"])
 
 
-def load_rubric(q, evals_dir=EVALS) -> dict:
-    return _yaml(os.path.join(evals_dir, q, "rubric.yaml"))
+# The hidden half (generators, rubrics, answer keys) is not in the repository: a command
+# that needs it opens the encrypted bundle (scripts/eval_private.py) into a temporary
+# directory and makes it the active hidden tree for its duration.
+_ACTIVE_PRIVATE: list[str] = []
+
+
+@contextlib.contextmanager
+def use_private(src=None):
+    """Open the hidden tree (`src`, a local plaintext copy, or the pinned bundle) for
+    the duration of the block."""
+    with eval_private.opened(src) as root:
+        _ACTIVE_PRIVATE.append(root)
+        try:
+            yield root
+        finally:
+            _ACTIVE_PRIVATE.pop()
+
+
+def private_root(private_dir=None) -> str:
+    d = private_dir or (_ACTIVE_PRIVATE[-1] if _ACTIVE_PRIVATE else None)
+    if not d or not os.path.isdir(d):
+        raise eval_private.BundleError("bundle_not_loaded", "the eval suite's hidden half is not open "
+                                       "(see evals/README.md)")
+    return d
+
+
+def load_rubric(q, private_dir=None) -> dict:
+    return _yaml(os.path.join(private_root(private_dir), q, "rubric.yaml"))
 
 
 def load_taxonomy(evals_dir=EVALS) -> dict:
     return _yaml(os.path.join(evals_dir, "taxonomy.yaml"))
 
 
-def load_generator(q, evals_dir=EVALS):
-    path = os.path.join(evals_dir, q, "generate.py")
+def load_generator(q, private_dir=None):
+    path = os.path.join(private_root(private_dir), q, "generate.py")
     spec = importlib.util.spec_from_file_location(f"_evalgen_{q}", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -99,9 +139,9 @@ def digest_dir(d) -> dict:
     return out
 
 
-def check_inputs(q, evals_dir=EVALS, data_dir=DATA) -> list[str]:
+def check_inputs(q, private_dir=None, data_dir=DATA) -> list[str]:
     """Regenerate into a temp dir; list the committed inputs that differ (empty = current)."""
-    gen = load_generator(q, evals_dir)
+    gen = load_generator(q, private_dir)
     with tempfile.TemporaryDirectory() as td:
         gen.generate(os.path.join(td, "inputs"), os.path.join(td, "_truth"))
         fresh = digest_dir(os.path.join(td, "inputs"))
@@ -110,10 +150,12 @@ def check_inputs(q, evals_dir=EVALS, data_dir=DATA) -> list[str]:
     return sorted(n for n in set(fresh) | set(committed) if fresh.get(n) != committed.get(n))
 
 
-def ensure_truth(q, evals_dir=EVALS, data_dir=DATA) -> dict:
-    """The answer key for the committed inputs; regenerated when missing or stale. Refuses
-    when the generator no longer reproduces the committed inputs (fail closed)."""
-    tpath = os.path.join(evals_dir, q, "_truth", "truth.json")
+def ensure_truth(q, private_dir=None, data_dir=DATA) -> dict:
+    """The answer key for the committed inputs; regenerated (inside the hidden tree) when
+    missing or stale. Refuses when the generator no longer reproduces the committed
+    inputs (fail closed)."""
+    root = private_root(private_dir)
+    tpath = os.path.join(root, q, "_truth", "truth.json")
     inputs_dir = os.path.join(data_dir, q)
     current = digest_dir(inputs_dir) if os.path.isdir(inputs_dir) else {}
     if os.path.exists(tpath):
@@ -121,14 +163,81 @@ def ensure_truth(q, evals_dir=EVALS, data_dir=DATA) -> dict:
             truth = json.load(f)
         if truth.get("inputs_sha256") == current and current:
             return truth
-    gen = load_generator(q, evals_dir)
+    gen = load_generator(q, root)
     with tempfile.TemporaryDirectory() as td:
-        truth = gen.generate(os.path.join(td, "inputs"), os.path.join(evals_dir, q, "_truth"))
+        truth = gen.generate(os.path.join(td, "inputs"), os.path.join(root, q, "_truth"))
         if digest_dir(os.path.join(td, "inputs")) != current:
             raise SystemExit(f"{q}: the generator does not reproduce data/evals/{q}/ "
                              f"(run `eval_suite.py generate {q}` and commit the inputs)")
     with open(tpath) as f:
         return json.load(f)
+
+
+def truth_candidates(q, private_dir=None) -> list[tuple[str, dict, dict]]:
+    """(key, rubric, truth) for every answer key of question q in the hidden tree: the
+    current one ("current", <q>/) and each legacy one ("legacy/<name>") kept so an
+    earlier run on earlier inputs stays gradable."""
+    root = private_root(private_dir)
+    out = []
+    cur = _read_json(os.path.join(root, q, "_truth", "truth.json"))
+    if isinstance(cur, dict) and os.path.isfile(os.path.join(root, q, "rubric.yaml")):
+        out.append(("current", load_rubric(q, root), cur))
+    leg = os.path.join(root, "legacy")
+    for name in sorted(os.listdir(leg)) if os.path.isdir(leg) else []:
+        t = _read_json(os.path.join(leg, name, "_truth", "truth.json"))
+        rp = os.path.join(leg, name, "rubric.yaml")
+        if isinstance(t, dict) and t.get("question") == q and os.path.isfile(rp):
+            out.append((f"legacy/{name}", _yaml(rp), t))
+    return out
+
+
+def _input_copies(run_dir, q, names) -> dict:
+    """sha256 of the run's own copies of the question's input files (data/<name>,
+    data/evals/<q>/<name> or <name> in the run directory)."""
+    out = {}
+    for n in names:
+        for p in (os.path.join(run_dir, "data", n), os.path.join(run_dir, "data", "evals", q, n),
+                  os.path.join(run_dir, n)):
+            if os.path.isfile(p):
+                with open(p, "rb") as f:
+                    out[n] = hashlib.sha256(f.read()).hexdigest()
+                break
+    return out
+
+
+def select_truth(q, run_dir, launch, verify_inputs, private_dir=None) -> tuple[str, dict, dict, str]:
+    """(key, rubric, truth, how) of the answer key that belongs to this run's inputs.
+
+    Verified: the key whose input hashes equal the launch record's (none matches: the
+    current key, which input_hash_problem then refuses). Unverified: the key that agrees
+    with the most of the run's own input copies and with none against it; with no copies,
+    the current key."""
+    cands = truth_candidates(q, private_dir)
+    if not cands:
+        root = private_root(private_dir)
+        return "current", load_rubric(q, root), ensure_truth(q, root), "regenerated"
+    current = next((c for c in cands if c[0] == "current"), cands[0])
+    if verify_inputs:
+        rec = (launch or {}).get("eval_inputs_sha256")
+        if isinstance(rec, dict):
+            prefix = f"data/evals/{q}/"
+            shipped = {p[len(prefix):]: h for p, h in rec.items() if p.startswith(prefix)}
+            for c in cands:
+                if c[2].get("inputs_sha256") == shipped:
+                    return (*c, "launch record")
+        return (*current, "no key matches the launch record")
+    names = sorted({n for c in cands for n in (c[2].get("inputs_sha256") or {})})
+    seen = _input_copies(run_dir, q, names)
+    best, best_n = None, 0
+    for c in cands:
+        want = c[2].get("inputs_sha256") or {}
+        agree = sum(1 for n, h in seen.items() if want.get(n) == h)
+        clash = any(n in want and want[n] != h for n, h in seen.items())
+        if not clash and agree > best_n:
+            best, best_n = c, agree
+    if best is not None:
+        return (*best, f"{best_n} input copies in the run")
+    return (*current, "no input copies in the run match a key" if seen else "no input copies in the run")
 
 
 # ---- answer extraction ------------------------------------------------------------------
@@ -658,19 +767,25 @@ def input_hash_problem(q, truth, launch) -> tuple[str, str] | None:
     return None
 
 
-def grade_run(q, run_dir, evals_dir=EVALS, data_dir=DATA, truth=None, launch=None, verify_inputs=True) -> dict:
-    rubric = load_rubric(q, evals_dir)
-    truth = truth or ensure_truth(q, evals_dir, data_dir)
+def grade_run(q, run_dir, private_dir=None, data_dir=DATA, truth=None, launch=None, verify_inputs=True) -> dict:
+    """Score one run. The answer key is `truth` when given (with the current rubric),
+    else the key in the hidden tree whose input hashes match the run's (select_truth)."""
+    if verify_inputs and launch is None:
+        launch = launch_record_for(run_dir)
+    if truth is not None:
+        key, rubric, how = "given", load_rubric(q, private_dir), "given"
+    else:
+        key, rubric, truth, how = select_truth(q, run_dir, launch, verify_inputs, private_dir)
     answer = extract_answer(run_dir, rubric, truth)
     texts = read_texts(run_dir, rubric.get("text_files") or DEFAULT_TEXT_FILES)
     records = read_all_records(run_dir)
     inputs = sorted(truth.get("inputs_sha256", {}))
-    out = score(answer, rubric, truth, texts, records, inputs, load_taxonomy(evals_dir))
-    out.update(run_dir=os.path.abspath(run_dir), answer=answer, truth_seed=truth.get("seed"),
-               inputs_sha256=truth.get("inputs_sha256"), inputs_verified=verify_inputs,
+    out = score(answer, rubric, truth, texts, records, inputs, load_taxonomy())
+    out.update(run_dir=os.path.abspath(run_dir), answer=answer, truth_seed=truth.get("seed"), truth_key=key,
+               truth_selected_by=how, inputs_sha256=truth.get("inputs_sha256"), inputs_verified=verify_inputs,
                grader="scripts/eval_suite.py", schema_version=1)
     if verify_inputs:
-        prob = input_hash_problem(q, truth, launch if launch is not None else launch_record_for(run_dir))
+        prob = input_hash_problem(q, truth, launch)
         if prob:   # refuse: a score against the wrong answer key means nothing
             out.update(quality=0.0, quality_gated=0.0, refused=prob[1], primary_layer="INFRA")
             out["failures"].insert(0, {"code": prob[0], "check": None, "layer": "INFRA", "detail": prob[1]})
@@ -705,15 +820,15 @@ def _zero_row(label, why):
             "failures": ["run_record_missing"], "detail": why}
 
 
-def grade_root(root, evals_dir=EVALS, data_dir=DATA) -> dict:
+def grade_root(root, private_dir=None, data_dir=DATA) -> dict:
     out = {"root": os.path.abspath(root), "schema_version": 1, "questions": {}}
-    for q in suite_questions(evals_dir):
+    for q in suite_questions():
         res = []
         for label, rec, rd, why in collected_runs(root, q):
             if rd is None:   # an expected replicate with no current run scores zero
                 res.append(_zero_row(label, why))
                 continue
-            s = grade_run(q, rd, evals_dir, data_dir, launch=rec)
+            s = grade_run(q, rd, private_dir, data_dir, launch=rec)
             with open(os.path.join(rd, "scores.json"), "w") as f:
                 json.dump(s, f, indent=1)
             res.append({"label": label} | {k: s[k] for k in ("run_dir", "quality", "quality_gated", "gate_action",
@@ -824,16 +939,16 @@ def launch_commands(questions, tag, reps, tree=None) -> list[str]:
     return [f"{env} python3 cloud/run_cluster.py cloud/configs/eval_{q}.py launch" for q in questions]
 
 
-def input_problems(tree, questions, evals_dir=EVALS, data_dir=DATA) -> list[str]:
+def input_problems(tree, questions, private_dir=None, data_dir=DATA) -> list[str]:
     """Preflight on the tree that will be shipped, not on this checkout: the inputs in
-    its archive of HEAD must hash to what each question's answer key was generated from."""
+    its archive of HEAD must hash to what each question's current answer key was generated from."""
     blob = _archive_of(tree)
     if not blob:
         return [f"{tree}: not a git checkout, cannot build the launch archive"]
     shipped = eval_paths.archive_sha256(blob)
     probs = []
     for q in questions:
-        prob = input_hash_problem(q, ensure_truth(q, evals_dir, data_dir), {"eval_inputs_sha256": shipped})
+        prob = input_hash_problem(q, ensure_truth(q, private_dir, data_dir), {"eval_inputs_sha256": shipped})
         if prob:
             probs.append(f"{q}: {tree}: {prob[1]}")
     return probs
@@ -880,11 +995,11 @@ def shipped_texts(repo) -> dict:
     return out
 
 
-def truth_markers(q, evals_dir=EVALS) -> list[tuple[str, "re.Pattern"]]:
+def truth_markers(q, private_dir=None) -> list[tuple[str, "re.Pattern"]]:
     """Numeric answers recorded in a question's (regenerated) truth: allocation vectors
     (optimum and trap) and headline values, in the forms a write-up would use. Any of them
     in a shipped file is a leak wherever it appears."""
-    t = ensure_truth(q, evals_dir)
+    t = ensure_truth(q, private_dir)
     al = t.get("allocation") or {}
     out, vals = [], []
     vecs = [al.get("optimum", {}).get("blocks")] + [n.get("blocks") for n in (al.get("naive_optima") or {}).values()]
@@ -906,15 +1021,15 @@ def truth_markers(q, evals_dir=EVALS) -> list[tuple[str, "re.Pattern"]]:
     return out
 
 
-def shipped_leaks(repo=REPO, extra_texts=None, evals_dir=EVALS) -> list[str]:
+def shipped_leaks(repo=REPO, extra_texts=None, private_dir=None) -> list[str]:
     """Shipped lines that tie the suite to a planted answer: a line naming the suite (or a
     question id) with a question's `leak_keywords` within LEAK_WINDOW lines."""
-    qs = suite_questions(evals_dir)
-    kws = {q: [k.lower() for k in load_rubric(q, evals_dir).get("leak_keywords", [])] for q in qs}
+    qs = suite_questions()
+    kws = {q: [k.lower() for k in load_rubric(q, private_dir).get("leak_keywords", [])] for q in qs}
     mention = re.compile("|".join([_SUITE_MENTION] + [re.escape(q) for q in qs]), re.I)
     texts = dict(shipped_texts(repo))
     texts.update(extra_texts or {})
-    markers = [(q, label, rx) for q in qs for label, rx in truth_markers(q, evals_dir)]
+    markers = [(q, label, rx) for q in qs for label, rx in truth_markers(q, private_dir)]
     hits = [f"{path}: {q} numeric answer {label}" for path, text in sorted(texts.items())
             for q, label, rx in markers if rx.search(text)]
     for path, text in sorted(texts.items()):
@@ -929,12 +1044,27 @@ def shipped_leaks(repo=REPO, extra_texts=None, evals_dir=EVALS) -> list[str]:
 
 # ---- CLI --------------------------------------------------------------------------------
 
+def _refusal(q, run_dir, err) -> dict:
+    """scores.json for a run that cannot be graded because the answer key is unavailable."""
+    detail = f"{err.code}: {err.detail}"
+    return {"question": q, "run_dir": os.path.abspath(run_dir) if run_dir else None, "quality": 0.0,
+            "quality_gated": 0.0, "refused": f"answer key unavailable ({detail})", "checks": [],
+            "failures": [{"code": "answer_key_unavailable", "check": None, "layer": "INFRA", "detail": detail}],
+            "primary_layer": "INFRA", "gate_action": None, "status": None, "rounds": None, "cost_usd": None,
+            "wall_hours": None, "grader": "scripts/eval_suite.py", "schema_version": 1}
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--with-private", action="store_true",
+                    help="with --self-test: also run the question-specific tests in the hidden half")
+    ap.add_argument("--private-dir", dest="private_dir_top", default=None)
     sub = ap.add_subparsers(dest="cmd")
+    hidden_help = "a local plaintext copy of the hidden half (default: decrypt the pinned bundle)"
     g = sub.add_parser("generate")
     g.add_argument("--check", action="store_true")
+    g.add_argument("--private-dir", help=hidden_help)
     g.add_argument("questions", nargs="*")
     r = sub.add_parser("run")
     r.add_argument("--tag", default="main")
@@ -942,6 +1072,7 @@ def main(argv=None) -> int:
     r.add_argument("--tree", default=None)
     r.add_argument("--execute", action="store_true")
     r.add_argument("--local", action="store_true", help="not supported: eval runs execute only on the cloud")
+    r.add_argument("--private-dir", help=hidden_help)
     r.add_argument("questions", nargs="*")
     gr = sub.add_parser("grade")
     gr.add_argument("question", nargs="?")
@@ -951,23 +1082,92 @@ def main(argv=None) -> int:
     gr.add_argument("--gated", action="store_true", help="print the gated score as the headline number")
     gr.add_argument("--unverified-inputs", action="store_true",
                     help="grade a run with no launch record of its inputs (ad hoc; recorded in scores.json)")
+    gr.add_argument("--private-dir", help=hidden_help)
     rp = sub.add_parser("report")
     rp.add_argument("a")
     rp.add_argument("b", nargs="?")
+    fe = sub.add_parser("fetch", help="maintainer: decrypt the bundle into a directory to edit it")
+    fe.add_argument("dest")
+    pu = sub.add_parser("publish", help="maintainer: encrypt and upload a hidden tree as the next bundle version")
+    pu.add_argument("--private-dir", required=True)
+    pu.add_argument("--version", type=int, default=None)
+    pu.add_argument("--new-key", action="store_true", help="generate a new key and store it in the keychain")
     args = ap.parse_args(argv)
+    private = getattr(args, "private_dir", None) or args.private_dir_top
     if args.self_test:
-        return _self_test()
+        return _self_test(args.with_private, private)
+    try:
+        return _run_command(ap, args, private)
+    except eval_private.BundleError as e:
+        if args.cmd == "grade" and args.question and args.run_dir:
+            s = _refusal(args.question, args.run_dir, e)
+            out = args.out or os.path.join(args.run_dir, "scores.json")
+            with open(out, "w") as f:
+                json.dump(s, f, indent=1)
+            print(f"REFUSED: {s['refused']}\nwrote {out}")
+        else:
+            print(f"REFUSED: the eval suite's hidden half is unavailable ({e.code}: {e.detail}); see evals/README.md")
+        return 1
+
+
+def _outside_repo(path) -> bool:
+    return os.path.commonpath([os.path.abspath(path), REPO]) != REPO
+
+
+def _run_command(ap, args, private) -> int:
+    if args.cmd == "fetch":
+        dest = os.path.abspath(args.dest)
+        if not _outside_repo(dest):
+            print(f"refusing: {dest} is inside the repository; decrypt the hidden half outside any checkout")
+            return 2
+        if os.path.exists(dest) and os.listdir(dest):
+            print(f"refusing: {dest} is not empty")
+            return 2
+        man = eval_private.fetch(dest, None, eval_private.default_store(), eval_private.read_pin())
+        print(f"decrypted bundle v{man['version']} into {dest} (plaintext answer keys: never commit or upload "
+              f"it, and delete it when done)")
+        return 0
+    if args.cmd == "publish":
+        src = os.path.abspath(args.private_dir)
+        if not _outside_repo(src):
+            print(f"refusing: {src} is inside the repository; keep the plaintext hidden half outside any checkout")
+            return 2
+        pin = eval_private.read_pin() or {}
+        version = args.version or int(pin.get("version", 0)) + 1
+        with use_private(src):   # every current answer key must match the committed inputs
+            stale = {q: check_inputs(q) for q in suite_questions()}
+        if any(stale.values()):
+            print(f"refusing: committed inputs differ from the generators: {stale}")
+            return 1
+        if args.new_key:
+            key = eval_private.new_key()
+            eval_private.keychain_store(key)
+        else:
+            key = eval_private.keychain_key()
+        store = eval_private.default_store()
+        new = eval_private.publish(src, version, key, store)
+        with tempfile.TemporaryDirectory() as td:   # a download-and-decrypt round trip before the pin is written
+            eval_private.fetch(os.path.join(td, "check"), None, store, new)
+        eval_private.write_pin(new)
+        print(f"published {new['prefix']}/bundle.enc (sha256 {new['bundle_sha256']}); round trip verified; "
+              f"wrote evals/private.yaml (commit it)")
+        return 0
     if args.cmd == "generate":
-        qs = args.questions or suite_questions()
-        bad = 0
-        for q in qs:
-            if args.check:
-                diff = check_inputs(q)
-                print(f"{q}: {'inputs current' if not diff else f'inputs differ: {diff}'}")
-                bad += bool(diff)
-            else:
-                load_generator(q).generate()
-                print(f"{q}: wrote data/evals/{q}/ and evals/{q}/_truth/truth.json")
+        if not args.check and not private:
+            print("refusing: generate writes answer keys into the hidden tree; pass --private-dir <dir> "
+                  "(from `fetch`) and `publish` it afterwards")
+            return 2
+        with use_private(private) as root:
+            qs = args.questions or suite_questions()
+            bad = 0
+            for q in qs:
+                if args.check:
+                    diff = check_inputs(q)
+                    print(f"{q}: {'inputs current' if not diff else f'inputs differ: {diff}'}")
+                    bad += bool(diff)
+                else:
+                    load_generator(q).generate(os.path.join(DATA, q), os.path.join(root, q, "_truth"))
+                    print(f"{q}: wrote data/evals/{q}/ and {os.path.join(root, q, '_truth', 'truth.json')}")
         return 1 if bad else 0
     if args.cmd == "run":
         if args.local:   # a local machine can always reach some checkout's history (Codex round 2)
@@ -977,10 +1177,11 @@ def main(argv=None) -> int:
             return 2
         qs = args.questions or suite_questions()
         tree = launch_tree(args.tree, qs[0])
-        stale = {q: check_inputs(q) for q in qs}
-        probs = [f"{q}: inputs differ from the generator: {d}" for q, d in stale.items() if d]
-        probs += leak_problems(tree)
-        probs += input_problems(tree, qs)   # the shipped tree's archived inputs, not this checkout's
+        with use_private(private):
+            stale = {q: check_inputs(q) for q in qs}
+            probs = [f"{q}: inputs differ from the generator: {d}" for q, d in stale.items() if d]
+            probs += leak_problems(tree)
+            probs += input_problems(tree, qs)   # the shipped tree's archived inputs, not this checkout's
         if probs:
             print("refusing to launch:\n  " + "\n  ".join(probs))
             return 1
@@ -998,17 +1199,20 @@ def main(argv=None) -> int:
                     return 1
         return 0
     if args.cmd == "grade":
+        if not args.root and not (args.question and args.run_dir):
+            ap.error("grade needs <question> <run_dir> or --root")
+        with use_private(private):
+            if args.root:
+                res = grade_root(args.root)
+            else:
+                s = grade_run(args.question, args.run_dir, verify_inputs=not args.unverified_inputs)
         if args.root:
-            res = grade_root(args.root)
             out = args.out or os.path.join(args.root, "suite_scores.json")
             with open(out, "w") as f:
                 json.dump(res, f, indent=1)
             print(report(res))
             print(f"wrote {out}")
             return 0
-        if not (args.question and args.run_dir):
-            ap.error("grade needs <question> <run_dir> or --root")
-        s = grade_run(args.question, args.run_dir, verify_inputs=not args.unverified_inputs)
         if s.get("refused"):
             print(f"REFUSED: {s['refused']}")
         out = args.out or os.path.join(args.run_dir, "scores.json")
@@ -1016,7 +1220,8 @@ def main(argv=None) -> int:
             json.dump(s, f, indent=1)
         key = "quality_gated" if args.gated else "quality"
         print(f"{args.question}: {key} {s[key]:.3f} (gated {s['quality_gated']:.3f}); gate {s['gate_action']}; "
-              f"rounds {s['rounds']}; US$ {s['cost_usd']}; primary layer {s['primary_layer']}")
+              f"rounds {s['rounds']}; US$ {s['cost_usd']}; primary layer {s['primary_layer']}; "
+              f"answer key {s.get('truth_key')} ({s.get('truth_selected_by')})")
         for c in s["checks"]:
             print(f"  {'PASS' if c['passed'] else 'FAIL'} {c['id']:<18} {c['score']:.2f}  {c['detail']}")
         print(f"wrote {out}")
@@ -1112,7 +1317,7 @@ def _toy():
     return rubric, truth
 
 
-def _self_test() -> int:
+def _self_test(with_private=False, private_dir=None) -> int:
     fails = []
 
     def ok(cond, msg):
@@ -1187,15 +1392,27 @@ def _self_test() -> int:
         txt = report(sa, sbb)
         ok("+0.30" in txt and "3.0→2.0" in txt and "30→22" in txt, f"S11 comparison table: {txt}")
         ok("| toy | 1 | 0.50 |" in report(sa), f"S11b single table: {report(sa)}")
+        for name, fn in (("S12", _test_s12_repo_tree), ("S13", _test_s13_truth_by_hashes),
+                         ("S14", _test_s14_grade_fails_closed)):
+            try:
+                fn(ok, os.path.join(td, name))
+            except (Exception, SystemExit) as e:  # noqa: BLE001 — a missing piece is a failed case
+                ok(False, f"{name} raised {type(e).__name__}: {e}")
 
-        # --- question-specific tests live in evals/test_suite.py (export-ignored: they hold
-        # expected answers); in a shipped tree they are absent and skipped ---
-        hidden_tests = os.path.join(EVALS, "test_suite.py")
-        if os.path.isfile(hidden_tests):
-            spec = importlib.util.spec_from_file_location("_eval_hidden_tests", hidden_tests)
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            mod.run(ok, td, sys.modules[__name__])
+        # --- question-specific tests hold expected answers, so they live in the hidden
+        # half (test_suite.py in the bundle); `--self-test --with-private` runs them ---
+        if with_private:
+            try:
+                with use_private(private_dir) as root:
+                    spec = importlib.util.spec_from_file_location("_eval_hidden_tests",
+                                                                  os.path.join(root, "test_suite.py"))
+                    mod = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(mod)
+                    mod.run(ok, td, sys.modules[__name__])
+            except eval_private.BundleError as e:
+                ok(False, f"--with-private: the hidden half is unavailable ({e.code}: {e.detail})")
+        else:
+            print("note: question-specific tests skipped (they are in the hidden half; --with-private runs them)")
     for f in fails:
         print("FAIL:", f, file=sys.stderr)
     if fails:
@@ -1203,6 +1420,80 @@ def _self_test() -> int:
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _test_s12_repo_tree(ok, td):
+    """The hidden half is not in the repository: no generator, rubric, answer key, hidden
+    test or design note under evals/ (tracked or on disk) or tracked anywhere."""
+    hidden = ("generate.py", "rubric.yaml", "_common.py", "test_suite.py", "truth.json")
+    on_disk = [os.path.relpath(os.path.join(dp, f), REPO) for dp, dirs, files in os.walk(EVALS)
+               for f in files if f in hidden or "_truth" in dp.split(os.sep)]
+    ok(not on_disk, f"S12 evals/ holds no hidden file on disk: {on_disk}")
+    if os.path.exists(os.path.join(REPO, ".git")):
+        tracked = subprocess.run(["git", "-C", REPO, "ls-files"], capture_output=True, text=True).stdout.split()
+        bad = [p for p in tracked if (p.startswith("evals/") and os.path.basename(p) in hidden)
+               or "/_truth/" in f"/{p}" or p == "docs/design/eval-suite.md"]
+        ok(not bad, f"S12b git tracks no hidden eval file: {bad}")
+        ok(set(os.listdir(EVALS)) >= {"README.md", "suite.yaml", "taxonomy.yaml"},
+           "S12c evals/ keeps the public files and a README on fetching the hidden half")
+
+
+def _test_s13_truth_by_hashes(ok, td):
+    """The grader picks the answer key whose input hashes match the run's: the current
+    one, or a legacy key kept so a completed run stays gradable."""
+    import eval_private
+    rubric, truth = _toy()
+    old = b"legacy inputs\n"
+    legacy = dict(truth, question="toy", seed=0, inputs_sha256={"a.csv": hashlib.sha256(old).hexdigest()},
+                  headlines={"total": {"basis": "own_plan", "value_of_optimum": 9.0}})
+    priv = os.path.join(td, "priv")
+    eval_private._write_private(priv, "toy", rubric, dict(truth, question="toy"))
+    eval_private._write_private(os.path.join(priv, "legacy", "toy_0"), None, rubric, legacy)
+    run = os.path.join(td, "run")
+    build_fixture(run, rubric, truth, "perfect")
+
+    def launch(h):
+        return {"eval_inputs_sha256": {"data/evals/toy/a.csv": h}}
+    s_cur = grade_run("toy", run, private_dir=priv, launch=launch("x"))
+    s_old = grade_run("toy", run, private_dir=priv, launch=launch(legacy["inputs_sha256"]["a.csv"]))
+    s_bad = grade_run("toy", run, private_dir=priv, launch=launch("z"))
+    ok(s_cur.get("truth_key") == "current" and s_cur["quality"] == 1.0, f"S13 current key by hash: {s_cur.get('truth_key')}")
+    ok(s_old.get("truth_key") == "legacy/toy_0" and s_old["truth_seed"] == 0,
+       f"S13b legacy key by hash: {s_old.get('truth_key')}")
+    ok(s_bad["quality"] == 0.0 and any(f["code"] == "inputs_mismatch" for f in s_bad["failures"]),
+       "S13c no key matches the recorded inputs: refused")
+    s_un = grade_run("toy", run, private_dir=priv, verify_inputs=False)
+    ok(s_un.get("truth_key") == "current", f"S13d unverified, no input copies in the run: current key ({s_un.get('truth_key')})")
+    os.makedirs(os.path.join(run, "data"))
+    with open(os.path.join(run, "data", "a.csv"), "wb") as f:
+        f.write(old)
+    s_copy = grade_run("toy", run, private_dir=priv, verify_inputs=False)
+    ok(s_copy.get("truth_key") == "legacy/toy_0",
+       f"S13e unverified: the run's own copies of the inputs pick the key ({s_copy.get('truth_key')})")
+
+
+def _test_s14_grade_fails_closed(ok, td):
+    """`grade` with no reachable bundle refuses with a finding (scores.json), not a crash
+    or a score."""
+    import contextlib
+    import io
+    import eval_private
+    rubric, truth = _toy()
+    run = os.path.join(td, "run")
+    build_fixture(run, rubric, truth, "perfect")
+    out = os.path.join(td, "scores.json")
+    saved = eval_private.default_store
+    eval_private.default_store = lambda: eval_private.LocalStore(os.path.join(td, "empty_store"))
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = main(["grade", "toy", run, "--unverified-inputs", "--out", out])
+    finally:
+        eval_private.default_store = saved
+    s = _read_json(out) or {}
+    codes = [f.get("code") for f in s.get("failures", [])]
+    ok(rc != 0 and s.get("quality") == 0.0 and "answer_key_unavailable" in codes and "REFUSED" in buf.getvalue(),
+       f"S14 grade without the bundle refuses with a finding: rc {rc} {codes} {buf.getvalue()[:200]!r}")
 
 
 def _archive_of(repo) -> bytes:

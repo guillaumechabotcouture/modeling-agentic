@@ -75,6 +75,10 @@ failures:
     layer: INFRA
     meaning: the run's launch record shows inputs other than those the answer key was generated from; not graded
     look_at: [assignments.json eval_inputs_sha256, data/evals/ in the shipped tree]
+  answer_key_unavailable:
+    layer: INFRA
+    meaning: the encrypted hidden half (answer keys, rubrics) could not be fetched, verified or decrypted; not graded
+    look_at: [evals/README.md, evals/private.yaml, $COILED_STORAGE_ACCOUNT and az login, the keychain item]
   inputs_unrecorded:
     layer: INFRA
     meaning: no launch record of the inputs the run received; not graded (use --unverified-inputs for an ad-hoc look)

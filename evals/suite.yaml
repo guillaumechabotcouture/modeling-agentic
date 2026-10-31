@@ -1,5 +1,5 @@
 # Eval suite manifest (Phase 50 α). Order is the report order. Each question has
-# evals/<q>/{question.txt, generate.py, rubric.yaml}, inputs in data/evals/<q>/ and a
+# evals/<q>/question.txt (generator, rubric and answer key: the encrypted hidden half, evals/README.md), inputs in data/evals/<q>/ and a
 # launcher config cloud/configs/eval_<q>.py. Nothing under evals/ is shipped to agents.
 version: 1
 questions:

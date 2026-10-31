@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Which repository paths belong to the evaluation suite's hidden side (Phase 50 α).
 
-`evals/` holds the generators, rubrics and answer keys of the synthetic eval questions,
-and docs/design/eval-suite.md describes the planted truths. Agents being scored must
-never see them, so they are never shipped (`scripts/eval_suite.py`, the generic grader,
-holds no question content and ships like the rest of `scripts/`):
+The generators, rubrics, answer keys and design note of the synthetic eval questions
+are no longer in the repository: they are an encrypted bundle in the project storage
+account (scripts/eval_private.py, evals/README.md). `evals/` keeps the question texts
+and the suite's public files. The rules below still treat all of `evals/`, any
+`_truth*` path and the old design-note path as hidden, so a decrypted copy placed in a
+checkout is never shipped (`scripts/eval_suite.py`, the generic grader, holds no
+question content and ships like the rest of `scripts/`):
 - `.gitattributes` marks them export-ignore, so `git archive` (the cloud launch
   tarball) leaves them out;
 - `cloud/run_cluster.py` `code_tarball` refuses a tarball that holds any of them;

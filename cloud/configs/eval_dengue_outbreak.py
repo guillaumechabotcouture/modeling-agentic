@@ -1,4 +1,4 @@
-"""Eval suite (Phase 50 α): question `dengue_outbreak` (synthetic; see docs/design/eval-suite.md)."""
+"""Eval suite (Phase 50 α): question `dengue_outbreak` (synthetic; the design note is in the encrypted hidden half, evals/README.md)."""
 import os
 import sys
 
