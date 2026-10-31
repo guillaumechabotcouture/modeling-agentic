@@ -245,3 +245,15 @@ Each fix was first reproduced by a failing self-test case, then fixed.
   settings paths (including `analysis.workers`) are used through `validate(path)`; its raising
   `validate` (SpecError on a bad settings leaf) is turned into a problem list; its new finding kinds
   flow through the ledger unchanged.
+
+## 11. Review round 2 (Codex, five P1s)
+
+Each was reproduced first: the new test was run against the previous code and failed.
+
+| # | Finding | Change | Test |
+|---|---|---|---|
+| 1 | An interrupted first spec draft stayed `started` and uncharged (the try counter moved before the journal entry) | The key is fixed before the call and the try is counted after it returns. On resume, `Machine._settle_interrupted` charges every `started` entry once (its allowance, else the task cap) before anything runs | T33, T34 |
+| 2 | A session with no cost and no session id was charged a duration estimate | `SdkTasks` never passes a duration: no reported cost means the whole allowance | S6 |
+| 3 | The crash read-back resumed the conversation with no dollar cap, up to three times | One read-back, capped at its own budget (at most $0.25, from what the run has left after this call's allowance). With no budget left there is no read-back and the whole allowance is charged. A failed read-back is charged the allowance plus its cap | S7, S8 |
+| 4 | A copied `run_state.json` could stop GATE from running in the golden traces | `copy_run` removes the v2 state files (`run_state.json`, `findings.jsonl`, `impact_ledger.jsonl`, `fix_*`, `gate_r*`). Checks B and D pass only if the GATE state actually ran (a GATE transition and its `gate_r<N>.json`) | G10, G11 |
+| 5 | Owned paths were compared case-sensitively | `owned_path` compares case-insensitively and, for an existing file, by identity: the same inode as an owned file, or any hard link. The agent write-scope hook does the same | T35 |

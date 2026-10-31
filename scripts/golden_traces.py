@@ -48,11 +48,25 @@ for _p in (HERE, REPO, os.path.join(REPO, "agents")):
         sys.path.insert(0, _p)
 
 
+# v2 machine state a stored run may carry: removed from every copy, so the replayed GATE starts
+# from the stored gate's inputs and actually runs (Codex R2-4).
+V2_STATE = ("run_state.json", "run_state.json.tmp", "findings.jsonl", "impact_ledger.jsonl")
+V2_STATE_GLOBS = ("fix_progress_r*.json", "fix_plan_r*.json", "gate_r*.json")
+
+
 def copy_run(src: str, dst: str) -> None:
-    if sys.platform == "darwin" and subprocess.run(["cp", "-cRp", src, dst], capture_output=True).returncode == 0:
+    import glob
+    if not (sys.platform == "darwin"
+            and subprocess.run(["cp", "-cRp", src, dst], capture_output=True).returncode == 0):
+        shutil.copytree(src, dst, symlinks=True)
+    else:
         subprocess.run(["chmod", "-R", "u+w", dst], capture_output=True)
-        return
-    shutil.copytree(src, dst, symlinks=True)
+    for f in V2_STATE:
+        if os.path.lexists(os.path.join(dst, f)):
+            os.remove(os.path.join(dst, f))
+    for g in V2_STATE_GLOBS:
+        for f in glob.glob(os.path.join(dst, g)):
+            os.remove(f)
 
 
 def history(run_dir: str) -> list[dict]:
@@ -148,15 +162,18 @@ def check_today(src: str, work: str, max_rounds: int) -> dict:
         st = SM.RunState(question=meta.get("question", ""), state="GATE", round=cur, max_rounds=max_rounds,
                          gate_mode="legacy", post_write=pw, signoff="none")
         m = SM.Machine(b, None, st, log=lambda *x: None)
+        n0 = len(m.st.history)
         m.step()
         mach = m.st.last_gate
+        legacy_ran = len(m.st.history) > n0 and m.st.history[-1].get("from") == "GATE"
         import findings_ledger as FL
         led = FL.load(b)
         exp_next = SM.route_gate(cli, pw)[0] if cli.get("action") else "FINAL"
         return {"round": cur, "max_rounds": max_rounds, "post_write": pw, "cli_action": cli.get("action"),
                 "cli_rule": cli.get("rule_matched"), "machine_action": mach.get("action"),
                 "machine_rule": mach.get("rule_matched"), "machine_next": m.st.state,
-                "same_action": cli.get("action") == mach.get("action")
+                "gate_ran": legacy_ran,
+                "same_action": legacy_ran and cli.get("action") == mach.get("action")
                 and str(cli.get("rule_matched")) == str(mach.get("rule_matched")),
                 "next_as_routed": m.st.state == exp_next,
                 "ledger": {"rows": len(led), "open_blocking": sum(1 for f in led.values() if f.blocking and f.status == "open"),
@@ -217,14 +234,17 @@ def check_v2(src: str, work: str, max_rounds: int | None = None, expected: tuple
         st = SM.RunState(question=meta.get("question", ""), state="GATE", round=cur, max_rounds=mr, gate_mode="v2",
                          post_write=pw, signoff="none")
         m = SM.Machine(b, None, st, backend=_ReplayBackend(d), log=lambda *x: None)
+        n0 = len(m.st.history)
         m.step()
         g = m.st.last_gate
+        gate_ran = (len(m.st.history) > n0 and m.st.history[-1].get("from") == "GATE"
+                    and os.path.exists(os.path.join(b, f"gate_r{cur}{'_post' if pw else ''}.json")))
         exp_next = SM.route_gate({"action": exp_action, "unresolved_high": d.get("unresolved_high")}, pw)[0]
-        ok = (g.get("action") is not None and g.get("action") == exp_action
+        ok = (gate_ran and g.get("action") is not None and g.get("action") == exp_action
               and str(g.get("rule_matched")) == str(exp_rule) and m.st.state == exp_next)
         return {"round": cur, "max_rounds": mr, "post_write": pw, "expected_action": exp_action,
                 "expected_rule": exp_rule, "v2_action": g.get("action"), "v2_rule": g.get("rule_matched"),
-                "v2_next": m.st.state, "expected_next": exp_next, "ok": ok}
+                "v2_next": m.st.state, "expected_next": exp_next, "gate_ran": gate_ran, "ok": ok}
     finally:
         shutil.rmtree(b, ignore_errors=True)
 
@@ -334,6 +354,18 @@ def _self_test() -> int:
         res = {"stored": {"same_as_stored": True, "override": False, "rules_action": "X"}, "v2": dict(r, ok=True),
                "today": {"cli_action": None, "same_action": True, "next_as_routed": True}}
         ok(not case_ok(res), "G9 a gate that gives no decision fails the case")
+        # G10 (Codex R2-4): a stored run that carries v2 state (run_state.json at FINAL with a
+        # matching last_gate) must still have its GATE executed; the check fails if GATE did not run.
+        SM.save_state(run_d, SM.RunState(question="q", state="FINAL", status="completed",
+                                         last_gate={"action": "PATCH_OR_RETHINK", "rule_matched": 2}))
+        SM.v2_gate = lambda *a, **k: {"action": "ACCEPT", "rule_matched": 4, "unresolved_high": [], "accept_blockers": []}
+        try:
+            r = check_v2(run_d, d)
+        finally:
+            SM.v2_gate = orig
+        ok(not r["ok"] and r.get("gate_ran"), f"G10 copied v2 state is excluded, so GATE runs (and here fails) {r}")
+        r = check_v2(run_d, d)
+        ok(r["ok"] and r.get("gate_ran"), "G11 every check D records that GATE ran")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
