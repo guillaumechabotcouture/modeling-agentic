@@ -38,16 +38,32 @@ pyrethroid bioassay mortality x (1 = susceptible), tau = 0.5:
 Note: Table 6 gives the funestus PBO row as two coefficients (2.53, 0.89); the linear form
 used for it is our reading of the table (flagged unverified in the engine card).
 
-Holes (physical decay of nets in use; v0.3): Briet et al. 2020 Malar J
-10.1186/s12936-020-03383-6, Additional file 2 Table S9: the log odds that a mosquito that
-entered attacks (feeds through) the net rise by beta_hole per unit of ln(holed area cm^2 + 1),
-0.379 for susceptible (Zeneti) and 0.541 for resistant (Akron) An. gambiae s.l. Holed area
-grows about exponentially over the first 3 years (main text), to a median across the seven
-country cohorts of ln(holed area) = 3.67 at 24 months (Table 3), so ln(H + 1) = 1.84 per year
-of net age, capped at 3 years. The fed share s of the Churcher outcome gets that log-odds
-increase; the extra feeds come out of the repelled share first, then the killed share.
-Interpolating beta_hole linearly in bioassay mortality between the two strains is our
-assumption (flagged unverified).
+Holes (physical decay of nets in use; v0.3, re-derived after review): Briet et al. 2020
+Malar J 10.1186/s12936-020-03383-6, main-text equation block (Methods, "Entomological
+model") and Additional file 2 Table S9 (PermaNet 2.0; susceptible Kisumu/Zeneti and
+resistant Akron An. gambiae s.l.). For a mosquito that has entered the hut, with holed area
+H (cm^2), insecticide content X (mg/m^2) and brand factor gamma (1 for PermaNet 2.0):
+  logit P_att = b0,att + b1,att ln(H+1) + b2,att gamma ln(X+1) + b3,att gamma ln(X+1) ln(H+1)
+  logit P_Bmu = b0,Bmu + b1,Bmu ln(H+1) + b2,Bmu gamma ln(X+1) + b3,Bmu gamma ln(X+1) ln(H+1)
+  logit P_Cmu = b0,Cmu + b1,Cmu ln(H+1) + b2,Cmu gamma ln(X+1)      (b3,Cmu = 0, b0,Cmu = logit 0.01)
+P_att: attacking (resulting in feeding and/or dying; Fig. S12 caption); P_Bmu: dying before
+feeding among attackers; P_Cmu: dying after feeding. Entry (P_ent) does not depend on holes.
+Per entered mosquito: repel = 1 - P_att; kill = P_att [P_Bmu + (1 - P_Bmu) P_Cmu];
+fed and survived = P_att (1 - P_Bmu)(1 - P_Cmu).
+Mapping onto the engine (explicit): Briet's absolute change in each outcome (repel, kill,
+fed and survived; per entered mosquito, holed (X(t), H(t)) minus intact (X(t), 0)) is added to
+the matching Churcher outcome (repeat r, die d, feed s; per attempt on a net user); the three
+changes sum to zero, results are clipped at zero and renormalised; a new net (H = 0) is
+unchanged. Absolute, not a ratio: Briet's intact-net feeding share is near zero, so a ratio
+multiplies Churcher's larger, decay-driven feeding share many-fold and compounds the two decay
+models (it gave 96% feeding at 2 years, against the paper's conclusion that holes act mainly
+through attrition and non-use). X(t) = 55 mg/m^2 (PermaNet
+2.0 target content, Additional file 2) times the Churcher insecticide-activity decay, so the
+insecticide x hole interaction uses the content left in the net. Holed area: ln(H + 1)
+grows linearly with net age to the seven cohorts' median mean ln(holed area) of 3.67 at 24
+months (Table 3; "increased over time approximately exponentially for the first 3 years"),
+capped at 3 years. Unverified (our choices): mixing the two strains linearly in bioassay
+mortality (x = 1 susceptible, x = 0 the resistant strain), linear-in-time ln area, X = 55.
 Dual-AI nets: the pyrethroid net above plus chlorfenapyr killing a share
 cfp_kill exp(-ln2 t / cfp_half) of the mosquitoes that would otherwise feed or be repelled
 (no published hut coefficient in the priors: cfp_kill is fitted to the pack).
@@ -81,10 +97,21 @@ CHURCHER = dict(tau=0.5, a1=0.63, a2=4.00, d1=0.071, d2=1.26, d3=1.52, th1=0.02,
                 pbo={"gambiae": (3.41, 5.88, 0.78), "funestus": (2.53, 0.89, 0.0)})
 CHURCHER_SOURCE = "Churcher et al. 2016 eLife 10.7554/eLife.16090, Table 6 (PMC5025277)"
 
-# Briet et al. 2020 Malar J: holes in nets in use.
-HOLES = dict(beta_susceptible=0.379, beta_resistant=0.541, ln_area_24m=3.67, cap_years=3.0)
-HOLES_SOURCE = ("Briet et al. 2020 Malar J 10.1186/s12936-020-03383-6: Additional file 2 Table S9 (beta_1,att) and "
+# Briet et al. 2020 Malar J, Additional file 2 Table S9 (PermaNet 2.0): (b0, b1 holes, b2 insecticide, b3 interaction).
+BRIET = {
+    "susceptible": {"att": (-2.555, 0.379, 1.807, -0.078), "Bmu": (-1.823, -0.235, 2.245, -0.094),
+                    "Cmu": (float(np.log(0.01 / 0.99)), -0.370, 2.816, 0.0)},
+    "resistant":   {"att": (-4.069, 0.541, 0.807, -0.101), "Bmu": (-4.840, -0.128, 2.325, -0.113),
+                    "Cmu": (float(np.log(0.01 / 0.99)), -0.114, 1.303, 0.0)},
+}
+HOLES = dict(ln_area_24m=3.67, cap_years=3.0, X_new=55.0, H_max=192000.0, gamma=1.0)
+HOLES_SOURCE = ("Briet et al. 2020 Malar J 10.1186/s12936-020-03383-6: main-text equations for P_att, P_Bmu, P_Cmu; "
+                "Additional file 2 Table S9 (coefficients, H_max) and the PermaNet 2.0 target content 55 mg/m2; "
                 "Table 3 (median of seven cohorts' mean ln holed area at 24 months)")
+
+
+def expit_(z):
+    return 1.0 / (1.0 + np.exp(-np.asarray(z, float)))
 
 
 def hole_log_area(age_d):
@@ -93,24 +120,53 @@ def hole_log_area(age_d):
     return HOLES["ln_area_24m"] / 2.0 * yrs
 
 
-def hole_beta(x):
-    """Log-odds increase in feeding per unit ln(holed area + 1), interpolated in bioassay mortality."""
+def briet_probs(X, lnH1, strain: str):
+    """(P_att, P_Bmu, P_Cmu) from Briet 2020's equations; lnH1 = ln(H + 1), X in mg/m^2."""
+    g = HOLES["gamma"] * np.log(np.asarray(X, float) + 1)
+    out = []
+    for k in ("att", "Bmu", "Cmu"):
+        b0, b1, b2, b3 = BRIET[strain][k]
+        out.append(expit_(b0 + b1 * lnH1 + b2 * g + b3 * g * lnH1))
+    return tuple(out)
+
+
+def briet_logit_slope_att(X, strain: str):
+    """d logit(P_att) / d ln(H + 1) at content X: b1,att + b3,att gamma ln(X + 1)."""
+    _, b1, _, b3 = BRIET[strain]["att"]
+    return b1 + b3 * HOLES["gamma"] * float(np.log(X + 1))
+
+
+def briet_outcomes(X, lnH1, strain: str):
+    """Per entered mosquito: (repel, kill, fed and survived)."""
+    a, b, c = briet_probs(X, lnH1, strain)
+    return 1 - a, a * (b + (1 - b) * c), a * (1 - b) * (1 - c)
+
+
+def briet_hole_deltas(X, lnH1, x):
+    """Absolute change in (repel, kill, fed and survived) per entered mosquito from holes lnH1 vs
+    none, at the same content X; strains mixed linearly in bioassay mortality x (x = 1
+    susceptible, x = 0 resistant). The three changes sum to zero."""
     x = np.clip(np.asarray(x, float), 0.0, 1.0)
-    return HOLES["beta_resistant"] + (HOLES["beta_susceptible"] - HOLES["beta_resistant"]) * x
+    out = []
+    for s in ("susceptible", "resistant"):
+        h = briet_outcomes(X, lnH1, s)
+        z = briet_outcomes(X, 0.0 * np.asarray(lnH1, float), s)
+        out.append([h[i] - z[i] for i in range(3)])
+    return tuple(x * out[0][i] + (1 - x) * out[1][i] for i in range(3))
 
 
-def apply_holes(r, d, s, x, age_d, on=True):
-    """Raise the fed share for holes (log-odds shift); extra feeds come from repelled, then killed."""
+def apply_holes(r, d, s, x, age_d, dec, on=True):
+    """Add Briet's absolute hole changes (per entered mosquito, at the net's remaining insecticide
+    content X = 55 x dec) to the Churcher (repeat, die, feed) outcomes; clip at zero and renormalise.
+    Absolute, not relative: Briet's intact-net feeding share is near zero, so a ratio would multiply
+    Churcher's (larger, decay-driven) feeding share many-fold and compound the two decay models."""
     if not on:
         return r, d, s
-    s = np.asarray(s, float)
-    s_new = _expit(_logit(np.clip(s, 1e-6, 1 - 1e-6)) + hole_beta(x) * hole_log_area(age_d))
-    s_new = np.maximum(s_new, s)
-    extra = s_new - s
-    take_r = np.minimum(extra, r)
-    r2 = r - take_r
-    d2 = np.maximum(d - (extra - take_r), 0.0)
-    return r2, d2, 1 - r2 - d2
+    X = HOLES["X_new"] * np.asarray(dec, float)
+    dr, dd, ds = briet_hole_deltas(X, hole_log_area(age_d), x)
+    r2, d2, s2 = np.maximum(r + dr, 0), np.maximum(d + dd, 0), np.maximum(s + ds, 0)
+    tot = r2 + d2 + s2
+    return r2 / tot, d2 / tot, s2 / tot
 
 # Protopopoff et al. 2018 Lancet: WHO cone bioassay mortality on walls sprayed with
 # Actellic 300CS (days since spraying, mortality).
@@ -202,13 +258,14 @@ def itn_effect(net_type, x, age_d, P, complex_: str = "gambiae", holes: bool = T
         dec = np.exp(-gam * age_d)
         r = (r0 - CHURCHER["rM"]) * dec + CHURCHER["rM"]
         d = d0 * dec
-        out.append((r, d))
-    (r_p, d_p), (r_b, d_b) = out
+        out.append((r, d, dec))
+    (r_p, d_p, dec_p), (r_b, d_b, dec_b) = out
     is_pbo = net_type == 1
     r = np.where(is_pbo, r_b, r_p)
     d = np.where(is_pbo, d_b, d_p)
+    dec = np.where(is_pbo, dec_b, dec_p)
     s = np.clip(1 - r - d, 0.0, 1.0)
-    r, d, s = apply_holes(r, d, s, x, age_d, holes and P.get("net_holes", 1.0) > 0)
+    r, d, s = apply_holes(r, d, s, x, age_d, dec, holes and P.get("net_holes", 1.0) > 0)
     c = P["cfp_kill"] * np.exp(-LN2 * age_d / P["cfp_half"])
     dual = net_type == 2
     r = np.where(dual, r * (1 - c), r)
@@ -299,9 +356,9 @@ def _self_test() -> int:
     ok(abs(dbf - db) > 0.03,"V7 PBO effect differs by species complex (separate Table 6 coefficients)")
     rs, ds, ss_ = itn_effect(np.array([0, 1, 2]), 0.088, np.array([0.0, 0.0, 0.0]), P)
     ok(np.allclose(rs + ds + ss_, 1) and ds[2] > ds[0] and ss_[2] < ss_[0], "V8 outcomes sum to one; dual-AI kills more, feeds fewer")
-    _, d1, _ = itn_effect(np.array([0]), 0.95, np.array([730.0]), P)
-    _, d0n, _ = itn_effect(np.array([0]), 0.95, np.array([0.0]), P)
-    ok(abs(d1[0] / d0n[0] - 0.5 ** (2 / 2.07)) < 0.02, "V9 net killing decays with the Churcher half-life")
+    _, d1, _ = itn_effect(np.array([0]), 0.95, np.array([730.0]), P, holes=False)
+    _, d0n, _ = itn_effect(np.array([0]), 0.95, np.array([0.0]), P, holes=False)
+    ok(abs(d1[0] / d0n[0] - 0.5 ** (2 / 2.07)) < 0.02, "V9 net killing decays with the Churcher half-life (holes off)")
     # IRS decay through the trial's cone points
     D = irs_decay(np.array([0.0, 270.0, 365.0, -1.0]), "pm_cs", P)
     ok(abs(D[0] - 1) < 1e-12 and abs(D[1] - 0.82 / 0.99) < 0.04 and abs(D[2] - 0.59 / 0.99) < 0.04 and D[3] == 0,
@@ -346,10 +403,40 @@ def _self_test() -> int:
     ok(np.allclose([r_new, d_new, s_new], [r_n0, d_n0, s_n0]), "V18 a new net has no holes effect")
     r2y, d2y, s2y = itn_effect(np.array([0]), 0.95, np.array([730.0]), P)
     r2n, d2n, s2n = itn_effect(np.array([0]), 0.95, np.array([730.0]), P, holes=False)
-    lo = lambda p: np.log(p / (1 - p))  # noqa: E731
-    ok(s2y[0] > s2n[0] and abs(lo(s2y[0]) - lo(s2n[0]) - hole_beta(0.95) * 3.67) < 1e-6 and abs(r2y + d2y + s2y - 1)[0] < 1e-12,
-       "V19 holes raise feeding by Briet's log-odds slope; outcomes still sum to one")
-    ok(abs(hole_beta(1.0) - 0.379) < 1e-12 and abs(hole_beta(0.0) - 0.541) < 1e-12, "V20 hole slope by resistance (Table S9 strains)")
+    dec2 = np.exp(-hut_new_net(0.95, False)[3] * 730.0)
+    dr_, dd2, ds_ = briet_hole_deltas(55.0 * dec2, 3.67, 0.95)
+    ok(s2y[0] > s2n[0] and np.allclose([r2y, d2y, s2y], [r2n + dr_, d2n + dd2, s2n + ds_])
+       and abs(r2y + d2y + s2y - 1)[0] < 1e-12,
+       "V19 a 2-year-old net: Briet's absolute hole changes added to the Churcher outcomes (more feeding), sum to one")
+    # Briet 2020 equations as published (main-text equation block; Additional file 2 Table S9)
+    pa, _, _ = briet_probs(0.0, np.log(HOLES["H_max"] + 1), "susceptible")
+    ok(abs(pa - expit_(-2.555 + 0.379 * np.log(192001))) < 1e-12 and abs(pa - 0.887) < 0.002,
+       f"V20 P_att for an unprotected human (X = 0, H = H_max, as the paper substitutes) = {float(pa):.3f}")
+    slope = briet_logit_slope_att(55.0, "susceptible")
+    ok(abs(slope - (0.379 - 0.078 * np.log(56))) < 1e-12 and abs(slope - 0.065) < 0.001,
+       f"V24 attack slope at 55 mg/m2 includes the insecticide x hole term: 0.379 - 0.078 ln(56) = {slope:.3f}")
+    for strain in ("susceptible", "resistant"):
+        a0, b0, c0 = briet_probs(55.0, 0.0, strain)
+        a1, b1_, c1 = briet_probs(55.0, 3.67, strain)
+        ok(a1 > a0 and b1_ < b0 and c1 < c0,
+           f"V25 {strain}: holes raise attacks and lower pre- and post-prandial killing (paper: holed nets kill less)")
+    one = briet_hole_deltas(55.0, 0.0, 0.95)
+    ok(all(abs(float(v)) < 1e-12 for v in one) and abs(sum(float(v) for v in briet_hole_deltas(27.5, 3.67, 0.5))) < 1e-12,
+       "V26 no holes: no change; the changes in repel, kill and feed sum to zero")
+    # Briet 2020 conclusion: physical decay matters more through attrition and non-use than as a direct
+    # loss of effect. At the cohorts' 24-month median holes, the direct change in feeding per attempt is small.
+    # (their cohorts' insecticide content was stable: Additional file 2, "chemical stability")
+    _, _, sh = itn_effect(np.array([0]), 0.95, np.array([730.0]), P)
+    _, _, sn = itn_effect(np.array([0]), 0.95, np.array([730.0]), P, holes=False)
+    ok(0 < sh[0] - sn[0] < 0.05,
+       f"V27 a net that keeps its insecticide (x = 0.95): holes add {sh[0] - sn[0]:.3f} to feeding per attempt at 2 years (small, as the paper concludes)")
+    # where the insecticide activity is gone (resistant population, Churcher half-life 0.33 y), holes act as on
+    # Briet's untreated net: the change equals the X ~ 0 equations
+    _, _, sh2 = itn_effect(np.array([0]), 0.088, np.array([730.0]), P)
+    _, _, sn2 = itn_effect(np.array([0]), 0.088, np.array([730.0]), P, holes=False)
+    _, _, ds0 = briet_hole_deltas(55.0 * np.exp(-hut_new_net(0.088, False)[3] * 730.0), 3.67, 0.088)
+    ok(abs((sh2[0] - sn2[0]) - float(ds0)) < 0.01 and sh2[0] - sn2[0] > 0.05,
+       f"V28 insecticide gone (x = 0.088, 2 years): holes add {sh2[0] - sn2[0]:.3f} to feeding, as Briet's near-untreated net")
     ok(resistance_of({"gambiae": 0.1, "default": 0.5}, "funestus") == 0.5 and resistance_of(0.3, "gambiae") == 0.3,
        "V16 resistance per species, with a default")
     if fails:

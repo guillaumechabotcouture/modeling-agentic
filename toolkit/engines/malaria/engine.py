@@ -393,9 +393,15 @@ def write_card(path: str) -> None:
                       "range_note": "Briet 2020 Table 3 cohorts: 24-month survival 0.69-0.98 (longer retention)"},
         "use_given_access": {"use_rate": 0.871, "source": BV + " (all-country use rate 87.1%, 83.3-90.1)", "verified": "matched"},
         "nightly_variation": {"use_persist": 0.5, "source": "assumption", "verified": "unverified"},
-        "holes": {"values": V.HOLES, "source": V.HOLES_SOURCE, "verified": "matched",
-                  "unverified_parts": ["interpolation of the slope by bioassay mortality", "linear growth of ln(area+1), cap at 3 y",
-                                       "extra feeds taken from the repelled share first"]},
+        "holes": {"values": V.HOLES, "coefficients_table_S9": V.BRIET, "source": V.HOLES_SOURCE, "verified": "matched",
+                  "equations": "logit P = b0 + b1 ln(H+1) + b2 gamma ln(X+1) + b3 gamma ln(X+1) ln(H+1) for P_att, P_Bmu, "
+                               "P_Cmu (Briet 2020 main text); repel = 1 - P_att, kill = P_att(P_Bmu + (1-P_Bmu)P_Cmu), "
+                               "fed = P_att(1-P_Bmu)(1-P_Cmu)",
+                  "mapping": "Briet's absolute change (holed minus intact at the remaining content X = 55 x Churcher decay) "
+                             "added to Churcher's (repeat, die, feed), clipped and renormalised",
+                  "unverified_parts": ["mixing the two strains linearly in bioassay mortality",
+                                       "linear growth of ln(area+1) with net age, cap at 3 y", "X = 55 x Churcher decay",
+                                       "the absolute-change mapping itself (our choice; a ratio mapping compounds the decay models)"]},
         "insecticide_decay_in_use": {"source": V.CHURCHER_SOURCE + " (Equations 15-19, resistance-dependent half-life)",
                                      "verified": "matched"},
         "transcription_check": "every Churcher 2016 equation used (2, 4, 8, 11-19) and every Table 6 coefficient re-checked "
