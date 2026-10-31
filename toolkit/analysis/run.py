@@ -220,7 +220,8 @@ def run(run_dir: str, spec_rel: str = "decision_spec.yaml", adopt: dict | None =
          "verdict": ("NOT_RUN" if x["status"] == "not_run" else "CHANGES_PLAN" if x["decision_changes"] else "NO_CHANGE"),
          "can_move_plan": x["can_move_plan"], "threshold_pct": 100.0 * x["share_threshold"],
          "share_pct": None if x["share_units_changed"] is None else 100.0 * x["share_units_changed"],
-         "statement": x["statement"]} for x in dts]}, DT.PRODUCER, [arts["point"], arts["uncertainty"]])
+         "statement": x["statement"], "detail": {k: x[k] for k in ("engine_arm_or", "engine_interaction",
+                                                    "rejected_values", "reachable_interaction") if k in x}} for x in dts]}, DT.PRODUCER, [arts["point"], arts["uncertainty"]])
     for x in dts:
         if x["path"]:
             S.deliverable(os.path.join(run_dir, x["path"]), DT.PRODUCER, "decision_test")

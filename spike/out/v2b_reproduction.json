@@ -290,60 +290,11 @@
   "status": "identical"
  },
  {
-  "quantity": "DT1 engine interaction",
-  "spike": 0.9822862522256957,
-  "v2": 0.9822862522256957,
-  "rel_diff": 0.0,
-  "status": "identical"
- },
- {
-  "quantity": "DT1 value 2.43: increment scale",
-  "spike": 0.0,
-  "v2": 0.0,
-  "rel_diff": 0.0,
-  "status": "identical"
- },
- {
-  "quantity": "DT1 value 2.43: units changed",
-  "spike": 0,
-  "v2": 0,
-  "rel_diff": 0.0,
-  "status": "identical"
- },
- {
-  "quantity": "DT1 value 1.19: increment scale",
-  "spike": 0.0,
-  "v2": 0.0,
-  "rel_diff": 0.0,
-  "status": "identical"
- },
- {
-  "quantity": "DT1 value 1.19: units changed",
-  "spike": 0,
-  "v2": 0,
-  "rel_diff": 0.0,
-  "status": "identical"
- },
- {
-  "quantity": "DT1 value 4.97: increment scale",
-  "spike": 0.0,
-  "v2": 0.0,
-  "rel_diff": 0.0,
-  "status": "identical"
- },
- {
-  "quantity": "DT1 value 4.97: units changed",
-  "spike": 0,
-  "v2": 0,
-  "rel_diff": 0.0,
-  "status": "identical"
- },
- {
-  "quantity": "DT1 plan changes",
-  "spike": false,
-  "v2": false,
-  "rel_diff": 0.0,
-  "status": "identical"
+  "quantity": "DT1",
+  "spike": "run: no LGA changes",
+  "v2": "not run",
+  "rel_diff": null,
+  "status": "CHANGED (Codex P1-12/13)"
  },
  {
   "quantity": "allocation: package per LGA (309)",
