@@ -38,14 +38,13 @@ PROMPTS = {
     "draft_spec": COMMON + """
 
 Task: draft decision_spec.yaml for the question, and analysis_settings.yaml with the
-computational settings only (uncertainty.draws, uncertainty.seed, emulator.points, emulator.seed;
-not repeated in the spec). Read the data files the question names and the
-example spec at {example}. Keep its section names (decision_units, calibration, horizon, emulator,
-options, objective, outcomes_reported, constraints, comparator, uncertainty, deliverable,
-deliverable_file, engine_needs). Do not set `engine`: the harness chooses it. Map the question's
-units to a units table (CSV) under data/ with one row per decision unit: write that table only from
-the question's data files, with a short derivation note in data/README.md. Output: decision_spec.yaml
-and {out} = {{"ok": true, "notes": "..."}}.""",
+computational settings only ({settings}; not repeated in the spec). Follow {skill} (the schema is the
+docstring of {schema}; a full example is {example}). Write `engine: auto`: the harness chooses the
+engine after sign-off. The question's input files are relative to the repository root {repo}; copy or
+derive what the spec reads (the units table, the calibration targets) into data/ in the run
+directory, only from those files, with a short derivation note in data/README.md. The spec's paths
+are relative to the run directory. Output: decision_spec.yaml, analysis_settings.yaml and
+{out} = {{"ok": true, "notes": "..."}}.""",
     "pick_engine": COMMON + """
 
 Task: choose the engine. {out_in} lists the registered engines, which are eligible, and why the
@@ -53,9 +52,10 @@ others are not. Pick one eligible engine and say why in two sentences (mechanism
 needs, validated benchmarks). Output: {out} = {{"engine": "<ref>", "why": "..."}}.""",
     "critique": COMMON + """
 
-Task: {reviewer} review, round {round}. Review the computed facts: analysis/analysis.json,
-analysis/allocation.csv, engine_choice.json, decision_spec.yaml, impact_ledger.jsonl and the draft
-(manuscript.md) if it exists. Judge what code cannot: plausibility against the domain, whether the
+Task: {reviewer} review, round {round}. Review the computed facts: the analysis artifacts in
+analysis/ (manifest.json and the *.yaml artifacts it lists), results.md, uncertainty_report.yaml,
+the deliverable file the spec names, engine_choice.json, decision_spec.yaml, impact_ledger.jsonl
+and the draft (manuscript.md) if it exists. Judge what code cannot: plausibility against the domain, whether the
 comparator and the objective match the question, hidden assumptions, overclaims. Write
 {file} in the critique-blockers schema: reviewer, round, verdict (PASS | REVISE),
 structural_mismatch {{detected: bool}}, carried_forward (round 1: []), blockers (ids {prefix}-NNN;
@@ -68,14 +68,15 @@ Then write {out} = {{"ok": true}}.""",
 Task: fix task {tid}: {brief}
 Findings: {findings}. Evidence from the last check (if any): {evidence}
 You may edit analysis_settings.yaml, which holds only computational settings
-(uncertainty.draws, uncertainty.seed, emulator.points, emulator.seed), and files under models/ext/.
+({settings}), and files under models/ext/.
 decision_spec.yaml is signed by the owner and you cannot change it; a fix that needs it changed is
 a finding for the owner. The harness undoes any other edit, then rebuilds and measures the effect.
 Output: {out} = {{"ok": true, "changed": "<one line>"}}.""",
     "write": COMMON + """
 
-Task: write manuscript.md ({mode}). Read analysis/analysis.json, engine_choice.json,
-decision_spec.yaml and scope_declaration.yaml if present. Write the narrative, the methods and the
+Task: write manuscript.md ({mode}). Read results.md and the analysis artifacts in analysis/
+(manifest.json lists them), engine_choice.json, decision_spec.yaml and scope_declaration.yaml if
+present. Write the narrative, the methods and the
 interpretation. Refer to numbers by name (the harness renders the numbers table below your text);
 do not type them. Mode `not_accepted`: the first section is "Status: not accepted by the final
 gate", listing the open blocking findings from findings.jsonl in plain words. Mode `declared`: a
@@ -83,6 +84,16 @@ Limitations section that repeats each declaration. Output: manuscript.md and {ou
 }
 OWNS = {"draft_spec": ("decision_spec.yaml", "analysis_settings.yaml", "data/"), "pick_engine": (), "plan_fixes": (),
         "critique": (), "fix": ("analysis_settings.yaml", "models/ext/"), "write": ("manuscript.md",)}
+
+
+def _answer_key(target: str, run_dir: str) -> bool:
+    """A path into the repository's evals/ tree or any _truth directory. data/evals/<q>/ (the
+    questions' public inputs) is readable."""
+    if "_truth" in target.replace("\\", "/").split("/"):
+        return True
+    p = os.path.realpath(os.path.join(run_dir, os.path.expanduser(target)))
+    rel = os.path.relpath(p, enforcement.REPO_ROOT).replace(os.sep, "/")
+    return rel == "evals" or rel.startswith("evals/") or target.replace("\\", "/").lstrip("./").startswith("evals/")
 
 
 def _allowed(path: str, run_dir: str, owns: tuple) -> str | None:
@@ -108,6 +119,11 @@ def _allowed(path: str, run_dir: str, owns: tuple) -> str | None:
             or low in {o.lower() for o in owns}:
         return None
     return f"this task may write only {', '.join(owns + (OUT,))}"
+
+
+def _settings_text() -> str:
+    from agents import analysis_backend as AB
+    return ", ".join(getattr(AB.backend(), "settings_paths", AB.SETTINGS_PATHS))
 
 
 class SdkTasks:
@@ -164,8 +180,8 @@ class SdkTasks:
                 if why:
                     return enforcement.deny_output(f"{kind}: {why}")
             if name in ("Read", "Grep", "Glob"):
-                tgt = str(ti.get("file_path") or ti.get("path") or "")
-                if "evals/" in tgt or "_truth" in tgt:
+                tgt = str(ti.get("file_path") or ti.get("path") or ti.get("pattern") or "")
+                if _answer_key(tgt, self.run_dir):
                     return enforcement.deny_output("evaluation answer keys are not readable")
             return {}
 
@@ -236,9 +252,12 @@ class SdkTasks:
         return name
 
     def draft_spec(self, question, run_dir, feedback):
-        ex = os.path.join(enforcement.REPO_ROOT, "spike", "decision_spec.yaml")
+        R = enforcement.REPO_ROOT
         p = f"Question:\n{question}\n" + (f"\nThe last draft failed validation:\n- " + "\n- ".join(feedback) if feedback else "")
-        return self._session("draft_spec", PROMPTS["draft_spec"].format(example=ex, out=OUT), p, OWNS["draft_spec"])
+        return self._session("draft_spec", PROMPTS["draft_spec"].format(
+            settings=_settings_text(), skill=os.path.join(R, ".claude", "skills", "decision-spec", "SKILL.md"),
+            schema=os.path.join(R, "toolkit", "spec", "schema.py"), example=os.path.join(R, "spike", "decision_spec.v2.yaml"),
+            repo=R, out=OUT), p, OWNS["draft_spec"])
 
     def sign_spec(self, run_dir):
         with open(os.path.join(run_dir, "decision_spec.signoff.json"), "w") as f:
@@ -267,7 +286,7 @@ class SdkTasks:
         return self._session("fix", PROMPTS["fix"].format(tid=task["id"], brief=task.get("brief", ""),
                                                            findings=task["findings"],
                                                            evidence=json.dumps(evidence)[:2000] if evidence else "none",
-                                                           out=OUT), "Make the fix.", owns)
+                                                           settings=_settings_text(), out=OUT), "Make the fix.", owns)
 
     def write(self, run_dir, mode):
         return self._session("write", PROMPTS["write"].format(mode=mode, out=OUT), "Write the draft.", OWNS["write"])
@@ -330,6 +349,13 @@ def _self_test() -> int:
         led = json.load(open(os.path.join(d, "budget_ledger.json")))
         ok(len(led["sessions"]) == 3 and abs(led["spent_usd"] - (0.42 + 0.42 + 1.25)) < 1e-9,
            f"S5 every charge is in budget_ledger.json ({led['spent_usd']})")
+        R = enforcement.REPO_ROOT
+        ok(not _answer_key(os.path.join(R, "data", "evals", "q", "districts.csv"), d)
+           and _answer_key(os.path.join(R, "evals", "q", "rubric.yaml"), d) and _answer_key("x/_truth/truth.json", d)
+           and _answer_key("evals/q/generate.py", d),
+           "S9 the questions' public inputs (data/evals/) are readable; evals/ and _truth are not")
+        ok("{settings}" not in PROMPTS["fix"].format(tid="T", brief="b", findings=[], evidence="", settings="a.b", out=OUT)
+           and "engine: auto" in PROMPTS["draft_spec"], "S10 the prompts follow the analysis backend's schema")
 
         async def crash_no_sid(prompt=None, options=None):
             raise RuntimeError("crash before the conversation started")

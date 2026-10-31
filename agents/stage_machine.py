@@ -671,7 +671,8 @@ class Machine:
             pick, why = eligible[0]["ref"], f"harness: the pick {pick!r} is not eligible; first eligible engine"
         else:
             why = (res.output or {}).get("why", "")
-        rec.update(AB.engine_choice_record(pick, why, rows))
+        cfg = next((r.get("config") for r in eligible if r["ref"] == pick), None) or {}
+        rec.update(AB.engine_choice_record(pick, why, rows, config=cfg))
         if self.cross and len(eligible) > 1:
             try:
                 rec["cross_check"] = self.backend.cross_check(
