@@ -1,0 +1,788 @@
+name: malaria-starsim
+version: 0.1-spike
+mechanisms:
+- 'Griffin-lite human natural history and immunity (fixed: Griffin et al. 2010 PLoS Med 10.1371/journal.pmed.1000324;
+  2014 Nat Commun; 2015 Lancet Infect Dis)'
+- species-specific vectors (Q0, phi_I, phi_B, mu0 from the D6 prior; endophily assumed)
+- 'ITN: deflection (repellence + blocking), killing, feeding; pyrethroid resistance; PBO; dual-AI; decay'
+- 'IRS: deterrence on entry and killing of indoor-resting fed mosquitoes; decay'
+- ITN x IRS redundancy from shared indoor target (no interaction factor)
+- SMC (28-day protection, clearance); case management (effective treatment)
+- expected severe episodes and deaths; DALYs from GBD 2019 weights and reference life table
+components:
+  net:
+  - none
+  - pyr
+  - pbo
+  - dual
+  smc:
+  - 0
+  - 1
+  irs:
+  - 0
+  - 1
+  cm:
+  - 0
+  - 1
+unit_attributes:
+  m0: emergence density per person, [0.2, 400]
+  season: 12 monthly values, mean 1
+  resistance: bioassay mortality [0, 1]
+  species: species shares
+  cm_ft: effective treatment [0, 0.95]
+  itn_use: net use after a campaign [0, 1]
+  itn_hist_years: past campaign years
+  campaign_year: decimal year of the package's campaign
+  smc_months: optional SMC months
+  irs_month: optional IRS month
+outputs:
+  per_capita:
+  - cases
+  - severe
+  - deaths
+  - treated
+  - dalys
+  windows:
+  - pfpr_u5
+  - pfpr_6m14y
+  - pfpr_2_10
+  - inc_u5
+  - inc_all
+  - inc_u5_smc
+  - eir_annual
+  cost_drivers:
+  - nets_given
+  - smc_doses
+  - irs_sprayed
+  - treated_all
+age_groups:
+- u5
+- '5_14'
+- 15p
+valid_ranges:
+  m0:
+  - 0.2
+  - 400
+  resistance:
+  - 0.1
+  - 1.0
+  cm_ft:
+  - 0.0
+  - 0.95
+  eir_annual:
+  - 0.1
+  - 300
+fitted:
+  itn_kill_max:
+    value: 0.2228
+    lo: 0.1762
+    hi: 0.2835
+    all_targets_in_band_at_value: true
+    benchmarks:
+    - B7
+    - B8
+    grid:
+    - 0.15
+    - 0.25
+    - 0.35
+    - 0.45
+    - 0.6
+    - 0.75
+    loss:
+    - 1.546
+    - 0.687
+    - 3.899
+    - 12.252
+    - 33.464
+    - 66.942
+    computed_on_grid:
+    - B7: 0.8025
+      B8: 0.6738
+    - B7: 0.7134
+      B8: 0.551
+    - B7: 0.6188
+      B8: 0.4551
+    - B7: 0.5274
+      B8: 0.3659
+    - B7: 0.4067
+      B8: 0.2718
+    - B7: 0.3235
+      B8: 0.1927
+  pbo_restore:
+    value: 1.0
+    lo: 0.2863
+    hi: 1.0
+    all_targets_in_band_at_value: false
+    benchmarks:
+    - B9
+    grid:
+    - 0.0
+    - 0.2
+    - 0.4
+    - 0.6
+    - 0.8
+    - 1.0
+    loss:
+    - 1.012
+    - 1.055
+    - 0.929
+    - 0.881
+    - 0.76
+    - 0.595
+    computed_on_grid:
+    - B9: 1.0
+    - B9: 1.0214
+    - B9: 0.9592
+    - B9: 0.9357
+    - B9: 0.876
+    - B9: 0.7932
+  cfp_kill:
+    value: 0.29
+    lo: 0.29
+    hi: 0.3162
+    all_targets_in_band_at_value: true
+    benchmarks:
+    - B10
+    - B11
+    grid:
+    - 0.05
+    - 0.15
+    - 0.3
+    - 0.45
+    - 0.6
+    - 0.8
+    loss:
+    - 4.209
+    - 1.633
+    - 1.421
+    - 7.21
+    - 17.145
+    - 39.176
+    computed_on_grid:
+    - B10: 0.9344
+      B11: 0.8617
+    - B10: 0.8284
+      B11: 0.6436
+    - B10: 0.6596
+      B11: 0.4036
+    - B10: 0.5157
+      B11: 0.2387
+    - B10: 0.3962
+      B11: 0.1528
+    - B10: 0.2552
+      B11: 0.0821
+  irs_kill:
+    value: 0.14
+    lo: 0.127
+    hi: 0.404
+    all_targets_in_band_at_value: true
+    benchmarks:
+    - B12
+    - B12b
+    grid:
+    - 0.1
+    - 0.25
+    - 0.4
+    - 0.55
+    - 0.7
+    - 0.9
+    loss:
+    - 0.689
+    - 0.856
+    - 1.553
+    - 2.97
+    - 4.912
+    - 7.794
+    computed_on_grid:
+    - B12: 0.8973
+      B12b: 0.7938
+    - B12: 0.8023
+      B12b: 0.6163
+    - B12: 0.7091
+      B12b: 0.4939
+    - B12: 0.6256
+      B12b: 0.3893
+    - B12: 0.5575
+      B12b: 0.3113
+    - B12: 0.4812
+      B12b: 0.243
+benchmarks:
+- id: B7
+  metric: ITN (pyrethroid) vs none, prevalence RR at 12 m
+  role: fit
+  target: 0.83
+  band:
+  - 0.68
+  - 0.98
+  source: C21 Pryce 2018 Cochrane CD000363.pub3
+  computed: 0.7349
+  per_seed:
+  - 0.7303
+  - 0.7097
+  - 0.7433
+  - 0.7458
+  - 0.7403
+  - 0.7487
+  - 0.7203
+  - 0.7418
+  se_log: 0.0067
+  in_band: true
+- id: B8
+  metric: ITN vs none, clinical incidence RR 0-24 m (under 5)
+  role: fit
+  target: 0.55
+  band:
+  - 0.46
+  - 0.64
+  source: C22 Pryce 2018
+  computed: 0.578
+  per_seed:
+  - 0.5772
+  - 0.5922
+  - 0.5964
+  - 0.5701
+  - 0.5743
+  - 0.5539
+  - 0.5725
+  - 0.5887
+  se_log: 0.0085
+  in_band: true
+- id: B9
+  metric: PBO vs pyrethroid nets, prevalence OR at 9 m (pooled over IRS arms)
+  role: fit
+  target: 0.37
+  band:
+  - 0.09
+  - 0.65
+  source: C15 Protopopoff 2018 Lancet
+  computed: 0.7985
+  per_seed:
+  - 0.796
+  - 0.7837
+  - 0.8003
+  - 0.825
+  - 0.7958
+  - 0.8045
+  - 0.7932
+  - 0.7904
+  se_log: 0.0054
+  in_band: false
+- id: B9b
+  metric: PBO vs pyrethroid nets, prevalence OR at 21 m (pooled over IRS arms)
+  role: held_out
+  target: 0.4
+  band:
+  - 0.2
+  - 0.81
+  source: C15 Protopopoff 2018 (added held-out durability check)
+  computed: 0.9534
+  per_seed:
+  - 0.9202
+  - 0.9713
+  - 0.9898
+  - 0.9433
+  - 0.9845
+  - 0.95
+  - 0.9111
+  - 0.9599
+  se_log: 0.0106
+  in_band: false
+- id: B9c
+  metric: PBO vs pyrethroid nets, prevalence aOR at 24 m (Misungwi)
+  role: held_out
+  target: 0.99
+  band:
+  - 0.67
+  - 1.45
+  source: C17 Mosha 2022 Lancet (added held-out durability check)
+  computed: 0.9931
+  per_seed:
+  - 1.0028
+  - 0.9356
+  - 0.9649
+  - 0.9972
+  - 1.0031
+  - 1.0074
+  - 1.0157
+  - 1.0206
+  se_log: 0.0104
+  in_band: true
+- id: B10
+  metric: Dual-AI vs pyrethroid nets, prevalence OR at 24 m
+  role: fit
+  target: 0.45
+  band:
+  - 0.23
+  - 0.67
+  source: C17 Mosha 2022
+  computed: 0.6876
+  per_seed:
+  - 0.7087
+  - 0.7242
+  - 0.6657
+  - 0.6314
+  - 0.692
+  - 0.6436
+  - 0.7264
+  - 0.7156
+  se_log: 0.0193
+  in_band: false
+- id: B11
+  metric: Dual-AI vs pyrethroid nets, incidence RR 0-24 m
+  role: fit
+  target: 0.54
+  band:
+  - 0.38
+  - 0.7
+  source: C20 Accrombessi 2023 Lancet
+  computed: 0.4015
+  per_seed:
+  - 0.4674
+  - 0.3823
+  - 0.398
+  - 0.3923
+  - 0.3998
+  - 0.3794
+  - 0.3981
+  - 0.4007
+  se_log: 0.0229
+  in_band: true
+- id: B12
+  metric: Non-pyrethroid IRS added to ITN, prevalence RR at 12 m
+  role: fit
+  target: 0.61
+  band:
+  - 0.34
+  - 0.88
+  source: C23 Pryce 2022 Cochrane CD012688.pub3
+  computed: 0.8778
+  per_seed:
+  - 0.8982
+  - 0.8512
+  - 0.8742
+  - 0.8764
+  - 0.9008
+  - 0.8692
+  - 0.8781
+  - 0.875
+  se_log: 0.0064
+  in_band: true
+- id: B12b
+  metric: Non-pyrethroid IRS added to ITN, incidence RR 0-24 m
+  role: fit
+  target: 0.86
+  band:
+  - 0.49
+  - 1.23
+  source: C23 Pryce 2022
+  computed: 0.7459
+  per_seed:
+  - 0.756
+  - 0.7173
+  - 0.7483
+  - 0.7586
+  - 0.7402
+  - 0.7605
+  - 0.7566
+  - 0.7308
+  se_log: 0.0074
+  in_band: true
+- id: B13
+  metric: SMC, in-season clinical incidence RR (3-59 m)
+  role: held_out
+  target: 0.27
+  band:
+  - 0.14
+  - 0.4
+  source: C27 Thwing 2024 AJTMH
+  computed: 0.3461
+  per_seed:
+  - 0.342
+  - 0.3457
+  - 0.3304
+  - 0.3487
+  - 0.3714
+  - 0.3472
+  - 0.3449
+  - 0.3398
+  se_log: 0.0117
+  in_band: true
+- id: B15
+  metric: ITN x IRS interaction OR (PBO x IRS, prevalence at 9 m, 2x2 factorial)
+  role: held_out
+  target: 2.43
+  band:
+  - 0.972
+  - 6.075
+  source: 'C16 Protopopoff 2018: interaction OR 2.43 (1.19-4.97)'
+  arm_or:
+  - a11: 0.6783
+    a10: 0.7964
+    a01: 0.8531
+  - a11: 0.6838
+    a10: 0.7719
+    a01: 0.8599
+  - a11: 0.7209
+    a10: 0.7999
+    a01: 0.9006
+  - a11: 0.6945
+    a10: 0.813
+    a01: 0.8301
+  - a11: 0.6665
+    a10: 0.8331
+    a01: 0.8778
+  - a11: 0.6832
+    a10: 0.8112
+    a01: 0.8569
+  - a11: 0.7232
+    a10: 0.8375
+    a01: 0.963
+  - a11: 0.6688
+    a10: 0.7828
+    a01: 0.8386
+  computed: 0.9823
+  per_seed:
+  - 0.9984
+  - 1.0303
+  - 1.0006
+  - 1.0291
+  - 0.9114
+  - 0.9829
+  - 0.8967
+  - 1.0188
+  se_log: 0.019
+  in_band: true
+- id: B16c
+  metric: 'EIR-prevalence curve (Beier 1999 rules: EIR > 15 -> PfPR >= 50%; EIR >= 200 -> PfPR > 80%)'
+  role: held_out
+  target: null
+  band: null
+  source: C35 Beier 1999 AJTMH
+  points:
+  - - 1.036
+    - 0.1047
+  - - 4.333
+    - 0.2547
+  - - 16.8
+    - 0.4652
+  - - 52.602
+    - 0.641
+  - - 175.755
+    - 0.7789
+  - - 524.759
+    - 0.853
+  rules_checked: 5
+  rules_met: 4
+  computed: 0.8
+  in_band: false
+- id: B17
+  metric: SMC $ per DALY averted (reference setting)
+  role: held_out
+  target: 38.37
+  band:
+  - 7.67
+  - 191.9
+  source: C28 Gilmartin 2021
+  computed: 18.3185
+  outcome_averted_per_capita: 0.1051
+  cost_per_capita: 1.9254
+  in_band: true
+- id: B18
+  metric: ITN vs none $ per DALY averted (reference setting)
+  role: held_out
+  target: 44.51
+  band:
+  - 8.9
+  - 222.6
+  source: C29 Conteh 2021
+  computed: 57.2551
+  outcome_averted_per_capita: 0.0156
+  cost_per_capita: 0.8915
+  in_band: true
+- id: B19
+  metric: IRS vs none $ per DALY averted (reference setting)
+  role: held_out
+  target: 25.16
+  band:
+  - 5.03
+  - 125.8
+  source: C29 Conteh 2021
+  computed: 369.655
+  outcome_averted_per_capita: 0.0669
+  cost_per_capita: 24.7385
+  in_band: false
+- id: B20
+  metric: Dual-AI vs pyrethroid nets, incremental $ per DALY averted (high resistance)
+  role: held_out
+  target: 19.0
+  band:
+  - 3.8
+  - 95.0
+  source: C19 Mosha 2022
+  computed: 3.6317
+  outcome_averted_per_capita: 0.0577
+  cost_per_capita: 0.2094
+  in_band: false
+notes:
+- endophily per species is an unverified assumption (not in the D6 prior)
+- resistance-to-killing uses attempt 8's power form; its maximum is fitted, not Churcher 2016's coefficients
+parameters:
+- name: itn_kill_max
+  value: 0.2228
+  kind: fitted
+  units: probability
+  lo: 0.1762
+  hi: 0.2835
+  source: fitted once to benchmarks B7, B8 (benchmarks/fitted.yaml)
+  verified: unverified
+- name: itn_kexp
+  value: 3.0
+  kind: fixed
+  units: exponent
+  lo: null
+  hi: null
+  source: E7 attempt 8 value (models/malaria_abm.py VC), kept; form after Churcher 2016 eLife 10.7554/eLife.16090
+  verified: unverified
+- name: itn_rep_max
+  value: 0.05
+  kind: fixed
+  units: probability
+  lo: null
+  hi: null
+  source: E7 attempt 8 value (models/malaria_abm.py VC), kept
+  verified: unverified
+- name: itn_block
+  value: 0.15
+  kind: fixed
+  units: probability
+  lo: null
+  hi: null
+  source: E7 attempt 8 value (models/malaria_abm.py VC), kept (barrier)
+  verified: unverified
+- name: block_half
+  value: 1095.0
+  kind: fixed
+  units: days
+  lo: null
+  hi: null
+  source: assumption (net physical integrity half-life 3 y)
+  verified: unverified
+- name: ins_half
+  value: 730.0
+  kind: fixed
+  units: days
+  lo: null
+  hi: null
+  source: E7 attempt 8 value (models/malaria_abm.py VC), kept
+  verified: unverified
+- name: pbo_restore
+  value: 1.0
+  kind: fitted
+  units: share
+  lo: 0.2863
+  hi: 1.0
+  source: fitted once to benchmarks B9 (benchmarks/fitted.yaml)
+  verified: unverified
+- name: pbo_half
+  value: 365.0
+  kind: fixed
+  units: days
+  lo: null
+  hi: null
+  source: E7 attempt 8 value (models/malaria_abm.py VC), kept
+  verified: unverified
+- name: cfp_kill
+  value: 0.29
+  kind: fitted
+  units: probability
+  lo: 0.29
+  hi: 0.3162
+  source: fitted once to benchmarks B10, B11 (benchmarks/fitted.yaml)
+  verified: unverified
+- name: cfp_half
+  value: 912.5
+  kind: fixed
+  units: days
+  lo: null
+  hi: null
+  source: E7 attempt 8 value (models/malaria_abm.py VC), kept
+  verified: unverified
+- name: irs_kill
+  value: 0.14
+  kind: fitted
+  units: probability
+  lo: 0.127
+  hi: 0.404
+  source: fitted once to benchmarks B12, B12b (benchmarks/fitted.yaml)
+  verified: unverified
+- name: irs_rep
+  value: 0.1
+  kind: fixed
+  units: probability
+  lo: null
+  hi: null
+  source: E7 attempt 8 value (models/malaria_abm.py VC), kept
+  verified: unverified
+- name: irs_half
+  value: 146.0
+  kind: fixed
+  units: days
+  lo: null
+  hi: null
+  source: E7 attempt 8 value (models/malaria_abm.py VC), kept
+  verified: unverified
+- name: irs_coverage
+  value: 0.8
+  kind: scenario
+  units: share
+  lo: null
+  hi: null
+  source: policy assumption (attempt 8 IRS_COVERAGE)
+  verified: unverified
+- name: net_retention_half
+  value: 730.0
+  kind: fixed
+  units: days
+  lo: null
+  hi: null
+  source: E7 attempt 8 value (models/malaria_abm.py VC), kept (net retention half-life ~2 y)
+  verified: unverified
+- name: smc_pe
+  value: 0.882
+  kind: fixed
+  units: share
+  lo: 0.787
+  hi: 0.934
+  source: ACCESS-SMC Partnership 2020 Lancet 10.1016/S0140-6736(20)32227-3
+  verified: matched
+- name: smc_hi_frac
+  value: 0.85
+  kind: fixed
+  units: share
+  lo: null
+  hi: null
+  source: E7 attempt 8 value (models/malaria_abm.py VC), kept (SMC access groups)
+  verified: unverified
+- name: cm_add
+  value: 0.15
+  kind: scenario
+  units: probability
+  lo: null
+  hi: null
+  source: 'E7 attempt 8 value (models/malaria_abm.py VC), kept (enhanced CM: +0.15 effective treatment)'
+  verified: unverified
+- name: cfr_severe_treated
+  value: 0.1
+  kind: fixed
+  units: probability
+  lo: null
+  hi: null
+  source: AQUAMAT (attempt 8 C48)
+  verified: unverified
+- name: cfr_severe_untreated
+  value: 0.3
+  kind: fixed
+  units: probability
+  lo: null
+  hi: null
+  source: assumption (attempt 8 C49)
+  verified: unverified
+- name: severe_access_add
+  value: 0.25
+  kind: fixed
+  units: probability
+  lo: null
+  hi: null
+  source: E7 attempt 8 value (models/malaria_abm.py VC), kept (severe-care access above CM)
+  verified: unverified
+- name: dw_moderate
+  value: 0.051
+  kind: fixed
+  units: weight
+  lo: null
+  hi: null
+  source: GBD 2019 disability weight, acute infectious episode, moderate
+  verified: unverified
+- name: dw_severe
+  value: 0.133
+  kind: fixed
+  units: weight
+  lo: null
+  hi: null
+  source: GBD 2019 disability weight, acute infectious episode, severe
+  verified: unverified
+- name: dur_moderate_d
+  value: 5.0
+  kind: fixed
+  units: days
+  lo: null
+  hi: null
+  source: E7 attempt 8 value (models/malaria_abm.py VC), kept (unit_model DUR_MOD)
+  verified: unverified
+- name: dur_severe_d
+  value: 10.0
+  kind: fixed
+  units: days
+  lo: null
+  hi: null
+  source: E7 attempt 8 value (models/malaria_abm.py VC), kept (unit_model DUR_SEV)
+  verified: unverified
+- name: le_u5
+  value: 87.0
+  kind: fixed
+  units: years
+  lo: null
+  hi: null
+  source: GBD 2019 reference life table e(x), mean age at death <5 (attempt 8)
+  verified: unverified
+- name: le_5_14
+  value: 80.0
+  kind: fixed
+  units: years
+  lo: null
+  hi: null
+  source: GBD 2019 reference life table e(x), 5-14 (attempt 8)
+  verified: unverified
+- name: le_15p
+  value: 54.0
+  kind: fixed
+  units: years
+  lo: null
+  hi: null
+  source: GBD 2019 reference life table e(x), 15+ (attempt 8)
+  verified: unverified
+- name: import_eir
+  value: 0.1
+  kind: fixed
+  units: infectious bites/person/year
+  lo: null
+  hi: null
+  source: E7 attempt 8 value (models/malaria_abm.py VC), kept
+  verified: unverified
+- name: n_agents
+  value: 4000.0
+  kind: fixed
+  units: agents
+  lo: null
+  hi: null
+  source: numerical setting
+  verified: unverified
+species_bionomics:
+  gambiae:
+    Q0: 0.92
+    phi_B: 0.85
+    phi_I: 0.9
+    mu0: 0.132
+    endophily: 0.8
+  arabiensis:
+    Q0: 0.71
+    phi_B: 0.8
+    phi_I: 0.86
+    mu0: 0.132
+    endophily: 0.5
+  funestus:
+    Q0: 0.94
+    phi_B: 0.78
+    phi_I: 0.87
+    mu0: 0.112
+    endophily: 0.85

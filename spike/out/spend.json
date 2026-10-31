@@ -1,0 +1,21 @@
+{
+ "cluster_prefix": "spike-v2-",
+ "window": [
+  "2026-10-31T05:50:00Z",
+  "2026-10-31T07:49:29Z"
+ ],
+ "credits": 109.25,
+ "instances": 12,
+ "clusters": [
+  "spike-v2-a",
+  "spike-v2-b",
+  "spike-v2-c",
+  "spike-v2-d",
+  "spike-v2-e",
+  "spike-v2-f"
+ ],
+ "usd_per_credit": 0.061,
+ "usd_est": 6.66,
+ "model_calls_usd": 0.0,
+ "batch_wall_min": 94.0
+}
