@@ -284,3 +284,18 @@ FINAL `completed`, in 31 s with 2 workers.
 - **The fix:** changed only `analysis_settings.yaml`.
 - **Impact rows:** they now separate what the agent changed (`files_changed`, measured before the rebuild) from
   what the rebuild rewrote (`outputs_changed`).
+
+## 13. Fixes from the first blind real run (v2blind1)
+
+The grader scored the run 1.0, but review found the gate had accepted with eight MEDIUM critic findings open. The
+critics wrote `done_when` as prose; `done_when.py` counted every test as missing (three MEDIUM
+`critique_done_when_missing`), and MEDIUM does not block ACCEPT under today's rule 4. The report also showed claim
+ids (`mix.itn`) instead of values, and the unit costs were typed into the spec with no copy of their file.
+Fixtures: the run's three critique YAMLs, `final_gate.json` and claims ledger (`tests/fixtures/v2blind1/`).
+
+| # | Change | Test |
+|---|---|---|
+| 1 | The critic prompt gives the structured `done_when` forms `done_when.py` accepts, with an example. In v2, a HIGH or MEDIUM blocker whose test is missing or does not parse is a schema error, repaired by the T37 path (only that critic, told its errors) while repairs remain | T38 |
+| 2 | v2 rule on top of today's: an ACCEPT with open HIGH/MEDIUM findings (critic blockers not closed by their test; harness-check findings) becomes PATCH_OR_RETHINK rule `4m` while rounds and budget remain, and those findings are planned in the fix loop; when none remain it becomes DECLARE_SCOPE rule `3m`, the findings are written to `declared_findings.yaml` and rendered in the report. The gate file and validator history record the action the machine takes. Golden-trace replays of stored v1 gates run without these rules (`v2_rules: false`) | T39, T42 |
+| 3 | The writer writes `[CLAIM:id]`; `render_report` substitutes the value from `models/claims_ledger.yaml`. An unresolved reference, or a ledger id left bare in the writer's text, is a non-declarable HIGH write-up finding | T40 |
+| 4 | Before the draft, every repository file the question names is copied into `data/inputs/` with its sha256 (`data/inputs_provenance.json`); every file the spec cites must be inside the run and is recorded with its sha256, else the spec does not pass the pre-sign check | T41 |

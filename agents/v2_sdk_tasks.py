@@ -41,9 +41,11 @@ PROMPTS = {
 Task: draft decision_spec.yaml for the question, and analysis_settings.yaml with the
 computational settings only ({settings}; not repeated in the spec). Follow {skill} (the schema is the
 docstring of {schema}; a full example is {example}). Write `engine: auto`: the harness chooses the
-engine after sign-off. The question's input files are relative to the repository root {repo}; copy or
-derive what the spec reads (the units table, the calibration targets) into data/ in the run
-directory, only from those files, with a short derivation note in data/README.md. The spec's paths
+engine after sign-off. The harness has copied the question's input files into data/inputs/ (same
+relative paths; their sha256 in data/inputs_provenance.json): read and cite those copies. Derive
+what the spec reads (the units table, the calibration targets, the costs) from them, into data/ in
+the run directory, with a short derivation note in data/README.md; take every number from a file,
+never type one from memory. Every file the spec cites must be inside the run directory; its paths
 are relative to the run directory. Output: decision_spec.yaml, analysis_settings.yaml and
 {out} = {{"ok": true, "notes": "..."}}.""",
     "pick_engine": COMMON + """
@@ -61,8 +63,19 @@ comparator and the objective match the question, hidden assumptions, overclaims.
 {file} in the critique-blockers schema: reviewer, round, verdict (PASS | REVISE),
 structural_mismatch {{detected: bool}}, carried_forward (round 1: []), blockers (ids {prefix}-NNN;
 each with id, severity ({severities}), category ({categories}), target_stage ({stages}),
-first_seen_round, claim, evidence, fix_requires, resolved (true/false), and a done_when test where one
-fits). Use only those values: the gate refuses any other.{feedback}
+first_seen_round, claim, evidence, fix_requires, resolved (true/false), and done_when (required for
+HIGH and MEDIUM). Use only those values: the gate refuses any other.
+
+done_when is a structured test the harness runs, never prose: a list of checks, all must pass.
+  - {{file: <path in the run>, exists: true}}
+  - {{file: <path>, contains: "<regex>"}}   or   {{file: <path>, lacks: "<regex>"}}
+  - {{file: <x.yaml or .json>, key: a.b.0, op: "==|!=|<|<=|>|>=|between|in|matches|width_gt", value: <v>}}
+  - {{file: <x.csv>, column: <name>, op: <op>, value: <v>, rows: all|any|none}}  (or agg: sum|mean|min|max|count)
+  - {{judgement: "<what would show it is fixed>"}}   only when no runnable check fits; at most one
+Example:
+  done_when:
+    - {{file: uncertainty_report.yaml, key: sampler_varied_parameters, op: ">=", value: 16}}
+    - {{file: manuscript.md, contains: "decision rule"}}{feedback}
 Then write {out} = {{"ok": true}}.""",
     "plan_fixes": FIX_PLANNER_PROMPT + "\nThe packet is in {out_in}. Write your JSON to {out}.",
     "fix": COMMON + """
@@ -79,8 +92,9 @@ Output: {out} = {{"ok": true, "changed": "<one line>"}}.""",
 Task: write manuscript.md ({mode}). Read results.md and the analysis artifacts in analysis/
 (manifest.json lists them), engine_choice.json, decision_spec.yaml and scope_declaration.yaml if
 present. Write the narrative, the methods and the
-interpretation. Refer to numbers by name (the harness renders the numbers table below your text);
-do not type them. Mode `not_accepted`: the first section is "Status: not accepted by the final
+interpretation. Write every number as a reference [CLAIM:<id>] to models/claims_ledger.yaml
+(the ids are listed there): the harness substitutes the value. Never type a number, and never write
+a bare id such as `mix.itn`: the gate refuses a report that shows one. Mode `not_accepted`: the first section is "Status: not accepted by the final
 gate", listing the open blocking findings from findings.jsonl in plain words. Mode `declared`: a
 Limitations section that repeats each declaration. Output: manuscript.md and {out} = {{"ok": true}}.""",
 }

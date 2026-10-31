@@ -1,0 +1,145 @@
+reviewer: critique-domain
+round: 1
+verdict: REVISE
+structural_mismatch:
+  detected: false
+carried_forward: []
+blockers:
+  - id: D-001
+    severity: MEDIUM
+    category: METHODS
+    target_stage: ANALYZE
+    first_seen_round: 1
+    claim: >-
+      The headline 95% UI is labelled "over calibration", and owner flag 3 says it covers "effect and
+      baseline-rate estimation". But the sampler varied only the 6 log rate ratios. The 10 district
+      baseline log-rates (z:D01..z:D10), which are also calibrated, were held at their MLE.
+    evidence: >-
+      uncertainty_report.yaml: sampler_varied_parameters: 6. analysis/calibration.yaml: n_parameters: 16,
+      and the covariance has z variances of about 0.0009-0.008 (SE about 3-9% per district). The z
+      parameters are negatively correlated with the lrr parameters, and the z parameters are positively
+      correlated with each other. Cases averted per district scale as exp(z) x (1 - exp(lrr)), so leaving
+      out z uncertainty and its covariance with lrr narrows the interval for total_cases_averted. The
+      label overstates what the interval covers.
+    fix_requires: >-
+      Draw from the full 16-parameter calibration covariance (lrr and z together) for the uncertainty
+      analysis, or relabel the interval to say that baseline-rate uncertainty is excluded and give the
+      reason.
+    done_when: >-
+      Either uncertainty_report.yaml shows sampler_varied_parameters: 16, or interval.excludes lists the
+      baseline rates and the owner flag and results text no longer say the baselines are covered.
+    resolved: false
+  - id: D-002
+    severity: MEDIUM
+    category: PRESENTATION
+    target_stage: WRITE
+    first_seen_round: 1
+    claim: >-
+      The question explicitly asks the report to "state the decision rule". results.md has a "Decision
+      rule" heading but only a table of comparator burden by package. That table reads as a
+      burden-threshold rule, and the allocation contradicts that reading: D10 (comparator 0.15
+      cases/person) gets ITN while D09 (0.238 cases/person) gets nothing.
+    evidence: >-
+      results.md Decision rule table: ITN range 0.15-1.39, none 0.238. In allocation_optimized.csv, D10
+      ITN averts 12,790 cases for US$1.24M (about US$97/case). An ITN campaign in D09 would cost US$3.24M
+      (600,000 x 5.40) and avert about 53k cases (about US$61/case), which is more cost-effective, but it
+      does not fit in the remaining envelope (US$17.874M is allocated). The real rule is an integer
+      (knapsack) maximisation of total cases averted under the envelope. Because districts cannot be
+      split, the choices are lumpy. The written rule exists only as a comment in decision_spec.yaml.
+    fix_requires: >-
+      In the write-up, state the decision rule in words: choose one package per district to maximise
+      total cases averted vs. no intervention, subject to total cost <= US$18.0M and SMC only where
+      eligible, using the calibrated point effects. Explain that districts are indivisible, which is why
+      a large, lower-burden but cost-effective district (D09) is left unfunded while smaller ones are
+      funded. Do not present the burden table as the rule.
+    done_when: >-
+      The manuscript has a decision-rule sentence matching the spec's rule, and the text explains the
+      D09/D10 ordering using indivisibility and the budget, not burden.
+    resolved: false
+  - id: D-003
+    severity: MEDIUM
+    category: PRESENTATION
+    target_stage: WRITE
+    first_seen_round: 1
+    claim: >-
+      The plan depends on the budget. DT1 shows 20-30% of districts changing package when the envelope
+      moves by +/-10%. The recommendation must not be presented as robust beyond the exact US$18.0M
+      figure.
+    evidence: >-
+      models/decision_tests/DT1.yaml: decision_changes: true. At US$16.2M, 2 units change (4 ITN+SMC,
+      3 ITN, 2 none, 1 SMC). At US$19.8M, 3 units change (5 ITN, 4 ITN+SMC, 1 none). By contrast, the
+      plan is very stable across calibration draws (all units >= 94% dominance), so budget, not effect
+      uncertainty, is what moves the decision.
+    fix_requires: >-
+      Report that the allocation is robust to effect-estimation uncertainty but not to the envelope.
+      Name which districts change at the lower and higher envelopes, and say what the manager should
+      prioritise if the budget shifts.
+    done_when: >-
+      The manuscript reports DT1 as CHANGES_PLAN and gives the units that switch. No sentence calls the
+      plan robust without qualifying it.
+    resolved: false
+  - id: D-004
+    severity: MEDIUM
+    category: HYPOTHESES
+    target_stage: WRITE
+    first_seen_round: 1
+    claim: >-
+      The fit shows strong overdispersion (dispersion 594, max Pearson residual 92). This means large
+      district-year variation that the package-only model does not explain, for example D01 under SMC at
+      216k vs 293k cases. The interval describes uncertainty in the expected (mean) effect, not the
+      year-to-year variation in cases actually averted in 2026-2028. It also assumes one pooled rate
+      ratio per package across districts whose baseline incidence differs by more than 10-fold. In
+      malaria, ITN/IRS/SMC effects on clinical incidence vary with transmission intensity.
+    evidence: >-
+      analysis/calibration.yaml: dispersion 593.89, pearson_chi2 49887 on df 84, pearson_residual_max
+      92.06. The D01 SMC years are 216,252 and 292,849 against an expected 247,090. The baseline z ranges
+      from -0.39 (D01) to -3.00 (D10).
+    fix_requires: >-
+      In the write-up, state that the UI is for expected cases averted under a common multiplicative
+      effect per package, scaled for overdispersion. State that it excludes interannual variation and
+      heterogeneity of effects across districts. Flag that the high-burden districts (D01, D02) carry
+      most of the total, so any transmission-dependent effect there moves the headline the most.
+    done_when: >-
+      The manuscript's limitations name the overdispersion and the pooled-effect assumption, and
+      describe the interval as an interval for the expected value.
+    resolved: false
+  - id: D-005
+    severity: LOW
+    category: HYPOTHESES
+    target_stage: WRITE
+    first_seen_round: 1
+    claim: >-
+      Hidden assumption: a single 2026 ITN campaign is credited with the full annual ITN rate ratio
+      estimated from the history in each of 2026, 2027 and 2028, with no net attrition or loss of
+      insecticide over the three years. Annual IRS gets the same effect each year, and SMC is costed per
+      season. In the field, ITN protection usually declines in years 2-3, so this assumption favours ITN
+      over IRS.
+    evidence: >-
+      decision_spec.yaml costs ITN as "one mass campaign covering 2026-2028". The engine applies a
+      constant per-year lrr:itn of -0.464 over the 2026-2029 objective horizon. The history labels ITN
+      by year, so it is not clear whether "ITN" years were campaign years or years with nets in use.
+      lrr:itn and lrr:irs are nearly equal (-0.464 vs -0.462) while IRS costs 2.2x more, so the choice of
+      ITN over IRS everywhere depends on this.
+    fix_requires: >-
+      State the assumption explicitly in the manuscript. Note that if ITN effect decays after the
+      campaign year, the ITN-vs-IRS comparison and the total would move.
+    resolved: false
+  - id: D-006
+    severity: LOW
+    category: METHODS
+    target_stage: ANALYZE
+    first_seen_round: 1
+    claim: >-
+      The identifiability diagnostics are internally inconsistent. The profile-likelihood CIs are
+      degenerate (zero-width) and do not contain the estimates, yet parameters are labelled
+      "well_identified" on the basis of SE alone. The overall status reads "weakly_or_unidentified".
+    evidence: >-
+      analysis/calibration.yaml: lrr:itn estimate -0.464 with profile_ci [-0.273, -0.273]. lrr:irs+itn+smc
+      estimate -0.778 with profile_ci [-1.091, -1.091]. These look like grid artefacts from too coarse a
+      profile grid.
+    fix_requires: >-
+      Fix or re-run the profile likelihood on a finer grid that brackets the estimates, or drop the
+      profile CI from the reported diagnostics. Do not cite "well_identified" from this output in the
+      text until the diagnostics are fixed.
+    done_when: Every profile_ci contains its estimate and has non-zero width, or profile CIs are not reported.
+    resolved: false

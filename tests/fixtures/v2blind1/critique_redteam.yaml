@@ -1,0 +1,113 @@
+reviewer: critique-redteam
+round: 1
+verdict: REVISE
+structural_mismatch:
+  detected: false
+carried_forward: []
+blockers:
+  - id: R-001
+    severity: MEDIUM
+    category: HYPOTHESES
+    target_stage: WRITE
+    first_seen_round: 1
+    claim: >-
+      About half of the headline total comes from three districts that were never observed with no package:
+      D01, D04 and D06. Their comparator burden is not data. It is inferred from treated years through the
+      pooled rate ratios. D01 contributes the most of any district, and it was also never observed under
+      ITN or under the recommended ITN+SMC. So both its counterfactual and its effect under the chosen
+      package are extrapolations from other districts.
+    evidence: >-
+      data/programme_history.csv: D01 years are ITN+IRS, SMC, ITN+IRS+SMC and IRS only. D04 and D06 have no
+      'none' year. allocation_optimized.csv: D01 419,580 + D04 100,098 + D06 146,826 = about 666k of the
+      1,304,108 total (about 51%), all under ITN+SMC. D01's own SMC-only years (216,252 and 292,849) vary
+      by 35%, so its baseline is poorly pinned down even before pooling.
+    fix_requires: >-
+      In the manuscript, state that the comparator burden for D01, D04 and D06 is model-inferred, not
+      observed. Also state that D01's ITN+SMC effect is borrowed entirely from other districts. Say that
+      this share of the headline rests on the pooled multiplicative-effect assumption. This complements
+      D-004 by naming the specific districts and the share of the total.
+    done_when: >-
+      The manuscript's limitations name D01, D04 and D06 as having no observed no-intervention year, and
+      give the approximate share of total cases averted that depends on them.
+    resolved: false
+  - id: R-002
+    severity: LOW
+    category: METHODS
+    target_stage: ANALYZE
+    first_seen_round: 1
+    claim: >-
+      lrr:itn+smc decides the package in 5 of 10 districts and has the largest sensitivity swing (16.2% of
+      the objective). It is a saturated cell estimated from only 7 district-years in 4 districts, and 3 of
+      those years (D04, D06) are in districts with no observed baseline. Its quasi-Poisson SE uses one
+      pooled dispersion, which large districts dominate, so it may understate how fragile this estimate is.
+      Its label "well_identified" (see D-006) should not be relied on.
+    evidence: >-
+      programme_history.csv ITN+SMC rows: D02 2017; D04 2017, 2020, 2023; D06 2018, 2022; D08 2016.
+      results.md sensitivity table: lrr:itn+smc swing 16.2%, the largest. calibration.yaml: dispersion
+      593.89.
+    fix_requires: >-
+      Either run a leave-one-district-out (or district-dropping) check on lrr:itn+smc and report whether the
+      ITN+SMC assignments survive, or disclose in the write-up that this effect rests on 7 observations in
+      4 districts.
+    done_when: >-
+      Either a leave-one-district-out result for lrr:itn+smc is reported, or the manuscript states the
+      7-observation / 4-district basis for the ITN+SMC effect.
+    resolved: false
+  - id: R-003
+    severity: LOW
+    category: PRESENTATION
+    target_stage: WRITE
+    first_seen_round: 1
+    claim: >-
+      The plan leaves the most populous district, D09 (600,000 people, about 18% of the total population),
+      with no intervention at all. D09 is still unfunded at the US$19.8M envelope. The objective matches the
+      question, which is pure maximisation of cases averted with no equity or coverage constraint. But a
+      programme manager will see this as the most consequential feature of the plan, and the results do
+      not mention it beyond a count.
+    evidence: >-
+      allocation_optimized.csv: D09 none, 0 cases averted. districts.csv: D09 population 600,000 of
+      3,330,000. DT1.yaml at 19,800,000: 'none: 1 units'. results.md: "Units with no package: 1".
+    fix_requires: >-
+      Name D09 in the recommendation. State that leaving it unfunded follows from the case-maximisation
+      objective with indivisible district packages, not from low need. Note what funding it would cost
+      (ITN campaign at the spec's unit cost) and what it would displace.
+    done_when: The manuscript names D09 as unfunded and explains why, in terms of the objective and the envelope.
+    resolved: false
+  - id: R-004
+    severity: LOW
+    category: DATA
+    target_stage: DATA
+    first_seen_round: 1
+    claim: >-
+      The unit costs cannot be audited from the run. unit_costs.csv was not copied into data/; the three
+      values were typed into the spec. Costs are also charged on the total population, which assumes 100%
+      coverage. Meanwhile the effects come from historical years whose coverage is unknown. The plan
+      therefore assumes that historical coverage equals full coverage.
+    evidence: >-
+      data/ holds only districts.csv and programme_history.csv. data/README.md says the costs were
+      "entered directly". decision_spec.yaml cost_items all use basis per_person on population total.
+    fix_requires: >-
+      Copy unit_costs.csv into data/ verbatim and reference it. State the coverage assumption (the cost per
+      person covered is applied to the whole population, and the effects are taken as the effects at that
+      coverage) in the manuscript.
+    done_when: data/unit_costs.csv exists in the run and the manuscript states the coverage assumption.
+    resolved: false
+  - id: R-005
+    severity: LOW
+    category: PRESENTATION
+    target_stage: WRITE
+    first_seen_round: 1
+    claim: >-
+      The headline is worded as a fact ("It averts 1.3M cases") rather than as a model estimate. The
+      allocation file reports cases averted to four decimal places, which implies false precision given a
+      UI of roughly +/-13% that covers only part of the uncertainty.
+    evidence: >-
+      results.md Recommendation: "It averts 1.3M cases against the comparator". allocation_optimized.csv,
+      for example D01 419579.984.
+    fix_requires: >-
+      In the manuscript, phrase the headline as an estimate ("is estimated to avert"), give it alongside its
+      partial-coverage UI label, and round the per-district figures in the text.
+    done_when: >-
+      The manuscript's headline sentence says "estimated" and is given with the UI and its coverage label.
+      Per-district figures in the text are rounded.
+    resolved: false

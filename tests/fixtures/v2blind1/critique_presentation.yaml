@@ -1,0 +1,105 @@
+reviewer: critique-presentation
+round: 1
+verdict: REVISE
+structural_mismatch:
+  detected: false
+carried_forward: []
+blockers:
+  - id: P-001
+    severity: MEDIUM
+    category: PRESENTATION
+    target_stage: WRITE
+    first_seen_round: 1
+    claim: >-
+      The manuscript explains the D09 omission with a per-dollar argument that its own numbers contradict. It says
+      funding D09 "would cost more than its expected return per dollar justifies". An ITN campaign in D09 costs
+      about US$3.24M and averts about 53k cases (about US$61 per case). D10, which is funded, costs US$1.24M for
+      12.8k cases (about US$97 per case). D09 is the more cost-effective of the two. It is left out because it
+      does not fit in the remaining envelope (indivisible, one package per district), not because of its return
+      per dollar.
+    evidence: >-
+      manuscript.md "Decision rule" paragraph on D09/D10 and the Summary caveat 2 ("follows directly from
+      maximising total cases averted per dollar"). allocation_optimized.csv: D10 cost 1,242,000 for 12,790 cases
+      averted; D09 population 600,000 x 5.40. Total allocated is 17.874M of 18M. results.md also says only
+      "Comparator per person", and its decision-rule table can be read as a burden threshold.
+    fix_requires: >-
+      Rewrite the explanation. The rule is whole-portfolio integer maximisation of total cases averted under the
+      envelope. Districts are indivisible. D09's package does not fit alongside the others without a net loss in
+      total averted. Remove the "per dollar" justification for D09.
+    done_when: >-
+      No sentence says D09 is excluded because of low return per dollar. The text cites indivisibility and the
+      budget.
+    resolved: false
+  - id: P-002
+    severity: MEDIUM
+    category: PRESENTATION
+    target_stage: WRITE
+    first_seen_round: 1
+    claim: >-
+      The interval's scope is overstated or unclear. The headline label and owner flag 3 say "calibration (effect
+      and baseline-rate estimation)", but only the 6 log rate ratios were drawn (sampler_varied_parameters: 6).
+      The 10 baseline log-rates were held fixed. The manuscript's Interpretation then calls the plan "robust to the
+      statistical uncertainty in the package effects".
+    evidence: >-
+      uncertainty_report.yaml: sampler_varied_parameters 6, interval.covers [calibration], and its excludes list
+      does not name baseline rates. The manuscript Limitations admit the baselines are held fixed. The Summary and
+      Interpretation do not.
+    fix_requires: >-
+      Where the interval is first reported, state that baseline-rate uncertainty is excluded, or carry it into the
+      draws (analysis fix). Qualify "robust" accordingly. This duplicates domain D-001, so address them together.
+    done_when: >-
+      The Summary and Interpretation describe the interval with the same scope as the Limitations section.
+    resolved: false
+  - id: P-003
+    severity: MEDIUM
+    category: PRESENTATION
+    target_stage: WRITE
+    first_seen_round: 1
+    claim: >-
+      The manuscript never names the units that change under DT1, and its Summary only says "up to share of
+      districts change". The manager cannot tell what to prioritise if the budget moves.
+    evidence: >-
+      DT1.yaml: at 16.2M, 2 units change (4 ITN+SMC, 3 ITN, 2 none, 1 SMC). At 19.8M, 3 units change (5 ITN, 4
+      ITN+SMC, 1 none). The manuscript describes these changes only in generic terms.
+    fix_requires: >-
+      Give the district IDs that change at each envelope, from models/decision_tests/DT1.yaml or the harness. Do
+      not type new numbers by hand. Say which districts to fund or drop first.
+    done_when: >-
+      The text lists the switching districts at both envelopes and reports the verdict CHANGES_PLAN.
+    resolved: false
+  - id: P-004
+    severity: LOW
+    category: PRESENTATION
+    target_stage: WRITE
+    first_seen_round: 1
+    claim: >-
+      allocation_optimized.csv has extra columns, cost_usd and an empty region column. The question specifies
+      columns district, package and cases_averted. The empty region column is noise and may fail a strict schema
+      check.
+    evidence: >-
+      allocation_optimized.csv header: district,package,cases_averted,cost_usd,region, with region empty on every
+      row.
+    fix_requires: >-
+      Drop the empty region column. Keep cost_usd only if it is documented as extra, or remove it.
+    done_when: >-
+      The CSV header is exactly district,package,cases_averted, or any extra column is non-empty and documented.
+    resolved: false
+  - id: P-005
+    severity: LOW
+    category: PRESENTATION
+    target_stage: WRITE
+    first_seen_round: 1
+    claim: >-
+      The manuscript reports the 'well_identified' labels and strong overdispersion, but the profile-likelihood
+      diagnostics are degenerate (domain D-006). Results.md still prints "well_identified" next to the estimates.
+      The results table also shows an SE-based interval for a dispersion of 594 without explaining what that
+      dispersion means. The ITN durability assumption sits only in Limitations, yet it decides ITN over IRS.
+    evidence: >-
+      results.md Calibration table. manuscript.md Limitations (identifiability, ITN durability) against the
+      Methods text, which makes no mention of either.
+    fix_requires: >-
+      Move the ITN no-decay assumption and the weak-diagnostics caveat into the Methods or Interpretation text,
+      beside the claim that IRS is not bought.
+    done_when: >-
+      The statement "do not buy IRS" carries the no-decay caveat in the same paragraph.
+    resolved: false

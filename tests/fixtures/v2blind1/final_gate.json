@@ -1,0 +1,41 @@
+{
+ "unresolved_high": [],
+ "accept_blockers": [],
+ "structural_mismatch": false,
+ "structural_reviewers": [],
+ "spec_violations": [],
+ "registry_violations": [],
+ "rigor_violations": [
+  {
+   "kind": "critique_done_when_missing",
+   "severity": "MEDIUM",
+   "stage": "CRITIQUE",
+   "target_stage": "CRITIQUE",
+   "claim": "critique-domain: 4 open HIGH/MEDIUM finding(s) without a valid done_when test (D-001, D-002, D-003, D-004); they still block. Re-spawn critique-domain to add the tests."
+  },
+  {
+   "kind": "critique_done_when_missing",
+   "severity": "MEDIUM",
+   "stage": "CRITIQUE",
+   "target_stage": "CRITIQUE",
+   "claim": "critique-presentation: 3 open HIGH/MEDIUM finding(s) without a valid done_when test (P-001, P-002, P-003); they still block. Re-spawn critique-presentation to add the tests."
+  },
+  {
+   "kind": "critique_done_when_missing",
+   "severity": "MEDIUM",
+   "stage": "CRITIQUE",
+   "target_stage": "CRITIQUE",
+   "claim": "critique-redteam: 1 open HIGH/MEDIUM finding(s) without a valid done_when test (R-001); they still block. Re-spawn critique-redteam to add the tests."
+  }
+ ],
+ "blocker_attempts": {},
+ "escalation_required": false,
+ "rounds_remaining": 1,
+ "action": "ACCEPT",
+ "rule_matched": 4,
+ "rationale": "No unresolved HIGH blockers, no missing required artifacts, no structural mismatch.",
+ "declared": [],
+ "declared_prev": [],
+ "done_when_status": {},
+ "post_write": true
+}
