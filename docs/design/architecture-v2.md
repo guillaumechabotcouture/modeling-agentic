@@ -38,8 +38,9 @@ better organised. They would not remove it. The large gains come from changing
    evidence service has fetched and checked, and an uncertainty range.
 5. **LLMs do judgement.** That means framing, model choice and extension, mapping data
    to model inputs, interpretation, critique and narrative.
-6. **The owner decides at three points:** the spec, the model choice, and any
-   limitation on the core decision. This replaces autonomous self-declaration.
+6. **The owner decides at two points:** the spec, and any limitation on the core
+   decision. This replaces autonomous self-declaration. Technical choices, including
+   which engine a run uses, stay with the AI and are checked and recorded, not signed.
 7. **Every change is measured on the evaluation suite** (`docs/design/eval-suite.md`)
    before it is kept.
 
@@ -92,7 +93,8 @@ class Engine(Protocol):
   - The `toolkit` modules promoted from runs (E4).
   - EMOD and OpenMalaria later, through the same contract.
 - **Each engine ships a benchmark pack.** These are its published validation results: the trial arms and the EIR–prevalence curves. The harness re-runs them per version, not per question. Today's per-run trial tuning becomes an engine property.
-- **The agent's job:** choose the engine, with a recorded reason checked against `describe()`; map data to `UnitSpec`; declare which parameters are calibrated; and extend the engine only through declared plug-ins with their own tests.
+- **Engine choice is automatic, not an owner checkpoint.** The harness filters eligible engines by matching the spec against each `EngineCard`: interventions, outputs, population scale, spatial structure and validated ranges. The AI picks among the eligible ones and records why, and the choice appears in the report and the model card. When more than one engine is eligible, the harness runs both on a small subset and compares the recommendations. That turns structural uncertainty into a measured check instead of a judgement call.
+- **The agent's job:** pick the engine within that filter, map data to `UnitSpec`, declare which parameters are calibrated, and extend the engine only through declared plug-ins with their own tests.
 - **Fallback for questions no engine covers:** the agent writes a model behind the same contract, and layers 3.4 onward apply unchanged.
 
 ### 3.4 Analysis engine (`analysis/`, harness code)
@@ -114,7 +116,7 @@ It reads the spec, the engine contract and the evidence registry, and produces t
 
 ### 3.5 Orchestration (state machine and fix planner: `stage-machine.md` S3–S4)
 
-- **States:** SPEC → SIGN → EVIDENCE → ENGINE_CHOICE (owner checkpoint) → CONFIGURE/CALIBRATE → ANALYZE → CRITIQUE → GATE → FIX_LOOP → WRITE → PRESENTATION → FINAL.
+- **States:** SPEC → SIGN → EVIDENCE → ENGINE_CHOICE (automatic: filter, AI pick, optional cross-engine check) → CONFIGURE/CALIBRATE → ANALYZE → CRITIQUE → GATE → FIX_LOOP → WRITE → PRESENTATION → FINAL.
 - **Findings ledger.** One typed ledger replaces today's critique YAMLs, fix checks, done_when, scope declarations, stall diagnoses and validator history. Each finding has an owner state and a resolution type: fix with a measured impact, decision test, or owner decision.
 - **Fix planner.** The LLM fix planner picks one finding per fix task. The harness rebuilds, measures the impact, and records it in `impact_ledger.jsonl`.
 - **Prompts shrink.** The lead prompt (≈1,000 lines) and the refusal hooks become state-table rows (S6).
@@ -122,7 +124,9 @@ It reads the spec, the engine contract and the evidence registry, and produces t
 ### 3.6 Review and owner checkpoints
 
 - **Critics** (domain, red team, sufficiency, presentation) review computed facts and the engine card against the expert priors. They no longer audit plumbing.
-- **The owner is asked three times:** to sign the spec, to approve the engine choice and extensions, and to decide on any limitation that bears on the deliverable (A21). Each pause uses the existing sign-off machinery with a time-out.
+- **The owner is asked twice:** to sign the spec, and to decide on any limitation that bears on the deliverable (A21). Each pause uses the existing sign-off machinery with a time-out.
+- **What the owner does not sign per run:** technical choices such as engine selection, calibration method or emulator design. The AI makes them, the harness checks them, and the report records them.
+- **Platform decisions are made once, outside runs.** Which engines the harness supports at all is the owner's call, on the AI's recommendation. Adding an engine brings dependencies, licences and adapter maintenance.
 
 ### 3.7 Report
 
@@ -194,13 +198,13 @@ re-run of E7.
 
 ## 8. Risks and open questions for the owner
 
-1. **Engine choice and R in the stack.**
+1. **Which engines the platform supports, and R in the stack.** This is a one-off platform decision for the owner. Which engine a given run uses is automatic (§3.3).
    - Option: malariasimulation (mature, R/C++, validated).
    - Option: Starsim malaria (Python, experimental as of 2026-10-27).
    - Option: EMOD (heavier, IDM-maintained).
    - Proposal: malariasimulation first for malaria. Starsim modules are for diseases they cover well, with LASER for spatial questions.
 2. **Questions no engine covers.** The fallback is an agent-written model behind the same contract. The risk is that this becomes the common path. We measure it on the suite.
-3. **Owner checkpoint latency.** Three pauses per run. Each needs a time-out and a default, as brief sign-off has today.
+3. **Owner checkpoint latency.** Two pauses per run. Each needs a time-out and a default, as brief sign-off has today.
 4. **Calibration framework.** Calabaria (IDM) or our current code. This is a spike decision.
 5. **Licensing and provenance of engine parameter sets.** Record versions and citations in the engine card.
 6. **Scope creep in "extend the engine".** Extensions must go through declared plug-ins with tests and a D1-style sufficiency test.
