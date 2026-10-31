@@ -114,6 +114,29 @@ _APPROACH_PATTERNS = [
     (r"\b(?:linear\s+)?regression\s+model\b", "regression"),
 ]
 
+# A19 (smoke before attempt 9): "Using a simple deterministic compartmental
+# malaria model (no agent-based model is needed)" was read as requiring an ABM,
+# and the structural mismatch forced RETHINK_STRUCTURAL. A mention is negated
+# when a negator sits earlier in the same clause, or a "not needed"-style
+# phrase follows it.
+_CLAUSE_BREAK = re.compile(r"[.;:()\[\]]|,\s+(?:but|and|or)\b", re.IGNORECASE)
+_NEG_BEFORE = re.compile(
+    r"\b(?:no|not|non|without|rather\s+than|instead\s+of|avoid(?:ing)?|"
+    r"(?:do|does|did)\s*n[o']?t\s+(?:need|use|require|build))\b(?:\s+\w+){0,4}\s*$",
+    re.IGNORECASE)
+_NEG_AFTER = re.compile(
+    r"^\s*(?:is|are)?\s*(?:not|n't)\s+(?:needed|required|necessary|wanted|appropriate)\b|"
+    r"^\s*(?:is|are)\s+(?:unnecessary|not\s+needed)\b",
+    re.IGNORECASE)
+
+
+def _negated(question: str, m: "re.Match") -> bool:
+    before = question[:m.start()]
+    cut = max((b.end() for b in _CLAUSE_BREAK.finditer(before)), default=0)
+    after = question[m.end():m.end() + 40]
+    return bool(_NEG_BEFORE.search(before[cut:]) or _NEG_AFTER.search(after))
+
+
 # Budget envelope: match "$320M", "$1.5B", "$320 million", "~$320M".
 # We avoid matching plain "320 million" without a dollar sign to reduce
 # false positives on non-budget numbers.
@@ -219,7 +242,9 @@ def detect_required_spec(question: str) -> dict:
 
     approaches: list[str] = []
     for pattern, name in _APPROACH_PATTERNS:
-        if re.search(pattern, question, re.IGNORECASE):
+        # A19: a negated mention ("no agent-based model is needed", "rather than
+        # an ABM") does not require the approach; it must be stated positively.
+        if any(not _negated(question, m) for m in re.finditer(pattern, question, re.IGNORECASE)):
             if name not in approaches:
                 approaches.append(name)
 
@@ -1179,6 +1204,20 @@ def _run_self_test() -> int:
     ok("emod" not in r1["frameworks"],
        "q1: emod NOT required (it's a benchmark mention, not a requirement)")
     ok("abm" in r1["approaches"], "q1: abm detected")
+    # A19: negated mentions do not require the approach.
+    for qn, want_abm in (
+            ("Using a simple deterministic compartmental malaria model (no agent-based model is needed), "
+             "choose the allocation.", False),
+            ("Build a compartmental model rather than an agent-based model.", False),
+            ("An agent-based model is not needed; use an ODE.", False),
+            ("We do not need an ABM for this.", False),
+            ("Build an agent-based model; no compartmental shortcuts.", True),
+            ("Use an agent-based model, not a regression model.", True)):
+        rn = detect_required_spec(qn)
+        ok(("abm" in rn["approaches"]) == want_abm, f"A19 negation: {qn!r} -> {rn['approaches']}")
+    rq = detect_required_spec("Using a simple deterministic compartmental malaria model (no agent-based model is needed).")
+    ok("compartmental" in rq["approaches"] and "deterministic" in rq["approaches"],
+       f"A19: positive mentions in the same question still count: {rq['approaches']}")
     ok(r1["budget_envelope"] == 320e6,
        f"q1: budget=320M, got {r1['budget_envelope']}")
     ok(r1["spatial_units"] == (774, "lgas"),
