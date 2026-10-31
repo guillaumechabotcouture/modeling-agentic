@@ -359,6 +359,11 @@ def _builder():
     return mod
 
 
+def _declared_limits():
+    from lib.siblings import load_private
+    return load_private("declared_limits", "_ma_render_claims_")
+
+
 def _claim_units():
     import importlib.util
     spec = importlib.util.spec_from_file_location(
@@ -397,7 +402,17 @@ def render_run(run_dir: str) -> dict:
     with open(source_path) as f:
         text = f.read()
 
+    limits_error: list[str] = []
+
     def _write_report(body):
+        # Phase 49 γ (A22): the harness writes the declared limits in place of the
+        # writer's [DECLARED_LIMITS] token (scripts/declared_limits.py). Unreadable
+        # declarations: the token stays, the render reports it, the gate flags it.
+        dl = _declared_limits()
+        try:
+            body = dl.expand(run_dir, body)
+        except dl.DeclaredLimitsError as e:
+            limits_error.append(f"declared limits not rendered: {e}")
         with open(report_path, "w") as f:
             f.write(body)
 
@@ -406,11 +421,20 @@ def render_run(run_dir: str) -> dict:
                  if not _in_protected_span(protected, m.start()))
     if n_refs == 0:
         # No references: the draft is the report
+        snap = None
         if source_path != report_path:
+            if _declared_limits().TOKEN in text:
+                # Codex round 2: the expanded report has an unrendered snapshot even
+                # with no claim references, so the gate reads the draft it came from.
+                snap = os.path.join(run_dir, "report.unrendered.md")
+                shutil.copy2(source_path, snap)
             _write_report(text)
-        return {"ok": True, "n_refs": 0, "n_unresolved": 0,
-                "unresolved_ids": [], "snapshot_path": None,
-                "report_path": report_path}
+        out = {"ok": not limits_error, "n_refs": 0, "n_unresolved": 0,
+               "unresolved_ids": [], "snapshot_path": snap,
+               "report_path": report_path}
+        if limits_error:
+            out["error"] = limits_error[0]
+        return out
 
     if os.path.exists(os.path.join(run_dir, "models", "claims_spec.yaml")):
         _, spec_errors = _builder().write(run_dir)
@@ -439,6 +463,9 @@ def render_run(run_dir: str) -> dict:
                 "report_path": report_path}
 
     _write_report(new_text)
+    if limits_error:
+        return {"ok": False, "error": limits_error[0], "n_refs": n_refs, "n_unresolved": 0,
+                "unresolved_ids": [], "snapshot_path": snapshot_path, "report_path": report_path}
     # Phase 47 β (A18): percentage claims cited here whose source holds a
     # proportion (rendered 100 times too small). Reported, not blocking: the
     # gate raises them (claim_percentage_is_proportion).
@@ -591,6 +618,34 @@ def _self_test() -> int:
             f.write("# Report\n\nNo claim references here.\n")
         render_run(d)
         ok(os.path.exists(os.path.join(d, "report.md")), "T7b a draft without references still becomes report.md")
+        # T7c (Phase 49 γ, A22): the [DECLARED_LIMITS] token becomes the harness-written block.
+        with open(os.path.join(d, "scope_declaration.yaml"), "w") as f:
+            yaml.safe_dump({"declarations": [{"id": "SD-007", "blocker_id": "allocation_unstable",
+                                              "claim": "Allocation unstable out of sample.",
+                                              "why_unresolved": "w"}]}, f)
+        with open(os.path.join(d, "manuscript.md"), "w") as f:
+            f.write("# Report\n\n## Executive summary\n\nAverts [CLAIM:dalys] DALYs.\n\n[DECLARED_LIMITS]\n\n"
+                    "## 1. Introduction\n\n```\n[DECLARED_LIMITS]\n```\n")
+        render_run(d)
+        rendered = open(os.path.join(d, "report.md")).read()
+        ok("**SD-007**: Allocation unstable out of sample." in rendered and "7.47M" in rendered
+           and rendered.count("[DECLARED_LIMITS]") == 1 and "[DECLARED_LIMITS]" in rendered.split("```")[1],
+           f"T7c the token is replaced by the declared-limits block (not inside code): {rendered[:600]}")
+        # T7d (Codex round 2): with no claim references, the expanded report still gets a
+        # fresh unrendered snapshot.
+        with open(os.path.join(d, "manuscript.md"), "w") as f:
+            f.write("# Report\n\n## Executive summary\n\nNo numbers.\n\n[DECLARED_LIMITS]\n\n## 1. Introduction\n")
+        r = render_run(d)
+        ok(r["ok"] and "No numbers." in open(os.path.join(d, "report.unrendered.md")).read()
+           and "**SD-007**" in open(os.path.join(d, "report.md")).read(),
+           f"T7d zero references: report.unrendered.md is refreshed and the block rendered: {r}")
+        # T7e (Codex round 2): unreadable declarations: a controlled render failure.
+        with open(os.path.join(d, "scope_declaration.yaml"), "w") as f:
+            f.write("declared_at: 2026-13-45\ndeclarations: []\n")
+        r = render_run(d)
+        ok(not r["ok"] and "declared limits not rendered" in r.get("error", "")
+           and "[DECLARED_LIMITS]" in open(os.path.join(d, "report.md")).read(),
+           f"T7e unreadable scope_declaration.yaml: render fails with a reason, token left: {r}")
 
     # T8: render_run reports unresolved references gracefully
     with tempfile.TemporaryDirectory() as d:
