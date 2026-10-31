@@ -2016,6 +2016,24 @@ def _run_self_test() -> int:
        and _pi.get("review_before") == "stale" and _pi.get("review_after") == "ok",
        f"PF5b (Codex P1-2) a draft revised after its review gets a review-only pass: {_pi} {_pseen.get('agents')}")
     shutil.rmtree(_pd, ignore_errors=True)
+    # PF5c (smoke 3, 2026-10-31): with no presentation critique yet, the pass must name the gate's
+    # current round (the other critiques'), not "N" — the critic wrote round 2 into a round-1 run and
+    # the final gate failed on the round mismatch (completed_gate_error).
+    _pd = tempfile.mkdtemp()
+    json.dump({"question": "q"}, open(os.path.join(_pd, "metadata.json"), "w"))
+    open(os.path.join(_pd, "manuscript.md"), "w").write("# Draft\n")
+    _yaml_pf.safe_dump({"reviewer": "critique-domain", "round": 1, "blockers": []},
+                       open(os.path.join(_pd, "critique_domain.yaml"), "w"))
+    _pseen_c = {}
+
+    async def _fq_c(prompt, options):
+        _pseen_c["prompt"] = prompt
+        yield ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+                            num_turns=2, session_id="p5c", total_cost_usd=1.0)
+    asyncio.run(presentation_fix_pass(_pd, _pd, "q", {"sessions": []}, 600.0, 2, query_fn=_fq_c))
+    ok("`This is critique round 1.`" in _pseen_c.get("prompt", ""),
+       f"PF5c a first presentation review names the gate's current round: {_pseen_c.get('prompt', '')[:300]!r}")
+    shutil.rmtree(_pd, ignore_errors=True)
     _pd = tempfile.mkdtemp()
     json.dump({"question": "q"}, open(os.path.join(_pd, "metadata.json"), "w"))
     open(os.path.join(_pd, "manuscript.md"), "w").write("# Draft\n")
