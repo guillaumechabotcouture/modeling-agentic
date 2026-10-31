@@ -11,8 +11,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 
-from agents import enforcement
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO not in sys.path:
+    sys.path.insert(0, _REPO)
+from agents import enforcement  # noqa: E402
 from agents.v2_tasks import CRITIQUE_FILE, PREFIX, TaskResult
 from agents.fix_loop import FIX_PLANNER_PROMPT
 
@@ -33,7 +37,9 @@ file named below, then stop."""
 PROMPTS = {
     "draft_spec": COMMON + """
 
-Task: draft decision_spec.yaml for the question. Read the data files the question names and the
+Task: draft decision_spec.yaml for the question, and analysis_settings.yaml with the
+computational settings only (uncertainty.draws, uncertainty.seed, emulator.points, emulator.seed;
+not repeated in the spec). Read the data files the question names and the
 example spec at {example}. Keep its section names (decision_units, calibration, horizon, emulator,
 options, objective, outcomes_reported, constraints, comparator, uncertainty, deliverable,
 deliverable_file, engine_needs). Do not set `engine`: the harness chooses it. Map the question's
@@ -61,10 +67,10 @@ Then write {out} = {{"ok": true}}.""",
 
 Task: fix task {tid}: {brief}
 Findings: {findings}. Evidence from the last check (if any): {evidence}
-You may edit decision_spec.yaml sections that are technical (emulator, calibration ranges,
-uncertainty, decision_tests, engine_needs) and files under data/ and models/ext/. The decision
-sections (decision_units, options, objective, constraints, comparator, horizon, deliverable) are
-signed by the owner: do not change them. The harness rebuilds and measures the effect.
+You may edit analysis_settings.yaml, which holds only computational settings
+(uncertainty.draws, uncertainty.seed, emulator.points, emulator.seed), and files under models/ext/.
+decision_spec.yaml is signed by the owner and you cannot change it; a fix that needs it changed is
+a finding for the owner. The harness undoes any other edit, then rebuilds and measures the effect.
 Output: {out} = {{"ok": true, "changed": "<one line>"}}.""",
     "write": COMMON + """
 
@@ -75,8 +81,8 @@ do not type them. Mode `not_accepted`: the first section is "Status: not accepte
 gate", listing the open blocking findings from findings.jsonl in plain words. Mode `declared`: a
 Limitations section that repeats each declaration. Output: manuscript.md and {out} = {{"ok": true}}.""",
 }
-OWNS = {"draft_spec": ("decision_spec.yaml", "data/"), "pick_engine": (), "plan_fixes": (),
-        "critique": (), "fix": ("decision_spec.yaml", "data/", "models/ext/"), "write": ("manuscript.md",)}
+OWNS = {"draft_spec": ("decision_spec.yaml", "analysis_settings.yaml", "data/"), "pick_engine": (), "plan_fixes": (),
+        "critique": (), "fix": ("analysis_settings.yaml", "models/ext/"), "write": ("manuscript.md",)}
 
 
 def _allowed(path: str, run_dir: str, owns: tuple) -> str | None:
@@ -93,14 +99,41 @@ def _allowed(path: str, run_dir: str, owns: tuple) -> str | None:
 
 
 class SdkTasks:
-    def __init__(self, run_dir: str, allow_cloud: bool = False, task_cap_usd: float = 3.0, max_turns: int = 30):
+    """Each call's dollar cap is the allowance the machine sets just before it (set_allowance: the
+    run's remaining budget less the write-up reserve, at most the task cap). Spend is charged
+    through agents/run_budget.py like the lead's sessions: a reported cost exactly (also one
+    reported before an exception); after a crash the conversation's cost is read back
+    (crashed_session_cost); when it cannot be, the whole allowance. Never $0 for a call that ran.
+    Every charge is also written to budget_ledger.json."""
+
+    def __init__(self, run_dir: str, allow_cloud: bool = False, task_cap_usd: float = 3.0, max_turns: int = 30,
+                 query_fn=None):
         self.run_dir = os.path.abspath(run_dir)
         self.cloud = allow_cloud
         self.cap = task_cap_usd
+        self.allowance = task_cap_usd
         self.turns = max_turns
+        self.query_fn = query_fn
+        self.n = 0
+
+    def set_allowance(self, usd: float) -> None:
+        self.allowance = float(usd)
+
+    def _charge(self, result, allowance: float, sid: str | None, elapsed_s: float, source: str) -> float:
+        from agents import run_budget as RB
+        ledger = RB.load_budget_ledger(self.run_dir)
+        self.n += 1
+        RB.charge_session(ledger, self.n, result, allowance, session_id=sid, elapsed_s=elapsed_s, source=source)
+        RB.write_budget_ledger(self.run_dir, ledger, None)
+        return float(ledger["sessions"][-1].get("total_cost_usd") or 0.0)
 
     def _session(self, kind: str, system: str, prompt: str, owns: tuple, model: str | None = None) -> TaskResult:
-        from claude_agent_sdk import ClaudeAgentOptions, HookMatcher, ResultMessage, query
+        import time
+        from claude_agent_sdk import ClaudeAgentOptions, HookMatcher, query
+        from agents import run_budget as RB
+        allowance = self.allowance
+        if allowance is None or allowance <= 0:
+            return TaskResult(False, None, 0.0, "no allowance: the call was not made")
         out = os.path.join(self.run_dir, OUT)
         if os.path.exists(out):
             os.remove(out)
@@ -120,29 +153,49 @@ class SdkTasks:
 
         opts = ClaudeAgentOptions(system_prompt=system, model=model or enforcement.MODEL_DEEP, tools=TOOLS,
                                   allowed_tools=TOOLS, permission_mode="bypassPermissions", cwd=self.run_dir,
-                                  max_turns=self.turns, max_budget_usd=self.cap, setting_sources=[],
+                                  max_turns=self.turns, max_budget_usd=allowance, setting_sources=[],
                                   env=enforcement.filtered_env(dict(os.environ), self.cloud),
                                   hooks={"PreToolUse": [HookMatcher(matcher=None, hooks=[pre])]})
 
+        seen = {"result": None, "sid": None}
+        qf = self.query_fn or query
+
         async def go():
-            res = None
-            async for m in query(prompt=prompt, options=opts):
-                if isinstance(m, ResultMessage):
-                    res = m
-            return res
+            async for m in qf(prompt=prompt, options=opts):
+                sid = getattr(m, "session_id", None) or ((getattr(m, "data", None) or {}).get("session_id")
+                                                         if isinstance(getattr(m, "data", None), dict) else None)
+                seen["sid"] = sid or seen["sid"]
+                if isinstance(getattr(m, "total_cost_usd", None), (int, float)):
+                    seen["result"] = m          # kept even if the stream raises afterwards
+
+        t0 = time.time()
+        err = None
         try:
-            r = asyncio.run(go())
-        except Exception as e:  # noqa: BLE001 -- a failed task is a result, not a crash of the machine
-            return TaskResult(False, None, 0.0, f"{type(e).__name__}: {e}"[:300])
-        usd = float(getattr(r, "total_cost_usd", 0.0) or 0.0)
+            asyncio.run(go())
+        except BaseException as e:  # noqa: BLE001 -- charged below, then reported (or re-raised)
+            err = e
+        source = "v2 task"
+        result = seen["result"]
+        if result is None and seen["sid"]:
+            async def readback():
+                return await RB.crashed_session_cost(opts, seen["sid"], query_fn=self.query_fn)
+            try:
+                result, source = asyncio.run(readback())
+            except Exception:  # noqa: BLE001 -- unknown cost: the allowance
+                result, source = None, "read-back failed"
+        usd = self._charge(result, allowance, seen["sid"], time.time() - t0, source)
+        if isinstance(err, (KeyboardInterrupt, SystemExit)):
+            raise err
+        if err is not None:
+            return TaskResult(False, None, usd, f"{type(err).__name__}: {err}"[:300], seen["sid"])
         try:
             output = json.load(open(out))
         except (OSError, ValueError):
-            return TaskResult(False, None, usd, f"no valid {OUT}")
+            return TaskResult(False, None, usd, f"no valid {OUT}", seen["sid"])
         finally:
             if os.path.exists(out):
                 os.remove(out)
-        return TaskResult(True, output, usd, str(output.get("notes") or output.get("changed") or "")[:300])
+        return TaskResult(True, output, usd, str(output.get("notes") or output.get("changed") or "")[:300], seen["sid"])
 
     def _input(self, obj) -> str:
         name = "_task_input.json"
@@ -186,3 +239,72 @@ class SdkTasks:
 
     def write(self, run_dir, mode):
         return self._session("write", PROMPTS["write"].format(mode=mode, out=OUT), "Write the draft.", OWNS["write"])
+
+
+def _self_test() -> int:
+    """Charging without the API: fake query streams."""
+    import tempfile
+    from types import SimpleNamespace as NS
+    fails = []
+
+    def ok(c, m):
+        print(("PASS " if c else "FAIL ") + m)
+        if not c:
+            fails.append(m)
+
+    def stream(*msgs, raise_after=None):
+        async def q(prompt=None, options=None):
+            for m in msgs:
+                yield m
+            if raise_after:
+                raise raise_after
+        return q
+    with tempfile.TemporaryDirectory() as d:
+        init = NS(subtype="init", data={"session_id": "s1"})
+        res = NS(total_cost_usd=0.42, session_id="s1", is_error=False)
+        t = SdkTasks(d, query_fn=stream(init, res))
+        t.set_allowance(2.0)
+        r = t._session("pick_engine", "x", "y", ())
+        ok(not r.ok and abs(r.usd - 0.42) < 1e-9 and r.session_id == "s1",
+           f"S1 a session without its output file still charges its reported cost ({r.usd})")
+        init2, res2 = NS(subtype="init", data={"session_id": "s2"}), NS(total_cost_usd=0.42, session_id="s2", is_error=False)
+        t = SdkTasks(d, query_fn=stream(init2, res2, raise_after=RuntimeError("stream broke")))
+        t.set_allowance(2.0)
+        r = t._session("pick_engine", "x", "y", ())
+        ok(not r.ok and abs(r.usd - 0.42) < 1e-9, f"S2 a cost reported before an exception is charged ({r.usd})")
+
+        async def failing_readback(prompt=None, options=None):
+            if options is not None and getattr(options, "resume", None):
+                raise RuntimeError("no read-back")
+            yield init
+            raise RuntimeError("crash before any cost")
+        import agents.run_budget as RB
+        orig = RB.crashed_session_cost
+
+        async def no_cost(options, sid, **k):
+            return None, "result"
+        RB.crashed_session_cost = no_cost
+        try:
+            t = SdkTasks(d, query_fn=failing_readback)
+            t.set_allowance(1.25)
+            r = t._session("pick_engine", "x", "y", ())
+        finally:
+            RB.crashed_session_cost = orig
+        ok(not r.ok and abs(r.usd - 1.25) < 1e-9, f"S3 a crash with no readable cost is charged the whole allowance ({r.usd})")
+        t = SdkTasks(d, query_fn=stream(init, res))
+        t.set_allowance(0.0)
+        r = t._session("pick_engine", "x", "y", ())
+        ok(not r.ok and r.usd == 0.0 and "not made" in r.note, "S4 no allowance: the call is not made")
+        led = json.load(open(os.path.join(d, "budget_ledger.json")))
+        ok(len(led["sessions"]) == 3 and abs(led["spent_usd"] - (0.42 + 0.42 + 1.25)) < 1e-9,
+           f"S5 every charge is in budget_ledger.json ({led['spent_usd']})")
+    if fails:
+        print(f"FAILED: {len(fails)} case(s)")
+        return 1
+    print("OK: all self-test cases passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(_self_test() if sys.argv[1:2] == ["--self-test"] else 2)
