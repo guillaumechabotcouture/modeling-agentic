@@ -166,7 +166,7 @@ def load_results(path: str, jobs: list[dict], engine) -> tuple[dict, list[str]]:
 
 
 def adopt(run_dir: str, src_results: str, src_jobs: str, src_design: str, jobs: list[dict], design: dict, engine,
-          sample: int = 4, workers: int = 2, rtol: float = 0.0) -> dict:
+          sample: int = 4, workers: int = 2, rtol: float = ADOPT_RTOL) -> dict:
     """Adopt a batch computed before results carried provenance (the spike's). Every stored job must equal the
     current job on its full inputs; the stored design must name the same engine, horizon and windows; and a
     deterministic sample of jobs is re-run with the current engine and must reproduce the stored results. The adopted
@@ -216,12 +216,12 @@ def adopt(run_dir: str, src_results: str, src_jobs: str, src_design: str, jobs: 
     rows, _ = compute.map_fn(run_dir, os.path.join(ROOT, "toolkit", "analysis", "batch.py") + "::run_job",
                              [{k: v for k, v in want[i].items() if k != "id"} for i in pick], backend="local",
                              max_workers=workers, ledger=False)
-    mism = []
+    mism, worst = [], [0.0]
     for i, r in zip(pick, rows):
         if not r.get("ok"):
             mism.append(f"{i}: rerun failed ({r.get('error')})")
-        elif not _same(r["result"]["result"], stored[i], rtol):
-            mism.append(f"{i}: rerun differs from the stored result")
+        elif not _same(r["result"]["result"], stored[i], rtol, worst):
+            mism.append(f"{i}: rerun differs from the stored result beyond rtol {rtol:g}")
     if mism:
         raise ValueError("stored batch not adopted: the current engine does not reproduce it: " + "; ".join(mism))
     ident = engine_identity(engine)
@@ -233,14 +233,25 @@ def adopt(run_dir: str, src_results: str, src_jobs: str, src_design: str, jobs: 
             f.write(json.dumps({"i": n, "ok": True, "result": {"result": stored[j["id"]], "provenance": {
                 "job_sha": job_sha(j), "engine": ident, "producer": PRODUCER, "adopted_from": src}}}) + "\n")
     return {"path": out, "adopted_from": src, "jobs_matched": len(seen), "rerun_sample": pick,
-            "rerun_reproduced": len(pick), "rtol": rtol}
+            "rerun_reproduced": len(pick), "rtol": rtol, "rerun_max_rel_diff": worst[0],
+            "ignored": sorted(TIMING_KEYS)}
 
 
-def _same(a, b, rtol) -> bool:
+# A re-run on another platform (the spike's batch ran on Linux VMs) differs in the last digits of floating point
+# (observed: about 1e-9 relative); 1e-6 separates that from a model change. Wall-clock timings are not outputs.
+ADOPT_RTOL = 1e-6
+TIMING_KEYS = frozenset({"seconds"})
+
+
+def _same(a, b, rtol, worst=None) -> bool:
     if isinstance(a, dict) and isinstance(b, dict):
-        return set(a) == set(b) and all(_same(a[k], b[k], rtol) for k in a)
+        ka, kb = set(a) - TIMING_KEYS, set(b) - TIMING_KEYS
+        return ka == kb and all([_same(a[k], b[k], rtol, worst) for k in ka])
     if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
-        return len(a) == len(b) and all(_same(x, y, rtol) for x, y in zip(a, b))
+        return len(a) == len(b) and all([_same(x, y, rtol, worst) for x, y in zip(a, b)])
     if isinstance(a, (int, float)) and isinstance(b, (int, float)) and not isinstance(a, bool):
-        return a == b or abs(a - b) <= rtol * max(abs(a), abs(b))
+        rel = 0.0 if a == b else abs(a - b) / max(abs(a), abs(b))
+        if worst is not None:
+            worst[0] = max(worst[0], rel)
+        return rel <= rtol
     return a == b
