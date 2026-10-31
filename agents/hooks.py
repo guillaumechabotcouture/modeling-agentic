@@ -21,6 +21,7 @@ from agents import enforcement, _registry
 import open_problems  # noqa: E402  (Phase 32: open-problem list, round plan, fix checks)
 import decision_brief  # noqa: E402  (Phase 33: the signed decision brief)
 import derived_rebuild  # noqa: E402  (Phase 39 β: the harness regenerates stale figures)
+import presentation_pass  # noqa: E402  (Phase 49 δ: which draft each presentation review read)
 
 REPO_ROOT = enforcement.REPO_ROOT
 
@@ -352,6 +353,7 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
     turn_warned: dict[str, set] = {}
     agent_types: dict[str, str] = {}
     snapshot_state: dict = {}
+    review_before: dict[str, str | None] = {}   # Phase 49 δ: critique sha at each presentation spawn
     session_t0 = time.time()   # Phase 32 γ: background agents end with their session
     if registered_agents is None:
         registered_agents = set(_registry().keys())
@@ -476,6 +478,9 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
         _safe_write(trace_file, record)  # a closed trace must not disable enforcement
         if deny_reason:
             return enforcement.deny_output(deny_reason)
+        if spawn and sub == "critique-presentation" and tool_use_id:
+            review_before[tool_use_id] = presentation_pass._sha(
+                os.path.join(run_path, presentation_pass.CRITIQUE))
         if integrity is not None:
             # Phase 23 α: record what this allowed call may change.
             integrity.on_pre(tool_use_id, tool_name, tool_input, agent_type,
@@ -498,6 +503,16 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
                     if fname.endswith(".png"):
                         _check_figure_size(os.path.join(fig_dir, fname), agent_id)
         snapshot_report(run_path, snapshot_state)
+        if tool_use_id in review_before:
+            # Phase 49 δ (Codex): record which draft this presentation review read and
+            # whether it produced a usable critique; the gate requires one for the
+            # delivered draft before ACCEPT.
+            try:
+                presentation_pass.record_review(run_path, review_before.pop(tool_use_id))
+                if integrity is not None:
+                    integrity.harness_wrote(presentation_pass.REVIEW)
+            except OSError:
+                pass
         if integrity is not None:
             for ev in integrity.on_post(tool_use_id):
                 print(f"[INTEGRITY] unexplained {ev['change']} of {ev['file']} "

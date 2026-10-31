@@ -1828,9 +1828,11 @@ def _run_self_test() -> int:
        .get("skipped"), "WU5 no budget left: the write-up is skipped and says so")
     shutil.rmtree(_wd, ignore_errors=True)
 
-    # PF (Phase 49 δ, A23): open presentation HIGHs for the writer get one fix pass and a re-review.
+    # PF (Phase 49 δ, A23): open presentation HIGHs for the writer, or a draft no review
+    # covers, get one fix pass and a review of the delivered draft.
     import yaml as _yaml_pf
     import time as _time_pf
+    import presentation_pass as _pp
     _pd = tempfile.mkdtemp()
     json.dump({"question": "q"}, open(os.path.join(_pd, "metadata.json"), "w"))
     _crit = {"reviewer": "critique-presentation", "round": 8, "blockers": [
@@ -1848,10 +1850,10 @@ def _run_self_test() -> int:
     async def _fq_p(prompt, options):
         _pseen["calls"] += 1
         _pseen["prompt"], _pseen["budget"], _pseen["agents"] = prompt, options.max_budget_usd, sorted(options.agents)
-        _t2 = _time_pf.time() + 20
+        _before = _pp._sha(os.path.join(_pd, "critique_presentation.yaml"))
         _yaml_pf.safe_dump(dict(_crit, blockers=[dict(b, resolved=True) for b in _crit["blockers"]]),
                            open(os.path.join(_pd, "critique_presentation.yaml"), "w"))
-        os.utime(os.path.join(_pd, "critique_presentation.yaml"), (_t2, _t2))
+        _pp.record_review(_pd, _before)      # what the hook records when the critic's spawn returns
         yield ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
                             num_turns=6, session_id="p1", total_cost_usd=6.0)
     _pbud = {"sessions": [{"session": 3, "total_cost_usd": 442.0}]}
@@ -1864,8 +1866,8 @@ def _run_self_test() -> int:
     ok(_pbud["sessions"][-1]["source"] == "presentation fix pass" and _pbud["sessions"][-1]["session"] == 4
        and _pbud["sessions"][-1]["total_cost_usd"] == 6.0, f"PF2 the pass is charged to the ledger: {_pbud['sessions'][-1]}")
     _pm = json.load(open(os.path.join(_pd, "metadata.json"))).get("presentation_fix_pass", {})
-    ok(_pm.get("ran") is True and _pm.get("still_open") == [] and _pm.get("rechecked") is True,
-       f"PF3 the outcome (re-reviewed, nothing open) is recorded in metadata.json: {_pm}")
+    ok(_pm.get("ran") is True and _pm.get("still_open") == [] and _pm.get("review_after") == "ok",
+       f"PF3 the outcome (reviewed, nothing open) is recorded in metadata.json: {_pm}")
     asyncio.run(presentation_fix_pass(_pd, _pd, "q", _pbud, 600.0, 5, query_fn=_fq_p))
     ok(_pseen["calls"] == 1, "PF4 once per run: a resumed run does not repeat the pass")
     shutil.rmtree(_pd, ignore_errors=True)
@@ -1873,13 +1875,24 @@ def _run_self_test() -> int:
     json.dump({"question": "q"}, open(os.path.join(_pd, "metadata.json"), "w"))
     open(os.path.join(_pd, "manuscript.md"), "w").write("# Draft\n")
     _yaml_pf.safe_dump(dict(_crit, blockers=_crit["blockers"][1:]), open(os.path.join(_pd, "critique_presentation.yaml"), "w"))
+    _pp.record_review(_pd, None)
     _pi = asyncio.run(presentation_fix_pass(_pd, _pd, "q", _pbud, 600.0, 4, query_fn=_fq_p))
     ok(_pseen["calls"] == 1 and not _pi.get("ran") and "presentation_fix_pass" not in json.load(
-        open(os.path.join(_pd, "metadata.json"))), f"PF5 nothing for the writer: no session, nothing recorded: {_pi}")
+        open(os.path.join(_pd, "metadata.json"))), f"PF5 reviewed draft, nothing for the writer: no session: {_pi}")
+    open(os.path.join(_pd, "manuscript.md"), "w").write("# Draft, revised after the review\n")
+    _pi = asyncio.run(presentation_fix_pass(_pd, _pd, "q", {"sessions": []}, 600.0, 4, query_fn=_fq_p))
+    ok(_pseen["calls"] == 2 and _pi.get("ran") and _pseen.get("agents") == ["critique-presentation"]
+       and "writer" not in _pseen.get("prompt", "").split("Do nothing else")[0].lower().replace("writer's", "")
+       and _pi.get("review_before") == "stale" and _pi.get("review_after") == "ok",
+       f"PF5b (Codex P1-2) a draft revised after its review gets a review-only pass: {_pi} {_pseen.get('agents')}")
+    shutil.rmtree(_pd, ignore_errors=True)
+    _pd = tempfile.mkdtemp()
+    json.dump({"question": "q"}, open(os.path.join(_pd, "metadata.json"), "w"))
+    open(os.path.join(_pd, "manuscript.md"), "w").write("# Draft\n")
     _yaml_pf.safe_dump(_crit, open(os.path.join(_pd, "critique_presentation.yaml"), "w"))
     _pi = asyncio.run(presentation_fix_pass(_pd, _pd, "q", {"sessions": [{"session": 3, "total_cost_usd": 600.0}]},
                                             600.0, 4, query_fn=_fq_p))
-    ok(_pseen["calls"] == 1 and "no budget" in str(_pi.get("skipped")) and json.load(
+    ok(_pseen["calls"] == 2 and "no budget" in str(_pi.get("skipped")) and json.load(
         open(os.path.join(_pd, "metadata.json"))).get("presentation_fix_pass", {}).get("items") == ["P-001"],
        f"PF6 no budget left: skipped, and the open items are recorded: {_pi}")
     shutil.rmtree(_pd, ignore_errors=True)
@@ -1888,6 +1901,86 @@ def _run_self_test() -> int:
     ok(_src_run.index("presentation_fix_pass(") > _src_run.index("final_writeup(")
        and _src_run.index("presentation_fix_pass(") < _src_run.index("finalize_run("),
        "PF7 run(): the pass comes after the final write-up and before the final gate (finalize_run)")
+
+    # PF8 (Codex P1-1): an interrupted pass is charged (the whole allowance: its cost is
+    # unreadable), its attempt is recorded so a resume does not repeat it, and the
+    # interruption propagates.
+    _pd = tempfile.mkdtemp()
+    json.dump({"question": "q"}, open(os.path.join(_pd, "metadata.json"), "w"))
+    open(os.path.join(_pd, "manuscript.md"), "w").write("# Draft\n")
+    _yaml_pf.safe_dump(_crit, open(os.path.join(_pd, "critique_presentation.yaml"), "w"))
+
+    async def _fq_cancel(prompt, options):
+        yield SystemMessage(subtype="init", data={"session_id": "pc"})
+        raise asyncio.CancelledError()
+    _cbud = {"sessions": [{"session": 3, "total_cost_usd": 590.0}]}
+    try:
+        asyncio.run(presentation_fix_pass(_pd, _pd, "q", _cbud, 600.0, 4, query_fn=_fq_cancel))
+        _raised = False
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        _raised = True
+    _pm = json.load(open(os.path.join(_pd, "metadata.json"))).get("presentation_fix_pass", {})
+    ok(_raised and _cbud["sessions"][-1]["session"] == 4 and _cbud["sessions"][-1]["total_cost_usd"] == 10.0
+       and "remaining allowance" in _cbud["sessions"][-1]["source"]
+       and json.load(open(os.path.join(_pd, "budget_ledger.json")))["spent_usd"] == 600.0,
+       f"PF8 an interrupted pass is charged its allowance and the ledger is written: {_raised} {_cbud['sessions'][-1]}")
+    ok(_pm.get("attempted") and _pm.get("interrupted") == "CancelledError",
+       f"PF8b the interrupted attempt is recorded: {_pm}")
+    _n = _pseen["calls"]
+    asyncio.run(presentation_fix_pass(_pd, _pd, "q", _cbud, 600.0, 5, query_fn=_fq_p))
+    ok(_pseen["calls"] == _n and len(_cbud["sessions"]) == 2, "PF8c a resumed run does not repeat (or re-charge) it")
+    shutil.rmtree(_pd, ignore_errors=True)
+
+    # PF9 (Codex P1-3): the harness's fallback render writes protected outputs under a
+    # harness grant and records them as harness writes.
+    from contextlib import contextmanager as _cm_pf
+
+    class _IgP:
+        def __init__(self):
+            self.grants, self.wrote, self.during = [], set(), None
+
+        @_cm_pf
+        def harness_pipeline(self, patterns):
+            self.grants.append(list(patterns))
+            yield
+
+        def harness_wrote(self, rel):
+            self.wrote.add(rel)
+    _pd = tempfile.mkdtemp()
+    os.makedirs(os.path.join(_pd, "models"))
+    open(os.path.join(_pd, "report.md"), "w").write("# old\n")
+    open(os.path.join(_pd, "manuscript.md"), "w").write("# Draft, newer\n")
+    _t = _time_pf.time() + 5
+    os.utime(os.path.join(_pd, "manuscript.md"), (_t, _t))
+    _igp = _IgP()
+    from agents.run_finish import _render_if_stale as _ris
+    _ris(_pd, _igp)
+    ok(_igp.grants and "report.md" in _igp.grants[0] and "models/claims_ledger.yaml" in _igp.grants[0]
+       and "report.md" in _igp.wrote,
+       f"PF9 the fallback render runs under a harness grant and records report.md: {_igp.grants} {_igp.wrote}")
+    shutil.rmtree(_pd, ignore_errors=True)
+
+    # PF10 (Codex P1-2): the hook records which draft a presentation review read.
+    _pd = tempfile.mkdtemp()
+    open(os.path.join(_pd, "manuscript.md"), "w").write("# Draft\n")
+    _hkp = agents_pkg.create_hooks(_pd, open(os.path.join(_pd, "trace.jsonl"), "a"), datetime.now(),
+                                   registered_agents=reg, max_rounds=8, hold_writer=False)
+    _spawn = {"tool_name": "Agent", "tool_input": {"subagent_type": "critique-presentation",
+                                                   "description": "review", "prompt": "This is critique round 8."}}
+    asyncio.run(_hkp["PreToolUse"][0].hooks[0](_spawn, "pr1", None))
+    _yaml_pf.safe_dump(_crit, open(os.path.join(_pd, "critique_presentation.yaml"), "w"))
+    asyncio.run(_hkp["PostToolUse"][0].hooks[0](_spawn, "pr1", None))
+    _rec = json.load(open(os.path.join(_pd, _pp.REVIEW)))
+    ok(_rec.get("ok") and _rec.get("draft") == "manuscript.md" and _pp.review_state(_pd)[0] == "ok",
+       f"PF10 the hook records the reviewed draft's hash when the critic returns: {_rec}")
+    asyncio.run(_hkp["PreToolUse"][0].hooks[0](_spawn, "pr2", None))
+    asyncio.run(_hkp["PostToolUse"][0].hooks[0](_spawn, "pr2", None))
+    ok(_pp.review_state(_pd)[0] == "failed",
+       "PF10b a critic spawn that returns without rewriting its critique is a failed review")
+    ok(enforcement.check_tool_use("Write", {"file_path": os.path.join(run_path, _pp.REVIEW), "content": "{}"},
+                                  run_path, "critique-presentation", reg) is not None,
+       "PF10c agents cannot write the review record")
+    shutil.rmtree(_pd, ignore_errors=True)
 
     # WU6-WU9 (Codex, Phase 29 review)
     _bd = tempfile.mkdtemp()
