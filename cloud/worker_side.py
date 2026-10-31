@@ -511,6 +511,11 @@ def brief_side(label):
     r = subprocess.run([sys.executable, "scripts/decision_brief.py", "status", rd], cwd=f"{WORK}/{label}",
                        capture_output=True, text=True)
     md = open(rd + "decision_brief.md").read() if os.path.exists(rd + "decision_brief.md") else None
+    # Phase 49 β: a pending scope sign-off is shown instead (scope_signoff.md, written by main.py).
+    sc = subprocess.run([sys.executable, "scripts/scope_signoff.py", "status", rd], cwd=f"{WORK}/{label}",
+                        capture_output=True, text=True).stdout.strip()
+    if sc == "awaiting" and os.path.exists(rd + "scope_signoff.md"):
+        return {"run_dir": rd, "status": "awaiting scope sign-off", "brief_md": open(rd + "scope_signoff.md").read()}
     return {"run_dir": rd, "status": r.stdout.strip() or r.stderr.strip(), "brief_md": md}
 
 
@@ -523,7 +528,11 @@ def sign_side(label, answers_yaml, note):
     os.write(fd, answers_yaml.encode())
     os.close(fd)
     env = {k: v for k, v in os.environ.items() if k != "MA_SIGNOFF_MODE"}
-    r = subprocess.run([sys.executable, "scripts/decision_brief.py", "sign", rd, "--by", "owner",
+    # Phase 49 β: a pending scope sign-off (AWAIT_OWNER) is answered first; else the brief.
+    st = subprocess.run([sys.executable, "scripts/scope_signoff.py", "status", rd], cwd=f"{WORK}/{label}",
+                        env=env, capture_output=True, text=True).stdout.strip()
+    script = "scripts/scope_signoff.py" if st == "awaiting" else "scripts/decision_brief.py"
+    r = subprocess.run([sys.executable, script, "sign", rd, "--by", "owner",
                         "--answers", p, "--note", note], cwd=f"{WORK}/{label}", env=env,
                        capture_output=True, text=True)
     return {"rc": r.returncode, "out": (r.stdout + r.stderr).strip()}

@@ -37,7 +37,10 @@ SUCCESS_STATUSES = {"completed", "completed_with_report_restored"}
 PARTIAL_STATUSES = {"completed_scope_declared", "completed_gate_not_accepted",
                     "completed_gate_error", "completed_gate_not_run",
                     "completed_no_report", "run_failed", "budget_exhausted",
-                    "awaiting_signoff"}   # Phase 33: resumable with --resume once signed
+                    "awaiting_signoff",   # Phase 33: resumable with --resume once signed
+                    # Phase 49 β: waiting for the owner on decision-bearing declarations
+                    # (resumable), and the owner declined one with no rounds left.
+                    "awaiting_scope_signoff", "completed_scope_declined"}
 
 
 _HARNESS_LOCK: dict = {}   # Phase 34 ε: modes of the harness files locked for this run (finalize_run restores them)
@@ -139,6 +142,9 @@ def run_final_gate(run_path: str, max_rounds: int,
         unresolved = decision.get("unresolved_high")
         if isinstance(unresolved, list):
             gate["n_unresolved_high"] = len(unresolved)
+            # Phase 49 β: the owner declined a declaration of a decision-bearing finding.
+            gate["owner_declined"] = any(isinstance(u, dict) and u.get("kind") == "scope_declaration_declined"
+                                         for u in unresolved)
         try:
             with open(os.path.join(run_path, "final_gate.json"), "w") as f:
                 json.dump(decision, f, indent=2)
@@ -168,6 +174,10 @@ def determine_status(session_outcome: str, gate: dict | None, has_report: bool,
     if session_outcome != "session_completed":
         return session_outcome
     action = (gate or {}).get("action")
+    if action == "AWAIT_OWNER":
+        return "awaiting_scope_signoff"      # Phase 49 β: resumable once the owner answers
+    if action == "RUN_FAILED" and (gate or {}).get("owner_declined"):
+        return "completed_scope_declined"    # Phase 49 β
     if action == "RUN_FAILED":
         return "run_failed"
     if not has_report:

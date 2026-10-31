@@ -707,6 +707,8 @@ A HIGH finding the lead declares in scope_declaration.yaml needs a decision
 test (Phase 49 α, A20): re-run the decision with the finding's quantity at its
 target and write the result file (format and exemptions in the rigor manifest,
 entry `decision_tests`); a test that shows the decision changes means fix it.
+A finding that bears on the primary decision goes to the owner with that test
+(Phase 49 β, entry `scope_signoff`): write the test before it is declared.
 
 If the full model is too slow for the local draw floor (>2 hours total),
 build a surrogate (emulator on a sparse grid of full-model runs) and

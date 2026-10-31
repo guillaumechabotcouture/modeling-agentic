@@ -20,6 +20,7 @@ from agents import enforcement, _registry
 # scripts/ is on sys.path: agents/__init__.py put it there before importing this module.
 import open_problems  # noqa: E402  (Phase 32: open-problem list, round plan, fix checks)
 import decision_brief  # noqa: E402  (Phase 33: the signed decision brief)
+import scope_signoff  # noqa: E402  (Phase 49 β: the owner signs decision-bearing declarations)
 import derived_rebuild  # noqa: E402  (Phase 39 β: the harness regenerates stale figures)
 import presentation_pass  # noqa: E402  (Phase 49 δ: which draft each presentation review read)
 
@@ -336,6 +337,21 @@ def signoff_hold_reason(run_path: str, mode: str | None, run_dir_rel: str = "{ru
             "open questions with --answers <file>).")
 
 
+def scope_hold_reason(run_path: str, mode: str | None, run_dir_rel: str = "{run_dir}") -> str | None:
+    """Phase 49 β: the writer waits while declarations of findings that bear on
+    the primary decision wait for sign-off (owner mode: the owner; lead mode: the lead)."""
+    if mode not in ("owner", "lead") or scope_signoff.status(run_path) != "awaiting":
+        return None
+    if mode == "owner":
+        return ("The gate's decision is AWAIT_OWNER: declarations of findings that bear on the primary decision "
+                "wait for the owner (scope_signoff_request.json). Do not spawn the writer. End your turn now with the "
+                "line AWAITING_SIGNOFF; the harness resumes you with the owner's answers.")
+    return (f"The gate's decision is AWAIT_OWNER. Review `python3 scripts/scope_signoff.py show {run_dir_rel}` (each "
+            f"finding, its declaration and decision test), write {run_dir_rel}/{scope_signoff.LEAD_ANSWERS} (one line "
+            "per finding: `\"<finding>\": {decision: accept|decline, note: <why>}`), then end your turn with the line "
+            "AWAITING_SIGNOFF; the harness signs your answers and resumes you.")
+
+
 def create_hooks(run_path: str, trace_file, start_time: datetime,
                  registered_agents=None, max_turns: dict[str, int] | None = None,
                  integrity=None, budget_status=None, max_rounds: int | None = None,
@@ -410,6 +426,11 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
         if (not deny_reason and signoff == "owner" and tool_name == "Bash"
                 and re.search(r"decision_brief\.py\b.*\bsign\b", str(tool_input.get("command") or ""), re.S)):
             deny_reason = "The owner signs the decision brief in this run; agents cannot sign it."
+        if (not deny_reason and signoff in ("owner", "lead") and tool_name == "Bash"
+                and re.search(r"scope_signoff\.py\b.*\bsign\b", str(tool_input.get("command") or ""), re.S)):
+            deny_reason = "Agents cannot sign scope declarations (the harness records the answers)."   # Phase 49 β
+        if not deny_reason and spawn and sub == "writer":
+            deny_reason = scope_hold_reason(run_path, signoff, run_path)   # Phase 49 β
         if not deny_reason and spawn:
             deny_reason = review_wait_reason(run_path, sub, session_t0)
         if not deny_reason and hold_writer and sub == "writer":
