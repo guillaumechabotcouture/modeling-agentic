@@ -62,7 +62,7 @@ rigor checks between rounds.
 
 | Goal                                  | Read first                                                    |
 |---------------------------------------|---------------------------------------------------------------|
-| Understand the lead loop              | `main.py` + `agents/__init__.py` (`_registry()`, `build_lead_prompt()`, `create_hooks()`) |
+| Understand the lead loop              | `main.py` (CLI, `run()` session loop) + `agents/__init__.py` (`_registry()`), `agents/lead_prompt.py` (`build_lead_prompt()`), `agents/hooks.py` (`create_hooks()`); run finishing, budget and preflight in `agents/run_finish.py`, `run_budget.py`, `run_preflight.py` |
 | Understand what agents may touch      | `agents/enforcement.py` (PreToolUse denies, harness hashing, env filtering) and `agents/integrity.py` (hash record of protected run artifacts) |
 | Add or modify a rigor gate            | `scripts/validate_critique_yaml.py` (`_check_*` fns) and any standalone validator under `scripts/`; shared loaders in `scripts/lib/` |
 | Tweak the modeler agent's behavior    | `agents/modeler.py` SYSTEM_PROMPT (~950 lines rendered; § 4 rigor contracts, timeline rendered from the manifest) |

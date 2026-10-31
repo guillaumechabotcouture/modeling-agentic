@@ -28,6 +28,7 @@ In review (Phase 48, simplification before attempt 9, with no change to gate out
 - **α:** duplicated helpers moved to `scripts/lib/`: the check-module command line (`lib/gate_cli.py`, six copies) and the private by-path loader (`lib/siblings.py`, three copies); two more copies replaced by the existing `lib.safe_io` helpers; two unused functions removed.
 - **β:** the sanity-schema, a-priori identifiability and effort-floor checks moved from `validate_critique_yaml.py` (8,757 → 7,834 lines) into `scripts/sanity_gate.py`, `scripts/identifiability_gate.py` and `scripts/effort_floors_gate.py`, each with `gate_findings(run_dir)` and its own self-test (stacked on α).
 - **γ:** `main.py` split by concern (3,057 → 2,077 lines): session plumbing, budget, preflight and run finishing moved to `agents/run_session.py`, `run_budget.py`, `run_preflight.py` and `run_finish.py`; `main.py` keeps the CLI and the session loop and re-exports every moved name (stacked on β).
+- **δ:** `agents/__init__.py` (1,934 → 453 lines) keeps the registry; the lead prompt and the hooks moved to `agents/lead_prompt.py` and `agents/hooks.py`, re-exported by the package (stacked on γ).
 
 Before attempt 9:
 - A16 (compute places chunks on free workers itself, so VMs that join mid-batch get work): merged (Phase 45 δ, #66);
