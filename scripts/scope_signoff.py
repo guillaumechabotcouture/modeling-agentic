@@ -111,6 +111,8 @@ def load_map(path: str = POLICY) -> dict:
         if not (isinstance(v, dict) and v.get("when") in CONDITIONS and isinstance(v.get("reason"), str)
                 and v["reason"].strip()):
             raise ValueError(f"decision_bearing.kinds.{k} needs `when:` ({', '.join(CONDITIONS)}) and `reason:`")
+        if not (isinstance(v.get("sources", []), list) and all(isinstance(x, str) for x in v.get("sources", []))):
+            raise ValueError(f"decision_bearing.kinds.{k}: `sources:` must be a list of run-relative paths")
         if v["when"] == "artifact" and not (isinstance(v.get("artifacts"), list) and v["artifacts"]
                                             and all(isinstance(a, str) for a in v["artifacts"])):
             raise ValueError(f"decision_bearing.kinds.{k}: `when: artifact` needs an `artifacts:` list")
@@ -213,8 +215,13 @@ def _file_sha(run_dir: str, rel) -> Optional[str]:
         return None
 
 
+def _evidence_text(text) -> str:
+    """The claim as evidence: whitespace and the gate round it was printed at do not count."""
+    return re.sub(r"\bround \d+\b", "round", " ".join(str(text or "").split()), flags=re.I)
+
+
 def build_item(run_dir: str, v: dict, reason: str, entries: list[dict], evidence: Optional[str] = None,
-               cover: Optional[list] = None) -> dict:
+               cover: Optional[list] = None, sources: tuple = ()) -> dict:
     """What the owner is shown for one finding, with its fingerprint."""
     dt = _dt_mod()
     ident = dt._ident(v)
@@ -235,7 +242,10 @@ def build_item(run_dir: str, v: dict, reason: str, entries: list[dict], evidence
     # Codex review (#85): the evidence is part of what the owner approves. The finding's own
     # result (its claim: observed values, metrics; for a persistence escalation the base
     # finding's), each declaration and the decision-test files' contents.
-    fp = hashlib.sha256(json.dumps({"finding": ident, "evidence": " ".join(str(evidence or v.get("claim") or "").split()),
+    # Codex round 2 (#3): and the files the finding was computed from (`sources:` in the map).
+    src = {rel: _file_sha(run_dir, rel) for rel in sources}
+    fp = hashlib.sha256(json.dumps({"finding": ident, "evidence": _evidence_text(evidence or v.get("claim")),
+                                    "sources": src,
                                     "entries": sorted(cover, key=lambda e: str(e.get("id"))),
                                     "tests": tests}, sort_keys=True, default=str).encode()).hexdigest()[:16]
     return {"finding": ident, "kind": v.get("kind"), "reason": reason, "claim": str(v.get("claim") or "")[:600],
@@ -371,8 +381,10 @@ def gate_findings(run_dir: str, round_n: Optional[int] = None, current: Optional
             continue
         base = [x for x in current or [] if isinstance(x, dict) and str(v.get("kind")).endswith("_persistent")
                 and x.get("kind") == str(v.get("kind"))[:-len("_persistent")]]
+        kind = str(v.get("kind") or "")
+        rule = cfg["kinds"].get(kind[:-len("_persistent")] if kind.endswith("_persistent") else kind) or {}
         item = build_item(run_dir, v, reason, entries, evidence=base[0].get("claim") if base else None,
-                          cover=na_entry)
+                          cover=na_entry, sources=tuple(rule.get("sources") or ()))
         if item["finding"] in seen:
             continue
         seen.add(item["finding"])
@@ -436,8 +448,13 @@ def record(run_dir: str, decision: dict, round_n: Optional[int] = None) -> Optio
     """Write the request when the decision waits for the owner; mark an older
     pending request superseded otherwise. Returns the path written, if any."""
     p = os.path.join(run_dir, REQUEST)
-    items = [b["owner_item"] for b in decision.get("unresolved_high") or []
-             if isinstance(b, dict) and b.get("owner_signoff") and isinstance(b.get("owner_item"), dict)]
+    # Codex round 2 (#4): a missing required analysis is an accept blocker; collect both, once each.
+    items, seen = [], set()
+    for b in list(decision.get("unresolved_high") or []) + list(decision.get("accept_blockers") or []):
+        it = b.get("owner_item") if isinstance(b, dict) and b.get("owner_signoff") else None
+        if isinstance(it, dict) and it.get("fingerprint") not in seen:
+            seen.add(it.get("fingerprint"))
+            items.append(it)
     now = _dt.datetime.now(_dt.timezone.utc).isoformat()
     if decision.get("action") == ACTION and items:
         doc = {"pending": True, "round": round_n, "requested_at": now, "items": items,
@@ -651,6 +668,40 @@ def _self_test() -> int:
                and f[0]["artifact"] == "outcome_fn",
                f"SO27 declaring a decision analysis not applicable needs the owner: {[x.get('kind') for x in f]}")
             os.remove(os.path.join(d, "scope_declaration.yaml"))
+            # SO28 (Codex round 2, #3): the source analysis file is part of the fingerprint.
+            sa = {"kind": "sensitivity_analysis_unstable", "severity": "HIGH", "stage": "OPTIMIZATION",
+                  "key": "sensitivity_analysis", "claim": "UNSTABLE: 3 of 10 flip"}
+            w(d, "models/sensitivity_analysis.yaml", {"verdict": "UNSTABLE", "flips": 3})
+            c = [dict(sa)]
+            gate_findings(d, 6, c)
+            w(d, "models/sensitivity_analysis.yaml", {"verdict": "UNSTABLE", "flips": 9})
+            c2 = [dict(sa)]
+            gate_findings(d, 6, c2)
+            ok(c[0]["owner_item"]["fingerprint"] != c2[0]["owner_item"]["fingerprint"],
+               "SO28 a changed source analysis (same summary claim) is a new item")
+            # SO29 (#4): owner items in accept blockers make a signable request, once each.
+            it = c2[0]["owner_item"]
+            p0 = record(d, {"action": ACTION, "unresolved_high": [{"owner_signoff": True, "owner_item": it}],
+                            "accept_blockers": [{"owner_signoff": True, "owner_item": it},
+                                                {"owner_signoff": True, "owner_item": dict(it, finding="x",
+                                                                                           fingerprint="f9")}]}, 6)
+            ok(p0 and [i["fingerprint"] for i in _load_request(d)["items"]] == [it["fingerprint"], "f9"],
+               "SO29 accept-blocker owner items are requested, deduplicated by fingerprint")
+            # SO30 (#5): the allocation consolidation's escalation goes to the owner; the round
+            # number in its text does not change the item.
+            od = {"kind": "allocation_rigor_drafts_overdue_persistent", "severity": "HIGH", "stage": "GATE",
+                  "claim": "persisted"}
+            base6 = {"kind": "allocation_rigor_drafts_overdue", "severity": "MEDIUM", "stage": "OPTIMIZATION",
+                     "claim": "Allocation rigor artifacts past their drafting deadline (round 6). Overdue: x."}
+            c = [dict(od), dict(base6)]
+            gate_findings(d, 6, c)
+            c2 = [dict(od), dict(base6, claim=base6["claim"].replace("round 6", "round 7"))]
+            gate_findings(d, 7, c2)
+            ok(c[0].get("owner_signoff") and c[0]["owner_item"]["fingerprint"] == c2[0]["owner_item"]["fingerprint"],
+               "SO30 the consolidated missing-analysis escalation is the owner's; the round number is not evidence")
+            # SO31 (#6): an optimizer with no benchmark is the owner's when the run allocates.
+            ok(bears(d, {"kind": "optimization_quality_no_benchmark", "severity": "HIGH"}, cfg, {}) is not None,
+               "SO31 optimization_quality_no_benchmark bears on an allocation")
             # Marking, the decision, the request.
             c = cur()
             ok(gate_findings(d, 6, c) == [] and c[0].get("owner_signoff") and c[1].get("owner_signoff")

@@ -104,6 +104,8 @@ decision_test:
 #                           none` marks a calibration target. When the run
 #                           lists no interventions, or the benchmark cannot be
 #                           read, the finding is treated as bearing (fail closed).
+# `sources:` (run-relative files the finding is computed from) are hashed into
+# the owner item's fingerprint: an answer covers that evidence only.
 #   always                  the kind is about an intervention effect the plan uses,
 #                           or an analysis every decision rests on is missing.
 #   artifact                `required_artifact_missing` (or a `not_applicable:`
@@ -115,46 +117,71 @@ decision_bearing:
     allocation_unstable:
       when: allocation
       reason: "the allocation does not hold out of sample, and the decision is the package per allocation unit"
+      sources: [models/allocation_robustness.yaml]
     sensitivity_analysis_unstable:
       when: allocation
       reason: "plausible parameter changes flip the recommended packages"
+      sources: [models/sensitivity_analysis.yaml]
     optimization_quality_gap_too_large:
       when: allocation
       reason: "the optimizer's allocation is far from the best one found by another method"
+      sources: [models/optimization_quality.yaml]
     within_zone_heterogeneity_unbounded:
       when: allocation
       reason: "variation inside allocation units may reverse the package choice"
+      sources: [models/within_zone_heterogeneity.yaml]
     benchmark_drift:
       when: benchmark_intervention
       reason: "the model's value for an intervention the decision chooses among is outside its benchmark band"
+      sources: [models/benchmark_targets.yaml, models/benchmark_computed.yaml, benchmark_match.yaml]
     effect_exceeds_trial_evidence:
       when: always
       reason: "an intervention effect used by the plan exceeds the trial evidence"
+      sources: [models/effect_concordance.yaml]
     # A decision analysis that was not run: nothing to vary, so not self-exemptable.
     allocation_robustness_missing:
       when: allocation
       reason: "the allocation's out-of-sample check was not run"
+      sources: [models/allocation_robustness.yaml]
     sensitivity_analysis_missing:
       when: allocation
       reason: "the allocation's sensitivity analysis was not run"
+      sources: [models/sensitivity_analysis.yaml]
     optimization_quality_missing:
       when: allocation
       reason: "the optimizer was not checked against another method"
+      sources: [models/optimization_quality.yaml]
     within_zone_heterogeneity_missing:
       when: allocation
       reason: "variation inside allocation units was not assessed"
+      sources: [models/within_zone_heterogeneity.yaml]
     daly_analysis_missing:
       when: allocation
       reason: "the allocation's DALY analysis was not run"
     uq_report_missing:
       when: always
       reason: "the recommendation has no uncertainty analysis"
+      sources: [uncertainty_report.yaml, models/outcome_fn.py]
     identifiability_report_missing:
       when: always
       reason: "the fitted parameters' identifiability was not assessed"
+      sources: [models/identifiability.yaml]
     outcome_fn_missing:
       when: always
       reason: "the decision has no outcome function to evaluate it"
+      sources: [models/outcome_fn.py]
+    optimization_quality_no_benchmark:
+      when: allocation
+      reason: "the optimizer's allocation was not compared with any other method"
+      sources: [models/optimization_quality.yaml]
+    # The allocation-rigor coordinator folds the missing allocation analyses into
+    # one finding (and its `_persistent` HIGH): the aggregate goes to the owner
+    # whole, since every member is a decision analysis.
+    allocation_rigor_drafts_overdue:
+      when: allocation
+      reason: "allocation analyses (sensitivity, cross-validation, optimizer check, coverage, DALYs) are missing past their deadline"
+      sources: [models/sensitivity_analysis.yaml, models/allocation_robustness.yaml, models/optimization_quality.yaml,
+                models/universal_coverage.yaml]
     required_artifact_missing:
       when: artifact
       artifacts: [allocation_robustness, sensitivity_analysis, optimization_quality,
