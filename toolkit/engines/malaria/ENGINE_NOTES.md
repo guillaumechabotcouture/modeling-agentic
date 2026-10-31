@@ -75,119 +75,118 @@ Benchmark pack:
   (chlorfenapyr kill, IRS kill), on the same 8 seeds as the final run.
 
 <!-- tables:start -->
-### Benchmark pack, before (spike v0.1) and after (v0.2)
+### Benchmark pack: spike v0.1, v0.2 (PR round 1) and v0.3
 
-| ID | Benchmark | Target (band) | v0.1 spike | v0.1 status | v0.2 | v0.2 seed range | v0.2 status | Role |
+| ID | Benchmark | Target (band) | v0.1 spike | v0.2 | v0.3 | v0.3 seed range | v0.3 status | Role |
 |---|---|---|---|---|---|---|---|---|
-| B7 | ITN (pyrethroid) vs none, prevalence RR at 12 m | 0.83 (0.68–0.98) | 0.735 | in band | 0.578 | 0.551–0.597 | **out of band** | held_out |
-| B8 | ITN vs none, clinical incidence RR 0-24 m (under 5) | 0.55 (0.46–0.64) | 0.578 | in band | 0.45 | 0.435–0.481 | **out of band** | held_out |
-| B9 | PBO vs pyrethroid nets (no IRS), prevalence OR at 9 m | 0.37 (0.09–0.65) | 0.798 | **out of band** | 0.506 | 0.469–0.566 | in band | held_out |
-| B9b | PBO vs pyrethroid nets (no IRS), prevalence OR at 21 m | 0.4 (0.2–0.81) | 0.953 | **out of band** | 0.691 | 0.663–0.716 | in band | held_out |
-| B9c | PBO vs pyrethroid nets, prevalence aOR at 24 m (Misungwi) | 0.99 (0.67–1.45) | 0.993 | in band | 0.75 | 0.702–0.796 | in band | held_out |
-| B10 | Dual-AI vs pyrethroid nets, prevalence OR at 24 m | 0.45 (0.23–0.67) | 0.688 | **out of band** | 0.642 | 0.574–0.68 | in band | fit |
-| B11 | Dual-AI vs pyrethroid nets, incidence RR 0-24 m | 0.54 (0.38–0.7) | 0.402 | in band | 0.501 | 0.447–0.543 | in band | fit |
-| B12 | Non-pyrethroid IRS added to ITN, prevalence RR at 12 m | 0.61 (0.34–0.88) | 0.878 | in band | 0.786 | 0.714–0.829 | in band | fit |
-| B12b | Non-pyrethroid IRS added to ITN, incidence RR 0-24 m | 0.86 (0.49–1.23) | 0.746 | in band | 0.576 | 0.539–0.602 | in band | fit |
-| B12m | Pirimiphos-methyl IRS added to pyrethroid nets (Muleba), prevalence OR at 9 m | 0.33 (0.19–0.55) | n/a | n/a | 0.427 | 0.403–0.463 | in band | fit |
-| B13 | SMC, in-season clinical incidence RR (3-59 m) | 0.27 (0.14–0.4) | 0.346 | in band | 0.353 | 0.327–0.386 | in band | held_out |
-| B15 | ITN x IRS interaction OR (PBO x IRS, prevalence at 9 m, 2x2 factorial) | 2.43 (1.19–4.97) | 0.982 | in band | 1.4 | 1.21–1.52 | in band | held_out |
-| B16c | EIR-prevalence curve (Beier 1999 rules: EIR > 15 -> PfPR >= 50%; EIR >= 200 -> PfPR > 80%) | rules | 4/5 rules | **out of band** | 4/5 rules | per seed: 4/5, 4/5, 4/5, 4/5, 4/5, 4/5, 4/5, 4/5 | **out of band** | held_out |
-| B17 | SMC $ per DALY averted (reference setting) | 38.4 (7.67–192) | 18.3 | in band | 18.8 | 17.6–20.4 | in band | held_out |
-| B18 | ITN vs none $ per DALY averted (reference setting) | 44.5 (8.9–223) | 57.3 | in band | 14.2 | 12.5–17.4 | in band | held_out |
-| B19 | IRS vs none $ per DALY averted (reference setting) | 25.2 (5.03–126) | 370 | **out of band** | 115 | 110–124 | in band | held_out |
-| B20 | Dual-AI vs pyrethroid nets, incremental $ per DALY averted (high resistance) | 19 (3.8–95) | 3.63 | **out of band** | 4.16 | 3.23–5.65 | in band | held_out |
+| B7 | ITN (pyrethroid) vs none, prevalence RR at 12 m | 0.83 (0.68–0.98) | 0.735 (in band) | 0.578 (**out of band**) | 0.642 | 0.619–0.681 | **out of band** | held_out |
+| B8 | ITN vs none, clinical incidence RR 0-24 m (under 5) | 0.55 (0.46–0.64) | 0.578 (in band) | 0.45 (**out of band**) | 0.54 | 0.523–0.554 | in band | held_out |
+| B9 | PBO vs pyrethroid nets (no IRS), prevalence OR at 9 m | 0.37 (0.09–0.65) | 0.798 (**out of band**) | 0.506 (in band) | 0.377 | 0.36–0.403 | in band | held_out |
+| B9b | PBO vs pyrethroid nets (no IRS), prevalence OR at 21 m | 0.4 (0.2–0.81) | 0.953 (**out of band**) | 0.691 (in band) | 0.797 | 0.769–0.827 | in band | held_out |
+| B9c | PBO vs pyrethroid nets, prevalence aOR at 24 m (Misungwi) | 0.99 (0.67–1.45) | 0.993 (in band) | 0.75 (in band) | 0.865 | 0.841–0.887 | in band | held_out |
+| B10 | Dual-AI vs pyrethroid nets, prevalence OR at 24 m | 0.45 (0.23–0.67) | 0.688 (**out of band**) | 0.642 (in band) | 0.667 | 0.614–0.696 | in band | fit |
+| B11 | Dual-AI vs pyrethroid nets, incidence RR 0-24 m | 0.54 (0.38–0.7) | 0.402 (in band) | 0.501 (in band) | 0.504 | 0.465–0.544 | in band | fit |
+| B12 | Non-pyrethroid IRS added to ITN, prevalence RR at 12 m | 0.61 (0.34–0.88) | 0.878 (in band) | 0.786 (in band) | 0.807 | 0.747–0.86 | in band | fit |
+| B12b | Non-pyrethroid IRS added to ITN, incidence RR 0-24 m | 0.86 (0.49–1.23) | 0.746 (in band) | 0.576 (in band) | 0.59 | 0.564–0.613 | in band | fit |
+| B12m | Pirimiphos-methyl IRS added to pyrethroid nets (Muleba), prevalence OR at 9 m | 0.33 (0.19–0.55) | n/a | 0.427 (in band) | 0.445 | 0.421–0.479 | in band | fit |
+| B13 | SMC, in-season clinical incidence RR (3-59 m) | 0.27 (0.14–0.4) | 0.346 (in band) | 0.353 (in band) | 0.361 | 0.339–0.382 | in band | held_out |
+| B15 | ITN x IRS interaction OR (PBO x IRS, prevalence at 9 m, 2x2 factorial) | 2.43 (1.19–4.97) | 0.982 (in band) | 1.4 (in band) | 1.44 | 1.29–1.61 | in band | held_out |
+| B16c | EIR-prevalence curve (Beier 1999 rules: EIR > 15 -> PfPR >= 50%; EIR >= 200 -> PfPR > 80%) | rules | 4/5 rules (**out of band**) | 4/5 rules (**out of band**) | 4/5 rules | per seed: 4/5, 4/5, 4/5, 4/5, 4/5, 4/5, 4/5, 4/5 | **out of band** | held_out |
+| B17 | SMC $ per DALY averted (reference setting) | 38.4 (7.67–192) | 18.3 (in band) | 18.8 (in band) | 18.1 | 16.4–20.2 | in band | held_out |
+| B18 | ITN vs none $ per DALY averted (reference setting) | 44.5 (8.9–223) | 57.3 (in band) | 14.2 (in band) | 23.2 | 20.1–28.2 | in band | held_out |
+| B19 | IRS vs none $ per DALY averted (reference setting) | 25.2 (5.03–126) | 370 (**out of band**) | 115 (in band) | 122 | 114–128 | in band | held_out |
+| B20 | Dual-AI vs pyrethroid nets, incremental $ per DALY averted (high resistance) | 19 (3.8–95) | 3.63 (**out of band**) | 4.16 (in band) | 4.33 | 3.71–5.03 | in band | held_out |
 
-v0.2: 14 in band, 3 out of band, 0 not assessable, 0 band mis-based, of 17 (9 of 12 held-out in band). 296 engine runs, 8 seeds per arm (common random numbers). v0.1: 10 of 16 in band.
-- B15 requires {'B9': [0.21, 0.65], 'B12m': [0.19, 0.55]}; computed B9 0.5058, B12m 0.4274.
-- B15 arms (OR vs standard LLIN): PBO alone 0.5058, IRS alone 0.4274, both 0.3024; prevalence {'a00': 0.5555, 'a10': 0.3874, 'a01': 0.3482, 'a11': 0.2744}.
-- B19: the target 25.2 is below the price floor 64.2 per DALY (cost per person divided by ALL the comparator's DALYs per person): no intervention can reach the target value at the pack's price; only the band's upper part is reachable. The band's basis (price or setting) differs from the decision's.
-- B19: price floor 64.2 per DALY (cost 24.6 per person over the comparator's 0.383 DALYs per person), below the band's upper edge 126; meeting the band would need 51% of all DALYs averted; the engine averts 55.6%.
+v0.3: 15 in band, 2 out of band, 0 not assessable, 0 band mis-based, of 17 (10 of 12 held-out in band). 296 engine runs, 8 seeds per arm (common random numbers). v0.1: 10 of 16 in band.
+- B15 requires {'B9': [0.21, 0.65], 'B12m': [0.19, 0.55]}; computed B9 0.3768, B12m 0.4447.
+- B15 arms (OR vs standard LLIN): PBO alone 0.3768, IRS alone 0.4447, both 0.2409; prevalence {'a00': 0.5609, 'a10': 0.325, 'a01': 0.3623, 'a11': 0.2354}.
+- B19: the target 25.2 is below the price floor 64.1 per DALY (cost per person divided by ALL the comparator's DALYs per person): no intervention can reach the target value at the pack's price; only the band's upper part is reachable. The band's basis (price or setting) differs from the decision's.
+- B19: price floor 64.1 per DALY (cost 24.5 per person over the comparator's 0.383 DALYs per person), below the band's upper edge 126; meeting the band would need 50.9% of all DALYs averted; the engine averts 52.5%.
 
 Fitted engine-level parameters (fit rule `joint-v1`, seeds [11, 12, 13, 14, 15, 16, 17, 18], 25 design points):
 
 | Parameter | Value | Range (all feasible targets in band) | Box | Fitted to |
 |---|---|---|---|---|
-| cfp_kill | 0.39 | 0.36–0.535 | [0.0, 0.8] | B10, B11, B12, B12b, B12m |
-| irs_kill | 0.409687 | 0.285–0.5344 | [0.0, 0.95] | B10, B11, B12, B12b, B12m |
+| cfp_kill | 0.395 | 0.395–0.54 | [0.0, 0.8] | B10, B11, B12, B12b, B12m |
+| irs_kill | 0.38 | 0.2672–0.5047 | [0.0, 0.95] | B10, B11, B12, B12b, B12m |
 
-Feasibility before fitting: infeasible in the box: none; conflicting pairs: none; all feasible targets in band at the value: True. Surrogate leave-one-out error (log scale): B10 0.0165, B11 0.0186, B12 0.0097, B12b 0.0143, B12m 0.0152.
-Verification at the value (re-run, re-calibrated): B10 0.6425 (surrogate 0.6422, in), B11 0.5008 (surrogate 0.5, in), B12 0.7857 (surrogate 0.7913, in), B12b 0.5764 (surrogate 0.5791, in), B12m 0.4274 (surrogate 0.4313, in).
+Feasibility before fitting: infeasible in the box: none; conflicting pairs: none; all feasible targets in band at the value: True. Surrogate leave-one-out error (log scale): B10 0.0175, B11 0.0126, B12 0.0079, B12b 0.0114, B12m 0.0167.
+Verification at the value (re-run, re-calibrated): B10 0.6667 (surrogate 0.6675, in), B11 0.5037 (surrogate 0.5007, in), B12 0.8074 (surrogate 0.7958, in), B12b 0.5904 (surrogate 0.5843, in), B12m 0.4447 (surrogate 0.4365, in).
 
 ### B15 by mechanism (Muleba 2×2, 9 months; re-calibrated per row; fitted parameters fixed)
 
 | Configuration | PBO alone OR | IRS alone OR | Both OR | Interaction OR | Seed range | Single arms in trial CI |
 |---|---|---|---|---|---|---|
 | Trial (Protopopoff 2018) | 0.37 | 0.33 | 0.29 | 2.43 | CI 1.19–4.97 | |
-| hut coefficients only (no household, no diversion, short IRS) | 0.4624 | 0.6743 | 0.3512 | 1.127 | 1.0014–1.3857 | no |
-| + IRS long-lasting product decay (alone) | 0.4624 | 0.4078 | 0.2504 | 1.328 | 1.141–1.4282 | yes |
-| + IRS diversion to outdoor biting 0.5 (alone) | 0.4624 | 0.7123 | 0.3667 | 1.113 | 0.9504–1.3315 | no |
-| + household net-use clustering 0.5 and net x IRS correlation 0.3 (alone) | 0.4555 | 0.6686 | 0.3447 | 1.132 | 1.0393–1.2449 | no |
-| + exposure correlated with net non-use 0.2 (alone) | 0.5063 | 0.6587 | 0.3568 | 1.07 | 0.9962–1.2151 | no |
-| all together (engine defaults) | 0.5058 | 0.4274 | 0.3024 | 1.399 | 1.2095–1.5153 | yes |
-| all together, high correlations (0.9, 0.9, 0.6) | 0.6186 | 0.4876 | 0.3702 | 1.227 | 1.1579–1.3063 | yes |
-| all together, full diversion (1.0) | 0.5058 | 0.4893 | 0.3241 | 1.309 | 1.1481–1.4876 | yes |
-| all together, high correlations and full diversion | 0.6186 | 0.5355 | 0.4086 | 1.234 | 1.1758–1.2974 | yes |
+| hut coefficients only (no household, no diversion, short IRS) | 0.3855 | 0.6868 | 0.2952 | 1.115 | 1.0093–1.1685 | no |
+| + IRS long-lasting product decay (alone) | 0.3855 | 0.4045 | 0.2228 | 1.429 | 1.2815–1.582 | yes |
+| + IRS diversion to outdoor biting 0.5 (alone) | 0.3855 | 0.699 | 0.3105 | 1.152 | 0.9929–1.2871 | no |
+| + household net-use clustering 0.5 and net x IRS correlation 0.3 (alone) | 0.3855 | 0.6869 | 0.2946 | 1.112 | 1.0448–1.1946 | no |
+| + exposure correlated with net non-use 0.2 (alone) | 0.3738 | 0.671 | 0.2922 | 1.165 | 1.045–1.2897 | no |
+| all together (engine defaults) | 0.3768 | 0.4447 | 0.2409 | 1.438 | 1.2855–1.607 | yes |
+| all together, high correlations (0.9, 0.9, 0.6) | 0.3792 | 0.4988 | 0.2561 | 1.354 | 1.2349–1.5112 | yes |
+| all together, full diversion (1.0) | 0.3768 | 0.4981 | 0.2668 | 1.422 | 1.1619–1.5719 | yes |
+| all together, high correlations and full diversion | 0.3792 | 0.5444 | 0.279 | 1.352 | 1.2694–1.4756 | yes |
+
+### Field-use mechanisms, each alone and together (nets vs none, B7/B8; Muleba B9/B15)
+
+| Configuration | B7 (0.68–0.98) | B8 (0.46–0.64) | B9 (0.09–0.65) | B15 (1.19–4.97) | B15 arms: PBO / IRS / both |
+|---|---|---|---|---|---|
+| hut-like nets (no attrition, full use given access, no holes) | 0.4654 [0.4308–0.4815] **out** | 0.2736 [0.2613–0.2884] **out** | 0.4092 [0.3542–0.4616] | 1.3644 [1.2189–1.5841] | 0.4092 / 0.4797 / 0.2679 |
+| + attrition alone (median retention 1.64 y) | 0.6049 [0.5843–0.637] **out** | 0.4871 [0.476–0.512] | 0.3916 [0.3506–0.4214] | 1.3731 [1.2487–1.5942] | 0.3916 / 0.4891 / 0.263 |
+| + use below access alone (use rate 0.871, half persistent) | 0.4431 [0.4292–0.4697] **out** | 0.2524 [0.2318–0.2729] **out** | 0.3775 [0.3413–0.4105] | 1.4335 [1.317–1.5368] | 0.3775 / 0.4804 / 0.2599 |
+| + holes alone (Briet 2020) | 0.5103 [0.4663–0.5418] **out** | 0.3778 [0.3512–0.4082] **out** | 0.4316 [0.4116–0.4552] | 1.337 [1.2697–1.486] | 0.4316 / 0.4631 / 0.2672 |
+| all field mechanisms (engine defaults) | 0.6423 [0.619–0.681] **out** | 0.5403 [0.523–0.5541] | 0.3768 [0.3602–0.4032] | 1.4379 [1.2855–1.607] | 0.3768 / 0.4447 / 0.2409 |
 <!-- tables:end -->
 
-## Reading the results
+## Reading the results (v0.3)
 
-**B15 (ITN×IRS interaction): 1.40, seed range 1.21–1.52, against the trial's 2.43
-(1.19–4.97).** It is in band and assessable, because both single arms fall inside the
-trial's CIs. The spike had 0.98, and its single arms were outside them. The mechanism
-table shows where the gain comes from:
-- the published hut coefficients alone give 1.13;
-- the long-lasting IRS decay is the largest single step (1.33), and it is the only
-  mechanism that brings the IRS-alone arm inside the trial's CI;
-- diversion, household clustering and exposure correlation change little on their own;
-- stronger correlations lower the interaction (1.23), because they weaken both single
-  arms more than the combined arm.
+v0.3 passes 15 of 17 benchmarks. v0.2 passed 14, but its PBO numbers rested on the
+miscopied Equation 4 and are superseded; the spike passed 10 of 16.
 
-**Why it stops short of 2.43.** The engine's combined arm matches the trial: OR 0.30
-against 0.29 (prevalence 27% against 26%). The shortfall is in the single arms, which are
-weaker than the trial's: PBO alone 0.51 against 0.37, IRS alone 0.43 against 0.33. With the
-trial's single arms and the engine's combined arm, the interaction would be
-0.30 / (0.37 × 0.33), about 2.5. So the engine reproduces the trial's redundancy (the
-combination adds little), but not the size of each intervention alone at 9 months. Two
-things probably limit the single arms:
-- prevalence falls slowly because patent infections clear slowly in the human module
-  (the spike saw the same pattern);
-- at 8.8% bioassay mortality, Churcher 2016's PBO curve predicts a smaller PBO gain than
-  Muleba observed.
+**B7, B8 (nets vs none, held out): B8 is now in band; B7 is still out, narrowly.**
+- With all field mechanisms, B8 is 0.54 (target 0.55) and B7 is 0.64. B7's band floor is
+  0.68, and its highest seed reaches it (0.681).
+- Hut-like nets (no attrition, full use, no holes) give B7 0.47 and B8 0.27, far stronger
+  than the trials. That is the hut-to-field gap the owner asked us to explain.
+- Attrition is the largest single factor: alone it brings B8 to 0.49 and B7 to 0.60.
+- Holes come second: alone, 0.38 and 0.51.
+- Use below access barely changes the mean on its own. Survey-reported use is mapped back
+  to access, so the average use stays the same and only who is covered on a given night
+  changes.
+- Nothing was fitted to B7/B8.
+- The rest of B7's gap is in prevalence (B7) rather than incidence (B8). The Cochrane
+  setting's 70% use at distribution is still an assumption.
 
-No interaction factor was added, and B15 was not a fit target.
+**B15 (ITN×IRS interaction, held out): 1.44, seed range 1.29–1.61, against the trial's
+2.43 (1.19–4.97).** It is in band and assessable.
+- After the Equation 4 fix, the PBO-alone arm matches the trial: OR 0.38 against 0.37.
+  This is B9, which moves from 0.51 to 0.38.
+- IRS alone is weaker than the trial (0.44 against 0.33).
+- The combined arm is stronger than the trial (0.24 against 0.29; prevalence 24% against
+  26%).
+- With the trial's single arms and the engine's combined arm, the interaction would be
+  about 2.0. So the shortfall now has two parts: the IRS-alone arm is too weak, and the
+  combination is more effective than in the trial, so there is less redundancy than
+  observed.
+- By mechanism, the long-lasting IRS decay is still the main step (1.12 to 1.43). The
+  household correlations and diversion change little on their own, and stronger
+  correlations lower the interaction slightly (1.35).
+- No interaction factor was added, and B15 was not a fit target.
 
-**B9, B9b (PBO): now in band, held out.** The spike's structural cap is gone: no fitted
-net parameter limits PBO any more. Correcting the basis also matters, since the trial's
-0.37 is PBO alone and not pooled over IRS arms.
+**B9b (PBO at 21 months): 0.80, in band only at its edge (0.81).** The PBO advantage fades
+by 21 months in the engine, while the trial kept OR 0.40. Under resistance the published
+relationships give a short insecticide half-life, and attrition adds to it. This is the
+next PBO mismatch to examine.
 
-**B7, B8 (nets vs none): now out of band, held out.** Nets with the published hut
-coefficients at 95% susceptibility are stronger than the Cochrane pooled trials: prevalence
-RR 0.58 against 0.68–0.98, incidence RR 0.45 against 0.46–0.64. The spike met these two only
-because it fitted net killing to them, and that fitted value is what capped PBO (B9). The
-engine now follows the hut data and reports the miss. Possible reasons: the Cochrane trials'
-nets and use differ from the setting's assumed 70% use; and hut-trial efficacy may overstate
-field efficacy. Adding a field-efficacy factor for nets would be a new fitted parameter.
-That needs an owner decision, because it would bring back the B7/B8-versus-B9 trade-off.
-B18 (ITN $/DALY, 14 against 57 in the spike) moves for the same reason and stays in band.
+**B19 (IRS $/DALY): 122, in band at the edge (126).** As in v0.2, the $25 target is below
+the $64 price floor, so the target value cannot be met at the decision's IRS price.
 
-**B19 (IRS $/DALY): 115, in band, but only at the band's upper edge (126).** The target
-($25) is below the price floor ($64 per DALY even if IRS averted every DALY), so the target
-value cannot be met at the decision's IRS price. The band's basis (older, cheaper IRS
-programmes) differs from the decision's cost spec. The band is now met only because the
-reference setting uses the long-lasting product with annual rounds, which averts 56% of
-DALYs against the 51% needed. With the short-lived product it would be out of band. The
-runner now reports the price floor and the share needed for every cost benchmark, and it
-marks a band `band_mis_based` when no fitted value can reach it.
+**B16c** is unchanged at 4 of 5 rules. It sits in the human module.
 
-**B20 (dual-AI incremental $/DALY): 4.16, in band, narrowly.** Some seeds fall below the
-band's floor (seed range 3.23–5.65). **B16c** is unchanged at 4 of 5 rules: EIR 17 gives
-PfPR 0.47, against at least 0.50. This sits in the human module, not in the mechanisms
-changed here.
-
-**Fit.** The joint fit (rule `joint-v1`, 25 design points × 8 seeds) found every target
-feasible and no conflicting pairs. All five fit targets are in band at the chosen values,
-the surrogate agrees with the verification re-run to within 1% (log scale), and
-calibration did not drift between the box centre and the fitted value.
+**Fit.** The fit (rule `joint-v1`, 25 design points × 8 seeds) found every target feasible
+and no conflicting pairs. The verification re-run confirms every fit target in band. The
+surrogate agrees with the re-run to within 1.5% (log scale), and calibration did not drift.
 
 ## Assumptions still unverified
 
@@ -198,3 +197,11 @@ calibration did not drift between the box centre and the fitted value.
 - The *An. funestus* PBO row of Churcher 2016 Table 6, read as a linear form.
 - The product mix of the Cochrane IRS-added-to-ITN trials (set to the short-lived product).
 - Trial-site seasonality and past net campaigns.
+- Field use (v0.3):
+  - the exponential shape of net loss (the paper's loss curve is S-shaped);
+  - the split of the use gap between persistent and night-to-night non-use (0.5);
+  - interpolating the holes slope by bioassay mortality;
+  - growth of holed area as linear in log area, with a cap at 3 years;
+  - Cochrane setting use at distribution (0.7);
+  - using a continent-wide retention (1.64 years) in trial settings without their own data.
+    Briët 2020's cohorts kept more of their nets: 69–98% survival at 24 months.

@@ -105,6 +105,21 @@ spread, the spike's values beside the new ones, B15's single-arm effects beside 
 interaction, and the sensitivity scan. No interaction factor is added. If the mechanisms
 cannot reach 2.43, the notes say how close they get and why.
 
+## Addendum (v0.3, after PR round 1)
+
+- **Review corrections.** Churcher Equation 4 is re-transcribed from the MathML, and every
+  other equation and coefficient table is re-checked. Pass flags follow status. A
+  verification re-run that disproves the surrogate withdraws the feasibility claim.
+- **B7/B8 (owner decision).** The gap between hut-trial and field effects is modelled
+  mechanistically, not with a fitted field-efficacy factor:
+  - attrition, at the published median retention;
+  - use below access, at the published use rate, with nightly variation;
+  - holes growing with net age, from published hut coefficients and field cohorts;
+  - insecticide decay, already in the hut relationships.
+
+  Survey-reported use is mapped to access at distribution. No value is fitted to B7/B8, and
+  each mechanism is reported alone and together.
+
 ## Out of scope
 
 Faster prevalence response (detection and duration of patent infection), age-incidence
