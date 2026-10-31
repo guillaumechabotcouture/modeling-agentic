@@ -84,6 +84,11 @@ Findings (none scope-declarable):
   declared_finding_changes_decision HIGH  the test finds the decision changes: the
                                           finding must be fixed, not declared
 
+Phase 49 β: a finding that bears on the primary decision is put to the owner
+(scripts/scope_signoff.py, run first, marks it); for it only the untested
+outcome is replaced by the owner's answer. A test that shows the decision
+changes, or an unusable one, still fails here.
+
 A declaration whose test passes stands; the report must cite the test
 (`tested_declarations(run_dir)` exposes the data for that check). A stall
 diagnosis with `decision: declare` (scripts/stall_rule.py) needs the same test
@@ -339,8 +344,11 @@ def gate_findings(run_dir: str, round_n: Optional[int] = None, current: Optional
             continue
         seen.add(ident)
         cover = covering(entries, v)
+        # Phase 49 β: a finding the owner decides (scripts/scope_signoff.py marks it) needs no
+        # decision test of its own to be declared: the owner sees the test, or that there is none.
+        owner = bool(v.get("owner_signoff") or v.get("owner_signed") or v.get("owner_declined"))
         if not cover:
-            if post_write:
+            if post_write and not owner:
                 out.append(_finding(UNTESTED, v, (
                     f"`{ident}` is open at the post-WRITE gate and no scope_declaration.yaml entry covers it. A run "
                     f"may end with it only as a declared limitation whose decision test shows the decision does not "
@@ -365,7 +373,7 @@ def gate_findings(run_dir: str, round_n: Optional[int] = None, current: Optional
                 f"`{ident}` is declared in {eid(e)}, and its decision test or exemption is not usable: {why}. "
                 "It does not count until fixed. " + _HOWTO),
                 {"finding": ident, "entry": eid(e), "status": "invalid", "problem": why}))
-        elif not any(s[1] in ("tested", "exempt") for s in statuses):
+        elif not owner and not any(s[1] in ("tested", "exempt") for s in statuses):
             out.append(_finding(UNTESTED, v, (
                 f"`{ident}` (HIGH) is declared in {', '.join(eid(s[0]) for s in statuses)} with no decision test. "
                 "A declared HIGH finding needs evidence that the decision does not depend on it. " + _HOWTO
@@ -400,7 +408,7 @@ def declaration_counts(run_dir: str, v: dict, current: Optional[list] = None) ->
             return True
     except ValueError:
         return False
-    if v.get("owner_signed"):
+    if v.get("owner_signed") or v.get("owner_signoff"):   # Phase 49 β: the owner decides it
         return True
     _doc, entries, problems = sd.load(run_dir)
     if problems:
@@ -541,6 +549,11 @@ def _self_test() -> int:
         sdecl["declarations"] = [{"id": "SD-9", "blocker_id": "B19", "why_unresolved": "x", "owner_amendment": "AM-2"}]
         w(d, "scope_declaration.yaml", sdecl)
         ok(kinds(gate_findings(d, 8, [b19])) == [INVALID], "DT18 an unknown amendment fails closed")
+        sdecl["declarations"] = [{"id": "SD-9", "blocker_id": "B19", "why_unresolved": "x"}]
+        w(d, "scope_declaration.yaml", sdecl)
+        ok(gate_findings(d, 8, [dict(b19, owner_signoff=True)], post_write=True) == []
+           and gate_findings(d, 8, [dict(b19, key="B20", owner_signoff=True)], post_write=True) == [],
+           "DT18b a finding put to the owner is not 'untested' here (declared or not)")
         # Out of scope: critic-derived, exempt classes, non-declarable, MEDIUM, accept blockers.
         sdecl["declarations"] = [{"id": "SD-1", "blockers": ["D-014_persistent", "done_when_unmet",
                                   "claims_ledger_missing", "coherence_audit_label_coherence", "figure_staleness_detected",

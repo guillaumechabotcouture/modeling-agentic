@@ -86,6 +86,9 @@ SCRIPT_OUTPUTS = (
     "open_problems.json.tmp",
     "open_problems.md.tmp",
     "decision_brief.signoff.json",   # Phase 33 α: scripts/decision_brief.py sign
+    "scope_signoff.json",            # Phase 49 β: scripts/scope_signoff.py sign
+    "scope_signoff_request.json",    # Phase 49 β: written by the gate
+    "scope_signoff_request.json.tmp",
     "decision_brief.signed/*",       # the signed copies, for restoring a changed file
     "acceptance_lock.json",          # Phase 33 α: written by the gate
     "done_when_registry.json",       # Phase 34: frozen finding tests, written by the gate

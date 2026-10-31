@@ -97,9 +97,14 @@ the live attachment picture.
 | Exit | Statuses |
 |------|----------|
 | 0    | `completed`, `completed_with_report_restored` |
-| 2    | `completed_scope_declared`, `completed_gate_not_accepted`, `completed_gate_error`, `completed_gate_not_run`, `completed_no_report`, `run_failed`, `budget_exhausted` |
+| 2    | `completed_scope_declared`, `completed_gate_not_accepted`, `completed_gate_error`, `completed_gate_not_run`, `completed_no_report`, `run_failed`, `budget_exhausted`, `awaiting_signoff`, `awaiting_scope_signoff`, `completed_scope_declined` |
 | 1    | `harness_tampered`, `artifact_tampered`, errors |
 | 130  | `interrupted` |
+
+`awaiting_signoff` (the decision brief) and `awaiting_scope_signoff` (Phase 49
+β: declarations of findings that bear on the primary decision) are resumable
+with `--resume` once signed; `completed_scope_declined` means the owner
+declined such a declaration and no rounds were left to fix it.
 
 Cloud credentials (`AZ_*` / `AZURE_*`) are stripped from the agent
 environment unless `main.py --cloud` is passed.
@@ -174,7 +179,7 @@ for f in main.py \
   scripts/lib/rigor_artifacts.py scripts/lib/safe_io.py \
   toolkit/alloc/costs.py toolkit/alloc/packages.py toolkit/alloc/optimize.py \
   scripts/lib/text_spans.py scripts/lib/transcript_cost.py \
-  scripts/declaration_tests.py scripts/lib/scope_declarations.py; do
+  scripts/declaration_tests.py scripts/lib/scope_declarations.py scripts/scope_signoff.py; do
   echo "== $f"; python3 "$f" --self-test || echo "FAILED: $f"
 done
 python3 scripts/validate_skill_attachments.py      # frontmatter + phantoms

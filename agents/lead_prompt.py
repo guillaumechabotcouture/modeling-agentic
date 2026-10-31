@@ -395,7 +395,7 @@ The validator will:
   `OBJ-NNN` blockers to `unresolved_high` with `reviewer:
   spec-compliance`.
 - Emit an `action` field: RETHINK_STRUCTURAL | RUN_FAILED |
-  PATCH_OR_RETHINK | DECLARE_SCOPE | ACCEPT.
+  PATCH_OR_RETHINK | DECLARE_SCOPE | AWAIT_OWNER | ACCEPT.
 
 Exit 0 means ACCEPT. Exit 1 means any non-ACCEPT action. Exit 3 means
 schema error — stop and fix before proceeding.
@@ -597,6 +597,15 @@ The validator has already decided for you. Your job is to carry it out:
   `decision_tests`); have the modeler write the test before you declare.
   An untested declaration does not count, and one whose test shows the
   decision changes cannot be declared.
+
+- **AWAIT_OWNER** (Phase 49 β): the run would DECLARE_SCOPE, but a
+  declared finding bears on the primary decision (the gate lists them;
+  map in `.claude/orchestration/scope_declaration_policy.yaml`). Only the
+  owner may accept it. Do not spawn the writer. In owner mode end your
+  turn with AWAITING_SIGNOFF; you are resumed with the answers. In lead
+  mode review `scripts/scope_signoff.py show` and sign with `--by lead`.
+  Then re-run the gate: an accepted declaration stands (state the
+  owner's acceptance in Limitations); a declined one must be fixed.
 
 - **ACCEPT**: no unresolved HIGH blockers, no structural mismatch.
   Proceed to STAGE 8.

@@ -99,7 +99,10 @@ SCRIPT_PRODUCES: dict[str, tuple[str, ...]] = {
                                   # list, acceptance lock and finding-test registry.
                                   "open_problems.json", "open_problems.md", "open_problems.json.tmp",
                                   "open_problems.md.tmp", "acceptance_lock.json",
-                                  "done_when_registry.json", "done_when_registry.json.tmp"),
+                                  "done_when_registry.json", "done_when_registry.json.tmp",
+                                  # Phase 49 β: the owner's sign-off request.
+                                  "scope_signoff_request.json", "scope_signoff_request.json.tmp"),
+    "scope_signoff.py": ("scope_signoff.json",),   # Phase 49 β: the lead signs in --signoff lead runs
     "decision_brief.py": ("decision_brief.signoff.json", "decision_brief.yaml", "success_criteria.yaml",
                           "decision_brief.signed/decision_brief.yaml", "decision_brief.signed/success_criteria.yaml"),
     "cross_model_critic.py": ("critique_crossmodel.yaml", "critique_crossmodel.yaml.tmp",

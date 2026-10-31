@@ -38,3 +38,56 @@ decision_test:
   # A stale figure is redrawn, not tested; a malformed decision_rule.md is a
   # document defect.
   exempt_kinds: [figure_staleness_detected, decision_rule_malformed]
+
+# Phase 49 β (A21): findings that bear on the primary decision go to the owner.
+#
+# Read by scripts/scope_signoff.py. The signed decision brief names the
+# decision and its unit (decision_brief.yaml `decision`, answers' `resolution`).
+# A HIGH gate finding of a kind below, when its condition holds, bears on that
+# decision: the lead cannot declare it by itself. A DECLARE_SCOPE that relies
+# on declaring it becomes AWAIT_OWNER: the owner sees each such finding with
+# its declaration and decision test (Phase 49 α) and accepts or declines it
+# (`scripts/scope_signoff.py sign`). A `<kind>_persistent` escalation follows
+# its base kind.
+#
+# Conditions (generic; no disease, country or intervention names):
+#   allocation              the run produces a per-unit allocation (an
+#                           allocation CSV or decision_rule.md): the decision
+#                           is which package each allocation unit receives.
+#   benchmark_intervention  the benchmark (models/benchmark_targets.yaml, by the
+#                           finding's key) names an intervention the decision
+#                           chooses among, in or excluded from the recommended
+#                           plan: a token of its `intervention` field, else its
+#                           `metric`, matches a package component
+#                           (models/effect_concordance.yaml `packages`,
+#                           `effects[].component`) or an intervention name
+#                           (models/eligibility_manifest.yaml); `intervention:
+#                           none` marks a calibration target. When the run
+#                           lists no interventions, or the benchmark cannot be
+#                           read, the finding is treated as bearing (fail closed).
+#   always                  the kind is about an intervention effect the plan uses.
+decision_bearing:
+  kinds:
+    allocation_unstable:
+      when: allocation
+      reason: "the allocation does not hold out of sample, and the decision is the package per allocation unit"
+    sensitivity_analysis_unstable:
+      when: allocation
+      reason: "plausible parameter changes flip the recommended packages"
+    optimization_quality_gap_too_large:
+      when: allocation
+      reason: "the optimizer's allocation is far from the best one found by another method"
+    within_zone_heterogeneity_unbounded:
+      when: allocation
+      reason: "variation inside allocation units may reverse the package choice"
+    benchmark_drift:
+      when: benchmark_intervention
+      reason: "the model's value for an intervention the decision chooses among is outside its benchmark band"
+    effect_exceeds_trial_evidence:
+      when: always
+      reason: "an intervention effect used by the plan exceeds the trial evidence"
+  # Words in benchmark metrics and intervention names that do not identify an
+  # intervention (comparisons, outcomes, units). Quote YAML 1.1 booleans ("on").
+  generic_tokens: [vs, or, rr, hr, irr, and, the, of, per, to, in, "on", with, without, added, none,
+                   usd, daly, dalys, cost, costs, effect, prevalence, incidence, rate, ratio, plan,
+                   status, quo, national, any, all, new, old, standard, std, base, baseline]

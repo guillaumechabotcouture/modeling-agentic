@@ -411,6 +411,9 @@ artifacts:
       effect_at_target, difference_stated}`, the same effect re-computed
       under the target setting's covariates (`scripts/benchmark_transfer.py`,
       MEDIUM if absent).
+      Phase 49 β: give each target an `intervention:` field naming the package
+      component it concerns (or `none` for a calibration target); a drift on a
+      benchmark of an intervention the decision chooses among goes to the owner.
 
   # ---- Phase 21 β additions -------------------------------------------------
 
@@ -591,3 +594,26 @@ artifacts:
       question|brief` + verbatim `quote:`, `owner_amendment: AM-n` naming the
       finding, or a class in `scope_declaration_policy.yaml` (no quantity to
       vary). None are declarable.
+
+  # ---- Phase 49 β -------------------------------------------------------------
+
+  - id: scope_signoff
+    path: scope_signoff.json
+    first_draft_round: 1
+    finalize_round: 8
+    stage: write
+    skill: model-fitness
+    triggered_by: always
+    scope_declarable: false
+    required_for_accept: never   # gate- and owner-written; see scripts/scope_signoff.py
+    description: |
+      **When the gate's decision is AWAIT_OWNER** (Phase 49 β, A21). A HIGH
+      finding that bears on the primary decision (map:
+      `scope_declaration_policy.yaml` `decision_bearing:`) cannot be declared
+      by the lead alone. The gate writes `scope_signoff_request.json`; the
+      owner (or, under `--signoff lead`, the lead with `--by lead`) answers
+      each finding with `scripts/scope_signoff.py sign` (accept | decline).
+      The owner reads each declaration's decision test (entry
+      `decision_tests`), or that it has none. Accepted: declarable. Declined:
+      HIGH `scope_declaration_declined`, fix it. A changed declaration or test
+      is asked again. Agents never write these files.

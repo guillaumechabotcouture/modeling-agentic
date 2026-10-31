@@ -190,6 +190,8 @@ _NON_DECLARABLE_KINDS = frozenset({
     "scope_declaration_untested",
     "scope_declaration_test_invalid",
     "declared_finding_changes_decision",
+    # Phase 49 β: the owner declined the declaration.
+    "scope_declaration_declined",
 })
 _NON_DECLARABLE_SUFFIXES = ("_invalid", "_unknown_verdict",
                             "_not_script_produced", "_stale")
@@ -597,6 +599,19 @@ def _recompute_action(d: dict, max_rounds: int, current_round: int,
         rationale = ("No unresolved HIGH blockers, no missing required "
                      "artifacts, no structural mismatch.")
         rule_matched = 4
+
+    owner = [b for b in outstanding if b.get("owner_signoff")]
+    if action == "DECLARE_SCOPE" and owner:
+        # Phase 49 β (A21): these bear on the primary decision; only the owner may accept them
+        # as declared limitations (scripts/scope_signoff.py).
+        action = "AWAIT_OWNER"
+        rationale = (
+            f"Rule {rule_matched} would DECLARE_SCOPE, but {len(owner)} of the declared finding(s) bear on the "
+            f"primary decision ({', '.join(str((b.get('owner_item') or {}).get('finding') or b.get('kind')) for b in owner)[:300]}). "
+            f"The owner decides: the gate wrote scope_signoff_request.json. Do not spawn the writer. Owner mode: end "
+            f"your turn with the line AWAITING_SIGNOFF; the harness resumes you with the answers. Lead mode: review "
+            f"`python3 scripts/scope_signoff.py show {{run_dir}}`, then sign with `--by lead`.")
+        rule_matched = f"{rule_matched}o"
 
     d["rounds_remaining"] = rounds_remaining
     d["action"] = action
@@ -1452,6 +1467,12 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None,
         violations += G(_check_persistent_medium_escalation, run_dir,
                         round_n=round_n,
                         current_kinds={v.get("kind") for v in violations})
+    # Phase 49 β (A21): findings that bear on the primary decision are marked for the
+    # owner's sign-off (in place); declined declarations are HIGH. Runs first, so the
+    # decision-test check leaves those findings to the owner.
+    violations += G(lambda rd: _load_sibling("scope_signoff").gate_findings(
+                        rd, round_n, violations, non_declarable=is_non_declarable),
+                    run_dir, check_name="scope_signoff")
     # Phase 49 α (A20): the decision-test check runs in main() over every gate finding
     # (spec-compliance, rigor, registry) once assembled: _apply_declaration_tests.
     # Phase 47 ε (A17): a finding at N gates in a row needs a diagnosis or a declaration.
@@ -4330,6 +4351,8 @@ def _incorporate_rigor_violations(decision: dict, violations: list[dict],
             "kind": v["kind"],
             "scope_declarable": not is_non_declarable(
                 v["kind"], v.get("scope_declarable")),
+            # Phase 49 β: a finding the owner must sign off before it is declared.
+            **({"owner_signoff": True, "owner_item": v.get("owner_item")} if v.get("owner_signoff") else {}),
         })
     _append_synthetic_blockers(d, "rigor-artifacts", "RIG", entries)
 
@@ -4619,6 +4642,14 @@ def _run_self_test() -> int:
         ok(dec["action"] == "PATCH_OR_RETHINK"
            and any(b.get("kind") == "scope_declaration_untested" for b in dec["unresolved_high"]),
            f"DT-V3 the untested registry declaration blocks rule 3a: {dec['action']}")
+    # Phase 49 β: a DECLARE_SCOPE that relies on a decision-bearing finding waits for the owner.
+    bdo = dict(bd, owner_signoff=True, owner_item={"finding": "benchmark_drift:B15"})
+    ok(act([bdo, sa], both, both)["action"] == "AWAIT_OWNER" and act([bdo, sa], both, both)["rule_matched"] == "3ao"
+       and act([bdo, sa], both, both, cur=8)["action"] == "AWAIT_OWNER",
+       "SO-V1 rule 3a / rule 3 with an owner-marked finding -> AWAIT_OWNER")
+    ok(act([bdo, sa, ut], both, both)["action"] == "PATCH_OR_RETHINK"
+       and act([bdo, sa, ut], both, both, cur=8)["action"] == "RUN_FAILED",
+       "SO-V2 the owner is asked only when the run would otherwise declare scope")
     with tempfile.TemporaryDirectory() as d:
         yaml.safe_dump({"declarations": [{"id": "SD-7", "blocker_id": "allocation_unstable", "why_unresolved": "x"}]},
                        open(os.path.join(d, "scope_declaration.yaml"), "w"))
@@ -7774,6 +7805,9 @@ def main() -> int:
     if not args.no_history:
         _append_validator_history(args.run_dir, args.current_round, decision,
                                   args.post_write)
+        # Phase 49 β: the owner's sign-off request (or its supersession). Unguarded: a
+        # request that cannot be written must not let the run go on (VALIDATOR_ERROR).
+        _load_sibling("scope_signoff").record(args.run_dir, decision, args.current_round)
     open_note = None
     if not args.no_history and not args.post_write:
         open_note = _write_open_problems(args.run_dir, args.current_round,

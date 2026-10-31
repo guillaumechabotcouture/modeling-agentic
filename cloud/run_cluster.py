@@ -4,7 +4,7 @@
     python cloud/run_cluster.py <config.py> status            # running / done per run, cluster and keeper state
     python cloud/run_cluster.py <config.py> collect           # fetch finished runs (from storage once stopped)
     python cloud/run_cluster.py <config.py> brief|report      # decision brief / convergence measures of a live run
-    python cloud/run_cluster.py <config.py> sign <answers.yaml> [note]
+    python cloud/run_cluster.py <config.py> sign <answers.yaml> [note]   # the brief, or pending scope declarations
     python cloud/run_cluster.py <config.py> relaunch <label>
     python cloud/run_cluster.py <config.py> shutdown          # cluster, overflow pool and keeper, by hand
     python cloud/run_cluster.py <config.py> report-cost [--ledger PATH]... [--start ISO] [--end ISO]

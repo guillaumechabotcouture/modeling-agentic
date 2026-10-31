@@ -261,6 +261,45 @@ async def wait_for_signoff(run_path: str, run_dir_rel: str, hours: float, poll_s
     return decision_brief.status(run_path) == "signed"
 
 
+SCOPE_SIGNOFF_PROMPT = (
+    "CONTINUE. The owner answered the scope declarations that bear on the primary decision.\n{text}\n"
+    "Do not end your turn until the pipeline reaches a terminal state.")
+
+
+async def wait_for_scope_signoff(run_path: str, run_dir_rel: str, hours: float, poll_s: float = 30.0,
+                                 integrity=None) -> bool:
+    """Phase 49 β: the gate's AWAIT_OWNER. The run waits for the owner to accept or
+    decline each declaration of a finding that bears on the primary decision.
+    True once answered; False when the wait times out (status
+    awaiting_scope_signoff, resumable with --resume after signing)."""
+    import scope_signoff
+    md = os.path.join(run_path, scope_signoff.MD)
+    try:
+        open(md, "w").write(scope_signoff.render_md(run_path))
+    except OSError:
+        pass
+    print(f"\n{'='*60}\nWAITING FOR THE OWNER: SCOPE DECLARATIONS THAT BEAR ON THE DECISION\n"
+          f"  Read:  {run_dir_rel}/{scope_signoff.MD}\n"
+          f"  Sign:  python3 scripts/scope_signoff.py sign {run_dir_rel} --answers <answers.yaml> "
+          f"[--note \"...\"]   (or --accept-all / --decline-all)\n"
+          f"  Waiting up to {hours:g} h.\n{'='*60}", flush=True)
+    with open(os.path.join(run_path, "trace.jsonl"), "a") as tf:
+        tf.write(json.dumps({"ts": datetime.now().isoformat(), "type": "awaiting_signoff",
+                             "what": "scope_declarations"}) + "\n")
+    deadline = time.time() + hours * 3600
+    while time.time() < deadline:
+        if scope_signoff.status(run_path) == "answered":
+            if integrity is not None:   # the owner signed outside any tool call
+                integrity.harness_wrote(scope_signoff.SIGNOFF)
+            with open(os.path.join(run_path, "trace.jsonl"), "a") as tf:
+                tf.write(json.dumps({"ts": datetime.now().isoformat(), "type": "signed_off",
+                                     "what": "scope_declarations"}) + "\n")
+            print("Scope declarations answered; resuming the lead.", flush=True)
+            return True
+        await asyncio.sleep(poll_s)
+    return scope_signoff.status(run_path) == "answered"
+
+
 def write_harness_baseline(run_path: str) -> tuple[dict, dict | None]:
     """Hash the harness into <run>/harness_manifest.json. On resume, also
     return the diff against the previous invocation's baseline (operator
@@ -338,6 +377,9 @@ async def run(question: str, max_rounds: int, max_sessions: int,
     import decision_brief
     if resume_context and decision_brief.is_signed(run_path):
         lead_prompt += "\n" + decision_brief.signoff_text(run_path) + "\n"
+    import scope_signoff
+    if resume_context and scope_signoff.status(run_path) == "answered":   # Phase 49 β
+        lead_prompt += "\n" + scope_signoff.answer_text(run_path) + "\n"
 
     harness_before, harness_prior_diff = write_harness_baseline(run_path)
     import atexit
@@ -506,6 +548,15 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                         break
                     signoff_waits += 1
                     lead_prompt = SIGNOFF_PROMPT.format(text=decision_brief.signoff_text(run_path))
+                    continue
+                if signoff == "owner" and scope_signoff.status(run_path) == "awaiting":
+                    # Phase 49 β: the gate's AWAIT_OWNER; the lead stopped for the owner.
+                    if not await wait_for_scope_signoff(run_path, run_dir_rel, signoff_hours, integrity=integrity):
+                        print("Scope sign-off wait timed out; resume with --resume after signing.", flush=True)
+                        session_outcome, paused = "awaiting_scope_signoff", True
+                        break
+                    signoff_waits += 1
+                    lead_prompt = SCOPE_SIGNOFF_PROMPT.format(text=scope_signoff.answer_text(run_path))
                     continue
                 where = pipeline_unfinished(run_path)
                 if where and session_num - signoff_waits < max_sessions:
@@ -1055,6 +1106,35 @@ def _run_self_test() -> int:
            and not _ihp(_RR) and _ihp(os.path.join(_RR, "docs")),
            "SO10 once signed the brief and criteria are frozen for every agent; docs/ (parent of docs/lessons) is harness")
         ok(exit_code_for("awaiting_signoff") == 2, "SO9 a paused run exits 2 (resumable)")
+        # SS1-SS6 (Phase 49 β): decision-bearing declarations wait for the owner.
+        import scope_signoff as _ss
+        from agents import scope_hold_reason
+        _db.restore(td)   # SO8 left the criteria edited: put the signed copy back
+        ok(scope_hold_reason(td, "owner") is None, "SS1 no request: the writer is not held")
+        _item = {"finding": "allocation_unstable:allocation_robustness", "fingerprint": "f1", "reason": "r",
+                 "declarations": [], "claim": "UNSTABLE"}
+        _ss.record(td, {"action": "AWAIT_OWNER", "unresolved_high": [{"owner_signoff": True, "owner_item": _item}]}, 7)
+        ok("AWAITING_SIGNOFF" in (scope_hold_reason(td, "owner") or "")
+           and "--by lead" in (scope_hold_reason(td, "lead") or "") and scope_hold_reason(td, None) is None
+           and "AWAITING_SIGNOFF" in call5("Agent", {"subagent_type": "writer", "prompt": "x"})
+           and "agents cannot sign" in call5("Bash", {"command": f"python3 scripts/scope_signoff.py sign {td} --accept-all"}),
+           "SS2 a pending request holds the writer; in owner mode no agent signs")
+        ok(asyncio.run(wait_for_scope_signoff(td, "runs/x", hours=0.00001, poll_s=0.01)) is False
+           and os.path.exists(os.path.join(td, _ss.MD)), "SS3 an unanswered wait times out; the owner's page is written")
+        _ss.sign(td, "owner", all_decision="accept")
+        ok(asyncio.run(wait_for_scope_signoff(td, "runs/x", hours=1, poll_s=0.01)) is True
+           and scope_hold_reason(td, "owner") is None and "accept by owner" in _ss.answer_text(td),
+           "SS4 answered: the wait ends, the writer is released, the lead is told")
+        ok(determine_status("session_completed", {"action": "AWAIT_OWNER"}, True, False, None) == "awaiting_scope_signoff"
+           and determine_status("session_completed", {"action": "RUN_FAILED", "owner_declined": True}, True, False, None)
+           == "completed_scope_declined"
+           and determine_status("session_completed", {"action": "RUN_FAILED"}, True, False, None) == "run_failed",
+           "SS5 final AWAIT_OWNER and an owner decline have their own statuses")
+        ok(exit_code_for("awaiting_scope_signoff") == 2 and exit_code_for("completed_scope_declined") == 2,
+           "SS6 both exit 2")
+        for f in (_ss.REQUEST, _ss.SIGNOFF, _ss.MD):
+            if os.path.exists(os.path.join(td, f)):
+                os.remove(os.path.join(td, f))
         for f in ("success_criteria.yaml", "decision_brief.yaml", "decision_brief.signoff.json", "decision_brief.md"):
             if os.path.exists(os.path.join(td, f)):
                 os.remove(os.path.join(td, f))
