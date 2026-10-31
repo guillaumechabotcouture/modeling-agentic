@@ -339,6 +339,33 @@ def run_pack(pack: dict, engine, runner: Runner, fitted: dict) -> dict:
                         "held_out_total": sum(r["role"] == "held_out" for r in rows)}}
 
 
+PRODUCER = "toolkit/engines/benchmark.py"
+
+
+def stamp(out: dict, engine) -> dict:
+    """Provenance on a results or fitted file: who wrote it, for which engine and code (Codex P1-13)."""
+    from toolkit.engines.contract import engine_identity
+    return {"producer": PRODUCER, "engine_identity": engine_identity(engine), **out}
+
+
+def verified_benchmarks(engine) -> tuple[list, str | None]:
+    """(benchmark rows, None) when the engine's results file was written by this runner for this engine's current
+    code; else ([], why). Decision tests read benchmark arm ratios only from here."""
+    from toolkit.engines.contract import engine_identity
+    path = getattr(engine, "results_path", None)
+    if not path or not os.path.exists(path):
+        return [], "the engine has no benchmark results file"
+    try:
+        doc = yaml.safe_load(open(path)) or {}
+    except (OSError, yaml.YAMLError) as e:
+        return [], f"benchmark results unreadable: {e}"
+    if doc.get("producer") != PRODUCER:
+        return [], f"{os.path.basename(path)} was not written by {PRODUCER} (no provenance): re-run the pack"
+    if doc.get("engine_identity") != engine_identity(engine):
+        return [], f"{os.path.basename(path)} was computed for another engine identity or code: re-run the pack"
+    return list(doc.get("benchmarks") or []), None
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("pack")
@@ -363,8 +390,8 @@ def main(argv=None) -> int:
     if a.action == "fit":
         out = fit(pack, eng, runner)
         path = a.out or os.path.join(d, "fitted.yaml")
-        yaml.safe_dump({"engine": pack["engine"], "fitted_at": time.strftime("%F %T"), "seeds": seeds,
-                        "n_sims": runner.nsims, "wall_s": round(time.time() - t0, 1), "parameters": out},
+        yaml.safe_dump(stamp({"engine": pack["engine"], "fitted_at": time.strftime("%F %T"), "seeds": seeds,
+                              "n_sims": runner.nsims, "wall_s": round(time.time() - t0, 1), "parameters": out}, eng),
                        open(path, "w"), sort_keys=False)
     else:
         f = yaml.safe_load(open(os.path.join(d, "fitted.yaml"))) if os.path.exists(os.path.join(d, "fitted.yaml")) else {}
@@ -372,7 +399,7 @@ def main(argv=None) -> int:
         out = run_pack(pack, eng, runner, fitted)
         out["wall_s"] = round(time.time() - t0, 1)
         path = a.out or os.path.join(d, "results.yaml")
-        yaml.safe_dump(out, open(path, "w"), sort_keys=False)
+        yaml.safe_dump(stamp(out, eng), open(path, "w"), sort_keys=False)
     print(f"wrote {path} ({runner.nsims} sims, {time.time() - t0:.0f}s)")
     return 0
 
@@ -425,6 +452,19 @@ def _self_test() -> int:
     ok(abs(rows["T3"]["computed"] - 3 / (1.5 * f["eff_a"]["value"])) < 1e-3, f"BP7 cost per outcome = cost difference / outcome averted ({rows['T3']['computed']})")
     ok(abs(res["settings_calibrated"]["c"]["value"] - 0.758) < 0.08, "BP8 a setting is calibrated to its baseline target")
     ok(rows["T4"]["rules_checked"] >= 1, "BP9 curve rules are checked")
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        eng.results_path = os.path.join(d, "results.yaml")
+        yaml.safe_dump(res, open(eng.results_path, "w"))
+        ok(verified_benchmarks(eng)[1] and "provenance" in verified_benchmarks(eng)[1],
+           "BP10 results without provenance are not verified (Codex P1-13)")
+        yaml.safe_dump(stamp(res, eng), open(eng.results_path, "w"))
+        rows2, why = verified_benchmarks(eng)
+        ok(why is None and len(rows2) == len(res["benchmarks"]), f"BP11 stamped results for this engine verify: {why}")
+        doc = yaml.safe_load(open(eng.results_path))
+        doc["engine_identity"]["code_sha256"] = "0" * 64
+        yaml.safe_dump(doc, open(eng.results_path, "w"))
+        ok("another engine" in (verified_benchmarks(eng)[1] or ""), "BP12 results for other engine code are refused")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

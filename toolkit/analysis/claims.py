@@ -4,7 +4,7 @@ The harness writes `models/claims_spec.yaml` (each claim names its source artifa
 field, never a value), builds `models/claims_ledger.yaml` with scripts/build_claims_ledger.py
 (values resolved from the artifacts by scripts/lib/provenance.py), and renders `results.md`
 from a harness template with scripts/render_claims.py. Interval claims carry
-`interval_label`, the spec's statement of what the interval covers (spike lesson 6).
+`interval: {level, covers, excludes}` from the spec, from which render_claims derives the label (lesson 6).
 The writer's narrative cites the same claim ids.
 """
 from __future__ import annotations
@@ -35,7 +35,7 @@ def claim_spec(A, arts: dict, point: dict, uq: dict, stab: dict, dts: list, cal:
     o = A.primary
     cl = [_c("headline.point", "scalar", arts["point"], f"data.averted.{o}", o),
           _c("headline.median", "scalar", arts["uncertainty"], f"data.fixed_plan.{o}.median", o,
-             interval_label=uq["label"]),
+             interval=uq["interval"]),
           _c("cost.allocated", "currency", arts["point"], "data.cost_allocated", "USD"),
           _c("cost.allocatable", "currency", arts["point"], "data.budget_allocatable", "USD"),
           _c("units.total", "count", arts["point"], "data.n_units", "units"),
@@ -45,7 +45,7 @@ def claim_spec(A, arts: dict, point: dict, uq: dict, stab: dict, dts: list, cal:
     for oc in A.outcomes[1:]:
         cl.append(_c(f"averted.{oc}.point", "scalar", arts["point"], f"data.averted.{oc}", oc))
         cl.append(_c(f"averted.{oc}.median", "scalar", arts["uncertainty"], f"data.fixed_plan.{oc}.median", oc,
-                     interval_label=uq["label"]))
+                     interval=uq["interval"]))
     for c in A.spec["options"]["components"]:
         cl.append(_c(f"mix.{c}", "count", arts["point"], f"data.mix.{c}", "units"))
     if stab.get("folds"):
@@ -59,7 +59,11 @@ def claim_spec(A, arts: dict, point: dict, uq: dict, stab: dict, dts: list, cal:
             cl.append(_c("stability.rank_worst", "scalar", arts["stability"], "data.metrics.rank_correlation_worst_fold"))
     for j, d in enumerate(dts):
         cl.append(_c(f"dt.{d['test_id']}.verdict", "label", arts["decision_tests"], f"data.tests[{j}].verdict"))
-        cl.append(_c(f"dt.{d['test_id']}.share", "percentage", arts["decision_tests"], f"data.tests[{j}].share_pct", "%"))
+        cl.append(_c(f"dt.{d['test_id']}.threshold", "percentage", arts["decision_tests"],
+                     f"data.tests[{j}].threshold_pct", "%"))
+        if d.get("status") != "not_run":
+            cl.append(_c(f"dt.{d['test_id']}.share", "percentage", arts["decision_tests"],
+                         f"data.tests[{j}].share_pct", "%"))
     if cal.get("method") == "emulator_inversion":
         cl.append(_c("calibration.clamped", "count", arts["calibration"], "data.diagnostics.clamped_units", "units"))
     elif cal.get("method") == "likelihood":
@@ -170,8 +174,12 @@ def results_template(A, point, uq, stab, sens, dts, cal, emu_acc) -> str:
                  f"{_fmt(r['swing_pct_of_point'])} | "
                  f"{max(r['low']['share_units_changed'], r['high']['share_units_changed']):.0%} |")
     L += ["", "## Decision tests", ""]
-    for d in dts:
+    for d in dts:   # words from code, numbers from claims (Codex P1-4)
+        if d.get("status") == "not_run":
+            L += [f"**{d['test_id']}** ({d['question']}) {d['statement']} Verdict: [CLAIM:dt.{d['test_id']}.verdict]. "
+                  "No result file was written.", ""]
+            continue
         L += [f"**{d['test_id']}** ({d['question']}) {d['statement']} Verdict: [CLAIM:dt.{d['test_id']}.verdict]; "
-              f"largest share of units changing package [CLAIM:dt.{d['test_id']}.share] (criterion: {d['criterion']}). "
-              f"Result file: `{d['path']}`.", ""]
+              f"largest share of units changing package [CLAIM:dt.{d['test_id']}.share] (the plan changes when more "
+              f"than [CLAIM:dt.{d['test_id']}.threshold] of units change package). Result file: `{d['path']}`.", ""]
     return "\n".join(L) + "\n"

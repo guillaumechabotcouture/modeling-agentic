@@ -199,6 +199,7 @@ def fit_likelihood(spec, model, rows=None, fixed_z=None, start=None, identifiabi
                         "n_targets": len(y), "n_parameters": len(names), "dispersion": phi,
                         "pearson_chi2": pearson, "df": df, "at_bound": at_bound,
                         "pearson_residual_max": float(np.max(np.abs(resid))),
+                        "unsupported_targets": int(np.sum((y > 0) & (mu < 1e-12))),
                         "fit": [{"unit": r["unit"], "t0": r["t0"], "package": r["package"], "observed": r["observed"],
                                  "expected": float(m)} for r, m in zip(L.rows, mu)]},
         "identifiability": {"method": "scripts/identifiability.py (Fisher information, ridges, profile likelihood) "

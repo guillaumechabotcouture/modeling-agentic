@@ -46,6 +46,22 @@ def _gp(X, y, kernel=None):
     return gp
 
 
+def _driver(res, name, where):
+    """A mapped cost driver: present and finite, or the analysis fails closed (Codex P1-7)."""
+    v = (res.get("cost_drivers") or {}).get(name)
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+        raise ValueError(f"{where}: cost driver {name!r} is missing or not finite ({v!r}); every cost driver the spec "
+                         "maps (analysis.cost_outputs) must be an engine output")
+    return float(v)
+
+
+def _metric(res, window, metric, where):
+    v = ((res.get("windows") or {}).get(window) or {}).get(metric)
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+        raise ValueError(f"{where}: window metric {window}.{metric} is missing or not finite ({v!r})")
+    return float(v)
+
+
 def _group(res, o, pm):
     sh = res["meta"]["age_shares"]
     gs = pm["age_groups"]
@@ -76,14 +92,27 @@ class EmulatorModel:
         self.lo = None
         X = np.asarray([self._x(p["z"], p["theta"], self.by_id[str(p["unit_id"])]) for p in pts], float)
         self.lo, self.hi = X.min(0), X.max(0)
+        # Codex P1-6: the design domain. The calibrated attribute and the fitted parameters span their declared
+        # design box (calibration.range, engine-card ranges); unit features span what the design points contain.
+        self.input_names = ["z"] + list(self.fitted_names) + list(self.features)
+        fr = {q.name: (q.lo, q.hi) for q in spec.engine().parameters() if q.kind == "fitted"}
+        zr = spec["calibration"]["range"]
+        self.dom_lo = np.array([min(zr[0], self.lo[0])] + [min(fr[nm][0], self.lo[1 + j]) for j, nm in
+                                                          enumerate(self.fitted_names)] + list(self.lo[1 + len(self.fitted_names):]))
+        self.dom_hi = np.array([max(zr[1], self.hi[0])] + [max(fr[nm][1], self.hi[1 + j]) for j, nm in
+                                                          enumerate(self.fitted_names)] + list(self.hi[1 + len(self.fitted_names):]))
+        self.last_events = []
         self.hold = np.array([bool(p["holdout"]) for p in pts])
         self.X = self._scale(X)
         self.T = {}
         get = lambda i, k: results[f"{pts[i]['point']}|{k}"]  # noqa: E731
         n = len(pts)
+        self.train_corrections = {}   # Codex P1-6: every floor applied to the training targets, counted
         for P, pm in self.pops.items():
             for o in self.outcomes:
                 base = np.array([_group(get(i, self.comp), o, pm) for i in range(n)])
+                if np.any(base < 1e-9):
+                    self.train_corrections[f"base_floor:{P}:{o}"] = int(np.sum(base < 1e-9))
                 self.T[("base", P, o)] = np.log(np.maximum(base, 1e-9))
                 for k in self.packages:
                     if k != self.comp:
@@ -91,14 +120,19 @@ class EmulatorModel:
                         self.T[("red", P, o, k)] = 1 - y / np.maximum(base, 1e-12)
         for name, m in self.cost_outputs.items():
             for k in self.packages:
-                self.T[("cost", name, k)] = np.array([get(i, k)["cost_drivers"].get(m["cost_driver"], 0.0)
+                self.T[("cost", name, k)] = np.array([_driver(get(i, k), m["cost_driver"], f"design point {i}, {k}")
                                                       for i in range(n)])
         cal = spec["calibration"]
-        self.T[("cal",)] = _logit(np.array([get(i, self.comp)["windows"][CAL_WINDOW][cal["metric"]] for i in range(n)]))
+        cm = np.array([_metric(get(i, self.comp), CAL_WINDOW, cal["metric"], f"design point {i}") for i in range(n)])
+        if np.any((cm < 1e-4) | (cm > 1 - 1e-4)):
+            self.train_corrections["cal_logit_clip"] = int(np.sum((cm < 1e-4) | (cm > 1 - 1e-4)))
+        self.T[("cal",)] = _logit(cm)
         for name, d in self.diagnostics.items():
             w = d.get("window", CAL_WINDOW)
-            self.T[("diag", name)] = np.log(np.maximum([get(i, self.comp)["windows"][w].get(d["metric"], 1.0)
-                                                        for i in range(n)], 1e-6))
+            v = np.array([_metric(get(i, self.comp), w, d["metric"], f"design point {i}") for i in range(n)])
+            if np.any(v < 1e-6):
+                self.train_corrections[f"diag_floor:{name}"] = int(np.sum(v < 1e-6))
+            self.T[("diag", name)] = np.log(np.maximum(v, 1e-6))
         self.gps, self.accuracy = {}, {}
         self.design_points = n
 
@@ -180,8 +214,15 @@ class EmulatorModel:
     def predict(self, zs, theta, ids, noise=None):
         """`noise`: an rng for the emulator-error source (reductions perturbed by their held-out RMSE)."""
         rows = [self.by_id[i] for i in ids]
-        X = self._scale(np.asarray([self._x(zs[i], theta, u) for i, u in zip(ids, rows)], float))
+        Xr = np.asarray([self._x(zs[i], theta, u) for i, u in zip(ids, rows)], float)
+        X = self._scale(Xr)
         n = len(ids)
+        ev = []                       # Codex P1-6: extrapolation and every clip, per unit (and package)
+        tol = 1e-9 * np.maximum(self.dom_hi - self.dom_lo, 1.0)
+        outside = (Xr < self.dom_lo - tol) | (Xr > self.dom_hi + tol)
+        for j in np.flatnonzero(outside.any(1)):
+            ev.append({"unit": ids[j], "package": "*", "kind": "extrapolation",
+                       "inputs": [self.input_names[c] for c in np.flatnonzero(outside[j])]})
         y = [{"y": {k: {} for k in self.packages}, "cost": {k: {} for k in self.packages}, "diag": {}} for _ in ids]
         for P, pm in self.pops.items():
             popv = np.array([float(u[pm["column"]]) for u in rows])
@@ -195,19 +236,27 @@ class EmulatorModel:
                     r = self.gps[("red", P, o, k)].predict(X)
                     if noise is not None:
                         r = r + noise.normal(0.0, self.red_rmse.get((P, k), 0.0), size=n)
+                    for j in np.flatnonzero((r < -0.5) | (r > 1.0)):
+                        ev.append({"unit": ids[j], "package": k, "kind": "reduction_clip", "outcome": o, "group": P,
+                                   "value": float(r[j])})
                     r = np.clip(r, -0.5, 1.0)
                     for j in range(n):
                         y[j]["y"][k][o] = y[j]["y"][k].get(o, 0.0) + float(b[j] * (1 - r[j])) * popv[j]
         tot = np.array([sum(float(u[pm["column"]]) for pm in self.pops.values()) for u in rows])
         for name in self.cost_outputs:
             for k in self.packages:
-                t = np.maximum(self.gps[("cost", name, k)].predict(X), 0.0)
+                t = self.gps[("cost", name, k)].predict(X)
+                for j in np.flatnonzero(t < 0):
+                    ev.append({"unit": ids[j], "package": k, "kind": "cost_output_floor", "output": name,
+                               "value": float(t[j])})
+                t = np.maximum(t, 0.0)
                 for j in range(n):
                     y[j]["cost"][k][name] = float(t[j]) * tot[j]
         for name in self.diagnostics:
             e = np.exp(self.gps[("diag", name)].predict(X))
             for j in range(n):
                 y[j]["diag"][name] = float(e[j])
+        self.last_events = ev
         return dict(zip(ids, y))
 
 
@@ -234,6 +283,7 @@ class DirectModel:
         self.accuracy = {"direct": True, "note": "outcomes from the engine itself; no emulator error"}
         self.runs = 0
         self.seed = int((an.get("direct") or {}).get("seed", 1))
+        self.last_events, self.train_corrections = [], {}
 
     def fit(self):
         return self
@@ -260,7 +310,7 @@ class DirectModel:
                 res = {"per_capita": r.per_capita, "meta": r.meta}
                 row["y"][k] = {o: sum(_group(res, o, pm) * float(u[pm["column"]]) for pm in self.pops.values())
                                for o in self.outcomes}
-                row["cost"][k] = {n: float(r.cost_drivers.get(m["cost_driver"], 0.0)) * tot
+                row["cost"][k] = {n: _driver({"cost_drivers": r.cost_drivers}, m["cost_driver"], f"unit {i}, {k}") * tot
                                   for n, m in self.cost_outputs.items()}
                 if k == self.comp:
                     for n, d in self.diagnostics.items():

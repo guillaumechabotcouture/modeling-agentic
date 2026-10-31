@@ -92,10 +92,13 @@ def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
     fixed = {o: [] for o in A.outcomes}
     opt_vals, same = [], np.zeros(len(A.ids))
     comps_used, outs, samples = set(), [], {}
+    corr_any = corr_plan = 0
     hl_outcome = A.spec["deliverable"]["headline"]["outcome"]
     for d in range(nd):
         theta, zs, noise, mult, sampled = D.draw()
         out, ben, cost = A.evaluate(theta, zs, noise=noise, cost_mult=mult)
+        corr_any += bool(A.last_events)
+        corr_plan += bool(A.plan_corrections(A.last_events, plan))
         row = {}
         for o in A.outcomes:
             v = sum(out[i]["y"][A.comp][o] - out[i]["y"][plan[i]][o] for i in A.ids)
@@ -119,12 +122,14 @@ def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
             "reoptimised_objective": q(opt_vals, lvl),
             "units_same_package_share_median": float(np.median(same / max(nd, 1))) if nd else None,
             "units_same_package_in_90pct_of_draws": int(np.sum(same / max(nd, 1) >= 0.9)) if nd else None,
-            "components_in_any_draw_plan": sorted(comps_used),
+            "components_in_any_draw_plan": sorted(comps_used), "interval": scope["interval"],
+            "model_corrections": {"draws_with_corrections": corr_any, "draws_with_corrections_on_plan": corr_plan},
             "headline": {"name": headline_name, "outcome": hl_outcome}}
-    agg = _pu().summarise_outputs(outs, samples, nd)
+    agg = _pu().summarise_outputs(outs, samples, nd, level=scope["level"])   # the signed level (Codex P1-11)
     report = {"producer": PRODUCER, "produced_by": "harness", "n_draws": nd, "n_draws_requested": nd,
               "n_successful": nd - len(agg["errors"]), "n_failed": len(agg["errors"]), "seed": data["seed"],
-              "interval_label": scope["label"], "covers": scope["covers"], "excludes": scope["excludes"],
+              "interval_label": scope["label"], "interval": scope["interval"], "covers": scope["covers"],
+              "excludes": scope["excludes"],
               "degenerate_outputs": agg["degenerate_outputs"],
               "sampler_varied_parameters": len(agg["varied_params"]),
               "scalar_outputs": agg["scalar_outputs"], "categorical_outputs": agg["categorical_outputs"],

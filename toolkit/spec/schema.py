@@ -122,10 +122,20 @@ class SpecError(ValueError):
 
 # --------------------------------------------------------------------------- loading
 SETTINGS = "analysis_settings.yaml"
-# Technical settings the run (and the fix loop) may change without a new owner sign-off. They may live in
-# analysis_settings.yaml beside the spec instead of in the signed spec; a key set in both is an error.
-# What the interval covers (uncertainty.sources / excluded, level) stays in the signed spec.
-SETTINGS_KEYS = {"calibration": None, "analysis": None, "uncertainty": ("draws", "seed")}
+# Purely computational settings the run (and the fix loop) may change without a new owner sign-off. Only these
+# leaves may live in analysis_settings.yaml; everything that can change costs, constraints, calibration, its
+# uncertainty, outcomes, the interval's coverage or the decision tests is in the signed spec (Codex P1-1).
+# A leaf set in both files is an error.
+SETTINGS_PATHS = frozenset({("uncertainty", "draws"), ("uncertainty", "seed"), ("analysis", "emulator", "points"),
+                            ("analysis", "emulator", "seed"), ("analysis", "workers")})
+
+
+def _leaves(d, pre=()):
+    for k, v in d.items():
+        if isinstance(v, dict) and v:
+            yield from _leaves(v, pre + (k,))
+        else:
+            yield pre + (k,), v
 
 
 def load(path: str) -> "Spec":
@@ -141,20 +151,20 @@ def load(path: str) -> "Spec":
             st = yaml.safe_load(f) or {}
         if not isinstance(st, dict):
             raise SpecError(f"{SETTINGS}: must be a mapping")
-        for k, v in st.items():
-            if k not in SETTINGS_KEYS:
-                raise SpecError(f"{SETTINGS}: {k} is not a run-owned setting ({', '.join(SETTINGS_KEYS)}); it belongs "
-                                "in the signed decision spec")
-            sub = SETTINGS_KEYS[k]
-            if sub is None:
-                if k in raw:
-                    raise SpecError(f"{SETTINGS}: {k} is also in the signed spec; keep it in one place")
-                raw[k] = v
-            else:
-                bad = [x for x in (v or {}) if x not in sub or x in (raw.get(k) or {})]
-                if bad:
-                    raise SpecError(f"{SETTINGS}: {k}.{bad} is not run-owned or is also in the signed spec")
-                raw.setdefault(k, {}).update(v or {})
+        for path, v in _leaves(st):
+            name = ".".join(map(str, path))
+            if path not in SETTINGS_PATHS:
+                raise SpecError(f"{SETTINGS}: {name} is not a computational setting "
+                                f"({', '.join('.'.join(x) for x in sorted(SETTINGS_PATHS))}); it belongs in the signed "
+                                "decision spec")
+            node = raw
+            for k in path[:-1]:
+                node = node.setdefault(k, {})
+                if not isinstance(node, dict):
+                    raise SpecError(f"{SETTINGS}: {name}: the signed spec's {k} is not a mapping")
+            if path[-1] in node:
+                raise SpecError(f"{SETTINGS}: {name} is also in the signed spec; keep it in one place")
+            node[path[-1]] = v
         settings_path = sp
     s = Spec(raw, base, path)
     s.settings_path = settings_path
@@ -248,12 +258,17 @@ class Spec:
         units = self.units()
         for comp, cov in (c.get("coverage") or {}).items():
             cap = caps.setdefault(comp, {})
-            if "max_units_share" in cov:
-                cap["max_units"] = float(cov["max_units_share"]) * len(units)
+            if "max_units_share" in cov:      # keep both limits: the binding one is the smaller (Codex P1-2)
+                v = float(cov["max_units_share"]) * len(units)
+                cap["max_units"] = min(v, float(cap["max_units"])) if "max_units" in cap else v
             if "max_population_share" in cov:
                 pop = cov.get("population", "total")
                 col = (o.get("populations") or {}).get(pop, pop)
-                cap["max_quantity"] = float(cov["max_population_share"]) * sum(float(u[col]) for u in units)
+                v = float(cov["max_population_share"]) * sum(float(u[col]) for u in units)
+                if "max_quantity" in cap and cap.get("quantity", pop) != pop:
+                    raise SpecError(f"constraints: {comp} has a max_quantity on {cap.get('quantity')} and a coverage "
+                                    f"share on {pop}; give one quantity")
+                cap["max_quantity"] = min(v, float(cap["max_quantity"])) if "max_quantity" in cap else v
                 cap["quantity"] = pop
         if caps:
             a["caps"] = caps
@@ -289,11 +304,11 @@ class Spec:
         inc = [s["kind"] for s in u.get("sources") or []]
         exc = [(e["kind"], e.get("reason", "")) for e in u.get("excluded") or []]
         lvl = float(u.get("level", 0.95))
-        covered = ", ".join(UNCERTAINTY_SHORT[k] for k in inc) or "nothing"
-        label = f"{lvl:.0%} UI over {covered}"
-        if exc:
-            label += "; not covered: " + ", ".join(UNCERTAINTY_SHORT[k] for k, _ in exc)
-        return {"level": lvl, "covers": inc, "excludes": [{"kind": k, "reason": r} for k, r in exc], "label": label}
+        meta = {"level": lvl, "covers": inc, "excludes": [k for k, _ in exc]}
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        import render_claims    # one rule for the label, from structured metadata only (Codex P1-5)
+        return {"level": lvl, "covers": inc, "excludes": [{"kind": k, "reason": r} for k, r in exc],
+                "interval": meta, "label": render_claims.interval_label(meta)}
 
 
 def load_engine(ref):
@@ -604,7 +619,15 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
             continue
         if not str(dt.get("text") or "").strip():
             bad.append(f"decision test {i}: text (the question it answers) is empty")
+        elif any(ch.isdigit() for ch in str(dt["text"])):
+            bad.append(f"decision test {i}: text must be descriptive, with no numbers (Codex P1-4): the values tested "
+                       "and the results are rendered from computed claims")
+        if "engine_arm_or" in dt:
+            bad.append(f"decision test {i}: engine_arm_or cannot be supplied; arm ratios come from the engine's "
+                       "verified benchmark results (Codex P1-13)")
         if t == "interaction_rescale":
+            if not dt.get("benchmark"):
+                bad.append(f"decision test {i}: benchmark (the engine benchmark whose arms set the interaction)")
             for c in list(dt.get("components") or []) + list(dt.get("with_any") or []):
                 if c not in comps:
                     bad.append(f"decision test {i}: unknown component {c}")
@@ -644,8 +667,9 @@ def _validate_deliverable(s) -> list[str]:
 
 
 # --------------------------------------------------------------------------- self-test
-def toy_spec(d: str, n: int = 12) -> str:
-    """A valid toy spec and units table in directory d (used by the analysis self-tests too)."""
+def toy_spec(d: str, n: int = 12, bench: str | None = None, dt_values=(1.0, 3.0)) -> str:
+    """A valid toy spec and units table in directory d (used by the analysis self-tests too). `bench`: a benchmark
+    results file for the toy engine (its interaction benchmark T2 drives decision test DT1)."""
     import math
     with open(os.path.join(d, "units.csv"), "w") as f:
         f.write("id,region,grp,cov,pop,elig,tgt\n")
@@ -656,7 +680,8 @@ def toy_spec(d: str, n: int = 12) -> str:
     spec = {
         "schema_version": 1, "question": "Which package per unit?", "decision_maker": "programme manager",
         "decision_date": 2026,
-        "engine": {"ref": "toolkit.engines.contract:ToyEngine"},
+        "engine": ({"ref": "toolkit.engines.contract:ToyEngine", "config": {"results_path": bench}} if bench
+                   else {"ref": "toolkit.engines.contract:ToyEngine"}),
         "horizon": {"start": 0, "stop": 3},
         "decision_units": {"csv": "units.csv", "id": "id", "region": "region",
                            "populations": {"all": {"column": "pop", "age_groups": ["all"]}}, "engine_attributes": {}},
@@ -682,8 +707,8 @@ def toy_spec(d: str, n: int = 12) -> str:
                      "stability": {"holdout_group": "grp", "covariates": ["cov"]},
                      "sensitivity": {"parameters": "fitted"},
                      "decision_tests": [{"id": "DT1", "type": "interaction_rescale", "components": ["b"],
-                                         "with_any": ["a"], "values": [1.0, 3.0], "finding": "benchmark_drift:T3",
-                                         "engine_arm_or": {"a11": 0.4, "a10": 0.5, "a01": 0.7},
+                                         "with_any": ["a"], "values": [float(v) for v in dt_values],
+                                         "finding": "benchmark_drift:T2", "benchmark": "T2",
                                          "text": "Does the plan change at the trial interaction?"}]},
         "deliverable": {"kind": "package_per_unit", "allocation_file": "allocation_optimized.csv",
                         "columns": {"unit": "unit", "package": "package", "value": "dalys_averted"},
@@ -748,27 +773,62 @@ def _self_test() -> int:
         ok(validate(s2) == [] and a["caps"]["b"]["max_units"] == 3.0 and "camp" in a["group_rules"],
            f"SP16 coverage becomes a toolkit/alloc cap and group rules pass through: {validate(s2)}")
         sc = s.uncertainty_scope()
-        ok(sc["label"] == "95% UI over engine parameters, calibration; not covered: unit costs, emulator error" and "not covered: unit costs"
-           in sc["label"], f"SP17 the interval label states what is covered and what is not: {sc['label']}")
+        ok(sc["label"] == "95% UI over engine parameters, calibration; not covered: costs, emulator", f"SP17 the interval label states what is covered and what is not: {sc['label']}")
         ok(validate({"schema_version": 1}) and validate(Spec({"engine": 3}, d)), "SP18 malformed specs fail closed")
         r = copy.deepcopy(s.raw)
-        an, cal = r.pop("analysis"), r.pop("calibration")
         draws = r["uncertainty"].pop("draws")
+        pts = r["analysis"]["emulator"].pop("points")
         with open(p, "w") as f:
             yaml.safe_dump(r, f)
         with open(os.path.join(d, SETTINGS), "w") as f:
-            yaml.safe_dump({"analysis": an, "calibration": cal, "uncertainty": {"draws": draws}}, f)
+            yaml.safe_dump({"uncertainty": {"draws": draws}, "analysis": {"emulator": {"points": pts}}}, f)
         s3 = load(p)
-        ok(validate(s3) == [] and s3["uncertainty"]["draws"] == draws and s3.settings_sha256,
-           f"SP19 run-owned settings (analysis, calibration, draws) can live in {SETTINGS}, outside the signed spec")
+        ok(validate(s3) == [] and s3["uncertainty"]["draws"] == draws and s3["analysis"]["emulator"]["points"] == pts
+           and s3.settings_sha256, f"SP19 computational settings (draws, design size) can live in {SETTINGS}")
+        for bad_set, label in (({"objective": {"outcome": "cases"}}, "a decision section"),
+                               ({"calibration": {"range": [-9, 9]}}, "a calibration setting"),
+                               ({"analysis": {"decision_tests": []}}, "the decision tests"),
+                               ({"uncertainty": {"sources": []}}, "the uncertainty sources"),
+                               ({"analysis": {"cost_outputs": {}}}, "a cost mapping"),
+                               ({"uncertainty": {"draws": 9}, "analysis": {"emulator": {"points": 9, "seed": 1}}}
+                                if False else {"analysis": {"emulator": {"holdout_share": 0.5}}}, "the hold-out share")):
+            with open(os.path.join(d, SETTINGS), "w") as f:
+                yaml.safe_dump(bad_set, f)
+            try:
+                load(p)
+                ok(False, f"SP20 {label} in the settings file is refused (Codex P1-1)")
+            except SpecError:
+                ok(True, f"SP20 {label} in the settings file is refused (Codex P1-1)")
         with open(os.path.join(d, SETTINGS), "w") as f:
-            yaml.safe_dump({"objective": {"outcome": "cases"}}, f)
+            yaml.safe_dump({"uncertainty": {"draws": draws, "seed": 3}}, f)
+        r2 = copy.deepcopy(r)
+        r2["uncertainty"]["draws"] = draws
+        with open(p, "w") as f:
+            yaml.safe_dump(r2, f)
         try:
             load(p)
-            ok(False, "SP20 a decision section in the settings file is refused")
+            ok(False, "SP21 a leaf in both files is refused")
         except SpecError:
-            ok(True, "SP20 a decision section in the settings file is refused")
+            ok(True, "SP21 a leaf in both files is refused")
         os.remove(os.path.join(d, SETTINGS))
+        r2["analysis"]["emulator"]["points"] = pts
+        with open(p, "w") as f:
+            yaml.safe_dump(r2, f)
+        r = copy.deepcopy(s.raw)
+        r["constraints"]["caps"] = {"b": {"max_units": 2}}
+        r["constraints"]["coverage"] = {"b": {"max_units_share": 0.5}}
+        ok(Spec(r, d).alloc_spec()["caps"]["b"]["max_units"] == 2,
+           "SP22 a max_units cap and a coverage share: the binding (smaller) limit is kept (Codex P1-2)")
+        r["constraints"]["caps"] = {"b": {"max_units": 9}}
+        ok(Spec(r, d).alloc_spec()["caps"]["b"]["max_units"] == 6, "SP22b ... whichever is smaller")
+        r = copy.deepcopy(s.raw)
+        r["analysis"]["decision_tests"][0]["text"] = "Does the plan change at an interaction of 2.43?"
+        ok(any("no numbers" in e for e in validate(Spec(r, d))), "SP23 a decision-test text with numbers is refused "
+                                                                 "(Codex P1-4)")
+        r = copy.deepcopy(s.raw)
+        r["analysis"]["decision_tests"][0]["engine_arm_or"] = {"a11": 0.4, "a10": 0.5, "a01": 0.7}
+        ok(any("cannot be supplied" in e for e in validate(Spec(r, d))),
+           "SP24 arm ratios supplied in the spec are refused (Codex P1-13)")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

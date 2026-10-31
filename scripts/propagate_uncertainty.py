@@ -379,11 +379,23 @@ def rare_event_summary(vals: list[float]) -> dict:
             "mean_if_nonzero": float(mean(nonzero))}
 
 
-def summarise_outputs(outs: list, per_param_samples: dict, n_draws: int) -> dict:
+def interval_quantiles(level: float = 0.95) -> tuple[float, float]:
+    """Lower and upper quantiles of a central interval. 0.95 keeps the historical constants exactly
+    (0.025, 0.975), so existing reports are unchanged."""
+    if level == 0.95:
+        return 0.025, 0.975
+    if not 0.5 <= float(level) < 1:
+        raise ValueError(f"interval level {level!r} must be in [0.5, 1)")
+    a = round((1.0 - float(level)) / 2.0, 12)
+    return a, round(1.0 - a, 12)
+
+
+def summarise_outputs(outs: list, per_param_samples: dict, n_draws: int, level: float = 0.95) -> dict:
     """Aggregate per-draw outcome dicts into the report's blocks (scalar_outputs, categorical_outputs,
     parameter_samples) with the degeneracy and rare-event diagnostics. Shared by propagate() and the v2
     analysis engine (toolkit/analysis/uncertainty.py), so both write the same uncertainty_report schema.
     Raises RuntimeError when more than 20% of draws failed."""
+    qlo, qhi = interval_quantiles(level)
     errors: list[dict] = []
     scalar_results: dict[str, list[float]] = {}
     categorical_results: dict[str, list[str]] = {}
@@ -435,8 +447,8 @@ def summarise_outputs(outs: list, per_param_samples: dict, n_draws: int) -> dict
         entry = {
             "mean": float(mean(vals)),
             "median": float(vals_sorted[n // 2]),
-            "ci_low": float(vals_sorted[int(0.025 * n)]),
-            "ci_high": float(vals_sorted[min(n - 1, int(0.975 * n))]),
+            "ci_low": float(vals_sorted[int(qlo * n)]),
+            "ci_high": float(vals_sorted[min(n - 1, int(qhi * n))]),
             "n": n,
             "n_nonfinite": n_nonfinite.get(key, 0),
         }
@@ -627,6 +639,13 @@ def _run_self_test() -> int:
     def ok(cond: bool, label: str) -> None:
         if not cond:
             failures.append(label)
+
+    # v2 (Codex P1-11): the interval level is passed through; 0.95 keeps the historical constants.
+    outs = [{"y": float(v)} for v in range(200)]
+    a95 = summarise_outputs(outs, {}, 200)["scalar_outputs"]["y"]
+    a80 = summarise_outputs(outs, {}, 200, level=0.80)["scalar_outputs"]["y"]
+    ok((a95["ci_low"], a95["ci_high"]) == (5.0, 195.0) and (a80["ci_low"], a80["ci_high"]) == (20.0, 180.0),
+       f"UQ-L1 summarise_outputs honours the interval level: {a95['ci_low'], a95['ci_high'], a80['ci_low'], a80['ci_high']}")
 
     with tempfile.TemporaryDirectory() as run_dir:
         os.makedirs(os.path.join(run_dir, "models"))

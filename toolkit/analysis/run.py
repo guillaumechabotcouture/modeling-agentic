@@ -28,7 +28,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 from toolkit.analysis import (batch as Bt, calibration as C, claims as CL, decision_tests as DT,  # noqa: E402
                               figures as FG, sensitivity as SE, stability as ST, uncertainty as UQ)
-from toolkit.analysis.artifacts import Store, plain, sha256  # noqa: E402
+from toolkit.analysis.artifacts import EXPECTED_KINDS, EXPECTED_ROLES, Store, plain, sha256  # noqa: E402
 from toolkit.analysis.core import Analysis  # noqa: E402
 from toolkit.analysis.model import DirectModel, EmulatorModel  # noqa: E402
 from toolkit.spec import schema, signoff  # noqa: E402
@@ -78,7 +78,11 @@ def decision_rule(A, out, plan) -> list[dict]:
             for k, v in sorted(rows.items(), key=lambda kv: -max(burden[i] for i in kv[1]))]
 
 
-def run(run_dir: str, spec_rel: str = "decision_spec.yaml", results: str | None = None, draws=None,
+class AnalysisBlocked(RuntimeError):
+    """The run stopped before publishing a plan (analysis/blocked.yaml says why)."""
+
+
+def run(run_dir: str, spec_rel: str = "decision_spec.yaml", adopt: dict | None = None, draws=None,
         unsigned: bool = False, log=print, compute_kw: dict | None = None) -> dict:
     t0 = time.time()
     run_dir = os.path.abspath(run_dir)
@@ -106,19 +110,33 @@ def run(run_dir: str, spec_rel: str = "decision_spec.yaml", results: str | None 
         os.makedirs(os.path.join(run_dir, "analysis", "batch"), exist_ok=True)
         with open(os.path.join(run_dir, "analysis", "batch", "design.json"), "w") as f:
             json.dump(design, f, indent=1)
-        if results:
-            res = Bt.load_results(results, jobs)
-            bsum = {"source": "stored results", "path": results, "sha256": sha256(results), "n": len(res)}
+        kw = dict(compute_kw or {})
+        if spec["analysis"].get("workers"):
+            kw.setdefault("max_workers", int(spec["analysis"]["workers"]))
+        if adopt:
+            # a batch computed before results carried provenance: adopted only after a full-input match and a re-run
+            # sample that reproduces it (Codex P1-3)
+            ad = Bt.adopt(run_dir, adopt["results"], adopt["jobs"], adopt["design"], jobs, design, eng,
+                          sample=int(adopt.get("sample", 4)), workers=int(kw.get("max_workers", 2)))
+            res, probs = Bt.load_results(ad["path"], jobs, eng)
+            bsum = {"source": "adopted stored batch", "adoption": ad, "n": len(res), "rejected_rows": len(probs)}
         else:
-            b = Bt.run(run_dir, jobs, **(compute_kw or {}))
-            res, bsum = b["results"], dict(b["summary"], path=os.path.relpath(b["path"], run_dir))
+            b = Bt.run(run_dir, jobs, eng, **kw)
+            res, probs = b["results"], b["problems"]
+            bsum = dict(b["summary"], path=os.path.relpath(b["path"], run_dir), rejected_rows=len(probs))
+        if probs:
+            raise ValueError(f"{len(probs)} batch results lack matching provenance (e.g. {probs[:3]}): the analysis fails "
+                             "closed")
         arts["batch"] = S.write("batch", {"evaluation": "emulator", "points": len(design["points"]), "jobs": len(jobs),
                                           "packages": design["packages"], "fitted_names": design["fitted_names"],
                                           "summary": bsum}, Bt.PRODUCER,
                                 [os.path.join(run_dir, "analysis", "batch", "design.json")] + data_in)
         model = EmulatorModel(spec, design, res, log=log).fit()
         arts["emulator"] = S.write("emulator", {"accuracy": model.accuracy, "fit_seconds": model.fit_seconds,
-                                                "features": model.features}, "toolkit/analysis/model.py",
+                                                "features": model.features, "training_corrections":
+                                                    model.train_corrections,
+                                                "domain": {"inputs": model.input_names, "lo": model.dom_lo,
+                                                           "hi": model.dom_hi}}, "toolkit/analysis/model.py",
                                    [os.path.join(run_dir, "analysis", "batch", "design.json")])
     else:
         model = DirectModel(spec, log=log)
@@ -139,11 +157,22 @@ def run(run_dir: str, spec_rel: str = "decision_spec.yaml", results: str | None 
     arts["calibration"] = S.write("calibration", cal, C.PRODUCER, data_in)
     # ---- point and optimum
     out0, ben0, cost0 = A.evaluate(A.theta0, z0)
+    events0 = list(A.last_events)
     sol = A.solve(ben0, cost0)
     plan = sol["choice"]
+    on_plan = A.plan_corrections(events0, plan)
+    if on_plan:
+        # Codex P1-6: an extrapolated or clipped prediction behind the plan stops the run before anything is published
+        S.write("blocked", {"reason": "model corrections bear on the plan", "corrections": on_plan[:200],
+                            "n_corrections": len(events0), "n_on_plan": len(on_plan)}, PRODUCER, [arts["calibration"]])
+        S.finalize("blocked", f"{len(on_plan)} model corrections (extrapolation, clips, floors) bear on the plan")
+        raise AnalysisBlocked(f"{len(on_plan)} model corrections bear on the plan (e.g. {on_plan[:2]}); see "
+                              "analysis/blocked.yaml")
     point = A.summary(plan, out0, cost0)
     point.update(plan=plan, n_units=len(A.ids), solver={k: sol[k] for k in ("status", "method", "objective", "cost")},
                  interactions=interactions(A, out0), rule=decision_rule(A, out0, plan),
+                 model_corrections={"n": len(events0), "on_plan": on_plan, "kinds": sorted({e["kind"] for e in events0}),
+                                    "examples": events0[:20]},
                  diagnostics={n: {"max": max(out0[i]["diag"][n] for i in A.ids),
                                   "median": sorted(out0[i]["diag"][n] for i in A.ids)[len(A.ids) // 2]}
                               for n in (spec["analysis"].get("diagnostics") or {})},
@@ -187,11 +216,14 @@ def run(run_dir: str, spec_rel: str = "decision_spec.yaml", results: str | None 
     # ---- decision tests
     dts = DT.run_all(A, z0, out0, ben0, cost0, plan, u["data"], run_dir)
     arts["decision_tests"] = S.write("decision_tests", {"tests": [
-        {"test_id": x["test_id"], "path": x["path"], "verdict": "CHANGES_PLAN" if x["decision_changes"] else "NO_CHANGE",
-         "can_move_plan": x["can_move_plan"], "share_pct": 100.0 * x["share_units_changed"], "statement": x["statement"]}
-        for x in dts]}, DT.PRODUCER, [arts["point"], arts["uncertainty"]])
+        {"test_id": x["test_id"], "path": x["path"], "status": x["status"],
+         "verdict": ("NOT_RUN" if x["status"] == "not_run" else "CHANGES_PLAN" if x["decision_changes"] else "NO_CHANGE"),
+         "can_move_plan": x["can_move_plan"], "threshold_pct": 100.0 * x["share_threshold"],
+         "share_pct": None if x["share_units_changed"] is None else 100.0 * x["share_units_changed"],
+         "statement": x["statement"]} for x in dts]}, DT.PRODUCER, [arts["point"], arts["uncertainty"]])
     for x in dts:
-        S.deliverable(os.path.join(run_dir, x["path"]), DT.PRODUCER, "decision_test")
+        if x["path"]:
+            S.deliverable(os.path.join(run_dir, x["path"]), DT.PRODUCER, "decision_test")
     # ---- figures
     figs = FG.draw(run_dir, point, u["data"], sens, cal, A.primary, arts)
     arts["figures"] = S.write("figures", {"figures": figs}, FG.PRODUCER,
@@ -205,12 +237,44 @@ def run(run_dir: str, spec_rel: str = "decision_spec.yaml", results: str | None 
     for rel, role in ((c["spec"], "claims_spec"), (c["ledger"], "claims_ledger"), (c["results"], "results")):
         S.deliverable(os.path.join(run_dir, rel), CL.PRODUCER, role)
     S.manifest["wall_s"] = round(time.time() - t0, 1)
-    S.save()
+    S.manifest["expected"] = {"kinds": list(EXPECTED_KINDS) + (["emulator"] if model.kind == "emulator" else []),
+                              "roles": list(EXPECTED_ROLES),
+                              "decision_tests": {x["test_id"]: x["path"] for x in dts}}
+    S.finalize("complete")
     return {"artifacts": arts, "point": point, "uncertainty": u["data"], "stability": stab, "sensitivity": sens,
-            "decision_tests": dts, "calibration": cal, "emulator_accuracy": model.accuracy, "wall_s": S.manifest["wall_s"]}
+            "decision_tests": dts, "calibration": cal, "emulator_accuracy": model.accuracy, "wall_s": S.manifest["wall_s"],
+            "_A": A, "_model": model}
 
 
 # --------------------------------------------------------------------------- self-test
+def _toy_bench(d):
+    """Stamped benchmark results for the toy engine (toolkit/engines/benchmark.py): T2 is its interaction benchmark."""
+    import yaml
+    from toolkit.engines import benchmark as BM
+    from toolkit.engines.contract import ToyEngine
+    path = os.path.join(d, "toy_bench.yaml")
+    eng = ToyEngine(results_path=path)
+    pack = {"engine": "toolkit.engines.contract:ToyEngine", "seeds": [1],
+            "horizon": {"start": 0, "stop": 3, "window": [0, 3], "windows": {"w": [1, 2]}},
+            "settings": {"s": {"unit": {"x": 0.0}}},
+            "arms": {"none": {"setting": "s", "package": {}}, "a": {"setting": "s", "package": {"a": 1}},
+                     "b": {"setting": "s", "package": {"b": 1}}, "ab": {"setting": "s", "package": {"a": 1, "b": 1}}},
+            "benchmarks": [{"id": "T2", "metric": "interaction", "target": 1.0, "band": [0.8, 1.25],
+                            "estimand": {"type": "interaction_or", "a11": "ab", "a10": "a", "a01": "b", "a00": "none",
+                                         "value": "windows.w.prev"}}]}
+    res = BM.run_pack(pack, eng, BM.Runner(pack, eng, 1), {})
+    yaml.safe_dump(BM.stamp(res, eng), open(path, "w"), sort_keys=False)
+    b = res["benchmarks"][0]
+    arm = {k: math.exp(sum(math.log(x[k]) for x in b["arm_or"]) / len(b["arm_or"])) for k in ("a11", "a10", "a01")}
+    den = math.log(arm["a11"] / arm["a10"])
+    v_ok = math.exp(0.5 * den) / arm["a01"]          # the interaction at half the increment: reachable
+    v_bad = 2.0 / arm["a01"]                           # above what removing the increment reaches: unreachable
+    return path, v_ok, v_bad
+
+
+import math  # noqa: E402  (used by _toy_bench at module level)
+
+
 def _self_test() -> int:
     import copy
     import math
@@ -226,7 +290,8 @@ def _self_test() -> int:
     q = lambda *a, **k: None  # noqa: E731
     with tempfile.TemporaryDirectory() as d:
         # ---------------- emulator path, emulator-inversion calibration (the spike's chain)
-        p = schema.toy_spec(d, n=24)
+        bench, v_ok, v_bad = _toy_bench(d)
+        p = schema.toy_spec(d, n=24, bench=bench, dt_values=(v_ok, v_bad))
         try:
             run(d, log=q)
             ok(False, "R1 an unsigned spec is refused")
@@ -254,11 +319,13 @@ def _self_test() -> int:
            and "total_benefit_loss_pct_worst_fold" in stb["metrics"],
            "R6 leave-one-group-out runs every fold and reports value lost beside package identity (lesson 5)")
         dt = R["decision_tests"][0]
-        r1 = dt["results"][0]
         res = yaml.safe_load(open(os.path.join(d, dt["path"])))
-        ok(abs(r1["increment_scale"] - math.log(0.7) / math.log(0.8)) < 1e-9 and res["produced_by"] == "harness"
-           and isinstance(res["decision_changes"], bool) and res["recommendation"]["with"],
-           f"R7 interaction rescale (the spike's DT1) writes a Phase 49 result file, produced_by harness")
+        r1 = dt["results"][0]
+        ok(abs(r1["achieved_interaction"] - v_ok) <= 1e-9 * v_ok and [x["value"] for x in dt["rejected_values"]] == [v_bad]
+           and res["produced_by"] == "harness" and isinstance(res["decision_changes"], bool)
+           and "verified benchmark results" in res["arm_source"],
+           "R7 interaction rescale: arms from verified benchmark results, the achieved interaction equals the requested "
+           "one, an unreachable value is rejected (Codex P1-12, P1-13)")
         sys.path.insert(0, os.path.join(ROOT, "scripts"))
         import mechanism_manifest as MM
         if hasattr(MM, "load_test_result"):
@@ -270,10 +337,14 @@ def _self_test() -> int:
         rows = list(csv.DictReader(open(os.path.join(d, "allocation_optimized.csv"))))
         ok(len(rows) == 24 and set(rows[0]) >= {"unit", "package", "dalys_averted"}, "R9 the deliverable CSV is written")
         rep = yaml.safe_load(open(os.path.join(d, "uncertainty_report.yaml")))
-        ok("total_dalys_averted" in rep["scalar_outputs"] and rep["interval_label"] == R["uncertainty"]["label"],
-           "R10 uncertainty_report.yaml carries the headline output and the interval label")
+        ok("total_dalys_averted" in rep["scalar_outputs"] and rep["interval_label"] == R["uncertainty"]["label"]
+           and rep["interval"] == R["uncertainty"]["interval"],
+           "R10 uncertainty_report.yaml carries the headline output and the structured interval")
         txt = open(os.path.join(d, "results.md")).read()
         ok("[CLAIM:" not in txt and R["uncertainty"]["label"] in txt, "R11 results.md is fully rendered from the ledger")
+        dsec = txt[txt.index("## Decision tests"):]
+        ok(all(not ch.isdigit() for ch in dt["statement"]) and "[CLAIM" not in dsec,
+           "R11b decision-test statements are words; their numbers are claims (Codex P1-4)")
         ok(all(os.path.exists(os.path.join(d, f["path"]) + ".provenance.json") for f in
                yaml.safe_load(open(os.path.join(d, "analysis", "figures.yaml")))["data"]["figures"]),
            "R12 every figure has a provenance sidecar")
@@ -284,11 +355,86 @@ def _self_test() -> int:
             f.write("# hand edit\n")
         kinds = {x["kind"] for x in contract.gate_findings(d)}
         ok("analysis_contract_tampered" in kinds, f"R14 a hand-edited artifact is caught: {kinds}")
-        # lesson 8: a test that only lowers unchosen benefits says so up front
-        A = type("A", (), {})()
         ok(DT._lowers_only_unchosen({"u": {"p": 1.0, "q": 2.0}}, {"u": {"p": 0.5, "q": 2.0}}, {"u": "q"})
            and not DT._lowers_only_unchosen({"u": {"p": 1.0, "q": 2.0}}, {"u": {"p": 3.0, "q": 2.0}}, {"u": "q"}),
            "R15 lesson 8: lowering only unchosen packages' benefits is recognised as unable to move the plan")
+        # Codex P1-6: extrapolation outside the design domain and clips are recorded and bear on the plan
+        A, M = R["_A"], R["_model"]
+        i0 = A.ids[0]
+        far = {i: (5.0 if i == i0 else R["calibration"]["units"][i]["z"]) for i in A.ids}
+        A.evaluate(A.theta0, far)
+        ev = A.last_events
+        ok(any(e["kind"] == "extrapolation" and e["unit"] == i0 for e in ev)
+           and A.plan_corrections(ev, R["point"]["plan"]),
+           "R16 a unit outside the design domain is recorded as extrapolation and bears on the plan (Codex P1-6)")
+        # Codex P1-3: stored results without provenance are refused; an adopted batch must match and reproduce
+        design, jobs = Bt.design(spec)
+        stored = os.path.join(d, "stored.jsonl")
+        sj = os.path.join(d, "stored_jobs.jsonl")
+        sd = os.path.join(d, "stored_design.json")
+        with open(os.path.join(d, "analysis", "batch", "results.jsonl")) as f:
+            rows_c = [json.loads(x) for x in f if x.strip()]
+        res_by = {jobs[r["i"]]["id"]: r["result"]["result"] for r in rows_c if r.get("ok")}
+        with open(stored, "w") as f:
+            for j in jobs:
+                f.write(json.dumps({"id": j["id"], "ok": True, "result": res_by[j["id"]]}) + "\n")
+        with open(sj, "w") as f:
+            for j in jobs:
+                f.write(json.dumps({k: j[k] for k in ("id",) + Bt.CORE}) + "\n")
+        json.dump({"spec_engine": design["spec_engine"], "horizon": design["horizon"], "cal_window": design["cal_window"]},
+                  open(sd, "w"))
+        got, probs = Bt.load_results(stored, jobs, spec.engine())
+        ok(not got and probs and "no provenance" in probs[0], "R17 stored results without provenance are refused (P1-3)")
+        ad = Bt.adopt(d, stored, sj, sd, jobs, design, spec.engine(), sample=3, workers=2)
+        got, probs = Bt.load_results(ad["path"], jobs, spec.engine())
+        ok(len(got) == len(jobs) and not probs and ad["rerun_reproduced"] == 3,
+           "R18 a stored batch is adopted after a full-input match and a re-run sample that reproduces it")
+        bad_jobs = [json.loads(x) for x in open(sj)]
+        bad_jobs[1]["seed"] += 1
+        with open(sj, "w") as f:
+            f.write("".join(json.dumps(x) + "\n" for x in bad_jobs))
+        try:
+            Bt.adopt(d, stored, sj, sd, jobs, design, spec.engine(), sample=2, workers=2)
+            ok(False, "R19 a stored job whose inputs differ is not adopted")
+        except ValueError as e:
+            ok("inputs differ" in str(e), "R19 a stored job whose inputs differ is not adopted")
+        bad_jobs[1]["seed"] -= 1
+        with open(sj, "w") as f:
+            f.write("".join(json.dumps(x) + "\n" for x in bad_jobs))
+        lines = open(stored).read().splitlines()
+        first = json.loads(lines[0])
+        first["result"]["per_capita"]["cases"]["all"] *= 1.5
+        lines[0] = json.dumps(first)
+        open(stored, "w").write("\n".join(lines) + "\n")
+        try:
+            Bt.adopt(d, stored, sj, sd, jobs, design, spec.engine(), sample=len(jobs), workers=2)
+            ok(False, "R20 a stored result the current engine does not reproduce is not adopted")
+        except ValueError as e:
+            ok("does not reproduce" in str(e), "R20 a stored result the current engine does not reproduce is not adopted")
+        from toolkit.analysis.model import _driver
+        try:
+            _driver({"cost_drivers": {"x": 1.0}}, "treated", "t")
+            ok(False, "R21 a missing cost driver fails closed (Codex P1-7)")
+        except ValueError:
+            ok(True, "R21 a missing cost driver fails closed (Codex P1-7)")
+        run(d, log=q, compute_kw={"max_workers": 2}, draws=2)
+        ok(contract.gate_findings(d) == [], "R22 a rerun publishes a fresh complete manifest")
+        orig = EmulatorModel.predict
+
+        def clipped(self, zs, theta, ids, noise=None):
+            out = orig(self, zs, theta, ids, noise)
+            self.last_events = self.last_events + [{"unit": ids[0], "package": "*", "kind": "reduction_clip"}]
+            return out
+        EmulatorModel.predict = clipped
+        try:
+            run(d, log=q, compute_kw={"max_workers": 2}, draws=2)
+            ok(False, "R23 a correction bearing on the plan blocks the run (Codex P1-6)")
+        except AnalysisBlocked:
+            ok({x["kind"] for x in contract.gate_findings(d)} == {"analysis_contract_blocked"}
+               and os.path.exists(os.path.join(d, "analysis", "blocked.yaml")),
+               "R23 a correction bearing on the plan blocks the run before anything is published (Codex P1-6)")
+        finally:
+            EmulatorModel.predict = orig
     with tempfile.TemporaryDirectory() as d:
         # ---------------- direct path, likelihood calibration (a cheap engine fitted to a panel)
         _direct_toy(d)
@@ -296,20 +442,20 @@ def _self_test() -> int:
         R = run(d, log=q)
         th = R["calibration"]["theta"]
         ok(abs(th["lrr:a"] - math.log(0.6)) < 0.05 and abs(th["lrr:a+b"] - math.log(0.5)) < 0.05,
-           f"R16 likelihood calibration recovers the planted package effects ({th})")
+           f"D1 likelihood calibration recovers the planted package effects ({th})")
         ident = R["calibration"]["identifiability"]["parameters"]
         ok(all(v["status"] in ("well_identified", "weakly_identified", "unidentified") for v in ident.values())
-           and ident["lrr:a"]["status"] == "well_identified", f"R17 identifiability from scripts/identifiability.py: "
+           and ident["lrr:a"]["status"] == "well_identified", f"D2 identifiability from scripts/identifiability.py: "
            f"{ {k: v['status'] for k, v in ident.items()} }")
         inter = {(r["a"], r["b"]): r for r in R["point"]["interactions"]}
         ok(abs(inter[("a", "b")]["interaction_ratio"] - 0.5 / (0.6 * 0.7)) < 0.05,
-           f"R18 the interaction ratio is computed from the point outcomes ({inter[('a', 'b')]['interaction_ratio']:.3f})")
+           f"D3 the interaction ratio is computed from the point outcomes ({inter[('a', 'b')]['interaction_ratio']:.3f})")
         ok(R["stability"]["n_folds"] == 3 and R["uncertainty"]["covers"] == ["calibration"],
-           "R19 likelihood path: refit-based stability and calibration-covariance uncertainty")
+           "D4 likelihood path: refit-based stability and calibration-covariance uncertainty")
         gr = next(x for x in R["decision_tests"] if x["type"] == "group_rule")
-        ok(gr["can_move_plan"] and gr["recommendation"]["with"], "R20 a group-rule decision test re-solves the plan")
+        ok(gr["can_move_plan"] and gr["recommendation"]["with"], "D5 a group-rule decision test re-solves the plan")
         from toolkit.analysis import contract
-        ok(contract.gate_findings(d) == [], f"R21 contract checks pass on the direct path: {contract.gate_findings(d)}")
+        ok(contract.gate_findings(d) == [], f"D6 contract checks pass on the direct path: {contract.gate_findings(d)}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -393,11 +539,13 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("run_dir")
     ap.add_argument("--spec", default="decision_spec.yaml")
-    ap.add_argument("--results", default=None, help="stored batch results (spike format or compute.py rows)")
+    ap.add_argument("--adopt", nargs=3, metavar=("RESULTS", "JOBS", "DESIGN"), default=None,
+                    help="adopt a stored batch computed before results carried provenance (verified, then re-run sample)")
     ap.add_argument("--draws", type=int, default=None)
     ap.add_argument("--unsigned", action="store_true", help="test runs only: every artifact records spec_signed false")
     a = ap.parse_args(argv)
-    R = run(a.run_dir, a.spec, a.results, a.draws, a.unsigned)
+    ad = dict(zip(("results", "jobs", "design"), a.adopt)) if a.adopt else None
+    R = run(a.run_dir, a.spec, ad, a.draws, a.unsigned)
     print(json.dumps({"point": {k: R["point"][k] for k in ("averted", "cost_allocated", "mix")},
                       "uncertainty": R["uncertainty"]["fixed_plan"], "label": R["uncertainty"]["label"],
                       "stability": {k: R["stability"].get(k) for k in ("verdict", "value_verdict")},

@@ -27,7 +27,8 @@ import yaml
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
-from toolkit.analysis.artifacts import ENVELOPE, KINDS, MANIFEST, PRODUCED_BY, PRODUCER_PREFIX, sha256  # noqa: E402
+from toolkit.analysis.artifacts import (ENVELOPE, EXPECTED_KINDS, EXPECTED_ROLES, KINDS, MANIFEST,  # noqa: E402
+                                        PRODUCED_BY, PRODUCER_PREFIX, sha256)
 
 SPEC = "decision_spec.yaml"
 
@@ -48,6 +49,26 @@ def gate_findings(run_dir: str) -> list[dict]:
     except (OSError, ValueError) as e:
         return [_f("analysis_contract_missing", f"{MANIFEST} unreadable: {e}")]
     out = []
+    # Codex P1-9: only a manifest the harness published at the end of a complete run certifies anything.
+    if man.get("status") == "blocked":
+        return [_f("analysis_contract_blocked", f"the analysis stopped before publishing a plan: {man.get('reason')} "
+                                                "(analysis/blocked.yaml)")]
+    if man.get("status") != "complete" or man.get("complete") is not True:
+        return [_f("analysis_contract_incomplete", f"{MANIFEST} does not record a completed run (status "
+                                                   f"{man.get('status')!r})")]
+    exp = man.get("expected") or {}
+    kinds = {e.get("kind") for e in (man.get("artifacts") or {}).values()}
+    roles = {e.get("role") for e in (man.get("deliverables") or {}).values()}
+    need_k = set(EXPECTED_KINDS) | set(exp.get("kinds") or [])
+    for k in sorted(need_k - kinds):
+        out.append(_f("analysis_contract_incomplete", f"the completed run has no {k} artifact", k))
+    for r in sorted(set(EXPECTED_ROLES) - roles):
+        out.append(_f("analysis_contract_incomplete", f"the completed run has no {r} deliverable", r))
+    listed = set(man.get("deliverables") or {})
+    for tid, rel in sorted((exp.get("decision_tests") or {}).items()):
+        if rel and rel not in listed:
+            out.append(_f("analysis_contract_incomplete", f"decision test {tid}: result file {rel} is not a deliverable",
+                          tid))
     cur = sha256(os.path.join(run_dir, SPEC))
     if man.get("spec_sha256") != cur:
         out.append(_f("analysis_contract_stale", f"the artifacts were computed for spec {str(man.get('spec_sha256'))[:12]}, "
@@ -86,6 +107,15 @@ def gate_findings(run_dir: str) -> list[dict]:
             out.append(_f("analysis_contract_schema", f"artifact {rel}: payload lacks {pm}", rel))
         if doc["spec_sha256"] != man.get("spec_sha256"):
             out.append(_f("analysis_contract_stale", f"artifact {rel} was computed for another spec", rel))
+        for src, h in sorted((doc.get("inputs") or {}).items()):     # Codex P1-10: every recorded input still current
+            cur_h = sha256(src if os.path.isabs(src) else os.path.join(run_dir, src))
+            if cur_h != h:
+                out.append(_f("analysis_contract_stale", f"artifact {rel}: input {src} changed (or vanished) after it "
+                                                         "was computed", f"{rel}:{src}"))
+        if kind == "calibration":
+            out += _calibration(rel, doc.get("data") or {})
+        if kind == "point" and ((doc.get("data") or {}).get("model_corrections") or {}).get("on_plan"):
+            out.append(_f("analysis_contract_model_domain", f"{rel}: model corrections bear on the plan", rel))
     for rel, ent in sorted((man.get("deliverables") or {}).items()):
         p = os.path.join(run_dir, rel)
         if not os.path.exists(p):
@@ -96,6 +126,35 @@ def gate_findings(run_dir: str) -> list[dict]:
     out += _decision_tests(run_dir, man)
     out += _claims(run_dir, man)
     out += _figures(run_dir, man)
+    return out
+
+
+def _calibration(rel, d) -> list[dict]:
+    """Codex P1-8: a calibration that did not converge, hit a bound, left targets outside what the model reaches
+    (clamped or unsupported), or left a parameter or unit unidentified does not certify a plan."""
+    out = []
+    m, dg, idf = d.get("method"), d.get("diagnostics") or {}, d.get("identifiability") or {}
+    if m == "emulator_inversion":
+        if dg.get("clamped_units"):
+            out.append(_f("analysis_contract_calibration", f"{rel}: {dg['clamped_units']} units' targets lie outside "
+                                                           "what the model reaches over the calibration range", rel))
+        if idf.get("units_unidentified"):
+            out.append(_f("analysis_contract_calibration", f"{rel}: {len(idf['units_unidentified'])} units' targets "
+                                                           "hardly constrain their attribute (flat slope)", rel))
+    elif m == "likelihood":
+        if dg.get("converged") is not True:
+            out.append(_f("analysis_contract_calibration", f"{rel}: the likelihood fit did not converge "
+                                                           f"({dg.get('message')})", rel))
+        if dg.get("at_bound"):
+            out.append(_f("analysis_contract_calibration", f"{rel}: parameters at a bound: {dg['at_bound'][:5]}", rel))
+        if dg.get("unsupported_targets"):
+            out.append(_f("analysis_contract_calibration", f"{rel}: {dg['unsupported_targets']} targets the model "
+                                                           "cannot produce (observed above zero, expected zero)", rel))
+        bad = [q for q, v in (idf.get("parameters") or {}).items() if v.get("status") == "unidentified"]
+        if bad:
+            out.append(_f("analysis_contract_calibration", f"{rel}: unidentified parameters {bad}", rel))
+    elif m != "none":
+        out.append(_f("analysis_contract_calibration", f"{rel}: unknown calibration method {m!r}", rel))
     return out
 
 
@@ -171,33 +230,86 @@ def _figures(run_dir, man) -> list[dict]:
 
 def _self_test() -> int:
     import tempfile
+    from toolkit.analysis.artifacts import Store
     fails = []
 
     def ok(c, m):
         print(("PASS " if c else "FAIL ") + m)
         if not c:
             fails.append(m)
+
+    def kinds(d):
+        return {x["kind"] for x in gate_findings(d)}
+
+    def complete_run(d, cal=None, drop_kind=None, finalize=True):
+        """A minimal completed run: every expected artifact kind and deliverable role."""
+        S = Store(d, sha256(os.path.join(d, SPEC)), True, {"name": "t", "version": "1", "card_sha256": "x"})
+        open(os.path.join(d, "units.csv"), "w").write("id\n1\n")
+        pay = {"engine": {"card": {}, "parameters": []}, "batch": {"evaluation": "direct"},
+               "calibration": cal or {"method": "none", "units": {}, "diagnostics": {}, "identifiability": {}},
+               "point": {"plan": {}, "averted": {}, "cost_allocated": 0, "mix": {}, "solver": {}},
+               "uncertainty": {"draws": 2, "covers": [], "excludes": [], "label": "", "fixed_plan": {}},
+               "stability": {"method": "m", "folds": [], "metrics": {}, "verdict": "NOT_RUN", "value_verdict": "NOT_RUN"},
+               "sensitivity": {"rows": []}, "decision_tests": {"tests": []}, "figures": {"figures": []},
+               "claims": {"n_claims": 0, "unresolved": []}}
+        for k, v in pay.items():
+            if k != drop_kind:
+                S.write(k, v, f"toolkit/analysis/{k}.py", ["units.csv"] if k == "calibration" else [])
+        for rel, role in (("alloc.csv", "allocation"), ("uncertainty_report.yaml", "uncertainty_report"),
+                          ("claims_spec.yaml", "claims_spec"), ("results.md", "results")):
+            open(os.path.join(d, rel), "w").write("x\n")
+            S.deliverable(os.path.join(d, rel), "toolkit/analysis/run.py", role)
+        os.makedirs(os.path.join(d, "models"), exist_ok=True)
+        yaml.safe_dump({"claims": []}, open(os.path.join(d, "models", "claims_ledger.yaml"), "w"))
+        S.deliverable(os.path.join(d, "models", "claims_ledger.yaml"), "toolkit/analysis/claims.py", "claims_ledger")
+        S.manifest["expected"] = {"kinds": list(EXPECTED_KINDS), "roles": list(EXPECTED_ROLES), "decision_tests": {}}
+        if finalize:
+            S.finalize("complete")
+        return S
+
     with tempfile.TemporaryDirectory() as d:
         ok(gate_findings(d) == [], "K1 a run without a spec or analysis: nothing to check")
         open(os.path.join(d, SPEC), "w").write("x: 1\n")
-        ok([x["kind"] for x in gate_findings(d)] == ["analysis_contract_missing"],
-           "K2 a spec without the analysis output fails closed")
+        ok(kinds(d) == {"analysis_contract_missing"}, "K2 a spec without the analysis output fails closed")
         os.makedirs(os.path.join(d, "analysis"))
         open(os.path.join(d, MANIFEST), "w").write("{not json")
-        ok([x["kind"] for x in gate_findings(d)] == ["analysis_contract_missing"], "K3 an unreadable manifest fails closed")
-        from toolkit.analysis.artifacts import Store
-        S = Store(d, sha256(os.path.join(d, SPEC)), True, {"name": "t", "version": "1", "card_sha256": "x"})
-        rel = S.write("sensitivity", {"rows": []}, "toolkit/analysis/sensitivity.py")
-        ok(gate_findings(d) == [], f"K4 a harness artifact for the current signed spec passes: {gate_findings(d)}")
+        ok(kinds(d) == {"analysis_contract_missing"}, "K3 an unreadable manifest fails closed")
+        S = complete_run(d)
+        ok(gate_findings(d) == [], f"K4 a completed harness run for the current signed spec passes: {gate_findings(d)}")
+        rel = "analysis/sensitivity.yaml"
         doc = yaml.safe_load(open(os.path.join(d, rel)))
         doc["produced_by"] = "agent"
         yaml.safe_dump(doc, open(os.path.join(d, rel), "w"))
         S.manifest["artifacts"][rel]["sha256"] = sha256(os.path.join(d, rel))
-        S.save()
-        ok("analysis_contract_schema" in [x["kind"] for x in gate_findings(d)],
-           "K5 an artifact not produced by the harness fails (even with a matching hash)")
+        S.finalize("complete")
+        ok("analysis_contract_schema" in kinds(d), "K5 an artifact not produced by the harness fails (matching hash)")
         open(os.path.join(d, SPEC), "a").write("y: 2\n")
-        ok("analysis_contract_stale" in [x["kind"] for x in gate_findings(d)], "K6 a spec edited after the analysis: stale")
+        ok("analysis_contract_stale" in kinds(d), "K6 a spec edited after the analysis: stale")
+    with tempfile.TemporaryDirectory() as d:
+        open(os.path.join(d, SPEC), "w").write("x: 1\n")
+        complete_run(d, finalize=False)
+        ok(kinds(d) == {"analysis_contract_missing"}, "K7 a run that never finished publishes no manifest (Codex P1-9)")
+        S = complete_run(d, drop_kind="sensitivity")
+        ok("analysis_contract_incomplete" in kinds(d), "K8 a completed run missing an expected artifact (Codex P1-9)")
+        S = complete_run(d)
+        S.finalize("blocked", "corrections bear on the plan")
+        ok(kinds(d) == {"analysis_contract_blocked"}, "K9 a blocked run is reported as blocked")
+        complete_run(d)
+        open(os.path.join(d, "units.csv"), "a").write("2\n")
+        ok("analysis_contract_stale" in kinds(d), "K10 an input changed after the artifact was computed (Codex P1-10)")
+        for cal, why in (({"method": "likelihood", "units": {}, "identifiability": {},
+                           "diagnostics": {"converged": False, "at_bound": []}}, "did not converge"),
+                         ({"method": "likelihood", "units": {}, "identifiability": {},
+                           "diagnostics": {"converged": True, "at_bound": ["z:u1"]}}, "at a bound"),
+                         ({"method": "likelihood", "units": {}, "identifiability": {},
+                           "diagnostics": {"converged": True, "at_bound": [], "unsupported_targets": 2}}, "cannot produce"),
+                         ({"method": "likelihood", "units": {}, "diagnostics": {"converged": True, "at_bound": []},
+                           "identifiability": {"parameters": {"p": {"status": "unidentified"}}}}, "unidentified"),
+                         ({"method": "emulator_inversion", "units": {}, "identifiability": {},
+                           "diagnostics": {"clamped_units": 3}}, "outside what the model reaches")):
+            complete_run(d, cal=cal)
+            f = [x for x in gate_findings(d) if x["kind"] == "analysis_contract_calibration"]
+            ok(f and why in f[0]["claim"], f"K11 calibration gated (Codex P1-8): {why}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

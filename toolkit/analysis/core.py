@@ -45,6 +45,7 @@ class Analysis:
         self.dfac = discount_factor(spec)
         self.method = spec["calibration"].get("method", "none")
         self.lik = None
+        self.last_events = []
 
     # ------------------------------------------------------------ calibration
     def calibrate(self, theta, shifts=None, ids=None):
@@ -71,6 +72,7 @@ class Analysis:
         with optional per-cost-item multipliers."""
         ids = ids or self.ids
         out = self.model.predict(zs, theta, ids, noise=noise)
+        self.last_events = list(getattr(self.model, "last_events", []) or [])
         ben = {i: {k: self.dfac * (out[i]["y"][self.comp][self.primary] - out[i]["y"][k][self.primary])
                    for k in self.pk} for i in ids}
         units = [self.by_id[i] for i in ids]
@@ -82,6 +84,11 @@ class Analysis:
         else:
             cost = {i: {k: cm[i][k]["total"] for k in self.pk} for i in ids}
         return out, ben, cost
+
+    def plan_corrections(self, events, plan) -> list[dict]:
+        """The model corrections (extrapolation, clips, floors) that bear on the plan: on a unit's chosen package,
+        on its comparator (every benefit is measured from it), or on the whole unit (Codex P1-6)."""
+        return [e for e in events if e["package"] in ("*", self.comp) or plan.get(e["unit"]) == e["package"]]
 
     def solve(self, ben, cost, budget=None, feas=None):
         r = aopt.solve(ben, cost, feas or self.feas, self.budget if budget is None else budget, method="ilp",

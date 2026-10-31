@@ -37,8 +37,9 @@ def pipeline_steps(spec_path: str, run_dir: str) -> list[dict]:
         deps.append(os.path.relpath(spec.settings_path, run_dir))
     if spec["calibration"].get("method") == "likelihood":
         deps.append(os.path.relpath(spec.resolve(spec["calibration"]["targets"]["csv"]), run_dir))
-    outs = ["analysis/manifest.json", spec["deliverable"]["allocation_file"], "uncertainty_report.yaml",
-            "models/claims_ledger.yaml", "results.md"]
+    # uncertainty_report.yaml and models/claims_ledger.yaml are written too, but S1 reserves them for their
+    # registered producers (agents/enforcement.py); the manifest (and the contract checks) track them instead.
+    outs = ["analysis/manifest.json", spec["deliverable"]["allocation_file"], "results.md"]
     return [{"id": "analyze", "cmd": f"python3 {os.path.join(ROOT, 'toolkit', 'analysis', 'run.py')} {run_dir} "
                                      f"--spec {os.path.relpath(spec_path, run_dir)}",
              "inputs": deps, "outputs": outs, "produced_by": "harness"}]

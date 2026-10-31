@@ -41,7 +41,15 @@ KINDS = {
     "decision_tests": ("tests",),
     "figures": ("figures",),
     "claims": ("n_claims", "unresolved"),
+    "blocked": ("reason", "corrections"),
 }
+
+
+# What a complete run must contain (Codex P1-9): artifact kinds (plus `emulator` on the emulator path) and
+# deliverable roles. Decision-test files are listed per test in the decision_tests artifact.
+EXPECTED_KINDS = ("engine", "batch", "calibration", "point", "uncertainty", "stability", "sensitivity",
+                  "decision_tests", "figures", "claims")
+EXPECTED_ROLES = ("allocation", "uncertainty_report", "claims_spec", "claims_ledger", "results")
 
 
 def sha256(path: str) -> str | None:
@@ -76,6 +84,10 @@ class Store:
         self.run_dir = os.path.abspath(run_dir)
         self.spec_sha, self.spec_signed, self.engine_info = spec_sha, spec_signed, engine_info
         os.makedirs(os.path.join(self.run_dir, "analysis"), exist_ok=True)
+        # Codex P1-9: a run's manifest is published once, atomically, when the run ends; an earlier run's manifest is
+        # withdrawn first, so a run that stops half way can never leave a complete-looking certificate behind.
+        if os.path.exists(self.path(MANIFEST)):
+            os.remove(self.path(MANIFEST))
         self.manifest = {"produced_by": PRODUCED_BY, "spec_sha256": spec_sha, "spec_signed": spec_signed,
                          "settings_sha256": settings_sha, "engine": engine_info, "artifacts": {}, "deliverables": {}}
 
@@ -101,18 +113,26 @@ class Store:
         with open(self.path(rel), "w", encoding="utf-8") as f:
             yaml.safe_dump(doc, f, sort_keys=False, width=120)
         self.manifest["artifacts"][rel] = {"kind": kind, "sha256": sha256(self.path(rel)), "producer": producer}
-        self.save()
         return rel
 
     def deliverable(self, path: str, producer: str, role: str) -> str:
         rel = self.rel(path)
         self.manifest["deliverables"][rel] = {"role": role, "sha256": sha256(path), "producer": producer}
-        self.save()
         return rel
 
-    def save(self):
-        with open(self.path(MANIFEST), "w", encoding="utf-8") as f:
-            json.dump(self.manifest, f, indent=1, sort_keys=True)
+    def finalize(self, status: str, reason: str = "") -> str:
+        """Publish the manifest atomically (write to a temporary file, then rename). status: complete | blocked."""
+        if status not in ("complete", "blocked"):
+            raise ValueError(status)
+        self.manifest.update(status=status, complete=status == "complete", reason=reason,
+                             finished_at=_dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"))
+        tmp = self.path(MANIFEST) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(plain(self.manifest), f, indent=1, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self.path(MANIFEST))
+        return MANIFEST
 
 
 def read(run_dir: str, rel: str) -> dict:

@@ -3,19 +3,24 @@
 Types (spec `analysis.decision_tests`):
   interaction_rescale  the spike's DT1: the increment of `components` on top of any of `with_any`
                        is rescaled so the engine's interaction odds ratio in the benchmark setting
-                       equals each value (arm odds ratios from the engine card's benchmark, or
-                       `engine_arm_or` in the spec);
+                       equals each value. The arm odds ratios come only from the engine's verified
+                       benchmark results (toolkit/engines/benchmark.py verified_benchmarks: written by
+                       the runner for this engine's current code), never from the spec (Codex P1-13).
+                       A value the rescaling cannot reach (scale outside [0, MAX_SCALE]) is rejected,
+                       and every reached value is checked: the achieved interaction equals the
+                       requested one (Codex P1-12);
   parameter_value      an engine parameter set to each value (an emulator input on the emulator path);
   group_rule           a constraints.group_rules rule removed (or `add:` a rule) and the plan re-solved;
   envelope             the plan re-solved at each envelope.
-Each writes `models/decision_tests/<id>.yaml` in the Phase 49 result schema (finding, varied,
-criterion, decision_changes, recommendation.with / without, share_units_changed,
-share_threshold) with `produced_by: harness`.
+A test with at least one usable value writes `models/decision_tests/<id>.yaml` in the Phase 49
+result schema (finding, varied, criterion, decision_changes, recommendation.with / without,
+share_units_changed, share_threshold) with `produced_by: harness`. A test with none writes no
+result file (a declaration citing it is then invalid) and is reported as not run, with why.
 
 Relevance, up front: when a test changes only benefits, and every benefit it changes goes down and
 belongs to a package no unit receives in the point plan, the point plan stays optimal (its value is
-unchanged and no alternative improves). The file then says first that the test cannot move the
-plan, and whether the components it acts on appear in any re-optimised uncertainty draw.
+unchanged and no alternative improves). The file then says first that the test cannot move the plan.
+Statements are words only; every number in results.md comes from computed claims (Codex P1-4).
 """
 from __future__ import annotations
 
@@ -28,9 +33,12 @@ import yaml
 
 from toolkit.alloc import packages as apackages
 from toolkit.analysis.artifacts import plain
+from toolkit.engines.benchmark import verified_benchmarks
 
 PRODUCER = "toolkit/analysis/decision_tests.py"
 DIR = os.path.join("models", "decision_tests")
+MAX_SCALE = 5.0
+ACHIEVED_RTOL = 1e-9
 
 
 def _threshold(A) -> float:
@@ -53,25 +61,40 @@ def run_all(A, z0, out0, ben0, cost0, plan, uq_data, run_dir) -> list[dict]:
     for dt in A.spec["analysis"].get("decision_tests") or []:
         rec = run_one(A, dt, z0, ben0, cost0, plan, uq_data)
         p = os.path.join(run_dir, DIR, f"{dt['id']}.yaml")
-        with open(p, "w") as f:
-            yaml.safe_dump(plain(rec), f, sort_keys=False, width=120)
-        rec["path"] = os.path.relpath(p, run_dir)
+        if rec.get("status") == "not_run":
+            if os.path.exists(p):
+                os.remove(p)            # no stale result file from an earlier run
+            rec["path"] = None
+        else:
+            with open(p, "w") as f:
+                yaml.safe_dump(plain(rec), f, sort_keys=False, width=120)
+            rec["path"] = os.path.relpath(p, run_dir)
         out.append(rec)
     return out
+
+
+def _not_run(A, dt, why, extra=None) -> dict:
+    return {"status": "not_run", "test_id": dt["id"], "type": dt["type"], "question": dt.get("text", ""),
+            "statement": f"This test was not run: {why}.", "reason": why, "can_move_plan": None,
+            "decision_changes": None, "share_units_changed": None, "share_threshold": _threshold(A),
+            "produced_by": "harness", "producer": PRODUCER, **(extra or {})}
 
 
 def run_one(A, dt, z0, ben0, cost0, plan, uq_data) -> dict:
     t = dt["type"]
     thr = _threshold(A)
-    cases, varied, lowers = [], "", []
+    extra, rejected = {}, []
     if t == "interaction_rescale":
-        varied, cases, lowers, extra = _interaction(A, dt, ben0, cost0, plan)
+        r = _interaction(A, dt, ben0, cost0, plan)
+        if r.get("not_run"):
+            return _not_run(A, dt, r["not_run"], r.get("info"))
+        varied, cases, lowers, extra, rejected = r["varied"], r["cases"], r["lowers"], r["extra"], r["rejected"]
     elif t == "parameter_value":
         p = dt["parameter"]
         if A.model.kind == "emulator" and p not in A.fr:
-            raise ValueError(f"decision test {dt['id']}: {p} is not an emulator input; use direct evaluation")
-        varied = f"engine parameter {p} set to {dt['values']} (point value {A.theta0.get(p)})"
-        extra = {}
+            return _not_run(A, dt, f"{p} is not an emulator input; it needs engine runs (direct evaluation)")
+        varied = f"engine parameter {p} set to each tested value"
+        cases, lowers = [], []
         for v in dt["values"]:
             theta = dict(A.theta0, **{p: float(v)})
             zs = {i: x[0] for i, x in A.calibrate(theta).items()} if A.method == "emulator_inversion" else z0
@@ -85,7 +108,7 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data) -> dict:
         if dt.get("add"):
             add = dict(dt["add"])
             rules[add.pop("id", dt["id"])] = add
-            varied = f"group rule added: {dt['add']}"
+            varied = f"group rule added on {add.get('by')} for {', '.join(map(str, add.get('components') or []))}"
         else:
             rules.pop(dt["rule"], None)
             varied = f"group rule {dt['rule']} removed"
@@ -95,13 +118,11 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data) -> dict:
         feas = apackages.feasibility(a, A.spec.units())
         cases = [("with" if dt.get("add") else "without", ben0, cost0, None, feas)]
         lowers = [False]
-        extra = {}
     elif t == "envelope":
-        varied = f"envelope set to {dt['values']} USD (point {A.spec['constraints']['envelope_usd']})"
+        varied = "the envelope set to each tested value"
         fixed = sum(float(v) for v in (A.spec["constraints"].get("fixed_costs_usd") or {}).values())
         cases = [(v, ben0, cost0, float(v) - fixed, None) for v in dt["values"]]
         lowers = [False] * len(cases)
-        extra = {}
     else:
         raise ValueError(f"decision test {dt.get('id')}: unknown type {t}")
     results = []
@@ -122,55 +143,75 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data) -> dict:
         stmt = ("This test cannot move the plan: it only lowers the benefit of packages that no unit receives in the "
                 "point plan, so the point plan stays optimal")
         if comps:
-            stmt += (f"; {', '.join(sorted(comps))} is in {in_plan} units of the point plan and in "
-                     f"{'some' if in_draws else 'none'} of the {uq_data.get('draws')} re-optimised uncertainty draws")
+            stmt += (f"; {', '.join(sorted(comps))} is in {'some' if in_plan else 'no'} unit of the point plan and in "
+                     f"{'some' if in_draws else 'none'} of the re-optimised uncertainty draws")
         can_move = False
     else:
         stmt = "This test can move the plan: it was re-solved for each value"
         can_move = True
+    if rejected:
+        stmt += "; some requested values could not be reached and were rejected"
     finding = dt.get("finding") or f"decision_test:{dt['id']}"
-    rec = {"statement": stmt + ".", "can_move_plan": can_move, "finding": finding, "test_id": dt["id"],
-           "type": t, "question": dt.get("text", ""), "varied": varied,
+    rec = {"statement": stmt + ".", "status": "run", "can_move_plan": can_move, "finding": finding,
+           "test_id": dt["id"], "type": t, "question": dt.get("text", ""), "varied": varied,
            "criterion": f"the package changes in more than {thr:.0%} of units",
            "decision_changes": bool(share > thr), "share_units_changed": float(share), "share_threshold": thr,
            "recommendation": {"with": A.mix_text(plan), "without": worst["recommendation"]},
-           "results": results, "produced_by": "harness", "producer": PRODUCER}
+           "results": results, "rejected_values": rejected, "produced_by": "harness", "producer": PRODUCER}
     if comps:
         rec["relevance"] = {"components": sorted(comps), "units_with_component_point_plan": in_plan,
                             "components_in_any_draw_plan": in_draws}
     if t == "interaction_rescale":
         rec["engine_arm_or"], rec["engine_interaction"] = extra.get("_arm"), extra.get("_int")
+        rec["arm_source"] = extra.get("_src")
     return rec
 
 
-def _interaction(A, dt, ben0, cost0, plan):
-    arm = dt.get("engine_arm_or")
-    if arm is None:
-        rows = {b["id"]: b for b in (A.eng.describe().benchmarks or [])}
-        b = rows.get(dt.get("benchmark"))
-        if not b or not b.get("arm_or"):
-            raise ValueError(f"decision test {dt['id']}: benchmark {dt.get('benchmark')} with arm odds ratios is not "
-                             "in the engine card")
-        arm = {k: float(np.exp(np.mean([np.log(x[k]) for x in b["arm_or"]]))) for k in ("a11", "a10", "a01")}
+def _interaction(A, dt, ben0, cost0, plan) -> dict:
+    rows, why = verified_benchmarks(A.eng)
+    if why:
+        return {"not_run": f"the engine's benchmark arm ratios are not verified ({why})"}
+    b = {r.get("id"): r for r in rows}.get(dt.get("benchmark"))
+    if not b or not b.get("arm_or"):
+        return {"not_run": f"benchmark {dt.get('benchmark')} with arm odds ratios is not in the verified results"}
+    arm = {k: float(np.exp(np.mean([np.log(x[k]) for x in b["arm_or"]]))) for k in ("a11", "a10", "a01")}
     eng_int = arm["a11"] / (arm["a10"] * arm["a01"])
+    den = math.log(arm["a11"] / arm["a10"])
+    if not den < 0:
+        return {"not_run": "in the benchmark setting the component adds nothing on top of the other, so no rescaling of "
+                           "its increment can set the interaction", "info": {"engine_arm_or": arm}}
     comp, with_any = set(dt["components"]), set(dt["with_any"])
-    cases, lowers, extra = [], [], {"_arm": arm, "_int": eng_int}
+    cases, lowers, rejected = [], [], []
+    extra = {"_arm": arm, "_int": eng_int,
+             "_src": f"verified benchmark results ({dt.get('benchmark')}), toolkit/engines/benchmark.py"}
+    lo_reach = arm["a10"] * math.exp(MAX_SCALE * den) / (arm["a10"] * arm["a01"])
+    hi_reach = 1.0 / arm["a01"]
     for v in dt["values"]:
-        num = math.log(v * arm["a01"])
-        den = math.log(arm["a11"] / arm["a10"])
-        gfac = float(np.clip(num / den, 0.0, 5.0)) if den < 0 else 5.0
+        g = math.log(v * arm["a01"]) / den
+        if not 0.0 <= g <= MAX_SCALE:
+            rejected.append({"value": v, "scale_needed": g, "reachable_interaction": [lo_reach, hi_reach]})
+            continue
+        achieved = arm["a10"] * math.exp(g * den) / (arm["a10"] * arm["a01"])
+        if abs(achieved - v) > ACHIEVED_RTOL * abs(v):
+            raise RuntimeError(f"decision test {dt['id']}: achieved interaction {achieved} != requested {v}")
         ben = {}
         for i in A.ids:
             ben[i] = {}
             for k, cs in A.pk.items():
                 if comp <= cs and cs & with_any:
                     base = next(n for n, c2 in A.pk.items() if c2 == cs - comp)
-                    ben[i][k] = ben0[i][base] + gfac * (ben0[i][k] - ben0[i][base])
+                    ben[i][k] = ben0[i][base] + g * (ben0[i][k] - ben0[i][base])
                 else:
                     ben[i][k] = ben0[i][k]
-        cases.append((v, ben, cost0, None, None))
+        cases.append((v, ben, None, None, None))
         lowers.append(_lowers_only_unchosen(ben0, ben, plan))
-        extra[v] = {"increment_scale": gfac}
+        extra[v] = {"increment_scale": g, "achieved_interaction": achieved}
+    if not cases:
+        return {"not_run": "no requested interaction can be reached by rescaling the increment within its allowed range "
+                           "(the engine's reachable interval is in the test's info)",
+                "info": {"engine_arm_or": arm, "engine_interaction": eng_int, "rejected_values": rejected,
+                         "reachable_interaction": [lo_reach, hi_reach]}}
+    cases = [(v, ben, cost0, b_, f_) for (v, ben, _c, b_, f_) in cases]
     varied = (f"the increment of {sorted(comp)} given any of {sorted(with_any)} rescaled so the engine's interaction "
-              f"odds ratio in the {dt.get('benchmark', 'benchmark')} setting ({eng_int:.3g}) equals {dt['values']}")
-    return varied, cases, lowers, extra
+              f"odds ratio in the {dt.get('benchmark')} setting equals each tested value")
+    return {"varied": varied, "cases": cases, "lowers": lowers, "extra": extra, "rejected": rejected}
