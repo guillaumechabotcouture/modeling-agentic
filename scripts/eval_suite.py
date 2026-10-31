@@ -856,7 +856,7 @@ def run_local(questions, tree, tag, reps, execute) -> int:
             assign[label] = {"launch_id": launch_id, "workspace": dest, "eval_inputs_sha256": shipped}
             cmd = [sys.executable, "main.py", question, "--max-rounds", "3", "--max-budget-usd", "35",
                    "--signoff", "lead"]
-            print(f"{q} {label}: cd {dest} && python3 main.py \"$(cat evals/{q}/question.txt)\" --max-rounds 3 "
+            print(f"{q} {label}: cd {dest} && python3 main.py \"$(cat {os.path.join(EVALS, q, 'question.txt')})\" --max-rounds 3 "
                   f"--max-budget-usd 35 --signoff lead")
             if execute:
                 subprocess.run(cmd, cwd=dest)
@@ -995,7 +995,7 @@ def main(argv=None) -> int:
             return 1
         if args.local:
             return run_local(qs, tree, args.tag, args.reps, args.execute)
-        cmds = launch_commands(qs, args.tag, args.reps, args.tree)
+        cmds = launch_commands(qs, args.tag, args.reps, tree if args.tree else None)
         print(f"preflight OK ({len(qs)} questions, {args.reps} replicate(s), model spend cap US$35 each, "
               f"at most US${35 * len(qs) * args.reps})")
         for c in cmds:
