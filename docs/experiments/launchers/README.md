@@ -4,6 +4,11 @@
 for launch, status, collect, shutdown and the keeper; the cluster stops itself once every
 run is stored). The scripts below are the record of how attempts up to 7 were launched.
 
+While a run is live, `python cloud/run_cluster.py <config> health --loop` checks it every
+5 minutes (it connects to the existing cluster only and cannot create one) and appends anomalies to `<out_dir>/health.log`: compute queued while
+compute VMs sit idle, a gate-finding spike, a `session_error`, no heartbeat or tool use, early
+spend, and compute charged with no completed row. Thresholds: `cloud/run_health.yaml`.
+
 Versioned copies of the scripts that start and manage cloud runs, so they are reviewed with the
 harness. They run from `~/modeling-agentic-keep/coiled_run/` (they write their outputs next to it);
 keep the two copies identical when changing either.
