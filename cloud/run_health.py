@@ -38,6 +38,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -302,8 +303,34 @@ class Monitor:
         return new
 
 
+_R = "[REDACTED]"
+_SECRET_PATTERNS = [
+    (re.compile(r"sk-ant-[A-Za-z0-9_\-]{8,}"), _R),                      # Anthropic API keys
+    (re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_\-]{16,}"), _R),             # OpenAI-style keys
+    (re.compile(r"(?i)\b(bearer|basic|token)\s+[A-Za-z0-9._~+/=\-]{8,}"), r"\1 " + _R),
+    (re.compile(r"\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"), _R),   # JWTs
+    (re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://)[^/\s:@]+:[^/\s@]+@"), r"\1" + _R + "@"),  # URL userinfo
+    (re.compile(r"(?i)([?&;\s](?:sig|signature|token|access_token|refresh_token|id_token|api[_-]?key|key|"
+                r"password|passwd|pwd|secret|client_secret|code|credential|auth)=)[^&\s;\"']+"), r"\1" + _R),
+    (re.compile(r"(?i)\b(AccountKey|SharedAccessKey|SharedAccessSignature|Password)=[^;\s\"']+"), r"\1=" + _R),
+    (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"), _R),                   # GitHub tokens
+    (re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"), _R),                  # AWS access key ids
+    (re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}"), _R),                # Slack tokens
+]
+
+
+def redact(text) -> str:
+    """Credentials removed from a free-form string (an error message, a trace
+    line) before it is printed or logged. Applied to every alert in
+    format_alert, which every output path goes through."""
+    s = str(text)
+    for pat, repl in _SECRET_PATTERNS:
+        s = pat.sub(repl, s)
+    return s
+
+
 def format_alert(a: dict, label: str = "") -> str:
-    return f"{a['at_iso']} {label + ' ' if label else ''}HEALTH {a['rule']}: {a['message']}"
+    return redact(f"{a['at_iso']} {label + ' ' if label else ''}HEALTH {a['rule']}: {a['message']}")
 
 
 def log_alerts(alerts: list[dict], path: str | None, label: str = "") -> None:
@@ -663,6 +690,33 @@ def _self_test() -> int:
         log_alerts(se, lp, "R1")
         with open(lp) as f:
             ok(f.read().startswith("2026-10-29T07:00:25Z R1 HEALTH session_error:"), "RH21 alerts are appended to the log")
+
+    # Codex round 1, P1-3: credentials in any free-form string are redacted
+    # before an alert is printed or logged (one place: format_alert).
+    secrets = {
+        "anthropic key": "sk-ant-api03-AbCdEf0123456789_-AbCdEf0123456789",
+        "openai key": "sk-proj-AbCdEf0123456789AbCdEf0123456789",
+        "bearer": "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl",
+        "url userinfo": "https://alice:s3cretPass@storage.example.net/x",
+        "query secret": "https://api.example.net/v1?api_key=AbC123SECRET&x=1",
+        "azure sas": "https://acct.blob.core.windows.net/c/b?sv=2022-11-02&ss=b&sig=AbCdEf%2Bgh%3D&se=2026",
+        "azure connection string": "DefaultEndpointsProtocol=https;AccountName=a;AccountKey=QUJDREVGR0g=;Endpoint",
+        "github token": "ghp_AbCdEf0123456789AbCdEf0123456789AbCd",
+        "aws key": "AKIAABCDEFGHIJKLMNOP",
+    }
+    leaked = {"AbCdEf0123456789_-AbCdEf0123456789", "AbCdEf0123456789AbCdEf0123456789", "c2lnbmF0dXJl",
+              "s3cretPass", "AbC123SECRET", "AbCdEf%2Bgh%3D", "QUJDREVGR0g=", "ghp_AbCdEf", "AKIAABCDEFGHIJKLMNOP"}
+    for label, sec in secrets.items():
+        a = _alert("monitor_error", f"k:{label}", now, f"could not read status.json: {sec} (exit 1)")
+        line = format_alert(a)
+        ok(not any(x in line for x in leaked) and "[REDACTED]" in line and "exit 1" in line,
+           f"RH22 a {label} is redacted from an alert ({line[-90:]})")
+    with tempfile.TemporaryDirectory() as td:
+        lp = os.path.join(td, "h.log")
+        log_alerts([_alert("session_error", "x", now, "error: " + secrets["anthropic key"])], lp, "R1")
+        ok("sk-ant" not in open(lp).read(), "RH23 the log file gets the redacted text too")
+    ok(redact("tls://10.0.0.7:8786 round 5 gate: 83 findings") == "tls://10.0.0.7:8786 round 5 gate: 83 findings",
+       "RH24 ordinary text, addresses and numbers are left alone")
 
     if fails:
         print(f"FAILED: {len(fails)} self-test case(s).")

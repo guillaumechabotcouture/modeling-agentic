@@ -784,10 +784,38 @@ def health_snapshots(cfg, client, assign: dict, now: float | None = None) -> dic
     return out
 
 
-def health(cfg, args, attach_fn=None, running_fn=None, sleep=time.sleep) -> int:
+def connect_existing(name: str, lister=None, security_fn=None, client_cls=None):
+    """A Client on the live cluster `name`, or None. Built from the cluster's
+    scheduler address and TLS security as the Coiled API reports them, then a
+    plain distributed.Client: nothing on this path can create a cluster
+    (a coiled Cluster opened by name on a cluster that has just stopped makes a new
+    one). A cluster that is gone, or stops between the list and the connect,
+    gives None."""
+    cid = live_id(name, lister)
+    if cid is None:
+        return None
+    if security_fn is None:
+        def security_fn(cluster_id):
+            from coiled.v2.core import CloudV2
+            with CloudV2() as cloud:
+                return cloud.security(cluster_id, workspace=WORKSPACE)
+    try:
+        sec, info = security_fn(cid)
+    except RuntimeError:            # the scheduler is no longer in the started state
+        return None
+    if client_cls is None:
+        from distributed import Client as client_cls
+    return client_cls(info["address_to_use"], security=sec, timeout="60s")
+
+
+def health(cfg, args, connect_fn=None, sleep=time.sleep) -> int:
     """`health`: check a live run once, or every `--interval` s with `--loop`,
     appending new alerts to the log (default <out_dir>/health.log) and stdout.
-    Attach-only: a stopped cluster is reported, never recreated."""
+    It connects with connect_existing, which cannot create a cluster; a
+    cluster that is not running is reported and that poll skipped. A poll
+    that cannot read something (assignments.json, a run file, the scheduler)
+    logs a monitor_error and the next poll tries again: the loop never ends
+    on a transient read. Every line goes through run_health.redact."""
     import argparse
     import run_health as rh
     ap = argparse.ArgumentParser(prog="run_cluster.py <config> health")
@@ -797,27 +825,58 @@ def health(cfg, args, attach_fn=None, running_fn=None, sleep=time.sleep) -> int:
     ap.add_argument("--thresholds", default=rh.THRESHOLDS)
     ap.add_argument("--max-polls", type=int, default=0, help=argparse.SUPPRESS)
     a = ap.parse_args(args)
-    attach_fn, running_fn = attach_fn or attach, running_fn or is_running
+    connect_fn = connect_fn or connect_existing
     thresholds = rh.load_thresholds(a.thresholds)
     monitors = {label: rh.Monitor(thresholds) for label in cfg.labels}
+    seen_poll_errors: set = set()
     polls = 0
+
+    def poll_error(what: str, e: Exception) -> None:
+        now = time.time()
+        key = f"poll:{what}:{type(e).__name__}"
+        alert = {"rule": "monitor_error", "key": key, "at": now, "at_iso": rh._iso(now),
+                 "message": f"could not read {what}: {type(e).__name__}: {str(e)[:200]} (retrying next poll)"}
+        if key not in seen_poll_errors:
+            seen_poll_errors.add(key)
+            rh.log_alerts([alert], a.log)
+        else:
+            print(rh.format_alert(alert))
+
     while True:
-        if not running_fn(cfg.name):
-            print(f"cluster {cfg.name}: stopped; nothing live to check")
-            return 0
-        assign = json.load(open(cfg.state_file))
-        snaps = health_snapshots(cfg, attach_fn(cfg.name).get_client(), assign)
-        for label, snap in snaps.items():
-            alerts = monitors[label].check(snap)
-            for err in snap.get("input_errors") or []:
-                key = f"input:{err}"
-                if key not in monitors[label].seen:
-                    monitors[label].seen.add(key)
-                    alerts.append({"rule": "monitor_error", "key": key, "at": snap["at"],
-                                   "at_iso": rh._iso(snap["at"]), "message": f"could not read {err}"})
-            rh.log_alerts(alerts, a.log, label)
-            if not alerts and not a.loop:
-                print(f"{label}: no anomalies ({len(snap.get('trace') or [])} trace events read)")
+        client = None
+        try:
+            client = connect_fn(cfg.name)
+            if client is None:
+                print(rh.redact(f"cluster {cfg.name}: not running; poll skipped"))
+            else:
+                try:
+                    with open(cfg.state_file, encoding="utf-8") as f:
+                        assign = json.load(f)
+                    if not isinstance(assign, dict):
+                        raise ValueError("not a mapping")
+                except (OSError, ValueError) as e:
+                    poll_error(os.path.basename(cfg.state_file), e)
+                    assign = None
+                for label, snap in (health_snapshots(cfg, client, assign).items() if assign is not None else ()):
+                    alerts = monitors[label].check(snap)
+                    for err in snap.get("input_errors") or []:
+                        key = f"input:{err}"
+                        if key not in monitors[label].seen:
+                            monitors[label].seen.add(key)
+                            alerts.append({"rule": "monitor_error", "key": key, "at": snap["at"],
+                                           "at_iso": rh._iso(snap["at"]), "message": f"could not read {err}"})
+                    rh.log_alerts(alerts, a.log, label)
+                    if not alerts and not a.loop:
+                        print(f"{label}: no anomalies ({len(snap.get('trace') or [])} trace events read)")
+        except Exception as e:  # noqa: BLE001 — one failed poll must not end the watch
+            poll_error("the cluster", e)
+        finally:
+            close = getattr(client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # noqa: BLE001
+                    pass
         polls += 1
         if not a.loop or (a.max_polls and polls >= a.max_polls):
             return 0
@@ -1002,22 +1061,84 @@ def _self_test_51c(ok) -> None:
         alerts = rh.Monitor(rh.load_thresholds()).check(s)
         ok(sorted({a["rule"] for a in alerts}) == ["session_error", "stall"],
            f"RC51c-3 a live snapshot raises session_error and stall ({sorted(a['rule'] for a in alerts)})")
-        attached = []
+        connected = []
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             rc = health(cfg, ["--loop", "--interval", "0", "--max-polls", "2"],
-                        attach_fn=lambda n: attached.append(n) or types.SimpleNamespace(get_client=lambda: client),
-                        running_fn=lambda n: True, sleep=lambda s: None)
+                        connect_fn=lambda n: connected.append(n) or client, sleep=lambda s: None)
         log = open(os.path.join(cfg.out_dir, "health.log")).read()
-        ok(rc == 0 and attached == ["h", "h"] and log.count("HEALTH session_error") == 1
+        ok(rc == 0 and connected == ["h", "h"] and log.count("HEALTH session_error") == 1
            and "HEALTH monitor_error: could not read trace.jsonl: unparseable line" in log,
            "RC51c-4 health --loop logs each alert once across polls, input errors included")
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            rc = health(cfg, [], attach_fn=lambda n: (_ for _ in ()).throw(AssertionError("attached")),
-                        running_fn=lambda n: False)
-        ok(rc == 0 and "stopped; nothing live to check" in buf.getvalue(),
-           "RC51c-5 a stopped cluster is reported, never attached to")
+            rc = health(cfg, ["--loop", "--interval", "0", "--max-polls", "3"], connect_fn=lambda n: None,
+                        sleep=lambda s: None)
+        ok(rc == 0 and buf.getvalue().count("not running; poll skipped") == 3,
+           "RC51c-5 a cluster that is not running is reported and the poll skipped, every poll")
+
+        # Codex round 1, P1-1: health connects through a path that cannot create a
+        # cluster (Coiled API security + a plain distributed Client), even in a stop race.
+        class NoCreate(types.ModuleType):
+            def __getattr__(self, k):
+                raise AssertionError(f"health touched coiled.{k}")
+        saved = sys.modules.get("coiled")
+        sys.modules["coiled"] = NoCreate("coiled")
+        made = []
+
+        def boom(*a, **k):
+            raise AssertionError("must not be called")
+        try:
+            got = connect_existing("h", lister=lambda: [{"name": "h", "id": 7, "current_state": {"state": "running"}}],
+                                   security_fn=lambda cid: ("SEC", {"address_to_use": f"tls://10.0.0.{cid}:8786"}),
+                                   client_cls=lambda addr, **kw: made.append((addr, kw.get("security"))) or "CLIENT")
+            ok(got == "CLIENT" and made == [("tls://10.0.0.7:8786", "SEC")],
+               "RC51c-7 connect_existing opens a plain Client on the live cluster's scheduler with its security")
+
+            def stopping(cid):
+                raise RuntimeError("Cannot get security info for cluster 7, scheduler state is stopping")
+            gone = connect_existing("h", lister=lambda: [{"name": "h", "id": 7, "current_state": {"state": "stopping"}}],
+                                    security_fn=boom, client_cls=boom)
+            race = connect_existing("h", lister=lambda: [{"name": "h", "id": 7, "current_state": {"state": "running"}}],
+                                    security_fn=stopping, client_cls=boom)
+            ok(gone is None and race is None,
+               "RC51c-8 a stopped cluster, or one stopping between list and connect, gives None, never a new one")
+        finally:
+            if saved is None:
+                sys.modules.pop("coiled", None)
+            else:
+                sys.modules["coiled"] = saved
+        import inspect as _inspect
+        src = _inspect.getsource(health) + _inspect.getsource(health_snapshots) + _inspect.getsource(connect_existing)
+        ok("coiled.Cluster(" not in src and "attach(" not in src, "RC51c-9 health never calls coiled.Cluster or attach")
+
+        # Codex round 1, P1-2: transient read errors are logged and retried, never fatal.
+        os.remove(cfg.state_file)
+        polls = []
+
+        def flaky(n):
+            polls.append(n)
+            if len(polls) == 2:
+                with open(cfg.state_file, "w") as f:
+                    f.write("{torn")
+            if len(polls) == 3:
+                with open(cfg.state_file, "w") as f:
+                    json.dump({"R1": {"worker": "agent"}}, f)
+            return client
+        open(os.path.join(cfg.out_dir, "health.log"), "w").close()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = health(cfg, ["--loop", "--interval", "0", "--max-polls", "3"], connect_fn=flaky,
+                        sleep=lambda s: None)
+        log = open(os.path.join(cfg.out_dir, "health.log")).read()
+        ok(rc == 0 and len(polls) == 3 and "FileNotFoundError" in log and "JSONDecodeError" in log
+           and "HEALTH session_error" in log,
+           "RC51c-10 a missing then torn assignments.json is a monitor error; the loop retries and recovers")
+        os.remove(os.path.join(rd, "status.json"))
+        with open(os.path.join(rd, "trace.jsonl"), "wb") as f:
+            f.write(b"\xff\xfe not text\n")
+        s3 = health_snapshots(cfg, client, {"R1": {"worker": "agent"}})["R1"]
+        ok(s3["status"] is None and s3["input_errors"], "RC51c-11 an unreadable or vanished run file is an input error")
 
         class Broken(FakeClient):
             def run_on_scheduler(self, fn, *a):
