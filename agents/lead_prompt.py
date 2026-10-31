@@ -592,6 +592,11 @@ The validator has already decided for you. Your job is to carry it out:
   the instruction: "Embed the scope_declaration.yaml acknowledgments
   verbatim in report.md §Limitations. Do not soften the language. Do
   not omit blockers."
+  Each declaration of a HIGH gate finding cites `decision_test: <path>`
+  (Phase 49 α; format and exemptions in the rigor manifest, entry
+  `decision_tests`); have the modeler write the test before you declare.
+  An untested declaration does not count, and one whose test shows the
+  decision changes cannot be declared.
 
 - **ACCEPT**: no unresolved HIGH blockers, no structural mismatch.
   Proceed to STAGE 8.

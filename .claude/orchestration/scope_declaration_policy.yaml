@@ -1,0 +1,40 @@
+# Phase 49 α (A20): which scope declarations need a decision test.
+#
+# Read by scripts/declaration_tests.py. A scope declaration that covers a HIGH
+# gate finding (or a MEDIUM escalated to HIGH, `<kind>_persistent`) must cite
+# `decision_test: <path>`: a result file in the D1/D9 format
+# (scripts/mechanism_manifest.py) recording what was set to its target, the
+# criterion, `decision_changes: true|false`, and the recommendation with and
+# without. A declaration needs no test when:
+#   - its entry carries `specified_by: question|brief` and a verbatim `quote:`
+#     (the owner scoped it out), or `owner_amendment: AM-n` naming the finding
+#     (checked by the same functions as D1/D9); or
+#   - the finding is in one of the classes below: it has no model quantity to
+#     vary, so a with/without run cannot be made. Each class says why.
+#
+# A data-availability limit is NOT on this list. In attempt 8 every declared
+# finding (allocation_unstable, benchmark_drift B15/B19, weakly identified
+# parameters) gave missing data as the reason it could not be fixed, and each
+# still had a quantity that could be set to its target (the held-out fold's
+# parameters, the trial's interaction OR, the benchmark's cost per DALY). The
+# missing data explains why a finding cannot be fixed; it does not show that
+# the decision does not depend on it. Findings whose subject is a missing
+# input or artifact are covered by `exempt_suffixes`.
+#
+# Gate code must not hard-code a disease, country or intervention here.
+
+decision_test:
+  # Findings about the write-up's own text (the writer fixes them), the
+  # critics' bookkeeping and the gate's bookkeeping (scope-declaration budget,
+  # effort follow-ups). A gate kind's `<kind>_persistent` escalation (stage
+  # GATE) is judged by its base finding's stage instead.
+  exempt_stages: [WRITE, CRITIQUE, GATE]
+  # Missing or unrun inputs, artifacts and tools: the fix is to produce them;
+  # there is no computed quantity to vary until they exist.
+  exempt_suffixes: [_missing, _incomplete, _unavailable, _not_run, _undocumented]
+  # Effort floors count work done (draws, iterations, parameters perturbed),
+  # not a model quantity.
+  exempt_prefixes: [effort_floors_, effort_floor_]
+  # A stale figure is redrawn, not tested; a malformed decision_rule.md is a
+  # document defect.
+  exempt_kinds: [figure_staleness_detected, decision_rule_malformed]
