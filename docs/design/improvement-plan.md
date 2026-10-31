@@ -26,6 +26,7 @@ Merged (Phase 47, harness fixes; #69–#73):
 
 In review (Phase 48, simplification before attempt 9, with no change to gate output; checked with `gate_replay.py` on attempts 7 and 8 and every local run):
 - **α:** duplicated helpers moved to `scripts/lib/`: the check-module command line (`lib/gate_cli.py`, six copies) and the private by-path loader (`lib/siblings.py`, three copies); two more copies replaced by the existing `lib.safe_io` helpers; two unused functions removed.
+- **β:** the sanity-schema, a-priori identifiability and effort-floor checks moved from `validate_critique_yaml.py` (8,757 → 7,834 lines) into `scripts/sanity_gate.py`, `scripts/identifiability_gate.py` and `scripts/effort_floors_gate.py`, each with `gate_findings(run_dir)` and its own self-test (stacked on α).
 
 Before attempt 9:
 - A16 (compute places chunks on free workers itself, so VMs that join mid-batch get work): merged (Phase 45 δ, #66);

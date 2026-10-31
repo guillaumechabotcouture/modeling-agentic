@@ -32,7 +32,7 @@ fix or explicitly acknowledge.
 
 ## When the gate fires
 
-`_check_sanity_schema` in `scripts/validate_critique_yaml.py`
+The STAGE 7 sanity-schema check (`scripts/sanity_gate.py`)
 triggers at **round ≥ 3**. Earlier rounds skip the check (you're
 still composing outputs). At round ≥ 3:
 

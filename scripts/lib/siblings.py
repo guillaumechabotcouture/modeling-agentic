@@ -8,8 +8,13 @@ can return the run's code. `load_private` imports the harness file by path
 under `<prefix><name>` in sys.modules, so the run's module is never picked
 up and never replaced. Phase 48 α: the copies in data_use, mechanism_manifest
 and calibration_spec; each passes its old prefix, so the sys.modules keys and
-the module objects they share are unchanged. (The validator's
-`_load_sibling` has different rules, plain name first, and stays there.)
+the module objects they share are unchanged.
+
+`load_sibling(name)` is the validator's loader (Phase 48 β moved it here from
+validate_critique_yaml.py, which imports it as `_load_sibling`): it reuses a
+loaded module only when its file is scripts/<name>.py, takes the plain name
+when it is free, and otherwise loads under `_ma_sibling_<name>`, never replacing
+a run's own module of that name.
 """
 from __future__ import annotations
 
@@ -34,6 +39,33 @@ def load_private(name: str, prefix: str):
         except BaseException:
             sys.modules.pop(key, None)
             raise
+    return mod
+
+
+# Phase 48 β: validate_critique_yaml._load_sibling, moved here unchanged so the
+# check modules moved out of the validator load siblings by the same rules.
+def load_sibling(name: str):
+    """Import scripts/<name>.py by path (no package install needed).
+    Registered in sys.modules so dataclasses in the module resolve."""
+    path = os.path.realpath(os.path.join(SCRIPTS, f"{name}.py"))
+    private = f"_ma_sibling_{name}"
+    for key in (name, private):
+        m = sys.modules.get(key)
+        if m is not None and os.path.realpath(getattr(m, "__file__", None) or "") == path:
+            return m
+    # A run's own module of the same name may already hold the plain name (E7
+    # attempt 7: models/pipeline.py, imported by the eligibility probe through
+    # the run's code); a suffix match returned it as scripts/pipeline.py. Never
+    # reuse it, and never replace it (the run's code imports it by that name).
+    key = private if name in sys.modules else name
+    spec = importlib.util.spec_from_file_location(key, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[key] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except BaseException:
+        sys.modules.pop(key, None)
+        raise
     return mod
 
 
@@ -78,6 +110,27 @@ def _self_test() -> int:
         SCRIPTS = real
     for k in ("_sib_selftest_data_schema", "_sib_selftest2_data_schema"):
         sys.modules.pop(k, None)
+    # S4: load_sibling takes the plain name when free, reuses it, and never
+    # returns or replaces a same-named module from elsewhere.
+    real_scripts = SCRIPTS
+    with open(os.path.join(d, "probe48.py"), "w") as f:
+        f.write("WHERE = 'scripts'\n")
+    SCRIPTS = d
+    try:
+        sys.modules.pop("probe48", None)
+        m1 = load_sibling("probe48")
+        ok(sys.modules.get("probe48") is m1 and load_sibling("probe48") is m1, "S4a plain name, reused")
+        other = type(sys)("probe48")
+        other.__file__ = os.path.join(d, "elsewhere", "probe48.py")
+        sys.modules["probe48"] = other
+        m2 = load_sibling("probe48")
+        ok(m2 is not other and sys.modules["probe48"] is other
+           and sys.modules.get("_ma_sibling_probe48") is m2 and m2.WHERE == "scripts",
+           "S4b a same-named module elsewhere is neither returned nor replaced")
+    finally:
+        SCRIPTS = real_scripts
+        for k in ("probe48", "_ma_sibling_probe48"):
+            sys.modules.pop(k, None)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
