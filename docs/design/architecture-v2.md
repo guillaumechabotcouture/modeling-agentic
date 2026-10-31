@@ -26,9 +26,11 @@ better organised. They would not remove it. The large gains come from changing
 
 ## 2. Principles
 
-1. **Reuse validated engines; don't rewrite them.** Transmission dynamics, intervention
-   effects and their interactions come from established, published simulators or
-   promoted toolkit modules. An agent writes model code only for what no engine covers.
+1. **Build engines once, validate them, and reuse them.** Transmission dynamics, intervention
+   effects and their interactions come from our own Starsim engine modules
+   (`toolkit/engines/<disease>/`). We build each once, validate it against trial data in a
+   benchmark pack, and reuse it in every run. An agent writes model code only for what no
+   engine covers. The stack stays Python on Starsim, with LASER for spatial questions.
 2. **Code computes every number.** Calibration, emulation, uncertainty, optimization,
    cross-validation, sensitivity, decision tests, figures and the claims ledger are
    harness code driven by the decision spec. Agents never hand-roll them, and never
@@ -77,7 +79,7 @@ Evidence Engine and WebFetch tools. It reuses `effect_size_registry.py`,
 a decision-relevant parameter; the others are marked as assumptions and varied
 widely. This is where today's confabulation and misattribution findings stop.
 
-### 3.3 Model engines (`engines/<name>/`, one contract)
+### 3.3 Model engines (`toolkit/engines/<disease>/`, our own Starsim code, one contract)
 
 ```python
 class Engine(Protocol):
@@ -87,12 +89,15 @@ class Engine(Protocol):
             seed: int) -> Outcomes          # cases, severe, deaths, DALYs, coverage, costs drivers
 ```
 
-- **First adapters:**
-  - `malariasimulation` (MRC-IDE, R with a C++ core) covers species-specific bionomics, ITN types including PBO and dual-AI, IRS, SMC, case management and RTS,S/R21. Its interactions are validated against trials by its authors.
-  - The Starsim disease modules.
-  - The `toolkit` modules promoted from runs (E4).
-  - EMOD and OpenMalaria later, through the same contract.
-- **Each engine ships a benchmark pack.** These are its published validation results: the trial arms and the EIR–prevalence curves. The harness re-runs them per version, not per question. Today's per-run trial tuning becomes an engine property.
+- **First engine: malaria, on Starsim, written and owned by us.**
+  - **Starting point:** attempt 8's Starsim model (`models/malaria_abm.py` and its intervention code), promoted into `toolkit/engines/malaria/` (E4).
+  - **Added mechanics:** the species-aware vector and intervention mechanics D7 calls for. Per-species indoor and in-bed biting fractions and endophily (the D6 priors). ITN effects split into repellence, killing and blocking, for pyrethroid, PBO and dual-AI nets. IRS killing and repellence acting on indoor-resting mosquitoes. ITN×IRS redundancy arises from those mechanics, not from a fitted factor. Also SMC, case management, and vaccines later.
+  - **No R, malariasimulation or other external simulators.**
+- **Later engines:** measles, TB and others on Starsim, and LASER for spatial transmission, through the same contract.
+- **Each engine ships a benchmark pack, validated once, not per question.**
+  - Trial arms: pyrethroid ITN vs none; PBO vs pyrethroid; dual-AI vs pyrethroid; IRS added to ITN; the ITN×IRS interaction (B15); SMC.
+  - EIR–prevalence and age-incidence curves, plus cost-effectiveness bands (B17–B20).
+  - The harness re-runs the pack on every engine change. The engine is fitted to the pack once, with its parameters recorded in the engine card, so per-run trial tuning stops.
 - **Engine choice is automatic, not an owner checkpoint.** The harness filters eligible engines by matching the spec against each `EngineCard`: interventions, outputs, population scale, spatial structure and validated ranges. The AI picks among the eligible ones and records why, and the choice appears in the report and the model card. When more than one engine is eligible, the harness runs both on a small subset and compares the recommendations. That turns structural uncertainty into a measured check instead of a judgement call.
 - **The agent's job:** pick the engine within that filter, map data to `UnitSpec`, declare which parameters are calibrated, and extend the engine only through declared plug-ins with their own tests.
 - **Fallback for questions no engine covers:** the agent writes a model behind the same contract, and layers 3.4 onward apply unchanged.
@@ -169,7 +174,7 @@ re-run of E7.
 - **Scope.** A one-state subset of E7, or E7 itself if it is cheap enough. Same question and data.
 - **Minimal v2:**
   1. a hand-written `decision_spec.yaml` (owner-reviewed);
-  2. a `malariasimulation` adapter behind `Engine` (R on the dev VM, via `rpy2` or a subprocess CLI), using its packaged species parameters and intervention models;
+  2. a Starsim malaria engine behind `Engine`, written by us. Start from attempt 8's model, add the species-aware vector, ITN and IRS mechanics, and validate it once against the benchmark pack, including B15;
   3. an analysis engine built from what we have: calabaria (or the current calibration code) to state PfPR, an emulator, `propagate_uncertainty`, `toolkit/alloc` optimize, leave-one-out, and decision tests;
   4. the existing critics on the computed facts;
   5. the existing writer with rendered numbers.
@@ -189,7 +194,7 @@ re-run of E7.
 |---|---|---|
 | V0 | Evaluation suite baseline (Phase 50) on the current architecture | Baseline scores recorded |
 | V1 | Decision spec schema and sign-off; planner drafts it | Every suite question produces a valid spec |
-| V2 | Engine contract plus the first adapter and its benchmark pack | Pack reproduces the published validation |
+| V2 | Engine contract plus the first Starsim engine (malaria) and its benchmark pack | Pack reproduces the trial results within band |
 | V3 | Analysis engine (calibrate, emulate, UQ, optimize, cross-validate, decision tests, figures, claims) | Suite questions run with no agent-written analysis code |
 | V4 | Findings ledger, fix loop and state machine (S3–S4); lead becomes fix planner | Golden-trace replays take the same gate actions; prompt size ↓ |
 | V5 | Evidence service | Share of verified parameters ≥ 90% on the suite |
@@ -198,13 +203,9 @@ re-run of E7.
 
 ## 8. Risks and open questions for the owner
 
-1. **Which engines the platform supports, and R in the stack.** This is a one-off platform decision for the owner. Which engine a given run uses is automatic (§3.3).
-   - Option: malariasimulation (mature, R/C++, validated).
-   - Option: Starsim malaria (Python, experimental as of 2026-10-27).
-   - Option: EMOD (heavier, IDM-maintained).
-   - Proposal: malariasimulation first for malaria. Starsim modules are for diseases they cover well, with LASER for spatial questions.
+1. **Engines are our own Starsim code** (owner decision, 2026-10-30). There is no R, no malariasimulation and no external simulators. The risk is that validating our own engine is work we own. The mitigation is the benchmark pack, validated once and re-run on every change, and promoting reviewed modules from runs (E4).
 2. **Questions no engine covers.** The fallback is an agent-written model behind the same contract. The risk is that this becomes the common path. We measure it on the suite.
 3. **Owner checkpoint latency.** Two pauses per run. Each needs a time-out and a default, as brief sign-off has today.
 4. **Calibration framework.** Calabaria (IDM) or our current code. This is a spike decision.
-5. **Licensing and provenance of engine parameter sets.** Record versions and citations in the engine card.
+5. **Provenance of engine parameters.** Each fitted or literature parameter in the engine card carries its source, from the evidence service, and its benchmark fit.
 6. **Scope creep in "extend the engine".** Extensions must go through declared plug-ins with tests and a D1-style sufficiency test.
