@@ -582,8 +582,23 @@ def record_cited_inputs(run_dir: str) -> list[str]:
         elif isinstance(x, list):
             for v in x:
                 walk_keys(v)
+    def walk_paths(x, key=""):  # any value that names an existing file or directory (engine config too)
+        if isinstance(x, dict):
+            for k, v in x.items():
+                if k not in ("deliverable", "deliverable_file"):
+                    walk_paths(v, str(k))
+        elif isinstance(x, list):
+            for v in x:
+                walk_paths(v, key)
+        elif isinstance(x, str) and x.strip() and ("/" in x or os.sep in x or key.endswith(("path", "file", "dir"))):
+            v = x.strip()
+            if ":" in v and not v.startswith("/") and "/" not in v.split(":", 1)[0]:
+                return                 # a module reference such as pkg.mod:Class
+            if os.path.exists(os.path.join(run_dir, os.path.expanduser(v))):
+                found.append(v)
     walk(spec)
     walk_keys(spec)
+    walk_paths(spec)
     prov, probs, root = _provenance(run_dir), [], os.path.realpath(run_dir)
     # The staged copies must still be the files the question named (the draft task may not touch
     # them; this checks it).
@@ -598,6 +613,8 @@ def record_cited_inputs(run_dir: str) -> list[str]:
         p = os.path.realpath(os.path.join(run_dir, rel))
         if not p.startswith(root + os.sep):
             probs.append(f"the spec cites {rel}, outside the run directory: copy it into data/")
+        elif os.path.isdir(p):
+            prov.setdefault("cited", {})[os.path.relpath(p, root).replace(os.sep, "/") + "/"] = {"dir": True}
         elif not os.path.isfile(p):
             probs.append(f"the spec cites {rel}, which does not exist")
         else:
@@ -640,17 +657,42 @@ def report_claim_findings(run_dir: str) -> list[dict]:
     bare = re.sub(r"(?m)^\s*(#+\s*)?\d+[.)]\s", " ", bare)
     # Numbers the owner gave (the signed spec, the question) are facts, not results: allowed.
     given = set()
-    for src in (os.path.join(run_dir, AB.SPEC_FILE), os.path.join(run_dir, "metadata.json")):
-        try:
-            given |= {g.replace(",", "") for g in re.findall(r"\d[\d,]*(?:\.\d+)?", open(src).read())}
-        except OSError:
-            pass
+    sources = []
+    try:
+        sources.append(open(os.path.join(run_dir, AB.SPEC_FILE)).read())
+    except OSError:
+        pass
+    try:   # the question only: not timestamps or other run metadata
+        sources.append(str(json.load(open(os.path.join(run_dir, "metadata.json"))).get("question") or ""))
+    except (OSError, ValueError):
+        pass
+    for src in sources:
+        given |= {g.replace(",", "") for g in re.findall(r"\d[\d,]*(?:\.\d+)?", src)}
     typed = []
-    for m_ in re.finditer(r"(?<![A-Za-z0-9_.\-])\d[\d,]*(?:\.\d+)?%?(?![A-Za-z0-9_\-])", bare):
+    # A whole number token: sign, digits with separators, decimals, exponent, magnitude suffix or %.
+    num = re.compile(r"(?<![A-Za-z0-9_.])[-+\u2212]?\d[\d,]*(?:\.\d+)?(?:[eE][-+]?\d+)?(?:\s?(?:[kKmMbB]n?|%))?(?![A-Za-z0-9_])")
+    for m_ in num.finditer(bare):
         t = m_.group(0).rstrip(",")
-        if re.fullmatch(r"(19|20)\d\d", t) or t.rstrip("%").replace(",", "") in given:
-            continue
+        core = re.sub(r"^[-+\u2212]", "", t)
+        core = re.sub(r"(?:\s?(?:[kKmMbB]n?|%))$", "", core).replace(",", "")
+        before = bare[max(0, m_.start() - 1):m_.start()]
+        if t[0] in "-+\u2212" and before and (before.isalnum() or before in "_"):
+            continue                                  # an identifier such as R-004
+        if re.fullmatch(r"(19|20)\d\d", core) and t == core:
+            continue                                  # a year
+        if t == core and core in given:
+            continue                                  # a number the owner gave
+        if bare[m_.end():m_.end() + 1] == "-" and re.fullmatch(r"(19|20)\d\d", core):
+            continue                                  # a year range 2026-2028
         typed.append(t)
+    rp2 = os.path.join(run_dir, "report.md")
+    if os.path.exists(rp2):
+        left = re.findall(r"\[CLAIM:([^\]]*)\]", open(rp2).read())
+        if left:
+            out.append({"kind": "report_claim_unrendered", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE",
+                        "key": "unrendered", "scope_declarable": False,
+                        "claim": f"The report still shows {len(left)} claim reference(s) ({', '.join(sorted(set(left))[:5])}), "
+                                 "e.g. inside code; write [CLAIM:id] in plain text."})
     if typed:
         out.append({"kind": "report_number_typed", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE",
                     "key": "numbers", "scope_declarable": False,
@@ -908,7 +950,8 @@ class Machine:
         errs = [f"draft_spec failed: {res.note}"] if not res.ok else []
         if res.ok:
             try:
-                errs = self.backend.pre_sign_problems(self.run_dir) + record_cited_inputs(self.run_dir)
+                errs = record_cited_inputs(self.run_dir)       # before anything reads a cited file
+                errs = errs or self.backend.pre_sign_problems(self.run_dir)
             except Exception as e:  # noqa: BLE001
                 errs = [f"spec unreadable: {e}"]
         if errs:
@@ -1769,6 +1812,33 @@ def _self_test() -> int:
                       log=lambda *a: None)
         ok(not any(f["kind"].startswith("report_") for f in m51.harness_findings()),
            "T51 golden replays (v2_rules off) do not run the v2 report checks")
+
+        # T52-T55: Codex round 2 on #95 (each failed on 7aa9642).
+        for txt in ("Benefit is -987654 cases.", "Benefit is 987K cases.", "Benefit is 987e6 cases."):
+            open(os.path.join(fr, "manuscript.md"), "w").write(txt + "\n")
+            if not any(f["kind"] == "report_number_typed" for f in report_claim_findings(fr)):
+                ok(False, f"T52 signed, magnitude-suffixed and scientific numbers are typed numbers: {txt}")
+                break
+        else:
+            ok(True, "T52 signed, magnitude-suffixed and scientific numbers are typed numbers")
+        json.dump({"question": "Choose packages for 10 districts.", "started": "2026-10-31T16:42:57Z"},
+                  open(os.path.join(fr, "metadata.json"), "w"))
+        open(os.path.join(fr, "manuscript.md"), "w").write("Across 10 districts it reduces cases by 57%.\n")
+        k53 = [f for f in report_claim_findings(fr) if f["kind"] == "report_number_typed"]
+        ok(k53 and "57%" in k53[0]["claim"] and "10" not in k53[0]["claim"].split("(")[1].split(")")[0].split(", "),
+           f"T53 only the question's own numbers are given; a timestamp's digits are not ({k53[:1]})")
+        open(os.path.join(fr, "manuscript.md"), "w").write("The plan averts `[CLAIM:headline.point]` cases.\n")
+        render_report(fr, spike)
+        ok(any(f["kind"] == "report_claim_unrendered" for f in report_claim_findings(fr)),
+           "T54 a claim reference left unrendered in the report (inside code) is a HIGH finding")
+        fe = os.path.join(td, "t55")
+        os.makedirs(os.path.join(fe, "data"))
+        yaml.safe_dump({"engine": {"ref": "toolkit.engines.contract:ToyEngine",
+                                   "config": {"results_path": os.path.join(td, "outside_bench")}}},
+                       open(os.path.join(fe, AB.SPEC_FILE), "w"))
+        os.makedirs(os.path.join(td, "outside_bench"), exist_ok=True)
+        ok(any("outside_bench" in x for x in record_cited_inputs(fe)),
+           "T55 an engine config path outside the run, without a file extension, is refused")
 
         # T23: a transition outside the table is refused.
         m = _SpikeMachine(os.path.join(td, "ref"), StubTasks({}), None, log=lambda *a: None)

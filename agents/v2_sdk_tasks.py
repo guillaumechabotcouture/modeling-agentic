@@ -109,8 +109,27 @@ def _answer_key(target: str, run_dir: str) -> bool:
     if "_truth" in low.split("/"):
         return True
     p = os.path.realpath(os.path.join(run_dir, os.path.expanduser(target)))
+    if "_truth" in p.replace(os.sep, "/").lower().split("/"):
+        return True                                    # a link resolving into an answer-key tree
     rel = os.path.relpath(p, enforcement.REPO_ROOT).replace(os.sep, "/").lower()   # case-insensitive filesystems
     return rel == "evals" or rel.startswith("evals/") or low.lstrip("./").startswith("evals/")
+
+
+def _reaches_answer_keys(base: str, limit: int = 20000) -> bool:
+    """Does a recursive search from `base` reach an answer key: a _truth directory or file, an evals/
+    tree, or a symlink resolving into one? Fail closed past `limit` entries."""
+    n = 0
+    for root, dirs, files in os.walk(base, followlinks=False):
+        for name in dirs + files:
+            n += 1
+            if n > limit:
+                return True
+            full = os.path.join(root, name)
+            if name.lower() == "_truth" or _answer_key(full, base):
+                return True
+            if os.path.islink(full) and _answer_key(os.path.realpath(full), base):
+                return True
+    return False
 
 
 def _within(p: str, root: str) -> bool:
@@ -125,8 +144,10 @@ def _search_denied(tool: str, ti: dict, run_dir: str) -> str | None:
     or data/."""
     import glob as _glob
     target = str(ti.get("file_path") or ti.get("path") or "")
-    pattern = str(ti.get("pattern") or ti.get("glob") or "")
-    if (target and _answer_key(target, run_dir)) or (pattern and _answer_key(pattern, run_dir)):
+    pattern = str(ti.get("pattern") or "") if tool == "Glob" else ""
+    filters = [str(ti.get(k) or "") for k in ("glob", "type")] + ([pattern] if pattern else [])
+    if (target and _answer_key(target, run_dir)) or any(f and ("_truth" in f.lower() or _answer_key(f, run_dir))
+                                                          for f in filters):
         return "evaluation answer keys are not readable"
     if tool == "Read":
         return None
@@ -143,11 +164,12 @@ def _search_denied(tool: str, ti: dict, run_dir: str) -> str | None:
             base = os.path.realpath(os.path.join(base, prefix) if not pattern.startswith("/") else "/" + prefix.lstrip("/"))
     repo = os.path.realpath(enforcement.REPO_ROOT)
     evals = os.path.join(repo, "evals")
-    if _within(base, os.path.realpath(run_dir)) or _within(base, os.path.join(repo, "data")):
-        return None
-    if _within(evals, base):
+    confined = _within(base, os.path.realpath(run_dir)) or _within(base, os.path.join(repo, "data"))
+    if not confined and _within(evals, base):
         return (f"{tool} from {base} would search the evaluation tree (evals/); confine it to the run directory "
                 "or data/")
+    if os.path.isdir(base) and _reaches_answer_keys(base):
+        return f"{tool} from {base} can reach an answer-key file (a _truth tree or a link to one)"
     return None
 
 
@@ -433,6 +455,19 @@ def _self_test() -> int:
         }
         got = {k: bool(_search_denied(t, ti, rd)) == want for k, ((t, ti), want) in cases.items()}
         ok(all(got.values()), f"S13 searches that reach evals/ are refused, confined ones are not {got}")
+        # S14-S15: Codex round 2. A _truth tree or a link into one under an allowed root, a Grep glob
+        # naming _truth, and a symlinked file resolving into _truth are refused.
+        rr = os.path.join(d, "rr")
+        os.makedirs(os.path.join(rr, "data", "private", "_truth"))
+        open(os.path.join(rr, "data", "private", "_truth", "secret.json"), "w").write("{}")
+        os.makedirs(os.path.join(rr, "run"))
+        os.symlink(os.path.join(rr, "data", "private", "_truth", "secret.json"), os.path.join(rr, "run", "alias.json"))
+        ok(_search_denied("Grep", {"path": os.path.join(rr, "data"), "pattern": ".", "glob": "**/_truth/**"}, rr)
+           and _search_denied("Grep", {"path": os.path.join(rr, "data"), "pattern": "."}, rr)
+           and _search_denied("Grep", {"path": os.path.join(rr, "run"), "pattern": "."}, os.path.join(rr, "run")),
+           "S14 a search under an allowed root that can reach a _truth tree (directly, by glob, or by a link) is refused")
+        ok(_search_denied("Read", {"file_path": "alias.json"}, os.path.join(rr, "run")),
+           "S15 a Read of a link resolving into _truth is refused")
         import validate_critique_yaml as V
         cp = PROMPTS["critique"].format(reviewer="critique-domain", round=1, file="f", prefix="D", out=OUT,
                                         feedback="\n- X", severities="H", categories=" | ".join(sorted(V.VALID_CATEGORY)),

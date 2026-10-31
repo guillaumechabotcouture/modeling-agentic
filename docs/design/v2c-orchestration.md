@@ -315,3 +315,13 @@ Fixtures: the run's three critique YAMLs, `final_gate.json` and claims ledger (`
 | The draft task could rewrite the staged inputs or their manifest | Both are harness-owned in the write guard; after the draft each copy's sha256 is checked against its record and its source | T50, S12 |
 | Golden replays ran the new report checks | They run only with `v2_rules` | T51 |
 | (item 5) A Grep or Glob at the repository root reached `evals/**/_truth` | A Read, Grep or Glob whose search root (its path, or a Glob pattern's literal prefix) contains the repository's `evals/` tree is refused unless confined to the run directory or `data/` | S13 |
+
+**Codex round 2 on #95 (six P1s), each reproduced against 7aa9642 first:**
+- **Typed numbers.** Signed, magnitude-suffixed and scientific forms (`-987654`, `987K`, `987e6`) are now caught (T52).
+- **Given numbers.** Only the signed spec and the question count as given. A timestamp's digits in `metadata.json` no longer excuse a result (T53).
+- **Unrendered references.** A `[CLAIM:]` left in the rendered report, for example inside code, is a HIGH finding (T54).
+- **Engine config paths.** Any value that names an existing file or directory, including engine config paths without an extension, must be inside the run. Containment is checked before the backend's validation reads anything (T55).
+- **Search guard.**
+  - Grep's `glob` and `type` parameters are checked.
+  - A search whose tree reaches a `_truth` entry, or a link into one, is refused even under an allowed root (S14).
+  - `_truth` is also checked on the resolved path, so a Read through a symlink is refused (S15).
