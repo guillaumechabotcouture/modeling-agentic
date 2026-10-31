@@ -666,7 +666,13 @@ Presentation pass (Phase 39 α): once the draft exists, spawn
 critique-presentation (`This is critique round N.`) on it, with the
 after-write findings from open_problems.json, and route what it raises
 to the writer (wording, captions) or the analyst (figures) before the
-final gate.
+final gate. Then spawn critique-presentation again on the revised draft
+(`This is critique round N.`) so its verdict covers the fixes. The
+harness records which draft each presentation review read; ACCEPT needs a
+successful review of the delivered draft (`presentation_review_*`). If the
+session ends with presentation HIGHs for the writer still open, or with no
+such review, the harness runs one writer fix pass and the review, paid from
+the write-up reserve (Phase 49 δ).
 
 #### STAGE 8.1: RENDER CLAIM REFERENCES (Phase 18 α — REQUIRED)
 
