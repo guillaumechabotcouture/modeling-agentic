@@ -72,6 +72,7 @@ CRITICS = ("critique-domain", "critique-redteam")
 # workstream B's schema.SETTINGS_PATHS), and the engine the harness chose is in engine_choice.json.
 PROTECTED_BY_FIX = (AB.SPEC_FILE, AB.SETTINGS_FILE)
 TASK_CAP_USD = 3.0            # one bounded task's allowance, at most what the run has left
+READBACK_CAP_USD = 0.25       # one crash read-back (resume for one tool-less turn), at most what is left
 # Findings whose resolution bears on the primary decision: Phase 49 β's owner rule decides
 # whether they may be declared. Without that rule they are not declarable (fail closed).
 DECISION_BEARING_KINDS = ("decision_test_changes_plan",)
@@ -237,9 +238,33 @@ def deliverable_problems(run_dir: str) -> list[str]:
         STATE_FILE, SIGNOFF_FILE, SCOPE_SIGNOFF, FL.LEDGER, FX.IMPACT, "report.md", "manuscript.md", "metadata.json",
         "final_gate.json", AB.ENGINE_CHOICE, "validator_history.jsonl", "gate_r*", "fix_plan_r*", "fix_progress_r*",
         "analysis/*", "models/pipeline*", "evidence/*", "data/*")
-    if any(P.path_match(norm, pat) for pat in owned):
+    if owned_path(root, norm, owned):
         return [f"deliverable path {rel!r} is a file the harness, the gate or a critic owns"]
     return []
+
+
+def owned_path(root: str, rel: str, owned) -> bool:
+    """Is `rel` (inside `root`) one of the owned paths? Compared case-insensitively (APFS and NTFS
+    are case-insensitive by default: Report.MD is report.md), and, when the file exists, by
+    identity: the same inode as an existing owned file, or any hard link (st_nlink > 1)."""
+    import glob
+    import pipeline as P
+    low = rel.lower()
+    if any(P.path_match(low, str(pat).lower()) for pat in owned):
+        return True
+    target = os.path.join(root, rel)
+    if not os.path.exists(target):
+        return False
+    try:
+        if os.path.isfile(target) and os.stat(target).st_nlink > 1:
+            return True
+        for pat in owned:
+            for hit in glob.glob(os.path.join(root, str(pat)), recursive=True):
+                if os.path.exists(hit) and os.path.samefile(hit, target):
+                    return True
+    except OSError:
+        return True                  # fail closed
+    return False
 
 
 def _owner_rule():
@@ -384,7 +409,18 @@ class Machine:
         self.st = st or state
         if self.st is None:
             raise ValueError("no run_state.json and no initial state")
+        self._settle_interrupted()
         save_state(self.run_dir, self.st)
+
+    def _settle_interrupted(self) -> None:
+        """Every journal entry left `started` by a previous process was interrupted: charge its
+        allowance once (the task cap when it had none) and mark it, before anything else runs."""
+        for j in self.st.journal.values():
+            if isinstance(j, dict) and j.get("status") == "started":
+                a = j.get("allowance_usd")
+                self.st.spent_usd += float(a if a is not None else self.st.task_cap_usd)
+                j["interrupted_charged"] = j.get("interrupted_charged", 0) + 1
+                j["status"] = "interrupted"
 
     # -------------------------------------------------- plumbing
     def _go(self, to: str, why: str = "", status: str | None = None) -> str:
@@ -440,7 +476,11 @@ class Machine:
         save_state(self.run_dir, self.st)
         setter = getattr(self.tasks, "set_allowance", None)
         if setter:
-            setter(allowance if allowance is not None else self.st.task_cap_usd)
+            a = allowance if allowance is not None else self.st.task_cap_usd
+            b = self._budget()
+            # A crash read-back is a paid call too: a small cap, from what is left after this allowance.
+            rb = READBACK_CAP_USD if b is None else max(0.0, min(READBACK_CAP_USD, round(b["left"] - a, 4)))
+            setter(a, readback_usd=rb)
         res = getattr(self.tasks, name)(*args)
         self._charge(res)
         out = res.output
@@ -532,9 +572,11 @@ class Machine:
         n = self.st.tries.get("spec", 0)
         if n >= MAX_SPEC_TRIES:
             return self._go("FINAL", "the spec did not validate", "run_failed")
-        self.st.tries["spec"] = n + 1
         fb = self.st.tries.get("spec_feedback")
+        # The key is fixed before the call and the try is counted only once the call returns, so an
+        # interrupted draft resumes under the same key (charged once by _settle_interrupted).
         res = self._task(f"SPEC#{self._visit()}:try{n + 1}", "draft_spec", self.st.question, self.run_dir, fb)
+        self.st.tries["spec"] = n + 1
         if res is None:
             return self._budget_out("SPEC")
         errs = [f"draft_spec failed: {res.note}"] if not res.ok else []
@@ -1083,6 +1125,45 @@ def _self_test() -> int:
         vs = [dict(dtf)]
         apply_owner_rule(dd, 2, vs, rule=Broken)
         ok(vs[0]["scope_declarable"] is False and not vs[0].get("owner_signoff"), "T32 an owner rule that fails is fail-closed")
+
+        # T33 (Codex R2-1): the first spec draft is interrupted. On resume the started-but-uncompleted
+        # entry is charged its allowance once and the draft runs again under the same key.
+        d, T, st = new_run("spec_crash", {"crash": {"draft_spec": 1}, "usd": 1.0}, budget=100.0)
+        try:
+            Machine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+        except RuntimeError:
+            pass
+        T2 = StubTasks(dict(T.s, crash={}))
+        m2 = Machine(d, T2, None, log=lambda *a: None, cross_engine_check=False)
+        s = m2.run()
+        j = load_state(d).journal
+        spec_keys = sorted(k for k in j if k.startswith("SPEC#"))
+        ok(s == "completed" and spec_keys == ["SPEC#0:try1"] and j["SPEC#0:try1"].get("interrupted_charged") == 1
+           and j["SPEC#0:try1"]["status"] == "completed",
+           f"T33 an interrupted spec draft is charged once and re-run under its own key {spec_keys}")
+        d, T, st = new_run("orphan", {}, budget=100.0)
+        st.journal["X#0:orphan"] = {"task": "critique", "status": "started", "allowance_usd": 2.5}
+        save_state(d, st)
+        m3 = Machine(d, StubTasks({}), None, log=lambda *a: None)
+        ok(abs(m3.st.spent_usd - 2.5) < 1e-9 and m3.st.journal["X#0:orphan"]["status"] == "interrupted"
+           and abs(Machine(d, StubTasks({}), None, log=lambda *a: None).st.spent_usd - 2.5) < 1e-9,
+           f"T34 on resume every started-but-uncompleted entry is charged once ({m3.st.spent_usd})")
+
+        # T35 (Codex R2-5): case aliases of owned files are refused (case-insensitive filesystems).
+        alias = {}
+        for name, path in (("state", "RUN_STATE.json"), ("report", "Report.MD"), ("spec", "Decision_Spec.yaml"),
+                           ("analysis", "Analysis/x.csv")):
+            dd2 = os.path.join(td, f"alias_{name}")
+            os.makedirs(dd2)
+            __import__("yaml").safe_dump({"deliverable_file": {"path": path, "columns": {"a": "b"}}},
+                                         open(os.path.join(dd2, AB.SPEC_FILE), "w"))
+            alias[name] = bool(deliverable_problems(dd2))
+        os.makedirs(os.path.join(td, "alias_link"))
+        __import__("yaml").safe_dump({"deliverable_file": {"path": "out.csv", "columns": {"a": "b"}}},
+                                     open(os.path.join(td, "alias_link", AB.SPEC_FILE), "w"))
+        os.link(os.path.join(td, "alias_link", AB.SPEC_FILE), os.path.join(td, "alias_link", "out.csv"))
+        alias["hardlink"] = bool(deliverable_problems(os.path.join(td, "alias_link")))
+        ok(all(alias.values()), f"T35 case aliases and a hard link to an owned file are refused {alias}")
 
         # T23: a transition outside the table is refused.
         m = Machine(os.path.join(td, "ref"), StubTasks({}), None, log=lambda *a: None)

@@ -94,7 +94,7 @@ class StubTasks:
         self.allowances: list = []
         self._crashes = dict(self.s.get("crash") or {})
 
-    def set_allowance(self, usd):
+    def set_allowance(self, usd, readback_usd=None):
         self.allowances.append(usd)
 
     def _r(self, name, ok=True, output=None, note=""):
