@@ -59,7 +59,7 @@ def run_all(A, z0, out0, ben0, cost0, plan, uq_data, run_dir) -> list[dict]:
     os.makedirs(os.path.join(run_dir, DIR), exist_ok=True)
     out = []
     for dt in A.spec["analysis"].get("decision_tests") or []:
-        rec = run_one(A, dt, z0, ben0, cost0, plan, uq_data)
+        rec = run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0)
         p = os.path.join(run_dir, DIR, f"{dt['id']}.yaml")
         if rec.get("status") == "not_run":
             if os.path.exists(p):
@@ -80,12 +80,13 @@ def _not_run(A, dt, why, extra=None) -> dict:
             "produced_by": "harness", "producer": PRODUCER, **(extra or {})}
 
 
-def run_one(A, dt, z0, ben0, cost0, plan, uq_data) -> dict:
+def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
     t = dt["type"]
     thr = _threshold(A)
+    evs = {}                       # model corrections per tested value (Codex r2 P1-3)
     extra, rejected = {}, []
     if t == "interaction_rescale":
-        r = _interaction(A, dt, ben0, cost0, plan)
+        r = _interaction(A, dt, ben0, cost0, plan, out0)
         if r.get("not_run"):
             return _not_run(A, dt, r["not_run"], r.get("info"))
         varied, cases, lowers, extra, rejected = r["varied"], r["cases"], r["lowers"], r["extra"], r["rejected"]
@@ -99,6 +100,7 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data) -> dict:
             theta = dict(A.theta0, **{p: float(v)})
             zs = {i: x[0] for i, x in A.calibrate(theta).items()} if A.method == "emulator_inversion" else z0
             _, ben, cost = A.evaluate(theta, zs)
+            evs[v] = list(A.last_events)
             same_cost = all(abs(cost[i][k] - cost0[i][k]) <= 1e-9 * max(1.0, abs(cost0[i][k])) for i in A.ids for k in A.pk)
             lowers.append(same_cost and _lowers_only_unchosen(ben0, ben, plan))
             cases.append((v, ben, cost, None, None))
@@ -129,6 +131,7 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data) -> dict:
     for (v, ben, cost, budget, feas), low in zip(cases, lowers):
         sol = A.solve(ben, cost, budget=budget, feas=feas)
         ch = sol["choice"]
+        A.guard(f"decision test {dt['id']} at {v}", [plan, ch], events=evs.get(v, []))
         n_changed = sum(ch[i] != plan[i] for i in A.ids)
         results.append({"value": v, "units_changed": n_changed, "share_units_changed": n_changed / len(A.ids),
                         "objective": sol["objective"], "point_plan_objective_under_test":
@@ -167,7 +170,15 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data) -> dict:
     return rec
 
 
-def _interaction(A, dt, ben0, cost0, plan) -> dict:
+def _rescale(ratio: float, g: float) -> float:
+    """The one transformation of the test (Codex r2 P1-5): an increment, as a ratio with and without the component, is
+    rescaled on the log scale (ratio ** g). It is applied to the benchmark's odds ratio (a11 / a10) to solve and verify
+    the target interaction, and to each unit's outcome ratio (package / package without the component) to change the
+    allocation, so the two cannot disagree on the scale."""
+    return ratio ** g
+
+
+def _interaction(A, dt, ben0, cost0, plan, out0) -> dict:
     rows, why = verified_benchmarks(A.eng)
     if why:
         return {"not_run": f"the engine's benchmark arm ratios are not verified ({why})"}
@@ -176,31 +187,38 @@ def _interaction(A, dt, ben0, cost0, plan) -> dict:
         return {"not_run": f"benchmark {dt.get('benchmark')} with arm odds ratios is not in the verified results"}
     arm = {k: float(np.exp(np.mean([np.log(x[k]) for x in b["arm_or"]]))) for k in ("a11", "a10", "a01")}
     eng_int = arm["a11"] / (arm["a10"] * arm["a01"])
-    den = math.log(arm["a11"] / arm["a10"])
-    if not den < 0:
+    r_inc = arm["a11"] / arm["a10"]               # the component's increment on top of the other, as an odds ratio
+    if not r_inc < 1:
         return {"not_run": "in the benchmark setting the component adds nothing on top of the other, so no rescaling of "
                            "its increment can set the interaction", "info": {"engine_arm_or": arm}}
+    inter = lambda g: arm["a10"] * _rescale(r_inc, g) / (arm["a10"] * arm["a01"])  # noqa: E731
     comp, with_any = set(dt["components"]), set(dt["with_any"])
     cases, lowers, rejected = [], [], []
     extra = {"_arm": arm, "_int": eng_int,
              "_src": f"verified benchmark results ({dt.get('benchmark')}), toolkit/engines/benchmark.py"}
-    lo_reach = arm["a10"] * math.exp(MAX_SCALE * den) / (arm["a10"] * arm["a01"])
-    hi_reach = 1.0 / arm["a01"]
+    lo_reach, hi_reach = inter(MAX_SCALE), inter(0.0)
+    o = A.primary
     for v in dt["values"]:
-        g = math.log(v * arm["a01"]) / den
+        g = math.log(v * arm["a01"]) / math.log(r_inc)
         if not 0.0 <= g <= MAX_SCALE:
             rejected.append({"value": v, "scale_needed": g, "reachable_interaction": [lo_reach, hi_reach]})
             continue
-        achieved = arm["a10"] * math.exp(g * den) / (arm["a10"] * arm["a01"])
+        achieved = inter(g)
         if abs(achieved - v) > ACHIEVED_RTOL * abs(v):
             raise RuntimeError(f"decision test {dt['id']}: achieved interaction {achieved} != requested {v}")
         ben = {}
         for i in A.ids:
             ben[i] = {}
+            y0 = out0[i]["y"][A.comp][o]
             for k, cs in A.pk.items():
                 if comp <= cs and cs & with_any:
                     base = next(n for n, c2 in A.pk.items() if c2 == cs - comp)
-                    ben[i][k] = ben0[i][base] + g * (ben0[i][k] - ben0[i][base])
+                    yb, yk = out0[i]["y"][base][o], out0[i]["y"][k][o]
+                    if yb <= 0 or yk <= 0:
+                        ben[i][k] = ben0[i][k]      # nothing to rescale (no outcome left)
+                        continue
+                    yk_new = yb * _rescale(yk / yb, g)
+                    ben[i][k] = A.dfac * (y0 - yk_new)
                 else:
                     ben[i][k] = ben0[i][k]
         cases.append((v, ben, None, None, None))
@@ -212,6 +230,6 @@ def _interaction(A, dt, ben0, cost0, plan) -> dict:
                 "info": {"engine_arm_or": arm, "engine_interaction": eng_int, "rejected_values": rejected,
                          "reachable_interaction": [lo_reach, hi_reach]}}
     cases = [(v, ben, cost0, b_, f_) for (v, ben, _c, b_, f_) in cases]
-    varied = (f"the increment of {sorted(comp)} given any of {sorted(with_any)} rescaled so the engine's interaction "
-              f"odds ratio in the {dt.get('benchmark')} setting equals each tested value")
+    varied = (f"the increment of {sorted(comp)} given any of {sorted(with_any)} rescaled on the log scale so the "
+              f"engine's interaction odds ratio in the {dt.get('benchmark')} setting equals each tested value")
     return {"varied": varied, "cases": cases, "lowers": lowers, "extra": extra, "rejected": rejected}

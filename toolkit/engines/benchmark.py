@@ -465,6 +465,17 @@ def _self_test() -> int:
         doc["engine_identity"]["code_sha256"] = "0" * 64
         yaml.safe_dump(doc, open(eng.results_path, "w"))
         ok("another engine" in (verified_benchmarks(eng)[1] or ""), "BP12 results for other engine code are refused")
+        yaml.safe_dump(stamp(res, eng), open(eng.results_path, "w"))
+        from toolkit.engines.contract import ParamSpec
+
+        class Refit(type(eng)):
+            def parameters(self):
+                return [ParamSpec(p.name, 0.55 if p.name == "eff_a" else p.value, p.kind, p.units, p.lo, p.hi,
+                                  p.source) for p in super().parameters()]
+        r2 = Refit()
+        r2.results_path = eng.results_path
+        ok("another engine" in (verified_benchmarks(r2)[1] or ""),
+           "BP13 results stamped before a fitted parameter changed are refused (Codex r2 P1-6)")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

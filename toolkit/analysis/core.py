@@ -26,6 +26,15 @@ def discount_factor(spec) -> float:
     return float((math.exp(-k * (t0 - b)) - math.exp(-k * (t1 - b))) / (k * (t1 - t0)))
 
 
+class AnalysisBlocked(RuntimeError):
+    """The run stopped before publishing (analysis/blocked.yaml says why): model corrections bear on a plan."""
+
+    def __init__(self, where: str, hits: list):
+        self.where, self.hits = where, list(hits)
+        super().__init__(f"{where}: {len(hits)} model corrections (extrapolation, clips, floors) bear on the plan "
+                         f"(e.g. {hits[:2]})")
+
+
 class Analysis:
     def __init__(self, spec, model, log=print):
         self.spec, self.model, self.log = spec, model, log
@@ -89,6 +98,16 @@ class Analysis:
         """The model corrections (extrapolation, clips, floors) that bear on the plan: on a unit's chosen package,
         on its comparator (every benefit is measured from it), or on the whole unit (Codex P1-6)."""
         return [e for e in events if e["package"] in ("*", self.comp) or plan.get(e["unit"]) == e["package"]]
+
+    def guard(self, where: str, plans, events=None):
+        """Codex r2 P1-3: in every evaluation (point, draws, stability folds, sensitivity, decision tests), model
+        corrections that bear on the point plan or on the plan re-optimised there stop publication."""
+        ev = self.last_events if events is None else events
+        hits = []
+        for p in plans:
+            hits += [h for h in self.plan_corrections(ev, p) if h not in hits]
+        if hits:
+            raise AnalysisBlocked(where, hits)
 
     def solve(self, ben, cost, budget=None, feas=None):
         r = aopt.solve(ben, cost, feas or self.feas, self.budget if budget is None else budget, method="ilp",

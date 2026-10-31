@@ -88,6 +88,14 @@ CORE = ("point", "package", "components", "unit", "params", "seed")     # a job'
 # (observed: about 1e-9 relative); 1e-6 separates that from a model change. Wall-clock timings are not outputs.
 ADOPT_RTOL = 1e-6
 TIMING_KEYS = frozenset({"seconds"})
+# Codex r2 P1-2: an adoption re-runs at least this many stored jobs before it stamps any of them.
+ADOPT_MIN_SAMPLE = 4
+ADOPT_MIN_SHARE = 0.01
+
+
+def min_adopt_sample(n_jobs: int) -> int:
+    import math
+    return min(n_jobs, max(ADOPT_MIN_SAMPLE, math.ceil(ADOPT_MIN_SHARE * n_jobs)))
 
 
 def job_sha(job: dict) -> str:
@@ -214,13 +222,21 @@ def adopt(run_dir: str, src_results: str, src_jobs: str, src_design: str, jobs: 
     if probs:
         raise ValueError("stored batch not adopted: " + "; ".join(probs[:8]))
     ids = sorted(want)
-    pick = sorted({ids[int(k * (len(ids) - 1) / max(sample - 1, 1))] for k in range(sample)}) if sample > 0 else []
+    need = min_adopt_sample(len(ids))
+    if not isinstance(sample, int) or isinstance(sample, bool) or sample < need:
+        raise ValueError(f"stored batch not adopted: the re-run sample must be at least {need} jobs "
+                         f"(max({ADOPT_MIN_SAMPLE}, {ADOPT_MIN_SHARE:.0%} of {len(ids)})); got {sample!r} (Codex r2 P1-2)")
+    n = min(sample, len(ids))
+    pick = sorted({ids[int(round(k * (len(ids) - 1) / max(n - 1, 1)))] for k in range(n)})
+    pick += [i for i in ids if i not in set(pick)][:n - len(pick)]     # spacing collisions: fill to n distinct jobs
     sys.path.insert(0, os.path.join(ROOT, "scripts"))
     import compute
     rows, _ = compute.map_fn(run_dir, os.path.join(ROOT, "toolkit", "analysis", "batch.py") + "::run_job",
                              [{k: v for k, v in want[i].items() if k != "id"} for i in pick], backend="local",
                              max_workers=workers, ledger=False)
     mism, worst = [], [0.0]
+    if len(rows) != len(pick):
+        mism.append(f"{len(rows)} re-run rows for {len(pick)} sampled jobs")
     for i, r in zip(pick, rows):
         if not r.get("ok"):
             mism.append(f"{i}: rerun failed ({r.get('error')})")

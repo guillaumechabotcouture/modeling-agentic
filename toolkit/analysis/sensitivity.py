@@ -72,6 +72,7 @@ def run(A, z0, ben0, cost0, plan, obj0) -> dict:
 
 def _end(A, v, ben, cost, plan) -> dict:
     sol = A.solve(ben, cost)
+    A.guard(f"sensitivity at {v}", [plan, sol["choice"]])
     spent = sum(cost[i][plan[i]] for i in A.ids)
     return {"value": float(v), "point_plan_objective": sum(ben[i][plan[i]] for i in A.ids),
             "point_plan_cost": spent, "point_plan_within_budget": spent <= A.budget * (1 + 1e-9),

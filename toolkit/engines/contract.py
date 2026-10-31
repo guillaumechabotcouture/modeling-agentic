@@ -127,8 +127,17 @@ def code_fingerprint(engine) -> str:
 
 
 def engine_identity(engine) -> dict:
+    """Name, version, code fingerprint, and (Codex r2 P1-6) hashes of the resolved parameters (values, kinds and
+    ranges, so a changed fitted.yaml changes the identity) and of the configured structure (components, unit
+    attributes, outputs, age groups, valid ranges: what constructor configuration sets)."""
+    import hashlib
+    import json
     card = engine.describe()
-    return {"name": card.name, "version": card.version, "code_sha256": code_fingerprint(engine)}
+    params = sorted((p.name, float(p.value), p.kind, p.lo, p.hi) for p in engine.parameters())
+    struct = {k: getattr(card, k) for k in ("components", "unit_attributes", "outputs", "age_groups", "valid_ranges")}
+    h = lambda x: hashlib.sha256(json.dumps(x, sort_keys=True, default=str).encode()).hexdigest()  # noqa: E731
+    return {"name": card.name, "version": card.version, "code_sha256": code_fingerprint(engine),
+            "params_sha256": h(params), "config_sha256": h(struct)}
 
 
 def _finite(x) -> bool:
@@ -289,6 +298,13 @@ def _self_test() -> int:
     fp = code_fingerprint(e)
     ok(len(fp) == 64 and fp == code_fingerprint(ToyEngine()) and engine_identity(e)["name"] == "toy",
        "C8 the engine code fingerprint is stable and part of its identity")
+
+    class Refit(ToyEngine):         # same code directory, another fitted value (as a changed fitted.yaml gives)
+        def parameters(self):
+            return [ParamSpec(p.name, 0.55 if p.name == "eff_a" else p.value, p.kind, p.units, p.lo, p.hi, p.source)
+                    for p in super().parameters()]
+    ok(engine_identity(Refit()) != engine_identity(e) and engine_identity(ToyEngine()) == engine_identity(e),
+       "C9 a changed fitted parameter value changes the engine identity (Codex r2 P1-6)")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

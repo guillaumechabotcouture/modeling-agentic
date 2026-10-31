@@ -81,6 +81,7 @@ class Drawer:
         if zs is None:
             cz = A.calibrate(theta, shifts)
             zs = {i: v[0] for i, v in cz.items()}
+            self.last_clamped = sorted(i for i, v in cz.items() if v[1])   # Codex r2 P1-4: kept per draw
         return theta, zs, noise, mult, sampled
 
 
@@ -93,12 +94,15 @@ def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
     opt_vals, same = [], np.zeros(len(A.ids))
     comps_used, outs, samples = set(), [], {}
     corr_any = corr_plan = 0
+    clamped_draws = []
     hl_outcome = A.spec["deliverable"]["headline"]["outcome"]
     for d in range(nd):
+        D.last_clamped = []
         theta, zs, noise, mult, sampled = D.draw()
+        if D.last_clamped:
+            clamped_draws.append({"draw": d, "units": len(D.last_clamped), "examples": D.last_clamped[:5]})
         out, ben, cost = A.evaluate(theta, zs, noise=noise, cost_mult=mult)
         corr_any += bool(A.last_events)
-        corr_plan += bool(A.plan_corrections(A.last_events, plan))
         row = {}
         for o in A.outcomes:
             v = sum(out[i]["y"][A.comp][o] - out[i]["y"][plan[i]][o] for i in A.ids)
@@ -106,6 +110,7 @@ def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
             row[f"{o}_averted"] = v
         row[headline_name] = row[f"{hl_outcome}_averted"]
         sol = A.solve(ben, cost)
+        A.guard(f"uncertainty draw {d}", [plan, sol["choice"]])
         opt_vals.append(sol["objective"])
         row["reoptimised_objective"] = sol["objective"]
         same += np.array([sol["choice"][i] == plan[i] for i in A.ids])
@@ -116,6 +121,14 @@ def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
         for k, v in sampled.items():
             samples.setdefault(k, []).append(v)
     lvl = scope["level"]
+    if clamped_draws:
+        # Codex r2 P1-4: where a draw's calibration clamps, that draw does not carry the full calibration uncertainty;
+        # the interval says so instead of claiming unrestricted calibration coverage.
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        import render_claims
+        meta = dict(scope["interval"])
+        meta["covers"] = ["calibration_partly_clamped" if k == "calibration" else k for k in meta["covers"]]
+        scope = dict(scope, interval=meta, covers=meta["covers"], label=render_claims.interval_label(meta))
     data = {"draws": nd, "seed": int(sp.get("seed", 42)) if seed is None else int(seed),
             "covers": scope["covers"], "excludes": scope["excludes"], "label": scope["label"],
             "fixed_plan": {o: q(v, lvl) for o, v in fixed.items()},
@@ -123,7 +136,10 @@ def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
             "units_same_package_share_median": float(np.median(same / max(nd, 1))) if nd else None,
             "units_same_package_in_90pct_of_draws": int(np.sum(same / max(nd, 1) >= 0.9)) if nd else None,
             "components_in_any_draw_plan": sorted(comps_used), "interval": scope["interval"],
-            "model_corrections": {"draws_with_corrections": corr_any, "draws_with_corrections_on_plan": corr_plan},
+            "calibration_clamped": {"draws": len(clamped_draws), "max_units": max((c["units"] for c in clamped_draws),
+                                                                                  default=0),
+                                    "per_draw": clamped_draws},
+            "model_corrections": {"draws_with_corrections": corr_any, "draws_with_corrections_on_plan": 0},
             "headline": {"name": headline_name, "outcome": hl_outcome}}
     agg = _pu().summarise_outputs(outs, samples, nd, level=scope["level"])   # the signed level (Codex P1-11)
     report = {"producer": PRODUCER, "produced_by": "harness", "n_draws": nd, "n_draws_requested": nd,

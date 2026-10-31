@@ -97,6 +97,7 @@ def run(A, z0, out0, ben0, cost0, plan) -> dict:
             return {"method": "skipped", "reason": "calibration.method none: nothing is calibrated, nothing to hold out",
                     "folds": [], "metrics": {}, "verdict": "NOT_RUN", "value_verdict": "NOT_RUN"}
         sol = A.solve(ben_f, cost_f)
+        A.guard(f"stability fold {gv}", [plan, sol["choice"]])
         pf = sol["choice"]
         c_full = [cost0[i][plan[i]] for i in hid]
         c_fold = [cost0[i][pf[i]] for i in hid]

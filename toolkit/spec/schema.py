@@ -151,20 +151,20 @@ def load(path: str) -> "Spec":
             st = yaml.safe_load(f) or {}
         if not isinstance(st, dict):
             raise SpecError(f"{SETTINGS}: must be a mapping")
-        for path, v in _leaves(st):
-            name = ".".join(map(str, path))
-            if path not in SETTINGS_PATHS:
+        for leaf, v in _leaves(st):
+            name = ".".join(map(str, leaf))
+            if leaf not in SETTINGS_PATHS:
                 raise SpecError(f"{SETTINGS}: {name} is not a computational setting "
                                 f"({', '.join('.'.join(x) for x in sorted(SETTINGS_PATHS))}); it belongs in the signed "
                                 "decision spec")
             node = raw
-            for k in path[:-1]:
+            for k in leaf[:-1]:
                 node = node.setdefault(k, {})
                 if not isinstance(node, dict):
                     raise SpecError(f"{SETTINGS}: {name}: the signed spec's {k} is not a mapping")
-            if path[-1] in node:
+            if leaf[-1] in node:
                 raise SpecError(f"{SETTINGS}: {name} is also in the signed spec; keep it in one place")
-            node[path[-1]] = v
+            node[leaf[-1]] = v
         settings_path = sp
     s = Spec(raw, base, path)
     s.settings_path = settings_path
@@ -785,6 +785,8 @@ def _self_test() -> int:
         s3 = load(p)
         ok(validate(s3) == [] and s3["uncertainty"]["draws"] == draws and s3["analysis"]["emulator"]["points"] == pts
            and s3.settings_sha256, f"SP19 computational settings (draws, design size) can live in {SETTINGS}")
+        ok(s3.path == p and s3.sha256 == sha256_file(p),
+           f"SP19b loading with a settings file keeps the spec's own path (Codex r2 P1-1): {s3.path}")
         for bad_set, label in (({"objective": {"outcome": "cases"}}, "a decision section"),
                                ({"calibration": {"range": [-9, 9]}}, "a calibration setting"),
                                ({"analysis": {"decision_tests": []}}, "the decision tests"),
