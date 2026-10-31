@@ -272,6 +272,13 @@ that the decision does not depend on it. The result format, where it goes and
 the few exemptions (the owner scoped it out; a finding with no quantity to
 vary) are in the rigor manifest, entry `decision_tests`.
 
+When the finding bears on the primary decision itself (a per-unit allocation
+that does not hold out of sample; a benchmark drift for an intervention the
+decision chooses among), the lead cannot declare it alone: the owner reads the
+declaration and its test and accepts or declines it (Phase 49 β, entry
+`scope_signoff`). Write the test so it answers the owner's question: does the
+package per unit change?
+
 ### "Level 1 is good enough for now"
 Level 1 IS good enough when the audience is internal decision support
 or rapid analysis. Level 1 is NOT good enough when the audience is a

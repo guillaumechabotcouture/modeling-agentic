@@ -40,19 +40,15 @@ decision_test:
   # named here needs a test (fail closed for new kinds).
   exempt_kinds:
     # A required artifact is absent: produce it; there is nothing to vary yet.
-    required_artifact_missing: "a required artifact is absent (not_applicable covers the rest)"
-    allocation_robustness_missing: "the cross-validation artifact is absent"
-    sensitivity_analysis_missing: "the sensitivity artifact is absent"
-    optimization_quality_missing: "the optimizer comparison artifact is absent"
+    # A missing decision analysis (the allocation's cross-validation and
+    # sensitivity, the optimizer check, the uncertainty and identifiability
+    # reports, the outcome function, ...) is not self-exemptable: it is in
+    # `decision_bearing:` below, so declaring its absence needs the owner.
+    required_artifact_missing: "a required document is absent (missing analyses: see decision_bearing)"
     universal_coverage_missing: "the universal-coverage artifact is absent"
-    within_zone_heterogeneity_missing: "the within-unit heterogeneity artifact is absent"
-    daly_analysis_missing: "the DALY analysis artifact is absent"
-    uq_report_missing: "the uncertainty report is absent"
-    identifiability_report_missing: "the identifiability report is absent"
     identifiability_a_priori_missing: "the a-priori identifiability arithmetic is absent"
     msc_manifest_missing: "the multi-structure manifest is absent"
     msc_report_missing: "the multi-structure report is absent"
-    outcome_fn_missing: "the outcome function is absent"
     decision_rule_missing: "decision_rule.md is absent"
     claims_ledger_missing: "the claims ledger is absent"
     claims_spec_missing: "the claims spec is absent"
@@ -81,3 +77,118 @@ decision_test:
     # A document defect, not a model result.
     figure_staleness_detected: "a stale figure is redrawn, not tested"
     decision_rule_malformed: "decision_rule.md does not parse as a rule"
+
+# Phase 49 β (A21): findings that bear on the primary decision go to the owner.
+#
+# Read by scripts/scope_signoff.py. The signed decision brief names the
+# decision and its unit (decision_brief.yaml `decision`, answers' `resolution`).
+# A HIGH gate finding of a kind below, when its condition holds, bears on that
+# decision: the lead cannot declare it by itself. A DECLARE_SCOPE that relies
+# on declaring it becomes AWAIT_OWNER: the owner sees each such finding with
+# its declaration and decision test (Phase 49 α) and accepts or declines it
+# (`scripts/scope_signoff.py sign`). A `<kind>_persistent` escalation follows
+# its base kind.
+#
+# Conditions (generic; no disease, country or intervention names):
+#   allocation              the run produces a per-unit allocation (an
+#                           allocation CSV or decision_rule.md): the decision
+#                           is which package each allocation unit receives.
+#   benchmark_intervention  the benchmark (models/benchmark_targets.yaml, by the
+#                           finding's key) names an intervention the decision
+#                           chooses among, in or excluded from the recommended
+#                           plan: a token of its `intervention` field, else its
+#                           `metric`, matches a package component
+#                           (models/effect_concordance.yaml `packages`,
+#                           `effects[].component`) or an intervention name
+#                           (models/eligibility_manifest.yaml); `intervention:
+#                           none` marks a calibration target. When the run
+#                           lists no interventions, or the benchmark cannot be
+#                           read, the finding is treated as bearing (fail closed).
+# `sources:` (run-relative files the finding is computed from) are hashed into
+# the owner item's fingerprint: an answer covers that evidence only.
+#   always                  the kind is about an intervention effect the plan uses,
+#                           or an analysis every decision rests on is missing.
+#   artifact                `required_artifact_missing` (or a `not_applicable:`
+#                           declaration) for one of the listed artifacts: the
+#                           analysis was not run, so there is nothing to vary
+#                           and only the owner may accept its absence.
+decision_bearing:
+  kinds:
+    allocation_unstable:
+      when: allocation
+      reason: "the allocation does not hold out of sample, and the decision is the package per allocation unit"
+      sources: [models/allocation_robustness.yaml]
+    sensitivity_analysis_unstable:
+      when: allocation
+      reason: "plausible parameter changes flip the recommended packages"
+      sources: [models/sensitivity_analysis.yaml]
+    optimization_quality_gap_too_large:
+      when: allocation
+      reason: "the optimizer's allocation is far from the best one found by another method"
+      sources: [models/optimization_quality.yaml]
+    within_zone_heterogeneity_unbounded:
+      when: allocation
+      reason: "variation inside allocation units may reverse the package choice"
+      sources: [models/within_zone_heterogeneity.yaml]
+    benchmark_drift:
+      when: benchmark_intervention
+      reason: "the model's value for an intervention the decision chooses among is outside its benchmark band"
+      sources: [models/benchmark_targets.yaml, models/benchmark_computed.yaml, benchmark_match.yaml]
+    effect_exceeds_trial_evidence:
+      when: always
+      reason: "an intervention effect used by the plan exceeds the trial evidence"
+      sources: [models/effect_concordance.yaml]
+    # A decision analysis that was not run: nothing to vary, so not self-exemptable.
+    allocation_robustness_missing:
+      when: allocation
+      reason: "the allocation's out-of-sample check was not run"
+      sources: [models/allocation_robustness.yaml]
+    sensitivity_analysis_missing:
+      when: allocation
+      reason: "the allocation's sensitivity analysis was not run"
+      sources: [models/sensitivity_analysis.yaml]
+    optimization_quality_missing:
+      when: allocation
+      reason: "the optimizer was not checked against another method"
+      sources: [models/optimization_quality.yaml]
+    within_zone_heterogeneity_missing:
+      when: allocation
+      reason: "variation inside allocation units was not assessed"
+      sources: [models/within_zone_heterogeneity.yaml]
+    daly_analysis_missing:
+      when: allocation
+      reason: "the allocation's DALY analysis was not run"
+    uq_report_missing:
+      when: always
+      reason: "the recommendation has no uncertainty analysis"
+      sources: [uncertainty_report.yaml, models/outcome_fn.py]
+    identifiability_report_missing:
+      when: always
+      reason: "the fitted parameters' identifiability was not assessed"
+      sources: [models/identifiability.yaml]
+    outcome_fn_missing:
+      when: always
+      reason: "the decision has no outcome function to evaluate it"
+      sources: [models/outcome_fn.py]
+    optimization_quality_no_benchmark:
+      when: allocation
+      reason: "the optimizer's allocation was not compared with any other method"
+      sources: [models/optimization_quality.yaml]
+    # The allocation-rigor coordinator folds the missing allocation analyses into
+    # one finding (and its `_persistent` HIGH): the aggregate goes to the owner
+    # whole, since every member is a decision analysis.
+    allocation_rigor_drafts_overdue:
+      when: allocation
+      reason: "allocation analyses (sensitivity, cross-validation, optimizer check, coverage, DALYs) are missing past their deadline"
+      sources: [models/sensitivity_analysis.yaml, models/allocation_robustness.yaml, models/optimization_quality.yaml,
+                models/universal_coverage.yaml]
+    required_artifact_missing:
+      when: artifact
+      artifacts: [allocation_robustness, sensitivity_analysis, optimization_quality,
+                  within_zone_heterogeneity, outcome_fn, identifiability]
+      reason: "a required decision analysis is absent"
+  # Words in benchmark metrics and intervention names that do not identify an
+  # intervention (comparisons, outcomes, units). Quote YAML 1.1 booleans ("on").
+  generic_tokens: [vs, or, rr, hr, irr, and, the, of, per, to, in, "on", with, without, added, none,
+                   usd, daly, dalys, cost, costs, effect, prevalence, incidence, rate, ratio, plan,
+                   status, quo, national, any, all, new, old, standard, std, base, baseline]
