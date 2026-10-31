@@ -59,8 +59,9 @@ where those contracts exist); the gate logic does not change when it does.
 
 A finding with a key needs a test naming that key (`benchmark_drift:B15` or
 `B15`): one test per benchmark, not one per kind. Keys are normalized as A17
-records them (`stall_rule.finding_key`: a parameter set is `n=<size>:<hash>`),
-and a `<kind>_persistent` escalation is named by its base finding's instance.
+records them (`stall_rule.finding_key`: a parameter set is `n=<size>:<hash>`).
+A `<kind>_persistent` escalation stands for each keyed instance of its base
+finding: it is covered when every instance is (one test per instance).
 
 All gate findings are checked (spec-compliance, rigor and registry), once they
 are assembled (`validate_critique_yaml._apply_declaration_tests`). A17 counts a
@@ -113,7 +114,7 @@ KINDS = (UNTESTED, INVALID, CHANGES)
 # outcome_fn + toolkit/alloc where those contracts exist) with no gate change.
 PRODUCERS = ("agent", "harness")
 POLICY = os.path.join(os.path.dirname(HERE), ".claude", "orchestration", "scope_declaration_policy.yaml")
-_POLICY_KEYS = ("exempt_stages", "exempt_suffixes", "exempt_prefixes", "exempt_kinds")
+_POLICY_KEYS = ("exempt_stages", "exempt_prefixes")
 _CRITIC_ID = re.compile(r"^[A-Z][A-Z0-9]{0,5}-\d{2,4}[a-z]?$")
 _HOWTO = ("Re-run the decision with the finding's quantity set to its target (the benchmark's value, the held-out "
           "fold's own parameters, the trial effect) and write a result file with `finding:` (kind:key), `varied`, "
@@ -143,6 +144,14 @@ def load_policy(path: str = POLICY) -> dict:
         if not isinstance(v, list) or not all(isinstance(x, str) and x.strip() for x in v):
             raise ValueError(f"{os.path.basename(path)}: decision_test.{k} must be a list of strings")
         out[k] = tuple(x.strip() for x in v)
+    # Codex review (round 2): named kinds with a reason each, no suffix classes.
+    kinds = pol.get("exempt_kinds", {})
+    if not isinstance(kinds, dict) or not all(isinstance(k, str) and isinstance(r, str) and r.strip()
+                                              for k, r in kinds.items()):
+        raise ValueError(f"{os.path.basename(path)}: decision_test.exempt_kinds must map each kind to its reason")
+    if "exempt_suffixes" in pol:
+        raise ValueError(f"{os.path.basename(path)}: decision_test.exempt_suffixes is not supported; name each kind")
+    out["exempt_kinds"] = dict(kinds)
     return out
 
 
@@ -161,8 +170,7 @@ def critic_derived(v: dict) -> bool:
 def kind_exempt(kind: str, policy: dict) -> bool:
     """The kind (or a persistent escalation's base) is in an exempt class by name."""
     for k in {kind, _base(kind)}:
-        if (k in policy["exempt_kinds"] or k.endswith(policy["exempt_suffixes"])
-                or k.startswith(policy["exempt_prefixes"])):
+        if k in policy["exempt_kinds"] or k.startswith(policy["exempt_prefixes"]):
             return True
     return False
 
@@ -182,14 +190,15 @@ def key_of(v: dict) -> str:
     return str(s).strip() if isinstance(s, (str, int)) and not isinstance(s, bool) and str(s).strip() else ""
 
 
-def with_base_identity(v: dict, current: list[dict]) -> dict:
-    """A `<kind>_persistent` escalation (no key of its own) takes its base finding's
-    instance key, when the gate holds exactly one keyed instance of the base."""
+def instances(v: dict, current: list[dict]) -> list[dict]:
+    """The instances a finding stands for. A `<kind>_persistent` escalation with no key
+    of its own stands for every keyed instance of its base kind the gate holds (Codex
+    review, round 2: C1 and C2): it is covered when each of them is."""
     kind = str(v.get("kind") or "")
     if not kind.endswith("_persistent") or key_of(v):
-        return v
-    keys = {key_of(x) for x in current if x.get("kind") == _base(kind)} - {""}
-    return dict(v, key=keys.pop()) if len(keys) == 1 else v
+        return [v]
+    keys = sorted({key_of(x) for x in current if x.get("kind") == _base(kind)} - {""})
+    return [dict(v, key=k) for k in keys] or [v]
 
 
 def identities(v: dict) -> set[str]:
@@ -330,10 +339,8 @@ def gate_findings(run_dir: str, round_n: Optional[int] = None, current: Optional
     if problems:
         return []        # an unreadable scope_declaration.yaml is already HIGH (scope_declaration_invalid)
     out, seen = [], set()
-    for v0 in current:
-        if not needs_test(v0, current, policy, non_declarable):
-            continue
-        v = with_base_identity(v0, current)
+    todo = [v for v0 in current if needs_test(v0, current, policy, non_declarable) for v in instances(v0, current)]
+    for v in todo:
         ident = _ident(v)
         if ident in seen:
             continue
@@ -405,8 +412,9 @@ def declaration_counts(run_dir: str, v: dict, current: Optional[list] = None) ->
     _doc, entries, problems = sd.load(run_dir)
     if problems:
         return False
-    v = with_base_identity(v, [x for x in (current or []) if isinstance(x, dict)])
-    return any(entry_status(run_dir, e, v)[0] in ("tested", "exempt") for e in covering(entries, v))
+    cur = [x for x in (current or []) if isinstance(x, dict)]
+    return all(any(entry_status(run_dir, e, u)[0] in ("tested", "exempt") for e in covering(entries, u))
+               for u in instances(v, cur))
 
 
 def diagnosis_problem(run_dir: str, entry: dict) -> Optional[str]:
@@ -583,6 +591,36 @@ def _self_test() -> int:
         ok(f == [], f"DT31 a persistent escalation is matched by its base finding's instance: {f}")
         w(d, "models/decision_tests/unid.yaml", dict(test, finding="weakly_identified_parameters:n=9:00000000"))
         ok(kinds(gate_findings(d, 8, [wkp, wkb])) == [INVALID], "DT32 ...and a test of another parameter set does not")
+        # DT33 (Codex round 2): a model-result failure is not an artifact gap; it needs a test.
+        ok(needs_test({"kind": "compute_results_incomplete", "severity": "HIGH", "stage": "MODEL"}, [], pol,
+                      lambda k, e: False)
+           and needs_test({"kind": "benchmark_computed_missing", "severity": "HIGH", "stage": "MODEL"}, [], pol,
+                          lambda k, e: False)
+           and not needs_test({"kind": "claims_ledger_missing", "severity": "HIGH", "stage": "ANALYZE"}, [], pol,
+                              lambda k, e: False),
+           "DT33 failed model results need a decision test; a missing artifact does not")
+        ok(all(isinstance(r, str) and r.strip() for r in pol["exempt_kinds"].values()) and "exempt_suffixes" not in pol,
+           "DT34 the exemptions are named kinds, each with a reason (no suffix classes)")
+        # DT35 (Codex round 2): a persistent escalation over several keyed base instances is covered
+        # when each instance is.
+        c1 = {"kind": "plan_minimum_bar_failed", "severity": "MEDIUM", "stage": "PLAN_CRITERIA", "key": "C1"}
+        c2 = dict(c1, key="C2")
+        pp = {"kind": "plan_minimum_bar_failed_persistent", "severity": "HIGH", "stage": "GATE"}
+        w(d, "models/decision_tests/c1.yaml", dict(test, finding="plan_minimum_bar_failed:C1"))
+        w(d, "models/decision_tests/c2.yaml", dict(test, finding="plan_minimum_bar_failed:C2"))
+        sdecl["declarations"] = [
+            {"id": "SD-C1", "blocker_id": "plan_minimum_bar_failed:C1", "why_unresolved": "x",
+             "decision_test": "models/decision_tests/c1.yaml"},
+            {"id": "SD-C2", "blocker_id": "plan_minimum_bar_failed:C2", "why_unresolved": "x",
+             "decision_test": "models/decision_tests/c2.yaml"}]
+        w(d, "scope_declaration.yaml", sdecl)
+        f = gate_findings(d, 8, [pp, c1, c2])
+        ok(f == [], f"DT35 each base instance tested: the escalation is covered: {[(x['kind'], x['key']) for x in f]}")
+        sdecl["declarations"] = sdecl["declarations"][:1]
+        w(d, "scope_declaration.yaml", sdecl)
+        f = gate_findings(d, 8, [pp, c1, c2], post_write=True)
+        ok([(x["kind"], x["key"]) for x in f] == [(UNTESTED, "plan_minimum_bar_failed_persistent:C2")],
+           f"DT35b ...one instance untested: that instance is reported: {[(x['kind'], x['key']) for x in f]}")
         # Exposed data (for the report-citation check).
         w(d, "models/decision_tests/alloc.yaml", test)
         sdecl["declarations"] = [{"id": "SD-007", "blocker_id": "allocation_unstable", "why_unresolved": "x",
