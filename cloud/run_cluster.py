@@ -770,7 +770,7 @@ def health_snapshots(cfg, client, assign: dict, now: float | None = None) -> dic
     try:
         sched = client.run_on_scheduler(rh.scheduler_view, res)
     except Exception as e:  # noqa: BLE001 — reported as a monitor error
-        sched, errors = None, [f"scheduler view: {type(e).__name__}: {str(e)[:160]}"]
+        sched, errors = None, [f"scheduler view: {type(e).__name__}: {rh.clip(e, 160)}"]
     out = {}
     for label in cfg.labels:
         errs = list(errors)
@@ -778,7 +778,7 @@ def health_snapshots(cfg, client, assign: dict, now: float | None = None) -> dic
             files = _on_worker(client, rh.run_files_view, label, worker=assign[label]["worker"])
         except Exception as e:  # noqa: BLE001
             files = {}
-            errs.append(f"run files: {type(e).__name__}: {str(e)[:160]}")
+            errs.append(f"run files: {type(e).__name__}: {rh.clip(e, 160)}")
         errs += list(files.get("errors") or [])
         out[label] = {**files, "at": now, "scheduler": sched, "input_errors": errs}
     return out
@@ -835,7 +835,7 @@ def health(cfg, args, connect_fn=None, sleep=time.sleep) -> int:
         now = time.time()
         key = f"poll:{what}:{type(e).__name__}"
         alert = {"rule": "monitor_error", "key": key, "at": now, "at_iso": rh._iso(now),
-                 "message": f"could not read {what}: {type(e).__name__}: {str(e)[:200]} (retrying next poll)"}
+                 "message": f"could not read {what}: {type(e).__name__}: {rh.clip(e, 200)} (retrying next poll)"}
         if key not in seen_poll_errors:
             seen_poll_errors.add(key)
             rh.log_alerts([alert], a.log)
@@ -1146,6 +1146,13 @@ def _self_test_51c(ok) -> None:
         s2 = health_snapshots(cfg, Broken(), {"R1": {"worker": "agent"}})["R1"]
         ok(s2["scheduler"] is None and any("scheduler gone" in e for e in s2["input_errors"]),
            "RC51c-6 an unreadable scheduler is an input error, not a quiet snapshot")
+
+        class Leaky(FakeClient):
+            def run_on_scheduler(self, fn, *a):
+                raise OSError("x" * 140 + "token=" + "sk-ant-api03-LEAKLEAKLEAKLEAK" + " tail")
+        s4 = health_snapshots(cfg, Leaky(), {"R1": {"worker": "agent"}})["R1"]
+        ok(not any("sk-ant" in e or "LEAK" in e for e in s4["input_errors"]),
+           f"RC51c-12 a scheduler error is redacted before it is truncated ({s4['input_errors'][0][-40:]})")
 
 
 def _self_test() -> int:

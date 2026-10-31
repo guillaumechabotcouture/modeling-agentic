@@ -202,7 +202,7 @@ def rule_session_error(snap: dict, cfg: dict, mem: dict) -> list[dict]:
     for e in snap.get("trace") or []:
         if isinstance(e, dict) and e.get("type") == "session_error":
             at = _epoch(e.get("ts")) or snap["at"]
-            err = str(e.get("error") or "")[:160].replace("\n", " ")
+            err = clip(e.get("error") or "", 160).replace("\n", " ")
             out.append(_alert("session_error", f"session_error@{e.get('ts')}", at,
                               f"session {e.get('session')} ended with an error: {err}"))
     return out
@@ -269,7 +269,7 @@ def rule_compute_no_rows(snap: dict, cfg: dict, mem: dict) -> list[dict]:
         ok_rows = (int(_num(n)) - int(_num(failed))) if n is not None else 0
         if core_h >= cfg["min_core_hours"] and ok_rows <= 0:
             at = _epoch(c.get("ts")) or snap["at"]
-            why = str(c.get("stopped") or "no rows")[:100]
+            why = clip(c.get("stopped") or "no rows", 100)
             out.append(_alert("compute_no_rows", f"compute_no_rows@{c.get('ts')}:{c.get('fn')}", at,
                               f"compute call charged {core_h:.1f} core-hours with no completed row "
                               f"({os.path.basename(str(c.get('fn') or '?'))}; {why})"))
@@ -316,6 +316,10 @@ _SECRET_PATTERNS = [
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"), _R),                   # GitHub tokens
     (re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"), _R),                  # AWS access key ids
     (re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}"), _R),                # Slack tokens
+    # Quoted JSON / Python-dict fields: "api_key": "...", 'access_token': '...'
+    (re.compile(r"""(?i)(["'](?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|"""
+                r"""secret|password|passwd|token|authorization|auth|sas|sig|signature|accountkey|"""
+                r"""sharedaccesskey|credential)s?["']\s*:\s*)(["'])(?:\\.|(?!\2).)*\2"""), r"\1\2" + _R + r"\2"),
 ]
 
 
@@ -327,6 +331,12 @@ def redact(text) -> str:
     for pat, repl in _SECRET_PATTERNS:
         s = pat.sub(repl, s)
     return s
+
+
+def clip(text, n: int) -> str:
+    """Redact, then truncate: a secret cut by truncation would leave a prefix
+    the patterns no longer match. Every captured free-form string uses this."""
+    return redact(text)[:n]
 
 
 def format_alert(a: dict, label: str = "") -> str:
@@ -717,6 +727,24 @@ def _self_test() -> int:
         ok("sk-ant" not in open(lp).read(), "RH23 the log file gets the redacted text too")
     ok(redact("tls://10.0.0.7:8786 round 5 gate: 83 findings") == "tls://10.0.0.7:8786 round 5 gate: 83 findings",
        "RH24 ordinary text, addresses and numbers are left alone")
+    # Codex round 2, example 1: a key that straddles a truncation boundary.
+    key = "sk-ant-api03-ZZsecretZZsecretZZsecretZZ"
+    err = "x" * 150 + key + " trailing"
+    al = Monitor(T).check({"at": now, "trace": [{"ts": _iso(now), "type": "session_error", "session": 4,
+                                                 "error": err}]})
+    line = format_alert(al[0]) if al else ""
+    ok(al and "sk-ant" not in line and "ZZsecret" not in line,
+       f"RH25 a key cut by truncation is redacted first, not left as a prefix ({line[-60:]})")
+    ok("sk-ant" not in clip(err, 160) and clip("a" * 300, 10) == "a" * 10, "RH25b clip redacts, then truncates")
+    # Codex round 2, example 2: quoted JSON / dict credential fields with colon separators.
+    for raw in ('{"api_key": "AKsecret123"}', "{'access_token': 'AKsecret123'}", '"Refresh_Token":"AKsecret123"',
+                '{"secret": "AKsecret123", "n": 1}', "{'Password': 'AKsecret123'}", '"token": "AKsecret123"',
+                '"authorization": "Basic AKsecret123"', "{'sas': 'AKsecret123'}", '"sig":"AKsecret123"',
+                '"AccountKey": "AKsecret123"'):
+        out = redact(raw)
+        ok("AKsecret123" not in out and "[REDACTED]" in out, f"RH26 quoted credential field redacted: {raw} -> {out}")
+    ok(redact('{"round": 5, "findings": 83, "key_count": 2}') == '{"round": 5, "findings": 83, "key_count": 2}',
+       "RH27 ordinary JSON fields are left alone")
 
     if fails:
         print(f"FAILED: {len(fails)} self-test case(s).")
