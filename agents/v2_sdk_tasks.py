@@ -14,8 +14,9 @@ import os
 import sys
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _REPO not in sys.path:
-    sys.path.insert(0, _REPO)
+for _p in (_REPO, os.path.join(_REPO, "scripts")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 from agents import enforcement  # noqa: E402
 from agents.v2_tasks import CRITIQUE_FILE, PREFIX, TaskResult
 from agents.fix_loop import FIX_PLANNER_PROMPT
@@ -59,8 +60,9 @@ and the draft (manuscript.md) if it exists. Judge what code cannot: plausibility
 comparator and the objective match the question, hidden assumptions, overclaims. Write
 {file} in the critique-blockers schema: reviewer, round, verdict (PASS | REVISE),
 structural_mismatch {{detected: bool}}, carried_forward (round 1: []), blockers (ids {prefix}-NNN;
-id, severity HIGH|MEDIUM|LOW, category, target_stage PLAN|DATA|MODEL|ANALYZE|WRITE,
-first_seen_round, claim, evidence, fix_requires, resolved, and a done_when test where one fits).
+each with id, severity ({severities}), category ({categories}), target_stage ({stages}),
+first_seen_round, claim, evidence, fix_requires, resolved (true/false), and a done_when test where one
+fits). Use only those values: the gate refuses any other.{feedback}
 Then write {out} = {{"ok": true}}.""",
     "plan_fixes": FIX_PLANNER_PROMPT + "\nThe packet is in {out_in}. Write your JSON to {out}.",
     "fix": COMMON + """
@@ -269,11 +271,16 @@ class SdkTasks:
         return self._session("pick_engine", PROMPTS["pick_engine"].format(out_in=inp, out=OUT),
                              "Choose the engine.", OWNS["pick_engine"], enforcement.MODEL_FAST)
 
-    def critique(self, run_dir, reviewer, round_n):
+    def critique(self, run_dir, reviewer, round_n, feedback=None):
+        import validate_critique_yaml as V
         f = CRITIQUE_FILE[reviewer]
         model = enforcement.MODEL_FAST if reviewer == "critique-presentation" else enforcement.MODEL_DEEP
-        return self._session("critique", PROMPTS["critique"].format(reviewer=reviewer, round=round_n, file=f,
-                                                                     prefix=PREFIX[reviewer], out=OUT),
+        fb = ("\n\nThis is a repair: the gate refused your file. Fix exactly these errors and keep the review:\n- "
+              + "\n- ".join(feedback)) if feedback else ""
+        return self._session("critique", PROMPTS["critique"].format(
+            reviewer=reviewer, round=round_n, file=f, prefix=PREFIX[reviewer], out=OUT, feedback=fb,
+            severities=" | ".join(sorted(V.VALID_SEVERITY)), categories=" | ".join(sorted(V.VALID_CATEGORY)),
+            stages=" | ".join(sorted(V.VALID_TARGET_STAGE))),
                              f"Review round {round_n}.", (f,), model)
 
     def plan_fixes(self, packet):
@@ -354,6 +361,12 @@ def _self_test() -> int:
            and _answer_key(os.path.join(R, "evals", "q", "rubric.yaml"), d) and _answer_key("x/_truth/truth.json", d)
            and _answer_key("evals/q/generate.py", d),
            "S9 the questions' public inputs (data/evals/) are readable; evals/ and _truth are not")
+        import validate_critique_yaml as V
+        cp = PROMPTS["critique"].format(reviewer="critique-domain", round=1, file="f", prefix="D", out=OUT,
+                                        feedback="\n- X", severities="H", categories=" | ".join(sorted(V.VALID_CATEGORY)),
+                                        stages="S")
+        ok(all(c in cp for c in V.VALID_CATEGORY) and "- X" in cp,
+           "S11 the critique prompt lists the gate's categories and carries a repair's errors")
         ok("{settings}" not in PROMPTS["fix"].format(tid="T", brief="b", findings=[], evidence="", settings="a.b", out=OUT)
            and "engine: auto" in PROMPTS["draft_spec"], "S10 the prompts follow the analysis backend's schema")
 
