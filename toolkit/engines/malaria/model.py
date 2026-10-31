@@ -15,6 +15,11 @@ diversion to outdoor biting) and killing of indoor-resting mosquitoes with a
 product-specific decay (vector.feeding). Daily records feed the engine's named windows;
 decision-window accumulators feed per-capita outcomes and cost drivers.
 
+v0.3: use below access. has_net is ACCESS (a net to sleep under); each night a person with
+access uses it with the nightly-use rule in using_net (use_rate from Bertozzi-Villa 2021).
+Nets are lost at rate ln2 / net_retention_half (attrition; median retention from the same
+source); holes grow with net age (vector.apply_holes, Briet 2020).
+
 v0.2 (workstream A): households. Agents are grouped into households of mean size
 `hh_size`. Three latent normals drive coverage and exposure:
   z_hh   household latent; a person's net-use latent is
@@ -45,7 +50,7 @@ G = dict(b0=0.590, b1=0.5, IB0=43.9, kb=2.16, ub=7.2, db=3650.,
          cD=0.068, cT=0.0219, cU=0.0062, gam1=1.82,
          rho=0.85, a0=8 * 365., sigma2=1.67, tau1=0.69, tau2=2.31, eip=10)
 S_, D_, T_, A_, U_ = 0, 1, 2, 3, 4
-DAILY = ("pfpr_u5", "pfpr_6m14y", "pfpr_2_10", "inc_u5", "inc_all", "inc_u5_smc", "eir")
+DAILY = ("pfpr_u5", "pfpr_6m14y", "pfpr_2_10", "inc_u5", "inc_all", "inc_u5_smc", "eir", "net_use", "net_access")
 
 
 class Malaria(ss.Disease):
@@ -67,6 +72,7 @@ class Malaria(ss.Disease):
             ss.FloatArr('prop_net', default=ss.random()), ss.FloatArr('prop_smc', default=ss.random()),
             ss.FloatArr('prop_spray', default=ss.random()),
             ss.FloatArr('hh', default=-1.0), ss.FloatArr('z_hh', default=0.0), ss.FloatArr('z_sp', default=0.0),
+            ss.FloatArr('prop_use', default=ss.random()),
         )
 
     def init_post(self):
@@ -122,6 +128,18 @@ class Malaria(ss.Disease):
         zz = a * z_net + np.sqrt(1 - a * a) * rs.normal(size=n)
         self.zeta[u] = np.exp(sig * zz - G['sigma2'] / 2)
 
+    def using_net(self, u):
+        """Who sleeps under a net tonight: access (has_net), not a persistent non-user, and the
+        nightly draw. A share use_persist of the use gap (1 - use_rate) is persistent non-use
+        (prop_use < q); the others use their net on a night with probability use_rate / (1 - q),
+        so mean nightly use among those with access is use_rate."""
+        P = self.P
+        acc = self.has_net[u]
+        q = P['use_persist'] * (1 - P['use_rate'])
+        p_night = min(1.0, P['use_rate'] / max(1 - q, 1e-9))
+        draw = self.rs.random(len(u)) < p_night
+        return acc & (self.prop_use[u] >= q) & draw
+
     @property
     def rs(self):
         if not hasattr(self, '_rng'):
@@ -156,7 +174,7 @@ class Malaria(ss.Disease):
         st = self.st[u]
         w0 = self.zeta[u] * (1 - G['rho'] * np.exp(-age_d / G['a0']))
         sw = w0.sum()
-        hn = self.has_net[u]
+        hn = self.using_net(u)
         net_type, net_age = self.net_type[u], ti - self.net_t[u]
         irs_det, irs_kill = V.irs_effect(ti - self.spray_t[u], P, p.irs_product)
         # infectiousness of humans to mosquitoes
@@ -213,7 +231,7 @@ class Malaria(ss.Disease):
             self.prot_eff[u[toP]] = 1.0
         for nm, d in (('IB', G['db']), ('IC', G['dc']), ('ID', G['dd']), ('IV', G['dv'])):
             getattr(self, nm)[u] = getattr(self, nm)[u] * np.exp(-1 / d)
-        lose = hn & (self.rs.random(n) < LN2 / P['net_retention_half'])
+        lose = self.has_net[u] & (self.rs.random(n) < LN2 / P['net_retention_half'])
         if lose.any():
             self.has_net[u[lose]] = False
         if ti % 365 == 0:
@@ -231,6 +249,8 @@ class Malaria(ss.Disease):
         dd['pfpr_6m14y'][ti] = det[c14].mean() if c14.any() else 0.0
         dd['pfpr_2_10'][ti] = det[c210].mean() if c210.any() else 0.0
         dd['eir'][ti] = eir_i.mean()
+        dd['net_use'][ti] = hn.mean()
+        dd['net_access'][ti] = self.has_net[u].mean()
         dd['inc_all'][ti] = clin.sum() / n
         nu5 = max((age_d < 5 * 365).sum(), 1)
         dd['inc_u5'][ti] = clin[a_i < 5 * 365].sum() / nu5

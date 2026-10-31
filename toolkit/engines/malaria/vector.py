@@ -25,7 +25,8 @@ NETS: published hut-trial relationships (Churcher et al. 2016 eLife 10.7554/eLif
 Table 6 and Equations 2, 4, 8, 11-19; read from PMC5025277). From discriminating-dose
 pyrethroid bioassay mortality x (1 = susceptible), tau = 0.5:
   hut mortality         logit(l) = 0.63 + 4.00 (x - tau)
-  PBO bioassay          logit(f) = (3.41 + 5.88 (x - tau)) / (1 + 0.78 (x - tau))  An. gambiae complex
+  PBO bioassay          logit(f) = 3.41 + 5.88 (x - tau) / (1 + 0.78 (x - tau))    An. gambiae complex
+                        (Equation 4; v0.2 divided b1 too, a transcription error from flattened text)
                         logit(f) = 2.53 + 0.89 (x - tau)                            An. funestus
                         (a PBO net uses l evaluated at f instead of x)
   entry vs untreated    m = 1 - [0.071 + 1.26 (l - tau) + 1.52 (l - tau)^2], capped to [0, 1]
@@ -36,6 +37,17 @@ pyrethroid bioassay mortality x (1 = susceptible), tau = 0.5:
                         r(t) = (r0 - r_M) exp(-gamma t) + r_M, r_M = 0.24;  d(t) = d0 exp(-gamma t)
 Note: Table 6 gives the funestus PBO row as two coefficients (2.53, 0.89); the linear form
 used for it is our reading of the table (flagged unverified in the engine card).
+
+Holes (physical decay of nets in use; v0.3): Briet et al. 2020 Malar J
+10.1186/s12936-020-03383-6, Additional file 2 Table S9: the log odds that a mosquito that
+entered attacks (feeds through) the net rise by beta_hole per unit of ln(holed area cm^2 + 1),
+0.379 for susceptible (Zeneti) and 0.541 for resistant (Akron) An. gambiae s.l. Holed area
+grows about exponentially over the first 3 years (main text), to a median across the seven
+country cohorts of ln(holed area) = 3.67 at 24 months (Table 3), so ln(H + 1) = 1.84 per year
+of net age, capped at 3 years. The fed share s of the Churcher outcome gets that log-odds
+increase; the extra feeds come out of the repelled share first, then the killed share.
+Interpolating beta_hole linearly in bioassay mortality between the two strains is our
+assumption (flagged unverified).
 Dual-AI nets: the pyrethroid net above plus chlorfenapyr killing a share
 cfp_kill exp(-ln2 t / cfp_half) of the mosquitoes that would otherwise feed or be repelled
 (no published hut coefficient in the priors: cfp_kill is fitted to the pack).
@@ -68,6 +80,37 @@ CHURCHER = dict(tau=0.5, a1=0.63, a2=4.00, d1=0.071, d2=1.26, d3=1.52, th1=0.02,
                 mu=-2.36, rho=-3.05, k0=0.70, Hys=2.64, rM=0.24,
                 pbo={"gambiae": (3.41, 5.88, 0.78), "funestus": (2.53, 0.89, 0.0)})
 CHURCHER_SOURCE = "Churcher et al. 2016 eLife 10.7554/eLife.16090, Table 6 (PMC5025277)"
+
+# Briet et al. 2020 Malar J: holes in nets in use.
+HOLES = dict(beta_susceptible=0.379, beta_resistant=0.541, ln_area_24m=3.67, cap_years=3.0)
+HOLES_SOURCE = ("Briet et al. 2020 Malar J 10.1186/s12936-020-03383-6: Additional file 2 Table S9 (beta_1,att) and "
+                "Table 3 (median of seven cohorts' mean ln holed area at 24 months)")
+
+
+def hole_log_area(age_d):
+    """ln(holed area + 1) of a net in use, by net age in days."""
+    yrs = np.minimum(np.maximum(np.asarray(age_d, float), 0.0) / 365.0, HOLES["cap_years"])
+    return HOLES["ln_area_24m"] / 2.0 * yrs
+
+
+def hole_beta(x):
+    """Log-odds increase in feeding per unit ln(holed area + 1), interpolated in bioassay mortality."""
+    x = np.clip(np.asarray(x, float), 0.0, 1.0)
+    return HOLES["beta_resistant"] + (HOLES["beta_susceptible"] - HOLES["beta_resistant"]) * x
+
+
+def apply_holes(r, d, s, x, age_d, on=True):
+    """Raise the fed share for holes (log-odds shift); extra feeds come from repelled, then killed."""
+    if not on:
+        return r, d, s
+    s = np.asarray(s, float)
+    s_new = _expit(_logit(np.clip(s, 1e-6, 1 - 1e-6)) + hole_beta(x) * hole_log_area(age_d))
+    s_new = np.maximum(s_new, s)
+    extra = s_new - s
+    take_r = np.minimum(extra, r)
+    r2 = r - take_r
+    d2 = np.maximum(d - (extra - take_r), 0.0)
+    return r2, d2, 1 - r2 - d2
 
 # Protopopoff et al. 2018 Lancet: WHO cone bioassay mortality on walls sprayed with
 # Actellic 300CS (days since spraying, mortality).
@@ -119,13 +162,20 @@ def resistance_of(resistance, species: str) -> float:
     return float(resistance)
 
 
+def pbo_bioassay(x, complex_: str = "gambiae"):
+    """Churcher 2016 Equation 4 (MathML in PMC5025277): logit(f) = b1 + b2 (x - tau) / (1 + b3 (x - tau))."""
+    C = CHURCHER
+    b1, b2, b3 = C["pbo"][complex_]
+    x = np.clip(np.asarray(x, float), 0.0, 1.0)
+    return _expit(b1 + b2 * (x - C["tau"]) / (1 + b3 * (x - C["tau"])))
+
+
 def hut_new_net(x, pbo: bool, complex_: str = "gambiae"):
     """Churcher 2016 per-attempt outcomes of a NEW net: (r0, d0, s0, gamma per day)."""
     C = CHURCHER
     x = np.clip(np.asarray(x, float), 0.0, 1.0)
     if pbo:
-        b1, b2, b3 = C["pbo"][complex_]
-        x = _expit((b1 + b2 * (x - C["tau"])) / (1 + b3 * (x - C["tau"])))
+        x = pbo_bioassay(x, complex_)
     l = _expit(C["a1"] + C["a2"] * (x - C["tau"]))
     m = np.clip(1 - (C["d1"] + C["d2"] * (l - C["tau"]) + C["d3"] * (l - C["tau"]) ** 2), 0.0, 1.0)
     k = C["th1"] * np.exp(C["th2"] * (1 - l - C["tau"]))
@@ -140,9 +190,10 @@ def hut_new_net(x, pbo: bool, complex_: str = "gambiae"):
     return r0, d0, s0, LN2 / (hy * 365.0)
 
 
-def itn_effect(net_type, x, age_d, P, complex_: str = "gambiae"):
+def itn_effect(net_type, x, age_d, P, complex_: str = "gambiae", holes: bool = True):
     """Per-contact (repelled, killed, fed) for nets of `net_type` (codes in NET_CODE) against
-    one species complex with bioassay mortality x, by net age in days."""
+    one species complex with bioassay mortality x, by net age in days (holes included unless
+    holes=False)."""
     net_type = np.asarray(net_type)
     age_d = np.maximum(np.asarray(age_d, float), 0.0)
     out = []
@@ -157,6 +208,7 @@ def itn_effect(net_type, x, age_d, P, complex_: str = "gambiae"):
     r = np.where(is_pbo, r_b, r_p)
     d = np.where(is_pbo, d_b, d_p)
     s = np.clip(1 - r - d, 0.0, 1.0)
+    r, d, s = apply_holes(r, d, s, x, age_d, holes and P.get("net_holes", 1.0) > 0)
     c = P["cfp_kill"] * np.exp(-LN2 * age_d / P["cfp_half"])
     dual = net_type == 2
     r = np.where(dual, r * (1 - c), r)
@@ -241,7 +293,8 @@ def _self_test() -> int:
     ok(abs(d_ - 0.260) < 3e-3 and abs(s_ - 0.062) < 3e-3 and abs(LN2 / g_ / 365 - 0.33) < 0.02,
        f"V5 Churcher: at 8.8% bioassay mortality a pyrethroid net kills 0.26, lets 0.062 feed, half-life 0.33 y")
     rb, db, sb, gb = hut_new_net(0.088, True)
-    ok(LN2 / gb > 4 * LN2 / g_ and sb < s_, "V6 PBO restores durability and blocks more feeding under resistance (gambiae complex)")
+    ok(g_ / gb > 1.5 and sb < s_,
+       f"V6 PBO lengthens insecticide half-life ({g_ / gb:.2f}x) and blocks more feeding under resistance (gambiae complex)")
     _, dbf, _, _ = hut_new_net(0.088, True, "funestus")
     ok(abs(dbf - db) > 0.03,"V7 PBO effect differs by species complex (separate Table 6 coefficients)")
     rs, ds, ss_ = itn_effect(np.array([0, 1, 2]), 0.088, np.array([0.0, 0.0, 0.0]), P)
@@ -276,6 +329,27 @@ def _self_test() -> int:
     w0 = np.ones(4)
     f, mu = cycle(b, w0, np.ones(4), np.ones(4), np.zeros(4))
     ok(abs(mu - b["mu0"]) < 1e-9, "V15 without interventions the cycle reproduces baseline mortality")
+    # Churcher 2016 Equation 4, against the paper: worked value and the published statements
+    ok(abs(float(pbo_bioassay(0.088)) - 0.460) < 0.002,
+       f"V21 Eq. 4 at x = 0.088 gives PBO bioassay mortality 0.460 ({float(pbo_bioassay(0.088)):.3f})")
+    xs = np.linspace(0.0, 1.0, 101)
+    gain = pbo_bioassay(xs) - xs
+    ok(0.1 < xs[int(np.argmax(gain))] < 0.6,
+       f"V22 A. gambiae complex: the PBO gain peaks at intermediate resistance (paper, Discussion; peak x = {xs[int(np.argmax(gain))]:.2f})")
+    ok(float(pbo_bioassay(xs, "funestus").min()) > 0.85,
+       "V23 A. funestus: PBO restores near-100% mortality at every resistance level (paper, Discussion)")
+    # holes (Briet 2020), in isolation
+    ok(hole_log_area(0.0) == 0 and abs(hole_log_area(730.0) - 3.67) < 1e-9 and hole_log_area(2000.0) == hole_log_area(3 * 365.0),
+       "V17 holed area: none when new, Briet's 24-month median at 2 years, capped at 3 years")
+    r_new, d_new, s_new = itn_effect(np.array([0]), 0.95, np.array([0.0]), P)
+    r_n0, d_n0, s_n0 = itn_effect(np.array([0]), 0.95, np.array([0.0]), P, holes=False)
+    ok(np.allclose([r_new, d_new, s_new], [r_n0, d_n0, s_n0]), "V18 a new net has no holes effect")
+    r2y, d2y, s2y = itn_effect(np.array([0]), 0.95, np.array([730.0]), P)
+    r2n, d2n, s2n = itn_effect(np.array([0]), 0.95, np.array([730.0]), P, holes=False)
+    lo = lambda p: np.log(p / (1 - p))  # noqa: E731
+    ok(s2y[0] > s2n[0] and abs(lo(s2y[0]) - lo(s2n[0]) - hole_beta(0.95) * 3.67) < 1e-6 and abs(r2y + d2y + s2y - 1)[0] < 1e-12,
+       "V19 holes raise feeding by Briet's log-odds slope; outcomes still sum to one")
+    ok(abs(hole_beta(1.0) - 0.379) < 1e-12 and abs(hole_beta(0.0) - 0.541) < 1e-12, "V20 hole slope by resistance (Table S9 strains)")
     ok(resistance_of({"gambiae": 0.1, "default": 0.5}, "funestus") == 0.5 and resistance_of(0.3, "gambiae") == 0.3,
        "V16 resistance per species, with a default")
     if fails:

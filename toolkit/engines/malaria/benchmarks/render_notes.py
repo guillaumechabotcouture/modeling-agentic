@@ -57,18 +57,25 @@ def _band(r):
     return f"{_fmt(r.get('target'))} ({_fmt(b[0])}–{_fmt(b[1])})" if b else "rules"
 
 
-def render(new: dict, old: dict | None, fitted: dict | None, mech: dict | None) -> str:
+def render(new: dict, old: dict | None, fitted: dict | None, mech: dict | None, mid: dict | None = None) -> str:
     o = {r["id"]: r for r in (old or {}).get("benchmarks", [])}
-    out = ["### Benchmark pack, before (spike v0.1) and after (v0.2)", "",
-           "| ID | Benchmark | Target (band) | v0.1 spike | v0.1 status | v0.2 | v0.2 seed range | v0.2 status | Role |",
+    m = {r["id"]: r for r in (mid or {}).get("benchmarks", [])}
+    ver = new.get("engine_version", "new")
+    out = [f"### Benchmark pack: spike v0.1, v0.2 (PR round 1) and v{ver}", "",
+           f"| ID | Benchmark | Target (band) | v0.1 spike | v0.2 | v{ver} | v{ver} seed range | v{ver} status | Role |",
            "|---|---|---|---|---|---|---|---|---|"]
+
+    def cell(p):
+        if not p:
+            return "n/a"
+        st = p.get("status") or ("in_band" if p.get("in_band") else "out_of_band")
+        return f"{_value(p)} ({LABEL[st]})"
     for r in new["benchmarks"]:
-        p = o.get(r["id"])
-        out.append(f"| {r['id']} | {r['metric']} | {_band(r)} | {_value(p) if p else 'n/a'} | "
-                   f"{_status_old(p) if p else 'n/a'} | {_value(r)} | {_spread(r)} | {LABEL[r['status']]} | {r['role']} |")
+        out.append(f"| {r['id']} | {r['metric']} | {_band(r)} | {cell(o.get(r['id']))} | {cell(m.get(r['id']))} | "
+                   f"{_value(r)} | {_spread(r)} | {LABEL[r['status']]} | {r['role']} |")
     s = new["summary"]
     bs = s["by_status"]
-    out += ["", f"v0.2: {bs['in_band']} in band, {bs['out_of_band']} out of band, {bs['not_assessable']} not assessable, "
+    out += ["", f"v{ver}: {bs['in_band']} in band, {bs['out_of_band']} out of band, {bs['not_assessable']} not assessable, "
             f"{bs['band_mis_based']} band mis-based, of {s['total']} ({s['held_out_in_band']} of {s['held_out_total']} "
             f"held-out in band). {new['n_sims']} engine runs, {len(new['seeds'])} seeds per arm (common random numbers). "
             f"v0.1: {(old or {}).get('summary', {}).get('in_band', 'n/a')} of {(old or {}).get('summary', {}).get('total', 'n/a')} in band."]
@@ -126,6 +133,16 @@ def render(new: dict, old: dict | None, fitted: dict | None, mech: dict | None) 
         for c in mech["configs"]:
             out.append(f"| {c['config']} | {c['or_pbo_alone']} | {c['or_irs_alone']} | {c['or_both']} | {c['interaction_or']} | "
                        f"{c['seed_min']}–{c['seed_max']} | {'yes' if c['single_arms_in_trial_ci'] else 'no'} |")
+        if mech.get("field_configs"):
+            out += ["", "### Field-use mechanisms, each alone and together (nets vs none, B7/B8; Muleba B9/B15)", "",
+                    "| Configuration | B7 (0.68–0.98) | B8 (0.46–0.64) | B9 (0.09–0.65) | B15 (1.19–4.97) | B15 arms: PBO / IRS / both |",
+                    "|---|---|---|---|---|---|"]
+            for c in mech["field_configs"]:
+                def v(k):
+                    x = c[k]
+                    return f"{x['computed']} [{x['seed_min']}–{x['seed_max']}]{'' if x['in_band'] else ' **out**'}"
+                a = c["B15"]["arm_or"]
+                out.append(f"| {c['config']} | {v('B7')} | {v('B8')} | {v('B9')} | {v('B15')} | {a['a10']} / {a['a01']} / {a['a11']} |")
     return "\n".join(out)
 
 
@@ -134,7 +151,8 @@ def write(path=NOTES) -> None:
     if new is None:
         raise SystemExit("results.yaml missing: run the pack first")
     block = render(new, _y(os.path.join(HERE, "history", "results_v0.1-spike.yaml")),
-                   _y(os.path.join(HERE, "fitted.yaml")), _y(os.path.join(HERE, "b15_mechanisms.yaml")))
+                   _y(os.path.join(HERE, "fitted.yaml")), _y(os.path.join(HERE, "b15_mechanisms.yaml")),
+                   _y(os.path.join(HERE, "history", "results_v0.2.yaml")))
     text = open(path).read()
     i, j = text.index(START), text.index(END)
     open(path, "w").write(text[:i + len(START)] + "\n" + block + "\n" + text[j:])

@@ -22,7 +22,8 @@ horizon:
     m0_24: [2020.0, 2022.0]
 
 settings:
-  cochrane_itn:        # Pryce 2018 Cochrane ITN vs none: pre-resistance-era trials
+  cochrane_itn:        # Pryce 2018 Cochrane ITN vs none: pre-resistance-era trials. itn_use 0.7 is an
+                       # ASSUMPTION (use at distribution); v0.3 attrition, use rate and holes then act on it.
     unit: {season: [0.7, 0.6, 0.7, 0.9, 1.1, 1.3, 1.4, 1.4, 1.3, 1.1, 0.8, 0.7], resistance: 0.95,
            species: {gambiae: 0.7, funestus: 0.3}, cm_ft: 0.3, itn_use: 0.7, campaign_year: 2020.0}
     params: {n_agents: 5000}
@@ -33,11 +34,14 @@ settings:
                        # 95.7% A. gambiae s.l. (95.6% s.s.), 3.7% A. funestus; net use 77% in year 1;
                        # 94% of households sprayed; one IRS round (Actellic 300CS) at the start.
                        # Seasonality and past campaigns remain assumptions.
+                       # v0.3: reported use 77.3% in year 1 (surveys at 4 and 9 months: mean 0.54 y after
+                       # distribution) and 59.2% in year 2 (16 and 21 months), so the site's own retention of
+                       # use has half-life ln2 / ln(0.773 / 0.592) = 2.60 y (949 days), from the trial.
     unit: {season: [1.3, 1.2, 1.4, 1.5, 1.3, 0.7, 0.5, 0.5, 0.6, 0.8, 1.1, 1.1],
            resistance: {gambiae: 0.088, arabiensis: 0.088, funestus: 0.545},
-           species: {gambiae: 0.915, arabiensis: 0.042, funestus: 0.037}, cm_ft: 0.3, itn_use: 0.77,
+           species: {gambiae: 0.915, arabiensis: 0.042, funestus: 0.037}, cm_ft: 0.3, itn_use: 0.773, itn_use_at: 0.54,
            itn_hist_years: [2017.0], campaign_year: 2020.0, irs_month: 1, irs_years: [2020.0], irs_product: pm_cs}
-    params: {n_agents: 5000, irs_coverage: 0.94}
+    params: {n_agents: 5000, irs_coverage: 0.94, net_retention_half: 949.0}
     calibrate: {attribute: m0, arm_package: {net: pyr}, value_path: windows.m9.pfpr_6m14y, target: 0.55,
                 grid: [8, 16, 32, 64, 128]}
   misungwi:            # Mosha 2022 (Misungwi, Tanzania): An. funestus dominant, resistant; pyrethroid arm 45.8% at 24 m

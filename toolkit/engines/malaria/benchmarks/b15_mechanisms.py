@@ -38,6 +38,44 @@ CONFIGS = [
 ]
 
 
+# v0.3 field-use mechanisms (B7/B8 nets vs none, and B9/B15 at Muleba): hut-like = all off.
+HUT = {"net_retention_half": 1e9, "use_rate": 1.0, "net_holes": 0.0}
+FIELD_CONFIGS = [
+    ("hut-like nets (no attrition, full use given access, no holes)", dict(HUT)),
+    ("+ attrition alone (median retention 1.64 y)", dict(HUT, net_retention_half=1.64 * 365)),
+    ("+ use below access alone (use rate 0.871, half persistent)", dict(HUT, use_rate=0.871)),
+    ("+ holes alone (Briet 2020)", dict(HUT, net_holes=1.0)),
+    ("all field mechanisms (engine defaults)", {}),
+]
+
+
+def field_scan(pack0, eng, fitted, workers):
+    """B7/B8 (Cochrane setting) and B9/B15 (Muleba) under each field-use mechanism. Muleba keeps
+    its trial-derived retention unless the row switches attrition off."""
+    byid = {b["id"]: b for b in pack0["benchmarks"]}
+    rows = []
+    for name, over in FIELD_CONFIGS:
+        pack = copy.deepcopy(pack0)
+        for s in ("cochrane_itn", "muleba"):
+            st = pack["settings"][s]
+            o = dict(over)
+            if s == "muleba" and "net_retention_half" in o and o["net_retention_half"] != 1e9:
+                o.pop("net_retention_half")         # Muleba's retention comes from its own trial data
+            st["params"] = dict(st.get("params") or {}, **o)
+        r = Runner(pack, eng, workers, pack["seeds"])
+        r.calibrate_settings(fitted, ["cochrane_itn", "muleba"])
+        row = {"config": name, "overrides": over}
+        for bid in ("B7", "B8", "B9", "B15"):
+            e = r.evaluate(byid[bid], fitted)
+            row[bid] = {"computed": round(e["computed"], 4), "seed_min": e["seed_min"], "seed_max": e["seed_max"],
+                        "in_band": bool(byid[bid]["band"][0] <= e["computed"] <= byid[bid]["band"][1])}
+            if bid == "B15":
+                row[bid]["arm_or"] = e["arm_or_geomean"]
+        rows.append(row)
+        print(row, flush=True)
+    return rows
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 1)
@@ -65,7 +103,8 @@ def main(argv=None) -> int:
                                                and 0.19 <= e["arm_or_geomean"]["a01"] <= 0.55)}
         rows.append(row)
         print(row, flush=True)
-    yaml.safe_dump({"fitted_used": fitted, "seeds": pack0["seeds"],
+    field = field_scan(pack0, eng, fitted, a.workers)
+    yaml.safe_dump({"fitted_used": fitted, "seeds": pack0["seeds"], "field_configs": field,
                     "trial": {"or_pbo_alone": 0.37, "or_irs_alone": 0.33, "or_both": 0.29, "interaction_or": 2.43,
                               "interaction_ci": [1.19, 4.97],
                               "prevalence": {"a00": 0.55, "a10": 0.31, "a01": 0.29, "a11": 0.26},
