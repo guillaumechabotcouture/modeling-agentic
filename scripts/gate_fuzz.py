@@ -97,6 +97,13 @@ DELEGATES: dict[tuple[str, str], tuple[str, str]] = {
         ("effect_concordance.gate_findings",
          "headline_binding docstring item 3: 'when models/effect_concordance.yaml exists'; the file's "
          "validity is effect_concordance's finding"),
+    ("declaration_tests", "scope_declaration.yaml"):
+        ("lib.scope_declarations.load",
+         "declaration_tests.gate_findings returns [] on an unreadable file: 'an unreadable "
+         "scope_declaration.yaml is already HIGH (scope_declaration_invalid)', from this loader"),
+    ("declared_limits", "scope_declaration.yaml"):
+        ("lib.scope_declarations.load",
+         "the shared loader of scope_declaration.yaml; its findings are the gate's scope_declaration_invalid"),
     ("claim_units", "models/claims_spec.yaml"):
         ("build_claims_ledger.build",
          "the claims-ledger validator: validate_critique_yaml._claims_spec_violations builds the ledger "
@@ -575,7 +582,7 @@ def _owner_view(spec: str, run_dir: str) -> set:
     paths replaced, so a clean copy and a corrupt copy compare)."""
     modname, fn = spec.rsplit(".", 1)
     r = getattr(importlib.import_module(modname), fn)(run_dir)
-    items = r[1] if isinstance(r, tuple) and len(r) == 2 else r
+    items = r[-1] if isinstance(r, tuple) and r else r     # (doc, errors) or (doc, entries, findings)
     if not isinstance(items, list):
         raise TypeError(f"{spec} returned {type(items).__name__}")
     real = os.path.realpath(run_dir)
@@ -666,7 +673,13 @@ def _supplement(run_dir: str, round_n: int) -> None:
       decision_brief  decision_brief.yaml (decision_brief.example_brief) signed with
                       decision_brief.sign, so the sign-off, frozen copies and lock exist;
       pipeline        models/pipeline.yaml with one shell step;
-      stall_rule      validator_history.jsonl with the earlier rounds' gate records."""
+      stall_rule      validator_history.jsonl with the earlier rounds' gate records;
+      declaration_tests  scope_declaration.yaml with one declaration."""
+    w0 = os.path.join(run_dir, "scope_declaration.yaml")
+    if not os.path.exists(w0):
+        with open(w0, "w") as f:
+            yaml.safe_dump({"declarations": [{"id": "SD-001", "blocker_id": "benchmark_drift",
+                                              "why_unresolved": "gate_fuzz fixture"}]}, f)
     import decision_brief as db
     w = lambda rel, txt: (os.makedirs(os.path.dirname(os.path.join(run_dir, rel)) or run_dir,  # noqa: E731
                                       exist_ok=True), open(os.path.join(run_dir, rel), "w").write(txt))
@@ -779,7 +792,13 @@ class _Async:
             except EOFError:
                 self.res = {"status": "raises", "detail": "child died"}
         elif not self.p.is_alive():
-            self.res = {"status": "raises", "detail": f"child exit {self.p.exitcode}"}
+            # The child may have sent its result just before exiting: read it if it is there.
+            try:
+                self.res = self.a.recv() if self.a.poll(2.0) else None
+            except EOFError:
+                self.res = None
+            if self.res is None:
+                self.res = {"status": "raises", "detail": f"child exit {self.p.exitcode} without a result"}
         elif time.time() - self.t0 > CASE_TIMEOUT_S + 10:
             self.p.kill()
             self.res = {"status": "timeout", "detail": f">{CASE_TIMEOUT_S}s"}

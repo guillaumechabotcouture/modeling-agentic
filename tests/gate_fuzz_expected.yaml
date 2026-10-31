@@ -161,6 +161,20 @@ expected_failures:
       symlink_escape: [fails_open]
     success_criteria.yaml:
       symlink_escape: [fails_open]
+  declaration_tests:
+    scope_declaration.yaml:
+      alias_loop: [fails_open]
+      symlink_escape: [fails_open]
+  declared_limits:
+    report.md:
+      symlink_escape: [fails_open]
+      undecodable: [fails_open]
+    report.unrendered.md:
+      symlink_escape: [fails_open]
+      undecodable: [fails_open]
+    scope_declaration.yaml:
+      alias_loop: [fails_open]
+      symlink_escape: [fails_open]
   effect_concordance:
     citations.md:
       big_int_float: [raises]
@@ -274,6 +288,11 @@ expected_failures:
       bad_date: [raises]
       symlink_escape: [fails_open]
       undecodable: [raises]
+  presentation_pass:
+    presentation_review.json:
+      symlink_escape: [fails_open]
+    report.md:
+      symlink_escape: [fails_open]
   sanity_gate:
     models/allocation.csv:
       big_int_float: [fails_open]
@@ -289,15 +308,21 @@ expected_failures:
       inf: [raises]
       symlink_escape: [fails_open]
       undecodable: [raises]
+    scope_declaration.yaml:
+      alias_loop: [fails_open]
+      bad_date: [raises]
+      corrupt: [fails_open]
+      empty: [fails_open]
+      symlink_escape: [fails_open]
+      undecodable: [raises]
+      wrong_type: [raises]
   stall_rule:
     validator_history.jsonl:
       empty: [fails_open]
       symlink_escape: [fails_open]
   uq_ci_quality:
     uncertainty_report.yaml:
-      bad_date: [raises]
       big_int_float: [raises]
-      big_int_str: [raises]
       symlink_escape: [fails_open]
   verdict_binding:
     models/benchmark_targets.yaml:
