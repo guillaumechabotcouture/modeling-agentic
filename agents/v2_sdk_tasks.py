@@ -91,10 +91,22 @@ def _allowed(path: str, run_dir: str, owns: tuple) -> str | None:
     if not p.startswith(root + os.sep):
         return "outside the run directory"
     rel = os.path.relpath(p, root).replace(os.sep, "/")
-    if rel == OUT or any(rel == o or rel.startswith(o) for o in owns if o.endswith("/")) or rel in owns:
-        return None
-    if rel in HARNESS_FILES or rel.startswith(HARNESS_PREFIXES):
+    low = rel.lower()
+    if low in {h.lower() for h in HARNESS_FILES} or low.startswith(tuple(h.lower() for h in HARNESS_PREFIXES)):
         return f"{rel} is written by the harness"
+    if os.path.exists(p):
+        try:
+            if os.path.isfile(p) and os.stat(p).st_nlink > 1:
+                return f"{rel} is a hard link"
+            for h in HARNESS_FILES:
+                hp = os.path.join(root, h)
+                if os.path.exists(hp) and os.path.samefile(hp, p):
+                    return f"{rel} is the harness file {h}"
+        except OSError:
+            return f"{rel} cannot be checked"
+    if low == OUT.lower() or any(low.startswith(o.lower()) for o in owns if o.endswith("/")) \
+            or low in {o.lower() for o in owns}:
+        return None
     return f"this task may write only {', '.join(owns + (OUT,))}"
 
 
@@ -112,18 +124,24 @@ class SdkTasks:
         self.cloud = allow_cloud
         self.cap = task_cap_usd
         self.allowance = task_cap_usd
+        self.readback = 0.0          # no read-back unless the machine grants a budget for it
         self.turns = max_turns
         self.query_fn = query_fn
         self.n = 0
 
-    def set_allowance(self, usd: float) -> None:
+    def set_allowance(self, usd: float, readback_usd: float | None = None) -> None:
+        """The call's dollar cap, and the cap of one crash read-back (0: none; the whole allowance
+        is then charged when a crashed session's cost is unknown)."""
         self.allowance = float(usd)
+        self.readback = max(0.0, float(readback_usd or 0.0))
 
-    def _charge(self, result, allowance: float, sid: str | None, elapsed_s: float, source: str) -> float:
+    def _charge(self, result, allowance: float, sid: str | None, source: str) -> float:
+        """Exactly the reported cost when there is one; otherwise the whole allowance. Never the
+        duration estimate charge_session uses for a session with no id (Codex R2-2)."""
         from agents import run_budget as RB
         ledger = RB.load_budget_ledger(self.run_dir)
         self.n += 1
-        RB.charge_session(ledger, self.n, result, allowance, session_id=sid, elapsed_s=elapsed_s, source=source)
+        RB.charge_session(ledger, self.n, result, allowance, session_id=sid, elapsed_s=None, source=source)
         RB.write_budget_ledger(self.run_dir, ledger, None)
         return float(ledger["sessions"][-1].get("total_cost_usd") or 0.0)
 
@@ -176,14 +194,28 @@ class SdkTasks:
             err = e
         source = "v2 task"
         result = seen["result"]
-        if result is None and seen["sid"]:
+        charge_cap = allowance
+        if result is None and seen["sid"] and self.readback > 0:
+            # One read-back, capped at its own small budget (never the SDK's unbounded default).
+            import dataclasses
+            probe = dataclasses.replace(opts, resume=seen["sid"], max_turns=1, tools=[], allowed_tools=[],
+                                        hooks=None, max_budget_usd=self.readback)
+            charge_cap = allowance + self.readback
+
             async def readback():
-                return await RB.crashed_session_cost(opts, seen["sid"], query_fn=self.query_fn)
+                async for m in qf(prompt=RB.RECONCILE_PROMPT, options=probe):
+                    c = getattr(m, "total_cost_usd", None)
+                    if isinstance(c, (int, float)):
+                        return m if (c > 0 and not getattr(m, "is_error", False)) else None
+                return None
             try:
-                result, source = asyncio.run(readback())
-            except Exception:  # noqa: BLE001 -- unknown cost: the allowance
+                result = asyncio.run(asyncio.wait_for(readback(), 120))
+                source = "read back after a crash" if result is not None else "read-back gave no cost"
+            except Exception:  # noqa: BLE001 -- unknown cost: the allowance plus the read-back cap
                 result, source = None, "read-back failed"
-        usd = self._charge(result, allowance, seen["sid"], time.time() - t0, source)
+        elif result is None:
+            source = "unknown cost: the whole allowance"
+        usd = self._charge(result, charge_cap, seen["sid"], source)
         if isinstance(err, (KeyboardInterrupt, SystemExit)):
             raise err
         if err is not None:
@@ -286,7 +318,7 @@ def _self_test() -> int:
         RB.crashed_session_cost = no_cost
         try:
             t = SdkTasks(d, query_fn=failing_readback)
-            t.set_allowance(1.25)
+            t.set_allowance(1.25)          # no read-back budget: none is made
             r = t._session("pick_engine", "x", "y", ())
         finally:
             RB.crashed_session_cost = orig
@@ -298,6 +330,35 @@ def _self_test() -> int:
         led = json.load(open(os.path.join(d, "budget_ledger.json")))
         ok(len(led["sessions"]) == 3 and abs(led["spent_usd"] - (0.42 + 0.42 + 1.25)) < 1e-9,
            f"S5 every charge is in budget_ledger.json ({led['spent_usd']})")
+
+        async def crash_no_sid(prompt=None, options=None):
+            raise RuntimeError("crash before the conversation started")
+            yield  # noqa: unreachable -- makes this an async generator
+        t = SdkTasks(d, query_fn=crash_no_sid)
+        t.set_allowance(1.75)
+        r = t._session("pick_engine", "x", "y", ())
+        ok(abs(r.usd - 1.75) < 1e-9, f"S6 (Codex R2-2) no cost and no session id: the whole allowance, not a duration estimate ({r.usd})")
+
+        probes = []
+
+        async def crash_then_probe(prompt=None, options=None):
+            if getattr(options, "resume", None):
+                probes.append(options.max_budget_usd)
+                yield NS(total_cost_usd=0.9, session_id="s9", is_error=False)
+                return
+            yield NS(subtype="init", data={"session_id": "s9"})
+            raise RuntimeError("crash after start")
+        t = SdkTasks(d, query_fn=crash_then_probe)
+        t.set_allowance(2.0, readback_usd=0.2)
+        r = t._session("pick_engine", "x", "y", ())
+        ok(probes == [0.2] and abs(r.usd - 0.9) < 1e-9,
+           f"S7 (Codex R2-3) the read-back is one call capped at its own small budget ({probes}, {r.usd})")
+        probes.clear()
+        t = SdkTasks(d, query_fn=crash_then_probe)
+        t.set_allowance(2.0, readback_usd=0.0)
+        r = t._session("pick_engine", "x", "y", ())
+        ok(probes == [] and abs(r.usd - 2.0) < 1e-9,
+           f"S8 (Codex R2-3) with no budget for a read-back none is made; the whole allowance is charged ({probes}, {r.usd})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
