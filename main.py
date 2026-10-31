@@ -87,6 +87,8 @@ from agents.run_finish import (  # noqa: E402,F401  Phase 48 γ: moved, re-expor
     WRITEUP_PROMPT,
     _harness_wrote_gate_outputs,
     final_writeup,
+    PRESENTATION_FIX_PROMPT,
+    presentation_fix_pass,
 )
 
 REPO_ROOT = enforcement.REPO_ROOT
@@ -582,6 +584,13 @@ async def run(question: str, max_rounds: int, max_sessions: int,
             await final_writeup(run_path, run_dir_rel, question, max_rounds, budget,
                                 max_budget_usd, session_num + 1, session_outcome, integrity,
                                 live_state=live_state)
+        # Phase 49 δ (A23): presentation HIGHs for the writer still open (not re-checked)
+        # get one writer fix pass and a re-review, paid from what is left (reserve included).
+        if not interrupted and not paused:
+            _next = 1 + max([session_num] + [int(r.get("session") or 0) for r in budget["sessions"]])
+            live_state.session = _next
+            await presentation_fix_pass(run_path, run_dir_rel, question, budget, max_budget_usd, _next,
+                                        integrity, live_state=live_state)
     finally:
         heartbeat.stop(timeout_s=180)   # last status + checkpoint; never blocks finalize longer
         status = finalize_run(
@@ -1818,6 +1827,67 @@ def _run_self_test() -> int:
     ok(asyncio.run(final_writeup(_wd, _wd, "q", 8, _bud2, 450.0, 2, "budget_exhausted", query_fn=_fq_w))
        .get("skipped"), "WU5 no budget left: the write-up is skipped and says so")
     shutil.rmtree(_wd, ignore_errors=True)
+
+    # PF (Phase 49 δ, A23): open presentation HIGHs for the writer get one fix pass and a re-review.
+    import yaml as _yaml_pf
+    import time as _time_pf
+    _pd = tempfile.mkdtemp()
+    json.dump({"question": "q"}, open(os.path.join(_pd, "metadata.json"), "w"))
+    _crit = {"reviewer": "critique-presentation", "round": 8, "blockers": [
+        {"id": "P-001", "severity": "HIGH", "target_stage": "WRITE", "claim": "units stripped",
+         "fix_requires": "restore units", "resolved": False},
+        {"id": "P-005", "severity": "HIGH", "target_stage": "MODEL", "claim": "figure", "resolved": False}]}
+    _yaml_pf.safe_dump(_crit, open(os.path.join(_pd, "critique_presentation.yaml"), "w"))
+    for _f in ("manuscript.md", "report.md"):
+        open(os.path.join(_pd, _f), "w").write("# Draft\n")
+    _t = _time_pf.time() + 5
+    os.utime(os.path.join(_pd, "manuscript.md"), (_t, _t))
+    os.utime(os.path.join(_pd, "report.md"), (_t + 1, _t + 1))
+    _pseen = {"calls": 0}
+
+    async def _fq_p(prompt, options):
+        _pseen["calls"] += 1
+        _pseen["prompt"], _pseen["budget"], _pseen["agents"] = prompt, options.max_budget_usd, sorted(options.agents)
+        _t2 = _time_pf.time() + 20
+        _yaml_pf.safe_dump(dict(_crit, blockers=[dict(b, resolved=True) for b in _crit["blockers"]]),
+                           open(os.path.join(_pd, "critique_presentation.yaml"), "w"))
+        os.utime(os.path.join(_pd, "critique_presentation.yaml"), (_t2, _t2))
+        yield ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+                            num_turns=6, session_id="p1", total_cost_usd=6.0)
+    _pbud = {"sessions": [{"session": 3, "total_cost_usd": 442.0}]}
+    _pi = asyncio.run(presentation_fix_pass(_pd, _pd, "q", _pbud, 600.0, 4, query_fn=_fq_p))
+    ok(_pi.get("ran") and _pi.get("items") == ["P-001"] and _pseen.get("agents") == ["critique-presentation", "writer"]
+       and abs((_pseen.get("budget") or 0) - 158.0) < 1e-6 and "`This is critique round 8.`" in _pseen.get("prompt", "")
+       and "P-001: units stripped Fix: restore units" in _pseen.get("prompt", "") and "P-005" not in _pseen.get("prompt", ""),
+       f"PF1 open writer HIGHs: one session with the writer and the presentation critic, budget incl. the reserve: "
+       f"{_pi} {_pseen.get('budget')}")
+    ok(_pbud["sessions"][-1]["source"] == "presentation fix pass" and _pbud["sessions"][-1]["session"] == 4
+       and _pbud["sessions"][-1]["total_cost_usd"] == 6.0, f"PF2 the pass is charged to the ledger: {_pbud['sessions'][-1]}")
+    _pm = json.load(open(os.path.join(_pd, "metadata.json"))).get("presentation_fix_pass", {})
+    ok(_pm.get("ran") is True and _pm.get("still_open") == [] and _pm.get("rechecked") is True,
+       f"PF3 the outcome (re-reviewed, nothing open) is recorded in metadata.json: {_pm}")
+    asyncio.run(presentation_fix_pass(_pd, _pd, "q", _pbud, 600.0, 5, query_fn=_fq_p))
+    ok(_pseen["calls"] == 1, "PF4 once per run: a resumed run does not repeat the pass")
+    shutil.rmtree(_pd, ignore_errors=True)
+    _pd = tempfile.mkdtemp()
+    json.dump({"question": "q"}, open(os.path.join(_pd, "metadata.json"), "w"))
+    open(os.path.join(_pd, "manuscript.md"), "w").write("# Draft\n")
+    _yaml_pf.safe_dump(dict(_crit, blockers=_crit["blockers"][1:]), open(os.path.join(_pd, "critique_presentation.yaml"), "w"))
+    _pi = asyncio.run(presentation_fix_pass(_pd, _pd, "q", _pbud, 600.0, 4, query_fn=_fq_p))
+    ok(_pseen["calls"] == 1 and not _pi.get("ran") and "presentation_fix_pass" not in json.load(
+        open(os.path.join(_pd, "metadata.json"))), f"PF5 nothing for the writer: no session, nothing recorded: {_pi}")
+    _yaml_pf.safe_dump(_crit, open(os.path.join(_pd, "critique_presentation.yaml"), "w"))
+    _pi = asyncio.run(presentation_fix_pass(_pd, _pd, "q", {"sessions": [{"session": 3, "total_cost_usd": 600.0}]},
+                                            600.0, 4, query_fn=_fq_p))
+    ok(_pseen["calls"] == 1 and "no budget" in str(_pi.get("skipped")) and json.load(
+        open(os.path.join(_pd, "metadata.json"))).get("presentation_fix_pass", {}).get("items") == ["P-001"],
+       f"PF6 no budget left: skipped, and the open items are recorded: {_pi}")
+    shutil.rmtree(_pd, ignore_errors=True)
+    import inspect as _inspect_pf
+    _src_run = _inspect_pf.getsource(run)
+    ok(_src_run.index("presentation_fix_pass(") > _src_run.index("final_writeup(")
+       and _src_run.index("presentation_fix_pass(") < _src_run.index("finalize_run("),
+       "PF7 run(): the pass comes after the final write-up and before the final gate (finalize_run)")
 
     # WU6-WU9 (Codex, Phase 29 review)
     _bd = tempfile.mkdtemp()

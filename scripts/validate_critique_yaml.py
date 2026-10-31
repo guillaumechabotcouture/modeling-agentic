@@ -1433,6 +1433,10 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None,
     # Phase 47 β (A18): a percentage claim whose source holds a proportion.
     violations += G(lambda rd: _load_sibling("claim_units").gate_findings(rd),
                     run_dir, check_name="claim_units")
+    # Phase 49 δ (A23): a draft changed after the presentation critique, with its
+    # writer HIGHs still open, has not been re-checked.
+    violations += G(lambda rd: _load_sibling("presentation_pass").gate_findings(rd),
+                    run_dir, check_name="presentation_pass")
     # Phase 34: done_when findings computed by the caller, added before the
     # escalation so their persistence counts (Codex review).
     violations += list(extra or [])
@@ -4641,6 +4645,21 @@ def _run_self_test() -> int:
     ok('_load_sibling("stall_rule").gate_findings(' in _src47 and 'check_name="stall_rule"' in _src47
        and _src47.index("stall_rule") > _src47.index("_check_persistent_medium_escalation"),
        "SW1 stall_rule runs in _check_rigor_artifacts after the persistence escalation")
+    ok('_load_sibling("presentation_pass").gate_findings(' in _src47,
+       "PP-W1 presentation_pass runs in _check_rigor_artifacts")
+    with tempfile.TemporaryDirectory() as d:
+        # Phase 49 δ: writer HIGHs open and the draft changed after the critique: MEDIUM, declarable.
+        yaml.safe_dump({"reviewer": "critique-presentation", "round": 8, "blockers": [
+            {"id": "P-002", "severity": "HIGH", "target_stage": "WRITE", "claim": "numbering",
+             "resolved": False}]}, open(os.path.join(d, "critique_presentation.yaml"), "w"))
+        open(os.path.join(d, "manuscript.md"), "w").write("# Draft\n")
+        import time as _time_pp
+        _tpp = _time_pp.time() + 5
+        os.utime(os.path.join(d, "manuscript.md"), (_tpp, _tpp))
+        _f = [v for v in _check_rigor_artifacts(d) if v.get("kind") == "presentation_fix_unchecked"]
+        ok(len(_f) == 1 and _f[0]["severity"] == "MEDIUM" and not is_non_declarable(
+            _f[0]["kind"], _f[0]["scope_declarable"]),
+           f"PP-W2 an unchecked presentation fix is a declarable MEDIUM at the gate: {_f}")
     with tempfile.TemporaryDirectory() as d:
         _append_validator_history(d, 2, {"action": "PATCH_OR_RETHINK", "rigor_violations": [
             {"kind": "benchmark_drift", "severity": "HIGH", "stall_key": "B9"},

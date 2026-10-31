@@ -604,3 +604,131 @@ async def final_writeup(run_path, run_dir_rel, question, max_rounds, budget, cap
     except (OSError, ValueError):
         pass
     return info
+
+
+PRESENTATION_FIX_PROMPT = """The modeling sessions have ended. The presentation critic's round-{round}
+review of the draft still lists {n} HIGH item(s) for the writer that nobody
+has re-checked:
+
+{items}
+
+For run directory {run_dir}, do exactly these three steps, then stop:
+1. Spawn the `writer` agent once. Tell it: "This is the final presentation
+   fix pass. Start from {run_dir}/{source}, the draft that still carries the
+   [CLAIM:id] references. Fix only the items listed below; leave any that are
+   already fixed. Keep every number as a [CLAIM:id] reference, change no
+   finding, verdict or conclusion, and write the revised draft to
+   {run_dir}/manuscript.md." Then give it the items above verbatim.
+2. Run `python3 scripts/render_claims.py {run_dir}`.
+3. Spawn `critique-presentation` with a prompt that begins
+   `This is critique round {round}.` Ask it to re-review {run_dir}/report.md,
+   carry every earlier blocker forward (still_present true or false, with
+   resolved_evidence), and rewrite critique_presentation.yaml and
+   critique_presentation.md.
+
+Do nothing else. The harness runs the final gate afterwards."""
+
+
+def _render_if_stale(run_path: str) -> None:
+    """The writer's draft is newer than report.md: render it (as the lead was told to)."""
+    draft, report = os.path.join(run_path, "manuscript.md"), os.path.join(run_path, "report.md")
+    try:
+        if os.path.exists(report) and os.path.getmtime(draft) <= os.path.getmtime(report):
+            return
+        subprocess.run([sys.executable, os.path.join(REPO_ROOT, "scripts", "render_claims.py"), run_path],
+                       capture_output=True, text=True, timeout=600)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+async def presentation_fix_pass(run_path, run_dir_rel, question, budget, cap, session_num,
+                                integrity=None, query_fn=None, live_state=None) -> dict:
+    """Phase 49 δ (A23): when the sessions end with open presentation HIGHs for
+    the writer (scripts/presentation_pass.py), run once per run a short session
+    paid from what is left of the budget, the write-up reserve included: the
+    writer fixes them, the claims are re-rendered and critique-presentation
+    re-reviews the draft, so the final gate reads a checked verdict. Never raises."""
+    info = {"ran": False}
+    try:
+        meta_path = os.path.join(run_path, "metadata.json")
+        try:
+            prior = (json.load(open(meta_path)).get("presentation_fix_pass") or {})
+        except (OSError, ValueError):
+            prior = {}
+        if prior.get("ran"):
+            return prior                        # once per run (a resumed run does not repeat it)
+        from presentation_pass import pending   # scripts/ is on sys.path (agents/__init__.py)
+        p = pending(run_path)
+        if not p["items"]:
+            return {"ran": False, "skipped": p["reason"]}   # nothing to record
+        info["items"] = [i["id"] for i in p["items"]]
+        left = remaining_budget(cap, budget["sessions"])
+        if left is not None and left <= 0:
+            info.update(skipped="no budget left for the presentation fix pass")
+        else:
+            await _presentation_session(run_path, run_dir_rel, question, budget, cap, session_num, p, left,
+                                        info, integrity, query_fn, live_state)
+    except Exception as e:  # noqa: BLE001 — finalize still runs; the gap is recorded
+        info.update(error=f"{type(e).__name__}: {e}"[:300])
+        print(f"[ERROR] presentation fix pass failed: {info['error']}", flush=True)
+    try:
+        mp = os.path.join(run_path, "metadata.json")
+        meta = json.load(open(mp))
+        meta["presentation_fix_pass"] = info
+        json.dump(meta, open(mp, "w"), indent=2)
+        if integrity is not None:
+            integrity.harness_wrote("metadata.json")
+    except (OSError, ValueError):
+        pass
+    return info
+
+
+async def _presentation_session(run_path, run_dir_rel, question, budget, cap, session_num, p, left,
+                                info, integrity, query_fn, live_state) -> None:
+    """One harness session: writer fix, render, presentation re-review; charged to the ledger."""
+    from presentation_pass import pending
+    agents_ = build_agents(question=question, run_dir=run_dir_rel)
+    agents = {k: agents_[k] for k in ("writer", "critique-presentation")}
+    trace = open(os.path.join(run_path, "trace.jsonl"), "a")
+    hooks = create_hooks(run_path, trace, datetime.now(), registered_agents=set(agents),
+                         max_turns={k: a.maxTurns for k, a in agents.items()}, integrity=integrity,
+                         hold_writer=False)   # the harness's own pass is never held
+    options = ClaudeAgentOptions(
+        system_prompt="You are the harness's presentation fix step. Follow the instructions literally.",
+        agents=agents, model=(smoke_settings() or {}).get("model", enforcement.MODEL_DEEP),
+        max_buffer_size=enforcement.MAX_BUFFER_SIZE, settings=enforcement.SESSION_SETTINGS, tools=LEAD_TOOLS,
+        allowed_tools=LEAD_TOOLS, permission_mode="bypassPermissions", setting_sources=["project"],
+        hooks=hooks, cwd=REPO_ROOT, env=enforcement.filtered_env(dict(os.environ), False), max_turns=10)
+    if left is not None:
+        options.max_budget_usd = left
+    source = "report.unrendered.md" if os.path.exists(os.path.join(run_path, "report.unrendered.md")) \
+        else "manuscript.md"
+    items = "\n".join(f"- {i['id']}: {i['claim'][:600]}"
+                      + (f" Fix: {i['fix_requires'][:400]}" if i["fix_requires"] else "") for i in p["items"])
+    prompt = PRESENTATION_FIX_PROMPT.format(round=p["round"] or "N", n=len(p["items"]), items=items,
+                                            run_dir=run_dir_rel, source=source)
+    print(f"\nPRESENTATION FIX PASS ({', '.join(info['items'])}; budget left ${left})", flush=True)
+    result, sid, err = None, None, None
+    try:
+        async for m in (query_fn or query)(prompt=prompt, options=options):
+            log_message(m, trace)
+            if live_state is not None:
+                live_state.on_message(m)
+            if isinstance(m, SystemMessage) and m.subtype == "init":
+                sid = (m.data or {}).get("session_id") or sid
+            elif isinstance(m, ResultMessage):
+                result, sid = m, m.session_id or sid
+    except Exception as e:  # noqa: BLE001 — still charged below, then recorded
+        err = f"{type(e).__name__}: {e}"[:300]
+    src = "presentation fix pass"
+    if result is None and sid:
+        result = await reconcile_conversation_cost(options, sid, query_fn=query_fn)
+        src = "presentation fix pass (crashed; cost read back)"
+    charge_session(budget, session_num, result, left, session_id=sid, elapsed_s=None, source=src)
+    write_budget_ledger(run_path, budget, cap, integrity)
+    _render_if_stale(run_path)
+    after = pending(run_path)
+    info.update(ran=True, still_open=[i["id"] for i in after["items"]],
+                rechecked=not after["draft_after_critique"])
+    if err:
+        info["error"] = err
