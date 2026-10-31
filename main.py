@@ -1996,6 +1996,10 @@ def main_v2(args) -> int:
     status = stage_machine.run_v2(question, run_path, tasks, max_rounds=args.max_rounds,
                                   signoff=args.signoff, budget_usd=args.max_budget_usd)
     print(f"v2 status: {status}", flush=True)
+    # Like the lead pipeline's finalize: upload the run when a storage account is configured, and
+    # record it in metadata.json, which the cloud launcher reads to stop the cluster.
+    stored = store_run_results(run_path)
+    print(f"v2 run stored: {stored}", flush=True)
     if status.startswith("paused:"):
         return 2
     return exit_code_for(status)

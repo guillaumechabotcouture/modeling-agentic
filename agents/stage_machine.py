@@ -671,7 +671,8 @@ class Machine:
             pick, why = eligible[0]["ref"], f"harness: the pick {pick!r} is not eligible; first eligible engine"
         else:
             why = (res.output or {}).get("why", "")
-        rec.update(AB.engine_choice_record(pick, why, rows))
+        cfg = next((r.get("config") for r in eligible if r["ref"] == pick), None) or {}
+        rec.update(AB.engine_choice_record(pick, why, rows, config=cfg))
         if self.cross and len(eligible) > 1:
             try:
                 rec["cross_check"] = self.backend.cross_check(
@@ -714,10 +715,14 @@ class Machine:
         if self.st.round > self.st.max_rounds:
             return self._go("FINAL", "round cap passed (gate did not stop the run)", "completed_gate_error")
         v = self._visit()
-        for reviewer in CRITICS:
-            res = self._task(f"CRITIQUE#{v}:r{self.st.round}:{reviewer}", "critique", self.run_dir, reviewer, self.st.round)
+        fb = self.st.tries.get("schema_feedback") or {}
+        critics = list(CRITICS) if (not fb or "*" in fb) else [r for r in fb if r in CRITICS or r == "critique-presentation"]
+        for reviewer in critics:
+            args = (self.run_dir, reviewer, self.st.round) + ((fb.get(reviewer) or fb.get("*"),) if fb else ())
+            res = self._task(f"CRITIQUE#{v}:r{self.st.round}:{reviewer}", "critique", *args)
             if res is None:
                 return self._budget_out("CRITIQUE")
+        self.st.tries.pop("schema_feedback", None)
         return self._go("GATE", f"critique round {self.st.round}")
 
     def h_GATE(self):
@@ -744,6 +749,14 @@ class Machine:
             self.st.tries["schema"] = n
             if n > MAX_SCHEMA_REPAIRS:
                 return self._go("FINAL", "critique schema errors persist", "completed_gate_error")
+            # Only the critics whose YAML failed are re-run, each told its own errors.
+            import validate_critique_yaml as V
+            by_file = {f: r for r, f in V.FILENAMES.items()}
+            fb: dict = {}
+            for e in d["schema_errors"]:
+                f = str(e).split(":", 1)[0].strip().split()[0]
+                fb.setdefault(by_file.get(f, "*"), []).append(str(e))
+            self.st.tries["schema_feedback"] = fb
             return self._go("CRITIQUE", f"schema errors: {'; '.join(d['schema_errors'])[:200]}")
         self.st.tries.pop("schema", None)
         why = f"{(d or {}).get('action')} (rule {(d or {}).get('rule_matched')}){' post-write' if pw else ''}"
@@ -1243,6 +1256,30 @@ def _self_test() -> int:
                f"T36 the default backend (workstream B) runs the machine end to end with engine: auto ({s})")
         else:
             ok(True, "T36 skipped: workstream B's analysis engine is not on this branch")
+
+        # T37 (first real run, v2blind1): critics wrote an invalid category three times because the
+        # repair re-ran them without the schema errors. The repair now re-runs only the critics whose
+        # YAML failed, and gives each its errors.
+        class Sloppy(StubTasks):
+            def critique(self, run_dir, reviewer, round_n, feedback=None):
+                res = super().critique(run_dir, reviewer, round_n)
+                if reviewer == "critique-domain" and not feedback:
+                    import yaml
+                    p = os.path.join(run_dir, "critique_domain.yaml")
+                    doc = yaml.safe_load(open(p))
+                    doc["blockers"] = [{"id": "D-001", "severity": "HIGH", "category": "DOMAIN", "target_stage": "ANALYZE",
+                                        "first_seen_round": round_n, "claim": "c", "evidence": "e", "fix_requires": "f",
+                                        "resolved": False}]
+                    doc["verdict"] = "REVISE"
+                    yaml.safe_dump(doc, open(p, "w"))
+                self.calls.append(f"feedback:{reviewer}:{bool(feedback)}")
+                return res
+        d, T, st = new_run("schema_repair", {})
+        T = Sloppy(T.s)
+        s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+        ok(s in ("completed", "completed_scope_declared") and "feedback:critique-domain:True" in T.calls
+           and T.calls.count("critique:critique-redteam:1") == 1,
+           f"T37 a schema repair re-runs only the failing critic, with its errors ({s}, {[c for c in T.calls if 'critique' in c][:6]})")
 
         # T23: a transition outside the table is refused.
         m = _SpikeMachine(os.path.join(td, "ref"), StubTasks({}), None, log=lambda *a: None)

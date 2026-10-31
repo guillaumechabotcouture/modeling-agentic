@@ -36,10 +36,18 @@ SPEC_FILE = "decision_spec.yaml"
 OUT_DIR = "analysis"
 ANALYSIS_JSON = f"{OUT_DIR}/analysis.json"
 ALLOCATION_CSV = f"{OUT_DIR}/allocation.csv"
-# Registered engines: (import ref, card file read without importing the engine, or None).
+def _empirical_config(spec: dict) -> dict:
+    """The package-rate engine is configured by the spec: its components and the outcome."""
+    comps = list(((spec.get("options") or {}).get("components") or {}).keys())
+    return {"components": comps, "outcome": (spec.get("objective") or {}).get("outcome") or "cases"}
+
+
+# Registered engines: (import ref, card file read without importing the engine or None,
+# config from the spec or None). A configured engine's card depends on its config.
 ENGINES = [
-    ("toolkit.engines.contract:ToyEngine", None),
-    ("toolkit.engines.malaria.engine:MalariaEngine", "toolkit/engines/malaria/card.yaml"),
+    ("toolkit.engines.contract:ToyEngine", None, None),
+    ("toolkit.engines.malaria.engine:MalariaEngine", "toolkit/engines/malaria/card.yaml", None),
+    ("toolkit.engines.empirical.engine:PackageRateEngine", None, _empirical_config),
 ]
 # Contract thresholds on the analysis output (B owns these once it lands).
 EMULATOR_R2_MIN = 0.8
@@ -47,15 +55,16 @@ EMULATOR_MAE_MAX = 0.05
 
 
 # ------------------------------------------------------------------ engine choice
-def _card(ref: str, card_path: str | None):
+def _card(ref: str, card_path: str | None, config: dict | None = None):
+    import importlib
     from toolkit.engines.contract import EngineCard
     if card_path:
         import yaml
         with open(os.path.join(REPO, card_path)) as f:
             doc = yaml.safe_load(f) or {}
         return EngineCard(**{k: v for k, v in doc.items() if k in EngineCard.__dataclass_fields__})
-    from spike.analysis.spec import load_engine
-    return load_engine(ref).describe()
+    mod, cls = ref.split(":")
+    return getattr(importlib.import_module(mod), cls)(**(config or {})).describe()
 
 
 def engine_needs(spec: dict) -> dict:
@@ -101,15 +110,17 @@ def eligible_engines(spec: dict, engines=None) -> list[dict]:
     """[{ref, name, version, eligible, why_not, card}] for every registered engine."""
     needs = engine_needs(spec)
     rows = []
-    for ref, card_path in engines or ENGINES:
+    for entry in engines or ENGINES:
+        ref, card_path, cfg_fn = (tuple(entry) + (None, None))[:3]
         try:
-            card = _card(ref, card_path)
+            config = cfg_fn(spec) if cfg_fn else {}
+            card = _card(ref, card_path, config)
         except Exception as e:  # noqa: BLE001 -- recorded: an engine that cannot describe itself is not eligible
             rows.append({"ref": ref, "eligible": False, "why_not": [f"card unreadable: {type(e).__name__}: {e}"]})
             continue
         why = card_fits(card, needs)
-        rows.append({"ref": ref, "name": card.name, "version": card.version, "eligible": not why, "why_not": why,
-                     "mechanisms": list(card.mechanisms)[:8], "benchmarks": len(card.benchmarks or [])})
+        rows.append({"ref": ref, "config": config, "name": card.name, "version": card.version, "eligible": not why,
+                     "why_not": why, "mechanisms": list(card.mechanisms)[:8], "benchmarks": len(card.benchmarks or [])})
     return rows
 
 
@@ -645,6 +656,11 @@ def _self_test() -> int:
     fake.engine_needs = lambda spec: {"components": {"a": [1]}, "outputs": ["dalys"]}
     rows = _ToolkitApi(fake).eligible_engines({}, [("toolkit.engines.contract:ToyEngine", None)])
     ok(rows[0]["eligible"], "B19 with B's engine_needs the filter uses B's vocabulary")
+    pr = eligible_engines({"options": {"components": {"itn": {}, "smc": {}}, "engine_map": {"itn": {"itn": 1}, "smc": {"smc": 1}}},
+                           "objective": {"outcome": "cases"}, "calibration": {"attribute": "log_rate"}})
+    emp = next(r for r in pr if r["ref"].endswith("PackageRateEngine"))
+    ok(emp["eligible"] and emp["config"] == {"components": ["itn", "smc"], "outcome": "cases"},
+       f"B23 the empirical engine is registered, configured from the spec, and eligible for a panel question {emp.get('why_not')}")
     with tempfile.TemporaryDirectory() as d:
         json.dump(engine_choice_record("x.y:Z", "w", []), open(os.path.join(d, ENGINE_CHOICE), "w"))
         ok(engine_choice_ref(d) == "x.y:Z", "B20 engine_choice.json in the agreed format ({engine: {ref, config}})")
