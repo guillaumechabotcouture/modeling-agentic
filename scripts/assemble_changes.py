@@ -83,6 +83,43 @@ class FragmentError(ValueError):
 # Fragments
 # --------------------------------------------------------------------------- #
 
+def _multiline(s: str) -> bool:
+    """True if `s` holds any character str.splitlines() breaks on (\\n, \\r,
+    \\v, \\f, \\x1c-\\x1e, \\x85, U+2028, U+2029): one would split a ledger row."""
+    return len((s + "x").splitlines()) != 1
+
+
+def fragment_name(branch: str) -> str:
+    """The fragment file for a branch: flat, '/' mapped to '__'."""
+    return branch.strip().replace("/", "__") + ".md"
+
+
+def fragment_paths(paths, where: str = "") -> list[str]:
+    """The one discovery rule, for CI and for assembly alike: of repo-relative
+    paths, those that are fragments (changes/<name>.md, README.md excluded).
+    Anything else under changes/ (a nested path, or a file that is not .md)
+    is an error, so a fragment can never be skipped by one side and seen by
+    the other."""
+    out = []
+    for p in paths:
+        if not p.startswith(CHANGES_DIR + "/"):
+            continue
+        rest = p[len(CHANGES_DIR) + 1:]
+        if "/" in rest:
+            raise FragmentError(f"{p}{where}: nested path under {CHANGES_DIR}/; fragments are flat "
+                                f"files (a branch 'a/b' uses {CHANGES_DIR}/{fragment_name('a/b')})")
+        if rest.upper() == "README.MD":
+            continue
+        if not rest.endswith(".md"):
+            raise FragmentError(f"{p}{where}: only .md fragments belong in {CHANGES_DIR}/")
+        out.append(p)
+    return sorted(out)
+
+
+def _same_entry(a: dict, b: dict) -> bool:
+    return all(a[k] == b[k] for k in ("phase", "commit", "status_group", "changelog", "status"))
+
+
 def parse_fragment(text: str, name: str = "fragment") -> dict:
     """Return {phase, commit, status_group, changelog, status: [lines], name}.
     Raises FragmentError on any structural problem (fail closed)."""
@@ -108,8 +145,10 @@ def parse_fragment(text: str, name: str = "fragment") -> dict:
         v = head.get(k)
         if isinstance(v, bool) or not isinstance(v, (str, int)) or not str(v).strip():
             raise FragmentError(f"{name}: header needs a non-empty '{k}'")
+        if _multiline(str(v)):
+            raise FragmentError(f"{name}: '{k}' must be one line (no line or paragraph separators)")
     group = head.get("status_group")
-    if group is not None and (not isinstance(group, str) or not group.strip() or "\n" in group):
+    if group is not None and (not isinstance(group, str) or not group.strip() or _multiline(group)):
         raise FragmentError(f"{name}: status_group must be a one-line string")
 
     sections: dict[str, list[str]] = {}
@@ -238,19 +277,26 @@ def _read(path: str) -> str:
         return f.read()
 
 
+def _decode(b: bytes, name: str) -> str:
+    try:
+        return b.decode("utf-8")
+    except UnicodeDecodeError:
+        raise FragmentError(f"{name}: not UTF-8 text") from None
+
+
 def load_fragments(root: str) -> list[dict]:
     d = os.path.join(root, CHANGES_DIR)
+    rel = []
+    for dp, dns, fns in os.walk(d) if os.path.isdir(d) else []:
+        rel += [os.path.relpath(os.path.join(dp, x), root).replace(os.sep, "/") for x in fns
+                if os.path.isfile(os.path.join(dp, x)) or os.path.islink(os.path.join(dp, x))]
     out = []
-    for fn in sorted(os.listdir(d)) if os.path.isdir(d) else []:
-        if not fn.endswith(".md") or fn.upper() == "README.MD":
-            continue
-        p = os.path.join(d, fn)
+    for r in fragment_paths(rel):
+        p = os.path.join(root, r)
         if os.path.islink(p) or not os.path.isfile(p):
-            raise FragmentError(f"{CHANGES_DIR}/{fn}: must be a regular file")
-        try:
-            out.append(parse_fragment(_read(p), f"{CHANGES_DIR}/{fn}"))
-        except UnicodeDecodeError:
-            raise FragmentError(f"{CHANGES_DIR}/{fn}: not UTF-8") from None
+            raise FragmentError(f"{r}: must be a regular file")
+        with open(p, "rb") as f:
+            out.append(parse_fragment(_decode(f.read(), r), r))
     return out
 
 
@@ -283,41 +329,79 @@ def _git(root: str, *args: str) -> str:
                           text=True, encoding="utf-8").stdout
 
 
-def _show(root: str, ref: str, path: str):
+def _show_bytes(root: str, ref: str, path: str):
     r = subprocess.run(["git", "-C", root, "show", f"{ref}:{path}"], capture_output=True)
-    return r.stdout.decode("utf-8") if r.returncode == 0 else None
+    return r.stdout if r.returncode == 0 else None
+
+
+def _show(root: str, ref: str, path: str):
+    b = _show_bytes(root, ref, path)
+    return None if b is None else _decode(b, f"{path} at {ref}")
+
+
+def _git_z(root: str, *args: str) -> list[str]:
+    """A git command's NUL-delimited output (-z), decoded per path: no quoting
+    of non-ASCII or special characters, unlike the line form."""
+    out = subprocess.run(["git", "-C", root, *args], check=True, capture_output=True).stdout
+    return [t.decode("utf-8", "surrogateescape") for t in out.split(b"\0") if t]
+
+
+def _fragments_at(root: str, ref: str) -> dict[str, dict]:
+    """{path: parsed fragment} for every fragment in the tree at `ref`."""
+    names = _git_z(root, "ls-tree", "-r", "-z", "--name-only", ref, "--", CHANGES_DIR)
+    out = {}
+    for p in fragment_paths(names, f" at {ref}"):
+        b = _show_bytes(root, ref, p)
+        out[p] = parse_fragment(_decode(b or b"", p), p)
+    return out
 
 
 def check_pr(root: str, base: str) -> list[str]:
     """Problems with the change between merge-base(base, HEAD) and the working
     tree's committed HEAD. Empty list = the PR follows the fragment rule."""
     mb = _git(root, "merge-base", base, "HEAD").strip()
-    status = _git(root, "diff", "--name-status", "--no-renames", mb, "HEAD")
-    added, deleted = [], []
-    for ln in status.splitlines():
-        parts = ln.split("\t")
-        if len(parts) < 2:
-            continue
-        st, path = parts[0], parts[-1]
-        if path.startswith(CHANGES_DIR + "/") and path.endswith(".md") \
-                and os.path.basename(path).upper() != "README.MD":
-            (deleted if st.startswith("D") else added).append(path)
-    problems = []
+    # -z: paths are NUL-delimited and never quoted (non-ASCII names included).
+    toks = _git_z(root, "diff", "--name-status", "--no-renames", "-z", mb, "HEAD")
+    pairs = list(zip(toks[0::2], toks[1::2]))
+    problems: list[str] = []
+    try:
+        changed = set(fragment_paths([p for _, p in pairs]))
+    except FragmentError as e:
+        problems.append(str(e))
+        changed = {p for _, p in pairs if p.startswith(CHANGES_DIR + "/") and p.endswith(".md")
+                   and "/" not in p[len(CHANGES_DIR) + 1:] and not p.upper().endswith("/README.MD")}
+    added = [p for st, p in pairs if p in changed and not st.startswith("D")]
+    deleted = [p for st, p in pairs if p in changed and st.startswith("D")]
     for p in added:
-        txt = _show(root, "HEAD", p)
         try:
-            parse_fragment(txt if txt is not None else "", p)
-        except (FragmentError, UnicodeDecodeError) as e:
+            parse_fragment(_decode(_show_bytes(root, "HEAD", p) or b"", p), p)
+        except FragmentError as e:
             problems.append(f"{e}")
     gone = []
     for p in deleted:
         try:
-            gone.append(parse_fragment(_show(root, mb, p) or "", p))
-        except (FragmentError, UnicodeDecodeError) as e:
+            gone.append(parse_fragment(_decode(_show_bytes(root, mb, p) or b"", p), p))
+        except FragmentError as e:
             problems.append(f"deleted fragment {e}")
+    # A folded entry must leave the queue: the same entry still present at HEAD
+    # under any name (a rename or copy of the consumed fragment) would fold twice.
+    if gone:
+        try:
+            queued = _fragments_at(root, "HEAD")
+        except FragmentError:
+            queued = {}          # already reported above, through the changed paths
+        for g in gone:
+            for p, q in queued.items():
+                if _same_entry(g, q):
+                    problems.append(f"{p}: the entry folded from {g['name']} is still queued under this "
+                                    f"name; a fold must remove it")
     for path, region, fold in ((CHANGELOG, ledger_region, fold_changelog),
                                (PLAN, status_region, fold_plan)):
-        old, new = _show(root, mb, path), _show(root, "HEAD", path)
+        try:
+            old, new = _show(root, mb, path), _show(root, "HEAD", path)
+        except FragmentError as e:
+            problems.append(str(e))
+            continue
         if old is None or new is None:
             if old != new:
                 problems.append(f"{path} was added or deleted; it must stay in place")
@@ -385,6 +469,14 @@ def _frag(phase, commit, text, group=None, status=()):
     if status:
         body += "\n## Status\n\n" + "\n".join(status) + "\n"
     return body
+
+
+def _safe_check(root: str) -> list[str]:
+    """check_pr against main, with a crash reported as a problem (self-test)."""
+    try:
+        return check_pr(root, "main")
+    except Exception as e:  # noqa: BLE001
+        return [f"CRASH {type(e).__name__}: {e}"]
 
 
 def _self_test() -> int:
@@ -534,6 +626,62 @@ def _self_test() -> int:
         git("commit", "-qam", "move marker")
         ok(check_pr(td, "main") == [], "CF16 moving the marker line is not a Status edit")
 
+        # Codex round 1 (P1s on #83), each reproduced here before the fix.
+        frag_a = _frag(49, "α", "**Declarations.** Row A.", "In review (Phase 49):", ["- **α:** declarations."])
+        git("checkout", "-q", "main")
+        git("checkout", "-q", "-b", "unicode")
+        put("changes/phase49-café.md", "no header\n")
+        git("add", "-A")
+        git("commit", "-qm", "non-ASCII fragment name")
+        ok(any("café" in x for x in _safe_check(td)),
+           "CF18 a fragment with a non-ASCII name is recognised (NUL-delimited diff), and checked")
+
+        git("checkout", "-q", "main")          # main still queues changes/phase49a.md (CF11)
+        git("checkout", "-q", "-b", "renamed-survivor")
+        assemble(td, write=True)
+        put("changes/phase49a-again.md", frag_a)
+        git("add", "-A")
+        git("commit", "-qm", "fold, but the entry stays queued under a new name")
+        ok(any("still queued" in x for x in _safe_check(td)),
+           "CF19 a folded fragment that survives under a new name (rename/copy) fails")
+
+        git("checkout", "-q", "main")
+        git("checkout", "-q", "-b", "nested")
+        put("changes/feature/x.md", frag_a.replace("Row A", "Row N"))
+        git("add", "-A")
+        git("commit", "-qm", "nested fragment")
+        pr = _safe_check(td)
+        ok(any("nested" in x for x in pr), f"CF20 a nested path under changes/ fails the check ({pr})")
+        try:
+            assemble(td, write=False)
+            ok(False, "CF21 assembly refuses a nested fragment")
+        except FragmentError:
+            ok(True, "CF21 assembly refuses a nested fragment (one discovery rule for CI and release)")
+        ok(fragment_name("feature/phase51a") == "feature__phase51a.md",
+           "CF22 a branch name with '/' maps to a flat fragment name")
+
+        git("checkout", "-q", "main")
+        git("checkout", "-q", "-b", "badbytes")
+        with open(os.path.join(td, "changes", "bad.md"), "wb") as fh:
+            fh.write(b"---\nphase: \"1\"\ncommit: \"\xff\"\n---\n## Changelog\nx\n")
+        git("add", "-A")
+        git("commit", "-qm", "undecodable fragment")
+        pr = _safe_check(td)
+        ok(any("bad.md" in x and "UTF-8" in x for x in pr), f"CF23 an undecodable fragment is reported invalid ({pr})")
+        git("checkout", "-q", "main")
+
+    for sep, label in (("\\n", "newline"), ("\\u2028", "line separator"), ("\\r", "carriage return")):
+        try:
+            parse_fragment(f'---\nphase: "51{sep}| 99 | z"\ncommit: "α"\n---\n## Changelog\nx\n', "n")
+            ok(False, f"CF24 rejects a {label} in phase")
+        except FragmentError:
+            ok(True, f"CF24 rejects a {label} in phase")
+    try:
+        parse_fragment('---\nphase: "51"\ncommit: "α\\u2029"\n---\n## Changelog\nx\n', "n")
+        ok(False, "CF24 rejects a paragraph separator in commit")
+    except FragmentError:
+        ok(True, "CF24 rejects a paragraph separator in commit")
+
     if fails:
         print(f"FAILED: {len(fails)} self-test case(s).")
         return 1
@@ -547,9 +695,13 @@ def main(argv=None) -> int:
     ap.add_argument("--check-pr", metavar="BASE", help="check HEAD against BASE (CI on pull requests)")
     ap.add_argument("--root", default=ROOT)
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--name", metavar="BRANCH", help="print the fragment path for a branch name")
     a = ap.parse_args(argv)
     if a.self_test:
         return _self_test()
+    if a.name:
+        print(f"{CHANGES_DIR}/{fragment_name(a.name)}")
+        return 0
     try:
         if a.check_pr:
             problems = check_pr(a.root, a.check_pr)
