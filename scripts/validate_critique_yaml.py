@@ -1452,10 +1452,8 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None,
         violations += G(_check_persistent_medium_escalation, run_dir,
                         round_n=round_n,
                         current_kinds={v.get("kind") for v in violations})
-    # Phase 49 α (A20): a scope declaration of a HIGH finding cites a decision test.
-    violations += G(lambda rd: _load_sibling("declaration_tests").gate_findings(
-                        rd, round_n, violations, post_write=post_write, non_declarable=is_non_declarable),
-                    run_dir, check_name="declaration_tests")
+    # Phase 49 α (A20): the decision-test check runs in main() over every gate finding
+    # (spec-compliance, rigor, registry) once assembled: _apply_declaration_tests.
     # Phase 47 ε (A17): a finding at N gates in a row needs a diagnosis or a declaration.
     violations += G(lambda rd: _load_sibling("stall_rule").gate_findings(
                         rd, round_n, violations, _declared_ids(rd), is_non_declarable),
@@ -1472,6 +1470,23 @@ _UNIVERSAL_COVERAGE_FIELDS = (
     ("universal_coverage_dalys_averted_estimate", ()),
     ("efficiency_pct", ("gc7_efficiency_pct",)),
 )
+
+
+def _apply_declaration_tests(decision: dict, run_dir: str, spec_v: list, rigor_v: list, reg_v: list,
+                             max_rounds: int, current_round: int, post_write: bool = False) -> dict:
+    """Phase 49 α (A20): a scope declaration of a HIGH gate finding needs a decision
+    test (scripts/declaration_tests.py). Run over every gate finding (Codex review:
+    spec-compliance and registry HIGHs reach rule 3a too), keeping each one's
+    identity: a registry finding is named by its parameter. The findings join the
+    rigor blockers (not declarable), and the decision is recomputed."""
+    found = [v if v.get("key") or str(v.get("name") or "-") == "-" else dict(v, key=v["name"])
+             for v in list(spec_v or []) + list(rigor_v or []) + list(reg_v or []) if isinstance(v, dict)]
+    dt = run_guarded(lambda: _load_sibling("declaration_tests").gate_findings(
+        run_dir, current_round, found, post_write=post_write, non_declarable=is_non_declarable),
+        check_name="declaration_tests")
+    if not dt:
+        return decision
+    return _incorporate_rigor_violations(decision, list(rigor_v or []) + dt, max_rounds, current_round)
 
 
 def _check_universal_coverage(run_dir: str) -> list[dict]:
@@ -4590,6 +4605,20 @@ def _run_self_test() -> int:
     ok(act([bd, sa, ut], both, both)["action"] == "PATCH_OR_RETHINK"
        and act([bd, sa, ut], both, both, cur=8)["action"] == "RUN_FAILED",
        "DT-V1 an untested declaration: no early DECLARE_SCOPE, RUN_FAILED at exhaustion")
+    # DT-V3 (Codex P1): a registry or spec-compliance HIGH declared at two gates in a row is held to
+    # the decision test too; rule 3a must not fire on it untested.
+    with tempfile.TemporaryDirectory() as d:
+        yaml.safe_dump({"declarations": [{"id": "SD-9", "blocker_id": "cost_crosscheck_mismatch",
+                                          "why_unresolved": "x"}]}, open(os.path.join(d, "scope_declaration.yaml"), "w"))
+        reg = [{"kind": "cost_crosscheck_mismatch", "severity": "HIGH", "stage": "REGISTRY", "name": "itn_cost",
+                "claim": "cost differs"}]
+        dec = incorporate_registry_violations({"unresolved_high": [], "declared": ["cost_crosscheck_mismatch"],
+                                               "declared_prev": ["cost_crosscheck_mismatch"]}, reg, 8, 5)
+        ok(dec["action"] == "DECLARE_SCOPE", f"DT-V3a precondition: rule 3a fires without the check ({dec['action']})")
+        dec = _apply_declaration_tests(dec, d, [], [], reg, 8, 5, post_write=False)
+        ok(dec["action"] == "PATCH_OR_RETHINK"
+           and any(b.get("kind") == "scope_declaration_untested" for b in dec["unresolved_high"]),
+           f"DT-V3 the untested registry declaration blocks rule 3a: {dec['action']}")
     with tempfile.TemporaryDirectory() as d:
         yaml.safe_dump({"declarations": [{"id": "SD-7", "blocker_id": "allocation_unstable", "why_unresolved": "x"}]},
                        open(os.path.join(d, "scope_declaration.yaml"), "w"))
@@ -7611,6 +7640,7 @@ def main() -> int:
                                            args.current_round, record=not args.no_history)
     decision = _defer_write_findings(decision, args.run_dir, args.max_rounds, args.current_round)
 
+    spec_violations, rigor_violations, reg_violations = [], [], []   # Phase 49 α
     if args.spec_compliance:
         spec_module = _load_spec_compliance()
         if spec_module is None:
@@ -7734,6 +7764,11 @@ def main() -> int:
         decision = incorporate_registry_violations(
             decision, reg_violations, args.max_rounds, args.current_round,
         )
+
+    # Phase 49 α (A20): every gate finding, once assembled, against the declarations.
+    decision = _apply_declaration_tests(decision, args.run_dir, spec_violations, rigor_violations,
+                                        reg_violations, args.max_rounds, args.current_round,
+                                        post_write=args.post_write)
 
     decision["post_write"] = bool(args.post_write)
     if not args.no_history:

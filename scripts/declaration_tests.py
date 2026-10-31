@@ -58,7 +58,14 @@ files itself (stage-machine S5: re-solve through outcome_fn + toolkit/alloc
 where those contracts exist); the gate logic does not change when it does.
 
 A finding with a key needs a test naming that key (`benchmark_drift:B15` or
-`B15`): one test per benchmark, not one per kind.
+`B15`): one test per benchmark, not one per kind. Keys are normalized as A17
+records them (`stall_rule.finding_key`: a parameter set is `n=<size>:<hash>`),
+and a `<kind>_persistent` escalation is named by its base finding's instance.
+
+All gate findings are checked (spec-compliance, rigor and registry), once they
+are assembled (`validate_critique_yaml._apply_declaration_tests`). A17 counts a
+declaration of a stalled finding, whatever its severity, only when the covering
+entry has a passing test or an exemption (`declaration_counts`).
 
 Exemptions on the entry (verified, as in D1/D9): `specified_by: question|brief`
 with a verbatim `quote:` of 3+ words from the run question or signed brief,
@@ -160,9 +167,29 @@ def kind_exempt(kind: str, policy: dict) -> bool:
     return False
 
 
+def _sr():
+    from lib.siblings import load_private
+    return load_private("stall_rule", "_ma_p49_")
+
+
 def key_of(v: dict) -> str:
-    k = v.get("key", v.get("stall_key"))
-    return str(k).strip() if isinstance(k, (str, int)) and not isinstance(k, bool) and str(k).strip() else ""
+    """The finding's instance key, normalized as A17 records it (stall_rule.finding_key:
+    a parameter set is `n=<size>:<hash>`), so a test can name the identity the gate printed."""
+    k = _sr().finding_key(v)
+    if k:
+        return k
+    s = v.get("stall_key")
+    return str(s).strip() if isinstance(s, (str, int)) and not isinstance(s, bool) and str(s).strip() else ""
+
+
+def with_base_identity(v: dict, current: list[dict]) -> dict:
+    """A `<kind>_persistent` escalation (no key of its own) takes its base finding's
+    instance key, when the gate holds exactly one keyed instance of the base."""
+    kind = str(v.get("kind") or "")
+    if not kind.endswith("_persistent") or key_of(v):
+        return v
+    keys = {key_of(x) for x in current if x.get("kind") == _base(kind)} - {""}
+    return dict(v, key=keys.pop()) if len(keys) == 1 else v
 
 
 def identities(v: dict) -> set[str]:
@@ -237,11 +264,21 @@ def _exemption(run_dir: str, entry: dict, names: set[str]) -> tuple[Optional[str
         if not mm.owner_quote_found(run_dir, by, entry.get("quote")):
             return None, (f"`specified_by: {by}` but its `quote` ({str(entry.get('quote'))[:100]!r}) is not found "
                           f"verbatim (3+ words) in the run's {by}")
-        return f"specified by the {by}", None
+        return f"specified by the {by}: '{' '.join(str(entry.get('quote')).split())}'", None
     if not any(mm.amendment_names(run_dir, am, n) for n in sorted(names)):
         return None, (f"`owner_amendment: {am!r}` is not a valid entry of brief_amendments.yaml whose change or "
                       f"reason names the finding ({', '.join(sorted(names))})")
     return f"owner amendment {str(am).strip()}", None
+
+
+def exemption(run_dir: str, entry: dict) -> Optional[str]:
+    """The reason a declaration needs no decision test, as the gate verifies it
+    ("specified by the brief: '<quote>'", "owner amendment AM-n"), else None. The
+    amendment must name one of the ids the entry declares. For the report check."""
+    if not isinstance(entry, dict):
+        return None
+    how, problem = _exemption(run_dir, entry, sd.entry_declared_ids(entry, True))
+    return None if problem else how
 
 
 def entry_status(run_dir: str, entry: dict, v: dict) -> tuple[str, str, Optional[dict]]:
@@ -266,7 +303,8 @@ def entry_status(run_dir: str, entry: dict, v: dict) -> tuple[str, str, Optional
     return "untested", "", None
 
 
-def _covering(entries: list[dict], v: dict) -> list[dict]:
+def covering(entries: list[dict], v: dict) -> list[dict]:
+    """The entries that declare this finding (with a justification)."""
     names = identities(v)
     return [e for e in entries if sd.entry_has_justification(e) and sd.entry_declared_ids(e, True) & names]
 
@@ -292,14 +330,15 @@ def gate_findings(run_dir: str, round_n: Optional[int] = None, current: Optional
     if problems:
         return []        # an unreadable scope_declaration.yaml is already HIGH (scope_declaration_invalid)
     out, seen = [], set()
-    for v in current:
-        if not needs_test(v, current, policy, non_declarable):
+    for v0 in current:
+        if not needs_test(v0, current, policy, non_declarable):
             continue
+        v = with_base_identity(v0, current)
         ident = _ident(v)
         if ident in seen:
             continue
         seen.add(ident)
-        cover = _covering(entries, v)
+        cover = covering(entries, v)
         if not cover:
             if post_write:
                 out.append(_finding(UNTESTED, v, (
@@ -350,6 +389,24 @@ def tested_declarations(run_dir: str) -> list[dict]:
                     "criterion": res.get("criterion"), "varied": res.get("varied"),
                     "recommendation": res.get("recommendation")})
     return out
+
+
+def declaration_counts(run_dir: str, v: dict, current: Optional[list] = None) -> bool:
+    """For A17 (scripts/stall_rule.py): a scope declaration clears a stalled finding,
+    of any severity, only when a covering entry has a passing decision test or an
+    exemption, or the finding is in an exempt class by kind."""
+    try:
+        if kind_exempt(str(v.get("kind") or ""), load_policy()):
+            return True
+    except ValueError:
+        return False
+    if v.get("owner_signed"):
+        return True
+    _doc, entries, problems = sd.load(run_dir)
+    if problems:
+        return False
+    v = with_base_identity(v, [x for x in (current or []) if isinstance(x, dict)])
+    return any(entry_status(run_dir, e, v)[0] in ("tested", "exempt") for e in covering(entries, v))
 
 
 def diagnosis_problem(run_dir: str, entry: dict) -> Optional[str]:
@@ -467,6 +524,8 @@ def _self_test() -> int:
         sdecl["declarations"] = [e]
         w(d, "scope_declaration.yaml", sdecl)
         ok(gate_findings(d, 8, [b19]) == [], "DT15 specified_by brief with a verbatim quote: exempt")
+        ok(exemption(d, e) == "specified by the brief: 'vector control is not in this grant'",
+           f"DT15b exemption() gives the verified quote: {exemption(d, e)}")
         sdecl["declarations"] = [dict(e, quote="vector control is out of scope")]
         w(d, "scope_declaration.yaml", sdecl)
         ok(kinds(gate_findings(d, 8, [b19])) == [INVALID], "DT16 a quote not in the brief fails closed")
@@ -475,6 +534,10 @@ def _self_test() -> int:
         sdecl["declarations"] = [{"id": "SD-9", "blocker_id": "B19", "why_unresolved": "x", "owner_amendment": "AM-1"}]
         w(d, "scope_declaration.yaml", sdecl)
         ok(gate_findings(d, 8, [b19]) == [], "DT17 an owner amendment naming the finding: exempt")
+        ok(exemption(d, sdecl["declarations"][0]) == "owner amendment AM-1"
+           and exemption(d, {"id": "x", "blocker_id": "B19", "owner_amendment": "AM-2"}) is None
+           and exemption(d, {"id": "x", "blocker_id": "B19"}) is None,
+           "DT17b exemption(): the reason the gate accepts, else None")
         sdecl["declarations"] = [{"id": "SD-9", "blocker_id": "B19", "why_unresolved": "x", "owner_amendment": "AM-2"}]
         w(d, "scope_declaration.yaml", sdecl)
         ok(kinds(gate_findings(d, 8, [b19])) == [INVALID], "DT18 an unknown amendment fails closed")
@@ -499,6 +562,27 @@ def _self_test() -> int:
         ok(needs_test({"kind": "sanity_check_failed_x_persistent", "severity": "HIGH", "stage": "GATE"},
                       [{"kind": "sanity_check_failed_x", "severity": "MEDIUM", "stage": "MODEL"}], pol,
                       lambda k, e: False), "DT21 a persistent escalation is judged by its base finding's stage")
+        # DT30 (Codex P1): a parameter-set key is A17's identity (n=<size>:<hash>), and a
+        # persistent escalation carries its base finding's instance identity.
+        from lib.siblings import load_private
+        fk = load_private("stall_rule", "_ma_p49_").finding_key
+        unid = {"kind": "unidentified_parameters", "severity": "HIGH", "stage": "IDENTIFIABILITY", "key": ["b", "a"]}
+        ident = f"unidentified_parameters:{fk(unid)}"
+        w(d, "models/decision_tests/unid.yaml", dict(test, finding=ident))
+        sdecl["declarations"] = [{"id": "SD-5", "blocker_id": "unidentified_parameters", "why_unresolved": "x",
+                                  "decision_test": "models/decision_tests/unid.yaml"}]
+        w(d, "scope_declaration.yaml", sdecl)
+        ok(gate_findings(d, 8, [unid]) == [], "DT30 a test naming A17's identity of a parameter set counts")
+        wkp = {"kind": "weakly_identified_parameters_persistent", "severity": "HIGH", "stage": "GATE"}
+        wkb = {"kind": "weakly_identified_parameters", "severity": "MEDIUM", "stage": "IDENTIFIABILITY", "key": ["a", "b"]}
+        w(d, "models/decision_tests/unid.yaml", dict(test, finding=f"weakly_identified_parameters:{fk(wkb)}"))
+        sdecl["declarations"] = [{"id": "SD-8", "blocker_id": "weakly_identified_parameters", "why_unresolved": "x",
+                                  "decision_test": "models/decision_tests/unid.yaml"}]
+        w(d, "scope_declaration.yaml", sdecl)
+        f = gate_findings(d, 8, [wkp, wkb])
+        ok(f == [], f"DT31 a persistent escalation is matched by its base finding's instance: {f}")
+        w(d, "models/decision_tests/unid.yaml", dict(test, finding="weakly_identified_parameters:n=9:00000000"))
+        ok(kinds(gate_findings(d, 8, [wkp, wkb])) == [INVALID], "DT32 ...and a test of another parameter set does not")
         # Exposed data (for the report-citation check).
         w(d, "models/decision_tests/alloc.yaml", test)
         sdecl["declarations"] = [{"id": "SD-007", "blocker_id": "allocation_unstable", "why_unresolved": "x",
