@@ -1,0 +1,83 @@
+# Phase 49 α (A20): which scope declarations need a decision test.
+#
+# Read by scripts/declaration_tests.py. A scope declaration that covers a HIGH
+# gate finding (or a MEDIUM escalated to HIGH, `<kind>_persistent`) must cite
+# `decision_test: <path>`: a result file in the D1/D9 format
+# (scripts/mechanism_manifest.py) recording what was set to its target, the
+# criterion, `decision_changes: true|false`, and the recommendation with and
+# without. A declaration needs no test when:
+#   - its entry carries `specified_by: question|brief` and a verbatim `quote:`
+#     (the owner scoped it out), or `owner_amendment: AM-n` naming the finding
+#     (checked by the same functions as D1/D9); or
+#   - the finding is a stage or a named kind below: it has no model quantity
+#     to vary, so a with/without run cannot be made. Each says why. A failed
+#     model result (results rows that did not run, a benchmark the model does
+#     not compute) is not on the list: it can change the decision, so it needs
+#     a test like any other finding (Codex review: 2 of 10 draws failing in the
+#     highest-transmission units is not bookkeeping).
+#
+# A data-availability limit is NOT on this list. In attempt 8 every declared
+# finding (allocation_unstable, benchmark_drift B15/B19, weakly identified
+# parameters) gave missing data as the reason it could not be fixed, and each
+# still had a quantity that could be set to its target (the held-out fold's
+# parameters, the trial's interaction OR, the benchmark's cost per DALY). The
+# missing data explains why a finding cannot be fixed; it does not show that
+# the decision does not depend on it. A required artifact that is absent is
+# exempt by name below: the fix is to produce it.
+#
+# Gate code must not hard-code a disease, country or intervention here.
+
+decision_test:
+  # Findings about the write-up's own text (the writer fixes them), the
+  # critics' bookkeeping and the gate's bookkeeping (scope-declaration budget,
+  # effort follow-ups). A gate kind's `<kind>_persistent` escalation (stage
+  # GATE) is judged by its base finding's stage instead.
+  exempt_stages: [WRITE, CRITIQUE, GATE]
+  # Effort floors count work done (draws, iterations, parameters perturbed),
+  # not a model quantity.
+  exempt_prefixes: [effort_floors_, effort_floor_]
+  # Named kinds, each with the reason it has no quantity to vary. A kind not
+  # named here needs a test (fail closed for new kinds).
+  exempt_kinds:
+    # A required artifact is absent: produce it; there is nothing to vary yet.
+    required_artifact_missing: "a required artifact is absent (not_applicable covers the rest)"
+    allocation_robustness_missing: "the cross-validation artifact is absent"
+    sensitivity_analysis_missing: "the sensitivity artifact is absent"
+    optimization_quality_missing: "the optimizer comparison artifact is absent"
+    universal_coverage_missing: "the universal-coverage artifact is absent"
+    within_zone_heterogeneity_missing: "the within-unit heterogeneity artifact is absent"
+    daly_analysis_missing: "the DALY analysis artifact is absent"
+    uq_report_missing: "the uncertainty report is absent"
+    identifiability_report_missing: "the identifiability report is absent"
+    identifiability_a_priori_missing: "the a-priori identifiability arithmetic is absent"
+    msc_manifest_missing: "the multi-structure manifest is absent"
+    msc_report_missing: "the multi-structure report is absent"
+    outcome_fn_missing: "the outcome function is absent"
+    decision_rule_missing: "decision_rule.md is absent"
+    claims_ledger_missing: "the claims ledger is absent"
+    claims_spec_missing: "the claims spec is absent"
+    plan_criteria_missing: "the plan's criteria file is absent"
+    sanity_schema_missing: "the sanity manifest is absent"
+    pre_mortem_missing: "the pre-mortem is absent"
+    eligibility_manifest_missing: "the eligibility manifest is absent"
+    data_schema_missing: "the data schema is absent"
+    benchmark_targets_missing: "the benchmark targets file is absent"
+    calibration_spec_missing: "the calibration spec is absent"
+    calibration_target_metadata_missing: "a calibration target lacks its metadata fields"
+    figure_validator_missing: "a figure has no provenance sidecar"
+    # A checking tool or reference did not run: rerun it.
+    benchmark_match_unavailable: "the benchmark comparison did not run"
+    coherence_audit_unavailable: "the coherence audit did not run"
+    writer_qa_unavailable: "writer QA did not run"
+    effort_floors_unavailable: "the effort-floor manifest could not be read"
+    done_when_unavailable: "the finding-test registry could not be read"
+    cross_model_critic_unavailable: "the cross-model critic did not run"
+    cross_model_critic_missing: "the cross-model critic was not run"
+    mechanism_priors_unavailable: "the run question could not be read for the priors"
+    pre_mortem_priors_unavailable: "the priors file could not be read"
+    # Documentation of something already computed.
+    surrogate_uq_undocumented: "the surrogate's calibration is not documented"
+    pre_model_decorative_undocumented: "a decorative parameter is not documented"
+    # A document defect, not a model result.
+    figure_staleness_detected: "a stale figure is redrawn, not tested"
+    decision_rule_malformed: "decision_rule.md does not parse as a rule"

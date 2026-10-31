@@ -158,6 +158,7 @@ for f in main.py \
   scripts/figure_validator.py scripts/gate_replay.py scripts/headline_binding.py scripts/identifiability.py \
   scripts/identifiability_a_priori.py scripts/lessons.py scripts/mechanism_manifest.py \
   scripts/calibration_spec.py \
+  scripts/gate_fuzz.py \
   scripts/numeric_consistency.py scripts/open_problems.py scripts/pipeline.py \
   scripts/optimization_quality.py scripts/plan_criteria.py \
   scripts/propagate_uncertainty.py scripts/render_claims.py \
@@ -174,12 +175,14 @@ for f in main.py \
   scripts/lib/positive_control.py scripts/lib/provenance.py \
   scripts/lib/rigor_artifacts.py scripts/lib/safe_io.py \
   toolkit/alloc/costs.py toolkit/alloc/packages.py toolkit/alloc/optimize.py \
-  scripts/lib/text_spans.py scripts/lib/transcript_cost.py; do
+  scripts/lib/text_spans.py scripts/lib/transcript_cost.py \
+  scripts/declaration_tests.py scripts/lib/scope_declarations.py; do
   echo "== $f"; python3 "$f" --self-test || echo "FAILED: $f"
 done
 python3 scripts/validate_skill_attachments.py      # frontmatter + phantoms
 python3 scripts/lib/expert_priors.py --validate    # priors corroboration
 python3 scripts/regression_eval.py                 # planted-defect regression eval (CI)
+python3 scripts/gate_fuzz.py                       # bad-input fuzz over every gate_findings check (CI)
 ```
 
 Install with `pip install -r requirements.txt` (pinned; add

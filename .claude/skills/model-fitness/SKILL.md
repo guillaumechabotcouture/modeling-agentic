@@ -259,6 +259,19 @@ can't answer its own stated question. "This model allocates
 interventions A and B but not C" is a scope declaration. "This model allocates all four
 interventions but can't properly evaluate one of them" is a structural gap.
 
+A declaration is also a claim that the decision does not depend on the
+finding, and the gate asks for the evidence (Phase 49 α, A20). For every HIGH
+gate finding you declare, re-run the decision with the finding's quantity set
+to its target and record whether the recommendation changes: the held-out
+fold's own parameters for an unstable allocation, the trial's value for a
+drifting effect benchmark, the benchmark's cost for a cost drift. If it does
+not change, the declaration stands and the report cites the test; if it does,
+the finding is a structural gap, not a scope boundary, and must be fixed.
+"No data to fix it" explains why a finding cannot be fixed; it is not evidence
+that the decision does not depend on it. The result format, where it goes and
+the few exemptions (the owner scoped it out; a finding with no quantity to
+vary) are in the rigor manifest, entry `decision_tests`.
+
 ### "Level 1 is good enough for now"
 Level 1 IS good enough when the audience is internal decision support
 or rapid analysis. Level 1 is NOT good enough when the audience is a

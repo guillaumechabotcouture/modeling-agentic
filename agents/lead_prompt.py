@@ -592,6 +592,11 @@ The validator has already decided for you. Your job is to carry it out:
   the instruction: "Embed the scope_declaration.yaml acknowledgments
   verbatim in report.md §Limitations. Do not soften the language. Do
   not omit blockers."
+  Each declaration of a HIGH gate finding cites `decision_test: <path>`
+  (Phase 49 α; format and exemptions in the rigor manifest, entry
+  `decision_tests`); have the modeler write the test before you declare.
+  An untested declaration does not count, and one whose test shows the
+  decision changes cannot be declared.
 
 - **ACCEPT**: no unresolved HIGH blockers, no structural mismatch.
   Proceed to STAGE 8.
@@ -661,7 +666,13 @@ Presentation pass (Phase 39 α): once the draft exists, spawn
 critique-presentation (`This is critique round N.`) on it, with the
 after-write findings from open_problems.json, and route what it raises
 to the writer (wording, captions) or the analyst (figures) before the
-final gate.
+final gate. Then spawn critique-presentation again on the revised draft
+(`This is critique round N.`) so its verdict covers the fixes. The
+harness records which draft each presentation review read; ACCEPT needs a
+successful review of the delivered draft (`presentation_review_*`). If the
+session ends with presentation HIGHs for the writer still open, or with no
+such review, the harness runs one writer fix pass and the review, paid from
+the write-up reserve (Phase 49 δ).
 
 #### STAGE 8.1: RENDER CLAIM REFERENCES (Phase 18 α — REQUIRED)
 

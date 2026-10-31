@@ -341,6 +341,9 @@ Appropriate when:
 - Some hypotheses are untestable with available data/model
 - A structural limitation exists that can't be resolved in this iteration
 - The model is fit for its primary purpose even if not for everything
+- and, for a HIGH gate finding, a decision test shows the recommendation
+  does not change when the finding's quantity is set to its target
+  (Phase 49 α; rigor manifest entry `decision_tests`, and `model-fitness`)
 
 ### Decision Heuristic
 
@@ -363,6 +366,8 @@ the bounds), run a test for each one you check, and decide: a specific fix,
 or a declaration. Record it in `models/stall_diagnoses.yaml`; the schema, the
 round count and how long a diagnosis lasts are in the rigor manifest
 (entry `stall_diagnoses`) and `effort_floors.yaml`.
+A declaration needs the same decision test as a scope declaration (entry
+`decision_tests`).
 
 ---
 
@@ -392,6 +397,19 @@ it's scientific integrity.
 - Example: "District-level DHIS2 treatment data + Bayesian calibration
   via calabaria cloud would enable longitudinal validation"
 ```
+
+### Where declarations appear in the report
+
+A declaration is a limit on the recommendation, so a reader of the
+executive summary alone must see it. The writer puts the placeholder
+`[DECLARED_LIMITS]` once in the executive summary; `scripts/render_claims.py`
+replaces it with a "What this does not establish" block generated from
+`scope_declaration.yaml`: each declaration's id, its claim, and its measured
+effect on the recommendation from its `decision_test` (or "untested",
+"exempt: <reason>", "invalid test"). Write each declaration's `claim` as one
+plain sentence a decision-maker can read, since it is printed as written.
+The full declaration still goes verbatim in §Limitations. The gate's
+`declared_limits_not_rendered` finding checks the placeholder and the block.
 
 ---
 
