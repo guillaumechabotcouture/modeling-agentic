@@ -2,7 +2,7 @@
 #
 # Quantitative minimums for what counts as "actually tried." Read by
 # scripts/effort_floors.py and surfaced through
-# scripts/validate_critique_yaml.py::_check_effort_floors.
+# scripts/effort_floors_gate.py::gate_findings (run by the STAGE 7 validator).
 #
 # Why this exists
 # ---------------

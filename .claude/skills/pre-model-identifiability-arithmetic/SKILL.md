@@ -30,8 +30,8 @@ Phase 15 α adds a required pre-model artifact:
 
 ## When the gate fires
 
-`_check_identifiability_a_priori` in
-`scripts/validate_critique_yaml.py` triggers at **round ≥ 2**.
+The STAGE 7 a-priori identifiability check
+(`scripts/identifiability_gate.py`) triggers at **round ≥ 2**.
 Drafting window is round 1. The artifact is required by round 2,
 escalating to HIGH at round 3+.
 

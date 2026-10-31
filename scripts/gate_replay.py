@@ -214,6 +214,11 @@ def _rigor_child(repo: str, copy: str, round_n: int, post_write: bool) -> int:
     import importlib.util
     path = os.path.join(repo, "scripts", "validate_critique_yaml.py")
     sys.path.insert(0, os.path.dirname(path))
+    # Phase 48 β: this script imported its own scripts/lib; drop it so the
+    # validator under test imports --repo's lib (a baseline checkout's lib
+    # can lack modules this one has, and the reverse).
+    for k in [k for k in sys.modules if k == "lib" or k.startswith("lib.")]:
+        del sys.modules[k]
     spec = importlib.util.spec_from_file_location("validate_critique_yaml", path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules["validate_critique_yaml"] = mod
