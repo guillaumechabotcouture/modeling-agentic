@@ -1,3 +1,8 @@
+producer: toolkit/engines/benchmark.py
+engine_identity:
+  name: malaria-starsim
+  version: 0.1-spike
+  code_sha256: a377d71376723cabe48b6c5e47258cb70a2e3a82604c55c6879abfc22aa3b979
 benchmarks:
 - id: B7
   metric: ITN (pyrethroid) vs none, prevalence RR at 12 m
@@ -262,8 +267,8 @@ benchmarks:
     - 0.641
   - - 175.755
     - 0.7789
-  - - 524.759
-    - 0.853
+  - - 524.574
+    - 0.8527
   rules_checked: 5
   rules_met: 4
   computed: 0.8
@@ -319,7 +324,7 @@ benchmarks:
 settings_calibrated:
   cochrane_itn:
     attribute: m0
-    value: 11.74633360031379
+    value: 11.746333578421101
     grid:
     - 4
     - 8
@@ -335,7 +340,7 @@ settings_calibrated:
     target: 0.5
   muleba:
     attribute: m0
-    value: 30.460808457076013
+    value: 30.460808378904165
     grid:
     - 8
     - 16
@@ -351,7 +356,7 @@ settings_calibrated:
     target: 0.55
   misungwi:
     attribute: m0
-    value: 9.89466204762414
+    value: 9.894662025288113
     grid:
     - 8
     - 16
@@ -383,7 +388,7 @@ settings_calibrated:
     target: 2.06
   irs_added:
     attribute: m0
-    value: 8.912069594169436
+    value: 8.912069582119198
     grid:
     - 8
     - 16
@@ -399,7 +404,7 @@ settings_calibrated:
     target: 0.4
   sahel_smc:
     attribute: m0
-    value: 17.815574600595138
+    value: 17.815574588310636
     grid:
     - 4
     - 8
@@ -415,7 +420,7 @@ settings_calibrated:
     target: 0.4
   ce_ref:
     attribute: m0
-    value: 16.293751602324168
+    value: 16.29375157042941
     grid:
     - 4
     - 8
@@ -431,7 +436,7 @@ settings_calibrated:
     target: 0.45
   ce_res:
     attribute: m0
-    value: 16.293751602324168
+    value: 16.29375157042941
     grid:
     - 4
     - 8
@@ -465,4 +470,4 @@ summary:
   total: 16
   held_out_in_band: 5
   held_out_total: 9
-wall_s: 321.2
+wall_s: 736.2
