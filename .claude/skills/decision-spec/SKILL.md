@@ -31,7 +31,10 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
 2. **Engine.** Pick an engine whose card (`describe()`) covers the interventions, outputs
    and unit attributes the question needs. Read its card: components and their values,
    unit attributes and ranges, outputs, age groups, fitted parameters and benchmarks. If no
-   engine covers the question, say so; do not bend the question to an engine.
+   engine covers the question, say so; do not bend the question to an engine. Or write
+   `engine: auto` (optionally `{auto: true, candidates: [...]}`): the engine is then chosen
+   after sign-off by the harness, which records it in `engine_choice.json`; the decision
+   sections are checked at sign-off and the engine-dependent ones once the choice exists.
 3. **Decision units.** The units table (one row per unit), its id column, the mapping of
    each engine unit attribute to a column (or a value with its source), and the population
    groups (unit column and engine age groups).

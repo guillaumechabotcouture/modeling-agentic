@@ -27,7 +27,8 @@ import yaml
 MANIFEST = os.path.join("analysis", "manifest.json")
 PRODUCED_BY = "harness"
 PRODUCER_PREFIX = "toolkit/analysis/"
-ENVELOPE = ("schema", "produced_by", "producer", "spec_sha256", "spec_signed", "engine", "inputs", "data")
+ENVELOPE = ("schema", "produced_by", "producer", "spec_sha256", "spec_signed", "engine", "engine_choice_sha256",
+            "inputs", "data")
 # Required payload fields per kind (the contract checks read these).
 KINDS = {
     "engine": ("card", "parameters"),
@@ -80,16 +81,18 @@ def plain(x):
 
 class Store:
     def __init__(self, run_dir: str, spec_sha: str | None, spec_signed: bool, engine_info: dict,
-                 settings_sha: str | None = None):
+                 settings_sha: str | None = None, engine_choice_sha: str | None = None):
         self.run_dir = os.path.abspath(run_dir)
         self.spec_sha, self.spec_signed, self.engine_info = spec_sha, spec_signed, engine_info
+        self.engine_choice_sha = engine_choice_sha        # engine: auto: the harness's engine_choice.json
         os.makedirs(os.path.join(self.run_dir, "analysis"), exist_ok=True)
         # Codex P1-9: a run's manifest is published once, atomically, when the run ends; an earlier run's manifest is
         # withdrawn first, so a run that stops half way can never leave a complete-looking certificate behind.
         if os.path.exists(self.path(MANIFEST)):
             os.remove(self.path(MANIFEST))
         self.manifest = {"produced_by": PRODUCED_BY, "spec_sha256": spec_sha, "spec_signed": spec_signed,
-                         "settings_sha256": settings_sha, "engine": engine_info, "artifacts": {}, "deliverables": {}}
+                         "settings_sha256": settings_sha, "engine_choice_sha256": engine_choice_sha,
+                         "engine": engine_info, "artifacts": {}, "deliverables": {}}
 
     def rel(self, path: str) -> str:
         return os.path.relpath(os.path.abspath(path), self.run_dir)
@@ -106,6 +109,7 @@ class Store:
         rel = os.path.join("analysis", f"{name or kind}.yaml")
         doc = {"schema": f"analysis.{kind}/1", "produced_by": PRODUCED_BY, "producer": producer,
                "spec_sha256": self.spec_sha, "spec_signed": self.spec_signed, "engine": self.engine_info,
+               "engine_choice_sha256": self.engine_choice_sha,
                "inputs": {self.rel(p) if os.path.isabs(p) else p: sha256(p if os.path.isabs(p) else self.path(p))
                           for p in inputs},
                "written_at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),

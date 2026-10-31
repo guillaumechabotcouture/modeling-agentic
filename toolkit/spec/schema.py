@@ -12,7 +12,9 @@ docs/design/v2-spec-and-analysis.md §1):
     question: "..."
     decision_maker: "<a role>"
     decision_date: 2026                    # a year or an ISO date
-    engine: {ref: "pkg.module:Class", config: {...}}       # constructor keyword arguments
+    engine: {ref: "pkg.module:Class", config: {...}}       # constructor keyword arguments; or `auto` /
+                                                           # {auto: true, candidates: [...]}: chosen after sign-off,
+                                                           # read from engine_choice.json (harness-written)
     horizon: {start: 2016.0, stop: 2027.0}                 # simulated period
     decision_units:
       csv: data/units.csv
@@ -80,6 +82,7 @@ import copy
 import csv
 import hashlib
 import importlib
+import json
 import os
 import sys
 
@@ -168,7 +171,44 @@ def load(path: str) -> "Spec":
         settings_path = sp
     s = Spec(raw, base, path)
     s.settings_path = settings_path
+    _resolve_engine_choice(s)
     return s
+
+
+ENGINE_CHOICE = "engine_choice.json"
+
+
+def engine_is_auto(eng) -> bool:
+    return eng == "auto" or (isinstance(eng, dict) and eng.get("auto") is True)
+
+
+def _resolve_engine_choice(s: "Spec") -> None:
+    """engine: auto (or {auto: true, candidates: [...]}) in the signed spec: the engine is the AI's choice, recorded by
+    the harness after sign-off in engine_choice.json beside the spec. Fail closed on a malformed choice or one outside
+    the signed candidates. An explicit engine in the spec wins and the choice file is ignored."""
+    eng = s.raw.get("engine")
+    if not engine_is_auto(eng):
+        return
+    s.engine_auto = True
+    cands = eng.get("candidates") if isinstance(eng, dict) else None
+    if cands is not None and (not isinstance(cands, list) or not all(isinstance(c, str) and ":" in c for c in cands)):
+        raise SpecError("engine.candidates: a list of 'module:Class' references")
+    cp = os.path.join(s.base, ENGINE_CHOICE)
+    if not os.path.exists(cp):
+        s.engine_pending = True
+        return
+    try:
+        doc = json.load(open(cp, encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise SpecError(f"{ENGINE_CHOICE}: unreadable: {e}") from e
+    e = doc.get("engine") if isinstance(doc, dict) else None
+    if not isinstance(e, dict) or not isinstance(e.get("ref"), str) or ":" not in e["ref"] \
+            or not isinstance(e.get("config") or {}, dict):
+        raise SpecError(f"{ENGINE_CHOICE}: engine must be {{ref: 'module:Class', config: {{...}}}}")
+    if cands and e["ref"] not in cands:
+        raise SpecError(f"{ENGINE_CHOICE}: engine {e['ref']} is not among the signed candidates {cands}")
+    s.raw["engine"] = {"ref": e["ref"], **({"config": dict(e["config"])} if e.get("config") else {})}
+    s.engine_choice_path = cp
 
 
 def sha256_file(path: str) -> str | None:
@@ -185,6 +225,9 @@ class Spec:
     def __init__(self, raw: dict, base: str, path: str | None = None):
         self.raw, self.base, self.path = raw, base, path
         self.settings_path = None
+        self.engine_auto, self.engine_pending, self.engine_choice_path = False, False, None
+        if engine_is_auto(raw.get("engine")) and path is None:
+            self.engine_auto = self.engine_pending = True      # a mapping with no file beside it: no choice to read
         self._engine = None
         self._units = None
 
@@ -205,8 +248,14 @@ class Spec:
     def settings_sha256(self) -> str | None:
         return sha256_file(self.settings_path) if self.settings_path else None
 
+    @property
+    def engine_choice_sha256(self) -> str | None:
+        return sha256_file(self.engine_choice_path) if self.engine_choice_path else None
+
     # ---- engine
     def engine(self):
+        if self.engine_pending:
+            raise SpecError(f"engine: auto, and the harness has not written {ENGINE_CHOICE} yet")
         if self._engine is None:
             self._engine = load_engine(self.raw["engine"])
         return self._engine
@@ -330,14 +379,58 @@ def _isnum(x) -> bool:
 
 
 # --------------------------------------------------------------------------- validation
-def validate(spec: "Spec | dict", base: str | None = None) -> list[str]:
-    """Problems with the spec (empty = valid). Never raises on a malformed spec."""
+def validate(spec: "Spec | dict", base: str | None = None, pending_ok: bool = False) -> list[str]:
+    """Problems with the spec (empty = valid). Never raises on a malformed spec. With engine: auto and no engine choice
+    yet, `pending_ok` (sign-off) checks the sections that do not depend on the engine; otherwise that is a problem."""
     if isinstance(spec, dict):
         spec = Spec(spec, base or os.getcwd())
     try:
+        if spec.engine_pending:
+            if not pending_ok:
+                return [f"engine: auto, and the harness has not written {ENGINE_CHOICE} yet (engine-dependent sections "
+                        "cannot be checked)"]
+            return _validate_pending(spec)
         return _validate(spec)
     except Exception as e:  # noqa: BLE001 -- a malformed section must be a finding, not a crash
         return [f"spec could not be checked: {type(e).__name__}: {e}"]
+
+
+def _validate_pending(s: Spec) -> list[str]:
+    """engine: auto before the choice: everything that does not need the engine card."""
+    r = s.raw
+    bad = [f"missing section {k}" for k in REQUIRED if k not in r]
+    if bad:
+        return bad
+    if r["schema_version"] != SCHEMA_VERSION:
+        return [f"schema_version {r['schema_version']!r} is not {SCHEMA_VERSION}"]
+    for k in ("question", "decision_maker"):
+        if not str(r.get(k) or "").strip():
+            bad.append(f"{k}: empty")
+    try:
+        units = s.units()
+    except OSError as e:
+        return bad + [f"decision_units: units table unreadable: {e}"]
+    if not units:
+        return bad + ["decision_units: the units table is empty"]
+    cols = set(units[0])
+    a = s.alloc_spec()
+    bad += [f"options: {e}" for e in acosts.validate(a, cols)]
+    bad += [f"constraints: {e}" for e in apackages.validate(a, units)]
+    if not bad:
+        try:
+            apackages.feasibility(a, units)
+        except ValueError as e:
+            bad.append(f"constraints: {e}")
+    if r["comparator"].get("package") not in s.packages():
+        bad.append(f"comparator: package {r['comparator'].get('package')!r} is not a package")
+    bad += [e for e in _validate_uncertainty(s, {}) if "the engine" not in e]
+    for dt in r["analysis"].get("decision_tests") or []:
+        if dt.get("type") not in DECISION_TEST_TYPES:
+            bad.append(f"decision test {dt.get('id')}: type {dt.get('type')!r} not in {DECISION_TEST_TYPES}")
+        if any(ch.isdigit() for ch in str(dt.get("text") or "")):
+            bad.append(f"decision test {dt.get('id')}: text must be descriptive, with no numbers")
+    bad += _validate_deliverable(s)
+    return bad
 
 
 def _validate(s: Spec) -> list[str]:
@@ -831,6 +924,42 @@ def _self_test() -> int:
         r["analysis"]["decision_tests"][0]["engine_arm_or"] = {"a11": 0.4, "a10": 0.5, "a01": 0.7}
         ok(any("cannot be supplied" in e for e in validate(Spec(r, d))),
            "SP24 arm ratios supplied in the spec are refused (Codex P1-13)")
+    with tempfile.TemporaryDirectory() as d:     # engine: auto (the engine is the AI's choice, made after sign-off)
+        p = toy_spec(d)
+        raw = yaml.safe_load(open(p))
+        toy = raw["engine"]
+        raw["engine"] = {"auto": True, "candidates": ["toolkit.engines.contract:ToyEngine"]}
+        yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+        try:
+            s = load(p)
+            errs, pend = validate(s), validate(s, pending_ok=True)
+            ok(s.engine_pending and any(ENGINE_CHOICE in e for e in errs) and pend == [],
+               f"SP25 engine auto before the choice: the decision sections validate, the engine-dependent ones wait: "
+               f"{errs[:2]} {pend[:2]}")
+        except Exception as e:  # noqa: BLE001
+            ok(False, f"SP25 engine auto before the choice validates its decision sections: {type(e).__name__}: {e}")
+        cp = os.path.join(d, ENGINE_CHOICE) if "ENGINE_CHOICE" in globals() else os.path.join(d, "engine_choice.json")
+        import json
+        json.dump({"engine": toy, "why": "the only eligible engine", "candidates": [
+            {"ref": toy["ref"], "eligible": True, "why_not": ""}], "cross_check": {}}, open(cp, "w"))
+        try:
+            s = load(p)
+            ok(s["engine"] == toy and validate(s) == [] and s.engine_choice_sha256 == sha256_file(cp),
+               "SP26 engine auto: the engine comes from engine_choice.json and the spec validates in full")
+        except Exception as e:  # noqa: BLE001
+            ok(False, f"SP26 engine auto reads engine_choice.json: {type(e).__name__}: {e}")
+        json.dump({"engine": {"ref": "toolkit.engines.empirical.engine:PackageRateEngine"}, "why": "x"}, open(cp, "w"))
+        try:
+            load(p)
+            ok(False, "SP27 a chosen engine outside the signed candidates is refused")
+        except Exception as e:  # noqa: BLE001
+            ok(isinstance(e, SpecError) and "candidate" in str(e), f"SP27 a chosen engine outside the signed candidates "
+                                                                   f"is refused: {e}")
+        raw["engine"] = toy
+        yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+        s = load(p)
+        ok(s["engine"] == toy and getattr(s, "engine_choice_path", None) is None,
+           "SP28 an explicit engine in the signed spec wins; engine_choice.json is ignored")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

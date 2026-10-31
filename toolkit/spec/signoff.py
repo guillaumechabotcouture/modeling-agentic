@@ -53,7 +53,7 @@ def status(run_dir: str) -> str:
         return "changed" if rec is not None else "absent"
     if rec is not None:
         return "signed" if DB._sha(path) == (rec.get("sha256") or {}).get(SPEC) else "changed"
-    return "invalid" if schema.validate(schema.load(path)) else "awaiting"
+    return "invalid" if schema.validate(schema.load(path), pending_ok=True) else "awaiting"
 
 
 def signed_sha(run_dir: str) -> str | None:
@@ -65,7 +65,7 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     path = os.path.join(run_dir, SPEC)
     if not os.path.exists(path):
         raise ValueError(f"{SPEC} does not exist")
-    errs = schema.validate(schema.load(path))
+    errs = schema.validate(schema.load(path), pending_ok=True)
     if errs:
         raise ValueError("spec not ready: " + "; ".join(errs[:10]))
     if _spec_record(run_dir) is not None:
@@ -127,6 +127,18 @@ def _self_test() -> int:
         with open(os.path.join(d, SPEC), "a") as f:
             f.write("\n# edited\n")
         ok(DB.status(d) == "changed", "SG9 a spec edit after the brief's sign-off shows as a changed brief sign-off")
+    with tempfile.TemporaryDirectory() as d:
+        p = schema.toy_spec(d)
+        raw = yaml.safe_load(open(p))
+        raw["engine"] = {"auto": True}
+        yaml.safe_dump(raw, open(p, "w"))
+        try:
+            st0 = status(d)
+            sign(d, "owner")
+            ok(st0 == "awaiting" and status(d) == "signed",
+               f"SG10 a spec with engine: auto can be signed before the engine is chosen ({st0})")
+        except ValueError as e:
+            ok(False, f"SG10 a spec with engine: auto can be signed before the engine is chosen: {e}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

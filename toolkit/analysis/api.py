@@ -21,6 +21,36 @@ from toolkit.analysis.artifacts import read  # noqa: E402
 from toolkit.spec import schema  # noqa: E402
 
 
+# The schema reads `engine: auto` (the engine chosen after sign-off, in engine_choice.json written by the harness).
+ENGINE_AUTO = True
+
+
+def engine_needs(spec: dict) -> dict:
+    """What an engine must offer to run this spec (for the stage machine's eligibility filter): engine component values,
+    per-capita outputs, cost drivers, window metrics, unit attributes and age groups."""
+    comps = {}
+    for m in ((spec.get("options") or {}).get("engine_map") or {}).values():
+        for k, v in (m or {}).items():
+            comps.setdefault(k, [])
+            if v not in comps[k]:
+                comps[k].append(v)
+    cal, an = spec.get("calibration") or {}, spec.get("analysis") or {}
+    outs = [(spec.get("objective") or {}).get("outcome")] + list(spec.get("outcomes_reported") or [])
+    if cal.get("method") == "likelihood":
+        outs.append((cal.get("targets") or {}).get("outcome") or (spec.get("objective") or {}).get("outcome"))
+    wins = ([cal["metric"]] if cal.get("method") == "emulator_inversion" and cal.get("metric") else []) + \
+        [d.get("metric") for d in (an.get("diagnostics") or {}).values()]
+    du = spec.get("decision_units") or {}
+    attrs = list((du.get("engine_attributes") or {}).keys()) + ([cal["attribute"]] if cal.get("attribute") else [])
+    ages = []
+    for pm in (du.get("populations") or {}).values():
+        ages += [g for g in (pm or {}).get("age_groups") or [] if g not in ages]
+    uniq = lambda xs: [x for i, x in enumerate(xs) if x and x not in xs[:i]]  # noqa: E731
+    return {"components": comps, "outputs": uniq(outs),
+            "cost_drivers": uniq([(m or {}).get("cost_driver") for m in (an.get("cost_outputs") or {}).values()]),
+            "windows": uniq(wins), "unit_attributes": uniq(attrs), "age_groups": ages}
+
+
 def validate(spec, base: str | None = None) -> list[str]:
     if isinstance(spec, str):
         return schema.validate(schema.load(spec))
@@ -35,6 +65,8 @@ def pipeline_steps(spec_path: str, run_dir: str) -> list[dict]:
     deps = [os.path.relpath(spec_path, run_dir), os.path.relpath(spec.resolve(spec["decision_units"]["csv"]), run_dir)]
     if spec.settings_path:
         deps.append(os.path.relpath(spec.settings_path, run_dir))
+    if spec.engine_auto:
+        deps.append(schema.ENGINE_CHOICE)
     if spec["calibration"].get("method") == "likelihood":
         deps.append(os.path.relpath(spec.resolve(spec["calibration"]["targets"]["csv"]), run_dir))
     # uncertainty_report.yaml and models/claims_ledger.yaml are written too, but S1 reserves them for their
@@ -82,6 +114,26 @@ def _self_test() -> int:
            f"AP2 pipeline steps name their inputs and outputs: {st}")
         ok(gate_findings(d) and gate_findings(d)[0]["kind"] == "analysis_contract_missing",
            "AP3 gate_findings before the analysis ran: missing (fail closed)")
+        try:
+            need = engine_needs(schema.load(p).raw)
+            ok(need["components"] == {"a": [1], "b": [1]} and "dalys" in need["outputs"] and "cases" in need["outputs"]
+               and need["windows"] == ["prev"] and "x" in need["unit_attributes"],
+               f"AP4 engine_needs states what an engine must offer for this spec: {need}")
+        except Exception as e:  # noqa: BLE001
+            ok(False, f"AP4 engine_needs: {type(e).__name__}: {e}")
+        ok(globals().get("ENGINE_AUTO") is True, "AP5 the API declares engine: auto support")
+        import json
+        import yaml
+        raw = yaml.safe_load(open(p))
+        raw["engine"] = {"auto": True}
+        yaml.safe_dump(raw, open(p, "w"))
+        json.dump({"engine": {"ref": "toolkit.engines.contract:ToyEngine"}, "why": "w"},
+                  open(os.path.join(d, "engine_choice.json"), "w"))
+        try:
+            st = pipeline_steps(p, d)
+            ok("engine_choice.json" in st[0]["inputs"], f"AP6 the engine choice is an input of the analyze step: {st}")
+        except Exception as e:  # noqa: BLE001
+            ok(False, f"AP6 the engine choice is an input of the analyze step: {type(e).__name__}: {e}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

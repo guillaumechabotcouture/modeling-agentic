@@ -110,7 +110,8 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
         raise PermissionError(f"decision spec is not signed (status: {st}); sign it (toolkit/spec/signoff.py) or pass "
                               "--unsigned for a test run")
     eng = spec.engine()
-    S = Store(run_dir, spec.sha256, st == "signed", _engine_info(eng), spec.settings_sha256)
+    S = Store(run_dir, spec.sha256, st == "signed", _engine_info(eng), spec.settings_sha256,
+              spec.engine_choice_sha256)
     holder["S"] = S
     card = eng.describe()
     arts = {}
@@ -627,6 +628,21 @@ def _self_test_round2(ok, d, q):
        and "calibration_partly_clamped" in u["interval"]["covers"] and "partly clamped" in u["label"],
        f"R30 draws whose calibration clamps are recorded and the interval does not claim full calibration coverage "
        f"(r2 P1-4): {cc} {u['label']}")
+    # engine: auto: the engine comes from the harness's engine_choice.json; its hash certifies every artifact
+    chosen = yaml.safe_load(open(os.path.join(d, "decision_spec.yaml")))["engine"]
+    _resign(d, lambda r: r.update(engine={"auto": True, "candidates": [chosen["ref"]]}))
+    cp = os.path.join(d, schema.ENGINE_CHOICE)
+    json.dump({"engine": chosen, "why": "self-test: the only candidate",
+               "candidates": [{"ref": chosen["ref"], "eligible": True, "why_not": ""}], "cross_check": {}}, open(cp, "w"))
+    run(d, log=q, compute_kw={"max_workers": 2}, draws=2)
+    pt = yaml.safe_load(open(os.path.join(d, "analysis", "point.yaml")))
+    clean = contract.gate_findings(d) == [] and pt["engine_choice_sha256"] == schema.sha256_file(cp)
+    doc = json.load(open(cp))
+    doc["why"] = "edited"
+    json.dump(doc, open(cp, "w"))
+    st = [x for x in contract.gate_findings(d) if x["kind"] == "analysis_contract_stale"]
+    ok(clean and st, f"R32 engine: auto runs on the harness's engine choice, and a changed choice makes the analysis "
+                     f"stale ({len(st)} findings)")
     del math
 
 

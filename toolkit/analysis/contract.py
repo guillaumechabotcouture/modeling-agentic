@@ -31,6 +31,7 @@ from toolkit.analysis.artifacts import (ENVELOPE, EXPECTED_KINDS, EXPECTED_ROLES
                                         PRODUCED_BY, PRODUCER_PREFIX, sha256)
 
 SPEC = "decision_spec.yaml"
+ENGINE_CHOICE = "engine_choice.json"     # toolkit/spec/schema.py ENGINE_CHOICE
 
 
 def _f(kind, claim, key=""):
@@ -77,6 +78,10 @@ def gate_findings(run_dir: str) -> list[dict]:
     if man.get("settings_sha256") != cur_set:
         out.append(_f("analysis_contract_stale", "analysis_settings.yaml changed (or appeared or vanished) after the "
                                                  "analysis ran: re-run the analysis"))
+    cur_ch = sha256(os.path.join(run_dir, ENGINE_CHOICE))
+    if man.get("engine_choice_sha256") != cur_ch:
+        out.append(_f("analysis_contract_stale", f"{ENGINE_CHOICE} changed (or appeared or vanished) after the analysis "
+                                                 "ran: re-run the analysis"))
     if not man.get("spec_signed"):
         out.append(_f("analysis_contract_unsigned", "the analysis ran on an unsigned spec (--unsigned: test runs only)"))
     for rel, ent in sorted((man.get("artifacts") or {}).items()):
@@ -107,6 +112,8 @@ def gate_findings(run_dir: str) -> list[dict]:
             out.append(_f("analysis_contract_schema", f"artifact {rel}: payload lacks {pm}", rel))
         if doc["spec_sha256"] != man.get("spec_sha256"):
             out.append(_f("analysis_contract_stale", f"artifact {rel} was computed for another spec", rel))
+        if doc.get("engine_choice_sha256") != cur_ch:
+            out.append(_f("analysis_contract_stale", f"artifact {rel} was computed for another engine choice", rel))
         for src, h in sorted((doc.get("inputs") or {}).items()):     # Codex P1-10: every recorded input still current
             cur_h = sha256(src if os.path.isabs(src) else os.path.join(run_dir, src))
             if cur_h != h:
@@ -310,6 +317,31 @@ def _self_test() -> int:
             complete_run(d, cal=cal)
             f = [x for x in gate_findings(d) if x["kind"] == "analysis_contract_calibration"]
             ok(f and why in f[0]["claim"], f"K11 calibration gated (Codex P1-8): {why}")
+        # engine choice (engine: auto): its hash is in the manifest and in every artifact header
+        cp = os.path.join(d, "engine_choice.json")
+        json.dump({"engine": {"ref": "x:Y"}, "why": "w"}, open(cp, "w"))
+        try:
+            import inspect
+            from toolkit.analysis import artifacts as AR
+            ok("engine_choice_sha" in inspect.signature(AR.Store.__init__).parameters,
+               "K12a the store takes the engine choice's hash")
+            orig_init = AR.Store.__init__
+
+            def with_choice(self, *a, **k):
+                orig_init(self, *a, engine_choice_sha=sha256(cp), **k)
+            AR.Store.__init__ = with_choice
+            try:
+                complete_run(d)
+            finally:
+                AR.Store.__init__ = orig_init
+            doc = yaml.safe_load(open(os.path.join(d, "analysis", "point.yaml")))
+            clean = gate_findings(d) == [] and doc.get("engine_choice_sha256") == sha256(cp)
+            json.dump({"engine": {"ref": "x:Z"}, "why": "w"}, open(cp, "w"))
+            st = [x for x in gate_findings(d) if x["kind"] == "analysis_contract_stale"]
+            ok(clean and len(st) > len(EXPECTED_KINDS),
+               f"K12 a changed engine choice makes the manifest and every artifact stale ({len(st)} findings)")
+        except Exception as e:  # noqa: BLE001
+            ok(False, f"K12 engine choice hashed in the manifest and artifact headers: {type(e).__name__}: {e}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
