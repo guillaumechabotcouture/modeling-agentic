@@ -47,10 +47,13 @@ How it works (no list of checks or files is kept by hand):
      ("?" after a file name: it does not), never asserted.
 
 Known failures are listed in `tests/gate_fuzz_expected.yaml` as
-`<module>: {<mutation>: [<failure>, ...]}` so CI passes while they are the
-work queue for the fail-closed I/O decision. CI fails on a failure not in
-the list and on a listed entry that no longer fails (remove it). A short
-allowlist (OPTIONAL_INPUTS below) names files a check documents as optional.
+`<module>: {<file>: {<mutation>: [<failure>, ...]}}`, one identity per case,
+so CI passes while they are the work queue for the fail-closed I/O decision.
+CI fails on a failure not in the list, on a listed case that no longer fails
+(remove it), and on a check that got no mutation case at all (coverage: the
+fixture gets its trigger artifacts in `_supplement()`, or the check is listed
+in NOT_FILE_BACKED with a reason). A short table (DELEGATES below) names, per check and file, another validator that
+owns that file's validity; it is run on the same corrupt run.
 
     python3 scripts/gate_fuzz.py              # full sweep, compare with the expected list
     python3 scripts/gate_fuzz.py --report     # print every failure, by module and class
@@ -84,13 +87,25 @@ EXPECTED = os.path.join(ROOT, "tests", "gate_fuzz_expected.yaml")
 FIXTURE_ROUND = 3     # every round-gated check is enforced from round 3
 CASE_TIMEOUT_S = 30
 
-# (module, run-relative file): the module documents the file as optional, so a
-# corrupt copy may be treated as absent. Each entry cites where it says so.
-OPTIONAL_INPUTS: dict[tuple[str, str], str] = {
+# Validation ownership (Codex round 1): (check, run-relative file) -> (owner,
+# why). The owner is "<module>.<function>" taking run_dir and returning a list
+# of findings or a (doc, errors) pair. A corrupt file counts as failing open
+# only when neither the check nor its declared owner, run on the same corrupt
+# run, reports something it did not report on the clean run.
+DELEGATES: dict[tuple[str, str], tuple[str, str]] = {
     ("headline_binding", "models/effect_concordance.yaml"):
-        "docstring item 3: 'when models/effect_concordance.yaml exists'; the file's own "
-        "validity is effect_concordance's finding",
+        ("effect_concordance.gate_findings",
+         "headline_binding docstring item 3: 'when models/effect_concordance.yaml exists'; the file's "
+         "validity is effect_concordance's finding"),
+    ("claim_units", "models/claims_spec.yaml"):
+        ("build_claims_ledger.build",
+         "the claims-ledger validator: validate_critique_yaml._claims_spec_violations builds the ledger "
+         "with build_claims_ledger.build and reports its spec errors as claims_spec_invalid"),
 }
+
+# Checks that are not file-backed, with the reason; any other check that gets
+# no mutation case is a coverage failure.
+NOT_FILE_BACKED: dict[str, str] = {}
 
 STRUCTURED = (".yaml", ".yml", ".json", ".jsonl", ".csv")
 YAML_EXT = (".yaml", ".yml")
@@ -540,7 +555,32 @@ def _case(modname: str, base: str, work: str, rel: str, mutation: str, clean: li
     if not isinstance(res, list):
         return {"status": "not_list", "detail": type(res).__name__}
     new = {_fkey(f) for f in res} - set(clean)
-    return {"status": "returned", "kind": kind, "new": bool(new), "n": len(res)}
+    out = {"status": "returned", "kind": kind, "new": bool(new), "n": len(res)}
+    owner = DELEGATES.get((modname, rel))
+    if not new and owner and mutation not in PROBES:
+        clean_run = os.path.join(work, "clean")
+        shutil.copytree(base, clean_run, symlinks=True)
+        try:
+            before, after = _owner_view(owner[0], clean_run), _owner_view(owner[0], run)
+            out["owner_reported"] = bool(after - before)
+        except Exception as e:  # noqa: BLE001 — an owner that crashes did not report it
+            out["owner_reported"] = False
+            out["owner_error"] = f"{owner[0]} raised {type(e).__name__}"
+        out["owner"] = owner[0]
+    return out
+
+
+def _owner_view(spec: str, run_dir: str) -> set:
+    """What a declared owner reports on run_dir, as comparable strings (run
+    paths replaced, so a clean copy and a corrupt copy compare)."""
+    modname, fn = spec.rsplit(".", 1)
+    r = getattr(importlib.import_module(modname), fn)(run_dir)
+    items = r[1] if isinstance(r, tuple) and len(r) == 2 else r
+    if not isinstance(items, list):
+        raise TypeError(f"{spec} returned {type(items).__name__}")
+    real = os.path.realpath(run_dir)
+    norm = lambda x: str(x).replace(real, "<run>").replace(run_dir, "<run>")  # noqa: E731
+    return {_fkey(x) if isinstance(x, dict) else norm(x) for x in items}
 
 
 def _classify(cases: list[dict]) -> list[dict]:
@@ -564,14 +604,45 @@ def _classify(cases: list[dict]) -> list[dict]:
         elif c["status"] == "returned":
             kind, new = c.pop("kind"), c.pop("new")
             judged = kind == "invalid" or (kind == "value" and key in sensitive)
-            if judged and not new and key not in OPTIONAL_INPUTS:
+            if judged and not new and not c.pop("owner_reported", False):
                 c["status"] = "fails_open"
-                c["detail"] = f"{c.pop('n')} finding(s), none new"
+                c["detail"] = f"{c.pop('n')} finding(s), none new" + (
+                    f"; owner {c['owner']} silent too" if c.get("owner") else "")
             else:
                 c["status"] = "ok"
                 c.pop("n", None)
         out.append(c)
     return out
+
+
+def _supplement(run_dir: str, round_n: int) -> None:
+    """Trigger artifacts for checks whose inputs the positive control lacks
+    (Codex round 1: a file-backed check with no mutation case is not tested).
+    Each is the smallest valid input its producer would write:
+      compute         a results file and its summary (two ok rows), as map_fn writes;
+      decision_brief  decision_brief.yaml (decision_brief.example_brief) signed with
+                      decision_brief.sign, so the sign-off, frozen copies and lock exist;
+      pipeline        models/pipeline.yaml with one shell step;
+      stall_rule      validator_history.jsonl with the earlier rounds' gate records."""
+    import decision_brief as db
+    w = lambda rel, txt: (os.makedirs(os.path.dirname(os.path.join(run_dir, rel)) or run_dir,  # noqa: E731
+                                      exist_ok=True), open(os.path.join(run_dir, rel), "w").write(txt))
+    rows = [{"key": f"k{i}", "ok": True, "params": {"i": i}, "value": float(i)} for i in range(2)]
+    w("models/fuzz_results.jsonl", "".join(json.dumps(r) + "\n" for r in rows))
+    w("models/fuzz_results.jsonl.summary.json", json.dumps(
+        {"fn": "models/model.py::outcome_fn", "n": 2, "n_ok": 2, "n_failed": 0, "task_core_s": 1.0,
+         "wall_s": 1.0, "backend": "local", "workers": 1}))
+    if not os.path.exists(os.path.join(run_dir, db.BRIEF)):
+        w(db.BRIEF, yaml.safe_dump(db.example_brief(), sort_keys=False))
+    if not db.is_signed(run_dir):
+        db.sign(run_dir, "gate_fuzz", accept_proposed=True)
+    w("models/pipeline.yaml", yaml.safe_dump({"steps": [
+        {"id": "allocate", "run": "python3 models/model.py", "inputs": ["models/model.py"],
+         "outputs": ["models/fuzz_pipeline_out.txt"]}]}, sort_keys=False))
+    w("validator_history.jsonl", "".join(
+        json.dumps({"round": r, "post_write": False, "at": f"2026-01-0{r}T00:00:00+00:00",
+                    "findings": [{"kind": "plan_minimum_bar_failed", "severity": "MEDIUM", "stage": "PLAN_CRITERIA",
+                                  "key": "MB-001"}]}) + "\n" for r in range(1, max(2, round_n))))
 
 
 def sweep(scripts_dir: str = HERE, modules=None, base: str | None = None, round_n: int = FIXTURE_ROUND,
@@ -592,6 +663,7 @@ def sweep(scripts_dir: str = HERE, modules=None, base: str | None = None, round_
                 sys.stdout = dn
                 try:
                     pc.build(base, round_n=round_n)
+                    _supplement(base, round_n)
                 finally:
                     sys.stdout = old
             shutil.rmtree(os.path.join(base, "models", "__pycache__"), ignore_errors=True)
@@ -687,15 +759,53 @@ FAILS = ("raises", "not_list", "fails_open", "timeout", "harness_error")
 
 
 def failures(res: dict) -> dict:
-    """{module: {mutation: sorted failure statuses}} from a sweep."""
+    """{module: {file: {mutation: sorted failure statuses}}} from a sweep: one
+    identity per case (Codex round 1), so a new failure in another file of a
+    listed module and mutation, or a fix to one listed case, both show. A
+    clean run that crashed is file "-", mutation "clean_run"."""
     out: dict = {}
     for c in res["cases"]:
         if c["status"] in FAILS:
-            out.setdefault(c["module"], {}).setdefault(c["mutation"], set()).add(c["status"])
+            out.setdefault(c["module"], {}).setdefault(c["file"], {}).setdefault(c["mutation"], set()).add(c["status"])
     for m, d in res["modules"].items():
         if d.get("error") or d.get("status"):
-            out.setdefault(m, {}).setdefault("clean_run", set()).add("raises")
-    return {m: {mu: sorted(s) for mu, s in sorted(d.items())} for m, d in sorted(out.items())}
+            out.setdefault(m, {}).setdefault("-", {}).setdefault("clean_run", set()).add("raises")
+    return {m: {f: {mu: sorted(s) for mu, s in sorted(fd.items())} for f, fd in sorted(d.items())}
+            for m, d in sorted(out.items())}
+
+
+def expected_cases(doc: dict) -> set:
+    """{(module, file, mutation, status)} from a failures()/expected mapping."""
+    return {(m, f, mu, s) for m, d in (doc or {}).items() for f, fd in (d or {}).items()
+            for mu, sts in (fd or {}).items() for s in sts}
+
+
+def to_expected(cases) -> dict:
+    out: dict = {}
+    for m, f, mu, s in cases:
+        out.setdefault(m, {}).setdefault(f, {}).setdefault(mu, []).append(s)
+    return {m: {f: {mu: sorted(v) for mu, v in sorted(fd.items())} for f, fd in sorted(d.items())}
+            for m, d in sorted(out.items())}
+
+
+def by_mutation(found: dict, module: str) -> dict:
+    """{mutation: statuses} over every file of one module (self-test helper)."""
+    out: dict = {}
+    for fd in (found.get(module) or {}).values():
+        for mu, sts in fd.items():
+            out.setdefault(mu, set()).update(sts)
+    return {mu: sorted(v) for mu, v in out.items()}
+
+
+def coverage_failures(res: dict, not_file_backed: dict | None = None) -> dict:
+    """{module: reason}: checks that got no mutation case (they read no file of
+    the fixture) and are not listed in NOT_FILE_BACKED with a reason."""
+    nfb = NOT_FILE_BACKED if not_file_backed is None else not_file_backed
+    with_cases = {c["module"] for c in res["cases"] if c["mutation"] not in PROBES}
+    return {m: "read no file of the fixture, so no mutation case ran; add its trigger artifacts to "
+               "_supplement() or list it in NOT_FILE_BACKED with a reason"
+            for m, d in sorted(res["modules"].items())
+            if m not in with_cases and not (d.get("error") or d.get("status")) and m not in nfb}
 
 
 def load_expected(path: str = EXPECTED) -> dict:
@@ -705,25 +815,19 @@ def load_expected(path: str = EXPECTED) -> dict:
         raise ValueError(f"{path}: needs a mapping 'expected_failures'")
     exp = doc["expected_failures"]
     for m, d in exp.items():
-        if not isinstance(d, dict) or not all(isinstance(v, list) for v in d.values()):
-            raise ValueError(f"{path}: expected_failures.{m} must map mutation -> [failure, ...]")
+        ok = isinstance(d, dict) and all(
+            isinstance(fd, dict) and all(isinstance(v, list) and all(isinstance(x, str) for x in v)
+                                         for v in fd.values()) for fd in d.values())
+        if not ok:
+            raise ValueError(f"{path}: expected_failures.{m} must map file -> mutation -> [failure, ...]")
     return exp
 
 
 def compare(found: dict, expected: dict) -> tuple[list[str], list[str]]:
-    """(new failures, stale expected entries)."""
-    new, stale = [], []
-    for m, d in found.items():
-        for mu, sts in d.items():
-            for s in sts:
-                if s not in (expected.get(m) or {}).get(mu, []):
-                    new.append(f"{m}: {mu}: {s}")
-    for m, d in expected.items():
-        for mu, sts in (d or {}).items():
-            for s in sts:
-                if s not in (found.get(m) or {}).get(mu, []):
-                    stale.append(f"{m}: {mu}: {s}")
-    return new, stale
+    """(new failures, stale expected entries), case by case."""
+    f, e = expected_cases(found), expected_cases(expected)
+    fmt = lambda c: ": ".join(c)  # noqa: E731
+    return sorted(map(fmt, f - e)), sorted(map(fmt, e - f))
 
 
 def report(res: dict) -> str:
@@ -804,6 +908,21 @@ def gate_findings(run_dir):
         return [{"kind": "a_invalid", "severity": "HIGH"}]
     return []
 ''',
+    "gf_nofile": '''
+def gate_findings(run_dir):
+    return []
+''',
+    # the silent-except pattern over two files: failures must be told apart by file
+    "gf_two": '''
+import os, yaml
+def gate_findings(run_dir):
+    for n in ("a.yaml", "b.yaml"):
+        try:
+            yaml.safe_load(open(os.path.join(run_dir, n)))
+        except Exception:
+            return []
+    return []
+''',
     "gf_round": '''
 def gate_findings(run_dir, round_n=None):
     return [] if round_n == 3 else [{"kind": "wrong_round"}]
@@ -838,14 +957,18 @@ def _self_test() -> int:
         os.makedirs(base)
         with open(os.path.join(base, "a.yaml"), "w") as f:
             f.write("n: 3\nitems:\n  - 1\n  - 2\n")
+        with open(os.path.join(base, "b.yaml"), "w") as f:
+            f.write("n: 3\nitems:\n  - 1\n  - 2\n")
         mods = discover(sd)
-        ok(mods == ["gf_closed", "gf_keys", "gf_notlist", "gf_open", "gf_round"],
+        ok(mods == ["gf_closed", "gf_keys", "gf_nofile", "gf_notlist", "gf_open", "gf_round", "gf_two"],
            f"GF1 discovery finds gate_findings(run_dir, ...) only, not gate_findings(result) ({mods})")
+        not_file_backed = {"gf_round": "self-test: reads no file by design",
+                           "gf_nofile": "self-test: listed, so not a coverage failure"}
         res = sweep(sd, mods, base=base, workers=4, log=lambda *_: None)
         ok(res["modules"]["gf_closed"]["reads"] == ["a.yaml"], "GF2 the clean run records the file a check reads")
         found = failures(res)
         ok("gf_closed" not in found, f"GF3 a fail-closed check passes every mutation ({found.get('gf_closed')})")
-        fo = found.get("gf_open", {})
+        fo = by_mutation(found, "gf_open")
         want_open = {"corrupt": ["fails_open"], "truncated": ["fails_open"], "symlink_escape": ["fails_open"],
                      "inf": ["fails_open"]}
         want_raise = {m: ["raises"] for m in ("empty", "undecodable", "wrong_type", "big_int_str",
@@ -857,23 +980,39 @@ def _self_test() -> int:
         ok("nan" not in fo, "GF6 NaN that fails `> 0` yields a new finding, so it is not fails_open")
         ok("gf_round" not in found and res["modules"]["gf_round"]["findings"] == [],
            "GF7 round_n is passed as the fixture round when the check takes it")
-        ok("not_list" in found.get("gf_notlist", {}).get("empty", []), "GF8 a non-list return is reported")
+        ok("not_list" in by_mutation(found, "gf_notlist").get("empty", []), "GF8 a non-list return is reported")
         ok("gf_keys" not in found, f"GF8b a check that reads keys, not values, is not held to NaN/inf ({found.get('gf_keys')})")
-        OPTIONAL_INPUTS[("gf_open", "a.yaml")] = "self-test"
+        # Codex round 1, P1-3: a declared owner validates the file; fail-open only if neither reports it.
+        DELEGATES[("gf_open", "a.yaml")] = ("gf_closed.gate_findings", "self-test")
         try:
-            fo2 = failures(sweep(sd, ["gf_open"], base=base, workers=4)).get("gf_open", {})
+            fo2 = by_mutation(failures(sweep(sd, ["gf_open"], base=base, workers=4)), "gf_open")
         finally:
-            del OPTIONAL_INPUTS[("gf_open", "a.yaml")]
+            del DELEGATES[("gf_open", "a.yaml")]
         ok(not any("fails_open" in v for v in fo2.values()) and "raises" in fo2.get("wrong_type", []),
-           "GF8c an allowlisted optional file is not held to fails_open, still to raises")
-        new, stale = compare(found, {"gf_open": fo, "gf_notlist": found.get("gf_notlist", {}),
-                                     "gf_gone": {"empty": ["raises"]}})
-        ok(new == [] and stale == ["gf_gone: empty: raises"], f"GF9 expected list: listed passes, stale reported ({new}, {stale})")
+           f"GF8c a file whose declared owner reports it is not fails_open; raises still count ({fo2})")
+        DELEGATES[("gf_open", "a.yaml")] = ("gf_round.gate_findings", "self-test: an owner that never reports")
+        try:
+            fo3 = by_mutation(failures(sweep(sd, ["gf_open"], base=base, workers=4)), "gf_open")
+        finally:
+            del DELEGATES[("gf_open", "a.yaml")]
+        ok(fo3.get("corrupt") == ["fails_open"], "GF8d an owner that also stays silent leaves the case fails_open")
+        # Codex round 1, P1-1: identities are module + file + mutation + status, case by case.
+        cases = expected_cases(found)
+        ok(("gf_two", "a.yaml", "corrupt", "fails_open") in cases and ("gf_two", "b.yaml", "corrupt", "fails_open") in cases,
+           "GF9 each failing case is identified by its file")
+        only_a = {c for c in cases if not (c[0] == "gf_two" and c[1] == "b.yaml")}
+        new, stale = compare(found, to_expected(only_a | {("gf_gone", "x.yaml", "empty", "raises")}))
+        ok(any(x.startswith("gf_two: b.yaml: corrupt") for x in new) and stale == ["gf_gone: x.yaml: empty: raises"],
+           f"GF10 a new failure in another file of a listed module+mutation is new; a fixed case is stale ({new[:3]}, {stale})")
         new2, _ = compare(found, {})
-        ok(len(new2) >= 5, "GF10 an unlisted failure is new")
+        ok(len(new2) >= 5, "GF10b an unlisted failure is new")
         p = os.path.join(td, "exp.yaml")
         write_expected(found, p)
         ok(load_expected(p) == found, "GF11 the expected list round-trips")
+        # Codex round 1, P1-2: a check that read no file got no case: a coverage failure unless listed.
+        cov = coverage_failures(res, {})
+        ok(sorted(cov) == ["gf_nofile", "gf_round"], f"GF11b a check with zero mutation cases is a coverage failure ({cov})")
+        ok(coverage_failures(res, not_file_backed) == {}, "GF11c unless listed as not file-backed, with a reason")
     # Mutation helpers keep layout and stay format-specific.
     t, n = _yaml_numbers("a: 1\nb: [2, x3]\nc: '4'\nd: 1.5e+3\n", ".nan")
     ok(t == "a: .nan\nb: [.nan, x3]\nc: '4'\nd: .nan\n" and n == 3, f"GF12 YAML numbers found by the parser ({t!r})")
@@ -913,7 +1052,9 @@ def main(argv=None) -> int:
     if a.write_expected:
         write_expected(found)
         print(f"Wrote {EXPECTED}")
-        return 0
+        for m, why in coverage_failures(res).items():
+            print(f"NO COVERAGE: {m}: {why}")
+        return 1 if coverage_failures(res) else 0
     try:
         expected = load_expected()
     except (OSError, ValueError, yaml.YAMLError) as e:
@@ -922,13 +1063,16 @@ def main(argv=None) -> int:
     if a.module:
         expected = {m: d for m, d in expected.items() if m in a.module}
     new, stale = compare(found, expected)
+    cov = coverage_failures(res)
     print(f"gate_fuzz: {len(res['modules'])} checks, {len(res['cases'])} cases in {res.get('seconds')} s; "
-          f"{sum(len(s) for d in found.values() for s in d.values())} known failure entries")
+          f"{len(expected_cases(found))} failing cases, all listed: {not new}")
     for x in new:
         print(f"NEW FAILURE: {x}")
     for x in stale:
         print(f"FIXED (remove from {os.path.relpath(EXPECTED, ROOT)}): {x}")
-    if new or stale:
+    for m, why in cov.items():
+        print(f"NO COVERAGE: {m}: {why}")
+    if new or stale or cov:
         return 1
     print("OK: no failures beyond the expected list.")
     return 0

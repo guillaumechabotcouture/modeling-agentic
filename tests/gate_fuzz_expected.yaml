@@ -3,103 +3,320 @@
 # that no longer fails. Regenerate with: python3 scripts/gate_fuzz.py --write-expected
 expected_failures:
   alloc_toolkit_use:
-    symlink_escape: [fails_open]
-    undecodable: [fails_open]
+    models/model.py:
+      symlink_escape: [fails_open]
+      undecodable: [fails_open]
+    models/outcome_fn.py:
+      symlink_escape: [fails_open]
+      undecodable: [fails_open]
+    models/pipeline.yaml:
+      alias_loop: [fails_open]
+      bad_date: [raises]
+      corrupt: [fails_open]
+      empty: [fails_open]
+      symlink_escape: [fails_open]
+      truncated: [fails_open]
+      undecodable: [raises]
+      wrong_type: [fails_open]
   benchmark_gate:
-    symlink_escape: [fails_open]
+    models/benchmark_targets.yaml:
+      symlink_escape: [fails_open]
   benchmark_transfer:
-    alias_loop: [fails_open]
-    bad_date: [raises]
-    big_int_str: [raises]
-    symlink_escape: [fails_open]
-    undecodable: [fails_open]
+    models/benchmark_targets.yaml:
+      alias_loop: [fails_open]
+      bad_date: [raises]
+      big_int_str: [raises]
+      symlink_escape: [fails_open]
+    models/model.py:
+      symlink_escape: [fails_open]
+      undecodable: [fails_open]
+    models/outcome_fn.py:
+      symlink_escape: [fails_open]
+      undecodable: [fails_open]
   calibration_spec:
-    bad_date: [raises]
-    big_int_float: [raises]
-    big_int_str: [raises]
-    inf: [fails_open]
-    nan: [fails_open]
-    symlink_escape: [fails_open]
+    models/calibration_result.yaml:
+      bad_date: [raises]
+      big_int_str: [raises]
+      symlink_escape: [fails_open]
+    models/calibration_spec.yaml:
+      bad_date: [raises]
+      big_int_float: [raises]
+      big_int_str: [raises]
+      symlink_escape: [fails_open]
+    models/identifiability.yaml:
+      bad_date: [raises]
+      big_int_float: [raises]
+      big_int_str: [raises]
+      inf: [fails_open]
+      nan: [fails_open]
+      symlink_escape: [fails_open]
   claim_units:
-    alias_loop: [fails_open]
-    bad_date: [fails_open, raises]
-    big_int_str: [fails_open]
-    corrupt: [fails_open]
-    empty: [fails_open]
-    symlink_escape: [fails_open]
-    truncated: [fails_open]
-    undecodable: [fails_open, raises]
-    wrong_type: [fails_open]
+    models/allocation.csv:
+      empty: [fails_open]
+      symlink_escape: [fails_open]
+      truncated: [fails_open]
+      undecodable: [fails_open]
+    models/claims_spec.yaml:
+      bad_date: [raises]
+      symlink_escape: [fails_open]
+      undecodable: [raises]
+    models/model_outputs.yaml:
+      alias_loop: [fails_open]
+      bad_date: [fails_open]
+      big_int_str: [fails_open]
+      corrupt: [fails_open]
+      empty: [fails_open]
+      symlink_escape: [fails_open]
+      truncated: [fails_open]
+      undecodable: [fails_open]
+      wrong_type: [fails_open]
+    models/sensitivity_analysis.yaml:
+      alias_loop: [fails_open]
+      bad_date: [fails_open]
+      big_int_str: [fails_open]
+      corrupt: [fails_open]
+      empty: [fails_open]
+      symlink_escape: [fails_open]
+      truncated: [fails_open]
+      undecodable: [fails_open]
+      wrong_type: [fails_open]
+    report.md:
+      symlink_escape: [fails_open]
+      undecodable: [fails_open]
+    uncertainty_report.yaml:
+      alias_loop: [fails_open]
+      bad_date: [fails_open]
+      big_int_str: [fails_open]
+      corrupt: [fails_open]
+      empty: [fails_open]
+      symlink_escape: [fails_open]
+      truncated: [fails_open]
+      undecodable: [fails_open]
+      wrong_type: [fails_open]
   comparator_efficiency:
-    symlink_escape: [fails_open]
-    undecodable: [fails_open]
+    report.md:
+      symlink_escape: [fails_open]
+      undecodable: [fails_open]
+  compute:
+    models/fuzz_results.jsonl:
+      symlink_escape: [fails_open]
+      wrong_type: [raises]
+    models/fuzz_results.jsonl.summary.json:
+      big_int_str: [fails_open]
+      corrupt: [fails_open]
+      empty: [fails_open]
+      inf: [raises]
+      nan: [raises]
+      symlink_escape: [fails_open]
+      truncated: [fails_open]
+      undecodable: [fails_open]
+      wrong_type: [fails_open]
   data_use:
-    alias_loop: [fails_open, raises]
-    bad_date: [fails_open, raises]
-    corrupt: [fails_open]
-    empty: [fails_open]
-    symlink_escape: [fails_open]
-    truncated: [fails_open]
-    undecodable: [fails_open, raises]
-    wrong_type: [fails_open]
+    data/districts.csv:
+      symlink_escape: [fails_open]
+      truncated: [fails_open]
+    metadata.json:
+      corrupt: [fails_open]
+      empty: [fails_open]
+      symlink_escape: [fails_open]
+      truncated: [fails_open]
+      undecodable: [fails_open]
+      wrong_type: [fails_open]
+    models/mechanism_manifest.yaml:
+      alias_loop: [fails_open]
+      bad_date: [fails_open]
+      corrupt: [fails_open]
+      empty: [fails_open]
+      symlink_escape: [fails_open]
+      truncated: [fails_open]
+      undecodable: [fails_open]
+      wrong_type: [fails_open]
+    models/model.py:
+      symlink_escape: [fails_open]
+    models/outcome_fn.py:
+      symlink_escape: [fails_open]
+      undecodable: [fails_open]
+    pre_mortem.yaml:
+      alias_loop: [raises]
+      bad_date: [raises]
+      corrupt: [fails_open]
+      empty: [fails_open]
+      symlink_escape: [fails_open]
+      truncated: [fails_open]
+      undecodable: [raises]
+      wrong_type: [fails_open]
+  decision_brief:
+    decision_brief.signoff.json:
+      symlink_escape: [fails_open]
+    decision_brief.yaml:
+      symlink_escape: [fails_open]
+    models/benchmark_targets.yaml:
+      alias_loop: [fails_open]
+      bad_date: [fails_open]
+      big_int_str: [fails_open]
+      corrupt: [fails_open]
+      empty: [fails_open]
+      symlink_escape: [fails_open]
+      truncated: [fails_open]
+      undecodable: [fails_open]
+      wrong_type: [fails_open]
+    success_criteria.yaml:
+      symlink_escape: [fails_open]
   effect_concordance:
-    bad_date: [raises]
-    big_int_float: [raises]
-    big_int_str: [raises]
-    corrupt: [fails_open]
-    empty: [fails_open]
-    symlink_escape: [fails_open]
-    truncated: [fails_open]
-    undecodable: [raises]
-    wrong_type: [fails_open]
+    citations.md:
+      big_int_float: [raises]
+      symlink_escape: [fails_open]
+    decision_brief.yaml:
+      bad_date: [raises]
+      big_int_str: [raises]
+      corrupt: [fails_open]
+      empty: [fails_open]
+      symlink_escape: [fails_open]
+      truncated: [fails_open]
+      undecodable: [raises]
+      wrong_type: [fails_open]
+    models/allocation.csv:
+      symlink_escape: [fails_open]
+    models/claims_ledger.yaml:
+      bad_date: [raises]
+      big_int_float: [raises]
+      big_int_str: [raises]
+      symlink_escape: [fails_open]
+      undecodable: [raises]
+    models/effect_concordance.yaml:
+      bad_date: [raises]
+      big_int_float: [raises]
+      big_int_str: [raises]
+      symlink_escape: [fails_open]
+      undecodable: [raises]
+    models/eligibility_manifest.yaml:
+      bad_date: [raises]
+      big_int_str: [raises]
+      corrupt: [fails_open]
+      empty: [fails_open]
+      symlink_escape: [fails_open]
+      truncated: [fails_open]
+      undecodable: [raises]
+      wrong_type: [fails_open]
+    models/units.csv:
+      symlink_escape: [fails_open]
   effort_floors_gate:
-    big_int_float: [fails_open]
-    symlink_escape: [fails_open]
-    undecodable: [fails_open]
+    models/calibration_result.yaml:
+      big_int_float: [fails_open]
+      symlink_escape: [fails_open]
+    models/model.py:
+      symlink_escape: [fails_open]
+      undecodable: [fails_open]
+    models/outcome_fn.py:
+      symlink_escape: [fails_open]
+      undecodable: [fails_open]
+    models/sensitivity_analysis.yaml:
+      symlink_escape: [fails_open]
+    uncertainty_report.yaml:
+      big_int_float: [fails_open]
+      symlink_escape: [fails_open]
   headline_binding:
-    bad_date: [raises]
-    big_int_float: [raises]
-    big_int_str: [raises]
-    symlink_escape: [fails_open]
-    undecodable: [raises]
+    citations.md:
+      big_int_float: [raises]
+      symlink_escape: [fails_open]
+    data/districts.csv:
+      symlink_escape: [fails_open]
+    models/allocation.csv:
+      symlink_escape: [fails_open]
+    models/claims_ledger.yaml:
+      bad_date: [raises]
+      big_int_float: [raises]
+      big_int_str: [raises]
+      symlink_escape: [fails_open]
+      undecodable: [raises]
+    models/effect_concordance.yaml:
+      bad_date: [raises]
+      big_int_str: [raises]
+      symlink_escape: [fails_open]
+      undecodable: [raises]
+    models/headline_binding.yaml:
+      bad_date: [raises]
+      symlink_escape: [fails_open]
+      undecodable: [raises]
+    uncertainty_report.yaml:
+      bad_date: [raises]
+      big_int_str: [raises]
+      symlink_escape: [fails_open]
+      undecodable: [raises]
   identifiability_gate:
-    bad_date: [raises]
-    big_int_str: [raises]
-    inf: [raises]
-    symlink_escape: [fails_open]
-    undecodable: [raises]
-    wrong_type: [raises]
+    models/identifiability_a_priori.yaml:
+      bad_date: [raises]
+      big_int_str: [raises]
+      inf: [raises]
+      symlink_escape: [fails_open]
+      undecodable: [raises]
+      wrong_type: [raises]
   mechanism_manifest:
-    alias_loop: [raises]
-    bad_date: [raises]
-    big_int_float: [raises]
-    corrupt: [fails_open]
-    empty: [fails_open]
-    symlink_escape: [fails_open]
-    truncated: [fails_open]
-    undecodable: [fails_open, raises]
-    wrong_type: [fails_open]
+    metadata.json:
+      symlink_escape: [fails_open]
+    models/mechanism_manifest.yaml:
+      symlink_escape: [fails_open]
+    models/sufficiency_age_profile.yaml:
+      big_int_float: [raises]
+    pre_mortem.yaml:
+      alias_loop: [raises]
+      bad_date: [raises]
+      corrupt: [fails_open]
+      empty: [fails_open]
+      symlink_escape: [fails_open]
+      truncated: [fails_open]
+      undecodable: [raises]
+      wrong_type: [fails_open]
+    report.md:
+      symlink_escape: [fails_open]
+      undecodable: [fails_open]
+  pipeline:
+    models/pipeline.yaml:
+      bad_date: [raises]
+      symlink_escape: [fails_open]
+      undecodable: [raises]
   sanity_gate:
-    bad_date: [raises]
-    big_int_float: [fails_open, raises]
-    big_int_str: [fails_open, raises]
-    empty: [fails_open]
-    inf: [fails_open, raises]
-    nan: [fails_open]
-    symlink_escape: [fails_open]
-    undecodable: [raises]
+    models/allocation.csv:
+      big_int_float: [fails_open]
+      big_int_str: [fails_open]
+      inf: [fails_open]
+      nan: [fails_open]
+      symlink_escape: [fails_open]
+    models/sanity_schema.yaml:
+      bad_date: [raises]
+      big_int_float: [raises]
+      big_int_str: [raises]
+      empty: [fails_open]
+      inf: [raises]
+      symlink_escape: [fails_open]
+      undecodable: [raises]
+  stall_rule:
+    validator_history.jsonl:
+      empty: [fails_open]
+      symlink_escape: [fails_open]
   uq_ci_quality:
-    bad_date: [raises]
-    big_int_float: [raises]
-    big_int_str: [raises]
-    symlink_escape: [fails_open]
+    uncertainty_report.yaml:
+      bad_date: [raises]
+      big_int_float: [raises]
+      big_int_str: [raises]
+      symlink_escape: [fails_open]
   verdict_binding:
-    alias_loop: [fails_open]
-    bad_date: [fails_open]
-    big_int_str: [fails_open]
-    corrupt: [fails_open]
-    empty: [fails_open]
-    symlink_escape: [fails_open]
-    truncated: [fails_open]
-    undecodable: [fails_open]
-    wrong_type: [fails_open]
+    models/benchmark_targets.yaml:
+      alias_loop: [fails_open]
+      bad_date: [fails_open]
+      big_int_str: [fails_open]
+      corrupt: [fails_open]
+      empty: [fails_open]
+      truncated: [fails_open]
+      undecodable: [fails_open]
+      wrong_type: [fails_open]
+    models/model_outputs.yaml:
+      alias_loop: [fails_open]
+      bad_date: [fails_open]
+      big_int_str: [fails_open]
+      corrupt: [fails_open]
+      empty: [fails_open]
+      symlink_escape: [fails_open]
+      truncated: [fails_open]
+      undecodable: [fails_open]
+      wrong_type: [fails_open]
