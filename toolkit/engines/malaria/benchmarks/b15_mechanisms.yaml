@@ -1,0 +1,342 @@
+fitted_used:
+  cfp_kill: 0.425
+  irs_kill: 0.421563
+seeds:
+- 11
+- 12
+- 13
+- 14
+- 15
+- 16
+- 17
+- 18
+field_configs:
+- config: hut-like nets (no attrition, full use given access, no holes)
+  overrides:
+    net_retention_half: 1000000000.0
+    use_rate: 1.0
+    net_holes: 0.0
+  B7:
+    computed: 0.4654
+    seed_min: 0.4308
+    seed_max: 0.4815
+    in_band: false
+  B8:
+    computed: 0.2736
+    seed_min: 0.2613
+    seed_max: 0.2884
+    in_band: false
+  B9:
+    computed: 0.4092
+    seed_min: 0.3542
+    seed_max: 0.4616
+    in_band: true
+  B15:
+    computed: 1.3969
+    seed_min: 1.1976
+    seed_max: 1.5867
+    in_band: true
+    arm_or:
+      a11: 0.2504
+      a10: 0.4092
+      a01: 0.438
+- config: + attrition alone (median retention 1.64 y)
+  overrides:
+    net_retention_half: 598.5999999999999
+    use_rate: 1.0
+    net_holes: 0.0
+  B7:
+    computed: 0.6049
+    seed_min: 0.5843
+    seed_max: 0.637
+    in_band: false
+  B8:
+    computed: 0.4871
+    seed_min: 0.476
+    seed_max: 0.512
+    in_band: true
+  B9:
+    computed: 0.3916
+    seed_min: 0.3506
+    seed_max: 0.4214
+    in_band: true
+  B15:
+    computed: 1.4014
+    seed_min: 1.3226
+    seed_max: 1.566
+    in_band: true
+    arm_or:
+      a11: 0.2499
+      a10: 0.3916
+      a01: 0.4553
+- config: + use below access alone (use rate 0.871, half persistent)
+  overrides:
+    net_retention_half: 1000000000.0
+    use_rate: 0.871
+    net_holes: 0.0
+  B7:
+    computed: 0.4431
+    seed_min: 0.4292
+    seed_max: 0.4697
+    in_band: false
+  B8:
+    computed: 0.2524
+    seed_min: 0.2318
+    seed_max: 0.2729
+    in_band: false
+  B9:
+    computed: 0.3775
+    seed_min: 0.3413
+    seed_max: 0.4105
+    in_band: true
+  B15:
+    computed: 1.519
+    seed_min: 1.3418
+    seed_max: 1.7325
+    in_band: true
+    arm_or:
+      a11: 0.2508
+      a10: 0.3775
+      a01: 0.4373
+- config: + holes alone (Briet 2020)
+  overrides:
+    net_retention_half: 1000000000.0
+    use_rate: 1.0
+    net_holes: 1.0
+  B7:
+    computed: 0.4564
+    seed_min: 0.3908
+    seed_max: 0.4963
+    in_band: false
+  B8:
+    computed: 0.264
+    seed_min: 0.2355
+    seed_max: 0.2882
+    in_band: false
+  B9:
+    computed: 0.405
+    seed_min: 0.3834
+    seed_max: 0.4381
+    in_band: true
+  B15:
+    computed: 1.4404
+    seed_min: 1.3338
+    seed_max: 1.5521
+    in_band: true
+    arm_or:
+      a11: 0.257
+      a10: 0.405
+      a01: 0.4405
+- config: all field mechanisms (engine defaults)
+  overrides: {}
+  B7:
+    computed: 0.5953
+    seed_min: 0.5799
+    seed_max: 0.6248
+    in_band: false
+  B8:
+    computed: 0.4623
+    seed_min: 0.4359
+    seed_max: 0.5047
+    in_band: true
+  B9:
+    computed: 0.3596
+    seed_min: 0.3417
+    seed_max: 0.406
+    in_band: true
+  B15:
+    computed: 1.4765
+    seed_min: 1.3581
+    seed_max: 1.5301
+    in_band: true
+    arm_or:
+      a11: 0.2396
+      a10: 0.3596
+      a01: 0.4513
+trial:
+  or_pbo_alone: 0.37
+  or_irs_alone: 0.33
+  or_both: 0.29
+  interaction_or: 2.43
+  interaction_ci:
+  - 1.19
+  - 4.97
+  prevalence:
+    a00: 0.55
+    a10: 0.31
+    a01: 0.29
+    a11: 0.26
+  source: Protopopoff 2018 Lancet, Table 2 (9 months)
+configs:
+- config: hut coefficients only (no household, no diversion, short IRS)
+  overrides:
+    hh_net_corr: 0.0
+    cov_corr: 0.0
+    exp_corr: 0.0
+    irs_divert: 0.0
+  irs_product: short
+  m0: 121.615
+  interaction_or: 1.17
+  seed_min: 1.0025
+  seed_max: 1.3714
+  or_pbo_alone: 0.3584
+  or_irs_alone: 0.6795
+  or_both: 0.2848
+  prevalence:
+    a00: 0.554
+    a10: 0.3082
+    a01: 0.4578
+    a11: 0.2614
+  single_arms_in_trial_ci: false
+- config: + IRS long-lasting product decay (alone)
+  overrides:
+    hh_net_corr: 0.0
+    cov_corr: 0.0
+    exp_corr: 0.0
+    irs_divert: 0.0
+  irs_product: pm_cs
+  m0: 121.615
+  interaction_or: 1.515
+  seed_min: 1.4021
+  seed_max: 1.6347
+  or_pbo_alone: 0.3584
+  or_irs_alone: 0.4049
+  or_both: 0.2199
+  prevalence:
+    a00: 0.554
+    a10: 0.3082
+    a01: 0.3348
+    a11: 0.2147
+  single_arms_in_trial_ci: true
+- config: + IRS diversion to outdoor biting 0.5 (alone)
+  overrides:
+    hh_net_corr: 0.0
+    cov_corr: 0.0
+    exp_corr: 0.0
+    irs_divert: 0.5
+  irs_product: short
+  m0: 121.615
+  interaction_or: 1.192
+  seed_min: 1.0591
+  seed_max: 1.3247
+  or_pbo_alone: 0.3584
+  or_irs_alone: 0.7057
+  or_both: 0.3015
+  prevalence:
+    a00: 0.554
+    a10: 0.3082
+    a01: 0.4672
+    a11: 0.2726
+  single_arms_in_trial_ci: false
+- config: + household net-use clustering 0.5 and net x IRS correlation 0.3 (alone)
+  overrides:
+    hh_net_corr: 0.5
+    cov_corr: 0.3
+    exp_corr: 0.0
+    irs_divert: 0.0
+  irs_product: short
+  m0: 121.615
+  interaction_or: 1.141
+  seed_min: 1.0531
+  seed_max: 1.268
+  or_pbo_alone: 0.3584
+  or_irs_alone: 0.6929
+  or_both: 0.2832
+  prevalence:
+    a00: 0.554
+    a10: 0.3082
+    a01: 0.4626
+    a11: 0.2603
+  single_arms_in_trial_ci: false
+- config: + exposure correlated with net non-use 0.2 (alone)
+  overrides:
+    hh_net_corr: 0.0
+    cov_corr: 0.0
+    exp_corr: 0.2
+    irs_divert: 0.0
+  irs_product: short
+  m0: 122.656
+  interaction_or: 1.188
+  seed_min: 1.0392
+  seed_max: 1.3688
+  or_pbo_alone: 0.353
+  or_irs_alone: 0.6653
+  or_both: 0.279
+  prevalence:
+    a00: 0.5557
+    a10: 0.3064
+    a01: 0.4542
+    a11: 0.259
+  single_arms_in_trial_ci: false
+- config: all together (engine defaults)
+  overrides: {}
+  irs_product: pm_cs
+  m0: 127.556
+  interaction_or: 1.476
+  seed_min: 1.3581
+  seed_max: 1.5301
+  or_pbo_alone: 0.3596
+  or_irs_alone: 0.4513
+  or_both: 0.2396
+  prevalence:
+    a00: 0.564
+    a10: 0.3175
+    a01: 0.3686
+    a11: 0.2366
+  single_arms_in_trial_ci: true
+- config: all together, high correlations (0.9, 0.9, 0.6)
+  overrides:
+    hh_net_corr: 0.9
+    cov_corr: 0.9
+    exp_corr: 0.6
+  irs_product: pm_cs
+  m0: 119.382
+  interaction_or: 1.39
+  seed_min: 1.2079
+  seed_max: 1.5718
+  or_pbo_alone: 0.3623
+  or_irs_alone: 0.5105
+  or_both: 0.2571
+  prevalence:
+    a00: 0.5519
+    a10: 0.3087
+    a01: 0.3861
+    a11: 0.2406
+  single_arms_in_trial_ci: true
+- config: all together, full diversion (1.0)
+  overrides:
+    irs_divert: 1.0
+  irs_product: pm_cs
+  m0: 127.556
+  interaction_or: 1.469
+  seed_min: 1.12
+  seed_max: 1.6264
+  or_pbo_alone: 0.3596
+  or_irs_alone: 0.4997
+  or_both: 0.264
+  prevalence:
+    a00: 0.564
+    a10: 0.3175
+    a01: 0.3926
+    a11: 0.2546
+  single_arms_in_trial_ci: true
+- config: all together, high correlations and full diversion
+  overrides:
+    hh_net_corr: 0.9
+    cov_corr: 0.9
+    exp_corr: 0.6
+    irs_divert: 1.0
+  irs_product: pm_cs
+  m0: 119.382
+  interaction_or: 1.364
+  seed_min: 1.1883
+  seed_max: 1.5794
+  or_pbo_alone: 0.3623
+  or_irs_alone: 0.5654
+  or_both: 0.2795
+  prevalence:
+    a00: 0.5519
+    a10: 0.3087
+    a01: 0.4105
+    a11: 0.2562
+  single_arms_in_trial_ci: false
