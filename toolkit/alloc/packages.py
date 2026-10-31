@@ -29,6 +29,10 @@ toolkit/alloc/costs.py; packages are read with costs.packages()):
     caps:                        # coupling constraints, handed to toolkit/alloc/optimize.py
       c2: {max_units: 12}                        # at most 12 units receive c2
       c1: {max_quantity: 250000, quantity: total}  # sum of a population (or column) where c1 is delivered
+    group_rules:                 # v2 (spike lesson 10): one decision for a whole group of units
+      campaign: {components: [c1], by: zone, rule: same_choice, reason: one campaign per zone}
+      # every unit with the same `zone` takes the same choice among these components (one of them,
+      # or none): handed to toolkit/alloc/optimize.py as `links`
 
 A package is infeasible in a unit when it contains a component that is not
 eligible there, or one another funder already delivers there (not chargeable
@@ -183,7 +187,7 @@ def validate(spec: dict, units: list[dict]) -> list[str]:
     for name, cs in pk.items():
         if cs - set(comps):
             errs.append(f"packages.{name}: unknown components {', '.join(sorted(cs - set(comps)))}")
-    for sec in ("eligibility", "footprints", "locks", "caps"):
+    for sec in ("eligibility", "footprints", "locks", "caps", "group_rules"):
         if spec.get(sec) is not None and not isinstance(spec[sec], dict):
             errs.append(f"{sec}: must be a mapping")
     if errs:
@@ -224,7 +228,40 @@ def validate(spec: dict, units: list[dict]) -> list[str]:
             errs.append(f"locks.{u}: unknown unit")
         if str(lk.get("package")) not in pk:
             errs.append(f"locks.{u}: unknown package {lk.get('package')}")
+    for gid, gr in (spec.get("group_rules") or {}).items():
+        if not isinstance(gr, dict):
+            errs.append(f"group_rules.{gid}: must be a mapping")
+            continue
+        cs = gr.get("components")
+        if not isinstance(cs, list) or not cs or any(str(c) not in comps for c in cs):
+            errs.append(f"group_rules.{gid}: components must be a non-empty list of known components")
+        if gr.get("rule", "same_choice") != "same_choice":
+            errs.append(f"group_rules.{gid}: rule {gr.get('rule')!r} is not supported (same_choice)")
+        if gr.get("by") not in fields:
+            errs.append(f"group_rules.{gid}: by {gr.get('by')!r} is not a column of the units table")
+        elif any(str(u.get(gr["by"], "")).strip() == "" for u in units):
+            errs.append(f"group_rules.{gid}: some units have no value of {gr['by']}")
+        for k in set(gr) - {"components", "by", "rule", "reason"}:
+            errs.append(f"group_rules.{gid}: unknown key {k}")
     return errs
+
+
+def group_links(spec: dict, units: list[dict]) -> list[dict]:
+    """The group rules as toolkit/alloc/optimize.py links: each unit's package class is the rule's component in
+    that package (or "none"). A package with two of the rule's components is its own class (their join)."""
+    uidk = spec["units"]["id"]
+    pk = costs.packages(spec)
+    out = []
+    for gid, gr in (spec.get("group_rules") or {}).items():
+        rc = {str(c) for c in gr["components"]}
+        groups, cls = {}, {}
+        for u in units:
+            i = str(u[uidk])
+            groups.setdefault(str(u[gr["by"]]).strip(), []).append(i)
+            cls[i] = {p: "+".join(sorted(cs & rc)) or "none" for p, cs in pk.items()}
+        out.append({"name": str(gid), "by": gr["by"], "components": sorted(rc), "groups": groups, "class": cls,
+                    "reason": gr.get("reason", "")})
+    return out
 
 
 def feasibility(spec: dict, units: list[dict]) -> dict:
@@ -280,7 +317,10 @@ def feasibility(spec: dict, units: list[dict]) -> dict:
             caps.append({"name": f"{c}.{kind}", "component": c, "max": float(cap[kind]), "weights": w})
     if errs:
         raise ValueError("infeasible packages spec: " + "; ".join(errs))
-    return {"feasible": feas, "reasons": reasons, "locks": locks, "footprints": foot, "caps": caps}
+    out = {"feasible": feas, "reasons": reasons, "locks": locks, "footprints": foot, "caps": caps}
+    if spec.get("group_rules"):
+        out["links"] = group_links(spec, units)
+    return out
 
 
 # --------------------------------------------------------------------------- self-test

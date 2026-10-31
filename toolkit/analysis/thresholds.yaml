@@ -1,0 +1,12 @@
+# Analysis-engine thresholds (v2 workstream B). Proposals for the owner's review; code reads
+# them from here and restates none.
+stability:
+  # Spike lesson 5: allocation stability judged by the share of the objective lost when one
+  # group's data are withheld and the fold plan is judged with the full calibration. The
+  # spike's worst fold lost 0.73%.
+  value_loss_pct_robust: 1.0
+  value_loss_pct_fragile: 5.0
+decision_tests:
+  # Phase 49 result files: the plan changes when more than this share of units change package
+  # (the spec's analysis.share_threshold overrides it).
+  share_threshold: 0.10

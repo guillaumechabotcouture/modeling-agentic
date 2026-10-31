@@ -31,6 +31,12 @@ API:
         toolkit/alloc/packages.py feasibility(), whose caps are then used
         unless caps is given (caps=[] drops them explicitly).
         caps: [{"name", "max", "weights": {unit: {package: w}}}].
+        links (v2, group rules): [{"name", "groups": {key: [unit, ...]},
+        "class": {unit: {package: label}}}]: every unit of a group takes a
+        package of the same class (e.g. every unit of a region gets the same
+        net type, or none). Taken from feasibility()["links"] unless given;
+        the ILP and brute force honour them, check() verifies them, greedy
+        refuses them (no bound holds).
         Returns {"choice": {unit: package}, "objective", "cost", "status",
         "method", "seconds", "cap_use": {name: use}, ...}; status is
         "optimal" (proven), "feasible" (ILP stopped early), "heuristic",
@@ -168,17 +174,21 @@ def _prepare(benefit, cost, feasible, budget, caps):
     return us, opts, caps, names, b0
 
 
-def prune(opts: dict) -> tuple[dict, int]:
+def prune(opts: dict, links=None) -> tuple[dict, int]:
     """Drop packages dominated within a unit: another costs no more, gives no less benefit and uses no more of
     any capped resource. Safe with caps (unlike E7 attempt 7's pruning, which ignored caps and was therefore
-    switched off whenever a cap existed). Exact ties keep the first package."""
+    switched off whenever a cap existed). Exact ties keep the first package. With links (group rules), only a
+    package of the same class in every link can dominate, so each group's common choice stays available."""
     out, n = {}, 0
     for u, o in opts.items():
         keep = []
+        cls = [L["class"][u] for L in links or [] if u in L["class"]]
         for j, (p, b, c, w) in enumerate(o):
             dom = False
             for k, (q, b2, c2, w2) in enumerate(o):
                 if k == j or not (c2 <= c and b2 >= b and all(x <= y for x, y in zip(w2, w))):
+                    continue
+                if any(cl.get(p) != cl.get(q) for cl in cls):
                     continue
                 if c2 < c or b2 > b or any(x < y for x, y in zip(w2, w)) or k < j:
                     dom = True
@@ -235,8 +245,10 @@ def _baseline(opts) -> float:
     return sum(min(x[1] for x in o) for o in opts.values())
 
 
-def check(choice, benefit, cost, feasible, budget, caps=None) -> list[str]:
-    """Independent check of an allocation: one feasible package per unit, within budget and caps."""
+def check(choice, benefit, cost, feasible, budget, caps=None, links=None) -> list[str]:
+    """Independent check of an allocation: one feasible package per unit, within budget and caps, and each
+    group of a link (group rule) on one class."""
+    lk = _links(feasible, links)
     us, opts, caps, names, b0 = _prepare(benefit, cost, feasible, budget, caps)
     errs = []
     if not isinstance(choice, dict) or set(choice) != set(us):
@@ -254,7 +266,47 @@ def check(choice, benefit, cost, feasible, budget, caps=None) -> list[str]:
     for k, (n, cp, x) in enumerate(zip(names, caps, use)):
         if x > float(cp["max"]) + CHECK_RTOL * _scale(float(cp["max"]), x):
             errs.append(f"cap {n}: use {x:g} exceeds {cp['max']:g}")
+    for L in lk:
+        for g, members in L["groups"].items():
+            labels = {L["class"].get(u, {}).get(choice.get(u)) for u in members}
+            if len(labels) > 1:
+                errs.append(f"group rule {L['name']}: group {g} mixes {sorted(map(str, labels))}")
     return errs
+
+
+def _links(feasible, links) -> list[dict]:
+    """The group rules: given, or those of a feasibility() dict (normalised to strings)."""
+    if links is None and isinstance(feasible, dict) and isinstance(feasible.get("feasible"), dict):
+        links = feasible.get("links")
+    out = []
+    for i, L in enumerate(links or []):
+        if not isinstance(L, dict) or not isinstance(L.get("groups"), dict) or not isinstance(L.get("class"), dict):
+            raise ValueError(f"links[{i}]: needs name, groups {{key: [unit]}} and class {{unit: {{package: label}}}}")
+        out.append({"name": str(L.get("name") or f"link{i}"),
+                    "groups": {str(g): [str(u) for u in m] for g, m in L["groups"].items()},
+                    "class": {str(u): {str(p): str(c) for p, c in m.items()} for u, m in L["class"].items()}})
+    return out
+
+
+def _check_links(lk, opts) -> list[dict]:
+    """Every grouped unit is known, in one group only, and has a class for each of its feasible packages."""
+    errs = []
+    for L in lk:
+        seen = set()
+        for g, members in L["groups"].items():
+            for u in members:
+                if u not in opts:
+                    errs.append(f"link {L['name']}: group {g} names unknown unit {u}")
+                elif u in seen:
+                    errs.append(f"link {L['name']}: unit {u} is in two groups")
+                else:
+                    seen.add(u)
+                    miss = [x[0] for x in opts[u] if x[0] not in L["class"].get(u, {})]
+                    if miss:
+                        errs.append(f"link {L['name']}: unit {u} has no class for packages {miss[:3]}")
+    if errs:
+        raise ValueError("invalid links: " + "; ".join(errs[:10]))
+    return lk
 
 
 def _result(method, us, opts, choice, status, t0, names, **extra):
@@ -268,7 +320,7 @@ def _result(method, us, opts, choice, status, t0, names, **extra):
     return r
 
 
-def _ilp(us, opts, caps, names, blim, cmax, time_limit):
+def _ilp(us, opts, caps, names, blim, cmax, time_limit, links=None):
     pulp = _pulp()
     if pulp is None:
         raise ImportError("method ilp needs PuLP (requirements.txt pins PuLP==3.3.0)")
@@ -294,6 +346,17 @@ def _ilp(us, opts, caps, names, blim, cmax, time_limit):
                  if opts[u][j][3][k]]
         if terms:
             prob += pulp.lpSum(terms) <= cmax[k] / ws
+    uidx = {u: i for i, u in enumerate(us)}
+    for li, L in enumerate(links or []):      # group rule: one class per group; y[label] is the group's choice
+        for gi, (g, members) in enumerate(sorted(L["groups"].items())):
+            labels = sorted({L["class"][u][y_[0]] for u in members for y_ in opts[u]})
+            y = {lab: pulp.LpVariable(f"y_{li}_{gi}_{n}", cat="Binary") for n, lab in enumerate(labels)}
+            prob += pulp.lpSum(y.values()) == 1
+            for u in members:
+                i = uidx[u]
+                for lab, yv in y.items():
+                    prob += pulp.lpSum(x[i, j] for j in range(len(opts[u]))
+                                       if L["class"][u][opts[u][j][0]] == lab) == yv
     prob.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=time_limit, gapRel=0.0, gapAbs=0.0))
     sol = prob.sol_status
     if sol == pulp.LpSolutionInfeasible or prob.status == pulp.LpStatusInfeasible:
@@ -384,7 +447,7 @@ def search_space(opts: dict) -> int:
     return n
 
 
-def _brute(us, opts, caps, names, blim, cmax, limit):
+def _brute(us, opts, caps, names, blim, cmax, limit, links=None):
     t0 = time.time()
     if search_space(opts) > limit:
         raise ValueError(f"brute: search space {search_space(opts):.3g} exceeds brute_limit {limit:.3g}")
@@ -399,6 +462,8 @@ def _brute(us, opts, caps, names, blim, cmax, limit):
         smin_w[i] = [smin_w[i + 1][k] + min(x[3][k] for x in o[i]) for k in range(K)]
     best = [-math.inf, None]
     pick = [None] * n
+    member = [[(li, g) for li, L in enumerate(links or []) for g, m in L["groups"].items() if u in m] for u in us]
+    fixed = {}                                    # (link, group) -> the class chosen so far on this branch
 
     def dfs(i, c, b, w):
         if c + smin_c[i] > blim or any(w[k] + smin_w[i][k] > cmax[k] for k in range(K)):
@@ -409,8 +474,20 @@ def _brute(us, opts, caps, names, blim, cmax, limit):
             best[0], best[1] = b, list(pick)
             return
         for x in o[i]:
-            pick[i] = x[0]
-            dfs(i + 1, c + x[2], b + x[1], [w[k] + x[3][k] for k in range(K)])
+            here, fits = [], True
+            for li, g in member[i]:
+                lab = links[li]["class"][us[i]][x[0]]
+                if fixed.get((li, g), lab) != lab:
+                    fits = False
+                    break
+                if (li, g) not in fixed:
+                    fixed[(li, g)] = lab
+                    here.append((li, g))
+            if fits:
+                pick[i] = x[0]
+                dfs(i + 1, c + x[2], b + x[1], [w[k] + x[3][k] for k in range(K)])
+            for key in here:
+                del fixed[key]
 
     sys.setrecursionlimit(max(sys.getrecursionlimit(), n + 100))
     dfs(0, 0.0, 0.0, [0.0] * K)
@@ -419,29 +496,34 @@ def _brute(us, opts, caps, names, blim, cmax, limit):
     return _result("brute", us, opts, dict(zip(us, best[1])), "optimal", t0, names)
 
 
-def solve(benefit, cost, feasible, budget, caps=None, method="ilp", time_limit=300, brute_limit=2_000_000):
+def solve(benefit, cost, feasible, budget, caps=None, method="ilp", time_limit=300, brute_limit=2_000_000,
+          links=None):
     if method not in METHOD_NAMES:
         raise ValueError(f"method must be one of {', '.join(METHOD_NAMES)}")
+    lk = _links(feasible, links)
     us, opts, caps, names, b0 = _prepare(benefit, cost, feasible, budget, caps)
+    lk = _check_links(lk, opts)
+    if lk and method == "greedy":
+        raise ValueError("greedy does not support group rules (links): no bound holds; use ilp or brute")
     base = _baseline(opts)
-    opts, npruned = prune(opts)
+    opts, npruned = prune(opts, lk)
     blim, cmax = _limits(opts, caps, b0)
     opts, nimp = drop_impossible(opts, blim, cmax)
     if any(not o for o in opts.values()):
         r = _result(method, us, opts, None, "infeasible" if method in EXACT else "no_feasible_found", time.time(),
                     names, bound=None)
     elif method == "ilp":
-        r = _ilp(us, opts, caps, names, blim, cmax, time_limit)
+        r = _ilp(us, opts, caps, names, blim, cmax, time_limit, lk)
     elif method == "greedy":
         r = _greedy(us, opts, caps, names, blim, cmax)
     else:
-        r = _brute(us, opts, caps, names, blim, cmax, brute_limit)
+        r = _brute(us, opts, caps, names, blim, cmax, brute_limit, lk)
     r["n_pruned_dominated"] = npruned
     r["n_impossible"] = nimp
     r["baseline"] = base
     r["search_space"] = search_space(opts)
     if r["choice"] is not None:
-        bad = check(r["choice"], benefit, cost, feasible, budget, caps)
+        bad = check(r["choice"], benefit, cost, feasible, budget, caps, links=lk)
         if bad:
             raise OptimizerError(f"{method} returned an allocation that violates its constraints: {'; '.join(bad)}")
     return r
@@ -492,13 +574,16 @@ def benchmark(benefit, cost, feasible, budget, caps=None, primary="ilp", methods
     us, opts, caps_l, names, b0 = _prepare(benefit, cost, feasible, budget, caps)
     if caps is None:
         caps = caps_l
-    popts, npruned = prune(opts)
+    lk = _check_links(_links(feasible, None), opts)
+    popts, npruned = prune(opts, lk)
     skipped = {}
     if methods is None:
         methods = []
         for m in ("ilp", "greedy", "brute"):
             if m == "ilp" and _pulp() is None:
                 skipped[m] = "PuLP not installed"
+            elif m == "greedy" and lk:
+                skipped[m] = "group rules (links): greedy has no bound"
             elif m == "brute" and search_space(popts) > brute_limit:
                 skipped[m] = f"search space {search_space(popts):.3g} > brute_limit {brute_limit:.3g}"
             else:
@@ -611,6 +696,49 @@ def _planted_world():
                                      + el * (1 - (RR1 if "c1" in cs else 1.0) * (RR2 if "c2" in cs else 1.0)))
                             for p, cs in ((p, set(cs)) for p, cs in spec["packages"].items())}
     return spec, units, benefit, cost
+
+
+def _self_test_links(ok, raises) -> None:
+    """v2 (spike lesson 10): group rules. 9 units in 3 zones; c1 must be decided zone by zone."""
+    units = [{"id": f"v{i:02d}", "zone": "abc"[i // 3], "pop": 1000 + 37 * i, "elig_pop": 200} for i in range(9)]
+    spec = {"units": {"id": "id", "populations": {"total": "pop", "eligible": "elig_pop"}},
+            "components": {"c1": {}, "c2": {"eligible": "eligible"}},
+            "packages": {"none": [], "c1": ["c1"], "c2": ["c2"], "c1+c2": ["c1", "c2"]},
+            "prices": {"base_year": 2024, "index": {"2024": 1.0}},
+            "cost_items": [{"id": "a", "component": "c1", "value": 1.0, "price_year": 2024, "price_rule": "index",
+                            "basis": "per_person", "includes": ["x"]},
+                           {"id": "b", "component": "c2", "value": 2.0, "price_year": 2024, "price_rule": "index",
+                            "basis": "per_eligible", "includes": ["y"]}],
+            "group_rules": {"campaign": {"components": ["c1"], "by": "zone", "rule": "same_choice"}}}
+    cm = costs.cost_matrix(spec, units)
+    cost = {u: {p: v["total"] for p, v in ps.items()} for u, ps in cm.items()}
+    # c1 pays off only in half of each zone's units, so an unlinked optimum splits zones
+    benefit = {u["id"]: {"none": 0.0, "c1": (900.0 if int(u["id"][1:]) % 2 else 50.0), "c2": 300.0,
+                         "c1+c2": (900.0 if int(u["id"][1:]) % 2 else 50.0) + 250.0} for u in units}
+    F = packages.feasibility(spec, units)
+    free = solve(benefit, cost, F, 9000, links=[], method="ilp")
+    ilp = solve(benefit, cost, F, 9000, method="ilp")
+    br = solve(benefit, cost, F, 9000, method="brute")
+    zones = {u["zone"]: set() for u in units}
+    for u in units:
+        zones[u["zone"]].add("c1" in ilp["choice"][u["id"]])
+    split = any(len({("c1" in free["choice"][u["id"]]) for u in units if u["zone"] == z}) > 1 for z in zones)
+    ok(split and all(len(v) == 1 for v in zones.values()),
+       f"TL1 without the rule the optimum splits a zone on c1; with it every zone takes one c1 decision {zones}")
+    ok(abs(ilp["objective"] - br["objective"]) <= 1e-6 * max(1.0, abs(br["objective"]))
+       and ilp["objective"] <= free["objective"] + 1e-9,
+       f"TL2 ILP and brute force agree under the group rule ({ilp['objective']} vs {br['objective']}) and it costs "
+       f"objective ({free['objective']})")
+    bad = dict(ilp["choice"])
+    first = [u["id"] for u in units if u["zone"] == "a"][0]
+    bad[first] = "c1" if "c1" not in bad[first] else "none"
+    ok(any("mixes" in e for e in check(bad, benefit, cost, F, 9000)), "TL3 check() rejects a split group")
+    ok(raises(lambda: solve(benefit, cost, F, 9000, method="greedy"), ValueError, "group rules"),
+       "TL4 greedy refuses group rules")
+    bad_spec = dict(spec, group_rules={"g": {"components": ["zz"], "by": "nope"}})
+    errs = packages.validate(bad_spec, units)
+    ok(any("known components" in e for e in errs) and any("not a column" in e for e in errs),
+       f"TL5 a group rule on an unknown component or column fails validation: {errs}")
 
 
 def _closed_form(benefit, cost, feas, k_steps):
@@ -811,6 +939,7 @@ def _self_test() -> int:
         ok(pr.stdout.split() == ["False", "True", "True", "False", "True"],
            f"TC36 imported as toolkit.alloc beside a run's costs.py, neither shadows the other: "
            f"{pr.stdout.strip()} {pr.stderr.strip()[-300:]}")
+    _self_test_links(ok, raises)
     if fails:
         print("SELF-TEST FAILURES:")
         for m in fails:

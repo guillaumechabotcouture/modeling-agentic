@@ -172,6 +172,37 @@ def _format_interval(lo: str, hi: str, lo_num: float, hi_num: float) -> str:
 # ----- Per-kind renderers ----------------------------------------------- #
 
 
+_SOURCE_ID_RE = re.compile(r"[a-z][a-z_]{0,40}")
+
+
+def interval_meta_problem(meta) -> str | None:
+    """Why an `interval:` block is unusable (None when it is fine): a level in [0.5, 1), and `covers` (non-empty) and
+    `excludes` as lists of source identifiers (lower-case letters and underscores, no free text)."""
+    if not isinstance(meta, dict) or set(meta) - {"level", "covers", "excludes"}:
+        return "interval must be a mapping of level, covers and excludes only"
+    lvl = meta.get("level")
+    if isinstance(lvl, bool) or not isinstance(lvl, (int, float)) or not 0.5 <= float(lvl) < 1:
+        return f"interval.level {lvl!r} must be a number in [0.5, 1)"
+    for k in ("covers", "excludes"):
+        v = meta.get(k, [] if k == "excludes" else None)
+        if not isinstance(v, list) or (k == "covers" and not v) or \
+                not all(isinstance(x, str) and _SOURCE_ID_RE.fullmatch(x) for x in v):
+            return f"interval.{k} must be a list of source identifiers ([a-z_]), {'non-empty' if k == 'covers' else ''}"
+    return None
+
+
+def interval_label(meta: dict) -> str:
+    """'95% UI over engine parameters, calibration; not covered: costs' from {level, covers, excludes}."""
+    bad = interval_meta_problem(meta)
+    if bad:
+        raise ValueError(bad)
+    words = lambda xs: ", ".join(x.replace("_", " ") for x in xs)  # noqa: E731
+    lab = f"{float(meta['level']) * 100:g}% UI over {words(meta['covers'])}"
+    if meta.get("excludes"):
+        lab += f"; not covered: {words(meta['excludes'])}"
+    return lab
+
+
 def render_claim(claim: dict) -> str:
     """Render a single claim entry to its display string.
 
@@ -187,9 +218,14 @@ def render_claim(claim: dict) -> str:
     ci_high = claim.get("ci_high")
     has_ci = ci_low is not None and ci_high is not None
 
+    # v2 (spike lesson 6, Codex P1-5): an interval says what it covers. The label is
+    # derived from structured metadata (`interval: {level, covers, excludes}`),
+    # never from free text; without it the default "95% CI" is unchanged.
+    label = interval_label(claim["interval"]) if claim.get("interval") is not None else "95% CI"
+
     def _ci(fmt) -> str:
         lo, hi = float(ci_low), float(ci_high)
-        return f" (95% CI: {_format_interval(fmt(lo), fmt(hi), lo, hi)})"
+        return f" ({label}: {_format_interval(fmt(lo), fmt(hi), lo, hi)})"
 
     def _pct(x: float) -> str:
         return f"{x:.1f}%".replace(".0%", "%")
@@ -298,6 +334,14 @@ def load_claims(ledger_path: str) -> dict[str, dict]:
                                                     float("-inf")):
                 raise ValueError(
                     f"{ledger_path}: claims[{i}] {cid!r} value is not finite")
+        # v2 (Codex P1-5): interval labels come from structured metadata only.
+        if "interval_label" in c:
+            raise ValueError(f"{ledger_path}: claims[{i}] {cid!r}: free-text interval_label is not accepted; "
+                             "give interval: {level, covers, excludes}")
+        if c.get("interval") is not None:
+            why = interval_meta_problem(c["interval"])
+            if why:
+                raise ValueError(f"{ledger_path}: claims[{i}] {cid!r}: {why}")
         # CI consistency (Phase 21 γ: currency and count too)
         if kind in _NUMERIC_KINDS:
             lo = c.get("ci_low")
@@ -471,6 +515,23 @@ def _self_test() -> int:
                       "ci_low": 5140000, "ci_high": 10420000})
     ok("7.47M" in s and "5.14M" in s and "10.42M" in s,
        f"T1 scalar+CI: got {s!r}")
+    ok("95% CI:" in s, f"T1 the default interval label is 95% CI: {s!r}")
+    s = render_claim({"id": "x", "claim_kind": "scalar", "value": 7467997, "ci_low": 5140000, "ci_high": 10420000,
+                      "interval": {"level": 0.95, "covers": ["engine_parameters"], "excludes": ["costs"]}})
+    ok("(95% UI over engine parameters; not covered: costs: 5.14M" in s and "CI" not in s,
+       f"T1b v2 lesson 6: the interval label is derived from structured metadata: {s!r}")
+    with tempfile.TemporaryDirectory() as d_il:
+        for bad_c, why in (({"interval_label": "95% UI over everything"}, "free text"),
+                           ({"interval": {"level": 0.95, "covers": ["all of it, 100%"]}}, "free text in covers"),
+                           ({"interval": {"level": 2, "covers": ["costs"]}}, "a bad level")):
+            pth = os.path.join(d_il, "l.yaml")
+            yaml.safe_dump({"claims": [dict({"id": "h", "claim_kind": "scalar", "value": 2, "ci_low": 1,
+                                             "ci_high": 3}, **bad_c)]}, open(pth, "w"))
+            try:
+                load_claims(pth)
+                ok(False, f"T1c a ledger interval with {why} is refused (Codex P1-5)")
+            except ValueError:
+                pass
     s = render_claim({"id": "x", "claim_kind": "scalar", "value": 320_000_000})
     ok(s == "320M", f"T1 scalar no-CI: got {s!r}")
     s = render_claim({"id": "x", "claim_kind": "count", "value": 63})
