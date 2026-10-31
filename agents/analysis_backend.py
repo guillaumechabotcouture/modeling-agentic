@@ -87,6 +87,9 @@ def card_fits(card, needs: dict) -> list[str]:
     wins = set((card.outputs or {}).get("windows") or [])
     why += [f"no window metric {w}" for w in needs.get("windows") or [] if w not in wins]
     why += [f"no unit attribute {a}" for a in needs.get("unit_attributes") or [] if a not in card.unit_attributes]
+    drivers = set((card.outputs or {}).get("cost_drivers") or [])
+    why += [f"no cost driver {c}" for c in needs.get("cost_drivers") or [] if c not in drivers]
+    why += [f"no age group {g}" for g in needs.get("age_groups") or [] if g not in (card.age_groups or [])]
     for a, (lo, hi) in (needs.get("ranges") or {}).items():
         vr = (card.valid_ranges or {}).get(a)
         if vr and (lo < vr[0] or hi > vr[1]):
@@ -239,6 +242,26 @@ def load_spec(path: str) -> dict:
     return merged_spec(os.path.dirname(os.path.abspath(path)))
 
 
+def pre_sign_problems(run_dir: str) -> list[str]:
+    """Before the engine is chosen: every section the spike needs, and a valid settings file."""
+    import yaml
+    from spike.analysis.spec import REQUIRED
+    try:
+        spec = yaml.safe_load(open(os.path.join(run_dir, SPEC_FILE))) or {}
+    except Exception as e:  # noqa: BLE001
+        return [f"{SPEC_FILE} unreadable: {type(e).__name__}"]
+    return [f"missing section {k}" for k in REQUIRED if k != "engine" and k not in spec] + settings_problems(run_dir, spec)
+
+
+def choice_spec(run_dir: str) -> dict:
+    """The spec the engine filter reads (merged with its settings)."""
+    return merged_spec(run_dir)
+
+
+# Sign-off: the spike adapter has none of its own; the machine's whole-file hash is used (sign = None).
+sign = None
+
+
 def validate(spec, base: str | None = None) -> list[str]:
     """`spec` is the spec file's path (merged with its settings and the engine choice) or a mapping."""
     from spike.analysis import spec as S
@@ -387,13 +410,40 @@ class _ToolkitApi:
         self.api = api
         self.headline = api.headline
         self.gate_findings = api.gate_findings
-        self.cross_check = cross_check
         # B's computational settings (incl. analysis.workers); its validate(path) refuses others.
         try:
             from toolkit.spec import schema
             self.settings_paths = tuple(".".join(p) for p in sorted(schema.SETTINGS_PATHS))
         except ImportError:
             self.settings_paths = SETTINGS_PATHS
+
+    def pre_sign_problems(self, run_dir: str) -> list[str]:
+        """B's checks of every section that does not need the engine (its sign-off check)."""
+        from toolkit.spec import schema
+        try:
+            return list(schema.validate(schema.load(os.path.join(run_dir, SPEC_FILE)), pending_ok=True))
+        except Exception as e:  # noqa: BLE001
+            return [f"spec validation failed: {type(e).__name__}: {e}"]
+
+    def choice_spec(self, run_dir: str) -> dict:
+        from toolkit.spec import schema
+        return schema.load(os.path.join(run_dir, SPEC_FILE)).raw
+
+    # B signs the spec itself (toolkit/spec/signoff.py); its analysis refuses an unsigned spec.
+    def sign(self, run_dir: str, by: str, note: str = "") -> dict:
+        from toolkit.spec import signoff
+        return signoff.sign(run_dir, by, note)
+
+    def signed_sha(self, run_dir: str):
+        from toolkit.spec import signoff
+        return signoff.signed_sha(run_dir) if signoff.status(run_dir) in ("signed", "changed") else None
+
+    def signoff_status(self, run_dir: str) -> str:
+        from toolkit.spec import signoff
+        return signoff.status(run_dir)
+
+    def cross_check(self, spec, refs, work_dir, n_units: int = 8):
+        return {"skipped": "the cross-engine check runs on the spike analysis only; not yet for workstream B's"}
 
     def validate(self, spec, base=None) -> list[str]:
         """B's validate raises on some refusals (a bad settings leaf: schema.SpecError); the
@@ -414,7 +464,12 @@ class _ToolkitApi:
         out = []
         for st in self.api.pipeline_steps(spec_path, run_dir):
             st = dict(st)
-            st["run"] = st.pop("cmd", st.get("run"))
+            run = st.pop("cmd", st.get("run"))
+            if isinstance(run, str) and run.split(" ", 1)[0] in ("python", "python3"):
+                # The harness's interpreter (its venv), not whatever `python3` is first on PATH:
+                # B's step failed with "No module named numpy" under the system python.
+                run = f"{sys.executable} {run.split(' ', 1)[1]}"
+            st["run"] = run
             st.pop("produced_by", None)
             out.append(st)
         return out
@@ -434,7 +489,7 @@ def backend(prefer: str = "auto"):
             # The machine chooses the engine after SIGN, so the signed spec says `engine: auto`
             # and the engine comes from engine_choice.json (agreed with B; B's schema marks it
             # ENGINE_AUTO). Without it every v2 run would fail at CONFIGURE: keep the spike adapter.
-            if getattr(schema, "ENGINE_AUTO", False) or prefer == "toolkit":
+            if getattr(api, "ENGINE_AUTO", False) or getattr(schema, "ENGINE_AUTO", False) or prefer == "toolkit":
                 return _ToolkitApi(api)
     return sys.modules[__name__]
 
@@ -585,8 +640,8 @@ def _self_test() -> int:
               pipeline_steps=lambda sp, d: [{"id": "analyze", "cmd": "python3 x.py", "inputs": [], "outputs": [],
                                              "produced_by": "harness"}])
     st = _ToolkitApi(fake).pipeline_steps("s", "d")
-    ok(st == [{"id": "analyze", "run": "python3 x.py", "inputs": [], "outputs": []}],
-       f"B14 workstream B's step (cmd, produced_by) becomes an S1 step (run) {st}")
+    ok(st == [{"id": "analyze", "run": f"{sys.executable} x.py", "inputs": [], "outputs": []}],
+       f"B14 workstream B's step (cmd, produced_by) becomes an S1 step (run) under the harness's interpreter {st}")
     fake.engine_needs = lambda spec: {"components": {"a": [1]}, "outputs": ["dalys"]}
     rows = _ToolkitApi(fake).eligible_engines({}, [("toolkit.engines.contract:ToyEngine", None)])
     ok(rows[0]["eligible"], "B19 with B's engine_needs the filter uses B's vocabulary")
@@ -609,7 +664,7 @@ def _self_test() -> int:
         sys.modules["toolkit.spec"].schema = sys.modules["toolkit.spec.schema"]
         sys.modules["toolkit.spec.schema"].SETTINGS_PATHS = frozenset({("uncertainty", "draws")})
         no_auto = backend()
-        sys.modules["toolkit.spec.schema"].ENGINE_AUTO = True
+        fake.ENGINE_AUTO = True
         with_auto = backend()
     finally:
         for k, mod in saved.items():

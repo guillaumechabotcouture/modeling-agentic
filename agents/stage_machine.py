@@ -191,11 +191,14 @@ def legacy_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, h
     return d
 
 
-def spec_signoff_findings(run_dir: str, signoff: str) -> list[dict]:
+def spec_signoff_findings(run_dir: str, signoff: str, backend=None) -> list[dict]:
     """decision_spec.yaml must not change after sign-off (non-declarable)."""
     if signoff == "none":
         return []
     rec = _signoff(run_dir)
+    if backend is not None and getattr(backend, "sign", None):
+        st = backend.signoff_status(run_dir)
+        rec = {"spec_sha256": signed_hash(run_dir)} if st == "signed" else (None if st != "changed" else {"spec_sha256": "x"})
     if rec is None:
         return [{"kind": "spec_unsigned", "severity": "HIGH", "stage": "PLAN", "target_stage": "PLAN", "key": "spec",
                  "scope_declarable": False, "claim": "decision_spec.yaml has no sign-off."}]
@@ -523,16 +526,42 @@ class Machine:
         return yaml.safe_load(open(os.path.join(self.run_dir, AB.SPEC_FILE))) or {}
 
     def harness_findings(self) -> list[dict]:
-        out = self.backend.gate_findings(self.run_dir) + spec_signoff_findings(self.run_dir, self.st.signoff)
+        out = self.backend.gate_findings(self.run_dir) + spec_signoff_findings(self.run_dir, self.st.signoff, self.backend)
         out += [{"kind": "deliverable_path_invalid", "severity": "HIGH", "stage": "PLAN", "target_stage": "PLAN",
                  "key": "deliverable", "scope_declarable": False, "claim": p} for p in deliverable_problems(self.run_dir)]
         return out
+
+    def _signed_ref(self, run_dir: str):
+        """The signed spec's sha256: from the backend's own sign-off (B) or the machine's."""
+        if getattr(self.backend, "sign", None):
+            return self.backend.signed_sha(run_dir)
+        return (_signoff(run_dir) or {}).get("spec_sha256")
+
+    def _sign(self, by: str, note: str = "") -> None:
+        if getattr(self.backend, "sign", None):
+            self.backend.sign(self.run_dir, by, note)
+        else:
+            sign(self.run_dir, by, note)
+
+    def _signed_by(self):
+        """Who signed the current spec, or None when it is unsigned or changed since."""
+        if getattr(self.backend, "sign", None):
+            if self.backend.signoff_status(self.run_dir) != "signed":
+                return None
+            try:
+                from toolkit.spec import signoff
+                rec = signoff._spec_record(self.run_dir) or {}
+            except Exception:  # noqa: BLE001
+                rec = {}
+            return rec.get("signed_by") or rec.get("by") or "owner"
+        rec = _signoff(self.run_dir)
+        return rec.get("by") if rec and rec.get("spec_sha256") == signed_hash(self.run_dir) else None
 
     def fix_guard(self, run_dir: str) -> list[str]:
         """What a fix task may not do: change decision_spec.yaml (compared with its sign-off, or with
         its hash when the loop started), or leave a settings file the analysis would refuse."""
         probs = []
-        ref = (_signoff(run_dir) or {}).get("spec_sha256") if self.st.signoff != "none" else None
+        ref = self._signed_ref(run_dir) if self.st.signoff != "none" else None
         ref = ref or self.st.journal.get(f"FIX_LOOP#{self._visit()}:spec_sha256", {}).get("output")
         if ref and signed_hash(run_dir) != ref:
             probs.append(f"{AB.SPEC_FILE} changed; it is signed (computational settings go in {AB.SETTINGS_FILE})")
@@ -582,7 +611,7 @@ class Machine:
         errs = [f"draft_spec failed: {res.note}"] if not res.ok else []
         if res.ok:
             try:
-                errs = _pre_engine_check(self._spec()) + AB.settings_problems(self.run_dir)
+                errs = self.backend.pre_sign_problems(self.run_dir)
             except Exception as e:  # noqa: BLE001
                 errs = [f"spec unreadable: {e}"]
         if errs:
@@ -595,15 +624,20 @@ class Machine:
         mode = self.st.signoff
         if mode == "none":
             return self._go("EVIDENCE", "sign-off not required (--signoff none)")
-        rec = _signoff(self.run_dir)
-        if rec and rec.get("spec_sha256") == signed_hash(self.run_dir) and (mode == "lead" or rec.get("by") == "owner"):
-            return self._go("EVIDENCE", f"spec signed by {rec.get('by')}")
+        by = self._signed_by()
+        if by and (mode == "lead" or by == "owner"):
+            return self._go("EVIDENCE", f"spec signed by {by}")
         if mode == "lead":
             res = self._task(f"SIGN#{self._visit()}:sign_spec", "sign_spec", self.run_dir)
-            rec = _signoff(self.run_dir)
-            if res is not None and res.ok and rec:
-                sign(self.run_dir, "lead", rec.get("note", ""))   # the harness records the hash
-                return self._go("EVIDENCE", "spec signed by the lead")
+            note = (_signoff(self.run_dir) or {}).get("note", "")
+            if res is not None and res.ok:
+                if os.path.exists(os.path.join(self.run_dir, SIGNOFF_FILE)) and getattr(self.backend, "sign", None):
+                    os.remove(os.path.join(self.run_dir, SIGNOFF_FILE))   # the lead's note; B writes its own record
+                try:
+                    self._sign("lead", note)              # the harness records the hash
+                    return self._go("EVIDENCE", "spec signed by the lead")
+                except ValueError as e:
+                    self.log(f"[machine] the spec could not be signed: {e}")
         self.st.paused = "awaiting_signoff"
         self.st.status = None
         save_state(self.run_dir, self.st)
@@ -619,7 +653,10 @@ class Machine:
         return self._go("ENGINE_CHOICE", "evidence stub")
 
     def h_ENGINE_CHOICE(self):
-        spec = AB.merged_spec(self.run_dir)
+        try:
+            spec = self.backend.choice_spec(self.run_dir)
+        except Exception as e:  # noqa: BLE001 -- fail closed
+            return self._go("FINAL", f"the spec cannot be read for the engine choice: {e}", "run_failed")
         rows = self.backend.eligible_engines(spec)
         eligible = [r for r in rows if r.get("eligible")]
         rec = {"at": _now(), "candidates": rows}
@@ -1210,7 +1247,9 @@ def main(argv=None) -> int:
         for h in st.history[-15:]:
             print(h)
         return 0
-    print(json.dumps(sign(a.run_dir, a.by, a.note)))
+    b = AB.backend()
+    rec = b.sign(a.run_dir, a.by, a.note) if getattr(b, "sign", None) else sign(a.run_dir, a.by, a.note)
+    print(json.dumps(rec, default=str))
     return 0
 
 

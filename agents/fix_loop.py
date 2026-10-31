@@ -311,12 +311,14 @@ def run_loop(run_dir: str, round_n: int, max_rounds: int, gate: dict | None, tas
             with open(prog_p, "w") as f:
                 json.dump(progress, f, default=str)
         evidence, rebuilt, attempts_, rejected, rep, r = None, [], 0, [], {}, None
+        agent_changed: set = set()
         check, passed, now_ids = {}, False, set(pend["before_ids"])
         while True:
             attempts_ += 1
             if attempts_ > 1 and out_of_budget():
                 break                                   # the retry is a paid call too
             r = tasks.fix(t, run_dir, evidence)
+            agent_changed |= set(changed_files(pend["snap"], snapshot(run_dir)))   # before any rebuild
             rejected = list(guard(run_dir)) if guard else []
             if rejected:
                 _restore(run_dir, pend["saved"])
@@ -338,7 +340,9 @@ def run_loop(run_dir: str, round_n: int, max_rounds: int, gate: dict | None, tas
         b2 = budget() if budget else None
         row = {"round": round_n, "task": t["id"], "findings": t["findings"], "action": t["action"],
                "owner_state": t.get("owner_state"), "brief": t.get("brief", "")[:300],
-               "files_changed": changed_files(pend["snap"], snapshot(run_dir)), "steps_rebuilt": sorted(set(rebuilt)),
+               # what the agent changed (measured before any rebuild), and what the rebuild then rewrote
+               "files_changed": sorted(agent_changed), "steps_rebuilt": sorted(set(rebuilt)),
+               "outputs_changed": sorted(set(changed_files(pend["snap"], snapshot(run_dir))) - agent_changed),
                "rebuild_ok": rep.get("ok", True), "attempts": attempts_,
                "seconds": round(time.time() - float(pend["t0"]), 1),
                "usd": (round(b2["spent"] - pend["usd0"], 4) if b2 and pend["usd0"] is not None else None),
@@ -466,6 +470,20 @@ def _self_test() -> int:
                       log=lambda *a: None, guard=guard, protect=("decision_spec.yaml",))
         ok(calls["fix"] == n and s6["resumed_done"] == 1 and len(impact_rows(d)) == 1,
            "F14 on resume a task with its impact row is not run again")
+
+        class Settings(Edit):
+            def fix(self, t, run_dir, evidence):
+                open(os.path.join(run_dir, "analysis_settings.yaml"), "w").write("uncertainty: {draws: 32}\n")
+                return NS(ok=True, note="", output=None)
+
+        def reb2(rd):
+            open(os.path.join(rd, "results.md"), "w").write("rebuilt\n")    # an output the step rewrites
+            return {"ok": True, "steps": [{"id": "analyze", "status": "ok"}]}
+        run_loop(d, 2, 3, None, Settings(), rebuild=reb2, harness_ids=lambda rd: set(), headline=lambda rd: {},
+                 log=lambda *a: None, guard=lambda rd: [], protect=())
+        row = impact_rows(d)[-1]
+        ok(row["files_changed"] == ["analysis_settings.yaml"] and row["outputs_changed"] == ["results.md"],
+           f"F15 the row separates what the agent changed from what the rebuild rewrote {row['files_changed']} {row['outputs_changed']}")
     ok("STAGE" not in FIX_PLANNER_PROMPT and "validate_critique_yaml" not in FIX_PLANNER_PROMPT
        and "spawn" not in FIX_PLANNER_PROMPT.lower(),
        "F12 the planner prompt has no stage protocol, validator invocation or spawn instructions")

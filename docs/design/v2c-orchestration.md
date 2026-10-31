@@ -257,3 +257,30 @@ Each was reproduced first: the new test was run against the previous code and fa
 | 3 | The crash read-back resumed the conversation with no dollar cap, up to three times | One read-back, capped at its own budget (at most $0.25, from what the run has left after this call's allowance). With no budget left there is no read-back and the whole allowance is charged. A failed read-back is charged the allowance plus its cap | S7, S8 |
 | 4 | A copied `run_state.json` could stop GATE from running in the golden traces | `copy_run` removes the v2 state files (`run_state.json`, `findings.jsonl`, `impact_ledger.jsonl`, `fix_*`, `gate_r*`). Checks B and D pass only if the GATE state actually ran (a GATE transition and its `gate_r<N>.json`) | G10, G11 |
 | 5 | Owned paths were compared case-sensitively | `owned_path` compares case-insensitively and, for an existing file, by identity: the same inode as an owned file, or any hard link. The agent write-scope hook does the same | T35 |
+
+## 12. Running on workstream B's analysis engine (checked at e19092d)
+
+B built `engine: auto` (`api.ENGINE_AUTO`, `api.engine_needs`). `backend()` now switches to B's API, and the
+machine routes four things through the backend so they use B's own rules:
+
+- **Pre-sign check (SPEC).** B uses `schema.validate(load(path), pending_ok=True)`; the spike adapter keeps its
+  section and settings checks.
+- **Sign-off (SIGN, the owner CLI, the fix guard, the signed-spec finding).** B uses `toolkit/spec/signoff.py`,
+  because B's analysis refuses an unsigned spec. The spike adapter keeps the machine's whole-file hash.
+- **The spec the engine filter reads (ENGINE_CHOICE).** B uses `schema.load(path).raw`, with `engine_needs`
+  (cost drivers and age groups are now checked against the card too).
+- **Pipeline commands.** A step command that starts with a bare `python3` runs under the harness's interpreter.
+  Under the system python, B's step failed with "No module named numpy".
+
+The cross-engine check runs on the spike analysis only; with B it is recorded as skipped.
+
+**End-to-end check** (B's toy spec with `engine: auto`, stubbed LLM tasks, from a `git archive` of e19092d): SPEC →
+SIGN (B's sign-off, by lead) → EVIDENCE → ENGINE_CHOICE → CONFIGURE → ANALYZE (B's step) → CRITIQUE → GATE
+(PATCH_OR_RETHINK) → FIX_LOOP → CRITIQUE → GATE (ACCEPT) → WRITE → PRESENTATION → GATE post-write (ACCEPT) →
+FINAL `completed`, in 31 s with 2 workers.
+
+- **Engine choice:** B's manifest is `complete`, with `engine_choice_sha256` set.
+- **Contract checks:** none fired.
+- **The fix:** changed only `analysis_settings.yaml`.
+- **Impact rows:** they now separate what the agent changed (`files_changed`, measured before the rebuild) from
+  what the rebuild rewrote (`outputs_changed`).
