@@ -22,17 +22,26 @@ horizon:
     m0_24: [2020.0, 2022.0]
 
 settings:
-  cochrane_itn:        # Pryce 2018 Cochrane ITN vs none: pre-resistance-era trials
+  cochrane_itn:        # Pryce 2018 Cochrane ITN vs none: pre-resistance-era trials. itn_use 0.7 is an
+                       # ASSUMPTION (use at distribution); v0.3 attrition, use rate and holes then act on it.
     unit: {season: [0.7, 0.6, 0.7, 0.9, 1.1, 1.3, 1.4, 1.4, 1.3, 1.1, 0.8, 0.7], resistance: 0.95,
            species: {gambiae: 0.7, funestus: 0.3}, cm_ft: 0.3, itn_use: 0.7, campaign_year: 2020.0}
     params: {n_agents: 5000}
     calibrate: {attribute: m0, arm_package: {}, value_path: windows.pre.pfpr_6m14y, target: 0.50,
                 grid: [4, 8, 16, 32, 64]}
-  muleba:              # Protopopoff 2018 (Muleba, Tanzania): high pyrethroid resistance, 2x2 PBO x IRS
-    unit: {season: [1.3, 1.2, 1.4, 1.5, 1.3, 0.7, 0.5, 0.5, 0.6, 0.8, 1.1, 1.1], resistance: 0.25,
-           species: {gambiae: 0.85, arabiensis: 0.05, funestus: 0.10}, cm_ft: 0.3, itn_use: 0.7,
-           itn_hist_years: [2017.0], campaign_year: 2020.0, irs_month: 1}
-    params: {n_agents: 5000}
+  muleba:              # Protopopoff 2018 (Muleba, Tanzania; PMC5910376): 2x2 PBO x IRS. From the paper:
+                       # permethrin WHO-tube mortality 8.8% (A. gambiae s.l.), 54.5% (A. funestus);
+                       # 95.7% A. gambiae s.l. (95.6% s.s.), 3.7% A. funestus; net use 77% in year 1;
+                       # 94% of households sprayed; one IRS round (Actellic 300CS) at the start.
+                       # Seasonality and past campaigns remain assumptions.
+                       # v0.3: reported use 77.3% in year 1 (surveys at 4 and 9 months: mean 0.54 y after
+                       # distribution) and 59.2% in year 2 (16 and 21 months), so the site's own retention of
+                       # use has half-life ln2 / ln(0.773 / 0.592) = 2.60 y (949 days), from the trial.
+    unit: {season: [1.3, 1.2, 1.4, 1.5, 1.3, 0.7, 0.5, 0.5, 0.6, 0.8, 1.1, 1.1],
+           resistance: {gambiae: 0.088, arabiensis: 0.088, funestus: 0.545},
+           species: {gambiae: 0.915, arabiensis: 0.042, funestus: 0.037}, cm_ft: 0.3, itn_use: 0.773, itn_use_at: 0.54,
+           itn_hist_years: [2017.0], campaign_year: 2020.0, irs_month: 1, irs_years: [2020.0], irs_product: pm_cs}
+    params: {n_agents: 5000, irs_coverage: 0.94, net_retention_half: 949.0}
     calibrate: {attribute: m0, arm_package: {net: pyr}, value_path: windows.m9.pfpr_6m14y, target: 0.55,
                 grid: [8, 16, 32, 64, 128]}
   misungwi:            # Mosha 2022 (Misungwi, Tanzania): An. funestus dominant, resistant; pyrethroid arm 45.8% at 24 m
@@ -51,7 +60,7 @@ settings:
   irs_added:           # Pryce 2022 Cochrane: non-pyrethroid-like IRS added to ITNs (4 cRCTs)
     unit: {season: [0.7, 0.6, 0.7, 0.9, 1.1, 1.3, 1.4, 1.4, 1.3, 1.1, 0.8, 0.7], resistance: 0.6,
            species: {gambiae: 0.6, arabiensis: 0.2, funestus: 0.2}, cm_ft: 0.3, itn_use: 0.6,
-           itn_hist_years: [2017.0], campaign_year: 2020.0}
+           itn_hist_years: [2017.0], campaign_year: 2020.0, irs_product: short}   # assumption: mostly short-lived products
     params: {n_agents: 5000}
     calibrate: {attribute: m0, arm_package: {net: pyr}, value_path: windows.m12.pfpr_6m14y, target: 0.40,
                 grid: [8, 16, 32, 64, 128]}
@@ -121,12 +130,14 @@ benchmarks:
      estimand: {type: ratio, num: coch_pyr, den: coch_none, value: windows.m12.pfpr_6m14y}}
   - {id: B8, metric: "ITN vs none, clinical incidence RR 0-24 m (under 5)", target: 0.55, band: [0.46, 0.64],
      source: "C22 Pryce 2018", estimand: {type: ratio, num: coch_pyr, den: coch_none, value: windows.m0_24.inc_u5}}
-  - {id: B9, metric: "PBO vs pyrethroid nets, prevalence OR at 9 m (pooled over IRS arms)", target: 0.37, band: [0.09, 0.65],
-     source: "C15 Protopopoff 2018 Lancet",
-     estimand: {type: odds_ratio, num: [mul_pbo, mul_pbo_irs], den: [mul_pyr, mul_pyr_irs], value: windows.m9.pfpr_6m14y}}
-  - {id: B9b, metric: "PBO vs pyrethroid nets, prevalence OR at 21 m (pooled over IRS arms)", target: 0.40, band: [0.20, 0.81],
-     source: "C15 Protopopoff 2018 (added held-out durability check)",
-     estimand: {type: odds_ratio, num: [mul_pbo, mul_pbo_irs], den: [mul_pyr, mul_pyr_irs], value: windows.m21.pfpr_6m14y}}
+  # v0.2 basis fix: the trial's 0.37 and 0.40 are PBO LLIN alone vs standard LLIN (Table 2; the factorial model
+  # has an interaction term, so its main-effect ORs equal the single-arm comparisons). v0.1 pooled over IRS arms.
+  - {id: B9, metric: "PBO vs pyrethroid nets (no IRS), prevalence OR at 9 m", target: 0.37, band: [0.09, 0.65],
+     source: "C15 Protopopoff 2018 Lancet, Table 2 (PBO LLIN vs standard LLIN, 9 months)",
+     estimand: {type: odds_ratio, num: mul_pbo, den: mul_pyr, value: windows.m9.pfpr_6m14y}}
+  - {id: B9b, metric: "PBO vs pyrethroid nets (no IRS), prevalence OR at 21 m", target: 0.40, band: [0.20, 0.81],
+     source: "C15 Protopopoff 2018, Table 2 (21 months; held-out durability check)",
+     estimand: {type: odds_ratio, num: mul_pbo, den: mul_pyr, value: windows.m21.pfpr_6m14y}}
   - {id: B9c, metric: "PBO vs pyrethroid nets, prevalence aOR at 24 m (Misungwi)", target: 0.99, band: [0.67, 1.45],
      source: "C17 Mosha 2022 Lancet (added held-out durability check)",
      estimand: {type: odds_ratio, num: mis_pbo, den: mis_pyr, value: windows.m24.pfpr_6m14y}}
@@ -139,10 +150,16 @@ benchmarks:
      estimand: {type: ratio, num: irs_itn_irs, den: irs_itn, value: windows.m12.pfpr_6m14y}}
   - {id: B12b, metric: "Non-pyrethroid IRS added to ITN, incidence RR 0-24 m", target: 0.86, band: [0.49, 1.23],
      source: "C23 Pryce 2022", estimand: {type: ratio, num: irs_itn_irs, den: irs_itn, value: windows.m0_24.inc_u5}}
+  - {id: B12m, metric: "Pirimiphos-methyl IRS added to pyrethroid nets (Muleba), prevalence OR at 9 m", target: 0.33,
+     band: [0.19, 0.55], source: "Protopopoff 2018 Lancet, Table 2 (standard LLIN + IRS vs standard LLIN; band = 95% CI)",
+     estimand: {type: odds_ratio, num: mul_pyr_irs, den: mul_pyr, value: windows.m9.pfpr_6m14y}}
   - {id: B13, metric: "SMC, in-season clinical incidence RR (3-59 m)", target: 0.27, band: [0.14, 0.40],
      source: "C27 Thwing 2024 AJTMH", estimand: {type: ratio, num: smc_on, den: smc_off, value: windows.m0_24.inc_u5_smc}}
-  - {id: B15, metric: "ITN x IRS interaction OR (PBO x IRS, prevalence at 9 m, 2x2 factorial)", target: 2.43, band: [0.972, 6.075],
+  # v0.2: band = the trial's 95% CI (v0.1 used x/2.5, 0.972-6.075, whose floor cannot separate "no interaction"
+  # from 2.43). Assessable only when both single-arm effects are inside the trial's 95% CIs (`requires`).
+  - {id: B15, metric: "ITN x IRS interaction OR (PBO x IRS, prevalence at 9 m, 2x2 factorial)", target: 2.43, band: [1.19, 4.97],
      source: "C16 Protopopoff 2018: interaction OR 2.43 (1.19-4.97)",
+     requires: {B9: [0.21, 0.65], B12m: [0.19, 0.55]},
      estimand: {type: interaction_or, a11: mul_pbo_irs, a10: mul_pbo, a01: mul_pyr_irs, a00: mul_pyr,
                 value: windows.m9.pfpr_6m14y}}
   - {id: B16c, metric: "EIR-prevalence curve (Beier 1999 rules: EIR > 15 -> PfPR >= 50%; EIR >= 200 -> PfPR > 80%)",
@@ -166,8 +183,10 @@ benchmarks:
      band: [3.8, 95.0], source: "C19 Mosha 2022", estimand: {type: cost_per_outcome, num: cer_dual, den: cer_pyr,
      value: per_capita_all.dalys, costs_num: {nets_given: 0.380}}}
 
-fit:   # in order; every benchmark not named here is held out
-  - {param: itn_kill_max, grid: [0.15, 0.25, 0.35, 0.45, 0.6, 0.75], targets: [B7, B8]}
-  - {param: pbo_restore, grid: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0], targets: [B9]}
-  - {param: cfp_kill, grid: [0.05, 0.15, 0.3, 0.45, 0.6, 0.8], targets: [B10, B11]}
-  - {param: irs_kill, grid: [0.1, 0.25, 0.4, 0.55, 0.7, 0.9], targets: [B12, B12b]}
+# v0.2: one joint fit of the parameters no published source sets. Pyrethroid and PBO nets use the Churcher 2016
+# hut-trial coefficients, so B7, B8, B9, B9b and B9c are held out. Every benchmark not in `targets` is held out.
+fit_joint:
+  rule: joint-v1
+  params: {cfp_kill: [0.0, 0.8], irs_kill: [0.0, 0.95]}
+  targets: [B10, B11, B12, B12b, B12m]
+  design: {n: 24, seed: 7}
