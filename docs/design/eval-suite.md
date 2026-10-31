@@ -33,9 +33,9 @@ The suite follows OmicsBench: a subtask DAG, JSON answer files, deterministic gr
   - `evals/**` is export-ignored, so `git archive` (the launch tarball) leaves it out;
   - `code_tarball` refuses any tarball that still holds hidden files (`scripts/lib/eval_paths.py`);
   - the harness manifest hashes none of them;
-  - an eval question runs only from a **sanitized workspace**: an archive of the tree, with no `evals/` and no `.git`. On the cloud this is the worker's unpacked tarball. Locally, `eval_suite.py run --local` builds one per replicate. `main.py` refuses an eval question (marked "(evaluation suite)") from a checkout. This is the structural barrier: in a checkout, the generators are reachable through `git show`, absolute paths or a recursive grep, and no deny pattern closes every route;
+  - eval questions run **only on the cloud launcher**. The worker is a fresh VM whose work directory is the launch archive: no `evals/`, no `.git`, and no other checkout on the machine. It sets `MA_EVAL_ISOLATED=cloud-worker`. `main.py` refuses an eval question without that marker, or in a root holding `evals/` content or history. The check runs on the effective question (including `--resume` metadata). A question counts as an eval question when its run metadata says `eval_question: true` or its text starts with the complete synthetic prefix. Local runs are not supported (`run --local` refuses), because a local machine can always reach some checkout's history (`git -C <checkout> show`), and no deny pattern closes every route;
   - as defence in depth only, `agents/enforcement.py` refuses agent `Read`, `Grep` and Bash references to `evals/…` and `_truth` paths;
-  - shipped text (the plan, CHANGELOG, skills, prompts, CLAUDE.md, configs, `scripts/`) never signals a planted answer. Self-test R1 scans the archive of HEAD and the tracked files for each rubric's `leak_keywords` next to a mention of the suite. The question ids are neutral for the same reason (the non-identifiable question is `dengue_outbreak`).
+  - shipped text (the plan, CHANGELOG, skills, prompts, CLAUDE.md, configs, `scripts/`) never signals a planted answer. Question-specific tests and fixtures live in the export-ignored `evals/test_suite.py`. Self-tests R1 and R6 scan the archive of HEAD and the tracked files for two things: each rubric's `leak_keywords` next to a mention of the suite, and, anywhere, each regenerated truth's allocation vectors and headline numbers. The question ids are neutral for the same reason (the non-identifiable question is `dengue_outbreak`).
   - Self-tests L1–L7, R1, R2, EP6–EP9 and RC50 fail if any of this breaks.
 
 ## 3. Questions and their truths
@@ -205,7 +205,8 @@ How to run each arm:
 - `run` refuses to launch when the inputs are stale or the tarball of HEAD holds hidden files.
 - **Inputs are verified.** `run` hashes the inputs in the archive of the tree it will ship, not this checkout's, and refuses if they differ from what the answer keys were generated from. Launch and relaunch record those hashes per run in `assignments.json`. Grading refuses a run whose recorded inputs differ from its truth (`inputs_mismatch`) or are unrecorded (`inputs_unrecorded`). `grade --unverified-inputs` allows an ad-hoc look, and the score records that it was used (R5).
 - **Replicates come from the launch record.** `grade --root` takes labels and launch ids from each question's `assignments.json`. It grades a label only when its `result.json` names this launch, and never a `<label>.before_*` copy. An expected replicate that is missing or stale scores 0, and so does a question with no launch record (`run_record_missing`; R4).
-- `run --local [--execute]` runs on this machine instead, each replicate in its own sanitized workspace, laid out the way `collect` lays out a cloud launch.
+- Single-run grading (`grade <q> <run_dir>`) uses the assignment's input hashes only when the label's collected `result.json` names the same launch (R11).
+- Allocation files with duplicate or unrecognised unit rows are infeasible (R10).
 
 **Expected cost:**
 - **Per question:** US$20–35 in model spend, capped at US$35, and under an hour. For comparison, the 8-district malaria smoke on 2026-10-31 (cap US$25, 2 rounds) cost US$14.05 in 46 min and stopped after round 1.
@@ -219,7 +220,7 @@ How to run each arm:
 
 - **Synthetic and simplified.** The truth is the optimum of the generating model. The question text fixes the parts of the model structure that would otherwise make several answers defensible (homogeneous mixing and final size for measles, SIR with the given contact matrix for flu, a stable prevalence for TB). The suite therefore tests estimation from data, mechanism discovery, optimisation, uncertainty and honesty. It does not test the choice of model structure.
 - **Lexical mechanism checks.** The checks match regular expressions within a window, so a negated sentence ("there is no redundancy") would still match. The allocation and value checks do not have this weakness, and a missed mechanism usually shows up there too.
-- **The repository is public.** The generators are visible on GitHub. The question text does not name the repository, and the data are synthetic. No run workspace, cloud or local, holds `evals/` or the history. An agent with web access could still look the repository up; we accept that risk and do not try to stop it.
+- **The repository is public.** The generators are visible on GitHub. The question text does not name the repository, and the data are synthetic. No run workspace holds `evals/` or the history; eval runs are cloud-only. An agent with web access could still look the repository up; we accept that risk and do not try to stop it.
 - **Dollars are model spend only** (`metadata.json` `total_cost_usd`). VM credits come from `run_cluster.py report-cost`.
 - **The questions are small.** They exercise the full pipeline at about 1/15 of an E7 run's cost. They do not replace an E7-scale run as the final check.
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import os
 import sys
 import tarfile
@@ -63,7 +64,8 @@ def archive_sha256(blob: bytes, prefix: str = "data/evals/") -> dict:
 
 
 # The marker every eval question's text carries in its first words.
-EVAL_MARKER = "(evaluation suite)"
+EVAL_PREFIX = "SYNTHETIC TEST QUESTION (evaluation suite):"
+ISOLATION_ENV, ISOLATION_VALUE = "MA_EVAL_ISOLATED", "cloud-worker"
 _WORKSPACE_HIDDEN = (".git", "evals", os.path.join("docs", "design", "eval-suite.md"))
 
 
@@ -78,17 +80,42 @@ def workspace_hidden(root: str) -> list[str]:
     return found
 
 
-def eval_workspace_problem(question: str, root: str) -> str | None:
-    """An eval question runs only in a sanitized workspace: an archive of the tree,
-    with no evals/ and no repository history. In a checkout, agents could reach the
-    answer keys through the history or the generators, and no deny pattern closes
-    every route."""
-    if EVAL_MARKER not in (question or ""):
+def is_eval_question(question: str, meta: dict | None = None) -> bool:
+    """An eval question is marked by explicit run metadata (`eval_question: true`) or by
+    the complete synthetic prefix at the start of its text, not by a substring anywhere."""
+    if isinstance(meta, dict) and meta.get("eval_question") is True:
+        return True
+    return (question or "").lstrip().startswith(EVAL_PREFIX)
+
+
+def question_for(question_arg: str | None, resume_dir: str | None) -> tuple[str, dict]:
+    """The question a run will actually use, and the run metadata it came from: the
+    argument, else the metadata.json of the run being resumed."""
+    meta = {}
+    if resume_dir:
+        try:
+            with open(os.path.join(resume_dir, "metadata.json")) as f:
+                meta = json.load(f) or {}
+        except (OSError, ValueError):
+            meta = {}
+        meta = meta if isinstance(meta, dict) else {}
+    return (question_arg or meta.get("question") or ""), meta
+
+
+def eval_workspace_problem(question: str, root: str, meta: dict | None = None) -> str | None:
+    """Eval questions run only on a cloud worker: a fresh VM whose work directory is the
+    unpacked launch archive (no evals/, no repository history) and which no other
+    checkout shares. A local machine can always reach some checkout's history, so a
+    local run is refused even from a clean directory. The worker sets
+    MA_EVAL_ISOLATED=cloud-worker (cloud/worker_side.py)."""
+    if not is_eval_question(question, meta):
         return None
+    if os.environ.get(ISOLATION_ENV) != ISOLATION_VALUE:
+        return ("this is an eval-suite question: eval runs execute only on the cloud launcher "
+                "(python3 scripts/eval_suite.py run), never on a local machine")
     found = workspace_hidden(root)
     if found:
-        return (f"this is an eval-suite question, and {root} holds {', '.join(found)}: run it from a sanitized "
-                "workspace (`python3 scripts/eval_suite.py run --local`, or the cloud launcher)")
+        return f"this is an eval-suite question, and {root} holds {', '.join(found)}: refusing"
     return None
 
 
@@ -129,13 +156,28 @@ def _self_test() -> int:
        "EP7 archive_sha256 hashes the shipped inputs only")
     import tempfile
     with tempfile.TemporaryDirectory() as td:
-        q = "SYNTHETIC TEST QUESTION (evaluation suite): x"
+        q = EVAL_PREFIX + " x"
         os.makedirs(os.path.join(td, "evals"))   # the empty directory entry git archive keeps
-        ok(eval_workspace_problem(q, td) is None, "EP8 a sanitized workspace (empty evals/) may run an eval question")
-        os.makedirs(os.path.join(td, ".git"))
-        open(os.path.join(td, ".git", "HEAD"), "w").close()
-        ok(eval_workspace_problem(q, td) and eval_workspace_problem("ordinary", td) is None,
-           "EP9 a checkout may not run an eval question; ordinary questions are unaffected")
+        saved = os.environ.pop(ISOLATION_ENV, None)
+        try:
+            ok(eval_workspace_problem(q, td), "EP8 off the cloud worker an eval question is refused, even in a clean dir")
+            os.environ[ISOLATION_ENV] = ISOLATION_VALUE
+            ok(eval_workspace_problem(q, td) is None, "EP8b a cloud worker's unpacked archive (empty evals/) may run it")
+            os.makedirs(os.path.join(td, ".git"))
+            open(os.path.join(td, ".git", "HEAD"), "w").close()
+            ok(eval_workspace_problem(q, td) and eval_workspace_problem("ordinary", td) is None,
+               "EP9 a root with history may not run an eval question; ordinary questions are unaffected")
+        finally:
+            os.environ.pop(ISOLATION_ENV, None)
+            if saved is not None:
+                os.environ[ISOLATION_ENV] = saved
+        ok(not is_eval_question("a question about the (evaluation suite) marker") and is_eval_question(q)
+           and is_eval_question("x", {"eval_question": True}), "EP10 detection: full prefix or explicit metadata only")
+        os.makedirs(os.path.join(td, "r"))
+        with open(os.path.join(td, "r", "metadata.json"), "w") as f:
+            json.dump({"question": q}, f)
+        ok(question_for(None, os.path.join(td, "r"))[0] == q and question_for("arg", None) == ("arg", {}),
+           "EP11 the effective question: the argument, else the resumed run's metadata")
     for f in fails:
         print("FAIL:", f, file=sys.stderr)
     if fails:
