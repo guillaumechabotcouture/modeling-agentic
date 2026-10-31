@@ -116,7 +116,10 @@ def main():
                   f"({loo['folds_with_rank_corr']} folds with ≥5 LGAs; verdict {A['loo']['verdict']}) | {ref['loo_worst_fold_rank_r']} (UNSTABLE) |",
                   f"| LOO package concordance, mean / worst fold | {fmt(loo['package_concordance_pct_mean'])}% / "
                   f"{fmt(loo['package_concordance_pct_worst_fold'])}% | 86.7% / 30.8% |",
-                  f"| LOO DALY gap, mean / worst fold | {fmt(loo['benefit_gap_pct_mean'])}% / {fmt(loo['benefit_gap_pct_worst_fold'])}% | 4.0% / 35.9% (cases) |",
+                  f"| LOO package concordance, worst fold with ≥5 LGAs | {fmt(loo.get('package_concordance_pct_worst_fold_ge5'))}% | n/a |",
+                  f"| LOO DALY gap in the held-out LGAs, mean / worst fold (skill metric) | {fmt(loo['benefit_gap_pct_mean'])}% / {fmt(loo['benefit_gap_pct_worst_fold'])}% | 4.0% / 35.9% (cases) |",
+                  f"| LOO DALYs lost over all LGAs (fold plan judged with full calibration), mean / worst | "
+                  f"{fmt(loo.get('total_benefit_loss_pct_mean'))}% / {fmt(loo.get('total_benefit_loss_pct_worst_fold'))}% | n/a |",
                   f"| Max calibrated annual EIR (B16: 120, band 40–200) | {fmt(A['calibration']['max_eir_annual'])} | 106–168 |",
                   f"| Units clamped at the calibration range | {A['calibration']['clamped_units']} of {A['calibration']['units']} | n/a |",
                   f"| Emulator held-out accuracy | reduction R² median {fmt(A['emulator_accuracy'].get('reduction_r2_median'))}, "
@@ -147,7 +150,7 @@ def main():
         sp = json.load(open(a.spend))
         parts += ["", "### Spend and time", "", "| Item | Spike | Attempt 8 |", "|---|---|---|",
                   f"| Coiled credits (clusters {sp['cluster_prefix']}*) | {sp['credits']} ({sp['instances']} VMs) | 5,074 |",
-                  f"| Estimated VM cost at {sp['usd_per_credit']} $/credit | ${sp['usd_est']:.2f} | about $300 |",
+                  f"| Estimated VM cost at {sp['usd_per_credit']} $/credit | ${sp['usd_est']:.2f} | about ${5074 * sp["usd_per_credit"]:.0f} at the same rate |",
                   f"| Pipeline model-call spend (critics, writer) | ${sp['model_calls_usd']:.2f} | $442 |",
                   f"| Batch wall time | {sp.get('batch_wall_min', 'n/a')} min | 44 h total run |"]
     text = "\n".join(parts)

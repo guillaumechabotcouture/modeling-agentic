@@ -212,11 +212,14 @@ class Analysis:
             c_full = [cost0[i][plan[i]]["total"] for i in hid]
             c_fold = [cost0[i][pf[i]]["total"] for i in hid]
             rho = _spearman(c_full, c_fold) if len(hid) >= 3 else None
+            tot_full = sum(ben0[i][plan[i]] for i in self.ids)
+            tot_fold = sum(ben0[i][pf[i]] for i in self.ids)   # the fold plan, judged with full-calibration benefits
             b_full = sum(ben0[i][plan[i]] for i in hid)
             b_fold = sum(ben0[i][pf[i]] for i in hid)
             folds.append({"group": gv, "n_units": len(hid), "rank_corr": rho,
                           "package_concordance_pct": 100.0 * np.mean([plan[i] == pf[i] for i in hid]),
                           "benefit_gap_pct": 100.0 * (b_full - b_fold) / b_full if b_full > 0 else 0.0,
+                          "total_benefit_loss_pct": 100.0 * (tot_full - tot_fold) / tot_full if tot_full > 0 else 0.0,
                           "z_shift_mean": float(np.mean([zh[i] - z0[i] for i in hid]))})
         big = [f for f in folds if f["n_units"] >= 5 and f["rank_corr"] is not None and not math.isnan(f["rank_corr"])]
         res = {"holdout_method": f"leave-one-{g}-out", "n_folds": len(folds), "folds": folds,
@@ -225,6 +228,9 @@ class Analysis:
                            "folds_with_rank_corr": len(big),
                            "package_concordance_pct_mean": _mean([f["package_concordance_pct"] for f in folds]),
                            "package_concordance_pct_worst_fold": min(f["package_concordance_pct"] for f in folds),
+                           "package_concordance_pct_worst_fold_ge5": min((f["package_concordance_pct"] for f in big), default=None),
+                           "total_benefit_loss_pct_mean": _mean([f["total_benefit_loss_pct"] for f in folds]),
+                           "total_benefit_loss_pct_worst_fold": max(f["total_benefit_loss_pct"] for f in folds),
                            "benefit_gap_pct_mean": _mean([f["benefit_gap_pct"] for f in folds]),
                            "benefit_gap_pct_worst_fold": max(f["benefit_gap_pct"] for f in folds)}}
         m_ = res["metrics"]
