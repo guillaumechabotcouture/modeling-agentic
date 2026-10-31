@@ -393,6 +393,19 @@ it's scientific integrity.
   via calabaria cloud would enable longitudinal validation"
 ```
 
+### Where declarations appear in the report
+
+A declaration is a limit on the recommendation, so a reader of the
+executive summary alone must see it. The writer puts the placeholder
+`[DECLARED_LIMITS]` once in the executive summary; `scripts/render_claims.py`
+replaces it with a "What this does not establish" block generated from
+`scope_declaration.yaml`: each declaration's id, its claim, and its measured
+effect on the recommendation from its `decision_test` (or "untested",
+"exempt: <reason>", "invalid test"). Write each declaration's `claim` as one
+plain sentence a decision-maker can read, since it is printed as written.
+The full declaration still goes verbatim in §Limitations. The gate's
+`declared_limits_not_rendered` finding checks the placeholder and the block.
+
 ---
 
 ## References

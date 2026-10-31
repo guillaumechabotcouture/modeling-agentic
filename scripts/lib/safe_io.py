@@ -97,7 +97,9 @@ def safe_load_mapping(
     try:
         with open(path, encoding="utf-8") as f:
             doc = yaml.safe_load(f)
-    except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
+    except (OSError, UnicodeDecodeError, yaml.YAMLError, ValueError, RecursionError) as e:
+        # ValueError / RecursionError: YAML that parses but cannot be constructed (an
+        # impossible date, nesting deeper than the interpreter allows); Phase 49 γ, fuzz #86.
         return None, [_finding(
             f"{kind_prefix}_invalid", stage,
             f"`{shown}` could not be read/parsed ({type(e).__name__}: "
@@ -253,6 +255,16 @@ def _self_test() -> int:
            and fs[0]["severity"] == "HIGH", "S2 parse error → HIGH invalid")
         ok(fs and fs[0]["scope_declarable"] is False,
            "S2b invalid is not scope-declarable")
+        # S2c/S2d (Phase 49 γ, fuzz #86): YAML construction errors outside YAMLError
+        # (an impossible date → ValueError; deep nesting → RecursionError) fail closed.
+        for name, text in (("date.yaml", "at: 2026-13-45\n"), ("deep.yaml", "a: " + "[" * 5000 + "]" * 5000 + "\n")):
+            p = write(d, name, text)
+            try:
+                doc, fs = safe_load_mapping(p, "x")
+                ok(doc is None and fs and fs[0]["kind"] == "x_invalid",
+                   f"S2c {name}: a construction error is an invalid finding: {fs}")
+            except (ValueError, RecursionError) as e:
+                ok(False, f"S2c {name}: safe_load_mapping raised {type(e).__name__}")
 
         # S3: top-level list → HIGH invalid
         p = write(d, "list.yaml", "- a\n- b\n")
