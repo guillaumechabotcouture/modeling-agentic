@@ -1,13 +1,48 @@
-# Malaria engine v0.2: benchmark notes
+# Malaria engine v0.3: benchmark notes
 
-Engine `malaria-starsim` v0.2 (workstream A of architecture v2). Design note:
+Engine `malaria-starsim` v0.3 (workstream A of architecture v2). Design note:
 `docs/design/v2a-malaria-engine.md`. Every number in the tables block is rendered from
-`benchmarks/results.yaml`, `benchmarks/fitted.yaml`, `benchmarks/b15_mechanisms.yaml` and
-the spike's `benchmarks/history/results_v0.1-spike.yaml` by `benchmarks/render_notes.py`.
-Reproduce with `bash toolkit/engines/malaria/benchmarks/validate_once.sh` (about 75 min on
-a 16-vCPU VM).
+`benchmarks/results.yaml`, `benchmarks/fitted.yaml` and `benchmarks/b15_mechanisms.yaml`,
+with the spike (`history/results_v0.1-spike.yaml`) and PR round 1 (`history/results_v0.2.yaml`)
+beside them, by `benchmarks/render_notes.py`. Reproduce with
+`bash toolkit/engines/malaria/benchmarks/validate_once.sh` on a VM.
 
-## What changed from the spike (v0.1)
+## v0.3: review corrections and field use of nets
+
+**Corrections from review (Codex round 1).** These change the v0.2 numbers, and v0.2's
+results are superseded:
+- **Churcher 2016 Equation 4 was miscopied in v0.2.** The PBO bioassay relationship is
+  logit(f) = b1 + b2(x − τ)/(1 + b3(x − τ)); v0.2 divided b1 as well. At Muleba (8.8%
+  permethrin mortality) PBO bioassay mortality is 0.46, not 0.81, so v0.2 overstated the
+  PBO effect there. The tests now reproduce the paper's own statements: in the
+  *An. gambiae* complex the PBO gain peaks at intermediate resistance, and in
+  *An. funestus* PBO restores near-100% mortality. The other equations used (2, 8, 11–19)
+  and every Table 6 coefficient were re-checked against the paper's MathML and table XML;
+  they match.
+- **A not-assessable or band-mis-based benchmark no longer counts as a pass.** Every pass
+  total now follows the status.
+- **The fit's feasibility claim uses the verification re-run, not the surrogate.** If the
+  re-run disproves the surrogate, the claim is withdrawn and the targets are listed.
+
+**Field use of nets (owner decision: model why field effects are lower than hut effects,
+with no fitted field-efficacy factor).** Each mechanism is tested on its own, then together:
+- **Attrition:** nets are lost with the LLIN median retention of 1.64 years (Bertozzi-Villa
+  2021, 40 countries, IQR 1.33–2.37), used as an exponential half-life. Muleba uses its own
+  trial-reported decline in use instead (77.3% in year 1, 59.2% in year 2, a 2.60-year
+  half-life).
+- **Use below access:** people with a net use it on 87.1% of nights on average
+  (Bertozzi-Villa 2021, use among those with access). Half of the use gap is persistent
+  non-use and half is night-to-night variation; that split is an assumption. Survey-reported
+  use is mapped back to access at distribution, and the mapping is capped at 100% access
+  and flagged when it hits the cap.
+- **Holes:** the log odds of feeding through a net rise by 0.379–0.541 per unit of
+  ln(holed area + 1) (Briët 2020, Table S9, susceptible and resistant strains). Holed area
+  grows to the seven-cohort median of ln(area) 3.67 at 24 months (Table 3).
+- **Insecticide decay in use** was already in the Churcher relationships.
+
+None of these values is fitted to B7/B8, and B7/B8 stay held out.
+
+## v0.2: what changed from the spike (v0.1)
 
 Mechanisms (no interaction factor anywhere):
 - **Nets from published hut-trial coefficients.** Pyrethroid and PBO nets use Churcher
