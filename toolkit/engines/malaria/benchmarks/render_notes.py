@@ -57,13 +57,16 @@ def _band(r):
     return f"{_fmt(r.get('target'))} ({_fmt(b[0])}–{_fmt(b[1])})" if b else "rules"
 
 
-def render(new: dict, old: dict | None, fitted: dict | None, mech: dict | None, mid: dict | None = None) -> str:
+def render(new: dict, old: dict | None, fitted: dict | None, mech: dict | None, mid: dict | None = None,
+           extra: list | None = None) -> str:
+    """extra: [(label, results dict)] of earlier rounds, shown between the spike and the current run."""
     o = {r["id"]: r for r in (old or {}).get("benchmarks", [])}
-    m = {r["id"]: r for r in (mid or {}).get("benchmarks", [])}
+    cols = [(lab, {r["id"]: r for r in (res or {}).get("benchmarks", [])}) for lab, res in (extra or ([("v0.2", mid)] if mid else []))]
     ver = new.get("engine_version", "new")
-    out = [f"### Benchmark pack: spike v0.1, v0.2 (PR round 1) and v{ver}", "",
-           f"| ID | Benchmark | Target (band) | v0.1 spike | v0.2 | v{ver} | v{ver} seed range | v{ver} status | Role |",
-           "|---|---|---|---|---|---|---|---|---|"]
+    head = " | ".join(lab for lab, _ in cols)
+    out = [f"### Benchmark pack: spike v0.1, earlier rounds and v{ver} (this run)", "",
+           f"| ID | Benchmark | Target (band) | v0.1 spike | {head} | v{ver} | v{ver} seed range | v{ver} status | Role |",
+           "|---|---|---|---|" + "---|" * len(cols) + "---|---|---|---|"]
 
     def cell(p):
         if not p:
@@ -71,7 +74,8 @@ def render(new: dict, old: dict | None, fitted: dict | None, mech: dict | None, 
         st = p.get("status") or ("in_band" if p.get("in_band") else "out_of_band")
         return f"{_value(p)} ({LABEL[st]})"
     for r in new["benchmarks"]:
-        out.append(f"| {r['id']} | {r['metric']} | {_band(r)} | {cell(o.get(r['id']))} | {cell(m.get(r['id']))} | "
+        mids = " | ".join(cell(c.get(r["id"])) for _, c in cols)
+        out.append(f"| {r['id']} | {r['metric']} | {_band(r)} | {cell(o.get(r['id']))} | {mids} | "
                    f"{_value(r)} | {_spread(r)} | {LABEL[r['status']]} | {r['role']} |")
     s = new["summary"]
     bs = s["by_status"]
@@ -152,7 +156,9 @@ def write(path=NOTES) -> None:
         raise SystemExit("results.yaml missing: run the pack first")
     block = render(new, _y(os.path.join(HERE, "history", "results_v0.1-spike.yaml")),
                    _y(os.path.join(HERE, "fitted.yaml")), _y(os.path.join(HERE, "b15_mechanisms.yaml")),
-                   _y(os.path.join(HERE, "history", "results_v0.2.yaml")))
+                   extra=[(lab, _y(os.path.join(HERE, "history", f))) for lab, f in
+                          (("v0.2 (round 1)", "results_v0.2.yaml"), ("v0.3 round 2", "results_v0.3-r2.yaml"))
+                          if os.path.exists(os.path.join(HERE, "history", f))])
     text = open(path).read()
     i, j = text.index(START), text.index(END)
     open(path, "w").write(text[:i + len(START)] + "\n" + block + "\n" + text[j:])

@@ -1,0 +1,304 @@
+engine: toolkit.engines.malaria.engine:MalariaEngine
+engine_version: '0.3'
+fitted_at: '2026-10-31 21:01:39'
+seeds:
+- 11
+- 12
+- 13
+- 14
+- 15
+- 16
+- 17
+- 18
+n_sims: 1744
+wall_s: 1910.0
+parameters:
+  cfp_kill:
+    value: 0.425
+    lo: 0.415
+    hi: 0.575
+    box:
+    - 0.0
+    - 0.8
+    benchmarks: &id001
+    - B10
+    - B11
+    - B12
+    - B12b
+    - B12m
+  irs_kill:
+    value: 0.421563
+    lo: 0.3028
+    hi: 0.5403
+    box:
+    - 0.0
+    - 0.95
+    benchmarks: *id001
+fit_rule:
+  version: joint-v1
+  description: LHS(n)+centre on the pack seeds; calibration at the box centre; quadratic
+    surrogate of each target's log value; infeasible targets dropped; argmin (n out
+    of band, band-scaled squared log error) on a dense grid; range = region with all
+    feasible targets in band; verification re-run with re-calibration at the chosen
+    value
+  seeds:
+  - 11
+  - 12
+  - 13
+  - 14
+  - 15
+  - 16
+  - 17
+  - 18
+  design_points: 25
+  design_seed: 7
+  targets: *id001
+feasibility:
+  feasible_in_box:
+  - B10
+  - B11
+  - B12
+  - B12b
+  - B12m
+  infeasible_in_box: []
+  conflicting_pairs: []
+  all_feasible_in_band_at_value: true
+  surrogate_all_feasible_in_band: true
+  disproved_by_verification: []
+  feasibility_verified: true
+surrogate:
+  B10:
+    loo_rmse_log: 0.0129
+  B11:
+    loo_rmse_log: 0.0167
+  B12:
+    loo_rmse_log: 0.0118
+  B12b:
+    loo_rmse_log: 0.0128
+  B12m:
+    loo_rmse_log: 0.0236
+calibration:
+  at_box_centre:
+    benin: 13.3257
+    irs_added: 28.658
+    misungwi: 11.9401
+    muleba: 127.5563
+  at_fitted_value:
+    benin: 13.3257
+    irs_added: 28.658
+    misungwi: 11.9401
+    muleba: 127.5563
+verification:
+  B10:
+    computed: 0.6646
+    predicted: 0.6626
+    in_band: true
+    seed_min: 0.6035
+    seed_max: 0.7393
+  B11:
+    computed: 0.5113
+    predicted: 0.4975
+    in_band: true
+    seed_min: 0.4813
+    seed_max: 0.5373
+  B12:
+    computed: 0.7997
+    predicted: 0.8005
+    in_band: true
+    seed_min: 0.7589
+    seed_max: 0.8497
+  B12b:
+    computed: 0.5742
+    predicted: 0.5756
+    in_band: true
+    seed_min: 0.5342
+    seed_max: 0.6301
+  B12m:
+    computed: 0.4513
+    predicted: 0.4435
+    in_band: true
+    seed_min: 0.4288
+    seed_max: 0.48
+design:
+  x:
+  - cfp_kill: 0.250152
+    irs_kill: 0.931837
+  - cfp_kill: 0.589734
+    irs_kill: 0.826513
+  - cfp_kill: 0.176768
+    irs_kill: 0.348043
+  - cfp_kill: 0.100176
+    irs_kill: 0.255118
+  - cfp_kill: 0.320739
+    irs_kill: 0.437156
+  - cfp_kill: 0.159902
+    irs_kill: 0.035515
+  - cfp_kill: 0.754657
+    irs_kill: 0.113745
+  - cfp_kill: 0.020837
+    irs_kill: 0.176856
+  - cfp_kill: 0.769717
+    irs_kill: 0.900195
+  - cfp_kill: 0.661002
+    irs_kill: 0.680857
+  - cfp_kill: 0.34051
+    irs_kill: 0.712648
+  - cfp_kill: 0.05919
+    irs_kill: 0.550888
+  - cfp_kill: 0.076672
+    irs_kill: 0.574517
+  - cfp_kill: 0.387085
+    irs_kill: 0.603547
+  - cfp_kill: 0.516562
+    irs_kill: 0.495381
+  - cfp_kill: 0.401189
+    irs_kill: 0.402175
+  - cfp_kill: 0.716993
+    irs_kill: 0.758197
+  - cfp_kill: 0.29985
+    irs_kill: 0.048498
+  - cfp_kill: 0.448874
+    irs_kill: 0.395396
+  - cfp_kill: 0.533726
+    irs_kill: 0.151257
+  - cfp_kill: 0.208496
+    irs_kill: 0.298993
+  - cfp_kill: 0.487641
+    irs_kill: 0.864783
+  - cfp_kill: 0.612318
+    irs_kill: 0.640949
+  - cfp_kill: 0.675587
+    irs_kill: 0.208938
+  - cfp_kill: 0.4
+    irs_kill: 0.475
+  computed:
+    B10:
+    - 0.7986
+    - 0.5496
+    - 0.8628
+    - 0.9206
+    - 0.742
+    - 0.8715
+    - 0.4225
+    - 0.9751
+    - 0.4254
+    - 0.5102
+    - 0.7122
+    - 0.9337
+    - 0.9312
+    - 0.6956
+    - 0.5969
+    - 0.6824
+    - 0.4574
+    - 0.7551
+    - 0.6358
+    - 0.5752
+    - 0.8377
+    - 0.6126
+    - 0.5188
+    - 0.4747
+    - 0.6869
+    B11:
+    - 0.6809
+    - 0.3771
+    - 0.7572
+    - 0.855
+    - 0.5935
+    - 0.7732
+    - 0.2781
+    - 0.9888
+    - 0.2679
+    - 0.3273
+    - 0.5748
+    - 0.9322
+    - 0.8848
+    - 0.5377
+    - 0.4182
+    - 0.5149
+    - 0.2893
+    - 0.6188
+    - 0.4807
+    - 0.4024
+    - 0.72
+    - 0.4475
+    - 0.3745
+    - 0.3169
+    - 0.5198
+    B12:
+    - 0.5961
+    - 0.6196
+    - 0.8266
+    - 0.8818
+    - 0.79
+    - 0.9789
+    - 0.9373
+    - 0.9235
+    - 0.6023
+    - 0.6871
+    - 0.6747
+    - 0.7399
+    - 0.7298
+    - 0.7252
+    - 0.7638
+    - 0.8187
+    - 0.6391
+    - 0.969
+    - 0.8176
+    - 0.9189
+    - 0.8599
+    - 0.6212
+    - 0.7151
+    - 0.8976
+    - 0.775
+    B12b:
+    - 0.2924
+    - 0.3281
+    - 0.6332
+    - 0.7128
+    - 0.56
+    - 0.954
+    - 0.8621
+    - 0.7917
+    - 0.3011
+    - 0.4022
+    - 0.3873
+    - 0.4795
+    - 0.4675
+    - 0.4482
+    - 0.5185
+    - 0.5927
+    - 0.3659
+    - 0.9251
+    - 0.6022
+    - 0.8173
+    - 0.6734
+    - 0.3263
+    - 0.4418
+    - 0.7624
+    - 0.5399
+    B12m:
+    - 0.2129
+    - 0.241
+    - 0.5189
+    - 0.6079
+    - 0.4312
+    - 0.9158
+    - 0.8245
+    - 0.7116
+    - 0.221
+    - 0.2917
+    - 0.2675
+    - 0.3504
+    - 0.3423
+    - 0.3285
+    - 0.3865
+    - 0.4643
+    - 0.2643
+    - 0.9075
+    - 0.4749
+    - 0.7381
+    - 0.5628
+    - 0.2253
+    - 0.3117
+    - 0.6584
+    - 0.4054
