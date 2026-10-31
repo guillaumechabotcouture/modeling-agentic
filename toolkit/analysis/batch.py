@@ -84,6 +84,10 @@ def design(spec) -> tuple[dict, list[dict]]:
 
 _E = {}
 CORE = ("point", "package", "components", "unit", "params", "seed")     # a job's own inputs (beside engine, horizon)
+# A re-run on another platform (the spike's batch ran on Linux VMs) differs in the last digits of floating point
+# (observed: about 1e-9 relative); 1e-6 separates that from a model change. Wall-clock timings are not outputs.
+ADOPT_RTOL = 1e-6
+TIMING_KEYS = frozenset({"seconds"})
 
 
 def job_sha(job: dict) -> str:
@@ -235,12 +239,6 @@ def adopt(run_dir: str, src_results: str, src_jobs: str, src_design: str, jobs: 
     return {"path": out, "adopted_from": src, "jobs_matched": len(seen), "rerun_sample": pick,
             "rerun_reproduced": len(pick), "rtol": rtol, "rerun_max_rel_diff": worst[0],
             "ignored": sorted(TIMING_KEYS)}
-
-
-# A re-run on another platform (the spike's batch ran on Linux VMs) differs in the last digits of floating point
-# (observed: about 1e-9 relative); 1e-6 separates that from a model change. Wall-clock timings are not outputs.
-ADOPT_RTOL = 1e-6
-TIMING_KEYS = frozenset({"seconds"})
 
 
 def _same(a, b, rtol, worst=None) -> bool:
