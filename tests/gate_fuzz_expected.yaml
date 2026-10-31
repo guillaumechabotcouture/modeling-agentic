@@ -316,6 +316,10 @@ expected_failures:
       symlink_escape: [fails_open]
       undecodable: [raises]
       wrong_type: [raises]
+  scope_signoff:
+    scope_declaration.yaml:
+      alias_loop: [fails_open]
+      symlink_escape: [fails_open]
   stall_rule:
     validator_history.jsonl:
       empty: [fails_open]

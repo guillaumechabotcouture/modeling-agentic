@@ -101,6 +101,10 @@ DELEGATES: dict[tuple[str, str], tuple[str, str]] = {
         ("lib.scope_declarations.load",
          "declaration_tests.gate_findings returns [] on an unreadable file: 'an unreadable "
          "scope_declaration.yaml is already HIGH (scope_declaration_invalid)', from this loader"),
+    ("scope_signoff", "scope_declaration.yaml"):
+        ("lib.scope_declarations.load",
+         "scope_signoff.gate_findings reads declarations through sd.load; an unreadable file is the "
+         "gate's scope_declaration_invalid, from this loader"),
     ("declared_limits", "scope_declaration.yaml"):
         ("lib.scope_declarations.load",
          "the shared loader of scope_declaration.yaml; its findings are the gate's scope_declaration_invalid"),
