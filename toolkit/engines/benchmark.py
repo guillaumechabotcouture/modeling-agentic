@@ -563,7 +563,11 @@ def fit_joint(pack: dict, engine, runner: Runner) -> dict:
                          "seeds": list(runner.seeds), "design_points": len(thetas), "design_seed": int(dz.get("seed", 1)),
                          "targets": targets},
             "feasibility": {"feasible_in_box": feasible, "infeasible_in_box": infeasible, "conflicting_pairs": conflicts,
-                            "all_feasible_in_band_at_value": bool(n_out[j] == 0)},
+                            # verified values, not the surrogate: a failed verification withdraws the claim
+                            "all_feasible_in_band_at_value": bool(feasible) and all(ver[t]["in_band"] for t in feasible),
+                            "surrogate_all_feasible_in_band": bool(n_out[j] == 0),
+                            "disproved_by_verification": [t for t in feasible if inband[t][j] and not ver[t]["in_band"]],
+                            "feasibility_verified": all(ver[t]["in_band"] == bool(inband[t][j]) for t in targets)},
             "surrogate": surr,
             "calibration": {"at_box_centre": cal_centre, "at_fitted_value": cal_best},
             "verification": ver,
@@ -589,14 +593,16 @@ def run_pack(pack: dict, engine, runner: Runner, fitted: dict, fit_info: dict | 
         rows.append(row)
     reach_check(pack, runner, rows, fit_info)
     apply_requires(rows)
+    for row in rows:                       # a pass is a status, never a raw band test
+        row["in_band"] = row["status"] == "in_band"
     for row in rows:
         print(f"{row['id']:6s} {row['role']:8s} computed {row['computed']:.4g} target {row.get('target')} "
               f"band {row.get('band')} {row['status']}", flush=True)
     by = {s: sum(r["status"] == s for r in rows) for s in STATUSES}
     return {"benchmarks": rows, "settings_calibrated": runner.calibrated, "fitted_used": fitted,
             "seeds": runner.seeds, "n_sims": runner.nsims,
-            "summary": {"in_band": sum(r["in_band"] for r in rows), "total": len(rows), "by_status": by,
-                        "held_out_in_band": sum(r["in_band"] for r in rows if r["role"] == "held_out"),
+            "summary": {"in_band": by["in_band"], "total": len(rows), "by_status": by,
+                        "held_out_in_band": sum(r["status"] == "in_band" for r in rows if r["role"] == "held_out"),
                         "held_out_total": sum(r["role"] == "held_out" for r in rows)}}
 
 
@@ -715,6 +721,12 @@ def _self_test() -> int:
     ok(res2["I1"]["status"] != "not_assessable" and res2["I2"]["status"] == "not_assessable"
        and "M1" in res2["I2"]["not_assessable_because"] and "M1" in res2["I2"]["requires_values"],
        "BP14 an interaction is not assessable when a required main effect misses, and reports it")
+    full2 = run_pack(p2, eng, Runner(p2, eng, 1), {})
+    rows2 = {x["id"]: x for x in full2["benchmarks"]}
+    ok(rows2["I2"]["in_band"] is False and all(x["in_band"] == (x["status"] == "in_band") for x in full2["benchmarks"])
+       and full2["summary"]["in_band"] == full2["summary"]["by_status"]["in_band"]
+       and full2["summary"]["in_band"] == sum(x["status"] == "in_band" for x in full2["benchmarks"]),
+       "BP14b a not-assessable (or mis-based) row never counts as a pass: in_band and every total follow status")
     ok(any("requires unknown" in s for s in validate(dict(p2, benchmarks=p2["benchmarks"] + [
         dict(pack["benchmarks"][1], id="I3", requires={"ZZ": [0, 1]})]), eng)), "BP15 requires naming an unknown benchmark is refused")
 
@@ -750,6 +762,24 @@ def _self_test() -> int:
         fit_joint=dict(p3["fit_joint"], targets=["J1", "J2", "J4"]))
     jc = fit_joint(conf, eng, Runner(conf, eng, 1))
     ok(["J1", "J4"] in jc["feasibility"]["conflicting_pairs"], "BP24 two targets that cannot be in band together are reported as a conflict")
+
+    class Disproved(Runner):
+        """Agrees with the engine during the design, then reports every target out of band."""
+        n_design = len(p3["fit_joint"]["targets"]) * (p3["fit_joint"]["design"]["n"] + 1)
+        k = 0
+
+        def evaluate(self, b, fitted):
+            r = super().evaluate(b, fitted)
+            Disproved.k += 1
+            if Disproved.k > Disproved.n_design:
+                lo, hi = b["band"]
+                r = dict(r, computed=hi * 10, in_band=False, status="out_of_band")
+            return r
+    jd = fit_joint(p3, eng, Disproved(p3, eng, 1))
+    fz = jd["feasibility"]
+    ok(fz["all_feasible_in_band_at_value"] is False and fz["feasibility_verified"] is False
+       and set(fz["disproved_by_verification"]) == {"J1", "J2"},
+       "BP26 a verification that disproves the surrogate overrides it: the feasibility claim is withdrawn")
     # reach check: cost per case = 30 / (1.5 eff_a) = 20 / eff_a, eff_a fitted range [0.3, 0.7] -> [28.6, 66.7]
     p4 = dict(pack, fit=[], benchmarks=[
         {"id": "R1", "metric": "unreachable", "target": 10.0, "band": [5.0, 20.0],
