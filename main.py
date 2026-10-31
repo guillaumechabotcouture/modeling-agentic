@@ -1973,6 +1973,34 @@ def _run_self_test() -> int:
     return 0
 
 
+def main_v2(args) -> int:
+    """v2 C: the stage machine drives the run; bounded agent tasks (agents/v2_sdk_tasks.py)
+    do the judgement. Resumes from run_state.json with --resume. The lead session, its
+    prompt and its flow hooks are not used."""
+    from agents import stage_machine, v2_sdk_tasks
+    if args.resume:
+        run_path = args.resume if os.path.isabs(args.resume) else os.path.join(os.getcwd(), args.resume)
+        st = stage_machine.load_state(run_path)
+        if st is None:
+            print(f"Error: {run_path} has no run_state.json (not a v2 run)")
+            return 1
+        question = st.question
+    else:
+        if not args.question:
+            print("Error: question is required (or use --resume)")
+            return 1
+        question = args.question
+        run_path = os.path.join(REPO_ROOT, "runs", create_run_dir(question))
+    print(f"Run (v2): {run_path}", flush=True)
+    tasks = v2_sdk_tasks.SdkTasks(run_path, allow_cloud=args.cloud)
+    status = stage_machine.run_v2(question, run_path, tasks, max_rounds=args.max_rounds,
+                                  signoff=args.signoff, budget_usd=args.max_budget_usd)
+    print(f"v2 status: {status}", flush=True)
+    if status.startswith("paused:"):
+        return 2
+    return exit_code_for(status)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Build a mathematical model for a research question"
@@ -2009,10 +2037,15 @@ def main() -> int:
                              "PATH, framework imports) and exit")
     parser.add_argument("--skip-preflight", action="store_true",
                         help="Skip the live preflight before a run (not recommended)")
+    parser.add_argument("--v2", action="store_true",
+                        help="v2 C: run the code-owned stage machine (agents/stage_machine.py) instead of "
+                             "the lead session. Off by default; today's pipeline is unchanged without it.")
     args = parser.parse_args()
 
     if args.self_test:
         return _run_self_test()
+    if args.v2:
+        return main_v2(args)
     if args.preflight_only or not args.skip_preflight:
         pf = asyncio.run(run_preflight(allow_cloud=args.cloud))
         print(f"Preflight: {'OK' if pf['ok'] else 'FAILED'} | models="

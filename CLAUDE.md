@@ -173,7 +173,9 @@ for f in main.py \
   scripts/lib/positive_control.py scripts/lib/provenance.py \
   scripts/lib/rigor_artifacts.py scripts/lib/safe_io.py \
   toolkit/alloc/costs.py toolkit/alloc/packages.py toolkit/alloc/optimize.py \
-  scripts/lib/text_spans.py scripts/lib/transcript_cost.py; do
+  scripts/lib/text_spans.py scripts/lib/transcript_cost.py \
+  scripts/golden_traces.py agents/stage_machine.py agents/findings_ledger.py \
+  agents/fix_loop.py agents/analysis_backend.py; do
   echo "== $f"; python3 "$f" --self-test || echo "FAILED: $f"
 done
 python3 scripts/validate_skill_attachments.py      # frontmatter + phantoms
