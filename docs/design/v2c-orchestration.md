@@ -212,3 +212,17 @@ with workstream B).
 SDK tasks are exercised by one real task (engine pick, $0.24) only; the evidence state is a stub;
 SIGN uses its own section hash until B's `toolkit/spec/signoff.py` lands, after which fixes edit
 only `analysis_settings.yaml`.
+
+## 9. Review round 1 (Codex, seven P1s): what changed
+
+Each fix was first reproduced by a failing self-test case, then fixed.
+
+| # | Finding | Change | Test |
+|---|---|---|---|
+| 1 | A measured decision test that changes the plan could be scope-declared without the owner | `analysis_backend.gate_findings` marks it `decision_bearing`; `stage_machine.apply_owner_rule` sends it through Phase 49 β's rule (`scripts/scope_signoff.py` plus the validator's AWAIT_OWNER path) and, when that rule is absent or fails, makes it not scope-declarable | T30–T32, B18 |
+| 2 | Resume could re-run a completed paid task or lose its charge | `run_state.json` holds a task journal (key, task, started and completed times, allowance, spend, session id, output). A completed task is replayed, not re-run; a task found started is charged its allowance once and run again; the fix loop skips tasks that have an impact row and keeps each task's pre-task snapshot | T25, T26, F14 |
+| 3 | A failed or interrupted SDK session was charged $0 | `SdkTasks` charges through `run_budget.charge_session` and writes `budget_ledger.json`: a reported cost (also one reported before an exception), else the conversation's cost read back (`crashed_session_cost`), else the whole allowance | S1–S5 |
+| 4 | Each call's cap was a fixed $3, not what the run had left | `Machine._allowance`: the task cap, at most the run's remaining budget less the write-up reserve (the write-up may use the reserve), recorded in the journal before the call; every paid call, including each critic of a pair and each retry, is checked first | T27, T28 |
+| 5 | Fix tasks could edit `decision_spec.yaml` | The owner signs the whole file (sha256, as workstream B does). Fixes edit `analysis_settings.yaml`, which may hold only `uncertainty.draws`, `uncertainty.seed`, `emulator.points`, `emulator.seed` (B's `schema.SETTINGS_PATHS` in the spike's vocabulary). The engine the harness chose is in `engine_choice.json`, so the spec stays as signed. After each fix the harness checks the spec hash and the settings file; a violation is undone before anything is rebuilt | T19, F13, B15–B17 |
+| 6 | The deliverable path was not validated | `deliverable_problems`: relative, inside the run directory, no symlink on the way, not a harness-, gate- or critic-owned file; otherwise nothing is written and a non-declarable HIGH `deliverable_path_invalid` is raised | T29 |
+| 7 | The golden traces exercised the legacy wrapper only | Check D runs the machine's v2 GATE state on each copy, fed the harness findings the stored gate recorded, against the stored action and rule; `run` exits 1 on any mismatch or missing decision; a mutation test (v2 gate replaced by ACCEPT) must fail | G7–G9 |

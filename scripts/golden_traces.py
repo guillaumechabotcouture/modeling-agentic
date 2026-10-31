@@ -20,6 +20,15 @@ Three checks per trace (docs/design/v2c-orchestration.md §7):
   C  the recorded sequence: every gate in validator_history.jsonl is routed, and the route
      is compared with what the run did next (another round, a post-write gate, or the end).
      Divergences are listed: they are places where today's lead did not follow STAGE 7.
+  D  the v2 GATE state itself (agents/stage_machine.py v2_gate, not the legacy wrapper) on a
+     copy, fed the harness findings the stored gate recorded (rigor, spec-compliance and
+     registry violations from final_gate.json); the critic YAMLs, scope declarations, done_when
+     tests and validator history are read from the copy as the stored gate read them. Its
+     action and rule must equal the stored ones (independent: they were written by the gate
+     at the time), or with `:<max_rounds>` the rule function's (A).
+
+`run` exits 1 when any check fails or any gate gives no decision. The self-test includes a
+mutation test: with v2_gate replaced by an unconditional ACCEPT, check D must fail.
 """
 from __future__ import annotations
 
@@ -157,12 +166,92 @@ def check_today(src: str, work: str, max_rounds: int) -> dict:
         shutil.rmtree(b, ignore_errors=True)
 
 
+# Kinds the v2 gate derives itself from the files (done_when tests, the optional cross-model
+# critic, the presentation critic's absence): not replayed from the stored list, so they are
+# neither double-counted nor taken on trust.
+_REDERIVED = ("done_when_", "cross_model_critic_", "critique_presentation_missing", "critique_done_when_missing")
+
+
+class _ReplayBackend:
+    """The harness checks as the stored gate recorded them (final_gate.json)."""
+
+    def __init__(self, decision: dict):
+        self.d = decision
+
+    def _keep(self, items):
+        return [copy.deepcopy(v) for v in items or [] if isinstance(v, dict)
+                and not str(v.get("kind") or "").startswith(_REDERIVED)]
+
+    def gate_findings(self, run_dir):
+        return self._keep(self.d.get("rigor_violations"))
+
+    def spec_violations(self, run_dir):
+        return self._keep(self.d.get("spec_violations"))
+
+    def registry_violations(self, run_dir):
+        return self._keep(self.d.get("registry_violations"))
+
+    def headline(self, run_dir):
+        return {}
+
+
+def check_v2(src: str, work: str, max_rounds: int | None = None, expected: tuple | None = None) -> dict:
+    """Check D: the machine's v2 GATE state on a copy, against the stored decision."""
+    import stage_machine as SM
+    d = json.load(open(os.path.join(src, "final_gate.json")))
+    hist = history(src)
+    cur = hist[-1]["round"] if hist else 1
+    mr = max_rounds or cur + int(d.get("rounds_remaining") or 0)
+    pw = bool(d.get("post_write"))
+    exp_action, exp_rule = expected or (d.get("action"), d.get("rule_matched"))
+    b = os.path.join(work, "v2")
+    copy_run(src, b)
+    try:
+        # The copy's history ends with the stored gate's own record; the v2 gate reads only
+        # earlier rounds from it (declared_prev), as the stored gate did.
+        meta = {}
+        try:
+            meta = json.load(open(os.path.join(b, "metadata.json")))
+        except (OSError, ValueError):
+            pass
+        st = SM.RunState(question=meta.get("question", ""), state="GATE", round=cur, max_rounds=mr, gate_mode="v2",
+                         post_write=pw, signoff="none")
+        m = SM.Machine(b, None, st, backend=_ReplayBackend(d), log=lambda *x: None)
+        m.step()
+        g = m.st.last_gate
+        exp_next = SM.route_gate({"action": exp_action, "unresolved_high": d.get("unresolved_high")}, pw)[0]
+        ok = (g.get("action") is not None and g.get("action") == exp_action
+              and str(g.get("rule_matched")) == str(exp_rule) and m.st.state == exp_next)
+        return {"round": cur, "max_rounds": mr, "post_write": pw, "expected_action": exp_action,
+                "expected_rule": exp_rule, "v2_action": g.get("action"), "v2_rule": g.get("rule_matched"),
+                "v2_next": m.st.state, "expected_next": exp_next, "ok": ok}
+    finally:
+        shutil.rmtree(b, ignore_errors=True)
+
+
+def case_ok(res: dict) -> bool:
+    st = res["stored"]
+    good = st["same_as_stored"] if not st.get("override") else st["rules_action"] is not None
+    good = good and res["v2"]["ok"]
+    if "today" in res:
+        t = res["today"]
+        good = good and t["cli_action"] is not None and t["same_action"] and t["next_as_routed"]
+    return bool(good)
+
+
 def run(cases: list[tuple[str, str, int | None]], work: str, skip_today: bool = False) -> dict:
     os.makedirs(work, exist_ok=True)
     out = {}
     for name, src, mr in cases:
         hist = history(src)
         res = {"source": src, "sequence": check_sequence(hist), "stored": check_stored(src, mr)}
+        res["stored"]["override"] = mr is not None
+        w = tempfile.mkdtemp(prefix=f"{name}_v2_", dir=work)
+        try:
+            exp = (res["stored"]["rules_action"], res["stored"]["rules_rule"]) if mr else None
+            res["v2"] = check_v2(src, w, mr, exp)
+        finally:
+            shutil.rmtree(w, ignore_errors=True)
         if not skip_today:
             st = res["stored"]
             w = tempfile.mkdtemp(prefix=f"{name}_", dir=work)
@@ -170,8 +259,9 @@ def run(cases: list[tuple[str, str, int | None]], work: str, skip_today: bool = 
                 res["today"] = check_today(src, w, mr or st["max_rounds"])
             finally:
                 shutil.rmtree(w, ignore_errors=True)
+        res["ok"] = case_ok(res)
         out[name] = res
-        print(json.dumps({name: {"stored": res["stored"], "today": res.get("today"),
+        print(json.dumps({name: {"ok": res["ok"], "stored": res["stored"], "v2": res["v2"], "today": res.get("today"),
                                  "sequence": {k: v for k, v in res["sequence"].items() if k != "divergences"}}},
                          default=str), flush=True)
     return out
@@ -210,6 +300,40 @@ def _self_test() -> int:
         r = check_stored(d, 8)
         ok(r["rules_action"] == "DECLARE_SCOPE" and str(r["rules_rule"]) == "3a",
            f"G6 the same decision with rounds left is the early finish (rule 3a) {r['rules_rule']}")
+    # G7-G9: check D on a small synthetic run, then the mutation test.
+    import yaml
+    import stage_machine as SM
+    import validate_critique_yaml as V
+    with tempfile.TemporaryDirectory() as d:
+        run_d = os.path.join(d, "run")
+        os.makedirs(run_d)
+        blk = {"id": "D-001", "severity": "HIGH", "category": "METHODS", "target_stage": "MODEL", "first_seen_round": 1,
+               "claim": "c", "evidence": "e", "fix_requires": "f", "resolved": False,
+               "done_when": [{"file": "x.txt", "exists": True}]}
+        for r, bl in (("critique-domain", [blk]), ("critique-redteam", [])):
+            yaml.safe_dump({"reviewer": r, "round": 1, "verdict": "REVISE" if bl else "PASS",
+                            "structural_mismatch": {"detected": False}, "carried_forward": [], "blockers": bl},
+                           open(os.path.join(run_d, V.FILENAMES[r]), "w"))
+        json.dump({"question": "q"}, open(os.path.join(run_d, "metadata.json"), "w"))
+        json.dump({"action": "PATCH_OR_RETHINK", "rule_matched": 2, "rounds_remaining": 2, "post_write": False,
+                   "unresolved_high": [], "rigor_violations": [], "spec_violations": [], "registry_violations": []},
+                  open(os.path.join(run_d, "final_gate.json"), "w"))
+        open(os.path.join(run_d, "validator_history.jsonl"), "w").write(
+            json.dumps({"round": 1, "action": "PATCH_OR_RETHINK", "findings": []}) + "\n")
+        r = check_v2(run_d, d)
+        ok(r["ok"] and r["v2_action"] == "PATCH_OR_RETHINK" and r["v2_next"] == "FIX_LOOP",
+           f"G7 the v2 GATE state reproduces a stored PATCH_OR_RETHINK {r}")
+        orig = SM.v2_gate
+        SM.v2_gate = lambda *a, **k: {"action": "ACCEPT", "rule_matched": 4, "unresolved_high": [], "accept_blockers": []}
+        try:
+            r = check_v2(run_d, d)
+        finally:
+            SM.v2_gate = orig
+        ok(not r["ok"] and r["v2_action"] == "ACCEPT",
+           "G8 mutation: a v2 gate that always ACCEPTs fails check D")
+        res = {"stored": {"same_as_stored": True, "override": False, "rules_action": "X"}, "v2": dict(r, ok=True),
+               "today": {"cli_action": None, "same_action": True, "next_as_routed": True}}
+        ok(not case_ok(res), "G9 a gate that gives no decision fails the case")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -237,7 +361,9 @@ def main(argv=None) -> int:
     res = run(cases, a.work, a.skip_today)
     with open(a.out, "w") as f:
         json.dump(res, f, indent=1, default=str)
-    return 0
+    bad = [n for n, r in res.items() if not r["ok"]]
+    print("ALL OK" if not bad else f"FAILED: {', '.join(bad)}")
+    return 1 if bad else 0
 
 
 if __name__ == "__main__":

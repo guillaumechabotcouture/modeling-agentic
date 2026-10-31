@@ -175,7 +175,7 @@ for f in main.py \
   toolkit/alloc/costs.py toolkit/alloc/packages.py toolkit/alloc/optimize.py \
   scripts/lib/text_spans.py scripts/lib/transcript_cost.py \
   scripts/golden_traces.py agents/stage_machine.py agents/findings_ledger.py \
-  agents/fix_loop.py agents/analysis_backend.py; do
+  agents/fix_loop.py agents/analysis_backend.py agents/v2_sdk_tasks.py; do
   echo "== $f"; python3 "$f" --self-test || echo "FAILED: $f"
 done
 python3 scripts/validate_skill_attachments.py      # frontmatter + phantoms
