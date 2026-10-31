@@ -187,9 +187,15 @@ def render_claim(claim: dict) -> str:
     ci_high = claim.get("ci_high")
     has_ci = ci_low is not None and ci_high is not None
 
+    # v2 (spike lesson 6): an interval says what it covers. The analysis engine
+    # writes `interval_label` (e.g. "95% UI over engine parameters and
+    # calibration"); it replaces the generic "95% CI".
+    label = claim.get("interval_label")
+    label = label.strip() if isinstance(label, str) and label.strip() else "95% CI"
+
     def _ci(fmt) -> str:
         lo, hi = float(ci_low), float(ci_high)
-        return f" (95% CI: {_format_interval(fmt(lo), fmt(hi), lo, hi)})"
+        return f" ({label}: {_format_interval(fmt(lo), fmt(hi), lo, hi)})"
 
     def _pct(x: float) -> str:
         return f"{x:.1f}%".replace(".0%", "%")
@@ -471,6 +477,11 @@ def _self_test() -> int:
                       "ci_low": 5140000, "ci_high": 10420000})
     ok("7.47M" in s and "5.14M" in s and "10.42M" in s,
        f"T1 scalar+CI: got {s!r}")
+    ok("95% CI:" in s, f"T1 the default interval label is 95% CI: {s!r}")
+    s = render_claim({"id": "x", "claim_kind": "scalar", "value": 7467997, "ci_low": 5140000,
+                      "ci_high": 10420000, "interval_label": "95% UI over engine parameters"})
+    ok("(95% UI over engine parameters: 5.14M" in s and "CI" not in s,
+       f"T1b v2 lesson 6: an interval_label replaces the generic label: {s!r}")
     s = render_claim({"id": "x", "claim_kind": "scalar", "value": 320_000_000})
     ok(s == "320M", f"T1 scalar no-CI: got {s!r}")
     s = render_claim({"id": "x", "claim_kind": "count", "value": 63})
