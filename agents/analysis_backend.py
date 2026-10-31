@@ -151,18 +151,87 @@ def _abs_spec(spec: dict, base: str) -> dict:
     return s
 
 
-def load_spec(path: str) -> dict:
+SETTINGS_FILE = "analysis_settings.yaml"
+ENGINE_CHOICE = "engine_choice.json"
+# The computational leaves a fix may change without a new sign-off (workstream B's
+# schema.SETTINGS_PATHS, in the spike's vocabulary). Everything else is in the signed spec.
+SETTINGS_PATHS = ("uncertainty.draws", "uncertainty.seed", "emulator.points", "emulator.seed")
+
+
+def _leaves(d: dict, prefix: str = "") -> dict:
+    out = {}
+    for k, v in (d or {}).items():
+        key = f"{prefix}{k}"
+        if isinstance(v, dict) and v:
+            out.update(_leaves(v, key + "."))
+        else:
+            out[key] = v
+    return out
+
+
+def settings_problems(run_dir: str, spec: dict | None = None) -> list[str]:
+    """What is wrong with analysis_settings.yaml: unreadable, a symlink, a leaf outside
+    SETTINGS_PATHS, or a leaf the signed spec also sets. Fail closed."""
     import yaml
-    with open(path) as f:
-        return _abs_spec(yaml.safe_load(f) or {}, os.path.dirname(os.path.abspath(path)))
+    p = os.path.join(run_dir, SETTINGS_FILE)
+    if os.path.islink(p):
+        return [f"{SETTINGS_FILE} is a symlink"]
+    if not os.path.exists(p):
+        return []
+    try:
+        doc = yaml.safe_load(open(p)) or {}
+        if spec is None:
+            spec = yaml.safe_load(open(os.path.join(run_dir, SPEC_FILE))) or {}
+    except Exception as e:  # noqa: BLE001
+        return [f"{SETTINGS_FILE} or {SPEC_FILE} unreadable: {type(e).__name__}"]
+    if not isinstance(doc, dict):
+        return [f"{SETTINGS_FILE} is not a mapping"]
+    sl = _leaves(spec)
+    bad = [f"{SETTINGS_FILE}: {k} is not a computational setting (allowed: {', '.join(SETTINGS_PATHS)})"
+           for k in _leaves(doc) if k not in SETTINGS_PATHS]
+    bad += [f"{SETTINGS_FILE}: {k} is also set in the signed {SPEC_FILE}" for k in _leaves(doc) if k in sl]
+    return bad
 
 
-def validate(spec: dict, base: str) -> list[str]:
+def merged_spec(run_dir: str) -> dict:
+    """The signed spec, plus the settings file's computational leaves, plus the engine the
+    harness chose (engine_choice.json). Raises on settings problems (fail closed)."""
+    import yaml
+    spec = yaml.safe_load(open(os.path.join(run_dir, SPEC_FILE))) or {}
+    probs = settings_problems(run_dir, spec)
+    if probs:
+        raise ValueError("; ".join(probs))
+    p = os.path.join(run_dir, SETTINGS_FILE)
+    if os.path.exists(p):
+        for k, v in _leaves(yaml.safe_load(open(p)) or {}).items():
+            cur = spec
+            parts = k.split(".")
+            for q in parts[:-1]:
+                cur = cur.setdefault(q, {})
+            cur[parts[-1]] = v
+    try:
+        eng = json.load(open(os.path.join(run_dir, ENGINE_CHOICE))).get("engine")
+    except (OSError, ValueError):
+        eng = None
+    if eng and not spec.get("engine"):
+        spec["engine"] = eng
+    return _abs_spec(spec, run_dir)
+
+
+def load_spec(path: str) -> dict:
+    return merged_spec(os.path.dirname(os.path.abspath(path)))
+
+
+def validate(spec, base: str | None = None) -> list[str]:
+    """`spec` is the spec file's path (merged with its settings and the engine choice) or a mapping."""
     from spike.analysis import spec as S
     try:
+        if isinstance(spec, str):
+            base = os.path.dirname(os.path.abspath(spec))
+            spec = merged_spec(base)
         return S.validate(_abs_spec(spec, base), base)
     except Exception as e:  # noqa: BLE001 -- fail closed
-        return [f"spec validation crashed: {type(e).__name__}: {e}"]
+        return [f"spec validation failed: {type(e).__name__}: {e}"]
 
 
 def pipeline_steps(spec_path: str, run_dir: str) -> list[dict]:
@@ -179,6 +248,7 @@ def pipeline_steps(spec_path: str, run_dir: str) -> list[dict]:
                 data.append(p)
     except OSError:
         pass
+    data += [f for f in (SETTINGS_FILE, ENGINE_CHOICE) if os.path.exists(os.path.join(run_dir, f))]
     return [
         {"id": "configure", "run": f"{py} {me} configure {SPEC_FILE} {OUT_DIR}",
          "inputs": [SPEC_FILE] + sorted(data),
@@ -283,8 +353,11 @@ def gate_findings(run_dir: str) -> list[dict]:
         out.append(_f("allocation_robustness_unknown", "HIGH", "ANALYZE", f"Unknown LOO verdict {v!r}.", "loo", False))
     for dt in A.get("decision_tests") or []:
         if dt.get("plan_changes"):
-            out.append(_f("decision_test_changes_plan", "HIGH", "ANALYZE",
-                          f"Decision test {dt.get('id')} changes the plan: {dt.get('text', '')}", str(dt.get("id"))))
+            # Decision-bearing: the stage machine sends it through the owner rule (Phase 49 β)
+            # before it can be declared; without that rule it is not declarable (fail closed).
+            out.append(dict(_f("decision_test_changes_plan", "HIGH", "ANALYZE",
+                               f"Decision test {dt.get('id')} changes the plan: {dt.get('text', '')}",
+                               str(dt.get("id"))), decision_bearing=True))
     return out
 
 
@@ -354,7 +427,7 @@ def toy_spec(units_csv: str, n_units: int | None = None, draws: int = 6) -> dict
                         "window": [1, 2], "metric": "prev", "target_uncertainty": {"common_state_sd_logit": 0.05},
                         "loo_covariates": ["cov"]},
         "horizon": {"start": 0, "stop": 3, "window": [0, 3]},
-        "emulator": {"points": 32, "holdout_share": 0.15, "seed": 5, "features": []},
+        "emulator": {"holdout_share": 0.15, "features": []},
         "options": {"units": {"csv": units_csv, "id": "id", "populations": {"total": "pop"}},
                     "components": {"a": {}, "b": {}}, "packages": {"generate": True},
                     "eligibility": {"b": {"column": "elig"}}, "engine_map": {"a": {"a": 1}, "b": {"b": 1}},
@@ -365,7 +438,12 @@ def toy_spec(units_csv: str, n_units: int | None = None, draws: int = 6) -> dict
                                     "price_rule": "as_published", "basis": "per_person", "includes": ["y"]}]},
         "objective": {"outcome": "dalys"}, "outcomes_reported": ["dalys", "cases"],
         "constraints": {"envelope_usd": 20000}, "comparator": {"package": "none"},
-        "uncertainty": {"draws": draws, "seed": 1}, "deliverable": "package per unit"}
+        "uncertainty": {}, "deliverable": "package per unit"}
+
+
+def toy_settings(draws: int = 6, points: int = 32) -> dict:
+    """The computational settings (analysis_settings.yaml) that go with toy_spec."""
+    return {"uncertainty": {"draws": draws, "seed": 1}, "emulator": {"points": points, "seed": 5}}
 
 
 def write_toy_units(path: str, n: int = 24, seed: int = 3) -> None:
@@ -400,6 +478,8 @@ def _self_test() -> int:
         p = os.path.join(d, "units.csv")
         write_toy_units(p)
         spec = toy_spec("units.csv")
+        import yaml
+        yaml.safe_dump(toy_settings(), open(os.path.join(d, SETTINGS_FILE), "w"))
         rows = eligible_engines(_abs_spec(spec, d))
         toy = next(r for r in rows if r["ref"].endswith("ToyEngine"))
         mal = next(r for r in rows if "malaria" in r["ref"])
@@ -411,10 +491,12 @@ def _self_test() -> int:
         ok(any("engine component value" in e for e in validate(bad, d)), "B5 a component the engine lacks fails validation")
         ok(gate_findings(d)[0]["kind"] == "analysis_missing" and not gate_findings(d)[0]["scope_declarable"],
            "B6 no analysis output is a non-declarable HIGH")
-        import yaml
         yaml.safe_dump(spec, open(os.path.join(d, SPEC_FILE), "w"))
+        ok(validate(os.path.join(d, SPEC_FILE)) == [] and merged_spec(d)["uncertainty"]["draws"] == 6,
+           "B4b the spec path validates merged with its settings file")
         steps = pipeline_steps(os.path.join(d, SPEC_FILE), d)
-        ok([s["id"] for s in steps] == ["configure", "analyze"] and "units.csv" in steps[0]["inputs"],
+        ok([s["id"] for s in steps] == ["configure", "analyze"] and "units.csv" in steps[0]["inputs"]
+           and SETTINGS_FILE in steps[1]["inputs"],
            "B7 the pipeline has configure and analyze, with the spec and its data as inputs")
         sys.path.insert(0, os.path.join(REPO, "scripts"))
         import pipeline as P
@@ -430,13 +512,31 @@ def _self_test() -> int:
         ok("uncertainty_draws_low" in kinds and "analysis_missing" not in kinds, f"B10 contract checks on real output {kinds}")
         rep2 = P.run(d)
         ok(rep2["ok"] and rep2["steps"] == [], "B11 nothing reruns when nothing changed")
-        spec["uncertainty"]["draws"] = 24
-        yaml.safe_dump(spec, open(os.path.join(d, SPEC_FILE), "w"))
+        yaml.safe_dump(toy_settings(draws=24), open(os.path.join(d, SETTINGS_FILE), "w"))
         rep3 = P.run(d)
         ok([s["id"] for s in rep3["steps"]] == ["configure", "analyze"]
            and "uncertainty_draws_low" not in {f["kind"] for f in gate_findings(d)},
-           "B12 a spec edit reruns its dependants and the finding clears")
-        cc = cross_check(_abs_spec(spec, d), ["toolkit.engines.contract:ToyEngine"] * 2, os.path.join(d, "xc"), 8)
+           "B12 a settings edit reruns its dependants and the finding clears")
+        yaml.safe_dump({"uncertainty": {"draws": 9}, "constraints": {"envelope_usd": 1}},
+                       open(os.path.join(d, SETTINGS_FILE), "w"))
+        probs = settings_problems(d)
+        ok(any("constraints.envelope_usd is not a computational setting" in x for x in probs)
+           and any("validation failed" in x for x in validate(os.path.join(d, SPEC_FILE))),
+           f"B15 a decision leaf in the settings file is refused and validation fails closed {probs}")
+        yaml.safe_dump({"calibration": {"attribute": "y"}}, open(os.path.join(d, SETTINGS_FILE), "w"))
+        ok(settings_problems(d), "B16 a settings leaf the signed spec also sets is refused")
+        os.remove(os.path.join(d, SETTINGS_FILE))
+        os.symlink(os.path.join(d, SPEC_FILE), os.path.join(d, SETTINGS_FILE))
+        ok(any("symlink" in x for x in settings_problems(d)), "B17 a symlinked settings file is refused")
+        os.remove(os.path.join(d, SETTINGS_FILE))
+        yaml.safe_dump(toy_settings(draws=24), open(os.path.join(d, SETTINGS_FILE), "w"))
+        A = json.load(open(os.path.join(d, ANALYSIS_JSON)))
+        A["decision_tests"] = [{"id": "DT1", "plan_changes": True, "text": "t"}]
+        json.dump(A, open(os.path.join(d, ANALYSIS_JSON), "w"))
+        dtf = [f for f in gate_findings(d) if f["kind"] == "decision_test_changes_plan"]
+        ok(dtf and dtf[0].get("decision_bearing") and dtf[0]["severity"] == "HIGH",
+           "B18 a measured decision test that changes the plan is a decision-bearing HIGH")
+        cc = cross_check(merged_spec(d), ["toolkit.engines.contract:ToyEngine"] * 2, os.path.join(d, "xc"), 8)
         ok(cc["agreement"] == 1.0 and cc["units"] == 8, f"B13 the cross-engine check compares plans (same engine twice agrees) {cc['agreement']}")
     from types import SimpleNamespace as NS
     fake = NS(validate=lambda s, b=None: [], headline=lambda d: {}, gate_findings=lambda d: [],

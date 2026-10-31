@@ -67,10 +67,14 @@ EDGES = {
 }
 LLM_STATES = ("SPEC", "ENGINE_CHOICE", "CRITIQUE", "FIX_LOOP", "PRESENTATION")
 CRITICS = ("critique-domain", "critique-redteam")
-# The decision content the owner signs. Technical settings (engine, emulator, calibration
-# ranges, uncertainty draws) are the AI's, checked and recorded, not signed (architecture-v2 §3.6).
-SIGNED_SECTIONS = ("decision_units", "options", "objective", "constraints", "comparator",
-                   "outcomes_reported", "horizon", "deliverable", "decision_date")
+# The owner signs the whole decision_spec.yaml (its sha256). Fix tasks never edit it: they edit
+# analysis_settings.yaml, which holds only computational leaves (analysis_backend.SETTINGS_PATHS;
+# workstream B's schema.SETTINGS_PATHS), and the engine the harness chose is in engine_choice.json.
+PROTECTED_BY_FIX = (AB.SPEC_FILE, AB.SETTINGS_FILE)
+TASK_CAP_USD = 3.0            # one bounded task's allowance, at most what the run has left
+# Findings whose resolution bears on the primary decision: Phase 49 β's owner rule decides
+# whether they may be declared. Without that rule they are not declarable (fail closed).
+DECISION_BEARING_KINDS = ("decision_test_changes_plan",)
 MAX_SPEC_TRIES = 3
 MAX_SCHEMA_REPAIRS = 2
 
@@ -93,6 +97,11 @@ class RunState:
     forced_status: str | None = None      # budget_exhausted: set when the budget, not the gate, ends the run
     paused: str | None = None
     tries: dict = field(default_factory=dict)
+    task_cap_usd: float = TASK_CAP_USD
+    # Every paid task: key -> {task, status started|completed, allowance_usd, usd, session_id,
+    # started, completed, ok, output, note}. Written before and after each call, so a resumed run
+    # never repeats a completed task or loses its charge, and charges an interrupted one its allowance.
+    journal: dict = field(default_factory=dict)
     last_gate: dict = field(default_factory=dict)
     history: list = field(default_factory=list)
 
@@ -182,30 +191,113 @@ def legacy_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, h
 
 
 def spec_signoff_findings(run_dir: str, signoff: str) -> list[dict]:
-    """The signed decision sections must not change after sign-off (non-declarable)."""
+    """decision_spec.yaml must not change after sign-off (non-declarable)."""
     if signoff == "none":
         return []
     rec = _signoff(run_dir)
     if rec is None:
         return [{"kind": "spec_unsigned", "severity": "HIGH", "stage": "PLAN", "target_stage": "PLAN", "key": "spec",
                  "scope_declarable": False, "claim": "decision_spec.yaml has no sign-off."}]
-    if rec.get("sections_sha") != signed_hash(run_dir):
+    if rec.get("spec_sha256") != signed_hash(run_dir):
         return [{"kind": "spec_changed_after_signoff", "severity": "HIGH", "stage": "PLAN", "target_stage": "PLAN",
                  "key": "spec", "scope_declarable": False,
-                 "claim": "A signed section of decision_spec.yaml changed after sign-off. The decision content is "
-                          f"the owner's ({', '.join(SIGNED_SECTIONS)}); restore it or ask for a new sign-off."}]
+                 "claim": "decision_spec.yaml changed after sign-off. It is the owner's; restore it or ask for a "
+                          "new sign-off. Computational settings belong in analysis_settings.yaml."}]
+    return []
+
+
+def deliverable_problems(run_dir: str) -> list[str]:
+    """The spec's `deliverable_file.path` must be a plain file inside the run directory: relative,
+    no `..`, no symlink on the way, and not a file the harness, the gate or a critic owns."""
+    import yaml
+    try:
+        spec = yaml.safe_load(open(os.path.join(run_dir, AB.SPEC_FILE))) or {}
+    except OSError:
+        return []
+    df = spec.get("deliverable_file")
+    if df is None:
+        return []
+    rel = df.get("path") if isinstance(df, dict) else None
+    if not isinstance(rel, str) or not rel.strip() or not isinstance(df.get("columns"), dict):
+        return ["deliverable_file needs a path and columns"]
+    if os.path.isabs(rel) or ".." in rel.replace("\\", "/").split("/"):
+        return [f"deliverable path {rel!r} must be relative and inside the run directory"]
+    root = os.path.realpath(run_dir)
+    target = os.path.join(root, rel)
+    if not os.path.realpath(target).startswith(root + os.sep):
+        return [f"deliverable path {rel!r} resolves outside the run directory"]
+    cur = root
+    for part in rel.replace("\\", "/").split("/"):
+        cur = os.path.join(cur, part)
+        if os.path.islink(cur):
+            return [f"deliverable path {rel!r} goes through a symlink ({os.path.relpath(cur, root)})"]
+    norm = os.path.relpath(target, root).replace(os.sep, "/")
+    import pipeline as P
+    owned = tuple(P._reserved_patterns()) + PROTECTED_BY_FIX + (
+        STATE_FILE, SIGNOFF_FILE, SCOPE_SIGNOFF, FL.LEDGER, FX.IMPACT, "report.md", "manuscript.md", "metadata.json",
+        "final_gate.json", AB.ENGINE_CHOICE, "validator_history.jsonl", "gate_r*", "fix_plan_r*", "fix_progress_r*",
+        "analysis/*", "models/pipeline*", "evidence/*", "data/*")
+    if any(P.path_match(norm, pat) for pat in owned):
+        return [f"deliverable path {rel!r} is a file the harness, the gate or a critic owns"]
+    return []
+
+
+def _owner_rule():
+    """Phase 49 β's owner rule (scripts/scope_signoff.py with the validator's AWAIT_OWNER path),
+    or None when this checkout does not have both."""
+    import inspect
+    import validate_critique_yaml as V
+    try:
+        import scope_signoff
+    except ImportError:
+        return None
+    try:
+        if "AWAIT_OWNER" not in inspect.getsource(V._recompute_action):
+            return None
+    except (OSError, TypeError):
+        return None
+    return scope_signoff
+
+
+def apply_owner_rule(run_dir: str, round_n: int, viols: list[dict], rule="auto") -> list[dict]:
+    """Decision-bearing findings (a measured decision test that changes the plan) go through
+    Phase 49 β's owner rule before they can be declared. Without the rule they are not
+    scope-declarable, so the run can neither declare them away nor finish around them."""
+    import validate_critique_yaml as V
+    rule = _owner_rule() if rule == "auto" else rule
+    bearing = [v for v in viols if v.get("decision_bearing") or v.get("kind") in DECISION_BEARING_KINDS]
+    if not bearing:
+        return []
+    if rule is not None:
+        for v in bearing:
+            v["owner_signoff"] = True
+            v.setdefault("owner_item", {"finding": FL.gate_id(v), "reason": "a measured decision test changes the plan",
+                                        "claim": v.get("claim", "")})
+        try:
+            return list(rule.gate_findings(run_dir, round_n, viols, non_declarable=V.is_non_declarable) or [])
+        except Exception as e:  # noqa: BLE001 -- fail closed below
+            reason = f"the owner rule failed ({type(e).__name__}: {e})"
+    else:
+        reason = "the owner rule (Phase 49 β, scripts/scope_signoff.py) is not available"
+    for v in bearing:
+        v["scope_declarable"] = False
+        v.pop("owner_signoff", None)
+        v["claim"] = f"{v.get('claim', '')} Not declarable: {reason}."
     return []
 
 
 def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra: list[dict],
-            history: bool = True, critics=CRITICS) -> dict:
-    """Today's rule functions on the v2 findings: critic YAMLs plus the harness's checks."""
+            history: bool = True, critics=CRITICS, spec_violations=None, registry_violations=None) -> dict:
+    """Today's rule functions, in today's order, on the v2 findings: the critic YAMLs, the
+    harness's checks (`extra`), and optionally spec-compliance and registry findings."""
     import done_when
     import validate_critique_yaml as V
     critiques, schema_errors = {}, []
     draft = any(os.path.exists(os.path.join(run_dir, f)) for f in ("report.md", "manuscript.md"))
     extra = list(extra)
-    names = list(critics) + (["critique-presentation"] if draft else [])
+    names = list(critics) + [r for r in V.REVIEWERS if r not in critics and r != "critique-presentation"
+                             and os.path.exists(os.path.join(run_dir, V.FILENAMES[r]))]
+    names += ["critique-presentation"] if draft else []
     for reviewer in names:
         path = os.path.join(run_dir, V.FILENAMES[reviewer])
         if not os.path.exists(path):
@@ -220,19 +312,30 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
             critiques[reviewer] = V.validate_critique(path, reviewer, round_n)
         except V.SchemaError as e:
             schema_errors.append(str(e))
+    for reviewer in V.OPTIONAL_REVIEWERS:
+        doc, vs = V._load_optional_critique(run_dir, reviewer, round_n)
+        if doc is not None:
+            critiques[reviewer] = doc
+        extra += vs
     if schema_errors:
         return {"schema_errors": schema_errors, "action": None}
     d = V.decide(critiques, max_rounds, round_n)
     d["declared"] = V._declared_ids(run_dir)
     d["declared_prev"] = V._previous_declared(run_dir, round_n)
+    d = V._apply_brief_scope(d, critiques, run_dir, max_rounds, round_n)
     d, dw = V._apply_done_when(d, critiques, run_dir, max_rounds, round_n, record=history)
     d = V._defer_write_findings(d, run_dir, max_rounds, round_n)
+    if spec_violations is not None:
+        d = V.incorporate_spec_violations(d, list(spec_violations), max_rounds, round_n)
     viols = extra + done_when.gate_findings(dw or {})
+    viols += apply_owner_rule(run_dir, round_n, viols)
     for v in viols:
         k = FL.gate_key(v)
         if k:
             v["stall_key"] = k
     d = V._incorporate_rigor_violations(d, viols, max_rounds, round_n)
+    if registry_violations is not None:
+        d = V.incorporate_registry_violations(d, list(registry_violations), max_rounds, round_n)
     d["post_write"] = bool(post_write)
     if history:
         V._append_validator_history(run_dir, round_n, d, post_write)
@@ -241,13 +344,15 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
 
 # ------------------------------------------------------------------ sign-off
 def signed_hash(run_dir: str) -> str | None:
-    import yaml
+    """sha256 of decision_spec.yaml as a file (the owner signs all of it, as workstream B does)."""
+    p = os.path.join(run_dir, AB.SPEC_FILE)
+    if os.path.islink(p):
+        return None
     try:
-        spec = yaml.safe_load(open(os.path.join(run_dir, AB.SPEC_FILE))) or {}
+        with open(p, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
     except OSError:
         return None
-    sub = {k: spec.get(k) for k in SIGNED_SECTIONS}
-    return hashlib.sha256(json.dumps(sub, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
 def _signoff(run_dir: str) -> dict | None:
@@ -258,8 +363,8 @@ def _signoff(run_dir: str) -> dict | None:
 
 
 def sign(run_dir: str, by: str, note: str = "") -> dict:
-    rec = {"by": by, "note": note, "at": _now(), "sections_sha": signed_hash(run_dir)}
-    if rec["sections_sha"] is None:
+    rec = {"by": by, "note": note, "at": _now(), "spec_sha256": signed_hash(run_dir)}
+    if rec["spec_sha256"] is None:
         raise ValueError(f"no {AB.SPEC_FILE} to sign")
     with open(os.path.join(run_dir, SIGNOFF_FILE), "w") as f:
         json.dump(rec, f, indent=1)
@@ -299,6 +404,65 @@ class Machine:
     def _charge(self, res) -> None:
         self.st.spent_usd += float(getattr(res, "usd", 0.0) or 0.0)
 
+    def _allowance(self, writeup: bool = False) -> float | None:
+        """What the next paid task may spend: the task cap, at most what the run has left less the
+        write-up reserve (the write-up itself may use the reserve). None: no run cap."""
+        cap = self.st.budget_usd
+        if not cap:
+            return None
+        from agents.run_budget import writeup_reserve
+        left = cap - self.st.spent_usd - (0.0 if writeup else writeup_reserve(cap))
+        return round(min(self.st.task_cap_usd, left), 4)
+
+    def _visit(self) -> int:
+        return sum(1 for h in self.st.history if h.get("to") == self.st.state)
+
+    def _task(self, key: str, name: str, *args, writeup: bool = False):
+        """One paid task through the journal. Returns its TaskResult, or None when the run has no
+        allowance left for it (the caller takes the budget path). A completed task is not run
+        again (its result is replayed, already charged); a task found started but not completed
+        was interrupted: it is charged its allowance once, then run again."""
+        from v2_tasks import TaskResult
+        j = self.st.journal.get(key)
+        if j and j.get("status") == "completed":
+            return TaskResult(bool(j.get("ok")), j.get("output"), 0.0, j.get("note", ""), j.get("session_id"))
+        if j and j.get("status") == "started":
+            a = j.get("allowance_usd")
+            self.st.spent_usd += float(a if a is not None else self.st.task_cap_usd)
+            j["interrupted_charged"] = j.get("interrupted_charged", 0) + 1
+            j["status"] = "interrupted"
+            save_state(self.run_dir, self.st)
+        allowance = self._allowance(writeup)
+        if allowance is not None and allowance <= 0:
+            return None
+        j = dict(j or {}, task=name, status="started", started=_now(), allowance_usd=allowance)
+        self.st.journal[key] = j
+        save_state(self.run_dir, self.st)
+        setter = getattr(self.tasks, "set_allowance", None)
+        if setter:
+            setter(allowance if allowance is not None else self.st.task_cap_usd)
+        res = getattr(self.tasks, name)(*args)
+        self._charge(res)
+        out = res.output
+        try:
+            json.dumps(out)
+        except (TypeError, ValueError):
+            out = None
+        j.update(status="completed", completed=_now(), ok=bool(res.ok), output=out, usd=float(res.usd or 0.0),
+                 note=(res.note or "")[:300], session_id=getattr(res, "session_id", None))
+        save_state(self.run_dir, self.st)
+        return res
+
+    def _budget_out(self, s: str):
+        """The budget path from state `s` (no allowance for the next paid task)."""
+        self.st.forced_status = "budget_exhausted"
+        if s in ("CRITIQUE", "FIX_LOOP") and not self._has_draft():
+            self.st.write_mode = "not_accepted"
+            return self._go("WRITE", "budget used: the harness writes the report")
+        if s in ("CRITIQUE", "FIX_LOOP", "PRESENTATION", "WRITE"):
+            return self._go("FINAL", "budget used")
+        return self._go("FINAL", "budget used before the model was built", "budget_exhausted")
+
     def _budget(self) -> dict | None:
         cap = self.st.budget_usd
         if not cap:
@@ -319,7 +483,21 @@ class Machine:
         return yaml.safe_load(open(os.path.join(self.run_dir, AB.SPEC_FILE))) or {}
 
     def harness_findings(self) -> list[dict]:
-        return self.backend.gate_findings(self.run_dir) + spec_signoff_findings(self.run_dir, self.st.signoff)
+        out = self.backend.gate_findings(self.run_dir) + spec_signoff_findings(self.run_dir, self.st.signoff)
+        out += [{"kind": "deliverable_path_invalid", "severity": "HIGH", "stage": "PLAN", "target_stage": "PLAN",
+                 "key": "deliverable", "scope_declarable": False, "claim": p} for p in deliverable_problems(self.run_dir)]
+        return out
+
+    def fix_guard(self, run_dir: str) -> list[str]:
+        """What a fix task may not do: change decision_spec.yaml (compared with its sign-off, or with
+        its hash when the loop started), or leave a settings file the analysis would refuse."""
+        probs = []
+        ref = (_signoff(run_dir) or {}).get("spec_sha256") if self.st.signoff != "none" else None
+        ref = ref or self.st.journal.get(f"FIX_LOOP#{self._visit()}:spec_sha256", {}).get("output")
+        if ref and signed_hash(run_dir) != ref:
+            probs.append(f"{AB.SPEC_FILE} changed; it is signed (computational settings go in {AB.SETTINGS_FILE})")
+        probs += [f"settings: {e}" for e in self.backend.validate(os.path.join(run_dir, AB.SPEC_FILE))]
+        return probs
 
     def harness_ids(self, run_dir: str) -> set[str]:
         return {FL.gate_id(v) for v in self.harness_findings()}
@@ -335,17 +513,7 @@ class Machine:
             return s
         self.st.paused = None
         if s in LLM_STATES and self._out_of_budget():
-            self.st.forced_status = "budget_exhausted"
-            if s in ("CRITIQUE", "FIX_LOOP") and not self._has_draft():
-                self.st.write_mode = "not_accepted"
-                return self._go("WRITE", "budget used: the harness writes the report")
-            if s == "CRITIQUE":
-                return self._go("FINAL", "budget used")
-            if s == "FIX_LOOP":
-                return self._go("FINAL", "budget used")
-            if s == "PRESENTATION":
-                return self._go("FINAL", "budget used")
-            return self._go("FINAL", "budget used before the model was built", "budget_exhausted")
+            return self._budget_out(s)
         return getattr(self, "h_" + s)()
 
     def run(self, max_steps: int = 200) -> str:
@@ -366,13 +534,13 @@ class Machine:
             return self._go("FINAL", "the spec did not validate", "run_failed")
         self.st.tries["spec"] = n + 1
         fb = self.st.tries.get("spec_feedback")
-        res = self.tasks.draft_spec(self.st.question, self.run_dir, fb)
-        self._charge(res)
+        res = self._task(f"SPEC#{self._visit()}:try{n + 1}", "draft_spec", self.st.question, self.run_dir, fb)
+        if res is None:
+            return self._budget_out("SPEC")
         errs = [f"draft_spec failed: {res.note}"] if not res.ok else []
         if res.ok:
             try:
-                errs = self.backend.validate(self._spec(), self.run_dir) if self._spec().get("engine") else \
-                    _pre_engine_check(self._spec())
+                errs = _pre_engine_check(self._spec()) + AB.settings_problems(self.run_dir)
             except Exception as e:  # noqa: BLE001
                 errs = [f"spec unreadable: {e}"]
         if errs:
@@ -386,13 +554,12 @@ class Machine:
         if mode == "none":
             return self._go("EVIDENCE", "sign-off not required (--signoff none)")
         rec = _signoff(self.run_dir)
-        if rec and rec.get("sections_sha") == signed_hash(self.run_dir) and (mode == "lead" or rec.get("by") == "owner"):
+        if rec and rec.get("spec_sha256") == signed_hash(self.run_dir) and (mode == "lead" or rec.get("by") == "owner"):
             return self._go("EVIDENCE", f"spec signed by {rec.get('by')}")
         if mode == "lead":
-            res = self.tasks.sign_spec(self.run_dir)
-            self._charge(res)
+            res = self._task(f"SIGN#{self._visit()}:sign_spec", "sign_spec", self.run_dir)
             rec = _signoff(self.run_dir)
-            if res.ok and rec:
+            if res is not None and res.ok and rec:
                 sign(self.run_dir, "lead", rec.get("note", ""))   # the harness records the hash
                 return self._go("EVIDENCE", "spec signed by the lead")
         self.st.paused = "awaiting_signoff"
@@ -410,15 +577,16 @@ class Machine:
         return self._go("ENGINE_CHOICE", "evidence stub")
 
     def h_ENGINE_CHOICE(self):
-        spec = self._spec()
-        rows = self.backend.eligible_engines(_with_abs_paths(spec, self.run_dir))
+        spec = AB.merged_spec(self.run_dir)
+        rows = self.backend.eligible_engines(spec)
         eligible = [r for r in rows if r.get("eligible")]
         rec = {"at": _now(), "candidates": rows}
         if not eligible:
             _write_json(self.run_dir, "engine_choice.json", rec)
             return self._go("FINAL", "no registered engine fits the spec", "run_failed")
-        res = self.tasks.pick_engine(spec, rows)
-        self._charge(res)
+        res = self._task(f"ENGINE_CHOICE#{self._visit()}:pick_engine", "pick_engine", spec, rows)
+        if res is None:
+            return self._budget_out("ENGINE_CHOICE")
         pick = (res.output or {}).get("engine") if res.ok else None
         if pick not in {r["ref"] for r in eligible}:
             pick, why = eligible[0]["ref"], f"harness: the pick {pick!r} is not eligible; first eligible engine"
@@ -428,20 +596,18 @@ class Machine:
         if self.cross and len(eligible) > 1:
             try:
                 rec["cross_check"] = self.backend.cross_check(
-                    _with_abs_paths(spec, self.run_dir), [pick] + [r["ref"] for r in eligible if r["ref"] != pick][:1],
+                    spec, [pick] + [r["ref"] for r in eligible if r["ref"] != pick][:1],
                     os.path.join(self.run_dir, "analysis", "cross_check"))
             except Exception as e:  # noqa: BLE001 -- recorded; the check is optional
                 rec["cross_check"] = {"error": f"{type(e).__name__}: {e}"}
-        _write_json(self.run_dir, "engine_choice.json", rec)
-        from v2_tasks import set_key
-        set_key(os.path.join(self.run_dir, AB.SPEC_FILE), "engine", pick)
+        _write_json(self.run_dir, AB.ENGINE_CHOICE, rec)     # the spec stays as signed
         self.st.engine = pick
         return self._go("CONFIGURE", f"engine {pick}")
 
     def h_CONFIGURE(self):
         import pipeline as P
         import yaml
-        errs = self.backend.validate(self._spec(), self.run_dir)
+        errs = self.backend.validate(os.path.join(self.run_dir, AB.SPEC_FILE))
         if errs:
             return self._go("FINAL", f"spec invalid for the engine: {'; '.join(errs)[:200]}", "run_failed")
         os.makedirs(os.path.join(self.run_dir, "models"), exist_ok=True)
@@ -468,9 +634,11 @@ class Machine:
             self.st.round_pending = False
         if self.st.round > self.st.max_rounds:
             return self._go("FINAL", "round cap passed (gate did not stop the run)", "completed_gate_error")
+        v = self._visit()
         for reviewer in CRITICS:
-            res = self.tasks.critique(self.run_dir, reviewer, self.st.round)
-            self._charge(res)
+            res = self._task(f"CRITIQUE#{v}:r{self.st.round}:{reviewer}", "critique", self.run_dir, reviewer, self.st.round)
+            if res is None:
+                return self._budget_out("CRITIQUE")
         return self._go("GATE", f"critique round {self.st.round}")
 
     def h_GATE(self):
@@ -478,7 +646,11 @@ class Machine:
         if self.st.gate_mode == "legacy":
             d = legacy_gate(self.run_dir, self.st.round, self.st.max_rounds, pw)
         else:
-            d = v2_gate(self.run_dir, self.st.round, self.st.max_rounds, pw, self.harness_findings())
+            sv = getattr(self.backend, "spec_violations", None)
+            rv = getattr(self.backend, "registry_violations", None)
+            d = v2_gate(self.run_dir, self.st.round, self.st.max_rounds, pw, self.harness_findings(),
+                        spec_violations=sv(self.run_dir) if sv else None,
+                        registry_violations=rv(self.run_dir) if rv else None)
         tag = f"gate_r{self.st.round}{'_post' if pw else ''}.json"
         _write_json(self.run_dir, tag, d or {})
         if pw:
@@ -504,9 +676,15 @@ class Machine:
         return self._go(nxt, why, status)
 
     def h_FIX_LOOP(self):
-        summ = FX.run_loop(self.run_dir, self.st.round, self.st.max_rounds, self._last_decision(), _Charging(self),
+        v = self._visit()
+        k = f"FIX_LOOP#{v}:spec_sha256"
+        if k not in self.st.journal:                       # the reference a fix may not move
+            self.st.journal[k] = {"task": "harness", "status": "completed", "output": signed_hash(self.run_dir)}
+            save_state(self.run_dir, self.st)
+        summ = FX.run_loop(self.run_dir, self.st.round, self.st.max_rounds, self._last_decision(),
+                           _Journaled(self, f"FIX_LOOP#{v}:r{self.st.round}"),
                            rebuild=self.rebuild, harness_ids=self.harness_ids, headline=self.backend.headline,
-                           budget=self._budget, log=self.log)
+                           budget=self._budget, log=self.log, guard=self.fix_guard, protect=PROTECTED_BY_FIX)
         self.st.history.append({"at": _now(), "fix_loop": summ})
         if summ.get("rethink"):
             return self._go(summ["rethink"], f"the planner chose a rethink ({summ['rethink']})")
@@ -525,8 +703,9 @@ class Machine:
 
     def h_WRITE(self):
         mode = self.st.write_mode or "not_accepted"
-        res = self.tasks.write(self.run_dir, mode)
-        self._charge(res)
+        res = self._task(f"WRITE#{self._visit()}:{mode}", "write", self.run_dir, mode, writeup=True)
+        if res is None:
+            return self._go("FINAL", "no budget left for the write-up", "completed_no_report")
         if not res.ok or not self._has_draft():
             return self._go("FINAL", "the writer produced no draft", "completed_no_report")
         render_report(self.run_dir, self.backend)
@@ -536,8 +715,10 @@ class Machine:
         return self._go("PRESENTATION", f"draft written ({mode})")
 
     def h_PRESENTATION(self):
-        res = self.tasks.critique(self.run_dir, "critique-presentation", self.st.round)
-        self._charge(res)
+        res = self._task(f"PRESENTATION#{self._visit()}:r{self.st.round}", "critique", self.run_dir,
+                         "critique-presentation", self.st.round)
+        if res is None:
+            return self._budget_out("PRESENTATION")
         return self._go("GATE", "presentation review of the draft")
 
     def _last_decision(self) -> dict | None:
@@ -561,20 +742,25 @@ class Machine:
 
 
 # ------------------------------------------------------------------ helpers
-class _Charging:
-    """The machine's tasks, with every result's spend charged to the run (used by the fix loop)."""
+class _Journaled:
+    """The machine's tasks for the fix loop, each call through the journal (Machine._task) under a
+    key that is the same on resume: plan calls by their order, fix calls by task id and attempt.
+    A call with no allowance left returns a failed result without being made."""
 
-    def __init__(self, m: "Machine"):
-        self.m = m
+    def __init__(self, m: "Machine", prefix: str):
+        self.m, self.prefix, self.n_plan = m, prefix, 0
 
-    def __getattr__(self, name):
-        fn = getattr(self.m.tasks, name)
+    def plan_fixes(self, packet):
+        self.n_plan += 1
+        return self._call(f"{self.prefix}:plan{self.n_plan}", "plan_fixes", packet)
 
-        def call(*a, **k):
-            res = fn(*a, **k)
-            self.m._charge(res)
-            return res
-        return call
+    def fix(self, task, run_dir, evidence):
+        return self._call(f"{self.prefix}:fix:{task['id']}:a{1 if evidence is None else 2}", "fix", task, run_dir, evidence)
+
+    def _call(self, key, name, *args):
+        from v2_tasks import TaskResult
+        res = self.m._task(key, name, *args)
+        return res if res is not None else TaskResult(False, None, 0.0, "no budget left for this task")
 
 
 def _write_json(run_dir: str, rel: str, obj) -> None:
@@ -633,8 +819,8 @@ def _write_deliverable(run_dir: str) -> None:
     spec = yaml.safe_load(open(os.path.join(run_dir, AB.SPEC_FILE))) or {}
     df = spec.get("deliverable_file")
     src = os.path.join(run_dir, AB.ALLOCATION_CSV)
-    if not isinstance(df, dict) or not os.path.exists(src):
-        return
+    if not isinstance(df, dict) or not os.path.exists(src) or deliverable_problems(run_dir):
+        return                      # an invalid destination is a HIGH finding, never written
     rows = list(csv.DictReader(open(src)))
     names = df.get("package_names") or {}
     with open(os.path.join(run_dir, df["path"]), "w", newline="") as f:
@@ -711,28 +897,29 @@ def _self_test() -> int:
             AB.write_toy_units(os.path.join(d, "units.csv"), n=12)
             spec = AB.toy_spec("units.csv")
             spec.pop("engine")
-            spec["emulator"]["points"] = 16          # small: the resume test runs the whole machine many times
             spec["deliverable_file"] = {"path": "allocation_optimized.csv",
                                         "columns": {"unit": "id", "package": "package", "dalys_averted": "dalys_averted"}}
-            script = dict({"spec": spec}, **script)
+            spec.update(script.pop("spec_extra", {}))
+            # 16 emulator points: the resume test runs the whole machine many times
+            script = dict({"spec": spec, "settings": AB.toy_settings(draws=6, points=16)}, **script)
             st = init_run(d, "toy question", max_rounds, signoff, "v2", budget)
             return d, StubTasks(script), st
 
         # T10: the happy path with one critic finding fixed in the loop.
         blocker = {"id": "D-001", "severity": "HIGH", "target_stage": "ANALYZE", "claim": "too few draws",
-                   "done_when": [{"file": "decision_spec.yaml", "key": "uncertainty.draws", "op": ">=", "value": 24}]}
+                   "done_when": [{"file": "analysis_settings.yaml", "key": "uncertainty.draws", "op": ">=", "value": 24}]}
         d, T, st = new_run("happy", {"critics": {1: {"critique-domain": [blocker]}},
-                                     "fixes": {"D-001": [("decision_spec.yaml", "uncertainty.draws", 24)],
-                                               "uncertainty_draws_low:draws": [("decision_spec.yaml", "uncertainty.draws", 24)]}})
+                                     "fixes": {"D-001": [("analysis_settings.yaml", "uncertainty.draws", 24)],
+                                               "uncertainty_draws_low:draws": [("analysis_settings.yaml", "uncertainty.draws", 24)]}})
         status = Machine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
         hist = [h["to"] for h in load_state(d).history if "to" in h]
         ok(status == "completed", f"T10 toy run completes: {status} via {hist}")
         ok(hist[:6] == ["SIGN", "EVIDENCE", "ENGINE_CHOICE", "CONFIGURE", "ANALYZE", "CRITIQUE"] and "FIX_LOOP" in hist
            and hist[-3:] == ["PRESENTATION", "GATE", "FINAL"], f"T11 the path SPEC..FIX_LOOP..WRITE..FINAL {hist}")
         rows = FX.impact_rows(d)
-        ok(rows and rows[0]["files_changed"] == ["decision_spec.yaml"] and "analyze" in rows[0]["steps_rebuilt"]
+        ok(rows and rows[0]["files_changed"] == ["analysis_settings.yaml"] and "analyze" in rows[0]["steps_rebuilt"]
            and rows[0]["headline_before"] != rows[0]["headline_after"] and rows[0]["passed"],
-           f"T12 the fix has an impact row: spec changed, analysis rebuilt, headline moved, check passed")
+           f"T12 the fix has an impact row: settings changed, analysis rebuilt, headline moved, check passed")
         led = FL.load(d)
         ok(led["D-001"].status == "fixed" and os.path.exists(os.path.join(d, "allocation_optimized.csv"))
            and "Numbers (rendered by the harness)" in open(os.path.join(d, "report.md")).read(),
@@ -743,13 +930,13 @@ def _self_test() -> int:
 
         # T16: resume after every state. Stop after k steps, rebuild the machine from disk, finish.
         d0, T0, st0 = new_run("ref", {"critics": {1: {"critique-domain": [blocker]}},
-                                      "fixes": {"D-001": [("decision_spec.yaml", "uncertainty.draws", 24)]}})
+                                      "fixes": {"D-001": [("analysis_settings.yaml", "uncertainty.draws", 24)]}})
         ref_status = Machine(d0, T0, st0, log=lambda *a: None, cross_engine_check=False).run()
         ref_path = [h["to"] for h in load_state(d0).history if "to" in h]
         bad = []
         for k in range(1, len(ref_path)):
             dk, Tk, stk = new_run(f"resume{k}", {"critics": {1: {"critique-domain": [blocker]}},
-                                                "fixes": {"D-001": [("decision_spec.yaml", "uncertainty.draws", 24)]}})
+                                                "fixes": {"D-001": [("analysis_settings.yaml", "uncertainty.draws", 24)]}})
             m = Machine(dk, Tk, stk, log=lambda *a: None, cross_engine_check=False)
             for _ in range(k):
                 m.step()
@@ -771,14 +958,27 @@ def _self_test() -> int:
         ok(Machine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run() == "completed",
            "T18 after the owner signs, the resumed run completes")
 
-        # T19: a signed section edited by a fix is a non-declarable HIGH at the next gate.
+        # T19: a fix that edits the signed spec, or puts a decision leaf in the settings file, is
+        # undone before anything is rebuilt; the spec stays as signed.
         d, T, st = new_run("tamper", {"critics": {1: {"critique-redteam": [dict(blocker, id="R-001")]}},
-                                      "fixes": {"R-001": [("decision_spec.yaml", "constraints.envelope_usd", 99999)]}},
+                                      "fixes": {"R-001": [("decision_spec.yaml", "constraints.envelope_usd", 99999),
+                                                          ("analysis_settings.yaml", "constraints.envelope_usd", 99999)]}},
                            signoff="lead", max_rounds=2)
-        s = Machine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+        signed_before = None
+
+        class Spy(StubTasks):
+            def fix(self, task, run_dir, evidence):
+                nonlocal signed_before
+                signed_before = signed_before or _signoff(run_dir)["spec_sha256"]
+                return super().fix(task, run_dir, evidence)
+        s = Machine(d, Spy(T.s), st, log=lambda *a: None, cross_engine_check=False).run()
+        rows = FX.impact_rows(d)
         led = FL.load(d)
-        ok("spec_changed_after_signoff:spec" in led and s == "run_failed",
-           f"T19 a signed section changed by a fix blocks the run ({s})")
+        ok(rows and all(r.get("rejected") and not r.get("steps_rebuilt") for r in rows)
+           and signed_hash(d) == signed_before and "constraints.envelope_usd" not in AB._leaves(
+               __import__("yaml").safe_load(open(os.path.join(d, AB.SETTINGS_FILE))) or {})
+           and "spec_changed_after_signoff:spec" not in led and s == "completed_scope_declared",
+           f"T19 edits to the signed spec are rejected and undone before any rebuild ({s}, {[r.get('rejected') for r in rows][:1]})")
 
         # T20: a structural mismatch is a back-edge to ENGINE_CHOICE, then the run continues.
         d, T, st = new_run("rethink", {"structural": {1: "critique-domain"}})
@@ -800,6 +1000,88 @@ def _self_test() -> int:
         p = [h["to"] for h in load_state(d).history if "to" in h]
         ok(s == "budget_exhausted" and "WRITE" in p and os.path.exists(os.path.join(d, "report.md")),
            f"T22 with the budget used the run ends budget_exhausted with a report ({s}, {p[-4:]})")
+
+        # T25: an interrupted paid task. The redteam critique crashes once in round 1: on resume the
+        # domain critique (completed) is not run again, and the interrupted one is charged its allowance.
+        d, T, st = new_run("crash", {"crash": {"critique:critique-redteam:1": 1}, "usd": 1.0}, budget=100.0)
+        m = Machine(d, T, st, log=lambda *a: None, cross_engine_check=False)
+        try:
+            m.run()
+            ok(False, "T25 the stub crash propagates")
+        except RuntimeError:
+            pass
+        spent_at_crash = load_state(d).spent_usd
+        T2 = StubTasks(dict(T.s, crash={}))
+        s = Machine(d, T2, None, log=lambda *a: None, cross_engine_check=False).run()
+        j = load_state(d).journal
+        dom = [k for k in j if k.endswith(":r1:critique-domain")]
+        red = [k for k in j if k.endswith(":r1:critique-redteam")]
+        ok(s == "completed" and "critique:critique-domain:1" not in T2.calls and T2.calls.count("critique:critique-redteam:1") == 1
+           and dom and j[dom[0]]["status"] == "completed" and red and j[red[0]].get("interrupted_charged") == 1,
+           f"T25 resume skips the completed critique and re-runs the interrupted one ({s}, {T2.calls[:3]})")
+        ok(abs(load_state(d).spent_usd - spent_at_crash - 3.0 - 1.0 * len(T2.calls)) < 1e-9,
+           f"T26 the interrupted task is charged its allowance ($3) once; completed ones are not charged again "
+           f"({spent_at_crash} -> {load_state(d).spent_usd}, {len(T2.calls)} new calls)")
+
+        # T27: each paid task gets an allowance from what is left (less the write-up reserve), set before
+        # the call; the second critic of a pair is not called when the first used the budget.
+        d, T, st = new_run("allow", {"usd": 9.0}, budget=30.0)
+        st.task_cap_usd = 9.0
+        save_state(d, st)
+        s = Machine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+        ok(T.allowances == [9.0, 9.0, 2.0, 3.0] and "critique:critique-redteam:1" not in T.calls
+           and s == "budget_exhausted",
+           f"T27 allowances follow the budget and the pair stops when it is used ({T.allowances}, {s})")
+        jj = load_state(d).journal
+        ok(all("allowance_usd" in e for k, e in jj.items() if not k.endswith("spec_sha256")),
+           "T28 every journal entry records the allowance it was given")
+
+        # T29: the deliverable destination must be a plain file inside the run, not one the harness owns.
+        bad_paths = {}
+        for name, path in (("escape", "../escape.csv"), ("owned", "run_state.json"), ("report", "report.md"),
+                           ("link", "out/link.csv")):
+            d, T, st = new_run(f"deliv_{name}", {"spec_extra": {"deliverable_file": {
+                "path": path, "columns": {"unit": "id", "package": "package"}}}}, max_rounds=1)
+            if name == "link":
+                os.makedirs(os.path.join(td, "elsewhere"), exist_ok=True)
+                os.symlink(os.path.join(td, "elsewhere"), os.path.join(d, "out"))
+            s = Machine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+            led = FL.load(d)
+            bad_paths[name] = ("deliverable_path_invalid:deliverable" in led and s == "run_failed"
+                               and not os.path.exists(os.path.join(td, "escape.csv"))
+                               and not os.path.exists(os.path.join(td, "elsewhere", "link.csv")))
+        ok(all(bad_paths.values()), f"T29 a deliverable outside the run, owned or through a symlink is refused {bad_paths}")
+
+        # T30: a measured decision test that changes the plan cannot be declared without the owner rule.
+        import validate_critique_yaml as V
+        dd = os.path.join(td, "dt")
+        os.makedirs(dd)
+        for r in CRITICS:
+            __import__("yaml").safe_dump({"reviewer": r, "round": 2, "verdict": "PASS", "structural_mismatch": {"detected": False},
+                                          "carried_forward": [], "blockers": []}, open(os.path.join(dd, V.FILENAMES[r]), "w"))
+        dtf = {"kind": "decision_test_changes_plan", "severity": "HIGH", "stage": "ANALYZE", "key": "DT1",
+               "claim": "DT1 changes the plan", "scope_declarable": True, "decision_bearing": True}
+        g = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False)
+        ok(_owner_rule() is None and g["action"] == "RUN_FAILED",
+           f"T30 without the owner rule the finding is not declarable: RUN_FAILED, not DECLARE_SCOPE ({g['action']})")
+        seen = {}
+
+        class Rule:
+            @staticmethod
+            def gate_findings(rd, rn, viols, non_declarable=None):
+                seen["marked"] = [v.get("owner_signoff") for v in viols if v.get("kind") == "decision_test_changes_plan"]
+                return []
+        vs = [dict(dtf)]
+        apply_owner_rule(dd, 2, vs, rule=Rule)
+        ok(seen.get("marked") == [True] and vs[0].get("owner_item"), "T31 with the owner rule the finding goes to it, marked for the owner")
+
+        class Broken:
+            @staticmethod
+            def gate_findings(*a, **k):
+                raise RuntimeError("x")
+        vs = [dict(dtf)]
+        apply_owner_rule(dd, 2, vs, rule=Broken)
+        ok(vs[0]["scope_declarable"] is False and not vs[0].get("owner_signoff"), "T32 an owner rule that fails is fail-closed")
 
         # T23: a transition outside the table is refused.
         m = Machine(os.path.join(td, "ref"), StubTasks({}), None, log=lambda *a: None)

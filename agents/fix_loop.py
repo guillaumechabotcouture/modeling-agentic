@@ -36,7 +36,7 @@ RETHINK_STATES = ("SPEC", "ENGINE_CHOICE")
 # Files the harness writes; never counted as an agent's change.
 _HARNESS_OWNED = ("findings.jsonl", IMPACT, "run_state.json", "trace.jsonl", "validator_history.jsonl",
                   "done_when_registry.json", "open_problems.md", "open_problems.json", "final_gate.json",
-                  "gate_r", "fix_plan_r", "models/pipeline_state.json", "models/pipeline_report.json", "analysis/")
+                  "gate_r", "fix_plan_r", "fix_progress_r", "models/pipeline_state.json", "models/pipeline_report.json", "analysis/")
 
 FIX_PLANNER_PROMPT = """\
 You are the fix planner of a modeling run. The harness runs the pipeline; you decide what
@@ -223,11 +223,40 @@ def append_impact(run_dir: str, row: dict) -> None:
         f.write(json.dumps(row, sort_keys=True, default=str) + "\n")
 
 
+def _read_or_none(path: str):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _restore(run_dir: str, saved: dict) -> None:
+    for rel, text in saved.items():
+        p = os.path.join(run_dir, rel)
+        if os.path.islink(p):
+            os.remove(p)
+        if text is None:
+            if os.path.exists(p):
+                os.remove(p)
+        else:
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(text)
+
+
 def run_loop(run_dir: str, round_n: int, max_rounds: int, gate: dict | None, tasks, rebuild, harness_ids,
-             headline, budget=None, log=print) -> dict:
+             headline, budget=None, log=print, guard=None, protect=()) -> dict:
     """One fix loop. `tasks` is the machine's Tasks (plan_fixes, fix); `rebuild(run_dir)` is the S1
     runner, returning its report; `harness_ids(run_dir)` the ledger ids the harness checks report
-    now; `headline(run_dir)` the numbers to record; `budget()` -> {spent, cap, left} or None."""
+    now; `headline(run_dir)` the numbers to record; `budget()` -> {spent, cap, left} or None.
+
+    `guard(run_dir)` -> problems with what the agent changed (a signed file edited, a setting
+    outside the allowed ones); with problems the files in `protect` are put back as they were
+    before the task, nothing is rebuilt, and the row records the rejection.
+
+    Resumable: a task with an impact row for this round is not run again, and a task that was
+    started keeps the snapshot taken before it (fix_progress_r<N>.json), so its row still
+    measures the change."""
     ledger = FL.load(run_dir)
     packet = build_packet(run_dir, ledger, round_n, max_rounds, gate, budget() if budget else None)
     plan, errs, tries = None, [], 0
@@ -243,28 +272,58 @@ def run_loop(run_dir: str, round_n: int, max_rounds: int, gate: dict | None, tas
         plan = default_plan(packet)
     with open(os.path.join(run_dir, f"fix_plan_r{round_n}.json"), "w") as f:
         json.dump({"round": round_n, "plan": plan, "rejected": errs}, f, indent=1)
+    done = {r.get("task") for r in impact_rows(run_dir) if r.get("round") == round_n}
+    prog_p = os.path.join(run_dir, f"fix_progress_r{round_n}.json")
+    try:
+        progress = json.load(open(prog_p))
+    except (OSError, ValueError):
+        progress = {}
     summary = {"round": round_n, "tasks": len(plan["tasks"]), "rows": 0, "passed": 0, "rethink": None,
-               "skipped_budget": 0, "plan_by": plan.get("by", "planner")}
+               "skipped_budget": 0, "rejected": 0, "resumed_done": 0, "plan_by": plan.get("by", "planner")}
+
+    def out_of_budget():
+        b = budget() if budget else None
+        return bool(b and b.get("left") is not None and b["left"] <= 0)
+
     for t in plan["tasks"]:
+        if t["id"] in done:
+            summary["resumed_done"] += 1
+            if t["action"] == "rethink":
+                summary["rethink"] = summary["rethink"] or t["owner_state"]
+            continue
         if t["action"] == "rethink":
             summary["rethink"] = summary["rethink"] or t["owner_state"]
             append_impact(run_dir, {"round": round_n, "task": t["id"], "findings": t["findings"], "action": "rethink",
                                     "owner_state": t["owner_state"], "passed": None, "note": "routed to " + t["owner_state"]})
             continue
-        b = budget() if budget else None
-        if b and b.get("left") is not None and b["left"] <= 0:
+        if out_of_budget():
             summary["skipped_budget"] += 1
             append_impact(run_dir, {"round": round_n, "task": t["id"], "findings": t["findings"],
                                     "action": t["action"], "passed": None, "note": "skipped: loop budget used"})
             continue
-        t0 = time.time()
-        usd0 = b["spent"] if b else None
-        before_h, before_ids = headline(run_dir), harness_ids(run_dir)
-        snap = snapshot(run_dir)
-        evidence, rebuilt, attempts_ = None, [], 0
+        b = budget() if budget else None
+        pend = progress.get(t["id"])
+        if pend is None:
+            pend = {"t0": time.time(), "usd0": b["spent"] if b else None, "before_h": headline(run_dir),
+                    "before_ids": sorted(harness_ids(run_dir)), "snap": snapshot(run_dir),
+                    "saved": {rel: _read_or_none(os.path.join(run_dir, rel)) for rel in protect}}
+            progress[t["id"]] = pend
+            with open(prog_p, "w") as f:
+                json.dump(progress, f, default=str)
+        evidence, rebuilt, attempts_, rejected, rep, r = None, [], 0, [], {}, None
+        check, passed, now_ids = {}, False, set(pend["before_ids"])
         while True:
             attempts_ += 1
+            if attempts_ > 1 and out_of_budget():
+                break                                   # the retry is a paid call too
             r = tasks.fix(t, run_dir, evidence)
+            rejected = list(guard(run_dir)) if guard else []
+            if rejected:
+                _restore(run_dir, pend["saved"])
+                log(f"[fix loop] {t['id']} rejected: {'; '.join(rejected)[:200]}")
+                check = {fid: {"passed": False, "why": "edit rejected"} for fid in t["findings"]}
+                passed = False
+                break
             rep = rebuild(run_dir) or {}
             rebuilt += [s.get("id") for s in rep.get("steps") or [] if s.get("status") == "ok"]
             ledger = FL.load(run_dir)
@@ -279,12 +338,17 @@ def run_loop(run_dir: str, round_n: int, max_rounds: int, gate: dict | None, tas
         b2 = budget() if budget else None
         row = {"round": round_n, "task": t["id"], "findings": t["findings"], "action": t["action"],
                "owner_state": t.get("owner_state"), "brief": t.get("brief", "")[:300],
-               "files_changed": changed_files(snap, snapshot(run_dir)), "steps_rebuilt": sorted(set(rebuilt)),
-               "rebuild_ok": rep.get("ok", True), "attempts": attempts_, "seconds": round(time.time() - t0, 1),
-               "usd": (round(b2["spent"] - usd0, 4) if b2 and usd0 is not None else None),
-               "headline_before": before_h, "headline_after": headline(run_dir),
+               "files_changed": changed_files(pend["snap"], snapshot(run_dir)), "steps_rebuilt": sorted(set(rebuilt)),
+               "rebuild_ok": rep.get("ok", True), "attempts": attempts_,
+               "seconds": round(time.time() - float(pend["t0"]), 1),
+               "usd": (round(b2["spent"] - pend["usd0"], 4) if b2 and pend["usd0"] is not None else None),
+               "headline_before": pend["before_h"], "headline_after": headline(run_dir),
                "check": check, "passed": passed if any(c["passed"] is not None for c in check.values()) else None,
-               "new_findings": sorted(now_ids - before_ids), "agent_note": (r.note or "")[:300]}
+               "new_findings": sorted(set(now_ids) - set(pend["before_ids"])),
+               "agent_note": ((r.note if r else "") or "")[:300]}
+        if rejected:
+            row["rejected"] = rejected
+            summary["rejected"] += 1
         append_impact(run_dir, row)
         summary["rows"] += 1
         summary["passed"] += bool(row["passed"])
@@ -371,6 +435,37 @@ def _self_test() -> int:
         s3 = run_loop(d, 3, 3, None, T(), rebuild=lambda rd: {"ok": True}, harness_ids=lambda rd: set(),
                       headline=lambda rd: {}, budget=lambda: {"spent": 10, "cap": 10, "left": 0}, log=lambda *a: None)
         ok(s3["skipped_budget"] == 2 and s3["rows"] == 0, "F11 with the loop budget used, tasks are recorded as skipped, not run")
+    with tempfile.TemporaryDirectory() as d:
+        open(os.path.join(d, "decision_spec.yaml"), "w").write("budget: 10\n")
+        FL.save(d, {"k:x": FL.Finding(id="k:x", kind="k", key="x", severity="HIGH", source="harness", blocking=True)})
+        calls = {"fix": 0, "rebuild": 0}
+
+        class Edit:
+            def plan_fixes(self, pk):
+                return NS(ok=True, note="", output={"tasks": [
+                    {"id": "T1", "findings": ["k:x"], "action": "fix", "owner_state": "CONFIGURE", "brief": "b"}]})
+
+            def fix(self, t, run_dir, evidence):
+                calls["fix"] += 1
+                open(os.path.join(run_dir, "decision_spec.yaml"), "w").write("budget: 99\n")
+                return NS(ok=True, note="", output=None)
+
+        def reb(rd):
+            calls["rebuild"] += 1
+            return {"ok": True}
+        guard = lambda rd: (["decision_spec.yaml changed after sign-off"]   # noqa: E731
+                            if "99" in open(os.path.join(rd, "decision_spec.yaml")).read() else [])
+        s5 = run_loop(d, 1, 3, None, Edit(), rebuild=reb, harness_ids=lambda rd: {"k:x"}, headline=lambda rd: {},
+                      log=lambda *a: None, guard=guard, protect=("decision_spec.yaml",))
+        row = impact_rows(d)[-1]
+        ok(s5["rejected"] == 1 and calls["rebuild"] == 0 and row.get("rejected") and row["passed"] is False
+           and open(os.path.join(d, "decision_spec.yaml")).read() == "budget: 10\n",
+           f"F13 an edit the guard rejects is undone, nothing is rebuilt, and the row says why {s5}")
+        n = calls["fix"]
+        s6 = run_loop(d, 1, 3, None, Edit(), rebuild=reb, harness_ids=lambda rd: {"k:x"}, headline=lambda rd: {},
+                      log=lambda *a: None, guard=guard, protect=("decision_spec.yaml",))
+        ok(calls["fix"] == n and s6["resumed_done"] == 1 and len(impact_rows(d)) == 1,
+           "F14 on resume a task with its impact row is not run again")
     ok("STAGE" not in FIX_PLANNER_PROMPT and "validate_critique_yaml" not in FIX_PLANNER_PROMPT
        and "spawn" not in FIX_PLANNER_PROMPT.lower(),
        "F12 the planner prompt has no stage protocol, validator invocation or spawn instructions")

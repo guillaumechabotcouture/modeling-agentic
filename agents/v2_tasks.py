@@ -39,6 +39,7 @@ class TaskResult:
     output: Any = None
     usd: float = 0.0
     note: str = ""
+    session_id: str | None = None
 
 
 class Tasks(Protocol):
@@ -62,7 +63,7 @@ def _yaml_dump(obj, path):
 def set_key(path: str, dotted: str, value) -> None:
     """Set a dotted key in a YAML file (the stub fixer's one edit)."""
     import yaml
-    doc = yaml.safe_load(open(path)) or {}
+    doc = (yaml.safe_load(open(path)) or {}) if os.path.exists(path) else {}
     cur = doc
     parts = dotted.split(".")
     for p in parts[:-1]:
@@ -75,6 +76,7 @@ class StubTasks:
     """Scripted, deterministic tasks. `script`:
 
       spec:        dict, or callable(question, run_dir) -> dict (the decision spec to write)
+      settings:    dict written to analysis_settings.yaml with the spec (computational settings)
       engine:      ref to pick (default: the first eligible)
       critics:     {round: {reviewer: [blocker, ...]}}  blockers need id, severity, target_stage, claim;
                    optional done_when, category. A blocker raised earlier is carried forward: resolved
@@ -83,14 +85,23 @@ class StubTasks:
       fixes:       {finding id: [(file, dotted key, value), ...] or callable(run_dir)}
       plan:        callable(packet) -> plan (default: the harness default plan)
       usd:         spend charged per task (default 0)
+      crash:       {call name: n}  the call raises (an interrupted session) the first n times
     """
 
     def __init__(self, script: dict | None = None):
         self.s = script or {}
         self.calls: list[str] = []
+        self.allowances: list = []
+        self._crashes = dict(self.s.get("crash") or {})
+
+    def set_allowance(self, usd):
+        self.allowances.append(usd)
 
     def _r(self, name, ok=True, output=None, note=""):
         self.calls.append(name)
+        if self._crashes.get(name, 0) > 0:
+            self._crashes[name] -= 1
+            raise RuntimeError(f"stub: {name} interrupted")
         return TaskResult(ok, output, float(self.s.get("usd", 0.0)), note)
 
     def draft_spec(self, question, run_dir, feedback):
@@ -100,6 +111,8 @@ class StubTasks:
         if not isinstance(spec, dict):
             return self._r("draft_spec", False, note="no spec scripted")
         _yaml_dump(spec, os.path.join(run_dir, "decision_spec.yaml"))
+        if isinstance(self.s.get("settings"), dict):
+            _yaml_dump(self.s["settings"], os.path.join(run_dir, "analysis_settings.yaml"))
         return self._r("draft_spec", note=f"feedback={len(feedback or [])}")
 
     def sign_spec(self, run_dir):
