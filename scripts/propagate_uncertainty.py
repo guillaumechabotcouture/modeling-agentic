@@ -379,6 +379,121 @@ def rare_event_summary(vals: list[float]) -> dict:
             "mean_if_nonzero": float(mean(nonzero))}
 
 
+def interval_quantiles(level: float = 0.95) -> tuple[float, float]:
+    """Lower and upper quantiles of a central interval. 0.95 keeps the historical constants exactly
+    (0.025, 0.975), so existing reports are unchanged."""
+    if level == 0.95:
+        return 0.025, 0.975
+    if not 0.5 <= float(level) < 1:
+        raise ValueError(f"interval level {level!r} must be in [0.5, 1)")
+    a = round((1.0 - float(level)) / 2.0, 12)
+    return a, round(1.0 - a, 12)
+
+
+def summarise_outputs(outs: list, per_param_samples: dict, n_draws: int, level: float = 0.95) -> dict:
+    """Aggregate per-draw outcome dicts into the report's blocks (scalar_outputs, categorical_outputs,
+    parameter_samples) with the degeneracy and rare-event diagnostics. Shared by propagate() and the v2
+    analysis engine (toolkit/analysis/uncertainty.py), so both write the same uncertainty_report schema.
+    Raises RuntimeError when more than 20% of draws failed."""
+    qlo, qhi = interval_quantiles(level)
+    errors: list[dict] = []
+    scalar_results: dict[str, list[float]] = {}
+    categorical_results: dict[str, list[str]] = {}
+    n_nonfinite: dict[str, int] = {}
+    for i, out in enumerate(outs):
+        if isinstance(out, dict) and "_error" in out:
+            errors.append(out["_error"])
+            continue
+        if not isinstance(out, dict):
+            errors.append({"draw": i, "exception": "TypeError",
+                           "message": f"outcome_fn must return dict, "
+                                      f"got {type(out).__name__}"})
+            continue
+        for key, val in out.items():
+            if isinstance(val, bool):
+                categorical_results.setdefault(key, []).append(str(val))
+            elif isinstance(val, (int, float)):
+                # Phase 21 δ: NaN/inf must not enter sorted() — NaN
+                # comparisons silently corrupt order statistics.
+                if math.isfinite(val):
+                    scalar_results.setdefault(key, []).append(float(val))
+                else:
+                    n_nonfinite[key] = n_nonfinite.get(key, 0) + 1
+            elif isinstance(val, str):
+                categorical_results.setdefault(key, []).append(val)
+            # Silently ignore other types (lists, dicts) — outcome_fn
+            # contract requires scalar-or-string outputs.
+
+    if errors and len(errors) / max(1, n_draws) > 0.2:
+        raise RuntimeError(
+            f"outcome_fn errors on >20% of draws "
+            f"({len(errors)}/{n_draws}). Last error: "
+            f"{errors[-1]}. Aborting."
+        )
+
+    # Parameter sample summary (computed first: the degeneracy diagnostic
+    # needs to know whether the sampler actually varied the inputs).
+    parameter_samples = parameter_summary(per_param_samples)
+    varied_params = [n for n, ps in parameter_samples.items() if ps["std"] > 0]
+
+    # Aggregate scalars.
+    scalar_summary = {}
+    degenerate_outputs: list[str] = []
+    for key, vals in scalar_results.items():
+        if not vals:
+            continue
+        vals_sorted = sorted(vals)
+        n = len(vals_sorted)
+        entry = {
+            "mean": float(mean(vals)),
+            "median": float(vals_sorted[n // 2]),
+            "ci_low": float(vals_sorted[int(qlo * n)]),
+            "ci_high": float(vals_sorted[min(n - 1, int(qhi * n))]),
+            "n": n,
+            "n_nonfinite": n_nonfinite.get(key, 0),
+        }
+        entry.update(rare_event_summary(vals))
+        # Phase 21 δ: a zero-width interval from uncertain inputs is a
+        # defect, not a precise answer. Flag it with a diagnostic.
+        scale = max(abs(entry["mean"]), 1e-300)
+        if n > 1 and (vals_sorted[-1] - vals_sorted[0]) / scale < 1e-12:
+            entry["degenerate"] = True
+            entry["degenerate_diagnostic"] = (
+                "every draw produced the same value although "
+                f"{len(varied_params)} sampled parameter(s) varied — "
+                "outcome_fn likely ignores its `params` argument (e.g. reads "
+                "module-level constants or a cached result)"
+                if varied_params else
+                "every draw produced the same value AND no sampled parameter "
+                "varied — the registry priors have zero width or the sampler "
+                "returned constants")
+            degenerate_outputs.append(key)
+        scalar_summary[key] = entry
+    for key, cnt in n_nonfinite.items():
+        if key not in scalar_summary:
+            scalar_summary[key] = {"n": 0, "n_nonfinite": cnt,
+                                   "degenerate": True,
+                                   "degenerate_diagnostic":
+                                       "all draws were NaN/inf"}
+            degenerate_outputs.append(key)
+
+    # Aggregate categoricals.
+    categorical_summary = {}
+    for key, vals in categorical_results.items():
+        counts = Counter(vals)
+        dominant, dominant_n = counts.most_common(1)[0]
+        categorical_summary[key] = {
+            "counts": dict(counts),
+            "dominant": dominant,
+            "dominance": dominant_n / len(vals),
+            "n": len(vals),
+        }
+
+    return {"errors": errors, "scalar_outputs": scalar_summary, "categorical_outputs": categorical_summary,
+            "parameter_samples": parameter_samples, "degenerate_outputs": degenerate_outputs,
+            "varied_params": varied_params}
+
+
 def propagate(run_dir: str, n_draws: int = 200, seed: int = 42,
               outcome_fn_spec: Optional[str] = None,
               verbose: bool = False,
@@ -481,95 +596,11 @@ def propagate(run_dir: str, n_draws: int = 200, seed: int = 42,
             if verbose and (i + 1) % 50 == 0:
                 print(f"  [{i+1}/{n_draws}] draws complete", file=sys.stderr)
 
-    n_nonfinite: dict[str, int] = {}
-    for i, out in enumerate(outs):
-        if isinstance(out, dict) and "_error" in out:
-            errors.append(out["_error"])
-            continue
-        if not isinstance(out, dict):
-            errors.append({"draw": i, "exception": "TypeError",
-                           "message": f"outcome_fn must return dict, "
-                                      f"got {type(out).__name__}"})
-            continue
-        for key, val in out.items():
-            if isinstance(val, bool):
-                categorical_results.setdefault(key, []).append(str(val))
-            elif isinstance(val, (int, float)):
-                # Phase 21 δ: NaN/inf must not enter sorted() — NaN
-                # comparisons silently corrupt order statistics.
-                if math.isfinite(val):
-                    scalar_results.setdefault(key, []).append(float(val))
-                else:
-                    n_nonfinite[key] = n_nonfinite.get(key, 0) + 1
-            elif isinstance(val, str):
-                categorical_results.setdefault(key, []).append(val)
-            # Silently ignore other types (lists, dicts) — outcome_fn
-            # contract requires scalar-or-string outputs.
-
-    if errors and len(errors) / max(1, n_draws) > 0.2:
-        raise RuntimeError(
-            f"outcome_fn errors on >20% of draws "
-            f"({len(errors)}/{n_draws}). Last error: "
-            f"{errors[-1]}. Aborting."
-        )
-
-    # Parameter sample summary (computed first: the degeneracy diagnostic
-    # needs to know whether the sampler actually varied the inputs).
-    parameter_samples = parameter_summary(per_param_samples)
-    varied_params = [n for n, ps in parameter_samples.items() if ps["std"] > 0]
-
-    # Aggregate scalars.
-    scalar_summary = {}
-    degenerate_outputs: list[str] = []
-    for key, vals in scalar_results.items():
-        if not vals:
-            continue
-        vals_sorted = sorted(vals)
-        n = len(vals_sorted)
-        entry = {
-            "mean": float(mean(vals)),
-            "median": float(vals_sorted[n // 2]),
-            "ci_low": float(vals_sorted[int(0.025 * n)]),
-            "ci_high": float(vals_sorted[min(n - 1, int(0.975 * n))]),
-            "n": n,
-            "n_nonfinite": n_nonfinite.get(key, 0),
-        }
-        entry.update(rare_event_summary(vals))
-        # Phase 21 δ: a zero-width interval from uncertain inputs is a
-        # defect, not a precise answer. Flag it with a diagnostic.
-        scale = max(abs(entry["mean"]), 1e-300)
-        if n > 1 and (vals_sorted[-1] - vals_sorted[0]) / scale < 1e-12:
-            entry["degenerate"] = True
-            entry["degenerate_diagnostic"] = (
-                "every draw produced the same value although "
-                f"{len(varied_params)} sampled parameter(s) varied — "
-                "outcome_fn likely ignores its `params` argument (e.g. reads "
-                "module-level constants or a cached result)"
-                if varied_params else
-                "every draw produced the same value AND no sampled parameter "
-                "varied — the registry priors have zero width or the sampler "
-                "returned constants")
-            degenerate_outputs.append(key)
-        scalar_summary[key] = entry
-    for key, cnt in n_nonfinite.items():
-        if key not in scalar_summary:
-            scalar_summary[key] = {"n": 0, "n_nonfinite": cnt,
-                                   "degenerate": True,
-                                   "degenerate_diagnostic":
-                                       "all draws were NaN/inf"}
-            degenerate_outputs.append(key)
-
-    # Aggregate categoricals.
-    categorical_summary = {}
-    for key, vals in categorical_results.items():
-        counts = Counter(vals)
-        dominant, dominant_n = counts.most_common(1)[0]
-        categorical_summary[key] = {
-            "counts": dict(counts),
-            "dominant": dominant,
-            "dominance": dominant_n / len(vals),
-            "n": len(vals),
-        }
+    agg = summarise_outputs(outs, per_param_samples, n_draws)
+    errors = errors + agg["errors"]
+    scalar_summary, categorical_summary = agg["scalar_outputs"], agg["categorical_outputs"]
+    parameter_samples, degenerate_outputs = agg["parameter_samples"], agg["degenerate_outputs"]
+    varied_params = agg["varied_params"]
 
     n_failed = len(errors)
     return {
@@ -608,6 +639,13 @@ def _run_self_test() -> int:
     def ok(cond: bool, label: str) -> None:
         if not cond:
             failures.append(label)
+
+    # v2 (Codex P1-11): the interval level is passed through; 0.95 keeps the historical constants.
+    outs = [{"y": float(v)} for v in range(200)]
+    a95 = summarise_outputs(outs, {}, 200)["scalar_outputs"]["y"]
+    a80 = summarise_outputs(outs, {}, 200, level=0.80)["scalar_outputs"]["y"]
+    ok((a95["ci_low"], a95["ci_high"]) == (5.0, 195.0) and (a80["ci_low"], a80["ci_high"]) == (20.0, 180.0),
+       f"UQ-L1 summarise_outputs honours the interval level: {a95['ci_low'], a95['ci_high'], a80['ci_low'], a80['ci_high']}")
 
     with tempfile.TemporaryDirectory() as run_dir:
         os.makedirs(os.path.join(run_dir, "models"))

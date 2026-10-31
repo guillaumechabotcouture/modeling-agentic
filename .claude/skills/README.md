@@ -32,6 +32,7 @@ These skills support the mechanical gates and adversarial review.
 - **allocation-cross-validation/** — Holdout cross-validation of the allocation rule itself (`models/allocation_robustness.yaml`).
 - **ecological-fallacy-quantification/** — Bounding impact loss when calibration units are much coarser than allocation units (`models/within_zone_heterogeneity.yaml`).
 - **optimizer-method-selection/** — Benchmarking the allocation optimizer against ILP / annealing / restarts (`models/optimization_quality.yaml`).
+- **decision-spec/** — Drafting `decision_spec.yaml` (architecture v2): the owner-signed spec the harness analysis engine (`toolkit/analysis`) runs from; uncertainty sources declared up front, group rules, decision tests.
 - **allocation-toolkit/** — Costs and packages declared as a spec and solved with `toolkit/alloc` (costs, packages, optimize); extensions in `models/ext/` recorded in `models/toolkit_use.yaml`.
 - **daly-weighted-analysis/** — DALYs averted alongside cases averted; multi-disease anchor tables; discounting conventions.
 - **decision-rule-extraction/** — Required when allocation CSV is produced: `decision_rule.md` schema (tabular / tree / prose-with-exceptions / non-compressible) with `accuracy_vs_optimizer` and exceptions list. Prevents shipping hundreds-of-rows tables without a defensible rule.

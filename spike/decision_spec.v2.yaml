@@ -1,0 +1,127 @@
+# The spike's 13-state decision spec (spike/decision_spec.yaml) in the v2 schema
+# (toolkit/spec/schema.py), for the reproduction run of workstream B. Same content; the
+# changes are structural: constraints hold eligibility, the uncertainty sources are declared
+# with the excluded ones and their reasons (lesson 6), and the engine's cost-driver and
+# diagnostic names are named here, not in harness code. Status: test input, not signed by
+# the owner (the reproduction run signs it as `lead`).
+schema_version: 1
+question: >-
+  Which intervention package (net type x SMC x IRS x case-management intensity) should each LGA
+  in Nigeria's 13 Global Fund-supported states receive under the GC7 malaria grant (2024-2026),
+  to maximise DALYs averted within the envelope? Subset of attempt 8's 774-LGA question.
+decision_maker: "NMEP programme manager with the CCM / Global Fund country team (attempt 8 brief)"
+decision_date: 2024
+engine: {ref: "toolkit.engines.malaria.engine:MalariaEngine"}
+horizon: {start: 2016.0, stop: 2027.0}
+
+decision_units:
+  csv: data/units.csv
+  id: lga_id
+  label: lga
+  region: state
+  engine_attributes:
+    season: {columns: [season_m01, season_m02, season_m03, season_m04, season_m05, season_m06,
+                       season_m07, season_m08, season_m09, season_m10, season_m11, season_m12]}
+    resistance: {column: resistance}
+    species: {columns: {gambiae: gambiae, arabiensis: arabiensis, funestus: funestus}}
+    cm_ft: {column: cm_ft}
+    campaign_year: {column: campaign_year}
+    itn_hist_years: {column: itn_hist_years, split: " "}
+    itn_use: {value: 0.55, source: "attempt 8 registry itn_postcampaign_use"}
+  populations:
+    u5: {column: pop_u5, age_groups: [u5]}
+    older: {column: pop_5p, age_groups: ["5_14", "15p"]}
+
+options:
+  populations: {total: pop, u5: pop_u5, smc_eligible: smc_pop}
+  components:
+    net_pyr: {group: net}
+    net_pbo: {group: net}
+    net_dual: {group: net}
+    smc: {eligible: smc_eligible}
+    irs: {}
+    cm: {}
+  packages: {generate: true}
+  engine_map:
+    net_pyr: {net: pyr}
+    net_pbo: {net: pbo}
+    net_dual: {net: dual}
+    smc: {smc: 1}
+    irs: {irs: 1}
+    cm: {cm: 1}
+  prices:
+    base_year: "2024"
+    index_name: US CPI-U annual average
+    index: {"2018": 251.1, "2021.5": 281.85, "2023": 304.7, "2024": 313.7}
+  cost_items:
+    - {id: net_pyr_commodity, component: net_pyr, value: 2.072, price_year: "2024", price_rule: as_published,
+       basis: per_commodity, people_per_commodity: 1.8, includes: [net, psm]}
+    - {id: net_pbo_commodity, component: net_pbo, value: 2.397, price_year: "2024", price_rule: as_published,
+       basis: per_commodity, people_per_commodity: 1.8, includes: [net, psm]}
+    - {id: net_dual_commodity, component: net_dual, value: 2.867, price_year: "2024", price_rule: as_published,
+       basis: per_commodity, people_per_commodity: 1.8, includes: [net, psm]}
+    - {id: net_pyr_delivery, component: net_pyr, value: 0.655, price_year: "2021.5", price_rule: index,
+       basis: per_commodity, people_per_commodity: 1.8, includes: [delivery]}
+    - {id: net_pbo_delivery, component: net_pbo, value: 0.655, price_year: "2021.5", price_rule: index,
+       basis: per_commodity, people_per_commodity: 1.8, includes: [delivery]}
+    - {id: net_dual_delivery, component: net_dual, value: 0.655, price_year: "2021.5", price_rule: index,
+       basis: per_commodity, people_per_commodity: 1.8, includes: [delivery]}
+    - {id: smc, component: smc, value: 3.97, price_year: "2024", price_rule: as_published, basis: per_eligible,
+       years: 3, includes: [drug, delivery]}
+    - {id: irs, component: irs, value: 8.26, price_year: "2018", price_rule: index, basis: per_person,
+       share: 0.8, years: 3, includes: [insecticide, spraying]}
+    - {id: cm_case, component: cm, value: 10.26, price_year: "2024", price_rule: as_published, basis: per_outcome,
+       outcome: treated, incremental: true, includes: [treatment, chw_programme]}
+
+objective: {outcome: dalys, sense: avert, horizon: [2024.0, 2027.0], discounting: none}
+constraints:
+  envelope_usd: 315_600_000
+  fixed_costs_usd: {cm_floor: 59_348_019.55}
+  eligibility:
+    smc: {column: smc_eligible}
+    irs: {column: irs_eligible}
+comparator: {package: none, text: "CF1 in GF states: no GF campaign in the window, no SMC, no IRS, CM at current level"}
+outcomes_reported: [dalys, cases, deaths]
+
+calibration:
+  method: emulator_inversion
+  attribute: m0
+  scale: log
+  range: [-1.2, 4.6]
+  target_column: target_pfpr_u5_2021
+  window: [2021.67, 2022.0]
+  metric: pfpr_u5
+  target_uncertainty: {region_sd_logit: 0.15,
+                       note: "state-level common-mode error on the logit target; NMIS 2021 state CIs are about +/-0.3 on the logit scale (95%)"}
+
+uncertainty:
+  level: 0.95
+  draws: 64
+  seed: 42
+  sources:
+    - {kind: engine_parameters}
+    - {kind: calibration}
+  excluded:
+    - {kind: costs, reason: "unit costs taken as given in the spike (attempt 8's cost spec); not varied"}
+    - {kind: emulator, reason: "emulator error not propagated in the spike; held-out accuracy is reported instead"}
+
+analysis:
+  evaluation: emulator
+  emulator: {points: 256, holdout_share: 0.1, seed: 7,
+             features: [resistance, cm_ft, arabiensis, funestus, sgroup, campaign_year]}
+  cost_outputs: {treated: {cost_driver: treated_all}}
+  diagnostics: {eir_annual: {window: cal, metric: eir_annual}}
+  stability:
+    holdout_group: archetype_id
+    covariates: [map_pfpr_2021, sgroup, lat, resistance, cm_ft, arabiensis]
+  sensitivity: {parameters: fitted}
+  decision_tests:
+    - {id: DT1, type: interaction_rescale, components: [irs], with_any: [net_pyr, net_pbo, net_dual],
+       benchmark: B15, values: [2.43, 1.19, 4.97], finding: "benchmark_drift:B15",
+       text: "Does the plan change when the ITN x IRS interaction equals the trial value (and its CI ends)?"}
+
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation.csv
+  columns: {unit: lga_id, package: package, value: dalys_averted}
+  headline: {name: total_dalys_averted, outcome: dalys}

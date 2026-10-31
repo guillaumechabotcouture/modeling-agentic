@@ -129,6 +129,7 @@ class MalariaEngine:
     def __init__(self, fitted_path: str = FITTED, results_path: str = RESULTS):
         self.fitted = (yaml.safe_load(open(fitted_path)) or {}).get("parameters", {}) if os.path.exists(fitted_path) else {}
         self.results_path = results_path
+        self.fitted_path = fitted_path        # recorded as an input of the analyses that use the engine
 
     def parameters(self) -> list:
         out = []

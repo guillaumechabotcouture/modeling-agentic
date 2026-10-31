@@ -78,7 +78,9 @@ BRIEF, SIGNOFF, LOCK, AMENDMENTS = ("decision_brief.yaml", "decision_brief.signo
                                     "acceptance_lock.json", "brief_amendments.yaml")
 SIGNED_DIR = "decision_brief.signed"   # copies of the frozen files as signed (Gemini review)
 CRITERIA, BENCHMARKS = "success_criteria.yaml", "models/benchmark_targets.yaml"
-FROZEN_AT_SIGNOFF = (BRIEF, CRITERIA)
+DECISION_SPEC = "decision_spec.yaml"   # v2 (toolkit/spec): frozen with the brief when present; absent, it hashes
+# to None on both sides, so runs without a spec are unchanged
+FROZEN_AT_SIGNOFF = (BRIEF, CRITERIA, DECISION_SPEC)
 SCOPED_CRITICS = ("critique-domain", "critique-presentation", "critique-redteam", "critique-methods")
 GAP, NONE = "GAP", "NONE"
 _LISTS = {"answers": "A", "constraints": "C", "accounting": "K", "out_of_scope": "OS", "comparators": "CF",

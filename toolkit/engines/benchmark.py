@@ -606,6 +606,33 @@ def run_pack(pack: dict, engine, runner: Runner, fitted: dict, fit_info: dict | 
                         "held_out_total": sum(r["role"] == "held_out" for r in rows)}}
 
 
+PRODUCER = "toolkit/engines/benchmark.py"
+
+
+def stamp(out: dict, engine) -> dict:
+    """Provenance on a results or fitted file: who wrote it, for which engine and code (Codex P1-13)."""
+    from toolkit.engines.contract import engine_identity
+    return {"producer": PRODUCER, "engine_identity": engine_identity(engine), **out}
+
+
+def verified_benchmarks(engine) -> tuple[list, str | None]:
+    """(benchmark rows, None) when the engine's results file was written by this runner for this engine's current
+    code; else ([], why). Decision tests read benchmark arm ratios only from here."""
+    from toolkit.engines.contract import engine_identity
+    path = getattr(engine, "results_path", None)
+    if not path or not os.path.exists(path):
+        return [], "the engine has no benchmark results file"
+    try:
+        doc = yaml.safe_load(open(path)) or {}
+    except (OSError, yaml.YAMLError) as e:
+        return [], f"benchmark results unreadable: {e}"
+    if doc.get("producer") != PRODUCER:
+        return [], f"{os.path.basename(path)} was not written by {PRODUCER} (no provenance): re-run the pack"
+    if doc.get("engine_identity") != engine_identity(engine):
+        return [], f"{os.path.basename(path)} was computed for another engine identity or code: re-run the pack"
+    return list(doc.get("benchmarks") or []), None
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("pack")
@@ -630,9 +657,9 @@ def main(argv=None) -> int:
     if a.action == "fit":
         out = fit_joint(pack, eng, runner) if pack.get("fit_joint") else fit(pack, eng, runner)
         path = a.out or os.path.join(d, "fitted.yaml")
-        yaml.safe_dump(dict({"engine": pack["engine"], "engine_version": eng.describe().version,
-                             "fitted_at": time.strftime("%F %T"), "seeds": seeds,
-                             "n_sims": runner.nsims, "wall_s": round(time.time() - t0, 1)}, **out),
+        yaml.safe_dump(stamp(dict({"engine": pack["engine"], "engine_version": eng.describe().version,
+                                   "fitted_at": time.strftime("%F %T"), "seeds": seeds,
+                                   "n_sims": runner.nsims, "wall_s": round(time.time() - t0, 1)}, **out), eng),
                        open(path, "w"), sort_keys=False)
     else:
         fp = os.path.join(d, "fitted.yaml")
@@ -643,7 +670,7 @@ def main(argv=None) -> int:
         out["fit_rule"] = (f.get("fit_rule") or {}).get("version")
         out["wall_s"] = round(time.time() - t0, 1)
         path = a.out or os.path.join(d, "results.yaml")
-        yaml.safe_dump(out, open(path, "w"), sort_keys=False)
+        yaml.safe_dump(stamp(out, eng), open(path, "w"), sort_keys=False)
     print(f"wrote {path} ({runner.nsims} sims, {time.time() - t0:.0f}s)")
     return 0
 
@@ -791,6 +818,31 @@ def _self_test() -> int:
     ok(res4["R1"]["status"] == "band_mis_based" and res4["R1"]["mis_based_reason"] == "unreachable_in_fitted_range"
        and res4["R2"]["status"] == "out_of_band" and abs(res4["R2"]["reach_in_fitted_range"][0] - 20 / 0.7) < 1e-3,
        "BP25 a cost band no fitted-range value can reach is band_mis_based; a reachable one stays out_of_band with its reach")
+    # provenance (workstream B, Codex P1-13 / r2 P1-6)
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        eng.results_path = os.path.join(d, "results.yaml")
+        yaml.safe_dump(res, open(eng.results_path, "w"))
+        ok(verified_benchmarks(eng)[1] and "provenance" in verified_benchmarks(eng)[1],
+           "BP27 results without provenance are not verified (Codex P1-13)")
+        yaml.safe_dump(stamp(res, eng), open(eng.results_path, "w"))
+        rows2, why = verified_benchmarks(eng)
+        ok(why is None and len(rows2) == len(res["benchmarks"]), f"BP28 stamped results for this engine verify: {why}")
+        doc = yaml.safe_load(open(eng.results_path))
+        doc["engine_identity"]["code_sha256"] = "0" * 64
+        yaml.safe_dump(doc, open(eng.results_path, "w"))
+        ok("another engine" in (verified_benchmarks(eng)[1] or ""), "BP29 results for other engine code are refused")
+        yaml.safe_dump(stamp(res, eng), open(eng.results_path, "w"))
+        from toolkit.engines.contract import ParamSpec
+
+        class Refit(type(eng)):
+            def parameters(self):
+                return [ParamSpec(p.name, 0.55 if p.name == "eff_a" else p.value, p.kind, p.units, p.lo, p.hi,
+                                  p.source) for p in super().parameters()]
+        r2 = Refit()
+        r2.results_path = eng.results_path
+        ok("another engine" in (verified_benchmarks(r2)[1] or ""),
+           "BP30 results stamped before a fitted parameter changed are refused (Codex r2 P1-6)")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

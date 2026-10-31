@@ -89,6 +89,21 @@ def _rebuild_derived(run_path: str, integrity=None) -> None:
         print(f"[REBUILD] failed: {type(e).__name__}: {e}", flush=True)
 
 
+def gate_command(run_path: str, max_rounds: int, current_round: int, post_write: bool,
+                 validator: str = VALIDATOR, history: bool = True) -> list[str]:
+    """The STAGE 7 validator command, exactly as the final gate runs it (v2 C:
+    shared with agents/stage_machine.py's legacy gate and the golden traces)."""
+    cmd = [sys.executable, validator, run_path,
+           "--max-rounds", str(max_rounds), "--current-round", str(current_round),
+           "--spec-compliance", "--parameter-registry", "--rigor-artifacts",
+           "--json"]
+    if post_write:
+        cmd.append("--post-write")
+    if not history:
+        cmd.append("--no-history")
+    return cmd
+
+
 def run_final_gate(run_path: str, max_rounds: int,
                    validator: str = VALIDATOR, timeout_s: int = 900) -> dict | None:
     """Phase 21 α: re-run the STAGE 7 validator after the session ends.
@@ -102,15 +117,11 @@ def run_final_gate(run_path: str, max_rounds: int,
     current_round = detect_current_round(run_path)
     if current_round is None:
         return None
-    cmd = [sys.executable, validator, run_path,
-           "--max-rounds", str(max_rounds), "--current-round", str(current_round),
-           "--spec-compliance", "--parameter-registry", "--rigor-artifacts",
-           "--json"]
     # Phase 21 β: --post-write makes coherence / sufficiency / writer-QA
     # HIGHs blocking. Only meaningful once a report exists; without one
     # determine_status() reports completed_no_report anyway.
-    if os.path.exists(os.path.join(run_path, "report.md")):
-        cmd.append("--post-write")
+    cmd = gate_command(run_path, max_rounds, current_round,
+                       os.path.exists(os.path.join(run_path, "report.md")), validator)
     gate = {"current_round": current_round, "max_rounds": max_rounds,
             "ran_at": datetime.now().isoformat(), "action": None}
     try:
