@@ -10,14 +10,28 @@ infections) to keep package contrasts low-noise.
 
 Changed for the engine (D7): one mosquito population per species, each with its own
 bionomics (vector.SPECIES), emergence share, feeding cycle and mortality; ITN effects
-split into deflection (repellence + blocking), killing and feeding; IRS deterrence and
-killing of indoor-resting mosquitoes (vector.feeding). Daily records feed the engine's
-named windows; decision-window accumulators feed per-capita outcomes and cost drivers.
+per species complex from the Churcher 2016 hut-trial relationships; IRS deterrence (with
+diversion to outdoor biting) and killing of indoor-resting mosquitoes with a
+product-specific decay (vector.feeding). Daily records feed the engine's named windows;
+decision-window accumulators feed per-capita outcomes and cost drivers.
+
+v0.2 (workstream A): households. Agents are grouped into households of mean size
+`hh_size`. Three latent normals drive coverage and exposure:
+  z_hh   household latent; a person's net-use latent is
+         z_net = sqrt(hh_net_corr) z_hh + sqrt(1 - hh_net_corr) e1, and the person uses a net
+         after a campaign if Phi(z_net) < itn_use (persistent: the same people use nets);
+  z_sp   household spraying latent, corr(z_sp, z_hh) = cov_corr; a household is sprayed if
+         Phi(z_sp) < coverage (the same houses each round);
+  zeta   biting-rate multiplier, lognormal with Griffin's sigma^2 = 1.67, whose log is
+         exp_corr z_net + sqrt(1 - exp_corr^2) e2: high-exposure people use nets less.
+Newborns join a random existing household.
 """
 from __future__ import annotations
 
 import numpy as np
 import starsim as ss
+
+from scipy.special import ndtr
 
 from . import vector as V
 
@@ -39,7 +53,7 @@ class Malaria(ss.Disease):
         super().__init__()
         self.define_pars(M0=5.0, season=np.ones(12), resistance=0.5, ft=0.3, species=None, P=None,
                          init_eir=50., win_start=None, win_stop=None, smc_months=(),
-                         import_eir=0.1)
+                         import_eir=0.1, irs_product="pm_cs")
         self.update_pars(pars, **kwargs)
         sd = np.sqrt((np.exp(G['sigma2']) - 1))
         self.define_states(
@@ -52,6 +66,7 @@ class Malaria(ss.Disease):
             ss.FloatArr('net_type', default=0.0), ss.FloatArr('spray_t', default=-1e9),
             ss.FloatArr('prop_net', default=ss.random()), ss.FloatArr('prop_smc', default=ss.random()),
             ss.FloatArr('prop_spray', default=ss.random()),
+            ss.FloatArr('hh', default=-1.0), ss.FloatArr('z_hh', default=0.0), ss.FloatArr('z_sp', default=0.0),
         )
 
     def init_post(self):
@@ -59,7 +74,9 @@ class Malaria(ss.Disease):
         p = self.pars
         self.P = dict(p.P)
         self.mix = V.species_mix(p.species)
+        self.res = {name: V.resistance_of(p.resistance, name) for name, _, _ in self.mix}
         u = self.sim.people.auids
+        self._households(u, initial=True)
         age_d = self.sim.people.age[u] * 365
         bites = p.init_eir / 365 * self.zeta[u] * (1 - G['rho'] * np.exp(-age_d / G['a0']))
         inf = bites * 0.35
@@ -76,6 +93,34 @@ class Malaria(ss.Disease):
         sel = (age_d > 18 * 365) & (age_d < 25 * 365)
         self.ic20 = float(self.IC[u][sel].mean()) if sel.any() else 0.0
         self.iv20 = float(self.IV[u][sel].mean()) if sel.any() else 0.0
+
+    def _households(self, u, initial=False):
+        """Assign households and the correlated coverage / exposure latents (see module doc)."""
+        P, rs, n = self.P, self.rs, len(u)
+        if n == 0:
+            return
+        if initial:
+            n_hh = max(int(np.ceil(n / P["hh_size"])), 1)
+            hh = rs.permutation(n) % n_hh
+            zh, z2 = rs.normal(size=n_hh), rs.normal(size=n_hh)
+            c = P["cov_corr"]
+            self.hh[u] = hh
+            self.z_hh[u] = zh[hh]
+            self.z_sp[u] = c * zh[hh] + np.sqrt(1 - c * c) * z2[hh]
+        else:
+            have = self.sim.people.auids
+            have = have[self.hh[have] >= 0]
+            donor = have[rs.integers(0, len(have), size=n)] if len(have) else u
+            self.hh[u] = self.hh[donor]
+            self.z_hh[u] = self.z_hh[donor]
+            self.z_sp[u] = self.z_sp[donor]
+        r, a = P["hh_net_corr"], P["exp_corr"]
+        z_net = np.sqrt(r) * self.z_hh[u] + np.sqrt(1 - r) * rs.normal(size=n)
+        self.prop_net[u] = ndtr(z_net)
+        self.prop_spray[u] = ndtr(self.z_sp[u])
+        sig = np.sqrt(G['sigma2'])
+        zz = a * z_net + np.sqrt(1 - a * a) * rs.normal(size=n)
+        self.zeta[u] = np.exp(sig * zz - G['sigma2'] / 2)
 
     @property
     def rs(self):
@@ -103,14 +148,17 @@ class Malaria(ss.Disease):
     def step(self):
         p, ti, P = self.pars, self.ti, self.P
         u = self.sim.people.auids
+        new = u[self.hh[u] < 0]
+        if len(new):
+            self._households(new)
         n = len(u)
         age_d = self.sim.people.age[u] * 365
         st = self.st[u]
         w0 = self.zeta[u] * (1 - G['rho'] * np.exp(-age_d / G['a0']))
         sw = w0.sum()
         hn = self.has_net[u]
-        n_defl, n_kill, n_fed = V.itn_effect(self.net_type[u], p.resistance, ti - self.net_t[u], P)
-        irs_det, irs_kill = V.irs_effect(ti - self.spray_t[u], P)
+        net_type, net_age = self.net_type[u], ti - self.net_t[u]
+        irs_det, irs_kill = V.irs_effect(ti - self.spray_t[u], P, p.irs_product)
         # infectiousness of humans to mosquitoes
         q = self._detect(age_d)
         c = np.zeros(n)
@@ -120,7 +168,8 @@ class Malaria(ss.Disease):
         s_t = self._season(ti)
         eir_i = np.full(n, p.import_eir / 365) * w0
         for (name, share, b), mo in zip(self.mix, self.mos):
-            y, w, z = V.feeding(b, hn, n_defl, n_kill, n_fed, irs_det, irs_kill)
+            n_defl, n_kill, n_fed = V.itn_effect(net_type, self.res[name], net_age, P, b["complex"])
+            y, w, z = V.feeding(b, hn, n_defl, n_kill, n_fed, irs_det, irs_kill, P["irs_divert"])
             f, mu = V.cycle(b, w0, y, w, z, G['tau1'], G['tau2'])
             lam_m = f * b['Q0'] * (w0 * y * c).sum() / sw
             beta = b['mu0'] * p.M0 * share * s_t
@@ -242,7 +291,7 @@ class ITNCampaign(ss.Intervention):
 
 class IRSRound(ss.Intervention):
     """Annual IRS round at `month` of each year; `coverage` = share of people in sprayed houses
-    (the same houses each round)."""
+    (the same households each round, drawn from the household spraying latent)."""
     def __init__(self, years=(), month=5, coverage=0.8, name=None):
         super().__init__(name=name)
         self.years, self.month, self.cov = list(years), month, coverage

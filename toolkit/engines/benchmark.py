@@ -3,13 +3,26 @@
 
     python3 -m toolkit.engines.benchmark <pack.yaml> fit   [--workers N] [--seeds K]
     python3 -m toolkit.engines.benchmark <pack.yaml> run   [--workers N] [--seeds K]
+    python3 -m toolkit.engines.benchmark <pack.yaml> validate
     python3 -m toolkit.engines.benchmark --self-test
 
 A pack is validated once per engine version, never per question:
-- `fit` runs the pack's `fit` steps in order (one engine parameter each, a grid, the
-  benchmarks it is fitted to) and writes `fitted.yaml` beside the pack;
-- `run` runs every benchmark with the fitted values and writes `results.yaml` (every
-  benchmark, in band or not, with its role: `fit` if a fit step used it, else `held_out`).
+- `fit` fits the engine-level parameters once and writes `fitted.yaml` beside the pack:
+  with `fit_joint` (preferred), all parameters jointly over a design of their box, with a
+  feasibility report before any value is chosen; with the legacy `fit` list, one parameter
+  at a time in order;
+- `run` runs every benchmark with the fitted values and writes `results.yaml`: every
+  benchmark with its role (`fit` if the fit used it, else `held_out`), its status and its
+  per-seed values.
+
+Statuses (never fitted toward unless `in_band`/`out_of_band`):
+    in_band          computed value inside the band
+    out_of_band      computed value outside the band
+    not_assessable   a benchmark it `requires` is outside the stated interval (e.g. an
+                     interaction whose single-arm effects miss the trial's)
+    band_mis_based   a cost-per-outcome band whose upper edge is below the price floor:
+                     even an intervention that averted ALL of the comparator's outcome would
+                     cost more per unit averted than the band allows at the pack's prices
 
 Pack schema:
     engine: <module>:<class>            # e.g. toolkit.engines.malaria.engine:MalariaEngine
@@ -25,22 +38,36 @@ Pack schema:
     arms: {<name>: {setting: <name>, package: {...}}}
     benchmarks:
       - id, metric, source, target, band: [lo, hi]
+        requires: {<id>: [lo, hi]}      # optional: assessable only if each is inside [lo, hi]
         estimand:
           {type: ratio | odds_ratio, num: arm | [arms], den: arm | [arms], value: <path>}
           {type: interaction_or, a11, a10, a01, a00, value: <path>}
           {type: cost_per_outcome, num, den, value: <path>, costs: {<driver>: <unit cost>}, costs_num: {<driver>: <incremental price>}}
           {type: curve_rules, arms: [...], x: <path>, y: <path>, rules: [{x_min, y_min} | {x_max, y_max}]}
-    fit: [{param, grid: [...], targets: [ids]}]
+    fit_joint: {rule: <version>, params: {<name>: [lo, hi]}, targets: [ids], design: {n, seed}}
+    fit: [{param, grid: [...], targets: [ids]}]          # legacy sequential fit
 
 Value paths: windows.<window>.<metric>, per_capita.<outcome>.<age group>,
 per_capita_all.<outcome> (age groups weighted by the model population), cost.<driver>.
 Ratios and odds ratios are geometric means over seeds of the per-seed CRN ratio; costs per
-outcome use seed means. A setting may not override a fitted parameter (fail closed).
+outcome use seed means (per-seed values are reported too). A setting may not override a
+fitted parameter (fail closed).
+
+Joint fit, rule `joint-v1`: settings are calibrated once at the box centre; a Latin
+hypercube of `n` points plus the centre is run on the pack's seeds (the same seeds as the
+final run); each target's log value gets a quadratic surrogate in the scaled parameters
+(leave-one-out error reported); a target that the surrogate puts out of band everywhere in
+the box is `infeasible_in_box` and leaves the objective, and pairs of targets that cannot
+be in band together are listed; the chosen value minimises (number of feasible targets out
+of band, then the band-scaled squared log error) on a dense grid; the range is the box
+region where every feasible target is in band; the targets are then re-run at the chosen
+value, with settings re-calibrated there, as a verification.
 """
 from __future__ import annotations
 
 import argparse
 import importlib
+import itertools
 import math
 import os
 import sys
@@ -57,6 +84,13 @@ else:  # pragma: no cover
     from toolkit.engines.contract import UnitSpec, Package, Horizon  # noqa: E402
 
 TYPES = ("ratio", "odds_ratio", "interaction_or", "cost_per_outcome", "curve_rules")
+STATUSES = ("in_band", "out_of_band", "not_assessable", "band_mis_based")
+JOINT_RULES = {
+    "joint-v1": "LHS(n)+centre on the pack seeds; calibration at the box centre; quadratic surrogate of each "
+                "target's log value; infeasible targets dropped; argmin (n out of band, band-scaled squared log "
+                "error) on a dense grid; range = region with all feasible targets in band; verification re-run "
+                "with re-calibration at the chosen value",
+}
 
 
 def load_engine(ref: str):
@@ -66,6 +100,11 @@ def load_engine(ref: str):
 
 def _h(d: dict) -> Horizon:
     return Horizon(float(d["start"]), float(d["stop"]), tuple(d["window"]), dict(d.get("windows") or {}))
+
+
+def fit_targets(pack: dict) -> set:
+    ids = {t for s in pack.get("fit") or [] for t in s["targets"]}
+    return ids | set((pack.get("fit_joint") or {}).get("targets") or [])
 
 
 def validate(pack: dict, engine) -> list[str]:
@@ -82,9 +121,8 @@ def validate(pack: dict, engine) -> list[str]:
     for a, cfg in arms.items():
         if cfg.get("setting") not in (pack.get("settings") or {}):
             bad.append(f"arm {a}: unknown setting {cfg.get('setting')}")
-    ids = set()
+    ids = {b.get("id") for b in pack.get("benchmarks") or []}
     for b in pack.get("benchmarks") or []:
-        ids.add(b.get("id"))
         e = b.get("estimand") or {}
         if e.get("type") not in TYPES:
             bad.append(f"{b.get('id')}: estimand type {e.get('type')!r} not in {TYPES}")
@@ -96,12 +134,36 @@ def validate(pack: dict, engine) -> list[str]:
             band = b.get("band")
             if not (isinstance(band, list) and len(band) == 2 and band[0] <= b.get("target", float("nan")) <= band[1]):
                 bad.append(f"{b.get('id')}: band must be [lo, hi] containing the target")
+        for r, iv in (b.get("requires") or {}).items():
+            if r not in ids or r == b.get("id"):
+                bad.append(f"{b.get('id')}: requires unknown benchmark {r}")
+            if not (isinstance(iv, list) and len(iv) == 2 and iv[0] < iv[1]):
+                bad.append(f"{b.get('id')}: requires {r} needs an interval [lo, hi]")
     for f in pack.get("fit") or []:
         if f.get("param") not in fitted:
             bad.append(f"fit step {f.get('param')}: not a fitted engine parameter")
         for t in f.get("targets") or []:
             if t not in ids:
                 bad.append(f"fit step {f.get('param')}: unknown benchmark {t}")
+    fj = pack.get("fit_joint")
+    if fj:
+        if pack.get("fit"):
+            bad.append("pack has both fit and fit_joint (one fit rule per engine version)")
+        if fj.get("rule") not in JOINT_RULES:
+            bad.append(f"fit_joint rule {fj.get('rule')!r} not in {sorted(JOINT_RULES)}")
+        for k, r in (fj.get("params") or {}).items():
+            if k not in fitted:
+                bad.append(f"fit_joint: {k} is not a fitted engine parameter")
+            if not (isinstance(r, list) and len(r) == 2 and r[0] < r[1]):
+                bad.append(f"fit_joint: {k} needs a range [lo, hi]")
+        missing = fitted - set(fj.get("params") or {})
+        if missing:
+            bad.append(f"fit_joint: fitted engine parameters not in the joint fit: {sorted(missing)}")
+        for t in fj.get("targets") or []:
+            if t not in ids:
+                bad.append(f"fit_joint: unknown benchmark {t}")
+        if not fj.get("targets"):
+            bad.append("fit_joint: no targets")
     return bad
 
 
@@ -144,6 +206,13 @@ def _job(args):
             "meta": dict(o.meta, age_shares=pdays)}
 
 
+def _spread(per) -> dict:
+    per = [float(x) for x in per if math.isfinite(float(x))]
+    if not per:
+        return {"per_seed": [], "seed_min": None, "seed_max": None}
+    return {"per_seed": [round(x, 4) for x in per], "seed_min": round(min(per), 4), "seed_max": round(max(per), 4)}
+
+
 class Runner:
     def __init__(self, pack: dict, engine, workers: int = 1, seeds=None):
         self.pack, self.engine, self.workers = pack, engine, workers
@@ -154,9 +223,9 @@ class Runner:
         self.nsims = 0
 
     def _map(self, jobs):
-        if self.workers <= 1:
+        if self.workers <= 1 or len(jobs) <= 1:
             return [_job(j) for j in jobs]
-        with ProcessPoolExecutor(self.workers) as ex:
+        with ProcessPoolExecutor(min(self.workers, len(jobs))) as ex:
             return list(ex.map(_job, jobs, chunksize=1))
 
     def _setting(self, name):
@@ -185,28 +254,37 @@ class Runner:
             order = np.argsort(ys)
             val = float(np.exp(np.interp(c["target"], ys[order], xs[order])))
             self.calibrated[n] = {"attribute": c["attribute"], "value": val, "grid": c["grid"],
-                                  "baseline_values": [round(float(y), 4) for y in ys], "target": c["target"]}
+                                  "baseline_values": [round(float(y), 4) for y in ys], "target": c["target"],
+                                  "at_grid_edge": bool(c["target"] < ys.min() or c["target"] > ys.max())}
 
-    def arm_results(self, arms, fitted: dict):
-        key = tuple(sorted(fitted.items()))
+    def _arm_jobs(self, a, fitted):
+        cfg = self.pack["arms"][a]
+        unit, hor, par = self._setting(cfg["setting"])
+        if cfg["setting"] in self.calibrated:
+            c = self.calibrated[cfg["setting"]]
+            unit[c["attribute"]] = c["value"]
+        return [(self.ref, dict(par, **fitted), unit, cfg.get("package") or {}, hor, sd) for sd in self.seeds]
+
+    def prefetch(self, arms, fitted_list):
+        """Run every (arm, fitted) pair not yet cached in one parallel batch."""
         jobs, need = [], []
-        for a in arms:
-            if (a, key) in self.cache:
-                continue
-            cfg = self.pack["arms"][a]
-            unit, hor, par = self._setting(cfg["setting"])
-            if cfg["setting"] in self.calibrated:
-                c = self.calibrated[cfg["setting"]]
-                unit[c["attribute"]] = c["value"]
-            for sd in self.seeds:
-                jobs.append((self.ref, dict(par, **fitted), unit, cfg.get("package") or {}, hor, sd))
-            need.append(a)
+        for f in fitted_list:
+            key = tuple(sorted(f.items()))
+            for a in arms:
+                if (a, key) in self.cache or (a, key) in need:
+                    continue
+                jobs += self._arm_jobs(a, f)
+                need.append((a, key))
         if jobs:
             res = self._map(jobs)
             self.nsims += len(jobs)
             k = len(self.seeds)
-            for i, a in enumerate(need):
-                self.cache[(a, key)] = res[i * k:(i + 1) * k]
+            for i, ak in enumerate(need):
+                self.cache[ak] = res[i * k:(i + 1) * k]
+
+    def arm_results(self, arms, fitted: dict):
+        self.prefetch(arms, [fitted])
+        key = tuple(sorted(fitted.items()))
         return {a: self.cache[(a, key)] for a in arms}
 
     def evaluate(self, b: dict, fitted: dict) -> dict:
@@ -233,19 +311,31 @@ class Runner:
                 o = {k: odds(pooled(e[k], i)) for k in ("a11", "a10", "a01", "a00")}
                 per.append((o["a11"] / o["a00"]) / ((o["a10"] / o["a00"]) * (o["a01"] / o["a00"])))
                 out.setdefault("arm_or", []).append({k: round(o[k] / o["a00"], 4) for k in ("a11", "a10", "a01")})
+            out["arm_or_geomean"] = {k: round(float(np.exp(np.mean([np.log(x[k]) for x in out["arm_or"]]))), 4)
+                                     for k in ("a11", "a10", "a01")}
+            out["arm_prevalence"] = {k: round(float(np.mean([pooled(e[k], i) for i in range(nseed)])), 4)
+                                     for k in ("a00", "a10", "a01", "a11")}
         elif e["type"] == "cost_per_outcome":
-            dv = np.mean([pooled(e["den"], i) - pooled(e["num"], i) for i in range(nseed)])
-            dc = 0.0
+            dv_i = [pooled(e["den"], i) - pooled(e["num"], i) for i in range(nseed)]
+            dc_i = [0.0] * nseed
             for drv, uc in (e.get("costs") or {}).items():       # unit cost x (driver in num - driver in den)
-                dc += float(uc) * np.mean([get(R[e["num"]][i], f"cost.{drv}") - get(R[e["den"]][i], f"cost.{drv}")
-                                           for i in range(nseed)])
+                for i in range(nseed):
+                    dc_i[i] += float(uc) * (get(R[e["num"]][i], f"cost.{drv}") - get(R[e["den"]][i], f"cost.{drv}"))
             for drv, uc in (e.get("costs_num") or {}).items():   # incremental unit price x driver in num
-                dc += float(uc) * np.mean([get(R[e["num"]][i], f"cost.{drv}") for i in range(nseed)])
+                for i in range(nseed):
+                    dc_i[i] += float(uc) * get(R[e["num"]][i], f"cost.{drv}")
+            dv, dc = float(np.mean(dv_i)), float(np.mean(dc_i))
+            base = float(np.mean([pooled(e["den"], i) for i in range(nseed)]))
             comp = float(dc / dv) if dv > 0 else float("inf")
-            out.update(computed=comp, outcome_averted_per_capita=float(dv), cost_per_capita=float(dc))
+            floor = float(dc / base) if base > 0 else float("inf")
+            out.update(computed=comp, outcome_averted_per_capita=dv, cost_per_capita=dc,
+                       comparator_outcome_per_capita=base, share_averted=float(dv / base) if base > 0 else None,
+                       price_floor=floor,
+                       share_averted_needed_for_band=float(dc / (b["band"][1] * base)) if base > 0 else None)
+            out.update(_spread([c / v if v > 0 else float("inf") for c, v in zip(dc_i, dv_i)]))
             return self._verdict(b, out)
         else:  # curve_rules
-            pts = []
+            pts, met_seed = [], []
             for a in e["arms"]:
                 xs = [get(R[a][i], e["x"]) for i in range(nseed)]
                 ys = [get(R[a][i], e["y"]) for i in range(nseed)]
@@ -257,20 +347,50 @@ class Runner:
                         checks.append(y >= r["y_min"])
                     if "x_max" in r and x <= r["x_max"]:
                         checks.append(y <= r["y_max"])
+            for i in range(nseed):
+                c_i = []
+                for a in e["arms"]:
+                    x, y = get(R[a][i], e["x"]), get(R[a][i], e["y"])
+                    for r in e["rules"]:
+                        if "x_min" in r and x >= r["x_min"]:
+                            c_i.append(y >= r["y_min"])
+                        if "x_max" in r and x <= r["x_max"]:
+                            c_i.append(y <= r["y_max"])
+                met_seed.append(f"{sum(c_i)}/{len(c_i)}")
             out.update(points=pts, rules_checked=len(checks), rules_met=int(sum(checks)),
-                       computed=float(np.mean(checks)) if checks else float("nan"))
+                       computed=float(np.mean(checks)) if checks else float("nan"), per_seed_rules_met=met_seed)
             out["in_band"] = bool(checks) and all(checks)
+            out["status"] = "in_band" if out["in_band"] else "out_of_band"
             return out
         per = np.asarray(per, float)
-        out.update(computed=float(np.exp(np.mean(np.log(per)))), per_seed=[round(float(x), 4) for x in per],
+        out.update(computed=float(np.exp(np.mean(np.log(per)))),
                    se_log=float(np.std(np.log(per), ddof=1) / math.sqrt(len(per))) if len(per) > 1 else None)
+        out.update(_spread(per))
         return self._verdict(b, out)
 
     @staticmethod
     def _verdict(b, out):
         lo, hi = b["band"]
         out["in_band"] = bool(lo <= out["computed"] <= hi)
+        out["status"] = "in_band" if out["in_band"] else "out_of_band"
+        if b["estimand"]["type"] == "cost_per_outcome" and out.get("price_floor", 0) > hi:
+            out["status"] = "band_mis_based"
         return out
+
+
+def apply_requires(rows: list) -> None:
+    """Gate benchmarks on the benchmarks they require (in place)."""
+    byid = {r["id"]: r for r in rows}
+    for r in rows:
+        req = r.get("requires") or {}
+        if not req:
+            continue
+        vals = {k: byid[k]["computed"] for k in req}
+        r["requires_values"] = {k: round(v, 4) for k, v in vals.items()}
+        miss = [k for k, (lo, hi) in req.items() if not lo <= vals[k] <= hi]
+        if miss:
+            r["status"] = "not_assessable"
+            r["not_assessable_because"] = {k: {"computed": round(vals[k], 4), "required": req[k]} for k in miss}
 
 
 def _loss(b, comp):
@@ -281,6 +401,7 @@ def _loss(b, comp):
     return ((math.log(comp) - math.log(b["target"])) / hw) ** 2
 
 
+# ------------------------------------------------------------------------- legacy fit
 def fit(pack: dict, engine, runner: Runner) -> dict:
     byid = {b["id"]: b for b in pack["benchmarks"]}
     fitted = {}
@@ -296,9 +417,6 @@ def fit(pack: dict, engine, runner: Runner) -> dict:
             comps.append(c)
             losses.append(sum(_loss(byid[t], c[t]) for t in step["targets"]))
         L = np.asarray(losses)
-        # Refine on a fine grid: interpolate each benchmark's log value between grid points, then take
-        # the value with the fewest out-of-band benchmarks, then the lowest loss. The range is where
-        # every target is in band (else where the loss is within one band half-width per target).
         xs = np.linspace(grid[0], grid[-1], 801)
         n_out, Lf = np.zeros(len(xs)), np.zeros(len(xs))
         for t in step["targets"]:
@@ -317,24 +435,134 @@ def fit(pack: dict, engine, runner: Runner) -> dict:
                     "computed_on_grid": [{k: round(v, 4) for k, v in c.items()} for c in comps]}
         print(f"fit {prm}: {best:.4f} [{lo:.3f}, {hi:.3f}] all in band: {bool(n_out[j] == 0)}; "
               f"grid loss {np.round(L, 2).tolist()}", flush=True)
-    return out
+    return {"parameters": out, "fit_rule": {"version": "sequential-v0", "description": "one-parameter grid fits in order"}}
 
 
-def run_pack(pack: dict, engine, runner: Runner, fitted: dict) -> dict:
-    fit_ids = {t for s in pack.get("fit") or [] for t in s["targets"]}
+# -------------------------------------------------------------------------- joint fit
+def lhs(n: int, d: int, seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    cut = (np.arange(n)[:, None] + rng.random((n, d))) / n
+    for j in range(d):
+        cut[:, j] = cut[rng.permutation(n), j]
+    return cut
+
+
+def _quad_features(X: np.ndarray) -> np.ndarray:
+    n, d = X.shape
+    cols = [np.ones(n)] + [X[:, j] for j in range(d)] + [X[:, i] * X[:, j] for i in range(d) for j in range(i, d)]
+    return np.column_stack(cols)
+
+
+def _quad_fit(X, y):
+    F = _quad_features(X)
+    coef, *_ = np.linalg.lstsq(F, y, rcond=None)
+    loo = []
+    for i in range(len(y)):
+        m = np.arange(len(y)) != i
+        c, *_ = np.linalg.lstsq(F[m], y[m], rcond=None)
+        loo.append(float(F[i] @ c - y[i]))
+    return coef, float(np.sqrt(np.mean(np.square(loo))))
+
+
+def _candidates(d: int, seed: int) -> np.ndarray:
+    if d <= 3:
+        g = np.linspace(0, 1, {1: 801, 2: 161, 3: 41}[d])
+        return np.array(list(itertools.product(*([g] * d))))
+    return np.random.default_rng(seed).random((50000, d))
+
+
+def fit_joint(pack: dict, engine, runner: Runner) -> dict:
+    spec = pack["fit_joint"]
+    byid = {b["id"]: b for b in pack["benchmarks"]}
+    names = list(spec["params"])
+    box = np.array([spec["params"][k] for k in names], float)
+    d = len(names)
+    targets = list(spec["targets"])
+    to_theta = lambda x: {k: round(float(box[j, 0] + x[j] * (box[j, 1] - box[j, 0])), 6) for j, k in enumerate(names)}  # noqa: E731
+    centre = to_theta(np.full(d, 0.5))
+    settings = sorted({pack["arms"][a]["setting"] for t in targets for a in _arms_of(byid[t]["estimand"])})
+    runner.calibrate_settings(centre, settings)
+    cal_centre = {s: round(runner.calibrated[s]["value"], 4) for s in settings if s in runner.calibrated}
+    dz = spec.get("design") or {}
+    X = np.vstack([lhs(int(dz.get("n", 8 * d + 8)), d, int(dz.get("seed", 1))), np.full((1, d), 0.5)])
+    thetas = [to_theta(x) for x in X]
+    arms = sorted({a for t in targets for a in _arms_of(byid[t]["estimand"])})
+    t0 = time.time()
+    runner.prefetch(arms, thetas)
+    print(f"joint fit: design of {len(thetas)} points x {len(arms)} arms x {len(runner.seeds)} seeds "
+          f"in {time.time() - t0:.0f}s", flush=True)
+    Y = {t: np.array([runner.evaluate(byid[t], th)["computed"] for th in thetas]) for t in targets}
+    surr, cand = {}, _candidates(d, int(dz.get("seed", 1)))
+    Fc = _quad_features(cand)
+    pred, inband = {}, {}
+    for t in targets:
+        coef, loo = _quad_fit(X, np.log(np.maximum(Y[t], 1e-12)))
+        surr[t] = {"loo_rmse_log": round(loo, 4)}
+        pred[t] = np.exp(Fc @ coef)
+        lo, hi = byid[t]["band"]
+        inband[t] = (pred[t] >= lo) & (pred[t] <= hi)
+    feasible = [t for t in targets if inband[t].any()]
+    infeasible = [t for t in targets if t not in feasible]
+    conflicts = [[a, b] for a, b in itertools.combinations(feasible, 2) if not (inband[a] & inband[b]).any()]
+    n_out = sum((~inband[t]).astype(int) for t in feasible) if feasible else np.zeros(len(cand))
+    L = sum(np.array([_loss(byid[t], v) for v in pred[t]]) for t in feasible) if feasible else np.zeros(len(cand))
+    j = int(np.argmin(n_out * 1e6 + L))
+    best = to_theta(cand[j])
+    region = cand[n_out == 0] if (n_out == 0).any() else cand[L <= max(len(feasible), 1)]
+    if not len(region):
+        region = cand[j:j + 1]
+    rng_ = {k: (round(float(box[i, 0] + region[:, i].min() * (box[i, 1] - box[i, 0])), 4),
+                round(float(box[i, 0] + region[:, i].max() * (box[i, 1] - box[i, 0])), 4)) for i, k in enumerate(names)}
+    # verification at the chosen value, settings re-calibrated there
+    runner.calibrate_settings(best, settings)
+    cal_best = {s: round(runner.calibrated[s]["value"], 4) for s in settings if s in runner.calibrated}
+    ver = {}
+    for t in targets:
+        r = runner.evaluate(byid[t], best)
+        ver[t] = {"computed": round(r["computed"], 4), "predicted": round(float(pred[t][j]), 4),
+                  "in_band": r["in_band"], "seed_min": r.get("seed_min"), "seed_max": r.get("seed_max")}
+    params = {k: {"value": best[k], "lo": min(rng_[k][0], best[k]), "hi": max(rng_[k][1], best[k]),
+                  "box": [float(box[i, 0]), float(box[i, 1])], "benchmarks": targets}
+              for i, k in enumerate(names)}
+    for k, v in params.items():
+        print(f"fit_joint {k}: {v['value']} [{v['lo']}, {v['hi']}]", flush=True)
+    return {"parameters": params,
+            "fit_rule": {"version": spec["rule"], "description": JOINT_RULES[spec["rule"]],
+                         "seeds": list(runner.seeds), "design_points": len(thetas), "design_seed": int(dz.get("seed", 1)),
+                         "targets": targets},
+            "feasibility": {"feasible_in_box": feasible, "infeasible_in_box": infeasible, "conflicting_pairs": conflicts,
+                            "all_feasible_in_band_at_value": bool(n_out[j] == 0)},
+            "surrogate": surr,
+            "calibration": {"at_box_centre": cal_centre, "at_fitted_value": cal_best},
+            "verification": ver,
+            "design": {"x": [{k: v for k, v in th.items()} for th in thetas],
+                       "computed": {t: [round(float(v), 4) for v in Y[t]] for t in targets}}}
+
+
+# ------------------------------------------------------------------------------ pack run
+def run_pack(pack: dict, engine, runner: Runner, fitted: dict, fit_info: dict | None = None) -> dict:
+    fit_ids = fit_targets(pack)
+    infeasible = set(((fit_info or {}).get("feasibility") or {}).get("infeasible_in_box") or [])
     runner.calibrate_settings(fitted)
     rows = []
     for b in pack["benchmarks"]:
         r = runner.evaluate(b, fitted)
         row = {"id": b["id"], "metric": b["metric"], "role": "fit" if b["id"] in fit_ids else "held_out",
                "target": b.get("target"), "band": b.get("band"), "source": b.get("source", "")}
+        if b.get("requires"):
+            row["requires"] = b["requires"]
+        if b["id"] in infeasible:
+            row["infeasible_in_box"] = True
         row.update({k: (round(v, 4) if isinstance(v, float) else v) for k, v in r.items()})
         rows.append(row)
-        print(f"{b['id']:6s} {row['role']:8s} computed {r['computed']:.4g} target {b.get('target')} band {b.get('band')} "
-              f"{'IN' if r['in_band'] else 'OUT'}", flush=True)
+    apply_requires(rows)
+    for row in rows:
+        print(f"{row['id']:6s} {row['role']:8s} computed {row['computed']:.4g} target {row.get('target')} "
+              f"band {row.get('band')} {row['status']}", flush=True)
+    by = {s: sum(r["status"] == s for r in rows) for s in STATUSES}
     return {"benchmarks": rows, "settings_calibrated": runner.calibrated, "fitted_used": fitted,
             "seeds": runner.seeds, "n_sims": runner.nsims,
-            "summary": {"in_band": sum(r["in_band"] for r in rows), "total": len(rows),
+            "summary": {"in_band": sum(r["in_band"] for r in rows), "total": len(rows), "by_status": by,
                         "held_out_in_band": sum(r["in_band"] for r in rows if r["role"] == "held_out"),
                         "held_out_total": sum(r["role"] == "held_out" for r in rows)}}
 
@@ -361,15 +589,19 @@ def main(argv=None) -> int:
     d = os.path.dirname(os.path.abspath(a.pack))
     t0 = time.time()
     if a.action == "fit":
-        out = fit(pack, eng, runner)
+        out = fit_joint(pack, eng, runner) if pack.get("fit_joint") else fit(pack, eng, runner)
         path = a.out or os.path.join(d, "fitted.yaml")
-        yaml.safe_dump({"engine": pack["engine"], "fitted_at": time.strftime("%F %T"), "seeds": seeds,
-                        "n_sims": runner.nsims, "wall_s": round(time.time() - t0, 1), "parameters": out},
+        yaml.safe_dump(dict({"engine": pack["engine"], "engine_version": eng.describe().version,
+                             "fitted_at": time.strftime("%F %T"), "seeds": seeds,
+                             "n_sims": runner.nsims, "wall_s": round(time.time() - t0, 1)}, **out),
                        open(path, "w"), sort_keys=False)
     else:
-        f = yaml.safe_load(open(os.path.join(d, "fitted.yaml"))) if os.path.exists(os.path.join(d, "fitted.yaml")) else {}
+        fp = os.path.join(d, "fitted.yaml")
+        f = yaml.safe_load(open(fp)) if os.path.exists(fp) else {}
         fitted = {k: v["value"] for k, v in (f.get("parameters") or {}).items()}
-        out = run_pack(pack, eng, runner, fitted)
+        out = run_pack(pack, eng, runner, fitted, f)
+        out["engine_version"] = eng.describe().version
+        out["fit_rule"] = (f.get("fit_rule") or {}).get("version")
         out["wall_s"] = round(time.time() - t0, 1)
         path = a.out or os.path.join(d, "results.yaml")
         yaml.safe_dump(out, open(path, "w"), sort_keys=False)
@@ -415,7 +647,7 @@ def _self_test() -> int:
     ok(any("unknown arm" in s for s in probs) and any("containing the target" in s for s in probs),
        "BP3 unknown arms and a band that excludes its target are refused")
     r = Runner(pack, eng, 1)
-    f = fit(pack, eng, r)
+    f = fit(pack, eng, r)["parameters"]
     ok(abs(f["eff_a"]["value"] - 0.6) < 0.02 and f["eff_a"]["lo"] <= 0.6 <= f["eff_a"]["hi"],
        f"BP4 the fit recovers the parameter that reproduces the target (eff_a 0.6): {f['eff_a']['value']}")
     res = run_pack(pack, eng, r, {"eff_a": f["eff_a"]["value"]})
@@ -424,7 +656,67 @@ def _self_test() -> int:
     ok(abs(rows["T2"]["computed"] - 1.0) > 0.01, "BP6 interaction OR of a multiplicative-in-burden engine is not forced to 1 on the odds scale")
     ok(abs(rows["T3"]["computed"] - 3 / (1.5 * f["eff_a"]["value"])) < 1e-3, f"BP7 cost per outcome = cost difference / outcome averted ({rows['T3']['computed']})")
     ok(abs(res["settings_calibrated"]["c"]["value"] - 0.758) < 0.08, "BP8 a setting is calibrated to its baseline target")
-    ok(rows["T4"]["rules_checked"] >= 1, "BP9 curve rules are checked")
+    ok(rows["T4"]["rules_checked"] >= 1 and len(rows["T4"]["per_seed_rules_met"]) == 2, "BP9 curve rules are checked, per seed too")
+    ok(all(rows[k]["status"] == ("in_band" if rows[k]["in_band"] else "out_of_band") for k in rows)
+       and len(rows["T1"]["per_seed"]) == 2 and rows["T3"]["seed_min"] is not None,
+       "BP10 every row has a status and per-seed values")
+
+    # ---- feasibility: price floor, requires-gating
+    p2 = dict(pack, fit=[], benchmarks=[
+        {"id": "C1", "metric": "too dear", "target": 0.5, "band": [0.1, 1.0],
+         "estimand": {"type": "cost_per_outcome", "num": "a", "den": "none", "value": "per_capita.cases.all",
+                      "costs": {"a_doses": 10.0}}},
+        {"id": "C2", "metric": "affordable", "target": 20.0, "band": [5.0, 80.0],
+         "estimand": {"type": "cost_per_outcome", "num": "a", "den": "none", "value": "per_capita.cases.all",
+                      "costs": {"a_doses": 10.0}}},
+        dict(pack["benchmarks"][0], id="M1"),
+        dict(pack["benchmarks"][1], id="I1", requires={"M1": [0.3, 0.5]}),
+        dict(pack["benchmarks"][1], id="I2", requires={"M1": [0.05, 0.1]})])
+    ok(validate(p2, eng) == [], "BP11 a pack with requires-gating validates")
+    r2 = Runner(p2, eng, 1)
+    res2 = {x["id"]: x for x in run_pack(p2, eng, r2, {})["benchmarks"]}
+    # cost 10 x 3 doses = 30 per person; comparator burden 1.5 cases per person -> floor 20 per case averted
+    ok(res2["C1"]["status"] == "band_mis_based" and abs(res2["C1"]["price_floor"] - 20.0) < 1e-6,
+       f"BP12 a cost band below the price floor is band_mis_based (floor {res2['C1']['price_floor']:.2f})")
+    ok(res2["C2"]["status"] in ("in_band", "out_of_band"), "BP13 a cost band above the floor is assessed normally")
+    ok(res2["I1"]["status"] != "not_assessable" and res2["I2"]["status"] == "not_assessable"
+       and "M1" in res2["I2"]["not_assessable_because"] and "M1" in res2["I2"]["requires_values"],
+       "BP14 an interaction is not assessable when a required main effect misses, and reports it")
+    ok(any("requires unknown" in s for s in validate(dict(p2, benchmarks=p2["benchmarks"] + [
+        dict(pack["benchmarks"][1], id="I3", requires={"ZZ": [0, 1]})]), eng)), "BP15 requires naming an unknown benchmark is refused")
+
+    # ---- joint fit: recovery, infeasibility, reproducibility
+    p3 = dict(pack, fit=None, benchmarks=[
+        dict(pack["benchmarks"][0], id="J1"),                                     # a vs none: 1 - eff_a = 0.4
+        {"id": "J2", "metric": "b vs none", "target": 0.8, "band": [0.75, 0.85],
+         "estimand": {"type": "ratio", "num": "b", "den": "none", "value": "per_capita.cases.all"}},
+        {"id": "J3", "metric": "unreachable", "target": 0.05, "band": [0.01, 0.1],
+         "estimand": {"type": "ratio", "num": "a", "den": "none", "value": "per_capita.cases.all"}}],
+        fit_joint={"rule": "joint-v1", "params": {"eff_a": [0.3, 0.7], "eff_b": [0.1, 0.5]},
+                   "targets": ["J1", "J2", "J3"], "design": {"n": 12, "seed": 3}})
+    p3.pop("fit")
+    ok(validate(p3, eng) == [], "BP16 a joint-fit pack validates")
+    ok(any("not in the joint fit" in s for s in validate(dict(p3, fit_joint=dict(p3["fit_joint"], params={"eff_a": [0.3, 0.7]})), eng)),
+       "BP17 a joint fit must include every fitted engine parameter")
+    ok(any("rule" in s for s in validate(dict(p3, fit_joint=dict(p3["fit_joint"], rule="nope")), eng)),
+       "BP18 an unknown fit rule is refused (the rule is versioned)")
+    j1 = fit_joint(p3, eng, Runner(p3, eng, 1))
+    ok(abs(j1["parameters"]["eff_a"]["value"] - 0.6) < 0.01 and abs(j1["parameters"]["eff_b"]["value"] - 0.2) < 0.01,
+       f"BP19 the joint fit recovers both parameters ({j1['parameters']['eff_a']['value']}, {j1['parameters']['eff_b']['value']})")
+    ok(j1["feasibility"]["infeasible_in_box"] == ["J3"] and j1["feasibility"]["all_feasible_in_band_at_value"],
+       "BP20 a target no value in the box can meet is reported infeasible_in_box and left out of the objective")
+    ok(all(j1["verification"][t]["in_band"] for t in ("J1", "J2")) and j1["fit_rule"]["version"] == "joint-v1"
+       and j1["fit_rule"]["seeds"] == [1, 2], "BP21 the fit is verified by re-running, and records its rule and seeds")
+    j2 = fit_joint(p3, eng, Runner(p3, eng, 1))
+    ok(j1["parameters"] == j2["parameters"] and j1["design"] == j2["design"], "BP22 the joint fit is reproducible")
+    res3 = {x["id"]: x for x in run_pack(p3, eng, Runner(p3, eng, 1), {k: v["value"] for k, v in j1["parameters"].items()}, j1)["benchmarks"]}
+    ok(res3["J3"].get("infeasible_in_box") is True and res3["J1"]["role"] == "fit", "BP23 the pack run carries the feasibility flags")
+    conf = dict(p3, benchmarks=p3["benchmarks"][:2] + [
+        {"id": "J4", "metric": "a vs none, other band", "target": 0.65, "band": [0.62, 0.68],
+         "estimand": {"type": "ratio", "num": "a", "den": "none", "value": "per_capita.cases.all"}}],
+        fit_joint=dict(p3["fit_joint"], targets=["J1", "J2", "J4"]))
+    jc = fit_joint(conf, eng, Runner(conf, eng, 1))
+    ok(["J1", "J4"] in jc["feasibility"]["conflicting_pairs"], "BP24 two targets that cannot be in band together are reported as a conflict")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
