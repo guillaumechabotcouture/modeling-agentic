@@ -87,6 +87,8 @@ from agents.run_finish import (  # noqa: E402,F401  Phase 48 γ: moved, re-expor
     WRITEUP_PROMPT,
     _harness_wrote_gate_outputs,
     final_writeup,
+    PRESENTATION_FIX_PROMPT,
+    presentation_fix_pass,
 )
 
 REPO_ROOT = enforcement.REPO_ROOT
@@ -582,6 +584,13 @@ async def run(question: str, max_rounds: int, max_sessions: int,
             await final_writeup(run_path, run_dir_rel, question, max_rounds, budget,
                                 max_budget_usd, session_num + 1, session_outcome, integrity,
                                 live_state=live_state)
+        # Phase 49 δ (A23): presentation HIGHs for the writer still open (not re-checked)
+        # get one writer fix pass and a re-review, paid from what is left (reserve included).
+        if not interrupted and not paused:
+            _next = 1 + max([session_num] + [int(r.get("session") or 0) for r in budget["sessions"]])
+            live_state.session = _next
+            await presentation_fix_pass(run_path, run_dir_rel, question, budget, max_budget_usd, _next,
+                                        integrity, live_state=live_state)
     finally:
         heartbeat.stop(timeout_s=180)   # last status + checkpoint; never blocks finalize longer
         status = finalize_run(
@@ -1818,6 +1827,190 @@ def _run_self_test() -> int:
     ok(asyncio.run(final_writeup(_wd, _wd, "q", 8, _bud2, 450.0, 2, "budget_exhausted", query_fn=_fq_w))
        .get("skipped"), "WU5 no budget left: the write-up is skipped and says so")
     shutil.rmtree(_wd, ignore_errors=True)
+
+    # PF (Phase 49 δ, A23): open presentation HIGHs for the writer, or a draft no review
+    # covers, get one fix pass and a review of the delivered draft.
+    import yaml as _yaml_pf
+    import time as _time_pf
+    import presentation_pass as _pp
+    _pd = tempfile.mkdtemp()
+    json.dump({"question": "q"}, open(os.path.join(_pd, "metadata.json"), "w"))
+    _crit = {"reviewer": "critique-presentation", "round": 8, "blockers": [
+        {"id": "P-001", "severity": "HIGH", "target_stage": "WRITE", "claim": "units stripped",
+         "fix_requires": "restore units", "resolved": False},
+        {"id": "P-005", "severity": "HIGH", "target_stage": "MODEL", "claim": "figure", "resolved": False}]}
+    _yaml_pf.safe_dump(_crit, open(os.path.join(_pd, "critique_presentation.yaml"), "w"))
+    for _f in ("manuscript.md", "report.md"):
+        open(os.path.join(_pd, _f), "w").write("# Draft\n")
+    _t = _time_pf.time() + 5
+    os.utime(os.path.join(_pd, "manuscript.md"), (_t, _t))
+    os.utime(os.path.join(_pd, "report.md"), (_t + 1, _t + 1))
+    _pseen = {"calls": 0}
+
+    async def _fq_p(prompt, options):
+        _pseen["calls"] += 1
+        _pseen["prompt"], _pseen["budget"], _pseen["agents"] = prompt, options.max_budget_usd, sorted(options.agents)
+        _before = _pp.snapshot(_pd)          # what the hook does when the critic's spawn starts
+        _yaml_pf.safe_dump(dict(_crit, blockers=[dict(b, resolved=True) for b in _crit["blockers"]]),
+                           open(os.path.join(_pd, "critique_presentation.yaml"), "w"))
+        _pp.record_review(_pd, _before)      # what the hook records when the critic's spawn returns
+        yield ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+                            num_turns=6, session_id="p1", total_cost_usd=6.0)
+    _pbud = {"sessions": [{"session": 3, "total_cost_usd": 442.0}]}
+    _pi = asyncio.run(presentation_fix_pass(_pd, _pd, "q", _pbud, 600.0, 4, query_fn=_fq_p))
+    ok(_pi.get("ran") and _pi.get("items") == ["P-001"] and _pseen.get("agents") == ["critique-presentation", "writer"]
+       and abs((_pseen.get("budget") or 0) - 158.0) < 1e-6 and "`This is critique round 8.`" in _pseen.get("prompt", "")
+       and "P-001: units stripped Fix: restore units" in _pseen.get("prompt", "") and "P-005" not in _pseen.get("prompt", ""),
+       f"PF1 open writer HIGHs: one session with the writer and the presentation critic, budget incl. the reserve: "
+       f"{_pi} {_pseen.get('budget')}")
+    ok(_pbud["sessions"][-1]["source"] == "presentation fix pass" and _pbud["sessions"][-1]["session"] == 4
+       and _pbud["sessions"][-1]["total_cost_usd"] == 6.0, f"PF2 the pass is charged to the ledger: {_pbud['sessions'][-1]}")
+    _pm = json.load(open(os.path.join(_pd, "metadata.json"))).get("presentation_fix_pass", {})
+    ok(_pm.get("ran") is True and _pm.get("still_open") == [] and _pm.get("review_after") == "ok",
+       f"PF3 the outcome (reviewed, nothing open) is recorded in metadata.json: {_pm}")
+    asyncio.run(presentation_fix_pass(_pd, _pd, "q", _pbud, 600.0, 5, query_fn=_fq_p))
+    ok(_pseen["calls"] == 1, "PF4 once per run: a resumed run does not repeat the pass")
+    shutil.rmtree(_pd, ignore_errors=True)
+    _pd = tempfile.mkdtemp()
+    json.dump({"question": "q"}, open(os.path.join(_pd, "metadata.json"), "w"))
+    open(os.path.join(_pd, "manuscript.md"), "w").write("# Draft\n")
+    _yaml_pf.safe_dump(dict(_crit, blockers=_crit["blockers"][1:]), open(os.path.join(_pd, "critique_presentation.yaml"), "w"))
+    _pp.record_review(_pd, dict(_pp.snapshot(_pd), critique_sha_before=None))
+    _pi = asyncio.run(presentation_fix_pass(_pd, _pd, "q", _pbud, 600.0, 4, query_fn=_fq_p))
+    ok(_pseen["calls"] == 1 and not _pi.get("ran") and "presentation_fix_pass" not in json.load(
+        open(os.path.join(_pd, "metadata.json"))), f"PF5 reviewed draft, nothing for the writer: no session: {_pi}")
+    open(os.path.join(_pd, "manuscript.md"), "w").write("# Draft, revised after the review\n")
+    _pi = asyncio.run(presentation_fix_pass(_pd, _pd, "q", {"sessions": []}, 600.0, 4, query_fn=_fq_p))
+    ok(_pseen["calls"] == 2 and _pi.get("ran") and _pseen.get("agents") == ["critique-presentation"]
+       and "writer" not in _pseen.get("prompt", "").split("Do nothing else")[0].lower().replace("writer's", "")
+       and _pi.get("review_before") == "stale" and _pi.get("review_after") == "ok",
+       f"PF5b (Codex P1-2) a draft revised after its review gets a review-only pass: {_pi} {_pseen.get('agents')}")
+    shutil.rmtree(_pd, ignore_errors=True)
+    _pd = tempfile.mkdtemp()
+    json.dump({"question": "q"}, open(os.path.join(_pd, "metadata.json"), "w"))
+    open(os.path.join(_pd, "manuscript.md"), "w").write("# Draft\n")
+    _yaml_pf.safe_dump(_crit, open(os.path.join(_pd, "critique_presentation.yaml"), "w"))
+    _pi = asyncio.run(presentation_fix_pass(_pd, _pd, "q", {"sessions": [{"session": 3, "total_cost_usd": 600.0}]},
+                                            600.0, 4, query_fn=_fq_p))
+    ok(_pseen["calls"] == 2 and "no budget" in str(_pi.get("skipped")) and json.load(
+        open(os.path.join(_pd, "metadata.json"))).get("presentation_fix_pass", {}).get("items") == ["P-001"],
+       f"PF6 no budget left: skipped, and the open items are recorded: {_pi}")
+    shutil.rmtree(_pd, ignore_errors=True)
+    import inspect as _inspect_pf
+    _src_run = _inspect_pf.getsource(run)
+    ok(_src_run.index("presentation_fix_pass(") > _src_run.index("final_writeup(")
+       and _src_run.index("presentation_fix_pass(") < _src_run.index("finalize_run("),
+       "PF7 run(): the pass comes after the final write-up and before the final gate (finalize_run)")
+
+    # PF8 (Codex P1-1): an interrupted pass is charged (the whole allowance: its cost is
+    # unreadable), its attempt is recorded so a resume does not repeat it, and the
+    # interruption propagates.
+    _pd = tempfile.mkdtemp()
+    json.dump({"question": "q"}, open(os.path.join(_pd, "metadata.json"), "w"))
+    open(os.path.join(_pd, "manuscript.md"), "w").write("# Draft\n")
+    _yaml_pf.safe_dump(_crit, open(os.path.join(_pd, "critique_presentation.yaml"), "w"))
+
+    async def _fq_cancel(prompt, options):
+        yield SystemMessage(subtype="init", data={"session_id": "pc"})
+        raise asyncio.CancelledError()
+    _cbud = {"sessions": [{"session": 3, "total_cost_usd": 590.0}]}
+    try:
+        asyncio.run(presentation_fix_pass(_pd, _pd, "q", _cbud, 600.0, 4, query_fn=_fq_cancel))
+        _raised = False
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        _raised = True
+    _pm = json.load(open(os.path.join(_pd, "metadata.json"))).get("presentation_fix_pass", {})
+    ok(_raised and _cbud["sessions"][-1]["session"] == 4 and _cbud["sessions"][-1]["total_cost_usd"] == 10.0
+       and "remaining allowance" in _cbud["sessions"][-1]["source"]
+       and json.load(open(os.path.join(_pd, "budget_ledger.json")))["spent_usd"] == 600.0,
+       f"PF8 an interrupted pass is charged its allowance and the ledger is written: {_raised} {_cbud['sessions'][-1]}")
+    ok(_pm.get("attempted") and _pm.get("interrupted") == "CancelledError",
+       f"PF8b the interrupted attempt is recorded: {_pm}")
+    _n = _pseen["calls"]
+    asyncio.run(presentation_fix_pass(_pd, _pd, "q", _cbud, 600.0, 5, query_fn=_fq_p))
+    ok(_pseen["calls"] == _n and len(_cbud["sessions"]) == 2, "PF8c a resumed run does not repeat (or re-charge) it")
+    shutil.rmtree(_pd, ignore_errors=True)
+
+    # PF9 (Codex P1-3): the harness's fallback render writes protected outputs under a
+    # harness grant and records them as harness writes.
+    from contextlib import contextmanager as _cm_pf
+
+    class _IgP:
+        def __init__(self):
+            self.grants, self.wrote, self.during = [], set(), None
+
+        @_cm_pf
+        def harness_pipeline(self, patterns):
+            self.grants.append(list(patterns))
+            yield
+
+        def harness_wrote(self, rel):
+            self.wrote.add(rel)
+    _pd = tempfile.mkdtemp()
+    os.makedirs(os.path.join(_pd, "models"))
+    open(os.path.join(_pd, "report.md"), "w").write("# old\n")
+    open(os.path.join(_pd, "manuscript.md"), "w").write("# Draft, newer\n")
+    _t = _time_pf.time() + 5
+    os.utime(os.path.join(_pd, "manuscript.md"), (_t, _t))
+    _igp = _IgP()
+    from agents.run_finish import _render_if_stale as _ris
+    _ris(_pd, _igp)
+    ok(_igp.grants and "report.md" in _igp.grants[0] and "models/claims_ledger.yaml" in _igp.grants[0]
+       and "report.md" in _igp.wrote,
+       f"PF9 the fallback render runs under a harness grant and records report.md: {_igp.grants} {_igp.wrote}")
+    shutil.rmtree(_pd, ignore_errors=True)
+
+    # PF10 (Codex P1-2, round 2): a full review spawn is snapshotted and pointed at the
+    # snapshot; the record holds the hashes taken then.
+    _pd = tempfile.mkdtemp()
+    open(os.path.join(_pd, "manuscript.md"), "w").write("# Draft\n")
+    open(os.path.join(_pd, "report.md"), "w").write("# Draft (rendered)\n")
+    _hkp = agents_pkg.create_hooks(_pd, open(os.path.join(_pd, "trace.jsonl"), "a"), datetime.now(),
+                                   registered_agents=reg, max_rounds=8, hold_writer=False)
+    _pre, _post = _hkp["PreToolUse"][0].hooks[0], _hkp["PostToolUse"][0].hooks[0]
+
+    def _spawn_p(prompt):
+        return {"tool_name": "Agent", "tool_input": {"subagent_type": "critique-presentation",
+                                                     "description": "review", "prompt": prompt}}
+    _r = asyncio.run(_pre(_spawn_p("This is critique round 8."), "pr1", None))
+    _upd = ((_r or {}).get("hookSpecificOutput") or {}).get("updatedInput") or {}
+    ok("presentation_review/" in _upd.get("prompt", "") and "Do not read the live" in _upd.get("prompt", ""),
+       f"PF10 the critic's prompt points at the snapshot: {_r}")
+    _yaml_pf.safe_dump(_crit, open(os.path.join(_pd, "critique_presentation.yaml"), "w"))
+    asyncio.run(_post(_spawn_p("This is critique round 8."), "pr1", None))
+    _rec = json.load(open(os.path.join(_pd, _pp.REVIEW)))
+    ok(_rec.get("ok") and set(_rec.get("files") or {}) == {"manuscript.md", "report.md"}
+       and _pp.review_state(_pd)[0] == "ok", f"PF10a both files' snapshot hashes recorded, current: {_rec}")
+    # Concurrent writer edit during the review: stale.
+    asyncio.run(_pre(_spawn_p("This is critique round 8."), "pr2", None))
+    open(os.path.join(_pd, "manuscript.md"), "w").write("# Draft, edited while the critic read\n")
+    _yaml_pf.safe_dump(dict(_crit, verdict="REVISE"), open(os.path.join(_pd, "critique_presentation.yaml"), "w"))
+    asyncio.run(_post(_spawn_p("This is critique round 8."), "pr2", None))
+    ok(_pp.review_state(_pd)[0] == "stale",
+       f"PF10b (Codex round 2) a writer edit during the review leaves it stale: {_pp.review_state(_pd)}")
+    # A clean review, then the fallback render rewrites report.md: stale.
+    asyncio.run(_pre(_spawn_p("This is critique round 8."), "pr3", None))
+    _yaml_pf.safe_dump(dict(_crit, verdict="PASS"), open(os.path.join(_pd, "critique_presentation.yaml"), "w"))
+    asyncio.run(_post(_spawn_p("This is critique round 8."), "pr3", None))
+    _ok_before = _pp.review_state(_pd)[0]
+    open(os.path.join(_pd, "report.md"), "w").write("# Rendered again by the fallback\n")
+    ok(_ok_before == "ok" and _pp.review_state(_pd)[0] == "stale",
+       f"PF10c (Codex round 2) report.md changed by a render after the review: stale ({_ok_before})")
+    # A repair-only spawn neither creates nor refreshes the record.
+    _rec_before = open(os.path.join(_pd, _pp.REVIEW)).read()
+    _r = asyncio.run(_pre(_spawn_p("This is a repair of critique_presentation.yaml."), "pr4", None))
+    _yaml_pf.safe_dump(dict(_crit, verdict="REVISE", round=8), open(os.path.join(_pd, "critique_presentation.yaml"), "w"))
+    asyncio.run(_post(_spawn_p("This is a repair of critique_presentation.yaml."), "pr4", None))
+    ok(open(os.path.join(_pd, _pp.REVIEW)).read() == _rec_before and _pp.review_state(_pd)[0] == "stale"
+       and "updatedInput" not in json.dumps(_r or {}),
+       "PF10d (Codex round 2) a repair-only spawn does not create or refresh the review record")
+    ok(enforcement.check_tool_use("Write", {"file_path": os.path.join(run_path, _pp.REVIEW), "content": "{}"},
+                                  run_path, "critique-presentation", reg) is not None
+       and enforcement.check_tool_use("Write", {"file_path": os.path.join(run_path, "presentation_review/x/report.md"),
+                                                "content": "x"}, run_path, "writer", reg) is not None,
+       "PF10e agents cannot write the review record or the snapshot")
+    shutil.rmtree(_pd, ignore_errors=True)
+    shutil.rmtree(_pd, ignore_errors=True)
 
     # WU6-WU9 (Codex, Phase 29 review)
     _bd = tempfile.mkdtemp()
