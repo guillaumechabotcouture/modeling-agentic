@@ -615,6 +615,49 @@ def _classify(cases: list[dict]) -> list[dict]:
     return out
 
 
+def _tree_state(d: str) -> dict:
+    out = {}
+    for dp, _, fns in os.walk(d):
+        for fn in fns:
+            p = os.path.join(dp, fn)
+            try:
+                with open(p, "rb") as f:
+                    out[os.path.relpath(p, d)] = hash(f.read())
+            except OSError:
+                pass
+    return out
+
+
+def _settle_one(modname: str, run: str, round_n: int) -> dict:
+    try:
+        _call(importlib.import_module(modname), run, round_n)
+    except Exception:  # noqa: BLE001 — a crash on the clean run is reported by _observe
+        pass
+    return {}
+
+
+def _settle(base: str, modules: list, work: str, round_n: int) -> tuple[str, list]:
+    """Codex round 2: some checks create state the first time they see a run
+    (decision_brief writes acceptance_lock.json with the benchmark targets'
+    hash). A mutation seen first would be locked as it is and never reported.
+    So every check runs on a copy of the base, in turn, until no file changes
+    (at most 3 passes); that settled copy is the base every case starts from.
+    The given base is not modified. Returns (settled dir, files created or
+    changed by settling)."""
+    shutil.copytree(base, work, symlinks=True)
+    first = before = _tree_state(work)
+    for _ in range(3):
+        for m in modules:
+            _in_child(_settle_one, m, work, round_n)
+        after = _tree_state(work)
+        if after == before:
+            break
+        before = after
+    shutil.rmtree(os.path.join(work, "models", "__pycache__"), ignore_errors=True)
+    final = _tree_state(work)
+    return work, sorted(k for k, v in final.items() if first.get(k) != v)
+
+
 def _supplement(run_dir: str, round_n: int) -> None:
     """Trigger artifacts for checks whose inputs the positive control lacks
     (Codex round 1: a file-backed check with no mutation case is not tested).
@@ -672,6 +715,8 @@ def sweep(scripts_dir: str = HERE, modules=None, base: str | None = None, round_
                 importlib.import_module(m)
             except Exception as e:  # noqa: BLE001
                 out["modules"][m] = {"reads": [], "findings": None, "error": f"import: {e}"}
+        base, out["settled"] = _settle(base, [m for m in modules if m not in out["modules"]],
+                                       os.path.join(td, "settled"), round_n)
         jobs = []
         for m in modules:
             if m in out["modules"]:
@@ -908,6 +953,21 @@ def gate_findings(run_dir):
         return [{"kind": "a_invalid", "severity": "HIGH"}]
     return []
 ''',
+    # locks a.yaml's hash the first time it sees it (as decision_brief locks the
+    # benchmark targets): a corrupt file seen first would be locked as it is
+    "gf_lock": '''
+import hashlib, json, os
+def gate_findings(run_dir):
+    with open(os.path.join(run_dir, "a.yaml"), "rb") as f:
+        h = hashlib.sha256(f.read()).hexdigest()
+    lp = os.path.join(run_dir, "lock.json")
+    if not os.path.exists(lp):
+        with open(lp, "w") as f:
+            json.dump({"a": h}, f)
+        return []
+    with open(lp) as f:
+        return [] if json.load(f).get("a") == h else [{"kind": "a_changed_after_lock", "severity": "HIGH"}]
+''',
     "gf_nofile": '''
 def gate_findings(run_dir):
     return []
@@ -960,7 +1020,7 @@ def _self_test() -> int:
         with open(os.path.join(base, "b.yaml"), "w") as f:
             f.write("n: 3\nitems:\n  - 1\n  - 2\n")
         mods = discover(sd)
-        ok(mods == ["gf_closed", "gf_keys", "gf_nofile", "gf_notlist", "gf_open", "gf_round", "gf_two"],
+        ok(mods == ["gf_closed", "gf_keys", "gf_lock", "gf_nofile", "gf_notlist", "gf_open", "gf_round", "gf_two"],
            f"GF1 discovery finds gate_findings(run_dir, ...) only, not gate_findings(result) ({mods})")
         not_file_backed = {"gf_round": "self-test: reads no file by design",
                            "gf_nofile": "self-test: listed, so not a coverage failure"}
@@ -968,6 +1028,13 @@ def _self_test() -> int:
         ok(res["modules"]["gf_closed"]["reads"] == ["a.yaml"], "GF2 the clean run records the file a check reads")
         found = failures(res)
         ok("gf_closed" not in found, f"GF3 a fail-closed check passes every mutation ({found.get('gf_closed')})")
+        # Codex round 2: first-seen state (a lock) is created in the base before the
+        # clean observation, so every mutation starts from the locked state.
+        ok(set((found.get("gf_lock") or {}).get("a.yaml", {})) <= {"symlink_escape"}   # same bytes behind a link
+           and not os.path.exists(os.path.join(base, "lock.json")),
+           f"GF3b a check that locks on first sight sees each mutation as a change after the lock; "
+           f"the given base is not modified ({by_mutation(found, 'gf_lock')})")
+        ok("lock.json" in res.get("settled", []), f"GF3c the settled first-seen files are recorded ({res.get('settled')})")
         fo = by_mutation(found, "gf_open")
         want_open = {"corrupt": ["fails_open"], "truncated": ["fails_open"], "symlink_escape": ["fails_open"],
                      "inf": ["fails_open"]}

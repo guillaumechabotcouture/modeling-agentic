@@ -146,20 +146,19 @@ expected_failures:
       undecodable: [raises]
       wrong_type: [fails_open]
   decision_brief:
-    decision_brief.signoff.json:
-      symlink_escape: [fails_open]
-    decision_brief.yaml:
-      symlink_escape: [fails_open]
-    models/benchmark_targets.yaml:
-      alias_loop: [fails_open]
-      bad_date: [fails_open]
-      big_int_str: [fails_open]
+    acceptance_lock.json:
       corrupt: [fails_open]
       empty: [fails_open]
       symlink_escape: [fails_open]
       truncated: [fails_open]
       undecodable: [fails_open]
-      wrong_type: [fails_open]
+      wrong_type: [raises]
+    decision_brief.signoff.json:
+      symlink_escape: [fails_open]
+    decision_brief.yaml:
+      symlink_escape: [fails_open]
+    models/benchmark_targets.yaml:
+      symlink_escape: [fails_open]
     success_criteria.yaml:
       symlink_escape: [fails_open]
   effect_concordance:
