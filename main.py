@@ -2034,6 +2034,19 @@ def _run_self_test() -> int:
     ok("`This is critique round 1.`" in _pseen_c.get("prompt", ""),
        f"PF5c a first presentation review names the gate's current round: {_pseen_c.get('prompt', '')[:300]!r}")
     shutil.rmtree(_pd, ignore_errors=True)
+    # PF5d (Codex on #93): a stale presentation round never wins, in either direction.
+    from agents import run_finish as _rf_pf
+    for _others, _pres, _want in ((2, 1, 2), (1, 2, 1), (None, 3, 3), (None, None, 1)):
+        _pd = tempfile.mkdtemp()
+        if _others is not None:
+            _yaml_pf.safe_dump({"reviewer": "critique-domain", "round": _others, "blockers": []},
+                               open(os.path.join(_pd, "critique_domain.yaml"), "w"))
+        if _pres is not None:
+            _yaml_pf.safe_dump({"reviewer": "critique-presentation", "round": _pres, "blockers": []},
+                               open(os.path.join(_pd, "critique_presentation.yaml"), "w"))
+        _got = _rf_pf._pass_round(_pd, {"round": _pres})
+        ok(_got == _want, f"PF5d others={_others} presentation={_pres}: round {_got}, want {_want}")
+        shutil.rmtree(_pd, ignore_errors=True)
     _pd = tempfile.mkdtemp()
     json.dump({"question": "q"}, open(os.path.join(_pd, "metadata.json"), "w"))
     open(os.path.join(_pd, "manuscript.md"), "w").write("# Draft\n")

@@ -620,12 +620,25 @@ async def final_writeup(run_path, run_dir_rel, question, max_rounds, budget, cap
 
 
 def _pass_round(run_path: str, pending: dict) -> int:
-    """The critique round the fix pass's presentation review must carry: the presentation
-    critique's own round if there is one, else the gate's current round from the other
-    critiques (detect_current_round), else 1. Never a placeholder: in smoke 3 (2026-10-31) the
-    prompt said "round N", the critic wrote round 2 into a round-1 run, and the final gate
-    failed on the mismatch (completed_gate_error)."""
-    return pending.get("round") or detect_current_round(run_path) or 1
+    """The critique round the fix pass's presentation review must carry: the round of the
+    other critiques (the gate's current round, presentation excluded), else the presentation
+    critique's own round, else 1. Never a placeholder: in smoke 3 (2026-10-31) the prompt said
+    "round N", the critic wrote round 2 into a round-1 run, and the final gate failed on the
+    mismatch (completed_gate_error). A stale presentation round must not win either way."""
+    import yaml
+    rounds = []
+    for path in glob.glob(os.path.join(run_path, "critique_*.yaml")):
+        if os.path.basename(path) == "critique_presentation.yaml":
+            continue
+        try:
+            with open(path) as f:
+                doc = yaml.safe_load(f)
+        except Exception:
+            continue
+        r = doc.get("round") if isinstance(doc, dict) else None
+        if isinstance(r, int) and not isinstance(r, bool):
+            rounds.append(r)
+    return max(rounds) if rounds else (pending.get("round") or detect_current_round(run_path) or 1)
 
 
 PRESENTATION_FIX_PROMPT = """The modeling sessions have ended. {situation}
