@@ -299,3 +299,19 @@ Fixtures: the run's three critique YAMLs, `final_gate.json` and claims ledger (`
 | 2 | v2 rule on top of today's: an ACCEPT with open HIGH/MEDIUM findings (critic blockers not closed by their test; harness-check findings) becomes PATCH_OR_RETHINK rule `4m` while rounds and budget remain, and those findings are planned in the fix loop; when none remain it becomes DECLARE_SCOPE rule `3m`, the findings are written to `declared_findings.yaml` and rendered in the report. The gate file and validator history record the action the machine takes. Golden-trace replays of stored v1 gates run without these rules (`v2_rules: false`) | T39, T42 |
 | 3 | The writer writes `[CLAIM:id]`; `render_report` substitutes the value from `models/claims_ledger.yaml`. An unresolved reference, or a ledger id left bare in the writer's text, is a non-declarable HIGH write-up finding | T40 |
 | 4 | Before the draft, every repository file the question names is copied into `data/inputs/` with its sha256 (`data/inputs_provenance.json`); every file the spec cites must be inside the run and is recorded with its sha256, else the spec does not pass the pre-sign check | T41 |
+
+**Codex round 1 on #95 (ten P1s) and the coordinator's item 5.** Each was reproduced against a3a31b7 first.
+
+| Finding | Change | Test |
+|---|---|---|
+| A resolved blocker whose test fails (`done_when_unmet`), or a missing presentation review, was excluded from the open set | Every HIGH/MEDIUM gate finding counts; only one that restates an open critic blocker is dropped as a duplicate | T43 |
+| Typed result numbers were never checked | A number in the writer's text outside `[CLAIM:]` is a HIGH finding, except years, list numbering, digits inside identifiers, and numbers the owner gave (the signed spec, the question) | T44 |
+| A copied `<!-- harness:` marker hid ids | The checks read `manuscript.md` (the writer's text), not the rendered report | T44b |
+| A write-up fix was checked against a stale report | The fix loop's rebuild re-renders the report when a draft exists | T45 |
+| Rule 3 / 3a DECLARE_SCOPE did not list the open findings | Every v2 DECLARE_SCOPE writes `declared_findings.yaml` and renders it | T46 |
+| A cited path with a space, or a path field without an extension, escaped provenance | Every string value ending in a data extension and every `csv`/`file`/`path`/`table` field is checked | T47 |
+| Copying could follow a symlinked `data/inputs` out of the run | No symlink on the way or hard-linked destination; copies are opened without following links | T48 |
+| Case variants of `evals/` and `_truth` passed the exclusion | Compared case-insensitively, in the harness and in the agents' read guard | T49, S12 |
+| The draft task could rewrite the staged inputs or their manifest | Both are harness-owned in the write guard; after the draft each copy's sha256 is checked against its record and its source | T50, S12 |
+| Golden replays ran the new report checks | They run only with `v2_rules` | T51 |
+| (item 5) A Grep or Glob at the repository root reached `evals/**/_truth` | A Read, Grep or Glob whose search root (its path, or a Glob pattern's literal prefix) contains the repository's `evals/` tree is refused unless confined to the run directory or `data/` | S13 |

@@ -387,7 +387,6 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
     return d
 
 
-_BOOKKEEPING = ("critique_", "done_when_", "scope_declaration_", "cross_model_critic_", "validator_check_")
 
 
 def open_findings(run_dir: str, decision: dict) -> list[dict]:
@@ -418,11 +417,21 @@ def open_findings(run_dir: str, decision: dict) -> list[dict]:
             dw = b.get("done_when")
             out.append({"id": str(b.get("id")), "source": reviewer, "severity": b.get("severity"),
                         "tested": dw is not None and not DW.problems(dw), "claim": str(b.get("claim") or "")[:300]})
+    critic_open = {o["id"] for o in out}
+    seen = set()
     for v in decision.get("rigor_violations") or []:
-        if (isinstance(v, dict) and str(v.get("severity")) in ("HIGH", "MEDIUM")
-                and not str(v.get("kind") or "").startswith(_BOOKKEEPING)):
-            out.append({"id": FL.gate_id(v), "source": "harness", "severity": v.get("severity"), "tested": True,
-                        "claim": str(v.get("claim") or "")[:300]})
+        if not (isinstance(v, dict) and str(v.get("severity")) in ("HIGH", "MEDIUM")):
+            continue
+        fid = FL.gate_id(v)
+        # Every gate finding counts (a resolved blocker whose test fails is done_when_unmet; a missing
+        # presentation review is critique_presentation_missing); only one that restates an open
+        # critic blocker (same id as its key) is a duplicate.
+        if str(v.get("key") or "") in critic_open or fid in seen:
+            continue
+        seen.add(fid)
+        out.append({"id": fid, "source": "harness", "severity": v.get("severity"),
+                    "tested": not str(v.get("kind") or "").startswith("critique_done_when_missing"),
+                    "claim": str(v.get("claim") or "")[:300]})
     return out
 
 
@@ -477,28 +486,65 @@ def _provenance(run_dir: str) -> dict:
         return {"inputs": {}, "cited": {}}
 
 
+def answer_key_path(rel: str) -> bool:
+    """A repository path into the evaluation tree. Compared case-insensitively: APFS and NTFS are
+    case-insensitive by default, so EVALS/q/rubric.yaml is evals/q/rubric.yaml."""
+    parts = [p.lower() for p in rel.replace(os.sep, "/").split("/") if p not in ("", ".")]
+    return bool(parts) and (parts[0] == "evals" or "_truth" in parts)
+
+
+def _question_paths(question: str) -> list[str]:
+    """File names in the question: bare tokens, and quoted or backticked ones (which may hold spaces)."""
+    import re
+    q = question or ""
+    toks = re.findall(r"[`\"']([^`\"'\n]+)[`\"']", q) + re.findall(r"[A-Za-z0-9_./-]+", q)
+    return [t.strip().strip("./") for t in toks if t.strip().lower().endswith(_INPUT_EXT)]
+
+
+def _safe_dest(run_dir: str, rel: str) -> str:
+    """The destination path inside the run, refusing any symlink on the way and any existing link."""
+    root = os.path.realpath(run_dir)
+    cur = root
+    for part in rel.split("/"):
+        cur = os.path.join(cur, part)
+        if os.path.islink(cur):
+            raise ValueError(f"{rel}: {os.path.relpath(cur, root)} is a symlink")
+    if os.path.exists(cur) and os.stat(cur).st_nlink > 1:
+        raise ValueError(f"{rel}: the destination is a hard link")
+    if not os.path.realpath(cur).startswith(root + os.sep):
+        raise ValueError(f"{rel}: outside the run directory")
+    return cur
+
+
+def _copy_nofollow(src: str, dest: str) -> None:
+    data = open(src, "rb").read()
+    fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o644)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+
+
 def stage_inputs(run_dir: str, question: str) -> list[str]:
     """Copy every repository file the question names into data/inputs/ (same relative path), with its
-    sha256 in data/inputs_provenance.json. Never the evaluation tree (evals/, _truth)."""
-    import re
-    import shutil
+    sha256 in data/inputs_provenance.json. Never the evaluation tree (evals/, _truth, any case), and
+    never through a link: a symlinked directory or a linked destination is refused (ValueError)."""
     staged = []
-    prov = _provenance(run_dir)
+    prov = {"inputs": {}, "cited": _provenance(run_dir).get("cited") or {}}
     root = os.path.realpath(REPO)
-    for tok in re.findall(r"[A-Za-z0-9_./-]+", question or ""):
-        tok = tok.strip("./")
-        if not tok.lower().endswith(_INPUT_EXT):
-            continue
+    for tok in _question_paths(question):
         src = os.path.realpath(os.path.join(root, tok))
         rel = os.path.relpath(src, root).replace(os.sep, "/")
-        if (not src.startswith(root + os.sep) or not os.path.isfile(src) or rel.startswith("evals/")
-                or "_truth" in rel.split("/") or rel.startswith("runs/")):
+        if (not src.startswith(root + os.sep) or not os.path.isfile(src) or answer_key_path(rel)
+                or answer_key_path(tok) or rel.lower().startswith("runs/")):
             continue
-        dest = f"data/inputs/{rel}"
-        os.makedirs(os.path.dirname(os.path.join(run_dir, dest)), exist_ok=True)
-        shutil.copyfile(src, os.path.join(run_dir, dest))
-        prov["inputs"][dest] = {"source": rel, "sha256": _sha256(src), "bytes": os.path.getsize(src)}
-        staged.append(dest)
+        dest_rel = f"data/inputs/{rel}"
+        dest = _safe_dest(run_dir, dest_rel)
+        parent = os.path.dirname(dest)
+        os.makedirs(parent, exist_ok=True)
+        _safe_dest(run_dir, dest_rel)                      # nothing linked was created on the way
+        _copy_nofollow(src, dest)
+        prov["inputs"][dest_rel] = {"source": rel, "sha256": _sha256(src), "bytes": os.path.getsize(src)}
+        staged.append(dest_rel)
+    _safe_dest(run_dir, PROVENANCE)
     os.makedirs(os.path.join(run_dir, "data"), exist_ok=True)
     _write_json(run_dir, PROVENANCE, prov)
     return staged
@@ -522,10 +568,32 @@ def record_cited_inputs(run_dir: str) -> list[str]:
         elif isinstance(x, list):
             for v in x:
                 walk(v)
-        elif isinstance(x, str) and x.strip().lower().endswith(_INPUT_EXT) and " " not in x.strip():
+        elif isinstance(x, str) and x.strip().lower().endswith(_INPUT_EXT):
             found.append(x.strip())
+
+    def walk_keys(x):          # a path field by name, whatever its spelling or extension
+        if isinstance(x, dict):
+            for k, v in x.items():
+                if k in ("deliverable", "deliverable_file"):
+                    continue
+                if k in ("csv", "file", "path", "table") and isinstance(v, str) and v.strip():
+                    found.append(v.strip())
+                walk_keys(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk_keys(v)
     walk(spec)
+    walk_keys(spec)
     prov, probs, root = _provenance(run_dir), [], os.path.realpath(run_dir)
+    # The staged copies must still be the files the question named (the draft task may not touch
+    # them; this checks it).
+    for dest, e in (prov.get("inputs") or {}).items():
+        p = os.path.join(run_dir, dest)
+        src = os.path.join(REPO, e.get("source", ""))
+        if not os.path.isfile(p) or os.path.islink(p) or _sha256(p) != e.get("sha256"):
+            probs.append(f"the staged input {dest} was changed or removed after it was copied")
+        elif os.path.isfile(src) and _sha256(src) != e.get("sha256"):
+            probs.append(f"the staged input {dest} no longer matches its source {e.get('source')}")
     for rel in sorted(set(found)):
         p = os.path.realpath(os.path.join(run_dir, rel))
         if not p.startswith(root + os.sep):
@@ -534,6 +602,7 @@ def record_cited_inputs(run_dir: str) -> list[str]:
             probs.append(f"the spec cites {rel}, which does not exist")
         else:
             prov.setdefault("cited", {})[os.path.relpath(p, root).replace(os.sep, "/")] = {"sha256": _sha256(p)}
+    os.makedirs(os.path.join(run_dir, "data"), exist_ok=True)
     _write_json(run_dir, PROVENANCE, prov)
     return probs
 
@@ -543,7 +612,7 @@ def report_claim_findings(run_dir: str) -> list[dict]:
     """The report must show values, never claim ids: an unresolved [CLAIM:id], or a claims-ledger id
     left bare in the text the writer wrote, is a HIGH write-up finding (not declarable)."""
     import re
-    rp, lp = os.path.join(run_dir, "report.md"), os.path.join(run_dir, "models", "claims_ledger.yaml")
+    rp, lp = os.path.join(run_dir, "manuscript.md"), os.path.join(run_dir, "models", "claims_ledger.yaml")
     if not (os.path.exists(rp) and os.path.exists(lp)):
         return []
     try:
@@ -552,9 +621,11 @@ def report_claim_findings(run_dir: str) -> list[dict]:
     except Exception as e:  # noqa: BLE001 -- fail closed
         return [{"kind": "report_claims_unreadable", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE",
                  "key": "claims", "scope_declarable": False, "claim": f"claims ledger unreadable: {e}"}]
-    text = open(rp).read().split("<!-- harness:")[0]
+    # The writer's own text, all of it: what the harness appends is not in manuscript.md, so no
+    # marker the writer could copy can hide anything.
+    text = open(rp).read()
     out = []
-    for cid in sorted(set(re.findall(r"\[CLAIM:([^\]]*)\]", text))):
+    for cid in sorted(set(re.findall(r"\[CLAIM:([^\]]*)\]", text)) - set(claims)):
         out.append({"kind": "report_claim_unresolved", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE",
                     "key": cid, "scope_declarable": False,
                     "claim": f"The report has [CLAIM:{cid}], which is not in the claims ledger."})
@@ -563,6 +634,28 @@ def report_claim_findings(run_dir: str) -> list[dict]:
             out.append({"kind": "report_claim_id_raw", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE",
                         "key": cid, "scope_declarable": False,
                         "claim": f"The report shows the claim id {cid} instead of its value: write [CLAIM:{cid}]."})
+    # A number typed by the writer (outside [CLAIM:] references): not years, not list or heading
+    # numbering, not digits inside an identifier (D09, DT1, R-004, PfPR2-10).
+    bare = re.sub(r"\[CLAIM:[^\]]*\]", " ", text)
+    bare = re.sub(r"(?m)^\s*(#+\s*)?\d+[.)]\s", " ", bare)
+    # Numbers the owner gave (the signed spec, the question) are facts, not results: allowed.
+    given = set()
+    for src in (os.path.join(run_dir, AB.SPEC_FILE), os.path.join(run_dir, "metadata.json")):
+        try:
+            given |= {g.replace(",", "") for g in re.findall(r"\d[\d,]*(?:\.\d+)?", open(src).read())}
+        except OSError:
+            pass
+    typed = []
+    for m_ in re.finditer(r"(?<![A-Za-z0-9_.\-])\d[\d,]*(?:\.\d+)?%?(?![A-Za-z0-9_\-])", bare):
+        t = m_.group(0).rstrip(",")
+        if re.fullmatch(r"(19|20)\d\d", t) or t.rstrip("%").replace(",", "") in given:
+            continue
+        typed.append(t)
+    if typed:
+        out.append({"kind": "report_number_typed", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE",
+                    "key": "numbers", "scope_declarable": False,
+                    "claim": f"The writer typed {len(typed)} number(s) ({', '.join(typed[:8])}); every number is a "
+                             "[CLAIM:id] the harness renders."})
     return out
 
 
@@ -725,7 +818,8 @@ class Machine:
         out = self.backend.gate_findings(self.run_dir) + spec_signoff_findings(self.run_dir, self.st.signoff, self.backend)
         out += [{"kind": "deliverable_path_invalid", "severity": "HIGH", "stage": "PLAN", "target_stage": "PLAN",
                  "key": "deliverable", "scope_declarable": False, "claim": p} for p in deliverable_problems(self.run_dir)]
-        out += report_claim_findings(self.run_dir)
+        if self.st.v2_rules:
+            out += report_claim_findings(self.run_dir)
         return out
 
     def _signed_ref(self, run_dir: str):
@@ -769,8 +863,13 @@ class Machine:
         return {FL.gate_id(v) for v in self.harness_findings()}
 
     def rebuild(self, run_dir: str) -> dict:
+        """The S1 pipeline, then the report again when a draft exists (a write-up fix edits
+        manuscript.md; its check must read the re-rendered report)."""
         import pipeline as P
-        return P.run(run_dir)
+        rep = P.run(run_dir)
+        if os.path.exists(os.path.join(run_dir, "manuscript.md")):
+            render_report(run_dir, self.backend)
+        return rep
 
     # -------------------------------------------------- one step
     def step(self) -> str:
@@ -942,10 +1041,11 @@ class Machine:
             if d.get("action"):
                 import validate_critique_yaml as V
                 V._append_validator_history(self.run_dir, self.st.round, d, pw)
-            if d.get("rule_matched") == "3m":
-                write_declared(self.run_dir, [o for o in opened if o["id"] in set(d["declared_open"])], d)
+            if self.st.v2_rules and d.get("action") == "DECLARE_SCOPE":
+                # Every DECLARE_SCOPE (rule 3, 3a or 3m) lists what is still open in the write-up.
+                write_declared(self.run_dir, opened, d)
                 if pw and self._has_draft():
-                    render_report(self.run_dir, self.backend)     # the write-up states what is declared
+                    render_report(self.run_dir, self.backend)
         tag = f"gate_r{self.st.round}{'_post' if pw else ''}.json"
         _write_json(self.run_dir, tag, d or {})
         if pw:
@@ -1325,6 +1425,9 @@ def _self_test() -> int:
         d, T, st = new_run("declare", {"critics": {1: {"critique-domain": [nofix]}}}, max_rounds=2)
         s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
         ok(s == "completed_scope_declared", f"T21 an unfixed critic blocker at exhaustion ends scope-declared ({s})")
+        rep21 = open(os.path.join(d, "report.md")).read()
+        ok(os.path.exists(os.path.join(d, DECLARED_FILE)) and "D-009" in rep21 and "Open findings, declared" in rep21,
+           "T46 (Codex #95-5) an ordinary DECLARE_SCOPE (rule 3) also lists what is open in the report")
 
         # T22: the budget, not the gate, ends the run: the harness writes the report.
         d, T, st = new_run("budget", {"critics": {1: {"critique-domain": [nofix]}}, "usd": 30.0}, budget=100.0)
@@ -1600,6 +1703,72 @@ def _self_test() -> int:
         ok(s == "completed_scope_declared" and g1["rule_matched"] == "3m" and "D-011" in rep
            and "Open findings, declared" in rep,
            f"T42b with no rounds left the open MEDIUM is declared, and the report says so ({s}, {g1['rule_matched']})")
+
+        # T43-T51: Codex round 1 on #95 (each failed on a3a31b7).
+        d43 = os.path.join(td, "t43")
+        os.makedirs(d43)
+        g43 = {"action": "ACCEPT", "rigor_violations": [
+            {"kind": "done_when_unmet", "severity": "MEDIUM", "key": "D-001", "claim": "the test fails"},
+            {"kind": "critique_presentation_missing", "severity": "MEDIUM", "claim": "no review"}]}
+        ok({o["id"] for o in open_findings(d43, g43)} == {"done_when_unmet:D-001", "critique_presentation_missing"},
+           "T43 a resolved blocker whose test fails, and a missing presentation review, stay open")
+        fr = os.path.join(td, "t44")
+        os.makedirs(os.path.join(fr, "models"))
+        shutil.copy(os.path.join(FX_DIR, "claims_ledger.yaml"), os.path.join(fr, "models", "claims_ledger.yaml"))
+        yaml.safe_dump({"schema_version": 1, "constraints": {"envelope_usd": 18000000}}, open(os.path.join(fr, AB.SPEC_FILE), "w"))
+        open(os.path.join(fr, "manuscript.md"), "w").write(
+            "1. Within the 18000000 budget for 2026-2028, D09 gets nothing; the plan averts 999,999 cases.\n")
+        k44 = [f for f in report_claim_findings(fr) if f["kind"] == "report_number_typed"]
+        ok(k44 and "999,999" in k44[0]["claim"] and "18000000" not in k44[0]["claim"] and "2026" not in k44[0]["claim"],
+           f"T44 a typed result number is HIGH; the owner's given numbers, years, ids and list numbers are not ({k44[:1]})")
+        open(os.path.join(fr, "manuscript.md"), "w").write("Intro.\n<!-- harness: copied -->\n`headline.point` and [CLAIM:nope].\n")
+        k44b = {f["kind"] for f in report_claim_findings(fr)}
+        ok({"report_claim_id_raw", "report_claim_unresolved"} <= k44b, f"T44b no marker the writer copies hides an id ({k44b})")
+        open(os.path.join(fr, "manuscript.md"), "w").write("Averts [CLAIM:headline.point] cases.\n")
+        open(os.path.join(fr, "report.md"), "w").write("stale [CLAIM:headline.point]\n")
+        m45 = Machine(fr, StubTasks({}), RunState(question="q", state="FIX_LOOP"), backend=spike, log=lambda *a: None)
+        m45.rebuild(fr)
+        ok("Averts 1.3M" in open(os.path.join(fr, "report.md")).read(),
+           "T45 the fix loop's rebuild re-renders the report from the edited draft")
+        fp = os.path.join(td, "t47", "run")
+        os.makedirs(os.path.join(fp, "data"))
+        os.makedirs(os.path.join(td, "t47", "x y"))
+        open(os.path.join(td, "t47", "x y", "units.csv"), "w").write("a\n")
+        open(os.path.join(fp, "data", "targets"), "w").write("t\n")
+        yaml.safe_dump({"decision_units": {"csv": "../x y/units.csv"}, "calibration": {"targets": {"csv": "data/targets"}}},
+                       open(os.path.join(fp, AB.SPEC_FILE), "w"))
+        p47 = record_cited_inputs(fp)
+        prov = json.load(open(os.path.join(fp, PROVENANCE)))
+        ok(any("../x y/units.csv" in x for x in p47) and "data/targets" in prov["cited"],
+           f"T47 a cited path with a space outside the run is refused; a path field without an extension is recorded ({p47})")
+        fq = os.path.join(td, "t48")
+        outside = os.path.join(td, "t48_outside")
+        os.makedirs(os.path.join(fq, "data"))
+        os.makedirs(outside)
+        os.symlink(outside, os.path.join(fq, "data", "inputs"))
+        try:
+            stage_inputs(fq, "Inputs: requirements.txt")
+            raised = False
+        except ValueError:
+            raised = True
+        ok(raised and not os.listdir(outside), "T48 a symlinked data/inputs is refused; nothing is written outside the run")
+        ok(answer_key_path("EVALS/q/rubric.yaml") and answer_key_path("data/_TRUTH/truth.json")
+           and not answer_key_path("data/evals/q/districts.csv"),
+           "T49 the answer-key exclusion is case-insensitive; the questions' public inputs are not excluded")
+        fs = os.path.join(td, "t50")
+        os.makedirs(fs)
+        stage_inputs(fs, "requirements.txt")
+        yaml.safe_dump({"decision_units": {"csv": "data/inputs/requirements.txt"}}, open(os.path.join(fs, AB.SPEC_FILE), "w"))
+        ok(record_cited_inputs(fs) == [], "T50 an untouched staged input passes")
+        open(os.path.join(fs, "data", "inputs", "requirements.txt"), "a").write("tampered\n")
+        ok(any("changed or removed" in x for x in record_cited_inputs(fs)),
+           "T50b a staged input changed after it was copied is refused")
+        open(os.path.join(fr, "manuscript.md"), "w").write("`headline.point`\n")
+        os.remove(os.path.join(fr, STATE_FILE))           # T45's machine left its state here
+        m51 = Machine(fr, StubTasks({}), RunState(question="q", state="GATE", v2_rules=False), backend=spike,
+                      log=lambda *a: None)
+        ok(not any(f["kind"].startswith("report_") for f in m51.harness_findings()),
+           "T51 golden replays (v2_rules off) do not run the v2 report checks")
 
         # T23: a transition outside the table is refused.
         m = _SpikeMachine(os.path.join(td, "ref"), StubTasks({}), None, log=lambda *a: None)

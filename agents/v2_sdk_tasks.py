@@ -26,8 +26,8 @@ OUT = "_task_output.json"
 # Files only the harness writes in a v2 run.
 HARNESS_FILES = ("run_state.json", "findings.jsonl", "impact_ledger.jsonl", "metadata.json", "final_gate.json",
                  "decision_spec.signoff.json", "engine_choice.json", "validator_history.jsonl", "done_when_registry.json",
-                 "report.md", "allocation_optimized.csv")
-HARNESS_PREFIXES = ("analysis/", "models/pipeline", "gate_r", "fix_plan_r", "evidence/")
+                 "report.md", "allocation_optimized.csv", "data/inputs_provenance.json", "declared_findings.yaml")
+HARNESS_PREFIXES = ("analysis/", "models/pipeline", "gate_r", "fix_plan_r", "evidence/", "data/inputs/")
 
 COMMON = """You are one bounded task inside a modeling run driven by code (a state machine). The harness
 computes every number from the decision spec and the engine; you never type a number the report
@@ -105,11 +105,50 @@ OWNS = {"draft_spec": ("decision_spec.yaml", "analysis_settings.yaml", "data/"),
 def _answer_key(target: str, run_dir: str) -> bool:
     """A path into the repository's evals/ tree or any _truth directory. data/evals/<q>/ (the
     questions' public inputs) is readable."""
-    if "_truth" in target.replace("\\", "/").split("/"):
+    low = target.replace("\\", "/").lower()
+    if "_truth" in low.split("/"):
         return True
     p = os.path.realpath(os.path.join(run_dir, os.path.expanduser(target)))
-    rel = os.path.relpath(p, enforcement.REPO_ROOT).replace(os.sep, "/")
-    return rel == "evals" or rel.startswith("evals/") or target.replace("\\", "/").lstrip("./").startswith("evals/")
+    rel = os.path.relpath(p, enforcement.REPO_ROOT).replace(os.sep, "/").lower()   # case-insensitive filesystems
+    return rel == "evals" or rel.startswith("evals/") or low.lstrip("./").startswith("evals/")
+
+
+def _within(p: str, root: str) -> bool:
+    p, root = os.path.normcase(p).lower(), os.path.normcase(root).lower()   # case-insensitive filesystems
+    return p == root or p.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def _search_denied(tool: str, ti: dict, run_dir: str) -> str | None:
+    """Why a Read, Grep or Glob may not run. A path or pattern naming the evaluation tree is refused;
+    so is any search whose root contains the repository's evals/ tree (a Grep at the repository root
+    reaches evals/**/_truth whatever its pattern), unless the search is confined to the run directory
+    or data/."""
+    import glob as _glob
+    target = str(ti.get("file_path") or ti.get("path") or "")
+    pattern = str(ti.get("pattern") or ti.get("glob") or "")
+    if (target and _answer_key(target, run_dir)) or (pattern and _answer_key(pattern, run_dir)):
+        return "evaluation answer keys are not readable"
+    if tool == "Read":
+        return None
+    base = os.path.realpath(os.path.join(run_dir, os.path.expanduser(target))) if target else os.path.realpath(run_dir)
+    if tool == "Glob" and pattern:
+        # A pattern can climb or be absolute: its literal prefix is part of the search root.
+        lit = []
+        for part in pattern.replace("\\", "/").split("/"):
+            if _glob.has_magic(part):
+                break
+            lit.append(part)
+        prefix = "/".join(lit)
+        if prefix:
+            base = os.path.realpath(os.path.join(base, prefix) if not pattern.startswith("/") else "/" + prefix.lstrip("/"))
+    repo = os.path.realpath(enforcement.REPO_ROOT)
+    evals = os.path.join(repo, "evals")
+    if _within(base, os.path.realpath(run_dir)) or _within(base, os.path.join(repo, "data")):
+        return None
+    if _within(evals, base):
+        return (f"{tool} from {base} would search the evaluation tree (evals/); confine it to the run directory "
+                "or data/")
+    return None
 
 
 def _allowed(path: str, run_dir: str, owns: tuple) -> str | None:
@@ -196,9 +235,9 @@ class SdkTasks:
                 if why:
                     return enforcement.deny_output(f"{kind}: {why}")
             if name in ("Read", "Grep", "Glob"):
-                tgt = str(ti.get("file_path") or ti.get("path") or ti.get("pattern") or "")
-                if _answer_key(tgt, self.run_dir):
-                    return enforcement.deny_output("evaluation answer keys are not readable")
+                why = _search_denied(name, ti, self.run_dir)
+                if why:
+                    return enforcement.deny_output(why)
             return {}
 
         opts = ClaudeAgentOptions(system_prompt=system, model=model or enforcement.MODEL_DEEP, tools=TOOLS,
@@ -375,6 +414,25 @@ def _self_test() -> int:
            and _answer_key(os.path.join(R, "evals", "q", "rubric.yaml"), d) and _answer_key("x/_truth/truth.json", d)
            and _answer_key("evals/q/generate.py", d),
            "S9 the questions' public inputs (data/evals/) are readable; evals/ and _truth are not")
+        ok(_answer_key(os.path.join(R, "EVALS", "q", "rubric.yaml"), d) and _answer_key("data/_TRUTH/t.json", d)
+           and _allowed("data/inputs/x.csv", d, ("data/",)) and _allowed("data/inputs_provenance.json", d, ("data/",))
+           and _allowed("data/units.csv", d, ("data/",)) is None,
+           "S12 (Codex #95) answer keys refused in any case; the staged inputs and their manifest are the harness's")
+        # S13: a search whose root contains the repository's evals/ tree is refused (a Grep at the repo
+        # root reaches evals/**/_truth whatever its pattern); one confined to the run or data/ is not.
+        rd = os.path.join(R, "runs", "x")
+        cases = {
+            "grep repo root": (("Grep", {"path": R, "pattern": "optimum"}), True),
+            "glob repo root": (("Glob", {"path": R, "pattern": "**/truth.json"}), True),
+            "glob climbing pattern": (("Glob", {"pattern": "../../**/truth.json"}), True),
+            "grep above the repo": (("Grep", {"path": os.path.dirname(R), "pattern": "x"}), True),
+            "grep run dir": (("Grep", {"path": rd, "pattern": "optimum"}), False),
+            "grep default (run dir)": (("Grep", {"pattern": "optimum"}), False),
+            "glob data/": (("Glob", {"path": os.path.join(R, "data"), "pattern": "**/*.csv"}), False),
+            "read a data file": (("Read", {"file_path": os.path.join(R, "data", "evals", "q", "a.csv")}), False),
+        }
+        got = {k: bool(_search_denied(t, ti, rd)) == want for k, ((t, ti), want) in cases.items()}
+        ok(all(got.values()), f"S13 searches that reach evals/ are refused, confined ones are not {got}")
         import validate_critique_yaml as V
         cp = PROMPTS["critique"].format(reviewer="critique-domain", round=1, file="f", prefix="D", out=OUT,
                                         feedback="\n- X", severities="H", categories=" | ".join(sorted(V.VALID_CATEGORY)),
