@@ -603,7 +603,9 @@ The validator has already decided for you. Your job is to carry it out:
   map in `.claude/orchestration/scope_declaration_policy.yaml`). Only the
   owner may accept it. Do not spawn the writer. In owner mode end your
   turn with AWAITING_SIGNOFF; you are resumed with the answers. In lead
-  mode review `scripts/scope_signoff.py show` and sign with `--by lead`.
+  mode review `scripts/scope_signoff.py show`, write your answers to
+  `scope_signoff_answers.yaml` and end your turn with AWAITING_SIGNOFF;
+  the harness signs them. Agents never run `scope_signoff.py sign`.
   Then re-run the gate: an accepted declaration stands (state the
   owner's acceptance in Limitations); a declined one must be fixed.
 

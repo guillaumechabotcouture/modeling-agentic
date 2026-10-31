@@ -610,7 +610,8 @@ def _recompute_action(d: dict, max_rounds: int, current_round: int,
             f"primary decision ({', '.join(str((b.get('owner_item') or {}).get('finding') or b.get('kind')) for b in owner)[:300]}). "
             f"The owner decides: the gate wrote scope_signoff_request.json. Do not spawn the writer. Owner mode: end "
             f"your turn with the line AWAITING_SIGNOFF; the harness resumes you with the answers. Lead mode: review "
-            f"`python3 scripts/scope_signoff.py show {{run_dir}}`, then sign with `--by lead`.")
+            f"`python3 scripts/scope_signoff.py show {{run_dir}}`, write scope_signoff_answers.yaml and end your turn with "
+            f"AWAITING_SIGNOFF; the harness signs.")
         rule_matched = f"{rule_matched}o"
 
     d["rounds_remaining"] = rounds_remaining

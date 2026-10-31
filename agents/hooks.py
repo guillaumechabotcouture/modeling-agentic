@@ -346,8 +346,9 @@ def scope_hold_reason(run_path: str, mode: str | None, run_dir_rel: str = "{run_
                 "wait for the owner (scope_signoff_request.json). Do not spawn the writer. End your turn now with the "
                 "line AWAITING_SIGNOFF; the harness resumes you with the owner's answers.")
     return (f"The gate's decision is AWAIT_OWNER. Review `python3 scripts/scope_signoff.py show {run_dir_rel}` (each "
-            "finding, its declaration and decision test), then sign: python3 scripts/scope_signoff.py sign "
-            f"{run_dir_rel} --by lead --answers <finding: accept|decline> --note \"<why>\" (or --accept-all), and re-run the gate.")
+            f"finding, its declaration and decision test), write {run_dir_rel}/{scope_signoff.LEAD_ANSWERS} (one line "
+            "per finding: `\"<finding>\": {decision: accept|decline, note: <why>}`), then end your turn with the line "
+            "AWAITING_SIGNOFF; the harness signs your answers and resumes you.")
 
 
 def create_hooks(run_path: str, trace_file, start_time: datetime,
@@ -423,9 +424,9 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
         if (not deny_reason and signoff == "owner" and tool_name == "Bash"
                 and re.search(r"decision_brief\.py\b.*\bsign\b", str(tool_input.get("command") or ""), re.S)):
             deny_reason = "The owner signs the decision brief in this run; agents cannot sign it."
-        if (not deny_reason and signoff == "owner" and tool_name == "Bash"
+        if (not deny_reason and signoff in ("owner", "lead") and tool_name == "Bash"
                 and re.search(r"scope_signoff\.py\b.*\bsign\b", str(tool_input.get("command") or ""), re.S)):
-            deny_reason = "The owner signs scope declarations in this run; agents cannot sign them."   # Phase 49 β
+            deny_reason = "Agents cannot sign scope declarations (the harness records the answers)."   # Phase 49 β
         if not deny_reason and spawn and sub == "writer":
             deny_reason = scope_hold_reason(run_path, signoff, run_path)   # Phase 49 β
         if not deny_reason and spawn:

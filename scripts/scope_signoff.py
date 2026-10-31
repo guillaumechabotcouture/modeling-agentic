@@ -32,8 +32,13 @@ How it runs
   `sign` from the owner's shell, or `cloud/run_cluster.py <config> sign`), then
   resumes the lead with the answers, like the decision-brief sign-off. A wait
   that times out ends the run `awaiting_scope_signoff` (resumable, exit 2).
-* `--signoff lead` (smokes): the lead reviews and signs with `--by lead`; the
-  record says the lead signed.
+* `--signoff lead` (smokes): the lead reviews and writes its answers to
+  `scope_signoff_answers.yaml`; the harness signs them `by: lead`.
+* Only the harness records an answer (`harness_record`, from main.py, after the
+  owner signed outside the agent session): the ledger holds the answer's hash
+  under a nonce the harness also writes to trace.jsonl. An answer without that
+  record does not count, so a signature an agent wrote is not an approval; no
+  script an agent runs is credited with writing it (agents/integrity.py).
 * `--signoff none`: no sign-off is asked for; the findings are declarable as
   before (the decision test of Phase 49 α still applies).
 * An accepted finding is declarable again (its α decision test is replaced by
@@ -66,6 +71,13 @@ if HERE not in sys.path:
 from lib import scope_declarations as sd  # noqa: E402
 
 REQUEST, SIGNOFF, MD = "scope_signoff_request.json", "scope_signoff.json", "scope_signoff.md"
+# Codex review (#85): the harness's record of each answer it received from outside the agent
+# session (the owner's CLI or `cloud/run_cluster.py sign`), and the lead's answers file under
+# --signoff lead. Agents never write the signature or the ledger: no script run by an agent is
+# credited with them (agents/integrity.py), and an answer counts only when the ledger records
+# its hash under a nonce the harness also wrote to trace.jsonl.
+LEDGER, LEAD_ANSWERS, TRACE = "scope_signoff_ledger.json", "scope_signoff_answers.yaml", "trace.jsonl"
+MAX_SIGNOFF_WAITS = 20
 DECLINED, INVALID = "scope_declaration_declined", "scope_signoff_invalid"
 POLICY = os.path.join(os.path.dirname(HERE), ".claude", "orchestration", "scope_declaration_policy.yaml")
 CONDITIONS = ("allocation", "benchmark_intervention", "always")
@@ -195,7 +207,7 @@ def _file_sha(run_dir: str, rel) -> Optional[str]:
         return None
 
 
-def build_item(run_dir: str, v: dict, reason: str, entries: list[dict]) -> dict:
+def build_item(run_dir: str, v: dict, reason: str, entries: list[dict], evidence: Optional[str] = None) -> dict:
     """What the owner is shown for one finding, with its fingerprint."""
     dt = _dt_mod()
     ident = dt._ident(v)
@@ -213,7 +225,11 @@ def build_item(run_dir: str, v: dict, reason: str, entries: list[dict]) -> dict:
             t["detail"] = detail
         decls.append({"id": str(e.get("id") or ""), "test": t,
                       "text": {f: str(e.get(f))[:1200] for f in sd.JUSTIFICATION_FIELDS if e.get(f)}})
-    fp = hashlib.sha256(json.dumps({"finding": ident, "entries": sorted(cover, key=lambda e: str(e.get("id"))),
+    # Codex review (#85): the evidence is part of what the owner approves. The finding's own
+    # result (its claim: observed values, metrics; for a persistence escalation the base
+    # finding's), each declaration and the decision-test files' contents.
+    fp = hashlib.sha256(json.dumps({"finding": ident, "evidence": " ".join(str(evidence or v.get("claim") or "").split()),
+                                    "entries": sorted(cover, key=lambda e: str(e.get("id"))),
                                     "tests": tests}, sort_keys=True, default=str).encode()).hexdigest()[:16]
     return {"finding": ident, "kind": v.get("kind"), "reason": reason, "claim": str(v.get("claim") or "")[:600],
             "declarations": decls, "declared": bool(cover), "fingerprint": fp}
@@ -243,6 +259,85 @@ def load_answers(run_dir: str) -> tuple[dict, list[dict]]:
     return ans, []
 
 
+def _answer_sha(a: dict) -> str:
+    return hashlib.sha256(json.dumps(a, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _trace_nonces(run_dir: str) -> set:
+    out = set()
+    try:
+        with open(os.path.join(run_dir, TRACE), encoding="utf-8") as f:
+            for line in f:
+                if '"scope_signoff_recorded"' in line:
+                    try:
+                        out.add(json.loads(line).get("nonce"))
+                    except ValueError:
+                        continue
+    except (OSError, UnicodeDecodeError):
+        pass
+    return out
+
+
+def verified_answers(run_dir: str) -> tuple[dict, list[dict]]:
+    """({fingerprint: answer}) for the answers the harness recorded: the ledger holds
+    the answer's hash under a nonce that trace.jsonl also holds. Findings for an
+    unreadable signature or ledger (fail closed: nothing counts)."""
+    answers, bad = load_answers(run_dir)
+    if bad or not answers:
+        return {}, bad
+    p = os.path.join(run_dir, LEDGER)
+    if not os.path.exists(p):
+        return {}, []
+    try:
+        with open(p, encoding="utf-8") as f:
+            led = json.load(f).get("entries")
+        if not isinstance(led, dict):
+            raise ValueError("`entries` must be a mapping")
+    except (OSError, UnicodeDecodeError, ValueError, AttributeError) as e:
+        return {}, [{"kind": INVALID, "severity": "HIGH", "stage": "GATE", "target_stage": "GATE",
+                     "scope_declarable": False,
+                     "claim": f"{LEDGER} cannot be read ({str(e)[:160]}); no owner answer counts. Only the harness "
+                              f"writes it, when it receives the owner's answers."}]
+    nonces = _trace_nonces(run_dir)
+    return {fp: a for fp, a in answers.items()
+            if isinstance(led.get(fp), dict) and led[fp].get("sha256") == _answer_sha(a)
+            and led[fp].get("nonce") in nonces}, []
+
+
+def harness_record(run_dir: str) -> str:
+    """The harness (main.py), never an agent: record the answers now in scope_signoff.json
+    in the ledger, under a fresh nonce also written to trace.jsonl. Returns the nonce."""
+    import secrets
+    answers, bad = load_answers(run_dir)
+    if bad:
+        raise ValueError(bad[0]["claim"])
+    p = os.path.join(run_dir, LEDGER)
+    try:
+        with open(p, encoding="utf-8") as f:
+            led = json.load(f).get("entries") or {}
+    except (OSError, ValueError, AttributeError):
+        led = {}
+    nonce = secrets.token_hex(16)
+    now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    for fp, a in answers.items():
+        if not (isinstance(led.get(fp), dict) and led[fp].get("sha256") == _answer_sha(a)):
+            led[fp] = {"sha256": _answer_sha(a), "nonce": nonce, "by": a.get("by"), "recorded_at": now}
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump({"entries": led, "producer": "main.py"}, f, indent=1)
+    with open(os.path.join(run_dir, TRACE), "a", encoding="utf-8") as f:
+        f.write(json.dumps({"ts": now, "type": "scope_signoff_recorded", "nonce": nonce}) + "\n")
+    return nonce
+
+
+def lead_answers(run_dir: str) -> Optional[dict]:
+    """--signoff lead: the lead's answers file (finding -> accept|decline), or None."""
+    try:
+        doc = _read_yaml(run_dir, LEAD_ANSWERS)
+    except (OSError, UnicodeDecodeError, ValueError, yaml.YAMLError):
+        return None
+    return doc if isinstance(doc, dict) and doc else None
+
+
 def gate_findings(run_dir: str, round_n: Optional[int] = None, current: Optional[list] = None,
                   non_declarable: Callable[[str, object], bool] = lambda k, e: e is False) -> list[dict]:
     """Mark each decision-bearing HIGH finding of `current` for the owner (in
@@ -252,7 +347,7 @@ def gate_findings(run_dir: str, round_n: Optional[int] = None, current: Optional
         return []
     cfg = load_map()
     dt = _dt_mod()
-    answers, out = load_answers(run_dir)
+    answers, out = verified_answers(run_dir)
     _doc, entries, problems = sd.load(run_dir)
     if problems:
         entries = []
@@ -265,7 +360,9 @@ def gate_findings(run_dir: str, round_n: Optional[int] = None, current: Optional
         reason = bears(run_dir, v, cfg, ctx)
         if not reason:
             continue
-        item = build_item(run_dir, v, reason, entries)
+        base = [x for x in current or [] if isinstance(x, dict) and str(v.get("kind")).endswith("_persistent")
+                and x.get("kind") == str(v.get("kind"))[:-len("_persistent")]]
+        item = build_item(run_dir, v, reason, entries, evidence=base[0].get("claim") if base else None)
         if item["finding"] in seen:
             continue
         seen.add(item["finding"])
@@ -318,12 +415,13 @@ def _load_request(run_dir: str) -> Optional[dict]:
         return None
 
 
-def status(run_dir: str) -> str:
-    """none (nothing asked) | awaiting | answered."""
+def status(run_dir: str, verified: bool = True) -> str:
+    """none (nothing asked) | awaiting | answered. verified=False: answers written but not
+    yet recorded by the harness (what the harness's wait looks for)."""
     req = _load_request(run_dir)
     if not req or not req.get("pending"):
         return "none"
-    answers, bad = load_answers(run_dir)
+    answers, bad = verified_answers(run_dir) if verified else load_answers(run_dir)
     if bad:
         return "awaiting"
     mode = os.environ.get("MA_SIGNOFF_MODE")
@@ -412,7 +510,7 @@ def sign(run_dir: str, by: str, answers: Optional[dict] = None, all_decision: Op
 def answer_text(run_dir: str) -> str:
     """What the lead is told after the sign-off."""
     req = _load_request(run_dir) or {}
-    answers, _ = load_answers(run_dir)
+    answers, _ = verified_answers(run_dir)
     lines = []
     for it in req.get("items") or []:
         a = answers.get(it.get("fingerprint")) or {}
@@ -521,12 +619,35 @@ def _self_test() -> int:
                 ok(True, "SO12 an item without an answer is refused")
             sign(d, "owner", {"allocation_unstable:allocation_robustness": "decline",
                               "benchmark_drift:B15": {"decision": "accept", "note": "IRS is out either way"}})
-            ok(status(d) == "answered", "SO13 answered once every item has an owner answer")
+            # SO23 (Codex P1): a signature file the harness has not recorded is not an owner answer.
+            c = cur()
+            gate_findings(d, 6, c)
+            ok(c[1].get("owner_signoff") and not c[1].get("owner_signed") and status(d) == "awaiting"
+               and status(d, verified=False) == "answered",
+               "SO23 an unrecorded signature (an agent could have written it) does not count")
+            before = {f: open(os.path.join(d, f)).read() for f in (REQUEST, SIGNOFF)}
+            import contextlib
+            import io
+            with contextlib.redirect_stdout(io.StringIO()):
+                main(["show", d])
+            ok({f: open(os.path.join(d, f)).read() for f in (REQUEST, SIGNOFF)} == before
+               and not os.path.exists(os.path.join(d, LEDGER)), "SO23b `show` writes nothing")
+            harness_record(d)
+            ok(status(d) == "answered", "SO13 answered once every item has a recorded owner answer")
             c = cur()
             f = gate_findings(d, 7, c)
             ok([x["kind"] for x in f] == [DECLINED] and c[1].get("owner_signed") and not c[1].get("owner_signoff")
                and not c[0].get("owner_signoff"), f"SO14 declined -> HIGH, accepted -> declarable: {f}")
             ok("decline by owner" in answer_text(d) and "Re-run" in answer_text(d), "SO15 the lead's resume text")
+            # SO24 (Codex P1): changed evidence (the finding's result) is asked again.
+            c = cur()
+            c[1]["claim"] = "B15 drift: observed 0.57"
+            gate_findings(d, 7, c)
+            c2 = cur()
+            c2[1]["claim"] = "B15 drift: observed 0.99"
+            gate_findings(d, 7, c2)
+            ok(c[1]["owner_item"]["fingerprint"] != c2[1]["owner_item"]["fingerprint"],
+               "SO24 the fingerprint covers the finding's evidence (0.57 -> 0.99 is a new item)")
             # A changed declaration is asked again.
             w(d, "models/decision_tests/b15.yaml", {"finding": "B15", "varied": "interaction OR at 2.0",
                                                     "criterion": "c", "decision_changes": False,
@@ -537,6 +658,7 @@ def _self_test() -> int:
             # Lead signatures count only in lead mode.
             record(d, {"action": ACTION, "unresolved_high": [{"owner_signoff": True, "owner_item": c[1]["owner_item"]}]}, 7)
             sign(d, "lead", all_decision="accept")
+            harness_record(d)
             c2 = cur()
             gate_findings(d, 7, c2)
             ok(c2[1].get("owner_signoff"), "SO17 a lead signature does not count in owner mode")
@@ -579,7 +701,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", nargs="?", choices=["show", "status", "sign"])
     ap.add_argument("run_dir", nargs="?")
-    ap.add_argument("--by", default="owner", choices=["owner", "lead"])
+    ap.add_argument("--by", default="owner", choices=["owner"])
     ap.add_argument("--answers", help="YAML mapping finding -> accept|decline (or {decision, note})")
     ap.add_argument("--accept-all", action="store_true")
     ap.add_argument("--decline-all", action="store_true")
@@ -597,10 +719,11 @@ def main(argv=None) -> int:
     if a.cmd == "status":
         print(status(a.run_dir))
         return 0
-    mode = os.environ.get("MA_SIGNOFF_MODE")
-    if mode == "owner" or (a.by != "owner" and mode != "lead"):
+    if os.environ.get("MA_SIGNOFF_MODE"):
         # Set only in the agents' environment (main.py): the owner signs from a shell of their own.
-        print("This run needs the owner's sign-off; agents cannot sign it.", file=sys.stderr)
+        # Under --signoff lead the lead writes scope_signoff_answers.yaml and the harness signs.
+        print("Agents cannot sign scope declarations. Owner: sign from your own shell. Lead (--signoff lead): "
+              f"write {LEAD_ANSWERS} and end your turn with AWAITING_SIGNOFF.", file=sys.stderr)
         return 1
     try:
         answers = yaml.safe_load(open(a.answers, encoding="utf-8")) if a.answers else None

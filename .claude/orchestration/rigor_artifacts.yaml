@@ -611,8 +611,10 @@ artifacts:
       finding that bears on the primary decision (map:
       `scope_declaration_policy.yaml` `decision_bearing:`) cannot be declared
       by the lead alone. The gate writes `scope_signoff_request.json`; the
-      owner (or, under `--signoff lead`, the lead with `--by lead`) answers
-      each finding with `scripts/scope_signoff.py sign` (accept | decline).
+      owner answers each finding (accept | decline) with
+      `scripts/scope_signoff.py sign` from their own shell; under `--signoff
+      lead` the lead writes `scope_signoff_answers.yaml` and the harness signs.
+      An answer counts only once the harness has recorded it.
       The owner reads each declaration's decision test (entry
       `decision_tests`), or that it has none. Accepted: declarable. Declined:
       HIGH `scope_declaration_declined`, fix it. A changed declaration or test

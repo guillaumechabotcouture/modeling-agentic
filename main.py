@@ -288,9 +288,12 @@ async def wait_for_scope_signoff(run_path: str, run_dir_rel: str, hours: float, 
                              "what": "scope_declarations"}) + "\n")
     deadline = time.time() + hours * 3600
     while time.time() < deadline:
-        if scope_signoff.status(run_path) == "answered":
-            if integrity is not None:   # the owner signed outside any tool call
+        if scope_signoff.status(run_path, verified=False) == "answered":
+            # The owner signed outside the agent session: the harness records it (Codex review).
+            scope_signoff.harness_record(run_path)
+            if integrity is not None:
                 integrity.harness_wrote(scope_signoff.SIGNOFF)
+                integrity.harness_wrote(scope_signoff.LEDGER)
             with open(os.path.join(run_path, "trace.jsonl"), "a") as tf:
                 tf.write(json.dumps({"ts": datetime.now().isoformat(), "type": "signed_off",
                                      "what": "scope_declarations"}) + "\n")
@@ -298,6 +301,18 @@ async def wait_for_scope_signoff(run_path: str, run_dir_rel: str, hours: float, 
             return True
         await asyncio.sleep(poll_s)
     return scope_signoff.status(run_path) == "answered"
+
+
+def session_slot_refusal(session_num: int, signoff_waits: int, max_sessions: int) -> str | None:
+    """Why session `session_num` may not start, or None. Sign-off waits do not use up
+    sessions (Codex review: the old `range(1, max_sessions + 2)` ran out after two
+    waits), and have their own cap."""
+    import scope_signoff
+    if signoff_waits > scope_signoff.MAX_SIGNOFF_WAITS:
+        return f"more than {scope_signoff.MAX_SIGNOFF_WAITS} sign-off waits"
+    if session_num - signoff_waits > max_sessions:
+        return "max_sessions reached"
+    return None
 
 
 def write_harness_baseline(run_path: str) -> tuple[dict, dict | None]:
@@ -435,8 +450,10 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                 "reserve": writeup_reserve(max_budget_usd)}
 
     try:
-        for session_num in range(1, max_sessions + 2):
-            if session_num - signoff_waits > max_sessions:
+        session_num = 0
+        while True:
+            session_num += 1
+            if session_slot_refusal(session_num, signoff_waits, max_sessions):
                 session_outcome = "max_sessions_reached"
                 break
             live_state.session = session_num
@@ -557,6 +574,22 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                         break
                     signoff_waits += 1
                     lead_prompt = SCOPE_SIGNOFF_PROMPT.format(text=scope_signoff.answer_text(run_path))
+                    continue
+                if (signoff == "lead" and scope_signoff.status(run_path) == "awaiting"
+                        and scope_signoff.lead_answers(run_path)):
+                    # Phase 49 β: --signoff lead; the harness signs the lead's answers file.
+                    try:
+                        scope_signoff.sign(run_path, "lead", scope_signoff.lead_answers(run_path))
+                        scope_signoff.harness_record(run_path)
+                        if integrity is not None:
+                            integrity.harness_wrote(scope_signoff.SIGNOFF)
+                            integrity.harness_wrote(scope_signoff.LEDGER)
+                        text = scope_signoff.answer_text(run_path)
+                    except ValueError as e:
+                        text = (f"Your {scope_signoff.LEAD_ANSWERS} was not signed: {e}. Fix it and end your turn "
+                                "with AWAITING_SIGNOFF again.")
+                    signoff_waits += 1
+                    lead_prompt = SCOPE_SIGNOFF_PROMPT.format(text=text)
                     continue
                 where = pipeline_unfinished(run_path)
                 if where and session_num - signoff_waits < max_sessions:
@@ -1115,13 +1148,14 @@ def _run_self_test() -> int:
                  "declarations": [], "claim": "UNSTABLE"}
         _ss.record(td, {"action": "AWAIT_OWNER", "unresolved_high": [{"owner_signoff": True, "owner_item": _item}]}, 7)
         ok("AWAITING_SIGNOFF" in (scope_hold_reason(td, "owner") or "")
-           and "--by lead" in (scope_hold_reason(td, "lead") or "") and scope_hold_reason(td, None) is None
+           and _ss.LEAD_ANSWERS in (scope_hold_reason(td, "lead") or "") and scope_hold_reason(td, None) is None
            and "AWAITING_SIGNOFF" in call5("Agent", {"subagent_type": "writer", "prompt": "x"})
-           and "agents cannot sign" in call5("Bash", {"command": f"python3 scripts/scope_signoff.py sign {td} --accept-all"}),
+           and "Agents cannot sign" in call5("Bash", {"command": f"python3 scripts/scope_signoff.py sign {td} --accept-all"}),
            "SS2 a pending request holds the writer; in owner mode no agent signs")
         ok(asyncio.run(wait_for_scope_signoff(td, "runs/x", hours=0.00001, poll_s=0.01)) is False
            and os.path.exists(os.path.join(td, _ss.MD)), "SS3 an unanswered wait times out; the owner's page is written")
         _ss.sign(td, "owner", all_decision="accept")
+        ok(scope_hold_reason(td, "owner") is not None, "SS3b a signature the harness has not recorded holds")
         ok(asyncio.run(wait_for_scope_signoff(td, "runs/x", hours=1, poll_s=0.01)) is True
            and scope_hold_reason(td, "owner") is None and "accept by owner" in _ss.answer_text(td),
            "SS4 answered: the wait ends, the writer is released, the lead is told")
@@ -1132,7 +1166,23 @@ def _run_self_test() -> int:
            "SS5 final AWAIT_OWNER and an owner decline have their own statuses")
         ok(exit_code_for("awaiting_scope_signoff") == 2 and exit_code_for("completed_scope_declined") == 2,
            "SS6 both exit 2")
-        for f in (_ss.REQUEST, _ss.SIGNOFF, _ss.MD):
+        # SS7 (Codex P1): --max-sessions 1 with a brief wait and a scope wait: the lead still gets
+        # the session that carries the scope answers (sessions run = 3, waits = 2).
+        _seen, _waits, _n = [], 0, 0
+        while True:
+            _n += 1
+            _why = session_slot_refusal(_n, _waits, 1)
+            if _why:
+                break
+            _seen.append(_n)
+            if _n in (1, 2):
+                _waits += 1          # session 1 ends for the brief, session 2 for the scope sign-off
+        ok(_seen == [1, 2, 3] and "max_sessions" in _why, f"SS7 two sign-off waits do not use up sessions: {_seen}")
+        ok("sign-off waits" in (session_slot_refusal(30, 25, 5) or ""), "SS7b the waits have their own cap")
+        from agents.integrity import SCRIPT_PRODUCES as _SP
+        ok(not any(_ss.SIGNOFF in outs or _ss.LEDGER in outs for outs in _SP.values()),
+           "SS8 no harness script run by an agent may write the signature or its ledger")
+        for f in (_ss.REQUEST, _ss.SIGNOFF, _ss.MD, _ss.LEDGER):
             if os.path.exists(os.path.join(td, f)):
                 os.remove(os.path.join(td, f))
         for f in ("success_criteria.yaml", "decision_brief.yaml", "decision_brief.signoff.json", "decision_brief.md"):
