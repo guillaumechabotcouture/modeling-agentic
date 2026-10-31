@@ -1,0 +1,468 @@
+benchmarks:
+- id: B7
+  metric: ITN (pyrethroid) vs none, prevalence RR at 12 m
+  role: fit
+  target: 0.83
+  band:
+  - 0.68
+  - 0.98
+  source: C21 Pryce 2018 Cochrane CD000363.pub3
+  computed: 0.7349
+  per_seed:
+  - 0.7303
+  - 0.7097
+  - 0.7433
+  - 0.7458
+  - 0.7403
+  - 0.7487
+  - 0.7203
+  - 0.7418
+  se_log: 0.0067
+  in_band: true
+- id: B8
+  metric: ITN vs none, clinical incidence RR 0-24 m (under 5)
+  role: fit
+  target: 0.55
+  band:
+  - 0.46
+  - 0.64
+  source: C22 Pryce 2018
+  computed: 0.578
+  per_seed:
+  - 0.5772
+  - 0.5922
+  - 0.5964
+  - 0.5701
+  - 0.5743
+  - 0.5539
+  - 0.5725
+  - 0.5887
+  se_log: 0.0085
+  in_band: true
+- id: B9
+  metric: PBO vs pyrethroid nets, prevalence OR at 9 m (pooled over IRS arms)
+  role: fit
+  target: 0.37
+  band:
+  - 0.09
+  - 0.65
+  source: C15 Protopopoff 2018 Lancet
+  computed: 0.7985
+  per_seed:
+  - 0.796
+  - 0.7837
+  - 0.8003
+  - 0.825
+  - 0.7958
+  - 0.8045
+  - 0.7932
+  - 0.7904
+  se_log: 0.0054
+  in_band: false
+- id: B9b
+  metric: PBO vs pyrethroid nets, prevalence OR at 21 m (pooled over IRS arms)
+  role: held_out
+  target: 0.4
+  band:
+  - 0.2
+  - 0.81
+  source: C15 Protopopoff 2018 (added held-out durability check)
+  computed: 0.9534
+  per_seed:
+  - 0.9202
+  - 0.9713
+  - 0.9898
+  - 0.9433
+  - 0.9845
+  - 0.95
+  - 0.9111
+  - 0.9599
+  se_log: 0.0106
+  in_band: false
+- id: B9c
+  metric: PBO vs pyrethroid nets, prevalence aOR at 24 m (Misungwi)
+  role: held_out
+  target: 0.99
+  band:
+  - 0.67
+  - 1.45
+  source: C17 Mosha 2022 Lancet (added held-out durability check)
+  computed: 0.9931
+  per_seed:
+  - 1.0028
+  - 0.9356
+  - 0.9649
+  - 0.9972
+  - 1.0031
+  - 1.0074
+  - 1.0157
+  - 1.0206
+  se_log: 0.0104
+  in_band: true
+- id: B10
+  metric: Dual-AI vs pyrethroid nets, prevalence OR at 24 m
+  role: fit
+  target: 0.45
+  band:
+  - 0.23
+  - 0.67
+  source: C17 Mosha 2022
+  computed: 0.6876
+  per_seed:
+  - 0.7087
+  - 0.7242
+  - 0.6657
+  - 0.6314
+  - 0.692
+  - 0.6436
+  - 0.7264
+  - 0.7156
+  se_log: 0.0193
+  in_band: false
+- id: B11
+  metric: Dual-AI vs pyrethroid nets, incidence RR 0-24 m
+  role: fit
+  target: 0.54
+  band:
+  - 0.38
+  - 0.7
+  source: C20 Accrombessi 2023 Lancet
+  computed: 0.4015
+  per_seed:
+  - 0.4674
+  - 0.3823
+  - 0.398
+  - 0.3923
+  - 0.3998
+  - 0.3794
+  - 0.3981
+  - 0.4007
+  se_log: 0.0229
+  in_band: true
+- id: B12
+  metric: Non-pyrethroid IRS added to ITN, prevalence RR at 12 m
+  role: fit
+  target: 0.61
+  band:
+  - 0.34
+  - 0.88
+  source: C23 Pryce 2022 Cochrane CD012688.pub3
+  computed: 0.8778
+  per_seed:
+  - 0.8982
+  - 0.8512
+  - 0.8742
+  - 0.8764
+  - 0.9008
+  - 0.8692
+  - 0.8781
+  - 0.875
+  se_log: 0.0064
+  in_band: true
+- id: B12b
+  metric: Non-pyrethroid IRS added to ITN, incidence RR 0-24 m
+  role: fit
+  target: 0.86
+  band:
+  - 0.49
+  - 1.23
+  source: C23 Pryce 2022
+  computed: 0.7459
+  per_seed:
+  - 0.756
+  - 0.7173
+  - 0.7483
+  - 0.7586
+  - 0.7402
+  - 0.7605
+  - 0.7566
+  - 0.7308
+  se_log: 0.0074
+  in_band: true
+- id: B13
+  metric: SMC, in-season clinical incidence RR (3-59 m)
+  role: held_out
+  target: 0.27
+  band:
+  - 0.14
+  - 0.4
+  source: C27 Thwing 2024 AJTMH
+  computed: 0.3461
+  per_seed:
+  - 0.342
+  - 0.3457
+  - 0.3304
+  - 0.3487
+  - 0.3714
+  - 0.3472
+  - 0.3449
+  - 0.3398
+  se_log: 0.0117
+  in_band: true
+- id: B15
+  metric: ITN x IRS interaction OR (PBO x IRS, prevalence at 9 m, 2x2 factorial)
+  role: held_out
+  target: 2.43
+  band:
+  - 0.972
+  - 6.075
+  source: 'C16 Protopopoff 2018: interaction OR 2.43 (1.19-4.97)'
+  arm_or:
+  - a11: 0.6783
+    a10: 0.7964
+    a01: 0.8531
+  - a11: 0.6838
+    a10: 0.7719
+    a01: 0.8599
+  - a11: 0.7209
+    a10: 0.7999
+    a01: 0.9006
+  - a11: 0.6945
+    a10: 0.813
+    a01: 0.8301
+  - a11: 0.6665
+    a10: 0.8331
+    a01: 0.8778
+  - a11: 0.6832
+    a10: 0.8112
+    a01: 0.8569
+  - a11: 0.7232
+    a10: 0.8375
+    a01: 0.963
+  - a11: 0.6688
+    a10: 0.7828
+    a01: 0.8386
+  computed: 0.9823
+  per_seed:
+  - 0.9984
+  - 1.0303
+  - 1.0006
+  - 1.0291
+  - 0.9114
+  - 0.9829
+  - 0.8967
+  - 1.0188
+  se_log: 0.019
+  in_band: true
+- id: B16c
+  metric: 'EIR-prevalence curve (Beier 1999 rules: EIR > 15 -> PfPR >= 50%; EIR >=
+    200 -> PfPR > 80%)'
+  role: held_out
+  target: null
+  band: null
+  source: C35 Beier 1999 AJTMH
+  points:
+  - - 1.036
+    - 0.1047
+  - - 4.333
+    - 0.2547
+  - - 16.8
+    - 0.4652
+  - - 52.602
+    - 0.641
+  - - 175.755
+    - 0.7789
+  - - 524.759
+    - 0.853
+  rules_checked: 5
+  rules_met: 4
+  computed: 0.8
+  in_band: false
+- id: B17
+  metric: SMC $ per DALY averted (reference setting)
+  role: held_out
+  target: 38.37
+  band:
+  - 7.67
+  - 191.9
+  source: C28 Gilmartin 2021
+  computed: 18.3185
+  outcome_averted_per_capita: 0.1051
+  cost_per_capita: 1.9254
+  in_band: true
+- id: B18
+  metric: ITN vs none $ per DALY averted (reference setting)
+  role: held_out
+  target: 44.51
+  band:
+  - 8.9
+  - 222.6
+  source: C29 Conteh 2021
+  computed: 57.2551
+  outcome_averted_per_capita: 0.0156
+  cost_per_capita: 0.8915
+  in_band: true
+- id: B19
+  metric: IRS vs none $ per DALY averted (reference setting)
+  role: held_out
+  target: 25.16
+  band:
+  - 5.03
+  - 125.8
+  source: C29 Conteh 2021
+  computed: 369.655
+  outcome_averted_per_capita: 0.0669
+  cost_per_capita: 24.7385
+  in_band: false
+- id: B20
+  metric: Dual-AI vs pyrethroid nets, incremental $ per DALY averted (high resistance)
+  role: held_out
+  target: 19.0
+  band:
+  - 3.8
+  - 95.0
+  source: C19 Mosha 2022
+  computed: 0.0
+  outcome_averted_per_capita: 0.0577
+  cost_per_capita: 0.0
+  in_band: false
+settings_calibrated:
+  cochrane_itn:
+    attribute: m0
+    value: 11.74633360031379
+    grid:
+    - 4
+    - 8
+    - 16
+    - 32
+    - 64
+    baseline_values:
+    - 0.3271
+    - 0.4415
+    - 0.5471
+    - 0.6331
+    - 0.6972
+    target: 0.5
+  muleba:
+    attribute: m0
+    value: 30.460808457076013
+    grid:
+    - 8
+    - 16
+    - 32
+    - 64
+    - 128
+    baseline_values:
+    - 0.3525
+    - 0.4557
+    - 0.5572
+    - 0.6375
+    - 0.699
+    target: 0.55
+  misungwi:
+    attribute: m0
+    value: 9.89466204762414
+    grid:
+    - 8
+    - 16
+    - 32
+    - 64
+    - 128
+    baseline_values:
+    - 0.4246
+    - 0.5334
+    - 0.6341
+    - 0.7024
+    - 0.7549
+    target: 0.458
+  benin:
+    attribute: m0
+    value: 5.720251196922489
+    grid:
+    - 4
+    - 8
+    - 16
+    - 32
+    - 64
+    baseline_values:
+    - 1.5106
+    - 2.5752
+    - 3.7233
+    - 4.8903
+    - 5.7066
+    target: 2.06
+  irs_added:
+    attribute: m0
+    value: 8.912069594169436
+    grid:
+    - 8
+    - 16
+    - 32
+    - 64
+    - 128
+    baseline_values:
+    - 0.3834
+    - 0.4899
+    - 0.5855
+    - 0.6699
+    - 0.7139
+    target: 0.4
+  sahel_smc:
+    attribute: m0
+    value: 17.815574600595138
+    grid:
+    - 4
+    - 8
+    - 16
+    - 32
+    - 64
+    baseline_values:
+    - 0.1954
+    - 0.2887
+    - 0.3877
+    - 0.4673
+    - 0.5632
+    target: 0.4
+  ce_ref:
+    attribute: m0
+    value: 16.293751602324168
+    grid:
+    - 4
+    - 8
+    - 16
+    - 32
+    - 64
+    baseline_values:
+    - 0.2526
+    - 0.358
+    - 0.4476
+    - 0.5373
+    - 0.6147
+    target: 0.45
+  ce_res:
+    attribute: m0
+    value: 16.293751602324168
+    grid:
+    - 4
+    - 8
+    - 16
+    - 32
+    - 64
+    baseline_values:
+    - 0.2526
+    - 0.358
+    - 0.4476
+    - 0.5373
+    - 0.6147
+    target: 0.45
+fitted_used:
+  itn_kill_max: 0.2228
+  pbo_restore: 1.0
+  cfp_kill: 0.29
+  irs_kill: 0.14
+seeds:
+- 11
+- 12
+- 13
+- 14
+- 15
+- 16
+- 17
+- 18
+n_sims: 296
+summary:
+  in_band: 10
+  total: 16
+  held_out_in_band: 5
+  held_out_total: 9
+wall_s: 429.2
