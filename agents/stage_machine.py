@@ -651,40 +651,7 @@ def report_claim_findings(run_dir: str) -> list[dict]:
             out.append({"kind": "report_claim_id_raw", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE",
                         "key": cid, "scope_declarable": False,
                         "claim": f"The report shows the claim id {cid} instead of its value: write [CLAIM:{cid}]."})
-    # A number typed by the writer (outside [CLAIM:] references): not years, not list or heading
-    # numbering, not digits inside an identifier (D09, DT1, R-004, PfPR2-10).
-    bare = re.sub(r"\[CLAIM:[^\]]*\]", " ", text)
-    bare = re.sub(r"(?m)^\s*(#+\s*)?\d+[.)]\s", " ", bare)
-    # Numbers the owner gave (the signed spec, the question) are facts, not results: allowed.
-    given = set()
-    sources = []
-    try:
-        sources.append(open(os.path.join(run_dir, AB.SPEC_FILE)).read())
-    except OSError:
-        pass
-    try:   # the question only: not timestamps or other run metadata
-        sources.append(str(json.load(open(os.path.join(run_dir, "metadata.json"))).get("question") or ""))
-    except (OSError, ValueError):
-        pass
-    for src in sources:
-        given |= {g.replace(",", "") for g in re.findall(r"\d[\d,]*(?:\.\d+)?", src)}
-    typed = []
-    # A whole number token: sign, digits with separators, decimals, exponent, magnitude suffix or %.
-    num = re.compile(r"(?<![A-Za-z0-9_.])[-+\u2212]?\d[\d,]*(?:\.\d+)?(?:[eE][-+]?\d+)?(?:\s?(?:[kKmMbB]n?|%))?(?![A-Za-z0-9_])")
-    for m_ in num.finditer(bare):
-        t = m_.group(0).rstrip(",")
-        core = re.sub(r"^[-+\u2212]", "", t)
-        core = re.sub(r"(?:\s?(?:[kKmMbB]n?|%))$", "", core).replace(",", "")
-        before = bare[max(0, m_.start() - 1):m_.start()]
-        if t[0] in "-+\u2212" and before and (before.isalnum() or before in "_"):
-            continue                                  # an identifier such as R-004
-        if re.fullmatch(r"(19|20)\d\d", core) and t == core:
-            continue                                  # a year
-        if t == core and core in given:
-            continue                                  # a number the owner gave
-        if bare[m_.end():m_.end() + 1] == "-" and re.fullmatch(r"(19|20)\d\d", core):
-            continue                                  # a year range 2026-2028
-        typed.append(t)
+    typed = typed_numbers(text, given_values(run_dir, claims))
     rp2 = os.path.join(run_dir, "report.md")
     if os.path.exists(rp2):
         left = re.findall(r"\[CLAIM:([^\]]*)\]", open(rp2).read())
@@ -694,10 +661,89 @@ def report_claim_findings(run_dir: str) -> list[dict]:
                         "claim": f"The report still shows {len(left)} claim reference(s) ({', '.join(sorted(set(left))[:5])}), "
                                  "e.g. inside code; write [CLAIM:id] in plain text."})
     if typed:
-        out.append({"kind": "report_number_typed", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE",
-                    "key": "numbers", "scope_declarable": False,
-                    "claim": f"The writer typed {len(typed)} number(s) ({', '.join(typed[:8])}); every number is a "
-                             "[CLAIM:id] the harness renders."})
+        # A text heuristic: MEDIUM and declarable until its false-positive rate is measured on stored
+        # runs (process rule 4). The structural cases above stay HIGH.
+        out.append({"kind": "report_number_typed", "severity": "MEDIUM", "stage": "WRITE", "target_stage": "WRITE",
+                    "key": "numbers", "scope_declarable": True,
+                    "claim": f"The writer typed {len(typed)} number(s) ({', '.join(typed[:8])}) that are not in the spec, "
+                             "the claims ledger or the question; write each as a [CLAIM:id] the harness renders."})
+    return out
+
+
+_SUFFIX = {"k": 1e3, "m": 1e6, "b": 1e9, "bn": 1e9}
+
+
+def given_values(run_dir: str, claims: dict | None = None) -> list[float]:
+    """Numbers a report may show as typed: those in the signed spec and the question (the owner's
+    facts), and every number in the claims ledger, the interval level included (0.95 is also 95)."""
+    import re
+    texts = []
+    try:
+        texts.append(open(os.path.join(run_dir, AB.SPEC_FILE)).read())
+    except OSError:
+        pass
+    try:   # the question only: not timestamps or other run metadata
+        texts.append(str(json.load(open(os.path.join(run_dir, "metadata.json"))).get("question") or ""))
+    except (OSError, ValueError):
+        pass
+    vals = []
+    for t in texts:
+        vals += [float(g.replace(",", "")) for g in re.findall(r"\d[\d,]*(?:\.\d+)?", t)]
+
+    def walk(x):
+        if isinstance(x, bool):
+            return
+        if isinstance(x, (int, float)):
+            vals.append(float(x))
+        elif isinstance(x, dict):
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, (list, tuple)):
+            for v in x:
+                walk(v)
+    walk(list((claims or {}).values()))
+    vals += [v * 100 for v in list(vals) if 0 < abs(v) <= 1]          # proportions written as percentages
+    return vals
+
+
+def typed_numbers(text: str, given: list[float]) -> list[str]:
+    """Numbers typed in `text` outside [CLAIM:] references that match none of `given` at the precision
+    they are written with. Not years or year ranges, list or heading numbering, or digits inside an
+    identifier (D09, DT1, R-004)."""
+    import math
+    import re
+    bare = re.sub(r"\[CLAIM:[^\]]*\]", " ", text)
+    bare = re.sub(r"(?m)^\s*(#+\s*)?\d+[.)]\s", " ", bare)
+    num = re.compile(r"(?<![A-Za-z0-9_.])[-+\u2212]?\d[\d,]*(?:\.\d+)?(?:[eE][-+]?\d+)?(?:\s?(?:[kKmMbB]n?|%))?(?![A-Za-z0-9_])")
+    out = []
+    for m_ in num.finditer(bare):
+        t = m_.group(0).rstrip(",")
+        before = bare[max(0, m_.start() - 1):m_.start()]
+        if t[0] in "-+\u2212" and before and (before.isalnum() or before == "_"):
+            continue                                  # an identifier such as R-004
+        mant = re.match(r"[-+\u2212]?([\d,]*(?:\.\d+)?)", t).group(1).replace(",", "")
+        rest = t[len(re.match(r"[-+\u2212]?[\d,]*(?:\.\d+)?", t).group(0)):].strip()
+        if re.fullmatch(r"(19|20)\d\d", mant) and not rest:
+            continue                                  # a year, or one end of a year range
+        try:
+            v = float(mant)
+        except ValueError:
+            continue
+        exp = re.match(r"[eE]([-+]?\d+)", rest)
+        if exp:
+            v *= 10 ** int(exp.group(1))
+            rest = rest[exp.end():].strip()
+        mult = _SUFFIX.get(rest.lower(), 1.0)
+        v *= mult
+        digits = mant.replace(".", "").lstrip("0") or "0"
+        sig = max(1, len(digits))
+        def same(g):
+            if g == 0 or v == 0:
+                return g == v
+            return float(f"{abs(g):.{sig}g}") == round(abs(v), 12) or math.isclose(abs(g), abs(v), rel_tol=1e-9)
+        if any(same(g) for g in given):
+            continue
+        out.append(t)
     return out
 
 
@@ -1831,6 +1877,14 @@ def _self_test() -> int:
         render_report(fr, spike)
         ok(any(f["kind"] == "report_claim_unrendered" for f in report_claim_findings(fr)),
            "T54 a claim reference left unrendered in the report (inside code) is a HIGH finding")
+        # T56: the typed-number rule is a text heuristic: MEDIUM and declarable (process rule 4), and the
+        # interval level and any value in the spec, the ledger or the question are not typed numbers.
+        open(os.path.join(fr, "manuscript.md"), "w").write(
+            "A 95% interval; about 1.3M cases for $17.9M across 10 districts; 3 years.\n")
+        k56 = [f for f in report_claim_findings(fr) if f["kind"] == "report_number_typed"]
+        ok(k56 and k56[0]["severity"] == "MEDIUM" and k56[0]["scope_declarable"]
+           and "(3)" in k56[0]["claim"],
+           f"T56 typed numbers are MEDIUM and declarable; 95%, 1.3M, $17.9M and 10 are exempt ({k56[:1]})")
         fe = os.path.join(td, "t55")
         os.makedirs(os.path.join(fe, "data"))
         yaml.safe_dump({"engine": {"ref": "toolkit.engines.contract:ToyEngine",

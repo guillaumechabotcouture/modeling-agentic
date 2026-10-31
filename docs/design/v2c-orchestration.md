@@ -325,3 +325,10 @@ Fixtures: the run's three critique YAMLs, `final_gate.json` and claims ledger (`
   - Grep's `glob` and `type` parameters are checked.
   - A search whose tree reaches a `_truth` entry, or a link into one, is refused even under an allowed root (S14).
   - `_truth` is also checked on the resolved path, so a Read through a symlink is refused (S15).
+
+**Typed-number rule demoted to MEDIUM (process rule 4).** It is a text heuristic. On the stored manuscripts
+(v2blind1, attempts 7 and 8, smokes 1 and 2, the Phase 40 smoke) it flags 550 numbers. At least 245 of them (45%) are
+false positives by context class: section numbers, citations and DOIs, pasted decision trees, leading-zero ids,
+interval levels, data ranges, unit denominators and software versions. So the finding is MEDIUM and declarable. The
+interval level and every value in the spec, the ledger or the question are exempt, matched at the precision written
+(T56). The structural cases stay HIGH: a bare ledger id and an unresolved or unrendered `[CLAIM:]`.
