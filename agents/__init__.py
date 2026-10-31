@@ -258,7 +258,10 @@ def _registry() -> dict[str, AgentDefinition]:
                     "pre-model-identifiability-arithmetic",
                     # Phase 21: planner writes the "Published benchmarks"
                     # table that becomes models/benchmark_targets.yaml.
-                    "benchmark-locked-acceptance"],
+                    "benchmark-locked-acceptance",
+                    # v2 workstream B: the planner drafts decision_spec.yaml
+                    # (toolkit/spec), which the owner signs.
+                    "decision-spec"],
         ),
         "data-agent": AgentDefinition(
             description=data.DESCRIPTION,

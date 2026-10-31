@@ -113,7 +113,7 @@ CALIBRATION_FIELDS = {
     "likelihood": ("attribute", "range", "parameters", "targets"),
     "none": (),
 }
-TARGET_FIELDS = ("csv", "unit", "start", "stop", "package", "observed", "exposure")
+TARGET_FIELDS = ("csv", "unit", "start", "package", "observed", "exposure")   # and `stop` (a column) or `period` (years)
 
 
 class SpecError(ValueError):
@@ -121,12 +121,44 @@ class SpecError(ValueError):
 
 
 # --------------------------------------------------------------------------- loading
+SETTINGS = "analysis_settings.yaml"
+# Technical settings the run (and the fix loop) may change without a new owner sign-off. They may live in
+# analysis_settings.yaml beside the spec instead of in the signed spec; a key set in both is an error.
+# What the interval covers (uncertainty.sources / excluded, level) stays in the signed spec.
+SETTINGS_KEYS = {"calibration": None, "analysis": None, "uncertainty": ("draws", "seed")}
+
+
 def load(path: str) -> "Spec":
     with open(path, encoding="utf-8") as f:
         raw = yaml.safe_load(f)
     if not isinstance(raw, dict):
         raise SpecError(f"{path}: the spec must be a mapping")
-    return Spec(raw, os.path.dirname(os.path.abspath(path)), path)
+    base = os.path.dirname(os.path.abspath(path))
+    sp = os.path.join(base, SETTINGS)
+    settings_path = None
+    if os.path.exists(sp):
+        with open(sp, encoding="utf-8") as f:
+            st = yaml.safe_load(f) or {}
+        if not isinstance(st, dict):
+            raise SpecError(f"{SETTINGS}: must be a mapping")
+        for k, v in st.items():
+            if k not in SETTINGS_KEYS:
+                raise SpecError(f"{SETTINGS}: {k} is not a run-owned setting ({', '.join(SETTINGS_KEYS)}); it belongs "
+                                "in the signed decision spec")
+            sub = SETTINGS_KEYS[k]
+            if sub is None:
+                if k in raw:
+                    raise SpecError(f"{SETTINGS}: {k} is also in the signed spec; keep it in one place")
+                raw[k] = v
+            else:
+                bad = [x for x in (v or {}) if x not in sub or x in (raw.get(k) or {})]
+                if bad:
+                    raise SpecError(f"{SETTINGS}: {k}.{bad} is not run-owned or is also in the signed spec")
+                raw.setdefault(k, {}).update(v or {})
+        settings_path = sp
+    s = Spec(raw, base, path)
+    s.settings_path = settings_path
+    return s
 
 
 def sha256_file(path: str) -> str | None:
@@ -142,6 +174,7 @@ class Spec:
 
     def __init__(self, raw: dict, base: str, path: str | None = None):
         self.raw, self.base, self.path = raw, base, path
+        self.settings_path = None
         self._engine = None
         self._units = None
 
@@ -157,6 +190,10 @@ class Spec:
     @property
     def sha256(self) -> str | None:
         return sha256_file(self.path) if self.path else None
+
+    @property
+    def settings_sha256(self) -> str | None:
+        return sha256_file(self.settings_path) if self.settings_path else None
 
     # ---- engine
     def engine(self):
@@ -462,6 +499,11 @@ def _validate_calibration(s, card, pnames, cols) -> list[str]:
             return bad + ["calibration.targets: the table is empty"]
         tc = set(rows[0])
         bad += [f"calibration.targets.{k}: no column {t[k]}" for k in TARGET_FIELDS[1:] if t[k] not in tc]
+        if "stop" in t:
+            if t["stop"] not in tc:
+                bad.append(f"calibration.targets.stop: no column {t['stop']}")
+        elif not (_isnum(t.get("period")) and t["period"] > 0):
+            bad.append("calibration.targets: give `stop` (a column) or `period` (years per row)")
         if bad:
             return bad
         ids = set(s.unit_ids())
@@ -709,6 +751,24 @@ def _self_test() -> int:
         ok(sc["label"] == "95% UI over engine parameters, calibration; not covered: unit costs, emulator error" and "not covered: unit costs"
            in sc["label"], f"SP17 the interval label states what is covered and what is not: {sc['label']}")
         ok(validate({"schema_version": 1}) and validate(Spec({"engine": 3}, d)), "SP18 malformed specs fail closed")
+        r = copy.deepcopy(s.raw)
+        an, cal = r.pop("analysis"), r.pop("calibration")
+        draws = r["uncertainty"].pop("draws")
+        with open(p, "w") as f:
+            yaml.safe_dump(r, f)
+        with open(os.path.join(d, SETTINGS), "w") as f:
+            yaml.safe_dump({"analysis": an, "calibration": cal, "uncertainty": {"draws": draws}}, f)
+        s3 = load(p)
+        ok(validate(s3) == [] and s3["uncertainty"]["draws"] == draws and s3.settings_sha256,
+           f"SP19 run-owned settings (analysis, calibration, draws) can live in {SETTINGS}, outside the signed spec")
+        with open(os.path.join(d, SETTINGS), "w") as f:
+            yaml.safe_dump({"objective": {"outcome": "cases"}}, f)
+        try:
+            load(p)
+            ok(False, "SP20 a decision section in the settings file is refused")
+        except SpecError:
+            ok(True, "SP20 a decision section in the settings file is refused")
+        os.remove(os.path.join(d, SETTINGS))
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
