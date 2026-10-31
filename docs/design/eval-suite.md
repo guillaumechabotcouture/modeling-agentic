@@ -33,8 +33,10 @@ The suite follows OmicsBench: a subtask DAG, JSON answer files, deterministic gr
   - `evals/**` is export-ignored, so `git archive` (the launch tarball) leaves it out;
   - `code_tarball` refuses any tarball that still holds hidden files (`scripts/lib/eval_paths.py`);
   - the harness manifest hashes none of them;
-  - agents may not `Read`, `Grep` or name `evals/…` or `_truth` paths in Bash (`agents/enforcement.py`).
-  - Self-tests L1–L7 and RC50 fail if any of this breaks.
+  - an eval question runs only from a **sanitized workspace**: an archive of the tree, with no `evals/` and no `.git`. On the cloud this is the worker's unpacked tarball. Locally, `eval_suite.py run --local` builds one per replicate. `main.py` refuses an eval question (marked "(evaluation suite)") from a checkout. This is the structural barrier: in a checkout, the generators are reachable through `git show`, absolute paths or a recursive grep, and no deny pattern closes every route;
+  - as defence in depth only, `agents/enforcement.py` refuses agent `Read`, `Grep` and Bash references to `evals/…` and `_truth` paths;
+  - shipped text (the plan, CHANGELOG, skills, prompts, CLAUDE.md, configs, `scripts/`) never signals a planted answer. Self-test R1 scans the archive of HEAD and the tracked files for each rubric's `leak_keywords` next to a mention of the suite. The question ids are neutral for the same reason (the non-identifiable question is `dengue_outbreak`).
+  - Self-tests L1–L7, R1, R2, EP6–EP9 and RC50 fail if any of this breaks.
 
 ## 3. Questions and their truths
 
@@ -115,7 +117,7 @@ All numbers come from the committed seed. "Value ratio" is the true benefit of a
   - **The trap:** counting direct protection only gives 3, 0, 0, 1, 6 (mostly 65+), for a value ratio of 0.298.
   - Calibrating q to the serosurvey (q̂ = 0.1668) gives the exact optimum.
 
-### 3.5 `dengue_scope` — a key quantity the data cannot identify
+### 3.5 `dengue_outbreak` — a key quantity the data cannot identify
 
 - **What it tests:**
   - identifiability;
@@ -149,10 +151,16 @@ Each question's `rubric.yaml` lists checks. Each check hangs off a subtask in a 
 | `unit_value_accuracy` | share of units whose reported benefit (CSV value column) is within `rel_tol` of the truth for the package chosen | ≥ `pass` |
 | `text_mentions` | 1 if one passage matches every pattern group within `window` characters (and names `units.min` of the planted units) | 1 |
 | `allocation_concordance` | categorical: share of units whose package is in the acceptable set (the optimum plus near-ties within `tie_tol`); vector: 1 − L1 distance / (2 × blocks) to the nearest acceptable split | ≥ `pass` |
-| `allocation_value` | true benefit of the run's plan / optimum, mapped linearly from `floor` (0) to 1 (1); 0 if over budget at true costs | ratio ≥ `pass_ratio` |
+| `allocation_value` | true benefit of the run's plan / optimum, mapped linearly from `floor` (0) to 1 (1) | ratio ≥ `pass_ratio` |
+
+**Feasibility comes first.** Before any allocation credit (concordance, plan value, unit estimates), the grader checks the raw allocation the run reported:
+- for categorical plans, every package must be available in its unit and the true cost within the budget (+0.5%);
+- for dose blocks, the doses must be whole blocks, none negative, exactly the doses available, and each group within its uptake cap.
+
+Rounding is never applied before this check. A plan that fails it scores 0 on every allocation check (`allocation_infeasible`; self-test R3).
 | `headline_accuracy` | 1 within `rel_tol` of the truth, falling to 0 at 3 × `rel_tol`. For allocation questions the truth is the true value of **the run's own plan** (estimation is scored apart from choice) | within `rel_tol` |
 | `interval_coverage` | 1 if the 95% interval covers the truth and its relative width ≤ `max_rel_width`; 0.5 if it covers but is wider; 0 if it misses | 1 |
-| `unidentifiable_declared` | 0.5 for declaring the quantity undetermined (pattern groups in report or scope declaration) + 0.5 for no false precision (no interval, or one that covers the truth with high/low ≥ `min_ratio`) | both |
+| `scope_honesty` | 0.5 for declaring the quantity undetermined (pattern groups in report or scope declaration) + 0.5 for no false precision (no interval, or one that covers the truth with high/low ≥ `min_ratio`) | both |
 | `gate_outcome` | 1 if the final gate action is in `expect` | 1 |
 
 How the checks combine:
@@ -195,7 +203,9 @@ python3 scripts/eval_suite.py report <A>/suite_scores.json <B>/suite_scores.json
 How to run each arm:
 - An architecture branch runs with `EVAL_TREE=<committed checkout> EVAL_TAG=s3`. Its tree must hold `data/evals/`, or the launch refuses.
 - `run` refuses to launch when the inputs are stale or the tarball of HEAD holds hidden files.
-- A question with no collected run scores 0 (`run_record_missing`).
+- **Inputs are verified.** `run` hashes the inputs in the archive of the tree it will ship, not this checkout's, and refuses if they differ from what the answer keys were generated from. Launch and relaunch record those hashes per run in `assignments.json`. Grading refuses a run whose recorded inputs differ from its truth (`inputs_mismatch`) or are unrecorded (`inputs_unrecorded`). `grade --unverified-inputs` allows an ad-hoc look, and the score records that it was used (R5).
+- **Replicates come from the launch record.** `grade --root` takes labels and launch ids from each question's `assignments.json`. It grades a label only when its `result.json` names this launch, and never a `<label>.before_*` copy. An expected replicate that is missing or stale scores 0, and so does a question with no launch record (`run_record_missing`; R4).
+- `run --local [--execute]` runs on this machine instead, each replicate in its own sanitized workspace, laid out the way `collect` lays out a cloud launch.
 
 **Expected cost:**
 - **Per question:** US$20–35 in model spend, capped at US$35, and under an hour. For comparison, the 8-district malaria smoke on 2026-10-31 (cap US$25, 2 rounds) cost US$14.05 in 46 min and stopped after round 1.
@@ -209,7 +219,7 @@ How to run each arm:
 
 - **Synthetic and simplified.** The truth is the optimum of the generating model. The question text fixes the parts of the model structure that would otherwise make several answers defensible (homogeneous mixing and final size for measles, SIR with the given contact matrix for flu, a stable prevalence for TB). The suite therefore tests estimation from data, mechanism discovery, optimisation, uncertainty and honesty. It does not test the choice of model structure.
 - **Lexical mechanism checks.** The checks match regular expressions within a window, so a negated sentence ("there is no redundancy") would still match. The allocation and value checks do not have this weakness, and a missed mechanism usually shows up there too.
-- **The repository is public.** The generators are visible on GitHub. The question text does not name the repository, and the data are synthetic. Cloud workers never receive `evals/`. In local runs, reads are refused by path, but a Python string built at run time (`os.path.join("evals", …)`) is not caught. Run the suite on the cloud.
+- **The repository is public.** The generators are visible on GitHub. The question text does not name the repository, and the data are synthetic. No run workspace, cloud or local, holds `evals/` or the history. An agent with web access could still look the repository up; we accept that risk and do not try to stop it.
 - **Dollars are model spend only** (`metadata.json` `total_cost_usd`). VM credits come from `run_cluster.py report-cost`.
 - **The questions are small.** They exercise the full pipeline at about 1/15 of an E7 run's cost. They do not replace an E7-scale run as the final check.
 

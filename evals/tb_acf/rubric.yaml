@@ -37,7 +37,7 @@ checks:
       - '\bT0?2\b|\bT0?5\b|\bT0?8\b'
     units: {names: [T02, T05, T08], min: 2}
   - {id: concordance, type: allocation_concordance, subtask: optimize, weight: 0.20, pass: 0.8}
-  - {id: plan_value, type: allocation_value, subtask: optimize, weight: 0.20, pass_ratio: 0.98, floor: 0.85, budget_tol: 0.005}
+  - {id: plan_value, type: allocation_value, subtask: optimize, weight: 0.20, pass_ratio: 0.98, floor: 0.85}
   - {id: headline, type: headline_accuracy, subtask: uncertainty, weight: 0.15, headline: total_cases_detected,
      outputs: [total_cases_detected, '.*cases_detected.*'], rel_tol: 0.10}
   - {id: interval, type: interval_coverage, subtask: uncertainty, weight: 0.15, headline: total_cases_detected,
@@ -55,3 +55,6 @@ self_test:
   wrong_text: >-
     Inputs used: districts.csv, acf_records_2022_2025.csv, algorithm_costs.csv and national_reference_yields.csv.
     One CXR/SYM yield ratio was pooled across districts to reduce noise.
+
+# Words that signal this question's planted answer (self-test R1).
+leak_keywords: [subclinical, "T02", "T05", "T08", yield ratio, pooled]

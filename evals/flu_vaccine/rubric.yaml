@@ -55,3 +55,6 @@ self_test:
   wrong_text: >-
     Inputs used: population.csv, contact_matrix.csv, serosurvey_last_season.csv, hospitalisations_last_season.csv
     and vaccine_effectiveness.csv. Doses go to the groups with the highest hospitalisation risk per dose.
+
+# Words that signal this question's planted answer (self-test R1).
+leak_keywords: [indirect protection, herd, school-age, "5-17", direct protection]

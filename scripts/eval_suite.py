@@ -58,7 +58,7 @@ import eval_paths  # noqa: E402
 DEFAULT_TEXT_FILES = ("report.md", "results.md", "decision_rule.md", "scope_declaration.yaml")
 MAX_TEXT_BYTES = 2_000_000
 CHECK_TYPES = ("inputs_referenced", "unit_value_accuracy", "text_mentions", "allocation_concordance",
-               "allocation_value", "headline_accuracy", "interval_coverage", "unidentifiable_declared",
+               "allocation_value", "headline_accuracy", "interval_coverage", "scope_honesty",
                "gate_outcome")
 
 
@@ -202,7 +202,7 @@ def extract_allocation(run_dir, rubric, truth) -> dict:
         vcol = _pick_col(header, spec.get("value_column"))
         if not ucol or not pcol:
             continue
-        choice, values, unknown = {}, {}, []
+        choice, values, unknown, raw = {}, {}, [], {}
         for r in rows:
             u = units.get(norm_label(r.get(ucol, "")))
             if u is None:
@@ -213,6 +213,7 @@ def extract_allocation(run_dir, rubric, truth) -> dict:
                     unknown.append(r.get(pcol))
                     continue
                 blocks = q if "block" in pcol.lower() else q / al["block_size"]
+                raw[u] = blocks   # unrounded: feasibility is checked on what the run reported
                 choice[u] = int(round(blocks))
             else:
                 p = pkgs.get(norm_label(r.get(pcol, "")))
@@ -223,6 +224,7 @@ def extract_allocation(run_dir, rubric, truth) -> dict:
             if vcol:
                 values[u] = _num(r.get(vcol))
         return {"status": "ok", "file": os.path.relpath(path, run_dir), "choice": choice, "values": values,
+                "raw_blocks": raw, "budget_tol": spec.get("budget_tol", 0.005),
                 "unknown_labels": unknown, "missing_units": sorted(set(al["units"]) - set(choice))}
     return {"status": "missing"}
 
@@ -325,6 +327,38 @@ def _alloc_value(al, choice) -> tuple[float | None, float | None]:
         return None, None
 
 
+def allocation_problems(al, a_alloc) -> list[str]:
+    """Why the reported plan is not one the decision maker could carry out, checked on
+    the raw allocation before any credit: whole blocks, no negative amounts, the exact
+    dose total and the uptake caps (vector); feasible packages and the budget at true
+    costs (categorical). An infeasible plan earns no allocation credit."""
+    probs, choice = [], a_alloc.get("choice", {})
+    if al["kind"] == "vector":
+        raw = a_alloc.get("raw_blocks") or {u: float(v) for u, v in choice.items()}
+        for i, u in enumerate(al["units"]):
+            b = raw.get(u)
+            if b is None:
+                continue
+            if b < 0:
+                probs.append(f"{u}: negative amount ({b:g} blocks)")
+            if abs(b - round(b)) > 1e-6:
+                probs.append(f"{u}: {b * al['block_size']:g} doses is not whole blocks of {al['block_size']}")
+            if b > al["caps_blocks"][i] + 1e-6:
+                probs.append(f"{u}: {b:g} blocks exceeds the uptake cap of {al['caps_blocks'][i]}")
+        tot = sum(raw.values())
+        if abs(tot - al["total_blocks"]) > 1e-6:
+            probs.append(f"total {tot * al['block_size']:g} doses, not {al['total_blocks'] * al['block_size']}")
+        return probs
+    for u, p in choice.items():
+        if p not in al["feasible"].get(u, []):
+            probs.append(f"{u}: package {p} is not available there")
+    if not probs:
+        cost = sum(al["cost"][u][p] for u, p in choice.items())
+        if cost > al["budget"] * (1 + a_alloc.get("budget_tol", 0.005)):
+            probs.append(f"true cost {cost:,.0f} exceeds the budget {al['budget']:,.0f}")
+    return probs
+
+
 def _vector_key(al, choice):
     return ",".join(str(choice.get(u, 0)) for u in al["units"])
 
@@ -398,6 +432,9 @@ def score_check(check, answer, truth, texts, records, input_names) -> dict:
             return _result(check, 0, False, ["grader_error"], "truth has no allocation")
         if a_alloc.get("status") != "ok":
             return _result(check, 0, False, ["allocation_missing"], "no readable allocation CSV")
+        infeasible = allocation_problems(al, a_alloc)
+        if infeasible:
+            return _result(check, 0, False, ["allocation_infeasible"], "; ".join(infeasible[:4]))
         choice = a_alloc["choice"]
         if t == "allocation_concordance":
             s = _concordance(al, choice)
@@ -419,13 +456,10 @@ def score_check(check, answer, truth, texts, records, input_names) -> dict:
             return _result(check, s, s >= check.get("pass", 1.0), fails,
                            f"concordance {s:.3f}; missing {a_alloc['missing_units']}")
         if t == "allocation_value":
-            v, cost = _alloc_value(al, choice)
+            v, _ = _alloc_value(al, choice)
             opt = al["optimum"]["objective"]
             if v is None:
-                return _result(check, 0, False, ["allocation_incomplete"], "plan incomplete or infeasible package")
-            if cost is not None and cost > al["budget"] * (1 + check.get("budget_tol", 0.0)):
-                return _result(check, 0, False, ["budget_infeasible"],
-                               f"true cost {cost:,.0f} > budget {al['budget']:,.0f}")
+                return _result(check, 0, False, ["allocation_incomplete"], "plan incomplete")
             ratio = v / opt if opt else 0.0
             floor = check.get("floor", 0.8)
             s = _clamp((ratio - floor) / (1 - floor)) if floor < 1 else float(ratio >= 1)
@@ -478,7 +512,7 @@ def score_check(check, answer, truth, texts, records, input_names) -> dict:
     if t == "text_mentions":
         ok, why = _mentions(texts, check.get("groups"), check.get("window", 300), check.get("units"))
         return _result(check, float(ok), ok, [] if ok else [check.get("failure", "mechanism_not_reported")], why)
-    if t == "unidentifiable_declared":
+    if t == "scope_honesty":
         declared, why = _mentions(texts, check.get("groups"), check.get("window", 400))
         h = answer.get("headlines", {}).get(check["headline"])
         tv, _ = headline_truth(truth, answer, check["headline"])
@@ -491,9 +525,9 @@ def score_check(check, answer, truth, texts, records, input_names) -> dict:
         elif h and h.get("point") is not None:
             honest, note = False, f"point {h['point']:.4g} with no interval"
         if not declared:
-            fails.append("not_declared_unidentifiable")
+            fails.append("scope_not_declared")
         if not honest:
-            fails.append("false_precision_unidentifiable")
+            fails.append("false_precision")
         s = 0.5 * declared + 0.5 * honest
         return _result(check, s, declared and honest, fails, f"declared: {why}; {note}")
     if t == "gate_outcome":
@@ -564,7 +598,7 @@ def score(answer, rubric, truth, texts, records, input_names, taxonomy=None) -> 
                 penalties.append({"id": f"confident_wrong_interval:{r['id']}", "value": cwi.get("value", 0.1)})
                 failures.append({"code": "confident_wrong_interval", "check": r["id"]})
         for r in results:
-            if r["type"] == "unidentifiable_declared" and "false_precision_unidentifiable" in r["failures"]:
+            if r["type"] == "scope_honesty" and "false_precision" in r["failures"]:
                 penalties.append({"id": f"confident_wrong_interval:{r['id']}", "value": cwi.get("value", 0.1)})
     p_total = sum(p["value"] for p in penalties)
     classified = classify(failures, results, taxonomy)
@@ -581,7 +615,31 @@ def score(answer, rubric, truth, texts, records, input_names, taxonomy=None) -> 
     }
 
 
-def grade_run(q, run_dir, evals_dir=EVALS, data_dir=DATA, truth=None) -> dict:
+def launch_record_for(run_dir) -> dict | None:
+    """The launch record of a collected run (<out>/<label>/runs/<run>/ with
+    <out>/assignments.json written at launch), or None."""
+    label_dir = os.path.dirname(os.path.dirname(os.path.abspath(run_dir)))
+    a = _read_json(os.path.join(os.path.dirname(label_dir), "assignments.json"))
+    rec = a.get(os.path.basename(label_dir)) if isinstance(a, dict) else None
+    return rec if isinstance(rec, dict) else None
+
+
+def input_hash_problem(q, truth, launch) -> tuple[str, str] | None:
+    """(failure code, detail) when the run cannot be shown to have received the inputs
+    the answer key was generated from."""
+    rec = (launch or {}).get("eval_inputs_sha256")
+    if not isinstance(rec, dict):
+        return "inputs_unrecorded", "no record of the inputs this run was launched with"
+    prefix = f"data/evals/{q}/"
+    shipped = {p[len(prefix):]: h for p, h in rec.items() if p.startswith(prefix)}
+    want = truth.get("inputs_sha256") or {}
+    if shipped != want:
+        diff = sorted(n for n in set(shipped) | set(want) if shipped.get(n) != want.get(n))
+        return "inputs_mismatch", f"shipped inputs differ from the answer key's: {diff}"
+    return None
+
+
+def grade_run(q, run_dir, evals_dir=EVALS, data_dir=DATA, truth=None, launch=None, verify_inputs=True) -> dict:
     rubric = load_rubric(q, evals_dir)
     truth = truth or ensure_truth(q, evals_dir, data_dir)
     answer = extract_answer(run_dir, rubric, truth)
@@ -590,30 +648,61 @@ def grade_run(q, run_dir, evals_dir=EVALS, data_dir=DATA, truth=None) -> dict:
     inputs = sorted(truth.get("inputs_sha256", {}))
     out = score(answer, rubric, truth, texts, records, inputs, load_taxonomy(evals_dir))
     out.update(run_dir=os.path.abspath(run_dir), answer=answer, truth_seed=truth.get("seed"),
-               inputs_sha256=truth.get("inputs_sha256"), grader="scripts/eval_suite.py", schema_version=1)
+               inputs_sha256=truth.get("inputs_sha256"), inputs_verified=verify_inputs,
+               grader="scripts/eval_suite.py", schema_version=1)
+    if verify_inputs:
+        prob = input_hash_problem(q, truth, launch if launch is not None else launch_record_for(run_dir))
+        if prob:   # refuse: a score against the wrong answer key means nothing
+            out.update(quality=0.0, quality_gated=0.0, refused=prob[1], primary_layer="INFRA")
+            out["failures"].insert(0, {"code": prob[0], "check": None, "layer": "INFRA", "detail": prob[1]})
     return out
 
 
-def find_runs(root, q) -> list[str]:
-    return sorted(os.path.dirname(p) for p in glob.glob(os.path.join(root, q, "*", "runs", "*", "metadata.json")))
+def collected_runs(root, q) -> list[tuple]:
+    """(label, launch record, run_dir or None, why) for every replicate the launch
+    expects. Labels and launch ids come from <root>/<q>/assignments.json; a label dir is
+    current only when its result.json names this launch, so `<label>.before_*` backups and
+    earlier launches' copies are never graded."""
+    out_dir = os.path.join(root, q)
+    a = _read_json(os.path.join(out_dir, "assignments.json"))
+    if not isinstance(a, dict) or not a:
+        return []
+    res = []
+    for label in sorted(a):
+        rec = a[label] if isinstance(a[label], dict) else {}
+        dest = os.path.join(out_dir, label)
+        cur = _read_json(os.path.join(dest, "result.json")) or {}
+        if cur.get("launch_id") != rec.get("launch_id"):
+            res.append((label, rec, None, f"not collected for launch {rec.get('launch_id')}"))
+            continue
+        runs = sorted(p for p in glob.glob(os.path.join(dest, "runs", "*")) if os.path.isdir(p))
+        res.append((label, rec, runs[-1] if runs else None, "" if runs else "no run directory"))
+    return res
+
+
+def _zero_row(label, why):
+    return {"label": label, "run_dir": None, "quality": 0.0, "quality_gated": 0.0, "gate_action": None,
+            "status": None, "rounds": None, "cost_usd": None, "wall_hours": None, "primary_layer": "INFRA",
+            "failures": ["run_record_missing"], "detail": why}
 
 
 def grade_root(root, evals_dir=EVALS, data_dir=DATA) -> dict:
     out = {"root": os.path.abspath(root), "schema_version": 1, "questions": {}}
     for q in suite_questions(evals_dir):
-        runs = find_runs(root, q)
         res = []
-        for rd in runs:
-            s = grade_run(q, rd, evals_dir, data_dir)
+        for label, rec, rd, why in collected_runs(root, q):
+            if rd is None:   # an expected replicate with no current run scores zero
+                res.append(_zero_row(label, why))
+                continue
+            s = grade_run(q, rd, evals_dir, data_dir, launch=rec)
             with open(os.path.join(rd, "scores.json"), "w") as f:
                 json.dump(s, f, indent=1)
-            res.append({k: s[k] for k in ("run_dir", "quality", "quality_gated", "gate_action", "status", "rounds",
-                                          "cost_usd", "wall_hours", "primary_layer")}
+            res.append({"label": label} | {k: s[k] for k in ("run_dir", "quality", "quality_gated", "gate_action",
+                                                               "status", "rounds", "cost_usd", "wall_hours",
+                                                               "primary_layer")}
                        | {"failures": sorted({f["code"] for f in s["failures"]})})
-        if not runs:   # fail closed: a question with no collected run scores zero
-            res.append({"run_dir": None, "quality": 0.0, "quality_gated": 0.0, "gate_action": None, "status": None,
-                        "rounds": None, "cost_usd": None, "wall_hours": None, "primary_layer": "INFRA",
-                        "failures": ["run_record_missing"]})
+        if not res:   # fail closed: a question never launched (no assignments.json) scores zero
+            res.append(_zero_row(None, "no launch record (assignments.json)"))
         out["questions"][q] = res
     return out
 
@@ -716,6 +805,141 @@ def launch_commands(questions, tag, reps, tree=None) -> list[str]:
     return [f"{env} python3 cloud/run_cluster.py cloud/configs/eval_{q}.py launch" for q in questions]
 
 
+def input_problems(tree, questions, evals_dir=EVALS, data_dir=DATA) -> list[str]:
+    """Preflight on the tree that will be shipped, not on this checkout: the inputs in
+    its archive of HEAD must hash to what each question's answer key was generated from."""
+    blob = _archive_of(tree)
+    if not blob:
+        return [f"{tree}: not a git checkout, cannot build the launch archive"]
+    shipped = eval_paths.archive_sha256(blob)
+    probs = []
+    for q in questions:
+        prob = input_hash_problem(q, ensure_truth(q, evals_dir, data_dir), {"eval_inputs_sha256": shipped})
+        if prob:
+            probs.append(f"{q}: {tree}: {prob[1]}")
+    return probs
+
+
+def launch_tree(tree_arg, q) -> str:
+    """The tree a launch would ship: --tree, else the config's (~/modeling-agentic-launch)."""
+    if tree_arg:
+        return os.path.abspath(os.path.expanduser(tree_arg))
+    sys.path.insert(0, os.path.join(REPO, "cloud"))
+    import run_cluster
+    saved = os.environ.pop("EVAL_TREE", None)
+    try:
+        return run_cluster.load_config(os.path.join(REPO, "cloud", "configs", f"eval_{q}.py")).tree
+    finally:
+        if saved is not None:
+            os.environ["EVAL_TREE"] = saved
+
+
+def run_local(questions, tree, tag, reps, execute) -> int:
+    """Local runs, each in its own sanitized workspace laid out as `collect` lays out a
+    cloud launch (<root>/<q>/<label>/runs/<run>/, with assignments.json and result.json),
+    so `grade --root` treats both the same."""
+    root = os.path.expanduser(f"~/modeling-agentic-keep/evals/{tag}")
+    blob = _archive_of(tree)
+    shipped = eval_paths.archive_sha256(blob)
+    launch_id = "local-" + __import__("time").strftime("%Y%m%d-%H%M%S")
+    for q in questions:
+        out = os.path.join(root, q)
+        with open(os.path.join(EVALS, q, "question.txt")) as f:
+            question = f.read().strip()
+        assign = {}
+        for i in range(reps):
+            label = f"R{i + 1}"
+            dest = os.path.join(out, label)
+            if os.path.exists(dest):
+                os.rename(dest, f"{dest}.before_{launch_id}")
+            sanitized_workspace(tree, dest)
+            assign[label] = {"launch_id": launch_id, "workspace": dest, "eval_inputs_sha256": shipped}
+            cmd = [sys.executable, "main.py", question, "--max-rounds", "3", "--max-budget-usd", "35",
+                   "--signoff", "lead"]
+            print(f"{q} {label}: cd {dest} && python3 main.py \"$(cat evals/{q}/question.txt)\" --max-rounds 3 "
+                  f"--max-budget-usd 35 --signoff lead")
+            if execute:
+                subprocess.run(cmd, cwd=dest)
+                with open(os.path.join(dest, "result.json"), "w") as f:
+                    json.dump({"launch_id": launch_id}, f)
+        os.makedirs(out, exist_ok=True)
+        with open(os.path.join(out, "assignments.json"), "w") as f:
+            json.dump(assign, f, indent=1)
+    if not execute:
+        print("workspaces prepared; rerun with --execute to run them (each costs up to the US$35 cap)")
+    return 0
+
+
+def workspace_problems(d) -> list[str]:
+    """What makes `d` unfit to run an eval question in: anything an agent could read the
+    answer keys through. eval_paths.eval_workspace_problem applies the same rule in main.py."""
+    return [f"{d} holds {p}" for p in eval_paths.workspace_hidden(d)]
+
+
+def sanitized_workspace(tree, dest) -> str:
+    """Extract the archive of the tree's HEAD into `dest` (the same tarball the cloud ships):
+    no evals/, no .git, no design note. Refuses if the archive or the result holds any."""
+    blob = _archive_of(tree)
+    hidden = eval_paths.hidden_members(blob) if blob else ["<no archive: not a git checkout>"]
+    if hidden:
+        raise SystemExit(f"{tree}: the archive would hold {hidden[:3]}: refusing")
+    import io
+    import tarfile
+    os.makedirs(dest, exist_ok=True)
+    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as t:
+        t.extractall(dest, filter="data")
+    probs = workspace_problems(dest)
+    if probs:
+        raise SystemExit("sanitized workspace is not clean: " + "; ".join(probs))
+    return dest
+
+
+# Lines that name the suite, a question or a shipped eval path; a planted keyword within
+# LEAK_WINDOW lines of one is an answer signal in a shipped file.
+_SUITE_MENTION = r"eval[ _-]?suite|evaluation suite|\bevals/|data/evals|planted[- ]truth|synthetic test question"
+LEAK_WINDOW = 1
+
+
+def shipped_texts(repo) -> dict:
+    """Every text file that reaches agents: the archive of HEAD, and the working-tree copy
+    of each tracked file outside the hidden set (so uncommitted edits are scanned too)."""
+    out = {}
+    blob = _archive_of(repo)
+    if blob:
+        import io
+        import tarfile
+        with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as t:
+            for m in t.getmembers():
+                if m.isfile() and m.size <= MAX_TEXT_BYTES and not eval_paths.is_hidden(m.name):
+                    out[f"HEAD:{m.name}"] = t.extractfile(m).read().decode("utf-8", errors="ignore")
+        tracked = subprocess.run(["git", "-C", repo, "ls-files"], capture_output=True, text=True).stdout.split()
+        for p in tracked:
+            full = os.path.join(repo, p)
+            if not eval_paths.is_hidden(p) and os.path.isfile(full) and os.path.getsize(full) <= MAX_TEXT_BYTES:
+                with open(full, errors="ignore") as f:
+                    out[p] = f.read()
+    return out
+
+
+def shipped_leaks(repo=REPO, extra_texts=None, evals_dir=EVALS) -> list[str]:
+    """Shipped lines that tie the suite to a planted answer: a line naming the suite (or a
+    question id) with a question's `leak_keywords` within LEAK_WINDOW lines."""
+    qs = suite_questions(evals_dir)
+    kws = {q: [k.lower() for k in load_rubric(q, evals_dir).get("leak_keywords", [])] for q in qs}
+    mention = re.compile("|".join([_SUITE_MENTION] + [re.escape(q) for q in qs]), re.I)
+    texts = dict(shipped_texts(repo))
+    texts.update(extra_texts or {})
+    hits = []
+    for path, text in sorted(texts.items()):
+        lines = text.splitlines()
+        for i, ln in enumerate(lines):
+            if not mention.search(ln):
+                continue
+            window = "\n".join(lines[max(0, i - LEAK_WINDOW): i + LEAK_WINDOW + 1]).lower()
+            hits += [f"{path}:{i + 1}: {q} keyword {k!r}" for q in qs for k in kws[q] if k in window]
+    return sorted(set(hits))
+
+
 # ---- CLI --------------------------------------------------------------------------------
 
 def main(argv=None) -> int:
@@ -730,6 +954,8 @@ def main(argv=None) -> int:
     r.add_argument("--reps", type=int, default=1)
     r.add_argument("--tree", default=None)
     r.add_argument("--execute", action="store_true")
+    r.add_argument("--local", action="store_true",
+                   help="run on this machine, each replicate in a sanitized workspace (an archive of the tree)")
     r.add_argument("questions", nargs="*")
     gr = sub.add_parser("grade")
     gr.add_argument("question", nargs="?")
@@ -737,6 +963,8 @@ def main(argv=None) -> int:
     gr.add_argument("--root")
     gr.add_argument("--out")
     gr.add_argument("--gated", action="store_true", help="print the gated score as the headline number")
+    gr.add_argument("--unverified-inputs", action="store_true",
+                    help="grade a run with no launch record of its inputs (ad hoc; recorded in scores.json)")
     rp = sub.add_parser("report")
     rp.add_argument("a")
     rp.add_argument("b", nargs="?")
@@ -757,14 +985,16 @@ def main(argv=None) -> int:
         return 1 if bad else 0
     if args.cmd == "run":
         qs = args.questions or suite_questions()
+        tree = launch_tree(args.tree, qs[0])
         stale = {q: check_inputs(q) for q in qs}
         probs = [f"{q}: inputs differ from the generator: {d}" for q, d in stale.items() if d]
-        probs += leak_problems(args.tree or REPO)
-        for q in qs:
-            ensure_truth(q)
+        probs += leak_problems(tree)
+        probs += input_problems(tree, qs)   # the shipped tree's archived inputs, not this checkout's
         if probs:
             print("refusing to launch:\n  " + "\n  ".join(probs))
             return 1
+        if args.local:
+            return run_local(qs, tree, args.tag, args.reps, args.execute)
         cmds = launch_commands(qs, args.tag, args.reps, args.tree)
         print(f"preflight OK ({len(qs)} questions, {args.reps} replicate(s), model spend cap US$35 each, "
               f"at most US${35 * len(qs) * args.reps})")
@@ -789,7 +1019,9 @@ def main(argv=None) -> int:
             return 0
         if not (args.question and args.run_dir):
             ap.error("grade needs <question> <run_dir> or --root")
-        s = grade_run(args.question, args.run_dir)
+        s = grade_run(args.question, args.run_dir, verify_inputs=not args.unverified_inputs)
+        if s.get("refused"):
+            print(f"REFUSED: {s['refused']}")
         out = args.out or os.path.join(args.run_dir, "scores.json")
         with open(out, "w") as f:
             json.dump(s, f, indent=1)
@@ -854,14 +1086,14 @@ def build_fixture(run_dir, rubric, truth, kind="perfect") -> None:
         if not h or h in outs:
             continue
         tv, _ = headline_truth(truth, ans, h)
-        identifiable = truth["headlines"][h].get("identifiable", True)
-        if perfect and identifiable:
+        reportable = truth["headlines"][h].get("reportable", True)
+        if perfect and reportable:
             outs[h] = {"mean": tv, "ci_low": tv * 0.9, "ci_high": tv * 1.1}
-        elif perfect:   # an honest range for an unidentifiable quantity
+        elif perfect:   # the range the data allow
             lo, hi = truth["headlines"][h]["consistent_range"]
             outs[h] = {"mean": (lo + hi) / 2, "ci_low": lo, "ci_high": hi}
         else:
-            wrong = truth["headlines"][h].get("naive_value_rho_1_in_10", tv * 2)
+            wrong = truth["headlines"][h].get("naive_value", tv * 2)
             outs[h] = {"mean": wrong, "ci_low": wrong * 0.97, "ci_high": wrong * 1.03}
     with open(os.path.join(run_dir, "uncertainty_report.yaml"), "w") as f:
         yaml.safe_dump({"scalar_outputs": outs}, f)
@@ -873,6 +1105,7 @@ def _toy():
         "kind": "categorical", "units": ["U1", "U2"], "packages": ["none", "X", "X+Y"], "budget": 10.0,
         "benefit": {"U1": {"none": 0, "X": 5, "X+Y": 6}, "U2": {"none": 0, "X": 4, "X+Y": 4.5}},
         "cost": {"U1": {"none": 0, "X": 4, "X+Y": 8}, "U2": {"none": 0, "X": 4, "X+Y": 8}},
+        "feasible": {"U1": ["none", "X", "X+Y"], "U2": ["none", "X", "X+Y"]},
         "optimum": {"choice": {"U1": "X", "U2": "X"}, "objective": 9.0},
         "acceptable": {"U1": ["X"], "U2": ["X"]},
         "naive_optima": {"n": {"choice": {"U1": "X+Y", "U2": "none"}, "true_objective": 6.0}}},
@@ -956,7 +1189,7 @@ def _self_test() -> int:
         vr = {"id": "v", "type": "allocation_value", "weight": 1, "pass_ratio": 0.9, "floor": 0.5}
         over = score_check(vr, {"allocation": {"status": "ok", "choice": {"U1": "X+Y", "U2": "X+Y"}, "values": {},
                                                "missing_units": [], "unknown_labels": []}}, truth, "", "", [])
-        ok(over["score"] == 0 and over["failures"] == ["budget_infeasible"], f"S10 over budget: {over}")
+        ok(over["score"] == 0 and over["failures"] == ["allocation_infeasible"], f"S10 over budget: {over}")
         # report and comparison
         sa = {"questions": {"toy": [{"run_dir": "r", "quality": 0.5, "quality_gated": 0.4, "gate_action": "ACCEPT",
                                      "status": "completed", "rounds": 3, "cost_usd": 30, "wall_hours": 0.9,
@@ -971,10 +1204,10 @@ def _self_test() -> int:
             real_tax = load_taxonomy()
             codes_used = {"run_record_missing", "run_failed", "no_report", "false_confidence_accept",
                           "confident_wrong_interval", "grader_error", "inputs_not_referenced", "allocation_missing",
-                          "allocation_incomplete", "allocation_discordant", "fell_for_trap", "budget_infeasible",
+                          "allocation_incomplete", "allocation_discordant", "fell_for_trap", "allocation_infeasible", "inputs_mismatch", "inputs_unrecorded",
                           "plan_value_low", "unit_estimates_off", "headline_missing", "headline_off",
                           "interval_misses_truth", "interval_uninformative", "mechanism_not_reported",
-                          "not_declared_unidentifiable", "false_precision_unidentifiable", "statement_missing",
+                          "scope_not_declared", "false_precision", "statement_missing",
                           "gate_outcome_unexpected"}
             ok(codes_used <= set(real_tax["failures"]), f"Q0 taxonomy covers every failure code: "
                                                         f"{codes_used - set(real_tax['failures'])}")
@@ -1051,6 +1284,12 @@ def _self_test() -> int:
             for p in ("evals/q/generate.py", "evals/q/_truth/t.json", "data/evals/q/a.csv", "docs/design/eval-suite.md"):
                 ok(eval_paths.is_hidden(p) == enforcement.is_eval_hidden(os.path.join(REPO, p)),
                    f"L7 enforcement and eval_paths agree on {p}")
+            for name, fn in (("R1", _review_r1_leaks), ("R2", _review_r2_workspace), ("R3", _review_r3_feasible),
+                             ("R4", _review_r4_discovery), ("R5", _review_r5_inputs)):
+                try:
+                    fn(ok, os.path.join(td, f"review_{name}"))
+                except (Exception, SystemExit) as e:  # noqa: BLE001 — a missing piece is a failed case, not a crash
+                    ok(False, f"{name} raised {type(e).__name__}: {e}")
     for f in fails:
         print("FAIL:", f, file=sys.stderr)
     if fails:
@@ -1058,6 +1297,138 @@ def _self_test() -> int:
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+# ---- review round 1 (Phase 50 α, Codex P1s): each test reproduces the reported scenario --
+
+def _write_alloc(rd, header, rows):
+    with open(os.path.join(rd, "allocation_optimized.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerows(rows)
+
+
+def _launch_fixture(out, q, truth, labels, hashes=None):
+    hashes = hashes if hashes is not None else {f"data/evals/{q}/{n}": h for n, h in truth["inputs_sha256"].items()}
+    os.makedirs(out, exist_ok=True)
+    with open(os.path.join(out, "assignments.json"), "w") as f:
+        json.dump({lab: {"launch_id": lid, "eval_inputs_sha256": hashes} for lab, lid in labels.items()}, f)
+
+
+def _collected(label_dir, launch_id, rubric, truth, kind):
+    build_fixture(os.path.join(label_dir, "runs", f"2026-11-01_{kind}"), rubric, truth, kind)
+    with open(os.path.join(label_dir, "result.json"), "w") as f:
+        json.dump({"launch_id": launch_id}, f)
+
+
+def _review_r1_leaks(ok, td):
+    hits = shipped_leaks(REPO)
+    ok(not hits, f"R1 no shipped file signals a planted answer: {hits[:5]}")
+    kw = sorted(load_rubric(suite_questions()[-1]).get("leak_keywords", ["?"]))[0]   # built here, never written out
+    fake = {"CHANGELOG.md": f"| 50 | the eval suite: one question's answer is partly {kw} |"}
+    ok(shipped_leaks(REPO, extra_texts=fake), "R1b a shipped line naming the suite beside a planted keyword is caught")
+    ok(all(load_rubric(q).get("leak_keywords") for q in suite_questions()), "R1c every rubric lists its planted keywords")
+
+
+def _review_r2_workspace(ok, td):
+    ok(workspace_problems(REPO), "R2 the grader checkout (evals/, .git) is refused as an eval workspace")
+    ws = sanitized_workspace(REPO, td)
+    ok(not workspace_problems(ws) and os.path.isfile(os.path.join(ws, "main.py"))
+       and os.path.isdir(os.path.join(ws, "data", "evals")), f"R2b the sanitized workspace has code and inputs only: {ws}")
+    q = open(os.path.join(EVALS, "malaria_alloc", "question.txt")).read()
+    ok(eval_paths.eval_workspace_problem(q, REPO) and not eval_paths.eval_workspace_problem(q, ws)
+       and not eval_paths.eval_workspace_problem("An ordinary question.", REPO),
+       "R2c an eval question is refused in a checkout and allowed in the sanitized workspace")
+    with open(os.path.join(REPO, "main.py")) as f:
+        ok("eval_workspace_problem(" in f.read(), "R2d main.py applies the workspace rule before a run starts")
+
+
+def _review_r3_feasible(ok, td):
+    q = "flu_vaccine"
+    rub, t = load_rubric(q), ensure_truth(q)
+
+    def flu(name, doses):
+        rd = os.path.join(td, name)
+        build_fixture(rd, rub, t, "perfect")
+        _write_alloc(rd, ["age_group", "doses", "hospitalisations_averted"], list(zip(t["allocation"]["units"], doses, [0] * 5)))
+        return grade_run(q, rd, truth=t, verify_inputs=False)
+    for name, doses in (("over", [0, 630000, 187500, 0, 0]),       # rounds to the optimum 0,8,2,0,0; 817,500 doses
+                        ("cap", [300000, 450000, 0, 0, 0]),         # 0-4 above 70% uptake (245,000)
+                        ("negative", [0, 600000, 225000, -75000, 0]),
+                        ("partial", [0, 600000, 112500, 37500, 0])):  # not whole blocks
+        s = flu(name, doses)
+        alloc = {c["id"]: c for c in s["checks"] if c["type"].startswith("allocation_")}
+        ok(all(c["score"] == 0 and "allocation_infeasible" in c["failures"] for c in alloc.values()),
+           f"R3 flu {name} allocation {doses} gets no allocation credit: {[(c['id'], c['score'], c['detail']) for c in alloc.values()]}")
+    q = "malaria_alloc"
+    rub, t = load_rubric(q), ensure_truth(q)
+    rd = os.path.join(td, "malaria_over")
+    build_fixture(rd, rub, t, "perfect")
+    al = t["allocation"]
+    rich = {u: max(al["feasible"][u], key=lambda p: al["cost"][u][p]) for u in al["units"]}
+    _write_alloc(rd, ["district", "package", "cases_averted"], [(u, p, al["benefit"][u][p]) for u, p in rich.items()])
+    s = grade_run(q, rd, truth=t, verify_inputs=False)
+    ok(all(c["score"] == 0 for c in s["checks"] if c["type"].startswith("allocation_") or c["type"] == "unit_value_accuracy"),
+       f"R3b an over-budget categorical plan gets no allocation credit: {[(c['id'], c['score']) for c in s['checks']]}")
+
+
+def _review_r4_discovery(ok, td):
+    q = "malaria_alloc"
+    rub, t = load_rubric(q), ensure_truth(q)
+    out = os.path.join(td, q)
+    _launch_fixture(out, q, t, {"R1": "L2", "R2": "L2", "R3": "L2"})
+    _collected(os.path.join(out, "R1"), "L2", rub, t, "wrong")                 # the current, failed run
+    _collected(os.path.join(out, "R1.before_L1_1793"), "L1", rub, t, "perfect")  # an earlier launch's success
+    _collected(os.path.join(out, "R3"), "L1", rub, t, "perfect")               # R3 not yet re-collected
+    rows = grade_root(td)["questions"][q]
+    ok(len(rows) == 3 and rows[0]["quality"] == 0.0 and rows[0]["run_dir"] and ".before_" not in rows[0]["run_dir"]
+       and rows[1]["run_dir"] is None and rows[1]["quality"] == 0.0 and rows[2]["quality"] == 0.0
+       and all(r["label"] in ("R1", "R2", "R3") for r in rows),
+       f"R4 labels come from assignments.json, backups are ignored, missing or stale replicates score 0: "
+       f"{[(r.get('label'), r['quality'], r['run_dir'] and os.path.basename(os.path.dirname(os.path.dirname(r['run_dir'])))) for r in rows]}")
+    ok(grade_root(os.path.join(td, "nothing"))["questions"][q][0]["failures"] == ["run_record_missing"],
+       "R4b no launch record: the question scores 0")
+
+
+def _review_r5_inputs(ok, td):
+    q = "tb_acf"
+    rub, t = load_rubric(q), ensure_truth(q)
+    good = os.path.join(td, "good")
+    _launch_fixture(os.path.join(good, q), q, t, {"R1": "L1"})
+    _collected(os.path.join(good, q, "R1"), "L1", rub, t, "perfect")
+    ok(grade_root(good)["questions"][q][0]["quality"] == 1.0, "R5 matching recorded input hashes: graded")
+    bad = os.path.join(td, "bad")
+    first = sorted(t["inputs_sha256"])[0]
+    hashes = {f"data/evals/{q}/{n}": ("0" * 64 if n == first else h) for n, h in t["inputs_sha256"].items()}
+    _launch_fixture(os.path.join(bad, q), q, t, {"R1": "L1"}, hashes=hashes)
+    _collected(os.path.join(bad, q, "R1"), "L1", rub, t, "perfect")
+    row = grade_root(bad)["questions"][q][0]
+    ok(row["quality"] == 0.0 and "inputs_mismatch" in row["failures"], f"R5b a run on other inputs is refused: {row}")
+    lone = os.path.join(td, "lone", "runs", "r")
+    build_fixture(lone, rub, t, "perfect")
+    s = grade_run(q, lone, truth=t)
+    ok(s["quality"] == 0.0 and any(f["code"] == "inputs_unrecorded" for f in s["failures"]),
+       "R5c a run with no launch record of its inputs is refused unless --unverified-inputs")
+    # preflight hashes the selected tree's archived inputs, not the grader checkout's
+    tree = os.path.join(td, "tree")
+    os.makedirs(os.path.join(tree, "data", "evals", q))
+    for n in os.listdir(os.path.join(DATA, q)):
+        shutil.copy(os.path.join(DATA, q, n), os.path.join(tree, "data", "evals", q, n))
+    git = ["git", "-C", tree, "-c", "user.email=t@t", "-c", "user.name=t"]
+    subprocess.run(["git", "init", "-q", tree], check=True)
+    subprocess.run(git + ["add", "-A"], check=True)
+    subprocess.run(git + ["commit", "-qm", "x"], check=True)
+    ok(not input_problems(tree, [q]), f"R5d a tree with the same inputs passes preflight: {input_problems(tree, [q])}")
+    with open(os.path.join(tree, "data", "evals", q, first), "a") as f:
+        f.write("x\n")
+    subprocess.run(git + ["commit", "-qam", "y"], check=True)
+    ok(input_problems(tree, [q]), "R5e a tree whose committed inputs differ from the truth is refused")
+    sys.path.insert(0, os.path.join(REPO, "cloud"))
+    import inspect
+    import run_cluster
+    ok("eval_inputs_sha256" in inspect.getsource(run_cluster.launch)
+       and "eval_inputs_sha256" in inspect.getsource(run_cluster.relaunch),
+       "R5f launch and relaunch record the shipped inputs' hashes per run")
 
 
 def _archive_of(repo) -> bytes:

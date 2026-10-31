@@ -17,7 +17,9 @@ Shipped: each question's input data, `data/evals/<q>/`, like the rest of `data/`
 """
 from __future__ import annotations
 
+import hashlib
 import io
+import os
 import sys
 import tarfile
 
@@ -31,7 +33,7 @@ def is_hidden(path: str) -> bool:
     parts = [p for p in str(path).replace("\\", "/").split("/") if p not in ("", ".")]
     if not parts:
         return False
-    if any(p.startswith("_truth") for p in parts):
+    if any(p.startswith("_truth") or p == ".git" for p in parts):
         return True
     if parts[0] == "evals":
         return True
@@ -47,6 +49,47 @@ def hidden_members(blob: bytes) -> list[str]:
             return sorted(m.name for m in t.getmembers() if not m.isdir() and is_hidden(m.name))
     except (tarfile.TarError, OSError, EOFError) as e:
         return [f"<unreadable archive: {type(e).__name__}>"]
+
+
+def archive_sha256(blob: bytes, prefix: str = "data/evals/") -> dict:
+    """sha256 of every file member under `prefix` in a .tar.gz: the inputs a launch
+    shipped, recorded with each run so grading can refuse a run on other inputs."""
+    out = {}
+    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:*") as t:
+        for m in t.getmembers():
+            if m.isfile() and m.name.startswith(prefix):
+                out[m.name] = hashlib.sha256(t.extractfile(m).read()).hexdigest()
+    return out
+
+
+# The marker every eval question's text carries in its first words.
+EVAL_MARKER = "(evaluation suite)"
+_WORKSPACE_HIDDEN = (".git", "evals", os.path.join("docs", "design", "eval-suite.md"))
+
+
+def workspace_hidden(root: str) -> list[str]:
+    """Hidden paths with content under `root`. `git archive` keeps an empty `evals/`
+    directory entry, so an empty directory holds nothing and does not count."""
+    found = []
+    for p in _WORKSPACE_HIDDEN:
+        full = os.path.join(root, p)
+        if os.path.isfile(full) or (os.path.isdir(full) and any(files for _, _, files in os.walk(full))):
+            found.append(p)
+    return found
+
+
+def eval_workspace_problem(question: str, root: str) -> str | None:
+    """An eval question runs only in a sanitized workspace: an archive of the tree,
+    with no evals/ and no repository history. In a checkout, agents could reach the
+    answer keys through the history or the generators, and no deny pattern closes
+    every route."""
+    if EVAL_MARKER not in (question or ""):
+        return None
+    found = workspace_hidden(root)
+    if found:
+        return (f"this is an eval-suite question, and {root} holds {', '.join(found)}: run it from a sanitized "
+                "workspace (`python3 scripts/eval_suite.py run --local`, or the cloud launcher)")
+    return None
 
 
 def _self_test() -> int:
@@ -80,6 +123,19 @@ def _self_test() -> int:
     ok(hidden_members(tgz(["main.py", "evals/q/_truth/truth.json"])) == ["evals/q/_truth/truth.json"],
        "EP4 an answer key in the tarball is reported")
     ok(hidden_members(b"not a tarball")[0].startswith("<unreadable"), "EP5 an unreadable tarball fails closed")
+    ok(hidden_members(tgz(["main.py", ".git/HEAD"])) == [".git/HEAD"], "EP6 a tarball holding .git is reported")
+    sums = archive_sha256(tgz(["main.py", "data/evals/q/a.csv"]))
+    ok(list(sums) == ["data/evals/q/a.csv"] and sums["data/evals/q/a.csv"] == hashlib.sha256(b"x").hexdigest(),
+       "EP7 archive_sha256 hashes the shipped inputs only")
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        q = "SYNTHETIC TEST QUESTION (evaluation suite): x"
+        os.makedirs(os.path.join(td, "evals"))   # the empty directory entry git archive keeps
+        ok(eval_workspace_problem(q, td) is None, "EP8 a sanitized workspace (empty evals/) may run an eval question")
+        os.makedirs(os.path.join(td, ".git"))
+        open(os.path.join(td, ".git", "HEAD"), "w").close()
+        ok(eval_workspace_problem(q, td) and eval_workspace_problem("ordinary", td) is None,
+           "EP9 a checkout may not run an eval question; ordinary questions are unaffected")
     for f in fails:
         print("FAIL:", f, file=sys.stderr)
     if fails:

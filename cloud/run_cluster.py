@@ -297,7 +297,8 @@ def launch(cfg):
     for label, w in zip(cfg.labels, workers):
         _submit(cfg, client, label, w, code, question, keys, launch_id)
         assign[label] = {"worker": w, "commit": commit, "submitted": time.strftime("%F %T"), "launch_id": launch_id,
-                         "cluster_id": cluster.cluster_id}
+                         "cluster_id": cluster.cluster_id,
+                         "eval_inputs_sha256": eval_paths.archive_sha256(code)}   # Phase 50 α: the inputs shipped
         print(f"fired {label} -> {w} @ {commit}", flush=True)
     json.dump(assign, open(cfg.state_file, "w"), indent=1)
     clusters = {"run": {"name": cfg.name, "id": cluster.cluster_id}, "launch_id": launch_id,
@@ -752,7 +753,8 @@ def relaunch(cfg, label):
     client.upload_file(os.path.join(HERE, "worker_side.py"))
     _submit(cfg, client, label, assign[label]["worker"], code, open(cfg.question_file).read().strip(), read_keys(),
             launch_id)
-    assign[label].update(commit=commit, submitted=time.strftime("%F %T"), relaunched=True)
+    assign[label].update(commit=commit, submitted=time.strftime("%F %T"), relaunched=True,
+                         eval_inputs_sha256=eval_paths.archive_sha256(code))
     json.dump(assign, open(cfg.state_file, "w"), indent=1)
     print(f"re-fired {label} -> {assign[label]['worker']} @ {commit}")
 

@@ -63,11 +63,22 @@ failures:
     meaning: the allocation is closer to the planted naive optimum than to the truth
     look_at: [models/mechanism_manifest.yaml, critique_domain.yaml]
     missed_by: [CRITIQUE, GATE]
-  budget_infeasible:
+  allocation_infeasible:
     layer: OPTIMIZE
-    meaning: the allocation costs more than the budget at the true unit costs
-    look_at: [models/optimization_quality.yaml, cost spec]
+    meaning: >-
+      the reported plan cannot be carried out: over budget at true costs, a package not
+      available in that unit, or (dose blocks) negative, partial blocks, over the uptake cap
+      or a total other than the doses available. No allocation credit is given.
+    look_at: [models/optimization_quality.yaml, cost spec, allocation_optimized.csv]
     missed_by: [GATE]
+  inputs_mismatch:
+    layer: INFRA
+    meaning: the run's launch record shows inputs other than those the answer key was generated from; not graded
+    look_at: [assignments.json eval_inputs_sha256, data/evals/ in the shipped tree]
+  inputs_unrecorded:
+    layer: INFRA
+    meaning: no launch record of the inputs the run received; not graded (use --unverified-inputs for an ad-hoc look)
+    look_at: [assignments.json, cloud/run_cluster.py launch]
   plan_value_low:
     layer: OPTIMIZE
     meaning: the plan achieves too little of the true optimum's benefit
@@ -101,14 +112,14 @@ failures:
     meaning: the planted mechanism is never named in the report, results or scope declaration
     look_at: [models/mechanism_manifest.yaml, critique_domain.yaml]
     missed_by: [CRITIQUE]
-  not_declared_unidentifiable:
+  scope_not_declared:
     layer: CRITIQUE
     meaning: a quantity the data cannot determine is not declared as such
     look_at: [scope_declaration.yaml, identifiability.yaml, critique_sufficiency.yaml]
     missed_by: [GATE]
-  false_precision_unidentifiable:
+  false_precision:
     layer: UQ
-    meaning: an unidentifiable quantity is reported with a narrow interval or one that misses the truth
+    meaning: a quantity the data do not determine is reported with a narrow interval or one that misses the truth
     look_at: [uncertainty_report.yaml, models/uq_declarations.yaml]
     missed_by: [CRITIQUE, GATE]
   statement_missing:

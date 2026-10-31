@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generator for eval question `dengue_scope` (synthetic; Phase 50 α).
+"""Generator for eval question `dengue_outbreak` (synthetic; Phase 50 α).
 
 The question where the data cannot identify a key quantity. Generating model (the
 answer key; never shipped to agents):
@@ -30,7 +30,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from _common import Rng, final_size, write_csv, write_truth  # noqa: E402
 
-QUESTION = "dengue_scope"
+QUESTION = "dengue_outbreak"
 SEED = 20261103
 HERE = os.path.dirname(os.path.abspath(__file__))
 INPUTS = os.path.join(os.path.dirname(os.path.dirname(HERE)), "data", "evals", QUESTION)   # shipped
@@ -107,10 +107,10 @@ def generate(inputs_dir: str = INPUTS, truth_dir: str = TRUTH, seed: int = SEED,
     truth = {
         "question": QUESTION, "seed": seed, "generator_version": 1,
         "headlines": {
-            "reff_2026": {"basis": "fixed", "value": reff_2026, "identifiable": True},
-            "attack_rate_2025": {"basis": "fixed", "value": attack, "identifiable": False,
+            "reff_2026": {"basis": "fixed", "value": reff_2026, "reportable": True},
+            "attack_rate_2025": {"basis": "fixed", "value": attack, "reportable": False,
                                  "consistent_range": [lo, hi],
-                                 "naive_value_rho_1_in_10": reported / (0.1 * N)},
+                                 "naive_value": reported / (0.1 * N)},
         },
         "parameters": {"r0": R0, "s0": S0, "rho": RHO, "r_eff0": R0 * S0, "total_infections": total_inf,
                        "total_reported": reported, "fit_from_data": fit},

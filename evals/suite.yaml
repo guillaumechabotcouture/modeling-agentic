@@ -7,7 +7,7 @@ questions:
   - measles_campaign
   - tb_acf
   - flu_vaccine
-  - dengue_scope
+  - dengue_outbreak
 # Per-run model spend is capped by the config (--max-budget-usd 35); compute VMs are
 # billed separately (cloud/run_cluster.py report-cost).
 expected_cost_usd_per_question: [20, 35]

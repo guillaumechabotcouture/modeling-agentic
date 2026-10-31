@@ -38,7 +38,7 @@ checks:
       - '\bM0?3\b|\bM0?7\b|\bM10\b'
     units: {names: [M03, M07, M10], min: 2}
   - {id: concordance, type: allocation_concordance, subtask: optimize, weight: 0.20, pass: 0.85}
-  - {id: plan_value, type: allocation_value, subtask: optimize, weight: 0.20, pass_ratio: 0.97, floor: 0.75, budget_tol: 0.005}
+  - {id: plan_value, type: allocation_value, subtask: optimize, weight: 0.20, pass_ratio: 0.97, floor: 0.75}
   - {id: headline, type: headline_accuracy, subtask: uncertainty, weight: 0.15, headline: total_cases_averted,
      outputs: [total_cases_averted, '.*cases_averted.*'], rel_tol: 0.20}
   - {id: interval, type: interval_coverage, subtask: uncertainty, weight: 0.15, headline: total_cases_averted,
@@ -56,3 +56,6 @@ self_test:
   wrong_text: >-
     Inputs used: districts.csv, routine_coverage_admin.csv and serosurvey_2025.csv. Immunity follows routine
     coverage; the lowest-coverage districts get the campaign.
+
+# Words that signal this question's planted answer (self-test R1).
+leak_keywords: [immunity gap, "M03", "M07", "M10", born 2020, administrative coverage]

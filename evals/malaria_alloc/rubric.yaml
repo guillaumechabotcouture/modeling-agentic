@@ -38,7 +38,7 @@ checks:
       - '\birs\b|indoor residual'
       - 'redundan|overlap|sub-?additiv|less than (multiplicative|additive)|not multiplicative|non-?multiplicative|interaction|antagonis|diminishing|little (added|additional|extra|incremental)|small (added|additional|incremental)|adds? (only|little)'
   - {id: concordance, type: allocation_concordance, subtask: optimize, weight: 0.20, pass: 0.8}
-  - {id: plan_value, type: allocation_value, subtask: optimize, weight: 0.20, pass_ratio: 0.98, floor: 0.85, budget_tol: 0.005}
+  - {id: plan_value, type: allocation_value, subtask: optimize, weight: 0.20, pass_ratio: 0.98, floor: 0.85}
   - {id: headline, type: headline_accuracy, subtask: uncertainty, weight: 0.15, headline: total_cases_averted,
      outputs: [total_cases_averted, '.*cases_averted.*'], rel_tol: 0.10}
   - {id: interval, type: interval_coverage, subtask: uncertainty, weight: 0.15, headline: total_cases_averted,
@@ -56,3 +56,7 @@ self_test:
   wrong_text: >-
     Inputs used: districts.csv, programme_history.csv and unit_costs.csv. Effects were combined
     multiplicatively, and spraying is added in the highest-burden districts.
+
+# Words that signal this question's planted answer. A shipped file (anything agents can
+# read) must never put one next to a mention of the suite (self-test R1).
+leak_keywords: [redundan, "ITN+IRS", "ITN x IRS", "IRS adds", multiplicative]
