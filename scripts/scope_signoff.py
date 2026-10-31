@@ -80,7 +80,7 @@ LEDGER, LEAD_ANSWERS, TRACE = "scope_signoff_ledger.json", "scope_signoff_answer
 MAX_SIGNOFF_WAITS = 20
 DECLINED, INVALID = "scope_declaration_declined", "scope_signoff_invalid"
 POLICY = os.path.join(os.path.dirname(HERE), ".claude", "orchestration", "scope_declaration_policy.yaml")
-CONDITIONS = ("allocation", "benchmark_intervention", "always")
+CONDITIONS = ("allocation", "benchmark_intervention", "always", "artifact")
 DECISIONS = ("accept", "decline")
 ACTION = "AWAIT_OWNER"
 _TOKEN = re.compile(r"[a-z][a-z0-9]*")
@@ -111,6 +111,9 @@ def load_map(path: str = POLICY) -> dict:
         if not (isinstance(v, dict) and v.get("when") in CONDITIONS and isinstance(v.get("reason"), str)
                 and v["reason"].strip()):
             raise ValueError(f"decision_bearing.kinds.{k} needs `when:` ({', '.join(CONDITIONS)}) and `reason:`")
+        if v["when"] == "artifact" and not (isinstance(v.get("artifacts"), list) and v["artifacts"]
+                                            and all(isinstance(a, str) for a in v["artifacts"])):
+            raise ValueError(f"decision_bearing.kinds.{k}: `when: artifact` needs an `artifacts:` list")
     gen = db.get("generic_tokens", [])
     if not isinstance(gen, list) or not all(isinstance(t, str) for t in gen):
         raise ValueError("decision_bearing.generic_tokens must be a list of strings")
@@ -176,6 +179,9 @@ def bears(run_dir: str, v: dict, cfg: dict, ctx: dict) -> Optional[str]:
         return None
     if rule["when"] == "always":
         return rule["reason"]
+    if rule["when"] == "artifact":
+        aid = str(v.get("artifact") or "")
+        return f"{rule['reason']}: `{aid}`" if aid in rule["artifacts"] else None
     if rule["when"] == "allocation":
         if "allocation" not in ctx:
             try:
@@ -207,11 +213,12 @@ def _file_sha(run_dir: str, rel) -> Optional[str]:
         return None
 
 
-def build_item(run_dir: str, v: dict, reason: str, entries: list[dict], evidence: Optional[str] = None) -> dict:
+def build_item(run_dir: str, v: dict, reason: str, entries: list[dict], evidence: Optional[str] = None,
+               cover: Optional[list] = None) -> dict:
     """What the owner is shown for one finding, with its fingerprint."""
     dt = _dt_mod()
     ident = dt._ident(v)
-    cover = dt.covering(entries, v)
+    cover = dt.covering(entries, v) if cover is None else cover
     decls, tests = [], {}
     for e in cover:
         status, detail, res = dt.entry_status(run_dir, e, v)
@@ -353,8 +360,10 @@ def gate_findings(run_dir: str, round_n: Optional[int] = None, current: Optional
         entries = []
     ctx: dict = {}
     seen = set()
-    for v in [x for x in (current or []) if isinstance(x, dict)]:
-        if v.get("severity") != "HIGH" or v.get("accept_blocker") or dt.critic_derived(v) \
+    todo = [(x, None) for x in (current or []) if isinstance(x, dict)]
+    todo += [(x, [e]) for x, e in _not_applicable_analyses(run_dir, entries, cfg, ctx)]
+    for v, na_entry in todo:
+        if v.get("severity") != "HIGH" or dt.critic_derived(v) \
                 or non_declarable(str(v.get("kind") or ""), v.get("scope_declarable")):
             continue
         reason = bears(run_dir, v, cfg, ctx)
@@ -362,7 +371,8 @@ def gate_findings(run_dir: str, round_n: Optional[int] = None, current: Optional
             continue
         base = [x for x in current or [] if isinstance(x, dict) and str(v.get("kind")).endswith("_persistent")
                 and x.get("kind") == str(v.get("kind"))[:-len("_persistent")]]
-        item = build_item(run_dir, v, reason, entries, evidence=base[0].get("claim") if base else None)
+        item = build_item(run_dir, v, reason, entries, evidence=base[0].get("claim") if base else None,
+                          cover=na_entry)
         if item["finding"] in seen:
             continue
         seen.add(item["finding"])
@@ -381,6 +391,44 @@ def gate_findings(run_dir: str, round_n: Optional[int] = None, current: Optional
             continue
         v["owner_signoff"] = True
         v["owner_item"] = item
+        if na_entry is not None:
+            out.append(v)          # the declared-absent analysis is a HIGH until the owner accepts it
+    return out
+
+
+def _not_applicable_analyses(run_dir: str, entries: list[dict], cfg: dict, ctx: dict) -> list:
+    """[(finding, entry)] for `not_applicable: <artifact>` declarations of a decision
+    analysis (the `artifact` rule's list) that the run requires and does not have:
+    declaring it absent is the owner's call, like the missing-artifact finding itself."""
+    rule = next((r for r in cfg["kinds"].values() if r["when"] == "artifact"), None)
+    if rule is None:
+        return []
+    kind = next(k for k, r in cfg["kinds"].items() if r is rule)
+    from lib.rigor_artifacts import load_artifacts
+    arts = {a.id: a for a in load_artifacts()}
+    out = []
+    for e in entries:
+        na = e.get("not_applicable")
+        if not na or not sd.entry_has_justification(e):
+            continue
+        for aid in (na if isinstance(na, list) else [na]):
+            aid = str(aid).strip()
+            a = arts.get(aid)
+            if aid not in rule["artifacts"] or a is None or os.path.exists(os.path.join(run_dir, a.path)):
+                continue
+            if a.triggered_by == "allocation":
+                if "allocation" not in ctx:
+                    try:
+                        ctx["allocation"] = _sibling("alloc_toolkit_use").allocation_present(run_dir)
+                    except Exception:  # noqa: BLE001 — fail closed
+                        ctx["allocation"] = True
+                if not ctx["allocation"]:
+                    continue
+            out.append(({"kind": kind, "severity": "HIGH", "stage": "GATE", "target_stage": "MODEL",
+                         "artifact": aid, "key": aid, "scope_declarable": True,
+                         "claim": (f"`{aid}` ({a.path}) is declared not applicable in scope_declaration.yaml (entry "
+                                   f"{e.get('id') or '?'}). It is a decision analysis, so only the owner may accept "
+                                   "its absence; or produce it.")}, e))
     return out
 
 
@@ -585,6 +633,24 @@ def _self_test() -> int:
             os.remove(os.path.join(d, "decision_rule.md"))
             ok(bears(d, cur()[0], cfg, {}) is None, "SO7 no allocation: allocation_unstable does not bear")
             open(os.path.join(d, "decision_rule.md"), "w").write("rule\n")
+            # SO25-SO27: a missing decision-relevant analysis is the owner's to accept, not self-exemptable.
+            ok(bears(d, {"kind": "sensitivity_analysis_missing", "severity": "HIGH"}, cfg, {}) is not None
+               and bears(d, {"kind": "uq_report_missing", "severity": "HIGH"}, cfg, {}) is not None
+               and bears(d, {"kind": "claims_ledger_missing", "severity": "HIGH"}, cfg, {}) is None,
+               "SO25 a missing decision analysis bears on the decision; a missing document does not")
+            ra = {"kind": "required_artifact_missing", "severity": "HIGH", "accept_blocker": True,
+                  "artifact": "sensitivity_analysis", "claim": "absent"}
+            c = [ra, dict(ra, artifact="claims_ledger")]
+            gate_findings(d, 6, c)
+            ok(c[0].get("owner_signoff") and not c[1].get("owner_signoff"),
+               "SO26 a missing required analysis is put to the owner; a missing document is not")
+            w(d, "scope_declaration.yaml", {"declarations": [
+                {"id": "SD-NA", "not_applicable": "outcome_fn", "justification": "no model run needed"}]})
+            f = gate_findings(d, 6, [])
+            ok(len(f) == 1 and f[0]["kind"] == "required_artifact_missing" and f[0].get("owner_signoff")
+               and f[0]["artifact"] == "outcome_fn",
+               f"SO27 declaring a decision analysis not applicable needs the owner: {[x.get('kind') for x in f]}")
+            os.remove(os.path.join(d, "scope_declaration.yaml"))
             # Marking, the decision, the request.
             c = cur()
             ok(gate_findings(d, 6, c) == [] and c[0].get("owner_signoff") and c[1].get("owner_signoff")

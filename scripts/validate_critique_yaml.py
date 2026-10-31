@@ -4340,6 +4340,8 @@ def _incorporate_rigor_violations(decision: dict, violations: list[dict],
                     "kind": v["kind"],
                     "scope_declarable": not is_non_declarable(
                         v["kind"], v.get("scope_declarable")),
+                    # Phase 49 β: a missing decision analysis is the owner's to accept.
+                    **({"owner_signoff": True, "owner_item": v.get("owner_item")} if v.get("owner_signoff") else {}),
                 })
             continue
         if v.get("severity") != "HIGH":
@@ -4643,6 +4645,13 @@ def _run_self_test() -> int:
         ok(dec["action"] == "PATCH_OR_RETHINK"
            and any(b.get("kind") == "scope_declaration_untested" for b in dec["unresolved_high"]),
            f"DT-V3 the untested registry declaration blocks rule 3a: {dec['action']}")
+    # SO-V3 (Phase 49 β): a missing decision analysis (an accept blocker) is the owner's at exhaustion.
+    _ra = {"kind": "required_artifact_missing", "severity": "HIGH", "accept_blocker": True, "scope_declarable": True,
+           "artifact": "sensitivity_analysis", "claim": "absent", "owner_signoff": True,
+           "owner_item": {"finding": "required_artifact_missing:sensitivity_analysis"}}
+    _d3 = _incorporate_rigor_violations({"unresolved_high": [], "declared": [], "declared_prev": []}, [_ra], 8, 8)
+    ok(_d3["action"] == "AWAIT_OWNER" and _d3["accept_blockers"][0].get("owner_signoff"),
+       f"SO-V3 a missing required analysis at exhaustion waits for the owner: {_d3['action']}")
     # Phase 49 β: a DECLARE_SCOPE that relies on a decision-bearing finding waits for the owner.
     bdo = dict(bd, owner_signoff=True, owner_item={"finding": "benchmark_drift:B15"})
     ok(act([bdo, sa], both, both)["action"] == "AWAIT_OWNER" and act([bdo, sa], both, both)["rule_matched"] == "3ao"

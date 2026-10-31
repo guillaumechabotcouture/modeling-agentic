@@ -40,19 +40,15 @@ decision_test:
   # named here needs a test (fail closed for new kinds).
   exempt_kinds:
     # A required artifact is absent: produce it; there is nothing to vary yet.
-    required_artifact_missing: "a required artifact is absent (not_applicable covers the rest)"
-    allocation_robustness_missing: "the cross-validation artifact is absent"
-    sensitivity_analysis_missing: "the sensitivity artifact is absent"
-    optimization_quality_missing: "the optimizer comparison artifact is absent"
+    # A missing decision analysis (the allocation's cross-validation and
+    # sensitivity, the optimizer check, the uncertainty and identifiability
+    # reports, the outcome function, ...) is not self-exemptable: it is in
+    # `decision_bearing:` below, so declaring its absence needs the owner.
+    required_artifact_missing: "a required document is absent (missing analyses: see decision_bearing)"
     universal_coverage_missing: "the universal-coverage artifact is absent"
-    within_zone_heterogeneity_missing: "the within-unit heterogeneity artifact is absent"
-    daly_analysis_missing: "the DALY analysis artifact is absent"
-    uq_report_missing: "the uncertainty report is absent"
-    identifiability_report_missing: "the identifiability report is absent"
     identifiability_a_priori_missing: "the a-priori identifiability arithmetic is absent"
     msc_manifest_missing: "the multi-structure manifest is absent"
     msc_report_missing: "the multi-structure report is absent"
-    outcome_fn_missing: "the outcome function is absent"
     decision_rule_missing: "decision_rule.md is absent"
     claims_ledger_missing: "the claims ledger is absent"
     claims_spec_missing: "the claims spec is absent"
@@ -108,7 +104,12 @@ decision_test:
 #                           none` marks a calibration target. When the run
 #                           lists no interventions, or the benchmark cannot be
 #                           read, the finding is treated as bearing (fail closed).
-#   always                  the kind is about an intervention effect the plan uses.
+#   always                  the kind is about an intervention effect the plan uses,
+#                           or an analysis every decision rests on is missing.
+#   artifact                `required_artifact_missing` (or a `not_applicable:`
+#                           declaration) for one of the listed artifacts: the
+#                           analysis was not run, so there is nothing to vary
+#                           and only the owner may accept its absence.
 decision_bearing:
   kinds:
     allocation_unstable:
@@ -129,6 +130,36 @@ decision_bearing:
     effect_exceeds_trial_evidence:
       when: always
       reason: "an intervention effect used by the plan exceeds the trial evidence"
+    # A decision analysis that was not run: nothing to vary, so not self-exemptable.
+    allocation_robustness_missing:
+      when: allocation
+      reason: "the allocation's out-of-sample check was not run"
+    sensitivity_analysis_missing:
+      when: allocation
+      reason: "the allocation's sensitivity analysis was not run"
+    optimization_quality_missing:
+      when: allocation
+      reason: "the optimizer was not checked against another method"
+    within_zone_heterogeneity_missing:
+      when: allocation
+      reason: "variation inside allocation units was not assessed"
+    daly_analysis_missing:
+      when: allocation
+      reason: "the allocation's DALY analysis was not run"
+    uq_report_missing:
+      when: always
+      reason: "the recommendation has no uncertainty analysis"
+    identifiability_report_missing:
+      when: always
+      reason: "the fitted parameters' identifiability was not assessed"
+    outcome_fn_missing:
+      when: always
+      reason: "the decision has no outcome function to evaluate it"
+    required_artifact_missing:
+      when: artifact
+      artifacts: [allocation_robustness, sensitivity_analysis, optimization_quality,
+                  within_zone_heterogeneity, outcome_fn, identifiability]
+      reason: "a required decision analysis is absent"
   # Words in benchmark metrics and intervention names that do not identify an
   # intervention (comparisons, outcomes, units). Quote YAML 1.1 booleans ("on").
   generic_tokens: [vs, or, rr, hr, irr, and, the, of, per, to, in, "on", with, without, added, none,
