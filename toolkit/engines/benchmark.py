@@ -222,11 +222,19 @@ class Runner:
         self.calibrated = {}
         self.nsims = 0
 
-    def _map(self, jobs):
+    def _map(self, jobs, chunk: int = 300):
+        """Run jobs; a fresh process pool per chunk (one long-lived pool broke on worker memory at
+        about 750 runs per VM in the spike)."""
         if self.workers <= 1 or len(jobs) <= 1:
             return [_job(j) for j in jobs]
-        with ProcessPoolExecutor(min(self.workers, len(jobs))) as ex:
-            return list(ex.map(_job, jobs, chunksize=1))
+        out = []
+        for i in range(0, len(jobs), chunk):
+            part = jobs[i:i + chunk]
+            with ProcessPoolExecutor(min(self.workers, len(part))) as ex:
+                out += list(ex.map(_job, part, chunksize=1))
+            if len(jobs) > chunk:
+                print(f"  ran {min(i + chunk, len(jobs))}/{len(jobs)} engine runs", flush=True)
+        return out
 
     def _setting(self, name):
         s = self.pack["settings"][name]
@@ -375,6 +383,7 @@ class Runner:
         out["status"] = "in_band" if out["in_band"] else "out_of_band"
         if b["estimand"]["type"] == "cost_per_outcome" and out.get("price_floor", 0) > hi:
             out["status"] = "band_mis_based"
+            out["mis_based_reason"] = "price_floor"
         return out
 
 
@@ -391,6 +400,29 @@ def apply_requires(rows: list) -> None:
         if miss:
             r["status"] = "not_assessable"
             r["not_assessable_because"] = {k: {"computed": round(vals[k], 4), "required": req[k]} for k in miss}
+
+
+def reach_check(pack: dict, runner: Runner, rows: list, fit_info: dict | None) -> None:
+    """For each out-of-band cost-per-outcome benchmark, evaluate it at every corner of the fitted
+    parameters' range (the values consistent with the effect benchmarks). If no corner reaches
+    the band, the band cannot be met at the pack's prices by any engine consistent with the
+    effect evidence: status band_mis_based (reason unreachable_in_fitted_range). In place."""
+    params = (fit_info or {}).get("parameters") or {}
+    if not params:
+        return
+    byid = {b["id"]: b for b in pack["benchmarks"]}
+    names = sorted(params)
+    corners = [dict(zip(names, c)) for c in itertools.product(*[(params[k]["lo"], params[k]["hi"]) for k in names])]
+    todo = [r for r in rows if byid[r["id"]]["estimand"]["type"] == "cost_per_outcome" and r["status"] == "out_of_band"]
+    for r in todo:
+        b = byid[r["id"]]
+        runner.prefetch(_arms_of(b["estimand"]), corners)
+        vals = [runner.evaluate(b, c)["computed"] for c in corners]
+        lo, hi = b["band"]
+        r["reach_in_fitted_range"] = [round(min(vals), 4), round(max(vals), 4)]
+        if all(v > hi for v in vals) or all(v < lo for v in vals):
+            r["status"] = "band_mis_based"
+            r["mis_based_reason"] = "unreachable_in_fitted_range"
 
 
 def _loss(b, comp):
@@ -555,6 +587,7 @@ def run_pack(pack: dict, engine, runner: Runner, fitted: dict, fit_info: dict | 
             row["infeasible_in_box"] = True
         row.update({k: (round(v, 4) if isinstance(v, float) else v) for k, v in r.items()})
         rows.append(row)
+    reach_check(pack, runner, rows, fit_info)
     apply_requires(rows)
     for row in rows:
         print(f"{row['id']:6s} {row['role']:8s} computed {row['computed']:.4g} target {row.get('target')} "
@@ -717,6 +750,17 @@ def _self_test() -> int:
         fit_joint=dict(p3["fit_joint"], targets=["J1", "J2", "J4"]))
     jc = fit_joint(conf, eng, Runner(conf, eng, 1))
     ok(["J1", "J4"] in jc["feasibility"]["conflicting_pairs"], "BP24 two targets that cannot be in band together are reported as a conflict")
+    # reach check: cost per case = 30 / (1.5 eff_a) = 20 / eff_a, eff_a fitted range [0.3, 0.7] -> [28.6, 66.7]
+    p4 = dict(pack, fit=[], benchmarks=[
+        {"id": "R1", "metric": "unreachable", "target": 10.0, "band": [5.0, 20.0],
+         "estimand": {"type": "cost_per_outcome", "num": "a", "den": "none", "value": "per_capita.cases.all", "costs": {"a_doses": 10.0}}},
+        {"id": "R2", "metric": "reachable", "target": 30.0, "band": [5.0, 40.0],
+         "estimand": {"type": "cost_per_outcome", "num": "a", "den": "none", "value": "per_capita.cases.all", "costs": {"a_doses": 10.0}}}])
+    info = {"parameters": {"eff_a": {"value": 0.4, "lo": 0.3, "hi": 0.7}}}
+    res4 = {x["id"]: x for x in run_pack(p4, eng, Runner(p4, eng, 1), {"eff_a": 0.4}, info)["benchmarks"]}
+    ok(res4["R1"]["status"] == "band_mis_based" and res4["R1"]["mis_based_reason"] == "unreachable_in_fitted_range"
+       and res4["R2"]["status"] == "out_of_band" and abs(res4["R2"]["reach_in_fitted_range"][0] - 20 / 0.7) < 1e-3,
+       "BP25 a cost band no fitted-range value can reach is band_mis_based; a reachable one stays out_of_band with its reach")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
