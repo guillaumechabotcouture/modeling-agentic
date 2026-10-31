@@ -937,6 +937,13 @@ def _self_test() -> int:
     import shutil
     from v2_tasks import StubTasks
     fails = []
+    # T10-T35 use the spike adapter's toy spec, so they pin that backend: since workstream B
+    # merged, the default backend is B's, whose spec schema the spike fixtures do not follow.
+    spike = AB.backend("spike")
+
+    def _SpikeMachine(*a, **k):
+        k.setdefault("backend", spike)
+        return Machine(*a, **k)
 
     def ok(c, m):
         print(("PASS " if c else "FAIL ") + m)
@@ -990,7 +997,7 @@ def _self_test() -> int:
         d, T, st = new_run("happy", {"critics": {1: {"critique-domain": [blocker]}},
                                      "fixes": {"D-001": [("analysis_settings.yaml", "uncertainty.draws", 24)],
                                                "uncertainty_draws_low:draws": [("analysis_settings.yaml", "uncertainty.draws", 24)]}})
-        status = Machine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+        status = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
         hist = [h["to"] for h in load_state(d).history if "to" in h]
         ok(status == "completed", f"T10 toy run completes: {status} via {hist}")
         ok(hist[:6] == ["SIGN", "EVIDENCE", "ENGINE_CHOICE", "CONFIGURE", "ANALYZE", "CRITIQUE"] and "FIX_LOOP" in hist
@@ -1011,17 +1018,17 @@ def _self_test() -> int:
         # T16: resume after every state. Stop after k steps, rebuild the machine from disk, finish.
         d0, T0, st0 = new_run("ref", {"critics": {1: {"critique-domain": [blocker]}},
                                       "fixes": {"D-001": [("analysis_settings.yaml", "uncertainty.draws", 24)]}})
-        ref_status = Machine(d0, T0, st0, log=lambda *a: None, cross_engine_check=False).run()
+        ref_status = _SpikeMachine(d0, T0, st0, log=lambda *a: None, cross_engine_check=False).run()
         ref_path = [h["to"] for h in load_state(d0).history if "to" in h]
         bad = []
         for k in range(1, len(ref_path)):
             dk, Tk, stk = new_run(f"resume{k}", {"critics": {1: {"critique-domain": [blocker]}},
                                                 "fixes": {"D-001": [("analysis_settings.yaml", "uncertainty.draws", 24)]}})
-            m = Machine(dk, Tk, stk, log=lambda *a: None, cross_engine_check=False)
+            m = _SpikeMachine(dk, Tk, stk, log=lambda *a: None, cross_engine_check=False)
             for _ in range(k):
                 m.step()
             del m
-            m2 = Machine(dk, StubTasks(Tk.s), None, log=lambda *a: None, cross_engine_check=False)   # from run_state.json
+            m2 = _SpikeMachine(dk, StubTasks(Tk.s), None, log=lambda *a: None, cross_engine_check=False)   # from run_state.json
             s2 = m2.run()
             p2 = [h["to"] for h in load_state(dk).history if "to" in h]
             if s2 != ref_status or p2 != ref_path:
@@ -1031,11 +1038,11 @@ def _self_test() -> int:
 
         # T17: owner sign-off pauses, persists, resumes.
         d, T, st = new_run("owner", {}, signoff="owner")
-        m = Machine(d, T, st, log=lambda *a: None, cross_engine_check=False)
+        m = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False)
         s = m.run()
         ok(s == "paused:awaiting_signoff" and load_state(d).state == "SIGN", f"T17 owner mode pauses at SIGN ({s})")
         sign(d, "owner", "ok")
-        ok(Machine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run() == "completed",
+        ok(_SpikeMachine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run() == "completed",
            "T18 after the owner signs, the resumed run completes")
 
         # T19: a fix that edits the signed spec, or puts a decision leaf in the settings file, is
@@ -1051,7 +1058,7 @@ def _self_test() -> int:
                 nonlocal signed_before
                 signed_before = signed_before or _signoff(run_dir)["spec_sha256"]
                 return super().fix(task, run_dir, evidence)
-        s = Machine(d, Spy(T.s), st, log=lambda *a: None, cross_engine_check=False).run()
+        s = _SpikeMachine(d, Spy(T.s), st, log=lambda *a: None, cross_engine_check=False).run()
         rows = FX.impact_rows(d)
         led = FL.load(d)
         ok(rows and all(r.get("rejected") and not r.get("steps_rebuilt") for r in rows)
@@ -1062,7 +1069,7 @@ def _self_test() -> int:
 
         # T20: a structural mismatch is a back-edge to ENGINE_CHOICE, then the run continues.
         d, T, st = new_run("rethink", {"structural": {1: "critique-domain"}})
-        s = Machine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+        s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
         p = [h["to"] for h in load_state(d).history if "to" in h]
         i = p.index("GATE")
         ok(p[i + 1] == "ENGINE_CHOICE" and s == "completed" and load_state(d).round == 2,
@@ -1071,12 +1078,12 @@ def _self_test() -> int:
         # T21: an open blocker at the last round: DECLARE_SCOPE when declarable.
         nofix = {"id": "D-009", "severity": "HIGH", "target_stage": "ANALYZE", "claim": "cannot fix"}
         d, T, st = new_run("declare", {"critics": {1: {"critique-domain": [nofix]}}}, max_rounds=2)
-        s = Machine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+        s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
         ok(s == "completed_scope_declared", f"T21 an unfixed critic blocker at exhaustion ends scope-declared ({s})")
 
         # T22: the budget, not the gate, ends the run: the harness writes the report.
         d, T, st = new_run("budget", {"critics": {1: {"critique-domain": [nofix]}}, "usd": 30.0}, budget=100.0)
-        s = Machine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+        s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
         p = [h["to"] for h in load_state(d).history if "to" in h]
         ok(s == "budget_exhausted" and "WRITE" in p and os.path.exists(os.path.join(d, "report.md")),
            f"T22 with the budget used the run ends budget_exhausted with a report ({s}, {p[-4:]})")
@@ -1084,7 +1091,7 @@ def _self_test() -> int:
         # T25: an interrupted paid task. The redteam critique crashes once in round 1: on resume the
         # domain critique (completed) is not run again, and the interrupted one is charged its allowance.
         d, T, st = new_run("crash", {"crash": {"critique:critique-redteam:1": 1}, "usd": 1.0}, budget=100.0)
-        m = Machine(d, T, st, log=lambda *a: None, cross_engine_check=False)
+        m = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False)
         try:
             m.run()
             ok(False, "T25 the stub crash propagates")
@@ -1092,7 +1099,7 @@ def _self_test() -> int:
             pass
         spent_at_crash = load_state(d).spent_usd
         T2 = StubTasks(dict(T.s, crash={}))
-        s = Machine(d, T2, None, log=lambda *a: None, cross_engine_check=False).run()
+        s = _SpikeMachine(d, T2, None, log=lambda *a: None, cross_engine_check=False).run()
         j = load_state(d).journal
         dom = [k for k in j if k.endswith(":r1:critique-domain")]
         red = [k for k in j if k.endswith(":r1:critique-redteam")]
@@ -1108,7 +1115,7 @@ def _self_test() -> int:
         d, T, st = new_run("allow", {"usd": 9.0}, budget=30.0)
         st.task_cap_usd = 9.0
         save_state(d, st)
-        s = Machine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+        s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
         ok(T.allowances == [9.0, 9.0, 2.0, 3.0] and "critique:critique-redteam:1" not in T.calls
            and s == "budget_exhausted",
            f"T27 allowances follow the budget and the pair stops when it is used ({T.allowances}, {s})")
@@ -1125,7 +1132,7 @@ def _self_test() -> int:
             if name == "link":
                 os.makedirs(os.path.join(td, "elsewhere"), exist_ok=True)
                 os.symlink(os.path.join(td, "elsewhere"), os.path.join(d, "out"))
-            s = Machine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+            s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
             led = FL.load(d)
             bad_paths[name] = ("deliverable_path_invalid:deliverable" in led and s == "run_failed"
                                and not os.path.exists(os.path.join(td, "escape.csv"))
@@ -1167,11 +1174,11 @@ def _self_test() -> int:
         # entry is charged its allowance once and the draft runs again under the same key.
         d, T, st = new_run("spec_crash", {"crash": {"draft_spec": 1}, "usd": 1.0}, budget=100.0)
         try:
-            Machine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+            _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
         except RuntimeError:
             pass
         T2 = StubTasks(dict(T.s, crash={}))
-        m2 = Machine(d, T2, None, log=lambda *a: None, cross_engine_check=False)
+        m2 = _SpikeMachine(d, T2, None, log=lambda *a: None, cross_engine_check=False)
         s = m2.run()
         j = load_state(d).journal
         spec_keys = sorted(k for k in j if k.startswith("SPEC#"))
@@ -1181,9 +1188,9 @@ def _self_test() -> int:
         d, T, st = new_run("orphan", {}, budget=100.0)
         st.journal["X#0:orphan"] = {"task": "critique", "status": "started", "allowance_usd": 2.5}
         save_state(d, st)
-        m3 = Machine(d, StubTasks({}), None, log=lambda *a: None)
+        m3 = _SpikeMachine(d, StubTasks({}), None, log=lambda *a: None)
         ok(abs(m3.st.spent_usd - 2.5) < 1e-9 and m3.st.journal["X#0:orphan"]["status"] == "interrupted"
-           and abs(Machine(d, StubTasks({}), None, log=lambda *a: None).st.spent_usd - 2.5) < 1e-9,
+           and abs(_SpikeMachine(d, StubTasks({}), None, log=lambda *a: None).st.spent_usd - 2.5) < 1e-9,
            f"T34 on resume every started-but-uncompleted entry is charged once ({m3.st.spent_usd})")
 
         # T35 (Codex R2-5): case aliases of owned files are refused (case-insensitive filesystems).
@@ -1202,8 +1209,43 @@ def _self_test() -> int:
         alias["hardlink"] = bool(deliverable_problems(os.path.join(td, "alias_link")))
         ok(all(alias.values()), f"T35 case aliases and a hard link to an owned file are refused {alias}")
 
+        # T36: the default backend. Once workstream B's analysis engine is on the branch, the
+        # machine runs on it by default: B's toy spec with engine: auto, B's sign-off, B's step.
+        if type(AB.backend()).__name__ == "_ToolkitApi":
+            import yaml
+            from toolkit.spec import schema
+            src = os.path.join(td, "b_src")
+            os.makedirs(src)
+            raw = yaml.safe_load(open(schema.toy_spec(src)))
+            raw["engine"] = "auto"
+            for k in ("draws", "seed"):
+                (raw.get("uncertainty") or {}).pop(k, None)
+            em = (raw.get("analysis") or {}).get("emulator") or {}
+            pts, eseed = em.pop("points", 24), em.pop("seed", 5)
+            (raw.get("analysis") or {}).pop("workers", None)
+            d = os.path.join(td, "b_run")
+            os.makedirs(d)
+            for f in os.listdir(src):
+                if f != AB.SPEC_FILE and os.path.isfile(os.path.join(src, f)):
+                    shutil.copy(os.path.join(src, f), d)
+            bl = {"id": "D-001", "severity": "HIGH", "target_stage": "ANALYZE", "claim": "too few draws",
+                  "done_when": [{"file": "analysis_settings.yaml", "key": "uncertainty.draws", "op": ">=", "value": 12}]}
+            T = StubTasks({"spec": raw, "critics": {1: {"critique-domain": [bl]}},
+                           "settings": {"uncertainty": {"draws": 6, "seed": 1},
+                                        "analysis": {"workers": 2, "emulator": {"points": pts, "seed": eseed}}},
+                           "fixes": {"D-001": [("analysis_settings.yaml", "uncertainty.draws", 12)]}})
+            st = init_run(d, "toy question", 3, "lead", "v2", None)
+            s = Machine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+            rows = FX.impact_rows(d)
+            man = os.path.exists(os.path.join(d, "analysis", "manifest.json"))
+            ok(s == "completed" and man and rows and rows[0]["files_changed"] == ["analysis_settings.yaml"]
+               and FL.load(d)["D-001"].status == "fixed",
+               f"T36 the default backend (workstream B) runs the machine end to end with engine: auto ({s})")
+        else:
+            ok(True, "T36 skipped: workstream B's analysis engine is not on this branch")
+
         # T23: a transition outside the table is refused.
-        m = Machine(os.path.join(td, "ref"), StubTasks({}), None, log=lambda *a: None)
+        m = _SpikeMachine(os.path.join(td, "ref"), StubTasks({}), None, log=lambda *a: None)
         m.st.state = "SPEC"
         try:
             m._go("WRITE")
