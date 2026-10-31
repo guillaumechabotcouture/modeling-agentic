@@ -1,9 +1,7 @@
 """Modeling agent orchestrator -- single lead session with parallel subagents."""
 
 import asyncio
-import contextlib
 import argparse
-import glob
 import json
 import os
 import re
@@ -23,14 +21,7 @@ from claude_agent_sdk import (
     ResultMessage,
     UserMessage,
     SystemMessage,
-    TaskStartedMessage,
-    TaskProgressMessage,
-    TaskNotificationMessage,
 )
-try:   # Phase 32 γ (Codex review): a background task can end with only an update
-    from claude_agent_sdk import TaskUpdatedMessage
-except ImportError:  # older SDKs
-    TaskUpdatedMessage = ()
 from agents import (
     build_agents,
     build_lead_prompt,
@@ -41,177 +32,64 @@ from agents import (
 )
 from agents import enforcement
 from agents.integrity import ArtifactIntegrity
+from agents.run_session import (  # noqa: E402,F401  Phase 48 γ: moved, re-exported
+    LEAD_TOOLS,
+    TERMINAL_TASK_STATUSES,
+    log_message,
+    result_summary,
+    result_is_success,
+    is_policy_block,
+)
+from agents.run_budget import (  # noqa: E402,F401  Phase 48 γ: moved, re-exported
+    BUDGET_LEDGER,
+    load_budget_ledger,
+    MAX_USD_PER_HOUR,
+    RECONCILE_PROMPT,
+    reconcile_conversation_cost,
+    TRANSCRIPT_MARGIN,
+    crashed_session_cost,
+    charge_session,
+    conversation_cost,
+    write_budget_ledger,
+    writeup_reserve,
+    remaining_budget,
+)
+from agents.run_preflight import (  # noqa: E402,F401  Phase 48 γ: moved, re-exported
+    PREFLIGHT_IMPORTS,
+    WRITER_DRAFT,
+    preflight_command,
+    pinned_sdk_version,
+    evaluate_preflight,
+    run_preflight,
+    _probe_subagent_write,
+    _sdk_version,
+)
+from agents.run_finish import (  # noqa: E402,F401  Phase 48 γ: moved, re-exported
+    VALIDATOR,
+    SUCCESS_STATUSES,
+    PARTIAL_STATUSES,
+    _HARNESS_LOCK,
+    detect_current_round,
+    PIPELINE_FINAL_BUDGET_S,
+    _rebuild_derived,
+    run_final_gate,
+    determine_status,
+    exit_code_for,
+    restore_report_if_missing,
+    VERDICT_BANNER_MARK,
+    add_verdict_banner,
+    _PROTECTED_META,
+    _restore_protected_meta,
+    finalize_run,
+    _store_blob_name,
+    write_model_card,
+    store_run_results,
+    WRITEUP_PROMPT,
+    _harness_wrote_gate_outputs,
+    final_writeup,
+)
 
 REPO_ROOT = enforcement.REPO_ROOT
-VALIDATOR = os.path.join(REPO_ROOT, "scripts", "validate_critique_yaml.py")
-
-# Phase 21 α: the lead's tool set is passed as `tools=` (the base set the
-# CLI exposes). `allowed_tools` alone is only a permission allowlist,
-# which bypassPermissions makes moot, so before Phase 21 the lead had
-# every default tool (including Edit) and used it on gate inputs.
-LEAD_TOOLS = ["Agent", "Bash", "Read", "Write", "Glob", "Grep", "Skill"]
-
-# Terminal statuses that count as success (exit 0). Everything else is
-# non-zero so cron / CI wrappers can't mistake a non-accepted run for a
-# good one. See determine_status() for the full list.
-SUCCESS_STATUSES = {"completed", "completed_with_report_restored"}
-# Pipeline finished and wrote a report, but the final gate did not ACCEPT.
-PARTIAL_STATUSES = {"completed_scope_declared", "completed_gate_not_accepted",
-                    "completed_gate_error", "completed_gate_not_run",
-                    "completed_no_report", "run_failed", "budget_exhausted",
-                    "awaiting_signoff"}   # Phase 33: resumable with --resume once signed
-
-
-BUDGET_LEDGER = "budget_ledger.json"
-
-
-def load_budget_ledger(run_path: str) -> dict:
-    """The harness-owned spend record (agents may not write it; the
-    integrity record watches it). Not metadata.json: the planner may edit
-    that file (Codex review of PR #15)."""
-    try:
-        with open(os.path.join(run_path, BUDGET_LEDGER)) as f:
-            d = json.load(f)
-        if isinstance(d, dict) and isinstance(d.get("sessions"), list):
-            return d
-    except (OSError, ValueError):
-        pass
-    return {"sessions": []}
-
-
-# Phase 28: a session that dies before starting its conversation (no session
-# id: no API call yet) is charged an upper bound from its duration, ~2x the
-# highest hourly spend observed (E7 runs averaged ~$25-30/h).
-MAX_USD_PER_HOUR = 60.0
-RECONCILE_PROMPT = ("The previous session was interrupted by a crash. Reply with the single word OK "
-                    "and do nothing else; the harness is reading this conversation's cost.")
-
-
-async def reconcile_conversation_cost(options, session_id: str, timeout_s: float = 300, query_fn=None):
-    """After a crash, the conversation's true cumulative cost: resume it for
-    one tool-less turn; the SDK reports cumulative cost for a resumed
-    conversation (verified 2026-10-23, crash smokes 2026-10-25). Returns the
-    ResultMessage, or None if it cannot be read (API down, timeout)."""
-    import dataclasses
-    probe = dataclasses.replace(options, resume=session_id, max_turns=1, tools=[], allowed_tools=[],
-                                agents={}, hooks=None, max_budget_usd=None)
-    qf = query_fn or query
-
-    async def go():
-        async for m in qf(prompt=RECONCILE_PROMPT, options=probe):
-            if isinstance(m, ResultMessage):
-                # The read-back turn itself costs something: an error result or a
-                # zero cost means the conversation was not actually resumed.
-                ok_ = (not m.is_error and isinstance(m.total_cost_usd, (int, float))
-                       and m.total_cost_usd > 0 and (m.session_id in (None, session_id)))
-                return m if ok_ else None
-        return None
-    try:
-        return await asyncio.wait_for(go(), timeout_s)
-    except Exception:  # noqa: BLE001 — unknown cost: the caller charges the allowance
-        return None
-
-
-_HARNESS_LOCK: dict = {}   # Phase 34 ε: modes of the harness files locked for this run (finalize_run restores them)
-TRANSCRIPT_MARGIN = 1.05   # Phase 34 δ: E7 attempt 6, transcript estimate +0.25% vs reported
-
-
-async def crashed_session_cost(options, session_id: str, attempts: int = 3, delay_s: float = 20.0,
-                               query_fn=None, transcript_root: str | None = None):
-    """Phase 34 δ: a crashed session's cumulative cost. Read it back by
-    resuming the conversation (retried: the 2026-10-27 smoke's single try
-    returned nothing, a second scenario's worked), else estimate it from the
-    CLI transcripts (+5%). Returns (result-like or None, source)."""
-    from types import SimpleNamespace
-    for i in range(attempts):
-        r = await reconcile_conversation_cost(options, session_id, query_fn=query_fn)
-        if r is not None:
-            return r, "reconciled: cumulative cost read back after a crash"
-        if i + 1 < attempts:
-            await asyncio.sleep(delay_s)
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "lib"))
-    import transcript_cost
-    est = transcript_cost.conversation_cost(session_id, transcript_root)
-    if est is None:
-        return None, "result"
-    return (SimpleNamespace(total_cost_usd=round(est * TRANSCRIPT_MARGIN, 4), session_id=session_id),
-            f"estimated from the CLI transcripts (+{TRANSCRIPT_MARGIN - 1:.0%}); read-back failed")
-
-
-def charge_session(ledger: dict, session: int, result, allowance: float | None,
-                   session_id: str | None = None, elapsed_s: float | None = None,
-                   source: str = "result") -> dict:
-    """Record one session's spend.
-    - A cost report (the session's own, or after a crash the cumulative cost
-      read back by resuming the conversation): charged exactly.
-    - Crashed before its conversation started (no session id, so no API
-      call): an upper bound from its duration.
-    - Otherwise (cost unreadable): the whole remaining allowance, so the cap
-      can never be exceeded (Codex reviews, PR #15 and #23).
-    E7 attempt 5: a ~$62 crashed session was charged the whole $450 and the
-    run stopped; reading the true cost back lets the run continue."""
-    cost = getattr(result, "total_cost_usd", None) if result is not None else None
-    if isinstance(cost, (int, float)):
-        # The SDK reports CUMULATIVE cost for a resumed conversation (same
-        # session_id; verified 2026-10-23): charge only the increase.
-        sid = getattr(result, "session_id", None)
-        # Everything already charged to this conversation, including a crashed
-        # session's read-back: each report adds only its increase.
-        prev = sum(e.get("total_cost_usd") or 0 for e in ledger.get("sessions", [])
-                   if sid and e.get("session_id") == sid)
-        entry = {"session": session, "session_id": sid, "reported_usd": round(cost, 4),
-                 "total_cost_usd": round(max(cost - prev, 0), 4), "source": source}
-    elif session_id is None and isinstance(elapsed_s, (int, float)):
-        bound = max(elapsed_s, 0) / 3600 * MAX_USD_PER_HOUR
-        charged = bound if allowance is None else min(bound, allowance)
-        entry = {"session": session, "session_id": session_id, "total_cost_usd": round(charged, 4),
-                 "source": f"upper bound: {elapsed_s:.0f}s at ${MAX_USD_PER_HOUR:.0f}/h "
-                           "(crashed before its conversation started)"}
-    else:
-        entry = {"session": session, "total_cost_usd": round(allowance or 0, 4),
-                 "source": "unreconciled: charged the full remaining allowance"}
-    ledger.setdefault("sessions", []).append(entry)
-    return ledger
-
-
-def conversation_cost(records: list[dict]) -> float | None:
-    """True spend from per-session results: the reported cost is cumulative
-    within a conversation (session_id), so take each conversation's maximum
-    and sum across conversations. Summing sessions over-counted resumed runs."""
-    by_sid: dict = {}
-    for i, r in enumerate(records):
-        c = r.get("total_cost_usd")
-        if isinstance(c, (int, float)):
-            k = r.get("session_id") or f"_nosid{i}"
-            by_sid[k] = max(by_sid.get(k, 0), c)
-    return round(sum(by_sid.values()), 4) if by_sid else None
-
-
-def write_budget_ledger(run_path: str, ledger: dict, cap: float | None, integrity=None) -> None:
-    ledger = {**ledger, "cap_usd": cap,
-              "spent_usd": round(sum(e.get("total_cost_usd") or 0 for e in ledger["sessions"]), 4)}
-    with open(os.path.join(run_path, BUDGET_LEDGER), "w") as f:
-        json.dump(ledger, f, indent=2)
-    if integrity is not None:
-        integrity.harness_wrote(BUDGET_LEDGER)
-
-
-def writeup_reserve(cap: float | None) -> float:
-    """Phase 29: dollars held back from the modeling sessions so the final
-    write-up can always run (8% of the cap, at least $10, at most half)."""
-    if cap is None:
-        return 0.0
-    return round(min(max(0.08 * cap, 10.0), 0.5 * cap), 2)
-
-
-def remaining_budget(cap: float | None, records: list[dict]) -> float | None:
-    """Dollars left under a run-wide cap, summed over every session so far
-    (including earlier invocations of a resumed run). None = no cap."""
-    if cap is None:
-        return None
-    spent = sum(r.get("total_cost_usd") or 0 for r in records
-                if isinstance(r.get("total_cost_usd"), (int, float)))
-    return round(cap - spent, 4)
 
 
 def slugify(text: str, max_len: int = 40) -> str:
@@ -302,102 +180,6 @@ def build_resume_context(run_path: str) -> str:
     )
 
 
-TERMINAL_TASK_STATUSES = ("completed", "failed", "killed", "stopped", "cancelled", "canceled", "error")
-
-
-def log_message(message, trace_file):
-    """Log a message from the lead session to console and trace."""
-    if isinstance(message, TaskStartedMessage):
-        print(f"  [task started] {message.description}", flush=True)
-        trace_file.write(json.dumps({
-            "ts": datetime.now().isoformat(),
-            "type": "task_started",
-            "task_id": message.task_id,
-            "description": message.description,
-        }) + "\n")
-    elif TaskUpdatedMessage and isinstance(message, TaskUpdatedMessage):
-        if str(message.status or "").lower() in TERMINAL_TASK_STATUSES:
-            trace_file.write(json.dumps({"ts": datetime.now().isoformat(), "type": "task_updated",
-                                         "task_id": message.task_id, "status": message.status}) + "\n")
-    elif isinstance(message, TaskProgressMessage):
-        tool = message.last_tool_name or ""
-        if tool:
-            print(f"  [progress] {message.description} | {tool}", flush=True)
-    elif isinstance(message, TaskNotificationMessage):
-        status_marker = "+" if message.status == "completed" else "!"
-        print(f"  [{status_marker} {message.status}] {message.summary[:120]}", flush=True)
-        usage = None
-        if message.usage:
-            u = message.usage
-            if isinstance(u, dict):
-                usage = u
-            else:
-                usage = {
-                    "total_tokens": u.total_tokens,
-                    "tool_uses": u.tool_uses,
-                    "duration_ms": u.duration_ms,
-                }
-        trace_file.write(json.dumps({
-            "ts": datetime.now().isoformat(),
-            "type": "task_notification",
-            "task_id": message.task_id,
-            "status": message.status,
-            "summary": message.summary,
-            "usage": usage,
-        }) + "\n")
-    elif isinstance(message, AssistantMessage):
-        for block in message.content:
-            if hasattr(block, "text") and block.text:
-                # Print lead's own reasoning (truncated for readability)
-                text = block.text.strip()
-                if text:
-                    for line in text.split("\n")[:5]:
-                        print(f"[lead] {line[:150]}", flush=True)
-                    if text.count("\n") > 5:
-                        print(f"[lead] ... ({text.count(chr(10))} lines total)", flush=True)
-    elif isinstance(message, ResultMessage):
-        print(f"\n[result] {message.subtype} | {message.duration_ms/1000:.0f}s"
-              f" | error={message.is_error}", flush=True)
-        trace_file.write(json.dumps({
-            "ts": datetime.now().isoformat(),
-            "type": "result",
-            **result_summary(message),
-        }) + "\n")
-    trace_file.flush()
-
-
-def result_summary(message) -> dict:
-    """JSON-safe record of a ResultMessage (cost, usage, models, errors)."""
-    return {
-        "subtype": getattr(message, "subtype", None),
-        "is_error": bool(getattr(message, "is_error", False)),
-        "num_turns": getattr(message, "num_turns", None),
-        "duration_ms": getattr(message, "duration_ms", None),
-        "total_cost_usd": getattr(message, "total_cost_usd", None),
-        "usage": getattr(message, "usage", None),
-        "model_usage": getattr(message, "model_usage", None),
-        "stop_reason": getattr(message, "stop_reason", None),
-        "errors": getattr(message, "errors", None),
-        "session_id": getattr(message, "session_id", None),
-    }
-
-
-def result_is_success(message) -> bool:
-    """Phase 21 α: a ResultMessage ends the stream for success AND for
-    error_max_turns / error_during_execution. Only subtype "success"
-    without is_error counts; everything else goes down the retry path."""
-    return (message is not None
-            and not getattr(message, "is_error", False)
-            and getattr(message, "subtype", None) == "success")
-
-
-def is_policy_block(error_str: str) -> bool:
-    # Phase 21 α: the bare substring "violate" matched ordinary errors
-    # (e.g. "constraint violated") and ended runs without retry.
-    low = error_str.lower()
-    return "usage policy" in low or "acceptable use policy" in low
-
-
 _TERMINAL_STAGES = {"DONE", "COMPLETE", "COMPLETED", "FINISHED", "RUN_FAILED",
                     "FAILED", "DECLARE_SCOPE", "ACCEPTED"}
 
@@ -477,230 +259,6 @@ async def wait_for_signoff(run_path: str, run_dir_rel: str, hours: float, poll_s
             return True
         await asyncio.sleep(poll_s)
     return decision_brief.status(run_path) == "signed"
-
-
-def detect_current_round(run_path: str) -> int | None:
-    """Highest `round:` across critique_*.yaml (the gate's own input),
-    falling back to pipeline_state.yaml."""
-    import yaml
-    rounds = []
-    for path in glob.glob(os.path.join(run_path, "critique_*.yaml")):
-        try:
-            with open(path) as f:
-                doc = yaml.safe_load(f)
-            r = doc.get("round") if isinstance(doc, dict) else None
-            if isinstance(r, int):
-                rounds.append(r)
-        except Exception:
-            continue
-    if rounds:
-        return max(rounds)
-    try:
-        with open(os.path.join(run_path, "pipeline_state.yaml")) as f:
-            state = yaml.safe_load(f) or {}
-        r = state.get("current_round")
-        return r if isinstance(r, int) else None
-    except Exception:
-        return None
-
-
-PIPELINE_FINAL_BUDGET_S = 3600   # S1: the declared pipeline's rebuild before a final gate
-
-
-def _rebuild_derived(run_path: str, integrity=None) -> None:
-    """Phase 39 β: regenerate stale figures before a final gate; S1: first rebuild the
-    run's declared pipeline (models/pipeline.yaml) as the harness. Never raises."""
-    try:
-        sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
-        import derived_rebuild
-        if integrity is not None and os.path.exists(os.path.join(run_path, derived_rebuild.pipeline.SPEC)):
-            try:
-                rep = derived_rebuild.pipeline.harness_build(run_path, integrity, PIPELINE_FINAL_BUDGET_S)
-                print("[PIPELINE] " + derived_rebuild.pipeline.summary_line(rep), flush=True)
-            except Exception as e:  # noqa: BLE001
-                print(f"[PIPELINE] failed: {type(e).__name__}: {e}", flush=True)
-        print("[REBUILD] " + derived_rebuild.summary_line(derived_rebuild.rebuild(run_path, integrity=integrity)),
-              flush=True)
-    except Exception as e:  # noqa: BLE001
-        print(f"[REBUILD] failed: {type(e).__name__}: {e}", flush=True)
-
-
-def run_final_gate(run_path: str, max_rounds: int,
-                   validator: str = VALIDATOR, timeout_s: int = 900) -> dict | None:
-    """Phase 21 α: re-run the STAGE 7 validator after the session ends.
-
-    The lead was supposed to re-run it after WRITE, but nothing enforced
-    that, so post-WRITE HIGHs (coherence, sufficiency) never reached a
-    gate. Returns None when there are no critique YAMLs to gate on;
-    otherwise a dict with action / exit_code / counts. Writes
-    final_gate.json and final_gate_stderr.txt into the run dir.
-    """
-    current_round = detect_current_round(run_path)
-    if current_round is None:
-        return None
-    cmd = [sys.executable, validator, run_path,
-           "--max-rounds", str(max_rounds), "--current-round", str(current_round),
-           "--spec-compliance", "--parameter-registry", "--rigor-artifacts",
-           "--json"]
-    # Phase 21 β: --post-write makes coherence / sufficiency / writer-QA
-    # HIGHs blocking. Only meaningful once a report exists; without one
-    # determine_status() reports completed_no_report anyway.
-    if os.path.exists(os.path.join(run_path, "report.md")):
-        cmd.append("--post-write")
-    gate = {"current_round": current_round, "max_rounds": max_rounds,
-            "ran_at": datetime.now().isoformat(), "action": None}
-    try:
-        proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True,
-                              text=True, timeout=timeout_s)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        gate.update(exit_code=None, error=f"{type(e).__name__}: {e}")
-        return gate
-    gate["exit_code"] = proc.returncode
-    try:
-        with open(os.path.join(run_path, "final_gate_stderr.txt"), "w") as f:
-            f.write(proc.stderr)
-    except OSError:
-        pass
-    decision = None
-    out = proc.stdout.strip()
-    if out:
-        try:
-            decision = json.loads(out[out.index("{"):])
-        except (ValueError, json.JSONDecodeError):
-            decision = None
-    if isinstance(decision, dict):
-        gate["action"] = decision.get("action")
-        if "schema_errors" in decision:
-            gate["schema_errors"] = decision["schema_errors"]
-        unresolved = decision.get("unresolved_high")
-        if isinstance(unresolved, list):
-            gate["n_unresolved_high"] = len(unresolved)
-        try:
-            with open(os.path.join(run_path, "final_gate.json"), "w") as f:
-                json.dump(decision, f, indent=2)
-        except OSError:
-            pass
-    else:
-        gate["error"] = (proc.stderr.strip().splitlines() or ["no JSON on stdout"])[-1][:500]
-    return gate
-
-
-def determine_status(session_outcome: str, gate: dict | None, has_report: bool,
-                     report_restored: bool, harness_diff: dict | None,
-                     integrity_violations: int = 0) -> str:
-    """Single source of truth for metadata.json["status"].
-
-    Phase 11 Commit η (F1) introduced status discrimination; Phase 21 α
-    stops equating "the stream ended" with "completed". Order matters:
-    tampering beats everything, then session-level failures, then the
-    final gate's verdict on what was delivered.
-    """
-    if harness_diff and enforcement.harness_changed(harness_diff):
-        return "harness_tampered"
-    if integrity_violations:
-        # Phase 23 α: decided from the harness's in-memory record, so a
-        # report file an agent made unwritable cannot hide it.
-        return "artifact_tampered"
-    if session_outcome != "session_completed":
-        return session_outcome
-    action = (gate or {}).get("action")
-    if action == "RUN_FAILED":
-        return "run_failed"
-    if not has_report:
-        return "completed_no_report"
-    if gate is None:
-        return "completed_gate_not_run"
-    if action == "ACCEPT":
-        return "completed_with_report_restored" if report_restored else "completed"
-    if action == "DECLARE_SCOPE":
-        return "completed_scope_declared"
-    if action is None or action == "VALIDATOR_ERROR":
-        return "completed_gate_error"
-    return "completed_gate_not_accepted"
-
-
-def exit_code_for(status: str) -> int:
-    if status in SUCCESS_STATUSES:
-        return 0
-    if status == "interrupted":
-        return 130
-    if status in PARTIAL_STATUSES:
-        return 2
-    return 1
-
-
-def restore_report_if_missing(run_path: str) -> bool:
-    """Phase 12 δ safety net, Phase 21 α rewiring: the PostToolUse hook
-    snapshots report.md every time it changes, so if it is missing at
-    the end but a snapshot exists, restore it. (The Phase 12 version
-    only snapshotted at run end, after the disappearance it guarded
-    against, and keyed on writer_qa CLEAN, which writer_qa also
-    reported for a missing report.)"""
-    report_path = os.path.join(run_path, "report.md")
-    snapshot_path = os.path.join(run_path, "report.snapshot.md")
-    if os.path.exists(report_path):
-        return False
-    if os.path.exists(os.path.join(run_path, "manuscript.md")):
-        # Phase 25: the writer's draft exists but the render step never ran.
-        # Build report.md from it (render_claims falls back to the draft
-        # itself when references cannot be resolved).
-        try:
-            r = subprocess.run([sys.executable, os.path.join(REPO_ROOT, "scripts", "render_claims.py"), run_path],
-                               capture_output=True, text=True, timeout=600)
-        except (subprocess.TimeoutExpired, OSError) as e:
-            r = subprocess.CompletedProcess([], 1, "", f"{type(e).__name__}: {e}")
-        if os.path.exists(report_path):
-            print("[WARNING] report.md was missing at run end; rendered from manuscript.md.",
-                  file=sys.stderr, flush=True)
-            return True
-        # Rendering failed (e.g. no claims ledger): the draft itself is the
-        # report; writer QA and the gate then judge it as written.
-        try:
-            shutil.copyfile(os.path.join(run_path, "manuscript.md"), report_path)
-            print(f"[WARNING] report.md was missing at run end; rendering failed "
-                  f"({(r.stdout + r.stderr).strip()[-300:]}); copied manuscript.md.",
-                  file=sys.stderr, flush=True)
-            return True
-        except OSError as e:
-            print(f"[ERROR] report.md missing; copying manuscript.md failed: {e}",
-                  file=sys.stderr, flush=True)
-    if not os.path.exists(snapshot_path):
-        return False
-    try:
-        shutil.copyfile(snapshot_path, report_path)
-    except OSError as e:
-        print(f"[ERROR] report.md missing AND restore failed: {e}",
-              file=sys.stderr, flush=True)
-        return False
-    print(f"[WARNING] report.md was missing at run end; restored from "
-          f"{snapshot_path}. Investigate trace.jsonl for the deletion path.",
-          file=sys.stderr, flush=True)
-    return True
-
-
-VERDICT_BANNER_MARK = "<!-- harness: final gate verdict -->"
-
-
-def add_verdict_banner(run_path: str, gate: dict | None) -> bool:
-    """If the final gate did not ACCEPT, make sure report.md opens with the
-    verdict (a report written before the final rejection would otherwise
-    read as accepted). Harness-written and labelled as such; idempotent."""
-    rp = os.path.join(run_path, "report.md")
-    action = (gate or {}).get("action")
-    if not os.path.exists(rp) or action == "ACCEPT":
-        return False
-    body = open(rp).read()
-    if VERDICT_BANNER_MARK in body:
-        return False
-    n = gate.get("unresolved_high")
-    n = len(n) if isinstance(n, list) else gate.get("n_unresolved_high")
-    banner = (f"{VERDICT_BANNER_MARK}\n> **Status: not accepted by the final gate** "
-              f"(verdict: {action or gate.get('error') or 'not run'}"
-              + (f"; {n} unresolved blocking finding(s)" if n is not None else "")
-              + "; see `final_gate.json`). Added by the harness after the report was written: "
-              "read the findings below as what was built, not as a recommendation.\n\n")
-    open(rp, "w").write(banner + body)
-    return True
 
 
 def write_harness_baseline(run_path: str) -> tuple[dict, dict | None]:
@@ -1032,246 +590,6 @@ async def run(question: str, max_rounds: int, max_sessions: int,
             harness_prior_diff, run_gate=not interrupted and not paused,
             original_meta=prior_meta, integrity=integrity)
     return status
-
-
-# methods_critic / cross_model decide which critiques the validator requires
-# (Codex review of PR #15: flipping methods_critic dropped a requirement).
-_PROTECTED_META = ("question", "started", "run_dir", "methods_critic", "cross_model")
-
-
-def _restore_protected_meta(metadata_path: str, original_meta: dict) -> bool:
-    """The planner may add decision_year to metadata.json; it may not change
-    the question spec-compliance is checked against. Put protected fields
-    back (recording what was there) and rewrite the file."""
-    try:
-        with open(metadata_path) as f:
-            meta = json.load(f)
-        if not isinstance(meta, dict):
-            raise ValueError("metadata.json is not an object")
-    except (OSError, ValueError):
-        # Missing or corrupted: rebuild it from the originals rather than
-        # let finalization write a metadata.json without the question.
-        meta = {"restored_fields": {"_metadata_unreadable": True}}
-    if not isinstance(meta.get("restored_fields"), dict):
-        meta["restored_fields"] = {}      # null / wrong type must not crash finalization
-    changed = not os.path.exists(metadata_path) or "_metadata_unreadable" in meta["restored_fields"]
-    for key in _PROTECTED_META:
-        if key in original_meta and meta.get(key) != original_meta[key]:
-            meta["restored_fields"][key] = meta.get(key)
-            meta[key] = original_meta[key]
-            changed = True
-    if changed:
-        with open(metadata_path, "w") as f:
-            json.dump(meta, f, indent=2)
-    return changed
-
-
-def finalize_run(run_path, run_dir_rel, run_start, max_rounds, session_outcome,
-                 session_num, session_id, session_records, harness_before,
-                 harness_prior_diff, run_gate: bool = True,
-                 original_meta: dict | None = None, integrity=None) -> str:
-    """Restore report if needed, run the final gate, check the harness
-    hash, and write metadata.json. Runs in a `finally`, so it executes on
-    Ctrl-C and on unexpected exceptions too."""
-    original_meta = original_meta or {}
-    # Last integrity scan FIRST: pending tool changes are judged against the
-    # previous baseline before the harness writes anything (Copilot, PR #15).
-    # Phase 39 β (Codex): regenerate stale figures while the integrity watch is
-    # still on, so anything a figure script changes is judged by the final scan.
-    if run_gate:
-        _rebuild_derived(run_path, integrity)
-    if integrity is not None:
-        integrity.final_check()
-        integrity.stop_watch()
-    report_restored = restore_report_if_missing(run_path)
-    if report_restored and integrity is not None:
-        for rel in ("report.md", "report.unrendered.md", "models/claims_ledger.yaml", "claims_ledger.yaml"):
-            integrity.harness_wrote(rel)
-    has_report = os.path.exists(os.path.join(run_path, "report.md"))
-    # Restore the protected fields BEFORE the gate: the validator reads the
-    # question from metadata.json (Codex review of PR #14: a planner edit to
-    # the question would otherwise be gated, then silently undone).
-    if _restore_protected_meta(os.path.join(run_path, "metadata.json"), original_meta) \
-            and integrity is not None:
-        integrity.harness_wrote("metadata.json")
-    if integrity is not None and integrity.open_events:
-        print(f"[INTEGRITY] {len(integrity.open_events)} unresolved change(s) to protected "
-              f"run artifacts; see {os.path.join(run_dir_rel, 'artifact_integrity.json')}",
-              flush=True)
-
-    gate = None
-    # A budget stop is still gated: the report shows what the money bought.
-    if run_gate:          # Phase 29: also after max_sessions / crashes: the verdict is evidence
-        print("\nRunning final STAGE 7 gate...", flush=True)
-        gate = run_final_gate(run_path, max_rounds)
-        if gate is None:
-            # No critique round was reached: record that explicitly (Codex, Phase 29).
-            gate = {"action": None, "error": "no critique round was reached; nothing to gate",
-                    "ran_at": datetime.now().isoformat()}
-            json.dump(gate, open(os.path.join(run_path, "final_gate.json"), "w"), indent=2)
-        add_verdict_banner(run_path, gate)
-        # Phase 44 α (E1): the model card, from the gated artifacts, before storage.
-        write_model_card(run_path, integrity)
-        # The card ran the run's code: put back protected metadata it may have changed
-        # (any change is already an integrity violation).
-        _restore_protected_meta(os.path.join(run_path, "metadata.json"), original_meta)
-
-    harness_diff = enforcement.diff_harness(harness_before, enforcement.hash_harness())
-    enforcement.unlock_harness(_HARNESS_LOCK)
-    status = determine_status(session_outcome, gate, has_report,
-                              report_restored, harness_diff,
-                              integrity_violations=len(integrity.open_events) if integrity else 0)
-
-    elapsed = (datetime.now() - run_start).total_seconds()
-    metadata_path = os.path.join(run_path, "metadata.json")
-    try:
-        with open(metadata_path) as f:
-            meta = json.load(f)
-        if not isinstance(meta, dict):
-            raise ValueError("metadata.json is not an object")
-    except (OSError, ValueError):
-        meta = {}
-    # Phase 11 Commit η (F1): `completed` is the timestamp the run loop
-    # finished (kept for backward compat with existing readers).
-    # `status` is the authoritative discriminator; see determine_status()
-    # for the values. Automation should consult `status` (or the process
-    # exit code), not the presence of `completed`.
-    meta["completed"] = datetime.now().isoformat()
-    meta["status"] = status
-    meta["session_outcome"] = session_outcome
-    meta["elapsed_s"] = elapsed
-    meta["sessions"] = session_num
-    meta["has_report"] = has_report
-    meta["report_restored"] = report_restored
-    meta["final_gate"] = gate
-    if integrity is not None:
-        meta["artifact_integrity_violations"] = len(integrity.open_events)
-        meta["artifact_integrity_resolved"] = len(integrity.events) - len(integrity.open_events)
-    if session_records:
-        meta.setdefault("session_results", []).extend(session_records)
-    meta["total_cost_usd"] = conversation_cost(meta.get("session_results", []))
-    if enforcement.harness_changed(harness_diff):
-        meta["harness_diff"] = harness_diff
-    if harness_prior_diff and enforcement.harness_changed(harness_prior_diff):
-        meta["harness_changed_since_last_invocation"] = harness_prior_diff
-    if session_id:
-        meta["session_id"] = session_id
-    with open(metadata_path, "w") as f:
-        json.dump(meta, f, indent=2)
-
-    print(f"\n{'='*60}", flush=True)
-    print(f"RUN {status.upper()}", flush=True)
-    print(f"  Duration: {elapsed:.0f}s ({elapsed/60:.1f} min)", flush=True)
-    print(f"  Sessions: {session_num}", flush=True)
-    print(f"  Report: {'written' if has_report else 'not written'}", flush=True)
-    if gate is not None:
-        print(f"  Final gate: {gate.get('action') or gate.get('error')}", flush=True)
-    if meta.get("total_cost_usd") is not None:
-        print(f"  Cost: ${meta['total_cost_usd']:.2f}", flush=True)
-    if status == "harness_tampered":
-        print(f"  HARNESS CHANGED DURING RUN: {harness_diff}", flush=True)
-    if status == "artifact_tampered":
-        print(f"  PROTECTED RUN ARTIFACTS CHANGED OUTSIDE THEIR WRITERS: "
-              f"{[e['file'] for e in integrity.open_events]}", flush=True)
-    print(f"  Results: {run_dir_rel}/", flush=True)
-    # Phase 29: the run's post-mortem (autopsy.md / autopsy.json), before storage
-    # so it travels with the results; plus one row in the cross-run register.
-    try:
-        sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
-        import run_autopsy
-        _a = run_autopsy.write(run_path)
-        print(f"  Autopsy: primary layer {_a.get('primary_layer') or 'none (accepted)'}", flush=True)
-        _row = run_autopsy.register_row(_a)
-        # Lessons ledger: known error classes that came back, plus this run's
-        # expert checklist (lessons_check.md).
-        import lessons
-        _row["lessons"] = lessons.register_fields(run_path)
-        print(f"  Lessons: {_row['lessons']}", flush=True)
-        import results_store
-        if results_store.configured_account():
-            _rp = os.path.join(run_path, "register_row.json")
-            json.dump(_row, open(_rp, "w"), indent=1, default=str)
-            results_store.upload_retry(_rp, f"outputs/register/{_a['run']}.json", attempts=2)
-    except Exception as e:  # noqa: BLE001 — never block finalize
-        print(f"[WARNING] autopsy/register failed: {type(e).__name__}: {e}", flush=True)
-    stored = store_run_results(run_path)
-    if stored:
-        print(f"  Stored: {stored}", flush=True)
-    print(f"{'='*60}", flush=True)
-    return status
-
-
-def _store_blob_name(run_path: str) -> str:
-    name = os.path.basename(os.path.normpath(run_path))
-    return f"outputs/{os.environ.get('MA_STORAGE_PREFIX', 'runs')}/{name}.tar.gz"
-
-
-def write_model_card(run_path: str, integrity=None, timeout: float | None = None) -> dict | None:
-    """Phase 44 α (E1): model_card.yaml / model_card.md, written by the harness
-    from the run's own artifacts (scripts/model_card.py; the model runs in a
-    separate process). Recorded as harness writes so the integrity record
-    accepts them. Never blocks finalize."""
-    card = None
-    own = ("model_card.yaml", "model_card.md")
-    # The card runs the run's own code after the final integrity check: anything it
-    # changes in the run's watched files besides the card is a violation (Codex review).
-    guard = integrity.harness_runs_code("model_card", allowed=own) if integrity is not None \
-        else contextlib.nullcontext()
-    try:
-        with guard:
-            sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
-            import model_card
-            import results_store
-            card = model_card.write(
-                run_path,
-                timeout=timeout or float(os.environ.get("MA_MODEL_CARD_TIMEOUT_S", model_card.DEFAULT_TIMEOUT_S)),
-                stored_blob=_store_blob_name(run_path) if results_store.configured_account() else None,
-                run_commit=model_card._git_head())
-        print(f"  Model card: {card['status']}"
-              + "".join(f"\n    - {r}" for r in card["not_usable_reasons"][:3]), flush=True)
-    except Exception as e:  # noqa: BLE001 — never block finalize
-        print(f"[WARNING] model card failed: {type(e).__name__}: {e}", flush=True)
-    if integrity is not None:
-        for rel in ("model_card.yaml", "model_card.md"):
-            if os.path.exists(os.path.join(run_path, rel)):
-                integrity.harness_wrote(rel)
-    return card
-
-
-def store_run_results(run_path: str, service=None) -> str | None:
-    """Phase 26: when a storage account is configured ($MA_STORAGE_ACCOUNT or
-    $COILED_STORAGE_ACCOUNT), upload the finished run directory to
-    outputs/<prefix>/<run name>.tar.gz so the result never depends on someone
-    collecting it from the VM. Answer keys and credential files are left out
-    and API keys redacted. The outcome is recorded in metadata.json
-    (`stored` / `store_error`); a failure is loud but never fatal."""
-    sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
-    import results_store
-    account = results_store.configured_account()
-    if not account and service is None:
-        return None
-    name = os.path.basename(os.path.normpath(run_path))
-    blob, err = None, None
-    try:
-        secrets = [os.environ.get(k, "") for k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")]
-        data, skipped = results_store.archive_dir(run_path, name, secrets)
-        tmp = os.path.join(os.path.dirname(os.path.normpath(run_path)), f".{name}.store.tar.gz")
-        with open(tmp, "wb") as f:
-            f.write(data)
-        blob = _store_blob_name(run_path)
-        results_store.upload_retry(tmp, blob, account, service=service)
-        os.remove(tmp)
-    except Exception as e:  # noqa: BLE001 — the local copy remains; say so loudly
-        blob, err = None, f"{type(e).__name__}: {e}"[:500]
-        print(f"[ERROR] RUN RESULTS NOT STORED (only the VM copy exists): {err}", file=sys.stderr, flush=True)
-    try:
-        mp = os.path.join(run_path, "metadata.json")
-        meta = json.load(open(mp)) if os.path.exists(mp) else {}
-        meta.update({"stored": blob, "store_error": err})
-        json.dump(meta, open(mp, "w"), indent=2)
-    except (OSError, ValueError):
-        pass
-    return blob
 
 
 # ---------------------------------------------------------------------------
@@ -2609,16 +1927,17 @@ def _run_self_test() -> int:
             yield ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
                                 num_turns=1, session_id="s", total_cost_usd=0.0)
         return q
-    _real_query = globals()["query"]
+    from agents import run_preflight as _preflight_mod   # Phase 48 γ: the probe's module
+    _real_query = _preflight_mod.query
     try:
-        globals()["query"] = _fake_query(child_error=True, lead_writes=True)
+        _preflight_mod.query = _fake_query(child_error=True, lead_writes=True)
         _w, _log, _ = asyncio.run(_probe_subagent_write(False))
         ok(not _w, "WD6 a refused subagent Write followed by the lead's Write must fail the probe")
-        globals()["query"] = _fake_query(child_error=False, lead_writes=False)
+        _preflight_mod.query = _fake_query(child_error=False, lead_writes=False)
         _w, _log, _ = asyncio.run(_probe_subagent_write(False))
         ok(_w, f"WD6 a successful subagent Write must pass the probe: {_log[-200:]}")
     finally:
-        globals()["query"] = _real_query
+        _preflight_mod.query = _real_query
 
     _rd = tempfile.mkdtemp()
     open(os.path.join(_rd, WRITER_DRAFT), "w").write("# Draft\n\nNo references.\n")
@@ -2652,305 +1971,6 @@ def _run_self_test() -> int:
         return 1
     print("OK: all self-test cases passed.")
     return 0
-
-
-# Phase 21 α: preflight. Every self-test mocks the SDK, so nothing
-# exercised the real CLI / model / PATH until a multi-hour run was already
-# spending money. 2026-10-20_150152 ran six hours on 4.x-era models (the
-# bundled CLI's alias table) with a system-Python PATH that made the
-# modeler give up on the requested framework. This ~1-minute check runs a
-# real lead + a real registered-style subagent and verifies both.
-PREFLIGHT_IMPORTS = ("laser.core", "laser.generic", "starsim", "yaml",
-                     "numpy", "scipy")
-
-
-WRITER_DRAFT = "manuscript.md"   # agents/writer.py writes this; render_claims.py builds report.md
-
-
-def preflight_command() -> str:
-    mods = ", ".join(PREFLIGHT_IMPORTS)
-    return (f"python3 -c \"import sys, {mods}; "
-            f"print('PREFLIGHT_OK', sys.executable)\"")
-
-
-def pinned_sdk_version() -> str | None:
-    """claude-agent-sdk version pinned in requirements.txt."""
-    try:
-        for line in open(os.path.join(REPO_ROOT, "requirements.txt")):
-            m = re.match(r"\s*claude-agent-sdk==([\w.]+)", line)
-            if m:
-                return m.group(1)
-    except OSError:
-        pass
-    return None
-
-
-def evaluate_preflight(text: str, model_usage: dict | None,
-                       is_error: bool, subagent_wrote: bool | None = None,
-                       sdk_version: str | None = None, sdk_pinned: str | None = None) -> list[str]:
-    """Return problems found (empty list = pass). Pure, so it is self-tested.
-    subagent_wrote: whether the probe subagent's Write of the writer's draft
-    file name landed on disk (Phase 25; None = not checked)."""
-    problems = []
-    if sdk_pinned and sdk_version and sdk_version != sdk_pinned:
-        # The bundled CLI changes behaviour between versions (Phase 25: a
-        # subagent Write rule cost two full E7 runs); test what is pinned.
-        problems.append(f"claude-agent-sdk {sdk_version} installed, {sdk_pinned} pinned in requirements.txt")
-    if subagent_wrote is False:
-        problems.append(f"a subagent could not Write {WRITER_DRAFT} (the writer's draft); "
-                        f"the WRITE stage would fail")
-    if is_error:
-        problems.append("preflight session ended with an error result")
-    # Absolute paths only: the model's prose can say "PREFLIGHT_OK line"
-    # (seen on Coiled 2026-10-21), which must not count as an interpreter.
-    hits = re.findall(r"PREFLIGHT_OK\s+(/\S+)", text or "")
-    want = os.path.realpath(sys.executable)
-    if len(hits) < 2:
-        problems.append(
-            f"expected the import probe to succeed in both the lead and the "
-            f"subagent (saw {len(hits)} PREFLIGHT_OK line(s)); a framework "
-            f"import failed or python3 is not the harness interpreter")
-    bad = sorted({h for h in hits if os.path.realpath(h) != want})
-    if bad:
-        problems.append(f"agents' python3 is {bad}, not the harness interpreter {want}")
-    used = set((model_usage or {}).keys())
-    if not used:
-        problems.append("ResultMessage.model_usage is empty; cannot verify models")
-    else:
-        # The CLI itself uses a small Haiku model for internal chores
-        # (Bash command summaries, titles); no pipeline agent runs on it.
-        unexpected = sorted(m for m in used
-                            if not m.startswith((enforcement.MODEL_DEEP,
-                                                 enforcement.MODEL_FAST,
-                                                 "claude-haiku-")))
-        if unexpected:
-            problems.append(f"unexpected models used: {unexpected} "
-                            f"(pinned: {enforcement.MODEL_DEEP}, {enforcement.MODEL_FAST})")
-        if not any(m.startswith(enforcement.MODEL_DEEP) for m in used):
-            problems.append(f"{enforcement.MODEL_DEEP} was not used")
-    return problems
-
-
-async def run_preflight(allow_cloud: bool = False) -> dict:
-    from claude_agent_sdk import AgentDefinition
-    cmd = preflight_command()
-    probe = AgentDefinition(
-        description="Preflight probe: runs one shell command and reports its output.",
-        prompt="Run exactly the shell command you are given with Bash and "
-               "reply with its full output verbatim. Do nothing else.",
-        tools=["Bash"], model=enforcement.MODEL_DEEP, maxTurns=4)
-    options = ClaudeAgentOptions(
-        system_prompt="You are a harness preflight check. Follow instructions literally.",
-        model=enforcement.MODEL_DEEP,
-        max_buffer_size=enforcement.MAX_BUFFER_SIZE, settings=enforcement.SESSION_SETTINGS,
-        agents={"preflight-probe": probe},
-        tools=["Bash", "Agent"], allowed_tools=["Bash", "Agent"],
-        permission_mode="bypassPermissions", setting_sources=[],
-        cwd=REPO_ROOT, env=enforcement.filtered_env(dict(os.environ), allow_cloud),
-        max_turns=8)
-    prompt = (f"1. Run this with Bash and copy its output verbatim:\n{cmd}\n"
-              f"2. Spawn the `preflight-probe` agent and give it exactly the same "
-              f"command. "
-              f"3. Reply with both outputs verbatim, one per line.")
-    texts, result = [], None
-    async for m in query(prompt=prompt, options=options):
-        if isinstance(m, AssistantMessage):
-            for b in m.content:
-                if hasattr(b, "text"):
-                    texts.append(b.text)
-        elif isinstance(m, UserMessage) and isinstance(m.content, list):
-            # The probe's real Bash output (tool results), not a paraphrase.
-            for b in m.content:
-                c = getattr(b, "content", None)
-                if isinstance(c, str):
-                    texts.append(c)
-                elif isinstance(c, list):
-                    texts.extend(x.get("text", "") for x in c if isinstance(x, dict))
-        elif isinstance(m, ResultMessage):
-            result = m
-            if getattr(m, "result", None):
-                texts.append(m.result)
-    usage = getattr(result, "model_usage", None) if result else None
-    wrote, write_log, write_cost = await _probe_subagent_write(allow_cloud)
-    problems = evaluate_preflight("\n".join(texts), usage,
-                                  bool(result is None or result.is_error), subagent_wrote=wrote,
-                                  sdk_version=_sdk_version(), sdk_pinned=pinned_sdk_version())
-    cost = getattr(result, "total_cost_usd", None) if result else None
-    return {"ok": not problems, "problems": problems,
-            "model_usage": usage,
-            "cost_usd": (cost or 0) + (write_cost or 0),
-            "sdk_version": _sdk_version(),
-            "write_probe": None if wrote else write_log[-1500:]}
-
-
-async def _probe_subagent_write(allow_cloud: bool, attempts: int = 2) -> tuple[bool, str, float]:
-    """A subagent must be able to Write the writer's draft file name with the
-    Write tool, as the writer does (Phase 25: the bundled CLI blocks some
-    names for subagents). One job per probe, retried once, so a model that
-    skips the step is not mistaken for a block; the tool results are kept
-    for the log."""
-    import tempfile
-    from claude_agent_sdk import AgentDefinition
-    log, cost = [], 0.0
-    for attempt in range(attempts):
-        wdir = tempfile.mkdtemp(prefix="ma_preflight_")
-        wpath = os.path.join(wdir, WRITER_DRAFT)
-        probe = AgentDefinition(
-            description="Preflight write probe: saves one file with the Write tool.",
-            prompt="Use the Write tool to save the exact text PREFLIGHT_WRITE to the file "
-                   "path you are given. Then reply with the tool's result verbatim.",
-            tools=["Write"], model=enforcement.MODEL_DEEP, maxTurns=3)
-        options = ClaudeAgentOptions(
-            system_prompt="You are a harness preflight check. Follow instructions literally.",
-            model=enforcement.MODEL_DEEP, max_buffer_size=enforcement.MAX_BUFFER_SIZE, settings=enforcement.SESSION_SETTINGS,
-            # The lead's real tool list: a subagent only gets tools its parent has.
-            agents={"write-probe": probe}, tools=LEAD_TOOLS, allowed_tools=LEAD_TOOLS,
-            permission_mode="bypassPermissions", setting_sources=[], cwd=REPO_ROOT,
-            env=enforcement.filtered_env(dict(os.environ), allow_cloud), max_turns=4)
-        by_subagent, sub_ids, lead_wrote, write_ok = False, set(), False, False
-        async for m in query(prompt=f"Spawn the `write-probe` agent and give it this file path: {wpath}. "
-                                    f"Do not write anything yourself. Reply with what it reported.",
-                             options=options):
-            if isinstance(m, AssistantMessage):
-                for b in m.content:
-                    if getattr(b, "name", None) != "Write":
-                        continue
-                    if getattr(m, "parent_tool_use_id", None):
-                        # A Write issued inside the subagent...
-                        if os.path.realpath(str((getattr(b, "input", None) or {}).get("file_path", ""))) \
-                                == os.path.realpath(wpath):
-                            by_subagent = True
-                            sub_ids.add(getattr(b, "id", None))
-                    else:
-                        lead_wrote = True        # ...not the lead's own
-            if isinstance(m, UserMessage) and isinstance(m.content, list):
-                for b in m.content:
-                    # ...and its result must not be an error (a refused Write).
-                    if getattr(b, "tool_use_id", None) in sub_ids and not getattr(b, "is_error", False):
-                        write_ok = True
-                for b in m.content:
-                    c = getattr(b, "content", None)
-                    log.append(c if isinstance(c, str) else json.dumps(c, default=str)[:500])
-            elif isinstance(m, ResultMessage):
-                cost += m.total_cost_usd or 0
-                log.append(f"[attempt {attempt + 1}] result: {(m.result or '')[:300]}")
-        wrote = (by_subagent and write_ok and not lead_wrote
-                 and os.path.exists(wpath) and "PREFLIGHT_WRITE" in open(wpath).read())
-        if lead_wrote:
-            log.append(f"[attempt {attempt + 1}] the lead used Write itself; not a subagent test")
-        if not by_subagent and os.path.exists(wpath):
-            log.append(f"[attempt {attempt + 1}] the file was written, but not by the subagent")
-        shutil.rmtree(wdir, ignore_errors=True)
-        if wrote:
-            return True, "\n".join(log), cost
-    return False, "\n".join(log), cost
-
-
-WRITEUP_PROMPT = """The modeling sessions have ended (outcome: {outcome}) without a report.
-Spawn the `writer` agent exactly once for run directory {run_dir}. Tell it:
-
-- This is the run's final write-up. The final gate's verdict is in
-  {run_dir}/final_gate.json (action: {action}; unresolved blocking findings:
-  {n_high}). If the action is not ACCEPT, the report's first section is
-  "Status: not accepted by the final gate": the verdict and each unresolved
-  blocking finding in plain words. The model is then presented as what was
-  built and where it fell short, never as a recommendation; any allocation
-  is labelled illustrative.
-- Write the draft to {run_dir}/manuscript.md from the artifacts that exist
-  (plan, data, models, results, critiques). Missing pieces are stated as
-  missing, not invented.
-
-Do nothing else; the harness renders report.md afterwards."""
-
-
-def _harness_wrote_gate_outputs(integrity) -> None:
-    """The validator (run by the harness) rewrites its own outputs: record them
-    as harness writes so they are not flagged as tampering (Codex, Phase 29)."""
-    if integrity is None:
-        return
-    from agents.integrity import SCRIPT_PRODUCES
-    for rel in set(SCRIPT_PRODUCES.get("validate_critique_yaml.py", ())) | {
-            "final_gate.json", "final_gate_stderr.txt", "metadata.json", BUDGET_LEDGER}:
-        integrity.harness_wrote(rel)
-
-
-async def final_writeup(run_path, run_dir_rel, question, max_rounds, budget, cap, session_num,
-                        outcome, integrity=None, query_fn=None, live_state=None) -> dict:
-    """Phase 29: when the modeling sessions end without a report (final-round
-    RUN_FAILED, budget, sessions, crash), run the final gate and one writer
-    session paid from the write-up reserve, so every run leaves a report that
-    states its verdict. Never raises into finalize."""
-    info = {"ran": False}
-    try:
-        _rebuild_derived(run_path, integrity)
-        gate = run_final_gate(run_path, max_rounds) or {}
-        _harness_wrote_gate_outputs(integrity)
-        n_high = len(gate.get("unresolved_high") or []) if isinstance(gate.get("unresolved_high"), list) \
-            else gate.get("n_unresolved_high")
-        left = remaining_budget(cap, budget["sessions"])
-        if left is not None and left <= 0:
-            info.update(skipped="no budget left for the write-up")
-            return info
-        agents = {"writer": build_agents(question=question, run_dir=run_dir_rel)["writer"]}
-        trace = open(os.path.join(run_path, "trace.jsonl"), "a")
-        hooks = create_hooks(run_path, trace, datetime.now(), registered_agents={"writer"},
-                             max_turns={"writer": agents["writer"].maxTurns}, integrity=integrity,
-                             hold_writer=False)   # the harness's own write-up is never held
-        options = ClaudeAgentOptions(
-            system_prompt="You are the harness's final write-up step. Follow the instructions literally.",
-            agents=agents, model=(smoke_settings() or {}).get("model", enforcement.MODEL_DEEP),
-            max_buffer_size=enforcement.MAX_BUFFER_SIZE, settings=enforcement.SESSION_SETTINGS, tools=LEAD_TOOLS, allowed_tools=LEAD_TOOLS,
-            permission_mode="bypassPermissions", setting_sources=["project"], hooks=hooks,
-            cwd=REPO_ROOT, env=enforcement.filtered_env(dict(os.environ), False), max_turns=8)
-        if left is not None:
-            options.max_budget_usd = left
-        prompt = WRITEUP_PROMPT.format(outcome=outcome, run_dir=run_dir_rel,
-                                       action=gate.get("action") or gate.get("error") or "not run",
-                                       n_high=n_high if n_high is not None else "unknown")
-        print(f"\nFINAL WRITE-UP (gate: {gate.get('action')}; budget left ${left})", flush=True)
-        result, sid, err = None, None, None
-        try:
-            async for m in (query_fn or query)(prompt=prompt, options=options):
-                log_message(m, trace)
-                if live_state is not None:
-                    live_state.on_message(m)         # stage snapshot of the writer, live status
-                if isinstance(m, SystemMessage) and m.subtype == "init":
-                    sid = (m.data or {}).get("session_id") or sid
-                elif isinstance(m, ResultMessage):
-                    result, sid = m, m.session_id or sid
-        except Exception as e:  # noqa: BLE001 — still charged below, then recorded
-            err = f"{type(e).__name__}: {e}"[:300]
-        source = "final write-up"
-        if result is None and sid:
-            result = await reconcile_conversation_cost(options, sid, query_fn=query_fn)
-            source = "final write-up (crashed; cost read back)"
-        # unreadable cost: the whole remaining allowance (cap holds)
-        charge_session(budget, session_num, result, left, session_id=sid, elapsed_s=None, source=source)
-        write_budget_ledger(run_path, budget, cap, integrity)
-        if err:
-            info["writer_error"] = err
-        info.update(ran=True, gate_action=gate.get("action"),
-                    manuscript=os.path.exists(os.path.join(run_path, "manuscript.md")))
-    except Exception as e:  # noqa: BLE001 — finalize still runs; the gap is recorded
-        info.update(error=f"{type(e).__name__}: {e}"[:300])
-        print(f"[ERROR] final write-up failed: {info['error']}", flush=True)
-    try:
-        mp = os.path.join(run_path, "metadata.json")
-        meta = json.load(open(mp))
-        meta["final_writeup"] = info
-        json.dump(meta, open(mp, "w"), indent=2)
-        _harness_wrote_gate_outputs(integrity)
-    except (OSError, ValueError):
-        pass
-    return info
-
-
-def _sdk_version() -> str | None:
-    try:
-        from importlib.metadata import version
-        return version("claude-agent-sdk")
-    except Exception:
-        return None
 
 
 def main() -> int:
