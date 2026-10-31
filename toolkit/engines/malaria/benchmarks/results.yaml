@@ -312,9 +312,9 @@ benchmarks:
   - 3.8
   - 95.0
   source: C19 Mosha 2022
-  computed: 0.0
+  computed: 3.6317
   outcome_averted_per_capita: 0.0577
-  cost_per_capita: 0.0
+  cost_per_capita: 0.2094
   in_band: false
 settings_calibrated:
   cochrane_itn:
@@ -465,4 +465,4 @@ summary:
   total: 16
   held_out_in_band: 5
   held_out_total: 9
-wall_s: 429.2
+wall_s: 321.2

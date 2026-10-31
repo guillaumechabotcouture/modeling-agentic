@@ -134,8 +134,10 @@ def run(out_dir: str, workers: int, results_dir: str | None = None, shard: str |
     os.makedirs(rdir, exist_ok=True)
     rp = os.path.join(rdir, "results.jsonl")
     done = set()
-    if os.path.exists(rp):
-        for line in open(rp):
+    for src in (rp, os.path.join(out_dir, "results_prev.jsonl")):   # resume, also from results shipped with the design
+        if not os.path.exists(src):
+            continue
+        for line in open(src):
             try:
                 r = json.loads(line)
                 if r.get("ok"):
@@ -149,16 +151,23 @@ def run(out_dir: str, workers: int, results_dir: str | None = None, shard: str |
     todo = [j for j in jobs if j["id"] not in done]
     t0 = time.time()
     n_ok = n_bad = 0
-    with open(rp, "a") as f, ProcessPoolExecutor(workers) as ex:
-        futs = [ex.submit(_run_one, (d["spec_engine"], hz, j)) for j in todo]
-        for k, fu in enumerate(as_completed(futs)):
-            r = fu.result()
-            f.write(json.dumps(r) + "\n")
-            f.flush()
-            n_ok += r["ok"]
-            n_bad += not r["ok"]
-            if (k + 1) % 200 == 0:
-                print(f"{k + 1}/{len(todo)} done, {time.time() - t0:.0f}s", flush=True)
+    # A fresh process pool per chunk: attempt 1 lost every shard to a BrokenProcessPool at ~750 runs
+    # (worker memory growth); max_tasks_per_child then deadlocked once every child had been recycled.
+    chunk = max(workers * 15, 1)
+    k = 0
+    with open(rp, "a") as f:
+        for c0 in range(0, len(todo), chunk):
+            with ProcessPoolExecutor(workers) as ex:
+                futs = [ex.submit(_run_one, (d["spec_engine"], hz, j)) for j in todo[c0:c0 + chunk]]
+                for fu in as_completed(futs):
+                    r = fu.result()
+                    f.write(json.dumps(r) + "\n")
+                    f.flush()
+                    n_ok += r["ok"]
+                    n_bad += not r["ok"]
+                    k += 1
+                    if k % 200 == 0:
+                        print(f"{k}/{len(todo)} done, {time.time() - t0:.0f}s", flush=True)
     summ = {"jobs": len(jobs), "already_done": len(done), "ran": len(todo), "ok": n_ok, "failed": n_bad,
             "wall_s": round(time.time() - t0, 1), "workers": workers}
     json.dump(summ, open(os.path.join(rdir, "batch_summary.json"), "w"), indent=1)

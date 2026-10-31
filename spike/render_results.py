@@ -141,7 +141,8 @@ def main():
             ("Question-specific code (spike/units.py)", loc(["spike/units.py"])),
             ("Question-specific spec (spike/decision_spec.yaml)", loc(["spike/decision_spec.yaml"]))]
     parts += ["", "### Code", "", "| Part | Non-blank lines |", "|---|---|"] + [f"| {k} | {v:,} |" for k, v in code]
-    parts.append("| Attempt 8: per-run model and analysis code (models/*.py, 42 files) | 5,850 |")
+    parts.append("| Attempt 8: per-run code, models/*.py (42 files; 5,850 lines with blanks) | 5,316 |")
+    parts.append("| Attempt 8: per-run driver scripts at the run root (12 files) | 2,426 |")
     if os.path.exists(a.spend):
         sp = json.load(open(a.spend))
         parts += ["", "### Spend and time", "", "| Item | Spike | Attempt 8 |", "|---|---|---|",

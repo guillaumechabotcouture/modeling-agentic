@@ -69,25 +69,31 @@ class Analysis:
     # ------------------------------------------------------------ calibration
     def calibrate(self, theta, shifts=None, ids=None):
         tc = self.spec["calibration"]["target_column"]
+        ids = ids or self.ids
+        G = len(self.zgrid)
+        X = []
+        for i in ids:
+            X += [self.em._x(z, theta, self.by_id[i]) for z in self.zgrid]
+        pred_all = self.em.gps[("cal",)].predict(self.em._scale(np.asarray(X, float))).reshape(len(ids), G)
         out = {}
-        for i in ids or self.ids:
+        for j, i in enumerate(ids):
             u = self.by_id[i]
             t = float(_logit(np.array([float(u[tc])]))[0])
             if shifts is not None and self.region:
                 t += shifts.get(u[self.region], 0.0)
-            pred = np.maximum.accumulate(self.em.predict_cal(self.zgrid, theta, u))   # monotone in transmission
+            pred = np.maximum.accumulate(pred_all[j])   # monotone in transmission
             clamped = not (pred[0] <= t <= pred[-1])
-            z = float(np.interp(t, pred, self.zgrid))
-            out[i] = (z, clamped)
+            out[i] = (float(np.interp(t, pred, self.zgrid)), clamped)
         return out
 
     # ------------------------------------------------------------ outcomes
     def outcomes(self, theta, zs, ids=None):
         o = self.spec["objective"]["outcome"]
         res = {}
-        for i in ids or self.ids:
+        ids = ids or self.ids
+        preds = self.em.predict_units([zs[i] for i in ids], theta, [self.by_id[i] for i in ids])
+        for i, pr in zip(ids, preds):
             u = self.by_id[i]
-            pr = self.em.predict_unit(zs[i], theta, u)
             row = {"eir": pr["eir"]}
             for k in self.pk:
                 vals = {}
@@ -118,7 +124,8 @@ class Analysis:
     def run(self, draws=None, seed=None):
         t0 = time.time()
         spec = self.spec
-        A = {"emulator_accuracy": self.em.accuracy, "budget_allocatable": self.budget}
+        A = {"emulator_accuracy": self.em.accuracy, "budget_allocatable": self.budget,
+             "partial_batch_test_only": self.em.partial, "design_points_used": int(len(self.em.hold))}
         cal = self.calibrate(self.theta0)
         z0 = {i: v[0] for i, v in cal.items()}
         out0 = self.outcomes(self.theta0, z0)

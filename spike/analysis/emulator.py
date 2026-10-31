@@ -57,6 +57,10 @@ class Emulator:
         self.outcomes = [self.primary] + self.outcomes
         pts = design["points"]
         missing = [f"{p['point']}|{k}" for p in pts for k in self.packages if f"{p['point']}|{k}" not in results]
+        self.partial = bool(os.environ.get("SPIKE_PARTIAL")) and bool(missing)
+        if self.partial:   # test-only: keep complete design points; recorded in analysis.json
+            pts = [p for p in pts if all(f"{p['point']}|{k}" in results for k in self.packages)]
+            missing = []
         if missing:
             raise ValueError(f"{len(missing)} engine results missing (e.g. {missing[:3]}): the analysis fails closed")
         self.lo = None
@@ -157,22 +161,30 @@ class Emulator:
         X = self._scale(np.asarray([self._x(z, theta, urow) for z in Z], float))
         return self.gps[("cal",)].predict(X)
 
-    def predict_unit(self, z, theta, urow):
-        """{"y": {(P, o, package): per-capita outcome}, "treated": {package: per capita}, "eir": annual EIR}."""
-        X = self._scale(np.asarray([self._x(z, theta, urow)], float))
-        out = {"y": {}, "treated": {}}
+    def predict_units(self, zs, theta, rows):
+        """Batched over units: [{"y": {(P, o, package): per-capita outcome}, "treated": {package: per capita},
+        "eir": annual EIR}] in the order of `rows`."""
+        X = self._scale(np.asarray([self._x(z, theta, u) for z, u in zip(zs, rows)], float))
+        n = len(rows)
+        outs = [{"y": {}, "treated": {}} for _ in range(n)]
         for P in self.pops:
             for o in self.outcomes:
-                b = math.exp(float(self.gps[("base", P, o)].predict(X)[0]))
-                out["y"][(P, o, self.comp)] = b
+                b = np.exp(self.gps[("base", P, o)].predict(X))
+                for j in range(n):
+                    outs[j]["y"][(P, o, self.comp)] = float(b[j])
                 for k in self.packages:
                     if k != self.comp:
-                        r = float(np.clip(self.gps[("red", P, o, k)].predict(X)[0], -0.5, 1.0))
-                        out["y"][(P, o, k)] = b * (1 - r)
+                        r = np.clip(self.gps[("red", P, o, k)].predict(X), -0.5, 1.0)
+                        for j in range(n):
+                            outs[j]["y"][(P, o, k)] = float(b[j] * (1 - r[j]))
         for k in self.packages:
-            out["treated"][k] = max(float(self.gps[("treated", k)].predict(X)[0]), 0.0)
-        out["eir"] = math.exp(float(self.gps[("eir",)].predict(X)[0]))
-        return out
+            t = np.maximum(self.gps[("treated", k)].predict(X), 0.0)
+            for j in range(n):
+                outs[j]["treated"][k] = float(t[j])
+        e = np.exp(self.gps[("eir",)].predict(X))
+        for j in range(n):
+            outs[j]["eir"] = float(e[j])
+        return outs
 
 
 def load_results(path: str) -> dict:
