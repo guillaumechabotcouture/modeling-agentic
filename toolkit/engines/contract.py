@@ -110,6 +110,36 @@ def resolve_params(engine, params: dict | None) -> dict:
     return out
 
 
+def code_fingerprint(engine) -> str:
+    """sha256 over the engine's own code: every .py file in its module's directory, plus this contract (v2,
+    Codex P1-3/P1-13). Batch results and benchmark results carry it, so results from other code are refused."""
+    import hashlib
+    import inspect
+    import os
+    d = os.path.dirname(os.path.abspath(inspect.getfile(type(engine))))
+    h = hashlib.sha256()
+    files = sorted({os.path.join(d, f) for f in os.listdir(d) if f.endswith(".py")} | {os.path.abspath(__file__)})
+    for f in files:
+        h.update(os.path.basename(f).encode() + b"\0")
+        with open(f, "rb") as fh:
+            h.update(fh.read())
+    return h.hexdigest()
+
+
+def engine_identity(engine) -> dict:
+    """Name, version, code fingerprint, and (Codex r2 P1-6) hashes of the resolved parameters (values, kinds and
+    ranges, so a changed fitted.yaml changes the identity) and of the configured structure (components, unit
+    attributes, outputs, age groups, valid ranges: what constructor configuration sets)."""
+    import hashlib
+    import json
+    card = engine.describe()
+    params = sorted((p.name, float(p.value), p.kind, p.lo, p.hi) for p in engine.parameters())
+    struct = {k: getattr(card, k) for k in ("components", "unit_attributes", "outputs", "age_groups", "valid_ranges")}
+    h = lambda x: hashlib.sha256(json.dumps(x, sort_keys=True, default=str).encode()).hexdigest()  # noqa: E731
+    return {"name": card.name, "version": card.version, "code_sha256": code_fingerprint(engine),
+            "params_sha256": h(params), "config_sha256": h(struct)}
+
+
 def _finite(x) -> bool:
     return isinstance(x, (int, float)) and math.isfinite(x)
 
@@ -181,7 +211,11 @@ class ToyEngine:
     """A closed-form engine for self-tests of the contract, the benchmark runner and the
     analysis engine. Burden b = base * exp(k * x) per person-year; component "a" multiplies
     it by (1 - eff_a), "b" by (1 - eff_b), and together by (1-eff_a)(1-eff_b) + synergy.
-    Prevalence in a window = 1 - exp(-burden); seed adds small noise (reproducible)."""
+    Prevalence in a window = 1 - exp(-burden); seed adds small noise (reproducible).
+    `results_path`: a benchmark results file (toolkit/engines/benchmark.py), for self-tests that need one."""
+
+    def __init__(self, results_path: str | None = None):
+        self.results_path = results_path
 
     def describe(self) -> EngineCard:
         return EngineCard(
@@ -189,7 +223,15 @@ class ToyEngine:
             components={"a": [0, 1], "b": [0, 1]},
             unit_attributes={"x": "transmission index [-2, 2]", "group": "label"},
             outputs={"per_capita": ["cases", "dalys"], "windows": ["prev"], "cost_drivers": ["a_doses", "b_doses"]},
-            age_groups=["all"], valid_ranges={"x": [-2, 2]})
+            age_groups=["all"], valid_ranges={"x": [-2, 2]},
+            benchmarks=self._bench())
+
+    def _bench(self):
+        import os
+        if not self.results_path or not os.path.exists(self.results_path):
+            return []
+        import yaml
+        return (yaml.safe_load(open(self.results_path)) or {}).get("benchmarks", [])
 
     def parameters(self) -> list:
         return [ParamSpec("base", 0.5, "fixed", source="assumption"),
@@ -253,6 +295,16 @@ def _self_test() -> int:
     o0 = e.run({}, u, Package("0", {}), h, 1).per_capita["cases"]["all"]
     o1 = e.run({}, u, Package("a", {"a": 1}), h, 1).per_capita["cases"]["all"]
     ok(abs(o1 / o0 - 0.5) < 1e-12, "C7 toy engine: component a halves the burden at eff_a = 0.5")
+    fp = code_fingerprint(e)
+    ok(len(fp) == 64 and fp == code_fingerprint(ToyEngine()) and engine_identity(e)["name"] == "toy",
+       "C8 the engine code fingerprint is stable and part of its identity")
+
+    class Refit(ToyEngine):         # same code directory, another fitted value (as a changed fitted.yaml gives)
+        def parameters(self):
+            return [ParamSpec(p.name, 0.55 if p.name == "eff_a" else p.value, p.kind, p.units, p.lo, p.hi, p.source)
+                    for p in super().parameters()]
+    ok(engine_identity(Refit()) != engine_identity(e) and engine_identity(ToyEngine()) == engine_identity(e),
+       "C9 a changed fitted parameter value changes the engine identity (Codex r2 P1-6)")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

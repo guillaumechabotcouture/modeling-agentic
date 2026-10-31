@@ -353,7 +353,13 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
     to what the measured peak memory per process (or the `peak_mb` hint)
     allows, and never rises again within the call (the allowance's wall-clock
     stop moves with it). An input whose process dies when the pool has one
-    process is retried once; a second death fails it as a model error."""
+    process is retried once; a second death fails it as a model error.
+
+    v2 (spike lesson 7): the pool is also replaced after every
+    `recycle_every()` finished inputs (drained, then rebuilt at the same size).
+    The spike's pools broke at about 750 runs per VM from worker memory growth,
+    and `max_tasks_per_child` deadlocked once every child had been recycled; a
+    fresh pool per chunk fixed both."""
     import multiprocessing as mp
     import tempfile
     progress = {} if progress is None else progress
@@ -384,6 +390,7 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
     alone = {}                                     # input -> times its process died with the pool at one process
     toks = {}                                      # pool pid -> start token (Phase 42 α: killed if its caller dies)
     shrink = False
+    recycle, since, recycles = recycle_every(cap), 0, 0     # v2: fresh pool per chunk of finished inputs
     # successes elsewhere in the batch (other dask chunks, rows reused on resume)
     prior_ok = int(prior_ok or 0) + int(os.environ.get("MA_COMPUTE_PRIOR_OK") or 0)
 
@@ -413,7 +420,7 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
             if shrink and not running:            # idle processes keep their memory: rebuild at the new size
                 ex.shutdown(wait=True)
                 _kill_groups(pids, grace_s=0, direct=False)
-                ex, shrink = new_pool(cap), False
+                ex, shrink, since = new_pool(cap), False, 0
                 rebudget()
             now = time.time()
             k = 0 if shrink else max(0, min(len(todo), cap - len(running)))
@@ -464,6 +471,7 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
                                      "error": f"chunk failed: {type(e).__name__}: {e}"[:500]})
                         continue
                     rows += got
+                    since += len(got)
                     progress["core_s"] += _known_core_s(got)
                     running.pop(f)
                     _rows_done(progress, got)
@@ -512,11 +520,13 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
                     todo = [it for it, _ in crashed] + todo
                     cap = max(1, cap // 2)
                 rebudget()
-                ex, shrink = new_pool(cap), False
+                ex, shrink, since = new_pool(cap), False, 0
             if seen_peak and _mem_slots(seen_peak, avail, n) < cap:
                 cap = _mem_slots(seen_peak, avail, n)
                 shrink = True                     # drain, then rebuild the pool at `cap` processes
                 rebudget()
+            if recycle and since >= recycle and todo and not shrink:
+                shrink, recycles = True, recycles + 1     # drain, then a fresh pool at the same size
             if todo or running:
                 reason = _breaker(rows, prior_ok=prior_ok)
                 if reason:
@@ -551,7 +561,18 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
     init_dir.cleanup()
     return rows, {"backend": "local", "workers": n, "slots": n, "cores_per_slot": 1, "core_s": progress["core_s"],
                   "stopped": stop, "unknown_chunks": lost + len(running), "breaks": breaks, "procs_final": cap,
-                  "peak_mb": round(seen_peak, 1) or None}
+                  "peak_mb": round(seen_peak, 1) or None, "pool_recycles": recycles}
+
+
+def recycle_every(procs: int) -> int:
+    """Finished inputs after which the local pool is replaced (v2, spike lesson 7): MA_COMPUTE_RECYCLE_EVERY,
+    else 15 per process (the spike's chunk size, well below the ~750 runs per VM at which its pools broke);
+    0 disables."""
+    v = os.environ.get("MA_COMPUTE_RECYCLE_EVERY")
+    try:
+        return max(0, int(v)) if v not in (None, "") else 15 * max(1, int(procs))
+    except ValueError:
+        return 15 * max(1, int(procs))
 
 
 # --------------------------------------------------------------------------- #
@@ -3616,6 +3637,15 @@ def _self_test_p35(ok) -> None:
         ok(s["n_failed"] == 0 and [r["result"]["x"] for r in rows] == list(range(16)) and s["breaks"] >= 1
            and s["procs_final"] < 4,
            f"P35-1 a pool broken by one process reruns its in-flight inputs at lower concurrency, none lost: {s}")
+        os.environ["MA_COMPUTE_RECYCLE_EVERY"] = "4"
+        try:
+            rows, s = map_fn(d, "models/oom.py::f", [{"x": k, "dir": busy} for k in range(12)], backend="local",
+                             max_workers=2)
+        finally:
+            os.environ.pop("MA_COMPUTE_RECYCLE_EVERY", None)
+        ok(s["n_failed"] == 0 and [r["result"]["x"] for r in rows] == list(range(12)) and s.get("pool_recycles", 0) >= 2
+           and recycle_every(8) == 120,
+           f"P35-1b v2 lesson 7: the pool is replaced after every chunk of finished inputs, none lost: {s}")
         rows, s = map_fn(d, "models/oom.py::always", [{"x": k} for k in range(3)], backend="local", max_workers=2)
         ok(s["failed_by_kind"] == {"model": 3} and all("alone" in r["error"] for r in rows),
            f"P35-2 an input that kills its process alone fails as a model error: {s}")
