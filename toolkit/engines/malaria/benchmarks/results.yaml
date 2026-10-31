@@ -2,7 +2,9 @@ producer: toolkit/engines/benchmark.py
 engine_identity:
   name: malaria-starsim
   version: 0.1-spike
-  code_sha256: a377d71376723cabe48b6c5e47258cb70a2e3a82604c55c6879abfc22aa3b979
+  code_sha256: 52fd70d6d119c6385c929c7b96d1ff9c4ab0c4d93b06aa1c24684e9cb1418011
+  params_sha256: b4da8569d272703c630c9b2507a09d5f0f93444cbf953f015e5f5b4ae3f72407
+  config_sha256: b44da20ed1bf1072f0ae9d119593b987410f19a4f3bebdca6e6d933ae03d2c3b
 benchmarks:
 - id: B7
   metric: ITN (pyrethroid) vs none, prevalence RR at 12 m
@@ -470,4 +472,4 @@ summary:
   total: 16
   held_out_in_band: 5
   held_out_total: 9
-wall_s: 736.2
+wall_s: 755.6
