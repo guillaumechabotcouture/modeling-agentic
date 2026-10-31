@@ -73,7 +73,9 @@ For each stalled finding, one of:
     malformed, does not count and is itself HIGH `stall_diagnoses_invalid`
     (fail closed; not scope-declarable).
   * a scope declaration naming its kind, its `kind:key` or its key in
-    scope_declaration.yaml (only for a finding that is scope-declarable).
+    scope_declaration.yaml (only for a finding that is scope-declarable), with
+    a passing decision test or an exemption (Phase 49 α, whatever the
+    finding's severity; scripts/declaration_tests.py `declaration_counts`).
 
 Without either: HIGH `finding_stalled_without_diagnosis` (target MODEL). It is
 closed by the diagnosis or the declaration of the underlying finding; naming
@@ -81,7 +83,10 @@ this kind itself in scope_declaration.yaml does nothing, and it never lets the
 early DECLARE_SCOPE (rule 3a) fire. At round exhaustion it is as declarable as
 its underlying finding, so it cannot by itself turn DECLARE_SCOPE into
 RUN_FAILED. A diagnosis with `decision: declare` satisfies this rule only; an
-open HIGH underlying finding still needs its scope declaration.
+open HIGH underlying finding still needs its scope declaration. Phase 49 α
+(A20): a `decision: declare` entry also needs `decision_test: <result file>`
+showing the decision does not change, or the same exemptions as a scope
+declaration (scripts/declaration_tests.py `diagnosis_problem`).
 
 The CLI replays a run's history. `--by-kind` matches history written before
 keys by kind alone (each kind one finding), an approximation for retro checks
@@ -284,12 +289,26 @@ def _entry_problems(run_dir: str, e, round_n: int) -> list[str]:
         p.append(f"`decision:` must be one of {', '.join(DECISIONS)}, got {d!r}")
     elif d == "fix" and not (isinstance(e.get("change"), str) and e["change"].strip()):
         p.append("`decision: fix` needs `change:` naming the specific change")
+    elif d == "declare":
+        # Phase 49 α (A20): declaring a stalled finding needs the decision test a
+        # scope declaration needs (or the same exemptions).
+        from lib.siblings import load_private
+        problem = load_private("declaration_tests", "_ma_p49_").diagnosis_problem(run_dir, e)
+        if problem:
+            p.append(problem)
     return p
 
 
 def _invalid(claim: str, kind: str = INVALID_KIND, stage: str = "MODEL") -> dict:
     return {"kind": kind, "severity": "HIGH", "stage": stage, "target_stage": "MODEL",
             "scope_declarable": False, "claim": claim}
+
+
+def _declaration_counts(run_dir: str, v: dict, current: list) -> bool:
+    """Phase 49 α (Codex review): a declaration counts only with a passing decision
+    test or an exemption (scripts/declaration_tests.py), whatever the severity."""
+    from lib.siblings import load_private
+    return load_private("declaration_tests", "_ma_p49_").declaration_counts(run_dir, v, current)
 
 
 def gate_findings(run_dir: str, round_n: Optional[int] = None, current: Optional[list] = None,
@@ -327,7 +346,7 @@ def gate_findings(run_dir: str, round_n: Optional[int] = None, current: Optional
         if len(rounds) < n:
             continue
         nd = bool(non_declarable(kind, v.get("scope_declarable")))
-        if not nd and {kind, ident, key} & declared:
+        if not nd and {kind, ident, key} & declared and _declaration_counts(run_dir, v, current):
             continue
         if any(r >= round_n - n + 1 for r in diagnosed.get(ident, [])):
             continue
@@ -476,6 +495,18 @@ def _self_test() -> int:
             f = run(d, [bd("B9")], 3)
             ok(stalled(f) == ["benchmark_drift:B9"] and any(why in x["claim"] for x in f if x["kind"] == INVALID_KIND),
                f"T3b an entry with a bad {why} does not count and is reported: {f}")
+        # T3d (Phase 49 α): `decision: declare` needs a decision test of its finding.
+        declare = dict(good, decision="declare", change=None)
+        diag(d, [declare])
+        f = run(d, [bd("B9")], 3)
+        ok(stalled(f) == ["benchmark_drift:B9"] and any("decision_test" in x["claim"] for x in f
+                                                         if x["kind"] == INVALID_KIND),
+           f"T3d a declare diagnosis without a decision test does not count: {f}")
+        yaml.safe_dump({"finding": "B9", "varied": "PBO effect at the trial value", "criterion": "package changes",
+                        "decision_changes": False, "recommendation": {"with": "A", "without": "A"}},
+                       open(os.path.join(d, "models", "dt_b9.yaml"), "w"))
+        diag(d, [dict(declare, decision_test="models/dt_b9.yaml")])
+        ok(run(d, [bd("B9")], 3) == [], "T3e ...with a passing decision test it does")
         open(os.path.join(d, "models", "stall_diagnoses.yaml"), "w").write("diagnoses: [unclosed\n")
         ok([x["kind"] for x in run(d, [], 3)] == [INVALID_KIND], "T3c an unparseable file is HIGH invalid")
         os.remove(os.path.join(d, "models", "stall_diagnoses.yaml"))
@@ -494,10 +525,25 @@ def _self_test() -> int:
         ok(stalled(run(d, [bd("B9")], 5)) == [], "T5 cleared at round 3: rounds 4-5 are a new run of 2")
         hist(d, {1: [bd("B9")], 2: [bd("B9")], 4: [bd("B9")]})
         ok(stalled(run(d, [bd("B9")], 5)) == [], "T5b a round with no gate record breaks the run")
-        # T6: a scope declaration of the finding (kind, kind:key or key) clears it.
+        # T6: a scope declaration of the finding (kind, kind:key or key) clears it, when the
+        # declaration has a decision test (Phase 49 α).
         hist(d, {1: [bd("B9"), mb], 2: [bd("B9"), mb]})
+        yaml.safe_dump({"finding": "B9", "varied": "PBO effect at the trial value", "criterion": "package changes",
+                        "decision_changes": False, "recommendation": {"with": "A", "without": "A"}},
+                       open(os.path.join(d, "models", "dt_b9.yaml"), "w"))
         for decl in (["benchmark_drift"], ["benchmark_drift:B9"], ["B9"]):
+            yaml.safe_dump({"declarations": [{"id": "SD-1", "blocker_id": decl[0], "why_unresolved": "x",
+                                              "decision_test": "models/dt_b9.yaml"}]},
+                           open(os.path.join(d, "scope_declaration.yaml"), "w"))
             ok(stalled(run(d, [bd("B9")], 3, declared=decl)) == [], f"T6 declared as {decl}")
+        # T6d (Codex P1): a MEDIUM stalled finding declared with no decision test stays stalled.
+        yaml.safe_dump({"declarations": [{"id": "SD-2", "blocker_id": "plan_minimum_bar_failed",
+                                          "why_unresolved": "x"}]}, open(os.path.join(d, "scope_declaration.yaml"), "w"))
+        ok(stalled(run(d, [mb], 3, declared=["plan_minimum_bar_failed"])) == ["plan_minimum_bar_failed:MB-005"],
+           "T6d a declaration without a decision test does not clear a stalled MEDIUM")
+        yaml.safe_dump({"declarations": [{"id": "SD-1", "blocker_id": "benchmark_drift", "why_unresolved": "x",
+                                          "decision_test": "models/dt_b9.yaml"}]},
+                       open(os.path.join(d, "scope_declaration.yaml"), "w"))
         ok(stalled(run(d, [bd("B9")], 3, declared=[STALL_KIND])) == ["benchmark_drift:B9"],
            "T6b declaring the stall kind itself does nothing")
         nd = run(d, [bd("B9")], 3, declared=["benchmark_drift"], non_declarable=lambda k, e: True)
