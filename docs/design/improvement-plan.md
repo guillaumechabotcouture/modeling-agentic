@@ -13,31 +13,27 @@ Merged to main:
 - **Integrity fixes found by the smokes:** #57 (final-gate false "deleted") and #59 (missing presentation critique after the harness write-up).
 - **Attempt 9 config** (#64): attempt 8's question and settings, unchanged.
 
-In review (Phase 46, simplification with no change to gate output):
+Merged (Phase 46, simplification with no change to gate output; #67, #68):
 - **α:** `scripts/gate_replay.py` replays the STAGE 7 validator on saved runs and diffs the findings; `agents/contract_packet.py` (unused, failing self-test) and five unused back-compat helpers removed.
-- **β:** the uncertainty-report, benchmark and comparator-efficiency checks moved from `validate_critique_yaml.py` (10,104 → 8,672 lines) into `scripts/uq_ci_quality.py`, `scripts/benchmark_gate.py` and `scripts/comparator_efficiency.py`, each with `gate_findings(run_dir)` and its own self-test (stacked on α).
+- **β:** the uncertainty-report, benchmark and comparator-efficiency checks moved from `validate_critique_yaml.py` (10,104 → 8,672 lines) into `scripts/uq_ci_quality.py`, `scripts/benchmark_gate.py` and `scripts/comparator_efficiency.py`, each with `gate_findings(run_dir)` and its own self-test.
 
-Merged (Phase 47 δ, #70):
+Merged (Phase 47, harness fixes; #69–#73):
+- **A9:** the rebuild re-records provenance for figures it redrew (α, #69).
+- **A18:** a `percentage` claim whose source holds a proportion (attempt 7, R-064: 0.587 would print as 0.6%) is a gate finding, HIGH once the draft cites it (`scripts/claim_units.py`; β, #72).
+- **D9:** decision-layer features listed under `decision_layer:` in `models/mechanism_manifest.yaml`, each with a with/without sufficiency test (or `specified_by` the question or brief) and the dates of the information it reads (γ, #71).
+- **A10:** a PreToolUse rule refuses kills chosen by pattern; agents stop processes by recorded PID (δ, #70).
+- **A17:** a gate finding present at 3 gates in a row needs a diagnosis in `models/stall_diagnoses.yaml` or a scope declaration before the next decision (`scripts/stall_rule.py`; ε, #73).
 
-In review (Phase 47 β, harness fix):
-- **A18:** a `percentage` claim whose source holds a proportion (attempt 7, R-064: 0.587 would print as 0.6%) is a gate finding, HIGH once the draft cites it (`scripts/claim_units.py`).
-
-In review (Phase 47 δ):
-- **A10:** the attempt 8 session crash was the modeler's own `pkill -f` / `ps | grep | kill` matching the session's command line; a PreToolUse rule now refuses kills chosen by pattern, and agents stop processes by recorded PID.
-
-In review (Phase 47 γ):
-- **D9:** decision-layer features listed under `decision_layer:` in `models/mechanism_manifest.yaml`, each with a with/without sufficiency test (or `specified_by` the question or brief) and the dates of the information it reads. The list is required once the run has an allocation; the red-team and sufficiency critics name features missing from it.
-
-In review (Phase 47 ε):
-- **A17:** a gate finding present at 3 gates in a row (`stall_rounds` in `effort_floors.yaml`) needs a diagnosis in `models/stall_diagnoses.yaml` or a scope declaration before the next decision; the decision text lists stalled findings (`scripts/stall_rule.py`).
+In review (Phase 48, simplification before attempt 9, with no change to gate output; checked with `gate_replay.py` on attempts 7 and 8 and every local run):
+- **α:** duplicated helpers moved to `scripts/lib/`: the check-module command line (`lib/gate_cli.py`, six copies) and the private by-path loader (`lib/siblings.py`, three copies); two more copies replaced by the existing `lib.safe_io` helpers; two unused functions removed.
 
 Before attempt 9:
-- A16 (compute places chunks on free workers itself, so VMs that join mid-batch get work);
-- A9 (stale data-stage figures): in review (Phase 47 α), the rebuild re-records provenance for figures it redrew;
+- A16 (compute places chunks on free workers itself, so VMs that join mid-batch get work): merged (Phase 45 δ, #66);
+- A9 (stale data-stage figures): merged (Phase 47 α, #69);
 - a pre-launch smoke on main, then owner sign-off on the brief.
 
 After attempt 9:
-- D10 (observed-vs-modelled inputs; D9 is in review above);
+- D10 (observed-vs-modelled inputs; D9 is merged above);
 - E3, E4; B4 (needs S3), B5, B6; C1–C3; D7;
 - smaller items: a gate-side P(output > 0) check from the per-draw values (A12 kept only the reporting); a pin or deterministic declaration can still exempt a frozen output with any reason (no weaker than before #62); attempt 8's B9 scope declaration rested on a stale benchmark value.
 

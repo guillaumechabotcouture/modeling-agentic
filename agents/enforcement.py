@@ -408,16 +408,6 @@ def bash_write_targets_cwd(command: str, cwd: str | None = None
     `cd runs/x && echo forged > critique_domain.yaml` resolves inside the
     run directory. After a `cd` whose destination is unknown, the cwd is
     None and callers must treat relative targets conservatively.
-    """
-    out: list[tuple[str, str | None]] = []
-    # Redirections on a cd segment apply in the cwd before it (`cd /tmp > x`).
-    for body, cur in iter_segments_with_cwd(command, cwd):
-        out.extend((t, cur) for t in _segment_targets(body))
-    return out
-
-
-def bash_write_targets(command: str) -> list[str]:
-    """Best-effort list of paths a shell command writes to.
 
     Heuristic, not a shell parser. It covers the forms observed in past
     runs (redirection, tee, sed -i, cp/mv/rm, git checkout/restore, and
@@ -425,15 +415,18 @@ def bash_write_targets(command: str) -> list[str]:
     code is caught after the fact by the harness hash in main.py.
 
     Known limitation (Codex review of PR #14): these forms still evade the
-    heuristic — variable
-    expansion (`p=…; echo > "$p"`), nested shells (`bash -c "cd …; …"`), a
-    `cd` that never runs (`false && cd x`) or runs in a pipeline,
-    backslash-escaped filenames, quotes inside `#` comments, and process
-substitution (`tee >(…) <protected>`). They are caught after the
-    fact by agents/integrity.py (Phase 23 α), which hashes protected run
+    heuristic — variable expansion (`p=…; echo > "$p"`), nested shells
+    (`bash -c "cd …; …"`), a `cd` that never runs (`false && cd x`) or runs
+    in a pipeline, backslash-escaped filenames, quotes inside `#` comments,
+    and process substitution (`tee >(…) <protected>`). They are caught after
+    the fact by agents/integrity.py (Phase 23 α), which hashes protected run
     artifacts and flags any change no allowed in-flight call explains.
     """
-    return [t for t, _ in bash_write_targets_cwd(command)]
+    out: list[tuple[str, str | None]] = []
+    # Redirections on a cd segment apply in the cwd before it (`cd /tmp > x`).
+    for body, cur in iter_segments_with_cwd(command, cwd):
+        out.extend((t, cur) for t in _segment_targets(body))
+    return out
 
 
 # ---------------------------------------------------------------------------

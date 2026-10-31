@@ -103,13 +103,6 @@ def _sidecars(run_dir: str) -> list[tuple[str, dict]]:
     return out
 
 
-def _inside(path: str, root: str) -> bool:
-    try:
-        return os.path.commonpath([os.path.realpath(path), os.path.realpath(root)]) == os.path.realpath(root)
-    except ValueError:
-        return False
-
-
 def _stale_or_unreadable(png: str) -> bool:
     """check_staleness, with a sidecar it cannot read counted as stale (fail closed)."""
     try:
@@ -137,13 +130,13 @@ def stale_scripts(run_dir: str) -> tuple[list[str], dict[str, list[str]], list[d
         if not script:
             skipped.append({"figure": rel, "why": "no generator script recorded"})
             continue
-        if not _inside(script, run_dir):
+        if not inside_dir(run_dir, script):
             # Sidecars written on another machine (or a moved run) record absolute
             # paths elsewhere: re-anchor them on this run directory by their
             # run-relative tail when that file exists.
             tail = script.split(os.path.basename(os.path.normpath(run_dir)) + os.sep, 1)
             cand = os.path.join(run_dir, tail[1]) if len(tail) == 2 else None
-            if cand and os.path.isfile(cand) and _inside(cand, run_dir):
+            if cand and os.path.isfile(cand) and inside_dir(run_dir, cand):
                 script = cand
             else:
                 skipped.append({"figure": rel, "why": f"generator script outside the run directory: {script}"})

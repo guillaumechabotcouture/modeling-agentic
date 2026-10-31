@@ -85,7 +85,6 @@ snapshot of the bounds at each round is the follow-up (B4, fix ledger S3).
 """
 from __future__ import annotations
 
-import argparse
 import fnmatch
 import math
 import os
@@ -107,21 +106,13 @@ DIAGNOSIS_ORDER = ("missing_data", "missing_mechanism", "structural_constraint",
 
 
 def _sibling(name: str):
-    """scripts/<name>.py by path, under a private module name."""
-    import importlib.util
-    key = f"_cs_p43_{name}"
-    if key in sys.modules:
-        return sys.modules[key]
-    spec = importlib.util.spec_from_file_location(key, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                                                    f"{name}.py"))
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[key] = mod
-    try:
-        spec.loader.exec_module(mod)
-    except BaseException:
-        sys.modules.pop(key, None)
-        raise
-    return mod
+    """scripts/<name>.py by path, under a private module name, so a run's own
+    module of the same name (models/ on sys.path) is never picked up."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    from lib.siblings import load_private
+    return load_private(name, "_cs_p43_")
 
 
 def _f(kind, sev, claim):
@@ -525,25 +516,21 @@ def _self_test() -> int:
     return 0
 
 
-def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("run_dir", nargs="?")
-    ap.add_argument("--round", type=int, default=None)
-    ap.add_argument("--self-test", action="store_true")
-    a = ap.parse_args(argv)
-    if a.self_test:
-        return _self_test()
-    if not a.run_dir:
-        ap.error("run_dir required")
-    fitted, errs, evidence = fitted_parameters(a.run_dir)
+def _print_fitted(run_dir: str) -> None:
+    fitted, errs, evidence = fitted_parameters(run_dir)
     print(f"fitted parameters ({len(fitted)}): {', '.join(sorted(fitted)) or 'none'}"
           + (f"  [errors: {'; '.join(errs)}]" if errs else ""))
-    if not os.path.exists(os.path.join(a.run_dir, PATH)):
+    if not os.path.exists(os.path.join(run_dir, PATH)):
         print(f"no {PATH}" + (" (the gate reports required_artifact_missing for a fitting run)" if evidence else ""))
-    v = gate_findings(a.run_dir, a.round)
-    for x in v:
-        print(f"[{x['severity']}] {x['kind']}: {x['claim'][:300]}")
-    return 1 if any(x["severity"] == "HIGH" for x in v) else 0
+
+
+def main(argv=None) -> int:
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    from lib import gate_cli
+    return gate_cli.run(argv, __doc__, gate_findings, _self_test, fails=gate_cli.any_high,
+                        round_default=None, preamble=_print_fitted)
 
 
 if __name__ == "__main__":
