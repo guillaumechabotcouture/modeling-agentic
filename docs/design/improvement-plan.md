@@ -38,6 +38,7 @@ In review (Phase 49, declarations held to evidence):
 - **α (A20):** a scope declaration of a HIGH gate finding cites a decision test (`scripts/declaration_tests.py`); untested or decision-changing declarations are HIGH and not declarable.
 - **β (A21):** a HIGH finding that bears on the primary decision is put to the owner (AWAIT_OWNER, `scripts/scope_signoff.py`), with its decision test or "untested"; stacked on α.
 
+<!-- change-fragments: scripts/assemble_changes.py adds new Status groups above this line -->
 Before attempt 9:
 - A16 (compute places chunks on free workers itself, so VMs that join mid-batch get work): merged (Phase 45 δ, #66);
 - A9 (stale data-stage figures): merged (Phase 47 α, #69);

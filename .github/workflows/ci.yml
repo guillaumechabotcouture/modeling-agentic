@@ -49,6 +49,11 @@ jobs:
           done
           exit $fail
 
+      # HEAD is the PR's merge commit; its first parent is the base branch.
+      - name: Ledger and plan Status change only through changes/ fragments
+        if: github.event_name == 'pull_request'
+        run: .venv/bin/python scripts/assemble_changes.py --check-pr HEAD^1
+
       - name: Skill attachments and expert priors
         run: |
           .venv/bin/python scripts/validate_skill_attachments.py
