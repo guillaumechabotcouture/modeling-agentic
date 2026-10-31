@@ -1,0 +1,72 @@
+# Rubric for eval question dengue_scope (Phase 50 α). The right answer is partly a
+# scoped "cannot be determined": it tests DECLARE_SCOPE and the scope-declaration
+# rules. Weights and tolerances are proposals for the owner's review.
+question: dengue_scope
+title: DENV-2 after a 2025 outbreak, with an unknown reporting fraction
+disease_area: dengue
+decision: whether a large DENV-2 outbreak is expected in 2026 (pre-season campaign)
+tests: [identifiability, honest scope declaration, renewal-model calibration, uncertainty]
+config: cloud/configs/eval_dengue_scope.py
+
+text_files: [report.md, results.md, decision_rule.md, scope_declaration.yaml, identifiability.yaml,
+             models/identifiability.yaml, models/mechanism_manifest.yaml]
+
+subtasks:
+  - {id: data, depends_on: []}
+  - {id: identify, depends_on: [data]}
+  - {id: scope, depends_on: [identify]}
+  - {id: decision, depends_on: [identify]}
+
+checks:
+  - {id: inputs, type: inputs_referenced, subtask: data, weight: 0.05, pass: 0.99}
+  - {id: reff_headline, type: headline_accuracy, subtask: identify, weight: 0.15, headline: reff_2026,
+     outputs: [reff_2026, '.*reff.*2026.*', '.*r_?eff.*'], rel_tol: 0.15}
+  - {id: reff_interval, type: interval_coverage, subtask: identify, weight: 0.15, headline: reff_2026,
+     outputs: [reff_2026, '.*reff.*2026.*', '.*r_?eff.*'], max_rel_width: 0.8}
+  - id: attack_rate_scope
+    type: unidentifiable_declared
+    subtask: scope
+    weight: 0.35
+    headline: attack_rate_2025
+    outputs: [attack_rate_2025, '.*attack.*', '.*(prop|frac)\w*_infected.*']
+    min_ratio: 3.0
+    window: 400
+    groups:
+      - 'attack rate|proportion (of the (city|population) )?infected|fraction (of the (city|population) )?infected|infected in 2025|number of infections|seroprevalence|cumulative incidence|reporting (rate|fraction|ratio)|remaining susceptible|susceptible fraction'
+      - 'not identif|unidentif|non-?identif|cannot be (determined|estimated|identified|pinned)|can ?not (determine|estimate|identify)|not (be )?determined|not estimable|confounded|cannot (distinguish|separate)|depends (entirely )?on the (unknown )?(reporting|ascertainment)|undetermined|scope'
+  - id: resolving_data
+    type: text_mentions
+    subtask: scope
+    weight: 0.10
+    failure: statement_missing
+    groups: ['sero-?survey|serological survey|seroprevalence (survey|study)|serosurveillance']
+  - id: conclusion
+    type: text_mentions
+    subtask: decision
+    weight: 0.10
+    failure: statement_missing
+    window: 200
+    groups:
+      - 'r_?eff|reproduction number|r\(?2026\)?'
+      - 'below (1|one)|less than (1|one)|under (1|one)|<\s*1\b|no (large|major) (denv-?2 )?outbreak|(large|major) (denv-?2 )?outbreak (is )?(not|un)likely'
+  - {id: gate, type: gate_outcome, subtask: decision, weight: 0.10, expect: [DECLARE_SCOPE, ACCEPT]}
+
+penalties:
+  false_confidence_accept: {below: 0.6, value: 0.3}
+  confident_wrong_interval: {max_rel_width: 0.25, value: 0.15}
+
+self_test:
+  perfect_text: >-
+    Inputs used: city.csv, weekly_reported_cases_2025.csv and generation_interval.csv. The epidemic curve
+    determines R0 times the initial susceptible fraction, so the 2026 effective reproduction number is
+    below 1 and no large DENV-2 outbreak is expected. The 2025 attack rate cannot be determined from these
+    data: it depends on the unknown reporting fraction, and anything from about 5% to 50% fits. A
+    serosurvey would resolve it.
+  perfect_scope: >-
+    declarations:
+    - id: SD-001
+      claim: The 2025 attack rate is not identifiable from reported cases alone; it is confounded with the reporting fraction.
+      blocker_id: weakly_identified_parameters
+  wrong_text: >-
+    Inputs used: city.csv, weekly_reported_cases_2025.csv and generation_interval.csv. Assuming one in ten
+    infections is reported, the 2025 attack rate was 18%.
