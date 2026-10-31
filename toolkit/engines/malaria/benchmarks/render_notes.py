@@ -72,14 +72,21 @@ def render(new: dict, old: dict | None, fitted: dict | None, mech: dict | None) 
             f"{bs['band_mis_based']} band mis-based, of {s['total']} ({s['held_out_in_band']} of {s['held_out_total']} "
             f"held-out in band). {new['n_sims']} engine runs, {len(new['seeds'])} seeds per arm (common random numbers). "
             f"v0.1: {(old or {}).get('summary', {}).get('in_band', 'n/a')} of {(old or {}).get('summary', {}).get('total', 'n/a')} in band."]
-    notes = [r for r in new["benchmarks"] if r["status"] in ("not_assessable", "band_mis_based") or r.get("requires")]
+    notes = [r for r in new["benchmarks"] if r["status"] in ("not_assessable", "band_mis_based") or r.get("requires")
+             or (r.get("price_floor") is not None and (r["price_floor"] > r["target"] or r.get("reach_in_fitted_range")))]
     for r in notes:
         if r.get("reach_in_fitted_range"):
             lo_, hi_ = r["reach_in_fitted_range"]
             out.append(f"- {r['id']}: over the fitted parameters' range (values consistent with the effect benchmarks) "
                        f"it spans {_fmt(lo_)}–{_fmt(hi_)} against the band {_fmt(r['band'][0])}–{_fmt(r['band'][1])}"
                        + ("; unreachable at the pack's prices." if r.get("mis_based_reason") == "unreachable_in_fitted_range" else "."))
-        if r.get("price_floor") is not None and (r["status"] == "band_mis_based" or r.get("reach_in_fitted_range")):
+        if r.get("price_floor") is not None and r["price_floor"] > r["target"]:
+            out.append(f"- {r['id']}: the target {_fmt(r['target'])} is below the price floor {_fmt(r['price_floor'])} per DALY "
+                       f"(cost per person divided by ALL the comparator's DALYs per person): no intervention can reach the "
+                       f"target value at the pack's price; only the band's upper part is reachable. The band's basis "
+                       f"(price or setting) differs from the decision's.")
+        if r.get("price_floor") is not None and (r["status"] == "band_mis_based" or r.get("reach_in_fitted_range")
+                                                 or r["price_floor"] > r["target"]):
             rel = "above" if r["price_floor"] > r["band"][1] else "below"
             out.append(f"- {r['id']}: price floor {_fmt(r['price_floor'])} per DALY (cost {_fmt(r['cost_per_capita'])} per person "
                        f"over the comparator's {_fmt(r['comparator_outcome_per_capita'])} DALYs per person), {rel} the band's "

@@ -338,7 +338,7 @@ class Runner:
             floor = float(dc / base) if base > 0 else float("inf")
             out.update(computed=comp, outcome_averted_per_capita=dv, cost_per_capita=dc,
                        comparator_outcome_per_capita=base, share_averted=float(dv / base) if base > 0 else None,
-                       price_floor=floor,
+                       price_floor=floor, target_below_price_floor=bool(floor > b["target"]),
                        share_averted_needed_for_band=float(dc / (b["band"][1] * base)) if base > 0 else None)
             out.update(_spread([c / v if v > 0 else float("inf") for c, v in zip(dc_i, dv_i)]))
             return self._verdict(b, out)
