@@ -30,6 +30,7 @@ In review (Phase 48, simplification before attempt 9, with no change to gate out
 - **γ:** `main.py` split by concern (3,057 → 2,077 lines): session plumbing, budget, preflight and run finishing moved to `agents/run_session.py`, `run_budget.py`, `run_preflight.py` and `run_finish.py`; `main.py` keeps the CLI and the session loop and re-exports every moved name (stacked on β).
 - **δ:** `agents/__init__.py` (1,934 → 453 lines) keeps the registry; the lead prompt and the hooks moved to `agents/lead_prompt.py` and `agents/hooks.py`, re-exported by the package (stacked on γ).
 
+<!-- change-fragments: scripts/assemble_changes.py adds new Status groups above this line -->
 Before attempt 9:
 - A16 (compute places chunks on free workers itself, so VMs that join mid-batch get work): merged (Phase 45 δ, #66);
 - A9 (stale data-stage figures): merged (Phase 47 α, #69);
