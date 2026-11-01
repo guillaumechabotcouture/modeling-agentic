@@ -15,6 +15,12 @@ the stored spike batch is reusable.
 Runs go to `scripts/compute.py` (`run_map`): dask on Coiled when the launcher provides a
 scheduler, else a local process pool that is replaced every chunk (spike lesson 7);
 results are kept per input, so a rerun completes a stopped batch.
+
+A batch computed elsewhere (VM shards) is shipped with the exact jobs it ran: each shard calls `ship()` where it ran
+(jobs, design, rows and a manifest with their sha256 and the computing platform), `merge_shipped()` joins shards from
+one platform, and `load_shipped()` (run.py `--shipped`) checks the rows against the shipped jobs instead of a design
+regenerated on the merging platform. `adopt()` refuses a stored batch recorded on another platform
+(`adopt_platform_differs`), because its replay check would recompute there what was computed elsewhere.
 """
 from __future__ import annotations
 
@@ -225,6 +231,13 @@ def adopt(run_dir: str, src_results: str, src_jobs: str, src_design: str, jobs: 
     from toolkit.analysis.artifacts import sha256
     from toolkit.engines.contract import engine_identity
     sd = json.load(open(src_design))
+    if sd.get("platform") is not None and not same_platform(sd["platform"], platform_info()):
+        # the replay below would recompute here what another platform computed; stochastic simulation amplifies
+        # last-bit differences (the Nigeria re-run: about 1.4%), so the check cannot tell a model change from noise
+        raise BatchRefused("adopt_platform_differs",
+                           f"stored batch not adopted: it was computed on {_plat(sd['platform'])} and this is "
+                           f"{_plat(platform_info())}; adopt it on the computing platform, or ship it with its exact "
+                           "inputs (batch.ship) and load it with load_shipped")
     want = {j["id"]: j for j in jobs}
     probs = []
     ref = design["spec_engine"]
@@ -294,6 +307,194 @@ def adopt(run_dir: str, src_results: str, src_jobs: str, src_design: str, jobs: 
     return {"path": out, "adopted_from": src, "jobs_matched": len(seen), "rerun_sample": pick,
             "rerun_reproduced": len(pick), "rtol": rtol, "rerun_max_rel_diff": worst[0],
             "ignored": sorted(TIMING_KEYS)}
+
+
+# ---------------------------------------------------------------- shipped batches (computed on one platform, merged on another)
+# A batch computed elsewhere (VM shards) ships with the exact jobs it ran, inputs included, its design and its rows,
+# each hashed in a manifest that names the platform. The merge and the analysis then check the rows against the
+# shipped jobs, never against a design regenerated on the merging platform: the Nigeria re-run's shards (Linux)
+# merged on macOS regenerated m0 = exp(z) with last-bit differences at one design point and 32 rows failed.
+SHIP_MANIFEST = "manifest.json"
+SHIP_FILES = {"jobs": "jobs.jsonl", "design": "design.json", "results": "results.jsonl"}
+PLATFORM_KEYS = ("system", "machine", "python", "numpy", "scipy")
+# Across platforms the regenerated design may differ from the shipped one only in the last bits (about 1e-16);
+# anything above this is a changed input, not floating point. On the same platform it must be identical.
+INPUT_RTOL = 1e-12
+
+
+class BatchRefused(ValueError):
+    """A stored or shipped batch that is not used, with a stable code (the message starts with it)."""
+
+    def __init__(self, code: str, msg: str):
+        super().__init__(f"[{code}] {msg}")
+        self.code = code
+
+
+def platform_info() -> dict:
+    """What floating-point results depend on: OS, CPU architecture, Python, numpy and scipy versions."""
+    import platform
+    try:
+        import scipy
+        sv = scipy.__version__
+    except ImportError:
+        sv = None
+    return {"system": platform.system(), "machine": platform.machine(), "python": platform.python_version(),
+            "numpy": np.__version__, "scipy": sv}
+
+
+def same_platform(a, b) -> bool:
+    return isinstance(a, dict) and isinstance(b, dict) and all(a.get(k) == b.get(k) for k in PLATFORM_KEYS)
+
+
+def _plat(p) -> str:
+    return "/".join(str((p or {}).get(k)) for k in PLATFORM_KEYS)
+
+
+def _file_sha(path: str) -> str | None:
+    from toolkit.analysis.artifacts import sha256
+    return sha256(path)
+
+
+def _write_bundle(out_dir: str, man: dict, design_: dict, jobs: list[dict], rows: list[dict]) -> dict:
+    os.makedirs(out_dir, exist_ok=True)
+    p = {k: os.path.join(out_dir, v) for k, v in SHIP_FILES.items()}
+    with open(p["jobs"], "w") as f:
+        f.write("".join(json.dumps(j, sort_keys=True) + "\n" for j in jobs))
+    with open(p["design"], "w") as f:
+        json.dump(design_, f, indent=1, sort_keys=True)
+    with open(p["results"], "w") as f:
+        f.write("".join(json.dumps({"id": r["id"], "ok": True, "result": r["result"]}, sort_keys=True) + "\n"
+                        for r in rows))
+    man = dict(man, producer=PRODUCER, n_jobs=len(jobs), n_rows=len(rows),
+               **{f"{k}_sha256": _file_sha(v) for k, v in p.items()})
+    with open(os.path.join(out_dir, SHIP_MANIFEST), "w") as f:
+        json.dump(man, f, indent=1, sort_keys=True)
+    return man
+
+
+def ship(out_dir: str, spec, design_: dict, jobs: list[dict], rows: list[dict], platform: dict | None = None) -> dict:
+    """Write a shipped batch (or one shard of it) where it was computed: the exact jobs, the design, the ok rows
+    ({"id", "ok", "result": run_job output}) and a manifest with each file's sha256, the decision spec's sha256 and
+    the computing platform. Returns the manifest."""
+    ids = {j["id"] for j in jobs}
+    ok_rows = [r for r in rows if r.get("ok") and r.get("id") in ids]
+    return _write_bundle(out_dir, {"platform": platform or platform_info(), "spec_sha256": spec.sha256,
+                                   "settings_sha256": getattr(spec, "settings_sha256", None)}, design_, jobs, ok_rows)
+
+
+def _read_bundle(d: str) -> tuple[dict, dict, list[dict], list[dict]]:
+    mp = os.path.join(d, SHIP_MANIFEST)
+    try:
+        man = json.load(open(mp))
+    except (OSError, ValueError) as e:
+        raise BatchRefused("shipped_unreadable", f"{mp}: {type(e).__name__}: {e}")
+    if not isinstance(man, dict) or not isinstance(man.get("platform"), dict):
+        raise BatchRefused("shipped_no_platform", f"{mp} does not record the platform that computed the batch")
+    for k, name in SHIP_FILES.items():
+        got = _file_sha(os.path.join(d, name))
+        if got is None or got != man.get(f"{k}_sha256"):
+            raise BatchRefused("shipped_hash_mismatch", f"{os.path.join(d, name)}: sha256 {got} differs from the "
+                                                         f"manifest's {man.get(f'{k}_sha256')}")
+    try:
+        des = json.load(open(os.path.join(d, SHIP_FILES["design"])))
+        jobs = [json.loads(x) for x in open(os.path.join(d, SHIP_FILES["jobs"])) if x.strip()]
+        rows = [json.loads(x) for x in open(os.path.join(d, SHIP_FILES["results"])) if x.strip()]
+    except (OSError, ValueError) as e:
+        raise BatchRefused("shipped_unreadable", f"{d}: {type(e).__name__}: {e}")
+    return man, des, jobs, rows
+
+
+def merge_shipped(out_dir: str, parts: list[str]) -> dict:
+    """Merge shipped shards into one shipped batch. They must come from one platform, one decision spec and one
+    design, with no job in two shards; each shard's hashes are checked. The merged jobs are the shards' own."""
+    if not parts:
+        raise BatchRefused("shipped_incomplete", "no shards to merge")
+    mans, jobs, rows, des = [], [], [], None
+    for p in parts:
+        man, d_, j_, r_ = _read_bundle(p)
+        if mans and not same_platform(man["platform"], mans[0]["platform"]):
+            raise BatchRefused("shipped_platform_mixed", f"{p} was computed on {_plat(man['platform'])}, "
+                                                         f"{parts[0]} on {_plat(mans[0]['platform'])}")
+        if mans and (man.get("spec_sha256"), man.get("design_sha256")) != (mans[0].get("spec_sha256"),
+                                                                           mans[0].get("design_sha256")):
+            raise BatchRefused("shipped_spec_differs", f"{p} was shipped for another decision spec or design than "
+                                                       f"{parts[0]}")
+        mans.append(man)
+        des = d_
+        jobs += j_
+        rows += r_
+    ids = [j.get("id") for j in jobs]
+    if len(set(ids)) != len(ids):
+        raise BatchRefused("shipped_duplicate_job", "a job appears in more than one shard")
+    pk = list(des.get("packages") or [])
+    jobs.sort(key=lambda j: (j.get("point", 0), pk.index(j["package"]) if j.get("package") in pk else len(pk)))
+    return _write_bundle(out_dir, {"platform": mans[0]["platform"], "spec_sha256": mans[0].get("spec_sha256"),
+                                   "settings_sha256": mans[0].get("settings_sha256"),
+                                   "merged_from": [{"path": os.path.basename(os.path.normpath(p)),
+                                                    "results_sha256": m.get("results_sha256")}
+                                                   for p, m in zip(parts, mans)]}, des, jobs, rows)
+
+
+def _input_diff(a, b, worst) -> bool:
+    """True when a and b have the same structure and non-numeric leaves; records the largest relative numeric
+    difference in worst[0]."""
+    if isinstance(a, dict) and isinstance(b, dict):
+        return set(a) == set(b) and all([_input_diff(a[k], b[k], worst) for k in a])
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        return len(a) == len(b) and all([_input_diff(x, y, worst) for x, y in zip(a, b)])
+    num = lambda x: isinstance(x, (int, float)) and not isinstance(x, bool)  # noqa: E731
+    if num(a) and num(b):
+        if a != b:
+            worst[0] = max(worst[0], abs(a - b) / max(abs(a), abs(b)))
+        return True
+    return a == b
+
+
+def load_shipped(bundle: str, spec, design_: dict, jobs: list[dict], engine) -> tuple[dict, list[dict], dict, dict]:
+    """(design, jobs, results, info) of a shipped batch, checked: file hashes; the decision spec; the shipped jobs
+    against the design regenerated here (identical on the computing platform; elsewhere equal up to last-bit
+    floating-point differences, INPUT_RTOL); every row's provenance against the shipped job it ran; every job
+    present. The shipped design and jobs are returned, so the analysis uses the inputs that were actually run.
+    Anything short of that raises BatchRefused (fail closed)."""
+    man, sdes, sjobs, rows = _read_bundle(bundle)
+    if man.get("spec_sha256") != spec.sha256:
+        raise BatchRefused("shipped_spec_differs", f"shipped for decision spec {man.get('spec_sha256')}, the current "
+                                                   f"one is {spec.sha256}")
+    want = [j["id"] for j in jobs]
+    got = [j.get("id") for j in sjobs]
+    if sorted(got) != sorted(want):
+        miss, extra = sorted(set(want) - set(got)), sorted(set(got) - set(want))
+        raise BatchRefused("shipped_incomplete", f"{len(miss)} current jobs not shipped (e.g. {miss[:3]}), "
+                                                 f"{len(extra)} shipped jobs not current (e.g. {extra[:3]})")
+    by = {j["id"]: j for j in sjobs}
+    sjobs = [by[i] for i in want]
+    cross = not same_platform(man["platform"], platform_info())
+    worst = [0.0]
+    for cur, sh in zip(jobs, sjobs):
+        if job_sha(cur) == job_sha(sh):
+            continue
+        if not cross:
+            raise BatchRefused("shipped_inputs_differ", f"{cur['id']}: the shipped inputs differ from the design "
+                                                        f"regenerated on the computing platform")
+        if not _input_diff(cur, sh, worst) or worst[0] > INPUT_RTOL:
+            raise BatchRefused("shipped_inputs_differ", f"{cur['id']}: the shipped inputs differ from the regenerated "
+                                                        f"design beyond floating point (max rel {worst[0]:.3g} > "
+                                                        f"{INPUT_RTOL:g})")
+    if not _input_diff(design_, sdes, worst) or worst[0] > (INPUT_RTOL if cross else 0.0):
+        raise BatchRefused("shipped_inputs_differ", f"the shipped design differs from the regenerated one "
+                                                    f"(max rel {worst[0]:.3g})")
+    res, probs = verify_rows([r for r in rows if r.get("ok")], sjobs, engine)
+    if probs:
+        raise BatchRefused("shipped_provenance", f"{len(probs)} shipped rows lack matching provenance "
+                                                 f"(e.g. {probs[:3]})")
+    miss = [i for i in want if i not in res]
+    if miss:
+        raise BatchRefused("shipped_incomplete", f"no shipped result for {len(miss)} jobs (e.g. {miss[:3]})")
+    info = {"inputs": "shipped", "cross_platform": cross, "computed_on": man["platform"], "merged_on": platform_info(),
+            "input_max_rel_diff": worst[0], "input_rtol": INPUT_RTOL if cross else 0.0,
+            "manifest_sha256": _file_sha(os.path.join(bundle, SHIP_MANIFEST)),
+            **{f"{k}_sha256": man.get(f"{k}_sha256") for k in SHIP_FILES}}
+    return sdes, sjobs, res, info
 
 
 def _same(a, b, rtol, worst=None) -> bool:

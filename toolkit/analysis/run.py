@@ -2,7 +2,7 @@
 """The analysis engine (architecture-v2 §3.4): every number from the spec, the engine and the run's data.
 
     python3 toolkit/analysis/run.py <run_dir> [--spec decision_spec.yaml] [--results <batch results.jsonl>]
-                                    [--draws N] [--unsigned]
+                                    [--shipped <shipped batch dir>] [--draws N] [--unsigned]
     python3 toolkit/analysis/run.py --self-test         # every step on the toy engine, both paths
 
 Steps (design: docs/design/v2-spec-and-analysis.md §2): validate the spec and check it is
@@ -133,7 +133,26 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
         kw = dict(compute_kw or {})
         if spec["analysis"].get("workers"):
             kw.setdefault("max_workers", int(spec["analysis"]["workers"]))
-        if adopt:
+        shipped = (adopt or {}).get("shipped")
+        adopt_in = []
+        if shipped:
+            # a batch computed elsewhere (VM shards) with its exact inputs: rows are checked against the shipped
+            # jobs, and the analysis uses the shipped design (batch.load_shipped)
+            from toolkit.engines.contract import engine_identity
+            design, jobs, res, info = Bt.load_shipped(shipped, spec, design, jobs, eng)
+            with open(os.path.join(run_dir, "analysis", "batch", "design.json"), "w") as f:
+                json.dump(design, f, indent=1)
+            with open(os.path.join(run_dir, "analysis", "batch", "results.jsonl"), "w") as f:
+                for n, j in enumerate(jobs):
+                    f.write(json.dumps({"i": n, "ok": True, "result": {"result": res[j["id"]], "provenance": {
+                        "job_sha": Bt.job_sha(j), "engine": engine_identity(eng), "producer": Bt.PRODUCER,
+                        "shipped_from": info}}}) + "\n")
+            res, probs = Bt.load_results(os.path.join(run_dir, "analysis", "batch", "results.jsonl"), jobs, eng)
+            bsum = {"source": "shipped batch", "shipped": info, "n": len(res), "rejected_rows": len(probs)}
+            adopt_in = [os.path.join(os.path.abspath(shipped), n) for n in
+                        [Bt.SHIP_MANIFEST] + list(Bt.SHIP_FILES.values())]
+        elif adopt:
+            adopt_in = [adopt["results"], adopt["jobs"], adopt["design"]]
             # a batch computed before results carried provenance: adopted only after a full-input match and a re-run
             # sample that reproduces it (Codex P1-3)
             ad = Bt.adopt(run_dir, adopt["results"], adopt["jobs"], adopt["design"], jobs, design, eng,
@@ -154,7 +173,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
                                           "prior_names": design.get("prior_names", []),
                                           "summary": bsum}, Bt.PRODUCER,
                                 [os.path.join(run_dir, "analysis", "batch", "design.json"), batch_rows] + data_in
-                                + ([adopt["results"], adopt["jobs"], adopt["design"]] if adopt else []))
+                                + adopt_in)
         model = EmulatorModel(spec, design, res, log=log).fit()
         arts["emulator"] = S.write("emulator", {"accuracy": model.accuracy, "fit_seconds": model.fit_seconds,
                                                 "features": model.features, "training_corrections":
@@ -436,6 +455,21 @@ def _self_test() -> int:
             ok(False, "R20 a stored result the current engine does not reproduce is not adopted")
         except ValueError as e:
             ok("does not reproduce" in str(e), "R20 a stored result the current engine does not reproduce is not adopted")
+        # a batch shipped from another platform with its exact inputs (the Nigeria re-run's shards): the analysis
+        # uses the shipped jobs and design, and records where they were computed
+        try:
+            sh = os.path.join(d, "shipped")
+            Bt.ship(sh, spec, design, jobs, [{"id": j["id"], "ok": True, "result": Bt.run_job(j)} for j in jobs],
+                    platform=dict(Bt.platform_info(), system="OtherOS"))
+            run(d, log=q, adopt={"shipped": sh}, compute_kw={"max_workers": 2}, draws=2)
+            bdoc = yaml.safe_load(open(os.path.join(d, "analysis", "batch.yaml")))
+            sm = bdoc["data"]["summary"]
+            ok(sm.get("source") == "shipped batch" and sm["shipped"]["cross_platform"] is True
+               and sm["n"] == len(jobs) and contract.gate_findings(d) == []
+               and any(k.endswith("shipped/jobs.jsonl") for k in bdoc["inputs"]),
+               f"R20b a batch shipped from another platform runs the analysis on its own inputs: {sm.get('source')}")
+        except Exception as e:      # noqa: BLE001 -- a failing case, not a crash of the self-test
+            ok(False, f"R20b a batch shipped from another platform runs the analysis ({type(e).__name__}: {e})")
         from toolkit.analysis.model import _driver
         try:
             _driver({"cost_drivers": {"x": 1.0}}, "treated", "t")
@@ -891,10 +925,16 @@ def main(argv=None) -> int:
     ap.add_argument("--spec", default="decision_spec.yaml")
     ap.add_argument("--adopt", nargs=3, metavar=("RESULTS", "JOBS", "DESIGN"), default=None,
                     help="adopt a stored batch computed before results carried provenance (verified, then re-run sample)")
+    ap.add_argument("--shipped", metavar="DIR", default=None,
+                    help="use a batch shipped from where it was computed (toolkit/analysis/batch.py ship/merge_shipped)")
     ap.add_argument("--draws", type=int, default=None)
     ap.add_argument("--unsigned", action="store_true", help="test runs only: every artifact records spec_signed false")
     a = ap.parse_args(argv)
     ad = dict(zip(("results", "jobs", "design"), a.adopt)) if a.adopt else None
+    if a.shipped:
+        if ad:
+            ap.error("--shipped and --adopt are alternatives")
+        ad = {"shipped": a.shipped}
     R = run(a.run_dir, a.spec, ad, a.draws, a.unsigned)
     print(json.dumps({"point": {k: R["point"][k] for k in ("averted", "cost_allocated", "mix")},
                       "uncertainty": R["uncertainty"]["fixed_plan"], "label": R["uncertainty"]["label"],
