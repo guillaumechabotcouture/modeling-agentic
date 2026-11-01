@@ -305,7 +305,7 @@ def launch(cfg):
     client = cluster.get_client()
     client.wait_for_workers(n0, timeout=1800)
     client.upload_file(os.path.join(HERE, "worker_side.py"))
-    workers = sorted(client.scheduler_info()["workers"])[:len(cfg.labels)]
+    workers = sorted(ws.scheduler_workers(lambda: ws.live_client(cluster, client), min_workers=n0))[:len(cfg.labels)]
     compute.register_compute_tags(client, exclude=workers)   # the agent VMs never take compute tasks
     launch_id = time.strftime("%Y%m%d-%H%M%S")
     assign = {}
@@ -326,10 +326,11 @@ def launch(cfg):
     json.dump(clusters, open(cfg.clusters_file, "w"), indent=1)
     time.sleep(10)
     if cfg.keeper:
-        clusters["keeper"] = {"name": cfg.keeper_name,
-                              "id": start_keeper(cfg, adapt_options(cfg, compute.ADAPT_OPTIONS), cluster.cluster_id,
-                                                 overflow)}
-        json.dump(clusters, open(cfg.clusters_file, "w"), indent=1)
+        kc = start_keeper(cfg, adapt_options(cfg, compute.ADAPT_OPTIONS), cluster.cluster_id, overflow)
+        clusters["keeper"] = {"name": cfg.keeper_name, "id": kc.cluster_id}
+        json.dump(clusters, open(cfg.clusters_file, "w"), indent=1)   # recorded before any read that can fail
+        time.sleep(30)
+        confirm_keeper(cfg.keeper_name, kc)
     print(f"launched {cfg.name}: results go to outputs/{cfg.storage_prefix}/; the cluster stops itself "
           "once every run is stored. Safe to disconnect.")
 
@@ -396,10 +397,32 @@ def start_keeper(cfg, adapt_opts, cluster_id, overflow=None):
                    cfg.keeper_hours, dict(adapt_opts), cluster_id, overflow, pure=False,
                    key=f"keeper-{cfg.name}-{cluster_id}")   # a new key per run cluster: never an old future
     fire_and_forget(fut)
-    time.sleep(30)
-    w = sorted(c.scheduler_info()["workers"])[0]
-    print(c.run(ws.keeper_log, workers=[w])[w].strip().splitlines()[-1:], f"(keeper {cfg.keeper_name}, pool {lo}..{hi})")
-    return kc.cluster_id
+    print(f"keeper {cfg.keeper_name} submitted (pool {lo}..{hi})", flush=True)
+    return kc
+
+
+def confirm_keeper(keeper_name, kc, attempts=6, delay_s=5.0, sleep=None):
+    """Print the keeper's last log line. The keeper cluster's client can be closed by now (a
+    failed reconnect closes it and empties its scheduler identity: v2blind1's
+    `KeyError: 'workers'`), so a closed client is replaced and the read retried with
+    backoff. Past the bound the launch fails with a message saying what to check; the run
+    is already fired and clusters.json already names the keeper."""
+    box = [None]
+
+    def client():
+        box[0] = ws.live_client(kc, box[0])
+        return box[0]
+    try:
+        w = sorted(ws.scheduler_workers(client, attempts=attempts, delay_s=delay_s, min_workers=1, sleep=sleep,
+                                        log=print))[0]
+        line = box[0].run(ws.keeper_log, workers=[w])[w].strip().splitlines()[-1:]
+    except Exception as e:  # noqa: BLE001 — reported, never ignored
+        raise SystemExit(f"keeper {keeper_name} (cluster {kc.cluster_id}) was submitted but not confirmed holding "
+                         f"the pool: {type(e).__name__}: {str(e)[:200]}. The run is fired and the clusters file "
+                         f"names the keeper; check `status` and `keeper-log` now (without a keeper the pool "
+                         f"stays at its start size).")
+    print(line, f"(keeper {keeper_name})")
+    return line
 
 
 def keeper_lines(st: dict | None, now: float | None = None) -> list[str]:
@@ -434,7 +457,7 @@ def status(cfg):
     if keep:
         try:
             kc = attach(cfg.keeper_name).get_client()
-            w = sorted(kc.scheduler_info()["workers"])[0]
+            w = sorted(ws.scheduler_workers(lambda: kc, attempts=3, min_workers=1))[0]
             print("\n".join(keeper_lines(kc.run(ws.keeper_status, workers=[w])[w])))
         except Exception as e:  # noqa: BLE001 — a keeper from before Phase 42 β has no status file
             print(f"keeper status unavailable: {type(e).__name__}: {str(e)[:120]}")
@@ -1067,8 +1090,8 @@ def _self_test_52(ok) -> None:
     except ws.SchedulerInfoUnavailable as e:
         ok(sleeps == [5.0, 8.0, 8.0] and "4 tries" in str(e) and "no worker table" in str(e),
            f"RC52b a worker table that never appears is refused after the bound, naming why: {e} {sleeps}")
-    got = ws.scheduler_workers(lambda: FakeClient([{"workers": {}}, {"workers": table}]), attempts=3,
-                               delay_s=0.0, sleep=sleeps.append, min_workers=1)
+    c = FakeClient([{"workers": {}}, {"workers": table}])
+    got = ws.scheduler_workers(lambda: c, attempts=3, delay_s=0.0, sleep=sleeps.append, min_workers=1)
     ok(got == table, "RC52c min_workers: an empty table (no worker joined yet) is waited out")
     closed = FakeClient([{}], status="closed")
     fresh = FakeClient([{"workers": table}])
@@ -1488,7 +1511,7 @@ def main(argv) -> int:
         report_cost(cfg, rest)
     elif cmd == "keeper-log":
         c = attach(cfg.keeper_name).get_client()
-        w = sorted(c.scheduler_info()["workers"])[0]
+        w = sorted(ws.scheduler_workers(lambda: c, attempts=3, min_workers=1))[0]
         print(c.run(ws.keeper_log, workers=[w])[w])
     elif cmd == "brief":
         r = _side(cfg, ws.brief_side)
