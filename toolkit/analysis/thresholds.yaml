@@ -22,7 +22,7 @@ calibration:
   chains: 4
   warmup: 4000
   mcmc_draws: 4000            # per chain; doubled up to `mcmc_max_doublings` times before failing closed
-  mcmc_max_doublings: 3
+  mcmc_max_doublings: 4       # measured (β): 3 left 2 of 200 SB3a fits at R-hat 1.011-1.012
   rhat_max: 1.01
   ess_bulk_min: 400
   draws_kept: 4000            # rows of the canonical posterior sample

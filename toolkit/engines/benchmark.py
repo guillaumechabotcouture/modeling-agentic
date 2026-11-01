@@ -330,6 +330,9 @@ def _job(args):
             "meta": dict(o.meta, age_shares=pdays)}
 
 
+COVERAGE_TASKS_PER_CHILD = 4
+
+
 def _coverage_job(args) -> dict:
     """One coverage replicate (v2d β): generate, calibrate, score. A calibrator that refuses (fails closed) makes the
     replicate invalid, with its message recorded; it is never counted as under-coverage."""
@@ -678,8 +681,13 @@ class Runner:
         jobs = [job + (r,) for r in range(reps)]
         if self.workers > 1 and reps > 1:
             # v2d β: replicates in parallel; the replicate seeds are fixed, so the result equals the serial one
-            with ProcessPoolExecutor(min(self.workers, reps)) as ex:
-                per = list(ex.map(_coverage_job, jobs, chunksize=1))
+            # fresh worker processes every few replicates: a worker's memory grows by about 0.3 GB per engine-backed
+            # fit (measured on SB5), which broke the pool at 8 workers on a 32 GiB VM
+            # (a fresh pool per chunk; max_tasks_per_child hung on macOS / Python 3.14 in the self-test)
+            per, k = [], self.workers * COVERAGE_TASKS_PER_CHILD
+            for i in range(0, reps, k):
+                with ProcessPoolExecutor(min(self.workers, len(jobs[i:i + k]))) as ex:
+                    per += list(ex.map(_coverage_job, jobs[i:i + k], chunksize=1))
         else:
             per = [_coverage_job(j) for j in jobs]
         self.exercised |= {c for p in per for c in p.pop("_configs") if c is not None}
