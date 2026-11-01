@@ -1550,6 +1550,33 @@ def _self_test() -> int:
         ok(any("direct" in b for b in bad), f"CR12 (Codex r2-5) posterior with an emulator is refused: {bad}")
     safe(cr11, "CR11-12 boundary stencil, emulator")
 
+    def cb8():
+        # SB2b evidence (coverage run 2026-11-01): 143 of 200 fits stopped at ESS about 100 after 6 adaptive stages, on
+        # a curved ridge in 5 parameters. Two curved ridges here (x1 = x0^2, x3 = 0.3 / x2) plus one free parameter:
+        # one Gaussian per stage cannot follow them. The marginals are known (x0 ~ U(0, 1), x2 ~ U(0.3, 1)).
+        names = [f"x{i}" for i in range(5)]
+        pri = {n: Prior.from_decl(n, {"dist": "uniform", "range": [0.0, 1.0], "source": "t"}) for n in names}
+        pri["x2"] = Prior.from_decl("x2", {"dist": "uniform", "range": [0.3, 1.0], "source": "t"})
+        pri["x3"] = Prior.from_decl("x3", {"dist": "uniform", "range": [0.3, 1.0], "source": "t"})
+
+        def banana(X):
+            r1 = (X["x1"] - X["x0"] ** 2) / 0.004
+            r2 = (X["x2"] * X["x3"] - 0.3) / 0.004
+            r3 = (X["x4"] - 0.5) / 0.05
+            return -0.5 * (r1 ** 2 + r2 ** 2 + r3 ** 2), {}
+        P = Problem(names, pri, banana)
+        try:
+            s = sample(P, seed=7, max_importance_params=thresholds()["max_importance_params_run_batch"])
+        except CalibrationRefused as e:
+            ok(False, f"CB8 a curved 5-parameter ridge (the SB2b case) reaches the ESS floor ({e})")
+            return
+        m = np.mean(s["rows"], axis=0)
+        ok(s["diagnostics"]["ess"] >= 1000 and abs(m[0] - 0.5) < 0.03 and abs(m[1] - 1 / 3) < 0.03
+           and abs(m[4] - 0.5) < 0.01,
+           f"CB8 a curved 5-parameter ridge (the SB2b case) reaches the ESS floor with the right marginals "
+           f"(ESS {s['diagnostics']['ess']:.0f}, means {np.round(m, 3)})")
+    safe(cb8, "CB8 curved ridge")
+
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
