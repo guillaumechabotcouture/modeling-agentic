@@ -83,6 +83,71 @@ def workspace_hidden(root: str) -> list[str]:
     return found
 
 
+# The bundle's hidden tree (scripts/eval_private.py) and where decrypted copies are kept
+# (.gitignore): names that are hidden wherever they sit under evals/.
+_EVALS_HIDDEN_NAMES = {"generate.py", "rubric.yaml", "_common.py", "test_suite.py"}
+_EVALS_HIDDEN_DIRS = {"legacy", "design"}
+_SKIP_DIRS = {".git", ".venv", "__pycache__", "node_modules"}
+
+
+def _git_tracked(root: str) -> set[str]:
+    import subprocess
+    try:
+        out = subprocess.run(["git", "-C", root, "ls-files", "-z"], capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    return set(out.stdout.decode("utf-8", "replace").split("\0")) - {""} if out.returncode == 0 else set()
+
+
+def tree_hidden_material(root: str, tracked: set[str] | None = None) -> list[str]:
+    """Hidden eval material on disk under `root`, untracked and ignored files included.
+
+    Coiled package sync uploads the launch tree as a wheel, so `git archive`'s
+    export-ignore does not protect it: the launcher refuses a tree holding any of
+    - a `_truth*` path component anywhere;
+    - a `*.enc` file (the encrypted bundle);
+    - a decrypted bundle (`evals_private/`, `eval_private_*/`, any `<x>/evals/` copy's
+      generators and rubrics);
+    - under any `evals/` directory: generate.py, rubric.yaml, _common.py, test_suite.py,
+      legacy/ or design/, or any file git does not track (the tracked files are public:
+      the repository is public; a nested checkout, such as a git worktree, answers
+      for the files inside it);
+    - HIDDEN_FILES (the old design note).
+    `tracked` is git's file list for `root` (read with `git ls-files` when None; no
+    list means every file under the top-level evals/ counts: fail closed)."""
+    if tracked is None:
+        tracked = _git_tracked(root)
+    repos: dict[str, set[str]] = {"": tracked}   # nested checkouts (a git worktree) answer for their files
+
+    def is_tracked(parts: list[str], k: int) -> bool:
+        for n in range(k, 0, -1):                 # the deepest checkout holding this evals/ directory
+            pre = "/".join(parts[:n])
+            if pre not in repos and os.path.exists(os.path.join(root, pre, ".git")):
+                repos[pre] = _git_tracked(os.path.join(root, pre))
+            if pre in repos:
+                return "/".join(parts[n:]) in repos[pre]
+        return "/".join(parts) in tracked
+
+    found = []
+    for dp, dirs, files in os.walk(root):
+        dirs[:] = sorted(d for d in dirs if d not in _SKIP_DIRS and not d.startswith(".venv"))
+        for fn in files:
+            rel = os.path.relpath(os.path.join(dp, fn), root).replace(os.sep, "/")
+            parts = rel.split("/")
+            hit = (any(p.startswith("_truth") for p in parts) or fn.endswith(".enc")
+                   or any(p == "evals_private" or p.startswith("eval_private_") for p in parts[:-1])
+                   or rel in HIDDEN_FILES)
+            for k, p in enumerate(parts[:-1]):
+                if p != "evals" or hit:
+                    continue
+                below = parts[k + 1:]
+                hit = (below[-1] in _EVALS_HIDDEN_NAMES or below[0] in _EVALS_HIDDEN_DIRS
+                       or not is_tracked(parts, k))
+            if hit:
+                found.append(rel)
+    return sorted(found)
+
+
 def is_eval_question(question: str, meta: dict | None = None) -> bool:
     """An eval question is marked by explicit run metadata (`eval_question: true`) or by
     the complete synthetic prefix at the start of its text, not by a substring anywhere."""
@@ -181,6 +246,53 @@ def _self_test() -> int:
             json.dump({"question": q}, f)
         ok(question_for(None, os.path.join(td, "r"))[0] == q and question_for("arg", None) == ("arg", {}),
            "EP11 the effective question: the argument, else the resumed run's metadata")
+    # EP12: the launch tree on disk (Coiled package sync ships it, untracked and ignored
+    # files included): hidden material anywhere in it is reported; the public files are not.
+    with tempfile.TemporaryDirectory() as td:
+        def put(rel):
+            p = os.path.join(td, rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            open(p, "w").close()
+        public = ["main.py", "evals/README.md", "evals/suite.yaml", "evals/q/question.txt",
+                  "data/evals/q/districts.csv", "scripts/eval_suite.py", ".git/HEAD", ".venv/lib/x.py"]
+        for rel in public:
+            put(rel)
+        tracked = {"main.py", "evals/README.md", "evals/suite.yaml", "evals/q/question.txt",
+                   "data/evals/q/districts.csv", "scripts/eval_suite.py"}
+        ok(tree_hidden_material(td, tracked) == [], f"EP12a a clean tree passes: {tree_hidden_material(td, tracked)}")
+        bad = ["evals/q/_truth/truth.json", "evals/q/generate.py", "evals/q/rubric.yaml", "evals/_common.py",
+               "evals/q/notes_untracked.txt", "evals_private/q/rubric.yaml", "eval_private_v3/manifest.json",
+               "outputs/bundle.enc", "runs/r/_truth_copy/x.json", "docs/design/eval-suite.md",
+               ".claude/worktrees/w/evals/q/generate.py",
+               "runs/cache/eval_private_v3/q/rubric.yaml", "tmp/evals_private/q/generate.py"]   # Codex r1
+        for rel in bad:
+            put(rel)
+        got = tree_hidden_material(td, tracked)
+        ok(got == sorted(bad), f"EP12b every kind of hidden material is reported: {sorted(set(bad) - set(got))} "
+                               f"missed, {sorted(set(got) - set(bad))} extra")
+        ok("evals/q/question.txt" in tracked and tree_hidden_material(td, set()) != [],
+           "EP12c without git's file list every file under evals/ counts (fail closed)")
+    # EP13 (Codex r2): untracked files under a nested evals/ count too; a nested checkout's
+    # own tracked public files (a git worktree under .claude/worktrees/) do not.
+    import subprocess
+    with tempfile.TemporaryDirectory() as td:
+        def put2(rel):
+            p = os.path.join(td, rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            open(p, "w").close()
+        put2("runs/cache/evals/q/answers.json")
+        ok(tree_hidden_material(td, set()) == ["runs/cache/evals/q/answers.json"],
+           f"EP13a an untracked file under a nested evals/ is reported: {tree_hidden_material(td, set())}")
+        os.remove(os.path.join(td, "runs/cache/evals/q/answers.json"))
+        wt = os.path.join(td, ".claude", "worktrees", "w")
+        put2(".claude/worktrees/w/evals/q/question.txt")
+        git_ok = subprocess.run(["git", "init", "-q", wt], capture_output=True).returncode == 0 and \
+            subprocess.run(["git", "-C", wt, "add", "evals/q/question.txt"], capture_output=True).returncode == 0
+        ok(not git_ok or tree_hidden_material(td, set()) == [],
+           f"EP13b a nested checkout's tracked question text passes: {tree_hidden_material(td, set())}")
+        put2(".claude/worktrees/w/evals/q/notes.txt")
+        ok(not git_ok or tree_hidden_material(td, set()) == [".claude/worktrees/w/evals/q/notes.txt"],
+           f"EP13c its untracked file under evals/ is reported: {tree_hidden_material(td, set())}")
     for f in fails:
         print("FAIL:", f, file=sys.stderr)
     if fails:

@@ -1,0 +1,39 @@
+{
+  "source": "evalbase1 measles_campaign R1 (run 2026-11-01_034212), trace.jsonl and artifact_integrity.json, 03:54-04:46 UTC. File names, agents and the order of events are kept; file contents are synthetic and no eval answer content is included.",
+  "figures_outputs_v1": ["figures/h1_*.png", "figures/package_stability.png", "figures/*.provenance.json"],
+  "figures_outputs_v2": ["figures/h1_*.png", "figures/package_stability.png",
+                         "figures/h*_*.png.provenance.json", "figures/package_stability.png.provenance.json"],
+  "events": [
+    {"op": "subagent_start", "agent_id": "a29ac6737bcf94a04", "agent": "data-agent"},
+    {"op": "pre", "id": "toolu_data_eda", "agent_id": "a29ac6737bcf94a04", "agent": "data-agent",
+     "tool": "Bash", "command": "python3 eda.py", "note": "no PostToolUse ever arrives for this call"},
+    {"op": "subagent_stop", "agent_id": "a29ac6737bcf94a04"},
+    {"op": "subagent_start", "agent_id": "adf11698794b0dca2", "agent": "modeler"},
+    {"op": "spec", "figures_outputs": "figures_outputs_v1"},
+    {"op": "harness_build", "writes": ["figures/h1_sero_vs_admin.png", "figures/h1_sero_vs_admin.png.provenance.json",
+                                        "figures/package_stability.png", "figures/package_stability.png.provenance.json"]},
+    {"op": "pre", "id": "toolu_mod_eda", "agent_id": "adf11698794b0dca2", "agent": "modeler", "tool": "Bash",
+     "command": "python3 - <<'EOF'\np='eda.py'; s=open(p).read()\nEOF\npython3 eda.py",
+     "note": "04:38:26: the modeler adds validate_figure() to eda.py and runs it"},
+    {"op": "write", "file": "figures/eda_01_admin_vs_sero.png"},
+    {"op": "write", "file": "figures/eda_01_admin_vs_sero.png.provenance.json"},
+    {"op": "write", "file": "figures/eda_02_admin_immunity_by_cohort.png.provenance.json"},
+    {"op": "post", "id": "toolu_mod_eda",
+     "expect_new": ["figures/eda_01_admin_vs_sero.png.provenance.json",
+                    "figures/eda_02_admin_immunity_by_cohort.png.provenance.json"]},
+    {"op": "pre", "id": "toolu_mod_spec", "agent_id": "adf11698794b0dca2", "agent": "modeler", "tool": "Bash",
+     "command": "python3 - <<'EOF'\np='models/pipeline.yaml'\nEOF", "note": "04:39:49: the modeler narrows the glob"},
+    {"op": "spec", "figures_outputs": "figures_outputs_v2"},
+    {"op": "post", "id": "toolu_mod_spec", "expect_new": []},
+    {"op": "subagent_stop", "agent_id": "adf11698794b0dca2"},
+    {"op": "final"}
+  ],
+  "observed_on_main_7d471e5": {
+    "status": "artifact_tampered",
+    "open": ["figures/eda_01_admin_vs_sero.png.provenance.json",
+             "figures/eda_02_admin_immunity_by_cohort.png.provenance.json"],
+    "in_flight_at_04_38": ["analyst:Bash", "critique-redteam:Bash", "data-agent:Bash", "lead:Agent", "modeler:Bash"]
+  },
+  "expected": {"open_after_final": [], "advisory_closed": ["figures/eda_01_admin_vs_sero.png.provenance.json",
+                                                           "figures/eda_02_admin_immunity_by_cohort.png.provenance.json"]}
+}

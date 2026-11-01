@@ -246,9 +246,22 @@ def code_tarball(cfg) -> tuple[bytes, str]:
     missing = [n for n in cfg.required_files if n not in names]
     if missing:
         raise SystemExit(f"code to launch lacks {missing}: refusing")
+    refuse_hidden_tree(cfg.tree)
     blob = subprocess.check_output(["git", "-C", cfg.tree, "archive", "--format=tar.gz", "HEAD"])
     refuse_hidden(blob, cfg.tree)
     return blob, head[:7]
+
+
+def refuse_hidden_tree(tree: str, tracked: set[str] | None = None) -> None:
+    """Coiled package sync uploads the launch tree as a wheel, untracked and ignored
+    files included, so export-ignore does not keep eval material off the workers: a
+    tree holding any on disk (eval_paths.tree_hidden_material) is refused. Move the
+    material out of the tree (or launch from a clean clone) and launch again."""
+    found = eval_paths.tree_hidden_material(tree, tracked)
+    if found:
+        raise SystemExit(f"{tree} holds hidden eval-suite material that package sync would upload "
+                         f"({len(found)}: {', '.join(found[:5])}{', ...' if len(found) > 5 else ''}); "
+                         "move it out of the launch tree: refusing")
 
 
 def refuse_hidden(blob: bytes, tree: str) -> None:
@@ -1214,6 +1227,29 @@ def _self_test() -> int:
         ok(False, f"RC50b the shipped eval inputs (data/evals/) pass: {e}")
     import inspect
     ok("refuse_hidden(blob" in inspect.getsource(code_tarball), "RC50c code_tarball checks the blob it returns")
+    # RC50d-f: Coiled package sync ships the launch tree itself (untracked and ignored files
+    # included), so a tree holding hidden eval material on disk is refused before launch.
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        os.makedirs(os.path.join(td, "evals", "q"))
+        open(os.path.join(td, "evals", "q", "question.txt"), "w").close()
+        try:
+            refuse_hidden_tree(td, tracked={"evals/q/question.txt"})
+            ok(True, "RC50d a tree with only the public eval files passes")
+        except SystemExit as e:
+            ok(False, f"RC50d a tree with only the public eval files passes: {e}")
+        for rel in ("evals/q/rubric.yaml", "evals_private/v1/q/_truth/truth.json", "outputs/bundle.enc"):
+            os.makedirs(os.path.dirname(os.path.join(td, rel)), exist_ok=True)
+            open(os.path.join(td, rel), "w").close()
+            try:
+                refuse_hidden_tree(td, tracked={"evals/q/question.txt"})
+                ok(False, f"RC50e a tree holding {rel} is refused")
+            except SystemExit as e:
+                ok(rel in str(e), f"RC50e the refusal names {rel}: {e}")
+            os.remove(os.path.join(td, rel))
+    src = inspect.getsource(code_tarball)
+    ok("refuse_hidden_tree(cfg.tree" in src and src.index("refuse_hidden_tree(") < src.index('"archive"'),
+       "RC50f code_tarball checks the launch tree on disk before it builds anything")
 
     now = time.time()
 

@@ -585,7 +585,7 @@ async def final_writeup(run_path, run_dir_rel, question, max_rounds, budget, cap
         result, sid, err = None, None, None
         try:
             async for m in (query_fn or query)(prompt=prompt, options=options):
-                log_message(m, trace)
+                log_message(m, trace, integrity=integrity)
                 if live_state is not None:
                     live_state.on_message(m)         # stage snapshot of the writer, live status
                 if isinstance(m, SystemMessage) and m.subtype == "init":
@@ -594,6 +594,10 @@ async def final_writeup(run_path, run_dir_rel, question, max_rounds, budget, cap
                     result, sid = m, m.session_id or sid
         except Exception as e:  # noqa: BLE001 — still charged below, then recorded
             err = f"{type(e).__name__}: {e}"[:300]
+        finally:
+            if integrity is not None:          # the session's calls end with it (Codex r1)
+                from agents.hooks import report_integrity
+                report_integrity(integrity.on_session_end(), trace)
         source = "final write-up"
         if result is None and sid:
             result = await reconcile_conversation_cost(options, sid, query_fn=query_fn)
@@ -778,7 +782,7 @@ async def _presentation_session(run_path, run_dir_rel, question, budget, cap, se
     try:
         try:
             async for m in (query_fn or query)(prompt=prompt, options=options):
-                log_message(m, trace)
+                log_message(m, trace, integrity=integrity)
                 if live_state is not None:
                     live_state.on_message(m)
                 if isinstance(m, SystemMessage) and m.subtype == "init":
@@ -795,6 +799,9 @@ async def _presentation_session(run_path, run_dir_rel, question, budget, cap, se
                 src = "presentation fix pass (crashed; cost read back)"
     finally:
         # Cancellation-safe: nothing awaited here, so an interruption cannot skip the charge.
+        if integrity is not None:              # the session's calls end with it (Codex r1)
+            from agents.hooks import report_integrity
+            report_integrity(integrity.on_session_end(), trace)
         charge_session(budget, session_num, result, left, session_id=sid, elapsed_s=None, source=src)
         write_budget_ledger(run_path, budget, cap, integrity)
         info["ran"] = True
