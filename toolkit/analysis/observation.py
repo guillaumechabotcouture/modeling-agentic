@@ -494,6 +494,13 @@ def _self_test_beta(ok) -> None:
                                                    f"the age mask is applied: {codes(s)}")
     safe(os13, "OS13-14 noise and maternal antibody")
 
+    def ol8():
+        v = loglik("betabinomial", np.array([1, 0, 300, 299]), n=300, p=np.array([0.0, 0.0, 1.0, 1.0]),
+                   design_effect=2.1)
+        ok(v[0] == -np.inf and v[1] == 0.0 and v[2] == 0.0 and v[3] == -np.inf,
+           f"OL8 (Codex r2-1) beta-binomial at p = 0 or 1 is a point mass, never a floored probability ({v})")
+    safe(ol8, "OL8 point masses")
+
 
 def toy_sources() -> list:
     """An administrative coverage source and a serosurvey with a shared frame gap (self-tests and docs)."""

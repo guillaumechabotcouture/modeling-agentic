@@ -1527,6 +1527,21 @@ def _self_test() -> int:
            f"({sorted(ids)[:4]})")
     safe(cr7, "CR7 unit attributes")
 
+    def cr11():
+        pri = {n: Prior.from_decl(n, {"dist": "uniform", "range": [0.9, 1.1], "source": "t"}) for n in ("a", "b")}
+        P = Problem(["a", "b"], pri, lambda X: (-0.5 * ((np.log(X["a"] * X["b"]) - math.log(1.1)) / 0.001) ** 2, {}))
+        s = {"best": np.array([1.0999, 1.1 / 1.0999]), "rows": np.array([[1.0, 1.1], [1.1, 1.0], [1.05, 1.1 / 1.05]])}
+        c = classify(P, s)
+        ok(c["likelihood_classes"] == {"a": "on_ridge", "b": "on_ridge"},
+           f"CR11 (Codex r2-2) a ridge point next to the prior's bound is not moved off the ridge "
+           f"({c['likelihood_classes']})")
+        from toolkit.spec import schema
+        bad = schema._validate_posterior({"parameters": [], "attribute": "x", "observation": {"model": "poisson"},
+                                          "priors": {"x": {"dist": "uniform", "range": [0, 1], "source": "t"}}},
+                                         "emulator")
+        ok(any("direct" in b for b in bad), f"CR12 (Codex r2-5) posterior with an emulator is refused: {bad}")
+    safe(cr11, "CR11-12 boundary stencil, emulator")
+
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

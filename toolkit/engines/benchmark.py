@@ -1523,6 +1523,16 @@ def _self_test() -> int:
                           f"(digests present: {has})")
     except Exception as ex:  # noqa: BLE001
         ok(False, f"BP51 declaration digests ({type(ex).__name__}: {ex})")
+    try:
+        p16 = dict(p14, configs={"x": {"k": 1}})
+        for b in p16["benchmarks"]:
+            b["estimand"]["calibrator"] = dict(b["estimand"]["calibrator"], args={"config": "x"})
+        p16b = dict(p16, configs={"x": {"k": 2}})
+        d1 = declaration_digest(p16["benchmarks"][0], p16)
+        d2 = declaration_digest(p16b["benchmarks"][0], p16b)
+        ok(d1 != d2, "BP52 (Codex r2-4) a changed named configuration (or threshold file) changes the case digest")
+    except Exception as ex:  # noqa: BLE001
+        ok(False, f"BP52 configuration in the digest ({type(ex).__name__}: {ex})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
