@@ -173,6 +173,19 @@ def apply_component(s: np.ndarray, N: np.ndarray, comp: dict, level: np.ndarray,
     return s, doses
 
 
+def reachable(C: np.ndarray, seeded: np.ndarray) -> np.ndarray:
+    """Groups infection can reach from the seeded groups in the contact graph (infection in j reaches i when
+    C_ij > 0), per member: (B, G) float mask. A deterministic run never infects the others, so the stop rule
+    judges whether the epidemic can grow on this set only."""
+    m = seeded.astype(bool).copy()
+    for _ in range(C.shape[-1]):
+        nxt = m | (np.einsum("bij,bj->bi", (C > 0).astype(float), m.astype(float)) > 0)
+        if np.array_equal(nxt, m):
+            break
+        m = nxt
+    return m.astype(float)
+
+
 def extinction_probability(K: np.ndarray, offspring: str, iters: int = 200000) -> np.ndarray:
     """Multitype branching process: x_i = G_i(x), the probability that a chain started by one case in group i
     dies out. K (B, G, G) with K[b, j, i] the expected infections in j caused by one case in i. Poisson:
@@ -293,7 +306,9 @@ def _module_class():
                 cand = np.nonzero(act)[0][recent < c["tol"]]
                 if len(cand):
                     s = self.S[cand] / c["N"][cand]
-                    r = c["q"][cand] * c["fmax"][cand] * spectral_radius(s[:, :, None] * c["C"][cand])
+                    m = c["reach_mask"][cand]                    # only groups the seeds can reach
+                    r = c["q"][cand] * c["fmax"][cand] * spectral_radius(
+                        (s * m)[:, :, None] * c["C"][cand] * m[:, None, :])
                     rest = recent[np.searchsorted(np.nonzero(act)[0], cand)] * r / np.maximum(1.0 - r, 1e-300)
                     done = cand[(r < 1.0) & (rest < c["tol"])]
                     self.active[done] = False
@@ -623,6 +638,7 @@ class CompartmentalEngine:
                "reach": {c: np.asarray([m["reach"][c] for m in mem]) for c in self.components},
                "members": mem}
         ctx["seed"] = (ctx["seed_share"] * N.sum(axis=1))[:, None] * ctx["pi"]
+        ctx["reach_mask"] = reachable(ctx["C"], ctx["seed"] > 0)
         return ctx
 
     def initial_state(self, params: dict, unit: UnitSpec, package: Package | None = None) -> dict:
@@ -923,6 +939,12 @@ def _self_test() -> int:
     capped = CompartmentalEngine(**dict(single, step_cap=30, segment=16))
     _, err = safe(lambda: capped.run({"r0": 2.0}, u1, Package("0", {}), hx, 1))
     ok(err is not None and "converged: false" in err, f"K5 an epidemic still running at the step cap fails closed: {err}")
+
+    ud = UnitSpec("d", {"N": [3e5, 2e5, 1e5], "s0": [1.0, 1.0, 1.0], "seed": 1e-9, "intro": "a",
+                        "contact": [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 2.0]]})
+    od, err = safe(lambda: em.run({"q": 1.0}, ud, Package("0", {}), hx, 1))
+    ok(err is None and od.windows["all"]["converged"] == 1.0 and od.per_capita["infections"]["b"] == 0.0,
+       f"K5b a supercritical group the seeds cannot reach does not hold the stop rule open (pack run 1): {err}")
 
     # K6: unknown configuration fails closed
     for bad in ({"mode": "both"}, {"structure": "network"}, {"initialiser": "survey"}, {"no_such_field": 1},
