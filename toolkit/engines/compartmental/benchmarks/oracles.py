@@ -555,6 +555,7 @@ def _self_test() -> int:
        "O16 cohort-sources generator: two overlapping sources, or administrative only")
     dg, tg = generate_group_attack(np.random.default_rng([5, 2]))
     ok(tg["hospitalisations_averted"] > 0 and len(dg["positive"]) == 3, "O17 group-attack generator")
+    ok(math.isnan(oracle_minimum([1.0, float("nan"), 1.0])), "O18 (Codex r1-9) the minimum oracle propagates NaN")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

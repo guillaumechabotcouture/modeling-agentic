@@ -1217,6 +1217,29 @@ def _self_test() -> int:
        "BP41 coverage: a calibrator that cannot be imported is not_assessable, never a pass")
     rr = {x["id"]: x for x in run_pack(p6, eng, Runner(p6, eng, 1), {})["benchmarks"]}
     ok(rr["SBT1"]["coverage"] == c1["coverage"], "BP42 coverage is reproducible (fixed seeds)")
+    # Codex round 1 (tests first)
+    om.oracle_vec = lambda v: list(v)
+    p8 = dict(p5, benchmarks=[
+        {"id": "W1", "metric": "relative le per element", "estimand": {
+            "type": "value", "compare": "le", "a": {"oracle": "vec", "args": {"v": [1e6, 1.0]}},
+            "b": {"oracle": "vec", "args": {"v": [1e6, 1e-6]}}, "tol": {"rel": 0.01}}},
+        {"id": "W2", "metric": "an oracle-only benchmark exercises no configuration", "estimand": {
+            "type": "value", "a": {"oracle": "sum", "args": {"a": 1, "b": 1}}, "b": 2.0, "tol": {"abs": 0.0}}}],
+        configs={"unused": {}})
+    res8 = run_pack(p8, eng, Runner(p8, eng, 1), {})
+    r8 = {x["id"]: x for x in res8["benchmarks"]}
+    ok(r8["W1"]["status"] == "out_of_band", "BP43 (Codex r1-7) a relative `le` is judged element by element")
+    ok(res8["configs_validated"] == {} and res8.get("configs_not_exercised") == ["unused"],
+       f"BP44 (Codex r1-6) only configurations a benchmark exercised are listed as validated: "
+       f"{res8['configs_validated']}, {res8.get('configs_not_exercised')}")
+    om.calibrate_nan = lambda make_engine, data, **k: {"intervals": {"mu": [float("nan"), float("nan")]}, "classes": {}}
+    p9 = dict(p6, benchmarks=[{"id": "SBN", "metric": "NaN intervals never pass a negative control", "estimand": {
+        "type": "coverage", "generator": {"fn": "normal", "args": {}},
+        "calibrator": {"fn": "_bp_oracles:calibrate_nan", "args": {}}, "replicates": 20, "seed": 1,
+        "quantities": ["mu"], "band": [0.0, 0.80]}}])
+    r9 = run_pack(p9, eng, Runner(p9, eng, 1), {})["benchmarks"][0]
+    ok(r9["status"] == "out_of_band" and r9.get("invalid_outputs") == 20,
+       f"BP45 (Codex r1-8) non-finite or unordered intervals fail the benchmark: {r9['status']}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

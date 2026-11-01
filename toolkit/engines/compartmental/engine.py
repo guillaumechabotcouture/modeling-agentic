@@ -946,6 +946,31 @@ def _self_test() -> int:
     ok(err is None and od.windows["all"]["converged"] == 1.0 and od.per_capita["infections"]["b"] == 0.0,
        f"K5b a supercritical group the seeds cannot reach does not hold the stop rule open (pack run 1): {err}")
 
+    # Codex round 1 (tests first)
+    nil = CompartmentalEngine(groups=["a", "b", "c"], structure="age_groups_contact_matrix", transmission="q",
+                              generation_interval=[1.0], tol=1e-9)
+    un = UnitSpec("n", {"N": [1e6, 1e6, 1e6], "s0": [1.0, 1.0, 1.0], "seed": 1e-9, "intro": "a",
+                        "contact": [[0, 0, 0], [0.1, 0, 0], [0, 1e5, 0]]})
+    on, err = safe(lambda: nil.run({"q": 1.0}, un, Package("0", {}), hx, 1))
+    exact_c = 1e5 * 0.1 * 3e-9 / 3          # one step a -> b, then b -> c (fractions of the whole population)
+    ok(err is None and on.windows["all"]["attack_rate"] > 0.5 * exact_c,
+       f"K13 (Codex r1-1) transient amplification through a nilpotent contact matrix is not cut off by rho = 0: "
+       f"{err or on.windows['all']['attack_rate']}")
+    zf = CompartmentalEngine(groups=["all"], generation_interval=[1.0], forcing="cosine", forcing_period=2.0)
+    oz, err = safe(lambda: zf.run({"r0": 0.8, "forcing_amplitude": 1.0, "forcing_phase": 0.0},
+                                  UnitSpec("z", {"N": [1e6], "s0": [1.0], "seed": 1e-9}), Package("0", {}), hx, 1))
+    ok(err is None and oz.windows["all"]["converged"] == 1.0,
+       f"K14 (Codex r1-2) an epidemic whose whole infectious history is zero stops: {err}")
+    ok(oz is not None and "p_major" not in oz.windows["all"],
+       "K15a (Codex r1-3) no p_major under seasonal forcing (the constant-environment equations do not apply)")
+    _, err = safe(lambda: CompartmentalEngine(groups=["all"], forcing="cosine", importation="branching"))
+    ok(err is not None and "forcing" in err, f"K15b branching importation with seasonal forcing is refused: {err}")
+    bp = CompartmentalEngine(groups=["all"], mode="windowed", generation_interval=[1.0], importation="branching")
+    ob1, err = safe(lambda: bp.run({"r0": 1.0}, UnitSpec("k", {"N": [1e6], "s0": [1.0], "seed": 1e-12}),
+                                   Package("0", {}), Horizon(0, 30, (0, 30), {"all": [0, 30]}), 1))
+    ok(err is None and ob1.windows["all"]["p_major"] == 0.0,
+       f"K16 (Codex r1-4) p_major is exactly 0 at R = 1: {err or ob1.windows['all']['p_major']}")
+
     # K6: unknown configuration fails closed
     for bad in ({"mode": "both"}, {"structure": "network"}, {"initialiser": "survey"}, {"no_such_field": 1},
                 {"importation": "maybe"}, {"offspring": "negbin"}, {"dt": "month"}):
@@ -1001,6 +1026,12 @@ def _self_test() -> int:
     na = {r["id"]: r["status"] for r in got if r["id"] in ("FS7", "RN5")}
     ok(got and not bad and na == {"FS7": "not_assessable", "RN5": "not_assessable"},
        f"K12b every assessable benchmark in band ({bad}); FS7 and RN5 not_assessable until transcribed ({na})")
+    # Codex r1-5: the stamp carries the full dynamics configuration, so a changed one is refused
+    alt = B.load_engine(pack["engine"], dict(pack["configs"][pack["default_config"]], results_path=RESULTS,
+                                             generation_interval=[0.5, 0.5]))
+    ok("configuration" in (B.verified_benchmarks(alt)[1] or ""),
+       f"K12c (Codex r1-5) results stamped for another dynamics configuration are refused: "
+       f"{B.verified_benchmarks(alt)[1]}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
