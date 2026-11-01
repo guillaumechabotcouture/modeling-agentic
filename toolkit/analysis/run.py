@@ -560,6 +560,50 @@ def _self_test_priors(ok, q):
         except ValueError as e:
             ok("['dw', 'synergy']" in str(e) and "must enter the design" in str(e),
                f"RP7 a design that lacks a drawn prior is refused, naming it: {e}")
+        # a parameter_value test outside the design box: before this, the emulator extrapolated and the guard blocked
+        # the whole analysis; now the value is refused (not_run, with why) and the run completes
+        rec = DTm.run_one(A, {"id": "DTx", "type": "parameter_value", "parameter": "dw", "values": [0.001],
+                              "text": "t"}, z0, ben0, cost0, plan0, R["uncertainty"], out0)
+        ok(rec["status"] == "not_run" and "outside the emulator design" in rec["reason"],
+           f"RP11 a parameter_value test value outside the emulator design box is refused, not extrapolated: {rec}")
+    _self_test_test_ranges(ok, q)
+
+
+def _self_test_test_ranges(ok, q):
+    """A parameter_value decision test on a drawn prior at a value outside its declared range: the emulator design box
+    spans the test's values too (the draws stay inside the declared range), so the test is evaluated inside the design
+    and the run completes."""
+    import tempfile
+    import yaml
+    from toolkit.spec import priors as PRI
+    with tempfile.TemporaryDirectory() as d:
+        pp = PRI.toy_priors_file(d)
+        p = schema.toy_spec(d, n=24)
+        r = yaml.safe_load(open(p))
+        r["engine"] = {"ref": "toolkit.spec.priors:ToyPriorEngine", "config": {"priors_path": pp}}
+        r["uncertainty"]["sources"].append({"kind": "emulator"})
+        r["uncertainty"]["excluded"] = [{"kind": "costs", "reason": "toy"}]
+        r["analysis"]["decision_tests"] = [{"id": "DTw", "type": "parameter_value", "parameter": "dw",
+                                            "values": [0.002], "text": "weaker weight, below the prior range"}]
+        yaml.safe_dump(r, open(p, "w"), sort_keys=False)
+        signoff.sign(d, "lead", note="self-test")
+        try:
+            R = run(d, log=q, compute_kw={"max_workers": 2})
+        except Exception as e:  # noqa: BLE001
+            ok(False, f"RP10 a parameter_value test below a prior's range runs inside the design: {type(e).__name__}: "
+                      f"{str(e)[:200]}")
+            return
+        design = json.load(open(os.path.join(d, "analysis", "batch", "design.json")))
+        dws = [pt["theta"]["dw"] for pt in design["points"]]
+        ok(design.get("design_ranges", {}).get("dw") == [0.002, 0.02] and min(dws) < 0.005 and max(dws) <= 0.02,
+           f"RP10 the design box of dw spans the test value and the prior range: {design.get('design_ranges')}, "
+           f"min {min(dws):.4f}")
+        t = {x["test_id"]: x for x in R["decision_tests"]}["DTw"]
+        rep = yaml.safe_load(open(os.path.join(d, "uncertainty_report.yaml")))
+        s = rep["parameter_samples"]["dw"]
+        ok(t["status"] == "run" and [x["value"] for x in t["results"]] == [0.002]
+           and 0.005 <= s["ci_low"] < s["ci_high"] <= 0.02,
+           f"RP12 the test runs at 0.002 and the draws stay inside the declared prior range: {t['status']}, {s}")
 
 
 def _resign(d, mutate):
