@@ -1242,7 +1242,8 @@ def posterior(make_engine, data, config, level=0.95, seed=0, **decl) -> dict:
     identifiability classes, automatic prior_range tests and the label's prior-dominated names. Fails closed."""
     E = EngineProblem(make_engine, data, config, **decl)
     P = E.problem
-    s = sample(P, seed=(int(seed) * 7919 + _data_hash(data)) % (2 ** 31))
+    over = {} if E.state_only else {"max_importance_params": thresholds()["max_importance_params_run_batch"]}
+    s = sample(P, seed=(int(seed) * 7919 + _data_hash(data)) % (2 ** 31), **over)
     if np.any(~np.isfinite(s["ll_rows"])):
         raise CalibrationRefused("posterior_ess", "a canonical draw has no finite likelihood")
     c = classify(P, s)
