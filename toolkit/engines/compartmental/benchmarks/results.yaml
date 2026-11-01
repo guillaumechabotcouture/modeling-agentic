@@ -1,0 +1,1418 @@
+producer: toolkit/engines/benchmark.py
+engine_identity:
+  name: compartmental-starsim
+  version: '0.1'
+  code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
+  params_sha256: f498058635c8fd432017ed42e7a4a9b51d9355e39178b298d90f5512b1c5f372
+  config_sha256: 7fb325cd3215f687d2adcdcd1d8f666a811c609b76939cb8f819e574f5ccd32f
+engine_config_sha256: 796a3b1dceea18349dbee97472167eea809434e8db2a6b9dc261c3e3c077b770
+benchmarks:
+- id: FS1a
+  metric: single-group final size, R0 = 1.5
+  role: held_out
+  target: null
+  band: null
+  source: Kermack-McKendrick (1927); Lambert W closed form
+  computed: 0.5828116449805854
+  reference: 0.58281164498064
+  error_abs: 5.46229728115577e-14
+  error_rel: 9.372320076647093e-14
+  tolerance:
+    abs: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 5.46229728115577e-14
+  - 5.46229728115577e-14
+  in_band: true
+  status: in_band
+- id: FS1b
+  metric: single-group final size, R0 = 2
+  role: held_out
+  target: null
+  band: null
+  source: Kermack-McKendrick (1927); Lambert W closed form
+  computed: 0.7968121303622717
+  reference: 0.7968121303623036
+  error_abs: 3.186340080674199e-14
+  error_rel: 3.998859905942192e-14
+  tolerance:
+    abs: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 3.186340080674199e-14
+  - 3.186340080674199e-14
+  in_band: true
+  status: in_band
+- id: FS1c
+  metric: single-group final size, R0 = 4
+  role: held_out
+  target: null
+  band: null
+  source: Kermack-McKendrick (1927); Lambert W closed form
+  computed: 0.9801725987397542
+  reference: 0.9801725987397569
+  error_abs: 2.7755575615628914e-15
+  error_rel: 2.8317028706286272e-15
+  tolerance:
+    abs: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 2.7755575615628914e-15
+  - 2.7755575615628914e-15
+  in_band: true
+  status: in_band
+- id: FS1d
+  metric: single-group final size, R0 = 12
+  role: held_out
+  target: null
+  band: null
+  source: Kermack-McKendrick (1927); Lambert W closed form
+  computed: 0.9999938553345866
+  reference: 0.9999938553345865
+  error_abs: 1.1102230246251565e-16
+  error_rel: 1.1102298466160962e-16
+  tolerance:
+    abs: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 1.1102230246251565e-16
+  - 1.1102230246251565e-16
+  in_band: true
+  status: in_band
+- id: FS1e
+  metric: single-group final size, R0 = 18
+  role: held_out
+  target: null
+  band: null
+  source: Kermack-McKendrick (1927); Lambert W closed form
+  computed: 0.9999999847700162
+  reference: 0.9999999847700161
+  error_abs: 1.1102230246251565e-16
+  error_rel: 1.1102230415338356e-16
+  tolerance:
+    abs: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 1.1102230246251565e-16
+  - 1.1102230246251565e-16
+  in_band: true
+  status: in_band
+- id: FS2a
+  metric: 'R0 = 0.5: attack rate at most the seed-size bound seed / (1 - R0)'
+  role: held_out
+  target: null
+  band: null
+  source: threshold theorem
+  computed: 1.999999043325724e-09
+  reference: 2.0e-09
+  error_abs: 9.56674276233652e-16
+  error_rel: 4.78337138116826e-07
+  tolerance:
+    abs: 1.0e-15
+  compare: le
+  per_seed_error_abs:
+  - 9.56674276233652e-16
+  - 9.56674276233652e-16
+  in_band: true
+  status: in_band
+- id: FS2b
+  metric: 'R0 = 1.01: final size equals the seeded closed form'
+  role: held_out
+  target: null
+  band: null
+  source: threshold theorem; Lambert W
+  computed: 0.019736509118963255
+  reference: 0.01973650911894509
+  error_abs: 1.8166024240429124e-14
+  error_rel: 9.204274236618442e-13
+  tolerance:
+    abs: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 1.8166024240429124e-14
+  - 1.8166024240429124e-14
+  in_band: true
+  status: in_band
+- id: FS2c
+  metric: R0 = 1 + e gives z close to 2e (e = 0.01; the O(e^2) term is under 2% of
+    2e)
+  role: held_out
+  target: null
+  band: null
+  source: threshold theorem
+  computed: 0.019736509118963255
+  reference: 0.02
+  error_abs: 0.0002634908810367452
+  error_rel: 0.01317454405183726
+  tolerance:
+    rel: 0.02
+  compare: eq
+  per_seed_error_abs:
+  - 0.0002634908810367452
+  - 0.0002634908810367452
+  in_band: true
+  status: in_band
+- id: FS3
+  metric: rank-one (proportionate) mixing reduces to the scalar final-size relation,
+    per group
+  role: held_out
+  target: null
+  band: null
+  source: Ma & Earn (2006) Bull Math Biol; Andreasen (2011)
+  computed: 5.051514762044462e-15
+  reference:
+  - 0.4638279198514079
+  - 0.7125194993192097
+  - 0.26776227820404097
+  error_abs: 5.051514762044462e-15
+  error_rel: 1.1816958092097471e-14
+  tolerance:
+    rel: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 5.051514762044462e-15
+  - 5.051514762044462e-15
+  computed_vector:
+  - 0.46382791985140287
+  - 0.7125194993192047
+  - 0.2677622782040378
+  in_band: true
+  status: in_band
+- id: FS4a
+  metric: 'all-or-nothing vaccination, v e = 0.5, R0 = 3: whole-population attack
+    rate z = s x (0.2914)'
+  role: held_out
+  target: null
+  band: null
+  source: herd-immunity identity
+  computed: 0.2914058219340202
+  reference: 0.29140582193290576
+  error_abs: 1.1144418721187321e-12
+  error_rel: 3.824363784932632e-12
+  tolerance:
+    rel: 1.0e-08
+  compare: eq
+  per_seed_error_abs:
+  - 1.1144418721187321e-12
+  - 1.1144418721187321e-12
+  in_band: true
+  status: in_band
+- id: FS4b
+  metric: 'same: attack rate among those left susceptible x (0.5828)'
+  role: held_out
+  target: null
+  band: null
+  source: herd-immunity identity
+  computed: 0.5828116438680404
+  reference: 0.5828116438658115
+  error_abs: 2.2288837442374643e-12
+  error_rel: 3.824363784932632e-12
+  tolerance:
+    rel: 1.0e-08
+  compare: eq
+  per_seed_error_abs:
+  - 2.2288837442374643e-12
+  - 2.2288837442374643e-12
+  in_band: true
+  status: in_band
+- id: FS4c
+  metric: 'v e = 0.7 >= 1 - 1/R0: no outbreak (attack rate within seed size)'
+  role: held_out
+  target: null
+  band: null
+  source: herd-immunity identity
+  computed: 9.999406755745053e-12
+  reference: 0.0
+  error_abs: 9.999406755745053e-12
+  error_rel: 9.999406755745052e+288
+  tolerance:
+    abs: 1.0e-10
+  compare: eq
+  per_seed_error_abs:
+  - 9.999406755745053e-12
+  - 9.999406755745053e-12
+  in_band: true
+  status: in_band
+- id: FS5
+  metric: R0 from the next-generation matrix equals the growth-rate-consistent R0
+    of the reference ODE (5x5 asymmetric, all susceptible)
+  role: held_out
+  target: null
+  band: null
+  source: Diekmann, Heesterbeek & Metz (1990)
+  computed: 3.220480117485684
+  reference: 3.22048005763425
+  error_abs: 5.98514340310885e-08
+  error_rel: 1.8584631160565265e-08
+  tolerance:
+    rel: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 5.98514340310885e-08
+  - 5.98514340310885e-08
+  in_band: true
+  status: in_band
+- id: FS6a
+  metric: 'multigroup final size equals the reference ODE run to extinction: identity
+    matrix (seeded group only)'
+  role: held_out
+  target: null
+  band: null
+  source: the pack's ODE (solve_ivp DOP853, rtol 1e-10)
+  computed: 2.6911806116913795e-13
+  reference:
+  - 0.7968128145862969
+  - 0.0
+  - 0.0
+  error_abs: 2.6911806116913795e-13
+  error_rel: 3.3774313896904795e-13
+  tolerance:
+    abs: 1.0e-05
+  compare: eq
+  per_seed_error_abs:
+  - 2.6911806116913795e-13
+  - 2.6911806116913795e-13
+  computed_vector:
+  - 0.7968128145860278
+  - 0.0
+  - 0.0
+  in_band: true
+  status: in_band
+- id: FS6b
+  metric: 'same: rank-one matrix, partial susceptibility'
+  role: held_out
+  target: null
+  band: null
+  source: the pack's ODE
+  computed: 6.161737786669619e-15
+  reference:
+  - 0.3386991229263173
+  - 0.45014352056074514
+  - 0.1681155953709314
+  error_abs: 6.161737786669619e-15
+  error_rel: 1.7665503217114414e-14
+  tolerance:
+    abs: 1.0e-05
+  compare: eq
+  per_seed_error_abs:
+  - 6.161737786669619e-15
+  - 6.161737786669619e-15
+  computed_vector:
+  - 0.33869912292631194
+  - 0.450143520560739
+  - 0.16811559537092843
+  in_band: true
+  status: in_band
+- id: FS6c
+  metric: 'same: asymmetric 5x5 matrix'
+  role: held_out
+  target: null
+  band: null
+  source: the pack's ODE
+  computed: 1.078026556911027e-13
+  reference:
+  - 0.9192900487786668
+  - 0.8631882864871626
+  - 0.6178062746082027
+  - 0.6582465122853505
+  - 0.67386809545775
+  error_abs: 1.078026556911027e-13
+  error_rel: 1.248889232844171e-13
+  tolerance:
+    abs: 1.0e-05
+  compare: eq
+  per_seed_error_abs:
+  - 1.078026556911027e-13
+  - 1.078026556911027e-13
+  computed_vector:
+  - 0.9192900487786215
+  - 0.8631882864870548
+  - 0.6178062746081979
+  - 0.6582465122853587
+  - 0.6738680954577423
+  in_band: true
+  status: in_band
+- id: FS8a
+  metric: the final size is the same at dt of one day and one week (R0 = 2)
+  role: held_out
+  target: null
+  band: null
+  source: "exponential-survival identity (\xA71.1)"
+  computed: 0.7968121303622778
+  reference: 0.7968121303622717
+  error_abs: 6.106226635438361e-15
+  error_rel: 7.663320377241441e-15
+  tolerance:
+    rel: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 6.106226635438361e-15
+  - 6.106226635438361e-15
+  in_band: true
+  status: in_band
+- id: FS8b
+  metric: the step cap is never reached in FS1-FS6 (every arm converged)
+  role: held_out
+  target: null
+  band: null
+  source: engine stop rule
+  computed: 1.0
+  reference: 1.0
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    abs: 0.0
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  - 0.0
+  in_band: true
+  status: in_band
+- id: BR1a
+  metric: 'one group, Poisson offspring: 1 - p solves 1 - p = exp(-R0 p) (R0 = 2)'
+  role: held_out
+  target: null
+  band: null
+  source: branching-process identities
+  computed: 0.7968121300200206
+  reference: 0.79681213002002
+  error_abs: 5.551115123125783e-16
+  error_rel: 6.966654891393671e-16
+  tolerance:
+    abs: 1.0e-08
+  compare: eq
+  per_seed_error_abs:
+  - 5.551115123125783e-16
+  - 5.551115123125783e-16
+  in_band: true
+  status: in_band
+- id: BR1b
+  metric: 'one group, geometric offspring: p = 1 - 1/R0 (R0 = 2)'
+  role: held_out
+  target: null
+  band: null
+  source: branching-process identities
+  computed: 0.5000000000000009
+  reference: 0.5
+  error_abs: 8.881784197001252e-16
+  error_rel: 1.7763568394002505e-15
+  tolerance:
+    abs: 1.0e-08
+  compare: eq
+  per_seed_error_abs:
+  - 8.881784197001252e-16
+  - 8.881784197001252e-16
+  in_band: true
+  status: in_band
+- id: BR1c
+  metric: 'block-diagonal matrix, introduction into the subcritical block: p_major
+    = 0'
+  role: held_out
+  target: null
+  band: null
+  source: branching-process identities
+  computed: 1.3322676295501878e-15
+  reference: 0.0
+  error_abs: 1.3322676295501878e-15
+  error_rel: 1.332267629550188e+285
+  tolerance:
+    abs: 1.0e-08
+  compare: eq
+  per_seed_error_abs:
+  - 1.3322676295501878e-15
+  - 1.3322676295501878e-15
+  in_band: true
+  status: in_band
+- id: BR1d
+  metric: 'same matrix, introduction into the supercritical block (R = 2.5): the one-group
+    Poisson value'
+  role: held_out
+  target: null
+  band: null
+  source: branching-process identities
+  computed: 0.8926447536092091
+  reference: 0.8926447536092056
+  error_abs: 3.552713678800501e-15
+  error_rel: 3.979986063252949e-15
+  tolerance:
+    abs: 1.0e-08
+  compare: eq
+  per_seed_error_abs:
+  - 3.552713678800501e-15
+  - 3.552713678800501e-15
+  in_band: true
+  status: in_band
+- id: BR1e
+  metric: 'branching importation: expected attack rate = p_major x the major-outbreak
+    final size'
+  role: held_out
+  target: null
+  band: null
+  source: "design note \xA71.1 (importation: branching)"
+  computed: 0.634909570819514
+  reference: 0.6349095708197771
+  error_abs: 2.630118345336996e-13
+  error_rel: 4.142508581089843e-13
+  tolerance:
+    abs: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 2.630118345336996e-13
+  - 2.630118345336996e-13
+  in_band: true
+  status: in_band
+- id: RN1
+  metric: 'growth phase: R0 = 1 / sum_s w_s exp(-r s) for the engine''s growth rate
+    r'
+  role: held_out
+  target: null
+  band: null
+  source: Wallinga & Lipsitch (2007) Proc R Soc B
+  computed: 2.0
+  reference: 1.9999994730362805
+  error_abs: 5.269637195493004e-07
+  error_rel: 2.634819291973589e-07
+  tolerance:
+    rel: 0.001
+  compare: eq
+  per_seed_error_abs:
+  - 5.269637195493004e-07
+  - 5.269637195493004e-07
+  in_band: true
+  status: in_band
+- id: RN2a
+  metric: unforced cumulative attack rate equals the FS1 solution, dt one day (w_1
+    = 1, R0 = 2)
+  role: held_out
+  target: null
+  band: null
+  source: Diekmann, Heesterbeek & Britton (2013), ch. 1
+  computed: 0.7968121303623035
+  reference: 0.7968121303623036
+  error_abs: 1.1102230246251565e-16
+  error_rel: 1.3933309776802064e-16
+  tolerance:
+    abs: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 1.1102230246251565e-16
+  - 1.1102230246251565e-16
+  in_band: true
+  status: in_band
+- id: RN2b
+  metric: same at dt one week
+  role: held_out
+  target: null
+  band: null
+  source: Diekmann, Heesterbeek & Britton (2013), ch. 1
+  computed: 0.7968121303623035
+  reference: 0.7968121303623036
+  error_abs: 1.1102230246251565e-16
+  error_rel: 1.3933309776802064e-16
+  tolerance:
+    abs: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 1.1102230246251565e-16
+  - 1.1102230246251565e-16
+  in_band: true
+  status: in_band
+- id: RN2c
+  metric: 'negative control: the linear renewal form misses the final size (0.8687
+    vs 0.7968)'
+  role: held_out
+  target: null
+  band: null
+  source: Codex review finding 2 (design note)
+  computed: 0.8687075605459232
+  reference: 0.7968121303623036
+  error_abs: 0.07189543018361966
+  error_rel: 0.09022883493368684
+  tolerance:
+    abs: 0.05
+  compare: differ
+  per_seed_error_abs:
+  - 0.07189543018361966
+  in_band: true
+  status: in_band
+- id: RN2d
+  metric: 'negative control value: the linear form ends at 0.8687'
+  role: held_out
+  target: null
+  band: null
+  source: Codex review finding 2 (design note)
+  computed: 0.8687075605459232
+  reference: 0.8687
+  error_abs: 7.560545923213091e-06
+  error_rel: 8.70328758283998e-06
+  tolerance:
+    abs: 0.0005
+  compare: eq
+  per_seed_error_abs:
+  - 7.560545923213091e-06
+  in_band: true
+  status: in_band
+- id: RN3a
+  metric: reff_end = R0 f(t_end) S_end / N (unforced)
+  role: held_out
+  target: null
+  band: null
+  source: identity
+  computed: 0.40637573927539355
+  reference: 0.40637573927539355
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    rel: 1.0e-09
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  - 0.0
+  in_band: true
+  status: in_band
+- id: RN3b
+  metric: reff_end < 1 after an unforced major epidemic
+  role: held_out
+  target: null
+  band: null
+  source: identity
+  computed: 0.40637573927539355
+  reference: 1.0
+  error_abs: 0.5936242607246065
+  error_rel: 0.5936242607246065
+  tolerance:
+    abs: 0.0
+  compare: le
+  per_seed_error_abs:
+  - 0.5936242607246065
+  - 0.5936242607246065
+  in_band: true
+  status: in_band
+- id: RN3c
+  metric: attack_rate counts only infections inside a window that starts with S <
+    N
+  role: held_out
+  target: null
+  band: null
+  source: identity
+  computed: 0.7957646538280179
+  reference: 0.795764653828018
+  error_abs: 1.1102230246251565e-16
+  error_rel: 1.3951650394176717e-16
+  tolerance:
+    rel: 1.0e-09
+  compare: eq
+  per_seed_error_abs:
+  - 1.1102230246251565e-16
+  - 1.1102230246251565e-16
+  in_band: true
+  status: in_band
+- id: RN3d
+  metric: 'forced: reff_end = R0 f(t_end) S_end / N with the cosine forcing at t_end'
+  role: held_out
+  target: null
+  band: null
+  source: identity
+  computed: 0.18088388276987707
+  reference: 0.18088388276987707
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    rel: 1.0e-09
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  - 0.0
+  in_band: true
+  status: in_band
+- id: RN3e
+  metric: 'forced: reff_ref uses the declared reference phase'
+  role: held_out
+  target: null
+  band: null
+  source: identity
+  computed: 0.2999505999572497
+  reference: 0.2999505999572497
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    rel: 1.0e-09
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  - 0.0
+  in_band: true
+  status: in_band
+- id: RN4
+  metric: 'a weekly series from the reference ODE (R0 = 1.8, infectious period 7 days),
+    refitted: R0 recovered'
+  role: held_out
+  target: null
+  band: null
+  source: the pack's ODE
+  computed: 1.81847197215557
+  reference: 1.8
+  error_abs: 0.01847197215556995
+  error_rel: 0.010262206753094416
+  tolerance:
+    rel: 0.05
+  compare: eq
+  per_seed_error_abs:
+  - 0.01847197215556995
+  in_band: true
+  status: in_band
+- id: CI1a
+  metric: 'independent doses: cohort b2010 (c = 0.9, 0.6; e = 0.85, 0.95), by hand
+    0.10105'
+  role: held_out
+  target: null
+  band: null
+  source: hand-computed
+  computed: 0.10105
+  reference: 0.10105
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: CI1b
+  metric: 'independent doses: cohort b2011 (one dose, c = 0.8), by hand 0.32'
+  role: held_out
+  target: null
+  band: null
+  source: hand-computed
+  computed: 0.31999999999999995
+  reference: 0.32
+  error_abs: 5.551115123125783e-17
+  error_rel: 1.734723475976807e-16
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 5.551115123125783e-17
+  in_band: true
+  status: in_band
+- id: CI1c
+  metric: 'nested doses: cohort b2010, by hand 0.1495'
+  role: held_out
+  target: null
+  band: null
+  source: hand-computed
+  computed: 0.1495
+  reference: 0.1495
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: CI1d
+  metric: 'nested doses, cohort b2012 (c = 0.7, 0.5): 0.3 + 0.2 x 0.15 + 0.5 x 0.0075'
+  role: held_out
+  target: null
+  band: null
+  source: hand-computed
+  computed: 0.33375000000000005
+  reference: 0.33375
+  error_abs: 5.551115123125783e-17
+  error_rel: 1.663255467603231e-16
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 5.551115123125783e-17
+  in_band: true
+  status: in_band
+- id: CI1e
+  metric: a group declared always immune has susceptibility 0
+  role: held_out
+  target: null
+  band: null
+  source: spec declaration
+  computed: 0.0
+  reference: 0.0
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    abs: 0.0
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: CI2
+  metric: a cohort's susceptibility is invariant to the survey-year/decision-year
+    shift (birth-year indexing)
+  role: held_out
+  target: null
+  band: null
+  source: structural
+  computed: 0.0
+  reference: 0.0
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    abs: 0.0
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: CI3
+  metric: mixed-cohort survey band positivity (Se = Sp = 1, no waning) = population-weighted
+    mean of its cohorts
+  role: held_out
+  target: null
+  band: null
+  source: identity
+  computed: 0.6333333333333333
+  reference: 0.6333333333333333
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: CI4a
+  metric: 'initial_state() equals the sim''s state at its first step: cohort_history
+    with a catch-up campaign'
+  role: held_out
+  target: null
+  band: null
+  source: identity
+  computed: 0.0
+  reference: 0.0
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: CI4b
+  metric: 'same: given initialiser with an all-or-nothing campaign'
+  role: held_out
+  target: null
+  band: null
+  source: identity
+  computed: 0.0
+  reference: 0.0
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: OB1a
+  metric: 'numerator inflation then denominator error: admin coverage c (1 + w) /
+    (1 + d) (0.8, 0.1, 0.05)'
+  role: held_out
+  target: null
+  band: null
+  source: hand-computed
+  computed: 0.8380952380952381
+  reference: 0.8380952380952381
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: OB1b
+  metric: 'assay: Se p + (1 - Sp)(1 - p) (0.7, 0.95, 0.98)'
+  role: held_out
+  target: null
+  band: null
+  source: hand-computed
+  computed: 0.6709999999999999
+  reference: 0.671
+  error_abs: 1.1102230246251565e-16
+  error_rel: 1.6545797684428563e-16
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 1.1102230246251565e-16
+  in_band: true
+  status: in_band
+- id: OB1c
+  metric: 'frame gap: (1 - phi) p + phi min(rel p, 1) (0.8, 0.1, 0.5)'
+  role: held_out
+  target: null
+  band: null
+  source: hand-computed
+  computed: 0.7600000000000001
+  reference: 0.76
+  error_abs: 1.1102230246251565e-16
+  error_rel: 1.4608197692436271e-16
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 1.1102230246251565e-16
+  in_band: true
+  status: in_band
+- id: OB1d
+  metric: 'antibody waning: p exp(-rate years) (0.9, 0.05, 4)'
+  role: held_out
+  target: null
+  band: null
+  source: hand-computed
+  computed: 0.7368576777701836
+  reference: 0.7368576777701836
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: OB1e
+  metric: 'under-ascertainment: reported = rho x true (1000, 0.1)'
+  role: held_out
+  target: null
+  band: null
+  source: hand-computed
+  computed: 100.0
+  reference: 100.0
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: OB1f
+  metric: 'recall bias: card share k c + (1 - k) min(c (1 + b), 1) (0.6, 0.4, 0.2)'
+  role: held_out
+  target: null
+  band: null
+  source: hand-computed
+  computed: 0.6719999999999999
+  reference: 0.672
+  error_abs: 1.1102230246251565e-16
+  error_rel: 1.6521175961683875e-16
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 1.1102230246251565e-16
+  in_band: true
+  status: in_band
+- id: OB1g
+  metric: numerator inflation alone can exceed 1 (0.95, 0.2 -> 1.14)
+  role: held_out
+  target: null
+  band: null
+  source: hand-computed
+  computed: 1.14
+  reference: 1.14
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: OB1h
+  metric: denominator error alone (0.9, 0.125 -> 0.8)
+  role: held_out
+  target: null
+  band: null
+  source: hand-computed
+  computed: 0.8
+  reference: 0.8
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: FS7
+  metric: published age-specific final sizes from a contact-matrix model
+  role: held_out
+  target: null
+  band: null
+  source: 'candidates: Mossong et al. (2008); Wallinga, Teunis & Kretzschmar (2006)
+    AJE'
+  computed: null
+  in_band: false
+  status: not_assessable
+  not_assessable_because: 'published values not yet transcribed: values to be transcribed
+    with a quoted span through the evidence service'
+- id: RN5
+  metric: published reproduction-number estimates from incidence series
+  role: held_out
+  target: null
+  band: null
+  source: Cori et al. (2013) AJE worked examples
+  computed: null
+  in_band: false
+  status: not_assessable
+  not_assessable_because: 'published values not yet transcribed: values to be transcribed
+    with a quoted span through the evidence service'
+settings_calibrated: {}
+fitted_used: {}
+configs_validated:
+  branch_blocks:
+    config:
+      groups:
+      - a
+      - b
+      structure: age_groups_contact_matrix
+      mode: to_extinction
+      initialiser: given
+      dt: day
+      transmission: q
+      generation_interval:
+      - 0.5
+      - 0.5
+      importation: branching
+      offspring: poisson
+      tol: 1.0e-12
+    engine_identity:
+      name: compartmental-starsim
+      version: '0.1'
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
+      params_sha256: 1f4773c98c4d8ffdfe34e3931519139d7ea5a20f56baed6baeaf619eb4c5953e
+      config_sha256: 98a47f981a5ec892a25dc64d191d8c674f744fa518da15e65b8a4cd75b05381c
+    config_sha256: 563ddcfabc7eb6daab07b15f95db55e1c3bce811a9dadf654f4e866a264b9e2f
+  branch_geometric:
+    config:
+      groups:
+      - all
+      structure: single_group
+      mode: to_extinction
+      initialiser: given
+      dt: day
+      generation_interval:
+      - 0.5
+      - 0.5
+      importation: branching
+      offspring: geometric
+      tol: 1.0e-12
+    engine_identity:
+      name: compartmental-starsim
+      version: '0.1'
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
+      params_sha256: f498058635c8fd432017ed42e7a4a9b51d9355e39178b298d90f5512b1c5f372
+      config_sha256: 7fb325cd3215f687d2adcdcd1d8f666a811c609b76939cb8f819e574f5ccd32f
+    config_sha256: caff24d6ec911b41101780b4ba786dd2508af0c03dfc48eb613659b63be12439
+  branch_poisson:
+    config:
+      groups:
+      - all
+      structure: single_group
+      mode: to_extinction
+      initialiser: given
+      dt: day
+      generation_interval:
+      - 0.5
+      - 0.5
+      importation: branching
+      offspring: poisson
+      tol: 1.0e-12
+    engine_identity:
+      name: compartmental-starsim
+      version: '0.1'
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
+      params_sha256: f498058635c8fd432017ed42e7a4a9b51d9355e39178b298d90f5512b1c5f372
+      config_sha256: 7fb325cd3215f687d2adcdcd1d8f666a811c609b76939cb8f819e574f5ccd32f
+    config_sha256: 27fa58e2eef34f5a9dea6c3513e697427efd9e9801b46895b02a17b9674ec96a
+  campaign:
+    config:
+      groups:
+      - all
+      structure: single_group
+      mode: to_extinction
+      initialiser: given
+      dt: day
+      generation_interval:
+      - 0.2
+      - 0.3
+      - 0.3
+      - 0.2
+      tol: 1.0e-15
+      step_cap: 50000
+      components:
+        vax:
+          kind: campaign
+          targets:
+          - all
+          reach: 0.5
+    engine_identity:
+      name: compartmental-starsim
+      version: '0.1'
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
+      params_sha256: 5540ffc405a674e55b2f60126520392027596708bdbf41ec3d7d8996a682a344
+      config_sha256: ff010416c4b68f84fe37a221e977c0723ba20bc3c59002670cad018c9b720be6
+    config_sha256: 8fc79a9645f81cfe1d163788679a171c31f567a98302eb70d63a37174715c9f7
+  cohort:
+    config:
+      groups:
+      - b2000
+      - b2010
+      - b2011
+      - b2012
+      structure: birth_cohorts
+      mode: to_extinction
+      initialiser: cohort_history
+      doses:
+      - d1
+      - d2
+      dose_dependence: independent
+      dt: day
+      generation_interval:
+      - 0.5
+      - 0.5
+      tol: 1.0e-12
+      components:
+        catchup:
+          kind: campaign
+          targets:
+          - b2011
+          - b2012
+          reach: 0.8
+    engine_identity:
+      name: compartmental-starsim
+      version: '0.1'
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
+      params_sha256: 832eb9b250933e5d9394f529943ccc94b093866ae68fa2ffa6bcd9b19fdee47f
+      config_sha256: 3a934a919914afe2be724acadab50b4862d4ba4d29f9ac24d1d9913d7c7988cf
+    config_sha256: 844d162299f70a05162892c74141a3f0879a0bfdd701170e30e9b3bdd49524f4
+  cohort_nested:
+    config:
+      groups:
+      - b2000
+      - b2010
+      - b2011
+      - b2012
+      structure: birth_cohorts
+      mode: to_extinction
+      initialiser: cohort_history
+      doses:
+      - d1
+      - d2
+      dose_dependence: nested
+      dt: day
+      generation_interval:
+      - 0.5
+      - 0.5
+      tol: 1.0e-12
+    engine_identity:
+      name: compartmental-starsim
+      version: '0.1'
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
+      params_sha256: 888421c56ea3500f357a7c69767dcad5df04c9f365094f7a293d59c320b58ee5
+      config_sha256: 57bb29ab48e4c22838a1bfa9c65e83eb14ffc24663a092ce4824592f77adf0a8
+    config_sha256: b862462505b16ab8697a784d9ddfe7977baa230432bbd3dfaa078f5a70d57207
+  multi3:
+    config:
+      groups:
+      - a
+      - b
+      - c
+      structure: age_groups_contact_matrix
+      mode: to_extinction
+      initialiser: given
+      dt: day
+      transmission: q
+      generation_interval:
+      - 0.5
+      - 0.3
+      - 0.2
+      tol: 1.0e-14
+      step_cap: 50000
+    engine_identity:
+      name: compartmental-starsim
+      version: '0.1'
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
+      params_sha256: 1f4773c98c4d8ffdfe34e3931519139d7ea5a20f56baed6baeaf619eb4c5953e
+      config_sha256: 0fb2636f7d35fafba804a9ff4deac4596a2ab8619caf6e5a3c623326ddfa6ff3
+    config_sha256: 3ade22fabbfc746011164354a46c2a5cd4a1577dc19a5e60ab34ebfd984e8bbe
+  multi5:
+    config:
+      groups:
+      - g1
+      - g2
+      - g3
+      - g4
+      - g5
+      structure: age_groups_contact_matrix
+      mode: to_extinction
+      initialiser: given
+      dt: day
+      transmission: q
+      generation_interval:
+      - 0.5
+      - 0.3
+      - 0.2
+      tol: 1.0e-14
+      step_cap: 50000
+    engine_identity:
+      name: compartmental-starsim
+      version: '0.1'
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
+      params_sha256: 1f4773c98c4d8ffdfe34e3931519139d7ea5a20f56baed6baeaf619eb4c5953e
+      config_sha256: 3b7fbeb22f46c8f390fee7199809ab81e5fba852fe46120c1b42cc33e169dd3d
+    config_sha256: 0b38aeef94f7340eda965373e403b5416f885209471ff4edbb5a67326c252ad5
+  single_day:
+    config:
+      groups:
+      - all
+      structure: single_group
+      mode: to_extinction
+      initialiser: given
+      dt: day
+      generation_interval:
+      - 0.2
+      - 0.3
+      - 0.3
+      - 0.2
+      tol: 1.0e-13
+      step_cap: 50000
+    engine_identity:
+      name: compartmental-starsim
+      version: '0.1'
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
+      params_sha256: f498058635c8fd432017ed42e7a4a9b51d9355e39178b298d90f5512b1c5f372
+      config_sha256: 7fb325cd3215f687d2adcdcd1d8f666a811c609b76939cb8f819e574f5ccd32f
+    config_sha256: 796a3b1dceea18349dbee97472167eea809434e8db2a6b9dc261c3e3c077b770
+  single_w1:
+    config:
+      groups:
+      - all
+      structure: single_group
+      mode: to_extinction
+      initialiser: given
+      dt: day
+      generation_interval:
+      - 1.0
+      tol: 1.0e-15
+      step_cap: 200000
+    engine_identity:
+      name: compartmental-starsim
+      version: '0.1'
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
+      params_sha256: f498058635c8fd432017ed42e7a4a9b51d9355e39178b298d90f5512b1c5f372
+      config_sha256: 7fb325cd3215f687d2adcdcd1d8f666a811c609b76939cb8f819e574f5ccd32f
+    config_sha256: 15adcc2e805893e3964d6e468ba0728cf93509d726dba6e7465077d98abef7fb
+  single_week:
+    config:
+      groups:
+      - all
+      structure: single_group
+      mode: to_extinction
+      initialiser: given
+      dt: week
+      generation_interval:
+      - 0.7
+      - 0.3
+      tol: 1.0e-13
+      step_cap: 50000
+    engine_identity:
+      name: compartmental-starsim
+      version: '0.1'
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
+      params_sha256: f498058635c8fd432017ed42e7a4a9b51d9355e39178b298d90f5512b1c5f372
+      config_sha256: 7fb325cd3215f687d2adcdcd1d8f666a811c609b76939cb8f819e574f5ccd32f
+    config_sha256: 4e5d8c57db8c5bf696d186890cd3c18ea7e0ecbf935c7f0e4d7107ea33e7e72e
+  win_day:
+    config:
+      groups:
+      - all
+      structure: single_group
+      mode: windowed
+      initialiser: given
+      dt: day
+      generation_interval:
+      - 1.0
+    engine_identity:
+      name: compartmental-starsim
+      version: '0.1'
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
+      params_sha256: f498058635c8fd432017ed42e7a4a9b51d9355e39178b298d90f5512b1c5f372
+      config_sha256: 1ffd8300a2cb6d7dc41c19a6276dbd225ff1616deaea4908dd90eb8355983055
+    config_sha256: 7d65861ab899ef948e88ea82b3f1e1751b71d6c510c768979361d7295900556b
+  win_forced:
+    config:
+      groups:
+      - all
+      structure: single_group
+      mode: windowed
+      initialiser: given
+      dt: day
+      generation_interval:
+      - 0.2
+      - 0.3
+      - 0.3
+      - 0.2
+      forcing: cosine
+      forcing_period: 365.0
+      forcing_ref_phase: 0.0
+    engine_identity:
+      name: compartmental-starsim
+      version: '0.1'
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
+      params_sha256: 84120e872544e4d566f625a1bf62f2e5cbd865dd1031f8884dbb6087f73ef65d
+      config_sha256: 6732c72c3c8e0a4c85c9956ba75427e3366bf846807814032db292edb7160eaf
+    config_sha256: 7d8f9e54ba3f9d0518d6e175f37147f4ff8ba7d73b59dad8b148ff6900fb262c
+  win_growth:
+    config:
+      groups:
+      - all
+      structure: single_group
+      mode: windowed
+      initialiser: given
+      dt: day
+      generation_interval:
+      - 0.1
+      - 0.2
+      - 0.4
+      - 0.2
+      - 0.1
+    engine_identity:
+      name: compartmental-starsim
+      version: '0.1'
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
+      params_sha256: f498058635c8fd432017ed42e7a4a9b51d9355e39178b298d90f5512b1c5f372
+      config_sha256: 1ffd8300a2cb6d7dc41c19a6276dbd225ff1616deaea4908dd90eb8355983055
+    config_sha256: dea8cdfe7542745294e2678dd2485781a49c518e8d0e67eda84792cf669a1a92
+  win_refit:
+    config:
+      groups:
+      - all
+      structure: single_group
+      mode: windowed
+      initialiser: given
+      dt: day
+      generation_interval:
+      - 0.19222968801614
+      - 0.107555584944665
+      - 0.093237559583233
+      - 0.080825579829346
+      - 0.070065908888554
+      - 0.060738587941397
+      - 0.05265293954843
+      - 0.045643669651416
+      - 0.039567488484311
+      - 0.034300181315669
+      - 0.029734069139977
+      - 0.02577580740709
+      - 0.022344477789424
+      - 0.01936993397711
+      - 0.016791367684377
+      - 0.014556065552166
+      - 0.012618331534487
+      - 0.010938552738968
+      - 0.009482389624663
+      - 0.008220074002441
+      - 0.007125800487027
+      - 0.006177198960233
+      - 0.005354877260986
+      - 0.004642024753423
+      - 0.004024068668836
+      - 0.003488376196091
+      - 0.003023996230406
+      - 0.002621435501067
+      - 0.002272464501495
+      - 0.001969949254313
+      - 0.001707705472193
+      - 0.001480372133127
+      - 0.001283301885614
+      - 0.001112466043346
+      - 0.000964372227199
+      - 0.000835992970892
+      - 0.000724703830813
+      - 0.000628229734796
+      - 0.00054459847306
+      - 0.000472100380534
+      - 0.000409253386348
+      - 0.000354772716023
+      - 0.000307544626955
+      - 0.000266603640294
+      - 0.000231112803764
+      - 0.000200346581932
+      - 0.000173676024168
+      - 0.000150555907067
+      - 0.000130513588514
+      - 0.000113139345499
+      - 9.8077998206e-05
+      - 8.5021649096e-05
+      - 7.3703388602e-05
+      - 6.3891838716e-05
+      - 5.5386422957e-05
+      - 4.8013266008e-05
+      - 4.1621639197e-05
+      - 3.6080879171e-05
+      - 3.1277716757e-05
+      - 2.7113961411e-05
+    engine_identity:
+      name: compartmental-starsim
+      version: '0.1'
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
+      params_sha256: f498058635c8fd432017ed42e7a4a9b51d9355e39178b298d90f5512b1c5f372
+      config_sha256: 1ffd8300a2cb6d7dc41c19a6276dbd225ff1616deaea4908dd90eb8355983055
+    config_sha256: 807628e2468cbfb3061bcda229c792ba0e8f251d57f071ae2ce5b4b31474aa15
+  win_week:
+    config:
+      groups:
+      - all
+      structure: single_group
+      mode: windowed
+      initialiser: given
+      dt: week
+      generation_interval:
+      - 1.0
+    engine_identity:
+      name: compartmental-starsim
+      version: '0.1'
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
+      params_sha256: f498058635c8fd432017ed42e7a4a9b51d9355e39178b298d90f5512b1c5f372
+      config_sha256: 1ffd8300a2cb6d7dc41c19a6276dbd225ff1616deaea4908dd90eb8355983055
+    config_sha256: 2ec3e4c3e7722afe16437742c8caf9bafb4b018ed33aac8a44bad10d2aa4cedb
+configs_not_exercised: []
+seeds:
+- 1
+- 2
+n_sims: 44
+summary:
+  in_band: 51
+  total: 53
+  by_status:
+    in_band: 51
+    out_of_band: 0
+    not_assessable: 2
+    band_mis_based: 0
+  held_out_in_band: 51
+  held_out_total: 53
+engine_version: '0.1'
+fit_rule: null
+wall_s: 77.0

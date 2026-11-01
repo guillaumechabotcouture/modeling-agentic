@@ -1,0 +1,337 @@
+# Benchmark pack: compartmental engine (Starsim), design note v2d §5. Pure validation: the engine has no
+# engine-level fitted parameters, so `fit` is empty and every benchmark is held out. Each benchmark runs the
+# Starsim engine and compares it with an oracle in oracles.py (closed form, final-size fixed point or the
+# reference ODE) or with a second computation of the same quantity. Time is in days.
+#   python3 -m toolkit.engines.benchmark toolkit/engines/compartmental/benchmarks/pack.yaml run --workers 4
+engine: toolkit.engines.compartmental.engine:CompartmentalEngine
+oracles: toolkit.engines.compartmental.benchmarks.oracles
+default_config: single_day          # the configuration whose engine identity stamps results.yaml
+seeds: [1, 2]
+horizon: {start: 0, stop: 200000, window: [0, 200000], windows: {all: [0, 200000]}}
+
+configs:
+  single_day: {groups: [all], structure: single_group, mode: to_extinction, initialiser: given, dt: day,
+               generation_interval: [0.2, 0.3, 0.3, 0.2], tol: 1.0e-13, step_cap: 50000}
+  single_week: {groups: [all], structure: single_group, mode: to_extinction, initialiser: given, dt: week,
+                generation_interval: [0.7, 0.3], tol: 1.0e-13, step_cap: 50000}
+  single_w1: {groups: [all], structure: single_group, mode: to_extinction, initialiser: given, dt: day,
+              generation_interval: [1.0], tol: 1.0e-15, step_cap: 200000}
+  campaign: {groups: [all], structure: single_group, mode: to_extinction, initialiser: given, dt: day,
+             generation_interval: [0.2, 0.3, 0.3, 0.2], tol: 1.0e-15, step_cap: 50000,
+             components: {vax: {kind: campaign, targets: [all], reach: 0.5}}}
+  multi3: {groups: [a, b, c], structure: age_groups_contact_matrix, mode: to_extinction, initialiser: given,
+           dt: day, transmission: q, generation_interval: [0.5, 0.3, 0.2], tol: 1.0e-14, step_cap: 50000}
+  multi5: {groups: [g1, g2, g3, g4, g5], structure: age_groups_contact_matrix, mode: to_extinction,
+           initialiser: given, dt: day, transmission: q, generation_interval: [0.5, 0.3, 0.2], tol: 1.0e-14,
+           step_cap: 50000}
+  branch_poisson: {groups: [all], structure: single_group, mode: to_extinction, initialiser: given, dt: day,
+                   generation_interval: [0.5, 0.5], importation: branching, offspring: poisson, tol: 1.0e-12}
+  branch_geometric: {groups: [all], structure: single_group, mode: to_extinction, initialiser: given, dt: day,
+                     generation_interval: [0.5, 0.5], importation: branching, offspring: geometric, tol: 1.0e-12}
+  branch_blocks: {groups: [a, b], structure: age_groups_contact_matrix, mode: to_extinction, initialiser: given,
+                  dt: day, transmission: q, generation_interval: [0.5, 0.5], importation: branching,
+                  offspring: poisson, tol: 1.0e-12}
+  win_day: {groups: [all], structure: single_group, mode: windowed, initialiser: given, dt: day,
+            generation_interval: [1.0]}
+  win_week: {groups: [all], structure: single_group, mode: windowed, initialiser: given, dt: week,
+             generation_interval: [1.0]}
+  win_growth: {groups: [all], structure: single_group, mode: windowed, initialiser: given, dt: day,
+               generation_interval: [0.1, 0.2, 0.4, 0.2, 0.1]}
+  win_forced: {groups: [all], structure: single_group, mode: windowed, initialiser: given, dt: day,
+               generation_interval: [0.2, 0.3, 0.3, 0.2], forcing: cosine, forcing_period: 365.0,
+               forcing_ref_phase: 0.0}
+  # win_refit: SIR generation interval (exponential, mean 7 days) on the daily grid, triangular discretisation
+  # (oracles.discretised_exponential_gi_triangle); the interval form biased R0 by +6% (pack run 2).
+  win_refit: {groups: [all], structure: single_group, mode: windowed, initialiser: given, dt: day,
+              generation_interval: [0.19222968801614, 0.107555584944665, 0.093237559583233, 0.080825579829346, 0.070065908888554, 0.060738587941397, 0.05265293954843, 0.045643669651416, 0.039567488484311, 0.034300181315669, 0.029734069139977, 0.02577580740709, 0.022344477789424, 0.01936993397711, 0.016791367684377, 0.014556065552166, 0.012618331534487, 0.010938552738968, 0.009482389624663, 0.008220074002441, 0.007125800487027, 0.006177198960233, 0.005354877260986, 0.004642024753423, 0.004024068668836, 0.003488376196091, 0.003023996230406, 0.002621435501067, 0.002272464501495, 0.001969949254313, 0.001707705472193, 0.001480372133127, 0.001283301885614, 0.001112466043346, 0.000964372227199, 0.000835992970892, 0.000724703830813, 0.000628229734796, 0.00054459847306, 0.000472100380534, 0.000409253386348, 0.000354772716023, 0.000307544626955, 0.000266603640294, 0.000231112803764, 0.000200346581932, 0.000173676024168, 0.000150555907067, 0.000130513588514, 0.000113139345499, 9.8077998206e-05, 8.5021649096e-05, 7.3703388602e-05, 6.3891838716e-05, 5.5386422957e-05, 4.8013266008e-05, 4.1621639197e-05, 3.6080879171e-05, 3.1277716757e-05, 2.7113961411e-05]}
+  cohort: {groups: [b2000, b2010, b2011, b2012], structure: birth_cohorts, mode: to_extinction,
+           initialiser: cohort_history, doses: [d1, d2], dose_dependence: independent, dt: day,
+           generation_interval: [0.5, 0.5], tol: 1.0e-12,
+           components: {catchup: {kind: campaign, targets: [b2011, b2012], reach: 0.8}}}
+  cohort_nested: {groups: [b2000, b2010, b2011, b2012], structure: birth_cohorts, mode: to_extinction,
+                  initialiser: cohort_history, doses: [d1, d2], dose_dependence: nested, dt: day,
+                  generation_interval: [0.5, 0.5], tol: 1.0e-12}
+
+settings:
+  r0_1p5: {config: single_day, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-9}, params: {r0: 1.5}}
+  r0_2: {config: single_day, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-9}, params: {r0: 2.0}}
+  r0_4: {config: single_day, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-9}, params: {r0: 4.0}}
+  r0_12: {config: single_day, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-9}, params: {r0: 12.0}}
+  r0_18: {config: single_day, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-9}, params: {r0: 18.0}}
+  r0_2_week: {config: single_week, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-9}, params: {r0: 2.0}}
+  sub_0p5: {config: single_w1, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-9}, params: {r0: 0.5}}
+  crit_1p01: {config: single_w1, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-9}, params: {r0: 1.01}}
+  vax_half: {config: campaign, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-12}, params: {r0: 3.0, "efficacy:vax": 1.0}}
+  vax_herd: {config: campaign, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-12, "reach:vax": 0.7},
+             params: {r0: 3.0, "efficacy:vax": 1.0}}
+  rank_one: {config: multi3, params: {q: 1.5},
+             unit: {N: [3.0e+5, 2.0e+5, 1.0e+5], s0: [1.0, 1.0, 1.0], seed: 1.0e-9, intro: a,
+                    contact: [[0.3, 0.2, 0.5], [0.6, 0.4, 1.0], [0.15, 0.1, 0.25]]}}
+  identity3: {config: multi3, params: {q: 1.0},
+              unit: {N: [3.0e+5, 2.0e+5, 1.0e+5], s0: [1.0, 1.0, 1.0], seed: 1.0e-6, intro: a,
+                     contact: [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 2.0]]}}
+  rank_one_ode: {config: multi3, params: {q: 1.5},
+                 unit: {N: [3.0e+5, 2.0e+5, 1.0e+5], s0: [1.0, 0.8, 0.9], seed: 1.0e-6, intro: a,
+                        contact: [[0.3, 0.2, 0.5], [0.6, 0.4, 1.0], [0.15, 0.1, 0.25]]}}
+  asym5: {config: multi5, params: {q: 0.6},
+          unit: {N: [2.0e+5, 3.0e+5, 2.5e+5, 1.5e+5, 1.0e+5], s0: [1.0, 0.9, 0.7, 0.8, 1.0], seed: 1.0e-6, intro: g2,
+                 contact: [[3.0, 1.0, 0.5, 0.3, 0.1], [0.8, 4.0, 1.2, 0.4, 0.2], [0.4, 1.0, 2.5, 0.9, 0.3],
+                           [0.2, 0.5, 1.1, 1.8, 0.6], [0.1, 0.3, 0.4, 0.7, 1.2]]}}
+  bp_2: {config: branch_poisson, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-9}, params: {r0: 2.0}}
+  bg_2: {config: branch_geometric, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-9}, params: {r0: 2.0}}
+  blocks_sub: {config: branch_blocks, params: {q: 1.0},
+               unit: {N: [5.0e+5, 5.0e+5], s0: [1.0, 1.0], seed: 1.0e-9, intro: b,
+                      contact: [[2.5, 0.0], [0.0, 0.6]]}}
+  blocks_super: {config: branch_blocks, params: {q: 1.0},
+                 unit: {N: [5.0e+5, 5.0e+5], s0: [1.0, 1.0], seed: 1.0e-9, intro: a,
+                        contact: [[2.5, 0.0], [0.0, 0.6]]}}
+  rn_growth: {config: win_growth, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-14}, params: {r0: 2.0},
+              horizon: {start: 0, stop: 200, window: [0, 200], windows: {growth: [40, 80], all: [0, 200]}}}
+  rn_day: {config: win_day, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-9}, params: {r0: 2.0},
+           horizon: {start: 0, stop: 400, window: [0, 400],
+                     windows: {all: [0, 400], early: [0, 20], late: [20, 400]}}}
+  rn_week: {config: win_week, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-9}, params: {r0: 2.0},
+            horizon: {start: 0, stop: 2800, window: [0, 2800], windows: {all: [0, 2800]}}}
+  rn_forced: {config: win_forced, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-6},
+              params: {r0: 1.8, forcing_amplitude: 0.3, forcing_phase: 30.0},
+              horizon: {start: 0, stop: 250, window: [0, 250], windows: {all: [0, 250]}}}
+  ci_cohort: {config: cohort, params: {"seroconversion:d1": 0.85, "seroconversion:d2": 0.95, r0: 4.0},
+              unit: {N: [4.0e+5, 1.0e+5, 1.0e+5, 1.0e+5], birth_year: [2000, 2010, 2011, 2012], decision_year: 2025,
+                     always_immune: [b2000], contact_rate: 10.0, seed: 1.0e-9, intro: b2012,
+                     "coverage:d1": [0.0, 0.9, 0.8, 0.7], "coverage:d2": [0.0, 0.6, 0.0, 0.5]}}
+
+arms:
+  fs1_1p5: {setting: r0_1p5, package: {}}
+  fs1_2: {setting: r0_2, package: {}}
+  fs1_4: {setting: r0_4, package: {}}
+  fs1_12: {setting: r0_12, package: {}}
+  fs1_18: {setting: r0_18, package: {}}
+  fs8_week: {setting: r0_2_week, package: {}}
+  fs2_sub: {setting: sub_0p5, package: {}}
+  fs2_crit: {setting: crit_1p01, package: {}}
+  fs4_half: {setting: vax_half, package: {vax: 1}}
+  fs4_herd: {setting: vax_herd, package: {vax: 1}}
+  fs3_rank1: {setting: rank_one, package: {}}
+  fs6_id: {setting: identity3, package: {}}
+  fs6_r1: {setting: rank_one_ode, package: {}}
+  fs6_asym: {setting: asym5, package: {}}
+  br_pois: {setting: bp_2, package: {}}
+  br_geom: {setting: bg_2, package: {}}
+  br_sub: {setting: blocks_sub, package: {}}
+  br_super: {setting: blocks_super, package: {}}
+  rn1: {setting: rn_growth, package: {}}
+  rn2_day: {setting: rn_day, package: {}}
+  rn2_week: {setting: rn_week, package: {}}
+  rn3_forced: {setting: rn_forced, package: {}}
+  ci_none: {setting: ci_cohort, package: {}}
+
+benchmarks:
+  # ---------------------------------------------------------------- to_extinction mode
+  - {id: FS1a, metric: "single-group final size, R0 = 1.5", source: "Kermack-McKendrick (1927); Lambert W closed form",
+     estimand: {type: value, a: {arm: fs1_1p5, value: windows.all.attack_rate},
+                b: {oracle: final_size_lambert, args: {r0: 1.5, seed: 1.0e-9}}, tol: {abs: 1.0e-6}}}
+  - {id: FS1b, metric: "single-group final size, R0 = 2", source: "Kermack-McKendrick (1927); Lambert W closed form",
+     estimand: {type: value, a: {arm: fs1_2, value: windows.all.attack_rate},
+                b: {oracle: final_size_lambert, args: {r0: 2.0, seed: 1.0e-9}}, tol: {abs: 1.0e-6}}}
+  - {id: FS1c, metric: "single-group final size, R0 = 4", source: "Kermack-McKendrick (1927); Lambert W closed form",
+     estimand: {type: value, a: {arm: fs1_4, value: windows.all.attack_rate},
+                b: {oracle: final_size_lambert, args: {r0: 4.0, seed: 1.0e-9}}, tol: {abs: 1.0e-6}}}
+  - {id: FS1d, metric: "single-group final size, R0 = 12", source: "Kermack-McKendrick (1927); Lambert W closed form",
+     estimand: {type: value, a: {arm: fs1_12, value: windows.all.attack_rate},
+                b: {oracle: final_size_lambert, args: {r0: 12.0, seed: 1.0e-9}}, tol: {abs: 1.0e-6}}}
+  - {id: FS1e, metric: "single-group final size, R0 = 18", source: "Kermack-McKendrick (1927); Lambert W closed form",
+     estimand: {type: value, a: {arm: fs1_18, value: windows.all.attack_rate},
+                b: {oracle: final_size_lambert, args: {r0: 18.0, seed: 1.0e-9}}, tol: {abs: 1.0e-6}}}
+  - {id: FS2a, metric: "R0 = 0.5: attack rate at most the seed-size bound seed / (1 - R0)", source: "threshold theorem",
+     estimand: {type: value, compare: le, a: {arm: fs2_sub, value: windows.all.attack_rate},
+                b: {oracle: seed_bound, args: {r0: 0.5, seed: 1.0e-9}}, tol: {abs: 1.0e-15}}}
+  - {id: FS2b, metric: "R0 = 1.01: final size equals the seeded closed form", source: "threshold theorem; Lambert W",
+     estimand: {type: value, a: {arm: fs2_crit, value: windows.all.attack_rate},
+                b: {oracle: final_size_lambert, args: {r0: 1.01, seed: 1.0e-9}}, tol: {abs: 1.0e-6}}}
+  - {id: FS2c, metric: "R0 = 1 + e gives z close to 2e (e = 0.01; the O(e^2) term is under 2% of 2e)", source: "threshold theorem",
+     estimand: {type: value, a: {arm: fs2_crit, value: windows.all.attack_rate}, b: 0.02, tol: {rel: 0.02}}}
+  - {id: FS3, metric: "rank-one (proportionate) mixing reduces to the scalar final-size relation, per group",
+     source: "Ma & Earn (2006) Bull Math Biol; Andreasen (2011)",
+     estimand: {type: value, a: {arm: fs3_rank1, value: per_capita_vec.infections},
+                b: {oracle: final_size_rank_one, args: {q: 1.5, a: [1.0, 2.0, 0.5], b: [0.3, 0.2, 0.5],
+                    N: [3.0e+5, 2.0e+5, 1.0e+5], s: [1.0, 1.0, 1.0], seed: [2.0e-9, 0.0, 0.0]}}, tol: {rel: 1.0e-6}}}
+  - {id: FS4a, metric: "all-or-nothing vaccination, v e = 0.5, R0 = 3: whole-population attack rate z = s x (0.2914)",
+     source: "herd-immunity identity",
+     estimand: {type: value, a: {arm: fs4_half, value: windows.all.attack_rate},
+                b: {oracle: herd_immunity, args: {r0: 3.0, coverage: 0.5, efficacy: 1.0, denominator: population}},
+                tol: {rel: 1.0e-8}}}
+  - {id: FS4b, metric: "same: attack rate among those left susceptible x (0.5828)", source: "herd-immunity identity",
+     estimand: {type: value,
+                a: {oracle: ratio, args: {a: {arm: fs4_half, value: windows.all.attack_rate},
+                                          b: {arm: fs4_half, value: windows.all.s_start}}},
+                b: {oracle: herd_immunity, args: {r0: 3.0, coverage: 0.5, efficacy: 1.0, denominator: susceptible}},
+                tol: {rel: 1.0e-8}}}
+  - {id: FS4c, metric: "v e = 0.7 >= 1 - 1/R0: no outbreak (attack rate within seed size)", source: "herd-immunity identity",
+     estimand: {type: value, a: {arm: fs4_herd, value: windows.all.attack_rate},
+                b: {oracle: herd_immunity, args: {r0: 3.0, coverage: 0.7, efficacy: 1.0}}, tol: {abs: 1.0e-10}}}
+  - {id: FS5, metric: "R0 from the next-generation matrix equals the growth-rate-consistent R0 of the reference ODE (5x5 asymmetric, all susceptible)",
+     source: "Diekmann, Heesterbeek & Metz (1990)",
+     estimand: {type: value, a: {arm: fs6_asym, value: windows.all.r0},
+                b: {oracle: ode_growth_r0, args: {q: 0.6, gamma: 0.25, s: [1.0, 1.0, 1.0, 1.0, 1.0],
+                    N: [2.0e+5, 3.0e+5, 2.5e+5, 1.5e+5, 1.0e+5],
+                    C: [[3.0, 1.0, 0.5, 0.3, 0.1], [0.8, 4.0, 1.2, 0.4, 0.2], [0.4, 1.0, 2.5, 0.9, 0.3],
+                        [0.2, 0.5, 1.1, 1.8, 0.6], [0.1, 0.3, 0.4, 0.7, 1.2]]}}, tol: {rel: 1.0e-6}}}
+  - {id: FS6a, metric: "multigroup final size equals the reference ODE run to extinction: identity matrix (seeded group only)",
+     source: "the pack's ODE (solve_ivp DOP853, rtol 1e-10)",
+     estimand: {type: value, a: {arm: fs6_id, value: per_capita_vec.infections},
+                b: {oracle: ode_final_size, args: {q: 1.0, gamma: 0.25, N: [3.0e+5, 2.0e+5, 1.0e+5], s: [1.0, 1.0, 1.0],
+                    seed: [2.0e-6, 0.0, 0.0], C: [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 2.0]]}}, tol: {abs: 1.0e-5}}}
+  - {id: FS6b, metric: "same: rank-one matrix, partial susceptibility", source: "the pack's ODE",
+     estimand: {type: value, a: {arm: fs6_r1, value: per_capita_vec.infections},
+                b: {oracle: ode_final_size, args: {q: 1.5, gamma: 0.25, N: [3.0e+5, 2.0e+5, 1.0e+5], s: [1.0, 0.8, 0.9],
+                    seed: [2.0e-6, 0.0, 0.0], C: [[0.3, 0.2, 0.5], [0.6, 0.4, 1.0], [0.15, 0.1, 0.25]]}}, tol: {abs: 1.0e-5}}}
+  - {id: FS6c, metric: "same: asymmetric 5x5 matrix", source: "the pack's ODE",
+     estimand: {type: value, a: {arm: fs6_asym, value: per_capita_vec.infections},
+                b: {oracle: ode_final_size, args: {q: 0.6, gamma: 0.25, N: [2.0e+5, 3.0e+5, 2.5e+5, 1.5e+5, 1.0e+5],
+                    s: [1.0, 0.9, 0.7, 0.8, 1.0], seed: [0.0, 3.3333333333333335e-6, 0.0, 0.0, 0.0],
+                    C: [[3.0, 1.0, 0.5, 0.3, 0.1], [0.8, 4.0, 1.2, 0.4, 0.2], [0.4, 1.0, 2.5, 0.9, 0.3],
+                        [0.2, 0.5, 1.1, 1.8, 0.6], [0.1, 0.3, 0.4, 0.7, 1.2]]}}, tol: {abs: 1.0e-5}}}
+  - {id: FS8a, metric: "the final size is the same at dt of one day and one week (R0 = 2)", source: "exponential-survival identity (§1.1)",
+     estimand: {type: identity, a: {arm: fs8_week, value: windows.all.attack_rate},
+                b: {arm: fs1_2, value: windows.all.attack_rate}, tol: {rel: 1.0e-6}}}
+  - {id: FS8b, metric: "the step cap is never reached in FS1-FS6 (every arm converged)", source: "engine stop rule",
+     estimand: {type: value,
+                a: {oracle: minimum, args: {values: [{arm: fs1_1p5, value: windows.all.converged},
+                    {arm: fs1_2, value: windows.all.converged}, {arm: fs1_4, value: windows.all.converged},
+                    {arm: fs1_12, value: windows.all.converged}, {arm: fs1_18, value: windows.all.converged},
+                    {arm: fs2_sub, value: windows.all.converged}, {arm: fs2_crit, value: windows.all.converged},
+                    {arm: fs3_rank1, value: windows.all.converged}, {arm: fs4_half, value: windows.all.converged},
+                    {arm: fs4_herd, value: windows.all.converged}, {arm: fs6_id, value: windows.all.converged},
+                    {arm: fs6_r1, value: windows.all.converged}, {arm: fs6_asym, value: windows.all.converged},
+                    {arm: fs8_week, value: windows.all.converged}]}},
+                b: 1.0, tol: {abs: 0.0}}}
+  # ---------------------------------------------------------------- multitype extinction (p_major, derived)
+  - {id: BR1a, metric: "one group, Poisson offspring: 1 - p solves 1 - p = exp(-R0 p) (R0 = 2)", source: "branching-process identities",
+     estimand: {type: value, a: {arm: br_pois, value: windows.all.p_major},
+                b: {oracle: branching_single, args: {r0: 2.0, offspring: poisson}}, tol: {abs: 1.0e-8}}}
+  - {id: BR1b, metric: "one group, geometric offspring: p = 1 - 1/R0 (R0 = 2)", source: "branching-process identities",
+     estimand: {type: value, a: {arm: br_geom, value: windows.all.p_major},
+                b: {oracle: branching_single, args: {r0: 2.0, offspring: geometric}}, tol: {abs: 1.0e-8}}}
+  - {id: BR1c, metric: "block-diagonal matrix, introduction into the subcritical block: p_major = 0", source: "branching-process identities",
+     estimand: {type: value, a: {arm: br_sub, value: windows.all.p_major}, b: 0.0, tol: {abs: 1.0e-8}}}
+  - {id: BR1d, metric: "same matrix, introduction into the supercritical block (R = 2.5): the one-group Poisson value",
+     source: "branching-process identities",
+     estimand: {type: value, a: {arm: br_super, value: windows.all.p_major},
+                b: {oracle: branching_single, args: {r0: 2.5, offspring: poisson}}, tol: {abs: 1.0e-8}}}
+  - {id: BR1e, metric: "branching importation: expected attack rate = p_major x the major-outbreak final size",
+     source: "design note §1.1 (importation: branching)",
+     estimand: {type: value, a: {arm: br_pois, value: windows.all.attack_rate},
+                b: {oracle: product, args: {a: {oracle: branching_single, args: {r0: 2.0, offspring: poisson}},
+                                            b: {oracle: final_size_lambert, args: {r0: 2.0, seed: 1.0e-9}}}},
+                tol: {abs: 1.0e-6}}}
+  # ---------------------------------------------------------------- windowed mode
+  - {id: RN1, metric: "growth phase: R0 = 1 / sum_s w_s exp(-r s) for the engine's growth rate r", source: "Wallinga & Lipsitch (2007) Proc R Soc B",
+     estimand: {type: identity, a: {arm: rn1, value: windows.all.r0},
+                b: {oracle: wallinga_lipsitch, args: {w: [0.1, 0.2, 0.4, 0.2, 0.1], dt_days: 1.0,
+                    r: {arm: rn1, value: windows.growth.growth_rate}}}, tol: {rel: 1.0e-3}}}
+  - {id: RN2a, metric: "unforced cumulative attack rate equals the FS1 solution, dt one day (w_1 = 1, R0 = 2)",
+     source: "Diekmann, Heesterbeek & Britton (2013), ch. 1",
+     estimand: {type: value, a: {arm: rn2_day, value: windows.all.attack_rate},
+                b: {oracle: final_size_lambert, args: {r0: 2.0, seed: 1.0e-9}}, tol: {abs: 1.0e-6}}}
+  - {id: RN2b, metric: "same at dt one week", source: "Diekmann, Heesterbeek & Britton (2013), ch. 1",
+     estimand: {type: value, a: {arm: rn2_week, value: windows.all.attack_rate},
+                b: {oracle: final_size_lambert, args: {r0: 2.0, seed: 1.0e-9}}, tol: {abs: 1.0e-6}}}
+  - {id: RN2c, metric: "negative control: the linear renewal form misses the final size (0.8687 vs 0.7968)",
+     source: "Codex review finding 2 (design note)",
+     estimand: {type: value, compare: differ,
+                a: {oracle: linear_renewal_attack, args: {r0: 2.0, w: [1.0], seed: 1.0e-9}},
+                b: {oracle: final_size_lambert, args: {r0: 2.0, seed: 1.0e-9}}, tol: {abs: 0.05}}}
+  - {id: RN2d, metric: "negative control value: the linear form ends at 0.8687", source: "Codex review finding 2 (design note)",
+     estimand: {type: value, a: {oracle: linear_renewal_attack, args: {r0: 2.0, w: [1.0], seed: 1.0e-9}},
+                b: 0.8687, tol: {abs: 5.0e-4}}}
+  - {id: RN3a, metric: "reff_end = R0 f(t_end) S_end / N (unforced)", source: "identity",
+     estimand: {type: identity, a: {arm: rn2_day, value: windows.all.reff_end},
+                b: {oracle: product, args: {a: {arm: rn2_day, value: windows.all.r0}, b: {arm: rn2_day, value: windows.all.s_end}}},
+                tol: {rel: 1.0e-9}}}
+  - {id: RN3b, metric: "reff_end < 1 after an unforced major epidemic", source: "identity",
+     estimand: {type: value, compare: le, a: {arm: rn2_day, value: windows.all.reff_end}, b: 1.0, tol: {abs: 0.0}}}
+  - {id: RN3c, metric: "attack_rate counts only infections inside a window that starts with S < N", source: "identity",
+     estimand: {type: identity, a: {arm: rn2_day, value: windows.late.attack_rate},
+                b: {oracle: difference, args: {a: {arm: rn2_day, value: windows.all.attack_rate},
+                                               b: {arm: rn2_day, value: windows.early.attack_rate}}}, tol: {rel: 1.0e-9}}}
+  - {id: RN3d, metric: "forced: reff_end = R0 f(t_end) S_end / N with the cosine forcing at t_end", source: "identity",
+     estimand: {type: identity, a: {arm: rn3_forced, value: windows.all.reff_end},
+                b: {oracle: product, args: {a: {arm: rn3_forced, value: windows.all.s_end},
+                    b: {oracle: cosine_forcing_r, args: {r0: 1.8, amplitude: 0.3, phase: 30.0, period: 365.0, t: 250.0}}}},
+                tol: {rel: 1.0e-9}}}
+  - {id: RN3e, metric: "forced: reff_ref uses the declared reference phase", source: "identity",
+     estimand: {type: identity, a: {arm: rn3_forced, value: windows.all.reff_ref},
+                b: {oracle: product, args: {a: {arm: rn3_forced, value: windows.all.s_end},
+                    b: {oracle: cosine_forcing_r, args: {r0: 1.8, amplitude: 0.3, phase: 30.0, period: 365.0, t: 0.0}}}},
+                tol: {rel: 1.0e-9}}}
+  - {id: RN4, metric: "a weekly series from the reference ODE (R0 = 1.8, infectious period 7 days), refitted: R0 recovered",
+     source: "the pack's ODE",
+     estimand: {type: value, a: {probe: refit_r0, args: {config: win_refit, r0: 1.8, gamma: 0.14285714285714285,
+                                                          weeks: 30, seed: 1.0e-7}},
+                b: 1.8, tol: {rel: 0.05}}}
+  # ---------------------------------------------------------------- cohort initialiser
+  - {id: CI1a, metric: "independent doses: cohort b2010 (c = 0.9, 0.6; e = 0.85, 0.95), by hand 0.10105", source: "hand-computed",
+     estimand: {type: value, a: {probe: initial_state, args: {config: cohort, group: b2010, unit: &ciunit
+                {N: [4.0e+5, 1.0e+5, 1.0e+5, 1.0e+5], birth_year: [2000, 2010, 2011, 2012], decision_year: 2025,
+                 always_immune: [b2000], contact_rate: 10.0, seed: 1.0e-9, intro: b2012,
+                 "coverage:d1": [0.0, 0.9, 0.8, 0.7], "coverage:d2": [0.0, 0.6, 0.0, 0.5]},
+                params: &ciparams {"seroconversion:d1": 0.85, "seroconversion:d2": 0.95, r0: 4.0}}},
+                b: 0.10105, tol: {abs: 1.0e-12}}}
+  - {id: CI1b, metric: "independent doses: cohort b2011 (one dose, c = 0.8), by hand 0.32", source: "hand-computed",
+     estimand: {type: value, a: {probe: initial_state, args: {config: cohort, group: b2011, unit: *ciunit, params: *ciparams}},
+                b: 0.32, tol: {abs: 1.0e-12}}}
+  - {id: CI1c, metric: "nested doses: cohort b2010, by hand 0.1495", source: "hand-computed",
+     estimand: {type: value, a: {probe: initial_state, args: {config: cohort_nested, group: b2010, unit: *ciunit, params: *ciparams}},
+                b: 0.1495, tol: {abs: 1.0e-12}}}
+  - {id: CI1d, metric: "nested doses, cohort b2012 (c = 0.7, 0.5): 0.3 + 0.2 x 0.15 + 0.5 x 0.0075",
+     source: "hand-computed",
+     estimand: {type: value, a: {probe: initial_state, args: {config: cohort_nested, group: b2012, unit: *ciunit, params: *ciparams}},
+                b: 0.33375, tol: {abs: 1.0e-12}}}
+  - {id: CI1e, metric: "a group declared always immune has susceptibility 0", source: "spec declaration",
+     estimand: {type: value, a: {probe: initial_state, args: {config: cohort, group: b2000, unit: *ciunit, params: *ciparams}},
+                b: 0.0, tol: {abs: 0.0}}}
+  - {id: CI2, metric: "a cohort's susceptibility is invariant to the survey-year/decision-year shift (birth-year indexing)", source: "structural",
+     estimand: {type: value, a: {probe: cohort_shift, args: {config: cohort, unit: *ciunit, shift_years: 1.0}}, b: 0.0, tol: {abs: 0.0}}}
+  - {id: CI3, metric: "mixed-cohort survey band positivity (Se = Sp = 1, no waning) = population-weighted mean of its cohorts",
+     source: "identity",
+     estimand: {type: value, a: {probe: band_positivity, args: {immune: [0.9, 0.7, 0.5], sizes: [100.0, 200.0, 300.0]}},
+                b: {oracle: weighted_mean, args: {values: [0.9, 0.7, 0.5], weights: [100.0, 200.0, 300.0]}}, tol: {abs: 1.0e-12}}}
+  - {id: CI4a, metric: "initial_state() equals the sim's state at its first step: cohort_history with a catch-up campaign", source: "identity",
+     estimand: {type: value, a: {probe: initial_state_vs_sim, args: {config: cohort, unit: *ciunit, params: *ciparams,
+                                                                    package: {catchup: 1}}}, b: 0.0, tol: {abs: 1.0e-12}}}
+  - {id: CI4b, metric: "same: given initialiser with an all-or-nothing campaign", source: "identity",
+     estimand: {type: value, a: {probe: initial_state_vs_sim, args: {config: campaign, unit: {N: [1.0e+6], s0: [0.9], seed: 1.0e-9},
+                                                                    params: {r0: 3.0, "efficacy:vax": 0.9}, package: {vax: 1}}},
+                b: 0.0, tol: {abs: 1.0e-12}}}
+  # ---------------------------------------------------------------- observation forward maps (harness, §3.4)
+  - {id: OB1a, metric: "numerator inflation then denominator error: admin coverage c (1 + w) / (1 + d) (0.8, 0.1, 0.05)", source: "hand-computed",
+     estimand: {type: value, a: {probe: observation, args: {mechanism: admin_coverage, coverage: 0.8, omega: 0.1, delta: 0.05}},
+                b: 0.8380952380952381, tol: {abs: 1.0e-12}}}
+  - {id: OB1b, metric: "assay: Se p + (1 - Sp)(1 - p) (0.7, 0.95, 0.98)", source: "hand-computed",
+     estimand: {type: value, a: {probe: observation, args: {mechanism: assay, p: 0.7, se: 0.95, sp: 0.98}},
+                b: 0.671, tol: {abs: 1.0e-12}}}
+  - {id: OB1c, metric: "frame gap: (1 - phi) p + phi min(rel p, 1) (0.8, 0.1, 0.5)", source: "hand-computed",
+     estimand: {type: value, a: {probe: observation, args: {mechanism: frame_gap, p: 0.8, phi: 0.1, rel: 0.5}},
+                b: 0.76, tol: {abs: 1.0e-12}}}
+  - {id: OB1d, metric: "antibody waning: p exp(-rate years) (0.9, 0.05, 4)", source: "hand-computed",
+     estimand: {type: value, a: {probe: observation, args: {mechanism: antibody_waning, p: 0.9, rate: 0.05, years: 4.0}},
+                b: 0.7368576777701836, tol: {abs: 1.0e-12}}}
+  - {id: OB1e, metric: "under-ascertainment: reported = rho x true (1000, 0.1)", source: "hand-computed",
+     estimand: {type: value, a: {probe: observation, args: {mechanism: under_ascertainment, value: 1000.0, rho: 0.1}},
+                b: 100.0, tol: {abs: 1.0e-12}}}
+  - {id: OB1f, metric: "recall bias: card share k c + (1 - k) min(c (1 + b), 1) (0.6, 0.4, 0.2)", source: "hand-computed",
+     estimand: {type: value, a: {probe: observation, args: {mechanism: recall_bias, coverage: 0.6, card_share: 0.4, beta: 0.2}},
+                b: 0.672, tol: {abs: 1.0e-12}}}
+  - {id: OB1g, metric: "numerator inflation alone can exceed 1 (0.95, 0.2 -> 1.14)", source: "hand-computed",
+     estimand: {type: value, a: {probe: observation, args: {mechanism: numerator_inflation, value: 0.95, omega: 0.2}},
+                b: 1.14, tol: {abs: 1.0e-12}}}
+  - {id: OB1h, metric: "denominator error alone (0.9, 0.125 -> 0.8)", source: "hand-computed",
+     estimand: {type: value, a: {probe: observation, args: {mechanism: denominator_error, value: 0.9, delta: 0.125}},
+                b: 0.8, tol: {abs: 1.0e-12}}}
+  # ---------------------------------------------------------------- held out, not yet transcribed (owner decision 2026-11-01)
+  - {id: FS7, metric: "published age-specific final sizes from a contact-matrix model", role: held_out,
+     source: "candidates: Mossong et al. (2008); Wallinga, Teunis & Kretzschmar (2006) AJE",
+     estimand: {type: value, not_transcribed: "values to be transcribed with a quoted span through the evidence service"}}
+  - {id: RN5, metric: "published reproduction-number estimates from incidence series", role: held_out,
+     source: "Cori et al. (2013) AJE worked examples",
+     estimand: {type: value, not_transcribed: "values to be transcribed with a quoted span through the evidence service"}}
