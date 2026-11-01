@@ -20,8 +20,14 @@ import math
 import time
 import warnings
 
+import os
+import sys
+
 import numpy as np
 
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 from toolkit.analysis.batch import CAL_WINDOW, calibrated_value
 from toolkit.engines.contract import Package, UnitSpec
 
@@ -79,6 +85,15 @@ class EmulatorModel:
         self.cost_outputs = dict(an.get("cost_outputs") or {})
         self.diagnostics = dict(an.get("diagnostics") or {})
         self.fitted_names = design["fitted_names"]
+        self.prior_names = list(design.get("prior_names") or [])
+        from toolkit.spec import priors as PRI
+        want = PRI.drawn(spec)
+        miss = sorted(set(want) - set(self.prior_names))
+        if miss:
+            raise ValueError(f"emulator design: the uncertainty draws vary {miss}, which are not inputs of this design; "
+                             "they must enter the design (rebuild the batch from toolkit/analysis/batch.py design(), "
+                             "which spans every prior's declared range), or be excluded by name in the signed spec")
+        self.param_names = list(self.fitted_names) + self.prior_names
         self.packages = design["packages"]
         self.comp = spec.comparator
         self.pops = spec["decision_units"]["populations"]
@@ -94,13 +109,15 @@ class EmulatorModel:
         self.lo, self.hi = X.min(0), X.max(0)
         # Codex P1-6: the design domain. The calibrated attribute and the fitted parameters span their declared
         # design box (calibration.range, engine-card ranges); unit features span what the design points contain.
-        self.input_names = ["z"] + list(self.fitted_names) + list(self.features)
+        self.input_names = ["z"] + self.param_names + list(self.features)
         fr = {q.name: (q.lo, q.hi) for q in spec.engine().parameters() if q.kind == "fitted"}
+        fr.update({k: (p.lo, p.hi) for k, p in want.items()})
         zr = spec["calibration"]["range"]
+        npar = len(self.param_names)
         self.dom_lo = np.array([min(zr[0], self.lo[0])] + [min(fr[nm][0], self.lo[1 + j]) for j, nm in
-                                                          enumerate(self.fitted_names)] + list(self.lo[1 + len(self.fitted_names):]))
+                                                          enumerate(self.param_names)] + list(self.lo[1 + npar:]))
         self.dom_hi = np.array([max(zr[1], self.hi[0])] + [max(fr[nm][1], self.hi[1 + j]) for j, nm in
-                                                          enumerate(self.fitted_names)] + list(self.hi[1 + len(self.fitted_names):]))
+                                                          enumerate(self.param_names)] + list(self.hi[1 + npar:]))
         self.last_events = []
         self.hold = np.array([bool(p["holdout"]) for p in pts])
         self.X = self._scale(X)
@@ -134,10 +151,11 @@ class EmulatorModel:
                 self.train_corrections[f"diag_floor:{name}"] = int(np.sum(v < 1e-6))
             self.T[("diag", name)] = np.log(np.maximum(v, 1e-6))
         self.gps, self.accuracy = {}, {}
+        self.error = None
         self.design_points = n
 
     def _x(self, z, theta, u):
-        return [z] + [float(theta[nm]) for nm in self.fitted_names] + [float(u[f]) for f in self.features]
+        return [z] + [float(theta[nm]) for nm in self.param_names] + [float(u[f]) for f in self.features]
 
     def _scale(self, X):
         return (X - self.lo) / np.where(self.hi > self.lo, self.hi - self.lo, 1.0)
@@ -179,12 +197,15 @@ class EmulatorModel:
         y, yh = self.T[("cal",)][ho], self.gps[("cal",)].predict(Xh)
         acc["cal_logit_rmse"] = float(np.sqrt(np.mean((y - yh) ** 2)))
         errs, r2, self.red_rmse = [], [], {}
+        cols, res = [], []
         for k in self.packages:
             if k == self.comp:
                 continue
             for P in self.pops:
                 key = ("red", P, self.primary, k)
                 t, p = self.T[key][ho], self.gps[key].predict(Xh)
+                cols.append((P, k))
+                res.append(t - p)
                 ss = np.sum((t - t.mean()) ** 2)
                 r2.append(1 - np.sum((t - p) ** 2) / ss if ss > 0 else float("nan"))
                 errs.append(np.mean(np.abs(t - p)))
@@ -195,6 +216,9 @@ class EmulatorModel:
         P0 = next(iter(self.pops))
         tb, pb = self.T[("base", P0, self.primary)][ho], self.gps[("base", P0, self.primary)].predict(Xh)
         acc["base_log_rmse"] = float(np.sqrt(np.mean((tb - pb) ** 2)))
+        if cols and ho.sum() >= EmulatorError.MIN_HOLDOUT:
+            self.error = EmulatorError(cols, np.array(res).T)
+            acc["error_model"] = self.error.summary()
         self.accuracy = acc
 
     # ---------------------------------------------------------------- prediction
@@ -212,8 +236,16 @@ class EmulatorModel:
         return (g.predict(Xp) - g.predict(Xm)) / (2 * h)
 
     def predict(self, zs, theta, ids, noise=None):
-        """`noise`: an rng for the emulator-error source (reductions perturbed by their held-out RMSE)."""
+        """`noise`: an rng for the emulator-error source: one joint draw of the reduction errors of every unit
+        (EmulatorError: a common component plus a per-unit one, from the held-out residuals), applied to every
+        outcome of a (population group, package)."""
         rows = [self.by_id[i] for i in ids]
+        E = None
+        if noise is not None:
+            if self.error is None:
+                raise ValueError("emulator error: fewer than "
+                                 f"{EmulatorError.MIN_HOLDOUT} held-out points, so the error cannot be drawn")
+            E = self.error.sample(noise, len(ids))
         Xr = np.asarray([self._x(zs[i], theta, u) for i, u in zip(ids, rows)], float)
         X = self._scale(Xr)
         n = len(ids)
@@ -234,8 +266,8 @@ class EmulatorModel:
                     if k == self.comp:
                         continue
                     r = self.gps[("red", P, o, k)].predict(X)
-                    if noise is not None:
-                        r = r + noise.normal(0.0, self.red_rmse.get((P, k), 0.0), size=n)
+                    if E is not None:
+                        r = r + E[:, self.error.col[(P, k)]]
                     for j in np.flatnonzero((r < -0.5) | (r > 1.0)):
                         ev.append({"unit": ids[j], "package": k, "kind": "reduction_clip", "outcome": o, "group": P,
                                    "value": float(r[j])})
@@ -258,6 +290,59 @@ class EmulatorModel:
                 y[j]["diag"][name] = float(e[j])
         self.last_events = ev
         return dict(zip(ids, y))
+
+
+class EmulatorError:
+    """The emulator-error source, from the held-out residuals of the reductions (one column per population group and
+    package, one row per held-out point; held-out points are real units at design values).
+
+    A unit's error is split into the error of the population mean, which a sum over units does not average away, and
+    the unit's deviation from it, which it does:
+        common  = m u + D' g / sqrt(H (H - 1))    u ~ N(0, 1), g ~ N(0, I_H): one per draw, shared by every unit
+        unit j  = D' g_j / sqrt(H - 1)            g_j ~ N(0, I_H): one per unit
+    m is the mean held-out residual and D the residuals minus m. The common part has the mean square that the held-out
+    set gives the population-mean error: its observed mean (sign unknown, so u) and that mean's sampling error. Both
+    parts are combinations of the observed residual vectors, so they keep the residuals' correlation across packages
+    and population groups. Independent per-unit errors at the held-out RMSE (the earlier model) make the error of an
+    n-unit total shrink as 1/sqrt(n); here it does not fall below the common part. Not captured: correlation at an
+    intermediate level (units of one region more alike than units at large), which H residuals cannot estimate."""
+    MIN_HOLDOUT = 3
+
+    def __init__(self, cols: list, R):
+        self.cols = list(cols)
+        self.col = {c: j for j, c in enumerate(self.cols)}
+        self.R = np.asarray(R, float)
+        self.H = self.R.shape[0]
+        self.m = self.R.mean(0)
+        self.D = self.R - self.m
+
+    def sample(self, rng, n: int):
+        """(n units x columns) errors for one draw."""
+        H = self.H
+        common = self.m * rng.normal() + self.D.T @ rng.normal(size=H) / math.sqrt(H * (H - 1))
+        return common[None, :] + rng.normal(size=(n, H)) @ self.D / math.sqrt(H - 1)
+
+    def summary(self) -> dict:
+        H = self.H
+        s = self.R.std(0, ddof=1)
+        rmse = np.sqrt(np.mean(self.R ** 2, 0))
+        sd_c = np.sqrt(self.m ** 2 + s ** 2 / H)
+        tstat = np.abs(self.m) / np.maximum(s / math.sqrt(H), 1e-300)
+        live = self.R[:, s > 0]
+        corr = None
+        if live.shape[1] > 1:
+            C = np.corrcoef(live.T)
+            corr = float(np.median(C[~np.eye(C.shape[0], dtype=bool)]))
+        return {"model": "common (population-mean) plus per-unit components from the held-out residual vectors",
+                "holdout_points": H, "columns": len(self.cols),
+                "residual_mean_median": float(np.median(self.m)), "residual_mean_abs_median": float(np.median(np.abs(self.m))),
+                "residual_sd_median": float(np.median(s)), "rmse_median": float(np.median(rmse)),
+                "sd_common_median": float(np.median(sd_c)), "sd_unit_median": float(np.median(s)),
+                "mean_residual_abs_t_median": float(np.median(tstat)),
+                "share_columns_mean_residual_beyond_2se": float(np.mean(tstat > 2)),
+                "cross_column_residual_corr_median": corr,
+                "not_captured": "correlation at an intermediate level (units of one region more alike than units at "
+                                "large), which the held-out residuals cannot estimate"}
 
 
 class DirectModel:
@@ -317,3 +402,56 @@ class DirectModel:
                         row["diag"][n] = float((r.windows.get(d.get("window", "")) or {}).get(d["metric"], math.nan))
             out[i] = row
         return out
+
+
+def _self_test() -> int:
+    """python3 toolkit/analysis/model.py --self-test (the emulator-error model; the emulators are tested in run.py)."""
+    fails = []
+
+    def ok(cond, msg):
+        print(("PASS " if cond else "FAIL ") + msg)
+        if not cond:
+            fails.append(msg)
+
+    def sd_of_mean(err, n, draws=3000, seed=1, old=None):
+        rng = np.random.default_rng(seed)
+        if old is not None:          # the earlier model: independent per unit at the held-out RMSE
+            return float(np.std([rng.normal(0, old, size=n).mean() for _ in range(draws)]))
+        return float(np.std([err.sample(rng, n)[:, 0].mean() for _ in range(draws)]))
+
+    # ME1 fully correlated error (every held-out residual the same): the error of an n-unit mean does not shrink
+    R = np.full((12, 2), 0.04)
+    e = EmulatorError([("all", "a"), ("all", "b")], R)
+    w10, w1000 = sd_of_mean(e, 10), sd_of_mean(e, 1000)
+    o10, o1000 = sd_of_mean(None, 10, old=0.04), sd_of_mean(None, 1000, old=0.04)
+    ok(abs(w1000 / w10 - 1) < 0.05 and abs(w10 - 0.04) < 0.004 and o10 / o1000 > 8,
+       f"ME1 fully correlated error: the interval of a total does not shrink with the number of units "
+       f"({w10:.4f} at 10 units, {w1000:.4f} at 1000; the independent model shrinks {o10 / o1000:.1f}x)")
+    # ME2 zero-mean independent residuals: the per-unit part averages out, the population-mean part (sd s/sqrt(H)) stays
+    rng = np.random.default_rng(3)
+    R2 = rng.normal(0, 0.05, size=(400, 1))
+    e2 = EmulatorError([("all", "a")], R2)
+    s, m, H = R2.std(ddof=1), R2.mean(), 400
+    want = math.sqrt(m ** 2 + s ** 2 / H + s ** 2 / 1000)
+    got = sd_of_mean(e2, 1000, draws=3000)
+    ok(abs(got / want - 1) < 0.1 and got > 1.2 * sd_of_mean(None, 1000, old=float(np.sqrt(np.mean(R2 ** 2)))),
+       f"ME2 independent residuals: a total's error has the per-unit part averaged and the mean's error kept "
+       f"({got:.5f}, theory {want:.5f})")
+    # ME3 the residuals' cross-package correlation is kept
+    R3 = np.column_stack([R2[:12, 0], R2[:12, 0]])
+    x = EmulatorError([("all", "a"), ("all", "b")], R3).sample(np.random.default_rng(5), 50)
+    ok(np.allclose(x[:, 0], x[:, 1]), "ME3 two packages with the same held-out residuals get the same error draw")
+    sm = e2.summary()
+    ok(sm["holdout_points"] == 400 and sm["sd_common_median"] < sm["sd_unit_median"]
+       and "not_captured" in sm, f"ME4 the error model is summarised for the artifact ({sm['sd_common_median']:.4f})")
+    if fails:
+        print(f"FAILED: {len(fails)} case(s)")
+        return 1
+    print("OK: all self-test cases passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] == ["--self-test"]:
+        sys.exit(_self_test())
+    print(__doc__)

@@ -60,7 +60,13 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
    `schema.UNCERTAINTY_KINDS` is either a source or excluded with a reason. The report's
    interval label is rendered from this list ("95% UI over calibration; not covered: unit
    costs, ..."). An interval that covers two sources is not a full 95% UI; say what it
-   leaves out (spike lesson 6).
+   leaves out (spike lesson 6). Engine parameters with published ranges (the engine's
+   `priors.yaml`) are drawn in every draw without being listed, and the label names them.
+   A scenario parameter (an achieved coverage, an added treatment rate) is held at its
+   value unless you give it a published range in `uncertainty.priors: {name: {dist,
+   range, source}}`; the label says it is held fixed. Fix a prior parameter only with
+   `uncertainty.excluded: [{parameter, reason}]`. Each drawn prior gets an automatic
+   `prior_range` decision test; do not declare one.
 10. **Analysis.** `evaluation: emulator` for engines too slow to run per unit and draw (give
     the design: points, hold-out share, features), `direct` otherwise; the stability
     hold-out group; sensitivity; and **decision tests** for each simplification,

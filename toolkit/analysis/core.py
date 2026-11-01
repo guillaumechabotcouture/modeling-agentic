@@ -50,7 +50,10 @@ class Analysis:
         self.budget = spec.budget()
         self.region = spec["decision_units"].get("region")
         self.fr = fitted_ranges(self.eng)
-        self.theta0 = {k: v[2] for k, v in self.fr.items()}
+        from toolkit.spec import priors as PRI
+        self.pr = PRI.drawn(spec)             # prior parameters, drawn in every uncertainty draw
+        self.dr = dict(self.fr, **{k: (p.lo, p.hi, p.value) for k, p in self.pr.items()})   # every drawn parameter
+        self.theta0 = {k: v[2] for k, v in self.dr.items()}
         self.dfac = discount_factor(spec)
         self.method = spec["calibration"].get("method", "none")
         self.lik = None

@@ -2,8 +2,10 @@
 
 Design: `analysis.emulator.points` design points. Each takes the engine attributes of one
 real unit (units drawn without replacement, then with replacement), a Sobol value of the
-calibrated attribute over `calibration.range`, and Sobol values of every fitted engine
-parameter over its engine-card range. Every package runs at every point with the same
+calibrated attribute over `calibration.range`, Sobol values of every fitted engine
+parameter over its engine-card range, and Sobol values of every prior parameter the
+uncertainty draws vary (toolkit/spec/priors.py) over its declared range (v2 priors; a spec
+whose engine and spec declare no prior gets the spike's design unchanged). Every package runs at every point with the same
 seed (common random numbers). A share `holdout_share` of points is held out to measure
 emulator accuracy. The design is the spike's (`spike/analysis/batch.py`), unchanged, so
 the stored spike batch is reusable.
@@ -35,6 +37,13 @@ def fitted_ranges(engine) -> dict:
     return {p.name: (p.lo, p.hi, p.value) for p in engine.parameters() if p.kind == "fitted"}
 
 
+def prior_ranges(spec) -> dict:
+    """{name: (lo, hi, value)} of the prior parameters the uncertainty draws vary (toolkit/spec/priors.py), in name
+    order. They are emulator inputs: the design spans their declared ranges, so every draw is inside the design box."""
+    from toolkit.spec import priors as PRI
+    return {k: (p.lo, p.hi, p.value) for k, p in PRI.drawn(spec).items()}
+
+
 def calibrated_value(spec, z: float) -> float:
     return float(math.exp(z)) if spec["calibration"].get("scale", "log") == "log" else float(z)
 
@@ -54,7 +63,10 @@ def design(spec) -> tuple[dict, list[dict]]:
     rng = np.random.default_rng(int(em.get("seed", 7)))
     fr = fitted_ranges(eng)
     names = sorted(fr)
-    sob = qmc.Sobol(d=1 + len(names), scramble=True, seed=int(em.get("seed", 7))).random(n)
+    pr = prior_ranges(spec)                 # v2 priors: drawn parameters enter the design as inputs
+    pnames = list(pr)
+    fr = dict(fr, **pr)
+    sob = qmc.Sobol(d=1 + len(names) + len(pnames), scramble=True, seed=int(em.get("seed", 7))).random(n)
     lo, hi = spec["calibration"]["range"]
     order = list(rng.permutation(len(units)))
     while len(order) < n:
@@ -67,7 +79,7 @@ def design(spec) -> tuple[dict, list[dict]]:
     for i in range(n):
         row = units[order[i]]
         z = lo + (hi - lo) * sob[i, 0]
-        theta = {nm: fr[nm][0] + (fr[nm][1] - fr[nm][0]) * sob[i, 1 + k] for k, nm in enumerate(names)}
+        theta = {nm: fr[nm][0] + (fr[nm][1] - fr[nm][0]) * sob[i, 1 + k] for k, nm in enumerate(names + pnames)}
         attrs = spec.unit_attributes(row)
         attrs[attr] = calibrated_value(spec, z)
         seed = 1000 + i
@@ -79,6 +91,8 @@ def design(spec) -> tuple[dict, list[dict]]:
     d = {"points": points, "fitted_names": names, "packages": list(pk), "spec_engine": spec["engine"],
          "horizon": {"start": h["start"], "stop": h["stop"], "window": list(spec["objective"]["horizon"])},
          "cal_window": list(spec["calibration"]["window"])}
+    if pnames:
+        d["prior_names"] = pnames
     return d, [dict(j, engine=spec["engine"], horizon=d["horizon"], windows=windows(spec)) for j in jobs]
 
 
