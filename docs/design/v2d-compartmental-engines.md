@@ -1,7 +1,10 @@
 # v2 workstream D: compartmental engine, yield mode and the spec changes they need (design note)
 
 Status: design note for owner review (2026-10-31), written before any code. Branch `v2d-design`, PR into
-`v2` (from 881e90c). No engine code and no cloud spend are part of this note.
+`v2` (from 881e90c). No engine code and no cloud spend are part of this note. Updated 2026-11-01 with the
+owner's answers to open questions 4, 5, 6 and 10 (§7): the compartmental engine is built on Starsim (§1.1),
+every observation source gets a measurement model (§3.4), the engine may run before the published
+benchmarks are transcribed, with a label (§5), and `contract.py` stays unchanged (§4).
 
 ## Why this workstream
 
@@ -26,13 +29,13 @@ Findings this note starts from:
 - **The v1 baseline on the outbreak question** under-covered the attack-rate interval, because the
   reporting fraction was fixed rather than propagated.
 
-## 1. Engines: one compartmental engine with two solvers, and a yield mode of the empirical engine
+## 1. Engines: one Starsim compartmental engine with two run modes, and a yield mode of the empirical engine
 
 **Proposal: two changes, not four engines.**
 
 | Engine | Change | Covers |
 |---|---|---|
-| `toolkit/engines/compartmental/` (new, numpy/scipy) | groups (age bands or birth cohorts) × a contact matrix; a susceptibility initialiser; interventions that move people out of S; two solvers: `final_size` and `renewal` | campaign, vaccine allocation, outbreak estimation, and later any closed-population epidemic question |
+| `toolkit/engines/compartmental/` (new, Starsim) | a Starsim compartmental module: groups (age bands or birth cohorts) × a contact matrix; a susceptibility initialiser; interventions that move people out of S; one discrete-time transmission step, run in two modes: `to_extinction` (final-size questions) and `windowed` (incidence series) | campaign, vaccine allocation, outbreak estimation, and later any closed-population epidemic question |
 | `toolkit/engines/empirical/` (extended) | `reference` package and `structural_zero` packages: the rate is identified relative to an observed package, and a package that cannot produce the outcome returns zero by construction | screening yield, and any "rate per person reached" question |
 
 ### 1.1 Compartmental engine
@@ -47,25 +50,29 @@ The transmissibility `q` is per contact, integrated over the infectious period, 
 dimensionless. The engine has no births, deaths, waning or migration within the horizon. These are stated
 on the card as out of range.
 
-**Susceptibility initialisers** (engine config, chosen in the spec):
-- `given`: the initial susceptible fraction `s_i` per group, from a unit attribute (for example a serosurvey
-  proportion, calibrated with its sampling error).
-- `cohort_history`: for each birth cohort, susceptibility after the doses it received. The doses come from
-  dose-coverage history and per-dose seroconversion. Dose k reaches its coverage `c_k` and seroconverts a
-  share `e_k` of those still susceptible. Whether a later dose goes preferentially to people who received an
-  earlier one is a declared `dose_dependence` (`independent`, `nested`); it is not fitted. Cohorts are
-  indexed by **birth year**, never by age, so a survey taken in year Y and a decision in year Y+1 shift
-  cohorts by construction. A structural test checks this (§6, CK3). Groups declared always-immune or
-  always-susceptible (for example by age bounds) come from the spec, with a source.
-- **Survey observation model (harness, not engine).** A serosurvey band is a mixture of cohorts. Its
-  expected seropositive share is the population-weighted immune share of those cohorts. The likelihood is
-  binomial. How the survey and the coverage history are reconciled is the one place this design needs
-  an owner decision (open question 4):
-  - (a) a per-unit coverage-measurement factor `kappa`. It reads as a denominator error in the coverage
-    data, has a declared prior range, and is calibrated to the survey;
-  - (b) survey only, interpolated across cohorts by the coverage pattern.
+**Built on Starsim** (decided 2026-11-01, owner). The stack is our own Python and Starsim code; no R,
+malariasimulation, EMOD or other external simulator. The engine follows the compartmental pattern in the
+`starsim-dev-nonstandard` skill: one `ss.Module` subclass, `GroupEpidemic`, holds group-level state as
+numpy vectors (`S`, `I` history, cumulative infections, length `G`) instead of per-agent arrays, and runs
+inside an `ss.Sim` with no network and no demographics. Group sizes `N_i` come from the unit attributes, not
+from the number of agents, so the sim's `People` object is a minimal placeholder. Interventions are
+`ss.Intervention` subclasses that act at the start of the sim, and outputs are `ss.Result` series plus the
+window metrics below. The malaria engine already runs this way (`build_sim()` returns an `ss.Sim`), so the
+harness, the batch runner and the benchmark runner need nothing new to run it.
 
-  The spec declares one as primary; the other runs as a structure decision test (§2.4).
+**Susceptibility initialisers** (engine config, chosen in the spec):
+- `given`: the initial susceptible fraction `s_i` per group, a latent quantity whose value comes from
+  calibration to the declared observation sources (§3.4), never copied from one survey.
+- `cohort_history`: for each birth cohort, susceptibility after the doses it received. Dose k reaches a
+  **latent true coverage** `c_k` and seroconverts a share `e_k` of those still susceptible. Whether a later
+  dose goes preferentially to people who received an earlier one is a declared `dose_dependence`
+  (`independent`, `nested`); it is not fitted. Cohorts are indexed by **birth year**, never by age, so a
+  survey taken in year Y and a decision in year Y+1 shift cohorts by construction. A structural test checks
+  this (§6, CI2). Groups declared always-immune or always-susceptible (for example by age bounds) come from
+  the spec, with a source.
+- The engine never reads administrative coverage or survey results directly. Each data source is an
+  **observation** of the latent coverage or immunity, with its own sampling frame and measurement bias,
+  modelled in the harness (§3.4). Neither source is treated as the truth.
 
 **Interventions.** Each component removes susceptibles before the epidemic. It reaches a share of the
 targeted groups, and in those it protects a share `e` of the susceptibles it reaches. That share is called
@@ -75,25 +82,49 @@ the spec declares `targets_susceptible: true`, so doses given to immune people a
 Packages are either campaign options (which groups are targeted) or **dose vectors** (a whole number of
 blocks per group; §2.2).
 
-**Solver `final_size`** (no time axis). It solves the multigroup final-size relation
+**The transmission step.** One discrete-time step of length `dt` (one day or one week, `ss.days(...)`),
+with susceptible depletion, in the bounded exponential-survival form:
 
-    z_i = s_i [1 − exp(−q Σ_j C_ij z_j)]          (z_i: share of group i infected over the epidemic)
+    I_i,t = S_i,t−1 · [1 − exp(−λ_i,t)],   λ_i,t = q f(t) Σ_j C_ij Σ_s w_s I_j,t−s / N_j,   S_i,t = S_i,t−1 − I_i,t
 
-by damped fixed-point iteration from `z = s`, with a residual check (tolerance 1e-10). It reports
-`converged`, and an unconverged solve fails closed. `q` is the transmissibility per contact. It is
-calibrated, or set from a declared R0 via the dominant eigenvalue of the next-generation matrix:
-`R0 = q · ρ(C)` with all groups fully susceptible, and `Reff = q · ρ(diag(s) C)`. Outputs:
-- per-capita infections per group (and cases, hospitalisations and other outcomes, through per-group
-  outcome-per-infection ratios that are unit attributes or calibrated);
-- window metrics `r0`, `reff_start`, `attack_rate` and `p_major`;
-- cost drivers: doses per group.
+- `w` is the generation-interval distribution on the `dt` grid; it must sum to 1, and a gap, a negative
+  value or a grid that differs from `dt` fails closed.
+- `f(t)` is 1 (unforced) or a declared seasonal forcing (`cosine` with amplitude and phase parameters).
+- `q` is calibrated, or set from a declared R0 via the dominant eigenvalue of the next-generation matrix:
+  `R0 = q · ρ(C)` with all groups fully susceptible, and `Reff = q · ρ(diag(s) C)`.
+- This form never infects more than the remaining susceptibles. With `f = 1`, summing the log survival over
+  the epidemic gives `log(S_i,∞/S_i,0) = −q Σ_j C_ij z_j`, with `z_j` the cumulative infections of group j
+  (seeds included) over `N_j`. That is the multigroup final-size relation, exactly, at any step length. The
+  linear form `I_t = (S_{t−1}/N) R Σ w I` does not satisfy it: with `w_1 = 1` and `R0 = 2`, it ends at an
+  attack rate of 0.8687 against the exact 0.7968 (Codex review, finding 2, reproduced).
+
+So one Starsim module answers both question types. The run mode is engine config:
+- **`to_extinction`** (campaign, vaccine allocation). The sim runs until incidence falls below a declared
+  tolerance (proposal: `1e-9 · N`), within a step cap. An epidemic still running at the cap reports
+  `converged: false` and fails closed. Outputs:
+  - per-capita infections per group (and cases, hospitalisations and other outcomes, through per-group
+    outcome-per-infection ratios that are unit attributes or calibrated);
+  - window metrics `r0`, `reff_start`, `attack_rate` and `p_major`;
+  - cost drivers: doses per group.
+- **`windowed`** (outbreak estimation). The sim runs over the horizon, and the harness fits reported counts
+  per window. Seeding is a calibrated initial incidence over the first generation interval. Outputs per
+  window are the infections and these metrics (Codex review, finding 5):
+  - `attack_rate`: infections *within the window* divided by `N`. This is new infections only;
+    pre-existing immunity is never counted;
+  - `reff_end` = `R0 · f(t_end) · S_end/N`: the reproduction number at the window's end;
+  - `reff_ref` = `R0 · f_ref · S_end/N`: at a declared reference phase, for example a season's start. With
+    `f = 1`, `reff_end` and `reff_ref` coincide;
+  - `growth_rate`;
+  - the `R(t)` trajectory.
+
+  A deliverable must name which reproduction number it reports.
 
 **Importation.** The spec declares the group the introduction enters (or a distribution over groups) and
 one of two modes:
-- `importation: deterministic`: the major-outbreak final size applies when the introduction can reach a
-  supercritical part of the contact graph, and zero otherwise. With one group or an irreducible matrix,
-  this means `Reff > 1`. The engine solves for the final size seeded from the introduction group's
-  connected component, never the maximal solution over disconnected components.
+- `importation: deterministic`: the sim is seeded in the introduction group only, so infection reaches only
+  the groups connected to it in the contact graph; no maximal solution over disconnected components is
+  taken. Below threshold the deterministic run gives a minor outbreak of about the seed's size, which the
+  benchmarks bound (FS2).
 - `importation: branching`: the expected size is `p_major · z`. `p_major` comes from the multitype
   extinction equations, `x_i = G_i(x)`, the probability that a chain started by one case in group i dies
   out, given a declared offspring distribution:
@@ -101,51 +132,43 @@ one of two modes:
   - `geometric` (an exponential infectious period).
 
   `p_major` is 0 when `Reff ≤ 1`. The scalar `1 − 1/Reff` holds only for one group with geometric
-  offspring and is not used otherwise (Codex review, finding 4).
+  offspring and is not used otherwise (Codex review, finding 4). A deterministic sim has no trajectory
+  that gives a probability of extinction, so `p_major` is the one quantity the engine computes from an
+  equation rather than from the sim. It is labelled as derived on the card, and BR1 checks it.
 
-**Solver `renewal`** (weekly or daily steps). It has susceptible depletion and uses the bounded
-exponential-survival form:
+**Determinism and seeding.** The module draws no random numbers: it uses no `ss` distributions and no
+networks. The contract's `seed` is still passed to `ss.Sim(rand_seed=seed)` and recorded in `Outcomes.meta`,
+as the malaria engine does. A contract self-test asserts that outputs are **identical across seeds**, which
+is stronger than today's same-seed check in `check_engine`. A stochastic variant (chain-binomial, for
+fade-out) would draw from Starsim's seeded random streams behind the same contract; it is out of scope.
 
-    I_t = S_{t−1} · [1 − exp(−R(t) · Σ_s w_s I_{t−s} / N)],   S_t = S_{t−1} − I_t,   R(t) = R0 · f(t)
+**Runtime per evaluation, and batching.** A Starsim sim has a fixed cost per sim (initialisation) and per
+step (the module loop), which a closed-form solve does not. The estimate, to be measured in δ before
+anything depends on it, is 20–100 ms per sim for one unit, 5 groups and 50–200 steps on one core. One sim
+per evaluation is too slow in two places:
+- per-draw re-optimisation over a joint package space: 4,368 packages × 1,000 draws × 50 ms is about
+  60 core-hours;
+- `posterior` calibration (§3.1): 2^14 prior points × 50 ms is about 14 minutes per fit, and the coverage
+  pack fits 1,400 times.
 
-This form never infects more than the remaining susceptibles. With `f = 1`, summing the log survival over the epidemic gives
-`log(S_∞/S_0) = −R0 · (cumulative infections, seeds included)/N` exactly. So it satisfies the final-size
-relation at any step length.
-The linear form `I_t = (S_{t−1}/N) R Σ w I` does not. With `w_1 = 1` and `R0 = 2`, it ends at an attack
-rate of 0.8687 against the exact 0.7968 (Codex review, finding 2, reproduced).
+So the module's state carries a leading **batch axis**: one sim evaluates many (parameter set, package)
+pairs at once, as vectors of shape batch × groups, at close to the cost of one sim. The engine exposes this
+as an optional `run_batch(param_sets, unit, packages, horizon, seed)` method beside the contract's `run()`.
+`contract.py` is unchanged, and the harness uses the method when an engine has it. A contract test checks
+that `run_batch()` equals `run()` pair by pair (rel. 1e-12). With batching:
+- per-draw re-optimisation is 1,000 sims per unit, about 1–2 minutes on one core, so `direct` evaluation
+  stays the default;
+- a calibration is about 16 sims of 1,024 points, a few seconds.
 
-- `w` is the given generation-interval distribution; it must sum to 1, and a gap or a negative value fails
-  closed.
-- `f(t)` is 1 (unforced) or a declared seasonal forcing (`cosine` with amplitude and phase parameters).
-- Seeding is a calibrated initial incidence over the first generation interval.
-- Outputs per window are the infections (so the harness can fit reported counts) and these metrics (Codex
-  review, finding 5):
-  - `attack_rate`: infections *within the window* divided by `N`. This is new infections only;
-    pre-existing immunity is never counted;
-  - `reff_end` = `R0 · f(t_end) · S_end/N`: the reproduction number at the window's end;
-  - `reff_ref` = `R0 · f_ref · S_end/N`: at a declared reference phase, for example a season's start.
-    With `f = 1`, `reff_end` and `reff_ref` coincide;
-  - `growth_rate`;
-  - the `R(t)` trajectory.
+If the δ measurement is more than 5× these estimates, the existing emulator path is the fallback, and the
+note comes back to the owner before ε.
 
-  A deliverable must name which reproduction number it reports.
-
-For one group with `f = 1`, the renewal epidemic's final size converges to the `final_size` solution. That
-is an identity, and the pack checks it (§5).
-
-**Why two solvers and not an ODE engine.** For a closed population with interventions before the epidemic,
-final size gives the decision quantity exactly and fast (about 1 ms per solve). That makes per-draw
-re-optimisation over thousands of packages cheap. Estimation from an incidence series needs a time axis;
-the renewal equation is the SIR-type model written in terms of the generation interval the data come with.
-A multigroup SIR ODE (`scipy.integrate.solve_ivp`) is written **only as a reference inside the benchmark
-pack**, to check both solvers. It is not exposed to runs until a question needs timing, for example a
-peak, vaccination during the season, or hospital capacity (out of scope).
-
-**Why numpy/scipy and not Starsim.** These are deterministic compartmental systems, and the owner's rule
-allows plain numpy/scipy where a final-size or ODE solver is simpler. A Starsim agent-based version would add
-stochastic noise and run time to a quantity that has a closed form. If a later question needs stochastic
-fade-out or contact heterogeneity beyond a matrix, a Starsim version goes behind the same contract and is
-benchmarked against this one.
+**Analytic solvers are test oracles only** (decided 2026-11-01, owner). The multigroup final-size fixed
+point, the Lambert W closed form, the herd-immunity identity, the Wallinga–Lipsitch relation and a
+multigroup SIR ODE (`scipy.integrate.solve_ivp`) are written **inside the benchmark pack** (§5), to check the
+Starsim engine. None is exposed to runs. If a question later needs timing within a season (a peak,
+vaccination during the season, hospital capacity), it is a new run mode of the same Starsim module with
+continuous-time progression, benchmarked against the pack's ODE (out of scope).
 
 ### 1.2 Empirical engine: a yield mode
 
@@ -241,23 +264,25 @@ deliverable:
 
 **New uncertainty kinds.**
 - `priors`: parameters the data do not inform, drawn from their declared prior.
-- `observation`: sampling error of survey proportions and counts. This kind is covered automatically when
-  calibration is `posterior` (the likelihood carries it); it must be listed or excluded like the others.
+- `observation`: the sampling error and the measurement-bias parameters of each declared observation
+  source (§3.4). This kind is covered automatically when calibration is `posterior` (the likelihood and the
+  bias priors carry it); it must be listed or excluded like the others.
 
 **Per-parameter coverage (the D-001 fix, §3.3).** `uncertainty.excluded` accepts `{parameter: <name>,
 reason}` as well as `{kind, reason}`.
 
-**Per-draw re-optimisation over a joint package space.** One final-size solve per package per draw: 4,368
-packages × 1,000 draws × about 1 ms is about 75 s on one core. This is cheap enough that `direct`
-evaluation stays the default for the compartmental engine, and no emulator is needed.
+**Per-draw re-optimisation over a joint package space.** One batched Starsim sim per draw evaluates every
+package of the unit (§1.1): 1,000 draws is about 1–2 minutes on one core, to be measured in δ. `direct`
+evaluation stays the default for the compartmental engine, with the emulator path as the fallback.
 
 **New decision-test types.**
 - `prior_range`: each parameter classified prior-dominated (§3.2) is set to each end of its declared range,
   and the plan or threshold decision is recomputed. The harness generates one automatically for every
   prior-dominated parameter that the decision depends on. The spec may not remove it.
 - `structure`: the analysis is re-run with an alternative engine configuration named in the signed spec,
-  for example `structure: cell` versus `main_effects`, forced versus unforced renewal, or observation model
-  (a) versus (b). It reports whether the plan, or the threshold decision, changes.
+  for example `structure: cell` versus `main_effects`, forced versus unforced renewal, or an alternative
+  measurement-bias model for one observation source (§3.4). It reports whether the plan, or the threshold
+  decision, changes.
 
 **Existing types.** `envelope` takes a resource amount as well as US dollars. On an `estimates`
 deliverable, the "plan changes" criterion becomes "the threshold decision changes" (`share_units_changed`
@@ -268,7 +293,8 @@ is not applicable).
 ### 3.1 A `posterior` calibration method for low-dimensional problems
 
 Compartmental calibrations have few global parameters: for example `q` plus seeding, `R0` plus reporting
-plus dispersion, or one factor per unit. Each comes with a declared prior. The method:
+plus dispersion, or latent coverage per unit with a few measurement-bias parameters per source (§3.4).
+Each comes with a declared prior. The method:
 
 ```yaml
 calibration:
@@ -276,15 +302,23 @@ calibration:
   priors:                                     # every parameter the calibration may move, with its source
     reporting: {dist: loguniform, range: [0.0333, 0.333], source: "<citation or the question>", verified: unverified}
   targets:
-    - {csv: ..., kind: incidence_series | survey_proportion | group_attack_rate | count_panel, ...,
-       observation: negbin | binomial | poisson, links: {...}}
-  per_unit: [kappa]                           # optional: independent per-unit parameters (posterior factorises by unit)
+    - {source: <observation source id, §3.4>, kind: incidence_series | survey_proportion | group_attack_rate
+       | coverage_report | count_panel, ..., observation: negbin | binomial | betabinomial | poisson, links: {...}}
+  per_unit: [<latent quantity>]               # optional: per-unit parameters (the posterior factorises by unit
+                                              # only when no shared bias parameter links the units)
 ```
 
 **Observation models** (new, `toolkit/analysis/observation.py`, harness): Poisson, negative binomial
-(dispersion as a parameter with a prior) and binomial. A reporting or detection fraction is an
-**observation parameter**, never an engine parameter. So engines stay mechanistic, and the data-quality
+(dispersion as a parameter with a prior), binomial and beta-binomial (for a declared design effect). Each
+target names its **observation source**, and the source declares its sampling frame and measurement-bias
+model (§3.4). A reporting or detection fraction is one such measurement-bias parameter, of a
+case-notification source, never an engine parameter. So engines stay mechanistic, and every data-quality
 assumption is visible in the spec.
+
+**Calibrating latent immunity does not need the epidemic.** When the targets observe coverage or immunity
+only (not cases), the likelihood needs the initialiser's output, not a run. The engine exposes an optional
+`initial_state(params, unit)` beside `run_batch()`, checked against the sim's state at its first step, so
+these fits cost microseconds per point even with many bias parameters.
 
 **Sampler**, chosen by dimension and reported:
 - up to 4 parameters: a scrambled Sobol design of 2^14 points over the prior, with importance weights from
@@ -374,17 +408,118 @@ midpoint.
   the critique YAML is. The test therefore rebuilds the case on the toy engine with likelihood calibration:
   draws that vary only `lrr:*` must fail, and full MVN draws must pass.
 
+### 3.4 Observation sources: a sampling frame and a measurement model for each (decided 2026-11-01, owner)
+
+The owner's answer: "admin coverage can be wrong and so can serosurvey, it depends on the sampling frame
+and the bias of the measurement." So no source is primary truth, and none is reconciled to another by a
+fitted correction factor (owner rule: model the mechanism, never a fitted fudge). The per-unit factor
+`kappa` of the first draft is withdrawn.
+
+**The model.** The quantity of interest is **latent**: the true immunity, coverage or incidence per unit
+(and per cohort or group). Each data set is an **observation source** that sees the latent quantity
+through two declared parts:
+- **(a) a sampling frame**: who could have been counted or sampled, and how. The frame decides which
+  population the observation describes, which may not be the unit's whole population.
+- **(b) a measurement process**: the named bias mechanisms and the error between the frame's true value and
+  the reported value.
+
+Bias mechanisms are parameters with priors (published where available, with a source). They are named from
+a closed vocabulary, each with a fixed functional form, so a bias is always a mechanism with a meaning and
+never a free multiplier.
+
+**Worked example: measles immunity by birth cohort.** The latent quantities are the true coverage `c_k` of
+each dose, per unit and birth cohort, and from them (with seroconversion) the immune share (§1.1).
+
+| Source | (a) Sampling frame | (b) Measurement process |
+|---|---|---|
+| Administrative coverage (doses reported / estimated target population) | every facility that reports, over the target population as projected | `numerator_inflation`: reported doses = true doses × (1 + ω), from over-reporting and doses given to children outside the target; `denominator_error`: target estimate = true target × (1 + δ), from census projections and migration. Observed coverage = `c_k · (1 + ω)/(1 + δ)`, so it can exceed 1. Reporting noise. Facilities that do not report are a frame gap |
+| Coverage survey, card or recall (household cluster survey) | households in the sampled clusters of the survey frame; the frame excludes some populations (for example insecure areas, nomadic or institutional populations), declared with their share of the unit | `recall_bias` in children without cards, and the card-retention difference; sampling error with the survey's design effect (beta-binomial) |
+| Serosurvey (cluster sample, assay) | as for the household survey, or the facility or school frame it used | `assay_sensitivity` and `assay_specificity`: observed positivity = Se · p + (1 − Sp)(1 − p); `antibody_waning`: protected people who have fallen below the assay cut-off, by years since vaccination; `maternal_antibody`: infants positive without vaccine immunity (an age band below a declared bound, modelled or excluded); design effect |
+
+- **Frame gaps are modelled, not ignored.** A survey's latent value is the immunity of the frame
+  population. The unit's immunity mixes the frame population and the out-of-frame share `φ` (from the
+  frame's documentation or the census), with a prior on the out-of-frame relative immunity.
+- **What is identifiable.** A bias parameter is identified only where sources **overlap**: the same unit,
+  cohort and period seen through different frames and bias mechanisms. Administrative data alone identify
+  only `c_k (1 + ω)/(1 + δ)`, so ω and δ trade off exactly, and both trade off against `c_k`. A serosurvey in
+  the same cohorts pins `c_k` up to the assay and waning terms, and with them the ratio
+  `(1 + ω)/(1 + δ)`, but still not ω and δ separately. The pre-model arithmetic
+  (`pre-model-identifiability-arithmetic`) states this before calibration, and the measures of §3.2 confirm
+  it after.
+- **What the harness reports.** Every bias parameter is classed with §3.2's classes (`identified`,
+  `partly_identified`, `prior_dominated`, with `on_ridge` where it trades off). The report's "what the data
+  do and do not determine" section lists them per source. Prior-dominated bias parameters keep their full
+  prior range in the draws, get the automatic `prior_range` decision test, and are named in the interval
+  label ("its width is set mainly by the declared denominator error of the administrative coverage,
+  −10% to +25%"). So the decision carries the measurement uncertainty, not just the sampling error.
+
+**How the spec declares a source.**
+
+```yaml
+observations:
+  sources:
+    - id: admin_mcv1
+      measures: dose_coverage             # closed: dose_coverage | seropositivity | case_notifications | ...
+      latent: {quantity: coverage, dose: 1, by: [unit, birth_year]}
+      frame:
+        design: administrative            # administrative | cluster_survey | facility_based | sentinel
+        population: "target population as projected by <source>"
+        excluded: []                      # each {who, share | share_column, relative_value_prior}
+      bias:
+        - {mechanism: numerator_inflation, param: omega_admin, prior: {...}, source: "<citation>", verified: unverified}
+        - {mechanism: denominator_error, param: delta_admin, prior: {...}, source: "<citation>", verified: unverified}
+      noise: {model: normal_logit, sd_prior: {...}}
+    - id: sero_2024
+      measures: seropositivity
+      latent: {quantity: immunity, by: [unit, birth_year]}
+      frame: {design: cluster_survey, design_effect: 2.1, excluded: [{who: "...", share: 0.06, relative_value_prior: {...}}]}
+      bias:
+        - {mechanism: assay_sensitivity, param: se_igg, prior: {...}, source: "<assay validation>"}
+        - {mechanism: assay_specificity, param: sp_igg, prior: {...}, source: "<assay validation>"}
+        - {mechanism: antibody_waning, param: wane_rate, prior: {...}, source: "<citation>"}
+        - {mechanism: maternal_antibody, handling: exclude_below_age, bound_months: 9}
+```
+
+- `bias: none` is allowed only with a stated reason, and the label then says "assumed unbiased: <source>
+  (<reason>)".
+- Bias parameters are shared across units by default. A per-unit bias needs its own declared prior; it is
+  then one more latent quantity, not a fit to the residual.
+- The generic vocabulary covers the other families: case notifications have a reporting fraction
+  (`under_ascertainment`) and a reporting delay; a screening panel has a detection fraction. Measles is the
+  worked example, not a special case.
+
+**Structural checks** (schema and contract, fail closed, version-2 specs):
+- `observation_source_undeclared` (HIGH): a calibration target, or a unit attribute that comes from data,
+  that names no declared source, or a source without a `frame` or a `bias` entry.
+- `bias_without_mechanism` (HIGH): a bias parameter whose mechanism is not in the closed vocabulary, or
+  that has no prior and source. A free per-unit factor is refused by this check.
+- `frame_gap_unmodelled` (MEDIUM): a source whose frame excludes part of a population that the decision
+  covers, with no out-of-frame share and prior.
+- `single_source_treated_as_truth` (HIGH): a latent quantity observed by one source whose bias parameters
+  are all fixed or `none` without a reason.
+
+**Critic check.** `critique-domain` reads each declared frame and bias list against the source's own
+documentation (survey report, assay validation, the denominator's source) and raises a blocker for a
+missing mechanism that the documentation names. This is a judgement, recorded as a critique blocker, and
+it does not replace the structural checks.
+
 ## 4. Engine card and `engine_needs` vocabulary
 
 Today `card_fits()` matches names only (components, outputs, windows, attributes). A configured engine
 (the package-rate engine takes its components from the spec) therefore fits almost any spec. The proposal
-is a closed vocabulary of **capabilities**, defined in `toolkit/engines/contract.py` (a typo fails closed).
-It goes on `EngineCard.capabilities`, optional with default `{}`, so existing cards load unchanged.
+is a closed vocabulary of **capabilities**, defined in a new `toolkit/engines/capabilities.py` (a typo
+fails closed). **`contract.py` is unchanged** (decided 2026-11-01, owner): `EngineCard` gains no field, and
+no engine's code fingerprint changes, so the malaria pack needs no re-stamp. Capabilities are read from
+each engine's `card.yaml`, which is not fingerprinted; the empirical and compartmental engines gain one.
+An engine without capabilities in its card has none, so it matches only version-1 specs, as today.
 
-**Capabilities come from the resolved configuration** (Codex review, finding 14). `describe()` is called on
-the engine as configured, so a compartmental engine configured for `final_size` does not advertise
-`incidence_series`. The empirical engine advertises `produced` only with `structural_zero` set. The card file
-may list the family's capabilities for documentation, but matching uses the configured card.
+**Capabilities come from the resolved configuration** (Codex review, finding 14). The card lists a base set
+and a `by_config` map from configuration fields to the values they add (for example `mode: windowed` adds
+`incidence_series` and `growth_rate`). `capabilities.resolve(engine)` reads the engine's configuration and
+returns the set for that configuration, so a compartmental engine configured `to_extinction` does not
+advertise `incidence_series`. The empirical engine advertises `produced` only with `structural_zero` set. A
+configuration field the map does not know fails closed. A self-test checks that every configuration field
+the map names exists on the engine, so the card cannot drift from the code unnoticed.
 
 Some spec contents do not determine the dynamics: an allocation with a count panel could suit an endemic
 engine or an empirical one. For those, the spec carries a typed `engine_needs.dynamics`, signed with the
@@ -397,7 +532,7 @@ once two engine families could fit.
 | `outcome_role` | per outcome: `prevented`, `produced` | `objective.sense` |
 | `intervention_action` | `reduce_rate`, `remove_susceptible_all_or_nothing`, `reduce_susceptibility_leaky`, `detect` | `options.components.<c>.action` (new optional field) |
 | `structure` | `single_group`, `age_groups_contact_matrix`, `birth_cohorts` | `decision_units.populations` (several groups with a matrix, or cohorts) |
-| `calibration_data` | `count_panel`, `survey_proportion`, `group_attack_rate`, `incidence_series`, `coverage_history` | `calibration.targets[].kind` |
+| `calibration_data` | `count_panel`, `survey_proportion`, `group_attack_rate`, `incidence_series`, `coverage_report` | `calibration.targets[].kind` |
 | `estimands` | `r0`, `reff_start`, `reff_end`, `attack_rate`, `growth_rate`, `p_major` | `deliverable.outputs[].metric` |
 | `decision_coupling` | `independent_units`, `joint_within_unit` | `options.quantities` present → `joint_within_unit` |
 
@@ -413,7 +548,7 @@ once two engine families could fit.
   version-1 spec whose draws hold a calibrated quantity at its estimate gets the finding. For a kind-level
   exclusion of `calibration`, the label already says calibration is not covered, so it passes. SP-a7 runs
   every existing self-test spec and fixture unchanged.
-- **Malaria card.** It gains `dynamics: agent_based_endemic`, `outcome_role: {cases: prevented, ...}` and
+- **Malaria card.** Its `card.yaml` gains `dynamics: agent_based_endemic`, `outcome_role: {cases: prevented, ...}` and
   `intervention_action: [reduce_rate]`. So it is no longer eligible for a final-size or renewal spec, and the
   compartmental engine is not eligible for an endemic vector-borne allocation.
 - **Explicit `engine_needs`.** When a version-2 spec gives `engine_needs` explicitly (allowed today), the
@@ -437,22 +572,28 @@ needs `components`, so it cannot be benchmarked as it stands. The changes:
 - `results.yaml` lists the configurations validated.
 
 A run may use a configuration only if it was validated, or if every field that changes the dynamics (the
-solver, the initialiser, `structure`, `reference`) matches a validated configuration. Sizes and names may
+run mode, the initialiser, `structure`, `reference`) matches a validated configuration. Sizes and names may
 differ.
 
-**Compartmental engine, `final_size` solver**
+Every compartmental benchmark below runs the **Starsim engine** and compares it with an oracle written
+inside the pack: a closed form, the final-size fixed point, or the pack's reference ODE. The oracles are
+not engines and are never exposed to runs (§1.1). The oracle's final size includes the seed term, so the
+comparison is exact up to the engine's stop tolerance.
+
+**Compartmental engine, `to_extinction` mode**
 
 | ID | Result | Source | Band |
 |---|---|---|---|
-| FS1 | single-group final size `z = 1 − exp(−R0 z)` at R0 = 1.5, 2, 4, 12, 18 | Kermack–McKendrick (1927); closed form via the Lambert W function | abs. 1e-8 |
-| FS2 | R0 ≤ 1 gives no major outbreak (z = 0); R0 = 1 + ε gives z ≈ 2ε | threshold theorem | abs. 1e-6 |
+| FS1 | single-group final size `z = 1 − exp(−R0 z)` at R0 = 1.5, 2, 4, 12, 18 | Kermack–McKendrick (1927); closed form via the Lambert W function | abs. 1e-6 |
+| FS2 | R0 ≤ 1 gives no major outbreak: the attack rate stays below the seed-size bound `seed/(1 − R0)`; R0 = 1 + ε gives z ≈ 2ε | threshold theorem | abs. 1e-6 (seed 1e-9) |
 | FS3 | multigroup with a rank-one (proportionate) matrix reduces to the scalar relation | Ma & Earn (2006), *Bull Math Biol*; Andreasen (2011) | rel. 1e-6 |
 | FS4 | all-or-nothing vaccination of a share v: whole-population attack rate `z = s·x`, with `s = 1 − v·e` and `x = 1 − exp(−R0 s x)` (x is the attack rate among those left susceptible); both denominators checked (R0 = 3, v·e = 0.5 gives x = 0.5828, z = 0.2914); zero at `v·e ≥ 1 − 1/R0` (Codex review, finding 3) | herd-immunity identity | rel. 1e-8 |
 | FS5 | `R0` from the next-generation matrix equals the growth-rate-consistent R0 of the reference ODE | Diekmann, Heesterbeek & Metz (1990) | rel. 1e-6 |
 | FS6 | multigroup final size equals the reference ODE run to extinction, for 3 contact matrices (identity, rank-one, an asymmetric 5×5) | the pack's ODE (`solve_ivp`, rtol 1e-10) | abs. 1e-5 |
+| FS8 | the final size is the same at `dt` of one day and one week, and the step cap is never reached in FS1–FS6 | exponential-survival identity (§1.1) | rel. 1e-6 |
 | FS7 (held out) | published age-specific final sizes from a contact-matrix model | candidates: Mossong et al. (2008) POLYMOD-based results; Wallinga, Teunis & Kretzschmar (2006, *AJE*) age-specific attack-rate fit. Values are transcribed with a quoted span through the evidence service before the pack is written; until then the benchmark is `not_assessable` | the paper's reported precision |
 
-**Compartmental engine, `renewal` solver**
+**Compartmental engine, `windowed` mode**
 
 | ID | Result | Source | Band |
 |---|---|---|---|
@@ -469,7 +610,9 @@ differ.
 |---|---|---|
 | CI1 | susceptibility after doses with given coverages and seroconversion, `independent` and `nested` dependence, against hand-computed values | abs. 1e-12 |
 | CI2 | a cohort's susceptibility is invariant to the survey-year/decision-year shift (birth-year indexing) | exact |
-| CI3 | a mixed-cohort survey band's expected positivity equals the population-weighted mean of its cohorts | abs. 1e-12 |
+| CI3 | a mixed-cohort survey band's expected positivity, with Se = Sp = 1 and no waning, equals the population-weighted mean of its cohorts | abs. 1e-12 |
+| CI4 | `initial_state()` equals the Starsim sim's state at its first step, for both initialisers | abs. 1e-12 |
+| OB1 | each bias mechanism's forward map against hand-computed values (for example admin coverage `c(1 + ω)/(1 + δ)`, positivity `Se·p + (1 − Sp)(1 − p)`, a frame gap mixing `φ`) | abs. 1e-12 |
 
 **Empirical engine, yield mode**
 
@@ -482,8 +625,9 @@ differ.
 **Coverage pack (`coverage.yaml`)**
 
 The pack uses simulation-based calibration of the harness calibration plus uncertainty chain. Its
-synthetic generator is the reference ODE or an independent Poisson generator, not the engine under test.
-Each case runs 200 replicates.
+synthetic generator is the reference ODE, an independent Poisson generator, or (for SB3) an independent
+generator of latent coverage and of each source's frame and biases, never the engine or the observation
+code under test. Each case runs 200 replicates.
 
 **What identifies a reporting fraction in a renewal fit.** Whether forcing is present does not decide it
 (Codex review, finding 11). Reporting is identified when the observed series shows substantial depletion
@@ -504,12 +648,17 @@ synthetic case, computed from its known generator, not asserted.
 | SB2a | confounded: the series is truncated before depletion | coverage of the attack rate in [0.90, 0.99] **with** the prior range carried; `reporting` classed `prior_dominated` or `on_ridge` in ≥ 90% of replicates; coverage **below 0.80** when `reporting` is fixed at its prior median (the negative control that reproduces the v1 failure) |
 | SB2b | confounded: unknown initial susceptible share (declared prior) plus unknown forcing amplitude, complete series | as SB2a, and the ridge reported names reporting with the susceptible share |
 | SB2c | identified despite known forcing: known susceptibility and depletion | as SB1 (guards against classing every forced fit as non-identified) |
-| SB3 | survey-calibrated cohort immunity (per-unit `kappa`) | coverage of the unit susceptible share in [0.90, 0.99] |
+| SB3a | cohort immunity from two overlapping sources (administrative coverage with numerator inflation and denominator error, and a serosurvey with assay error, waning and a frame gap), biases drawn from their priors | coverage of the unit susceptible share in [0.90, 0.99]; the coverage-to-immunity ratio identified, ω and δ separately classed `prior_dominated` or `on_ridge` in ≥ 90% of replicates |
+| SB3b | negative controls for SB3a: (i) administrative coverage taken as the truth; (ii) the serosurvey taken as the truth | each below 0.80 coverage of the susceptible share (the "one source is primary" error the owner's rule excludes) |
+| SB3c | administrative coverage only | every bias parameter classed `prior_dominated`; coverage in [0.90, 0.99] with the prior ranges carried |
 | SB4 | yield-mode panel (unit rates and package ratios) | coverage of the plan total in [0.90, 0.99]; the D-001 negative control (unit rates held at the MLE) is below the band |
 | SB5 | group-attack-rate calibration of `q` | coverage of hospitalisations-averted for a fixed plan in [0.90, 0.99] |
 
-**Held-out benchmarks and gating.** The held-out published benchmarks (FS7, RN5) are reported but do not
-block until their values are transcribed. The analytic identities (FS1–6, RN1–4, CI, EY) and the coverage
+**Held-out benchmarks and gating** (decided 2026-11-01, owner: use the engine before they are transcribed,
+labelled). The held-out published benchmarks (FS7, RN5) are reported as `not_assessable` and do not block
+until their values are transcribed. Until then, every report from the engine carries a harness-rendered
+label: "validated against analytic identities and simulation-based coverage; published benchmarks FS7 and
+RN5 not yet assessed". The analytic identities (FS1–8, BR1, RN1–4, CI1–4, OB1, EY1–3) and the coverage
 pack must pass before any run uses the engine, and `card.yaml` records `results.yaml`'s sha256 as the
 malaria card does. Every pack result carries the engine's code fingerprint, so a code change invalidates
 it.
@@ -518,45 +667,39 @@ it.
 
 | Commit | Content | Tests written first (each must fail on 881e90c) |
 |---|---|---|
-| α spec | `sense` (`maximise`, `minimise` alias); `headline.quantity`; `constraints.resources`; `options.quantities` with caps and the joint-package limit; `deliverable.kind: estimates` with the threshold rule; `priors` and `observation` kinds; per-parameter exclusions; `schema_version: 2` gating of the new obligations; `capabilities` vocabulary (contract.py, or capabilities.py per open question 10) with configured-card matching; `engine_needs` derivation and the superset check; the sense/outcome-role check; the malaria re-stamp if (a) | SP-a1 `maximise` validates and `avert` specs are byte-identical after load; SP-a2 maximising a `prevented` outcome is refused; SP-a3 quantity expansion yields C(16,5) level sets for 11 steps over 5 groups, distinct level components per group, and drops capped ones; SP-a4 an over-limit joint space is refused; SP-a5 an `estimates` spec without options validates; SP-a6 a needs-superset violation is refused; SP-a7 every existing self-test spec and fixture validates unchanged and derives no capability needs; SP-a8 a `final_size`-configured card does not match an `incidence_series` need |
-| β analysis | one `benefit()` function used by evaluate, summary, uncertainty and interaction tests; `summary()` totals; posterior folds and `|optimum − comparator|` normalisation in stability; resource caps into toolkit/alloc; the `estimates` path (not-applicable artifacts); observation models; `posterior` calibration; likelihood identifiability plus contraction classes; ridge refusal in `likelihood`; draw provenance (canonical sample id and row, applied values including `zs`) and the label from it; `analysis_contract_uncovered_parameter`; `prior_range` and `structure` decision tests | AN-b1 the toy engine with a produced outcome: the maximise plan equals the brute-force optimum; AN-b2 the D-001 rebuild fails the new check and full draws pass; AN-b3 a ridge panel stops with `calibration_ridge` (today: jittered MVN); AN-b4 a prior-dominated toy parameter gets an automatic `prior_range` test and is named in the label; AN-b5 a threshold decision on toy draws gives yes/no/undetermined at the right probabilities; AN-b6 a maximise headline interval has the same sign as its point value (today's `uncertainty.run()` would flip it); AN-b7 a posterior-calibrated allocation runs its stability folds instead of reporting "nothing calibrated"; AN-b8 a product-only-identified pair under narrow priors is classed `on_ridge`, not `identified`; AN-b9 draws at half the posterior sd fail the provenance check |
+| α spec | `sense` (`maximise`, `minimise` alias); `headline.quantity`; `constraints.resources`; `options.quantities` with caps and the joint-package limit; `deliverable.kind: estimates` with the threshold rule; `priors` and `observation` kinds; per-parameter exclusions; `schema_version: 2` gating of the new obligations; `observations.sources` with frames, the closed bias-mechanism vocabulary and the four structural checks (§3.4); `capabilities` vocabulary in `capabilities.py`, read from `card.yaml` with `by_config` resolution (`contract.py` unchanged); `engine_needs` derivation and the superset check; the sense/outcome-role check | SP-a1 `maximise` validates and `avert` specs are byte-identical after load; SP-a2 maximising a `prevented` outcome is refused; SP-a3 quantity expansion yields C(16,5) level sets for 11 steps over 5 groups, distinct level components per group, and drops capped ones; SP-a4 an over-limit joint space is refused; SP-a5 an `estimates` spec without options validates; SP-a6 a needs-superset violation is refused; SP-a7 every existing self-test spec and fixture validates unchanged and derives no capability needs; SP-a8 a `to_extinction`-configured card does not match an `incidence_series` need; SP-a9 a target with no declared source, a bias with no mechanism or prior, and a free per-unit factor are each refused; SP-a10 `contract.py` and the malaria engine's code fingerprint are byte-identical to 881e90c |
+| β analysis | one `benefit()` function used by evaluate, summary, uncertainty and interaction tests; `summary()` totals; posterior folds and `|optimum − comparator|` normalisation in stability; resource caps into toolkit/alloc; the `estimates` path (not-applicable artifacts); observation models and the per-source measurement model (frames, bias mechanisms, frame gaps); `posterior` calibration, using `run_batch()` and `initial_state()` when an engine has them; likelihood identifiability plus contraction classes; ridge refusal in `likelihood`; draw provenance (canonical sample id and row, applied values including `zs`) and the label from it; `analysis_contract_uncovered_parameter`; `prior_range` and `structure` decision tests | AN-b1 the toy engine with a produced outcome: the maximise plan equals the brute-force optimum; AN-b2 the D-001 rebuild fails the new check and full draws pass; AN-b3 a ridge panel stops with `calibration_ridge` (today: jittered MVN); AN-b4 a prior-dominated toy parameter gets an automatic `prior_range` test and is named in the label; AN-b5 a threshold decision on toy draws gives yes/no/undetermined at the right probabilities; AN-b6 a maximise headline interval has the same sign as its point value (today's `uncertainty.run()` would flip it); AN-b7 a posterior-calibrated allocation runs its stability folds instead of reporting "nothing calibrated"; AN-b8 a product-only-identified pair under narrow priors is classed `on_ridge`, not `identified`; AN-b9 draws at half the posterior sd fail the provenance check; AN-b10 on a toy latent quantity seen by two sources, a bias parameter seen by one source only is classed `prior_dominated`, gets a `prior_range` test and is named in the label |
 | γ empirical yield | `reference`, `structural_zero`, `structure: main_effects \| cell`; card capabilities; pack EY1–3 and SB4 | EY1–3 as in §5; E5 the old constructor's outputs are unchanged |
-| δ compartmental engine | groups, contact matrix, initialisers (`given`, `cohort_history`), components, `final_size` and `renewal` solvers, card; the pack's reference ODE; runner estimand types `value`, `identity` and `coverage`, and pack `configs` carried through workers, cache keys and identity; multitype extinction; packs FS, BR, RN, CI and SB1–3, SB5 | contract test (`check_engine`); FS1–6, BR1, RN1–4, CI1–3 written as failing tests before the solvers (RN2 includes the linear-form negative control); SB1–SB3 and SB5 run on the dev VM |
-| ε wiring and retro | register the engine in `ENGINES`; capabilities on the malaria card; the planner's `decision-spec` skill gains the new fields (vocabulary only, no thresholds); CHANGELOG row and `improvement-plan.md` update; local dry run of each family's spec on the harness with **no model calls** (hand-written specs from the public inputs, kept out of the repository) to confirm each validates, chooses the right engine and produces every artifact | T-e1 engine choice selects exactly one eligible engine for each of the four family specs and the malaria spec; T-e2 every script's `--self-test` passes |
+| δ compartmental engine (Starsim) | first, a runtime spike on the dev VM: one `ss.Module` with the exponential-survival step, timed per sim and per batch of 1,024 (the go/no-go for `direct` evaluation, §1.1). Then the `GroupEpidemic` module, start-of-sim interventions, `ss.Result` outputs, groups and contact matrix, initialisers (`given`, `cohort_history`), `to_extinction` and `windowed` modes, `run_batch()` and `initial_state()`, multitype extinction for `p_major`, `card.yaml`; the pack's oracles (closed forms, final-size fixed point, reference ODE); runner estimand types `value`, `identity` and `coverage`, and pack `configs` carried through workers, cache keys and identity; packs FS, BR, RN, CI, OB and SB1–3, SB5 | contract test (`check_engine`), plus outputs identical across seeds and `run_batch()` equal to `run()`; FS1–8, BR1, RN1–4, CI1–4, OB1 written as failing tests before the module (RN2 includes the linear-form negative control); SB1–SB3 and SB5 run on the dev VM |
+| ε wiring and retro | register the engine in `ENGINES`; capabilities in the malaria `card.yaml`; the planner's `decision-spec` skill gains the new fields (vocabulary only, no thresholds); CHANGELOG row and `improvement-plan.md` update; local dry run of each family's spec on the harness with **no model calls** (hand-written specs from the public inputs, kept out of the repository) to confirm each validates, chooses the right engine and produces every artifact | T-e1 engine choice selects exactly one eligible engine for each of the four family specs and the malaria spec; T-e2 every script's `--self-test` passes |
 
 **Cost (estimates, to be confirmed before spending).**
-- **VM.** The pack work is light: analytic checks run in seconds. The coverage pack is 7 cases × 200
-  replicates × one calibration (under 1 s for Sobol importance sampling on vectorised numpy): about
-  30–60 minutes on the 8-vCPU dev VM with set-up, under US$5. Nothing heavy runs on the laptop.
-- **Malaria re-stamp** (Codex review, finding 16). `code_fingerprint()` hashes `toolkit/engines/contract.py`
-  for every engine. Adding `EngineCard.capabilities` and the vocabulary therefore invalidates the malaria
-  engine's `results.yaml`, and with it its benchmark-backed decision tests. Two options:
-  - (a) re-stamp. Run the malaria pack with `fit_and_run.sh` in run-only mode, with no refit, on the
-    Coiled VM, as v2a κ did. This is several VM-hours. The cost is to be measured; the estimate is
-    US$10–30, so owner approval is needed.
-  - (b) keep `contract.py` byte-identical. The vocabulary and its check live in a new
-    `toolkit/engines/capabilities.py`. Each engine exposes an optional `capabilities()` method, which
-    `card_fits()` reads, and an engine without it has none. The malaria engine's own directory still changes
-    to add the method, which also changes its fingerprint. So (b) is only free if the malaria card's
-    capabilities come from its `card.yaml`, which is not fingerprinted. That is less clean, but needs no
-    re-stamp.
-
-  The note recommends (a), batched with α, and raises the choice as open question 10.
+- **VM.** The analytic checks run in seconds. The coverage pack is 10 cases × 200 replicates × one
+  calibration. With batching, a renewal fit is a few seconds and an immunity fit (initialiser only) well
+  under one, so about 1–2 hours on the 8-vCPU dev VM with set-up and the δ runtime spike, under US$5, to be
+  measured. Nothing heavy runs on the laptop.
+- **No malaria re-stamp** (Codex review, finding 16; decided 2026-11-01, owner). `code_fingerprint()`
+  hashes `toolkit/engines/contract.py` for every engine, so changing it would invalidate the malaria
+  `results.yaml`. `contract.py` stays byte-identical, capabilities live in `capabilities.py` and the cards'
+  `card.yaml`, and the optional `run_batch()` and `initial_state()` methods are on the new engine only.
+  SP-a10 checks that the malaria fingerprint is unchanged. No VM time is needed for the malaria pack.
 - **Model calls.** One v2 run per question, four runs, after ε merges. This note does not have a measured
   per-run spend for v2. It should be read from the first blind run's `run_state.json` before asking. As
   a planning range: US$15–40 per run, US$60–160 for four. This is above the US$10 approval line, so the
   runs wait for an explicit owner go-ahead with the measured figure.
 
 **Out of scope.**
-- An ODE solver exposed to runs (timing, peaks, vaccination during the season).
+- A continuous-time run mode exposed to runs (timing, peaks, vaccination during the season).
+- Any analytic solver exposed to runs; they stay as the pack's oracles.
 - Leaky protection.
 - Births, deaths, waning and migration.
-- Stochastic or agent-based versions.
+- Stochastic (chain-binomial) or agent-based versions of the Starsim engine.
 - Coupling between decision units (spatial transmission; LASER later).
 - Hierarchical pooling across units beyond `main_effects`/`cell`.
 - An optimiser for joint package spaces above the limit.
 - Cost-effectiveness of a campaign when no costs are given.
-- The evidence service (priors stay `unverified` with a source until V5).
+- The evidence service (priors, including the measurement-bias priors, stay `unverified` with a source
+  until V5).
 - Deleting gate checks the new contract check supersedes (listed in the PR, not deleted).
 
 ## 7. Risks and open questions for the owner
@@ -567,36 +710,50 @@ it.
    - the label and the "what the data do not determine" section name the parameter and its range;
    - the `prior_range` test shows whether the decision depends on it;
    - the priors are in the signed spec.
-2. **Structure choice is still a choice.** Forced or unforced renewal, and observation model (a) or (b),
-   can change the answer. The `structure` test reports it, but the primary structure is signed, not
+2. **Structure choice is still a choice.** Forced or unforced renewal, and which bias mechanisms a source
+   declares, can change the answer. The `structure` test reports it, but the primary structure is signed, not
    learned.
 3. **Final-size outcomes ignore timing.** Final size is wrong for decisions where the epidemic is
-   interrupted (by a season's end or a mid-epidemic intervention). The card states this range, and the
-   ODE solver is the planned extension.
+   interrupted (by a season's end or a mid-epidemic intervention). The card states this range, and a
+   continuous-time run mode of the same Starsim module is the planned extension.
 4. **The joint-package limit.** The limit makes larger dose-allocation problems fail closed rather than be
    solved approximately.
 5. **Coverage pack noise.** 200 replicates give about ±1.5% on the coverage estimate. A borderline engine
    could pass or fail by chance. The pack therefore fixes its seeds and reports the binomial interval.
+6. **Measurement-bias priors are thin.** Published values for over-reporting, denominator error,
+   out-of-frame immunity and antibody waning are scattered and context-specific. Where only one source
+   observes a quantity, the answer's width is set by these priors. Mitigations: they are named in the
+   label, tested by `prior_range`, stay `unverified` with a source until the evidence service (V5), and
+   `critique-domain` checks them against the source documents.
+7. **Starsim runtime.** The batching estimate (§1.1) is not yet measured. The δ spike measures it first;
+   above 5× the estimate the emulator path is used and the note returns to the owner before ε.
 
-**Open questions**
+**Open questions.** Questions 4, 5, 6 and 10 were answered by the owner on 2026-11-01; the others stand as
+proposed.
+
 1. **Sense vocabulary.** Is `maximise` plus `minimise` (as an alias of `avert`) right, or should `minimise`
    report levels only, with no "averted"?
 2. **Joint allocation as one decision unit with enumerated packages.** Is the limit of 50,000 packages
    acceptable, or is a structured optimiser (for example marginal-gain with a bound) wanted now?
 3. **Calibration method.** Adopt `posterior` (declared priors, Sobol importance sampling or adaptive
    Metropolis) beside `likelihood`, and refuse ridged likelihood fits instead of jittering them?
-4. **Survey reconciliation.** For cohort immunity, is a per-unit coverage-measurement factor (read as a
-   denominator error, with a prior) acceptable under "mechanisms over fitted correction factors", or
-   should survey-only (b) be primary?
-5. **Numpy/scipy, not Starsim,** for the compartmental engine?
-6. **Gating on published benchmarks.** May the engine be used while FS7 and RN5 are `not_assessable`
-   (values not yet transcribed), given that the analytic and coverage packs pass?
+4. **Survey reconciliation.** *Decided 2026-11-01 (owner).* Neither source is primary: administrative
+   coverage and serosurveys can both be wrong, depending on the sampling frame and the measurement bias.
+   Each source gets a declared frame and bias model, biases are parameters with priors, and the harness
+   reports which are identified (§3.4). The per-unit factor `kappa` is withdrawn.
+5. **Engine framework.** *Decided 2026-11-01 (owner).* Starsim, our own Python and Starsim code, never R,
+   malariasimulation, EMOD or another external simulator. Analytic solvers remain as test oracles in the
+   pack, not as the engine (§1.1).
+6. **Gating on published benchmarks.** *Decided 2026-11-01 (owner).* Yes: the engine may be used while
+   FS7 and RN5 are `not_assessable`, with a label on every report (§5).
 7. **Thresholds.** Do the proposed values suit you: contraction classes 0.1/0.5, ESS floor 1,000, R-hat
-   1.01, the coverage band [0.90, 0.99], the realised-spread ratio 0.5, and condition number 1e8? All of
+   1.01, the coverage band [0.90, 0.99], the realised-spread ratio 0.5, condition number 1e8, the
+   to-extinction stop tolerance `1e-9 · N`, and the 5× runtime trigger for the emulator fallback? All of
    them go in `thresholds.yaml`.
 8. **Spend.** Approval for four v2 runs after ε, at the spend measured from the first blind run.
 9. **Exact resource use.** Is `use: exactly` (spend every block) needed now? It needs lower bounds through pruning, the ILP, brute force and `check()`; without it, `at_most` is used and unused blocks are reported.
-10. **Malaria re-stamp.** (a) Put `capabilities` in `contract.py` and re-stamp the malaria pack (VM, roughly US$10–30, to be measured), or (b) keep `contract.py` byte-identical and read capabilities from card files?
+10. **Malaria re-stamp.** *Decided 2026-11-01 (owner).* Keep `contract.py` unchanged and read capabilities
+    from the engine cards (option b); no re-stamp (§4, §6).
 
 ## Addendum: Codex review round 1 (read-only, on e108b50)
 
@@ -622,4 +779,4 @@ claims were re-computed before editing:
 | 13 | new obligations broke version-1 specs | `schema_version: 2` opt-in; version-1 semantics unchanged except the D-001 check |
 | 14 | family capabilities do not certify a configuration | matching on the configured card; typed `engine_needs.dynamics` where the spec is ambiguous |
 | 15 | the runner cannot build configured engines | pack `configs` through workers, cache keys and identity |
-| 16 | changing `contract.py` invalidates malaria results | re-stamp (a) or a byte-identical contract (b): open question 10 |
+| 16 | changing `contract.py` invalidates malaria results | byte-identical contract, capabilities from `card.yaml` (owner decision, open question 10) |
