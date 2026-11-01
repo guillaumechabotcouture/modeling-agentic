@@ -1587,9 +1587,18 @@ def _self_test() -> int:
                                           "carried_forward": [], "blockers": []}, open(os.path.join(dd, V.FILENAMES[r]), "w"))
         dtf = {"kind": "decision_test_changes_plan", "severity": "HIGH", "stage": "ANALYZE", "key": "DT1",
                "claim": "DT1 changes the plan", "scope_declarable": True, "decision_bearing": True}
-        g = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False)
-        ok(_owner_rule() is None and g["action"] == "RUN_FAILED",
+        # main #85 is merged, so the rule is present here; T30 removes it for the call, T30b uses it.
+        _real_rule = globals()["_owner_rule"]
+        globals()["_owner_rule"] = lambda: None
+        try:
+            g = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False)
+        finally:
+            globals()["_owner_rule"] = _real_rule
+        ok(g["action"] == "RUN_FAILED",
            f"T30 without the owner rule the finding is not declarable: RUN_FAILED, not DECLARE_SCOPE ({g['action']})")
+        g = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False)
+        ok(_owner_rule() is not None and g["action"] == "AWAIT_OWNER",
+           f"T30b with the owner rule (main #85) the finding goes to the owner: AWAIT_OWNER ({g['action']})")
         seen = {}
 
         class Rule:

@@ -40,7 +40,11 @@ jobs:
       - name: Self-tests (every script with --self-test)
         run: |
           fail=0
-          for f in main.py $(git ls-files 'scripts/*.py' 'scripts/lib/*.py' 'toolkit/**/*.py' 'cloud/*.py'); do
+          # v2's harness modules under agents/ are listed by name (other agents/ files only mention
+          # --self-test in text, or run a live preflight).
+          for f in main.py $(git ls-files 'scripts/*.py' 'scripts/lib/*.py' 'toolkit/**/*.py' 'cloud/*.py') \
+              agents/stage_machine.py agents/findings_ledger.py agents/fix_loop.py \
+              agents/analysis_backend.py agents/v2_sdk_tasks.py; do
             case "$f" in */__init__.py) continue;; esac
             grep -q -- '--self-test' "$f" || continue
             echo "::group::$f"
