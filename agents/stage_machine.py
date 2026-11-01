@@ -273,9 +273,18 @@ def owned_path(root: str, rel: str, owned) -> bool:
     return False
 
 
+# Phase 49 β's sign-off lifecycle in v2: a fingerprinted request (scope_signoff.record) written at
+# AWAIT_OWNER and the owner's answers taken through the harness (harness_record), honouring the
+# run's signoff mode. Not wired yet (Codex round 1 on #98): until it is, decision-bearing findings
+# stay non-declarable rather than waiting in OWNER_DECISION for an answer nobody can give.
+OWNER_LIFECYCLE_WIRED = False
+
+
 def _owner_rule():
     """Phase 49 β's owner rule (scripts/scope_signoff.py with the validator's AWAIT_OWNER path),
-    or None when this checkout does not have both."""
+    or None when this checkout does not have both, or v2's sign-off lifecycle is not wired."""
+    if not OWNER_LIFECYCLE_WIRED:
+        return None
     import inspect
     import validate_critique_yaml as V
     try:
@@ -1587,18 +1596,16 @@ def _self_test() -> int:
                                           "carried_forward": [], "blockers": []}, open(os.path.join(dd, V.FILENAMES[r]), "w"))
         dtf = {"kind": "decision_test_changes_plan", "severity": "HIGH", "stage": "ANALYZE", "key": "DT1",
                "claim": "DT1 changes the plan", "scope_declarable": True, "decision_bearing": True}
-        # main #85 is merged, so the rule is present here; T30 removes it for the call, T30b uses it.
-        _real_rule = globals()["_owner_rule"]
-        globals()["_owner_rule"] = lambda: None
-        try:
-            g = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False)
-        finally:
-            globals()["_owner_rule"] = _real_rule
-        ok(g["action"] == "RUN_FAILED",
-           f"T30 without the owner rule the finding is not declarable: RUN_FAILED, not DECLARE_SCOPE ({g['action']})")
         g = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False)
-        ok(_owner_rule() is not None and g["action"] == "AWAIT_OWNER",
-           f"T30b with the owner rule (main #85) the finding goes to the owner: AWAIT_OWNER ({g['action']})")
+        ok(_owner_rule() is None and g["action"] == "RUN_FAILED",
+           f"T30 without the owner rule the finding is not declarable: RUN_FAILED, not DECLARE_SCOPE ({g['action']})")
+        # T30b (Codex round 1 on #98): main #85's rule is now in the checkout, but v2 does not yet
+        # write a fingerprinted request (scope_signoff.record) or take answers through the harness
+        # (harness_record), so AWAIT_OWNER would wait for an answer nobody can give. v2 stays fail
+        # closed until that lifecycle is wired.
+        import scope_signoff as _ss
+        ok(hasattr(_ss, "gate_findings") and not OWNER_LIFECYCLE_WIRED,
+           "T30b the owner rule is merged, and v2 does not use it until its sign-off lifecycle is wired")
         seen = {}
 
         class Rule:
