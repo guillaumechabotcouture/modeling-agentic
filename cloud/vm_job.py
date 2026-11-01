@@ -111,10 +111,22 @@ def _tarball(tree: str | None, src_dir: str | None) -> bytes | None:
 
 
 def _client(name):
-    c = rc.attach(name).get_client()
-    w = sorted(c.scheduler_info()["workers"])
+    """The VM cluster's client and its worker. The table is read with worker_side's bounded
+    reader (scheduler_info() is {} while the client is not connected; a closed client is
+    replaced from the cluster), so only a connected scheduler with no worker says so."""
+    cl, box = rc.attach(name), [None]
+
+    def client():
+        box[0] = ws.live_client(cl, box[0])
+        return box[0]
+
+    try:
+        w = sorted(ws.scheduler_workers(client, log=print))
+    except ws.SchedulerInfoUnavailable as e:
+        raise SystemExit(f"{name}: {e}") from e
     if not w:
         raise SystemExit(f"{name} has no worker yet")
+    c = client()
     c.upload_file(os.path.join(HERE, "worker_side.py"))   # the side functions below live in it
     return c, w[0]
 

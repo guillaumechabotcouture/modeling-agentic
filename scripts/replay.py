@@ -944,10 +944,10 @@ def _self_test() -> int:
                f"SQ4 a worker table that never appears stops the launch before any scaling: {type(e).__name__}: {e}")
         c = _SQClient([{}, {"workers": five}])
         try:
-            got = rq.case_workers(_sq_cluster([c]), c, 5, 2, log=lambda m: None)
+            got = rq.pick_case_workers(_sq_cluster([c]), c, 5, 2, log=lambda m: None)
         except Exception as e:  # noqa: BLE001
             got = f"{type(e).__name__}: {e}"
-        ok(got == sorted(five)[:2], f"SQ5 case workers are read once the table is populated: {got}")
+        ok(got == (c, sorted(five)[:2]), f"SQ5 case workers are read once the table is populated: {got}")
 
     if failures:
         print("SELF-TEST FAILURES:", *failures, sep="\n  - "); return 1

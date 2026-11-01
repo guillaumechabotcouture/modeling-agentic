@@ -979,6 +979,51 @@ def _security():
                     tls_client_key=pem("key.pem"), require_encryption=True)
 
 
+# The scheduler's worker table. distributed's Client.scheduler_info() returns {} (no
+# "workers" key) whenever the client is not connected: before its first identity reply,
+# while it reconnects, after a failed reconnect (PR #99: v2blind1's launch died on
+# KeyError: 'workers'). Every read here goes through cloud/worker_side.py's bounded
+# reader, which waits that out with doubling backoff and past the bound raises
+# SchedulerInfoUnavailable: an unpopulated identity is never read as "no workers".
+SCHED_ATTEMPTS, SCHED_DELAY_S = 6, 5.0                 # dispatch: up to ~2 min of waiting
+SCHED_SETTLE_ATTEMPTS, SCHED_SETTLE_DELAY_S = 3, 2.0   # settling a call that is ending
+
+
+def _worker_side():
+    """cloud/worker_side.py (imports nothing at module level), loaded once by path under a
+    private name, so a run's models/worker_side.py on sys.path cannot shadow it."""
+    mod = sys.modules.get("ma_compute_worker_side")
+    if mod is None:
+        spec = importlib.util.spec_from_file_location("ma_compute_worker_side",
+                                                      os.path.join(REPO, "cloud", "worker_side.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        sys.modules["ma_compute_worker_side"] = mod
+    return mod
+
+
+def _sched_workers(c, attempts=None, delay_s=None) -> dict:
+    """{address: info} from client `c`, read with worker_side's bounded reader."""
+    return _worker_side().scheduler_workers(
+        lambda: c, attempts=attempts or SCHED_ATTEMPTS, delay_s=SCHED_DELAY_S if delay_s is None else delay_s,
+        log=lambda m: print(f"compute: {m}", file=sys.stderr, flush=True))
+
+
+def _cancel_remote(c, call_id, exclude) -> dict:
+    """Ask every worker (but the excluded run workers) to stop `call_id`'s chunks. Raises
+    SchedulerInfoUnavailable when the worker table cannot be read: the caller then leaves
+    the stop unconfirmed instead of reaching no worker and calling that confirmed."""
+    w = _sched_workers(c, SCHED_SETTLE_ATTEMPTS, SCHED_SETTLE_DELAY_S)
+    return c.run(_cancel_call, call_id, workers=[a for a in w if a not in exclude])
+
+
+def _gone_workers(c, workers) -> list:
+    """`workers` no longer in the scheduler's table. Raises SchedulerInfoUnavailable when the
+    table cannot be read (the caller then charges every worker as busy for the call)."""
+    live = _sched_workers(c, SCHED_SETTLE_ATTEMPTS, SCHED_SETTLE_DELAY_S)
+    return [w for w in workers if w not in live]
+
+
 # Phase 45 δ (A16): a demand marker asks for this resource, which no worker has,
 # so it waits in the scheduler's unrunnable set and never runs.
 DEMAND_RESOURCE = "ma-compute-demand"
@@ -1041,7 +1086,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
         # Dask pickles functions by reference when it can, so the scheduler and
         # workers must be able to import this module: ship it to them.
         c.upload_file(os.path.abspath(__file__))
-        winfo = c.scheduler_info()["workers"]
+        winfo = _sched_workers(c)
         # Phase 30: on an autoscaling pool, compute workers carry a resource tag
         # (ComputeTagPlugin) and tasks ask for it, so VMs that join mid-batch get
         # work and the run's own VM (untagged) never does.
@@ -1344,8 +1389,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                 # timed-out calls were each charged the whole pool, ~65 real core-hours
                 # booked as 282, and the run cap stopped all further compute).
                 try:
-                    got_c = c.run(_cancel_call, call_id,
-                                  workers=[w for w in c.scheduler_info()["workers"] if w not in exclude])
+                    got_c = _cancel_remote(c, call_id, exclude)
                     if any(v == -1 for v in (got_c or {}).values()):
                         progress["remote_unconfirmed"] = True     # a chunk could not be identified
                 except Exception:  # noqa: BLE001 — cannot confirm the remote stop
@@ -1386,8 +1430,8 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
             # as busy for the whole call.
             # On an autoscaling pool, scale-down only retires idle workers: no lost work.
             try:
-                gone = [] if res else [w for w in workers if w not in c.scheduler_info()["workers"]]
-            except Exception:  # noqa: BLE001
+                gone = [] if res else _gone_workers(c, workers)
+            except Exception:  # noqa: BLE001 — table unreadable: every worker charged as busy
                 gone = [] if res else list(workers)
             progress["gone_workers"] = len(gone)
     done_i = {r["i"] for r in rows}
@@ -1752,12 +1796,12 @@ def _stop_orphans(p: dict, backend: str | None) -> tuple[bool, str]:
         cloudpickle.register_pickle_by_value(sys.modules[__name__])
         exclude = {w.strip() for w in os.environ.get("MA_COMPUTE_EXCLUDE_WORKERS", "").split(",") if w.strip()}
         with Client(addr, timeout="30s", security=_security()) as c:
-            got = c.run(_cancel_call, call_id, workers=[w for w in c.scheduler_info()["workers"] if w not in exclude])
+            got = _cancel_remote(c, call_id, exclude)
         if any(v == -1 for v in (got or {}).values()):
             return False, "a remote chunk could not be identified (not signalled)"
         return True, "remote chunks cancelled"
     except Exception as e:  # noqa: BLE001 — cannot confirm: bounded by shares
-        return False, f"remote cancel failed ({type(e).__name__})"
+        return False, f"remote cancel failed ({type(e).__name__}{': ' + str(e)[:200] if str(e) else ''})"
 
 
 def _drop_progress(progress: dict) -> None:
