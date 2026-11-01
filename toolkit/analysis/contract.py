@@ -392,6 +392,50 @@ def _self_test() -> int:
                f"K12 a changed engine choice makes the manifest and every artifact stale ({len(st)} findings)")
         except Exception as e:  # noqa: BLE001
             ok(False, f"K12 engine choice hashed in the manifest and artifact headers: {type(e).__name__}: {e}")
+    # figure sources are recorded relative to the run dir: a run whose outputs moved (VM /tmp paths) still checks,
+    # and a source outside the run dir fails closed
+    try:
+        with tempfile.TemporaryDirectory() as parent:
+            d = os.path.join(parent, "run_a")
+            os.makedirs(os.path.join(d, "figures"))
+            open(os.path.join(d, SPEC), "w").write("x: 1\n")
+            S = complete_run(d, finalize=False)
+            png = os.path.join(d, "figures", "f.png")
+            open(png, "wb").write(b"png")
+            src = "analysis/point.yaml"
+
+            def sidecar(run, srcs):
+                json.dump({"png_path": "figures/f.png", "paths_relative_to": "run_dir", "source_hashes": srcs,
+                           "produced_by": "harness"}, open(os.path.join(run, "figures", "f.png.provenance.json"), "w"))
+            sidecar(d, {src: sha256(os.path.join(d, src))})
+            S.deliverable(png, "toolkit/analysis/figures.py", "figure")
+            S.finalize("complete")
+            figk = lambda r: [x["claim"] for x in gate_findings(r) if x["kind"] == "analysis_contract_figure"]  # noqa: E731
+            ok(gate_findings(d) == [], f"K14a figure sources recorded relative to the run dir pass: {gate_findings(d)}")
+            moved = os.path.join(parent, "run_moved")
+            os.rename(d, moved)
+            ok(gate_findings(moved) == [], f"K14b the run dir moved: its figures still check against their sources "
+                                           f"{gate_findings(moved)}")
+            keep = open(os.path.join(moved, src)).read()
+            open(os.path.join(moved, src), "a").write("# edited\n")
+            ok(any("changed after" in c for c in figk(moved)), "K14c a relative source edited after drawing: finding")
+            open(os.path.join(moved, src), "w").write(keep)
+            other = os.path.join(parent, "elsewhere.yaml")
+            open(other, "w").write(keep)
+            sidecar(moved, {other: sha256(other)})
+            ok(any("outside the run dir" in c for c in figk(moved)),
+               f"K14d an absolute source outside the run dir fails closed, even with a matching hash: {figk(moved)}")
+            sidecar(moved, {"../elsewhere.yaml": sha256(other)})
+            ok(any("outside the run dir" in c for c in figk(moved)),
+               f"K14e a relative source that escapes the run dir fails closed: {figk(moved)}")
+            sidecar(moved, {"/tmp/vm_job_x/run/analysis/point.yaml": sha256(os.path.join(moved, src))})
+            ok(figk(moved) != [], "K14f an absolute VM path that no longer exists fails closed")
+            sidecar(moved, {os.path.join(moved, src): sha256(os.path.join(moved, src))})
+            ok(figk(moved) == [], f"K14g a legacy absolute source inside the run dir still passes: {figk(moved)}")
+            sidecar(moved, ["not", "a", "mapping"])
+            ok(figk(moved) != [], "K14h a sidecar whose sources are not a mapping fails closed")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"K14 figure sources relative to the run dir: {type(e).__name__}: {e}")
     # v2d β (Codex r1-4): the gate re-reads the canonical posterior sample against the uncertainty draws
     try:
         import numpy as np

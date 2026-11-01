@@ -407,6 +407,33 @@ def _run_self_test() -> int:
         ok(status6["status"] == "missing_provenance",
            f"T6: no sidecar should yield missing_provenance; got {status6}")
 
+        # T7: a sidecar whose paths are relative to the run dir (the v2
+        # harness figures, toolkit/analysis/figures.py) is checked against
+        # the run dir it sits in, so moving the run dir keeps it fresh.
+        run_a = os.path.join(d, "run_a")
+        os.makedirs(os.path.join(run_a, "figures"))
+        os.makedirs(os.path.join(run_a, "analysis"))
+        with open(os.path.join(run_a, "analysis", "point.yaml"), "w") as f:
+            f.write("a: 1\n")
+        png7 = os.path.join(run_a, "figures", "f.png")
+        with open(png7, "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
+        with open(_provenance_path(png7), "w") as f:
+            json.dump({"png_path": "figures/f.png", "paths_relative_to": "run_dir",
+                       "source_hashes": {"analysis/point.yaml": _hash_file(
+                           os.path.join(run_a, "analysis", "point.yaml"))}}, f)
+        run_b = os.path.join(d, "run_b")
+        os.rename(run_a, run_b)
+        png7b = os.path.join(run_b, "figures", "f.png")
+        st7 = check_staleness(png7b)
+        ok(st7["status"] == "fresh",
+           f"T7: relative sources resolve against the moved run dir; got {st7}")
+        with open(os.path.join(run_b, "analysis", "point.yaml"), "a") as f:
+            f.write("b: 2\n")
+        st7b = check_staleness(png7b)
+        ok(st7b["status"] == "stale",
+           f"T7: an edited relative source is stale; got {st7b}")
+
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)
         for f in failures:
