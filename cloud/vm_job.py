@@ -147,11 +147,15 @@ def cmd_up(a):
         time.sleep(15)    # stopping: never create (or attach) until it has stopped
     else:
         raise SystemExit(f"{a.name} is still stopping; try again later")
-    cl = coiled.Cluster(name=a.name, workspace=rc.WORKSPACE, n_workers=1, worker_cpu=a.cpu, worker_memory=a.memory,
+    n = int(getattr(a, "workers", 1) or 1)
+    cl = coiled.Cluster(name=a.name, workspace=rc.WORKSPACE, n_workers=n, worker_cpu=a.cpu, worker_memory=a.memory,
                         scheduler_cpu=2, spot_policy="on-demand", idle_timeout=a.idle_timeout,
                         shutdown_on_close=False)
+    # the first worker is enough to start: compute.py re-reads the worker table every 2 s and gives a worker that
+    # joins later a chunk at once (Phase 45 δ)
     cl.get_client().wait_for_workers(1, timeout=1500)
-    print(f"{a.name} up (idle timeout {a.idle_timeout}; a running job holds it regardless)")
+    print(f"{a.name} up with {n} worker(s) requested (idle timeout {a.idle_timeout}; a running job holds it "
+          "regardless)")
 
 
 def cmd_start(a):
@@ -166,14 +170,19 @@ def cmd_start(a):
     if not token:
         raise SystemExit(f"{a.job_id} is queued or running on {a.name}; pick another id")
     shell = " ".join(cmd) if len(cmd) == 1 else cmd
+    store = {"prefix": a.store.rstrip("/"), "account": a.store_account} if a.store else None
     fut = c.submit(ws.job_task, a.job_id, code, shell, secrets, a.max_hours, a.setup_sdk, token=token,
+                   cluster_compute=a.cluster_compute, store=store, shutdown_when_stored=a.shutdown_when_stored,
                    workers=[w], allow_other_workers=False, pure=False, key=f"job-{a.job_id}-{int(time.time())}")
     fire_and_forget(fut)
     dest = local_dir(a.name, a.job_id, a.out)
     os.makedirs(dest, exist_ok=True)
     json.dump({"name": a.name, "worker": w, "job_id": a.job_id, "cmd": cmd, "submitted": time.strftime("%F %T"),
-               "max_hours": a.max_hours}, open(os.path.join(dest, "job.json"), "w"), indent=1)
-    print(f"started {a.job_id} on {a.name} ({w}); outputs -> {dest}")
+               "max_hours": a.max_hours, "cluster_compute": a.cluster_compute, "store": store,
+               "shutdown_when_stored": a.shutdown_when_stored}, open(os.path.join(dest, "job.json"), "w"), indent=1)
+    tail = (f"; outputs go to {store['prefix']}/ and the cluster stops itself once they are verified there"
+            if a.shutdown_when_stored else "")
+    print(f"started {a.job_id} on {a.name} ({w}); outputs -> {dest}{tail}")
 
 
 def _print(st, dest):
@@ -529,6 +538,7 @@ def main(argv=None) -> int:
     up.add_argument("--cpu", type=int, default=4)
     up.add_argument("--memory", default="16 GiB")
     up.add_argument("--idle-timeout", default="20 minutes")
+    up.add_argument("--workers", type=int, default=1, help="workers of the one cluster (one scheduler for all)")
     st = sub.add_parser("start")
     st.add_argument("name")
     st.add_argument("job_id")
@@ -538,6 +548,13 @@ def main(argv=None) -> int:
     st.add_argument("--max-hours", type=float, default=24.0)
     st.add_argument("--setup-sdk", action="store_true")
     st.add_argument("--anthropic-key", action="store_true")
+    st.add_argument("--cluster-compute", action="store_true",
+                    help="the job's compute.py run_map uses every worker of this cluster")
+    st.add_argument("--store", metavar="PREFIX", default=None,
+                    help="when the job ends, upload $JOB_OUT to <PREFIX>/ and verify each file read back (sha256)")
+    st.add_argument("--store-account", default=None, help="storage account (default: the worker's configured one)")
+    st.add_argument("--shutdown-when-stored", action="store_true",
+                    help="the job stops its cluster once it is done and every output is verified in storage")
     for nm in ("status", "wait"):
         p = sub.add_parser(nm)
         p.add_argument("name")
@@ -550,6 +567,11 @@ def main(argv=None) -> int:
         p.add_argument("--out", default=OUT)
     a = ap.parse_args(argv)
     a.command = command
+    if a.cmd == "start":
+        if a.shutdown_when_stored and not a.store:
+            ap.error("--shutdown-when-stored needs --store PREFIX: the cluster stops only once outputs are verified")
+        if a.cluster_compute and not (a.tree or a.dir):
+            ap.error("--cluster-compute needs the shipped tree (--tree, or --dir with scripts/compute.py)")
     {"up": cmd_up, "start": cmd_start, "status": cmd_status, "wait": cmd_wait, "down": cmd_down}[a.cmd](a)
     return 0
 

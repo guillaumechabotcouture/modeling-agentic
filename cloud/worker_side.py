@@ -688,12 +688,89 @@ def _beat_run(argv, log, d, st, timeout_s, heartbeat_s):
     return p.wait()
 
 
-def job_task(job_id, code, cmd, secrets=None, max_hours=24.0, setup_sdk=False, heartbeat_s=30, token=None):
+def _load_by_path(name, path):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _cluster_env(work):
+    """The env a job's compute.py run_map needs to send its chunks to this cluster's workers: the scheduler address
+    and this worker's TLS credentials (compute.export_worker_env, from the shipped tree, loaded by path under a private
+    name), written outside the job's out/ so they are never fetched or stored."""
+    import os
+    p = os.path.join(work, "scripts", "compute.py")
+    if not os.path.exists(p):
+        raise RuntimeError("cluster compute needs the shipped tree's scripts/compute.py")
+    return _load_by_path("_ma_job_compute", p).export_worker_env(os.path.join(os.path.dirname(work), ".tls"))
+
+
+def _shutdown_cluster():
+    """Stop this cluster from inside one of its tasks (as run_to_disk does once every run is stored)."""
+    from distributed import get_client
+    get_client().shutdown()
+
+
+def store_outputs(out, prefix, account, store, beat=None):
+    """Upload every file under `out` (no links; never a sensitive path: store.is_sensitive_path) to
+    <prefix>/<rel>, then read each back from storage and compare sha256 with the local file. Returns
+    {"prefix", "files": {rel: sha256}, "skipped", "verified", "why"}; any error is recorded, not raised."""
+    import hashlib, os, tempfile
+    sha = lambda p: hashlib.sha256(open(p, "rb").read()).hexdigest()  # noqa: E731
+    rec = {"prefix": prefix, "files": {}, "skipped": [], "verified": False, "why": ""}
+    try:
+        rels = []
+        for root, _, fns in os.walk(out):
+            for fn in sorted(fns):
+                p = os.path.join(root, fn)
+                rel = os.path.relpath(p, out).replace(os.sep, "/")
+                if os.path.islink(p) or store.is_sensitive_path(rel):
+                    rec["skipped"].append(rel)
+                else:
+                    rels.append(rel)
+        rec["skipped"].sort()
+        for rel in sorted(rels):
+            store.upload_retry(os.path.join(out, rel), f"{prefix}/{rel}", account)
+            rec["files"][rel] = sha(os.path.join(out, rel))
+            if beat:
+                beat()
+        bad = []
+        with tempfile.TemporaryDirectory() as td:
+            for rel, h in rec["files"].items():
+                back = os.path.join(td, "back")
+                store.download(f"{prefix}/{rel}", back, account)
+                if sha(back) != h:
+                    bad.append(rel)
+                if beat:
+                    beat()
+        if bad:
+            rec["why"] = f"{len(bad)} stored copies differ from the job's files (sha256), e.g. {bad[:3]}"
+        elif not rec["files"]:
+            rec["why"] = "the job wrote no outputs to store"
+        else:
+            rec["verified"] = True
+    except Exception as e:  # noqa: BLE001 -- unverified, never raised: the cluster then idles out for collection
+        rec["why"] = f"{type(e).__name__}: {e}"[:300]
+    return rec
+
+
+def job_task(job_id, code, cmd, secrets=None, max_hours=24.0, setup_sdk=False, heartbeat_s=30, token=None,
+             cluster_compute=False, store=None, shutdown_when_stored=False, store_mod=None):
     """The job, as a dask task: claim the id (the 'queued' record with this submission's
     token; with no token, an id that is neither queued nor running), unpack `code` (a
     tar.gz, or None), run `cmd` (a shell string or an argv list) in it with JOB_OUT set,
     heartbeat into state.json throughout, stop it after `max_hours`. Secrets go to the
-    job's environment only, never to a file. The state record is replaced, never removed."""
+    job's environment only, never to a file. The state record is replaced, never removed.
+
+    Batch mode (one cluster, one scheduler, N workers): `cluster_compute` gives the job the
+    cluster's scheduler, so its compute.py run_map spreads chunks over every worker of this
+    cluster; `store` ({"prefix", "account"}) uploads $JOB_OUT to storage when the job ends and
+    reads every file back (store_outputs); `shutdown_when_stored` then stops the cluster from
+    here, but only for a job that is done with every output verified in storage. Otherwise
+    the cluster is left to its idle timeout, so the outputs can still be collected. None of
+    this depends on the laptop."""
     import io, os, re, shutil, signal, subprocess, sys, tarfile, time
     d = _job_dir(job_id)
     with _JobLock(d):
@@ -724,6 +801,8 @@ def job_task(job_id, code, cmd, secrets=None, max_hours=24.0, setup_sdk=False, h
         env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "/usr/bin:/bin")
         env.update(secrets or {})
         env["JOB_OUT"] = out
+        if cluster_compute:
+            env.update(_cluster_env(work))
         with open(os.path.join(d, "job.log"), "ab", buffering=0) as log:
             if setup_sdk and os.path.exists(os.path.join(work, "requirements.txt")):   # dev_vm.py's SDK pin
                 pins = [ln.split("#")[0].strip() for ln in open(os.path.join(work, "requirements.txt"))
@@ -756,9 +835,26 @@ def job_task(job_id, code, cmd, secrets=None, max_hours=24.0, setup_sdk=False, h
         st.update(state="failed", error=f"{type(e).__name__}: {e}"[:500], ended=time.time(), heartbeat=time.time())
         _job_write(d, st)
         return st
-    st.update(state="timed_out" if st.get("timed_out") else ("done" if rc == 0 else "failed"), rc=rc,
-              ended=time.time(), duration_s=round(time.time() - t0), heartbeat=time.time())
+    final = dict(state="timed_out" if st.get("timed_out") else ("done" if rc == 0 else "failed"), rc=rc,
+                 ended=time.time(), duration_s=round(time.time() - t0))
+    if store:
+        def beat():
+            st["heartbeat"] = time.time()
+            _job_write(d, st)
+        try:
+            smod = store_mod or _load_by_path("_ma_job_results_store", os.path.join(work, "scripts",
+                                                                                     "results_store.py"))
+        except Exception as e:  # noqa: BLE001
+            st["stored"] = {"prefix": store.get("prefix"), "verified": False,
+                            "why": f"no results_store in the shipped tree ({type(e).__name__}: {e})"[:300]}
+        else:
+            st["stored"] = store_outputs(out, store["prefix"], store.get("account"), smod, beat)
+    st.update(final, heartbeat=time.time())
+    down = bool(shutdown_when_stored and st["state"] == "done" and (st.get("stored") or {}).get("verified"))
+    st["shutdown"] = down
     _job_write(d, st)
+    if down:
+        _shutdown_cluster()
     return st
 
 
