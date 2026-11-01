@@ -41,3 +41,6 @@ validator_stderr_*.txt
 /docs/design/eval-suite.md
 bundle.enc
 *.bundle.enc
+
+# Licensed run inputs (DHS/MAP-derived): never committed to this public repo; see cloud/nigeria_gf13_inputs.py
+/data/nigeria_gf13/
