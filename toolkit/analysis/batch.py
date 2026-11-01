@@ -5,7 +5,9 @@ real unit (units drawn without replacement, then with replacement), a Sobol valu
 calibrated attribute over `calibration.range`, Sobol values of every fitted engine
 parameter over its engine-card range, and Sobol values of every prior parameter the
 uncertainty draws vary (toolkit/spec/priors.py) over its declared range (v2 priors; a spec
-whose engine and spec declare no prior gets the spike's design unchanged). Every package runs at every point with the same
+whose engine and spec declare no prior gets the spike's design unchanged). A parameter that a
+`parameter_value` decision test sets outside that range has its design box widened to span the
+test's values (`design_ranges` in design.json); the draws keep the declared range. Every package runs at every point with the same
 seed (common random numbers). A share `holdout_share` of points is held out to measure
 emulator accuracy. The design is the spike's (`spike/analysis/batch.py`), unchanged, so
 the stored spike batch is reusable.
@@ -44,6 +46,20 @@ def prior_ranges(spec) -> dict:
     return {k: (p.lo, p.hi, p.value) for k, p in PRI.drawn(spec).items()}
 
 
+def test_value_ranges(spec, names) -> dict:
+    """{name: (lo, hi)} of the values the spec's parameter_value decision tests set for design parameters `names`.
+    The design box spans them too, so each test is evaluated inside the design (the draws keep the declared ranges)."""
+    out = {}
+    for dt in (spec["analysis"].get("decision_tests") or []):
+        if dt.get("type") != "parameter_value" or dt.get("parameter") not in names:
+            continue
+        vs = [float(v) for v in dt.get("values") or []]
+        if vs:
+            lo, hi = out.get(dt["parameter"], (min(vs), max(vs)))
+            out[dt["parameter"]] = (min(lo, *vs), max(hi, *vs))
+    return out
+
+
 def calibrated_value(spec, z: float) -> float:
     return float(math.exp(z)) if spec["calibration"].get("scale", "log") == "log" else float(z)
 
@@ -66,7 +82,14 @@ def design(spec) -> tuple[dict, list[dict]]:
     pr = prior_ranges(spec)                 # v2 priors: drawn parameters enter the design as inputs
     pnames = list(pr)
     fr = dict(fr, **pr)
-    sob = qmc.Sobol(d=1 + len(names) + len(pnames), scramble=True, seed=int(em.get("seed", 7))).random(n)
+    tv = test_value_ranges(spec, set(fr))
+    ext = {}
+    for nm, (tlo, thi) in tv.items():
+        lo_, hi_ = min(fr[nm][0], tlo), max(fr[nm][1], thi)
+        if (lo_, hi_) != (fr[nm][0], fr[nm][1]):
+            ext[nm] = [lo_, hi_]
+            fr[nm] = (lo_, hi_, fr[nm][2])
+    sob =qmc.Sobol(d=1 + len(names) + len(pnames), scramble=True, seed=int(em.get("seed", 7))).random(n)
     lo, hi = spec["calibration"]["range"]
     order = list(rng.permutation(len(units)))
     while len(order) < n:
@@ -93,7 +116,9 @@ def design(spec) -> tuple[dict, list[dict]]:
          "cal_window": list(spec["calibration"]["window"])}
     if pnames:
         d["prior_names"] = pnames
-    return d, [dict(j, engine=spec["engine"], horizon=d["horizon"], windows=windows(spec)) for j in jobs]
+    if ext:
+        d["design_ranges"] = ext          # parameters whose design box was widened to span decision-test values
+    return d,[dict(j, engine=spec["engine"], horizon=d["horizon"], windows=windows(spec)) for j in jobs]
 
 
 _E = {}
