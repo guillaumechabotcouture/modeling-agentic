@@ -585,7 +585,7 @@ async def final_writeup(run_path, run_dir_rel, question, max_rounds, budget, cap
         result, sid, err = None, None, None
         try:
             async for m in (query_fn or query)(prompt=prompt, options=options):
-                log_message(m, trace)
+                log_message(m, trace, integrity=integrity)
                 if live_state is not None:
                     live_state.on_message(m)         # stage snapshot of the writer, live status
                 if isinstance(m, SystemMessage) and m.subtype == "init":
@@ -778,7 +778,7 @@ async def _presentation_session(run_path, run_dir_rel, question, budget, cap, se
     try:
         try:
             async for m in (query_fn or query)(prompt=prompt, options=options):
-                log_message(m, trace)
+                log_message(m, trace, integrity=integrity)
                 if live_state is not None:
                     live_state.on_message(m)
                 if isinstance(m, SystemMessage) and m.subtype == "init":

@@ -32,6 +32,7 @@ from agents import (
 )
 from agents import enforcement
 from agents.integrity import ArtifactIntegrity
+from agents.hooks import report_integrity
 from agents.run_session import (  # noqa: E402,F401  Phase 48 γ: moved, re-exported
     LEAD_TOOLS,
     TERMINAL_TASK_STATUSES,
@@ -517,7 +518,7 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                 cleanup_orphaned_claude_processes()
 
                 async for message in query(prompt=lead_prompt, options=options):
-                    log_message(message, trace_file)
+                    log_message(message, trace_file, integrity=integrity)
                     live_state.on_message(message)
                     if (isinstance(message, SystemMessage)
                             and message.subtype == "init"):
@@ -537,6 +538,9 @@ async def run(question: str, max_rounds: int, max_sessions: int,
             except Exception as e:
                 error_str = str(e)
             finally:
+                # The session's calls still in flight end with it (judged first), before
+                # the harness writes its own records below.
+                report_integrity(integrity.on_session_end(), trace_file)
                 if result is not None:
                     session_records.append({"session": session_num, **result_summary(result)})
                 charged_from, source = result, "result"
@@ -907,6 +911,35 @@ def _run_self_test() -> int:
         asyncio.run(post_i({"tool_name": "Bash", "tool_input": {"command": "true"}}, "h1", None))
         ok(len(ig3.events) == n0 + 1 and ig3.events[-1]["file"] == "critique_domain.yaml",
            f"IN7 hooks record a lead change to a critique: {ig3.events[n0:]}")
+        # IN10 (evalbase1 measles/flu): SubagentStop and the SDK's task messages end in-flight calls
+        stop_i = hk["SubagentStop"][0].hooks[0]
+        sub = {"tool_name": "Bash", "tool_input": {"command": "sleep 1"}, "agent_id": "d1", "agent_type": "data-agent"}
+        asyncio.run(pre_i(sub, "h2", None))
+        ok("h2" in ig3.inflight and ig3.inflight["h2"].get("agent_id") == "d1", "IN10a the hook passes agent_id")
+        asyncio.run(stop_i({"agent_id": "d1", "agent_type": "data-agent"}, None, None))
+        ok("h2" not in ig3.inflight, f"IN10b SubagentStop ends the agent's call: {list(ig3.inflight)}")
+        from claude_agent_sdk import TaskStartedMessage as _TS, TaskNotificationMessage as _TN
+        asyncio.run(pre_i(dict(sub, agent_id="m9", agent_type="modeler"), "h3", None))
+        log_message(_TS(subtype="task_started", data={}, task_id="bk9", description="x", uuid="u", session_id="s",
+                        tool_use_id="h3"), trace, integrity=ig3)
+        log_message(_TN(subtype="task_notification", data={}, task_id="bk9", status="completed", output_file="",
+                        summary="Background command completed", uuid="u", session_id="s", tool_use_id="h3"),
+                    trace, integrity=ig3)
+        ok("h3" not in ig3.inflight, f"IN10c a background-completion notification ends the call: {list(ig3.inflight)}")
+        # IN11: an agent's full pipeline build in the real run dir is refused; the allowed forms pass
+        for cmd, denied in ((f"nohup python3 scripts/pipeline.py run {td} > models/pipeline_run.log 2>&1 &", True),
+                            (f"python3 scripts/pipeline.py run {td} sensitivity --scratch --keep", False),
+                            (f"python3 scripts/pipeline.py run {td} --dry-run", False),
+                            (f"python3 scripts/pipeline.py validate {td}", False)):
+            r = asyncio.run(pre_i({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": REPO_ROOT,
+                                   "agent_id": "m9", "agent_type": "modeler"}, "h4", None))
+            why = str((r.get("hookSpecificOutput") or {}).get("permissionDecisionReason") or "")
+            ok(bool(why) == denied and (not denied or ("--scratch" in why and "--dry-run" in why and "lead" in why)),
+               f"IN11 {'refused' if denied else 'allowed'}: {cmd} -> {why[:120]}")
+            ig3.inflight.pop("h4", None)
+        # IN12: agents/integrity.py's own self-test (lifecycle, retired globs, measles replay)
+        from agents import integrity as _integ
+        ok(_integ._self_test() == 0, "IN12 agents/integrity.py --self-test")
         # TW1-TW3 (Phase 31): a subagent is warned before its turn limit, once per level
         hk2 = agents_pkg.create_hooks(td, trace, datetime.now(), registered_agents=reg, max_turns={"modeler": 20})
         pre2, post2, start2 = (hk2["PreToolUse"][0].hooks[0], hk2["PostToolUse"][0].hooks[0],
