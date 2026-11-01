@@ -1117,6 +1117,58 @@ def _self_test_52(ok) -> None:
         ok("x-keeper" in str(e) and "not confirmed" in str(e) and "keeper-log" in str(e),
            f"RC52f a keeper that cannot be confirmed fails the launch with a clear message: {e}")
 
+    # Codex round 1: a readable log is not proof; only a tick line (written after adapt()
+    # and a worker-table read) confirms the keeper is holding the pool.
+    for log in ("(no log yet)", "12:00:00 keeper holding x 3..9 {}\n12:00:01 keeper error OSError: no; retrying"):
+        kc3 = types.SimpleNamespace(cluster_id=10, get_client=lambda log=log: FakeClient([{"workers": table}], log=log))
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                confirm_keeper("x-keeper", kc3, attempts=2, delay_s=0.0, sleep=lambda s: None)
+            ok(False, f"RC52h a keeper log with no tick line is not confirmation: {log[-40:]!r}")
+        except SystemExit as e:
+            ok("not confirmed" in str(e), f"RC52h a keeper log with no tick line is not confirmation: {log[-40:]!r}")
+    late = FakeClient([{"workers": table}], log="(no log yet)")
+    logs = iter(["(no log yet)", "12:00:00 keeper holding x 3..9 {}",
+                 "12:00:00 keeper holding x 3..9 {}\n12:01:00 workers=3 (overflow 0) refusals=0 active=primary"])
+    late.run = lambda fn, workers: {w: next(logs) for w in workers}
+    with contextlib.redirect_stdout(io.StringIO()):
+        line = confirm_keeper("x-keeper", types.SimpleNamespace(cluster_id=11, get_client=lambda: late),
+                              attempts=4, delay_s=0.0, sleep=lambda s: None)
+    ok("workers=3" in str(line), f"RC52i a keeper whose first tick comes late is confirmed once it ticks: {line}")
+
+    # Codex round 1: launch keeps the replacement client for the rest of the launch.
+    from unittest import mock
+
+    class LaunchClient(FakeClient):
+        def wait_for_workers(self, *a, **kw):
+            pass
+
+        def upload_file(self, *a):
+            self.status = "closed"   # the client drops right after the upload
+
+    old_c, new_c = LaunchClient([{}]), LaunchClient([{"workers": {f"tls://a:{i}": {} for i in range(4)}}])
+    run_cl = types.SimpleNamespace(cluster_id=12, get_client=lambda: old_c if old_c.status == "running" else new_c)
+    used = []
+    comp = types.SimpleNamespace(WORKER_VM_TYPES=[], WORKER_OPTIONS={}, ADAPT_OPTIONS={},
+                                 register_compute_tags=lambda c, exclude: used.append(c))
+    fake_coiled = types.ModuleType("coiled")
+    fake_coiled.Cluster = lambda **kw: run_cl
+    with tempfile.TemporaryDirectory() as d:
+        q = os.path.join(d, "q.txt")
+        open(q, "w").write("question")
+        lcfg = RunConfig(name="lt", question_file=q, labels=("R1",), out_dir=d, keeper=False, overflow_max=0)
+        with mock.patch.dict(sys.modules, {"coiled": fake_coiled}), \
+                mock.patch.object(sys.modules[__name__], "is_running", return_value=False), \
+                mock.patch.object(sys.modules[__name__], "read_keys", return_value={"ANTHROPIC_API_KEY": "k"}), \
+                mock.patch.object(sys.modules[__name__], "code_tarball", return_value=(b"", "c0")), \
+                mock.patch.object(sys.modules[__name__], "_compute", return_value=comp), \
+                mock.patch.object(sys.modules[__name__], "_submit", side_effect=lambda cfg, c, *a: used.append(c)), \
+                mock.patch.object(eval_paths, "archive_sha256", return_value="0"), \
+                mock.patch.object(time, "sleep", lambda s: None), contextlib.redirect_stdout(io.StringIO()):
+            launch(lcfg)
+    ok(used and all(c is new_c for c in used),
+       f"RC52j launch uses the replacement client after the first one closed: {[c is new_c for c in used]}")
+
     # The keeper loop itself, on a fake coiled: the first tick's identity is empty.
     class FakeCluster:
         adapts = []
