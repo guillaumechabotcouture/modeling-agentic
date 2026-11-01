@@ -418,16 +418,16 @@ benchmarks:
   target: null
   band: null
   source: branching-process identities
-  computed: 0.79681213002002
+  computed: 0.7968121300200206
   reference: 0.79681213002002
-  error_abs: 0.0
-  error_rel: 0.0
+  error_abs: 5.551115123125783e-16
+  error_rel: 6.966654891393671e-16
   tolerance:
     abs: 1.0e-08
   compare: eq
   per_seed_error_abs:
-  - 0.0
-  - 0.0
+  - 5.551115123125783e-16
+  - 5.551115123125783e-16
   in_band: true
   status: in_band
 - id: BR1b
@@ -436,16 +436,16 @@ benchmarks:
   target: null
   band: null
   source: branching-process identities
-  computed: 0.5
+  computed: 0.5000000000000009
   reference: 0.5
-  error_abs: 0.0
-  error_rel: 0.0
+  error_abs: 8.881784197001252e-16
+  error_rel: 1.7763568394002505e-15
   tolerance:
     abs: 1.0e-08
   compare: eq
   per_seed_error_abs:
-  - 0.0
-  - 0.0
+  - 8.881784197001252e-16
+  - 8.881784197001252e-16
   in_band: true
   status: in_band
 - id: BR1c
@@ -490,16 +490,16 @@ benchmarks:
   target: null
   band: null
   source: "design note \xA71.1 (importation: branching)"
-  computed: 0.6349095708195136
+  computed: 0.634909570819514
   reference: 0.6349095708197771
-  error_abs: 2.6345592374354965e-13
-  error_rel: 4.14950310803132e-13
+  error_abs: 2.630118345336996e-13
+  error_rel: 4.142508581089843e-13
   tolerance:
     abs: 1.0e-06
   compare: eq
   per_seed_error_abs:
-  - 2.6345592374354965e-13
-  - 2.6345592374354965e-13
+  - 2.630118345336996e-13
+  - 2.630118345336996e-13
   in_band: true
   status: in_band
 - id: RN1
@@ -1114,5 +1114,5 @@ parameters:
   verified: unverified
 validation_label: validated against analytic identities and simulation-based coverage; published benchmarks FS7
   and RN5 not yet assessed
-results_sha256: a5f79f377a3808c05f19ac34ceae81ba6f9793a6a03a66a94436ba8319769b22
+results_sha256: ff861f1561f1db57ca6c08fcdf089535717d38b313b59bf0b149365437459b9c
 benchmark_pack: 'benchmarks/pack.yaml (oracles: benchmarks/oracles.py, test only)'

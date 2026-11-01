@@ -2,9 +2,10 @@ producer: toolkit/engines/benchmark.py
 engine_identity:
   name: compartmental-starsim
   version: '0.1'
-  code_sha256: 124c6e2f72644fbc2d3fd8d6d62a2fdf7fd5d9dcd357e57e4ec1bfad1894fd4a
+  code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
   params_sha256: f498058635c8fd432017ed42e7a4a9b51d9355e39178b298d90f5512b1c5f372
   config_sha256: 7fb325cd3215f687d2adcdcd1d8f666a811c609b76939cb8f819e574f5ccd32f
+engine_config_sha256: 796a3b1dceea18349dbee97472167eea809434e8db2a6b9dc261c3e3c077b770
 benchmarks:
 - id: FS1a
   metric: single-group final size, R0 = 1.5
@@ -373,16 +374,16 @@ benchmarks:
   target: null
   band: null
   source: branching-process identities
-  computed: 0.79681213002002
+  computed: 0.7968121300200206
   reference: 0.79681213002002
-  error_abs: 0.0
-  error_rel: 0.0
+  error_abs: 5.551115123125783e-16
+  error_rel: 6.966654891393671e-16
   tolerance:
     abs: 1.0e-08
   compare: eq
   per_seed_error_abs:
-  - 0.0
-  - 0.0
+  - 5.551115123125783e-16
+  - 5.551115123125783e-16
   in_band: true
   status: in_band
 - id: BR1b
@@ -391,16 +392,16 @@ benchmarks:
   target: null
   band: null
   source: branching-process identities
-  computed: 0.5
+  computed: 0.5000000000000009
   reference: 0.5
-  error_abs: 0.0
-  error_rel: 0.0
+  error_abs: 8.881784197001252e-16
+  error_rel: 1.7763568394002505e-15
   tolerance:
     abs: 1.0e-08
   compare: eq
   per_seed_error_abs:
-  - 0.0
-  - 0.0
+  - 8.881784197001252e-16
+  - 8.881784197001252e-16
   in_band: true
   status: in_band
 - id: BR1c
@@ -448,16 +449,16 @@ benchmarks:
   target: null
   band: null
   source: "design note \xA71.1 (importation: branching)"
-  computed: 0.6349095708195136
+  computed: 0.634909570819514
   reference: 0.6349095708197771
-  error_abs: 2.6345592374354965e-13
-  error_rel: 4.14950310803132e-13
+  error_abs: 2.630118345336996e-13
+  error_rel: 4.142508581089843e-13
   tolerance:
     abs: 1.0e-06
   compare: eq
   per_seed_error_abs:
-  - 2.6345592374354965e-13
-  - 2.6345592374354965e-13
+  - 2.630118345336996e-13
+  - 2.630118345336996e-13
   in_band: true
   status: in_band
 - id: RN1
@@ -999,9 +1000,10 @@ configs_validated:
     engine_identity:
       name: compartmental-starsim
       version: '0.1'
-      code_sha256: 124c6e2f72644fbc2d3fd8d6d62a2fdf7fd5d9dcd357e57e4ec1bfad1894fd4a
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
       params_sha256: 1f4773c98c4d8ffdfe34e3931519139d7ea5a20f56baed6baeaf619eb4c5953e
       config_sha256: 98a47f981a5ec892a25dc64d191d8c674f744fa518da15e65b8a4cd75b05381c
+    config_sha256: 563ddcfabc7eb6daab07b15f95db55e1c3bce811a9dadf654f4e866a264b9e2f
   branch_geometric:
     config:
       groups:
@@ -1019,9 +1021,10 @@ configs_validated:
     engine_identity:
       name: compartmental-starsim
       version: '0.1'
-      code_sha256: 124c6e2f72644fbc2d3fd8d6d62a2fdf7fd5d9dcd357e57e4ec1bfad1894fd4a
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
       params_sha256: f498058635c8fd432017ed42e7a4a9b51d9355e39178b298d90f5512b1c5f372
       config_sha256: 7fb325cd3215f687d2adcdcd1d8f666a811c609b76939cb8f819e574f5ccd32f
+    config_sha256: caff24d6ec911b41101780b4ba786dd2508af0c03dfc48eb613659b63be12439
   branch_poisson:
     config:
       groups:
@@ -1039,9 +1042,10 @@ configs_validated:
     engine_identity:
       name: compartmental-starsim
       version: '0.1'
-      code_sha256: 124c6e2f72644fbc2d3fd8d6d62a2fdf7fd5d9dcd357e57e4ec1bfad1894fd4a
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
       params_sha256: f498058635c8fd432017ed42e7a4a9b51d9355e39178b298d90f5512b1c5f372
       config_sha256: 7fb325cd3215f687d2adcdcd1d8f666a811c609b76939cb8f819e574f5ccd32f
+    config_sha256: 27fa58e2eef34f5a9dea6c3513e697427efd9e9801b46895b02a17b9674ec96a
   campaign:
     config:
       groups:
@@ -1066,9 +1070,10 @@ configs_validated:
     engine_identity:
       name: compartmental-starsim
       version: '0.1'
-      code_sha256: 124c6e2f72644fbc2d3fd8d6d62a2fdf7fd5d9dcd357e57e4ec1bfad1894fd4a
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
       params_sha256: 5540ffc405a674e55b2f60126520392027596708bdbf41ec3d7d8996a682a344
       config_sha256: ff010416c4b68f84fe37a221e977c0723ba20bc3c59002670cad018c9b720be6
+    config_sha256: 8fc79a9645f81cfe1d163788679a171c31f567a98302eb70d63a37174715c9f7
   cohort:
     config:
       groups:
@@ -1098,9 +1103,10 @@ configs_validated:
     engine_identity:
       name: compartmental-starsim
       version: '0.1'
-      code_sha256: 124c6e2f72644fbc2d3fd8d6d62a2fdf7fd5d9dcd357e57e4ec1bfad1894fd4a
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
       params_sha256: 832eb9b250933e5d9394f529943ccc94b093866ae68fa2ffa6bcd9b19fdee47f
       config_sha256: 3a934a919914afe2be724acadab50b4862d4ba4d29f9ac24d1d9913d7c7988cf
+    config_sha256: 844d162299f70a05162892c74141a3f0879a0bfdd701170e30e9b3bdd49524f4
   cohort_nested:
     config:
       groups:
@@ -1123,9 +1129,10 @@ configs_validated:
     engine_identity:
       name: compartmental-starsim
       version: '0.1'
-      code_sha256: 124c6e2f72644fbc2d3fd8d6d62a2fdf7fd5d9dcd357e57e4ec1bfad1894fd4a
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
       params_sha256: 888421c56ea3500f357a7c69767dcad5df04c9f365094f7a293d59c320b58ee5
       config_sha256: 57bb29ab48e4c22838a1bfa9c65e83eb14ffc24663a092ce4824592f77adf0a8
+    config_sha256: b862462505b16ab8697a784d9ddfe7977baa230432bbd3dfaa078f5a70d57207
   multi3:
     config:
       groups:
@@ -1146,9 +1153,10 @@ configs_validated:
     engine_identity:
       name: compartmental-starsim
       version: '0.1'
-      code_sha256: 124c6e2f72644fbc2d3fd8d6d62a2fdf7fd5d9dcd357e57e4ec1bfad1894fd4a
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
       params_sha256: 1f4773c98c4d8ffdfe34e3931519139d7ea5a20f56baed6baeaf619eb4c5953e
       config_sha256: 0fb2636f7d35fafba804a9ff4deac4596a2ab8619caf6e5a3c623326ddfa6ff3
+    config_sha256: 3ade22fabbfc746011164354a46c2a5cd4a1577dc19a5e60ab34ebfd984e8bbe
   multi5:
     config:
       groups:
@@ -1171,9 +1179,10 @@ configs_validated:
     engine_identity:
       name: compartmental-starsim
       version: '0.1'
-      code_sha256: 124c6e2f72644fbc2d3fd8d6d62a2fdf7fd5d9dcd357e57e4ec1bfad1894fd4a
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
       params_sha256: 1f4773c98c4d8ffdfe34e3931519139d7ea5a20f56baed6baeaf619eb4c5953e
       config_sha256: 3b7fbeb22f46c8f390fee7199809ab81e5fba852fe46120c1b42cc33e169dd3d
+    config_sha256: 0b38aeef94f7340eda965373e403b5416f885209471ff4edbb5a67326c252ad5
   single_day:
     config:
       groups:
@@ -1192,9 +1201,10 @@ configs_validated:
     engine_identity:
       name: compartmental-starsim
       version: '0.1'
-      code_sha256: 124c6e2f72644fbc2d3fd8d6d62a2fdf7fd5d9dcd357e57e4ec1bfad1894fd4a
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
       params_sha256: f498058635c8fd432017ed42e7a4a9b51d9355e39178b298d90f5512b1c5f372
       config_sha256: 7fb325cd3215f687d2adcdcd1d8f666a811c609b76939cb8f819e574f5ccd32f
+    config_sha256: 796a3b1dceea18349dbee97472167eea809434e8db2a6b9dc261c3e3c077b770
   single_w1:
     config:
       groups:
@@ -1210,9 +1220,10 @@ configs_validated:
     engine_identity:
       name: compartmental-starsim
       version: '0.1'
-      code_sha256: 124c6e2f72644fbc2d3fd8d6d62a2fdf7fd5d9dcd357e57e4ec1bfad1894fd4a
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
       params_sha256: f498058635c8fd432017ed42e7a4a9b51d9355e39178b298d90f5512b1c5f372
       config_sha256: 7fb325cd3215f687d2adcdcd1d8f666a811c609b76939cb8f819e574f5ccd32f
+    config_sha256: 15adcc2e805893e3964d6e468ba0728cf93509d726dba6e7465077d98abef7fb
   single_week:
     config:
       groups:
@@ -1229,9 +1240,10 @@ configs_validated:
     engine_identity:
       name: compartmental-starsim
       version: '0.1'
-      code_sha256: 124c6e2f72644fbc2d3fd8d6d62a2fdf7fd5d9dcd357e57e4ec1bfad1894fd4a
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
       params_sha256: f498058635c8fd432017ed42e7a4a9b51d9355e39178b298d90f5512b1c5f372
       config_sha256: 7fb325cd3215f687d2adcdcd1d8f666a811c609b76939cb8f819e574f5ccd32f
+    config_sha256: 4e5d8c57db8c5bf696d186890cd3c18ea7e0ecbf935c7f0e4d7107ea33e7e72e
   win_day:
     config:
       groups:
@@ -1245,9 +1257,10 @@ configs_validated:
     engine_identity:
       name: compartmental-starsim
       version: '0.1'
-      code_sha256: 124c6e2f72644fbc2d3fd8d6d62a2fdf7fd5d9dcd357e57e4ec1bfad1894fd4a
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
       params_sha256: f498058635c8fd432017ed42e7a4a9b51d9355e39178b298d90f5512b1c5f372
       config_sha256: 1ffd8300a2cb6d7dc41c19a6276dbd225ff1616deaea4908dd90eb8355983055
+    config_sha256: 7d65861ab899ef948e88ea82b3f1e1751b71d6c510c768979361d7295900556b
   win_forced:
     config:
       groups:
@@ -1267,9 +1280,10 @@ configs_validated:
     engine_identity:
       name: compartmental-starsim
       version: '0.1'
-      code_sha256: 124c6e2f72644fbc2d3fd8d6d62a2fdf7fd5d9dcd357e57e4ec1bfad1894fd4a
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
       params_sha256: 84120e872544e4d566f625a1bf62f2e5cbd865dd1031f8884dbb6087f73ef65d
-      config_sha256: 1ffd8300a2cb6d7dc41c19a6276dbd225ff1616deaea4908dd90eb8355983055
+      config_sha256: 6732c72c3c8e0a4c85c9956ba75427e3366bf846807814032db292edb7160eaf
+    config_sha256: 7d8f9e54ba3f9d0518d6e175f37147f4ff8ba7d73b59dad8b148ff6900fb262c
   win_growth:
     config:
       groups:
@@ -1287,9 +1301,10 @@ configs_validated:
     engine_identity:
       name: compartmental-starsim
       version: '0.1'
-      code_sha256: 124c6e2f72644fbc2d3fd8d6d62a2fdf7fd5d9dcd357e57e4ec1bfad1894fd4a
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
       params_sha256: f498058635c8fd432017ed42e7a4a9b51d9355e39178b298d90f5512b1c5f372
       config_sha256: 1ffd8300a2cb6d7dc41c19a6276dbd225ff1616deaea4908dd90eb8355983055
+    config_sha256: dea8cdfe7542745294e2678dd2485781a49c518e8d0e67eda84792cf669a1a92
   win_refit:
     config:
       groups:
@@ -1362,9 +1377,10 @@ configs_validated:
     engine_identity:
       name: compartmental-starsim
       version: '0.1'
-      code_sha256: 124c6e2f72644fbc2d3fd8d6d62a2fdf7fd5d9dcd357e57e4ec1bfad1894fd4a
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
       params_sha256: f498058635c8fd432017ed42e7a4a9b51d9355e39178b298d90f5512b1c5f372
       config_sha256: 1ffd8300a2cb6d7dc41c19a6276dbd225ff1616deaea4908dd90eb8355983055
+    config_sha256: 807628e2468cbfb3061bcda229c792ba0e8f251d57f071ae2ce5b4b31474aa15
   win_week:
     config:
       groups:
@@ -1378,9 +1394,11 @@ configs_validated:
     engine_identity:
       name: compartmental-starsim
       version: '0.1'
-      code_sha256: 124c6e2f72644fbc2d3fd8d6d62a2fdf7fd5d9dcd357e57e4ec1bfad1894fd4a
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
       params_sha256: f498058635c8fd432017ed42e7a4a9b51d9355e39178b298d90f5512b1c5f372
       config_sha256: 1ffd8300a2cb6d7dc41c19a6276dbd225ff1616deaea4908dd90eb8355983055
+    config_sha256: 2ec3e4c3e7722afe16437742c8caf9bafb4b018ed33aac8a44bad10d2aa4cedb
+configs_not_exercised: []
 seeds:
 - 1
 - 2
@@ -1397,4 +1415,4 @@ summary:
   held_out_total: 53
 engine_version: '0.1'
 fit_rule: null
-wall_s: 74.1
+wall_s: 77.0

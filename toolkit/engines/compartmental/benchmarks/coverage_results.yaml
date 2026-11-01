@@ -2,9 +2,10 @@ producer: toolkit/engines/benchmark.py
 engine_identity:
   name: compartmental-starsim
   version: '0.1'
-  code_sha256: 124c6e2f72644fbc2d3fd8d6d62a2fdf7fd5d9dcd357e57e4ec1bfad1894fd4a
+  code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
   params_sha256: 84120e872544e4d566f625a1bf62f2e5cbd865dd1031f8884dbb6087f73ef65d
-  config_sha256: 1ffd8300a2cb6d7dc41c19a6276dbd225ff1616deaea4908dd90eb8355983055
+  config_sha256: 6732c72c3c8e0a4c85c9956ba75427e3366bf846807814032db292edb7160eaf
+engine_config_sha256: eb08a7e62ffdea9c74880c27a4834b582eb105a2a39b8f42779c6cb39b096c86
 benchmarks:
 - id: SB1
   metric: 'identified renewal fit: known initial susceptibility, unforced, complete
@@ -125,96 +126,11 @@ benchmarks:
     (AttributeError: module ''toolkit.analysis.calibration'' has no attribute ''posterior'')'
 settings_calibrated: {}
 fitted_used: {}
-configs_validated:
-  cohorts:
-    config:
-      groups:
-      - b2021
-      - b2022
-      - b2023
-      - b2024
-      - b2025
-      structure: birth_cohorts
-      mode: to_extinction
-      initialiser: cohort_history
-      doses:
-      - d1
-      dt: day
-      generation_interval:
-      - 0.5
-      - 0.5
-    engine_identity:
-      name: compartmental-starsim
-      version: '0.1'
-      code_sha256: 124c6e2f72644fbc2d3fd8d6d62a2fdf7fd5d9dcd357e57e4ec1bfad1894fd4a
-      params_sha256: d92e590c60d79025f414cb6bc3527495ef6f234f26c46d90a99e4399541516f4
-      config_sha256: 10303480f25dd87f82dd4e2bd2df09b26249aa6c28ff70729ad3af842a6cb647
-  groups3:
-    config:
-      groups:
-      - a
-      - b
-      - c
-      structure: age_groups_contact_matrix
-      mode: to_extinction
-      initialiser: given
-      dt: day
-      transmission: q
-      generation_interval:
-      - 0.5
-      - 0.3
-      - 0.2
-      components:
-        plan:
-          kind: campaign
-          targets:
-          - b
-          reach: 0.5
-      outcomes:
-      - hospitalisations
-    engine_identity:
-      name: compartmental-starsim
-      version: '0.1'
-      code_sha256: 124c6e2f72644fbc2d3fd8d6d62a2fdf7fd5d9dcd357e57e4ec1bfad1894fd4a
-      params_sha256: 90ac425c1ea2af7fd5ff9f111d1383d9f322c05b38ef79e9752a7727bf2fe281
-      config_sha256: 8ef4b24217e2217589e4cc0407cc539694dc595361db772d29c368e53cc5a5e5
-  renewal:
-    config:
-      groups:
-      - all
-      structure: single_group
-      mode: windowed
-      initialiser: given
-      dt: week
-      generation_interval:
-      - 0.767455843065087
-      - 0.146995943257602
-      - 0.054076785460076
-      - 0.019893737615401
-      - 0.007318497076765
-      - 0.002692324614815
-      - 0.00099045087475
-      - 0.000364366514311
-      - 0.000134042949666
-      - 4.9311645416e-05
-      - 1.8140740559e-05
-      - 6.673605499e-06
-      - 2.455082262e-06
-      - 9.0317429e-07
-      - 3.32259253e-07
-      - 1.22231348e-07
-      - 4.49664e-08
-      - 1.6542214e-08
-      - 6.085541e-09
-      - 2.238745e-09
-      forcing: cosine
-      forcing_period: 365.0
-    engine_identity:
-      name: compartmental-starsim
-      version: '0.1'
-      code_sha256: 124c6e2f72644fbc2d3fd8d6d62a2fdf7fd5d9dcd357e57e4ec1bfad1894fd4a
-      params_sha256: 84120e872544e4d566f625a1bf62f2e5cbd865dd1031f8884dbb6087f73ef65d
-      config_sha256: 1ffd8300a2cb6d7dc41c19a6276dbd225ff1616deaea4908dd90eb8355983055
+configs_validated: {}
+configs_not_exercised:
+- cohorts
+- groups3
+- renewal
 seeds:
 - 1
 n_sims: 0
