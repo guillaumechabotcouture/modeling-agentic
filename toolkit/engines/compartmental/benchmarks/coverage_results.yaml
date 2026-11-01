@@ -5,145 +5,655 @@ engine_identity:
   code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
   params_sha256: 84120e872544e4d566f625a1bf62f2e5cbd865dd1031f8884dbb6087f73ef65d
   config_sha256: 6732c72c3c8e0a4c85c9956ba75427e3366bf846807814032db292edb7160eaf
-engine_config_sha256: eb08a7e62ffdea9c74880c27a4834b582eb105a2a39b8f42779c6cb39b096c86
+engine_config_sha256: 6430f390a3fc3746f15649cdcfe6c65ea257d47a896b6ffa069d5ecdaae006c8
 benchmarks:
 - id: SB1
-  metric: 'identified renewal fit: known initial susceptibility, unforced, complete
-    epidemic'
+  metric: 'identified renewal fit: known initial susceptibility and seeding, unforced,
+    complete epidemic'
   role: held_out
   target: null
-  band: null
+  band:
+  - 0.9
+  - 0.99
   source: ''
-  computed: null
-  in_band: false
-  status: not_assessable
-  not_assessable_because: 'calibrator toolkit.analysis.calibration:posterior not available
-    (AttributeError: module ''toolkit.analysis.calibration'' has no attribute ''posterior'')'
+  computed: 0.96
+  coverage:
+    r0: 0.96
+    attack_rate: 0.96
+    reff_end: 0.96
+  coverage_se:
+    r0: 0.013856406460551024
+    attack_rate: 0.013856406460551024
+    reff_end: 0.013856406460551024
+  class_share:
+    reporting: 1.0
+  replicates: 200
+  invalid_outputs: 0
+  class_counts:
+    r0:
+      identified: 200
+    reporting:
+      identified: 200
+  per_replicate_sha256: 788ea1ddc980744f16673f179b502d4826fcc072ac38649d94a201dc10e2ed28
+  interval_width_median:
+    r0: 0.027645032752568688
+    attack_rate: 0.008396845865098368
+    reff_end: 0.010604352895827257
+  sampler:
+    ess:
+      min: 2569.595342363747
+      median: 5002.759601776863
+      max: 6139.5327976842855
+    seconds:
+      min: 40.817
+      median: 42.256
+      max: 45.466
+  declaration_sha256: aafff2683ab0a035eb22d30eea6fe9f7224dab2416e9fa764ae967880b1b5e0e
+  code_sha256: c9f2be8b2a08b926ec62e3d0cec403dc1b6a98277200acfbcf417c70dc104be7
+  in_band: true
+  status: in_band
 - id: SB2a
-  metric: 'confounded: series truncated before depletion; prior range of reporting
-    carried'
+  metric: 'confounded: series truncated before depletion, seeding unknown; prior range
+    of reporting carried'
   role: held_out
   target: null
-  band: null
+  band:
+  - 0.9
+  - 0.99
   source: ''
-  computed: null
-  in_band: false
-  status: not_assessable
-  not_assessable_because: 'calibrator toolkit.analysis.calibration:posterior not available
-    (AttributeError: module ''toolkit.analysis.calibration'' has no attribute ''posterior'')'
+  computed: 0.95
+  coverage:
+    attack_rate: 0.95
+  coverage_se:
+    attack_rate: 0.015411035007422448
+  class_share:
+    reporting: 0.96
+  replicates: 200
+  invalid_outputs: 0
+  class_counts:
+    r0:
+      identified: 199
+      prior_dominated: 1
+    reporting:
+      prior_dominated: 192
+      identified: 4
+      partly_identified: 4
+    seed_share:
+      prior_dominated: 189
+      identified: 11
+  per_replicate_sha256: 1d1f19c1162bfcf2f6db06a6e7b9414e0e7440ccd640248e23435d34ac111e0c
+  interval_width_median:
+    attack_rate: 0.010366376099325112
+  sampler:
+    ess:
+      min: 2004.6642984257176
+      median: 3048.534000251354
+      max: 5101.2030584895565
+    seconds:
+      min: 23.198
+      median: 35.489999999999995
+      max: 48.523
+  declaration_sha256: b0db6abf3529932b196d8968a714e2fb70a26abe5858231dd650b606bd34230c
+  code_sha256: c9f2be8b2a08b926ec62e3d0cec403dc1b6a98277200acfbcf417c70dc104be7
+  in_band: true
+  status: in_band
 - id: SB2a_neg
   metric: 'negative control for SB2a: reporting fixed at its prior median (reproduces
     the v1 failure)'
   role: held_out
   target: null
-  band: null
+  band:
+  - 0.0
+  - 0.8
   source: ''
-  computed: null
-  in_band: false
-  status: not_assessable
-  not_assessable_because: 'calibrator toolkit.analysis.calibration:posterior not available
-    (AttributeError: module ''toolkit.analysis.calibration'' has no attribute ''posterior'')'
+  computed: 0.335
+  coverage:
+    attack_rate: 0.335
+  coverage_se:
+    attack_rate: 0.0333747659167821
+  class_share: {}
+  replicates: 200
+  invalid_outputs: 0
+  class_counts:
+    r0:
+      identified: 200
+    seed_share:
+      identified: 200
+  per_replicate_sha256: 59e75c38dd9f3370ec710ac9a625344e5b34d4849b4b060d1df0ccc8a047e34f
+  interval_width_median:
+    attack_rate: 0.0022385195733920244
+  sampler:
+    ess:
+      min: 2520.9857005087483
+      median: 4935.870553701776
+      max: 6382.687815072226
+    seconds:
+      min: 30.604
+      median: 35.7485
+      max: 44.579
+  declaration_sha256: 91f562e4bf2f62f24a2edd790bb6b2fd7646cb57fc0de572f4fe82b37e9d3dac
+  code_sha256: c9f2be8b2a08b926ec62e3d0cec403dc1b6a98277200acfbcf417c70dc104be7
+  in_band: true
+  status: in_band
 - id: SB2b
   metric: 'confounded: unknown initial susceptible share (declared prior) and unknown
     forcing amplitude, complete series'
   role: held_out
   target: null
-  band: null
+  band:
+  - 0.9
+  - 0.99
   source: ''
-  computed: null
+  computed: 0.28
+  coverage:
+    attack_rate: 0.28
+  coverage_se:
+    attack_rate: 0.03174901573277509
+  class_share:
+    reporting: 0.27
+  replicates: 200
+  invalid_outputs: 143
+  class_counts:
+    forcing_amplitude:
+      partly_identified: 21
+      identified: 17
+      prior_dominated: 19
+    r0:
+      partly_identified: 7
+      prior_dominated: 44
+      identified: 6
+    reporting:
+      prior_dominated: 54
+      identified: 3
+    s0:
+      identified: 14
+      prior_dominated: 43
+    seed_share:
+      prior_dominated: 54
+      identified: 3
+  per_replicate_sha256: c51b8f80edc83f1cdbd60805d10b17e8bcdfd5733add163f5e67478e7091525d
+  errors:
+  - 'CalibrationRefused: posterior_ess: effective sample size 102 below the floor
+    1000 after 6 adaptive stages'
+  - 'CalibrationRefused: posterior_ess: effective sample size 103 below the floor
+    1000 after 6 adaptive stages'
+  - 'CalibrationRefused: posterior_ess: effective sample size 105 below the floor
+    1000 after 6 adaptive stages'
+  - 'CalibrationRefused: posterior_ess: effective sample size 106 below the floor
+    1000 after 6 adaptive stages'
+  - 'CalibrationRefused: posterior_ess: effective sample size 115 below the floor
+    1000 after 6 adaptive stages'
+  interval_width_median:
+    attack_rate: 0.0005083533827786839
+  sampler:
+    ess:
+      min: 1077.1397373921786
+      median: 2288.2037898408707
+      max: 4066.153617868072
+    seconds:
+      min: 40.443
+      median: 79.227
+      max: 128.0
+  ridge_share: 0.21
+  declaration_sha256: 973c8930aac0df72eb98bb68c53bd01ec1579c1faeb14ebfb28aa31691ac07d8
+  code_sha256: c9f2be8b2a08b926ec62e3d0cec403dc1b6a98277200acfbcf417c70dc104be7
   in_band: false
-  status: not_assessable
-  not_assessable_because: 'calibrator toolkit.analysis.calibration:posterior not available
-    (AttributeError: module ''toolkit.analysis.calibration'' has no attribute ''posterior'')'
+  status: out_of_band
 - id: SB2c
   metric: 'identified despite known forcing: known susceptibility and depletion'
   role: held_out
   target: null
-  band: null
+  band:
+  - 0.9
+  - 0.99
   source: ''
-  computed: null
-  in_band: false
-  status: not_assessable
-  not_assessable_because: 'calibrator toolkit.analysis.calibration:posterior not available
-    (AttributeError: module ''toolkit.analysis.calibration'' has no attribute ''posterior'')'
+  computed: 0.97
+  coverage:
+    r0: 0.97
+    attack_rate: 0.97
+    reff_end: 0.97
+  coverage_se:
+    r0: 0.012062338081814825
+    attack_rate: 0.012062338081814825
+    reff_end: 0.012062338081814825
+  class_share:
+    reporting: 1.0
+  replicates: 200
+  invalid_outputs: 0
+  class_counts:
+    r0:
+      identified: 200
+    reporting:
+      identified: 200
+  per_replicate_sha256: c3144359ea62f87a5bfdd09481dba6027bd222ba01c5657e3d00fbee0cef9665
+  interval_width_median:
+    r0: 0.03211690341006901
+    attack_rate: 0.01198434792247488
+    reff_end: 0.013685138234974109
+  sampler:
+    ess:
+      min: 2868.755497981119
+      median: 5310.554130555865
+      max: 6156.223607974742
+    seconds:
+      min: 40.095
+      median: 42.3765
+      max: 44.898
+  declaration_sha256: 33fc49fe4adbc7a5c9e3f5e448a910c2072cff627ccbbf1d763733b66d23ec37
+  code_sha256: c9f2be8b2a08b926ec62e3d0cec403dc1b6a98277200acfbcf417c70dc104be7
+  in_band: true
+  status: in_band
 - id: SB3a
   metric: cohort immunity from two overlapping sources (admin coverage with numerator
     inflation and denominator error; serosurvey with assay error, waning, frame gap)
   role: held_out
   target: null
-  band: null
+  band:
+  - 0.9
+  - 0.99
   source: ''
-  computed: null
-  in_band: false
-  status: not_assessable
-  not_assessable_because: 'calibrator toolkit.analysis.calibration:posterior not available
-    (AttributeError: module ''toolkit.analysis.calibration'' has no attribute ''posterior'')'
+  computed: 0.925
+  coverage:
+    susceptible_share: 0.925
+  coverage_se:
+    susceptible_share: 0.01862458053218917
+  class_share:
+    omega: 1.0
+    delta: 1.0
+    net_bias:admin: 1.0
+  replicates: 200
+  invalid_outputs: 0
+  class_counts:
+    coverage[0]:
+      identified: 200
+    coverage[1]:
+      identified: 200
+    coverage[2]:
+      identified: 200
+    coverage[3]:
+      identified: 200
+    coverage[4]:
+      identified: 200
+    delta:
+      prior_dominated: 200
+    net_bias:admin:
+      identified: 200
+    omega:
+      prior_dominated: 200
+    rel_out:
+      prior_dominated: 200
+    se:
+      prior_dominated: 200
+    sp:
+      prior_dominated: 200
+    wane_rate:
+      partly_identified: 168
+      identified: 29
+      prior_dominated: 3
+  per_replicate_sha256: 55186e4fc12acefe8a650c7c037f5f4a585af48bacf6a3bb06254f4002676ade
+  interval_width_median:
+    susceptible_share: 0.08103766097437501
+  sampler:
+    ess_bulk_min:
+      min: 405.61093434311806
+      median: 698.3685938600456
+      max: 2107.2864383172578
+    rhat_max:
+      min: 1.002213762106132
+      median: 1.0067343177443648
+      max: 1.0099217227379849
+    seconds:
+      min: 36.588
+      median: 68.80250000000001
+      max: 236.63
+  declaration_sha256: be4fb08458144df36e14b4337db41b485b3b996cb6982c3f3836f46e01d569a6
+  code_sha256: c9f2be8b2a08b926ec62e3d0cec403dc1b6a98277200acfbcf417c70dc104be7
+  in_band: true
+  status: in_band
 - id: SB3b_admin_truth
   metric: 'negative control: administrative coverage taken as the truth'
   role: held_out
   target: null
-  band: null
+  band:
+  - 0.0
+  - 0.8
   source: ''
-  computed: null
-  in_band: false
-  status: not_assessable
-  not_assessable_because: 'calibrator toolkit.analysis.calibration:posterior not available
-    (AttributeError: module ''toolkit.analysis.calibration'' has no attribute ''posterior'')'
+  computed: 0.18
+  coverage:
+    susceptible_share: 0.18
+  coverage_se:
+    susceptible_share: 0.027166155414412252
+  class_share: {}
+  replicates: 200
+  invalid_outputs: 0
+  class_counts:
+    coverage[0]:
+      identified: 200
+    coverage[1]:
+      identified: 200
+    coverage[2]:
+      identified: 200
+    coverage[3]:
+      identified: 200
+    coverage[4]:
+      identified: 200
+  per_replicate_sha256: c57780651f41cef88dc1734abb1308042a7ccfcc8fe98a2f388210d633adc52e
+  interval_width_median:
+    susceptible_share: 0.03532491820166321
+  sampler:
+    ess_bulk_min:
+      min: 574.2154423366555
+      median: 796.6836185239467
+      max: 1819.475628189869
+    rhat_max:
+      min: 1.0021970559138995
+      median: 1.0063975437629282
+      max: 1.0099295791001508
+    seconds:
+      min: 10.626
+      median: 18.328
+      max: 28.859
+  declaration_sha256: 44e21db18722b5c8cb0ca15516e0b9661ce1626e908104e0fe1c99d23bc96bfc
+  code_sha256: c9f2be8b2a08b926ec62e3d0cec403dc1b6a98277200acfbcf417c70dc104be7
+  in_band: true
+  status: in_band
 - id: SB3b_sero_truth
   metric: 'negative control: the serosurvey taken as the truth'
   role: held_out
   target: null
-  band: null
+  band:
+  - 0.0
+  - 0.8
   source: ''
-  computed: null
-  in_band: false
-  status: not_assessable
-  not_assessable_because: 'calibrator toolkit.analysis.calibration:posterior not available
-    (AttributeError: module ''toolkit.analysis.calibration'' has no attribute ''posterior'')'
+  computed: 0.465
+  coverage:
+    susceptible_share: 0.465
+  coverage_se:
+    susceptible_share: 0.03526861210765175
+  class_share: {}
+  replicates: 200
+  invalid_outputs: 0
+  class_counts:
+    coverage[0]:
+      identified: 200
+    coverage[1]:
+      identified: 200
+    coverage[2]:
+      identified: 200
+    coverage[3]:
+      identified: 200
+    coverage[4]:
+      identified: 200
+  per_replicate_sha256: 7ffeb3e83ababbc87d37376e8fa90bd5c758acec5c1ab5baa86093f50129e52b
+  interval_width_median:
+    susceptible_share: 0.06337788946158739
+  sampler:
+    ess_bulk_min:
+      min: 611.9518729798472
+      median: 833.2671001245506
+      max: 1923.4641792540995
+    rhat_max:
+      min: 1.0024770040668871
+      median: 1.0061343683205697
+      max: 1.0099493156840735
+    seconds:
+      min: 13.075
+      median: 23.3405
+      max: 36.246
+  declaration_sha256: 12360ce6420c81fa9bf83e0538e031b6c2175025057ca380f92351007a86b8b4
+  code_sha256: c9f2be8b2a08b926ec62e3d0cec403dc1b6a98277200acfbcf417c70dc104be7
+  in_band: true
+  status: in_band
 - id: SB3c
   metric: 'administrative coverage only: every bias parameter prior-dominated, prior
     ranges carried'
   role: held_out
   target: null
-  band: null
+  band:
+  - 0.9
+  - 0.99
   source: ''
-  computed: null
-  in_band: false
-  status: not_assessable
-  not_assessable_because: 'calibrator toolkit.analysis.calibration:posterior not available
-    (AttributeError: module ''toolkit.analysis.calibration'' has no attribute ''posterior'')'
+  computed: 0.905
+  coverage:
+    susceptible_share: 0.905
+  coverage_se:
+    susceptible_share: 0.02073342711661533
+  class_share:
+    omega: 1.0
+    delta: 1.0
+    rel_out: 1.0
+  replicates: 200
+  invalid_outputs: 0
+  class_counts:
+    coverage[0]:
+      prior_dominated: 185
+      identified: 15
+    coverage[1]:
+      prior_dominated: 180
+      identified: 20
+    coverage[2]:
+      prior_dominated: 176
+      identified: 24
+    coverage[3]:
+      prior_dominated: 176
+      identified: 24
+    coverage[4]:
+      prior_dominated: 185
+      identified: 15
+    delta:
+      prior_dominated: 200
+    net_bias:admin:
+      prior_dominated: 200
+    omega:
+      prior_dominated: 200
+    rel_out:
+      prior_dominated: 200
+  per_replicate_sha256: 7195c202ffe1c3607b1264e6506d27484407ebf72a2e072080b1d05718ab80a5
+  interval_width_median:
+    susceptible_share: 0.12923243059632727
+  sampler:
+    ess_bulk_min:
+      min: 401.1452490748411
+      median: 774.8189821807066
+      max: 1781.937317840365
+    rhat_max:
+      min: 1.0020015164886196
+      median: 1.0068260155750066
+      max: 1.0099930682826639
+    seconds:
+      min: 25.291
+      median: 47.718
+      max: 125.318
+  declaration_sha256: be8ece3c0c15d49683b592cabc736683e49b03ea4de401030a1473488f29dad3
+  code_sha256: c9f2be8b2a08b926ec62e3d0cec403dc1b6a98277200acfbcf417c70dc104be7
+  in_band: true
+  status: in_band
 - id: SB5
   metric: 'group-attack-rate calibration of q: coverage of hospitalisations averted
     by a fixed plan'
   role: held_out
   target: null
-  band: null
+  band:
+  - 0.9
+  - 0.99
   source: ''
-  computed: null
-  in_band: false
-  status: not_assessable
-  not_assessable_because: 'calibrator toolkit.analysis.calibration:posterior not available
-    (AttributeError: module ''toolkit.analysis.calibration'' has no attribute ''posterior'')'
+  computed: 0.93
+  coverage:
+    hospitalisations_averted: 0.93
+  coverage_se:
+    hospitalisations_averted: 0.01804161855266871
+  class_share: {}
+  replicates: 200
+  invalid_outputs: 0
+  class_counts:
+    q:
+      identified: 200
+  per_replicate_sha256: 0be63c1338a2846269ee4ebb7b50818166383fb1a900c39499f379811680526d
+  interval_width_median:
+    hospitalisations_averted: 6.86944311617882e-05
+  sampler:
+    ess:
+      min: 6415.8796799814645
+      median: 8468.101210393806
+      max: 9168.99249868409
+    seconds:
+      min: 70.73
+      median: 87.941
+      max: 110.932
+  declaration_sha256: 99543c0f3493cee1b371a84346c50d6fd8903cadc4a8324e2fa1c22e22ad4225
+  code_sha256: c9f2be8b2a08b926ec62e3d0cec403dc1b6a98277200acfbcf417c70dc104be7
+  in_band: true
+  status: in_band
 settings_calibrated: {}
 fitted_used: {}
-configs_validated: {}
-configs_not_exercised:
-- cohorts
-- groups3
-- renewal
+configs_validated:
+  cohorts:
+    config:
+      groups:
+      - b2021
+      - b2022
+      - b2023
+      - b2024
+      - b2025
+      structure: birth_cohorts
+      mode: to_extinction
+      initialiser: cohort_history
+      doses:
+      - d1
+      dt: day
+      generation_interval:
+      - 0.5
+      - 0.5
+    engine_identity:
+      name: compartmental-starsim
+      version: '0.1'
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
+      params_sha256: d92e590c60d79025f414cb6bc3527495ef6f234f26c46d90a99e4399541516f4
+      config_sha256: 10303480f25dd87f82dd4e2bd2df09b26249aa6c28ff70729ad3af842a6cb647
+    config_sha256: 78176ef3011a0c39b5d5723a55120738c373470ec9a3866616a6c3a3002a087b
+  groups3:
+    config:
+      groups:
+      - a
+      - b
+      - c
+      structure: age_groups_contact_matrix
+      mode: to_extinction
+      initialiser: given
+      dt: day
+      transmission: q
+      generation_interval:
+      - 0.5
+      - 0.3
+      - 0.2
+      components:
+        plan:
+          kind: campaign
+          targets:
+          - b
+          reach: 0.5
+      outcomes:
+      - hospitalisations
+    engine_identity:
+      name: compartmental-starsim
+      version: '0.1'
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
+      params_sha256: 90ac425c1ea2af7fd5ff9f111d1383d9f322c05b38ef79e9752a7727bf2fe281
+      config_sha256: 8ef4b24217e2217589e4cc0407cc539694dc595361db772d29c368e53cc5a5e5
+    config_sha256: 35307247ef7685ee19db2ac29555d738411e6b7fbea6d80c0226d68521b58bb2
+  renewal:
+    config:
+      groups:
+      - all
+      structure: single_group
+      mode: windowed
+      initialiser: given
+      dt: day
+      generation_interval:
+      - 0.19222968801614
+      - 0.107555584944665
+      - 0.093237559583233
+      - 0.080825579829346
+      - 0.070065908888554
+      - 0.060738587941397
+      - 0.05265293954843
+      - 0.045643669651416
+      - 0.039567488484311
+      - 0.034300181315669
+      - 0.029734069139977
+      - 0.02577580740709
+      - 0.022344477789424
+      - 0.01936993397711
+      - 0.016791367684377
+      - 0.014556065552166
+      - 0.012618331534487
+      - 0.010938552738968
+      - 0.009482389624663
+      - 0.008220074002441
+      - 0.007125800487027
+      - 0.006177198960233
+      - 0.005354877260986
+      - 0.004642024753423
+      - 0.004024068668836
+      - 0.003488376196091
+      - 0.003023996230406
+      - 0.002621435501067
+      - 0.002272464501495
+      - 0.001969949254313
+      - 0.001707705472193
+      - 0.001480372133127
+      - 0.001283301885614
+      - 0.001112466043346
+      - 0.000964372227199
+      - 0.000835992970892
+      - 0.000724703830813
+      - 0.000628229734796
+      - 0.00054459847306
+      - 0.000472100380534
+      - 0.000409253386348
+      - 0.000354772716023
+      - 0.000307544626955
+      - 0.000266603640294
+      - 0.000231112803764
+      - 0.000200346581932
+      - 0.000173676024168
+      - 0.000150555907067
+      - 0.000130513588514
+      - 0.000113139345499
+      - 9.8077998206e-05
+      - 8.5021649096e-05
+      - 7.3703388602e-05
+      - 6.3891838716e-05
+      - 5.5386422957e-05
+      - 4.8013266008e-05
+      - 4.1621639197e-05
+      - 3.6080879171e-05
+      - 3.1277716757e-05
+      - 2.7113961411e-05
+      forcing: cosine
+      forcing_period: 365.0
+      rt_trajectory: false
+    engine_identity:
+      name: compartmental-starsim
+      version: '0.1'
+      code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
+      params_sha256: 84120e872544e4d566f625a1bf62f2e5cbd865dd1031f8884dbb6087f73ef65d
+      config_sha256: 6732c72c3c8e0a4c85c9956ba75427e3366bf846807814032db292edb7160eaf
+    config_sha256: 6430f390a3fc3746f15649cdcfe6c65ea257d47a896b6ffa069d5ecdaae006c8
+configs_not_exercised: []
 seeds:
 - 1
 n_sims: 0
 summary:
-  in_band: 0
+  in_band: 9
   total: 10
   by_status:
-    in_band: 0
-    out_of_band: 0
-    not_assessable: 10
+    in_band: 9
+    out_of_band: 1
+    not_assessable: 0
     band_mis_based: 0
-  held_out_in_band: 0
+  held_out_in_band: 9
   held_out_total: 10
 engine_version: '0.1'
 fit_rule: null
-wall_s: 0.0
+wall_s: 13809.9

@@ -828,3 +828,56 @@ built and self-tested on a toy conjugate case (an exact posterior covers, a half
   in the test's mapping, not a change to the engine.
 - The observation forward maps (`toolkit/analysis/observation.py`) are the only part of §3.4 built here;
   the likelihoods and the per-source measurement model stay in β.
+
+## Addendum: β measured (2026-11-01, branch `v2-calibration`, calibration part)
+
+**Built.** These parts of β are built:
+- the `posterior` calibration (§3.1);
+- the observation likelihoods and the per-source measurement model (§3.4);
+- the identifiability classes (§3.2), with prior_range tests and label names;
+- draw provenance and its contract check (§3.3);
+- the ridge refusal in `likelihood`;
+- `method: posterior` on the allocation path, including the stability folds.
+
+These tests were written failing first: AN-b3, AN-b7, AN-b8, AN-b9 and AN-b10. Not built in this PR: the maximise objective, the estimates path, resource caps, the single `benefit()`, the `structure` test, and AN-b1, b2 and b4–b6.
+
+**Coverage pack (`benchmarks/coverage_results.yaml`, 200 replicates per case, two 8-vCPU dev VMs).**
+
+| Case | Coverage (binomial SE about 0.015–0.02) | Band | Classes | Status |
+|---|---|---|---|---|
+| SB1 identified renewal | R0, attack rate, reff_end each 0.96 | [0.90, 0.99] | reporting `identified` 200/200 | in band |
+| SB2a truncated, seeding unknown | attack rate 0.95 | [0.90, 0.99] | reporting prior-dominated 192/200 (0.96) | in band |
+| SB2a_neg reporting fixed | 0.335 | < 0.80 | – | in band (under-covers, as the negative control should) |
+| SB2b s0, forcing and seeding unknown | 0.28 | [0.90, 0.99] | reporting prior-dominated 54 of the 57 completed fits | **out of band**: 143 of 200 fits refused, ESS about 100 below the floor of 1,000 after 6 adaptive stages |
+| SB2c known forcing | 0.97 each | [0.90, 0.99] | reporting `identified` 200/200 | in band |
+| SB3a two overlapping sources | susceptible share 0.925 | [0.90, 0.99] | ω and δ `prior_dominated` 200/200; `net_bias:admin` (the coverage-to-immunity ratio) `identified` 200/200 | in band |
+| SB3b administrative data taken as truth | 0.18 | < 0.80 | – | in band (under-covers) |
+| SB3b serosurvey taken as truth | 0.465 | < 0.80 | – | in band (under-covers) |
+| SB3c administrative data only | 0.905 | [0.90, 0.99] | ω, δ and rel_out `prior_dominated` 200/200 | in band |
+| SB5 group attack rate, q | hospitalisations averted 0.93 | [0.90, 0.99] | q `identified` 200/200 | in band |
+
+In SB3a the assay parameters se and sp are `prior_dominated`, and waning is `partly_identified` (168/200). The ratio is identified given the assay-validation ranges, as §3.4 anticipated ("up to the assay and waning terms").
+
+**Deviations from the note, and why (measured).**
+- **SB1/SB2 generator.** The renewal SB cases now generate from an independent implementation of the declared discrete renewal process (`oracles.renewal_discrete`), not from the SIR ODE. O19 checks that it equals the engine's windowed run.
+  - With the ODE, the daily renewal engine's growth differs: R0 2.43 needs about 2.50 in the engine to match the ODE's early growth. At the data's precision the R0 interval then covered 2 of 10 replicates (Codex round 2).
+  - The engine-against-ODE approximation stays RN4's job (R0 within 5%).
+  - The renewal configuration also moved from weekly to daily steps, with the cases reported weekly. A weekly step cannot carry generations shorter than a week: R0 2.43 grew ×2.1 per week in the engine against ×4.2 in the ODE.
+- **Unknown seeding in SB2a and SB2b.** With a known seed, the early level identifies reporting (seed × growth × reporting), so the cases would not be confounded. §5 already names the seeding as the confounder for SB2a.
+- **SB5's q range** starts at 0.45, not 0.40. With ρ(C) = 2.49, q = 0.4015 is critical, and the engine fails closed at its step cap on near-critical epidemics: 22,681 steps at q = 0.4016, and no convergence within 400,000 at criticality. The posterior now refuses on any engine failure (`posterior_engine_failure`) rather than drop the parameter sets the engine failed on.
+- **Sampler by evaluation path.** One `run_batch()` call costs about 40 ms whatever the batch size (Starsim initialisation), so 4-chain Metropolis on the engine takes about 20 min per fit. `run_batch()` problems therefore use importance sampling up to 5 parameters (`max_importance_params_run_batch`), and `initial_state()` problems keep 4. At 5, 2 of 200 SB3b fits fell below the ESS floor. Metropolis may double its draws up to 4 times (`mcmc_max_doublings`); at 3 doublings, 2 of 200 SB3a fits stopped at R-hat 1.011–1.012.
+- **SB2b is the open item.** Its posterior is a curved ridge in 5 dimensions (reporting with s0, s0 with R0, seeding). Single Gaussian adaptive stages do not reach the ESS floor there, and the step fails closed, as designed. Proposed fix: a population Monte Carlo proposal (a mixture of local Gaussians at resampled points), or adaptive Metropolis with many vectorised chains in one `run_batch()` call, so one engine call serves all chains. Either changes the calibration code, so every case is re-run with it.
+- **Classes.** Likelihood identifiability uses the Fisher information of the likelihood alone, in prior-scale units: each parameter on its prior's own scale, divided by the prior sd.
+  - The curvature is Richardson-extrapolated from steps h and h/2, because a straight step along a curved exact ridge gains curvature in proportion to h².
+  - Near a bound, the step shrinks rather than the point moving.
+  - A flat direction loads every parameter that carries at least half of its largest loading, so a null direction spread over many parameters is still a ridge.
+  - The profile likelihood is not computed for posterior fits.
+  - In prior-scale units, a parameter whose prior is much narrower than its partner's absorbs the flat direction, and the partner is classed by that narrow prior's information. The ridge list records this.
+- **`ridge_names` in SB2b** (ridge share 0.21) is computed on the 57 completed fits only.
+- **Worker memory.** A coverage worker's memory grows by about 0.3 GB per engine-backed fit, which broke the SB5 pool once on a 32 GiB VM. Replicates now run in fresh worker pools per chunk.
+
+**Spend.** 70.2 Coiled credits (about US$4.28) across seven VM sessions in the IDM default workspace (`idm-coiled-idmad-r2`), including two runs discarded because review fixes changed the calibration code; every cluster is stopped. The final pass ran in about 2 h of wall time on two VMs.
+
+**Codex review.** Two read-only rounds: 11 findings, then 5. Each was fixed with a test written failing first:
+- r1: floored zero expectations; engine failures; distributed null directions; finite-difference curvature on ridges; the gate re-reading draws; noise for unbiased sources; unit attributes in tests and label; NaN provenance; maternal-antibody exclusion refused; weak ridges refused; merge digests.
+- r2: beta-binomial point masses; the stencil near bounds; the renewal generator; configurations and thresholds in the digests; posterior refused on the emulator path.
