@@ -39,6 +39,7 @@ import dataclasses
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tarfile
@@ -305,7 +306,13 @@ def launch(cfg):
     client = cluster.get_client()
     client.wait_for_workers(n0, timeout=1800)
     client.upload_file(os.path.join(HERE, "worker_side.py"))
-    workers = sorted(client.scheduler_info()["workers"])[:len(cfg.labels)]
+    box = [client]
+
+    def run_client():   # a client closed since the upload is replaced, and the replacement kept
+        box[0] = ws.live_client(cluster, box[0])
+        return box[0]
+    workers = sorted(ws.scheduler_workers(run_client, min_workers=n0))[:len(cfg.labels)]
+    client = box[0]
     compute.register_compute_tags(client, exclude=workers)   # the agent VMs never take compute tasks
     launch_id = time.strftime("%Y%m%d-%H%M%S")
     assign = {}
@@ -326,10 +333,11 @@ def launch(cfg):
     json.dump(clusters, open(cfg.clusters_file, "w"), indent=1)
     time.sleep(10)
     if cfg.keeper:
-        clusters["keeper"] = {"name": cfg.keeper_name,
-                              "id": start_keeper(cfg, adapt_options(cfg, compute.ADAPT_OPTIONS), cluster.cluster_id,
-                                                 overflow)}
-        json.dump(clusters, open(cfg.clusters_file, "w"), indent=1)
+        kc = start_keeper(cfg, adapt_options(cfg, compute.ADAPT_OPTIONS), cluster.cluster_id, overflow)
+        clusters["keeper"] = {"name": cfg.keeper_name, "id": kc.cluster_id}
+        json.dump(clusters, open(cfg.clusters_file, "w"), indent=1)   # recorded before any read that can fail
+        time.sleep(30)
+        confirm_keeper(cfg.keeper_name, kc)
     print(f"launched {cfg.name}: results go to outputs/{cfg.storage_prefix}/; the cluster stops itself "
           "once every run is stored. Safe to disconnect.")
 
@@ -396,10 +404,47 @@ def start_keeper(cfg, adapt_opts, cluster_id, overflow=None):
                    cfg.keeper_hours, dict(adapt_opts), cluster_id, overflow, pure=False,
                    key=f"keeper-{cfg.name}-{cluster_id}")   # a new key per run cluster: never an old future
     fire_and_forget(fut)
-    time.sleep(30)
-    w = sorted(c.scheduler_info()["workers"])[0]
-    print(c.run(ws.keeper_log, workers=[w])[w].strip().splitlines()[-1:], f"(keeper {cfg.keeper_name}, pool {lo}..{hi})")
-    return kc.cluster_id
+    print(f"keeper {cfg.keeper_name} submitted (pool {lo}..{hi})", flush=True)
+    return kc
+
+
+KEEPER_TICK = re.compile(r"\bworkers=\d+ \(overflow \d+\)")   # _keeper_loop's tick line
+
+
+def confirm_keeper(keeper_name, kc, attempts=8, delay_s=5.0, max_delay_s=60.0, sleep=None):
+    """Wait (bounded, doubling backoff) for the keeper's first tick line: it is written only
+    after adapt() and a worker-table read, so it is the evidence the pool is held; a readable
+    log alone ("(no log yet)", "keeper error ...; retrying") is not. The keeper cluster's
+    client can be closed by now (a failed reconnect closes it and empties its scheduler
+    identity: v2blind1's `KeyError: 'workers'`), so a closed client is replaced. Past the
+    bound the launch fails with a message saying what to check; the run is already fired
+    and clusters.json already names the keeper."""
+    sleep = sleep or time.sleep
+    box = [None]
+
+    def client():
+        box[0] = ws.live_client(kc, box[0])
+        return box[0]
+    delay, last = delay_s, ["(not read)"]
+    for i in range(max(1, int(attempts))):
+        try:
+            w = sorted(ws.scheduler_workers(client, attempts=3, delay_s=delay_s, min_workers=1, sleep=sleep,
+                                            log=print))[0]
+            lines = box[0].run(ws.keeper_log, workers=[w])[w].strip().splitlines()
+            ticks = [ln for ln in lines if KEEPER_TICK.search(ln)]
+            if ticks:
+                print(ticks[-1:], f"(keeper {keeper_name})")
+                return ticks[-1:]
+            last = lines[-1:] or ["(empty log)"]
+        except Exception as e:  # noqa: BLE001 — retried, then reported
+            last = [f"{type(e).__name__}: {str(e)[:200]}"]
+        if i < attempts - 1:
+            sleep(delay)
+            delay = min(max_delay_s, delay * 2)
+    raise SystemExit(f"keeper {keeper_name} (cluster {kc.cluster_id}) was submitted but not confirmed holding "
+                     f"the pool after {attempts} tries (last: {last[0][:200]}). The run is fired and the clusters "
+                     f"file names the keeper; check `status` and `keeper-log` now (without a keeper the pool "
+                     f"stays at its start size).")
 
 
 def keeper_lines(st: dict | None, now: float | None = None) -> list[str]:
@@ -434,7 +479,7 @@ def status(cfg):
     if keep:
         try:
             kc = attach(cfg.keeper_name).get_client()
-            w = sorted(kc.scheduler_info()["workers"])[0]
+            w = sorted(ws.scheduler_workers(lambda: kc, attempts=3, min_workers=1))[0]
             print("\n".join(keeper_lines(kc.run(ws.keeper_status, workers=[w])[w])))
         except Exception as e:  # noqa: BLE001 — a keeper from before Phase 42 β has no status file
             print(f"keeper status unavailable: {type(e).__name__}: {str(e)[:120]}")
@@ -1033,6 +1078,161 @@ def _self_test_42b(ok, RunConfig) -> None:
     ok("none yet" in keeper_lines(None)[0], "RC33d status says when the keeper has written no status yet")
 
 
+def _self_test_52(ok) -> None:
+    """The keeper's `KeyError: 'workers'` race (no Coiled, no network). distributed's
+    Client.scheduler_info() returns {} when the client is not connected: before its first
+    identity reply, while reconnecting, and after a failed reconnect closes it. v2blind1
+    (2026-10-31) crashed at the end of `launch` on it, before clusters.json recorded the keeper."""
+    import contextlib
+    import io
+    import tempfile
+    import types
+
+    class FakeClient:
+        def __init__(self, infos, status="running", log="12:00:00 keeper holding x 3..9 {}\n12:00:01 workers=3 (overflow 0) refusals=0 active=primary"):
+            self.infos, self.status, self.log, self.calls = list(infos), status, log, 0
+
+        def scheduler_info(self):
+            self.calls += 1
+            return self.infos.pop(0) if len(self.infos) > 1 else self.infos[0]
+
+        def run(self, fn, workers):
+            return {w: self.log for w in workers}
+
+    table = {"tls://10.0.0.5:1": {"name": "a"}, "tls://10.0.0.6:1": {"name": "b"}}
+    sleeps = []
+    c = FakeClient([{}, {"id": "s"}, {"workers": table}])
+    got = ws.scheduler_workers(lambda: c, attempts=5, delay_s=2.0, sleep=sleeps.append)
+    ok(got == table and sleeps == [2.0, 4.0],
+       f"RC52a the worker table is read once the scheduler has populated it, with doubling backoff: {sleeps}")
+    sleeps.clear()
+    try:
+        ws.scheduler_workers(lambda: FakeClient([{}]), attempts=4, delay_s=5.0, max_delay_s=8.0, sleep=sleeps.append)
+        ok(False, "RC52b a worker table that never appears is refused after the bound")
+    except ws.SchedulerInfoUnavailable as e:
+        ok(sleeps == [5.0, 8.0, 8.0] and "4 tries" in str(e) and "no worker table" in str(e),
+           f"RC52b a worker table that never appears is refused after the bound, naming why: {e} {sleeps}")
+    c = FakeClient([{"workers": {}}, {"workers": table}])
+    got = ws.scheduler_workers(lambda: c, attempts=3, delay_s=0.0, sleep=sleeps.append, min_workers=1)
+    ok(got == table, "RC52c min_workers: an empty table (no worker joined yet) is waited out")
+    closed = FakeClient([{}], status="closed")
+    fresh = FakeClient([{"workers": table}])
+    ok(ws.live_client(types.SimpleNamespace(get_client=lambda: fresh), closed) is fresh
+       and ws.live_client(types.SimpleNamespace(get_client=lambda: closed), fresh) is fresh,
+       "RC52d a closed client is replaced from its cluster; an open one is kept")
+
+    # v2blind1's sequence: the keeper cluster's client failed to reconnect ("closing client"),
+    # so scheduler_info() returned {}; `launch` died with KeyError: 'workers'.
+    calls = iter([closed, fresh])
+    kc = types.SimpleNamespace(cluster_id=2307781, get_client=lambda: next(calls, fresh))
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        line = confirm_keeper("x-keeper", kc, attempts=3, delay_s=0.0, sleep=lambda s: None)
+    ok("keeper holding" in out.getvalue() or "workers=3" in out.getvalue(),
+       f"RC52e replay v2blind1: a closed keeper client is replaced and the keeper's log line printed: {line}")
+    kc2 = types.SimpleNamespace(cluster_id=9, get_client=lambda: FakeClient([{}], status="closed"))
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            confirm_keeper("x-keeper", kc2, attempts=2, delay_s=0.0, sleep=lambda s: None)
+        ok(False, "RC52f a keeper that cannot be confirmed fails the launch with a clear message")
+    except SystemExit as e:
+        ok("x-keeper" in str(e) and "not confirmed" in str(e) and "keeper-log" in str(e),
+           f"RC52f a keeper that cannot be confirmed fails the launch with a clear message: {e}")
+
+    # Codex round 1: a readable log is not proof; only a tick line (written after adapt()
+    # and a worker-table read) confirms the keeper is holding the pool.
+    for log in ("(no log yet)", "12:00:00 keeper holding x 3..9 {}\n12:00:01 keeper error OSError: no; retrying"):
+        kc3 = types.SimpleNamespace(cluster_id=10, get_client=lambda log=log: FakeClient([{"workers": table}], log=log))
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                confirm_keeper("x-keeper", kc3, attempts=2, delay_s=0.0, sleep=lambda s: None)
+            ok(False, f"RC52h a keeper log with no tick line is not confirmation: {log[-40:]!r}")
+        except SystemExit as e:
+            ok("not confirmed" in str(e), f"RC52h a keeper log with no tick line is not confirmation: {log[-40:]!r}")
+    late = FakeClient([{"workers": table}], log="(no log yet)")
+    logs = iter(["(no log yet)", "12:00:00 keeper holding x 3..9 {}",
+                 "12:00:00 keeper holding x 3..9 {}\n12:01:00 workers=3 (overflow 0) refusals=0 active=primary"])
+    late.run = lambda fn, workers: {w: next(logs) for w in workers}
+    with contextlib.redirect_stdout(io.StringIO()):
+        line = confirm_keeper("x-keeper", types.SimpleNamespace(cluster_id=11, get_client=lambda: late),
+                              attempts=4, delay_s=0.0, sleep=lambda s: None)
+    ok("workers=3" in str(line), f"RC52i a keeper whose first tick comes late is confirmed once it ticks: {line}")
+
+    # Codex round 1: launch keeps the replacement client for the rest of the launch.
+    from unittest import mock
+
+    class LaunchClient(FakeClient):
+        def wait_for_workers(self, *a, **kw):
+            pass
+
+        def upload_file(self, *a):
+            self.status = "closed"   # the client drops right after the upload
+
+    old_c, new_c = LaunchClient([{}]), LaunchClient([{"workers": {f"tls://a:{i}": {} for i in range(4)}}])
+    run_cl = types.SimpleNamespace(cluster_id=12, get_client=lambda: old_c if old_c.status == "running" else new_c)
+    used = []
+    comp = types.SimpleNamespace(WORKER_VM_TYPES=[], WORKER_OPTIONS={}, ADAPT_OPTIONS={},
+                                 register_compute_tags=lambda c, exclude: used.append(c))
+    fake_coiled = types.ModuleType("coiled")
+    fake_coiled.Cluster = lambda **kw: run_cl
+    with tempfile.TemporaryDirectory() as d:
+        q = os.path.join(d, "q.txt")
+        open(q, "w").write("question")
+        lcfg = RunConfig(name="lt", question_file=q, labels=("R1",), out_dir=d, keeper=False, overflow_max=0)
+        with mock.patch.dict(sys.modules, {"coiled": fake_coiled}), \
+                mock.patch.object(sys.modules[__name__], "is_running", return_value=False), \
+                mock.patch.object(sys.modules[__name__], "read_keys", return_value={"ANTHROPIC_API_KEY": "k"}), \
+                mock.patch.object(sys.modules[__name__], "code_tarball", return_value=(b"", "c0")), \
+                mock.patch.object(sys.modules[__name__], "_compute", return_value=comp), \
+                mock.patch.object(sys.modules[__name__], "_submit", side_effect=lambda cfg, c, *a: used.append(c)), \
+                mock.patch.object(eval_paths, "archive_sha256", return_value="0"), \
+                mock.patch.object(time, "sleep", lambda s: None), contextlib.redirect_stdout(io.StringIO()):
+            launch(lcfg)
+    ok(used and all(c is new_c for c in used),
+       f"RC52j launch uses the replacement client after the first one closed: {[c is new_c for c in used]}")
+
+    # The keeper loop itself, on a fake coiled: the first tick's identity is empty.
+    class FakeCluster:
+        adapts = []
+
+        def __init__(self, **kw):
+            self.cluster_id = 7
+            self.client = FakeClient([{}, {"workers": table}])
+
+        def adapt(self, **kw):
+            FakeCluster.adapts.append(kw)
+
+        def get_client(self):
+            return self.client
+
+    ticks = iter([True] * 6)
+    fake = types.ModuleType("coiled")
+    fake.list_clusters = lambda workspace: ([{"name": "x", "id": 7, "current_state": {"state": "running"}}]
+                                            if next(ticks, False) else [])
+    fake.Cluster = FakeCluster
+    real_coiled, real_sleep = sys.modules.get("coiled"), time.sleep
+    paths = (ws.KEEPER_STATUS, ws.KEEPER_LOG)
+    with tempfile.TemporaryDirectory() as d:
+        ws.KEEPER_STATUS, ws.KEEPER_LOG = os.path.join(d, "st.json"), os.path.join(d, "keeper.log")
+        sys.modules["coiled"] = fake
+        time.sleep = lambda s: None
+        try:
+            r = ws._keeper_loop("tok", "x", "ws", 3, 9, 1.0, {}, cluster_id=7, tick_s=0)
+            log = open(ws.KEEPER_LOG).read()
+            st = json.load(open(ws.KEEPER_STATUS))
+        finally:
+            time.sleep = real_sleep
+            ws.KEEPER_STATUS, ws.KEEPER_LOG = paths
+            if real_coiled is None:
+                sys.modules.pop("coiled", None)
+            else:
+                sys.modules["coiled"] = real_coiled
+    ok(r == "keeper exited" and len(FakeCluster.adapts) == 1 and "keeper error" not in log
+       and st.get("workers") == 2 and "workers=2" in log and KEEPER_TICK.search(log),
+       f"RC52g the keeper loop waits out an unpopulated scheduler identity without dropping its adapt(): "
+       f"adapts={len(FakeCluster.adapts)} log={log[-300:]!r}")
+
+
 def _self_test_51c(ok) -> None:
     """Phase 51 γ: the `health` command on a fake cluster (no Coiled, no network)."""
     import contextlib
@@ -1350,6 +1550,7 @@ def _self_test() -> int:
             ok(True, "RC15 a config without CONFIG is refused")
     _self_test_42b(ok, RunConfig)
     _self_test_51c(ok)
+    _self_test_52(ok)
     for f in sorted(os.listdir(os.path.join(HERE, "configs"))):
         if f.endswith(".py") and not f.startswith("_"):   # _*.py: shared helpers (configs/_eval.py)
             try:
@@ -1384,7 +1585,7 @@ def main(argv) -> int:
         report_cost(cfg, rest)
     elif cmd == "keeper-log":
         c = attach(cfg.keeper_name).get_client()
-        w = sorted(c.scheduler_info()["workers"])[0]
+        w = sorted(ws.scheduler_workers(lambda: c, attempts=3, min_workers=1))[0]
         print(c.run(ws.keeper_log, workers=[w])[w])
     elif cmd == "brief":
         r = _side(cfg, ws.brief_side)
