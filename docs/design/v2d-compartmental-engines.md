@@ -144,7 +144,10 @@ fade-out) would draw from Starsim's seeded random streams behind the same contra
 
 **Runtime per evaluation, and batching.** A Starsim sim has a fixed cost per sim (initialisation) and per
 step (the module loop), which a closed-form solve does not. The estimate, to be measured in δ before
-anything depends on it, is 20–100 ms per sim for one unit, 5 groups and 50–200 steps on one core. One sim
+anything depends on it, was 20–100 ms per sim for one unit, 5 groups and 50–200 steps on one core.
+*Measured in δ (2026-11-01, dev VM, one core of a Xeon Platinum 8573C, Starsim 3.3.4): 37 / 56 / 92 ms per
+sim at 50 / 100 / 200 steps, and 54 / 88 / 149 ms for a batch of 1,024 (0.05–0.15 ms per member), so `direct`
+evaluation stays the default (addendum "δ measured").* One sim
 per evaluation is too slow in two places:
 - per-draw re-optimisation over a joint package space: 4,368 packages × 1,000 draws × 50 ms is about
   60 core-hours;
@@ -780,3 +783,41 @@ claims were re-computed before editing:
 | 14 | family capabilities do not certify a configuration | matching on the configured card; typed `engine_needs.dynamics` where the spec is ambiguous |
 | 15 | the runner cannot build configured engines | pack `configs` through workers, cache keys and identity |
 | 16 | changing `contract.py` invalidates malaria results | byte-identical contract, capabilities from `card.yaml` (owner decision, open question 10) |
+
+## Addendum: δ measured (2026-11-01, branch `v2d-delta-engine`)
+
+**Runtime spike (go).** `benchmarks/runtime_spike.py` and `runtime_spike.json`: one `ss.Module` with the
+exponential-survival step, 5 groups, one thread. Per sim 37 / 56 / 92 ms at 50 / 100 / 200 steps (about
+27–63 ms of it is `ss.Sim` initialisation, which grows with the number of steps); a batch of 1,024 in 54 /
+88 / 149 ms. Inside the 20–100 ms estimate, so no emulator fallback.
+
+**Pack (`benchmarks/results.yaml`, stamped by the runner).** 51 of 51 assessable benchmarks in band (FS1–FS8,
+BR1, RN1–RN4 with the linear-form negative control, CI1–CI4, OB1); FS7 and RN5 `not_assessable` until
+transcribed. 44 engine runs, 74 s on 4 workers.
+
+**Coverage pack (`benchmarks/coverage.yaml`).** SB1–SB3 and SB5 are written with their independent generators,
+but all ten cases are `not_assessable`: they need the harness `posterior` calibration with observation
+likelihoods and identifiability classes (§3.1–§3.4), which is workstream β. The runner's `coverage` type is
+built and self-tested on a toy conjugate case (an exact posterior covers, a half-width one is caught).
+
+**Deviations from the note, and why.**
+- `to_extinction` runs as Starsim segments of doubling length (256, 512, … steps, the state carried between
+  them), each stopped early once every batch member has converged, because `ss.Sim` initialisation grows
+  with the number of steps: one sim sized to the step cap would cost seconds.
+- The stop rule is stricter than "incidence below a tolerance": over one generation interval the incidence
+  is below `tol · N`, the reproduction number at the forcing's maximum is below 1 **on the groups the seeds
+  can reach**, and the infections still to come (bounded by one generation's incidence × R/(1 − R)) are
+  below `tol · N`. The first pack run found that a supercritical group no seed can reach held the rule open
+  (FS6a, BR1c); a near-critical epidemic still fails closed at the step cap.
+- Seeding is a pulse at day 0 in the introduction group, taken from its susceptibles (seeds counted in the
+  final size, as the oracles assume), not an initial incidence spread over the first generation interval.
+- For several groups `reff_end` and `reff_ref` are `q f ρ(diag(s_end) C)`, which reduce to the note's
+  `R0 f S_end/N` for one group. `growth_rate` is the least-squares slope of log incidence over the window.
+- `run_batch()` also accepts one unit per pair, so latent unit attributes (initial susceptibility, coverage)
+  can vary across a batch.
+- RN4 maps the reference ODE's exponential generation interval onto the daily grid with the triangular
+  discretisation (infector and infectee uniform within their days). The interval form gave R0 1.909 for a
+  true 1.8, exactly what that discretisation implies; the triangular form recovers 1.818. This is a choice
+  in the test's mapping, not a change to the engine.
+- The observation forward maps (`toolkit/analysis/observation.py`) are the only part of §3.4 built here;
+  the likelihoods and the per-source measurement model stay in β.

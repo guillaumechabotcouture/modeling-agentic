@@ -1,0 +1,1118 @@
+name: compartmental-starsim
+version: '0.1'
+mechanisms:
+- closed population of groups (age bands with a contact matrix, or birth cohorts with homogeneous mixing C_ij =
+  c N_j / N); no births, deaths, waning or migration within the horizon
+- discrete-time transmission with susceptible depletion in the exponential-survival form, a declared generation
+  interval on the dt grid, optional cosine seasonal forcing
+- R0 = q rho(C) from the next-generation matrix; Reff = q f rho(diag(s) C)
+- 'susceptibility initialisers: given (calibrated latent share) or cohort_history (latent true dose coverage by
+  birth year, seroconversion, declared dose dependence)'
+- 'interventions before the epidemic: all-or-nothing protection of the susceptibles reached; doses given to immune
+  people are wasted unless targets_susceptible is declared'
+- 'p_major: multitype branching-process extinction equations (derived from an equation, not from the sim)'
+- run mode to_extinction
+components:
+  none:
+  - 0
+unit_attributes:
+  N: group sizes, one per group (> 0)
+  seed: initial infections as a share of the unit's population (default 1e-9)
+  intro: 'introduction group, or {group: share} (default: the first group)'
+  contact_rate: mean daily contacts per person (homogeneous mixing, C_ij = c N_j / N; default 1)
+  s0: initial susceptible share per group [0, 1] (a latent quantity, calibrated)
+  always_immune: groups declared immune (from the spec, with a source)
+  always_susceptible: groups declared susceptible (from the spec, with a source)
+outputs:
+  per_capita:
+  - infections
+  windows:
+  - attack_rate
+  - s_start
+  - s_end
+  - r0
+  - reff_start
+  - reff_end
+  - reff_ref
+  - growth_rate
+  - growth_defined
+  - p_major
+  - attack_rate:all
+  - converged
+  - steps
+  cost_drivers: []
+age_groups:
+- all
+valid_ranges:
+  s0:
+  - 0.0
+  - 1.0
+  r0:
+  - 0.05
+  - 40.0
+  seed:
+  - 0.0
+  - 0.01
+fitted: {}
+benchmarks:
+- id: FS1a
+  metric: single-group final size, R0 = 1.5
+  role: held_out
+  target: null
+  band: null
+  source: Kermack-McKendrick (1927); Lambert W closed form
+  computed: 0.5828116449805854
+  reference: 0.58281164498064
+  error_abs: 5.46229728115577e-14
+  error_rel: 9.372320076647093e-14
+  tolerance:
+    abs: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 5.46229728115577e-14
+  - 5.46229728115577e-14
+  in_band: true
+  status: in_band
+- id: FS1b
+  metric: single-group final size, R0 = 2
+  role: held_out
+  target: null
+  band: null
+  source: Kermack-McKendrick (1927); Lambert W closed form
+  computed: 0.7968121303622717
+  reference: 0.7968121303623036
+  error_abs: 3.186340080674199e-14
+  error_rel: 3.998859905942192e-14
+  tolerance:
+    abs: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 3.186340080674199e-14
+  - 3.186340080674199e-14
+  in_band: true
+  status: in_band
+- id: FS1c
+  metric: single-group final size, R0 = 4
+  role: held_out
+  target: null
+  band: null
+  source: Kermack-McKendrick (1927); Lambert W closed form
+  computed: 0.9801725987397542
+  reference: 0.9801725987397569
+  error_abs: 2.7755575615628914e-15
+  error_rel: 2.8317028706286272e-15
+  tolerance:
+    abs: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 2.7755575615628914e-15
+  - 2.7755575615628914e-15
+  in_band: true
+  status: in_band
+- id: FS1d
+  metric: single-group final size, R0 = 12
+  role: held_out
+  target: null
+  band: null
+  source: Kermack-McKendrick (1927); Lambert W closed form
+  computed: 0.9999938553345866
+  reference: 0.9999938553345865
+  error_abs: 1.1102230246251565e-16
+  error_rel: 1.1102298466160962e-16
+  tolerance:
+    abs: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 1.1102230246251565e-16
+  - 1.1102230246251565e-16
+  in_band: true
+  status: in_band
+- id: FS1e
+  metric: single-group final size, R0 = 18
+  role: held_out
+  target: null
+  band: null
+  source: Kermack-McKendrick (1927); Lambert W closed form
+  computed: 0.9999999847700162
+  reference: 0.9999999847700161
+  error_abs: 1.1102230246251565e-16
+  error_rel: 1.1102230415338356e-16
+  tolerance:
+    abs: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 1.1102230246251565e-16
+  - 1.1102230246251565e-16
+  in_band: true
+  status: in_band
+- id: FS2a
+  metric: 'R0 = 0.5: attack rate at most the seed-size bound seed / (1 - R0)'
+  role: held_out
+  target: null
+  band: null
+  source: threshold theorem
+  computed: 1.999999043325724e-09
+  reference: 2.0e-09
+  error_abs: 9.56674276233652e-16
+  error_rel: 4.78337138116826e-07
+  tolerance:
+    abs: 1.0e-15
+  compare: le
+  per_seed_error_abs:
+  - 9.56674276233652e-16
+  - 9.56674276233652e-16
+  in_band: true
+  status: in_band
+- id: FS2b
+  metric: 'R0 = 1.01: final size equals the seeded closed form'
+  role: held_out
+  target: null
+  band: null
+  source: threshold theorem; Lambert W
+  computed: 0.019736509118963255
+  reference: 0.01973650911894509
+  error_abs: 1.8166024240429124e-14
+  error_rel: 9.204274236618442e-13
+  tolerance:
+    abs: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 1.8166024240429124e-14
+  - 1.8166024240429124e-14
+  in_band: true
+  status: in_band
+- id: FS2c
+  metric: R0 = 1 + e gives z close to 2e (e = 0.01; the O(e^2) term is under 2% of 2e)
+  role: held_out
+  target: null
+  band: null
+  source: threshold theorem
+  computed: 0.019736509118963255
+  reference: 0.02
+  error_abs: 0.0002634908810367452
+  error_rel: 0.01317454405183726
+  tolerance:
+    rel: 0.02
+  compare: eq
+  per_seed_error_abs:
+  - 0.0002634908810367452
+  - 0.0002634908810367452
+  in_band: true
+  status: in_band
+- id: FS3
+  metric: rank-one (proportionate) mixing reduces to the scalar final-size relation, per group
+  role: held_out
+  target: null
+  band: null
+  source: Ma & Earn (2006) Bull Math Biol; Andreasen (2011)
+  computed: 5.051514762044462e-15
+  reference:
+  - 0.4638279198514079
+  - 0.7125194993192097
+  - 0.26776227820404097
+  error_abs: 5.051514762044462e-15
+  error_rel: 1.1816958092097471e-14
+  tolerance:
+    rel: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 5.051514762044462e-15
+  - 5.051514762044462e-15
+  computed_vector:
+  - 0.46382791985140287
+  - 0.7125194993192047
+  - 0.2677622782040378
+  in_band: true
+  status: in_band
+- id: FS4a
+  metric: 'all-or-nothing vaccination, v e = 0.5, R0 = 3: whole-population attack rate z = s x (0.2914)'
+  role: held_out
+  target: null
+  band: null
+  source: herd-immunity identity
+  computed: 0.2914058219340202
+  reference: 0.29140582193290576
+  error_abs: 1.1144418721187321e-12
+  error_rel: 3.824363784932632e-12
+  tolerance:
+    rel: 1.0e-08
+  compare: eq
+  per_seed_error_abs:
+  - 1.1144418721187321e-12
+  - 1.1144418721187321e-12
+  in_band: true
+  status: in_band
+- id: FS4b
+  metric: 'same: attack rate among those left susceptible x (0.5828)'
+  role: held_out
+  target: null
+  band: null
+  source: herd-immunity identity
+  computed: 0.5828116438680404
+  reference: 0.5828116438658115
+  error_abs: 2.2288837442374643e-12
+  error_rel: 3.824363784932632e-12
+  tolerance:
+    rel: 1.0e-08
+  compare: eq
+  per_seed_error_abs:
+  - 2.2288837442374643e-12
+  - 2.2288837442374643e-12
+  in_band: true
+  status: in_band
+- id: FS4c
+  metric: 'v e = 0.7 >= 1 - 1/R0: no outbreak (attack rate within seed size)'
+  role: held_out
+  target: null
+  band: null
+  source: herd-immunity identity
+  computed: 9.999406755745053e-12
+  reference: 0.0
+  error_abs: 9.999406755745053e-12
+  error_rel: 9.999406755745052e+288
+  tolerance:
+    abs: 1.0e-10
+  compare: eq
+  per_seed_error_abs:
+  - 9.999406755745053e-12
+  - 9.999406755745053e-12
+  in_band: true
+  status: in_band
+- id: FS5
+  metric: R0 from the next-generation matrix equals the growth-rate-consistent R0 of the reference ODE (5x5 asymmetric,
+    all susceptible)
+  role: held_out
+  target: null
+  band: null
+  source: Diekmann, Heesterbeek & Metz (1990)
+  computed: 3.220480117485684
+  reference: 3.22048005763425
+  error_abs: 5.98514340310885e-08
+  error_rel: 1.8584631160565265e-08
+  tolerance:
+    rel: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 5.98514340310885e-08
+  - 5.98514340310885e-08
+  in_band: true
+  status: in_band
+- id: FS6a
+  metric: 'multigroup final size equals the reference ODE run to extinction: identity matrix (seeded group only)'
+  role: held_out
+  target: null
+  band: null
+  source: the pack's ODE (solve_ivp DOP853, rtol 1e-10)
+  computed: 2.6911806116913795e-13
+  reference:
+  - 0.7968128145862969
+  - 0.0
+  - 0.0
+  error_abs: 2.6911806116913795e-13
+  error_rel: 3.3774313896904795e-13
+  tolerance:
+    abs: 1.0e-05
+  compare: eq
+  per_seed_error_abs:
+  - 2.6911806116913795e-13
+  - 2.6911806116913795e-13
+  computed_vector:
+  - 0.7968128145860278
+  - 0.0
+  - 0.0
+  in_band: true
+  status: in_band
+- id: FS6b
+  metric: 'same: rank-one matrix, partial susceptibility'
+  role: held_out
+  target: null
+  band: null
+  source: the pack's ODE
+  computed: 6.161737786669619e-15
+  reference:
+  - 0.3386991229263173
+  - 0.45014352056074514
+  - 0.1681155953709314
+  error_abs: 6.161737786669619e-15
+  error_rel: 1.7665503217114414e-14
+  tolerance:
+    abs: 1.0e-05
+  compare: eq
+  per_seed_error_abs:
+  - 6.161737786669619e-15
+  - 6.161737786669619e-15
+  computed_vector:
+  - 0.33869912292631194
+  - 0.450143520560739
+  - 0.16811559537092843
+  in_band: true
+  status: in_band
+- id: FS6c
+  metric: 'same: asymmetric 5x5 matrix'
+  role: held_out
+  target: null
+  band: null
+  source: the pack's ODE
+  computed: 1.078026556911027e-13
+  reference:
+  - 0.9192900487786668
+  - 0.8631882864871626
+  - 0.6178062746082027
+  - 0.6582465122853505
+  - 0.67386809545775
+  error_abs: 1.078026556911027e-13
+  error_rel: 1.248889232844171e-13
+  tolerance:
+    abs: 1.0e-05
+  compare: eq
+  per_seed_error_abs:
+  - 1.078026556911027e-13
+  - 1.078026556911027e-13
+  computed_vector:
+  - 0.9192900487786215
+  - 0.8631882864870548
+  - 0.6178062746081979
+  - 0.6582465122853587
+  - 0.6738680954577423
+  in_band: true
+  status: in_band
+- id: FS8a
+  metric: the final size is the same at dt of one day and one week (R0 = 2)
+  role: held_out
+  target: null
+  band: null
+  source: "exponential-survival identity (\xA71.1)"
+  computed: 0.7968121303622778
+  reference: 0.7968121303622717
+  error_abs: 6.106226635438361e-15
+  error_rel: 7.663320377241441e-15
+  tolerance:
+    rel: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 6.106226635438361e-15
+  - 6.106226635438361e-15
+  in_band: true
+  status: in_band
+- id: FS8b
+  metric: the step cap is never reached in FS1-FS6 (every arm converged)
+  role: held_out
+  target: null
+  band: null
+  source: engine stop rule
+  computed: 1.0
+  reference: 1.0
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    abs: 0.0
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  - 0.0
+  in_band: true
+  status: in_band
+- id: BR1a
+  metric: 'one group, Poisson offspring: 1 - p solves 1 - p = exp(-R0 p) (R0 = 2)'
+  role: held_out
+  target: null
+  band: null
+  source: branching-process identities
+  computed: 0.79681213002002
+  reference: 0.79681213002002
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    abs: 1.0e-08
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  - 0.0
+  in_band: true
+  status: in_band
+- id: BR1b
+  metric: 'one group, geometric offspring: p = 1 - 1/R0 (R0 = 2)'
+  role: held_out
+  target: null
+  band: null
+  source: branching-process identities
+  computed: 0.5
+  reference: 0.5
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    abs: 1.0e-08
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  - 0.0
+  in_band: true
+  status: in_band
+- id: BR1c
+  metric: 'block-diagonal matrix, introduction into the subcritical block: p_major = 0'
+  role: held_out
+  target: null
+  band: null
+  source: branching-process identities
+  computed: 1.3322676295501878e-15
+  reference: 0.0
+  error_abs: 1.3322676295501878e-15
+  error_rel: 1.332267629550188e+285
+  tolerance:
+    abs: 1.0e-08
+  compare: eq
+  per_seed_error_abs:
+  - 1.3322676295501878e-15
+  - 1.3322676295501878e-15
+  in_band: true
+  status: in_band
+- id: BR1d
+  metric: 'same matrix, introduction into the supercritical block (R = 2.5): the one-group Poisson value'
+  role: held_out
+  target: null
+  band: null
+  source: branching-process identities
+  computed: 0.8926447536092091
+  reference: 0.8926447536092056
+  error_abs: 3.552713678800501e-15
+  error_rel: 3.979986063252949e-15
+  tolerance:
+    abs: 1.0e-08
+  compare: eq
+  per_seed_error_abs:
+  - 3.552713678800501e-15
+  - 3.552713678800501e-15
+  in_band: true
+  status: in_band
+- id: BR1e
+  metric: 'branching importation: expected attack rate = p_major x the major-outbreak final size'
+  role: held_out
+  target: null
+  band: null
+  source: "design note \xA71.1 (importation: branching)"
+  computed: 0.6349095708195136
+  reference: 0.6349095708197771
+  error_abs: 2.6345592374354965e-13
+  error_rel: 4.14950310803132e-13
+  tolerance:
+    abs: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 2.6345592374354965e-13
+  - 2.6345592374354965e-13
+  in_band: true
+  status: in_band
+- id: RN1
+  metric: 'growth phase: R0 = 1 / sum_s w_s exp(-r s) for the engine''s growth rate r'
+  role: held_out
+  target: null
+  band: null
+  source: Wallinga & Lipsitch (2007) Proc R Soc B
+  computed: 2.0
+  reference: 1.9999994730362805
+  error_abs: 5.269637195493004e-07
+  error_rel: 2.634819291973589e-07
+  tolerance:
+    rel: 0.001
+  compare: eq
+  per_seed_error_abs:
+  - 5.269637195493004e-07
+  - 5.269637195493004e-07
+  in_band: true
+  status: in_band
+- id: RN2a
+  metric: unforced cumulative attack rate equals the FS1 solution, dt one day (w_1 = 1, R0 = 2)
+  role: held_out
+  target: null
+  band: null
+  source: Diekmann, Heesterbeek & Britton (2013), ch. 1
+  computed: 0.7968121303623035
+  reference: 0.7968121303623036
+  error_abs: 1.1102230246251565e-16
+  error_rel: 1.3933309776802064e-16
+  tolerance:
+    abs: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 1.1102230246251565e-16
+  - 1.1102230246251565e-16
+  in_band: true
+  status: in_band
+- id: RN2b
+  metric: same at dt one week
+  role: held_out
+  target: null
+  band: null
+  source: Diekmann, Heesterbeek & Britton (2013), ch. 1
+  computed: 0.7968121303623035
+  reference: 0.7968121303623036
+  error_abs: 1.1102230246251565e-16
+  error_rel: 1.3933309776802064e-16
+  tolerance:
+    abs: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 1.1102230246251565e-16
+  - 1.1102230246251565e-16
+  in_band: true
+  status: in_band
+- id: RN2c
+  metric: 'negative control: the linear renewal form misses the final size (0.8687 vs 0.7968)'
+  role: held_out
+  target: null
+  band: null
+  source: Codex review finding 2 (design note)
+  computed: 0.8687075605459232
+  reference: 0.7968121303623036
+  error_abs: 0.07189543018361966
+  error_rel: 0.09022883493368684
+  tolerance:
+    abs: 0.05
+  compare: differ
+  per_seed_error_abs:
+  - 0.07189543018361966
+  in_band: true
+  status: in_band
+- id: RN2d
+  metric: 'negative control value: the linear form ends at 0.8687'
+  role: held_out
+  target: null
+  band: null
+  source: Codex review finding 2 (design note)
+  computed: 0.8687075605459232
+  reference: 0.8687
+  error_abs: 7.560545923213091e-06
+  error_rel: 8.70328758283998e-06
+  tolerance:
+    abs: 0.0005
+  compare: eq
+  per_seed_error_abs:
+  - 7.560545923213091e-06
+  in_band: true
+  status: in_band
+- id: RN3a
+  metric: reff_end = R0 f(t_end) S_end / N (unforced)
+  role: held_out
+  target: null
+  band: null
+  source: identity
+  computed: 0.40637573927539355
+  reference: 0.40637573927539355
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    rel: 1.0e-09
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  - 0.0
+  in_band: true
+  status: in_band
+- id: RN3b
+  metric: reff_end < 1 after an unforced major epidemic
+  role: held_out
+  target: null
+  band: null
+  source: identity
+  computed: 0.40637573927539355
+  reference: 1.0
+  error_abs: 0.5936242607246065
+  error_rel: 0.5936242607246065
+  tolerance:
+    abs: 0.0
+  compare: le
+  per_seed_error_abs:
+  - 0.5936242607246065
+  - 0.5936242607246065
+  in_band: true
+  status: in_band
+- id: RN3c
+  metric: attack_rate counts only infections inside a window that starts with S < N
+  role: held_out
+  target: null
+  band: null
+  source: identity
+  computed: 0.7957646538280179
+  reference: 0.795764653828018
+  error_abs: 1.1102230246251565e-16
+  error_rel: 1.3951650394176717e-16
+  tolerance:
+    rel: 1.0e-09
+  compare: eq
+  per_seed_error_abs:
+  - 1.1102230246251565e-16
+  - 1.1102230246251565e-16
+  in_band: true
+  status: in_band
+- id: RN3d
+  metric: 'forced: reff_end = R0 f(t_end) S_end / N with the cosine forcing at t_end'
+  role: held_out
+  target: null
+  band: null
+  source: identity
+  computed: 0.18088388276987707
+  reference: 0.18088388276987707
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    rel: 1.0e-09
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  - 0.0
+  in_band: true
+  status: in_band
+- id: RN3e
+  metric: 'forced: reff_ref uses the declared reference phase'
+  role: held_out
+  target: null
+  band: null
+  source: identity
+  computed: 0.2999505999572497
+  reference: 0.2999505999572497
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    rel: 1.0e-09
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  - 0.0
+  in_band: true
+  status: in_band
+- id: RN4
+  metric: 'a weekly series from the reference ODE (R0 = 1.8, infectious period 7 days), refitted: R0 recovered'
+  role: held_out
+  target: null
+  band: null
+  source: the pack's ODE
+  computed: 1.81847197215557
+  reference: 1.8
+  error_abs: 0.01847197215556995
+  error_rel: 0.010262206753094416
+  tolerance:
+    rel: 0.05
+  compare: eq
+  per_seed_error_abs:
+  - 0.01847197215556995
+  in_band: true
+  status: in_band
+- id: CI1a
+  metric: 'independent doses: cohort b2010 (c = 0.9, 0.6; e = 0.85, 0.95), by hand 0.10105'
+  role: held_out
+  target: null
+  band: null
+  source: hand-computed
+  computed: 0.10105
+  reference: 0.10105
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: CI1b
+  metric: 'independent doses: cohort b2011 (one dose, c = 0.8), by hand 0.32'
+  role: held_out
+  target: null
+  band: null
+  source: hand-computed
+  computed: 0.31999999999999995
+  reference: 0.32
+  error_abs: 5.551115123125783e-17
+  error_rel: 1.734723475976807e-16
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 5.551115123125783e-17
+  in_band: true
+  status: in_band
+- id: CI1c
+  metric: 'nested doses: cohort b2010, by hand 0.1495'
+  role: held_out
+  target: null
+  band: null
+  source: hand-computed
+  computed: 0.1495
+  reference: 0.1495
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: CI1d
+  metric: 'nested doses, cohort b2012 (c = 0.7, 0.5): 0.3 + 0.2 x 0.15 + 0.5 x 0.0075'
+  role: held_out
+  target: null
+  band: null
+  source: hand-computed
+  computed: 0.33375000000000005
+  reference: 0.33375
+  error_abs: 5.551115123125783e-17
+  error_rel: 1.663255467603231e-16
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 5.551115123125783e-17
+  in_band: true
+  status: in_band
+- id: CI1e
+  metric: a group declared always immune has susceptibility 0
+  role: held_out
+  target: null
+  band: null
+  source: spec declaration
+  computed: 0.0
+  reference: 0.0
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    abs: 0.0
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: CI2
+  metric: a cohort's susceptibility is invariant to the survey-year/decision-year shift (birth-year indexing)
+  role: held_out
+  target: null
+  band: null
+  source: structural
+  computed: 0.0
+  reference: 0.0
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    abs: 0.0
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: CI3
+  metric: mixed-cohort survey band positivity (Se = Sp = 1, no waning) = population-weighted mean of its cohorts
+  role: held_out
+  target: null
+  band: null
+  source: identity
+  computed: 0.6333333333333333
+  reference: 0.6333333333333333
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: CI4a
+  metric: 'initial_state() equals the sim''s state at its first step: cohort_history with a catch-up campaign'
+  role: held_out
+  target: null
+  band: null
+  source: identity
+  computed: 0.0
+  reference: 0.0
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: CI4b
+  metric: 'same: given initialiser with an all-or-nothing campaign'
+  role: held_out
+  target: null
+  band: null
+  source: identity
+  computed: 0.0
+  reference: 0.0
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: OB1a
+  metric: 'numerator inflation then denominator error: admin coverage c (1 + w) / (1 + d) (0.8, 0.1, 0.05)'
+  role: held_out
+  target: null
+  band: null
+  source: hand-computed
+  computed: 0.8380952380952381
+  reference: 0.8380952380952381
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: OB1b
+  metric: 'assay: Se p + (1 - Sp)(1 - p) (0.7, 0.95, 0.98)'
+  role: held_out
+  target: null
+  band: null
+  source: hand-computed
+  computed: 0.6709999999999999
+  reference: 0.671
+  error_abs: 1.1102230246251565e-16
+  error_rel: 1.6545797684428563e-16
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 1.1102230246251565e-16
+  in_band: true
+  status: in_band
+- id: OB1c
+  metric: 'frame gap: (1 - phi) p + phi min(rel p, 1) (0.8, 0.1, 0.5)'
+  role: held_out
+  target: null
+  band: null
+  source: hand-computed
+  computed: 0.7600000000000001
+  reference: 0.76
+  error_abs: 1.1102230246251565e-16
+  error_rel: 1.4608197692436271e-16
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 1.1102230246251565e-16
+  in_band: true
+  status: in_band
+- id: OB1d
+  metric: 'antibody waning: p exp(-rate years) (0.9, 0.05, 4)'
+  role: held_out
+  target: null
+  band: null
+  source: hand-computed
+  computed: 0.7368576777701836
+  reference: 0.7368576777701836
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: OB1e
+  metric: 'under-ascertainment: reported = rho x true (1000, 0.1)'
+  role: held_out
+  target: null
+  band: null
+  source: hand-computed
+  computed: 100.0
+  reference: 100.0
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: OB1f
+  metric: 'recall bias: card share k c + (1 - k) min(c (1 + b), 1) (0.6, 0.4, 0.2)'
+  role: held_out
+  target: null
+  band: null
+  source: hand-computed
+  computed: 0.6719999999999999
+  reference: 0.672
+  error_abs: 1.1102230246251565e-16
+  error_rel: 1.6521175961683875e-16
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 1.1102230246251565e-16
+  in_band: true
+  status: in_band
+- id: OB1g
+  metric: numerator inflation alone can exceed 1 (0.95, 0.2 -> 1.14)
+  role: held_out
+  target: null
+  band: null
+  source: hand-computed
+  computed: 1.14
+  reference: 1.14
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: OB1h
+  metric: denominator error alone (0.9, 0.125 -> 0.8)
+  role: held_out
+  target: null
+  band: null
+  source: hand-computed
+  computed: 0.8
+  reference: 0.8
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: FS7
+  metric: published age-specific final sizes from a contact-matrix model
+  role: held_out
+  target: null
+  band: null
+  source: 'candidates: Mossong et al. (2008); Wallinga, Teunis & Kretzschmar (2006) AJE'
+  computed: null
+  in_band: false
+  status: not_assessable
+  not_assessable_because: 'published values not yet transcribed: values to be transcribed with a quoted span through
+    the evidence service'
+- id: RN5
+  metric: published reproduction-number estimates from incidence series
+  role: held_out
+  target: null
+  band: null
+  source: Cori et al. (2013) AJE worked examples
+  computed: null
+  in_band: false
+  status: not_assessable
+  not_assessable_because: 'published values not yet transcribed: values to be transcribed with a quoted span through
+    the evidence service'
+notes:
+- p_major is derived (multitype extinction equations), not simulated
+- 'out of range: births, deaths, waning and migration within the horizon; timing within a season for interventions
+  (all act before the epidemic); leaky protection'
+- 'deterministic: the module draws no random numbers; the seed is recorded only'
+- validated against analytic identities and simulation-based coverage; published benchmarks FS7 and RN5 not yet
+  assessed
+- 'configuration: {"components": {}, "dose_dependence": "independent", "doses": [], "dt": "day", "forcing": "none",
+  "forcing_period": 365.0, "forcing_ref_phase": 0.0, "generation_interval": [0.2, 0.3, 0.3, 0.2], "groups": ["all"],
+  "importation": "deterministic", "initialiser": "given", "mode": "to_extinction", "offspring": "poisson", "outcomes":
+  [], "segment": 256, "step_cap": 50000, "structure": "single_group", "targets_susceptible": false, "tol": 1e-13,
+  "transmission": "r0"}'
+configured_as: single_day
+configuration_vocabulary:
+  structure:
+  - single_group
+  - age_groups_contact_matrix
+  - birth_cohorts
+  mode:
+  - to_extinction
+  - windowed
+  initialiser:
+  - given
+  - cohort_history
+  dt:
+  - day
+  - week
+  transmission:
+  - r0
+  - q
+  forcing:
+  - none
+  - cosine
+  importation:
+  - deterministic
+  - branching
+  offspring:
+  - poisson
+  - geometric
+  dose_dependence:
+  - independent
+  - nested
+  component_kinds:
+  - campaign
+  - doses
+capabilities:
+  base:
+    outcome_role:
+      infections: prevented
+    intervention_action:
+    - remove_susceptible_all_or_nothing
+    estimands:
+    - r0
+    - reff_start
+    - attack_rate
+    - p_major
+    calibration_data:
+    - group_attack_rate
+  by_config:
+    mode:
+      to_extinction:
+        dynamics:
+        - closed_epidemic_final_size
+      windowed:
+        dynamics:
+        - closed_epidemic_renewal
+        estimands:
+        - reff_end
+        - growth_rate
+        - incidence_series
+        calibration_data:
+        - incidence_series
+    structure:
+      single_group:
+        structure:
+        - single_group
+      age_groups_contact_matrix:
+        structure:
+        - age_groups_contact_matrix
+      birth_cohorts:
+        structure:
+        - birth_cohorts
+    initialiser:
+      given: {}
+      cohort_history:
+        calibration_data:
+        - survey_proportion
+        - coverage_report
+    components:
+      doses:
+        decision_coupling:
+        - joint_within_unit
+      campaign:
+        decision_coupling:
+        - independent_units
+parameters:
+- name: r0
+  value: 2.5
+  kind: calibrated
+  units: basic reproduction number (all groups susceptible)
+  lo: 0.05
+  hi: 40.0
+  source: calibrated per run, or declared per question (decision spec), with its source
+  verified: unverified
+validation_label: validated against analytic identities and simulation-based coverage; published benchmarks FS7
+  and RN5 not yet assessed
+results_sha256: a5f79f377a3808c05f19ac34ceae81ba6f9793a6a03a66a94436ba8319769b22
+benchmark_pack: 'benchmarks/pack.yaml (oracles: benchmarks/oracles.py, test only)'

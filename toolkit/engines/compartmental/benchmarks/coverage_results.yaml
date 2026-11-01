@@ -1,0 +1,233 @@
+producer: toolkit/engines/benchmark.py
+engine_identity:
+  name: compartmental-starsim
+  version: '0.1'
+  code_sha256: 124c6e2f72644fbc2d3fd8d6d62a2fdf7fd5d9dcd357e57e4ec1bfad1894fd4a
+  params_sha256: 84120e872544e4d566f625a1bf62f2e5cbd865dd1031f8884dbb6087f73ef65d
+  config_sha256: 1ffd8300a2cb6d7dc41c19a6276dbd225ff1616deaea4908dd90eb8355983055
+benchmarks:
+- id: SB1
+  metric: 'identified renewal fit: known initial susceptibility, unforced, complete
+    epidemic'
+  role: held_out
+  target: null
+  band: null
+  source: ''
+  computed: null
+  in_band: false
+  status: not_assessable
+  not_assessable_because: 'calibrator toolkit.analysis.calibration:posterior not available
+    (AttributeError: module ''toolkit.analysis.calibration'' has no attribute ''posterior'')'
+- id: SB2a
+  metric: 'confounded: series truncated before depletion; prior range of reporting
+    carried'
+  role: held_out
+  target: null
+  band: null
+  source: ''
+  computed: null
+  in_band: false
+  status: not_assessable
+  not_assessable_because: 'calibrator toolkit.analysis.calibration:posterior not available
+    (AttributeError: module ''toolkit.analysis.calibration'' has no attribute ''posterior'')'
+- id: SB2a_neg
+  metric: 'negative control for SB2a: reporting fixed at its prior median (reproduces
+    the v1 failure)'
+  role: held_out
+  target: null
+  band: null
+  source: ''
+  computed: null
+  in_band: false
+  status: not_assessable
+  not_assessable_because: 'calibrator toolkit.analysis.calibration:posterior not available
+    (AttributeError: module ''toolkit.analysis.calibration'' has no attribute ''posterior'')'
+- id: SB2b
+  metric: 'confounded: unknown initial susceptible share (declared prior) and unknown
+    forcing amplitude, complete series'
+  role: held_out
+  target: null
+  band: null
+  source: ''
+  computed: null
+  in_band: false
+  status: not_assessable
+  not_assessable_because: 'calibrator toolkit.analysis.calibration:posterior not available
+    (AttributeError: module ''toolkit.analysis.calibration'' has no attribute ''posterior'')'
+- id: SB2c
+  metric: 'identified despite known forcing: known susceptibility and depletion'
+  role: held_out
+  target: null
+  band: null
+  source: ''
+  computed: null
+  in_band: false
+  status: not_assessable
+  not_assessable_because: 'calibrator toolkit.analysis.calibration:posterior not available
+    (AttributeError: module ''toolkit.analysis.calibration'' has no attribute ''posterior'')'
+- id: SB3a
+  metric: cohort immunity from two overlapping sources (admin coverage with numerator
+    inflation and denominator error; serosurvey with assay error, waning, frame gap)
+  role: held_out
+  target: null
+  band: null
+  source: ''
+  computed: null
+  in_band: false
+  status: not_assessable
+  not_assessable_because: 'calibrator toolkit.analysis.calibration:posterior not available
+    (AttributeError: module ''toolkit.analysis.calibration'' has no attribute ''posterior'')'
+- id: SB3b_admin_truth
+  metric: 'negative control: administrative coverage taken as the truth'
+  role: held_out
+  target: null
+  band: null
+  source: ''
+  computed: null
+  in_band: false
+  status: not_assessable
+  not_assessable_because: 'calibrator toolkit.analysis.calibration:posterior not available
+    (AttributeError: module ''toolkit.analysis.calibration'' has no attribute ''posterior'')'
+- id: SB3b_sero_truth
+  metric: 'negative control: the serosurvey taken as the truth'
+  role: held_out
+  target: null
+  band: null
+  source: ''
+  computed: null
+  in_band: false
+  status: not_assessable
+  not_assessable_because: 'calibrator toolkit.analysis.calibration:posterior not available
+    (AttributeError: module ''toolkit.analysis.calibration'' has no attribute ''posterior'')'
+- id: SB3c
+  metric: 'administrative coverage only: every bias parameter prior-dominated, prior
+    ranges carried'
+  role: held_out
+  target: null
+  band: null
+  source: ''
+  computed: null
+  in_band: false
+  status: not_assessable
+  not_assessable_because: 'calibrator toolkit.analysis.calibration:posterior not available
+    (AttributeError: module ''toolkit.analysis.calibration'' has no attribute ''posterior'')'
+- id: SB5
+  metric: 'group-attack-rate calibration of q: coverage of hospitalisations averted
+    by a fixed plan'
+  role: held_out
+  target: null
+  band: null
+  source: ''
+  computed: null
+  in_band: false
+  status: not_assessable
+  not_assessable_because: 'calibrator toolkit.analysis.calibration:posterior not available
+    (AttributeError: module ''toolkit.analysis.calibration'' has no attribute ''posterior'')'
+settings_calibrated: {}
+fitted_used: {}
+configs_validated:
+  cohorts:
+    config:
+      groups:
+      - b2021
+      - b2022
+      - b2023
+      - b2024
+      - b2025
+      structure: birth_cohorts
+      mode: to_extinction
+      initialiser: cohort_history
+      doses:
+      - d1
+      dt: day
+      generation_interval:
+      - 0.5
+      - 0.5
+    engine_identity:
+      name: compartmental-starsim
+      version: '0.1'
+      code_sha256: 124c6e2f72644fbc2d3fd8d6d62a2fdf7fd5d9dcd357e57e4ec1bfad1894fd4a
+      params_sha256: d92e590c60d79025f414cb6bc3527495ef6f234f26c46d90a99e4399541516f4
+      config_sha256: 10303480f25dd87f82dd4e2bd2df09b26249aa6c28ff70729ad3af842a6cb647
+  groups3:
+    config:
+      groups:
+      - a
+      - b
+      - c
+      structure: age_groups_contact_matrix
+      mode: to_extinction
+      initialiser: given
+      dt: day
+      transmission: q
+      generation_interval:
+      - 0.5
+      - 0.3
+      - 0.2
+      components:
+        plan:
+          kind: campaign
+          targets:
+          - b
+          reach: 0.5
+      outcomes:
+      - hospitalisations
+    engine_identity:
+      name: compartmental-starsim
+      version: '0.1'
+      code_sha256: 124c6e2f72644fbc2d3fd8d6d62a2fdf7fd5d9dcd357e57e4ec1bfad1894fd4a
+      params_sha256: 90ac425c1ea2af7fd5ff9f111d1383d9f322c05b38ef79e9752a7727bf2fe281
+      config_sha256: 8ef4b24217e2217589e4cc0407cc539694dc595361db772d29c368e53cc5a5e5
+  renewal:
+    config:
+      groups:
+      - all
+      structure: single_group
+      mode: windowed
+      initialiser: given
+      dt: week
+      generation_interval:
+      - 0.767455843065087
+      - 0.146995943257602
+      - 0.054076785460076
+      - 0.019893737615401
+      - 0.007318497076765
+      - 0.002692324614815
+      - 0.00099045087475
+      - 0.000364366514311
+      - 0.000134042949666
+      - 4.9311645416e-05
+      - 1.8140740559e-05
+      - 6.673605499e-06
+      - 2.455082262e-06
+      - 9.0317429e-07
+      - 3.32259253e-07
+      - 1.22231348e-07
+      - 4.49664e-08
+      - 1.6542214e-08
+      - 6.085541e-09
+      - 2.238745e-09
+      forcing: cosine
+      forcing_period: 365.0
+    engine_identity:
+      name: compartmental-starsim
+      version: '0.1'
+      code_sha256: 124c6e2f72644fbc2d3fd8d6d62a2fdf7fd5d9dcd357e57e4ec1bfad1894fd4a
+      params_sha256: 84120e872544e4d566f625a1bf62f2e5cbd865dd1031f8884dbb6087f73ef65d
+      config_sha256: 1ffd8300a2cb6d7dc41c19a6276dbd225ff1616deaea4908dd90eb8355983055
+seeds:
+- 1
+n_sims: 0
+summary:
+  in_band: 0
+  total: 10
+  by_status:
+    in_band: 0
+    out_of_band: 0
+    not_assessable: 10
+    band_mis_based: 0
+  held_out_in_band: 0
+  held_out_total: 10
+engine_version: '0.1'
+fit_rule: null
+wall_s: 0.0
