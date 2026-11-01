@@ -24,10 +24,12 @@ import sys
 
 import numpy as np
 
-from toolkit.analysis.model import _logit
-from toolkit.engines.contract import Horizon
-
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+from toolkit.analysis.model import _logit  # noqa: E402
+from toolkit.engines.contract import Horizon  # noqa: E402
+
 PRODUCER = "toolkit/analysis/calibration.py"
 GRID = 161
 FLAT_SLOPE = 0.05          # d logit(metric) / d attribute below this: the target hardly constrains the attribute
@@ -210,3 +212,171 @@ def fit_likelihood(spec, model, rows=None, fixed_z=None, start=None, identifiabi
                                                                           for v in ident.values())
                                        else "weakly_or_unidentified" if ident else "not_assessed")},
     }
+
+
+# --------------------------------------------------------------------------- self-test (v2d β)
+def _self_test() -> int:
+    import tempfile
+    fails = []
+
+    def ok(c, m):
+        print(("PASS " if c else "FAIL ") + m)
+        if not c:
+            fails.append(m)
+
+    def safe(fn, msg):
+        try:
+            fn()
+        except Exception as e:          # a missing function is a failing case, not a crash of the whole self-test
+            ok(False, f"{msg} ({type(e).__name__}: {e})")
+
+    def normal_problem(d, sd=0.05, mu=None, lo=-1.0, hi=1.0):
+        mu = np.linspace(-0.3, 0.3, d) if mu is None else np.asarray(mu, float)
+        names = [f"x{i}" for i in range(d)]
+        pri = {n: Prior.from_decl(n, {"dist": "uniform", "range": [lo, hi], "source": "test"}) for n in names}
+
+        def ll(X):
+            v = np.stack([X[n] for n in names], axis=1)
+            return -0.5 * np.sum(((v - mu) / sd) ** 2, axis=1), {"sum": v.sum(axis=1)}
+        return Problem(names, pri, ll), mu
+
+    def cb1():
+        P, mu = normal_problem(2)
+        s = sample(P, seed=3)
+        m = np.mean(s["rows"], axis=0)
+        sdv = np.std(s["rows"], axis=0)
+        ok(s["method"] == "importance" and s["diagnostics"]["ess"] >= 1000 and np.max(np.abs(m - mu)) < 0.01
+           and np.max(np.abs(sdv / 0.05 - 1)) < 0.08,
+           f"CB1 importance sampling (<= 4 parameters) recovers a Gaussian posterior: mean {m}, sd {sdv}, "
+           f"ESS {s['diagnostics'].get('ess')}")
+        s2 = sample(P, seed=3)
+        s3 = sample(P, seed=4)
+        ok(s2["sample_id"] == s["sample_id"] and s3["sample_id"] != s["sample_id"],
+           "CB2 deterministic seeding: the same seed gives the same canonical sample (same id); another seed does not")
+        try:
+            sample(P, seed=3, ess_floor=10 ** 9)
+            ok(False, "CB3 an ESS below the floor fails closed")
+        except CalibrationRefused as e:
+            ok(e.code == "posterior_ess", f"CB3 an ESS below the floor fails closed ({e.code})")
+    safe(cb1, "CB1-3 importance sampler")
+
+    def cb4():
+        P, mu = normal_problem(6, sd=0.1)
+        s = sample(P, seed=5)
+        m = np.mean(s["rows"], axis=0)
+        sdv = np.std(s["rows"], axis=0)
+        dg = s["diagnostics"]
+        ok(s["method"] == "adaptive_metropolis" and dg["chains"] == 4 and dg["rhat_max"] <= 1.01
+           and dg["ess_bulk_min"] >= 400 and np.max(np.abs(m - mu)) < 0.02 and np.max(np.abs(sdv / 0.1 - 1)) < 0.12,
+           f"CB4 adaptive Metropolis (> 4 parameters): 4 chains, R-hat {dg.get('rhat_max')}, bulk ESS "
+           f"{dg.get('ess_bulk_min')}, mean error {np.max(np.abs(m - mu)):.3f}, sd ratio {sdv / 0.1}")
+        try:
+            sample(P, seed=5, ess_bulk_min=10 ** 9)
+            ok(False, "CB5 MCMC below its ESS floor fails closed")
+        except CalibrationRefused as e:
+            ok(e.code == "posterior_mcmc", f"CB5 MCMC below its ESS floor fails closed ({e.code})")
+    safe(cb4, "CB4-5 adaptive Metropolis")
+
+    def anb8():
+        names = ["a", "b"]
+        pri = {n: Prior.from_decl(n, {"dist": "uniform", "range": [0.9, 1.1], "source": "test"}) for n in names}
+        P = Problem(names, pri, lambda X: (-0.5 * ((np.log(X["a"] * X["b"]) - math.log(1.1)) / 0.005) ** 2, {}))
+        s = sample(P, seed=1)
+        c = classify(P, s)
+        ok(c["contraction"]["a"] > 0.5 and c["likelihood_classes"] == {"a": "on_ridge", "b": "on_ridge"}
+           and c["classes"] == {"a": "prior_dominated", "b": "prior_dominated"}
+           and any(set(r["params"]) == {"a", "b"} for r in c["ridges"]),
+           f"AN-b8 a product-only-identified pair under narrow priors is on_ridge, not identified, although its "
+           f"marginals contract ({c.get('contraction')}, {c.get('likelihood_classes')})")
+        P2, _ = normal_problem(2)
+        c2 = classify(P2, sample(P2, seed=1))
+        ok(set(c2["classes"].values()) == {"identified"}, f"CB6 well-identified parameters are identified: {c2['classes']}")
+        pri3 = dict(pri, c=Prior.from_decl("c", {"dist": "loguniform", "range": [0.1, 10.0], "source": "test"}))
+        P3 = Problem(["a", "b", "c"], pri3, lambda X: (-0.5 * ((X["a"] - 1.0) / 0.01) ** 2, {}))
+        c3 = classify(P3, sample(P3, seed=2))
+        ok(c3["likelihood_classes"]["c"] == "unidentified" and c3["classes"]["c"] == "prior_dominated"
+           and abs(c3["contraction"]["c"]) < 0.1 and c3["classes"]["a"] == "identified",
+           f"CB7 a parameter the data do not see is unidentified and prior-dominated (contraction on its prior's own "
+           f"log scale {c3['contraction'].get('c'):.3f})")
+    safe(anb8, "AN-b8 / CB6-7 identifiability classes")
+
+    def anb9():
+        P, mu = normal_problem(2)
+        s = sample(P, seed=3)
+        rec = draws(s, 50, seed=9)
+        ok(check_provenance(s, rec) == [], "AN-b9a draws taken as rows of the canonical sample pass the provenance check")
+        mean = np.mean(s["rows"], axis=0)
+        half = [dict(r, values={n: float(mean[j] + 0.5 * (r["values"][n] - mean[j])) for j, n in enumerate(s["names"])})
+                for r in rec]
+        f = check_provenance(s, half)
+        ok(bool(f) and all(x["kind"] == "analysis_contract_uncovered_parameter" for x in f),
+           f"AN-b9 draws at half the posterior sd fail the provenance check ({len(f)} findings)")
+        other = [dict(r, sample_id="0" * 64) for r in rec]
+        ok(check_provenance(s, other) != [], "AN-b9b draws citing another sample fail the provenance check")
+    safe(anb9, "AN-b9 draw provenance")
+
+    def anb10():
+        from toolkit.analysis import observation as ob
+        srcs = ob.toy_sources()
+        srcs[1]["bias"] = {"none": "a reference survey with a validated assay (toy)"}
+        srcs[0]["frame"]["excluded"] = []
+        srcs[1]["frame"]["excluded"] = []
+        A, S = ob.Source(srcs[0]), ob.Source(srcs[1])
+        rng = np.random.default_rng(2)
+        x_true, om, de = 0.7, 0.12, 0.05
+        adm = A.expected(np.array([x_true]), {"omega": om, "delta": de})[0] * math.exp(rng.normal(0, 0.03))
+        npos = int(rng.binomial(400, x_true))
+        pri = {"x": Prior.from_decl("x", {"dist": "uniform", "range": [0.3, 0.95], "source": "test"})}
+        pri.update({k: Prior.from_decl(k, v) for k, v in A.priors().items()})
+
+        def ll(X):
+            vals = {k: X[k] for k in ("omega", "delta")}
+            e_adm = A.expected(X["x"], vals)
+            out = ob.loglik("lognormal", np.full_like(X["x"], adm), mu=e_adm, sd=0.03)
+            out = out + ob.loglik("binomial", np.full_like(X["x"], npos), n=400, p=S.expected(X["x"], {}))
+            return out, {"x": X["x"]}
+        P = Problem(["x", "omega", "delta"], pri, ll, derived={A.net_name(): lambda X: A.net_multiplier(X)})
+        s = sample(P, seed=4)
+        c = classify(P, s)
+        tests = prior_range_tests(c, P)
+        lab = label_parts(c, P)
+        ok(c["classes"]["omega"] == "prior_dominated" and c["classes"]["x"] in ("identified", "partly_identified")
+           and c["classes"]["net_bias:admin"] == "identified"
+           and any(t["id"] == "prior_range_omega" and t["values"] == [0.0, 0.25] for t in tests)
+           and "omega" in lab["prior_dominated"] and "omega" in lab["label"],
+           f"AN-b10 a bias parameter seen by one source only is prior_dominated, gets a prior_range test and is named "
+           f"in the label ({c.get('classes')}; tests {[t['id'] for t in tests]}; label {lab.get('label')!r})")
+    safe(anb10, "AN-b10 one-source bias parameter")
+
+    def anb3():
+        from toolkit.analysis import run as R
+        from toolkit.analysis.model import DirectModel
+        from toolkit.spec.schema import load
+        with tempfile.TemporaryDirectory() as d:
+            R._direct_toy(d)
+            spec = load(os.path.join(d, "decision_spec.yaml"))
+            m = DirectModel(spec, log=lambda *a: None)
+            m.fit()
+            rows = [r for r in read_targets(spec) if r["package"] != "none"]
+            try:
+                fit_likelihood(spec, m, rows=rows)
+                ok(False, "AN-b3 a ridge panel (no reference package) stops with calibration_ridge (today: jittered MVN)")
+            except CalibrationRefused as e:
+                ok(e.code == "calibration_ridge", f"AN-b3 a ridge panel stops with calibration_ridge ({e})")
+            full = fit_likelihood(spec, m)
+            ok(full["cov"] is not None, "AN-b3b the full panel (with the reference package) still fits")
+    safe(anb3, "AN-b3 ridge refusal")
+
+    if fails:
+        print(f"FAILED: {len(fails)} case(s)")
+        return 1
+    print("OK: all self-test cases passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    if ROOT not in sys.path:
+        sys.path.insert(0, ROOT)
+    if sys.argv[1:2] == ["--self-test"]:
+        sys.exit(_self_test())
+    print(__doc__)

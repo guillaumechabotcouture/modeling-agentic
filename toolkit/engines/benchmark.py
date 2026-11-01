@@ -1283,6 +1283,39 @@ def _self_test() -> int:
     ok(r10["benchmarks"][0]["status"] == "in_band" and "rate2" in r10["configs_validated"],
        f"BP46 (Codex r2-1) a setting without config runs the pack's default_config, and counts as exercising it: "
        f"{r10['benchmarks'][0]['status']}, {sorted(r10['configs_validated'])}")
+    # ---- v2d β: ridge names, a calibrator that refuses, replicates in parallel
+    om.calibrate_ridge = lambda make_engine, data, with_ridge=True, **k: dict(
+        _cal(make_engine, data), ridges=[{"params": ["mu", "nu"]}] if with_ridge else [])
+    sb = {"type": "coverage", "generator": {"fn": "normal", "args": {}}, "replicates": 40, "seed": 2,
+          "quantities": ["mu"], "band": [0.85, 1.0], "ridge_names": ["mu", "nu"]}
+    p11 = dict(p6, benchmarks=[
+        {"id": "R1", "metric": "ridge reported", "estimand": dict(sb, calibrator={"fn": "_bp_oracles:calibrate_ridge"})},
+        {"id": "R2", "metric": "ridge missing", "estimand": dict(sb, calibrator={"fn": "_bp_oracles:calibrate_ridge",
+                                                                                 "args": {"with_ridge": False}})}])
+    r11 = {x["id"]: x for x in run_pack(p11, eng, Runner(p11, eng, 1), {})["benchmarks"]}
+    ok(r11["R1"]["status"] == "in_band" and r11["R1"].get("ridge_share") == 1.0 and r11["R2"]["status"] == "out_of_band"
+       and r11["R2"].get("ridge_share") == 0.0,
+       f"BP47 (v2d β) `ridge_names`: the reported ridge must name them in >= class_share_min of replicates "
+       f"({r11['R1'].get('ridge_share')}, {r11['R2'].get('ridge_share')})")
+
+    def _refuse(make_engine, data, **k):
+        raise ValueError("posterior_ess: effective sample size 3 below the floor 1000")
+    om.calibrate_refuse = _refuse
+    p12 = dict(p6, benchmarks=[{"id": "F1", "metric": "a calibrator that refuses", "estimand": dict(
+        sb, calibrator={"fn": "_bp_oracles:calibrate_refuse"}, replicates=5, ridge_names=None, band=[0.0, 0.8])}])
+    r12 = run_pack(p12, eng, Runner(p12, eng, 1), {})["benchmarks"][0]
+    ok(r12["status"] == "out_of_band" and r12.get("invalid_outputs") == 5 and "posterior_ess" in str(r12.get("errors")),
+       f"BP48 (v2d β) a calibrator that refuses counts as an invalid replicate (recorded), never under-coverage: "
+       f"{r12['status']}, {r12.get('errors')}")
+    p13 = dict(p6, oracles="toolkit.engines.benchmark", benchmarks=[{"id": "P1", "metric": "parallel", "estimand": {
+        "type": "coverage", "generator": {"fn": "selftest_normal", "args": {}},
+        "calibrator": {"fn": "toolkit.engines.benchmark:calibrate_selftest_normal", "args": {}}, "replicates": 30,
+        "seed": 4, "quantities": ["mu"], "band": [0.8, 1.0]}}])
+    s1 = run_pack(p13, eng, Runner(p13, eng, 1), {})["benchmarks"][0]
+    s2 = run_pack(p13, eng, Runner(p13, eng, 2), {})["benchmarks"][0]
+    ok(s1["coverage"] == s2["coverage"] and s1.get("per_replicate_sha256") == s2.get("per_replicate_sha256")
+       and s1.get("per_replicate_sha256"),
+       f"BP49 (v2d β) coverage replicates run in parallel give the serial result ({s1['coverage']}, {s2['coverage']})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

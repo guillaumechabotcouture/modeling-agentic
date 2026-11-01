@@ -479,11 +479,51 @@ def _self_test() -> int:
         from toolkit.analysis import contract
         ok(contract.gate_findings(d) == [], f"D6 contract checks pass on the direct path: {contract.gate_findings(d)}")
     _self_test_priors(ok, q)
+    _self_test_posterior(ok, q)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_posterior(ok, q):
+    """v2d β: the direct toy panel calibrated by `posterior` (declared priors, joint posterior sample)."""
+    import tempfile
+    import yaml
+    from toolkit.analysis import contract
+    with tempfile.TemporaryDirectory() as d:
+        _direct_toy(d)
+        sp = os.path.join(d, "decision_spec.yaml")
+        spec = yaml.safe_load(open(sp))
+        lrr = {"dist": "uniform", "range": [-2.0, 1.0], "source": "toy: a wide declared range"}
+        spec["calibration"].update(method="posterior", priors={
+            "lrr:a": lrr, "lrr:b": lrr, "lrr:a+b": lrr,
+            "log_rate": {"dist": "uniform", "range": [-8.0, 2.0], "source": "toy: the calibration range"}},
+            observation={"model": "poisson"})
+        yaml.safe_dump(spec, open(sp, "w"), sort_keys=False)
+        signoff.sign(d, "lead")
+        try:
+            R = run(d, log=q)
+        except Exception as e:      # noqa: BLE001 -- a failing case, not a crash of the self-test
+            ok(False, f"AN-b7 a posterior-calibrated allocation runs ({type(e).__name__}: {e})")
+            return
+        st = R["stability"]
+        ok(st.get("n_folds") == 3 and st.get("calibration_method") == "posterior" and st.get("method") != "skipped",
+           f"AN-b7 a posterior-calibrated allocation runs its stability folds instead of reporting 'nothing "
+           f"calibrated' ({st.get('method')}, {st.get('n_folds')} folds)")
+        cal = R["calibration"]
+        th = cal.get("theta") or {}
+        ok(cal.get("method") == "posterior" and abs(th.get("lrr:a", 9) - math.log(0.6)) < 0.1
+           and set((cal.get("identifiability") or {}).get("classes", {})) >= {"lrr:a", "z:u0"},
+           f"AN-b7b the posterior recovers the planted effects and classes every estimated name ({th})")
+        u = R["uncertainty"]
+        ok(u.get("draw_provenance", {}).get("findings") == [] and u.get("draw_provenance", {}).get("draws") == 8
+           and "calibration" in u["covers"],
+           f"AN-b7c uncertainty draws are rows of the canonical posterior sample (provenance recorded and checked): "
+           f"{u.get('draw_provenance', {}).get('findings')}")
+        ok(contract.gate_findings(d) == [], f"AN-b7d contract checks pass on the posterior path: "
+                                            f"{contract.gate_findings(d)}")
 
 
 def _self_test_priors(ok, q):
