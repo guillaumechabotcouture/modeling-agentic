@@ -411,6 +411,9 @@ artifacts:
       effect_at_target, difference_stated}`, the same effect re-computed
       under the target setting's covariates (`scripts/benchmark_transfer.py`,
       MEDIUM if absent).
+      Phase 49 β: give each target an `intervention:` field naming the package
+      component it concerns (or `none` for a calibration target); a drift on a
+      benchmark of an intervention the decision chooses among goes to the owner.
 
   # ---- Phase 21 β additions -------------------------------------------------
 
@@ -559,3 +562,60 @@ artifacts:
       ran or wrote; `result:`), and `decision: fix` (with `change:`) or
       `declare`. An entry lasts `stall_rounds` rounds. A missing test file
       is HIGH, not declarable. A scope declaration of the finding also clears it.
+      A `declare` entry also needs a `decision_test:` (entry `decision_tests`).
+
+  # ---- Phase 49 α -------------------------------------------------------------
+
+  - id: decision_tests
+    path: models/decision_tests/
+    first_draft_round: 2
+    finalize_round: 8
+    stage: model
+    skill: model-fitness
+    triggered_by: always
+    scope_declarable: false
+    required_for_accept: never   # required per declared HIGH finding by scripts/declaration_tests.py
+    description: |
+      **When a HIGH gate finding is to be scope-declared** (Phase 49 α, A20).
+      Re-run the decision with the finding's quantity set to its target (the
+      benchmark's value, a held-out fold's own parameters, the trial effect)
+      and write one result file per finding, e.g.
+      `models/decision_tests/<kind>_<key>.yaml`: `finding:` (`kind:key`, or
+      the key; one file per benchmark id), `varied:`, `criterion:` (the
+      package for a stated share of units, or the headline beyond its
+      interval), `decision_changes: true|false`, and `recommendation: {with:
+      <as delivered>, without: <with the quantity at its target>}`
+      (optional `share_units_changed` / `share_threshold`, `produced_by:
+      agent|harness`; the D1/D9 format).
+      The scope_declaration.yaml entry cites it: `decision_test: <path>`. No
+      change: the declaration stands; cite the test in the report. A change:
+      HIGH `declared_finding_changes_decision`, fix the finding. No test:
+      HIGH `scope_declaration_untested`. Exempt: `specified_by:
+      question|brief` + verbatim `quote:`, `owner_amendment: AM-n` naming the
+      finding, or a class in `scope_declaration_policy.yaml` (no quantity to
+      vary). None are declarable.
+
+  # ---- Phase 49 β -------------------------------------------------------------
+
+  - id: scope_signoff
+    path: scope_signoff.json
+    first_draft_round: 1
+    finalize_round: 8
+    stage: write
+    skill: model-fitness
+    triggered_by: always
+    scope_declarable: false
+    required_for_accept: never   # gate- and owner-written; see scripts/scope_signoff.py
+    description: |
+      **When the gate's decision is AWAIT_OWNER** (Phase 49 β, A21). A HIGH
+      finding that bears on the primary decision (map:
+      `scope_declaration_policy.yaml` `decision_bearing:`) cannot be declared
+      by the lead alone. The gate writes `scope_signoff_request.json`; the
+      owner answers each finding (accept | decline) with
+      `scripts/scope_signoff.py sign` from their own shell; under `--signoff
+      lead` the lead writes `scope_signoff_answers.yaml` and the harness signs.
+      An answer counts only once the harness has recorded it.
+      The owner reads each declaration's decision test (entry
+      `decision_tests`), or that it has none. Accepted: declarable. Declined:
+      HIGH `scope_declaration_declined`, fix it. A changed declaration or test
+      is asked again. Agents never write these files.

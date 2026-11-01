@@ -49,6 +49,18 @@ be moved to the appendix or omitted.
 writing files named REPORT*/SUMMARY*/FINDINGS*/ANALYSIS*.md, and
 `scripts/render_claims.py` builds `report.md` from your draft.)
 
+**Executive summary** (`## Executive summary`, before §1; after the
+harness's status line when there is one)
+- The decision, the recommendation and its headline impact, in plain words
+- When `{run_dir}/scope_declaration.yaml` exists, end the summary with the
+  placeholder `[DECLARED_LIMITS]` on its own line, exactly once, before §1
+  (not inside a comment or code block). `scripts/render_claims.py` replaces it
+  with a "What this does not establish" block it generates from the
+  declarations and their decision tests (id, the limit, its measured effect
+  on the recommendation). Do not type the declarations or their effects in
+  the summary yourself; they still go verbatim in §Limitations. The gate
+  checks the placeholder and the rendered block (`declared_limits_not_rendered`).
+
 **1. Introduction**
 - Research question and why it matters
 - Literature context (from plan.md)

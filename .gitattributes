@@ -1,0 +1,7 @@
+# Phase 50 α: the eval suite's generators, rubrics and answer keys (evals/) and the
+# design note that describes the planted truths are never shipped to agents or cloud
+# workers. `git archive` (the cloud launch tarball) honours export-ignore, and
+# cloud/run_cluster.py code_tarball refuses a tarball that still holds any of them
+# (scripts/lib/eval_paths.py). A question's input data live in data/evals/<q>/ and ship.
+/evals/** export-ignore
+/docs/design/eval-suite.md export-ignore
