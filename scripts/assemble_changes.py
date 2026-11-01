@@ -367,20 +367,24 @@ def _fragments_at(root: str, ref: str) -> tuple[dict[str, dict], list[str]]:
     return out, errors
 
 
-def _merge_regions(ours: list[str], base: list[str], theirs: list[str]) -> list[str] | None:
-    """`theirs`' change from `base` applied to `ours` (git merge-file); None on a conflict."""
+def _merge_regions(ours: list[str], base: list[str], theirs: list[str]) -> list[list[str]]:
+    """The acceptable results of applying `theirs`' change from `base` to `ours` (git
+    merge-file --union): where both sides inserted at the same place (v2's own rows and
+    main's), both are kept, ours first or theirs first. Nothing else is rearranged."""
     import tempfile
+    out = []
     with tempfile.TemporaryDirectory() as td:
-        paths = []
+        paths = {}
         for name, lines in (("ours", ours), ("base", base), ("theirs", theirs)):
-            p = os.path.join(td, name)
+            p = paths[name] = os.path.join(td, name)
             with open(p, "w", encoding="utf-8") as fh:
                 fh.write("".join(ln + "\n" for ln in lines))
-            paths.append(p)
-        r = subprocess.run(["git", "merge-file", "-p", *paths], capture_output=True)
-    if r.returncode != 0:
-        return None
-    return r.stdout.decode("utf-8", "surrogateescape").splitlines()
+        for a, b in (("ours", "theirs"), ("theirs", "ours")):
+            r = subprocess.run(["git", "merge-file", "-p", "--union", paths[a], paths["base"], paths[b]],
+                               capture_output=True)
+            if r.returncode == 0:
+                out.append(r.stdout.decode("utf-8", "surrogateescape").splitlines())
+    return out
 
 
 def _upstream_span(root: str, upstream: str | None, mb: str):
@@ -465,9 +469,8 @@ def check_pr(root: str, base: str, upstream: str | None = None) -> list[str]:
         if span is not None:
             up_old, up_new = (region(_show(root, ref, path) or "") for ref in span)
             # Ordered and count-preserving (Codex round 1 on #98): the region must be exactly
-            # upstream's change applied to this branch's region by a clean three-way merge.
-            merged = _merge_regions(expect, up_old, up_new)
-            if merged is not None and merged == got:
+            # upstream's change applied to this branch's region by a three-way merge.
+            if got in _merge_regions(expect, up_old, up_new):
                 continue
         what = "ledger table" if path == CHANGELOG else "Status section"
         if got == region(old):
@@ -796,6 +799,26 @@ def _self_test() -> int:
             pr = check_pr(td, "longlived", upstream="main")
             ok(len(pr) == 1 and "Status section was edited directly" in pr[0],
                f"CF29{name} a {name} of an existing Status line next to the merge still fails ({pr})")
+            git("checkout", "-q", "main")
+        # CF29e: the long-lived branch had added its own row at the same place (v2's rows before
+        # fragments existed); the merge keeps both, in either order, and passes.
+        git("checkout", "-q", "longlived")
+        git("checkout", "-q", "-b", "longlived2")
+        put(CHANGELOG, _read(os.path.join(td, CHANGELOG)).replace("Old row. |\n", "Old row. |\n| v2 | C | Branch row. |\n"))
+        git("commit", "-qam", "a row on the long-lived branch")
+        for order in ("branch-first", "upstream-first"):
+            git("checkout", "-q", "longlived2")
+            git("checkout", "-q", "-b", f"port-{order}")
+            subprocess.run(["git", "-C", td, "merge", "-q", "--no-ff", "-m", "merge main", "main"], capture_output=True)
+            rows = "| v2 | C | Branch row. |\n| 49 | ω | Upstream row. |\n"
+            if order == "upstream-first":
+                rows = "| 49 | ω | Upstream row. |\n| v2 | C | Branch row. |\n"
+            txt = re.sub(r"<<<<<<<[^\n]*\n.*?>>>>>>>[^\n]*\n", lambda m: rows, _read(os.path.join(td, CHANGELOG)), flags=re.S)
+            put(CHANGELOG, txt)
+            git("add", "-A")
+            git("commit", "-qm", "resolve")
+            pr = check_pr(td, "longlived2", upstream="main")
+            ok(pr == [], f"CF29e both sides' rows at the same place pass in {order} order ({pr})")
             git("checkout", "-q", "main")
 
     for sep, label in (("\\n", "newline"), ("\\u2028", "line separator"), ("\\r", "carriage return")):
