@@ -1005,13 +1005,55 @@ def verified_benchmarks(engine) -> tuple[list, str | None]:
     return list(doc.get("benchmarks") or []), None
 
 
+def merge_results(pack: dict, docs: list, engine) -> dict:
+    """Combine results files of per-case runs (`run --only`) into the pack's results, in pack order (v2d β: the
+    coverage pack runs case by case on a VM). Every file must carry this runner's stamp for the current engine
+    identity and configuration; a missing or duplicated case fails closed."""
+    want = stamp({}, engine)
+    rows, validated, nsims, wall = {}, {}, 0, 0.0
+    for d in docs:
+        for k in ("producer", "engine_identity", "engine_config_sha256"):
+            if d.get(k) != want.get(k):
+                raise ValueError(f"merge: a results file has another {k} (computed by other code or configuration)")
+        for r in d.get("benchmarks") or []:
+            if r["id"] in rows:
+                raise ValueError(f"merge: case {r['id']} appears twice")
+            rows[r["id"]] = r
+        validated.update(d.get("configs_validated") or {})
+        nsims += int(d.get("n_sims") or 0)
+        wall += float(d.get("wall_s") or 0.0)
+    ids = [b["id"] for b in pack["benchmarks"]]
+    miss = [i for i in ids if i not in rows]
+    extra = sorted(set(rows) - set(ids))
+    if miss or extra:
+        raise ValueError(f"merge: missing cases {miss}, cases not in the pack {extra}")
+    out_rows = [rows[i] for i in ids]
+    by = {s: sum(r["status"] == s for r in out_rows) for s in STATUSES}
+    d0 = docs[0]
+    out = {"benchmarks": out_rows, "settings_calibrated": d0.get("settings_calibrated", {}),
+           "fitted_used": d0.get("fitted_used", {}), "configs_validated": dict(sorted(validated.items())),
+           "configs_not_exercised": sorted(set(pack.get("configs") or {}) - set(validated)),
+           "seeds": d0.get("seeds"), "n_sims": nsims,
+           "summary": {"in_band": by["in_band"], "total": len(out_rows), "by_status": by,
+                       "held_out_in_band": sum(r["status"] == "in_band" for r in out_rows if r["role"] == "held_out"),
+                       "held_out_total": sum(r["role"] == "held_out" for r in out_rows)}}
+    for k in ("engine_version", "fit_rule"):
+        if k in d0:
+            out[k] = d0[k]
+    if any("wall_s" in d for d in docs):
+        out["wall_s"] = round(wall, 1)
+    return stamp(out, engine)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("pack")
-    ap.add_argument("action", choices=["fit", "run", "validate"])
+    ap.add_argument("action", choices=["fit", "run", "validate", "merge"])
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 1)
     ap.add_argument("--seeds", type=int, default=0, help="use the first K seeds of the pack (0 = all)")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--only", default=None, help="run: only these benchmark ids (comma-separated); merge the files")
+    ap.add_argument("--inputs", nargs="*", default=[], help="merge: results files of per-case runs")
     a = ap.parse_args(argv)
     pack = yaml.safe_load(open(a.pack))
     eng = load_engine(pack["engine"], (pack.get("configs") or {}).get(pack.get("default_config")))
@@ -1022,9 +1064,22 @@ def main(argv=None) -> int:
     if a.action == "validate":
         print("pack valid")
         return 0
+    d = os.path.dirname(os.path.abspath(a.pack))
+    if a.action == "merge":
+        merged = merge_results(pack, [yaml.safe_load(open(x)) for x in a.inputs], eng)
+        path = a.out or os.path.join(d, "results.yaml")
+        yaml.safe_dump(merged, open(path, "w"), sort_keys=False)
+        print(f"wrote {path} ({len(merged['benchmarks'])} cases)")
+        return 0
+    if a.only:
+        keep = set(a.only.split(","))
+        unknown = keep - {b["id"] for b in pack["benchmarks"]}
+        if unknown:
+            print(f"--only: unknown ids {sorted(unknown)}")
+            return 2
+        pack = dict(pack, benchmarks=[b for b in pack["benchmarks"] if b["id"] in keep])
     seeds = pack["seeds"][:a.seeds] if a.seeds else pack["seeds"]
     runner = Runner(pack, eng, a.workers, seeds)
-    d = os.path.dirname(os.path.abspath(a.pack))
     t0 = time.time()
     if a.action == "fit":
         out = fit_joint(pack, eng, runner) if pack.get("fit_joint") else fit(pack, eng, runner)
@@ -1400,6 +1455,28 @@ def _self_test() -> int:
     ok(s1["coverage"] == s2["coverage"] and s1.get("per_replicate_sha256") == s2.get("per_replicate_sha256")
        and s1.get("per_replicate_sha256"),
        f"BP49 (v2d β) coverage replicates run in parallel give the serial result ({s1['coverage']}, {s2['coverage']})")
+    p14 = dict(p13, benchmarks=[dict(p13["benchmarks"][0], id="P1"), dict(p13["benchmarks"][0], id="P2", seed=5)])
+    full = stamp(run_pack(p14, eng, Runner(p14, eng, 1), {}), eng)
+    parts = [stamp(run_pack(dict(p14, benchmarks=[b]), eng, Runner(p14, eng, 1), {}), eng) for b in p14["benchmarks"]]
+    try:
+        mg = merge_results(p14, parts[::-1], eng)
+        same = ([{k: v for k, v in r.items()} for r in mg["benchmarks"]] == full["benchmarks"]
+                and mg["summary"] == full["summary"] and mg["engine_identity"] == full["engine_identity"])
+        try:
+            merge_results(p14, parts[:1], eng)
+            short = False
+        except ValueError:
+            short = True
+        bad = dict(parts[1], engine_identity=dict(parts[1]["engine_identity"], code_sha256="0" * 64))
+        try:
+            merge_results(p14, [parts[0], bad], eng)
+            other = False
+        except ValueError:
+            other = True
+        ok(same and short and other, "BP50 (v2d β) per-case runs merge into the full results in pack order; a missing "
+           "case or another code identity is refused")
+    except NameError as ex:
+        ok(False, f"BP50 merge_results ({ex})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

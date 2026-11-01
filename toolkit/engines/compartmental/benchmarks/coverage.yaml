@@ -23,10 +23,11 @@ configs:
             forcing: cosine, forcing_period: 365.0, rt_trajectory: false}
   cohorts: {groups: [b2021, b2022, b2023, b2024, b2025], structure: birth_cohorts, mode: to_extinction,
             initialiser: cohort_history, doses: [d1], dt: day, generation_interval: [0.5, 0.5]}
-  # step_cap raised from the default 20,000: q near 0.40 is near-critical (R0 = q rho(C) = 0.996 at q = 0.4), and a
-  # near-critical member must converge rather than fail closed inside the prior's support.
+  # SB5's q range starts at 0.45 (R0 = q rho(C) = 1.12), not 0.40: rho(C) = 2.49, so q = 0.4015 is critical, and the
+  # engine fails closed at its step cap on a near-critical epidemic (measured: 22,681 steps at q = 0.4016, and no
+  # convergence within 400,000 steps at criticality). The generator and the prior use the same range.
   groups3: {groups: [a, b, c], structure: age_groups_contact_matrix, mode: to_extinction, initialiser: given,
-            dt: day, transmission: q, generation_interval: [0.5, 0.3, 0.2], step_cap: 400000,
+            dt: day, transmission: q, generation_interval: [0.5, 0.3, 0.2],
             components: {plan: {kind: campaign, targets: [b], reach: 0.5}}, outcomes: [hospitalisations]}
 settings: {}
 arms: {}
@@ -219,10 +220,10 @@ benchmarks:
     metric: "group-attack-rate calibration of q: coverage of hospitalisations averted by a fixed plan"
     estimand:
       type: coverage
-      generator: {fn: group_attack, args: {}}
+      generator: {fn: group_attack, args: {q_range: [0.45, 1.0]}}
       calibrator: {fn: "toolkit.analysis.calibration:posterior", args: {
         config: groups3,
-        priors: {q: {dist: uniform, range: [0.4, 1.0], source: "the generator's q range (synthetic)"}},
+        priors: {q: {dist: uniform, range: [0.45, 1.0], source: "the generator's q range (synthetic)"}},
         engine_params: {q: "param:q", "efficacy:plan": "data:efficacy"},
         unit: {N: "data:N", contact: "data:contact", s0: [1.0, 1.0, 1.0], seed: "data:seed_unit_share", intro: a,
                "ratio:hospitalisations": "data:hosp_ratio"},
