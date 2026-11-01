@@ -843,6 +843,129 @@ def _self_test() -> int:
         r2.results_path = eng.results_path
         ok("another engine" in (verified_benchmarks(r2)[1] or ""),
            "BP30 results stamped before a fitted parameter changed are refused (Codex r2 P1-6)")
+
+    # ---- v2d δ: estimand types value / identity / coverage, oracles and probes, pack configs
+    import types
+    om = types.ModuleType("_bp_oracles")
+    om.oracle_toy_cases = lambda x, eff_a=0.5, a=1, years=3.0: 0.5 * math.exp(0.8 * x) * (1 - eff_a * a) * years
+    om.oracle_sum = lambda a, b: float(a) + float(b)
+    om.probe_cases_vec = lambda make_engine, config, x: [make_engine(config).run(
+        {}, UnitSpec("u", {"x": x}), Package("p", {}), Horizon(0, 3, (0, 3), {}), 1).per_capita["cases"]["all"]]
+
+    def _gen(rng, mu_sd=1.0, n=20):
+        mu = float(rng.normal(0.0, mu_sd))
+        return {"y": rng.normal(mu, 1.0, n).tolist()}, {"mu": mu}
+
+    def _cal(make_engine, data, level=0.95, shrink=1.0, mu_sd=1.0):
+        y = np.asarray(data["y"])
+        prec = 1.0 / mu_sd ** 2 + len(y)
+        m, sd = y.sum() / prec, math.sqrt(1.0 / prec) * shrink
+        zq = 1.959963984540054
+        return {"intervals": {"mu": [m - zq * sd, m + zq * sd]}, "classes": {"mu": "identified"}}
+    om.generate_normal = _gen
+    om.calibrate_normal = _cal
+    sys.modules["_bp_oracles"] = om
+    p5 = {"engine": "toolkit.engines.contract:ToyEngine", "oracles": "_bp_oracles", "seeds": [1, 2],
+          "horizon": pack["horizon"],
+          "settings": {"s": {"unit": {"x": 0.3}}},
+          "arms": {"none": {"setting": "s", "package": {}}, "a": {"setting": "s", "package": {"a": 1}}},
+          "benchmarks": [
+              {"id": "V1", "metric": "toy cases vs closed form", "estimand": {
+                  "type": "value", "a": {"arm": "a", "value": "per_capita.cases.all"},
+                  "b": {"oracle": "toy_cases", "args": {"x": 0.3}}, "tol": {"rel": 1e-12}}},
+              {"id": "V2", "metric": "too tight against a wrong reference", "estimand": {
+                  "type": "value", "a": {"arm": "a", "value": "per_capita.cases.all"},
+                  "b": {"oracle": "toy_cases", "args": {"x": 0.31}}, "tol": {"abs": 1e-6}}},
+              {"id": "V3", "metric": "identity of two computations, nested oracle args", "estimand": {
+                  "type": "identity", "a": {"arm": "none", "value": "per_capita.cases.all"},
+                  "b": {"oracle": "sum", "args": {"a": {"arm": "a", "value": "per_capita.cases.all"},
+                                                  "b": {"arm": "a", "value": "per_capita.cases.all"}}},
+                  "tol": {"rel": 1e-12}}},
+              {"id": "V4", "metric": "inequality", "estimand": {
+                  "type": "value", "compare": "le", "a": {"arm": "a", "value": "per_capita.cases.all"}, "b": 10.0,
+                  "tol": {"abs": 0.0}}},
+              {"id": "V5", "metric": "negative control: the two must differ", "estimand": {
+                  "type": "value", "compare": "differ", "a": {"arm": "none", "value": "per_capita.cases.all"},
+                  "b": {"arm": "a", "value": "per_capita.cases.all"}, "tol": {"abs": 0.1}}},
+              {"id": "V6", "metric": "vector path and a probe", "estimand": {
+                  "type": "value", "a": {"arm": "none", "value": "per_capita_vec.cases"},
+                  "b": {"probe": "cases_vec", "args": {"config": None, "x": 0.3}}, "tol": {"abs": 1e-12}}},
+              {"id": "V8", "metric": "held out, values not yet transcribed", "estimand": {
+                  "type": "value", "not_transcribed": "to be transcribed"}}]}
+    ok(validate(p5, eng) == [], f"BP31 a pack with value/identity estimands, oracles, probes and configs validates: "
+       f"{validate(p5, eng)}")
+    bad5 = dict(p5, settings=dict(p5["settings"], s=dict(p5["settings"]["s"], config="nope")),
+                benchmarks=p5["benchmarks"] + [
+                    {"id": "V9", "metric": "m", "estimand": {"type": "value", "a": {"oracle": "no_such"}, "b": 1.0,
+                                                            "tol": {"abs": 1e-3}}},
+                    {"id": "V10", "metric": "m", "estimand": {"type": "value", "a": {"arm": "a", "value": "windows.w.prev"},
+                                                             "b": 1.0, "tol": {}}}])
+    pr5 = validate(bad5, eng)
+    ok(any("unknown config" in s for s in pr5) and any("no_such" in s for s in pr5) and any("tol" in s for s in pr5),
+       f"BP32 an unknown config, an unknown oracle and a missing tolerance are refused: {pr5}")
+    res5 = run_pack(p5, eng, Runner(p5, eng, 1), {})
+    r5 = {x["id"]: x for x in res5["benchmarks"]}
+    ok(r5["V1"]["status"] == "in_band" and r5["V2"]["status"] == "out_of_band" and r5["V2"]["error_abs"] > 1e-6,
+       "BP33 value: in band against its oracle, out of band against a wrong one, with the error reported")
+    ok(r5["V3"]["status"] == "in_band" and r5["V4"]["status"] == "in_band" and r5["V5"]["status"] == "in_band",
+       "BP34 identity with nested oracle args; `le` and `differ` comparisons")
+    ok(r5["V6"]["status"] == "in_band" and r5["V8"]["status"] == "not_assessable"
+       and "transcribed" in r5["V8"]["not_assessable_because"],
+       "BP35 vector paths and probes; a not-transcribed benchmark is not_assessable, never a pass")
+    p7 = {"engine": "toolkit.engines.empirical.engine:PackageRateEngine", "default_config": "rate2", "seeds": [1],
+          "horizon": pack["horizon"],
+          "configs": {"rate2": {"components": ["x", "y"], "outcome": "cases"},
+                      "rate3": {"components": ["x", "y", "z"], "outcome": "cases"}},
+          "settings": {"pr": {"config": "rate2", "unit": {"log_rate": math.log(0.2)}},
+                       "pr3": {"config": "rate3", "unit": {"log_rate": math.log(0.2)}, "params": {"lrr:z": math.log(0.5)}}},
+          "arms": {"pr0": {"setting": "pr", "package": {}}, "prz": {"setting": "pr3", "package": {"z": 1}}},
+          "benchmarks": [
+              {"id": "V7", "metric": "a configured engine (pack configs)", "estimand": {
+                  "type": "value", "a": {"arm": "pr0", "value": "per_capita.cases.all"}, "b": 0.6, "tol": {"rel": 1e-12}}},
+              {"id": "V7b", "metric": "a second configuration of the same engine", "estimand": {
+                  "type": "value", "a": {"arm": "prz", "value": "per_capita.cases.all"}, "b": 0.3, "tol": {"rel": 1e-12}}}]}
+    e7 = load_engine(p7["engine"], p7["configs"]["rate2"])
+    ok(validate(p7, e7) == [], f"BP36a a configured-engine pack validates: {validate(p7, e7)}")
+    ok(any("lrr:z" in s for s in validate(dict(p7, settings=dict(p7["settings"], pr=dict(
+        p7["settings"]["pr"], params={"lrr:z": 0.1}))), e7)),
+       "BP36b a setting parameter is checked against its own configuration's engine")
+    res7 = run_pack(p7, e7, Runner(p7, e7, 1), {})
+    r7 = {x["id"]: x for x in res7["benchmarks"]}
+    cv = res7.get("configs_validated") or {}
+    ok(r7["V7"]["status"] == "in_band" and r7["V7b"]["status"] == "in_band" and set(cv) == {"rate2", "rate3"}
+       and cv["rate3"]["config"] == {"components": ["x", "y", "z"], "outcome": "cases"}
+       and cv["rate2"]["engine_identity"]["config_sha256"] != cv["rate3"]["engine_identity"]["config_sha256"],
+       "BP36 configured engines run per setting; results list each validated configuration with its identity")
+    k1 = _engine_key("m:C", {"b": 1, "a": [1, 2]})
+    ok(k1 == _engine_key("m:C", {"a": [1, 2], "b": 1}) and k1 != _engine_key("m:C", {"a": [1, 3], "b": 1})
+       and k1 != _engine_key("m:C", None), "BP37 the worker cache key carries the canonical config")
+    p6 = {"engine": "toolkit.engines.contract:ToyEngine", "oracles": "_bp_oracles", "seeds": [1],
+          "horizon": pack["horizon"], "settings": {}, "arms": {},
+          "benchmarks": [
+              {"id": "SBT1", "metric": "exact posterior covers", "estimand": {
+                  "type": "coverage", "generator": {"fn": "normal", "args": {"mu_sd": 1.0}},
+                  "calibrator": {"fn": "_bp_oracles:calibrate_normal", "args": {}}, "replicates": 400, "seed": 11,
+                  "quantities": ["mu"], "band": [0.92, 0.98], "classes": {"mu": ["identified"]}, "class_share_min": 0.9}},
+              {"id": "SBT2", "metric": "half-width posterior under-covers (negative control)", "estimand": {
+                  "type": "coverage", "generator": {"fn": "normal", "args": {"mu_sd": 1.0}},
+                  "calibrator": {"fn": "_bp_oracles:calibrate_normal", "args": {"shrink": 0.5}}, "replicates": 400,
+                  "seed": 11, "quantities": ["mu"], "band": [0.0, 0.80]}},
+              {"id": "SBT3", "metric": "a calibrator that does not exist yet", "estimand": {
+                  "type": "coverage", "generator": {"fn": "normal", "args": {}},
+                  "calibrator": {"fn": "toolkit.analysis.no_such_module:posterior", "args": {}}, "replicates": 10,
+                  "seed": 1, "quantities": ["mu"], "band": [0.9, 0.99]}}]}
+    ok(validate(p6, eng) == [], f"BP38 a coverage pack validates: {validate(p6, eng)}")
+    r6 = {x["id"]: x for x in run_pack(p6, eng, Runner(p6, eng, 1), {})["benchmarks"]}
+    c1 = r6["SBT1"]
+    ok(c1["status"] == "in_band" and 0.92 <= c1["coverage"]["mu"] <= 0.98 and c1["class_share"]["mu"] == 1.0
+       and c1["replicates"] == 400 and c1["coverage_se"]["mu"] > 0,
+       f"BP39 coverage: an exact posterior covers at the nominal level, with its binomial SE ({c1.get('coverage')})")
+    ok(r6["SBT2"]["status"] == "in_band" and r6["SBT2"]["coverage"]["mu"] < 0.8,
+       "BP40 coverage: the negative control's under-coverage is detected (in its below-0.80 band)")
+    ok(r6["SBT3"]["status"] == "not_assessable" and "calibrator" in r6["SBT3"]["not_assessable_because"],
+       "BP41 coverage: a calibrator that cannot be imported is not_assessable, never a pass")
+    rr = {x["id"]: x for x in run_pack(p6, eng, Runner(p6, eng, 1), {})["benchmarks"]}
+    ok(rr["SBT1"]["coverage"] == c1["coverage"], "BP42 coverage is reproducible (fixed seeds)")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

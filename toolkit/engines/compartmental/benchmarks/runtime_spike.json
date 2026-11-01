@@ -1,0 +1,81 @@
+{
+ "python": "3.14.3",
+ "starsim": "3.3.4",
+ "numpy": "2.4.4",
+ "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.41",
+ "cpu_count": 4,
+ "threads": {
+  "OMP_NUM_THREADS": "1",
+  "OPENBLAS_NUM_THREADS": "1",
+  "MKL_NUM_THREADS": "1"
+ },
+ "cases": [
+  {
+   "batch": 1,
+   "groups": 5,
+   "steps": 50,
+   "reps": 30,
+   "ms_per_sim_median": 37.161,
+   "ms_init_median": 26.888,
+   "ms_run_median": 10.163,
+   "ms_per_member_median": 37.1611,
+   "attack_rate_member0": 0.649299
+  },
+  {
+   "batch": 1,
+   "groups": 5,
+   "steps": 100,
+   "reps": 30,
+   "ms_per_sim_median": 56.248,
+   "ms_init_median": 39.327,
+   "ms_run_median": 16.807,
+   "ms_per_member_median": 56.2479,
+   "attack_rate_member0": 0.697254
+  },
+  {
+   "batch": 1,
+   "groups": 5,
+   "steps": 200,
+   "reps": 30,
+   "ms_per_sim_median": 92.029,
+   "ms_init_median": 62.497,
+   "ms_run_median": 29.502,
+   "ms_per_member_median": 92.0288,
+   "attack_rate_member0": 0.697255
+  },
+  {
+   "batch": 1024,
+   "groups": 5,
+   "steps": 50,
+   "reps": 10,
+   "ms_per_sim_median": 54.26,
+   "ms_init_median": 28.284,
+   "ms_run_median": 25.845,
+   "ms_per_member_median": 0.053,
+   "attack_rate_member0": 0.180514
+  },
+  {
+   "batch": 1024,
+   "groups": 5,
+   "steps": 100,
+   "reps": 10,
+   "ms_per_sim_median": 88.258,
+   "ms_init_median": 40.957,
+   "ms_run_median": 46.353,
+   "ms_per_member_median": 0.0862,
+   "attack_rate_member0": 0.478559
+  },
+  {
+   "batch": 1024,
+   "groups": 5,
+   "steps": 200,
+   "reps": 10,
+   "ms_per_sim_median": 149.121,
+   "ms_init_median": 62.817,
+   "ms_run_median": 86.297,
+   "ms_per_member_median": 0.1456,
+   "attack_rate_member0": 0.478822
+  }
+ ],
+ "cpu_model": "INTEL(R) XEON(R) PLATINUM 8573C"
+}
