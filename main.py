@@ -937,6 +937,11 @@ def _run_self_test() -> int:
             ok(bool(why) == denied and (not denied or ("--scratch" in why and "--dry-run" in why and "lead" in why)),
                f"IN11 {'refused' if denied else 'allowed'}: {cmd} -> {why[:120]}")
             ig3.inflight.pop("h4", None)
+        # IN11b (Codex r1): the write-up and presentation sessions end their calls too
+        import inspect as _insp
+        from agents import run_finish as _rf
+        ok(all("on_session_end()" in _insp.getsource(f) for f in (_rf.final_writeup, _rf._presentation_session)),
+           "IN11b every session loop ends its in-flight calls")
         # IN12: agents/integrity.py's own self-test (lifecycle, retired globs, measles replay)
         from agents import integrity as _integ
         ok(_integ._self_test() == 0, "IN12 agents/integrity.py --self-test")

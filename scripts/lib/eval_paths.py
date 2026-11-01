@@ -123,7 +123,7 @@ def tree_hidden_material(root: str, tracked: set[str] | None = None) -> list[str
             rel = os.path.relpath(os.path.join(dp, fn), root).replace(os.sep, "/")
             parts = rel.split("/")
             hit = (any(p.startswith("_truth") for p in parts) or fn.endswith(".enc")
-                   or parts[0] == "evals_private" or parts[0].startswith("eval_private_")
+                   or any(p == "evals_private" or p.startswith("eval_private_") for p in parts[:-1])
                    or rel in HIDDEN_FILES)
             for k, p in enumerate(parts[:-1]):
                 if p != "evals" or hit:
@@ -251,7 +251,8 @@ def _self_test() -> int:
         bad = ["evals/q/_truth/truth.json", "evals/q/generate.py", "evals/q/rubric.yaml", "evals/_common.py",
                "evals/q/notes_untracked.txt", "evals_private/q/rubric.yaml", "eval_private_v3/manifest.json",
                "outputs/bundle.enc", "runs/r/_truth_copy/x.json", "docs/design/eval-suite.md",
-               ".claude/worktrees/w/evals/q/generate.py"]
+               ".claude/worktrees/w/evals/q/generate.py",
+               "runs/cache/eval_private_v3/q/rubric.yaml", "tmp/evals_private/q/generate.py"]   # Codex r1
         for rel in bad:
             put(rel)
         got = tree_hidden_material(td, tracked)

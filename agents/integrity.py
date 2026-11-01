@@ -259,6 +259,9 @@ def _is_full_build(args: list[str]) -> bool:
     pos, opts, j = [], set(), 0
     while j < len(args):
         t = args[j]
+        if t == "--":
+            pos.extend(a for a in args[j + 1:] if not re.fullmatch(r"\d*(>>?|<|&>>?|>&|<&)\S*", a))
+            break                        # argparse: everything after `--` is positional
         redir = re.fullmatch(r"\d*(>>?|<|&>>?|>&|<&)(\S*)", t)
         if redir:
             j += 1 if redir.group(2) else 2      # `>f`, `2>&1`; a bare `>` takes the next token
@@ -278,6 +281,23 @@ def _is_full_build(args: list[str]) -> bool:
         return False
     # `run <run_dir> <step>` without --scratch is refused by the CLI itself.
     return len(pos) == 2 and pos[0] == "run"
+
+
+def _bind_positional(cmd_str: str, operands: list[str]) -> str:
+    """`sh -c STRING $0 $1 …`: substitute $@, $*, $N and ${N} in STRING with the
+    shell-quoted operands it would see ($0 is the first operand)."""
+    import shlex
+    if not operands or "$" not in cmd_str:
+        return cmd_str
+    args = operands[1:]
+    every = " ".join(shlex.quote(a) for a in args)
+
+    def one(m):
+        n = int(m.group(1) or m.group(2))
+        v = operands[0] if n == 0 else (args[n - 1] if n - 1 < len(args) else "")
+        return shlex.quote(v)
+    s = re.sub(r'"\$[@*]"|\$[@*]|"\$\{[@*]\}"|\$\{[@*]\}', lambda m: every, cmd_str)
+    return re.sub(r'"?\$(?:(\d)|\{(\d+)\})"?', one, s)
 
 
 def _executed_scripts(command: str, cwd: str | None = None, _depth: int = 0
@@ -327,13 +347,29 @@ def _executed_scripts(command: str, cwd: str | None = None, _depth: int = 0
             if noexec:
                 cmd_str = None
             if cmd_str is not None:
+                # `bash -c '… "$@"' $0 $1 …`: the string runs with these as its positional
+                # parameters, so they are part of what runs (Codex r1).
+                cmd_str = _bind_positional(cmd_str, toks[j + 2:])
                 inner, bg = _executed_scripts(cmd_str, base, _depth + 1)
                 found += inner
                 background = background or bg
             continue
         if len(toks) < 2 or not re.fullmatch(r"python[\d.]*", os.path.basename(toks[0])):
             continue
-        k = next((i for i, t in enumerate(toks[1:], 1) if not t.startswith("-")), None)
+        # The script is the first operand after the interpreter's own options; -W/-X take
+        # an operand (`python3 -W ignore x.py`), and -c/-m/- run no script file (Codex r1).
+        k, i = None, 1
+        while i < len(toks):
+            t = toks[i]
+            if t == "-" or re.fullmatch(r"-[bBdEiIOPqsSuvVxR]*[cm].*", t, re.S):
+                break
+            if t in ("-W", "-X"):
+                i += 2
+                continue
+            if not t.startswith("-"):
+                k = i
+                break
+            i += 1
         if k is None:
             continue
         script = os.path.expanduser(toks[k])
@@ -526,17 +562,18 @@ class ArtifactIntegrity:
     def _built(self) -> set[str]:
         """Files the harness's pipeline run wrote: recorded by harness_wrote during its run,
         and the outputs its own record (models/pipeline_state.json, a protected runner
-        file) lists, so a resumed run keeps them. Only ever makes ownership stickier."""
-        out = set(self._pipeline_built)
+        file) lists, so a resumed run keeps them. Accumulated for the life of this
+        record: rewriting the state file later cannot take a file back out (Codex r1).
+        Only ever makes ownership stickier."""
         mod = _pipeline()
         if mod is not None:
             try:
                 for rec in (mod._load_state(self.run_path).get("steps") or {}).values():
                     if isinstance(rec, dict) and isinstance(rec.get("outputs"), dict):
-                        out.update(str(k) for k in rec["outputs"])
+                        self._pipeline_built.update(str(k) for k in rec["outputs"])
             except Exception:  # noqa: BLE001 — a bad record adds nothing (the scan still flags it)
                 pass
-        return out
+        return set(self._pipeline_built)
 
     def _pm(self):
         return getattr(_pipeline(), "path_match", fnmatch.fnmatchcase)
@@ -698,7 +735,13 @@ class ArtifactIntegrity:
     def _end(self, ids: list[str], where: str) -> list[dict]:
         if not ids:
             return []
-        new = self._check(where=where)
+        # The ending calls get their post-hook scan: an unarmed background grant they
+        # launched is armed only if its producer is alive now, else dropped (Codex r1).
+        self._ending = set(ids)
+        try:
+            new = self._check(where=where)
+        finally:
+            self._ending = set()
         for k in ids:
             self.inflight.pop(k, None)
         self.unmatched_intents += len(ids)
@@ -817,7 +860,8 @@ class ArtifactIntegrity:
             if g.get("pipeline"):
                 keep.append(g)   # held by harness_pipeline until its run ends
                 continue
-            if not g["armed"] and g.get("launch_id") != getattr(self, "_posting", None):
+            if not g["armed"] and g.get("launch_id") != getattr(self, "_posting", None) \
+                    and g.get("launch_id") not in getattr(self, "_ending", ()):
                 # Only the launching call's own post-hook arms it; if that
                 # post-hook never comes, the grant expires like an intent.
                 if time.monotonic() - g.get("t", 0) < INTENT_TTL_S:
@@ -851,7 +895,9 @@ class ArtifactIntegrity:
                 continue
             if rel in self._baseline or rel in self._released or rel in self._unowned:
                 continue         # S1: existed before it was declared a pipeline output, or released
-            in_flight = sorted({f"{i['agent'] or 'lead'}:{i['tool']}" for i in self.inflight.values()})
+            if rel not in cur and not self._watched(rel):
+                continue         # gone, and no longer protected (a retired glob's never-built file)
+            in_flight =sorted({f"{i['agent'] or 'lead'}:{i['tool']}" for i in self.inflight.values()})
             if cur.get(rel) == self.hashes.get(rel):
                 # Same bytes, but rewritten (mtime moved) by a sanctioned
                 # producer: a deterministic regeneration still resolves an
@@ -1145,12 +1191,56 @@ def _self_test() -> int:
         ig.on_agent_stop("c1")
         ok(list(ig.inflight) == ["y"], f"IG8 only c1's call ends: {list(ig.inflight)}")
 
+    # IG11 (Codex r1 P1): a background producer launched by a call that never got its
+    # PostToolUse does not keep a grant after its agent stops (the process is gone).
+    with tempfile.TemporaryDirectory() as d:
+        w(d, "model_comparison_formal.yaml", "a: 1\n")
+        ig = ArtifactIntegrity(d, process_check=lambda: set())
+        ig.on_pre("bg", "Bash", {"command": f"nohup python3 scripts/compare_models.py {d} &"}, "modeler",
+                  cwd=enforcement.REPO_ROOT, agent_id="m1")
+        ig.on_agent_stop("m1")
+        ig.on_pre("l1", "Bash", {"command": "true"}, None, cwd=d, agent_id="lead")
+        w(d, "model_comparison_formal.yaml", "a: forged\n")
+        ok([x["file"] for x in ig.on_post("l1")] == ["model_comparison_formal.yaml"] and not ig.grants,
+           f"IG11 the stopped agent's unarmed grant ends with it: {ig.grants}")
+
+    # IG12 (Codex r1 P1): editing the runner's record cannot take back what the harness built.
+    with tempfile.TemporaryDirectory() as d:
+        spec(d, ["figures/old_*.png", "figures/h1_*.png"], extra="a")
+        w(d, "figures/old_a.png", "built\n")
+        w(d, "models/pipeline_state.json", json.dumps({"steps": {"figures": {
+            "ok": True, "outputs": {"figures/old_a.png": "x"}}}}))
+        ig = ArtifactIntegrity(d, process_check=lambda: set())       # a resumed run: built per the record
+        ig.on_pre("t1", "Bash", {"command": "python3 -c 'x'"}, "modeler", cwd=d, agent_id="m1")
+        w(d, "models/pipeline_state.json", json.dumps({"steps": {}}))
+        spec(d, ["figures/h1_*.png"], extra="bb")
+        w(d, "figures/old_a.png", "forged\n")
+        ok("figures/old_a.png" in [x["file"] for x in ig.on_post("t1")],
+           f"IG12 a built file stays owned when the state record is rewritten: {ig.open_events}")
+
+    # IG13 (Codex r1 P2): one call that retires the glob and deletes the never-built file.
+    with tempfile.TemporaryDirectory() as d:
+        spec(d, ["figures/*.provenance.json"], extra="a")
+        ig = ArtifactIntegrity(d, process_check=lambda: set())
+        ig.on_pre("t1", "Bash", {"command": "python3 eda.py"}, "modeler", cwd=d, agent_id="m1")
+        w(d, "figures/eda.png.provenance.json", "{}\n")
+        ig.on_post("t1")
+        ig.on_pre("t2", "Bash", {"command": "python3 -c 'x'"}, "modeler", cwd=d, agent_id="m1")
+        os.remove(os.path.join(d, "figures/eda.png.provenance.json"))
+        spec(d, ["figures/h1_*.png"], extra="bb")
+        new = ig.on_post("t2")
+        ok(new == [] and ig.open_events == [], f"IG13 nothing stays open: {new} {ig.open_events}")
+
     # IG9-IG10: which Bash commands are a full pipeline build in the real run directory.
     run = "runs/r1"
     for cmd in (f"nohup python3 scripts/pipeline.py run {run} > models/pipeline_run.log 2>&1 &",
                 "python3 scripts/pipeline.py run . --budget-s 600",
                 f"cd x; timeout 900 python3 {enforcement.REPO_ROOT}/scripts/pipeline.py run {run}",
-                f"bash -c 'python3 scripts/pipeline.py run {run}'"):
+                f"bash -c 'python3 scripts/pipeline.py run {run}'",
+                f"python3 scripts/pipeline.py run -- {run}",                      # Codex r1
+                f"python3 -W ignore scripts/pipeline.py run {run}",
+                f"python3 -X utf8 -u scripts/pipeline.py run {run}",
+                f"bash -c 'python3 scripts/pipeline.py run \"$@\"' sh {run}"):
         ok(pipeline_builds(cmd, enforcement.REPO_ROOT), f"IG9 a full build is recognised: {cmd}")
     for cmd in (f"python3 scripts/pipeline.py run {run} sensitivity --scratch --keep",
                 f"python3 scripts/pipeline.py run {run} b --scr",
@@ -1159,7 +1249,9 @@ def _self_test() -> int:
                 f"python3 scripts/pipeline.py validate {run}",
                 "python3 scripts/pipeline.py --self-test",
                 f"grep -n 'pipeline.py run {run}' models/notes.md",
-                f"python3 models/pipeline.py run {run}"):
+                f"python3 models/pipeline.py run {run}",
+                f"bash -c 'python3 scripts/pipeline.py run \"$@\"' sh {run} --dry-run",   # Codex r1
+                f"python3 scripts/pipeline.py run -- {run} b"):
         ok(not pipeline_builds(cmd, enforcement.REPO_ROOT), f"IG10 not a full build: {cmd}")
 
     if fails:
