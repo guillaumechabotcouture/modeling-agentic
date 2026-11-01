@@ -116,6 +116,10 @@ class RunConfig:
             raise ValueError("adapt_interval must be positive")
         if self.overflow_max and not self.overflow_vm_types:
             raise ValueError("overflow_max needs overflow_vm_types")
+        if self.compute_start < 1 and (self.compute_env or {}).get("MA_COMPUTE_RESOURCE"):
+            raise ValueError("compute_start must be at least 1 when compute tasks need a resource tag "
+                             "(MA_COMPUTE_RESOURCE): with no tagged worker the autoscaler's target stays at the "
+                             "current pool, so the pool never grows")
 
     @property
     def state_file(self):
@@ -337,7 +341,7 @@ def launch(cfg):
         clusters["keeper"] = {"name": cfg.keeper_name, "id": kc.cluster_id}
         json.dump(clusters, open(cfg.clusters_file, "w"), indent=1)   # recorded before any read that can fail
         time.sleep(30)
-        confirm_keeper(cfg.keeper_name, kc)
+        confirm_keeper(cfg.keeper_name, kc, run_alive=lambda: is_running(cfg.name))
     print(f"launched {cfg.name}: results go to outputs/{cfg.storage_prefix}/; the cluster stops itself "
           "once every run is stored. Safe to disconnect.")
 
@@ -411,7 +415,7 @@ def start_keeper(cfg, adapt_opts, cluster_id, overflow=None):
 KEEPER_TICK = re.compile(r"\bworkers=\d+ \(overflow \d+\)")   # _keeper_loop's tick line
 
 
-def confirm_keeper(keeper_name, kc, attempts=8, delay_s=5.0, max_delay_s=60.0, sleep=None):
+def confirm_keeper(keeper_name, kc, attempts=8, delay_s=5.0, max_delay_s=60.0, sleep=None, run_alive=None):
     """Wait (bounded, doubling backoff) for the keeper's first tick line: it is written only
     after adapt() and a worker-table read, so it is the evidence the pool is held; a readable
     log alone ("(no log yet)", "keeper error ...; retrying") is not. The keeper cluster's
@@ -441,6 +445,17 @@ def confirm_keeper(keeper_name, kc, attempts=8, delay_s=5.0, max_delay_s=60.0, s
         if i < attempts - 1:
             sleep(delay)
             delay = min(max_delay_s, delay * 2)
+    # A run that ended (or paused) before the keeper's first tick stops its own cluster, and the keeper then exits
+    # by design: nothing is left to hold, so this is reported, not a launch failure.
+    try:
+        stopped = run_alive is not None and not run_alive()
+    except Exception:  # noqa: BLE001 — unknown run state: fail as before
+        stopped = False
+    if stopped:
+        msg = (f"keeper {keeper_name}: not confirmed, but the run cluster has already stopped (the run ended or paused "
+               "before the keeper's first tick), so the keeper exited by design; check `status` before relaunching")
+        print(msg)
+        return [msg]
     raise SystemExit(f"keeper {keeper_name} (cluster {kc.cluster_id}) was submitted but not confirmed holding "
                      f"the pool after {attempts} tries (last: {last[0][:200]}). The run is fired and the clusters "
                      f"file names the keeper; check `status` and `keeper-log` now (without a keeper the pool "
@@ -1178,15 +1193,15 @@ def _self_test_52(ok) -> None:
             line = confirm_keeper("x-keeper", kc4, attempts=2, delay_s=0.0, sleep=lambda s: None,
                                   run_alive=lambda: False)
         ok("run cluster" in str(line) and "stopped" in str(line),
-           f"RC52j a run cluster that stopped before the keeper ticked is reported, not a launch failure: {line}")
+           f"RC52m a run cluster that stopped before the keeper ticked is reported, not a launch failure: {line}")
     except SystemExit as e:
-        ok(False, f"RC52j a run cluster that stopped before the keeper ticked is reported, not a launch failure: {e}")
+        ok(False, f"RC52m a run cluster that stopped before the keeper ticked is reported, not a launch failure: {e}")
     try:
         with contextlib.redirect_stdout(io.StringIO()):
             confirm_keeper("x-keeper", kc4, attempts=2, delay_s=0.0, sleep=lambda s: None, run_alive=lambda: True)
-        ok(False, "RC52k a live run with an unconfirmed keeper still fails the launch")
+        ok(False, "RC52n a live run with an unconfirmed keeper still fails the launch")
     except SystemExit as e:
-        ok("not confirmed" in str(e), f"RC52k a live run with an unconfirmed keeper still fails the launch: {e}")
+        ok("not confirmed" in str(e), f"RC52n a live run with an unconfirmed keeper still fails the launch: {e}")
 
     # Codex round 1: launch keeps the replacement client for the rest of the launch.
     from unittest import mock
