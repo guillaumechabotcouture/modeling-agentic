@@ -482,6 +482,49 @@ def create_or_attach(name, n_workers, workspace=WORKSPACE):
                           worker_options={"nthreads": 1}, shutdown_on_close=False)
 
 
+def _worker_side():
+    """cloud/worker_side.py's bounded worker-table reader (PR #99), loaded once by path.
+    Client.scheduler_info() is {} (no "workers" key) while the client is not connected."""
+    import importlib.util
+    mod = sys.modules.get("ma_replay_worker_side")
+    if mod is None:
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cloud", "worker_side.py")
+        spec = importlib.util.spec_from_file_location("ma_replay_worker_side", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        sys.modules["ma_replay_worker_side"] = mod
+    return mod
+
+
+def _read_workers(cluster, box, log, min_workers=0):
+    """The worker table, replacing a closed client in `box` from `cluster`; raises
+    SchedulerInfoUnavailable past the bound."""
+    w = _worker_side()
+
+    def get():
+        box[0] = w.live_client(cluster, box[0])
+        return box[0]
+    return w.scheduler_workers(get, min_workers=min_workers, log=log)
+
+
+def size_pool(cluster, client, want, log=print):
+    """Grow an attached cluster to `want` workers when its real worker table is smaller;
+    never scale on an unpopulated identity (read as zero, it would shrink a larger pool).
+    Returns the client to use (a closed one is replaced)."""
+    box = [client]
+    if len(_read_workers(cluster, box, log)) < want:
+        cluster.scale(want)       # an attached cluster may be smaller
+    box[0].wait_for_workers(want, timeout=1800)
+    return box[0]
+
+
+def pick_case_workers(cluster, client, want, n, log=print):
+    """(client, the first `n` worker addresses) once `want` workers are in the table."""
+    box = [client]
+    w = _read_workers(cluster, box, log, min_workers=want)
+    return box[0], sorted(w)[:n]
+
+
 def launch(cases, variants, repo, batch_dir, cluster_name, workers, anthropic_key, dry_agent=False,
            workspace=WORKSPACE, log=print, openai_key=None, compute_workers=0):
     """compute_workers: extra workers that run no case, only compute-service
@@ -500,12 +543,9 @@ def launch(cases, variants, repo, batch_dir, cluster_name, workers, anthropic_ke
     vbundle = variants_bundle(variants)
     log(f"code {code_info} ({len(code) >> 20} MB); variants {len(vbundle) >> 10} KB; {len(cases)} cases on {n} workers")
     cluster = create_or_attach(cluster_name, n + compute_workers, workspace)
-    client = cluster.get_client()
-    if len(client.scheduler_info()["workers"]) < n + compute_workers:
-        cluster.scale(n + compute_workers)       # an attached cluster may be smaller
-    client.wait_for_workers(n + compute_workers, timeout=1800)
+    client = size_pool(cluster, cluster.get_client(), n + compute_workers, log)
     client.upload_file(os.path.abspath(__file__))
-    case_workers = sorted(client.scheduler_info()["workers"])[:n]
+    client, case_workers = pick_case_workers(cluster, client, n + compute_workers, n, log)
     assign = assign_workers(cases, case_workers)
     scattered = {}
     for w in sorted(set(assign.values())):
