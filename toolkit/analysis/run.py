@@ -532,6 +532,21 @@ def _self_test_priors(ok, q):
            and os.path.exists(os.path.join(d, t["path"])),
            "RP5 every drawn prior gets an automatic prior_range test; the DALY-weight ends move the objective")
         ok(contract.gate_findings(d) == [], f"RP6 the contract checks pass with priors: {contract.gate_findings(d)}")
+        from toolkit.analysis import decision_tests as DTm
+        A = R["_A"]
+        z0 = {i: v["z"] for i, v in R["calibration"]["units"].items()}
+        out0, ben0, cost0 = A.evaluate(A.theta0, z0)
+        plan0 = R["point"]["plan"]
+        orig_cal = A.calibrate
+        A.calibrate = lambda th, shifts=None, ids=None: {i: (z, True) for i, (z, _c) in orig_cal(th, shifts, ids).items()}
+        try:
+            rec = DTm.run_one(A, DTm.prior_range_tests(A)[0], z0, ben0, cost0, plan0, R["uncertainty"], out0)
+        finally:
+            A.calibrate = orig_cal
+        ok(all(x.get("calibration_clamped_units") == len(A.ids) for x in rec["results"])
+           and "calibration clamped" in rec["statement"],
+           f"RP8 an end whose calibration clamps is flagged in the result and its statement (Codex r1 P1-3): "
+           f"{rec['statement']}")
         design.pop("prior_names")
         try:
             EmulatorModel(schema.load(p), design, {}, log=q)

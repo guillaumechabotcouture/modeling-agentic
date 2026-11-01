@@ -202,6 +202,11 @@ def problems(spec) -> list[str]:
         if not why:
             bad.append(f"uncertainty.excluded: parameter {name} needs a reason")
     inc = [x.get("kind") for x in u.get("sources") or [] if isinstance(x, dict)]
+    if spec.raw["calibration"].get("method") == "likelihood" and drawn(spec):
+        bad.append(f"uncertainty: likelihood calibration does not condition on prior draws (its fit and covariance hold "
+                   f"the priors at their point values), so drawing {sorted(drawn(spec))} would add variation the data "
+                   "contradict; exclude them by name or kind with a reason, or calibrate by emulator inversion "
+                   "(re-inverted per draw) (Codex r1 P1-1)")
     if "priors" in inc and not allp:
         bad.append("uncertainty.sources priors: neither the engine card nor the spec declares a prior")
     return bad
@@ -236,8 +241,10 @@ def plan(spec) -> dict:
     sources = []
     for k, what in list(UNCERTAINTY_KINDS.items()) + [("priors", PRIORS_WHAT)]:
         if k == "priors":
-            st = "drawn" if dr else "excluded" if k in kex else "none_declared"
-            why = kex.get(k) or ("" if dr else "no prior parameter on the engine card or in the spec")
+            declared = set(card["priors"]) | set(sp)
+            st = "drawn" if dr else "excluded" if (k in kex or declared) else "none_declared"
+            why = kex.get(k) or ("" if dr else "; ".join(f"{n} excluded: {exc[n]}" for n in sorted(exc) if n in declared)
+                                 or "no prior parameter on the engine card or in the spec")
         else:
             st = "drawn" if k in inc else "excluded"
             why = kex.get(k, "")
@@ -398,6 +405,15 @@ def _self_test() -> int:
         ok(min(xs) >= 0.1 and max(xs) <= 0.5 and abs(np.mean(xs) - (0.1 + 0.2 + 0.5) / 3) < 0.01
            and abs(np.mean(ys)) < 0.05, "PR16 draws stay in the bounded support with the declared shape")
         ok(load_card(ToyEngine())["priors"] == {} and drawn(s0) == {}, "PR17 an engine without a priors file has no priors")
+        r4 = copy.deepcopy(r)
+        r4["uncertainty"]["excluded"].append({"parameter": "dw", "reason": "owner: held for this test"})
+        st4 = {x["kind"]: x for x in plan(schema.Spec(r4, d))["sources"]}["priors"]
+        ok(st4["status"] == "excluded" and "dw" in st4.get("reason", "") and "held for this test" in st4["reason"],
+           f"PR19 every prior excluded by name: the plan says excluded, with the reasons (Codex r1 P2): {st4}")
+        bad(lambda x: x["calibration"].update(method="likelihood", parameters=[], targets={}),
+            "does not condition on prior draws",
+            "PR20 likelihood calibration with drawn priors is refused: its fit is conditional on their point values "
+            "(Codex r1 P1-1)")
         # the malaria card's priors file: every fixed parameter accounted for, ranges contain the point values
         try:
             from toolkit.engines.malaria.engine import MalariaEngine

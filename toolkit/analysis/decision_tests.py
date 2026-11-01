@@ -118,7 +118,12 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
         cases, lowers = [], []
         for v in dt["values"]:
             theta = dict(A.theta0, **{p: float(v)})
-            zs = {i: x[0] for i, x in A.calibrate(theta).items()} if A.method == "emulator_inversion" else z0
+            if A.method == "emulator_inversion":
+                cz = A.calibrate(theta)
+                zs = {i: x[0] for i, x in cz.items()}
+                extra[v] = {"calibration_clamped_units": sum(bool(x[1]) for x in cz.values())}   # Codex r1 P1-3
+            else:
+                zs = z0
             _, ben, cost = A.evaluate(theta, zs)
             evs[v] = list(A.last_events)
             same_cost = all(abs(cost[i][k] - cost0[i][k]) <= 1e-9 * max(1.0, abs(cost0[i][k])) for i in A.ids for k in A.pk)
@@ -174,6 +179,9 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
         can_move = True
     if rejected:
         stmt += "; some requested values could not be reached and were rejected"
+    if any(r.get("calibration_clamped_units") for r in results):
+        stmt += ("; at some tested values the calibration clamped at its range for some units, so those units do not "
+                 "match their targets there (calibration_clamped_units per value)")
     finding = dt.get("finding") or f"decision_test:{dt['id']}"
     rec = {"statement": stmt + ".", "status": "run", "can_move_plan": can_move, "finding": finding,
            "test_id": dt["id"], "type": t, "question": dt.get("text", ""), "varied": varied,

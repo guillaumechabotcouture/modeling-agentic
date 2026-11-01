@@ -93,6 +93,10 @@ class EmulatorModel:
             raise ValueError(f"emulator design: the uncertainty draws vary {miss}, which are not inputs of this design; "
                              "they must enter the design (rebuild the batch from toolkit/analysis/batch.py design(), "
                              "which spans every prior's declared range), or be excluded by name in the signed spec")
+        extra = sorted(set(self.prior_names) - set(want))
+        if extra:
+            raise ValueError(f"emulator design: its prior inputs {extra} are not drawn by this spec; rebuild the batch "
+                             "from toolkit/analysis/batch.py design() so the design and the draws agree")
         self.param_names = list(self.fitted_names) + self.prior_names
         self.packages = design["packages"]
         self.comp = spec.comparator
@@ -298,12 +302,13 @@ class EmulatorError:
 
     A unit's error is split into the error of the population mean, which a sum over units does not average away, and
     the unit's deviation from it, which it does:
-        common  = m u + D' g / sqrt(H (H - 1))    u ~ N(0, 1), g ~ N(0, I_H): one per draw, shared by every unit
+        common  = m + D' g / sqrt(H (H - 1))      g ~ N(0, I_H): one per draw, shared by every unit
         unit j  = D' g_j / sqrt(H - 1)            g_j ~ N(0, I_H): one per unit
-    m is the mean held-out residual and D the residuals minus m. The common part has the mean square that the held-out
-    set gives the population-mean error: its observed mean (sign unknown, so u) and that mean's sampling error. Both
-    parts are combinations of the observed residual vectors, so they keep the residuals' correlation across packages
-    and population groups. Independent per-unit errors at the held-out RMSE (the earlier model) make the error of an
+    m is the mean held-out residual (signed, per column) and D the residuals minus m: the common part is the held-out
+    estimate of the population-mean error, N(m, S/H), so an observed bias keeps its sign and its pattern across
+    packages (Codex r1 P1-2), and the draws' centre moves by it; the point estimate does not. Both parts are
+    combinations of the observed residual vectors, so they keep the residuals' correlation across packages and
+    population groups. Independent per-unit errors at the held-out RMSE (the earlier model) make the error of an
     n-unit total shrink as 1/sqrt(n); here it does not fall below the common part. Not captured: correlation at an
     intermediate level (units of one region more alike than units at large), which H residuals cannot estimate."""
     MIN_HOLDOUT = 3
@@ -319,21 +324,22 @@ class EmulatorError:
     def sample(self, rng, n: int):
         """(n units x columns) errors for one draw."""
         H = self.H
-        common = self.m * rng.normal() + self.D.T @ rng.normal(size=H) / math.sqrt(H * (H - 1))
+        common = self.m + self.D.T @ rng.normal(size=H) / math.sqrt(H * (H - 1))
         return common[None, :] + rng.normal(size=(n, H)) @ self.D / math.sqrt(H - 1)
 
     def summary(self) -> dict:
         H = self.H
         s = self.R.std(0, ddof=1)
         rmse = np.sqrt(np.mean(self.R ** 2, 0))
-        sd_c = np.sqrt(self.m ** 2 + s ** 2 / H)
+        sd_c = s / math.sqrt(H)
         tstat = np.abs(self.m) / np.maximum(s / math.sqrt(H), 1e-300)
         live = self.R[:, s > 0]
         corr = None
         if live.shape[1] > 1:
             C = np.corrcoef(live.T)
             corr = float(np.median(C[~np.eye(C.shape[0], dtype=bool)]))
-        return {"model": "common (population-mean) plus per-unit components from the held-out residual vectors",
+        return {"model": "common (population-mean, centred on the signed mean residual) plus per-unit components from "
+                         "the held-out residual vectors",
                 "holdout_points": H, "columns": len(self.cols),
                 "residual_mean_median": float(np.median(self.m)), "residual_mean_abs_median": float(np.median(np.abs(self.m))),
                 "residual_sd_median": float(np.median(s)), "rmse_median": float(np.median(rmse)),
@@ -419,20 +425,21 @@ def _self_test() -> int:
             return float(np.std([rng.normal(0, old, size=n).mean() for _ in range(draws)]))
         return float(np.std([err.sample(rng, n)[:, 0].mean() for _ in range(draws)]))
 
-    # ME1 fully correlated error (every held-out residual the same): the error of an n-unit mean does not shrink
-    R = np.full((12, 2), 0.04)
+    # ME1 the error of an n-unit mean converges to the population-mean error (sd s/sqrt(H)), not to zero
+    R = np.random.default_rng(11).normal(0, 0.04, size=(12, 2))
     e = EmulatorError([("all", "a"), ("all", "b")], R)
     w10, w1000 = sd_of_mean(e, 10), sd_of_mean(e, 1000)
+    sH = R[:, 0].std(ddof=1) / math.sqrt(12)
     o10, o1000 = sd_of_mean(None, 10, old=0.04), sd_of_mean(None, 1000, old=0.04)
-    ok(abs(w1000 / w10 - 1) < 0.05 and abs(w10 - 0.04) < 0.004 and o10 / o1000 > 8,
-       f"ME1 fully correlated error: the interval of a total does not shrink with the number of units "
+    ok(w10 / w1000 < 2.0 and abs(w1000 / sH - 1) < 0.1 and o10 / o1000 > 8,
+       f"ME1 the error of a total converges to the population-mean error, not to zero as 1/sqrt(n) "
        f"({w10:.4f} at 10 units, {w1000:.4f} at 1000; the independent model shrinks {o10 / o1000:.1f}x)")
     # ME2 zero-mean independent residuals: the per-unit part averages out, the population-mean part (sd s/sqrt(H)) stays
     rng = np.random.default_rng(3)
     R2 = rng.normal(0, 0.05, size=(400, 1))
     e2 = EmulatorError([("all", "a")], R2)
     s, m, H = R2.std(ddof=1), R2.mean(), 400
-    want = math.sqrt(m ** 2 + s ** 2 / H + s ** 2 / 1000)
+    want = math.sqrt(s ** 2 / H + s ** 2 / 1000)      # the signed mean m is a shift, not a spread
     got = sd_of_mean(e2, 1000, draws=3000)
     ok(abs(got / want - 1) < 0.1 and got > 1.2 * sd_of_mean(None, 1000, old=float(np.sqrt(np.mean(R2 ** 2)))),
        f"ME2 independent residuals: a total's error has the per-unit part averaged and the mean's error kept "
@@ -441,6 +448,14 @@ def _self_test() -> int:
     R3 = np.column_stack([R2[:12, 0], R2[:12, 0]])
     x = EmulatorError([("all", "a"), ("all", "b")], R3).sample(np.random.default_rng(5), 50)
     ok(np.allclose(x[:, 0], x[:, 1]), "ME3 two packages with the same held-out residuals get the same error draw")
+    # ME5 Codex r1 P1-2: opposite-signed held-out biases keep their sign (package b is over-predicted relative to a)
+    x0 = np.random.default_rng(2).normal(0, 0.002, size=20)
+    e5 = EmulatorError([("all", "a"), ("all", "b")], np.column_stack([0.04 + x0, -0.04 + x0]))
+    g = np.random.default_rng(6)
+    dd = np.array([e5.sample(g, 200).mean(0) for _ in range(400)])
+    ok(np.all(dd[:, 0] - dd[:, 1] > 0.07) and np.corrcoef(dd.T)[0, 1] > 0.5,
+       f"ME5 signed residual means are kept: the difference stays near 0.08 and the errors stay positively correlated "
+       f"({np.min(dd[:, 0] - dd[:, 1]):.4f}, corr {np.corrcoef(dd.T)[0, 1]:.2f})")
     sm = e2.summary()
     ok(sm["holdout_points"] == 400 and sm["sd_common_median"] < sm["sd_unit_median"]
        and "not_captured" in sm, f"ME4 the error model is summarised for the artifact ({sm['sd_common_median']:.4f})")

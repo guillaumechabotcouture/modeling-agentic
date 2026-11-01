@@ -52,12 +52,15 @@ def run(A, z0, ben0, cost0, plan, obj0) -> dict:
         ends = []
         for v in (lo, hi):
             theta = dict(A.theta0, **{p: float(v)})
+            clamped = 0
             if A.method == "emulator_inversion":
-                zs = {i: x[0] for i, x in A.calibrate(theta).items()}
+                cz = A.calibrate(theta)
+                zs = {i: x[0] for i, x in cz.items()}
+                clamped = sum(bool(x[1]) for x in cz.values())     # Codex r1 P1-3: recorded per end
             else:
                 zs = z0
             _, ben, cost = A.evaluate(theta, zs)
-            ends.append(_end(A, v, ben, cost, plan))
+            ends.append(dict(_end(A, v, ben, cost, plan), calibration_clamped_units=clamped))
         rows.append({"name": p, "kind": "parameter", "basis": basis, "point": A.theta0.get(p), "low": ends[0],
                      "high": ends[1]})
     for it, (lo, hi) in ((A.spec["analysis"].get("sensitivity") or {}).get("cost_items") or {}).items():
