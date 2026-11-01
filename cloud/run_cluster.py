@@ -1033,6 +1033,109 @@ def _self_test_42b(ok, RunConfig) -> None:
     ok("none yet" in keeper_lines(None)[0], "RC33d status says when the keeper has written no status yet")
 
 
+def _self_test_52(ok) -> None:
+    """The keeper's `KeyError: 'workers'` race (no Coiled, no network). distributed's
+    Client.scheduler_info() returns {} when the client is not connected: before its first
+    identity reply, while reconnecting, and after a failed reconnect closes it. v2blind1
+    (2026-10-31) crashed at the end of `launch` on it, before clusters.json recorded the keeper."""
+    import contextlib
+    import io
+    import tempfile
+    import types
+
+    class FakeClient:
+        def __init__(self, infos, status="running", log="12:00:00 keeper holding x 3..9 {}\n12:00:01 workers=3"):
+            self.infos, self.status, self.log, self.calls = list(infos), status, log, 0
+
+        def scheduler_info(self):
+            self.calls += 1
+            return self.infos.pop(0) if len(self.infos) > 1 else self.infos[0]
+
+        def run(self, fn, workers):
+            return {w: self.log for w in workers}
+
+    table = {"tls://10.0.0.5:1": {"name": "a"}, "tls://10.0.0.6:1": {"name": "b"}}
+    sleeps = []
+    c = FakeClient([{}, {"id": "s"}, {"workers": table}])
+    got = ws.scheduler_workers(lambda: c, attempts=5, delay_s=2.0, sleep=sleeps.append)
+    ok(got == table and sleeps == [2.0, 4.0],
+       f"RC52a the worker table is read once the scheduler has populated it, with doubling backoff: {sleeps}")
+    sleeps.clear()
+    try:
+        ws.scheduler_workers(lambda: FakeClient([{}]), attempts=4, delay_s=5.0, max_delay_s=8.0, sleep=sleeps.append)
+        ok(False, "RC52b a worker table that never appears is refused after the bound")
+    except ws.SchedulerInfoUnavailable as e:
+        ok(sleeps == [5.0, 8.0, 8.0] and "4 tries" in str(e) and "no worker table" in str(e),
+           f"RC52b a worker table that never appears is refused after the bound, naming why: {e} {sleeps}")
+    got = ws.scheduler_workers(lambda: FakeClient([{"workers": {}}, {"workers": table}]), attempts=3,
+                               delay_s=0.0, sleep=sleeps.append, min_workers=1)
+    ok(got == table, "RC52c min_workers: an empty table (no worker joined yet) is waited out")
+    closed = FakeClient([{}], status="closed")
+    fresh = FakeClient([{"workers": table}])
+    ok(ws.live_client(types.SimpleNamespace(get_client=lambda: fresh), closed) is fresh
+       and ws.live_client(types.SimpleNamespace(get_client=lambda: closed), fresh) is fresh,
+       "RC52d a closed client is replaced from its cluster; an open one is kept")
+
+    # v2blind1's sequence: the keeper cluster's client failed to reconnect ("closing client"),
+    # so scheduler_info() returned {}; `launch` died with KeyError: 'workers'.
+    calls = iter([closed, fresh])
+    kc = types.SimpleNamespace(cluster_id=2307781, get_client=lambda: next(calls, fresh))
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        line = confirm_keeper("x-keeper", kc, attempts=3, delay_s=0.0, sleep=lambda s: None)
+    ok("keeper holding" in out.getvalue() or "workers=3" in out.getvalue(),
+       f"RC52e replay v2blind1: a closed keeper client is replaced and the keeper's log line printed: {line}")
+    kc2 = types.SimpleNamespace(cluster_id=9, get_client=lambda: FakeClient([{}], status="closed"))
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            confirm_keeper("x-keeper", kc2, attempts=2, delay_s=0.0, sleep=lambda s: None)
+        ok(False, "RC52f a keeper that cannot be confirmed fails the launch with a clear message")
+    except SystemExit as e:
+        ok("x-keeper" in str(e) and "not confirmed" in str(e) and "keeper-log" in str(e),
+           f"RC52f a keeper that cannot be confirmed fails the launch with a clear message: {e}")
+
+    # The keeper loop itself, on a fake coiled: the first tick's identity is empty.
+    class FakeCluster:
+        adapts = []
+
+        def __init__(self, **kw):
+            self.cluster_id = 7
+            self.client = FakeClient([{}, {"workers": table}])
+
+        def adapt(self, **kw):
+            FakeCluster.adapts.append(kw)
+
+        def get_client(self):
+            return self.client
+
+    ticks = iter([True] * 6)
+    fake = types.ModuleType("coiled")
+    fake.list_clusters = lambda workspace: ([{"name": "x", "id": 7, "current_state": {"state": "running"}}]
+                                            if next(ticks, False) else [])
+    fake.Cluster = FakeCluster
+    real_coiled, real_sleep = sys.modules.get("coiled"), time.sleep
+    paths = (ws.KEEPER_STATUS, ws.KEEPER_LOG)
+    with tempfile.TemporaryDirectory() as d:
+        ws.KEEPER_STATUS, ws.KEEPER_LOG = os.path.join(d, "st.json"), os.path.join(d, "keeper.log")
+        sys.modules["coiled"] = fake
+        time.sleep = lambda s: None
+        try:
+            r = ws._keeper_loop("tok", "x", "ws", 3, 9, 1.0, {}, cluster_id=7, tick_s=0)
+            log = open(ws.KEEPER_LOG).read()
+            st = json.load(open(ws.KEEPER_STATUS))
+        finally:
+            time.sleep = real_sleep
+            ws.KEEPER_STATUS, ws.KEEPER_LOG = paths
+            if real_coiled is None:
+                sys.modules.pop("coiled", None)
+            else:
+                sys.modules["coiled"] = real_coiled
+    ok(r == "keeper exited" and len(FakeCluster.adapts) == 1 and "keeper error" not in log
+       and st.get("workers") == 2 and "workers=2" in log,
+       f"RC52g the keeper loop waits out an unpopulated scheduler identity without dropping its adapt(): "
+       f"adapts={len(FakeCluster.adapts)} log={log[-300:]!r}")
+
+
 def _self_test_51c(ok) -> None:
     """Phase 51 γ: the `health` command on a fake cluster (no Coiled, no network)."""
     import contextlib
@@ -1350,6 +1453,7 @@ def _self_test() -> int:
             ok(True, "RC15 a config without CONFIG is refused")
     _self_test_42b(ok, RunConfig)
     _self_test_51c(ok)
+    _self_test_52(ok)
     for f in sorted(os.listdir(os.path.join(HERE, "configs"))):
         if f.endswith(".py") and not f.startswith("_"):   # _*.py: shared helpers (configs/_eval.py)
             try:
