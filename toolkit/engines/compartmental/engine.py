@@ -189,37 +189,32 @@ def reachable(C: np.ndarray, seeded: np.ndarray) -> np.ndarray:
 def extinction_probability(K: np.ndarray, offspring: str, iters: int = 200000) -> np.ndarray:
     """Multitype branching process: x_i = G_i(x), the probability that a chain started by one case in group i
     dies out. K (B, G, G) with K[b, j, i] the expected infections in j caused by one case in i. Poisson:
-    G_i(x) = exp(-sum_j K_ji (1 - x_j)); geometric: G_i(x) = 1 / (1 + sum_j K_ji (1 - x_j)). Iterated from
-    x = 0 (the minimal fixed point), then polished by Newton steps."""
+    G_i(x) = exp(-sum_j K_ji (1 - x_j)); geometric: G_i(x) = 1 / (1 + sum_j K_ji (1 - x_j)). Extinction is
+    certain (x = 1) when rho(K) <= 1, since every class's radius is at most rho(K). Otherwise x is iterated
+    from 0 (monotone to the minimal fixed point, linearly convergent when supercritical); a member that has
+    not converged within `iters`, or whose residual x - G(x) exceeds 1e-12, fails closed."""
     B, G, _ = K.shape
     KT = np.swapaxes(K, 1, 2)                              # KT[b, i, j] = K[b, j, i]
 
-    def g(x):
-        m = np.einsum("bij,bj->bi", KT, 1.0 - x)
+    def g(x, kt=KT):
+        m = np.einsum("bij,bj->bi", kt, 1.0 - x)
         return np.exp(-m) if offspring == "poisson" else 1.0 / (1.0 + m)
+    sub = spectral_radius(K) <= 1.0
     x = np.zeros((B, G))
+    x[sub] = 1.0
+    live = ~sub
     for _ in range(iters):
-        xn = g(x)
-        if np.max(np.abs(xn - x)) < 1e-15:
-            x = xn
+        if not live.any():
             break
-        x = xn
-    for _ in range(50):                                    # Newton polish of x - G(x) = 0, per member
-        m = np.einsum("bij,bj->bi", KT, 1.0 - x)
-        gx = np.exp(-m) if offspring == "poisson" else 1.0 / (1.0 + m)
-        dg = (gx if offspring == "poisson" else gx ** 2)[:, :, None] * KT     # dG_i/dx_j
-        J = np.eye(G)[None] - dg
-        try:
-            step = np.linalg.solve(J, (x - gx)[:, :, None])[:, :, 0]
-        except np.linalg.LinAlgError:
-            break
-        xn = np.clip(x - step, 0.0, 1.0)
-        bad = ~np.isfinite(xn).all(axis=1) | (np.max(np.abs(xn - gx), axis=1) > np.max(np.abs(x - gx), axis=1))
-        xn[bad] = x[bad]
-        if np.max(np.abs(xn - x)) < 1e-16:
-            x = xn
-            break
-        x = xn
+        xn = g(x[live], KT[live])
+        delta = np.max(np.abs(xn - x[live]), axis=1)
+        x[live] = xn
+        idx = np.nonzero(live)[0]
+        live[idx[delta < 1e-15]] = False
+    res = np.max(np.abs(x - g(x)), axis=1)
+    if live.any() or np.any(res > 1e-12):
+        raise RuntimeError(f"multitype extinction equations did not converge (members "
+                           f"{[int(b) for b in np.nonzero(live | (res > 1e-12))[0]][:10]}; near-critical?)")
     return x
 
 
@@ -299,18 +294,35 @@ def _module_class():
             self.inc.append(new)
             self._last = new.sum(axis=1)
             if c["mode"] == "to_extinction" and act.any():
-                # Stop rule: the epidemic cannot grow again (Reff at the forcing's maximum below 1) and the
-                # infections still to come, bounded by one generation's incidence x R / (1 - R), are below
-                # tol x N. Near-critical epidemics run on (and fail closed at the step cap).
-                recent = self.hist[:, act].sum(axis=(0, 2)) / c["N"][act].sum(axis=1)
-                cand = np.nonzero(act)[0][recent < c["tol"]]
+                # Stop rule. A member whose whole infectious history is zero can never infect again. Otherwise,
+                # with v the incidence over one generation interval per group (an upper bound on the infection
+                # pressure still to act) and K the next-generation matrix at the forcing's maximum and the
+                # current susceptibility, on the groups the seeds can reach (K_ij = q f_max s_i C_ij N_i / N_j),
+                # the infections still to come are at most sum((I - K)^-1 K v) when rho(K) < 1. The member stops
+                # when that bound is below tol x N. Near-critical epidemics run on, and fail closed at the cap.
+                idx = np.nonzero(act)[0]
+                v = self.hist[:, act].sum(axis=0)                        # (n_act, G) counts
+                Ntot = c["N"][act].sum(axis=1)
+                dead = idx[v.sum(axis=1) == 0.0]
+                cand = idx[(v.sum(axis=1) / Ntot < c["tol"]) & (v.sum(axis=1) > 0.0)]
+                done = list(dead)
                 if len(cand):
-                    s = self.S[cand] / c["N"][cand]
+                    sel = np.searchsorted(idx, cand)
+                    N = c["N"][cand]
                     m = c["reach_mask"][cand]                    # only groups the seeds can reach
-                    r = c["q"][cand] * c["fmax"][cand] * spectral_radius(
-                        (s * m)[:, :, None] * c["C"][cand] * m[:, None, :])
-                    rest = recent[np.searchsorted(np.nonzero(act)[0], cand)] * r / np.maximum(1.0 - r, 1e-300)
-                    done = cand[(r < 1.0) & (rest < c["tol"])]
+                    s = self.S[cand] / N
+                    K = ((c["q"][cand] * c["fmax"][cand])[:, None, None] * (s * m)[:, :, None] * c["C"][cand]
+                         * m[:, None, :] * N[:, :, None] / N[:, None, :])
+                    r = spectral_radius(K)
+                    ok_r = r < 1.0
+                    if ok_r.any():
+                        Kc, vc = K[ok_r], v[sel][ok_r]
+                        G = Kc.shape[-1]
+                        fut = np.linalg.solve(np.eye(G)[None] - Kc, np.einsum("bij,bj->bi", Kc, vc)[:, :, None])[:, :, 0]
+                        rest = np.maximum(fut, 0.0).sum(axis=1) / Ntot[sel][ok_r]
+                        done += list(cand[ok_r][rest < c["tol"]])
+                if done:
+                    done = np.asarray(done, int)
                     self.active[done] = False
                     self.stopped[done] = k
 
@@ -369,6 +381,9 @@ class CompartmentalEngine:
             raise ValueError("groups: give distinct group names")
         if structure == "single_group" and len(groups) != 1:
             raise ValueError("single_group structure takes exactly one group")
+        if importation == "branching" and forcing != "none":
+            raise ValueError("importation: branching needs forcing: none (the extinction equations assume a constant "
+                             "environment; a seasonal p_major is out of scope)")
         if initialiser == "cohort_history" and structure != "birth_cohorts":
             raise ValueError("cohort_history needs structure birth_cohorts (cohorts are indexed by birth year)")
         self.groups, self.structure, self.mode, self.initialiser = groups, structure, mode, initialiser
@@ -472,7 +487,8 @@ class CompartmentalEngine:
 
     def _window_metrics(self) -> list:
         m = ["attack_rate", "s_start", "s_end", "r0", "reff_start", "reff_end", "reff_ref", "growth_rate",
-             "growth_defined", "p_major"] + [f"attack_rate:{g}" for g in self.groups]
+             "growth_defined"] + (["p_major"] if self.forcing == "none" else []) + \
+            [f"attack_rate:{g}" for g in self.groups]
         return m + (["converged", "steps"] if self.mode == "to_extinction" else [])
 
     def describe(self) -> EngineCard:
@@ -743,8 +759,8 @@ class CompartmentalEngine:
         times = np.arange(T1) * self.dt_days
         s_start0 = state["s_first"]                               # after interventions, before seeding
         S_after = (s_start0 * N)[None] - np.cumsum(inc, axis=0)   # S after each step
-        pm = self._p_major(ctx, s_start0)
-        scale = pm if self.importation == "branching" else np.ones(B)
+        pm = self._p_major(ctx, s_start0) if self.forcing == "none" else None
+        scale = pm if self.importation == "branching" else np.ones(B)      # branching implies no forcing
         fref = ctx["forcing"](self.forcing_ref_phase)
         r0 = q * spectral_radius(C)
         w0, w1 = float(horizon.window[0]), float(horizon.window[1])
@@ -779,7 +795,9 @@ class CompartmentalEngine:
                 m = {"attack_rate": float(tot.sum() / Ntot[b] * scale[b]), "s_start": float(S0.sum() / Ntot[b]),
                      "s_end": float(S1.sum() / Ntot[b]), "r0": float(r0[b]), "reff_start": float(q[b] * f0 * rho0),
                      "reff_end": float(q[b] * f1 * rho1), "reff_ref": float(q[b] * fref[b] * rho1),
-                     "growth_rate": gr, "growth_defined": gdef, "p_major": float(pm[b])}
+                     "growth_rate": gr, "growth_defined": gdef}
+                if pm is not None:
+                    m["p_major"] = float(pm[b])
                 m.update({f"attack_rate:{g}": float(tot[i] / N[b, i] * scale[b]) for i, g in enumerate(self.groups)})
                 if self.mode == "to_extinction":
                     m["converged"] = float(not state["active"][b])

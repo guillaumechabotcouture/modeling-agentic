@@ -340,6 +340,7 @@ class Runner:
         self.calibrated = {}
         self.nsims = 0
         self._engines = {}
+        self.exercised = set()           # configurations a benchmark ran (arms or probes)
 
     def _map(self, jobs, chunk: int = 300):
         """Run jobs; a fresh process pool per chunk (one long-lived pool broke on worker memory at
@@ -366,6 +367,7 @@ class Runner:
         """The pack's engine with a named configuration (None: the runner's engine). Used by probes."""
         if config_name is None:
             return self.engine
+        self.exercised.add(config_name)
         if config_name not in self._engines:
             self._engines[config_name] = load_engine(self.ref, (self.pack.get("configs") or {})[config_name])
         return self._engines[config_name]
@@ -403,6 +405,8 @@ class Runner:
             c = self.calibrated[cfg["setting"]]
             unit[c["attribute"]] = c["value"]
         conf = self._config(cfg["setting"])
+        if self.pack["settings"][cfg["setting"]].get("config") is not None:
+            self.exercised.add(self.pack["settings"][cfg["setting"]]["config"])
         return [(self.ref, conf, dict(par, **fitted), unit, cfg.get("package") or {}, hor, sd) for sd in self.seeds]
 
     def prefetch(self, arms, fitted_list):
@@ -560,9 +564,8 @@ class Runner:
             err_rel = float(np.max(np.abs(d) / np.maximum(np.abs(bv), 1e-300)))
             if not (np.all(np.isfinite(av)) and np.all(np.isfinite(bv))):
                 ok_i = False
-            elif cmp == "le":
-                excess = float(np.max(d))
-                ok_i = excess <= (tol if kind == "abs" else tol * float(np.max(np.abs(bv))))
+            elif cmp == "le":                   # element by element, each against its own reference
+                ok_i = bool(np.all(d <= (tol if kind == "abs" else tol * np.abs(bv))))
             elif cmp == "differ":
                 ok_i = (err_abs if kind == "abs" else err_rel) > tol
             else:
@@ -597,13 +600,24 @@ class Runner:
         reps, seed = int(e["replicates"]), int(e.get("seed", 0))
         hits = {q: 0 for q in qs}
         cls_hits = {p: 0 for p in classes}
+        invalid = 0
         for r in range(reps):
             rng = np.random.default_rng([seed, r])
             data, truth = gen(rng, **(e["generator"].get("args") or {}))
             post = cal(self.make_engine, data, **(e["calibrator"].get("args") or {}))
+            bad = False
             for q in qs:
-                lo, hi = post["intervals"][q]
-                hits[q] += int(lo <= truth[q] <= hi)
+                iv = (post.get("intervals") or {}).get(q)
+                try:
+                    lo, hi, tv = float(iv[0]), float(iv[1]), float(truth[q])
+                except (TypeError, ValueError, IndexError, KeyError):
+                    bad = True
+                    continue
+                if not (math.isfinite(lo) and math.isfinite(hi) and math.isfinite(tv) and lo <= hi):
+                    bad = True
+                    continue
+                hits[q] += int(lo <= tv <= hi)
+            invalid += int(bad)
             for p, allowed in classes.items():
                 cls_hits[p] += int((post.get("classes") or {}).get(p) in allowed)
         cov = {q: hits[q] / reps for q in qs}
@@ -612,8 +626,10 @@ class Runner:
         lo, hi = e["band"]
         need = float(e.get("class_share_min", 0.9))
         out = {"computed": min(cov.values()), "coverage": cov, "coverage_se": se, "class_share": share,
-               "replicates": reps, "band": [lo, hi]}
-        out["in_band"] = all(lo <= c <= hi for c in cov.values()) and all(v >= need for v in share.values())
+               "replicates": reps, "band": [lo, hi], "invalid_outputs": invalid}
+        # a calibration that returns no usable interval is a failure, never "under-coverage detected"
+        out["in_band"] = (invalid == 0 and all(lo <= c <= hi for c in cov.values())
+                          and all(v >= need for v in share.values()))
         out["status"] = "in_band" if out["in_band"] else "out_of_band"
         return out
 
@@ -845,12 +861,12 @@ def run_pack(pack: dict, engine, runner: Runner, fitted: dict, fit_info: dict | 
               f"band {row.get('band')} {row['status']}", flush=True)
     by = {s: sum(r["status"] == s for r in rows) for s in STATUSES}
     from toolkit.engines.contract import engine_identity
-    used = sorted({c for c in [s.get("config") for s in (pack.get("settings") or {}).values()] if c}
-                  | set(pack.get("configs") or {}))
-    configs_validated = {c: {"config": pack["configs"][c], "engine_identity": engine_identity(runner.make_engine(c))}
-                         for c in used}
+    used = sorted(runner.exercised)
+    configs_validated = {c: {"config": pack["configs"][c], "engine_identity": engine_identity(runner.make_engine(c)),
+                             "config_sha256": config_digest(runner.make_engine(c))} for c in used}
     return {"benchmarks": rows, "settings_calibrated": runner.calibrated, "fitted_used": fitted,
             "configs_validated": configs_validated,
+            "configs_not_exercised": sorted(set(pack.get("configs") or {}) - set(used)),
             "seeds": runner.seeds, "n_sims": runner.nsims,
             "summary": {"in_band": by["in_band"], "total": len(rows), "by_status": by,
                         "held_out_in_band": sum(r["status"] == "in_band" for r in rows if r["role"] == "held_out"),
@@ -860,10 +876,22 @@ def run_pack(pack: dict, engine, runner: Runner, fitted: dict, fit_info: dict | 
 PRODUCER = "toolkit/engines/benchmark.py"
 
 
+def config_digest(engine):
+    """sha256 of a configured engine's full configuration (`engine.config()`), or None for an engine without one.
+    engine_identity() hashes only the card's structure, which does not show every field that changes the
+    dynamics (generation interval, offspring distribution, ...); the stamp carries this digest beside it."""
+    import hashlib
+    import json
+    if not callable(getattr(engine, "config", None)):
+        return None
+    return hashlib.sha256(json.dumps(engine.config(), sort_keys=True, default=str).encode()).hexdigest()
+
+
 def stamp(out: dict, engine) -> dict:
     """Provenance on a results or fitted file: who wrote it, for which engine and code (Codex P1-13)."""
     from toolkit.engines.contract import engine_identity
-    return {"producer": PRODUCER, "engine_identity": engine_identity(engine), **out}
+    extra = {"engine_config_sha256": config_digest(engine)} if config_digest(engine) else {}
+    return {"producer": PRODUCER, "engine_identity": engine_identity(engine), **extra, **out}
 
 
 def verified_benchmarks(engine) -> tuple[list, str | None]:
@@ -881,6 +909,8 @@ def verified_benchmarks(engine) -> tuple[list, str | None]:
         return [], f"{os.path.basename(path)} was not written by {PRODUCER} (no provenance): re-run the pack"
     if doc.get("engine_identity") != engine_identity(engine):
         return [], f"{os.path.basename(path)} was computed for another engine identity or code: re-run the pack"
+    if config_digest(engine) is not None and doc.get("engine_config_sha256") != config_digest(engine):
+        return [], f"{os.path.basename(path)} was computed for another engine configuration: re-run the pack"
     return list(doc.get("benchmarks") or []), None
 
 

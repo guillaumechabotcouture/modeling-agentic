@@ -84,7 +84,9 @@ def oracle_constant(value: float) -> float:
 
 
 def oracle_minimum(values) -> float:
-    return float(min(float(v) for v in values))
+    """The smallest value; NaN if any value is not finite (so the runner's finite check fails the benchmark)."""
+    v = [float(x) for x in values]
+    return float("nan") if not v or not all(math.isfinite(x) for x in v) else min(v)
 
 
 def oracle_difference(a, b) -> float:
