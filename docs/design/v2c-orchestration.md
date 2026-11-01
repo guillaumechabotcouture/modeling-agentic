@@ -332,3 +332,14 @@ false positives by context class: section numbers, citations and DOIs, pasted de
 interval levels, data ranges, unit denominators and software versions. So the finding is MEDIUM and declarable. The
 interval level and every value in the spec, the ledger or the question are exempt, matched at the precision written
 (T56). The structural cases stay HIGH: a bare ledger id and an unresolved or unrendered `[CLAIM:]`.
+
+**Typed-number rule lowered to LOW (advisory).** Item 2 makes an open MEDIUM block ACCEPT in v2. A MEDIUM with a
+false-positive rate of 45% or more would therefore spend fix rounds and add spurious declarations to correct reports.
+The finding is now LOW. It is recorded in `findings.jsonl` and named in the presentation critic's prompt, but it never
+blocks, never goes to the fix loop and is never declared. A run whose only open finding is a typed number reaches
+ACCEPT (T57; the same run ended `run_failed` with the MEDIUM).
+
+It goes back up to MEDIUM or HIGH only after both of these:
+- its false-positive classes are exempted structurally (section and figure numbers, citations, pasted artifact text,
+  identifiers, threshold levels, data ranges, unit denominators, versions);
+- a new measurement on the stored runs.

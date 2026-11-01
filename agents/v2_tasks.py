@@ -190,6 +190,8 @@ class StubTasks:
         ref = (" It averts [CLAIM:headline.point] cases."
                if os.path.exists(os.path.join(run_dir, "models", "claims_ledger.yaml")) else "")
         text = f"# Report\n\n{head}The plan is the harness's optimisation; the harness renders every number.{ref}\n"
+        if self.s.get("manuscript"):
+            text = f"# Report\n\n{head}{self.s['manuscript']}"
         del A
         open(os.path.join(run_dir, "manuscript.md"), "w").write(text)
         return self._r(f"write:{mode}")

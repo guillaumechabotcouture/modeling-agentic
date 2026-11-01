@@ -661,9 +661,11 @@ def report_claim_findings(run_dir: str) -> list[dict]:
                         "claim": f"The report still shows {len(left)} claim reference(s) ({', '.join(sorted(set(left))[:5])}), "
                                  "e.g. inside code; write [CLAIM:id] in plain text."})
     if typed:
-        # A text heuristic: MEDIUM and declarable until its false-positive rate is measured on stored
-        # runs (process rule 4). The structural cases above stay HIGH.
-        out.append({"kind": "report_number_typed", "severity": "MEDIUM", "stage": "WRITE", "target_stage": "WRITE",
+        # A text heuristic with a measured false-positive rate of 45% or more (design note §13): LOW,
+        # advisory. It is reported (findings.jsonl, the presentation critic's input) but never blocks,
+        # goes to the fix loop or is declared. It goes back up only after structural exemptions for its
+        # false-positive classes and a new measurement. The structural cases above stay HIGH.
+        out.append({"kind": "report_number_typed", "severity": "LOW", "stage": "WRITE", "target_stage": "WRITE",
                     "key": "numbers", "scope_declarable": True,
                     "claim": f"The writer typed {len(typed)} number(s) ({', '.join(typed[:8])}) that are not in the spec, "
                              "the claims ledger or the question; write each as a [CLAIM:id] the harness renders."})
@@ -1882,9 +1884,20 @@ def _self_test() -> int:
         open(os.path.join(fr, "manuscript.md"), "w").write(
             "A 95% interval; about 1.3M cases for $17.9M across 10 districts; 3 years.\n")
         k56 = [f for f in report_claim_findings(fr) if f["kind"] == "report_number_typed"]
-        ok(k56 and k56[0]["severity"] == "MEDIUM" and k56[0]["scope_declarable"]
-           and "(3)" in k56[0]["claim"],
-           f"T56 typed numbers are MEDIUM and declarable; 95%, 1.3M, $17.9M and 10 are exempt ({k56[:1]})")
+        ok(k56 and k56[0]["severity"] == "LOW" and "(3)" in k56[0]["claim"],
+           f"T56 typed numbers are LOW (advisory); 95%, 1.3M, $17.9M and 10 are exempt ({k56[:1]})")
+        # T57: a run whose only open finding is a typed number reaches ACCEPT; the finding is reported
+        # in findings.jsonl (advisory), not planned and not declared.
+        d57, T57, st57 = new_run("typed_only", {"manuscript": "The plan averts 999 cases. It averts [CLAIM:headline.point] cases.\n"})
+        os.makedirs(os.path.join(d57, "models"), exist_ok=True)
+        shutil.copy(os.path.join(FX_DIR, "claims_ledger.yaml"), os.path.join(d57, "models", "claims_ledger.yaml"))
+        s57 = _SpikeMachine(d57, T57, st57, log=lambda *a: None, cross_engine_check=False).run()
+        led57 = FL.load(d57)
+        typed57 = [f for f in led57.values() if f.kind == "report_number_typed"]
+        ok(s57 == "completed" and typed57 and typed57[0].severity == "LOW" and not typed57[0].blocking
+           and not os.path.exists(os.path.join(d57, DECLARED_FILE))
+           and json.load(open(os.path.join(d57, "final_gate.json")))["action"] == "ACCEPT",
+           f"T57 a run whose only open finding is a typed number reaches ACCEPT; the finding is advisory ({s57})")
         fe = os.path.join(td, "t55")
         os.makedirs(os.path.join(fe, "data"))
         yaml.safe_dump({"engine": {"ref": "toolkit.engines.contract:ToyEngine",
