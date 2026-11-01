@@ -1,0 +1,6 @@
+age_group,ve_against_infection,source
+0-4,0.55,test-negative studies, assumed known
+5-17,0.62,test-negative studies, assumed known
+18-49,0.58,test-negative studies, assumed known
+50-64,0.48,test-negative studies, assumed known
+65+,0.4,test-negative studies, assumed known

@@ -1,0 +1,41 @@
+# Thresholds for the live run-health monitor (cloud/run_health.py; Phase 51 γ).
+# Each rule fires once per occurrence; alerts go to the health log and stdout.
+# Unknown rules or settings are errors, so a typo cannot switch a rule off.
+
+idle_compute:
+  # Compute chunks are queued while a compute-tagged VM has had nothing to do
+  # for this long. Attempt 8 (A16): one VM held all 24 chunks of a 1,100-draw
+  # batch for 36-47 min while 23 sat idle. The pool keeps an idle VM 10 min
+  # (scale_down_after), so 15 min idle with work queued is not churn.
+  idle_minutes: 15
+  min_idle_workers: 1
+
+gate_spike:
+  # A gate reports more than `ratio` x the findings of the previous round's
+  # last gate, and at least `min_findings`. Attempt 8 round 5: 19 -> 83.
+  # Counted on all findings: HIGH counts jump by design at round 2, when
+  # round-1 advisories become HIGH (attempt 8: 3 -> 40 HIGH, 24 -> 44 in all).
+  ratio: 3.0
+  min_findings: 20
+
+session_error:
+  # A session ended with an error (attempt 8: exit 143 at 2026-10-29 07:00 UTC).
+  enabled: true
+
+stall:
+  # status.json is written every minute by the heartbeat thread.
+  heartbeat_minutes: 10
+  # Attempt 8's longest gap between tool calls was under 30 min (a long
+  # compute call is one Bash tool call that the agent waits on).
+  tool_use_minutes: 45
+
+spend_early:
+  # Spend (ledger, or the live estimate when higher) over this share of the
+  # cap while the run is still before this round.
+  fraction: 0.5
+  before_round: 4
+
+compute_no_rows:
+  # A compute call charged at least this many core-hours with no completed
+  # row (attempt 8: a dead caller charged its whole 400 core-hour reservation).
+  min_core_hours: 1.0

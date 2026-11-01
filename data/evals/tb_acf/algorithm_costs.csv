@@ -1,0 +1,3 @@
+algorithm,usd_per_person_screened,description
+SYM,2.8,symptom screen; Xpert MTB/RIF Ultra for presumptive TB
+CXR,7.6,chest X-ray for everyone screened; Xpert if abnormal

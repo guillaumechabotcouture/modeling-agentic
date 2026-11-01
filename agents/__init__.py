@@ -452,5 +452,6 @@ from agents.hooks import (  # noqa: E402,F401
     work_running,
     review_wait_reason,
     signoff_hold_reason,
+    scope_hold_reason,
     create_hooks,
 )

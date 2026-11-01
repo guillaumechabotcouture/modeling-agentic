@@ -1,0 +1,5 @@
+# Phase 50 α: where the eval suite's encrypted hidden half lives (evals/README.md).
+# Written by `scripts/eval_suite.py publish`; nothing here is secret.
+version: 1
+prefix: outputs/evals_private/v1
+bundle_sha256: 6f6894380273cb7f0d01f314db9416d7f4c671a488adb6cf408804737701a899

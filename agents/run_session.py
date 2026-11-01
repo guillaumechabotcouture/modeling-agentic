@@ -31,8 +31,12 @@ LEAD_TOOLS = ["Agent", "Bash", "Read", "Write", "Glob", "Grep", "Skill"]
 TERMINAL_TASK_STATUSES = ("completed", "failed", "killed", "stopped", "cancelled", "canceled", "error")
 
 
-def log_message(message, trace_file):
-    """Log a message from the lead session to console and trace."""
+def log_message(message, trace_file, integrity=None):
+    """Log a message from the lead session to console and trace. With `integrity`, the
+    task messages also end in-flight tool calls: a foreground Bash call the CLI moves to
+    the background gets no PostToolUse, only these messages (agents/integrity.py)."""
+    if integrity is not None:
+        _integrity_task_event(message, trace_file, integrity)
     if isinstance(message, TaskStartedMessage):
         print(f"  [task started] {message.description}", flush=True)
         trace_file.write(json.dumps({
@@ -90,6 +94,28 @@ def log_message(message, trace_file):
             **result_summary(message),
         }) + "\n")
     trace_file.flush()
+
+
+def _integrity_task_event(message, trace_file, integrity) -> None:
+    try:
+        if isinstance(message, TaskStartedMessage):
+            integrity.on_task_started(message.task_id, getattr(message, "tool_use_id", None))
+            return
+        if isinstance(message, TaskNotificationMessage):
+            evs = integrity.on_task_ended(message.task_id, getattr(message, "tool_use_id", None))
+        elif TaskUpdatedMessage and isinstance(message, TaskUpdatedMessage):
+            patch = getattr(message, "patch", None) or {}
+            status = getattr(message, "status", None) or (patch.get("status") if isinstance(patch, dict) else None)
+            if str(status or "").lower() not in TERMINAL_TASK_STATUSES:
+                return
+            evs = integrity.on_task_ended(message.task_id, None)
+        else:
+            return
+    except Exception as e:  # noqa: BLE001 — bookkeeping must not end the session
+        print(f"[INTEGRITY] task event not recorded: {type(e).__name__}: {e}", flush=True)
+        return
+    from agents.hooks import report_integrity
+    report_integrity(evs, trace_file)
 
 
 def result_summary(message) -> dict:
