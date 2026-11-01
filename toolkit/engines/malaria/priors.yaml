@@ -1,0 +1,77 @@
+# Engine-card priors of the malaria engine (toolkit/spec/priors.py). Card metadata only: this file is not
+# engine code (the code fingerprint covers *.py), and the parameter values, kinds and ranges in engine.py
+# are unchanged, so the benchmark pack needs no re-stamp. Every `fixed` engine parameter is listed below as
+# a prior, as fixed with the reason, or as a setting. Sources: the engine's parameter table, ENGINE_NOTES.md
+# and the attempt 8 parameter registry (citations.md C25, C48, C49, C50; registry_build.py).
+# Triangular priors take the engine's point value as their mode.
+engine: malaria-starsim
+priors:
+  net_retention_half:
+    dist: triangular
+    range: [485.45, 865.05]            # 1.33-2.37 years, in days
+    source: "Bertozzi-Villa et al. 2021 Nat Commun 10.1038/s41467-021-23707-7 (PMC8196080): LLIN median retention
+      1.64 y, IQR 1.33-2.37 across 40 countries"
+    verified: matched
+    note: "an interquartile range across countries, used as the range for one country's value: it covers the central
+      half of countries, so it is narrower than a 95% range would be"
+  use_rate:
+    dist: triangular
+    range: [0.833, 0.901]
+    source: "Bertozzi-Villa et al. 2021 Nat Commun 10.1038/s41467-021-23707-7 (PMC8196080): ITN use among those with
+      access, all countries, 87.1% (83.3-90.1)"
+    verified: matched
+  smc_pe:
+    dist: triangular
+    range: [0.787, 0.934]
+    source: "ACCESS-SMC Partnership 2020 Lancet 396:1829, 10.1016/S0140-6736(20)32227-3 (PMC7718580): protective
+      effectiveness 88.2% (95% CI 78.7-93.4) over 28 days, children 3-59 months, 7 Sahel countries incl. Nigeria
+      (attempt 8 C25)"
+    verified: matched
+  dw_moderate:
+    dist: triangular
+    range: [0.032, 0.074]
+    source: "GBD 2019 disability weight, acute infectious episode, moderate: 0.051 (0.032-0.074) (Salomon et al. 2015
+      Lancet Glob Health 10.1016/S2214-109X(15)00069-8; quoted in GBD 2019 Hepatitis B and C Collaborators 2023 Lancet
+      Public Health, PMC11138131; attempt 8 C50)"
+    verified: matched
+  dw_severe:
+    dist: triangular
+    range: [0.088, 0.190]
+    source: "GBD 2019 disability weight, acute infectious episode, severe: 0.133 (0.088-0.190) (as dw_moderate;
+      attempt 8 C50)"
+    verified: matched
+  cfr_severe_treated:
+    dist: uniform
+    range: [0.085, 0.109]
+    source: "Dondorp et al. 2010 Lancet 376:1647 (AQUAMAT), 10.1016/S0140-6736(10)61924-1 (PMC3033534): in-hospital
+      mortality 8.5% with artesunate, 10.9% with quinine, African children with severe malaria (attempt 8 C48)"
+    verified: matched
+    note: "the two trial arms; attempt 8's upper bound of 0.15 (referral delay outside trial hospitals) was a modeller
+      judgment and is not used"
+fixed:
+  cfp_half: "attempt 8's range (1.5-3.5 y, registry cfp_half_life_years) is a modeller reading of Mosha 2022/2024
+    durability, not a published half-life estimate"
+  irs_rep: "no published range on the card or in the attempt 8 registry"
+  irs_half: "no published range (attempt 8 value; used only by the generic short-lived product)"
+  irs_divert: "the card's range [0, 1] is an assumption with no source"
+  hh_size: "no published range on the card (assumption)"
+  hh_net_corr: "the card's range [0, 0.9] is an assumption with no source (varied in the ENGINE_NOTES sensitivity scan)"
+  cov_corr: "the card's range [0, 0.9] is an assumption with no source (varied in the ENGINE_NOTES sensitivity scan)"
+  exp_corr: "the card's range [0, 0.6] is an assumption with no source (varied in the ENGINE_NOTES sensitivity scan)"
+  use_persist: "the card's range [0, 1] is an assumption with no source"
+  smc_hi_frac: "no published range (attempt 8 value)"
+  cfr_severe_untreated: "attempt 8's range 0.15-0.50 (C49) is a modeller assumption; no published estimate was located"
+  severe_access_add: "no published range (attempt 8 value)"
+  dur_moderate_d: "no published range (attempt 8 value)"
+  dur_severe_d: "no published range (attempt 8 value)"
+  le_u5: "GBD reference life table: a normative standard, which GBD carries without uncertainty"
+  le_5_14: "GBD reference life table: a normative standard, which GBD carries without uncertainty"
+  le_15p: "GBD reference life table: a normative standard, which GBD carries without uncertainty"
+  import_eir: "no published range (attempt 8 value)"
+settings: [n_agents, net_holes]
+not_exposed:
+  hut_trial_coefficients: "Churcher et al. 2016 Table 6 coefficients are module constants (vector.CHURCHER), not engine
+    parameters; drawing them needs an engine change (code fingerprint, benchmark re-stamp)"
+  smc_protection_days: "the SMC protection duration is a module constant (model.py), not an engine parameter"
+  species_bionomics: "Q0, phi_I, phi_B, mu0 per species are module constants (vector.SPECIES), not engine parameters"
+  natural_history: "the Griffin-lite natural-history constants (model.py) are fixed by design (GRIFFIN)"
