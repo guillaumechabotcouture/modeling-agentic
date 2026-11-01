@@ -57,7 +57,11 @@ docs/design/v2-spec-and-analysis.md §1):
       draws: 64
       seed: 42
       sources: [{kind: engine_parameters}, {kind: calibration}, {kind: costs, items: {id: [0.8, 1.2]}}]
-      excluded: [{kind: emulator, reason: "..."}]
+      excluded: [{kind: emulator, reason: "..."}, {parameter: <prior parameter>, reason: "..."}]
+      priors: {<scenario or fixed engine parameter>: {dist: uniform | loguniform | triangular, range: [lo, hi],
+               source: "<citation>", verified: unverified}}
+                                           # engine-card priors (the engine's priors.yaml) are drawn without being
+                                           # listed (kind `priors`, toolkit/spec/priors.py); the label names them
     analysis:
       evaluation: emulator | direct        # an emulator for slow engines, the engine itself for cheap ones
       emulator: {points, holdout_share, seed, features, design_seed}
@@ -107,6 +111,10 @@ UNCERTAINTY_KINDS = {
     "costs": "unit costs (a multiplier range per cost item)",
     "emulator": "emulator error (held-out residuals)",
 }
+# Drawn whenever there is something to draw, so a spec need not list them (v2d note §2.4: version-1 specs stay valid);
+# a spec may list one (no-op) or exclude it with a reason, and the interval label then says it is not covered.
+OPTIONAL_KINDS = {"priors": "engine parameters with published ranges (engine-card priors.yaml or uncertainty.priors), "
+                            "drawn from their declared priors"}
 UNCERTAINTY_SHORT = {"engine_parameters": "engine parameters", "calibration": "calibration", "costs": "unit costs",
                      "emulator": "emulator error"}
 DECISION_TEST_TYPES = ("interaction_rescale", "parameter_value", "group_rule", "envelope")
@@ -350,10 +358,22 @@ class Spec:
     def uncertainty_scope(self) -> dict:
         """What an interval covers and what it does not (spike lesson 6), for labels."""
         u = self.raw["uncertainty"]
-        inc = [s["kind"] for s in u.get("sources") or []]
-        exc = [(e["kind"], e.get("reason", "")) for e in u.get("excluded") or []]
+        inc = [s["kind"] for s in u.get("sources") or [] if s.get("kind") not in OPTIONAL_KINDS]
+        exc = [(e["kind"], e.get("reason", "")) for e in u.get("excluded") or [] if "kind" in e]
         lvl = float(u.get("level", 0.95))
         meta = {"level": lvl, "covers": inc, "excludes": [k for k, _ in exc]}
+        if not self.engine_pending:
+            # v2 priors: the label names what the draws vary and what they hold fixed (toolkit/spec/priors.py)
+            from toolkit.spec import priors as PRI
+            P = PRI.plan(self)
+            if P["prior_dominated"]:
+                at = inc.index("engine_parameters") + 1 if "engine_parameters" in inc else 0
+                meta["covers"] = inc = inc[:at] + ["priors"] + inc[at:]
+                meta["prior_dominated"] = P["prior_dominated"]
+            if P["label_fixed"]["named"]:
+                meta["fixed"] = P["label_fixed"]["named"]
+            if P["label_fixed"]["other"]:
+                meta["fixed_other"] = P["label_fixed"]["other"]
         sys.path.insert(0, os.path.join(ROOT, "scripts"))
         import render_claims    # one rule for the label, from structured metadata only (Codex P1-5)
         return {"level": lvl, "covers": inc, "excludes": [{"kind": k, "reason": r} for k, r in exc],
@@ -559,6 +579,8 @@ def _validate(s: Spec) -> list[str]:
             bad.append(f"analysis.cost_outputs.{k}: {m!r} is not an engine cost driver {drivers}")
     bad += _validate_calibration(s, card, pnames, cols)
     bad += _validate_uncertainty(s, pnames)
+    from toolkit.spec import priors as PRI
+    bad += PRI.problems(s)
     bad += _validate_analysis(s, card, pnames, cols, pk)
     bad += _validate_deliverable(s)
     return bad
@@ -634,10 +656,18 @@ def _validate_uncertainty(s, pnames) -> list[str]:
         return ["uncertainty: a mapping"]
     bad = []
     inc = [x.get("kind") for x in u.get("sources") or [] if isinstance(x, dict)]
-    exc = {x.get("kind"): x.get("reason") for x in u.get("excluded") or [] if isinstance(x, dict)}
+    exc = {x.get("kind"): x.get("reason") for x in u.get("excluded") or [] if isinstance(x, dict) and "parameter" not in x}
     for k in inc + list(exc):
-        if k not in UNCERTAINTY_KINDS:
-            bad.append(f"uncertainty: unknown source kind {k!r} (known: {', '.join(UNCERTAINTY_KINDS)})")
+        if k not in UNCERTAINTY_KINDS and k not in OPTIONAL_KINDS:
+            bad.append(f"uncertainty: unknown source kind {k!r} (known: {', '.join(list(UNCERTAINTY_KINDS) + list(OPTIONAL_KINDS))})")
+    for x in u.get("excluded") or []:
+        if isinstance(x, dict) and "parameter" in x and "kind" in x:
+            bad.append("uncertainty.excluded: an entry names a kind or a parameter, not both")
+    for k, why in exc.items():
+        if k in OPTIONAL_KINDS and not str(why or "").strip():
+            bad.append(f"uncertainty: the exclusion of {k} needs a reason")
+        if k in OPTIONAL_KINDS and k in inc:
+            bad.append(f"uncertainty: {k} is both a source and excluded")
     for k in UNCERTAINTY_KINDS:
         if k not in inc and not str(exc.get(k) or "").strip():
             bad.append(f"uncertainty: source {k} ({UNCERTAINTY_KINDS[k]}) is neither declared in `sources` nor "
@@ -705,6 +735,10 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
         i = dt.get("id")
         if not i or i in seen:
             bad.append(f"analysis.decision_tests: id {i!r} missing or duplicated")
+        if str(i or "").startswith("prior_range_") or dt.get("type") == "prior_range":
+            bad.append(f"decision test {i}: prior_range tests are generated by the harness for every drawn prior "
+                       "(toolkit/analysis/decision_tests.py); the spec cannot declare one")
+            continue
         seen.add(i)
         t = dt.get("type")
         if t not in DECISION_TEST_TYPES:
@@ -851,6 +885,9 @@ def _self_test() -> int:
             "not a column", "SP10 lesson 10: a group rule on an unknown column is refused")
         bad(lambda r: r["analysis"]["decision_tests"].append({"id": "DT2", "type": "magic", "text": "t"}),
             "not in", "SP11 an unknown decision-test type is refused")
+        bad(lambda r: r["analysis"]["decision_tests"].append({"id": "prior_range_eff_a", "type": "parameter_value",
+                                                               "parameter": "eff_a", "values": [0.3], "text": "t"}),
+            "generated by the harness", "SP11b the spec cannot declare (or shadow) an automatic prior_range test")
         bad(lambda r: r["objective"].update(outcome="nope"), "per-capita output", "SP12 an unknown objective outcome")
         bad(lambda r: r.pop("deliverable"), "missing section deliverable", "SP13 a missing section is refused")
         bad(lambda r: r["uncertainty"]["sources"].append({"kind": "emulator"}) or r["uncertainty"].update(excluded=[
@@ -866,7 +903,8 @@ def _self_test() -> int:
         ok(validate(s2) == [] and a["caps"]["b"]["max_units"] == 3.0 and "camp" in a["group_rules"],
            f"SP16 coverage becomes a toolkit/alloc cap and group rules pass through: {validate(s2)}")
         sc = s.uncertainty_scope()
-        ok(sc["label"] == "95% UI over engine parameters, calibration; not covered: costs, emulator", f"SP17 the interval label states what is covered and what is not: {sc['label']}")
+        ok(sc["label"] == "95% UI over engine parameters, calibration; held fixed: synergy and 3 other engine parameters; "
+                         "not covered: costs, emulator", f"SP17 the interval label states what is covered and what is not: {sc['label']}")
         ok(validate({"schema_version": 1}) and validate(Spec({"engine": 3}, d)), "SP18 malformed specs fail closed")
         r = copy.deepcopy(s.raw)
         draws = r["uncertainty"].pop("draws")

@@ -173,13 +173,23 @@ def _format_interval(lo: str, hi: str, lo_num: float, hi_num: float) -> str:
 
 
 _SOURCE_ID_RE = re.compile(r"[a-z][a-z_]{0,40}")
+_PARAM_ID_RE = re.compile(r"[a-z][a-z0-9_]{0,40}")
+INTERVAL_KEYS = {"level", "covers", "excludes", "prior_dominated", "fixed", "fixed_other"}
 
 
 def interval_meta_problem(meta) -> str | None:
     """Why an `interval:` block is unusable (None when it is fine): a level in [0.5, 1), and `covers` (non-empty) and
-    `excludes` as lists of source identifiers (lower-case letters and underscores, no free text)."""
-    if not isinstance(meta, dict) or set(meta) - {"level", "covers", "excludes"}:
-        return "interval must be a mapping of level, covers and excludes only"
+    `excludes` as lists of source identifiers (lower-case letters and underscores, no free text). Optional (v2 priors):
+    `prior_dominated` and `fixed`, lists of parameter identifiers, and `fixed_other`, a count."""
+    if not isinstance(meta, dict) or set(meta) - INTERVAL_KEYS:
+        return "interval must be a mapping of level, covers, excludes, prior_dominated, fixed and fixed_other only"
+    for k in ("prior_dominated", "fixed"):
+        v = meta.get(k, [])
+        if not isinstance(v, list) or not all(isinstance(x, str) and _PARAM_ID_RE.fullmatch(x) for x in v):
+            return f"interval.{k} must be a list of parameter identifiers ([a-z0-9_])"
+    fo = meta.get("fixed_other", 0)
+    if isinstance(fo, bool) or not isinstance(fo, int) or fo < 0:
+        return "interval.fixed_other must be a count"
     lvl = meta.get("level")
     if isinstance(lvl, bool) or not isinstance(lvl, (int, float)) or not 0.5 <= float(lvl) < 1:
         return f"interval.level {lvl!r} must be a number in [0.5, 1)"
@@ -198,6 +208,12 @@ def interval_label(meta: dict) -> str:
         raise ValueError(bad)
     words = lambda xs: ", ".join(x.replace("_", " ") for x in xs)  # noqa: E731
     lab = f"{float(meta['level']) * 100:g}% UI over {words(meta['covers'])}"
+    if meta.get("prior_dominated"):
+        lab += f"; set by declared ranges, not by data: {', '.join(meta['prior_dominated'])}"
+    fx, fo = list(meta.get("fixed") or []), int(meta.get("fixed_other") or 0)
+    if fx or fo:
+        other = f"{fo} {'other ' if fx else ''}engine parameter{'s' if fo != 1 else ''}"
+        lab += "; held fixed: " + (", ".join(fx) + (f" and {other}" if fo else "") if fx else other)
     if meta.get("excludes"):
         lab += f"; not covered: {words(meta['excludes'])}"
     return lab
@@ -547,8 +563,15 @@ def _self_test() -> int:
                       "interval": {"level": 0.95, "covers": ["engine_parameters"], "excludes": ["costs"]}})
     ok("(95% UI over engine parameters; not covered: costs: 5.14M" in s and "CI" not in s,
        f"T1b v2 lesson 6: the interval label is derived from structured metadata: {s!r}")
+    lab = interval_label({"level": 0.95, "covers": ["engine_parameters", "priors"], "excludes": ["costs"],
+                          "prior_dominated": ["smc_pe", "dw_5_14"], "fixed": ["cm_add"], "fixed_other": 3})
+    ok(lab == "95% UI over engine parameters, priors; set by declared ranges, not by data: smc_pe, dw_5_14; held fixed: "
+              "cm_add and 3 other engine parameters; not covered: costs",
+       f"T1d v2 priors: the label names the prior-dominated and the fixed parameters: {lab!r}")
     with tempfile.TemporaryDirectory() as d_il:
         for bad_c, why in (({"interval_label": "95% UI over everything"}, "free text"),
+                           ({"interval": {"level": 0.95, "covers": ["costs"], "fixed": ["held at 3%"]}},
+                            "free text in fixed"),
                            ({"interval": {"level": 0.95, "covers": ["all of it, 100%"]}}, "free text in covers"),
                            ({"interval": {"level": 2, "covers": ["costs"]}}, "a bad level")):
             pth = os.path.join(d_il, "l.yaml")

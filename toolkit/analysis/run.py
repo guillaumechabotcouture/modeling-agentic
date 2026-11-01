@@ -116,8 +116,9 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     card = eng.describe()
     arts = {}
     # Codex r2 P1-7: the files the engine reads (benchmark results, fitted values) are inputs of what uses them
-    eng_files = [f for f in (getattr(eng, "results_path", None), getattr(eng, "fitted_path", None))
-                 if f and os.path.exists(f)]
+    from toolkit.spec import priors as PRI
+    eng_files = [f for f in (getattr(eng, "results_path", None), getattr(eng, "fitted_path", None),
+                             PRI.priors_path(eng)) if f and os.path.exists(f)]
     arts["engine"] = S.write("engine", {"card": card.to_dict(), "parameters": [vars(p) for p in eng.parameters()]},
                              PRODUCER, [spec_path] + eng_files)
     data_in = [spec.resolve(spec["decision_units"]["csv"])]
@@ -150,6 +151,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
                              "closed")
         arts["batch"] = S.write("batch", {"evaluation": "emulator", "points": len(design["points"]), "jobs": len(jobs),
                                           "packages": design["packages"], "fitted_names": design["fitted_names"],
+                                          "prior_names": design.get("prior_names", []),
                                           "summary": bsum}, Bt.PRODUCER,
                                 [os.path.join(run_dir, "analysis", "batch", "design.json"), batch_rows] + data_in
                                 + ([adopt["results"], adopt["jobs"], adopt["design"]] if adopt else []))
@@ -201,7 +203,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
         f"mix {point['mix']}")
     # ---- uncertainty
     u = UQ.run(A, plan, spec["deliverable"]["headline"]["name"], draws=draws)
-    arts["uncertainty"] = S.write("uncertainty", u["data"], UQ.PRODUCER, [arts["point"]])
+    arts["uncertainty"] = S.write("uncertainty", u["data"], UQ.PRODUCER, [arts["point"]] + eng_files)
     S.deliverable(UQ.write_report(run_dir, u["report"]), UQ.PRODUCER, "uncertainty_report")
     log(f"UQ: {u['data']['fixed_plan'][A.primary]} ({u['data']['label']})")
     # ---- stability
@@ -476,11 +478,88 @@ def _self_test() -> int:
         ok(gr["can_move_plan"] and gr["recommendation"]["with"], "D5 a group-rule decision test re-solves the plan")
         from toolkit.analysis import contract
         ok(contract.gate_findings(d) == [], f"D6 contract checks pass on the direct path: {contract.gate_findings(d)}")
+    _self_test_priors(ok, q)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_priors(ok, q):
+    """v2 priors on the emulator path: an engine-card prior (a DALY weight) and a scenario parameter with a spec range
+    enter the design, are drawn, get prior_range tests and are named in the label; correlated emulator error."""
+    import tempfile
+    import yaml
+    from toolkit.analysis import contract
+    from toolkit.spec import priors as PRI
+    with tempfile.TemporaryDirectory() as d:
+        pp = PRI.toy_priors_file(d)
+        p = schema.toy_spec(d, n=24)
+        r = yaml.safe_load(open(p))
+        r["engine"] = {"ref": "toolkit.spec.priors:ToyPriorEngine", "config": {"priors_path": pp}}
+        r["uncertainty"]["sources"].append({"kind": "emulator"})
+        r["uncertainty"]["excluded"] = [{"kind": "costs", "reason": "toy"}]
+        r["uncertainty"]["priors"] = {"synergy": {"dist": "uniform", "range": [-0.05, 0.1], "source": "toy spec range"}}
+        r["analysis"]["decision_tests"] = []
+        yaml.safe_dump(r, open(p, "w"), sort_keys=False)
+        signoff.sign(d, "lead", note="self-test")
+        R = run(d, log=q, compute_kw={"max_workers": 2})
+        M = R["_model"]
+        design = json.load(open(os.path.join(d, "analysis", "batch", "design.json")))
+        ok(design["prior_names"] == ["dw", "synergy"] and M.input_names[:5] == ["z", "eff_a", "eff_b", "dw", "synergy"]
+           and all(0.005 <= pt["theta"]["dw"] <= 0.02 for pt in design["points"]),
+           f"RP1 drawn priors enter the emulator design over their declared ranges: {M.input_names}")
+        u = R["uncertainty"]
+        ok("priors" in u["covers"] and "set by declared ranges, not by data: dw, synergy" in u["label"]
+           and "held fixed: 2 engine parameters" in u["label"], f"RP2 the label names the priors and what is fixed: "
+                                                                f"{u['label']}")
+        rep = yaml.safe_load(open(os.path.join(d, "uncertainty_report.yaml")))
+        dws = rep["parameter_samples"]["dw"]
+        ok(set(rep["sources_drawn"]) == {"engine_parameters", "calibration", "emulator", "priors"}
+           and [x["kind"] for x in rep["sources_not_drawn"]] == ["costs"]
+           and {x["name"] for x in rep["parameters_fixed"]} == {"base", "k"}
+           and all(x["reason"] for x in rep["parameters_fixed"]) and 0.005 <= dws["ci_low"] < dws["ci_high"] <= 0.02,
+           f"RP3 the report lists every source and every fixed parameter with why, and the priors vary: {dws}")
+        em = rep["emulator_error"]
+        ok(em and em["holdout_points"] >= 3 and em["sd_common_median"] > 0 and "population-mean" in em["model"],
+           f"RP4 the emulator-error model and its held-out evidence are in the report: {em and em['sd_common_median']}")
+        prt = {x["test_id"]: x for x in R["decision_tests"]}
+        t = prt.get("prior_range_dw")
+        ok(set(prt) == {"prior_range_dw", "prior_range_synergy"} and t["automatic"] and t["status"] == "run"
+           and [x["value"] for x in t["results"]] == [0.005, 0.02]
+           and t["results"][0]["point_plan_objective_under_test"] < t["results"][1]["point_plan_objective_under_test"]
+           and os.path.exists(os.path.join(d, t["path"])),
+           "RP5 every drawn prior gets an automatic prior_range test; the DALY-weight ends move the objective")
+        ok(contract.gate_findings(d) == [], f"RP6 the contract checks pass with priors: {contract.gate_findings(d)}")
+        from toolkit.analysis import decision_tests as DTm
+        A = R["_A"]
+        z0 = {i: v["z"] for i, v in R["calibration"]["units"].items()}
+        out0, ben0, cost0 = A.evaluate(A.theta0, z0)
+        plan0 = R["point"]["plan"]
+        orig_cal = A.calibrate
+        A.calibrate = lambda th, shifts=None, ids=None: {i: (z, True) for i, (z, _c) in orig_cal(th, shifts, ids).items()}
+        try:
+            rec = DTm.run_one(A, DTm.prior_range_tests(A)[0], z0, ben0, cost0, plan0, R["uncertainty"], out0)
+        finally:
+            A.calibrate = orig_cal
+        ok(all(x.get("calibration_clamped_units") == len(A.ids) for x in rec["results"])
+           and "calibration clamped" in rec["statement"],
+           f"RP8 an end whose calibration clamps is flagged in the result and its statement (Codex r1 P1-3): "
+           f"{rec['statement']}")
+        err = M.error
+        npk = len(M.packages) - 1
+        ok(err is not None and len(err.cols) == len(M.pops) * len(M.outcomes) * npk
+           and {c[1] for c in err.cols} == set(M.outcomes),
+           f"RP9 each outcome gets its own held-out residual column, so one outcome's bias is not applied to another "
+           f"(Codex r2 P1): {err and len(err.cols)} columns")
+        design.pop("prior_names")
+        try:
+            EmulatorModel(schema.load(p), design, {}, log=q)
+            ok(False, "RP7 a design that lacks a drawn prior is refused, naming it")
+        except ValueError as e:
+            ok("['dw', 'synergy']" in str(e) and "must enter the design" in str(e),
+               f"RP7 a design that lacks a drawn prior is refused, naming it: {e}")
 
 
 def _resign(d, mutate):

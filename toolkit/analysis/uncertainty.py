@@ -7,12 +7,17 @@ its two sources, so the stored spike batch reproduces):
                      (sd `calibration.target_uncertainty.region_sd_logit`), then re-inversion;
                      likelihood: (calibrated parameters, unit attributes) from N(estimate, covariance)
   costs              a uniform multiplier per listed cost item
-  emulator           reductions perturbed by their held-out RMSE
+  emulator           one joint draw of the reduction errors of every unit: a common (population-mean) component
+                     plus a per-unit one, from the held-out residuals (toolkit/analysis/model.py EmulatorError)
+  priors             (v2 priors, drawn whenever there is one) every prior parameter from its declared bounded
+                     distribution (toolkit/spec/priors.py), on its own random stream, before calibration
 The point plan is evaluated in every draw (the headline interval) and the plan is
 re-optimised in every draw (package stability). The interval's label comes from the spec
 (`Spec.uncertainty_scope`): what it covers and what it does not. Writes
 `uncertainty_report.yaml` in the schema of scripts/propagate_uncertainty.py (shared
-summariser), plus the scope.
+summariser), plus the scope and the draw plan: every source drawn or not, every engine
+parameter drawn or held fixed with why, and the emulator-error model with its held-out
+evidence, so a report cannot claim more precision than the draws carry.
 """
 from __future__ import annotations
 
@@ -43,6 +48,11 @@ class Drawer:
         sp = A.spec["uncertainty"]
         self.src = {s["kind"]: s for s in sp.get("sources") or []}
         self.rng = np.random.default_rng(int(seed))
+        from toolkit.spec.priors import PRIOR_STREAM
+        self.prng = np.random.default_rng([int(seed), PRIOR_STREAM])     # priors: their own stream
+        if "emulator" in self.src and getattr(A.model, "error", None) is None:
+            raise ValueError("uncertainty: the emulator source is declared but the emulator has no error model (fewer "
+                             "than 3 held-out points); raise analysis.emulator.holdout_share or exclude it with a reason")
         cal = A.spec["calibration"]
         self.sd = float((cal.get("target_uncertainty") or {}).get("region_sd_logit", 0.0))
         self.regions = sorted({u[A.region] for u in A.spec.units()}) if A.region else []
@@ -56,6 +66,9 @@ class Drawer:
         A = self.A
         theta, sampled = dict(A.theta0), {}
         shifts, zs, noise, mult = None, None, None, None
+        for k, p in A.pr.items():
+            theta[k] = p.sample(self.prng)
+            sampled[k] = theta[k]
         for kind in ORDER:
             if kind not in self.src:
                 continue
@@ -129,6 +142,9 @@ def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
         meta = dict(scope["interval"])
         meta["covers"] = ["calibration_partly_clamped" if k == "calibration" else k for k in meta["covers"]]
         scope = dict(scope, interval=meta, covers=meta["covers"], label=render_claims.interval_label(meta))
+    from toolkit.spec import priors as PRI
+    plan_ = PRI.plan(A.spec)
+    plan_["emulator_error"] = (getattr(A.model, "accuracy", {}) or {}).get("error_model") if "emulator" in D.src else None
     data = {"draws": nd, "seed": int(sp.get("seed", 42)) if seed is None else int(seed),
             "covers": scope["covers"], "excludes": scope["excludes"], "label": scope["label"],
             "fixed_plan": {o: q(v, lvl) for o, v in fixed.items()},
@@ -140,7 +156,8 @@ def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
                                                                                   default=0),
                                     "per_draw": clamped_draws},
             "model_corrections": {"draws_with_corrections": corr_any, "draws_with_corrections_on_plan": 0},
-            "headline": {"name": headline_name, "outcome": hl_outcome}}
+            "headline": {"name": headline_name, "outcome": hl_outcome}, "draw_plan": plan_,
+            "prior_dominated": plan_["prior_dominated"]}
     agg = _pu().summarise_outputs(outs, samples, nd, level=scope["level"])   # the signed level (Codex P1-11)
     report = {"producer": PRODUCER, "produced_by": "harness", "n_draws": nd, "n_draws_requested": nd,
               "n_successful": nd - len(agg["errors"]), "n_failed": len(agg["errors"]), "seed": data["seed"],
@@ -149,7 +166,15 @@ def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
               "degenerate_outputs": agg["degenerate_outputs"],
               "sampler_varied_parameters": len(agg["varied_params"]),
               "scalar_outputs": agg["scalar_outputs"], "categorical_outputs": agg["categorical_outputs"],
-              "parameter_samples": agg["parameter_samples"], "backend": "local"}
+              "parameter_samples": agg["parameter_samples"], "backend": "local",
+              "sources_drawn": [x["kind"] for x in plan_["sources"] if x["status"] == "drawn"],
+              "sources_not_drawn": [{k: x[k] for k in ("kind", "status", "reason") if k in x} for x in plan_["sources"]
+                                    if x["status"] != "drawn"],
+              "parameters_drawn": [{k: x.get(k) for k in ("name", "source_kind", "dist", "range", "source")}
+                                   for x in plan_["drawn"]],
+              "parameters_fixed": [{k: x.get(k) for k in ("name", "kind", "value", "reason")} for x in plan_["fixed"]
+                                   if x["status"] == "fixed"],
+              "not_exposed": plan_["not_exposed"], "emulator_error": plan_["emulator_error"]}
     return {"data": data, "report": report}
 
 

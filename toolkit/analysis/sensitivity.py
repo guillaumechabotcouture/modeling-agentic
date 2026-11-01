@@ -2,6 +2,7 @@
 
 Each parameter is set to each end of its range, the others at their point values:
   fitted engine parameters   the engine-card range (emulator inputs on the emulator path);
+  prior parameters           their declared prior range (drawn, so emulator inputs too);
   calibrated parameters      estimate -/+ 1.96 standard errors (likelihood calibration);
   cost items                 `analysis.sensitivity.cost_items: {id: [lo, hi]}` multipliers.
 For each end: the point plan's objective, the re-optimised objective, and the share of units
@@ -21,6 +22,8 @@ def _ranges(A) -> dict:
     out = {}
     for k, (lo, hi, _v) in A.fr.items():
         out[k] = (lo, hi, "engine-card range")
+    for k, p in A.pr.items():                    # v2 priors: drawn, so emulator inputs
+        out[k] = (p.lo, p.hi, "declared prior range")
     if A.method == "likelihood":
         se = {p: v.get("se") for p, v in (A.lik["identifiability"].get("parameters") or {}).items()}
         if not se and A.lik.get("cov") is not None:
@@ -32,7 +35,8 @@ def _ranges(A) -> dict:
         bad = [p for p in sel if p not in out]
         if bad and A.model.kind == "emulator":
             raise ValueError(f"analysis.sensitivity: {bad} are not emulator inputs; vary them with engine runs "
-                             "(direct evaluation) or add them to the emulator design")
+                             "(direct evaluation), or give them a published prior (the engine's priors.yaml or "
+                             "uncertainty.priors) so they are drawn and enter the emulator design")
         for p in bad:
             ps = next(x for x in A.eng.parameters() if x.name == p)
             if ps.lo is None or ps.hi is None:
@@ -48,12 +52,15 @@ def run(A, z0, ben0, cost0, plan, obj0) -> dict:
         ends = []
         for v in (lo, hi):
             theta = dict(A.theta0, **{p: float(v)})
+            clamped = 0
             if A.method == "emulator_inversion":
-                zs = {i: x[0] for i, x in A.calibrate(theta).items()}
+                cz = A.calibrate(theta)
+                zs = {i: x[0] for i, x in cz.items()}
+                clamped = sum(bool(x[1]) for x in cz.values())     # Codex r1 P1-3: recorded per end
             else:
                 zs = z0
             _, ben, cost = A.evaluate(theta, zs)
-            ends.append(_end(A, v, ben, cost, plan))
+            ends.append(dict(_end(A, v, ben, cost, plan), calibration_clamped_units=clamped))
         rows.append({"name": p, "kind": "parameter", "basis": basis, "point": A.theta0.get(p), "low": ends[0],
                      "high": ends[1]})
     for it, (lo, hi) in ((A.spec["analysis"].get("sensitivity") or {}).get("cost_items") or {}).items():
