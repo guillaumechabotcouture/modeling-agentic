@@ -718,7 +718,7 @@ class Runner:
         if ridge_names:
             out["ridge_share"] = sum(int(p["ridge_ok"]) for p in per) / reps
             ok_ridge = out["ridge_share"] >= need
-        out["declaration_sha256"] = declaration_digest(b)
+        out["declaration_sha256"] = declaration_digest(b, self.pack)
         out["code_sha256"] = calibrator_code_digest(self.pack, e)
         # a calibration that returns no usable interval is a failure, never "under-coverage detected"
         out["in_band"] = (invalid == 0 and all(lo <= c <= hi for c in cov.values())
@@ -1007,10 +1007,28 @@ def verified_benchmarks(engine) -> tuple[list, str | None]:
     return list(doc.get("benchmarks") or []), None
 
 
-def declaration_digest(b: dict) -> str:
+def declaration_digest(b: dict, pack: dict | None = None) -> str:
+    """sha256 of a case's declaration with the named configurations it uses resolved (Codex r2-4), plus the analysis
+    thresholds file (the calibrator's floors and class thresholds)."""
     import hashlib
     import json
-    return hashlib.sha256(json.dumps(b, sort_keys=True, default=str).encode()).hexdigest()
+    cfgs = (pack or {}).get("configs") or {}
+    used = sorted({v for v in _walk_values(b) if isinstance(v, str) and v in cfgs})
+    th = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "analysis", "thresholds.yaml")
+    doc = {"case": b, "configs": {c: cfgs[c] for c in used},
+           "thresholds": open(th).read() if os.path.exists(th) else None}
+    return hashlib.sha256(json.dumps(doc, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _walk_values(x):
+    if isinstance(x, dict):
+        for v in x.values():
+            yield from _walk_values(v)
+    elif isinstance(x, list):
+        for v in x:
+            yield from _walk_values(v)
+    else:
+        yield x
 
 
 def calibrator_code_digest(pack: dict, e: dict) -> str:
@@ -1050,7 +1068,7 @@ def merge_results(pack: dict, docs: list, engine) -> dict:
     for b in pack["benchmarks"]:          # Codex r1-11: a coverage row is bound to its declaration and calibrator code
         r = rows.get(b["id"])
         if r is not None and b["estimand"]["type"] == "coverage":
-            if r.get("declaration_sha256") != declaration_digest(b):
+            if r.get("declaration_sha256") != declaration_digest(b, pack):
                 raise ValueError(f"merge: {b['id']} was computed for another declaration")
             if r.get("code_sha256") != calibrator_code_digest(pack, b["estimand"]):
                 raise ValueError(f"merge: {b['id']} was computed by other calibration, observation or generator code")

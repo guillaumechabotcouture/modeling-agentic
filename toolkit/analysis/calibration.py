@@ -587,19 +587,21 @@ def sample(P: Problem, seed: int = 0, **override) -> dict:
 
 
 def _fd_hessian(P, names, t0, sd, h):
-    """Central finite-difference Hessian of -loglik in prior-scale units (one batch of 1 + 2d + 2d(d-1) points)."""
+    """Central finite-difference Hessian of -loglik in prior-scale units (one batch of 1 + 2d + 2d(d-1) points);
+    `h` is one step per dimension, in prior-sd units."""
     d = len(names)
+    h = np.broadcast_to(np.asarray(h, float), (d,))
     pts = [np.zeros(d)]
     for i in range(d):
         for s in (1, -1):
             e = np.zeros(d)
-            e[i] = s * h
+            e[i] = s * h[i]
             pts.append(e)
     pairs = [(i, k) for i in range(d) for k in range(i + 1, d)]
     for i, k in pairs:
         for si, sk in ((1, 1), (1, -1), (-1, 1), (-1, -1)):
             e = np.zeros(d)
-            e[i], e[k] = si * h, sk * h
+            e[i], e[k] = si * h[i], sk * h[k]
             pts.append(e)
     S = np.asarray(pts)
     T = t0 + S * sd
@@ -609,11 +611,11 @@ def _fd_hessian(P, names, t0, sd, h):
     H = np.zeros((d, d))
     f0 = f[0]
     for i in range(d):
-        H[i, i] = (f[1 + 2 * i] - 2 * f0 + f[2 + 2 * i]) / h ** 2
+        H[i, i] = (f[1 + 2 * i] - 2 * f0 + f[2 + 2 * i]) / h[i] ** 2
     base = 1 + 2 * d
     for q, (i, k) in enumerate(pairs):
         a, b, c, e = f[base + 4 * q: base + 4 * q + 4]
-        H[i, k] = H[k, i] = (a - b - c + e) / (4 * h * h)
+        H[i, k] = H[k, i] = (a - b - c + e) / (4 * h[i] * h[k])
     return H, bool(np.all(np.isfinite(H)))
 
 
@@ -632,14 +634,19 @@ def classify(P: Problem, smp: dict, **override) -> dict:
     sd = np.array([math.sqrt(P.priors[n].natural_var()) for n in names])
     t0 = np.array([float(P.priors[n].natural(smp["best"][j])) for j, n in enumerate(names)])
     h = 0.01
-    for j, n in enumerate(names):                         # keep the stencil inside the prior's support
+    # Codex r2-2: the evaluation point stays where it is (moving it can leave a curved ridge); near a bound the step
+    # in that dimension shrinks so the central stencil fits inside the prior's support
+    hv = np.full(d, h)
+    for j, n in enumerate(names):
         lo, hi = P.priors[n].natural_support()
-        pad = 2.5 * h * sd[j]
-        t0[j] = min(max(t0[j], lo + pad), hi - pad)
+        tiny = 1e-6 * sd[j]
+        t0[j] = min(max(t0[j], lo + tiny), hi - tiny)
+        gap = min(t0[j] - lo, hi - t0[j]) / sd[j]
+        hv[j] = min(h, gap / 1.01)
     # Codex r1-5: a fixed-step curvature along a curved exact ridge grows as h^2 (the straight step leaves the
     # ridge); Richardson extrapolation from h and h/2 removes that term, so a ridge stays flat at any precision.
-    H1, fin1 = _fd_hessian(P, names, t0, sd, h)
-    H2, fin2 = _fd_hessian(P, names, t0, sd, h / 2)
+    H1, fin1 = _fd_hessian(P, names, t0, sd, hv)
+    H2, fin2 = _fd_hessian(P, names, t0, sd, hv / 2)
     fin = fin1 and fin2
     H = (4.0 * H2 - H1) / 3.0
     if not fin:
@@ -685,11 +692,11 @@ def classify(P: Problem, smp: dict, **override) -> dict:
             g = np.zeros(d)                                   # gradient in prior-scale units
             for j in range(d):
                 e = np.zeros(d)
-                e[j] = h * sd[j]
+                e[j] = hv[j] * sd[j]
                 tp, tm = t0 + e, t0 - e
                 xp = np.array([[P.priors[n].from_natural(tp[i]) for i, n in enumerate(names)]])
                 xm = np.array([[P.priors[n].from_natural(tm[i]) for i, n in enumerate(names)]])
-                g[j] = (nat(_derived_values(P, xp)[k])[0] - nat(_derived_values(P, xm)[k])[0]) / (2 * h)
+                g[j] = (nat(_derived_values(P, xp)[k])[0] - nat(_derived_values(P, xm)[k])[0]) / (2 * hv[j])
             gn = float(g @ g)
             sh = float(np.sum((g @ Vf) ** 2) / gn) if gn > 0 and Vf.size else 0.0
             curv = float(g @ H @ g / gn) if gn > 0 else 0.0

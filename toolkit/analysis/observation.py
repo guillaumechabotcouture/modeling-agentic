@@ -158,9 +158,17 @@ def loglik(model: str, y, **kw) -> np.ndarray:
         if np.any(rho >= 1):
             raise ValueError("design effect too large for the sample size (ICC >= 1)")
         t = 1.0 / rho - 1.0
-        pc = np.clip(p, 1e-300, 1 - 1e-16)
-        a, b = pc * t, (1 - pc) * t
-        return lc + betaln(y + a, n - y + b) - betaln(a, b)
+        y, n, p = np.broadcast_arrays(y, n, p)
+        out = np.where(p == 0, np.where(y == 0, 0.0, -np.inf), np.where(y == n, 0.0, -np.inf))  # point masses
+        inner = (p > 0) & (p < 1)                     # Codex r2-1: no floored probability
+        if np.any(inner):
+            pi, yi, ni = p[inner], y[inner], n[inner]
+            ti = np.broadcast_to(t, p.shape)[inner]
+            a, b = pi * ti, (1 - pi) * ti
+            lci = np.broadcast_to(lc, p.shape)[inner]
+            out = out.astype(float)
+            out[inner] = lci + betaln(yi + a, ni - yi + b) - betaln(a, b)
+        return out
     y = _arr(y, "observed values")
     mu = _arr(kw["mu"], "mu")
     sd = _arr(kw["sd"], "sd")

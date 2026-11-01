@@ -649,15 +649,17 @@ def _validate_calibration(s, card, pnames, cols) -> list[str]:
         if t.get("outcome", s.raw["objective"]["outcome"]) not in card.outputs.get("per_capita", []):
             bad.append("calibration.targets.outcome: not an engine per-capita output")
     if m == "posterior":
-        bad += _validate_posterior(cal)
+        bad += _validate_posterior(cal, s.raw["analysis"].get("evaluation"))
     return bad
 
 
-def _validate_posterior(cal) -> list[str]:
+def _validate_posterior(cal, evaluation="direct") -> list[str]:
     """v2d §3.1: every quantity the posterior moves has a declared prior with its source (no silent defaults), and the
     count panel names its observation model."""
     from toolkit.analysis.calibration import Prior
     bad = []
+    if evaluation != "direct":      # Codex r2-5: the posterior evaluates the engine itself
+        bad.append("calibration.method posterior needs analysis.evaluation: direct (no emulator path yet)")
     pri = cal.get("priors")
     if not isinstance(pri, dict):
         return ["calibration.priors: a mapping {name: {dist, range, source}}"]
