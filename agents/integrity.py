@@ -251,21 +251,32 @@ def pipeline_builds(command: str, cwd: str | None = None) -> bool:
     writes is an integrity violation (evalbase1 flu_vaccine: 56 events from one
     `nohup python3 scripts/pipeline.py run . &`). Same execution parser as
     `harness_scripts_run`: a mention of the command is not a run of it."""
-    runs, _bg = _executed_scripts(command, cwd)
+    runs, _bg = _executed_scripts(command, cwd, bind=True)
     return any(name == "pipeline.py" and _is_full_build(args) for name, args in runs)
 
 
+def _strip_redirections(args: list[str]) -> list[str]:
+    """The shell removes redirections (`>f`, `2>&1`, a bare `>` and its operand) before
+    the program sees its arguments."""
+    out, j = [], 0
+    while j < len(args):
+        redir = re.fullmatch(r"\d*(>>?|<|&>>?|>&|<&)(\S*)", args[j])
+        if redir:
+            j += 1 if redir.group(2) else 2
+            continue
+        out.append(args[j])
+        j += 1
+    return out
+
+
 def _is_full_build(args: list[str]) -> bool:
+    args = _strip_redirections(args)
     pos, opts, j = [], set(), 0
     while j < len(args):
         t = args[j]
         if t == "--":
-            pos.extend(a for a in args[j + 1:] if not re.fullmatch(r"\d*(>>?|<|&>>?|>&|<&)\S*", a))
+            pos.extend(args[j + 1:])
             break                        # argparse: everything after `--` is positional
-        redir = re.fullmatch(r"\d*(>>?|<|&>>?|>&|<&)(\S*)", t)
-        if redir:
-            j += 1 if redir.group(2) else 2      # `>f`, `2>&1`; a bare `>` takes the next token
-            continue
         if t.startswith("-") and t != "-":
             name = t.split("=", 1)[0]
             match = [o for o in _PIPELINE_FLAGS if o == name] or \
@@ -300,10 +311,12 @@ def _bind_positional(cmd_str: str, operands: list[str]) -> str:
     return re.sub(r'"?\$(?:(\d)|\{(\d+)\})"?', one, s)
 
 
-def _executed_scripts(command: str, cwd: str | None = None, _depth: int = 0
+def _executed_scripts(command: str, cwd: str | None = None, _depth: int = 0, bind: bool = False
                       ) -> tuple[list[tuple[str, list[str]]], bool]:
     """(name, arguments) of each repo script under scripts/ a Bash command executes
-    with a Python interpreter, and whether it backgrounds them."""
+    with a Python interpreter, and whether it backgrounds them. `bind` substitutes a
+    `sh -c` string's positional parameters: for refusals only (it can only add runs),
+    never for crediting a producer (Codex r2: `sh -c '$1 x.py' sh python3` runs nothing)."""
     import shlex
     found, background = [], False
     for seg, base in enforcement.iter_segments_with_cwd(command, cwd):
@@ -349,8 +362,9 @@ def _executed_scripts(command: str, cwd: str | None = None, _depth: int = 0
             if cmd_str is not None:
                 # `bash -c '… "$@"' $0 $1 …`: the string runs with these as its positional
                 # parameters, so they are part of what runs (Codex r1).
-                cmd_str = _bind_positional(cmd_str, toks[j + 2:])
-                inner, bg = _executed_scripts(cmd_str, base, _depth + 1)
+                if bind:
+                    cmd_str = _bind_positional(cmd_str, toks[j + 2:])
+                inner, bg = _executed_scripts(cmd_str, base, _depth + 1, bind)
                 found += inner
                 background = background or bg
             continue
@@ -363,8 +377,8 @@ def _executed_scripts(command: str, cwd: str | None = None, _depth: int = 0
             t = toks[i]
             if t == "-" or re.fullmatch(r"-[bBdEiIOPqsSuvVxR]*[cm].*", t, re.S):
                 break
-            if t in ("-W", "-X"):
-                i += 2
+            if re.fullmatch(r"-[bBdEiIOPqsSuvVxR]*[WX]", t):
+                i += 2                   # -W / -X (alone or ending a cluster: -uW) take the next token
                 continue
             if not t.startswith("-"):
                 k = i
@@ -464,6 +478,16 @@ class ArtifactIntegrity:
                 self.events = list(ev)
                 dc = prior.get("declaration_changes")
                 self.declaration_changes = [c for c in dc if isinstance(c, dict)] if isinstance(dc, list) else []
+                # A resumed run keeps the globs declared before and what the harness built
+                # (Codex r2): both only ever add protection. The record is harness-written;
+                # any other change to it is an unresolvable violation.
+                for key, dst in (("pipeline_declared", self.pipeline_patterns), ("pipeline_built", None)):
+                    vals = prior.get(key)
+                    vals = [v for v in vals if isinstance(v, str)] if isinstance(vals, list) else []
+                    if dst is None:
+                        self._pipeline_built.update(vals)
+                    else:
+                        dst.extend(v for v in vals if v not in dst)
             except (OSError, ValueError, AttributeError) as e:
                 self.events = [{"file": REPORT_NAME, "change": "invalid_at_start", "open": True,
                                 "resolvable": False, "detected": "start", "detail": str(e)[:200],
@@ -986,6 +1010,8 @@ class ArtifactIntegrity:
                            "unmatched_intents": self.unmatched_intents,
                            "open_violations": len(self.open_events),
                            "declaration_changes": self.declaration_changes,
+                           "pipeline_declared": list(self.pipeline_patterns),
+                           "pipeline_built": sorted(self._pipeline_built),
                            "violations": self.events}, f, indent=2)
         except OSError:
             self.report_ok = False       # finalize blocks on in-memory events anyway
@@ -1231,6 +1257,23 @@ def _self_test() -> int:
         new = ig.on_post("t2")
         ok(new == [] and ig.open_events == [], f"IG13 nothing stays open: {new} {ig.open_events}")
 
+    # IG14 (Codex r2 P1): positional binding never credits a producer (it only widens refusals).
+    ok(harness_scripts_run(f"bash -c '$1 scripts/compare_models.py runs/r' sh python3", enforcement.REPO_ROOT)[0] == [],
+       "IG14 `sh -c '$1 …' sh python3` does not credit compare_models.py")
+
+    # IG15 (Codex r2 P1): a resumed record keeps the globs declared before and what the harness built.
+    with tempfile.TemporaryDirectory() as d:
+        spec(d, ["figures/old_*.png", "figures/h1_*.png"], extra="a")
+        ig = ArtifactIntegrity(d, process_check=lambda: set())
+        harness_build(ig, d, ["figures/old_a.png"])
+        spec(d, ["figures/h1_*.png"], extra="bb")
+        ig.final_check()
+        ig2 = ArtifactIntegrity(d, process_check=lambda: set())         # resume
+        ig2.on_pre("t1", "Bash", {"command": "python3 -c 'x'"}, "modeler", cwd=d, agent_id="m1")
+        w(d, "figures/old_a.png", "forged after resume\n")
+        ok([x["file"] for x in ig2.on_post("t1")] == ["figures/old_a.png"],
+           f"IG15 a built file under a retired glob stays protected across a resume: {ig2.pipeline_patterns}")
+
     # IG9-IG10: which Bash commands are a full pipeline build in the real run directory.
     run = "runs/r1"
     for cmd in (f"nohup python3 scripts/pipeline.py run {run} > models/pipeline_run.log 2>&1 &",
@@ -1240,7 +1283,11 @@ def _self_test() -> int:
                 f"python3 scripts/pipeline.py run -- {run}",                      # Codex r1
                 f"python3 -W ignore scripts/pipeline.py run {run}",
                 f"python3 -X utf8 -u scripts/pipeline.py run {run}",
-                f"bash -c 'python3 scripts/pipeline.py run \"$@\"' sh {run}"):
+                f"bash -c 'python3 scripts/pipeline.py run \"$@\"' sh {run}",
+                f"python3 scripts/pipeline.py run -- {run} > models/log 2>&1",      # Codex r2
+                f"python3 -uW ignore scripts/pipeline.py run {run}",
+                f"python3 -uXutf8 scripts/pipeline.py run {run}",
+                f"python3 -BX utf8 scripts/pipeline.py run {run}"):
         ok(pipeline_builds(cmd, enforcement.REPO_ROOT), f"IG9 a full build is recognised: {cmd}")
     for cmd in (f"python3 scripts/pipeline.py run {run} sensitivity --scratch --keep",
                 f"python3 scripts/pipeline.py run {run} b --scr",
