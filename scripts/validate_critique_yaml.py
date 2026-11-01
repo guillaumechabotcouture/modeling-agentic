@@ -66,6 +66,11 @@ from lib.md_helpers import _strip_limitations_and_scope  # noqa: E402
 # Phase 48 β: the sibling-script loader lives in lib.siblings (shared with the
 # check modules moved out of this file); same rules, same module objects.
 from lib.siblings import load_sibling as _load_sibling  # noqa: E402
+# Phase 49 α: the scope-declaration normalizer (Phase 21 β) lives in
+# lib.scope_declarations, shared with scripts/declaration_tests.py.
+from lib.scope_declarations import (  # noqa: E402
+    CRITIC_DERIVED_PREFIXES as _CRITIC_DERIVED_PREFIXES, load as _load_scope_declarations,
+    entry_declared_ids as _entry_declared_ids, entry_has_justification as _entry_has_justification)
 
 
 # Phase 21 β: closed verdict vocabularies of each producing script. A
@@ -180,6 +185,13 @@ _NON_DECLARABLE_KINDS = frozenset({
     "eligibility_benefit_scales_with_total",
     "eligibility_probe_error",
     "a_priori_count_mismatch",
+    # Phase 49 α: a declared HIGH finding without a usable decision test, or
+    # one whose test shows the decision changes.
+    "scope_declaration_untested",
+    "scope_declaration_test_invalid",
+    "declared_finding_changes_decision",
+    # Phase 49 β: the owner declined the declaration.
+    "scope_declaration_declined",
 })
 _NON_DECLARABLE_SUFFIXES = ("_invalid", "_unknown_verdict",
                             "_not_script_produced", "_stale")
@@ -588,6 +600,20 @@ def _recompute_action(d: dict, max_rounds: int, current_round: int,
                      "artifacts, no structural mismatch.")
         rule_matched = 4
 
+    owner = [b for b in outstanding if b.get("owner_signoff")]
+    if action == "DECLARE_SCOPE" and owner:
+        # Phase 49 β (A21): these bear on the primary decision; only the owner may accept them
+        # as declared limitations (scripts/scope_signoff.py).
+        action = "AWAIT_OWNER"
+        rationale = (
+            f"Rule {rule_matched} would DECLARE_SCOPE, but {len(owner)} of the declared finding(s) bear on the "
+            f"primary decision ({', '.join(str((b.get('owner_item') or {}).get('finding') or b.get('kind')) for b in owner)[:300]}). "
+            f"The owner decides: the gate wrote scope_signoff_request.json. Do not spawn the writer. Owner mode: end "
+            f"your turn with the line AWAITING_SIGNOFF; the harness resumes you with the answers. Lead mode: review "
+            f"`python3 scripts/scope_signoff.py show {{run_dir}}`, write scope_signoff_answers.yaml and end your turn with "
+            f"AWAITING_SIGNOFF; the harness signs.")
+        rule_matched = f"{rule_matched}o"
+
     d["rounds_remaining"] = rounds_remaining
     d["action"] = action
     d["rule_matched"] = rule_matched
@@ -595,8 +621,8 @@ def _recompute_action(d: dict, max_rounds: int, current_round: int,
     return d
 
 
-# Gate kinds that carry a critic's finding under another name: never declared away early.
-_CRITIC_DERIVED_PREFIXES = ("done_when_", "critique_", "claim_overclaimed", "sufficiency", "crossmodel")
+# Gate kinds that carry a critic's finding under another name (never declared
+# away early): _CRITIC_DERIVED_PREFIXES, from lib.scope_declarations.
 
 
 def _declared_early(outstanding: list[dict], d: dict) -> bool:
@@ -1433,6 +1459,10 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None,
     # Phase 47 β (A18): a percentage claim whose source holds a proportion.
     violations += G(lambda rd: _load_sibling("claim_units").gate_findings(rd),
                     run_dir, check_name="claim_units")
+    # Phase 49 δ (A23): a draft changed after the presentation critique, with its
+    # writer HIGHs still open, has not been re-checked.
+    violations += G(lambda rd: _load_sibling("presentation_pass").gate_findings(rd),
+                    run_dir, check_name="presentation_pass")
     # Phase 34: done_when findings computed by the caller, added before the
     # escalation so their persistence counts (Codex review).
     violations += list(extra or [])
@@ -1442,10 +1472,22 @@ def _check_rigor_artifacts(run_dir: str, round_n: int | None = None,
         violations += G(_check_persistent_medium_escalation, run_dir,
                         round_n=round_n,
                         current_kinds={v.get("kind") for v in violations})
+    # Phase 49 β (A21): findings that bear on the primary decision are marked for the
+    # owner's sign-off (in place); declined declarations are HIGH. Runs first, so the
+    # decision-test check leaves those findings to the owner.
+    violations += G(lambda rd: _load_sibling("scope_signoff").gate_findings(
+                        rd, round_n, violations, non_declarable=is_non_declarable),
+                    run_dir, check_name="scope_signoff")
+    # Phase 49 α (A20): the decision-test check runs in main() over every gate finding
+    # (spec-compliance, rigor, registry) once assembled: _apply_declaration_tests.
     # Phase 47 ε (A17): a finding at N gates in a row needs a diagnosis or a declaration.
     violations += G(lambda rd: _load_sibling("stall_rule").gate_findings(
                         rd, round_n, violations, _declared_ids(rd), is_non_declarable),
                     run_dir, check_name="stall_rule")
+    # Phase 49 γ (A22): the declared limits are in the executive summary as the
+    # harness rendered them from scope_declaration.yaml (positional token check).
+    violations += G(lambda rd: _load_sibling("declared_limits").gate_findings(rd),
+                    run_dir, check_name="declared_limits")
     _annotate_first_seen(run_dir, violations)
     return violations
 
@@ -1458,6 +1500,23 @@ _UNIVERSAL_COVERAGE_FIELDS = (
     ("universal_coverage_dalys_averted_estimate", ()),
     ("efficiency_pct", ("gc7_efficiency_pct",)),
 )
+
+
+def _apply_declaration_tests(decision: dict, run_dir: str, spec_v: list, rigor_v: list, reg_v: list,
+                             max_rounds: int, current_round: int, post_write: bool = False) -> dict:
+    """Phase 49 α (A20): a scope declaration of a HIGH gate finding needs a decision
+    test (scripts/declaration_tests.py). Run over every gate finding (Codex review:
+    spec-compliance and registry HIGHs reach rule 3a too), keeping each one's
+    identity: a registry finding is named by its parameter. The findings join the
+    rigor blockers (not declarable), and the decision is recomputed."""
+    found = [v if v.get("key") or str(v.get("name") or "-") == "-" else dict(v, key=v["name"])
+             for v in list(spec_v or []) + list(rigor_v or []) + list(reg_v or []) if isinstance(v, dict)]
+    dt = run_guarded(lambda: _load_sibling("declaration_tests").gate_findings(
+        run_dir, current_round, found, post_write=post_write, non_declarable=is_non_declarable),
+        check_name="declaration_tests")
+    if not dt:
+        return decision
+    return _incorporate_rigor_violations(decision, list(rigor_v or []) + dt, max_rounds, current_round)
 
 
 def _check_universal_coverage(run_dir: str) -> list[dict]:
@@ -3464,94 +3523,8 @@ def _check_coherence_audit(run_dir: str, post_write: bool = False) -> list[dict]
     return out
 
 
-# ---------------------------------------------------------------------------
-# Phase 21 β — scope_declaration.yaml normalization
-# ---------------------------------------------------------------------------
-#
-# Real runs used at least eight different top-level keys for their
-# declarations (`declarations`, `scope_declarations`, `unresolved_blockers`,
-# `unresolved_high_blockers`, `acknowledged_limitations`, ...), referenced
-# blockers via `blocker_id`, lists of ids, or ids embedded in prose, and
-# marked some entries `status: RESOLVED`. The Phase 19 β budget counted only
-# `declarations:` entries with `id`/`claim`, so any other shape burned zero
-# budget; the pre-mortem check accepted any substring anywhere in the file.
-# One normalizer now feeds both.
-
-_BLOCKER_ID_RE = re.compile(r"\b[A-Z][A-Z0-9]{0,5}-\d{2,4}\b")
-_STRUCTURED_ID_FIELDS = ("blocker_id", "blocker_ids", "blockers", "covers",
-                         "concern_id", "concern_ids", "ids", "acknowledges",
-                         "blocker")
-_JUSTIFICATION_FIELDS = ("why_unresolved", "justification", "rationale",
-                         "claim", "reason", "impact_on_conclusions",
-                         "description")
-_NON_DECLARATION_KEYS = frozenset({"budget", "version", "run_dir",
-                                   "generated_at", "declared_at"})
-
-
-def _load_scope_declarations(run_dir: str
-                             ) -> tuple[Optional[dict], list[dict], list[dict]]:
-    """Return (doc, entries, findings) for scope_declaration.yaml.
-
-    `entries` is every mapping found in any top-level list (except the
-    `budget` block and metadata keys), plus any top-level mapping value
-    that itself looks like a declaration (has an id field). Entries with
-    `status: RESOLVED` are dropped — they declare nothing.
-    """
-    path = artifact_path("scope_declaration", run_dir)
-    doc, findings = safe_load_mapping(path, "scope_declaration", stage="GATE",
-                                      display_path="scope_declaration.yaml")
-    if doc is None:
-        return None, [], findings
-    entries: list[dict] = []
-    for key, val in doc.items():
-        if key in _NON_DECLARATION_KEYS:
-            continue
-        items = val if isinstance(val, list) else (
-            [dict(val, id=val.get("id", key))]
-            if isinstance(val, dict) else [])
-        for e in items:
-            if isinstance(e, dict):
-                if str(e.get("status") or "").strip().upper() == "RESOLVED":
-                    continue
-                entries.append(e)
-            elif isinstance(e, str) and e.strip():
-                entries.append({"claim": e})
-            else:
-                entries.append({})
-    return doc, entries, findings
-
-
-def _strings_in(obj: Any) -> list[str]:
-    if isinstance(obj, str):
-        return [obj]
-    if isinstance(obj, dict):
-        return [s for v in obj.values() for s in _strings_in(v)]
-    if isinstance(obj, list):
-        return [s for v in obj for s in _strings_in(v)]
-    return []
-
-
-def _entry_declared_ids(entry: dict, structured_only: bool) -> set[str]:
-    """Blocker ids an entry declares. Structured fields always count;
-    with structured_only=False, ids mentioned anywhere in the entry's
-    text count too (one entry listing 20 ids declares 20 blockers).
-    The entry's own `id` (e.g. SD-001) is not a blocker reference unless
-    it is the only identifier present."""
-    ids: set[str] = set()
-    for f in _STRUCTURED_ID_FIELDS:
-        v = entry.get(f)
-        for x in (v if isinstance(v, list) else [v]):
-            if isinstance(x, (str, int)) and str(x).strip():
-                ids.add(str(x).strip())
-    if not structured_only:
-        own = str(entry.get("id") or "")
-        for txt in _strings_in({k: v for k, v in entry.items() if k != "id"}):
-            ids.update(m for m in _BLOCKER_ID_RE.findall(txt) if m != own)
-    return ids
-
-
-def _entry_has_justification(entry: dict) -> bool:
-    return any(str(entry.get(f) or "").strip() for f in _JUSTIFICATION_FIELDS)
+# Phase 21 β scope_declaration.yaml normalization: moved to
+# scripts/lib/scope_declarations.py (Phase 49 α), imported at the top.
 
 
 # Phase 19 β — scope-declaration budget cap. Default is 3 declarations
@@ -4375,6 +4348,8 @@ def _incorporate_rigor_violations(decision: dict, violations: list[dict],
                     "kind": v["kind"],
                     "scope_declarable": not is_non_declarable(
                         v["kind"], v.get("scope_declarable")),
+                    # Phase 49 β: a missing decision analysis is the owner's to accept.
+                    **({"owner_signoff": True, "owner_item": v.get("owner_item")} if v.get("owner_signoff") else {}),
                 })
             continue
         if v.get("severity") != "HIGH":
@@ -4387,6 +4362,8 @@ def _incorporate_rigor_violations(decision: dict, violations: list[dict],
             "kind": v["kind"],
             "scope_declarable": not is_non_declarable(
                 v["kind"], v.get("scope_declarable")),
+            # Phase 49 β: a finding the owner must sign off before it is declared.
+            **({"owner_signoff": True, "owner_item": v.get("owner_item")} if v.get("owner_signoff") else {}),
         })
     _append_synthetic_blockers(d, "rigor-artifacts", "RIG", entries)
 
@@ -4641,6 +4618,34 @@ def _run_self_test() -> int:
     ok('_load_sibling("stall_rule").gate_findings(' in _src47 and 'check_name="stall_rule"' in _src47
        and _src47.index("stall_rule") > _src47.index("_check_persistent_medium_escalation"),
        "SW1 stall_rule runs in _check_rigor_artifacts after the persistence escalation")
+    ok('_load_sibling("presentation_pass").gate_findings(' in _src47,
+       "PP-W1 presentation_pass runs in _check_rigor_artifacts")
+    ok('_load_sibling("declared_limits").gate_findings(' in _src47,
+       "DL-W1 declared_limits runs in _check_rigor_artifacts")
+    with tempfile.TemporaryDirectory() as d:
+        # Phase 49 γ: declarations and no [DECLARED_LIMITS] token: a HIGH accept blocker,
+        # declarable, through the validator's own declaration loader.
+        yaml.safe_dump({"declarations": [{"id": "SD-9", "blocker_ids": ["allocation_unstable"],
+                                          "why_unresolved": "w"}]}, open(os.path.join(d, "scope_declaration.yaml"), "w"))
+        open(os.path.join(d, "manuscript.md"), "w").write("# T\n\n## Executive summary\n\nFund.\n\n## 1. Intro\n")
+        _f = [v for v in _check_rigor_artifacts(d) if v.get("kind") == "declared_limits_not_rendered"]
+        ok(len(_f) == 1 and _f[0]["severity"] == "HIGH" and _f[0]["accept_blocker"]
+           and not is_non_declarable(_f[0]["kind"], _f[0]["scope_declarable"]),
+           f"DL-W2 declarations without the rendered block: HIGH accept blocker, declarable: {_f}")
+    with tempfile.TemporaryDirectory() as d:
+        # Phase 49 δ (Codex): a draft no recorded presentation review covers blocks ACCEPT at
+        # every round; at exhaustion the run is DECLARE_SCOPE listing it, not RUN_FAILED.
+        yaml.safe_dump({"reviewer": "critique-presentation", "round": 8, "blockers": []},
+                       open(os.path.join(d, "critique_presentation.yaml"), "w"))
+        open(os.path.join(d, "manuscript.md"), "w").write("# Draft\n")
+        _f = [v for v in _check_rigor_artifacts(d) if v.get("kind", "").startswith("presentation_review_")]
+        ok(len(_f) == 1 and _f[0]["kind"] == "presentation_review_missing" and _f[0]["severity"] == "HIGH"
+           and _f[0]["accept_blocker"], f"PP-W2 a draft no review covers is a HIGH accept blocker: {_f}")
+        _dpp = _incorporate_rigor_violations({"unresolved_high": [], "accept_blockers": []}, _f, 8, 8)
+        ok(_dpp["action"] == "DECLARE_SCOPE" and _dpp["accept_blockers"],
+           f"PP-W3 at the last round it is DECLARE_SCOPE (listed), never ACCEPT nor RUN_FAILED: {_dpp.get('action')}")
+        _dpp = _incorporate_rigor_violations({"unresolved_high": [], "accept_blockers": []}, _f, 8, 5)
+        ok(_dpp["action"] == "PATCH_OR_RETHINK", f"PP-W4 with rounds left ACCEPT is refused: {_dpp.get('action')}")
     with tempfile.TemporaryDirectory() as d:
         _append_validator_history(d, 2, {"action": "PATCH_OR_RETHINK", "rigor_violations": [
             {"kind": "benchmark_drift", "severity": "HIGH", "stall_key": "B9"},
@@ -4656,6 +4661,50 @@ def _run_self_test() -> int:
            f"SW3 the decision text lists stalled findings: {txt}")
     ok(act([bd, sa], both, both, cur=8)["action"] == "DECLARE_SCOPE" and act([bd, sa], both, both, cur=8)["rule_matched"] == 3,
        "EF7 in the last round the existing rule 3 applies")
+    # Phase 49 α: an untested declaration blocks rule 3a, and rule 3 at exhaustion.
+    ut = {"kind": "scope_declaration_untested", "id": "RIG-009", "severity": "HIGH",
+          "scope_declarable": not is_non_declarable("scope_declaration_untested")}
+    ok(act([bd, sa, ut], both, both)["action"] == "PATCH_OR_RETHINK"
+       and act([bd, sa, ut], both, both, cur=8)["action"] == "RUN_FAILED",
+       "DT-V1 an untested declaration: no early DECLARE_SCOPE, RUN_FAILED at exhaustion")
+    # DT-V3 (Codex P1): a registry or spec-compliance HIGH declared at two gates in a row is held to
+    # the decision test too; rule 3a must not fire on it untested.
+    with tempfile.TemporaryDirectory() as d:
+        yaml.safe_dump({"declarations": [{"id": "SD-9", "blocker_id": "cost_crosscheck_mismatch",
+                                          "why_unresolved": "x"}]}, open(os.path.join(d, "scope_declaration.yaml"), "w"))
+        reg = [{"kind": "cost_crosscheck_mismatch", "severity": "HIGH", "stage": "REGISTRY", "name": "itn_cost",
+                "claim": "cost differs"}]
+        dec = incorporate_registry_violations({"unresolved_high": [], "declared": ["cost_crosscheck_mismatch"],
+                                               "declared_prev": ["cost_crosscheck_mismatch"]}, reg, 8, 5)
+        ok(dec["action"] == "DECLARE_SCOPE", f"DT-V3a precondition: rule 3a fires without the check ({dec['action']})")
+        dec = _apply_declaration_tests(dec, d, [], [], reg, 8, 5, post_write=False)
+        ok(dec["action"] == "PATCH_OR_RETHINK"
+           and any(b.get("kind") == "scope_declaration_untested" for b in dec["unresolved_high"]),
+           f"DT-V3 the untested registry declaration blocks rule 3a: {dec['action']}")
+    # SO-V3 (Phase 49 β): a missing decision analysis (an accept blocker) is the owner's at exhaustion.
+    _ra = {"kind": "required_artifact_missing", "severity": "HIGH", "accept_blocker": True, "scope_declarable": True,
+           "artifact": "sensitivity_analysis", "claim": "absent", "owner_signoff": True,
+           "owner_item": {"finding": "required_artifact_missing:sensitivity_analysis"}}
+    _d3 = _incorporate_rigor_violations({"unresolved_high": [], "declared": [], "declared_prev": []}, [_ra], 8, 8)
+    ok(_d3["action"] == "AWAIT_OWNER" and _d3["accept_blockers"][0].get("owner_signoff"),
+       f"SO-V3 a missing required analysis at exhaustion waits for the owner: {_d3['action']}")
+    # Phase 49 β: a DECLARE_SCOPE that relies on a decision-bearing finding waits for the owner.
+    bdo = dict(bd, owner_signoff=True, owner_item={"finding": "benchmark_drift:B15"})
+    ok(act([bdo, sa], both, both)["action"] == "AWAIT_OWNER" and act([bdo, sa], both, both)["rule_matched"] == "3ao"
+       and act([bdo, sa], both, both, cur=8)["action"] == "AWAIT_OWNER",
+       "SO-V1 rule 3a / rule 3 with an owner-marked finding -> AWAIT_OWNER")
+    ok(act([bdo, sa, ut], both, both)["action"] == "PATCH_OR_RETHINK"
+       and act([bdo, sa, ut], both, both, cur=8)["action"] == "RUN_FAILED",
+       "SO-V2 the owner is asked only when the run would otherwise declare scope")
+    with tempfile.TemporaryDirectory() as d:
+        yaml.safe_dump({"declarations": [{"id": "SD-7", "blocker_id": "allocation_unstable", "why_unresolved": "x"}]},
+                       open(os.path.join(d, "scope_declaration.yaml"), "w"))
+        _v49 = [{"kind": "allocation_unstable", "severity": "HIGH", "stage": "OPTIMIZATION",
+                 "key": "allocation_robustness", "claim": "UNSTABLE"}]
+        _f49 = _load_sibling("declaration_tests").gate_findings(d, 5, _v49, non_declarable=is_non_declarable)
+        ok([x["kind"] for x in _f49] == ["scope_declaration_untested"]
+           and is_non_declarable(_f49[0]["kind"], _f49[0]["scope_declarable"]),
+           f"DT-V2 the wired check flags the untested declaration, not declarable: {_f49}")
     with tempfile.TemporaryDirectory() as d:
         with open(os.path.join(d, _VALIDATOR_HISTORY_FILE), "w") as f:
             f.write(json.dumps({"round": 3, "action": "PATCH_OR_RETHINK", "declared": ["a"]}) + "\n")
@@ -7668,6 +7717,7 @@ def main() -> int:
                                            args.current_round, record=not args.no_history)
     decision = _defer_write_findings(decision, args.run_dir, args.max_rounds, args.current_round)
 
+    spec_violations, rigor_violations, reg_violations = [], [], []   # Phase 49 α
     if args.spec_compliance:
         spec_module = _load_spec_compliance()
         if spec_module is None:
@@ -7792,10 +7842,18 @@ def main() -> int:
             decision, reg_violations, args.max_rounds, args.current_round,
         )
 
+    # Phase 49 α (A20): every gate finding, once assembled, against the declarations.
+    decision = _apply_declaration_tests(decision, args.run_dir, spec_violations, rigor_violations,
+                                        reg_violations, args.max_rounds, args.current_round,
+                                        post_write=args.post_write)
+
     decision["post_write"] = bool(args.post_write)
     if not args.no_history:
         _append_validator_history(args.run_dir, args.current_round, decision,
                                   args.post_write)
+        # Phase 49 β: the owner's sign-off request (or its supersession). Unguarded: a
+        # request that cannot be written must not let the run go on (VALIDATOR_ERROR).
+        _load_sibling("scope_signoff").record(args.run_dir, decision, args.current_round)
     open_note = None
     if not args.no_history and not args.post_write:
         open_note = _write_open_problems(args.run_dir, args.current_round,

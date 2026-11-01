@@ -1,0 +1,18 @@
+{
+ "cap_usd": 600.0,
+ "spent_usd": 442.0104,
+ "sessions": [
+  {
+   "session": 1,
+   "reported_usd": 5.7046
+  },
+  {
+   "session": 2,
+   "reported_usd": 121.3347
+  },
+  {
+   "session": 3,
+   "reported_usd": 442.0104
+  }
+ ]
+}

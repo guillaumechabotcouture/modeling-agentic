@@ -25,3 +25,22 @@ validator_stderr_*.txt
 /experiments/*
 !/experiments/E[0-9]*_*/
 /*.pdf
+
+# Phase 50 α: the eval suite's hidden half (generators, rubrics, answer keys, hidden tests,
+# design note) lives only in the encrypted bundle (evals/README.md); never commit a
+# decrypted copy or the bundle itself
+/evals/**/_truth/
+/evals/**/generate.py
+/evals/**/rubric.yaml
+/evals/_common.py
+/evals/test_suite.py
+/evals/legacy/
+/evals/design/
+/evals_private/
+/eval_private_*/
+/docs/design/eval-suite.md
+bundle.enc
+*.bundle.enc
+
+# Licensed run inputs (DHS/MAP-derived): never committed to this public repo; see cloud/nigeria_gf13_inputs.py
+/data/nigeria_gf13/

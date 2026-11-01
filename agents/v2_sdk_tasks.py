@@ -254,6 +254,9 @@ class SdkTasks:
         async def pre(input_data, tool_use_id, context):
             name = input_data.get("tool_name")
             ti = input_data.get("tool_input") or {}
+            if name not in TOOLS:
+                # Fail closed (main #97): no shell, so no full pipeline build and no background call.
+                return enforcement.deny_output(f"{kind}: {name} is not one of this task's tools ({', '.join(TOOLS)})")
             if name in ("Write", "Edit"):
                 why = _allowed(ti.get("file_path", ""), self.run_dir, owns)
                 if why:
@@ -507,6 +510,25 @@ def _self_test() -> int:
         r = t._session("pick_engine", "x", "y", ())
         ok(probes == [] and abs(r.usd - 2.0) < 1e-9,
            f"S8 (Codex R2-3) with no budget for a read-back none is made; the whole allowance is charged ({probes}, {r.usd})")
+        # S16 (main #97 ported): a task has file tools only. Should the CLI offer any other tool (Bash,
+        # a subagent, a notebook edit), the hook refuses it, so no task can run a full
+        # `scripts/pipeline.py run <run_dir>` or leave a background call no hook sees end.
+        verdicts = {}
+
+        async def probe_hook(prompt=None, options=None):
+            pre = options.hooks["PreToolUse"][0].hooks[0]
+            for name, ti in (("Bash", {"command": f"python3 scripts/pipeline.py run {d}"}),
+                             ("Agent", {"subagent_type": "modeler", "prompt": "x"}),
+                             ("NotebookEdit", {"notebook_path": os.path.join(d, "n.ipynb")}),
+                             ("Read", {"file_path": os.path.join(d, "budget_ledger.json")})):
+                out = await pre({"tool_name": name, "tool_input": ti}, "t1", None)
+                verdicts[name] = (out.get("hookSpecificOutput") or {}).get("permissionDecision") == "deny"
+            yield NS(total_cost_usd=0.01, session_id="s16", is_error=False)
+        t = SdkTasks(d, query_fn=probe_hook)
+        t.set_allowance(1.0)
+        t._session("pick_engine", "x", "y", ())
+        ok(verdicts == {"Bash": True, "Agent": True, "NotebookEdit": True, "Read": False},
+           f"S16 tools outside the task's file tools are refused at PreToolUse; a Read is not ({verdicts})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

@@ -15,6 +15,7 @@ distributed==2026.8.0
 cloudpickle==3.1.2
 numpy==2.4.4
 scipy==1.17.1           # scripts/identifiability.py
+cryptography==46.0.6    # scripts/eval_private.py (Fernet); already in the venv via azure-identity
 
 # --- Modeling toolkit used by agent-generated model code ---
 # Not imported by the harness itself, but the modeler prompt and skills
