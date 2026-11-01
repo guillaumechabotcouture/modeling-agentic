@@ -7,6 +7,80 @@ with the spike (`history/results_v0.1-spike.yaml`) and PR round 1 (`history/resu
 beside them, by `benchmarks/render_notes.py`. Reproduce with
 `bash toolkit/engines/malaria/benchmarks/validate_once.sh` on a VM.
 
+## v0.4 scope (written and pushed before any v0.4 pack run)
+
+The open gaps after v0.3 are B7 (0.595 against 0.68–0.98), B16c (4 of 5 rules), B8's marginal
+pass (0.462 against a 0.46 floor) and the Muleba calibration grid edge (m0 127.6 against a
+grid bound of 128). The owner's rule: explain an overshoot with a mechanism from published
+data, never a fitted correction. B7, B8 and B16c stay held out. Nothing below was chosen by
+its B7 result. Each candidate was weighed on the trials' own design and on published data
+before the pack was run, and the pack is run once on the committed set.
+
+### What the B7 trials measured
+
+Pryce 2018 (Cochrane CD000363.pub3, PMC6418392) pools 6 trials for ITN vs no nets,
+*P. falciparum* prevalence: RR 0.83 (0.71–0.98), 18,809 participants. Five of the six could
+be identified from the review's Characteristics of included studies table:
+
+| Trial | Setting | Ages in the prevalence survey | Unit randomised | Transmission | Net use |
+|---|---|---|---|---|---|
+| Halbluetzel 1996 | Burkina Faso | 0–59 months (curtains, not nets) | groups of villages | EIR 300–500 | not stated |
+| Moyou-Somo 1995 | Cameroon | 15 and under | household (20:20) | EIR 10–20 | not described |
+| Rowland 1996 | Pakistan | all ages | household (97:95) | low | 66% every night, 82% 3–6 nights a week |
+| Smithuis 2013 | Myanmar | under 10 | village (10:10); 6.8% of the weight | not stated | not stated |
+| Sochantha 2006 | Cambodia | all ages (10,726 people, 34 villages) | village | EIR 6 | 87%; 14% of controls used an ITN |
+
+The sixth trial is not named in the accessible text. Every identified trial measured
+prevalence by microscopy (blood smears), as the engine does. Sochantha 2006 (Trop Med Int
+Health 11:1166) reports the age dependence directly. The all-ages prevalence ratio was 0.91
+(0.65–1.28), and the under-5 OR 0.63 (0.26–1.53), with a significant age interaction
+(p = 0.042). The same nets reduce child prevalence more than all-age prevalence. The pack's
+B7 measures prevalence in 6 months to 14 years. Two of the five identified trials measured
+all ages, and the other three used three different child age bands.
+
+### Candidate mechanisms
+
+| # | Candidate | Published evidence | Expected direction on B7 | Decision |
+|---|---|---|---|---|
+| 1 | **Age band of the prevalence outcome** | Table above; Sochantha's age interaction | up (toward 1): all-age and wider child bands respond less than 6 m–14 y | **implement** |
+| 2 | Microscopy vs RDT | all identified trials used microscopy; so does the engine | none | no change needed |
+| 3 | Control-arm net use | 14% in Sochantha only | up, small | not implemented: one trial, would need a setting per trial |
+| 4 | Household randomisation (the community effect reaches control households) | Moyou-Somo, Rowland | up | not implemented: two small trials; needs nets allocated within one simulated population |
+| 5 | Outdoor and early biting of the Asian trials' vectors (*An. dirus*, *An. minimus*, *An. culicifacies*) | trial settings (Sochantha: forest malaria) | up | not implemented: the D6 prior has no Asian bionomics, and they do not apply to the Nigeria decision. Recorded as a basis mismatch of B7 |
+| 6 | Transmission intensity per trial (EIR 6 to 500) | table above | mixed | not implemented: needs a setting per trial |
+| 7 | Trial nets maintained or re-treated (less attrition than LLIN campaigns) | trial descriptions (e.g. 6-monthly re-treatment in the ITN trials of that era) | down (a stronger effect) | not implemented: no trial-specific retention data. Recorded as a known risk in the opposite direction |
+| 8 | S-shaped net loss curve (Bertozzi-Villa 2021 smooth-compact function) | the main text says the curve is S-shaped; its steepness is in Supplementary Note 1.4, which is not accessible | down at 12 m | not implemented: a parameter would be guessed; the exponential stays flagged |
+
+**Committed (1): B7 is measured in each identified trial's own ages.**
+- **Estimand:** B7 becomes the geometric mean of the RR in each identified trial's age band:
+  - 0–59 months (Halbluetzel);
+  - 15 years and under (Moyou-Somo);
+  - all ages (Rowland, Sochantha: two entries);
+  - under 10 years (Smithuis).
+- **Engine change:** new window metrics for these bands (`pfpr_lt5`, `pfpr_le15`, `pfpr_all`, `pfpr_lt10`), all by microscopy as before.
+- **Weights:** equal. The Cochrane weights are not in the accessible text (only Smithuis's 6.8% is), so equal weighting is an unverified assumption, stated in the pack.
+- **Old estimand kept as a diagnostic:** the run also reports the old 6 m–14 y RR, which is not used for the status.
+
+**B8:** unchanged (under-5 clinical incidence, 0–24 months).
+- The incidence trials' ages are not all identifiable. Those that are: Henry 2005 (Côte d'Ivoire, kdr frequency about 90%) and Sochantha 2006 (an all-ages consultation rate, adjusted rate ratio 0.72).
+- No mechanism is committed for B8, and its marginal pass stays marginal.
+
+**B16c: no mechanism committed; expected to stay at 4 of 5 rules.**
+- Beier 1999's full text was not accessible (HTTP 403), so the age group of its prevalence surveys and its EIR methods cannot be checked.
+- One candidate was considered and set aside: reporting an adult's EIR, as a human landing catch would, instead of the population mean, which is about 0.8 times an adult's.
+  - It moves every point to higher EIR, so it cannot satisfy the rule that fails.
+  - Beier pooled landing and spray-catch EIRs, so the adult basis is not established.
+
+**Muleba grid edge (fit rule).**
+- **Grid:** Muleba's calibration grid extends to 256.
+- **Runner flag:** the runner flags a calibrated value within 5% (in log terms) of either outer grid bound as `near_grid_edge`. Until now it was flagged only when the target lay outside the grid.
+
+**Expected outcome:**
+- B7 rises. No magnitude is predicted, and it may stay out of band.
+- No other benchmark's estimand changes.
+- Muleba's interpolated m0 should not move: the added grid point lies above the bracketing interval.
+- The joint fit is re-run because the engine code changed.
+
 ## v0.3: review corrections and field use of nets
 
 **Corrections from review (Codex round 1).** These change the v0.2 numbers, and v0.2's
