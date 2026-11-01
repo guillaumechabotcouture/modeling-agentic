@@ -41,6 +41,9 @@ Pack schema:
         requires: {<id>: [lo, hi]}      # optional: assessable only if each is inside [lo, hi]
         estimand:
           {type: ratio | odds_ratio, num: arm | [arms], den: arm | [arms], value: <path>}
+          {type: ratio | odds_ratio, num, den, values: [{path, weight, label}], diagnostic_values: [paths]}
+                                        # several outcome definitions: weighted geometric mean of the
+                                        # per-definition ratios; diagnostics are reported, not judged
           {type: interaction_or, a11, a10, a01, a00, value: <path>}
           {type: cost_per_outcome, num, den, value: <path>, costs: {<driver>: <unit cost>}, costs_num: {<driver>: <incremental price>}}
           {type: curve_rules, arms: [...], x: <path>, y: <path>, rules: [{x_min, y_min} | {x_max, y_max}]}
@@ -130,6 +133,16 @@ def validate(pack: dict, engine) -> list[str]:
         for a in _arms_of(e):
             if a not in arms:
                 bad.append(f"{b.get('id')}: unknown arm {a}")
+        if "values" in e:
+            vs = e.get("values")
+            if "value" in e:
+                bad.append(f"{b.get('id')}: estimand has both value and values")
+            if e["type"] not in ("ratio", "odds_ratio"):
+                bad.append(f"{b.get('id')}: values (several value paths) is only for ratio and odds_ratio")
+            if not (isinstance(vs, list) and vs and all(isinstance(v, dict) and v.get("path")
+                                                         and isinstance(v.get("weight"), (int, float)) and v["weight"] > 0
+                                                         for v in vs)):
+                bad.append(f"{b.get('id')}: values must be a non-empty list of {{path, weight > 0}}")
         if e["type"] != "curve_rules":
             band = b.get("band")
             if not (isinstance(band, list) and len(band) == 2 and band[0] <= b.get("target", float("nan")) <= band[1]):
@@ -165,6 +178,14 @@ def validate(pack: dict, engine) -> list[str]:
         if not fj.get("targets"):
             bad.append("fit_joint: no targets")
     return bad
+
+
+def grid_edge(value: float, grid, tol: float = 0.05) -> bool:
+    """A calibrated value within `tol` (in log terms) of an outer grid bound, or beyond it: the grid
+    may be cutting the calibration off, so it must be extended (fit rule)."""
+    lo, hi = math.log(min(grid)), math.log(max(grid))
+    v = math.log(max(float(value), 1e-300))
+    return bool(v - lo < tol or hi - v < tol)
 
 
 def _arms_of(e: dict) -> list:
@@ -263,7 +284,11 @@ class Runner:
             val = float(np.exp(np.interp(c["target"], ys[order], xs[order])))
             self.calibrated[n] = {"attribute": c["attribute"], "value": val, "grid": c["grid"],
                                   "baseline_values": [round(float(y), 4) for y in ys], "target": c["target"],
-                                  "at_grid_edge": bool(c["target"] < ys.min() or c["target"] > ys.max())}
+                                  "at_grid_edge": bool(c["target"] < ys.min() or c["target"] > ys.max()),
+                                  "near_grid_edge": grid_edge(val, c["grid"])}
+            if self.calibrated[n]["near_grid_edge"]:
+                print(f"  WARNING: setting {n}: calibrated {c['attribute']} {val:.4g} is at the edge of its grid "
+                      f"{c['grid']}: extend the grid (fit rule)", flush=True)
 
     def _arm_jobs(self, a, fitted):
         cfg = self.pack["arms"][a]
@@ -309,10 +334,26 @@ class Runner:
             p = min(max(p, 1e-4), 1 - 1e-4)
             return p / (1 - p)
         out = {}
-        if e["type"] == "ratio":
-            per = [pooled(e["num"], i) / pooled(e["den"], i) for i in range(nseed)]
-        elif e["type"] == "odds_ratio":
-            per = [odds(pooled(e["num"], i)) / odds(pooled(e["den"], i)) for i in range(nseed)]
+        if e["type"] in ("ratio", "odds_ratio"):
+            tr = (lambda p: p) if e["type"] == "ratio" else odds   # noqa: E731
+
+            def per_path(path):
+                def pv(arms, i):
+                    return float(np.mean([get(R[a][i], path) for a in (arms if isinstance(arms, list) else [arms])]))
+                return [tr(pv(e["num"], i)) / tr(pv(e["den"], i)) for i in range(nseed)]
+            if e.get("values"):
+                # several outcome definitions (e.g. each trial's age band): per seed, the weighted geometric
+                # mean of each definition's ratio
+                ws = np.asarray([float(v["weight"]) for v in e["values"]])
+                comps = [per_path(v["path"]) for v in e["values"]]
+                per = [float(np.exp(sum(w * np.log(c[i]) for w, c in zip(ws, comps)) / ws.sum())) for i in range(nseed)]
+                out["components"] = {v.get("label") or v["path"]: round(float(np.exp(np.mean(np.log(c)))), 4)
+                                     for v, c in zip(e["values"], comps)}
+            else:
+                per = per_path(e.get("value") or "")
+            if e.get("diagnostic_values"):
+                out["diagnostics"] = {pth: round(float(np.exp(np.mean(np.log(per_path(pth))))), 4)
+                                      for pth in e["diagnostic_values"]}
         elif e["type"] == "interaction_or":
             per = []
             for i in range(nseed):
@@ -818,6 +859,36 @@ def _self_test() -> int:
     ok(res4["R1"]["status"] == "band_mis_based" and res4["R1"]["mis_based_reason"] == "unreachable_in_fitted_range"
        and res4["R2"]["status"] == "out_of_band" and abs(res4["R2"]["reach_in_fitted_range"][0] - 20 / 0.7) < 1e-3,
        "BP25 a cost band no fitted-range value can reach is band_mis_based; a reachable one stays out_of_band with its reach")
+    # ---- v0.4 (malaria B7): a ratio measured in several outcome definitions (e.g. each trial's age band)
+    multi = {"type": "ratio", "num": "a", "den": "none",
+             "values": [{"path": "per_capita.cases.all", "weight": 1.0, "label": "cases"},
+                        {"path": "windows.w.prev", "weight": 3.0, "label": "prevalence"}],
+             "diagnostic_values": ["windows.w.prev"]}
+    p5 = dict(pack, fit=[], benchmarks=[
+        {"id": "V1", "metric": "pooled", "target": 0.5, "band": [0.1, 0.9], "estimand": multi},
+        dict(pack["benchmarks"][0], id="V2", estimand=dict(pack["benchmarks"][0]["estimand"])),
+        dict(pack["benchmarks"][0], id="V3", estimand=dict(pack["benchmarks"][0]["estimand"], value="windows.w.prev"))])
+    ok(validate(p5, eng) == [], "BP31 a ratio over several weighted value paths validates")
+    res5 = {x["id"]: x for x in run_pack(p5, eng, Runner(p5, eng, 1), {"eff_a": 0.6})["benchmarks"]}
+    want = math.exp((1.0 * math.log(res5["V2"]["computed"]) + 3.0 * math.log(res5["V3"]["computed"])) / 4.0)
+    ok(abs(res5["V1"]["computed"] - want) < 2e-3 and abs(res5["V1"]["components"]["prevalence"] - res5["V3"]["computed"]) < 2e-3
+       and abs(res5["V1"]["diagnostics"]["windows.w.prev"] - res5["V3"]["computed"]) < 2e-3,
+       f"BP32 the pooled ratio is the weighted geometric mean of each definition's ratio ({res5['V1']['computed']} vs {want:.4f}); "
+       "components and diagnostics are reported")
+    for bad_vals, why in (([], "empty"), ([{"path": "windows.w.prev", "weight": 0.0}], "zero weight"),
+                          ([{"path": "windows.w.prev"}], "no weight")):
+        pb = dict(p5, benchmarks=[{"id": "V9", "metric": "m", "target": 0.5, "band": [0.1, 0.9],
+                                   "estimand": dict(multi, values=bad_vals)}])
+        ok(any("values" in s for s in validate(pb, eng)), f"BP33 a multi-value estimand with {why} values is refused")
+    pboth = dict(p5, benchmarks=[{"id": "V8", "metric": "m", "target": 0.5, "band": [0.1, 0.9],
+                                  "estimand": dict(multi, value="windows.w.prev")}])
+    ok(any("both value and values" in s for s in validate(pboth, eng)), "BP34 value and values together are refused")
+    # ---- v0.4: a calibrated value at (not only beyond) an outer grid bound is flagged
+    ok(grid_edge(127.6, [8, 16, 32, 64, 128]) and grid_edge(8.2, [8, 16, 32, 64, 128])
+       and not grid_edge(127.6, [8, 16, 32, 64, 128, 256]) and not grid_edge(40.0, [8, 16, 32, 64, 128]),
+       "BP35 a calibrated value within 5% (log) of an outer grid bound is near the grid edge; an interior one is not")
+    ok(res["settings_calibrated"]["c"]["near_grid_edge"] is False and "near_grid_edge" in res["settings_calibrated"]["c"],
+       "BP36 every calibrated setting reports near_grid_edge")
     # provenance (workstream B, Codex P1-13 / r2 P1-6)
     import tempfile
     with tempfile.TemporaryDirectory() as d:

@@ -25,7 +25,9 @@ Unit attributes (UnitSpec.attributes):
   resistance may be one value or {species: value, default: value}
 Package components: net none|pyr|pbo|dual; smc 0|1; irs 0|1; cm 0|1 (enhanced CM).
 Outcomes: per-person totals over the decision window by age group (u5, 5_14, 15p) for
-cases, severe, deaths, treated and DALYs; named-window metrics; cost drivers per person.
+cases, severe, deaths, treated and DALYs; named-window metrics (microscopy prevalence in
+model.PFPR_BANDS: pfpr_u5, pfpr_6m14y, pfpr_2_10 and, from v0.4, pfpr_lt5, pfpr_lt10,
+pfpr_le15, pfpr_all); cost drivers per person.
 """
 from __future__ import annotations
 
@@ -52,7 +54,7 @@ RESULTS = os.path.join(HERE, "benchmarks", "results.yaml")
 AGES = ["u5", "5_14", "15p"]
 GRIFFIN = "Griffin et al. 2010 PLoS Med 10.1371/journal.pmed.1000324; 2014 Nat Commun; 2015 Lancet Infect Dis"
 A8 = "E7 attempt 8 value (models/malaria_abm.py VC), kept"
-VERSION = "0.3"
+VERSION = "0.4"
 BV = "Bertozzi-Villa et al. 2021 Nat Commun 10.1038/s41467-021-23707-7 (PMC8196080)"
 
 # name, value, kind, units, lo, hi, source, verified
@@ -161,7 +163,9 @@ class MalariaEngine:
                 "biting heterogeneity correlated with net non-use",
                 "ITN x IRS redundancy from shared indoor target, diversion and correlated coverage (no interaction factor)",
                 "SMC (28-day protection, clearance); case management (effective treatment)",
-                "expected severe episodes and deaths; DALYs from GBD 2019 weights and reference life table"],
+                "expected severe episodes and deaths; DALYs from GBD 2019 weights and reference life table",
+                "microscopy prevalence by age band, including the ITN trials' own bands (under 5 from birth, under 10, "
+                "15 and under, all ages; Pryce 2018 characteristics of included studies)"],
             components={"net": ["none", "pyr", "pbo", "dual"], "smc": [0, 1], "irs": [0, 1], "cm": [0, 1]},
             unit_attributes={
                 "m0": "emergence density per person, [0.2, 400]", "season": "12 monthly values, mean 1",
@@ -173,8 +177,8 @@ class MalariaEngine:
                 "itn_use_at": "years after distribution at which itn_use was measured (default 0)",
                 "hist_net": "net type of past campaigns (default pyr)"},
             outputs={"per_capita": ["cases", "severe", "deaths", "treated", "dalys"],
-                     "windows": ["pfpr_u5", "pfpr_6m14y", "pfpr_2_10", "inc_u5", "inc_all", "inc_u5_smc", "eir_annual",
-                                 "net_use", "net_access"],
+                     "windows": list(M.PFPR_BANDS) + ["inc_u5", "inc_all", "inc_u5_smc", "eir_annual",
+                                                      "net_use", "net_access"],
                      "cost_drivers": ["nets_given", "smc_doses", "irs_sprayed", "treated_all"]},
             age_groups=AGES,
             valid_ranges={"m0": [0.2, 400], "resistance": [0.1, 1.0], "cm_ft": [0.0, 0.95], "eir_annual": [0.1, 300]},
@@ -247,12 +251,12 @@ class MalariaEngine:
             sel = (yv >= t_a) & (yv < t_b)
             dur = max(t_b - t_a, 1e-9)
             d = dz.daily
-            wins[name] = {
-                "pfpr_u5": float(d["pfpr_u5"][sel].mean()), "pfpr_6m14y": float(d["pfpr_6m14y"][sel].mean()),
-                "pfpr_2_10": float(d["pfpr_2_10"][sel].mean()), "inc_u5": float(d["inc_u5"][sel].sum()),
+            wins[name] = {k: float(d[k][sel].mean()) for k in M.PFPR_BANDS}
+            wins[name].update({
+                "inc_u5": float(d["inc_u5"][sel].sum()),
                 "inc_all": float(d["inc_all"][sel].sum()), "inc_u5_smc": float(d["inc_u5_smc"][sel].sum()),
                 "eir_annual": float(d["eir"][sel].sum() / dur),
-                "net_use": float(d["net_use"][sel].mean()), "net_access": float(d["net_access"][sel].mean())}
+                "net_use": float(d["net_use"][sel].mean()), "net_access": float(d["net_access"][sel].mean())})
         tot_treated = float(dz.acc["treated"].sum() / max(dz.acc_cost["pdays_all"] / ndays, 1e-9))
         cd = {"nets_given": float(dz.acc_cost["nets_given"]), "smc_doses": float(dz.acc_cost["smc_doses"]),
               "irs_sprayed": float(dz.acc_cost["irs_sprayed"]), "treated_all": tot_treated}
@@ -370,6 +374,23 @@ def _self_test() -> int:
        f"M18 nightly variation: same mean use; persistent non-use repeats the same people ({o1:.3f}), nightly does not ({o0:.3f})")
     sim.init()
     ok(sim.interventions["irs"].years == [2020], "M13 irs_years restricts IRS to the trial's rounds")
+    # ---- v0.4: prevalence in the B7 trials' own age bands (microscopy, as before)
+    yrs = np.array([0.3, 4.0, 8.0, 12.0, 15.5, 30.0])
+    pb = M.prevalence_bands(np.array([1.0, 0.0, 1.0, 0.0, 1.0, 0.0]), yrs * 365)
+    ok(abs(pb["pfpr_lt5"] - 0.5) < 1e-12 and abs(pb["pfpr_lt10"] - 2 / 3) < 1e-12 and abs(pb["pfpr_le15"] - 0.6) < 1e-12
+       and abs(pb["pfpr_all"] - 0.5) < 1e-12 and abs(pb["pfpr_u5"] - 0.0) < 1e-12 and abs(pb["pfpr_6m14y"] - 1 / 3) < 1e-12,
+       f"M19 age bands: under 5 from birth, under 10, 15 and under (< 16 y), all ages; the old bands unchanged {pb}")
+    hP = Horizon(2016.0, 2021.1, (2020.0, 2021.1), {"m12": [2020.92, 2021.08]})
+    uP = UnitSpec("t", {"m0": 6.0, "season": [1.0] * 12, "resistance": 0.95, "species": {"gambiae": 1.0},
+                        "cm_ft": 0.3, "itn_use": 0.7, "campaign_year": 2020.0})
+    o_none = es.run({"n_agents": 2500}, uP, Package("none", {}), hP, 9)
+    o_net = es.run({"n_agents": 2500}, uP, Package("pyr", {"net": "pyr"}), hP, 9)
+    keys = ("pfpr_lt5", "pfpr_lt10", "pfpr_le15", "pfpr_all")
+    ok(all(k in o_net.windows["m12"] and 0.0 <= o_net.windows["m12"][k] <= 1.0 for k in keys),
+       "M20 the new age-band prevalences are reported in every window")
+    rr = {k: o_net.windows["m12"][k] / max(o_none.windows["m12"][k], 1e-9) for k in ("pfpr_lt5", "pfpr_all")}
+    ok(rr["pfpr_all"] > rr["pfpr_lt5"],
+       f"M21 forward behaviour (Sochantha 2006 age interaction): nets cut all-age prevalence less than under-5 prevalence {rr}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
