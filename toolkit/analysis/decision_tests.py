@@ -116,7 +116,21 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
         varied = (f"engine parameter {p} set to each end of its declared prior range ({dt.get('source')})"
                   if t == "prior_range" else f"engine parameter {p} set to each tested value")
         cases, lowers = [], []
-        for v in dt["values"]:
+        vals = list(dt["values"])
+        if A.model.kind == "emulator":
+            # an emulator answer outside its design box is an extrapolation (and the plan guard would block the whole
+            # analysis): such a value is refused, with the box; toolkit/analysis/batch.py widens the box to span the
+            # spec's own parameter_value test values
+            j = A.model.input_names.index(p)
+            box = [float(A.model.dom_lo[j]), float(A.model.dom_hi[j])]
+            tol = 1e-9 * max(box[1] - box[0], 1.0)
+            rejected = [{"value": v, "design_box": box} for v in vals if not box[0] - tol <= float(v) <= box[1] + tol]
+            vals = [v for v in vals if box[0] - tol <= float(v) <= box[1] + tol]
+            if not vals:
+                return _not_run(A, dt, f"every value of {p} is outside the emulator design box {box} (an emulator "
+                                       "answer there would be an extrapolation); rebuild the batch so the design spans "
+                                       "the test's values", {"rejected_values": rejected})
+        for v in vals:
             theta = dict(A.theta0, **{p: float(v)})
             if A.method == "emulator_inversion":
                 cz = A.calibrate(theta)

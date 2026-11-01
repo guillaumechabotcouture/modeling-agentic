@@ -116,6 +116,7 @@ class EmulatorModel:
         self.input_names = ["z"] + self.param_names + list(self.features)
         fr = {q.name: (q.lo, q.hi) for q in spec.engine().parameters() if q.kind == "fitted"}
         fr.update({k: (p.lo, p.hi) for k, p in want.items()})
+        fr.update({k: tuple(v) for k, v in (design.get("design_ranges") or {}).items() if k in fr})   # test values
         zr = spec["calibration"]["range"]
         npar = len(self.param_names)
         self.dom_lo = np.array([min(zr[0], self.lo[0])] + [min(fr[nm][0], self.lo[1 + j]) for j, nm in
