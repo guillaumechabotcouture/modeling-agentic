@@ -596,6 +596,12 @@ class CompartmentalEngine:
             comp[k] = float(v)
         reach = {c: _num(a.get(f"reach:{c}", cfg.get("reach", 1.0)), f"reach:{c}")
                  for c, cfg in self.components.items()}
+        shares = {**{f"reach:{c}": v for c, v in reach.items()},
+                  **{f"efficacy:{c}": float(P[f"efficacy:{c}"]) for c in self.components},
+                  **{f"seroconversion:{d}": float(P[f"seroconversion:{d}"]) for d in self.doses}}
+        bad = {k: v for k, v in shares.items() if not (math.isfinite(v) and 0.0 <= v <= 1.0)}
+        if bad:
+            raise ValueError(f"unit {unit.id}: shares outside [0, 1]: {bad}")
         ratios = {}
         for o in self.outcomes:
             v = a.get(f"ratio:{o}")

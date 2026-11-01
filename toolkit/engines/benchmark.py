@@ -141,8 +141,13 @@ def _oracles(pack: dict):
     return importlib.import_module(pack["oracles"]) if pack.get("oracles") else None
 
 
+def _config_name(pack: dict, setting: dict):
+    """A setting's configuration name: its own `config`, else the pack's `default_config` (None: unconfigured)."""
+    return setting.get("config") if setting.get("config") is not None else pack.get("default_config")
+
+
 def _config_of(pack: dict, setting: dict):
-    name = setting.get("config")
+    name = _config_name(pack, setting)
     return None if name is None else (pack.get("configs") or {}).get(name)
 
 
@@ -173,11 +178,12 @@ def validate(pack: dict, engine) -> list[str]:
             bad.append(f"config {name}: the engine refuses it ({type(ex).__name__}: {ex})")
     for s, cfg in (pack.get("settings") or {}).items():
         sp = specs
-        if cfg.get("config") is not None:
-            if cfg["config"] not in configs:
-                bad.append(f"setting {s}: unknown config {cfg['config']!r}")
+        cname = _config_name(pack, cfg)
+        if cname is not None:
+            if cname not in configs:
+                bad.append(f"setting {s}: unknown config {cname!r}")
                 continue
-            sp = cfg_specs.get(cfg["config"], {})
+            sp = cfg_specs.get(cname, {})
         fit_s = {k for k, p in sp.items() if p.kind == "fitted"}
         for k in (cfg.get("params") or {}):
             if k not in sp:
@@ -405,8 +411,9 @@ class Runner:
             c = self.calibrated[cfg["setting"]]
             unit[c["attribute"]] = c["value"]
         conf = self._config(cfg["setting"])
-        if self.pack["settings"][cfg["setting"]].get("config") is not None:
-            self.exercised.add(self.pack["settings"][cfg["setting"]]["config"])
+        name = _config_name(self.pack, self.pack["settings"][cfg["setting"]])
+        if name is not None:
+            self.exercised.add(name)
         return [(self.ref, conf, dict(par, **fitted), unit, cfg.get("package") or {}, hor, sd) for sd in self.seeds]
 
     def prefetch(self, arms, fitted_list):
