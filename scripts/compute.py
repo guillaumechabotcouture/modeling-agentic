@@ -2722,11 +2722,139 @@ def _self_test() -> int:
     _self_test_p37(ok)
     _self_test_p42(ok)
     _self_test_p45d(ok)
+    _self_test_sched(ok)
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_sched(ok) -> None:
+    """Scheduler reads (PR #99's race, carried to compute.py; no network). distributed's
+    Client.scheduler_info() returns {} (no "workers" key) whenever the client is not
+    connected: before its first identity reply, while it reconnects, after a failed
+    reconnect. Every read of the worker table here goes through worker_side's bounded
+    reader: an unpopulated identity is waited out, and past the bound the call fails
+    with SchedulerInfoUnavailable. It is never read as "no workers"."""
+    import tempfile
+    from unittest import mock
+
+    class Stop(Exception):
+        pass
+
+    class FakeClient:
+        def __init__(self, infos, status="running", stop_at_run=True):
+            self.infos, self.status, self.ran, self.stop_at_run = list(infos), status, [], stop_at_run
+
+        def __call__(self, *a, **kw):           # distributed.Client(addr, ...) returns this fake
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def scheduler_info(self):
+            return self.infos.pop(0) if len(self.infos) > 1 else self.infos[0]
+
+        def upload_file(self, *a, **kw):
+            pass
+
+        def run(self, fn, *a, workers=None, **kw):
+            self.ran.append(list(workers or []))
+            if self.stop_at_run:
+                raise Stop()
+            return {w: 1 for w in workers or []}
+
+    table = {"tls://10.0.0.5:1": {"resources": {}}, "tls://10.0.0.6:1": {"resources": {}},
+             "tls://10.0.0.9:1": {"resources": {}}}
+    two = ["tls://10.0.0.5:1", "tls://10.0.0.6:1"]
+    wsm = _worker_side()
+    sleeps = []
+    env = {"MA_COMPUTE_SCHEDULER": "tls://sched:8786", "MA_COMPUTE_EXCLUDE_WORKERS": "tls://10.0.0.9:1"}
+    with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, env), \
+            mock.patch.object(time, "sleep", sleeps.append):
+        os.environ.pop("MA_COMPUTE_RESOURCE", None)
+        for sub in ("models", "data"):
+            os.makedirs(os.path.join(d, sub))
+        # SR1 dispatch: two empty identities, then the table; the call goes on to the
+        # table's workers (less the excluded run worker), after a doubling backoff.
+        c = FakeClient([{}, {"id": "s"}, {"workers": table}])
+        with mock.patch("distributed.Client", c):
+            try:
+                _map_dask(d, "models/fn.py::f", [{"x": 1}], 0)
+                ok(False, "SR1 dispatch waits out an unpopulated scheduler identity")
+            except Stop:
+                ok(c.ran == [two] and len(sleeps) == 2 and sleeps[1] == 2 * sleeps[0],
+                   f"SR1 dispatch waits out an unpopulated identity, then uses the table's workers: {c.ran} {sleeps}")
+            except Exception as e:  # noqa: BLE001
+                ok(False, f"SR1 dispatch waits out an unpopulated scheduler identity: {type(e).__name__}: {e}")
+        # SR2 an identity that never populates fails the call, naming why; nothing is dispatched.
+        sleeps.clear()
+        c = FakeClient([{}], status="connecting")
+        with mock.patch("distributed.Client", c):
+            try:
+                _map_dask(d, "models/fn.py::f", [{"x": 1}], 0)
+                ok(False, "SR2 an identity that never populates fails the call")
+            except wsm.SchedulerInfoUnavailable as e:
+                ok(not c.ran and len(sleeps) == SCHED_ATTEMPTS - 1 and "no worker table" in str(e),
+                   f"SR2 an identity that never populates fails the call after the bound, naming why: {e} {sleeps}")
+            except Exception as e:  # noqa: BLE001
+                ok(False, f"SR2 an unpopulated identity raises SchedulerInfoUnavailable, not {type(e).__name__}: {e}")
+        # SR3 an empty table read from a connected scheduler is a real "no workers": refused as before.
+        c = FakeClient([{"workers": {}}])
+        with mock.patch("distributed.Client", c):
+            try:
+                _map_dask(d, "models/fn.py::f", [{"x": 1}], 0)
+                ok(False, "SR3 a connected scheduler with no compute worker is refused")
+            except RuntimeError as e:
+                ok("no compute workers" in str(e) and not isinstance(e, wsm.SchedulerInfoUnavailable),
+                   f"SR3 a connected scheduler with no compute worker is refused as before: {e}")
+        # SR4 the remote cancel (settle and orphan paths) reads the table the same way.
+        sleeps.clear()
+        c = FakeClient([{}, {"workers": table}], stop_at_run=False)
+        try:
+            got = _cancel_remote(c, "call1", {"tls://10.0.0.9:1"})
+        except Exception as e:  # noqa: BLE001
+            got = f"{type(e).__name__}: {e}"
+        ok(c.ran == [two] and got == {w: 1 for w in two} and len(sleeps) == 1,
+           f"SR4 the remote cancel waits out an unpopulated identity, then reaches every worker: {c.ran} {got}")
+        c = FakeClient([{}], stop_at_run=False)
+        try:
+            _cancel_remote(c, "call1", set())
+            ok(False, "SR4b a cancel with no worker table raises instead of reaching no worker")
+        except wsm.SchedulerInfoUnavailable:
+            ok(not c.ran, "SR4b a cancel with no worker table raises instead of reaching no worker")
+        except Exception as e:  # noqa: BLE001
+            ok(False, f"SR4b a cancel with no worker table raises SchedulerInfoUnavailable, not {type(e).__name__}")
+        p = {"call_id": "call1"}
+        c = FakeClient([{}], stop_at_run=False)
+        with mock.patch("distributed.Client", c):
+            done, how = _stop_orphans(p, "dask")
+        ok(not done and "SchedulerInfoUnavailable" in how and not c.ran,
+           f"SR5 an orphan's cancel with no worker table is unconfirmed, naming why: {how}")
+        c = FakeClient([{}, {"workers": table}], stop_at_run=False)
+        with mock.patch("distributed.Client", c):
+            done, how = _stop_orphans(p, "dask")
+        ok(done and c.ran == [two], f"SR5b an orphan's cancel recovers once the table appears: {how} {c.ran}")
+        # SR6 the vanished-worker check: an unpopulated identity is not "every worker
+        # vanished"; past the bound it raises (the caller then charges every worker as busy).
+        try:
+            gone = _gone_workers(FakeClient([{}, {"workers": {"tls://10.0.0.5:1": {}}}]), two)
+        except Exception as e:  # noqa: BLE001
+            gone = f"{type(e).__name__}"
+        ok(gone == ["tls://10.0.0.6:1"], f"SR6 the vanished-worker check waits out an unpopulated identity: {gone}")
+        try:
+            _gone_workers(FakeClient([{}]), two)
+            ok(False, "SR6b a vanished-worker check with no table raises")
+        except wsm.SchedulerInfoUnavailable:
+            ok(True, "SR6b a vanished-worker check with no table raises")
+        except Exception as e:  # noqa: BLE001
+            ok(False, f"SR6b a vanished-worker check with no table raises SchedulerInfoUnavailable, not {type(e).__name__}")
+    ok(_worker_side() is wsm and os.path.samefile(wsm.__file__, os.path.join(REPO, "cloud", "worker_side.py")),
+       "SR7 the reader is the repo's cloud/worker_side.py, loaded once by path (a models/worker_side.py cannot shadow it)")
 
 
 def _self_test_p45d(ok) -> None:

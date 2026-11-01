@@ -895,6 +895,60 @@ def _self_test() -> int:
         ok(c2["flat"].get("n_blockers") == 1 and c2["flat"].get("n_high") == 1 and c2["flat"].get("schema_ok") == 1.0,
            f"K4 critic output scored: {c2['flat']}")
 
+    # SQ1-SQ4 (PR #99's race in the Coiled launcher; no network): scheduler_info() is {}
+    # while the client is not connected. An attached pool is sized from the real worker
+    # table, never from an unpopulated identity read as zero workers (which would scale
+    # a larger attached pool down to the batch's size).
+    import types
+    from unittest import mock
+    import replay_coiled as rq
+
+    class _SQClient:
+        def __init__(self, infos, status="running"):
+            self.infos, self.status, self.waited = list(infos), status, []
+        def scheduler_info(self):
+            return self.infos.pop(0) if len(self.infos) > 1 else self.infos[0]
+        def wait_for_workers(self, n, timeout=None):
+            self.waited.append(n)
+
+    def _sq_cluster(clients):
+        it = iter(clients)
+        cl = types.SimpleNamespace(scaled=[], get_client=lambda: next(it, clients[-1]))
+        cl.scale = cl.scaled.append
+        return cl
+
+    five = {f"tls://10.0.0.{i}:1": {} for i in range(5)}
+    with mock.patch.object(time, "sleep", lambda s: None):
+        c = _SQClient([{}, {"workers": five}])
+        cl = _sq_cluster([c])
+        try:
+            got = rq.size_pool(cl, c, 3, log=lambda m: None)
+        except Exception as e:  # noqa: BLE001
+            got = f"{type(e).__name__}: {e}"
+        ok(got is c and cl.scaled == [] and c.waited == [3],
+           f"SQ1 an attached pool of 5 is not scaled to 3 because of an unpopulated identity: {got} {cl.scaled}")
+        c = _SQClient([{"workers": {"tls://a:1": {}}}])
+        cl = _sq_cluster([c])
+        ok(rq.size_pool(cl, c, 3, log=lambda m: None) is c and cl.scaled == [3], f"SQ2 a smaller pool is grown: {cl.scaled}")
+        closed, fresh = _SQClient([{}], status="closed"), _SQClient([{"workers": five}])
+        cl = _sq_cluster([fresh])
+        ok(rq.size_pool(cl, closed, 3, log=lambda m: None) is fresh and fresh.waited == [3] and cl.scaled == [],
+           "SQ3 a closed client is replaced from the cluster")
+        c = _SQClient([{}])
+        cl = _sq_cluster([c])
+        try:
+            rq.size_pool(cl, c, 3, log=lambda m: None)
+            ok(False, "SQ4 a worker table that never appears stops the launch")
+        except Exception as e:  # noqa: BLE001
+            ok(type(e).__name__ == "SchedulerInfoUnavailable" and cl.scaled == [] and not c.waited,
+               f"SQ4 a worker table that never appears stops the launch before any scaling: {type(e).__name__}: {e}")
+        c = _SQClient([{}, {"workers": five}])
+        try:
+            got = rq.case_workers(_sq_cluster([c]), c, 5, 2, log=lambda m: None)
+        except Exception as e:  # noqa: BLE001
+            got = f"{type(e).__name__}: {e}"
+        ok(got == sorted(five)[:2], f"SQ5 case workers are read once the table is populated: {got}")
+
     if failures:
         print("SELF-TEST FAILURES:", *failures, sep="\n  - "); return 1
     print("OK: all self-test cases passed.")
