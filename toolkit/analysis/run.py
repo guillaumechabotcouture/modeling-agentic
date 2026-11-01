@@ -122,7 +122,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     arts["engine"] = S.write("engine", {"card": card.to_dict(), "parameters": [vars(p) for p in eng.parameters()]},
                              PRODUCER, [spec_path] + eng_files)
     data_in = [spec.resolve(spec["decision_units"]["csv"])]
-    if spec["calibration"].get("method") == "likelihood":
+    if spec["calibration"].get("method") in ("likelihood", "posterior"):
         data_in.append(spec.resolve(spec["calibration"]["targets"]["csv"]))
     # ---- outcome model
     if spec["analysis"]["evaluation"] == "emulator":
@@ -175,6 +175,10 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
         cal = C.inversion_report(spec, model, A.theta0, cal0)
     elif A.method == "likelihood":
         cal = {k: A.lik[k] for k in ("method", "diagnostics", "identifiability", "theta", "names", "cov")}
+        cal["units"] = {i: {"z": z0[i]} for i in A.ids}
+    elif A.method == "posterior":
+        cal = {k: A.lik[k] for k in ("method", "diagnostics", "identifiability", "theta", "names", "sample", "priors",
+                                     "prior_range_tests", "prior_dominated")}
         cal["units"] = {i: {"z": z0[i]} for i in A.ids}
     else:
         cal = {"method": "none", "units": {}, "diagnostics": {}, "identifiability": {"status": "not_applicable"}}

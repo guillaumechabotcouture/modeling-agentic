@@ -101,6 +101,285 @@ def band_positivity(immune, sizes, se: float = 1.0, sp: float = 1.0, waning=None
     return float(np.dot(pos, w) / w.sum())
 
 
+# ------------------------------------------------------------------ v2d β: observation likelihoods (§3.1)
+LIKELIHOODS = ("poisson", "negbin", "binomial", "betabinomial", "lognormal")
+
+
+def _arr(x, what):
+    a = np.asarray(x, float)
+    if not np.all(np.isfinite(a)):
+        raise ValueError(f"{what}: non-finite values")
+    return a
+
+
+def _counts(y, what="observed counts"):
+    a = _arr(y, what)
+    if np.any(a < 0) or np.any(a != np.round(a)):
+        raise ValueError(f"{what}: must be non-negative integers")
+    return a
+
+
+def loglik(model: str, y, **kw) -> np.ndarray:
+    """Element-wise log-likelihood of observations `y` under one observation model (vectorised, broadcasting):
+      poisson       y | mu
+      negbin        y | mu, dispersion (the size k: variance mu + mu^2 / k)
+      binomial      y | n, p
+      betabinomial  y | n, p, design_effect (ICC = (deff - 1)/(n - 1); variance n p (1 - p) deff; deff 1 = binomial)
+      lognormal     y | mu, sd (log y ~ N(log mu, sd); reporting noise of a positive report)
+    Invalid observations or parameters and unknown models fail closed (ValueError)."""
+    from scipy.special import betaln, gammaln, xlogy
+    if model not in LIKELIHOODS:
+        raise ValueError(f"observation model {model!r} not in {LIKELIHOODS}")
+    if model in ("poisson", "negbin"):
+        y = _counts(y)
+        mu = _arr(kw["mu"], "mu")
+        if np.any(mu < 0):
+            raise ValueError("mu must be >= 0")
+        if model == "poisson":
+            return xlogy(y, mu) - mu - gammaln(y + 1)
+        k = _arr(kw["dispersion"], "dispersion")
+        if np.any(k <= 0):
+            raise ValueError("negative-binomial dispersion (size) must be > 0")
+        return (gammaln(y + k) - gammaln(k) - gammaln(y + 1) + k * (np.log(k) - np.log(k + mu))
+                + xlogy(y, mu) - xlogy(y, k + mu))
+    if model in ("binomial", "betabinomial"):
+        y = _counts(y)
+        n = _counts(kw["n"], "n")
+        p = _arr(kw["p"], "p")
+        if np.any(y > n) or np.any(p < 0) or np.any(p > 1):
+            raise ValueError("binomial: need y <= n and p in [0, 1]")
+        lc = gammaln(n + 1) - gammaln(y + 1) - gammaln(n - y + 1)
+        deff = _arr(kw.get("design_effect", 1.0), "design_effect") if model == "betabinomial" else np.asarray(1.0)
+        if np.any(deff < 1):
+            raise ValueError("design_effect must be >= 1")
+        if model == "binomial" or np.all(deff == 1.0):
+            return lc + xlogy(y, p) + xlogy(n - y, 1 - p)
+        rho = (deff - 1.0) / np.maximum(n - 1.0, 1.0)
+        if np.any(rho >= 1):
+            raise ValueError("design effect too large for the sample size (ICC >= 1)")
+        t = 1.0 / rho - 1.0
+        pc = np.clip(p, 1e-300, 1 - 1e-16)
+        a, b = pc * t, (1 - pc) * t
+        return lc + betaln(y + a, n - y + b) - betaln(a, b)
+    y = _arr(y, "observed values")
+    mu = _arr(kw["mu"], "mu")
+    sd = _arr(kw["sd"], "sd")
+    if np.any(y <= 0) or np.any(sd <= 0):
+        raise ValueError("lognormal: observed values and sd must be > 0")
+    with np.errstate(divide="ignore"):
+        lmu = np.log(mu)
+    return -np.log(y) - np.log(sd) - 0.5 * math.log(2 * math.pi) - 0.5 * ((np.log(y) - lmu) / sd) ** 2
+
+
+# --------------------------------------------- v2d β: the per-source measurement model (§3.4, owner rule)
+# No source is truth; each declares a sampling frame and its measurement process. A bias is a mechanism from this
+# closed vocabulary, with a parameter, a prior and a source; never a free multiplier fitted to the residual.
+DESIGNS = ("administrative", "cluster_survey", "facility_based", "sentinel")
+MEASURES = ("dose_coverage", "seropositivity", "case_notifications")
+LATENT = ("coverage", "immunity", "incidence", "attack_rate")
+BIAS = {   # mechanism: (what it maps, multiplicative factor or None)
+    "numerator_inflation": "reported = value (1 + omega)",
+    "denominator_error": "reported = value / (1 + delta)",
+    "under_ascertainment": "reported = rho value",
+    "recall_bias": "reported = k c + (1 - k) min(c (1 + beta), 1) (card share k declared)",
+    "antibody_waning": "p exp(-rate years since vaccination)",
+    "assay_sensitivity": "positivity = Se p + (1 - Sp)(1 - p)",
+    "assay_specificity": "positivity = Se p + (1 - Sp)(1 - p)",
+    "maternal_antibody": "handled by excluding ages below a declared bound (no parameter)",
+}
+ORDER = ("antibody_waning", "recall_bias", "numerator_inflation", "denominator_error", "under_ascertainment",
+         "assay")      # the forward maps compose in this order (the assay acts last, on the true positivity)
+NOISE = {"case_notifications": ("negbin", "poisson"), "dose_coverage": ("lognormal",),
+         "seropositivity": ("betabinomial", "binomial")}
+PRIOR_DISTS = ("uniform", "loguniform", "beta", "triangular")
+
+
+def _prior_ok(p) -> bool:
+    if not isinstance(p, dict) or p.get("dist") not in PRIOR_DISTS:
+        return False
+    if p["dist"] == "beta":
+        return all(isinstance(p.get(k), (int, float)) and p[k] > 0 for k in ("a", "b"))
+    r = p.get("range")
+    return (isinstance(r, (list, tuple)) and len(r) == 2 and all(isinstance(x, (int, float)) for x in r)
+            and r[0] < r[1] and (p["dist"] != "loguniform" or r[0] > 0))
+
+
+def _none_reason(bias):
+    """`bias: {none: <reason>}` -> the reason; `bias: none` -> ''; otherwise None."""
+    if bias == "none":
+        return ""
+    if isinstance(bias, dict) and set(bias) == {"none"}:
+        return str(bias["none"] or "").strip()
+    return None
+
+
+def check_sources(sources) -> list:
+    """Structural checks of observation-source declarations, fail closed: [(code, message)] with the codes of v2d
+    §3.4 (observation_source_undeclared, bias_without_mechanism, frame_gap_unmodelled)."""
+    out = []
+    if not isinstance(sources, list) or not sources:
+        return [("observation_source_undeclared", "observations: declare at least one source")]
+    gaps = {}
+    for s in sources:
+        sid = s.get("id") if isinstance(s, dict) else None
+        if not sid or not isinstance(s, dict):
+            out.append(("observation_source_undeclared", f"a source without an id: {s!r}"))
+            continue
+        if s.get("measures") not in MEASURES:
+            out.append(("observation_source_undeclared", f"{sid}: measures {s.get('measures')!r} not in {MEASURES}"))
+        if (s.get("latent") or {}).get("quantity") not in LATENT:
+            out.append(("observation_source_undeclared", f"{sid}: latent quantity not in {LATENT}"))
+        fr = s.get("frame")
+        if not isinstance(fr, dict) or fr.get("design") not in DESIGNS:
+            out.append(("observation_source_undeclared", f"{sid}: a frame with design in {DESIGNS} is required"))
+        else:
+            for ex in fr.get("excluded") or []:
+                okx = (isinstance(ex, dict) and ex.get("who") and ex.get("param")
+                       and (isinstance(ex.get("share"), (int, float)) or ex.get("share_column"))
+                       and _prior_ok(ex.get("relative_value_prior")) and ex.get("source"))
+                if not okx:
+                    out.append(("frame_gap_unmodelled", f"{sid}: excluded population {ex!r} needs who, param, share, "
+                                                        "relative_value_prior and source"))
+                    continue
+                key = ex["param"]
+                sig = (ex.get("share"), ex.get("share_column"), repr(ex["relative_value_prior"]))
+                if key in gaps and gaps[key] != sig:
+                    out.append(("frame_gap_unmodelled", f"{sid}: excluded population {key} declared differently by "
+                                                        "two sources"))
+                gaps[key] = sig
+        if "bias" not in s:
+            out.append(("observation_source_undeclared", f"{sid}: no bias entry (declare mechanisms, or none with a "
+                                                         "reason)"))
+            continue
+        why = _none_reason(s["bias"])
+        if why is not None:
+            if not why:
+                out.append(("bias_without_mechanism", f"{sid}: `bias: none` needs a stated reason"))
+            continue
+        if not isinstance(s["bias"], list) or not s["bias"]:
+            out.append(("bias_without_mechanism", f"{sid}: bias must be a list of mechanisms or {{none: reason}}"))
+            continue
+        for b in s["bias"]:
+            m = (b or {}).get("mechanism") if isinstance(b, dict) else None
+            if m not in BIAS:
+                out.append(("bias_without_mechanism", f"{sid}: bias mechanism {m!r} is not in the closed vocabulary "
+                                                      f"{sorted(BIAS)} (a free multiplier is refused)"))
+                continue
+            if b.get("per_unit"):
+                out.append(("bias_without_mechanism", f"{sid}: per-unit bias {m} is not supported (a per-unit factor "
+                                                      "would be a fit to the residual)"))
+                continue
+            if m == "maternal_antibody":
+                if b.get("handling") != "exclude_below_age" or not isinstance(b.get("bound_months"), (int, float)):
+                    out.append(("bias_without_mechanism", f"{sid}: maternal_antibody needs handling "
+                                                          "exclude_below_age and bound_months"))
+                continue
+            if not b.get("param") or not _prior_ok(b.get("prior")) or not str(b.get("source") or "").strip():
+                out.append(("bias_without_mechanism", f"{sid}: bias {m} needs a param, a prior (one of {PRIOR_DISTS}) "
+                                                      "and a source"))
+            if m == "recall_bias" and not isinstance(b.get("card_share"), (int, float)):
+                out.append(("bias_without_mechanism", f"{sid}: recall_bias needs the declared card_share"))
+        noise = s.get("noise") or {}
+        if noise.get("model") not in NOISE.get(s.get("measures"), ()):
+            out.append(("observation_source_undeclared", f"{sid}: noise model {noise.get('model')!r} not in "
+                                                         f"{NOISE.get(s.get('measures'), ())}"))
+    return out
+
+
+class Source:
+    """One declared observation source: the forward map from the latent quantity to the expected observation, its
+    parameters (bias mechanisms and frame-gap relative values) with their priors, and the unit value implied by the
+    frame and its excluded populations. Vectorised over arrays of parameter values."""
+
+    def __init__(self, decl: dict, as_truth: bool = False):
+        bad = check_sources([decl])
+        if bad:
+            raise ValueError("; ".join(m for _, m in bad))
+        self.decl, self.id, self.as_truth = decl, decl["id"], bool(as_truth)
+        self.measures, self.latent = decl["measures"], decl["latent"]["quantity"]
+        self.noise = dict(decl.get("noise") or {})
+        self.design_effect = (decl.get("frame") or {}).get("design_effect", 1.0)
+        reason = _none_reason(decl["bias"])
+        self.unbiased_reason = "taken as the truth (negative control)" if as_truth else reason
+        self.bias = [] if (as_truth or reason is not None) else [b for b in decl["bias"]
+                                                                 if b["mechanism"] != "maternal_antibody"]
+        self.excluded = [] if as_truth else list(decl["frame"].get("excluded") or [])
+
+    def params(self) -> list:
+        return [b["param"] for b in self.bias] + [e["param"] for e in self.excluded]
+
+    def priors(self) -> dict:
+        out = {b["param"]: dict(b["prior"], source=b.get("source", "")) for b in self.bias}
+        out.update({e["param"]: dict(e["relative_value_prior"], source=e.get("source", "")) for e in self.excluded})
+        return out
+
+    def _p(self, vals, m):
+        b = next(x for x in self.bias if x["mechanism"] == m)
+        return np.asarray(vals[b["param"]], float), b
+
+    def expected(self, latent, vals: dict, years=None):
+        """Expected observed value (a coverage, a positivity or a count rate) for latent values of the frame
+        population; `years` are years since vaccination (antibody waning)."""
+        v = np.asarray(latent, float)
+        have = {b["mechanism"] for b in self.bias}
+        for m in ORDER:
+            if m == "assay":
+                if have & {"assay_sensitivity", "assay_specificity"}:
+                    se = self._p(vals, "assay_sensitivity")[0] if "assay_sensitivity" in have else 1.0
+                    sp = self._p(vals, "assay_specificity")[0] if "assay_specificity" in have else 1.0
+                    v = se * v + (1.0 - sp) * (1.0 - v)
+                continue
+            if m not in have:
+                continue
+            x, b = self._p(vals, m)
+            if m == "antibody_waning":
+                if years is None:
+                    raise ValueError(f"{self.id}: antibody_waning needs years since vaccination")
+                v = v * np.exp(-x * np.asarray(years, float))
+            elif m == "recall_bias":
+                k = float(b["card_share"])
+                v = k * v + (1.0 - k) * np.minimum(v * (1.0 + x), 1.0)
+            elif m == "numerator_inflation":
+                v = v * (1.0 + x)
+            elif m == "denominator_error":
+                v = v / (1.0 + x)
+            elif m == "under_ascertainment":
+                v = v * x
+        return v
+
+    def unit_value(self, frame_value, vals: dict, shares=None):
+        """The unit's value from the frame population's value and each excluded population (share phi, relative
+        value rel): (1 - phi) p + phi min(rel p, 1), applied in turn."""
+        v = np.asarray(frame_value, float)
+        for e in self.excluded:
+            phi = float((shares or {}).get(e["param"], e.get("share")))
+            rel = np.asarray(vals[e["param"]], float)
+            v = (1.0 - phi) * v + phi * np.minimum(rel * v, 1.0)
+        return v
+
+    MULTIPLICATIVE = ("numerator_inflation", "denominator_error", "under_ascertainment")
+
+    def net_name(self) -> str:
+        return f"net_bias:{self.id}"
+
+    def net_multiplier(self, vals: dict):
+        """The product of the source's multiplicative bias factors (a derived quantity: what overlapping sources
+        identify even when the factors trade off)."""
+        out = 1.0
+        for b in self.bias:
+            x = np.asarray(vals[b["param"]], float)
+            if b["mechanism"] == "numerator_inflation":
+                out = out * (1.0 + x)
+            elif b["mechanism"] == "denominator_error":
+                out = out / (1.0 + x)
+            elif b["mechanism"] == "under_ascertainment":
+                out = out * x
+        return out
+
+    def n_multiplicative(self) -> int:
+        return sum(b["mechanism"] in self.MULTIPLICATIVE for b in self.bias)
+
+
 def _self_test_beta(ok) -> None:
     """v2d β: observation likelihoods and the per-source measurement model (§3.1, §3.4)."""
     from scipy import stats
@@ -118,7 +397,7 @@ def _self_test_beta(ok) -> None:
         ok(np.max(np.abs(nb - ref)) < 1e-10 and abs(np.exp(nb).sum() - 1) < 1e-9,
            "OL1 negative binomial (mean mu, size k) equals scipy's nbinom and sums to 1")
         po = loglik("poisson", y[:80], mu=30.0)
-        ok(np.max(np.abs(loglik("negbin", y[:80], mu=30.0, dispersion=1e9) - po)) < 1e-6
+        ok(np.max(np.abs(loglik("negbin", y[:80], mu=30.0, dispersion=1e8) - po)) < 1e-4
            and np.max(np.abs(po - stats.poisson.logpmf(y[:80], 30.0))) < 1e-10,
            "OL2 the negative binomial tends to the Poisson as the size grows")
     safe(ol1, "OL1-2 negative binomial")

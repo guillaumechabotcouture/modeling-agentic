@@ -85,10 +85,15 @@ PRIOR_RANGE_PREFIX = "prior_range_"
 def prior_range_tests(A) -> list[dict]:
     """The automatic prior_range tests: every drawn prior is prior-dominated (the calibration does not condition on
     it), so each gets one (v2d note §3.2)."""
-    return [{"id": f"{PRIOR_RANGE_PREFIX}{k}", "type": "prior_range", "parameter": k, "values": [p.lo, p.hi],
-             "automatic": True, "finding": f"decision_test:{PRIOR_RANGE_PREFIX}{k}",
-             "text": f"Does the plan change when {k} is at either end of its declared range?",
-             "source": p.source} for k, p in A.pr.items()]
+    out = [{"id": f"{PRIOR_RANGE_PREFIX}{k}", "type": "prior_range", "parameter": k, "values": [p.lo, p.hi],
+            "automatic": True, "finding": f"decision_test:{PRIOR_RANGE_PREFIX}{k}",
+            "text": f"Does the plan change when {k} is at either end of its declared range?",
+            "source": p.source} for k, p in A.pr.items()]
+    if A.method == "posterior":
+        # v2d §3.2: a calibration parameter the data do not determine (prior-dominated or partly identified) gets the
+        # same automatic test; the calibration is redone with the parameter held at each end of its declared range
+        out += [dict(t, calibrated=True) for t in (A.lik or {}).get("prior_range_tests") or []]
+    return out
 
 
 def _not_run(A, dt, why, extra=None) -> dict:
@@ -122,6 +127,11 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
                 cz = A.calibrate(theta)
                 zs = {i: x[0] for i, x in cz.items()}
                 extra[v] = {"calibration_clamped_units": sum(bool(x[1]) for x in cz.values())}   # Codex r1 P1-3
+            elif A.method == "posterior" and p in (A.lik or {}).get("params", []):
+                from toolkit.analysis import calibration as C
+                fit = C.fit_posterior_panel(A.spec, A.model, fixed_params={p: float(v)}, sample_it=False)
+                theta = dict(A.theta0, **fit["theta"])
+                zs = dict(fit["z"])
             else:
                 zs = z0
             _, ben, cost = A.evaluate(theta, zs)

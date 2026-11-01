@@ -64,13 +64,14 @@ class Analysis:
         """{unit: (z, clamped)} for emulator inversion; the fitted z for likelihood; None for none."""
         if self.method == "emulator_inversion":
             return C.invert(self.spec, self.model, theta, shifts, ids)
-        if self.method == "likelihood":
+        if self.method in ("likelihood", "posterior"):
             return {i: (self.lik["z"].get(i, self.lik["fixed_z"].get(i)), False) for i in (ids or self.ids)}
         return {i: (None, False) for i in (ids or self.ids)}
 
     def fit_calibration(self):
-        if self.method == "likelihood":
-            self.lik = C.fit_likelihood(self.spec, self.model)
+        if self.method in ("likelihood", "posterior"):
+            fit = C.fit_likelihood if self.method == "likelihood" else C.fit_posterior_panel
+            self.lik = fit(self.spec, self.model)
             self.theta0 = dict(self.theta0, **self.lik["theta"])
             missing = [i for i in self.ids if i not in self.lik["z"]]
             if missing:

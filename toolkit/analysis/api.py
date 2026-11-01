@@ -36,7 +36,7 @@ def engine_needs(spec: dict) -> dict:
                 comps[k].append(v)
     cal, an = spec.get("calibration") or {}, spec.get("analysis") or {}
     outs = [(spec.get("objective") or {}).get("outcome")] + list(spec.get("outcomes_reported") or [])
-    if cal.get("method") == "likelihood":
+    if cal.get("method") in ("likelihood", "posterior"):
         outs.append((cal.get("targets") or {}).get("outcome") or (spec.get("objective") or {}).get("outcome"))
     wins = ([cal["metric"]] if cal.get("method") == "emulator_inversion" and cal.get("metric") else []) + \
         [d.get("metric") for d in (an.get("diagnostics") or {}).values()]
@@ -67,7 +67,7 @@ def pipeline_steps(spec_path: str, run_dir: str) -> list[dict]:
         deps.append(os.path.relpath(spec.settings_path, run_dir))
     if spec.engine_auto:
         deps.append(schema.ENGINE_CHOICE)
-    if spec["calibration"].get("method") == "likelihood":
+    if spec["calibration"].get("method") in ("likelihood", "posterior"):
         deps.append(os.path.relpath(spec.resolve(spec["calibration"]["targets"]["csv"]), run_dir))
     # uncertainty_report.yaml and models/claims_ledger.yaml are written too, but S1 reserves them for their
     # registered producers (agents/enforcement.py); the manifest (and the contract checks) track them instead.

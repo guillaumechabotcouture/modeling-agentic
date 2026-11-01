@@ -330,6 +330,71 @@ def _job(args):
             "meta": dict(o.meta, age_shares=pdays)}
 
 
+def _coverage_job(args) -> dict:
+    """One coverage replicate (v2d β): generate, calibrate, score. A calibrator that refuses (fails closed) makes the
+    replicate invalid, with its message recorded; it is never counted as under-coverage."""
+    ref, configs, oracles, gfn, gargs, cfn, cargs, seed, qs, classes, ridge_names, r = args
+    used = set()
+
+    def make_engine(name=None):
+        used.add(name)
+        cfg = configs.get(name) if name is not None else None
+        key = _engine_key(ref, cfg)
+        if key not in _ENGINE:
+            _ENGINE[key] = load_engine(ref, cfg)
+        return _ENGINE[key]
+    gen = getattr(importlib.import_module(oracles), "generate_" + gfn)
+    mod, fn = cfn.split(":")
+    cal = getattr(importlib.import_module(mod), fn)
+    rng = np.random.default_rng([seed, r])
+    data, truth = gen(rng, **gargs)
+    out = {"replicate": r, "hits": {}, "class_ok": {}, "width": {}, "invalid": False, "ridge_ok": False}
+    t0 = time.time()
+    try:
+        post = cal(make_engine, data, **cargs)
+    except (ValueError, RuntimeError, ArithmeticError, np.linalg.LinAlgError) as ex:
+        out.update(invalid=True, error=f"{type(ex).__name__}: {str(ex)[:200]}", _configs=used)
+        return out
+    for q in qs:
+        iv = (post.get("intervals") or {}).get(q)
+        try:
+            lo, hi, tv = float(iv[0]), float(iv[1]), float(truth[q])
+        except (TypeError, ValueError, IndexError, KeyError):
+            out["invalid"] = True
+            continue
+        if not (math.isfinite(lo) and math.isfinite(hi) and math.isfinite(tv) and lo <= hi):
+            out["invalid"] = True
+            continue
+        out["hits"][q] = int(lo <= tv <= hi)
+        out["width"][q] = hi - lo
+    cl = post.get("classes") or {}
+    out["classes"] = {k: cl.get(k) for k in sorted(set(classes) | set(cl))}
+    for p, allowed in classes.items():
+        out["class_ok"][p] = int(cl.get(p) in allowed)
+    out["ridge_ok"] = bool(ridge_names) and any(set(ridge_names) <= set(x.get("params") or [])
+                                                for x in post.get("ridges") or [])
+    d = dict(post.get("diagnostics") or {})
+    out["diagnostics"] = {k: d[k] for k in ("ess", "ess_bulk_min", "rhat_max") if k in d}
+    out["diagnostics"]["seconds"] = round(time.time() - t0, 3)
+    out["_configs"] = used
+    return out
+
+
+def generate_selftest_normal(rng, mu_sd=1.0, n=20):
+    """Self-test generator (importable, so replicates can run in worker processes): y ~ N(mu, 1), mu ~ N(0, mu_sd)."""
+    mu = float(rng.normal(0.0, mu_sd))
+    return {"y": rng.normal(mu, 1.0, n).tolist()}, {"mu": mu}
+
+
+def calibrate_selftest_normal(make_engine, data, mu_sd=1.0):
+    """Self-test calibrator: the exact conjugate posterior's 95% interval."""
+    y = np.asarray(data["y"])
+    prec = 1.0 / mu_sd ** 2 + len(y)
+    m, sd = y.sum() / prec, math.sqrt(1.0 / prec)
+    return {"intervals": {"mu": [m - 1.959963984540054 * sd, m + 1.959963984540054 * sd]},
+            "classes": {"mu": "identified"}}
+
+
 def _spread(per) -> dict:
     per = [float(x) for x in per if math.isfinite(float(x))]
     if not per:
@@ -602,41 +667,60 @@ class Runner:
             return {"computed": None, "in_band": False, "status": "not_assessable",
                     "not_assessable_because": f"calibrator {e['calibrator']['fn']} not available "
                                               f"({type(ex).__name__}: {ex})"}
+        del gen, cal
         qs = list(e["quantities"])
         classes = e.get("classes") or {}
+        ridge_names = list(e.get("ridge_names") or [])
         reps, seed = int(e["replicates"]), int(e.get("seed", 0))
-        hits = {q: 0 for q in qs}
-        cls_hits = {p: 0 for p in classes}
-        invalid = 0
-        for r in range(reps):
-            rng = np.random.default_rng([seed, r])
-            data, truth = gen(rng, **(e["generator"].get("args") or {}))
-            post = cal(self.make_engine, data, **(e["calibrator"].get("args") or {}))
-            bad = False
-            for q in qs:
-                iv = (post.get("intervals") or {}).get(q)
-                try:
-                    lo, hi, tv = float(iv[0]), float(iv[1]), float(truth[q])
-                except (TypeError, ValueError, IndexError, KeyError):
-                    bad = True
-                    continue
-                if not (math.isfinite(lo) and math.isfinite(hi) and math.isfinite(tv) and lo <= hi):
-                    bad = True
-                    continue
-                hits[q] += int(lo <= tv <= hi)
-            invalid += int(bad)
-            for p, allowed in classes.items():
-                cls_hits[p] += int((post.get("classes") or {}).get(p) in allowed)
+        job = (self.ref, self.pack.get("configs") or {}, self.pack["oracles"], e["generator"]["fn"],
+               e["generator"].get("args") or {}, e["calibrator"]["fn"], e["calibrator"].get("args") or {}, seed, qs,
+               classes, ridge_names)
+        jobs = [job + (r,) for r in range(reps)]
+        if self.workers > 1 and reps > 1:
+            # v2d β: replicates in parallel; the replicate seeds are fixed, so the result equals the serial one
+            with ProcessPoolExecutor(min(self.workers, reps)) as ex:
+                per = list(ex.map(_coverage_job, jobs, chunksize=1))
+        else:
+            per = [_coverage_job(j) for j in jobs]
+        self.exercised |= {c for p in per for c in p.pop("_configs") if c is not None}
+        import hashlib
+        import json
+        hits = {q: sum(p["hits"].get(q, 0) for p in per) for q in qs}
+        cls_hits = {c: sum(p["class_ok"].get(c, 0) for p in per) for c in classes}
+        invalid = sum(int(p["invalid"]) for p in per)
         cov = {q: hits[q] / reps for q in qs}
         se = {q: math.sqrt(max(cov[q] * (1 - cov[q]), 1e-12) / reps) for q in qs}
-        share = {p: cls_hits[p] / reps for p in classes}
+        share = {c: cls_hits[c] / reps for c in classes}
         lo, hi = e["band"]
         need = float(e.get("class_share_min", 0.9))
+        counts = {}
+        for p in per:
+            for k, v in (p.get("classes") or {}).items():
+                counts.setdefault(k, {}).setdefault(v, 0)
+                counts[k][v] += 1
+        errors = sorted({p["error"] for p in per if p.get("error")})
         out = {"computed": min(cov.values()), "coverage": cov, "coverage_se": se, "class_share": share,
-               "replicates": reps, "band": [lo, hi], "invalid_outputs": invalid}
+               "replicates": reps, "band": [lo, hi], "invalid_outputs": invalid, "class_counts": counts,
+               "per_replicate_sha256": hashlib.sha256(json.dumps(   # timings excluded: the result, not the run
+                   [{k: ({a: b for a, b in v.items() if a != "seconds"} if k == "diagnostics" else v)
+                     for k, v in p.items()} for p in per], sort_keys=True, default=str).encode()).hexdigest()}
+        if errors:
+            out["errors"] = errors[:5]
+        widths = {q: [p["width"][q] for p in per if q in p.get("width", {})] for q in qs}
+        out["interval_width_median"] = {q: float(np.median(w)) if w else None for q, w in widths.items()}
+        diag = [p.get("diagnostics") or {} for p in per]
+        for key in ("ess", "ess_bulk_min", "rhat_max", "seconds"):
+            vals = [d[key] for d in diag if isinstance(d.get(key), (int, float))]
+            if vals:
+                out.setdefault("sampler", {})[key] = {"min": float(min(vals)), "median": float(np.median(vals)),
+                                                      "max": float(max(vals))}
+        ok_ridge = True
+        if ridge_names:
+            out["ridge_share"] = sum(int(p["ridge_ok"]) for p in per) / reps
+            ok_ridge = out["ridge_share"] >= need
         # a calibration that returns no usable interval is a failure, never "under-coverage detected"
         out["in_band"] = (invalid == 0 and all(lo <= c <= hi for c in cov.values())
-                          and all(v >= need for v in share.values()))
+                          and all(v >= need for v in share.values()) and ok_ridge)
         out["status"] = "in_band" if out["in_band"] else "out_of_band"
         return out
 

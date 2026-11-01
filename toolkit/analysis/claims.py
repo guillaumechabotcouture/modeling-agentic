@@ -147,6 +147,16 @@ def results_template(A, point, uq, stab, sens, dts, cal, emu_acc) -> str:
         d = cal["diagnostics"]
         L += [f"Emulator inversion per unit; [CLAIM:calibration.clamped] of {d['units']} units clamped at the range "
               f"{d['range']}; identifiability: {cal['identifiability']['status']}.", ""]
+    elif cal.get("method") == "posterior":
+        d, idf = cal["diagnostics"], cal.get("identifiability") or {}
+        L += [f"Posterior over {d['n_targets']} targets and {d['n_parameters']} parameters (declared priors, "
+              f"{d.get('observation')} observations, sampler {d.get('sampler')}); the plan uses the posterior mode.",
+              "", "| Parameter | Class | Contraction |", "|---|---|---|"]
+        for p in cal.get("names") or []:
+            if not p.startswith("z:"):
+                L.append(f"| {p} | {(idf.get('classes') or {}).get(p)} | "
+                         f"{_fmt((idf.get('contraction') or {}).get(p))} |")
+        L.append("")
     elif cal.get("method") == "likelihood":
         d = cal["diagnostics"]
         L += [f"Poisson quasi-likelihood over {d['n_targets']} targets and {d['n_parameters']} parameters; dispersion "

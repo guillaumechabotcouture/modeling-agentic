@@ -5,7 +5,9 @@ its two sources, so the stored spike batch reproduces):
   engine_parameters  every fitted engine parameter, uniform within its engine-card range
   calibration        emulator_inversion: a per-region common-mode shift of the logit target
                      (sd `calibration.target_uncertainty.region_sd_logit`), then re-inversion;
-                     likelihood: (calibrated parameters, unit attributes) from N(estimate, covariance)
+                     likelihood: (calibrated parameters, unit attributes) from N(estimate, covariance);
+                     posterior: rows of the canonical joint posterior sample (v2d §3.3: each draw records the
+                     sample id, its row and the values applied, re-checked against the sample, fail closed)
   costs              a uniform multiplier per listed cost item
   emulator           one joint draw of the reduction errors of every unit: a common (population-mean) component
                      plus a per-unit one, from the held-out residuals (toolkit/analysis/model.py EmulatorError)
@@ -61,6 +63,13 @@ class Drawer:
                 raise ValueError("uncertainty: the calibration covariance is singular; the calibration source cannot "
                                  "be drawn (see analysis/calibration.yaml identifiability)")
             self.mvn = (np.array([A.lik["x"][n] for n in A.lik["names"]]), np.array(A.lik["cov"]))
+        self.seed = int(seed)
+        self.post_draws, self.records = None, []
+
+    def prepare(self, nd):
+        if self.A.method == "posterior" and "calibration" in self.src:
+            from toolkit.analysis import calibration as C
+            self.post_draws = C.draws(C.sample_of(self.A.lik), nd, self.seed)
 
     def draw(self):
         A = self.A
@@ -86,6 +95,16 @@ class Drawer:
                     theta[p] = float(x[p])
                     sampled[p] = theta[p]
                 zs = {i: float(x.get(f"z:{i}", A.lik["fixed_z"].get(i))) for i in A.ids}
+            elif kind == "calibration" and A.method == "posterior":
+                r = self.post_draws[len(self.records)]
+                v = r["values"]
+                for p in A.lik["params"]:
+                    theta[p] = float(v[p]) if p in v else float(A.lik["fixed_params"][p])
+                    sampled[p] = theta[p]
+                zs = {i: float(v[f"z:{i}"]) if f"z:{i}" in v else float(A.lik["fixed_z"][i]) for i in A.ids}
+                applied = {**{p: theta[p] for p in A.lik["params"]}, **{f"z:{i}": zs[i] for i in A.ids}}
+                self.records.append({"sample_id": r["sample_id"], "row": r["row"],
+                                     "values": {n: applied[n] for n in A.lik["sample"]["names"]}})
             elif kind == "costs":
                 mult = {it: float(self.rng.uniform(lo, hi)) for it, (lo, hi) in self.src["costs"]["items"].items()}
                 sampled.update({f"cost:{k}": v for k, v in mult.items()})
@@ -103,6 +122,7 @@ def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
     nd = int(draws if draws is not None else sp.get("draws", 32))
     scope = A.spec.uncertainty_scope()
     D = Drawer(A, seed if seed is not None else sp.get("seed", 42))
+    D.prepare(nd)
     fixed = {o: [] for o in A.outcomes}
     opt_vals, same = [], np.zeros(len(A.ids))
     comps_used, outs, samples = set(), [], {}
@@ -142,6 +162,24 @@ def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
         meta = dict(scope["interval"])
         meta["covers"] = ["calibration_partly_clamped" if k == "calibration" else k for k in meta["covers"]]
         scope = dict(scope, interval=meta, covers=meta["covers"], label=render_claims.interval_label(meta))
+    prov = None
+    if A.method == "posterior" and D.post_draws is not None:
+        # v2d §3.3: re-read the canonical sample; every draw's applied values must equal its row (fail closed)
+        from toolkit.analysis import calibration as C
+        smp = C.sample_of(A.lik)
+        found = C.check_provenance(smp, D.records)
+        prov = {"sample_id": smp["sample_id"], "draws": len(D.records), "rows": [r["row"] for r in D.records],
+                "applied": D.records, "findings": found, "alarms": C.spread_alarm(smp, D.records)}
+        if found:
+            raise ValueError(f"uncertainty: {len(found)} draws are not rows of the canonical posterior sample "
+                             f"(e.g. {found[0]})")
+        pd = list(A.lik.get("prior_dominated") or [])
+        if pd:
+            sys.path.insert(0, os.path.join(ROOT, "scripts"))
+            import render_claims
+            meta = dict(scope["interval"])
+            meta["prior_dominated"] = sorted(set(meta.get("prior_dominated") or []) | set(pd))
+            scope = dict(scope, interval=meta, label=render_claims.interval_label(meta))
     from toolkit.spec import priors as PRI
     plan_ = PRI.plan(A.spec)
     plan_["emulator_error"] = (getattr(A.model, "accuracy", {}) or {}).get("error_model") if "emulator" in D.src else None
@@ -157,7 +195,9 @@ def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
                                     "per_draw": clamped_draws},
             "model_corrections": {"draws_with_corrections": corr_any, "draws_with_corrections_on_plan": 0},
             "headline": {"name": headline_name, "outcome": hl_outcome}, "draw_plan": plan_,
-            "prior_dominated": plan_["prior_dominated"]}
+            "prior_dominated": sorted(set(plan_["prior_dominated"]) | set((A.lik or {}).get("prior_dominated") or []))}
+    if prov is not None:
+        data["draw_provenance"] = prov
     agg = _pu().summarise_outputs(outs, samples, nd, level=scope["level"])   # the signed level (Codex P1-11)
     report = {"producer": PRODUCER, "produced_by": "harness", "n_draws": nd, "n_draws_requested": nd,
               "n_successful": nd - len(agg["errors"]), "n_failed": len(agg["errors"]), "seed": data["seed"],

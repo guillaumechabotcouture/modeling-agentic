@@ -412,15 +412,18 @@ def _loguniform(rng, lo, hi):
 def generate_renewal_series(rng, r0_range=(1.3, 2.5), reporting_range=(0.0333, 0.333), gamma=1 / 7.0,
                             weeks=30, population=1.0e6, seed_share=1.0e-5, dispersion=20.0, s0=1.0,
                             s0_range=None, forcing_amplitude_range=None, forcing_phase=0.0, forcing_period=365.0,
-                            truncate_weeks=None):
+                            truncate_weeks=None, seed_share_range=None):
     """SB1/SB2: weekly reported cases from the reference ODE (single group), negative-binomial reporting
     noise around reporting x true infections. `s0_range` makes the initial susceptible share unknown
     (drawn); `forcing_amplitude_range` adds an unknown (drawn) cosine forcing; `truncate_weeks` ends the
-    series before depletion. Truth: R0, the attack rate and reff_end over the observed window, reporting."""
+    series before depletion; `seed_share_range` makes the seeding unknown (drawn log-uniformly). Truth: R0, the attack
+    rate and reff_end over the observed window, reporting."""
     r0 = float(rng.uniform(*r0_range))
     rho = _loguniform(rng, *reporting_range)
     s = float(rng.uniform(*s0_range)) if s0_range else float(s0)
     amp = float(rng.uniform(*forcing_amplitude_range)) if forcing_amplitude_range else 0.0
+    if seed_share_range:
+        seed_share = _loguniform(rng, *seed_share_range)
     f = (lambda t: 1.0 + amp * math.cos(2 * math.pi * (t - forcing_phase) / forcing_period)) if amp else None
     n_obs = int(truncate_weeks or weeks)
     tt = np.arange(n_obs + 1) * 7.0
@@ -435,7 +438,8 @@ def generate_renewal_series(rng, r0_range=(1.3, 2.5), reporting_range=(0.0333, 0
              "reff_end": r0 * f_end * s_end, "s0": s, "forcing_amplitude": amp}
     data = {"weekly_cases": [int(x) for x in cases], "population": population, "weeks": n_obs,
             "gamma": gamma, "known": {"s0": None if s0_range else s, "forcing": "none" if not forcing_amplitude_range
-                                      else "cosine (amplitude unknown)"}}
+                                      else "cosine (amplitude unknown)",
+                                      "seed": None if seed_share_range else seed_share}}
     return data, truth
 
 
@@ -471,6 +475,7 @@ def generate_cohort_sources(rng, n_cohorts=5, coverage_beta=(8.0, 2.0), omega_pr
                     design_effect=design_effect, out_of_frame_share=out_of_frame_share, n_effective=n_eff)
     truth = {"susceptible_share": float(np.mean(1 - immune_unit)), "omega": omega, "delta": delta,
              "ratio": (1 + omega) / (1 + delta)}
+    data.update(cohort_size=[1.0] * n_cohorts, out_of_frame_share=out_of_frame_share)
     return data, truth
 
 
@@ -494,7 +499,8 @@ def generate_group_attack(rng, q_range=(0.4, 1.0), N=(3.0e5, 2.0e5, 1.0e5),
     hosp = np.asarray(hosp_ratio)
     averted = float(np.sum((z0 - z1) * N * hosp))
     data = {"N": N.tolist(), "contact": C.tolist(), "survey_n": survey_n, "positive": [int(x) for x in obs],
-            "hosp_ratio": list(hosp), "plan_coverage": list(plan_coverage), "efficacy": efficacy}
+            "hosp_ratio": list(hosp), "plan_coverage": list(plan_coverage), "efficacy": efficacy,
+            "seed_unit_share": float(np.dot(seed, N) / N.sum())}
     return data, {"q": q, "hospitalisations_averted": averted}
 
 

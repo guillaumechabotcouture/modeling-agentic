@@ -160,6 +160,25 @@ def _calibration(rel, d) -> list[dict]:
         bad = [q for q, v in (idf.get("parameters") or {}).items() if v.get("status") == "unidentified"]
         if bad:
             out.append(_f("analysis_contract_calibration", f"{rel}: unidentified parameters {bad}", rel))
+    elif m == "posterior":
+        # v2d §3.1-§3.3: the sampler met its floors (it fails closed otherwise), the canonical sample is recorded with
+        # its id, and the point is a converged posterior mode
+        if dg.get("converged") is not True:
+            out.append(_f("analysis_contract_calibration", f"{rel}: the posterior mode did not converge "
+                                                           f"({dg.get('message')})", rel))
+        smp = d.get("sample") or {}
+        if not (smp.get("sample_id") and smp.get("rows") and smp.get("names")):
+            out.append(_f("analysis_contract_uncovered_parameter", f"{rel}: no canonical posterior sample recorded",
+                          rel))
+        else:
+            import numpy as np
+            from toolkit.analysis import calibration as C
+            if C.check_provenance({"sample_id": smp["sample_id"], "names": smp["names"],
+                                   "rows": np.asarray(smp["rows"], float)}, []):
+                out.append(_f("analysis_contract_uncovered_parameter", f"{rel}: the canonical sample does not match "
+                                                                       "its recorded id", rel))
+        if not idf.get("classes"):
+            out.append(_f("analysis_contract_calibration", f"{rel}: no identifiability classes", rel))
     elif m != "none":
         out.append(_f("analysis_contract_calibration", f"{rel}: unknown calibration method {m!r}", rel))
     return out
