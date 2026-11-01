@@ -184,7 +184,7 @@ for f in main.py \
   scripts/sensitivity_analysis.py \
   scripts/source_checks.py scripts/stall_rule.py \
   scripts/spec_compliance.py scripts/structure_metrics.py scripts/validate_critique_yaml.py \
-  scripts/verdict_binding.py \
+  scripts/verdict_binding.py scripts/eval_suite.py scripts/lib/eval_paths.py \
   scripts/uq_ci_quality.py scripts/validate_skill_attachments.py scripts/watch_run.py \
   scripts/within_zone_sensitivity.py scripts/writer_qa.py \
   scripts/lib/expert_priors.py scripts/lib/md_helpers.py \

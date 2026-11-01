@@ -2367,6 +2367,20 @@ def main() -> int:
 
     if args.self_test:
         return _run_self_test()
+    # Phase 50 α: an eval-suite question runs only on a cloud worker (its work directory is
+    # the launch archive: no evals/, no .git), so agents cannot reach answer keys by any
+    # route. Checked on the question the run will actually use, including --resume.
+    here = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, os.path.join(here, "scripts", "lib"))
+    from eval_paths import eval_workspace_problem, question_for
+    resume_dir = None
+    if args.resume:
+        resume_dir = args.resume if os.path.isabs(args.resume) else os.path.join(os.getcwd(), args.resume)
+    eval_question, eval_meta = question_for(args.question, resume_dir)
+    why = eval_workspace_problem(eval_question, here, eval_meta)
+    if why:
+        print(f"REFUSED: {why}", file=sys.stderr)
+        return 1
     if args.preflight_only or not args.skip_preflight:
         pf = asyncio.run(run_preflight(allow_cloud=args.cloud))
         print(f"Preflight: {'OK' if pf['ok'] else 'FAILED'} | models="

@@ -25,6 +25,9 @@ def run_job_impl(label, code, question, flags, anthropic_key, openai_key, max_ro
     env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "OPENAI", "AZ_", "AZURE_"))}
     env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "/usr/bin:/bin")
     env["ANTHROPIC_API_KEY"] = anthropic_key
+    # Phase 50 α: this fresh VM's work dir is the launch archive (no evals/, no .git), the only
+    # place main.py lets an eval-suite question run (scripts/lib/eval_paths.py).
+    env["MA_EVAL_ISOLATED"] = "cloud-worker"
     notes = []
     if openai_key:   # Codex CLI for the cross-model critic
         arch = "x86_64" if os.uname().machine in ("x86_64", "amd64") else "aarch64"

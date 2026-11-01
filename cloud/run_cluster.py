@@ -47,6 +47,8 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import worker_side as ws  # noqa: E402 — uploaded to the VMs under this name
+sys.path.insert(0, os.path.join(os.path.dirname(HERE), "scripts", "lib"))
+import eval_paths  # noqa: E402 — Phase 50 α: what a launch tarball must never hold
 sys.modules.setdefault("run_cluster", sys.modules[__name__])   # configs import RunConfig from here
 
 WORKSPACE = "idm-coiled-idmad-r2"
@@ -245,7 +247,18 @@ def code_tarball(cfg) -> tuple[bytes, str]:
     if missing:
         raise SystemExit(f"code to launch lacks {missing}: refusing")
     blob = subprocess.check_output(["git", "-C", cfg.tree, "archive", "--format=tar.gz", "HEAD"])
+    refuse_hidden(blob, cfg.tree)
     return blob, head[:7]
+
+
+def refuse_hidden(blob: bytes, tree: str) -> None:
+    """Phase 50 α: eval answer keys, generators and rubrics never reach a worker.
+    .gitattributes export-ignores them; a tree whose attributes are missing or wrong
+    (an old branch, a deleted line) is refused here instead of shipped."""
+    hidden = eval_paths.hidden_members(blob)
+    if hidden:
+        raise SystemExit(f"{tree}: the code tarball would ship eval-suite files agents must not see "
+                         f"({len(hidden)}, e.g. {hidden[:3]}); check .gitattributes: refusing")
 
 
 # ---- commands ---------------------------------------------------------------------------
@@ -286,7 +299,8 @@ def launch(cfg):
     for label, w in zip(cfg.labels, workers):
         _submit(cfg, client, label, w, code, question, keys, launch_id)
         assign[label] = {"worker": w, "commit": commit, "submitted": time.strftime("%F %T"), "launch_id": launch_id,
-                         "cluster_id": cluster.cluster_id}
+                         "cluster_id": cluster.cluster_id,
+                         "eval_inputs_sha256": eval_paths.archive_sha256(code)}   # Phase 50 α: the inputs shipped
         print(f"fired {label} -> {w} @ {commit}", flush=True)
     json.dump(assign, open(cfg.state_file, "w"), indent=1)
     clusters = {"run": {"name": cfg.name, "id": cluster.cluster_id}, "launch_id": launch_id,
@@ -741,7 +755,8 @@ def relaunch(cfg, label):
     client.upload_file(os.path.join(HERE, "worker_side.py"))
     _submit(cfg, client, label, assign[label]["worker"], code, open(cfg.question_file).read().strip(), read_keys(),
             launch_id)
-    assign[label].update(commit=commit, submitted=time.strftime("%F %T"), relaunched=True)
+    assign[label].update(commit=commit, submitted=time.strftime("%F %T"), relaunched=True,
+                         eval_inputs_sha256=eval_paths.archive_sha256(code))
     json.dump(assign, open(cfg.state_file, "w"), indent=1)
     print(f"re-fired {label} -> {assign[label]['worker']} @ {commit}")
 
@@ -1183,6 +1198,22 @@ def _self_test() -> int:
     ok(ws.run_stored(tb({"runs/r/models/metadata.json": meta(stored="x")})) is None,
        "RC3 a nested metadata.json does not count")
     ok(ws.run_stored(b"not a tarball") is None, "RC4 an unreadable tarball fails closed")
+    # RC50 (Phase 50 α): a tarball holding eval answer keys, generators or rubrics is refused.
+    refused = []
+    for members in ({"main.py": b"x", "evals/q/_truth/truth.json": b"{}"}, {"evals/q/generate.py": b"x"},
+                    {"docs/design/eval-suite.md": b"x"}):
+        try:
+            refuse_hidden(tb(members), "t")
+        except SystemExit:
+            refused.append(True)
+    ok(len(refused) == 3, f"RC50 a tarball with eval-suite files is refused ({len(refused)}/3)")
+    try:
+        refuse_hidden(tb({"main.py": b"x", "data/evals/q/districts.csv": b"x"}), "t")
+        ok(True, "RC50b the shipped eval inputs (data/evals/) pass")
+    except SystemExit as e:
+        ok(False, f"RC50b the shipped eval inputs (data/evals/) pass: {e}")
+    import inspect
+    ok("refuse_hidden(blob" in inspect.getsource(code_tarball), "RC50c code_tarball checks the blob it returns")
 
     now = time.time()
 
@@ -1284,7 +1315,7 @@ def _self_test() -> int:
     _self_test_42b(ok, RunConfig)
     _self_test_51c(ok)
     for f in sorted(os.listdir(os.path.join(HERE, "configs"))):
-        if f.endswith(".py"):
+        if f.endswith(".py") and not f.startswith("_"):   # _*.py: shared helpers (configs/_eval.py)
             try:
                 c = load_config(os.path.join(HERE, "configs", f))
                 ok(c.storage_prefix.startswith(("runs/", "_checks/")), f"RC16 configs/{f} loads")

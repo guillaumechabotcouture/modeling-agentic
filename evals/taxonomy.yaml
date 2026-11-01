@@ -1,0 +1,150 @@
+# Failure-mode taxonomy (Phase 50 α): every failure code a grader can emit, the harness
+# layer that most likely caused it, and where to look. `scripts/eval_suite.py` attaches
+# the layer to each failure and names the run's primary layer: the most upstream layer
+# among its failures (order below). `refine` rules move a failure to another layer when
+# other checks in the same run tell the causes apart; the first matching rule wins.
+# `missed_by` names the layers that should have caught the failure before the report.
+layers:   # upstream to downstream
+  - id: INFRA
+    where: cloud/ launcher and workers, scripts/compute.py, main.py exit status
+  - id: ORCHESTRATION
+    where: main.py session loop, agents/lead_prompt.py, agents/hooks.py (stage order, rounds, budget)
+  - id: DATA
+    where: data-agent prompt (agents/), data_provenance.md, data/ inputs
+  - id: MODEL
+    where: modeler prompt (agents/modeler.py), mechanism manifest (scripts/mechanism_manifest.py), calibration spec, skills
+  - id: OPTIMIZE
+    where: toolkit/alloc, scripts/optimization_quality.py, scripts/allocation_robustness.py
+  - id: UQ
+    where: scripts/propagate_uncertainty.py, scripts/uq_ci_quality.py, models/uq_declarations.yaml
+  - id: CRITIQUE
+    where: critique-* agents (agents/critique_*.py) and their skills
+  - id: GATE
+    where: scripts/validate_critique_yaml.py and its check modules; scope declarations
+  - id: WRITE
+    where: writer agent, scripts/render_claims.py, report.md, deliverable files
+
+failures:
+  run_record_missing:
+    layer: INFRA
+    meaning: the run directory has no metadata.json (not collected, or the run never started)
+    look_at: [run.log, result.json, cloud/run_cluster.py collect]
+  run_failed:
+    layer: INFRA
+    meaning: main.py ended run_failed, harness_tampered or interrupted
+    look_at: [metadata.json status, run.log, final_gate_stderr.txt]
+  no_report:
+    layer: ORCHESTRATION
+    meaning: no report.md; the pipeline stopped before WRITE
+    look_at: [metadata.json, trace.jsonl, budget_ledger.json]
+  inputs_not_referenced:
+    layer: DATA
+    meaning: the run's records never name some of the question's input files
+    look_at: [data_provenance.md, plan.md]
+  allocation_missing:
+    layer: WRITE
+    meaning: no allocation CSV with the requested columns
+    look_at: [allocation_optimized.csv, models/]
+    missed_by: [GATE]
+  allocation_incomplete:
+    layer: WRITE
+    meaning: the allocation CSV leaves out units or uses package names it cannot map
+    look_at: [allocation_optimized.csv]
+  allocation_discordant:
+    layer: OPTIMIZE
+    meaning: the chosen packages differ from the true optimum (beyond near-ties)
+    look_at: [models/optimization_quality.yaml, toolkit/alloc]
+    refine:
+      - {if_failed: [unit_estimates], layer: MODEL}
+      - {if_failed: [mechanism], layer: MODEL}
+    missed_by: [CRITIQUE]
+  fell_for_trap:
+    layer: MODEL
+    meaning: the allocation is closer to the planted naive optimum than to the truth
+    look_at: [models/mechanism_manifest.yaml, critique_domain.yaml]
+    missed_by: [CRITIQUE, GATE]
+  allocation_infeasible:
+    layer: OPTIMIZE
+    meaning: >-
+      the reported plan cannot be carried out: over budget at true costs, a package not
+      available in that unit, or (dose blocks) negative, partial blocks, over the uptake cap
+      or a total other than the doses available. No allocation credit is given.
+    look_at: [models/optimization_quality.yaml, cost spec, allocation_optimized.csv]
+    missed_by: [GATE]
+  inputs_mismatch:
+    layer: INFRA
+    meaning: the run's launch record shows inputs other than those the answer key was generated from; not graded
+    look_at: [assignments.json eval_inputs_sha256, data/evals/ in the shipped tree]
+  answer_key_unavailable:
+    layer: INFRA
+    meaning: the encrypted hidden half (answer keys, rubrics) could not be fetched, verified or decrypted; not graded
+    look_at: [evals/README.md, evals/private.yaml, $COILED_STORAGE_ACCOUNT and az login, the keychain item]
+  inputs_unrecorded:
+    layer: INFRA
+    meaning: no launch record of the inputs the run received; not graded (use --unverified-inputs for an ad-hoc look)
+    look_at: [assignments.json, cloud/run_cluster.py launch]
+  plan_value_low:
+    layer: OPTIMIZE
+    meaning: the plan achieves too little of the true optimum's benefit
+    refine:
+      - {if_failed: [unit_estimates], layer: MODEL}
+      - {if_failed: [mechanism], layer: MODEL}
+  unit_estimates_off:
+    layer: MODEL
+    meaning: per-unit benefits in the allocation CSV are far from the generating model's
+    look_at: [models/calibration_result.yaml, models/benefit_table.csv]
+  headline_missing:
+    layer: UQ
+    meaning: the uncertainty report has no output for the requested headline
+    look_at: [uncertainty_report.yaml, models/outcome_fn.py]
+  headline_off:
+    layer: MODEL
+    meaning: the headline estimate is outside the tolerance around the truth
+    refine:
+      - {if_passed: [unit_estimates], layer: UQ}
+  interval_misses_truth:
+    layer: UQ
+    meaning: the 95% interval excludes the true value
+    refine:
+      - {if_failed: [headline], layer: MODEL}
+    missed_by: [CRITIQUE]
+  interval_uninformative:
+    layer: UQ
+    meaning: the interval covers the truth but is wider than the rubric allows
+  mechanism_not_reported:
+    layer: MODEL
+    meaning: the planted mechanism is never named in the report, results or scope declaration
+    look_at: [models/mechanism_manifest.yaml, critique_domain.yaml]
+    missed_by: [CRITIQUE]
+  scope_not_declared:
+    layer: CRITIQUE
+    meaning: a quantity the data cannot determine is not declared as such
+    look_at: [scope_declaration.yaml, identifiability.yaml, critique_sufficiency.yaml]
+    missed_by: [GATE]
+  false_precision:
+    layer: UQ
+    meaning: a quantity the data do not determine is reported with a narrow interval or one that misses the truth
+    look_at: [uncertainty_report.yaml, models/uq_declarations.yaml]
+    missed_by: [CRITIQUE, GATE]
+  statement_missing:
+    layer: WRITE
+    meaning: a required statement (decision conclusion, data that would resolve the question) is absent
+    look_at: [report.md, decision_rule.md]
+  gate_outcome_unexpected:
+    layer: GATE
+    meaning: the final gate action is not one the rubric expects for this question
+    look_at: [final_gate.json, validator_history.jsonl]
+  false_confidence_accept:
+    layer: GATE
+    meaning: the gate accepted an answer that scores below the rubric's floor
+    look_at: [final_gate.json, open_problems.json]
+    missed_by: [CRITIQUE]
+  confident_wrong_interval:
+    layer: UQ
+    meaning: a narrow interval that excludes the truth (precision without accuracy)
+    look_at: [uncertainty_report.yaml, sampler settings]
+    missed_by: [CRITIQUE]
+  grader_error:
+    layer: INFRA
+    meaning: the grader could not evaluate a check (unknown type, bad rubric, unreadable artifact)
+    look_at: [the rubric, scores.json detail]

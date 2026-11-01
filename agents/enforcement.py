@@ -246,6 +246,26 @@ _PY_WRITE = re.compile(
     r"""|Path\(\s*(?:f?['"])([^'"]+)['"]\s*\)\s*\.\s*write_(?:text|bytes)"""
 )
 _ENV_REF = re.compile(r"""(?:^|[\s/'"=<(])\.env(?:\.[\w-]+)?(?=$|[\s'";|&)<>])""")
+# Phase 50 α: the eval suite's answer keys, generators and rubrics (evals/, any _truth*
+# path, docs/design/eval-suite.md; scripts/lib/eval_paths.py has the same rule). Cloud
+# workers never receive them (the launch tarball leaves them out); this keeps a local
+# run from reading them directly. A shell reference is matched as a path from the repo
+# root (`evals/...`, `../evals/...`), so `data/evals/` (the shipped inputs) stays readable.
+_EVAL_REF = re.compile(r"""(?:^|[\s'"=<(]|(?:\.\./)+)(?:\./)?evals/|(?:^|[\s/'"=<(])_truth\w*(?=$|[/\s'";|&)<>])"""
+                       r"""|\beval-suite\.md\b""")
+EVAL_DENY_REASON = ("evaluation-suite answer keys, generators and rubrics (evals/, _truth/) are not accessible "
+                    "to agents; a question's input data are in data/evals/<question>/")
+
+
+def is_eval_hidden(path: str, cwd: str | None = None) -> bool:
+    p = _abspath(path, cwd)
+    if any(part.startswith("_truth") for part in p.split(os.sep)):
+        return True
+    rel = os.path.relpath(p, REPO_ROOT)
+    return not rel.startswith("..") and (rel.split(os.sep, 1)[0] == "evals"
+                                         or rel == os.path.join("docs", "design", "eval-suite.md"))
+
+
 # Commands whose path arguments are all written / destroyed.
 _DESTRUCTIVE_ALL_ARGS = {"rm", "rmdir", "truncate", "shred", "chmod", "chown",
                          "touch", "unlink"}
@@ -589,6 +609,8 @@ def bash_reason(command: str, run_path: str, agent_type: str | None,
     if _ENV_REF.search(command):
         return ("credential files (.env) are not accessible to agents; cloud "
                 "credentials are provided in the environment when --cloud is set")
+    if _EVAL_REF.search(command):
+        return EVAL_DENY_REASON
     for target, tcwd in bash_write_targets_cwd(command, cwd):
         if tcwd is not None or os.path.isabs(os.path.expanduser(target.strip("'\""))):
             candidates = [(target, tcwd)]
@@ -650,6 +672,8 @@ def check_tool_use(tool_name: str, tool_input: dict, run_path: str,
             val = str(tool_input.get(key) or "")
             if val and (is_env_file(val, cwd) or ".env" in val):
                 return "credential files (.env) are not accessible to agents"
+            if val and key != "glob" and is_eval_hidden(val, cwd):
+                return EVAL_DENY_REASON
         return None
     if tool_name == "Bash":
         return bash_reason(tool_input.get("command") or "", run_path,
