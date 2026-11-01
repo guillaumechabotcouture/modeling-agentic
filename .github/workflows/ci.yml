@@ -49,10 +49,11 @@ jobs:
           done
           exit $fail
 
-      # HEAD is the PR's merge commit; its first parent is the base branch.
+      # HEAD is the PR's merge commit; its first parent is the base branch. --upstream:
+      # a PR into a long-lived branch (v2) that merges main brings main's checked rows.
       - name: Ledger and plan Status change only through changes/ fragments
         if: github.event_name == 'pull_request'
-        run: .venv/bin/python scripts/assemble_changes.py --check-pr HEAD^1
+        run: .venv/bin/python scripts/assemble_changes.py --check-pr HEAD^1 --upstream origin/main
 
       - name: Skill attachments and expert priors
         run: |

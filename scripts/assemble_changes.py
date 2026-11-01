@@ -367,10 +367,33 @@ def _fragments_at(root: str, ref: str) -> tuple[dict[str, dict], list[str]]:
     return out, errors
 
 
-def check_pr(root: str, base: str) -> list[str]:
+def _upstream_span(root: str, upstream: str | None, mb: str):
+    """(old, new) commits of `upstream` this PR merged in: new = merge-base(upstream, HEAD),
+    old = merge-base(new, mb). None when the PR merged nothing new from it (a PR into
+    `upstream` itself, or a branch that has not merged it since mb)."""
+    if not upstream:
+        return None
+    try:
+        new = _git(root, "merge-base", upstream, "HEAD").strip()
+    except subprocess.CalledProcessError:
+        return None
+    if not new or subprocess.run(["git", "-C", root, "merge-base", "--is-ancestor", new, mb],
+                                 capture_output=True).returncode == 0:
+        return None
+    return _git(root, "merge-base", new, mb).strip(), new
+
+
+def check_pr(root: str, base: str, upstream: str | None = None) -> list[str]:
     """Problems with the change between merge-base(base, HEAD) and the working
-    tree's committed HEAD. Empty list = the PR follows the fragment rule."""
+    tree's committed HEAD. Empty list = the PR follows the fragment rule.
+
+    `upstream` (CI: origin/main): a long-lived branch such as v2 merges main, and
+    with it main's ledger rows and Status lines, which were checked on main. Lines
+    the PR adds or removes exactly as `upstream` did between the merged commits are
+    then not direct edits; any other change still is. A PR into `upstream` merged
+    nothing new from it, so it is checked as before."""
     mb = _git(root, "merge-base", base, "HEAD").strip()
+    span = _upstream_span(root, upstream, mb)
     # -z: paths are NUL-delimited and never quoted (non-ASCII names included).
     toks = _git_z(root, "diff", "--name-status", "--no-renames", "-z", mb, "HEAD")
     pairs = list(zip(toks[0::2], toks[1::2]))
@@ -423,6 +446,13 @@ def check_pr(root: str, base: str) -> list[str]:
             continue
         if expect == got:
             continue
+        if span is not None:
+            up_old, up_new = (region(_show(root, ref, path) or "") for ref in span)
+            added = [ln for ln in got if ln not in expect]
+            removed = [ln for ln in expect if ln not in got]
+            if (all(ln in up_new and ln not in up_old for ln in added)
+                    and all(ln in up_old and ln not in up_new for ln in removed)):
+                continue
         what = "ledger table" if path == CHANGELOG else "Status section"
         if got == region(old):
             problems.append(f"{path}: fragments were deleted without folding them into the {what} "
@@ -709,6 +739,33 @@ def _self_test() -> int:
         ok(any("bad.md" in x and "UTF-8" in x for x in pr), f"CF23 an undecodable fragment is reported invalid ({pr})")
         git("checkout", "-q", "main")
 
+        # CF27-CF29: a long-lived branch (v2) that merges main brings main's ledger and Status
+        # lines with it. Those lines were reviewed on main; with --upstream main they are not
+        # a direct edit. Anything else is, and a PR into main is checked as before.
+        git("checkout", "-q", "-b", "longlived")
+        git("checkout", "-q", "main")
+        put(CHANGELOG, _read(os.path.join(td, CHANGELOG)).replace("Old row. |\n", "Old row. |\n| 49 | ω | Upstream row. |\n"))
+        put(PLAN, _read(os.path.join(td, PLAN)).replace("- a smoke.", "- a smoke.\n- upstream status."))
+        git("commit", "-qam", "a ledger row and a Status line on main")
+        git("checkout", "-q", "longlived")
+        git("checkout", "-q", "-b", "port")
+        git("merge", "-q", "--no-ff", "-m", "merge main into longlived", "main")
+        pr = check_pr(td, "longlived")
+        ok(any("edited directly" in x for x in pr), f"CF27 without --upstream the merged lines read as direct edits ({pr})")
+        pr = check_pr(td, "longlived", upstream="main")
+        ok(pr == [], f"CF28 with --upstream the lines a merge of main brings are not direct edits ({pr})")
+        put(CHANGELOG, _read(os.path.join(td, CHANGELOG)).replace("Upstream row. |\n", "Upstream row. |\n| 99 | z | Sneaked. |\n"))
+        git("commit", "-qam", "plus a direct row")
+        pr = check_pr(td, "longlived", upstream="main")
+        ok(len(pr) == 1 and "edited directly" in pr[0], f"CF29 a direct row next to the merged ones still fails ({pr})")
+        git("checkout", "-q", "main")
+        git("checkout", "-q", "-b", "plain-into-main")
+        put(CHANGELOG, _read(os.path.join(td, CHANGELOG)).replace("Upstream row. |\n", "Upstream row. |\n| 98 | y | Direct. |\n"))
+        git("commit", "-qam", "direct edit into main")
+        pr = check_pr(td, "main", upstream="main")
+        ok(len(pr) == 1 and "edited directly" in pr[0], f"CF29b --upstream changes nothing for a PR into main ({pr})")
+        git("checkout", "-q", "main")
+
     for sep, label in (("\\n", "newline"), ("\\u2028", "line separator"), ("\\r", "carriage return")):
         try:
             parse_fragment(f'---\nphase: "51{sep}| 99 | z"\ncommit: "α"\n---\n## Changelog\nx\n', "n")
@@ -732,6 +789,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--write", action="store_true", help="fold the fragments and delete them")
     ap.add_argument("--check-pr", metavar="BASE", help="check HEAD against BASE (CI on pull requests)")
+    ap.add_argument("--upstream", metavar="REF", help="with --check-pr: lines a merge of REF brought "
+                    "(e.g. origin/main into v2) are not direct edits")
     ap.add_argument("--root", default=ROOT)
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--name", metavar="BRANCH", help="print the fragment path for a branch name")
@@ -743,7 +802,7 @@ def main(argv=None) -> int:
         return 0
     try:
         if a.check_pr:
-            problems = check_pr(a.root, a.check_pr)
+            problems = check_pr(a.root, a.check_pr, upstream=a.upstream)
             for p in problems:
                 print(f"::error::{p}" if os.environ.get("GITHUB_ACTIONS") else f"ERROR: {p}")
             if not problems:
