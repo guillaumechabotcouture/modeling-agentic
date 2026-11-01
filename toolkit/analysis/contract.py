@@ -13,7 +13,8 @@ harness wrote, for the spec that was signed:
   analysis_contract_unsigned   the spec the artifacts were computed for was not signed
   analysis_contract_decision_test  a decision-test result file fails the Phase 49 loader, or is not harness-produced
   analysis_contract_claims     a ledger claim is not harness-produced or cites a file the manifest does not list
-  analysis_contract_figure     a figure's sources changed after it was drawn
+  analysis_contract_figure     a figure's sources changed after it was drawn, or are recorded outside the run dir
+                               (sources are recorded relative to the run dir, so a moved run dir still checks)
 All HIGH, none scope-declarable; each fails closed (an unreadable file is a finding).
 """
 from __future__ import annotations
@@ -29,6 +30,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 from toolkit.analysis.artifacts import (ENVELOPE, EXPECTED_KINDS, EXPECTED_ROLES, KINDS, MANIFEST,  # noqa: E402
                                         PRODUCED_BY, PRODUCER_PREFIX, sha256)
+from toolkit.analysis.figures import resolve_source  # noqa: E402
 
 SPEC = "decision_spec.yaml"
 ENGINE_CHOICE = "engine_choice.json"     # toolkit/spec/schema.py ENGINE_CHOICE
@@ -278,10 +280,18 @@ def _figures(run_dir, man) -> list[dict]:
         except (OSError, ValueError):
             out.append(_f("analysis_contract_figure", f"{rel}: provenance sidecar missing or unreadable", rel))
             continue
-        for src, h in (sc.get("source_hashes") or {}).items():
-            if sha256(src) != h:
-                out.append(_f("analysis_contract_figure", f"{rel}: source {os.path.relpath(src, run_dir)} changed after "
-                                                          "the figure was drawn", rel))
+        srcs = sc.get("source_hashes") if isinstance(sc, dict) else None
+        if not isinstance(srcs, dict):
+            out.append(_f("analysis_contract_figure", f"{rel}: provenance sidecar records no source mapping", rel))
+            continue
+        for src, h in srcs.items():
+            # recorded relative to the run dir (toolkit/analysis/figures.py); outside the run dir fails closed
+            p, why = resolve_source(run_dir, src)
+            if p is None:
+                out.append(_f("analysis_contract_figure", f"{rel}: {why}", rel))
+            elif sha256(p) != h:
+                out.append(_f("analysis_contract_figure", f"{rel}: source {os.path.relpath(p, os.path.realpath(run_dir))}"
+                                                          " changed after the figure was drawn", rel))
     return out
 
 

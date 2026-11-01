@@ -276,7 +276,20 @@ def check_staleness(png_path: str) -> dict:
         sidecar = json.load(f)
     stale = []
     missing = []
+    # v2 harness sidecars record paths relative to the run dir
+    # (`paths_relative_to: run_dir`, png_path relative too): resolve them
+    # against the run dir this PNG sits in, so a moved run stays checkable.
+    base = None
+    rel_png = sidecar.get("png_path")
+    if (sidecar.get("paths_relative_to") == "run_dir" and isinstance(rel_png, str)
+            and not os.path.isabs(rel_png)):
+        ap = os.path.abspath(png_path)
+        tail = os.sep + os.path.normpath(rel_png)
+        if ap.endswith(tail):
+            base = ap[: -len(tail)]
     for path, recorded_hash in (sidecar.get("source_hashes") or {}).items():
+        if base is not None and not os.path.isabs(path):
+            path = os.path.join(base, path)
         if not os.path.exists(path):
             missing.append(path)
             continue
