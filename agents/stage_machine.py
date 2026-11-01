@@ -99,6 +99,9 @@ class RunState:
     paused: str | None = None
     tries: dict = field(default_factory=dict)
     task_cap_usd: float = TASK_CAP_USD
+    # v2's own gate rules on top of today's (structured done_when as schema, open MEDIUMs fixed or
+    # declared, never accepted). False only to replay stored v1 gates (scripts/golden_traces.py).
+    v2_rules: bool = True
     # Every paid task: key -> {task, status started|completed, allowance_usd, usd, session_id,
     # started, completed, ok, output, note}. Written before and after each call, so a resumed run
     # never repeats a completed task or loses its charge, and charges an interrupted one its allowance.
@@ -315,7 +318,8 @@ def apply_owner_rule(run_dir: str, round_n: int, viols: list[dict], rule="auto")
 
 
 def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra: list[dict],
-            history: bool = True, critics=CRITICS, spec_violations=None, registry_violations=None) -> dict:
+            history: bool = True, critics=CRITICS, spec_violations=None, registry_violations=None,
+            strict_done_when: bool = False, append_history: bool | None = None) -> dict:
     """Today's rule functions, in today's order, on the v2 findings: the critic YAMLs, the
     harness's checks (`extra`), and optionally spec-compliance and registry findings."""
     import done_when
@@ -340,6 +344,19 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
             critiques[reviewer] = V.validate_critique(path, reviewer, round_n)
         except V.SchemaError as e:
             schema_errors.append(str(e))
+    if strict_done_when:
+        # v2blind1: critics wrote done_when as prose, done_when.py counted every test as missing,
+        # and the open MEDIUMs were accepted. A HIGH or MEDIUM blocker's test is part of the schema
+        # here: one that does not parse is repaired like any schema error (the T37 path).
+        import done_when as DW
+        for reviewer, doc in critiques.items():
+            for b in doc.get("blockers") or []:
+                if b.get("resolved") or str(b.get("severity")) not in ("HIGH", "MEDIUM"):
+                    continue
+                probs = DW.problems(b["done_when"]) if b.get("done_when") is not None else ["missing"]
+                if probs:
+                    schema_errors.append(f"{V.FILENAMES[reviewer]}: blocker {b.get('id')} done_when: "
+                                         f"{'; '.join(probs)[:300]}")
     for reviewer in V.OPTIONAL_REVIEWERS:
         doc, vs = V._load_optional_critique(run_dir, reviewer, round_n)
         if doc is not None:
@@ -365,9 +382,371 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
     if registry_violations is not None:
         d = V.incorporate_registry_violations(d, list(registry_violations), max_rounds, round_n)
     d["post_write"] = bool(post_write)
-    if history:
+    if history if append_history is None else append_history:
         V._append_validator_history(run_dir, round_n, d, post_write)
     return d
+
+
+
+
+def open_findings(run_dir: str, decision: dict) -> list[dict]:
+    """Every HIGH or MEDIUM finding still open after a gate: the critics' unresolved blockers (not
+    closed by their done_when test), and the harness checks' findings (their test is the check
+    itself). `tested`: the finding has a test the fix loop can work to. A write-up finding waits
+    for the draft."""
+    import done_when as DW
+    import validate_critique_yaml as V
+    draft = os.path.exists(os.path.join(run_dir, "manuscript.md"))
+    closed = set(map(str, decision.get("resolved_by_test") or [])) | set(map(str, decision.get("outside_brief") or []))
+    out = []
+    for reviewer, name in V.FILENAMES.items():
+        p = os.path.join(run_dir, name)
+        if not os.path.exists(p) or (reviewer == "critique-presentation" and not draft):
+            continue
+        try:
+            import yaml
+            doc = yaml.safe_load(open(p)) or {}
+        except Exception:  # noqa: BLE001 -- the gate already failed closed on an unreadable file
+            continue
+        for b in doc.get("blockers") or []:
+            if (not isinstance(b, dict) or b.get("resolved") or str(b.get("severity")) not in ("HIGH", "MEDIUM")
+                    or str(b.get("id")) in closed):
+                continue
+            if b.get("target_stage") == "WRITE" and not draft:
+                continue
+            dw = b.get("done_when")
+            out.append({"id": str(b.get("id")), "source": reviewer, "severity": b.get("severity"),
+                        "tested": dw is not None and not DW.problems(dw), "claim": str(b.get("claim") or "")[:300]})
+    critic_open = {o["id"] for o in out}
+    seen = set()
+    for v in decision.get("rigor_violations") or []:
+        if not (isinstance(v, dict) and str(v.get("severity")) in ("HIGH", "MEDIUM")):
+            continue
+        fid = FL.gate_id(v)
+        # Every gate finding counts (a resolved blocker whose test fails is done_when_unmet; a missing
+        # presentation review is critique_presentation_missing); only one that restates an open
+        # critic blocker (same id as its key) is a duplicate.
+        if str(v.get("key") or "") in critic_open or fid in seen:
+            continue
+        seen.add(fid)
+        out.append({"id": fid, "source": "harness", "severity": v.get("severity"),
+                    "tested": not str(v.get("kind") or "").startswith("critique_done_when_missing"),
+                    "claim": str(v.get("claim") or "")[:300]})
+    return out
+
+
+def apply_medium_rule(decision: dict, opened: list[dict], rounds_remaining: int, budget_ok: bool) -> dict:
+    """v2: the gate never accepts an open HIGH or MEDIUM finding. Today's rules ACCEPT when no HIGH
+    is open (rule 4); in v2 an open finding with a test goes to the fix loop while rounds and
+    budget remain (rule 4m) and is declared, with the write-up saying so, when they do not (3m).
+    The decision's action and rationale say what the machine then does."""
+    if decision.get("action") != "ACCEPT" or not opened:
+        return decision
+    d = dict(decision)
+    tested = [f["id"] for f in opened if f["tested"]]
+    if tested and rounds_remaining > 0 and budget_ok:
+        d.update(action="PATCH_OR_RETHINK", rule_matched="4m", open_tested=tested,
+                 rationale=(f"No HIGH finding is open, but {len(tested)} finding(s) with a test are "
+                            f"({', '.join(tested)[:300]}) and {rounds_remaining} round(s) remain: they go to the "
+                            "fix loop before ACCEPT."))
+    else:
+        why = "no rounds remain" if rounds_remaining <= 0 else ("the budget is used" if not budget_ok
+                                                                 else "none has a test the fix loop can work to")
+        d.update(action="DECLARE_SCOPE", rule_matched="3m", declared_open=[f["id"] for f in opened],
+                 rationale=(f"{len(opened)} HIGH/MEDIUM finding(s) are still open and {why}: they are declared "
+                            "in the write-up (declared_findings.yaml), not accepted."))
+    return d
+
+
+DECLARED_FILE = "declared_findings.yaml"
+
+
+def write_declared(run_dir: str, opened: list[dict], decision: dict) -> None:
+    import yaml
+    with open(os.path.join(run_dir, DECLARED_FILE), "w") as f:
+        yaml.safe_dump({"rule": decision.get("rule_matched"), "rationale": decision.get("rationale"),
+                        "declared": [{"id": o["id"], "severity": o["severity"], "source": o["source"],
+                                      "claim": o["claim"]} for o in opened]}, f, sort_keys=False)
+
+
+# ---- provenance of inputs
+_INPUT_EXT = (".csv", ".tsv", ".json", ".yaml", ".yml", ".txt", ".xlsx", ".parquet")
+PROVENANCE = "data/inputs_provenance.json"
+
+
+def _sha256(path: str) -> str:
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def _provenance(run_dir: str) -> dict:
+    try:
+        return json.load(open(os.path.join(run_dir, PROVENANCE)))
+    except (OSError, ValueError):
+        return {"inputs": {}, "cited": {}}
+
+
+def answer_key_path(rel: str) -> bool:
+    """A repository path into the evaluation tree. Compared case-insensitively: APFS and NTFS are
+    case-insensitive by default, so EVALS/q/rubric.yaml is evals/q/rubric.yaml."""
+    parts = [p.lower() for p in rel.replace(os.sep, "/").split("/") if p not in ("", ".")]
+    return bool(parts) and (parts[0] == "evals" or "_truth" in parts)
+
+
+def _question_paths(question: str) -> list[str]:
+    """File names in the question: bare tokens, and quoted or backticked ones (which may hold spaces)."""
+    import re
+    q = question or ""
+    toks = re.findall(r"[`\"']([^`\"'\n]+)[`\"']", q) + re.findall(r"[A-Za-z0-9_./-]+", q)
+    return [t.strip().strip("./") for t in toks if t.strip().lower().endswith(_INPUT_EXT)]
+
+
+def _safe_dest(run_dir: str, rel: str) -> str:
+    """The destination path inside the run, refusing any symlink on the way and any existing link."""
+    root = os.path.realpath(run_dir)
+    cur = root
+    for part in rel.split("/"):
+        cur = os.path.join(cur, part)
+        if os.path.islink(cur):
+            raise ValueError(f"{rel}: {os.path.relpath(cur, root)} is a symlink")
+    if os.path.exists(cur) and os.stat(cur).st_nlink > 1:
+        raise ValueError(f"{rel}: the destination is a hard link")
+    if not os.path.realpath(cur).startswith(root + os.sep):
+        raise ValueError(f"{rel}: outside the run directory")
+    return cur
+
+
+def _copy_nofollow(src: str, dest: str) -> None:
+    data = open(src, "rb").read()
+    fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o644)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+
+
+def stage_inputs(run_dir: str, question: str) -> list[str]:
+    """Copy every repository file the question names into data/inputs/ (same relative path), with its
+    sha256 in data/inputs_provenance.json. Never the evaluation tree (evals/, _truth, any case), and
+    never through a link: a symlinked directory or a linked destination is refused (ValueError)."""
+    staged = []
+    prov = {"inputs": {}, "cited": _provenance(run_dir).get("cited") or {}}
+    root = os.path.realpath(REPO)
+    for tok in _question_paths(question):
+        src = os.path.realpath(os.path.join(root, tok))
+        rel = os.path.relpath(src, root).replace(os.sep, "/")
+        if (not src.startswith(root + os.sep) or not os.path.isfile(src) or answer_key_path(rel)
+                or answer_key_path(tok) or rel.lower().startswith("runs/")):
+            continue
+        dest_rel = f"data/inputs/{rel}"
+        dest = _safe_dest(run_dir, dest_rel)
+        parent = os.path.dirname(dest)
+        os.makedirs(parent, exist_ok=True)
+        _safe_dest(run_dir, dest_rel)                      # nothing linked was created on the way
+        _copy_nofollow(src, dest)
+        prov["inputs"][dest_rel] = {"source": rel, "sha256": _sha256(src), "bytes": os.path.getsize(src)}
+        staged.append(dest_rel)
+    _safe_dest(run_dir, PROVENANCE)
+    os.makedirs(os.path.join(run_dir, "data"), exist_ok=True)
+    _write_json(run_dir, PROVENANCE, prov)
+    return staged
+
+
+def record_cited_inputs(run_dir: str) -> list[str]:
+    """Every file decision_spec.yaml cites must be inside the run directory; each is recorded with
+    its sha256 in data/inputs_provenance.json. Returns the problems (pre-sign)."""
+    import yaml
+    try:
+        spec = yaml.safe_load(open(os.path.join(run_dir, AB.SPEC_FILE))) or {}
+    except Exception as e:  # noqa: BLE001
+        return [f"{AB.SPEC_FILE} unreadable: {type(e).__name__}"]
+    found = []
+
+    def walk(x):
+        if isinstance(x, dict):
+            for k, v in x.items():
+                if k not in ("deliverable", "deliverable_file"):      # outputs the run writes, not inputs
+                    walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+        elif isinstance(x, str) and x.strip().lower().endswith(_INPUT_EXT):
+            found.append(x.strip())
+
+    def walk_keys(x):          # a path field by name, whatever its spelling or extension
+        if isinstance(x, dict):
+            for k, v in x.items():
+                if k in ("deliverable", "deliverable_file"):
+                    continue
+                if k in ("csv", "file", "path", "table") and isinstance(v, str) and v.strip():
+                    found.append(v.strip())
+                walk_keys(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk_keys(v)
+    def walk_paths(x, key=""):  # any value that names an existing file or directory (engine config too)
+        if isinstance(x, dict):
+            for k, v in x.items():
+                if k not in ("deliverable", "deliverable_file"):
+                    walk_paths(v, str(k))
+        elif isinstance(x, list):
+            for v in x:
+                walk_paths(v, key)
+        elif isinstance(x, str) and x.strip() and ("/" in x or os.sep in x or key.endswith(("path", "file", "dir"))):
+            v = x.strip()
+            if ":" in v and not v.startswith("/") and "/" not in v.split(":", 1)[0]:
+                return                 # a module reference such as pkg.mod:Class
+            if os.path.exists(os.path.join(run_dir, os.path.expanduser(v))):
+                found.append(v)
+    walk(spec)
+    walk_keys(spec)
+    walk_paths(spec)
+    prov, probs, root = _provenance(run_dir), [], os.path.realpath(run_dir)
+    # The staged copies must still be the files the question named (the draft task may not touch
+    # them; this checks it).
+    for dest, e in (prov.get("inputs") or {}).items():
+        p = os.path.join(run_dir, dest)
+        src = os.path.join(REPO, e.get("source", ""))
+        if not os.path.isfile(p) or os.path.islink(p) or _sha256(p) != e.get("sha256"):
+            probs.append(f"the staged input {dest} was changed or removed after it was copied")
+        elif os.path.isfile(src) and _sha256(src) != e.get("sha256"):
+            probs.append(f"the staged input {dest} no longer matches its source {e.get('source')}")
+    for rel in sorted(set(found)):
+        p = os.path.realpath(os.path.join(run_dir, rel))
+        if not p.startswith(root + os.sep):
+            probs.append(f"the spec cites {rel}, outside the run directory: copy it into data/")
+        elif os.path.isdir(p):
+            prov.setdefault("cited", {})[os.path.relpath(p, root).replace(os.sep, "/") + "/"] = {"dir": True}
+        elif not os.path.isfile(p):
+            probs.append(f"the spec cites {rel}, which does not exist")
+        else:
+            prov.setdefault("cited", {})[os.path.relpath(p, root).replace(os.sep, "/")] = {"sha256": _sha256(p)}
+    os.makedirs(os.path.join(run_dir, "data"), exist_ok=True)
+    _write_json(run_dir, PROVENANCE, prov)
+    return probs
+
+
+# ---- claims in the write-up
+def report_claim_findings(run_dir: str) -> list[dict]:
+    """The report must show values, never claim ids: an unresolved [CLAIM:id], or a claims-ledger id
+    left bare in the text the writer wrote, is a HIGH write-up finding (not declarable)."""
+    import re
+    rp, lp = os.path.join(run_dir, "manuscript.md"), os.path.join(run_dir, "models", "claims_ledger.yaml")
+    if not (os.path.exists(rp) and os.path.exists(lp)):
+        return []
+    try:
+        import render_claims as RCL
+        claims = RCL.load_claims(lp)
+    except Exception as e:  # noqa: BLE001 -- fail closed
+        return [{"kind": "report_claims_unreadable", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE",
+                 "key": "claims", "scope_declarable": False, "claim": f"claims ledger unreadable: {e}"}]
+    # The writer's own text, all of it: what the harness appends is not in manuscript.md, so no
+    # marker the writer could copy can hide anything.
+    text = open(rp).read()
+    out = []
+    for cid in sorted(set(re.findall(r"\[CLAIM:([^\]]*)\]", text)) - set(claims)):
+        out.append({"kind": "report_claim_unresolved", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE",
+                    "key": cid, "scope_declarable": False,
+                    "claim": f"The report has [CLAIM:{cid}], which is not in the claims ledger."})
+    for cid in sorted(c for c in claims if "." in c or "_" in c):     # a plain word is not an id
+        if re.search(r"(?<![A-Za-z0-9_.:\-])" + re.escape(cid) + r"(?![A-Za-z0-9_\-]|\.[A-Za-z0-9_])", text):
+            out.append({"kind": "report_claim_id_raw", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE",
+                        "key": cid, "scope_declarable": False,
+                        "claim": f"The report shows the claim id {cid} instead of its value: write [CLAIM:{cid}]."})
+    typed = typed_numbers(text, given_values(run_dir, claims))
+    rp2 = os.path.join(run_dir, "report.md")
+    if os.path.exists(rp2):
+        left = re.findall(r"\[CLAIM:([^\]]*)\]", open(rp2).read())
+        if left:
+            out.append({"kind": "report_claim_unrendered", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE",
+                        "key": "unrendered", "scope_declarable": False,
+                        "claim": f"The report still shows {len(left)} claim reference(s) ({', '.join(sorted(set(left))[:5])}), "
+                                 "e.g. inside code; write [CLAIM:id] in plain text."})
+    if typed:
+        # A text heuristic with a measured false-positive rate of 45% or more (design note §13): LOW,
+        # advisory. It is reported (findings.jsonl, the presentation critic's input) but never blocks,
+        # goes to the fix loop or is declared. It goes back up only after structural exemptions for its
+        # false-positive classes and a new measurement. The structural cases above stay HIGH.
+        out.append({"kind": "report_number_typed", "severity": "LOW", "stage": "WRITE", "target_stage": "WRITE",
+                    "key": "numbers", "scope_declarable": True,
+                    "claim": f"The writer typed {len(typed)} number(s) ({', '.join(typed[:8])}) that are not in the spec, "
+                             "the claims ledger or the question; write each as a [CLAIM:id] the harness renders."})
+    return out
+
+
+_SUFFIX = {"k": 1e3, "m": 1e6, "b": 1e9, "bn": 1e9}
+
+
+def given_values(run_dir: str, claims: dict | None = None) -> list[float]:
+    """Numbers a report may show as typed: those in the signed spec and the question (the owner's
+    facts), and every number in the claims ledger, the interval level included (0.95 is also 95)."""
+    import re
+    texts = []
+    try:
+        texts.append(open(os.path.join(run_dir, AB.SPEC_FILE)).read())
+    except OSError:
+        pass
+    try:   # the question only: not timestamps or other run metadata
+        texts.append(str(json.load(open(os.path.join(run_dir, "metadata.json"))).get("question") or ""))
+    except (OSError, ValueError):
+        pass
+    vals = []
+    for t in texts:
+        vals += [float(g.replace(",", "")) for g in re.findall(r"\d[\d,]*(?:\.\d+)?", t)]
+
+    def walk(x):
+        if isinstance(x, bool):
+            return
+        if isinstance(x, (int, float)):
+            vals.append(float(x))
+        elif isinstance(x, dict):
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, (list, tuple)):
+            for v in x:
+                walk(v)
+    walk(list((claims or {}).values()))
+    vals += [v * 100 for v in list(vals) if 0 < abs(v) <= 1]          # proportions written as percentages
+    return vals
+
+
+def typed_numbers(text: str, given: list[float]) -> list[str]:
+    """Numbers typed in `text` outside [CLAIM:] references that match none of `given` at the precision
+    they are written with. Not years or year ranges, list or heading numbering, or digits inside an
+    identifier (D09, DT1, R-004)."""
+    import math
+    import re
+    bare = re.sub(r"\[CLAIM:[^\]]*\]", " ", text)
+    bare = re.sub(r"(?m)^\s*(#+\s*)?\d+[.)]\s", " ", bare)
+    num = re.compile(r"(?<![A-Za-z0-9_.])[-+\u2212]?\d[\d,]*(?:\.\d+)?(?:[eE][-+]?\d+)?(?:\s?(?:[kKmMbB]n?|%))?(?![A-Za-z0-9_])")
+    out = []
+    for m_ in num.finditer(bare):
+        t = m_.group(0).rstrip(",")
+        before = bare[max(0, m_.start() - 1):m_.start()]
+        if t[0] in "-+\u2212" and before and (before.isalnum() or before == "_"):
+            continue                                  # an identifier such as R-004
+        mant = re.match(r"[-+\u2212]?([\d,]*(?:\.\d+)?)", t).group(1).replace(",", "")
+        rest = t[len(re.match(r"[-+\u2212]?[\d,]*(?:\.\d+)?", t).group(0)):].strip()
+        if re.fullmatch(r"(19|20)\d\d", mant) and not rest:
+            continue                                  # a year, or one end of a year range
+        try:
+            v = float(mant)
+        except ValueError:
+            continue
+        exp = re.match(r"[eE]([-+]?\d+)", rest)
+        if exp:
+            v *= 10 ** int(exp.group(1))
+            rest = rest[exp.end():].strip()
+        mult = _SUFFIX.get(rest.lower(), 1.0)
+        v *= mult
+        digits = mant.replace(".", "").lstrip("0") or "0"
+        sig = max(1, len(digits))
+        def same(g):
+            if g == 0 or v == 0:
+                return g == v
+            return float(f"{abs(g):.{sig}g}") == round(abs(v), 12) or math.isclose(abs(g), abs(v), rel_tol=1e-9)
+        if any(same(g) for g in given):
+            continue
+        out.append(t)
+    return out
 
 
 # ------------------------------------------------------------------ sign-off
@@ -529,6 +908,8 @@ class Machine:
         out = self.backend.gate_findings(self.run_dir) + spec_signoff_findings(self.run_dir, self.st.signoff, self.backend)
         out += [{"kind": "deliverable_path_invalid", "severity": "HIGH", "stage": "PLAN", "target_stage": "PLAN",
                  "key": "deliverable", "scope_declarable": False, "claim": p} for p in deliverable_problems(self.run_dir)]
+        if self.st.v2_rules:
+            out += report_claim_findings(self.run_dir)
         return out
 
     def _signed_ref(self, run_dir: str):
@@ -572,8 +953,13 @@ class Machine:
         return {FL.gate_id(v) for v in self.harness_findings()}
 
     def rebuild(self, run_dir: str) -> dict:
+        """The S1 pipeline, then the report again when a draft exists (a write-up fix edits
+        manuscript.md; its check must read the re-rendered report)."""
         import pipeline as P
-        return P.run(run_dir)
+        rep = P.run(run_dir)
+        if os.path.exists(os.path.join(run_dir, "manuscript.md")):
+            render_report(run_dir, self.backend)
+        return rep
 
     # -------------------------------------------------- one step
     def step(self) -> str:
@@ -601,6 +987,7 @@ class Machine:
         n = self.st.tries.get("spec", 0)
         if n >= MAX_SPEC_TRIES:
             return self._go("FINAL", "the spec did not validate", "run_failed")
+        stage_inputs(self.run_dir, self.st.question)
         fb = self.st.tries.get("spec_feedback")
         # The key is fixed before the call and the try is counted only once the call returns, so an
         # interrupted draft resumes under the same key (charged once by _settle_interrupted).
@@ -611,7 +998,8 @@ class Machine:
         errs = [f"draft_spec failed: {res.note}"] if not res.ok else []
         if res.ok:
             try:
-                errs = self.backend.pre_sign_problems(self.run_dir)
+                errs = record_cited_inputs(self.run_dir)       # before anything reads a cited file
+                errs = errs or self.backend.pre_sign_problems(self.run_dir)
             except Exception as e:  # noqa: BLE001
                 errs = [f"spec unreadable: {e}"]
         if errs:
@@ -734,7 +1122,21 @@ class Machine:
             rv = getattr(self.backend, "registry_violations", None)
             d = v2_gate(self.run_dir, self.st.round, self.st.max_rounds, pw, self.harness_findings(),
                         spec_violations=sv(self.run_dir) if sv else None,
-                        registry_violations=rv(self.run_dir) if rv else None)
+                        registry_violations=rv(self.run_dir) if rv else None,
+                        strict_done_when=self.st.v2_rules and self.st.tries.get("schema", 0) < MAX_SCHEMA_REPAIRS,
+                        append_history=False)
+            opened = []
+            if d.get("action") and self.st.v2_rules:
+                opened = open_findings(self.run_dir, d)
+                d = apply_medium_rule(d, opened, int(d.get("rounds_remaining") or 0), not self._out_of_budget())
+            if d.get("action"):
+                import validate_critique_yaml as V
+                V._append_validator_history(self.run_dir, self.st.round, d, pw)
+            if self.st.v2_rules and d.get("action") == "DECLARE_SCOPE":
+                # Every DECLARE_SCOPE (rule 3, 3a or 3m) lists what is still open in the write-up.
+                write_declared(self.run_dir, opened, d)
+                if pw and self._has_draft():
+                    render_report(self.run_dir, self.backend)
         tag = f"gate_r{self.st.round}{'_post' if pw else ''}.json"
         _write_json(self.run_dir, tag, d or {})
         if pw:
@@ -743,6 +1145,12 @@ class Machine:
         self.st.last_gate.update(round=self.st.round, post_write=pw)
         if (d or {}).get("action"):
             FL.sync(self.run_dir, d, self.st.round, post_write=pw)
+            if d.get("rule_matched") == "4m":           # these are why the loop runs: plan them
+                led = FL.load(self.run_dir)
+                for fid in d.get("open_tested") or []:
+                    if fid in led:
+                        led[fid].blocking = True
+                FL.save(self.run_dir, led)
         nxt, status, mode = route_gate(d, pw)
         if nxt == "CRITIQUE":                               # schema errors: re-run the critics
             n = self.st.tries.get("schema", 0) + 1
@@ -884,6 +1292,14 @@ def render_report(run_dir: str, backend=AB) -> str:
     headline numbers, the declared limits (verbatim), and the deliverable file the spec names."""
     import yaml
     draft = open(os.path.join(run_dir, "manuscript.md")).read()
+    lp = os.path.join(run_dir, "models", "claims_ledger.yaml")
+    if os.path.exists(lp):
+        # The writer writes [CLAIM:id]; the harness substitutes the value (no number is typed).
+        import render_claims as RCL
+        try:
+            draft, _unresolved = RCL.render_text(draft, RCL.load_claims(lp))
+        except Exception:  # noqa: BLE001 -- left unrendered; report_claim_findings flags it
+            pass
     h = backend.headline(run_dir)
     lines = ["", "<!-- harness: rendered from analysis/analysis.json -->", "## Numbers (rendered by the harness)", "",
              "| quantity | value |", "|---|---|"]
@@ -897,6 +1313,13 @@ def render_report(run_dir: str, backend=AB) -> str:
         for e in decl:
             lines.append(f"- **{e.get('id')}** ({e.get('blocker_id')}): {e.get('why_unresolved', '')} "
                          f"Impact: {e.get('impact_on_conclusions', '')}")
+    try:
+        dec2 = (yaml.safe_load(open(os.path.join(run_dir, DECLARED_FILE))) or {})
+    except OSError:
+        dec2 = {}
+    if dec2.get("declared"):
+        lines += ["", "## Open findings, declared (not resolved)", "", str(dec2.get("rationale") or ""), ""]
+        lines += [f"- **{e['id']}** ({e['severity']}, {e['source']}): {e['claim']}" for e in dec2["declared"]]
     with open(os.path.join(run_dir, "report.md"), "w") as f:
         f.write(draft.rstrip() + "\n" + "\n".join(lines) + "\n")
     _write_deliverable(run_dir)
@@ -1000,16 +1423,16 @@ def _self_test() -> int:
                                         "columns": {"unit": "id", "package": "package", "dalys_averted": "dalys_averted"}}
             spec.update(script.pop("spec_extra", {}))
             # 16 emulator points: the resume test runs the whole machine many times
-            script = dict({"spec": spec, "settings": AB.toy_settings(draws=6, points=16)}, **script)
+            script = dict({"spec": spec, "settings": AB.toy_settings(draws=24, points=16)}, **script)
             st = init_run(d, "toy question", max_rounds, signoff, "v2", budget)
             return d, StubTasks(script), st
 
         # T10: the happy path with one critic finding fixed in the loop.
         blocker = {"id": "D-001", "severity": "HIGH", "target_stage": "ANALYZE", "claim": "too few draws",
-                   "done_when": [{"file": "analysis_settings.yaml", "key": "uncertainty.draws", "op": ">=", "value": 24}]}
+                   "done_when": [{"file": "analysis_settings.yaml", "key": "uncertainty.draws", "op": ">=", "value": 32}]}
         d, T, st = new_run("happy", {"critics": {1: {"critique-domain": [blocker]}},
-                                     "fixes": {"D-001": [("analysis_settings.yaml", "uncertainty.draws", 24)],
-                                               "uncertainty_draws_low:draws": [("analysis_settings.yaml", "uncertainty.draws", 24)]}})
+                                     "fixes": {"D-001": [("analysis_settings.yaml", "uncertainty.draws", 32)],
+                                               "uncertainty_draws_low:draws": [("analysis_settings.yaml", "uncertainty.draws", 32)]}})
         status = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
         hist = [h["to"] for h in load_state(d).history if "to" in h]
         ok(status == "completed", f"T10 toy run completes: {status} via {hist}")
@@ -1030,13 +1453,13 @@ def _self_test() -> int:
 
         # T16: resume after every state. Stop after k steps, rebuild the machine from disk, finish.
         d0, T0, st0 = new_run("ref", {"critics": {1: {"critique-domain": [blocker]}},
-                                      "fixes": {"D-001": [("analysis_settings.yaml", "uncertainty.draws", 24)]}})
+                                      "fixes": {"D-001": [("analysis_settings.yaml", "uncertainty.draws", 32)]}})
         ref_status = _SpikeMachine(d0, T0, st0, log=lambda *a: None, cross_engine_check=False).run()
         ref_path = [h["to"] for h in load_state(d0).history if "to" in h]
         bad = []
         for k in range(1, len(ref_path)):
             dk, Tk, stk = new_run(f"resume{k}", {"critics": {1: {"critique-domain": [blocker]}},
-                                                "fixes": {"D-001": [("analysis_settings.yaml", "uncertainty.draws", 24)]}})
+                                                "fixes": {"D-001": [("analysis_settings.yaml", "uncertainty.draws", 32)]}})
             m = _SpikeMachine(dk, Tk, stk, log=lambda *a: None, cross_engine_check=False)
             for _ in range(k):
                 m.step()
@@ -1093,6 +1516,9 @@ def _self_test() -> int:
         d, T, st = new_run("declare", {"critics": {1: {"critique-domain": [nofix]}}}, max_rounds=2)
         s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
         ok(s == "completed_scope_declared", f"T21 an unfixed critic blocker at exhaustion ends scope-declared ({s})")
+        rep21 = open(os.path.join(d, "report.md")).read()
+        ok(os.path.exists(os.path.join(d, DECLARED_FILE)) and "D-009" in rep21 and "Open findings, declared" in rep21,
+           "T46 (Codex #95-5) an ordinary DECLARE_SCOPE (rule 3) also lists what is open in the report")
 
         # T22: the budget, not the gate, ends the run: the harness writes the report.
         d, T, st = new_run("budget", {"critics": {1: {"critique-domain": [nofix]}}, "usd": 30.0}, budget=100.0)
@@ -1280,6 +1706,206 @@ def _self_test() -> int:
         ok(s in ("completed", "completed_scope_declared") and "feedback:critique-domain:True" in T.calls
            and T.calls.count("critique:critique-redteam:1") == 1,
            f"T37 a schema repair re-runs only the failing critic, with its errors ({s}, {[c for c in T.calls if 'critique' in c][:6]})")
+
+        # T38-T41: from the first blind real run (v2blind1). Fixtures: its three critique YAMLs,
+        # final_gate.json and claims ledger (tests/fixtures/v2blind1; no question text, no evals content).
+        import yaml
+        FX_DIR = os.path.join(REPO, "tests", "fixtures", "v2blind1")
+        fb = os.path.join(td, "blind1")
+        os.makedirs(fb)
+        for f in ("critique_domain.yaml", "critique_redteam.yaml", "critique_presentation.yaml"):
+            shutil.copy(os.path.join(FX_DIR, f), fb)
+        open(os.path.join(fb, "manuscript.md"), "w").write("draft\n")
+        g = v2_gate(fb, 1, 2, True, [], history=False, strict_done_when=True)
+        errs = " ".join(g.get("schema_errors") or [])
+        ok(g.get("action") is None and "critique_domain.yaml: blocker D-001 done_when" in errs
+           and "critique_presentation.yaml: blocker P-001 done_when" in errs,
+           f"T38 a prose done_when is a schema error the critic is asked to repair ({errs[:160]})")
+        g = v2_gate(fb, 1, 2, True, [], history=False, strict_done_when=False)
+        ok(g.get("action") == "ACCEPT", f"T38b after the repairs the gate itself still accepts ({g.get('action')})")
+        # T39: an open MEDIUM with a valid test goes to the fix loop while rounds remain; else it is declared.
+        for f in ("critique_domain.yaml", "critique_redteam.yaml", "critique_presentation.yaml"):
+            doc = yaml.safe_load(open(os.path.join(fb, f)))
+            for b in doc["blockers"]:
+                b["done_when"] = [{"judgement": str(b.get("done_when"))[:200]}]
+            yaml.safe_dump(doc, open(os.path.join(fb, f), "w"))
+        g = v2_gate(fb, 1, 2, True, [], history=False, strict_done_when=True)
+        opened = open_findings(fb, g)
+        ids = sorted(f["id"] for f in opened if f["tested"])
+        ok("D-001" in ids and "P-001" in ids and "R-001" in ids and len(ids) >= 8,
+           f"T39 the run's open MEDIUM critic findings are found, with their tests ({ids})")
+        a = apply_medium_rule(dict(g), opened, rounds_remaining=1, budget_ok=True)
+        b2 = apply_medium_rule(dict(g), opened, rounds_remaining=0, budget_ok=True)
+        c2 = apply_medium_rule(dict(g), opened, rounds_remaining=1, budget_ok=False)
+        ok(a["action"] == "PATCH_OR_RETHINK" and a["rule_matched"] == "4m" and "before ACCEPT" in a["rationale"]
+           and b2["action"] == "DECLARE_SCOPE" and b2["rule_matched"] == "3m" and c2["action"] == "DECLARE_SCOPE"
+           and sorted(b2["declared_open"]) == sorted(f["id"] for f in opened),
+           f"T39b open findings: fixed while rounds and budget remain, else declared, never accepted ({a['action']}, {b2['action']})")
+        # T40: the write-up shows values, not claim ids.
+        fr = os.path.join(td, "render")
+        os.makedirs(os.path.join(fr, "models"))
+        shutil.copy(os.path.join(FX_DIR, "claims_ledger.yaml"), os.path.join(fr, "models", "claims_ledger.yaml"))
+        yaml.safe_dump({"schema_version": 1}, open(os.path.join(fr, AB.SPEC_FILE), "w"))
+        open(os.path.join(fr, "manuscript.md"), "w").write(
+            "The plan averts [CLAIM:headline.point] cases at [CLAIM:cost.allocated].\n")
+        render_report(fr, AB)
+        rep = open(os.path.join(fr, "report.md")).read()
+        ok("[CLAIM:" not in rep and "headline.point" not in rep.split("<!-- harness")[0] and not report_claim_findings(fr),
+           f"T40 claim references are rendered inline ({rep.splitlines()[0][:120]})")
+        open(os.path.join(fr, "manuscript.md"), "w").write("ITN in `mix.itn` districts; [CLAIM:no.such.claim].\n")
+        render_report(fr, AB)
+        kinds = [(f["kind"], f["severity"]) for f in report_claim_findings(fr)]
+        ok(("report_claim_id_raw", "HIGH") in kinds and ("report_claim_unresolved", "HIGH") in kinds,
+           f"T40b a raw claim id or an unresolved reference in the report is a HIGH finding ({kinds})")
+        # T41: every input the question names is copied into data/ with its sha256; a spec citing a
+        # file outside the run is refused.
+        fp = os.path.join(td, "prov")
+        os.makedirs(fp)
+        staged = stage_inputs(fp, "Inputs: requirements.txt (the pins) and no/such/file.csv.")
+        prov = json.load(open(os.path.join(fp, "data", "inputs_provenance.json")))
+        src = open(os.path.join(REPO, "requirements.txt"), "rb").read()
+        ok(staged == ["data/inputs/requirements.txt"]
+           and prov["inputs"]["data/inputs/requirements.txt"]["sha256"] == hashlib.sha256(src).hexdigest()
+           and open(os.path.join(fp, "data", "inputs", "requirements.txt"), "rb").read() == src,
+           f"T41 the question's input files are copied into data/inputs/ with their sha256 ({staged})")
+        yaml.safe_dump({"decision_units": {"csv": "data/inputs/requirements.txt"}, "calibration": {"targets": {"csv": "../outside/targets.csv"}}},
+                       open(os.path.join(fp, AB.SPEC_FILE), "w"))
+        probs = record_cited_inputs(fp)
+        prov = json.load(open(os.path.join(fp, "data", "inputs_provenance.json")))
+        ok(any("../outside/targets.csv" in x and "outside the run" in x for x in probs) and "data/inputs/requirements.txt" in prov["cited"],
+           f"T41b cited inputs are recorded with their sha256; one outside the run is refused ({probs})")
+
+        # T42: through the machine. A MEDIUM with a runnable test goes to the fix loop (rule 4m) and
+        # is fixed before ACCEPT; one that cannot be fixed, with no rounds left, is declared (3m) and
+        # the report says so.
+        med = {"id": "D-010", "severity": "MEDIUM", "target_stage": "ANALYZE", "claim": "more draws",
+               "done_when": [{"file": "analysis_settings.yaml", "key": "uncertainty.draws", "op": ">=", "value": 40}]}
+        d, T, st = new_run("medium_fix", {"critics": {1: {"critique-domain": [med]}},
+                                          "fixes": {"D-010": [("analysis_settings.yaml", "uncertainty.draws", 40)]}})
+        s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+        g1 = json.load(open(os.path.join(d, "gate_r1.json")))
+        ok(s == "completed" and g1["action"] == "PATCH_OR_RETHINK" and g1["rule_matched"] == "4m"
+           and FX.impact_rows(d) and FX.impact_rows(d)[0]["findings"] == ["D-010"],
+           f"T42 an open MEDIUM with a test is fixed in the loop before ACCEPT ({s}, {g1['action']} {g1['rule_matched']})")
+        d, T, st = new_run("medium_declare", {"critics": {1: {"critique-domain": [dict(med, id="D-011")]}}}, max_rounds=1)
+        s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+        g1 = json.load(open(os.path.join(d, "gate_r1.json")))
+        rep = open(os.path.join(d, "report.md")).read()
+        ok(s == "completed_scope_declared" and g1["rule_matched"] == "3m" and "D-011" in rep
+           and "Open findings, declared" in rep,
+           f"T42b with no rounds left the open MEDIUM is declared, and the report says so ({s}, {g1['rule_matched']})")
+
+        # T43-T51: Codex round 1 on #95 (each failed on a3a31b7).
+        d43 = os.path.join(td, "t43")
+        os.makedirs(d43)
+        g43 = {"action": "ACCEPT", "rigor_violations": [
+            {"kind": "done_when_unmet", "severity": "MEDIUM", "key": "D-001", "claim": "the test fails"},
+            {"kind": "critique_presentation_missing", "severity": "MEDIUM", "claim": "no review"}]}
+        ok({o["id"] for o in open_findings(d43, g43)} == {"done_when_unmet:D-001", "critique_presentation_missing"},
+           "T43 a resolved blocker whose test fails, and a missing presentation review, stay open")
+        fr = os.path.join(td, "t44")
+        os.makedirs(os.path.join(fr, "models"))
+        shutil.copy(os.path.join(FX_DIR, "claims_ledger.yaml"), os.path.join(fr, "models", "claims_ledger.yaml"))
+        yaml.safe_dump({"schema_version": 1, "constraints": {"envelope_usd": 18000000}}, open(os.path.join(fr, AB.SPEC_FILE), "w"))
+        open(os.path.join(fr, "manuscript.md"), "w").write(
+            "1. Within the 18000000 budget for 2026-2028, D09 gets nothing; the plan averts 999,999 cases.\n")
+        k44 = [f for f in report_claim_findings(fr) if f["kind"] == "report_number_typed"]
+        ok(k44 and "999,999" in k44[0]["claim"] and "18000000" not in k44[0]["claim"] and "2026" not in k44[0]["claim"],
+           f"T44 a typed result number is HIGH; the owner's given numbers, years, ids and list numbers are not ({k44[:1]})")
+        open(os.path.join(fr, "manuscript.md"), "w").write("Intro.\n<!-- harness: copied -->\n`headline.point` and [CLAIM:nope].\n")
+        k44b = {f["kind"] for f in report_claim_findings(fr)}
+        ok({"report_claim_id_raw", "report_claim_unresolved"} <= k44b, f"T44b no marker the writer copies hides an id ({k44b})")
+        open(os.path.join(fr, "manuscript.md"), "w").write("Averts [CLAIM:headline.point] cases.\n")
+        open(os.path.join(fr, "report.md"), "w").write("stale [CLAIM:headline.point]\n")
+        m45 = Machine(fr, StubTasks({}), RunState(question="q", state="FIX_LOOP"), backend=spike, log=lambda *a: None)
+        m45.rebuild(fr)
+        ok("Averts 1.3M" in open(os.path.join(fr, "report.md")).read(),
+           "T45 the fix loop's rebuild re-renders the report from the edited draft")
+        fp = os.path.join(td, "t47", "run")
+        os.makedirs(os.path.join(fp, "data"))
+        os.makedirs(os.path.join(td, "t47", "x y"))
+        open(os.path.join(td, "t47", "x y", "units.csv"), "w").write("a\n")
+        open(os.path.join(fp, "data", "targets"), "w").write("t\n")
+        yaml.safe_dump({"decision_units": {"csv": "../x y/units.csv"}, "calibration": {"targets": {"csv": "data/targets"}}},
+                       open(os.path.join(fp, AB.SPEC_FILE), "w"))
+        p47 = record_cited_inputs(fp)
+        prov = json.load(open(os.path.join(fp, PROVENANCE)))
+        ok(any("../x y/units.csv" in x for x in p47) and "data/targets" in prov["cited"],
+           f"T47 a cited path with a space outside the run is refused; a path field without an extension is recorded ({p47})")
+        fq = os.path.join(td, "t48")
+        outside = os.path.join(td, "t48_outside")
+        os.makedirs(os.path.join(fq, "data"))
+        os.makedirs(outside)
+        os.symlink(outside, os.path.join(fq, "data", "inputs"))
+        try:
+            stage_inputs(fq, "Inputs: requirements.txt")
+            raised = False
+        except ValueError:
+            raised = True
+        ok(raised and not os.listdir(outside), "T48 a symlinked data/inputs is refused; nothing is written outside the run")
+        ok(answer_key_path("EVALS/q/rubric.yaml") and answer_key_path("data/_TRUTH/truth.json")
+           and not answer_key_path("data/evals/q/districts.csv"),
+           "T49 the answer-key exclusion is case-insensitive; the questions' public inputs are not excluded")
+        fs = os.path.join(td, "t50")
+        os.makedirs(fs)
+        stage_inputs(fs, "requirements.txt")
+        yaml.safe_dump({"decision_units": {"csv": "data/inputs/requirements.txt"}}, open(os.path.join(fs, AB.SPEC_FILE), "w"))
+        ok(record_cited_inputs(fs) == [], "T50 an untouched staged input passes")
+        open(os.path.join(fs, "data", "inputs", "requirements.txt"), "a").write("tampered\n")
+        ok(any("changed or removed" in x for x in record_cited_inputs(fs)),
+           "T50b a staged input changed after it was copied is refused")
+        open(os.path.join(fr, "manuscript.md"), "w").write("`headline.point`\n")
+        os.remove(os.path.join(fr, STATE_FILE))           # T45's machine left its state here
+        m51 = Machine(fr, StubTasks({}), RunState(question="q", state="GATE", v2_rules=False), backend=spike,
+                      log=lambda *a: None)
+        ok(not any(f["kind"].startswith("report_") for f in m51.harness_findings()),
+           "T51 golden replays (v2_rules off) do not run the v2 report checks")
+
+        # T52-T55: Codex round 2 on #95 (each failed on 7aa9642).
+        for txt in ("Benefit is -987654 cases.", "Benefit is 987K cases.", "Benefit is 987e6 cases."):
+            open(os.path.join(fr, "manuscript.md"), "w").write(txt + "\n")
+            if not any(f["kind"] == "report_number_typed" for f in report_claim_findings(fr)):
+                ok(False, f"T52 signed, magnitude-suffixed and scientific numbers are typed numbers: {txt}")
+                break
+        else:
+            ok(True, "T52 signed, magnitude-suffixed and scientific numbers are typed numbers")
+        json.dump({"question": "Choose packages for 10 districts.", "started": "2026-10-31T16:42:57Z"},
+                  open(os.path.join(fr, "metadata.json"), "w"))
+        open(os.path.join(fr, "manuscript.md"), "w").write("Across 10 districts it reduces cases by 57%.\n")
+        k53 = [f for f in report_claim_findings(fr) if f["kind"] == "report_number_typed"]
+        ok(k53 and "57%" in k53[0]["claim"] and "10" not in k53[0]["claim"].split("(")[1].split(")")[0].split(", "),
+           f"T53 only the question's own numbers are given; a timestamp's digits are not ({k53[:1]})")
+        open(os.path.join(fr, "manuscript.md"), "w").write("The plan averts `[CLAIM:headline.point]` cases.\n")
+        render_report(fr, spike)
+        ok(any(f["kind"] == "report_claim_unrendered" for f in report_claim_findings(fr)),
+           "T54 a claim reference left unrendered in the report (inside code) is a HIGH finding")
+        # T56: the typed-number rule is a text heuristic: MEDIUM and declarable (process rule 4), and the
+        # interval level and any value in the spec, the ledger or the question are not typed numbers.
+        open(os.path.join(fr, "manuscript.md"), "w").write(
+            "A 95% interval; about 1.3M cases for $17.9M across 10 districts; 3 years.\n")
+        k56 = [f for f in report_claim_findings(fr) if f["kind"] == "report_number_typed"]
+        ok(k56 and k56[0]["severity"] == "LOW" and "(3)" in k56[0]["claim"],
+           f"T56 typed numbers are LOW (advisory); 95%, 1.3M, $17.9M and 10 are exempt ({k56[:1]})")
+        # T57: a run whose only open finding is a typed number reaches ACCEPT; the finding is reported
+        # in findings.jsonl (advisory), not planned and not declared.
+        d57, T57, st57 = new_run("typed_only", {"manuscript": "The plan averts 999 cases. It averts [CLAIM:headline.point] cases.\n"})
+        os.makedirs(os.path.join(d57, "models"), exist_ok=True)
+        shutil.copy(os.path.join(FX_DIR, "claims_ledger.yaml"), os.path.join(d57, "models", "claims_ledger.yaml"))
+        s57 = _SpikeMachine(d57, T57, st57, log=lambda *a: None, cross_engine_check=False).run()
+        led57 = FL.load(d57)
+        typed57 = [f for f in led57.values() if f.kind == "report_number_typed"]
+        ok(s57 == "completed" and typed57 and typed57[0].severity == "LOW" and not typed57[0].blocking
+           and not os.path.exists(os.path.join(d57, DECLARED_FILE))
+           and json.load(open(os.path.join(d57, "final_gate.json")))["action"] == "ACCEPT",
+           f"T57 a run whose only open finding is a typed number reaches ACCEPT; the finding is advisory ({s57})")
+        fe = os.path.join(td, "t55")
+        os.makedirs(os.path.join(fe, "data"))
+        yaml.safe_dump({"engine": {"ref": "toolkit.engines.contract:ToyEngine",
+                                   "config": {"results_path": os.path.join(td, "outside_bench")}}},
+                       open(os.path.join(fe, AB.SPEC_FILE), "w"))
+        os.makedirs(os.path.join(td, "outside_bench"), exist_ok=True)
+        ok(any("outside_bench" in x for x in record_cited_inputs(fe)),
+           "T55 an engine config path outside the run, without a file extension, is refused")
 
         # T23: a transition outside the table is refused.
         m = _SpikeMachine(os.path.join(td, "ref"), StubTasks({}), None, log=lambda *a: None)

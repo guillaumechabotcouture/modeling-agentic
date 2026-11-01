@@ -232,7 +232,7 @@ def check_v2(src: str, work: str, max_rounds: int | None = None, expected: tuple
         except (OSError, ValueError):
             pass
         st = SM.RunState(question=meta.get("question", ""), state="GATE", round=cur, max_rounds=mr, gate_mode="v2",
-                         post_write=pw, signoff="none")
+                         post_write=pw, signoff="none", v2_rules=False)   # today's rules only: the stored gates
         m = SM.Machine(b, None, st, backend=_ReplayBackend(d), log=lambda *x: None)
         n0 = len(m.st.history)
         m.step()

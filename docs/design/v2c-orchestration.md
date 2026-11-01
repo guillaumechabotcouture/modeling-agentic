@@ -284,3 +284,62 @@ FINAL `completed`, in 31 s with 2 workers.
 - **The fix:** changed only `analysis_settings.yaml`.
 - **Impact rows:** they now separate what the agent changed (`files_changed`, measured before the rebuild) from
   what the rebuild rewrote (`outputs_changed`).
+
+## 13. Fixes from the first blind real run (v2blind1)
+
+The grader scored the run 1.0, but review found the gate had accepted with eight MEDIUM critic findings open. The
+critics wrote `done_when` as prose; `done_when.py` counted every test as missing (three MEDIUM
+`critique_done_when_missing`), and MEDIUM does not block ACCEPT under today's rule 4. The report also showed claim
+ids (`mix.itn`) instead of values, and the unit costs were typed into the spec with no copy of their file.
+Fixtures: the run's three critique YAMLs, `final_gate.json` and claims ledger (`tests/fixtures/v2blind1/`).
+
+| # | Change | Test |
+|---|---|---|
+| 1 | The critic prompt gives the structured `done_when` forms `done_when.py` accepts, with an example. In v2, a HIGH or MEDIUM blocker whose test is missing or does not parse is a schema error, repaired by the T37 path (only that critic, told its errors) while repairs remain | T38 |
+| 2 | v2 rule on top of today's: an ACCEPT with open HIGH/MEDIUM findings (critic blockers not closed by their test; harness-check findings) becomes PATCH_OR_RETHINK rule `4m` while rounds and budget remain, and those findings are planned in the fix loop; when none remain it becomes DECLARE_SCOPE rule `3m`, the findings are written to `declared_findings.yaml` and rendered in the report. The gate file and validator history record the action the machine takes. Golden-trace replays of stored v1 gates run without these rules (`v2_rules: false`) | T39, T42 |
+| 3 | The writer writes `[CLAIM:id]`; `render_report` substitutes the value from `models/claims_ledger.yaml`. An unresolved reference, or a ledger id left bare in the writer's text, is a non-declarable HIGH write-up finding | T40 |
+| 4 | Before the draft, every repository file the question names is copied into `data/inputs/` with its sha256 (`data/inputs_provenance.json`); every file the spec cites must be inside the run and is recorded with its sha256, else the spec does not pass the pre-sign check | T41 |
+
+**Codex round 1 on #95 (ten P1s) and the coordinator's item 5.** Each was reproduced against a3a31b7 first.
+
+| Finding | Change | Test |
+|---|---|---|
+| A resolved blocker whose test fails (`done_when_unmet`), or a missing presentation review, was excluded from the open set | Every HIGH/MEDIUM gate finding counts; only one that restates an open critic blocker is dropped as a duplicate | T43 |
+| Typed result numbers were never checked | A number in the writer's text outside `[CLAIM:]` is a HIGH finding, except years, list numbering, digits inside identifiers, and numbers the owner gave (the signed spec, the question) | T44 |
+| A copied `<!-- harness:` marker hid ids | The checks read `manuscript.md` (the writer's text), not the rendered report | T44b |
+| A write-up fix was checked against a stale report | The fix loop's rebuild re-renders the report when a draft exists | T45 |
+| Rule 3 / 3a DECLARE_SCOPE did not list the open findings | Every v2 DECLARE_SCOPE writes `declared_findings.yaml` and renders it | T46 |
+| A cited path with a space, or a path field without an extension, escaped provenance | Every string value ending in a data extension and every `csv`/`file`/`path`/`table` field is checked | T47 |
+| Copying could follow a symlinked `data/inputs` out of the run | No symlink on the way or hard-linked destination; copies are opened without following links | T48 |
+| Case variants of `evals/` and `_truth` passed the exclusion | Compared case-insensitively, in the harness and in the agents' read guard | T49, S12 |
+| The draft task could rewrite the staged inputs or their manifest | Both are harness-owned in the write guard; after the draft each copy's sha256 is checked against its record and its source | T50, S12 |
+| Golden replays ran the new report checks | They run only with `v2_rules` | T51 |
+| (item 5) A Grep or Glob at the repository root reached `evals/**/_truth` | A Read, Grep or Glob whose search root (its path, or a Glob pattern's literal prefix) contains the repository's `evals/` tree is refused unless confined to the run directory or `data/` | S13 |
+
+**Codex round 2 on #95 (six P1s), each reproduced against 7aa9642 first:**
+- **Typed numbers.** Signed, magnitude-suffixed and scientific forms (`-987654`, `987K`, `987e6`) are now caught (T52).
+- **Given numbers.** Only the signed spec and the question count as given. A timestamp's digits in `metadata.json` no longer excuse a result (T53).
+- **Unrendered references.** A `[CLAIM:]` left in the rendered report, for example inside code, is a HIGH finding (T54).
+- **Engine config paths.** Any value that names an existing file or directory, including engine config paths without an extension, must be inside the run. Containment is checked before the backend's validation reads anything (T55).
+- **Search guard.**
+  - Grep's `glob` and `type` parameters are checked.
+  - A search whose tree reaches a `_truth` entry, or a link into one, is refused even under an allowed root (S14).
+  - `_truth` is also checked on the resolved path, so a Read through a symlink is refused (S15).
+
+**Typed-number rule demoted to MEDIUM (process rule 4).** It is a text heuristic. On the stored manuscripts
+(v2blind1, attempts 7 and 8, smokes 1 and 2, the Phase 40 smoke) it flags 550 numbers. At least 245 of them (45%) are
+false positives by context class: section numbers, citations and DOIs, pasted decision trees, leading-zero ids,
+interval levels, data ranges, unit denominators and software versions. So the finding is MEDIUM and declarable. The
+interval level and every value in the spec, the ledger or the question are exempt, matched at the precision written
+(T56). The structural cases stay HIGH: a bare ledger id and an unresolved or unrendered `[CLAIM:]`.
+
+**Typed-number rule lowered to LOW (advisory).** Item 2 makes an open MEDIUM block ACCEPT in v2. A MEDIUM with a
+false-positive rate of 45% or more would therefore spend fix rounds and add spurious declarations to correct reports.
+The finding is now LOW. It is recorded in `findings.jsonl` and named in the presentation critic's prompt, but it never
+blocks, never goes to the fix loop and is never declared. A run whose only open finding is a typed number reaches
+ACCEPT (T57; the same run ended `run_failed` with the MEDIUM).
+
+It goes back up to MEDIUM or HIGH only after both of these:
+- its false-positive classes are exempted structurally (section and figure numbers, citations, pasted artifact text,
+  identifiers, threshold levels, data ranges, unit denominators, versions);
+- a new measurement on the stored runs.

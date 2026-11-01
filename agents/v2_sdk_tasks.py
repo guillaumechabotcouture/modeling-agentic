@@ -26,8 +26,8 @@ OUT = "_task_output.json"
 # Files only the harness writes in a v2 run.
 HARNESS_FILES = ("run_state.json", "findings.jsonl", "impact_ledger.jsonl", "metadata.json", "final_gate.json",
                  "decision_spec.signoff.json", "engine_choice.json", "validator_history.jsonl", "done_when_registry.json",
-                 "report.md", "allocation_optimized.csv")
-HARNESS_PREFIXES = ("analysis/", "models/pipeline", "gate_r", "fix_plan_r", "evidence/")
+                 "report.md", "allocation_optimized.csv", "data/inputs_provenance.json", "declared_findings.yaml")
+HARNESS_PREFIXES = ("analysis/", "models/pipeline", "gate_r", "fix_plan_r", "evidence/", "data/inputs/")
 
 COMMON = """You are one bounded task inside a modeling run driven by code (a state machine). The harness
 computes every number from the decision spec and the engine; you never type a number the report
@@ -41,9 +41,11 @@ PROMPTS = {
 Task: draft decision_spec.yaml for the question, and analysis_settings.yaml with the
 computational settings only ({settings}; not repeated in the spec). Follow {skill} (the schema is the
 docstring of {schema}; a full example is {example}). Write `engine: auto`: the harness chooses the
-engine after sign-off. The question's input files are relative to the repository root {repo}; copy or
-derive what the spec reads (the units table, the calibration targets) into data/ in the run
-directory, only from those files, with a short derivation note in data/README.md. The spec's paths
+engine after sign-off. The harness has copied the question's input files into data/inputs/ (same
+relative paths; their sha256 in data/inputs_provenance.json): read and cite those copies. Derive
+what the spec reads (the units table, the calibration targets, the costs) from them, into data/ in
+the run directory, with a short derivation note in data/README.md; take every number from a file,
+never type one from memory. Every file the spec cites must be inside the run directory; its paths
 are relative to the run directory. Output: decision_spec.yaml, analysis_settings.yaml and
 {out} = {{"ok": true, "notes": "..."}}.""",
     "pick_engine": COMMON + """
@@ -56,13 +58,26 @@ needs, validated benchmarks). Output: {out} = {{"engine": "<ref>", "why": "..."}
 Task: {reviewer} review, round {round}. Review the computed facts: the analysis artifacts in
 analysis/ (manifest.json and the *.yaml artifacts it lists), results.md, uncertainty_report.yaml,
 the deliverable file the spec names, engine_choice.json, decision_spec.yaml, impact_ledger.jsonl
-and the draft (manuscript.md) if it exists. Judge what code cannot: plausibility against the domain, whether the
+and the draft (manuscript.md) if it exists. The presentation review also reads findings.jsonl:
+its LOW report_number_typed rows (advisory) name numbers the writer typed instead of [CLAIM:id];
+raise one only if it misleads the reader. Judge what code cannot: plausibility against the domain, whether the
 comparator and the objective match the question, hidden assumptions, overclaims. Write
 {file} in the critique-blockers schema: reviewer, round, verdict (PASS | REVISE),
 structural_mismatch {{detected: bool}}, carried_forward (round 1: []), blockers (ids {prefix}-NNN;
 each with id, severity ({severities}), category ({categories}), target_stage ({stages}),
-first_seen_round, claim, evidence, fix_requires, resolved (true/false), and a done_when test where one
-fits). Use only those values: the gate refuses any other.{feedback}
+first_seen_round, claim, evidence, fix_requires, resolved (true/false), and done_when (required for
+HIGH and MEDIUM). Use only those values: the gate refuses any other.
+
+done_when is a structured test the harness runs, never prose: a list of checks, all must pass.
+  - {{file: <path in the run>, exists: true}}
+  - {{file: <path>, contains: "<regex>"}}   or   {{file: <path>, lacks: "<regex>"}}
+  - {{file: <x.yaml or .json>, key: a.b.0, op: "==|!=|<|<=|>|>=|between|in|matches|width_gt", value: <v>}}
+  - {{file: <x.csv>, column: <name>, op: <op>, value: <v>, rows: all|any|none}}  (or agg: sum|mean|min|max|count)
+  - {{judgement: "<what would show it is fixed>"}}   only when no runnable check fits; at most one
+Example:
+  done_when:
+    - {{file: uncertainty_report.yaml, key: sampler_varied_parameters, op: ">=", value: 16}}
+    - {{file: manuscript.md, contains: "decision rule"}}{feedback}
 Then write {out} = {{"ok": true}}.""",
     "plan_fixes": FIX_PLANNER_PROMPT + "\nThe packet is in {out_in}. Write your JSON to {out}.",
     "fix": COMMON + """
@@ -79,8 +94,9 @@ Output: {out} = {{"ok": true, "changed": "<one line>"}}.""",
 Task: write manuscript.md ({mode}). Read results.md and the analysis artifacts in analysis/
 (manifest.json lists them), engine_choice.json, decision_spec.yaml and scope_declaration.yaml if
 present. Write the narrative, the methods and the
-interpretation. Refer to numbers by name (the harness renders the numbers table below your text);
-do not type them. Mode `not_accepted`: the first section is "Status: not accepted by the final
+interpretation. Write every number as a reference [CLAIM:<id>] to models/claims_ledger.yaml
+(the ids are listed there): the harness substitutes the value. Never type a number, and never write
+a bare id such as `mix.itn`: the gate refuses a report that shows one. Mode `not_accepted`: the first section is "Status: not accepted by the final
 gate", listing the open blocking findings from findings.jsonl in plain words. Mode `declared`: a
 Limitations section that repeats each declaration. Output: manuscript.md and {out} = {{"ok": true}}.""",
 }
@@ -91,11 +107,72 @@ OWNS = {"draft_spec": ("decision_spec.yaml", "analysis_settings.yaml", "data/"),
 def _answer_key(target: str, run_dir: str) -> bool:
     """A path into the repository's evals/ tree or any _truth directory. data/evals/<q>/ (the
     questions' public inputs) is readable."""
-    if "_truth" in target.replace("\\", "/").split("/"):
+    low = target.replace("\\", "/").lower()
+    if "_truth" in low.split("/"):
         return True
     p = os.path.realpath(os.path.join(run_dir, os.path.expanduser(target)))
-    rel = os.path.relpath(p, enforcement.REPO_ROOT).replace(os.sep, "/")
-    return rel == "evals" or rel.startswith("evals/") or target.replace("\\", "/").lstrip("./").startswith("evals/")
+    if "_truth" in p.replace(os.sep, "/").lower().split("/"):
+        return True                                    # a link resolving into an answer-key tree
+    rel = os.path.relpath(p, enforcement.REPO_ROOT).replace(os.sep, "/").lower()   # case-insensitive filesystems
+    return rel == "evals" or rel.startswith("evals/") or low.lstrip("./").startswith("evals/")
+
+
+def _reaches_answer_keys(base: str, limit: int = 20000) -> bool:
+    """Does a recursive search from `base` reach an answer key: a _truth directory or file, an evals/
+    tree, or a symlink resolving into one? Fail closed past `limit` entries."""
+    n = 0
+    for root, dirs, files in os.walk(base, followlinks=False):
+        for name in dirs + files:
+            n += 1
+            if n > limit:
+                return True
+            full = os.path.join(root, name)
+            if name.lower() == "_truth" or _answer_key(full, base):
+                return True
+            if os.path.islink(full) and _answer_key(os.path.realpath(full), base):
+                return True
+    return False
+
+
+def _within(p: str, root: str) -> bool:
+    p, root = os.path.normcase(p).lower(), os.path.normcase(root).lower()   # case-insensitive filesystems
+    return p == root or p.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def _search_denied(tool: str, ti: dict, run_dir: str) -> str | None:
+    """Why a Read, Grep or Glob may not run. A path or pattern naming the evaluation tree is refused;
+    so is any search whose root contains the repository's evals/ tree (a Grep at the repository root
+    reaches evals/**/_truth whatever its pattern), unless the search is confined to the run directory
+    or data/."""
+    import glob as _glob
+    target = str(ti.get("file_path") or ti.get("path") or "")
+    pattern = str(ti.get("pattern") or "") if tool == "Glob" else ""
+    filters = [str(ti.get(k) or "") for k in ("glob", "type")] + ([pattern] if pattern else [])
+    if (target and _answer_key(target, run_dir)) or any(f and ("_truth" in f.lower() or _answer_key(f, run_dir))
+                                                          for f in filters):
+        return "evaluation answer keys are not readable"
+    if tool == "Read":
+        return None
+    base = os.path.realpath(os.path.join(run_dir, os.path.expanduser(target))) if target else os.path.realpath(run_dir)
+    if tool == "Glob" and pattern:
+        # A pattern can climb or be absolute: its literal prefix is part of the search root.
+        lit = []
+        for part in pattern.replace("\\", "/").split("/"):
+            if _glob.has_magic(part):
+                break
+            lit.append(part)
+        prefix = "/".join(lit)
+        if prefix:
+            base = os.path.realpath(os.path.join(base, prefix) if not pattern.startswith("/") else "/" + prefix.lstrip("/"))
+    repo = os.path.realpath(enforcement.REPO_ROOT)
+    evals = os.path.join(repo, "evals")
+    confined = _within(base, os.path.realpath(run_dir)) or _within(base, os.path.join(repo, "data"))
+    if not confined and _within(evals, base):
+        return (f"{tool} from {base} would search the evaluation tree (evals/); confine it to the run directory "
+                "or data/")
+    if os.path.isdir(base) and _reaches_answer_keys(base):
+        return f"{tool} from {base} can reach an answer-key file (a _truth tree or a link to one)"
+    return None
 
 
 def _allowed(path: str, run_dir: str, owns: tuple) -> str | None:
@@ -182,9 +259,9 @@ class SdkTasks:
                 if why:
                     return enforcement.deny_output(f"{kind}: {why}")
             if name in ("Read", "Grep", "Glob"):
-                tgt = str(ti.get("file_path") or ti.get("path") or ti.get("pattern") or "")
-                if _answer_key(tgt, self.run_dir):
-                    return enforcement.deny_output("evaluation answer keys are not readable")
+                why = _search_denied(name, ti, self.run_dir)
+                if why:
+                    return enforcement.deny_output(why)
             return {}
 
         opts = ClaudeAgentOptions(system_prompt=system, model=model or enforcement.MODEL_DEEP, tools=TOOLS,
@@ -361,6 +438,38 @@ def _self_test() -> int:
            and _answer_key(os.path.join(R, "evals", "q", "rubric.yaml"), d) and _answer_key("x/_truth/truth.json", d)
            and _answer_key("evals/q/generate.py", d),
            "S9 the questions' public inputs (data/evals/) are readable; evals/ and _truth are not")
+        ok(_answer_key(os.path.join(R, "EVALS", "q", "rubric.yaml"), d) and _answer_key("data/_TRUTH/t.json", d)
+           and _allowed("data/inputs/x.csv", d, ("data/",)) and _allowed("data/inputs_provenance.json", d, ("data/",))
+           and _allowed("data/units.csv", d, ("data/",)) is None,
+           "S12 (Codex #95) answer keys refused in any case; the staged inputs and their manifest are the harness's")
+        # S13: a search whose root contains the repository's evals/ tree is refused (a Grep at the repo
+        # root reaches evals/**/_truth whatever its pattern); one confined to the run or data/ is not.
+        rd = os.path.join(R, "runs", "x")
+        cases = {
+            "grep repo root": (("Grep", {"path": R, "pattern": "optimum"}), True),
+            "glob repo root": (("Glob", {"path": R, "pattern": "**/truth.json"}), True),
+            "glob climbing pattern": (("Glob", {"pattern": "../../**/truth.json"}), True),
+            "grep above the repo": (("Grep", {"path": os.path.dirname(R), "pattern": "x"}), True),
+            "grep run dir": (("Grep", {"path": rd, "pattern": "optimum"}), False),
+            "grep default (run dir)": (("Grep", {"pattern": "optimum"}), False),
+            "glob data/": (("Glob", {"path": os.path.join(R, "data"), "pattern": "**/*.csv"}), False),
+            "read a data file": (("Read", {"file_path": os.path.join(R, "data", "evals", "q", "a.csv")}), False),
+        }
+        got = {k: bool(_search_denied(t, ti, rd)) == want for k, ((t, ti), want) in cases.items()}
+        ok(all(got.values()), f"S13 searches that reach evals/ are refused, confined ones are not {got}")
+        # S14-S15: Codex round 2. A _truth tree or a link into one under an allowed root, a Grep glob
+        # naming _truth, and a symlinked file resolving into _truth are refused.
+        rr = os.path.join(d, "rr")
+        os.makedirs(os.path.join(rr, "data", "private", "_truth"))
+        open(os.path.join(rr, "data", "private", "_truth", "secret.json"), "w").write("{}")
+        os.makedirs(os.path.join(rr, "run"))
+        os.symlink(os.path.join(rr, "data", "private", "_truth", "secret.json"), os.path.join(rr, "run", "alias.json"))
+        ok(_search_denied("Grep", {"path": os.path.join(rr, "data"), "pattern": ".", "glob": "**/_truth/**"}, rr)
+           and _search_denied("Grep", {"path": os.path.join(rr, "data"), "pattern": "."}, rr)
+           and _search_denied("Grep", {"path": os.path.join(rr, "run"), "pattern": "."}, os.path.join(rr, "run")),
+           "S14 a search under an allowed root that can reach a _truth tree (directly, by glob, or by a link) is refused")
+        ok(_search_denied("Read", {"file_path": "alias.json"}, os.path.join(rr, "run")),
+           "S15 a Read of a link resolving into _truth is refused")
         import validate_critique_yaml as V
         cp = PROMPTS["critique"].format(reviewer="critique-domain", round=1, file="f", prefix="D", out=OUT,
                                         feedback="\n- X", severities="H", categories=" | ".join(sorted(V.VALID_CATEGORY)),

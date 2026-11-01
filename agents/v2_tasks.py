@@ -187,7 +187,11 @@ class StubTasks:
             pass
         head = {"accepted": "", "declared": "Status: scope declared (see Limitations).\n\n",
                 "not_accepted": "Status: not accepted by the final gate.\n\n"}[mode]
-        text = (f"# Report\n\n{head}The plan is the harness's optimisation; every number below is rendered from "
-                f"analysis/analysis.json.\n\n<!-- numbers: {json.dumps((A.get('point') or {}).get('averted'))} -->\n")
+        ref = (" It averts [CLAIM:headline.point] cases."
+               if os.path.exists(os.path.join(run_dir, "models", "claims_ledger.yaml")) else "")
+        text = f"# Report\n\n{head}The plan is the harness's optimisation; the harness renders every number.{ref}\n"
+        if self.s.get("manuscript"):
+            text = f"# Report\n\n{head}{self.s['manuscript']}"
+        del A
         open(os.path.join(run_dir, "manuscript.md"), "w").write(text)
         return self._r(f"write:{mode}")
