@@ -1,0 +1,149 @@
+# Coverage pack (design note v2d §5): simulation-based calibration of the HARNESS calibration plus
+# uncertainty chain on the compartmental engine. Its generators (oracles.py: generate_*) are the reference
+# ODE, an independent latent-coverage generator and the final-size fixed point, never the engine or the
+# observation code under test. Each case runs 200 replicates with fixed seeds.
+#
+# The calibrator is the harness `posterior` method with observation models and identifiability classes
+# (v2d §3.1-§3.4, workstream β). It does not exist yet, so every case below reports not_assessable until β
+# lands; the runner never counts a missing calibrator as a pass.
+#   python3 -m toolkit.engines.benchmark toolkit/engines/compartmental/benchmarks/coverage.yaml run --out <path>
+engine: toolkit.engines.compartmental.engine:CompartmentalEngine
+oracles: toolkit.engines.compartmental.benchmarks.oracles
+default_config: renewal
+seeds: [1]
+horizon: {start: 0, stop: 210, window: [0, 210], windows: {all: [0, 210]}}
+configs:
+  renewal: {groups: [all], structure: single_group, mode: windowed, initialiser: given, dt: week,
+            generation_interval: [0.767455843065087, 0.146995943257602, 0.054076785460076, 0.019893737615401, 0.007318497076765, 0.002692324614815, 0.00099045087475, 0.000364366514311, 0.000134042949666, 4.9311645416e-05, 1.8140740559e-05, 6.673605499e-06, 2.455082262e-06, 9.0317429e-07, 3.32259253e-07, 1.22231348e-07, 4.49664e-08, 1.6542214e-08, 6.085541e-09, 2.238745e-09],
+            forcing: cosine, forcing_period: 365.0}
+  cohorts: {groups: [b2021, b2022, b2023, b2024, b2025], structure: birth_cohorts, mode: to_extinction,
+            initialiser: cohort_history, doses: [d1], dt: day, generation_interval: [0.5, 0.5]}
+  groups3: {groups: [a, b, c], structure: age_groups_contact_matrix, mode: to_extinction, initialiser: given,
+            dt: day, transmission: q, generation_interval: [0.5, 0.3, 0.2],
+            components: {plan: {kind: campaign, targets: [b], reach: 0.5}}, outcomes: [hospitalisations]}
+settings: {}
+arms: {}
+benchmarks:
+  - id: SB1
+    metric: "identified renewal fit: known initial susceptibility, unforced, complete epidemic"
+    estimand:
+      type: coverage
+      generator: {fn: renewal_series, args: {weeks: 30}}
+      calibrator: {fn: "toolkit.analysis.calibration:posterior", args: {config: renewal, priors: {
+        r0: {dist: uniform, range: [1.3, 2.5]}, reporting: {dist: loguniform, range: [0.0333, 0.333]}},
+        forcing: none, s0: known}}
+      replicates: 200
+      seed: 101
+      quantities: [r0, attack_rate, reff_end]
+      band: [0.90, 0.99]
+      classes: {reporting: [identified]}
+      class_share_min: 0.90
+  - id: SB2a
+    metric: "confounded: series truncated before depletion; prior range of reporting carried"
+    estimand:
+      type: coverage
+      generator: {fn: renewal_series, args: {weeks: 30, truncate_weeks: 6}}
+      calibrator: {fn: "toolkit.analysis.calibration:posterior", args: {config: renewal, priors: {
+        r0: {dist: uniform, range: [1.3, 2.5]}, reporting: {dist: loguniform, range: [0.0333, 0.333]}},
+        forcing: none, s0: known}}
+      replicates: 200
+      seed: 102
+      quantities: [attack_rate]
+      band: [0.90, 0.99]
+      classes: {reporting: [prior_dominated, on_ridge]}
+      class_share_min: 0.90
+  - id: SB2a_neg
+    metric: "negative control for SB2a: reporting fixed at its prior median (reproduces the v1 failure)"
+    estimand:
+      type: coverage
+      generator: {fn: renewal_series, args: {weeks: 30, truncate_weeks: 6}}
+      calibrator: {fn: "toolkit.analysis.calibration:posterior", args: {config: renewal, priors: {
+        r0: {dist: uniform, range: [1.3, 2.5]}}, fixed: {reporting: 0.1053}, forcing: none, s0: known}}
+      replicates: 200
+      seed: 102
+      quantities: [attack_rate]
+      band: [0.0, 0.80]
+  - id: SB2b
+    metric: "confounded: unknown initial susceptible share (declared prior) and unknown forcing amplitude, complete series"
+    estimand:
+      type: coverage
+      generator: {fn: renewal_series, args: {weeks: 30, s0_range: [0.4, 1.0], forcing_amplitude_range: [0.0, 0.3]}}
+      calibrator: {fn: "toolkit.analysis.calibration:posterior", args: {config: renewal, priors: {
+        r0: {dist: uniform, range: [1.3, 2.5]}, reporting: {dist: loguniform, range: [0.0333, 0.333]},
+        s0: {dist: uniform, range: [0.4, 1.0]}, forcing_amplitude: {dist: uniform, range: [0.0, 0.3]}}}}
+      replicates: 200
+      seed: 103
+      quantities: [attack_rate]
+      band: [0.90, 0.99]
+      classes: {reporting: [prior_dominated, on_ridge]}
+      class_share_min: 0.90
+      ridge_names: [reporting, s0]
+  - id: SB2c
+    metric: "identified despite known forcing: known susceptibility and depletion"
+    estimand:
+      type: coverage
+      generator: {fn: renewal_series, args: {weeks: 30, forcing_amplitude_range: [0.2, 0.2]}}
+      calibrator: {fn: "toolkit.analysis.calibration:posterior", args: {config: renewal, priors: {
+        r0: {dist: uniform, range: [1.3, 2.5]}, reporting: {dist: loguniform, range: [0.0333, 0.333]}},
+        forcing: {amplitude: 0.2, phase: 0.0}, s0: known}}
+      replicates: 200
+      seed: 104
+      quantities: [r0, attack_rate, reff_end]
+      band: [0.90, 0.99]
+      classes: {reporting: [identified]}
+      class_share_min: 0.90
+  - id: SB3a
+    metric: "cohort immunity from two overlapping sources (admin coverage with numerator inflation and denominator error; serosurvey with assay error, waning, frame gap)"
+    estimand:
+      type: coverage
+      generator: {fn: cohort_sources, args: {}}
+      calibrator: {fn: "toolkit.analysis.calibration:posterior", args: {config: cohorts, sources: [admin, sero]}}
+      replicates: 200
+      seed: 105
+      quantities: [susceptible_share]
+      band: [0.90, 0.99]
+      classes: {omega: [prior_dominated, on_ridge], delta: [prior_dominated, on_ridge], ratio: [identified]}
+      class_share_min: 0.90
+  - id: SB3b_admin_truth
+    metric: "negative control: administrative coverage taken as the truth"
+    estimand:
+      type: coverage
+      generator: {fn: cohort_sources, args: {}}
+      calibrator: {fn: "toolkit.analysis.calibration:posterior", args: {config: cohorts, sources: [admin], treat_as_truth: admin}}
+      replicates: 200
+      seed: 105
+      quantities: [susceptible_share]
+      band: [0.0, 0.80]
+  - id: SB3b_sero_truth
+    metric: "negative control: the serosurvey taken as the truth"
+    estimand:
+      type: coverage
+      generator: {fn: cohort_sources, args: {}}
+      calibrator: {fn: "toolkit.analysis.calibration:posterior", args: {config: cohorts, sources: [sero], treat_as_truth: sero}}
+      replicates: 200
+      seed: 105
+      quantities: [susceptible_share]
+      band: [0.0, 0.80]
+  - id: SB3c
+    metric: "administrative coverage only: every bias parameter prior-dominated, prior ranges carried"
+    estimand:
+      type: coverage
+      generator: {fn: cohort_sources, args: {admin_only: true}}
+      calibrator: {fn: "toolkit.analysis.calibration:posterior", args: {config: cohorts, sources: [admin]}}
+      replicates: 200
+      seed: 106
+      quantities: [susceptible_share]
+      band: [0.90, 0.99]
+      classes: {omega: [prior_dominated], delta: [prior_dominated]}
+      class_share_min: 0.90
+  - id: SB5
+    metric: "group-attack-rate calibration of q: coverage of hospitalisations averted by a fixed plan"
+    estimand:
+      type: coverage
+      generator: {fn: group_attack, args: {}}
+      calibrator: {fn: "toolkit.analysis.calibration:posterior", args: {config: groups3, priors: {
+        q: {dist: uniform, range: [0.4, 1.0]}}}}
+      replicates: 200
+      seed: 107
+      quantities: [hospitalisations_averted]
+      band: [0.90, 0.99]

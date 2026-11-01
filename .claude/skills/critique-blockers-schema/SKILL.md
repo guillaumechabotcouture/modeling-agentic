@@ -273,7 +273,12 @@ Then:
 | `structural` true                                  | RETHINK. If no rounds left → run FAILS, no writer.|
 | `unresolved_high` non-empty, rounds remaining      | PATCH or RETHINK. ACCEPT is forbidden.            |
 | `unresolved_high` non-empty, no rounds remaining   | DECLARE_SCOPE with per-blocker acknowledgment.    |
+| DECLARE_SCOPE relying on a finding that bears on the decision | AWAIT_OWNER: the owner accepts or declines each such declaration (Phase 49 β). |
 | `unresolved_high` empty                            | ACCEPT. Proceed to STAGE 8.                       |
+
+A gate finding declared in `scope_declaration.yaml` also needs a decision
+test showing the recommendation does not change (Phase 49 α; rigor manifest
+entry `decision_tests`). Critic blockers are not affected.
 
 Your YAML is the input to this decision. If you mark things HIGH that
 aren't truly blocking, you waste rounds. If you mark blocking things

@@ -111,10 +111,22 @@ def _tarball(tree: str | None, src_dir: str | None) -> bytes | None:
 
 
 def _client(name):
-    c = rc.attach(name).get_client()
-    w = sorted(c.scheduler_info()["workers"])
+    """The VM cluster's client and its worker. The table is read with worker_side's bounded
+    reader (scheduler_info() is {} while the client is not connected; a closed client is
+    replaced from the cluster), so only a connected scheduler with no worker says so."""
+    cl, box = rc.attach(name), [None]
+
+    def client():
+        box[0] = ws.live_client(cl, box[0])
+        return box[0]
+
+    try:
+        w = sorted(ws.scheduler_workers(client, log=print))
+    except ws.SchedulerInfoUnavailable as e:
+        raise SystemExit(f"{name}: {e}") from e
     if not w:
         raise SystemExit(f"{name} has no worker yet")
+    c = client()
     c.upload_file(os.path.join(HERE, "worker_side.py"))   # the side functions below live in it
     return c, w[0]
 
@@ -290,11 +302,69 @@ def _self_test() -> int:
                "RC43 a job id that is running is not restarted")
         finally:
             ws.JOBS = old
+    _self_test_sched(ok)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_sched(ok) -> None:
+    """`_client` reads the VM's worker table through worker_side's bounded reader (PR #99's
+    race; no network): Client.scheduler_info() is {} while the client is not connected."""
+    import types
+    from unittest import mock
+
+    class FakeClient:
+        def __init__(self, infos, status="running"):
+            self.infos, self.status, self.uploads = list(infos), status, 0
+
+        def scheduler_info(self):
+            return self.infos.pop(0) if len(self.infos) > 1 else self.infos[0]
+
+        def upload_file(self, *a):
+            self.uploads += 1
+
+    table = {"tls://10.0.0.7:1": {}, "tls://10.0.0.5:1": {}}
+
+    def attach(clients):
+        it = iter(clients)
+        return lambda name: types.SimpleNamespace(get_client=lambda: next(it, clients[-1]))
+
+    sleeps = []
+    with mock.patch.object(time, "sleep", sleeps.append):
+        c = FakeClient([{}, {"workers": table}])
+        with mock.patch.object(rc, "attach", attach([c])):
+            try:
+                got = _client("vm1")
+            except BaseException as e:  # noqa: BLE001
+                got = f"{type(e).__name__}: {e}"
+        ok(got == (c, "tls://10.0.0.5:1") and c.uploads == 1 and len(sleeps) == 1,
+           f"VJ1 _client waits out an unpopulated identity, then uses the first worker: {got}")
+        closed, fresh = FakeClient([{}], status="closed"), FakeClient([{"workers": table}])
+        with mock.patch.object(rc, "attach", attach([closed, fresh])):
+            try:
+                got = _client("vm1")
+            except BaseException as e:  # noqa: BLE001
+                got = f"{type(e).__name__}: {e}"
+        ok(got == (fresh, "tls://10.0.0.5:1") and fresh.uploads == 1 and not closed.uploads,
+           f"VJ2 a closed client is replaced from the cluster before the upload: {got}")
+        with mock.patch.object(rc, "attach", attach([FakeClient([{}])])):
+            try:
+                _client("vm1")
+                ok(False, "VJ3 a worker table that never appears stops with a clear message")
+            except SystemExit as e:
+                ok("vm1" in str(e) and "worker table unavailable" in str(e) and "no worker yet" not in str(e),
+                   f"VJ3 a worker table that never appears stops with a clear message, not 'no worker yet': {e}")
+            except BaseException as e:  # noqa: BLE001
+                ok(False, f"VJ3 a worker table that never appears stops with SystemExit, not {type(e).__name__}: {e}")
+        with mock.patch.object(rc, "attach", attach([FakeClient([{"workers": {}}])])):
+            try:
+                _client("vm1")
+                ok(False, "VJ4 a connected scheduler with no worker still says so")
+            except SystemExit as e:
+                ok("no worker yet" in str(e), f"VJ4 a connected scheduler with no worker still says so: {e}")
 
 
 def main(argv=None) -> int:

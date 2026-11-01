@@ -1,0 +1,8 @@
+---
+phase: "50"
+commit: "δ"
+---
+
+## Changelog
+
+**Every remaining read of the scheduler's worker table uses the bounded reader from PR #99.** distributed's `Client.scheduler_info()` returns `{}`, with no `workers` key, whenever the client is not connected (before its first identity reply, while it reconnects, after a failed reconnect). PR #99 fixed the keeper and the launcher; the same unguarded `scheduler_info()["workers"]` read remained in `cloud/vm_job.py` (`_client`), `scripts/compute.py` (the dispatch read in `_map_dask`, which v2's engine batch reaches through `run_map`, the remote cancel when a call settles and for an orphaned call, and the vanished-worker check) and `scripts/replay_coiled.py` (sizing an attached pool and picking case workers). Each now reads through `cloud/worker_side.py`'s `scheduler_workers` (doubling backoff, then `SchedulerInfoUnavailable` naming the last state); `compute.py` and `replay_coiled.py` load that file by path under a private module name, so a run's `models/worker_side.py` cannot shadow it and nothing new is imported at module level. An unpopulated identity is never read as zero workers: dispatch waits it out or fails with a clear message instead of `KeyError`, a cancel that cannot read the table stays unconfirmed (and says why), the vanished-worker check still charges every worker as busy when the table cannot be read, `replay_coiled` never scales an attached pool on it (read as zero, it would have scaled a larger pool down to the batch's size), and `vm_job` replaces a closed client and says "no worker yet" only for a connected scheduler with none. Self-tests SR1-7 (`compute.py`), VJ1-4 (`vm_job.py`) and SQ1-5 (`replay.py`), on fake clients with no network, failed before the fix.

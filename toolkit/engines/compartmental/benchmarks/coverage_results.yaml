@@ -1,0 +1,149 @@
+producer: toolkit/engines/benchmark.py
+engine_identity:
+  name: compartmental-starsim
+  version: '0.1'
+  code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
+  params_sha256: 84120e872544e4d566f625a1bf62f2e5cbd865dd1031f8884dbb6087f73ef65d
+  config_sha256: 6732c72c3c8e0a4c85c9956ba75427e3366bf846807814032db292edb7160eaf
+engine_config_sha256: eb08a7e62ffdea9c74880c27a4834b582eb105a2a39b8f42779c6cb39b096c86
+benchmarks:
+- id: SB1
+  metric: 'identified renewal fit: known initial susceptibility, unforced, complete
+    epidemic'
+  role: held_out
+  target: null
+  band: null
+  source: ''
+  computed: null
+  in_band: false
+  status: not_assessable
+  not_assessable_because: 'calibrator toolkit.analysis.calibration:posterior not available
+    (AttributeError: module ''toolkit.analysis.calibration'' has no attribute ''posterior'')'
+- id: SB2a
+  metric: 'confounded: series truncated before depletion; prior range of reporting
+    carried'
+  role: held_out
+  target: null
+  band: null
+  source: ''
+  computed: null
+  in_band: false
+  status: not_assessable
+  not_assessable_because: 'calibrator toolkit.analysis.calibration:posterior not available
+    (AttributeError: module ''toolkit.analysis.calibration'' has no attribute ''posterior'')'
+- id: SB2a_neg
+  metric: 'negative control for SB2a: reporting fixed at its prior median (reproduces
+    the v1 failure)'
+  role: held_out
+  target: null
+  band: null
+  source: ''
+  computed: null
+  in_band: false
+  status: not_assessable
+  not_assessable_because: 'calibrator toolkit.analysis.calibration:posterior not available
+    (AttributeError: module ''toolkit.analysis.calibration'' has no attribute ''posterior'')'
+- id: SB2b
+  metric: 'confounded: unknown initial susceptible share (declared prior) and unknown
+    forcing amplitude, complete series'
+  role: held_out
+  target: null
+  band: null
+  source: ''
+  computed: null
+  in_band: false
+  status: not_assessable
+  not_assessable_because: 'calibrator toolkit.analysis.calibration:posterior not available
+    (AttributeError: module ''toolkit.analysis.calibration'' has no attribute ''posterior'')'
+- id: SB2c
+  metric: 'identified despite known forcing: known susceptibility and depletion'
+  role: held_out
+  target: null
+  band: null
+  source: ''
+  computed: null
+  in_band: false
+  status: not_assessable
+  not_assessable_because: 'calibrator toolkit.analysis.calibration:posterior not available
+    (AttributeError: module ''toolkit.analysis.calibration'' has no attribute ''posterior'')'
+- id: SB3a
+  metric: cohort immunity from two overlapping sources (admin coverage with numerator
+    inflation and denominator error; serosurvey with assay error, waning, frame gap)
+  role: held_out
+  target: null
+  band: null
+  source: ''
+  computed: null
+  in_band: false
+  status: not_assessable
+  not_assessable_because: 'calibrator toolkit.analysis.calibration:posterior not available
+    (AttributeError: module ''toolkit.analysis.calibration'' has no attribute ''posterior'')'
+- id: SB3b_admin_truth
+  metric: 'negative control: administrative coverage taken as the truth'
+  role: held_out
+  target: null
+  band: null
+  source: ''
+  computed: null
+  in_band: false
+  status: not_assessable
+  not_assessable_because: 'calibrator toolkit.analysis.calibration:posterior not available
+    (AttributeError: module ''toolkit.analysis.calibration'' has no attribute ''posterior'')'
+- id: SB3b_sero_truth
+  metric: 'negative control: the serosurvey taken as the truth'
+  role: held_out
+  target: null
+  band: null
+  source: ''
+  computed: null
+  in_band: false
+  status: not_assessable
+  not_assessable_because: 'calibrator toolkit.analysis.calibration:posterior not available
+    (AttributeError: module ''toolkit.analysis.calibration'' has no attribute ''posterior'')'
+- id: SB3c
+  metric: 'administrative coverage only: every bias parameter prior-dominated, prior
+    ranges carried'
+  role: held_out
+  target: null
+  band: null
+  source: ''
+  computed: null
+  in_band: false
+  status: not_assessable
+  not_assessable_because: 'calibrator toolkit.analysis.calibration:posterior not available
+    (AttributeError: module ''toolkit.analysis.calibration'' has no attribute ''posterior'')'
+- id: SB5
+  metric: 'group-attack-rate calibration of q: coverage of hospitalisations averted
+    by a fixed plan'
+  role: held_out
+  target: null
+  band: null
+  source: ''
+  computed: null
+  in_band: false
+  status: not_assessable
+  not_assessable_because: 'calibrator toolkit.analysis.calibration:posterior not available
+    (AttributeError: module ''toolkit.analysis.calibration'' has no attribute ''posterior'')'
+settings_calibrated: {}
+fitted_used: {}
+configs_validated: {}
+configs_not_exercised:
+- cohorts
+- groups3
+- renewal
+seeds:
+- 1
+n_sims: 0
+summary:
+  in_band: 0
+  total: 10
+  by_status:
+    in_band: 0
+    out_of_band: 0
+    not_assessable: 10
+    band_mis_based: 0
+  held_out_in_band: 0
+  held_out_total: 10
+engine_version: '0.1'
+fit_rule: null
+wall_s: 0.0

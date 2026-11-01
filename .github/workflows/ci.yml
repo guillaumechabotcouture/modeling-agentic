@@ -40,7 +40,11 @@ jobs:
       - name: Self-tests (every script with --self-test)
         run: |
           fail=0
-          for f in main.py $(git ls-files 'scripts/*.py' 'scripts/lib/*.py' 'toolkit/**/*.py' 'cloud/*.py'); do
+          # v2's harness modules under agents/ are listed by name (other agents/ files only mention
+          # --self-test in text, or run a live preflight).
+          for f in main.py $(git ls-files 'scripts/*.py' 'scripts/lib/*.py' 'toolkit/**/*.py' 'cloud/*.py') \
+              agents/stage_machine.py agents/findings_ledger.py agents/fix_loop.py \
+              agents/analysis_backend.py agents/v2_sdk_tasks.py; do
             case "$f" in */__init__.py) continue;; esac
             grep -q -- '--self-test' "$f" || continue
             echo "::group::$f"
@@ -49,6 +53,12 @@ jobs:
           done
           exit $fail
 
+      # HEAD is the PR's merge commit; its first parent is the base branch. --upstream:
+      # a PR into a long-lived branch (v2) that merges main brings main's checked rows.
+      - name: Ledger and plan Status change only through changes/ fragments
+        if: github.event_name == 'pull_request'
+        run: .venv/bin/python scripts/assemble_changes.py --check-pr HEAD^1 --upstream origin/main
+
       - name: Skill attachments and expert priors
         run: |
           .venv/bin/python scripts/validate_skill_attachments.py
@@ -56,6 +66,12 @@ jobs:
 
       - name: Planted-defect regression eval (deterministic gates)
         run: .venv/bin/python scripts/regression_eval.py
+
+      # Every gate_findings(run_dir) check against every bad-input class; known
+      # failures are listed in tests/gate_fuzz_expected.yaml.
+      - name: Gate fuzz (bad input never crashes a check or makes it pass)
+        timeout-minutes: 3
+        run: .venv/bin/python scripts/gate_fuzz.py
 
       - name: Structure metrics against main (information only)
         if: always()

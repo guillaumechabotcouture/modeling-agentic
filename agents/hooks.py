@@ -20,7 +20,9 @@ from agents import enforcement, _registry
 # scripts/ is on sys.path: agents/__init__.py put it there before importing this module.
 import open_problems  # noqa: E402  (Phase 32: open-problem list, round plan, fix checks)
 import decision_brief  # noqa: E402  (Phase 33: the signed decision brief)
+import scope_signoff  # noqa: E402  (Phase 49 β: the owner signs decision-bearing declarations)
 import derived_rebuild  # noqa: E402  (Phase 39 β: the harness regenerates stale figures)
+import presentation_pass  # noqa: E402  (Phase 49 δ: which draft each presentation review read)
 
 REPO_ROOT = enforcement.REPO_ROOT
 
@@ -64,6 +66,27 @@ def _safe_write(trace_file, record: dict) -> None:
         trace_file.flush()
     except (ValueError, OSError):
         pass
+
+
+def report_integrity(events, trace_file) -> None:
+    """Print and trace integrity violations found at any end of an in-flight call."""
+    for ev in events or ():
+        print(f"[INTEGRITY] unexplained {ev['change']} of {ev['file']} "
+              f"(in flight: {ev['in_flight'] or 'nothing'})", flush=True)
+        _safe_write(trace_file, {"ts": ev["ts"], "type": "integrity_violation", **ev})
+
+
+# evalbase1 flu_vaccine: the modeler ran `nohup python3 scripts/pipeline.py run . &` itself;
+# that writes every declared output into the real run directory outside the harness's run,
+# and each file became an integrity violation (56 events).
+PIPELINE_BUILD_DENY = (
+    "a full `scripts/pipeline.py run <run_dir>` writes the declared outputs into the real run "
+    "directory, and only the harness's own pipeline run may write them (it builds the stale steps "
+    "after your turn ends). Allowed forms: try one step in a copy with "
+    "`python3 scripts/pipeline.py run <run_dir> <step> --scratch [--keep]`, list what would rerun with "
+    "`python3 scripts/pipeline.py run <run_dir> --dry-run`, check the file with "
+    "`python3 scripts/pipeline.py validate <run_dir>`, or ask the lead to have the harness build the "
+    "pipeline (it does so after each modeler and analyst stage).")
 
 
 def snapshot_report(run_path: str, state: dict) -> bool:
@@ -335,6 +358,21 @@ def signoff_hold_reason(run_path: str, mode: str | None, run_dir_rel: str = "{ru
             "open questions with --answers <file>).")
 
 
+def scope_hold_reason(run_path: str, mode: str | None, run_dir_rel: str = "{run_dir}") -> str | None:
+    """Phase 49 β: the writer waits while declarations of findings that bear on
+    the primary decision wait for sign-off (owner mode: the owner; lead mode: the lead)."""
+    if mode not in ("owner", "lead") or scope_signoff.status(run_path) != "awaiting":
+        return None
+    if mode == "owner":
+        return ("The gate's decision is AWAIT_OWNER: declarations of findings that bear on the primary decision "
+                "wait for the owner (scope_signoff_request.json). Do not spawn the writer. End your turn now with the "
+                "line AWAITING_SIGNOFF; the harness resumes you with the owner's answers.")
+    return (f"The gate's decision is AWAIT_OWNER. Review `python3 scripts/scope_signoff.py show {run_dir_rel}` (each "
+            f"finding, its declaration and decision test), write {run_dir_rel}/{scope_signoff.LEAD_ANSWERS} (one line "
+            "per finding: `\"<finding>\": {decision: accept|decline, note: <why>}`), then end your turn with the line "
+            "AWAITING_SIGNOFF; the harness signs your answers and resumes you.")
+
+
 def create_hooks(run_path: str, trace_file, start_time: datetime,
                  registered_agents=None, max_turns: dict[str, int] | None = None,
                  integrity=None, budget_status=None, max_rounds: int | None = None,
@@ -352,6 +390,7 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
     turn_warned: dict[str, set] = {}
     agent_types: dict[str, str] = {}
     snapshot_state: dict = {}
+    review_before: dict[str, str | None] = {}   # Phase 49 δ: critique sha at each presentation spawn
     session_t0 = time.time()   # Phase 32 γ: background agents end with their session
     if registered_agents is None:
         registered_agents = set(_registry().keys())
@@ -405,9 +444,18 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
         sub = tool_input.get("subagent_type") if spawn else None
         if not deny_reason and spawn and sub != "planner":
             deny_reason = signoff_hold_reason(run_path, signoff, run_path)
+        if not deny_reason and tool_name == "Bash":
+            from agents.integrity import pipeline_builds
+            if pipeline_builds(str(tool_input.get("command") or ""), input_data.get("cwd")):
+                deny_reason = PIPELINE_BUILD_DENY
         if (not deny_reason and signoff == "owner" and tool_name == "Bash"
                 and re.search(r"decision_brief\.py\b.*\bsign\b", str(tool_input.get("command") or ""), re.S)):
             deny_reason = "The owner signs the decision brief in this run; agents cannot sign it."
+        if (not deny_reason and signoff in ("owner", "lead") and tool_name == "Bash"
+                and re.search(r"scope_signoff\.py\b.*\bsign\b", str(tool_input.get("command") or ""), re.S)):
+            deny_reason = "Agents cannot sign scope declarations (the harness records the answers)."   # Phase 49 β
+        if not deny_reason and spawn and sub == "writer":
+            deny_reason = scope_hold_reason(run_path, signoff, run_path)   # Phase 49 β
         if not deny_reason and spawn:
             deny_reason = review_wait_reason(run_path, sub, session_t0)
         if not deny_reason and hold_writer and sub == "writer":
@@ -476,10 +524,30 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
         _safe_write(trace_file, record)  # a closed trace must not disable enforcement
         if deny_reason:
             return enforcement.deny_output(deny_reason)
+        updated = None
+        if spawn and sub == "critique-presentation" and tool_use_id \
+                and head.startswith("This is critique round") and presentation_pass.draft_file(run_path):
+            # Phase 49 δ (Codex round 2): only a full review is a review (a repair or a
+            # fix check never creates or refreshes the record). The harness snapshots
+            # the files the critic reads, read-only, records their hashes now, and
+            # points the critic at the snapshot.
+            try:
+                snap = presentation_pass.snapshot(run_path)
+                review_before[tool_use_id] = snap
+                if integrity is not None:
+                    for rel in snap["copied"]:
+                        integrity.harness_wrote(rel)
+                updated = dict(tool_input, prompt=str(tool_input.get("prompt") or "")
+                               + presentation_pass.snapshot_note(run_path, snap))
+            except OSError:
+                pass
         if integrity is not None:
             # Phase 23 α: record what this allowed call may change.
             integrity.on_pre(tool_use_id, tool_name, tool_input, agent_type,
-                             cwd=input_data.get("cwd"))
+                             cwd=input_data.get("cwd"), agent_id=agent_id)
+        if updated is not None:
+            return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow",
+                                           "updatedInput": updated}}
         return {}
 
     async def post_tool_hook(input_data, tool_use_id, context):
@@ -498,11 +566,18 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
                     if fname.endswith(".png"):
                         _check_figure_size(os.path.join(fig_dir, fname), agent_id)
         snapshot_report(run_path, snapshot_state)
+        if tool_use_id in review_before:
+            # Phase 49 δ (Codex): record which draft this presentation review read and
+            # whether it produced a usable critique; the gate requires one for the
+            # delivered draft before ACCEPT.
+            try:
+                presentation_pass.record_review(run_path, review_before.pop(tool_use_id))
+                if integrity is not None:
+                    integrity.harness_wrote(presentation_pass.REVIEW)
+            except OSError:
+                pass
         if integrity is not None:
-            for ev in integrity.on_post(tool_use_id):
-                print(f"[INTEGRITY] unexplained {ev['change']} of {ev['file']} "
-                      f"(in flight: {ev['in_flight'] or 'nothing'})", flush=True)
-                _safe_write(trace_file, {"ts": ev["ts"], "type": "integrity_violation", **ev})
+            report_integrity(integrity.on_post(tool_use_id), trace_file)
         if agent_id == "lead" and tool_name in ("Agent", "Task"):
             note = budget_note(_status(), len({r.get("round") for r in _gate_rounds(run_path)}))
             if note:
@@ -585,6 +660,10 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
             "turns_used": turns_used,
             "approx_stop_reason": approx_stop_reason,
         })
+        if integrity is not None:
+            # Its calls still in flight end here (a call the CLI moved to the background
+            # gets no PostToolUse), before the harness builds anything after this stage.
+            report_integrity(integrity.on_agent_stop(agent_id), trace_file)
         # Phase 39 β: figures drawn from this stage's outputs are regenerated by
         # the harness before anyone reads them (the analyst, the critics, the gate).
         if agent_type in REBUILD_AFTER:
