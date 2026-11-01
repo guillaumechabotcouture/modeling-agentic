@@ -139,10 +139,14 @@ def validate(pack: dict, engine) -> list[str]:
                 bad.append(f"{b.get('id')}: estimand has both value and values")
             if e["type"] not in ("ratio", "odds_ratio"):
                 bad.append(f"{b.get('id')}: values (several value paths) is only for ratio and odds_ratio")
-            if not (isinstance(vs, list) and vs and all(isinstance(v, dict) and v.get("path")
-                                                         and isinstance(v.get("weight"), (int, float)) and v["weight"] > 0
-                                                         for v in vs)):
-                bad.append(f"{b.get('id')}: values must be a non-empty list of {{path, weight > 0}}")
+            if not (isinstance(vs, list) and vs and all(isinstance(v, dict) and value_path_ok(v.get("path"))
+                                                         and _pos_weight(v.get("weight")) for v in vs)):
+                bad.append(f"{b.get('id')}: values must be a non-empty list of {{path, weight}} with a valid value "
+                           "path and a finite weight > 0")
+        if "diagnostic_values" in e:
+            dv = e.get("diagnostic_values")
+            if not (isinstance(dv, list) and all(value_path_ok(x) for x in dv)):
+                bad.append(f"{b.get('id')}: diagnostic_values must be a list of valid value paths")
         if e["type"] != "curve_rules":
             band = b.get("band")
             if not (isinstance(band, list) and len(band) == 2 and band[0] <= b.get("target", float("nan")) <= band[1]):
@@ -178,6 +182,22 @@ def validate(pack: dict, engine) -> list[str]:
         if not fj.get("targets"):
             bad.append("fit_joint: no targets")
     return bad
+
+
+_PATH_PARTS = {"windows": 3, "per_capita": 3, "per_capita_all": 2, "cost": 2}
+
+
+def value_path_ok(path) -> bool:
+    """A value path `get` can read: windows.<w>.<metric>, per_capita.<outcome>.<age>,
+    per_capita_all.<outcome> or cost.<driver>, with no empty part."""
+    if not isinstance(path, str):
+        return False
+    parts = path.split(".")
+    return _PATH_PARTS.get(parts[0]) == len(parts) and all(parts)
+
+
+def _pos_weight(w) -> bool:
+    return isinstance(w, (int, float)) and not isinstance(w, bool) and math.isfinite(w) and w > 0
 
 
 def grid_edge(value: float, grid, tol: float = 0.05) -> bool:
@@ -876,13 +896,24 @@ def _self_test() -> int:
        f"BP32 the pooled ratio is the weighted geometric mean of each definition's ratio ({res5['V1']['computed']} vs {want:.4f}); "
        "components and diagnostics are reported")
     for bad_vals, why in (([], "empty"), ([{"path": "windows.w.prev", "weight": 0.0}], "zero weight"),
-                          ([{"path": "windows.w.prev"}], "no weight")):
+                          ([{"path": "windows.w.prev"}], "no weight"),
+                          ([{"path": "windows.w.prev", "weight": float("inf")}], "infinite weight"),
+                          ([{"path": "windows.w.prev", "weight": float("nan")}], "NaN weight"),
+                          ([{"path": "windows.w.prev", "weight": True}], "boolean weight"),
+                          ([{"path": 123, "weight": 1.0}], "non-string path"),
+                          ([{"path": "windows", "weight": 1.0}], "malformed path"),
+                          ([{"path": "windows.w.prev.x", "weight": 1.0}], "over-long path")):
         pb = dict(p5, benchmarks=[{"id": "V9", "metric": "m", "target": 0.5, "band": [0.1, 0.9],
                                    "estimand": dict(multi, values=bad_vals)}])
         ok(any("values" in s for s in validate(pb, eng)), f"BP33 a multi-value estimand with {why} values is refused")
     pboth = dict(p5, benchmarks=[{"id": "V8", "metric": "m", "target": 0.5, "band": [0.1, 0.9],
                                   "estimand": dict(multi, value="windows.w.prev")}])
     ok(any("both value and values" in s for s in validate(pboth, eng)), "BP34 value and values together are refused")
+    for dv, why in (("windows.w.prev", "a scalar"), (["windows"], "a malformed path"), ([7], "a non-string")):
+        pd_ = dict(p5, benchmarks=[{"id": "V7", "metric": "m", "target": 0.5, "band": [0.1, 0.9],
+                                    "estimand": dict(multi, diagnostic_values=dv)}])
+        ok(any("diagnostic_values" in s for s in validate(pd_, eng)),
+           f"BP34b diagnostic_values given as {why} is refused (Codex r1 P2)")
     # ---- v0.4: a calibrated value at (not only beyond) an outer grid bound is flagged
     ok(grid_edge(127.6, [8, 16, 32, 64, 128]) and grid_edge(8.2, [8, 16, 32, 64, 128])
        and not grid_edge(127.6, [8, 16, 32, 64, 128, 256]) and not grid_edge(40.0, [8, 16, 32, 64, 128]),
