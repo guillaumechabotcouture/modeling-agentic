@@ -39,6 +39,7 @@ import dataclasses
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tarfile
@@ -305,7 +306,13 @@ def launch(cfg):
     client = cluster.get_client()
     client.wait_for_workers(n0, timeout=1800)
     client.upload_file(os.path.join(HERE, "worker_side.py"))
-    workers = sorted(ws.scheduler_workers(lambda: ws.live_client(cluster, client), min_workers=n0))[:len(cfg.labels)]
+    box = [client]
+
+    def run_client():   # a client closed since the upload is replaced, and the replacement kept
+        box[0] = ws.live_client(cluster, box[0])
+        return box[0]
+    workers = sorted(ws.scheduler_workers(run_client, min_workers=n0))[:len(cfg.labels)]
+    client = box[0]
     compute.register_compute_tags(client, exclude=workers)   # the agent VMs never take compute tasks
     launch_id = time.strftime("%Y%m%d-%H%M%S")
     assign = {}
@@ -401,28 +408,43 @@ def start_keeper(cfg, adapt_opts, cluster_id, overflow=None):
     return kc
 
 
-def confirm_keeper(keeper_name, kc, attempts=6, delay_s=5.0, sleep=None):
-    """Print the keeper's last log line. The keeper cluster's client can be closed by now (a
-    failed reconnect closes it and empties its scheduler identity: v2blind1's
-    `KeyError: 'workers'`), so a closed client is replaced and the read retried with
-    backoff. Past the bound the launch fails with a message saying what to check; the run
-    is already fired and clusters.json already names the keeper."""
+KEEPER_TICK = re.compile(r"\bworkers=\d+ \(overflow \d+\)")   # _keeper_loop's tick line
+
+
+def confirm_keeper(keeper_name, kc, attempts=8, delay_s=5.0, max_delay_s=60.0, sleep=None):
+    """Wait (bounded, doubling backoff) for the keeper's first tick line: it is written only
+    after adapt() and a worker-table read, so it is the evidence the pool is held; a readable
+    log alone ("(no log yet)", "keeper error ...; retrying") is not. The keeper cluster's
+    client can be closed by now (a failed reconnect closes it and empties its scheduler
+    identity: v2blind1's `KeyError: 'workers'`), so a closed client is replaced. Past the
+    bound the launch fails with a message saying what to check; the run is already fired
+    and clusters.json already names the keeper."""
+    sleep = sleep or time.sleep
     box = [None]
 
     def client():
         box[0] = ws.live_client(kc, box[0])
         return box[0]
-    try:
-        w = sorted(ws.scheduler_workers(client, attempts=attempts, delay_s=delay_s, min_workers=1, sleep=sleep,
-                                        log=print))[0]
-        line = box[0].run(ws.keeper_log, workers=[w])[w].strip().splitlines()[-1:]
-    except Exception as e:  # noqa: BLE001 — reported, never ignored
-        raise SystemExit(f"keeper {keeper_name} (cluster {kc.cluster_id}) was submitted but not confirmed holding "
-                         f"the pool: {type(e).__name__}: {str(e)[:200]}. The run is fired and the clusters file "
-                         f"names the keeper; check `status` and `keeper-log` now (without a keeper the pool "
-                         f"stays at its start size).")
-    print(line, f"(keeper {keeper_name})")
-    return line
+    delay, last = delay_s, ["(not read)"]
+    for i in range(max(1, int(attempts))):
+        try:
+            w = sorted(ws.scheduler_workers(client, attempts=3, delay_s=delay_s, min_workers=1, sleep=sleep,
+                                            log=print))[0]
+            lines = box[0].run(ws.keeper_log, workers=[w])[w].strip().splitlines()
+            ticks = [ln for ln in lines if KEEPER_TICK.search(ln)]
+            if ticks:
+                print(ticks[-1:], f"(keeper {keeper_name})")
+                return ticks[-1:]
+            last = lines[-1:] or ["(empty log)"]
+        except Exception as e:  # noqa: BLE001 — retried, then reported
+            last = [f"{type(e).__name__}: {str(e)[:200]}"]
+        if i < attempts - 1:
+            sleep(delay)
+            delay = min(max_delay_s, delay * 2)
+    raise SystemExit(f"keeper {keeper_name} (cluster {kc.cluster_id}) was submitted but not confirmed holding "
+                     f"the pool after {attempts} tries (last: {last[0][:200]}). The run is fired and the clusters "
+                     f"file names the keeper; check `status` and `keeper-log` now (without a keeper the pool "
+                     f"stays at its start size).")
 
 
 def keeper_lines(st: dict | None, now: float | None = None) -> list[str]:
@@ -1067,7 +1089,7 @@ def _self_test_52(ok) -> None:
     import types
 
     class FakeClient:
-        def __init__(self, infos, status="running", log="12:00:00 keeper holding x 3..9 {}\n12:00:01 workers=3"):
+        def __init__(self, infos, status="running", log="12:00:00 keeper holding x 3..9 {}\n12:00:01 workers=3 (overflow 0) refusals=0 active=primary"):
             self.infos, self.status, self.log, self.calls = list(infos), status, log, 0
 
         def scheduler_info(self):
@@ -1206,7 +1228,7 @@ def _self_test_52(ok) -> None:
             else:
                 sys.modules["coiled"] = real_coiled
     ok(r == "keeper exited" and len(FakeCluster.adapts) == 1 and "keeper error" not in log
-       and st.get("workers") == 2 and "workers=2" in log,
+       and st.get("workers") == 2 and "workers=2" in log and KEEPER_TICK.search(log),
        f"RC52g the keeper loop waits out an unpopulated scheduler identity without dropping its adapt(): "
        f"adapts={len(FakeCluster.adapts)} log={log[-300:]!r}")
 
