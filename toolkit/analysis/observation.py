@@ -480,6 +480,19 @@ def _self_test_beta(ok) -> None:
            "OS12 a source's net multiplicative bias is a derived quantity")
     safe(os8, "OS8-12 measurement model")
 
+    def os13():
+        codes = lambda s: sorted({f[0] for f in check_sources(s)})  # noqa: E731
+        s = toy_sources()
+        s[1]["bias"] = {"none": "a perfect assay (toy)"}
+        s[1]["noise"] = {"model": "poisson"}
+        ok(codes(s) == ["observation_source_undeclared"], f"OS13 (Codex r1-6) the noise model is checked even for an "
+                                                          f"unbiased source: {codes(s)}")
+        s = toy_sources()
+        s[1]["bias"].append({"mechanism": "maternal_antibody", "handling": "exclude_below_age", "bound_months": 9})
+        ok(codes(s) == ["bias_without_mechanism"], f"OS14 (Codex r1-9) maternal_antibody exclusion is refused until "
+                                                   f"the age mask is applied: {codes(s)}")
+    safe(os13, "OS13-14 noise and maternal antibody")
+
 
 def toy_sources() -> list:
     """An administrative coverage source and a serosurvey with a shared frame gap (self-tests and docs)."""

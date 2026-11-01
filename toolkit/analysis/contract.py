@@ -361,6 +361,28 @@ def _self_test() -> int:
                f"K12 a changed engine choice makes the manifest and every artifact stale ({len(st)} findings)")
         except Exception as e:  # noqa: BLE001
             ok(False, f"K12 engine choice hashed in the manifest and artifact headers: {type(e).__name__}: {e}")
+    # v2d β (Codex r1-4): the gate re-reads the canonical posterior sample against the uncertainty draws
+    try:
+        import numpy as np
+        from toolkit.analysis import calibration as C
+        rows = np.array([[0.1, 1.0], [0.2, 2.0], [0.3, 3.0]])
+        sid = C._sample_id(["a", "z:u"], rows)
+        cal = {"method": "posterior", "sample": {"sample_id": sid, "names": ["a", "z:u"], "rows": rows.tolist()}}
+        rec = [{"sample_id": sid, "row": 1, "values": {"a": 0.2, "z:u": 2.0}},
+               {"sample_id": sid, "row": 2, "values": {"a": 0.3, "z:u": 3.0}}]
+        unc = {"draws": 2, "covers": ["calibration"], "draw_provenance": {"sample_id": sid, "draws": 2, "applied": rec}}
+        good = _posterior_provenance("analysis/calibration.yaml", cal, unc)
+        half = dict(unc, draw_provenance=dict(unc["draw_provenance"], applied=[dict(rec[0], values={"a": 0.15,
+                                                                                                    "z:u": 2.0}),
+                                                                             rec[1]]))
+        bad1 = _posterior_provenance("analysis/calibration.yaml", cal, half)
+        bad2 = _posterior_provenance("analysis/calibration.yaml", cal, dict(unc, draw_provenance=None))
+        bad3 = _posterior_provenance("analysis/calibration.yaml", cal, dict(unc, draws=3))
+        ok(good == [] and all(b and b[0]["kind"] == "analysis_contract_uncovered_parameter" for b in (bad1, bad2, bad3)),
+           f"K13 (Codex r1-4) the gate checks every uncertainty draw against the canonical sample "
+           f"({len(bad1)}, {len(bad2)}, {len(bad3)} findings)")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"K13 posterior provenance in the gate: {type(e).__name__}: {e}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

@@ -1377,6 +1377,120 @@ def _self_test() -> int:
             ok(full["cov"] is not None, "AN-b3b the full panel (with the reference package) still fits")
     safe(anb3, "AN-b3 ridge refusal")
 
+    class FakeEngine:
+        """A windowed toy engine: incidence = scale x r0 per step; fails closed above `fail_above`."""
+        mode, groups, step_cap, dt_days = "windowed", ["all"], 10, 1.0
+
+        def __init__(self, scale=0.01, fail_above=None):
+            self.scale, self.fail_above = scale, fail_above
+
+        def run_batch(self, params, units, packages, horizon, seed):
+            from toolkit.engines.contract import Outcomes
+            if self.fail_above is not None and any(p["r0"] > self.fail_above for p in params):
+                raise RuntimeError("step cap reached")
+            return [Outcomes(per_capita={"infections": {"all": 0.1}}, windows={"all": {"r0": p["r0"]}},
+                             cost_drivers={}, meta={"incidence": [self.scale * p["r0"]] * 3, "s_start": [1.0]})
+                    for p in params]
+    toy_decl = {"priors": {"r0": {"dist": "uniform", "range": [1.0, 2.0], "source": "t"}},
+                "engine_params": {"r0": "param:r0"}, "unit": {"N": [1000.0]}, "horizon": {"steps": 3},
+                "sources": [{"id": "n", "measures": "case_notifications", "latent": {"quantity": "incidence"},
+                             "frame": {"design": "facility_based", "excluded": []},
+                             "bias": {"none": "complete reporting (toy)"}, "noise": {"model": "poisson"}}],
+                "targets": [{"source": "n", "observed": "data:y", "latent": "incidence"}],
+                "quantities": {"r0": "window:r0"}}
+
+    def cr1():
+        ok(posterior(lambda name: FakeEngine(), {"y": [12, 13, 11]}, "toy", **toy_decl)["intervals"]["r0"][0] > 1.0,
+           "CR0 the toy engine-backed posterior runs")
+        try:
+            posterior(lambda name: FakeEngine(scale=0.0), {"y": [12, 13, 11]}, "toy", **toy_decl)
+            ok(False, "CR1 (Codex r1-1) positive counts against a zero expectation are refused, never floored")
+        except CalibrationRefused as e:
+            ok(e.code == "posterior_ess", f"CR1 (Codex r1-1) positive counts against a zero expectation are refused, "
+                                          f"never floored ({e.code})")
+    safe(cr1, "CR1 zero expectations")
+
+    def cr2():
+        try:
+            posterior(lambda name: FakeEngine(fail_above=1.5), {"y": [12, 13, 11]}, "toy", **toy_decl)
+            ok(False, "CR2 (Codex r1-2) engine failures inside the prior's support refuse the calibration")
+        except CalibrationRefused as e:
+            ok(e.code == "posterior_engine_failure", f"CR2 (Codex r1-2) engine failures inside the prior's support "
+                                                     f"refuse the calibration ({e.code})")
+    safe(cr2, "CR2 engine failures")
+
+    def codex_r1():
+        # r1-3: a null direction spread over many parameters is a ridge
+        d = 16
+        names = [f"c{i}" for i in range(d)]
+        pr = {n: Prior.from_decl(n, {"dist": "beta", "a": 8, "b": 2, "source": "t"}) for n in names}
+
+        def diff(X):
+            v = np.stack([X[n] for n in names], axis=1)
+            return -0.5 * np.sum(((v[:, 1:] - v[:, :1]) / 0.01) ** 2, axis=1), {}
+        P = Problem(names, pr, diff)
+        c = classify(P, sample(P, seed=2))
+        ok(all(v == "on_ridge" for v in c["likelihood_classes"].values()) and c["ridges"],
+           f"CR3 (Codex r1-3) a null direction shared by 16 parameters makes each on_ridge "
+           f"({sorted(set(c['likelihood_classes'].values()))}, {len(c['ridges'])} ridges)")
+        # r1-5: a very precise product-only likelihood keeps its ridge (finite-difference curvature checked)
+        pri = {n: Prior.from_decl(n, {"dist": "uniform", "range": [0.9, 1.1], "source": "t"}) for n in ("a", "b")}
+        P = Problem(["a", "b"], pri, lambda X: (-0.5 * (np.log(X["a"] * X["b"]) / 1e-6) ** 2, {}))
+        s = {"best": np.array([1.0, 1.0]), "rows": np.array([[0.95, 1 / 0.95], [1.05, 1 / 1.05], [1.0, 1.0]])}
+        c = classify(P, s)
+        ok(c["likelihood_classes"] == {"a": "on_ridge", "b": "on_ridge"},
+           f"CR5 (Codex r1-5) a product ridge stays a ridge at high precision ({c['likelihood_classes']})")
+        # r1-8: a NaN applied value is a provenance failure
+        P2, _ = normal_problem(2)
+        s2 = sample(P2, seed=3)
+        rec = draws(s2, 3, seed=1)
+        rec[0]["values"]["x0"] = float("nan")
+        ok(check_provenance(s2, rec) != [], "CR8 (Codex r1-8) a NaN applied value fails the provenance check")
+    safe(codex_r1, "CR3-8 Codex r1 cases")
+
+    def cr10():
+        I = _ident()
+        fa = I.fisher_analysis(lambda x: 0.5 * (100 * (x["a"] - 1) ** 2 + 0.01 * (x["b"] - 1) ** 2),
+                               {"a": 1.0, "b": 1.0}, {"a": (-10, 10), "b": (-10, 10)})
+        ok(ridge_refusal(fa) is not None, f"CR10 (Codex r1-10) a weak ridge the detector reports is refused, not only "
+                                          f"a null direction ({fa.get('ridges')})")
+    safe(cr10, "CR10 weak ridges")
+
+    def cr7():
+        from toolkit.analysis import run as R
+        from toolkit.analysis.model import DirectModel
+        from toolkit.spec.schema import load
+        global classify
+        orig = classify
+        with tempfile.TemporaryDirectory() as d:
+            R._direct_toy(d)
+            import yaml
+            sp = os.path.join(d, "decision_spec.yaml")
+            raw = yaml.safe_load(open(sp))
+            lrr = {"dist": "uniform", "range": [-2.0, 1.0], "source": "toy"}
+            raw["calibration"].update(method="posterior", observation={"model": "poisson"}, priors={
+                "lrr:a": lrr, "lrr:b": lrr, "lrr:a+b": lrr, "log_rate": {"dist": "uniform", "range": [-8.0, 2.0],
+                                                                         "source": "toy"}})
+            yaml.safe_dump(raw, open(sp, "w"))
+            spec = load(sp)
+            m = DirectModel(spec, log=lambda *a: None)
+            m.fit()
+
+            def all_pd(P, smp, **k):
+                c = orig(P, smp, **k)
+                c["classes"] = {n: "prior_dominated" for n in c["classes"]}
+                return c
+            classify = all_pd
+            try:
+                fit = fit_posterior_panel(spec, m)
+            finally:
+                classify = orig
+        ids = {t["parameter"] for t in fit["prior_range_tests"]}
+        ok("z:u0" in ids and "z:u0" in fit["prior_dominated"],
+           f"CR7 (Codex r1-7) prior-dominated unit attributes get prior_range tests and are named in the label "
+           f"({sorted(ids)[:4]})")
+    safe(cr7, "CR7 unit attributes")
+
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

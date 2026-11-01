@@ -1477,6 +1477,21 @@ def _self_test() -> int:
            "case or another code identity is refused")
     except NameError as ex:
         ok(False, f"BP50 merge_results ({ex})")
+    # Codex r1-11: a coverage row carries its declaration and calibration-code digests; merge re-checks both
+    try:
+        p15 = dict(p14, benchmarks=[dict(b, estimand=dict(b["estimand"], calibrator=dict(
+            b["estimand"]["calibrator"], args={"mu_sd": 2.0}))) if b["id"] == "P2" else b for b in p14["benchmarks"]])
+        r0 = parts[0]["benchmarks"][0]
+        has = bool(r0.get("declaration_sha256")) and bool(r0.get("code_sha256"))
+        try:
+            merge_results(p15, parts, eng)
+            stale = False
+        except ValueError:
+            stale = True
+        ok(has and stale, f"BP51 (Codex r1-11) a per-case result for another declaration is refused at merge "
+                          f"(digests present: {has})")
+    except Exception as ex:  # noqa: BLE001
+        ok(False, f"BP51 declaration digests ({type(ex).__name__}: {ex})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
