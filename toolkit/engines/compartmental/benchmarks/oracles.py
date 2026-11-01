@@ -230,6 +230,21 @@ def discretised_exponential_gi(gamma: float, dt_days: float, L: int):
     return [float(x) for x in w / w.sum()]
 
 
+def discretised_exponential_gi_triangle(gamma: float, dt_days: float, L: int):
+    """The same density discretised for a renewal model whose infections are binned by step: with both the
+    infector's and the infectee's times uniform within their steps, the lag in steps s has weight
+    integral (1 - |tau/dt - s|) g(tau) over ((s-1) dt, (s+1) dt); the same-step mass (s = 0) is folded into
+    w_1 (the engine's renewal starts at lag 1). The interval form above over-states R by about 6% at
+    R0 = 1.8 with a 7-day infectious period on a daily grid (pack run 2, RN4); this form by about 1%."""
+    from scipy.integrate import quad
+    g = lambda t: gamma * math.exp(-gamma * t)  # noqa: E731
+    d = float(dt_days)
+    w = [quad(lambda t: (1 - abs(t / d - s)) * g(t), max(s - 1, 0) * d, (s + 1) * d)[0] for s in range(1, L + 1)]
+    w[0] += quad(lambda t: (1 - t / d) * g(t), 0.0, d)[0]
+    w = np.asarray(w)
+    return [float(x) for x in w / w.sum()]
+
+
 # ------------------------------------------------------------------------- the linear-form control
 def oracle_linear_renewal_attack(r0: float, w, seed: float = 1e-9, steps: int = 100000) -> float:
     """The NEGATIVE CONTROL of RN2: the linear renewal form I_t = (S_{t-1}/N) R0 sum_s w_s I_{t-s},
