@@ -208,8 +208,10 @@ class EmulatorModel:
             for P in self.pops:
                 key = ("red", P, self.primary, k)
                 t, p = self.T[key][ho], self.gps[key].predict(Xh)
-                cols.append((P, k))
-                res.append(t - p)
+                for o in self.outcomes:          # Codex r2 P1: one residual column per outcome
+                    ko = ("red", P, o, k)
+                    cols.append((P, o, k))
+                    res.append(self.T[ko][ho] - self.gps[ko].predict(Xh))
                 ss = np.sum((t - t.mean()) ** 2)
                 r2.append(1 - np.sum((t - p) ** 2) / ss if ss > 0 else float("nan"))
                 errs.append(np.mean(np.abs(t - p)))
@@ -241,8 +243,8 @@ class EmulatorModel:
 
     def predict(self, zs, theta, ids, noise=None):
         """`noise`: an rng for the emulator-error source: one joint draw of the reduction errors of every unit
-        (EmulatorError: a common component plus a per-unit one, from the held-out residuals), applied to every
-        outcome of a (population group, package)."""
+        (EmulatorError: a common component plus a per-unit one, from the held-out residuals), one column per
+        (population group, outcome, package)."""
         rows = [self.by_id[i] for i in ids]
         E = None
         if noise is not None:
@@ -271,7 +273,7 @@ class EmulatorModel:
                         continue
                     r = self.gps[("red", P, o, k)].predict(X)
                     if E is not None:
-                        r = r + E[:, self.error.col[(P, k)]]
+                        r = r + E[:, self.error.col[(P, o, k)]]
                     for j in np.flatnonzero((r < -0.5) | (r > 1.0)):
                         ev.append({"unit": ids[j], "package": k, "kind": "reduction_clip", "outcome": o, "group": P,
                                    "value": float(r[j])})
@@ -297,8 +299,8 @@ class EmulatorModel:
 
 
 class EmulatorError:
-    """The emulator-error source, from the held-out residuals of the reductions (one column per population group and
-    package, one row per held-out point; held-out points are real units at design values).
+    """The emulator-error source, from the held-out residuals of the reductions (one column per population group,
+    outcome and package, one row per held-out point; held-out points are real units at design values).
 
     A unit's error is split into the error of the population mean, which a sum over units does not average away, and
     the unit's deviation from it, which it does:

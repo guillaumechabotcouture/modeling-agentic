@@ -547,6 +547,12 @@ def _self_test_priors(ok, q):
            and "calibration clamped" in rec["statement"],
            f"RP8 an end whose calibration clamps is flagged in the result and its statement (Codex r1 P1-3): "
            f"{rec['statement']}")
+        err = M.error
+        npk = len(M.packages) - 1
+        ok(err is not None and len(err.cols) == len(M.pops) * len(M.outcomes) * npk
+           and {c[1] for c in err.cols} == set(M.outcomes),
+           f"RP9 each outcome gets its own held-out residual column, so one outcome's bias is not applied to another "
+           f"(Codex r2 P1): {err and len(err.cols)} columns")
         design.pop("prior_names")
         try:
             EmulatorModel(schema.load(p), design, {}, log=q)

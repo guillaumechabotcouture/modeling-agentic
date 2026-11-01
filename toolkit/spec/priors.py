@@ -207,6 +207,9 @@ def problems(spec) -> list[str]:
                    f"the priors at their point values), so drawing {sorted(drawn(spec))} would add variation the data "
                    "contradict; exclude them by name or kind with a reason, or calibrate by emulator inversion "
                    "(re-inverted per draw) (Codex r1 P1-1)")
+    if inc and not [k for k in inc if k != "priors"] and not drawn(spec):
+        bad.append("uncertainty.sources: priors is the only source and every prior is excluded, so the interval "
+                   "draws nothing (Codex r2 P2)")
     if "priors" in inc and not allp:
         bad.append("uncertainty.sources priors: neither the engine card nor the spec declares a prior")
     return bad
@@ -410,6 +413,10 @@ def _self_test() -> int:
         st4 = {x["kind"]: x for x in plan(schema.Spec(r4, d))["sources"]}["priors"]
         ok(st4["status"] == "excluded" and "dw" in st4.get("reason", "") and "held for this test" in st4["reason"],
            f"PR19 every prior excluded by name: the plan says excluded, with the reasons (Codex r1 P2): {st4}")
+        bad(lambda x: x["uncertainty"].update(sources=[{"kind": "priors"}], excluded=[
+            {"kind": k, "reason": "r"} for k in ("engine_parameters", "calibration", "costs", "emulator")]
+            + [{"parameter": "dw", "reason": "r"}]), "draws nothing",
+            "PR21 a spec whose only source is priors, with every prior excluded, is refused (Codex r2 P2)")
         bad(lambda x: x["calibration"].update(method="likelihood", parameters=[], targets={}),
             "does not condition on prior draws",
             "PR20 likelihood calibration with drawn priors is refused: its fit is conditional on their point values "
