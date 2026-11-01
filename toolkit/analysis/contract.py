@@ -50,6 +50,7 @@ def gate_findings(run_dir: str) -> list[dict]:
     except (OSError, ValueError) as e:
         return [_f("analysis_contract_missing", f"{MANIFEST} unreadable: {e}")]
     out = []
+    cal_doc, unc_doc = None, None
     # Codex P1-9: only a manifest the harness published at the end of a complete run certifies anything.
     if man.get("status") == "blocked":
         return [_f("analysis_contract_blocked", f"the analysis stopped before publishing a plan: {man.get('reason')} "
@@ -121,6 +122,9 @@ def gate_findings(run_dir: str) -> list[dict]:
                                                          "was computed", f"{rel}:{src}"))
         if kind == "calibration":
             out += _calibration(rel, doc.get("data") or {})
+            cal_doc = (rel, doc.get("data") or {})
+        if kind == "uncertainty":
+            unc_doc = doc.get("data") or {}
         if kind == "point" and ((doc.get("data") or {}).get("model_corrections") or {}).get("on_plan"):
             out.append(_f("analysis_contract_model_domain", f"{rel}: model corrections bear on the plan", rel))
     for rel, ent in sorted((man.get("deliverables") or {}).items()):
@@ -130,6 +134,8 @@ def gate_findings(run_dir: str) -> list[dict]:
         elif sha256(p) != ent.get("sha256"):
             out.append(_f("analysis_contract_tampered", f"deliverable {rel} ({ent.get('role')}) changed after the "
                                                         "harness wrote it", rel))
+    if cal_doc and cal_doc[1].get("method") == "posterior" and unc_doc is not None:
+        out += _posterior_provenance(cal_doc[0], cal_doc[1], unc_doc)
     out += _decision_tests(run_dir, man)
     out += _claims(run_dir, man)
     out += _figures(run_dir, man)
@@ -160,9 +166,53 @@ def _calibration(rel, d) -> list[dict]:
         bad = [q for q, v in (idf.get("parameters") or {}).items() if v.get("status") == "unidentified"]
         if bad:
             out.append(_f("analysis_contract_calibration", f"{rel}: unidentified parameters {bad}", rel))
+    elif m == "posterior":
+        # v2d §3.1-§3.3: the sampler met its floors (it fails closed otherwise), the canonical sample is recorded with
+        # its id, and the point is a converged posterior mode
+        if dg.get("converged") is not True:
+            out.append(_f("analysis_contract_calibration", f"{rel}: the posterior mode did not converge "
+                                                           f"({dg.get('message')})", rel))
+        smp = d.get("sample") or {}
+        if not (smp.get("sample_id") and smp.get("rows") and smp.get("names")):
+            out.append(_f("analysis_contract_uncovered_parameter", f"{rel}: no canonical posterior sample recorded",
+                          rel))
+        else:
+            import numpy as np
+            from toolkit.analysis import calibration as C
+            if C.check_provenance({"sample_id": smp["sample_id"], "names": smp["names"],
+                                   "rows": np.asarray(smp["rows"], float)}, []):
+                out.append(_f("analysis_contract_uncovered_parameter", f"{rel}: the canonical sample does not match "
+                                                                       "its recorded id", rel))
+        if not idf.get("classes"):
+            out.append(_f("analysis_contract_calibration", f"{rel}: no identifiability classes", rel))
     elif m != "none":
         out.append(_f("analysis_contract_calibration", f"{rel}: unknown calibration method {m!r}", rel))
     return out
+
+
+def _posterior_provenance(rel, cal: dict, unc: dict) -> list[dict]:
+    """v2d §3.3 (Codex r1-4): when the interval covers a posterior calibration, every uncertainty draw is a row of the
+    canonical sample: one record per draw, citing the sample's id, with the applied values of every estimated name
+    equal to that row (re-read here, fail closed)."""
+    if "calibration" not in (unc.get("covers") or []):
+        return []
+    import numpy as np
+    from toolkit.analysis import calibration as C
+    smp = cal.get("sample") or {}
+    prov = unc.get("draw_provenance")
+    kind = "analysis_contract_uncovered_parameter"
+    if not isinstance(prov, dict) or not isinstance(prov.get("applied"), list):
+        return [_f(kind, f"{rel}: the uncertainty draws record no provenance against the posterior sample", rel)]
+    if len(prov["applied"]) != unc.get("draws") or prov.get("sample_id") != smp.get("sample_id"):
+        return [_f(kind, f"{rel}: {len(prov['applied'])} provenance records for {unc.get('draws')} draws, or another "
+                         "sample cited", rel)]
+    try:
+        found = C.check_provenance({"sample_id": smp["sample_id"], "names": smp["names"],
+                                    "rows": np.asarray(smp["rows"], float)}, prov["applied"])
+    except (KeyError, TypeError, ValueError) as e:
+        return [_f(kind, f"{rel}: the canonical sample is unreadable ({e})", rel)]
+    return [_f(kind, f"{rel}: {len(found)} draw values are not the canonical sample's rows (e.g. {found[0]})", rel)] \
+        if found else []
 
 
 def _decision_tests(run_dir, man) -> list[dict]:
@@ -342,6 +392,28 @@ def _self_test() -> int:
                f"K12 a changed engine choice makes the manifest and every artifact stale ({len(st)} findings)")
         except Exception as e:  # noqa: BLE001
             ok(False, f"K12 engine choice hashed in the manifest and artifact headers: {type(e).__name__}: {e}")
+    # v2d β (Codex r1-4): the gate re-reads the canonical posterior sample against the uncertainty draws
+    try:
+        import numpy as np
+        from toolkit.analysis import calibration as C
+        rows = np.array([[0.1, 1.0], [0.2, 2.0], [0.3, 3.0]])
+        sid = C._sample_id(["a", "z:u"], rows)
+        cal = {"method": "posterior", "sample": {"sample_id": sid, "names": ["a", "z:u"], "rows": rows.tolist()}}
+        rec = [{"sample_id": sid, "row": 1, "values": {"a": 0.2, "z:u": 2.0}},
+               {"sample_id": sid, "row": 2, "values": {"a": 0.3, "z:u": 3.0}}]
+        unc = {"draws": 2, "covers": ["calibration"], "draw_provenance": {"sample_id": sid, "draws": 2, "applied": rec}}
+        good = _posterior_provenance("analysis/calibration.yaml", cal, unc)
+        half = dict(unc, draw_provenance=dict(unc["draw_provenance"], applied=[dict(rec[0], values={"a": 0.15,
+                                                                                                    "z:u": 2.0}),
+                                                                             rec[1]]))
+        bad1 = _posterior_provenance("analysis/calibration.yaml", cal, half)
+        bad2 = _posterior_provenance("analysis/calibration.yaml", cal, dict(unc, draw_provenance=None))
+        bad3 = _posterior_provenance("analysis/calibration.yaml", cal, dict(unc, draws=3))
+        ok(good == [] and all(b and b[0]["kind"] == "analysis_contract_uncovered_parameter" for b in (bad1, bad2, bad3)),
+           f"K13 (Codex r1-4) the gate checks every uncertainty draw against the canonical sample "
+           f"({len(bad1)}, {len(bad2)}, {len(bad3)} findings)")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"K13 posterior provenance in the gate: {type(e).__name__}: {e}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

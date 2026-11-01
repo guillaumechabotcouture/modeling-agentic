@@ -50,7 +50,7 @@ docs/design/v2-spec-and-analysis.md §1):
     comparator: {package: none, text: "what happens without the plan"}
     outcomes_reported: [dalys, cases]
     calibration:
-      method: emulator_inversion | likelihood | none
+      method: emulator_inversion | likelihood | posterior | none
       ...                                  # see CALIBRATION_FIELDS
     uncertainty:                           # spike lesson 6: sources declared up front
       level: 0.95
@@ -102,7 +102,7 @@ SCHEMA_VERSION = 1
 REQUIRED = ("schema_version", "question", "decision_maker", "decision_date", "engine", "horizon", "decision_units",
             "options", "objective", "constraints", "comparator", "outcomes_reported", "calibration", "uncertainty",
             "analysis", "deliverable")
-CALIBRATION_METHODS = ("emulator_inversion", "likelihood", "none")
+CALIBRATION_METHODS = ("emulator_inversion", "likelihood", "posterior", "none")
 EVALUATIONS = ("emulator", "direct")
 # Spike lesson 6: every kind is either a declared source or excluded with a reason.
 UNCERTAINTY_KINDS = {
@@ -122,6 +122,7 @@ DELIVERABLE_KINDS = ("package_per_unit",)
 CALIBRATION_FIELDS = {
     "emulator_inversion": ("attribute", "range", "target_column", "window", "metric"),
     "likelihood": ("attribute", "range", "parameters", "targets"),
+    "posterior": ("attribute", "range", "parameters", "targets", "priors", "observation"),   # v2d §3.1
     "none": (),
 }
 TARGET_FIELDS = ("csv", "unit", "start", "package", "observed", "exposure")   # and `stop` (a column) or `period` (years)
@@ -647,6 +648,40 @@ def _validate_calibration(s, card, pnames, cols) -> list[str]:
             bad.append(f"calibration.targets: packages not in options (map them with package_map): {unk_p[:5]}")
         if t.get("outcome", s.raw["objective"]["outcome"]) not in card.outputs.get("per_capita", []):
             bad.append("calibration.targets.outcome: not an engine per-capita output")
+    if m == "posterior":
+        bad += _validate_posterior(cal, s.raw["analysis"].get("evaluation"))
+    return bad
+
+
+def _validate_posterior(cal, evaluation="direct") -> list[str]:
+    """v2d §3.1: every quantity the posterior moves has a declared prior with its source (no silent defaults), and the
+    count panel names its observation model."""
+    from toolkit.analysis.calibration import Prior
+    bad = []
+    if evaluation != "direct":      # Codex r2-5: the posterior evaluates the engine itself
+        bad.append("calibration.method posterior needs analysis.evaluation: direct (no emulator path yet)")
+    pri = cal.get("priors")
+    if not isinstance(pri, dict):
+        return ["calibration.priors: a mapping {name: {dist, range, source}}"]
+    for n in list(cal.get("parameters") or []) + [cal.get("attribute")]:
+        d = pri.get(n)
+        if d is None:
+            bad.append(f"calibration.priors: {n} has no prior (no silent defaults)")
+            continue
+        try:
+            Prior.from_decl(n, d)
+        except ValueError as e:
+            bad.append(f"calibration.priors.{n}: {e}")
+        if not str((d or {}).get("source") or "").strip():
+            bad.append(f"calibration.priors.{n}: give its source")
+    extra = sorted(set(pri) - set(cal.get("parameters") or []) - {cal.get("attribute")})
+    if extra:
+        bad.append(f"calibration.priors: {extra} are not calibrated by this spec")
+    ob = cal.get("observation") or {}
+    if ob.get("model") not in ("poisson", "negbin"):
+        bad.append("calibration.observation.model: poisson | negbin")
+    elif ob["model"] == "negbin" and not (_isnum(ob.get("dispersion")) and ob["dispersion"] > 0):
+        bad.append("calibration.observation.dispersion: a positive number for negbin")
     return bad
 
 

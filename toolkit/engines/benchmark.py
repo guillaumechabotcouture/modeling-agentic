@@ -371,6 +371,74 @@ def _job(args):
             "meta": dict(o.meta, age_shares=pdays)}
 
 
+COVERAGE_TASKS_PER_CHILD = 4
+
+
+def _coverage_job(args) -> dict:
+    """One coverage replicate (v2d β): generate, calibrate, score. A calibrator that refuses (fails closed) makes the
+    replicate invalid, with its message recorded; it is never counted as under-coverage."""
+    ref, configs, oracles, gfn, gargs, cfn, cargs, seed, qs, classes, ridge_names, r = args
+    used = set()
+
+    def make_engine(name=None):
+        used.add(name)
+        cfg = configs.get(name) if name is not None else None
+        key = _engine_key(ref, cfg)
+        if key not in _ENGINE:
+            _ENGINE[key] = load_engine(ref, cfg)
+        return _ENGINE[key]
+    gen = getattr(importlib.import_module(oracles), "generate_" + gfn)
+    mod, fn = cfn.split(":")
+    cal = getattr(importlib.import_module(mod), fn)
+    rng = np.random.default_rng([seed, r])
+    data, truth = gen(rng, **gargs)
+    out = {"replicate": r, "hits": {}, "class_ok": {}, "width": {}, "invalid": False, "ridge_ok": False}
+    t0 = time.time()
+    try:
+        post = cal(make_engine, data, **cargs)
+    except (ValueError, RuntimeError, ArithmeticError, np.linalg.LinAlgError) as ex:
+        out.update(invalid=True, error=f"{type(ex).__name__}: {str(ex)[:200]}", _configs=used)
+        return out
+    for q in qs:
+        iv = (post.get("intervals") or {}).get(q)
+        try:
+            lo, hi, tv = float(iv[0]), float(iv[1]), float(truth[q])
+        except (TypeError, ValueError, IndexError, KeyError):
+            out["invalid"] = True
+            continue
+        if not (math.isfinite(lo) and math.isfinite(hi) and math.isfinite(tv) and lo <= hi):
+            out["invalid"] = True
+            continue
+        out["hits"][q] = int(lo <= tv <= hi)
+        out["width"][q] = hi - lo
+    cl = post.get("classes") or {}
+    out["classes"] = {k: cl.get(k) for k in sorted(set(classes) | set(cl))}
+    for p, allowed in classes.items():
+        out["class_ok"][p] = int(cl.get(p) in allowed)
+    out["ridge_ok"] = bool(ridge_names) and any(set(ridge_names) <= set(x.get("params") or [])
+                                                for x in post.get("ridges") or [])
+    d = dict(post.get("diagnostics") or {})
+    out["diagnostics"] = {k: d[k] for k in ("ess", "ess_bulk_min", "rhat_max") if k in d}
+    out["diagnostics"]["seconds"] = round(time.time() - t0, 3)
+    out["_configs"] = used
+    return out
+
+
+def generate_selftest_normal(rng, mu_sd=1.0, n=20):
+    """Self-test generator (importable, so replicates can run in worker processes): y ~ N(mu, 1), mu ~ N(0, mu_sd)."""
+    mu = float(rng.normal(0.0, mu_sd))
+    return {"y": rng.normal(mu, 1.0, n).tolist()}, {"mu": mu}
+
+
+def calibrate_selftest_normal(make_engine, data, mu_sd=1.0):
+    """Self-test calibrator: the exact conjugate posterior's 95% interval."""
+    y = np.asarray(data["y"])
+    prec = 1.0 / mu_sd ** 2 + len(y)
+    m, sd = y.sum() / prec, math.sqrt(1.0 / prec)
+    return {"intervals": {"mu": [m - 1.959963984540054 * sd, m + 1.959963984540054 * sd]},
+            "classes": {"mu": "identified"}}
+
+
 def _spread(per) -> dict:
     per = [float(x) for x in per if math.isfinite(float(x))]
     if not per:
@@ -663,41 +731,67 @@ class Runner:
             return {"computed": None, "in_band": False, "status": "not_assessable",
                     "not_assessable_because": f"calibrator {e['calibrator']['fn']} not available "
                                               f"({type(ex).__name__}: {ex})"}
+        del gen, cal
         qs = list(e["quantities"])
         classes = e.get("classes") or {}
+        ridge_names = list(e.get("ridge_names") or [])
         reps, seed = int(e["replicates"]), int(e.get("seed", 0))
-        hits = {q: 0 for q in qs}
-        cls_hits = {p: 0 for p in classes}
-        invalid = 0
-        for r in range(reps):
-            rng = np.random.default_rng([seed, r])
-            data, truth = gen(rng, **(e["generator"].get("args") or {}))
-            post = cal(self.make_engine, data, **(e["calibrator"].get("args") or {}))
-            bad = False
-            for q in qs:
-                iv = (post.get("intervals") or {}).get(q)
-                try:
-                    lo, hi, tv = float(iv[0]), float(iv[1]), float(truth[q])
-                except (TypeError, ValueError, IndexError, KeyError):
-                    bad = True
-                    continue
-                if not (math.isfinite(lo) and math.isfinite(hi) and math.isfinite(tv) and lo <= hi):
-                    bad = True
-                    continue
-                hits[q] += int(lo <= tv <= hi)
-            invalid += int(bad)
-            for p, allowed in classes.items():
-                cls_hits[p] += int((post.get("classes") or {}).get(p) in allowed)
+        job = (self.ref, self.pack.get("configs") or {}, self.pack["oracles"], e["generator"]["fn"],
+               e["generator"].get("args") or {}, e["calibrator"]["fn"], e["calibrator"].get("args") or {}, seed, qs,
+               classes, ridge_names)
+        jobs = [job + (r,) for r in range(reps)]
+        if self.workers > 1 and reps > 1:
+            # v2d β: replicates in parallel; the replicate seeds are fixed, so the result equals the serial one
+            # fresh worker processes every few replicates: a worker's memory grows by about 0.3 GB per engine-backed
+            # fit (measured on SB5), which broke the pool at 8 workers on a 32 GiB VM
+            # (a fresh pool per chunk; max_tasks_per_child hung on macOS / Python 3.14 in the self-test)
+            per, k = [], self.workers * COVERAGE_TASKS_PER_CHILD
+            for i in range(0, reps, k):
+                with ProcessPoolExecutor(min(self.workers, len(jobs[i:i + k]))) as ex:
+                    per += list(ex.map(_coverage_job, jobs[i:i + k], chunksize=1))
+        else:
+            per = [_coverage_job(j) for j in jobs]
+        self.exercised |= {c for p in per for c in p.pop("_configs") if c is not None}
+        import hashlib
+        import json
+        hits = {q: sum(p["hits"].get(q, 0) for p in per) for q in qs}
+        cls_hits = {c: sum(p["class_ok"].get(c, 0) for p in per) for c in classes}
+        invalid = sum(int(p["invalid"]) for p in per)
         cov = {q: hits[q] / reps for q in qs}
         se = {q: math.sqrt(max(cov[q] * (1 - cov[q]), 1e-12) / reps) for q in qs}
-        share = {p: cls_hits[p] / reps for p in classes}
+        share = {c: cls_hits[c] / reps for c in classes}
         lo, hi = e["band"]
         need = float(e.get("class_share_min", 0.9))
+        counts = {}
+        for p in per:
+            for k, v in (p.get("classes") or {}).items():
+                counts.setdefault(k, {}).setdefault(v, 0)
+                counts[k][v] += 1
+        errors = sorted({p["error"] for p in per if p.get("error")})
         out = {"computed": min(cov.values()), "coverage": cov, "coverage_se": se, "class_share": share,
-               "replicates": reps, "band": [lo, hi], "invalid_outputs": invalid}
+               "replicates": reps, "band": [lo, hi], "invalid_outputs": invalid, "class_counts": counts,
+               "per_replicate_sha256": hashlib.sha256(json.dumps(   # timings excluded: the result, not the run
+                   [{k: ({a: b for a, b in v.items() if a != "seconds"} if k == "diagnostics" else v)
+                     for k, v in p.items()} for p in per], sort_keys=True, default=str).encode()).hexdigest()}
+        if errors:
+            out["errors"] = errors[:5]
+        widths = {q: [p["width"][q] for p in per if q in p.get("width", {})] for q in qs}
+        out["interval_width_median"] = {q: float(np.median(w)) if w else None for q, w in widths.items()}
+        diag = [p.get("diagnostics") or {} for p in per]
+        for key in ("ess", "ess_bulk_min", "rhat_max", "seconds"):
+            vals = [d[key] for d in diag if isinstance(d.get(key), (int, float))]
+            if vals:
+                out.setdefault("sampler", {})[key] = {"min": float(min(vals)), "median": float(np.median(vals)),
+                                                      "max": float(max(vals))}
+        ok_ridge = True
+        if ridge_names:
+            out["ridge_share"] = sum(int(p["ridge_ok"]) for p in per) / reps
+            ok_ridge = out["ridge_share"] >= need
+        out["declaration_sha256"] = declaration_digest(b, self.pack)
+        out["code_sha256"] = calibrator_code_digest(self.pack, e)
         # a calibration that returns no usable interval is a failure, never "under-coverage detected"
         out["in_band"] = (invalid == 0 and all(lo <= c <= hi for c in cov.values())
-                          and all(v >= need for v in share.values()))
+                          and all(v >= need for v in share.values()) and ok_ridge)
         out["status"] = "in_band" if out["in_band"] else "out_of_band"
         return out
 
@@ -982,13 +1076,102 @@ def verified_benchmarks(engine) -> tuple[list, str | None]:
     return list(doc.get("benchmarks") or []), None
 
 
+def declaration_digest(b: dict, pack: dict | None = None) -> str:
+    """sha256 of a case's declaration with the named configurations it uses resolved (Codex r2-4), plus the analysis
+    thresholds file (the calibrator's floors and class thresholds)."""
+    import hashlib
+    import json
+    cfgs = (pack or {}).get("configs") or {}
+    used = sorted({v for v in _walk_values(b) if isinstance(v, str) and v in cfgs})
+    th = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "analysis", "thresholds.yaml")
+    doc = {"case": b, "configs": {c: cfgs[c] for c in used},
+           "thresholds": open(th).read() if os.path.exists(th) else None}
+    return hashlib.sha256(json.dumps(doc, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _walk_values(x):
+    if isinstance(x, dict):
+        for v in x.values():
+            yield from _walk_values(v)
+    elif isinstance(x, list):
+        for v in x:
+            yield from _walk_values(v)
+    else:
+        yield x
+
+
+def calibrator_code_digest(pack: dict, e: dict) -> str:
+    """sha256 over the calibrator's module, the observation module and the oracles (generator) module files."""
+    import hashlib
+    h = hashlib.sha256()
+    mods = [e["calibrator"]["fn"].split(":")[0], "toolkit.analysis.observation", pack["oracles"]]
+    for m in mods:
+        try:
+            f = getattr(importlib.import_module(m), "__file__", None)
+        except ImportError:
+            f = None
+        h.update(m.encode() + b"\0")
+        if f and os.path.exists(f):
+            h.update(open(f, "rb").read())
+    return h.hexdigest()
+
+
+def merge_results(pack: dict, docs: list, engine) -> dict:
+    """Combine results files of per-case runs (`run --only`) into the pack's results, in pack order (v2d β: the
+    coverage pack runs case by case on a VM). Every file must carry this runner's stamp for the current engine
+    identity and configuration; a missing or duplicated case fails closed."""
+    want = stamp({}, engine)
+    rows, validated, nsims, wall = {}, {}, 0, 0.0
+    for d in docs:
+        for k in ("producer", "engine_identity", "engine_config_sha256"):
+            if d.get(k) != want.get(k):
+                raise ValueError(f"merge: a results file has another {k} (computed by other code or configuration)")
+        for r in d.get("benchmarks") or []:
+            if r["id"] in rows:
+                raise ValueError(f"merge: case {r['id']} appears twice")
+            rows[r["id"]] = r
+        validated.update(d.get("configs_validated") or {})
+        nsims += int(d.get("n_sims") or 0)
+        wall += float(d.get("wall_s") or 0.0)
+    ids = [b["id"] for b in pack["benchmarks"]]
+    for b in pack["benchmarks"]:          # Codex r1-11: a coverage row is bound to its declaration and calibrator code
+        r = rows.get(b["id"])
+        if r is not None and b["estimand"]["type"] == "coverage":
+            if r.get("declaration_sha256") != declaration_digest(b, pack):
+                raise ValueError(f"merge: {b['id']} was computed for another declaration")
+            if r.get("code_sha256") != calibrator_code_digest(pack, b["estimand"]):
+                raise ValueError(f"merge: {b['id']} was computed by other calibration, observation or generator code")
+    miss = [i for i in ids if i not in rows]
+    extra = sorted(set(rows) - set(ids))
+    if miss or extra:
+        raise ValueError(f"merge: missing cases {miss}, cases not in the pack {extra}")
+    out_rows = [rows[i] for i in ids]
+    by = {s: sum(r["status"] == s for r in out_rows) for s in STATUSES}
+    d0 = docs[0]
+    out = {"benchmarks": out_rows, "settings_calibrated": d0.get("settings_calibrated", {}),
+           "fitted_used": d0.get("fitted_used", {}), "configs_validated": dict(sorted(validated.items())),
+           "configs_not_exercised": sorted(set(pack.get("configs") or {}) - set(validated)),
+           "seeds": d0.get("seeds"), "n_sims": nsims,
+           "summary": {"in_band": by["in_band"], "total": len(out_rows), "by_status": by,
+                       "held_out_in_band": sum(r["status"] == "in_band" for r in out_rows if r["role"] == "held_out"),
+                       "held_out_total": sum(r["role"] == "held_out" for r in out_rows)}}
+    for k in ("engine_version", "fit_rule"):
+        if k in d0:
+            out[k] = d0[k]
+    if any("wall_s" in d for d in docs):
+        out["wall_s"] = round(wall, 1)
+    return stamp(out, engine)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("pack")
-    ap.add_argument("action", choices=["fit", "run", "validate"])
+    ap.add_argument("action", choices=["fit", "run", "validate", "merge"])
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 1)
     ap.add_argument("--seeds", type=int, default=0, help="use the first K seeds of the pack (0 = all)")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--only", default=None, help="run: only these benchmark ids (comma-separated); merge the files")
+    ap.add_argument("--inputs", nargs="*", default=[], help="merge: results files of per-case runs")
     a = ap.parse_args(argv)
     pack = yaml.safe_load(open(a.pack))
     eng = load_engine(pack["engine"], (pack.get("configs") or {}).get(pack.get("default_config")))
@@ -999,9 +1182,22 @@ def main(argv=None) -> int:
     if a.action == "validate":
         print("pack valid")
         return 0
+    d = os.path.dirname(os.path.abspath(a.pack))
+    if a.action == "merge":
+        merged = merge_results(pack, [yaml.safe_load(open(x)) for x in a.inputs], eng)
+        path = a.out or os.path.join(d, "results.yaml")
+        yaml.safe_dump(merged, open(path, "w"), sort_keys=False)
+        print(f"wrote {path} ({len(merged['benchmarks'])} cases)")
+        return 0
+    if a.only:
+        keep = set(a.only.split(","))
+        unknown = keep - {b["id"] for b in pack["benchmarks"]}
+        if unknown:
+            print(f"--only: unknown ids {sorted(unknown)}")
+            return 2
+        pack = dict(pack, benchmarks=[b for b in pack["benchmarks"] if b["id"] in keep])
     seeds = pack["seeds"][:a.seeds] if a.seeds else pack["seeds"]
     runner = Runner(pack, eng, a.workers, seeds)
-    d = os.path.dirname(os.path.abspath(a.pack))
     t0 = time.time()
     if a.action == "fit":
         out = fit_joint(pack, eng, runner) if pack.get("fit_joint") else fit(pack, eng, runner)
@@ -1385,6 +1581,86 @@ def _self_test() -> int:
     ok(r10["benchmarks"][0]["status"] == "in_band" and "rate2" in r10["configs_validated"],
        f"BP46 (Codex r2-1) a setting without config runs the pack's default_config, and counts as exercising it: "
        f"{r10['benchmarks'][0]['status']}, {sorted(r10['configs_validated'])}")
+    # ---- v2d β: ridge names, a calibrator that refuses, replicates in parallel
+    om.calibrate_ridge = lambda make_engine, data, with_ridge=True, **k: dict(
+        _cal(make_engine, data), ridges=[{"params": ["mu", "nu"]}] if with_ridge else [])
+    sb = {"type": "coverage", "generator": {"fn": "normal", "args": {}}, "replicates": 40, "seed": 2,
+          "quantities": ["mu"], "band": [0.85, 1.0], "ridge_names": ["mu", "nu"]}
+    p11 = dict(p6, benchmarks=[
+        {"id": "R1", "metric": "ridge reported", "estimand": dict(sb, calibrator={"fn": "_bp_oracles:calibrate_ridge"})},
+        {"id": "R2", "metric": "ridge missing", "estimand": dict(sb, calibrator={"fn": "_bp_oracles:calibrate_ridge",
+                                                                                 "args": {"with_ridge": False}})}])
+    r11 = {x["id"]: x for x in run_pack(p11, eng, Runner(p11, eng, 1), {})["benchmarks"]}
+    ok(r11["R1"]["status"] == "in_band" and r11["R1"].get("ridge_share") == 1.0 and r11["R2"]["status"] == "out_of_band"
+       and r11["R2"].get("ridge_share") == 0.0,
+       f"BP47 (v2d β) `ridge_names`: the reported ridge must name them in >= class_share_min of replicates "
+       f"({r11['R1'].get('ridge_share')}, {r11['R2'].get('ridge_share')})")
+
+    def _refuse(make_engine, data, **k):
+        raise ValueError("posterior_ess: effective sample size 3 below the floor 1000")
+    om.calibrate_refuse = _refuse
+    p12 = dict(p6, benchmarks=[{"id": "F1", "metric": "a calibrator that refuses", "estimand": dict(
+        sb, calibrator={"fn": "_bp_oracles:calibrate_refuse"}, replicates=5, ridge_names=None, band=[0.0, 0.8])}])
+    r12 = run_pack(p12, eng, Runner(p12, eng, 1), {})["benchmarks"][0]
+    ok(r12["status"] == "out_of_band" and r12.get("invalid_outputs") == 5 and "posterior_ess" in str(r12.get("errors")),
+       f"BP48 (v2d β) a calibrator that refuses counts as an invalid replicate (recorded), never under-coverage: "
+       f"{r12['status']}, {r12.get('errors')}")
+    p13 = dict(p6, oracles="toolkit.engines.benchmark", benchmarks=[{"id": "P1", "metric": "parallel", "estimand": {
+        "type": "coverage", "generator": {"fn": "selftest_normal", "args": {}},
+        "calibrator": {"fn": "toolkit.engines.benchmark:calibrate_selftest_normal", "args": {}}, "replicates": 30,
+        "seed": 4, "quantities": ["mu"], "band": [0.8, 1.0]}}])
+    s1 = run_pack(p13, eng, Runner(p13, eng, 1), {})["benchmarks"][0]
+    s2 = run_pack(p13, eng, Runner(p13, eng, 2), {})["benchmarks"][0]
+    ok(s1["coverage"] == s2["coverage"] and s1.get("per_replicate_sha256") == s2.get("per_replicate_sha256")
+       and s1.get("per_replicate_sha256"),
+       f"BP49 (v2d β) coverage replicates run in parallel give the serial result ({s1['coverage']}, {s2['coverage']})")
+    p14 = dict(p13, benchmarks=[dict(p13["benchmarks"][0], id="P1"), dict(p13["benchmarks"][0], id="P2", seed=5)])
+    full = stamp(run_pack(p14, eng, Runner(p14, eng, 1), {}), eng)
+    parts = [stamp(run_pack(dict(p14, benchmarks=[b]), eng, Runner(p14, eng, 1), {}), eng) for b in p14["benchmarks"]]
+    try:
+        mg = merge_results(p14, parts[::-1], eng)
+        same = ([{k: v for k, v in r.items()} for r in mg["benchmarks"]] == full["benchmarks"]
+                and mg["summary"] == full["summary"] and mg["engine_identity"] == full["engine_identity"])
+        try:
+            merge_results(p14, parts[:1], eng)
+            short = False
+        except ValueError:
+            short = True
+        bad = dict(parts[1], engine_identity=dict(parts[1]["engine_identity"], code_sha256="0" * 64))
+        try:
+            merge_results(p14, [parts[0], bad], eng)
+            other = False
+        except ValueError:
+            other = True
+        ok(same and short and other, "BP50 (v2d β) per-case runs merge into the full results in pack order; a missing "
+           "case or another code identity is refused")
+    except NameError as ex:
+        ok(False, f"BP50 merge_results ({ex})")
+    # Codex r1-11: a coverage row carries its declaration and calibration-code digests; merge re-checks both
+    try:
+        p15 = dict(p14, benchmarks=[dict(b, estimand=dict(b["estimand"], calibrator=dict(
+            b["estimand"]["calibrator"], args={"mu_sd": 2.0}))) if b["id"] == "P2" else b for b in p14["benchmarks"]])
+        r0 = parts[0]["benchmarks"][0]
+        has = bool(r0.get("declaration_sha256")) and bool(r0.get("code_sha256"))
+        try:
+            merge_results(p15, parts, eng)
+            stale = False
+        except ValueError:
+            stale = True
+        ok(has and stale, f"BP51 (Codex r1-11) a per-case result for another declaration is refused at merge "
+                          f"(digests present: {has})")
+    except Exception as ex:  # noqa: BLE001
+        ok(False, f"BP51 declaration digests ({type(ex).__name__}: {ex})")
+    try:
+        p16 = dict(p14, configs={"x": {"k": 1}})
+        for b in p16["benchmarks"]:
+            b["estimand"]["calibrator"] = dict(b["estimand"]["calibrator"], args={"config": "x"})
+        p16b = dict(p16, configs={"x": {"k": 2}})
+        d1 = declaration_digest(p16["benchmarks"][0], p16)
+        d2 = declaration_digest(p16b["benchmarks"][0], p16b)
+        ok(d1 != d2, "BP52 (Codex r2-4) a changed named configuration (or threshold file) changes the case digest")
+    except Exception as ex:  # noqa: BLE001
+        ok(False, f"BP52 configuration in the digest ({type(ex).__name__}: {ex})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

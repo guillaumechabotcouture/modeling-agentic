@@ -6,7 +6,8 @@ with the full calibration:
   emulator_inversion  the held-out units' calibrated attribute comes from a ridge regression on
                       `stability.covariates` fitted to the other units (the spike's method);
   likelihood          the calibration is refitted without the held-out units' targets, their
-                      own attribute kept at the full fit (it is not identified without them).
+                      own attribute kept at the full fit (it is not identified without them);
+  posterior           the same fold, at the fold posterior's mode (the estimator of the full fit's point).
 Metrics: the share of the objective lost over all units (the headline, lesson 5) and in the
 held-out units; rank correlation of the held-out units' spend; package concordance. The
 identity verdict is scripts/allocation_robustness.compute_verdict; `value_verdict` applies the
@@ -90,6 +91,12 @@ def run(A, z0, out0, ben0, cost0, plan) -> dict:
                                    start={**{p: A.lik["x"][p] for p in A.lik["params"]},
                                           **{f"z:{u}": A.lik["z"][u] for u in A.lik["z"] if u not in hid}},
                                    identifiability=False)
+            theta = dict(A.theta0, **fit["theta"])
+            zh = dict(fit["z"], **{i: z0[i] for i in hid})
+            _, ben_f, cost_f = A.evaluate(theta, zh)
+        elif A.method == "posterior":
+            rows = [r for r in C.read_targets(A.spec) if r["unit"] not in set(hid)]
+            fit = C.fit_posterior_panel(A.spec, A.model, rows=rows, fixed_z={i: z0[i] for i in hid}, sample_it=False)
             theta = dict(A.theta0, **fit["theta"])
             zh = dict(fit["z"], **{i: z0[i] for i in hid})
             _, ben_f, cost_f = A.evaluate(theta, zh)

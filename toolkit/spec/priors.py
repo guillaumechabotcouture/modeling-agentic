@@ -202,8 +202,8 @@ def problems(spec) -> list[str]:
         if not why:
             bad.append(f"uncertainty.excluded: parameter {name} needs a reason")
     inc = [x.get("kind") for x in u.get("sources") or [] if isinstance(x, dict)]
-    if spec.raw["calibration"].get("method") == "likelihood" and drawn(spec):
-        bad.append(f"uncertainty: likelihood calibration does not condition on prior draws (its fit and covariance hold "
+    if spec.raw["calibration"].get("method") in ("likelihood", "posterior") and drawn(spec):
+        bad.append(f"uncertainty: {spec.raw['calibration']['method']} calibration does not condition on prior draws (its fit and covariance hold "
                    f"the priors at their point values), so drawing {sorted(drawn(spec))} would add variation the data "
                    "contradict; exclude them by name or kind with a reason, or calibrate by emulator inversion "
                    "(re-inverted per draw) (Codex r1 P1-1)")

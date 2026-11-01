@@ -412,31 +412,68 @@ def _loguniform(rng, lo, hi):
 def generate_renewal_series(rng, r0_range=(1.3, 2.5), reporting_range=(0.0333, 0.333), gamma=1 / 7.0,
                             weeks=30, population=1.0e6, seed_share=1.0e-5, dispersion=20.0, s0=1.0,
                             s0_range=None, forcing_amplitude_range=None, forcing_phase=0.0, forcing_period=365.0,
-                            truncate_weeks=None):
-    """SB1/SB2: weekly reported cases from the reference ODE (single group), negative-binomial reporting
+                            truncate_weeks=None, seed_share_range=None, generation_interval=None):
+    """SB1/SB2: weekly reported cases from the reference ODE (single group), or, with `generation_interval` (daily
+    weights), from an independent implementation of the discrete renewal process (`renewal_discrete`), negative-binomial reporting
     noise around reporting x true infections. `s0_range` makes the initial susceptible share unknown
     (drawn); `forcing_amplitude_range` adds an unknown (drawn) cosine forcing; `truncate_weeks` ends the
-    series before depletion. Truth: R0, the attack rate and reff_end over the observed window, reporting."""
+    series before depletion; `seed_share_range` makes the seeding unknown (drawn log-uniformly). Truth: R0, the attack
+    rate and reff_end over the observed window, reporting."""
     r0 = float(rng.uniform(*r0_range))
     rho = _loguniform(rng, *reporting_range)
     s = float(rng.uniform(*s0_range)) if s0_range else float(s0)
     amp = float(rng.uniform(*forcing_amplitude_range)) if forcing_amplitude_range else 0.0
+    if seed_share_range:
+        seed_share = _loguniform(rng, *seed_share_range)
     f = (lambda t: 1.0 + amp * math.cos(2 * math.pi * (t - forcing_phase) / forcing_period)) if amp else None
     n_obs = int(truncate_weeks or weeks)
     tt = np.arange(n_obs + 1) * 7.0
-    t, sv, iv, cum = ode_sir(r0, [[1.0]], [1.0], [s], [seed_share], gamma, tt[-1], t_eval=tt, forcing=f)
-    inc = np.diff(cum[0])
+    if generation_interval is not None:
+        inc_d, attack, s_last = renewal_discrete(r0, generation_interval, s, seed_share, 7 * n_obs, f)
+        inc = inc_d.reshape(n_obs, 7).sum(axis=1)
+        f_end = f(7.0 * n_obs) if f else 1.0
+        truth_ar, truth_reff = attack, r0 * f_end * s_last
+    else:
+        t, sv, iv, cum = ode_sir(r0, [[1.0]], [1.0], [s], [seed_share], gamma, tt[-1], t_eval=tt, forcing=f)
+        inc = np.diff(cum[0])
+        f_end = f(tt[-1]) if f else 1.0
+        truth_ar, truth_reff = float(cum[0, -1] - cum[0, 0] + seed_share), r0 * f_end * float(sv[0, -1])
     mu = np.maximum(rho * population * inc, 1e-12)
     p = dispersion / (dispersion + mu)
     cases = rng.negative_binomial(dispersion, p)
-    s_end = float(sv[0, -1])
-    f_end = f(tt[-1]) if f else 1.0
-    truth = {"r0": r0, "reporting": rho, "attack_rate": float(cum[0, -1] - cum[0, 0] + seed_share),
-             "reff_end": r0 * f_end * s_end, "s0": s, "forcing_amplitude": amp}
+    truth = {"r0": r0, "reporting": rho, "attack_rate": float(truth_ar),
+             "reff_end": float(truth_reff), "s0": s, "forcing_amplitude": amp}
     data = {"weekly_cases": [int(x) for x in cases], "population": population, "weeks": n_obs,
             "gamma": gamma, "known": {"s0": None if s0_range else s, "forcing": "none" if not forcing_amplitude_range
-                                      else "cosine (amplitude unknown)"}}
+                                      else "cosine (amplitude unknown)",
+                                      "seed": None if seed_share_range else seed_share}}
     return data, truth
+
+
+def renewal_discrete(r0, w, s0, seed, steps, forcing=None):
+    """An independent implementation (not the engine's code) of the declared discrete-time renewal process with
+    exponential survival, one group, daily steps: a seed pulse at day 0 taken from the susceptibles, then
+    I_k = S_{k-1} (1 - exp(-r0 f(k) sum_l w_l I_{k-l})). Returns (incidence on days 1..steps as shares, the attack
+    rate over days 0..steps-1 including the seed, the susceptible share after day steps-1), the window conventions
+    the engine's outputs use."""
+    w = np.asarray(w, float)
+    S = float(s0)
+    sd = min(float(seed), S)
+    S -= sd
+    hist = np.zeros(len(w))
+    hist[0] = sd
+    inc = [sd]
+    s_after = [S]
+    for k in range(1, int(steps) + 1):
+        f = forcing(float(k)) if forcing else 1.0
+        new = S * -math.expm1(-r0 * f * float(np.dot(w, hist)))
+        S -= new
+        hist = np.roll(hist, 1)
+        hist[0] = new
+        inc.append(new)
+        s_after.append(S)
+    inc = np.asarray(inc)
+    return inc[1:], float(inc[:-1].sum()), float(s_after[-2])
 
 
 def generate_cohort_sources(rng, n_cohorts=5, coverage_beta=(8.0, 2.0), omega_prior=(0.0, 0.25),
@@ -471,6 +508,7 @@ def generate_cohort_sources(rng, n_cohorts=5, coverage_beta=(8.0, 2.0), omega_pr
                     design_effect=design_effect, out_of_frame_share=out_of_frame_share, n_effective=n_eff)
     truth = {"susceptible_share": float(np.mean(1 - immune_unit)), "omega": omega, "delta": delta,
              "ratio": (1 + omega) / (1 + delta)}
+    data.update(cohort_size=[1.0] * n_cohorts, out_of_frame_share=out_of_frame_share)
     return data, truth
 
 
@@ -494,7 +532,8 @@ def generate_group_attack(rng, q_range=(0.4, 1.0), N=(3.0e5, 2.0e5, 1.0e5),
     hosp = np.asarray(hosp_ratio)
     averted = float(np.sum((z0 - z1) * N * hosp))
     data = {"N": N.tolist(), "contact": C.tolist(), "survey_n": survey_n, "positive": [int(x) for x in obs],
-            "hosp_ratio": list(hosp), "plan_coverage": list(plan_coverage), "efficacy": efficacy}
+            "hosp_ratio": list(hosp), "plan_coverage": list(plan_coverage), "efficacy": efficacy,
+            "seed_unit_share": float(np.dot(seed, N) / N.sum())}
     return data, {"q": q, "hospitalisations_averted": averted}
 
 
@@ -558,6 +597,24 @@ def _self_test() -> int:
     dg, tg = generate_group_attack(np.random.default_rng([5, 2]))
     ok(tg["hospitalisations_averted"] > 0 and len(dg["positive"]) == 3, "O17 group-attack generator")
     ok(math.isnan(oracle_minimum([1.0, float("nan"), 1.0])), "O18 (Codex r1-9) the minimum oracle propagates NaN")
+    try:     # Codex r2-3: the renewal SB cases generate from the declared discrete process; it must equal the engine
+        from toolkit.engines.compartmental.engine import CompartmentalEngine
+        from toolkit.engines.contract import Horizon, Package, UnitSpec
+        w = discretised_exponential_gi_triangle(1 / 7, 1.0, 40)
+        w = list(np.asarray(w) / np.sum(w))
+        f = lambda t: 1.0 + 0.2 * math.cos(2 * math.pi * t / 365.0)  # noqa: E731
+        inc, ar, s_last = renewal_discrete(1.9, w, 0.8, 1e-5, 70, f)
+        eng = CompartmentalEngine(groups=["all"], structure="single_group", mode="windowed", initialiser="given",
+                                  dt="day", generation_interval=w, forcing="cosine", forcing_period=365.0)
+        o = eng.run({"r0": 1.9, "forcing_amplitude": 0.2, "forcing_phase": 0.0},
+                    UnitSpec("u", {"N": [1.0e6], "s0": [0.8], "seed": 1e-5}), Package("p", {}),
+                    Horizon(0, 70, (0, 70), {"all": (0, 70)}), 1)
+        win = o.windows["all"]
+        ok(np.max(np.abs(np.asarray(o.meta["incidence"]) - inc)) < 1e-12 and abs(win["attack_rate"] - ar) < 1e-12
+           and abs(win["reff_end"] - 1.9 * f(70.0) * s_last / 1.0) < 1e-9,
+           "O19 (Codex r2-3) the independent discrete renewal generator equals the engine's windowed run")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"O19 discrete renewal generator ({type(e).__name__}: {e})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

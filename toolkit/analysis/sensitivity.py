@@ -31,6 +31,13 @@ def _ranges(A) -> dict:
         for p in A.lik["params"]:
             if se.get(p):
                 out[p] = (A.theta0[p] - 1.96 * se[p], A.theta0[p] + 1.96 * se[p], "estimate +/- 1.96 SE")
+    if A.method == "posterior":                  # v2d β: the posterior's own 95% interval
+        import numpy as np
+        rows = np.asarray(A.lik["sample"]["rows"], float)
+        for j, p in enumerate(A.lik["sample"]["names"]):
+            if p in A.lik["params"]:
+                lo, hi = np.quantile(rows[:, j], [0.025, 0.975])
+                out[p] = (float(lo), float(hi), "posterior 95% interval")
     if isinstance(sel, list):
         bad = [p for p in sel if p not in out]
         if bad and A.model.kind == "emulator":
