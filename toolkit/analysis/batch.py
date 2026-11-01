@@ -308,3 +308,183 @@ def _same(a, b, rtol, worst=None) -> bool:
             worst[0] = max(worst[0], rel)
         return rel <= rtol
     return a == b
+
+
+# --------------------------------------------------------------------------- self-test
+def _self_test() -> int:
+    """python3 toolkit/analysis/batch.py --self-test: shipping a batch with its exact inputs, and adoption across
+    platforms, on the toy engine. The cases replay the Nigeria re-run: shards computed on Linux VMs and merged on
+    macOS, where one design point's inputs (m0 = exp(z)) regenerated with last-bit differences (32 rows' input
+    hashes mismatched, one row per package), and one adoption re-run reproduced only to about 1.4%."""
+    import copy
+    import shutil
+    import tempfile
+    fails = []
+
+    def ok(cond, msg):
+        print(("PASS " if cond else "FAIL ") + msg)
+        if not cond:
+            fails.append(msg)
+
+    def case(label, fn):
+        try:
+            fn()
+        except Exception as e:      # noqa: BLE001 -- a missing function is a failing case, not a crash of the test
+            ok(False, f"{label} ({type(e).__name__}: {e})")
+
+    def refused(fn, code):
+        try:
+            fn()
+        except ValueError as e:
+            return getattr(e, "code", None) == code, f"{getattr(e, 'code', None)}: {e}"
+        return False, "not refused"
+
+    from toolkit.spec import schema
+    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    g = globals()
+    linux = {"system": "Linux", "machine": "x86_64", "python": "3.12.3", "numpy": "2.1.3", "scipy": "1.14.1"}
+    with tempfile.TemporaryDirectory() as d:
+        spec = schema.load(schema.toy_spec(d, n=12))
+        spec["analysis"]["emulator"]["points"] = 8
+        eng = spec.engine()
+        design0, jobs0 = design(spec)
+        attr = spec["calibration"]["attribute"]
+        # the VM's inputs: design point 3 regenerated with a last-bit difference in the calibrated attribute
+        vm_jobs = copy.deepcopy(jobs0)
+        for j in vm_jobs:
+            if j["point"] == 3:
+                j["unit"][attr] = float(np.nextafter(j["unit"][attr], np.inf))
+        vm_design = copy.deepcopy(design0)
+        vm_design["points"][3]["z"] = float(np.nextafter(vm_design["points"][3]["z"], np.inf))
+        n3 = sum(j["point"] == 3 for j in vm_jobs)
+        rows = [{"id": j["id"], "ok": True, "result": run_job(j)} for j in vm_jobs]
+        made = [0]
+
+        def b0():
+            # the observed failure, kept as evidence: regenerating the design at merge time loses the shipped rows
+            res, probs = verify_rows(rows, jobs0, eng)
+            ok(len(probs) == n3 and all("inputs differ" in p for p in probs),
+               f"BA0 regenerating the design at merge time rejects the {n3} rows of the point with last-bit "
+               f"differences (the re-run's 32 rows, one per package): {len(probs)}")
+        case("BA0", b0)
+
+        def shard_dirs(plat_a, plat_b=None, jobs=None, rws=None):
+            jobs, rws, out = jobs or vm_jobs, rws or rows, []
+            made[0] += 1
+            for k in (0, 1):
+                sd = os.path.join(d, f"run{made[0]}_shard{k}")
+                mine = [j for j in jobs if j["point"] % 2 == k]
+                ids = {j["id"] for j in mine}
+                g["ship"](sd, spec, vm_design, mine, [r for r in rws if r["id"] in ids],
+                          platform=plat_a if k == 0 or plat_b is None else plat_b)
+                out.append(sd)
+            return out
+
+        def merged(sds):
+            m = os.path.join(d, f"merged{made[0]}")
+            g["merge_shipped"](m, sds)
+            return m
+
+        def b1():
+            m = merged(shard_dirs(linux))
+            man = json.load(open(os.path.join(m, SHIP_MANIFEST)))
+            ok(man.get("platform") == linux and man.get("jobs_sha256") and man.get("results_sha256")
+               and man.get("design_sha256"),
+               "BA1 a shipped batch carries its exact jobs file, design and results, each hashed, and the platform "
+               "that computed them")
+            des, jbs, res, info = g["load_shipped"](m, spec, design0, jobs0, eng)
+            ok(len(res) == len(jobs0) and jbs == vm_jobs and des["points"][3]["z"] == vm_design["points"][3]["z"]
+               and info.get("inputs") == "shipped" and info.get("cross_platform") is True
+               and 0 < info.get("input_max_rel_diff", 0) <= INPUT_RTOL,
+               f"BA1 merged on another platform, every row is accepted against the shipped inputs, not a design "
+               f"regenerated at merge time: {len(res)}/{len(jobs0)}, {info}")
+        case("BA1", b1)
+
+        def b2():
+            m = merged(shard_dirs(platform_info()))
+            r, why = refused(lambda: g["load_shipped"](m, spec, design0, jobs0, eng), "shipped_inputs_differ")
+            ok(r, f"BA2 on the computing platform the design must regenerate exactly; a difference fails closed: {why}")
+        case("BA2", b2)
+
+        def b3():
+            big = copy.deepcopy(vm_jobs)
+            for j in big:
+                if j["point"] == 3:
+                    j["unit"][attr] *= 1 + 1e-6
+            m = merged(shard_dirs(linux, jobs=big, rws=[{"id": j["id"], "ok": True, "result": run_job(j)}
+                                                         for j in big]))
+            r, why = refused(lambda: g["load_shipped"](m, spec, design0, jobs0, eng), "shipped_inputs_differ")
+            ok(r, f"BA3 across platforms only last-bit input differences are accepted (1e-6 is a changed input): {why}")
+        case("BA3", b3)
+
+        def b4():
+            m = merged(shard_dirs(linux))
+            p = os.path.join(m, "results.jsonl")
+            lines = open(p).read().splitlines()
+            r0 = json.loads(lines[0])
+            r0["result"]["result"]["per_capita"] = {}
+            lines[0] = json.dumps(r0)
+            open(p, "w").write("\n".join(lines) + "\n")
+            r, why = refused(lambda: g["load_shipped"](m, spec, design0, jobs0, eng), "shipped_hash_mismatch")
+            ok(r, f"BA4 a shipped file edited after hashing fails closed: {why}")
+        case("BA4", b4)
+
+        def b5():
+            sds = shard_dirs(linux, dict(linux, system="Darwin", machine="arm64"))
+            r, why = refused(lambda: merged(sds), "shipped_platform_mixed")
+            ok(r, f"BA5 shards computed on different platforms are not merged into one batch: {why}")
+        case("BA5", b5)
+
+        def b6():
+            sds = shard_dirs(linux)
+            r, why = refused(lambda: g["load_shipped"](sds[0], spec, design0, jobs0, eng), "shipped_incomplete")
+            ok(r, f"BA6 a batch missing jobs of the current design fails closed: {why}")
+        case("BA6", b6)
+
+        def b7():
+            m = merged(shard_dirs(linux))
+            d2 = os.path.join(d, "other_spec")
+            os.makedirs(d2)
+            shutil.copy(spec.path, d2)
+            shutil.copy(os.path.join(d, "units.csv"), d2)
+            with open(os.path.join(d2, os.path.basename(spec.path)), "a") as f:
+                f.write("# edited\n")
+            spec2 = schema.load(os.path.join(d2, os.path.basename(spec.path)))
+            r, why = refused(lambda: g["load_shipped"](m, spec2, design0, jobs0, eng), "shipped_spec_differs")
+            ok(r, f"BA7 a batch shipped for another decision spec fails closed: {why}")
+        case("BA7", b7)
+
+        def b8():
+            sj, sr, sdz = (os.path.join(d, x) for x in ("a_jobs.jsonl", "a_res.jsonl", "a_design.json"))
+            with open(sj, "w") as f:
+                f.write("".join(json.dumps({k: j[k] for k in ("id",) + CORE}) + "\n" for j in jobs0))
+            with open(sr, "w") as f:
+                f.write("".join(json.dumps({"id": j["id"], "ok": True, "result": run_job(j)["result"]}) + "\n"
+                                for j in jobs0))
+            json.dump({"spec_engine": design0["spec_engine"], "horizon": design0["horizon"],
+                       "cal_window": design0["cal_window"], "platform": linux}, open(sdz, "w"))
+            import compute
+            called = []
+            orig = compute.map_fn
+            compute.map_fn = lambda *a, **k: called.append(1) or orig(*a, **k)
+            try:
+                r, why = refused(lambda: adopt(d, sr, sj, sdz, jobs0, design0, eng, sample=len(jobs0)),
+                                 "adopt_platform_differs")
+            finally:
+                compute.map_fn = orig
+            ok(r and not called, f"BA8 an adoption recorded on another platform is refused before its replay "
+                                 f"recomputes anything (the re-run's 1.4% sample): {why}; replays run {len(called)}")
+            ok(ADOPT_RTOL == 1e-6, "BA9 the adoption tolerance is unchanged (1e-6)")
+        case("BA8", b8)
+    if fails:
+        print(f"FAILED: {len(fails)} self-test case(s)")
+        return 1
+    print("OK: all self-test cases passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] == ["--self-test"]:
+        sys.exit(_self_test())
+    print(__doc__)
+    sys.exit(2)
