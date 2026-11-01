@@ -989,6 +989,12 @@ def _self_test() -> int:
     ok(err is None and ob1.windows["all"]["p_major"] == 0.0,
        f"K16 (Codex r1-4) p_major is exactly 0 at R = 1: {err or ob1.windows['all']['p_major']}")
 
+    for bad_u, bad_p in (({"reach:vax": 1.1}, {}), ({}, {"efficacy:vax": 1.5}), ({}, {"efficacy:vax": -0.2})):
+        _, err = safe(lambda: e.run(dict({"r0": 3.0}, **bad_p), UnitSpec("x", dict(u1.attributes, **bad_u)),
+                                    Package("v", {"vax": 1}), hx, 1))
+        ok(err is not None and "ValueError" in err,
+           f"K17 (Codex r2-2) a reach or efficacy outside [0, 1] is refused ({bad_u or bad_p}): {err}")
+
     # K6: unknown configuration fails closed
     for bad in ({"mode": "both"}, {"structure": "network"}, {"initialiser": "survey"}, {"no_such_field": 1},
                 {"importation": "maybe"}, {"offspring": "negbin"}, {"dt": "month"}):

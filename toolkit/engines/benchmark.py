@@ -1270,6 +1270,12 @@ def _self_test() -> int:
     r9 = run_pack(p9, eng, Runner(p9, eng, 1), {})["benchmarks"][0]
     ok(r9["status"] == "out_of_band" and r9.get("invalid_outputs") == 20,
        f"BP45 (Codex r1-8) non-finite or unordered intervals fail the benchmark: {r9['status']}")
+    p10 = dict(p7, settings=dict(p7["settings"], pr=dict((k, v) for k, v in p7["settings"]["pr"].items() if k != "config")),
+               benchmarks=[p7["benchmarks"][0]])
+    r10 = run_pack(p10, e7, Runner(p10, e7, 1), {})
+    ok(r10["benchmarks"][0]["status"] == "in_band" and "rate2" in r10["configs_validated"],
+       f"BP46 (Codex r2-1) a setting without config runs the pack's default_config, and counts as exercising it: "
+       f"{r10['benchmarks'][0]['status']}, {sorted(r10['configs_validated'])}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
