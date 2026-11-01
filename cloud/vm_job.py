@@ -23,6 +23,24 @@ plain directory), with secrets (`--anthropic-key`) in its environment only. `--s
 installs the pinned claude-agent-sdk from the tree's requirements.txt first (the useful part
 of keep/coiled_run/dev_vm.py, which this replaces).
 
+Batch mode: one cluster, one scheduler, N workers for a whole compute.py batch.
+
+    python cloud/vm_job.py up <name> --workers N [--cpu 8 --memory "32 GiB"]
+    python cloud/vm_job.py start <name> <job_id> --tree . --cluster-compute \\
+        --store outputs/<prefix> [--store-account A] --shutdown-when-stored -- <command ...>
+
+`--cluster-compute` gives the job this cluster's scheduler, so its `compute.run_map` (v2's
+`toolkit/analysis/batch.run`) spreads chunks over the cluster's workers. compute.py gives
+chunks only to workers with nothing processing, and the job's own worker is processing the
+job, so N workers give N - 1 compute VMs: ask for one more than the batch needs.
+`--store` uploads $JOB_OUT to <prefix>/ when the job ends and reads every file back
+(sha256); `--shutdown-when-stored` then stops the cluster from inside the job, but only
+when the job is done and every output is verified in storage. A failed or unverified job
+leaves the cluster to its idle timeout, so its outputs can still be collected. Nothing
+waits on the laptop: start returns at once and the cluster stops itself. (The Nigeria
+re-run used six one-worker clusters, each with its own scheduler, about 5 minutes of
+start-up and a 20-minute idle tail, shut down by a watcher on the laptop.)
+
 Rules: the IDM Coiled default workspace only; attach-only for everything but `up`
 (coiled.Cluster(name=...) on a cluster that is gone creates a new, empty one).
 """
