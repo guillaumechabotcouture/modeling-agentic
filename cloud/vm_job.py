@@ -303,6 +303,7 @@ def _self_test() -> int:
         finally:
             ws.JOBS = old
     _self_test_sched(ok)
+    _self_test_batch(ok)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -365,6 +366,155 @@ def _self_test_sched(ok) -> None:
                 ok(False, "VJ4 a connected scheduler with no worker still says so")
             except SystemExit as e:
                 ok("no worker yet" in str(e), f"VJ4 a connected scheduler with no worker still says so: {e}")
+
+
+def _self_test_batch(ok) -> None:
+    """One cluster, one scheduler, N workers for a whole batch, stopping itself once the outputs are verified in
+    storage (the Nigeria re-run used 6 one-worker clusters, each with its own scheduler, ~5 min start-up and a
+    20-minute idle tail after its shard ended, shut down from a laptop watcher). No network: fake coiled, store and
+    shutdown."""
+    import shutil
+    import tempfile
+    import types
+    from unittest import mock
+
+    def case(label, fn):
+        try:
+            fn()
+        except BaseException as e:  # noqa: BLE001 -- a missing function is a failing case, not a crash
+            ok(False, f"{label} ({type(e).__name__}: {e})")
+
+    def oc1():
+        made, states = [], [["stopping"], ["stopping"], ["stopped"]]
+
+        class FakeCluster:
+            def __init__(self, **kw):
+                made.append(kw)
+
+            def get_client(self):
+                return types.SimpleNamespace(wait_for_workers=lambda n, timeout=None: made.append(("wait", n)))
+        fake = types.SimpleNamespace(Cluster=FakeCluster)
+        a = types.SimpleNamespace(name="b1", cpu=8, memory="32 GiB", idle_timeout="10 minutes", workers=6)
+        with mock.patch.dict(sys.modules, {"coiled": fake}), mock.patch.object(time, "sleep", lambda s: None), \
+                mock.patch.object(rc, "cluster_states", lambda n: states.pop(0) if len(states) > 1 else states[0]):
+            cmd_up(a)
+        kw = made[0] if made and isinstance(made[0], dict) else {}
+        ok(len([m for m in made if isinstance(m, dict)]) == 1 and kw.get("n_workers") == 6
+           and kw.get("scheduler_cpu") == 2 and kw.get("worker_cpu") == 8 and kw.get("shutdown_on_close") is False
+           and kw.get("workspace") == rc.WORKSPACE and ("wait", 1) in made and not states[:-1],
+           f"OC1 `up --workers 6` makes one cluster (one 2-vCPU scheduler, 6 workers) only after a stopping one has "
+           f"stopped, and waits for the first worker: {kw}")
+    case("OC1", oc1)
+
+    def oc1b():
+        ap_err = []
+        with mock.patch("argparse.ArgumentParser.error", lambda self, m: (ap_err.append(m), (_ for _ in ()).throw(
+                SystemExit(2)))):
+            for argv in (["start", "b1", "j", "--shutdown-when-stored", "--", "true"],
+                         ["start", "b1", "j", "--cluster-compute", "--", "true"]):
+                try:
+                    main(argv)
+                except SystemExit:
+                    pass
+        ok(len(ap_err) == 2 and "--store" in ap_err[0] and "--tree" in ap_err[1],
+           f"OC1b --shutdown-when-stored needs --store, and --cluster-compute needs the shipped tree: {ap_err}")
+    case("OC1b", oc1b)
+
+    class FakeStore:
+        """results_store's interface over a local directory; `corrupt` changes what a download returns."""
+
+        def __init__(self, root, corrupt=False):
+            self.root, self.corrupt, self.uploads = root, corrupt, []
+
+        def is_sensitive_path(self, rel):
+            return rel.split("/")[0].startswith("_truth") or rel.endswith(".env")
+
+        def upload_retry(self, path, blob, account=None):
+            self.uploads.append(blob)
+            dest = os.path.join(self.root, blob)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            shutil.copy(path, dest)
+            return {"blob": blob}
+
+        def download(self, blob, path, account=None):
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            shutil.copy(os.path.join(self.root, blob), path)
+            if self.corrupt:
+                open(path, "a").write("x")
+            return {"blob": blob}
+
+    with tempfile.TemporaryDirectory() as d:
+        old = ws.JOBS
+        ws.JOBS = os.path.join(d, "vm")
+        downs = []
+        job = ("import os\nopen(os.path.join(os.environ['JOB_OUT'], 'shard.jsonl'), 'w').write('{}\\n')\n"
+               "os.makedirs(os.path.join(os.environ['JOB_OUT'], 'sub'))\n"
+               "open(os.path.join(os.environ['JOB_OUT'], 'sub', 'b.json'), 'w').write('[]')\n"
+               "os.makedirs(os.path.join(os.environ['JOB_OUT'], '_truth'))\n"
+               "open(os.path.join(os.environ['JOB_OUT'], '_truth', 'key.csv'), 'w').write('secret')\n"
+               "print('sched', os.environ.get('MA_COMPUTE_SCHEDULER'))\n"
+               "raise SystemExit(int(os.environ.get('RC', '0')))\n")
+        code = io.BytesIO()
+        with tarfile.open(fileobj=code, mode="w:gz") as t:
+            ti = tarfile.TarInfo("job.py")
+            ti.size = len(job)
+            t.addfile(ti, io.BytesIO(job.encode()))
+        code = code.getvalue()
+        try:
+            with mock.patch.object(ws, "_cluster_env", lambda work: {"MA_COMPUTE_SCHEDULER": "tls://sched:8786"},
+                                   create=True), \
+                    mock.patch.object(ws, "_shutdown_cluster", lambda: downs.append(1), create=True):
+                def oc2():
+                    fs = FakeStore(os.path.join(d, "blob1"))
+                    st = ws.job_task("b1", code, [sys.executable, "job.py"], None, 1.0, cluster_compute=True,
+                                     store={"prefix": "outputs/t/b1", "account": "acct"}, shutdown_when_stored=True,
+                                     store_mod=fs)
+                    log = open(os.path.join(ws.JOBS, "b1", "job.log")).read()
+                    ok("sched tls://sched:8786" in log,
+                       f"OC2 a batch job's run_map reaches this cluster's scheduler (MA_COMPUTE_SCHEDULER): {log[-80:]}")
+                    sto = st.get("stored") or {}
+                    ok(st["state"] == "done" and sto.get("verified") is True
+                       and sorted(fs.uploads) == ["outputs/t/b1/shard.jsonl", "outputs/t/b1/sub/b.json"]
+                       and sto.get("skipped") == ["_truth/key.csv"] and len(downs) == 1 and st.get("shutdown") is True,
+                       f"OC3 when the job is done and every output (no sensitive file) is read back from storage with "
+                       f"the same sha256, the job shuts its cluster down itself: {sto}, shutdowns {len(downs)}")
+                    ok(ws.job_state("b1")["state"].get("stored", {}).get("verified") is True,
+                       "OC3b the verification is recorded in the job's state")
+                case("OC2", oc2)
+
+                def oc4():
+                    downs.clear()
+                    fs = FakeStore(os.path.join(d, "blob2"), corrupt=True)
+                    st = ws.job_task("b2", code, [sys.executable, "job.py"], None, 1.0, store={"prefix": "outputs/t/b2"},
+                                     shutdown_when_stored=True, store_mod=fs)
+                    ok(st["state"] == "done" and (st.get("stored") or {}).get("verified") is False and not downs
+                       and not st.get("shutdown") and "sha256" in str((st.get("stored") or {}).get("why")),
+                       f"OC4 a stored copy that differs is not verified, and the cluster is left to its idle timeout "
+                       f"for collection: {st.get('stored')}")
+                case("OC4", oc4)
+
+                def oc5():
+                    downs.clear()
+                    fs = FakeStore(os.path.join(d, "blob3"))
+                    with mock.patch.dict(os.environ, {"RC": "3"}):
+                        st = ws.job_task("b3", code, [sys.executable, "job.py"], None, 1.0,
+                                         store={"prefix": "outputs/t/b3"}, shutdown_when_stored=True, store_mod=fs)
+                    ok(st["state"] == "failed" and not downs and fs.uploads,
+                       f"OC5 a failed job stores what it wrote but never shuts the cluster down: {st['state']}, "
+                       f"{len(fs.uploads)} uploads, shutdowns {len(downs)}")
+                case("OC5", oc5)
+
+                def oc6():
+                    downs.clear()
+                    st = ws.job_task("b4", code, [sys.executable, "job.py"], None, 1.0,
+                                     store={"prefix": "outputs/t/b4"}, shutdown_when_stored=True)
+                    ok(st["state"] == "done" and (st.get("stored") or {}).get("verified") is False and not downs
+                       and "results_store" in str((st.get("stored") or {}).get("why")),
+                       f"OC6 storage requested without the shipped tree's results_store fails closed (no shutdown): "
+                       f"{st.get('stored')}")
+                case("OC6", oc6)
+        finally:
+            ws.JOBS = old
 
 
 def main(argv=None) -> int:
