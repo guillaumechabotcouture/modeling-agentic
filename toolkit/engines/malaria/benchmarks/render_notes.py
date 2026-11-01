@@ -84,6 +84,7 @@ def render(new: dict, old: dict | None, fitted: dict | None, mech: dict | None, 
             f"held-out in band). {new['n_sims']} engine runs, {len(new['seeds'])} seeds per arm (common random numbers). "
             f"v0.1: {(old or {}).get('summary', {}).get('in_band', 'n/a')} of {(old or {}).get('summary', {}).get('total', 'n/a')} in band."]
     notes = [r for r in new["benchmarks"] if r["status"] in ("not_assessable", "band_mis_based") or r.get("requires")
+             or r.get("components")
              or (r.get("price_floor") is not None and (r["price_floor"] > r["target"] or r.get("reach_in_fitted_range")))]
     for r in notes:
         if r.get("reach_in_fitted_range"):
@@ -108,10 +109,21 @@ def render(new: dict, old: dict | None, fitted: dict | None, mech: dict | None, 
             why = "" if r["status"] != "not_assessable" else " (not assessable: " + ", ".join(
                 f"{k} {v['computed']} outside {v['required']}" for k, v in r["not_assessable_because"].items()) + ")"
             out.append(f"- {r['id']} requires {r['requires']}; computed {vals}{why}.")
+        if r.get("components"):
+            comp = "; ".join(f"{k} {v}" for k, v in r["components"].items())
+            diag = "; ".join(f"{k} {v}" for k, v in (r.get("diagnostics") or {}).items())
+            out.append(f"- {r['id']} by outcome definition (geometric mean of these): {comp}."
+                       + (f" Diagnostic, not judged: {diag}." if diag else ""))
         if r.get("arm_or_geomean"):
             a = r["arm_or_geomean"]
             out.append(f"- {r['id']} arms (OR vs standard LLIN): PBO alone {a['a10']}, IRS alone {a['a01']}, both {a['a11']}; "
                        f"prevalence {r['arm_prevalence']}.")
+    cal = new.get("settings_calibrated") or {}
+    if cal:
+        out += ["", "Calibrated transmission per setting (value, grid; a value at an outer grid bound is flagged):", ""]
+        out.append("; ".join(f"{k} {c['attribute']} {float(c['value']):.4g} on {c['grid']}"
+                             + (" **at the grid edge**" if c.get("near_grid_edge") or c.get("at_grid_edge") else "")
+                             for k, c in cal.items()) + ".")
     if fitted:
         out += ["", f"Fitted engine-level parameters (fit rule `{fitted['fit_rule']['version']}`, seeds "
                 f"{fitted['fit_rule'].get('seeds')}, {fitted['fit_rule'].get('design_points')} design points):", "",
@@ -157,7 +169,8 @@ def write(path=NOTES) -> None:
     block = render(new, _y(os.path.join(HERE, "history", "results_v0.1-spike.yaml")),
                    _y(os.path.join(HERE, "fitted.yaml")), _y(os.path.join(HERE, "b15_mechanisms.yaml")),
                    extra=[(lab, _y(os.path.join(HERE, "history", f))) for lab, f in
-                          (("v0.2 (round 1)", "results_v0.2.yaml"), ("v0.3 round 2", "results_v0.3-r2.yaml"))
+                          (("v0.2 (round 1)", "results_v0.2.yaml"), ("v0.3 round 2", "results_v0.3-r2.yaml"),
+                           ("v0.3", "results_v0.3.yaml"))
                           if os.path.exists(os.path.join(HERE, "history", f))])
     text = open(path).read()
     i, j = text.index(START), text.index(END)
@@ -174,12 +187,17 @@ def _self_test() -> int:
          "comparator_outcome_per_capita": 1.0, "share_averted_needed_for_band": 2.0, "share_averted": 0.4}],
         "summary": {"total": 2, "held_out_in_band": 0, "held_out_total": 1,
                     "by_status": {"in_band": 1, "out_of_band": 0, "not_assessable": 0, "band_mis_based": 1}},
-        "n_sims": 10, "seeds": [1, 2]}
+        "n_sims": 10, "seeds": [1, 2],
+        "settings_calibrated": {"site": {"attribute": "m0", "value": 127.6, "grid": [8, 128], "near_grid_edge": True}}}
+    new["benchmarks"][0].update(components={"trial A (all ages)": 0.8, "trial B (under 5)": 0.6},
+                                diagnostics={"windows.m12.pfpr_6m14y": 0.62})
     txt = render(new, {"benchmarks": [{"id": "X1", "computed": 3.0, "in_band": False}], "summary": {"in_band": 0, "total": 1}},
                  None, None)
     ok = ("| X1 |" in txt and "**out of band**" in txt and "band mis-based" in txt and "200%" in txt
-          and "0.9–1.3" in txt)
-    print(("PASS" if ok else "FAIL") + " R1 the notes table renders statuses, seed ranges and the price-floor note")
+          and "0.9–1.3" in txt and "trial A (all ages) 0.8" in txt and "Diagnostic, not judged" in txt
+          and "**at the grid edge**" in txt)
+    print(("PASS" if ok else "FAIL") + " R1 the notes table renders statuses, seed ranges, the price-floor note, components by outcome "
+          "definition and grid-edge flags")
     if not ok:
         print(txt)
         return 1
