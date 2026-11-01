@@ -155,6 +155,21 @@ class Likelihood:
         return x
 
 
+def ridge_refusal(fa: dict) -> str | None:
+    """v2d §3.1 (AN-b3, Codex r1-10): why a likelihood fit is refused, or None. Every ridge scripts/identifiability.py
+    reports (a null direction, or a direction whose relative SE exceeds its RIDGE_REL_SE) and a condition number above
+    the threshold are refused; the covariance is never jittered."""
+    ridges = fa.get("ridges") or []
+    cond = fa.get("condition_number")
+    cmax = float(thresholds()["ridge_condition_max"])
+    if ridges:
+        return (f"the likelihood has {len(ridges)} flat or weakly determined direction(s) "
+                f"{[r.get('params') for r in ridges][:3]} (condition number {cond})")
+    if cond is None or not (cond <= cmax):
+        return f"condition number {cond} above {cmax:g}"
+    return None
+
+
 def fit_likelihood(spec, model, rows=None, fixed_z=None, start=None, identifiability=True) -> dict:
     from scipy.optimize import minimize
     L = Likelihood(spec, model, rows, fixed_z)
@@ -176,13 +191,10 @@ def fit_likelihood(spec, model, rows=None, fixed_z=None, start=None, identifiabi
     names_h, H = I.hessian(qnll, xh, b)
     # v2d §3.1 (AN-b3): a ridged fit is refused, never jittered into a positive-definite covariance. The finding tells
     # the planner to reparameterise (a reference package) or to declare priors and use `posterior`.
-    null = [r for r in fa.get("ridges") or [] if r.get("null_direction")]
-    cond = fa.get("condition_number")
-    cmax = float(thresholds()["ridge_condition_max"])
-    if null or cond is None or not (cond <= cmax):
-        raise CalibrationRefused("calibration_ridge", f"the likelihood has a flat direction (condition number "
-                                 f"{cond}, max {cmax:g}; null directions {[r['params'] for r in null][:3]}): "
-                                 "reparameterise (a reference package) or declare priors and use method posterior")
+    why = ridge_refusal(fa)
+    if why:
+        raise CalibrationRefused("calibration_ridge", f"{why}: reparameterise (a reference package) or declare priors "
+                                                      "and use method posterior")
     try:
         cov = np.linalg.inv(np.asarray(H))
         cov = (cov + cov.T) / 2
@@ -574,25 +586,9 @@ def sample(P: Problem, seed: int = 0, **override) -> dict:
     return out
 
 
-def _derived_values(P, X):
-    return {k: np.asarray(f({n: X[:, j] for j, n in enumerate(P.names)}), float) for k, f in P.derived.items()}
-
-
-def classify(P: Problem, smp: dict, **override) -> dict:
-    """Identifiability classes (v2d §3.2): likelihood classes from the Fisher information of the likelihood alone in
-    prior-scale units (flat directions, ridge loadings), contraction 1 - var_post/var_prior on each prior's own
-    scale, and the combined class: prior_dominated (on_ridge, unidentified, or contraction < 0.1), identified
-    (likelihood identified and contraction >= 0.5) or partly_identified. Derived quantities are classed the same way
-    (gradient projected on the flat directions; contraction on the log scale when positive)."""
-    th = dict(thresholds(), **override)
-    names, d = P.names, len(P.names)
-    sd = np.array([math.sqrt(P.priors[n].natural_var()) for n in names])
-    t0 = np.array([float(P.priors[n].natural(smp["best"][j])) for j, n in enumerate(names)])
-    h = 0.01
-    for j, n in enumerate(names):                         # keep the stencil inside the prior's support
-        lo, hi = P.priors[n].natural_support()
-        pad = 2.5 * h * sd[j]
-        t0[j] = min(max(t0[j], lo + pad), hi - pad)
+def _fd_hessian(P, names, t0, sd, h):
+    """Central finite-difference Hessian of -loglik in prior-scale units (one batch of 1 + 2d + 2d(d-1) points)."""
+    d = len(names)
     pts = [np.zeros(d)]
     for i in range(d):
         for s in (1, -1):
@@ -618,19 +614,50 @@ def classify(P: Problem, smp: dict, **override) -> dict:
     for q, (i, k) in enumerate(pairs):
         a, b, c, e = f[base + 4 * q: base + 4 * q + 4]
         H[i, k] = H[k, i] = (a - b - c + e) / (4 * h * h)
-    fin = bool(np.all(np.isfinite(H)))
+    return H, bool(np.all(np.isfinite(H)))
+
+
+def _derived_values(P, X):
+    return {k: np.asarray(f({n: X[:, j] for j, n in enumerate(P.names)}), float) for k, f in P.derived.items()}
+
+
+def classify(P: Problem, smp: dict, **override) -> dict:
+    """Identifiability classes (v2d §3.2): likelihood classes from the Fisher information of the likelihood alone in
+    prior-scale units (flat directions, ridge loadings), contraction 1 - var_post/var_prior on each prior's own
+    scale, and the combined class: prior_dominated (on_ridge, unidentified, or contraction < 0.1), identified
+    (likelihood identified and contraction >= 0.5) or partly_identified. Derived quantities are classed the same way
+    (gradient projected on the flat directions; contraction on the log scale when positive)."""
+    th = dict(thresholds(), **override)
+    names, d = P.names, len(P.names)
+    sd = np.array([math.sqrt(P.priors[n].natural_var()) for n in names])
+    t0 = np.array([float(P.priors[n].natural(smp["best"][j])) for j, n in enumerate(names)])
+    h = 0.01
+    for j, n in enumerate(names):                         # keep the stencil inside the prior's support
+        lo, hi = P.priors[n].natural_support()
+        pad = 2.5 * h * sd[j]
+        t0[j] = min(max(t0[j], lo + pad), hi - pad)
+    # Codex r1-5: a fixed-step curvature along a curved exact ridge grows as h^2 (the straight step leaves the
+    # ridge); Richardson extrapolation from h and h/2 removes that term, so a ridge stays flat at any precision.
+    H1, fin1 = _fd_hessian(P, names, t0, sd, h)
+    H2, fin2 = _fd_hessian(P, names, t0, sd, h / 2)
+    fin = fin1 and fin2
+    H = (4.0 * H2 - H1) / 3.0
     if not fin:
         H = np.nan_to_num(H, nan=0.0, posinf=0.0, neginf=0.0)
     lam, V = np.linalg.eigh(0.5 * (H + H.T))
     flat = lam < th["flat_eigenvalue"]
     Vf = V[:, flat]
     lmin = th["ridge_loading_min"]
-    ridges = []
+    ridges, on_flat = [], set()
     for j in np.nonzero(flat)[0]:
-        loaded = [names[i] for i in range(d) if abs(V[i, j]) >= lmin]
+        # Codex r1-3: a null direction spread over many parameters loads each one weakly; every parameter carrying
+        # at least half the largest loading (or the absolute minimum) is on that ridge
+        cut = min(lmin, 0.5 * float(np.max(np.abs(V[:, j]))))
+        loaded = [names[i] for i in range(d) if abs(V[i, j]) >= cut]
         if len(loaded) >= 2:
+            on_flat.update(loaded)
             ridges.append({"params": loaded, "eigenvalue": float(lam[j]),
-                           "loadings": {names[i]: round(float(V[i, j]), 3) for i in range(d) if abs(V[i, j]) >= lmin}})
+                           "loadings": {names[i]: round(float(V[i, j]), 3) for i in range(d) if abs(V[i, j]) >= cut}})
     sub = [names[i] for i in range(d) if Vf.size and float(np.sum(Vf[i, :] ** 2)) >= lmin ** 2]
     if len(sub) >= 2 and Vf.shape[1] > 1:      # several flat directions: also name the whole flat subspace
         ridges.append({"params": sub, "kind": "flat_subspace", "dimension": int(Vf.shape[1])})
@@ -638,7 +665,8 @@ def classify(P: Problem, smp: dict, **override) -> dict:
     for i, n in enumerate(names):
         sh = float(np.sum(Vf[i, :] ** 2)) if Vf.size else 0.0
         share[n] = sh
-        lik[n] = ("unidentified" if H[i, i] < th["flat_eigenvalue"] else "on_ridge" if sh >= lmin ** 2
+        lik[n] = ("unidentified" if H[i, i] < th["flat_eigenvalue"] else "on_ridge" if (sh >= lmin ** 2
+                                                                                       or n in on_flat)
                   else "identified")
     rows = np.asarray(smp["rows"], float)
     contraction = {}
@@ -748,7 +776,8 @@ def check_provenance(smp: dict, recorded: list, rtol: float = 1e-12) -> list:
         for j, nm in enumerate(smp["names"]):
             v = vals.get(nm)
             ref = float(rows[i, j])
-            if not isinstance(v, (int, float)) or abs(float(v) - ref) > rtol * max(1.0, abs(ref)):
+            if (not isinstance(v, (int, float)) or not math.isfinite(float(v)) or not math.isfinite(ref)
+                    or abs(float(v) - ref) > rtol * max(1.0, abs(ref))):
                 out.append({"kind": "analysis_contract_uncovered_parameter", "draw": k, "parameter": nm,
                             "detail": f"applied {v!r}, canonical sample row {i} has {ref!r}"})
     return out
@@ -803,7 +832,7 @@ def panel_problem(spec, model, rows=None, fixed_z=None, fixed_params=None):
         out = np.full(n, -np.inf)
         for i in range(n):
             x = dict(fixed_params, **{nm: float(X[nm][i]) for nm in names})
-            mu = np.maximum(L.expected(x), 1e-300)
+            mu = np.maximum(L.expected(x), 0.0)        # no floor (Codex r1-1): a zero mean with counts has no support
             out[i] = float(np.sum(ob.loglik(model_, y, mu=mu, **({"dispersion": float(k)} if k else {}))))
         return out, {}
     P = Problem(names, pri, ll, chunk=256)
@@ -856,7 +885,7 @@ def fit_posterior_panel(spec, model, rows=None, fixed_z=None, fixed_params=None,
         out["sample"] = {"sample_id": s["sample_id"], "names": s["names"], "rows": s["rows"].tolist(),
                          "method": s["method"], "seed": s["seed"]}
         out["diagnostics"].update(sampler=s["method"], **{k: v for k, v in s["diagnostics"].items()})
-        pr_tests = [t for t in prior_range_tests(c, P) if not t["parameter"].startswith("z:")]
+        pr_tests = prior_range_tests(c, P)      # unit attributes included (Codex r1-7)
         lab = label_parts(c, P)
         out["identifiability"] = {"method": c["method"], "classes": c["classes"],
                                   "likelihood_classes": c["likelihood_classes"], "contraction": c["contraction"],
@@ -864,7 +893,7 @@ def fit_posterior_panel(spec, model, rows=None, fixed_z=None, fixed_params=None,
                                   "status": ("well_identified" if all(v == "identified" for v in c["classes"].values())
                                              else "partly_or_prior_dominated")}
         out["prior_range_tests"] = pr_tests
-        out["prior_dominated"] = [n for n in lab["prior_dominated"] if not n.startswith("z:")]
+        out["prior_dominated"] = list(lab["prior_dominated"])
         out["priors"] = {n: P.priors[n].describe() for n in P.names}
     return out
 
@@ -941,6 +970,7 @@ class EngineProblem:
         self.engine_params = dict(engine_params or {})
         self.unit_decl = dict(unit or {})
         self.findings = []
+        self.failed = 0
         decls = [_ref(s, data) for s in (sources or [])]
         bad = ob.check_sources(decls)
         if bad:
@@ -1037,6 +1067,7 @@ class EngineProblem:
             return self.eng.run_batch(params, units, pk, self._horizon(), 1)
         except RuntimeError:
             if len(params) == 1:
+                self.failed += 1          # counted; posterior() refuses (Codex r1-2: never a truncated posterior)
                 return [None]
             h = len(params) // 2
             return self._run(params[:h], units[:h], pk[:h]) + self._run(params[h:], units[h:], pk[h:])
@@ -1093,9 +1124,8 @@ class EngineProblem:
         nz = s.noise
         m = nz["model"]
         if m in ("negbin", "poisson"):
-            mu = e
             kw = {"dispersion": float(_ref(nz["dispersion"], self.data))} if m == "negbin" else {}
-            return float(np.sum(ob.loglik(m, y, mu=np.maximum(mu, 1e-300), **kw)))
+            return float(np.sum(ob.loglik(m, y, mu=np.maximum(e, 0.0), **kw)))   # no floor (Codex r1-1)
         if m == "lognormal":
             return float(np.sum(ob.loglik(m, y, mu=e, sd=float(_ref(nz["sd"], self.data)))))
         n = np.asarray(_ref(t["n"], self.data), float) * np.ones_like(y)
@@ -1212,9 +1242,15 @@ def posterior(make_engine, data, config, level=0.95, seed=0, **decl) -> dict:
     iv = {}
     for q, d in E.quantities.items():
         v = E.scenario(q, d, s) if isinstance(d, dict) else s["aux_rows"][q]
+        if E.failed:
+            break
         if not np.all(np.isfinite(v)):
             raise CalibrationRefused("posterior_quantity", f"{q}: non-finite in {int(np.sum(~np.isfinite(v)))} draws")
         iv[q] = interval(v, level)
+    if E.failed:
+        raise CalibrationRefused("posterior_engine_failure", f"the engine failed closed on {E.failed} parameter sets "
+                                 "inside the prior's support (for example at its step cap); the posterior would be "
+                                 "conditioned on convergence")
     lab = label_parts(c, P)
     return {"intervals": iv, "classes": c["classes"], "likelihood_classes": c["likelihood_classes"],
             "contraction": c["contraction"], "ridges": c["ridges"], "sample_id": s["sample_id"], "method": s["method"],

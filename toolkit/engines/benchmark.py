@@ -718,6 +718,8 @@ class Runner:
         if ridge_names:
             out["ridge_share"] = sum(int(p["ridge_ok"]) for p in per) / reps
             ok_ridge = out["ridge_share"] >= need
+        out["declaration_sha256"] = declaration_digest(b)
+        out["code_sha256"] = calibrator_code_digest(self.pack, e)
         # a calibration that returns no usable interval is a failure, never "under-coverage detected"
         out["in_band"] = (invalid == 0 and all(lo <= c <= hi for c in cov.values())
                           and all(v >= need for v in share.values()) and ok_ridge)
@@ -1005,6 +1007,28 @@ def verified_benchmarks(engine) -> tuple[list, str | None]:
     return list(doc.get("benchmarks") or []), None
 
 
+def declaration_digest(b: dict) -> str:
+    import hashlib
+    import json
+    return hashlib.sha256(json.dumps(b, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def calibrator_code_digest(pack: dict, e: dict) -> str:
+    """sha256 over the calibrator's module, the observation module and the oracles (generator) module files."""
+    import hashlib
+    h = hashlib.sha256()
+    mods = [e["calibrator"]["fn"].split(":")[0], "toolkit.analysis.observation", pack["oracles"]]
+    for m in mods:
+        try:
+            f = getattr(importlib.import_module(m), "__file__", None)
+        except ImportError:
+            f = None
+        h.update(m.encode() + b"\0")
+        if f and os.path.exists(f):
+            h.update(open(f, "rb").read())
+    return h.hexdigest()
+
+
 def merge_results(pack: dict, docs: list, engine) -> dict:
     """Combine results files of per-case runs (`run --only`) into the pack's results, in pack order (v2d β: the
     coverage pack runs case by case on a VM). Every file must carry this runner's stamp for the current engine
@@ -1023,6 +1047,13 @@ def merge_results(pack: dict, docs: list, engine) -> dict:
         nsims += int(d.get("n_sims") or 0)
         wall += float(d.get("wall_s") or 0.0)
     ids = [b["id"] for b in pack["benchmarks"]]
+    for b in pack["benchmarks"]:          # Codex r1-11: a coverage row is bound to its declaration and calibrator code
+        r = rows.get(b["id"])
+        if r is not None and b["estimand"]["type"] == "coverage":
+            if r.get("declaration_sha256") != declaration_digest(b):
+                raise ValueError(f"merge: {b['id']} was computed for another declaration")
+            if r.get("code_sha256") != calibrator_code_digest(pack, b["estimand"]):
+                raise ValueError(f"merge: {b['id']} was computed by other calibration, observation or generator code")
     miss = [i for i in ids if i not in rows]
     extra = sorted(set(rows) - set(ids))
     if miss or extra:

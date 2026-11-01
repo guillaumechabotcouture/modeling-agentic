@@ -247,6 +247,10 @@ def check_sources(sources) -> list:
                     out.append(("frame_gap_unmodelled", f"{sid}: excluded population {key} declared differently by "
                                                         "two sources"))
                 gaps[key] = sig
+        noise = s.get("noise") or {}
+        if noise.get("model") not in NOISE.get(s.get("measures"), ()):
+            out.append(("observation_source_undeclared", f"{sid}: noise model {noise.get('model')!r} not in "
+                                                         f"{NOISE.get(s.get('measures'), ())}"))
         if "bias" not in s:
             out.append(("observation_source_undeclared", f"{sid}: no bias entry (declare mechanisms, or none with a "
                                                          "reason)"))
@@ -270,19 +274,16 @@ def check_sources(sources) -> list:
                                                       "would be a fit to the residual)"))
                 continue
             if m == "maternal_antibody":
-                if b.get("handling") != "exclude_below_age" or not isinstance(b.get("bound_months"), (int, float)):
-                    out.append(("bias_without_mechanism", f"{sid}: maternal_antibody needs handling "
-                                                          "exclude_below_age and bound_months"))
+                # Codex r1-9: the declared age exclusion is not yet applied to observations, denominators and latent
+                # predictions, so accepting it would leave infant positives in the likelihood
+                out.append(("bias_without_mechanism", f"{sid}: maternal_antibody (exclude_below_age) is not supported "
+                                                      "yet: exclude those ages from the target data instead"))
                 continue
             if not b.get("param") or not _prior_ok(b.get("prior")) or not str(b.get("source") or "").strip():
                 out.append(("bias_without_mechanism", f"{sid}: bias {m} needs a param, a prior (one of {PRIOR_DISTS}) "
                                                       "and a source"))
             if m == "recall_bias" and not isinstance(b.get("card_share"), (int, float)):
                 out.append(("bias_without_mechanism", f"{sid}: recall_bias needs the declared card_share"))
-        noise = s.get("noise") or {}
-        if noise.get("model") not in NOISE.get(s.get("measures"), ()):
-            out.append(("observation_source_undeclared", f"{sid}: noise model {noise.get('model')!r} not in "
-                                                         f"{NOISE.get(s.get('measures'), ())}"))
     return out
 
 

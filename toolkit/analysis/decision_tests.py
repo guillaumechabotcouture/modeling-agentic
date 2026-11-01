@@ -115,7 +115,7 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
         varied, cases, lowers, extra, rejected = r["varied"], r["cases"], r["lowers"], r["extra"], r["rejected"]
     elif t in ("parameter_value", "prior_range"):
         p = dt["parameter"]
-        if A.model.kind == "emulator" and p not in A.dr:
+        if A.model.kind == "emulator" and p not in A.dr and not p.startswith("z:"):
             return _not_run(A, dt, f"{p} is not an emulator input; it needs engine runs (direct evaluation), or a "
                                    "published prior so it enters the emulator design")
         varied = (f"engine parameter {p} set to each end of its declared prior range ({dt.get('source')})"
@@ -127,11 +127,15 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
                 cz = A.calibrate(theta)
                 zs = {i: x[0] for i, x in cz.items()}
                 extra[v] = {"calibration_clamped_units": sum(bool(x[1]) for x in cz.values())}   # Codex r1 P1-3
-            elif A.method == "posterior" and p in (A.lik or {}).get("params", []):
+            elif A.method == "posterior" and (p in (A.lik or {}).get("params", []) or p.startswith("z:")):
                 from toolkit.analysis import calibration as C
-                fit = C.fit_posterior_panel(A.spec, A.model, fixed_params={p: float(v)}, sample_it=False)
+                if p.startswith("z:"):     # a unit attribute at each end of its range, the calibration redone
+                    fit = C.fit_posterior_panel(A.spec, A.model, fixed_z={p[2:]: float(v)}, sample_it=False)
+                    zs = dict(fit["z"], **{p[2:]: float(v)})
+                else:
+                    fit = C.fit_posterior_panel(A.spec, A.model, fixed_params={p: float(v)}, sample_it=False)
+                    zs = dict(fit["z"])
                 theta = dict(A.theta0, **fit["theta"])
-                zs = dict(fit["z"])
             else:
                 zs = z0
             _, ben, cost = A.evaluate(theta, zs)
