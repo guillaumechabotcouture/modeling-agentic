@@ -1,13 +1,13 @@
 producer: toolkit/engines/benchmark.py
 engine_identity:
   name: malaria-starsim
-  version: '0.3'
-  code_sha256: 705431b5bc0430d6923b976f357ff9597cb1b7add3977b4b5539a42d038a468d
+  version: '0.4'
+  code_sha256: a7a80b3c3a70bc3b908ad1f766951308153b07fb902ed7663dcadc2739dd9c18
   params_sha256: c9f0a188be9664576e2aca05e3c9d0d15a161cfb6f32e2b7318b0517a786294b
-  config_sha256: b6875832be6959469820153cac1a6ba037e9facbdd9a9a53474f7bba4cbd0fbd
+  config_sha256: eb9d39627ddda563f781e8a6f7a32f71f13e454576e7e2de0f77b946ad4c7489
 engine: toolkit.engines.malaria.engine:MalariaEngine
-engine_version: '0.3'
-fitted_at: '2026-10-31 22:16:06'
+engine_version: '0.4'
+fitted_at: '2026-11-01 16:49:36'
 seeds:
 - 11
 - 12
@@ -17,8 +17,8 @@ seeds:
 - 16
 - 17
 - 18
-n_sims: 1744
-wall_s: 2044.0
+n_sims: 1748
+wall_s: 3958.0
 parameters:
   cfp_kill:
     value: 0.425

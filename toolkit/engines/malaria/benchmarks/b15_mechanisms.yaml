@@ -17,9 +17,9 @@ field_configs:
     use_rate: 1.0
     net_holes: 0.0
   B7:
-    computed: 0.4654
-    seed_min: 0.4308
-    seed_max: 0.4815
+    computed: 0.4624
+    seed_min: 0.4193
+    seed_max: 0.4781
     in_band: false
   B8:
     computed: 0.2736
@@ -46,9 +46,9 @@ field_configs:
     use_rate: 1.0
     net_holes: 0.0
   B7:
-    computed: 0.6049
-    seed_min: 0.5843
-    seed_max: 0.637
+    computed: 0.6034
+    seed_min: 0.5867
+    seed_max: 0.6296
     in_band: false
   B8:
     computed: 0.4871
@@ -75,9 +75,9 @@ field_configs:
     use_rate: 0.871
     net_holes: 0.0
   B7:
-    computed: 0.4431
-    seed_min: 0.4292
-    seed_max: 0.4697
+    computed: 0.4391
+    seed_min: 0.4235
+    seed_max: 0.4664
     in_band: false
   B8:
     computed: 0.2524
@@ -104,9 +104,9 @@ field_configs:
     use_rate: 1.0
     net_holes: 1.0
   B7:
-    computed: 0.4564
-    seed_min: 0.3908
-    seed_max: 0.4963
+    computed: 0.456
+    seed_min: 0.4073
+    seed_max: 0.4779
     in_band: false
   B8:
     computed: 0.264
@@ -130,9 +130,9 @@ field_configs:
 - config: all field mechanisms (engine defaults)
   overrides: {}
   B7:
-    computed: 0.5953
-    seed_min: 0.5799
-    seed_max: 0.6248
+    computed: 0.5888
+    seed_min: 0.5701
+    seed_max: 0.6088
     in_band: false
   B8:
     computed: 0.4623

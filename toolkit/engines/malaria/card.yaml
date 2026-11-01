@@ -1,5 +1,5 @@
 name: malaria-starsim
-version: '0.3'
+version: '0.4'
 mechanisms:
 - 'Griffin-lite human natural history and immunity (fixed: Griffin et al. 2010 PLoS Med 10.1371/journal.pmed.1000324;
   2014 Nat Commun; 2015 Lancet Infect Dis)'
@@ -16,6 +16,8 @@ mechanisms:
 - ITN x IRS redundancy from shared indoor target, diversion and correlated coverage (no interaction factor)
 - SMC (28-day protection, clearance); case management (effective treatment)
 - expected severe episodes and deaths; DALYs from GBD 2019 weights and reference life table
+- microscopy prevalence by age band, including the ITN trials' own bands (under 5 from birth, under 10, 15 and under,
+  all ages; Pryce 2018 characteristics of included studies)
 components:
   net:
   - none
@@ -57,6 +59,10 @@ outputs:
   - pfpr_u5
   - pfpr_6m14y
   - pfpr_2_10
+  - pfpr_lt5
+  - pfpr_lt10
+  - pfpr_le15
+  - pfpr_all
   - inc_u5
   - inc_all
   - inc_u5_smc
@@ -114,26 +120,34 @@ fitted:
     - B12m
 benchmarks:
 - id: B7
-  metric: ITN (pyrethroid) vs none, prevalence RR at 12 m
+  metric: ITN (pyrethroid) vs none, prevalence RR at 12 m (trials' own age bands)
   role: held_out
   target: 0.83
   band:
   - 0.68
   - 0.98
   source: C21 Pryce 2018 Cochrane CD000363.pub3
-  computed: 0.5953
-  se_log: 0.0079
+  components:
+    Halbluetzel 1996 (0-59 months): 0.5585
+    Moyou-Somo 1995 (15 and under): 0.5979
+    Rowland 1996 (all ages): 0.6025
+    Smithuis 2013 (under 10): 0.5836
+    Sochantha 2006 (all ages): 0.6025
+  diagnostics:
+    windows.m12.pfpr_6m14y: 0.5953
+  computed: 0.5888
+  se_log: 0.0067
   per_seed:
-  - 0.5895
-  - 0.5984
-  - 0.6248
-  - 0.5851
-  - 0.5947
-  - 0.5799
-  - 0.597
-  - 0.5941
-  seed_min: 0.5799
-  seed_max: 0.6248
+  - 0.5869
+  - 0.5969
+  - 0.6088
+  - 0.5834
+  - 0.5865
+  - 0.5701
+  - 0.5934
+  - 0.5849
+  seed_min: 0.5701
+  seed_max: 0.6088
   in_band: false
   status: out_of_band
 - id: B8
