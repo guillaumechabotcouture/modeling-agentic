@@ -367,6 +367,22 @@ def _fragments_at(root: str, ref: str) -> tuple[dict[str, dict], list[str]]:
     return out, errors
 
 
+def _merge_regions(ours: list[str], base: list[str], theirs: list[str]) -> list[str] | None:
+    """`theirs`' change from `base` applied to `ours` (git merge-file); None on a conflict."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        paths = []
+        for name, lines in (("ours", ours), ("base", base), ("theirs", theirs)):
+            p = os.path.join(td, name)
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write("".join(ln + "\n" for ln in lines))
+            paths.append(p)
+        r = subprocess.run(["git", "merge-file", "-p", *paths], capture_output=True)
+    if r.returncode != 0:
+        return None
+    return r.stdout.decode("utf-8", "surrogateescape").splitlines()
+
+
 def _upstream_span(root: str, upstream: str | None, mb: str):
     """(old, new) commits of `upstream` this PR merged in: new = merge-base(upstream, HEAD),
     old = merge-base(new, mb). None when the PR merged nothing new from it (a PR into
@@ -448,10 +464,10 @@ def check_pr(root: str, base: str, upstream: str | None = None) -> list[str]:
             continue
         if span is not None:
             up_old, up_new = (region(_show(root, ref, path) or "") for ref in span)
-            added = [ln for ln in got if ln not in expect]
-            removed = [ln for ln in expect if ln not in got]
-            if (all(ln in up_new and ln not in up_old for ln in added)
-                    and all(ln in up_old and ln not in up_new for ln in removed)):
+            # Ordered and count-preserving (Codex round 1 on #98): the region must be exactly
+            # upstream's change applied to this branch's region by a clean three-way merge.
+            merged = _merge_regions(expect, up_old, up_new)
+            if merged is not None and merged == got:
                 continue
         what = "ledger table" if path == CHANGELOG else "Status section"
         if got == region(old):
@@ -765,6 +781,22 @@ def _self_test() -> int:
         pr = check_pr(td, "main", upstream="main")
         ok(len(pr) == 1 and "edited directly" in pr[0], f"CF29b --upstream changes nothing for a PR into main ({pr})")
         git("checkout", "-q", "main")
+        # CF29c/d (Codex round 1 on #98): moving or duplicating an existing line next to the merge
+        # is a direct edit, although every line it leaves is one upstream or the base already had.
+        for name, edit in (("move", lambda t: t.replace("- **A:** things.\n", "").replace(
+                                "- a smoke.\n", "- a smoke.\n- **A:** things.\n")),
+                           ("dup", lambda t: t.replace("- a smoke.\n", "- a smoke.\n- a smoke.\n"))):
+            git("checkout", "-q", "longlived")
+            git("checkout", "-q", "-b", f"port-{name}")
+            git("merge", "-q", "--no-ff", "-m", "merge main", "main")
+            before = _read(os.path.join(td, PLAN))
+            put(PLAN, edit(before))
+            ok(_read(os.path.join(td, PLAN)) != before, f"CF29{name} setup changed the Status section")
+            git("commit", "-qam", f"{name} a Status line")
+            pr = check_pr(td, "longlived", upstream="main")
+            ok(len(pr) == 1 and "Status section was edited directly" in pr[0],
+               f"CF29{name} a {name} of an existing Status line next to the merge still fails ({pr})")
+            git("checkout", "-q", "main")
 
     for sep, label in (("\\n", "newline"), ("\\u2028", "line separator"), ("\\r", "carriage return")):
         try:
