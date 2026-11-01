@@ -990,6 +990,17 @@ def _self_test_42b(ok, RunConfig) -> None:
             ok(False, f"RC25 rejects {why}")
         except ValueError:
             ok(True, f"RC25 rejects {why}")
+    # 2026-11-01 (local check against distributed 2026.8.0): with no worker carrying the compute resource, compute.py's
+    # queued chunks and demand markers leave adaptive_target at 1 (their duration is unknown until a chunk has run),
+    # so a pool that starts with no compute VM never grows and the batch waits forever.
+    try:
+        RunConfig(name="t", question_file="/dev/null", compute_start=0, compute_env={"MA_COMPUTE_RESOURCE": "compute"})
+        ok(False, "RC25b a resource-tagged pool with no compute VM at start is refused (it cannot scale up)")
+    except ValueError as e:
+        ok("compute_start" in str(e), f"RC25b a resource-tagged pool with no compute VM at start is refused: {e}")
+    ok(RunConfig(name="t", question_file="/dev/null", compute_start=1,
+                 compute_env={"MA_COMPUTE_RESOURCE": "compute"}).compute_start == 1,
+       "RC25c one compute VM at start is accepted")
     q = ws.quota_refusal(E7R7_REFUSAL)
     ok(q == {"family": "standardEv5Family", "limit": 350, "usage": 344, "required": 8},
        f"RC26 the attempt-7 quota refusal parses: {q}")
@@ -1157,6 +1168,25 @@ def _self_test_52(ok) -> None:
         line = confirm_keeper("x-keeper", types.SimpleNamespace(cluster_id=11, get_client=lambda: late),
                               attempts=4, delay_s=0.0, sleep=lambda s: None)
     ok("workers=3" in str(line), f"RC52i a keeper whose first tick comes late is confirmed once it ticks: {line}")
+
+    # v2-nigeria-gf13-full (2026-11-01): the run paused for sign-off and its cluster stopped ~5 min after it was fired,
+    # before the keeper's first tick; the keeper then exited by design ("run cluster stopped") and the launch failed
+    # with "not confirmed holding the pool". A run cluster that has stopped is reported as such, not as a failure.
+    kc4 = types.SimpleNamespace(cluster_id=12, get_client=lambda: FakeClient([{}], status="closed"))
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            line = confirm_keeper("x-keeper", kc4, attempts=2, delay_s=0.0, sleep=lambda s: None,
+                                  run_alive=lambda: False)
+        ok("run cluster" in str(line) and "stopped" in str(line),
+           f"RC52j a run cluster that stopped before the keeper ticked is reported, not a launch failure: {line}")
+    except SystemExit as e:
+        ok(False, f"RC52j a run cluster that stopped before the keeper ticked is reported, not a launch failure: {e}")
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            confirm_keeper("x-keeper", kc4, attempts=2, delay_s=0.0, sleep=lambda s: None, run_alive=lambda: True)
+        ok(False, "RC52k a live run with an unconfirmed keeper still fails the launch")
+    except SystemExit as e:
+        ok("not confirmed" in str(e), f"RC52k a live run with an unconfirmed keeper still fails the launch: {e}")
 
     # Codex round 1: launch keeps the replacement client for the rest of the launch.
     from unittest import mock
