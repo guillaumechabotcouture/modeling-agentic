@@ -51,50 +51,50 @@ configs:
                   generation_interval: [0.5, 0.5], tol: 1.0e-12}
 
 settings:
-  r0_1p5: {config: single_day, unit: {N: [1.0e6], s0: [1.0], seed: 1.0e-9}, params: {r0: 1.5}}
-  r0_2: {config: single_day, unit: {N: [1.0e6], s0: [1.0], seed: 1.0e-9}, params: {r0: 2.0}}
-  r0_4: {config: single_day, unit: {N: [1.0e6], s0: [1.0], seed: 1.0e-9}, params: {r0: 4.0}}
-  r0_12: {config: single_day, unit: {N: [1.0e6], s0: [1.0], seed: 1.0e-9}, params: {r0: 12.0}}
-  r0_18: {config: single_day, unit: {N: [1.0e6], s0: [1.0], seed: 1.0e-9}, params: {r0: 18.0}}
-  r0_2_week: {config: single_week, unit: {N: [1.0e6], s0: [1.0], seed: 1.0e-9}, params: {r0: 2.0}}
-  sub_0p5: {config: single_w1, unit: {N: [1.0e6], s0: [1.0], seed: 1.0e-9}, params: {r0: 0.5}}
-  crit_1p01: {config: single_w1, unit: {N: [1.0e6], s0: [1.0], seed: 1.0e-9}, params: {r0: 1.01}}
-  vax_half: {config: campaign, unit: {N: [1.0e6], s0: [1.0], seed: 1.0e-12}, params: {r0: 3.0, "efficacy:vax": 1.0}}
-  vax_herd: {config: campaign, unit: {N: [1.0e6], s0: [1.0], seed: 1.0e-12, "reach:vax": 0.7},
+  r0_1p5: {config: single_day, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-9}, params: {r0: 1.5}}
+  r0_2: {config: single_day, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-9}, params: {r0: 2.0}}
+  r0_4: {config: single_day, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-9}, params: {r0: 4.0}}
+  r0_12: {config: single_day, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-9}, params: {r0: 12.0}}
+  r0_18: {config: single_day, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-9}, params: {r0: 18.0}}
+  r0_2_week: {config: single_week, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-9}, params: {r0: 2.0}}
+  sub_0p5: {config: single_w1, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-9}, params: {r0: 0.5}}
+  crit_1p01: {config: single_w1, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-9}, params: {r0: 1.01}}
+  vax_half: {config: campaign, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-12}, params: {r0: 3.0, "efficacy:vax": 1.0}}
+  vax_herd: {config: campaign, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-12, "reach:vax": 0.7},
              params: {r0: 3.0, "efficacy:vax": 1.0}}
   rank_one: {config: multi3, params: {q: 1.5},
-             unit: {N: [3.0e5, 2.0e5, 1.0e5], s0: [1.0, 1.0, 1.0], seed: 1.0e-9, intro: a,
+             unit: {N: [3.0e+5, 2.0e+5, 1.0e+5], s0: [1.0, 1.0, 1.0], seed: 1.0e-9, intro: a,
                     contact: [[0.3, 0.2, 0.5], [0.6, 0.4, 1.0], [0.15, 0.1, 0.25]]}}
   identity3: {config: multi3, params: {q: 1.0},
-              unit: {N: [3.0e5, 2.0e5, 1.0e5], s0: [1.0, 1.0, 1.0], seed: 1.0e-6, intro: a,
+              unit: {N: [3.0e+5, 2.0e+5, 1.0e+5], s0: [1.0, 1.0, 1.0], seed: 1.0e-6, intro: a,
                      contact: [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 2.0]]}}
   rank_one_ode: {config: multi3, params: {q: 1.5},
-                 unit: {N: [3.0e5, 2.0e5, 1.0e5], s0: [1.0, 0.8, 0.9], seed: 1.0e-6, intro: a,
+                 unit: {N: [3.0e+5, 2.0e+5, 1.0e+5], s0: [1.0, 0.8, 0.9], seed: 1.0e-6, intro: a,
                         contact: [[0.3, 0.2, 0.5], [0.6, 0.4, 1.0], [0.15, 0.1, 0.25]]}}
   asym5: {config: multi5, params: {q: 0.6},
-          unit: {N: [2.0e5, 3.0e5, 2.5e5, 1.5e5, 1.0e5], s0: [1.0, 0.9, 0.7, 0.8, 1.0], seed: 1.0e-6, intro: g2,
+          unit: {N: [2.0e+5, 3.0e+5, 2.5e+5, 1.5e+5, 1.0e+5], s0: [1.0, 0.9, 0.7, 0.8, 1.0], seed: 1.0e-6, intro: g2,
                  contact: [[3.0, 1.0, 0.5, 0.3, 0.1], [0.8, 4.0, 1.2, 0.4, 0.2], [0.4, 1.0, 2.5, 0.9, 0.3],
                            [0.2, 0.5, 1.1, 1.8, 0.6], [0.1, 0.3, 0.4, 0.7, 1.2]]}}
-  bp_2: {config: branch_poisson, unit: {N: [1.0e6], s0: [1.0], seed: 1.0e-9}, params: {r0: 2.0}}
-  bg_2: {config: branch_geometric, unit: {N: [1.0e6], s0: [1.0], seed: 1.0e-9}, params: {r0: 2.0}}
+  bp_2: {config: branch_poisson, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-9}, params: {r0: 2.0}}
+  bg_2: {config: branch_geometric, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-9}, params: {r0: 2.0}}
   blocks_sub: {config: branch_blocks, params: {q: 1.0},
-               unit: {N: [5.0e5, 5.0e5], s0: [1.0, 1.0], seed: 1.0e-9, intro: b,
+               unit: {N: [5.0e+5, 5.0e+5], s0: [1.0, 1.0], seed: 1.0e-9, intro: b,
                       contact: [[2.5, 0.0], [0.0, 0.6]]}}
   blocks_super: {config: branch_blocks, params: {q: 1.0},
-                 unit: {N: [5.0e5, 5.0e5], s0: [1.0, 1.0], seed: 1.0e-9, intro: a,
+                 unit: {N: [5.0e+5, 5.0e+5], s0: [1.0, 1.0], seed: 1.0e-9, intro: a,
                         contact: [[2.5, 0.0], [0.0, 0.6]]}}
-  rn_growth: {config: win_growth, unit: {N: [1.0e6], s0: [1.0], seed: 1.0e-14}, params: {r0: 2.0},
+  rn_growth: {config: win_growth, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-14}, params: {r0: 2.0},
               horizon: {start: 0, stop: 200, window: [0, 200], windows: {growth: [40, 80], all: [0, 200]}}}
-  rn_day: {config: win_day, unit: {N: [1.0e6], s0: [1.0], seed: 1.0e-9}, params: {r0: 2.0},
+  rn_day: {config: win_day, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-9}, params: {r0: 2.0},
            horizon: {start: 0, stop: 400, window: [0, 400],
                      windows: {all: [0, 400], early: [0, 20], late: [20, 400]}}}
-  rn_week: {config: win_week, unit: {N: [1.0e6], s0: [1.0], seed: 1.0e-9}, params: {r0: 2.0},
+  rn_week: {config: win_week, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-9}, params: {r0: 2.0},
             horizon: {start: 0, stop: 2800, window: [0, 2800], windows: {all: [0, 2800]}}}
-  rn_forced: {config: win_forced, unit: {N: [1.0e6], s0: [1.0], seed: 1.0e-6},
+  rn_forced: {config: win_forced, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-6},
               params: {r0: 1.8, forcing_amplitude: 0.3, forcing_phase: 30.0},
               horizon: {start: 0, stop: 250, window: [0, 250], windows: {all: [0, 250]}}}
   ci_cohort: {config: cohort, params: {"seroconversion:d1": 0.85, "seroconversion:d2": 0.95, r0: 4.0},
-              unit: {N: [4.0e5, 1.0e5, 1.0e5, 1.0e5], birth_year: [2000, 2010, 2011, 2012], decision_year: 2025,
+              unit: {N: [4.0e+5, 1.0e+5, 1.0e+5, 1.0e+5], birth_year: [2000, 2010, 2011, 2012], decision_year: 2025,
                      always_immune: [b2000], contact_rate: 10.0, seed: 1.0e-9, intro: b2012,
                      "coverage:d1": [0.0, 0.9, 0.8, 0.7], "coverage:d2": [0.0, 0.6, 0.0, 0.5]}}
 
@@ -152,7 +152,7 @@ benchmarks:
      source: "Ma & Earn (2006) Bull Math Biol; Andreasen (2011)",
      estimand: {type: value, a: {arm: fs3_rank1, value: per_capita_vec.infections},
                 b: {oracle: final_size_rank_one, args: {q: 1.5, a: [1.0, 2.0, 0.5], b: [0.3, 0.2, 0.5],
-                    N: [3.0e5, 2.0e5, 1.0e5], s: [1.0, 1.0, 1.0], seed: [2.0e-9, 0.0, 0.0]}}, tol: {rel: 1.0e-6}}}
+                    N: [3.0e+5, 2.0e+5, 1.0e+5], s: [1.0, 1.0, 1.0], seed: [2.0e-9, 0.0, 0.0]}}, tol: {rel: 1.0e-6}}}
   - {id: FS4a, metric: "all-or-nothing vaccination, v e = 0.5, R0 = 3: whole-population attack rate z = s x (0.2914)",
      source: "herd-immunity identity",
      estimand: {type: value, a: {arm: fs4_half, value: windows.all.attack_rate},
@@ -171,21 +171,21 @@ benchmarks:
      source: "Diekmann, Heesterbeek & Metz (1990)",
      estimand: {type: value, a: {arm: fs6_asym, value: windows.all.r0},
                 b: {oracle: ode_growth_r0, args: {q: 0.6, gamma: 0.25, s: [1.0, 1.0, 1.0, 1.0, 1.0],
-                    N: [2.0e5, 3.0e5, 2.5e5, 1.5e5, 1.0e5],
+                    N: [2.0e+5, 3.0e+5, 2.5e+5, 1.5e+5, 1.0e+5],
                     C: [[3.0, 1.0, 0.5, 0.3, 0.1], [0.8, 4.0, 1.2, 0.4, 0.2], [0.4, 1.0, 2.5, 0.9, 0.3],
                         [0.2, 0.5, 1.1, 1.8, 0.6], [0.1, 0.3, 0.4, 0.7, 1.2]]}}, tol: {rel: 1.0e-6}}}
   - {id: FS6a, metric: "multigroup final size equals the reference ODE run to extinction: identity matrix (seeded group only)",
      source: "the pack's ODE (solve_ivp DOP853, rtol 1e-10)",
      estimand: {type: value, a: {arm: fs6_id, value: per_capita_vec.infections},
-                b: {oracle: ode_final_size, args: {q: 1.0, gamma: 0.25, N: [3.0e5, 2.0e5, 1.0e5], s: [1.0, 1.0, 1.0],
+                b: {oracle: ode_final_size, args: {q: 1.0, gamma: 0.25, N: [3.0e+5, 2.0e+5, 1.0e+5], s: [1.0, 1.0, 1.0],
                     seed: [2.0e-6, 0.0, 0.0], C: [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 2.0]]}}, tol: {abs: 1.0e-5}}}
   - {id: FS6b, metric: "same: rank-one matrix, partial susceptibility", source: "the pack's ODE",
      estimand: {type: value, a: {arm: fs6_r1, value: per_capita_vec.infections},
-                b: {oracle: ode_final_size, args: {q: 1.5, gamma: 0.25, N: [3.0e5, 2.0e5, 1.0e5], s: [1.0, 0.8, 0.9],
+                b: {oracle: ode_final_size, args: {q: 1.5, gamma: 0.25, N: [3.0e+5, 2.0e+5, 1.0e+5], s: [1.0, 0.8, 0.9],
                     seed: [2.0e-6, 0.0, 0.0], C: [[0.3, 0.2, 0.5], [0.6, 0.4, 1.0], [0.15, 0.1, 0.25]]}}, tol: {abs: 1.0e-5}}}
   - {id: FS6c, metric: "same: asymmetric 5x5 matrix", source: "the pack's ODE",
      estimand: {type: value, a: {arm: fs6_asym, value: per_capita_vec.infections},
-                b: {oracle: ode_final_size, args: {q: 0.6, gamma: 0.25, N: [2.0e5, 3.0e5, 2.5e5, 1.5e5, 1.0e5],
+                b: {oracle: ode_final_size, args: {q: 0.6, gamma: 0.25, N: [2.0e+5, 3.0e+5, 2.5e+5, 1.5e+5, 1.0e+5],
                     s: [1.0, 0.9, 0.7, 0.8, 1.0], seed: [0.0, 3.3333333333333335e-6, 0.0, 0.0, 0.0],
                     C: [[3.0, 1.0, 0.5, 0.3, 0.1], [0.8, 4.0, 1.2, 0.4, 0.2], [0.4, 1.0, 2.5, 0.9, 0.3],
                         [0.2, 0.5, 1.1, 1.8, 0.6], [0.1, 0.3, 0.4, 0.7, 1.2]]}}, tol: {abs: 1.0e-5}}}
@@ -270,7 +270,7 @@ benchmarks:
   # ---------------------------------------------------------------- cohort initialiser
   - {id: CI1a, metric: "independent doses: cohort b2010 (c = 0.9, 0.6; e = 0.85, 0.95), by hand 0.10105", source: "hand-computed",
      estimand: {type: value, a: {probe: initial_state, args: {config: cohort, group: b2010, unit: &ciunit
-                {N: [4.0e5, 1.0e5, 1.0e5, 1.0e5], birth_year: [2000, 2010, 2011, 2012], decision_year: 2025,
+                {N: [4.0e+5, 1.0e+5, 1.0e+5, 1.0e+5], birth_year: [2000, 2010, 2011, 2012], decision_year: 2025,
                  always_immune: [b2000], contact_rate: 10.0, seed: 1.0e-9, intro: b2012,
                  "coverage:d1": [0.0, 0.9, 0.8, 0.7], "coverage:d2": [0.0, 0.6, 0.0, 0.5]},
                 params: &ciparams {"seroconversion:d1": 0.85, "seroconversion:d2": 0.95, r0: 4.0}}},
@@ -298,7 +298,7 @@ benchmarks:
      estimand: {type: value, a: {probe: initial_state_vs_sim, args: {config: cohort, unit: *ciunit, params: *ciparams,
                                                                     package: {catchup: 1}}}, b: 0.0, tol: {abs: 1.0e-12}}}
   - {id: CI4b, metric: "same: given initialiser with an all-or-nothing campaign", source: "identity",
-     estimand: {type: value, a: {probe: initial_state_vs_sim, args: {config: campaign, unit: {N: [1.0e6], s0: [0.9], seed: 1.0e-9},
+     estimand: {type: value, a: {probe: initial_state_vs_sim, args: {config: campaign, unit: {N: [1.0e+6], s0: [0.9], seed: 1.0e-9},
                                                                     params: {r0: 3.0, "efficacy:vax": 0.9}, package: {vax: 1}}},
                 b: 0.0, tol: {abs: 1.0e-12}}}
   # ---------------------------------------------------------------- observation forward maps (harness, §3.4)

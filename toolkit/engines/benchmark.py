@@ -44,8 +44,24 @@ Pack schema:
           {type: interaction_or, a11, a10, a01, a00, value: <path>}
           {type: cost_per_outcome, num, den, value: <path>, costs: {<driver>: <unit cost>}, costs_num: {<driver>: <incremental price>}}
           {type: curve_rules, arms: [...], x: <path>, y: <path>, rules: [{x_min, y_min} | {x_max, y_max}]}
+          {type: value | identity, a: <side>, b: <side>, tol: {abs: x} | {rel: x}, compare: eq | le | differ}
+          {type: value, not_transcribed: <why>}          # held out, values not yet transcribed: not_assessable
+          {type: coverage, generator: {fn, args}, calibrator: {fn: <module>:<fn>, args}, replicates, seed,
+           quantities: [...], band: [lo, hi], classes: {<param>: [allowed class, ...]}, class_share_min}
     fit_joint: {rule: <version>, params: {<name>: [lo, hi]}, targets: [ids], design: {n, seed}}
     fit: [{param, grid: [...], targets: [ids]}]          # legacy sequential fit
+    configs: {<name>: {<constructor keywords>}}          # configured engines (v2d §5); a setting names its
+    default_config: <name>                               # `config`; results are stamped with default_config's engine
+    oracles: <module>                                    # oracle_<name> / probe_<name> / generate_<name> functions
+
+Sides (v2d δ): a number; {arm, value: <path>}; {oracle: <name>, args}; {probe: <name>, args}. Oracle and
+probe args may themselves be sides (resolved first). A probe gets the pack's engine factory first
+(make_engine(config_name)). `value` compares an engine computation with a reference (a number or an
+oracle); `identity` compares two computations of one quantity. Vector values compare element-wise (the
+worst element decides). `le`: a <= b + tol; `differ`: |a - b| > tol (a negative control). A coverage
+benchmark runs simulation-based calibration: `replicates` synthetic data sets from the generator (seeded
+per replicate), each calibrated by the calibrator, which returns {intervals: {q: [lo, hi]}, classes};
+a calibrator that cannot be imported makes the benchmark not_assessable, never a pass.
 
 Value paths: windows.<window>.<metric>, per_capita.<outcome>.<age group>,
 per_capita_all.<outcome> (age groups weighted by the model population), cost.<driver>.
@@ -83,7 +99,9 @@ else:  # pragma: no cover
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
     from toolkit.engines.contract import UnitSpec, Package, Horizon  # noqa: E402
 
-TYPES = ("ratio", "odds_ratio", "interaction_or", "cost_per_outcome", "curve_rules")
+TYPES = ("ratio", "odds_ratio", "interaction_or", "cost_per_outcome", "curve_rules", "value", "identity", "coverage")
+COMPARE_TYPES = ("value", "identity")
+COMPARES = ("eq", "le", "differ")
 STATUSES = ("in_band", "out_of_band", "not_assessable", "band_mis_based")
 JOINT_RULES = {
     "joint-v1": "LHS(n)+centre on the pack seeds; calibration at the box centre; quadratic surrogate of each "
@@ -93,9 +111,39 @@ JOINT_RULES = {
 }
 
 
-def load_engine(ref: str):
+def load_engine(ref: str, config: dict | None = None):
+    """The engine class `module:Class`, built with the pack configuration's keywords (none: no arguments)."""
     mod, cls = ref.split(":")
-    return getattr(importlib.import_module(mod), cls)()
+    return getattr(importlib.import_module(mod), cls)(**(config or {}))
+
+
+def _engine_key(ref: str, config: dict | None) -> tuple:
+    """Worker cache key: the engine reference and its canonical configuration."""
+    import json
+    return (ref, None if config is None else json.dumps(config, sort_keys=True, default=str))
+
+
+def _side_refs(x, kind: str) -> list:
+    """Every `kind` (arm | oracle | probe) named in a side, recursively through oracle/probe args."""
+    out = []
+    if isinstance(x, dict):
+        if kind in x:
+            out.append(x[kind])
+        for v in (x.get("args") or {}).values() if ("oracle" in x or "probe" in x) else []:
+            out += _side_refs(v, kind)
+    elif isinstance(x, list):
+        for v in x:
+            out += _side_refs(v, kind)
+    return out
+
+
+def _oracles(pack: dict):
+    return importlib.import_module(pack["oracles"]) if pack.get("oracles") else None
+
+
+def _config_of(pack: dict, setting: dict):
+    name = setting.get("config")
+    return None if name is None else (pack.get("configs") or {}).get(name)
 
 
 def _h(d: dict) -> Horizon:
@@ -111,17 +159,40 @@ def validate(pack: dict, engine) -> list[str]:
     bad = []
     specs = {p.name: p for p in engine.parameters()}
     fitted = {k for k, p in specs.items() if p.kind == "fitted"}
+    configs = pack.get("configs") or {}
+    if not isinstance(configs, dict):
+        return ["configs must be a mapping {name: {constructor keywords}}"]
+    if pack.get("default_config") is not None and pack["default_config"] not in configs:
+        bad.append(f"default_config {pack['default_config']!r} is not a declared config")
+    cfg_specs = {}
+    for name, cfg in configs.items():
+        try:
+            e = load_engine(pack["engine"], cfg)
+            cfg_specs[name] = {p.name: p for p in e.parameters()}
+        except Exception as ex:  # noqa: BLE001 -- recorded: a config the engine refuses is a pack error
+            bad.append(f"config {name}: the engine refuses it ({type(ex).__name__}: {ex})")
     for s, cfg in (pack.get("settings") or {}).items():
+        sp = specs
+        if cfg.get("config") is not None:
+            if cfg["config"] not in configs:
+                bad.append(f"setting {s}: unknown config {cfg['config']!r}")
+                continue
+            sp = cfg_specs.get(cfg["config"], {})
+        fit_s = {k for k, p in sp.items() if p.kind == "fitted"}
         for k in (cfg.get("params") or {}):
-            if k not in specs:
+            if k not in sp:
                 bad.append(f"setting {s}: unknown parameter {k}")
-            elif k in fitted:
+            elif k in fit_s:
                 bad.append(f"setting {s}: overrides fitted parameter {k} (no per-setting tuning)")
     arms = pack.get("arms") or {}
     for a, cfg in arms.items():
         if cfg.get("setting") not in (pack.get("settings") or {}):
             bad.append(f"arm {a}: unknown setting {cfg.get('setting')}")
     ids = {b.get("id") for b in pack.get("benchmarks") or []}
+    try:
+        om = _oracles(pack)
+    except ImportError as ex:
+        return bad + [f"oracles module {pack.get('oracles')!r} cannot be imported: {ex}"]
     for b in pack.get("benchmarks") or []:
         e = b.get("estimand") or {}
         if e.get("type") not in TYPES:
@@ -130,6 +201,9 @@ def validate(pack: dict, engine) -> list[str]:
         for a in _arms_of(e):
             if a not in arms:
                 bad.append(f"{b.get('id')}: unknown arm {a}")
+        if e["type"] in COMPARE_TYPES or e["type"] == "coverage":
+            bad += _validate_new(b, e, om)
+            continue
         if e["type"] != "curve_rules":
             band = b.get("band")
             if not (isinstance(band, list) and len(band) == 2 and band[0] <= b.get("target", float("nan")) <= band[1]):
@@ -167,7 +241,48 @@ def validate(pack: dict, engine) -> list[str]:
     return bad
 
 
+def _validate_new(b: dict, e: dict, om) -> list:
+    bid = b.get("id")
+    bad = []
+    if e["type"] == "coverage":
+        g = (e.get("generator") or {}).get("fn")
+        if om is None or not callable(getattr(om, f"generate_{g}", None)):
+            bad.append(f"{bid}: generator {g!r} not found (generate_{g} in the oracles module)")
+        c = (e.get("calibrator") or {}).get("fn")
+        if not isinstance(c, str) or ":" not in c:
+            bad.append(f"{bid}: calibrator must be '<module>:<function>'")
+        r = e.get("replicates")
+        if isinstance(r, bool) or not isinstance(r, int) or r < 1:
+            bad.append(f"{bid}: replicates must be a positive integer")
+        if not e.get("quantities"):
+            bad.append(f"{bid}: no quantities to cover")
+        band = e.get("band")
+        if not (isinstance(band, list) and len(band) == 2 and 0 <= band[0] <= band[1] <= 1):
+            bad.append(f"{bid}: coverage band must be [lo, hi] within [0, 1]")
+        return bad
+    if e.get("not_transcribed"):
+        return bad
+    for side in ("a", "b"):
+        if side not in e:
+            bad.append(f"{bid}: {e['type']} needs sides a and b")
+    for kind in ("oracle", "probe"):
+        for name in _side_refs([e.get("a"), e.get("b")], kind):
+            if om is None or not callable(getattr(om, f"{kind}_{name}", None)):
+                bad.append(f"{bid}: {kind} {name!r} not found ({kind}_{name} in the oracles module)")
+    tol = e.get("tol")
+    if not (isinstance(tol, dict) and len(tol) == 1 and next(iter(tol)) in ("abs", "rel")
+            and isinstance(next(iter(tol.values())), (int, float)) and next(iter(tol.values())) >= 0):
+        bad.append(f"{bid}: tol must be {{abs: x}} or {{rel: x}} with x >= 0")
+    if e.get("compare", "eq") not in COMPARES:
+        bad.append(f"{bid}: compare {e.get('compare')!r} not in {COMPARES}")
+    if e["type"] == "identity" and not (_side_refs(e.get("a"), "arm") or _side_refs(e.get("a"), "probe")):
+        bad.append(f"{bid}: an identity compares two engine computations (side a names no arm or probe)")
+    return bad
+
+
 def _arms_of(e: dict) -> list:
+    if e.get("type") in COMPARE_TYPES:
+        return list(dict.fromkeys(_side_refs([e.get("a"), e.get("b")], "arm")))
     out = []
     for k in ("num", "den", "a11", "a10", "a01", "a00"):
         v = e.get(k)
@@ -175,8 +290,10 @@ def _arms_of(e: dict) -> list:
     return out + list(e.get("arms") or [])
 
 
-def get(res: dict, path: str) -> float:
+def get(res: dict, path: str):
     kind, *rest = path.split(".")
+    if kind == "per_capita_vec":            # one outcome per age group, in the engine's order
+        return [float(v) for v in res["per_capita"][rest[0]].values()]
     if kind == "windows":
         return float(res["windows"][rest[0]][rest[1]])
     if kind == "per_capita":
@@ -194,10 +311,11 @@ _ENGINE = {}
 
 
 def _job(args):
-    ref, params, unit, package, horizon, seed = args
-    if ref not in _ENGINE:
-        _ENGINE[ref] = load_engine(ref)
-    eng = _ENGINE[ref]
+    ref, config, params, unit, package, horizon, seed = args
+    key = _engine_key(ref, config)
+    if key not in _ENGINE:
+        _ENGINE[key] = load_engine(ref, config)
+    eng = _ENGINE[key]
     o = eng.run(params, UnitSpec("bench", unit), Package("p", package), _h(horizon), seed)
     pdays = o.meta.get("age_shares")
     if pdays is None:
@@ -221,6 +339,7 @@ class Runner:
         self.cache = {}
         self.calibrated = {}
         self.nsims = 0
+        self._engines = {}
 
     def _map(self, jobs, chunk: int = 300):
         """Run jobs; a fresh process pool per chunk (one long-lived pool broke on worker memory at
@@ -240,6 +359,17 @@ class Runner:
         s = self.pack["settings"][name]
         return dict(s["unit"]), dict(s.get("horizon") or self.pack["horizon"]), dict(s.get("params") or {})
 
+    def _config(self, setting_name):
+        return _config_of(self.pack, self.pack["settings"][setting_name])
+
+    def make_engine(self, config_name=None):
+        """The pack's engine with a named configuration (None: the runner's engine). Used by probes."""
+        if config_name is None:
+            return self.engine
+        if config_name not in self._engines:
+            self._engines[config_name] = load_engine(self.ref, (self.pack.get("configs") or {})[config_name])
+        return self._engines[config_name]
+
     def calibrate_settings(self, fitted: dict, names=None):
         """Settings with `calibrate`: pick the unit attribute value (log-linear interpolation on
         a grid) so the baseline arm reproduces the trial site's baseline value."""
@@ -250,7 +380,8 @@ class Runner:
             unit, hor, par = self._setting(n)
             for g in c["grid"]:
                 for sd in self.seeds[:2]:
-                    jobs.append((self.ref, dict(par, **fitted), dict(unit, **{c["attribute"]: g}), c.get("arm_package") or {}, hor, sd))
+                    jobs.append((self.ref, self._config(n), dict(par, **fitted), dict(unit, **{c["attribute"]: g}),
+                                 c.get("arm_package") or {}, hor, sd))
                     idx.append((n, g))
         res = self._map(jobs)
         self.nsims += len(jobs)
@@ -271,7 +402,8 @@ class Runner:
         if cfg["setting"] in self.calibrated:
             c = self.calibrated[cfg["setting"]]
             unit[c["attribute"]] = c["value"]
-        return [(self.ref, dict(par, **fitted), unit, cfg.get("package") or {}, hor, sd) for sd in self.seeds]
+        conf = self._config(cfg["setting"])
+        return [(self.ref, conf, dict(par, **fitted), unit, cfg.get("package") or {}, hor, sd) for sd in self.seeds]
 
     def prefetch(self, arms, fitted_list):
         """Run every (arm, fitted) pair not yet cached in one parallel batch."""
@@ -297,6 +429,10 @@ class Runner:
 
     def evaluate(self, b: dict, fitted: dict) -> dict:
         e = b["estimand"]
+        if e["type"] in COMPARE_TYPES:
+            return self._compare(b, fitted)
+        if e["type"] == "coverage":
+            return self._coverage(b)
         R = self.arm_results(_arms_of(e), fitted)
         nseed = len(self.seeds)
         val = lambda a, i: get(R[a][i], e.get("value") or "")  # noqa: E731
@@ -375,6 +511,111 @@ class Runner:
                    se_log=float(np.std(np.log(per), ddof=1) / math.sqrt(len(per))) if len(per) > 1 else None)
         out.update(_spread(per))
         return self._verdict(b, out)
+
+    # -------------------------------------------------------------- v2d δ: value / identity / coverage
+    def _side(self, x, R, i):
+        if isinstance(x, bool):
+            raise ValueError(f"a side cannot be a boolean ({x})")
+        if isinstance(x, (int, float)):
+            return float(x)
+        if isinstance(x, list):
+            return [self._side(v, R, i) for v in x]
+        if not isinstance(x, dict):
+            raise ValueError(f"bad side {x!r}")
+        if "arm" in x:
+            return get(R[x["arm"]][i], x["value"])
+        om = _oracles(self.pack)
+        args = {k: self._side(v, R, i) if self._is_side(v) else v for k, v in (x.get("args") or {}).items()}
+        if "oracle" in x:
+            return getattr(om, f"oracle_{x['oracle']}")(**args)
+        if "probe" in x:
+            return getattr(om, f"probe_{x['probe']}")(self.make_engine, **args)
+        raise ValueError(f"bad side {x!r}")
+
+    @staticmethod
+    def _is_side(v) -> bool:
+        if isinstance(v, dict):
+            return any(k in v for k in ("arm", "oracle", "probe"))
+        if isinstance(v, list):
+            return any(isinstance(x, dict) and any(k in x for k in ("arm", "oracle", "probe")) for x in v)
+        return False
+
+    def _compare(self, b: dict, fitted: dict) -> dict:
+        e = b["estimand"]
+        if e.get("not_transcribed"):
+            return {"computed": None, "in_band": False, "status": "not_assessable",
+                    "not_assessable_because": f"published values not yet transcribed: {e['not_transcribed']}"}
+        R = self.arm_results(_arms_of(e), fitted)
+        (kind, tol), = e["tol"].items()
+        cmp = e.get("compare", "eq")
+        seeds = range(len(self.seeds)) if _arms_of(e) else range(1)     # oracle/probe-only: one evaluation
+        per, worst = [], None
+        for i in seeds:
+            a, ref = self._side(e["a"], R, i), self._side(e["b"], R, i)
+            av, bv = np.atleast_1d(np.asarray(a, float)), np.atleast_1d(np.asarray(ref, float))
+            if av.shape != bv.shape:
+                raise ValueError(f"{b['id']}: sides have shapes {av.shape} and {bv.shape}")
+            d = av - bv
+            err_abs = float(np.max(np.abs(d)))
+            err_rel = float(np.max(np.abs(d) / np.maximum(np.abs(bv), 1e-300)))
+            if not (np.all(np.isfinite(av)) and np.all(np.isfinite(bv))):
+                ok_i = False
+            elif cmp == "le":
+                excess = float(np.max(d))
+                ok_i = excess <= (tol if kind == "abs" else tol * float(np.max(np.abs(bv))))
+            elif cmp == "differ":
+                ok_i = (err_abs if kind == "abs" else err_rel) > tol
+            else:
+                ok_i = (err_abs if kind == "abs" else err_rel) <= tol
+            rec = {"a": a, "b": ref, "error_abs": err_abs, "error_rel": err_rel, "ok": bool(ok_i)}
+            per.append(rec)
+            if worst is None or (not ok_i and worst["ok"]) or (ok_i == worst["ok"] and err_abs > worst["error_abs"]):
+                worst = rec
+        out = {"computed": worst["a"] if np.ndim(worst["a"]) == 0 else worst["error_abs"],
+               "reference": worst["b"], "error_abs": worst["error_abs"], "error_rel": worst["error_rel"],
+               "tolerance": {kind: tol}, "compare": cmp,
+               "per_seed_error_abs": [p["error_abs"] for p in per]}
+        if np.ndim(worst["a"]):
+            out["computed_vector"] = [float(v) for v in worst["a"]]
+        out["in_band"] = all(p["ok"] for p in per)
+        out["status"] = "in_band" if out["in_band"] else "out_of_band"
+        return out
+
+    def _coverage(self, b: dict) -> dict:
+        e = b["estimand"]
+        om = _oracles(self.pack)
+        gen = getattr(om, "generate_" + e["generator"]["fn"])
+        try:
+            mod, fn = e["calibrator"]["fn"].split(":")
+            cal = getattr(importlib.import_module(mod), fn)
+        except (ImportError, AttributeError, ValueError) as ex:
+            return {"computed": None, "in_band": False, "status": "not_assessable",
+                    "not_assessable_because": f"calibrator {e['calibrator']['fn']} not available "
+                                              f"({type(ex).__name__}: {ex})"}
+        qs = list(e["quantities"])
+        classes = e.get("classes") or {}
+        reps, seed = int(e["replicates"]), int(e.get("seed", 0))
+        hits = {q: 0 for q in qs}
+        cls_hits = {p: 0 for p in classes}
+        for r in range(reps):
+            rng = np.random.default_rng([seed, r])
+            data, truth = gen(rng, **(e["generator"].get("args") or {}))
+            post = cal(self.make_engine, data, **(e["calibrator"].get("args") or {}))
+            for q in qs:
+                lo, hi = post["intervals"][q]
+                hits[q] += int(lo <= truth[q] <= hi)
+            for p, allowed in classes.items():
+                cls_hits[p] += int((post.get("classes") or {}).get(p) in allowed)
+        cov = {q: hits[q] / reps for q in qs}
+        se = {q: math.sqrt(max(cov[q] * (1 - cov[q]), 1e-12) / reps) for q in qs}
+        share = {p: cls_hits[p] / reps for p in classes}
+        lo, hi = e["band"]
+        need = float(e.get("class_share_min", 0.9))
+        out = {"computed": min(cov.values()), "coverage": cov, "coverage_se": se, "class_share": share,
+               "replicates": reps, "band": [lo, hi]}
+        out["in_band"] = all(lo <= c <= hi for c in cov.values()) and all(v >= need for v in share.values())
+        out["status"] = "in_band" if out["in_band"] else "out_of_band"
+        return out
 
     @staticmethod
     def _verdict(b, out):
@@ -589,17 +830,27 @@ def run_pack(pack: dict, engine, runner: Runner, fitted: dict, fit_info: dict | 
             row["requires"] = b["requires"]
         if b["id"] in infeasible:
             row["infeasible_in_box"] = True
-        row.update({k: (round(v, 4) if isinstance(v, float) else v) for k, v in r.items()})
+        new_type = b["estimand"]["type"] in COMPARE_TYPES + ("coverage",)
+        row.update({k: (round(v, 4) if isinstance(v, float) and not new_type else v) for k, v in r.items()})
         rows.append(row)
     reach_check(pack, runner, rows, fit_info)
     apply_requires(rows)
     for row in rows:                       # a pass is a status, never a raw band test
         row["in_band"] = row["status"] == "in_band"
     for row in rows:
-        print(f"{row['id']:6s} {row['role']:8s} computed {row['computed']:.4g} target {row.get('target')} "
+        comp = row["computed"]
+        comp = f"{comp:.4g}" if isinstance(comp, (int, float)) else str(comp)
+        ref = f" reference {row['reference']}" if "reference" in row else ""
+        print(f"{row['id']:6s} {row['role']:8s} computed {comp} target {row.get('target')}{ref} "
               f"band {row.get('band')} {row['status']}", flush=True)
     by = {s: sum(r["status"] == s for r in rows) for s in STATUSES}
+    from toolkit.engines.contract import engine_identity
+    used = sorted({c for c in [s.get("config") for s in (pack.get("settings") or {}).values()] if c}
+                  | set(pack.get("configs") or {}))
+    configs_validated = {c: {"config": pack["configs"][c], "engine_identity": engine_identity(runner.make_engine(c))}
+                         for c in used}
     return {"benchmarks": rows, "settings_calibrated": runner.calibrated, "fitted_used": fitted,
+            "configs_validated": configs_validated,
             "seeds": runner.seeds, "n_sims": runner.nsims,
             "summary": {"in_band": by["in_band"], "total": len(rows), "by_status": by,
                         "held_out_in_band": sum(r["status"] == "in_band" for r in rows if r["role"] == "held_out"),
@@ -642,7 +893,7 @@ def main(argv=None) -> int:
     ap.add_argument("--out", default=None)
     a = ap.parse_args(argv)
     pack = yaml.safe_load(open(a.pack))
-    eng = load_engine(pack["engine"])
+    eng = load_engine(pack["engine"], (pack.get("configs") or {}).get(pack.get("default_config")))
     bad = validate(pack, eng)
     if bad:
         print("pack invalid:\n  " + "\n  ".join(bad))

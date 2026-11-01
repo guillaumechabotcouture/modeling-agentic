@@ -339,13 +339,13 @@ def _res(o):
     return {"per_capita": o.per_capita, "windows": o.windows, "cost_drivers": o.cost_drivers, "meta": o.meta}
 
 
-def probe_observation(mechanism: str, **args) -> float:
+def probe_observation(make_engine, mechanism: str, **args) -> float:
     """OB1: one bias mechanism's forward map (toolkit/analysis/observation.py)."""
     from toolkit.analysis import observation as ob
     return float(ob.forward(mechanism, **args))
 
 
-def probe_band_positivity(immune, sizes, se: float = 1.0, sp: float = 1.0) -> float:
+def probe_band_positivity(make_engine, immune, sizes, se: float = 1.0, sp: float = 1.0) -> float:
     """CI3: a mixed-cohort survey band's expected positivity from the observation forward map."""
     from toolkit.analysis import observation as ob
     return float(ob.band_positivity(immune, sizes, se=se, sp=sp))
@@ -382,6 +382,103 @@ def probe_refit_r0(make_engine, config: str, r0: float, gamma: float, weeks: int
         if best is None or res.fun < best.fun:
             best = res
     return float(math.exp(best.x[0]))
+
+
+# ---------------------------------------------------------------- coverage-pack generators (coverage.yaml)
+# Independent of the engine and of the observation code under test: the renewal cases use the reference ODE,
+# the cohort case draws latent coverage and each source's frame and biases directly, and SB5 uses the
+# final-size fixed point. Each returns (data the calibration sees, truth the interval must cover).
+def _loguniform(rng, lo, hi):
+    return float(math.exp(rng.uniform(math.log(lo), math.log(hi))))
+
+
+def generate_renewal_series(rng, r0_range=(1.3, 2.5), reporting_range=(0.0333, 0.333), gamma=1 / 7.0,
+                            weeks=30, population=1.0e6, seed_share=1.0e-5, dispersion=20.0, s0=1.0,
+                            s0_range=None, forcing_amplitude_range=None, forcing_phase=0.0, forcing_period=365.0,
+                            truncate_weeks=None):
+    """SB1/SB2: weekly reported cases from the reference ODE (single group), negative-binomial reporting
+    noise around reporting x true infections. `s0_range` makes the initial susceptible share unknown
+    (drawn); `forcing_amplitude_range` adds an unknown (drawn) cosine forcing; `truncate_weeks` ends the
+    series before depletion. Truth: R0, the attack rate and reff_end over the observed window, reporting."""
+    r0 = float(rng.uniform(*r0_range))
+    rho = _loguniform(rng, *reporting_range)
+    s = float(rng.uniform(*s0_range)) if s0_range else float(s0)
+    amp = float(rng.uniform(*forcing_amplitude_range)) if forcing_amplitude_range else 0.0
+    f = (lambda t: 1.0 + amp * math.cos(2 * math.pi * (t - forcing_phase) / forcing_period)) if amp else None
+    n_obs = int(truncate_weeks or weeks)
+    tt = np.arange(n_obs + 1) * 7.0
+    t, sv, iv, cum = ode_sir(r0, [[1.0]], [1.0], [s], [seed_share], gamma, tt[-1], t_eval=tt, forcing=f)
+    inc = np.diff(cum[0])
+    mu = np.maximum(rho * population * inc, 1e-12)
+    p = dispersion / (dispersion + mu)
+    cases = rng.negative_binomial(dispersion, p)
+    s_end = float(sv[0, -1])
+    f_end = f(tt[-1]) if f else 1.0
+    truth = {"r0": r0, "reporting": rho, "attack_rate": float(cum[0, -1] - cum[0, 0] + seed_share),
+             "reff_end": r0 * f_end * s_end, "s0": s, "forcing_amplitude": amp}
+    data = {"weekly_cases": [int(x) for x in cases], "population": population, "weeks": n_obs,
+            "gamma": gamma, "known": {"s0": None if s0_range else s, "forcing": "none" if not forcing_amplitude_range
+                                      else "cosine (amplitude unknown)"}}
+    return data, truth
+
+
+def generate_cohort_sources(rng, n_cohorts=5, coverage_beta=(8.0, 2.0), omega_prior=(0.0, 0.25),
+                            delta_prior=(-0.10, 0.25), se=(0.92, 0.98), sp=(0.95, 0.995), wane_rate=(0.0, 0.05),
+                            out_of_frame_share=0.06, out_of_frame_rel=(0.5, 1.0), survey_n=300, design_effect=2.1,
+                            admin_only=False, seroconversion=0.93, decision_year=2026, survey_year=2025):
+    """SB3: latent true coverage of one dose by birth cohort; an administrative source (numerator inflation,
+    denominator error, reporting noise) and, unless `admin_only`, a serosurvey of the in-frame population
+    (assay Se/Sp, waning by years since vaccination, a frame gap with out-of-frame relative immunity,
+    beta-binomial sampling with the survey's design effect). Truth: the unit's susceptible share."""
+    years = np.arange(decision_year - n_cohorts, decision_year)
+    c = rng.beta(*coverage_beta, n_cohorts)
+    omega = float(rng.uniform(*omega_prior))
+    delta = float(rng.uniform(*delta_prior))
+    admin = np.clip(c * (1 + omega) / (1 + delta) * np.exp(rng.normal(0, 0.03, n_cohorts)), 0, None)
+    immune_frame = c * seroconversion
+    rel = float(rng.uniform(*out_of_frame_rel))
+    immune_unit = (1 - out_of_frame_share) * immune_frame + out_of_frame_share * np.minimum(rel * immune_frame, 1)
+    data = {"birth_year": [int(y) for y in years], "admin_coverage": [float(x) for x in admin],
+            "decision_year": decision_year, "survey_year": survey_year, "seroconversion": seroconversion}
+    if not admin_only:
+        se_, sp_ = float(rng.uniform(*se)), float(rng.uniform(*sp))
+        wr = float(rng.uniform(*wane_rate))
+        age = np.maximum(survey_year - years - 1, 0)
+        pos = se_ * immune_frame * np.exp(-wr * age) + (1 - sp_) * (1 - immune_frame * np.exp(-wr * age))
+        n_eff = max(int(survey_n / design_effect), 1)
+        rho_icc = (design_effect - 1) / max(survey_n - 1, 1)
+        a = pos * (1 / max(rho_icc, 1e-9) - 1)
+        b = (1 - pos) * (1 / max(rho_icc, 1e-9) - 1)
+        pk = rng.beta(np.maximum(a, 1e-6), np.maximum(b, 1e-6))
+        data.update(sero_n=survey_n, sero_positive=[int(x) for x in rng.binomial(survey_n, pk)],
+                    design_effect=design_effect, out_of_frame_share=out_of_frame_share, n_effective=n_eff)
+    truth = {"susceptible_share": float(np.mean(1 - immune_unit)), "omega": omega, "delta": delta,
+             "ratio": (1 + omega) / (1 + delta)}
+    return data, truth
+
+
+def generate_group_attack(rng, q_range=(0.4, 1.0), N=(3.0e5, 2.0e5, 1.0e5),
+                          C=((2.0, 0.5, 0.2), (0.6, 1.5, 0.4), (0.3, 0.5, 1.0)), survey_n=400,
+                          hosp_ratio=(0.002, 0.004, 0.02), plan_coverage=(0.0, 0.5, 0.0), efficacy=0.9):
+    """SB5: last season's group attack rates (binomial serosurveys of `survey_n` per group) from the final-size
+    fixed point at a drawn q; the decision quantity is hospitalisations averted by a fixed plan (all-or-nothing
+    vaccination of a share of each group) next season, computed by the same independent oracle."""
+    q = float(rng.uniform(*q_range))
+    N, C = np.asarray(N, float), np.asarray(C, float)
+    G = len(N)
+    seed = np.zeros(G)
+    seed[0] = 1e-6
+    z = np.asarray(oracle_final_size_multigroup(q, C, N, np.ones(G), seed))
+    obs = rng.binomial(survey_n, np.clip(z, 0, 1))
+    s_next = 1 - z
+    z0 = np.asarray(oracle_final_size_multigroup(q, C, N, s_next, seed))
+    s_plan = s_next * (1 - np.asarray(plan_coverage) * efficacy)
+    z1 = np.asarray(oracle_final_size_multigroup(q, C, N, s_plan, seed))
+    hosp = np.asarray(hosp_ratio)
+    averted = float(np.sum((z0 - z1) * N * hosp))
+    data = {"N": N.tolist(), "contact": C.tolist(), "survey_n": survey_n, "positive": [int(x) for x in obs],
+            "hosp_ratio": list(hosp), "plan_coverage": list(plan_coverage), "efficacy": efficacy}
+    return data, {"q": q, "hospitalisations_averted": averted}
 
 
 # --------------------------------------------------------------------------------- self-test
@@ -429,6 +526,20 @@ def _self_test() -> int:
        "O13 cohort susceptibility, independent and nested, by hand")
     w = discretised_exponential_gi(1 / 7, 7.0, 12)
     ok(abs(sum(w) - 1) < 1e-14 and w[0] > w[1] > 0, "O14 discretised generation interval sums to 1")
+    d1, t1 = generate_renewal_series(np.random.default_rng([7, 0]))
+    d2, t2 = generate_renewal_series(np.random.default_rng([7, 0]))
+    dtr, ttr = generate_renewal_series(np.random.default_rng([7, 0]), truncate_weeks=5)
+    ok(d1 == d2 and t1 == t2 and len(d1["weekly_cases"]) == 30 and t1["attack_rate"] > 0.3
+       and ttr["attack_rate"] < 0.05 and len(dtr["weekly_cases"]) == 5,
+       f"O15 renewal generator: reproducible; a complete epidemic depletes ({t1['attack_rate']:.2f}), a truncated "
+       f"one does not ({ttr['attack_rate']:.3f})")
+    dc, tc = generate_cohort_sources(np.random.default_rng([3, 1]))
+    da, ta = generate_cohort_sources(np.random.default_rng([3, 1]), admin_only=True)
+    ok(0 < tc["susceptible_share"] < 1 and "sero_positive" in dc and "sero_positive" not in da
+       and abs(tc["ratio"] - (1 + tc["omega"]) / (1 + tc["delta"])) < 1e-15,
+       "O16 cohort-sources generator: two overlapping sources, or administrative only")
+    dg, tg = generate_group_attack(np.random.default_rng([5, 2]))
+    ok(tg["hospitalisations_averted"] > 0 and len(dg["positive"]) == 3, "O17 group-attack generator")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
