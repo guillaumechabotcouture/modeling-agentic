@@ -25,3 +25,6 @@ validator_stderr_*.txt
 /experiments/*
 !/experiments/E[0-9]*_*/
 /*.pdf
+
+# Licensed run inputs (DHS/MAP-derived): never committed to this public repo; see cloud/nigeria_gf13_inputs.py
+/data/nigeria_gf13/
