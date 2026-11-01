@@ -166,6 +166,48 @@ def verify_attached(cl, expected_id):
     return cl
 
 
+class SchedulerInfoUnavailable(RuntimeError):
+    """The scheduler's worker table could not be read within the retry bound."""
+
+
+def live_client(cluster, client):
+    """`client` while it is open; a fresh one from `cluster` once distributed has closed it
+    (a client whose reconnect fails is closed for good and reports an empty identity)."""
+    if client is not None and getattr(client, "status", None) not in ("closed", "closing"):
+        return client
+    return cluster.get_client()
+
+
+def scheduler_workers(get_client, attempts=6, delay_s=5.0, max_delay_s=60.0, min_workers=0, sleep=None, log=None):
+    """The scheduler's worker table {address: info}, from client.scheduler_info()["workers"].
+    distributed returns {} there (no "workers" key) whenever the client is not connected:
+    before its first identity reply, while it reconnects, and after a failed reconnect has
+    closed it. Each try takes a client from `get_client` and waits with doubling backoff
+    (at most `max_delay_s`); after `attempts` tries it raises SchedulerInfoUnavailable
+    naming the last state, never an empty table that would read as "no workers"."""
+    import time
+    sleep = sleep or time.sleep
+    delay, last = delay_s, "no try made"
+    for i in range(max(1, int(attempts))):
+        try:
+            c = get_client()
+            info = c.scheduler_info()
+            w = info.get("workers") if isinstance(info, dict) else None
+            if isinstance(w, dict) and len(w) >= min_workers:
+                return w
+            last = (f"{len(w)} of {min_workers} workers joined" if isinstance(w, dict) else
+                    f"scheduler identity has no worker table (client {getattr(c, 'status', '?')})")
+        except Exception as e:  # noqa: BLE001 — retried, then reported
+            last = f"{type(e).__name__}: {str(e)[:160]}"
+        if i < attempts - 1:
+            if log:
+                log(f"{time.strftime('%T')} scheduler worker table not ready ({last}); "
+                    f"retry {i + 1}/{attempts - 1} in {delay:g}s")
+            sleep(delay)
+            delay = min(max_delay_s, delay * 2)
+    raise SchedulerInfoUnavailable(f"scheduler worker table unavailable after {attempts} tries: {last}")
+
+
 def keeper_task(token, name, workspace, lo, hi, hours, adapt_options, cluster_id=None, overflow=None):
     """Run the keeper, then stop the keeper's own cluster (and the overflow
     pool's): once the run cluster has stopped there is nothing to hold, and an
@@ -198,6 +240,7 @@ def keeper_task(token, name, workspace, lo, hi, hours, adapt_options, cluster_id
 
 OVERFLOW_PREFIX = "ovf-"
 KEEPER_STATUS = "/tmp/keeper_status.json"
+KEEPER_LOG = "/tmp/keeper.log"
 
 
 def quota_refusal(reason):
@@ -349,10 +392,10 @@ class _Overflow:
         proc = c.processing()
         run_proc = run_client.processing()
         busy_joined = {str(w.get("name"))[len(OVERFLOW_PREFIX):]: bool(run_proc.get(a))
-                       for a, w in run_client.scheduler_info()["workers"].items()
+                       for a, w in scheduler_workers(lambda: run_client, attempts=3).items()
                        if str(w.get("name", "")).startswith(OVERFLOW_PREFIX)}
         vms = {str(w.get("name")): {"addr": a, "joined": bool(proc.get(a)), "busy": busy_joined.get(str(w.get("name")), False)}
-               for a, w in c.scheduler_info()["workers"].items()}
+               for a, w in scheduler_workers(lambda: c, attempts=3).items()}
         cl.sync(cl._set_plan_requested)
         plan = overflow_plan(desired, len(cl.plan), vms, self.idle_since, now, self.spec.get("scale_down_s", 1200))
         self.idle_since = plan["idle_since"]
@@ -402,7 +445,7 @@ def _keeper_loop(token, name, workspace, lo, hi, hours, adapt_options, cluster_i
               "refusals": [], "refusal_count": 0, "last_refusal_at": None, "errors": []}
     seen = set()
     ovf = _Overflow(ovf_spec, workspace) if ovf_spec.get("id") else None
-    with open("/tmp/keeper.log", "a", buffering=1) as f, contextlib.redirect_stdout(f), contextlib.redirect_stderr(f):
+    with open(KEEPER_LOG, "a", buffering=1) as f, contextlib.redirect_stdout(f), contextlib.redirect_stderr(f):
         print(f"{time.strftime('%T')} keeper holding {name} {lo}..{hi} {adapt_options}", flush=True)
         t_end = time.time() + hours * 3600
         while time.time() < t_end:
@@ -417,7 +460,11 @@ def _keeper_loop(token, name, workspace, lo, hi, hours, adapt_options, cluster_i
                     print(f"{time.strftime('%T')} {e}; keeper exiting", flush=True)
                     return "keeper exited"
                 cl.adapt(minimum=lo, maximum=hi, **adapt_options)
-                c = cl.get_client()
+                box = [cl.get_client()]
+
+                def run_client():   # the inner loop keeps one client; a closed one is replaced
+                    box[0] = live_client(cl, box[0])
+                    return box[0]
                 while time.time() < t_end:
                     try:
                         if not alive():
@@ -425,7 +472,10 @@ def _keeper_loop(token, name, workspace, lo, hi, hours, adapt_options, cluster_i
                     except Exception:  # noqa: BLE001 — an API hiccup is not a stop
                         pass
                     now = time.time()
-                    winfo = c.scheduler_info()["workers"]
+                    # Not yet populated (start-up, reconnect): retried with backoff; past the
+                    # bound the error goes to the reconnect path below with a log line.
+                    winfo = scheduler_workers(run_client, attempts=6, delay_s=5.0, log=print)
+                    c = box[0]
                     n_ovf = sum(str(w.get("name", "")).startswith(OVERFLOW_PREFIX) for w in winfo.values())
                     status.update(updated=now, workers=len(winfo), primary_workers=len(winfo) - n_ovf,
                                   overflow_workers=n_ovf)
@@ -469,7 +519,7 @@ def state_of(c):
 
 def keeper_log():
     import os
-    p = "/tmp/keeper.log"
+    p = KEEPER_LOG
     return open(p).read()[-3000:] if os.path.exists(p) else "(no log yet)"
 
 
