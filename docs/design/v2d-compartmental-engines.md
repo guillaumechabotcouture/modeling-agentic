@@ -806,9 +806,16 @@ built and self-tested on a toy conjugate case (an exact posterior covers, a half
   with the number of steps: one sim sized to the step cap would cost seconds.
 - The stop rule is stricter than "incidence below a tolerance": over one generation interval the incidence
   is below `tol · N`, the reproduction number at the forcing's maximum is below 1 **on the groups the seeds
-  can reach**, and the infections still to come (bounded by one generation's incidence × R/(1 − R)) are
-  below `tol · N`. The first pack run found that a supercritical group no seed can reach held the rule open
-  (FS6a, BR1c); a near-critical epidemic still fails closed at the step cap.
+  can reach**, and the infections still to come are below `tol · N`. That remainder is bounded with the
+  next-generation resolvent, `sum((I − K)^-1 K v)`, where `v` is the incidence over one generation per group
+  and `K` the next-generation matrix at the current susceptibility. A scalar R/(1 − R) bound misses transient
+  amplification through a nilpotent matrix (Codex round 1). A member whose whole infectious history is zero
+  stops. The first pack run found that a supercritical group no seed can reach held the rule open (FS6a,
+  BR1c). A near-critical epidemic still fails closed at the step cap.
+- `p_major` is reported only without seasonal forcing, because the extinction equations assume a constant
+  environment. `importation: branching` with forcing is refused (Codex round 1).
+- The results stamp also carries `engine_config_sha256`, the full dynamics configuration. `engine_identity()`
+  does not hash every field that changes the dynamics, and `contract.py` stays unchanged (Codex round 1).
 - Seeding is a pulse at day 0 in the introduction group, taken from its susceptibles (seeds counted in the
   final size, as the oracles assume), not an initial incidence spread over the first generation interval.
 - For several groups `reff_end` and `reff_ref` are `q f ρ(diag(s_end) C)`, which reduce to the note's
