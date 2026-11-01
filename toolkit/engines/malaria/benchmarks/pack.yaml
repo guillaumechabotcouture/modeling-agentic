@@ -43,7 +43,7 @@ settings:
            itn_hist_years: [2017.0], campaign_year: 2020.0, irs_month: 1, irs_years: [2020.0], irs_product: pm_cs}
     params: {n_agents: 5000, irs_coverage: 0.94, net_retention_half: 949.0}
     calibrate: {attribute: m0, arm_package: {net: pyr}, value_path: windows.m9.pfpr_6m14y, target: 0.55,
-                grid: [8, 16, 32, 64, 128]}
+                grid: [8, 16, 32, 64, 128, 256]}   # v0.4: v0.3 calibrated to 127.6, at the old bound 128
   misungwi:            # Mosha 2022 (Misungwi, Tanzania): An. funestus dominant, resistant; pyrethroid arm 45.8% at 24 m
     unit: {season: [1.3, 1.2, 1.4, 1.5, 1.3, 0.7, 0.5, 0.5, 0.6, 0.8, 1.1, 1.1], resistance: 0.25,
            species: {funestus: 0.85, arabiensis: 0.15}, cm_ft: 0.3, itn_use: 0.7,
@@ -125,9 +125,20 @@ arms:
   eir_300: {setting: eir_300, package: {}}
 
 benchmarks:
-  - {id: B7, metric: "ITN (pyrethroid) vs none, prevalence RR at 12 m", target: 0.83, band: [0.68, 0.98],
-     source: "C21 Pryce 2018 Cochrane CD000363.pub3",
-     estimand: {type: ratio, num: coch_pyr, den: coch_none, value: windows.m12.pfpr_6m14y}}
+  # v0.4: B7 is measured in each identified trial's own ages (Pryce 2018, Characteristics of included studies;
+  # PMC6418392): Halbluetzel 1996 0-59 months, Moyou-Somo 1995 15 and under, Rowland 1996 all ages, Smithuis 2013
+  # under 10, Sochantha 2006 all ages (its all-age prevalence ratio 0.91 vs under-5 OR 0.63, age interaction
+  # p = 0.042). The sixth trial is not identified. Equal weights: the Cochrane weights are not in the accessible text
+  # (ASSUMPTION). The v0.3 definition (6 m-14 y) is reported as a diagnostic, not judged.
+  - {id: B7, metric: "ITN (pyrethroid) vs none, prevalence RR at 12 m (trials' own age bands)", target: 0.83,
+     band: [0.68, 0.98], source: "C21 Pryce 2018 Cochrane CD000363.pub3",
+     estimand: {type: ratio, num: coch_pyr, den: coch_none,
+                values: [{path: windows.m12.pfpr_lt5, weight: 1, label: "Halbluetzel 1996 (0-59 months)"},
+                         {path: windows.m12.pfpr_le15, weight: 1, label: "Moyou-Somo 1995 (15 and under)"},
+                         {path: windows.m12.pfpr_all, weight: 1, label: "Rowland 1996 (all ages)"},
+                         {path: windows.m12.pfpr_lt10, weight: 1, label: "Smithuis 2013 (under 10)"},
+                         {path: windows.m12.pfpr_all, weight: 1, label: "Sochantha 2006 (all ages)"}],
+                diagnostic_values: [windows.m12.pfpr_6m14y]}}
   - {id: B8, metric: "ITN vs none, clinical incidence RR 0-24 m (under 5)", target: 0.55, band: [0.46, 0.64],
      source: "C22 Pryce 2018", estimand: {type: ratio, num: coch_pyr, den: coch_none, value: windows.m0_24.inc_u5}}
   # v0.2 basis fix: the trial's 0.37 and 0.40 are PBO LLIN alone vs standard LLIN (Table 2; the factorial model

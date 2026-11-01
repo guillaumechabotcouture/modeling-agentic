@@ -50,7 +50,23 @@ G = dict(b0=0.590, b1=0.5, IB0=43.9, kb=2.16, ub=7.2, db=3650.,
          cD=0.068, cT=0.0219, cU=0.0062, gam1=1.82,
          rho=0.85, a0=8 * 365., sigma2=1.67, tau1=0.69, tau2=2.31, eip=10)
 S_, D_, T_, A_, U_ = 0, 1, 2, 3, 4
-DAILY = ("pfpr_u5", "pfpr_6m14y", "pfpr_2_10", "inc_u5", "inc_all", "inc_u5_smc", "eir", "net_use", "net_access")
+# Microscopy prevalence by age band (years, [lo, hi)). v0.4 adds the B7 trials' own bands (Pryce 2018
+# characteristics table): under 5 from birth (Halbluetzel 1996), under 10 (Smithuis 2013), 15 and under
+# (Moyou-Somo 1995; ages < 16) and all ages (Rowland 1996, Sochantha 2006).
+PFPR_BANDS = {"pfpr_u5": (0.5, 5.0), "pfpr_6m14y": (0.5, 15.0), "pfpr_2_10": (2.0, 10.0),
+              "pfpr_lt5": (0.0, 5.0), "pfpr_lt10": (0.0, 10.0), "pfpr_le15": (0.0, 16.0), "pfpr_all": (0.0, 1e9)}
+DAILY = tuple(PFPR_BANDS) + ("inc_u5", "inc_all", "inc_u5_smc", "eir", "net_use", "net_access")
+
+
+def prevalence_bands(det, age_d) -> dict:
+    """Mean microscopy-detectable share (det: per-person probability of a positive slide) in each
+    age band of PFPR_BANDS; age_d in days. The 6-month lower bound of the old bands is 182 days."""
+    out = {}
+    for k, (lo, hi) in PFPR_BANDS.items():
+        lo_d = 182.0 if lo == 0.5 else lo * 365
+        sel = (age_d >= lo_d) & (age_d < hi * 365)
+        out[k] = float(det[sel].mean()) if sel.any() else 0.0
+    return out
 
 
 class Malaria(ss.Disease):
@@ -241,13 +257,9 @@ class Malaria(ss.Disease):
         # daily records (microscopy-detectable prevalence)
         det = ((st == D_) | (st == T_)).astype(float)
         det[st == A_] = q[st == A_]
-        u5 = (age_d >= 182) & (age_d < 5 * 365)
-        c14 = (age_d >= 182) & (age_d < 15 * 365)
-        c210 = (age_d >= 2 * 365) & (age_d < 10 * 365)
         dd = self.daily
-        dd['pfpr_u5'][ti] = det[u5].mean() if u5.any() else 0.0
-        dd['pfpr_6m14y'][ti] = det[c14].mean() if c14.any() else 0.0
-        dd['pfpr_2_10'][ti] = det[c210].mean() if c210.any() else 0.0
+        for k, v in prevalence_bands(det, age_d).items():
+            dd[k][ti] = v
         dd['eir'][ti] = eir_i.mean()
         dd['net_use'][ti] = hn.mean()
         dd['net_access'][ti] = self.has_net[u].mean()

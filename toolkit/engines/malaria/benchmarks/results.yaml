@@ -1,32 +1,40 @@
 producer: toolkit/engines/benchmark.py
 engine_identity:
   name: malaria-starsim
-  version: '0.3'
-  code_sha256: 705431b5bc0430d6923b976f357ff9597cb1b7add3977b4b5539a42d038a468d
+  version: '0.4'
+  code_sha256: a7a80b3c3a70bc3b908ad1f766951308153b07fb902ed7663dcadc2739dd9c18
   params_sha256: c9f0a188be9664576e2aca05e3c9d0d15a161cfb6f32e2b7318b0517a786294b
-  config_sha256: b6875832be6959469820153cac1a6ba037e9facbdd9a9a53474f7bba4cbd0fbd
+  config_sha256: eb9d39627ddda563f781e8a6f7a32f71f13e454576e7e2de0f77b946ad4c7489
 benchmarks:
 - id: B7
-  metric: ITN (pyrethroid) vs none, prevalence RR at 12 m
+  metric: ITN (pyrethroid) vs none, prevalence RR at 12 m (trials' own age bands)
   role: held_out
   target: 0.83
   band:
   - 0.68
   - 0.98
   source: C21 Pryce 2018 Cochrane CD000363.pub3
-  computed: 0.5953
-  se_log: 0.0079
+  components:
+    Halbluetzel 1996 (0-59 months): 0.5585
+    Moyou-Somo 1995 (15 and under): 0.5979
+    Rowland 1996 (all ages): 0.6025
+    Smithuis 2013 (under 10): 0.5836
+    Sochantha 2006 (all ages): 0.6025
+  diagnostics:
+    windows.m12.pfpr_6m14y: 0.5953
+  computed: 0.5888
+  se_log: 0.0067
   per_seed:
-  - 0.5895
-  - 0.5984
-  - 0.6248
-  - 0.5851
-  - 0.5947
-  - 0.5799
-  - 0.597
-  - 0.5941
-  seed_min: 0.5799
-  seed_max: 0.6248
+  - 0.5869
+  - 0.5969
+  - 0.6088
+  - 0.5834
+  - 0.5865
+  - 0.5701
+  - 0.5934
+  - 0.5849
+  seed_min: 0.5701
+  seed_max: 0.6088
   in_band: false
   status: out_of_band
 - id: B8
@@ -496,6 +504,7 @@ settings_calibrated:
     - 0.6915
     target: 0.5
     at_grid_edge: false
+    near_grid_edge: false
   muleba:
     attribute: m0
     value: 127.55630198413618
@@ -505,14 +514,17 @@ settings_calibrated:
     - 32
     - 64
     - 128
+    - 256
     baseline_values:
     - 0.1614
     - 0.2512
     - 0.348
     - 0.4586
     - 0.5505
+    - 0.65
     target: 0.55
     at_grid_edge: false
+    near_grid_edge: false
   misungwi:
     attribute: m0
     value: 11.94009999943619
@@ -530,6 +542,7 @@ settings_calibrated:
     - 0.7346
     target: 0.458
     at_grid_edge: false
+    near_grid_edge: false
   benin:
     attribute: m0
     value: 13.325651042337062
@@ -547,6 +560,7 @@ settings_calibrated:
     - 4.1205
     target: 2.06
     at_grid_edge: false
+    near_grid_edge: false
   irs_added:
     attribute: m0
     value: 28.657978758741436
@@ -564,6 +578,7 @@ settings_calibrated:
     - 0.6089
     target: 0.4
     at_grid_edge: false
+    near_grid_edge: false
   sahel_smc:
     attribute: m0
     value: 24.554699639585277
@@ -581,6 +596,7 @@ settings_calibrated:
     - 0.5278
     target: 0.4
     at_grid_edge: false
+    near_grid_edge: false
   ce_ref:
     attribute: m0
     value: 17.366921424257992
@@ -598,6 +614,7 @@ settings_calibrated:
     - 0.5973
     target: 0.45
     at_grid_edge: false
+    near_grid_edge: false
   ce_res:
     attribute: m0
     value: 17.366921424257992
@@ -615,6 +632,7 @@ settings_calibrated:
     - 0.5973
     target: 0.45
     at_grid_edge: false
+    near_grid_edge: false
 fitted_used:
   cfp_kill: 0.425
   irs_kill: 0.421563
@@ -627,7 +645,7 @@ seeds:
 - 16
 - 17
 - 18
-n_sims: 296
+n_sims: 298
 summary:
   in_band: 15
   total: 17
@@ -638,6 +656,6 @@ summary:
     band_mis_based: 0
   held_out_in_band: 10
   held_out_total: 12
-engine_version: '0.3'
+engine_version: '0.4'
 fit_rule: joint-v1
-wall_s: 468.0
+wall_s: 847.2
