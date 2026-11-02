@@ -15,6 +15,9 @@ the stored spike batch is reusable.
 Runs go to `scripts/compute.py` (`run_map`): dask on Coiled when the launcher provides a
 scheduler, else a local process pool that is replaced every chunk (spike lesson 7);
 results are kept per input, so a rerun completes a stopped batch.
+For an engine whose packages share a starting state (`batch_shares_state`, e.g. the malaria
+engine's burn-in), the compute tasks are design points: `run_point` runs one point's packages in
+one `run_batch` call, and the per-job rows (with their own provenance) are written as before.
 
 A batch computed elsewhere (VM shards) is shipped with the exact jobs it ran: each shard calls `ship()` where it ran
 (jobs, design, rows and a manifest with their sha256 and the computing platform), `merge_shipped()` joins shards from
@@ -132,7 +135,9 @@ CORE = ("point", "package", "components", "unit", "params", "seed")     # a job'
 # A re-run on another platform (the spike's batch ran on Linux VMs) differs in the last digits of floating point
 # (observed: about 1e-9 relative); 1e-6 separates that from a model change. Wall-clock timings are not outputs.
 ADOPT_RTOL = 1e-6
-TIMING_KEYS = frozenset({"seconds"})
+# v0.5 (review P2): an engine that shares a starting state reports where its batch forked and how many members shared
+# it; both depend on how jobs were grouped (a replay runs one job alone), not on the job's outputs.
+TIMING_KEYS = frozenset({"seconds", "fork_year", "burnin_members"})
 # Codex r2 P1-2: an adoption re-runs at least this many stored jobs before it stamps any of them.
 ADOPT_MIN_SAMPLE = 4
 ADOPT_MIN_SHARE = 0.01
@@ -171,18 +176,73 @@ def run_job(job: dict) -> dict:
             "provenance": {"job_sha": job_sha(job), "engine": engine_identity(eng), "producer": PRODUCER}}
 
 
+def shares_state(engine) -> bool:
+    """The engine declares that the packages of one unit, parameter set and seed share one starting state (computed
+    once, e.g. a burn-in) and offers run_batch: one design point's jobs then run as one compute task."""
+    return bool(getattr(engine, "batch_shares_state", False)) and callable(getattr(engine, "run_batch", None))
+
+
+def point_groups(jobs: list[dict]) -> list[dict]:
+    """Compute inputs for a shared-state engine: one per (design point, seed), holding that point's jobs in order."""
+    by = {}
+    for j in jobs:
+        by.setdefault((j["point"], j["seed"]), []).append(j)
+    return [{"jobs": g} for g in by.values()]
+
+
+def run_point(group: dict) -> dict:
+    """The compute.py function for a shared-state engine: one point's jobs in one run_batch call. Each row carries
+    its own job's provenance, as run_job's does."""
+    from toolkit.engines.contract import engine_identity
+    jobs = group["jobs"]
+    j0 = jobs[0]
+    for j in jobs[1:]:
+        if any(json.dumps(j.get(k), sort_keys=True) != json.dumps(j0.get(k), sort_keys=True)
+               for k in ("engine", "horizon", "windows", "seed")):
+            raise ValueError("run_point: the jobs of one task must share engine, horizon, windows and seed")
+    eng = _engine(j0["engine"])
+    hz = j0["horizon"]
+    h = Horizon(float(hz["start"]), float(hz["stop"]), tuple(hz["window"]), dict(j0.get("windows") or {}))
+    outs = eng.run_batch([j["params"] for j in jobs], [UnitSpec(str(j["point"]), j["unit"]) for j in jobs],
+                         [Package(j["package"], j["components"]) for j in jobs], h, int(j0["seed"]))
+    ident = engine_identity(eng)
+    return {"rows": [{"result": {"per_capita": o.per_capita, "windows": o.windows, "cost_drivers": o.cost_drivers,
+                                 "meta": o.meta},
+                      "provenance": {"job_sha": job_sha(j), "engine": ident, "producer": PRODUCER}}
+                     for j, o in zip(jobs, outs)]}
+
+
 def run(run_dir: str, jobs: list[dict], engine, out_rel: str = "analysis/batch/results.jsonl", **kw) -> dict:
-    """Run every job through scripts/compute.py; returns {job id: result} for rows whose provenance matches."""
+    """Run every job through scripts/compute.py; returns {job id: result} for rows whose provenance matches. For a
+    shared-state engine the compute tasks are design points (`points.jsonl` beside `out_rel`), and the per-job rows
+    are written to `out_rel` in the same format as run_job's."""
     sys.path.insert(0, os.path.join(ROOT, "scripts"))
     import compute
     out = os.path.join(run_dir, out_rel)
     os.makedirs(os.path.dirname(out), exist_ok=True)
-    inputs = [{k: v for k, v in j.items() if k != "id"} for j in jobs]
-    rows, summ = compute.run_map(run_dir, os.path.join(ROOT, "toolkit", "analysis", "batch.py") + "::run_job",
-                                 inputs, out, purpose="v2 analysis: engine batch", **kw)
+    if not shares_state(engine):
+        inputs = [{k: v for k, v in j.items() if k != "id"} for j in jobs]
+        rows, summ = compute.run_map(run_dir, os.path.join(ROOT, "toolkit", "analysis", "batch.py") + "::run_job",
+                                     inputs, out, purpose="v2 analysis: engine batch", **kw)
+    else:
+        groups = point_groups([{k: v for k, v in j.items()} for j in jobs])
+        pout = os.path.join(os.path.dirname(out), "points.jsonl")
+        prow, summ = compute.run_map(run_dir, os.path.join(ROOT, "toolkit", "analysis", "batch.py") + "::run_point",
+                                     groups, pout, purpose="v2 analysis: engine batch (one task per design point)", **kw)
+        byid = {}
+        for g, r in zip(groups, prow):
+            if r.get("ok"):
+                for j, row in zip(g["jobs"], r["result"]["rows"]):
+                    byid[j["id"]] = row
+        rows = [{"ok": True, "result": byid[j["id"]]} if j["id"] in byid else {"ok": False} for j in jobs]
+        with open(out, "w") as f:
+            for n, (j, r) in enumerate(zip(jobs, rows)):
+                if r["ok"]:
+                    f.write(json.dumps({"i": n, "ok": True, "result": r["result"]}) + "\n")
+        summ = dict(summ, tasks=len(groups), n=len(jobs), n_failed=sum(not r["ok"] for r in rows))
     res, problems = verify_rows([dict(r, id=j["id"]) for j, r in zip(jobs, rows) if r.get("ok")], jobs, engine)
     return {"results": res, "problems": problems,
-            "summary": {k: summ.get(k) for k in ("backend", "workers", "n", "n_failed", "wall_s")}, "path": out}
+            "summary": {k: summ.get(k) for k in ("backend", "workers", "n", "n_failed", "wall_s", "tasks")}, "path": out}
 
 
 def verify_rows(rows: list[dict], jobs: list[dict], engine) -> tuple[dict, list[str]]:
@@ -676,7 +736,39 @@ def _self_test() -> int:
             ok(r and not called, f"BA8 an adoption recorded on another platform is refused before its replay "
                                  f"recomputes anything (the re-run's 1.4% sample): {why}; replays run {len(called)}")
             ok(ADOPT_RTOL == 1e-6, "BA9 the adoption tolerance is unchanged (1e-6)")
+            m = {"per_capita": {"x": 1.0}, "meta": {"seconds": 1, "fork_year": 2020.0, "burnin_members": 4}}
+            ok(_same(m, {"per_capita": {"x": 1.0}, "meta": {"seconds": 2, "fork_year": 2024.0, "burnin_members": 1}},
+                     ADOPT_RTOL) and not _same(m, {"per_capita": {"x": 1.1}, "meta": m["meta"]}, ADOPT_RTOL),
+               "BA13 (review P2) a replay run alone matches a grouped row: fork point and group size are not outputs")
         case("BA8", b8)
+
+        def b10():
+            from toolkit.engines.benchmark import SharedStateToy
+            ref = "toolkit.engines.benchmark:SharedStateToy"
+            sj = [dict(j, engine=ref) for j in jobs0 if j["point"] in (0, 1)]
+            groups = g["point_groups"](sj)
+            SharedStateToy.calls.clear()
+            rows = [r for gr in groups for r in g["run_point"](gr)["rows"]]
+            flat = [j for gr in groups for j in gr["jobs"]]
+            npk = len(design0["packages"])
+            ok(len(groups) == 2 and SharedStateToy.calls == [npk, npk] and len(rows) == len(sj)
+               and sorted(j["id"] for j in flat) == sorted(j["id"] for j in sj)
+               and all(r["provenance"]["job_sha"] == job_sha(j) and r["result"] == run_job(j)["result"]
+                       for r, j in zip(rows, flat)),
+               f"BA10 for an engine whose packages share a starting state, one point's jobs run in one run_batch call "
+               f"(batch sizes {SharedStateToy.calls}); each row keeps its job's provenance and equals run_job")
+            ok(g["shares_state"](SharedStateToy()) and not g["shares_state"](eng),
+               "BA11 other engines keep one compute task per job")
+            rd = os.path.join(d, "shared_run")
+            os.makedirs(rd)
+            b = g["run"](rd, sj, SharedStateToy(), max_workers=1)
+            res, probs = load_results(b["path"], sj, SharedStateToy())
+            ok(not b["problems"] and len(b["results"]) == len(sj) and res == b["results"] and not probs
+               and b["summary"]["tasks"] == 2 and b["summary"]["n"] == len(sj)
+               and all(b["results"][j["id"]] == run_job(j)["result"] for j in sj),
+               f"BA12 run() computes one task per point and writes per-job rows that load_results accepts: "
+               f"{b['summary']}, {probs[:2]}")
+        case("BA10", b10)
     if fails:
         print(f"FAILED: {len(fails)} self-test case(s)")
         return 1

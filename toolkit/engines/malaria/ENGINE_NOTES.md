@@ -1,11 +1,66 @@
-# Malaria engine v0.4: benchmark notes
+# Malaria engine v0.5: benchmark notes
 
-Engine `malaria-starsim` v0.4 (workstream A of architecture v2). Design note:
+Engine `malaria-starsim` v0.5 (workstream A of architecture v2). Design note:
 `docs/design/v2a-malaria-engine.md`. Every number in the tables block is rendered from
-`benchmarks/results.yaml`, `benchmarks/fitted.yaml` and `benchmarks/b15_mechanisms.yaml`,
-with the spike (`history/results_v0.1-spike.yaml`) and the earlier rounds (`history/results_v0.2.yaml`,
-`results_v0.3-r2.yaml`, `results_v0.3.yaml`) beside them, by `benchmarks/render_notes.py`. Reproduce with
-`bash toolkit/engines/malaria/benchmarks/validate_once.sh` on a VM.
+`benchmarks/results.yaml`, `benchmarks/fitted.yaml`, `benchmarks/b15_mechanisms.yaml`,
+`benchmarks/equilibration.yaml` and `benchmarks/runtime.yaml`, with the spike
+(`history/results_v0.1-spike.yaml`) and the earlier rounds (`history/results_v0.2.yaml`,
+`results_v0.3-r2.yaml`, `results_v0.3.yaml`, `results_v0.4.yaml`) beside them, by
+`benchmarks/render_notes.py`. Reproduce with `bash toolkit/engines/malaria/benchmarks/validate_once.sh` on a VM.
+
+## v0.5 scope: an equilibrated starting state (written before the v0.5 pack run)
+
+**The problem.** Up to v0.4 every run started at horizon.start with immunity set by a
+closed-form approximation from a guessed EIR (`init_eir = min(0.6 m0, 150)`). Immunity
+decays over 30 years (IC, IV) and 10 years (IB, ID), so that start is far from the
+engine's own equilibrium for adults. A diagnostic against a 60-year no-intervention
+burn-in, at under-5 PfPR 5–45%, found:
+- adult IC and ID at 2021 were 1.2–2 times too low, and still 0.65–0.92 of equilibrium
+  inside a 2024–27 decision window;
+- adult cases were overstated by 30–100%, and adult severe cases and deaths by up to 2 times;
+- under-5 burden, the calibration to under-5 PfPR and DALYs averted changed by less than
+  10% (no package ranking that matters changed);
+- but the `treated_all` cost driver counts all ages, and it feeds a per-outcome cost item,
+  so treatment costs and cases averted at all ages were biased.
+
+**The change (no fitted factor; B7, B8 and B16c stay held out).**
+- **Burn-in.** Each run starts `burnin_years` (card parameter, default 50; source: the
+  equilibration evidence below) before horizon.start, with no vector control or
+  chemoprevention and case management at the unit's `cm_ft`. The closed-form guess
+  (`init_eir_per_m0`, 0.6) now sets only the state at the start of the burn-in.
+- **Population.** The burn-in starts with n_agents exp(−0.0269 × burnin_years) people
+  (births 37, deaths 11 per 1,000 per year), which grows to n_agents at horizon.start,
+  in expectation, as in the diagnostic. Transmission is per person, so the smaller early
+  population changes noise, not intensity (the diagnostic found the same adult immunity
+  with 4,000 people from the first year).
+- **Shared by packages.** `run_batch()` runs the burn-in and the unit's own history once per
+  (unit, seed, burn-in parameters) and copies the sim exactly for each package at the
+  first step any package's component acts (the decision start at the latest). Every
+  package therefore has an identical history (common random numbers), and a package run
+  alone gives the same outcomes as in a batch. Parameter sets that differ only in
+  parameters that act after the fork (IRS, SMC, dual-AI chlorfenapyr kill, enhanced case
+  management, severe-case and DALY accounting) share one burn-in, so the joint fit's design
+  points share it too.
+- **Callers batch.** The benchmark runner sends one setting's arms per seed to
+  `run_batch()`, and the analysis batch sends one design point's packages per task, for an
+  engine that declares `batch_shares_state`.
+- **Declaration.** Every benchmark pack now declares its engine's initialisation method
+  and its equilibration evidence (`initialisation: {method, evidence}`, checked by the
+  runner; disease-agnostic). The malaria pack's evidence is `equilibration.yaml`; the
+  compartmental pack's is its initialiser benchmarks.
+
+**Tests written first.** Engine V1–V8 (burn-in parameter; population grows to n_agents;
+identical pre-start history across packages; a package alone equals the same package in a
+batch; post-fork parameters share a burn-in; independence from the starting guess; the
+doubling check), runner BP53–BP57, batch BA10–BA12, equilibration Q1–Q6, renderer R2.
+
+**Expected outcome.** Adult immunity at horizon.start rises toward equilibrium, with
+fewer adult cases. Under-5 calibrations move little. Effect ratios on child outcomes should
+move little, and so should B7's under-5 components. B7's all-age components (Rowland,
+Sochantha) may move: with more adult immunity, adult prevalence responds less to nets, and
+v0.4's gap was in exactly that age pattern. No magnitude is predicted. The cost-per-DALY
+benchmarks (B17–B20) may move a little through adult DALYs; their costs do not include
+treatment.
 
 ## v0.4 scope (written and pushed before any v0.4 pack run)
 
@@ -162,74 +217,174 @@ Benchmark pack:
   (chlorfenapyr kill, IRS kill), on the same 8 seeds as the final run.
 
 <!-- tables:start -->
-### Benchmark pack: spike v0.1, earlier rounds and v0.4 (this run)
+### Benchmark pack: spike v0.1, earlier rounds and v0.5 (this run)
 
-| ID | Benchmark | Target (band) | v0.1 spike | v0.2 (round 1) | v0.3 round 2 | v0.3 | v0.4 | v0.4 seed range | v0.4 status | Role |
-|---|---|---|---|---|---|---|---|---|---|---|
-| B7 | ITN (pyrethroid) vs none, prevalence RR at 12 m (trials' own age bands) | 0.83 (0.68–0.98) | 0.735 (in band) | 0.578 (**out of band**) | 0.642 (**out of band**) | 0.595 (**out of band**) | 0.589 | 0.57–0.609 | **out of band** | held_out |
-| B8 | ITN vs none, clinical incidence RR 0-24 m (under 5) | 0.55 (0.46–0.64) | 0.578 (in band) | 0.45 (**out of band**) | 0.54 (in band) | 0.462 (in band) | 0.462 | 0.436–0.505 | in band | held_out |
-| B9 | PBO vs pyrethroid nets (no IRS), prevalence OR at 9 m | 0.37 (0.09–0.65) | 0.798 (**out of band**) | 0.506 (in band) | 0.377 (in band) | 0.36 (in band) | 0.36 | 0.342–0.406 | in band | held_out |
-| B9b | PBO vs pyrethroid nets (no IRS), prevalence OR at 21 m | 0.4 (0.2–0.81) | 0.953 (**out of band**) | 0.691 (in band) | 0.797 (in band) | 0.662 (in band) | 0.662 | 0.638–0.694 | in band | held_out |
-| B9c | PBO vs pyrethroid nets, prevalence aOR at 24 m (Misungwi) | 0.99 (0.67–1.45) | 0.993 (in band) | 0.75 (in band) | 0.865 (in band) | 0.705 (in band) | 0.705 | 0.666–0.732 | in band | held_out |
-| B10 | Dual-AI vs pyrethroid nets, prevalence OR at 24 m | 0.45 (0.23–0.67) | 0.688 (**out of band**) | 0.642 (in band) | 0.667 (in band) | 0.665 (in band) | 0.665 | 0.604–0.739 | in band | fit |
-| B11 | Dual-AI vs pyrethroid nets, incidence RR 0-24 m | 0.54 (0.38–0.7) | 0.402 (in band) | 0.501 (in band) | 0.504 (in band) | 0.511 (in band) | 0.511 | 0.481–0.537 | in band | fit |
-| B12 | Non-pyrethroid IRS added to ITN, prevalence RR at 12 m | 0.61 (0.34–0.88) | 0.878 (in band) | 0.786 (in band) | 0.807 (in band) | 0.8 (in band) | 0.8 | 0.759–0.85 | in band | fit |
-| B12b | Non-pyrethroid IRS added to ITN, incidence RR 0-24 m | 0.86 (0.49–1.23) | 0.746 (in band) | 0.576 (in band) | 0.59 (in band) | 0.574 (in band) | 0.574 | 0.534–0.63 | in band | fit |
-| B12m | Pirimiphos-methyl IRS added to pyrethroid nets (Muleba), prevalence OR at 9 m | 0.33 (0.19–0.55) | n/a | 0.427 (in band) | 0.445 (in band) | 0.451 (in band) | 0.451 | 0.429–0.48 | in band | fit |
-| B13 | SMC, in-season clinical incidence RR (3-59 m) | 0.27 (0.14–0.4) | 0.346 (in band) | 0.353 (in band) | 0.361 (in band) | 0.355 (in band) | 0.355 | 0.344–0.366 | in band | held_out |
-| B15 | ITN x IRS interaction OR (PBO x IRS, prevalence at 9 m, 2x2 factorial) | 2.43 (1.19–4.97) | 0.982 (in band) | 1.4 (in band) | 1.44 (in band) | 1.48 (in band) | 1.48 | 1.36–1.53 | in band | held_out |
-| B16c | EIR-prevalence curve (Beier 1999 rules: EIR > 15 -> PfPR >= 50%; EIR >= 200 -> PfPR > 80%) | rules | 4/5 rules (**out of band**) | 4/5 rules (**out of band**) | 4/5 rules (**out of band**) | 4/5 rules (**out of band**) | 4/5 rules | per seed: 4/5, 4/5, 4/5, 4/5, 4/5, 4/5, 4/5, 4/5 | **out of band** | held_out |
-| B17 | SMC $ per DALY averted (reference setting) | 38.4 (7.67–192) | 18.3 (in band) | 18.8 (in band) | 18.1 (in band) | 18.1 (in band) | 18.1 | 16.4–20.2 | in band | held_out |
-| B18 | ITN vs none $ per DALY averted (reference setting) | 44.5 (8.9–223) | 57.3 (in band) | 14.2 (in band) | 23.2 (in band) | 19.1 (in band) | 19.1 | 17.3–22.3 | in band | held_out |
-| B19 | IRS vs none $ per DALY averted (reference setting) | 25.2 (5.03–126) | 370 (**out of band**) | 115 (in band) | 122 (in band) | 114 (in band) | 114 | 107–118 | in band | held_out |
-| B20 | Dual-AI vs pyrethroid nets, incremental $ per DALY averted (high resistance) | 19 (3.8–95) | 3.63 (**out of band**) | 4.16 (in band) | 4.33 (in band) | 4.89 (in band) | 4.89 | 4.25–5.92 | in band | held_out |
+| ID | Benchmark | Target (band) | v0.1 spike | v0.2 (round 1) | v0.3 round 2 | v0.3 | v0.4 | v0.5 | v0.5 seed range | v0.5 status | Role |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| B7 | ITN (pyrethroid) vs none, prevalence RR at 12 m (trials' own age bands) | 0.83 (0.68–0.98) | 0.735 (in band) | 0.578 (**out of band**) | 0.642 (**out of band**) | 0.595 (**out of band**) | 0.589 (**out of band**) | 0.578 | 0.538–0.6 | **out of band** | held_out |
+| B8 | ITN vs none, clinical incidence RR 0-24 m (under 5) | 0.55 (0.46–0.64) | 0.578 (in band) | 0.45 (**out of band**) | 0.54 (in band) | 0.462 (in band) | 0.462 (in band) | 0.449 | 0.405–0.474 | **out of band** | held_out |
+| B9 | PBO vs pyrethroid nets (no IRS), prevalence OR at 9 m | 0.37 (0.09–0.65) | 0.798 (**out of band**) | 0.506 (in band) | 0.377 (in band) | 0.36 (in band) | 0.36 (in band) | 0.359 | 0.31–0.396 | in band | held_out |
+| B9b | PBO vs pyrethroid nets (no IRS), prevalence OR at 21 m | 0.4 (0.2–0.81) | 0.953 (**out of band**) | 0.691 (in band) | 0.797 (in band) | 0.662 (in band) | 0.662 (in band) | 0.67 | 0.627–0.697 | in band | held_out |
+| B9c | PBO vs pyrethroid nets, prevalence aOR at 24 m (Misungwi) | 0.99 (0.67–1.45) | 0.993 (in band) | 0.75 (in band) | 0.865 (in band) | 0.705 (in band) | 0.705 (in band) | 0.7 | 0.664–0.775 | in band | held_out |
+| B10 | Dual-AI vs pyrethroid nets, prevalence OR at 24 m | 0.45 (0.23–0.67) | 0.688 (**out of band**) | 0.642 (in band) | 0.667 (in band) | 0.665 (in band) | 0.665 (in band) | 0.649 | 0.587–0.694 | in band | fit |
+| B11 | Dual-AI vs pyrethroid nets, incidence RR 0-24 m | 0.54 (0.38–0.7) | 0.402 (in band) | 0.501 (in band) | 0.504 (in band) | 0.511 (in band) | 0.511 (in band) | 0.501 | 0.467–0.535 | in band | fit |
+| B12 | Non-pyrethroid IRS added to ITN, prevalence RR at 12 m | 0.61 (0.34–0.88) | 0.878 (in band) | 0.786 (in band) | 0.807 (in band) | 0.8 (in band) | 0.8 (in band) | 0.802 | 0.723–0.849 | in band | fit |
+| B12b | Non-pyrethroid IRS added to ITN, incidence RR 0-24 m | 0.86 (0.49–1.23) | 0.746 (in band) | 0.576 (in band) | 0.59 (in band) | 0.574 (in band) | 0.574 (in band) | 0.572 | 0.553–0.598 | in band | fit |
+| B12m | Pirimiphos-methyl IRS added to pyrethroid nets (Muleba), prevalence OR at 9 m | 0.33 (0.19–0.55) | n/a | 0.427 (in band) | 0.445 (in band) | 0.451 (in band) | 0.451 (in band) | 0.449 | 0.405–0.482 | in band | fit |
+| B13 | SMC, in-season clinical incidence RR (3-59 m) | 0.27 (0.14–0.4) | 0.346 (in band) | 0.353 (in band) | 0.361 (in band) | 0.355 (in band) | 0.355 (in band) | 0.358 | 0.348–0.374 | in band | held_out |
+| B15 | ITN x IRS interaction OR (PBO x IRS, prevalence at 9 m, 2x2 factorial) | 2.43 (1.19–4.97) | 0.982 (in band) | 1.4 (in band) | 1.44 (in band) | 1.48 (in band) | 1.48 (in band) | 1.49 | 1.29–1.72 | in band | held_out |
+| B16c | EIR-prevalence curve (Beier 1999 rules: EIR > 15 -> PfPR >= 50%; EIR >= 200 -> PfPR > 80%) | rules | 4/5 rules (**out of band**) | 4/5 rules (**out of band**) | 4/5 rules (**out of band**) | 4/5 rules (**out of band**) | 4/5 rules (**out of band**) | 4/5 rules | per seed: 4/5, 4/5, 4/5, 4/5, 4/5, 4/5, 4/5, 4/5 | **out of band** | held_out |
+| B17 | SMC $ per DALY averted (reference setting) | 38.4 (7.67–192) | 18.3 (in band) | 18.8 (in band) | 18.1 (in band) | 18.1 (in band) | 18.1 (in band) | 19 | 17.2–21.1 | in band | held_out |
+| B18 | ITN vs none $ per DALY averted (reference setting) | 44.5 (8.9–223) | 57.3 (in band) | 14.2 (in band) | 23.2 (in band) | 19.1 (in band) | 19.1 (in band) | 19.5 | 16.9–24.6 | in band | held_out |
+| B19 | IRS vs none $ per DALY averted (reference setting) | 25.2 (5.03–126) | 370 (**out of band**) | 115 (in band) | 122 (in band) | 114 (in band) | 114 (in band) | 119 | 114–132 | in band | held_out |
+| B20 | Dual-AI vs pyrethroid nets, incremental $ per DALY averted (high resistance) | 19 (3.8–95) | 3.63 (**out of band**) | 4.16 (in band) | 4.33 (in band) | 4.89 (in band) | 4.89 (in band) | 4.58 | 3.87–8.27 | in band | held_out |
 
-v0.4: 15 in band, 2 out of band, 0 not assessable, 0 band mis-based, of 17 (10 of 12 held-out in band). 298 engine runs, 8 seeds per arm (common random numbers). v0.1: 10 of 16 in band.
-- B7 by outcome definition (geometric mean of these): Halbluetzel 1996 (0-59 months) 0.5585; Moyou-Somo 1995 (15 and under) 0.5979; Rowland 1996 (all ages) 0.6025; Smithuis 2013 (under 10) 0.5836; Sochantha 2006 (all ages) 0.6025. Diagnostic, not judged: windows.m12.pfpr_6m14y 0.5953.
-- B15 requires {'B9': [0.21, 0.65], 'B12m': [0.19, 0.55]}; computed B9 0.3596, B12m 0.4513.
-- B15 arms (OR vs standard LLIN): PBO alone 0.3596, IRS alone 0.4513, both 0.2396; prevalence {'a00': 0.564, 'a10': 0.3175, 'a01': 0.3686, 'a11': 0.2366}.
-- B19: the target 25.2 is below the price floor 64.1 per DALY (cost per person divided by ALL the comparator's DALYs per person): no intervention can reach the target value at the pack's price; only the band's upper part is reachable. The band's basis (price or setting) differs from the decision's.
-- B19: price floor 64.1 per DALY (cost 24.5 per person over the comparator's 0.383 DALYs per person), below the band's upper edge 126; meeting the band would need 50.9% of all DALYs averted; the engine averts 56.3%.
+v0.5: 14 in band, 3 out of band, 0 not assessable, 0 band mis-based, of 17 (9 of 12 held-out in band). 298 engine runs, 8 seeds per arm (common random numbers). v0.1: 10 of 16 in band.
+- B7 by outcome definition (geometric mean of these): Halbluetzel 1996 (0-59 months) 0.5589; Moyou-Somo 1995 (15 and under) 0.5828; Rowland 1996 (all ages) 0.5849; Smithuis 2013 (under 10) 0.581; Sochantha 2006 (all ages) 0.5849. Diagnostic, not judged: windows.m12.pfpr_6m14y 0.5827.
+- B15 requires {'B9': [0.21, 0.65], 'B12m': [0.19, 0.55]}; computed B9 0.3594, B12m 0.4492.
+- B15 arms (OR vs standard LLIN): PBO alone 0.3595, IRS alone 0.4492, both 0.2406; prevalence {'a00': 0.5674, 'a10': 0.3205, 'a01': 0.3708, 'a11': 0.24}.
+- B19: the target 25.2 is below the price floor 67.7 per DALY (cost per person divided by ALL the comparator's DALYs per person): no intervention can reach the target value at the pack's price; only the band's upper part is reachable. The band's basis (price or setting) differs from the decision's.
+- B19: price floor 67.7 per DALY (cost 24.8 per person over the comparator's 0.367 DALYs per person), below the band's upper edge 126; meeting the band would need 53.8% of all DALYs averted; the engine averts 56.9%.
 
 Calibrated transmission per setting (value, grid; a value at an outer grid bound is flagged):
 
-cochrane_itn m0 13.3 on [4, 8, 16, 32, 64]; muleba m0 127.6 on [8, 16, 32, 64, 128, 256]; misungwi m0 11.94 on [8, 16, 32, 64, 128]; benin m0 13.33 on [4, 8, 16, 32, 64]; irs_added m0 28.66 on [8, 16, 32, 64, 128]; sahel_smc m0 24.55 on [4, 8, 16, 32, 64]; ce_ref m0 17.37 on [4, 8, 16, 32, 64]; ce_res m0 17.37 on [4, 8, 16, 32, 64].
+cochrane_itn m0 13.47 on [4, 8, 16, 32, 64]; muleba m0 127.4 on [8, 16, 32, 64, 128, 256]; misungwi m0 12.28 on [8, 16, 32, 64, 128]; benin m0 13.45 on [4, 8, 16, 32, 64]; irs_added m0 29.06 on [8, 16, 32, 64, 128]; sahel_smc m0 23.55 on [4, 8, 16, 32, 64]; ce_ref m0 17.31 on [4, 8, 16, 32, 64]; ce_res m0 17.31 on [4, 8, 16, 32, 64].
 
 Fitted engine-level parameters (fit rule `joint-v1`, seeds [11, 12, 13, 14, 15, 16, 17, 18], 25 design points):
 
 | Parameter | Value | Range (all feasible targets in band) | Box | Fitted to |
 |---|---|---|---|---|
-| cfp_kill | 0.425 | 0.415–0.575 | [0.0, 0.8] | B10, B11, B12, B12b, B12m |
-| irs_kill | 0.421563 | 0.3028–0.5403 | [0.0, 0.95] | B10, B11, B12, B12b, B12m |
+| cfp_kill | 0.43 | 0.41–0.58 | [0.0, 0.8] | B10, B11, B12, B12b, B12m |
+| irs_kill | 0.415625 | 0.3087–0.5284 | [0.0, 0.95] | B10, B11, B12, B12b, B12m |
 
-Feasibility before fitting: infeasible in the box: none; conflicting pairs: none; all feasible targets in band at the value: True. Surrogate leave-one-out error (log scale): B10 0.0129, B11 0.0167, B12 0.0118, B12b 0.0128, B12m 0.0236.
-Verification at the value (re-run, re-calibrated): B10 0.6646 (surrogate 0.6626, in), B11 0.5113 (surrogate 0.4975, in), B12 0.7997 (surrogate 0.8005, in), B12b 0.5742 (surrogate 0.5756, in), B12m 0.4513 (surrogate 0.4435, in).
+Feasibility before fitting: infeasible in the box: none; conflicting pairs: none; all feasible targets in band at the value: True. Surrogate leave-one-out error (log scale): B10 0.0146, B11 0.024, B12 0.0121, B12b 0.0187, B12m 0.0164.
+Verification at the value (re-run, re-calibrated): B10 0.6491 (surrogate 0.6537, in), B11 0.5013 (surrogate 0.4983, in), B12 0.8017 (surrogate 0.7997, in), B12b 0.5716 (surrogate 0.5726, in), B12m 0.4492 (surrogate 0.4477, in).
 
-### B15 by mechanism (Muleba 2×2, 9 months; re-calibrated per row; fitted parameters fixed)
+### Equilibration of the starting state (burn-in 50 y; 6 seeds, 4000 agents, state at 2050.0)
 
-| Configuration | PBO alone OR | IRS alone OR | Both OR | Interaction OR | Seed range | Single arms in trial CI |
-|---|---|---|---|---|---|---|
-| Trial (Protopopoff 2018) | 0.37 | 0.33 | 0.29 | 2.43 | CI 1.19–4.97 | |
-| hut coefficients only (no household, no diversion, short IRS) | 0.3584 | 0.6795 | 0.2848 | 1.17 | 1.0025–1.3714 | no |
-| + IRS long-lasting product decay (alone) | 0.3584 | 0.4049 | 0.2199 | 1.515 | 1.4021–1.6347 | yes |
-| + IRS diversion to outdoor biting 0.5 (alone) | 0.3584 | 0.7057 | 0.3015 | 1.192 | 1.0591–1.3247 | no |
-| + household net-use clustering 0.5 and net x IRS correlation 0.3 (alone) | 0.3584 | 0.6929 | 0.2832 | 1.141 | 1.0531–1.268 | no |
-| + exposure correlated with net non-use 0.2 (alone) | 0.353 | 0.6653 | 0.279 | 1.188 | 1.0392–1.3688 | no |
-| all together (engine defaults) | 0.3596 | 0.4513 | 0.2396 | 1.476 | 1.3581–1.5301 | yes |
-| all together, high correlations (0.9, 0.9, 0.6) | 0.3623 | 0.5105 | 0.2571 | 1.39 | 1.2079–1.5718 | yes |
-| all together, full diversion (1.0) | 0.3596 | 0.4997 | 0.264 | 1.469 | 1.12–1.6264 | yes |
-| all together, high correlations and full diversion | 0.3623 | 0.5654 | 0.2795 | 1.364 | 1.1883–1.5794 | no |
+Seed means at horizon.start. Doubled: twice the burn-in. Guess x0.25 / x4: the card's burn-in from a closed-form immunity guess 4x lower or higher. None: no burn-in (the v0.4 start). Criterion: within 5% for IC, ID in bands 15_30, 30p, 15p.
 
-### Field-use mechanisms, each alone and together (nets vs none, B7/B8; Muleba B9/B15)
+| m0 | PfPR 6-59 m | Quantity | Band | Burn-in | Doubled | Change | Guess x0.25 | Guess x4 | Difference | None (v0.4 start) | None / burn-in |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1.5 | 0.123 | IC | 15_30 | 10.3 | 10.6 | +2.6% | 10.6 | 10.3 | +2.8% | 4.52 | 0.439 |
+| 1.5 | 0.123 | IC | 30p | 18.1 | 18.7 | +3.7% | 17.9 | 18.7 | -4.5% | 7.59 | 0.42 |
+| 1.5 | 0.123 | IC | 15p | 14.7 | 15.3 | +4.0% | 14.7 | 15.1 | -2.3% | 6.2 | 0.423 |
+| 1.5 | 0.123 | ID | 15_30 | 6.16 | 6.33 | +2.8% | 6.39 | 6.25 | +2.1% | 2.57 | 0.417 |
+| 1.5 | 0.123 | ID | 30p | 7.69 | 7.81 | +1.5% | 7.78 | 7.71 | +0.9% | 3.17 | 0.412 |
+| 1.5 | 0.123 | ID | 15p | 7.02 | 7.18 | +2.2% | 7.17 | 7.07 | +1.4% | 2.9 | 0.413 |
+| 3.5 | 0.242 | IC | 15_30 | 24.4 | 24.8 | +1.4% | 24.3 | 24 | +1.5% | 10.5 | 0.429 |
+| 3.5 | 0.242 | IC | 30p | 41.1 | 42.2 | +2.7% | 40.5 | 43.3 | -6.5% | 17.7 | 0.431 |
+| 3.5 | 0.242 | IC | 15p | 33.8 | 34.7 | +2.9% | 33.4 | 34.8 | -4.1% | 14.4 | 0.427 |
+| 3.5 | 0.242 | ID | 15_30 | 14.1 | 14.4 | +1.7% | 14.1 | 14 | +1.0% | 5.9 | 0.418 |
+| 3.5 | 0.242 | ID | 30p | 17 | 16.9 | -0.4% | 17 | 17.3 | -1.9% | 7.36 | 0.434 |
+| 3.5 | 0.242 | ID | 15p | 15.7 | 15.8 | +0.7% | 15.7 | 15.8 | -0.8% | 6.7 | 0.426 |
+| 9.0 | 0.404 | IC | 15_30 | 51.9 | 50.9 | -1.9% | 52.2 | 51.7 | +1.0% | 26.5 | 0.51 |
+| 9.0 | 0.404 | IC | 30p | 87.5 | 89.1 | +1.8% | 85 | 91.4 | -7.0% | 45.1 | 0.515 |
+| 9.0 | 0.404 | IC | 15p | 72 | 72.8 | +1.2% | 70.6 | 74 | -4.6% | 36.7 | 0.51 |
+| 9.0 | 0.404 | ID | 15_30 | 29 | 28.4 | -2.0% | 29 | 28.9 | +0.4% | 14.9 | 0.515 |
+| 9.0 | 0.404 | ID | 30p | 34.9 | 34.7 | -0.6% | 34.1 | 34.5 | -1.0% | 18.6 | 0.534 |
+| 9.0 | 0.404 | ID | 15p | 32.3 | 32 | -1.0% | 31.9 | 32 | -0.5% | 17 | 0.525 |
+| 28.0 | 0.534 | IC | 15_30 | 108 | 106 | -2.1% | 109 | 110 | -0.9% | 78.9 | 0.73 |
+| 28.0 | 0.534 | IC | 30p | 183 | 187 | +2.0% | 179 | 196 | -8.6% | 135 | 0.735 |
+| 28.0 | 0.534 | IC | 15p | 150 | 152 | +1.3% | 149 | 159 | -6.3% | 109 | 0.727 |
+| 28.0 | 0.534 | ID | 15_30 | 57.3 | 56.3 | -1.8% | 57.8 | 58.3 | -1.0% | 43.1 | 0.751 |
+| 28.0 | 0.534 | ID | 30p | 69 | 69.2 | +0.3% | 68.9 | 69 | -0.1% | 53.9 | 0.781 |
+| 28.0 | 0.534 | ID | 15p | 63.9 | 63.7 | -0.3% | 64 | 64.3 | -0.5% | 49 | 0.767 |
 
-| Configuration | B7 (0.68–0.98) | B8 (0.46–0.64) | B9 (0.09–0.65) | B15 (1.19–4.97) | B15 arms: PBO / IRS / both |
+Criterion: NOT met: init_guess: m0 3.5: IC 30p differs -6.5% between the x0.25 and x4 guesses; init_guess: m0 9.0: IC 30p differs -7.0% between the x0.25 and x4 guesses; init_guess: m0 28.0: IC 30p differs -8.6% between the x0.25 and x4 guesses; init_guess: m0 28.0: IC 15p differs -6.3% between the x0.25 and x4 guesses
+
+### Per-run cost (runtime.yaml: 4000 agents, horizon 2016.0-2027.0, 4 packages per point, 6 points, one core each)
+
+| Start | CPU s per point | CPU s per package run | Relative to v0.4 | Wall s per point | Peak memory (MB) |
 |---|---|---|---|---|---|
-| hut-like nets (no attrition, full use given access, no holes) | 0.4624 [0.4193–0.4781] **out** | 0.2736 [0.2613–0.2884] **out** | 0.4092 [0.3542–0.4616] | 1.3969 [1.1976–1.5867] | 0.4092 / 0.438 / 0.2504 |
-| + attrition alone (median retention 1.64 y) | 0.6034 [0.5867–0.6296] **out** | 0.4871 [0.476–0.512] | 0.3916 [0.3506–0.4214] | 1.4014 [1.3226–1.566] | 0.3916 / 0.4553 / 0.2499 |
-| + use below access alone (use rate 0.871, half persistent) | 0.4391 [0.4235–0.4664] **out** | 0.2524 [0.2318–0.2729] **out** | 0.3775 [0.3413–0.4105] | 1.519 [1.3418–1.7325] | 0.3775 / 0.4373 / 0.2508 |
-| + holes alone (Briet 2020) | 0.456 [0.4073–0.4779] **out** | 0.264 [0.2355–0.2882] **out** | 0.405 [0.3834–0.4381] | 1.4404 [1.3338–1.5521] | 0.405 / 0.4405 / 0.257 |
-| all field mechanisms (engine defaults) | 0.5888 [0.5701–0.6088] **out** | 0.4623 [0.4359–0.5047] | 0.3596 [0.3417–0.406] | 1.4765 [1.3581–1.5301] | 0.3596 / 0.4513 / 0.2396 |
+| v0.4 start (no burn-in, one run per package) | 150.5 | 37.6 | 1.00x | 150 | 441 |
+| v0.5: one burn-in per point, packages forked (run_batch) | 209.8 | 52.4 | 1.39x | 210 | 1,832 |
+| v0.5 without sharing (one burn-in per package run) | 577.7 | 144.4 | 3.84x | 578 | 1,005 |
 <!-- tables:end -->
+
+## Reading the results (v0.5: one fit and pack run at a 50-year burn-in)
+
+**Benchmarks: 14 of 17 in band, against 15 of 17 for v0.4.** Fitted values barely moved
+(cfp_kill 0.43 against 0.425; irs_kill 0.416 against 0.422). Every effect benchmark moved by
+3% or less.
+- **B8 left the band.** 0.449 against a floor of 0.46 (v0.4: 0.462, a marginal pass). The move
+  is −2.9%, about one standard error of the log ratio (0.018 to 0.019 per round). With more
+  adult immunity, fewer of the infections that nets prevent turn clinical. B8 stays held out,
+  and nothing was tuned toward it.
+- **B7 stays out of band:** 0.578 (v0.4: 0.589). The all-age components moved slightly away
+  from Sochantha's age pattern (all ages 0.585, under 5 0.559). The gap was predicted to point
+  at the human module, and an equilibrated start does not close it.
+- **B16c:** 4 of 5 rules, unchanged.
+- **Cost per DALY (B17–B20):** in band, within 5% of v0.4.
+- **Calibrated transmission:** m0 shifted by 4.1% or less at every site. Muleba is at 127.4 (grid
+  edge 256, not flagged).
+
+**Equilibration (equilibration.yaml), m0 1.5 to 28 (under-5 PfPR about 12% to 53%).**
+- **Doubling check:** after the 50-year burn-in, adult IC and ID by age band change by 4.0% or
+  less when the burn-in is doubled. This meets the 5% criterion at all four levels.
+- **The v0.4 start:** adult immunity was at 0.41–0.78 of equilibrium (the "None / burn-in"
+  column), the same deficit the diagnostic found.
+- **Starting guess, immunity:** adult IC 30+ still differs 6.5–8.6% between the x0.25 and x4
+  guesses at m0 3.5, 9 and 28 (IC 15+ 6.3% at m0 28). This misses the 5% criterion as first
+  written.
+  - It is residual memory of the burn-in's first cohort, not a second fixed point. A 70-year
+    burn-in brings the same spread to 1.8% or less, and both guesses approach the same value.
+  - The card's own guess (x1) is within 4% of the doubled burn-in.
+- **Starting guess, decision outputs (guess_sensitivity.yaml):** the x4 and x0.25 guesses move
+  under-5 PfPR in the calibration window, all-age cases and treated_all (2024–27, no package)
+  by 2.4% or less. DALYs averted by PBO nets plus enhanced case management move by 0.6% or
+  less, at m0 3.5, 9 and 28 over 6 seeds.
+  - These differences are within noise: the paired standard errors are 1–6%. The check
+    rules out large effects but cannot resolve effects of 1–2%.
+- **V7's criterion changed after the result was seen.** It was first written as adult immunity
+  within 5% between the two guesses. After the coordinator's review it now asks for decision
+  outputs within 3%, and the immunity spread is reported beside it but not judged. The
+  burn-in stays at 50 years (owner's default, coordinator's decision). The 70-year option
+  costs about 40% more burn-in time per point.
+
+**Two defects found while validating, both fixed.**
+- **Households (code review).** In v0.4, newborns never founded new households, so the mean
+  household size grew with the population: about 4-fold over a 50-year burn-in. Newborns now
+  found households as needed to keep the mean at hh_size (V9).
+- **Starsim before 1900.** Starsim 3.3.2's births and deaths do nothing in a sim that starts
+  before 1900, so a long burn-in kept its starting population. The 70-year run's 140-year arm
+  showed this. Such a start now fails closed (V2c), and the evidence runs are dated 2050.
+
+**Per-run cost and memory (runtime.yaml; one decision point; 4,000 agents; 2016–2027; four
+packages; one core per task).**
+
+| Start | CPU s per point | Relative to v0.4 | Peak memory per process |
+|---|---|---|---|
+| v0.4 start | 150 | 1.00x | 0.44 GB |
+| v0.5 shared (`run_batch`) | 210 | 1.39x | 1.8 GB |
+| v0.5 without sharing | 578 | 3.84x | 1.0 GB |
+
+- **Wall time** equals CPU time: one core, single-threaded.
+- **Where the time goes:** the burn-in, and the shared history to the decision start in
+  2024, cost about 135–160 s once per point. Each package then costs about 10–19 s: 3 years
+  plus restoring the snapshot.
+- **Batches with more packages:** the cost per package falls as packages are added. A
+  32-package design point, as in the 13-state Nigeria batch (256 points × 32 packages =
+  8,192 runs), is estimated (not measured) at about 0.4–0.6 times v0.4's 32 × 37.6 s.
+- **Memory:** a shared-burn-in process holds the burn-in sim, its snapshot and one member,
+  about 1.8 GB at 4,000 agents. After the shrink fix, each further member adds tens of MB.
+  Before it, fit tasks with 50 members reached about 8 GB and broke the process pool twice.
+  - On E8-class workers (8 vCPU, 64 GiB), 8 processes per worker need about 15–25 GB.
+  - The benchmark fit and run used 24 processes on 128 GiB, peaking at about 41 GB.
+
+**The burn-in is not cached across runs.** `toolkit/analysis/batch.py` sends each design point's
+packages as one task (`run_point`), so the 32 packages of a point share one burn-in. The 256
+points each compute their own: each point has its own unit, m0, parameters and seed.
+
+**B15 mechanism scan: not re-run in full for v0.5.** The compute cap ended the job after 3 of
+its 14 configurations. v0.4's scan is kept in `history/b15_mechanisms_v0.4.yaml`. B15 itself
+was run in the pack: 1.49, in band.
+
+**Evidence provenance.** equilibration.yaml and guess_sensitivity.yaml were computed at commit
+d5652f8. The engine code since then differs only in releasing memory between forked members,
+which does not change any value: `run_batch` and `initial_state` give identical numbers, and
+the preliminary and final guess-sensitivity runs agreed to every digit. results.yaml and
+fitted.yaml were computed on the final code and verify against it.
 
 ## Reading the results (v0.4: one run of the committed scope)
 
