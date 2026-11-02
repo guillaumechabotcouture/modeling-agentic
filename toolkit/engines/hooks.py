@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""Optional engine hooks for figures: the delivery schedule and monthly series (v2 figures design note §5).
+
+    python3 toolkit/engines/hooks.py --self-test
+
+`toolkit/engines/contract.py` is part of every engine's code fingerprint, so a new method there would make every
+engine's benchmark stamps stale. These hooks are optional and live here instead. An engine offers a hook by defining
+the method; the harness calls it only through the functions below, which check the engine's answer and fail closed
+(`HookUnsupported` when the engine does not offer the hook, `HookInvalid` when its answer is malformed). Neither hook
+may change what `Engine.run` / `run_batch` return: an engine that adds them keeps every existing run byte-identical.
+
+Hook 1, the schedule (pure: no simulation, no random numbers):
+
+    engine.schedule(params: dict, unit: UnitSpec, package: Package, horizon: Horizon) -> list[dict]
+
+    One dict per delivery event of the unit in the arm `package`, over [horizon.start, horizon.window[1]):
+        component  str          a key of EngineCard.components (the engine's component, not the spec's)
+        label      str          what is delivered, in the engine's words (e.g. "campaign", "round")
+        kind       str          "history" (before the delivery period, every arm), "decision" (in the delivery
+                                period, paid by the decision; only when the package has the component) or
+                                "routine" (outside the delivery period, every arm, not paid by the decision)
+        t0         float        decimal year the event starts
+        t1         float|None   decimal year it ends (None for a point event)
+        charged    bool         paid by the decision (true exactly for kind "decision")
+    The engine computes it with the same code that configures its simulation, so the schedule cannot drift from what
+    the simulation delivers.
+
+Hook 2, monthly series (a separate method, so `run` / `run_batch` are untouched):
+
+    EngineCard.outputs["series"] = {metric: {"label": str, "units": str, "aggregate": "mean" | "rate"}}
+    engine.run_series(params: dict, unit: UnitSpec, packages: list[Package], horizon: Horizon, seed: int,
+                      metrics: list[str], step: str = "month") -> list[dict]
+
+    One dict per package, in the order given: {"package": Package.id, "t": [decimal year at the start of each step,
+    from horizon.start to horizon.window[1]], "values": {metric: [one value per step, per person]}}. "mean" is the
+    step mean of a state (a prevalence); "rate" is events per person-year over the step (an incidence). Metrics must
+    be listed in the card's outputs["series"]. Packages share their history as in run_batch (common random numbers).
+
+Nothing here names a disease, component or metric.
+"""
+from __future__ import annotations
+
+import math
+import os
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+KINDS = ("history", "decision", "routine")
+AGGREGATES = ("mean", "rate")
+STEPS = ("month",)
+
+
+class HookUnsupported(RuntimeError):
+    """The engine does not offer the hook (the figure that needs it is recorded as not produced, with this text)."""
+
+    def __init__(self, hook: str, engine):
+        card = engine.describe()
+        self.hook = hook
+        super().__init__(f"engine {card.name} v{card.version} does not offer {hook}() (toolkit/engines/hooks.py)")
+
+
+class HookInvalid(ValueError):
+    """The engine's answer does not have the documented shape."""
+
+
+def _num(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def supports(engine, hook: str) -> bool:
+    if hook == "schedule":
+        return callable(getattr(engine, "schedule", None))
+    if hook == "series":
+        return callable(getattr(engine, "run_series", None)) and bool(series_metrics(engine))
+    raise ValueError(f"unknown hook {hook!r}")
+
+
+def series_metrics(engine) -> dict:
+    """{metric: {label, units, aggregate}} from the card; {} when the engine declares none."""
+    s = (engine.describe().outputs or {}).get("series") or {}
+    return dict(s) if isinstance(s, dict) else {}
+
+
+def schedule(engine, params, unit, package, horizon) -> list[dict]:
+    """The engine's delivery schedule for one unit and arm, checked (fail closed)."""
+    if not supports(engine, "schedule"):
+        raise HookUnsupported("schedule", engine)
+    ev = engine.schedule(params, unit, package, horizon)
+    comps = set(engine.describe().components)
+    if not isinstance(ev, list):
+        raise HookInvalid(f"schedule() returned {type(ev).__name__}, not a list")
+    out, bad = [], []
+    for n, e in enumerate(ev):
+        if not isinstance(e, dict):
+            bad.append(f"event {n}: not a mapping")
+            continue
+        if e.get("component") not in comps:
+            bad.append(f"event {n}: component {e.get('component')!r} is not an engine component")
+        if e.get("kind") not in KINDS:
+            bad.append(f"event {n}: kind {e.get('kind')!r} is not one of {KINDS}")
+        if not _num(e.get("t0")) or not (e.get("t1") is None or (_num(e["t1"]) and e["t1"] >= e["t0"])):
+            bad.append(f"event {n}: t0 must be a number and t1 None or >= t0")
+        if not isinstance(e.get("charged"), bool) or e.get("charged") != (e.get("kind") == "decision"):
+            bad.append(f"event {n}: charged must be true exactly for kind decision")
+        if not str(e.get("label") or "").strip():
+            bad.append(f"event {n}: no label")
+        out.append({k: e.get(k) for k in ("component", "label", "kind", "t0", "t1", "charged")})
+    if bad:
+        raise HookInvalid("; ".join(bad[:5]))
+    return out
+
+
+def run_series(engine, params, unit, packages, horizon, seed, metrics, step="month") -> list[dict]:
+    """The engine's monthly series for one unit, its packages and one seed, checked (fail closed)."""
+    if not supports(engine, "series"):
+        raise HookUnsupported("run_series", engine)
+    known = series_metrics(engine)
+    miss = [m for m in metrics if m not in known]
+    if miss:
+        raise HookInvalid(f"metrics {miss} are not in the card's outputs['series'] ({sorted(known)})")
+    bad_agg = [m for m in metrics if (known[m] or {}).get("aggregate") not in AGGREGATES]
+    if bad_agg:
+        raise HookInvalid(f"metrics {bad_agg}: aggregate must be one of {AGGREGATES}")
+    if step not in STEPS:
+        raise HookInvalid(f"step {step!r} is not one of {STEPS}")
+    res = engine.run_series(params, unit, list(packages), horizon, int(seed), list(metrics), step)
+    if not isinstance(res, list) or len(res) != len(packages):
+        raise HookInvalid("run_series() must return one entry per package")
+    for p, r in zip(packages, res):
+        if not isinstance(r, dict) or r.get("package") != p.id:
+            raise HookInvalid(f"run_series(): entry for {p.id} missing or out of order")
+        t = r.get("t")
+        if not isinstance(t, list) or not t or not all(_num(x) for x in t) or any(b <= a for a, b in zip(t, t[1:])):
+            raise HookInvalid(f"run_series(): {p.id}: t must be increasing numbers")
+        if not (t[0] >= float(horizon.start) - 1e-9 and t[-1] < float(horizon.window[1]) + 1e-9):
+            raise HookInvalid(f"run_series(): {p.id}: t must lie in [horizon.start, window end)")
+        vals = r.get("values")
+        if not isinstance(vals, dict) or set(vals) != set(metrics):
+            raise HookInvalid(f"run_series(): {p.id}: values must hold exactly the requested metrics")
+        for m in metrics:
+            v = vals[m]
+            if not isinstance(v, list) or len(v) != len(t) or not all(_num(x) for x in v):
+                raise HookInvalid(f"run_series(): {p.id}.{m}: one finite value per step")
+    return res
+
+
+# --------------------------------------------------------------------------- self-test
+def _self_test() -> int:
+    from toolkit.engines.contract import EngineCard, Horizon, Package, ToyEngine, UnitSpec
+    fails = []
+
+    def ok(c, m):
+        print(("PASS " if c else "FAIL ") + m)
+        if not c:
+            fails.append(m)
+
+    class Hooked(ToyEngine):
+        def describe(self):
+            c = super().describe()
+            out = dict(c.outputs, series={"prev": {"label": "prevalence", "units": "share", "aggregate": "mean"}})
+            return EngineCard(**dict(c.to_dict(), outputs=out))
+
+        def schedule(self, params, unit, package, horizon):
+            ev = [{"component": "a", "label": "past round", "kind": "history", "t0": horizon.start, "t1": None,
+                   "charged": False}]
+            if package.components.get("a"):
+                ev.append({"component": "a", "label": "round", "kind": "decision", "t0": horizon.window[0],
+                           "t1": None, "charged": True})
+            return ev
+
+        def run_series(self, params, unit, packages, horizon, seed, metrics, step="month"):
+            n = int(round((horizon.window[1] - horizon.start) * 12))
+            t = [horizon.start + k / 12 for k in range(n)]
+            return [{"package": p.id, "t": t, "values": {m: [0.1] * n for m in metrics}} for p in packages]
+
+    h = Horizon(0.0, 3.0, (1.0, 3.0), {})
+    u = UnitSpec("u", {"x": 0.0})
+    pa, p0 = Package("a", {"a": 1}), Package("none", {})
+    plain = ToyEngine()
+    ok(not supports(plain, "schedule") and not supports(plain, "series"), "H1 the toy engine offers neither hook")
+    for hook, call in (("schedule", lambda: schedule(plain, {}, u, pa, h)),
+                       ("series", lambda: run_series(plain, {}, u, [pa], h, 1, ["prev"]))):
+        try:
+            call()
+            ok(False, f"H2 {hook}: an engine without the hook fails closed")
+        except HookUnsupported as e:
+            ok(f"{hook}()" in str(e) and "toy" in str(e), f"H2 {hook}: an engine without the hook fails closed: {e}")
+    E = Hooked()
+    s = schedule(E, {}, u, pa, h)
+    ok([x["kind"] for x in s] == ["history", "decision"] and s[1]["charged"], "H3 a valid schedule is returned")
+    ok([x["kind"] for x in schedule(E, {}, u, p0, h)] == ["history"], "H4 the comparator arm has no decision event")
+    r = run_series(E, {}, u, [p0, pa], h, 1, ["prev"])
+    ok([x["package"] for x in r] == ["none", "a"] and len(r[0]["t"]) == 36, "H5 a valid series is returned")
+
+    class Bad(Hooked):
+        def schedule(self, params, unit, package, horizon):
+            return [{"component": "zz", "label": "", "kind": "decision", "t0": 1.0, "t1": 0.5, "charged": False}]
+
+        def run_series(self, params, unit, packages, horizon, seed, metrics, step="month"):
+            return [{"package": p.id, "t": [0.0, 0.0], "values": {}} for p in packages]
+
+    for label, call, needle in (
+            ("H6 a malformed schedule is refused", lambda: schedule(Bad(), {}, u, pa, h), "not an engine component"),
+            ("H7 a malformed series is refused", lambda: run_series(Bad(), {}, u, [pa], h, 1, ["prev"]), "increasing"),
+            ("H8 a metric the card does not list is refused", lambda: run_series(E, {}, u, [pa], h, 1, ["inc"]),
+             "not in the card")):
+        try:
+            call()
+            ok(False, label)
+        except HookInvalid as e:
+            ok(needle in str(e), f"{label}: {e}")
+    print("OK: all self-test cases passed." if not fails else f"FAILED: {len(fails)} case(s)")
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        sys.exit(_self_test())
+    print(__doc__)
