@@ -19,6 +19,39 @@ LIVE_STATES = ("running", "ready", "pending", "starting", "scaling")
 WORKSPACE = "idm-coiled-idmad-r2"
 
 
+def ensure_bwrap(run=None, which=None, platform=None) -> str:
+    """Best effort: install bubblewrap, which the v2 derivation sandbox needs (scripts/pipeline.py sandbox_kind;
+    docs/design/v2-derived-inputs.md §7). The Coiled image has passwordless sudo and setpriv but no bwrap. Tries
+    `sudo -n apt-get install -y bubblewrap`, then again after `apt-get update`. Returns a one-line note for the
+    run's notes and never raises: without bwrap, a derivation that must run fails closed (derivation_unsandboxed),
+    and a run past sign-off only checks hashes. `run`/`which`/`platform` are for the self-test."""
+    import shutil
+    import subprocess
+    import sys
+    run = run or subprocess.run
+    which = which or shutil.which
+    platform = platform or sys.platform
+    if not platform.startswith("linux"):
+        return f"bwrap: not Linux ({platform}); no install"
+    if which("bwrap"):
+        return "bwrap: present"
+    if not which("sudo"):
+        return "bwrap: missing and no sudo; derivations that must run will fail closed"
+
+    def sh(*cmd):
+        try:
+            return run(["sudo", "-n", *cmd], capture_output=True, text=True, timeout=600).returncode
+        except Exception as e:  # noqa: BLE001 -- best effort
+            return f"{type(e).__name__}"
+    rc = sh("apt-get", "install", "-y", "bubblewrap")
+    if rc != 0:
+        sh("apt-get", "update")
+        rc = sh("apt-get", "install", "-y", "bubblewrap")
+    if rc == 0 and which("bwrap"):
+        return "bwrap: installed"
+    return f"bwrap: install failed ({rc}); derivations that must run will fail closed"
+
+
 def run_job_impl(label, code, question, flags, anthropic_key, openai_key, max_rounds=8, max_sessions=5):
     """Unpack the code, run main.py, return the run directory as a tarball."""
     import glob, io, os, shutil, subprocess, sys, tarfile, time, urllib.request
@@ -32,7 +65,7 @@ def run_job_impl(label, code, question, flags, anthropic_key, openai_key, max_ro
     # Phase 50 α: this fresh VM's work dir is the launch archive (no evals/, no .git), the only
     # place main.py lets an eval-suite question run (scripts/lib/eval_paths.py).
     env["MA_EVAL_ISOLATED"] = "cloud-worker"
-    notes = []
+    notes = [ensure_bwrap()]          # the v2 derivation sandbox (best effort; never fails the run)
     if openai_key:   # Codex CLI for the cross-model critic
         arch = "x86_64" if os.uname().machine in ("x86_64", "amd64") else "aarch64"
         url = (f"https://github.com/openai/codex/releases/download/rust-v{CODEX_VERSION}/"

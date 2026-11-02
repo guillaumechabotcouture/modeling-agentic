@@ -1491,6 +1491,46 @@ def _self_test_attach(ok) -> None:
     # replay_coiled.py is uploaded to the workers on its own (client.upload_file), so it cannot load
     # worker_side.py at import and keeps its own copy of the name: this check keeps the two equal.
     ok(WORKSPACE == ws.WORKSPACE == rq.WORKSPACE, "RC60f launcher, worker side and replay backend name one workspace")
+    _self_test_bwrap(ok)
+
+
+def _self_test_bwrap(ok) -> None:
+    """RC61: the agent VM's best-effort bubblewrap install (worker_side.ensure_bwrap), shell calls stubbed."""
+    from types import SimpleNamespace as NS
+
+    def case(present, rcs, platform="linux", sudo=True, raise_on=None):
+        calls, have = [], {"bwrap": present}
+
+        def which(name):
+            return "/usr/bin/" + name if (name == "sudo" and sudo) or (name == "bwrap" and have["bwrap"]) else None
+
+        def run(cmd, **k):
+            calls.append(" ".join(cmd[2:]))
+            if raise_on and raise_on in cmd:
+                raise OSError("no apt")
+            rc = rcs.pop(0) if rcs else 1
+            if rc == 0 and "install" in cmd:
+                have["bwrap"] = True
+            return NS(returncode=rc)
+        return ws.ensure_bwrap(run=run, which=which, platform=platform), calls
+    note, calls = case(True, [])
+    ok(note == "bwrap: present" and calls == [], f"RC61a bwrap present: nothing is run ({note}, {calls})")
+    note, calls = case(False, [0])
+    ok(note == "bwrap: installed" and calls == ["apt-get install -y bubblewrap"],
+       f"RC61b missing: one sudo -n apt-get install ({note}, {calls})")
+    note, calls = case(False, [100, 0, 0])
+    ok(note == "bwrap: installed" and calls == ["apt-get install -y bubblewrap", "apt-get update",
+                                                "apt-get install -y bubblewrap"],
+       f"RC61c a failed install is retried after apt-get update ({note}, {calls})")
+    note, calls = case(False, [100, 0, 100])
+    ok(note.startswith("bwrap: install failed") and "fail closed" in note,
+       f"RC61d both installs fail: a note, no exception ({note})")
+    note, calls = case(False, [], raise_on="apt-get")
+    ok(note.startswith("bwrap: install failed"), f"RC61e a raising shell call is a note, not a failure ({note})")
+    note, calls = case(False, [], sudo=False)
+    ok("no sudo" in note and calls == [], f"RC61f no sudo: nothing is run ({note})")
+    note, calls = case(False, [], platform="darwin")
+    ok("not Linux" in note and calls == [], f"RC61g not Linux: nothing is run ({note})")
 
 
 def _self_test() -> int:
