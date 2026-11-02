@@ -162,6 +162,53 @@ def render(new: dict, old: dict | None, fitted: dict | None, mech: dict | None, 
     return "\n".join(out)
 
 
+def render_equilibration(eq: dict) -> str:
+    """The v0.5 equilibration evidence (equilibration.yaml): adult immunity after the card's burn-in, doubled, from
+    the x0.25 and x4 starting guesses, and with no burn-in (the v0.4 start)."""
+    out = [f"### Equilibration of the starting state (burn-in {eq['burnin_years']} y; {len(eq['seeds'])} seeds, "
+           f"{eq['n_agents']} agents, state at {eq['horizon_start']})", "",
+           "Seed means at horizon.start. Doubled: twice the burn-in. Guess x0.25 / x4: the card's burn-in from a "
+           "closed-form immunity guess 4x lower or higher. None: no burn-in (the v0.4 start). Criterion: within "
+           f"{100 * eq['criterion']['rel_tol']:.0f}% for {', '.join(eq['criterion']['quantities'])} in bands "
+           f"{', '.join(eq['criterion']['bands'])}.", "",
+           "| m0 | PfPR 6-59 m | Quantity | Band | Burn-in | Doubled | Change | Guess x0.25 | Guess x4 | Difference "
+           "| None (v0.4 start) | None / burn-in |",
+           "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    for lv in eq["levels"]:
+        A = lv["arms"]
+        for q in eq["criterion"]["quantities"]:
+            for b in eq["criterion"]["bands"]:
+                k = f"{q}_{b}"
+                base = A["base"]["immunity"][q][b]
+                none = A.get("none", {}).get("immunity", {}).get(q, {}).get(b)
+                out.append(f"| {lv['m0']} | {_fmt(A['base']['pfpr_u5'])} | {q} | {b} | {_fmt(base)} | "
+                           f"{_fmt(A['doubled']['immunity'][q][b])} | {100 * lv['doubling_rel'][k]:+.1f}% | "
+                           f"{_fmt(A['guess_lo']['immunity'][q][b])} | {_fmt(A['guess_hi']['immunity'][q][b])} | "
+                           f"{100 * lv['init_guess_rel'][k]:+.1f}% | {_fmt(none)} | "
+                           f"{_fmt(none / base) if none is not None and base else 'n/a'} |")
+    pr = eq.get("problems") or []
+    out += ["", "Criterion: " + ("met at every level." if not pr else "NOT met: " + "; ".join(pr))]
+    return "\n".join(out)
+
+
+def render_runtime(rt: dict) -> str:
+    """Per-run cost of the v0.5 start against the v0.4 start (runtime.yaml)."""
+    n = len(rt["packages"])
+    out = [f"### Per-run cost (runtime.yaml: {rt['n_agents']} agents, horizon {rt['horizon']['start']}-"
+           f"{rt['horizon']['stop']}, {n} packages per point, {rt['repeats']} points, one core each)", "",
+           "| Start | CPU s per point | CPU s per package run | Relative to v0.4 | Wall s per point | Peak memory (MB) |",
+           "|---|---|---|---|---|---|"]
+    for k, lab in (("v04", "v0.4 start (no burn-in, one run per package)"),
+                   ("v05_shared", "v0.5: one burn-in per point, packages forked (run_batch)"),
+                   ("v05_unshared", "v0.5 without sharing (one burn-in per package run)")):
+        r = rt["seconds_per_point"][k]
+        wall = (rt.get("wall_seconds_per_point") or {}).get(k)
+        mem = (rt.get("peak_rss_mb") or {}).get(k)
+        out.append(f"| {lab} | {r:.1f} | {r / n:.1f} | {r / rt['seconds_per_point']['v04']:.2f}x | "
+                   f"{_fmt(wall)} | {_fmt(mem)} |")
+    return "\n".join(out)
+
+
 def write(path=NOTES) -> None:
     new = _y(os.path.join(HERE, "results.yaml"))
     if new is None:
@@ -170,8 +217,14 @@ def write(path=NOTES) -> None:
                    _y(os.path.join(HERE, "fitted.yaml")), _y(os.path.join(HERE, "b15_mechanisms.yaml")),
                    extra=[(lab, _y(os.path.join(HERE, "history", f))) for lab, f in
                           (("v0.2 (round 1)", "results_v0.2.yaml"), ("v0.3 round 2", "results_v0.3-r2.yaml"),
-                           ("v0.3", "results_v0.3.yaml"))
+                           ("v0.3", "results_v0.3.yaml"), ("v0.4", "results_v0.4.yaml"))
                           if os.path.exists(os.path.join(HERE, "history", f))])
+    eq = _y(os.path.join(HERE, "equilibration.yaml"))
+    if eq:
+        block += "\n\n" + render_equilibration(eq)
+    rt = _y(os.path.join(HERE, "runtime.yaml"))
+    if rt:
+        block += "\n\n" + render_runtime(rt)
     text = open(path).read()
     i, j = text.index(START), text.index(END)
     open(path, "w").write(text[:i + len(START)] + "\n" + block + "\n" + text[j:])
@@ -200,6 +253,26 @@ def _self_test() -> int:
           "definition and grid-edge flags")
     if not ok:
         print(txt)
+        return 1
+    imm = lambda v: {"IC": {"15_30": v, "30p": v, "15p": v}, "ID": {"15_30": v, "30p": v, "15p": v}}  # noqa: E731
+    eq = {"burnin_years": 50, "seeds": [1, 2], "n_agents": 4000, "horizon_start": 2016.0,
+          "criterion": {"rel_tol": 0.05, "quantities": ["IC", "ID"], "bands": ["15_30", "30p", "15p"]},
+          "levels": [{"m0": 1.5, "arms": {"base": {"pfpr_u5": 0.05, "immunity": imm(10.0)},
+                                          "doubled": {"immunity": imm(10.2)}, "guess_lo": {"immunity": imm(9.9)},
+                                          "guess_hi": {"immunity": imm(10.0)}, "none": {"immunity": imm(5.0)}},
+                      "doubling_rel": {f"{q}_{b}": 0.02 for q in ("IC", "ID") for b in ("15_30", "30p", "15p")},
+                      "init_guess_rel": {f"{q}_{b}": -0.01 for q in ("IC", "ID") for b in ("15_30", "30p", "15p")}}],
+          "problems": []}
+    t2 = render_equilibration(eq)
+    rt = {"n_agents": 4000, "horizon": {"start": 2016.0, "stop": 2027.0}, "packages": ["a", "b"], "repeats": 2,
+          "seconds_per_point": {"v04": 20.0, "v05_shared": 30.0, "v05_unshared": 100.0}}
+    t3 = render_runtime(rt)
+    ok2 = ("+2.0%" in t2 and "-1.0%" in t2 and "| 0.5 |" in t2 and "met at every level" in t2 and "1.50x" in t3
+           and "5.00x" in t3)
+    print(("PASS" if ok2 else "FAIL") + " R2 the equilibration evidence and the per-run cost render with their relative "
+          "differences")
+    if not ok2:
+        print(t2, t3)
         return 1
     print("OK: all self-test cases passed.")
     return 0

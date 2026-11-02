@@ -1,11 +1,21 @@
-# Optional cloud-execution extras for scripts/cloud_batch.py and
-# scripts/propagate_uncertainty.py --cloud (Azure Batch). Install on top
-# of requirements.txt:
+# Optional cloud extras. Install on top of requirements.txt:
 #   pip install -r requirements.txt -r requirements-cloud.txt
+
+# --- IDM Coiled (current): cloud/run_cluster.py, cloud/vm_job.py,
+# cloud/worker_side.py, scripts/replay_coiled.py ---
+# Pinned to the version in the validated launcher venv (~/.venvs/ma-coiled)
+# on 2026-11-01; dask and distributed pins in requirements.txt match it.
+coiled==1.135.6
+
+# --- Run storage: scripts/results_store.py (uploads finished runs) ---
+# and the legacy Azure Batch path below.
 # Pinned to the versions validated in the project .venv on 2026-10-20.
-azure-batch==14.2.0
 azure-identity==1.25.3
 azure-storage-blob==12.28.0
+
+# --- Azure Batch (legacy, v1 only): scripts/cloud_batch.py and
+# scripts/propagate_uncertainty.py --cloud. Kept until that path is retired. ---
+azure-batch==14.2.0
 
 # modelops-calabaria (BaseModel wrappers in
 # .claude/skills/laser-spatial-disease-modeling/scripts/laser_basemodel.py)

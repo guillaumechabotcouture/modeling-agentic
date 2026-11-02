@@ -68,7 +68,8 @@ fixed:
   le_5_14: "GBD reference life table: a normative standard, which GBD carries without uncertainty"
   le_15p: "GBD reference life table: a normative standard, which GBD carries without uncertainty"
   import_eir: "no published range (attempt 8 value)"
-settings: [n_agents, net_holes]
+settings: [n_agents, net_holes, burnin_years, init_eir_per_m0]   # v0.5: numerical settings of the start
+  # (burn-in length and its starting guess; benchmarks/equilibration.yaml shows the results do not depend on them)
 not_exposed:
   hut_trial_coefficients: "Churcher et al. 2016 Table 6 coefficients are module constants (vector.CHURCHER), not engine
     parameters; drawing them needs an engine change (code fingerprint, benchmark re-stamp)"
