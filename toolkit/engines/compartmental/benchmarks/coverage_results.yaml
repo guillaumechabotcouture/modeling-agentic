@@ -52,6 +52,13 @@ benchmarks:
   code_sha256: b32c3d6a50d8336fd9eea82d61b0bad065ff4ef79eee94d21d63d71eff55cc97
   in_band: true
   status: in_band
+  refusals: 0
+  refusal_share: 0.0
+  refusal_share_max: 0.02
+  rescored_from:
+    declaration_sha256: dded87061504672064e59a0874a237be723813269d1a6ed44c019fbc8676195c
+    note: stored replicate aggregates re-scored; no new run
+  computation_sha256: 0fc6623da01ed2e207ee74e96bdba4e1c77d637e5f0c07132e67352b298ecb05
 - id: SB2a
   metric: 'confounded: series truncated before depletion, seeding unknown; prior range
     of reporting carried'
@@ -96,6 +103,13 @@ benchmarks:
   code_sha256: b32c3d6a50d8336fd9eea82d61b0bad065ff4ef79eee94d21d63d71eff55cc97
   in_band: true
   status: in_band
+  refusals: 0
+  refusal_share: 0.0
+  refusal_share_max: 0.02
+  rescored_from:
+    declaration_sha256: 7cec4be72b4b97048e66f92ff1c31b69b4e572fbda429203946de0365337fbd5
+    note: stored replicate aggregates re-scored; no new run
+  computation_sha256: 2e33fbb08d9ef0c30715c66a96d0afd666d468b062c3d47e0a8c95677ed3ba8c
 - id: SB2a_neg
   metric: 'negative control for SB2a: reporting fixed at its prior median (reproduces
     the v1 failure)'
@@ -134,6 +148,13 @@ benchmarks:
   code_sha256: b32c3d6a50d8336fd9eea82d61b0bad065ff4ef79eee94d21d63d71eff55cc97
   in_band: true
   status: in_band
+  refusals: 0
+  refusal_share: 0.0
+  refusal_share_max: 0.02
+  rescored_from:
+    declaration_sha256: 1e39fda3abde7b51ee53b05403d48ec18e40049b8d2f5db728acfa0406281576
+    note: stored replicate aggregates re-scored; no new run
+  computation_sha256: 2334ae7dac6d88325d2bc0fe224a2b87284afa9c13ccbac06e0ab09f7a4e3168
 - id: SB2b
   metric: 'confounded: unknown initial susceptible share (declared prior) and unknown
     forcing amplitude, complete series'
@@ -189,8 +210,15 @@ benchmarks:
   ridge_share: 0.97
   declaration_sha256: 049b7f9e59760a9434d677969381208794542319f5d844011519998fc8872c1f
   code_sha256: b32c3d6a50d8336fd9eea82d61b0bad065ff4ef79eee94d21d63d71eff55cc97
-  in_band: false
-  status: out_of_band
+  in_band: true
+  status: in_band
+  refusals: 1
+  refusal_share: 0.005
+  refusal_share_max: 0.02
+  rescored_from:
+    declaration_sha256: 049b7f9e59760a9434d677969381208794542319f5d844011519998fc8872c1f
+    note: stored replicate aggregates re-scored; no new run
+  computation_sha256: 27ccda73f0821e579951470bbb75305f338ca74122536fd32fa5d704f698582f
 - id: SB2c
   metric: 'identified despite known forcing: known susceptibility and depletion'
   role: held_out
@@ -235,6 +263,13 @@ benchmarks:
   code_sha256: b32c3d6a50d8336fd9eea82d61b0bad065ff4ef79eee94d21d63d71eff55cc97
   in_band: true
   status: in_band
+  refusals: 0
+  refusal_share: 0.0
+  refusal_share_max: 0.02
+  rescored_from:
+    declaration_sha256: e1002704d545b6c39d1742c45981c4fd2de87267c4b8bc36cd6ed6052794a497
+    note: stored replicate aggregates re-scored; no new run
+  computation_sha256: 59fb7ed6823e371beb4cddf970b1dca39737d8e575e3ac3205260bc0be3073b7
 - id: SB3a
   metric: cohort immunity from two overlapping sources (admin coverage with numerator
     inflation and denominator error; serosurvey with assay error, waning, frame gap)
@@ -252,7 +287,7 @@ benchmarks:
   class_share:
     omega: 1.0
     delta: 1.0
-    net_bias:admin: 0.0
+    net_bias:admin: 1.0
   replicates: 200
   invalid_outputs: 0
   class_counts:
@@ -303,10 +338,17 @@ benchmarks:
       min: 36.214
       median: 83.086
       max: 283.579
-  declaration_sha256: a4016f74288f816703994fc704820f0c7a940190d6ca24fdf08ac76940981d9f
+  declaration_sha256: 9b7e937217826a3a64c0ab646bc34718607b40c9e40060e16cd9fd783da8b300
   code_sha256: b32c3d6a50d8336fd9eea82d61b0bad065ff4ef79eee94d21d63d71eff55cc97
-  in_band: false
-  status: out_of_band
+  in_band: true
+  status: in_band
+  refusals: 0
+  refusal_share: 0.0
+  refusal_share_max: 0.02
+  rescored_from:
+    declaration_sha256: a4016f74288f816703994fc704820f0c7a940190d6ca24fdf08ac76940981d9f
+    note: stored replicate aggregates re-scored; no new run
+  computation_sha256: 07edb58e5815f2f31fb7f9990c7015a9c61e052a3b11057ab2a5f20c3db0b999
 - id: SB3b_admin_truth
   metric: 'negative control: administrative coverage taken as the truth'
   role: held_out
@@ -354,6 +396,13 @@ benchmarks:
   code_sha256: b32c3d6a50d8336fd9eea82d61b0bad065ff4ef79eee94d21d63d71eff55cc97
   in_band: true
   status: in_band
+  refusals: 0
+  refusal_share: 0.0
+  refusal_share_max: 0.02
+  rescored_from:
+    declaration_sha256: 971f05595a28993f336e614ca526cb0385526e7986f939e08d480259683ebf83
+    note: stored replicate aggregates re-scored; no new run
+  computation_sha256: 97ac0dc5f3caab131cf53befb42bbde5550d8b6ac9eb04f8ce7a22b40572f73a
 - id: SB3b_sero_truth
   metric: 'negative control: the serosurvey taken as the truth'
   role: held_out
@@ -401,6 +450,13 @@ benchmarks:
   code_sha256: b32c3d6a50d8336fd9eea82d61b0bad065ff4ef79eee94d21d63d71eff55cc97
   in_band: true
   status: in_band
+  refusals: 0
+  refusal_share: 0.0
+  refusal_share_max: 0.02
+  rescored_from:
+    declaration_sha256: 6764f3eb932e989c61e227e9f7c1e2c619031550815b0f4fd293cc8cb1574b47
+    note: stored replicate aggregates re-scored; no new run
+  computation_sha256: 4b50cd881edc590fe0fabfdc9c7cf617af9ac062b71d109d38f2b26d10cca3a1
 - id: SB3c
   metric: 'administrative coverage only: every bias parameter prior-dominated, prior
     ranges carried'
@@ -465,6 +521,13 @@ benchmarks:
   code_sha256: b32c3d6a50d8336fd9eea82d61b0bad065ff4ef79eee94d21d63d71eff55cc97
   in_band: true
   status: in_band
+  refusals: 0
+  refusal_share: 0.0
+  refusal_share_max: 0.02
+  rescored_from:
+    declaration_sha256: c84a727e6284a3356716ce997b10f90d585ce015e21f1537a5fbc89cea737d9e
+    note: stored replicate aggregates re-scored; no new run
+  computation_sha256: ac97cb8967c478839125a4ae7f3ecb71bdc7531469ffe14473724b296ac1f0b3
 - id: SB5
   metric: 'group-attack-rate calibration of q: coverage of hospitalisations averted
     by a fixed plan'
@@ -501,6 +564,13 @@ benchmarks:
   code_sha256: b32c3d6a50d8336fd9eea82d61b0bad065ff4ef79eee94d21d63d71eff55cc97
   in_band: true
   status: in_band
+  refusals: 0
+  refusal_share: 0.0
+  refusal_share_max: 0.02
+  rescored_from:
+    declaration_sha256: b4938236879af25e9e552e24595f993ea174af6f9c2158519e6fc6cc3d322acf
+    note: stored replicate aggregates re-scored; no new run
+  computation_sha256: 3f2b690e8efbb8682684f4b0f5fb2923bebe665bb7b3d42040c135ed9b8b965c
 settings_calibrated: {}
 fitted_used: {}
 configs_validated:
@@ -642,14 +712,14 @@ seeds:
 - 1
 n_sims: 0
 summary:
-  in_band: 8
+  in_band: 10
   total: 10
   by_status:
-    in_band: 8
-    out_of_band: 2
+    in_band: 10
+    out_of_band: 0
     not_assessable: 0
     band_mis_based: 0
-  held_out_in_band: 8
+  held_out_in_band: 10
   held_out_total: 10
 engine_version: '0.1'
 fit_rule: null

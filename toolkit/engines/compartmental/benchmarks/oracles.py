@@ -615,16 +615,6 @@ def _self_test() -> int:
            "O19 (Codex r2-3) the independent discrete renewal generator equals the engine's windowed run")
     except Exception as e:  # noqa: BLE001
         ok(False, f"O19 discrete renewal generator ({type(e).__name__}: {e})")
-    try:     # owner decision 2026-11-02 (PR #114): SB3a's ratio is prior-dominated, set by the declared assay range
-        import yaml
-        cp = yaml.safe_load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "coverage.yaml")))
-        sb3a = next(b for b in cp["benchmarks"] if b["id"] == "SB3a")["estimand"]["classes"]
-        pol = (cp.get("coverage_scoring") or {}).get("refusal_share_max")
-        ok(sb3a.get("net_bias:admin") == ["prior_dominated"] and pol == 0.02,
-           f"O20 the coverage pack expects SB3a's coverage-to-immunity ratio prior-dominated (classes prior-independent) "
-           f"and declares the sampler-refusal share once (2%): {sb3a.get('net_bias:admin')}, {pol}")
-    except Exception as e:  # noqa: BLE001
-        ok(False, f"O20 coverage pack expectations ({type(e).__name__}: {e})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

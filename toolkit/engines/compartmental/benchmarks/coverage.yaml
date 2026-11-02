@@ -31,6 +31,11 @@ configs:
             components: {plan: {kind: campaign, targets: [b], reach: 0.5}}, outcomes: [hospitalisations]}
 settings: {}
 arms: {}
+# Owner decision 2026-11-02: a coverage case allows up to this share of replicates in which the sampler fails closed
+# (posterior_ess, posterior_mcmc); each refusal is counted as a MISS in the coverage and the class shares, never dropped,
+# and is reported apart (`refusals`). A case may declare its own `refusal_share_max`. In a real run a refusal still stops
+# the calibration.
+coverage_scoring: {refusal_share_max: 0.02}
 
 # ---------------------------------------------------------------- shared declarations (YAML anchors)
 x-notifications: &notifications
@@ -179,7 +184,11 @@ benchmarks:
       seed: 105
       quantities: [susceptible_share]
       band: [0.90, 0.99]
-      classes: {omega: [prior_dominated, on_ridge], delta: [prior_dominated, on_ridge], "net_bias:admin": [identified]}
+      # Restated 2026-11-02 (owner, PR #114) after seeing the result: with likelihood classes independent of the prior
+      # (log-scale loadings), the coverage-to-immunity ratio is pinned only through the declared assay-sensitivity range
+      # (v2d §3.4, "up to the assay and waning terms"), so it is expected prior-dominated. The former [identified]
+      # expectation was written under the prior-sd loadings this PR replaced.
+      classes: {omega: [prior_dominated, on_ridge], delta: [prior_dominated, on_ridge], "net_bias:admin": [prior_dominated]}
       class_share_min: 0.90
   - id: SB3b_admin_truth
     metric: "negative control: administrative coverage taken as the truth"

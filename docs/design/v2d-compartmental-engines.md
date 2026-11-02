@@ -962,3 +962,30 @@ The cause is the classification rule, not the sampler:
 - **SB2b's one invalid fit.** It still needs either more stages for that replicate or an accepted rate of sampler refusals.
 
 **Spend.** 62.4 Coiled credits (about US$3.81) on two 8-vCPU VMs in `idm-coiled-idmad-r2`, about 3.1 h of wall time; both clusters stopped.
+
+**Owner decisions, 2026-11-02 (implemented in the same PR; re-scored from the stored replicate results, no new run, no
+spend).**
+1. **SB3a's expectation restated after seeing the result.** The coverage-to-immunity ratio (`net_bias:admin`) is now expected `prior_dominated`, determined by the declared assay-sensitivity range.
+   - The former `identified` expectation was written under the prior-sd loadings this PR replaced.
+   - The classes stay prior-independent. There is no `validated: true` or prior-as-data mechanism; a prior's source stays in its provenance, not in the class.
+2. **Sampler refusals in the coverage pack.** A case allows a declared share of replicates in which the sampler fails closed (`posterior_ess`, `posterior_mcmc`): `coverage_scoring.refusal_share_max: 0.02` at pack level, which a case may override.
+   - Each refusal is counted as a miss in the coverage and the class shares, never dropped, and is reported separately (`refusals`, `refusal_share`).
+   - Any other invalid output still fails the case.
+   - In a real run a refusal still stops the calibration.
+   - No extra sampler stages were added.
+   - `benchmark.py rescore` re-scores stored results only when the computation is unchanged. It checks the engine stamp, the calibrator-code digest and the computation digest (the declaration without its scoring fields) against the pack the results were computed for.
+
+| Case | Coverage (refusals counted as misses) | Class check | Refusals | Status |
+|---|---|---|---|---|
+| SB1 | 0.965 | reporting identified 1.00 | 0 | in band |
+| SB2a | 0.945 | reporting prior-dominated 0.965 | 0 | in band |
+| SB2a_neg | 0.345 | – | 0 | in band |
+| SB2b | 0.915 | reporting prior-dominated 0.98; ridge share 0.97 | 1 of 200 (0.5%, within 2%) | in band |
+| SB2c | 0.97 | reporting identified 1.00 | 0 | in band |
+| SB3a | 0.925 | ω, δ 1.00; ratio prior-dominated 1.00 (restated) | 0 | in band |
+| SB3b, administrative data as truth | 0.18 | – | 0 | in band |
+| SB3b, serosurvey as truth | 0.465 | – | 0 | in band |
+| SB3c | 0.905 | ω, δ, rel_out 1.00 | 0 | in band |
+| SB5 | 0.93 | – | 0 | in band |
+
+10 of 10 in band.
