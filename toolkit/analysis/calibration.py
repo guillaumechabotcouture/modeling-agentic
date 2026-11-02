@@ -645,6 +645,58 @@ def sample(P: Problem, seed: int = 0, **override) -> dict:
     return out
 
 
+def _log_jacobian(prior, x, sd) -> float:
+    """d u / d s for one parameter: u its log scale (log x for a positive support, log(1 + x) for a support from above
+    -1 containing 0, x otherwise), s its prior-scale coordinate (natural scale / prior sd)."""
+    dxdt = x if prior.dist == "loguniform" else 1.0          # natural scale t: log x for a log-uniform prior
+    lo = prior.lo
+    if lo is not None and lo > 0:
+        dudx = 1.0 / x
+    elif lo is not None and lo > -1:
+        dudx = 1.0 / (1.0 + x)
+    else:
+        dudx = 1.0
+    return float(dudx * dxdt * sd)
+
+
+def _polish(P, names, t0, sd, maxiter=40, h=1e-4):
+    """Move t0 (natural scale) to the likelihood's maximum within the prior's support: L-BFGS-B in prior-scale units
+    with central-difference gradients, one batch of 2d + 1 points per step."""
+    from scipy.optimize import minimize
+    d = len(names)
+    lo = np.array([P.priors[n].natural_support()[0] for n in names])
+    hi = np.array([P.priors[n].natural_support()[1] for n in names])
+    pad = 2.0 * h * sd
+
+    def to_x(T):
+        return np.stack([P.priors[n].from_natural(T[:, j]) for j, n in enumerate(names)], axis=1)
+
+    def fg(sv):
+        t = t0 + sv * sd
+        pts = [t]
+        for i in range(d):
+            for sg in (1, -1):
+                e = t.copy()
+                e[i] += sg * h * sd[i]
+                pts.append(e)
+        T = np.clip(np.asarray(pts), lo, hi)
+        ll, _ = P.evaluate(to_x(T))
+        if not np.all(np.isfinite(ll)):
+            return float("inf"), np.zeros(d)
+        g = np.array([-(ll[1 + 2 * i] - ll[2 + 2 * i]) / (2 * h) for i in range(d)])
+        return -float(ll[0]), g
+    b = [((lo[i] + pad[i] - t0[i]) / sd[i], (hi[i] - pad[i] - t0[i]) / sd[i]) for i in range(d)]
+    b = [(min(a, 0.0), max(c, 0.0)) for a, c in b]
+    try:
+        r = minimize(fg, np.zeros(d), jac=True, method="L-BFGS-B", bounds=b, options={"maxiter": maxiter})
+        f0, _ = fg(np.zeros(d))
+        if np.all(np.isfinite(r.x)) and r.fun <= f0:
+            return t0 + r.x * sd
+    except (ValueError, FloatingPointError):
+        pass
+    return t0
+
+
 def _fd_hessian(P, names, t0, sd, h):
     """Central finite-difference Hessian of -loglik in prior-scale units (one batch of 1 + 2d + 2d(d-1) points);
     `h` is one step per dimension, in prior-sd units."""
@@ -693,8 +745,11 @@ def classify(P: Problem, smp: dict, **override) -> dict:
     sd = np.array([math.sqrt(P.priors[n].natural_var()) for n in names])
     t0 = np.array([float(P.priors[n].natural(smp["best"][j])) for j, n in enumerate(names)])
     h = 0.01
-    # Codex r2-2: the evaluation point stays where it is (moving it can leave a curved ridge); near a bound the step
-    # in that dimension shrinks so the central stencil fits inside the prior's support
+    # log-loadings follow-up: the Fisher point is the likelihood's maximum (polished from the best sample point within
+    # the support). Away from it, residuals times the ridge's second derivative add curvature along an exact ridge
+    # (measured: 0.18 on the SB2b-like ridge of CB9, above the flat threshold).
+    t0 = _polish(P, names, t0, sd)
+    # Codex r2-2: near a bound the step in that dimension shrinks so the central stencil fits inside the support
     hv = np.full(d, h)
     for j, n in enumerate(names):
         lo, hi = P.priors[n].natural_support()
@@ -711,19 +766,29 @@ def classify(P: Problem, smp: dict, **override) -> dict:
     if not fin:
         H = np.nan_to_num(H, nan=0.0, posinf=0.0, neginf=0.0)
     lam, V = np.linalg.eigh(0.5 * (H + H.T))
-    flat = lam < th["flat_eigenvalue"]
-    Vf = V[:, flat]
+    flat = lam < th["flat_eigenvalue"]          # flatness: the likelihood against the prior's precision (prior units)
+    # log-loadings follow-up (v2d §3.2: likelihood classes independent of the prior): which parameters a flat direction
+    # moves is measured on each parameter's log scale (log x for a positive support, log(1 + x) for a support from
+    # above -1 that contains 0, the value itself otherwise), not in prior-sd units, where a narrow partner prior
+    # absorbed the ridge (SB2b: reporting's loading 0.21 on (reporting x s0, R0 x s0, seed / s0))
+    Jd = np.array([_log_jacobian(P.priors[n], P.priors[n].from_natural(t0[j]), sd[j]) for j, n in enumerate(names)])
+    Vf = np.zeros((d, 0))
+    if flat.any():
+        W = Jd[:, None] * V[:, flat]
+        Vf, _ = np.linalg.qr(W)
     lmin = th["ridge_loading_min"]
     ridges, on_flat = [], set()
     for j in np.nonzero(flat)[0]:
+        w = Jd * V[:, j]
+        w = w / max(float(np.linalg.norm(w)), 1e-300)
         # Codex r1-3: a null direction spread over many parameters loads each one weakly; every parameter carrying
         # at least half the largest loading (or the absolute minimum) is on that ridge
-        cut = min(lmin, 0.5 * float(np.max(np.abs(V[:, j]))))
-        loaded = [names[i] for i in range(d) if abs(V[i, j]) >= cut]
+        cut = min(lmin, 0.5 * float(np.max(np.abs(w))))
+        loaded = [names[i] for i in range(d) if abs(w[i]) >= cut]
         if len(loaded) >= 2:
             on_flat.update(loaded)
             ridges.append({"params": loaded, "eigenvalue": float(lam[j]),
-                           "loadings": {names[i]: round(float(V[i, j]), 3) for i in range(d) if abs(V[i, j]) >= cut}})
+                           "loadings": {names[i]: round(float(w[i]), 3) for i in range(d) if abs(w[i]) >= cut}})
     sub = [names[i] for i in range(d) if Vf.size and float(np.sum(Vf[i, :] ** 2)) >= lmin ** 2]
     if len(sub) >= 2 and Vf.shape[1] > 1:      # several flat directions: also name the whole flat subspace
         ridges.append({"params": sub, "kind": "flat_subspace", "dimension": int(Vf.shape[1])})
@@ -757,7 +822,9 @@ def classify(P: Problem, smp: dict, **override) -> dict:
                 xm = np.array([[P.priors[n].from_natural(tm[i]) for i, n in enumerate(names)]])
                 g[j] = (nat(_derived_values(P, xp)[k])[0] - nat(_derived_values(P, xm)[k])[0]) / (2 * hv[j])
             gn = float(g @ g)
-            sh = float(np.sum((g @ Vf) ** 2) / gn) if gn > 0 and Vf.size else 0.0
+            gu = g / Jd                                       # the same gradient on the log scales
+            gun = float(gu @ gu)
+            sh = float(np.sum((gu @ Vf) ** 2) / gun) if gun > 0 and Vf.size else 0.0
             curv = float(g @ H @ g / gn) if gn > 0 else 0.0
             share[k] = sh
             lik[k] = ("unidentified" if gn == 0 or curv < th["flat_eigenvalue"] else "on_ridge" if sh >= lmin ** 2
@@ -773,9 +840,10 @@ def classify(P: Problem, smp: dict, **override) -> dict:
             classes[n] = "partly_identified"
     return {"classes": classes, "likelihood_classes": lik, "contraction": contraction, "ridge_share": share,
             "ridges": ridges, "fisher_eigenvalues": [float(x) for x in lam], "fisher_finite": fin,
-            "method": "Fisher information of the likelihood alone at the best sample point, in prior-scale units "
-                      "(each parameter on its prior's own scale / prior sd); flat eigenvalue < "
-                      f"{th['flat_eigenvalue']}, loading >= {lmin}; contraction 1 - var_post/var_prior"}
+            "method": "Fisher information of the likelihood alone at its maximum (polished from the best sample point); "
+                      f"flat directions where it adds less than {th['flat_eigenvalue']} of the prior's precision; "
+                      f"loadings on each parameter's log scale, >= {lmin} (or half the largest); contraction "
+                      "1 - var_post/var_prior on each prior's own scale"}
 
 
 # ------------------------------------------------------------------ prior-dominated: tests and label (§3.2)
@@ -1635,6 +1703,40 @@ def _self_test() -> int:
            f"CB8 a curved 5-parameter ridge (the SB2b case) reaches the ESS floor with the right marginals "
            f"(ESS {s['diagnostics']['ess']:.0f}, means {np.round(m, 3)})")
     safe(cb8, "CB8 curved ridge")
+
+    def cb9():
+        # SB2b evidence (re-run 2026-11-01, PR #110): reporting classed `identified` in 102 of 200 fits although the
+        # likelihood fixes only (reporting x s0, R0 x s0, seed / s0). Loadings in prior-sd units let the narrower s0
+        # and R0 priors absorb the ridge (reporting's loading about 0.21). The same priors and ridge, synthetic:
+        pri = {"reporting": Prior.from_decl("reporting", {"dist": "loguniform", "range": [0.0333, 0.333], "source": "t"}),
+               "s0": Prior.from_decl("s0", {"dist": "uniform", "range": [0.4, 1.0], "source": "t"}),
+               "r0": Prior.from_decl("r0", {"dist": "uniform", "range": [1.3, 2.5], "source": "t"}),
+               "seed": Prior.from_decl("seed", {"dist": "loguniform", "range": [1e-6, 1e-4], "source": "t"})}
+        true = {"reporting": 0.1, "s0": 0.75, "r0": 1.9, "seed": 1e-5}
+
+        def ll(X):
+            a = np.log(X["reporting"] * X["s0"]) - math.log(true["reporting"] * true["s0"])
+            b = np.log(X["r0"] * X["s0"]) - math.log(true["r0"] * true["s0"])
+            c = np.log(X["seed"] / X["s0"]) - math.log(true["seed"] / true["s0"])
+            return -0.5 * ((a / 0.02) ** 2 + (b / 0.01) ** 2 + (c / 0.05) ** 2), {}
+        P = Problem(list(pri), pri, ll)
+        c = classify(P, sample(P, seed=3))
+        ok(c["likelihood_classes"]["reporting"] == "on_ridge" and c["classes"]["reporting"] == "prior_dominated"
+           and any({"reporting", "s0"} <= set(r["params"]) for r in c["ridges"]),
+           f"CB9 (SB2b) on a 4-parameter ridge, reporting is on_ridge whatever the partners' prior widths: loadings on "
+           f"each parameter's log scale ({c['likelihood_classes']}, ridges {[r['params'] for r in c['ridges']]})")
+        # guard: a parameter the data pin is identified even under a narrow prior; one the data do not see is
+        # prior-dominated however narrow its prior; a data-identified parameter beside a ridge stays identified
+        pri2 = {"d": Prior.from_decl("d", {"dist": "uniform", "range": [0.9, 1.1], "source": "t"}),
+                "e": Prior.from_decl("e", {"dist": "uniform", "range": [0.95, 1.05], "source": "t"}),
+                "c": Prior.from_decl("c", {"dist": "uniform", "range": [0.1, 1.0], "source": "t"})}
+        P2 = Problem(list(pri2), pri2, lambda X: (-0.5 * (((X["d"] - 1.02) / 0.002) ** 2
+                                                         + ((X["c"] - 0.4) / 0.01) ** 2), {}))
+        c2 = classify(P2, sample(P2, seed=4))
+        ok(c2["classes"] == {"d": "identified", "e": "prior_dominated", "c": "identified"},
+           f"CB10 guard: a narrow-prior parameter the data pin is identified; one they do not see is prior-dominated "
+           f"({c2['classes']})")
+    safe(cb9, "CB9-10 log-scale loadings")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
