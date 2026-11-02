@@ -1,0 +1,436 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Run console</title>
+<!-- scripts/run_console.py serves this page on 127.0.0.1 only. No external scripts, fonts or styles:
+     run outputs derive from licensed data and nothing here may leave the machine. -->
+<style>
+:root {
+  --bg: #fbfaf7; --panel: #ffffff; --ink: #1f2328; --muted: #646b73; --line: #e3e0d8; --soft: #f2f0ea;
+  --accent: #2f5d8a; --accent-soft: #e6eef6; --ok: #2e6b46; --warn: #8a5a12; --bad: #9a2f2f; --wait: #6a4b9a;
+  --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #16181b; --panel: #1d2024; --ink: #e6e3dc; --muted: #9aa0a6; --line: #30343a; --soft: #23272c;
+  --accent: #8db4dc; --accent-soft: #24313f; --ok: #79b48e; --warn: #d2a35a; --bad: #e08a8a; --wait: #b39ddb; } }
+:root[data-theme="dark"] {
+  --bg: #16181b; --panel: #1d2024; --ink: #e6e3dc; --muted: #9aa0a6; --line: #30343a; --soft: #23272c;
+  --accent: #8db4dc; --accent-soft: #24313f; --ok: #79b48e; --warn: #d2a35a; --bad: #e08a8a; --wait: #b39ddb; }
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink); font: 15px/1.55 var(--sans); }
+button, select, input, textarea { font: inherit; color: inherit; }
+button { background: var(--soft); border: 1px solid var(--line); border-radius: 6px; padding: 3px 10px; cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+button.link { background: none; border: none; color: var(--accent); padding: 0; }
+.app { display: grid; grid-template-columns: 270px 1fr auto; grid-template-rows: auto auto 1fr; height: 100vh; }
+header { grid-column: 2 / 4; padding: 12px 20px 6px; border-bottom: 1px solid var(--line); background: var(--panel); }
+header h1 { font: 600 17px/1.3 var(--serif); margin: 0 0 4px; }
+.meta { color: var(--muted); font-size: 13px; display: flex; flex-wrap: wrap; gap: 4px 16px; align-items: center; }
+.meta b { color: var(--ink); font-weight: 600; }
+.stepper { grid-column: 2 / 4; display: flex; gap: 2px; padding: 8px 20px; overflow-x: auto; border-bottom: 1px solid var(--line); background: var(--panel); }
+.step { flex: 0 0 auto; font-size: 11.5px; letter-spacing: .02em; padding: 4px 8px; border-radius: 4px; border: 1px solid var(--line); background: var(--bg); color: var(--muted); cursor: pointer; }
+.step.done { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, var(--line)); }
+.step.current { color: var(--bg); background: var(--accent); border-color: var(--accent); }
+.step.waiting { color: var(--bg); background: var(--wait); border-color: var(--wait); }
+.step.failed { color: var(--bg); background: var(--bad); border-color: var(--bad); }
+.step.skipped { opacity: .45; text-decoration: line-through; }
+.step.sel { outline: 2px solid var(--accent); outline-offset: 1px; }
+.stepinfo { margin-left: 10px; font-size: 12px; color: var(--muted); align-self: center; white-space: nowrap; }
+aside { grid-row: 1 / 4; border-right: 1px solid var(--line); background: var(--panel); overflow-y: auto; padding: 12px; }
+aside .brand { font: 600 15px var(--serif); margin: 2px 4px 10px; }
+.tabs { display: flex; gap: 4px; margin-bottom: 10px; }
+.tabs button.on { background: var(--accent-soft); border-color: var(--accent); }
+.group { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 12px 4px 4px; }
+.runitem { padding: 7px 8px; border-radius: 6px; cursor: pointer; border: 1px solid transparent; }
+.runitem:hover { background: var(--soft); }
+.runitem.on { background: var(--accent-soft); border-color: var(--line); }
+.runitem .q { font-size: 13px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.runitem .s { font-size: 11.5px; color: var(--muted); }
+main { grid-column: 2; grid-row: 3; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.stream { flex: 1; overflow-y: auto; padding: 16px 20px 24px; }
+.stream-inner { max-width: 780px; margin: 0 auto; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; margin: 10px 0; }
+.card .head { display: flex; gap: 8px; align-items: baseline; font-size: 12px; color: var(--muted); }
+.card .head .t { color: var(--ink); font-weight: 600; font-size: 14px; flex: 1; }
+.card .body { margin-top: 4px; }
+.card .acts { margin-top: 8px; display: flex; gap: 6px; flex-wrap: wrap; }
+.card.stage { background: none; border: none; border-left: 2px solid var(--line); border-radius: 0; padding: 2px 12px; margin: 4px 0; font-size: 13px; color: var(--muted); }
+.card.stage .t { font-weight: 500; font-size: 13px; }
+.card.error { border-color: var(--bad); }
+.card.error .t { color: var(--bad); }
+.card.decision_needed { border: 2px solid var(--wait); }
+.card.decision_needed .t { color: var(--wait); }
+.card.chat.user { background: var(--accent-soft); margin-left: 15%; }
+.card.chat.assistant .body { font-family: var(--serif); font-size: 15.5px; }
+.card.feedback { border-style: dashed; }
+.sev { font-size: 11px; font-weight: 700; padding: 0 6px; border-radius: 3px; border: 1px solid currentColor; }
+.sev.HIGH { color: var(--bad); } .sev.MEDIUM { color: var(--warn); } .sev.LOW { color: var(--muted); }
+.thumb { max-width: 260px; max-height: 170px; border: 1px solid var(--line); border-radius: 4px; cursor: zoom-in; display: block; margin-top: 6px; background: #fff; }
+.cite { display: inline; font: 12px var(--mono); background: var(--accent-soft); color: var(--accent); border: none; border-radius: 3px; padding: 0 4px; cursor: pointer; }
+.uncited { margin-top: 6px; font-size: 12px; color: var(--warn); }
+.cost { font-size: 11.5px; color: var(--muted); }
+.composer { border-top: 1px solid var(--line); background: var(--panel); padding: 10px 20px 14px; }
+.composer .row { max-width: 780px; margin: 0 auto; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.composer textarea { width: 100%; max-width: 780px; display: block; margin: 6px auto; min-height: 58px; resize: vertical; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); }
+.chip { font-size: 12px; background: var(--accent-soft); border-radius: 12px; padding: 1px 8px; }
+.side { grid-column: 3; grid-row: 3; width: 0; overflow: hidden; border-left: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; }
+.side.open { width: min(46vw, 640px); }
+.side .bar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--line); font-size: 13px; }
+.side .bar .t { flex: 1; font-family: var(--mono); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.side .content { overflow: auto; padding: 12px 16px; flex: 1; }
+.side img { max-width: 100%; background: #fff; }
+pre, code { font-family: var(--mono); font-size: 12.5px; }
+pre { background: var(--soft); padding: 8px 10px; border-radius: 6px; overflow-x: auto; }
+.lines div { white-space: pre-wrap; font: 12px/1.5 var(--mono); padding: 0 6px; }
+.lines div.hit { background: var(--accent-soft); outline: 1px solid var(--accent); }
+.md h1, .md h2, .md h3 { font-family: var(--serif); line-height: 1.3; }
+.md h1 { font-size: 20px; } .md h2 { font-size: 17px; margin-top: 18px; } .md h3 { font-size: 15px; }
+.md table { border-collapse: collapse; font-size: 13px; margin: 8px 0; }
+.md td, .md th { border: 1px solid var(--line); padding: 3px 8px; }
+.md .hit { background: var(--accent-soft); }
+.muted { color: var(--muted); } .small { font-size: 12.5px; }
+.kv td { padding: 1px 10px 1px 0; vertical-align: top; font-size: 13px; }
+.toast { position: fixed; bottom: 16px; right: 16px; background: var(--ink); color: var(--bg); padding: 8px 14px; border-radius: 6px; font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none; max-width: 420px; }
+.toast.on { opacity: .95; }
+.answer { border-top: 1px solid var(--line); padding-top: 8px; margin-top: 8px; }
+label.inline { display: inline-flex; gap: 4px; align-items: center; margin-right: 12px; font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside>
+    <div class="brand">Run console</div>
+    <div class="tabs"><button id="tab-runs" class="on">Runs</button><button id="tab-learn">Learning</button>
+      <span style="flex:1"></span><button id="theme" title="Light or dark">◐</button></div>
+    <div id="sidebar"></div>
+  </aside>
+  <header>
+    <h1 id="title">Select a run</h1>
+    <div class="meta" id="meta"></div>
+  </header>
+  <div class="stepper" id="stepper"></div>
+  <main>
+    <div class="stream"><div class="stream-inner" id="stream"></div></div>
+    <div class="composer">
+      <div class="row">
+        <select id="kind"></select>
+        <select id="layer"></select>
+        <span id="anchor"></span>
+        <span style="flex:1"></span>
+        <span class="cost" id="chatspend"></span>
+      </div>
+      <textarea id="text" placeholder="Ask about the run, or give guidance or a correction…"></textarea>
+      <div class="row">
+        <input id="proposed" placeholder="proposed change (optional)" style="flex:1; min-width:200px; padding:4px 8px; border:1px solid var(--line); border-radius:6px; background:var(--bg)">
+        <button id="record" title="Record as feedback without asking Claude">Record only</button>
+        <button id="send" class="primary">Send</button>
+      </div>
+    </div>
+  </main>
+  <div class="side" id="side">
+    <div class="bar"><span class="t" id="side-title"></span><button id="side-close">Close</button></div>
+    <div class="content" id="side-content"></div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+"use strict";
+const TOKEN = "__CONSOLE_TOKEN__";
+const S = { runs: [], run: null, runId: null, filter: null, anchor: null, verdict: null, meta: null, live: false, liveTimer: null, tab: "runs" };
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+function toast(msg) { const t = $("toast"); t.textContent = msg; t.classList.add("on"); clearTimeout(toast.h); toast.h = setTimeout(() => t.classList.remove("on"), 4000); }
+async function api(path, body) {
+  const opt = body === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json", "X-Console-Token": TOKEN }, body: JSON.stringify(body) };
+  const r = await fetch(path, opt);
+  const j = await r.json().catch(() => ({ error: "not JSON (" + r.status + ")" }));
+  if (!r.ok) throw new Error(j.error || r.status);
+  return j;
+}
+const q = (o) => Object.entries(o).map(([k, v]) => k + "=" + encodeURIComponent(v)).join("&");
+
+// ---- markdown (small, local) with [[file#anchor]] citations
+function inline(s) {
+  s = esc(s);
+  s = s.replace(/\[\[([^\]#]+)(?:#([^\]]*))?\]\]/g, (m, f, a) => `<button class="cite" data-file="${f.trim()}" data-anchor="${(a || "").trim()}">${f.trim()}${a ? "#" + a.trim() : ""}</button>`);
+  s = s.replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>").replace(/(^|[\s(])\*([^*\s][^*]*)\*/g, "$1<i>$2</i>");
+  return s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1");   // links render as text: nothing leaves the page
+}
+function md(src) {
+  const L = String(src || "").split("\n"), out = []; let i = 0;
+  while (i < L.length) {
+    let l = L[i];
+    if (/^```/.test(l)) { const b = []; i++; while (i < L.length && !/^```/.test(L[i])) b.push(L[i++]); i++; out.push("<pre>" + esc(b.join("\n")) + "</pre>"); continue; }
+    let m = l.match(/^(#{1,4})\s+(.*)/);
+    if (m) { out.push(`<h${m[1].length} data-h="${esc(m[2].trim())}">${inline(m[2])}</h${m[1].length}>`); i++; continue; }
+    if (/^\s*\|/.test(l)) { const rows = []; while (i < L.length && /^\s*\|/.test(L[i])) rows.push(L[i++]);
+      const cells = (r) => r.trim().replace(/^\||\|$/g, "").split("|").map((c) => c.trim());
+      let h = "<table>"; rows.forEach((r, k) => { if (/^\s*\|?\s*:?-{2,}/.test(r)) return; const tag = k === 0 ? "th" : "td"; h += "<tr>" + cells(r).map((c) => `<${tag}>${inline(c)}</${tag}>`).join("") + "</tr>"; });
+      out.push(h + "</table>"); continue; }
+    if (/^\s*([-*]|\d+\.)\s+/.test(l)) { const ord = /^\s*\d+\./.test(l), it = [];
+      while (i < L.length && /^\s*([-*]|\d+\.)\s+/.test(L[i])) { let t = L[i++].replace(/^\s*([-*]|\d+\.)\s+/, ""); while (i < L.length && /^\s{2,}\S/.test(L[i]) && !/^\s*([-*]|\d+\.)\s+/.test(L[i])) t += " " + L[i++].trim(); it.push("<li>" + inline(t) + "</li>"); }
+      out.push((ord ? "<ol>" : "<ul>") + it.join("") + (ord ? "</ol>" : "</ul>")); continue; }
+    if (/^>\s?/.test(l)) { const b = []; while (i < L.length && /^>\s?/.test(L[i])) b.push(L[i++].replace(/^>\s?/, "")); out.push("<blockquote>" + inline(b.join(" ")) + "</blockquote>"); continue; }
+    if (!l.trim()) { i++; continue; }
+    const p = []; while (i < L.length && L[i].trim() && !/^(#{1,4}\s|```|\s*\||\s*([-*]|\d+\.)\s+|>)/.test(L[i])) p.push(L[i++]);
+    if (!p.length) p.push(L[i++]);
+    out.push("<p>" + inline(p.join(" ")) + "</p>");
+  }
+  return '<div class="md">' + out.join("\n") + "</div>";
+}
+
+// ---- sidebar: runs and the learning view
+async function loadRuns() {
+  try { const j = await api("/api/runs"); S.runs = j.runs; S.meta = j; } catch (e) { $("sidebar").innerHTML = `<div class="card error">${esc(e.message)}</div>`; return; }
+  if (!$("kind").options.length) {
+    $("kind").innerHTML = S.meta.kinds.map((k) => `<option>${k}</option>`).join("");
+    $("layer").innerHTML = S.meta.layers.map((k) => `<option>${k}</option>`).join("");
+    syncComposer();
+  }
+  renderChatSpend();
+  if (S.tab === "runs") renderRuns();
+  if (!S.runId && S.runs.length) selectRun(S.runs[0].id);
+}
+function renderChatSpend() {
+  const c = S.meta && S.meta.chat; if (!c) return;
+  $("chatspend").textContent = c.key ? `chat $${c.spent.toFixed(3)} of $${c.cap.toFixed(2)}` : "chat off: ANTHROPIC_API_KEY is not set";
+}
+function renderRuns() {
+  const groups = {}; S.runs.forEach((r) => (groups[r.group || ""] = groups[r.group || ""] || []).push(r));
+  let h = "";
+  for (const [g, rs] of Object.entries(groups)) {
+    h += `<div class="group">${esc(g || "runs")}</div>`;
+    for (const r of rs) h += `<div class="runitem ${r.id === S.runId ? "on" : ""}" data-run="${esc(r.id)}"><div class="q">${esc(r.question || r.name)}</div>
+      <div class="s">${esc((r.started || "").slice(0, 10))} · ${esc(r.state || "?")}${r.paused ? " · " + esc(r.paused) : ""}${r.status ? " · " + esc(r.status) : ""}${r.mirror ? " · mirror" : ""}</div>
+      ${r.headline ? `<div class="s">${esc(r.headline.slice(0, 140))}</div>` : ""}${r.engine ? `<div class="s"><code>${esc(r.engine)}</code></div>` : ""}${r.error ? `<div class="s" style="color:var(--bad)">${esc(r.error)}</div>` : ""}</div>`;
+  }
+  $("sidebar").innerHTML = h || '<div class="muted small">No runs under the roots.</div>';
+  document.querySelectorAll(".runitem").forEach((el) => (el.onclick = () => selectRun(el.dataset.run)));
+}
+async function renderLearning() {
+  let j; try { j = await api("/api/learning"); } catch (e) { $("sidebar").innerHTML = `<div class="card error">${esc(e.message)}</div>`; return; }
+  let h = `<div class="small muted">${j.n} feedback item(s) across ${S.runs.length} run(s), by layer.</div><div class="acts" style="margin:8px 0"><button id="export">Export digest</button></div>`;
+  for (const [layer, items] of Object.entries(j.by_layer)) {
+    if (!items.length) continue;
+    h += `<div class="group">${esc(layer)} (${items.length})</div>`;
+    for (const r of items) h += `<div class="runitem" title="${esc(r.run)}"><div class="q"><b>${esc(r.kind)}</b>${r.verdict ? " · " + esc(r.verdict) : ""}: ${esc(r.text)}</div>
+      <div class="s">${esc(r.run)} · ${esc((r.anchor || {}).file || "")}${(r.anchor || {}).id ? "#" + esc(r.anchor.id) : ""}</div>${r.proposed_change ? `<div class="s">→ ${esc(r.proposed_change)}</div>` : ""}</div>`;
+  }
+  if (j.errors.length) h += `<div class="card error small">${j.errors.map(esc).join("<br>")}</div>`;
+  $("sidebar").innerHTML = h;
+  $("export").onclick = async () => { try { const r = await api("/api/export", {}); toast("Digest written: " + r.path); } catch (e) { toast(e.message); } };
+}
+
+// ---- one run: header, stepper, stream
+async function selectRun(id) { S.runId = id; S.filter = null; await refresh(); if (S.tab === "runs") renderRuns(); }
+async function refresh() {
+  if (!S.runId) return;
+  try { S.run = await api("/api/run?" + q({ run: S.runId })); } catch (e) { $("stream").innerHTML = `<div class="card error"><div class="head"><span class="t">The run cannot be read</span></div><div class="body">${esc(e.message)}</div></div>`; return; }
+  renderHeader(); renderStepper(); renderStream();
+}
+function renderHeader() {
+  const r = S.run, st = r.state || {}, c = r.compute || {};
+  $("title").textContent = st.question || r.name;
+  const calls = (c.calls || []).map((k) => `${esc(k.fn)} ${k.done == null ? "?" : k.done}/${k.n}${k.eta_s != null ? " · ETA " + fmtS(k.eta_s) : ""}${k.error ? " · " + esc(k.error) : ""}`).join("; ");
+  $("meta").innerHTML = (r.error ? `<span style="color:var(--bad)">${esc(r.error)}</span>` : "") +
+    `<span>state <b>${esc(st.state || "?")}</b>${st.paused ? " (" + esc(st.paused) + ")" : ""}</span>` +
+    `<span>round <b>${esc(st.round)}</b> of ${esc(st.max_rounds)}</span>` + (st.status ? `<span>status <b>${esc(st.status)}</b></span>` : "") +
+    `<span>spent <b>$${Number(st.spent_usd || 0).toFixed(2)}</b>${st.budget_usd != null ? " of $" + Number(st.budget_usd).toFixed(2) : ""}</span>` +
+    `<span title="${esc(c.cap_source || "")}">compute <b>${esc(c.used_core_h)}</b> of ${esc(c.cap_core_h)} core-h${c.error ? " · " + esc(c.error) : ""}</span>` +
+    (calls ? `<span>batch ${calls}</span>` : "") + (r.mirror ? "<span>mirror (read-only)</span>" : "") +
+    `<span style="flex:1"></span><button class="link" id="b-results">results</button><button class="link" id="b-compute">compute</button><button class="link" id="b-build">build on this run</button>`;
+  $("b-results").onclick = () => openDoc();
+  $("b-compute").onclick = () => openCompute();
+  $("b-build").onclick = buildOn;
+}
+const fmtS = (s) => s >= 3600 ? (s / 3600).toFixed(1) + " h" : s >= 60 ? Math.round(s / 60) + " min" : s + " s";
+function renderStepper() {
+  const sp = S.run.stepper;
+  if (!sp) { $("stepper").innerHTML = '<span class="muted small">No stage history.</span>'; return; }
+  $("stepper").innerHTML = sp.stages.map((s) => `<span class="step ${s.status} ${S.filter === s.state ? "sel" : ""}" data-s="${s.state}" title="${s.status}">${s.state}</span>`).join("") +
+    `<span class="stepinfo">round ${esc(sp.round)}/${esc(sp.max_rounds)} · fix-loop rounds ${sp.fix_rounds}${S.filter ? ` · showing ${S.filter} <button class="link" id="nofilter">show all</button>` : ""}</span>`;
+  document.querySelectorAll(".step").forEach((el) => (el.onclick = () => { S.filter = S.filter === el.dataset.s ? null : el.dataset.s; renderStepper(); renderStream(); }));
+  if ($("nofilter")) $("nofilter").onclick = () => { S.filter = null; renderStepper(); renderStream(); };
+}
+function renderStream() {
+  const atBottom = (() => { const s = document.querySelector(".stream"); return s.scrollHeight - s.scrollTop - s.clientHeight < 80; })();
+  const cards = S.run.cards.filter((c) => !S.filter || c.stage === S.filter);
+  $("stream").innerHTML = cards.map(card).join("") || '<div class="muted">No cards for this stage.</div>';
+  wire($("stream"));
+  if (atBottom) { const s = document.querySelector(".stream"); s.scrollTop = s.scrollHeight; }
+}
+const when = (at) => at ? esc(at.replace("T", " ").replace(/\+00:00$/, " UTC").slice(0, 20)) : "";
+function card(c) {
+  const a = c.anchor ? esc(JSON.stringify(c.anchor)) : "";
+  const comment = c.anchor ? `<button data-act="comment" data-anchor="${a}">comment</button>` : "";
+  const open = c.anchor && c.anchor.file ? `<button data-act="open" data-file="${esc(c.anchor.file)}" data-anchor-id="${esc(c.anchor.id || "")}">open</button>` : "";
+  const head = (t, extra) => `<div class="head"><span class="t">${t}</span>${extra || ""}<span>${esc(c.stage || "")}</span><span>${when(c.at)}</span></div>`;
+  switch (c.kind) {
+    case "stage": return `<div class="card stage">${head(esc(c.title), c.spent_usd != null ? `<span>$${Number(c.spent_usd).toFixed(2)}</span>` : "")}<div>${esc(c.body)}</div></div>`;
+    case "fix_loop": return `<div class="card stage">${head("fix loop")}<div class="small">${esc(c.body)}</div></div>`;
+    case "figure": return `<div class="card">${head(esc(c.title))}<div class="body">${esc(c.body)}${c.producer ? ` <span class="muted small">· ${esc(c.producer)}${c.sources ? " from " + c.sources.map(esc).join(", ") : ""}</span>` : ""}${c.provenance_error ? `<div style="color:var(--bad)" class="small">provenance unreadable: ${esc(c.provenance_error)}</div>` : ""}
+      <img class="thumb" loading="lazy" src="/api/file?${q({ run: S.runId, path: c.file })}" data-act="open" data-file="${esc(c.file)}"></div><div class="acts">${open}${comment}</div></div>`;
+    case "blocker": return `<div class="card">${head(`<span class="sev ${esc(c.severity)}">${esc(c.severity)}</span> ${esc(c.title)}`, `<span>${esc(c.category)} → ${esc(c.target_stage)}</span>`)}
+      <div class="body">${esc(c.claim)}${c.fix_requires ? `<div class="small muted" style="margin-top:4px">fix requires: ${esc(c.fix_requires)}</div>` : ""}${c.resolved ? '<div class="small" style="color:var(--ok)">resolved</div>' : ""}</div>
+      <div class="acts"><button data-act="agree" data-anchor="${a}">agree</button><button data-act="disagree" data-anchor="${a}">disagree</button>${comment}${open}</div></div>`;
+    case "gate": return `<div class="card">${head(esc(c.title), `<span>rule ${esc(c.rule)}</span>`)}<div class="body">${esc(c.body)}${(c.unresolved_high || []).length ? `<div class="small" style="color:var(--bad)">unresolved HIGH: ${c.unresolved_high.map(esc).join("; ")}</div>` : ""}${Object.keys(c.done_when_status || {}).length ? `<div class="small muted">done_when: ${esc(JSON.stringify(c.done_when_status))}</div>` : ""}</div><div class="acts">${open}${comment}</div></div>`;
+    case "decision_test": return `<div class="card">${head(esc(c.title))}<div class="body">${esc(c.body)}${c.criterion ? `<div class="small muted">criterion: ${esc(c.criterion)}</div>` : ""}</div><div class="acts">${open}${comment}</div></div>`;
+    case "batch": return `<div class="card">${head(esc(c.title))}<div class="body small">${esc(c.purpose || "")} · ${c.done == null ? "?" : c.done}/${esc(c.n)} done${c.core_s != null ? " · " + Math.round(c.core_s) + " core-s" : ""}${c.eta_s != null ? " · ETA " + fmtS(c.eta_s) : ""}${c.error ? " · " + esc(c.error) : ""}</div></div>`;
+    case "decision_needed": return decisionCard(c, head);
+    case "chat": {
+      const body = c.role === "assistant" ? md(c.text) : esc(c.text).replace(/\n/g, "<br>");
+      const unc = (c.uncited || []).length ? `<div class="uncited">uncited: ${c.uncited.map(esc).join(" · ")}</div>` : "";
+      return `<div class="card chat ${esc(c.role)}"><div class="head"><span class="t">${c.role === "assistant" ? "Claude" : "You"}</span>${c.usd != null ? `<span>$${Number(c.usd).toFixed(4)}${c.model && c.model !== "claude-opus-5-5" ? " · served by " + esc(c.model) + ", priced at Opus 5.5 rates" : ""}</span>` : ""}<span>${when(c.at)}</span></div><div class="body">${body}</div>${unc}</div>`;
+    }
+    case "feedback": return `<div class="card feedback">${head("feedback " + esc(c.fb_kind) + (c.verdict ? " · " + esc(c.verdict) : ""), `<span>layer ${esc(c.layer)}</span>`)}<div class="body small">${esc(c.text)}${c.anchor && c.anchor.file ? ` <span class="muted">on ${esc(c.anchor.file)}${c.anchor.id ? "#" + esc(c.anchor.id) : ""}</span>` : ""}${c.proposed_change ? `<div class="muted">proposed: ${esc(c.proposed_change)}</div>` : ""}</div></div>`;
+    case "error": return `<div class="card error">${head(esc(c.title))}<div class="body small">${esc(c.body)}</div><div class="acts">${open}</div></div>`;
+    default: return `<div class="card">${head(esc(c.title || c.kind))}<div class="body">${esc(c.body || "")}</div></div>`;
+  }
+}
+function decisionCard(c, head) {
+  const id = esc(c.id);
+  if (c.sub === "spec") return `<div class="card decision_needed">${head(esc(c.title))}<div class="body">${md(c.body)}</div>
+    <div class="answer" data-for="${id}"><textarea class="note" placeholder="Your note (required): what you checked, what you accept" style="width:100%;min-height:50px"></textarea>
+    <label class="inline"><input type="checkbox" class="confirm"> I have read the sheet and sign the spec as the owner</label><button class="primary" data-act="sign-spec">Sign</button><div class="small result"></div></div></div>`;
+  const items = (c.items || []).map((it, k) => `<div style="margin:8px 0"><b><code>${esc(it.finding)}</code></b> <span class="muted small">fingerprint ${esc(it.fingerprint)}</span>
+      <div class="small">Why it bears on the decision: ${esc(it.reason)}</div><div class="small">Gate finding: ${esc(it.claim)}</div>
+      ${(it.declarations || []).map((d) => `<div class="small muted">Declaration ${esc(d.id)}: ${inline(d.test)}</div>`).join("") || '<div class="small muted">Not declared, and untested.</div>'}
+      <label class="inline"><input type="radio" name="a${k}${id}" value="accept" data-f="${esc(it.finding)}" ${it.answer === "accept" ? "checked" : ""}> accept</label>
+      <label class="inline"><input type="radio" name="a${k}${id}" value="decline" data-f="${esc(it.finding)}" ${it.answer === "decline" ? "checked" : ""}> decline</label>${it.answer ? `<span class="small">recorded: ${esc(it.answer)}</span>` : ""}</div>`).join("");
+  return `<div class="card decision_needed">${head(esc(c.title), c.status ? `<span>${esc(c.status)}</span>` : "")}<div class="body small">${esc(c.body)}</div>${items}
+    <div class="answer" data-for="${id}"><textarea class="note" placeholder="Your note (required)" style="width:100%;min-height:50px"></textarea>
+    <label class="inline"><input type="checkbox" class="confirm"> I answer these declarations as the owner</label><button class="primary" data-act="scope">Submit answers</button><div class="small result"></div></div></div>`;
+}
+function wire(root) {
+  root.querySelectorAll(".cite").forEach((b) => (b.onclick = () => openFile(b.dataset.file, b.dataset.anchor)));
+  root.querySelectorAll("[data-act]").forEach((b) => (b.onclick = () => act(b)));
+}
+async function act(b) {
+  const anchor = b.dataset.anchor ? JSON.parse(b.dataset.anchor) : null;
+  switch (b.dataset.act) {
+    case "open": return openFile(b.dataset.file, b.dataset.anchorId || "");
+    case "comment": return setAnchor(anchor, null);
+    case "agree":
+      try { await api("/api/feedback", { run: S.runId, kind: "approval", layer: "critique", verdict: "agree", anchor, text: `Agree with ${anchor.id}`, stage: "CRITIQUE" }); toast(`Recorded: agree with ${anchor.id}`); refresh(); } catch (e) { toast(e.message); }
+      return;
+    case "disagree": setAnchor(anchor, "disagree"); $("kind").value = "correction"; $("layer").value = "critique"; syncComposer(); $("text").placeholder = `Why do you disagree with ${anchor.id}?`; return;
+    case "sign-spec": case "scope": {
+      const box = b.closest(".answer"), note = box.querySelector(".note").value, confirmed = box.querySelector(".confirm").checked;
+      const res = box.querySelector(".result");
+      let body = { run: S.runId, note, confirm: confirmed };
+      if (b.dataset.act === "scope") { body.answers = {}; b.closest(".card").querySelectorAll("input[type=radio]:checked").forEach((r) => (body.answers[r.dataset.f] = r.value)); }
+      if (!confirmed) { res.textContent = "Tick the confirmation first."; return; }
+      if (!window.confirm(b.dataset.act === "scope" ? "Submit these answers through scripts/scope_signoff.py sign?" : "Sign the decision spec through agents/stage_machine.py sign?")) return;
+      try { const r = await api(b.dataset.act === "scope" ? "/api/scope" : "/api/sign_spec", body);
+        res.innerHTML = r.refused ? `<span style="color:var(--bad)">Not sent: ${esc(r.refused)}</span>` : `<span style="color:${r.ok ? "var(--ok)" : "var(--bad)"}">exit ${esc(r.rc)}</span><pre>${esc(r.out)}</pre><div class="muted">${esc((r.cmd || []).slice(1).join(" "))}</div>`;
+        if (r.ok) refresh(); } catch (e) { res.textContent = e.message; }
+      return;
+    }
+  }
+}
+
+// ---- composer
+function setAnchor(a, verdict) { S.anchor = a; S.verdict = verdict; renderAnchor(); $("text").focus(); }
+function renderAnchor() {
+  $("anchor").innerHTML = S.anchor ? `<span class="chip">on ${esc(S.anchor.kind)} ${esc(S.anchor.id || "")}${S.verdict ? " · " + S.verdict : ""} <button class="link" id="unanchor">×</button></span>` : "";
+  if ($("unanchor")) $("unanchor").onclick = () => setAnchor(null, null);
+}
+function syncComposer() { const steer = $("kind").value !== "question"; $("layer").style.display = steer ? "" : "none"; $("proposed").style.display = steer ? "" : "none"; $("record").style.display = steer ? "" : "none"; }
+$("kind").onchange = syncComposer;
+function curStage() { return S.filter || (S.run && S.run.state && S.run.state.state) || ""; }
+$("record").onclick = async () => {
+  const text = $("text").value.trim(); if (!text || !S.runId) return;
+  try { await api("/api/feedback", { run: S.runId, kind: $("kind").value, layer: $("layer").value, text, anchor: S.anchor, verdict: S.verdict, proposed_change: $("proposed").value, stage: curStage() });
+    $("text").value = ""; $("proposed").value = ""; setAnchor(null, null); toast("Feedback recorded"); refresh(); } catch (e) { toast(e.message); }
+};
+$("send").onclick = async () => {
+  const text = $("text").value.trim(); if (!text || !S.runId) return;
+  const kind = $("kind").value, btn = $("send");
+  btn.disabled = true; btn.textContent = "Thinking…";
+  try {
+    const body = { run: S.runId, text, anchor: S.anchor, kind, layer: $("layer").value, proposed_change: $("proposed").value, stage: curStage(), verdict: S.verdict };
+    const r = await api("/api/chat", body);
+    if (!r.ok) toast(r.error + (r.feedback ? " (the feedback was recorded)" : ""));
+    else { $("text").value = ""; $("proposed").value = ""; setAnchor(null, null); S.meta.chat.spent = r.spent; renderChatSpend(); }
+    refresh();
+  } catch (e) { toast(e.message); } finally { btn.disabled = false; btn.textContent = "Send"; }
+};
+$("text").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) $("send").click(); });
+
+// ---- side panel: artifacts, results, compute, build-on
+function side(title, html) { $("side-title").textContent = title; $("side-content").innerHTML = html; $("side").classList.add("open"); wire($("side-content")); }
+$("side-close").onclick = () => { $("side").classList.remove("open"); stopLive(); };
+async function openFile(file, anchor) {
+  if (!S.runId) return;
+  const url = "/api/file?" + q({ run: S.runId, path: file });
+  if (/\.(png|jpe?g|svg)$/i.test(file)) {
+    const fig = (S.run.cards || []).find((c) => c.kind === "figure" && c.file === file);
+    side(file, `<img src="${url}">${fig ? `<p>${esc(fig.body)}</p><p class="small muted">${esc(fig.producer || "")} ${fig.sources ? "from " + fig.sources.map(esc).join(", ") : ""}</p>` : ""}<div class="acts"><button data-act="comment" data-anchor="${esc(JSON.stringify({ kind: "figure", id: file, file }))}">comment</button></div>`);
+    return;
+  }
+  let text;
+  try { const r = await fetch(url); text = await r.text(); if (!r.ok) throw new Error(JSON.parse(text).error); } catch (e) { side(file, `<div class="card error"><div class="body">${esc(e.message)}</div></div>`); return; }
+  if (/\.md$/i.test(file)) {
+    side(file + (anchor ? "#" + anchor : ""), md(text));
+    if (anchor) { const h = [...$("side-content").querySelectorAll("[data-h]")].find((e) => e.dataset.h.toLowerCase().includes(anchor.toLowerCase())); if (h) { h.classList.add("hit"); h.scrollIntoView({ block: "start" }); } }
+  } else {
+    const lines = text.split("\n"), key = (anchor || "").toLowerCase();
+    let hit = -1;
+    if (key) hit = lines.findIndex((l) => new RegExp(`(^|[\\s"'{:\\-])${key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}($|[\\s"',:}])`, "i").test(l));
+    side(file + (anchor ? "#" + anchor : ""), `<div class="lines">${lines.map((l, k) => `<div class="${k >= hit && hit >= 0 && k < hit + 12 ? "hit" : ""}" ${k === hit ? 'id="hit"' : ""}>${esc(l) || " "}</div>`).join("")}</div>`);
+    if ($("hit")) $("hit").scrollIntoView({ block: "center" });
+  }
+}
+function openDoc() {
+  const d = S.run.docs || {}, names = Object.keys(d);
+  if (!names.length) { side("results", '<div class="muted">No results.md, manuscript.md or report.md yet.</div>'); return; }
+  side(names.join(" · "), names.map((n) => `<h2 class="muted small">${esc(n)}</h2>` + (d[n].error ? `<div class="card error">${esc(d[n].error)}</div>` : md(d[n].text))).join("<hr>"));
+}
+async function openCompute() {
+  const c = S.run.compute || {};
+  const calls = (c.calls || []).map((k) => `<tr><td><code>${esc(k.fn)}</code></td><td>${esc(k.purpose || "")}</td><td>${k.done == null ? "?" : k.done}/${esc(k.n)}</td><td>${k.core_s == null ? "" : Math.round(k.core_s)}</td><td>${k.eta_s == null ? "" : fmtS(k.eta_s)}</td><td>${esc(k.error || "")}</td></tr>`).join("");
+  let h = `<h3>This run</h3><table class="kv"><tr><td>core-hours</td><td>${esc(c.used_core_h)} of ${esc(c.cap_core_h)} <span class="muted small">(${esc(c.cap_source)})</span></td></tr><tr><td>finished calls</td><td>${esc(c.done_calls)}</td></tr></table>${c.error ? `<div class="card error">${esc(c.error)}</div>` : ""}
+    ${calls ? `<table class="kv"><tr><td>fn</td><td>purpose</td><td>done/n</td><td>core-s</td><td>ETA</td><td></td></tr>${calls}</table>` : '<p class="muted small">No compute call in flight.</p>'}
+    <h3>Coiled</h3><label class="inline"><input type="checkbox" id="live" ${S.live ? "checked" : ""}> live (refreshes at most once a minute; each refresh attaches to the cluster read-only)</label><div id="cloud"></div>`;
+  side("compute", h);
+  $("live").onchange = () => { S.live = $("live").checked; if (S.live) { cloud(); S.liveTimer = setInterval(cloud, 60000); } else stopLive(); };
+  cloud(false);
+}
+function stopLive() { S.live = false; clearInterval(S.liveTimer); S.liveTimer = null; }
+async function cloud(force) {
+  let j; try { j = await api("/api/cloud?" + q({ live: (force === false ? false : S.live) ? 1 : 0 })); } catch (e) { if ($("cloud")) $("cloud").innerHTML = `<div class="card error">${esc(e.message)}</div>`; return; }
+  if (!$("cloud")) return;
+  if (!j.available) { $("cloud").innerHTML = `<p class="muted">${esc(j.why)}</p>`; return; }
+  const s = j.snapshot;
+  if (!s) { $("cloud").innerHTML = '<p class="muted small">No snapshot yet: turn on live.</p>'; return; }
+  const cl = s.clusters ? Object.entries(s.clusters).map(([k, v]) => `<tr><td>${k}</td><td>${esc(v.name || "")}</td><td><b>${esc(v.state)}</b></td></tr>`).join("") : "";
+  $("cloud").innerHTML = `<p class="small muted">snapshot ${when(s.at)}${j.next_refresh_s ? " · next refresh in " + j.next_refresh_s + " s" : ""}</p>${cl ? `<table class="kv">${cl}</table>` : ""}` +
+    ["status", "health", "report-cost"].map((k) => `<h4>${k} <span class="muted small">exit ${esc(s[k].rc)}</span></h4><pre>${esc(s[k].out)}</pre>`).join("");
+}
+async function buildOn() {
+  if (!window.confirm("Write a draft directory that reuses this run's assets? Nothing is launched.")) return;
+  try {
+    const r = await api("/api/build_on", { run: S.runId });
+    const b = (r.batches || []).map((x) => `<tr><td><code>${esc(x.out)}</code></td><td><b>${x.reused ? "reused" : "not reused"}</b></td><td>${esc(x.why)}</td></tr>`).join("");
+    side("build on this run", `<p>Draft written: <code>${esc(r.draft_dir)}</code></p><h3>Commands (run them yourself; they spend money)</h3>
+      <p class="small">Continue this run:</p><pre>${esc(r.commands.continue_this_run)}</pre><p class="small">New run on the same question:</p><pre>${esc(r.commands.new_run)}</pre>
+      <h3>Reused assets</h3><p class="small">spec ${esc(r.spec.copied_from || "none")} · sign-off ${esc(r.spec.signoff_status)} · engine <code>${esc(r.engine || "")}</code></p><p class="small">${(r.copied || []).map((x) => `<code>${esc(x)}</code>`).join(" ")}</p>
+      <h3>Stored engine batches</h3>${b ? `<table class="kv">${b}</table>` : '<p class="muted small">No stored batch.</p>'}
+      <h3>What needs harness support</h3><ul>${(r.harness_support || []).map((x) => `<li class="small">${esc(x)}</li>`).join("")}</ul>`);
+  } catch (e) { toast(e.message); }
+}
+
+// ---- tabs, theme, refresh
+$("tab-runs").onclick = () => { S.tab = "runs"; $("tab-runs").classList.add("on"); $("tab-learn").classList.remove("on"); renderRuns(); };
+$("tab-learn").onclick = () => { S.tab = "learn"; $("tab-learn").classList.add("on"); $("tab-runs").classList.remove("on"); renderLearning(); };
+$("theme").onclick = () => { const d = document.documentElement, dark = d.dataset.theme ? d.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches; d.dataset.theme = dark ? "light" : "dark"; };
+loadRuns();
+setInterval(() => { if (!document.hidden) { refresh(); loadRuns(); } }, 20000);
+</script>
+</body>
+</html>
