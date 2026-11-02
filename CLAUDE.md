@@ -2,8 +2,9 @@
 
 **Purpose**: this file orients a fresh agent (or contributor) before
 they touch the codebase. Read this first; then jump to the layer
-you're working on. It is also loaded into every pipeline agent's
-context (`setting_sources=["project"]`), so it describes the system
+you're working on. It is also loaded into every v1 pipeline agent's
+context (`setting_sources=["project"]`; v2's bounded tasks load no
+settings), so it describes the system
 without documenting how the gates can be satisfied on paper.
 
 ## What this project is
@@ -14,19 +15,37 @@ optimization, decision rules, sensitivity analyses) for public-health
 questions in any disease area: for example "How should a national
 program allocate its malaria budget across districts?", "Where should
 measles campaigns run next year?", or "Which TB case-finding package
-should each district get?". The harness chains a **lead** agent
-through the pipeline stages (PLAN → DATA → MODEL → ANALYZE → CRITIQUE
-→ GATE → WRITE), spawning specialist sub-agents and running mechanical
-rigor checks between rounds.
+should each district get?". Two pipelines share the rigor gates:
 
-## The four layers
+- **v1 (default, `python3 main.py "<question>"`)**: a **lead** agent
+  chains the stages PLAN → DATA → MODEL → ANALYZE → CRITIQUE → GATE →
+  WRITE, spawning specialist sub-agents and running mechanical rigor
+  checks between rounds.
+- **v2 (`python3 main.py --v2 "<question>"`)**: code owns the flow.
+  `agents/stage_machine.py` steps through the states SPEC → SIGN →
+  EVIDENCE → ENGINE_CHOICE → CONFIGURE → ANALYZE → CRITIQUE → GATE →
+  FIX_LOOP / OWNER_DECISION → WRITE → PRESENTATION → FINAL (the full
+  transition table is `EDGES` in that file) and persists them in
+  `run_state.json`. LLMs do bounded tasks (`agents/v2_tasks.py`,
+  `agents/v2_sdk_tasks.py`): draft the decision spec, pick an engine,
+  critique, plan and make fixes, write. Every number comes from harness
+  code: the owner-signed decision spec (`toolkit/spec/`), an engine
+  (`toolkit/engines/`) and the analysis engine (`toolkit/analysis/`).
+  Design: `docs/architecture-v2.md`, `docs/design/v2c-orchestration.md`,
+  `docs/design/v2-spec-and-analysis.md`.
+
+v1 stays supported until the owner retires it.
+
+## The layers
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
 │  ORCHESTRATION  main.py + agents/                              │
-│  Lead loop, agent registry, prompt definitions, skill          │
+│  v1: lead loop, agent registry, prompt definitions, skill      │
 │  attachments, tool/path enforcement (agents/enforcement.py).   │
 │  Runs the STAGE 7 validator after the session → final_gate.json│
+│  v2: stage machine (agents/stage_machine.py), findings ledger, │
+│  fix loop, bounded SDK tasks (agents/v2_sdk_tasks.py).         │
 └────────────┬───────────────────────────────────────────────────┘
              │
              ▼
@@ -37,13 +56,31 @@ rigor checks between rounds.
 │  sensitivity_analysis.py, figure_validator.py,                 │
 │  spec_compliance.py, coherence_audit.py, render_claims.py,     │
 │  eligibility_probe.py, etc. Shared helpers in scripts/lib/.    │
-│  Every script under scripts/ has --self-test.                  │
+│  Self-tests found and run by scripts/self_tests.py.            │
+└────────────┬───────────────────────────────────────────────────┘
+             │
+             ▼
+┌────────────────────────────────────────────────────────────────┐
+│  TOOLKIT  toolkit/   (v2 harness code; tested, reused by runs) │
+│  spec/ decision spec schema, priors, owner sign-off;           │
+│  engines/ malaria (Starsim), compartmental (Starsim),          │
+│  empirical package-rate, with cards and benchmarks;            │
+│  analysis/ calibration, uncertainty, sensitivity, decision     │
+│  tests, figures, claims (run.py); alloc/ costs, packages, ILP. │
+└────────────┬───────────────────────────────────────────────────┘
+             │
+             ▼
+┌────────────────────────────────────────────────────────────────┐
+│  CLOUD  cloud/ + scripts/compute.py   (IDM Coiled, optional)   │
+│  run_cluster.py launches runs from cloud/configs/*.py; keeper, │
+│  run health, VM jobs (vm_job.py), worker-side helpers.         │
+│  scripts/compute.py runs engine batches locally or on Dask.    │
 └────────────┬───────────────────────────────────────────────────┘
              │
              ▼
 ┌────────────────────────────────────────────────────────────────┐
 │  SKILLS  .claude/skills/                                       │
-│  57 SKILL.md files: process/rigor contracts (disease-agnostic),│
+│  58 SKILL.md files: process/rigor contracts (disease-agnostic),│
 │  epi fundamentals, frameworks (Starsim, LASER, stisim), and    │
 │  disease-specific skills (e.g. malaria-modeling).              │
 │  Attached to agents in agents/__init__.py.                     │
@@ -55,6 +92,8 @@ rigor checks between rounds.
 │  Per-question output: data/, models/, figures/, plan.md,       │
 │  results.md, decision_rule.md, report.md, critique_*.yaml,     │
 │  scope_declaration.yaml, final_gate.json, model_card.yaml.     │
+│  v2 runs add run_state.json, decision_spec.yaml (+ signoff),   │
+│  engine_choice.json, findings.jsonl, analysis/.                │
 └────────────────────────────────────────────────────────────────┘
 ```
 
@@ -69,17 +108,22 @@ rigor checks between rounds.
 | Add a new skill                       | Create `.claude/skills/<name>/SKILL.md` with `name`/`description` frontmatter, attach in `agents/__init__.py`, run `python3 scripts/validate_skill_attachments.py` |
 | Trace a phase change                  | `CHANGELOG.md` (phase commit ledger and gate internals); `changes/` for merged phases not yet folded in |
 | See what artifacts a run produces     | Any local `runs/<timestamp>_*/` directory. `runs/` is gitignored, so there is no checked-in example; run the pipeline or ask a maintainer for one. |
+| Understand the v2 run                 | `agents/stage_machine.py` (states, `EDGES`, `route_gate`), `agents/findings_ledger.py`, `agents/fix_loop.py`, `agents/analysis_backend.py`; design in `docs/design/v2c-orchestration.md` |
+| Change a v2 engine or the analysis    | `toolkit/engines/contract.py` (the Engine contract) and each engine's `card.yaml`; `toolkit/analysis/run.py`; `toolkit/spec/schema.py` |
+| Run on the cloud                      | `cloud/run_cluster.py` docstring (launch, status, collect, shutdown) and a config in `cloud/configs/`; `cloud-compute` skill |
 | Reuse a finished run's model          | `<run>/model_card.md` (written at finalize by `scripts/model_card.py`), then `python3 scripts/ask.py <run> --set <input>=<value>` (refuses anything outside the card's valid domain) |
 
 ## Agents
 
 The registry in `agents/__init__.py` (`_registry()`) is the source of
-truth for agents, models, tools, `maxTurns`, and skills. Current
+truth for v1 agents, models, tools, `maxTurns`, and skills. Current
 agents: `planner`, `data-agent`, `modeler`, `analyst`,
 `critique-methods` (opt-in, `--methods-critic`), `critique-domain`, `critique-premortem`,
 `critique-presentation`, `critique-redteam`, `critique-sufficiency`,
 `writer`. The lead may only spawn these registered types; built-in
-types such as `general-purpose` are denied.
+types such as `general-purpose` are denied. v2 does not spawn these
+agents: each of its LLM tasks is one bounded SDK session with a
+task-specific prompt and file tools only (`agents/v2_sdk_tasks.py`).
 
 Skills: process/rigor skills attach unconditionally; domain skills
 (`malaria-modeling`, `vectors`, Starsim/stisim sub-skills, …) attach
@@ -97,7 +141,7 @@ the live attachment picture.
 | Exit | Statuses |
 |------|----------|
 | 0    | `completed`, `completed_with_report_restored` |
-| 2    | `completed_scope_declared`, `completed_gate_not_accepted`, `completed_gate_error`, `completed_gate_not_run`, `completed_no_report`, `run_failed`, `budget_exhausted`, `awaiting_signoff`, `awaiting_scope_signoff`, `completed_scope_declined` |
+| 2    | `completed_scope_declared`, `completed_gate_not_accepted`, `completed_gate_error`, `completed_gate_not_run`, `completed_no_report`, `run_failed`, `budget_exhausted`, `awaiting_signoff`, `awaiting_scope_signoff`, `completed_scope_declined`, `paused:awaiting_signoff`, `paused:awaiting_scope_signoff` (v2) |
 | 1    | `harness_tampered`, `artifact_tampered`, errors |
 | 130  | `interrupted` |
 
@@ -105,9 +149,15 @@ the live attachment picture.
 β: declarations of findings that bear on the primary decision) are resumable
 with `--resume` once signed; `completed_scope_declined` means the owner
 declined such a declaration and no rounds were left to fix it.
+A v2 run (`main.py --v2`) prints `paused:<reason>` when its state machine
+stops for the owner, at SIGN (the decision spec: `python3
+agents/stage_machine.py sign <run_dir> --by owner`) or at OWNER_DECISION
+(scope declarations), and exits 2; `main.py --v2 --resume <run_dir>`
+continues from `run_state.json`.
 
-Cloud credentials (`AZ_*` / `AZURE_*`) are stripped from the agent
-environment unless `main.py --cloud` is passed.
+Cloud and third-party credentials (`AZ_*`, `AZURE_*`, `OPENAI_*`,
+`AWS_*`, `GOOGLE_*`) are blanked in the agent environment unless
+`main.py --cloud` is passed (`agents/enforcement.py`, `filtered_env`).
 
 ## Phase history
 
@@ -139,9 +189,12 @@ fragments (see Conventions).
 - **Fail closed**: a gate that cannot read, parse, or recognize its
   input (missing file, wrong type, unknown verdict string) must emit a
   finding, not return an empty list.
-- **Self-test discipline**: every script under `scripts/` (and
-  `scripts/lib/`), plus `main.py`, has a `--self-test` flag that runs
-  inline test cases. Run all of them before opening a PR (list below).
+- **Self-test discipline**: `main.py`, every module under `scripts/`,
+  `toolkit/` and `cloud/`, and the v2 harness modules under `agents/`
+  are expected to have a `--self-test` flag that runs inline test cases.
+  `scripts/self_tests.py` finds them; a module in that scope without one
+  fails discovery unless `EXEMPT` in that file names it with a reason.
+  Run them all before opening a PR (below).
 - **Retro-checks against real runs**: when a phase ships a new gate,
   the PR description includes a retro-check against a recent local
   `runs/` directory showing the gate produces the expected output.
@@ -156,47 +209,12 @@ fragments (see Conventions).
 
 ## How to verify changes end-to-end
 
-Before opening a PR, every command below must report
-"OK: all self-test cases passed." (or exit 0):
+Before opening a PR, every command below must exit 0 (each self-test
+reports "OK: all self-test cases passed."):
 
 ```bash
-for f in main.py \
-  scripts/alloc_toolkit_use.py scripts/allocation_robustness.py scripts/ask.py scripts/benchmark_gate.py scripts/benchmark_match.py \
-  scripts/benchmark_transfer.py scripts/model_card.py \
-  scripts/build_claims_ledger.py scripts/data_schema.py scripts/data_use.py \
-  scripts/cloud_batch.py scripts/coherence_audit.py \
-  scripts/comparator_efficiency.py scripts/compare_models.py scripts/compute.py scripts/convergence_report.py \
-  scripts/cross_model_critic.py scripts/decision_brief.py scripts/derived_rebuild.py scripts/done_when.py \
-  scripts/effect_size_registry.py \
-  scripts/assemble_changes.py \
-  scripts/effect_concordance.py \
-  scripts/effort_floors.py scripts/eligibility_probe.py \
-  scripts/figure_validator.py scripts/gate_replay.py scripts/headline_binding.py scripts/identifiability.py \
-  scripts/identifiability_a_priori.py scripts/lessons.py scripts/mechanism_manifest.py \
-  scripts/calibration_spec.py \
-  scripts/gate_fuzz.py \
-  scripts/numeric_consistency.py scripts/open_problems.py scripts/pipeline.py \
-  scripts/optimization_quality.py scripts/plan_criteria.py \
-  scripts/propagate_uncertainty.py scripts/render_claims.py \
-  scripts/results_store.py scripts/run_autopsy.py \
-  cloud/run_health.py \
-  scripts/sanity_checks.py scripts/sdk_scenarios.py \
-  scripts/sensitivity_analysis.py \
-  scripts/source_checks.py scripts/stall_rule.py \
-  scripts/spec_compliance.py scripts/structure_metrics.py scripts/validate_critique_yaml.py \
-  scripts/verdict_binding.py scripts/eval_suite.py scripts/lib/eval_paths.py \
-  scripts/uq_ci_quality.py scripts/validate_skill_attachments.py scripts/watch_run.py \
-  scripts/within_zone_sensitivity.py scripts/writer_qa.py \
-  scripts/lib/expert_priors.py scripts/lib/md_helpers.py \
-  scripts/lib/positive_control.py scripts/lib/provenance.py \
-  scripts/lib/rigor_artifacts.py scripts/lib/safe_io.py \
-  toolkit/alloc/costs.py toolkit/alloc/packages.py toolkit/alloc/optimize.py \
-  scripts/lib/text_spans.py scripts/lib/transcript_cost.py \
-  scripts/golden_traces.py agents/stage_machine.py agents/findings_ledger.py \
-  agents/fix_loop.py agents/analysis_backend.py agents/v2_sdk_tasks.py \
-  scripts/declaration_tests.py scripts/lib/scope_declarations.py scripts/scope_signoff.py; do
-  echo "== $f"; python3 "$f" --self-test || echo "FAILED: $f"
-done
+python3 scripts/self_tests.py --jobs 2             # every --self-test, as CI runs them
+python3 scripts/self_tests.py --list               # what runs, and each exemption's reason
 python3 scripts/validate_skill_attachments.py      # frontmatter + phantoms
 python3 scripts/lib/expert_priors.py --validate    # priors corroboration
 python3 scripts/regression_eval.py                 # planted-defect regression eval (CI)
@@ -218,7 +236,8 @@ nohup python3 main.py "<research question>" \
 ```
 
 The run produces `runs/<timestamp>_<question>/` with all artifacts and
-`final_gate.json` (the post-run validator decision).
+`final_gate.json` (the post-run validator decision). Add `--v2` to run
+the stage machine instead of the lead session.
 
 After the plan, the run waits for the owner to sign the decision brief
 (`python3 scripts/decision_brief.py show|sign <run_dir>`); use

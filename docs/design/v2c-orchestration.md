@@ -1,6 +1,7 @@
 # v2 workstream C: the code-owned state machine, the findings ledger and the fix loop
 
-**Status:** design note for review (2026-10-31), written before the code. It makes
+**Status:** design note (2026-10-31), written before the code and merged into `v2` with
+the implementation in PR #90 (follow-ups #94, #95). It makes
 `stage-machine.md` S3–S4 and `architecture-v2.md` (PR #82) §3.5–3.6 concrete for the v2
 pipeline. Branch `v2c-orchestrate`, PR into `v2`.
 

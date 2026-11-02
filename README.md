@@ -1,12 +1,17 @@
 # modeling-agentic
 
-A multi-agent system for building publication-quality epidemiological and public-health models, for any disease area (malaria, measles, TB, HIV, polio, NCDs, ...). Give it a research question; it researches the topic, pulls data, builds and calibrates models using established frameworks (Starsim, LASER, stisim, scipy/lmfit), runs quantitative rigor checks (uncertainty propagation, multi-structural comparison, identifiability), critiques the result from several angles (methods, domain, presentation, an adversarial red team, a pre-model pre-mortem, and a post-write evidence-sufficiency check), and a **mechanical STAGE 7 gate** then computes the decision (PATCH / RETHINK / ACCEPT / DECLARE_SCOPE / RUN_FAILED) from structured blocker YAMLs so critique agents cannot talk themselves into generous verdicts. Finally a writer assembles the report.
+A multi-agent system for building publication-quality epidemiological and public-health models, for any disease area (malaria, measles, TB, HIV, polio, NCDs, ...). It has two pipelines:
+
+- **v1 (the default)**: a lead agent and eleven specialist agents, described in most of this README.
+- **v2 (`main.py --v2`)**: code runs the pipeline as a state machine, every number comes from tested harness code (an owner-signed decision spec, a disease engine and the analysis engine), and LLMs do bounded tasks. See [v2: the stage machine](#v2-the-stage-machine).
+
+v1 stays supported until the owner retires it. In v1, you give it a research question; it researches the topic, pulls data, builds and calibrates models using established frameworks (Starsim, LASER, stisim, scipy/lmfit), runs quantitative rigor checks (uncertainty propagation, multi-structural comparison, identifiability), critiques the result from several angles (methods, domain, presentation, an adversarial red team, a pre-model pre-mortem, and a post-write evidence-sufficiency check), and a **mechanical STAGE 7 gate** then computes the decision (PATCH / RETHINK / ACCEPT / DECLARE_SCOPE / RUN_FAILED) from structured blocker YAMLs so critique agents cannot talk themselves into generous verdicts. Finally a writer assembles the report.
 
 Built on the [Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview).
 
-> **Working in this codebase?** Read [`CLAUDE.md`](./CLAUDE.md) first — it lays out the four layers (orchestration / rigor gates / skills / runs), the agent registry, run exit statuses, conventions, and the self-test list. The phase-by-phase history is in [`CHANGELOG.md`](./CHANGELOG.md).
+> **Working in this codebase?** Read [`CLAUDE.md`](./CLAUDE.md) first — it lays out the layers (orchestration / rigor gates / toolkit / cloud / skills / runs), the agent registry, run exit statuses, conventions, and how to run every self-test. The phase-by-phase history is in [`CHANGELOG.md`](./CHANGELOG.md).
 
-## Architecture
+## Architecture (v1)
 
 A single **lead agent** orchestrates eleven specialist subagents through a staged pipeline. The lead delegates via the `Agent` tool (registered agent types only), invokes the mechanical validator, makes PATCH/RETHINK decisions, and tracks state in `pipeline_state.yaml` for crash-safe resume. A PreToolUse hook (`agents/enforcement.py`) stops agents from editing harness code or files they don't own: the lead cannot write critique YAMLs or `models/**`, and script outputs can only be written by their scripts. The harness is hashed at start and end of a run, and any change marks the run `harness_tampered`.
 
@@ -27,7 +32,7 @@ A single **lead agent** orchestrates eleven specialist subagents through a stage
 
 `agents/__init__.py` (`_registry()`) is the source of truth for this table.
 
-## Pipeline
+## Pipeline (v1)
 
 ```
 Question
@@ -74,6 +79,47 @@ Question
 
 Stages 4–7 loop up to `--max-rounds` times. STAGE 7 is not a judgment call — the lead runs the validator and executes whatever action the exit code prescribes. The multi-line `STAGE 7 decision (round N/M)` stderr block is pasted verbatim into `progress.md` as an audit trail.
 
+## v2: the stage machine
+
+`python3 main.py --v2 "<question>"` runs `agents/stage_machine.py` instead of the lead session. Code owns the state, every transition and every number; the state is saved to `run_state.json` after each transition, so `main.py --v2 --resume <run_dir>` continues where a run stopped.
+
+```
+SPEC → SIGN → EVIDENCE → ENGINE_CHOICE → CONFIGURE → ANALYZE → CRITIQUE → GATE
+                                                                            │
+        ┌───────────────────────────┬───────────────────────────────────────┤
+        ▼                           ▼                                       ▼
+    FIX_LOOP                  OWNER_DECISION                              WRITE → PRESENTATION → GATE (post-write) → FINAL
+ (back to CRITIQUE,            (back to GATE)
+  SPEC or ENGINE_CHOICE)
+```
+
+The full transition table is `EDGES` in `agents/stage_machine.py`.
+
+| State | What happens | Who |
+|---|---|---|
+| SPEC, SIGN | An LLM task drafts `decision_spec.yaml` (question, decision maker, engine, interventions, costs, budget, outcomes, analysis settings); `toolkit/spec/schema.py` validates it; the owner signs its sha256 (`python3 agents/stage_machine.py sign <run_dir> --by owner`) | LLM task, then owner |
+| EVIDENCE | Placeholder in this version | harness |
+| ENGINE_CHOICE | An LLM task picks one of the eligible engines; the harness records `engine_choice.json` | LLM task, harness |
+| CONFIGURE | The harness checks the spec against the engine and writes the run's build pipeline (`models/pipeline.yaml`) | harness |
+| ANALYZE | `toolkit/analysis/run.py`: engine batch or direct runs, calibration with identifiability, point outcomes and the `toolkit/alloc` optimum, uncertainty, leave-one-group-out stability, sensitivity, decision tests, figures, claims ledger, deliverable CSV, each under `analysis/` | harness |
+| CRITIQUE | `critique-domain` and `critique-redteam` write today's critique YAML schema | LLM tasks |
+| GATE | The STAGE 7 validator's rule functions, run in-process on the findings ledger (`findings.jsonl`) | harness |
+| FIX_LOOP | An LLM task plans fixes; each fix is one bounded task, and the harness measures its effect (`impact_ledger.jsonl`) | LLM tasks, harness |
+| OWNER_DECISION | Waits for the owner on scope declarations that bear on the decision | owner |
+| WRITE, PRESENTATION | An LLM task writes `manuscript.md`; the harness renders `report.md` from the claims ledger; `critique-presentation` reviews the draft before the post-write gate | LLM tasks, harness |
+
+Each LLM task is one short Agent SDK session (`agents/v2_sdk_tasks.py`) with a task prompt, file tools only (Read, Glob, Grep, Write, Edit), a turn cap, a dollar cap and a hook that refuses writes outside the files the task owns. A run that stops for the owner prints `paused:awaiting_signoff` or `paused:awaiting_scope_signoff` and exits 2.
+
+**Engines** (`toolkit/engines/`, behind the contract in `toolkit/engines/contract.py`; each has a `card.yaml` listing its mechanisms, parameters and valid domain):
+
+| Engine | What it is |
+|---|---|
+| `malaria/` | Starsim malaria engine (human natural history and immunity, species-specific vectors, vector control and treatment interventions), fitted once to trial benchmarks (`malaria/benchmarks/`) |
+| `compartmental/` | Starsim group-level transmission engine (age bands or birth cohorts, contact matrix, seasonal forcing) |
+| `empirical/` | Package-rate engine: per-unit rates and per-package rate ratios estimated from a unit panel |
+
+Design notes: `docs/architecture-v2.md`, `docs/design/v2c-orchestration.md` (state machine), `docs/design/v2-spec-and-analysis.md` (spec and analysis), `docs/design/v2a-malaria-engine.md`, `docs/design/v2d-compartmental-engines.md`.
+
 ## Mechanical backstops (what the gate catches that critique agents miss)
 
 Adversarial critique alone has proven insufficient: in early runs, critique agents accepted reports that shipped with registered-but-unused parameters, calibration data more than a decade older than the decision year, and allocation tables of several hundred rows without an articulated rule. Phase 1.5, Phase 2, and Phase 3 added a series of pure-function checks that run independently of critique judgment.
@@ -102,13 +148,16 @@ The modeler ships these alongside the model code:
 
 ## Cloud compute (optional)
 
-Azure Batch support for slow `outcome_fn` evaluations. `scripts/propagate_uncertainty.py --cloud` submits each draw as a Batch task on `Standard_D4s_v5` dedicated nodes (or `Standard_A2_v2` for free-trial quota). See the `cloud-compute` skill. Credentials live in `.env` (`AZ_*`) and are passed to agents only when `main.py --cloud` is set. Pools created by a run are deleted in a `finally` block. Install the extras with `pip install -r requirements-cloud.txt`.
+**IDM Coiled (current).** `cloud/run_cluster.py <config.py> launch` starts a whole run (v1 or v2) on Coiled from a config in `cloud/configs/`. Each run gets its own agent VM, keeps running when the launching laptop disconnects, and uploads its directory to the project storage account when it ends; `status`, `collect`, `health`, `sign` and `shutdown` manage it (see the script's docstring). `cloud/vm_job.py` runs detached jobs on a single VM. Inside a run, `scripts/compute.py map` fans batches of model evaluations (calibration grids, uncertainty draws, v2 engine batches) out over the run's Dask workers, or runs them locally. See the `cloud-compute` skill.
+
+**Azure Batch (legacy, v1).** `scripts/propagate_uncertainty.py --cloud` can submit each uncertainty draw as an Azure Batch task through `scripts/cloud_batch.py`. Credentials live in `.env` (`AZ_*`) and are passed to agents only when `main.py --cloud` is set. Pools created by a run are deleted in a `finally` block. Install the extras with `pip install -r requirements-cloud.txt`.
 
 ## Skills ecosystem
 
-56 skills under `.claude/skills/`, attached per-agent in `agents/__init__.py`. Domain skills attach only when the question matches their trigger words. See `.claude/skills/README.md` for the indexed list; broad groups:
+58 skills under `.claude/skills/`, attached per-agent in `agents/__init__.py`. Domain skills attach only when the question matches their trigger words. See `.claude/skills/README.md` for the indexed list; broad groups:
 
-- **Pipeline rigor** — `adversarial-redteam`, `critique-blockers-schema`, `spec-compliance-rules`, `effect-size-priors`, `uncertainty-quantification`, `multi-structural-comparison`, `identifiability-analysis`, `decision-rule-extraction`
+- **Pipeline rigor** — `adversarial-redteam`, `critique-blockers-schema`, `spec-compliance-rules`, `effect-size-priors`, `uncertainty-quantification`, `multi-structural-comparison`, `identifiability-analysis`, `pre-model-identifiability-arithmetic`, `decision-rule-extraction`, `benchmark-locked-acceptance`, `evidence-sufficiency`, `pre-mortem-domain`, `sanity-schema`, `sensitivity-analysis-remediation`
+- **Allocation and decisions** — `decision-spec` (v2), `allocation-toolkit`, `allocation-cross-validation`, `optimizer-method-selection`, `daly-weighted-analysis`, `eligible-population-consistency`, `ecological-fallacy-quantification`, `mechanistic-vs-hybrid-architecture`
 - **Modeling strategy & evaluation** — `modeling-strategy`, `modeling-fundamentals`, `model-fitness`, `model-validation`, `investigation-threads`
 - **Epi fundamentals** — `basic_epi_modeling`, `sir-models`, `sir-elaborations`, `parameter-estimation`, `vaccination`, `vectors`, `surveillance`
 - **Disease-specific** — `malaria-modeling`
@@ -142,15 +191,22 @@ python main.py "Which districts should receive measles follow-up campaigns next 
 |------|:-:|---------|
 | `--max-rounds N` | 5 | Max critique-revision cycles |
 | `--max-sessions N` | 10 | Max top-level sessions (for retry-after-crash / context recovery) |
-| `--resume runs/<dir>` | — | Resume a prior run from its `pipeline_state.yaml` or detected artifacts |
-| `--cloud` | off | Pass Azure credentials to agents for Batch UQ |
+| `--resume runs/<dir>` | — | Resume a prior run from its `pipeline_state.yaml` or detected artifacts (v2: from `run_state.json`) |
+| `--v2` | off | Run the v2 stage machine instead of the lead session |
+| `--signoff owner\|lead\|none` | owner | Who signs the decision brief (v1) or the decision spec (v2) before compute; `lead` for unattended test runs |
+| `--signoff-hours H` | 24 | How long a v1 owner sign-off wait lasts before the run pauses (resumable) |
+| `--max-budget-usd X` | — | Hard dollar cap for the whole run, including earlier sessions of a resumed run |
+| `--methods-critic` | off | Add `critique-methods` to every v1 STAGE 6 |
+| `--cross-model` | off | Add the Codex CLI cross-model critic to every v1 STAGE 6 (sends run artifacts to OpenAI) |
+| `--cloud` | off | Pass cloud credentials (`AZ_*`, `AZURE_*`) to agents |
+| `--preflight-only` / `--skip-preflight` | — | Run only the ~1-minute live preflight, or skip it (v1) |
 | `--self-test` | — | Run inline self-tests (no API calls) and exit |
 
-Exit codes: 0 accepted (`completed`, `completed_with_report_restored`); 2 finished without an accepted gate (`completed_scope_declared`, `completed_gate_not_accepted`, `completed_gate_error`, `completed_gate_not_run`, `completed_no_report`, `run_failed`); 1 `harness_tampered` or error; 130 interrupted.
+Exit codes: 0 accepted (`completed`, `completed_with_report_restored`); 2 finished without an accepted gate, or paused for the owner (resumable); 1 `harness_tampered`, `artifact_tampered` or error; 130 interrupted. The full status list is in `CLAUDE.md` ("Run outcomes").
 
 ## Run outputs
 
-Each run writes to `runs/<timestamp>_<slug>/`:
+Each v1 run writes to `runs/<timestamp>_<slug>/` (a v2 run adds `run_state.json`, `decision_spec.yaml` and its signoff, `engine_choice.json`, `findings.jsonl`, `impact_ledger.jsonl` and `analysis/`):
 
 ```
 runs/<timestamp>_<question-slug>/      (gitignored; local only)
@@ -210,9 +266,11 @@ runs/<timestamp>_<question-slug>/      (gitignored; local only)
 | `scripts/eligibility_probe.py` | Behavioral check that targeted-intervention benefits scale with the eligible population |
 | `scripts/coherence_audit.py`, `scripts/render_claims.py` | Claims-ledger rendering and report↔ledger binding audit |
 | `scripts/effort_floors.py`, `scripts/benchmark_match.py` | Effort minimums and published-benchmark acceptance bands |
-| `scripts/cloud_batch.py` | Azure Batch SDK wrapper (pool mgmt, task submit, teardown) |
+| `scripts/compute.py` | Compute service: fans batches of model evaluations out locally or over Dask/Coiled workers |
+| `scripts/cloud_batch.py` | Azure Batch SDK wrapper (legacy; pool mgmt, task submit, teardown) |
+| `scripts/self_tests.py` | Finds and runs every module's `--self-test` (as CI does) |
 
-## Crash recovery and resume
+## Crash recovery and resume (v1)
 
 Long runs (4–8 hours) occasionally crash mid-pipeline (API overload, OOM, orphaned processes). Handled in two places:
 
@@ -231,16 +289,25 @@ Long runs (4–8 hours) occasionally crash mid-pipeline (API overload, OOM, orph
 
 ```
 modeling-agentic/
-├── main.py                    CLI entry point + retry/resume loop
+├── main.py                    CLI entry point + retry/resume loop (v1), --v2 dispatch
 ├── agents/
-│   ├── __init__.py            Lead prompt, agent registry, hooks
+│   ├── __init__.py            Agent registry (v1)
+│   ├── lead_prompt.py, hooks.py, run_*.py   Lead prompt, hooks, session/budget/preflight/finish (v1)
 │   ├── enforcement.py         PreToolUse path/agent denies, harness hashing, env filtering
+│   ├── integrity.py           Hash record of protected run artifacts
 │   ├── planner.py, data.py, modeler.py, analyst.py
 │   ├── critique_{methods,domain,presentation,premortem,sufficiency}.py
 │   ├── red_team.py
-│   └── writer.py
+│   ├── writer.py
+│   └── stage_machine.py, findings_ledger.py, fix_loop.py, analysis_backend.py,
+│       v2_tasks.py, v2_sdk_tasks.py   v2 state machine and its bounded LLM tasks
+├── toolkit/                   v2 harness code: spec/, engines/, analysis/, alloc/
+├── cloud/                     Coiled launcher (run_cluster.py), configs/, keeper, VM jobs, run health
 ├── scripts/                   Mechanical validators + rigor scripts (scripts/lib/ shared helpers)
-├── .claude/skills/            56 skills attached to agents by role
+├── evals/                     Eval-suite questions (public half; scripts/eval_suite.py)
+├── docs/                      Architecture and design notes (docs/design/)
+├── changes/                   One change fragment per PR, folded into CHANGELOG.md at release
+├── .claude/skills/            58 skills attached to agents by role
 ├── .claude/orchestration/     rigor_artifacts.yaml, effort_floors.yaml, expert_priors.yaml
 ├── CHANGELOG.md               Phase ledger
 ├── runs/                      Timestamped run outputs (gitignored)
