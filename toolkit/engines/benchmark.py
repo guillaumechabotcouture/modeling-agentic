@@ -1661,6 +1661,70 @@ def _self_test() -> int:
         ok(d1 != d2, "BP52 (Codex r2-4) a changed named configuration (or threshold file) changes the case digest")
     except Exception as ex:  # noqa: BLE001
         ok(False, f"BP52 configuration in the digest ({type(ex).__name__}: {ex})")
+    # owner decision 2026-11-02 (SB2b): a declared share of sampler refusals is allowed, each counted as a MISS
+    try:
+        from toolkit.analysis.calibration import CalibrationRefused as _CR
+
+        def _cal_refuse_some(make_engine, data, every=50, **k):
+            if int(round(abs(data["y"][0]) * 1e6)) % every == 0:
+                raise _CR("posterior_ess", "effective sample size 513 below the floor 1000 after 12 adaptive stages")
+            return _cal(make_engine, data)
+        om.calibrate_refuse_some = _cal_refuse_some
+        om.calibrate_other_error = lambda make_engine, data, **k: (_ for _ in ()).throw(ValueError("bad input"))
+        base = {"type": "coverage", "generator": {"fn": "normal", "args": {}}, "replicates": 60, "seed": 3,
+                "quantities": ["mu"], "band": [0.85, 1.0]}
+        p17 = dict(p6, coverage_scoring={"refusal_share_max": 0.02}, benchmarks=[
+            {"id": "Q1", "metric": "rare refusals", "estimand": dict(base, calibrator={"fn": "_bp_oracles:calibrate_refuse_some",
+                                                                                         "args": {"every": 10 ** 9}})},
+            {"id": "Q2", "metric": "no refusals", "estimand": dict(base, calibrator={"fn": "_bp_oracles:calibrate_normal"})},
+            {"id": "Q3", "metric": "other errors", "estimand": dict(base, calibrator={"fn": "_bp_oracles:calibrate_other_error"},
+                                                                    replicates=3, band=[0.0, 1.0])}])
+        r17 = {x["id"]: x for x in run_pack(p17, eng, Runner(p17, eng, 1), {})["benchmarks"]}
+        # force exactly one refusal in Q1: the replicate whose first observation rounds to a multiple of `every`
+        ref1 = r17["Q1"].get("refusals")
+        cov1, cov2 = r17["Q1"]["coverage"]["mu"], r17["Q2"]["coverage"]["mu"]
+        ok(ref1 == 0 and cov1 == cov2 and r17["Q1"]["status"] == r17["Q2"]["status"]
+           and r17["Q3"]["status"] == "out_of_band" and r17["Q3"].get("refusals") == 0,
+           f"BP53a refusals are counted apart from other failures ({ref1}, {r17['Q3'].get('refusals')})")
+        ids = []
+        for r in range(60):
+            dat, _t = _gen(np.random.default_rng([3, r]))
+            ids.append(int(round(abs(dat["y"][0]) * 1e6)))
+        one = next(m for m in range(2, 10 ** 6) if sum(i % m == 0 for i in ids) == 1)
+        two = next(m for m in range(2, 10 ** 6) if sum(i % m == 0 for i in ids) == 2)
+        p18 = dict(p17, benchmarks=[
+            {"id": "R1", "metric": "one refusal in 60", "estimand": dict(base, calibrator={
+                "fn": "_bp_oracles:calibrate_refuse_some", "args": {"every": one}}, refusal_share_max=0.02)},
+            {"id": "R2", "metric": "two refusals in 60", "estimand": dict(base, calibrator={
+                "fn": "_bp_oracles:calibrate_refuse_some", "args": {"every": two}})}])
+        r18 = {x["id"]: x for x in run_pack(p18, eng, Runner(p18, eng, 1), {})["benchmarks"]}
+        hit_q2 = round(cov2 * 60)
+        ok(r18["R1"].get("refusals") == 1 and r18["R1"]["coverage"]["mu"] <= (hit_q2 - 0) / 60
+           and r18["R1"]["coverage"]["mu"] >= (hit_q2 - 1) / 60 and r18["R1"].get("refusal_share_max") == 0.02
+           and r18["R1"]["status"] == ("in_band" if r18["R1"]["coverage"]["mu"] >= 0.85 else "out_of_band")
+           and r18["R2"].get("refusals") == 2 and r18["R2"]["status"] == "out_of_band",
+           f"BP53 a refusal counts as a miss in the coverage, up to the declared share (1/60 within 2%, 2/60 above): "
+           f"{r18['R1'].get('refusals')}, {r18['R1']['coverage']}, {r18['R1']['status']}; "
+           f"{r18['R2'].get('refusals')}, {r18['R2']['status']}")
+        # re-scoring stored results: allowed when only the scoring fields changed, refused otherwise
+        old = stamp(run_pack(p18, eng, Runner(p18, eng, 1), {}), eng)
+        new = dict(p18, benchmarks=[dict(p18["benchmarks"][0], estimand=dict(p18["benchmarks"][0]["estimand"],
+                                                                                band=[0.95, 1.0])),
+                                    p18["benchmarks"][1]])
+        rs = rescore_results(new, old, p18, eng)
+        bad = dict(p18, benchmarks=[dict(p18["benchmarks"][0], estimand=dict(p18["benchmarks"][0]["estimand"], seed=4)),
+                                    p18["benchmarks"][1]])
+        try:
+            rescore_results(bad, old, p18, eng)
+            refused = False
+        except ValueError:
+            refused = True
+        ok(rs["benchmarks"][0]["band"] == [0.95, 1.0] and rs["benchmarks"][0]["status"] == "out_of_band"
+           and rs["benchmarks"][0].get("rescored_from") and refused,
+           "BP54 stored results are re-scored when only the band, classes or refusal share changed; a changed "
+           "computation (seed, generator, calibrator) is refused")
+    except Exception as ex:  # noqa: BLE001
+        ok(False, f"BP53-54 refusals and re-scoring ({type(ex).__name__}: {ex})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
