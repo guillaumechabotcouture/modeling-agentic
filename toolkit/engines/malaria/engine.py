@@ -112,6 +112,9 @@ _PARAMS = [
 # horizon.start. Births 37 and deaths 11 per 1,000 per year (_demog); 0.0269 per year is the growth measured in the
 # pre-v0.5 burn-in diagnostic (ENGINE_NOTES.md, v0.5) and checked by self-test V2.
 POP_GROWTH = 0.0269
+# Starsim 3.3.2's Births and Deaths add and remove no one in a sim that starts before 1900 (measured: 500 agents from
+# 1890 or 1899 stay 500 for 5 years; from 1900, 73 births). A burn-in that would start earlier fails closed (V2c).
+MIN_START_YEAR = 1900.0
 # Parameters read only by package components (after the fork) or by the outcome accounting in the decision window:
 # param sets that differ only in these share one burn-in (checked by V5). cfp_kill and cfp_half act through dual-AI
 # nets, so they join the burn-in key when past campaigns used dual-AI nets (hist_net: dual).
@@ -274,6 +277,10 @@ class MalariaEngine:
         if B < 0 or abs(B - round(B)) > 1e-9:
             raise ValueError(f"burnin_years must be a whole number of years >= 0 (got {B:g})")
         B = int(round(B))
+        if float(horizon.start) - B < MIN_START_YEAR:
+            raise ValueError(f"the sim would start in {float(horizon.start) - B:g} (horizon.start {horizon.start:g} - "
+                             f"burnin_years {B}); Starsim 3.3.2 births and deaths do nothing before {MIN_START_YEAR:g}, "
+                             "so the population would not grow: shorten the burn-in or move the horizon")
         n = int(P["n_agents"])
         n0 = n if B == 0 else max(int(round(n * np.exp(-POP_GROWTH * B))), 50)
         season = np.asarray(a.get("season", [1.0] * 12), float)
@@ -621,6 +628,11 @@ def _self_test_v05(ok, e, unit) -> None:
            f"V9 (review P2) households keep their declared mean size (hh_size 5) while the population grows: {hs}")
         s0 = e.initial_state({"n_agents": n, "burnin_years": 0}, u, horizon=hz, seed=1)
         ok(s0["N"] == n and s0["N0"] == n, "V2b without a burn-in the population at horizon.start is n_agents exactly")
+        try:
+            e.initial_state({"n_agents": n, "burnin_years": 140}, u, horizon=hz, seed=1)
+            ok(False, "V2c a burn-in starting before 1900 (Starsim demography inactive) fails closed")
+        except ValueError as ex:
+            ok("1900" in str(ex), "V2c a burn-in starting before 1900 (Starsim demography inactive) fails closed")
     case("V2", v2)
 
     def v3():
