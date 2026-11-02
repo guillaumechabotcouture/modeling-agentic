@@ -103,11 +103,38 @@ details.question div { white-space: pre-wrap; color: var(--ink); max-height: 240
 .fig .c { font-size: 13px; margin-top: 8px; }
 .fig .p { font-size: 11.5px; color: var(--faint); margin-top: 2px; }
 .empty { color: var(--muted); font-size: 13.5px; padding: 18px 2px; }
-table.cmp { border-collapse: collapse; width: 100%; font-size: 13px; margin: 6px 0 4px; }
+table.cmp { border-collapse: collapse; width: 100%; table-layout: fixed; font-size: 13px; margin: 6px 0 4px; }
+table.cmp th:first-child { width: 40%; }
+table.cmp td { overflow-wrap: anywhere; }
 table.cmp th, table.cmp td { text-align: left; padding: 5px 10px 5px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
 table.cmp th { font-weight: 500; color: var(--muted); }
 table.cmp tr.ch td { color: var(--ink); font-weight: 500; }
 table.cmp .n { text-align: right; font-variant-numeric: tabular-nums; }
+table.cmp tr.ch td { background: color-mix(in srgb, var(--accent-soft) 55%, transparent); }
+.term { border-bottom: 1px dotted var(--faint); cursor: help; }
+.ctx { font-size: 12.5px; color: var(--muted); margin: 2px 0 8px; }
+.ctx b { font-weight: 500; color: var(--ink); }
+table.t { border-collapse: collapse; width: 100%; font-size: 13px; margin-top: 4px; }
+table.t th { text-align: left; font-weight: 500; color: var(--muted); font-size: 12px; padding: 4px 10px 4px 0; border-bottom: 1px solid var(--line); }
+table.t td { padding: 6px 10px 6px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+table.t tr:last-child td { border-bottom: none; }
+table.t td:first-child { max-width: 140px; overflow-wrap: anywhere; }
+table.t.fixed { table-layout: fixed; } table.t.fixed td { overflow-wrap: anywhere; max-width: none; }
+table.t .n, .md td.n, .md th.n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+table.t td.clip { max-width: 0; width: 46%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+table.t tr.row { cursor: pointer; } table.t tr.row:hover td { background: var(--soft); }
+table.t tr.more td { background: var(--bg); padding: 10px 12px; white-space: normal; }
+table.t tr.grp td { padding-top: 10px; font-size: 12.5px; color: var(--muted); }
+.ok-i { color: var(--ok); } .bad-i { color: var(--bad); }
+.stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px 18px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 18px; margin: 14px 0 6px; }
+.stat .k { font-size: 12px; color: var(--muted); }
+.stat .v { font-size: 18px; font-weight: 600; line-height: 1.3; }
+.stat .v.hero { font-size: 22px; }
+.stat .d { font-size: 12px; color: var(--muted); }
+.stat .s { font-size: 11px; color: var(--faint); background: none; border: none; padding: 0; cursor: pointer; }
+.stat .s:hover { color: var(--accent); }
+.stat.wide { grid-column: span 2; }
+.md .doc-h1 { font-size: 12.5px; color: var(--muted); font-weight: 400; margin: 0 0 10px; }
 .cmp-h { font-size: 13px; font-weight: 600; margin: 18px 0 2px; }
 .stream { flex: 1; overflow-y: auto; min-height: 0; }
 .stream .wrap { padding-top: 14px; padding-bottom: 28px; }
@@ -160,7 +187,7 @@ table.cmp .n { text-align: right; font-variant-numeric: tabular-nums; }
 .lines div.hit { background: var(--accent-soft); }
 .md h1 { font-size: 18px; white-space: normal; } .md h2 { font-size: 16px; margin-top: 18px; } .md h3 { font-size: 14.5px; }
 .md table { border-collapse: collapse; font-size: 13px; margin: 8px 0; }
-.md td, .md th { border: 1px solid var(--line); padding: 3px 8px; }
+.md table.t { margin: 10px 0 14px; }
 .md .hit { background: var(--accent-soft); }
 .md p:first-child { margin-top: 0; } .md p:last-child { margin-bottom: 0; }
 .muted { color: var(--muted); } .small { font-size: 12.5px; }
@@ -198,6 +225,7 @@ label.inline { display: inline-flex; gap: 4px; align-items: center; margin-right
       <div class="crumb"><button class="link" id="navbtn">☰ Runs</button><span id="crumb"></span><span class="acts" id="acts"></span></div>
       <h1 id="title">Select a run</h1>
       <div class="meta" id="meta"></div>
+      <div class="ctx" id="stopline" hidden></div>
       <details class="question" id="qbox" hidden><summary>Question</summary><div id="qtext"></div></details>
     </div></header>
     <div class="stepper"><div class="wrap"><div class="steps" id="stepper"></div><div class="stepnote"><span class="views"><button id="v-stream" class="on">Stream</button><button id="v-figs">Figures</button></span><span id="stepnote"></span></div></div></div>
@@ -262,6 +290,31 @@ const day = (at) => { const d = new Date(at); return isNaN(d) ? "" : d.toLocaleD
 const hhmm = (at) => (at && /T\d\d:\d\d/.test(at)) ? at.slice(11, 16) : "";
 const when = (at) => at ? `<span class="tm" title="${esc(at)}">${esc(day(at))} ${esc(hhmm(at))}</span>` : "";
 const usd = (x) => "$" + Number(x || 0).toFixed(2);
+function num(v, unit) {   // 12.34M, 86.6M, 147.1K, $260.7M; small values as is with separators
+  if (v == null || v === "" || isNaN(v)) return v == null ? "—" : String(v);
+  const a = Math.abs(v), pre = unit === "usd" ? "$" : "";
+  const c = a >= 1e9 ? (v / 1e9).toFixed(2) + "B" : a >= 1e6 ? (v / 1e6).toFixed(2) + "M" : a >= 1e4 ? (v / 1e3).toFixed(1) + "K"
+    : Number.isInteger(v) ? v.toLocaleString("en-US") : Number(v.toPrecision(6)).toLocaleString("en-US", { maximumFractionDigits: 6 });
+  return pre + c;
+}
+const UNIT = { dalys: "DALYs", usd: "", units: "units" };
+const unitWord = (u) => (u in UNIT ? UNIT[u] : u);
+const pct = (x, d = 1) => x == null ? "—" : `${Number(x).toFixed(d)}%`;
+function uiText(lo, hi, level) {   // "95% UI 11.29–13.65M"
+  const sfx = (v) => { const a = Math.abs(v); return a >= 1e9 ? "B" : a >= 1e6 ? "M" : a >= 1e4 ? "K" : ""; };
+  const s = sfx(hi), f = (v) => num(v).replace(/[BMK]$/, "");
+  return `${Math.round((level || 0.95) * 100)}% ${T("UI")} ${f(lo)}–${f(hi)}${s && sfx(lo) === s ? s : ""}`;
+}
+function T(key, label) {   // a glossary term: dotted underline, the definition and its source on hover
+  const g = S.meta && S.meta.glossary && S.meta.glossary[key];
+  return g ? `<span class="term" tabindex="0" title="${esc(g.text + " (" + g.source + ")")}">${esc(label || key)}</span>` : esc(label || key);
+}
+function bench(text) {     // benchmark ids in run text, defined by the run's engine card
+  const B = (S.run && S.run.benchmarks) || {};
+  return esc(text).replace(/\bB\d+[a-z]?\b/g, (id) => B[id] ? `<span class="term" tabindex="0" title="${esc(`${id}: ${B[id].metric || ""}. Role ${String(B[id].role || "?").replace("_", " ")}; target ${B[id].target} (band ${(B[id].band || []).join("–")}); engine ${B[id].computed}; ${String(B[id].status || "").replace(/_/g, " ")}.`)}">${id}</span>` : id);
+}
+const clip = (t, n) => (t.length <= n ? t : t.slice(0, n).replace(/\s+\S*$/, "") + "…");
+const ctx = (what, needs) => `<div class="ctx">${what} <b>Needs you: ${needs}</b></div>`;
 const fmtS = (s) => s >= 3600 ? (s / 3600).toFixed(1) + " h" : s >= 60 ? Math.round(s / 60) + " min" : s + " s";
 
 // ---- markdown (small, local) with [[file#anchor]] citations
@@ -271,16 +324,21 @@ function inline(s) {
   s = s.replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>").replace(/(^|[\s(])\*([^*\s][^*]*)\*/g, "$1<i>$2</i>");
   return s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1");   // links render as text: nothing leaves the page
 }
-function md(src) {
+const NUMCELL = /^[-+]?[$]?\d[\d,]*(\.\d+)?%?$/;
+function cellNum(c) { const t = c.trim(); if (!NUMCELL.test(t)) return null; const v = Number(t.replace(/[$,%]/g, "")); return /\./.test(t) || t.includes("%") || Math.abs(v) < 10000 ? t : t.replace(/[\d.]+/, (x) => Number(x).toLocaleString("en-US")); }
+function md(src, doc) {
   const L = String(src || "").split("\n"), out = []; let i = 0;
   while (i < L.length) {
     let l = L[i];
     if (/^```/.test(l)) { const b = []; i++; while (i < L.length && !/^```/.test(L[i])) b.push(L[i++]); i++; out.push("<pre>" + esc(b.join("\n")) + "</pre>"); continue; }
     let m = l.match(/^(#{1,4})\s+(.*)/);
+    if (m && doc && m[1].length === 1) { out.push(`<div class="doc-h1" data-h="${esc(m[2].trim())}">${inline(m[2])}</div>`); i++; continue; }
     if (m) { out.push(`<h${m[1].length} data-h="${esc(m[2].trim())}">${inline(m[2])}</h${m[1].length}>`); i++; continue; }
     if (/^\s*\|/.test(l)) { const rows = []; while (i < L.length && /^\s*\|/.test(L[i])) rows.push(L[i++]);
       const cells = (r) => r.trim().replace(/^\||\|$/g, "").split("|").map((c) => c.trim());
-      let h = "<table>"; rows.forEach((r, k) => { if (/^\s*\|?\s*:?-{2,}/.test(r)) return; const tag = k === 0 ? "th" : "td"; h += "<tr>" + cells(r).map((c) => `<${tag}>${inline(c)}</${tag}>`).join("") + "</tr>"; });
+      const body = rows.slice(1).filter((r) => !/^\s*\|?\s*:?-{2,}/.test(r)).map(cells), ncol = cells(rows[0]).length;
+      const isNum = [...Array(ncol).keys()].map((j) => body.length && body.every((r) => r[j] == null || r[j] === "" || cellNum(r[j]) != null));
+      let h = '<table class="t">'; rows.forEach((r, k) => { if (/^\s*\|?\s*:?-{2,}/.test(r)) return; const tag = k === 0 ? "th" : "td"; h += "<tr>" + cells(r).map((c, j) => `<${tag}${isNum[j] ? ' class="n"' : ""}>${isNum[j] && k ? esc(cellNum(c) || c) : inline(c)}</${tag}>`).join("") + "</tr>"; });
       out.push(h + "</table>"); continue; }
     if (/^\s*([-*]|\d+\.)\s+/.test(l)) { const ord = /^\s*\d+\./.test(l), it = [];
       while (i < L.length && /^\s*([-*]|\d+\.)\s+/.test(L[i])) { let t = L[i++].replace(/^\s*([-*]|\d+\.)\s+/, ""); while (i < L.length && /^\s{2,}\S/.test(L[i]) && !/^\s*([-*]|\d+\.)\s+/.test(L[i])) t += " " + L[i++].trim(); it.push("<li>" + inline(t) + "</li>"); }
@@ -321,12 +379,13 @@ function runRow(r, sub) {
   const det = on ? `<div class="det">
       ${eng ? `<span>engine</span><b>${esc(eng)}</b>` : ""}
       ${r.ended ? `<span>ended</span><b>${esc(r.ended)}</b>` : ""}
-      ${r.headline_number ? `<span>outcome</span><b>${esc(r.headline_number)}${r.ui ? " (" + esc(r.ui) + ")" : ""}${r.shift ? ` · ${esc(r.shift)} vs ${esc(r.shift_vs)}` : ""}</b>` : ""}
+      ${r.headline_number ? `<span>outcome</span><b>${esc(r.headline_number)}${r.ui_vals ? " (" + uiText(...r.ui_vals) + ")" : r.ui ? " (95% UI " + esc(r.ui.replace(/([0-9.]+)M-/, "$1–")) + ")" : ""}</b>` : ""}
+      ${r.shift ? `<span>largest shift</span><b>${esc(r.shift)} vs ${esc(r.shift_vs)}</b>` : ""}
       ${r.spent_usd != null ? `<span>model spend</span><b>${usd(r.spent_usd)}</b>` : ""}
       ${r.spec_sha ? `<span>spec</span><b>${esc(r.spec_sha.slice(0, 10))}</b>` : ""}
       ${r.signed_at ? `<span>signed</span><b>${esc(day(r.signed_at))} ${esc(hhmm(r.signed_at))} by ${esc(r.signed_by || "?")}</b>` : ""}
       ${r.launch_commit ? `<span>commit</span><b>${esc(r.launch_commit)}</b>` : ""}
-      ${r.signoff_note ? `<span>sign-off note</span><b>${esc(r.signoff_note.slice(0, 300))}${r.signoff_note.length > 300 ? "…" : ""}</b>` : ""}
+      ${r.signoff_note ? `<span>sign-off note</span><b>${esc(r.signoff_note.length > 80 ? r.signoff_note.slice(0, 80).replace(/\s+\S*$/, "") + "…" : r.signoff_note)} <button class="link" data-note="${esc(r.id)}">full note</button></b>` : ""}
       <span>folder</span><b>${esc(r.full_label || r.label || r.name)}</b><span>path</span><b class="tail" title="${esc(r.id)}">${esc(r.id)}</b></div>` : "";
   return `<div class="runitem ${on ? "on" : ""} ${cmp ? "cmp" : ""}" data-run="${esc(r.id)}">
     <div class="top"><span class="l">${esc(runLabel(r))}</span><span class="state ${cls}">${esc(words)}</span>${r.headline_number ? `<span class="h">${esc(r.headline_number)}</span>` : ""}</div>
@@ -352,6 +411,7 @@ function renderRuns() {
     if (e.shiftKey && S.runId && el.dataset.run !== S.runId) { S.cmp = el.dataset.run; renderRuns(); renderCompare(); return; }
     $("app").classList.remove("nav"); S.cmp = null; selectRun(el.dataset.run);
   }));
+  document.querySelectorAll("[data-note]").forEach((b) => (b.onclick = (e) => { e.stopPropagation(); const r = S.runs.find((x) => x.id === b.dataset.note); side("sign-off note · " + runLabel(r), `<p>${esc(r.signoff_note)}</p><p class="small muted">${esc(r.signed_by || "")} · ${esc(r.signed_at || "")} · decision_spec.signoff.json</p>`); }));
   const d = document.querySelector("details.drafts"); if (d && d.querySelector(".runitem.on")) d.open = true;
 }
 async function renderLearning() {
@@ -388,11 +448,15 @@ function renderHeader() {
   const failed = sp.stages.find((s) => s.status === "failed"), cls = summary.chip === "stopped" ? "" : cls0;
   const calls = c.calls || [], k = calls.find((x) => x.live) || calls[0];
   const items = [];
-  items.push(`<span class="state ${cls} ${c.live ? "live" : ""}" title="${esc(r.error || (failed && failed.why) || r.status || "")}">${esc(failed ? "Failed in " + stage(failed.state) : c.live ? "Running · " + stage(st.state) : summary.chip === "stopped" && summary.ended ? summary.ended.replace(/^./, (x) => x.toUpperCase()) : words)}${st.round != null ? ` <span class="muted">· round ${esc(st.round)} of ${esc(st.max_rounds)}</span>` : ""}</span>`);
+  items.push(`<span class="state ${cls} ${c.live ? "live" : ""}" title="${esc(r.error || (failed && failed.why) || r.status || "")}">${esc(failed ? "Failed in " + stage(failed.state) : c.live ? "Running · " + stage(st.state) : (summary.chip === "stopped" || !summary.chip) && r.stop ? "Stopped in " + stage(st.state).toLowerCase() : words)}${st.round != null ? ` <span class="muted">· round ${esc(st.round)} of ${esc(st.max_rounds)}</span>` : ""}</span>`);
   if (k && k.done != null) items.push(k.live ? `<span>Engine batch <b>${k.done}/${esc(k.n)}</b>${k.eta_s != null ? " · ETA " + fmtS(k.eta_s) : ""}</span>`
                                            : `<span title="the run is not live; this progress record was left behind">Engine batch interrupted at <b>${k.done}/${esc(k.n)}</b></span>`);
   items.push(`<span><b>${usd(st.spent_usd)}</b>${st.budget_usd != null ? " of " + usd(st.budget_usd) : ""} spent</span>`);
-  items.push(`<span title="${esc(c.cap_source || "")}${c.error ? " · " + esc(c.error) : ""}"><b>${esc(c.used_core_h)}</b> of ${esc(c.cap_core_h)} core-h</span>`);
+  const reused = (summary.batches || r.batches || []).filter((b) => b.reused);
+  items.push(`<span title="${esc(c.cap_source || "")}${c.error ? " · " + esc(c.error) : ""}">this run <b>${esc(c.used_core_h)}</b> of ${esc(c.cap_core_h)} core-h${reused.map((b) => ` · plus ${num(b.reused)} reused points${b.reused_from ? " computed in " + esc(b.reused_from) : " from an earlier batch"}`).join("")}</span>`);
+  const task = (r.stop || "").split(": ")[1];
+  $("stopline").innerHTML = r.stop ? `Why stopped: ${task ? esc(task.replace(/(\d{4}-\d\d-\d\d) (\d\d:\d\d)/, (m, d, t) => day(d + "T00:00:00Z") + " " + t + " UTC")) + "; " : ""}the run does not record who stopped it or why.${r.operator_note ? ` Latest operator note (progress.md): ${esc(r.operator_note.replace(/\.+$/, "").slice(0, 220))}${r.operator_note.length > 220 ? "…" : "."}` : ""}` : "";
+  $("stopline").hidden = !r.stop;
   $("meta").innerHTML = items.join("");
   $("acts").innerHTML = `<button class="link" id="b-results">Results</button><button class="link" id="b-compute">Compute</button><button class="link" id="b-build">Build on this run</button>`;
   $("b-results").onclick = () => openDoc();
@@ -432,15 +496,16 @@ async function renderCompare() {
   const order = ((S.meta.projects || []).find((p) => p.lineage.includes(S.runId)) || { lineage: [] }).lineage;
   const [a, b] = order.indexOf(S.cmp) >= 0 && order.indexOf(S.cmp) < order.indexOf(S.runId) ? [S.cmp, S.runId] : [S.runId, S.cmp];   // older on the left
   let j; try { j = await api("/api/compare?" + q({ a, b })); } catch (e) { toast(e.message); return; }
+  const val = (v) => { if (v == null) return "—"; try { const x = JSON.parse(v); if (Array.isArray(x)) return x.length === 2 && x.every((n) => typeof n === "number") ? `${x[0]}–${x[1]}` : x.join(", "); return String(x); } catch (e) { return String(v); } };
   const [A, B] = j.labels, row = (k, a, b, ch) => `<tr class="${ch ? "ch" : ""}"><td>${k}</td><td>${a}</td><td>${b}</td></tr>`;
   const eng = (e) => e && e.name ? esc(`${e.name} ${e.version || ""}`) : "—";
   const head = `<table class="cmp"><tr><th></th><th>${esc(A)}</th><th>${esc(B)}</th></tr>`;
   let h = `<div class="cmp-h" style="margin-top:4px">Compare ${esc(A)} and ${esc(B)} <button class="link" id="cmp-close">close</button></div>` + head +
     row("status", esc(j.chips[0].join(" · ")), esc(j.chips[1].join(" · ")), false) +
     row("engine", eng(j.engines[0]), eng(j.engines[1]), eng(j.engines[0]) !== eng(j.engines[1])) +
-    row("outcome", esc((j.headline[0][0] || "—") + (j.headline[0][1] ? " (" + j.headline[0][1] + ")" : "")), esc((j.headline[1][0] || "—") + (j.headline[1][1] ? " (" + j.headline[1][1] + ")" : "")), j.headline[0][0] !== j.headline[1][0]) +
+    row("outcome", ...[0, 1].map((k) => esc(j.headline[k][0] || "—") + ((j.ui_vals || [])[k] ? " (" + uiText(...j.ui_vals[k]) + ")" : j.headline[k][1] ? " (95% UI " + esc(j.headline[k][1].replace(/([0-9.]+)M-/, "$1–")) + ")" : "")), j.headline[0][0] !== j.headline[1][0]) +
     row("model spend", usd(j.spent[0]), usd(j.spent[1]), false) + "</table>";
-  h += `<div class="cmp-h">Signed spec</div>` + (j.spec_diff.length ? head + j.spec_diff.map((d) => row(esc(d.field.replace("decision_units.", "")), esc(d.before == null ? "—" : d.before), esc(d.after == null ? "—" : d.after), true)).join("") + "</table>" : '<div class="empty" style="padding:4px 0">Same lineage fields in both specs.</div>');
+  h += `<div class="cmp-h">Signed spec</div>` + (j.spec_diff.length ? head + j.spec_diff.map((d) => row(esc(d.field.replace("decision_units.", "")), esc(val(d.before)), esc(val(d.after)), true)).join("") + "</table>" : '<div class="empty" style="padding:4px 0">Same lineage fields in both specs.</div>');
   const pk = Object.entries(j.packages);
   h += `<div class="cmp-h">Units per package component</div>` + (pk.length ? `<table class="cmp"><tr><th></th><th class="n">${esc(A)}</th><th class="n">${esc(B)}</th><th class="n">change</th></tr>` + pk.map(([k, [a, b]]) => `<tr class="${a !== b ? "ch" : ""}"><td>${esc(k)}</td><td class="n">${a}</td><td class="n">${b}</td><td class="n">${b - a > 0 ? "+" : ""}${b - a || ""}</td></tr>`).join("") + "</table>" : '<div class="empty" style="padding:4px 0">No allocation.csv in either run.</div>');
   const ts = Object.entries(j.tests), v = (x) => x === "CHANGES_PLAN" ? "changes plan" : x === "NO_CHANGE" ? "no change" : x || "—";
@@ -453,10 +518,70 @@ function renderStream() {
   if (S.view === "figs") { $("stream").innerHTML = renderFigures(); wire($("stream")); return; }
   renderFigures();
   const box = $("streambox"), atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
-  const cards = S.run.cards.filter((c) => !S.filter || c.stage === S.filter);
-  $("stream").innerHTML = cards.map(card).join("") || '<div class="muted small" style="padding:12px 0">Nothing here for this stage.</div>';
+  const cards = S.run.cards.filter((c) => !S.filter || c.stage === S.filter), items = [], seen = {};
+  for (const c of cards) {   // blockers of one round and all decision tests read as one table each
+    const g = c.kind === "blocker" ? "b" + (c.round == null ? "" : c.round) : c.kind === "decision_test" ? "dt" : null;
+    if (!g) { items.push(c); continue; }
+    if (!seen[g]) { seen[g] = { kind: g === "dt" ? "dt_table" : "blocker_table", round: c.round, at: c.at, rows: [] }; items.push(seen[g]); }
+    seen[g].rows.push(c);
+  }
+  const top = !S.filter ? summaryBlock() : "";
+  $("stream").innerHTML = top + (items.map(card).join("") || '<div class="muted small" style="padding:12px 0">Nothing here for this stage.</div>');
   wire($("stream"));
   if (atBottom) box.scrollTop = box.scrollHeight;
+}
+function summaryBlock(forDoc) {
+  const sm = (S.run && S.run.summary) || [];
+  if (!sm.length) return "";
+  const cite = (it) => `<button class="s" data-act="open" data-file="${esc(it.source)}" data-anchor-id="${esc(it.key.split(".").pop())}" title="${esc(it.source + " · " + it.key)}">${esc(it.source.split("/").pop())}</button>`;
+  const tiles = sm.map((it, i) => {
+    const label = it.unit === "dalys" ? T("DALYs") + " averted" : it.label === "allocatable" ? T("allocatable", "Allocatable") : esc(it.label.replace(/^./, (x) => x.toUpperCase()));
+    const v = it.unit === "units" ? `${num(it.value)}${it.of ? ` <span class="d">of ${num(it.of)} units</span>` : ""}` : num(it.value, it.unit);
+    const ui = it.ui ? `<div class="d">${uiText(it.ui[0], it.ui[1], it.level)} · median ${num(it.median)}</div>` : "";
+    return `<div class="stat ${i === 0 && it.ui ? "wide" : ""}"><div class="k">${label}</div><div class="v ${i === 0 && it.ui ? "hero" : ""}">${v}</div>${ui}<div>${cite(it)}${it.ui_source ? " " + cite({ source: it.ui_source, key: "fixed_plan" }) : ""}</div></div>`;
+  }).join("");
+  const covers = (sm[0] && sm[0].covers) || [];
+  return `<div class="stats">${tiles}</div>${covers.length ? `<div class="ctx">Point plan, ${T("comparator")}-based. The ${T("UI")} covers ${covers.map((c) => c === "calibration_partly_clamped" ? T("calibration partly clamped") : esc(c.replace(/_/g, " "))).join(", ")}. <b>Needs you: no.</b></div>` : ""}`;
+}
+function statusCell(p) { return p === true ? '<span class="ok-i">✓ pass</span>' : p === false ? '<span class="bad-i">✗ fail</span>' : '<span class="muted">? unknown</span>'; }
+function gateCard(c, head, open, comment) {
+  const dw = c.done_when || [];
+  const rows = dw.map((r) => {
+    const checks = r.checks.length ? r.checks : ["(no done-when test recorded)"], n = checks.length;
+    return `<tr class="grp"><td colspan="5"><b>${esc(r.blocker)}</b> ${r.severity ? T(r.severity) : ""} · ${esc(r.reviewer || "")} — ${bench(clip((r.claim || "").split("\n")[0], 150))}</td></tr>` +
+      checks.map((ch, k) => `<tr><td>${esc(r.blocker)}.${k + 1}</td><td>${bench(ch)}</td>${k === 0 ? `<td rowspan="${n}">${statusCell(r.passes)}</td><td rowspan="${n}">${esc((r.detail || "").replace(/^(FAIL|PASS)\s*/, ""))}</td><td rowspan="${n}">${r.mechanical ? T("mechanical") : T("judged")}</td>` : ""}</tr>`).join("");
+  }).join("");
+  const act = c.action || "", rule = c.rule != null ? `rule ${c.rule}` : "";
+  const needs = act === "AWAIT_OWNER" ? "yes, answer the decision card below." : "no.";
+  return `<div class="card">${head(`${T("gate", "Gate")} round ${esc((c.title.match(/round (\d+)/) || [])[1] || "?")}: ${T(act)} <span class="muted small">(${T(rule)})</span>`)}
+    ${ctx(`${T("gate", "The gate")} decides whether the run may write its report. ${T("ACCEPT")} needs no unresolved ${T("HIGH")} ${T("blocker")} and no missing required artifact.`, needs)}
+    <div class="body">${esc(c.body)}</div>
+    ${rows ? `<div class="cmp-h">${T("done-when", "Done-when")} tests, by blocker</div><table class="t fixed"><colgroup><col style="width:11%"><col style="width:45%"><col style="width:9%"><col style="width:24%"><col style="width:11%"></colgroup><tr><th>criterion</th><th>what it checks</th><th>status</th><th>detail</th><th>test</th></tr>${rows}</table>` : ""}
+    <div class="acts">${open}${comment}</div></div>`;
+}
+function blockerTable(g) {
+  const rows = g.rows.map((c, i) => {
+    const a = esc(JSON.stringify(c.anchor || {}));
+    return `<tr class="row" data-tog="bt${g.round}_${i}"><td>${esc(c.blocker_id)}</td><td>${T(c.severity)}</td><td>${esc(c.reviewer || "")}</td><td>${esc(stage(c.target_stage))}</td><td class="clip">${bench(String(c.claim || "").split("\n")[0])}</td><td>${c.resolved ? '<span class="ok-i">✓ resolved</span>' : "open"}</td></tr>
+      <tr class="more" id="bt${g.round}_${i}" hidden><td colspan="6"><div>${bench(c.claim || "")}</div>${c.evidence ? `<div class="sub">Evidence: ${bench(c.evidence)}</div>` : ""}${c.fix_requires ? `<div class="sub">Fix requires: ${bench(c.fix_requires)}</div>` : ""}
+      <div class="acts"><button data-act="agree" data-anchor="${a}">Agree</button><button data-act="disagree" data-anchor="${a}">Disagree</button><button data-act="comment" data-anchor="${a}">Comment</button><button data-act="open" data-file="${esc(c.anchor.file)}" data-anchor-id="${esc(c.blocker_id)}">Open</button></div></td></tr>`;
+  }).join("");
+  const high = g.rows.filter((c) => c.severity === "HIGH" && !c.resolved).length;
+  return `<div class="card"><div class="head"><span class="t">Critique${g.round != null ? " round " + esc(g.round) : ""}: ${g.rows.length} ${T("blocker", "blockers")}, ${high} open ${T("HIGH")}</span>${when(g.at)}</div>
+    ${ctx(`Findings from the critics. An open ${T("HIGH")} blocks ${T("ACCEPT")}; each has a ${T("done-when")} test. Click a row for the full claim.`, "no. Agree or disagree to record feedback.")}
+    <table class="t"><tr><th>id</th><th>severity</th><th>reviewer</th><th>${T("target stage")}</th><th>claim</th><th>status</th></tr>${rows}</table></div>`;
+}
+function dtTable(g) {
+  g.rows.forEach((c) => { if (c.changes == null) c.changes = c.verdict === "CHANGES_PLAN"; c.test_id = c.test_id || (c.anchor || {}).id; });   // a server from before ζ
+  const thrs = [...new Set(g.rows.map((c) => c.threshold_pct))], thr = thrs.length === 1 ? thrs[0] : undefined;
+  const rows = g.rows.map((c) => `<tr><td><button class="link" data-act="open" data-file="${esc(c.anchor.file)}" data-anchor-id="${esc(c.test_id)}">${esc(c.test_id)}</button></td><td>${bench(c.body || "")}</td>
+    <td class="n">${(c.values || []).map((v) => esc(typeof v === "number" ? num(v) : v)).join(", ") || "—"}</td>
+    <td>${c.changes ? '<span class="bad-i">yes</span>' : "no"}</td><td class="n">${pct(c.share_pct)}${c.threshold_pct != null && c.threshold_pct !== thr ? ` <span class="muted">(threshold ${pct(c.threshold_pct, 0)})</span>` : ""}</td>
+    <td class="n">${(c.objective_vs_point_pct || []).map((x) => x == null ? "—" : (x > 0 ? "+" : "") + pct(x, 2)).join(", ") || "—"}</td></tr>`).join("");
+  const ch = g.rows.filter((c) => c.changes).length;
+  return `<div class="card"><div class="head"><span class="t">${T("decision test", "Decision tests")}: ${ch} of ${g.rows.length} change the plan</span>${when(g.at)}</div>
+    ${ctx(`Each test re-solves the plan with one input at other values. It changes the plan when more than ${thr != null ? pct(thr, 0) : "the threshold share"} of units change package.`, "no.")}
+    <table class="t"><tr><th>id</th><th style="width:44%">what it tests</th><th class="n">value tested</th><th>plan changes?</th><th class="n">units changed</th><th class="n">objective vs point plan</th></tr>${rows}</table></div>`;
 }
 function card(c) {
   const a = c.anchor ? esc(JSON.stringify(c.anchor)) : "";
@@ -465,18 +590,14 @@ function card(c) {
   const head = (t, extra) => `<div class="head"><span class="t">${t}</span>${extra || ""}${when(c.at)}</div>`;
   const line = (cls, txt) => `<div class="line ${cls || ""}"><span class="x">${txt}</span>${when(c.at)}</div>`;
   switch (c.kind) {
+    case "blocker_table": return blockerTable(c);
+    case "dt_table": return dtTable(c);
     case "stage": return line(c.stage === "FINAL" && /fail/i.test(c.body || "") ? "bad" : "", `<b>${esc(c.title)}</b>${c.body ? " · " + esc(c.body) : ""}${c.spent_usd != null ? ` · ${usd(c.spent_usd)}` : ""}`);
     case "fix_loop": return line("", `<b>Fix loop</b> · ${esc(c.body)}`);
     case "batch": return line("", `<b>Engine batch</b> · ${c.done == null ? "?" : c.done}/${esc(c.n)} done${c.live ? (c.eta_s != null ? " · ETA " + fmtS(c.eta_s) : "") : c.done != null ? " · interrupted" : ""}${c.error ? " · " + esc(c.error) : ""}`);
-    case "figure": return `<div class="card">${head(esc(c.body || c.title))}<img class="thumb" loading="lazy" src="/api/file?${q({ run: S.runId, path: c.file })}" data-act="open" data-file="${esc(c.file)}">
+    case "figure": return `<div class="card">${head(esc(c.body || c.title))}${ctx("A figure from the analysis.", "no.")}<img class="thumb" loading="lazy" src="/api/file?${q({ run: S.runId, path: c.file })}" data-act="open" data-file="${esc(c.file)}">
       <div class="sub">${esc(c.title)}${c.producer ? ` · ${esc(c.producer)}` : ""}</div>${c.provenance_error ? `<div class="sub" style="color:var(--bad)">provenance unreadable: ${esc(c.provenance_error)}</div>` : ""}<div class="acts">${open}${comment}</div></div>`;
-    case "blocker": return `<div class="card">${head(`<span class="sev ${esc(c.severity)}">${esc(c.severity)}</span>${esc(c.title)}`)}
-      <div class="body">${esc(c.claim)}</div>${c.fix_requires ? `<div class="sub">Fix requires: ${esc(c.fix_requires)}</div>` : ""}
-      <div class="sub">${esc(c.category || "")}${c.target_stage ? " → " + esc(stage(c.target_stage)) : ""}${c.resolved ? ' · <span style="color:var(--ok)">resolved</span>' : ""}</div>
-      <div class="acts"><button data-act="agree" data-anchor="${a}">Agree</button><button data-act="disagree" data-anchor="${a}">Disagree</button>${comment}${open}</div></div>`;
-    case "gate": return `<div class="card">${head(esc(c.title))}<div class="body">${esc(c.body)}</div>${(c.unresolved_high || []).length ? `<div class="sub" style="color:var(--bad)">Unresolved HIGH: ${c.unresolved_high.map(esc).join("; ")}</div>` : ""}
-      ${Object.keys(c.done_when_status || {}).length ? `<div class="sub">Done-when: ${Object.entries(c.done_when_status).map(([k, v]) => esc(k) + " " + esc(typeof v === "object" ? JSON.stringify(v) : v)).join(" · ")} · rule ${esc(c.rule)}</div>` : `<div class="sub">rule ${esc(c.rule)}</div>`}<div class="acts">${open}${comment}</div></div>`;
-    case "decision_test": return `<div class="card">${head(esc(c.title))}<div class="body">${esc(c.body)}</div>${c.criterion ? `<div class="sub">Criterion: ${esc(c.criterion)}</div>` : ""}<div class="acts">${open}${comment}</div></div>`;
+    case "gate": return gateCard(c, head, open, comment);
     case "decision_needed": return decisionCard(c, head);
     case "chat": {
       const body = c.role === "assistant" ? md(c.text) : esc(c.text).replace(/\n/g, "<br>");
@@ -491,7 +612,7 @@ function card(c) {
 }
 function decisionCard(c, head) {
   const id = esc(c.id);
-  if (c.sub === "spec") return `<div class="card need">${head(esc(c.title))}<div class="body">${md(c.body)}</div>
+  if (c.sub === "spec") return `<div class="card need">${head(esc(c.title))}${ctx("The run waits for the owner to sign its decision spec.", "yes, answer below.")}<div class="body">${md(c.body)}</div>
     <div class="answer" data-for="${id}"><textarea class="note" placeholder="Your note (required): what you checked, what you accept"></textarea>
     <label class="inline"><input type="checkbox" class="confirm"> I have read the sheet and sign the spec as the owner</label><button class="primary" data-act="sign-spec">Sign</button><div class="small result"></div></div></div>`;
   const items = (c.items || []).map((it, k) => `<div style="margin:12px 0"><b>${esc(it.finding)}</b>
@@ -499,11 +620,12 @@ function decisionCard(c, head) {
       ${(it.declarations || []).map((d) => `<div class="sub">Declaration ${esc(d.id)}: ${inline(d.test)}</div>`).join("") || '<div class="sub">Not declared, and untested.</div>'}
       <div style="margin-top:6px"><label class="inline"><input type="radio" name="a${k}${id}" value="accept" data-f="${esc(it.finding)}" ${it.answer === "accept" ? "checked" : ""}> accept</label>
       <label class="inline"><input type="radio" name="a${k}${id}" value="decline" data-f="${esc(it.finding)}" ${it.answer === "decline" ? "checked" : ""}> decline</label>${it.answer ? `<span class="small muted">recorded: ${esc(it.answer)}</span>` : ""}</div></div>`).join("");
-  return `<div class="card need">${head(esc(c.title), c.status ? `<span class="tm">${esc(c.status)}</span>` : "")}<div class="body">${esc(c.body)}</div>${items}
+  return `<div class="card need">${head(esc(c.title), c.status ? `<span class="tm">${esc(c.status)}</span>` : "")}${ctx("Findings that bear on the decision; only the owner may accept them.", "yes, answer below.")}<div class="body">${esc(c.body)}</div>${items}
     <div class="answer" data-for="${id}"><textarea class="note" placeholder="Your note (required)"></textarea>
     <label class="inline"><input type="checkbox" class="confirm"> I answer these declarations as the owner</label><button class="primary" data-act="scope">Submit answers</button><div class="small result"></div></div></div>`;
 }
 function wire(root) {
+  root.querySelectorAll("tr[data-tog]").forEach((tr) => (tr.onclick = () => { const m = document.getElementById(tr.dataset.tog); if (m) m.hidden = !m.hidden; }));
   root.querySelectorAll(".cite").forEach((b) => (b.onclick = () => openFile(b.dataset.file, b.dataset.anchor)));
   root.querySelectorAll("[data-act]").forEach((b) => (b.onclick = () => act(b)));
 }
@@ -586,7 +708,7 @@ async function openFile(file, anchor) {
 function openDoc() {
   const d = S.run.docs || {}, names = Object.keys(d);
   if (!names.length) { side("results", '<div class="muted">No results.md, manuscript.md or report.md yet.</div>'); return; }
-  side(names.join(" · "), names.map((n) => `<h2 class="muted small"><code>${esc(n)}</code></h2>` + (d[n].error ? `<div class="card error">${esc(d[n].error)}</div>` : md(d[n].text))).join("<hr>"));
+  side(names.join(" · "), summaryBlock() + names.map((n) => (d[n].error ? `<div class="card error">${esc(d[n].error)}</div>` : md(d[n].text, true))).join("<hr>"));
 }
 async function openCompute() {
   const c = S.run.compute || {};

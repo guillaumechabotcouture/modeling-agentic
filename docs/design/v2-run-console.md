@@ -142,6 +142,22 @@ and signed spec are byte-identical to another run's; the copy whose label sorts 
 left): status, engine versions, outcome and interval, spend, the spec diff, units per package
 component, and each decision test's "changes the plan?" side by side.
 
+**Reader support (ζ).** Data the owner compares is a table, never JSON: the gate's done-when status
+joined with each blocker's done-when checks (criterion, what it checks, pass or fail, detail, mechanical
+or judged, grouped by blocker); one table per critique round of blockers (id, severity, reviewer, target
+stage, one-line claim, status; a row expands to the claim, evidence and fix); one table of decision tests
+(the spec's question text, values tested, plan changes, share of units changed, re-solved objective vs
+the point plan); and the compare view, runs as columns. The stream opens with a summary of the run's key
+numbers, each with its unit and its source file: outcomes averted (the headline first, with its 95% UI
+and median from `analysis/uncertainty.yaml`), envelope (`decision_spec.yaml`), allocatable and allocated
+cost and units with no package (`analysis/point.yaml`). Every card and table says what it is and whether
+it needs the owner. Terms the pipeline uses are marked and defined on hover from one `GLOSSARY` in the
+module, each with the file it is defined in; benchmark ids are defined from the run's engine card. An
+unfinished run that is not moving says where it stopped and which journal task never finished; the run
+does not record who stopped it, so the page says so and shows the latest operator note in `progress.md`.
+Compute used counts this run's core-hours and names engine-batch points reused from an earlier run in the
+lineage (same batch output and code fingerprint).
+
 **Figures.** A Stream / Figures toggle above the stream. Figures is a grid of thumbnails with the caption
 from `analysis/figures.yaml` and the producer and time from the provenance; a click opens the figure in
 the side panel with a comment button anchored to it. With no figures, one line says why (the run has not
@@ -246,6 +262,7 @@ A synthetic run dir with toy numbers (no licensed data):
 | RC9 | run discovery under roots; build-on draft (copies, batch reuse verdict from `compute.code_fingerprint`) |
 | RC10 | the HTTP server binds 127.0.0.1 only and serves the page and `/api/run` on a toy run |
 | RC15 | lineage on a toy lineage of three runs plus two staging copies: one project, order, drafts, relations, the spec diff and its phrase, engine version, chip and end reason, package shift, compare, `/api/runs` projects and `/api/compare` |
+| RC16 | every term the page marks, every gate action, rule and severity has a definition and a source; JSON only for anchors and request bodies; done-when rows join gate status and blocker; the summary's order, intervals and sources; reused batch points |
 | RC14 | live vs finished: an ETA and live core-seconds only for a fresh progress record on an unfinished run; a progress record left on a finished run, or a stale one, is interrupted; the headline number |
 
 Plus one real end-to-end check, not part of the self-test: start the server on a toy run, hit the

@@ -201,6 +201,16 @@ def stepper(st: dict) -> dict:
             "status": st.get("status")}
 
 
+def _words(v) -> str:
+    """A mapping or list in plain words ("fixed: T-001, T-002 · rejected: none"), never JSON."""
+    if isinstance(v, dict):
+        return " · ".join(f"{str(k).replace('_', ' ')}: {_words(x) if x not in (None, [], {}) else 'none'}"
+                          for k, x in v.items())
+    if isinstance(v, (list, tuple)):
+        return ", ".join(_words(x) for x in v)
+    return str(v)
+
+
 def timeline_cards(st: dict) -> list:
     out = []
     for i, h in enumerate(st.get("history") or []):
@@ -213,7 +223,7 @@ def timeline_cards(st: dict) -> list:
                         "anchor": {"kind": "stage", "id": h["to"], "file": "run_state.json"}})
         elif "fix_loop" in h:
             out.append({"id": f"fix:{i}", "kind": "fix_loop", "stage": "FIX_LOOP", "at": h.get("at", ""),
-                        "title": "fix loop", "body": json.dumps(h["fix_loop"], default=str)[:800],
+                        "title": "fix loop", "body": _words(h["fix_loop"])[:800],
                         "anchor": {"kind": "stage", "id": "FIX_LOOP", "file": "run_state.json"}})
     return out
 
@@ -235,7 +245,7 @@ def critique_cards(run_dir: str) -> list:
                         "title": f"{doc.get('reviewer') or rel} raised {bid}",
                         "reviewer": doc.get("reviewer"), "round": doc.get("round"), "blocker_id": bid,
                         **{k: b.get(k) for k in ("severity", "category", "target_stage", "claim", "fix_requires",
-                                                 "done_when", "resolved", "first_seen_round")},
+                                                 "done_when", "resolved", "first_seen_round", "evidence")},
                         "anchor": {"kind": "blocker", "id": bid, "file": rel}})
     return out
 
@@ -256,8 +266,45 @@ def gate_cards(run_dir: str) -> list:
                     "action": doc.get("action"), "rule": doc.get("rule_matched"), "body": doc.get("rationale", ""),
                     "unresolved_high": [str(u.get("claim") if isinstance(u, dict) else u)[:300] for u in uh],
                     "done_when_status": doc.get("done_when_status") or {},
+                    "done_when": done_when_rows(run_dir, doc.get("done_when_status") or {}),
                     "anchor": {"kind": "gate", "id": "action", "file": rel}})
     return out
+
+
+def _check_words(c) -> str:
+    """One done-when check in words: "manuscript.md contains DT2", "judgement: ..."."""
+    if not isinstance(c, dict):
+        return str(c)
+    if "judgement" in c:
+        return f"judged: {c['judgement']}"
+    f = c.get("file", "?")
+    for k in ("contains", "lacks"):
+        if k in c:
+            return f"{f} {k} {str(c[k]).replace('(?i)', '')}"
+    if c.get("exists"):
+        return f"{f} exists"
+    if "key" in c:
+        return f"{f}: {c['key']} {c.get('op', '=')} {c.get('value')}"
+    return _words(c)
+
+
+def done_when_rows(run_dir: str, status: dict) -> list:
+    """The gate's done-when status joined with each blocker's done_when checks (critique_*.yaml):
+    [{blocker, reviewer, severity, checks: [words], passes, detail, mechanical}]."""
+    specs = {}
+    for c in critique_cards(run_dir):
+        if c["kind"] == "blocker":
+            specs[c["blocker_id"]] = c
+    rows = []
+    for bid, st in sorted((status or {}).items()):
+        st = st if isinstance(st, dict) else {"detail": str(st)}
+        b = specs.get(bid) or {}
+        dw = b.get("done_when")
+        rows.append({"blocker": bid, "reviewer": b.get("reviewer"), "severity": b.get("severity"),
+                     "claim": b.get("claim"), "checks": [_check_words(x) for x in (dw if isinstance(dw, list) else
+                                                                                [dw] if dw else [])],
+                     "passes": st.get("passes"), "detail": st.get("detail"), "mechanical": st.get("mechanical")})
+    return rows
 
 
 def figure_cards(run_dir: str) -> list:
@@ -296,6 +343,8 @@ def decision_test_cards(run_dir: str) -> list:
     tests = ((doc or {}).get("data") or {}).get("tests") if isinstance(doc, dict) else None
     if err or not isinstance(tests, list):
         return [_err_card(run_dir, p, "ANALYZE", err or "no data.tests list")]
+    spec, _ = _read(os.path.join(run_dir, "decision_spec.yaml"))
+    spec_tests = {str(x.get("id")): x for x in (_dig(spec, "analysis.decision_tests") or []) if isinstance(x, dict)}
     out = []
     for t in tests:
         if not isinstance(t, dict):
@@ -304,10 +353,25 @@ def decision_test_cards(run_dir: str) -> list:
         q, _ = _read(os.path.join(run_dir, f)) if t.get("path") else (None, None)
         q = q if isinstance(q, dict) else {}
         changes = t.get("verdict") == "CHANGES_PLAN" or q.get("decision_changes") is True
+        res = [r for r in q.get("results") or [] if isinstance(r, dict)]
+        rel = []
+        for r in res:
+            a, b = r.get("objective"), r.get("point_plan_objective_under_test")
+            rel.append(round(100 * (a - b) / b, 2) if isinstance(a, (int, float)) and isinstance(b, (int, float)) and b
+                       else None)
+        share = t.get("share_pct")
+        if share is None and isinstance(q.get("share_units_changed"), (int, float)):
+            share = 100 * q["share_units_changed"]
+        thr = t.get("threshold_pct")
+        if thr is None and isinstance(q.get("share_threshold"), (int, float)):
+            thr = 100 * q["share_threshold"]
         out.append({"id": f"dt:{tid}", "kind": "decision_test", "stage": "ANALYZE", "at": _mtime(p),
                     "title": f"{tid}: {'changes the plan' if changes else 'does not change the plan'}",
-                    "body": q.get("question") or t.get("statement", ""), "verdict": t.get("verdict"),
-                    "criterion": q.get("criterion"), "recommendation": q.get("recommendation"),
+                    "body": (spec_tests.get(tid) or {}).get("text") or q.get("question") or t.get("statement", ""),
+                    "verdict": t.get("verdict"), "changes": changes, "test_id": tid,
+                    "values": [r.get("value") for r in res], "share_pct": share, "threshold_pct": thr,
+                    "objective_vs_point_pct": rel, "criterion": q.get("criterion"),
+                    "recommendation": q.get("recommendation"),
                     "anchor": {"kind": "decision_test", "id": tid, "file": f}})
     return out
 
@@ -510,6 +574,151 @@ def engine_of(run_dir: str, st: dict | None) -> str | None:
     return (st or {}).get("engine")
 
 
+# ------------------------------------------------------------------ reader support: summary, glossary, context
+def _data(run_dir: str, rel: str) -> dict:
+    doc, _ = _read(os.path.join(run_dir, rel))
+    d = doc.get("data") if isinstance(doc, dict) else None
+    return d if isinstance(d, dict) else {}
+
+
+def results_summary(run_dir: str) -> list:
+    """The run's key numbers, each with its unit and the file it is read from: outcomes averted (the
+    headline with its interval and median), envelope, allocatable and allocated cost, units with no package."""
+    pt, un = _data(run_dir, "analysis/point.yaml"), _data(run_dir, "analysis/uncertainty.yaml")
+    spec, _ = _read(os.path.join(run_dir, "decision_spec.yaml"))
+    head = ((un.get("headline") or {}).get("outcome")) if isinstance(un.get("headline"), dict) else None
+    out = []
+    for k, v in (pt.get("averted") or {}).items():
+        if not isinstance(v, (int, float)):
+            continue
+        item = {"label": f"{k} averted", "value": v, "unit": k, "source": "analysis/point.yaml", "key": f"averted.{k}"}
+        fp = (un.get("fixed_plan") or {}).get(k) if isinstance(un.get("fixed_plan"), dict) else None
+        if isinstance(fp, dict) and fp.get("ci_low") is not None:
+            item.update(ui=[fp.get("ci_low"), fp.get("ci_high")], level=fp.get("level"), median=fp.get("median"),
+                        ui_source="analysis/uncertainty.yaml", covers=un.get("covers"))
+        out.insert(0, item) if k == head else out.append(item)
+    env = _dig(spec, "constraints.envelope_usd")
+    for label, v, src, key in (("envelope", env, "decision_spec.yaml", "constraints.envelope_usd"),
+                               ("allocatable", pt.get("budget_allocatable"), "analysis/point.yaml", "budget_allocatable"),
+                               ("allocated", pt.get("cost_allocated"), "analysis/point.yaml", "cost_allocated")):
+        if isinstance(v, (int, float)):
+            out.append({"label": label, "value": v, "unit": "usd", "source": src, "key": key})
+    mix = pt.get("mix") or {}
+    if isinstance(mix.get("no_package"), int):
+        out.append({"label": "units with no package", "value": mix["no_package"], "unit": "units",
+                    "of": pt.get("n_units"), "source": "analysis/point.yaml", "key": "mix.no_package"})
+    return out
+
+
+def benchmarks(run_dir: str) -> dict:
+    """The engine card's benchmarks by id (analysis/engine.yaml): what each measures, its role and status."""
+    card = (_data(run_dir, "analysis/engine.yaml").get("card") or {})
+    return {str(b["id"]): {k: b.get(k) for k in ("metric", "role", "target", "band", "computed", "status", "source")}
+            for b in card.get("benchmarks") or [] if isinstance(b, dict) and b.get("id")}
+
+
+def batch_info(run_dir: str) -> list:
+    """Each stored engine batch's summary: points computed here and reused from an earlier batch."""
+    out = []
+    for p in sorted(glob.glob(os.path.join(run_dir, "analysis", "**", "*.summary.json"), recursive=True)):
+        d, _ = _read(p)
+        if isinstance(d, dict) and d.get("n") is not None:
+            out.append({"out": _rel(run_dir, p)[:-len(".summary.json")], "n": d.get("n"), "computed": d.get("computed"),
+                        "reused": d.get("reused") or 0, "code_fp": d.get("code_fp"), "task_core_s": d.get("task_core_s")})
+    return out
+
+
+def is_active(run_dir: str, st: dict | None) -> bool:
+    """Unfinished, and a live progress record or run_state.json written within STALE_S."""
+    try:
+        fresh = time.time() - os.path.getmtime(os.path.join(run_dir, "run_state.json")) < STALE_S
+    except OSError:
+        fresh = False
+    return not finished(run_dir, st) and (fresh or compute_status(run_dir, None, st)["live"])
+
+
+def stop_detail(run_dir: str, st: dict | None) -> str:
+    """Why an unfinished run is not moving, in words, from run_state.json: the stage, the round, and the
+    last task the journal shows as started and never completed. The operator's reason is not recorded there."""
+    st = st or {}
+    if not st or finished(run_dir, st) or st.get("paused") or is_active(run_dir, st):
+        return ""
+    j = st.get("journal") if isinstance(st.get("journal"), dict) else {}
+    open_ = [(k, v) for k, v in j.items() if isinstance(v, dict) and v.get("status") == "started"]
+    where = f"{stage_word(st.get('state'))} (round {st.get('round')} of {st.get('max_rounds')})"
+    if open_:
+        k, v = open_[-1]
+        return f"during {where}: task {v.get('task') or k} started {str(v.get('started') or '')[:16].replace('T', ' ')} and never finished"
+    return f"in {where}"
+
+
+def operator_note(run_dir: str) -> str:
+    """The last note in progress.md's "## Notes" section, if any."""
+    txt, _ = _read(os.path.join(run_dir, "progress.md"))
+    if not isinstance(txt, str) or "## Notes" not in txt:
+        return ""
+    notes = [ln[2:].strip() for ln in txt.split("## Notes", 1)[1].splitlines() if ln.startswith("- ")]
+    return notes[-1] if notes else ""
+
+
+_GATE = "scripts/validate_critique_yaml.py (_recompute_action)"
+_SCHEMA = ".claude/skills/critique-blockers-schema/SKILL.md"
+GLOSSARY = {   # term -> (definition, where it is defined). The page marks only terms listed here (RC16).
+    "gate": ("Decides from the critiques' blockers, the done-when tests and the required artifacts whether the run "
+             "may write its report (ACCEPT), must fix (PATCH_OR_RETHINK), declares scope, waits for the owner, "
+             "or fails. It applies fixed rules in order.", _GATE),
+    "ACCEPT": ("Rule 4: no unresolved HIGH blocker, no missing required artifact, no structural mismatch. The run "
+               "may write its report.", _GATE),
+    "PATCH_OR_RETHINK": ("Rule 2: a HIGH blocker or a missing required artifact is open and rounds remain. The run "
+                         "goes to the fix loop; ACCEPT is forbidden.", _GATE),
+    "DECLARE_SCOPE": ("Rules 3 and 3a: the open items are declared as limits of scope in scope_declaration.yaml and "
+                      "the report quotes each declaration in Limitations. DECLARE_SCOPE is not ACCEPT.", _GATE),
+    "RETHINK_STRUCTURAL": ("Rule 1 with rounds left: a critic found a structural mismatch (the model does not answer "
+                           "the question). Not patchable, not scope-declarable.", _GATE),
+    "RUN_FAILED": ("Rule 1 with no rounds left, or rule 5: rounds are exhausted with a finding that cannot be "
+                   "scope-declared. The run fails.", _GATE),
+    "AWAIT_OWNER": ("A finding that bears on the primary decision would be declared; only the owner may accept it, so "
+                    "the run waits at OWNER_DECISION.", "agents/stage_machine.py (route_gate); scripts/scope_signoff.py"),
+    "rule 1": ("Structural mismatch → RETHINK_STRUCTURAL, or RUN_FAILED with no rounds left.", _GATE),
+    "rule 2": ("HIGH blocker or missing required artifact, rounds left → PATCH_OR_RETHINK.", _GATE),
+    "rule 3": ("Rounds exhausted, every open item scope-declarable → DECLARE_SCOPE.", _GATE),
+    "rule 3a": ("Every open item declared at this gate and the previous one, none from a critic, all declarable → "
+                "DECLARE_SCOPE with rounds left.", _GATE),
+    "rule 4": ("Nothing outstanding → ACCEPT.", _GATE),
+    "rule 5": ("Rounds exhausted with a finding that cannot be scope-declared → RUN_FAILED.", _GATE),
+    "blocker": ("A critic's finding with a stable id, a severity, the stage that must change, and a done-when test. "
+                "The gate decides from these, not from the critique's prose.", _SCHEMA),
+    "HIGH": ("The report cannot ship over it: a hard blocker, a wrong parameter or citation, a missing required "
+             "deliverable, or an unsupported primary number. Blocks ACCEPT.", _SCHEMA),
+    "MEDIUM": ("Degrades the report but does not invalidate the core conclusions (most presentation issues).", _SCHEMA),
+    "LOW": ("A minor note; it is not carried forward between rounds.", _SCHEMA),
+    "target stage": ("The stage the fix belongs to (PLAN, DATA, MODEL, ANALYZE or WRITE).", _SCHEMA),
+    "done-when": ("The test that decides a HIGH or MEDIUM blocker is fixed: file checks (exists, contains or lacks a "
+                  "pattern, a key compared with a value) or a judgement. Frozen once the gate has seen it, re-run "
+                  "every round; passing it resolves the blocker.", _SCHEMA + "; scripts/done_when.py"),
+    "mechanical": ("A done-when test made only of file checks: the harness decides it.", "scripts/done_when.py (mechanical)"),
+    "judged": ("A done-when test with a judgement: a reviewer decides it.", "scripts/done_when.py (mechanical)"),
+    "fix loop": ("One open finding per task: the planner orders the fixes, an agent edits, the harness diffs the "
+                 "files, rebuilds and re-runs the finding's checks.", "agents/fix_loop.py"),
+    "UI": ("Uncertainty interval: the 2.5th to 97.5th percentile of the outcome over the uncertainty draws, for the "
+           "point plan held fixed. Its label lists what the draws cover.", "toolkit/analysis/uncertainty.py"),
+    "calibration partly clamped": ("In some draws the calibration hit a bound for some units; those draws do not carry "
+                                   "the full calibration uncertainty, and the interval says so.",
+                                   "toolkit/analysis/uncertainty.py"),
+    "decision test": ("The plan re-solved with one input set to stated values. It changes the plan when the package "
+                      "changes in more than the threshold share of units.", "toolkit/analysis/decision_tests.py"),
+    "benchmark": ("A published result the engine is run against. Role fit: the calibration used it; held out: it did "
+                  "not. Status: inside or outside the target band.", "toolkit/engines/benchmark.py"),
+    "DALYs": ("Disability-adjusted life years. Averted = the comparator's outcome minus the plan's.",
+              "toolkit/spec/schema.py (objective, sense: avert)"),
+    "comparator": ("What happens without the plan: the package every unit gets in the counterfactual (the spec's "
+                   "comparator).", "toolkit/spec/schema.py"),
+    "allocatable": ("The envelope minus the spec's fixed costs: what the optimiser may assign to packages.",
+                    "analysis/point.yaml budget_allocatable; decision_spec.yaml constraints"),
+}
+GATE_ACTIONS = ("ACCEPT", "PATCH_OR_RETHINK", "DECLARE_SCOPE", "RETHINK_STRUCTURAL", "RUN_FAILED", "AWAIT_OWNER")
+
+
 def read_run(run_dir: str, cap=None) -> dict:
     st, err = load_run_state(run_dir)
     box = inbox(run_dir)
@@ -524,7 +733,9 @@ def read_run(run_dir: str, cap=None) -> dict:
             "stepper": stepper(st) if st else None, "compute": compute_status(run_dir, cap, st),
             "inbox": box, "cards": build_cards(run_dir, st, box, cap), "docs": docs,
             "headline": headline(run_dir), "engine": engine_of(run_dir, st), "finished": finished(run_dir, st),
-            "status": run_status(run_dir, st), "fail_statuses": FAIL_STATUSES}
+            "status": run_status(run_dir, st), "fail_statuses": FAIL_STATUSES, "summary": results_summary(run_dir),
+            "benchmarks": benchmarks(run_dir), "batches": batch_info(run_dir), "stop": stop_detail(run_dir, st),
+            "operator_note": operator_note(run_dir)}
 
 
 # ------------------------------------------------------------------ feedback and the learning view
@@ -1045,20 +1256,21 @@ def identity(run_dir: str, st: dict | None, head: str = "") -> dict:
         if c["kind"] == "decision_test":
             tests[c["anchor"]["id"]] = c.get("verdict")
     status = run_status(run_dir, st)
-    comp = compute_status(run_dir, None, st)
-    active = (not finished(run_dir, st)) and (comp["live"] or time.time() - os.path.getmtime(
-        os.path.join(run_dir, "run_state.json")) < STALE_S)
+    active = is_active(run_dir, st)
     chip = ("failed" if status in FAIL_STATUSES else "completed" if status else "waiting" if (st or {}).get("paused")
             else "running" if active else "stopped" if not finished(run_dir, st) else "ended")
     m = re.search(r"95% (?:UI|CI|interval)[^\d$]*([^)]+)\)", head or "")
+    top = next((x for x in results_summary(run_dir) if x.get("ui")), None)
     return {"spec_sha": spec_sha, "signed_at": so.get("signed_at"), "signed_by": so.get("signed_by"),
             "signoff_note": so.get("note"), "engine_id": eng, "packages": package_counts(run_dir), "tests": tests,
-            "ui": m.group(1).strip() if m else None, "chip": chip, "ended": end_reason(st, status, chip),
+            "ui": m.group(1).strip() if m else None,
+            "ui_vals": top["ui"] + [top.get("level")] if top else None, "chip": chip, "ended": end_reason(st, status, chip),
             "spent_usd": (st or {}).get("spent_usd"), "launch_commit": _meta(run_dir).get("commit"),
             "spec_fields": spec_fields(_read(os.path.join(run_dir, "decision_spec.yaml"))[0]),
             "first_at": min((h.get("at") or "" for h in (st or {}).get("history") or [] if isinstance(h, dict)
                              and h.get("from") == "SIGN"), default=""), "last_at": _last_at(st),
-            "has_engine_choice": bool(eng), "state_sha": _sha(os.path.join(run_dir, "run_state.json"))}
+            "has_engine_choice": bool(eng), "state_sha": _sha(os.path.join(run_dir, "run_state.json")),
+            "batches": batch_info(run_dir), "stop": stop_detail(run_dir, st), "operator_note": operator_note(run_dir)}
 
 
 def _resumed(st_hist: list) -> bool:
@@ -1100,9 +1312,15 @@ def projects(runs: list) -> list:
                 if a and b and not a.get("_error") and not b.get("_error"):
                     k = max(set(a) | set(b), key=lambda c: (abs(b.get(c, 0) - a.get(c, 0)), c))
                     if b.get(k, 0) != a.get(k, 0):
-                        r["shift"] = f"{k} {a.get(k, 0)}→{b.get(k, 0)}"
+                        r["shift"] = f"{k}: {a.get(k, 0)} → {b.get(k, 0)} units"
                         r["shift_vs"] = base["label"]
             prev = r
+        for i, r in enumerate(pj["lineage"]):        # where reused engine points were computed
+            for b in r.get("batches") or []:
+                if b.get("reused"):
+                    src = next((x for x in reversed(pj["lineage"][:i]) for y in x.get("batches") or []
+                                if y.get("code_fp") == b.get("code_fp") and y.get("out") == b.get("out")), None)
+                    b["reused_from"] = src["label"] if src else None
     return sorted(out.values(), key=lambda pj: max((r.get("last_at") or "" for r in pj["lineage"] + pj["drafts"]),
                                                    default=""), reverse=True)
 
@@ -1115,6 +1333,7 @@ def compare(a: dict, b: dict) -> dict:
             "spec_diff": spec_diff(a.get("spec_fields") or {}, b.get("spec_fields") or {}),
             "engines": [a.get("engine_id"), b.get("engine_id")],
             "headline": [[a.get("headline_number"), a.get("ui")], [b.get("headline_number"), b.get("ui")]],
+            "ui_vals": [a.get("ui_vals"), b.get("ui_vals")],
             "packages": {c: [(a.get("packages") or {}).get(c, 0), (b.get("packages") or {}).get(c, 0)] for c in comps
                          if not c.startswith("_")},
             "tests": {t: [(a.get("tests") or {}).get(t), (b.get("tests") or {}).get(t)] for t in tids},
@@ -1286,7 +1505,8 @@ class Console:
                                                              "drafts": [r["id"] for r in p["drafts"]]}
                                                             for p in projects(runs)], "sync": self.sync_state, "chat": {
                 "spent": self.chat.spent, "cap": self.chat.cap_usd, "key": api_key() is not None},
-                "kinds": KINDS, "layers": LAYERS, "states": states()}
+                "kinds": KINDS, "layers": LAYERS, "states": states(),
+                "glossary": {k: {"text": v[0], "source": v[1]} for k, v in GLOSSARY.items()}}
         if method == "GET" and path == "/api/learning":
             return 200, "json", learning([r["id"] for r in self.runs()])
         if method == "GET" and path == "/api/compare":
@@ -1889,7 +2109,7 @@ def _self_test() -> int:
             ok(C["engine_id"]["version"] == "0.6" and C["chip"] == "failed" and C["ended"] == "analyze timed out"
                and B["chip"] in ("running", "stopped") and B["ended"].endswith("critique"), f"RC15d engine version, chip and why it ended ({C['engine_id']}, "
                f"{C['chip']}, {C['ended']})")
-            ok(C["shift"] in ("smc 2→0", "cm 3→3") and C["shift"] == "smc 2→0" and C["shift_vs"] == "B",
+            ok(C["shift"] == "smc: 2 → 0 units" and C["shift_vs"] == "B",
                f"RC15e the package shift is against the nearest earlier run with an allocation ({C['shift']})")
             cmpd = compare(B, C)
             ok(cmpd["packages"] == {"cm": [3, 3], "net": [0, 1], "smc": [2, 0]}
@@ -1905,6 +2125,41 @@ def _self_test() -> int:
                 srv.shutdown()
             ok(len(j["projects"]) == 1 and len(j["projects"][0]["lineage"]) == 3 and c2["labels"] == ["B", "C"],
                "RC15g /api/runs lists projects and /api/compare answers")
+        # RC16 reader support: every marked term is defined; no JSON shown; tables from structured data
+        page = open(HTML, encoding="utf-8").read()
+        marked = set(re.findall(r'T\("([^"]+)"', page))
+        ok(marked and marked <= set(GLOSSARY) and set(GATE_ACTIONS) <= set(GLOSSARY)
+           and {f"rule {r}" for r in ("1", "2", "3", "3a", "4", "5")} <= set(GLOSSARY)
+           and {"HIGH", "MEDIUM", "LOW"} <= set(GLOSSARY) and all(len(v) == 2 and v[0] and v[1] for v in GLOSSARY.values()),
+           f"RC16a every term the page marks, every gate action, rule and severity has a definition and a source "
+           f"(undefined: {sorted(marked - set(GLOSSARY))})")
+        js = [ln for ln in page.splitlines() if "JSON.stringify" in ln]
+        ok(all("anchor" in ln or "body: JSON.stringify" in ln for ln in js),
+           "RC16b JSON.stringify is used only for anchors and request bodies, never for text the reader sees")
+        g = [c for c in read_run(rd)["cards"] if c["kind"] == "gate"][0]
+        ok(g["done_when"] and g["done_when"][0]["blocker"] == "T-001" and g["done_when"][0]["severity"] == "HIGH"
+           and g["done_when"][0]["detail"] == "fail" and _words({"fixed": ["T-001", "T-002"], "rejected": []})
+           == "fixed: T-001, T-002 · rejected: none", f"RC16c done-when rows join the gate status with the blocker; "
+           f"fix-loop records read as words ({g['done_when'][:1]})")
+        with tempfile.TemporaryDirectory() as t4:
+            d = _toy_run(os.path.join(t4, "r"))
+            os.makedirs(os.path.join(d, "analysis", "batch"))
+            for rel, doc in (("analysis/point.yaml", {"data": {"averted": {"dalys": 1.5e6, "cases": 2e6}, "n_units": 10,
+                                                                 "budget_allocatable": 80.0, "cost_allocated": 79.0,
+                                                                 "mix": {"no_package": 2}}}),
+                             ("analysis/uncertainty.yaml", {"data": {"headline": {"outcome": "dalys"}, "covers": ["costs"],
+                                                                       "fixed_plan": {"dalys": {"ci_low": 1.2e6, "ci_high": 1.8e6,
+                                                                                                "median": 1.4e6, "level": 0.95}}}}),
+                             ("decision_spec.yaml", {"constraints": {"envelope_usd": 100.0}})):
+                yaml.safe_dump(doc, open(os.path.join(d, rel), "w"))
+            json.dump({"n": 4, "computed": 1, "reused": 3, "code_fp": "ab", "task_core_s": 10.0},
+                      open(os.path.join(d, "analysis", "batch", "p.jsonl.summary.json"), "w"))
+            sm = results_summary(d)
+            ok([x["label"] for x in sm] == ["dalys averted", "cases averted", "envelope", "allocatable", "allocated",
+                                            "units with no package"] and sm[0]["ui"] == [1.2e6, 1.8e6]
+               and sm[0]["source"] == "analysis/point.yaml" and sm[2]["source"] == "decision_spec.yaml"
+               and sm[-1]["of"] == 10 and batch_info(d)[0]["reused"] == 3,
+               f"RC16d the summary: headline first with its UI, each value with its source; reused batch points ({sm})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
