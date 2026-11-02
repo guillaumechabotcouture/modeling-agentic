@@ -924,3 +924,68 @@ The cause is the classification rule, not the sampler:
 **Proposed fix (owner's call; not made here).** Measure ridge loadings on each parameter's log (relative) scale instead of in prior-sd units. That makes the likelihood classes prior-independent, as §3.2 intends: the SB2b null direction then loads 0.5 on each of the four parameters. This changes class semantics for every case, so it needs its own test from this evidence and a full re-run.
 
 **Spend.** 61.5 Coiled credits (about US$3.75) on two 8-vCPU VMs in `idm-coiled-idmad-r2`, about 3 h of wall time; both clusters stopped.
+
+## Addendum: log-scale ridge loadings measured (2026-11-02, branch `v2-calibration-logloadings`)
+
+**Change (owner-approved follow-up to the SB2b addendum).** Identifiability-class ridge loadings are measured on each parameter's log scale: log x for a positive support, log(1 + x) for a support from above −1 that contains 0, and the value itself otherwise. Flatness is still judged against the prior's precision (eigenvalue < 0.111), and the loading cut-off stays at 0.30 (or half the largest loading). The Fisher point is polished to the likelihood's maximum within the support. At the best sample point, the residuals times the ridge's second derivative added curvature (0.18 on CB9), which hid the exact ridge.
+
+**Tests first.**
+- **CB9** puts the SB2b priors on the ridge (reporting × s0, R0 × s0, seed / s0). It failed before the change (reporting `identified`) and passes after (all four parameters on one ridge).
+- **CB10 (guard):** a narrow-prior parameter the data pin stays identified, and one the data do not see stays prior-dominated. It passed before and after.
+- **Ablation:** with the polish but prior-sd loadings, reporting is still `identified`. The log scale is what fixes it.
+
+**Ten cases re-run** (200 replicates each; same bands and cut-offs). Coverage is unchanged in every case:
+
+| Case | Coverage | Class check before (#110) | Class check after | Status after |
+|---|---|---|---|---|
+| SB1 | 0.965 | reporting identified 1.00 | 1.00 | in band |
+| SB2a | 0.945 | reporting prior-dominated 0.965 | 0.965 | in band |
+| SB2a_neg | 0.345 | – | – | in band |
+| SB2b | 0.915 | reporting 0.465, ridge share 0.34 | **reporting 0.98, ridge share 0.97** | out of band: 1 of 200 fits below the ESS floor, as in #110 |
+| SB2c | 0.97 | reporting identified 1.00 | 1.00 | in band |
+| SB3a | 0.925 | ω, δ 1.00; net bias identified 1.00 | ω, δ 1.00; **net bias identified 0.00** | **out of band** |
+| SB3b, administrative data as truth | 0.18 | – | – | in band |
+| SB3b, serosurvey as truth | 0.465 | – | – | in band |
+| SB3c | 0.905 | ω, δ, rel_out 1.00 | 1.00 | in band |
+| SB5 | 0.93 | – | – | in band |
+
+**What changed and why.**
+- **SB2b:** reporting, s0, R0 and seeding are now prior-dominated in 194–196 of 200 replicates (was about half). The ridge reported names reporting with s0 in 0.97 of replicates.
+- **SB3a:** the coverage-to-immunity ratio (the administrative source's net bias) is now prior-dominated in 200/200. On one inspected replicate there are four flat directions: (ω, δ); (ω, δ, se) with log-scale loadings −0.77, −0.43, −0.33; rel_out; and sp. The ratio's gradient loads 0.214 on them, above 0.09, so it is on_ridge, with contraction 0.94.
+  - The ratio is pinned only through the declared assay-sensitivity range. §3.4 states this ("up to the assay and waning terms").
+  - Prior-sd loadings hid it, because se's narrow prior absorbed that direction.
+  - So SB3a's expectation that the ratio is `identified` assumes the assay range is information. The prior-independent classes of §3.2 class the ratio `prior_dominated` instead. Its width is set by the declared assay validation, and it now gets the prior_range test and the label. The coverage is unchanged.
+- **Other classes:** the coverages c_k in SB3a are now prior-dominated in 61–88 of 200 replicates (were all identified). They load on the same assay direction.
+
+**For the owner.** Two choices remain, and neither was made here (bands and cut-offs untouched):
+- **SB3a's class expectation.** (a) Keep prior-independent classes and restate SB3a's expectation for the ratio as "prior-dominated, set by the assay validation range". (b) Keep "identified" and treat a validated assay range as data, not prior, for example a declared `validated: true` prior class that the loadings would use in prior units.
+- **SB2b's one invalid fit.** It still needs either more stages for that replicate or an accepted rate of sampler refusals.
+
+**Spend.** 62.4 Coiled credits (about US$3.81) on two 8-vCPU VMs in `idm-coiled-idmad-r2`, about 3.1 h of wall time; both clusters stopped.
+
+**Owner decisions, 2026-11-02 (implemented in the same PR; re-scored from the stored replicate results, no new run, no
+spend).**
+1. **SB3a's expectation restated after seeing the result.** The coverage-to-immunity ratio (`net_bias:admin`) is now expected `prior_dominated`, determined by the declared assay-sensitivity range.
+   - The former `identified` expectation was written under the prior-sd loadings this PR replaced.
+   - The classes stay prior-independent. There is no `validated: true` or prior-as-data mechanism; a prior's source stays in its provenance, not in the class.
+2. **Sampler refusals in the coverage pack.** A case allows a declared share of replicates in which the sampler fails closed (`posterior_ess`, `posterior_mcmc`): `coverage_scoring.refusal_share_max: 0.02` at pack level, which a case may override.
+   - Each refusal is counted as a miss in the coverage and the class shares, never dropped, and is reported separately (`refusals`, `refusal_share`).
+   - Any other invalid output still fails the case.
+   - In a real run a refusal still stops the calibration.
+   - No extra sampler stages were added.
+   - `benchmark.py rescore` re-scores stored results only when the computation is unchanged. It checks the engine stamp, the calibrator-code digest and the computation digest (the declaration without its scoring fields) against the pack the results were computed for.
+
+| Case | Coverage (refusals counted as misses) | Class check | Refusals | Status |
+|---|---|---|---|---|
+| SB1 | 0.965 | reporting identified 1.00 | 0 | in band |
+| SB2a | 0.945 | reporting prior-dominated 0.965 | 0 | in band |
+| SB2a_neg | 0.345 | – | 0 | in band |
+| SB2b | 0.915 | reporting prior-dominated 0.98; ridge share 0.97 | 1 of 200 (0.5%, within 2%) | in band |
+| SB2c | 0.97 | reporting identified 1.00 | 0 | in band |
+| SB3a | 0.925 | ω, δ 1.00; ratio prior-dominated 1.00 (restated) | 0 | in band |
+| SB3b, administrative data as truth | 0.18 | – | 0 | in band |
+| SB3b, serosurvey as truth | 0.465 | – | 0 | in band |
+| SB3c | 0.905 | ω, δ, rel_out 1.00 | 0 | in band |
+| SB5 | 0.93 | – | 0 | in band |
+
+10 of 10 in band.

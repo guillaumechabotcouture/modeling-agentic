@@ -437,6 +437,10 @@ def _result(o) -> dict:
 
 
 COVERAGE_TASKS_PER_CHILD = 4
+# A sampler that fails closed below its floor (toolkit/analysis/calibration.py). In the coverage pack a declared share of
+# such refusals is allowed, each counted as a miss (owner decision 2026-11-02); in a real run a refusal still stops.
+SAMPLER_REFUSALS = ("posterior_ess", "posterior_mcmc")
+SCORING_KEYS = ("band", "classes", "class_share_min", "ridge_names", "refusal_share_max")
 
 
 def _coverage_job(args) -> dict:
@@ -462,7 +466,8 @@ def _coverage_job(args) -> dict:
     try:
         post = cal(make_engine, data, **cargs)
     except (ValueError, RuntimeError, ArithmeticError, np.linalg.LinAlgError) as ex:
-        out.update(invalid=True, error=f"{type(ex).__name__}: {str(ex)[:200]}", _configs=used)
+        out.update(invalid=True, error=f"{type(ex).__name__}: {str(ex)[:200]}", _configs=used,
+                   refused=getattr(ex, "code", None) in SAMPLER_REFUSALS)
         return out
     for q in qs:
         iv = (post.get("intervals") or {}).get(q)
@@ -838,21 +843,18 @@ class Runner:
         import hashlib
         import json
         hits = {q: sum(p["hits"].get(q, 0) for p in per) for q in qs}
-        cls_hits = {c: sum(p["class_ok"].get(c, 0) for p in per) for c in classes}
         invalid = sum(int(p["invalid"]) for p in per)
-        cov = {q: hits[q] / reps for q in qs}
+        refusals = sum(int(bool(p.get("refused"))) for p in per)
+        cov = {q: hits[q] / reps for q in qs}           # a refused or invalid replicate is a miss (never dropped)
         se = {q: math.sqrt(max(cov[q] * (1 - cov[q]), 1e-12) / reps) for q in qs}
-        share = {c: cls_hits[c] / reps for c in classes}
-        lo, hi = e["band"]
-        need = float(e.get("class_share_min", 0.9))
         counts = {}
         for p in per:
             for k, v in (p.get("classes") or {}).items():
                 counts.setdefault(k, {}).setdefault(v, 0)
                 counts[k][v] += 1
         errors = sorted({p["error"] for p in per if p.get("error")})
-        out = {"computed": min(cov.values()), "coverage": cov, "coverage_se": se, "class_share": share,
-               "replicates": reps, "band": [lo, hi], "invalid_outputs": invalid, "class_counts": counts,
+        out = {"coverage": cov, "coverage_se": se, "replicates": reps, "invalid_outputs": invalid,
+               "refusals": refusals, "class_counts": counts,
                "per_replicate_sha256": hashlib.sha256(json.dumps(   # timings excluded: the result, not the run
                    [{k: ({a: b for a, b in v.items() if a != "seconds"} if k == "diagnostics" else v)
                      for k, v in p.items()} for p in per], sort_keys=True, default=str).encode()).hexdigest()}
@@ -866,16 +868,12 @@ class Runner:
             if vals:
                 out.setdefault("sampler", {})[key] = {"min": float(min(vals)), "median": float(np.median(vals)),
                                                       "max": float(max(vals))}
-        ok_ridge = True
         if ridge_names:
             out["ridge_share"] = sum(int(p["ridge_ok"]) for p in per) / reps
-            ok_ridge = out["ridge_share"] >= need
         out["declaration_sha256"] = declaration_digest(b, self.pack)
+        out["computation_sha256"] = computation_digest(b, self.pack)
         out["code_sha256"] = calibrator_code_digest(self.pack, e)
-        # a calibration that returns no usable interval is a failure, never "under-coverage detected"
-        out["in_band"] = (invalid == 0 and all(lo <= c <= hi for c in cov.values())
-                          and all(v >= need for v in share.values()) and ok_ridge)
-        out["status"] = "in_band" if out["in_band"] else "out_of_band"
+        out.update(score_coverage(out, e, self.pack))
         return out
 
     @staticmethod
@@ -1164,6 +1162,92 @@ def verified_benchmarks(engine) -> tuple[list, str | None]:
     return list(doc.get("benchmarks") or []), None
 
 
+def refusal_share_max(e: dict, pack: dict) -> float:
+    """The declared share of sampler refusals a coverage case allows: the case's own `refusal_share_max`, else the
+    pack's `coverage_scoring.refusal_share_max`, else 0."""
+    v = e.get("refusal_share_max", (pack.get("coverage_scoring") or {}).get("refusal_share_max", 0.0))
+    return float(v)
+
+
+def score_coverage(row: dict, e: dict, pack: dict) -> dict:
+    """Status of a coverage case from its replicate aggregates (the run's or stored ones): every quantity's coverage in
+    the band (refused and invalid replicates counted as misses), every expected class in at least class_share_min of
+    replicates (a refused replicate has no class: a miss), the ridge names likewise, no invalid output other than
+    sampler refusals, and refusals within the declared share (owner decision 2026-11-02)."""
+    reps = int(row["replicates"])
+    lo, hi = e["band"]
+    need = float(e.get("class_share_min", 0.9))
+    classes = e.get("classes") or {}
+    counts = row.get("class_counts") or {}
+    share = {c: sum(n for k, n in (counts.get(c) or {}).items() if k in allowed) / reps for c, allowed in classes.items()}
+    refusals = int(row.get("refusals") or 0)
+    other = int(row.get("invalid_outputs") or 0) - refusals
+    rmax = refusal_share_max(e, pack)
+    cov = row["coverage"]
+    ok_ridge = (not e.get("ridge_names")) or float(row.get("ridge_share") or 0.0) >= need
+    in_band = (other == 0 and refusals <= rmax * reps + 1e-9 and all(lo <= c <= hi for c in cov.values())
+               and all(v >= need for v in share.values()) and ok_ridge)
+    return {"computed": min(cov.values()), "band": [lo, hi], "class_share": share, "refusal_share": refusals / reps,
+            "refusal_share_max": rmax, "in_band": bool(in_band), "status": "in_band" if in_band else "out_of_band"}
+
+
+def computation_digest(b: dict, pack: dict | None = None) -> str:
+    """The declaration digest without the scoring fields: what determines the replicates' outputs."""
+    e = dict(b["estimand"])
+    for k in SCORING_KEYS:
+        e.pop(k, None)
+    core = {k: v for k, v in b.items() if k not in ("estimand", "metric")}
+    core["estimand"] = e
+    return declaration_digest(core, pack)
+
+
+def rescore_results(pack: dict, doc: dict, previous_pack: dict, engine) -> dict:
+    """Re-score stored coverage results under the current pack's scoring fields, without re-running. Each stored row
+    must carry the stamp of the current engine and calibrator code, must have been computed for `previous_pack`'s
+    declaration of its case (declaration digest), and that declaration may differ from the current one only in scoring
+    fields (computation digest). Refusals are read from the row, or, for a row stored before they were counted, only
+    when every one of its invalid outputs is a recorded sampler refusal."""
+    want = stamp({}, engine)
+    for k in ("producer", "engine_identity", "engine_config_sha256"):
+        if doc.get(k) != want.get(k):
+            raise ValueError(f"rescore: the stored results have another {k}")
+    cur = {b["id"]: b for b in pack["benchmarks"]}
+    old = {b["id"]: b for b in previous_pack["benchmarks"]}
+    rows = []
+    for r in doc.get("benchmarks") or []:
+        b = cur.get(r["id"])
+        if b is None or b["estimand"]["type"] != "coverage":
+            rows.append(r)
+            continue
+        bo = old.get(r["id"])
+        if bo is None or r.get("declaration_sha256") != declaration_digest(bo, previous_pack):
+            raise ValueError(f"rescore: {r['id']} was not computed for the previous pack's declaration")
+        if r.get("code_sha256") != calibrator_code_digest(pack, b["estimand"]):
+            raise ValueError(f"rescore: {r['id']} was computed by other calibration, observation or generator code")
+        if computation_digest(bo, previous_pack) != computation_digest(b, pack):
+            raise ValueError(f"rescore: {r['id']}: more than the scoring fields changed; re-run the case")
+        r = dict(r)
+        if "refusals" not in r:
+            errs = list(r.get("errors") or [])
+            inv = int(r.get("invalid_outputs") or 0)
+            all_refusals = errs and all(any(f"{c}:" in x for c in SAMPLER_REFUSALS) for x in errs)
+            r["refusals"] = inv if (all_refusals and len(errs) == inv) else 0
+        r.update(score_coverage(r, b["estimand"], pack))
+        r["rescored_from"] = {"declaration_sha256": r["declaration_sha256"],
+                              "note": "stored replicate aggregates re-scored; no new run"}
+        r["declaration_sha256"] = declaration_digest(b, pack)
+        r["computation_sha256"] = computation_digest(b, pack)
+        r["in_band"] = r["status"] == "in_band"
+        rows.append(r)
+    out = {k: v for k, v in doc.items() if k not in ("producer", "engine_identity", "engine_config_sha256")}
+    out["benchmarks"] = rows
+    by = {st: sum(x["status"] == st for x in rows) for st in STATUSES}
+    out["summary"] = {"in_band": by["in_band"], "total": len(rows), "by_status": by,
+                      "held_out_in_band": sum(x["status"] == "in_band" for x in rows if x["role"] == "held_out"),
+                      "held_out_total": sum(x["role"] == "held_out" for x in rows)}
+    return stamp(out, engine)
+
+
 def declaration_digest(b: dict, pack: dict | None = None) -> str:
     """sha256 of a case's declaration with the named configurations it uses resolved (Codex r2-4), plus the analysis
     thresholds file (the calibrator's floors and class thresholds)."""
@@ -1254,12 +1338,13 @@ def merge_results(pack: dict, docs: list, engine) -> dict:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("pack")
-    ap.add_argument("action", choices=["fit", "run", "validate", "merge"])
+    ap.add_argument("action", choices=["fit", "run", "validate", "merge", "rescore"])
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 1)
     ap.add_argument("--seeds", type=int, default=0, help="use the first K seeds of the pack (0 = all)")
     ap.add_argument("--out", default=None)
     ap.add_argument("--only", default=None, help="run: only these benchmark ids (comma-separated); merge the files")
-    ap.add_argument("--inputs", nargs="*", default=[], help="merge: results files of per-case runs")
+    ap.add_argument("--inputs", nargs="*", default=[], help="merge: results files of per-case runs; rescore: one file")
+    ap.add_argument("--previous-pack", default=None, help="rescore: the pack the stored results were computed for")
     a = ap.parse_args(argv)
     pack = yaml.safe_load(open(a.pack))
     eng = load_engine(pack["engine"], (pack.get("configs") or {}).get(pack.get("default_config")))
@@ -1276,6 +1361,13 @@ def main(argv=None) -> int:
         path = a.out or os.path.join(d, "results.yaml")
         yaml.safe_dump(merged, open(path, "w"), sort_keys=False)
         print(f"wrote {path} ({len(merged['benchmarks'])} cases)")
+        return 0
+    if a.action == "rescore":
+        prev = yaml.safe_load(open(a.previous_pack))
+        res = rescore_results(pack, yaml.safe_load(open(a.inputs[0])), prev, eng)
+        path = a.out or a.inputs[0]
+        yaml.safe_dump(res, open(path, "w"), sort_keys=False)
+        print(f"wrote {path} ({res['summary']['in_band']} of {res['summary']['total']} in band)")
         return 0
     if a.only:
         keep = set(a.only.split(","))
@@ -1811,6 +1903,81 @@ def _self_test() -> int:
         ok(d1 != d2, "BP52 (Codex r2-4) a changed named configuration (or threshold file) changes the case digest")
     except Exception as ex:  # noqa: BLE001
         ok(False, f"BP52 configuration in the digest ({type(ex).__name__}: {ex})")
+    # owner decision 2026-11-02 (SB2b): a declared share of sampler refusals is allowed, each counted as a MISS
+    try:
+        from toolkit.analysis.calibration import CalibrationRefused as _CR
+
+        def _cal_refuse_some(make_engine, data, every=50, **k):
+            if int(round(abs(data["y"][0]) * 1e6)) % every == 0:
+                raise _CR("posterior_ess", "effective sample size 513 below the floor 1000 after 12 adaptive stages")
+            return _cal(make_engine, data)
+        om.calibrate_refuse_some = _cal_refuse_some
+        om.calibrate_other_error = lambda make_engine, data, **k: (_ for _ in ()).throw(ValueError("bad input"))
+        base = {"type": "coverage", "generator": {"fn": "normal", "args": {}}, "replicates": 60, "seed": 3,
+                "quantities": ["mu"], "band": [0.85, 1.0]}
+        p17 = dict(p6, coverage_scoring={"refusal_share_max": 0.02}, benchmarks=[
+            {"id": "Q1", "metric": "rare refusals", "estimand": dict(base, calibrator={"fn": "_bp_oracles:calibrate_refuse_some",
+                                                                                         "args": {"every": 10 ** 9}})},
+            {"id": "Q2", "metric": "no refusals", "estimand": dict(base, calibrator={"fn": "_bp_oracles:calibrate_normal"})},
+            {"id": "Q3", "metric": "other errors", "estimand": dict(base, calibrator={"fn": "_bp_oracles:calibrate_other_error"},
+                                                                    replicates=3, band=[0.0, 1.0])}])
+        r17 = {x["id"]: x for x in run_pack(p17, eng, Runner(p17, eng, 1), {})["benchmarks"]}
+        # force exactly one refusal in Q1: the replicate whose first observation rounds to a multiple of `every`
+        ref1 = r17["Q1"].get("refusals")
+        cov1, cov2 = r17["Q1"]["coverage"]["mu"], r17["Q2"]["coverage"]["mu"]
+        ok(ref1 == 0 and cov1 == cov2 and r17["Q1"]["status"] == r17["Q2"]["status"]
+           and r17["Q3"]["status"] == "out_of_band" and r17["Q3"].get("refusals") == 0,
+           f"BP53a refusals are counted apart from other failures ({ref1}, {r17['Q3'].get('refusals')})")
+        ids = []
+        for r in range(60):
+            dat, _t = _gen(np.random.default_rng([3, r]))
+            ids.append(int(round(abs(dat["y"][0]) * 1e6)))
+        one = next(m for m in range(2, 10 ** 6) if sum(i % m == 0 for i in ids) == 1)
+        two = next(m for m in range(2, 10 ** 6) if sum(i % m == 0 for i in ids) == 2)
+        p18 = dict(p17, benchmarks=[
+            {"id": "R1", "metric": "one refusal in 60", "estimand": dict(base, calibrator={
+                "fn": "_bp_oracles:calibrate_refuse_some", "args": {"every": one}}, refusal_share_max=0.02)},
+            {"id": "R2", "metric": "two refusals in 60", "estimand": dict(base, calibrator={
+                "fn": "_bp_oracles:calibrate_refuse_some", "args": {"every": two}})}])
+        r18 = {x["id"]: x for x in run_pack(p18, eng, Runner(p18, eng, 1), {})["benchmarks"]}
+        hit_q2 = round(cov2 * 60)
+        ok(r18["R1"].get("refusals") == 1 and r18["R1"]["coverage"]["mu"] <= (hit_q2 - 0) / 60
+           and r18["R1"]["coverage"]["mu"] >= (hit_q2 - 1) / 60 and r18["R1"].get("refusal_share_max") == 0.02
+           and r18["R1"]["status"] == ("in_band" if r18["R1"]["coverage"]["mu"] >= 0.85 else "out_of_band")
+           and r18["R2"].get("refusals") == 2 and r18["R2"]["status"] == "out_of_band",
+           f"BP53 a refusal counts as a miss in the coverage, up to the declared share (1/60 within 2%, 2/60 above): "
+           f"{r18['R1'].get('refusals')}, {r18['R1']['coverage']}, {r18['R1']['status']}; "
+           f"{r18['R2'].get('refusals')}, {r18['R2']['status']}")
+        # re-scoring stored results: allowed when only the scoring fields changed, refused otherwise
+        old = stamp(run_pack(p18, eng, Runner(p18, eng, 1), {}), eng)
+        new = dict(p18, benchmarks=[dict(p18["benchmarks"][0], estimand=dict(p18["benchmarks"][0]["estimand"],
+                                                                                band=[0.95, 1.0])),
+                                    p18["benchmarks"][1]])
+        rs = rescore_results(new, old, p18, eng)
+        bad = dict(p18, benchmarks=[dict(p18["benchmarks"][0], estimand=dict(p18["benchmarks"][0]["estimand"], seed=4)),
+                                    p18["benchmarks"][1]])
+        try:
+            rescore_results(bad, old, p18, eng)
+            refused = False
+        except ValueError:
+            refused = True
+        ok(rs["benchmarks"][0]["band"] == [0.95, 1.0] and rs["benchmarks"][0]["status"] == "out_of_band"
+           and rs["benchmarks"][0].get("rescored_from") and refused,
+           "BP54 stored results are re-scored when only the band, classes or refusal share changed; a changed "
+           "computation (seed, generator, calibrator) is refused")
+    except Exception as ex:  # noqa: BLE001
+        ok(False, f"BP53-54 refusals and re-scoring ({type(ex).__name__}: {ex})")
+    # O20 (kept here, not in oracles.py: the oracles file is part of the calibrator-code digest of stored results)
+    try:
+        cp = yaml.safe_load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "compartmental", "benchmarks",
+                                              "coverage.yaml")))
+        sb3a = next(b for b in cp["benchmarks"] if b["id"] == "SB3a")["estimand"]["classes"]
+        pol = (cp.get("coverage_scoring") or {}).get("refusal_share_max")
+        ok(sb3a.get("net_bias:admin") == ["prior_dominated"] and pol == 0.02,
+           f"O20 the coverage pack expects SB3a's coverage-to-immunity ratio prior-dominated (classes prior-independent) "
+           f"and declares the sampler-refusal share once (2%): {sb3a.get('net_bias:admin')}, {pol}")
+    except Exception as ex:  # noqa: BLE001
+        ok(False, f"O20 coverage pack expectations ({type(ex).__name__}: {ex})")
     _self_test_initialisation(ok, pack, eng)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
