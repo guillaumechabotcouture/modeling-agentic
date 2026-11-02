@@ -249,10 +249,6 @@ def engine_choice_ref(run_dir: str) -> str | None:
     return e if isinstance(e, str) else None
 
 
-def load_spec(path: str) -> dict:
-    return merged_spec(os.path.dirname(os.path.abspath(path)))
-
-
 def pre_sign_problems(run_dir: str) -> list[str]:
     """Before the engine is chosen: every section the spike needs, and a valid settings file."""
     import yaml
@@ -511,7 +507,7 @@ def main(argv=None) -> int:
     if argv[:1] == ["--self-test"]:
         return _self_test()
     if len(argv) == 3 and argv[0] in ("configure", "analyze"):
-        spec = load_spec(argv[1])
+        spec = merged_spec(os.path.dirname(os.path.abspath(argv[1])))   # the spec's directory is the run directory
         out = os.path.abspath(argv[2])
         os.makedirs(out, exist_ok=True)
         if argv[0] == "configure":
