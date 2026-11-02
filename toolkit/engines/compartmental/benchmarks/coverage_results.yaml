@@ -16,15 +16,15 @@ benchmarks:
   - 0.9
   - 0.99
   source: ''
-  computed: 0.96
+  computed: 0.965
   coverage:
-    r0: 0.96
-    attack_rate: 0.96
-    reff_end: 0.96
+    r0: 0.965
+    attack_rate: 0.965
+    reff_end: 0.965
   coverage_se:
-    r0: 0.013856406460551024
-    attack_rate: 0.013856406460551024
-    reff_end: 0.013856406460551024
+    r0: 0.012995191418367032
+    attack_rate: 0.012995191418367032
+    reff_end: 0.012995191418367032
   class_share:
     reporting: 1.0
   replicates: 200
@@ -34,22 +34,22 @@ benchmarks:
       identified: 200
     reporting:
       identified: 200
-  per_replicate_sha256: 788ea1ddc980744f16673f179b502d4826fcc072ac38649d94a201dc10e2ed28
+  per_replicate_sha256: e5bfe7f3ec9bdec3629aa360c0becc000551d9109e105f8dc64855ee35fc479a
   interval_width_median:
-    r0: 0.027645032752568688
-    attack_rate: 0.008396845865098368
-    reff_end: 0.010604352895827257
+    r0: 0.02726625296252083
+    attack_rate: 0.008377146396536694
+    reff_end: 0.010558656695915908
   sampler:
     ess:
-      min: 2569.595342363747
-      median: 5002.759601776863
-      max: 6139.5327976842855
+      min: 2294.747402580775
+      median: 3703.7824901273043
+      max: 7955.414679097486
     seconds:
-      min: 40.817
-      median: 42.256
-      max: 45.466
-  declaration_sha256: aafff2683ab0a035eb22d30eea6fe9f7224dab2416e9fa764ae967880b1b5e0e
-  code_sha256: c9f2be8b2a08b926ec62e3d0cec403dc1b6a98277200acfbcf417c70dc104be7
+      min: 40.461
+      median: 50.0715
+      max: 70.57
+  declaration_sha256: dded87061504672064e59a0874a237be723813269d1a6ed44c019fbc8676195c
+  code_sha256: 214a04ee171dc99f0bdc54b5914d30101d5d459ceda18c3282af803b40de5747
   in_band: true
   status: in_band
 - id: SB2a
@@ -61,13 +61,13 @@ benchmarks:
   - 0.9
   - 0.99
   source: ''
-  computed: 0.95
+  computed: 0.945
   coverage:
-    attack_rate: 0.95
+    attack_rate: 0.945
   coverage_se:
-    attack_rate: 0.015411035007422448
+    attack_rate: 0.016120638945153514
   class_share:
-    reporting: 0.96
+    reporting: 0.965
   replicates: 200
   invalid_outputs: 0
   class_counts:
@@ -75,26 +75,26 @@ benchmarks:
       identified: 199
       prior_dominated: 1
     reporting:
-      prior_dominated: 192
-      identified: 4
+      prior_dominated: 193
+      identified: 3
       partly_identified: 4
     seed_share:
       prior_dominated: 189
       identified: 11
-  per_replicate_sha256: 1d1f19c1162bfcf2f6db06a6e7b9414e0e7440ccd640248e23435d34ac111e0c
+  per_replicate_sha256: d9ec11efc9c66c3ac798defa73ee04032ea775a761f14efba312f1cfbdca6079
   interval_width_median:
-    attack_rate: 0.010366376099325112
+    attack_rate: 0.010484237897913974
   sampler:
     ess:
-      min: 2004.6642984257176
-      median: 3048.534000251354
-      max: 5101.2030584895565
+      min: 2010.6915505714824
+      median: 3137.2234852938836
+      max: 5246.475992942413
     seconds:
-      min: 23.198
-      median: 35.489999999999995
-      max: 48.523
-  declaration_sha256: b0db6abf3529932b196d8968a714e2fb70a26abe5858231dd650b606bd34230c
-  code_sha256: c9f2be8b2a08b926ec62e3d0cec403dc1b6a98277200acfbcf417c70dc104be7
+      min: 27.598
+      median: 47.8755
+      max: 67.346
+  declaration_sha256: 7cec4be72b4b97048e66f92ff1c31b69b4e572fbda429203946de0365337fbd5
+  code_sha256: 214a04ee171dc99f0bdc54b5914d30101d5d459ceda18c3282af803b40de5747
   in_band: true
   status: in_band
 - id: SB2a_neg
@@ -106,11 +106,11 @@ benchmarks:
   - 0.0
   - 0.8
   source: ''
-  computed: 0.335
+  computed: 0.345
   coverage:
-    attack_rate: 0.335
+    attack_rate: 0.345
   coverage_se:
-    attack_rate: 0.0333747659167821
+    attack_rate: 0.033613613313656115
   class_share: {}
   replicates: 200
   invalid_outputs: 0
@@ -119,20 +119,20 @@ benchmarks:
       identified: 200
     seed_share:
       identified: 200
-  per_replicate_sha256: 59e75c38dd9f3370ec710ac9a625344e5b34d4849b4b060d1df0ccc8a047e34f
+  per_replicate_sha256: b1113bb28de17678120fc9a1130f05543be862a9fcdee10cd9860cd13ee7643a
   interval_width_median:
-    attack_rate: 0.0022385195733920244
+    attack_rate: 0.0022550945725654985
   sampler:
     ess:
-      min: 2520.9857005087483
-      median: 4935.870553701776
-      max: 6382.687815072226
+      min: 3784.265235907357
+      median: 5447.275551777586
+      max: 6737.347069749893
     seconds:
-      min: 30.604
-      median: 35.7485
-      max: 44.579
-  declaration_sha256: 91f562e4bf2f62f24a2edd790bb6b2fd7646cb57fc0de572f4fe82b37e9d3dac
-  code_sha256: c9f2be8b2a08b926ec62e3d0cec403dc1b6a98277200acfbcf417c70dc104be7
+      min: 25.846
+      median: 47.022999999999996
+      max: 88.51
+  declaration_sha256: 1e39fda3abde7b51ee53b05403d48ec18e40049b8d2f5db728acfa0406281576
+  code_sha256: 214a04ee171dc99f0bdc54b5914d30101d5d459ceda18c3282af803b40de5747
   in_band: true
   status: in_band
 - id: SB2b
@@ -144,59 +144,53 @@ benchmarks:
   - 0.9
   - 0.99
   source: ''
-  computed: 0.28
+  computed: 0.915
   coverage:
-    attack_rate: 0.28
+    attack_rate: 0.915
   coverage_se:
-    attack_rate: 0.03174901573277509
+    attack_rate: 0.019719913792915014
   class_share:
-    reporting: 0.27
+    reporting: 0.465
   replicates: 200
-  invalid_outputs: 143
+  invalid_outputs: 1
   class_counts:
     forcing_amplitude:
-      partly_identified: 21
-      identified: 17
-      prior_dominated: 19
+      partly_identified: 60
+      identified: 107
+      prior_dominated: 32
     r0:
-      partly_identified: 7
-      prior_dominated: 44
-      identified: 6
+      prior_dominated: 143
+      partly_identified: 22
+      identified: 34
     reporting:
-      prior_dominated: 54
-      identified: 3
+      prior_dominated: 93
+      identified: 102
+      partly_identified: 4
     s0:
-      identified: 14
-      prior_dominated: 43
+      prior_dominated: 124
+      identified: 64
+      partly_identified: 11
     seed_share:
-      prior_dominated: 54
-      identified: 3
-  per_replicate_sha256: c51b8f80edc83f1cdbd60805d10b17e8bcdfd5733add163f5e67478e7091525d
+      prior_dominated: 93
+      identified: 106
+  per_replicate_sha256: 7eeff6d0cc93200541960c7d53e39816ceaeb240a5c8e01bc146d4a3bd051fb9
   errors:
-  - 'CalibrationRefused: posterior_ess: effective sample size 102 below the floor
-    1000 after 6 adaptive stages'
-  - 'CalibrationRefused: posterior_ess: effective sample size 103 below the floor
-    1000 after 6 adaptive stages'
-  - 'CalibrationRefused: posterior_ess: effective sample size 105 below the floor
-    1000 after 6 adaptive stages'
-  - 'CalibrationRefused: posterior_ess: effective sample size 106 below the floor
-    1000 after 6 adaptive stages'
-  - 'CalibrationRefused: posterior_ess: effective sample size 115 below the floor
-    1000 after 6 adaptive stages'
+  - 'CalibrationRefused: posterior_ess: effective sample size 513 below the floor
+    1000 after 12 adaptive stages'
   interval_width_median:
-    attack_rate: 0.0005083533827786839
+    attack_rate: 0.12387741627254967
   sampler:
     ess:
-      min: 1077.1397373921786
-      median: 2288.2037898408707
-      max: 4066.153617868072
+      min: 1081.8685113704316
+      median: 2277.359119420994
+      max: 3498.6579273650955
     seconds:
-      min: 40.443
-      median: 79.227
-      max: 128.0
-  ridge_share: 0.21
-  declaration_sha256: 973c8930aac0df72eb98bb68c53bd01ec1579c1faeb14ebfb28aa31691ac07d8
-  code_sha256: c9f2be8b2a08b926ec62e3d0cec403dc1b6a98277200acfbcf417c70dc104be7
+      min: 55.452
+      median: 294.534
+      max: 498.587
+  ridge_share: 0.34
+  declaration_sha256: 049b7f9e59760a9434d677969381208794542319f5d844011519998fc8872c1f
+  code_sha256: 214a04ee171dc99f0bdc54b5914d30101d5d459ceda18c3282af803b40de5747
   in_band: false
   status: out_of_band
 - id: SB2c
@@ -225,22 +219,22 @@ benchmarks:
       identified: 200
     reporting:
       identified: 200
-  per_replicate_sha256: c3144359ea62f87a5bfdd09481dba6027bd222ba01c5657e3d00fbee0cef9665
+  per_replicate_sha256: 8ac2a2bbe3d32b7e7c6a8c128c1a82ca7392693906156d26d21daf49cc630608
   interval_width_median:
-    r0: 0.03211690341006901
-    attack_rate: 0.01198434792247488
-    reff_end: 0.013685138234974109
+    r0: 0.03198210838508542
+    attack_rate: 0.012091053256894524
+    reff_end: 0.013760053560428864
   sampler:
     ess:
-      min: 2868.755497981119
-      median: 5310.554130555865
-      max: 6156.223607974742
+      min: 2146.655955937051
+      median: 3918.7956218751333
+      max: 4783.190621007814
     seconds:
-      min: 40.095
-      median: 42.3765
-      max: 44.898
-  declaration_sha256: 33fc49fe4adbc7a5c9e3f5e448a910c2072cff627ccbbf1d763733b66d23ec37
-  code_sha256: c9f2be8b2a08b926ec62e3d0cec403dc1b6a98277200acfbcf417c70dc104be7
+      min: 48.515
+      median: 50.2325
+      max: 52.828
+  declaration_sha256: e1002704d545b6c39d1742c45981c4fd2de87267c4b8bc36cd6ed6052794a497
+  code_sha256: 214a04ee171dc99f0bdc54b5914d30101d5d459ceda18c3282af803b40de5747
   in_band: true
   status: in_band
 - id: SB3a
@@ -303,11 +297,11 @@ benchmarks:
       median: 1.0067343177443648
       max: 1.0099217227379849
     seconds:
-      min: 36.588
-      median: 68.80250000000001
-      max: 236.63
-  declaration_sha256: be4fb08458144df36e14b4337db41b485b3b996cb6982c3f3836f46e01d569a6
-  code_sha256: c9f2be8b2a08b926ec62e3d0cec403dc1b6a98277200acfbcf417c70dc104be7
+      min: 36.374
+      median: 81.84
+      max: 280.205
+  declaration_sha256: a4016f74288f816703994fc704820f0c7a940190d6ca24fdf08ac76940981d9f
+  code_sha256: 214a04ee171dc99f0bdc54b5914d30101d5d459ceda18c3282af803b40de5747
   in_band: true
   status: in_band
 - id: SB3b_admin_truth
@@ -350,11 +344,11 @@ benchmarks:
       median: 1.0063975437629282
       max: 1.0099295791001508
     seconds:
-      min: 10.626
-      median: 18.328
-      max: 28.859
-  declaration_sha256: 44e21db18722b5c8cb0ca15516e0b9661ce1626e908104e0fe1c99d23bc96bfc
-  code_sha256: c9f2be8b2a08b926ec62e3d0cec403dc1b6a98277200acfbcf417c70dc104be7
+      min: 12.487
+      median: 21.847
+      max: 34.687
+  declaration_sha256: 971f05595a28993f336e614ca526cb0385526e7986f939e08d480259683ebf83
+  code_sha256: 214a04ee171dc99f0bdc54b5914d30101d5d459ceda18c3282af803b40de5747
   in_band: true
   status: in_band
 - id: SB3b_sero_truth
@@ -397,11 +391,11 @@ benchmarks:
       median: 1.0061343683205697
       max: 1.0099493156840735
     seconds:
-      min: 13.075
-      median: 23.3405
-      max: 36.246
-  declaration_sha256: 12360ce6420c81fa9bf83e0538e031b6c2175025057ca380f92351007a86b8b4
-  code_sha256: c9f2be8b2a08b926ec62e3d0cec403dc1b6a98277200acfbcf417c70dc104be7
+      min: 15.798
+      median: 27.5795
+      max: 42.812
+  declaration_sha256: 6764f3eb932e989c61e227e9f7c1e2c619031550815b0f4fd293cc8cb1574b47
+  code_sha256: 214a04ee171dc99f0bdc54b5914d30101d5d459ceda18c3282af803b40de5747
   in_band: true
   status: in_band
 - id: SB3c
@@ -461,11 +455,11 @@ benchmarks:
       median: 1.0068260155750066
       max: 1.0099930682826639
     seconds:
-      min: 25.291
-      median: 47.718
-      max: 125.318
-  declaration_sha256: be8ece3c0c15d49683b592cabc736683e49b03ea4de401030a1473488f29dad3
-  code_sha256: c9f2be8b2a08b926ec62e3d0cec403dc1b6a98277200acfbcf417c70dc104be7
+      min: 30.238
+      median: 56.9685
+      max: 152.063
+  declaration_sha256: c84a727e6284a3356716ce997b10f90d585ce015e21f1537a5fbc89cea737d9e
+  code_sha256: 214a04ee171dc99f0bdc54b5914d30101d5d459ceda18c3282af803b40de5747
   in_band: true
   status: in_band
 - id: SB5
@@ -488,20 +482,20 @@ benchmarks:
   class_counts:
     q:
       identified: 200
-  per_replicate_sha256: 0be63c1338a2846269ee4ebb7b50818166383fb1a900c39499f379811680526d
+  per_replicate_sha256: 686d78797e4150fdc7a2c5ee591d0132751c0475b6baca2d19248d1517ad7623
   interval_width_median:
-    hospitalisations_averted: 6.86944311617882e-05
+    hospitalisations_averted: 6.815599878056483e-05
   sampler:
     ess:
-      min: 6415.8796799814645
-      median: 8468.101210393806
-      max: 9168.99249868409
+      min: 3235.910468991932
+      median: 6863.543207101846
+      max: 9157.379468903637
     seconds:
-      min: 70.73
-      median: 87.941
-      max: 110.932
-  declaration_sha256: 99543c0f3493cee1b371a84346c50d6fd8903cadc4a8324e2fa1c22e22ad4225
-  code_sha256: c9f2be8b2a08b926ec62e3d0cec403dc1b6a98277200acfbcf417c70dc104be7
+      min: 91.709
+      median: 109.73750000000001
+      max: 138.221
+  declaration_sha256: b4938236879af25e9e552e24595f993ea174af6f9c2158519e6fc6cc3d322acf
+  code_sha256: 214a04ee171dc99f0bdc54b5914d30101d5d459ceda18c3282af803b40de5747
   in_band: true
   status: in_band
 settings_calibrated: {}
@@ -656,4 +650,4 @@ summary:
   held_out_total: 10
 engine_version: '0.1'
 fit_rule: null
-wall_s: 13809.9
+wall_s: 21239.8

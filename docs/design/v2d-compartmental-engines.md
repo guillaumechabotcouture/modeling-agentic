@@ -881,3 +881,46 @@ In SB3a the assay parameters se and sp are `prior_dominated`, and waning is `par
 **Codex review.** Two read-only rounds: 11 findings, then 5. Each was fixed with a test written failing first:
 - r1: floored zero expectations; engine failures; distributed null directions; finite-difference curvature on ridges; the gate re-reading draws; noise for unbiased sources; unit attributes in tests and label; NaN provenance; maternal-antibody exclusion refused; weak ridges refused; merge digests.
 - r2: beta-binomial point masses; the stencil near bounds; the renewal generator; configurations and thresholds in the digests; posterior refused on the emulator path.
+
+## Addendum: SB2b follow-up measured (2026-11-01, branch `v2-calibration-sb2b`)
+
+**Change.** The importance sampler's adaptive stages draw from a population Monte Carlo mixture (Cappé et al. 2004):
+- a defensive Gaussian over the weighted cloud (20%);
+- local Gaussians at 256 points resampled by weight, at four scales: Silverman's factor, then 1/4, 1/16 and 1/64 of it.
+
+Every stage's density is cached for the balance heuristic, and up to 12 stages are allowed (was 6). The ESS floor and the bands are unchanged.
+
+**Spike.**
+- Test CB8 is a curved ridge in 5 parameters. Single-Gaussian stages stopped it at ESS 97, which is the SB2b signature; with the mixture it reaches ESS 2,082 with the right marginals.
+- On three SB2b replicates that had stopped at ESS 179–655, the mixture reached ESS 1,637–2,331 in 6–12 stages, at 57–126 s per fit on the laptop.
+- Vectorised multi-chain Metropolis was rejected on measured cost: about 600 s per fit, at 0.15 s per 256-member `run_batch()` call.
+
+**All ten cases re-run** (200 replicates each; `coverage_results.yaml`):
+
+| Case | Coverage | Status |
+|---|---|---|
+| SB1 | 0.965 | in band |
+| SB2a | 0.945 | in band |
+| SB2a_neg | 0.345 | in band |
+| SB2b | 0.915 | out of band (classes; see below) |
+| SB2c | 0.97 | in band |
+| SB3a | 0.925 | in band |
+| SB3b, administrative data as truth | 0.18 | in band |
+| SB3b, serosurvey as truth | 0.465 | in band |
+| SB3c | 0.905 | in band |
+| SB5 | 0.93 | in band |
+
+**SB2b.** The sampler problem is resolved: 199 of 200 fits complete, with ESS between 1,082 and 3,499 (median 2,277), at a median of 295 s per fit on the VM. One fit stopped at ESS 513 after 12 stages. Attack-rate coverage is 0.915, inside [0.90, 0.99].
+
+The case still fails its class check:
+- reporting is `prior_dominated` in only 0.465 of replicates (93 of 200), against a required 0.90;
+- the reported ridge names reporting with s0 in only 0.34.
+
+The cause is the classification rule, not the sampler:
+- **The exact ridge.** In this case it is one-dimensional and runs through four parameters: (reporting × s0, R0 × s0, seed / s0) are identified.
+- **Loadings in prior-sd units.** Reporting has the widest prior (a factor of 10). The narrower s0 and R0 priors therefore absorb most of the flat direction: per unit of change along the ridge, s0 moves 4.1, R0 5.4, reporting 1.5 and seeding 0.75 prior sds. Reporting's loading is about 0.21, below both the 0.30 minimum and half of the largest loading.
+- **Consequence.** Reporting is classed `identified`, because its contraction comes from the declared ranges of s0 and R0. The epidemics that failed the sampler before, the larger ones, are exactly the ones that now complete and are classed this way.
+
+**Proposed fix (owner's call; not made here).** Measure ridge loadings on each parameter's log (relative) scale instead of in prior-sd units. That makes the likelihood classes prior-independent, as §3.2 intends: the SB2b null direction then loads 0.5 on each of the four parameters. This changes class semantics for every case, so it needs its own test from this evidence and a full re-run.
+
+**Spend.** 61.5 Coiled credits (about US$3.75) on two 8-vCPU VMs in `idm-coiled-idmad-r2`, about 3 h of wall time; both clusters stopped.
