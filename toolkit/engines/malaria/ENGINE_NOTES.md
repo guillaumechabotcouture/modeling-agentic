@@ -1,12 +1,100 @@
-# Malaria engine v0.5: benchmark notes
+# Malaria engine v0.6: benchmark notes
 
-Engine `malaria-starsim` v0.5 (workstream A of architecture v2). Design note:
+Engine `malaria-starsim` v0.6 (workstream A of architecture v2). Design note:
 `docs/design/v2a-malaria-engine.md`. Every number in the tables block is rendered from
 `benchmarks/results.yaml`, `benchmarks/fitted.yaml`, `benchmarks/b15_mechanisms.yaml`,
 `benchmarks/equilibration.yaml` and `benchmarks/runtime.yaml`, with the spike
 (`history/results_v0.1-spike.yaml`) and the earlier rounds (`history/results_v0.2.yaml`,
 `results_v0.3-r2.yaml`, `results_v0.3.yaml`, `results_v0.4.yaml`) beside them, by
 `benchmarks/render_notes.py`. Reproduce with `bash toolkit/engines/malaria/benchmarks/validate_once.sh` on a VM.
+
+**v0.6 numbers are v0.5's.** The v0.6 changes act only when a horizon gives a delivery period or a unit sets
+`itn_routine_interval`, and the pack and the evidence use neither. The pack's results, fit, equilibration and
+guess-sensitivity files therefore keep the numbers v0.5 computed. Their identity fields were re-stamped after
+`benchmarks/restamp_proof.py` found v0.5 and v0.6 outputs identical on the pack's settings and the evidence cases
+(`benchmarks/restamp_proof.yaml`; each file records `restamped:`). A Coiled run of `validate_once.sh` is open until it
+confirms them.
+
+## v0.6 scope: a delivery period distinct from the outcome window (written before the v0.6 code)
+
+**The problem.** Up to v0.5 one window, `objective.horizon`, did two jobs: it bounded the
+years in which package components are delivered (SMC rounds, IRS rounds, the enhanced
+case-management add-on) and the years over which health outcomes are counted. A net
+campaign pays for a net that lasts about 3 years, but its benefit was counted only until
+the window ended. In the Nigeria v2 run (13 Global Fund states, 309 units, window
+2024.0–2027.0), the 67 units whose campaign is at 2026.25 got credit for about 0.75 y of
+a net's life against its full cost (184 units at 2025.25 got about 1.75 y; 58 at 2024.25
+about 2.75 y). The optimiser's net choices follow that truncation, not the nets' effect.
+
+**The owner's decision (2026-11-02).**
+- Extend the outcome window to 2029.25, so every campaign's net is counted for its whole life.
+- Deliver the funded annual components only in the funded years.
+- In both the package and the comparator, model the next routine net campaign 3 years
+  after each GC7 campaign when it falls inside the outcome window. Each campaign is then
+  credited with about its own 3 years: the 2024.25 and 2025.25 campaigns are followed by
+  routine campaigns at 2027.25 and 2028.25, and the 2026.25 campaign runs to the window
+  end at 2029.25.
+
+**The change (a mechanism; no correction factor).**
+- **Delivery period.** The spec gains `objective.delivery: [t0, t1]`. It is optional and
+  must lie inside `objective.horizon`. It reaches engines as the `delivery` field of a
+  `DeliveryHorizon`, a subclass of the contract's `Horizon` in `toolkit/engines/horizon.py`.
+  The harness builds a `DeliveryHorizon` only when the spec gives the field, and an engine
+  reads it as `getattr(horizon, "delivery", None)` (`None` means the decision window).
+  `contract.py` is unchanged: it is part of every engine's code fingerprint, and editing it
+  would make the compartmental engine's benchmark stamps stale as well. The analysis batch writes `delivery` into a job's horizon only when the spec
+  gives it, so job hashes of existing specs do not change. An engine that honours the
+  field declares `supports_delivery`; the spec validator refuses `objective.delivery` for
+  an engine that does not (fail closed: another engine would ignore it silently).
+- **What the engine delivers.** SMC rounds and default IRS rounds run in each year of the
+  delivery period. The case-management add-on applies from the delivery start and stops at
+  its end. The package's net campaign defaults to the delivery start. With an explicit
+  delivery period, the run fails closed when a component event (the net campaign, an SMC
+  round or an IRS round, including rounds set by `irs_years`) falls outside it, or when the
+  period is not inside the outcome window.
+- **What is paid and what is counted.** Cost drivers (`nets_given`, `smc_doses`,
+  `irs_sprayed`, `treated_all`) are counted over the delivery period. Health outcomes and
+  their per-capita denominators are counted over the outcome window.
+- **`treated_all` (the case-management cost driver).** It is counted over the delivery
+  period: treatments given in delivery years per mean person in those years. Treatments
+  after the delivery period ends are not GC7-funded, and the add-on itself has stopped
+  then, so charging them would bill the plan for care it does not buy. Counting over the
+  outcome window would also leak each package's later epidemiology into the incremental
+  treatment cost (fewer cases after a net campaign means fewer treatments in 2027–29),
+  which is a health effect, not a cost of case management. The per-capita `treated`
+  outcome is still counted over the outcome window: it is a health output.
+- **Routine campaigns in every arm.** A new unit attribute `itn_routine_interval` (years;
+  default: none) schedules routine net campaigns at `campaign_year + k x interval` (k = 1,
+  2, ...) while they fall before the outcome window's end. They run in every package,
+  including the comparator, since `campaign_year` is the unit's campaign date whether or not
+  a package buys nets. Their net type is the unit's `hist_net`, the type the routine
+  programme distributed before (default pyr), and their nets are never charged: they are
+  not part of the decision. A routine campaign inside the delivery period fails closed,
+  because the plan funds those years. Like `itn_hist_years`, it acts through the shared
+  history, so it is part of the burn-in key, and every arm of a unit sees the same schedule.
+  `itn_hist_years` already accepts years after horizon.start: past campaigns run in all
+  arms and are uncharged. The interval attribute is used instead because the spec can then
+  set one value (`{value: 3}`) rather than a new derived column per unit.
+
+**Back-compatibility.** Without `objective.delivery` and `itn_routine_interval`, a run is
+byte-identical to v0.5: the delivery period is the window, the add-on has no end, and the
+delivery accumulators add the same terms in the same order as the window ones. The
+benchmark pack, the equilibration and guess-sensitivity evidence and the runtime script
+build horizons without the new field, and their units do not set the new attribute. Two
+checks prove it. Self-test D9 runs packages with and without an explicit delivery period
+equal to the window and compares the outcomes exactly. `benchmarks/restamp_proof.py` runs
+the pack's settings and arms under the v0.5 code (origin/v2) and the v0.6 code, and
+compares every output exactly. Only after that proof are the identity fields of the stored
+evidence re-stamped, and each file records that it was re-stamped by the proof, not
+recomputed. A Coiled validation run confirms it afterwards; that run is open until it
+reports.
+
+**Tests written first.** Engine D1–D9: SMC, IRS and the add-on stop at the delivery end;
+cost drivers are counted over delivery only; outcomes accumulate over the full window; a
+routine campaign acts in both the package and the comparator and is uncharged; delivery
+outside the window, a campaign outside delivery and a routine campaign inside delivery
+fail closed; equal delivery is byte-identical. Spec SP-D1–SP-D3; batch
+BA-D1.
 
 ## v0.5 scope: an equilibrated starting state (written before the v0.5 pack run)
 

@@ -25,8 +25,8 @@ attribute_binding:
     default: "[]"
     meaning: "no past net campaigns (no nets in place at the start)"
   campaign_year:
-    default: "the start of the decision window"
-    meaning: "every unit's net campaign at the start of the window"
+    default: "the start of the delivery period (the decision window when the spec gives no objective.delivery)"
+    meaning: "every unit's net campaign at the start of the delivery period"
   smc_months:
     default: "derived from the seasonality"
     meaning: "chemoprevention months from the seasonal peak"
@@ -34,8 +34,8 @@ attribute_binding:
     default: "derived from the seasonality"
     meaning: "spraying three months before the seasonal peak"
   irs_years:
-    default: "every year of the window"
-    meaning: "a spraying round every year"
+    default: "every year of the delivery period (the decision window when the spec gives no objective.delivery)"
+    meaning: "a spraying round every delivery year"
   irs_product:
     default: pm_cs
     meaning: "the long-lasting product's decay"
@@ -45,3 +45,6 @@ attribute_binding:
   hist_net:
     default: pyr
     meaning: "past campaigns distributed standard pyrethroid nets"
+  itn_routine_interval:
+    default: none
+    meaning: "no routine net campaign after the package's campaign (v0.6): nets from the last campaign decay to the window's end"

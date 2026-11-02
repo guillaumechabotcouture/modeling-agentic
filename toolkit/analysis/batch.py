@@ -37,7 +37,8 @@ import numpy as np
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
-from toolkit.engines.contract import UnitSpec, Package, Horizon  # noqa: E402
+from toolkit.engines.contract import UnitSpec, Package  # noqa: E402
+from toolkit.engines.horizon import make_horizon  # noqa: E402
 
 PRODUCER = "toolkit/analysis/batch.py"
 CAL_WINDOW = "cal"
@@ -123,6 +124,8 @@ def design(spec) -> tuple[dict, list[dict]]:
     d = {"points": points, "fitted_names": names, "packages": list(pk), "spec_engine": spec["engine"],
          "horizon": {"start": h["start"], "stop": h["stop"], "window": list(spec["objective"]["horizon"])},
          "cal_window": list(spec["calibration"]["window"])}
+    if spec["objective"].get("delivery") is not None:   # v0.6: only when given, so other specs' job hashes stay
+        d["horizon"]["delivery"] = [float(x) for x in spec["objective"]["delivery"]]
     if pnames:
         d["prior_names"] = pnames
     if ext:
@@ -169,7 +172,7 @@ def run_job(job: dict) -> dict:
     from toolkit.engines.contract import engine_identity
     eng = _engine(job["engine"])
     hz = job["horizon"]
-    h = Horizon(float(hz["start"]), float(hz["stop"]), tuple(hz["window"]), dict(job.get("windows") or {}))
+    h = make_horizon(hz["start"], hz["stop"], hz["window"], job.get("windows"), hz.get("delivery"))
     o = eng.run(job["params"], UnitSpec(str(job["point"]), job["unit"]), Package(job["package"], job["components"]),
                 h, int(job["seed"]))
     return {"result": {"per_capita": o.per_capita, "windows": o.windows, "cost_drivers": o.cost_drivers, "meta": o.meta},
@@ -202,7 +205,7 @@ def run_point(group: dict) -> dict:
             raise ValueError("run_point: the jobs of one task must share engine, horizon, windows and seed")
     eng = _engine(j0["engine"])
     hz = j0["horizon"]
-    h = Horizon(float(hz["start"]), float(hz["stop"]), tuple(hz["window"]), dict(j0.get("windows") or {}))
+    h = make_horizon(hz["start"], hz["stop"], hz["window"], j0.get("windows"), hz.get("delivery"))
     outs = eng.run_batch([j["params"] for j in jobs], [UnitSpec(str(j["point"]), j["unit"]) for j in jobs],
                          [Package(j["package"], j["components"]) for j in jobs], h, int(j0["seed"]))
     ident = engine_identity(eng)
@@ -303,7 +306,7 @@ def adopt(run_dir: str, src_results: str, src_jobs: str, src_design: str, jobs: 
     ref = design["spec_engine"]
     if sd.get("spec_engine") not in (ref, ref.get("ref") if isinstance(ref, dict) and not ref.get("config") else None):
         probs.append(f"stored design engine {sd.get('spec_engine')!r} differs from {ref!r}")
-    for k in ("start", "stop", "window"):
+    for k in ("start", "stop", "window", "delivery"):
         if (sd.get("horizon") or {}).get(k) != design["horizon"].get(k):
             probs.append(f"stored design horizon.{k} differs")
     if sd.get("cal_window") != design["cal_window"]:
@@ -769,6 +772,36 @@ def _self_test() -> int:
                f"BA12 run() computes one task per point and writes per-job rows that load_results accepts: "
                f"{b['summary']}, {probs[:2]}")
         case("BA10", b10)
+
+        def bd1():
+            ok(all("delivery" not in j["horizon"] for j in jobs0) and "delivery" not in design0["horizon"],
+               "BA-D1 a spec without objective.delivery writes no delivery key (v0.5 job hashes unchanged)")
+            sd = schema.Spec(copy.deepcopy(spec.raw), d)
+            sd.raw["objective"]["delivery"] = [0, 2]
+            dd, jd = design(sd)
+            ok(dd["horizon"].get("delivery") == [0.0, 2.0] and all(j["horizon"].get("delivery") == [0.0, 2.0] for j in jd)
+               and job_sha(jd[0]) != job_sha(jobs0[0]),
+               f"BA-D1b objective.delivery reaches the design and every job's horizon: {dd['horizon']}")
+            from toolkit.engines.contract import ToyEngine
+            seen = []
+
+            class Spy(ToyEngine):
+                def run(self, params, unit, package, horizon, seed):
+                    seen.append(getattr(horizon, "delivery", None))
+                    return super().run(params, unit, package, horizon, seed)
+            key = json.dumps(jd[0]["engine"], sort_keys=True)
+            old_e = g["_E"].get(key)
+            g["_E"][key] = Spy()
+            try:
+                run_job(jd[0])
+                run_job(jobs0[0])
+            finally:
+                if old_e is None:
+                    g["_E"].pop(key, None)
+                else:
+                    g["_E"][key] = old_e
+            ok(seen == [(0.0, 2.0), None], f"BA-D1c run_job hands the engine the delivery period (or none): {seen}")
+        case("BA-D1", bd1)
     if fails:
         print(f"FAILED: {len(fails)} self-test case(s)")
         return 1
