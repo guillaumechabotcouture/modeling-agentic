@@ -15,6 +15,74 @@ guess-sensitivity files therefore keep the numbers v0.5 computed. Their identity
 (`benchmarks/restamp_proof.yaml`; each file records `restamped:`). A Coiled run of `validate_once.sh` is open until it
 confirms them.
 
+## v0.7 scope: routine SMC in every arm after the delivery period (written before the v0.7 code)
+
+**The problem.** v0.6 split the delivery period (`objective.delivery`) from the outcome window
+and added routine net campaigns in every arm (`itn_routine_interval`). SMC had no routine
+counterpart. A run with outcomes over 2024.0–2029.25 and delivery over 2024.0–2027.0 then stopped
+SMC at the end of delivery in the plan arm only. The engine simulated what follows: children who
+had been protected for three seasons lost that protection while their immunity was lower than
+in the comparator, so their burden rose after 2027. That rebound was booked as a cost of SMC, and
+the plan's SMC fell from 62 units to 1. In reality SMC is a routine annual programme. It goes on
+after the grant whether or not the grant funded it.
+
+**The owner's decision (2026-11-02).** After the delivery period, both arms continue the same
+routine programme. Nets already do this through `itn_routine_interval`, and SMC now does the
+same. Case management after delivery stays at the unit's current level (`cm_ft`, without the
+GC7 add-on) in both arms, as in v0.6.
+
+**The change (a mechanism; no correction factor).**
+- **New unit attribute `smc_routine`** (0 or 1 per unit; a column or a value; default 0). Where
+  it is 1, SMC rounds run every season from the end of the delivery period to the end of the
+  outcome window, in every arm including the comparator. Each season uses the unit's SMC months
+  (`smc_months`, or the default from the seasonality), the same months the package's SMC uses.
+  A round belongs to the routine programme when its decimal time t satisfies
+  `delivery end <= t < window end`.
+- **Never charged.** Routine rounds fall after the delivery period, and cost drivers count the
+  delivery period only (v0.6), so `smc_doses` never includes them. The routine intervention is
+  also built with counting switched off, so no later change to the delivery accumulators can
+  charge it.
+- **Shared history.** Like routine nets, routine SMC is a unit attribute. It is part of the
+  burn-in key, it is built into every arm's sim before the fork, and the fork time is still the
+  first event the decision pays for.
+- **Where both apply.** In a unit with `smc_routine = 1` whose package also has SMC, the
+  package's rounds cover the delivery seasons (e.g. 2024–2026) and the routine rounds cover every
+  later season (2027 onwards). The engine checks that the two schedules together form one
+  continuous season sequence: no missing season and no round given twice. The check fails
+  closed. The plan arm with SMC in delivery plus routine SMC then gives the same health
+  outcomes as SMC delivered every season of the window. Only the cost drivers differ, because
+  the routine seasons are not charged.
+- **Fail closed.**
+  - `smc_routine = 1` without `objective.delivery` is refused. Without a delivery period
+    there is no "after the grant", and the package's SMC already covers the whole window.
+  - A value other than 0 or 1 is refused.
+  - A routine round inside the delivery period is refused, because the plan funds those
+    years.
+
+**Back-compatibility.** With `smc_routine` absent or 0, the sim is built exactly as in v0.6: the
+same interventions, in the same order, with the same random draws. A self-test compares the
+outcomes of runs with the attribute absent and set to 0, with and without a delivery period.
+`benchmarks/restamp_proof.py prove --old-ref origin/v2` then runs the pack's settings and the
+equilibration and guess-sensitivity cases under the v0.6 code and the v0.7 code, and compares
+every output exactly. The identity fields of the stored evidence are re-stamped only when that
+proof passes. Each re-stamped file's `restamped:` record then names the v0.6 identity it
+replaced, and it keeps the v0.6 record (whose numbers came from v0.5) under `previous`.
+
+**Tests written first (α).** Engine R0–R7:
+- R0: the attribute and its default are declared.
+- R1: routine rounds are scheduled in every season after delivery and in no arm's delivery
+  seasons.
+- R2: routine SMC acts in the comparator and in the package.
+- R3: it is uncharged. Cost drivers are equal with and without it.
+- R4: comparator burden after delivery is lower where `smc_routine = 1`, and identical before.
+- R5: there is no rebound gap. The plan arm with SMC in delivery plus routine SMC equals SMC in
+  every season of the window.
+- R6: validation errors, including the schedule check against a synthetic gap, double round
+  and in-delivery round.
+- R7: absent and 0 give byte-identical outputs.
+
+Proof script RP8 covers re-stamping a file that already holds a `restamped:` record.
+
 ## v0.6 scope: a delivery period distinct from the outcome window (written before the v0.6 code)
 
 **The problem.** Up to v0.5 one window, `objective.horizon`, did two jobs: it bounded the
