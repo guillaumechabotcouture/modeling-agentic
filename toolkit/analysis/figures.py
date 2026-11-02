@@ -31,10 +31,25 @@ def _save(fig, run_dir, name, sources):
     sp = path + ".provenance.json"
     with open(sp) as f:
         sc = json.load(f)
-    sc.update(produced_by="harness", producer=PRODUCER)
+    # paths relative to the run dir, so the provenance survives outputs moving off the VM (contract.py resolves them)
+    sc.update(produced_by="harness", producer=PRODUCER, paths_relative_to="run_dir",
+              png_path=os.path.relpath(path, run_dir),
+              source_hashes={os.path.relpath(p, run_dir): h for p, h in (sc.get("source_hashes") or {}).items()})
     with open(sp, "w") as f:
         json.dump(sc, f, indent=2, sort_keys=True)
     return os.path.relpath(path, run_dir)
+
+
+def resolve_source(run_dir: str, src) -> tuple[str | None, str]:
+    """(absolute path, "") of a figure source recorded relative to the run dir, or (None, why) when the recorded path
+    is not a string or points outside the run dir. A legacy absolute path inside the run dir is accepted as is."""
+    if not isinstance(src, str) or not src:
+        return None, f"source {src!r} is not a path"
+    root = os.path.realpath(run_dir)
+    p = os.path.realpath(src if os.path.isabs(src) else os.path.join(run_dir, src))
+    if os.path.commonpath([root, p]) != root:
+        return None, f"source {src} is outside the run dir"
+    return p, ""
 
 
 def draw(run_dir: str, point: dict, uq: dict, sens: dict, cal: dict, outcome: str, labels: dict) -> list[dict]:

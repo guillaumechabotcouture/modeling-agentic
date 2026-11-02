@@ -276,7 +276,20 @@ def check_staleness(png_path: str) -> dict:
         sidecar = json.load(f)
     stale = []
     missing = []
+    # v2 harness sidecars record paths relative to the run dir
+    # (`paths_relative_to: run_dir`, png_path relative too): resolve them
+    # against the run dir this PNG sits in, so a moved run stays checkable.
+    base = None
+    rel_png = sidecar.get("png_path")
+    if (sidecar.get("paths_relative_to") == "run_dir" and isinstance(rel_png, str)
+            and not os.path.isabs(rel_png)):
+        ap = os.path.abspath(png_path)
+        tail = os.sep + os.path.normpath(rel_png)
+        if ap.endswith(tail):
+            base = ap[: -len(tail)]
     for path, recorded_hash in (sidecar.get("source_hashes") or {}).items():
+        if base is not None and not os.path.isabs(path):
+            path = os.path.join(base, path)
         if not os.path.exists(path):
             missing.append(path)
             continue
@@ -406,6 +419,33 @@ def _run_self_test() -> int:
         status6 = check_staleness(png6)
         ok(status6["status"] == "missing_provenance",
            f"T6: no sidecar should yield missing_provenance; got {status6}")
+
+        # T7: a sidecar whose paths are relative to the run dir (the v2
+        # harness figures, toolkit/analysis/figures.py) is checked against
+        # the run dir it sits in, so moving the run dir keeps it fresh.
+        run_a = os.path.join(d, "run_a")
+        os.makedirs(os.path.join(run_a, "figures"))
+        os.makedirs(os.path.join(run_a, "analysis"))
+        with open(os.path.join(run_a, "analysis", "point.yaml"), "w") as f:
+            f.write("a: 1\n")
+        png7 = os.path.join(run_a, "figures", "f.png")
+        with open(png7, "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
+        with open(_provenance_path(png7), "w") as f:
+            json.dump({"png_path": "figures/f.png", "paths_relative_to": "run_dir",
+                       "source_hashes": {"analysis/point.yaml": _hash_file(
+                           os.path.join(run_a, "analysis", "point.yaml"))}}, f)
+        run_b = os.path.join(d, "run_b")
+        os.rename(run_a, run_b)
+        png7b = os.path.join(run_b, "figures", "f.png")
+        st7 = check_staleness(png7b)
+        ok(st7["status"] == "fresh",
+           f"T7: relative sources resolve against the moved run dir; got {st7}")
+        with open(os.path.join(run_b, "analysis", "point.yaml"), "a") as f:
+            f.write("b: 2\n")
+        st7b = check_staleness(png7b)
+        ok(st7b["status"] == "stale",
+           f"T7: an edited relative source is stale; got {st7b}")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)

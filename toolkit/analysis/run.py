@@ -393,6 +393,18 @@ def _self_test() -> int:
                yaml.safe_load(open(os.path.join(d, "analysis", "figures.yaml")))["data"]["figures"]),
            "R12 every figure has a provenance sidecar")
         from toolkit.analysis import contract
+        # figure sources relative to the run dir: a run whose outputs moved off the VM (/tmp/...) still checks
+        figs = yaml.safe_load(open(os.path.join(d, "analysis", "figures.yaml")))["data"]["figures"]
+        rels = [all(not os.path.isabs(s) for s in json.load(open(os.path.join(d, f["path"]) + ".provenance.json"))
+                    ["source_hashes"]) for f in figs]
+        moved = d + "_moved"
+        os.rename(d, moved)
+        try:
+            fk = [x["claim"] for x in contract.gate_findings(moved) if x["kind"] == "analysis_contract_figure"]
+        finally:
+            os.rename(moved, d)
+        ok(figs and all(rels) and fk == [],
+           f"R12b figure sources are recorded relative to the run dir, and a moved run dir checks clean: {fk[:2]}")
         ok(contract.gate_findings(d) == [], f"R13 the contract checks pass on a harness run: {contract.gate_findings(d)}")
         rel = os.path.join("analysis", "point.yaml")
         with open(os.path.join(d, rel), "a") as f:
