@@ -46,6 +46,7 @@ import fix_loop as FX  # noqa: E402
 STATE_FILE = "run_state.json"
 SIGNOFF_FILE = "decision_spec.signoff.json"
 SCOPE_SIGNOFF = "scope_signoff.json"      # Phase 49 β (PR #85)
+SIGNOFF_SHEET = "decision_spec.signoff_sheet.md"   # v2-derived-inputs: what signing accepts beyond the spec's text
 STATES = ("SPEC", "SIGN", "EVIDENCE", "ENGINE_CHOICE", "CONFIGURE", "ANALYZE", "CRITIQUE", "GATE",
           "FIX_LOOP", "OWNER_DECISION", "WRITE", "PRESENTATION", "FINAL")
 # The state table: every transition the machine may take. A transition outside it is a bug
@@ -102,6 +103,12 @@ class RunState:
     # v2's own gate rules on top of today's (structured done_when as schema, open MEDIUMs fixed or
     # declared, never accepted). False only to replay stored v1 gates (scripts/golden_traces.py).
     v2_rules: bool = True
+    # docs/design/v2-derived-inputs.md: the spec this machine drafts reads derived or staged data only, made by
+    # derivations the harness runs in a sandbox (init_run sets it for every new run; False for older states).
+    derived_inputs: bool = False
+    # The development flag (owner, 2026-11-01): where there is no sandbox (macOS) derivations run unsandboxed, the
+    # record says so, and the gate holds a HIGH non-declarable finding: such a run cannot be accepted.
+    derive_unsandboxed: bool = False
     # Every paid task: key -> {task, status started|completed, allowance_usd, usd, session_id,
     # started, completed, ok, output, note}. Written before and after each call, so a resumed run
     # never repeats a completed task or loses its charge, and charges an interrupted one its allowance.
@@ -563,51 +570,12 @@ def record_cited_inputs(run_dir: str) -> list[str]:
     """Every file decision_spec.yaml cites must be inside the run directory; each is recorded with
     its sha256 in data/inputs_provenance.json. Returns the problems (pre-sign)."""
     import yaml
+    import pipeline as P
     try:
         spec = yaml.safe_load(open(os.path.join(run_dir, AB.SPEC_FILE))) or {}
     except Exception as e:  # noqa: BLE001
         return [f"{AB.SPEC_FILE} unreadable: {type(e).__name__}"]
-    found = []
-
-    def walk(x):
-        if isinstance(x, dict):
-            for k, v in x.items():
-                if k not in ("deliverable", "deliverable_file"):      # outputs the run writes, not inputs
-                    walk(v)
-        elif isinstance(x, list):
-            for v in x:
-                walk(v)
-        elif isinstance(x, str) and x.strip().lower().endswith(_INPUT_EXT):
-            found.append(x.strip())
-
-    def walk_keys(x):          # a path field by name, whatever its spelling or extension
-        if isinstance(x, dict):
-            for k, v in x.items():
-                if k in ("deliverable", "deliverable_file"):
-                    continue
-                if k in ("csv", "file", "path", "table") and isinstance(v, str) and v.strip():
-                    found.append(v.strip())
-                walk_keys(v)
-        elif isinstance(x, list):
-            for v in x:
-                walk_keys(v)
-    def walk_paths(x, key=""):  # any value that names an existing file or directory (engine config too)
-        if isinstance(x, dict):
-            for k, v in x.items():
-                if k not in ("deliverable", "deliverable_file"):
-                    walk_paths(v, str(k))
-        elif isinstance(x, list):
-            for v in x:
-                walk_paths(v, key)
-        elif isinstance(x, str) and x.strip() and ("/" in x or os.sep in x or key.endswith(("path", "file", "dir"))):
-            v = x.strip()
-            if ":" in v and not v.startswith("/") and "/" not in v.split(":", 1)[0]:
-                return                 # a module reference such as pkg.mod:Class
-            if os.path.exists(os.path.join(run_dir, os.path.expanduser(v))):
-                found.append(v)
-    walk(spec)
-    walk_keys(spec)
-    walk_paths(spec)
+    found = P.cited_paths(spec, run_dir)       # one walk, shared with the derived-input checks
     prov, probs, root = _provenance(run_dir), [], os.path.realpath(run_dir)
     # The staged copies must still be the files the question named (the draft task may not touch
     # them; this checks it).
@@ -919,6 +887,13 @@ class Machine:
                  "key": "deliverable", "scope_declarable": False, "claim": p} for p in deliverable_problems(self.run_dir)]
         if self.st.v2_rules:
             out += report_claim_findings(self.run_dir)
+        if self.st.derived_inputs or os.path.exists(os.path.join(self.run_dir, "data", "derivations.yaml")):
+            import pipeline as P
+            try:
+                spec = self._spec()
+            except Exception:  # noqa: BLE001 -- the spec's own findings say why; the data refs need it
+                spec = None
+            out += P.derivation_findings(self.run_dir, spec, required=self.st.derived_inputs)
         return out
 
     def _signed_ref(self, run_dir: str):
@@ -1007,8 +982,20 @@ class Machine:
         errs = [f"draft_spec failed: {res.note}"] if not res.ok else []
         if res.ok:
             try:
-                errs = record_cited_inputs(self.run_dir)       # before anything reads a cited file
-                errs = errs or self.backend.pre_sign_problems(self.run_dir)
+                errs = self._derive() if self.st.derived_inputs else []
+                errs = errs or record_cited_inputs(self.run_dir)       # before anything reads a cited file
+                if self.st.derived_inputs:
+                    # Workstream B's schema runs the derived-input checks itself (and per candidate engine); the
+                    # spike adapter does not know them, so the harness runs them for it.
+                    if not errs and not hasattr(self.backend, "candidate_rows"):
+                        import pipeline as P
+                        errs = [f"{p['code']}: {p['claim']}" for p in P.derivation_problems(
+                            self.run_dir, self._spec(), required=True)]
+                    errs = errs or self.backend.pre_sign_problems(self.run_dir, derived=True)
+                    if not errs:
+                        self._write_sheet()
+                else:
+                    errs = errs or self.backend.pre_sign_problems(self.run_dir)
             except Exception as e:  # noqa: BLE001
                 errs = [f"spec unreadable: {e}"]
         if errs:
@@ -1016,6 +1003,19 @@ class Machine:
             return self._go("SPEC", f"spec invalid: {'; '.join(errs)[:200]}")
         self.st.tries.pop("spec_feedback", None)
         return self._go("SIGN", "spec drafted and valid")
+
+    def _derive(self) -> list[str]:
+        """The draft's declared derivations, run by the harness (scripts/pipeline.py derive). Their problems go back
+        to the planner with the script's stderr tail: the planner never needs a shell to learn whether its code
+        works."""
+        import pipeline as P
+        rep = P.derive(self.run_dir, unsandboxed_ok=self.st.derive_unsandboxed)
+        return [f"{p['code']}: {p['claim']}" for p in rep["problems"]]
+
+    def _write_sheet(self) -> None:
+        from toolkit.spec import signoff
+        with open(os.path.join(self.run_dir, SIGNOFF_SHEET), "w") as f:
+            f.write(signoff.sheet(self.run_dir, getattr(self.backend, "candidates", None)))
 
     def h_SIGN(self):
         mode = self.st.signoff
@@ -1356,12 +1356,13 @@ def _write_deliverable(run_dir: str) -> None:
 
 
 def init_run(run_dir: str, question: str, max_rounds: int = 3, signoff: str = "owner", gate_mode: str = "v2",
-             budget_usd: float | None = None) -> RunState:
+             budget_usd: float | None = None, derived_inputs: bool = True, derive_unsandboxed: bool = False) -> RunState:
     os.makedirs(run_dir, exist_ok=True)
     st = load_state(run_dir)
     if st is not None:
         return st
-    st = RunState(question=question, max_rounds=max_rounds, signoff=signoff, gate_mode=gate_mode, budget_usd=budget_usd)
+    st = RunState(question=question, max_rounds=max_rounds, signoff=signoff, gate_mode=gate_mode, budget_usd=budget_usd,
+                  derived_inputs=derived_inputs, derive_unsandboxed=derive_unsandboxed)
     _write_json(run_dir, "metadata.json", {"question": question, "started": _now(), "pipeline": "v2",
                                            "max_rounds": max_rounds, "signoff": signoff})
     save_state(run_dir, st)
@@ -1369,9 +1370,9 @@ def init_run(run_dir: str, question: str, max_rounds: int = 3, signoff: str = "o
 
 
 def run_v2(question: str, run_dir: str, tasks, max_rounds: int = 3, signoff: str = "owner",
-           budget_usd: float | None = None, log=print) -> str:
+           budget_usd: float | None = None, log=print, derive_unsandboxed: bool = False) -> str:
     """Entry point for main.py --v2 (and the dry run). Resumes when run_state.json exists."""
-    st = init_run(run_dir, question, max_rounds, signoff, "v2", budget_usd)
+    st = init_run(run_dir, question, max_rounds, signoff, "v2", budget_usd, derive_unsandboxed=derive_unsandboxed)
     m = Machine(run_dir, tasks, st, log=log)
     return m.run()
 
@@ -1433,7 +1434,7 @@ def _self_test() -> int:
             spec.update(script.pop("spec_extra", {}))
             # 16 emulator points: the resume test runs the whole machine many times
             script = dict({"spec": spec, "settings": AB.toy_settings(draws=24, points=16)}, **script)
-            st = init_run(d, "toy question", max_rounds, signoff, "v2", budget)
+            st = init_run(d, "toy question", max_rounds, signoff, "v2", budget, derived_inputs=False)   # pre-DI fixture
             return d, StubTasks(script), st
 
         # T10: the happy path with one critic finding fixed in the loop.
@@ -1689,7 +1690,7 @@ def _self_test() -> int:
                            "settings": {"uncertainty": {"draws": 6, "seed": 1},
                                         "analysis": {"workers": 2, "emulator": {"points": pts, "seed": eseed}}},
                            "fixes": {"D-001": [("analysis_settings.yaml", "uncertainty.draws", 12)]}})
-            st = init_run(d, "toy question", 3, "lead", "v2", None)
+            st = init_run(d, "toy question", 3, "lead", "v2", None, derived_inputs=False)   # pre-DI fixture
             s = Machine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
             rows = FX.impact_rows(d)
             man = os.path.exists(os.path.join(d, "analysis", "manifest.json"))
@@ -1938,11 +1939,108 @@ def _self_test() -> int:
             ok(False, "T24 an unknown persisted state fails closed")
         except ValueError:
             ok(True, "T24 an unknown persisted state fails closed")
+        try:
+            _self_test_derived(ok, td)
+        except Exception as e:  # noqa: BLE001 -- before the derivation step exists (step α) this is the failure
+            import traceback
+            traceback.print_exc()
+            ok(False, f"DI machine tests: {type(e).__name__}: {e}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_derived(ok, td: str) -> None:
+    """DI1, DI8 and the development flag at the gate, through the machine (docs/design/v2-derived-inputs.md §4)."""
+    import shutil
+    import yaml
+    from v2_tasks import StubTasks
+    from toolkit.spec import schema as S
+    import pipeline as P
+    toolkit = AB.backend("toolkit")
+    flag = P.sandbox_kind() is None
+    # DI1: the evidence's shape. The task writes the units table itself; the spec is refused before SIGN.
+    d = os.path.join(td, "di1")
+    os.makedirs(d)
+    raw = yaml.safe_load(open(S.toy_spec(d)))
+    os.remove(os.path.join(d, AB.SPEC_FILE))
+    st = init_run(d, "toy question", 3, "none", "v2", None, derived_inputs=True, derive_unsandboxed=flag)
+    status = Machine(d, StubTasks({"spec": raw}), st, backend=toolkit, log=lambda *a: None,
+                     cross_engine_check=False).run(max_steps=12)
+    s1 = load_state(d)
+    fb = s1.tries.get("spec_feedback") or []
+    ok(status == "run_failed" and any(x.startswith("units_not_derived") for x in fb)
+       and "SIGN" not in [h.get("to") for h in s1.history],
+       f"DI1c through the machine: a units table the task wrote is refused before SIGN ({status}; {fb[:2]})")
+    # DI8: engine auto with two candidates; the second needs an attribute no derived column binds.
+    mods = os.path.join(td, "di8mods")
+    os.makedirs(mods)
+    with open(os.path.join(mods, "di8_engines.py"), "w") as f:
+        f.write("from toolkit.engines.contract import ToyEngine\n\n\nclass NeedsGroup(ToyEngine):\n"
+                "    \"\"\"The toy engine with a card that gives `group` no default.\"\"\"\n")
+    with open(os.path.join(mods, "attribute_binding.yaml"), "w") as f:
+        yaml.safe_dump({"attribute_binding": {"x": "required", "group": "required"}}, f)
+    sys.path.insert(0, mods)
+    fake = os.path.join(td, "di8repo")
+    os.makedirs(os.path.join(fake, "toyraw"))
+    tmp = os.path.join(td, "di8src")
+    os.makedirs(tmp)
+    base = yaml.safe_load(open(S.toy_spec(tmp)))
+    shutil.copyfile(os.path.join(tmp, "units.csv"), os.path.join(fake, "toyraw", "units_raw.csv"))
+    cols = open(os.path.join(fake, "toyraw", "units_raw.csv")).readline().strip().split(",")
+    staged = "data/inputs/toyraw/units_raw.csv"
+
+    def draft(question, run_dir):
+        os.makedirs(os.path.join(run_dir, "data", "derive"), exist_ok=True)
+        open(os.path.join(run_dir, "data", "derive", "units.py"), "w").write(S.TOY_DERIVE_SCRIPT)
+        yaml.safe_dump({"derivations": [{"id": "units", "script": "data/derive/units.py", "inputs": [staged],
+                                         "outputs": ["data/derived/units.csv"],
+                                         "columns": {"uses": {staged: cols}}}]},
+                       open(os.path.join(run_dir, "data", "derivations.yaml"), "w"), sort_keys=False)
+        r = json.loads(json.dumps(base))
+        r["engine"] = {"auto": True, "candidates": ["toolkit.engines.contract:ToyEngine", "di8_engines:NeedsGroup"]}
+        r["decision_units"]["csv"] = "data/derived/units.csv"
+        r["decision_units"]["defaults_accepted"] = {"group": "the toy units carry no group label"}
+        r["calibration"]["target_frame"] = {"band": "prev", "source": "the engine's own window metric"}
+        return r
+    d = os.path.join(td, "di8")
+    os.makedirs(d)
+    global REPO
+    old_repo, REPO = REPO, fake
+    try:
+        st = init_run(d, "Which package per unit? Inputs: toyraw/units_raw.csv", 3, "owner", "v2", None,
+                      derived_inputs=True, derive_unsandboxed=flag)
+        m = Machine(d, StubTasks({"spec": draft}), st,
+                    backend=toolkit, log=lambda *a: None, cross_engine_check=False)
+        m.run(max_steps=4)
+        sheet = open(os.path.join(d, SIGNOFF_SHEET)).read() if os.path.exists(os.path.join(d, SIGNOFF_SHEET)) else ""
+        ok(m.st.state == "SIGN" and m.st.paused == "awaiting_signoff" and "NeedsGroup" in sheet
+           and "engine_attribute_unbound" in sheet and "group" in sheet,
+           f"DI8a engine auto: the full checks run per candidate in SPEC, before SIGN; the candidate that needs an "
+           f"unbound attribute is shown ineligible with the reason ({m.st.state}, {m.st.tries.get('spec_feedback')})")
+        toolkit.sign(d, "owner")
+        for _ in range(6):
+            if m.st.state in ("CONFIGURE", "FINAL"):
+                break
+            m.step()
+        ec = json.load(open(os.path.join(d, AB.ENGINE_CHOICE)))
+        rows = {r["ref"]: r for r in ec["candidates"]}
+        ng = rows.get("di8_engines:NeedsGroup") or {}
+        ok(ec["engine"]["ref"] == "toolkit.engines.contract:ToyEngine" and ng.get("eligible") is False
+           and any("engine_attribute_unbound" in w and "group" in w for w in ng.get("why_not") or []),
+           f"DI8b engine_choice.json records that candidate as ineligible with the unbound list: {ng.get('why_not')}")
+        kinds = {f["kind"]: f for f in m.harness_findings()}
+        rec_kind = json.load(open(os.path.join(d, P.DERIVATIONS_RECORD)))["derivations"]["units"]["sandbox"]["kind"]
+        ok(("derivation_unsandboxed" in kinds and kinds["derivation_unsandboxed"]["severity"] == "HIGH"
+            and not kinds["derivation_unsandboxed"]["scope_declarable"]) if rec_kind == "none"
+           else "derivation_unsandboxed" not in kinds,
+           f"DI-U3 a run that used the development flag carries a HIGH non-declarable gate finding (no ACCEPT); a "
+           f"sandboxed one does not (sandbox {rec_kind}; {sorted(kinds)})")
+    finally:
+        REPO = old_repo
+        sys.path.remove(mods)
 
 
 def main(argv=None) -> int:

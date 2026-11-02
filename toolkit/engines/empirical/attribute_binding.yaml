@@ -1,0 +1,4 @@
+# How the spec must bind each unit attribute of this engine (docs/design/v2-derived-inputs.md §3.3). Card metadata,
+# not engine code. An attribute not listed here is required (fail closed).
+attribute_binding:
+  log_rate: required

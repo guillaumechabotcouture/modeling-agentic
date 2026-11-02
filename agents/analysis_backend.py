@@ -106,11 +106,23 @@ def card_fits(card, needs: dict) -> list[str]:
     return why
 
 
+def candidate_entries(spec: dict, engines=None) -> list:
+    """The engines to consider: the registered ones, or only the signed candidates (`engine: {auto: true, candidates:
+    [...]}`; a candidate that is not registered is considered with no card file and no configuration)."""
+    entries = list(engines or ENGINES)
+    eng = spec.get("engine")
+    cands = eng.get("candidates") if isinstance(eng, dict) and eng.get("auto") is True else None
+    if engines is None and isinstance(cands, list) and cands:
+        known = {e[0]: e for e in entries}
+        entries = [known.get(c, (c, None, None)) for c in cands]
+    return entries
+
+
 def eligible_engines(spec: dict, engines=None) -> list[dict]:
-    """[{ref, name, version, eligible, why_not, card}] for every registered engine."""
+    """[{ref, name, version, eligible, why_not, card}] for every registered engine (or every signed candidate)."""
     needs = engine_needs(spec)
     rows = []
-    for entry in engines or ENGINES:
+    for entry in candidate_entries(spec, engines):
         ref, card_path, cfg_fn = (tuple(entry) + (None, None))[:3]
         try:
             config = cfg_fn(spec) if cfg_fn else {}
@@ -249,8 +261,9 @@ def engine_choice_ref(run_dir: str) -> str | None:
     return e if isinstance(e, str) else None
 
 
-def pre_sign_problems(run_dir: str) -> list[str]:
-    """Before the engine is chosen: every section the spike needs, and a valid settings file."""
+def pre_sign_problems(run_dir: str, derived: bool | None = None) -> list[str]:
+    """Before the engine is chosen: every section the spike needs, and a valid settings file. (`derived`: the
+    derived-input checks are workstream B's schema's; the spike's spec has none.)"""
     import yaml
     from spike.analysis.spec import REQUIRED
     try:
@@ -424,17 +437,51 @@ class _ToolkitApi:
         except ImportError:
             self.settings_paths = SETTINGS_PATHS
 
-    def pre_sign_problems(self, run_dir: str) -> list[str]:
-        """B's checks of every section that does not need the engine (its sign-off check)."""
+    def pre_sign_problems(self, run_dir: str, derived: bool | None = None) -> list[str]:
+        """B's sign-off checks. With `engine: auto` the engine-independent sections first, then the full checks
+        (engine attributes, calibration, priors) per candidate the card filter keeps: a candidate that fails them is
+        ineligible, and the spec is refused only when no candidate passes. Without this, those checks ran only at
+        CONFIGURE, after SIGN (docs/design/v2-derived-inputs.md §1). The rows are kept for the sign-off sheet."""
         from toolkit.spec import schema
+        self.candidates = []
         try:
-            return list(schema.validate(schema.load(os.path.join(run_dir, SPEC_FILE)), pending_ok=True))
+            s = schema.load(os.path.join(run_dir, SPEC_FILE))
+            if derived is not None:
+                s.derived = derived
+            if not s.engine_pending:
+                return list(schema.validate(s))
+            bad = list(schema.validate(s, pending_ok=True))
+            # The candidates are checked even when an engine-independent section fails, so one try of the draft
+            # task hears every problem (MAX_SPEC_TRIES is small).
+            rows = self.candidate_rows(s)
+            self.candidates = rows
+            if any(r.get("eligible") for r in rows):
+                return bad
+            return bad + ["no candidate engine passes the full checks before sign-off"] + [
+                f"[{r['ref']}] {w}" for r in rows for w in (r.get("why_not") or []) if w not in bad]
         except Exception as e:  # noqa: BLE001
             return [f"spec validation failed: {type(e).__name__}: {e}"]
 
+    def candidate_rows(self, s, engines=None) -> list[dict]:
+        """eligible_engines on the card, then the spec's full validation with each card-eligible candidate."""
+        import yaml
+        from toolkit.spec import schema
+        signed = s.raw.get("engine")
+        try:      # the signed candidates, also once engine_choice.json exists (a back-edge to ENGINE_CHOICE)
+            signed = (yaml.safe_load(open(s.path)) or {}).get("engine", signed) if s.path else signed
+        except (OSError, yaml.YAMLError):
+            pass
+        rows = self._card_rows(dict(s.raw, engine=signed), engines)
+        for r in rows:
+            if r.get("eligible"):
+                probs = schema.validate(schema.with_engine(s, r["ref"], r.get("config")))
+                if probs:
+                    r.update(eligible=False, why_not=list(probs))
+        return rows
+
     def choice_spec(self, run_dir: str) -> dict:
         from toolkit.spec import schema
-        return schema.load(os.path.join(run_dir, SPEC_FILE)).raw
+        return dict(schema.load(os.path.join(run_dir, SPEC_FILE)).raw, _run_dir=run_dir)
 
     # B signs the spec itself (toolkit/spec/signoff.py); its analysis refuses an unsigned spec.
     def sign(self, run_dir: str, by: str, note: str = "") -> dict:
@@ -460,12 +507,21 @@ class _ToolkitApi:
         except Exception as e:  # noqa: BLE001
             return [f"spec validation failed: {type(e).__name__}: {e}"]
 
-    def eligible_engines(self, spec, engines=None):
+    def _card_rows(self, spec, engines=None):
         """The filter in B's vocabulary when B exposes engine_needs(spec); otherwise ours."""
         en = getattr(self.api, "engine_needs", None)
         if en is not None:
             spec = dict(spec, engine_needs=en(spec))
         return eligible_engines(spec, engines)
+
+    def eligible_engines(self, spec, engines=None):
+        """The card filter, then (for a spec read by choice_spec, which knows its run directory) the full checks per
+        candidate, so ENGINE_CHOICE never picks an engine the spec cannot bind."""
+        rd = spec.get("_run_dir") if isinstance(spec, dict) else None
+        if not rd:
+            return self._card_rows(spec, engines)
+        from toolkit.spec import schema
+        return self.candidate_rows(schema.load(os.path.join(rd, SPEC_FILE)), engines)
 
     def pipeline_steps(self, spec_path, run_dir):
         out = []

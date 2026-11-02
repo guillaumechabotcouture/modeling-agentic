@@ -1,0 +1,47 @@
+# How the spec must bind each unit attribute of this engine (docs/design/v2-derived-inputs.md §3.3). Card metadata,
+# like priors.yaml: not engine code, so the engine's code fingerprint and its benchmark stamps are unchanged.
+#   required                         the spec binds it (decision_units.engine_attributes or calibration.attribute)
+#   {default, meaning}               the engine's value when it is not given; the spec binds it or accepts the
+#                                    default by name (decision_units.defaults_accepted: {attribute: reason})
+# An attribute not listed here is required (fail closed). The defaults are the values engine.py applies.
+attribute_binding:
+  m0: required
+  season:
+    default: "[1.0] * 12"
+    meaning: "no seasonality: the same emergence in every month"
+  resistance:
+    default: 0.5
+    meaning: "bioassay mortality 0.5 in every unit"
+  species:
+    default: "the module's default species shares"
+    meaning: "the same vector species composition in every unit"
+  cm_ft:
+    default: 0.3
+    meaning: "effective treatment of 30% of clinical episodes in every unit"
+  itn_use:
+    default: 0.55
+    meaning: "net use of 55% after a campaign in every unit"
+  itn_hist_years:
+    default: "[]"
+    meaning: "no past net campaigns (no nets in place at the start)"
+  campaign_year:
+    default: "the start of the decision window"
+    meaning: "every unit's net campaign at the start of the window"
+  smc_months:
+    default: "derived from the seasonality"
+    meaning: "chemoprevention months from the seasonal peak"
+  irs_month:
+    default: "derived from the seasonality"
+    meaning: "spraying three months before the seasonal peak"
+  irs_years:
+    default: "every year of the window"
+    meaning: "a spraying round every year"
+  irs_product:
+    default: pm_cs
+    meaning: "the long-lasting product's decay"
+  itn_use_at:
+    default: 0
+    meaning: "net use measured at distribution"
+  hist_net:
+    default: pyr
+    meaning: "past campaigns distributed standard pyrethroid nets"
