@@ -15,6 +15,9 @@ the stored spike batch is reusable.
 Runs go to `scripts/compute.py` (`run_map`): dask on Coiled when the launcher provides a
 scheduler, else a local process pool that is replaced every chunk (spike lesson 7);
 results are kept per input, so a rerun completes a stopped batch.
+For an engine whose packages share a starting state (`batch_shares_state`, e.g. the malaria
+engine's burn-in), the compute tasks are design points: `run_point` runs one point's packages in
+one `run_batch` call, and the per-job rows (with their own provenance) are written as before.
 
 A batch computed elsewhere (VM shards) is shipped with the exact jobs it ran: each shard calls `ship()` where it ran
 (jobs, design, rows and a manifest with their sha256 and the computing platform), `merge_shipped()` joins shards from

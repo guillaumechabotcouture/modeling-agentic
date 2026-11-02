@@ -26,6 +26,10 @@ Statuses (never fitted toward unless `in_band`/`out_of_band`):
 
 Pack schema:
     engine: <module>:<class>            # e.g. toolkit.engines.malaria.engine:MalariaEngine
+    initialisation:                     # required (v0.5): how the engine sets the state at horizon.start
+      method: <text>                    # e.g. a burn-in of declared length, or a closed-form initialiser
+      evidence: [<benchmark id> | <file beside the pack>]   # that the state is equilibrated (or correct);
+                                        # or ["not applicable: <reason>"] for an engine without dynamic state
     seeds: [1, 2, 3, 4]                 # common random numbers: every arm uses the same seeds
     horizon: {start, stop, window: [t0, t1], windows: {name: [t0, t1]}}
     settings:                           # one simulated trial site (or reference setting)
@@ -56,6 +60,9 @@ Pack schema:
     configs: {<name>: {<constructor keywords>}}          # configured engines (v2d §5); a setting names its
     default_config: <name>                               # `config`; results are stamped with default_config's engine
     oracles: <module>                                    # oracle_<name> / probe_<name> / generate_<name> functions
+
+An engine with `batch_shares_state` and `run_batch` (a starting state shared by the packages of one unit and seed,
+e.g. a burn-in) gets the jobs of one unit, horizon and seed in one run_batch call; results are per job either way.
 
 Sides (v2d δ): a number; {arm, value: <path>}; {oracle: <name>, args}; {probe: <name>, args}. Oracle and
 probe args may themselves be sides (resolved first). A probe gets the pack's engine factory first
