@@ -13,6 +13,10 @@ MAX_RETURN_FILE = 50 * 2**20
 CODEX_VERSION = "0.163.0"
 WORK = "/tmp/ab"
 LIVE_STATES = ("running", "ready", "pending", "starting", "scaling")
+# The IDM Coiled default workspace (non-sensitive; never the prod subscription). The launcher and
+# the VM jobs read it from here; scripts/replay_coiled.py keeps a copy (it is uploaded to the
+# workers on its own), held equal by cloud/run_cluster.py self-test RC60f.
+WORKSPACE = "idm-coiled-idmad-r2"
 
 
 def run_job_impl(label, code, question, flags, anthropic_key, openai_key, max_rounds=8, max_sessions=5):
@@ -164,6 +168,17 @@ def verify_attached(cl, expected_id):
         finally:
             raise SystemExit(f"cluster {expected_id} stopped while attaching; the new empty cluster {got} was shut down")
     return cl
+
+
+def attach_existing(name, workspace, expected_id):
+    """The one attach call: coiled.Cluster(name=...) without waiting for workers, then
+    verify_attached, which shuts down and refuses any cluster other than `expected_id`. Callers
+    check first that the cluster is live (run_cluster.attach, the keeper loop), so a stopping or
+    stopped cluster is never attached by name; the overflow handle attaches by the id the launch
+    created."""
+    import coiled
+    return verify_attached(coiled.Cluster(name=name, workspace=workspace, shutdown_on_close=False,
+                                          wait_for_workers=False), expected_id)
 
 
 class SchedulerInfoUnavailable(RuntimeError):
@@ -376,11 +391,8 @@ class _Overflow:
         self.spec, self.workspace, self.cl, self.c, self.idle_since = spec, workspace, None, None, {}
 
     def attach(self):
-        import coiled
         if self.cl is None:
-            self.cl = verify_attached(coiled.Cluster(name=self.spec["name"], workspace=self.workspace,
-                                                     shutdown_on_close=False, wait_for_workers=False),
-                                      self.spec["id"])
+            self.cl = attach_existing(self.spec["name"], self.workspace, self.spec["id"])
             self.c = self.cl.get_client()
         return self.cl, self.c
 
@@ -453,9 +465,8 @@ def _keeper_loop(token, name, workspace, lo, hi, hours, adapt_options, cluster_i
                 if not alive():
                     print(f"{time.strftime('%T')} {name} is not running; keeper exiting", flush=True)
                     return "keeper exited"
-                cl = coiled.Cluster(name=name, workspace=workspace, shutdown_on_close=False, wait_for_workers=False)
                 try:
-                    verify_attached(cl, cluster_id)
+                    cl = attach_existing(name, workspace, cluster_id)
                 except SystemExit as e:
                     print(f"{time.strftime('%T')} {e}; keeper exiting", flush=True)
                     return "keeper exited"

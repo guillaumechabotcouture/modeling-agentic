@@ -47,21 +47,13 @@ from typing import Optional
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from lib.safe_io import safe_load_mapping  # noqa: E402
+from lib.safe_io import safe_load_mapping, sha256_file as _sha  # noqa: E402
 
 CRITIQUE = "critique_presentation.yaml"
 DRAFT = "manuscript.md"
 REVIEW = "presentation_review.json"     # written by the harness (agents/hooks.py) only
 KINDS = {"missing": "presentation_review_missing", "failed": "presentation_review_failed",
          "stale": "presentation_review_stale"}
-
-
-def _sha(path: str) -> Optional[str]:
-    try:
-        with open(path, "rb") as f:
-            return hashlib.sha256(f.read()).hexdigest()
-    except OSError:
-        return None
 
 
 def draft_file(run_dir: str) -> Optional[str]:
