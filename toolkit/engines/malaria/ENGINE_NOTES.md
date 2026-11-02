@@ -1,11 +1,66 @@
-# Malaria engine v0.4: benchmark notes
+# Malaria engine v0.5: benchmark notes
 
-Engine `malaria-starsim` v0.4 (workstream A of architecture v2). Design note:
+Engine `malaria-starsim` v0.5 (workstream A of architecture v2). Design note:
 `docs/design/v2a-malaria-engine.md`. Every number in the tables block is rendered from
-`benchmarks/results.yaml`, `benchmarks/fitted.yaml` and `benchmarks/b15_mechanisms.yaml`,
-with the spike (`history/results_v0.1-spike.yaml`) and the earlier rounds (`history/results_v0.2.yaml`,
-`results_v0.3-r2.yaml`, `results_v0.3.yaml`) beside them, by `benchmarks/render_notes.py`. Reproduce with
-`bash toolkit/engines/malaria/benchmarks/validate_once.sh` on a VM.
+`benchmarks/results.yaml`, `benchmarks/fitted.yaml`, `benchmarks/b15_mechanisms.yaml`,
+`benchmarks/equilibration.yaml` and `benchmarks/runtime.yaml`, with the spike
+(`history/results_v0.1-spike.yaml`) and the earlier rounds (`history/results_v0.2.yaml`,
+`results_v0.3-r2.yaml`, `results_v0.3.yaml`, `results_v0.4.yaml`) beside them, by
+`benchmarks/render_notes.py`. Reproduce with `bash toolkit/engines/malaria/benchmarks/validate_once.sh` on a VM.
+
+## v0.5 scope: an equilibrated starting state (written before the v0.5 pack run)
+
+**The problem.** Up to v0.4 every run started at horizon.start with immunity set by a
+closed-form approximation from a guessed EIR (`init_eir = min(0.6 m0, 150)`). Immunity
+decays over 30 years (IC, IV) and 10 years (IB, ID), so that start is far from the
+engine's own equilibrium for adults. A diagnostic against a 60-year no-intervention
+burn-in, at under-5 PfPR 5–45%, found:
+- adult IC and ID at 2021 were 1.2–2 times too low, and still 0.65–0.92 of equilibrium
+  inside a 2024–27 decision window;
+- adult cases were overstated by 30–100%, and adult severe cases and deaths by up to 2 times;
+- under-5 burden, the calibration to under-5 PfPR and DALYs averted changed by less than
+  10% (no package ranking that matters changed);
+- but the `treated_all` cost driver counts all ages, and it feeds a per-outcome cost item,
+  so treatment costs and cases averted at all ages were biased.
+
+**The change (no fitted factor; B7, B8 and B16c stay held out).**
+- **Burn-in.** Each run starts `burnin_years` (card parameter, default 50; source: the
+  equilibration evidence below) before horizon.start, with no vector control or
+  chemoprevention and case management at the unit's `cm_ft`. The closed-form guess
+  (`init_eir_per_m0`, 0.6) now sets only the state at the start of the burn-in.
+- **Population.** The burn-in starts with n_agents exp(−0.0269 × burnin_years) people
+  (births 37, deaths 11 per 1,000 per year), which grows to n_agents at horizon.start,
+  in expectation, as in the diagnostic. Transmission is per person, so the smaller early
+  population changes noise, not intensity (the diagnostic found the same adult immunity
+  with 4,000 people from the first year).
+- **Shared by packages.** `run_batch()` runs the burn-in and the unit's own history once per
+  (unit, seed, burn-in parameters) and copies the sim exactly for each package at the
+  first step any package's component acts (the decision start at the latest). Every
+  package therefore has an identical history (common random numbers), and a package run
+  alone gives the same outcomes as in a batch. Parameter sets that differ only in
+  parameters that act after the fork (IRS, SMC, dual-AI chlorfenapyr kill, enhanced case
+  management, severe-case and DALY accounting) share one burn-in, so the joint fit's design
+  points share it too.
+- **Callers batch.** The benchmark runner sends one setting's arms per seed to
+  `run_batch()`, and the analysis batch sends one design point's packages per task, for an
+  engine that declares `batch_shares_state`.
+- **Declaration.** Every benchmark pack now declares its engine's initialisation method
+  and its equilibration evidence (`initialisation: {method, evidence}`, checked by the
+  runner; disease-agnostic). The malaria pack's evidence is `equilibration.yaml`; the
+  compartmental pack's is its initialiser benchmarks.
+
+**Tests written first.** Engine V1–V8 (burn-in parameter; population grows to n_agents;
+identical pre-start history across packages; a package alone equals the same package in a
+batch; post-fork parameters share a burn-in; independence from the starting guess; the
+doubling check), runner BP53–BP57, batch BA10–BA12, equilibration Q1–Q6, renderer R2.
+
+**Expected outcome.** Adult immunity at horizon.start rises toward equilibrium, with
+fewer adult cases. Under-5 calibrations move little. Effect ratios on child outcomes should
+move little, and so should B7's under-5 components. B7's all-age components (Rowland,
+Sochantha) may move: with more adult immunity, adult prevalence responds less to nets, and
+v0.4's gap was in exactly that age pattern. No magnitude is predicted. The cost-per-DALY
+benchmarks (B17–B20) may move a little through adult DALYs; their costs do not include
+treatment.
 
 ## v0.4 scope (written and pushed before any v0.4 pack run)
 
