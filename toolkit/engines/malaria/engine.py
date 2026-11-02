@@ -28,6 +28,16 @@ Outcomes: per-person totals over the decision window by age group (u5, 5_14, 15p
 cases, severe, deaths, treated and DALYs; named-window metrics (microscopy prevalence in
 model.PFPR_BANDS: pfpr_u5, pfpr_6m14y, pfpr_2_10 and, from v0.4, pfpr_lt5, pfpr_lt10,
 pfpr_le15, pfpr_all); cost drivers per person.
+
+v0.5: an equilibrated start. Each run begins with a no-intervention burn-in of `burnin_years`
+(card parameter, default 50; source benchmarks/equilibration.yaml) before horizon.start, from
+a closed-form immunity guess whose influence the burn-in removes. The population starts at
+n_agents exp(-POP_GROWTH burnin_years) and grows to about n_agents at horizon.start.
+run_batch() runs the burn-in and the shared history once per (unit, seed, burn-in parameters)
+and forks an exact copy for each package at its first component event, so packages share an
+identical history (common random numbers); run() is run_batch() with one member.
+initial_state() returns the state at horizon.start. `batch_shares_state` tells the benchmark
+runner and the analysis batch to send one unit's packages together.
 """
 from __future__ import annotations
 
@@ -54,7 +64,7 @@ RESULTS = os.path.join(HERE, "benchmarks", "results.yaml")
 AGES = ["u5", "5_14", "15p"]
 GRIFFIN = "Griffin et al. 2010 PLoS Med 10.1371/journal.pmed.1000324; 2014 Nat Commun; 2015 Lancet Infect Dis"
 A8 = "E7 attempt 8 value (models/malaria_abm.py VC), kept"
-VERSION = "0.4"
+VERSION = "0.5"
 BV = "Bertozzi-Villa et al. 2021 Nat Commun 10.1038/s41467-021-23707-7 (PMC8196080)"
 
 # name, value, kind, units, lo, hi, source, verified
@@ -90,8 +100,26 @@ _PARAMS = [
     ("le_5_14", 80.0, "fixed", "years", None, None, "GBD 2019 reference life table e(x), 5-14 (attempt 8)", "unverified"),
     ("le_15p", 54.0, "fixed", "years", None, None, "GBD 2019 reference life table e(x), 15+ (attempt 8)", "unverified"),
     ("import_eir", 0.1, "fixed", "infectious bites/person/year", None, None, A8, "unverified"),
-    ("n_agents", 4000, "fixed", "agents", None, None, "numerical setting", "unverified"),
+    ("n_agents", 4000, "fixed", "agents", None, None, "numerical setting (population at horizon.start)", "unverified"),
+    ("burnin_years", 50.0, "fixed", "years", None, None, "convergence evidence: benchmarks/equilibration.yaml (adult IC "
+     "and ID by age within 5% when the burn-in is doubled, and independent of init_eir_per_m0, at four transmission "
+     "levels); whole years, so the seasonal phase at horizon.start is unchanged", "unverified"),
+    ("init_eir_per_m0", 0.6, "fixed", "infectious bites/person/year per unit m0", None, None,
+     "assumption: the closed-form immunity guess at the start of the burn-in (EIR capped at 150); after the burn-in "
+     "the starting immunity does not depend on it (benchmarks/equilibration.yaml)", "unverified"),
 ]
+# v0.5: the burn-in starts with n_agents exp(-POP_GROWTH burnin_years) people and grows to about n_agents at
+# horizon.start. Births 37 and deaths 11 per 1,000 per year (_demog); 0.0269 per year is the growth measured in the
+# pre-v0.5 burn-in diagnostic (ENGINE_NOTES.md, v0.5) and checked by self-test V2.
+POP_GROWTH = 0.0269
+# Parameters read only by package components (after the fork) or by the outcome accounting in the decision window:
+# param sets that differ only in these share one burn-in (checked by V5). cfp_kill and cfp_half act through dual-AI
+# nets, so they join the burn-in key when past campaigns used dual-AI nets (hist_net: dual).
+POST_FORK = frozenset({"irs_kill", "irs_rep", "irs_half", "irs_coverage", "smc_pe", "smc_hi_frac", "cm_add",
+                       "cfr_severe_treated", "cfr_severe_untreated", "severe_access_add", "dw_moderate", "dw_severe",
+                       "dur_moderate_d", "dur_severe_d", "le_u5", "le_5_14", "le_15p"})
+DUAL_NET = frozenset({"cfp_kill", "cfp_half"})
+IMM_BANDS = (("0_5", 0.0, 5.0), ("5_15", 5.0, 15.0), ("15_30", 15.0, 30.0), ("30p", 30.0, 1e9), ("15p", 15.0, 1e9))
 
 
 def _people(n):
@@ -191,48 +219,192 @@ class MalariaEngine:
                    "fitted) and varied in the ENGINE_NOTES sensitivity scan",
                    "IRS product decay: pm_cs from Protopopoff 2018 cone bioassays (matched); short from attempt 8 (unverified)"])
 
-    def run(self, params, unit: UnitSpec, package: Package, horizon: Horizon, seed: int) -> Outcomes:
-        t0 = time.time()
-        sim, P = self.build_sim(params, unit, package, horizon, seed)
-        sim.run()
-        return self._outcomes(sim, P, horizon, seed, t0)
+    # ---------------------------------------------------------------- v0.5: equilibrated start, shared by packages
+    # A run is a no-intervention burn-in of `burnin_years` before horizon.start (case management at the unit's
+    # cm_ft, no vector control or chemoprevention), the unit's own history from horizon.start, and the package from
+    # its first component event. run_batch runs the burn-in and the shared history once per (unit, seed, burn-in
+    # parameters) and copies the sim for each package at the fork, so every package has an identical history
+    # (common random numbers). run() is run_batch with one member.
+    batch_shares_state = True
 
-    def build_sim(self, params, unit: UnitSpec, package: Package, horizon: Horizon, seed: int):
-        """The Starsim sim for one run (not yet run), and the resolved parameters."""
-        import starsim as ss
-        P = resolve_params(self, params)
-        a = dict(unit.attributes)
+    def initialisation(self) -> dict:
+        P = resolve_params(self, {})
+        return {"method": f"no-intervention burn-in of {P['burnin_years']:g} years before horizon.start (case "
+                          "management at the unit's cm_ft), from a closed-form immunity guess (init_eir_per_m0); the "
+                          "population starts at n_agents exp(-0.0269 burnin_years) and grows to n_agents; packages "
+                          "share the burn-in and the history up to their first component event",
+                "evidence": "benchmarks/equilibration.yaml"}
+
+    def _plan(self, P: dict, a: dict, components: dict, horizon: Horizon) -> dict:
+        """The package's component settings and the decimal years at which they first act."""
         comp = {"net": "none", "smc": 0, "irs": 0, "cm": 0}
-        comp.update(package.components)
+        comp.update(components)
         season = np.asarray(a.get("season", [1.0] * 12), float)
-        smc_m = tuple(a.get("smc_months") or default_smc_months(season))
         w0, w1 = horizon.window
-        dis = M.Malaria(M0=float(a.get("m0", 5.0)), season=season, resistance=_resistance(a.get("resistance", 0.5)),
-                        ft=float(a.get("cm_ft", 0.3)), species=a.get("species"), P=P,
-                        init_eir=min(0.6 * float(a.get("m0", 5.0)), 150.0), win_start=w0, win_stop=w1,
-                        smc_months=smc_m, import_eir=P["import_eir"], irs_product=a.get("irs_product", "pm_cs"))
-        use, self._access_capped = access_for_use(float(a.get("itn_use", 0.55)), float(a.get("itn_use_at", 0.0)), P)
-        itv = [M.CaseManagement(base=float(a.get("cm_ft", 0.3)), add=P["cm_add"] if int(comp["cm"]) else 0.0,
-                                start=w0, name="cm")]
-        hist = [float(y) for y in a.get("itn_hist_years", [])]
-        if hist:
-            itv.append(M.ITNCampaign(years=hist, use=use, net_type=a.get("hist_net", "pyr"), name="itn_hist"))
         years = list(range(int(np.floor(w0)), int(np.ceil(w1))))
+        cfg = {"cm_add": P["cm_add"] if int(comp["cm"]) else 0.0, "net": None, "smc": None, "irs": None,
+               "events": [float(w0)]}
         if comp["net"] != "none":
-            itv.append(M.ITNCampaign(years=[float(a.get("campaign_year", w0))], use=use, net_type=comp["net"],
-                                     count=True, name="itn_new"))
+            cy = float(a.get("campaign_year", w0))
+            cfg["net"] = {"years": [cy], "net_type": comp["net"]}
+            cfg["events"].append(cy)
         if int(comp["smc"]):
-            itv.append(M.SMCDelivery(years=years, months=smc_m, pe=P["smc_pe"], hi_frac=P["smc_hi_frac"], name="smc"))
+            months = tuple(a.get("smc_months") or default_smc_months(season))
+            cfg["smc"] = {"years": years, "months": months}
+            cfg["events"] += [y + (m - 1) / 12 for y in years for m in months]
         if int(comp["irs"]):
             month = int(a.get("irs_month") or ((int(np.argmax(season)) - 3) % 12 + 1))
             irs_years = [int(np.floor(float(y))) for y in a.get("irs_years", years)]
-            itv.append(M.IRSRound(years=irs_years, month=month, coverage=P["irs_coverage"], name="irs"))
-        sim = ss.Sim(people=_people(int(P["n_agents"])), start=float(horizon.start), stop=float(horizon.stop),
+            cfg["irs"] = {"years": irs_years, "month": month}
+            cfg["events"] += [y + (month - 1) / 12 for y in irs_years]
+        return cfg
+
+    @staticmethod
+    def _burnin_key(P: dict, a: dict) -> str:
+        import json
+        skip = POST_FORK | (frozenset() if a.get("hist_net", "pyr") == "dual" else DUAL_NET)
+        return json.dumps({"P": {k: v for k, v in P.items() if k not in skip}, "unit": a}, sort_keys=True, default=str)
+
+    def _base_sim(self, P: dict, a: dict, horizon: Horizon, seed: int, cfg: dict | None = None):
+        """The sim from horizon.start - burnin_years (not yet initialised), with every component slot present and
+        inert unless `cfg` sets it; returns (sim, n0, access_capped)."""
+        import starsim as ss
+        B = float(P["burnin_years"])
+        if B < 0 or abs(B - round(B)) > 1e-9:
+            raise ValueError(f"burnin_years must be a whole number of years >= 0 (got {B:g})")
+        B = int(round(B))
+        n = int(P["n_agents"])
+        n0 = n if B == 0 else max(int(round(n * np.exp(-POP_GROWTH * B))), 50)
+        season = np.asarray(a.get("season", [1.0] * 12), float)
+        w0, w1 = horizon.window
+        m0 = float(a.get("m0", 5.0))
+        dis = M.Malaria(M0=m0, season=season, resistance=_resistance(a.get("resistance", 0.5)),
+                        ft=float(a.get("cm_ft", 0.3)), species=a.get("species"), P=P,
+                        init_eir=min(P["init_eir_per_m0"] * m0, 150.0), win_start=w0, win_stop=w1,
+                        smc_months=tuple(a.get("smc_months") or default_smc_months(season)),
+                        import_eir=P["import_eir"], irs_product=a.get("irs_product", "pm_cs"),
+                        rec_year=float(horizon.start))
+        use, capped = access_for_use(float(a.get("itn_use", 0.55)), float(a.get("itn_use_at", 0.0)), P)
+        itv = [M.CaseManagement(base=float(a.get("cm_ft", 0.3)), add=0.0, start=w0, name="cm")]
+        hist = [float(y) for y in a.get("itn_hist_years", [])]
+        if hist:
+            itv.append(M.ITNCampaign(years=hist, use=use, net_type=a.get("hist_net", "pyr"), name="itn_hist"))
+        itv += [M.ITNCampaign(years=[], use=use, net_type="pyr", count=True, name="itn_new"),
+                M.SMCDelivery(years=[], pe=P["smc_pe"], hi_frac=P["smc_hi_frac"], name="smc"),
+                M.IRSRound(years=[], coverage=P["irs_coverage"], name="irs")]
+        if cfg is not None:
+            self._configure({i.name: i for i in itv}, None, P, cfg)
+        sim = ss.Sim(people=_people(n0), start=float(horizon.start) - B, stop=float(horizon.stop),
                      dt=ss.days(1), diseases=dis, demographics=_demog(), interventions=itv,
                      rand_seed=int(seed), verbose=0)
+        return sim, n0, capped
+
+    @staticmethod
+    def _configure(itv, dz, P: dict, cfg: dict) -> None:
+        """Set the package's components (and, after a fork, the member's parameters) on the sim's interventions."""
+        if dz is not None:
+            dz.P = dict(P)
+        itv["cm"].add = float(cfg["cm_add"])
+        net, smc, irs = itv["itn_new"], itv["smc"], itv["irs"]
+        net.years = list(cfg["net"]["years"]) if cfg["net"] else []
+        net.code = V.NET_CODE[cfg["net"]["net_type"]] if cfg["net"] else V.NET_CODE["pyr"]
+        smc.years = list(cfg["smc"]["years"]) if cfg["smc"] else []
+        if cfg["smc"]:
+            smc.months = list(cfg["smc"]["months"])
+        smc.pe, smc.hi_frac = P["smc_pe"], P["smc_hi_frac"]
+        irs.years = list(cfg["irs"]["years"]) if cfg["irs"] else []
+        if cfg["irs"]:
+            irs.month = int(cfg["irs"]["month"])
+        irs.cov = P["irs_coverage"]
+        for it in (net, smc, irs):
+            it.__dict__.pop("_tis", None)          # event steps are recomputed from the new years
+
+    def build_sim(self, params, unit: UnitSpec, package: Package, horizon: Horizon, seed: int):
+        """The Starsim sim of one run (not yet run, burn-in included), and the resolved parameters."""
+        P = resolve_params(self, params)
+        a = dict(unit.attributes)
+        sim, _, self._access_capped = self._base_sim(P, a, horizon, seed, self._plan(P, a, package.components, horizon))
         return sim, P
 
-    def _outcomes(self, sim, P, horizon, seed, t0) -> Outcomes:
+    def run(self, params, unit: UnitSpec, package: Package, horizon: Horizon, seed: int) -> Outcomes:
+        return self.run_batch([params], unit, [package], horizon, seed)[0]
+
+    def run_batch(self, param_sets, unit, packages, horizon: Horizon, seed: int) -> list:
+        """Outcomes of many (parameter set, package) pairs at one seed; `unit` is one UnitSpec or one per pair,
+        `packages` one Package or one per pair. Pairs whose burn-in inputs agree (the unit and every parameter outside
+        POST_FORK) share one burn-in and one history up to the earliest component event of any of them; each pair is
+        then continued from an exact copy. Each pair's outcomes equal run() of that pair (self-test V4)."""
+        import copy
+        B = len(param_sets)
+        units = list(unit) if isinstance(unit, (list, tuple)) else [unit] * B
+        pkgs = list(packages) if isinstance(packages, (list, tuple)) else [packages] * B
+        if B == 0 or len(units) != B or len(pkgs) != B:
+            raise ValueError("run_batch: give one unit (or one per pair) and one package (or one per pair)")
+        mem = []
+        for p, u, k in zip(param_sets, units, pkgs):
+            P = resolve_params(self, p)
+            a = dict(u.attributes)
+            mem.append((P, a, self._plan(P, a, k.components, horizon)))
+        groups = {}
+        for i, (P, a, _) in enumerate(mem):
+            groups.setdefault(self._burnin_key(P, a), []).append(i)
+        out = [None] * B
+        for idx in groups.values():
+            t0 = time.time()
+            P0, a0, _ = mem[idx[0]]
+            sim, n0, capped = self._base_sim(P0, a0, horizon, seed)
+            sim.init()
+            yv = np.asarray(sim.t.yearvec)
+            tf = min(t for i in idx for t in mem[i][2]["events"])
+            ti_f = int(np.argmin(np.abs(yv - tf)))          # the same nearest-step rule as the components' events
+            if ti_f >= 1:
+                sim.run(until=yv[ti_f - 1])
+            shared = (time.time() - t0) / len(idx)
+            for n, i in enumerate(idx):
+                t1 = time.time()
+                s = sim if n == len(idx) - 1 else copy.deepcopy(sim)
+                P, a, cfg = mem[i]
+                self._configure(s.interventions, s.diseases.malaria, P, cfg)
+                s.run()
+                dz = s.diseases.malaria
+                out[i] = self._outcomes(s, P, horizon, seed, t1 - shared, capped, extra={
+                    "burnin_years": int(round(P["burnin_years"])), "n_burnin_start": n0, "n_start": dz.n_start,
+                    "fork_year": round(float(yv[ti_f]), 6), "burnin_members": len(idx),
+                    "start_state_sha256": dz.start_sha})
+        return out
+
+    def initial_state(self, params, unit: UnitSpec, package: Package | None = None, horizon: Horizon | None = None,
+                      seed: int = 1) -> dict:
+        """The state at horizon.start after the burn-in (no package acts before it): population, mean immunity by
+        age band (IB, IC, ID, IV) and microscopy prevalence. For the equilibration evidence and self-tests."""
+        if horizon is None:
+            raise ValueError("initial_state needs the horizon: the state is the one at horizon.start")
+        P = resolve_params(self, params)
+        a = dict(unit.attributes)
+        sim, n0, _ = self._base_sim(P, a, horizon, seed)
+        sim.init()
+        yv = np.asarray(sim.t.yearvec)
+        ti = int(np.argmin(np.abs(yv - float(horizon.start))))
+        if ti >= 1:
+            sim.run(until=yv[ti - 1])
+        dz = sim.diseases.malaria
+        u = sim.people.auids
+        age = np.asarray(sim.people.age[u], float)
+        imm = {nm: {} for nm in ("IB", "IC", "ID", "IV")}
+        for nm in imm:
+            v = np.asarray(getattr(dz, nm)[u], float)
+            for b, lo, hi in IMM_BANDS:
+                s = (age >= lo) & (age < hi)
+                imm[nm][b] = float(v[s].mean()) if s.any() else float("nan")
+        st = np.asarray(dz.st[u])
+        det = ((st == M.D_) | (st == M.T_)).astype(float)
+        q = dz._detect(age * 365)
+        det[st == M.A_] = q[st == M.A_]
+        return {"N": int(len(u)), "N0": int(n0), "year": float(yv[ti]), "burnin_years": int(round(P["burnin_years"])),
+                "init_eir": min(P["init_eir_per_m0"] * float(a.get("m0", 5.0)), 150.0), "immunity": imm,
+                "pfpr": M.prevalence_bands(det, age * 365)}
+
+    def _outcomes(self, sim, P, horizon, seed, t0, capped=None, extra=None) -> Outcomes:
         w0, w1 = horizon.window
         dz = sim.diseases.malaria
         yv = np.asarray(sim.t.yearvec)
@@ -260,11 +432,13 @@ class MalariaEngine:
         tot_treated = float(dz.acc["treated"].sum() / max(dz.acc_cost["pdays_all"] / ndays, 1e-9))
         cd = {"nets_given": float(dz.acc_cost["nets_given"]), "smc_doses": float(dz.acc_cost["smc_doses"]),
               "irs_sprayed": float(dz.acc_cost["irs_sprayed"]), "treated_all": tot_treated}
+        if capped is None:
+            capped = bool(getattr(self, "_access_capped", False))
         return Outcomes(per_capita=pc, windows=wins, cost_drivers=cd,
-                        meta={"seconds": round(time.time() - t0, 2), "seed": int(seed),
-                              "itn_access_capped": bool(getattr(self, "_access_capped", False)),
-                              "age_shares": {g: float(dz.acc["pdays"][i] / max(dz.acc["pdays"].sum(), 1))
-                                             for i, g in enumerate(AGES)}})
+                        meta=dict({"seconds": round(time.time() - t0, 2), "seed": int(seed),
+                                   "itn_access_capped": bool(capped),
+                                   "age_shares": {g: float(dz.acc["pdays"][i] / max(dz.acc["pdays"].sum(), 1))
+                                                  for i, g in enumerate(AGES)}}, **(extra or {})))
 
 
 def to_jsonable(o: Outcomes) -> dict:
@@ -280,7 +454,7 @@ def _self_test() -> int:
             fails.append(msg)
 
     e = MalariaEngine()
-    e_par = {"n_agents": 600}
+    e_par = {"n_agents": 600, "burnin_years": 0}      # mechanism tests: no burn-in (v0.5 cases below)
     unit = UnitSpec("t", {"m0": 8.0, "season": [1.0] * 12, "resistance": 0.5, "species": {"gambiae": 0.7, "arabiensis": 0.3},
                           "cm_ft": 0.3, "itn_use": 0.6, "itn_hist_years": [2016.3], "campaign_year": 2018.1})
     h = Horizon(2015.0, 2019.0, (2018.0, 2019.0), {"pre": [2017.0, 2018.0], "post": [2018.3, 2019.0]})
@@ -314,7 +488,7 @@ def _self_test() -> int:
     u1 = UnitSpec("t", dict(unit.attributes, itn_hist_years=[], campaign_year=2020.0, irs_month=1))
 
     def latents(over):
-        sim, _ = es.build_sim(dict(over, n_agents=2000), u1, Package("x", {"net": "pyr", "irs": 1}), h1, 5)
+        sim, _ = es.build_sim(dict(over, n_agents=2000, burnin_years=0), u1, Package("x", {"net": "pyr", "irs": 1}), h1, 5)
         sim.init()
         dz = sim.diseases.malaria
         uu = sim.people.auids
@@ -340,7 +514,7 @@ def _self_test() -> int:
     irs_l = es.run({}, u1, Package("i", {"irs": 1}), h1, 7)
     ok(irs_l.windows["post"]["eir_annual"] < irs_s.windows["post"]["eir_annual"],
        "M12 the long-lasting IRS product cuts EIR more over six months than the short-lived one")
-    sim, _ = es.build_sim({"n_agents": 600}, UnitSpec("t", dict(u1.attributes, irs_years=[2020.0])),
+    sim, _ = es.build_sim({"n_agents": 600, "burnin_years": 0}, UnitSpec("t", dict(u1.attributes, irs_years=[2020.0])),
                           Package("i", {"irs": 1}), Horizon(2019.0, 2021.5, (2020.0, 2021.5), {}), 3)
     # ---- v0.3 field-use mechanisms in isolation: attrition, use below access, nightly variation
     P0 = resolve_params(e, {})
@@ -361,7 +535,7 @@ def _self_test() -> int:
        "M17 with attrition and the use gap switched off, access stays and everyone with access uses it")
 
     def overlap(persist):
-        sim2, _ = es.build_sim({"n_agents": 1500, "use_persist": persist}, u1, Package("n", {}), h1, 6)
+        sim2, _ = es.build_sim({"n_agents": 1500, "use_persist": persist, "burnin_years": 0}, u1, Package("n", {}), h1, 6)
         sim2.init()
         dz2 = sim2.diseases.malaria
         uu = sim2.people.auids

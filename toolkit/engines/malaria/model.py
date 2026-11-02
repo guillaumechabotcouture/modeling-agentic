@@ -74,7 +74,7 @@ class Malaria(ss.Disease):
         super().__init__()
         self.define_pars(M0=5.0, season=np.ones(12), resistance=0.5, ft=0.3, species=None, P=None,
                          init_eir=50., win_start=None, win_stop=None, smc_months=(),
-                         import_eir=0.1, irs_product="pm_cs")
+                         import_eir=0.1, irs_product="pm_cs", rec_year=None)
         self.update_pars(pars, **kwargs)
         sd = np.sqrt((np.exp(G['sigma2']) - 1))
         self.define_states(
@@ -115,6 +115,22 @@ class Malaria(ss.Disease):
         sel = (age_d > 18 * 365) & (age_d < 25 * 365)
         self.ic20 = float(self.IC[u][sel].mean()) if sel.any() else 0.0
         self.iv20 = float(self.IV[u][sel].mean()) if sel.any() else 0.0
+        self.n_start, self.start_sha = None, None
+
+    def state_hash(self, u) -> str:
+        """sha256 of the human and mosquito state and the daily records so far (v0.5: packages forked from one
+        burn-in must agree on it at horizon.start)."""
+        import hashlib
+        h = hashlib.sha256()
+        for nm in ('st', 'zeta', 'IB', 'IC', 'ID', 'IV', 'lb', 'lc', 'ld', 'lv', 'prot_until', 'prot_eff', 'has_net',
+                   'net_t', 'net_type', 'spray_t', 'hh', 'z_hh', 'z_sp', 'prop_net', 'prop_use'):
+            h.update(np.ascontiguousarray(np.asarray(getattr(self, nm)[u], float)).tobytes())
+        h.update(np.ascontiguousarray(np.asarray(self.sim.people.age[u], float)).tobytes())
+        for mo in self.mos:
+            h.update(np.asarray([mo['S'], mo['I']], float).tobytes() + np.asarray(mo['q'], float).tobytes())
+        for k in DAILY:
+            h.update(self.daily[k][:self.ti].tobytes())
+        return h.hexdigest()
 
     def _households(self, u, initial=False):
         """Assign households and the correlated coverage / exposure latents (see module doc)."""
@@ -185,6 +201,8 @@ class Malaria(ss.Disease):
         new = u[self.hh[u] < 0]
         if len(new):
             self._households(new)
+        if self.n_start is None and p.rec_year is not None and self.year() >= p.rec_year - 1e-9:
+            self.n_start, self.start_sha = len(u), self.state_hash(u)      # the state at horizon.start
         n = len(u)
         age_d = self.sim.people.age[u] * 365
         st = self.st[u]
