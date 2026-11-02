@@ -1,0 +1,8 @@
+---
+phase: "v2"
+commit: "N3"
+---
+
+## Changelog
+
+**A batch computed on one platform is used with the exact inputs it ran, not a design regenerated elsewhere.** In the Nigeria re-run, the engine batch was computed in shards on Linux Coiled VMs and merged on macOS. The merge regenerated the design, and one design point's inputs (`m0 = exp(z)`) came out with last-bit differences, so 32 rows' input hashes mismatched; the adoption replay of one sampled job, recomputed on macOS, reproduced only to about 1.4% because the stochastic simulation amplifies floating-point noise. Both failed closed, as they should. `toolkit/analysis/batch.py` now has `ship()` (written where the batch ran: the exact jobs file with its inputs, the design, the rows, and a manifest with each file's sha256, the decision spec's sha256 and the computing platform), `merge_shipped()` (refuses shards from mixed platforms, `shipped_platform_mixed`, or for different specs or designs) and `load_shipped()` (file hashes, spec, completeness, each row's provenance against the shipped job it ran; the regenerated design must equal the shipped one exactly on the computing platform, and across platforms may differ only below 1e-12 relative, about 1e-16 observed). `toolkit/analysis/run.py --shipped DIR` runs the analysis on the shipped design and jobs and records where they were computed. `adopt()` refuses a stored batch whose design records another platform before its replay recomputes anything (`adopt_platform_differs`); refusals carry a stable code (`BatchRefused`). The adoption tolerance (1e-6) is unchanged. Self-tests BA0-BA9 (`batch.py`, new) and R20b (`run.py`) were written first from the re-run's evidence; BA1-BA8 failed before the fix. `toolkit/engines/contract.py` is unchanged.
