@@ -2840,6 +2840,10 @@ def _self_test() -> int:
         _self_test_wall(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"SW: {type(e).__name__}: {e}")
+    try:
+        _self_test_xhost(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"XH: {type(e).__name__}: {e}")
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
         return 1
@@ -2879,6 +2883,162 @@ def _self_test_wall(ok) -> None:
         open(os.path.join(d, "models", "helper.py"), "w").write("X = 1\n")
         ok(fp1 == fp0 and code_fingerprint(d, "models/fn.py::f") != fp1,
            "SW5 the pipeline runner's own definition and records are not part of a batch's fingerprint; model code is")
+
+
+def _self_test_xhost(ok) -> None:
+    """XH1-XH7 (Nigeria v2 full run, 2026-11-02): a caller on another host killed
+    without settling (the analyze step's timeout) left a 120 core-hour
+    reservation that a resumed run on a new cluster held forever, and its
+    progress path pointed into the old checkout."""
+    global PROGRESS_HEARTBEAT_S
+    import subprocess as _sp
+    import tempfile
+    import threading
+    now = time.time()
+    other = "coiled-dask-old-worker"
+    out = [{"n": 32, "share": 5000.0, "started": now - 4000, "cores": 8},
+           {"n": 32, "share": 7000.0, "started": now - 3000, "cores": 8}]
+    bound = 5000.0 + 7000.0 + 2 * 8 * SHARE_STOP_GRACE_S
+
+    def rec(age, **kw):
+        return {"t": now - age, "core_s": 1000.0, "done_tasks": 184, "max_task_core_s": 10.0,
+                "remote_unconfirmed": False, "out": out, "call_id": "c-old", **kw}
+
+    def setup(d, record, rel=None, old_root=None, **res):
+        """A run dir whose ledger holds one reservation from `other`; the record
+        is written at `.compute_progress/abc.json` (None: not written; str: raw)."""
+        os.makedirs(os.path.join(d, "models"), exist_ok=True)
+        pdir = os.path.join(d, PROGRESS_DIR)
+        os.makedirs(pdir, exist_ok=True)
+        pf = os.path.join(pdir, "abc.json")
+        if record is not None:
+            open(pf, "w").write(record if isinstance(record, str) else json.dumps(record))
+        ref = rel if rel is not None else (os.path.join(old_root, PROGRESS_DIR, "abc.json") if old_root else pf)
+        led = {"core_seconds": 0.0, "calls": [], "reservations": {"x": {
+            "core_s": 432000.0, "pid": 1941, "pid_start": "proc:24313", "host": other,
+            "fn": "/old/toolkit/analysis/batch.py::run_point", "backend": "dask", "n": 256,
+            "progress": ref, "started": now - 5000, **res}}}
+        return led, pf
+
+    def settle(d, led):
+        try:
+            return _live_reservations(led, os.path.realpath(d), now=now), None
+        except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+            return None, f"{type(e).__name__}: {e}"
+
+    # XH1 a stale cross-host record (heartbeat recorded, not refreshed past the
+    # bound) is settled from its record: work done + its chunks' shares (they
+    # cannot be cancelled from here), not the reservation; nothing is signalled here.
+    with tempfile.TemporaryDirectory() as d:
+        bystander = _sp.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+        try:
+            time.sleep(0.2)
+            led, pf = setup(d, rec(PROGRESS_STALE_S + 60, hb_s=PROGRESS_HEARTBEAT_S,
+                                   pids=[[bystander.pid, _pid_start(bystander.pid)]], pids_complete=True))
+            held, err = settle(d, led)
+            c = (led["calls"] or [{}])[0]
+            ok(err is None and held == 0.0 and not led["reservations"]
+               and abs(led["core_seconds"] - (1000.0 + bound)) < 1e-6 and "another host" in str(c.get("stopped"))
+               and "charged work done" in str(c.get("stopped")) and not os.path.exists(pf)
+               and bystander.poll() is None,
+               f"XH1 a stale cross-host reservation is charged its record ({1000.0 + bound:.0f} core-s), "
+               f"not held: held={held} err={err} led={led}")
+        finally:
+            bystander.kill()
+            bystander.wait()
+    # XH2 a fresh cross-host record stays held, untouched.
+    with tempfile.TemporaryDirectory() as d:
+        led, pf = setup(d, rec(30, hb_s=PROGRESS_HEARTBEAT_S))
+        held, err = settle(d, led)
+        ok(err is None and held == 432000.0 and "x" in led["reservations"] and not led["calls"]
+           and os.path.exists(pf), f"XH2 a fresh cross-host reservation stays held: held={held} err={err} {led}")
+    # XH3 a record without a heartbeat (written before it existed), in a run dir
+    # that has not moved, cannot tell a long task from a dead caller: held
+    # within the 24-h bound, settled past it.
+    with tempfile.TemporaryDirectory() as d:
+        led, pf = setup(d, rec(PROGRESS_STALE_S + 60))
+        held, err = settle(d, led)
+        ok(err is None and held == 432000.0 and "x" in led["reservations"],
+           f"XH3a a legacy record not moved is held within the bound: held={held} err={err}")
+        led, pf = setup(d, rec(PROGRESS_STALE_LEGACY_S + 60))
+        held, err = settle(d, led)
+        ok(err is None and held == 0.0 and abs(led["core_seconds"] - (1000.0 + bound)) < 1e-6,
+           f"XH3b a legacy record past the 24-h bound is settled from its record: held={held} err={err} {led}")
+    # XH4 the run dir moved (resumed on a new cluster, another checkout): the old
+    # absolute path is resolved by its `.compute_progress/<name>` suffix in this run
+    # dir; a legacy record that can no longer be refreshed here is settled once stale.
+    with tempfile.TemporaryDirectory() as d:
+        led, pf = setup(d, rec(PROGRESS_STALE_S + 60), old_root="/tmp/ab/F1/runs/R")
+        held, err = settle(d, led)
+        c = (led["calls"] or [{}])[0]
+        ok(err is None and held == 0.0 and abs(led["core_seconds"] - (1000.0 + bound)) < 1e-6
+           and c.get("done_core_s") == 1000.0 and not os.path.exists(pf),
+           f"XH4 a moved run dir resolves the old progress path and settles from it: held={held} err={err} {led}")
+        led, pf = setup(d, rec(60), old_root="/tmp/ab/F1/runs/R")
+        held, err = settle(d, led)
+        ok(err is None and held == 432000.0, f"XH4b a moved record still fresh is held: held={held} err={err}")
+        # The same suffix resolution for a same-host caller that died.
+        led, pf = setup(d, rec(60, hb_s=PROGRESS_HEARTBEAT_S), old_root="/tmp/ab/F1/runs/R",
+                        host=os.uname().nodename, pid=2 ** 22 + 7, pid_start=None)
+        led["reservations"]["x"]["backend"] = "dask"
+        os.environ.pop("MA_COMPUTE_SCHEDULER", None)
+        held, err = settle(d, led)
+        ok(err is None and held == 0.0 and abs(led["core_seconds"] - (1000.0 + bound)) < 1e-6,
+           f"XH4c a dead same-host caller's old absolute path resolves too: held={held} err={err} {led}")
+    # XH5 fail closed: an unreadable (or missing) record from another host is held
+    # within the 24-h bound from its reservation, then charged in full.
+    for content, what in (("{not json", "unreadable"), (None, "missing")):
+        with tempfile.TemporaryDirectory() as d:
+            led, _ = setup(d, content)
+            held, err = settle(d, led)
+            ok(err is None and held == 432000.0, f"XH5a {what} record, reserved 1.4 h ago: held: {held} {err}")
+            led, _ = setup(d, content, started=now - PROGRESS_STALE_LEGACY_S - 60)
+            held, err = settle(d, led)
+            c = (led["calls"] or [{}])[0]
+            ok(err is None and held == 0.0 and led["core_seconds"] == 432000.0
+               and "charged its reservation" in str(c.get("stopped")),
+               f"XH5b {what} record past the bound: charged in full: held={held} err={err} {led}")
+    # XH6 local work in flight on another host (no share, cannot be stopped from
+    # here) charges the reservation.
+    with tempfile.TemporaryDirectory() as d:
+        led, _ = setup(d, rec(PROGRESS_STALE_S + 60, hb_s=PROGRESS_HEARTBEAT_S,
+                              out=[{"n": 1, "started": now - 100, "cores": 1}], pids=[[1, "proc:1"]],
+                              pids_complete=True), backend="local")
+        held, err = settle(d, led)
+        ok(err is None and held == 0.0 and led["core_seconds"] == 432000.0,
+           f"XH6 cross-host local work in flight: the reservation is charged: held={held} err={err} {led}")
+    # XH7 a running call records its progress path relative to the run dir and
+    # refreshes the record's heartbeat while a task runs longer than it.
+    saved = PROGRESS_HEARTBEAT_S
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        open(os.path.join(d, "models", "nap.py"), "w").write(
+            "import time\ndef nap(p):\n    time.sleep(p['s']); return {'ok': 1}\n")
+        seen = {}
+        try:
+            PROGRESS_HEARTBEAT_S = 0.2
+            th = threading.Thread(target=lambda: map_fn(d, "models/nap.py::nap", [{"s": 2.0}], backend="local",
+                                                        max_workers=1, max_core_hours=0.1))
+            th.start()
+            end = time.time() + 20
+            while time.time() < end and th.is_alive():
+                try:
+                    r = next(iter(json.load(open(os.path.join(d, LEDGER_REL)))["reservations"].values()))
+                    p = json.load(open(os.path.join(d, r["progress"])))
+                    seen.setdefault("ref", r["progress"])
+                    seen.setdefault("t", []).append(p["t"])
+                    seen["hb"] = p.get("hb_s")
+                except (OSError, ValueError, KeyError, StopIteration, TypeError):
+                    pass
+                time.sleep(0.1)
+            th.join(30)
+        finally:
+            PROGRESS_HEARTBEAT_S = saved
+        ts = sorted(set(seen.get("t", [])))
+        ok(seen.get("ref") == os.path.join(PROGRESS_DIR, os.path.basename(str(seen.get("ref"))))
+           and seen.get("hb") == 0.2 and len(ts) >= 4,
+           f"XH7 the progress path is relative and the record is refreshed during a 2-s task: {seen.get('ref')} "
+           f"hb={seen.get('hb')} {len(ts)} distinct t")
 
 
 def _self_test_sched(ok) -> None:
