@@ -625,6 +625,9 @@ def run_label(run_dir: str, root: str | None) -> tuple[str, str]:
     if len(parts) > 1:
         parts = parts[:-1]
     names = [x for x in os.path.realpath(root).split(os.sep) if x and x not in ("run", "runs")]
+    base = os.path.basename(os.path.realpath(root))
+    if parts == [os.path.basename(run_dir)] and base not in ("run", "runs"):
+        parts = [base]               # a run directly under a named root (a mirror's live/<run>) is named by it
     return "/".join(parts) or os.path.basename(run_dir), (names[-1] if names else root)
 
 
@@ -2217,6 +2220,22 @@ def _self_test() -> int:
                and [d["field"] for d in cmpd["spec_diff"]] == sorted(fields)
                and cmpd["engines"][0]["version"] == "0.5" and cmpd["engines"][1]["version"] == "0.6",
                f"RC15f compare: spec diff, engine versions, package counts side by side ({cmpd['packages']})")
+            live = os.path.join(t3 + "_live", "live")
+            shutil.copytree(os.path.join(t3, "C_amended", ts), os.path.join(live, ts))
+            sp20 = yaml.safe_load(open(os.path.join(live, ts, "decision_spec.yaml")))
+            sp20["horizon"]["stop"] = 2030.0
+            yaml.safe_dump(sp20, open(os.path.join(live, ts, "decision_spec.yaml"), "w"))
+            so20 = json.load(open(os.path.join(live, ts, "decision_spec.signoff.json")))
+            so20.update(signed_at="2026-01-03T00:00:00+00:00",
+                        sha256={"decision_spec.yaml": _sha(os.path.join(live, ts, "decision_spec.yaml"))})
+            json.dump(so20, open(os.path.join(live, ts, "decision_spec.signoff.json"), "w"))
+            pj20 = projects(Console([t3], mirror=live).runs())
+            lin20 = pj20[0]["lineage"] if len(pj20) == 1 else []
+            ok([(r["label"], r["mirror"]) for r in lin20] == [("A", False), ("B", False), ("C", False), ("live", True)]
+               and lin20[-1]["relation"] == "amended + re-signed",
+               f"RC20 --mirror combines with --roots: the mirrored live run joins the same project's lineage "
+               f"({[(r['label'], r['mirror']) for r in lin20]})")
+            shutil.rmtree(t3 + "_live")
             with make_server(Console([t3]), "127.0.0.1", 0) as srv:
                 threading.Thread(target=srv.serve_forever, daemon=True).start()
                 base = f"http://127.0.0.1:{srv.server_address[1]}"

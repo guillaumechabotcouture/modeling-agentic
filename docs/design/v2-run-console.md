@@ -266,6 +266,7 @@ A synthetic run dir with toy numbers (no licensed data):
 | RC17 | the keys the page reads from `/api/runs` are served; errors show in a banner; fetches time out |
 | RC18 | parsed artifacts are cached by mtime and size and re-read when rewritten |
 | RC19 | done-when patterns as plain alternatives; component names from the question; project title; operator notes newer than the run; decision-test units |
+| RC20 | `--mirror` with `--roots`: the mirrored run joins the same project's lineage |
 | RC14 | live vs finished: an ETA and live core-seconds only for a fresh progress record on an unfinished run; a progress record left on a finished run, or a stale one, is interrupted; the headline number |
 
 Plus one real end-to-end check, not part of the self-test: start the server on a toy run, hit the

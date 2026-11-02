@@ -411,7 +411,7 @@ function runRow(r, sub) {
       <span>folder</span><b>${esc(r.full_label || r.label || r.name)}</b><span>path</span><b class="tail" title="${esc(r.id)}">${esc(r.id)}</b></div>` : "";
   return `<div class="runitem ${on ? "on" : ""} ${cmp ? "cmp" : ""}" data-run="${esc(r.id)}">
     <div class="top"><span class="l">${esc(runLabel(r))}</span><span class="state ${cls}">${esc(words)}</span>${r.headline_number ? `<span class="h">${esc(r.headline_number)}</span>` : ""}</div>
-    <div class="sc" title="${esc(r.signoff_note || "")}">${esc(sub)}</div>${det}</div>`;
+    <div class="sc" title="${esc(r.signoff_note || "")}">${r.mirror ? '<span class="chip">live mirror</span> ' : ""}${esc(sub)}</div>${det}</div>`;
 }
 function renderRuns() {
   const by = {}; S.runs.forEach((r) => (by[r.id] = r));
