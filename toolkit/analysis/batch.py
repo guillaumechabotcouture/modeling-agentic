@@ -769,6 +769,36 @@ def _self_test() -> int:
                f"BA12 run() computes one task per point and writes per-job rows that load_results accepts: "
                f"{b['summary']}, {probs[:2]}")
         case("BA10", b10)
+
+        def bd1():
+            ok(all("delivery" not in j["horizon"] for j in jobs0) and "delivery" not in design0["horizon"],
+               "BA-D1 a spec without objective.delivery writes no delivery key (v0.5 job hashes unchanged)")
+            sd = schema.Spec(copy.deepcopy(spec.raw), d)
+            sd.raw["objective"]["delivery"] = [0, 2]
+            dd, jd = design(sd)
+            ok(dd["horizon"].get("delivery") == [0.0, 2.0] and all(j["horizon"].get("delivery") == [0.0, 2.0] for j in jd)
+               and job_sha(jd[0]) != job_sha(jobs0[0]),
+               f"BA-D1b objective.delivery reaches the design and every job's horizon: {dd['horizon']}")
+            from toolkit.engines.contract import ToyEngine
+            seen = []
+
+            class Spy(ToyEngine):
+                def run(self, params, unit, package, horizon, seed):
+                    seen.append(getattr(horizon, "delivery", None))
+                    return super().run(params, unit, package, horizon, seed)
+            key = json.dumps(jd[0]["engine"], sort_keys=True)
+            old_e = g["_E"].get(key)
+            g["_E"][key] = Spy()
+            try:
+                run_job(jd[0])
+                run_job(jobs0[0])
+            finally:
+                if old_e is None:
+                    g["_E"].pop(key, None)
+                else:
+                    g["_E"][key] = old_e
+            ok(seen == [(0.0, 2.0), None], f"BA-D1c run_job hands the engine the delivery period (or none): {seen}")
+        case("BA-D1", bd1)
     if fails:
         print(f"FAILED: {len(fails)} self-test case(s)")
         return 1

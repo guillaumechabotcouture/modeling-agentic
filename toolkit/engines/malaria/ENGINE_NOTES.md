@@ -30,9 +30,12 @@ about 2.75 y). The optimiser's net choices follow that truncation, not the nets'
 
 **The change (a mechanism; no correction factor).**
 - **Delivery period.** The spec gains `objective.delivery: [t0, t1]`. It is optional and
-  must lie inside `objective.horizon`. It reaches engines as `Horizon.delivery`, which
-  defaults to `None` (meaning the decision window), so every horizon built without it is
-  unchanged. The analysis batch writes `delivery` into a job's horizon only when the spec
+  must lie inside `objective.horizon`. It reaches engines as the `delivery` field of a
+  `DeliveryHorizon`, a subclass of the contract's `Horizon` in `toolkit/engines/horizon.py`.
+  The harness builds a `DeliveryHorizon` only when the spec gives the field, and an engine
+  reads it as `getattr(horizon, "delivery", None)` (`None` means the decision window).
+  `contract.py` is unchanged: it is part of every engine's code fingerprint, and editing it
+  would make the compartmental engine's benchmark stamps stale as well. The analysis batch writes `delivery` into a job's horizon only when the spec
   gives it, so job hashes of existing specs do not change. An engine that honours the
   field declares `supports_delivery`; the spec validator refuses `objective.delivery` for
   an engine that does not (fail closed: another engine would ignore it silently).
@@ -83,7 +86,7 @@ reports.
 cost drivers are counted over delivery only; outcomes accumulate over the full window; a
 routine campaign acts in both the package and the comparator and is uncharged; delivery
 outside the window, a campaign outside delivery and a routine campaign inside delivery
-fail closed; equal delivery is byte-identical. Spec SP-D1–SP-D3; contract C-D1; batch
+fail closed; equal delivery is byte-identical. Spec SP-D1–SP-D3; batch
 BA-D1.
 
 ## v0.5 scope: an equilibrated starting state (written before the v0.5 pack run)

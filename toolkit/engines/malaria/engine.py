@@ -598,6 +598,7 @@ def _self_test() -> int:
     ok(rr["pfpr_all"] > rr["pfpr_lt5"],
        f"M21 forward behaviour (Sochantha 2006 age interaction): nets cut all-age prevalence less than under-5 prevalence {rr}")
     _self_test_v05(ok, e, unit)
+    _self_test_v06(ok, e, unit)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -707,6 +708,119 @@ def _self_test_v05(ok, e, unit) -> None:
            f"V8 equilibration: adult IC and ID by age stay within 5% when the burn-in is doubled, at >= 2 "
            f"transmission levels (benchmarks/equilibration.yaml): {probs[:3]}")
     case("V6", v6)
+
+
+def _self_test_v06(ok, e, unit) -> None:
+    """v0.6: a delivery period (DeliveryHorizon.delivery) distinct from the outcome window, and routine net campaigns in every
+    arm (itn_routine_interval). Without either, a run is byte-identical to v0.5 (D9; benchmarks/restamp_proof.py
+    compares the v0.5 and v0.6 code on the pack's own settings)."""
+    def case(label, fn):
+        try:
+            fn()
+        except Exception as ex:  # noqa: BLE001 -- a missing feature is a failing case, not a crash of the test
+            ok(False, f"{label} ({type(ex).__name__}: {ex})")
+
+    base = {"n_agents": 500, "burnin_years": 2}
+    season = [0.4, 0.4, 0.5, 0.7, 1.0, 1.4, 1.8, 2.0, 1.6, 1.0, 0.7, 0.5]
+    u = UnitSpec("t", dict(unit.attributes, season=season, itn_hist_years=[2015.3], campaign_year=2016.1, irs_month=4))
+    # outcome window 2016-2019, delivery 2016-2017; the same sim with the window cut to the delivery period
+    try:
+        from toolkit.engines.horizon import DeliveryHorizon
+        hd = DeliveryHorizon(2015.0, 2019.0, (2016.0, 2019.0), {"y1": [2016.0, 2017.0], "y3": [2018.0, 2019.0]},
+                     delivery=(2016.0, 2017.0))
+    except (ImportError, TypeError) as ex:
+        ok(False, f"D0-D9 a horizon carries a delivery period (toolkit/engines/horizon.py) ({ex})")
+        return
+    hw = Horizon(2015.0, 2019.0, (2016.0, 2017.0), {"y1": [2016.0, 2017.0], "y3": [2018.0, 2019.0]})
+    full = Package("full", {"net": "pyr", "smc": 1, "irs": 1, "cm": 1})
+
+    def d0():
+        ok(VERSION == "0.6" and getattr(e, "supports_delivery", False) is True
+           and "itn_routine_interval" in e.describe().unit_attributes,
+           "D0 engine v0.6 declares that it honours a delivery period and the routine-campaign attribute")
+        b = yaml.safe_load(open(os.path.join(HERE, "attribute_binding.yaml")))["attribute_binding"]
+        ok(isinstance(b.get("itn_routine_interval"), dict) and "default" in b["itn_routine_interval"],
+           "D0b the routine-campaign attribute has a declared default in attribute_binding.yaml (no routine campaign)")
+    case("D0", d0)
+
+    def d1():
+        sim, _ = e.build_sim(base, u, full, hd, 3)
+        itv = sim.interventions
+        ok(itv["smc"].years == [2016] and itv["irs"].years == [2016] and itv["cm"].stop == 2017.0
+           and itv["cm"].start == 2016.0,
+           "D1 SMC rounds, IRS rounds and the case-management add-on act only in the delivery period")
+        sim2, _ = e.build_sim(base, u, full, Horizon(2015.0, 2019.0, (2016.0, 2019.0), {}), 3)
+        ok(sim2.interventions["smc"].years == [2016, 2017, 2018] and sim2.interventions["cm"].stop is None,
+           "D1b without a delivery period they act in every year of the window, the add-on with no end (v0.5)")
+        sim.run()
+        ok(abs(sim.diseases.malaria.pars.ft - float(u.attributes["cm_ft"])) < 1e-12,
+           "D1c after the delivery period effective treatment is back at the unit's cm_ft")
+    case("D1", d1)
+
+    def d2():
+        a, = e.run_batch([base], u, [full], hd, 4)
+        b, = e.run_batch([base], u, [full], hw, 4)
+        ok(a.cost_drivers == b.cost_drivers and a.cost_drivers["smc_doses"] > 0 and a.cost_drivers["irs_sprayed"] > 0
+           and a.cost_drivers["nets_given"] > 0,
+           f"D2 cost drivers are counted over the delivery period only (equal to a run whose window is the delivery "
+           f"period): {a.cost_drivers} vs {b.cost_drivers}")
+        ok(a.per_capita["cases"]["u5"] > 2.0 * b.per_capita["cases"]["u5"] and a.windows["y1"] == b.windows["y1"],
+           "D3 health outcomes accumulate over the full outcome window (three years, not the one delivery year)")
+    case("D2", d2)
+
+    def d4():
+        ur = UnitSpec("t", dict(u.attributes, itn_routine_interval=1.0, hist_net="pbo"))
+        sim, _ = e.build_sim(base, ur, Package("none", {}), hd, 3)
+        hist = sim.interventions["itn_hist"]
+        ok(np.allclose(hist.years, [2015.3, 2017.1, 2018.1]) and hist.code == V.NET_CODE["pbo"],
+           f"D4 routine campaigns at campaign_year + k x interval inside the window, net type hist_net: {hist.years}")
+        pk = [Package("none", {}), Package("pyr", {"net": "pyr"})]
+        r_none, r_pyr = e.run_batch([base] * 2, ur, pk, hd, 5)
+        n_none, n_pyr = e.run_batch([base] * 2, UnitSpec("t", dict(u.attributes, hist_net="pbo")), pk, hd, 5)
+        ok(r_none.windows["y3"]["net_access"] > 0.3 and r_pyr.windows["y3"]["net_access"] > 0.3
+           and n_none.windows["y3"]["net_access"] < 0.25,
+           f"D5 the routine campaign acts in the package and in the comparator (access in the last year "
+           f"{r_none.windows['y3']['net_access']:.2f}, {r_pyr.windows['y3']['net_access']:.2f}; without it "
+           f"{n_none.windows['y3']['net_access']:.2f})")
+        ok(r_none.cost_drivers["nets_given"] == 0 and r_pyr.cost_drivers == n_pyr.cost_drivers,
+           "D6 routine campaigns are never charged (nets_given counts the package's campaign only)")
+    case("D4", d4)
+
+    def d7():
+        def refused(h, attrs, pkg, needle, label):
+            try:
+                e.run(base, UnitSpec("t", dict(u.attributes, **attrs)), pkg, h, 1)
+                ok(False, label)
+            except ValueError as ex:
+                ok(needle in str(ex), f"{label} ({ex})")
+        refused(DeliveryHorizon(2015.0, 2019.0, (2016.0, 2019.0), {}, delivery=(2016.0, 2019.5)), {}, Package("n", {}),
+                "delivery", "D7 a delivery period outside the outcome window fails closed")
+        refused(DeliveryHorizon(2015.0, 2019.0, (2016.0, 2019.0), {}, delivery=(2017.0, 2016.0)), {}, Package("n", {}),
+                "delivery", "D7b an empty delivery period fails closed")
+        refused(hd, {"campaign_year": 2017.5}, Package("p", {"net": "pyr"}), "campaign",
+                "D7c the package's net campaign outside the delivery period fails closed")
+        refused(hd, {"irs_years": [2018.0]}, Package("i", {"irs": 1}), "IRS",
+                "D7d an IRS round (irs_years) outside the delivery period fails closed")
+        refused(hd, {"itn_routine_interval": 0.5}, Package("n", {}), "routine",
+                "D7e a routine campaign inside the delivery period fails closed (the plan funds those years)")
+        refused(hd, {"itn_routine_interval": 0.0}, Package("n", {}), "itn_routine_interval",
+                "D7f a non-positive routine interval fails closed")
+    case("D7", d7)
+
+    def d9():
+        hz = Horizon(2015.0, 2017.0, (2016.0, 2017.0), {"pre": [2015.0, 2016.0], "post": [2016.2, 2017.0]})
+        hz_eq = DeliveryHorizon(2015.0, 2017.0, (2016.0, 2017.0), dict(hz.windows), delivery=(2016.0, 2017.0))
+        ub = UnitSpec("t", dict(unit.attributes, itn_hist_years=[2015.3], campaign_year=2016.1))
+        pk = [Package("none", {}), Package("pyr", {"net": "pyr"}), Package("dual_smc", {"net": "dual", "smc": 1}),
+              Package("cm", {"cm": 1}), Package("pbo_irs", {"net": "pbo", "irs": 1})]
+        strip = lambda o: (o.per_capita, o.windows, o.cost_drivers,  # noqa: E731
+                           {k: v for k, v in o.meta.items() if k != "seconds"})
+        for sd in (5, 6):
+            a = [strip(o) for o in e.run_batch([base] * len(pk), ub, pk, hz, sd)]
+            b = [strip(o) for o in e.run_batch([base] * len(pk), ub, pk, hz_eq, sd)]
+            ok(a == b, f"D9 (seed {sd}) an explicit delivery period equal to the window gives byte-identical outcomes, "
+                       f"cost drivers and meta for {len(pk)} packages")
+    case("D9", d9)
 
 
 def write_card(path: str) -> None:
