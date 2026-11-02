@@ -141,13 +141,14 @@ def main(argv=None) -> int:
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 1)
     ap.add_argument("--seeds", type=int, default=len(SEEDS))
     ap.add_argument("--out", default=OUT)
+    ap.add_argument("--burnin", type=int, default=None, help="test another burn-in than the card's (a sensitivity run)")
     a = ap.parse_args(argv)
     from toolkit.engines.malaria.engine import MalariaEngine, VERSION
     from toolkit.engines.contract import code_fingerprint
     from toolkit.engines.contract import resolve_params
     eng = MalariaEngine()
     P = resolve_params(eng, {})
-    B = int(round(P["burnin_years"]))
+    B = int(round(P["burnin_years"])) if a.burnin is None else int(a.burnin)
     seeds = SEEDS[:a.seeds]
     jobs = [(m0, arm, over, s) for m0 in LEVELS for arm, over in arms(B, P["init_eir_per_m0"]).items() for s in seeds]
     jobs.sort(key=lambda j: -j[2].get("burnin_years", 0))           # longest first
