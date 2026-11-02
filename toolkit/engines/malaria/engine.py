@@ -385,6 +385,11 @@ class MalariaEngine:
                     "start_state_sha256": dz.start_sha})
                 if n == len(idx) - 2:
                     snap = None                # the last member continues the original sim
+                try:
+                    dz.daily, dz.mos = {}, []
+                    s.shrink(size_limit=None, die=False)   # Starsim keeps finished sims alive: drop their people and loop
+                except Exception:  # noqa: BLE001 -- best effort; the outcomes are already computed
+                    pass
                 del s, dz
                 gc.collect()                   # Starsim sims hold reference cycles: free each member before the next
             del sim
