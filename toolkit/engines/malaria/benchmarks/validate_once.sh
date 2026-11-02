@@ -24,6 +24,6 @@ PY="${PYTHON:-python3}"
 [ -n "${JOB_OUT:-}" ] && cp "$D/results.yaml" "$JOB_OUT/"
 "$PY" -W ignore "$D/b15_mechanisms.py" --workers "$WB"
 [ -n "${JOB_OUT:-}" ] && cp "$D/b15_mechanisms.yaml" "$JOB_OUT/"
-"$PY" -W ignore "$D/runtime.py" --workers 6
+"$PY" -W ignore "$D/runtime.py" --workers "$WB"
 [ -n "${JOB_OUT:-}" ] && cp "$D/runtime.yaml" "$JOB_OUT/"
 echo "validate_once: done"
