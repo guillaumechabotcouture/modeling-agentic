@@ -782,12 +782,12 @@ class Machine:
                 j["status"] = "interrupted"
 
     # -------------------------------------------------- plumbing
-    def _go(self, to: str, why: str = "", status: str | None = None) -> str:
+    def _go(self, to: str, why: str = "", status: str | None = None, extra: dict | None = None) -> str:
         frm = self.st.state
         if to not in EDGES[frm]:
             raise RuntimeError(f"transition {frm} -> {to} is not in the state table")
         self.st.history.append({"at": _now(), "from": frm, "to": to, "why": why, "round": self.st.round,
-                                "spent_usd": round(self.st.spent_usd, 4)})
+                                "spent_usd": round(self.st.spent_usd, 4), **(extra or {})})
         self.st.state = to
         if to == "FINAL":
             self.st.status = self.st.forced_status or status or "completed_gate_error"
@@ -1081,16 +1081,48 @@ class Machine:
         self.st.engine = pick
         return self._go("CONFIGURE", f"engine {pick}")
 
+    def _write_pipeline(self) -> str | None:
+        """models/pipeline.yaml from the backend's steps (their limits from the compute budget as it is now), or why
+        it could not be written (fail closed: an unreadable budget stops the run before any compute)."""
+        import yaml
+        try:
+            steps = self.backend.pipeline_steps(os.path.join(self.run_dir, AB.SPEC_FILE), self.run_dir)
+        except Exception as e:  # noqa: BLE001
+            return f"the pipeline could not be written: {type(e).__name__}: {e}"
+        os.makedirs(os.path.join(self.run_dir, "models"), exist_ok=True)
+        with open(os.path.join(self.run_dir, "models", "pipeline.yaml"), "w") as f:
+            yaml.safe_dump({"version": 1, "steps": steps}, f, sort_keys=False)
+        return None
+
+    def reopen_interrupted_analysis(self) -> str | None:
+        """--resume of a run that ended run_failed because its analysis step timed out or was killed
+        (resumable_failure): back to ANALYZE with the pipeline rewritten, so the step's limit follows the compute
+        budget as it is now and the engine batch keeps the rows it had finished (scripts/compute.py reuses them).
+        Recorded in the history as FINAL -> ANALYZE; outside the state table on purpose, since no handler may take
+        it. Returns the cause, or None when the run is not resumable (it stays as it is)."""
+        cause = resumable_failure(self.run_dir, self.st)
+        if cause is None:
+            return None
+        err = self._write_pipeline()
+        if err:
+            self.log(f"[machine] not resumed: {err}")
+            return None
+        self.st.history.append({"at": _now(), "from": "FINAL", "to": "ANALYZE", "round": self.st.round,
+                                "why": f"resumed: the analysis step had {'timed out' if cause == 'timeout' else 'been killed'}",
+                                "resumed_from": self.st.status, "spent_usd": round(self.st.spent_usd, 4)})
+        self.st.state, self.st.status = "ANALYZE", None
+        save_state(self.run_dir, self.st)
+        self.log(f"[machine] FINAL -> ANALYZE (resumed after an analysis {cause})")
+        return cause
+
     def h_CONFIGURE(self):
         import pipeline as P
-        import yaml
         errs = self.backend.validate(os.path.join(self.run_dir, AB.SPEC_FILE))
         if errs:
             return self._go("FINAL", f"spec invalid for the engine: {'; '.join(errs)[:200]}", "run_failed")
-        os.makedirs(os.path.join(self.run_dir, "models"), exist_ok=True)
-        with open(os.path.join(self.run_dir, "models", "pipeline.yaml"), "w") as f:
-            yaml.safe_dump({"version": 1, "steps": self.backend.pipeline_steps(
-                os.path.join(self.run_dir, AB.SPEC_FILE), self.run_dir)}, f, sort_keys=False)
+        err = self._write_pipeline()
+        if err:
+            return self._go("FINAL", f"configure failed: {err}"[:300], "run_failed")
         steps, _errs = P.load(self.run_dir)
         if not any(s_.get("id") == "configure" for s_ in steps):    # workstream B: one analyze step
             return self._go("ANALYZE", "pipeline written (no separate configure step)")
@@ -1102,7 +1134,9 @@ class Machine:
     def h_ANALYZE(self):
         rep = self.rebuild(self.run_dir)
         if not rep.get("ok"):
-            return self._go("FINAL", f"analysis failed: {_rep_error(rep)}", "run_failed")
+            cause = analysis_failure_cause(rep)
+            why = f"analysis failed: {_rep_error(rep)}" + ("; resumable with --resume" if cause else "")
+            return self._go("FINAL", why, "run_failed", extra={"resumable": cause} if cause else None)
         return self._go("CRITIQUE", "analysis built")
 
     def h_CRITIQUE(self):
@@ -1286,6 +1320,50 @@ def _rep_error(rep: dict) -> str:
     return "; ".join(str(e) for e in errs)[:300]
 
 
+# A step killed by these signals was stopped from outside (out of memory, a stop); a crash (SIGSEGV...) is not.
+_KILL_SIGNALS = (9, 15, 2, 1)     # SIGKILL, SIGTERM, SIGINT, SIGHUP
+
+
+def analysis_failure_cause(rep: dict) -> str | None:
+    """'timeout' or 'killed' when the pipeline report's only failures are steps that ran out of wall-clock time
+    (scripts/pipeline.py `_run_cmd`) or died of an external signal, with the steps below them skipped; None for
+    anything else (a step that exited with an error, a crash, missing inputs, a validation error)."""
+    if not isinstance(rep, dict) or rep.get("errors"):
+        return None
+    cause = None
+    for s in rep.get("steps") or []:
+        if not isinstance(s, dict) or s.get("status") == "ok":
+            continue
+        rc, err = s.get("returncode"), str(s.get("error") or "")
+        if s.get("status") == "skipped" and err.startswith("upstream step not rebuilt"):
+            continue
+        if s.get("status") == "failed" and rc is None and err.startswith("timed out after "):
+            cause = cause or "timeout"
+        elif s.get("status") == "failed" and type(rc) is int and -rc in _KILL_SIGNALS:
+            cause = cause or "killed"
+        else:
+            return None
+    return cause
+
+
+def resumable_failure(run_dir: str, st: RunState) -> str | None:
+    """Why this run may be resumed at ANALYZE ('timeout' | 'killed'), or None: only a run that ended run_failed on
+    its ANALYZE -> FINAL transition, whose pipeline report (models/pipeline_report.json, written by the harness's
+    run) says the analysis was interrupted. Read from the report, so a run that failed before the history carried
+    the `resumable` marker is classified the same way."""
+    if st.state != "FINAL" or st.status != "run_failed" or not st.history:
+        return None
+    last = st.history[-1]
+    if not isinstance(last, dict) or last.get("from") != "ANALYZE" or last.get("to") != "FINAL":
+        return None
+    try:
+        with open(os.path.join(run_dir, "models", "pipeline_report.json")) as f:
+            rep = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return analysis_failure_cause(rep)
+
+
 def _with_abs_paths(spec: dict, run_dir: str) -> dict:
     return AB._abs_spec(spec, run_dir)
 
@@ -1370,10 +1448,13 @@ def init_run(run_dir: str, question: str, max_rounds: int = 3, signoff: str = "o
 
 
 def run_v2(question: str, run_dir: str, tasks, max_rounds: int = 3, signoff: str = "owner",
-           budget_usd: float | None = None, log=print, derive_unsandboxed: bool = False) -> str:
-    """Entry point for main.py --v2 (and the dry run). Resumes when run_state.json exists."""
+           budget_usd: float | None = None, log=print, derive_unsandboxed: bool = False, backend=None,
+           cross_engine_check: bool = True) -> str:
+    """Entry point for main.py --v2 (and the dry run). Resumes when run_state.json exists, also a run that ended
+    run_failed because its analysis step timed out or was killed (Machine.reopen_interrupted_analysis)."""
     st = init_run(run_dir, question, max_rounds, signoff, "v2", budget_usd, derive_unsandboxed=derive_unsandboxed)
-    m = Machine(run_dir, tasks, st, log=log)
+    m = Machine(run_dir, tasks, st, backend=backend, log=log, cross_engine_check=cross_engine_check)
+    m.reopen_interrupted_analysis()
     return m.run()
 
 
@@ -1924,6 +2005,13 @@ def _self_test() -> int:
         ok(any("outside_bench" in x for x in record_cited_inputs(fe)),
            "T55 an engine config path outside the run, without a file extension, is refused")
 
+        try:
+            _self_test_resume(ok, td, spike, new_run)
+        except Exception as e:  # noqa: BLE001 -- before the resume path exists this is the failure
+            import traceback
+            traceback.print_exc()
+            ok(False, f"T58-T60 analysis timeout and resume: {type(e).__name__}: {e}")
+
         # T23: a transition outside the table is refused.
         m = _SpikeMachine(os.path.join(td, "ref"), StubTasks({}), None, log=lambda *a: None)
         m.st.state = "SPEC"
@@ -1950,6 +2038,137 @@ def _self_test() -> int:
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+_TOY_BATCH_FN = '''import os
+import time
+
+
+def f(p):
+    with open(os.environ["MA_TOY_CALLS"], "a") as fh:
+        fh.write(f"{p['i']}\\n")
+    if p["i"] >= int(os.environ.get("MA_TOY_SLOW_FROM") or 99):
+        parent = os.getppid()
+        for _ in range(600):              # until the step is killed (this process is then orphaned)
+            time.sleep(0.1)
+            if os.getppid() != parent:
+                break
+    return {"v": p["i"]}
+'''
+_TOY_BATCH_DRIVER = '''import json
+import os
+import sys
+sys.path.insert(0, {scripts!r})
+import compute
+
+
+def main(rd):
+    os.makedirs(os.path.join(rd, "analysis"), exist_ok=True)
+    rows, _ = compute.run_map(rd, os.path.join(rd, "models", "toy_fn.py") + "::f", [{{"i": i}} for i in range(6)],
+                              os.path.join(rd, "analysis", "rows.jsonl"), backend="local", max_workers=1,
+                              purpose="toy batch")
+    json.dump([bool(r.get("ok")) for r in rows], open(os.path.join(rd, "analysis", "toy_rows.json"), "w"))
+    return 0 if all(r.get("ok") for r in rows) else 1
+
+
+if __name__ == "__main__":         # the local pool's spawned processes import this file again
+    sys.exit(main(sys.argv[1]))
+'''
+
+
+def _self_test_resume(ok, td: str, spike, new_run) -> None:
+    """T58-T60 (Nigeria v2 full run, 2026-11-02: ANALYZE -> FINAL run_failed when the runner's 1-h limit killed the
+    engine batch). A toy engine batch through scripts/compute.py, as a pipeline step before the spike's analysis."""
+    import yaml
+    from v2_tasks import StubTasks
+    quiet = lambda *a: None  # noqa: E731
+    drv = os.path.join(td, "toy_batch_driver.py")
+    open(drv, "w").write(_TOY_BATCH_DRIVER.format(scripts=os.path.join(REPO, "scripts")))
+
+    class Batch:
+        """The spike backend with a toy engine batch step first; `run` replaces the batch command."""
+        def __init__(self, tmo, run=None):
+            self.tmo, self.run = tmo, run
+
+        def __getattr__(self, k):
+            return getattr(spike, k)
+
+        def pipeline_steps(self, spec_path, run_dir):
+            steps = [dict(s) for s in spike.pipeline_steps(spec_path, run_dir)]
+            for s in steps:
+                if s["id"] == "analyze":
+                    s["inputs"] = s["inputs"] + ["analysis/toy_rows.json"]
+            return [{"id": "batch", "run": self.run or f"{sys.executable} {drv} {run_dir}", "inputs": [AB.SPEC_FILE],
+                     "outputs": ["analysis/toy_rows.json"], "timeout_s": self.tmo}] + steps
+
+    def toy_run(name):
+        d, T, _st = new_run(name, {})
+        os.makedirs(os.path.join(d, "models"), exist_ok=True)
+        open(os.path.join(d, "models", "toy_fn.py"), "w").write(_TOY_BATCH_FN)
+        return d, T
+
+    # T58: the batch step times out with 3 of 6 rows done: run_failed, recorded as resumable.
+    d, T = toy_run("analyze_timeout")
+    calls = os.path.join(td, "toy_calls.txt")
+    os.environ.update(MA_TOY_CALLS=calls, MA_TOY_SLOW_FROM="3")
+    try:
+        s1 = run_v2("toy question", d, T, signoff="none", log=quiet, backend=Batch(8), cross_engine_check=False)
+    finally:
+        os.environ.pop("MA_TOY_SLOW_FROM", None)
+    st = load_state(d)
+    first = open(calls).read().split() if os.path.exists(calls) else []
+    ok(s1 == "run_failed" and st.history[-1]["from"] == "ANALYZE" and st.history[-1].get("resumable") == "timeout"
+       and resumable_failure(d, st) == "timeout" and first[:3] == ["0", "1", "2"],
+       f"T58 an analysis step that times out ends run_failed, marked resumable ({s1}, {st.history[-1]}, calls {first})")
+    # T59: --resume (run_v2 on the same run) continues at ANALYZE with the step limit as the backend gives it now,
+    # and the batch computes only the rows the killed attempt had not finished.
+    s2 = run_v2("toy question", d, T, signoff="none", log=quiet, backend=Batch(120), cross_engine_check=False)
+    st = load_state(d)
+    again = open(calls).read().split()[len(first):]
+    back = [h for h in st.history if h.get("from") == "FINAL"]
+    tmo = {s["id"]: s.get("timeout_s") for s in yaml.safe_load(open(os.path.join(d, "models", "pipeline.yaml")))["steps"]}
+    ok(s2 in ("completed", "completed_scope_declared") and len(back) == 1 and back[0]["to"] == "ANALYZE"
+       and back[0].get("resumed_from") == "run_failed" and tmo["batch"] == 120,
+       f"T59 --resume reopens the run at ANALYZE, rewrites the step limits and finishes ({s2}, {back}, {tmo})")
+    ok(sorted(again) == ["3", "4", "5"],
+       f"T59b the resumed batch reuses the rows the killed attempt kept and computes the rest only ({again})")
+    ok(run_v2("toy question", d, T, signoff="none", log=quiet, backend=Batch(120), cross_engine_check=False) == s2
+       and len([h for h in load_state(d).history if h.get("from") == "FINAL"]) == 1,
+       "T59c a finished run is not reopened")
+    # T60: other run_failed causes stay terminal.
+    d, T = toy_run("analyze_error")
+    open(os.path.join(td, "toy_fail.py"), "w").write("import sys\nsys.exit(3)\n")
+    fail = Batch(30, run=f"{sys.executable} {os.path.join(td, 'toy_fail.py')}")
+    s1 = run_v2("toy question", d, T, signoff="none", log=quiet, backend=fail, cross_engine_check=False)
+    n = len(load_state(d).history)
+    s2 = run_v2("toy question", d, T, signoff="none", log=quiet, backend=fail, cross_engine_check=False)
+    st = load_state(d)
+    ok(s1 == s2 == "run_failed" and len(st.history) == n and st.history[-1]["from"] == "ANALYZE"
+       and "resumable" not in st.history[-1]
+       and resumable_failure(d, st) is None,
+       f"T60 an analysis step that fails on its own stays run_failed on resume ({s1}, {s2}, {st.history[-1]})")
+    rep = {"ok": False, "errors": [], "steps": [{"id": "analyze", "status": "failed", "returncode": 1, "error": ""}]}
+    causes = [analysis_failure_cause(dict(rep, steps=[dict(rep["steps"][0], returncode=rc, error=e)]))
+              for rc, e in ((-9, ""), (-15, ""), (-11, ""), (1, "boom"), (None, "OSError: no such file"))]
+    ok(causes == ["killed", "killed", None, None, None],
+       f"T60b killed by SIGKILL/SIGTERM is resumable; a crash, an error exit or a failed start is not ({causes})")
+    st_spec = RunState(question="q", state="FINAL", status="run_failed",
+                       history=[{"from": "SPEC", "to": "FINAL", "why": "the spec did not validate"}])
+    os.makedirs(os.path.join(d, "models"), exist_ok=True)
+    json.dump(dict(rep, steps=[dict(rep["steps"][0], returncode=None, error="timed out after 9s (process group killed)")]),
+              open(os.path.join(d, "models", "pipeline_report.json"), "w"))
+    ok(resumable_failure(d, st_spec) is None and resumable_failure(d, RunState(
+        question="q", state="FINAL", status="completed", history=[{"from": "ANALYZE", "to": "FINAL"}])) is None,
+       "T60c a run_failed outside ANALYZE, or another status, is not resumable whatever the report says")
+
+    class Unreadable(Batch):
+        def pipeline_steps(self, spec_path, run_dir):
+            raise ValueError("MA_COMPUTE_MAX_CORE_HOURS='lots' is not a number")
+    d, T = toy_run("configure_unreadable")
+    s1 = run_v2("toy question", d, T, signoff="none", log=quiet, backend=Unreadable(30), cross_engine_check=False)
+    st = load_state(d)
+    ok(s1 == "run_failed" and st.history[-1]["from"] == "CONFIGURE" and "MA_COMPUTE_MAX_CORE_HOURS" in st.history[-1]["why"],
+       f"T60d an unreadable compute budget fails the run at CONFIGURE (fail closed): {st.history[-1]}")
 
 
 def _self_test_derived(ok, td: str) -> None:

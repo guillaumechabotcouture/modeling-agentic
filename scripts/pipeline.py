@@ -105,6 +105,7 @@ STEP_KEYS = {"id", "run", "inputs", "outputs", "purpose", "timeout_s", "inputs_j
 COMPUTE_KEYS = {"inputs_jsonl", "out"}
 TOP_KEYS = {"steps", "version"}
 DEFAULT_TIMEOUT_S = 3600
+KILL_GRACE_S = 10           # after a timeout kill: how long to wait for the step's pipes to close
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 _GLOB = re.compile(r"[*?\[]")
 
@@ -695,7 +696,17 @@ def _run_cmd(cmd, cwd, timeout_s, env, shell=False):
             os.killpg(p.pid, signal.SIGKILL)
         except OSError:
             pass
-        p.communicate()
+        # A process that left the group (a compute pool process makes its own) can keep the step's pipes open:
+        # do not wait for their end-of-file past a short grace (a plain communicate() hung the runner for good).
+        try:
+            p.communicate(timeout=KILL_GRACE_S)
+        except subprocess.TimeoutExpired:
+            for fh in (p.stdout, p.stderr):
+                try:
+                    fh.close()
+                except OSError:
+                    pass
+            p.wait()
         return None, f"timed out after {timeout_s:.0f}s (process group killed)"
 
 
@@ -1909,6 +1920,20 @@ def _self_test() -> int:
         spec(d, [dict(three[0], timeout_s=1)] + three[1:])
         rep = run(d)
         ok(rep["steps"][0]["returncode"] is None and time.time() - t1 < 15, f"PL15 a timed-out step is killed: {rep['steps']}")
+        # PL15b (v2 analyze timeout, 2026-11-02): a process that left the step's group (as compute.py's pool
+        # processes do) and keeps its pipes open must not hang the runner after the kill.
+        w(d, "models/a.py", "import subprocess, sys, time\n"
+                            "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'], start_new_session=True)\n"
+                            "open('models/a.pid', 'w').write(str(c.pid))\ntime.sleep(30)\n")
+        t1 = time.time()
+        rep = run(d)
+        took = time.time() - t1
+        try:
+            os.kill(int(open(os.path.join(d, "models", "a.pid")).read()), signal.SIGKILL)
+        except (OSError, ValueError):
+            pass
+        ok(rep["steps"][0]["returncode"] is None and took < 1 + KILL_GRACE_S + 10,
+           f"PL15b a timed-out step whose escaped child holds its pipes ends within the grace ({took:.0f}s)")
         ok("AZURE_CLIENT_SECRET" not in script_env({"AZURE_CLIENT_SECRET": "s", "HOME": "/h"}),
            "PL16 steps run without cloud credentials")
         # Scratch mode: runs in a copy; the run dir is untouched.
