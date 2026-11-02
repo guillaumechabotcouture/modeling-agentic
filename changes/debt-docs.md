@@ -1,0 +1,8 @@
+---
+phase: "v2 debt"
+commit: "A α–β"
+---
+
+## Changelog
+
+**Docs describe v2 as it is, and one discovery rule finds every self-test for CLAUDE.md and CI.** `scripts/self_tests.py` lists every tracked module under `scripts/`, `toolkit/` and `cloud/`, `main.py` and the v2 harness modules named in it (`agents/stage_machine.py`, `findings_ledger.py`, `fix_loop.py`, `analysis_backend.py`, `v2_sdk_tasks.py`, and now `output_caps.py`), runs each `--self-test`, and fails when a module in that scope has none and no `EXEMPT` entry giving the reason (13 files and `cloud/configs/` are exempt today, each with its reason; `--list` prints them). CI's self-test step calls it instead of a shell loop that skipped any file without the flag; apart from `agents/output_caps.py`, the files it runs are the ones the old loop ran. CLAUDE.md's hand-kept list of 81 files (38 other files with a self-test were missing from it) is replaced by the command. CLAUDE.md now describes both pipelines (v1's lead stages and v2's stage machine states from `agents/stage_machine.py`), adds the toolkit and cloud layers, counts 58 skills (it said 57; README and the skills index said 56), adds the v2 `paused:awaiting_signoff` / `paused:awaiting_scope_signoff` statuses (exit 2) to the run-outcome table, and lists every credential prefix `filtered_env` blanks. README gains a v2 section (states, bounded tasks, engines, design notes), Coiled as the current cloud path with Azure Batch marked legacy, the full CLI flag table, and the v2 files in the layout. The status lines of `docs/design/stage-machine.md` and `docs/design/v2c-orchestration.md` now say where each was merged (PR #37; PR #90) instead of "for review". No code path changes.
