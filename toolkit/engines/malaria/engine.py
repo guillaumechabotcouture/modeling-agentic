@@ -334,7 +334,7 @@ class MalariaEngine:
         `packages` one Package or one per pair. Pairs whose burn-in inputs agree (the unit and every parameter outside
         POST_FORK) share one burn-in and one history up to the earliest component event of any of them; each pair is
         then continued from an exact copy. Each pair's outcomes equal run() of that pair (self-test V4)."""
-        import copy
+        import pickle
         B = len(param_sets)
         units = list(unit) if isinstance(unit, (list, tuple)) else [unit] * B
         pkgs = list(packages) if isinstance(packages, (list, tuple)) else [packages] * B
@@ -359,10 +359,13 @@ class MalariaEngine:
             ti_f = int(np.argmin(np.abs(yv - tf)))          # the same nearest-step rule as the components' events
             if ti_f >= 1:
                 sim.run(until=yv[ti_f - 1])
+            # one snapshot, restored per member (faster than copy.deepcopy of a Starsim sim); the last member continues
+            # the original
+            snap = pickle.dumps(sim, protocol=pickle.HIGHEST_PROTOCOL) if len(idx) > 1 else None
             shared = (time.time() - t0) / len(idx)
             for n, i in enumerate(idx):
                 t1 = time.time()
-                s = sim if n == len(idx) - 1 else copy.deepcopy(sim)
+                s = sim if n == len(idx) - 1 else pickle.loads(snap)
                 P, a, cfg = mem[i]
                 self._configure(s.interventions, s.diseases.malaria, P, cfg)
                 s.run()
