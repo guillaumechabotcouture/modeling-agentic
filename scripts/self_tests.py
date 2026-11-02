@@ -49,6 +49,7 @@ EXEMPT = {
     "toolkit/engines/malaria/model.py": "engine module; exercised by toolkit/engines/malaria/engine.py --self-test",
     "toolkit/engines/compartmental/benchmarks/runtime_spike.py": "one-off timing script for the dev VM",
     "toolkit/engines/malaria/benchmarks/b15_mechanisms.py": "diagnostic scan script, not a library",
+    "toolkit/engines/malaria/benchmarks/runtime.py": "timing and peak-memory measurement script for a VM, not a library",
 }
 MARKER = "--self-test"
 
