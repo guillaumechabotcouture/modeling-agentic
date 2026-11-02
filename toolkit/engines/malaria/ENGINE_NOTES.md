@@ -19,6 +19,87 @@ Both proofs ran on the pack's settings and the evidence cases (`benchmarks/resta
 Each file's `restamped:` record holds the v0.7 re-stamp, with the v0.6 record under `previous`. A Coiled run of
 `validate_once.sh` is open until it confirms them.
 
+## v0.8 scope: the figure hooks, schedule() and run_series() (written before the v0.8 code)
+
+**The problem.** The v2 figure set (`docs/design/v2-figures.md` §5, PR #127) has two figures the
+harness cannot draw from stored results: a per-region timeline of what is delivered when, and
+monthly trajectories of the calibration metric and incidence for the comparator and the plan.
+PR #127 defines two optional engine hooks for them in `toolkit/engines/hooks.py`; `contract.py` is
+unchanged. v0.8 implements both hooks in the malaria engine, exactly to that interface, and
+changes nothing that `run` and `run_batch` return.
+
+**Hook 1: `schedule(params, unit, package, horizon) -> list[dict]`.**
+- One dict per delivery event, `{component, label, kind, t0, t1, charged}`, over
+  `[horizon.start, window end)`. `charged` is true exactly when `kind` is `decision`.
+- `history`: the unit's past net campaigns (`itn_hist_years`, net type `hist_net`).
+- `decision`: the package's events in the delivery period: the net campaign
+  (`campaign_year`), each SMC round, each IRS round, and the case-management add-on as a period
+  (`t0` the delivery start, `t1` its end; the window end when there is no delivery period, where
+  the add-on has no end).
+- `routine`: routine net campaigns (`itn_routine_interval`) and routine SMC rounds
+  (`smc_routine`), in every arm.
+- Point events (campaigns and rounds) have `t1 = None`. Events the sim would run outside
+  `[horizon.start, window end)` are not listed: a past campaign before `horizon.start` acts in the
+  burn-in, and a round after the window's end has no outcome counted.
+- **One source.** The schedule logic now lives in one pure function, `delivery_plan(a,
+  components, horizon)`. It returns the package's component settings, the history, routine and
+  add-on timings, and the event list. `_plan` (the package's settings for the sim) and
+  `_base_sim` (the history and routine interventions and the add-on period) both read it, and
+  `schedule()` returns its event list. There is no second copy of the schedule rules.
+  `delivery_plan` makes every check `_plan` made before (fail closed), in the same order.
+- **Pure.** No sim is built and no random number is drawn. A self-test runs `schedule()` with
+  `starsim.Sim` replaced by a function that raises, and checks that numpy's global random state
+  and the unit's attributes are unchanged.
+
+**Hook 2: `outputs["series"]` and `run_series(params, unit, packages, horizon, seed, metrics, step="month")`.**
+- The card declares `outputs["series"]`: `pfpr_u5` (under-5 microscopy prevalence, 6-59
+  months: the calibration metric, the same definition as the window metric `pfpr_u5`; aggregate
+  `mean`, units share), `pfpr_2_10` and `pfpr_all` (`mean`, share), `inc_all` (all-age clinical
+  incidence; aggregate `rate`, episodes per person-year) and `inc_u5` (under-5 clinical
+  incidence, `rate`, episodes per child-year).
+- It returns one dict per package, in order: `{"package": id, "t": [...], "values": {metric:
+  [...]}}`. Steps start at `horizon.start + k/12` and run up to the window's end; the last step
+  ends at the window's end.
+- **How it is recorded.** The model already records each of these quantities every day
+  (`Malaria.daily`, the records the named windows read). `run_series` reads those records after
+  each member's run, before they are freed. No analyzer is added and the sim is not changed. A
+  `mean` value is the mean of the step's daily values. A `rate` value is the step's sum of daily
+  episodes per person, divided by the step's length in years.
+- **Consistency with the window metrics.** A window whose bounds lie on the step grid selects the
+  same days as its steps. So its `pfpr_u5` equals the day-weighted mean of the steps' values, and
+  its `inc_u5` / `inc_all` (episodes per person over the window) equal the sum of rate x step
+  length. A self-test checks both to 1e-9.
+- **Shared history.** `run_batch`'s member loop moves into one internal function. `run_batch`
+  and `run_series` both call it, so `run_series` gets the same shared burn-in, history and fork
+  (common random numbers) as `run_batch`. Its packages are therefore identical before the first
+  component event.
+
+**Byte identity.** `run` and `run_batch` build, configure and run the same sims as v0.7, and
+return the same outcomes. The new card output and the code change the engine identity
+(`config_sha256`, `code_sha256`, version 0.8). As for v0.6 (#123) and v0.7 (#126):
+- `benchmarks/restamp_proof.py prove --old-ref origin/v2` compares v0.7 and v0.8 on the pack's
+  settings and the evidence cases. It runs on a Coiled VM in the IDM default workspace, not on
+  the laptop.
+- The stored evidence is re-stamped with `restamp` only when all 19 cases are identical.
+- Self-test S7 checks, on a toy unit with history, decision and routine events, that recording
+  the series does not change the outcomes: the member loop run by `run_series` returns outcomes
+  byte-identical to `run_batch`'s. The v0.7-to-v0.8 comparison itself is the proof above, since
+  a self-test cannot hold the v0.7 code.
+
+**Tests written first (α).** Engine S0–S8:
+- S0: version 0.8, and `hooks.supports` is true for both hooks.
+- S1: `schedule()` for a toy unit with past, decision and routine nets, package and routine SMC,
+  IRS and the add-on equals the event list of the sim the engine builds (its interventions'
+  years, rounds and add-on period). The comparator arm has no decision event.
+- S2: `schedule()` is pure.
+- S3: #127's checker (`hooks.schedule`) accepts every arm's schedule.
+- S4: `run_series` shape and units: one entry per package in order, monthly steps over
+  `[horizon.start, window end)`, the card's labels, units and aggregates.
+- S5: the series averaged over a window equal the window metrics.
+- S6: the packages' series are identical before the fork, and differ after it.
+- S7: `run_batch` is unchanged by series recording.
+- S8: `hooks.run_series` refuses a metric the card does not list.
+
 ## v0.7 scope: routine SMC in every arm after the delivery period (written before the v0.7 code)
 
 **The problem.** v0.6 split the delivery period (`objective.delivery`) from the outcome window
