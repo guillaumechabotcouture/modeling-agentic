@@ -35,7 +35,7 @@ REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 # Phase 42 ε: toolkit/ too; run model code imports it, so it is read-only and hashed like scripts/.
 HARNESS_DIRS = ("scripts", "agents", ".claude", "toolkit")
 HARNESS_FILES = ("main.py", "CLAUDE.md", "CHANGELOG.md", "requirements.txt",
-                 "requirements-cloud.txt")
+                 "requirements-cloud.txt", "requirements-agent.txt")   # the last: PR #116 (absent until it merges: skipped when hashed)
 # Phase 31: the lessons ledger records expert findings about the agents' own
 # work, so agents may not edit it. Read-only but not hashed: observations are
 # appended while runs are live.

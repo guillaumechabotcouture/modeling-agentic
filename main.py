@@ -1611,6 +1611,9 @@ def _run_self_test() -> int:
             f.write("x = 2\n")
         d = enforcement.diff_harness(before, enforcement.hash_harness(td))
         ok(d["modified"] == ["scripts/a.py"], f"T1 modification missed: {d}")
+        ok(enforcement.is_harness_path(os.path.join(enforcement.REPO_ROOT, "requirements-agent.txt"))
+           and "requirements-agent.txt" not in enforcement.hash_harness(td),
+           "T1b requirements-agent.txt (PR #116) is a harness file; absent, the hash skips it (no false tamper)")
 
     # G1: final gate parses validator JSON, handles missing critiques and errors
     with tempfile.TemporaryDirectory() as td:
