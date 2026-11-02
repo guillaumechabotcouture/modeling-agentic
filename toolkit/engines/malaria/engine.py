@@ -734,6 +734,7 @@ def _self_test() -> int:
     _self_test_v05(ok, e, unit)
     _self_test_v06(ok, e, unit)
     _self_test_v07(ok, e, unit)
+    _self_test_v08(ok, e, unit)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -984,7 +985,7 @@ def _self_test_v07(ok, e, unit) -> None:
     full = Package("full", {"net": "pyr", "smc": 1, "irs": 1, "cm": 1})
 
     def r0():
-        ok(VERSION == "0.7" and "smc_routine" in e.describe().unit_attributes,
+        ok(tuple(int(x) for x in VERSION.split(".")) >= (0, 7) and "smc_routine" in e.describe().unit_attributes,
            "R0 engine v0.7 declares the routine-SMC unit attribute on its card")
         b = yaml.safe_load(open(os.path.join(HERE, "attribute_binding.yaml")))["attribute_binding"]
         ok(isinstance(b.get("smc_routine"), dict) and str(b["smc_routine"].get("default")) == "0",
@@ -1073,6 +1074,182 @@ def _self_test_v07(ok, e, unit) -> None:
                        f"attribute absent for {len(pk)} packages")
     case("R7", r7)
 
+
+
+def _self_test_v08(ok, e, unit) -> None:
+    """v0.8: the figure hooks of toolkit/engines/hooks.py (#127). schedule() is pure and comes from the code that
+    configures the sim (delivery_plan); run_series() reads the model's daily records through run_batch's member loop,
+    so run / run_batch are unchanged (S7; benchmarks/restamp_proof.py compares the v0.7 and v0.8 code)."""
+    def case(label, fn):
+        try:
+            fn()
+        except Exception as ex:  # noqa: BLE001 -- a missing feature is a failing case, not a crash of the test
+            ok(False, f"{label} ({type(ex).__name__}: {ex})")
+
+    import copy
+    from toolkit.engines import hooks as HK
+    from toolkit.engines.horizon import DeliveryHorizon
+    base = {"n_agents": 500, "burnin_years": 2}
+    season = [0.4, 0.4, 0.5, 0.7, 1.0, 1.4, 1.8, 2.0, 1.6, 1.0, 0.7, 0.5]
+    wins = {"y1": [2016.0, 2017.0], "y3": [2018.0, 2019.0], "all": [2015.0, 2019.0]}
+    # past campaigns before (burn-in) and inside the covered range; routine nets 2017.1, 2018.1; routine SMC 2017-18
+    attrs = dict(unit.attributes, season=season, itn_hist_years=[2014.5, 2015.3], campaign_year=2016.1, irs_month=4,
+                 itn_routine_interval=1.0, smc_routine=1)
+    u = UnitSpec("t", attrs)
+    hd = DeliveryHorizon(2015.0, 2019.0, (2016.0, 2019.0), dict(wins), delivery=(2016.0, 2017.0))
+    none, full = Package("none", {}), Package("full", {"net": "pyr", "smc": 1, "irs": 1, "cm": 1})
+    smc_only = Package("smc", {"smc": 1})
+    metrics = ["pfpr_u5", "inc_all", "inc_u5"]
+
+    def s0():
+        ok(tuple(int(x) for x in VERSION.split(".")) >= (0, 8) and HK.supports(e, "schedule")
+           and HK.supports(e, "series"), "S0 engine v0.8 offers both figure hooks (hooks.supports)")
+    case("S0", s0)
+
+    def s1():
+        key = lambda ev: (ev["component"], ev["kind"], round(float(ev["t0"]), 9),  # noqa: E731
+                          None if ev["t1"] is None else round(float(ev["t1"]), 9))
+        w1, st = float(hd.window[1]), float(hd.start)
+        cov = lambda ts: sorted(round(float(t), 9) for t in ts if st <= float(t) < w1)  # noqa: E731
+        for pkg in (none, full, smc_only):
+            ev = e.schedule(base, u, pkg, hd)
+            sim, _ = e.build_sim(base, u, pkg, hd, 3)
+            sim.init()
+            itv = sim.interventions
+            nets = cov(itv["itn_hist"].years)
+            got = sorted(round(x["t0"], 9) for x in ev if x["component"] == "net" and x["kind"] != "decision")
+            hist = sorted(round(x["t0"], 9) for x in ev if x["component"] == "net" and x["kind"] == "history")
+            rout = sorted(round(x["t0"], 9) for x in ev if x["component"] == "net" and x["kind"] == "routine")
+            ok(got == nets and hist == [2015.3] and np.allclose(rout, [2017.1, 2018.1]),
+               f"S1 ({pkg.id}) past and routine net campaigns equal the sim's: {got} vs {nets}")
+            want = {("net", "decision", t, None) for t in cov(itv["itn_new"].years)}
+            want |= {("smc", "decision", t, None) for t in cov(itv["smc"].targets())}
+            want |= {("irs", "decision", t, None) for t in cov(y + (itv["irs"].month - 1) / 12 for y in itv["irs"].years)}
+            want |= {("smc", "routine", t, None) for t in cov(itv["smc_routine"].targets())}
+            if itv["cm"].add > 0:
+                want.add(("cm", "decision", round(itv["cm"].start, 9),
+                          round(itv["cm"].stop if itv["cm"].stop is not None else w1, 9)))
+            have = {key(x) for x in ev if not (x["component"] == "net" and x["kind"] != "decision")}
+            ok(have == want and len(have) == len([x for x in ev if not (x["component"] == "net"
+                                                                       and x["kind"] != "decision")])
+               and all(x["charged"] == (x["kind"] == "decision") for x in ev),
+               f"S1b ({pkg.id}) decision and routine SMC / IRS / net / add-on events equal the sim's "
+               f"({len(have)} vs {len(want)}; differing: {sorted(have ^ want, key=str)[:4]})")
+        evn = e.schedule(base, u, none, hd)
+        evf = e.schedule(base, u, full, hd)
+        ok(not [x for x in evn if x["kind"] == "decision"]
+           and {x["component"] for x in evf if x["kind"] == "decision"} == {"net", "smc", "irs", "cm"}
+           and [x for x in evn if x["kind"] != "decision"] == [x for x in evf if x["kind"] != "decision"],
+           "S1c the comparator has no decision event; every arm has the same history and routine events")
+    case("S1", s1)
+
+    def s2():
+        import starsim as ss
+        ua = UnitSpec("t", copy.deepcopy(attrs))
+        before, st0 = copy.deepcopy(ua.attributes), np.random.get_state()
+        real = ss.Sim
+
+        def no_sim(*a, **k):
+            raise AssertionError("schedule() built a sim")
+        ss.Sim = no_sim
+        try:
+            a1 = e.schedule(base, ua, full, hd)
+            a2 = e.schedule(base, ua, full, hd)
+        finally:
+            ss.Sim = real
+        st1 = np.random.get_state()
+        ok(a1 == a2 and ua.attributes == before and st0[0] == st1[0] and np.array_equal(st0[1], st1[1])
+           and st0[2:] == st1[2:], "S2 schedule() is pure: no sim, no random draw, the unit unchanged, same answer")
+    case("S2", s2)
+
+    def s3():
+        hw = Horizon(2015.0, 2019.0, (2016.0, 2019.0), dict(wins))
+        uw = UnitSpec("t", {k: v for k, v in attrs.items() if k not in ("smc_routine", "itn_routine_interval")})
+        for pkg in (none, full, smc_only):
+            for h, uu, nm in ((hd, u, "delivery"), (hw, uw, "window")):
+                s = HK.schedule(e, base, uu, pkg, h)
+                ok(all(float(h.start) <= x["t0"] < float(h.window[1]) for x in s),
+                   f"S3 ({pkg.id}, {nm}) #127's checker accepts the schedule ({len(s)} events in "
+                   "[horizon.start, window end))")
+        try:
+            e.schedule(base, UnitSpec("t", dict(attrs, campaign_year=2017.5)), full, hd)
+            ok(False, "S3b a campaign outside the delivery period fails closed in schedule() as in the sim")
+        except ValueError as ex:
+            ok("delivery period" in str(ex), f"S3b a campaign outside the delivery period fails closed in schedule() "
+                                             f"as in the sim ({ex})")
+    case("S3", s3)
+
+    def s4():
+        card = e.describe().outputs.get("series") or {}
+        ok(card.get("pfpr_u5", {}).get("aggregate") == "mean" and card.get("inc_all", {}).get("aggregate") == "rate"
+           and card.get("inc_u5", {}).get("aggregate") == "rate" and "year" in card.get("inc_all", {}).get("units", "")
+           and "year" in card.get("inc_u5", {}).get("units", "")
+           and all(str(v.get("label") or "").strip() for v in card.values()),
+           f"S4 the card declares the series: under-5 prevalence (mean), all-age and under-5 incidence (rate per "
+           f"person-year): {card}")
+        r = HK.run_series(e, base, u, [full, none], hd, 5, metrics)
+        t = r[0]["t"]
+        ok([x["package"] for x in r] == ["full", "none"] and len(t) == 48 and abs(t[0] - 2015.0) < 1e-12
+           and np.allclose(np.diff(t), 1 / 12) and t[-1] < 2019.0,
+           f"S4b one entry per package in order, monthly steps over [horizon.start, window end): {len(t)} steps")
+        v = r[1]["values"]
+        ok(all(0.0 <= x <= 1.0 for x in v["pfpr_u5"]) and all(x >= 0 for x in v["inc_all"] + v["inc_u5"])
+           and 0.05 < float(np.mean(v["inc_all"])) < 20,
+           f"S4c prevalence is a share and incidence episodes per person-year (comparator mean all-age "
+           f"{float(np.mean(v['inc_all'])):.2f})")
+    case("S4", s4)
+
+    def s5():
+        outs, ser = e._run_members([base] * 2, [u] * 2, [none, full], hd, 5, series=metrics)
+        pub = e.run_series(base, u, [none, full], hd, 5, metrics)
+        ok([s["values"] for s in ser] == [p["values"] for p in pub] and [s["t"] for s in ser] == [p["t"] for p in pub],
+           "S5 run_series returns the member loop's series")
+        for o, s, pb in zip(outs, ser, pub):
+            t, n = np.asarray(s["t"]), np.asarray(s["days"], float)
+            ends = np.append(t[1:], float(hd.window[1]))
+            for w, (a, b) in wins.items():
+                m = (t >= a - 1e-9) & (t < b - 1e-9)
+                p = float((np.asarray(s["values"]["pfpr_u5"])[m] * n[m]).sum() / n[m].sum())
+                i5 = float((np.asarray(s["values"]["inc_u5"])[m] * (ends - t)[m]).sum())
+                ia = float((np.asarray(s["values"]["inc_all"])[m] * (ends - t)[m]).sum())
+                W = o.windows[w]
+                ok(abs(p - W["pfpr_u5"]) < 1e-9 and abs(i5 - W["inc_u5"]) < 1e-9 * max(1, W["inc_u5"])
+                   and abs(ia - W["inc_all"]) < 1e-9 * max(1, W["inc_all"]),
+                   f"S5b ({s['package']}, {w}) the series over the window equal the window metrics: pfpr_u5 "
+                   f"{p:.6f} vs {W['pfpr_u5']:.6f}, inc_u5 {i5:.6f} vs {W['inc_u5']:.6f}, inc_all {ia:.6f} vs "
+                   f"{W['inc_all']:.6f}")
+                pm = float(np.mean(np.asarray(pb["values"]["pfpr_u5"])[m]))
+                ok(abs(pm - W["pfpr_u5"]) <= 0.02 * max(W["pfpr_u5"], 1e-3),
+                   f"S5c ({s['package']}, {w}) the plain mean of the public monthly prevalence is within 2% of the "
+                   f"window metric ({pm:.4f} vs {W['pfpr_u5']:.4f})")
+    case("S5", s5)
+
+    def s6():
+        a, b = e.run_series(base, u, [none, full], hd, 6, metrics)
+        t = np.asarray(a["t"])
+        pre = t < 2016.0 - 1e-9
+        ok(all(np.array_equal(np.asarray(a["values"][m])[pre], np.asarray(b["values"][m])[pre]) for m in metrics)
+           and any(not np.array_equal(np.asarray(a["values"][m])[~pre], np.asarray(b["values"][m])[~pre])
+                   for m in metrics),
+           "S6 packages share their history: identical series before the first component event, different after")
+    case("S6", s6)
+
+    def s7():
+        strip = lambda o: (o.per_capita, o.windows, o.cost_drivers,  # noqa: E731
+                           {k: v for k, v in o.meta.items() if k != "seconds"})
+        pk = [none, full, smc_only]
+        a = [strip(o) for o in e.run_batch([base] * 3, u, pk, hd, 7)]
+        outs, _ = e._run_members([base] * 3, [u] * 3, pk, hd, 7, series=metrics)
+        ok(a == [strip(o) for o in outs], "S7 recording the series leaves the outcomes byte-identical to run_batch's")
+    case("S7", s7)
+
+    def s8():
+        try:
+            HK.run_series(e, base, u, [none], hd, 1, ["no_such_metric"])
+            ok(False, "S8 a metric the card does not list is refused")
+        except HK.HookInvalid as ex:
+            ok("not in the card" in str(ex), f"S8 a metric the card does not list is refused ({ex})")
+    case("S8", s8)
 
 def write_card(path: str) -> None:
     """Engine card (describe() plus every parameter with its kind, range and source) as YAML."""
