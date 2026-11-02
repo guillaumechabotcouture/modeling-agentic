@@ -1,12 +1,19 @@
-# Malaria engine v0.5: benchmark notes
+# Malaria engine v0.6: benchmark notes
 
-Engine `malaria-starsim` v0.5 (workstream A of architecture v2). Design note:
+Engine `malaria-starsim` v0.6 (workstream A of architecture v2). Design note:
 `docs/design/v2a-malaria-engine.md`. Every number in the tables block is rendered from
 `benchmarks/results.yaml`, `benchmarks/fitted.yaml`, `benchmarks/b15_mechanisms.yaml`,
 `benchmarks/equilibration.yaml` and `benchmarks/runtime.yaml`, with the spike
 (`history/results_v0.1-spike.yaml`) and the earlier rounds (`history/results_v0.2.yaml`,
 `results_v0.3-r2.yaml`, `results_v0.3.yaml`, `results_v0.4.yaml`) beside them, by
 `benchmarks/render_notes.py`. Reproduce with `bash toolkit/engines/malaria/benchmarks/validate_once.sh` on a VM.
+
+**v0.6 numbers are v0.5's.** The v0.6 changes act only when a horizon gives a delivery period or a unit sets
+`itn_routine_interval`, and the pack and the evidence use neither. The pack's results, fit, equilibration and
+guess-sensitivity files therefore keep the numbers v0.5 computed. Their identity fields were re-stamped after
+`benchmarks/restamp_proof.py` found v0.5 and v0.6 outputs identical on the pack's settings and the evidence cases
+(`benchmarks/restamp_proof.yaml`; each file records `restamped:`). A Coiled run of `validate_once.sh` is open until it
+confirms them.
 
 ## v0.6 scope: a delivery period distinct from the outcome window (written before the v0.6 code)
 
