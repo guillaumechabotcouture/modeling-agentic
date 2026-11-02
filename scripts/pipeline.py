@@ -1497,21 +1497,29 @@ def derive(run_dir: str, unsandboxed_ok: bool = False, limits: dict | None = Non
     if errs:
         rep.update(ok=False, problems=[{"code": "derivation_failed", "id": None, "claim": e} for e in errs])
         return rep
-    kind = sandbox_kind()
-    if kind is None and not unsandboxed_ok:
+    kind = found = sandbox_kind()
+    old = load_record(run_dir)["derivations"]
+
+    def current(d):
+        """Up to date: recorded ok, nothing changed, and made in a sandbox (an unsandboxed record is re-made
+        wherever a sandbox exists). A current derivation needs no sandbox: a resumed run on a machine without one
+        only checks the hashes."""
+        e = old.get(d["id"])
+        rk = ((e or {}).get("sandbox") or {}).get("kind")
+        return (isinstance(e, dict) and e.get("ok") and _current(d, e, run_dir) is None
+                and (rk != "none" or found is None))
+    if kind is None and not unsandboxed_ok and not all(current(d) for d in ders):
         rep.update(ok=False, problems=[{"code": "derivation_unsandboxed", "id": None, "claim":
                    f"no sandbox on this machine ({sys.platform}): derivations run only in Linux namespaces (bubblewrap). "
                    "The development flag runs them unsandboxed, and a run that uses it cannot be accepted"}])
         return rep
     kind = kind or "none"
-    old = load_record(run_dir)["derivations"]
     prov = _prov_inputs(run_dir)
     entries, bad_outputs = {}, set()
     for d in ders:
         sid = d["id"]
         e = old.get(sid)
-        if isinstance(e, dict) and e.get("ok") and _current(d, e, run_dir) is None \
-                and (e.get("sandbox") or {}).get("kind") == kind:
+        if current(d):
             entries[sid] = e
             rep["up_to_date"].append(sid)
             continue
@@ -2524,6 +2532,25 @@ def _self_test_derivations(ok) -> None:
                     f"DI6 editing {what} gives derivation_stale and re-running clears it: {got} -> {after}")
         except Exception as e:  # noqa: BLE001
             rep(False, f"DI6 staleness: {type(e).__name__}: {e}")
+    with tempfile.TemporaryDirectory() as d:          # DI6e: a resume past SIGN on a machine without a sandbox
+        d = os.path.realpath(di_fixture(d))
+        try:
+            derive(d, unsandboxed_ok=flag)
+            rp = os.path.join(d, DERIVATIONS_RECORD)
+            rec = json.load(open(rp))
+            rec["derivations"]["units"]["sandbox"]["kind"] = "bwrap"      # as if made on the VM
+            json.dump(rec, open(rp, "w"))
+            saved = list(_SANDBOX)
+            _SANDBOX[:] = [None]
+            try:
+                r = derive(d)
+            finally:
+                _SANDBOX[:] = saved
+            rep(r["ok"] and r["up_to_date"] == ["units"] and not r["problems"],
+                f"DI6e a current sandboxed record needs no sandbox to be verified (a resumed run only checks hashes): "
+                f"{codes(r)} {r['up_to_date']}")
+        except Exception as e:  # noqa: BLE001
+            rep(False, f"DI6e: {type(e).__name__}: {e}")
     with tempfile.TemporaryDirectory() as d:
         d = os.path.realpath(di_fixture(d, ignores={}))
         try:

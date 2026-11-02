@@ -302,6 +302,10 @@ reason is given.
   for every new run. The machine self-tests written before this note (T10-T50) set it to False,
   because they exercise the gate and the fix loop, not the data stage. The DI tests run the
   machine with it set.
+- **A current record needs no sandbox.** `derive()` re-runs only what is stale. A derivation
+  recorded as ok, made in a sandbox, and unchanged since is up to date on any machine, so a run
+  resumed past SIGN on a host without bubblewrap only checks hashes (`derivation_stale`). A record
+  made with the development flag is re-made wherever a sandbox exists.
 - **The column accounting** reads the header of each staged `.csv`/`.tsv`. A staged table that the
   spec cites directly counts as used. The removal test (`ignored_column_used`) runs only for the
   ignored columns of tabular inputs.
