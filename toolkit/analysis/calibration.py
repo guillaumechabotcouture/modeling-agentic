@@ -387,6 +387,60 @@ def json_dumps(x) -> str:
     return json.dumps(x, sort_keys=True, default=str)
 
 
+def _pmc_mixture(Z, w, m, C, rng, th) -> dict:
+    """The proposal of one adaptive stage (population Monte Carlo, Cappe et al. 2004; v2d β SB2b): a defensive share
+    from one Gaussian over the weighted cloud (the former single-Gaussian stage), and the rest from local Gaussians
+    centred at points resampled by weight, with the cloud's covariance shrunk by Silverman's factor and three further
+    scales (1/4, 1/16, 1/64), so a thin curved ridge is followed by the narrow components."""
+    d = Z.shape[1]
+    K = int(th.get("pmc_centres", 256))
+    pos = (rng.random() + np.arange(K)) / K
+    idx = np.minimum(np.searchsorted(np.cumsum(w), pos), len(w) - 1)
+    beta = (4.0 / ((d + 2) * K)) ** (1.0 / (d + 4))
+    Lg = np.linalg.cholesky(C)
+    scales = [beta * 4.0 ** -j for j in range(4)]
+    Ls = [np.linalg.cholesky(sc * sc * (C - 0.0) + 1e-12 * np.eye(d)) for sc in scales]
+    return {"defensive": float(th.get("pmc_defensive", 0.2)), "m": m, "Lg": Lg, "centres": Z[idx], "Ls": Ls}
+
+
+def _mix_sample(mix, n, rng):
+    d = len(mix["m"])
+    nd = int(round(mix["defensive"] * n))
+    out = [mix["m"] + rng.standard_normal((nd, d)) @ mix["Lg"].T]
+    nl = n - nd
+    c = rng.integers(0, len(mix["centres"]), nl)
+    sc = rng.integers(0, len(mix["Ls"]), nl)
+    eps = rng.standard_normal((nl, d))
+    loc = np.empty((nl, d))
+    for j, L in enumerate(mix["Ls"]):
+        sel = sc == j
+        loc[sel] = mix["centres"][c[sel]] + eps[sel] @ L.T
+    out.append(loc)
+    return np.vstack(out)
+
+
+def _mix_logpdf(Z, mix, chunk=2048):
+    """log density of the stage mixture at Z (the balance-heuristic weights need every stage's density)."""
+    from scipy.linalg import solve_triangular
+    from scipy.special import logsumexp
+    d = Z.shape[1]
+    a = mix["defensive"]
+    lg = _mvn_logpdf(Z, mix["m"], mix["Lg"]) + math.log(a)
+    K, S = len(mix["centres"]), len(mix["Ls"])
+    out = np.empty(len(Z))
+    for i in range(0, len(Z), chunk):
+        z = Z[i:i + chunk]
+        parts = []
+        for L in mix["Ls"]:
+            diff = (z[:, None, :] - mix["centres"][None, :, :]).reshape(-1, d)
+            y = solve_triangular(L, diff.T, lower=True)
+            q = (-0.5 * np.sum(y * y, axis=0)).reshape(len(z), K)
+            parts.append(q - np.sum(np.log(np.diag(L))) - 0.5 * d * math.log(2 * math.pi))
+        loc = logsumexp(np.concatenate(parts, axis=1), axis=1) + math.log((1 - a) / (K * S))
+        out[i:i + chunk] = np.logaddexp(lg[i:i + chunk], loc)
+    return out
+
+
 def _importance(P, rng, seed, th):
     from scipy.special import logsumexp
     from scipy.stats import qmc
@@ -397,15 +451,16 @@ def _importance(P, rng, seed, th):
     Z = ndtri(U)
     X = P.x_of_z(Z)
     ll, aux = P.evaluate(X)
-    comps = [("prior", n0, None, None)]
+    comps = [("prior", n0, None)]
     lp = _logphi(Z)
+    dens = [lp.copy()]                 # each stage's proposal density at every point (cached; a stage adds its points)
     stages, ess = 0, 0.0
 
+    def comp_logpdf(comp, Zq):
+        return _logphi(Zq) if comp[0] == "prior" else _mix_logpdf(Zq, comp[2])
+
     def weights():
-        logq = []
-        for kind, n, m, L in comps:
-            lq = lp if kind == "prior" else _mvn_logpdf(Z, m, L)
-            logq.append(lq + math.log(n / len(Z)))
+        logq = [dq + math.log(c[1] / len(Z)) for c, dq in zip(comps, dens)]     # balance heuristic over all stages
         lw = ll + lp - logsumexp(np.stack(logq), axis=0)
         lw = np.where(np.isfinite(lw), lw, -np.inf)
         if not np.isfinite(lw).any():
@@ -419,15 +474,19 @@ def _importance(P, rng, seed, th):
         C = (Z - m).T @ ((Z - m) * w[:, None])
         h = 2.0 * (1.0 / n0) ** (1.0 / d)                   # about the first stage's point spacing, in z units
         C = 2.0 * (C + C.T) / 2.0 + h * h * np.eye(d)
-        L = np.linalg.cholesky(C)
         ns = 2 ** int(th["stage_log2"])
-        Zs = m + rng.standard_normal((ns, d)) @ L.T
-        lls, auxs = P.evaluate(P.x_of_z(Zs))
-        Z, X = np.vstack([Z, Zs]), np.vstack([X, P.x_of_z(Zs)])
+        mix = _pmc_mixture(Z, w, m, C, rng, th)          # SB2b: local components that follow a curved ridge
+        Zs = _mix_sample(mix, ns, rng)
+        Xs = P.x_of_z(Zs)
+        lls, auxs = P.evaluate(Xs)
+        comp = ("mix", ns, mix)
+        dens = [np.concatenate([dq, comp_logpdf(c, Zs)]) for c, dq in zip(comps, dens)]
+        Z, X = np.vstack([Z, Zs]), np.vstack([X, Xs])
+        dens.append(comp_logpdf(comp, Z))
+        comps.append(comp)
         ll = np.concatenate([ll, lls])
         aux = {k: np.concatenate([aux[k], auxs[k]]) for k in aux}
         lp = _logphi(Z)
-        comps.append(("gauss", ns, m, L))
         stages += 1
         w, ess = weights()
     if w is None or ess < th["ess_floor"]:
@@ -1549,6 +1608,33 @@ def _self_test() -> int:
                                          "emulator")
         ok(any("direct" in b for b in bad), f"CR12 (Codex r2-5) posterior with an emulator is refused: {bad}")
     safe(cr11, "CR11-12 boundary stencil, emulator")
+
+    def cb8():
+        # SB2b evidence (coverage run 2026-11-01): 143 of 200 fits stopped at ESS about 100 after 6 adaptive stages, on
+        # a curved ridge in 5 parameters. Two curved ridges here (x1 = x0^2, x3 = 0.3 / x2) plus one free parameter:
+        # one Gaussian per stage cannot follow them. The marginals are known (x0 ~ U(0, 1), x2 ~ U(0.3, 1)).
+        names = [f"x{i}" for i in range(5)]
+        pri = {n: Prior.from_decl(n, {"dist": "uniform", "range": [0.0, 1.0], "source": "t"}) for n in names}
+        pri["x2"] = Prior.from_decl("x2", {"dist": "uniform", "range": [0.3, 1.0], "source": "t"})
+        pri["x3"] = Prior.from_decl("x3", {"dist": "uniform", "range": [0.3, 1.0], "source": "t"})
+
+        def banana(X):
+            r1 = (X["x1"] - X["x0"] ** 2) / 0.004
+            r2 = (X["x2"] * X["x3"] - 0.3) / 0.004
+            r3 = (X["x4"] - 0.5) / 0.05
+            return -0.5 * (r1 ** 2 + r2 ** 2 + r3 ** 2), {}
+        P = Problem(names, pri, banana)
+        try:
+            s = sample(P, seed=7, max_importance_params=thresholds()["max_importance_params_run_batch"])
+        except CalibrationRefused as e:
+            ok(False, f"CB8 a curved 5-parameter ridge (the SB2b case) reaches the ESS floor ({e})")
+            return
+        m = np.mean(s["rows"], axis=0)
+        ok(s["diagnostics"]["ess"] >= 1000 and abs(m[0] - 0.5) < 0.03 and abs(m[1] - 1 / 3) < 0.03
+           and abs(m[4] - 0.5) < 0.01,
+           f"CB8 a curved 5-parameter ridge (the SB2b case) reaches the ESS floor with the right marginals "
+           f"(ESS {s['diagnostics']['ess']:.0f}, means {np.round(m, 3)})")
+    safe(cb8, "CB8 curved ridge")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

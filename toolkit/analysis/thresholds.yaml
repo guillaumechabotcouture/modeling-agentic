@@ -20,8 +20,8 @@ calibration:
   # from initial_state() (microseconds) keep 4: at 5, 2 of 200 SB3b fits fell below the ESS floor.
   max_importance_params_run_batch: 5
   sobol_log2: 14              # first stage: 2^14 scrambled Sobol points over the prior
-  stage_log2: 13              # each adaptive stage: a Gaussian fitted to the weighted points (balance-heuristic pool)
-  max_stages: 6
+  stage_log2: 13              # each adaptive stage: a population Monte Carlo mixture (balance-heuristic pool)
+  max_stages: 12              # measured (SB2b follow-up): curved 5-parameter ridges needed up to 12 mixture stages
   ess_floor: 1000
   chains: 4
   warmup: 4000
