@@ -39,8 +39,10 @@ is used; --timeout-s stops it at a wall-clock limit.
 
 Phase 35, failures handled by the service (no agent troubleshooting):
 memory is measured per process and concurrency lowered to fit; a process
-death (out of memory) or a lost VM reruns the affected inputs at lower
-concurrency; a model error repeating on most rows stops the batch early.
+death (out of memory) reruns the affected inputs at lower concurrency; a chunk
+lost with its VM is resubmitted up to MA_COMPUTE_INFRA_RETRIES (2) times per
+input, and the autoscaler never retires a worker that is running one
+(`BusyWorkerGuard`); a model error repeating on most rows stops the batch early.
 Failed rows carry `kind`: model | infra | stopped. The CLI reuses rows of an
 earlier run of the same command (same function, code, data and params), so
 rerunning completes a stopped or partly failed batch (`--fresh` disables).
@@ -187,6 +189,10 @@ TAIL = 2                   # attempt marker: a chunk's breaker-stopped inputs re
 BREAKER_MIN = 8            # same model error at least this often, and on half the finished rows
 MEM_HEADROOM = 1.2         # a process may grow 20% past the largest peak seen
 MEM_USABLE = 0.85          # share of the memory available at start that the pool may use
+# 2026-11-02 (Nigeria v2 full run F3): two chunks lost when the autoscaler retired their workers were
+# resubmitted once each, and both resubmissions were lost the same way: 16 rows infra, the analysis failed.
+INFRA_RETRIES = 2          # MA_COMPUTE_INFRA_RETRIES when unset: resubmissions per input after its chunk was lost
+NO_WORKER_WAIT_S = 1800    # MA_COMPUTE_NO_WORKER_WAIT_S when unset: how long a call waits with no compute worker
 
 
 def _peak_mb() -> float:
@@ -954,9 +960,9 @@ def _cancel_call(call_id: str) -> int:
 
 
 try:
-    from distributed.diagnostics.plugin import WorkerPlugin as _WorkerPlugin
+    from distributed.diagnostics.plugin import SchedulerPlugin as _SchedulerPlugin, WorkerPlugin as _WorkerPlugin
 except ImportError:          # local backend only
-    _WorkerPlugin = object
+    _SchedulerPlugin = _WorkerPlugin = object
 
 
 class ComputeTagPlugin(_WorkerPlugin):
@@ -977,6 +983,26 @@ class ComputeTagPlugin(_WorkerPlugin):
         return None
 
 
+class BusyWorkerGuard(_SchedulerPlugin):
+    """2026-11-02 (Nigeria v2 full run F3): the autoscaler never retires a
+    worker that is running a task. Adaptive scaling (dask's, and Coiled's on
+    top of it) asks `Scheduler.workers_to_close(target=n)`; given a target, it
+    takes idle workers first and then busy ones, and `retire_workers` does not
+    wait for a running task. A pinned chunk there can run nowhere else, so its
+    work was lost (F3: 2 chunks, then their 2 resubmissions). Every caller of
+    workers_to_close filters its candidates through `valid_workers_downscaling`,
+    so this holds whichever process runs adapt (the keeper, client-side). It
+    also keeps the run VM's worker (busy with the run) from being chosen.
+    Registered by the launcher (`register_compute_tags`) and by every dask
+    call (idempotent: a cluster started before this gets it on its next batch)."""
+
+    name = "ma-compute-busy-guard"
+    idempotent = True
+
+    def valid_workers_downscaling(self, scheduler, workers):
+        return [ws for ws in workers if not ws.processing]
+
+
 # Launcher settings for an autoscaling pool (Coiled check, Phase 30). Coiled's
 # adapt adds VMs only when queued work exceeds `target_duration` (default 3 min),
 # and dask counts each worker thread as a parallel slot although a compute VM
@@ -994,6 +1020,7 @@ WORKER_VM_TYPES = ["Standard_E8s_v5", "Standard_E8as_v5", "Standard_E8ds_v5"]
 # Phase 42 β: an idle VM is retired after interval x wait_count = 10 min (dask's default is
 # 5 s x 24 = 2 min), so consecutive batches reuse VMs; attempt 8 created 734 VMs in 18 h.
 # cloud/run_cluster.py derives these from RunConfig.scale_down_after / adapt_interval.
+# Whatever the target, a worker running a chunk is never the one retired (BusyWorkerGuard).
 ADAPT_OPTIONS = {"target_duration": "20s", "interval": "15s", "wait_count": 40}
 
 
@@ -1004,6 +1031,7 @@ def register_compute_tags(client, exclude: list[str] | tuple = (), resource: str
     import (Coiled check, Phase 30; same class of bug as PR #20)."""
     client.upload_file(os.path.abspath(__file__))
     client.register_plugin(ComputeTagPlugin(resource, exclude=list(exclude)), name=ComputeTagPlugin.name)
+    client.register_plugin(BusyWorkerGuard(), name=BusyWorkerGuard.name)
 
 
 def export_worker_env(tls_dir: str, worker=None) -> dict:
@@ -1128,9 +1156,13 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
 
     Phase 35: what one chunk learns about memory (its pool broke, or its
     measured peak allowed fewer processes) sets the processes for every chunk
-    submitted after it. A chunk lost with its VM, or whose subprocess died, is
-    resubmitted once with half the processes. A model error repeating across
-    chunks stops the call (`_breaker`).
+    submitted after it. A chunk whose subprocess died is resubmitted once with
+    half the processes. A chunk lost with its VM (left, died, unconfirmed) is
+    resubmitted up to MA_COMPUTE_INFRA_RETRIES times per input (the first time
+    with half the processes), each lost attempt charged; with no compute worker
+    taking work, the call waits MA_COMPUTE_NO_WORKER_WAIT_S for the pool, then
+    its queued inputs fail as infra. A model error is never resubmitted; one
+    repeating across chunks stops the call (`_breaker`).
 
     Phase 45 δ (A16): this loop places every chunk itself. Each chunk is
     pinned to a compute worker that has nothing processing, and the worker
@@ -1160,6 +1192,17 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
         # Dask pickles functions by reference when it can, so the scheduler and
         # workers must be able to import this module: ship it to them.
         c.upload_file(os.path.abspath(__file__))
+        # The autoscaler must not retire a worker under a running chunk. Not installed
+        # (the scheduler refuses it): the call goes on, recovery below still applies,
+        # and the summary says why.
+        try:
+            c.register_plugin(BusyWorkerGuard(), name=BusyWorkerGuard.name)
+            guard = True
+        except Exception as e:  # noqa: BLE001
+            guard = f"not installed: {type(e).__name__}: {e}"[:200]
+            print(f"compute: busy-worker guard {guard}", file=sys.stderr, flush=True)
+        retries = int(os.environ.get("MA_COMPUTE_INFRA_RETRIES") or INFRA_RETRIES)
+        no_worker_wait = float(os.environ.get("MA_COMPUTE_NO_WORKER_WAIT_S") or NO_WORKER_WAIT_S)
         winfo = _sched_workers(c)
         # Phase 30: on an autoscaling pool, compute workers carry a resource tag
         # (ComputeTagPlugin) and tasks ask for it, so VMs that join mid-batch get
@@ -1233,13 +1276,15 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
             started[f] = time.time()
             return f
         futs, queue, started, errors = {}, [(ch, 0, None) for ch in chunks], {}, {}
+        losses = {}                                 # input -> times its chunk was lost (chunk_lost)
 
         def halved(used, worker=None):
             return max(1, int(used or cpus.get(worker) or cores_per_slot) // 2)
 
         def chunk_lost(f, ch, attempt, used, f_share, msg):
             """A chunk whose result is lost (its worker died or left, or the task
-            failed): charge it, then resubmit it once with half the processes."""
+            failed): charge it, then resubmit it on the remaining or new workers,
+            up to `retries` times per input, the first time with half the processes."""
             nonlocal lost
             # Its work is unknown: charge the share it was allowed
             # (chunks enforce their share), or estimate it at the end.
@@ -1249,13 +1294,17 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                 progress["core_s"] += min(f_share, busy)
             else:
                 lost += 1
+            n_lost = 1 + max(losses.get(i, 0) for i, _ in ch)
+            losses.update({i: n_lost for i, _ in ch})
             progress.setdefault("chunks", []).append(
-                {"n": len(ch), "attempt": attempt, "error": msg[:200], "worker": pinned.get(f),
+                {"n": len(ch), "attempt": attempt, "losses": n_lost, "error": msg[:200], "worker": pinned.get(f),
                  "core_s": round(min(f_share, busy), 1) if f_share else None,
                  "wall_s": round(time.time() - started.get(f, time.time()), 1)})
             errors.update({i: msg for i, _ in ch})
-            if attempt == 0 and (deadline is None or time.time() < deadline):
-                queue.insert(0, (ch, 1, halved(used)))
+            if n_lost <= retries and (deadline is None or time.time() < deadline):
+                # A rerun tail stays one (no chunk breaker); a lost VM says nothing more about memory.
+                queue.insert(0, (ch, TAIL if attempt == TAIL else 1, halved(used) if n_lost == 1 else used))
+                progress["resubmitted"] = progress.get("resubmitted", 0) + 1
                 return
             rows.extend({"i": i, "ok": False, "kind": INFRA, "error": errors[i]} for i, _ in ch)
 
@@ -1285,6 +1334,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                 markers.append(c.submit(_demand_marker, key=f"{funcname(_remote_task)}-{uuid.uuid4().hex}",
                                         resources={res: 1, DEMAND_RESOURCE: 1}, pure=False))
         pending, rows, stop, lost = set(), [], None, 0
+        no_w = None                                 # since when no compute worker has been taking work
         try:
             while queue or pending:
                 _note(progress, inflight(), call_id=call_id)
@@ -1334,6 +1384,18 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                     if not res and not ok_w and not pending:
                         stop = "no compute workers left"      # a fixed list cannot grow back
                         break
+                    # A pool with no compute worker taking work (none joined, or all are
+                    # closing): wait for it to grow back, within a bound. The queued inputs
+                    # then fail as infra (the machine's shortfall), so a rerun completes them.
+                    if res and queue and not pending and not any(s_[2] for s_ in ok_w.values()):
+                        no_w = no_w or time.time()
+                        if time.time() - no_w >= no_worker_wait:
+                            stop = f"no compute worker for {no_worker_wait:g} s"
+                            errors.update({i: f"{stop}: the pool did not grow back" for ch, _, _ in queue
+                                           for i, _ in ch if i not in errors})
+                            break
+                    else:
+                        no_w = None
                     busy = {pinned[f] for f in pending}
                     free = [a for a, v in ok_w.items() if v[2] and not v[1] and a not in busy]
                     random.shuffle(free)                    # two calls seldom pick the same worker
@@ -1502,7 +1564,8 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
             # The scheduler silently reruns tasks from a worker that died; that
             # attempt's work is invisible here, so a vanished worker is charged
             # as busy for the whole call.
-            # On an autoscaling pool, scale-down only retires idle workers: no lost work.
+            # On an autoscaling pool, scale-down retires only idle workers (BusyWorkerGuard);
+            # a chunk lost in the race between that choice and a placement is seen above.
             try:
                 gone = [] if res else _gone_workers(c, workers)
             except Exception:  # noqa: BLE001 — table unreadable: every worker charged as busy
@@ -1527,7 +1590,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                   "bundle_rescatters": progress.get("bundle_rescatters", 0), "moved": progress.get("moved", 0),
                   "invariant_violation": (f"{len(absent)} inputs returned no row" if absent else None),
                   "chunks": progress.get("chunks", []), "procs_final": learned["procs"],
-                  "peak_mb": learned["peak"]}
+                  "peak_mb": learned["peak"], "busy_guard": guard, "resubmitted": progress.get("resubmitted", 0)}
 
 
 # --------------------------------------------------------------------------- #
@@ -3829,7 +3892,7 @@ def _self_test_infra(ok) -> None:
                 after = cc.run_on_scheduler(pick)
                 nm = cc.run_on_scheduler(names)
                 after_n = cc.run_on_scheduler(pick, 0, "name")
-                guard = "ma-compute-busy-guard"             # BusyWorkerGuard.name
+                guard = BusyWorkerGuard.name
                 ok(w[0] in before and guard in cc.run_on_scheduler(guards)
                    and w[0] not in after and w[1] in after and nm[w[0]] not in after_n and nm[w[1]] in after_n,
                    f"IR1 a busy worker is never chosen to close once a compute call has run (without the guard "
