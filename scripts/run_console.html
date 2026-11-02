@@ -21,6 +21,7 @@
   --bg: #141518; --panel: #1b1d21; --ink: #e7e8ea; --muted: #9a9fa8; --faint: #636871; --line: #2b2e34; --soft: #23262b;
   --accent: #86a8e8; --accent-soft: #232d40; --ok: #6fbf8c; --warn: #d9a650; --bad: #e57f80; color-scheme: dark; }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink); font: 14.5px/1.55 var(--sans); }
 button, select, input, textarea { font: inherit; color: inherit; }
 button { background: none; border: 1px solid var(--line); border-radius: 6px; padding: 3px 10px; cursor: pointer; font-size: 13px; }
@@ -192,6 +193,8 @@ table.t tr.grp td { padding-top: 10px; font-size: 12.5px; color: var(--muted); }
 .md p:first-child { margin-top: 0; } .md p:last-child { margin-bottom: 0; }
 .muted { color: var(--muted); } .small { font-size: 12.5px; }
 .kv td { padding: 2px 12px 2px 0; vertical-align: top; font-size: 13px; }
+.banner { position: fixed; top: 0; left: 0; right: 0; z-index: 30; background: var(--bad); color: #fff; font-size: 13px; padding: 6px 16px; display: flex; gap: 12px; align-items: center; }
+.banner span { flex: 1; } .banner button { color: #fff; border-color: rgba(255,255,255,.5); padding: 1px 8px; }
 .toast { position: fixed; bottom: 16px; right: 16px; background: var(--ink); color: var(--bg); padding: 8px 14px; border-radius: 6px; font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none; max-width: 420px; }
 .toast.on { opacity: .95; }
 .answer { border-top: 1px solid var(--line); padding-top: 10px; margin-top: 10px; }
@@ -252,6 +255,7 @@ label.inline { display: inline-flex; gap: 4px; align-items: center; margin-right
   </div>
 </div>
 <div class="toast" id="toast"></div>
+<div class="banner" id="banner" hidden><span id="banner-text"></span><button id="banner-retry">Retry</button><button id="banner-close">Dismiss</button></div>
 <script>
 "use strict";
 const TOKEN = "__CONSOLE_TOKEN__";
@@ -259,9 +263,17 @@ const S = { runs: [], run: null, runId: null, filter: null, anchor: null, verdic
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 function toast(msg) { const t = $("toast"); t.textContent = msg; t.classList.add("on"); clearTimeout(toast.h); toast.h = setTimeout(() => t.classList.remove("on"), 4000); }
+// Errors are never swallowed: a failed fetch or render shows one line at the top of the page.
+function fail(where, e) { $("banner-text").textContent = `${where} failed: ${e && e.message ? e.message : e}`; $("banner").hidden = false; console.error(where, e); }
+window.addEventListener("error", (e) => fail("Page script", e.error || e.message));
+window.addEventListener("unhandledrejection", (e) => fail("Page script", e.reason));
 async function api(path, body) {
   const opt = body === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json", "X-Console-Token": TOKEN }, body: JSON.stringify(body) };
-  const r = await fetch(path, opt);
+  const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), body === undefined ? 60000 : 600000);
+  let r;
+  try { r = await fetch(path, { ...opt, signal: ctl.signal }); }
+  catch (e) { throw new Error(e.name === "AbortError" ? `${path.split("?")[0]}: no answer from the console server within ${body === undefined ? 60 : 600} s` : `${path.split("?")[0]}: ${e.message} (is the console server running?)`); }
+  finally { clearTimeout(timer); }
   const j = await r.json().catch(() => ({ error: "not JSON (" + r.status + ")" }));
   if (!r.ok) throw new Error(j.error || r.status);
   return j;
@@ -353,8 +365,18 @@ function md(src, doc) {
 }
 
 // ---- sidebar: runs and the learning view
+const PAGE_NEEDS = ["runs", "projects", "kinds", "layers", "chat", "glossary"];   // RC17: /api/runs must carry these
 async function loadRuns() {
-  try { const j = await api("/api/runs"); S.runs = j.runs; S.meta = j; } catch (e) { $("sidebar").innerHTML = `<div class="card error">${esc(e.message)}</div>`; return; }
+  if (!S.meta) $("sidebar").innerHTML = '<div class="muted small" style="margin:0 8px">Loading runs…</div>';
+  try {
+    const j = await api("/api/runs"), missing = PAGE_NEEDS.filter((k) => !(k in j));
+    if (missing.length) throw new Error(`/api/runs lacks ${missing.join(", ")}: restart the console server from this checkout`);
+    S.runs = j.runs; S.meta = j;
+  } catch (e) { $("sidebar").innerHTML = `<div class="card error small">${esc(e.message)}</div>`; fail("Loading runs", e); return; }
+  $("banner").hidden = true;
+  try { renderLoaded(); } catch (e) { fail("Showing runs", e); }
+}
+function renderLoaded() {
   if (!$("kind").options.length) {
     $("kind").innerHTML = S.meta.kinds.map((k) => `<option>${k}</option>`).join("");
     $("layer").innerHTML = S.meta.layers.map((k) => `<option>${k}</option>`).join("");
@@ -432,8 +454,8 @@ async function renderLearning() {
 async function selectRun(id) { S.runId = id; S.filter = null; S.cmp = null; await refresh(); if (S.tab === "runs") renderRuns(); }
 async function refresh() {
   if (!S.runId) return;
-  try { S.run = await api("/api/run?" + q({ run: S.runId })); } catch (e) { $("stream").innerHTML = `<div class="card error"><div class="head"><span class="t">The run cannot be read</span></div><div class="body">${esc(e.message)}</div></div>`; return; }
-  renderHeader(); renderStepper(); renderStream();
+  try { S.run = await api("/api/run?" + q({ run: S.runId })); } catch (e) { $("stream").innerHTML = `<div class="card error"><div class="head"><span class="t">The run cannot be read</span></div><div class="body">${esc(e.message)}</div></div>`; fail("Loading the run", e); return; }
+  try { renderHeader(); renderStepper(); renderStream(); } catch (e) { fail("Showing the run", e); }
 }
 function renderHeader() {
   const r = S.run, st = r.state || {}, c = r.compute || {}, sp = r.stepper || { stages: [] };
@@ -748,6 +770,8 @@ async function buildOn() {
 $("tab-runs").onclick = () => { S.tab = "runs"; $("tab-runs").classList.add("on"); $("tab-learn").classList.remove("on"); renderRuns(); };
 $("tab-learn").onclick = () => { S.tab = "learn"; $("tab-learn").classList.add("on"); $("tab-runs").classList.remove("on"); renderLearning(); };
 $("theme").onclick = () => { const d = document.documentElement, dark = d.dataset.theme ? d.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches; d.dataset.theme = dark ? "light" : "dark"; };
+$("banner-close").onclick = () => ($("banner").hidden = true);
+$("banner-retry").onclick = () => { $("banner").hidden = true; loadRuns(); refresh(); };
 $("navbtn").onclick = (e) => { e.stopPropagation(); $("app").classList.toggle("nav"); };
 document.querySelector("main").addEventListener("click", () => $("app").classList.remove("nav"));
 { const t = new URLSearchParams(location.search).get("theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; }

@@ -2141,6 +2141,14 @@ def _self_test() -> int:
            and g["done_when"][0]["detail"] == "fail" and _words({"fixed": ["T-001", "T-002"], "rejected": []})
            == "fixed: T-001, T-002 · rejected: none", f"RC16c done-when rows join the gate status with the blocker; "
            f"fix-loop records read as words ({g['done_when'][:1]})")
+        needs = re.search(r"const PAGE_NEEDS = \[([^\]]*)\]", page)
+        keys = re.findall(r'"([a-z_]+)"', needs.group(1)) if needs else []
+        _, _, served = Console([os.path.join(td, "runs")]).handle("GET", "/api/runs", {}, {})
+        ok(keys and set(keys) <= set(served) and {k for k in re.findall(r"S\.meta\.([a-z_]+)", page)} <= set(keys),
+           f"RC17 the keys the page needs from /api/runs (PAGE_NEEDS, and every S.meta.<key> it reads) are served "
+           f"(needs {keys}; served {sorted(served)})")
+        ok('id="banner"' in page and 'addEventListener("unhandledrejection"' in page and "AbortController" in page,
+           "RC17b a failed fetch or render shows a banner; fetches time out instead of hanging")
         with tempfile.TemporaryDirectory() as t4:
             d = _toy_run(os.path.join(t4, "r"))
             os.makedirs(os.path.join(d, "analysis", "batch"))
