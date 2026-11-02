@@ -1,0 +1,164 @@
+producer: toolkit/engines/malaria/benchmarks/runtime.py
+engine_version: '0.5'
+clock: process CPU seconds (cpu_s) and wall seconds (wall_s), one core per task
+n_agents: 4000
+horizon:
+  start: 2016.0
+  stop: 2027.0
+  window:
+  - 2024.0
+  - 2027.0
+  windows:
+    cal:
+    - 2021.67
+    - 2022.0
+packages:
+- none
+- pyr
+- dual_smc
+- cm
+repeats: 6
+seconds_per_point:
+  v04: 150.46
+  v05_shared: 209.79
+  v05_unshared: 577.74
+wall_seconds_per_point:
+  v04: 150.48
+  v05_shared: 209.81
+  v05_unshared: 577.79
+peak_rss_mb:
+  v04: 440.8
+  v05_shared: 1831.8
+  v05_unshared: 1005.2
+ratio_to_v04:
+  v04: 1.0
+  v05_shared: 1.394
+  v05_unshared: 3.84
+shared_equals_unshared: true
+points:
+- m0: 9.0
+  seed: 1
+  mode: v04
+  cpu_s: 140.1
+  wall_s: 140.13
+  peak_rss_mb: 438.9
+  fork_year: 2024.0
+- m0: 9.0
+  seed: 1
+  mode: v05_shared
+  cpu_s: 201.11
+  wall_s: 201.13
+  peak_rss_mb: 1830.7
+  fork_year: 2024.0
+- m0: 9.0
+  seed: 1
+  mode: v05_unshared
+  cpu_s: 583.89
+  wall_s: 583.93
+  peak_rss_mb: 1004.3
+  fork_year: 2024.0
+- m0: 9.0
+  seed: 2
+  mode: v04
+  cpu_s: 144.27
+  wall_s: 144.29
+  peak_rss_mb: 438.9
+  fork_year: 2024.0
+- m0: 9.0
+  seed: 2
+  mode: v05_shared
+  cpu_s: 214.86
+  wall_s: 214.9
+  peak_rss_mb: 1829.2
+  fork_year: 2024.0
+- m0: 9.0
+  seed: 2
+  mode: v05_unshared
+  cpu_s: 548.6
+  wall_s: 548.64
+  peak_rss_mb: 1003.5
+  fork_year: 2024.0
+- m0: 9.0
+  seed: 3
+  mode: v04
+  cpu_s: 147.72
+  wall_s: 147.76
+  peak_rss_mb: 437.9
+  fork_year: 2024.0
+- m0: 9.0
+  seed: 3
+  mode: v05_shared
+  cpu_s: 207.05
+  wall_s: 207.07
+  peak_rss_mb: 1831.3
+  fork_year: 2024.0
+- m0: 9.0
+  seed: 3
+  mode: v05_unshared
+  cpu_s: 595.34
+  wall_s: 595.38
+  peak_rss_mb: 1004.6
+  fork_year: 2024.0
+- m0: 28.0
+  seed: 1
+  mode: v04
+  cpu_s: 151.56
+  wall_s: 151.58
+  peak_rss_mb: 440.7
+  fork_year: 2024.0
+- m0: 28.0
+  seed: 1
+  mode: v05_shared
+  cpu_s: 195.74
+  wall_s: 195.75
+  peak_rss_mb: 1831.1
+  fork_year: 2024.0
+- m0: 28.0
+  seed: 1
+  mode: v05_unshared
+  cpu_s: 577.05
+  wall_s: 577.13
+  peak_rss_mb: 1004.2
+  fork_year: 2024.0
+- m0: 28.0
+  seed: 2
+  mode: v04
+  cpu_s: 152.84
+  wall_s: 152.86
+  peak_rss_mb: 440.8
+  fork_year: 2024.0
+- m0: 28.0
+  seed: 2
+  mode: v05_shared
+  cpu_s: 221.78
+  wall_s: 221.8
+  peak_rss_mb: 1830.1
+  fork_year: 2024.0
+- m0: 28.0
+  seed: 2
+  mode: v05_unshared
+  cpu_s: 566.85
+  wall_s: 566.9
+  peak_rss_mb: 1005.2
+  fork_year: 2024.0
+- m0: 28.0
+  seed: 3
+  mode: v04
+  cpu_s: 166.27
+  wall_s: 166.29
+  peak_rss_mb: 439.9
+  fork_year: 2024.0
+- m0: 28.0
+  seed: 3
+  mode: v05_shared
+  cpu_s: 218.18
+  wall_s: 218.2
+  peak_rss_mb: 1831.8
+  fork_year: 2024.0
+- m0: 28.0
+  seed: 3
+  mode: v05_unshared
+  cpu_s: 594.73
+  wall_s: 594.79
+  peak_rss_mb: 1005.2
+  fork_year: 2024.0
