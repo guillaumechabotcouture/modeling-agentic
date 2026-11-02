@@ -64,7 +64,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
-import hashlib
 import json
 import os
 import re
@@ -73,6 +72,8 @@ import sys
 import tempfile
 
 import yaml
+
+from lib.safe_io import sha256_file as _sha  # noqa: E402  (also DB._sha in toolkit/spec/signoff.py)
 
 BRIEF, SIGNOFF, LOCK, AMENDMENTS = ("decision_brief.yaml", "decision_brief.signoff.json",
                                     "acceptance_lock.json", "brief_amendments.yaml")
@@ -122,14 +123,6 @@ decision depends on (say in the claim what the brief should settle), or
 kept as a note for the next run. Do not re-open what the brief settles, or
 what it puts out of scope.
 """
-
-
-def _sha(path: str) -> str | None:
-    try:
-        with open(path, "rb") as f:
-            return hashlib.sha256(f.read()).hexdigest()
-    except OSError:
-        return None
 
 
 def _load(path: str):

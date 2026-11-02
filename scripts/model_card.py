@@ -56,7 +56,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime
-import hashlib
 import importlib.util
 import inspect
 import json
@@ -114,12 +113,7 @@ def _read_json(path: str):
         return None
 
 
-def _sha(path: str) -> str | None:
-    try:
-        with open(path, "rb") as f:
-            return hashlib.sha256(f.read()).hexdigest()
-    except OSError:
-        return None
+_sha = _sibling("lib.safe_io").safe_io.sha256_file   # bound at import, before any run code loads
 
 
 def _short(s, n=240) -> str:
