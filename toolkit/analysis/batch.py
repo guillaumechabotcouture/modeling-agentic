@@ -135,7 +135,9 @@ CORE = ("point", "package", "components", "unit", "params", "seed")     # a job'
 # A re-run on another platform (the spike's batch ran on Linux VMs) differs in the last digits of floating point
 # (observed: about 1e-9 relative); 1e-6 separates that from a model change. Wall-clock timings are not outputs.
 ADOPT_RTOL = 1e-6
-TIMING_KEYS = frozenset({"seconds"})
+# v0.5 (review P2): an engine that shares a starting state reports where its batch forked and how many members shared
+# it; both depend on how jobs were grouped (a replay runs one job alone), not on the job's outputs.
+TIMING_KEYS = frozenset({"seconds", "fork_year", "burnin_members"})
 # Codex r2 P1-2: an adoption re-runs at least this many stored jobs before it stamps any of them.
 ADOPT_MIN_SAMPLE = 4
 ADOPT_MIN_SHARE = 0.01
@@ -734,6 +736,10 @@ def _self_test() -> int:
             ok(r and not called, f"BA8 an adoption recorded on another platform is refused before its replay "
                                  f"recomputes anything (the re-run's 1.4% sample): {why}; replays run {len(called)}")
             ok(ADOPT_RTOL == 1e-6, "BA9 the adoption tolerance is unchanged (1e-6)")
+            m = {"per_capita": {"x": 1.0}, "meta": {"seconds": 1, "fork_year": 2020.0, "burnin_members": 4}}
+            ok(_same(m, {"per_capita": {"x": 1.0}, "meta": {"seconds": 2, "fork_year": 2024.0, "burnin_members": 1}},
+                     ADOPT_RTOL) and not _same(m, {"per_capita": {"x": 1.1}, "meta": m["meta"]}, ADOPT_RTOL),
+               "BA13 (review P2) a replay run alone matches a grouped row: fork point and group size are not outputs")
         case("BA8", b8)
 
         def b10():

@@ -530,7 +530,8 @@ class Runner:
         fn, by = _job_list, {}
         for n, j in enumerate(jobs):
             ref, config, params, unit, package, horizon, seed = j
-            key = json.dumps([ref, config, unit, horizon, seed], sort_keys=True, default=str) if self._shared(j) else n
+            key = json.dumps([ref, config, unit, horizon, seed], sort_keys=True,
+                             default=lambda x: x.tolist() if hasattr(x, "tolist") else repr(x)) if self._shared(j) else n
             by.setdefault(key, []).append(j)
         tasks = list(by.values())
         if self.workers <= 1 or len(tasks) <= 1:

@@ -263,7 +263,8 @@ class MalariaEngine:
     def _burnin_key(P: dict, a: dict) -> str:
         import json
         skip = POST_FORK | (frozenset() if a.get("hist_net", "pyr") == "dual" else DUAL_NET)
-        return json.dumps({"P": {k: v for k, v in P.items() if k not in skip}, "unit": a}, sort_keys=True, default=str)
+        return json.dumps({"P": {k: v for k, v in P.items() if k not in skip}, "unit": a}, sort_keys=True,
+                          default=lambda x: x.tolist() if hasattr(x, "tolist") else repr(x))   # arrays in full (review P3)
 
     def _base_sim(self, P: dict, a: dict, horizon: Horizon, seed: int, cfg: dict | None = None):
         """The sim from horizon.start - burnin_years (not yet initialised), with every component slot present and
@@ -405,7 +406,8 @@ class MalariaEngine:
         det[st == M.A_] = q[st == M.A_]
         return {"N": int(len(u)), "N0": int(n0), "year": float(yv[ti]), "burnin_years": int(round(P["burnin_years"])),
                 "init_eir": min(P["init_eir_per_m0"] * float(a.get("m0", 5.0)), 150.0), "immunity": imm,
-                "pfpr": M.prevalence_bands(det, age * 365)}
+                "pfpr": M.prevalence_bands(det, age * 365),
+                "hh_mean_size": float(len(u) / max(len(np.unique(np.asarray(dz.hh[u]))), 1))}
 
     def _outcomes(self, sim, P, horizon, seed, t0, capped=None, extra=None) -> Outcomes:
         w0, w1 = horizon.window
@@ -565,7 +567,15 @@ def _self_test() -> int:
     keys = ("pfpr_lt5", "pfpr_lt10", "pfpr_le15", "pfpr_all")
     ok(all(k in o_net.windows["m12"] and 0.0 <= o_net.windows["m12"][k] <= 1.0 for k in keys),
        "M20 the new age-band prevalences are reported in every window")
-    rr = {k: o_net.windows["m12"][k] / max(o_none.windows["m12"][k], 1e-9) for k in ("pfpr_lt5", "pfpr_all")}
+    # v0.5: the ratio is the geometric mean over three seeds (one seed flipped it when the household fix changed the
+    # random draws: 0.521 under 5 vs 0.487 all ages, within seed noise)
+    lr = {"pfpr_lt5": [], "pfpr_all": []}
+    for sd in (9, 10, 11):
+        a0, a1 = e.run_batch([dict(e_par, n_agents=2500)] * 2, uP, [Package("none", {}), Package("pyr", {"net": "pyr"})],
+                             hP, sd)
+        for k in lr:
+            lr[k].append(np.log(a1.windows["m12"][k] / max(a0.windows["m12"][k], 1e-9)))
+    rr = {k: float(np.exp(np.mean(v))) for k, v in lr.items()}
     ok(rr["pfpr_all"] > rr["pfpr_lt5"],
        f"M21 forward behaviour (Sochantha 2006 age interaction): nets cut all-age prevalence less than under-5 prevalence {rr}")
     _self_test_v05(ok, e, unit)
@@ -606,6 +616,9 @@ def _self_test_v05(ok, e, unit) -> None:
         ok(all(s["N0"] < 0.8 * n for s in sts) and abs(mean / n - 1) < 0.03,
            f"V2 the burn-in population starts smaller ({sts[0]['N0']}) and grows to n_agents at horizon.start "
            f"(mean {mean:.0f} of {n} over 6 seeds)")
+        hs = [s["hh_mean_size"] for s in sts]
+        ok(all(abs(h / 5.0 - 1) < 0.1 for h in hs),
+           f"V9 (review P2) households keep their declared mean size (hh_size 5) while the population grows: {hs}")
         s0 = e.initial_state({"n_agents": n, "burnin_years": 0}, u, horizon=hz, seed=1)
         ok(s0["N"] == n and s0["N0"] == n, "V2b without a burn-in the population at horizon.start is n_agents exactly")
     case("V2", v2)
@@ -626,6 +639,13 @@ def _self_test_v05(ok, e, unit) -> None:
         ok(solo.per_capita == outs[2].per_capita and solo.windows == outs[2].windows
            and solo.cost_drivers == outs[2].cost_drivers,
            "V4 a package run alone equals the same package in a shared batch (the fork copies the state exactly)")
+        ue = UnitSpec("t", dict(u.attributes, irs_years=[2015.0], irs_month=6))
+        pair = e.run_batch([base] * 2, ue, [pk[0], Package("irs", {"irs": 1})], hz, 5)
+        alone = e.run(base, ue, pk[0], hz, 5)
+        ok(pair[0].meta["fork_year"] < 2015.5 and alone.meta["fork_year"] == hz.window[0]
+           and alone.per_capita == pair[0].per_capita and alone.windows == pair[0].windows,
+           "V4b (review P2) a package forked early, beside a member whose component acts before the decision start, "
+           "equals the same package run alone (forked at the decision start)")
     case("V3", v3)
 
     def v5():

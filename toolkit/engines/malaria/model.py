@@ -148,10 +148,25 @@ class Malaria(ss.Disease):
         else:
             have = self.sim.people.auids
             have = have[self.hh[have] >= 0]
-            donor = have[rs.integers(0, len(have), size=n)] if len(have) else u
-            self.hh[u] = self.hh[donor]
-            self.z_hh[u] = self.z_hh[donor]
-            self.z_sp[u] = self.z_sp[donor]
+            # v0.5 (review P2): newborns found new households as needed to keep the mean household size at
+            # hh_size while the population grows (v0.4 never created households: over a 50-year burn-in the mean
+            # size grew about 4-fold); the others join the household of a random existing person
+            k = len(np.unique(np.asarray(self.hh[have]))) if len(have) else 0
+            need = int(np.clip(np.ceil((len(have) + n) / P["hh_size"]) - k, 0, n)) if len(have) else n
+            order = rs.permutation(n)
+            fnd, join = u[order[:need]], u[order[need:]]
+            if len(fnd):
+                start = (float(np.max(np.asarray(self.hh[have]))) + 1) if len(have) else 0.0
+                zh, z2 = rs.normal(size=len(fnd)), rs.normal(size=len(fnd))
+                c = P["cov_corr"]
+                self.hh[fnd] = start + np.arange(len(fnd))
+                self.z_hh[fnd] = zh
+                self.z_sp[fnd] = c * zh + np.sqrt(1 - c * c) * z2
+            if len(join):
+                donor = have[rs.integers(0, len(have), size=len(join))]
+                self.hh[join] = self.hh[donor]
+                self.z_hh[join] = self.z_hh[donor]
+                self.z_sp[join] = self.z_sp[donor]
         r, a = P["hh_net_corr"], P["exp_corr"]
         z_net = np.sqrt(r) * self.z_hh[u] + np.sqrt(1 - r) * rs.normal(size=n)
         self.prop_net[u] = ndtr(z_net)
