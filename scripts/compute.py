@@ -99,6 +99,8 @@ REPO = os.path.dirname(HERE)
 # Repo code a run's model may import (Phase 42 ε: toolkit/, e.g. toolkit/alloc).
 REPO_CODE_DIRS = ("scripts", "toolkit")
 DEFAULT_MAX_TASKS = 20000
+RUN_CAP_CORE_HOURS = "200"         # MA_COMPUTE_MAX_CORE_HOURS when unset: the run-wide cap
+CORES_PER_WORKER = 8               # MA_COMPUTE_CORES_PER_WORKER when unset and no worker reports its cores
 DEFAULT_MAX_FILE_MB = 100
 LEDGER_REL = os.path.join("models", "compute_ledger.json")
 
@@ -297,6 +299,46 @@ def _chunks(items: list, n_chunks: int) -> list:
 
 
 CAP_STOP = "stopped: compute cap reached"
+
+
+# v2 (Nigeria full run, 2026-11-02): scripts/pipeline.py's fixed 1-h limit killed an engine batch at 184 of 256
+# design points. A pipeline step that runs the run's batches gets its wall-clock limit from the run cap instead.
+STEP_WALL_MARGIN = 2.0              # workers join late, tasks do not pack perfectly, a lost VM reruns its inputs
+STEP_WALL_OWN_S = 3600.0            # the step's own work besides the batches (what the fixed limit allowed)
+STEP_WALL_CEILING_S = 24 * 3600.0
+
+
+def step_wall_s(environ=None) -> float | None:
+    """Wall-clock limit for a pipeline step that runs the run's engine batches: the time the cluster's target pool
+    (MA_COMPUTE_TARGET_WORKERS x MA_COMPUTE_PROCS_PER_WORKER or MA_COMPUTE_CORES_PER_WORKER cores) takes to use
+    the whole run cap (MA_COMPUTE_MAX_CORE_HOURS), times STEP_WALL_MARGIN, plus STEP_WALL_OWN_S, at most
+    STEP_WALL_CEILING_S. The ledger holds every call in the step to the run cap, so this limit is a backstop that
+    the cap reaches first on a busy pool. None without a cluster (none of MA_COMPUTE_SCHEDULER, MA_COMPUTE_RESOURCE,
+    MA_COMPUTE_TARGET_WORKERS): the runner's default applies. A value that is not a finite number of the right
+    kind raises ValueError (fail closed: the run must not start on a budget nobody can read)."""
+    env = os.environ if environ is None else environ
+    if not any(env.get(k) for k in ("MA_COMPUTE_SCHEDULER", "MA_COMPUTE_RESOURCE", "MA_COMPUTE_TARGET_WORKERS")):
+        return None
+
+    def num(key, default, kind):
+        raw = env.get(key)
+        if raw is None or str(raw).strip() == "":
+            return default
+        try:
+            v = kind(str(raw).strip())
+        except ValueError:
+            raise ValueError(f"{key}={raw!r} is not {'an integer' if kind is int else 'a number'}") from None
+        if v != v or v in (float("inf"), float("-inf")) or v < 0:
+            raise ValueError(f"{key}={raw!r} must be a finite number >= 0")
+        return v
+    cap_h = num("MA_COMPUTE_MAX_CORE_HOURS", float(RUN_CAP_CORE_HOURS), float)
+    workers = max(1, num("MA_COMPUTE_TARGET_WORKERS", 1, int))      # 0 or unset: no target, count one
+    cores = num("MA_COMPUTE_PROCS_PER_WORKER", None, int)
+    if cores is None:
+        cores = num("MA_COMPUTE_CORES_PER_WORKER", CORES_PER_WORKER, int)
+    if cores < 1:
+        raise ValueError(f"cores per worker must be >= 1, got {cores}")
+    return min(STEP_WALL_CEILING_S, STEP_WALL_MARGIN * cap_h * 3600 / (workers * cores) + STEP_WALL_OWN_S)
 
 
 def _budget_deadline(deadline, allowance_s, cores):
@@ -1124,7 +1166,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
         env_procs = os.environ.get("MA_COMPUTE_PROCS_PER_WORKER")
         cpus = c.run(os.cpu_count, workers=workers) if workers else {}
         procs = {w: int(env_procs) if env_procs else (cpus.get(w) or 1) for w in workers}   # compute VMs run nothing else
-        cores_per_slot = max(procs.values()) if procs else int(env_procs or os.environ.get("MA_COMPUTE_CORES_PER_WORKER") or 8)
+        cores_per_slot = max(procs.values()) if procs else int(env_procs or os.environ.get("MA_COMPUTE_CORES_PER_WORKER") or CORES_PER_WORKER)
         pool = max(len(workers), target if res else 0, 1)        # the pool the batch may grow into
         chunks = _chunks(list(enumerate(inputs)), pool * chunks_per_worker)
         slots = max(1, min(pool, len(chunks)))   # _remote_task runs one chunk at a time per VM
@@ -1890,7 +1932,7 @@ def map_fn(run_dir: str, fn_spec: str, inputs: list, backend: str = "auto",
         backend = "dask" if os.environ.get("MA_COMPUTE_SCHEDULER") else "local"
     progress = {"_rows": on_rows}
     if ledger:
-        cap_s = float(os.environ.get("MA_COMPUTE_MAX_CORE_HOURS", "200")) * 3600
+        cap_s = float(os.environ.get("MA_COMPUTE_MAX_CORE_HOURS", RUN_CAP_CORE_HOURS)) * 3600
         with _LedgerLock(run_dir) as led:
             held = _live_reservations(led)
             remaining = cap_s - led["core_seconds"] - held
@@ -2005,14 +2047,18 @@ def input_key(params) -> str:
 
 
 _FP_SKIP_EXT = (".log", ".out", ".err", ".png", ".pdf", ".svg", ".jpg", ".jpeg", ".tmp", ".lock", ".pyc")
+# scripts/pipeline.py's definition and records (models/pipeline.yaml, pipeline_state.json, pipeline_report.json):
+# no model reads them, and the runner rewrites them when a step fails or its limit changes, which would discard the
+# partial rows of the batch that step was running (Nigeria v2 full run, 2026-11-02).
+_FP_RUNNER_FILES = ("pipeline.yaml", "pipeline_state.json", "pipeline_report.json")
 _FP_HASH_MB = 64           # files up to this size are fingerprinted by content, larger ones by size and mtime
 
 
 def code_fingerprint(run_dir: str, fn_spec: str, exclude=()) -> str:
     """What a result depends on besides its params: every file under the run's
     models/ and data/ (following symlinked directories) and the repo's
-    scripts/ and toolkit/, except (outside data/) logs, figures, summaries, the ledger, and
-    this call's own results file (`exclude`), and any batch's partial rows or
+    scripts/ and toolkit/, except (outside data/) logs, figures, summaries, the ledger, the
+    pipeline runner's own files in models/ (_FP_RUNNER_FILES), and this call's own results file (`exclude`), and any batch's partial rows or
     detached-job record; files up to 64 MB by content, larger ones by
     size and mtime. Any change and earlier rows are not reused."""
     run_dir = os.path.realpath(run_dir)
@@ -2041,11 +2087,13 @@ def code_fingerprint(run_dir: str, fn_spec: str, exclude=()) -> str:
                     links.append(f"{os.path.join(dp, x)}->{os.readlink(os.path.join(dp, x))}")
             names = set(fns)
             in_data = root == os.path.join(run_dir, "data")
+            runner = dp == os.path.join(run_dir, "models")
             for fn in fns:
                 is_output = fn + ".summary.json" in names     # another call's results file, any extension
                 if not in_data and not is_output and (fn.endswith(_FP_SKIP_EXT) or fn.endswith(".summary.json")
                                                       or fn.endswith((PARTIAL_EXT, JOB_EXT))
-                                                      or fn.startswith("compute_ledger.json")):
+                                                      or fn.startswith("compute_ledger.json")
+                                                      or (runner and fn in _FP_RUNNER_FILES)):
                     continue          # logs, figures, summaries, the ledger (never skipped under data/)
                 files.add(os.path.join(dp, fn))
     for ln in sorted(links):
@@ -2808,7 +2856,8 @@ def _self_test_wall(ok) -> None:
        "SW1 without a cluster there is no derived limit (the runner's default applies)")
     ok(step_wall_s(cl) == 20475 and step_wall_s(dict(cl, MA_COMPUTE_PROCS_PER_WORKER="4")) == 2 * 150 * 3600 / 32 + 3600,
        f"SW2 the run cap on the target pool, twice, plus an hour: {step_wall_s(cl)}")
-    ok(step_wall_s(dict(cl, MA_COMPUTE_TARGET_WORKERS="")) == 2 * 150 * 3600 / 8 + 3600 > step_wall_s(cl)
+    small = dict(cl, MA_COMPUTE_MAX_CORE_HOURS="20")
+    ok(step_wall_s(dict(small, MA_COMPUTE_TARGET_WORKERS="")) == 2 * 20 * 3600 / 8 + 3600 > step_wall_s(small)
        and step_wall_s(dict(cl, MA_COMPUTE_MAX_CORE_HOURS="1e6")) == 24 * 3600,
        "SW3 an unknown pool counts as one worker; the limit has a 24-h ceiling")
     bad = []

@@ -782,12 +782,12 @@ class Machine:
                 j["status"] = "interrupted"
 
     # -------------------------------------------------- plumbing
-    def _go(self, to: str, why: str = "", status: str | None = None) -> str:
+    def _go(self, to: str, why: str = "", status: str | None = None, extra: dict | None = None) -> str:
         frm = self.st.state
         if to not in EDGES[frm]:
             raise RuntimeError(f"transition {frm} -> {to} is not in the state table")
         self.st.history.append({"at": _now(), "from": frm, "to": to, "why": why, "round": self.st.round,
-                                "spent_usd": round(self.st.spent_usd, 4)})
+                                "spent_usd": round(self.st.spent_usd, 4), **(extra or {})})
         self.st.state = to
         if to == "FINAL":
             self.st.status = self.st.forced_status or status or "completed_gate_error"
@@ -1081,16 +1081,48 @@ class Machine:
         self.st.engine = pick
         return self._go("CONFIGURE", f"engine {pick}")
 
+    def _write_pipeline(self) -> str | None:
+        """models/pipeline.yaml from the backend's steps (their limits from the compute budget as it is now), or why
+        it could not be written (fail closed: an unreadable budget stops the run before any compute)."""
+        import yaml
+        try:
+            steps = self.backend.pipeline_steps(os.path.join(self.run_dir, AB.SPEC_FILE), self.run_dir)
+        except Exception as e:  # noqa: BLE001
+            return f"the pipeline could not be written: {type(e).__name__}: {e}"
+        os.makedirs(os.path.join(self.run_dir, "models"), exist_ok=True)
+        with open(os.path.join(self.run_dir, "models", "pipeline.yaml"), "w") as f:
+            yaml.safe_dump({"version": 1, "steps": steps}, f, sort_keys=False)
+        return None
+
+    def reopen_interrupted_analysis(self) -> str | None:
+        """--resume of a run that ended run_failed because its analysis step timed out or was killed
+        (resumable_failure): back to ANALYZE with the pipeline rewritten, so the step's limit follows the compute
+        budget as it is now and the engine batch keeps the rows it had finished (scripts/compute.py reuses them).
+        Recorded in the history as FINAL -> ANALYZE; outside the state table on purpose, since no handler may take
+        it. Returns the cause, or None when the run is not resumable (it stays as it is)."""
+        cause = resumable_failure(self.run_dir, self.st)
+        if cause is None:
+            return None
+        err = self._write_pipeline()
+        if err:
+            self.log(f"[machine] not resumed: {err}")
+            return None
+        self.st.history.append({"at": _now(), "from": "FINAL", "to": "ANALYZE", "round": self.st.round,
+                                "why": f"resumed: the analysis step had {'timed out' if cause == 'timeout' else 'been killed'}",
+                                "resumed_from": self.st.status, "spent_usd": round(self.st.spent_usd, 4)})
+        self.st.state, self.st.status = "ANALYZE", None
+        save_state(self.run_dir, self.st)
+        self.log(f"[machine] FINAL -> ANALYZE (resumed after an analysis {cause})")
+        return cause
+
     def h_CONFIGURE(self):
         import pipeline as P
-        import yaml
         errs = self.backend.validate(os.path.join(self.run_dir, AB.SPEC_FILE))
         if errs:
             return self._go("FINAL", f"spec invalid for the engine: {'; '.join(errs)[:200]}", "run_failed")
-        os.makedirs(os.path.join(self.run_dir, "models"), exist_ok=True)
-        with open(os.path.join(self.run_dir, "models", "pipeline.yaml"), "w") as f:
-            yaml.safe_dump({"version": 1, "steps": self.backend.pipeline_steps(
-                os.path.join(self.run_dir, AB.SPEC_FILE), self.run_dir)}, f, sort_keys=False)
+        err = self._write_pipeline()
+        if err:
+            return self._go("FINAL", f"configure failed: {err}"[:300], "run_failed")
         steps, _errs = P.load(self.run_dir)
         if not any(s_.get("id") == "configure" for s_ in steps):    # workstream B: one analyze step
             return self._go("ANALYZE", "pipeline written (no separate configure step)")
@@ -1102,7 +1134,9 @@ class Machine:
     def h_ANALYZE(self):
         rep = self.rebuild(self.run_dir)
         if not rep.get("ok"):
-            return self._go("FINAL", f"analysis failed: {_rep_error(rep)}", "run_failed")
+            cause = analysis_failure_cause(rep)
+            why = f"analysis failed: {_rep_error(rep)}" + ("; resumable with --resume" if cause else "")
+            return self._go("FINAL", why, "run_failed", extra={"resumable": cause} if cause else None)
         return self._go("CRITIQUE", "analysis built")
 
     def h_CRITIQUE(self):
@@ -1286,6 +1320,50 @@ def _rep_error(rep: dict) -> str:
     return "; ".join(str(e) for e in errs)[:300]
 
 
+# A step killed by these signals was stopped from outside (out of memory, a stop); a crash (SIGSEGV...) is not.
+_KILL_SIGNALS = (9, 15, 2, 1)     # SIGKILL, SIGTERM, SIGINT, SIGHUP
+
+
+def analysis_failure_cause(rep: dict) -> str | None:
+    """'timeout' or 'killed' when the pipeline report's only failures are steps that ran out of wall-clock time
+    (scripts/pipeline.py `_run_cmd`) or died of an external signal, with the steps below them skipped; None for
+    anything else (a step that exited with an error, a crash, missing inputs, a validation error)."""
+    if not isinstance(rep, dict) or rep.get("errors"):
+        return None
+    cause = None
+    for s in rep.get("steps") or []:
+        if not isinstance(s, dict) or s.get("status") == "ok":
+            continue
+        rc, err = s.get("returncode"), str(s.get("error") or "")
+        if s.get("status") == "skipped" and err.startswith("upstream step not rebuilt"):
+            continue
+        if s.get("status") == "failed" and rc is None and err.startswith("timed out after "):
+            cause = cause or "timeout"
+        elif s.get("status") == "failed" and type(rc) is int and -rc in _KILL_SIGNALS:
+            cause = cause or "killed"
+        else:
+            return None
+    return cause
+
+
+def resumable_failure(run_dir: str, st: RunState) -> str | None:
+    """Why this run may be resumed at ANALYZE ('timeout' | 'killed'), or None: only a run that ended run_failed on
+    its ANALYZE -> FINAL transition, whose pipeline report (models/pipeline_report.json, written by the harness's
+    run) says the analysis was interrupted. Read from the report, so a run that failed before the history carried
+    the `resumable` marker is classified the same way."""
+    if st.state != "FINAL" or st.status != "run_failed" or not st.history:
+        return None
+    last = st.history[-1]
+    if not isinstance(last, dict) or last.get("from") != "ANALYZE" or last.get("to") != "FINAL":
+        return None
+    try:
+        with open(os.path.join(run_dir, "models", "pipeline_report.json")) as f:
+            rep = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return analysis_failure_cause(rep)
+
+
 def _with_abs_paths(spec: dict, run_dir: str) -> dict:
     return AB._abs_spec(spec, run_dir)
 
@@ -1370,10 +1448,13 @@ def init_run(run_dir: str, question: str, max_rounds: int = 3, signoff: str = "o
 
 
 def run_v2(question: str, run_dir: str, tasks, max_rounds: int = 3, signoff: str = "owner",
-           budget_usd: float | None = None, log=print, derive_unsandboxed: bool = False) -> str:
-    """Entry point for main.py --v2 (and the dry run). Resumes when run_state.json exists."""
+           budget_usd: float | None = None, log=print, derive_unsandboxed: bool = False, backend=None,
+           cross_engine_check: bool = True) -> str:
+    """Entry point for main.py --v2 (and the dry run). Resumes when run_state.json exists, also a run that ended
+    run_failed because its analysis step timed out or was killed (Machine.reopen_interrupted_analysis)."""
     st = init_run(run_dir, question, max_rounds, signoff, "v2", budget_usd, derive_unsandboxed=derive_unsandboxed)
-    m = Machine(run_dir, tasks, st, log=log)
+    m = Machine(run_dir, tasks, st, backend=backend, log=log, cross_engine_check=cross_engine_check)
+    m.reopen_interrupted_analysis()
     return m.run()
 
 
@@ -1979,12 +2060,19 @@ import os
 import sys
 sys.path.insert(0, {scripts!r})
 import compute
-rd = sys.argv[1]
-os.makedirs(os.path.join(rd, "analysis"), exist_ok=True)
-rows, _ = compute.run_map(rd, os.path.join(rd, "models", "toy_fn.py") + "::f", [{{"i": i}} for i in range(6)],
-                          os.path.join(rd, "analysis", "rows.jsonl"), backend="local", max_workers=1, purpose="toy batch")
-json.dump([bool(r.get("ok")) for r in rows], open(os.path.join(rd, "analysis", "toy_rows.json"), "w"))
-sys.exit(0 if all(r.get("ok") for r in rows) else 1)
+
+
+def main(rd):
+    os.makedirs(os.path.join(rd, "analysis"), exist_ok=True)
+    rows, _ = compute.run_map(rd, os.path.join(rd, "models", "toy_fn.py") + "::f", [{{"i": i}} for i in range(6)],
+                              os.path.join(rd, "analysis", "rows.jsonl"), backend="local", max_workers=1,
+                              purpose="toy batch")
+    json.dump([bool(r.get("ok")) for r in rows], open(os.path.join(rd, "analysis", "toy_rows.json"), "w"))
+    return 0 if all(r.get("ok") for r in rows) else 1
+
+
+if __name__ == "__main__":         # the local pool's spawned processes import this file again
+    sys.exit(main(sys.argv[1]))
 '''
 
 
@@ -2059,7 +2147,7 @@ def _self_test_resume(ok, td: str, spike, new_run) -> None:
        and "resumable" not in st.history[-1]
        and resumable_failure(d, st) is None,
        f"T60 an analysis step that fails on its own stays run_failed on resume ({s1}, {s2}, {st.history[-1]})")
-    rep = {"ok": False, "errors": [], "steps": [{"id": "analyze", "status": "failed", "returncode": rc, "error": e}]}
+    rep = {"ok": False, "errors": [], "steps": [{"id": "analyze", "status": "failed", "returncode": 1, "error": ""}]}
     causes = [analysis_failure_cause(dict(rep, steps=[dict(rep["steps"][0], returncode=rc, error=e)]))
               for rc, e in ((-9, ""), (-15, ""), (-11, ""), (1, "boom"), (None, "OSError: no such file"))]
     ok(causes == ["killed", "killed", None, None, None],

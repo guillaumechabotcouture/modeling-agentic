@@ -60,7 +60,13 @@ def validate(spec, base: str | None = None) -> list[str]:
 def pipeline_steps(spec_path: str, run_dir: str) -> list[dict]:
     """One step: the analysis reads the spec and its data and writes analysis/ and the deliverables. The engine
     batch inside it is resumable (scripts/compute.py keeps rows per input), so a rerun after a spec edit only
-    computes what changed in the batch; the steps after it are cheap."""
+    computes what changed in the batch; the steps after it are cheap. On a cluster the step's wall-clock limit
+    (`timeout_s`) comes from the run's compute cap (scripts/compute.py `step_wall_s`); without one the runner's
+    default applies. An unreadable compute budget raises ValueError."""
+    if os.path.join(ROOT, "scripts") not in sys.path:
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    import compute
+    wall = compute.step_wall_s()
     spec = schema.load(spec_path)
     deps = [os.path.relpath(spec_path, run_dir), os.path.relpath(spec.resolve(spec["decision_units"]["csv"]), run_dir)]
     if spec.settings_path:
@@ -72,9 +78,12 @@ def pipeline_steps(spec_path: str, run_dir: str) -> list[dict]:
     # uncertainty_report.yaml and models/claims_ledger.yaml are written too, but S1 reserves them for their
     # registered producers (agents/enforcement.py); the manifest (and the contract checks) track them instead.
     outs = ["analysis/manifest.json", spec["deliverable"]["allocation_file"], "results.md"]
-    return [{"id": "analyze", "cmd": f"{sys.executable} {os.path.join(ROOT, 'toolkit', 'analysis', 'run.py')} {run_dir} "
-                                     f"--spec {os.path.relpath(spec_path, run_dir)}",
-             "inputs": deps, "outputs": outs, "produced_by": "harness"}]
+    step = {"id": "analyze", "cmd": f"{sys.executable} {os.path.join(ROOT, 'toolkit', 'analysis', 'run.py')} {run_dir} "
+                                    f"--spec {os.path.relpath(spec_path, run_dir)}",
+            "inputs": deps, "outputs": outs, "produced_by": "harness"}
+    if wall is not None:
+        step["timeout_s"] = round(wall)
+    return [step]
 
 
 def headline(run_dir: str) -> dict:
