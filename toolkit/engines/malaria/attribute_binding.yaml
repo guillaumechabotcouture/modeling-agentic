@@ -48,3 +48,6 @@ attribute_binding:
   itn_routine_interval:
     default: none
     meaning: "no routine net campaign after the package's campaign (v0.6): nets from the last campaign decay to the window's end"
+  smc_routine:
+    default: 0
+    meaning: "no routine SMC after the delivery period (v0.7): the package's SMC ends with the delivery period and no arm gets SMC afterwards"

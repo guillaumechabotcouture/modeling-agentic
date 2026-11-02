@@ -389,15 +389,24 @@ class IRSRound(ss.Intervention):
 
 class SMCDelivery(ss.Intervention):
     """SMC monthly cycles for 3-59 months: clears infection, 28-day protection with
-    efficacy `pe`; semi-correlated cycle coverage (high / low access groups)."""
-    def __init__(self, years=(), months=(7, 8, 9, 10), pe=0.882, hi_frac=0.85, p_hi=0.95, p_lo=0.5, name=None):
+    efficacy `pe`; semi-correlated cycle coverage (high / low access groups).
+    v0.7: `count` False never adds doses to the cost driver (routine SMC); `after` / `before` keep only the rounds
+    at decimal times after <= t < before (None: no bound)."""
+    def __init__(self, years=(), months=(7, 8, 9, 10), pe=0.882, hi_frac=0.85, p_hi=0.95, p_lo=0.5, name=None,
+                 count=True, after=None, before=None):
         super().__init__(name=name)
         self.years, self.months, self.pe = list(years), list(months), pe
         self.hi_frac, self.p_hi, self.p_lo = hi_frac, p_hi, p_lo
+        self.count, self.after, self.before = count, after, before
+
+    def targets(self):
+        """The decimal times of the rounds."""
+        return [t for t in (y + (m - 1) / 12 for y in self.years for m in self.months)
+                if (self.after is None or t >= self.after) and (self.before is None or t < self.before)]
 
     def step(self):
         if not hasattr(self, '_tis'):
-            self._tis = _event_tis(self.sim, [y + (m - 1) / 12 for y in self.years for m in self.months])
+            self._tis = _event_tis(self.sim, self.targets())
         if self.ti in self._tis:
             dz = self.sim.diseases.malaria
             u = self.sim.people.auids
@@ -405,7 +414,7 @@ class SMCDelivery(ss.Intervention):
             e = u[(a >= 0.25) & (a < 5)]
             hi = dz.prop_smc[e] < self.hi_frac
             got = e[dz.rs.random(len(e)) < np.where(hi, self.p_hi, self.p_lo)]
-            if dz.in_delivery():
+            if self.count and dz.in_delivery():
                 dz.acc_cost['smc_doses'] += len(got) / len(u)
             dz.st[got] = S_
             dz.prot_until[got] = self.ti + 28
