@@ -116,6 +116,10 @@ class RunConfig:
             raise ValueError("adapt_interval must be positive")
         if self.overflow_max and not self.overflow_vm_types:
             raise ValueError("overflow_max needs overflow_vm_types")
+        if self.compute_start < 1 and (self.compute_env or {}).get("MA_COMPUTE_RESOURCE"):
+            raise ValueError("compute_start must be at least 1 when compute tasks need a resource tag "
+                             "(MA_COMPUTE_RESOURCE): with no tagged worker the autoscaler's target stays at the "
+                             "current pool, so the pool never grows")
 
     @property
     def state_file(self):
@@ -337,7 +341,7 @@ def launch(cfg):
         clusters["keeper"] = {"name": cfg.keeper_name, "id": kc.cluster_id}
         json.dump(clusters, open(cfg.clusters_file, "w"), indent=1)   # recorded before any read that can fail
         time.sleep(30)
-        confirm_keeper(cfg.keeper_name, kc)
+        confirm_keeper(cfg.keeper_name, kc, run_alive=lambda: is_running(cfg.name))
     print(f"launched {cfg.name}: results go to outputs/{cfg.storage_prefix}/; the cluster stops itself "
           "once every run is stored. Safe to disconnect.")
 
@@ -411,7 +415,7 @@ def start_keeper(cfg, adapt_opts, cluster_id, overflow=None):
 KEEPER_TICK = re.compile(r"\bworkers=\d+ \(overflow \d+\)")   # _keeper_loop's tick line
 
 
-def confirm_keeper(keeper_name, kc, attempts=8, delay_s=5.0, max_delay_s=60.0, sleep=None):
+def confirm_keeper(keeper_name, kc, attempts=8, delay_s=5.0, max_delay_s=60.0, sleep=None, run_alive=None):
     """Wait (bounded, doubling backoff) for the keeper's first tick line: it is written only
     after adapt() and a worker-table read, so it is the evidence the pool is held; a readable
     log alone ("(no log yet)", "keeper error ...; retrying") is not. The keeper cluster's
@@ -441,6 +445,17 @@ def confirm_keeper(keeper_name, kc, attempts=8, delay_s=5.0, max_delay_s=60.0, s
         if i < attempts - 1:
             sleep(delay)
             delay = min(max_delay_s, delay * 2)
+    # A run that ended (or paused) before the keeper's first tick stops its own cluster, and the keeper then exits
+    # by design: nothing is left to hold, so this is reported, not a launch failure.
+    try:
+        stopped = run_alive is not None and not run_alive()
+    except Exception:  # noqa: BLE001 — unknown run state: fail as before
+        stopped = False
+    if stopped:
+        msg = (f"keeper {keeper_name}: not confirmed, but the run cluster has already stopped (the run ended or paused "
+               "before the keeper's first tick), so the keeper exited by design; check `status` before relaunching")
+        print(msg)
+        return [msg]
     raise SystemExit(f"keeper {keeper_name} (cluster {kc.cluster_id}) was submitted but not confirmed holding "
                      f"the pool after {attempts} tries (last: {last[0][:200]}). The run is fired and the clusters "
                      f"file names the keeper; check `status` and `keeper-log` now (without a keeper the pool "
@@ -990,6 +1005,17 @@ def _self_test_42b(ok, RunConfig) -> None:
             ok(False, f"RC25 rejects {why}")
         except ValueError:
             ok(True, f"RC25 rejects {why}")
+    # 2026-11-01 (local check against distributed 2026.8.0): with no worker carrying the compute resource, compute.py's
+    # queued chunks and demand markers leave adaptive_target at 1 (their duration is unknown until a chunk has run),
+    # so a pool that starts with no compute VM never grows and the batch waits forever.
+    try:
+        RunConfig(name="t", question_file="/dev/null", compute_start=0, compute_env={"MA_COMPUTE_RESOURCE": "compute"})
+        ok(False, "RC25b a resource-tagged pool with no compute VM at start is refused (it cannot scale up)")
+    except ValueError as e:
+        ok("compute_start" in str(e), f"RC25b a resource-tagged pool with no compute VM at start is refused: {e}")
+    ok(RunConfig(name="t", question_file="/dev/null", compute_start=1,
+                 compute_env={"MA_COMPUTE_RESOURCE": "compute"}).compute_start == 1,
+       "RC25c one compute VM at start is accepted")
     q = ws.quota_refusal(E7R7_REFUSAL)
     ok(q == {"family": "standardEv5Family", "limit": 350, "usage": 344, "required": 8},
        f"RC26 the attempt-7 quota refusal parses: {q}")
@@ -1157,6 +1183,25 @@ def _self_test_52(ok) -> None:
         line = confirm_keeper("x-keeper", types.SimpleNamespace(cluster_id=11, get_client=lambda: late),
                               attempts=4, delay_s=0.0, sleep=lambda s: None)
     ok("workers=3" in str(line), f"RC52i a keeper whose first tick comes late is confirmed once it ticks: {line}")
+
+    # v2-nigeria-gf13-full (2026-11-01): the run paused for sign-off and its cluster stopped ~5 min after it was fired,
+    # before the keeper's first tick; the keeper then exited by design ("run cluster stopped") and the launch failed
+    # with "not confirmed holding the pool". A run cluster that has stopped is reported as such, not as a failure.
+    kc4 = types.SimpleNamespace(cluster_id=12, get_client=lambda: FakeClient([{}], status="closed"))
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            line = confirm_keeper("x-keeper", kc4, attempts=2, delay_s=0.0, sleep=lambda s: None,
+                                  run_alive=lambda: False)
+        ok("run cluster" in str(line) and "stopped" in str(line),
+           f"RC52m a run cluster that stopped before the keeper ticked is reported, not a launch failure: {line}")
+    except SystemExit as e:
+        ok(False, f"RC52m a run cluster that stopped before the keeper ticked is reported, not a launch failure: {e}")
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            confirm_keeper("x-keeper", kc4, attempts=2, delay_s=0.0, sleep=lambda s: None, run_alive=lambda: True)
+        ok(False, "RC52n a live run with an unconfirmed keeper still fails the launch")
+    except SystemExit as e:
+        ok("not confirmed" in str(e), f"RC52n a live run with an unconfirmed keeper still fails the launch: {e}")
 
     # Codex round 1: launch keeps the replacement client for the rest of the launch.
     from unittest import mock
