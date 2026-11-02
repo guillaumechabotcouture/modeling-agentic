@@ -1,0 +1,151 @@
+producer: toolkit/engines/malaria/benchmarks/restamp_proof.py
+old:
+  ref: origin/v2
+  commit: fd1ef9a1cc559c9f5c7a464d74a59edabbe0e27b
+  identity:
+    code_sha256: 1a4b27a4315a440dbd64b3b7fcde1d53e1bb9f2c7399d4a62cb15239d20b036e
+    config_sha256: eb9d39627ddda563f781e8a6f7a32f71f13e454576e7e2de0f77b946ad4c7489
+    name: malaria-starsim
+    params_sha256: 04b1cab140eb45c36aa89d24656fddfdf500d28596f50523dcdd606ae2de6992
+    version: '0.5'
+  engine_version: '0.5'
+new:
+  commit_of_tree_base: 23567732b99cca82e73e705c031d8da82791eb29
+  identity:
+    code_sha256: 108665c0c1af3a21362ea55853caf8d147ce5b37ee1b98433eb19d84a749c393
+    config_sha256: 32abb939985579aca3bfa2ca2b30201ea61d29bfc1d0a81e7e1265b2e11625e5
+    name: malaria-starsim
+    params_sha256: 04b1cab140eb45c36aa89d24656fddfdf500d28596f50523dcdd606ae2de6992
+    version: '0.6'
+  engine_version: '0.6'
+scope:
+  pack_settings:
+  - benin
+  - ce_ref
+  - ce_res
+  - cochrane_itn
+  - eir_1
+  - eir_10
+  - eir_100
+  - eir_3
+  - eir_30
+  - eir_300
+  - irs_added
+  - misungwi
+  - muleba
+  - sahel_smc
+  pack_arms: every arm of each setting, in one run_batch per setting and seed
+  seeds:
+  - 11
+  n_agents: each setting's own (pack.yaml params; 5000 where set, else the card's 4000); equilibration 4000; guess
+    sensitivity the card's 4000
+  burnin_years: the card's (50), the pack's own
+  evidence_cases:
+  - - equilibration
+    - - 3.5
+      - base
+      - burnin_years: 50
+      - 1
+  - - equilibration
+    - - 28.0
+      - doubled
+      - burnin_years: 100
+      - 1
+  - - equilibration
+    - - 9.0
+      - guess_hi
+      - burnin_years: 50
+        init_eir_per_m0: 2.4
+      - 2
+  - - guess_sensitivity
+    - - 3.5
+      - x1
+      - 1
+      - 50
+  - - guess_sensitivity
+    - - 28.0
+      - x0.25
+      - 2
+      - 50
+  not_repeated: calibration-grid runs (same code path at other attribute values)
+  compared: per_capita, windows, cost_drivers and meta (minus wall-clock seconds) exactly as JSON; initial-state
+    dicts exactly
+cases:
+  equilibration:28.0:doubled:seed1:
+    equal: true
+    old_sha256: 2b5d90a767f83286eeafbb87b49a06d7971ce7b36f18446051d435177a113307
+    new_sha256: 2b5d90a767f83286eeafbb87b49a06d7971ce7b36f18446051d435177a113307
+  equilibration:3.5:base:seed1:
+    equal: true
+    old_sha256: 0dc727a06d158c9663fb6bbecdbe6db7880a1baab74a991ef171995bf50cc3f1
+    new_sha256: 0dc727a06d158c9663fb6bbecdbe6db7880a1baab74a991ef171995bf50cc3f1
+  equilibration:9.0:guess_hi:seed2:
+    equal: true
+    old_sha256: 5ead0b325f596d1c3fa0c9075d7ba3cc1b458660ef7e84d98585b7351dd21f44
+    new_sha256: 5ead0b325f596d1c3fa0c9075d7ba3cc1b458660ef7e84d98585b7351dd21f44
+  guess_sensitivity:28.0:x0.25:seed2:
+    equal: true
+    old_sha256: 826b9ce26040fef80bcdee496759bfd69d14fa1d20e72c3c2eadac792861fff1
+    new_sha256: 826b9ce26040fef80bcdee496759bfd69d14fa1d20e72c3c2eadac792861fff1
+  guess_sensitivity:3.5:x1:seed1:
+    equal: true
+    old_sha256: dc5993923146c427ca91a24fb993993cb3503e8c03bedab569ef33eee943f3b6
+    new_sha256: dc5993923146c427ca91a24fb993993cb3503e8c03bedab569ef33eee943f3b6
+  pack:benin:11:
+    equal: true
+    old_sha256: 2fbe17651e1aa36b2d156a186f77cb77aa18821f07f00ebcde354c671d9da743
+    new_sha256: 2fbe17651e1aa36b2d156a186f77cb77aa18821f07f00ebcde354c671d9da743
+  pack:ce_ref:11:
+    equal: true
+    old_sha256: 19ec414a5b288e11a816a18b581136f3cc674d229a996950937435f465e258c4
+    new_sha256: 19ec414a5b288e11a816a18b581136f3cc674d229a996950937435f465e258c4
+  pack:ce_res:11:
+    equal: true
+    old_sha256: dd59d9a5170b4977cdf089a3f9e0fe9900adb38e43c4b083670a91564f6a4224
+    new_sha256: dd59d9a5170b4977cdf089a3f9e0fe9900adb38e43c4b083670a91564f6a4224
+  pack:cochrane_itn:11:
+    equal: true
+    old_sha256: 7de1a36943d15d393be154cc513173b2930b24153dbe4ade29b8df084d455727
+    new_sha256: 7de1a36943d15d393be154cc513173b2930b24153dbe4ade29b8df084d455727
+  pack:eir_100:11:
+    equal: true
+    old_sha256: 2b562adda33d2ec7ae7ee9cb722b01bf195db9e528a21a0baa05345d3d6d4ba8
+    new_sha256: 2b562adda33d2ec7ae7ee9cb722b01bf195db9e528a21a0baa05345d3d6d4ba8
+  pack:eir_10:11:
+    equal: true
+    old_sha256: 9c130e8afc6fd8bfb9ba2d434a77faef9ac3a3c4875d3bc3574a11d449b1b775
+    new_sha256: 9c130e8afc6fd8bfb9ba2d434a77faef9ac3a3c4875d3bc3574a11d449b1b775
+  pack:eir_1:11:
+    equal: true
+    old_sha256: 12b97fc0d1f5d2ea63bdfada4032f6c180a1a7404294cf2d23272874f197bdb8
+    new_sha256: 12b97fc0d1f5d2ea63bdfada4032f6c180a1a7404294cf2d23272874f197bdb8
+  pack:eir_300:11:
+    equal: true
+    old_sha256: c783fe874272d71a88033c4b88f31527de329d69b5450d9cbcb47a4be4665437
+    new_sha256: c783fe874272d71a88033c4b88f31527de329d69b5450d9cbcb47a4be4665437
+  pack:eir_30:11:
+    equal: true
+    old_sha256: d380f5d2669ee70e7414c2d3ee631170b9628804b13918d3cb6c858d65222cc7
+    new_sha256: d380f5d2669ee70e7414c2d3ee631170b9628804b13918d3cb6c858d65222cc7
+  pack:eir_3:11:
+    equal: true
+    old_sha256: 8299928362d65b0fc9f7f21bef79a47ef5addb4c673f030652d36f7c01cc05bb
+    new_sha256: 8299928362d65b0fc9f7f21bef79a47ef5addb4c673f030652d36f7c01cc05bb
+  pack:irs_added:11:
+    equal: true
+    old_sha256: 22625ac44a5d0f67dfb679e9b44e01e2738d348d23dcd452288fbc2a89d4a180
+    new_sha256: 22625ac44a5d0f67dfb679e9b44e01e2738d348d23dcd452288fbc2a89d4a180
+  pack:misungwi:11:
+    equal: true
+    old_sha256: d68b9456b55afd883a55ebf851d169b2de102c0d95465fac35026576441c5cf5
+    new_sha256: d68b9456b55afd883a55ebf851d169b2de102c0d95465fac35026576441c5cf5
+  pack:muleba:11:
+    equal: true
+    old_sha256: ef9590b10a44ac75a952ae6b7730d79cdd592f4b5b8ff05f6e36f0dbd8a629fd
+    new_sha256: ef9590b10a44ac75a952ae6b7730d79cdd592f4b5b8ff05f6e36f0dbd8a629fd
+  pack:sahel_smc:11:
+    equal: true
+    old_sha256: 015792ce7d8e97b8ceba55dcc8986102124fadb90fc2271db6948187af7bd719
+    new_sha256: 015792ce7d8e97b8ceba55dcc8986102124fadb90fc2271db6948187af7bd719
+n_cases: 19
+identical: true

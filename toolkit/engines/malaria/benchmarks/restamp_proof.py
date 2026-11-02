@@ -39,6 +39,8 @@ import yaml
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(HERE))))
 REL = os.path.relpath(HERE, ROOT)                # toolkit/engines/malaria/benchmarks
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 OUT = os.path.join(HERE, "restamp_proof.yaml")
 STAMPED = ("results.yaml", "fitted.yaml", "equilibration.yaml", "guess_sensitivity.yaml")
 # (module, job args): equilibration arms at two levels and the guess-sensitivity batches at two levels, one seed each
