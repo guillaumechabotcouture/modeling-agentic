@@ -305,6 +305,29 @@ def _self_test() -> int:
         ok(False, "RP7 an identity the line edit cannot place fails closed")
     except ValueError:
         ok(True, "RP7 an identity the line edit cannot place fails closed")
+    # v0.7: a file already re-stamped once (v0.6) is re-stamped again; the earlier record moves under `previous`
+    p2 = {"identical": True, "scope": {"seeds": [11]},
+          "old": {"identity": {"name": "m", "version": "0.6", "code_sha256": "bb", "params_sha256": "pp"}},
+          "new": {"identity": {"name": "m", "version": "0.7", "code_sha256": "cc", "params_sha256": "pp"},
+                  "engine_version": "0.7"}}
+    try:
+        out2 = restamp_text(out, p2, "def")
+        r2 = yaml.safe_load(out2)
+        body = out[:out.index("restamped:")]
+        ok(r2["engine_identity"] == {"name": "m", "version": "0.7", "code_sha256": "cc", "params_sha256": "qq"}
+           and r2["engine_version"] == "0.7" and r2["restamped"]["old_identity"]["code_sha256"] == "bb"
+           and r2["restamped"]["old_engine_version"] == "0.6" and r2["restamped"]["proof_script_commit"] == "def"
+           and r2["restamped"]["previous"] == [r["restamped"]]
+           and out2.startswith(body.replace("'0.6'", "'0.7'").replace("bb", "cc")),
+           "RP8 a file re-stamped before is re-stamped again: identity lines updated, every other byte kept, the "
+           "earlier record kept under previous")
+    except Exception as ex:  # noqa: BLE001 -- a missing feature is a failing case
+        ok(False, f"RP8 a file re-stamped before is re-stamped again ({type(ex).__name__}: {ex})")
+    try:
+        restamp_text("engine_version: '0.6'\nrestamped:\n  by: x\nlevels: [2]\n", p2, "def")
+        ok(False, "RP9 a restamped record that is not the file's last key fails closed")
+    except ValueError:
+        ok(True, "RP9 a restamped record that is not the file's last key fails closed")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

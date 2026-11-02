@@ -657,6 +657,7 @@ def _self_test() -> int:
        f"M21 forward behaviour (Sochantha 2006 age interaction): nets cut all-age prevalence less than under-5 prevalence {rr}")
     _self_test_v05(ok, e, unit)
     _self_test_v06(ok, e, unit)
+    _self_test_v07(ok, e, unit)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -793,7 +794,7 @@ def _self_test_v06(ok, e, unit) -> None:
     full = Package("full", {"net": "pyr", "smc": 1, "irs": 1, "cm": 1})
 
     def d0():
-        ok(VERSION == "0.6" and getattr(e, "supports_delivery", False) is True
+        ok(tuple(int(x) for x in VERSION.split(".")) >= (0, 6) and getattr(e, "supports_delivery", False) is True
            and "itn_routine_interval" in e.describe().unit_attributes,
            "D0 engine v0.6 declares that it honours a delivery period and the routine-campaign attribute")
         b = yaml.safe_load(open(os.path.join(HERE, "attribute_binding.yaml")))["attribute_binding"]
@@ -882,6 +883,119 @@ def _self_test_v06(ok, e, unit) -> None:
             ok(a == b, f"D9 (seed {sd}) an explicit delivery period equal to the window gives byte-identical outcomes, "
                        f"cost drivers and meta for {len(pk)} packages")
     case("D9", d9)
+
+
+def _self_test_v07(ok, e, unit) -> None:
+    """v0.7: routine SMC in every arm after the delivery period (smc_routine). With the attribute absent or 0, a run is
+    byte-identical to v0.6 (R7; benchmarks/restamp_proof.py compares the v0.6 and v0.7 code on the pack's settings)."""
+    def case(label, fn):
+        try:
+            fn()
+        except Exception as ex:  # noqa: BLE001 -- a missing feature is a failing case, not a crash of the test
+            ok(False, f"{label} ({type(ex).__name__}: {ex})")
+
+    from toolkit.engines.horizon import DeliveryHorizon
+    base = {"n_agents": 1000, "burnin_years": 2}
+    season = [0.4, 0.4, 0.5, 0.7, 1.0, 1.4, 1.8, 2.0, 1.6, 1.0, 0.7, 0.5]
+    wins = {"y1": [2016.0, 2017.0], "y3": [2018.0, 2019.0]}
+    attrs = dict(unit.attributes, season=season, itn_hist_years=[2015.3], campaign_year=2016.1, irs_month=4)
+    u = UnitSpec("t", attrs)
+    ur = UnitSpec("t", dict(attrs, smc_routine=1))
+    hd = DeliveryHorizon(2015.0, 2019.0, (2016.0, 2019.0), dict(wins), delivery=(2016.0, 2017.0))
+    hw = Horizon(2015.0, 2019.0, (2016.0, 2019.0), dict(wins))     # no delivery period: SMC every window season
+    months = default_smc_months(np.asarray(season))
+    none, smc = Package("none", {}), Package("smc", {"smc": 1})
+    full = Package("full", {"net": "pyr", "smc": 1, "irs": 1, "cm": 1})
+
+    def r0():
+        ok(VERSION == "0.7" and "smc_routine" in e.describe().unit_attributes,
+           "R0 engine v0.7 declares the routine-SMC unit attribute on its card")
+        b = yaml.safe_load(open(os.path.join(HERE, "attribute_binding.yaml")))["attribute_binding"]
+        ok(isinstance(b.get("smc_routine"), dict) and str(b["smc_routine"].get("default")) == "0",
+           "R0b the routine-SMC attribute has the declared default 0 in attribute_binding.yaml (no routine SMC)")
+    case("R0", r0)
+
+    def r1():
+        want = [y + (m - 1) / 12 for y in (2017, 2018) for m in months]
+        for pkg, own in ((none, []), (full, [2016])):
+            sim, _ = e.build_sim(base, ur, pkg, hd, 3)
+            sim.init()
+            itv = sim.interventions
+            r = itv["smc_routine"]
+            ok(np.allclose(sorted(r.targets()), want) and itv["smc"].years == own and r.count is False
+               and list(r.months) == list(months),
+               f"R1 ({pkg.name}) routine SMC rounds in every season after the delivery period, in the unit's SMC months, "
+               f"uncounted; the package's own SMC only in delivery seasons: {sorted(r.targets())}, {itv['smc'].years}")
+        sim, _ = e.build_sim(base, UnitSpec("t", dict(attrs, smc_routine=0)), full, hd, 3)
+        sim.init()
+        ok("smc_routine" not in list(sim.interventions.keys()),
+           "R1b with smc_routine 0 no routine-SMC intervention is built (the v0.6 sim)")
+    case("R1", r1)
+
+    def r2():
+        r_none, r_smc = e.run_batch([base] * 2, ur, [none, smc], hd, 5)
+        n_none, n_smc = e.run_batch([base] * 2, u, [none, smc], hd, 5)
+        ok(r_none.meta["burnin_members"] == 2,
+           "R2 the comparator and the package share one burn-in and history with routine SMC")
+        k = "inc_u5_smc"
+        ok(r_none.windows["y3"][k] < 0.7 * n_none.windows["y3"][k] and r_smc.windows["y3"][k] < 0.7 * n_smc.windows["y3"][k],
+           f"R2b routine SMC acts after delivery in the comparator ({r_none.windows['y3'][k]:.3f} vs "
+           f"{n_none.windows['y3'][k]:.3f} without) and in the package ({r_smc.windows['y3'][k]:.3f} vs "
+           f"{n_smc.windows['y3'][k]:.3f})")
+        ok(r_none.windows["y1"] == n_none.windows["y1"] and r_none.per_capita["cases"]["u5"] < n_none.per_capita["cases"]["u5"],
+           "R4 comparator burden after delivery is lower where smc_routine = 1 (and identical in the delivery year)")
+        ok(r_none.cost_drivers["smc_doses"] == 0 and r_none.cost_drivers == n_none.cost_drivers
+           and r_smc.cost_drivers == n_smc.cost_drivers and r_smc.cost_drivers["smc_doses"] > 0,
+           f"R3 routine SMC is never charged: cost drivers are equal with and without it ({r_smc.cost_drivers} vs "
+           f"{n_smc.cost_drivers})")
+    case("R2", r2)
+
+    def r5():
+        a = e.run(base, ur, smc, hd, 7)          # package SMC in 2016, routine SMC in 2017 and 2018
+        b = e.run(base, u, smc, hw, 7)           # package SMC in every window season (no delivery period)
+        ok(a.per_capita == b.per_capita and a.windows == b.windows,
+           "R5 no rebound gap: SMC in the delivery period followed by routine SMC gives the same health outcomes as "
+           "SMC in every season of the window (no missing season, no double round)")
+        ok(0 < a.cost_drivers["smc_doses"] < 0.5 * b.cost_drivers["smc_doses"],
+           f"R5b only the delivery seasons are charged ({a.cost_drivers['smc_doses']:.3f} vs "
+           f"{b.cost_drivers['smc_doses']:.3f} for SMC charged in all three)")
+    case("R5", r5)
+
+    def r6():
+        def refused(h, at, pkg, needle, label):
+            try:
+                e.run(base, UnitSpec("t", dict(attrs, **at)), pkg, h, 1)
+                ok(False, label)
+            except ValueError as ex:
+                ok(needle in str(ex), f"{label} ({ex})")
+        refused(hw, {"smc_routine": 1}, none, "objective.delivery",
+                "R6 smc_routine = 1 without a delivery period fails closed")
+        refused(hd, {"smc_routine": 2}, none, "smc_routine", "R6b smc_routine other than 0 or 1 fails closed")
+        refused(hd, {"smc_routine": "yes"}, none, "smc_routine", "R6c a non-numeric smc_routine fails closed")
+        P = smc_schedule_problems
+        mo = (7,)
+        ok(P([2016.5], [2017.5, 2018.5], mo, 2016.0, 2017.0, 2019.0) == [],
+           "R6d the schedule check passes a continuous season sequence")
+        ok(any("missing" in p for p in P([2016.5], [2018.5], mo, 2016.0, 2017.0, 2019.0)),
+           "R6e the schedule check fails a missing season between the package's SMC and routine SMC")
+        ok(any("twice" in p for p in P([2016.5], [2016.5, 2017.5, 2018.5], mo, 2016.0, 2017.0, 2019.0)),
+           "R6f the schedule check fails a round given twice")
+        ok(any("inside the delivery period" in p for p in P([], [2016.5, 2017.5, 2018.5], mo, 2016.0, 2017.0, 2019.0)),
+           "R6g the schedule check fails a routine round inside the delivery period")
+    case("R6", r6)
+
+    def r7():
+        strip = lambda o: (o.per_capita, o.windows, o.cost_drivers,  # noqa: E731
+                           {k: v for k, v in o.meta.items() if k != "seconds"})
+        u0 = UnitSpec("t", dict(attrs, smc_routine=0))
+        pk = [none, smc, full]
+        small = {"n_agents": 400, "burnin_years": 2}
+        for h, nm in ((hd, "delivery"), (hw, "no delivery")):
+            a = [strip(o) for o in e.run_batch([small] * len(pk), u, pk, h, 5)]
+            b = [strip(o) for o in e.run_batch([small] * len(pk), u0, pk, h, 5)]
+            ok(a == b, f"R7 ({nm}) smc_routine = 0 gives byte-identical outcomes, cost drivers and meta to the "
+                       f"attribute absent for {len(pk)} packages")
+    case("R7", r7)
 
 
 def write_card(path: str) -> None:
