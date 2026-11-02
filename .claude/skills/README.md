@@ -1,6 +1,6 @@
 # Skills Index
 
-56 skills live here; agents attach them in `agents/__init__.py`
+58 skills live here; agents attach them in `agents/__init__.py`
 (`_registry()`). Each skill is a directory with a `SKILL.md` that opens
 with YAML frontmatter (`name` matching the directory, `description`)
 followed by the guidance body. `python3 scripts/validate_skill_attachments.py`
