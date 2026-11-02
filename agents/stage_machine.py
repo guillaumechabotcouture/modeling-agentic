@@ -1095,8 +1095,8 @@ class Machine:
         return None
 
     def reopen_interrupted_analysis(self) -> str | None:
-        """--resume of a run that ended run_failed because its analysis step timed out or was killed
-        (resumable_failure): back to ANALYZE with the pipeline rewritten, so the step's limit follows the compute
+        """--resume of a run that ended run_failed because its analysis step timed out, was killed, or lost engine
+        rows to the machine (resumable_failure): back to ANALYZE with the pipeline rewritten, so the step's limit follows the compute
         budget as it is now and the engine batch keeps the rows it had finished (scripts/compute.py reuses them).
         Recorded in the history as FINAL -> ANALYZE; outside the state table on purpose, since no handler may take
         it. Returns the cause, or None when the run is not resumable (it stays as it is)."""
@@ -1108,7 +1108,7 @@ class Machine:
             self.log(f"[machine] not resumed: {err}")
             return None
         self.st.history.append({"at": _now(), "from": "FINAL", "to": "ANALYZE", "round": self.st.round,
-                                "why": f"resumed: the analysis step had {'timed out' if cause == 'timeout' else 'been killed'}",
+                                "why": f"resumed: {_RESUME_WHY[cause]}",
                                 "resumed_from": self.st.status, "spent_usd": round(self.st.spent_usd, 4)})
         self.st.state, self.st.status = "ANALYZE", None
         save_state(self.run_dir, self.st)
@@ -1134,7 +1134,7 @@ class Machine:
     def h_ANALYZE(self):
         rep = self.rebuild(self.run_dir)
         if not rep.get("ok"):
-            cause = analysis_failure_cause(rep)
+            cause = analysis_failure_cause(rep, self.run_dir)
             why = f"analysis failed: {_rep_error(rep)}" + ("; resumable with --resume" if cause else "")
             return self._go("FINAL", why, "run_failed", extra={"resumable": cause} if cause else None)
         return self._go("CRITIQUE", "analysis built")
@@ -1320,14 +1320,19 @@ def _rep_error(rep: dict) -> str:
     return "; ".join(str(e) for e in errs)[:300]
 
 
+# Machine.reopen_interrupted_analysis's history line, per resumable cause.
+_RESUME_WHY = {"timeout": "the analysis step had timed out", "killed": "the analysis step had been killed",
+               "infra": "engine rows had failed on lost workers (kind infra)"}
+
 # A step killed by these signals was stopped from outside (out of memory, a stop); a crash (SIGSEGV...) is not.
 _KILL_SIGNALS = (9, 15, 2, 1)     # SIGKILL, SIGTERM, SIGINT, SIGHUP
 
 
-def analysis_failure_cause(rep: dict) -> str | None:
-    """'timeout' or 'killed' when the pipeline report's only failures are steps that ran out of wall-clock time
-    (scripts/pipeline.py `_run_cmd`) or died of an external signal, with the steps below them skipped; None for
-    anything else (a step that exited with an error, a crash, missing inputs, a validation error)."""
+def analysis_failure_cause(rep: dict, run_dir: str | None = None) -> str | None:
+    """'timeout', 'killed' or 'infra' when the pipeline report's only failures are steps that ran out of wall-clock
+    time (scripts/pipeline.py `_run_cmd`), died of an external signal, or exited with an error because their engine
+    batch lost rows to the machine (`_infra_batch`, read from `run_dir`), with the steps below them skipped; None
+    for anything else (another error exit, a crash, missing inputs, a validation error)."""
     if not isinstance(rep, dict) or rep.get("errors"):
         return None
     cause = None
@@ -1341,13 +1346,50 @@ def analysis_failure_cause(rep: dict) -> str | None:
             cause = cause or "timeout"
         elif s.get("status") == "failed" and type(rc) is int and -rc in _KILL_SIGNALS:
             cause = cause or "killed"
+        elif s.get("status") == "failed" and type(rc) is int and rc > 0 and run_dir and _infra_batch(run_dir, rep):
+            cause = cause or "infra"
         else:
             return None
     return cause
 
 
+# Where the analysis's engine batch keeps compute.py's per-call summaries (toolkit/analysis/batch.py).
+BATCH_DIR = os.path.join("analysis", "batch")
+
+
+def _infra_batch(run_dir: str, rep: dict) -> bool:
+    """2026-11-02 (Nigeria v2 full run F3): whether the engine batch this pipeline run computed failed only with
+    kind infra (lost workers; scripts/compute.py has already retried them within the call). Read from the summaries
+    compute.py wrote under analysis/batch/ during this run, i.e. after the run's start (the report's mtime minus its
+    `seconds`, on the same clock as theirs): at least one has failed rows, and every one with failed rows has only
+    infra ones. Never read from the error text. Anything unreadable is False (not resumable)."""
+    try:
+        started = os.path.getmtime(os.path.join(run_dir, "models", "pipeline_report.json")) - float(rep["seconds"]) - 2.0
+        d = os.path.join(run_dir, BATCH_DIR)
+        names = sorted(n for n in os.listdir(d) if n.endswith(".summary.json"))
+    except (OSError, KeyError, TypeError, ValueError):
+        return False
+    failed = 0
+    for n in names:
+        p = os.path.join(d, n)
+        try:
+            if os.path.getmtime(p) < started:
+                continue                          # an earlier pipeline run's batch
+            with open(p) as f:
+                summ = json.load(f)
+            kinds, n_failed = summ.get("failed_by_kind"), int(summ.get("n_failed") or 0)
+        except (OSError, ValueError, TypeError, AttributeError):
+            return False
+        if not n_failed:
+            continue
+        if not isinstance(kinds, dict) or set(kinds) != {"infra"} or kinds["infra"] != n_failed:
+            return False                          # a model error or a stopped row needs more than a rerun
+        failed += n_failed
+    return failed > 0
+
+
 def resumable_failure(run_dir: str, st: RunState) -> str | None:
-    """Why this run may be resumed at ANALYZE ('timeout' | 'killed'), or None: only a run that ended run_failed on
+    """Why this run may be resumed at ANALYZE ('timeout' | 'killed' | 'infra'), or None: only a run that ended run_failed on
     its ANALYZE -> FINAL transition, whose pipeline report (models/pipeline_report.json, written by the harness's
     run) says the analysis was interrupted. Read from the report, so a run that failed before the history carried
     the `resumable` marker is classified the same way."""
@@ -1361,7 +1403,7 @@ def resumable_failure(run_dir: str, st: RunState) -> str | None:
             rep = json.load(f)
     except (OSError, ValueError):
         return None
-    return analysis_failure_cause(rep)
+    return analysis_failure_cause(rep, run_dir)
 
 
 def _with_abs_paths(spec: dict, run_dir: str) -> dict:
@@ -1451,7 +1493,8 @@ def run_v2(question: str, run_dir: str, tasks, max_rounds: int = 3, signoff: str
            budget_usd: float | None = None, log=print, derive_unsandboxed: bool = False, backend=None,
            cross_engine_check: bool = True) -> str:
     """Entry point for main.py --v2 (and the dry run). Resumes when run_state.json exists, also a run that ended
-    run_failed because its analysis step timed out or was killed (Machine.reopen_interrupted_analysis)."""
+    run_failed because its analysis step timed out, was killed or lost engine rows to the machine
+    (Machine.reopen_interrupted_analysis)."""
     st = init_run(run_dir, question, max_rounds, signoff, "v2", budget_usd, derive_unsandboxed=derive_unsandboxed)
     m = Machine(run_dir, tasks, st, backend=backend, log=log, cross_engine_check=cross_engine_check)
     m.reopen_interrupted_analysis()
@@ -2061,11 +2104,23 @@ import sys
 sys.path.insert(0, {scripts!r})
 import compute
 
+if os.environ.get("MA_TOY_INFRA_FROM"):
+    # T61: rows from this input on come back as compute.py reports a chunk lost with its worker.
+    _real_map = compute.map_fn
+
+    def _lossy(run_dir, fn_spec, inputs, **kw):
+        rows, s = _real_map(run_dir, fn_spec, inputs, **kw)
+        k0 = int(os.environ["MA_TOY_INFRA_FROM"])
+        return [r if inputs[r["i"]]["i"] < k0 else {{"i": r["i"], "ok": False, "kind": "infra",
+                                                    "error": "chunk failed: its worker left the cluster"}}
+                for r in rows], s
+    compute.map_fn = _lossy
+
 
 def main(rd):
-    os.makedirs(os.path.join(rd, "analysis"), exist_ok=True)
+    os.makedirs(os.path.join(rd, "analysis", "batch"), exist_ok=True)
     rows, _ = compute.run_map(rd, os.path.join(rd, "models", "toy_fn.py") + "::f", [{{"i": i}} for i in range(6)],
-                              os.path.join(rd, "analysis", "rows.jsonl"), backend="local", max_workers=1,
+                              os.path.join(rd, "analysis", "batch", "rows.jsonl"), backend="local", max_workers=1,
                               purpose="toy batch")
     json.dump([bool(r.get("ok")) for r in rows], open(os.path.join(rd, "analysis", "toy_rows.json"), "w"))
     return 0 if all(r.get("ok") for r in rows) else 1
@@ -2169,6 +2224,56 @@ def _self_test_resume(ok, td: str, spike, new_run) -> None:
     st = load_state(d)
     ok(s1 == "run_failed" and st.history[-1]["from"] == "CONFIGURE" and "MA_COMPUTE_MAX_CORE_HOURS" in st.history[-1]["why"],
        f"T60d an unreadable compute budget fails the run at CONFIGURE (fail closed): {st.history[-1]}")
+    # T61 (Nigeria v2 full run F3, 2026-11-02: 16 of 256 design points failed with kind infra when the autoscaler
+    # retired busy workers, the analysis failed closed, and the run could not be resumed): an analysis that failed
+    # only because engine rows failed with kind infra is resumable, read from the batch summary compute.py wrote.
+    d, T = toy_run("analyze_infra")
+    calls2 = os.path.join(td, "toy_calls_infra.txt")
+    os.environ.update(MA_TOY_CALLS=calls2, MA_TOY_INFRA_FROM="3")
+    try:
+        s1 = run_v2("toy question", d, T, signoff="none", log=quiet, backend=Batch(120), cross_engine_check=False)
+    finally:
+        os.environ.pop("MA_TOY_INFRA_FROM", None)
+    st = load_state(d)
+    first = open(calls2).read().split() if os.path.exists(calls2) else []
+    ok(s1 == "run_failed" and st.history[-1]["from"] == "ANALYZE" and st.history[-1].get("resumable") == "infra"
+       and resumable_failure(d, st) == "infra" and sorted(first) == ["0", "1", "2", "3", "4", "5"],
+       f"T61 an analysis that failed only on infra engine rows ends run_failed, marked resumable ({s1}, "
+       f"{st.history[-1]}, calls {first})")
+    s2 = run_v2("toy question", d, T, signoff="none", log=quiet, backend=Batch(120), cross_engine_check=False)
+    st = load_state(d)
+    again = open(calls2).read().split()[len(first):]
+    back = [h for h in st.history if h.get("from") == "FINAL"]
+    ok(s2 in ("completed", "completed_scope_declared") and len(back) == 1 and back[0]["to"] == "ANALYZE"
+       and "infra" in back[0]["why"] and sorted(again) == ["3", "4", "5"],
+       f"T61b --resume reopens the run at ANALYZE and the batch recomputes only the infra rows ({s2}, {back}, "
+       f"{again})")
+    # T61c: the cause is read from the batch summaries this run of the pipeline wrote: infra only.
+    d = os.path.join(td, "infra_cases")
+    os.makedirs(os.path.join(d, "models"), exist_ok=True)
+    os.makedirs(os.path.join(d, "analysis", "batch"), exist_ok=True)
+    rp = os.path.join(d, "models", "pipeline_report.json")
+    sp = os.path.join(d, "analysis", "batch", "points.jsonl.summary.json")
+    rep1 = {"ok": False, "errors": [], "seconds": 30.0,
+            "steps": [{"id": "analyze", "status": "failed", "returncode": 1, "error": "ValueError: 512 engine results "
+                       "missing"}]}
+
+    def cause_with(kinds, age_s=0.0, summary=True):
+        json.dump(rep1, open(rp, "w"))
+        if os.path.exists(sp):
+            os.remove(sp)
+        if summary:
+            json.dump({"n": 256, "n_failed": sum(kinds.values()), "failed_by_kind": kinds, "stopped": None},
+                      open(sp, "w"))
+            t_ = time.time() - age_s
+            os.utime(sp, (t_, t_))
+        return analysis_failure_cause(rep1, d)
+    got = [cause_with({"infra": 16}), cause_with({"infra": 16, "model": 1}), cause_with({"stopped": 4}),
+           cause_with({}), cause_with({"infra": 16}, age_s=3600), cause_with({"infra": 16}, summary=False),
+           analysis_failure_cause(rep1)]
+    ok(got == ["infra", None, None, None, None, None, None],
+       f"T61c infra only, in a summary written during this pipeline run, is resumable; a model or stopped row, no "
+       f"failed row, an older summary, no summary, or no run dir is not ({got})")
 
 
 def _self_test_derived(ok, td: str) -> None:
