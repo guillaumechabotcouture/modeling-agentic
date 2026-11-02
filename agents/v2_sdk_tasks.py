@@ -26,8 +26,10 @@ OUT = "_task_output.json"
 # Files only the harness writes in a v2 run.
 HARNESS_FILES = ("run_state.json", "findings.jsonl", "impact_ledger.jsonl", "metadata.json", "final_gate.json",
                  "decision_spec.signoff.json", "engine_choice.json", "validator_history.jsonl", "done_when_registry.json",
-                 "report.md", "allocation_optimized.csv", "data/inputs_provenance.json", "declared_findings.yaml")
-HARNESS_PREFIXES = ("analysis/", "models/pipeline", "gate_r", "fix_plan_r", "evidence/", "data/inputs/")
+                 "report.md", "allocation_optimized.csv", "data/inputs_provenance.json", "declared_findings.yaml",
+                 "data/derivations_record.json", "decision_spec.signoff_sheet.md")
+# data/derived/ (v2-derived-inputs): the tables the spec reads are written only by the harness's derivation runner.
+HARNESS_PREFIXES = ("analysis/", "models/pipeline", "gate_r", "fix_plan_r", "evidence/", "data/inputs/", "data/derived/")
 
 COMMON = """You are one bounded task inside a modeling run driven by code (a state machine). The harness
 computes every number from the decision spec and the engine; you never type a number the report
@@ -42,12 +44,23 @@ Task: draft decision_spec.yaml for the question, and analysis_settings.yaml with
 computational settings only ({settings}; not repeated in the spec). Follow {skill} (the schema is the
 docstring of {schema}; a full example is {example}). Write `engine: auto`: the harness chooses the
 engine after sign-off. The harness has copied the question's input files into data/inputs/ (same
-relative paths; their sha256 in data/inputs_provenance.json): read and cite those copies. Derive
-what the spec reads (the units table, the calibration targets, the costs) from them, into data/ in
-the run directory, with a short derivation note in data/README.md; take every number from a file,
-never type one from memory. Every file the spec cites must be inside the run directory; its paths
-are relative to the run directory. Output: decision_spec.yaml, analysis_settings.yaml and
-{out} = {{"ok": true, "notes": "..."}}.""",
+relative paths; their sha256 in data/inputs_provenance.json): read them. You write code, never
+tables. For each file the spec reads that is not a staged input (the units table, calibration
+targets, cost tables), write one script under data/derive/ and declare it in data/derivations.yaml
+(id, script, inputs, outputs, columns). The harness runs it as `python <script> --inputs <paths>
+--outputs <paths>` in a sandbox (no network, inputs read-only, only the standard library, numpy,
+pandas and pyyaml), twice, and writes its outputs to data/derived/, where you cannot write; if it
+fails, the next try shows you its error. Every column of every staged table a derivation reads is in
+columns.uses or in columns.ignores with a reason, and a staged table no derivation reads is in
+ignored_inputs with a reason: the owner sees what you chose not to use. Bind every engine unit
+attribute in decision_units.engine_attributes, or accept the engine card's default by name in
+decision_units.defaults_accepted with a reason (each engine's attribute_binding.yaml lists the
+defaults). Declare the calibration target's frame (the population band it measures) and, when it
+differs from the engine output it is compared with, the mapping. A prior goes on an engine
+parameter, never on a unit attribute bound to data. Note what each derivation does in
+data/README.md. Every file the spec cites is a staged input or a derived output; paths are relative
+to the run directory. Output: decision_spec.yaml, analysis_settings.yaml, data/derivations.yaml,
+the scripts, and {out} = {{"ok": true, "notes": "..."}}.""",
     "pick_engine": COMMON + """
 
 Task: choose the engine. {out_in} lists the registered engines, which are eligible, and why the
@@ -100,7 +113,8 @@ a bare id such as `mix.itn`: the gate refuses a report that shows one. Mode `not
 gate", listing the open blocking findings from findings.jsonl in plain words. Mode `declared`: a
 Limitations section that repeats each declaration. Output: manuscript.md and {out} = {{"ok": true}}.""",
 }
-OWNS = {"draft_spec": ("decision_spec.yaml", "analysis_settings.yaml", "data/"), "pick_engine": (), "plan_fixes": (),
+OWNS = {"draft_spec": ("decision_spec.yaml", "analysis_settings.yaml", "data/derive/", "data/derivations.yaml",
+                       "data/README.md"), "pick_engine": (), "plan_fixes": (),
         "critique": (), "fix": ("analysis_settings.yaml", "models/ext/"), "write": ("manuscript.md",)}
 
 

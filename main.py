@@ -2433,7 +2433,8 @@ def main_v2(args) -> int:
     print(f"Run (v2): {run_path}", flush=True)
     tasks = v2_sdk_tasks.SdkTasks(run_path, allow_cloud=args.cloud)
     status = stage_machine.run_v2(question, run_path, tasks, max_rounds=args.max_rounds,
-                                  signoff=args.signoff, budget_usd=args.max_budget_usd)
+                                  signoff=args.signoff, budget_usd=args.max_budget_usd,
+                                  derive_unsandboxed=getattr(args, "dev_unsandboxed_derivations", False))
     print(f"v2 status: {status}", flush=True)
     # Like the lead pipeline's finalize: upload the run when a storage account is configured, and
     # record it in metadata.json, which the cloud launcher reads to stop the cluster.
@@ -2483,6 +2484,10 @@ def main() -> int:
     parser.add_argument("--v2", action="store_true",
                         help="v2 C: run the code-owned stage machine (agents/stage_machine.py) instead of "
                              "the lead session. Off by default; today's pipeline is unchanged without it.")
+    parser.add_argument("--dev-unsandboxed-derivations", action="store_true",
+                        help="v2 development only: run the spec's data derivations without a sandbox where there is "
+                             "none (macOS). The record says sandbox none and the run cannot be accepted "
+                             "(docs/design/v2-derived-inputs.md).")
     args = parser.parse_args()
 
     if args.self_test:
