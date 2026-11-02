@@ -1220,6 +1220,66 @@ def main(argv=None) -> int:
     return 0
 
 
+def _self_test_initialisation(ok, pack, eng) -> None:
+    """v0.5 (BP53-BP57): every pack declares how its engine sets the starting state and the evidence that it is
+    equilibrated; arms that share a starting state run together through the engine's run_batch."""
+    import tempfile
+    try:
+        p = {k: v for k, v in pack.items() if k != "initialisation"}
+        ok(any("initialisation" in s for s in validate(p, eng)),
+           "BP53 a pack that does not declare its engine's initialisation method is refused")
+        for bad, why in ((dict(method=""), "no method"), (dict(method="burn-in", evidence=[]), "no evidence"),
+                         (dict(method="burn-in", evidence=["ZZ9"]), "unknown evidence")):
+            ok(any("initialisation" in s for s in validate(dict(p, initialisation=bad), eng)),
+               f"BP54 an initialisation declaration with {why} is refused")
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "eq.yaml"), "w").write("x: 1\n")
+            good = dict(p, initialisation={"method": "burn-in", "evidence": ["eq.yaml", "T1"]})
+            ok(validate(good, eng, base=d) == [] and any("initialisation" in s for s in validate(
+                dict(p, initialisation={"method": "burn-in", "evidence": ["missing.yaml"]}), eng, base=d)),
+               "BP55 evidence names a benchmark of the pack or a file beside it (which must exist)")
+        ok(validate(dict(p, initialisation={"method": "closed form", "evidence": ["not applicable: no state"]}),
+                    eng) == [], "BP55b an engine without a dynamic state says so, with its reason")
+        sp = dict(pack, engine="toolkit.engines.benchmark:SharedStateToy")
+        SharedStateToy.calls.clear()
+        rs = Runner(sp, load_engine(sp["engine"]), 1)
+        got = rs.arm_results(["none", "a", "b", "ab"], {"eff_a": 0.6})
+        ref = Runner(pack, eng, 1).arm_results(["none", "a", "b", "ab"], {"eff_a": 0.6})
+        ok(got == ref and SharedStateToy.calls == [4, 4],
+           f"BP56 arms of one setting and seed run in one run_batch call when the engine shares the starting "
+           f"state (batch sizes {SharedStateToy.calls}), with the same results")
+        SharedStateToy.calls.clear()
+        Runner(pack, eng, 1).arm_results(["none", "a"], {"eff_a": 0.6})
+        ok(SharedStateToy.calls == [], "BP57 other engines keep one run per job")
+    except Exception as ex:  # noqa: BLE001
+        ok(False, f"BP53-57 initialisation declaration and shared runs ({type(ex).__name__}: {ex})")
+
+
+class SharedStateToy:
+    """Self-test engine (BP56): the toy engine, declaring that its packages share one starting state, with a
+    run_batch that records its batch sizes."""
+    batch_shares_state = True
+    calls = []
+
+    def __init__(self):
+        from toolkit.engines.contract import ToyEngine
+        self._toy = ToyEngine()
+
+    def describe(self):
+        return self._toy.describe()
+
+    def parameters(self):
+        return self._toy.parameters()
+
+    def run(self, params, unit, package, horizon, seed):
+        return self._toy.run(params, unit, package, horizon, seed)
+
+    def run_batch(self, param_sets, unit, packages, horizon, seed):
+        units = unit if isinstance(unit, (list, tuple)) else [unit] * len(param_sets)
+        SharedStateToy.calls.append(len(param_sets))
+        return [self.run(p, u, k, horizon, seed) for p, u, k in zip(param_sets, units, packages)]
+
+
 def _self_test() -> int:
     fails = []
 
@@ -1230,6 +1290,7 @@ def _self_test() -> int:
 
     pack = {
         "engine": "toolkit.engines.contract:ToyEngine", "seeds": [1, 2],
+        "initialisation": {"method": "closed form", "evidence": ["not applicable: the toy engine has no dynamic state"]},
         "horizon": {"start": 0, "stop": 3, "window": [0, 3], "windows": {"w": [1, 2]}},
         "settings": {"s": {"unit": {"x": 0.0}},
                      "c": {"unit": {"x": 0.0}, "calibrate": {"attribute": "x", "value_path": "windows.w.prev",
@@ -1661,6 +1722,7 @@ def _self_test() -> int:
         ok(d1 != d2, "BP52 (Codex r2-4) a changed named configuration (or threshold file) changes the case digest")
     except Exception as ex:  # noqa: BLE001
         ok(False, f"BP52 configuration in the digest ({type(ex).__name__}: {ex})")
+    _self_test_initialisation(ok, pack, eng)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

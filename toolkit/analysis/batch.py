@@ -677,6 +677,25 @@ def _self_test() -> int:
                                  f"recomputes anything (the re-run's 1.4% sample): {why}; replays run {len(called)}")
             ok(ADOPT_RTOL == 1e-6, "BA9 the adoption tolerance is unchanged (1e-6)")
         case("BA8", b8)
+
+        def b10():
+            from toolkit.engines.benchmark import SharedStateToy
+            ref = "toolkit.engines.benchmark:SharedStateToy"
+            sj = [dict(j, engine=ref) for j in jobs0 if j["point"] in (0, 1)]
+            groups = g["point_groups"](sj)
+            SharedStateToy.calls.clear()
+            rows = [r for gr in groups for r in g["run_point"](gr)["rows"]]
+            flat = [j for gr in groups for j in gr["jobs"]]
+            npk = len(design0["packages"])
+            ok(len(groups) == 2 and SharedStateToy.calls == [npk, npk] and len(rows) == len(sj)
+               and sorted(j["id"] for j in flat) == sorted(j["id"] for j in sj)
+               and all(r["provenance"]["job_sha"] == job_sha(j) and r["result"] == run_job(j)["result"]
+                       for r, j in zip(rows, flat)),
+               f"BA10 for an engine whose packages share a starting state, one point's jobs run in one run_batch call "
+               f"(batch sizes {SharedStateToy.calls}); each row keeps its job's provenance and equals run_job")
+            ok(g["shares_state"](SharedStateToy()) and not g["shares_state"](eng),
+               "BA11 other engines keep one compute task per job")
+        case("BA10", b10)
     if fails:
         print(f"FAILED: {len(fails)} self-test case(s)")
         return 1

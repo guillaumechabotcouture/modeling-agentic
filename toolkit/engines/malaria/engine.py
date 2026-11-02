@@ -391,11 +391,93 @@ def _self_test() -> int:
     rr = {k: o_net.windows["m12"][k] / max(o_none.windows["m12"][k], 1e-9) for k in ("pfpr_lt5", "pfpr_all")}
     ok(rr["pfpr_all"] > rr["pfpr_lt5"],
        f"M21 forward behaviour (Sochantha 2006 age interaction): nets cut all-age prevalence less than under-5 prevalence {rr}")
+    _self_test_v05(ok, e, unit)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_v05(ok, e, unit) -> None:
+    """v0.5: the equilibrated start. A no-intervention burn-in of `burnin_years` before horizon.start, run once per
+    (unit, seed) and shared by every package (run_batch); the population starts smaller and grows to n_agents."""
+    def case(label, fn):
+        try:
+            fn()
+        except Exception as ex:  # noqa: BLE001 -- a missing function is a failing case, not a crash of the test
+            ok(False, f"{label} ({type(ex).__name__}: {ex})")
+
+    hz = Horizon(2015.0, 2017.0, (2016.0, 2017.0), {"pre": [2015.0, 2016.0], "post": [2016.2, 2017.0]})
+    u = UnitSpec("t", dict(unit.attributes, itn_hist_years=[2015.3], campaign_year=2016.1))
+    pk = [Package("none", {}), Package("pyr", {"net": "pyr"}), Package("dual_smc", {"net": "dual", "smc": 1}),
+          Package("cm", {"cm": 1})]
+    base = {"n_agents": 500, "burnin_years": 3}
+
+    def v1():
+        ok(getattr(e, "batch_shares_state", False) is True and callable(getattr(e, "run_batch", None)),
+           "V1 the engine declares that packages share one initial state, and runs them through run_batch")
+        b = {p.name: p for p in e.parameters()}.get("burnin_years")
+        ok(b is not None and b.value == 50 and b.kind == "fixed" and "equilibration.yaml" in b.source,
+           "V1b the burn-in length is a declared card parameter (default 50 y) whose source is the convergence evidence")
+    case("V1", v1)
+
+    def v2():
+        n, B = 1500, 10
+        sts = [e.initial_state({"n_agents": n, "burnin_years": B}, u, horizon=hz, seed=s) for s in range(1, 7)]
+        mean = float(np.mean([s["N"] for s in sts]))
+        ok(all(s["N0"] < 0.8 * n for s in sts) and abs(mean / n - 1) < 0.03,
+           f"V2 the burn-in population starts smaller ({sts[0]['N0']}) and grows to n_agents at horizon.start "
+           f"(mean {mean:.0f} of {n} over 6 seeds)")
+        s0 = e.initial_state({"n_agents": n, "burnin_years": 0}, u, horizon=hz, seed=1)
+        ok(s0["N"] == n and s0["N0"] == n, "V2b without a burn-in the population at horizon.start is n_agents exactly")
+    case("V2", v2)
+
+    def v3():
+        outs = e.run_batch([base] * len(pk), u, pk, hz, 5)
+        hs = {o.meta["start_state_sha256"] for o in outs}
+        pre = [o.windows["pre"] for o in outs]
+        other = e.run_batch([base], u, [pk[0]], hz, 6)[0]
+        ok(len(hs) == 1 and all(p == pre[0] for p in pre) and other.meta["start_state_sha256"] not in hs
+           and all(o.meta["burnin_members"] == len(pk) for o in outs),
+           "V3 packages run from one burn-in share an identical pre-start history (state hash at horizon.start and "
+           "every pre-package window), and another seed does not")
+        f = outs[0].meta["fork_year"]
+        ok(hz.start <= f <= hz.window[0] and outs[0].meta["burnin_years"] == 3,
+           f"V3b the packages fork at their first component event, within [horizon.start, decision start] ({f})")
+        solo = e.run(base, u, pk[2], hz, 5)
+        ok(solo.per_capita == outs[2].per_capita and solo.windows == outs[2].windows
+           and solo.cost_drivers == outs[2].cost_drivers,
+           "V4 a package run alone equals the same package in a shared batch (the fork copies the state exactly)")
+    case("V3", v3)
+
+    def v5():
+        ps = [dict(base, cfp_kill=0.1, irs_kill=0.2), dict(base, cfp_kill=0.7, irs_kill=0.8)]
+        a, b = e.run_batch(ps, u, [pk[2], pk[2]], hz, 5)
+        ok(a.meta["start_state_sha256"] == b.meta["start_state_sha256"] and a.meta["burnin_members"] == 2
+           and a.windows["post"] != b.windows["post"],
+           "V5 parameters that act only through package components share one burn-in, and still change the outcomes")
+        c, d = e.run_batch([dict(base, hh_net_corr=0.1), dict(base, hh_net_corr=0.8)], u, [pk[1], pk[1]], hz, 5)
+        ok(c.meta["start_state_sha256"] != d.meta["start_state_sha256"] and c.meta["burnin_members"] == 1,
+           "V5b a parameter that acts during the burn-in gets its own burn-in")
+    case("V5", v5)
+
+    def v6():
+        lo = e.initial_state({"n_agents": 400, "burnin_years": 0, "init_eir_per_m0": 0.15}, u, horizon=hz, seed=2)
+        hi = e.initial_state({"n_agents": 400, "burnin_years": 0, "init_eir_per_m0": 2.4}, u, horizon=hz, seed=2)
+        ok(hi["immunity"]["IC"]["15p"] > 1.5 * lo["immunity"]["IC"]["15p"],
+           "V6 without a burn-in the starting immunity follows the init_eir guess (the knob the evidence varies)")
+        from toolkit.engines.malaria.benchmarks import equilibration as EQ
+        doc = yaml.safe_load(open(EQ.OUT)) if os.path.exists(EQ.OUT) else None
+        bv = {p.name: p.value for p in e.parameters()}["burnin_years"]
+        probs = EQ.problems(doc, bv, VERSION)
+        ok(not [p for p in probs if not p.startswith("doubling")],
+           f"V7 after the burn-in, adult IC and ID by age do not depend on the init_eir guess (x0.25 vs x4 within "
+           f"5%, at >= 2 transmission levels; benchmarks/equilibration.yaml): {probs[:3]}")
+        ok(not [p for p in probs if not p.startswith("init_guess")],
+           f"V8 equilibration: adult IC and ID by age stay within 5% when the burn-in is doubled, at >= 2 "
+           f"transmission levels (benchmarks/equilibration.yaml): {probs[:3]}")
+    case("V6", v6)
 
 
 def write_card(path: str) -> None:
