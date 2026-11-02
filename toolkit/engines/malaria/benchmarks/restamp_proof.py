@@ -165,25 +165,72 @@ def prove(old_ref: str, seeds: list, workers: int, settings: list | None = None)
             "cases": rows, "n_cases": len(rows), "identical": bool(rows) and all(r["equal"] for r in rows.values())}
 
 
-def restamp_doc(doc: dict, name: str, proof: dict, script_commit: str) -> dict:
-    """The file with its identity fields set to the proof's new identity, and a record of the re-stamp."""
-    new = proof["new"]
-    out = dict(doc)
+def _record(doc: dict, proof: dict, script_commit: str) -> dict:
     rec = {"by": f"{REL}/restamp_proof.py (byte-identity proof, not recomputed)",
            "proof": f"{REL}/restamp_proof.yaml", "proof_identical": proof["identical"],
            "scope": proof["scope"], "old_engine_version": doc.get("engine_version", (doc.get("engine_identity") or {})
                                                                    .get("version")),
            "proof_script_commit": script_commit,
-           "note": "the numbers below were computed by the old code; the proof shows the new code gives identical "
-                   "outputs on these inputs. A Coiled pack run (validate_once.sh) confirms it."}
+           "note": "the numbers in this file were computed by the old code; the proof shows the new code gives "
+                   "identical outputs on these inputs. A Coiled pack run (validate_once.sh) confirms it."}
     if "engine_identity" in doc:
-        rec["old_identity"] = doc["engine_identity"]
-        out["engine_identity"] = new["identity"]
-    if "engine_version" in doc:
-        out["engine_version"] = new["engine_version"]
+        rec["old_identity"] = dict(doc["engine_identity"])
     if "code_sha256" in doc:
         rec["old_code_sha256"] = doc["code_sha256"]   # kept as is: the code that computed the numbers
-    out["restamped"] = rec
+    return rec
+
+
+def _changed(proof: dict) -> dict:
+    """Identity keys whose value the new code changes: {key: (old, new)}."""
+    o, n = proof["old"]["identity"], proof["new"]["identity"]
+    return {k: (o.get(k), n[k]) for k in n if o.get(k) != n[k]}
+
+
+def restamp_doc(doc: dict, proof: dict, script_commit: str) -> dict:
+    """The file's content after a re-stamp: each identity key the new code changes is set to its new value where the
+    file holds the old one (other keys, e.g. a pre-fit params hash, stay), engine_version is the new version, and
+    `restamped` records the re-stamp."""
+    out = dict(doc)
+    if "engine_identity" in doc:
+        ident = dict(doc["engine_identity"])
+        for k, (old, new) in _changed(proof).items():
+            if ident.get(k) == old:
+                ident[k] = new
+        out["engine_identity"] = ident
+    if "engine_version" in doc:
+        out["engine_version"] = proof["new"]["engine_version"]
+    out["restamped"] = _record(doc, proof, script_commit)
+    return out
+
+
+def _scalar(k, v) -> str:
+    return f"'{v}'" if k == "version" else str(v)      # versions are quoted strings, hashes plain
+
+
+def restamp_text(text: str, proof: dict, script_commit: str) -> str:
+    """restamp_doc applied to the file's text line by line, so every other byte stays as written; checked against
+    restamp_doc (fail closed when they disagree)."""
+    doc = yaml.safe_load(text) or {}
+    ch = _changed(proof)
+    lines, in_id = text.splitlines(keepends=True), False
+    for i, ln in enumerate(lines):
+        if ln.startswith("engine_identity:"):
+            in_id = True
+            continue
+        if in_id and not ln.startswith("  "):
+            in_id = False
+        if in_id:
+            for k, (old, new) in ch.items():
+                if ln.rstrip("\n") == f"  {k}: {_scalar(k, old)}":
+                    lines[i] = f"  {k}: {_scalar(k, new)}\n"
+        elif ln.startswith("engine_version: ") and "engine_version" in doc:
+            lines[i] = f"engine_version: '{proof['new']['engine_version']}'\n"
+    out = "".join(lines)
+    if not out.endswith("\n"):
+        out += "\n"
+    out += yaml.safe_dump({"restamped": _record(doc, proof, script_commit)}, sort_keys=False, width=110)
+    if yaml.safe_load(out) != restamp_doc(doc, proof, script_commit):
+        raise ValueError("re-stamp: the line edit does not give the expected content (fields not where expected)")
     return out
 
 
@@ -202,14 +249,17 @@ def restamp() -> int:
         print("refused: commit restamp_proof.py first (the record names the commit of the proof script)")
         return 1
     commit = _git("log", "-n", "1", "--format=%H", "--", me)
+    texts = {}
     for f in STAMPED:
         p = os.path.join(HERE, f)
-        doc = yaml.safe_load(open(p)) or {}
-        if "restamped" in doc:
+        text = open(p).read()
+        if "restamped" in (yaml.safe_load(text) or {}):
             print(f"refused: {f} is already re-stamped")
             return 1
-        yaml.safe_dump(restamp_doc(doc, f, proof, commit), open(p, "w"), sort_keys=False, width=110)
-        print(f"re-stamped {f}")
+        texts[p] = restamp_text(text, proof, commit)
+    for p, t in texts.items():
+        open(p, "w").write(t)
+        print(f"re-stamped {os.path.basename(p)}")
     return 0
 
 
@@ -233,17 +283,28 @@ def _self_test() -> int:
     ok(sum(c["kind"] == "pack" for c in cs) == 4 and len({c["id"] for c in cs}) == len(cs),
        "RP4 every pack setting runs at every seed; case ids are unique")
     proof = {"identical": True, "scope": {"seeds": [11]},
-             "new": {"identity": {"name": "m", "version": "0.6", "code_sha256": "n"}, "engine_version": "0.6"}}
-    old_id = {"name": "m", "version": "0.5", "code_sha256": "o"}
-    r = restamp_doc({"producer": "p", "engine_identity": old_id, "engine_version": "0.5", "benchmarks": [1]},
-                    "results.yaml", proof, "abc")
-    ok(r["engine_identity"] == proof["new"]["identity"] and r["engine_version"] == "0.6" and r["benchmarks"] == [1]
-       and r["restamped"]["old_identity"] == old_id and r["restamped"]["old_engine_version"] == "0.5"
-       and r["restamped"]["proof_script_commit"] == "abc" and "not recomputed" in r["restamped"]["by"],
-       "RP5 a re-stamp changes only the identity fields and records the old identity, version, scope and commit")
-    e = restamp_doc({"engine_version": "0.5", "code_sha256": "c", "levels": [2]}, "equilibration.yaml", proof, "abc")
-    ok(e["engine_version"] == "0.6" and e["code_sha256"] == "c" and e["restamped"]["old_code_sha256"] == "c"
+             "old": {"identity": {"name": "m", "version": "0.5", "code_sha256": "aa", "params_sha256": "pp"}},
+             "new": {"identity": {"name": "m", "version": "0.6", "code_sha256": "bb", "params_sha256": "pp"},
+                     "engine_version": "0.6"}}
+    txt = ("producer: p\nengine_identity:\n  name: m\n  version: '0.5'\n  code_sha256: aa\n  params_sha256: qq\n"
+           "benchmarks:\n- id: B1\n  metric: a long text\n    wrapped as the writer wrapped it\nengine_version: '0.5'\n")
+    out = restamp_text(txt, proof, "abc")
+    r = yaml.safe_load(out)
+    ok(r["engine_identity"] == {"name": "m", "version": "0.6", "code_sha256": "bb", "params_sha256": "qq"}
+       and r["engine_version"] == "0.6" and r["benchmarks"] == yaml.safe_load(txt)["benchmarks"]
+       and r["restamped"]["old_identity"]["code_sha256"] == "aa" and r["restamped"]["old_engine_version"] == "0.5"
+       and r["restamped"]["proof_script_commit"] == "abc" and "not recomputed" in r["restamped"]["by"]
+       and out.startswith(txt.replace("'0.5'", "'0.6'").replace("aa", "bb")),
+       "RP5 a re-stamp changes only the identity keys the new code changes (a file's own params hash stays), keeps "
+       "every other byte, and records the old identity, version, scope and commit")
+    e = yaml.safe_load(restamp_text("producer: q\nengine_version: '0.5'\ncode_sha256: cc\nlevels: [2]\n", proof, "abc"))
+    ok(e["engine_version"] == "0.6" and e["code_sha256"] == "cc" and e["restamped"]["old_code_sha256"] == "cc"
        and "engine_identity" not in e, "RP6 evidence files keep the code hash that computed them, beside the record")
+    try:
+        restamp_text("engine_identity: {name: m, version: '0.5', code_sha256: aa}\n", proof, "abc")
+        ok(False, "RP7 an identity the line edit cannot place fails closed")
+    except ValueError:
+        ok(True, "RP7 an identity the line edit cannot place fails closed")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
