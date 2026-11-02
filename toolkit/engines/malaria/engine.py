@@ -54,6 +54,13 @@ delivery period's end to the outcome window's end, in every package including th
 needs an explicit delivery period (fail closed). With package SMC as well, the package's delivery seasons and the
 routine seasons must form one continuous season sequence (smc_schedule_problems). With the attribute absent or 0,
 a run is byte-identical to v0.6 (self-test R7; benchmarks/restamp_proof.py).
+
+v0.8: the two figure hooks of toolkit/engines/hooks.py. schedule() lists the unit's delivery events in one arm
+(history, decision, routine) from delivery_plan(), the one function the sim's configuration also reads; it is pure.
+run_series() returns monthly series of the card's outputs["series"] (under-5 prevalence, the calibration metric;
+all-age and under-5 clinical incidence per person-year; two more prevalence bands), read from the model's daily
+records through run_batch's member loop (shared burn-in and history). run and run_batch are unchanged (self-test S7;
+benchmarks/restamp_proof.py compares the v0.7 and v0.8 code).
 """
 from __future__ import annotations
 
@@ -82,7 +89,7 @@ RESULTS = os.path.join(HERE, "benchmarks", "results.yaml")
 AGES = ["u5", "5_14", "15p"]
 GRIFFIN = "Griffin et al. 2010 PLoS Med 10.1371/journal.pmed.1000324; 2014 Nat Commun; 2015 Lancet Infect Dis"
 A8 = "E7 attempt 8 value (models/malaria_abm.py VC), kept"
-VERSION = "0.7"
+VERSION = "0.8"
 BV = "Bertozzi-Villa et al. 2021 Nat Commun 10.1038/s41467-021-23707-7 (PMC8196080)"
 
 # name, value, kind, units, lo, hi, source, verified
@@ -141,6 +148,17 @@ POST_FORK = frozenset({"irs_kill", "irs_rep", "irs_half", "irs_coverage", "smc_p
                        "dur_moderate_d", "dur_severe_d", "le_u5", "le_5_14", "le_15p"})
 DUAL_NET = frozenset({"cfp_kill", "cfp_half"})
 IMM_BANDS = (("0_5", 0.0, 5.0), ("5_15", 5.0, 15.0), ("15_30", 15.0, 30.0), ("30p", 30.0, 1e9), ("15p", 15.0, 1e9))
+# v0.8: the monthly series run_series offers (toolkit/engines/hooks.py), each one of the model's daily records
+# (model.DAILY) with the same definition as the window metric of the same name
+SERIES = {
+    "pfpr_u5": {"label": "microscopy prevalence, children 6-59 months (the calibration metric)",
+                "units": "share", "aggregate": "mean"},
+    "pfpr_2_10": {"label": "microscopy prevalence, ages 2-10", "units": "share", "aggregate": "mean"},
+    "pfpr_all": {"label": "microscopy prevalence, all ages", "units": "share", "aggregate": "mean"},
+    "inc_all": {"label": "clinical incidence, all ages", "units": "episodes per person-year", "aggregate": "rate"},
+    "inc_u5": {"label": "clinical incidence, under 5", "units": "episodes per child-year (under 5)",
+               "aggregate": "rate"},
+}
 
 
 def _people(n):
@@ -262,7 +280,8 @@ class MalariaEngine:
             outputs={"per_capita": ["cases", "severe", "deaths", "treated", "dalys"],
                      "windows": list(M.PFPR_BANDS) + ["inc_u5", "inc_all", "inc_u5_smc", "eir_annual",
                                                       "net_use", "net_access"],
-                     "cost_drivers": ["nets_given", "smc_doses", "irs_sprayed", "treated_all"]},
+                     "cost_drivers": ["nets_given", "smc_doses", "irs_sprayed", "treated_all"],
+                     "series": {k: dict(v) for k, v in SERIES.items()}},
             age_groups=AGES,
             valid_ranges={"m0": [0.2, 400], "resistance": [0.1, 1.0], "cm_ft": [0.0, 0.95], "eir_annual": [0.1, 300]},
             fitted={k: v for k, v in self.fitted.items()},
@@ -338,9 +357,13 @@ class MalariaEngine:
         return {"years": years, "months": months, "after": float(d1), "before": w1,
                 "rounds": [t for t in (y + (m - 1) / 12 for y in years for m in months) if d1 <= t < w1]}
 
-    def _plan(self, P: dict, a: dict, components: dict, horizon: Horizon) -> dict:
-        """The package's component settings and the decimal years at which they first act. v0.6: components act in
-        the delivery period (the decision window unless horizon.delivery is given)."""
+    @classmethod
+    def delivery_plan(cls, a: dict, components: dict, horizon: Horizon) -> dict:
+        """v0.8: the one source of a unit's delivery schedule in one arm, read by the sim (_plan for the package's
+        components, _base_sim for the past and routine campaigns, routine SMC and the add-on period) and by
+        schedule(). Pure: no sim, no random numbers. Fails closed as _plan did up to v0.7, in the same order.
+        v0.6: the package's components act in the delivery period (the decision window unless horizon.delivery is
+        given)."""
         bad = delivery_problems(horizon)
         if bad:
             raise ValueError("; ".join(bad))
@@ -348,40 +371,72 @@ class MalariaEngine:
         comp.update(components)
         season = np.asarray(a.get("season", [1.0] * 12), float)
         d0, d1 = delivery_period(horizon)
+        ex = explicit_delivery(horizon)
         years = list(range(int(np.floor(d0)), int(np.ceil(d1))))
-        cfg = {"cm_add": P["cm_add"] if int(comp["cm"]) else 0.0, "net": None, "smc": None, "irs": None,
-               "events": [float(d0)]}
+        plan = {"net": None, "smc": None, "irs": None, "fork_events": [float(d0)],
+                # the add-on acts in the delivery period; without one it starts at the window and has no end (v0.5)
+                "cm": {"on": bool(int(comp["cm"])), "start": d0, "stop": d1 if ex else None}}
+        ev = []                                      # (component, label, kind, t0, t1) of every delivery event
         timed = []                                   # (component, decimal year) of every event the decision pays for
         if comp["net"] != "none":
             cy = float(a.get("campaign_year", d0))
-            cfg["net"] = {"years": [cy], "net_type": comp["net"]}
-            cfg["events"].append(cy)
+            plan["net"] = {"years": [cy], "net_type": comp["net"]}
+            plan["fork_events"].append(cy)
             timed.append(("net campaign (campaign_year)", cy))
+            ev.append(("net", f"net campaign ({comp['net']})", "decision", cy, None))
         if int(comp["smc"]):
             months = tuple(a.get("smc_months") or default_smc_months(season))
-            cfg["smc"] = {"years": years, "months": months}
-            ev = [y + (m - 1) / 12 for y in years for m in months]
-            cfg["events"] += ev
-            timed += [("SMC round", t) for t in ev]
+            plan["smc"] = {"years": years, "months": months}
+            ts = [y + (m - 1) / 12 for y in years for m in months]
+            plan["fork_events"] += ts
+            timed += [("SMC round", t) for t in ts]
+            ev += [("smc", "SMC round", "decision", t, None) for t in ts]
         if int(comp["irs"]):
             month = int(a.get("irs_month") or ((int(np.argmax(season)) - 3) % 12 + 1))
             irs_years = [int(np.floor(float(y))) for y in a.get("irs_years", years)]
-            cfg["irs"] = {"years": irs_years, "month": month}
-            ev = [y + (month - 1) / 12 for y in irs_years]
-            cfg["events"] += ev
-            timed += [("IRS round", t) for t in ev]
-        if explicit_delivery(horizon):
+            plan["irs"] = {"years": irs_years, "month": month}
+            ts = [y + (month - 1) / 12 for y in irs_years]
+            plan["fork_events"] += ts
+            timed += [("IRS round", t) for t in ts]
+            ev += [("irs", "IRS round", "decision", t, None) for t in ts]
+        if plan["cm"]["on"]:
+            ev.append(("cm", "enhanced case management (add-on)", "decision", float(d0), float(d1)))
+        if ex:
             out = [f"{c} at {t:.3f}" for c, t in timed if not d0 <= t < d1]
             if out:
                 raise ValueError(f"outside the delivery period [{d0:g}, {d1:g}): {', '.join(out[:4])}")
-        self._routine_years(a, horizon)              # validated here, before any sim is built
-        rs = self._smc_routine(a, horizon)           # v0.7: and routine SMC with the package's own rounds
+        plan["hist_years"] = [float(y) for y in a.get("itn_hist_years", [])]
+        plan["hist_net"] = a.get("hist_net", "pyr")
+        plan["routine_years"] = cls._routine_years(a, horizon)   # validated here, before any sim is built
+        rs = cls._smc_routine(a, horizon)            # v0.7: and routine SMC with the package's own rounds
         if rs is not None:
             pkg = [t for c, t in timed if c == "SMC round"]
             bad = smc_schedule_problems(pkg, rs["rounds"], rs["months"], d0, d1, float(horizon.window[1]))
             if bad:
                 raise ValueError("; ".join(bad))
-        return cfg
+        plan["smc_routine"] = rs
+        ev += [("net", f"past net campaign ({plan['hist_net']})", "history", t, None) for t in plan["hist_years"]]
+        ev += [("net", f"routine net campaign ({plan['hist_net']})", "routine", t, None) for t in plan["routine_years"]]
+        ev += [("smc", "routine SMC round", "routine", t, None) for t in (rs or {}).get("rounds", [])]
+        st, w1 = float(horizon.start), float(horizon.window[1])
+        plan["events"] = sorted(
+            ({"component": c, "label": lb, "kind": k, "t0": float(t0), "t1": None if t1 is None else float(t1),
+              "charged": k == "decision"} for c, lb, k, t0, t1 in ev if st <= t0 < w1),
+            key=lambda x: x["t0"])
+        return plan
+
+    def _plan(self, P: dict, a: dict, components: dict, horizon: Horizon) -> dict:
+        """The package's component settings and the decimal years at which they first act (from delivery_plan)."""
+        dp = self.delivery_plan(a, components, horizon)
+        return {"cm_add": P["cm_add"] if dp["cm"]["on"] else 0.0, "net": dp["net"], "smc": dp["smc"],
+                "irs": dp["irs"], "events": dp["fork_events"]}
+
+    def schedule(self, params, unit: UnitSpec, package: Package, horizon: Horizon) -> list:
+        """v0.8 figure hook (toolkit/engines/hooks.py): the unit's delivery events in the arm `package` over
+        [horizon.start, window end), from delivery_plan, the code that configures the sim. Pure. A past campaign
+        before horizon.start (it acts in the burn-in) and a round after the window's end are not listed."""
+        resolve_params(self, params)                 # unknown parameters fail closed, as in run()
+        return [dict(x) for x in self.delivery_plan(dict(unit.attributes), package.components, horizon)["events"]]
 
     @staticmethod
     def _burnin_key(P: dict, a: dict) -> str:
@@ -416,15 +471,17 @@ class MalariaEngine:
                         import_eir=P["import_eir"], irs_product=a.get("irs_product", "pm_cs"),
                         rec_year=float(horizon.start), del_start=d0 if ex else None, del_stop=d1 if ex else None)
         use, capped = access_for_use(float(a.get("itn_use", 0.55)), float(a.get("itn_use_at", 0.0)), P)
+        dp = self.delivery_plan(a, {}, horizon)      # v0.8: the history, routine and add-on timings (one source)
         # v0.6: the add-on acts in the delivery period; without one it starts at the window and has no end (v0.5)
-        itv = [M.CaseManagement(base=float(a.get("cm_ft", 0.3)), add=0.0, start=d0, stop=d1 if ex else None, name="cm")]
-        hist = [float(y) for y in a.get("itn_hist_years", [])] + self._routine_years(a, horizon)
+        itv = [M.CaseManagement(base=float(a.get("cm_ft", 0.3)), add=0.0, start=dp["cm"]["start"],
+                                stop=dp["cm"]["stop"], name="cm")]
+        hist = dp["hist_years"] + dp["routine_years"]
         if hist:
-            itv.append(M.ITNCampaign(years=hist, use=use, net_type=a.get("hist_net", "pyr"), name="itn_hist"))
+            itv.append(M.ITNCampaign(years=hist, use=use, net_type=dp["hist_net"], name="itn_hist"))
         itv += [M.ITNCampaign(years=[], use=use, net_type="pyr", count=True, name="itn_new"),
                 M.SMCDelivery(years=[], pe=P["smc_pe"], hi_frac=P["smc_hi_frac"], name="smc"),
                 M.IRSRound(years=[], coverage=P["irs_coverage"], name="irs")]
-        rs = self._smc_routine(a, horizon)
+        rs = dp["smc_routine"]
         if rs is not None:     # v0.7: built only when set, last, so a unit without it gets the v0.6 sim exactly
             itv.append(M.SMCDelivery(years=rs["years"], months=rs["months"], pe=P["smc_pe"], hi_frac=P["smc_hi_frac"],
                                      count=False, after=rs["after"], before=rs["before"], name="smc_routine"))
@@ -472,13 +529,61 @@ class MalariaEngine:
         `packages` one Package or one per pair. Pairs whose burn-in inputs agree (the unit and every parameter outside
         POST_FORK) share one burn-in and one history up to the earliest component event of any of them; each pair is
         then continued from an exact copy. Each pair's outcomes equal run() of that pair (self-test V4)."""
-        import gc
-        import pickle
         B = len(param_sets)
         units = list(unit) if isinstance(unit, (list, tuple)) else [unit] * B
         pkgs = list(packages) if isinstance(packages, (list, tuple)) else [packages] * B
         if B == 0 or len(units) != B or len(pkgs) != B:
             raise ValueError("run_batch: give one unit (or one per pair) and one package (or one per pair)")
+        return self._run_members(param_sets, units, pkgs, horizon, seed)[0]
+
+    def run_series(self, params, unit: UnitSpec, packages: list, horizon: Horizon, seed: int, metrics: list,
+                   step: str = "month") -> list:
+        """v0.8 figure hook (toolkit/engines/hooks.py): monthly series of `metrics` (keys of the card's
+        outputs["series"]) for each package, in order, at one seed. The packages share the burn-in and the history
+        (run_batch's member loop); the series are read from the model's daily records, so the sims are run_batch's."""
+        if step != "month":
+            raise ValueError(f"run_series: step {step!r} is not supported (month)")
+        miss = [m for m in metrics if m not in SERIES]
+        if miss or not metrics:
+            raise ValueError(f"run_series: metrics {miss or metrics} are not in the card's series {sorted(SERIES)}")
+        pkgs = list(packages)
+        if not pkgs:
+            raise ValueError("run_series: give at least one package")
+        _, ser = self._run_members([params] * len(pkgs), [unit] * len(pkgs), pkgs, horizon, seed,
+                                   series=list(metrics))
+        return [{"package": s["package"], "t": s["t"], "values": s["values"]} for s in ser]
+
+    @staticmethod
+    def _series(sim, horizon: Horizon, metrics: list, pid: str) -> dict:
+        """Monthly steps from horizon.start (step k starts at horizon.start + k/12; the last ends at the window's
+        end). A "mean" metric is the mean of the step's daily values; a "rate" metric the step's sum of daily
+        episodes per person over its length in years. The days of a step are those a named window over the same
+        span selects, so window metrics are the day-weighted (mean) or length-weighted (rate) sums of steps."""
+        yv = np.asarray(sim.t.yearvec)
+        d = sim.diseases.malaria.daily
+        st, w1 = float(horizon.start), float(horizon.window[1])
+        n = int(np.ceil((w1 - st) * 12 - 1e-9))
+        t = [st + k / 12 for k in range(n)]
+        ends = t[1:] + [w1]
+        vals, days = {m: [] for m in metrics}, []
+        for a, b in zip(t, ends):
+            sel = (yv >= a) & (yv < b)
+            k = int(sel.sum())
+            if k == 0:
+                raise ValueError(f"run_series: no simulated day in the step [{a:.4f}, {b:.4f})")
+            days.append(k)
+            for m in metrics:
+                x = d[m][sel]
+                vals[m].append(float(x.mean()) if SERIES[m]["aggregate"] == "mean" else float(x.sum() / (b - a)))
+        return {"package": pid, "t": t, "values": vals, "days": days}
+
+    def _run_members(self, param_sets, units, pkgs, horizon: Horizon, seed: int, series: list | None = None):
+        """run_batch's member loop: (outcomes, series) per (parameter set, unit, package); series is None per member
+        unless `series` lists metrics (v0.8), which are read from the daily records after the run and change
+        nothing in it (self-test S7)."""
+        import gc
+        import pickle
+        B = len(param_sets)
         mem = []
         for p, u, k in zip(param_sets, units, pkgs):
             P = resolve_params(self, p)
@@ -487,7 +592,7 @@ class MalariaEngine:
         groups = {}
         for i, (P, a, _) in enumerate(mem):
             groups.setdefault(self._burnin_key(P, a), []).append(i)
-        out = [None] * B
+        out, ser = [None] * B, [None] * B
         for idx in groups.values():
             t0 = time.time()
             P0, a0, _ = mem[idx[0]]
@@ -513,6 +618,8 @@ class MalariaEngine:
                     "burnin_years": int(round(P["burnin_years"])), "n_burnin_start": n0, "n_start": dz.n_start,
                     "fork_year": round(float(yv[ti_f]), 6), "burnin_members": len(idx),
                     "start_state_sha256": dz.start_sha})
+                if series:
+                    ser[i] = self._series(s, horizon, series, pkgs[i].id)
                 if n == len(idx) - 2:
                     snap = None                # the last member continues the original sim
                 try:
@@ -524,7 +631,7 @@ class MalariaEngine:
                 gc.collect()                   # Starsim sims hold reference cycles: free each member before the next
             del sim
             gc.collect()
-        return out
+        return out, ser
 
     def initial_state(self, params, unit: UnitSpec, package: Package | None = None, horizon: Horizon | None = None,
                       seed: int = 1) -> dict:
