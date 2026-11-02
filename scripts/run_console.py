@@ -94,18 +94,34 @@ def _rel(run_dir: str, p: str) -> str:
     return os.path.relpath(p, run_dir).replace(os.sep, "/")
 
 
+_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+_CACHE: dict = {}              # path -> ((mtime_ns, size), result); the page polls, the files rarely change
+_CACHE_MAX = 2000
+
+
 def _read(path: str):
-    """(parsed, None) or (None, error). JSON or YAML by extension; text otherwise."""
+    """(parsed, None) or (None, error). JSON or YAML by extension; text otherwise. Cached by the file's
+    mtime and size, so callers treat the parsed value as read-only."""
     try:
+        st = os.stat(path)
+        key = (st.st_mtime_ns, st.st_size)
+        hit = _CACHE.get(path)
+        if hit and hit[0] == key:
+            return hit[1]
         with open(path, encoding="utf-8") as f:
             raw = f.read()
         if path.endswith(".json"):
-            return json.loads(raw), None
-        if path.endswith((".yaml", ".yml")):
-            return yaml.safe_load(raw), None
-        return raw, None
+            out = (json.loads(raw), None)
+        elif path.endswith((".yaml", ".yml")):
+            out = (yaml.load(raw, Loader=_LOADER), None)
+        else:
+            out = (raw, None)
     except (OSError, UnicodeDecodeError, ValueError, yaml.YAMLError) as e:
         return None, f"{type(e).__name__}: {str(e)[:200]}"
+    if len(_CACHE) >= _CACHE_MAX:
+        _CACHE.clear()
+    _CACHE[path] = (key, out)
+    return out
 
 
 def read_jsonl(path: str) -> tuple[list, list]:
@@ -2149,6 +2165,13 @@ def _self_test() -> int:
            f"(needs {keys}; served {sorted(served)})")
         ok('id="banner"' in page and 'addEventListener("unhandledrejection"' in page and "AbortController" in page,
            "RC17b a failed fetch or render shows a banner; fetches time out instead of hanging")
+        with tempfile.TemporaryDirectory() as t5:
+            f5 = os.path.join(t5, "a.yaml")
+            open(f5, "w").write("x: 1\n")
+            first = _read(f5)[0]
+            open(f5, "w").write("x: 22\n")
+            ok(first == {"x": 1} and _read(f5)[0] == {"x": 22} and _read(f5) is _read(f5),
+               "RC18 parsed files are cached by mtime and size, and a rewritten file is read again")
         with tempfile.TemporaryDirectory() as t4:
             d = _toy_run(os.path.join(t4, "r"))
             os.makedirs(os.path.join(d, "analysis", "batch"))
@@ -2198,6 +2221,7 @@ def main(argv=None) -> int:
     con = Console(roots, a.run_dir, a.mirror, a.sync_cmd, a.sync_s, a.cloud_config, a.chat_cap_usd, a.core_hours_cap)
     if a.sync_cmd:
         threading.Thread(target=con.sync_loop, daemon=True).start()
+    threading.Thread(target=con.runs, daemon=True).start()   # warm the parse cache before the first page load
     try:
         srv = bind(con, a.port)
     except ValueError as e:
