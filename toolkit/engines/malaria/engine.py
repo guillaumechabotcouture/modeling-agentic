@@ -17,10 +17,11 @@ Unit attributes (UnitSpec.attributes):
   itn_use         survey-reported nightly net use, measured itn_use_at years after the campaign
   itn_use_at      optional (default 0); access at distribution = itn_use / (retention(t) x use_rate)
   itn_hist_years  decimal years of past pyrethroid-net campaigns
-  campaign_year   decimal year of the package's net campaign (in the decision window)
+  campaign_year   decimal year of the package's net campaign (in the delivery period)
+  itn_routine_interval  optional (v0.6); years between routine net campaigns after campaign_year, in every arm
   smc_months      optional; default: rainfall-peak month -1 .. +2 (season is lagged one month)
   irs_month       optional; default: three months before the transmission peak
-  irs_years       optional; decimal years of IRS rounds (default: every year of the window)
+  irs_years       optional; decimal years of IRS rounds (default: every year of the delivery period)
   irs_product     optional; pm_cs (default, pirimiphos-methyl CS) | short
   resistance may be one value or {species: value, default: value}
 Package components: net none|pyr|pbo|dual; smc 0|1; irs 0|1; cm 0|1 (enhanced CM).
@@ -38,6 +39,14 @@ and forks an exact copy for each package at its first component event, so packag
 identical history (common random numbers); run() is run_batch() with one member.
 initial_state() returns the state at horizon.start. `batch_shares_state` tells the benchmark
 runner and the analysis batch to send one unit's packages together.
+
+v0.6: a delivery period distinct from the outcome window (`horizon.delivery`, a DeliveryHorizon from
+toolkit/engines/horizon.py; default: the decision window). SMC rounds, default IRS rounds and the enhanced
+case-management add-on act only in delivery years; with an explicit period, every component event must fall in it
+(fail closed). Cost drivers count the delivery period (what the decision pays for), health outcomes the outcome window.
+`itn_routine_interval` adds routine net campaigns at campaign_year + k x interval before the window's end, in every
+package including the comparator, with net type hist_net and never charged. Without either, a run is byte-identical
+to v0.5 (self-test D9; benchmarks/restamp_proof.py).
 """
 from __future__ import annotations
 
@@ -51,11 +60,13 @@ import yaml
 
 if __package__:
     from ..contract import EngineCard, ParamSpec, UnitSpec, Package, Horizon, Outcomes, resolve_params, check_engine
+    from ..horizon import delivery_period, delivery_problems, explicit_delivery
     from . import model as M
     from . import vector as V
 else:  # pragma: no cover
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
     from toolkit.engines.contract import EngineCard, ParamSpec, UnitSpec, Package, Horizon, Outcomes, resolve_params, check_engine  # noqa: E402
+    from toolkit.engines.horizon import delivery_period, delivery_problems, explicit_delivery  # noqa: E402
     from toolkit.engines.malaria import model as M, vector as V  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -64,7 +75,7 @@ RESULTS = os.path.join(HERE, "benchmarks", "results.yaml")
 AGES = ["u5", "5_14", "15p"]
 GRIFFIN = "Griffin et al. 2010 PLoS Med 10.1371/journal.pmed.1000324; 2014 Nat Commun; 2015 Lancet Infect Dis"
 A8 = "E7 attempt 8 value (models/malaria_abm.py VC), kept"
-VERSION = "0.5"
+VERSION = "0.6"
 BV = "Bertozzi-Villa et al. 2021 Nat Commun 10.1038/s41467-021-23707-7 (PMC8196080)"
 
 # name, value, kind, units, lo, hi, source, verified
@@ -194,6 +205,8 @@ class MalariaEngine:
                 "biting heterogeneity correlated with net non-use",
                 "ITN x IRS redundancy from shared indoor target, diversion and correlated coverage (no interaction factor)",
                 "SMC (28-day protection, clearance); case management (effective treatment)",
+                "delivery period distinct from the outcome window: components act and cost drivers count only in "
+                "delivery years; routine net campaigns after the package's campaign in every arm (v0.6)",
                 "expected severe episodes and deaths; DALYs from GBD 2019 weights and reference life table",
                 "microscopy prevalence by age band, including the ITN trials' own bands (under 5 from birth, under 10, "
                 "15 and under, all ages; Pryce 2018 characteristics of included studies)"],
@@ -206,7 +219,9 @@ class MalariaEngine:
                 "smc_months": "optional SMC months", "irs_month": "optional IRS month",
                 "irs_years": "optional IRS round years", "irs_product": "pm_cs | short",
                 "itn_use_at": "years after distribution at which itn_use was measured (default 0)",
-                "hist_net": "net type of past campaigns (default pyr)"},
+                "hist_net": "net type of past campaigns (default pyr)",
+                "itn_routine_interval": "years between routine net campaigns after campaign_year: every arm, net type "
+                                        "hist_net, never charged (default: none)"},
             outputs={"per_capita": ["cases", "severe", "deaths", "treated", "dalys"],
                      "windows": list(M.PFPR_BANDS) + ["inc_u5", "inc_all", "inc_u5_smc", "eir_annual",
                                                       "net_use", "net_access"],
@@ -229,6 +244,8 @@ class MalariaEngine:
     # parameters) and copies the sim for each package at the fork, so every package has an identical history
     # (common random numbers). run() is run_batch with one member.
     batch_shares_state = True
+    # v0.6: honours horizon.delivery (toolkit/engines/horizon.py); the spec validator refuses the field otherwise
+    supports_delivery = True
 
     def initialisation(self) -> dict:
         P = resolve_params(self, {})
@@ -238,28 +255,62 @@ class MalariaEngine:
                           "share the burn-in and the history up to their first component event",
                 "evidence": "benchmarks/equilibration.yaml"}
 
+    @staticmethod
+    def _routine_years(a: dict, horizon: Horizon) -> list:
+        """v0.6: routine (non-decision) net campaigns at campaign_year + k x itn_routine_interval, k >= 1, before the
+        outcome window ends; [] without the attribute. They run in every arm, so they belong to the shared history."""
+        iv = a.get("itn_routine_interval")
+        if iv is None:
+            return []
+        iv = float(iv)
+        if not iv > 0:
+            raise ValueError(f"itn_routine_interval must be > 0 years (got {iv:g})")
+        d0, d1 = delivery_period(horizon)
+        cy, w1 = float(a.get("campaign_year", d0)), float(horizon.window[1])
+        out = [cy + k * iv for k in range(1, int(np.ceil((w1 - cy) / iv)) + 1) if cy + k * iv < w1]
+        inside = [y for y in out if d0 <= y < d1]
+        if inside:
+            raise ValueError(f"routine net campaign(s) at {inside} fall inside the delivery period [{d0:g}, {d1:g}): "
+                             "the decision funds those years (itn_routine_interval)")
+        return out
+
     def _plan(self, P: dict, a: dict, components: dict, horizon: Horizon) -> dict:
-        """The package's component settings and the decimal years at which they first act."""
+        """The package's component settings and the decimal years at which they first act. v0.6: components act in
+        the delivery period (the decision window unless horizon.delivery is given)."""
+        bad = delivery_problems(horizon)
+        if bad:
+            raise ValueError("; ".join(bad))
         comp = {"net": "none", "smc": 0, "irs": 0, "cm": 0}
         comp.update(components)
         season = np.asarray(a.get("season", [1.0] * 12), float)
-        w0, w1 = horizon.window
-        years = list(range(int(np.floor(w0)), int(np.ceil(w1))))
+        d0, d1 = delivery_period(horizon)
+        years = list(range(int(np.floor(d0)), int(np.ceil(d1))))
         cfg = {"cm_add": P["cm_add"] if int(comp["cm"]) else 0.0, "net": None, "smc": None, "irs": None,
-               "events": [float(w0)]}
+               "events": [float(d0)]}
+        timed = []                                   # (component, decimal year) of every event the decision pays for
         if comp["net"] != "none":
-            cy = float(a.get("campaign_year", w0))
+            cy = float(a.get("campaign_year", d0))
             cfg["net"] = {"years": [cy], "net_type": comp["net"]}
             cfg["events"].append(cy)
+            timed.append(("net campaign (campaign_year)", cy))
         if int(comp["smc"]):
             months = tuple(a.get("smc_months") or default_smc_months(season))
             cfg["smc"] = {"years": years, "months": months}
-            cfg["events"] += [y + (m - 1) / 12 for y in years for m in months]
+            ev = [y + (m - 1) / 12 for y in years for m in months]
+            cfg["events"] += ev
+            timed += [("SMC round", t) for t in ev]
         if int(comp["irs"]):
             month = int(a.get("irs_month") or ((int(np.argmax(season)) - 3) % 12 + 1))
             irs_years = [int(np.floor(float(y))) for y in a.get("irs_years", years)]
             cfg["irs"] = {"years": irs_years, "month": month}
-            cfg["events"] += [y + (month - 1) / 12 for y in irs_years]
+            ev = [y + (month - 1) / 12 for y in irs_years]
+            cfg["events"] += ev
+            timed += [("IRS round", t) for t in ev]
+        if explicit_delivery(horizon):
+            out = [f"{c} at {t:.3f}" for c, t in timed if not d0 <= t < d1]
+            if out:
+                raise ValueError(f"outside the delivery period [{d0:g}, {d1:g}): {', '.join(out[:4])}")
+        self._routine_years(a, horizon)              # validated here, before any sim is built
         return cfg
 
     @staticmethod
@@ -285,16 +336,19 @@ class MalariaEngine:
         n0 = n if B == 0 else max(int(round(n * np.exp(-POP_GROWTH * B))), 50)
         season = np.asarray(a.get("season", [1.0] * 12), float)
         w0, w1 = horizon.window
+        d0, d1 = delivery_period(horizon)
+        ex = explicit_delivery(horizon)
         m0 = float(a.get("m0", 5.0))
         dis = M.Malaria(M0=m0, season=season, resistance=_resistance(a.get("resistance", 0.5)),
                         ft=float(a.get("cm_ft", 0.3)), species=a.get("species"), P=P,
                         init_eir=min(P["init_eir_per_m0"] * m0, 150.0), win_start=w0, win_stop=w1,
                         smc_months=tuple(a.get("smc_months") or default_smc_months(season)),
                         import_eir=P["import_eir"], irs_product=a.get("irs_product", "pm_cs"),
-                        rec_year=float(horizon.start))
+                        rec_year=float(horizon.start), del_start=d0 if ex else None, del_stop=d1 if ex else None)
         use, capped = access_for_use(float(a.get("itn_use", 0.55)), float(a.get("itn_use_at", 0.0)), P)
-        itv = [M.CaseManagement(base=float(a.get("cm_ft", 0.3)), add=0.0, start=w0, name="cm")]
-        hist = [float(y) for y in a.get("itn_hist_years", [])]
+        # v0.6: the add-on acts in the delivery period; without one it starts at the window and has no end (v0.5)
+        itv = [M.CaseManagement(base=float(a.get("cm_ft", 0.3)), add=0.0, start=d0, stop=d1 if ex else None, name="cm")]
+        hist = [float(y) for y in a.get("itn_hist_years", [])] + self._routine_years(a, horizon)
         if hist:
             itv.append(M.ITNCampaign(years=hist, use=use, net_type=a.get("hist_net", "pyr"), name="itn_hist"))
         itv += [M.ITNCampaign(years=[], use=use, net_type="pyr", count=True, name="itn_new"),
@@ -453,7 +507,11 @@ class MalariaEngine:
                 "inc_all": float(d["inc_all"][sel].sum()), "inc_u5_smc": float(d["inc_u5_smc"][sel].sum()),
                 "eir_annual": float(d["eir"][sel].sum() / dur),
                 "net_use": float(d["net_use"][sel].mean()), "net_access": float(d["net_access"][sel].mean())})
-        tot_treated = float(dz.acc["treated"].sum() / max(dz.acc_cost["pdays_all"] / ndays, 1e-9))
+        # v0.6: treatments in the delivery period per mean person in it (the add-on and its funding end there); the
+        # delivery accumulators equal the window ones when the period is the window
+        d0, d1 = delivery_period(horizon)
+        ndel = max(((yv >= d0) & (yv < d1)).sum(), 1)
+        tot_treated = float(dz.acc_del_treated.sum() / max(dz.acc_cost["pdays_del"] / ndel, 1e-9))
         cd = {"nets_given": float(dz.acc_cost["nets_given"]), "smc_doses": float(dz.acc_cost["smc_doses"]),
               "irs_sprayed": float(dz.acc_cost["irs_sprayed"]), "treated_all": tot_treated}
         if capped is None:
@@ -745,11 +803,13 @@ def _self_test_v06(ok, e, unit) -> None:
 
     def d1():
         sim, _ = e.build_sim(base, u, full, hd, 3)
+        sim.init()
         itv = sim.interventions
         ok(itv["smc"].years == [2016] and itv["irs"].years == [2016] and itv["cm"].stop == 2017.0
            and itv["cm"].start == 2016.0,
            "D1 SMC rounds, IRS rounds and the case-management add-on act only in the delivery period")
         sim2, _ = e.build_sim(base, u, full, Horizon(2015.0, 2019.0, (2016.0, 2019.0), {}), 3)
+        sim2.init()
         ok(sim2.interventions["smc"].years == [2016, 2017, 2018] and sim2.interventions["cm"].stop is None,
            "D1b without a delivery period they act in every year of the window, the add-on with no end (v0.5)")
         sim.run()
@@ -771,6 +831,7 @@ def _self_test_v06(ok, e, unit) -> None:
     def d4():
         ur = UnitSpec("t", dict(u.attributes, itn_routine_interval=1.0, hist_net="pbo"))
         sim, _ = e.build_sim(base, ur, Package("none", {}), hd, 3)
+        sim.init()
         hist = sim.interventions["itn_hist"]
         ok(np.allclose(hist.years, [2015.3, 2017.1, 2018.1]) and hist.code == V.NET_CODE["pbo"],
            f"D4 routine campaigns at campaign_year + k x interval inside the window, net type hist_net: {hist.years}")

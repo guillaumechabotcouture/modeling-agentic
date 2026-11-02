@@ -74,7 +74,7 @@ class Malaria(ss.Disease):
         super().__init__()
         self.define_pars(M0=5.0, season=np.ones(12), resistance=0.5, ft=0.3, species=None, P=None,
                          init_eir=50., win_start=None, win_stop=None, smc_months=(),
-                         import_eir=0.1, irs_product="pm_cs", rec_year=None)
+                         import_eir=0.1, irs_product="pm_cs", rec_year=None, del_start=None, del_stop=None)
         self.update_pars(pars, **kwargs)
         sd = np.sqrt((np.exp(G['sigma2']) - 1))
         self.define_states(
@@ -112,6 +112,9 @@ class Malaria(ss.Disease):
         self.daily = {k: np.zeros(n) for k in DAILY}
         self.acc = {k: np.zeros(3) for k in ('cases', 'severe', 'deaths', 'pdays', 'treated')}
         self.acc_cost = dict(smc_doses=0.0, irs_sprayed=0.0, nets_given=0.0, pdays_all=0.0)
+        # v0.6: treatments and person-days in the delivery period (the treatment cost driver); the same terms in the
+        # same order as acc['treated'] and pdays_all, so they are equal when the delivery period is the window
+        self.acc_del_treated, self.acc_cost['pdays_del'] = np.zeros(3), 0.0
         sel = (age_d > 18 * 365) & (age_d < 25 * 365)
         self.ic20 = float(self.IC[u][sel].mean()) if sel.any() else 0.0
         self.iv20 = float(self.IV[u][sel].mean()) if sel.any() else 0.0
@@ -209,6 +212,13 @@ class Malaria(ss.Disease):
     def in_window(self):
         p, yr = self.pars, self.year()
         return p.win_start is not None and p.win_start <= yr < p.win_stop
+
+    def in_delivery(self):
+        """v0.6: inside the delivery period (what the decision pays for); the window when none is set."""
+        p = self.pars
+        if p.del_start is None:
+            return self.in_window()
+        return p.del_start <= self.year() < p.del_stop
 
     def step(self):
         p, ti, P = self.pars, self.ti, self.P
@@ -315,6 +325,10 @@ class Malaria(ss.Disease):
                 self.acc['deaths'][g] += theta[m].sum() * cfr
                 self.acc['pdays'][g] += (ag == g).sum()
             self.acc_cost['pdays_all'] += n
+            if self.in_delivery():         # the delivery period lies inside the window (the engine checks it)
+                for g in range(3):
+                    self.acc_del_treated[g] += treat[agi == g].sum()
+                self.acc_cost['pdays_del'] += n
 
     def _detect(self, age_d):
         fd = 1 - (1 - G['fd0']) / (1 + (age_d / G['ad']) ** G['gd'])
@@ -350,7 +364,7 @@ class ITNCampaign(ss.Intervention):
             dz.has_net[give] = True
             dz.net_t[give] = self.ti
             dz.net_type[give] = self.code
-            if self.count and dz.in_window():
+            if self.count and dz.in_delivery():
                 dz.acc_cost['nets_given'] += len(give) / len(u)
 
 
@@ -369,7 +383,7 @@ class IRSRound(ss.Intervention):
             u = self.sim.people.auids
             hit = u[dz.prop_spray[u] < self.cov]
             dz.spray_t[hit] = self.ti
-            if dz.in_window():
+            if dz.in_delivery():
                 dz.acc_cost['irs_sprayed'] += len(hit) / len(u)
 
 
@@ -391,7 +405,7 @@ class SMCDelivery(ss.Intervention):
             e = u[(a >= 0.25) & (a < 5)]
             hi = dz.prop_smc[e] < self.hi_frac
             got = e[dz.rs.random(len(e)) < np.where(hi, self.p_hi, self.p_lo)]
-            if dz.in_window():
+            if dz.in_delivery():
                 dz.acc_cost['smc_doses'] += len(got) / len(u)
             dz.st[got] = S_
             dz.prot_until[got] = self.ti + 28
@@ -399,11 +413,12 @@ class SMCDelivery(ss.Intervention):
 
 
 class CaseManagement(ss.Intervention):
-    """Effective treatment probability of clinical episodes; `add` from `start`."""
-    def __init__(self, base=0.3, add=0.0, start=2024.0, name=None):
+    """Effective treatment probability of clinical episodes; `add` from `start` until `stop` (v0.6; None: no end)."""
+    def __init__(self, base=0.3, add=0.0, start=2024.0, stop=None, name=None):
         super().__init__(name=name)
-        self.base, self.add, self.start = base, add, start
+        self.base, self.add, self.start, self.stop = base, add, start, stop
 
     def step(self):
         yr = float(self.sim.t.yearvec[self.ti])
-        self.sim.diseases.malaria.pars.ft = min(0.95, self.base + (self.add if yr >= self.start else 0.0))
+        on = yr >= self.start and (self.stop is None or yr < self.stop)
+        self.sim.diseases.malaria.pars.ft = min(0.95, self.base + (self.add if on else 0.0))

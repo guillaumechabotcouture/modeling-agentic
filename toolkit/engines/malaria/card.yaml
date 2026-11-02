@@ -1,5 +1,5 @@
 name: malaria-starsim
-version: '0.5'
+version: '0.6'
 mechanisms:
 - 'Griffin-lite human natural history and immunity (fixed: Griffin et al. 2010 PLoS Med 10.1371/journal.pmed.1000324;
   2014 Nat Commun; 2015 Lancet Infect Dis)'
@@ -15,6 +15,8 @@ mechanisms:
   with net non-use'
 - ITN x IRS redundancy from shared indoor target, diversion and correlated coverage (no interaction factor)
 - SMC (28-day protection, clearance); case management (effective treatment)
+- 'delivery period distinct from the outcome window: components act and cost drivers count only in delivery years;
+  routine net campaigns after the package''s campaign in every arm (v0.6)'
 - expected severe episodes and deaths; DALYs from GBD 2019 weights and reference life table
 - microscopy prevalence by age band, including the ITN trials' own bands (under 5 from birth, under 10, 15 and under,
   all ages; Pryce 2018 characteristics of included studies)
@@ -48,6 +50,8 @@ unit_attributes:
   irs_product: pm_cs | short
   itn_use_at: years after distribution at which itn_use was measured (default 0)
   hist_net: net type of past campaigns (default pyr)
+  itn_routine_interval: 'years between routine net campaigns after campaign_year: every arm, net type hist_net,
+    never charged (default: none)'
 outputs:
   per_capita:
   - cases

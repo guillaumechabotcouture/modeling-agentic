@@ -37,7 +37,10 @@ docs/design/v2-spec-and-analysis.md §1):
     objective:
       outcome: dalys                       # an engine per-capita output
       sense: avert                         # benefit = comparator outcome - package outcome
-      horizon: [2024.0, 2027.0]            # the decision window
+      horizon: [2024.0, 2027.0]            # the decision window (outcomes are counted over it)
+      delivery: [2024.0, 2026.0]           # optional: the years whose components the decision delivers and pays
+                                           # for, inside horizon (default: horizon); only for an engine that declares
+                                           # supports_delivery (toolkit/engines/horizon.py)
       discounting: none | {rate: 0.03, base_year: 2024}
     constraints:
       envelope_usd: 1.0e6
@@ -108,6 +111,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 from toolkit.alloc import costs as acosts, packages as apackages  # noqa: E402
 from toolkit.engines.contract import Engine, Horizon  # noqa: E402
+from toolkit.engines.horizon import make_horizon  # noqa: E402
 
 SCHEMA_VERSION = 1
 REQUIRED = ("schema_version", "question", "decision_maker", "decision_date", "engine", "horizon", "decision_units",
@@ -282,8 +286,9 @@ class Spec:
         return self._engine
 
     def horizon(self, windows: dict | None = None) -> Horizon:
+        """The engine horizon; a DeliveryHorizon when the spec gives objective.delivery (else the contract's own)."""
         h, o = self.raw["horizon"], self.raw["objective"]
-        return Horizon(float(h["start"]), float(h["stop"]), tuple(float(x) for x in o["horizon"]), dict(windows or {}))
+        return make_horizon(h["start"], h["stop"], tuple(float(x) for x in o["horizon"]), windows, o.get("delivery"))
 
     # ---- units
     def units(self) -> list[dict]:
@@ -690,6 +695,17 @@ def _validate(s: Spec) -> list[str]:
         bad.append("objective.horizon: [t0, t1] with t0 < t1")
     elif isinstance(h, dict) and _isnum(h.get("start")) and not (h["start"] <= win[0] and win[1] <= h["stop"]):
         bad.append("objective.horizon: the decision window must lie inside the simulated horizon")
+    if o.get("delivery") is not None:
+        dl = o["delivery"]
+        if not (isinstance(dl, list) and len(dl) == 2 and all(_isnum(x) for x in dl) and dl[0] < dl[1]):
+            bad.append("objective.delivery: [t0, t1] with t0 < t1")
+        elif isinstance(win, list) and len(win) == 2 and all(_isnum(x) for x in win) and not (
+                win[0] <= dl[0] and dl[1] <= win[1]):
+            bad.append("objective.delivery: the delivery period must lie inside the decision window objective.horizon")
+        if not getattr(eng, "supports_delivery", False):
+            bad.append(f"objective.delivery: engine {card.name} does not honour a delivery period (it would deliver "
+                       "and count costs over the whole decision window); remove the field or use an engine that "
+                       "declares supports_delivery")
     outs = card.outputs.get("per_capita", [])
     if o.get("outcome") not in outs:
         bad.append(f"objective.outcome: {o.get('outcome')!r} is not an engine per-capita output {outs}")
