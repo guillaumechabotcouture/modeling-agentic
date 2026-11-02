@@ -18,6 +18,7 @@ environment; never logged).
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as _dt
 import glob
 import hashlib
@@ -316,14 +317,25 @@ def _meta(run_dir: str) -> dict:
     return meta if isinstance(meta, dict) else {}
 
 
+def _last_at(st: dict | None) -> str:
+    return max((h.get("at") or "" for h in (st or {}).get("history") or [] if isinstance(h, dict)), default="")
+
+
+def _meta_end(run_dir: str, st: dict | None) -> dict:
+    """metadata.json's status and finished, unless the run moved on after it (a resumed copy keeps the old
+    metadata: its history has transitions after `finished`)."""
+    m = _meta(run_dir)
+    return m if m.get("finished") and str(m["finished"]) >= _last_at(st) else {}
+
+
 def run_status(run_dir: str, st: dict | None) -> str | None:
-    """run_state's status, else the one main.py recorded in metadata.json."""
-    return (st or {}).get("status") or _meta(run_dir).get("status")
+    """run_state's status, else the one main.py recorded in metadata.json when the run ended."""
+    return (st or {}).get("status") or _meta_end(run_dir, st).get("status")
 
 
 def finished(run_dir: str, st: dict | None) -> bool:
-    """The run has ended: FINAL, a terminal status, or metadata.json says it finished."""
-    return (st or {}).get("state") == "FINAL" or bool(run_status(run_dir, st)) or bool(_meta(run_dir).get("finished"))
+    """The run has ended: FINAL, a terminal status, or metadata.json says it finished after its last step."""
+    return (st or {}).get("state") == "FINAL" or bool(run_status(run_dir, st)) or bool(_meta_end(run_dir, st))
 
 
 def compute_status(run_dir: str, cap_core_hours: float | None = None, st: dict | None = None,
@@ -852,13 +864,26 @@ def discover(roots: list, mirror_roots: list = (), depth: int = 4) -> list:
                 seen.add(dp)
                 dirs[:] = []
                 out.append(run_summary(dp, root, mirror))
-    seen_labels: dict = {}
-    for r in out:
-        seen_labels[r["label"]] = seen_labels.get(r["label"], 0) + 1
-    for r in out:                              # two runs under one label: add the run folder
-        if seen_labels[r["label"]] > 1:
-            r["label"] = f"{r['label']}/{r['name']}"
-    return sorted(out, key=lambda r: r.get("started") or "", reverse=True)
+    return sorted(_short_labels(out), key=lambda r: r.get("started") or "", reverse=True)
+
+
+def _short_labels(runs: list) -> list:
+    """F2_baseline -> F2 when that is unique; else the full label; else the full label and the run folder."""
+    def count(key):
+        n: dict = {}
+        for r in runs:
+            n[key(r)] = n.get(key(r), 0) + 1
+        return n
+    for r in runs:
+        r.setdefault("path_label", r["label"])
+    full = count(lambda r: r["path_label"])
+    for r in runs:
+        r["full_label"] = r["path_label"] if full[r["path_label"]] == 1 else f"{r['path_label']}/{r['name']}"
+    short = count(lambda r: r["full_label"].split("/")[0].split("_")[0])
+    for r in runs:
+        k = r["full_label"].split("/")[0].split("_")[0]
+        r["label"] = k if short[k] == 1 and k else r["full_label"]
+    return runs
 
 
 def run_summary(run_dir: str, root: str | None = None, mirror: bool = False) -> dict:
@@ -870,11 +895,231 @@ def run_summary(run_dir: str, root: str | None = None, mirror: bool = False) -> 
         os.path.join(run_dir, "run_state.json"))
     label, group = run_label(run_dir, root)
     head = headline(run_dir)
+    resumed = _resumed(hist)
     return {"id": run_dir, "name": os.path.basename(run_dir), "mirror": mirror, "label": label, "group": group,
-            "headline_number": headline_number(head), "finished": finished(run_dir, st),
+            "headline_number": headline_number(head), "finished": finished(run_dir, st), "resumed": resumed,
             "question": str((st or {}).get("question") or meta.get("question") or "")[:240], "started": started,
             "state": (st or {}).get("state"), "status": run_status(run_dir, st), "paused": (st or {}).get("paused"),
-            "headline": head, "engine": engine_of(run_dir, st), "error": err}
+            "headline": head, "engine": engine_of(run_dir, st), "error": err,
+            **identity(run_dir, st, head)}
+
+
+# ------------------------------------------------------------------ lineage: projects, scenarios, compare
+LINEAGE_FIELDS = ("horizon", "objective.horizon", "objective.delivery", "decision_units.engine_attributes",
+                  "decision_units.defaults_accepted", "constraints", "analysis.decision_tests")
+
+
+def _dig(doc, dotted: str):
+    for k in dotted.split("."):
+        doc = doc.get(k) if isinstance(doc, dict) else None
+    return doc
+
+
+def _flat(v, path: str, out: dict) -> dict:
+    if isinstance(v, dict):
+        for k in sorted(v, key=str):
+            _flat(v[k], f"{path}.{k}", out)
+    else:
+        out[path] = json.dumps(v, sort_keys=True, default=str) if isinstance(v, list) else str(v)
+    return out
+
+
+def spec_fields(spec) -> dict:
+    """The lineage fields of a decision spec as flat path -> value strings. defaults_accepted: its keys;
+    analysis.decision_tests: its ids."""
+    out: dict = {}
+    for f in LINEAGE_FIELDS:
+        v = _dig(spec, f)
+        if v is None:
+            continue
+        if f.endswith("defaults_accepted"):
+            v = sorted(v) if isinstance(v, (dict, list)) else v
+            v = [x if not isinstance(x, dict) else x.get("id") or x.get("name") for x in v] if isinstance(v, list) else v
+        elif f.endswith("decision_tests") and isinstance(v, list):
+            v = sorted(str(t.get("id") if isinstance(t, dict) else t) for t in v)
+        _flat(v, f, out)
+    return out
+
+
+def spec_diff(before: dict, after: dict) -> list:
+    """[{field, before, after}] over two spec_fields() maps; a field one side lacks is None."""
+    return [{"field": k, "before": before.get(k), "after": after.get(k)}
+            for k in sorted(set(before) | set(after)) if before.get(k) != after.get(k)]
+
+
+def _val(v) -> str:
+    """A diff value for a phrase: 2027.0 -> 2027, [2024.0, 2027.0] -> 2024–2027, long text cut."""
+    if v is None:
+        return "—"
+    try:
+        x = json.loads(v)
+    except ValueError:
+        x = v
+    num = (lambda n: str(int(n)) if isinstance(n, float) and n.is_integer() else str(n))
+    if isinstance(x, list) and len(x) == 2 and all(isinstance(n, (int, float)) for n in x):
+        return f"{num(x[0])}–{num(x[1])}"
+    t = num(x) if isinstance(x, (int, float)) and not isinstance(x, bool) else str(v)
+    return t if len(t) <= 24 else t[:22] + "…"
+
+
+def diff_phrase(diff: list, n: int = 4) -> str:
+    """A short phrase for a spec diff, in LINEAGE_FIELDS order. A block added or removed whole reads as
+    "+name value" or "−name" (its `value` child, if any); a changed leaf as "field before → after"."""
+    def rank(f):
+        return next((i for i, x in enumerate(LINEAGE_FIELDS) if f.startswith(x)), len(LINEAGE_FIELDS))
+    groups: dict = {}
+    for d in sorted(diff, key=lambda d: (rank(d["field"]), d["field"])):
+        groups.setdefault(d["field"].rsplit(".", 1)[0] if "engine_attributes." in d["field"] else d["field"], []).append(d)
+    bits = []
+    for key, ds in groups.items():
+        name = key.split("engine_attributes.")[-1].replace("decision_units.", "")
+        val = next((d for d in ds if d["field"].endswith(".value")), ds[0])
+        if all(d["before"] is None for d in ds):
+            bits.append(f"+{name} {_val(val['after'])}" if len(ds) > 1 or val["after"] else f"+{name}")
+        elif all(d["after"] is None for d in ds):
+            bits.append(f"−{name}")
+        else:
+            bits += [f"{d['field'].split('engine_attributes.')[-1].replace('decision_units.', '')} "
+                     f"{_val(d['before'])} → {_val(d['after'])}" for d in ds]
+    return " · ".join(bits[:n]) + (f" · +{len(bits) - n} more" if len(bits) > n else "")
+
+
+def package_counts(run_dir: str) -> dict:
+    """allocation.csv: how many units each package component (split on "+") is assigned to."""
+    p = os.path.join(run_dir, "allocation.csv")
+    if not os.path.exists(p):
+        return {}
+    counts: dict = {}
+    try:
+        with open(p, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                for c in str(row.get("package") or "").split("+"):
+                    if c.strip():
+                        counts[c.strip()] = counts.get(c.strip(), 0) + 1
+    except (OSError, csv.Error) as e:
+        return {"_error": f"{type(e).__name__}: {e}"}
+    return dict(sorted(counts.items()))
+
+
+def _sha(path: str) -> str | None:
+    try:
+        return hashlib.sha256(open(path, "rb").read()).hexdigest()
+    except OSError:
+        return None
+
+
+def end_reason(st: dict | None, status: str | None, chip: str) -> str:
+    st = st or {}
+    hist = [h for h in st.get("history") or [] if isinstance(h, dict) and "to" in h]
+    why = str((hist[-1].get("why") if hist else "") or "")
+    where = stage_word(hist[-1].get("from") if hist and st.get("state") == "FINAL" else st.get("state"))
+    if chip == "failed":
+        if "timed out" in why:
+            return f"{where} timed out"
+        if re.search(r"Traceback|line \d+|Error\b", why):
+            return f"{where} crashed"
+        return why.split("\n")[0][:60] or str(status)
+    return {"stopped": f"stopped in {where}", "waiting": f"waiting: {st.get('paused')}", "running": f"in {where}",
+            "completed": str(status or "completed")}.get(chip, "")
+
+
+def stage_word(s) -> str:
+    return str(s or "?").lower().replace("_", " ")
+
+
+def identity(run_dir: str, st: dict | None, head: str = "") -> dict:
+    """What tells runs of one question apart: spec sha and sign-off, engine and version, outcome, package
+    counts, decision-test verdicts, how it ended, spend."""
+    so, _ = _read(os.path.join(run_dir, "decision_spec.signoff.json"))
+    so = so if isinstance(so, dict) else {}
+    spec_sha = (so.get("sha256") or {}).get("decision_spec.yaml") if isinstance(so.get("sha256"), dict) else None
+    spec_sha = spec_sha or _sha(os.path.join(run_dir, "decision_spec.yaml"))
+    ec, _ = _read(os.path.join(run_dir, "engine_choice.json"))
+    eng = {}
+    if isinstance(ec, dict) and isinstance(ec.get("engine"), dict):
+        ref = ec["engine"].get("ref")
+        cand = next((c for c in ec.get("candidates") or [] if isinstance(c, dict) and c.get("ref") == ref), {})
+        eng = {"ref": ref, "name": cand.get("name"), "version": cand.get("version"), "at": ec.get("at")}
+    tests = {}
+    for c in decision_test_cards(run_dir):
+        if c["kind"] == "decision_test":
+            tests[c["anchor"]["id"]] = c.get("verdict")
+    status = run_status(run_dir, st)
+    comp = compute_status(run_dir, None, st)
+    active = (not finished(run_dir, st)) and (comp["live"] or time.time() - os.path.getmtime(
+        os.path.join(run_dir, "run_state.json")) < STALE_S)
+    chip = ("failed" if status in FAIL_STATUSES else "completed" if status else "waiting" if (st or {}).get("paused")
+            else "running" if active else "stopped" if not finished(run_dir, st) else "ended")
+    m = re.search(r"95% (?:UI|CI|interval)[^\d$]*([^)]+)\)", head or "")
+    return {"spec_sha": spec_sha, "signed_at": so.get("signed_at"), "signed_by": so.get("signed_by"),
+            "signoff_note": so.get("note"), "engine_id": eng, "packages": package_counts(run_dir), "tests": tests,
+            "ui": m.group(1).strip() if m else None, "chip": chip, "ended": end_reason(st, status, chip),
+            "spent_usd": (st or {}).get("spent_usd"), "launch_commit": _meta(run_dir).get("commit"),
+            "spec_fields": spec_fields(_read(os.path.join(run_dir, "decision_spec.yaml"))[0]),
+            "first_at": min((h.get("at") or "" for h in (st or {}).get("history") or [] if isinstance(h, dict)
+                             and h.get("from") == "SIGN"), default=""), "last_at": _last_at(st),
+            "has_engine_choice": bool(eng), "state_sha": _sha(os.path.join(run_dir, "run_state.json"))}
+
+
+def _resumed(st_hist: list) -> bool:
+    return any(h.get("from") == "FINAL" for h in st_hist if isinstance(h, dict))
+
+
+def projects(runs: list) -> list:
+    """Runs grouped by question into projects; inside one, the lineage in order (oldest first in `lineage`),
+    each run's relation to the one before it and its scenario (the spec diff against it). A staging copy is
+    a draft, not a run: a dir that never got past sign-off (state SPEC or SIGN and no engine_choice.json),
+    or a byte-identical copy of another run's run_state.json (the copy whose label sorts first is the run)."""
+    by_sha: dict = {}
+    for r in runs:
+        by_sha.setdefault((r.get("state_sha"), r.get("spec_sha")), []).append(r)
+    for r in runs:
+        twins = sorted(by_sha.get((r.get("state_sha"), r.get("spec_sha"))) or [], key=lambda x: x["label"])
+        r["draft"] = None
+        if r.get("state") in ("SPEC", "SIGN") and not r.get("has_engine_choice"):
+            r["draft"] = "never got past sign-off"
+        elif r.get("state_sha") and len(twins) > 1 and twins[0] is not r:
+            r["draft"] = f"a copy of {twins[0]['label']}"
+    out: dict = {}
+    for r in runs:
+        out.setdefault(r.get("question") or "", {"question": r.get("question") or "", "lineage": [], "drafts": []})
+        out[r.get("question") or ""]["drafts" if r["draft"] else "lineage"].append(r)
+    for pj in out.values():
+        pj["lineage"].sort(key=lambda r: (r.get("signed_at") or "", (r.get("engine_id") or {}).get("at") or "",
+                                          r.get("first_at") or "", r.get("last_at") or ""))
+        prev = None
+        for r in pj["lineage"]:
+            r["prev"], r["relation"], r["scenario"], r["diff"], r["shift"] = None, None, "", [], ""
+            if prev:
+                r["prev"], r["diff"] = prev["id"], spec_diff(prev.get("spec_fields") or {}, r.get("spec_fields") or {})
+                r["relation"] = ("amended + re-signed" if r.get("spec_sha") != prev.get("spec_sha")
+                                 else "resumed" if r.get("resumed") else "relaunched")
+                r["scenario"] = diff_phrase(r["diff"]) or "same signed spec"
+                base = next((x for x in reversed(pj["lineage"][:pj["lineage"].index(r)]) if x.get("packages")), None)
+                a, b = (base or {}).get("packages") or {}, r.get("packages") or {}
+                if a and b and not a.get("_error") and not b.get("_error"):
+                    k = max(set(a) | set(b), key=lambda c: (abs(b.get(c, 0) - a.get(c, 0)), c))
+                    if b.get(k, 0) != a.get(k, 0):
+                        r["shift"] = f"{k} {a.get(k, 0)}→{b.get(k, 0)}"
+                        r["shift_vs"] = base["label"]
+            prev = r
+    return sorted(out.values(), key=lambda pj: max((r.get("last_at") or "" for r in pj["lineage"] + pj["drafts"]),
+                                                   default=""), reverse=True)
+
+
+def compare(a: dict, b: dict) -> dict:
+    """Two run summaries side by side: spec diff, engines, headline, package counts, decision tests."""
+    comps = sorted(set(a.get("packages") or {}) | set(b.get("packages") or {}))
+    tids = sorted(set(a.get("tests") or {}) | set(b.get("tests") or {}))
+    return {"a": a["id"], "b": b["id"], "labels": [a["label"], b["label"]],
+            "spec_diff": spec_diff(a.get("spec_fields") or {}, b.get("spec_fields") or {}),
+            "engines": [a.get("engine_id"), b.get("engine_id")],
+            "headline": [[a.get("headline_number"), a.get("ui")], [b.get("headline_number"), b.get("ui")]],
+            "packages": {c: [(a.get("packages") or {}).get(c, 0), (b.get("packages") or {}).get(c, 0)] for c in comps
+                         if not c.startswith("_")},
+            "tests": {t: [(a.get("tests") or {}).get(t), (b.get("tests") or {}).get(t)] for t in tids},
+            "spent": [a.get("spent_usd"), b.get("spent_usd")], "chips": [[a.get("chip"), a.get("ended")],
+                                                                          [b.get("chip"), b.get("ended")]]}
 
 
 def batch_reuse(run_dir: str) -> list:
@@ -1009,7 +1254,7 @@ class Console:
     def runs(self) -> list:
         found = discover(self.roots, [self.mirror] if self.mirror else [])
         ids = {r["id"] for r in found}
-        return [run_summary(d, os.path.dirname(d)) for d in self.extra if d not in ids] + found
+        return _short_labels([run_summary(d, os.path.dirname(d)) for d in self.extra if d not in ids] + found)
 
     def run_dir(self, rid: str) -> tuple[str, bool]:
         rid = os.path.realpath(rid) if rid else rid
@@ -1035,11 +1280,22 @@ class Console:
             with open(HTML, encoding="utf-8") as f:
                 return 200, "text/html; charset=utf-8", f.read().replace("__CONSOLE_TOKEN__", self.token).encode()
         if method == "GET" and path == "/api/runs":
-            return 200, "json", {"runs": self.runs(), "sync": self.sync_state, "chat": {
+            runs = self.runs()
+            return 200, "json", {"runs": runs, "projects": [{"question": p["question"],
+                                                             "lineage": [r["id"] for r in p["lineage"]],
+                                                             "drafts": [r["id"] for r in p["drafts"]]}
+                                                            for p in projects(runs)], "sync": self.sync_state, "chat": {
                 "spent": self.chat.spent, "cap": self.chat.cap_usd, "key": api_key() is not None},
                 "kinds": KINDS, "layers": LAYERS, "states": states()}
         if method == "GET" and path == "/api/learning":
             return 200, "json", learning([r["id"] for r in self.runs()])
+        if method == "GET" and path == "/api/compare":
+            by = {r["id"]: r for r in self.runs()}
+            projects(list(by.values()))
+            a, b = by.get(os.path.realpath(q.get("a") or "")), by.get(os.path.realpath(q.get("b") or ""))
+            if not a or not b:
+                raise ValueError("unknown run")
+            return 200, "json", compare(a, b)
         if method == "GET" and path == "/api/cloud":
             return 200, "json", self.cloud.snapshot(q.get("live") == "1")
         rd, mirror = self.run_dir(q.get("run") or body.get("run") or "")
@@ -1567,6 +1823,88 @@ def _self_test() -> int:
             ok(finished(live, load_run_state(live)[0]) and headline_number("It averts 12.34M dalys against x")
                == "12.34M DALYs" and headline_number("no number") == "",
                "RC14d metadata.json finished means finished; the headline number is read from the recommendation")
+        # RC15 lineage: projects, staging copies, relations, the scenario diff, compare
+        with tempfile.TemporaryDirectory() as t3:
+            ts = "2026-01-01_000000_toy-question"
+            fail_path = ("SPEC", "SIGN", "EVIDENCE", "ENGINE_CHOICE", "CONFIGURE", "ANALYZE", "FINAL")
+            spec = {"horizon": {"start": 2016.0, "stop": 2027.0}, "objective": {"horizon": [2024.0, 2027.0]},
+                    "decision_units": {"engine_attributes": {"season": {"column": "s"}}},
+                    "constraints": {"envelope_usd": 100}, "analysis": {"decision_tests": [{"id": "DT1"}]}}
+
+            def lin(rel, path, spec_doc, signed_at, version, alloc, resumed=False, status="run_failed"):
+                d = _toy_run(os.path.join(t3, rel, ts), path[-1], None, status, path=path)
+                st = json.load(open(os.path.join(d, "run_state.json")))
+                st["question"] = "Toy question: one option per unit."
+                for h in st["history"]:                     # each run its own times, as a relaunch would have
+                    h["at"] = h["at"].replace("2026-01-01", signed_at[:10])
+                st["history"] = [h for h in st["history"] if "to" in h]
+                st["history"][-1]["why"] = "analysis failed: analyze: timed out after 3600s"
+                if resumed:
+                    st["history"] += [{"at": "2026-01-01T01:00:00+00:00", "from": "FINAL", "to": "ANALYZE", "why": "resume"},
+                                      {"at": "2026-01-01T01:10:00+00:00", "from": "ANALYZE", "to": "CRITIQUE", "why": "built"}]
+                    st["state"], st["status"] = "CRITIQUE", None
+                json.dump(st, open(os.path.join(d, "run_state.json"), "w"))
+                yaml.safe_dump(spec_doc, open(os.path.join(d, "decision_spec.yaml"), "w"))
+                json.dump({"signed_by": "owner", "signed_at": signed_at, "note": f"sign {rel}",
+                           "sha256": {"decision_spec.yaml": _sha(os.path.join(d, "decision_spec.yaml"))}},
+                          open(os.path.join(d, "decision_spec.signoff.json"), "w"))
+                json.dump({"at": signed_at, "engine": {"ref": "toy.engine:Toy"}, "candidates": [
+                    {"ref": "toy.engine:Toy", "name": "toy", "version": version}]},
+                          open(os.path.join(d, "engine_choice.json"), "w"))
+                if alloc:
+                    open(os.path.join(d, "allocation.csv"), "w").write(
+                        "unit,package\n" + "".join(f"{i},{p}\n" for i, p in enumerate(alloc)))
+                return d
+            lin("A/runs", fail_path, spec, "2026-01-01T00:00:00+00:00", "0.5", None)
+            lin("B_baseline", fail_path, spec, "2026-01-01T00:00:00+00:00", "0.5",
+                ["cm+smc", "cm+smc", "cm"], resumed=True)
+            spec2 = json.loads(json.dumps(spec))
+            spec2["horizon"]["stop"], spec2["objective"]["delivery"] = 2029.25, [2024.0, 2027.0]
+            spec2["decision_units"]["engine_attributes"]["routine"] = {"value": 3, "source": "toy"}
+            lin("C_amended", fail_path, spec2, "2026-01-02T00:00:00+00:00", "0.6", ["cm", "cm", "cm+net"])
+            cp = os.path.join(t3, "x_copy", ts)
+            shutil.copytree(os.path.join(t3, "A", "runs", ts), cp)
+            stg = _toy_run(os.path.join(t3, "x", ts), "SIGN", "awaiting_signoff", None, path=("SPEC", "SIGN"))
+            st = json.load(open(os.path.join(stg, "run_state.json")))
+            st["question"] = "Toy question: one option per unit."
+            json.dump(st, open(os.path.join(stg, "run_state.json"), "w"))
+            runs = discover([t3])
+            pj = projects(runs)
+            ok(len(pj) == 1 and [r["label"] for r in pj[0]["lineage"]] == ["A", "B", "C"]
+               and sorted((r["label"], r["draft"]) for r in pj[0]["drafts"]) == [
+                   ("x", "never got past sign-off"), ("x_copy", "a copy of A")],
+               f"RC15a one project per question; lineage A, B, C by sign-off; staging copies are drafts "
+               f"({[(r['label'], r.get('draft')) for r in runs]})")
+            A, B, C = (pj[0]["lineage"] + [{}] * 3)[:3] if pj else ({}, {}, {})
+            ok([A["relation"], B["relation"], C["relation"]] == [None, "resumed", "amended + re-signed"]
+               and B["scenario"] == "same signed spec",
+               f"RC15b relations: resumed (FINAL -> ANALYZE, same spec), amended + re-signed (new spec sha) "
+               f"({[A['relation'], B['relation'], C['relation']]})")
+            fields = {d["field"]: (d["before"], d["after"]) for d in C["diff"]}
+            ok(fields == {"horizon.stop": ("2027.0", "2029.25"), "objective.delivery": (None, "[2024.0, 2027.0]"),
+                          "decision_units.engine_attributes.routine.source": (None, "toy"),
+                          "decision_units.engine_attributes.routine.value": (None, "3")}
+               and C["scenario"] == "horizon.stop 2027 → 2029.25 · +objective.delivery 2024–2027 · +routine 3",
+               f"RC15c the scenario is the structured spec diff and its phrase ({C['scenario']!r}; {fields})")
+            ok(C["engine_id"]["version"] == "0.6" and C["chip"] == "failed" and C["ended"] == "analyze timed out"
+               and B["chip"] in ("running", "stopped") and B["ended"].endswith("critique"), f"RC15d engine version, chip and why it ended ({C['engine_id']}, "
+               f"{C['chip']}, {C['ended']})")
+            ok(C["shift"] in ("smc 2→0", "cm 3→3") and C["shift"] == "smc 2→0" and C["shift_vs"] == "B",
+               f"RC15e the package shift is against the nearest earlier run with an allocation ({C['shift']})")
+            cmpd = compare(B, C)
+            ok(cmpd["packages"] == {"cm": [3, 3], "net": [0, 1], "smc": [2, 0]}
+               and [d["field"] for d in cmpd["spec_diff"]] == sorted(fields)
+               and cmpd["engines"][0]["version"] == "0.5" and cmpd["engines"][1]["version"] == "0.6",
+               f"RC15f compare: spec diff, engine versions, package counts side by side ({cmpd['packages']})")
+            with make_server(Console([t3]), "127.0.0.1", 0) as srv:
+                threading.Thread(target=srv.serve_forever, daemon=True).start()
+                base = f"http://127.0.0.1:{srv.server_address[1]}"
+                j = json.load(urllib.request.urlopen(base + "/api/runs"))
+                c2 = json.load(urllib.request.urlopen(base + "/api/compare?" + urllib.parse.urlencode(
+                    {"a": B["id"], "b": C["id"]})))
+                srv.shutdown()
+            ok(len(j["projects"]) == 1 and len(j["projects"][0]["lineage"]) == 3 and c2["labels"] == ["B", "C"],
+               "RC15g /api/runs lists projects and /api/compare answers")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

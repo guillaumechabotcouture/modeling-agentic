@@ -116,7 +116,36 @@ Known limits, recorded as open items:
 `run_state.json`. The sidebar labels each run by its path under the root without `runs` folders and
 without the timestamped run folder (`F1/runs/2026-..._question` is "F1"), and under the label shows a
 state chip, the headline number ("12.34M DALYs", from "averts ... " in the recommendation) and the
-start date. Group headers (the root's name) appear only when there is more than one root. `--run-dir` adds and selects one run.
+start date. Group headers (the root's name) appear only when there is more than one root.
+
+**Projects and lineage.** Runs with the same `question` are one project, titled with a short question
+title. Inside it the runs form a lineage ordered by spec sign-off time, then engine-choice time, then
+history; the sidebar shows the newest on top. Each row shows a short label (the folder's first token:
+`F2_baseline` is "F2" when that is unique), a status chip (completed, failed, stopped, running, waiting),
+the headline number, and one line: the relation to the run before it and the scenario. The relation is
+*amended + re-signed* when the signed spec's sha differs, *resumed* when the history has a FINAL → stage
+transition on the same spec, and *relaunched* otherwise. The scenario is a structured diff of the spec's
+lineage fields (`horizon`, `objective.horizon`, `objective.delivery`, `decision_units.engine_attributes`,
+`decision_units.defaults_accepted` keys, `constraints`, `analysis.decision_tests` ids), shown as a short
+phrase; the sign-off note is its tooltip. The selected run expands to its engine and version (from
+`engine_choice.json`), why it ended, outcome with interval and the largest package-component shift
+against the nearest earlier run with an `allocation.csv`, model spend, spec sha, sign-off time and
+signer, launch commit when `metadata.json` records one, folder and path. A status counts from
+`metadata.json` only when its `finished` is not older than the last history entry (a resumed copy keeps
+its source's metadata).
+
+**Staging copies.** A directory is a draft, listed under "Drafts and staging copies", not a run, when it
+never got past sign-off (state SPEC or SIGN and no `engine_choice.json`), or when its `run_state.json`
+and signed spec are byte-identical to another run's; the copy whose label sorts first is the run.
+
+**Compare.** Shift-clicking a second run opens a compare view in the main column (older run on the
+left): status, engine versions, outcome and interval, spend, the spec diff, units per package
+component, and each decision test's "changes the plan?" side by side.
+
+**Figures.** A Stream / Figures toggle above the stream. Figures is a grid of thumbnails with the caption
+from `analysis/figures.yaml` and the producer and time from the provenance; a click opens the figure in
+the side panel with a comment button anchored to it. With no figures, one line says why (the run has not
+reached ANALYZE, ANALYZE is running, the run ended in ANALYZE before it wrote any). `--run-dir` adds and selects one run.
 
 **Persisted conversation.** `<run_dir>/owner/chat.jsonl` (one line per message: ts, role, text, anchor,
 stage, usd) and `<run_dir>/owner/feedback.jsonl`. Selecting a run loads both and rebuilds the cards.
@@ -216,6 +245,7 @@ A synthetic run dir with toy numbers (no licensed data):
 | RC8 | v2 tasks cannot write `owner/`; the console writes only under `owner/`, the draft dir and through the sign commands |
 | RC9 | run discovery under roots; build-on draft (copies, batch reuse verdict from `compute.code_fingerprint`) |
 | RC10 | the HTTP server binds 127.0.0.1 only and serves the page and `/api/run` on a toy run |
+| RC15 | lineage on a toy lineage of three runs plus two staging copies: one project, order, drafts, relations, the spec diff and its phrase, engine version, chip and end reason, package shift, compare, `/api/runs` projects and `/api/compare` |
 | RC14 | live vs finished: an ETA and live core-seconds only for a fresh progress record on an unfinished run; a progress record left on a finished run, or a stale one, is interrupted; the headline number |
 
 Plus one real end-to-end check, not part of the self-test: start the server on a toy run, hit the

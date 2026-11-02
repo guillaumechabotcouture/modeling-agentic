@@ -30,7 +30,7 @@ button.primary { background: var(--accent); color: var(--panel); border-color: v
 button.link { border: none; color: var(--muted); padding: 2px 4px; }
 button.link:hover { color: var(--accent); }
 select, input, textarea { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px; font-size: 13px; }
-.app { display: grid; grid-template-columns: 248px minmax(0, 1fr) auto; height: 100vh; }
+.app { display: grid; grid-template-columns: 300px minmax(0, 1fr) auto; height: 100vh; }
 
 /* sidebar */
 aside { border-right: 1px solid var(--line); background: var(--panel); overflow-y: auto; padding: 16px 12px; }
@@ -46,6 +46,19 @@ aside { border-right: 1px solid var(--line); background: var(--panel); overflow-
 .runitem .l { font-weight: 600; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .runitem .s { font-size: 12px; color: var(--muted); display: flex; gap: 6px; align-items: center; white-space: nowrap; overflow: hidden; }
 .runitem .q { font-size: 13px; }
+.runitem .top { display: flex; gap: 8px; align-items: baseline; }
+.runitem .top .l { flex: none; }
+.runitem .top .h { margin-left: auto; font-size: 12px; color: var(--muted); white-space: nowrap; }
+.runitem .sc { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; }
+.runitem.on .sc { white-space: normal; }
+.runitem.cmp { box-shadow: inset 0 0 0 1px var(--accent); }
+.runitem .det { font-size: 12px; color: var(--muted); margin-top: 6px; display: grid; grid-template-columns: auto 1fr; gap: 1px 8px; }
+.runitem .det b { font-weight: 500; color: var(--ink); overflow-wrap: anywhere; }
+.runitem .det b.tail { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; }
+.project { font-size: 12.5px; font-weight: 600; margin: 4px 8px 6px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+details.drafts { margin: 10px 8px 0; font-size: 12px; color: var(--muted); }
+details.drafts summary { cursor: pointer; }
+.hint { font-size: 11.5px; color: var(--faint); margin: 14px 8px 0; }
 .state { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); white-space: nowrap; }
 .state::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--faint); flex: none; }
 .state.bad { color: var(--bad); } .state.bad::before { background: var(--bad); }
@@ -80,7 +93,22 @@ details.question div { white-space: pre-wrap; color: var(--ink); max-height: 240
 .st.waiting i { border-color: var(--warn); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 20%, transparent); }
 .st.failed { color: var(--bad); } .st.failed i { background: var(--bad); border-color: var(--bad); width: 8px; height: 8px; margin-left: -4px; top: 1px; }
 .st.sel span { text-decoration: underline; text-underline-offset: 3px; }
-.stepnote { font-size: 12px; color: var(--muted); margin-top: 8px; }
+.stepnote { font-size: 12px; color: var(--muted); margin-top: 10px; display: flex; gap: 12px; align-items: center; }
+.views { display: flex; gap: 2px; background: var(--soft); border-radius: 7px; padding: 2px; }
+.views button { border: none; border-radius: 5px; color: var(--muted); padding: 1px 10px; font-size: 12.5px; }
+.views button.on { background: var(--panel); color: var(--ink); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+.figs { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 14px; margin: 12px 0; }
+.fig { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px; cursor: zoom-in; }
+.fig img { width: 100%; aspect-ratio: 16 / 10; object-fit: contain; background: #fff; border-radius: 6px; display: block; }
+.fig .c { font-size: 13px; margin-top: 8px; }
+.fig .p { font-size: 11.5px; color: var(--faint); margin-top: 2px; }
+.empty { color: var(--muted); font-size: 13.5px; padding: 18px 2px; }
+table.cmp { border-collapse: collapse; width: 100%; font-size: 13px; margin: 6px 0 4px; }
+table.cmp th, table.cmp td { text-align: left; padding: 5px 10px 5px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+table.cmp th { font-weight: 500; color: var(--muted); }
+table.cmp tr.ch td { color: var(--ink); font-weight: 500; }
+table.cmp .n { text-align: right; font-variant-numeric: tabular-nums; }
+.cmp-h { font-size: 13px; font-weight: 600; margin: 18px 0 2px; }
 .stream { flex: 1; overflow-y: auto; min-height: 0; }
 .stream .wrap { padding-top: 14px; padding-bottom: 28px; }
 
@@ -172,7 +200,7 @@ label.inline { display: inline-flex; gap: 4px; align-items: center; margin-right
       <div class="meta" id="meta"></div>
       <details class="question" id="qbox" hidden><summary>Question</summary><div id="qtext"></div></details>
     </div></header>
-    <div class="stepper"><div class="wrap"><div class="steps" id="stepper"></div><div class="stepnote" id="stepnote"></div></div></div>
+    <div class="stepper"><div class="wrap"><div class="steps" id="stepper"></div><div class="stepnote"><span class="views"><button id="v-stream" class="on">Stream</button><button id="v-figs">Figures</button></span><span id="stepnote"></span></div></div></div>
     <div class="stream" id="streambox"><div class="wrap" id="stream"></div></div>
     <div class="composer"><div class="wrap">
       <div class="row">
@@ -199,7 +227,7 @@ label.inline { display: inline-flex; gap: 4px; align-items: center; margin-right
 <script>
 "use strict";
 const TOKEN = "__CONSOLE_TOKEN__";
-const S = { runs: [], run: null, runId: null, filter: null, anchor: null, verdict: null, meta: null, live: false, liveTimer: null, tab: "runs" };
+const S = { runs: [], run: null, runId: null, filter: null, anchor: null, verdict: null, meta: null, live: false, liveTimer: null, tab: "runs", view: "stream", cmp: null };
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 function toast(msg) { const t = $("toast"); t.textContent = msg; t.classList.add("on"); clearTimeout(toast.h); toast.h = setTimeout(() => t.classList.remove("on"), 4000); }
@@ -276,7 +304,8 @@ async function loadRuns() {
   }
   renderChatSpend();
   if (S.tab === "runs") renderRuns();
-  if (!S.runId && S.runs.length) selectRun(S.runs[0].id);
+  const first = ((S.meta.projects || [])[0] || {}).lineage || [];
+  if (!S.runId && S.runs.length) selectRun(first.length ? first[first.length - 1] : S.runs[0].id);
 }
 function renderChatSpend() {
   const c = S.meta && S.meta.chat; if (!c) return;
@@ -284,21 +313,46 @@ function renderChatSpend() {
   $("send").disabled = !c.key; $("send").title = c.key ? "Send (Ctrl or Cmd + Enter)" : "Chat is off: ANTHROPIC_API_KEY is unset or a placeholder.";
 }
 const runLabel = (r) => r.label || r.name;
+const CHIP = { completed: "ok", failed: "bad", stopped: "", running: "live", waiting: "warn", ended: "" };
+function runRow(r, sub) {
+  const cls = CHIP[r.chip] != null ? CHIP[r.chip] : runState(r)[0], words = r.chip || runState(r)[1];
+  const eng = r.engine_id && r.engine_id.name ? `${r.engine_id.name} ${r.engine_id.version || ""}`.trim() : (r.engine || "");
+  const on = r.id === S.runId, cmp = S.cmp === r.id;
+  const det = on ? `<div class="det">
+      ${eng ? `<span>engine</span><b>${esc(eng)}</b>` : ""}
+      ${r.ended ? `<span>ended</span><b>${esc(r.ended)}</b>` : ""}
+      ${r.headline_number ? `<span>outcome</span><b>${esc(r.headline_number)}${r.ui ? " (" + esc(r.ui) + ")" : ""}${r.shift ? ` · ${esc(r.shift)} vs ${esc(r.shift_vs)}` : ""}</b>` : ""}
+      ${r.spent_usd != null ? `<span>model spend</span><b>${usd(r.spent_usd)}</b>` : ""}
+      ${r.spec_sha ? `<span>spec</span><b>${esc(r.spec_sha.slice(0, 10))}</b>` : ""}
+      ${r.signed_at ? `<span>signed</span><b>${esc(day(r.signed_at))} ${esc(hhmm(r.signed_at))} by ${esc(r.signed_by || "?")}</b>` : ""}
+      ${r.launch_commit ? `<span>commit</span><b>${esc(r.launch_commit)}</b>` : ""}
+      ${r.signoff_note ? `<span>sign-off note</span><b>${esc(r.signoff_note.slice(0, 300))}${r.signoff_note.length > 300 ? "…" : ""}</b>` : ""}
+      <span>folder</span><b>${esc(r.full_label || r.label || r.name)}</b><span>path</span><b class="tail" title="${esc(r.id)}">${esc(r.id)}</b></div>` : "";
+  return `<div class="runitem ${on ? "on" : ""} ${cmp ? "cmp" : ""}" data-run="${esc(r.id)}">
+    <div class="top"><span class="l">${esc(runLabel(r))}</span><span class="state ${cls}">${esc(words)}</span>${r.headline_number ? `<span class="h">${esc(r.headline_number)}</span>` : ""}</div>
+    <div class="sc" title="${esc(r.signoff_note || "")}">${esc(sub)}</div>${det}</div>`;
+}
 function renderRuns() {
-  const groups = {}; S.runs.forEach((r) => (groups[r.group || ""] = groups[r.group || ""] || []).push(r));
-  const many = Object.keys(groups).length > 1;
+  const by = {}; S.runs.forEach((r) => (by[r.id] = r));
+  const pjs = (S.meta && S.meta.projects) || [{ question: "", lineage: S.runs.map((r) => r.id), drafts: [] }];
   let h = "";
-  for (const [g, rs] of Object.entries(groups)) {
-    if (many) h += `<div class="group">${esc(g || "runs")}</div>`;
-    for (const r of rs) {
-      const [cls, words] = runState(r);
-      h += `<div class="runitem ${r.id === S.runId ? "on" : ""}" data-run="${esc(r.id)}" title="${esc(r.name)}">
-        <div class="l">${esc(runLabel(r))}</div>
-        <div class="s"><span class="state ${cls}">${esc(words)}</span>${r.headline_number ? `<span>· ${esc(r.headline_number)}</span>` : ""}${r.started ? `<span>· ${esc(day(r.started))}</span>` : ""}${r.mirror ? "<span>· mirror</span>" : ""}</div></div>`;
+  for (const pj of pjs) {
+    h += `<div class="project" title="${esc(pj.question)}">${esc(shortTitle(pj.question) || "Runs")}</div>`;
+    for (const id of [...pj.lineage].reverse()) {   // newest on top
+      const r = by[id]; if (!r) continue;
+      const eng = r.engine_id && r.engine_id.name ? `${r.engine_id.name} ${r.engine_id.version || ""}`.trim() : "";
+      const sub = r.relation ? `${r.relation}${r.prev && by[r.prev] ? " " + runLabel(by[r.prev]) : ""} · ${r.scenario}` : [eng, r.ended, r.started ? day(r.started) : ""].filter(Boolean).join(" · ");
+      h += runRow(r, sub);
     }
+    if (pj.drafts.length) h += `<details class="drafts"><summary>Drafts and staging copies (${pj.drafts.length})</summary>${pj.drafts.map((id) => by[id] ? runRow(by[id], by[id].draft || "") : "").join("")}</details>`;
   }
-  $("sidebar").innerHTML = h || '<div class="muted small">No runs under the roots.</div>';
-  document.querySelectorAll(".runitem[data-run]").forEach((el) => (el.onclick = () => { $("app").classList.remove("nav"); selectRun(el.dataset.run); }));
+  h += S.runs.length > 1 ? '<div class="hint">Shift-click a second run to compare.</div>' : "";
+  $("sidebar").innerHTML = S.runs.length ? h : '<div class="muted small">No runs under the roots.</div>';
+  document.querySelectorAll(".runitem[data-run]").forEach((el) => (el.onclick = (e) => {
+    if (e.shiftKey && S.runId && el.dataset.run !== S.runId) { S.cmp = el.dataset.run; renderRuns(); renderCompare(); return; }
+    $("app").classList.remove("nav"); S.cmp = null; selectRun(el.dataset.run);
+  }));
+  const d = document.querySelector("details.drafts"); if (d && d.querySelector(".runitem.on")) d.open = true;
 }
 async function renderLearning() {
   let j; try { j = await api("/api/learning"); } catch (e) { $("sidebar").innerHTML = `<div class="card error">${esc(e.message)}</div>`; return; }
@@ -315,7 +369,7 @@ async function renderLearning() {
 }
 
 // ---- one run: header, stepper, stream
-async function selectRun(id) { S.runId = id; S.filter = null; await refresh(); if (S.tab === "runs") renderRuns(); }
+async function selectRun(id) { S.runId = id; S.filter = null; S.cmp = null; await refresh(); if (S.tab === "runs") renderRuns(); }
 async function refresh() {
   if (!S.runId) return;
   try { S.run = await api("/api/run?" + q({ run: S.runId })); } catch (e) { $("stream").innerHTML = `<div class="card error"><div class="head"><span class="t">The run cannot be read</span></div><div class="body">${esc(e.message)}</div></div>`; return; }
@@ -330,11 +384,11 @@ function renderHeader() {
   $("title").title = question;
   $("qbox").hidden = !question; $("qtext").textContent = question;
   // at most four items: state and round, engine batch, spend, compute used
-  const [cls, words] = runState({ ...st, status: r.status || st.status, finished: r.finished, error: r.error, fail_statuses: r.fail_statuses });
-  const failed = sp.stages.find((s) => s.status === "failed");
+  const [cls0, words] = runState({ ...st, status: r.status || st.status, finished: r.finished, error: r.error, fail_statuses: r.fail_statuses });
+  const failed = sp.stages.find((s) => s.status === "failed"), cls = summary.chip === "stopped" ? "" : cls0;
   const calls = c.calls || [], k = calls.find((x) => x.live) || calls[0];
   const items = [];
-  items.push(`<span class="state ${cls} ${c.live ? "live" : ""}" title="${esc(r.error || (failed && failed.why) || r.status || "")}">${esc(failed ? "Failed in " + stage(failed.state) : c.live ? "Running · " + stage(st.state) : words)}${st.round != null ? ` <span class="muted">· round ${esc(st.round)} of ${esc(st.max_rounds)}</span>` : ""}</span>`);
+  items.push(`<span class="state ${cls} ${c.live ? "live" : ""}" title="${esc(r.error || (failed && failed.why) || r.status || "")}">${esc(failed ? "Failed in " + stage(failed.state) : c.live ? "Running · " + stage(st.state) : summary.chip === "stopped" && summary.ended ? summary.ended.replace(/^./, (x) => x.toUpperCase()) : words)}${st.round != null ? ` <span class="muted">· round ${esc(st.round)} of ${esc(st.max_rounds)}</span>` : ""}</span>`);
   if (k && k.done != null) items.push(k.live ? `<span>Engine batch <b>${k.done}/${esc(k.n)}</b>${k.eta_s != null ? " · ETA " + fmtS(k.eta_s) : ""}</span>`
                                            : `<span title="the run is not live; this progress record was left behind">Engine batch interrupted at <b>${k.done}/${esc(k.n)}</b></span>`);
   items.push(`<span><b>${usd(st.spent_usd)}</b>${st.budget_usd != null ? " of " + usd(st.budget_usd) : ""} spent</span>`);
@@ -358,7 +412,46 @@ function renderStepper() {
   document.querySelectorAll(".st").forEach((el) => (el.onclick = () => { S.filter = S.filter === el.dataset.s ? null : el.dataset.s; renderStepper(); renderStream(); }));
   if ($("nofilter")) $("nofilter").onclick = () => { S.filter = null; renderStepper(); renderStream(); };
 }
+$("v-stream").onclick = () => setView("stream");
+$("v-figs").onclick = () => setView("figs");
+function setView(v) { S.view = v; S.cmp = null; $("v-stream").classList.toggle("on", v === "stream"); $("v-figs").classList.toggle("on", v === "figs"); renderStream(); renderRuns(); $("streambox").scrollTop = 0; }
+function renderFigures() {
+  const figs = S.run.cards.filter((c) => c.kind === "figure"), sp = S.run.stepper || { stages: [] };
+  $("v-figs").textContent = figs.length ? `Figures (${figs.length})` : "Figures";
+  if (!figs.length) {
+    const an = sp.stages.find((s) => s.state === "ANALYZE") || {};
+    const why = an.status === "failed" ? "the run ended in ANALYZE before it wrote any"
+      : an.status === "current" || an.status === "waiting" ? "ANALYZE is still running"
+      : an.status === "done" ? "ANALYZE wrote none to figures/" : "the run has not reached ANALYZE";
+    return `<div class="empty">No figures yet: ${why}.</div>`;
+  }
+  return `<div class="figs">${figs.map((c) => `<div class="fig" data-act="open" data-file="${esc(c.file)}"><img loading="lazy" src="/api/file?${q({ run: S.runId, path: c.file })}" alt="">
+    <div class="c">${esc(c.body || c.title)}</div><div class="p">${esc(c.producer || c.title)}${c.at ? " · " + esc(day(c.at)) + " " + esc(hhmm(c.at)) : ""}</div></div>`).join("")}</div>`;
+}
+async function renderCompare() {
+  const order = ((S.meta.projects || []).find((p) => p.lineage.includes(S.runId)) || { lineage: [] }).lineage;
+  const [a, b] = order.indexOf(S.cmp) >= 0 && order.indexOf(S.cmp) < order.indexOf(S.runId) ? [S.cmp, S.runId] : [S.runId, S.cmp];   // older on the left
+  let j; try { j = await api("/api/compare?" + q({ a, b })); } catch (e) { toast(e.message); return; }
+  const [A, B] = j.labels, row = (k, a, b, ch) => `<tr class="${ch ? "ch" : ""}"><td>${k}</td><td>${a}</td><td>${b}</td></tr>`;
+  const eng = (e) => e && e.name ? esc(`${e.name} ${e.version || ""}`) : "—";
+  const head = `<table class="cmp"><tr><th></th><th>${esc(A)}</th><th>${esc(B)}</th></tr>`;
+  let h = `<div class="cmp-h" style="margin-top:4px">Compare ${esc(A)} and ${esc(B)} <button class="link" id="cmp-close">close</button></div>` + head +
+    row("status", esc(j.chips[0].join(" · ")), esc(j.chips[1].join(" · ")), false) +
+    row("engine", eng(j.engines[0]), eng(j.engines[1]), eng(j.engines[0]) !== eng(j.engines[1])) +
+    row("outcome", esc((j.headline[0][0] || "—") + (j.headline[0][1] ? " (" + j.headline[0][1] + ")" : "")), esc((j.headline[1][0] || "—") + (j.headline[1][1] ? " (" + j.headline[1][1] + ")" : "")), j.headline[0][0] !== j.headline[1][0]) +
+    row("model spend", usd(j.spent[0]), usd(j.spent[1]), false) + "</table>";
+  h += `<div class="cmp-h">Signed spec</div>` + (j.spec_diff.length ? head + j.spec_diff.map((d) => row(esc(d.field.replace("decision_units.", "")), esc(d.before == null ? "—" : d.before), esc(d.after == null ? "—" : d.after), true)).join("") + "</table>" : '<div class="empty" style="padding:4px 0">Same lineage fields in both specs.</div>');
+  const pk = Object.entries(j.packages);
+  h += `<div class="cmp-h">Units per package component</div>` + (pk.length ? `<table class="cmp"><tr><th></th><th class="n">${esc(A)}</th><th class="n">${esc(B)}</th><th class="n">change</th></tr>` + pk.map(([k, [a, b]]) => `<tr class="${a !== b ? "ch" : ""}"><td>${esc(k)}</td><td class="n">${a}</td><td class="n">${b}</td><td class="n">${b - a > 0 ? "+" : ""}${b - a || ""}</td></tr>`).join("") + "</table>" : '<div class="empty" style="padding:4px 0">No allocation.csv in either run.</div>');
+  const ts = Object.entries(j.tests), v = (x) => x === "CHANGES_PLAN" ? "changes plan" : x === "NO_CHANGE" ? "no change" : x || "—";
+  h += `<div class="cmp-h">Decision tests: does the plan change?</div>` + (ts.length ? head + ts.map(([k, [a, b]]) => row(esc(k), esc(v(a)), esc(v(b)), a !== b)).join("") + "</table>" : '<div class="empty" style="padding:4px 0">No decision tests in either run.</div>');
+  $("stream").innerHTML = h; $("streambox").scrollTop = 0;
+  $("cmp-close").onclick = () => { S.cmp = null; renderRuns(); renderStream(); };
+}
 function renderStream() {
+  if (S.cmp) return renderCompare();
+  if (S.view === "figs") { $("stream").innerHTML = renderFigures(); wire($("stream")); return; }
+  renderFigures();
   const box = $("streambox"), atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
   const cards = S.run.cards.filter((c) => !S.filter || c.stage === S.filter);
   $("stream").innerHTML = cards.map(card).join("") || '<div class="muted small" style="padding:12px 0">Nothing here for this stage.</div>';
