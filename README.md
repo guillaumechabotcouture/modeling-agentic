@@ -224,8 +224,8 @@ Long runs (4–8 hours) occasionally crash mid-pipeline (API overload, OOM, orph
 
 - Python 3.14 (the version the pins in `requirements.txt` were validated on; 3.10+ likely works but is untested)
 - An [Anthropic API key](https://platform.claude.com/)
-- `pip install -r requirements.txt` — pinned harness, scientific stack (`numpy`, `scipy`, `pandas`, `matplotlib`, `seaborn`, `lmfit`, `statsmodels`, `scikit-learn`, `xgboost`, `PuLP`, `optuna`, `geopandas`), and frameworks (`starsim`, `laser-core`, `laser.generic`)
-- Optional: `requirements-cloud.txt` (Azure Batch + Storage) for `--cloud` UQ; `pymc` for Bayesian mechanistic models; `stisim` installs separately when its skill is used
+- `pip install -r requirements.txt` — pinned harness and v2 toolkit (`numpy`, `scipy`, `pandas`, `matplotlib`, `scikit-learn`, `PuLP`, `starsim`, `dask`), plus, through its include of `requirements-agent.txt`, the libraries agent-written model code and skill scripts import (`seaborn`, `lmfit`, `statsmodels`, `xgboost`, `optuna`, `geopandas`, `sciris`, `laser-core`, `laser.generic`, `polars`, `numba`)
+- Optional: `requirements-cloud.txt` (`coiled`; Azure Storage for run uploads; Azure Batch, legacy) for cloud runs; `pymc` for Bayesian mechanistic models; `stisim` installs separately when its skill is used
 
 ## Layout
 

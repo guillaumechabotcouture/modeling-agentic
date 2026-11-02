@@ -203,8 +203,10 @@ python3 scripts/regression_eval.py                 # planted-defect regression e
 python3 scripts/gate_fuzz.py                       # bad-input fuzz over every gate_findings check (CI)
 ```
 
-Install with `pip install -r requirements.txt` (pinned; add
-`-r requirements-cloud.txt` for Azure Batch).
+Install with `pip install -r requirements.txt` (pinned; it includes
+`requirements-agent.txt`, the libraries agent-written model code and
+skill scripts import; add `-r requirements-cloud.txt` for Coiled, run
+storage and the legacy Azure Batch path).
 
 Live verification (kicks off a real run, ~5 hours, ~$25). Prefer
 alternating the disease area between retros so gates are not tuned to

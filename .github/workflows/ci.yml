@@ -27,7 +27,9 @@ jobs:
         with:
           python-version: "3.14"
           cache: pip
-          cache-dependency-path: requirements.txt
+          cache-dependency-path: |
+            requirements.txt
+            requirements-agent.txt
 
       # A project venv, as in local use: main.py's self-test checks that
       # agents get the venv interpreter first on PATH.

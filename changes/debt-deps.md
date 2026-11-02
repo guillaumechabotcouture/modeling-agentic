@@ -1,0 +1,8 @@
+---
+phase: "v2 debt"
+commit: "B α–β"
+---
+
+## Changelog
+
+**Requirements split by who imports them; rasterio removed; coiled pinned.** An AST import scan of every tracked `.py` file (plus `importlib` string imports) found no harness, toolkit or cloud import of seaborn, statsmodels, lmfit, xgboost, optuna, geopandas, rasterio or sciris, and laser-core, laser.generic, polars and numba imported only by `.claude/skills/laser-spatial-disease-modeling/scripts/`. All but rasterio are named by the modeler prompt or a skill and imported by stored runs (seaborn in 20 local runs, geopandas in 14, statsmodels in 7), so they move to a new `requirements-agent.txt`, which `requirements.txt` includes with `-r`: `pip install -r requirements.txt` installs the same set as before minus rasterio (imported nowhere, named nowhere, in no stored run), and the v1 preflight's `laser.core` / `laser.generic` imports still resolve. `requirements.txt` now holds the harness and the v2 toolkit (pandas, matplotlib, scikit-learn, PuLP and starsim, each annotated with its importer). `requirements-cloud.txt` pins `coiled==1.135.6` (the launcher venv's version; four `cloud/` files and `scripts/replay_coiled.py` import it and it was pinned nowhere), notes that azure-identity and azure-storage-blob serve `scripts/results_store.py` run uploads, and marks azure-batch legacy (v1 `scripts/cloud_batch.py` only). `scripts/model_card.py` read model-import pins from `requirements.txt` alone; it now follows `-r` includes (cycle-safe; an unreadable include adds no pins, so its packages show as unpinned), so model cards still see the pins of model-code libraries (self-test MC12). CI's pip cache key includes the new file.
