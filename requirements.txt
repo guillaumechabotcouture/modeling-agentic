@@ -1,48 +1,40 @@
 # Pinned to the versions validated in the project .venv (Python 3.14.3)
 # on 2026-10-20 (Phase 21 ε). Bump deliberately and re-run every
-# --self-test (see CLAUDE.md) plus a live retro before merging a bump.
+# --self-test (python3 scripts/self_tests.py, or see CLAUDE.md) plus a
+# live retro before merging a bump.
+# This file holds what the harness and the v2 toolkit import (main.py,
+# agents/, scripts/, toolkit/, cloud/). Libraries only agent-written model
+# code and skill scripts import are in requirements-agent.txt, included
+# below so `pip install -r requirements.txt` still gives a working run
+# environment (the v1 preflight imports laser.core and laser.generic).
 # Cloud execution extras live in requirements-cloud.txt.
 
 # --- Harness (main.py, agents/, scripts/) ---
 claude-agent-sdk==0.2.169   # bundles CLI 2.1.305; must know the pinned MODEL_* ids (agents/enforcement.py)
 python-dotenv==1.2.2
 PyYAML==6.0.3
-Pillow==12.2.0          # agents/__init__.py figure checks
-psutil==7.2.2           # agents/__init__.py orphan-process cleanup
-requests==2.33.1        # scripts/cloud_batch.py
+Pillow==12.2.0          # agents/hooks.py figure checks
+psutil==7.2.2           # orphan-process cleanup, compute.py worker checks
+requests==2.33.1        # scripts/cloud_batch.py (legacy Azure Batch)
 dask==2026.8.0          # scripts/compute.py (Phase 24 compute service; matches the Coiled env)
 distributed==2026.8.0
 cloudpickle==3.1.2
 numpy==2.4.4
-scipy==1.17.1           # scripts/identifiability.py
+scipy==1.17.1           # scripts/identifiability.py, toolkit/analysis/
 cryptography==46.0.6    # scripts/eval_private.py (Fernet); already in the venv via azure-identity
 
-# --- Modeling toolkit used by agent-generated model code ---
-# Not imported by the harness itself, but the modeler prompt and skills
-# direct agents to these libraries and past runs import them.
-pandas==3.0.2
-matplotlib==3.10.8
-seaborn==0.13.2
-statsmodels==0.14.6
-scikit-learn==1.8.0
-lmfit==1.3.4
-xgboost==3.2.0
-PuLP==3.3.0             # ILP benchmark (optimizer-method-selection skill)
-optuna==4.8.0           # calibration (modelops-calabaria skill)
-geopandas==1.1.3
-rasterio==1.5.0
-sciris==3.2.9
+# --- v2 toolkit (toolkit/) ---
+pandas==3.0.2           # toolkit/engines/malaria/engine.py, cloud/nigeria_gf13_inputs.py
+matplotlib==3.10.8      # toolkit/analysis/figures.py
+scikit-learn==1.8.0     # toolkit/analysis/model.py (emulator)
+PuLP==3.3.0             # toolkit/alloc/optimize.py (ILP)
+starsim==3.3.2          # toolkit/engines/malaria/, toolkit/engines/compartmental/
 
-# --- Disease-modeling frameworks ---
-starsim==3.3.2
-laser-core==1.0.1
-laser.generic==1.1.0
-polars==1.39.3          # laser-spatial-disease-modeling skill scripts
-numba==0.65.0           # laser-spatial-disease-modeling skill scripts
+# --- Agent-written model code and skill scripts ---
+-r requirements-agent.txt
 
 # Removed in Phase 21 ε: openai (never imported), prophet (never
 # imported by the harness or any run; statsmodels covers the time-series
 # cases the modeler prompt lists).
-
-# Bayesian modeling (optional, heavier dependency)
-# pymc
+# Removed in v2 debt B: rasterio (imported nowhere: no harness file, no
+# skill script, no skill or prompt mention, no stored run).
