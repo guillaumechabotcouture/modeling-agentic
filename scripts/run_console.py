@@ -699,11 +699,21 @@ def uncited(text: str) -> list:
     return out
 
 
+def api_key() -> str | None:
+    """ANTHROPIC_API_KEY, or None when it is unset or an obvious placeholder (empty, `...`, `your…`, `xxx`)."""
+    key = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+    low = key.lower()
+    if (not key or set(key) <= {".", " "} or "your" in low or "xxx" in low
+            or (low.startswith("<") and low.endswith(">"))):
+        return None
+    return key
+
+
 def default_client():
-    key = os.environ.get("ANTHROPIC_API_KEY")
+    key = api_key()
     if not key:
-        raise RuntimeError("ANTHROPIC_API_KEY is not set in the console's environment; chat is off (the rest of "
-                           "the console works). Export it in the shell that starts the console.")
+        raise RuntimeError("ANTHROPIC_API_KEY is not set (or is a placeholder) in the console's environment; chat is "
+                           "off (the rest of the console works). Export the real key in the shell that starts it.")
     import anthropic
     return anthropic.Anthropic(api_key=key)
 
@@ -970,7 +980,7 @@ class Console:
                 return 200, "text/html; charset=utf-8", f.read().replace("__CONSOLE_TOKEN__", self.token).encode()
         if method == "GET" and path == "/api/runs":
             return 200, "json", {"runs": self.runs(), "sync": self.sync_state, "chat": {
-                "spent": self.chat.spent, "cap": self.chat.cap_usd, "key": bool(os.environ.get("ANTHROPIC_API_KEY"))},
+                "spent": self.chat.spent, "cap": self.chat.cap_usd, "key": api_key() is not None},
                 "kinds": KINDS, "layers": LAYERS, "states": states()}
         if method == "GET" and path == "/api/learning":
             return 200, "json", learning([r["id"] for r in self.runs()])
@@ -1005,6 +1015,24 @@ class Console:
         if path == "/api/export":
             return 200, "json", {"path": export_digest([r["id"] for r in self.runs()], self.digest_dir)}
         return 404, "json", {"error": "not found"}
+
+
+DEFAULT_PORT, PORT_TRIES = 8765, 20
+
+
+def bind(console: Console, port: int | None = None):
+    """The server on 127.0.0.1. No --port: the first free port from DEFAULT_PORT on (PORT_TRIES ports).
+    An explicit --port that is busy is an error (ValueError, one line)."""
+    ports = [port] if port is not None else range(DEFAULT_PORT, DEFAULT_PORT + PORT_TRIES)
+    for p in ports:
+        try:
+            return make_server(console, "127.0.0.1", p)
+        except OSError as e:
+            if port is not None:
+                raise ValueError(f"port {port} on 127.0.0.1 is in use ({e.strerror}); choose another with --port, "
+                                 "or omit --port to use the next free one") from None
+    raise ValueError(f"ports {DEFAULT_PORT}-{DEFAULT_PORT + PORT_TRIES - 1} on 127.0.0.1 are all in use; "
+                     "choose one with --port")
 
 
 def make_server(console: Console, host: str = "127.0.0.1", port: int = 8765):
@@ -1415,6 +1443,47 @@ def _self_test() -> int:
         ok(not seen[:0] and s0["snapshot"] is None and s1["snapshot"]["clusters"]["run"]["state"] == "running"
            and [c[1] for c in seen] == ["status", "health", "report-cost"] * 2,
            f"RC11 cloud refresh: only when live, never within 60 s, status/health/report-cost only ({seen})")
+        # RC12 a busy port: the next free one without --port; a one-line error with an explicit --port
+        import socket
+        global DEFAULT_PORT
+        held = socket.socket()
+        held.bind(("127.0.0.1", 0))
+        held.listen(1)
+        busy, old_default = held.getsockname()[1], DEFAULT_PORT
+        DEFAULT_PORT = busy
+        con = Console([td], log=lambda *a: None)
+        try:
+            srv = bind(con)
+            ok(srv.server_address[0] == "127.0.0.1" and srv.server_address[1] != busy,
+               f"RC12a no --port and the default busy: the next free port ({busy} -> {srv.server_address[1]})")
+            srv.server_close()
+            try:
+                bind(con, busy)
+                ok(False, "RC12b an explicit busy --port is a clear error")
+            except ValueError as e:
+                ok(f"port {busy}" in str(e) and "in use" in str(e) and "\n" not in str(e),
+                   f"RC12b an explicit busy --port is a one-line error ({e})")
+            rc = main(["--roots", td, "--port", str(busy)])
+            ok(rc == 1, "RC12c main exits 1 on a busy explicit port (no traceback)")
+        finally:
+            DEFAULT_PORT = old_default
+            held.close()
+        # RC13 a placeholder key counts as no key: no client is built and no call is made
+        prev = os.environ.get("ANTHROPIC_API_KEY")
+        try:
+            for ph in ("", "...", "your-key-here", "sk-ant-xxxx", "<YOUR_KEY>"):
+                os.environ["ANTHROPIC_API_KEY"] = ph
+                made = []
+                r = ChatSession(1.0, lambda: made.append(1) or default_client(), log=lambda *a: None).send(rd, "hi")
+                ok(api_key() is None and not r["ok"] and "not set" in r["error"],
+                   f"RC13 a placeholder key ({ph!r}) means no key and no call")
+            os.environ["ANTHROPIC_API_KEY"] = "sk-ant-api03-realistic"
+            ok(api_key() == "sk-ant-api03-realistic", "RC13b a real-looking key is used")
+        finally:
+            if prev is None:
+                os.environ.pop("ANTHROPIC_API_KEY", None)
+            else:
+                os.environ["ANTHROPIC_API_KEY"] = prev
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -1430,7 +1499,8 @@ def main(argv=None) -> int:
     ap.add_argument("--sync-cmd", help="a command that refreshes --mirror (run every --sync-s seconds)")
     ap.add_argument("--sync-s", type=float, default=120.0)
     ap.add_argument("--cloud-config", help="cloud/configs/<x>.py: the remote sign path and the compute panel")
-    ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--port", type=int, default=None,
+                    help=f"default: the first free port from {DEFAULT_PORT} (an explicit port must be free)")
     ap.add_argument("--chat-cap-usd", type=float, default=2.0, help="chat spend cap for this session (default $2)")
     ap.add_argument("--core-hours-cap", type=float, default=None,
                     help="the run's MA_COMPUTE_MAX_CORE_HOURS, if not the default")
@@ -1444,9 +1514,13 @@ def main(argv=None) -> int:
     con = Console(roots, a.run_dir, a.mirror, a.sync_cmd, a.sync_s, a.cloud_config, a.chat_cap_usd, a.core_hours_cap)
     if a.sync_cmd:
         threading.Thread(target=con.sync_loop, daemon=True).start()
-    srv = make_server(con, "127.0.0.1", a.port)
+    try:
+        srv = bind(con, a.port)
+    except ValueError as e:
+        print(f"Run console: {e}", file=sys.stderr)
+        return 1
     print(f"Run console: http://127.0.0.1:{srv.server_address[1]}/  (chat cap ${a.chat_cap_usd:.2f}; "
-          f"chat {'on' if os.environ.get('ANTHROPIC_API_KEY') else 'off: ANTHROPIC_API_KEY is not set'})", flush=True)
+          f"chat {'on' if api_key() else 'off: ANTHROPIC_API_KEY is not set or is a placeholder'})", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

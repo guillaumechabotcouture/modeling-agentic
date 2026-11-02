@@ -198,7 +198,8 @@ async function loadRuns() {
 }
 function renderChatSpend() {
   const c = S.meta && S.meta.chat; if (!c) return;
-  $("chatspend").textContent = c.key ? `chat $${c.spent.toFixed(3)} of $${c.cap.toFixed(2)}` : "chat off: ANTHROPIC_API_KEY is not set";
+  $("chatspend").textContent = c.key ? `chat $${c.spent.toFixed(3)} of $${c.cap.toFixed(2)}` : "chat off: ANTHROPIC_API_KEY is missing (unset or a placeholder)";
+  $("send").disabled = !c.key; $("send").title = c.key ? "" : "Chat is off: the API key is missing. Record only still works.";
 }
 function renderRuns() {
   const groups = {}; S.runs.forEach((r) => (groups[r.group || ""] = groups[r.group || ""] || []).push(r));
