@@ -65,6 +65,16 @@ in UTC and the C locale). Known limit: on a machine with neither /proc nor
 psutil, tokens saved by a build before this normalisation differ from the new
 ones for the same process, so a caller of that build still running across the
 upgrade may be taken for dead. Linux VMs read /proc and are unaffected.
+A reservation made on another host (a run resumed on a new cluster) is
+judged by its record's heartbeat: a call refreshes the record every 30 s
+from its own thread, and one not refreshed for 5 min is settled like a dead
+local caller, except that nothing is signalled from here: its remote chunks
+are bounded by their shares, local work in flight charges the reservation.
+A record with no heartbeat (written before it) is settled after 5 min only
+if it was kept in another run dir, otherwise after 24 h; no readable record
+holds the reservation for 24 h, then charges it in full. Records are kept
+relative to the run dir; an older absolute path into another run dir is
+found by its `.compute_progress/<name>` suffix in this one.
 
 Known limits: a process the model starts in its own session (setsid,
 daemonizing) escapes the kill on a stop. Work redone by dask after a worker
@@ -91,6 +101,7 @@ import json
 import os
 import sys
 import tarfile
+import threading
 import time
 import traceback
 
@@ -1649,6 +1660,15 @@ def _pid_alive(pid, start: str | None = None) -> bool:
 
 SHARE_STOP_GRACE_S = 15.0            # a chunk's overrun past its share while it is stopped (grace periods)
 PROGRESS_DIR = ".compute_progress"   # under the run dir, outside models/ and data/ (not fingerprinted or bundled)
+# A ledgered call rewrites its record's `t` at least every PROGRESS_HEARTBEAT_S
+# (its own thread, also while one task runs for hours). Its pid cannot be read
+# from another host, so a reservation made there is taken as dead when its
+# record has not been refreshed for PROGRESS_STALE_S (ten heartbeats: also
+# covers clock skew between hosts). With no heartbeat to read (a record from
+# before it, or none at all), only an age past the longest step limit counts.
+PROGRESS_HEARTBEAT_S = 30.0
+PROGRESS_STALE_S = 300.0
+PROGRESS_STALE_LEGACY_S = 24 * 3600.0
 
 
 def _note(progress: dict, out: list, extra_core_s: float = 0.0, **more) -> None:
@@ -1658,13 +1678,38 @@ def _note(progress: dict, out: list, extra_core_s: float = 0.0, **more) -> None:
     timeout, SIGKILL) is charged for work done, not its whole reservation.
     Written before new work is submitted. If a write fails the record is
     removed, so settlement falls back to charging the reservation."""
-    path = progress.get("_file")
-    if not path:
+    if progress.get("_beat_err"):
+        raise progress["_beat_err"]
+    if not progress.get("_file"):
         return
     rec = {"t": time.time(), "core_s": round(float(progress.get("core_s") or 0) + extra_core_s, 1),
            "done_tasks": int(progress.get("done_tasks") or 0),
            "max_task_core_s": round(float(progress.get("max_task_core_s") or 0), 2),
            "remote_unconfirmed": bool(progress.get("remote_unconfirmed")), "out": out, **more}
+    if progress.get("_hb"):
+        rec["hb_s"] = progress["_hb"]        # its heartbeat: another host judges the caller by it
+    _write_note(progress, rec)
+
+
+def _write_note(progress: dict, rec: dict | None) -> None:
+    """Write `rec` as the call's progress record, or (None) the last one again
+    with a new `t` (the heartbeat). One writer at a time."""
+    lock = progress.get("_lock")
+    if lock is None:
+        return _write_note_locked(progress, rec)
+    with lock:
+        return _write_note_locked(progress, rec)
+
+
+def _write_note_locked(progress: dict, rec: dict | None) -> None:
+    path = progress.get("_file")
+    if not path:
+        return
+    if rec is None:
+        if progress.get("_last") is None:
+            return
+        rec = dict(progress["_last"], t=time.time())
+    progress["_last"] = rec
     try:
         tmp = path + ".tmp"
         with open(tmp, "w") as f:
@@ -1714,7 +1759,7 @@ def _rows_done(progress: dict, rows: list, core_s: float | None = None) -> None:
                   file=sys.stderr, flush=True)
 
 
-def _settle_dead(led, r, now=None) -> tuple[float, str, dict]:
+def _settle_dead(led, r, now=None, run_dir=None, foreign=False) -> tuple[float, str, dict]:
     """Phase 42 α: what a caller that died without settling is charged, and why.
 
     From its progress record: the core-seconds it had accounted for, plus an
@@ -1727,10 +1772,14 @@ def _settle_dead(led, r, now=None) -> tuple[float, str, dict]:
     alone, and work with no share (local) charges the reservation. Never more
     than the reservation; no readable record charges it in full. The largest
     per-task core time seen is recorded as an estimate only: it is not a bound
-    (a long task after short ones), so it is never what is charged."""
+    (a long task after short ones), so it is never what is charged.
+
+    A caller on another host (`foreign`): nothing is signalled from here (its
+    pids are that host's; its scheduler may be gone), so its remote chunks are
+    bounded by their shares and local work in flight charges the reservation."""
     now = time.time() if now is None else now
     held = float(r.get("core_s") or 0)
-    path = r.get("progress")
+    path, _ = _progress_path(r.get("progress"), run_dir)
     if not path:
         return held, "caller died; no progress record (reserved before Phase 42, or it could not be kept); charged its reservation", {}
     try:
@@ -1742,7 +1791,9 @@ def _settle_dead(led, r, now=None) -> tuple[float, str, dict]:
         return held, f"caller died; progress record unreadable ({type(e).__name__}); charged its reservation", {}
     if p.get("remote_unconfirmed"):
         return held, "caller died; remote chunks not confirmed stopped; charged its reservation", {}
-    if out:
+    if foreign:
+        stopped, how = (False, "on another host: not stopped from here") if out else (True, "nothing in flight")
+    elif out:
         stopped, how = _stop_orphans(p, r.get("backend"))
     else:
         stopped, how = True, "nothing in flight"
@@ -1767,7 +1818,8 @@ def _settle_dead(led, r, now=None) -> tuple[float, str, dict]:
     est = sum(int(c.get("n") or 1) for c in out) * per if per else None
     charge = min(held, done + bound)
     why = (f"caller died; charged work done ({done:.0f} core-s) + in flight ({len(out)} chunks, "
-           f"<= {bound:.0f} core-s; {how}), not its reservation ({held:.0f} core-s)")
+           f"<= {bound:.0f} core-s; {how}), " + ("not its reservation" if charge < held else "capped at its reservation")
+           + f" ({held:.0f} core-s)")
     return charge, why, {"done_core_s": round(done, 1), "inflight_bound_core_s": round(bound, 1),
                          "inflight_estimate_core_s": None if est is None else round(est, 1),
                          "reserved_core_s": round(held, 1)}
@@ -1867,8 +1919,86 @@ def _stop_orphans(p: dict, backend: str | None) -> tuple[bool, str]:
         return False, f"remote cancel failed ({type(e).__name__}{': ' + str(e)[:200] if str(e) else ''})"
 
 
+def _start_heartbeat(progress: dict):
+    """Refresh the call's progress record every `progress["_hb"]` seconds until
+    the returned stop() is called. A record that can be neither refreshed nor
+    removed stops the batch at its next `_note`, as a failed write does."""
+    stop = threading.Event()
+
+    def beat():
+        while not stop.wait(progress["_hb"]):
+            try:
+                _write_note(progress, None)
+            except Exception as e:  # noqa: BLE001 -- raised in the batch's own thread
+                progress["_beat_err"] = e
+                return
+    th = threading.Thread(target=beat, name="compute-progress-heartbeat", daemon=True)
+    th.start()
+
+    def end():
+        stop.set()
+        th.join()
+    return end
+
+
+def _progress_path(ref: str | None, run_dir: str | None) -> tuple[str | None, str | None]:
+    """Where a reservation's progress record is read, and the run dir it was
+    recorded under when that is not this one (None otherwise). Records are kept
+    relative to the run dir; an absolute one (before that) into another run dir
+    (moved, or resumed in another checkout) is found by its
+    `.compute_progress/<name>` suffix in this one."""
+    if not ref or run_dir is None:
+        return ref or None, None
+    if not os.path.isabs(ref):
+        return os.path.join(run_dir, ref), None
+    parent = os.path.dirname(ref)
+    if os.path.basename(parent) != PROGRESS_DIR:
+        return ref, None                          # not placed by map_fn: read as recorded
+    old = os.path.dirname(parent)
+    if os.path.realpath(old) == os.path.realpath(run_dir):
+        return ref, None
+    return os.path.join(run_dir, PROGRESS_DIR, os.path.basename(ref)), old
+
+
+def _foreign_dead(r: dict, run_dir: str | None, now: float) -> str | None:
+    """Why a reservation made on another host is taken as dead (its pid cannot
+    be read from here), or None: still held. Dead when its record carries a
+    heartbeat not refreshed for PROGRESS_STALE_S; or its record was kept in
+    another run dir (this ledger is a copy its caller can no longer settle) and
+    is as old; or, with nothing better to read (no heartbeat; no readable
+    record: the reservation's time), it is older than PROGRESS_STALE_LEGACY_S.
+    Until then it is held; never forever."""
+    path, moved = _progress_path(r.get("progress"), run_dir)
+    t = hb = None
+    try:
+        p = json.load(open(path))
+        t, hb = float(p["t"]), float(p.get("hb_s") or 0)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        t = None
+    if t is not None:
+        age = now - t
+        if hb and age > PROGRESS_STALE_S:
+            return f"has not refreshed its progress record for {age:.0f} s (every {hb:g} s while it runs)"
+        if moved and age > PROGRESS_STALE_S:
+            return f"kept its progress record under {moved}, not this run dir, {age:.0f} s ago"
+    else:
+        try:
+            t = float(r["started"])
+        except (KeyError, TypeError, ValueError):
+            return "recorded no time"
+    age = now - t
+    if age > PROGRESS_STALE_LEGACY_S:
+        return f"last recorded {age / 3600:.1f} h ago (over {PROGRESS_STALE_LEGACY_S / 3600:g} h, the longest step limit)"
+    return None
+
+
 def _drop_progress(progress: dict) -> None:
-    path, progress["_file"] = progress.get("_file"), None
+    lock = progress.get("_lock")
+    if lock is not None:
+        with lock:
+            path, progress["_file"] = progress.get("_file"), None
+    else:
+        path, progress["_file"] = progress.get("_file"), None
     if path:
         try:
             os.remove(path)
@@ -1876,30 +2006,37 @@ def _drop_progress(progress: dict) -> None:
             pass
 
 
-def _live_reservations(led) -> float:
-    """Core-seconds held by calls still running on this host. A call whose
-    process is gone (or defunct) without settling is charged for its work
-    done and a bound on its chunks still in flight (`_settle_dead`)."""
+def _live_reservations(led, run_dir=None, now=None) -> float:
+    """Core-seconds held by calls still running. A call whose process is gone
+    (or defunct) without settling is charged for its work done and a bound on
+    its chunks still in flight (`_settle_dead`). A call made on another host is
+    judged by its progress record's heartbeat (`_foreign_dead`)."""
     host, total = os.uname().nodename, 0.0
     for rid, r in list(led["reservations"].items()):
-        alive = r.get("host") != host
+        gone = None
         if r.get("host") == host:
             try:
                 alive = _pid_alive(int(r["pid"]), r.get("pid_start"))
             except (ValueError, KeyError, TypeError):
                 alive = False
+        else:
+            gone = _foreign_dead(r, run_dir, time.time() if now is None else now)
+            alive = gone is None
         if alive:
             total += float(r.get("core_s") or 0)
         else:
-            charge, why, parts = _settle_dead(led, r)
+            charge, why, parts = _settle_dead(led, r, now=now, run_dir=run_dir, foreign=gone is not None)
+            if gone:
+                why = f"caller on another host ({r.get('host')}) {gone}; {why}"
             del led["reservations"][rid]
             led["core_seconds"] = round(led["core_seconds"] + charge, 1)
             led["calls"].append({"fn": r.get("fn"), "backend": r.get("backend"), "n": r.get("n"),
                                  "purpose": r.get("purpose"), "out": r.get("out"), "stopped": why,
                                  "task_core_s": round(charge, 1), **parts, "ts": time.strftime("%FT%T")})
-            if r.get("progress"):
+            path, _ = _progress_path(r.get("progress"), run_dir)
+            if path:
                 try:
-                    os.remove(r["progress"])
+                    os.remove(path)
                 except OSError:
                     pass
     return total
@@ -1930,11 +2067,12 @@ def map_fn(run_dir: str, fn_spec: str, inputs: list, backend: str = "auto",
     allowance_s, rid, hint = (None if max_core_hours is None else max_core_hours * 3600), None, None
     if backend == "auto":
         backend = "dask" if os.environ.get("MA_COMPUTE_SCHEDULER") else "local"
-    progress = {"_rows": on_rows}
+    progress = {"_rows": on_rows, "_lock": threading.Lock()}
+    end_beat = None
     if ledger:
         cap_s = float(os.environ.get("MA_COMPUTE_MAX_CORE_HOURS", RUN_CAP_CORE_HOURS)) * 3600
         with _LedgerLock(run_dir) as led:
-            held = _live_reservations(led)
+            held = _live_reservations(led, run_dir)
             remaining = cap_s - led["core_seconds"] - held
             if remaining <= 0:
                 raise RuntimeError(
@@ -1951,7 +2089,7 @@ def map_fn(run_dir: str, fn_spec: str, inputs: list, backend: str = "auto",
             pfile = os.path.join(run_dir, PROGRESS_DIR, hashlib.sha1(rid.encode()).hexdigest()[:16] + ".json")
             try:
                 os.makedirs(os.path.dirname(pfile), exist_ok=True)
-                progress["_file"] = pfile
+                progress["_file"], progress["_hb"] = pfile, PROGRESS_HEARTBEAT_S
                 _note(progress, [])
             except OSError:
                 progress["_file"] = None
@@ -1959,7 +2097,11 @@ def map_fn(run_dir: str, fn_spec: str, inputs: list, backend: str = "auto",
                                         "pid_start": _pid_start(os.getpid()),
                                         "host": os.uname().nodename, "fn": fn_spec, "backend": backend,
                                         "n": len(inputs), "purpose": purpose, "out": out,
-                                        "progress": progress.get("_file"), "started": round(time.time(), 1)}
+                                        # relative: a moved or resumed run dir still finds it
+                                        "progress": progress["_file"] and os.path.relpath(progress["_file"], run_dir),
+                                        "started": round(time.time(), 1)}
+            if progress["_file"]:
+                end_beat = _start_heartbeat(progress)
             # Phase 35: the last measured peak memory of this function starts the
             # call at a concurrency that fits, instead of rediscovering it by crashing.
             hint = ((led.get("mem_profile") or {}).get(fn_spec) or {}).get("peak_mb")
@@ -1972,12 +2114,16 @@ def map_fn(run_dir: str, fn_spec: str, inputs: list, backend: str = "auto",
     t0 = time.time()
     deadline = t0 + timeout_s if timeout_s else None
     try:
-        if backend == "dask":
-            rows, info = _map_dask(run_dir, fn_spec, inputs, max_workers, deadline=deadline,
-                                   allowance_s=allowance_s, progress=progress, peak_mb=hint, prior_ok=prior_ok)
-        else:
-            rows, info = _map_local(run_dir, fn_spec, inputs, max_workers, deadline=deadline,
-                                    allowance_s=allowance_s, progress=progress, peak_mb=hint, prior_ok=prior_ok)
+        try:
+            if backend == "dask":
+                rows, info = _map_dask(run_dir, fn_spec, inputs, max_workers, deadline=deadline,
+                                       allowance_s=allowance_s, progress=progress, peak_mb=hint, prior_ok=prior_ok)
+            else:
+                rows, info = _map_local(run_dir, fn_spec, inputs, max_workers, deadline=deadline,
+                                        allowance_s=allowance_s, progress=progress, peak_mb=hint, prior_ok=prior_ok)
+        finally:
+            if end_beat:
+                end_beat()                        # stopped before the ledger lock is taken to settle
         done = {r["i"] for r in rows}
         why = info.get("stopped") or "timed out"
         rows += [{"i": i, "ok": False, "kind": STOPPED, "error": why} for i in range(len(inputs)) if i not in done]
