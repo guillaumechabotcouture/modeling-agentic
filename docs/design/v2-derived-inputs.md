@@ -1,7 +1,8 @@
 # v2: harness-run derivations for the units table and the spec's data (design note)
 
-**Status:** design note for owner review (2026-11-01), written before any code. Branch
-`v2-derived-inputs-design`, PR into `v2`. No code and no cloud spend are part of this note. It
+**Status:** written before any code (2026-11-01, PR #113); the owner decided its open questions
+the same day (§6), and it was built in branch `v2-derived-inputs` (steps α-γ, and δ's retro DI14;
+§7 records what was built differently and why). It
 extends `v2-spec-and-analysis.md` §1 (the decision spec), `v2c-orchestration.md` §3 (the SPEC and
 SIGN states) and `v2d-compartmental-engines.md` §3.4 (observation sources).
 
@@ -178,7 +179,7 @@ A dropped column is the failure that no later check can see, because it is absen
 the derivations account for every column of every staged tabular input:
 - each column is in `columns.uses` or in `columns.ignores` with a reason. Globs are allowed, and an
   ignore glob needs its own reason;
-- **`input_column_unaccounted`** (MEDIUM, before SIGN): a column in neither list;
+- **`input_column_unaccounted`** (HIGH, before SIGN; owner decision 3, §6): a column in neither list;
 - **`ignored_column_used`** (HIGH): the harness re-runs each derivation on its inputs with the
   ignored columns removed. If the output changes, the declaration is wrong. This makes the `ignores`
   list a tested claim, not a comment;
@@ -237,16 +238,90 @@ All of these are self-tests that fail before the code exists: in `scripts/pipeli
 | γ spec checks | `units_not_derived`, `data_ref_not_derived`, `derivation_stale`; card `attribute_binding` for the three engines and `engine_attribute_unbound` before SIGN, per candidate; `prior_target_not_parameter`; `target_frame_unmapped`; input-column accounting; the sign-off record freezes the derivation record; the sign-off sheet lists accepted defaults and ignored columns; the `decision-spec` skill and the `draft_spec` prompt say how to write a derivation (a consequence of the structure, not the fix) | DI7–DI13 pass; all self-tests in `CLAUDE.md` pass |
 | δ retro and live | DI14 on the 2026-11-01 run directory; then the SPEC stage alone (planner plus derivations, no engine batch) re-run on the dev VM against the same staged inputs, compared column by column with the scripted table (match counts only). Its cost estimate goes to the owner before it starts | the retro refuses the hand-written draft and accepts the scripted one; the live SPEC stage produces a units table whose bound attributes and constraint columns match the scripted table, or the differences are listed as findings |
 
-## 6. Open questions for the owner
+## 6. Owner decisions (decided 2026-11-01)
 
-1. **The sandbox on macOS.** Linux namespaces are available on the dev VM and the agent VM.
-   Proposal: macOS fails closed, and the development flag blocks ACCEPT. The alternative is a
-   container on macOS.
-2. **The import allowlist.** The proposal is the standard library, numpy, pandas and pyyaml.
-   Geometry inputs (for example a centroid's latitude) would need geopandas or shapely. Add them,
-   or require geometry to be staged as tables?
-3. **Input-column accounting on wide inputs.** Globs with reasons keep it short. Should
-   `input_column_unaccounted` be MEDIUM (declarable) or HIGH?
-4. **Scope of the obligations.** Proposal: every spec the stage machine drafts. Specs written by
-   hand for harness-only runs could opt in with the same declaration, as the scripted path
-   effectively did.
+The four questions this note left open were decided by the owner on 2026-11-01, before the build.
+
+1. **The sandbox on macOS.** Decided: derivations fail closed on macOS (`derivation_unsandboxed`).
+   A development flag (`main.py --v2 --dev-unsandboxed-derivations`) lets them run; the record says
+   `sandbox: none`, and any run that used it cannot reach ACCEPT (a HIGH, non-declarable gate
+   finding).
+2. **The import allowlist.** Decided: the standard library, numpy, pandas and pyyaml. Geometry is
+   staged as tables; geopandas and shapely are not allowed.
+3. **Input-column accounting on wide inputs.** Decided: `input_column_unaccounted` is HIGH (this
+   note proposed MEDIUM in §3.5).
+4. **Scope of the obligations.** Decided: every spec the stage machine drafts. A hand-written spec
+   for a harness-only run may opt in with the same declaration (`data/derivations.yaml`). DI12
+   (existing specs and fixtures unchanged) holds.
+
+## 7. As built (branch `v2-derived-inputs`)
+
+The build follows §3 with these differences. Each one is a choice made during the build, and the
+reason is given.
+
+- **The sandbox on the Coiled VMs.** A probe on a VM in the default workspace found that jobs run
+  in a container whose host forbids unprivileged user namespaces
+  (`apparmor_restrict_unprivileged_userns=1`). Unprivileged `bwrap` fails there, and so does
+  `unshare --net`. Root in the container has full capabilities. The runner therefore has two kinds:
+  - `bwrap`: unprivileged, every namespace unshared. It is used where the host allows it.
+  - `bwrap-sudo`: started with `sudo -n`, with network, pid, ipc and uts namespaces but no user
+    namespace, so that root can bind the run's private files. The child then drops to the run's
+    own user with `setpriv`: no capabilities, an empty bounding set, `no_new_privs`.
+
+  `sandbox_kind()` probes `bwrap` first, then `bwrap-sudo`. The record names the kind. The note
+  assumed unprivileged namespaces on the dev and agent VMs. On a VM like the one probed, the
+  harness needs passwordless sudo and the `bubblewrap` and `setpriv` packages; this should be
+  confirmed for the agent VM image.
+- **Caps are set inside the sandbox.** `sudo` may reset resource limits, so the child is a
+  launcher (`scripts/pipeline.py _derive_child`). It sets `RLIMIT_AS`, `RLIMIT_CPU`,
+  `RLIMIT_FSIZE` and `RLIMIT_NPROC` and then runs the script with `runpy`. It runs as
+  `python -I`, with a cleared environment (no credentials, `PYTHONHASHSEED=0`, one BLAS thread).
+  The run directory is replaced by an empty read-only tmpfs. The declared inputs and the script
+  are bound read-only into a private work directory, and only that directory is writable. The
+  wall-clock cap is the existing process-group kill.
+- **Calling convention.** The harness runs `python <script> --inputs <paths> --outputs <paths>`,
+  in the declared order. A derivation must read at least one input, which refuses a table typed
+  into a script. Inputs and outputs are files, not globs.
+- **Attribute binding is its own file.** It is `attribute_binding.yaml`, beside each engine
+  module (malaria, compartmental, empirical, and the toy engine beside `contract.py`). It is not
+  part of `card.yaml`, which `engine.py --card` regenerates. Keys may be globs, for attributes
+  named by configuration (`reach:*`). Engine subclasses inherit the binding through the class
+  hierarchy. Code fingerprints and benchmark stamps are unchanged (DI12b).
+- **Where the frame is declared.** `calibration.target_frame: {band, source, mapping: {to,
+  method, source}}`, or `calibration.targets.frame` for a panel. `band` names the population the
+  target measures, compared with the engine output (`calibration.metric` or the targets'
+  outcome). Under the obligations, a target with no declared frame is also
+  `target_frame_unmapped`. The note does not define the per-region error level (§3.4) as a
+  check, and none was added.
+- **The pre-sign fix covers ENGINE_CHOICE as well.** With `engine: auto`, `pre_sign_problems`
+  runs the full checks per card-eligible candidate, even when an engine-independent section
+  fails, so that one try of the draft task hears every problem. ENGINE_CHOICE applies the same
+  per-candidate checks, so it never picks an engine the spec cannot bind. A spec's
+  `engine.candidates` now limits the candidates considered (before, every registered engine was).
+- **Who is under the obligations.** `RunState.derived_inputs` holds this, and `init_run` sets it
+  for every new run. The machine self-tests written before this note (T10-T50) set it to False,
+  because they exercise the gate and the fix loop, not the data stage. The DI tests run the
+  machine with it set.
+- **The column accounting** reads the header of each staged `.csv`/`.tsv`. A staged table that the
+  spec cites directly counts as used. The removal test (`ignored_column_used`) runs only for the
+  ignored columns of tabular inputs.
+
+DI14 retro (2026-11-01 run, local, counts only; derivations ran unsandboxed on macOS):
+- **The planner's draft is refused**, with 28 problems:
+  - `units_not_derived` 1;
+  - `input_column_unaccounted` 15 (15 staged tables that no derivation reads);
+  - `engine_attribute_unbound` 9 (on the one card-eligible engine);
+  - `prior_target_not_parameter` 1;
+  - `target_frame_unmapped` 1.
+
+  No candidate engine passes: two fail on their cards, and the third fails the full checks.
+- **The scripted derivation passes.** `derive_units.py` was adapted in two ways: scipy's root
+  finder became a bisection (scipy is outside the allowlist), and it takes the
+  `--inputs/--outputs` arguments. It was then declared as a derivation, with 8 inputs, 7 staged
+  tables in `ignored_inputs`, 50 columns used and 98 ignored (each found by removing the column
+  and comparing the output). It ran 3 times. Its table has the run's 309 rows and 36 columns: 35
+  columns are identical and 1 matches within a relative 1e-6 (the bisection).
+- **The signed spec, with its path pointed at the derived table**, still gives
+  `engine_attribute_unbound` 6 (defaults it relied on silently) and `target_frame_unmapped` 1.
+  With those 6 defaults accepted by name and the target's frame declared, it passes, and the one
+  engine that fits is eligible.
