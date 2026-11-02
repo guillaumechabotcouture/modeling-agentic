@@ -263,6 +263,9 @@ A synthetic run dir with toy numbers (no licensed data):
 | RC10 | the HTTP server binds 127.0.0.1 only and serves the page and `/api/run` on a toy run |
 | RC15 | lineage on a toy lineage of three runs plus two staging copies: one project, order, drafts, relations, the spec diff and its phrase, engine version, chip and end reason, package shift, compare, `/api/runs` projects and `/api/compare` |
 | RC16 | every term the page marks, every gate action, rule and severity has a definition and a source; JSON only for anchors and request bodies; done-when rows join gate status and blocker; the summary's order, intervals and sources; reused batch points |
+| RC17 | the keys the page reads from `/api/runs` are served; errors show in a banner; fetches time out |
+| RC18 | parsed artifacts are cached by mtime and size and re-read when rewritten |
+| RC19 | done-when patterns as plain alternatives; component names from the question; project title; operator notes newer than the run; decision-test units |
 | RC14 | live vs finished: an ETA and live core-seconds only for a fresh progress record on an unfinished run; a progress record left on a finished run, or a stale one, is interrupted; the headline number |
 
 Plus one real end-to-end check, not part of the self-test: start the server on a toy run, hit the

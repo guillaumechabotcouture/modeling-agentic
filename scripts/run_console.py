@@ -287,8 +287,43 @@ def gate_cards(run_dir: str) -> list:
     return out
 
 
+def _alternatives(pattern: str) -> list:
+    """A regex's top-level alternatives as plain phrases: "(?i)status[- ]quo|business[- ]as[- ]usual" ->
+    ["status quo", "business as usual"]. Groups and classes are kept whole, then stripped of regex syntax."""
+    p, parts, depth, cur, cls = str(pattern).replace("(?i)", ""), [], 0, "", False
+    for ch in p:
+        if ch == "[" and not cls:
+            cls = True
+        elif ch == "]" and cls:
+            cls = False
+        elif not cls and ch == "(":
+            depth += 1
+        elif not cls and ch == ")":
+            depth -= 1
+        if ch == "|" and depth == 0 and not cls:
+            parts.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    parts.append(cur)
+    out = []
+    for x in parts:
+        x = re.sub(r"\[[^\]]*\]", " ", x)                 # [- ] and the like read as a space
+        x = re.sub(r"\.\{\d*,?\d*\}|\.\*|\.\+", " … ", x)   # .{0,80} reads as "…"
+        x = re.sub(r"\\[bBdswDSW]|[\\^$?*+{}]|\d+,\d*", "", x)
+        x = re.sub(r"(?<=[A-Za-z])\.(?=[A-Za-z])", " ", x)       # case.management: "." matches the space
+        while re.search(r"\(([^()]*)\)", x):                    # inner groups first: (ly) -> ly, (a|b) -> a/b
+            x = re.sub(r"\(([^()]*)\)", lambda m: m.group(1).replace("|", "/"), x)
+        x = x.replace("|", "/")
+        x = re.sub(r"\s+", " ", x).strip(" …")
+        if x:
+            out.append(x)
+    return out
+
+
 def _check_words(c) -> str:
-    """One done-when check in words: "manuscript.md contains DT2", "judgement: ..."."""
+    """One done-when check in words: "manuscript.md mentions one of: status quo, business as usual",
+    "judged: ..."."""
     if not isinstance(c, dict):
         return str(c)
     if "judgement" in c:
@@ -296,7 +331,10 @@ def _check_words(c) -> str:
     f = c.get("file", "?")
     for k in ("contains", "lacks"):
         if k in c:
-            return f"{f} {k} {str(c[k]).replace('(?i)', '')}"
+            alts = _alternatives(c[k]) or [str(c[k])]
+            verb = "mentions" if k == "contains" else "does not mention"
+            return (f"{f} {verb} {alts[0]}" if len(alts) == 1 else
+                    f"{f} {verb} {'one' if k == 'contains' else 'any'} of: {', '.join(alts)}")
     if c.get("exists"):
         return f"{f} exists"
     if "key" in c:
@@ -319,6 +357,8 @@ def done_when_rows(run_dir: str, status: dict) -> list:
         rows.append({"blocker": bid, "reviewer": b.get("reviewer"), "severity": b.get("severity"),
                      "claim": b.get("claim"), "checks": [_check_words(x) for x in (dw if isinstance(dw, list) else
                                                                                 [dw] if dw else [])],
+                     "raw": [(x.get("contains") or x.get("lacks") or "") if isinstance(x, dict) else ""
+                             for x in (dw if isinstance(dw, list) else [dw] if dw else [])],
                      "passes": st.get("passes"), "detail": st.get("detail"), "mechanical": st.get("mechanical")})
     return rows
 
@@ -359,6 +399,8 @@ def decision_test_cards(run_dir: str) -> list:
     tests = ((doc or {}).get("data") or {}).get("tests") if isinstance(doc, dict) else None
     if err or not isinstance(tests, list):
         return [_err_card(run_dir, p, "ANALYZE", err or "no data.tests list")]
+    units = {str(x.get("name")): x.get("units") for x in (_data(run_dir, "analysis/engine.yaml").get("parameters") or [])
+             if isinstance(x, dict)}
     spec, _ = _read(os.path.join(run_dir, "decision_spec.yaml"))
     spec_tests = {str(x.get("id")): x for x in (_dig(spec, "analysis.decision_tests") or []) if isinstance(x, dict)}
     out = []
@@ -369,6 +411,8 @@ def decision_test_cards(run_dir: str) -> list:
         q, _ = _read(os.path.join(run_dir, f)) if t.get("path") else (None, None)
         q = q if isinstance(q, dict) else {}
         changes = t.get("verdict") == "CHANGES_PLAN" or q.get("decision_changes") is True
+        param = (spec_tests.get(tid) or {}).get("parameter") or q.get("parameter") or (
+            tid[len("prior_range_"):] if tid.startswith("prior_range_") else None)
         res = [r for r in q.get("results") or [] if isinstance(r, dict)]
         rel = []
         for r in res:
@@ -385,6 +429,7 @@ def decision_test_cards(run_dir: str) -> list:
                     "title": f"{tid}: {'changes the plan' if changes else 'does not change the plan'}",
                     "body": (spec_tests.get(tid) or {}).get("text") or q.get("question") or t.get("statement", ""),
                     "verdict": t.get("verdict"), "changes": changes, "test_id": tid,
+                    "parameter": param, "unit": units.get(param) if param else None,
                     "values": [r.get("value") for r in res], "share_pct": share, "threshold_pct": thr,
                     "objective_vs_point_pct": rel, "criterion": q.get("criterion"),
                     "recommendation": q.get("recommendation"),
@@ -665,15 +710,19 @@ def stop_detail(run_dir: str, st: dict | None) -> str:
     if open_:
         k, v = open_[-1]
         return f"during {where}: task {v.get('task') or k} started {str(v.get('started') or '')[:16].replace('T', ' ')} and never finished"
-    return f"in {where}"
+    return f"in {where}: no task was open"
 
 
-def operator_note(run_dir: str) -> str:
-    """The last note in progress.md's "## Notes" section, if any."""
+def operator_note(run_dir: str, st: dict | None = None) -> str:
+    """The last note in progress.md's "## Notes" section, only when it is dated after the run's last
+    transition (notes carry a day, "2026-11-02 (operator): ...", so the day must be later): an older note
+    is about an earlier attempt, not about why this run stopped."""
     txt, _ = _read(os.path.join(run_dir, "progress.md"))
     if not isinstance(txt, str) or "## Notes" not in txt:
         return ""
     notes = [ln[2:].strip() for ln in txt.split("## Notes", 1)[1].splitlines() if ln.startswith("- ")]
+    last = _last_at(st)[:10]
+    notes = [n for n in notes if (re.match(r"(\d{4}-\d\d-\d\d)", n) or [None, ""])[1] > last] if last else notes
     return notes[-1] if notes else ""
 
 
@@ -751,7 +800,7 @@ def read_run(run_dir: str, cap=None) -> dict:
             "headline": headline(run_dir), "engine": engine_of(run_dir, st), "finished": finished(run_dir, st),
             "status": run_status(run_dir, st), "fail_statuses": FAIL_STATUSES, "summary": results_summary(run_dir),
             "benchmarks": benchmarks(run_dir), "batches": batch_info(run_dir), "stop": stop_detail(run_dir, st),
-            "operator_note": operator_note(run_dir)}
+            "operator_note": operator_note(run_dir, st)}
 
 
 # ------------------------------------------------------------------ feedback and the learning view
@@ -1125,7 +1174,7 @@ def run_summary(run_dir: str, root: str | None = None, mirror: bool = False) -> 
     resumed = _resumed(hist)
     return {"id": run_dir, "name": os.path.basename(run_dir), "mirror": mirror, "label": label, "group": group,
             "headline_number": headline_number(head), "finished": finished(run_dir, st), "resumed": resumed,
-            "question": str((st or {}).get("question") or meta.get("question") or "")[:240], "started": started,
+            "question": str((st or {}).get("question") or meta.get("question") or ""), "started": started,
             "state": (st or {}).get("state"), "status": run_status(run_dir, st), "paused": (st or {}).get("paused"),
             "headline": head, "engine": engine_of(run_dir, st), "error": err,
             **identity(run_dir, st, head)}
@@ -1286,11 +1335,38 @@ def identity(run_dir: str, st: dict | None, head: str = "") -> dict:
             "first_at": min((h.get("at") or "" for h in (st or {}).get("history") or [] if isinstance(h, dict)
                              and h.get("from") == "SIGN"), default=""), "last_at": _last_at(st),
             "has_engine_choice": bool(eng), "state_sha": _sha(os.path.join(run_dir, "run_state.json")),
-            "batches": batch_info(run_dir), "stop": stop_detail(run_dir, st), "operator_note": operator_note(run_dir)}
+            "batches": batch_info(run_dir), "stop": stop_detail(run_dir, st), "operator_note": operator_note(run_dir, st)}
 
 
 def _resumed(st_hist: list) -> bool:
     return any(h.get("from") == "FINAL" for h in st_hist if isinstance(h, dict))
+
+
+def component_names(question: str, ids) -> dict:
+    """A component id spelled out from the question when its letters are the initials of consecutive words
+    ("cm" -> "case management", "smc" -> "seasonal malaria chemoprevention"); otherwise the id."""
+    words = re.findall(r"[A-Za-z][A-Za-z-]*", question or "")
+    out = {}
+    for c in ids:
+        k = str(c).lower()
+        if not k.isalpha() or len(k) < 2:
+            continue
+        for i in range(len(words) - len(k) + 1):
+            w = words[i:i + len(k)]
+            if "".join(x[0].lower() for x in w) == k and all(len(x) > 2 for x in w):
+                out[c] = " ".join(x.lower() for x in w)
+                break
+    return out
+
+
+def short_title(question: str) -> str:
+    """The question's first clause, without a leading "Build a ... model of": the project's name."""
+    q = re.split(r"(?<=[.?!])\s", (question or "").strip(), maxsplit=1)[0]
+    q = re.split(r",|;|\s(?:using|with|that|so that|in order to)\s", q, maxsplit=1)[0]
+    q = re.sub(r"^(?:build|develop|create|construct|write|make)\s+(?:an?\s+|the\s+)?[\w\s-]*?\bmodel\s+of\s+", "", q,
+               flags=re.I)
+    q = re.sub(r"\s*\([^)]*\)", "", q).strip(" .")
+    return q[:1].upper() + q[1:]
 
 
 def projects(runs: list) -> list:
@@ -1310,7 +1386,8 @@ def projects(runs: list) -> list:
             r["draft"] = f"a copy of {twins[0]['label']}"
     out: dict = {}
     for r in runs:
-        out.setdefault(r.get("question") or "", {"question": r.get("question") or "", "lineage": [], "drafts": []})
+        out.setdefault(r.get("question") or "", {"question": r.get("question") or "", "title": short_title(r.get("question")),
+                                                 "lineage": [], "drafts": []})
         out[r.get("question") or ""]["drafts" if r["draft"] else "lineage"].append(r)
     for pj in out.values():
         pj["lineage"].sort(key=lambda r: (r.get("signed_at") or "", (r.get("engine_id") or {}).get("at") or "",
@@ -1326,9 +1403,16 @@ def projects(runs: list) -> list:
                 base = next((x for x in reversed(pj["lineage"][:pj["lineage"].index(r)]) if x.get("packages")), None)
                 a, b = (base or {}).get("packages") or {}, r.get("packages") or {}
                 if a and b and not a.get("_error") and not b.get("_error"):
-                    k = max(set(a) | set(b), key=lambda c: (abs(b.get(c, 0) - a.get(c, 0)), c))
-                    if b.get(k, 0) != a.get(k, 0):
-                        r["shift"] = f"{k}: {a.get(k, 0)} → {b.get(k, 0)} units"
+                    def weight(c):   # the units moved, times the share of the component's units that moved
+                        d = abs(b.get(c, 0) - a.get(c, 0))
+                        return d * d / max(a.get(c, 0), b.get(c, 0), 1)
+                    top = sorted((c for c in set(a) | set(b) if b.get(c, 0) != a.get(c, 0)),
+                                 key=lambda c: (-weight(c), c))[:2]
+                    names = component_names(pj["question"], set(a) | set(b))
+                    r["shifts"] = [{"component": c, "name": names.get(c, c), "before": a.get(c, 0), "after": b.get(c, 0)}
+                                   for c in top]
+                    if top:
+                        r["shift"] = " · ".join(f"{x['name']}: {x['before']} → {x['after']} units" for x in r["shifts"])
                         r["shift_vs"] = base["label"]
             prev = r
         for i, r in enumerate(pj["lineage"]):        # where reused engine points were computed
@@ -1516,7 +1600,7 @@ class Console:
                 return 200, "text/html; charset=utf-8", f.read().replace("__CONSOLE_TOKEN__", self.token).encode()
         if method == "GET" and path == "/api/runs":
             runs = self.runs()
-            return 200, "json", {"runs": runs, "projects": [{"question": p["question"],
+            return 200, "json", {"runs": runs, "projects": [{"question": p["question"], "title": p["title"],
                                                              "lineage": [r["id"] for r in p["lineage"]],
                                                              "drafts": [r["id"] for r in p["drafts"]]}
                                                             for p in projects(runs)], "sync": self.sync_state, "chat": {
@@ -2125,7 +2209,8 @@ def _self_test() -> int:
             ok(C["engine_id"]["version"] == "0.6" and C["chip"] == "failed" and C["ended"] == "analyze timed out"
                and B["chip"] in ("running", "stopped") and B["ended"].endswith("critique"), f"RC15d engine version, chip and why it ended ({C['engine_id']}, "
                f"{C['chip']}, {C['ended']})")
-            ok(C["shift"] == "smc: 2 → 0 units" and C["shift_vs"] == "B",
+            ok([(x["component"], x["before"], x["after"]) for x in C["shifts"]] == [("smc", 2, 0), ("net", 0, 1)]
+               and C["shift_vs"] == "B",
                f"RC15e the package shift is against the nearest earlier run with an allocation ({C['shift']})")
             cmpd = compare(B, C)
             ok(cmpd["packages"] == {"cm": [3, 3], "net": [0, 1], "smc": [2, 0]}
@@ -2165,6 +2250,31 @@ def _self_test() -> int:
            f"(needs {keys}; served {sorted(served)})")
         ok('id="banner"' in page and 'addEventListener("unhandledrejection"' in page and "AbortController" in page,
            "RC17b a failed fetch or render shows a banner; fetches time out instead of hanging")
+        # RC19 plain words for patterns, components, project titles; notes newer than the run; units
+        q19 = ("Build an agent-based model of toy fever across Examplia's 300 districts (D) using a toy engine. "
+               "Options: seasonal mass chemoprevention (SMC) and case management.")
+        ok(_check_words({"file": "m.md", "contains": "(?i)status[- ]quo|business[- ]as[- ]usual|current (X )?(plan|alloc)"})
+           == "m.md mentions one of: status quo, business as usual, current X plan/alloc"
+           and _check_words({"file": "m.md", "lacks": "(?i)DT2"}) == "m.md does not mention DT2"
+           and component_names(q19, ["smc", "cm", "net_x"]) == {"smc": "seasonal mass chemoprevention", "cm": "case management"}
+           and short_title(q19) == "Toy fever across Examplia's 300 districts",
+           f"RC19a a pattern reads as its alternatives; components are spelled out from the question; the project "
+           f"title is the first clause ({short_title(q19)!r}, {component_names(q19, ['smc', 'cm'])})")
+        with tempfile.TemporaryDirectory() as t6:
+            d6 = _toy_run(os.path.join(t6, "r"))
+            st6 = load_run_state(d6)[0]
+            open(os.path.join(d6, "progress.md"), "w").write("## Notes:\n\n- 2025-12-31 (operator): old\n")
+            old = operator_note(d6, st6)
+            open(os.path.join(d6, "progress.md"), "w").write("## Notes:\n\n- 2026-01-02 (operator): new\n")
+            yaml.safe_dump({"data": {"parameters": [{"name": "p", "units": "days"}]}},
+                           open(os.path.join(d6, "analysis", "engine.yaml"), "w"))
+            yaml.safe_dump({"data": {"tests": [{"test_id": "prior_range_p", "verdict": "NO_CHANGE"}]}},
+                           open(os.path.join(d6, "analysis", "decision_tests.yaml"), "w"))
+            dt6 = [c for c in decision_test_cards(d6) if c["kind"] == "decision_test"]
+            ok(old == "" and operator_note(d6, st6) == "2026-01-02 (operator): new"
+               and dt6 and dt6[0]["parameter"] == "p" and dt6[0]["unit"] == "days",
+               "RC19b only a note dated after the run's last transition is quoted; a decision test's value carries the "
+               "parameter's unit from the engine card")
         with tempfile.TemporaryDirectory() as t5:
             f5 = os.path.join(t5, "a.yaml")
             open(f5, "w").write("x: 1\n")

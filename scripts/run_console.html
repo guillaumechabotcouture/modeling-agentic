@@ -119,7 +119,7 @@ table.t { border-collapse: collapse; width: 100%; font-size: 13px; margin-top: 4
 table.t th { text-align: left; font-weight: 500; color: var(--muted); font-size: 12px; padding: 4px 10px 4px 0; border-bottom: 1px solid var(--line); }
 table.t td { padding: 6px 10px 6px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
 table.t tr:last-child td { border-bottom: none; }
-table.t td:first-child { max-width: 140px; overflow-wrap: anywhere; }
+table.t td:first-child { max-width: 150px; min-width: 64px; }
 table.t.fixed { table-layout: fixed; } table.t.fixed td { overflow-wrap: anywhere; max-width: none; }
 table.t .n, .md td.n, .md th.n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 table.t td.clip { max-width: 0; width: 46%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -402,7 +402,7 @@ function runRow(r, sub) {
       ${eng ? `<span>engine</span><b>${esc(eng)}</b>` : ""}
       ${r.ended ? `<span>ended</span><b>${esc(r.ended)}</b>` : ""}
       ${r.headline_number ? `<span>outcome</span><b>${esc(r.headline_number)}${r.ui_vals ? " (" + uiText(...r.ui_vals) + ")" : r.ui ? " (95% UI " + esc(r.ui.replace(/([0-9.]+)M-/, "$1–")) + ")" : ""}</b>` : ""}
-      ${r.shift ? `<span>largest shift</span><b>${esc(r.shift)} vs ${esc(r.shift_vs)}</b>` : ""}
+      ${r.shift ? `<span>largest shifts</span><b>${(r.shifts || []).length ? r.shifts.map((x) => `${esc(x.name)}: ${x.before} → ${x.after} units`).join("<br>") : esc(r.shift)}<br><span class="muted">vs ${esc(r.shift_vs)}</span></b>` : ""}
       ${r.spent_usd != null ? `<span>model spend</span><b>${usd(r.spent_usd)}</b>` : ""}
       ${r.spec_sha ? `<span>spec</span><b>${esc(r.spec_sha.slice(0, 10))}</b>` : ""}
       ${r.signed_at ? `<span>signed</span><b>${esc(day(r.signed_at))} ${esc(hhmm(r.signed_at))} by ${esc(r.signed_by || "?")}</b>` : ""}
@@ -418,7 +418,7 @@ function renderRuns() {
   const pjs = (S.meta && S.meta.projects) || [{ question: "", lineage: S.runs.map((r) => r.id), drafts: [] }];
   let h = "";
   for (const pj of pjs) {
-    h += `<div class="project" title="${esc(pj.question)}">${esc(shortTitle(pj.question) || "Runs")}</div>`;
+    h += `<div class="project" title="${esc(pj.question)}">${esc(pj.title || shortTitle(pj.question) || "Runs")}</div>`;
     for (const id of [...pj.lineage].reverse()) {   // newest on top
       const r = by[id]; if (!r) continue;
       const eng = r.engine_id && r.engine_id.name ? `${r.engine_id.name} ${r.engine_id.version || ""}`.trim() : "";
@@ -477,7 +477,9 @@ function renderHeader() {
   const reused = (summary.batches || r.batches || []).filter((b) => b.reused);
   items.push(`<span title="${esc(c.cap_source || "")}${c.error ? " · " + esc(c.error) : ""}">this run <b>${esc(c.used_core_h)}</b> of ${esc(c.cap_core_h)} core-h${reused.map((b) => ` · plus ${num(b.reused)} reused points${b.reused_from ? " computed in " + esc(b.reused_from) : " from an earlier batch"}`).join("")}</span>`);
   const task = (r.stop || "").split(": ")[1];
-  $("stopline").innerHTML = r.stop ? `Why stopped: ${task ? esc(task.replace(/(\d{4}-\d\d-\d\d) (\d\d:\d\d)/, (m, d, t) => day(d + "T00:00:00Z") + " " + t + " UTC")) + "; " : ""}the run does not record who stopped it or why.${r.operator_note ? ` Latest operator note (progress.md): ${esc(r.operator_note.replace(/\.+$/, "").slice(0, 220))}${r.operator_note.length > 220 ? "…" : "."}` : ""}` : "";
+  const where = (r.stop || "").split(":")[0].replace(/ \(round (\d+) of \d+\)/, ", round $1");
+  $("stopline").innerHTML = r.stop ? `<span title="${esc(task || "")}">Stopped ${esc(where)}; no reason recorded.</span>${r.operator_note ? ` <button class="link" id="b-note">note</button>` : ""}` : "";
+  if ($("b-note")) $("b-note").onclick = () => side("operator note · progress.md", `<p>${esc(r.operator_note)}</p><p class="small muted">The latest note in progress.md, written after this run's last transition.</p>`);
   $("stopline").hidden = !r.stop;
   $("meta").innerHTML = items.join("");
   $("acts").innerHTML = `<button class="link" id="b-results">Results</button><button class="link" id="b-compute">Compute</button><button class="link" id="b-build">Build on this run</button>`;
@@ -571,7 +573,7 @@ function gateCard(c, head, open, comment) {
   const rows = dw.map((r) => {
     const checks = r.checks.length ? r.checks : ["(no done-when test recorded)"], n = checks.length;
     return `<tr class="grp"><td colspan="5"><b>${esc(r.blocker)}</b> ${r.severity ? T(r.severity) : ""} · ${esc(r.reviewer || "")} — ${bench(clip((r.claim || "").split("\n")[0], 150))}</td></tr>` +
-      checks.map((ch, k) => `<tr><td>${esc(r.blocker)}.${k + 1}</td><td>${bench(ch)}</td>${k === 0 ? `<td rowspan="${n}">${statusCell(r.passes)}</td><td rowspan="${n}">${esc((r.detail || "").replace(/^(FAIL|PASS)\s*/, ""))}</td><td rowspan="${n}">${r.mechanical ? T("mechanical") : T("judged")}</td>` : ""}</tr>`).join("");
+      checks.map((ch, k) => `<tr><td>${esc(r.blocker)}.${k + 1}</td><td${(r.raw || [])[k] ? ` title="${esc("pattern: " + r.raw[k])}"` : ""}>${bench(ch)}</td>${k === 0 ? `<td rowspan="${n}">${statusCell(r.passes)}</td><td rowspan="${n}">${esc((r.detail || "").replace(/^(FAIL|PASS)\s*/, ""))}</td><td rowspan="${n}">${r.mechanical ? T("mechanical") : T("judged")}</td>` : ""}</tr>`).join("");
   }).join("");
   const act = c.action || "", rule = c.rule != null ? `rule ${c.rule}` : "";
   const needs = act === "AWAIT_OWNER" ? "yes, answer the decision card below." : "no.";
@@ -596,14 +598,17 @@ function blockerTable(g) {
 function dtTable(g) {
   g.rows.forEach((c) => { if (c.changes == null) c.changes = c.verdict === "CHANGES_PLAN"; c.test_id = c.test_id || (c.anchor || {}).id; });   // a server from before ζ
   const thrs = [...new Set(g.rows.map((c) => c.threshold_pct))], thr = thrs.length === 1 ? thrs[0] : undefined;
-  const rows = g.rows.map((c) => `<tr><td><button class="link" data-act="open" data-file="${esc(c.anchor.file)}" data-anchor-id="${esc(c.test_id)}">${esc(c.test_id)}</button></td><td>${bench(c.body || "")}</td>
-    <td class="n">${(c.values || []).map((v) => esc(typeof v === "number" ? num(v) : v)).join(", ") || "—"}</td>
+  const first = (t) => { const m = String(t).match(/^.*?[.?!](?=\s|$)/); return m ? m[0] : String(t); };
+  const rows = g.rows.map((c, i) => { const body = c.body || "", lead = first(body), rest = body.slice(lead.length).trim();
+    return `<tr><td><button class="link" data-act="open" data-file="${esc(c.anchor.file)}" data-anchor-id="${esc(c.test_id)}">${esc(c.test_id).replace(/_/g, "_<wbr>")}</button></td>
+    <td>${bench(lead)}${rest ? ` <button class="link" data-more="dtm${i}">more</button><div id="dtm${i}" hidden class="sub">${bench(rest)}</div>` : ""}${c.parameter ? `<div class="sub">${esc(c.parameter)}</div>` : ""}</td>
+    <td class="n">${(c.values || []).map((v) => esc(typeof v === "number" ? num(v) : v)).join(", ") || "—"}${c.unit && (c.values || []).some((v) => typeof v === "number") ? ` <span class="muted">${esc(c.unit)}</span>` : ""}</td>
     <td>${c.changes ? '<span class="bad-i">yes</span>' : "no"}</td><td class="n">${pct(c.share_pct)}${c.threshold_pct != null && c.threshold_pct !== thr ? ` <span class="muted">(threshold ${pct(c.threshold_pct, 0)})</span>` : ""}</td>
-    <td class="n">${(c.objective_vs_point_pct || []).map((x) => x == null ? "—" : (x > 0 ? "+" : "") + pct(x, 2)).join(", ") || "—"}</td></tr>`).join("");
+    <td class="n">${(c.objective_vs_point_pct || []).map((x) => x == null ? "—" : (x > 0 ? "+" : "") + pct(x, 2)).join(", ") || "—"}</td></tr>`; }).join("");
   const ch = g.rows.filter((c) => c.changes).length;
   return `<div class="card"><div class="head"><span class="t">${T("decision test", "Decision tests")}: ${ch} of ${g.rows.length} change the plan</span>${when(g.at)}</div>
     ${ctx(`Each test re-solves the plan with one input at other values. It changes the plan when more than ${thr != null ? pct(thr, 0) : "the threshold share"} of units change package.`, "no.")}
-    <table class="t"><tr><th>id</th><th style="width:44%">what it tests</th><th class="n">value tested</th><th>plan changes?</th><th class="n">units changed</th><th class="n">objective vs point plan</th></tr>${rows}</table></div>`;
+    <table class="t"><tr><th>id</th><th style="width:44%">what it tests</th><th class="n">value tested</th><th>plan changes?</th><th class="n">units changed</th><th class="n"><span class="term" tabindex="0" title="The objective of the plan re-solved at the tested value, relative to the point plan's objective evaluated at the same value: how much re-optimising gains (models/decision_tests/*.yaml: objective vs point_plan_objective_under_test).">re-solved vs point plan</span></th></tr>${rows}</table></div>`;
 }
 function card(c) {
   const a = c.anchor ? esc(JSON.stringify(c.anchor)) : "";
@@ -647,6 +652,7 @@ function decisionCard(c, head) {
     <label class="inline"><input type="checkbox" class="confirm"> I answer these declarations as the owner</label><button class="primary" data-act="scope">Submit answers</button><div class="small result"></div></div></div>`;
 }
 function wire(root) {
+  root.querySelectorAll("[data-more]").forEach((b) => (b.onclick = (e) => { e.stopPropagation(); const m = document.getElementById(b.dataset.more); if (m) { m.hidden = !m.hidden; b.textContent = m.hidden ? "more" : "less"; } }));
   root.querySelectorAll("tr[data-tog]").forEach((tr) => (tr.onclick = () => { const m = document.getElementById(tr.dataset.tog); if (m) m.hidden = !m.hidden; }));
   root.querySelectorAll(".cite").forEach((b) => (b.onclick = () => openFile(b.dataset.file, b.dataset.anchor)));
   root.querySelectorAll("[data-act]").forEach((b) => (b.onclick = () => act(b)));
