@@ -1,0 +1,8 @@
+---
+phase: "v2a"
+commit: "v0.7 α–γ"
+---
+
+## Changelog
+
+**Malaria engine v0.7: routine SMC in every arm after the delivery period (owner decision 2026-11-02).** A run with outcomes over 2024.0–2029.25 and delivery over 2024.0–2027.0 stopped SMC in the plan arm at the end of delivery. The engine booked the rebound that followed as a cost of SMC, and the plan's SMC fell from 62 units to 1; in practice SMC is a routine annual programme that continues after the grant. The new unit attribute is `smc_routine` (0 or 1, a column or a value; default 0, declared in `attribute_binding.yaml`). Where it is 1, SMC rounds run in the unit's SMC months in every season from the end of the delivery period to the end of the outcome window, in every arm including the comparator, and are never charged. Where the package also has SMC, its delivery seasons and the routine seasons must form one continuous season sequence (`smc_schedule_problems`); the plan arm then has the same health outcomes as SMC in every season of the window (self-test R5). The engine refuses (fail closed) `smc_routine = 1` without `objective.delivery`, a value other than 0 or 1, and a routine round inside the delivery period. With the attribute absent or 0, a run is byte-identical to v0.6 (self-test R7). `benchmarks/restamp_proof.py` compared v0.6 and v0.7 on the pack's own inputs, and the evidence identity fields were re-stamped only after that proof passed; the script can now re-stamp a file re-stamped before, keeping the earlier record under `restamped.previous`. Tests: engine R0–R7, written first; `restamp_proof` RP8–RP9. Case management after delivery is unchanged from v0.6: the unit's `cm_ft` in both arms, without the add-on.
