@@ -74,7 +74,7 @@ class Malaria(ss.Disease):
         super().__init__()
         self.define_pars(M0=5.0, season=np.ones(12), resistance=0.5, ft=0.3, species=None, P=None,
                          init_eir=50., win_start=None, win_stop=None, smc_months=(),
-                         import_eir=0.1, irs_product="pm_cs")
+                         import_eir=0.1, irs_product="pm_cs", rec_year=None)
         self.update_pars(pars, **kwargs)
         sd = np.sqrt((np.exp(G['sigma2']) - 1))
         self.define_states(
@@ -115,6 +115,22 @@ class Malaria(ss.Disease):
         sel = (age_d > 18 * 365) & (age_d < 25 * 365)
         self.ic20 = float(self.IC[u][sel].mean()) if sel.any() else 0.0
         self.iv20 = float(self.IV[u][sel].mean()) if sel.any() else 0.0
+        self.n_start, self.start_sha = None, None
+
+    def state_hash(self, u) -> str:
+        """sha256 of the human and mosquito state and the daily records so far (v0.5: packages forked from one
+        burn-in must agree on it at horizon.start)."""
+        import hashlib
+        h = hashlib.sha256()
+        for nm in ('st', 'zeta', 'IB', 'IC', 'ID', 'IV', 'lb', 'lc', 'ld', 'lv', 'prot_until', 'prot_eff', 'has_net',
+                   'net_t', 'net_type', 'spray_t', 'hh', 'z_hh', 'z_sp', 'prop_net', 'prop_use'):
+            h.update(np.ascontiguousarray(np.asarray(getattr(self, nm)[u], float)).tobytes())
+        h.update(np.ascontiguousarray(np.asarray(self.sim.people.age[u], float)).tobytes())
+        for mo in self.mos:
+            h.update(np.asarray([mo['S'], mo['I']], float).tobytes() + np.asarray(mo['q'], float).tobytes())
+        for k in DAILY:
+            h.update(self.daily[k][:self.ti].tobytes())
+        return h.hexdigest()
 
     def _households(self, u, initial=False):
         """Assign households and the correlated coverage / exposure latents (see module doc)."""
@@ -132,10 +148,25 @@ class Malaria(ss.Disease):
         else:
             have = self.sim.people.auids
             have = have[self.hh[have] >= 0]
-            donor = have[rs.integers(0, len(have), size=n)] if len(have) else u
-            self.hh[u] = self.hh[donor]
-            self.z_hh[u] = self.z_hh[donor]
-            self.z_sp[u] = self.z_sp[donor]
+            # v0.5 (review P2): newborns found new households as needed to keep the mean household size at
+            # hh_size while the population grows (v0.4 never created households: over a 50-year burn-in the mean
+            # size grew about 4-fold); the others join the household of a random existing person
+            k = len(np.unique(np.asarray(self.hh[have]))) if len(have) else 0
+            need = int(np.clip(np.ceil((len(have) + n) / P["hh_size"]) - k, 0, n)) if len(have) else n
+            order = rs.permutation(n)
+            fnd, join = u[order[:need]], u[order[need:]]
+            if len(fnd):
+                start = (float(np.max(np.asarray(self.hh[have]))) + 1) if len(have) else 0.0
+                zh, z2 = rs.normal(size=len(fnd)), rs.normal(size=len(fnd))
+                c = P["cov_corr"]
+                self.hh[fnd] = start + np.arange(len(fnd))
+                self.z_hh[fnd] = zh
+                self.z_sp[fnd] = c * zh + np.sqrt(1 - c * c) * z2
+            if len(join):
+                donor = have[rs.integers(0, len(have), size=len(join))]
+                self.hh[join] = self.hh[donor]
+                self.z_hh[join] = self.z_hh[donor]
+                self.z_sp[join] = self.z_sp[donor]
         r, a = P["hh_net_corr"], P["exp_corr"]
         z_net = np.sqrt(r) * self.z_hh[u] + np.sqrt(1 - r) * rs.normal(size=n)
         self.prop_net[u] = ndtr(z_net)
@@ -185,6 +216,8 @@ class Malaria(ss.Disease):
         new = u[self.hh[u] < 0]
         if len(new):
             self._households(new)
+        if self.n_start is None and p.rec_year is not None and self.year() >= p.rec_year - 1e-9:
+            self.n_start, self.start_sha = len(u), self.state_hash(u)      # the state at horizon.start
         n = len(u)
         age_d = self.sim.people.age[u] * 365
         st = self.st[u]

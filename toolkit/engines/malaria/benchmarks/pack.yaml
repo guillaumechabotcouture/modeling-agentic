@@ -9,6 +9,13 @@
 # which is setting description, not engine tuning; settings may not override fitted parameters.
 engine: toolkit.engines.malaria.engine:MalariaEngine
 seeds: [11, 12, 13, 14, 15, 16, 17, 18]
+# v0.5: every setting starts from a no-intervention burn-in of burnin_years (card parameter, default 50) before
+# horizon.start, shared by the arms of one setting and seed (engine run_batch). Evidence: equilibration.yaml.
+initialisation:
+  method: "no-intervention burn-in of burnin_years before horizon.start, from a closed-form immunity guess; the
+    population grows to n_agents at horizon.start; arms of one setting and seed share the burn-in and the history
+    up to their first component event"
+  evidence: [equilibration.yaml]
 horizon:
   start: 2014.0
   stop: 2022.2

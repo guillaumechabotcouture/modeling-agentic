@@ -8,6 +8,12 @@ oracles: toolkit.engines.compartmental.benchmarks.oracles
 default_config: single_day          # the configuration whose engine identity stamps results.yaml
 seeds: [1, 2]
 horizon: {start: 0, stop: 200000, window: [0, 200000], windows: {all: [0, 200000]}}
+# Engine initialisation (benchmark.py validate_initialisation): no burn-in. The susceptible shares at the start come
+# from the configured initialiser (given: the unit's s0; cohort_history: coverage by birth cohort), and the evidence is
+# the initialiser benchmarks below; an epidemic from importation has no endemic state to equilibrate.
+initialisation:
+  method: "susceptible shares set at the start by the configured initialiser (given | cohort_history); no burn-in"
+  evidence: [CI1a, CI1b, CI1c, CI1d, CI4a, CI4b]
 
 configs:
   single_day: {groups: [all], structure: single_group, mode: to_extinction, initialiser: given, dt: day,

@@ -26,6 +26,10 @@ Statuses (never fitted toward unless `in_band`/`out_of_band`):
 
 Pack schema:
     engine: <module>:<class>            # e.g. toolkit.engines.malaria.engine:MalariaEngine
+    initialisation:                     # required (v0.5): how the engine sets the state at horizon.start
+      method: <text>                    # e.g. a burn-in of declared length, or a closed-form initialiser
+      evidence: [<benchmark id> | <file beside the pack>]   # that the state is equilibrated (or correct);
+                                        # or ["not applicable: <reason>"] for an engine without dynamic state
     seeds: [1, 2, 3, 4]                 # common random numbers: every arm uses the same seeds
     horizon: {start, stop, window: [t0, t1], windows: {name: [t0, t1]}}
     settings:                           # one simulated trial site (or reference setting)
@@ -56,6 +60,9 @@ Pack schema:
     configs: {<name>: {<constructor keywords>}}          # configured engines (v2d §5); a setting names its
     default_config: <name>                               # `config`; results are stamped with default_config's engine
     oracles: <module>                                    # oracle_<name> / probe_<name> / generate_<name> functions
+
+An engine with `batch_shares_state` and `run_batch` (a starting state shared by the packages of one unit and seed,
+e.g. a burn-in) gets the jobs of one unit, horizon and seed in one run_batch call; results are per job either way.
 
 Sides (v2d δ): a number; {arm, value: <path>}; {oracle: <name>, args}; {probe: <name>, args}. Oracle and
 probe args may themselves be sides (resolved first). A probe gets the pack's engine factory first
@@ -163,8 +170,45 @@ def fit_targets(pack: dict) -> set:
     return ids | set((pack.get("fit_joint") or {}).get("targets") or [])
 
 
-def validate(pack: dict, engine) -> list[str]:
+NOT_APPLICABLE = "not applicable:"
+
+
+def shares_state(engine) -> bool:
+    """The engine declares that runs of one unit and seed share one starting state (computed once, e.g. a burn-in)
+    and offers run_batch: such runs go to the engine together."""
+    return bool(getattr(engine, "batch_shares_state", False)) and callable(getattr(engine, "run_batch", None))
+
+
+def validate_initialisation(pack: dict, base: str | None = None) -> list[str]:
+    """`initialisation: {method, evidence}`: how the engine sets the state at horizon.start, and the evidence that the
+    state is equilibrated (benchmark ids of the pack, or files beside it, which must exist when `base` is given), or
+    one `not applicable: <reason>` for an engine without a dynamic state."""
+    d = pack.get("initialisation")
+    if not isinstance(d, dict):
+        return ["initialisation: the pack must declare the engine's initialisation method and its evidence "
+                "({method, evidence})"]
     bad = []
+    if not (isinstance(d.get("method"), str) and d["method"].strip()):
+        bad.append("initialisation: no method")
+    ev = d.get("evidence")
+    if not (isinstance(ev, list) and ev and all(isinstance(x, str) and x.strip() for x in ev)):
+        return bad + ["initialisation: evidence must be a non-empty list"]
+    ids = {b.get("id") for b in pack.get("benchmarks") or []}
+    na = [x for x in ev if x.lower().startswith(NOT_APPLICABLE)]
+    if na and (len(ev) > 1 or not na[0][len(NOT_APPLICABLE):].strip()):
+        bad.append(f"initialisation: '{NOT_APPLICABLE} <reason>' stands alone and gives its reason")
+    for x in ev:
+        if x in ids or x in na:
+            continue
+        if base is None and ("/" in x or "." in x):
+            continue                    # a file: checked where the pack's directory is known
+        if base is None or not os.path.isfile(os.path.join(base, x)):
+            bad.append(f"initialisation: evidence {x!r} is neither a benchmark of the pack nor a file beside it")
+    return bad
+
+
+def validate(pack: dict, engine, base: str | None = None) -> list[str]:
+    bad = validate_initialisation(pack, base)
     specs = {p.name: p for p in engine.parameters()}
     fitted = {k for k, p in specs.items() if p.kind == "fitted"}
     configs = pack.get("configs") or {}
@@ -363,7 +407,28 @@ def _job(args):
     if key not in _ENGINE:
         _ENGINE[key] = load_engine(ref, config)
     eng = _ENGINE[key]
-    o = eng.run(params, UnitSpec("bench", unit), Package("p", package), _h(horizon), seed)
+    return _result(eng.run(params, UnitSpec("bench", unit), Package("p", package), _h(horizon), seed))
+
+
+def _job_list(jobs):
+    """One task: a single job, or jobs of one unit, horizon and seed that share the engine's starting state (one
+    run_batch call; Runner._map groups them)."""
+    if len(jobs) == 1 and not shares_state(_engine_of(jobs[0])):
+        return [_job(jobs[0])]
+    ref, config, _, unit, _, horizon, seed = jobs[0]
+    outs = _engine_of(jobs[0]).run_batch([j[2] for j in jobs], UnitSpec("bench", unit), [Package("p", j[4]) for j in jobs],
+                                         _h(horizon), seed)
+    return [_result(o) for o in outs]
+
+
+def _engine_of(job):
+    key = _engine_key(job[0], job[1])
+    if key not in _ENGINE:
+        _ENGINE[key] = load_engine(job[0], job[1])
+    return _ENGINE[key]
+
+
+def _result(o) -> dict:
     pdays = o.meta.get("age_shares")
     if pdays is None:
         pdays = {g: 1.0 / len(o.per_capita[next(iter(o.per_capita))]) for g in o.per_capita[next(iter(o.per_capita))]}
@@ -459,17 +524,35 @@ class Runner:
 
     def _map(self, jobs, chunk: int = 300):
         """Run jobs; a fresh process pool per chunk (one long-lived pool broke on worker memory at
-        about 750 runs per VM in the spike)."""
-        if self.workers <= 1 or len(jobs) <= 1:
-            return [_job(j) for j in jobs]
-        out = []
-        for i in range(0, len(jobs), chunk):
-            part = jobs[i:i + chunk]
-            with ProcessPoolExecutor(min(self.workers, len(part))) as ex:
-                out += list(ex.map(_job, part, chunksize=1))
-            if len(jobs) > chunk:
-                print(f"  ran {min(i + chunk, len(jobs))}/{len(jobs)} engine runs", flush=True)
+        about 750 runs per VM in the spike). For an engine that shares the starting state (shares_state),
+        jobs of one unit, horizon and seed go to the engine together (one run_batch call), in job order."""
+        import json
+        fn, by = _job_list, {}
+        for n, j in enumerate(jobs):
+            ref, config, params, unit, package, horizon, seed = j
+            key = json.dumps([ref, config, unit, horizon, seed], sort_keys=True,
+                             default=lambda x: x.tolist() if hasattr(x, "tolist") else repr(x)) if self._shared(j) else n
+            by.setdefault(key, []).append(j)
+        tasks = list(by.values())
+        if self.workers <= 1 or len(tasks) <= 1:
+            res = [fn(t) for t in tasks]
+        else:
+            res = []
+            for i in range(0, len(tasks), chunk):
+                part = tasks[i:i + chunk]
+                with ProcessPoolExecutor(min(self.workers, len(part))) as ex:
+                    res += list(ex.map(fn, part, chunksize=1))
+                if len(tasks) > chunk:
+                    print(f"  ran {min(i + chunk, len(tasks))}/{len(tasks)} engine tasks", flush=True)
+        done = {}
+        for t, r in zip(tasks, res):
+            for j, o in zip(t, r):
+                done[id(j)] = o
+        out = [done[id(j)] for j in jobs]
         return out
+
+    def _shared(self, job) -> bool:
+        return shares_state(_engine_of(job))
 
     def _setting(self, name):
         s = self.pack["settings"][name]
@@ -999,6 +1082,10 @@ def run_pack(pack: dict, engine, runner: Runner, fitted: dict, fit_info: dict | 
     fit_ids = fit_targets(pack)
     infeasible = set(((fit_info or {}).get("feasibility") or {}).get("infeasible_in_box") or [])
     runner.calibrate_settings(fitted)
+    # v0.5: every arm the pack evaluates in one batch, so arms of one setting and seed share a starting state when
+    # the engine supports it (results are per job either way)
+    runner.prefetch(sorted({a for b in pack["benchmarks"] if b["estimand"]["type"] not in COMPARE_TYPES + ("coverage",)
+                            for a in _arms_of(b["estimand"])}), [fitted])
     rows = []
     for b in pack["benchmarks"]:
         r = runner.evaluate(b, fitted)
@@ -1026,7 +1113,8 @@ def run_pack(pack: dict, engine, runner: Runner, fitted: dict, fit_info: dict | 
     used = sorted(runner.exercised)
     configs_validated = {c: {"config": pack["configs"][c], "engine_identity": engine_identity(runner.make_engine(c)),
                              "config_sha256": config_digest(runner.make_engine(c))} for c in used}
-    return {"benchmarks": rows, "settings_calibrated": runner.calibrated, "fitted_used": fitted,
+    return {"benchmarks": rows, "initialisation": pack.get("initialisation"),
+            "settings_calibrated": runner.calibrated, "fitted_used": fitted,
             "configs_validated": configs_validated,
             "configs_not_exercised": sorted(set(pack.get("configs") or {}) - set(used)),
             "seeds": runner.seeds, "n_sims": runner.nsims,
@@ -1175,7 +1263,7 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     pack = yaml.safe_load(open(a.pack))
     eng = load_engine(pack["engine"], (pack.get("configs") or {}).get(pack.get("default_config")))
-    bad = validate(pack, eng)
+    bad = validate(pack, eng, base=os.path.dirname(os.path.abspath(a.pack)))
     if bad:
         print("pack invalid:\n  " + "\n  ".join(bad))
         return 2
@@ -1220,6 +1308,67 @@ def main(argv=None) -> int:
     return 0
 
 
+def _self_test_initialisation(ok, pack, eng) -> None:
+    """v0.5 (BP53-BP57): every pack declares how its engine sets the starting state and the evidence that it is
+    equilibrated; arms that share a starting state run together through the engine's run_batch."""
+    import tempfile
+    try:
+        p = {k: v for k, v in pack.items() if k != "initialisation"}
+        ok(any("initialisation" in s for s in validate(p, eng)),
+           "BP53 a pack that does not declare its engine's initialisation method is refused")
+        for bad, why in ((dict(method=""), "no method"), (dict(method="burn-in", evidence=[]), "no evidence"),
+                         (dict(method="burn-in", evidence=["ZZ9"]), "unknown evidence")):
+            ok(any("initialisation" in s for s in validate(dict(p, initialisation=bad), eng)),
+               f"BP54 an initialisation declaration with {why} is refused")
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "eq.yaml"), "w").write("x: 1\n")
+            good = dict(p, initialisation={"method": "burn-in", "evidence": ["eq.yaml", "T1"]})
+            ok(validate(good, eng, base=d) == [] and any("initialisation" in s for s in validate(
+                dict(p, initialisation={"method": "burn-in", "evidence": ["missing.yaml"]}), eng, base=d)),
+               "BP55 evidence names a benchmark of the pack or a file beside it (which must exist)")
+        ok(validate(dict(p, initialisation={"method": "closed form", "evidence": ["not applicable: no state"]}),
+                    eng) == [], "BP55b an engine without a dynamic state says so, with its reason")
+        sp = dict(pack, engine="toolkit.engines.benchmark:SharedStateToy")
+        Shared = importlib.import_module("toolkit.engines.benchmark").SharedStateToy   # the class load_engine builds
+        Shared.calls.clear()
+        rs = Runner(sp, load_engine(sp["engine"]), 1)
+        got = rs.arm_results(["none", "a", "b", "ab"], {"eff_a": 0.6})
+        ref = Runner(pack, eng, 1).arm_results(["none", "a", "b", "ab"], {"eff_a": 0.6})
+        ok(got == ref and Shared.calls == [4, 4],
+           f"BP56 arms of one setting and seed run in one run_batch call when the engine shares the starting "
+           f"state (batch sizes {Shared.calls}), with the same results")
+        Shared.calls.clear()
+        Runner(pack, eng, 1).arm_results(["none", "a"], {"eff_a": 0.6})
+        ok(Shared.calls == [] and not shares_state(eng), "BP57 other engines keep one run per job")
+    except Exception as ex:  # noqa: BLE001
+        ok(False, f"BP53-57 initialisation declaration and shared runs ({type(ex).__name__}: {ex})")
+
+
+class SharedStateToy:
+    """Self-test engine (BP56): the toy engine, declaring that its packages share one starting state, with a
+    run_batch that records its batch sizes."""
+    batch_shares_state = True
+    calls = []
+
+    def __init__(self):
+        from toolkit.engines.contract import ToyEngine
+        self._toy = ToyEngine()
+
+    def describe(self):
+        return self._toy.describe()
+
+    def parameters(self):
+        return self._toy.parameters()
+
+    def run(self, params, unit, package, horizon, seed):
+        return self._toy.run(params, unit, package, horizon, seed)
+
+    def run_batch(self, param_sets, unit, packages, horizon, seed):
+        units = unit if isinstance(unit, (list, tuple)) else [unit] * len(param_sets)
+        SharedStateToy.calls.append(len(param_sets))
+        return [self.run(p, u, k, horizon, seed) for p, u, k in zip(param_sets, units, packages)]
+
+
 def _self_test() -> int:
     fails = []
 
@@ -1230,6 +1379,7 @@ def _self_test() -> int:
 
     pack = {
         "engine": "toolkit.engines.contract:ToyEngine", "seeds": [1, 2],
+        "initialisation": {"method": "closed form", "evidence": ["not applicable: the toy engine has no dynamic state"]},
         "horizon": {"start": 0, "stop": 3, "window": [0, 3], "windows": {"w": [1, 2]}},
         "settings": {"s": {"unit": {"x": 0.0}},
                      "c": {"unit": {"x": 0.0}, "calibrate": {"attribute": "x", "value_path": "windows.w.prev",
@@ -1451,7 +1601,7 @@ def _self_test() -> int:
     om.generate_normal = _gen
     om.calibrate_normal = _cal
     sys.modules["_bp_oracles"] = om
-    p5 = {"engine": "toolkit.engines.contract:ToyEngine", "oracles": "_bp_oracles", "seeds": [1, 2],
+    p5 = {"initialisation": {"method": "closed form", "evidence": ["not applicable: no dynamic state"]}, "engine": "toolkit.engines.contract:ToyEngine", "oracles": "_bp_oracles", "seeds": [1, 2],
           "horizon": pack["horizon"],
           "settings": {"s": {"unit": {"x": 0.3}}},
           "arms": {"none": {"setting": "s", "package": {}}, "a": {"setting": "s", "package": {"a": 1}}},
@@ -1498,7 +1648,7 @@ def _self_test() -> int:
     ok(r5["V6"]["status"] == "in_band" and r5["V8"]["status"] == "not_assessable"
        and "transcribed" in r5["V8"]["not_assessable_because"],
        "BP35 vector paths and probes; a not-transcribed benchmark is not_assessable, never a pass")
-    p7 = {"engine": "toolkit.engines.empirical.engine:PackageRateEngine", "default_config": "rate2", "seeds": [1],
+    p7 = {"initialisation": {"method": "closed form", "evidence": ["not applicable: no dynamic state"]}, "engine": "toolkit.engines.empirical.engine:PackageRateEngine", "default_config": "rate2", "seeds": [1],
           "horizon": pack["horizon"],
           "configs": {"rate2": {"components": ["x", "y"], "outcome": "cases"},
                       "rate3": {"components": ["x", "y", "z"], "outcome": "cases"}},
@@ -1525,7 +1675,7 @@ def _self_test() -> int:
     k1 = _engine_key("m:C", {"b": 1, "a": [1, 2]})
     ok(k1 == _engine_key("m:C", {"a": [1, 2], "b": 1}) and k1 != _engine_key("m:C", {"a": [1, 3], "b": 1})
        and k1 != _engine_key("m:C", None), "BP37 the worker cache key carries the canonical config")
-    p6 = {"engine": "toolkit.engines.contract:ToyEngine", "oracles": "_bp_oracles", "seeds": [1],
+    p6 = {"initialisation": {"method": "closed form", "evidence": ["not applicable: no dynamic state"]}, "engine": "toolkit.engines.contract:ToyEngine", "oracles": "_bp_oracles", "seeds": [1],
           "horizon": pack["horizon"], "settings": {}, "arms": {},
           "benchmarks": [
               {"id": "SBT1", "metric": "exact posterior covers", "estimand": {
@@ -1661,6 +1811,7 @@ def _self_test() -> int:
         ok(d1 != d2, "BP52 (Codex r2-4) a changed named configuration (or threshold file) changes the case digest")
     except Exception as ex:  # noqa: BLE001
         ok(False, f"BP52 configuration in the digest ({type(ex).__name__}: {ex})")
+    _self_test_initialisation(ok, pack, eng)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
