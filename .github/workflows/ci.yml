@@ -37,21 +37,11 @@ jobs:
           .venv/bin/pip install --upgrade pip
           .venv/bin/pip install -r requirements.txt
 
-      - name: Self-tests (every script with --self-test)
-        run: |
-          fail=0
-          # v2's harness modules under agents/ are listed by name (other agents/ files only mention
-          # --self-test in text, or run a live preflight).
-          for f in main.py $(git ls-files 'scripts/*.py' 'scripts/lib/*.py' 'toolkit/**/*.py' 'cloud/*.py') \
-              agents/stage_machine.py agents/findings_ledger.py agents/fix_loop.py \
-              agents/analysis_backend.py agents/v2_sdk_tasks.py; do
-            case "$f" in */__init__.py) continue;; esac
-            grep -q -- '--self-test' "$f" || continue
-            echo "::group::$f"
-            if ! .venv/bin/python "$f" --self-test; then echo "::error file=$f::self-test failed"; fail=1; fi
-            echo "::endgroup::"
-          done
-          exit $fail
+      # One discovery rule, shared with CLAUDE.md: every tracked module under scripts/, toolkit/
+      # and cloud/, main.py and the v2 harness modules named in scripts/self_tests.py. A module in
+      # scope with no --self-test fails this step unless it has an EXEMPT entry with a reason.
+      - name: Self-tests (every module with --self-test, found by scripts/self_tests.py)
+        run: .venv/bin/python scripts/self_tests.py --python .venv/bin/python
 
       # HEAD is the PR's merge commit; its first parent is the base branch. --upstream:
       # a PR into a long-lived branch (v2) that merges main brings main's checked rows.
