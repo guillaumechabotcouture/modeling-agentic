@@ -2061,11 +2061,23 @@ import sys
 sys.path.insert(0, {scripts!r})
 import compute
 
+if os.environ.get("MA_TOY_INFRA_FROM"):
+    # T61: rows from this input on come back as compute.py reports a chunk lost with its worker.
+    _real_map = compute.map_fn
+
+    def _lossy(run_dir, fn_spec, inputs, **kw):
+        rows, s = _real_map(run_dir, fn_spec, inputs, **kw)
+        k0 = int(os.environ["MA_TOY_INFRA_FROM"])
+        return [r if inputs[r["i"]]["i"] < k0 else {{"i": r["i"], "ok": False, "kind": "infra",
+                                                    "error": "chunk failed: its worker left the cluster"}}
+                for r in rows], s
+    compute.map_fn = _lossy
+
 
 def main(rd):
-    os.makedirs(os.path.join(rd, "analysis"), exist_ok=True)
+    os.makedirs(os.path.join(rd, "analysis", "batch"), exist_ok=True)
     rows, _ = compute.run_map(rd, os.path.join(rd, "models", "toy_fn.py") + "::f", [{{"i": i}} for i in range(6)],
-                              os.path.join(rd, "analysis", "rows.jsonl"), backend="local", max_workers=1,
+                              os.path.join(rd, "analysis", "batch", "rows.jsonl"), backend="local", max_workers=1,
                               purpose="toy batch")
     json.dump([bool(r.get("ok")) for r in rows], open(os.path.join(rd, "analysis", "toy_rows.json"), "w"))
     return 0 if all(r.get("ok") for r in rows) else 1
@@ -2169,6 +2181,56 @@ def _self_test_resume(ok, td: str, spike, new_run) -> None:
     st = load_state(d)
     ok(s1 == "run_failed" and st.history[-1]["from"] == "CONFIGURE" and "MA_COMPUTE_MAX_CORE_HOURS" in st.history[-1]["why"],
        f"T60d an unreadable compute budget fails the run at CONFIGURE (fail closed): {st.history[-1]}")
+    # T61 (Nigeria v2 full run F3, 2026-11-02: 16 of 256 design points failed with kind infra when the autoscaler
+    # retired busy workers, the analysis failed closed, and the run could not be resumed): an analysis that failed
+    # only because engine rows failed with kind infra is resumable, read from the batch summary compute.py wrote.
+    d, T = toy_run("analyze_infra")
+    calls2 = os.path.join(td, "toy_calls_infra.txt")
+    os.environ.update(MA_TOY_CALLS=calls2, MA_TOY_INFRA_FROM="3")
+    try:
+        s1 = run_v2("toy question", d, T, signoff="none", log=quiet, backend=Batch(120), cross_engine_check=False)
+    finally:
+        os.environ.pop("MA_TOY_INFRA_FROM", None)
+    st = load_state(d)
+    first = open(calls2).read().split() if os.path.exists(calls2) else []
+    ok(s1 == "run_failed" and st.history[-1]["from"] == "ANALYZE" and st.history[-1].get("resumable") == "infra"
+       and resumable_failure(d, st) == "infra" and sorted(first) == ["0", "1", "2", "3", "4", "5"],
+       f"T61 an analysis that failed only on infra engine rows ends run_failed, marked resumable ({s1}, "
+       f"{st.history[-1]}, calls {first})")
+    s2 = run_v2("toy question", d, T, signoff="none", log=quiet, backend=Batch(120), cross_engine_check=False)
+    st = load_state(d)
+    again = open(calls2).read().split()[len(first):]
+    back = [h for h in st.history if h.get("from") == "FINAL"]
+    ok(s2 in ("completed", "completed_scope_declared") and len(back) == 1 and back[0]["to"] == "ANALYZE"
+       and "infra" in back[0]["why"] and sorted(again) == ["3", "4", "5"],
+       f"T61b --resume reopens the run at ANALYZE and the batch recomputes only the infra rows ({s2}, {back}, "
+       f"{again})")
+    # T61c: the cause is read from the batch summaries this run of the pipeline wrote: infra only.
+    d = os.path.join(td, "infra_cases")
+    os.makedirs(os.path.join(d, "models"), exist_ok=True)
+    os.makedirs(os.path.join(d, "analysis", "batch"), exist_ok=True)
+    rp = os.path.join(d, "models", "pipeline_report.json")
+    sp = os.path.join(d, "analysis", "batch", "points.jsonl.summary.json")
+    rep1 = {"ok": False, "errors": [], "seconds": 30.0,
+            "steps": [{"id": "analyze", "status": "failed", "returncode": 1, "error": "ValueError: 512 engine results "
+                       "missing"}]}
+
+    def cause_with(kinds, age_s=0.0, summary=True):
+        json.dump(rep1, open(rp, "w"))
+        if os.path.exists(sp):
+            os.remove(sp)
+        if summary:
+            json.dump({"n": 256, "n_failed": sum(kinds.values()), "failed_by_kind": kinds, "stopped": None},
+                      open(sp, "w"))
+            t_ = time.time() - age_s
+            os.utime(sp, (t_, t_))
+        return analysis_failure_cause(rep1, d)
+    got = [cause_with({"infra": 16}), cause_with({"infra": 16, "model": 1}), cause_with({"stopped": 4}),
+           cause_with({}), cause_with({"infra": 16}, age_s=3600), cause_with({"infra": 16}, summary=False),
+           analysis_failure_cause(rep1)]
+    ok(got == ["infra", None, None, None, None, None, None],
+       f"T61c infra only, in a summary written during this pipeline run, is resumable; a model or stopped row, no "
+       f"failed row, an older summary, no summary, or no run dir is not ({got})")
 
 
 def _self_test_derived(ok, td: str) -> None:
