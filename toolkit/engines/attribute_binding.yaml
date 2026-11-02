@@ -1,0 +1,7 @@
+# The toy engine's attribute binding (toolkit/engines/contract.py:ToyEngine; card metadata beside its module, as an
+# engine's priors.yaml is). docs/design/v2-derived-inputs.md §3.3. An attribute not listed here is required.
+attribute_binding:
+  x: required
+  group:
+    default: ""
+    meaning: "no group label"

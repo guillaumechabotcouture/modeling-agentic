@@ -1,0 +1,33 @@
+# How the spec must bind each unit attribute of this engine (docs/design/v2-derived-inputs.md §3.3). Card metadata,
+# like priors.yaml: not engine code, so the engine's code fingerprint and its benchmark stamps are unchanged.
+#   required                         the spec binds it (decision_units.engine_attributes or calibration.attribute)
+#   {default, meaning}               the engine's value when it is not given; the spec binds it or accepts the
+#                                    default by name (decision_units.defaults_accepted: {attribute: reason})
+# Keys may be globs for attributes named by configuration (reach:<component>, ratio:<outcome>, coverage:<dose>).
+# An attribute not listed here is required (fail closed). The defaults are the values engine.py applies.
+attribute_binding:
+  N: required
+  s0: required
+  contact: required
+  contact_rate:
+    default: 1.0
+    meaning: "one contact per person per day under homogeneous mixing"
+  seed:
+    default: 1.0e-9
+    meaning: "initial infections as a 1e-9 share of the unit's population"
+  intro:
+    default: "the first group"
+    meaning: "infection introduced into the first group"
+  birth_year: required
+  decision_year: required
+  "coverage:*": required
+  always_immune:
+    default: "[]"
+    meaning: "no group declared immune"
+  always_susceptible:
+    default: "[]"
+    meaning: "no group declared susceptible"
+  "reach:*":
+    default: "the component's configured reach"
+    meaning: "the share of the targeted groups the component reaches, as configured"
+  "ratio:*": required

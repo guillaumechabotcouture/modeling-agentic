@@ -25,7 +25,9 @@ docs/design/v2-spec-and-analysis.md §1):
         a: {column: col}                   # {column, split}, {columns: [..] or {k: col}}, {value, source}
       populations:                         # population group <- unit column and engine age groups
         all: {column: pop, age_groups: [all]}
-    options:                               # toolkit/alloc sections (costs.py, packages.py)
+      defaults_accepted: {attr: "<reason>"}   # an engine card default taken by name (the card's attribute_binding.yaml);
+                                           # every other card attribute is bound or calibrated (v2-derived-inputs)
+    options:                              # toolkit/alloc sections (costs.py, packages.py)
       populations: {total: pop}            # alloc population names -> unit columns
       components: {c1: {group: g}, ...}
       packages: {generate: true} | {name: [components]}
@@ -52,6 +54,8 @@ docs/design/v2-spec-and-analysis.md §1):
     calibration:
       method: emulator_inversion | likelihood | posterior | none
       ...                                  # see CALIBRATION_FIELDS
+      target_frame: {band, source, mapping: {to, method, source}}   # the population band the target measures; a
+                                           # mapping when it is not the compared output's (targets.frame for a panel)
     uncertainty:                           # spike lesson 6: sources declared up front
       level: 0.95
       draws: 64
@@ -79,6 +83,13 @@ docs/design/v2-spec-and-analysis.md §1):
 
 Every check names the section it failed. Nothing here names a disease, a place or an
 intervention; those live in engines and specs.
+
+Derived inputs (docs/design/v2-derived-inputs.md): a spec the stage machine drafts, or one in a run
+that declares data/derivations.yaml, reads only staged inputs and harness-derived files
+(scripts/pipeline.py), binds every engine attribute or accepts its default by name, and declares
+its calibration target's frame. Those problems start with their code (units_not_derived,
+data_ref_not_derived, derivation_stale, engine_attribute_unbound, attribute_column_empty,
+target_frame_unmapped, ...); so does prior_target_not_parameter, which applies to every spec.
 """
 from __future__ import annotations
 
@@ -235,6 +246,7 @@ class Spec:
         self.raw, self.base, self.path = raw, base, path
         self.settings_path = None
         self.engine_auto, self.engine_pending, self.engine_choice_path = False, False, None
+        self.derived = None          # derived-input obligations: None = when the run declares derivations
         if engine_is_auto(raw.get("engine")) and path is None:
             self.engine_auto = self.engine_pending = True      # a mapping with no file beside it: no choice to read
         self._engine = None
@@ -400,20 +412,183 @@ def _isnum(x) -> bool:
 
 
 # --------------------------------------------------------------------------- validation
-def validate(spec: "Spec | dict", base: str | None = None, pending_ok: bool = False) -> list[str]:
+def validate(spec: "Spec | dict", base: str | None = None, pending_ok: bool = False,
+             derived: bool | None = None) -> list[str]:
     """Problems with the spec (empty = valid). Never raises on a malformed spec. With engine: auto and no engine choice
-    yet, `pending_ok` (sign-off) checks the sections that do not depend on the engine; otherwise that is a problem."""
+    yet, `pending_ok` (sign-off) checks the sections that do not depend on the engine; otherwise that is a problem.
+    `derived` (docs/design/v2-derived-inputs.md): True for a spec the stage machine drafted, which must read derived or
+    staged data only and bind every engine attribute; None applies the same obligations when the run declares
+    derivations (data/derivations.yaml beside the spec), the opt-in for hand-written specs; False never."""
     if isinstance(spec, dict):
         spec = Spec(spec, base or os.getcwd())
+    if derived is not None:
+        spec.derived = derived
     try:
         if spec.engine_pending:
             if not pending_ok:
                 return [f"engine: auto, and the harness has not written {ENGINE_CHOICE} yet (engine-dependent sections "
                         "cannot be checked)"]
-            return _validate_pending(spec)
-        return _validate(spec)
+            return _validate_pending(spec) + (_derived_checks(spec, None) if obligations(spec) else [])
+        return _validate(spec) + (_derived_checks(spec, spec.engine()) if obligations(spec) else [])
     except Exception as e:  # noqa: BLE001 -- a malformed section must be a finding, not a crash
         return [f"spec could not be checked: {type(e).__name__}: {e}"]
+
+
+# --------------------------------------------------------------------------- derived inputs (v2-derived-inputs)
+DERIVATIONS = "data/derivations.yaml"
+BINDING_FILE = "attribute_binding.yaml"
+
+
+def obligations(s: Spec) -> bool:
+    """Do the derived-input obligations apply? A machine-drafted spec (derived=True), or a run that declares them."""
+    if s.derived is not None:
+        return bool(s.derived)
+    return os.path.exists(os.path.join(s.base, DERIVATIONS))
+
+
+def _derived_checks(s: Spec, eng) -> list[str]:
+    """Data the spec reads is derived or staged (scripts/pipeline.py), the target's frame matches the output it is
+    compared with, and (with an engine) every engine attribute is bound or its default accepted by name."""
+    if os.path.join(ROOT, "scripts") not in sys.path:
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    import pipeline as P
+    bad = [f"{p['code']}: {p['claim']}" for p in P.derivation_problems(s.base, s.raw, required=True)]
+    bad += frame_problems(s)
+    if eng is not None:
+        try:
+            bad += attribute_problems(s, eng)
+        except Exception as e:  # noqa: BLE001 -- fail closed
+            bad.append(f"engine_attribute_unbound: the attribute binding could not be checked: {type(e).__name__}: {e}")
+    return bad
+
+
+def _read_binding(path: str | None) -> tuple[dict, list[str]]:
+    if not path or not os.path.exists(path):
+        return {}, []
+    try:
+        doc = yaml.safe_load(open(path, encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as e:
+        return {}, [f"engine_attribute_unbound: attribute binding {path} unreadable: {e}"]
+    b = doc.get("attribute_binding") if isinstance(doc, dict) else None
+    if not isinstance(b, dict):
+        return {}, [f"engine_attribute_unbound: {path}: `attribute_binding` must be a mapping"]
+    out, bad = {}, []
+    for k, v in b.items():
+        if v == "required" or (isinstance(v, dict) and "default" in v and str(v.get("meaning") or "").strip()):
+            out[str(k)] = v
+        else:
+            bad.append(f"engine_attribute_unbound: {path}: {k} must be `required` or {{default, meaning}}")
+    return out, bad
+
+
+def load_binding(engine) -> tuple[dict, list[str]]:
+    """The engine card's attribute binding ({attribute or glob: required | {default, meaning}}): `binding_path` on the
+    engine, else attribute_binding.yaml beside the module of the engine's class or of its nearest base class that has
+    one (the priors.yaml convention). No file: every attribute is required."""
+    import inspect
+    p = getattr(engine, "binding_path", None) if not isinstance(engine, type) else None
+    if p:
+        return _read_binding(p)
+    for klass in (engine if isinstance(engine, type) else type(engine)).__mro__:
+        try:
+            cand = os.path.join(os.path.dirname(os.path.abspath(inspect.getfile(klass))), BINDING_FILE)
+        except (TypeError, OSError):
+            continue
+        if os.path.exists(cand):
+            return _read_binding(cand)
+    return {}, []
+
+
+def binding_for_ref(ref: str) -> dict:
+    """The attribute binding of an engine class named 'module:Class' (imported, not constructed)."""
+    mod, cls = str(ref).split(":")
+    return load_binding(getattr(importlib.import_module(mod), cls))[0]
+
+
+def binding_rule(binding: dict, attr: str):
+    import fnmatch
+    if attr in binding:
+        return binding[attr]
+    for k, v in binding.items():
+        if fnmatch.fnmatchcase(attr, k):
+            return v
+    return "required"
+
+
+def attribute_problems(s: Spec, eng) -> list[str]:
+    """No silent defaults: every unit attribute on the engine card is bound to a column or a value, moved by the
+    calibration, or (when the card gives it a default) accepted by name with a reason; a bound column has a value in
+    every row (engine_attribute_unbound, attribute_column_empty)."""
+    card = eng.describe()
+    binding, bad = load_binding(eng)
+    du = s.raw["decision_units"]
+    ea = du.get("engine_attributes") or {}
+    acc = du.get("defaults_accepted") or {}
+    if not isinstance(acc, dict):
+        bad.append("engine_attribute_unbound: decision_units.defaults_accepted is {attribute: reason}")
+        acc = {}
+    cal = s.raw.get("calibration") or {}
+    moved = {cal.get("attribute")} if cal.get("method") not in (None, "none") else set()
+    for a in card.unit_attributes:
+        if a in ea or a in moved:
+            continue
+        rule = binding_rule(binding, a)
+        if rule == "required":
+            bad.append(f"engine_attribute_unbound: engine {card.name}: {a} (required"
+                       + ("; it has no default to accept" if a in acc else "") + "): bind it in "
+                       "decision_units.engine_attributes")
+        elif not str(acc.get(a) or "").strip():
+            bad.append(f"engine_attribute_unbound: engine {card.name}: {a} (default {rule['default']!r}: "
+                       f"{rule['meaning']}): bind it, or accept the default by name in "
+                       "decision_units.defaults_accepted with a reason")
+    units = s.units()
+    for a, m in ea.items():
+        if not isinstance(m, dict):
+            continue
+        cols = [m["column"]] if "column" in m else (list(m["columns"].values()) if isinstance(m.get("columns"), dict)
+                                                     else list(m.get("columns") or []))
+        for c in cols:
+            blank = sum(1 for u in units if str(u.get(c) if u.get(c) is not None else "").strip() == "")
+            if blank:
+                bad.append(f"attribute_column_empty: decision_units.engine_attributes.{a}: column {c} is "
+                           + ("missing" if c not in units[0] else f"blank in {blank} of {len(units)} rows"))
+    return bad
+
+
+def frame_problems(s: Spec) -> list[str]:
+    """A calibration target declares the population band it measures (its frame); when that band differs from the
+    engine output it is compared with, the spec declares the mapping (target_frame_unmapped). v2d §3.4: no source
+    is the truth."""
+    cal = s.raw.get("calibration") or {}
+    m = cal.get("method")
+    if m in (None, "none") or not isinstance(cal, dict):
+        return []
+    if m == "emulator_inversion":
+        compared, fr, where = cal.get("metric"), cal.get("target_frame"), "calibration.target_frame"
+    else:
+        t = cal.get("targets") or {}
+        compared = t.get("outcome", (s.raw.get("objective") or {}).get("outcome"))
+        fr, where = t.get("frame"), "calibration.targets.frame"
+    if not (isinstance(fr, dict) and str(fr.get("band") or "").strip() and str(fr.get("source") or "").strip()):
+        return [f"target_frame_unmapped: {where}: declare the frame of the calibration target {{band, source}}: the "
+                f"population band it measures, compared with engine output {compared}"]
+    if fr["band"] == compared:
+        return []
+    mp = fr.get("mapping")
+    if isinstance(mp, dict) and mp.get("to") == compared and str(mp.get("method") or "").strip() \
+            and str(mp.get("source") or "").strip():
+        return []
+    return [f"target_frame_unmapped: {where}: the target measures {fr['band']} and is compared with engine output "
+            f"{compared}; declare mapping {{to: {compared}, method, source}}, or compare it with the output for its band"]
+
+
+def with_engine(s: Spec, ref: str, config: dict | None = None) -> Spec:
+    """The spec with one candidate engine in place of `auto` (the pre-sign check of each candidate)."""
+    raw = copy.deepcopy(s.raw)
+    raw["engine"] = {"ref": ref, **({"config": dict(config)} if config else {})}
+    out = Spec(raw, s.base, s.path)
+    out.settings_path, out.derived = s.settings_path, s.derived
+    return out
 
 
 def _validate_pending(s: Spec) -> list[str]:
@@ -649,11 +824,11 @@ def _validate_calibration(s, card, pnames, cols) -> list[str]:
         if t.get("outcome", s.raw["objective"]["outcome"]) not in card.outputs.get("per_capita", []):
             bad.append("calibration.targets.outcome: not an engine per-capita output")
     if m == "posterior":
-        bad += _validate_posterior(cal, s.raw["analysis"].get("evaluation"))
+        bad += _validate_posterior(cal, s.raw["analysis"].get("evaluation"), s.raw["decision_units"])
     return bad
 
 
-def _validate_posterior(cal, evaluation="direct") -> list[str]:
+def _validate_posterior(cal, evaluation="direct", du=None) -> list[str]:
     """v2d §3.1: every quantity the posterior moves has a declared prior with its source (no silent defaults), and the
     count panel names its observation model."""
     from toolkit.analysis.calibration import Prior
@@ -674,7 +849,12 @@ def _validate_posterior(cal, evaluation="direct") -> list[str]:
             bad.append(f"calibration.priors.{n}: {e}")
         if not str((d or {}).get("source") or "").strip():
             bad.append(f"calibration.priors.{n}: give its source")
-    extra = sorted(set(pri) - set(cal.get("parameters") or []) - {cal.get("attribute")})
+    bound = data_bound_attributes(du or {})
+    for n in sorted(set(pri) & set(bound)):
+        bad.append(f"prior_target_not_parameter: calibration.priors: {n} is a unit attribute bound to data column "
+                   f"{bound[n]}, not an engine parameter: declare that column's uncertainty where it arises, as the "
+                   "observation of a latent quantity through a source with a frame and a bias model (v2d §3.4)")
+    extra = sorted(set(pri) - set(cal.get("parameters") or []) - {cal.get("attribute")} - set(bound))
     if extra:
         bad.append(f"calibration.priors: {extra} are not calibrated by this spec")
     ob = cal.get("observation") or {}
@@ -683,6 +863,16 @@ def _validate_posterior(cal, evaluation="direct") -> list[str]:
     elif ob["model"] == "negbin" and not (_isnum(ob.get("dispersion")) and ob["dispersion"] > 0):
         bad.append("calibration.observation.dispersion: a positive number for negbin")
     return bad
+
+
+def data_bound_attributes(du: dict) -> dict:
+    """{unit attribute: column(s)} for the attributes the spec binds to data columns (data, not engine parameters)."""
+    out = {}
+    for a, m in ((du or {}).get("engine_attributes") or {}).items():
+        if isinstance(m, dict) and ("column" in m or "columns" in m):
+            c = m.get("column") or m.get("columns")
+            out[a] = c if isinstance(c, str) else ", ".join(c.values() if isinstance(c, dict) else c)
+    return out
 
 
 def _validate_uncertainty(s, pnames) -> list[str]:

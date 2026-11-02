@@ -37,7 +37,28 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
    sections are checked at sign-off and the engine-dependent ones once the choice exists.
 3. **Decision units.** The units table (one row per unit), its id column, the mapping of
    each engine unit attribute to a column (or a value with its source), and the population
-   groups (unit column and engine age groups).
+   groups (unit column and engine age groups). Every unit attribute on the engine card is
+   bound, moved by the calibration, or, when the card gives it a default (the engine's
+   `attribute_binding.yaml`), accepted by name with a reason in
+   `decision_units.defaults_accepted: {attribute: reason}`. The sign-off sheet shows the owner
+   each accepted default with what it assumes. An attribute left unbound is refused
+   (`engine_attribute_unbound`): an engine never falls back to a default silently.
+
+   **Derived data, not tables.** In a v2 run you do not write the units table or any other
+   table the spec reads. Write a script per derived file under `data/derive/` and declare it
+   in `data/derivations.yaml` (the format is in `scripts/pipeline.py`, section
+   "derivations"): its staged inputs, its outputs under `data/derived/`, and the column
+   accounting (every column of every staged table it reads is in `columns.uses`, or in
+   `columns.ignores` with a reason; a staged table no derivation reads goes in
+   `ignored_inputs` with a reason). The harness runs each script as
+   `python <script> --inputs <paths> --outputs <paths>` in a sandbox: no network, read-only
+   inputs, the standard library, numpy, pandas and pyyaml only. It runs it twice (the
+   outputs must match) and once more without the ignored columns (the output must not
+   change). It records the hashes of the script, inputs and outputs in
+   `data/derivations_record.json`. The sign-off freezes that record, so a later change to a
+   derived file needs a new sign-off. A failed script comes back to you with its error.
+   Codes: `units_not_derived`, `data_ref_not_derived`, `derivation_stale`, `derivation_failed`,
+   `derivation_nondeterministic`, `input_column_unaccounted`, `ignored_column_used`.
 4. **Options.** Components, packages (`generate: true` for every combination with at most
    one per group, or the exact list the question offers, with its names), the engine map
    (component to engine component value), prices and cost items in toolkit/alloc form
@@ -55,7 +76,11 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
 8. **Calibration.** `emulator_inversion` (an attribute per unit to a target column, for a
    slow engine), `likelihood` (calibrated engine parameters and a per-unit attribute fitted
    to a panel of observed counts by unit, period and package), or `none`. Only parameters
-   the engine card marks `calibrated` may be fitted per run.
+   the engine card marks `calibrated` may be fitted per run. Declare the target's frame:
+   `calibration.target_frame: {band, source}` (for a panel, `calibration.targets.frame`), the
+   population band the target measures. When that band differs from the engine output it is
+   compared with, declare `mapping: {to: <output>, method, source}`; otherwise the target is
+   refused (`target_frame_unmapped`). No source is the truth (v2d §3.4).
 9. **Uncertainty: declare the sources up front.** Every kind in
    `schema.UNCERTAINTY_KINDS` is either a source or excluded with a reason. The report's
    interval label is rendered from this list ("95% UI over calibration; not covered: unit
@@ -66,7 +91,10 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
    value unless you give it a published range in `uncertainty.priors: {name: {dist,
    range, source}}`; the label says it is held fixed. Fix a prior parameter only with
    `uncertainty.excluded: [{parameter, reason}]`. Each drawn prior gets an automatic
-   `prior_range` decision test; do not declare one.
+   `prior_range` decision test; do not declare one. A prior targets an engine parameter only
+   (`prior_target_not_parameter`). A unit attribute bound to a data column is data: if the
+   column is uncertain, declare that where it arises, as the observation of a latent quantity
+   through a source with a sampling frame and a bias model.
 10. **Analysis.** `evaluation: emulator` for engines too slow to run per unit and draw (give
     the design: points, hold-out share, features), `direct` otherwise; the stability
     hold-out group; sensitivity; and **decision tests** for each simplification,

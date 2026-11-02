@@ -125,7 +125,7 @@ def load_card(engine) -> dict:
     for name, d in (doc.get("priors") or {}).items():
         ps = specs.get(name)
         if ps is None:
-            out["problems"].append(f"engine priors: {name} is not an engine parameter")
+            out["problems"].append(f"prior_target_not_parameter: engine priors: {name} is not an engine parameter")
             continue
         if ps.kind != "fixed":
             out["problems"].append(f"engine priors: {name} is of kind {ps.kind}; only a fixed parameter takes a card prior")
@@ -163,7 +163,9 @@ def kind_excluded(u: dict, kind: str) -> str | None:
     return None
 
 
-def spec_priors(u: dict, engine, card: dict) -> tuple[dict, list[str]]:
+def spec_priors(u: dict, engine, card: dict, bound: dict | None = None) -> tuple[dict, list[str]]:
+    """`bound`: the unit attributes the spec binds to data columns ({attribute: column}); a prior on one is refused
+    with its own explanation (docs/design/v2-derived-inputs.md §3.4)."""
     specs = {q.name: q for q in engine.parameters()}
     out, bad = {}, []
     sp = u.get("priors") or {}
@@ -172,7 +174,10 @@ def spec_priors(u: dict, engine, card: dict) -> tuple[dict, list[str]]:
     for name, d in sp.items():
         ps = specs.get(name)
         if ps is None:
-            bad.append(f"uncertainty.priors: {name} is not an engine parameter")
+            why = (f"; it is a unit attribute bound to data column {bound[name]}: declare that column's uncertainty "
+                   "where it arises, as the observation of a latent quantity through a source with a frame and a "
+                   "bias model (v2d §3.4)" if name in (bound or {}) else "")
+            bad.append(f"prior_target_not_parameter: uncertainty.priors: {name} is not an engine parameter{why}")
             continue
         if ps.kind not in SPEC_PRIOR_KINDS:
             bad.append(f"uncertainty.priors: {name} is of kind {ps.kind}; a spec prior is for a scenario or fixed parameter")
@@ -193,7 +198,8 @@ def problems(spec) -> list[str]:
     eng = spec.engine()
     u = spec.raw["uncertainty"]
     card = load_card(eng)
-    sp, bad = spec_priors(u, eng, card)
+    from toolkit.spec.schema import data_bound_attributes
+    sp, bad = spec_priors(u, eng, card, data_bound_attributes(spec.raw.get("decision_units") or {}))
     bad = card["problems"] + bad
     allp = set(card["priors"]) | set(sp)
     for name, why in excluded_parameters(u).items():

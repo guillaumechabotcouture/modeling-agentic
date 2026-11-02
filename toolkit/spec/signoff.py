@@ -2,6 +2,7 @@
 """Owner sign-off of the decision spec: a thin adapter over scripts/decision_brief.py.
 
     python3 toolkit/spec/signoff.py status <run_dir>
+    python3 toolkit/spec/signoff.py sheet <run_dir>          # what signing accepts beyond the spec's text
     python3 toolkit/spec/signoff.py sign <run_dir> --by owner|lead [--note TEXT]
     python3 toolkit/spec/signoff.py --self-test
 
@@ -31,6 +32,10 @@ from toolkit.spec import schema  # noqa: E402
 
 SPEC = DB.DECISION_SPEC
 SPEC_SIGNOFF = "decision_spec.signoff.json"
+# docs/design/v2-derived-inputs.md: the harness's record of the derivations that made the spec's data. The sign-off
+# freezes its hash next to the spec's, and the derived files it lists, so a later change to either breaks it.
+DERIVATIONS_RECORD = "data/derivations_record.json"
+SHEET = "decision_spec.signoff_sheet.md"
 
 
 def _spec_record(run_dir: str) -> dict | None:
@@ -52,8 +57,36 @@ def status(run_dir: str) -> str:
     if not os.path.exists(path):
         return "changed" if rec is not None else "absent"
     if rec is not None:
-        return "signed" if DB._sha(path) == (rec.get("sha256") or {}).get(SPEC) else "changed"
+        return "signed" if DB._sha(path) == (rec.get("sha256") or {}).get(SPEC) and not derived_changed(run_dir, rec) \
+            else "changed"
     return "invalid" if schema.validate(schema.load(path), pending_ok=True) else "awaiting"
+
+
+def derived_changed(run_dir: str, rec: dict) -> list[str]:
+    """What changed since sign-off among the derivation record and the derived files it lists (empty: nothing). A
+    sign-off made before the record existed, in a run that has none, is unaffected."""
+    signed = (rec.get("sha256") or {}).get(DERIVATIONS_RECORD)
+    now = DB._sha(os.path.join(run_dir, DERIVATIONS_RECORD))
+    if signed is None and now is None:
+        return []
+    if signed != now:
+        return [DERIVATIONS_RECORD]
+    try:
+        derivs = (json.load(open(os.path.join(run_dir, DERIVATIONS_RECORD))) or {}).get("derivations") or {}
+    except (OSError, ValueError):
+        return [DERIVATIONS_RECORD]
+    return sorted(o for e in derivs.values() for o, h in ((e or {}).get("outputs") or {}).items()
+                  if DB._sha(os.path.join(run_dir, o)) != h)
+
+
+def _freeze_record(run_dir: str, path: str) -> dict:
+    """Add the derivation record's hash to a sign-off file (the brief's or the spec's own)."""
+    with open(path, encoding="utf-8") as f:
+        rec = json.load(f)
+    rec.setdefault("sha256", {})[DERIVATIONS_RECORD] = DB._sha(os.path.join(run_dir, DERIVATIONS_RECORD))
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(rec, f, indent=1)
+    return rec
 
 
 def signed_sha(run_dir: str) -> str | None:
@@ -71,15 +104,74 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     if _spec_record(run_dir) is not None:
         raise ValueError("the spec is already signed; a change needs a new sign-off by the owner")
     if os.path.exists(os.path.join(run_dir, DB.BRIEF)):
-        return DB.sign(run_dir, by, answers=answers, note=note, accept_proposed=accept_proposed)
+        DB.sign(run_dir, by, answers=answers, note=note, accept_proposed=accept_proposed)
+        return _freeze_record(run_dir, os.path.join(run_dir, DB.SIGNOFF))
     record = {"signed_by": by, "signed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "note": note,
-              "sha256": {SPEC: DB._sha(path)}, "producer": "toolkit/spec/signoff.py",
+              "sha256": {SPEC: DB._sha(path), DERIVATIONS_RECORD: DB._sha(os.path.join(run_dir, DERIVATIONS_RECORD))},
+              "producer": "toolkit/spec/signoff.py",
               "schema_version": schema.SCHEMA_VERSION}
     os.makedirs(os.path.join(run_dir, DB.SIGNED_DIR), exist_ok=True)
     shutil.copyfile(path, os.path.join(run_dir, DB.SIGNED_DIR, SPEC))
     with open(os.path.join(run_dir, SPEC_SIGNOFF), "w", encoding="utf-8") as f:
         json.dump(record, f, indent=1)
     return record
+
+
+def sheet(run_dir: str, candidates: list | None = None) -> str:
+    """The sign-off sheet (markdown): what signing accepts beyond the spec's text. Each engine default the spec
+    accepts by name, with the card's meaning and the spec's reason; the staged columns and tables the derivations
+    do not use, with their reasons; the derivations; and, when given, the candidate engines and why any is
+    ineligible ({ref, eligible, why_not} rows from the pre-sign check)."""
+    import yaml
+    path = os.path.join(run_dir, SPEC)
+    try:
+        raw = yaml.safe_load(open(path, encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as e:
+        return f"# Decision spec sign-off sheet\n\n{SPEC} unreadable: {e}\n"
+    out = ["# Decision spec sign-off sheet", "",
+           f"Signing accepts `{SPEC}` (sha256 `{(DB._sha(path) or '')[:16]}`) and the derived data recorded in "
+           f"`{DERIVATIONS_RECORD}` (sha256 `{(DB._sha(os.path.join(run_dir, DERIVATIONS_RECORD)) or 'none')[:16]}`). "
+           "It also accepts what follows.", ""]
+    eng = raw.get("engine")
+    refs = [eng["ref"]] if isinstance(eng, dict) and eng.get("ref") else \
+        (list(eng.get("candidates") or []) if isinstance(eng, dict) else [])
+    refs = refs or [r.get("ref") for r in candidates or [] if r.get("ref")]
+    binds = {}
+    for ref in refs:
+        try:
+            binds[ref] = schema.binding_for_ref(ref)
+        except Exception:  # noqa: BLE001 -- the sheet still shows the spec's reason
+            binds[ref] = {}
+    acc = ((raw.get("decision_units") or {}).get("defaults_accepted") or {})
+    out.append("## Engine defaults accepted by name")
+    if not acc:
+        out.append("None: every engine unit attribute is bound to the units table, a value or the calibration.")
+    for a, why in sorted(acc.items()):
+        means = sorted({f"{r['default']!r}: {r['meaning']}" for r in (schema.binding_rule(b, a) for b in binds.values())
+                        if isinstance(r, dict)})
+        out.append(f"- **{a}**: " + ("; ".join(means) if means else "the chosen engine's default")
+                   + f". Reason: {why}")
+    out.append("")
+    try:
+        import pipeline as P
+        ders, ign, errs = P.load_derivations(run_dir)
+    except Exception as e:  # noqa: BLE001
+        ders, ign, errs = [], {}, [f"{type(e).__name__}: {e}"]
+    out.append("## Staged inputs and columns not used")
+    rows = [f"- `{inp}`: column `{c}`: {why}" for d in ders
+            for inp, cs in sorted(((d.get("columns") or {}).get("ignores") or {}).items()) for c, why in sorted(cs.items())]
+    rows += [f"- `{inp}` (the whole table): {why}" for inp, why in sorted(ign.items())]
+    out += rows or ["None: every column of every staged table is used."]
+    out += ["", "## Derivations"] + [f"- **{d['id']}**: `{d['script']}` reads {len(d['inputs'])} file(s), writes "
+                                     + ", ".join(f"`{o}`" for o in d["outputs"]) for d in ders]
+    out += [f"- declaration problem: {e}" for e in errs] + [""]
+    if candidates:
+        out.append("## Candidate engines (pre-sign check)")
+        for r in candidates:
+            out.append(f"- `{r.get('ref')}`: " + ("eligible" if r.get("eligible") else "ineligible: "
+                                                  + "; ".join(str(w) for w in r.get("why_not") or [])[:1500]))
+        out.append("")
+    return "\n".join(out)
 
 
 def _self_test() -> int:
@@ -178,13 +270,16 @@ def main(argv=None) -> int:
     if argv[:1] == ["--self-test"]:
         return _self_test()
     ap = argparse.ArgumentParser()
-    ap.add_argument("action", choices=["status", "sign"])
+    ap.add_argument("action", choices=["status", "sign", "sheet"])
     ap.add_argument("run_dir")
     ap.add_argument("--by", default="owner", choices=["owner", "lead"])
     ap.add_argument("--note", default="")
     a = ap.parse_args(argv)
     if a.action == "status":
         print(status(a.run_dir))
+        return 0
+    if a.action == "sheet":
+        print(sheet(a.run_dir))
         return 0
     print(json.dumps(sign(a.run_dir, a.by, a.note), indent=1))
     return 0
