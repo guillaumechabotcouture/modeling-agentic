@@ -1,6 +1,6 @@
 # Stage machine: code runs the pipeline, LLMs reason and edit code
 
-**Status:** design for review (2026-10-27). It makes `docs/architecture-v2.md` §3.1 (stage graph, Python orchestrator, migration step 5) concrete, and adds what E7 attempts 6 and 7 showed is missing:
+**Status:** design, merged to main in PR #37 (written 2026-10-27). Step S4, the code-owned state machine, is implemented on the `v2` branch as `agents/stage_machine.py` (PR #90; design note `v2c-orchestration.md`). It makes `docs/architecture-v2.md` §3.1 (stage graph, Python orchestrator, migration step 5) concrete, and adds what E7 attempts 6 and 7 showed is missing:
 - a declared build pipeline per run;
 - small fixes whose impact is measured one at a time;
 - gate inputs computed by the harness instead of written by agents;

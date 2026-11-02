@@ -1,0 +1,24 @@
+# Libraries that agent-written model code (v1 runs) and skill scripts
+# import. The harness and the v2 toolkit do not import them (checked with
+# an AST import scan of every tracked .py file); the modeler prompt
+# (agents/modeler.py) and the skills direct agents to them, and stored
+# runs import them. requirements.txt includes this file.
+# Same pins and validation date as requirements.txt.
+
+# --- Modeling libraries named in the modeler prompt and skills ---
+seaborn==0.13.2         # plotting in run code (modeling-fundamentals skill)
+statsmodels==0.14.6     # GLM, ARIMA/ETS (modeler prompt; model-validation, multi-structural-comparison skills)
+lmfit==1.3.4            # curve and ODE fitting (modeler prompt; model-validation skill)
+xgboost==3.2.0          # gradient boosting (modeler prompt)
+optuna==4.8.0           # calibration (modelops-calabaria, starsim-dev-calibration skills)
+geopandas==1.1.3        # spatial inputs (laser-spatial-disease-modeling skill)
+sciris==3.2.9           # sciris-utilities, starsim-dev-* skills
+
+# --- Disease-modeling frameworks ---
+laser-core==1.0.1       # laser-spatial-disease-modeling skill scripts; v1 preflight imports laser.core
+laser.generic==1.1.0    # same; v1 preflight imports laser.generic
+polars==1.39.3          # laser-spatial-disease-modeling skill scripts
+numba==0.65.0           # laser-spatial-disease-modeling skill scripts
+
+# Bayesian modeling (optional, heavier dependency)
+# pymc

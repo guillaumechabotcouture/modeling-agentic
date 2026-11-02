@@ -52,7 +52,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(HERE), "scripts", "lib"))
 import eval_paths  # noqa: E402 — Phase 50 α: what a launch tarball must never hold
 sys.modules.setdefault("run_cluster", sys.modules[__name__])   # configs import RunConfig from here
 
-WORKSPACE = "idm-coiled-idmad-r2"
+WORKSPACE = ws.WORKSPACE
 ENV_FILE = os.path.expanduser("~/modeling-agentic/.env")
 CHUNK = 8 * 2**20
 _ATTACH = {"ready", "running", "pending", "starting", "scaling"}
@@ -207,12 +207,10 @@ def attach(name: str):
     """Attach to a live cluster; refuse rather than create one. The check and
     the attach are not atomic, so the cluster we get must be the one we checked
     (otherwise it is a new empty one: shut down and refused)."""
-    import coiled
     cid = live_id(name)
     if cid is None:
         raise SystemExit(f"cluster {name!r} is not running; refusing to create a new one")
-    cl = coiled.Cluster(name=name, workspace=WORKSPACE, shutdown_on_close=False, wait_for_workers=False)
-    return ws.verify_attached(cl, cid)
+    return ws.attach_existing(name, WORKSPACE, cid)
 
 
 def _compute(cfg):
@@ -1428,6 +1426,73 @@ def _self_test_51c(ok) -> None:
            f"RC51c-12 a scheduler error is redacted before it is truncated ({s4['input_errors'][0][-40:]})")
 
 
+def _self_test_attach(ok) -> None:
+    """RC60: one attach call (worker_side.attach_existing) for the launcher, the keeper and the
+    overflow pool; one workspace name for the launcher and the VM jobs, equal to the replay backend's."""
+    import importlib.util
+    import types
+    calls = []
+
+    class Cl:
+        def __init__(self, **kw):
+            calls.append(kw)
+            self.cluster_id = kw.pop("_id", 5)
+            self.down = False
+
+        def shutdown(self):
+            self.down = True
+
+    fake = types.ModuleType("coiled")
+    fake.Cluster = Cl
+    listed = []
+    fake.list_clusters = lambda workspace: listed
+    saved = sys.modules.get("coiled")
+    sys.modules["coiled"] = fake
+    try:
+        cl = ws.attach_existing("n", "w", 5)
+        ok(calls == [{"name": "n", "workspace": "w", "shutdown_on_close": False, "wait_for_workers": False}]
+           and cl.cluster_id == 5, f"RC60a attach_existing attaches by name without waiting for workers: {calls}")
+        made = []
+        fake.Cluster = lambda **kw: made.append(Cl(**kw)) or made[-1]
+        try:
+            ws.attach_existing("n", "w", 9)
+            ok(False, "RC60b a cluster that is not the one checked is refused")
+        except SystemExit as e:
+            ok(made and made[-1].down and "stopped while attaching" in str(e),
+               f"RC60b a cluster that is not the one checked is shut down and refused: {e}")
+        calls.clear()
+        fake.Cluster = Cl
+        listed[:] = [{"name": "n", "id": 5, "current_state": {"state": "stopping"}}]
+        try:
+            attach("n")
+            ok(False, "RC60c attach refuses a stopping cluster")
+        except SystemExit as e:
+            ok(not calls and "not running" in str(e), f"RC60c attach never constructs a Cluster for a stopping one: {calls}")
+        listed[:] = [{"name": "n", "id": 5, "current_state": {"state": "running"}}]
+        cl = attach("n")
+        ok(calls == [{"name": "n", "workspace": WORKSPACE, "shutdown_on_close": False, "wait_for_workers": False}]
+           and cl.cluster_id == 5, f"RC60d attach checks running, then attaches with wait_for_workers=False: {calls}")
+        calls.clear()
+        ov = ws._Overflow({"name": "n-overflow", "id": 5}, "w")
+        ov.cl = None
+        Cl.get_client = lambda self: "C"
+        ok(ov.attach() == (ov.cl, "C") and calls == [{"name": "n-overflow", "workspace": "w", "shutdown_on_close": False,
+                                                     "wait_for_workers": False}],
+           f"RC60e the keeper's overflow handle attaches through the same call: {calls}")
+    finally:
+        if saved is None:
+            sys.modules.pop("coiled", None)
+        else:
+            sys.modules["coiled"] = saved
+    spec = importlib.util.spec_from_file_location(
+        "_rc60_replay_coiled", os.path.join(os.path.dirname(HERE), "scripts", "replay_coiled.py"))
+    rq = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rq)
+    # replay_coiled.py is uploaded to the workers on its own (client.upload_file), so it cannot load
+    # worker_side.py at import and keeps its own copy of the name: this check keeps the two equal.
+    ok(WORKSPACE == ws.WORKSPACE == rq.WORKSPACE, "RC60f launcher, worker side and replay backend name one workspace")
+
+
 def _self_test() -> int:
     import datetime as dt
     import io
@@ -1596,6 +1661,7 @@ def _self_test() -> int:
     _self_test_42b(ok, RunConfig)
     _self_test_51c(ok)
     _self_test_52(ok)
+    _self_test_attach(ok)
     for f in sorted(os.listdir(os.path.join(HERE, "configs"))):
         if f.endswith(".py") and not f.startswith("_"):   # _*.py: shared helpers (configs/_eval.py)
             try:
