@@ -542,16 +542,34 @@ def _uncertainty(run_dir: str) -> dict:
                                   "scripts/effect_size_registry.py::sample_prior (scripts/ask.py checks they match)"}
 
 
-def _environment(wres: dict | None) -> dict:
-    pins = {}
+def _requirement_pins(path: str, _seen: set | None = None) -> dict:
+    """`name==version` pins in a requirements file and the files it includes with `-r`
+    (requirements.txt includes requirements-agent.txt, where model-code libraries are pinned).
+    A file that cannot be read adds no pins, so its packages show as unpinned."""
+    seen = _seen if _seen is not None else set()
+    path = os.path.realpath(path)
+    if path in seen:
+        return {}
+    seen.add(path)
+    pins: dict = {}
     try:
-        with open(os.path.join(REPO, "requirements.txt")) as f:
-            for line in f:
-                m = re.match(r"\s*([A-Za-z0-9_.\-]+)\s*==\s*([^\s#]+)", line)
-                if m:
-                    pins[m.group(1).lower().replace("_", "-")] = m.group(2)
+        with open(path) as f:
+            lines = f.readlines()
     except OSError:
-        pass
+        return pins
+    for line in lines:
+        inc = re.match(r"\s*(?:-r|--requirement)\s+([^\s#]+)", line)
+        if inc:
+            pins.update(_requirement_pins(os.path.join(os.path.dirname(path), inc.group(1)), seen))
+            continue
+        m = re.match(r"\s*([A-Za-z0-9_.\-]+)\s*==\s*([^\s#]+)", line)
+        if m:
+            pins[m.group(1).lower().replace("_", "-")] = m.group(2)
+    return pins
+
+
+def _environment(wres: dict | None) -> dict:
+    pins = _requirement_pins(os.path.join(REPO, "requirements.txt"))
     used = (wres or {}).get("third_party") or {}
     rows = {d: {"installed": v, "pinned": pins.get(d.lower().replace("_", "-"))} for d, v in used.items()}
     return {"python": (wres or {}).get("python") or sys.version.split()[0],
@@ -1012,6 +1030,14 @@ def _self_test() -> int:
                f"MC11 symlinked external code fails closed; got {c['not_usable_reasons']}")
             os.remove(os.path.join(d, "models/helper.py"))
             w("models/helper.py", "SCALE = 10.0\n")
+        # MC12: pins come from requirements.txt and the files it includes with -r (cycles stop).
+        os.makedirs(os.path.join(d, "req"), exist_ok=True)
+        w("req/a.txt", "numpy==1.0  # x\n-r b.txt\n")
+        w("req/b.txt", "Seaborn==0.1\nlaser.generic==2.0\n-r a.txt\n-r missing.txt\n")
+        rp = _requirement_pins(os.path.join(d, "req/a.txt"))
+        ok(rp == {"numpy": "1.0", "seaborn": "0.1", "laser.generic": "2.0"}, f"MC12 pins follow -r; got {rp}")
+        live = _requirement_pins(os.path.join(REPO, "requirements.txt"))
+        ok("claude-agent-sdk" in live and "statsmodels" in live, f"MC12 the repo's pins include requirements-agent.txt")
         # MC10: a model that hangs is stopped and reported.
         w("models/outcome_fn.py", "import time\ndef outcome_fn(p):\n    time.sleep(30)\n")
         c = build(d, timeout=3)
