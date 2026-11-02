@@ -1,16 +1,7 @@
 producer: toolkit/engines/malaria/benchmarks/restamp_proof.py
 old:
   ref: origin/v2
-  commit: fd1ef9a1cc559c9f5c7a464d74a59edabbe0e27b
-  identity:
-    code_sha256: 1a4b27a4315a440dbd64b3b7fcde1d53e1bb9f2c7399d4a62cb15239d20b036e
-    config_sha256: eb9d39627ddda563f781e8a6f7a32f71f13e454576e7e2de0f77b946ad4c7489
-    name: malaria-starsim
-    params_sha256: 04b1cab140eb45c36aa89d24656fddfdf500d28596f50523dcdd606ae2de6992
-    version: '0.5'
-  engine_version: '0.5'
-new:
-  commit_of_tree_base: 23567732b99cca82e73e705c031d8da82791eb29
+  commit: 4788105d7c524a9e63eb03e8c35a1e0f1f8f5ddd
   identity:
     code_sha256: 108665c0c1af3a21362ea55853caf8d147ce5b37ee1b98433eb19d84a749c393
     config_sha256: 32abb939985579aca3bfa2ca2b30201ea61d29bfc1d0a81e7e1265b2e11625e5
@@ -18,6 +9,15 @@ new:
     params_sha256: 04b1cab140eb45c36aa89d24656fddfdf500d28596f50523dcdd606ae2de6992
     version: '0.6'
   engine_version: '0.6'
+new:
+  commit_of_tree_base: fac395a499b3b20ab7d89b42999b6bbb0fd63142
+  identity:
+    code_sha256: d4e8a852eff1b69ef324393f1efa899289e6fbfdea10d8493be6bd9684f1ed86
+    config_sha256: 50edd3784a2d8d31dcad3f7c1726c32dd810a53a8a137042c6b676ed91dc5172
+    name: malaria-starsim
+    params_sha256: 04b1cab140eb45c36aa89d24656fddfdf500d28596f50523dcdd606ae2de6992
+    version: '0.7'
+  engine_version: '0.7'
 scope:
   pack_settings:
   - benin
