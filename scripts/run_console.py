@@ -58,6 +58,8 @@ PRICE = {"in": 4.0, "out": 20.0, "cache_write": 5.0, "cache_read": 0.20}
 HISTORY_TURNS = 12
 # Character budgets for the run context (each part says when it was cut).
 BUDGET = {"results": 12000, "gate": 3000, "blockers": 6000, "tests": 3000, "timeline": 3000, "owner": 3000}
+OPTIONAL_STATES = ("FIX_LOOP", "OWNER_DECISION", "PRESENTATION")   # the stepper hides them when never entered
+STALE_S = 1800.0               # a progress record not updated for this long is not live
 CLOUD_MIN_S = 60.0             # each cloud refresh attaches to a cluster: never more often than this
 
 SYSTEM = """You are the run console's assistant. The owner of a modelling run (an epidemiological
@@ -179,17 +181,20 @@ def stepper(st: dict) -> dict:
     failed_from = hist[-1].get("from") if cur == "FINAL" and st.get("status") in FAIL_STATUSES and hist else None
     out = []
     for i, s in enumerate(order):
+        why = None
         if s == cur:
             status = "waiting" if st.get("paused") else "current"
         elif s == failed_from:
-            status = "failed"
+            status, why = "failed", hist[-1].get("why")
         elif s in left or s in entered:
             status = "done"
         elif i < ci:
             status = "skipped"
         else:
             status = "todo"
-        out.append({"state": s, "status": status})
+        if s in OPTIONAL_STATES and status in ("todo", "skipped"):
+            continue
+        out.append({"state": s, "status": status, **({"why": why} if why else {})})
     return {"stages": out, "round": st.get("round"), "max_rounds": st.get("max_rounds"),
             "fix_rounds": sum(1 for h in hist if h["to"] == "FIX_LOOP"), "paused": st.get("paused"),
             "status": st.get("status")}
@@ -306,13 +311,32 @@ def decision_test_cards(run_dir: str) -> list:
     return out
 
 
-def compute_status(run_dir: str, cap_core_hours: float | None = None) -> dict:
-    """Core-hours used vs cap and each call in flight (ledger reservations joined with their progress)."""
+def _meta(run_dir: str) -> dict:
+    meta, _ = _read(os.path.join(run_dir, "metadata.json"))
+    return meta if isinstance(meta, dict) else {}
+
+
+def run_status(run_dir: str, st: dict | None) -> str | None:
+    """run_state's status, else the one main.py recorded in metadata.json."""
+    return (st or {}).get("status") or _meta(run_dir).get("status")
+
+
+def finished(run_dir: str, st: dict | None) -> bool:
+    """The run has ended: FINAL, a terminal status, or metadata.json says it finished."""
+    return (st or {}).get("state") == "FINAL" or bool(run_status(run_dir, st)) or bool(_meta(run_dir).get("finished"))
+
+
+def compute_status(run_dir: str, cap_core_hours: float | None = None, st: dict | None = None,
+                   now: float | None = None) -> dict:
+    """Core-hours used vs cap and each call in flight (ledger reservations joined with their progress).
+    A call is live only while the run is unfinished and its progress record is fresh; otherwise it was
+    interrupted and has no ETA. Used = the ledger's settled core_seconds plus live calls' core_s."""
     import compute as C
+    ended, now = finished(run_dir, st), time.time() if now is None else now
     cap = float(cap_core_hours if cap_core_hours is not None else C.RUN_CAP_CORE_HOURS)
     out = {"cap_core_h": cap, "cap_source": "--core-hours-cap" if cap_core_hours is not None
            else "compute.RUN_CAP_CORE_HOURS (default; the run's MA_COMPUTE_MAX_CORE_HOURS is not recorded)",
-           "used_core_h": 0.0, "calls": [], "done_calls": 0}
+           "used_core_h": 0.0, "calls": [], "done_calls": 0, "live": False}
     p = os.path.join(run_dir, C.LEDGER_REL)
     if not os.path.exists(p):
         return out
@@ -320,13 +344,13 @@ def compute_status(run_dir: str, cap_core_hours: float | None = None) -> dict:
     if err or not isinstance(led, dict):
         out["error"] = f"{C.LEDGER_REL}: {err or 'not a mapping'}"
         return out
-    out["used_core_h"] = round(float(led.get("core_seconds") or 0) / 3600, 2)
+    used = float(led.get("core_seconds") or 0)
     out["done_calls"] = len(led.get("calls") or [])
     for rid, r in sorted((led.get("reservations") or {}).items()):
         if not isinstance(r, dict):
             continue
         call = {"fn": r.get("fn"), "purpose": r.get("purpose"), "n": r.get("n"), "done": None, "core_s": None,
-                "eta_s": None, "started": r.get("started")}
+                "eta_s": None, "started": r.get("started"), "live": False}
         prog = os.path.join(run_dir, C.PROGRESS_DIR, os.path.basename(str(r.get("progress") or "")))
         if r.get("progress") and os.path.isfile(prog):
             rec, perr = _read(prog)
@@ -334,12 +358,16 @@ def compute_status(run_dir: str, cap_core_hours: float | None = None) -> dict:
                 call["error"] = f"progress record: {perr or 'not a mapping'}"
             else:
                 call["done"], call["core_s"] = int(rec.get("done_tasks") or 0), rec.get("core_s")
+                call["live"] = not ended and now - float(rec.get("t") or 0) < STALE_S
                 el = float(rec.get("t") or 0) - float(r.get("started") or 0)
-                if call["done"] and r.get("n") and el > 0:
-                    call["eta_s"] = round((int(r["n"]) - call["done"]) * el / call["done"])
+                if call["live"]:
+                    used += float(rec.get("core_s") or 0)
+                    if call["done"] and r.get("n") and el > 0:
+                        call["eta_s"] = round((int(r["n"]) - call["done"]) * el / call["done"])
         else:
             call["error"] = "no progress record"
         out["calls"].append(call)
+    out["used_core_h"], out["live"] = round(used / 3600, 2), any(c["live"] for c in out["calls"])
     return out
 
 
@@ -417,7 +445,7 @@ def build_cards(run_dir: str, st: dict | None, box: dict, cap=None) -> list:
         except Exception as e:  # noqa: BLE001 -- a reader bug is shown, not hidden
             cards.append({"id": f"error:{fn.__name__}", "kind": "error", "stage": "", "at": "",
                           "title": f"{fn.__name__} failed", "body": f"{type(e).__name__}: {e}", "anchor": None})
-    comp = compute_status(run_dir, cap)
+    comp = compute_status(run_dir, cap, st)
     for i, c in enumerate(comp["calls"]):
         cards.append({"id": f"batch:{i}", "kind": "batch", "stage": "ANALYZE",
                       "at": _iso(c["started"]) if c.get("started") else "", "title": f"engine batch {c.get('fn')}",
@@ -444,6 +472,25 @@ def headline(run_dir: str) -> str:
     return (m.group(1).strip() if m else "")[:300]
 
 
+def headline_number(text: str) -> str:
+    """The first "averts <number> <unit>" in the headline, e.g. "12.34M DALYs"; "" when there is none."""
+    m = re.search(r"\bavert(?:s|ed)?\s+([\d.,]+\s?[kKMB]?)\s+([A-Za-z]+)", text or "")
+    return f"{m.group(1)} {'DALYs' if m.group(2).lower() == 'dalys' else m.group(2)}" if m else ""
+
+
+def run_label(run_dir: str, root: str | None) -> tuple[str, str]:
+    """(label, group). The label is the path under the root without "runs" folders and without the
+    timestamped run folder when a parent names it (F1/runs/2026-..._question -> F1). The group is the
+    root's last folder that is not "run"/"runs"."""
+    if not root:
+        return os.path.basename(run_dir), os.path.basename(os.path.dirname(run_dir))
+    parts = [x for x in os.path.relpath(run_dir, root).split(os.sep) if x not in (".", "run", "runs")]
+    if len(parts) > 1:
+        parts = parts[:-1]
+    names = [x for x in os.path.realpath(root).split(os.sep) if x and x not in ("run", "runs")]
+    return "/".join(parts) or os.path.basename(run_dir), (names[-1] if names else root)
+
+
 def engine_of(run_dir: str, st: dict | None) -> str | None:
     doc, err = _read(os.path.join(run_dir, "engine_choice.json"))
     if isinstance(doc, dict) and isinstance(doc.get("engine"), dict):
@@ -462,9 +509,10 @@ def read_run(run_dir: str, cap=None) -> dict:
             docs[name] = {"text": txt, "error": derr}
     return {"run_dir": run_dir, "name": os.path.basename(run_dir), "error": err,
             "state": {k: v for k, v in (st or {}).items() if k not in ("history", "journal", "last_gate")},
-            "stepper": stepper(st) if st else None, "compute": compute_status(run_dir, cap),
+            "stepper": stepper(st) if st else None, "compute": compute_status(run_dir, cap, st),
             "inbox": box, "cards": build_cards(run_dir, st, box, cap), "docs": docs,
-            "headline": headline(run_dir), "engine": engine_of(run_dir, st)}
+            "headline": headline(run_dir), "engine": engine_of(run_dir, st), "finished": finished(run_dir, st),
+            "status": run_status(run_dir, st), "fail_statuses": FAIL_STATUSES}
 
 
 # ------------------------------------------------------------------ feedback and the learning view
@@ -804,6 +852,12 @@ def discover(roots: list, mirror_roots: list = (), depth: int = 4) -> list:
                 seen.add(dp)
                 dirs[:] = []
                 out.append(run_summary(dp, root, mirror))
+    seen_labels: dict = {}
+    for r in out:
+        seen_labels[r["label"]] = seen_labels.get(r["label"], 0) + 1
+    for r in out:                              # two runs under one label: add the run folder
+        if seen_labels[r["label"]] > 1:
+            r["label"] = f"{r['label']}/{r['name']}"
     return sorted(out, key=lambda r: r.get("started") or "", reverse=True)
 
 
@@ -814,11 +868,13 @@ def run_summary(run_dir: str, root: str | None = None, mirror: bool = False) -> 
     hist = (st or {}).get("history") or []
     started = meta.get("started") or (hist[0].get("at") if hist and isinstance(hist[0], dict) else "") or _mtime(
         os.path.join(run_dir, "run_state.json"))
-    return {"id": run_dir, "name": os.path.basename(run_dir), "mirror": mirror,
-            "group": os.path.relpath(os.path.dirname(run_dir), root) if root else os.path.dirname(run_dir),
+    label, group = run_label(run_dir, root)
+    head = headline(run_dir)
+    return {"id": run_dir, "name": os.path.basename(run_dir), "mirror": mirror, "label": label, "group": group,
+            "headline_number": headline_number(head), "finished": finished(run_dir, st),
             "question": str((st or {}).get("question") or meta.get("question") or "")[:240], "started": started,
-            "state": (st or {}).get("state"), "status": (st or {}).get("status"), "paused": (st or {}).get("paused"),
-            "headline": headline(run_dir), "engine": engine_of(run_dir, st), "error": err}
+            "state": (st or {}).get("state"), "status": run_status(run_dir, st), "paused": (st or {}).get("paused"),
+            "headline": head, "engine": engine_of(run_dir, st), "error": err}
 
 
 def batch_reuse(run_dir: str) -> list:
@@ -1165,19 +1221,23 @@ def _self_test() -> int:
         ok(err is None and by["OWNER_DECISION"] == "waiting" and by["GATE"] == "done" and by["FIX_LOOP"] == "done"
            and by["WRITE"] == "todo" and sp["fix_rounds"] == 1 and sp["round"] == 2,
            f"RC1a stepper: done, waiting, todo and one fix-loop round ({by}, {sp['fix_rounds']})")
-        ok([s["state"] for s in sp["stages"]] == list(states()) and states()[0] == "SPEC" and states()[-1] == "FINAL",
-           "RC1b the stage list is stage_machine.STATES")
+        ok([s["state"] for s in sp["stages"]] == [s for s in states() if s != "PRESENTATION"]
+           and states()[0] == "SPEC" and states()[-1] == "FINAL",
+           "RC1b the stage list is stage_machine.STATES, without optional states never entered")
         rd2 = _toy_run(os.path.join(td, "runs", "proj", "run2"), "WRITE", None,
                        path=("SPEC", "SIGN", "EVIDENCE", "ENGINE_CHOICE", "CONFIGURE", "ANALYZE", "CRITIQUE", "GATE",
                              "WRITE"))
         by2 = {s["state"]: s["status"] for s in stepper(load_run_state(rd2)[0])["stages"]}
-        ok(by2["FIX_LOOP"] == "skipped" and by2["OWNER_DECISION"] == "skipped" and by2["WRITE"] == "current",
-           f"RC1c states before the current one never entered are skipped ({by2})")
+        ok("FIX_LOOP" not in by2 and "OWNER_DECISION" not in by2 and "PRESENTATION" not in by2
+           and by2["WRITE"] == "current" and by2["FINAL"] == "todo",
+           f"RC1c FIX_LOOP, OWNER_DECISION and PRESENTATION are collapsed when never entered ({by2})")
         rd3 = _toy_run(os.path.join(td, "runs", "other", "run3"), "FINAL", None, "run_failed",
                        path=("SPEC", "SIGN", "EVIDENCE", "ENGINE_CHOICE", "CONFIGURE", "ANALYZE", "FINAL"))
-        by3 = {s["state"]: s["status"] for s in stepper(load_run_state(rd3)[0])["stages"]}
-        ok(by3["ANALYZE"] == "failed" and by3["CRITIQUE"] == "skipped", f"RC1d a failed run marks the state it "
-           f"failed in ({by3})")
+        sp3 = stepper(load_run_state(rd3)[0])["stages"]
+        by3 = {s["state"]: s["status"] for s in sp3}
+        ok(by3["ANALYZE"] == "failed" and by3["CRITIQUE"] == "skipped"
+           and [s.get("why") for s in sp3 if s["state"] == "ANALYZE"] == ["step 6"],
+           f"RC1d a failed run marks the state it failed in, with the reason ({by3})")
         bad = os.path.join(td, "bad")
         os.makedirs(bad)
         open(os.path.join(bad, "run_state.json"), "w").write("{not json")
@@ -1205,7 +1265,7 @@ def _self_test() -> int:
            and f[0]["at"] == "2026-01-01T00:05:30+00:00", "RC3a a figure card has its caption and provenance")
         cs = compute_status(rd)
         c0 = cs["calls"][0] if cs["calls"] else {}
-        ok(cs["used_core_h"] == 2.0 and c0.get("done") == 25 and c0.get("n") == 100
+        ok(cs["used_core_h"] == 2.01 and c0.get("done") == 25 and c0.get("n") == 100
            and 250 <= (c0.get("eta_s") or 0) <= 350,
            f"RC3b ledger and progress give core-hours, done/n and an ETA from the observed rate ({cs})")
         ok("decision_test" in kinds and "decision_needed" in kinds and "batch" in kinds and "stage" in kinds
@@ -1361,8 +1421,10 @@ def _self_test() -> int:
         runs = discover([os.path.join(td, "runs")])
         names = {r["name"]: r for r in runs}
         ok(set(names) == {"run1", "run2", "run3"} and names["run1"]["headline"].startswith("The plan averts 120")
-           and names["run1"]["group"] == "proj" and names["run1"]["engine"] == "toy.engine:Toy",
-           f"RC9a runs are found under the roots with question, headline, group and engine ({sorted(names)})")
+           and names["run1"]["engine"] == "toy.engine:Toy" and names["run1"]["headline_number"] == "120 toy"
+           and names["run1"]["label"] == "proj/run1" and names["run3"]["label"] == "other"
+           and names["run1"]["group"] == names["run3"]["group"] == os.path.basename(td),
+           f"RC9a runs are found under the roots with a label, question, headline, group and engine ({sorted(names)})")
         os.makedirs(os.path.join(rd, "data", "derive"))
         open(os.path.join(rd, "data", "derive", "units.py"), "w").write("print('toy')\n")
         open(os.path.join(rd, "decision_spec.yaml"), "w").write("toy: spec\n")
@@ -1484,6 +1546,27 @@ def _self_test() -> int:
                 os.environ.pop("ANTHROPIC_API_KEY", None)
             else:
                 os.environ["ANTHROPIC_API_KEY"] = prev
+        # RC14 live vs finished, and compute used
+        with tempfile.TemporaryDirectory() as t2:
+            live = _toy_run(os.path.join(t2, "live"))
+            cl = compute_status(live, None, load_run_state(live)[0])
+            done = _toy_run(os.path.join(t2, "done"), "FINAL", None, "run_failed",
+                            path=("SPEC", "SIGN", "EVIDENCE", "ENGINE_CHOICE", "CONFIGURE", "ANALYZE", "FINAL"))
+            cd = compute_status(done, None, load_run_state(done)[0])
+            stale = compute_status(live, None, load_run_state(live)[0], now=time.time() + STALE_S + 1)
+            ok(cl["live"] and cl["calls"][0]["live"] and cl["calls"][0]["eta_s"] is not None
+               and cl["used_core_h"] == 2.01, f"RC14a an unfinished run with a fresh progress record is live: "
+               f"an ETA, and used = settled + live core_s ({cl['used_core_h']})")
+            ok(not cd["live"] and cd["calls"][0]["done"] == 25 and cd["calls"][0]["eta_s"] is None
+               and cd["used_core_h"] == 2.0, f"RC14b a progress record left on a finished run is interrupted: "
+               f"no ETA, used = settled only ({cd['used_core_h']})")
+            ok(not stale["live"] and stale["calls"][0]["eta_s"] is None and stale["used_core_h"] == 2.0,
+               "RC14c a progress record older than STALE_S is not live")
+            json.dump({"question": "q", "started": "2026-01-01T00:00:00+00:00", "finished": "2026-01-01T01:00:00"},
+                      open(os.path.join(live, "metadata.json"), "w"))
+            ok(finished(live, load_run_state(live)[0]) and headline_number("It averts 12.34M dalys against x")
+               == "12.34M DALYs" and headline_number("no number") == "",
+               "RC14d metadata.json finished means finished; the headline number is read from the recommendation")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

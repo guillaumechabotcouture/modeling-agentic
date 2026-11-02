@@ -75,9 +75,18 @@ file's mtime), a stage and an anchor `{kind, id, file}`:
 left it, *current* when it is `state`, *waiting* when it is current and `paused` is set, *failed* when
 the run ended in a failure status (`run_failed`, `completed_gate_error`, `completed_gate_not_accepted`,
 `completed_scope_declined`) and this was the state FINAL was entered from, and *skipped* when it comes
-before the current state in order and the history never entered it. The strip shows the round
-(`round`, `max_rounds`) and the number of fix-loop rounds (history entries into FIX_LOOP). Clicking a
-state filters the stream to that stage's cards.
+before the current state in order and the history never entered it. FIX_LOOP, OWNER_DECISION and
+PRESENTATION are left out when they were never entered. The strip is a thin line of dots with short
+labels: done is filled, current is ringed, a failed state is a small red dot with the reason on hover,
+and a state not reached is muted. It shows the number of fix-loop rounds (history entries into
+FIX_LOOP) when there were any. Clicking a state filters the stream to that stage's cards.
+
+**Status line.** At most four items, in plain words: the state and round, the engine batch
+("Engine batch 184/256", with an ETA only while the run is live), spend, and compute used. A run is
+finished when it is FINAL, has a status (from `run_state.json` or `metadata.json`), or
+`metadata.json` records `finished`. A progress record is live only while the run is unfinished and
+the record was updated within `STALE_S`; otherwise the batch reads "interrupted" and has no ETA.
+Compute used is the ledger's settled `core_seconds` plus the `core_s` of live progress records.
 
 ## 5. Owner inbox: the only writes that change a run
 
@@ -104,8 +113,10 @@ Known limits, recorded as open items:
 ## 6. Projects, chat persistence and "Build on this run"
 
 **Discovery.** `--roots` (default: the repo's `runs/`) is scanned to depth 4 for directories with
-`run_state.json`. The sidebar groups runs by their parent directory and shows the question, start
-date, state, headline and engine. `--run-dir` adds and selects one run.
+`run_state.json`. The sidebar labels each run by its path under the root without `runs` folders and
+without the timestamped run folder (`F1/runs/2026-..._question` is "F1"), and under the label shows a
+state chip, the headline number ("12.34M DALYs", from "averts ... " in the recommendation) and the
+start date. Group headers (the root's name) appear only when there is more than one root. `--run-dir` adds and selects one run.
 
 **Persisted conversation.** `<run_dir>/owner/chat.jsonl` (one line per message: ts, role, text, anchor,
 stage, usd) and `<run_dir>/owner/feedback.jsonl`. Selecting a run loads both and rebuilds the cards.
@@ -205,6 +216,7 @@ A synthetic run dir with toy numbers (no licensed data):
 | RC8 | v2 tasks cannot write `owner/`; the console writes only under `owner/`, the draft dir and through the sign commands |
 | RC9 | run discovery under roots; build-on draft (copies, batch reuse verdict from `compute.code_fingerprint`) |
 | RC10 | the HTTP server binds 127.0.0.1 only and serves the page and `/api/run` on a toy run |
+| RC14 | live vs finished: an ETA and live core-seconds only for a fresh progress record on an unfinished run; a progress record left on a finished run, or a stale one, is interrupted; the headline number |
 
 Plus one real end-to-end check, not part of the self-test: start the server on a toy run, hit the
 endpoints, and send one real chat message (spend capped at $1, reported in the PR).
