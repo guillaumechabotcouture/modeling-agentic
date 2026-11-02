@@ -69,6 +69,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 from lib import scope_declarations as sd  # noqa: E402
+from lib.safe_io import sha256_file  # noqa: E402
 
 REQUEST, SIGNOFF, MD = "scope_signoff_request.json", "scope_signoff.json", "scope_signoff.md"
 # Codex review (#85): the harness's record of each answer it received from outside the agent
@@ -209,10 +210,11 @@ def bears(run_dir: str, v: dict, cfg: dict, ctx: dict) -> Optional[str]:
 
 def _file_sha(run_dir: str, rel) -> Optional[str]:
     try:
-        with open(os.path.join(run_dir, str(rel)), "rb") as f:
-            return hashlib.sha256(f.read()).hexdigest()[:16]
-    except (OSError, TypeError):
+        path = os.path.join(run_dir, str(rel))
+    except TypeError:
         return None
+    h = sha256_file(path)
+    return h[:16] if h else None
 
 
 def _evidence_text(text) -> str:
