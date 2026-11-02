@@ -5,8 +5,8 @@
     python3 toolkit/engines/malaria/benchmarks/restamp_proof.py restamp      # only after a passing proof
     python3 toolkit/engines/malaria/benchmarks/restamp_proof.py --self-test
 
-v0.6 adds a delivery period and routine campaigns that act only when a horizon or a unit asks for them. The benchmark
-pack, the equilibration evidence and the guess-sensitivity evidence ask for neither. `prove` runs their inputs under
+v0.6 adds a delivery period and routine campaigns, and v0.7 routine SMC (smc_routine); each acts only when a horizon
+or a unit asks for it. The benchmark pack, the equilibration evidence and the guess-sensitivity evidence ask for none. `prove` runs their inputs under
 the old code (`git archive <old-ref>` into a temporary directory) and under the working tree, one process each, and
 compares every output exactly (per-capita outcomes, windows, cost drivers, meta without wall-clock seconds;
 initial-state dicts). It writes restamp_proof.yaml: the scope, the two engine identities, one sha256 per case and
@@ -21,7 +21,9 @@ EVIDENCE_CASES. The calibration-grid runs are not repeated: they are the same co
 equilibration.yaml and guess_sensitivity.yaml, and only when the stored proof is for the current code, says
 `identical: true`, and was produced by this script as committed (no uncommitted change). Each file then records
 `restamped: {by, proof, scope, old_identity, old_engine_version, proof_script_commit, note}`: re-stamped by the proof,
-not recomputed. A Coiled pack run confirms it afterwards (validate_once.sh).
+not recomputed. A file re-stamped before (v0.6) is re-stamped again: its earlier record is replaced by the new one,
+which keeps it under `previous`; a file already stamped for the new version is refused. A Coiled pack run confirms it
+afterwards (validate_once.sh).
 """
 from __future__ import annotations
 
@@ -177,6 +179,9 @@ def _record(doc: dict, proof: dict, script_commit: str) -> dict:
         rec["old_identity"] = dict(doc["engine_identity"])
     if "code_sha256" in doc:
         rec["old_code_sha256"] = doc["code_sha256"]   # kept as is: the code that computed the numbers
+    if isinstance(doc.get("restamped"), dict):        # v0.7: a file re-stamped before keeps the earlier record(s)
+        prev = dict(doc["restamped"])
+        rec["previous"] = [{k: v for k, v in prev.items() if k != "previous"}] + list(prev.get("previous") or [])
     return rec
 
 
@@ -212,6 +217,14 @@ def restamp_text(text: str, proof: dict, script_commit: str) -> str:
     restamp_doc (fail closed when they disagree)."""
     doc = yaml.safe_load(text) or {}
     ch = _changed(proof)
+    if "restamped" in doc:
+        # v0.7: an earlier record is the file's last top-level key (the previous re-stamp appended it); it is replaced
+        # by the new record, which keeps it under `previous` (fail closed when it is not last)
+        ls = text.splitlines(keepends=True)
+        at = [i for i, ln in enumerate(ls) if ln.startswith("restamped:")]
+        if len(at) != 1 or any(ln.strip() and not ln.startswith((" ", "-", "#")) for ln in ls[at[0] + 1:]):
+            raise ValueError("re-stamp: the earlier `restamped:` record is not the file's last top-level key")
+        text = "".join(ls[:at[0]])
     lines, in_id = text.splitlines(keepends=True), False
     for i, ln in enumerate(lines):
         if ln.startswith("engine_identity:"):
@@ -253,8 +266,9 @@ def restamp() -> int:
     for f in STAMPED:
         p = os.path.join(HERE, f)
         text = open(p).read()
-        if "restamped" in (yaml.safe_load(text) or {}):
-            print(f"refused: {f} is already re-stamped")
+        d = yaml.safe_load(text) or {}
+        if str(d.get("engine_version", (d.get("engine_identity") or {}).get("version"))) == str(proof["new"]["engine_version"]):
+            print(f"refused: {f} is already stamped for engine {proof['new']['engine_version']}")
             return 1
         texts[p] = restamp_text(text, proof, commit)
     for p, t in texts.items():

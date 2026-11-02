@@ -1,5 +1,5 @@
 name: malaria-starsim
-version: '0.6'
+version: '0.7'
 mechanisms:
 - 'Griffin-lite human natural history and immunity (fixed: Griffin et al. 2010 PLoS Med 10.1371/journal.pmed.1000324;
   2014 Nat Commun; 2015 Lancet Infect Dis)'
@@ -17,6 +17,7 @@ mechanisms:
 - SMC (28-day protection, clearance); case management (effective treatment)
 - 'delivery period distinct from the outcome window: components act and cost drivers count only in delivery years;
   routine net campaigns after the package''s campaign in every arm (v0.6)'
+- routine SMC in every arm after the delivery period, uncharged (v0.7)
 - expected severe episodes and deaths; DALYs from GBD 2019 weights and reference life table
 - microscopy prevalence by age band, including the ITN trials' own bands (under 5 from birth, under 10, 15 and under,
   all ages; Pryce 2018 characteristics of included studies)
@@ -52,6 +53,8 @@ unit_attributes:
   hist_net: net type of past campaigns (default pyr)
   itn_routine_interval: 'years between routine net campaigns after campaign_year: every arm, net type hist_net,
     never charged (default: none)'
+  smc_routine: '0 | 1: routine SMC every season from the delivery period''s end to the window''s end in the unit''s
+    SMC months: every arm, never charged; needs objective.delivery (default 0)'
 outputs:
   per_capita:
   - cases

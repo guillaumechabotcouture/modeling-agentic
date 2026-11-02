@@ -19,6 +19,7 @@ Unit attributes (UnitSpec.attributes):
   itn_hist_years  decimal years of past pyrethroid-net campaigns
   campaign_year   decimal year of the package's net campaign (in the delivery period)
   itn_routine_interval  optional (v0.6); years between routine net campaigns after campaign_year, in every arm
+  smc_routine     optional (v0.7); 0 | 1: routine SMC every season after the delivery period, in every arm
   smc_months      optional; default: rainfall-peak month -1 .. +2 (season is lagged one month)
   irs_month       optional; default: three months before the transmission peak
   irs_years       optional; decimal years of IRS rounds (default: every year of the delivery period)
@@ -47,6 +48,12 @@ case-management add-on act only in delivery years; with an explicit period, ever
 `itn_routine_interval` adds routine net campaigns at campaign_year + k x interval before the window's end, in every
 package including the comparator, with net type hist_net and never charged. Without either, a run is byte-identical
 to v0.5 (self-test D9; benchmarks/restamp_proof.py).
+
+v0.7: `smc_routine` (0 | 1, default 0) runs routine SMC rounds in the unit's SMC months in every season from the
+delivery period's end to the outcome window's end, in every package including the comparator, never charged. It
+needs an explicit delivery period (fail closed). With package SMC as well, the package's delivery seasons and the
+routine seasons must form one continuous season sequence (smc_schedule_problems). With the attribute absent or 0,
+a run is byte-identical to v0.6 (self-test R7; benchmarks/restamp_proof.py).
 """
 from __future__ import annotations
 
@@ -75,7 +82,7 @@ RESULTS = os.path.join(HERE, "benchmarks", "results.yaml")
 AGES = ["u5", "5_14", "15p"]
 GRIFFIN = "Griffin et al. 2010 PLoS Med 10.1371/journal.pmed.1000324; 2014 Nat Commun; 2015 Lancet Infect Dis"
 A8 = "E7 attempt 8 value (models/malaria_abm.py VC), kept"
-VERSION = "0.6"
+VERSION = "0.7"
 BV = "Bertozzi-Villa et al. 2021 Nat Commun 10.1038/s41467-021-23707-7 (PMC8196080)"
 
 # name, value, kind, units, lo, hi, source, verified
@@ -169,6 +176,33 @@ def default_smc_months(season):
     return tuple(((rain_peak - 2 + k) % 12) + 1 for k in range(4))
 
 
+def smc_schedule_problems(pkg_rounds, routine_rounds, months, d0, d1, w1) -> list:
+    """v0.7: problems with the SMC rounds of one arm, the package's (in the delivery period [d0, d1)) and the routine
+    programme's (in [d1, w1)), as decimal times. Together they must be one continuous season sequence in `months`: no
+    round given twice, no season missing between the first round and the window's end, no routine round inside the
+    delivery period."""
+    key = lambda t: round(float(t) * 12)         # noqa: E731 -- a round's month index (rounds are month starts)
+    bad = []
+    inside = [round(t, 3) for t in routine_rounds if d0 <= t < d1]
+    if inside:
+        bad.append(f"routine SMC round(s) at {inside[:4]} inside the delivery period [{d0:g}, {d1:g}): the decision "
+                   "funds those seasons (smc_routine)")
+    allr = [key(t) for t in list(pkg_rounds) + list(routine_rounds)]
+    dup = sorted({k for k in allr if allr.count(k) > 1})
+    if dup:
+        bad.append(f"SMC round(s) at {[round(k / 12, 3) for k in dup[:4]]} given twice (package and routine SMC)")
+    if allr:
+        first = min(allr)
+        y0 = first // 12
+        want = {k for y in range(y0, int(np.ceil(w1)) + 1) for m in months
+                for k in [y * 12 + (int(m) - 1)] if first <= k and k / 12 < w1}
+        miss = sorted(want - set(allr))
+        if miss:
+            bad.append(f"SMC season(s) missing at {[round(k / 12, 3) for k in miss[:4]]} between the package's SMC and "
+                       "routine SMC (smc_routine)")
+    return bad
+
+
 class MalariaEngine:
     def __init__(self, fitted_path: str = FITTED, results_path: str = RESULTS):
         self.fitted = (yaml.safe_load(open(fitted_path)) or {}).get("parameters", {}) if os.path.exists(fitted_path) else {}
@@ -207,6 +241,7 @@ class MalariaEngine:
                 "SMC (28-day protection, clearance); case management (effective treatment)",
                 "delivery period distinct from the outcome window: components act and cost drivers count only in "
                 "delivery years; routine net campaigns after the package's campaign in every arm (v0.6)",
+                "routine SMC in every arm after the delivery period, uncharged (v0.7)",
                 "expected severe episodes and deaths; DALYs from GBD 2019 weights and reference life table",
                 "microscopy prevalence by age band, including the ITN trials' own bands (under 5 from birth, under 10, "
                 "15 and under, all ages; Pryce 2018 characteristics of included studies)"],
@@ -221,7 +256,9 @@ class MalariaEngine:
                 "itn_use_at": "years after distribution at which itn_use was measured (default 0)",
                 "hist_net": "net type of past campaigns (default pyr)",
                 "itn_routine_interval": "years between routine net campaigns after campaign_year: every arm, net type "
-                                        "hist_net, never charged (default: none)"},
+                                        "hist_net, never charged (default: none)",
+                "smc_routine": "0 | 1: routine SMC every season from the delivery period's end to the window's end in "
+                               "the unit's SMC months: every arm, never charged; needs objective.delivery (default 0)"},
             outputs={"per_capita": ["cases", "severe", "deaths", "treated", "dalys"],
                      "windows": list(M.PFPR_BANDS) + ["inc_u5", "inc_all", "inc_u5_smc", "eir_annual",
                                                       "net_use", "net_access"],
@@ -274,6 +311,33 @@ class MalariaEngine:
                              "the decision funds those years (itn_routine_interval)")
         return out
 
+    @staticmethod
+    def _smc_routine(a: dict, horizon: Horizon) -> dict | None:
+        """v0.7: the routine SMC programme of a unit with smc_routine = 1: every season in the unit's SMC months from
+        the delivery period's end to the outcome window's end, in every arm, never charged. None when the attribute
+        is absent or 0 (the v0.6 sim). Needs an explicit delivery period (fail closed)."""
+        v = a.get("smc_routine")
+        if v is None:
+            return None
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            f = float("nan")
+        if isinstance(v, bool) or f not in (0.0, 1.0):
+            raise ValueError(f"smc_routine must be 0 or 1 (got {v!r})")
+        if f == 0.0:
+            return None
+        if not explicit_delivery(horizon):
+            raise ValueError("smc_routine = 1 needs a delivery period (objective.delivery): routine SMC runs after the "
+                             "delivery period ends, and without one the package's SMC covers the whole window")
+        d0, d1 = delivery_period(horizon)
+        w1 = float(horizon.window[1])
+        season = np.asarray(a.get("season", [1.0] * 12), float)
+        months = tuple(a.get("smc_months") or default_smc_months(season))
+        years = list(range(int(np.floor(d1)), int(np.ceil(w1)) + 1))
+        return {"years": years, "months": months, "after": float(d1), "before": w1,
+                "rounds": [t for t in (y + (m - 1) / 12 for y in years for m in months) if d1 <= t < w1]}
+
     def _plan(self, P: dict, a: dict, components: dict, horizon: Horizon) -> dict:
         """The package's component settings and the decimal years at which they first act. v0.6: components act in
         the delivery period (the decision window unless horizon.delivery is given)."""
@@ -311,6 +375,12 @@ class MalariaEngine:
             if out:
                 raise ValueError(f"outside the delivery period [{d0:g}, {d1:g}): {', '.join(out[:4])}")
         self._routine_years(a, horizon)              # validated here, before any sim is built
+        rs = self._smc_routine(a, horizon)           # v0.7: and routine SMC with the package's own rounds
+        if rs is not None:
+            pkg = [t for c, t in timed if c == "SMC round"]
+            bad = smc_schedule_problems(pkg, rs["rounds"], rs["months"], d0, d1, float(horizon.window[1]))
+            if bad:
+                raise ValueError("; ".join(bad))
         return cfg
 
     @staticmethod
@@ -354,6 +424,10 @@ class MalariaEngine:
         itv += [M.ITNCampaign(years=[], use=use, net_type="pyr", count=True, name="itn_new"),
                 M.SMCDelivery(years=[], pe=P["smc_pe"], hi_frac=P["smc_hi_frac"], name="smc"),
                 M.IRSRound(years=[], coverage=P["irs_coverage"], name="irs")]
+        rs = self._smc_routine(a, horizon)
+        if rs is not None:     # v0.7: built only when set, last, so a unit without it gets the v0.6 sim exactly
+            itv.append(M.SMCDelivery(years=rs["years"], months=rs["months"], pe=P["smc_pe"], hi_frac=P["smc_hi_frac"],
+                                     count=False, after=rs["after"], before=rs["before"], name="smc_routine"))
         if cfg is not None:
             self._configure({i.name: i for i in itv}, None, P, cfg)
         sim = ss.Sim(people=_people(n0), start=float(horizon.start) - B, stop=float(horizon.stop),
@@ -374,6 +448,8 @@ class MalariaEngine:
         if cfg["smc"]:
             smc.months = list(cfg["smc"]["months"])
         smc.pe, smc.hi_frac = P["smc_pe"], P["smc_hi_frac"]
+        if "smc_routine" in itv:   # v0.7: routine rounds act after the fork, with the member's own SMC parameters
+            itv["smc_routine"].pe, itv["smc_routine"].hi_frac = P["smc_pe"], P["smc_hi_frac"]
         irs.years = list(cfg["irs"]["years"]) if cfg["irs"] else []
         if cfg["irs"]:
             irs.month = int(cfg["irs"]["month"])
@@ -924,7 +1000,7 @@ def _self_test_v07(ok, e, unit) -> None:
             r = itv["smc_routine"]
             ok(np.allclose(sorted(r.targets()), want) and itv["smc"].years == own and r.count is False
                and list(r.months) == list(months),
-               f"R1 ({pkg.name}) routine SMC rounds in every season after the delivery period, in the unit's SMC months, "
+               f"R1 ({pkg.id}) routine SMC rounds in every season after the delivery period, in the unit's SMC months, "
                f"uncounted; the package's own SMC only in delivery seasons: {sorted(r.targets())}, {itv['smc'].years}")
         sim, _ = e.build_sim(base, UnitSpec("t", dict(attrs, smc_routine=0)), full, hd, 3)
         sim.init()
