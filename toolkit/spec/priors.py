@@ -430,6 +430,34 @@ def _self_test() -> int:
                f"PR18 the malaria priors file is complete and consistent with the engine: {mc['problems'][:3]}")
         except ImportError as e:
             ok(False, f"PR18 the malaria engine imports: {e}")
+    # DI9 (docs/design/v2-derived-inputs.md §3.4): priors target engine parameters only.
+    with tempfile.TemporaryDirectory() as d:
+        s0 = schema.load(schema.toy_spec(d))
+
+        def errs_of(mut):
+            r = copy.deepcopy(s0.raw)
+            r["decision_units"]["engine_attributes"] = {"group": {"column": "grp"}}
+            mut(r)
+            return schema.validate(schema.Spec(r, d))
+        rng = {"dist": "uniform", "range": [0.0, 1.0], "source": "a survey"}
+        e = errs_of(lambda r: r["uncertainty"].update(priors={"group": rng}))
+        ok(any(x.startswith("prior_target_not_parameter") and "group" in x for x in e),
+           f"DI9a a prior in uncertainty.priors on a data-bound unit attribute gives prior_target_not_parameter: {e[:2]}")
+        e = errs_of(lambda r: r["uncertainty"].update(priors={"synergy": {"dist": "uniform", "range": [-0.5, 0.5],
+                                                                          "source": "a trial"}}))
+        ok(not any(x.startswith("prior_target_not_parameter") for x in e),
+           f"DI9b a prior on an engine (scenario) parameter passes: {e[:2]}")
+        post = {"method": "posterior", "attribute": "x", "range": [-2, 2], "parameters": [], "scale": "linear",
+                "targets": {"csv": "units.csv", "unit": "id", "start": "id", "package": "id", "observed": "tgt",
+                            "exposure": "pop", "period": 1},
+                "priors": {"x": {"dist": "uniform", "range": [-2, 2], "source": "a latent intensity, wide"},
+                           "group": rng},
+                "observation": {"model": "poisson"}}
+        e = errs_of(lambda r: (r.update(calibration=post), r["analysis"].update(evaluation="direct")))
+        ok(any(x.startswith("prior_target_not_parameter") and "group" in x for x in e)
+           and not any(x.startswith("prior_target_not_parameter") and " x " in f" {x} " for x in e),
+           f"DI9c a calibration.priors entry on a data-bound attribute is refused; the posterior's latent quantity "
+           f"with a declared observation model passes: {[x for x in e if 'prior_target' in x][:3]}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

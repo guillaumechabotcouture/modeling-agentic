@@ -139,6 +139,33 @@ def _self_test() -> int:
                f"SG10 a spec with engine: auto can be signed before the engine is chosen ({st0})")
         except ValueError as e:
             ok(False, f"SG10 a spec with engine: auto can be signed before the engine is chosen: {e}")
+    # DI6, DI7, DI10 (docs/design/v2-derived-inputs.md): the sign-off freezes the derivation record, and the sheet
+    # shows the owner the accepted defaults and the columns the run chose not to use.
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            schema.derived_toy_spec(d)
+            rec = sign(d, "owner")
+            ok(rec["sha256"].get(DERIVATIONS_RECORD) and status(d) == "signed",
+               f"DI6c the sign-off freezes the derivation record's hash next to the spec's: {sorted(rec['sha256'])}")
+            out = os.path.join(d, "data", "derived", "units.csv")
+            with open(out, "a") as f:
+                f.write("99,r0,g0,0,1000,0,0.1,x\n")
+            ok(status(d) == "changed", f"DI6d an edit of a derived file after sign-off breaks the sign-off: {status(d)}")
+        with tempfile.TemporaryDirectory() as d:
+            schema.derived_toy_spec(d)
+            import yaml as _y
+            dp = os.path.join(d, "data", "derivations.yaml")
+            doc = _y.safe_load(open(dp))
+            doc["derivations"][0]["columns"]["ignores"] = {"data/inputs/units_raw.csv": {"elig": "not used by the toy"}}
+            doc["derivations"][0]["columns"]["uses"]["data/inputs/units_raw.csv"].remove("elig")
+            _y.safe_dump(doc, open(dp, "w"))
+            md = sheet(d)
+            ok("group" in md and "the toy units carry no group label" in md and "no group label" in md,
+               f"DI7f the sign-off sheet lists each accepted default with its card meaning and the spec's reason")
+            ok("elig" in md and "not used by the toy" in md and "units_raw.csv" in md,
+               "DI10c the sign-off sheet lists the ignored columns per input")
+    except Exception as e:  # noqa: BLE001 -- before the record and the sheet exist (step α) this is the failure
+        ok(False, f"DI6/DI7/DI10 sign-off: {type(e).__name__}: {e}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

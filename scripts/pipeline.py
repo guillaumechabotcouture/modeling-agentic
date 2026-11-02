@@ -1742,6 +1742,11 @@ def _self_test() -> int:
             rep = harness_build(d, ig)
             ok(rep["errors"] and not ig.open_events,
                f"PO13 (review) an invalid pipeline's report is written inside the harness grant: {ig.open_events}")
+    try:
+        _self_test_derivations(ok)
+    except Exception as e:  # noqa: BLE001 -- before the runner exists (step α) this is the failure
+        print(f"FAIL DI derivation tests: {type(e).__name__}: {e}")
+        ok(False, f"DI derivation tests: {type(e).__name__}: {e}")
     if fails:
         print("SELF-TEST FAILURES:")
         for f in fails:
@@ -1749,6 +1754,195 @@ def _self_test() -> int:
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+_DI_GOOD = '''import argparse
+import csv
+ap = argparse.ArgumentParser()
+ap.add_argument("--inputs", nargs="+")
+ap.add_argument("--outputs", nargs="+")
+a = ap.parse_args()
+rows = list(csv.DictReader(open(a.inputs[0], newline="")))
+with open(a.outputs[0], "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow(["id", "x", "pop"])
+    for r in rows:
+        w.writerow([r["id"], round(float(r["a"]) - float(r["b"]), 6), r["pop"]])
+{extra}
+'''
+
+
+def di_fixture(d: str, extra: str = "", uses=("id", "a", "b", "pop"), ignores=None, n: int = 6) -> str:
+    """A run directory with one staged input (recorded in the provenance, as stage_inputs does), one derivation
+    script and its declaration. `extra` is appended to the script (a planted defect); `ignores`: {column: reason}."""
+    import yaml
+    os.makedirs(os.path.join(d, "data", "inputs"), exist_ok=True)
+    os.makedirs(os.path.join(d, "data", "derive"), exist_ok=True)
+    raw = os.path.join(d, "data", "inputs", "raw.csv")
+    with open(raw, "w") as f:
+        f.write("id,a,b,c,pop\n" + "".join(f"u{i},{i * 0.5:.2f},{i * 0.1:.2f},{i % 3},{1000 + i}\n" for i in range(n)))
+    with open(os.path.join(d, "data", "inputs_provenance.json"), "w") as f:
+        json.dump({"inputs": {"data/inputs/raw.csv": {"source": "fixture/raw.csv", "sha256": _sha(raw)}}, "cited": {}}, f)
+    with open(os.path.join(d, "data", "derive", "units.py"), "w") as f:
+        f.write(_DI_GOOD.replace("{extra}", extra))
+    cols = {"uses": {"data/inputs/raw.csv": list(uses)},
+            "ignores": {"data/inputs/raw.csv": dict({"c": "a label the units table does not need"} if ignores is None
+                                                    else ignores)}}
+    with open(os.path.join(d, DERIVATIONS), "w") as f:
+        yaml.safe_dump({"derivations": [{"id": "units", "script": "data/derive/units.py",
+                                         "inputs": ["data/inputs/raw.csv"], "outputs": ["data/derived/units.csv"],
+                                         "columns": cols}]}, f, sort_keys=False)
+    return d
+
+
+def _self_test_derivations(ok) -> None:
+    """DI2-DI6, DI10, DI13 and the fail-closed path (docs/design/v2-derived-inputs.md §4). DI2-DI5 need the Linux
+    sandbox; without one they are reported SKIP, or FAIL when MA_REQUIRE_SANDBOX=1 (the VM run)."""
+    def rep(c, m):
+        print(("PASS " if c else "FAIL ") + m)
+        ok(c, m)
+
+    def codes(r):
+        return [p.get("code") for p in (r or {}).get("problems") or []]
+
+    try:
+        kind = sandbox_kind()
+    except Exception as e:  # noqa: BLE001 -- the tests below report what is missing
+        kind = None
+        rep(False, f"DI0 sandbox_kind() is callable: {type(e).__name__}: {e}")
+    need = os.environ.get("MA_REQUIRE_SANDBOX") == "1"
+    # The fail-closed path (owner decision 1): no sandbox, no run, unless the development flag is given.
+    if kind is None:
+        with tempfile.TemporaryDirectory() as d:
+            d = os.path.realpath(di_fixture(d))
+            try:
+                r = derive(d)
+                rep("derivation_unsandboxed" in codes(r) and not os.path.exists(os.path.join(d, "data/derived/units.csv")),
+                    f"DI-U1 no sandbox on {sys.platform}: derivations fail closed (derivation_unsandboxed) {codes(r)}")
+                r = derive(d, unsandboxed_ok=True)
+                recd = json.load(open(os.path.join(d, DERIVATIONS_RECORD)))
+                kinds = [f["kind"] for f in derivation_findings(d)]
+                sev = {f["kind"]: (f["severity"], f["scope_declarable"]) for f in derivation_findings(d)}
+                rep(r["ok"] and recd["derivations"]["units"]["sandbox"]["kind"] == "none" and "derivation_unsandboxed" in kinds
+                    and sev["derivation_unsandboxed"] == ("HIGH", False),
+                    f"DI-U2 the development flag runs them, records sandbox none, and leaves a HIGH non-declarable "
+                    f"finding (no ACCEPT): {codes(r)} {sev}")
+            except Exception as e:  # noqa: BLE001
+                rep(False, f"DI-U1/U2 fail-closed path: {type(e).__name__}: {e}")
+    sandboxed = kind is not None
+    if not sandboxed:
+        msg = f"no sandbox on this machine ({sys.platform})"
+        for t in ("DI2 a socket fails inside the sandbox", "DI3 writes to an input or outside the output directory fail",
+                  "DI4 memory, CPU and file-size caps"):
+            if need:
+                rep(False, f"{t}: {msg} (MA_REQUIRE_SANDBOX=1)")
+            else:
+                print(f"SKIP {t}: {msg}")
+    else:
+        lim = {"wall_s": 120}
+        with tempfile.TemporaryDirectory() as d:
+            d = os.path.realpath(di_fixture(d, extra="import socket\nsocket.create_connection(('1.1.1.1', 53), timeout=5)"))
+            r = derive(d, limits=lim)
+            e = json.load(open(os.path.join(d, DERIVATIONS_RECORD)))["derivations"]["units"]
+            rep(codes(r) == ["derivation_failed"] and not e["ok"] and "unreachable" in (e["reason"] + e["stderr_tail"]).lower(),
+                f"DI2 a derivation that opens a socket fails in the sandbox, the reason recorded: {codes(r)} "
+                f"{(e['reason'] + ' | ' + e['stderr_tail'][-160:])!r}")
+        for label, extra in (("an input", "open(a.inputs[0], 'a').write('x')"),
+                             ("outside its output directory", "open('/tmp/di3_escape.txt', 'w').write('x')"),
+                             ("into the run directory", "open({run!r} + '/data/units.csv', 'w').write('x')"),
+                             ("an undeclared output", "open('data/derived/extra.csv', 'w').write('x')")):
+            with tempfile.TemporaryDirectory() as d:
+                d = os.path.realpath(d)
+                di_fixture(d, extra=extra.replace("{run!r}", repr(d)))
+                before = _sha(os.path.join(d, "data/inputs/raw.csv"))
+                r = derive(d, limits=lim)
+                rep(codes(r) == ["derivation_failed"] and _sha(os.path.join(d, "data/inputs/raw.csv")) == before
+                    and not os.path.exists(os.path.join(d, "data/units.csv")) and not os.path.exists("/tmp/di3_escape.txt")
+                    and not os.path.exists(os.path.join(d, "data/derived/units.csv")),
+                    f"DI3 a derivation that writes {label} fails and the input's hash is unchanged: {codes(r)}")
+        for cap, extra, lim2 in (("memory_bytes", "b = bytearray(3 << 30)", {"memory_bytes": 768 << 20}),
+                                 ("cpu_s", "while True:\n    pass", {"cpu_s": 2}),
+                                 ("file_bytes", "open(a.outputs[0], 'w').write('x' * (8 << 20))", {"file_bytes": 1 << 20})):
+            with tempfile.TemporaryDirectory() as d:
+                d = os.path.realpath(di_fixture(d, extra=extra))
+                r = derive(d, limits=dict(lim, **lim2))
+                e = json.load(open(os.path.join(d, DERIVATIONS_RECORD)))["derivations"]["units"]
+                rep(codes(r) == ["derivation_failed"] and e.get("cap") == cap and cap in e["reason"],
+                    f"DI4 the {cap} cap kills a derivation and the record names it: {codes(r)} cap={e.get('cap')} "
+                    f"{e['reason'][:120]!r}")
+    flag = not sandboxed          # DI5, DI6 and DI10 run everywhere: unsandboxed (flag) where there is no sandbox
+    for label, extra in (("an unseeded random", "import random\nopen(a.outputs[0], 'a').write(str(random.random()))"),
+                         ("a time-dependent", "import time\nopen(a.outputs[0], 'a').write(str(time.time_ns()))")):
+        with tempfile.TemporaryDirectory() as d:
+            d = os.path.realpath(di_fixture(d, extra=extra))
+            try:
+                r = derive(d, unsandboxed_ok=flag)
+                rep(codes(r) == ["derivation_nondeterministic"] and not os.path.exists(os.path.join(d, "data/derived/units.csv")),
+                    f"DI5 {label} derivation gives derivation_nondeterministic: {codes(r)}")
+            except Exception as e:  # noqa: BLE001
+                rep(False, f"DI5 {label} derivation: {type(e).__name__}: {e}")
+    with tempfile.TemporaryDirectory() as d:
+        d = os.path.realpath(di_fixture(d))
+        try:
+            r = derive(d, unsandboxed_ok=flag)
+            out = os.path.join(d, "data/derived/units.csv")
+            clean = [p["code"] for p in derivation_problems(d)]
+            rep(r["ok"] and os.path.exists(out) and clean == [] and r["ran"] == ["units"],
+                f"DI6a a correct derivation runs (twice) and its outputs are current: {codes(r)} {clean}")
+            r2 = derive(d, unsandboxed_ok=flag)
+            rep(r2["ok"] and r2["ran"] == [] and r2["up_to_date"] == ["units"],
+                f"DI6b nothing changed: nothing re-runs ({r2['ran']})")
+            for what, path, txt in (("its output", "data/derived/units.csv", "id,x,pop\nu0,9,9\n"),
+                                    ("its script", "data/derive/units.py", None),
+                                    ("an input", "data/inputs/raw.csv", None)):
+                p = os.path.join(d, path)
+                orig = open(p).read()
+                open(p, "w").write(txt if txt is not None else orig + "\n# edited\n")
+                got = [x["code"] for x in derivation_problems(d)]
+                if path == "data/inputs/raw.csv":
+                    open(p, "w").write(orig)            # restore the staged input (its provenance hash)
+                    with open(os.path.join(d, "data/derive/units.py"), "a") as f:
+                        f.write("")
+                r3 = derive(d, unsandboxed_ok=flag)
+                after = [x["code"] for x in derivation_problems(d)]
+                rep("derivation_stale" in got and r3["ok"] and after == [],
+                    f"DI6 editing {what} gives derivation_stale and re-running clears it: {got} -> {after}")
+        except Exception as e:  # noqa: BLE001
+            rep(False, f"DI6 staleness: {type(e).__name__}: {e}")
+    with tempfile.TemporaryDirectory() as d:
+        d = os.path.realpath(di_fixture(d, ignores={}))
+        try:
+            got = [p["code"] for p in derivation_problems(d)]
+            rep("input_column_unaccounted" in got and any("c" in p["claim"] for p in derivation_problems(d)),
+                f"DI10a an input column neither used nor ignored gives input_column_unaccounted: {got}")
+        except Exception as e:  # noqa: BLE001
+            rep(False, f"DI10a column accounting: {type(e).__name__}: {e}")
+    with tempfile.TemporaryDirectory() as d:
+        d = os.path.realpath(di_fixture(d, uses=("id", "a", "pop"), ignores={"b": "said to be unused", "c": "label"}))
+        try:
+            r = derive(d, unsandboxed_ok=flag)
+            rep(codes(r) == ["ignored_column_used"], f"DI10b an ignored column whose removal changes the output gives "
+                                                     f"ignored_column_used: {codes(r)}")
+        except Exception as e:  # noqa: BLE001
+            rep(False, f"DI10b ignored column used: {type(e).__name__}: {e}")
+    with tempfile.TemporaryDirectory() as d:
+        d = os.path.realpath(di_fixture(d, extra="import scipy"))
+        try:
+            r = derive(d, unsandboxed_ok=flag)
+            e = json.load(open(os.path.join(d, DERIVATIONS_RECORD)))["derivations"]["units"]
+            rep(codes(r) == ["derivation_failed"] and "scipy" in e["reason"],
+                f"DI2b an import outside the allowlist (standard library, numpy, pandas, pyyaml) is refused before the run: "
+                f"{codes(r)} {e['reason'][:100]!r}")
+        except Exception as e:  # noqa: BLE001
+            rep(False, f"DI2b import allowlist: {type(e).__name__}: {e}")
+    # DI13: the new harness code and its messages name no disease, place or intervention (CLAUDE.md convention).
+    try:
+        src = open(os.path.abspath(__file__), encoding="utf-8").read()
+        a, b = src.index("# ---- derivations (v2-derived-inputs)"), src.index("# ---- end of derivations")
+        rep(not domain_terms(src[a:b]), f"DI13 the derivation runner names no disease, place or intervention: "
+                                         f"{domain_terms(src[a:b])}")
+    except Exception as e:  # noqa: BLE001
+        rep(False, f"DI13 domain terms: {type(e).__name__}: {e}")
 
 
 def main(argv=None) -> int:

@@ -1033,11 +1033,132 @@ def _self_test() -> int:
         s = load(p)
         ok(s["engine"] == toy and getattr(s, "engine_choice_path", None) is None,
            "SP28 an explicit engine in the signed spec wins; engine_choice.json is ignored")
+    try:
+        _self_test_derived(ok)
+    except Exception as e:  # noqa: BLE001 -- before the checks exist (step α) this is the failure
+        ok(False, f"DI spec checks: {type(e).__name__}: {e}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+TOY_DERIVE_SCRIPT = ("import argparse\nimport csv\nap = argparse.ArgumentParser()\nap.add_argument('--inputs', nargs='+')\n"
+                     "ap.add_argument('--outputs', nargs='+')\na = ap.parse_args()\n"
+                     "rows = list(csv.DictReader(open(a.inputs[0], newline='')))\n"
+                     "with open(a.outputs[0], 'w', newline='') as f:\n"
+                     "    w = csv.DictWriter(f, fieldnames=list(rows[0]) + ['lbl'])\n    w.writeheader()\n"
+                     "    for i, r in enumerate(rows):\n        w.writerow(dict(r, lbl='' if i == 0 else 'u' + r['id']))\n")
+
+
+def derived_toy_spec(d: str, n: int = 12, **kw) -> str:
+    """toy_spec with its units table made by a recorded derivation (docs/design/v2-derived-inputs.md): the table is a
+    staged input (as stage_inputs records it), a copying script derives data/derived/units.csv (adding a column `lbl`
+    blank in one row), and the spec accepts the toy's one default by name and declares its target's frame. Where
+    there is no sandbox the derivation runs with the development flag (the record says sandbox none)."""
+    import pipeline as P
+    p = toy_spec(d, n=n, **kw)
+    os.makedirs(os.path.join(d, "data", "inputs"), exist_ok=True)
+    os.makedirs(os.path.join(d, "data", "derive"), exist_ok=True)
+    raw = os.path.join(d, "data", "inputs", "units_raw.csv")
+    os.replace(os.path.join(d, "units.csv"), raw)
+    with open(raw, newline="") as f:
+        cols = next(csv.reader(f))
+    with open(os.path.join(d, "data", "inputs_provenance.json"), "w") as f:
+        json.dump({"inputs": {"data/inputs/units_raw.csv": {"source": "fixture/units_raw.csv", "sha256": sha256_file(raw)}},
+                   "cited": {}}, f)
+    with open(os.path.join(d, "data", "derive", "units.py"), "w") as f:
+        f.write(TOY_DERIVE_SCRIPT)
+    with open(os.path.join(d, "data", "derivations.yaml"), "w") as f:
+        yaml.safe_dump({"derivations": [{"id": "units", "script": "data/derive/units.py",
+                                         "inputs": ["data/inputs/units_raw.csv"], "outputs": ["data/derived/units.csv"],
+                                         "columns": {"uses": {"data/inputs/units_raw.csv": cols}}}]}, f, sort_keys=False)
+    raw_spec = yaml.safe_load(open(p))
+    raw_spec["decision_units"]["csv"] = "data/derived/units.csv"
+    raw_spec["decision_units"]["defaults_accepted"] = {"group": "the toy units carry no group label"}
+    raw_spec["calibration"]["target_frame"] = {"band": "prev", "source": "the toy target measures the engine's own "
+                                                                         "window metric"}
+    with open(p, "w") as f:
+        yaml.safe_dump(raw_spec, f, sort_keys=False)
+    rep = P.derive(d, unsandboxed_ok=P.sandbox_kind() is None)
+    if not rep["ok"]:
+        raise RuntimeError(f"derived_toy_spec: the fixture's derivation failed: {rep['problems']}")
+    return p
+
+
+def _self_test_derived(ok) -> None:
+    """DI1, DI7, DI11, DI12 and DI13 (docs/design/v2-derived-inputs.md §4)."""
+    import tempfile
+    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+
+    def has(errs, code, needle=""):
+        return any(e.startswith(code) and needle in e for e in errs)
+
+    with tempfile.TemporaryDirectory() as d:          # DI1: the units table written by the task, not derived
+        p = toy_spec(d)
+        errs = validate(load(p), derived=True)
+        ok(has(errs, "units_not_derived"), f"DI1 a units table written by the task (no derivation) gives "
+                                           f"units_not_derived: {errs[:3]}")
+        ok(validate(load(p)) == [], "DI12a the same spec outside a v2 machine run (no derivation declared) validates "
+                                    "unchanged")
+    with tempfile.TemporaryDirectory() as d:
+        p = derived_toy_spec(d)
+        s = load(p)
+        ok(validate(s) == [], f"DI7a the derived toy spec (one default accepted by name) validates: {validate(s)[:3]}")
+
+        def errs_of(mut):
+            r = copy.deepcopy(s.raw)
+            mut(r)
+            return validate(Spec(r, d, p))
+        e = errs_of(lambda r: r["decision_units"].pop("defaults_accepted"))
+        ok(has(e, "engine_attribute_unbound", "group"), f"DI7b an attribute with a card default, neither bound nor "
+                                                         f"accepted, gives engine_attribute_unbound: {e[:3]}")
+        e = errs_of(lambda r: r["calibration"].update(attribute="group"))
+        ok(has(e, "engine_attribute_unbound", "x"), f"DI7c a required attribute left unbound gives "
+                                                     f"engine_attribute_unbound: {e[:3]}")
+        e = errs_of(lambda r: (r["calibration"].update(attribute="group"),
+                               r["decision_units"]["defaults_accepted"].update(x="accept the engine's value")))
+        ok(has(e, "engine_attribute_unbound", "x"), f"DI7d a required attribute cannot be accepted as a default: {e[:3]}")
+        e = errs_of(lambda r: r["decision_units"]["engine_attributes"].update(group={"column": "lbl"}))
+        ok(has(e, "attribute_column_empty", "lbl"), f"DI7e a bound column blank in a row gives attribute_column_empty: "
+                                                     f"{e[:3]}")
+        e = errs_of(lambda r: r["calibration"].update(target_frame={"band": "prev_young", "source": "a survey"}))
+        ok(has(e, "target_frame_unmapped", "prev_young"), f"DI11a a target whose frame band differs from the engine "
+                                                           f"output's, with no mapping, gives target_frame_unmapped: {e[:3]}")
+        e = errs_of(lambda r: r["calibration"].update(target_frame={
+            "band": "prev_young", "source": "a survey",
+            "mapping": {"to": "prev", "method": "age-band conversion", "source": "a published conversion"}}))
+        ok(not has(e, "target_frame_unmapped"), f"DI11b with a declared mapping it passes: {e[:3]}")
+        e = errs_of(lambda r: r["calibration"].pop("target_frame"))
+        ok(has(e, "target_frame_unmapped"), f"DI11c a target with no declared frame gives target_frame_unmapped: {e[:3]}")
+        os.remove(os.path.join(d, "data", "derivations.yaml"))
+        e = validate(load(p), derived=True)
+        ok(has(e, "units_not_derived") or has(e, "data_ref_not_derived"),
+           f"DI1b a spec citing data/derived/ with no declaration is refused: {e[:3]}")
+    # DI12: contract.py and the engines' code are unchanged (the fingerprints still match the benchmark stamps).
+    from toolkit.engines.contract import code_fingerprint
+    for mod, cls, res in (("toolkit.engines.malaria.engine", "MalariaEngine", "toolkit/engines/malaria/benchmarks/results.yaml"),
+                          ("toolkit.engines.compartmental.engine", "CompartmentalEngine",
+                           "toolkit/engines/compartmental/benchmarks/results.yaml")):
+        try:
+            klass = getattr(importlib.import_module(mod), cls)
+            stamp = (yaml.safe_load(open(os.path.join(ROOT, res))) or {})["engine_identity"]["code_sha256"]
+            ok(code_fingerprint(klass.__new__(klass)) == stamp,
+               f"DI12b {cls}: the engine code fingerprint (with contract.py) still matches its benchmark stamp")
+        except ImportError as e:
+            print(f"SKIP DI12b {cls}: {e}")
+    try:
+        import pipeline as P
+        src = "".join(inspect_source(f) for f in (attribute_problems, frame_problems, load_binding))
+        ok(not P.domain_terms(src), f"DI13 the spec checks name no disease, place or intervention: {P.domain_terms(src)}")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"DI13 spec checks: {type(e).__name__}: {e}")
+
+
+def inspect_source(fn) -> str:
+    import inspect
+    return inspect.getsource(fn)
 
 
 def main(argv=None) -> int:
