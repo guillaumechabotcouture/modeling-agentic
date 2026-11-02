@@ -2788,11 +2788,48 @@ def _self_test() -> int:
     _self_test_p42(ok)
     _self_test_p45d(ok)
     _self_test_sched(ok)
+    try:
+        _self_test_wall(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"SW: {type(e).__name__}: {e}")
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_wall(ok) -> None:
+    """SW1-SW5 (Nigeria v2 full run, 2026-11-02): the engine batch step's wall-clock limit, and the partial rows of a
+    batch killed in a pipeline step staying reusable after the runner records the failure."""
+    import tempfile
+    cl = {"MA_COMPUTE_RESOURCE": "compute", "MA_COMPUTE_TARGET_WORKERS": "8", "MA_COMPUTE_MAX_CORE_HOURS": "150"}
+    ok(step_wall_s({}) is None and step_wall_s({"MA_COMPUTE_MAX_CORE_HOURS": "150"}) is None,
+       "SW1 without a cluster there is no derived limit (the runner's default applies)")
+    ok(step_wall_s(cl) == 20475 and step_wall_s(dict(cl, MA_COMPUTE_PROCS_PER_WORKER="4")) == 2 * 150 * 3600 / 32 + 3600,
+       f"SW2 the run cap on the target pool, twice, plus an hour: {step_wall_s(cl)}")
+    ok(step_wall_s(dict(cl, MA_COMPUTE_TARGET_WORKERS="")) == 2 * 150 * 3600 / 8 + 3600 > step_wall_s(cl)
+       and step_wall_s(dict(cl, MA_COMPUTE_MAX_CORE_HOURS="1e6")) == 24 * 3600,
+       "SW3 an unknown pool counts as one worker; the limit has a 24-h ceiling")
+    bad = []
+    for k, v in (("MA_COMPUTE_MAX_CORE_HOURS", "lots"), ("MA_COMPUTE_MAX_CORE_HOURS", "-1"), ("MA_COMPUTE_MAX_CORE_HOURS", "inf"),
+                 ("MA_COMPUTE_TARGET_WORKERS", "8.5"), ("MA_COMPUTE_PROCS_PER_WORKER", "0")):
+        try:
+            step_wall_s(dict(cl, **{k: v}))
+            bad.append(f"{k}={v}")
+        except ValueError:
+            pass
+    ok(not bad, f"SW4 unreadable budget values are refused (fail closed): accepted {bad}")
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        open(os.path.join(d, "models", "fn.py"), "w").write("def f(p):\n    return p\n")
+        fp0 = code_fingerprint(d, "models/fn.py::f")
+        for rel in ("pipeline.yaml", "pipeline_state.json", "pipeline_report.json"):
+            open(os.path.join(d, "models", rel), "w").write('{"steps": {"analyze": {"ok": false}}}\n')
+        fp1 = code_fingerprint(d, "models/fn.py::f")
+        open(os.path.join(d, "models", "helper.py"), "w").write("X = 1\n")
+        ok(fp1 == fp0 and code_fingerprint(d, "models/fn.py::f") != fp1,
+           "SW5 the pipeline runner's own definition and records are not part of a batch's fingerprint; model code is")
 
 
 def _self_test_sched(ok) -> None:

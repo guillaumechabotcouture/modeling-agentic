@@ -135,6 +135,35 @@ def _self_test() -> int:
             ok("engine_choice.json" in st[0]["inputs"], f"AP6 the engine choice is an input of the analyze step: {st}")
         except Exception as e:  # noqa: BLE001
             ok(False, f"AP6 the engine choice is an input of the analyze step: {type(e).__name__}: {e}")
+        # AP8 (Nigeria v2 full run, 2026-11-02): the analyze step was killed by the runner's fixed 1-h limit with
+        # 184 of 256 design points done. Its limit now follows the run's compute cap on the cluster's target pool.
+        keys = ("MA_COMPUTE_SCHEDULER", "MA_COMPUTE_RESOURCE", "MA_COMPUTE_TARGET_WORKERS", "MA_COMPUTE_PROCS_PER_WORKER",
+                "MA_COMPUTE_CORES_PER_WORKER", "MA_COMPUTE_MAX_CORE_HOURS")
+        saved = {k: os.environ.pop(k) for k in keys if k in os.environ}
+        try:
+            st = pipeline_steps(p, d)
+            ok("timeout_s" not in st[0], f"AP8a without a cluster the runner's default limit applies: {st[0].get('timeout_s')}")
+            os.environ.update(MA_COMPUTE_RESOURCE="compute", MA_COMPUTE_TARGET_WORKERS="8", MA_COMPUTE_MAX_CORE_HOURS="150")
+            st = pipeline_steps(p, d)
+            # 150 core-hours on 8 workers x 8 cores: 8437.5 s; twice that, plus the hour the step had before.
+            ok(st[0].get("timeout_s") == 20475, f"AP8b the limit comes from the declared compute cap: {st[0].get('timeout_s')}")
+            os.environ["MA_COMPUTE_MAX_CORE_HOURS"] = "100000"
+            ok(pipeline_steps(p, d)[0].get("timeout_s") == 24 * 3600, "AP8c the limit has a ceiling (24 h)")
+            for k, bad in (("MA_COMPUTE_MAX_CORE_HOURS", "lots"), ("MA_COMPUTE_TARGET_WORKERS", "eight"),
+                           ("MA_COMPUTE_MAX_CORE_HOURS", "nan")):
+                os.environ.update(MA_COMPUTE_MAX_CORE_HOURS="150", MA_COMPUTE_TARGET_WORKERS="8")
+                os.environ[k] = bad
+                try:
+                    pipeline_steps(p, d)
+                    ok(False, f"AP8d an unreadable {k}={bad!r} is refused (fail closed)")
+                except ValueError:
+                    ok(True, f"AP8d an unreadable {k}={bad!r} is refused (fail closed)")
+        except Exception as e:  # noqa: BLE001
+            ok(False, f"AP8 the analyze step's limit from the compute budget: {type(e).__name__}: {e}")
+        finally:
+            for k in keys:
+                os.environ.pop(k, None)
+            os.environ.update(saved)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
