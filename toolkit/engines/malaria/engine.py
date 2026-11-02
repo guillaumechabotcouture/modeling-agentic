@@ -342,6 +342,7 @@ class MalariaEngine:
         `packages` one Package or one per pair. Pairs whose burn-in inputs agree (the unit and every parameter outside
         POST_FORK) share one burn-in and one history up to the earliest component event of any of them; each pair is
         then continued from an exact copy. Each pair's outcomes equal run() of that pair (self-test V4)."""
+        import gc
         import pickle
         B = len(param_sets)
         units = list(unit) if isinstance(unit, (list, tuple)) else [unit] * B
@@ -382,6 +383,12 @@ class MalariaEngine:
                     "burnin_years": int(round(P["burnin_years"])), "n_burnin_start": n0, "n_start": dz.n_start,
                     "fork_year": round(float(yv[ti_f]), 6), "burnin_members": len(idx),
                     "start_state_sha256": dz.start_sha})
+                if n == len(idx) - 2:
+                    snap = None                # the last member continues the original sim
+                del s, dz
+                gc.collect()                   # Starsim sims hold reference cycles: free each member before the next
+            del sim
+            gc.collect()
         return out
 
     def initial_state(self, params, unit: UnitSpec, package: Package | None = None, horizon: Horizon | None = None,

@@ -196,12 +196,16 @@ def render_runtime(rt: dict) -> str:
     n = len(rt["packages"])
     out = [f"### Per-run cost (runtime.yaml: {rt['n_agents']} agents, horizon {rt['horizon']['start']}-"
            f"{rt['horizon']['stop']}, {n} packages per point, {rt['repeats']} points, one core each)", "",
-           "| Start | Seconds per point | Seconds per package run | Relative to v0.4 |", "|---|---|---|---|"]
+           "| Start | CPU s per point | CPU s per package run | Relative to v0.4 | Wall s per point | Peak memory (MB) |",
+           "|---|---|---|---|---|---|"]
     for k, lab in (("v04", "v0.4 start (no burn-in, one run per package)"),
                    ("v05_shared", "v0.5: one burn-in per point, packages forked (run_batch)"),
                    ("v05_unshared", "v0.5 without sharing (one burn-in per package run)")):
         r = rt["seconds_per_point"][k]
-        out.append(f"| {lab} | {r:.1f} | {r / n:.1f} | {r / rt['seconds_per_point']['v04']:.2f}x |")
+        wall = (rt.get("wall_seconds_per_point") or {}).get(k)
+        mem = (rt.get("peak_rss_mb") or {}).get(k)
+        out.append(f"| {lab} | {r:.1f} | {r / n:.1f} | {r / rt['seconds_per_point']['v04']:.2f}x | "
+                   f"{_fmt(wall)} | {_fmt(mem)} |")
     return "\n".join(out)
 
 
