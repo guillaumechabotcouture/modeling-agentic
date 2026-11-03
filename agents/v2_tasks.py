@@ -52,12 +52,19 @@ class Tasks(Protocol):
     def write(self, run_dir: str, mode: str) -> TaskResult: ...
 
 
+def _sio():
+    """scripts/lib/safe_io.py: run-dir writes with no link followed (follow-up to #129)."""
+    scripts = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    from lib import safe_io
+    return safe_io
+
+
 def _yaml_dump(obj, path):
+    """Publish YAML atomically with no link followed (a random temporary name, never a planted `.tmp`)."""
     import yaml
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        yaml.safe_dump(obj, f, sort_keys=False)
-    os.replace(tmp, path)
+    _sio().publish(path, yaml.safe_dump(obj, sort_keys=False))
 
 
 def set_key(path: str, dotted: str, value) -> None:
@@ -116,8 +123,8 @@ class StubTasks:
         return self._r("draft_spec", note=f"feedback={len(feedback or [])}")
 
     def sign_spec(self, run_dir):
-        with open(os.path.join(run_dir, "decision_spec.signoff.json"), "w") as f:
-            json.dump({"by": "lead", "note": "stub: the spec matches the question"}, f)
+        _sio().write_nofollow(run_dir, "decision_spec.signoff.json", json.dumps(
+            {"by": "lead", "note": "stub: the spec matches the question"}).encode(), atomic=True)
         return self._r("sign_spec")
 
     def pick_engine(self, spec, eligible):
@@ -193,5 +200,5 @@ class StubTasks:
         if self.s.get("manuscript"):
             text = f"# Report\n\n{head}{self.s['manuscript']}"
         del A
-        open(os.path.join(run_dir, "manuscript.md"), "w").write(text)
+        _sio().write_nofollow(run_dir, "manuscript.md", text.encode("utf-8"), atomic=True)
         return self._r(f"write:{mode}")

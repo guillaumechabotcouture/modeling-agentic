@@ -272,19 +272,13 @@ def _commit(run_dir: str, rel: str, cand: dict, integrity=None) -> str | None:
 
 def _write_sidecar(run_dir: str, sp: str, sc: dict, integrity=None) -> str | None:
     """Write a sidecar the harness built, inside the run only. None when written."""
-    tmp = sp + ".tmp"
-    if os.path.islink(sp) or not all(inside_dir(run_dir, p) for p in (sp, tmp)):
+    if os.path.islink(sp) or not inside_dir(run_dir, sp):
         return "sidecar is a symlink or resolves outside the run directory"
-    try:
-        if os.path.lexists(tmp):
-            os.unlink(tmp)
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
-        with os.fdopen(fd, "w") as f:
-            json.dump(sc, f, indent=2, sort_keys=True)
-        if not inside_dir(run_dir, sp) or os.path.islink(sp):
-            os.unlink(tmp)
-            return "sidecar resolves outside the run directory"
-        os.replace(tmp, sp)
+    from lib.safe_io import publish, LinkRefused
+    try:      # anchored at the run dir, no link followed at any component, atomic (follow-up to #129)
+        publish(sp, json.dumps(sc, indent=2, sort_keys=True), run_dir)
+    except LinkRefused:
+        return "sidecar resolves outside the run directory"
     except OSError as e:
         return f"sidecar not writable: {type(e).__name__}"
     if integrity is not None:
@@ -399,11 +393,10 @@ def rebuild(run_dir: str, timeout_s: float = SCRIPT_TIMEOUT_S, python: str | Non
               "provenance_rerecorded": rerecorded, "provenance_not_rerecorded": not_rerecorded,
               "provenance_invalidated": invalidated,
               "rebuilt": sorted({f for r in runs if r["returncode"] == 0 for f in r["figures"]} - set(still))}
+    from lib.safe_io import publish, LinkRefused
     try:
-        os.makedirs(os.path.join(run_dir, "figures"), exist_ok=True)
-        with open(os.path.join(run_dir, REPORT), "w") as f:
-            json.dump(report, f, indent=1)
-    except OSError:
+        publish(os.path.join(run_dir, REPORT), json.dumps(report, indent=1), run_dir)
+    except (LinkRefused, OSError):
         pass
     return report
 

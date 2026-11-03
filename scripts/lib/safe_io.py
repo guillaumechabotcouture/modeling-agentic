@@ -336,6 +336,31 @@ def remove_path(path: str, root: str | None = None) -> bool:
     return remove_nofollow(base, rel)
 
 
+def rename_nofollow(base: str, src_rel: str, dst_rel: str) -> None:
+    """Move base/src_rel to base/dst_rel: both parents opened with no link followed (dst's created as needed), the
+    source must be a plain file (a link or a directory is refused, never moved), the rename relative to the two dir
+    fds. A link at the destination name is replaced, never followed."""
+    sp, dp = _parts(src_rel), _parts(dst_rel)
+    base = os.path.realpath(base)
+    sfd = dir_fd_nofollow(base, sp[:-1])
+    try:
+        st = os.stat(sp[-1], dir_fd=sfd, follow_symlinks=False)
+        if not stat.S_ISREG(st.st_mode):
+            raise LinkRefused(f"{src_rel}: not a plain file (a link or a directory is not moved)")
+        dfd = dir_fd_nofollow(base, dp[:-1], create=True)
+        try:
+            os.replace(sp[-1], dp[-1], src_dir_fd=sfd, dst_dir_fd=dfd)
+        finally:
+            os.close(dfd)
+    finally:
+        os.close(sfd)
+
+
+def copy_nofollow(base: str, src_rel: str, dst_rel: str) -> None:
+    """Copy base/src_rel to base/dst_rel: read with no link followed, published atomically with no link followed."""
+    write_nofollow(base, dst_rel, read_nofollow(base, src_rel)[0], atomic=True)
+
+
 def open_append_nofollow(base: str, rel: str):
     """A text file object appending to base/rel (created if absent, never truncated), opened with no link followed
     at any component and refused when the file has other hard links. Also usable as an flock target."""

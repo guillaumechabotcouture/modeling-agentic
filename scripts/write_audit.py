@@ -194,6 +194,18 @@ REVIEWED: dict = {
     "scripts/gate_replay.py": {"shutil": (3, _EVAL), "open-write": (1, _EVAL)},
     "scripts/golden_traces.py": {"shutil": (6, _EVAL), "os-remove": (2, _EVAL), "tempfile-dir": (2, _EVAL),
                                  "open-write": (1, _EVAL)},
+    "scripts/pipeline.py": {
+        "shutil": (10, "the step's pyc cache and derivation work dirs (" + _TMP_REASON + "); the aside dir the harness "
+                       "made (mkdtemp) and a planted .pipeline_aside_* dir, removed with rmtree, which removes links, "
+                       "never their targets; the scratch copy (copytree with symlinks=True, a sibling temp dir the "
+                       "harness made, then rmtree)"),
+        "tempfile-dir": (2, "the aside dir (mkdtemp inside the run dir, a random name the harness owns) and the "
+                            "scratch copy (mkdtemp beside the run dir)"),
+        "os-remove": (3, "inside the scratch copy the harness made: links re-pointed into the copy, and its own "
+                         "manifest replaced"),
+        "os-symlink": (1, "inside the scratch copy: a link re-pointed into the copy, never at the real run dir"),
+        "open-write": (3, "the scratch copy's manifest (its own file after the link is removed); the derivation's "
+                          "column-stripped input and mount points in its temporary work dirs")},
     "scripts/plant_defects.py": {"open-write": (3, _EVAL), "shutil": (4, _EVAL)},
     "scripts/regression_eval.py": {"open-write": (2, _EVAL), "shutil": (1, _EVAL)},
     "scripts/replay.py": {"shutil": (2, _EVAL), "os-link": (1, _EVAL), "open-write": (6, _EVAL), "os-remove": (1, _EVAL)},
@@ -221,9 +233,9 @@ REVIEWED: dict = {
     "tools/run_console/run_console.py": {"open-write": (2, "the console's temporary answers file (mkstemp)"),
                                          "os-remove": (2, "the console's temporary answers file (mkstemp)")},
 }
-_V1 = ("v1 pipeline (main.py without --v2, its hooks and gates): writes in its run dir with plain opens; attacker-"
-       "reachable under the hostile-artifact model; NOT migrated (v1 is retired and deleted after the Nigeria v2 report)")
-_V2 = "v2 harness, attacker-reachable, NOT migrated yet"
+_V1 = ("v1 pipeline (main.py without --v2, its hooks and gates): writes in its run dir with plain opens, attacker-"
+       "reachable under the hostile-artifact model; removed at v1 retirement (the owner deletes v1 once v2 is shown "
+       "superior), not migrated")
 # OPEN_ITEMS: attacker-reachable write sites not yet on lib.safe_io. Counted exactly, so none is added; each migration
 # lowers a count. These are known gaps, not exemptions.
 OPEN_ITEMS: dict = {
@@ -232,27 +244,17 @@ OPEN_ITEMS: dict = {
     "agents/observability.py": {"open-write": (5, _V1), "os-rename": (1, _V1), "os-remove": (3, _V1)},
     "agents/output_caps.py": {"open-write": (1, _V1)},
     "agents/run_finish.py": {"open-write": (13, _V1), "shutil": (2, _V1), "os-remove": (1, _V1)},
-    "agents/v2_tasks.py": {"open-write": (3, _V2 + ": stub tasks for dry runs"), "os-rename": (1, _V2 + ": stub tasks")},
     "scripts/ask.py": {"open-write": (1, _V1)},
     "scripts/benchmark_match.py": {"open-write": (1, _V1)},
     "scripts/coherence_audit.py": {"open-write": (1, _V1)},
     "scripts/compare_models.py": {"open-write": (1, _V1)},
     "scripts/cross_model_critic.py": {"open-write": (4, _V1), "os-rename": (1, _V1)},
-    "scripts/derived_rebuild.py": {"os-remove": (2, _V2 + ": derivation sidecars"), "os.open-write": (1, _V2),
-                                   "open-write": (2, _V2), "os-rename": (1, _V2)},
     "scripts/effort_floors.py": {"open-write": (1, _V1)},
     "scripts/eligibility_probe.py": {"open-write": (1, _V1)},
     "scripts/identifiability.py": {"open-write": (1, _V1)},
     "scripts/lessons.py": {"open-write": (3, _V1)},
     "scripts/model_card.py": {"open-write": (3, _V1), "os-rename": (1, _V1)},
     "scripts/open_problems.py": {"open-write": (2, _V1), "os-rename": (2, _V1)},
-    "scripts/pipeline.py": {
-        "shutil": (11, _V2 + ": sandbox copies (temporary) and the aside copy of a failed step's outputs"),
-        "os-rename": (3, _V2 + ": moving a failed step's outputs aside and back"),
-        "tempfile-dir": (2, _V2 + ": temporary dirs created next to the run dir"),
-        "os-remove": (7, _V2 + ": a failed step's leftovers, sandbox mount points"),
-        "os-symlink": (1, _V2 + ": the sandbox's models link"),
-        "open-write": (3, _V2 + ": a CSV filter and mount points in the sandbox")},
     "scripts/presentation_pass.py": {"open-write": (2, _V1), "os-rename": (1, _V1)},
     "scripts/propagate_uncertainty.py": {"open-write": (1, _V1)},
     "scripts/run_autopsy.py": {"open-write": (2, _V1)},

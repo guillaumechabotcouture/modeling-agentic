@@ -784,23 +784,25 @@ def _recover_aside(run_dir: str, dry: bool = False) -> list[str]:
     `.pipeline_aside_*/<rel>`. Its state record was not updated, so putting back the
     files whose place is empty returns the run to where it was before that step (only
     files that were not suspect are ever set aside). `dry`: just list them."""
+    from lib.safe_io import rename_nofollow, LinkRefused
     back = []
     for d in glob.glob(os.path.join(run_dir, ".pipeline_aside_*")):
+        if os.path.islink(d) or not os.path.isdir(d):
+            continue                         # a planted link, not an aside dir the harness made
+        aside_rel = os.path.basename(d)
         for dp, _dirs, fns in os.walk(d):
             for fn in fns:
-                rel = os.path.relpath(os.path.join(dp, fn), d)
-                dst = os.path.join(run_dir, rel)
-                if os.path.lexists(dst) or not _inside(os.path.dirname(dst), run_dir):
+                rel = os.path.relpath(os.path.join(dp, fn), d).replace(os.sep, "/")
+                if os.path.lexists(os.path.join(run_dir, rel)):
                     continue
                 if not dry:
-                    try:
-                        os.makedirs(os.path.dirname(dst), exist_ok=True)
-                        os.replace(os.path.join(dp, fn), dst)
-                    except OSError:
+                    try:              # no link followed on either side; a link entry is refused, never moved
+                        rename_nofollow(run_dir, f"{aside_rel}/{rel}", rel)
+                    except (LinkRefused, OSError):
                         continue
-                back.append(rel.replace(os.sep, "/"))
+                back.append(rel)
         if not dry:
-            shutil.rmtree(d, ignore_errors=True)
+            shutil.rmtree(d, ignore_errors=True)   # rmtree removes links, never their targets
     return back
 
 
@@ -846,45 +848,43 @@ def _run_one(step: dict, run_dir: str, timeout_s: float, python: str | None, rec
     except OSError as e:
         row["error"] = f"could not set old outputs aside: {e}"
         return row
-    good: dict[str, str] = {}      # rel -> its copy aside (the files to restore on failure)
+    good: dict[str, str] = {}      # rel -> its copy aside, relative to the run dir (the files to restore on failure)
+    from lib.safe_io import copy_nofollow, remove_nofollow, rename_nofollow, LinkRefused
+    aside_rel = os.path.relpath(aside, os.path.realpath(run_dir)).replace(os.sep, "/")
 
     def restore() -> list[str]:
         back = []
         for rel in sorted(_snapshot(step, run_dir)):
             try:
-                os.remove(os.path.join(run_dir, rel))          # what the failed run left
-            except OSError:
+                remove_nofollow(run_dir, rel)                   # what the failed run left (the entry, never a target)
+            except (LinkRefused, OSError):
                 pass
         for rel, src in sorted(good.items()):
-            dst = os.path.join(run_dir, rel)
             try:
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-                os.replace(src, dst)
+                rename_nofollow(run_dir, src, rel)
                 back.append(rel)
-            except OSError:
+            except (LinkRefused, OSError):
                 pass
         return back
 
     try:
         for rel in sorted(before):
             src = os.path.join(run_dir, rel)
-            kept = os.path.join(aside, rel)
+            kept = f"{aside_rel}/{rel}"
             is_good = (_sha(src) == trusted.get(rel) if trusted else True) \
                 and not (suspect is not None and suspect(rel))
-            try:
-                if rel in keep or is_good:
-                    os.makedirs(os.path.dirname(kept), exist_ok=True)
+            try:              # every move, copy and removal relative to no-follow dir fds (lib.safe_io)
                 if rel in keep:
-                    shutil.copy2(src, kept)
+                    copy_nofollow(run_dir, rel, kept)
                     good[rel] = kept
                     continue
                 if is_good:
-                    os.replace(src, kept)
+                    rename_nofollow(run_dir, rel, kept)
                     good[rel] = kept
                 else:
-                    os.remove(src)
+                    remove_nofollow(run_dir, rel)
                 row["removed"].append(rel)
-            except OSError as e:
+            except (LinkRefused, OSError) as e:
                 row["error"] = f"could not clear old output {rel}: {e}"
                 row["restored"] = restore()
                 return row
@@ -979,12 +979,12 @@ def run(run_dir: str, budget_s: float | None = None, integrity=None, python: str
         recovered = _recover_aside(run_dir)
         if recovered:
             report["recovered"] = recovered     # not marked harness-written: previous bytes
+        from lib.safe_io import remove_nofollow, LinkRefused
         for rel in retired:
             try:
-                if os.path.isfile(os.path.join(run_dir, rel)):
-                    os.remove(os.path.join(run_dir, rel))
+                if os.path.isfile(os.path.join(run_dir, rel)) and remove_nofollow(run_dir, rel):
                     produced.append(rel)
-            except OSError:
+            except (LinkRefused, OSError):
                 pass
         report["retired"] = [r for r in retired if r in produced]
         if released:
@@ -1580,10 +1580,12 @@ def derive(run_dir: str, unsandboxed_ok: bool = False, limits: dict | None = Non
                  "sandbox": {"kind": kind, "limits": lim}, "python": sys.version.split()[0], "libraries": _libraries(),
                  "runtime_s": None, "stderr_tail": "", "runs": 0}
         entries[sid] = entry
+        from lib.safe_io import remove_nofollow, LinkRefused
         for o in d["outputs"]:                 # nothing stale stays readable while this derivation is not current
-            p = os.path.join(run_dir, o)
-            if os.path.isfile(p):
-                os.remove(p)
+            try:
+                remove_nofollow(run_dir, str(o))       # the entry itself, relative to a no-follow dir fd
+            except (LinkRefused, OSError):
+                pass
         why = ([f"input {i} is missing" for i in d["inputs"] if entry["inputs"][i] is None]
                + [f"input {i} comes from derivation output that failed" for i in d["inputs"] if i in bad_outputs]
                + [f"staged input {i} is not the file the harness staged (its hash differs from {INPUTS_PROVENANCE})"
