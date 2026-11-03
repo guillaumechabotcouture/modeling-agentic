@@ -2732,6 +2732,21 @@ def _self_test() -> int:
         pr = list(csv.DictReader(open(ent_t["parameters"]["table"]))) if "parameters" in ent_t else []
         ok({r["name"]: r["kind"] for r in pr if r.get("name")}.items() >= {"p_eff": "fitted", "p_dur": "prior"}.items(),
            f"TT2c parameters show fitted against prior-drawn values with their ranges: {pr[:3]}")
+        # a spec-declared engine parameter value (toolkit/spec/engine_parameters.py): shown as "spec value", with
+        # the card value it replaces marked, even when the card gives the parameter no range
+        import shutil
+        dsv = os.path.join(base, "run_spec_value")
+        shutil.copytree(d, dsv)
+        edit(dsv, "engine", lambda x: x.update(spec_values={"p_cost": {
+            "value": 2.0, "units": "", "card_value": 1.0, "card_range": None, "outside_card_range": False,
+            "source": "toy source", "reason": "toy reason", "uncertainty": "held fixed at the spec value"}}))
+        rsv = render(dsv, os.path.join(base, "spec_value"), only=["parameters"])
+        esv = {f["figure"]: f for f in rsv["figures"]}.get("parameters") or {}
+        prs = {x["name"]: x for x in csv.DictReader(open(esv["table"]))} if esv else {}
+        ok(prs.get("p_cost", {}).get("kind") == "spec value" and float(prs["p_cost"]["value"]) == 2.0
+           and float(prs["p_cost"]["card_value"]) == 1.0 and "spec value" in esv.get("caption", "")
+           and prs.get("p_eff", {}).get("kind") == "fitted",
+           f"TT2e a spec value is shown as such, with the card value it replaces: {prs.get('p_cost')}")
         dsg = ent_t.get("design_coverage") or {}
         ok(dsg and "40 design points" in dsg.get("caption", ""), f"TT2d design coverage counts the design points: {dsg}")
         sim = {"timeline", "trajectories", "burn_in", "seasonality", "stochastic_noise"}

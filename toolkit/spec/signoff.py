@@ -231,6 +231,29 @@ def _self_test() -> int:
                f"SG10 a spec with engine: auto can be signed before the engine is chosen ({st0})")
         except ValueError as e:
             ok(False, f"SG10 a spec with engine: auto can be signed before the engine is chosen: {e}")
+    # Spec-declared engine parameter values (toolkit/spec/engine_parameters.py): the sheet shows each with its source,
+    # its reason and the card value it replaces; a value outside the card's range is a HIGH note the owner signs.
+    with tempfile.TemporaryDirectory() as d:
+        p = schema.toy_spec(d)
+        raw = yaml.safe_load(open(p))
+        raw["engine"] = {"ref": "toolkit.spec.engine_parameters:ToySpecEngine"}
+        raw["engine_parameters"] = {
+            "base": {"value": 0.3, "outside_card_range": True, "source": "a toy sweep", "reason": "toy headline"},
+            "k": {"value": 0.9, "source": "a toy survey", "reason": "toy setting"}}
+        yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+        md = sheet(d)
+        sec = md.split("## Engine parameter values set by the spec")[-1].split("\n## ")[0] \
+            if "## Engine parameter values set by the spec" in md else ""
+        ok(sec and "**HIGH**" in sec and sec.count("HIGH") == 1 and "a toy sweep" in sec and "toy headline" in sec
+           and "0.4" in sec and "0.6" in sec and "a toy survey" in sec and "0.8" in sec,
+           f"SG11 the sheet lists each spec value (source, reason, card value) and a HIGH note for the one outside the "
+           f"card's range: {sec[:300]!r}")
+        raw["engine"] = {"auto": True, "candidates": ["toolkit.spec.engine_parameters:ToySpecEngine",
+                                                      "toolkit.engines.contract:ToyEngine"]}
+        yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+        sec = sheet(d).split("## Engine parameter values set by the spec")[-1].split("\n## ")[0]
+        ok("ToySpecEngine" in sec and "ToyEngine" in sec and sec.count("**HIGH**") == 1,
+           f"SG12 with engine: auto, the card values are shown per candidate engine: {sec[:300]!r}")
     # DI6, DI7, DI10 (docs/design/v2-derived-inputs.md): the sign-off freezes the derivation record, and the sheet
     # shows the owner the accepted defaults and the columns the run chose not to use.
     try:

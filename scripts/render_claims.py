@@ -568,6 +568,16 @@ def _self_test() -> int:
     ok(lab == "95% UI over engine parameters, priors; set by declared ranges, not by data: smc_pe, dw_5_14; held fixed: "
               "cm_add and 3 other engine parameters; not covered: costs",
        f"T1d v2 priors: the label names the prior-dominated and the fixed parameters: {lab!r}")
+    try:
+        lab = interval_label({"level": 0.95, "covers": ["priors"], "excludes": [], "prior_dominated": ["use_rate"],
+                              "spec_fixed": ["retention_half"], "fixed": ["cm_add"]})
+    except ValueError as e:
+        lab = f"refused: {e}"
+    ok(lab == "95% UI over priors; set by declared ranges, not by data: use_rate; held fixed at the spec value: "
+              "retention_half; held fixed: cm_add",
+       f"T1e spec-declared engine parameter values held fixed are named as such in the label: {lab!r}")
+    ok(interval_meta_problem({"level": 0.95, "covers": ["priors"], "spec_fixed": ["held at 0.75 y"]}) is not None,
+       "T1f the spec-value list holds parameter identifiers only (no free text)")
     with tempfile.TemporaryDirectory() as d_il:
         for bad_c, why in (({"interval_label": "95% UI over everything"}, "free text"),
                            ({"interval": {"level": 0.95, "covers": ["costs"], "fixed": ["held at 3%"]}},
