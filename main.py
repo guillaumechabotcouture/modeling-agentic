@@ -1990,6 +1990,29 @@ def _run_self_test() -> int:
     ok(store_run_results(_run) is None or os.environ.get("MA_STORAGE_ACCOUNT"),
        "ST1 nothing is stored when no account is configured")
     shutil.rmtree(_sr, ignore_errors=True)
+    # ST2 (2026-11-02 v2 run crashed in FIX_LOOP, stored=None): a v2 run that raises is still stored,
+    # with the crash recorded in metadata.json, and the exception still propagates (exit 1).
+    _rs = globals().get("run_v2_and_store")
+    _cr = tempfile.mkdtemp()
+    _stored_calls = []
+
+    def _crash():
+        raise KeyError('"tasks"')
+
+    def _fake_store(rp):
+        _stored_calls.append(json.load(open(os.path.join(rp, "metadata.json"))).get("crash"))
+        return "outputs/runs/x.tar.gz"
+    _raised = False
+    if _rs is not None:
+        try:
+            _rs(_crash, _cr, store=_fake_store)
+        except KeyError:
+            _raised = True
+    ok(_rs is not None and _raised and len(_stored_calls) == 1 and "KeyError" in (_stored_calls[0] or ""),
+       f"ST2 a crashed v2 run is stored with its crash recorded, and the crash still propagates ({_stored_calls})")
+    ok(_rs is not None and _rs(lambda: "completed", _cr, store=lambda rp: _stored_calls.append("ok")) == "completed"
+       and _stored_calls[-1] == "ok", "ST2b a finished v2 run is stored once and its status returned")
+    shutil.rmtree(_cr, ignore_errors=True)
 
     # WU (Phase 29): every run ends with a report.
     ok(writeup_reserve(450.0) == 36.0 and writeup_reserve(8.0) == 4.0 and writeup_reserve(None) == 0.0,
