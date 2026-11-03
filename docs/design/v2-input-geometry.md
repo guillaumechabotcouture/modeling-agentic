@@ -122,6 +122,13 @@ presentation file's own hash is not frozen. A check that failed cannot be signed
 - The signer (`signoff.sign`, and through it `decision_brief.sign`) passes that hash to the freeze. If the
   current evidence differs, the sign-off is refused: HIGH exceptions are never approved against boundaries
   nobody saw. A sheet with no recorded geometry evidence is stale and regenerated.
+- Every brief sign-off of a run with a decision spec binds this hash (Codex on 4d20e23). That covers the CLI,
+  the harness's lead sign-off and `signoff.sign`. When no hash is passed, `decision_brief.sign` reads it from the
+  current sheet's sources line, without following a link, and checks that the sheet was generated from the spec
+  being signed. With no sheet, a sheet without that line or without the evidence, or a stale sheet, the
+  sign-off is refused: "regenerate the sheet".
+- A sheet without a sources footer is refused by `signoff.sign` too ("predates source binding; regenerate"),
+  not skipped. `python3 toolkit/spec/signoff.py sheet <run_dir> --write` regenerates and publishes the sheet.
 - Every signer, including the spike adapter `stage_machine.sign`, reads the spec once without following a link
   and hashes and freezes that same content.
 - The sheet reads the check's record with `read_nofollow`. A link there is refused on the sheet, and nothing

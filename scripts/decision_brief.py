@@ -386,6 +386,33 @@ def parse_lead_answers(run_dir: str) -> tuple[dict | None, list[str]]:
     return {"answers": {str(k): v for k, v in (ans or {}).items()}, "accept_proposed": ap, "note": note}, []
 
 
+REGENERATE_SHEET = "regenerate the sheet (python3 toolkit/spec/signoff.py sheet <run_dir> --write) and read it again"
+
+
+def _sheet_geometry_evidence(run_dir: str, spec_sha: str) -> str:
+    """The geometry evidence hash the current sign-off sheet shows (its sources line), for the spec with `spec_sha`.
+    Read once without following a link. No sheet, a sheet without a sources line or without the evidence, or a sheet
+    generated from another spec: ValueError ("regenerate the sheet")."""
+    from lib.safe_io import LinkRefused, read_nofollow
+    from toolkit.spec import signoff as SO
+    try:
+        text = read_nofollow(run_dir, SO.SHEET)[0].decode("utf-8", "replace")
+    except FileNotFoundError:
+        raise ValueError(f"no sign-off sheet ({SO.SHEET}) shows the geometry evidence this sign-off would approve: "
+                         + REGENERATE_SHEET) from None
+    except (LinkRefused, OSError) as e:
+        raise ValueError(f"{SO.SHEET} cannot be read without following a link ({e}): " + REGENERATE_SHEET) from None
+    src = SO.sheet_sources(text)
+    if src is None:
+        raise ValueError(f"{SO.SHEET} predates source binding (no sources line): " + REGENERATE_SHEET)
+    ev = src.get("geometry_evidence_sha256")
+    if not isinstance(ev, str):
+        raise ValueError(f"{SO.SHEET} records no geometry evidence: " + REGENERATE_SHEET)
+    if src.get("spec_sha256") != spec_sha:
+        raise ValueError(f"{SO.SHEET} was generated from another spec (it is stale): " + REGENERATE_SHEET)
+    return ev
+
+
 def signoff_outputs(run_dir: str) -> list[str]:
     """What sign() writes (run-relative): the record, the signed copies of the frozen files that exist, and the
     spec's geometry record when there is a spec. The harness registers these after it signs."""
@@ -445,6 +472,11 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
         if root not in sys.path:
             sys.path.insert(0, root)
         from toolkit.spec import geometry
+        if expect_geometry is None:
+            # Codex on 4d20e23: every entry point (the CLI, the harness's lead sign-off) binds the geometry evidence
+            # the current sign-off sheet shows; a sheet that lacks it (or no sheet) refuses
+            import hashlib as _hl
+            expect_geometry = _sheet_geometry_evidence(run_dir, _hl.sha256(captured[DECISION_SPEC]).hexdigest())
         try:
             spec_doc = yaml.safe_load(captured[DECISION_SPEC].decode("utf-8")) or {}
         except (yaml.YAMLError, UnicodeDecodeError) as e:

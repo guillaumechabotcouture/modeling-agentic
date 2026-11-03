@@ -147,8 +147,13 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     if expect_sheet_sha256 is not None and sheet_sha != expect_sheet_sha256:
         raise ValueError(f"{SHEET} changed since it was shown: read it again before signing")
     src = sheet_sources(sheet_bytes.decode("utf-8", "replace")) if sheet_bytes is not None else None
-    if sheet_bytes is not None and (src is not None or expect_sheet_sha256 not in (None, "none")) and (
-            src is None or src.get("spec_sha256") != sha or src.get("derivations_sha256") != (dsha or "none")):
+    if sheet_bytes is not None and src is None:
+        # Codex on 4d20e23: a sheet without its sources footer cannot show which spec, record and geometry evidence
+        # it was generated from; it is refused, never skipped
+        raise ValueError(f"{SHEET} predates source binding (no sources line); regenerate the sheet (python3 "
+                         "toolkit/spec/signoff.py sheet <run_dir> --write) and read it again")
+    if sheet_bytes is not None and (
+            src.get("spec_sha256") != sha or src.get("derivations_sha256") != (dsha or "none")):
         raise ValueError(f"{SHEET} was generated from another spec or derivation record (it is stale): the sheet is "
                          "regenerated before the owner signs; read the new one")
     # Codex on 08f96a9: the geometry evidence the sheet showed must still be current when the freeze approves
@@ -350,6 +355,7 @@ def _self_test() -> int:
         schema.toy_spec(d)
         yaml.safe_dump(DB.example_brief(), open(os.path.join(d, DB.BRIEF), "w"))
         yaml.safe_dump({"hard_blockers": [{"id": "HB-001", "text": "t"}]}, open(os.path.join(d, DB.CRITERIA), "w"))
+        write_sheet(d)                 # with a spec, a brief sign-off binds the sheet's geometry evidence (#131)
         rec = sign(d, "owner")
         ok(rec.get("producer") == "scripts/decision_brief.py" and rec["sha256"].get(SPEC) and status(d) == "signed"
            and DB.status(d) == "signed", f"SG8 with a brief, the brief machinery signs and freezes the spec: {rec}")
@@ -650,6 +656,8 @@ def main(argv=None) -> int:
     ap.add_argument("run_dir")
     ap.add_argument("--by", default=None, choices=["owner", "lead"])
     ap.add_argument("--note", default="")
+    ap.add_argument("--write", action="store_true", help="sheet: regenerate and publish the sheet (with its sources "
+                                                         "line) instead of printing it")
     a = ap.parse_args(argv)
     if a.action == "sign" and a.by is None:
         ap.error("sign needs --by owner or --by lead")
@@ -657,7 +665,7 @@ def main(argv=None) -> int:
         print(status(a.run_dir))
         return 0
     if a.action == "sheet":
-        print(sheet(a.run_dir))
+        print(write_sheet(a.run_dir) if a.write else sheet(a.run_dir))
         return 0
     print(json.dumps(sign(a.run_dir, a.by, a.note), indent=1))
     return 0
