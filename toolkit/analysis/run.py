@@ -275,7 +275,8 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     rend = FG.render(run_dir)
     figs = rend["figures"]
     arts["figures"] = S.write("figures", {"figures": figs, "not_produced": rend["not_produced"],
-                                          "tiers": rend["tiers"], "groups": rend["groups"]}, FG.PRODUCER,
+                                          "tiers": rend["tiers"], "groups": rend["groups"],
+                                          "overviews": rend.get("overviews") or {}}, FG.PRODUCER,
                               sorted({s for f in figs for s in f["sources"]}))
     for fgd in figs:
         S.deliverable(os.path.join(run_dir, fgd["path"]), FG.PRODUCER, "figure")

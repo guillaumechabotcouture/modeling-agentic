@@ -168,6 +168,12 @@ def aggregate(run_dir: str, step: dict, results: list[dict]) -> dict:
             e = acc.setdefault(r["unit"], {}).setdefault(arm, {m: [] for m in metrics})
             for m in metrics:
                 e[m].append(s["values"][m])
+    # per unit and seed: comparator minus plan, averaged over the outcome window (the stochastic-noise figure)
+    w0, w1 = (float(x) for x in spec["objective"]["horizon"])
+    inwin = np.array([(w0 - 1e-9) <= x < w1 for x in (t or [])])
+    seed_effects = {i: {m: [float(np.mean(np.asarray(c)[inwin] - np.asarray(p)[inwin]))
+                            for c, p in zip(a["comparator"][m], a["plan"][m])] for m in metrics}
+                    for i, a in acc.items()} if inwin.any() else {}
     per_unit = {i: {arm: {m: list(np.mean(np.asarray(v[m], float), axis=0)) for m in metrics} for arm, v in a.items()}
                 for i, a in acc.items()}
 
@@ -193,7 +199,7 @@ def aggregate(run_dir: str, step: dict, results: list[dict]) -> dict:
                for r, ids in step["sample"].items() if ids}
     allids = [i for ids in step["sample"].values() for i in ids]
     return {"total": {"t": t, "arms": wmean(allids), "target": target(allids), "units": allids}, "regions": regions,
-            "per_unit": per_unit}
+            "per_unit": per_unit, "seed_effects": seed_effects}
 
 
 def write(run_dir: str, data: dict, inputs: list[str]) -> str:
@@ -229,6 +235,7 @@ def run(run_dir: str, per_region: int = 3, seeds: int = 3, metrics=None, log=pri
     if bad:
         raise RuntimeError(f"trajectories: {len(bad)} of {len(rows)} tasks failed (e.g. {str(bad[0])[:300]})")
     series = aggregate(run_dir, step, [r["result"] for r in rows])
+    seed_effects = series.pop("seed_effects", {})
     from toolkit.spec import schema
     spec = schema.load(os.path.join(run_dir, "decision_spec.yaml"))
     h = spec.horizon({})
@@ -237,7 +244,7 @@ def run(run_dir: str, per_region: int = 3, seeds: int = 3, metrics=None, log=pri
             "engine": step["engine"], "hooks_contract": step["hooks_contract"], "selection": step["selection"],
             "metrics": step["metrics"], "metric_info": step["metric_info"],
             "calibration_metric": (spec.get("calibration") or {}).get("metric"),
-            "delivery": [float(x) for x in d], "window": [float(x) for x in h.window], "series": series,
+            "delivery": [float(x) for x in d], "window": [float(x) for x in h.window], "series": series, "seed_effects": seed_effects,
             "compute": {k: summ.get(k) for k in ("backend", "workers", "n", "n_failed", "wall_s")}}
     write(run_dir, data, inputs)
     return data

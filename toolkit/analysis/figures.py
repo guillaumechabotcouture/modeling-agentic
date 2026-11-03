@@ -35,20 +35,24 @@ PRODUCER = "toolkit/analysis/figures.py"
 # question: DECISION_SETS maps the spec's deliverable.kind to its decision figures (one declared table; an unknown
 # kind gets a not-produced entry, fail closed).
 TIERS = {
-    "data_model": ("calibration_fit", "sensitivity"),
-    "simulation": ("timeline", "trajectories"),
+    "data_model": ("data_coverage", "unit_attributes", "parameters", "calibration_fit", "design_coverage",
+                   "sensitivity"),
+    "simulation": ("timeline", "trajectories", "burn_in", "seasonality", "stochastic_noise"),
 }
 DECISION_SETS = {
     "package_per_unit": ("headline", "allocation_map", "stability_map", "burden_map", "dollars", "frontier",
-                         "cost_per_outcome"),
+                         "cost_per_outcome", "decision_tests", "comparison"),
 }
 TIER_OF = {n: k for k, v in TIERS.items() for n in v}
 TIER_OF.update({n: "decision" for v in DECISION_SETS.values() for n in v})
 
 
+def deliverable_kind(spec: dict) -> str:
+    return str(((spec or {}).get("deliverable") or {}).get("kind", "package_per_unit"))
+
+
 def tiers_for(spec: dict) -> dict:
-    kind = ((spec or {}).get("deliverable") or {}).get("kind", "package_per_unit")
-    return dict(TIERS, decision=DECISION_SETS.get(kind, ()))
+    return dict(TIERS, decision=DECISION_SETS.get(deliverable_kind(spec), ()))
 
 
 ORDER = TIERS["data_model"] + TIERS["simulation"] + tuple(n for v in DECISION_SETS.values() for n in v
@@ -125,6 +129,11 @@ class RunData:
         if rel not in self.used:
             self.used.append(rel)
         return doc["data"]
+
+    def use(self, rel: str):
+        """Record a source file this figure read (besides the analysis artifacts)."""
+        if rel not in self.used:
+            self.used.append(rel)
 
     def doc(self, kind):
         """The whole artifact document (envelope included), or None."""
@@ -303,6 +312,582 @@ def _spec_threshold(R) -> tuple[float, str]:
     import yaml
     return float(yaml.safe_load(open(os.path.join(ROOT, "toolkit", "analysis", "thresholds.yaml")))
                  ["decision_tests"]["share_threshold"]), "thresholds.yaml"
+
+
+def _bound_attributes(R) -> list[dict]:
+    """The spec's engine attributes as bound: {attribute, kind: column|columns|value, columns, value, source}."""
+    out = []
+    for a, m in ((R.spec.get("decision_units") or {}).get("engine_attributes") or {}).items():
+        m = m or {}
+        if "value" in m:
+            out.append({"attribute": a, "kind": "value", "columns": [], "value": m["value"], "source": m.get("source")})
+        elif "column" in m:
+            out.append({"attribute": a, "kind": "column", "columns": [m["column"]], "split": m.get("split")})
+        elif "columns" in m:
+            cols = m["columns"]
+            out.append({"attribute": a, "kind": "columns", "columns": list(cols.values()) if isinstance(cols, dict)
+                        else list(cols), "keys": list(cols) if isinstance(cols, dict) else None})
+    cal = R.spec.get("calibration") or {}
+    if cal.get("attribute"):
+        out.append({"attribute": cal["attribute"], "kind": "calibrated", "columns": [], "source": "calibration"})
+    return out
+
+
+def _num_or_none(v):
+    try:
+        x = float(v)
+        return x if math.isfinite(x) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def fig_data_coverage(R, t):
+    import yaml
+    regs = R.regions()
+    pops = (R.spec.get("decision_units") or {}).get("populations") or {}
+    popcols = [pm["column"] for pm in pops.values() if isinstance(pm, dict) and pm.get("column")]
+    pop = {i: sum(_num_or_none(R.by_id[i].get(c)) or 0.0 for c in popcols) for i in R.ids}
+    attrs = _bound_attributes(R)
+    der_p = os.path.join(R.dir, "data", "derivations.yaml")
+    ders = (yaml.safe_load(open(der_p)) or {}).get("derivations") or [] if os.path.exists(der_p) else []
+    if ders:
+        R.use("data/derivations.yaml")
+    inputs = []
+    for dv in ders:
+        cols = dv.get("columns") or {}
+        for inp in dv.get("inputs") or []:
+            inputs.append({"input": inp, "derivation": dv.get("id"), "used": len((cols.get("uses") or {}).get(inp) or []),
+                           "ignored": len((cols.get("ignores") or {}).get(inp) or {})})
+    rows = []
+    for r in regs:
+        ids = [i for i in R.ids if R.region(i) == r]
+        rows.append({"region": r, "units": len(ids), "population": sum(pop[i] for i in ids)})
+    miss_total = 0
+    for a in attrs:
+        cells = [R.by_id[i].get(c) for i in R.ids for c in a["columns"]]
+        miss = sum(1 for v in cells if v is None or str(v).strip() == "" or str(v).lower() == "nan")
+        miss_total += miss
+        binding = (", ".join(a["columns"][:3]) + (f" … ({len(a['columns'])} columns)" if len(a["columns"]) > 3 else "")
+                   if a["columns"] else (f"value {a.get('value')}" if a["kind"] == "value" else a["kind"]))
+        rows.append({"attribute": a["attribute"], "binding": ",".join(a["columns"]) if a["columns"] else binding,
+                     "shown": binding, "source": a.get("source") or "", "missing_cells": miss,
+                     "cells": len(cells)})
+    rows += inputs
+    U = R.labels.unit_title()
+    RT = R.labels.region_title()
+    na = len(attrs)
+    H = 0.6 + 0.24 * len(regs) + 0.5 + 0.2 * na + 0.5 + (0.22 * len(inputs) + 0.3 if inputs else 0) + 0.4
+    fig = _fig(t, 7.8, H)
+    y = H - 0.65
+    h1 = 0.24 * len(regs)
+    a1 = fig.add_axes([0.24, (y - h1) / H, 0.62, h1 / H])
+    FS.style(a1, t, grid="x")
+    pv = [x["population"] for x in rows[:len(regs)]]
+    a1.barh(range(len(regs))[::-1], pv, height=0.6, color=t["cat"][0])
+    for k, x in enumerate(rows[:len(regs)][::-1]):
+        a1.text(x["population"], k, f"  {x['units']} {U}", va="center", fontsize=7, color=t["ink2"])
+    a1.set_yticks(range(len(regs)))
+    a1.set_yticklabels(regs[::-1], fontsize=7.5)
+    a1.set_xlim(0, max(pv + [1]) * 1.2)
+    FS.set_axis_format(a1, "x", "count")
+    a1.set_title(f"population and {U} by {RT.lower()}", fontsize=8.5, loc="left", color=t["ink"])
+    y -= h1 + 0.75
+    h2 = 0.2 * na
+    a2 = fig.add_axes([0.02, (y - h2) / H, 0.96, max(h2, 0.2) / H])
+    a2.axis("off")
+    a2.set_title("engine attributes as bound by the spec (units-table column, or a value with its source)", fontsize=8.5,
+                 loc="left", color=t["ink"])
+    for k, x in enumerate([r for r in rows if "attribute" in r]):
+        yy = 1 - (k + 0.5) / max(na, 1)
+        a2.text(0.0, yy, x["attribute"], fontsize=7.5, color=t["ink"], va="center", transform=a2.transAxes)
+        a2.text(0.22, yy, "← " + textwrap.shorten(str(x["shown"]), 60, placeholder="…"), fontsize=7.5,
+                color=t["ink2"], va="center", transform=a2.transAxes)
+        miss = f"{x['missing_cells']} of {x['cells']} cells missing" if x["cells"] else textwrap.shorten(
+            str(x["source"]), 40, placeholder="…")
+        a2.text(0.72, yy, miss, fontsize=7.5, color=t["ink"] if x["missing_cells"] else t["ink2"], va="center",
+                transform=a2.transAxes)
+    if inputs:
+        y -= h2 + 0.75
+        h3 = 0.22 * len(inputs)
+        a3 = fig.add_axes([0.42, (y - h3) / H, 0.5, h3 / H])
+        FS.style(a3, t, grid="x")
+        ys = range(len(inputs))[::-1]
+        a3.barh([v + 0.18 for v in ys], [x["used"] for x in inputs], height=0.34, color=t["cat"][0], label="used")
+        a3.barh([v - 0.18 for v in ys], [x["ignored"] for x in inputs], height=0.34, color=t["cat"][1],
+                label="ignored (with a reason)")
+        a3.set_yticks(list(ys))
+        a3.set_yticklabels([textwrap.shorten(os.path.basename(x["input"]), 42, placeholder="…") for x in inputs],
+                           fontsize=7)
+        FS.set_axis_format(a3, "x", "count")
+        a3.legend(loc="lower right", fontsize=7)
+        a3.set_title(f"staged inputs → derivation → units table: columns per input", fontsize=8.5, loc="left",
+                     color=t["ink"])
+    cs = R.spec.get("calibration") or {}
+    meas = []
+    if cs.get("target_frame"):
+        meas.append("calibration target frame declared")
+    if cs.get("target_uncertainty"):
+        meas.append("target error model declared")
+    title = (f"{len(R.ids)} {U} in {len(regs)} {RT.lower()}s; {na} engine attributes bound, "
+             f"{miss_total} missing cells" + (f"; {len(inputs)} staged inputs" if inputs else ""))
+    cap = ("Units and population by region, how each engine attribute is bound, and the columns each staged input "
+           "contributes to the units table (data/derivations.yaml)"
+           + (f"; {', '.join(meas)}." if meas else "; no measurement model declared.")
+           + ("" if inputs else " No derivation record in the run dir."))
+    return fig, title, cap, rows, "data coverage and provenance"
+
+
+def fig_unit_attributes(R, t):
+    import numpy as np
+    attrs = [a for a in _bound_attributes(R) if a["kind"] in ("column", "columns")]
+    if not attrs:
+        raise Missing("the spec binds no engine attribute to units-table columns")
+    card = (R.opt("engine") or {}).get("card") or {}
+    vr = card.get("valid_ranges") or {}
+    regs = R.regions()
+    panels = []
+    for a in attrs:
+        if a["kind"] == "columns" and len(a["columns"]) == 12 and not a.get("keys"):
+            panels.append(("profile", a["attribute"], a["columns"], None))
+        elif a["kind"] == "columns":
+            for k, c in zip(a.get("keys") or a["columns"], a["columns"]):
+                panels.append(("scalar", f"{a['attribute']}: {k}", [c], None))
+        else:
+            panels.append(("scalar", a["attribute"], a["columns"], a.get("split")))
+    ncol = 3
+    nrow = math.ceil(len(panels) / ncol)
+    ph = 0.17 * len(regs) + 0.7
+    fig = _fig(t, 8.2, ph * nrow + 0.8)
+    gs = fig.add_gridspec(nrow, ncol, left=0.1, right=0.99, top=_top(fig, 0.7), bottom=0.04, hspace=0.6, wspace=0.12)
+    rows, outside = [], 0
+    for n, (kind, name, cols, split) in enumerate(panels):
+        ax = fig.add_subplot(gs[n // ncol, n % ncol])
+        FS.style(ax, t, grid="x")
+        if kind == "profile":
+            M = np.array([[_num_or_none(R.by_id[i].get(c)) or np.nan for c in cols] for i in R.ids])
+            for row in M:
+                ax.plot(range(1, 13), row, color=t["neutral"], lw=0.6)
+            ax.plot(range(1, 13), np.nanmedian(M, axis=0), color=t["cat"][0], lw=2)
+            ax.set_xticks([1, 4, 7, 10])
+            ax.set_xlabel("month (median in colour)", fontsize=7)
+            FS.set_axis_format(ax, "y")
+            rows += [{"attribute": name, "unit": i, **{c: v for c, v in zip(cols, M[k])}} for k, i in enumerate(R.ids)]
+        else:
+            lo_hi = vr.get(name.split(":")[0])
+            for yv, r in enumerate(regs[::-1]):
+                vals = []
+                for i in R.ids:
+                    if R.region(i) != r:
+                        continue
+                    raw = R.by_id[i].get(cols[0])
+                    vs = [_num_or_none(x) for x in str(raw).split(split)] if split else [_num_or_none(raw)]
+                    vals += [v for v in vs if v is not None]
+                    rows += [{"attribute": name, "unit": i, "region": r, "value": v} for v in vs]
+                bad = [v for v in vals if lo_hi and not (lo_hi[0] <= v <= lo_hi[1])]
+                outside += len(bad)
+                ax.scatter(vals, [yv] * len(vals), s=7, color=t["cat"][0], edgecolors=t["surface"], linewidths=0.3,
+                           zorder=3)
+                if bad:
+                    ax.scatter(bad, [yv] * len(bad), s=30, facecolors="none", edgecolors=t["ink"], linewidths=1,
+                               zorder=4)
+            ax.set_yticks(range(len(regs)))
+            ax.set_yticklabels(regs[::-1] if n % ncol == 0 else [], fontsize=6.5)
+            FS.set_axis_format(ax, "x")
+            ax.locator_params(axis="x", nbins=4)
+        ax.tick_params(labelsize=6.5)
+        ax.set_title(textwrap.shorten(name, 34, placeholder="…"), fontsize=8, loc="left", color=t["ink"])
+    vals_bound = [a for a in _bound_attributes(R) if a["kind"] == "value"]
+    title = (f"{len(attrs)} engine attributes from the units table across {len(R.ids)} units; "
+             f"{outside} values outside the engine's valid ranges")
+    cap = ("Each bound attribute by region (dots: units; ringed: outside the engine card's valid range); monthly "
+           "profiles as thin lines with the median." + (f" Set by value: {', '.join(a['attribute'] for a in vals_bound)}."
+                                                       if vals_bound else ""))
+    return fig, title, cap, rows, "unit attribute distributions"
+
+
+def fig_parameters(R, t):
+    eng = R.opt("engine") or {}
+    params = eng.get("parameters") or []
+    if not params:
+        raise Missing("needs the engine parameters (analysis/engine.yaml)")
+    rep = {}
+    try:
+        rep = R.report()
+    except Missing:
+        pass
+    drawn = {x["name"]: x for x in rep.get("parameters_drawn") or [] if isinstance(x, dict) and x.get("name")}
+    cal_theta = (R.opt("calibration") or {}).get("theta") or {}
+    rows = []
+    for p in params:
+        name = p["name"]
+        d = drawn.get(name) or {}
+        if d.get("source_kind") == "prior":
+            kind = "prior"
+        elif name in cal_theta:
+            kind = "calibrated"
+        else:
+            kind = p.get("kind") or "fixed"
+        rng = d.get("range") if d.get("range") else [p.get("lo"), p.get("hi")]
+        lo, hi = (_num_or_none(rng[0]), _num_or_none(rng[1])) if rng else (None, None)
+        val = _num_or_none(cal_theta.get(name, p.get("value")))
+        rows.append({"name": name, "label": R.labels.parameter(name), "kind": kind, "value": val, "lo": lo, "hi": hi,
+                     "units": p.get("units") or "", "dist": d.get("dist") or "", "drawn": bool(d),
+                     "source": textwrap.shorten(str(d.get("source") or p.get("source") or ""), 90, placeholder="…")})
+    ranged = [r for r in rows if r["lo"] is not None and r["hi"] is not None and r["hi"] > r["lo"] and
+              r["value"] is not None]
+    if not ranged:
+        raise Missing("no engine parameter declares a range")
+    kinds = ["fitted", "prior", "calibrated", "fixed", "scenario"]
+    present = [k for k in kinds if any(r["kind"] == k for r in ranged)] + \
+        sorted({r["kind"] for r in ranged} - set(kinds))
+    col = {k: (t["cat"][n] if n < FS.MAX_SCATTER_CATEGORIES else t["ink2"]) for n, k in enumerate(present)}
+    ranged.sort(key=lambda r: (present.index(r["kind"]), r["name"]))
+    fig = _fig(t, 7.8, 0.32 * len(ranged) + 1.5)
+    h = fig.get_figheight()
+    ax = fig.add_axes([0.42, 0.75 / h, 0.5, _top(fig, 0.6) - 0.75 / h])
+    FS.style(ax, t, grid="x")
+    edge = 0
+    markers = {"fitted": "o", "prior": "D", "calibrated": "s"}
+    for y, r in enumerate(ranged[::-1]):
+        pos = (r["value"] - r["lo"]) / (r["hi"] - r["lo"])
+        edge += pos <= 0.02 or pos >= 0.98
+        ax.plot([0, 1], [y, y], color=t["neutral"], lw=3, solid_capstyle="round", zorder=1)
+        ax.scatter([pos], [y], s=36, marker=markers.get(r["kind"], "o"), color=col[r["kind"]],
+                   edgecolors=t["surface"], linewidths=1, zorder=3)
+    ax.set_yticks(range(len(ranged)))
+    ax.set_yticklabels([f"{r['label']}  {FS.fmt(r['value'])} {r['units']}".rstrip() + f"  ({FS.fmt(r['lo'])}–"
+                        f"{FS.fmt(r['hi'])})" for r in ranged[::-1]], fontsize=7)
+    ax.set_xlim(-0.05, 1.05)
+    ax.set_xticks([0, 0.5, 1])
+    ax.set_xticklabels(["low end", "middle", "high end"], fontsize=7)
+    from matplotlib.lines import Line2D
+    fig.legend(handles=[Line2D([0], [0], marker=markers.get(k, "o"), ls="", color=col[k], label=k) for k in present],
+               loc="lower left", bbox_to_anchor=(0.42, 0.0), ncol=len(present), fontsize=7.5)
+    cnt = {k: sum(r["kind"] == k for r in rows) for k in present}
+    title = (", ".join(f"{v} {k}" for k, v in cnt.items()) + f" of {len(rows)} parameters have ranges; "
+             f"{edge} at a range edge")
+    cap = (f"Each parameter's value within its range (fitted: engine fit; prior: drawn from the spec's prior; "
+           f"calibrated: the run's calibration). {len(rows) - len(ranged)} parameters without a range are fixed "
+           f"values (table view lists all with their sources).")
+    return fig, title, cap, rows, "parameters: priors, fitted and calibrated values with their ranges"
+
+
+def fig_design_coverage(R, t):
+    import numpy as np
+    dp = os.path.join(R.dir, "analysis", "batch", "design.json")
+    if not os.path.exists(dp):
+        raise Missing("needs analysis/batch/design.json (the emulator path's design)")
+    R.use("analysis/batch/design.json")
+    design = json.load(open(dp))
+    pts = design.get("points") or []
+    if not pts:
+        raise Missing("the design has no points")
+    cal = R.opt("calibration") or {}
+    uz = {i: (v or {}).get("z") for i, v in (cal.get("units") or {}).items()}
+    feats = list(((R.spec.get("analysis") or {}).get("emulator") or {}).get("features") or [])
+    names = sorted({k for p in pts for k in (p.get("theta") or {})})
+    panels = [("z", "calibrated attribute (design scale)")] + [("f", f) for f in feats] + [("p", n) for n in names]
+    ncol = 3
+    nrow = math.ceil(len(panels) / ncol)
+    fig = _fig(t, 8.0, 1.05 * nrow + 1.2)
+    gs = fig.add_gridspec(nrow, ncol, left=0.08, right=0.99, top=_top(fig, 0.7), bottom=0.13, hspace=0.9, wspace=0.12)
+    rows = []
+    dunits = [str(p.get("unit_id")) for p in pts]
+    hold = [bool(p.get("holdout")) for p in pts]
+    for n, (kind, name) in enumerate(panels):
+        ax = fig.add_subplot(gs[n // ncol, n % ncol])
+        FS.style(ax, t, grid="x")
+        if kind == "z":
+            dv = [p.get("z") for p in pts]
+            uv = [v for v in uz.values() if v is not None]
+            label_u = "units (fitted)"
+        elif kind == "f":
+            dv = [_num_or_none(R.by_id.get(u, {}).get(name)) for u in dunits]
+            uv = [_num_or_none(R.by_id[i].get(name)) for i in R.ids]
+            label_u = "units"
+        else:
+            dv = [(p.get("theta") or {}).get(name) for p in pts]
+            uv = []
+            label_u = ""
+        if uv:
+            ax.scatter([v for v in uv if v is not None], [1] * len([v for v in uv if v is not None]), s=8,
+                       color=t["neutral"], zorder=2)
+        ax.scatter([v for v, h in zip(dv, hold) if v is not None and not h], [0] * sum(1 for v, h in zip(dv, hold)
+                                                                                     if v is not None and not h),
+                   s=10, color=t["cat"][0], zorder=3)
+        ax.scatter([v for v, h in zip(dv, hold) if v is not None and h], [0] * sum(1 for v, h in zip(dv, hold)
+                                                                                 if v is not None and h),
+                   s=16, facecolors="none", edgecolors=t["cat"][1], linewidths=1, zorder=3)
+        ax.set_yticks([0, 1] if uv else [0])
+        ax.set_yticklabels((["design", label_u] if uv else ["design"]) if n % ncol == 0 else ([""] * (2 if uv else 1)),
+                           fontsize=7)
+        ax.set_ylim(-0.6, 1.6)
+        FS.set_axis_format(ax, "x")
+        ax.locator_params(axis="x", nbins=4)
+        ax.tick_params(labelsize=6.5)
+        ax.set_title(textwrap.shorten(name, 34, placeholder="…"), fontsize=8, loc="left", color=t["ink"])
+        dv_ok = [v for v in dv if v is not None]
+        uv_ok = [v for v in uv if v is not None]
+        out = [v for v in uv_ok if dv_ok and not (min(dv_ok) <= v <= max(dv_ok))]
+        rows.append({"dimension": name, "design_min": min(dv_ok) if dv_ok else None,
+                     "design_max": max(dv_ok) if dv_ok else None, "units_outside_design_range": len(out),
+                     "units": len(uv_ok)})
+    from matplotlib.lines import Line2D
+    fig.legend(handles=[Line2D([0], [0], marker="o", ls="", color=t["cat"][0], label="design point"),
+                        Line2D([0], [0], marker="o", ls="", markerfacecolor="none", markeredgecolor=t["cat"][1],
+                               label="held out"),
+                        Line2D([0], [0], marker="o", ls="", color=t["neutral"], label="units")],
+               loc="lower left", bbox_to_anchor=(0.08, 0.0), ncol=3, fontsize=7.5)
+    n_out = sum(r["units_outside_design_range"] for r in rows)
+    title = f"Design covers the units: {n_out} unit values fall outside the design range across {len(rows)} dimensions"
+    cap = (f"{len(pts)} design points ({sum(hold)} held out) against the units, per emulator input: the calibrated "
+           f"attribute, the unit features and the drawn parameters.")
+    return fig, title, cap, rows, "design and emulator coverage"
+
+
+def fig_burn_in(R, t):
+    tr = R.opt("trajectories") or {}
+    if tr.get("burn_in"):
+        raise Missing("burn-in series present but no renderer yet")
+    raise Missing("needs a series over the burn-in: run_series (engine hooks contract figures-hooks/1) starts at "
+                  "horizon.start, after the burn-in, and the run dir holds no equilibration evidence")
+
+
+def _monthly_profile_attribute(R):
+    for a in _bound_attributes(R):
+        if a["kind"] == "columns" and len(a["columns"]) == 12 and not a.get("keys"):
+            return a
+    return None
+
+
+def _trajectories_current(R):
+    tr = R.opt("trajectories")
+    if not tr or tr.get("status") != "ok":
+        raise Missing("needs trajectory runs (python -m toolkit.analysis.trajectories run <run_dir>)"
+                      + (f": {tr.get('reason')}" if tr and tr.get("reason") else ""))
+    doc = R.doc("trajectories") or {}
+    from toolkit.analysis.artifacts import sha256
+    stale = [rel for rel, h in (doc.get("inputs") or {}).items() if sha256(os.path.join(R.dir, rel)) != h]
+    if stale:
+        raise Missing(f"the trajectories are stale: {', '.join(stale)} changed after they were computed; rerun "
+                      "python -m toolkit.analysis.trajectories run <run_dir>")
+    run_eng = (R.doc("point") or {}).get("engine") or {}
+    te = tr.get("engine") or {}
+    if run_eng and (te.get("name"), str(te.get("version"))) != (run_eng.get("name"), str(run_eng.get("version"))):
+        raise Missing(f"the trajectories are stale: computed by engine {te.get('name')} v{te.get('version')}, the "
+                      f"analysis by {run_eng.get('name')} v{run_eng.get('version')}")
+    return tr
+
+
+def trajectory_checks(R, tr) -> list[dict]:
+    """The harness checks paired with the trajectory figure (a later dynamics-review gate reads them)."""
+    import numpy as np
+    out = []
+    d0, d1 = tr["delivery"]
+    ser = tr["series"]
+    panels = {"total": ser["total"], **(ser.get("regions") or {})}
+    worst = 0.0
+    for p, s in panels.items():
+        for m in tr["metrics"]:
+            c, pl = np.asarray(s["arms"]["comparator"][m]), np.asarray(s["arms"]["plan"][m])
+            pre = np.asarray(s["t"]) < d0 - 1e-9
+            if pre.any():
+                scale = max(float(np.max(np.abs(c[pre]))), 1e-12)
+                worst = max(worst, float(np.max(np.abs(c[pre] - pl[pre]))) / scale)
+    out.append({"check": "plan_equals_comparator_before_delivery", "value": worst,
+                "status": "pass" if worst <= 1e-9 else "flag", "detail": "largest relative difference before delivery"})
+    cm = tr.get("calibration_metric")
+    win = (R.spec.get("calibration") or {}).get("window")
+    if cm in tr["metrics"] and win:
+        flags, n = [], 0
+        for p, s in panels.items():
+            tg = s.get("target") or {}
+            if tg.get("value") is None:
+                continue
+            tt = np.asarray(s["t"])
+            sel = (tt >= float(win[0]) - 1 / 24) & (tt < float(win[1]) + 1 / 24)
+            if not sel.any():
+                continue
+            v = float(np.mean(np.asarray(s["arms"]["comparator"][cm])[sel]))
+            n += 1
+            if not tg["lo"] <= v <= tg["hi"]:
+                flags.append(p)
+        out.append({"check": "pre_intervention_vs_target", "value": len(flags), "panels": n,
+                    "status": "pass" if not flags else "flag",
+                    "detail": f"modelled comparator over the calibration window outside the target interval in "
+                              f"{len(flags)} of {n} panels" + (f": {', '.join(flags[:5])}" if flags else "")})
+    w1 = tr["window"][1]
+    if d1 < w1 - 1e-9:
+        s = ser["total"]
+        tt = np.asarray(s["t"])
+        i0, i1 = int(np.searchsorted(tt, d1) - 1), int(np.searchsorted(tt, d1))
+        if 0 <= i0 < i1 < len(tt):
+            jumps = {m: float((s["arms"]["plan"][m][i1] - s["arms"]["plan"][m][i0])
+                              / max(abs(s["arms"]["plan"][m][i0]), 1e-12)) for m in tr["metrics"]}
+            out.append({"check": "end_of_delivery_step", "value": jumps, "status": "info",
+                        "detail": "relative step in the plan's series across the end of delivery (month before vs "
+                                  "after)"})
+    return out
+
+
+def fig_seasonality(R, t):
+    import numpy as np
+    tr = _trajectories_current(R)
+    a = _monthly_profile_attribute(R)
+    if a is None:
+        raise Missing("no engine attribute is a monthly profile (12 units-table columns) to check the modelled "
+                      "season against")
+    m = next((k for k in tr["metrics"] if (tr["metric_info"].get(k) or {}).get("aggregate") == "rate"),
+             tr["metrics"][0])
+    ser = tr["series"]
+    panels = ["total"] + sorted(ser.get("regions") or {})
+    ncol = 4
+    nrow = math.ceil(len(panels) / ncol)
+    fig = _fig(t, 8.0, 1.5 * nrow + 1.0)
+    gs = fig.add_gridspec(nrow, ncol, left=0.06, right=0.99, top=_top(fig, 0.75), bottom=0.1, hspace=0.8, wspace=0.25)
+    rows, shifts = [], []
+    d0 = tr["delivery"][0]
+    for n, p in enumerate(panels):
+        s = ser["total"] if p == "total" else ser["regions"][p]
+        ids = s.get("units") or []
+        prof = np.nanmean([[_num_or_none(R.by_id[i].get(c)) or np.nan for c in a["columns"]] for i in ids], axis=0)
+        tt = np.asarray(s["t"])
+        v = np.asarray(s["arms"]["comparator"][m])
+        sel = tt < d0 - 1e-9 if (tt < d0 - 1e-9).sum() >= 12 else np.ones_like(tt, bool)
+        mon = np.array([int(round((x % 1) * 12)) % 12 for x in tt[sel]])
+        mod = np.array([np.mean(v[sel][mon == k]) if (mon == k).any() else np.nan for k in range(12)])
+        prof_n, mod_n = prof / np.nanmean(prof), mod / np.nanmean(mod)
+        ax = fig.add_subplot(gs[n // ncol, n % ncol])
+        FS.style(ax, t, grid="y")
+        ax.plot(range(1, 13), prof_n, color=t["muted"], lw=1.4)
+        ax.plot(range(1, 13), mod_n, color=t["cat"][0], lw=1.6)
+        ax.set_xticks([1, 4, 7, 10])
+        ax.tick_params(labelsize=6.5)
+        FS.set_axis_format(ax, "y")
+        pk_in, pk_mod = int(np.nanargmax(prof_n)) + 1, int(np.nanargmax(mod_n)) + 1
+        lag = (pk_mod - pk_in) % 12
+        shifts.append(lag)
+        ax.set_title(f"{'Sample' if p == 'total' else p}: lag {lag} mo", fontsize=7.5, loc="left", color=t["ink"])
+        rows.append({"panel": p, "input_peak_month": pk_in, "model_peak_month": pk_mod, "lag_months": lag,
+                     **{f"input_m{k + 1:02d}": prof_n[k] for k in range(12)},
+                     **{f"model_m{k + 1:02d}": mod_n[k] for k in range(12)}})
+    from matplotlib.lines import Line2D
+    fig.legend(handles=[Line2D([0], [0], color=t["muted"], lw=1.4, label=f"input profile ({a['attribute']})"),
+                        Line2D([0], [0], color=t["cat"][0], lw=1.6,
+                               label=f"modelled {tr['metric_info'].get(m, {}).get('label', m)}, comparator")],
+               loc="lower left", bbox_to_anchor=(0.06, 0.0), ncol=2, fontsize=7.5)
+    med = sorted(shifts)[len(shifts) // 2]
+    title = f"Modelled seasonal peak lags the input profile by a median of {med} months"
+    cap = ("Input monthly profile and the modelled comparator series by calendar month, each scaled to its mean, in "
+           "the purposive trajectory sample (before delivery where a full year is available).")
+    return fig, title, cap, rows, "seasonality check (diagnostic)"
+
+
+def fig_stochastic_noise(R, t):
+    import numpy as np
+    tr = _trajectories_current(R)
+    se = tr.get("seed_effects") or {}
+    if not se:
+        raise Missing("the trajectory step recorded no per-seed effects (rerun the trajectory step)")
+    m = next((k for k in tr["metrics"] if (tr["metric_info"].get(k) or {}).get("aggregate") == "rate"),
+             tr["metrics"][0])
+    units = sorted(se, key=lambda i: np.mean(se[i][m]))
+    fig = _fig(t, 7.6, 0.22 * len(units) + 1.4)
+    h = fig.get_figheight()
+    ax = fig.add_axes([0.2, 0.6 / h, 0.75, _top(fig, 0.55) - 0.6 / h])
+    FS.style(ax, t, grid="x")
+    rows, rel = [], []
+    for y, i in enumerate(units):
+        v = np.asarray(se[i][m], float)
+        ax.scatter(v, [y] * len(v), s=12, color=t["cat"][0], alpha=0.8, zorder=3)
+        ax.plot([v.mean()] * 2, [y - 0.3, y + 0.3], color=t["ink"], lw=1.4, zorder=4)
+        if len(v) > 1 and abs(v.mean()) > 0:
+            rel.append(float(np.std(v, ddof=1) / abs(v.mean())))
+        rows.append({"unit": i, "region": R.region(i) if i in R.by_id else "", "mean": float(v.mean()),
+                     "sd": float(np.std(v, ddof=1)) if len(v) > 1 else None, **{f"seed_{k}": x for k, x in enumerate(v)}})
+    ax.set_yticks(range(len(units)))
+    ax.set_yticklabels([f"{R.region(i) if i in R.by_id else ''} {i}" for i in units], fontsize=6.5)
+    FS.set_axis_format(ax, "x")
+    lab = tr["metric_info"].get(m, {}).get("label", m)
+    ax.set_xlabel(f"{lab} averted per person over the outcome window, by seed (bar: mean)", fontsize=8)
+    med = sorted(rel)[len(rel) // 2] if rel else None
+    title = (f"Seed-to-seed spread is {FS.fmt(med, 'percent')} of the mean effect (median over {len(rel)} sampled units)"
+             if med is not None else "Seed-to-seed spread of the effect in the sampled units")
+    cap = (f"Comparator minus plan, {lab}, over the outcome window for each seed of the trajectory step "
+           f"({tr.get('seeds')} seeds) in the purposive sample: what one simulation's Monte Carlo noise looks like.")
+    return fig, title, cap, rows, "stochastic noise (diagnostic)"
+
+
+def fig_decision_tests(R, t):
+    dt = R.art("decision_tests")
+    tests = dt.get("tests") or []
+    if not tests:
+        raise Missing("the run declares no decision tests")
+    fig = _fig(t, 7.8, 0.36 * len(tests) + 1.4)
+    h = fig.get_figheight()
+    ax = fig.add_axes([0.36, 0.7 / h, 0.42, _top(fig, 0.6) - 0.7 / h])
+    FS.style(ax, t, grid="x")
+    rows, k = [], 0
+    mx = max([float(x.get("share_pct") or 0) for x in tests] + [float(x.get("threshold_pct") or 0) for x in tests] + [1])
+    for y, x in enumerate(tests[::-1]):
+        sh, th, v = x.get("share_pct"), x.get("threshold_pct"), x.get("verdict")
+        if v == "NOT_RUN" or sh is None:
+            ax.text(0, y, " not run", va="center", fontsize=7.5, color=t["ink2"])
+        else:
+            ax.barh(y, float(sh) / 100, height=0.5, color=t["cat"][0] if v == "CHANGES_PLAN" else t["neutral"])
+        if th is not None:
+            ax.plot([float(th) / 100] * 2, [y - 0.35, y + 0.35], color=t["ink"], lw=1.2)
+        if v == "CHANGES_PLAN":
+            k += 1
+            ax.text(1.02, y, "changes the plan", transform=ax.get_yaxis_transform(), va="center", fontsize=7.5,
+                    color=t["ink"])
+        rows.append({"test": x.get("test_id"), "verdict": v, "share_pct": sh, "threshold_pct": th,
+                     "statement": x.get("statement")})
+    ax.set_yticks(range(len(tests)))
+    ax.set_yticklabels([textwrap.shorten(str(x.get("test_id")).replace("prior_range_", "prior range: ")
+                                         .replace("_", " "), 40, placeholder="…") for x in tests[::-1]], fontsize=7.5)
+    ax.set_xlim(0, mx / 100 * 1.15)
+    FS.set_axis_format(ax, "x", "percent")
+    ax.set_xlabel(f"share of {R.labels.unit_title()} whose package changes (tick: the test's threshold)", fontsize=8)
+    n_run = sum(1 for x in tests if x.get("verdict") in ("CHANGES_PLAN", "NO_CHANGE"))
+    title = f"{k} of {n_run} decision tests change the plan" + (
+        f"; {len(tests) - n_run} not run" if len(tests) > n_run else "")
+    cap = ("Each decision test re-solves the plan under its alternative and counts the units that change package; "
+           "filled bars cross the test's threshold.")
+    return fig, title, cap, rows, "decision tests: does the plan change?"
+
+
+def fig_comparison(R, t):
+    raise Missing("drawn across runs: python -m toolkit.analysis.figures compare <run_dir> <run_dir> ... --out <dir>")
+
+
+def contact_sheets(res: dict, dest: str, run_dir: str, harness: bool) -> dict:
+    """One overview PNG per tier: a grid of the tier's figures with their titles."""
+    from PIL import Image, ImageDraw
+    out = {}
+    for tier in ("data_model", "simulation", "decision"):
+        ents = [f for f in res["figures"] if f.get("tier") == tier]
+        if not ents:
+            continue
+        thumbs = []
+        for f in ents:
+            p = f["path"] if os.path.isabs(f["path"]) else os.path.join(run_dir, f["path"])
+            im = Image.open(p).convert("RGB")
+            im.thumbnail((620, 520))
+            thumbs.append(im)
+        ncol = 3 if len(thumbs) > 2 else len(thumbs)
+        cw, ch = 640, max(im.height for im in thumbs) + 20
+        nrow = math.ceil(len(thumbs) / ncol)
+        sheet = Image.new("RGB", (cw * ncol, ch * nrow + 40), FS.THEMES["light"]["surface"])
+        dr = ImageDraw.Draw(sheet)
+        dr.text((10, 10), f"{tier.replace('_', ' and ').replace('data and model', 'data and model')}: "
+                          f"{len(thumbs)} figures", fill=FS.THEMES["light"]["ink"])
+        for n, im in enumerate(thumbs):
+            sheet.paste(im, ((n % ncol) * cw + 10, (n // ncol) * ch + 40))
+        path = os.path.join(dest, f"overview_{tier}.png")
+        sheet.save(path, dpi=(FS.DPI, FS.DPI))
+        out[tier] = os.path.relpath(path, run_dir) if harness else path
+    return out
 
 
 def fig_headline(R, t):
@@ -1024,21 +1609,7 @@ def fig_timeline(R, t):
 
 
 def fig_trajectories(R, t):
-    tr = R.opt("trajectories")
-    if not tr or tr.get("status") != "ok":
-        raise Missing("needs trajectory runs (python -m toolkit.analysis.trajectories run <run_dir>)"
-                      + (f": {tr.get('reason')}" if tr and tr.get("reason") else ""))
-    doc = R.doc("trajectories") or {}
-    from toolkit.analysis.artifacts import sha256
-    stale = [rel for rel, h in (doc.get("inputs") or {}).items() if sha256(os.path.join(R.dir, rel)) != h]
-    if stale:
-        raise Missing(f"the trajectories are stale: {', '.join(stale)} changed after they were computed; rerun "
-                      "python -m toolkit.analysis.trajectories run <run_dir>")
-    run_eng = (R.doc("point") or {}).get("engine") or {}
-    te = tr.get("engine") or {}
-    if run_eng and (te.get("name"), str(te.get("version"))) != (run_eng.get("name"), str(run_eng.get("version"))):
-        raise Missing(f"the trajectories are stale: computed by engine {te.get('name')} v{te.get('version')}, the "
-                      f"analysis by {run_eng.get('name')} v{run_eng.get('version')}")
+    tr = _trajectories_current(R)
     ser = tr["series"]
     metrics = tr["metrics"]
     sample = tr.get("sample") or {}
@@ -1085,7 +1656,8 @@ def fig_trajectories(R, t):
     cap = (f"A purposive sample of {n_units} units ({tr.get('per_region')} per region at the lowest, median and highest "
            f"comparator burden; {tr.get('seeds')} seeds), population-weighted within the sample: not a regional "
            f"estimate. Shaded: delivery period {d0:g}–{d1:g}.")
-    return fig, title, cap, rows, "modelled trajectories in a purposive sample (diagnostic)"
+    return fig, title, cap, rows, "modelled trajectories in a purposive sample (diagnostic)", \
+        {"checks": trajectory_checks(R, tr)}
 
 
 def _frontier_xy(fr: dict, primary: str) -> tuple[list, list]:
@@ -1094,7 +1666,10 @@ def _frontier_xy(fr: dict, primary: str) -> tuple[list, list]:
     return [float(p["envelope_usd"]) for p in pts], [float(p["averted"][primary]) for p in pts]
 
 
-FUNCS = {"headline": fig_headline, "allocation_map": fig_allocation, "stability_map": fig_stability,
+FUNCS = {"data_coverage": fig_data_coverage, "unit_attributes": fig_unit_attributes, "parameters": fig_parameters,
+         "design_coverage": fig_design_coverage, "burn_in": fig_burn_in, "seasonality": fig_seasonality,
+         "stochastic_noise": fig_stochastic_noise, "decision_tests": fig_decision_tests, "comparison": fig_comparison,
+         "headline": fig_headline, "allocation_map": fig_allocation, "stability_map": fig_stability,
          "burden_map": fig_burden, "calibration_fit": fig_calibration, "frontier": fig_frontier,
          "dollars": fig_dollars, "cost_per_outcome": fig_cost_per_outcome, "sensitivity": fig_sensitivity,
          "timeline": fig_timeline, "trajectories": fig_trajectories}
@@ -1148,7 +1723,13 @@ def render(run_dir: str, out_dir: str | None = None, labels_overlay: dict | None
         R = RunData(run_dir, labels_overlay, figure_data, trajectories)
     except Missing as e:
         return {"figures": [], "not_produced": [{"figure": n, "reason": str(e)} for n in ORDER]}
-    for name in only or ORDER:
+    tiers = tiers_for(R.spec)
+    names = [n for k in ("data_model", "simulation", "decision") for n in tiers[k]]
+    if not tiers["decision"] and (not only or any(TIER_OF.get(n) == "decision" for n in only)):
+        notp.append({"figure": "decision_figures", "tier": "decision",
+                     "reason": f"no decision figure set declared for kind {deliverable_kind(R.spec)} "
+                               f"(toolkit/analysis/figures.py DECISION_SETS)"})
+    for name in [n for n in names if not only or n in only]:
         R.used = []
         try:
             got = FUNCS[name](R, t)
@@ -1175,6 +1756,10 @@ def render(run_dir: str, out_dir: str | None = None, labels_overlay: dict | None
     res = {"figures": figs, "not_produced": notp, "tiers": {k: list(v) for k, v in tiers_for(R.spec).items()},
            "groups": {"decision": list(tiers_for(R.spec)["decision"]),
                       "diagnostics": [n for k in ("data_model", "simulation") for n in tiers_for(R.spec)[k]]}}
+    try:
+        res["overviews"] = contact_sheets(res, dest, run_dir, harness) if figs else {}
+    except Exception as e:  # noqa: BLE001 - an overview is a convenience; its failure is recorded, not fatal
+        res["overviews"] = {"error": f"{type(e).__name__}: {e}"}
     if not harness or write_index:
         import yaml
         os.makedirs(dest, exist_ok=True)
