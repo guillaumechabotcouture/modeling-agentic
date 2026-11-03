@@ -719,11 +719,12 @@ def _lead_wrote_answers(run_path: str, since) -> str | None:
     import decision_brief
     import hashlib
     from agents.hooks import LEAD_ANSWERS_EVENT
-    try:
-        sha = hashlib.sha256(open(os.path.join(run_path, decision_brief.LEAD_ANSWERS), "rb").read()).hexdigest()
-        lines = open(os.path.join(run_path, "trace.jsonl"), encoding="utf-8").read().splitlines()
-    except OSError as e:
-        return f"the trace cannot be read ({e})"
+    from lib.safe_io import LinkRefused, read_nofollow
+    try:                                 # never through a link (lib.safe_io)
+        sha = hashlib.sha256(read_nofollow(run_path, decision_brief.LEAD_ANSWERS)[0]).hexdigest()
+        lines = read_nofollow(run_path, "trace.jsonl")[0].decode("utf-8", "replace").splitlines()
+    except (LinkRefused, OSError) as e:
+        return f"the answers file or the trace cannot be read without following a link ({e})"
     for ln in reversed(lines):
         try:
             rec = json.loads(ln)
@@ -966,7 +967,7 @@ def _self_test_owner_cli(ok, td: str, trace, reg) -> None:
     helper = os.path.join(td, "helper.py")
     indirect = {"helper script": f"python3 scripts/decision_brief.py status {td} && python3 {helper}",
                 "split name": f"G=geom; python3 toolkit/spec/${{G}}etry.py approve {td} --by owner",
-                "python -c, getattr": "python3 -c \"import importlib as i; m=i.import_module('toolkit.spec.geo'+"
+                "python -c, getattr": "python3 -c \"import importlib as i; m=getattr(i, 'import_' + 'module')('toolkit.spec.geo'+"
                                       f"'metry'); getattr(m, 'app'+'rove')('{td}', 'own'+'er')\"",
                 "xargs": f"echo approve {td} --by owner | xargs python3 toolkit/spec/geo*.py",
                 "symlink": f"ln -s {REPO_ROOT}/toolkit/spec/geometry.py {td}/g.py && python3 {td}/g.py approve {td} "

@@ -1,0 +1,8 @@
+---
+phase: "v2a"
+commit: "v0.8 δ"
+---
+
+## Changelog
+
+**Malaria engine v0.8: the Coiled `validate_once.sh` confirmation of the re-stamped benchmark evidence (identical in every value).** The v0.6, v0.7 and v0.8 re-stamps of `results.yaml`, `fitted.yaml`, `equilibration.yaml` and `guess_sensitivity.yaml` relied on byte-identity proofs (`restamp_proof.py`), and each v0.8 record said `confirmation: {validate_once: pending}`. A full recomputation, `bash toolkit/engines/malaria/benchmarks/validate_once.sh 16 12`, ran at c0ed767 on one Coiled VM (cluster 2319071, run `run1`, workspace `idm-coiled-idmad-r2`; Python 3.14.3, NumPy 2.4.4, Starsim 3.3.4, Linux x86_64; outputs stored and verified at `outputs/engine-v08-confirm/run1`). The run covered the equilibration, guess sensitivity, joint fit (1,748 sims), pack run (298 sims), B15 mechanism scan and per-run cost. Every value in the four files equals the committed one: 14 of 17 in band, with B7 (0.578), B8 (0.449) and B16c (4 of 5 rules) out of band as before; fit cfp_kill 0.43, irs_kill 0.415625. Only wall-clock fields and identity hashes differ, and both are expected: the evidence files keep the hash of the code that computed them (RP6), and `fitted.yaml` keeps the params hash its v0.5 fit wrote. Each file's latest `restamped` record now says `confirmation: {validate_once: done, evidence: {run id, commit, environment, date, ...}}`; nothing else changed. A smoke first measured peak memory per process at full scale (50-member fit groups at 5,000 agents: 1.78 GB; 100-year equilibration burn-ins: 1.28 GB), and that sized the run at 12 batch processes on a 16 vCPU / 64 GiB VM (VM peak 48.8 GB). Compute: 92.05 Coiled credits (smoke and run on one cluster, stopped).

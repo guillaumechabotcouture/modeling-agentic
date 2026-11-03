@@ -1,267 +1,18 @@
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Run console</title>
-<!-- scripts/run_console.py serves this page on 127.0.0.1 only. No external scripts, fonts or styles:
-     run outputs derive from licensed data and nothing here may leave the machine. -->
-<style>
-:root {
-  --bg: #f7f7f8; --panel: #ffffff; --ink: #1d1f23; --muted: #6b7079; --faint: #a3a7ae; --line: #e6e7ea; --soft: #f0f1f3;
-  --accent: #3a63b8; --accent-soft: #e9effa; --ok: #2f7d4f; --warn: #a86a10; --bad: #b3363a;
-  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, Helvetica, Arial, sans-serif;
-  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  color-scheme: light;
-}
-@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
-  --bg: #141518; --panel: #1b1d21; --ink: #e7e8ea; --muted: #9a9fa8; --faint: #636871; --line: #2b2e34; --soft: #23262b;
-  --accent: #86a8e8; --accent-soft: #232d40; --ok: #6fbf8c; --warn: #d9a650; --bad: #e57f80; color-scheme: dark; } }
-:root[data-theme="dark"] {
-  --bg: #141518; --panel: #1b1d21; --ink: #e7e8ea; --muted: #9a9fa8; --faint: #636871; --line: #2b2e34; --soft: #23262b;
-  --accent: #86a8e8; --accent-soft: #232d40; --ok: #6fbf8c; --warn: #d9a650; --bad: #e57f80; color-scheme: dark; }
-* { box-sizing: border-box; }
-[hidden] { display: none !important; }
-html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink); font: 14.5px/1.55 var(--sans); }
-button, select, input, textarea { font: inherit; color: inherit; }
-button { background: none; border: 1px solid var(--line); border-radius: 6px; padding: 3px 10px; cursor: pointer; font-size: 13px; }
-button:hover { border-color: var(--faint); }
-button:disabled { opacity: .5; cursor: default; }
-button.primary { background: var(--accent); color: var(--panel); border-color: var(--accent); }
-button.link { border: none; color: var(--muted); padding: 2px 4px; }
-button.link:hover { color: var(--accent); }
-select, input, textarea { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px; font-size: 13px; }
-.app { display: grid; grid-template-columns: 300px minmax(0, 1fr) auto; height: 100vh; }
-
-/* sidebar */
-aside { border-right: 1px solid var(--line); background: var(--panel); overflow-y: auto; padding: 16px 12px; }
-.brand { display: flex; align-items: center; gap: 6px; margin: 0 6px 14px; font-weight: 600; font-size: 14px; }
-.brand span { flex: 1; }
-.tabs { display: flex; gap: 2px; margin: 0 2px 12px; background: var(--soft); border-radius: 7px; padding: 2px; }
-.tabs button { flex: 1; border: none; border-radius: 5px; color: var(--muted); }
-.tabs button.on { background: var(--panel); color: var(--ink); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
-.group { font-size: 12px; color: var(--muted); margin: 16px 8px 4px; }
-.runitem { padding: 8px 10px; border-radius: 7px; cursor: pointer; margin-bottom: 1px; }
-.runitem:hover { background: var(--soft); }
-.runitem.on { background: var(--accent-soft); }
-.runitem .l { font-weight: 600; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.runitem .s { font-size: 12px; color: var(--muted); display: flex; gap: 6px; align-items: center; white-space: nowrap; overflow: hidden; }
-.runitem .q { font-size: 13px; }
-.runitem .top { display: flex; gap: 8px; align-items: baseline; }
-.runitem .top .l { flex: none; }
-.runitem .top .h { margin-left: auto; font-size: 12px; color: var(--muted); white-space: nowrap; }
-.runitem .sc { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; }
-.runitem.on .sc { white-space: normal; }
-.runitem.cmp { box-shadow: inset 0 0 0 1px var(--accent); }
-.runitem .det { font-size: 12px; color: var(--muted); margin-top: 6px; display: grid; grid-template-columns: auto 1fr; gap: 1px 8px; }
-.runitem .det b { font-weight: 500; color: var(--ink); overflow-wrap: anywhere; }
-.runitem .det b.tail { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; }
-.project { font-size: 12.5px; font-weight: 600; margin: 4px 8px 6px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-details.drafts { margin: 10px 8px 0; font-size: 12px; color: var(--muted); }
-details.drafts summary { cursor: pointer; }
-.hint { font-size: 11.5px; color: var(--faint); margin: 14px 8px 0; }
-.state { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); white-space: nowrap; }
-.state::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--faint); flex: none; }
-.state.bad { color: var(--bad); } .state.bad::before { background: var(--bad); }
-.state.ok { color: var(--ok); } .state.ok::before { background: var(--ok); }
-.state.warn { color: var(--warn); } .state.warn::before { background: var(--warn); }
-.state.live::before { background: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
-
-/* main column: header, stepper, stream, composer */
-main { display: flex; flex-direction: column; min-width: 0; min-height: 0; height: 100vh; }
-.wrap { max-width: 900px; margin: 0 auto; padding: 0 28px; width: 100%; }
-header { padding: 20px 0 6px; flex: none; }
-.crumb { font-size: 12px; color: var(--muted); display: flex; gap: 8px; align-items: center; }
-#navbtn { display: none; }
-h1 { font-size: 18px; font-weight: 600; margin: 2px 0 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.meta { display: flex; flex-wrap: wrap; gap: 4px 18px; align-items: center; font-size: 13px; color: var(--muted); }
-.meta b { color: var(--ink); font-weight: 500; }
-.crumb .acts { margin-left: auto; display: flex; gap: 2px; }
-details.question { margin-top: 8px; font-size: 13px; color: var(--muted); }
-details.question summary { cursor: pointer; width: max-content; }
-details.question div { white-space: pre-wrap; color: var(--ink); max-height: 240px; overflow: auto; margin-top: 6px; padding: 10px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
-.stepper { flex: none; padding: 14px 0 12px; border-bottom: 1px solid var(--line); }
-.steps { display: flex; overflow-x: auto; scrollbar-width: none; }
-.st { flex: 1 0 58px; position: relative; text-align: center; cursor: pointer; padding-top: 14px; font-size: 11.5px; color: var(--faint); }
-.st::before { content: ""; position: absolute; top: 4px; left: 0; right: 0; height: 2px; background: var(--line); }
-.st:first-child::before { left: 50%; } .st:last-child::before { right: 50%; }
-.st.done::before, .st.current::before, .st.waiting::before, .st.failed::before { background: var(--faint); }
-.st:first-child.done::before { background: var(--faint); }
-.st i { position: absolute; top: 0; left: 50%; width: 10px; height: 10px; margin-left: -5px; border-radius: 50%; background: var(--panel); border: 2px solid var(--line); }
-.st.done { color: var(--muted); } .st.done i { background: var(--muted); border-color: var(--muted); }
-.st.current, .st.waiting { color: var(--ink); font-weight: 600; }
-.st.current i { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
-.st.waiting i { border-color: var(--warn); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 20%, transparent); }
-.st.failed { color: var(--bad); } .st.failed i { background: var(--bad); border-color: var(--bad); width: 8px; height: 8px; margin-left: -4px; top: 1px; }
-.st.sel span { text-decoration: underline; text-underline-offset: 3px; }
-.stepnote { font-size: 12px; color: var(--muted); margin-top: 10px; display: flex; gap: 12px; align-items: center; }
-.views { display: flex; gap: 2px; background: var(--soft); border-radius: 7px; padding: 2px; }
-.views button { border: none; border-radius: 5px; color: var(--muted); padding: 1px 10px; font-size: 12.5px; }
-.views button.on { background: var(--panel); color: var(--ink); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
-.figs { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 14px; margin: 12px 0; }
-.fig { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px; cursor: zoom-in; }
-.fig img { width: 100%; aspect-ratio: 16 / 10; object-fit: contain; background: #fff; border-radius: 6px; display: block; }
-.fig .c { font-size: 13px; margin-top: 8px; }
-.fig .p { font-size: 11.5px; color: var(--faint); margin-top: 2px; }
-.empty { color: var(--muted); font-size: 13.5px; padding: 18px 2px; }
-table.cmp { border-collapse: collapse; width: 100%; table-layout: fixed; font-size: 13px; margin: 6px 0 4px; }
-table.cmp th:first-child { width: 40%; }
-table.cmp td { overflow-wrap: anywhere; }
-table.cmp th, table.cmp td { text-align: left; padding: 5px 10px 5px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
-table.cmp th { font-weight: 500; color: var(--muted); }
-table.cmp tr.ch td { color: var(--ink); font-weight: 500; }
-table.cmp .n { text-align: right; font-variant-numeric: tabular-nums; }
-table.cmp tr.ch td { background: color-mix(in srgb, var(--accent-soft) 55%, transparent); }
-.term { border-bottom: 1px dotted var(--faint); cursor: help; }
-.ctx { font-size: 12.5px; color: var(--muted); margin: 2px 0 8px; }
-.ctx b { font-weight: 500; color: var(--ink); }
-table.t { border-collapse: collapse; width: 100%; font-size: 13px; margin-top: 4px; }
-table.t th { text-align: left; font-weight: 500; color: var(--muted); font-size: 12px; padding: 4px 10px 4px 0; border-bottom: 1px solid var(--line); }
-table.t td { padding: 6px 10px 6px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
-table.t tr:last-child td { border-bottom: none; }
-table.t td:first-child { max-width: 150px; min-width: 64px; }
-table.t.fixed { table-layout: fixed; } table.t.fixed td { overflow-wrap: anywhere; max-width: none; }
-table.t .n, .md td.n, .md th.n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
-table.t td.clip { max-width: 0; width: 46%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-table.t tr.row { cursor: pointer; } table.t tr.row:hover td { background: var(--soft); }
-table.t tr.more td { background: var(--bg); padding: 10px 12px; white-space: normal; }
-table.t tr.grp td { padding-top: 10px; font-size: 12.5px; color: var(--muted); }
-.ok-i { color: var(--ok); } .bad-i { color: var(--bad); }
-.stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px 18px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 18px; margin: 14px 0 6px; }
-.stat .k { font-size: 12px; color: var(--muted); }
-.stat .v { font-size: 18px; font-weight: 600; line-height: 1.3; }
-.stat .v.hero { font-size: 22px; }
-.stat .d { font-size: 12px; color: var(--muted); }
-.stat .s { font-size: 11px; color: var(--faint); background: none; border: none; padding: 0; cursor: pointer; }
-.stat .s:hover { color: var(--accent); }
-.stat.wide { grid-column: span 2; }
-.md .doc-h1 { font-size: 12.5px; color: var(--muted); font-weight: 400; margin: 0 0 10px; }
-.cmp-h { font-size: 13px; font-weight: 600; margin: 18px 0 2px; }
-.stream { flex: 1; overflow-y: auto; min-height: 0; }
-.stream .wrap { padding-top: 14px; padding-bottom: 28px; }
-
-/* one card style; transitions are single lines */
-.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 18px; margin: 12px 0; }
-.card .head { display: flex; gap: 10px; align-items: baseline; }
-.card .head .t { flex: 1; font-weight: 600; min-width: 0; }
-.tm { font-size: 12px; color: var(--faint); white-space: nowrap; }
-.card .body { margin-top: 6px; }
-.card .sub { font-size: 12.5px; color: var(--muted); margin-top: 6px; }
-.card .acts { margin-top: 10px; display: flex; gap: 6px; flex-wrap: wrap; }
-.card .acts button { color: var(--muted); padding: 2px 9px; font-size: 12.5px; }
-.card .acts button:hover { color: var(--ink); }
-.card.need { border-left: 3px solid var(--warn); }
-.card.error .t { color: var(--bad); }
-.line { display: flex; gap: 8px; align-items: baseline; font-size: 13px; color: var(--muted); padding: 3px 2px; margin: 2px 0; }
-.line .x { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.line b { color: var(--ink); font-weight: 500; }
-.line.bad b { color: var(--bad); }
-.chat.user { background: var(--accent-soft); border-color: transparent; margin-left: 12%; }
-.chat.feedback { border-style: dashed; }
-.sev { font-size: 11px; font-weight: 600; letter-spacing: .02em; margin-right: 6px; }
-.sev.HIGH { color: var(--bad); } .sev.MEDIUM { color: var(--warn); } .sev.LOW { color: var(--muted); }
-.thumb { max-width: 100%; width: 360px; border-radius: 6px; cursor: zoom-in; display: block; margin-top: 10px; background: #fff; border: 1px solid var(--line); }
-.cite { font-size: 12px; background: var(--accent-soft); color: var(--accent); border: none; border-radius: 4px; padding: 0 5px; }
-.uncited { margin-top: 6px; font-size: 12px; color: var(--warn); }
-.stream code { font-family: inherit; background: var(--soft); border-radius: 4px; padding: 0 4px; font-size: .95em; }
-.stream pre { background: var(--soft); padding: 8px 10px; border-radius: 6px; overflow-x: auto; white-space: pre-wrap; font: inherit; font-size: 13px; }
-
-/* composer: sticky, always visible */
-.composer { flex: none; border-top: 1px solid var(--line); background: var(--panel); padding: 10px 0 12px; }
-.composer .row { display: flex; gap: 8px; align-items: flex-end; }
-.composer textarea { flex: 1; min-height: 40px; max-height: 30vh; resize: vertical; padding: 9px 12px; border-radius: 8px; font-size: 14px; background: var(--bg); }
-.composer .opts { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; font-size: 12.5px; color: var(--muted); }
-.composer .opts input { flex: 1; min-width: 160px; }
-.chip { font-size: 12px; background: var(--accent-soft); color: var(--accent); border-radius: 12px; padding: 1px 8px; }
-
-/* side panel: the only place with mono ids and paths */
-.side { width: 0; overflow: hidden; border-left: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; height: 100vh; }
-.side.open { width: min(46vw, 640px); }
-.side .bar { display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
-.side .bar .t { flex: 1; font: 12px var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
-.side .content { overflow: auto; padding: 16px 20px; flex: 1; }
-.side img { max-width: 100%; background: #fff; }
-.side pre, .side code { font-family: var(--mono); font-size: 12.5px; }
-.side td code { word-break: break-all; }
-.side pre { background: var(--soft); padding: 8px 10px; border-radius: 6px; overflow-x: auto; }
-.lines div { white-space: pre-wrap; font: 12px/1.5 var(--mono); padding: 0 6px; }
-.lines div.hit { background: var(--accent-soft); }
-.md h1 { font-size: 18px; white-space: normal; } .md h2 { font-size: 16px; margin-top: 18px; } .md h3 { font-size: 14.5px; }
-.md table { border-collapse: collapse; font-size: 13px; margin: 8px 0; }
-.md table.t { margin: 10px 0 14px; }
-.md .hit { background: var(--accent-soft); }
-.md p:first-child { margin-top: 0; } .md p:last-child { margin-bottom: 0; }
-.muted { color: var(--muted); } .small { font-size: 12.5px; }
-.kv td { padding: 2px 12px 2px 0; vertical-align: top; font-size: 13px; }
-.banner { position: fixed; top: 0; left: 0; right: 0; z-index: 30; background: var(--bad); color: #fff; font-size: 13px; padding: 6px 16px; display: flex; gap: 12px; align-items: center; }
-.banner span { flex: 1; } .banner button { color: #fff; border-color: rgba(255,255,255,.5); padding: 1px 8px; }
-.toast { position: fixed; bottom: 16px; right: 16px; background: var(--ink); color: var(--bg); padding: 8px 14px; border-radius: 6px; font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none; max-width: 420px; }
-.toast.on { opacity: .95; }
-.answer { border-top: 1px solid var(--line); padding-top: 10px; margin-top: 10px; }
-.answer textarea { width: 100%; min-height: 50px; }
-label.inline { display: inline-flex; gap: 4px; align-items: center; margin-right: 12px; font-size: 13px; }
-
-@media (max-width: 760px) {
-  .app { grid-template-columns: minmax(0, 1fr); }
-  aside { display: none; position: fixed; inset: 0 auto 0 0; width: 84vw; z-index: 10; box-shadow: 0 0 24px rgba(0,0,0,.25); }
-  .app.nav aside { display: block; }
-  #navbtn { display: inline-block; }
-  .wrap { padding: 0 16px; }
-  header { padding-top: 12px; }
-  .st { flex-basis: 30px; } .st span { display: none; }
-  .st.current span, .st.waiting span, .st.failed span { display: inline; position: relative; white-space: nowrap; }
-  .chat.user { margin-left: 0; }
-  .side { position: fixed; top: 0; right: 0; z-index: 20; }
-  .side.open { width: 100vw; }
-}
-</style>
-</head>
-<body>
-<div class="app" id="app">
-  <aside>
-    <div class="brand"><span>Run console</span><button class="link" id="theme" title="Light or dark">◐</button></div>
-    <div class="tabs"><button id="tab-runs" class="on">Runs</button><button id="tab-learn">Learning</button></div>
-    <div id="sidebar"></div>
-  </aside>
-  <main>
-    <header><div class="wrap">
-      <div class="crumb"><button class="link" id="navbtn">☰ Runs</button><span id="crumb"></span><span class="acts" id="acts"></span></div>
-      <h1 id="title">Select a run</h1>
-      <div class="meta" id="meta"></div>
-      <div class="ctx" id="stopline" hidden></div>
-      <details class="question" id="qbox" hidden><summary>Question</summary><div id="qtext"></div></details>
-    </div></header>
-    <div class="stepper"><div class="wrap"><div class="steps" id="stepper"></div><div class="stepnote"><span class="views"><button id="v-stream" class="on">Stream</button><button id="v-figs">Figures</button></span><span id="stepnote"></span></div></div></div>
-    <div class="stream" id="streambox"><div class="wrap" id="stream"></div></div>
-    <div class="composer"><div class="wrap">
-      <div class="row">
-        <textarea id="text" rows="1" placeholder="Ask, or give guidance or a correction…"></textarea>
-        <button id="send" class="primary">Send</button>
-      </div>
-      <div class="opts">
-        <select id="kind" title="What this message is"></select>
-        <select id="layer" title="Which layer the feedback is about"></select>
-        <input id="proposed" placeholder="proposed change (optional)">
-        <button id="record" title="Record as feedback without asking Claude">Record only</button>
-        <span id="anchor"></span>
-        <span style="flex:1"></span>
-        <span id="chatspend"></span>
-      </div>
-    </div></div>
-  </main>
-  <div class="side" id="side">
-    <div class="bar"><span class="t" id="side-title"></span><button id="side-close">Close</button></div>
-    <div class="content" id="side-content"></div>
-  </div>
-</div>
-<div class="toast" id="toast"></div>
-<div class="banner" id="banner" hidden><span id="banner-text"></span><button id="banner-retry">Retry</button><button id="banner-close">Dismiss</button></div>
-<script>
+// The run console page script (served by run_console.py at /run_console.js; the CSP allows no inline script).
 "use strict";
-const TOKEN = "__CONSOLE_TOKEN__";
-const S = { runs: [], run: null, runId: null, filter: null, anchor: null, verdict: null, meta: null, live: false, liveTimer: null, tab: "runs", view: "stream", cmp: null };
+const TOKEN = document.querySelector('meta[name="console-token"]').content;
+const S = { runs: [], run: null, runId: null, filter: null, anchor: null, verdict: null, meta: null, live: false, liveTimer: null, tab: "runs", view: "stream", cmp: null, loadSeq: 0, loading: false };
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const unesc = (s) => String(s).replace(/&(amp|lt|gt|quot|#39);/g, (m, k) => ({ amp: "&", lt: "<", gt: ">", quot: '"', "#39": "'" }[k]));
+// Artifact text is untrusted (agents write it). Every value in an HTML attribute goes through esc(); values a
+// control acts on (anchors, the run and the ticket a decision card was shown for) stay in JS and the attribute
+// holds only ref(), an index this page made.
+const REFS = {};
+let REF_N = 0;
+function ref(obj) { const k = "r" + (++REF_N); REFS[k] = obj; return k; }
+const getRef = (k) => REFS[k] || {};
+let TOG_N = 0;
 function toast(msg) { const t = $("toast"); t.textContent = msg; t.classList.add("on"); clearTimeout(toast.h); toast.h = setTimeout(() => t.classList.remove("on"), 4000); }
 // Errors are never swallowed: a failed fetch or render shows one line at the top of the page.
 function fail(where, e) { $("banner-text").textContent = `${where} failed: ${e && e.message ? e.message : e}`; $("banner").hidden = false; console.error(where, e); }
@@ -302,8 +53,9 @@ const day = (at) => { const d = new Date(at); return isNaN(d) ? "" : d.toLocaleD
 const hhmm = (at) => (at && /T\d\d:\d\d/.test(at)) ? at.slice(11, 16) : "";
 const when = (at) => at ? `<span class="tm" title="${esc(at)}">${esc(day(at))} ${esc(hhmm(at))}</span>` : "";
 const usd = (x) => "$" + Number(x || 0).toFixed(2);
-function num(v, unit) {   // 12.34M, 86.6M, 147.1K, $260.7M; small values as is with separators
-  if (v == null || v === "" || isNaN(v)) return v == null ? "—" : String(v);
+function num(v, unit) {   // 12.34M, 86.6M, 147.1K, $260.7M; small values as is with separators; HTML-safe
+  if (v == null || v === "" || typeof v === "boolean" || isNaN(v)) return v == null ? "—" : esc(String(v));
+  v = Number(v);
   const a = Math.abs(v), pre = unit === "usd" ? "$" : "";
   const c = a >= 1e9 ? (v / 1e9).toFixed(2) + "B" : a >= 1e6 ? (v / 1e6).toFixed(2) + "M" : a >= 1e4 ? (v / 1e3).toFixed(1) + "K"
     : Number.isInteger(v) ? v.toLocaleString("en-US") : Number(v.toPrecision(6)).toLocaleString("en-US", { maximumFractionDigits: 6 });
@@ -332,7 +84,7 @@ const fmtS = (s) => s >= 3600 ? (s / 3600).toFixed(1) + " h" : s >= 60 ? Math.ro
 // ---- markdown (small, local) with [[file#anchor]] citations
 function inline(s) {
   s = esc(s);
-  s = s.replace(/\[\[([^\]#]+)(?:#([^\]]*))?\]\]/g, (m, f, a) => `<button class="cite" data-file="${f.trim()}" data-anchor="${(a || "").trim()}">${f.trim()}${a ? "#" + a.trim() : ""}</button>`);
+  s = s.replace(/\[\[([^\]#]+)(?:#([^\]]*))?\]\]/g, (m, f, a) => `<button class="cite" data-file="${esc(unesc(f.trim()))}" data-anchor="${esc(unesc((a || "").trim()))}">${f.trim()}${a ? "#" + a.trim() : ""}</button>`);
   s = s.replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>").replace(/(^|[\s(])\*([^*\s][^*]*)\*/g, "$1<i>$2</i>");
   return s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1");   // links render as text: nothing leaves the page
 }
@@ -365,7 +117,7 @@ function md(src, doc) {
 }
 
 // ---- sidebar: runs and the learning view
-const PAGE_NEEDS = ["runs", "projects", "kinds", "layers", "chat", "glossary"];   // RC17: /api/runs must carry these
+const PAGE_NEEDS = ["runs", "projects", "kinds", "layers", "chat", "glossary", "sync"];   // RC17: /api/runs must carry these
 async function loadRuns() {
   if (!S.meta) $("sidebar").innerHTML = '<div class="muted small" style="margin:0 8px">Loading runs…</div>';
   try {
@@ -383,9 +135,19 @@ function renderLoaded() {
     syncComposer();
   }
   renderChatSpend();
+  renderSync();
   if (S.tab === "runs") renderRuns();
   const first = ((S.meta.projects || [])[0] || {}).lineage || [];
   if (!S.runId && S.runs.length) selectRun(first.length ? first[first.length - 1] : S.runs[0].id);
+}
+function renderSync() {   // the mirror's freshness: last successful sync, failures, stale after two missed
+  const sy = S.meta.sync, el = $("syncline");
+  if (!sy) { el.hidden = true; return; }
+  el.hidden = false;
+  const last = sy.last_ok_at ? `${day(sy.last_ok_at)} ${hhmm(sy.last_ok_at)} UTC` : "never";
+  el.className = "hint" + (sy.stale ? " stale" : "");
+  el.textContent = !sy.configured ? `Mirror: ${sy.why}.` : `Mirror synced ${last}${sy.failures ? ` · ${sy.failures} failed since` : ""}${sy.stale ? ` · stale: ${sy.why}; remote approval is off` : ""}`;
+  el.title = sy.last_error ? "last error: " + sy.last_error : "";
 }
 function renderChatSpend() {
   const c = S.meta && S.meta.chat; if (!c) return;
@@ -410,7 +172,7 @@ function runRow(r, sub) {
       ${r.signoff_note ? `<span>sign-off note</span><b>${esc(r.signoff_note.length > 80 ? r.signoff_note.slice(0, 80).replace(/\s+\S*$/, "") + "…" : r.signoff_note)} <button class="link" data-note="${esc(r.id)}">full note</button></b>` : ""}
       <span>folder</span><b>${esc(r.full_label || r.label || r.name)}</b><span>path</span><b class="tail" title="${esc(r.id)}">${esc(r.id)}</b></div>` : "";
   return `<div class="runitem ${on ? "on" : ""} ${cmp ? "cmp" : ""}" data-run="${esc(r.id)}">
-    <div class="top"><span class="l">${esc(runLabel(r))}</span><span class="state ${cls}">${esc(words)}</span>${r.headline_number ? `<span class="h">${esc(r.headline_number)}</span>` : ""}</div>
+    <div class="top"><span class="l">${esc(runLabel(r))}</span><span class="state ${esc(cls)}">${esc(words)}</span>${r.headline_number ? `<span class="h">${esc(r.headline_number)}</span>` : ""}</div>
     <div class="sc" title="${esc(r.signoff_note || "")}">${r.mirror ? '<span class="chip">live mirror</span> ' : ""}${esc(sub)}</div>${det}</div>`;
 }
 function renderRuns() {
@@ -451,10 +213,24 @@ async function renderLearning() {
 }
 
 // ---- one run: header, stepper, stream
-async function selectRun(id) { S.runId = id; S.filter = null; S.cmp = null; await refresh(); if (S.tab === "runs") renderRuns(); }
+async function selectRun(id) {   // the composer's anchor and snapshot belong to the run they were taken in
+  if (id !== S.runId) setAnchor(null, null, null);
+  S.runId = id; S.filter = null; S.cmp = null; await refresh(); if (S.tab === "runs") renderRuns();
+}
 async function refresh() {
+  // Only the answer to the latest request is shown: a slower answer for an earlier request, or for a run no
+  // longer selected, is dropped (request sequence). Decisions are disabled until the answer is in.
   if (!S.runId) return;
-  try { S.run = await api("/api/run?" + q({ run: S.runId })); } catch (e) { $("stream").innerHTML = `<div class="card error"><div class="head"><span class="t">The run cannot be read</span></div><div class="body">${esc(e.message)}</div></div>`; fail("Loading the run", e); return; }
+  const seq = ++S.loadSeq, id = S.runId;
+  S.loading = true; markLoading();
+  let run;
+  try { run = await api("/api/run?" + q({ run: id })); } catch (e) {
+    if (seq !== S.loadSeq) return;
+    S.loading = false;
+    $("stream").innerHTML = `<div class="card error"><div class="head"><span class="t">The run cannot be read</span></div><div class="body">${esc(e.message)}</div></div>`; fail("Loading the run", e); return;
+  }
+  if (seq !== S.loadSeq || id !== S.runId) return;
+  S.run = run; S.loading = false;
   try { renderHeader(); renderStepper(); renderStream(); } catch (e) { fail("Showing the run", e); }
 }
 function renderHeader() {
@@ -470,12 +246,12 @@ function renderHeader() {
   const failed = sp.stages.find((s) => s.status === "failed"), cls = summary.chip === "stopped" ? "" : cls0;
   const calls = c.calls || [], k = calls.find((x) => x.live) || calls[0];
   const items = [];
-  items.push(`<span class="state ${cls} ${c.live ? "live" : ""}" title="${esc(r.error || (failed && failed.why) || r.status || "")}">${esc(failed ? "Failed in " + stage(failed.state) : c.live ? "Running · " + stage(st.state) : (summary.chip === "stopped" || !summary.chip) && r.stop ? "Stopped in " + stage(st.state).toLowerCase() : words)}${st.round != null ? ` <span class="muted">· round ${esc(st.round)} of ${esc(st.max_rounds)}</span>` : ""}</span>`);
+  items.push(`<span class="state ${esc(cls)} ${c.live ? "live" : ""}" title="${esc(r.error || (failed && failed.why) || r.status || "")}">${esc(failed ? "Failed in " + stage(failed.state) : c.live ? "Running · " + stage(st.state) : (summary.chip === "stopped" || !summary.chip) && r.stop ? "Stopped in " + stage(st.state).toLowerCase() : words)}${st.round != null ? ` <span class="muted">· round ${esc(st.round)} of ${esc(st.max_rounds)}</span>` : ""}</span>`);
   if (k && k.done != null) items.push(k.live ? `<span>Engine batch <b>${k.done}/${esc(k.n)}</b>${k.eta_s != null ? " · ETA " + fmtS(k.eta_s) : ""}</span>`
                                            : `<span title="the run is not live; this progress record was left behind">Engine batch interrupted at <b>${k.done}/${esc(k.n)}</b></span>`);
   items.push(`<span><b>${usd(st.spent_usd)}</b>${st.budget_usd != null ? " of " + usd(st.budget_usd) : ""} spent</span>`);
   const reused = (summary.batches || r.batches || []).filter((b) => b.reused);
-  items.push(`<span title="${esc(c.cap_source || "")}${c.error ? " · " + esc(c.error) : ""}">this run <b>${esc(c.used_core_h)}</b> of ${esc(c.cap_core_h)} core-h${reused.map((b) => ` · plus ${num(b.reused)} reused points${b.reused_from ? " computed in " + esc(b.reused_from) : " from an earlier batch"}`).join("")}</span>`);
+  items.push(`<span title="${esc((c.cap_source || "") + (c.error ? " · " + c.error : ""))}">this run <b>${esc(c.used_core_h)}</b> of ${esc(c.cap_core_h)} core-h${reused.map((b) => ` · plus ${num(b.reused)} reused points${b.reused_from ? " computed in " + esc(b.reused_from) : " from an earlier batch"}`).join("")}</span>`);
   const task = (r.stop || "").split(": ")[1];
   const where = (r.stop || "").split(":")[0].replace(/ \(round (\d+) of \d+\)/, ", round $1");
   $("stopline").innerHTML = r.stop ? `<span title="${esc(task || "")}">Stopped ${esc(where)}; no reason recorded.</span>${r.operator_note ? ` <button class="link" id="b-note">note</button>` : ""}` : "";
@@ -492,7 +268,7 @@ function renderStepper() {
   if (!sp) { $("stepper").innerHTML = ""; $("stepnote").textContent = "No stage history."; return; }
   const tip = { done: "done", current: "current", waiting: "waiting for you", failed: "failed", skipped: "not reached", todo: "not reached" };
   const ended = sp.stages.some((s) => s.status === "failed");   // a failed run's FINAL is not a step reached
-  $("stepper").innerHTML = sp.stages.map((s) => `<div class="st ${ended && s.state === "FINAL" ? "todo" : s.status} ${S.filter === s.state ? "sel" : ""}" data-s="${s.state}" title="${esc(stage(s.state) + ": " + (s.why || tip[s.status] || s.status))}"><i></i><span>${esc(stage(s.state))}</span></div>`).join("");
+  $("stepper").innerHTML = sp.stages.map((s) => `<div class="st ${esc(ended && s.state === "FINAL" ? "todo" : s.status)} ${S.filter === s.state ? "sel" : ""}" data-s="${esc(s.state)}" title="${esc(stage(s.state) + ": " + (s.why || tip[s.status] || s.status))}"><i></i><span>${esc(stage(s.state))}</span></div>`).join("");
   const note = [];
   if (sp.fix_rounds) note.push(`${sp.fix_rounds} fix-loop round${sp.fix_rounds > 1 ? "s" : ""}`);
   if (S.filter) note.push(`showing ${esc(stage(S.filter))} <button class="link" id="nofilter">show all</button>`);
@@ -500,9 +276,18 @@ function renderStepper() {
   document.querySelectorAll(".st").forEach((el) => (el.onclick = () => { S.filter = S.filter === el.dataset.s ? null : el.dataset.s; renderStepper(); renderStream(); }));
   if ($("nofilter")) $("nofilter").onclick = () => { S.filter = null; renderStepper(); renderStream(); };
 }
-$("v-stream").onclick = () => setView("stream");
-$("v-figs").onclick = () => setView("figs");
-function setView(v) { S.view = v; S.cmp = null; $("v-stream").classList.toggle("on", v === "stream"); $("v-figs").classList.toggle("on", v === "figs"); renderStream(); renderRuns(); $("streambox").scrollTop = 0; }
+// Stream and Figures narrate the run; Spec, Evidence, Engine and Calibration (dossier.js) show what it is made of.
+const VIEWS = ["stream", "figs", "spec", "evidence", "engine", "calibration"];
+VIEWS.forEach((v) => { if ($("v-" + v)) $("v-" + v).onclick = () => setView(v); });
+function setView(v) { S.view = v; S.cmp = null; VIEWS.forEach((x) => { if ($("v-" + x)) $("v-" + x).classList.toggle("on", x === v); }); renderStream(); renderRuns(); $("streambox").scrollTop = 0; }
+// A figure is shown only as the bytes its render-time snapshot hashed: the request is snapshot-bound (bound=1, the
+// digest) and refused by the server on a mismatch. With no captured digest (the file could not be read when the
+// card was rendered) no request is made (review round 5, P2-5).
+const FIG_NO_DIGEST = '<div class="empty small">The figure could not be read when this page was rendered (no digest was captured); reload the run.</div>';
+function figSrc(file, snap) {
+  const sha = snap && snap.sha256;
+  return typeof sha === "string" && /^[0-9a-f]{64}$/.test(sha) ? "/api/file?" + q({ run: S.runId, path: file, bound: 1, sha }) : null;
+}
 function renderFigures() {
   const figs = S.run.cards.filter((c) => c.kind === "figure"), sp = S.run.stepper || { stages: [] };
   $("v-figs").textContent = figs.length ? `Figures (${figs.length})` : "Figures";
@@ -513,7 +298,7 @@ function renderFigures() {
       : an.status === "done" ? "ANALYZE wrote none to figures/" : "the run has not reached ANALYZE";
     return `<div class="empty">No figures yet: ${why}.</div>`;
   }
-  return `<div class="figs">${figs.map((c) => `<div class="fig" data-act="open" data-file="${esc(c.file)}"><img loading="lazy" src="/api/file?${q({ run: S.runId, path: c.file })}" alt="">
+  return `<div class="figs">${figs.map((c) => `<div class="fig" data-act="open" data-file="${esc(c.file)}">${figSrc(c.file, c.snapshot) ? `<img loading="lazy" src="${esc(figSrc(c.file, c.snapshot))}" alt="">` : FIG_NO_DIGEST}
     <div class="c">${esc(c.body || c.title)}</div><div class="p">${esc(c.producer || c.title)}${c.at ? " · " + esc(day(c.at)) + " " + esc(hhmm(c.at)) : ""}</div></div>`).join("")}</div>`;
 }
 async function renderCompare() {
@@ -529,10 +314,10 @@ async function renderCompare() {
     row("engine", eng(j.engines[0]), eng(j.engines[1]), eng(j.engines[0]) !== eng(j.engines[1])) +
     row("outcome", ...[0, 1].map((k) => esc(j.headline[k][0] || "—") + ((j.ui_vals || [])[k] ? " (" + uiText(...j.ui_vals[k]) + ")" : j.headline[k][1] ? " (95% UI " + esc(j.headline[k][1].replace(/([0-9.]+)M-/, "$1–")) + ")" : "")), j.headline[0][0] !== j.headline[1][0]) +
     row("model spend", usd(j.spent[0]), usd(j.spent[1]), false) + "</table>";
-  h += `<div class="cmp-h">Signed spec</div>` + (j.spec_diff.length ? head + j.spec_diff.map((d) => row(esc(d.field.replace("decision_units.", "")), esc(val(d.before)), esc(val(d.after)), true)).join("") + "</table>" : '<div class="empty" style="padding:4px 0">Same lineage fields in both specs.</div>');
+  h += `<div class="cmp-h">Spec${j.same_spec ? " (the same file in both runs)" : ""}</div>` + (!j.same_spec && !j.spec_diff.length ? `<div class="empty" style="padding:4px 0">The spec files differ (sha256 ${esc(String((j.spec_shas || [])[0] || "?").slice(0, 10))} and ${esc(String((j.spec_shas || [])[1] || "?").slice(0, 10))}) outside the compared fields.</div>` : "") + (j.spec_diff.length ? head + j.spec_diff.map((d) => row(esc(d.field.replace("decision_units.", "")), esc(val(d.before)), esc(val(d.after)), true)).join("") + "</table>" : (j.same_spec ? '<div class="empty" style="padding:4px 0">Same spec.</div>' : ""));
   const pk = Object.entries(j.packages);
   h += `<div class="cmp-h">Units per package component</div>` + (pk.length ? `<table class="cmp"><tr><th></th><th class="n">${esc(A)}</th><th class="n">${esc(B)}</th><th class="n">change</th></tr>` + pk.map(([k, [a, b]]) => `<tr class="${a !== b ? "ch" : ""}"><td>${esc(k)}</td><td class="n">${a}</td><td class="n">${b}</td><td class="n">${b - a > 0 ? "+" : ""}${b - a || ""}</td></tr>`).join("") + "</table>" : '<div class="empty" style="padding:4px 0">No allocation.csv in either run.</div>');
-  const ts = Object.entries(j.tests), v = (x) => x === "CHANGES_PLAN" ? "changes plan" : x === "NO_CHANGE" ? "no change" : x || "—";
+  const ts = Object.entries(j.tests), v = (x) => x == null ? "—" : DT_WORD[x] || DT_WORD[DT_STATE_OF[x]] || DT_WORD.error;
   h += `<div class="cmp-h">Decision tests: does the plan change?</div>` + (ts.length ? head + ts.map(([k, [a, b]]) => row(esc(k), esc(v(a)), esc(v(b)), a !== b)).join("") + "</table>" : '<div class="empty" style="padding:4px 0">No decision tests in either run.</div>');
   $("stream").innerHTML = h; $("streambox").scrollTop = 0;
   $("cmp-close").onclick = () => { S.cmp = null; renderRuns(); renderStream(); };
@@ -540,6 +325,7 @@ async function renderCompare() {
 function renderStream() {
   if (S.cmp) return renderCompare();
   if (S.view === "figs") { $("stream").innerHTML = renderFigures(); wire($("stream")); return; }
+  if (S.view !== "stream" && typeof renderDossier === "function") { renderFigures(); return renderDossier(); }
   renderFigures();
   const box = $("streambox"), atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
   const cards = S.run.cards.filter((c) => !S.filter || c.stage === S.filter), items = [], seen = {};
@@ -550,8 +336,11 @@ function renderStream() {
     seen[g].rows.push(c);
   }
   const top = !S.filter ? summaryBlock() : "";
+  const saved = saveForms();
   $("stream").innerHTML = top + (items.map(card).join("") || '<div class="muted small" style="padding:12px 0">Nothing here for this stage.</div>');
+  restoreForms(saved);
   wire($("stream"));
+  markLoading();
   if (atBottom) box.scrollTop = box.scrollHeight;
 }
 function summaryBlock(forDoc) {
@@ -573,7 +362,7 @@ function gateCard(c, head, open, comment) {
   const rows = dw.map((r) => {
     const checks = r.checks.length ? r.checks : ["(no done-when test recorded)"], n = checks.length;
     return `<tr class="grp"><td colspan="5"><b>${esc(r.blocker)}</b> ${r.severity ? T(r.severity) : ""} · ${esc(r.reviewer || "")} — ${bench(clip((r.claim || "").split("\n")[0], 150))}</td></tr>` +
-      checks.map((ch, k) => `<tr><td>${esc(r.blocker)}.${k + 1}</td><td${(r.raw || [])[k] ? ` title="${esc("pattern: " + r.raw[k])}"` : ""}>${bench(ch)}</td>${k === 0 ? `<td rowspan="${n}">${statusCell(r.passes)}</td><td rowspan="${n}">${esc((r.detail || "").replace(/^(FAIL|PASS)\s*/, ""))}</td><td rowspan="${n}">${r.mechanical ? T("mechanical") : T("judged")}</td>` : ""}</tr>`).join("");
+      checks.map((ch, k) => `<tr><td>${esc(r.blocker)}.${k + 1}</td><td${(r.raw || [])[k] ? ` title="${esc("pattern: " + r.raw[k])}"` : ""}>${bench(ch)}</td>${k === 0 ? `<td rowspan="${esc(n)}">${statusCell(r.passes)}</td><td rowspan="${esc(n)}">${esc((r.detail || "").replace(/^(FAIL|PASS)\s*/, ""))}</td><td rowspan="${esc(n)}">${r.mechanical ? T("mechanical") : T("judged")}</td>` : ""}</tr>`).join("");
   }).join("");
   const act = c.action || "", rule = c.rule != null ? `rule ${c.rule}` : "";
   const needs = act === "AWAIT_OWNER" ? "yes, answer the decision card below." : "no.";
@@ -585,71 +374,110 @@ function gateCard(c, head, open, comment) {
 }
 function blockerTable(g) {
   const rows = g.rows.map((c, i) => {
-    const a = esc(JSON.stringify(c.anchor || {}));
-    return `<tr class="row" data-tog="bt${g.round}_${i}"><td>${esc(c.blocker_id)}</td><td>${T(c.severity)}</td><td>${esc(c.reviewer || "")}</td><td>${esc(stage(c.target_stage))}</td><td class="clip">${bench(String(c.claim || "").split("\n")[0])}</td><td>${c.resolved ? '<span class="ok-i">✓ resolved</span>' : "open"}</td></tr>
-      <tr class="more" id="bt${g.round}_${i}" hidden><td colspan="6"><div>${bench(c.claim || "")}</div>${c.evidence ? `<div class="sub">Evidence: ${bench(c.evidence)}</div>` : ""}${c.fix_requires ? `<div class="sub">Fix requires: ${bench(c.fix_requires)}</div>` : ""}
-      <div class="acts"><button data-act="agree" data-anchor="${a}">Agree</button><button data-act="disagree" data-anchor="${a}">Disagree</button><button data-act="comment" data-anchor="${a}">Comment</button><button data-act="open" data-file="${esc(c.anchor.file)}" data-anchor-id="${esc(c.blocker_id)}">Open</button></div></td></tr>`;
+    const tog = "bt" + (++TOG_N);
+    return `<tr class="row" data-tog="${esc(tog)}"><td>${esc(c.blocker_id)}</td><td>${T(c.severity)}</td><td>${esc(c.reviewer || "")}</td><td>${esc(stage(c.target_stage))}</td><td class="clip">${bench(String(c.claim || "").split("\n")[0])}</td><td>${c.resolved ? '<span class="ok-i">✓ resolved</span>' : "open"}</td></tr>
+      <tr class="more" id="${esc(tog)}" hidden><td colspan="6"><div>${bench(c.claim || "")}</div>${c.evidence ? `<div class="sub">Evidence: ${bench(c.evidence)}</div>` : ""}${c.fix_requires ? `<div class="sub">Fix requires: ${bench(c.fix_requires)}</div>` : ""}
+      <div class="acts"><button data-act="agree" data-ref="${ref({ anchor: c.anchor || {}, evidence: c.snapshot, run: S.run && S.run.run_dir })}">Agree</button><button data-act="disagree" data-ref="${ref({ anchor: c.anchor || {}, evidence: c.snapshot, run: S.run && S.run.run_dir })}">Disagree</button><button data-act="comment" data-ref="${ref({ anchor: c.anchor || {}, evidence: c.snapshot, run: S.run && S.run.run_dir })}">Comment</button><button data-act="open" data-file="${esc(c.anchor.file)}" data-anchor-id="${esc(c.blocker_id)}">Open</button></div></td></tr>`;
   }).join("");
   const high = g.rows.filter((c) => c.severity === "HIGH" && !c.resolved).length;
   return `<div class="card"><div class="head"><span class="t">Critique${g.round != null ? " round " + esc(g.round) : ""}: ${g.rows.length} ${T("blocker", "blockers")}, ${high} open ${T("HIGH")}</span>${when(g.at)}</div>
     ${ctx(`Findings from the critics. An open ${T("HIGH")} blocks ${T("ACCEPT")}; each has a ${T("done-when")} test. Click a row for the full claim.`, "no. Agree or disagree to record feedback.")}
     <table class="t"><tr><th>id</th><th>severity</th><th>reviewer</th><th>${T("target stage")}</th><th>claim</th><th>status</th></tr>${rows}</table></div>`;
 }
+// Four states, never folded: a test that did not run, or whose result cannot be read, is not "no change".
+const DT_STATE_OF = { CHANGES_PLAN: "changed", NO_CHANGE: "unchanged", NOT_RUN: "not_run" };
+const DT_WORD = { changed: "changes plan", unchanged: "no change", not_run: "not run", error: "error: cannot be read" };
+const DT_CELL = { changed: '<span class="bad-i">yes</span>', unchanged: "no", not_run: '<span class="muted">not run</span>', error: '<span class="bad-i">error</span>' };
 function dtTable(g) {
-  g.rows.forEach((c) => { if (c.changes == null) c.changes = c.verdict === "CHANGES_PLAN"; c.test_id = c.test_id || (c.anchor || {}).id; });   // a server from before ζ
+  g.rows.forEach((c) => { if (!c.state) c.state = DT_STATE_OF[c.verdict] || "error"; c.test_id = c.test_id || (c.anchor || {}).id; });   // a server from before the four states
   const thrs = [...new Set(g.rows.map((c) => c.threshold_pct))], thr = thrs.length === 1 ? thrs[0] : undefined;
   const first = (t) => { const m = String(t).match(/^.*?[.?!](?=\s|$)/); return m ? m[0] : String(t); };
   const rows = g.rows.map((c, i) => { const body = c.body || "", lead = first(body), rest = body.slice(lead.length).trim();
     return `<tr><td><button class="link" data-act="open" data-file="${esc(c.anchor.file)}" data-anchor-id="${esc(c.test_id)}">${esc(c.test_id).replace(/_/g, "_<wbr>")}</button></td>
-    <td>${bench(lead)}${rest ? ` <button class="link" data-more="dtm${i}">more</button><div id="dtm${i}" hidden class="sub">${bench(rest)}</div>` : ""}${c.parameter ? `<div class="sub">${esc(c.parameter)}</div>` : ""}</td>
+    <td>${bench(lead)}${rest ? ` <button class="link" data-more="${esc("dtm" + i)}">more</button><div id="${esc("dtm" + i)}" hidden class="sub">${bench(rest)}</div>` : ""}${c.parameter ? `<div class="sub">${esc(c.parameter)}</div>` : ""}</td>
     <td class="n">${(c.values || []).map((v) => esc(typeof v === "number" ? num(v) : v)).join(", ") || "—"}${c.unit && (c.values || []).some((v) => typeof v === "number") ? ` <span class="muted">${esc(c.unit)}</span>` : ""}</td>
-    <td>${c.changes ? '<span class="bad-i">yes</span>' : "no"}</td><td class="n">${pct(c.share_pct)}${c.threshold_pct != null && c.threshold_pct !== thr ? ` <span class="muted">(threshold ${pct(c.threshold_pct, 0)})</span>` : ""}</td>
+    <td${c.why ? ` title="${esc(c.why)}"` : ""}>${DT_CELL[c.state] || DT_CELL.error}</td><td class="n">${pct(c.share_pct)}${c.threshold_pct != null && c.threshold_pct !== thr ? ` <span class="muted">(threshold ${pct(c.threshold_pct, 0)})</span>` : ""}</td>
     <td class="n">${(c.objective_vs_point_pct || []).map((x) => x == null ? "—" : (x > 0 ? "+" : "") + pct(x, 2)).join(", ") || "—"}</td></tr>`; }).join("");
-  const ch = g.rows.filter((c) => c.changes).length;
-  return `<div class="card"><div class="head"><span class="t">${T("decision test", "Decision tests")}: ${ch} of ${g.rows.length} change the plan</span>${when(g.at)}</div>
+  const n = (st) => g.rows.filter((c) => c.state === st).length, nr = n("not_run"), er = n("error");
+  return `<div class="card"><div class="head"><span class="t">${T("decision test", "Decision tests")}: ${n("changed")} of ${g.rows.length} change the plan${nr ? `, ${nr} not run` : ""}${er ? `, ${er} cannot be read` : ""}</span>${when(g.at)}</div>
     ${ctx(`Each test re-solves the plan with one input at other values. It changes the plan when more than ${thr != null ? pct(thr, 0) : "the threshold share"} of units change package.`, "no.")}
     <table class="t"><tr><th>id</th><th style="width:44%">what it tests</th><th class="n">value tested</th><th>plan changes?</th><th class="n">units changed</th><th class="n"><span class="term" tabindex="0" title="The objective of the plan re-solved at the tested value, relative to the point plan's objective evaluated at the same value: how much re-optimising gains (models/decision_tests/*.yaml: objective vs point_plan_objective_under_test).">re-solved vs point plan</span></th></tr>${rows}</table></div>`;
 }
 function card(c) {
-  const a = c.anchor ? esc(JSON.stringify(c.anchor)) : "";
-  const comment = c.anchor ? `<button data-act="comment" data-anchor="${a}">Comment</button>` : "";
+  const comment = c.anchor ? `<button data-act="comment" data-ref="${ref({ anchor: c.anchor, evidence: c.snapshot, run: S.run && S.run.run_dir })}">Comment</button>` : "";
   const open = c.anchor && c.anchor.file ? `<button data-act="open" data-file="${esc(c.anchor.file)}" data-anchor-id="${esc(c.anchor.id || "")}">Open</button>` : "";
   const head = (t, extra) => `<div class="head"><span class="t">${t}</span>${extra || ""}${when(c.at)}</div>`;
-  const line = (cls, txt) => `<div class="line ${cls || ""}"><span class="x">${txt}</span>${when(c.at)}</div>`;
+  const line = (cls, txt) => `<div class="line ${esc(cls || "")}"><span class="x">${txt}</span>${when(c.at)}</div>`;
   switch (c.kind) {
     case "blocker_table": return blockerTable(c);
     case "dt_table": return dtTable(c);
     case "stage": return line(c.stage === "FINAL" && /fail/i.test(c.body || "") ? "bad" : "", `<b>${esc(c.title)}</b>${c.body ? " · " + esc(c.body) : ""}${c.spent_usd != null ? ` · ${usd(c.spent_usd)}` : ""}`);
     case "fix_loop": return line("", `<b>Fix loop</b> · ${esc(c.body)}`);
     case "batch": return line("", `<b>Engine batch</b> · ${c.done == null ? "?" : c.done}/${esc(c.n)} done${c.live ? (c.eta_s != null ? " · ETA " + fmtS(c.eta_s) : "") : c.done != null ? " · interrupted" : ""}${c.error ? " · " + esc(c.error) : ""}`);
-    case "figure": return `<div class="card">${head(esc(c.body || c.title))}${ctx("A figure from the analysis.", "no.")}<img class="thumb" loading="lazy" src="/api/file?${q({ run: S.runId, path: c.file })}" data-act="open" data-file="${esc(c.file)}">
+    case "figure": return `<div class="card">${head(esc(c.body || c.title))}${ctx("A figure from the analysis.", "no.")}${figSrc(c.file, c.snapshot) ? `<img class="thumb" loading="lazy" src="${esc(figSrc(c.file, c.snapshot))}" data-act="open" data-file="${esc(c.file)}">` : FIG_NO_DIGEST}
       <div class="sub">${esc(c.title)}${c.producer ? ` · ${esc(c.producer)}` : ""}</div>${c.provenance_error ? `<div class="sub" style="color:var(--bad)">provenance unreadable: ${esc(c.provenance_error)}</div>` : ""}<div class="acts">${open}${comment}</div></div>`;
     case "gate": return gateCard(c, head, open, comment);
     case "decision_needed": return decisionCard(c, head);
     case "chat": {
       const body = c.role === "assistant" ? md(c.text) : esc(c.text).replace(/\n/g, "<br>");
       const unc = (c.uncited || []).length ? `<div class="uncited">Uncited: ${c.uncited.map(esc).join(" · ")}</div>` : "";
-      const cost = c.usd != null ? `<span class="tm" title="${c.model && c.model !== "claude-opus-5-5" ? "served by " + esc(c.model) + ", priced at Opus 5.5 rates" : ""}">$${Number(c.usd).toFixed(3)}</span>` : "";
-      return `<div class="card chat ${esc(c.role)}"><div class="head"><span class="t">${c.role === "assistant" ? "Claude" : "You"}</span>${cost}${when(c.at)}</div><div class="body">${body}</div>${unc}</div>`;
+      const unchk = (c.citations || []).filter((x) => x.status !== "checked");
+      const chk = unchk.length ? `<div class="uncited">Citations not checked against what Claude was shown: ${unchk.map((x) => esc(x.file + (x.anchor ? "#" + x.anchor : "") + " (" + x.status + ")")).join(" · ")}</div>` : "";
+      const cost = c.usd != null ? `<span class="tm" title="${esc(c.fallback ? "a refusal fallback answered" + (c.model ? " (" + c.model + ")" : "") + ": charged at the reserved worst case" : c.model && c.model !== "claude-opus-5-5" ? "served by " + c.model + ", priced at Opus 5.5 rates" : "")}">$${Number(c.usd).toFixed(3)}</span>` : "";
+      return `<div class="card chat ${esc(c.role)}"><div class="head"><span class="t">${c.role === "assistant" ? "Claude" : "You"}</span>${cost}${when(c.at)}</div><div class="body">${body}</div>${unc}${chk}</div>`;
     }
-    case "feedback": return `<div class="card chat feedback">${head("Feedback: " + esc(c.fb_kind) + (c.verdict ? " · " + esc(c.verdict) : ""), `<span class="tm">${esc(c.layer)}</span>`)}<div class="body">${esc(c.text)}</div>${c.anchor && c.anchor.file ? `<div class="sub">on ${esc(c.anchor.file)}${c.anchor.id ? "#" + esc(c.anchor.id) : ""}</div>` : ""}${c.proposed_change ? `<div class="sub">Proposed: ${esc(c.proposed_change)}</div>` : ""}</div>`;
+    case "feedback": return `<div class="card chat feedback">${head("Feedback: " + esc(c.fb_kind) + (c.verdict ? " · " + esc(c.verdict) : ""), `<span class="tm">${esc(c.layer)}</span>`)}<div class="body">${esc(c.text)}</div>${c.evidence && c.evidence.excerpt ? `<div class="sub" title="${esc("sha256 " + (c.evidence.sha256 || "none") + " · " + (c.evidence.at || ""))}">Seen then (round ${esc(c.evidence.round == null ? "?" : c.evidence.round)}, ${esc(String(c.evidence.sha256 || "none").slice(0, 10))}): ${esc(clip(String(c.evidence.excerpt), 300))}</div>` : ""}${c.anchor && c.anchor.file ? `<div class="sub">on ${esc(c.anchor.file)}${c.anchor.id ? "#" + esc(c.anchor.id) : ""}</div>` : ""}${c.proposed_change ? `<div class="sub">Proposed: ${esc(c.proposed_change)}</div>` : ""}</div>`;
     case "error": return `<div class="card error">${head(esc(c.title))}<div class="body small">${esc(c.body)}</div><div class="acts">${open}</div></div>`;
     default: return `<div class="card">${head(esc(c.title || c.kind))}<div class="body">${esc(c.body || "")}</div></div>`;
   }
 }
+function remoteBlock() {   // a remote answer needs a fresh mirror: why not, or ""
+  const sy = S.meta && S.meta.sync;
+  return S.run && S.run.mirror && sy && sy.stale ? `The mirror is stale (${sy.why}): remote approval is off until a sync succeeds.` : "";
+}
 function decisionCard(c, head) {
-  const id = esc(c.id);
+  // The controls act on the run and the content this card was rendered for (ref), never on whatever run is
+  // selected when the button is pressed; the server checks the ticket and the sign command the content.
+  const k = ref({ run: c.run_id, ticket: c.ticket, sub: c.sub, sha: c.spec_sha256, dsha: c.derivations_sha256, ssha: c.sheet_sha256, fps: c.fingerprints || [] });
+  const block = remoteBlock() || (c.sub === "spec" && c.sheet_stale ? `The sign-off sheet is stale (${c.sheet_stale}); approval waits for the regenerated sheet.` : ""), dis = block ? " disabled" : "";
+  const blockNote = block ? `<div class="small" style="color:var(--bad)">${esc(block)}</div>` : "";
   if (c.sub === "spec") return `<div class="card need">${head(esc(c.title))}${ctx("The run waits for the owner to sign its decision spec.", "yes, answer below.")}<div class="body">${md(c.body)}</div>
-    <div class="answer" data-for="${id}"><textarea class="note" placeholder="Your note (required): what you checked, what you accept"></textarea>
-    <label class="inline"><input type="checkbox" class="confirm"> I have read the sheet and sign the spec as the owner</label><button class="primary" data-act="sign-spec">Sign</button><div class="small result"></div></div></div>`;
-  const items = (c.items || []).map((it, k) => `<div style="margin:12px 0"><b>${esc(it.finding)}</b>
+    <div class="small muted">Signing binds to decision_spec.yaml sha256 ${esc(String(c.spec_sha256 || "?").slice(0, 12))}; a spec changed since this page loaded is refused.</div>
+    <div class="answer" data-ref="${esc(k)}" data-key="${esc(c.ticket || "")}"><textarea class="note" placeholder="Your note (required): what you checked, what you accept"></textarea>
+    <label class="inline"><input type="checkbox" class="confirm"> I have read the sheet and sign the spec as the owner</label><button class="primary" data-act="sign-spec"${dis}>Sign</button>${blockNote}<div class="small result"></div></div></div>`;
+  const items = (c.items || []).map((it, i) => `<div style="margin:12px 0"><b>${esc(it.finding)}</b>
       <div class="sub">Why it bears on the decision: ${esc(it.reason)}</div><div class="sub">Gate finding: ${esc(it.claim)}</div>
       ${(it.declarations || []).map((d) => `<div class="sub">Declaration ${esc(d.id)}: ${inline(d.test)}</div>`).join("") || '<div class="sub">Not declared, and untested.</div>'}
-      <div style="margin-top:6px"><label class="inline"><input type="radio" name="a${k}${id}" value="accept" data-f="${esc(it.finding)}" ${it.answer === "accept" ? "checked" : ""}> accept</label>
-      <label class="inline"><input type="radio" name="a${k}${id}" value="decline" data-f="${esc(it.finding)}" ${it.answer === "decline" ? "checked" : ""}> decline</label>${it.answer ? `<span class="small muted">recorded: ${esc(it.answer)}</span>` : ""}</div></div>`).join("");
+      <div style="margin-top:6px"><label class="inline"><input type="radio" name="${esc(k + "_" + i)}" value="accept" data-f="${esc(it.fingerprint)}" ${it.answer === "accept" ? "checked" : ""}> accept</label>
+      <label class="inline"><input type="radio" name="${esc(k + "_" + i)}" value="decline" data-f="${esc(it.fingerprint)}" ${it.answer === "decline" ? "checked" : ""}> decline</label>${it.answer ? `<span class="small muted">recorded: ${esc(it.answer)}</span>` : ""}</div></div>`).join("");
   return `<div class="card need">${head(esc(c.title), c.status ? `<span class="tm">${esc(c.status)}</span>` : "")}${ctx("Findings that bear on the decision; only the owner may accept them.", "yes, answer below.")}<div class="body">${esc(c.body)}</div>${items}
-    <div class="answer" data-for="${id}"><textarea class="note" placeholder="Your note (required)"></textarea>
-    <label class="inline"><input type="checkbox" class="confirm"> I answer these declarations as the owner</label><button class="primary" data-act="scope">Submit answers</button><div class="small result"></div></div></div>`;
+    <div class="answer" data-ref="${esc(k)}" data-key="${esc(c.ticket || "")}"><textarea class="note" placeholder="Your note (required)"></textarea>
+    <label class="inline"><input type="checkbox" class="confirm"> I answer these declarations as the owner</label><button class="primary" data-act="scope"${dis}>Submit answers</button>${blockNote}<div class="small result"></div></div></div>`;
+}
+// An answer being written survives a refresh: its note, confirmation and choices are kept by the card's ticket
+// (the run and the content shown). A changed request has a new ticket, so its form starts empty.
+function saveForms() {
+  const out = {};
+  document.querySelectorAll("#stream .answer[data-key]").forEach((box) => {
+    const card = box.closest(".card");
+    out[box.dataset.key] = { note: box.querySelector(".note").value, confirm: box.querySelector(".confirm").checked,
+      radios: [...card.querySelectorAll("input[type=radio]:checked")].map((r) => [r.dataset.f, r.value]),
+      focus: document.activeElement === box.querySelector(".note"), result: box.querySelector(".result").textContent };
+  });
+  return out;
+}
+function restoreForms(saved) {
+  document.querySelectorAll("#stream .answer[data-key]").forEach((box) => {
+    const f = saved[box.dataset.key]; if (!f) return;
+    const card = box.closest(".card");
+    box.querySelector(".note").value = f.note; box.querySelector(".confirm").checked = f.confirm;
+    box.querySelector(".result").textContent = f.result || "";
+    for (const [fp, v] of f.radios) card.querySelectorAll("input[type=radio]").forEach((r) => { if (r.dataset.f === fp && r.value === v) r.checked = true; });
+    if (f.focus) box.querySelector(".note").focus();
+  });
+}
+function markLoading() {   // while a run loads, no decision can be sent
+  document.querySelectorAll(".answer button.primary").forEach((b) => { b.disabled = S.loading || !!remoteBlock(); });
 }
 function wire(root) {
   root.querySelectorAll("[data-more]").forEach((b) => (b.onclick = (e) => { e.stopPropagation(); const m = document.getElementById(b.dataset.more); if (m) { m.hidden = !m.hidden; b.textContent = m.hidden ? "more" : "less"; } }));
@@ -658,19 +486,25 @@ function wire(root) {
   root.querySelectorAll("[data-act]").forEach((b) => (b.onclick = () => act(b)));
 }
 async function act(b) {
-  const anchor = b.dataset.anchor ? JSON.parse(b.dataset.anchor) : null;
+  // The anchor and the evidence snapshot the card was rendered with (sealed by the server) travel together.
+  const R = b.dataset.ref ? getRef(b.dataset.ref) : {}, anchor = R.anchor || null, shown = R.evidence || null;
+  // A control acts on the run it was rendered for; a control left from another run is refused, never redirected.
+  if (anchor && R.run && R.run !== S.runId && b.dataset.act !== "open") { toast("This control belongs to another run: reload it."); return; }
   switch (b.dataset.act) {
     case "open": return openFile(b.dataset.file, b.dataset.anchorId || "");
-    case "comment": return setAnchor(anchor, null);
+    case "comment": return setAnchor(anchor, null, shown, R.run);
     case "agree":
-      try { await api("/api/feedback", { run: S.runId, kind: "approval", layer: "critique", verdict: "agree", anchor, text: `Agree with ${anchor.id}`, stage: "CRITIQUE" }); toast(`Recorded: agree with ${anchor.id}`); refresh(); } catch (e) { toast(e.message); }
+      try { await api("/api/feedback", { run: R.run || S.runId, kind: "approval", layer: "critique", verdict: "agree", anchor, evidence: shown, text: `Agree with ${anchor.id}`, stage: "CRITIQUE" }); toast(`Recorded: agree with ${anchor.id}`); refresh(); } catch (e) { toast(e.message); }
       return;
-    case "disagree": setAnchor(anchor, "disagree"); $("kind").value = "correction"; $("layer").value = "critique"; syncComposer(); $("text").placeholder = `Why do you disagree with ${anchor.id}?`; return;
+    case "disagree": setAnchor(anchor, "disagree", shown, R.run); $("kind").value = "correction"; $("layer").value = "critique"; syncComposer(); $("text").placeholder = `Why do you disagree with ${anchor.id}?`; return;
     case "sign-spec": case "scope": {
       const box = b.closest(".answer"), note = box.querySelector(".note").value, confirmed = box.querySelector(".confirm").checked;
-      const res = box.querySelector(".result");
-      let body = { run: S.runId, note, confirm: confirmed };
-      if (b.dataset.act === "scope") { body.answers = {}; b.closest(".card").querySelectorAll("input[type=radio]:checked").forEach((r) => (body.answers[r.dataset.f] = r.value)); }
+      const res = box.querySelector(".result"), R = getRef(box.dataset.ref);
+      if (S.loading || !S.run || !R.run || R.run !== S.run.run_dir || S.run.run_dir !== S.runId) { res.textContent = "The run is loading or another run is selected: wait for it to load, then answer."; return; }
+      if (remoteBlock()) { res.textContent = remoteBlock(); return; }
+      const body = { run: R.run, ticket: R.ticket, note, confirm: confirmed };
+      if (b.dataset.act === "scope") { body.fingerprints = R.fps; body.answers = {}; b.closest(".card").querySelectorAll("input[type=radio]:checked").forEach((r) => (body.answers[r.dataset.f] = r.value)); }
+      else { body.spec_sha256 = R.sha; body.derivations_sha256 = R.dsha; body.sheet_sha256 = R.ssha; }
       if (!confirmed) { res.textContent = "Tick the confirmation first."; return; }
       if (!window.confirm(b.dataset.act === "scope" ? "Submit these answers through scripts/scope_signoff.py sign?" : "Sign the decision spec through agents/stage_machine.py sign?")) return;
       try { const r = await api(b.dataset.act === "scope" ? "/api/scope" : "/api/sign_spec", body);
@@ -682,7 +516,13 @@ async function act(b) {
 }
 
 // ---- composer
-function setAnchor(a, verdict) { S.anchor = a; S.verdict = verdict; renderAnchor(); $("text").focus(); }
+function setAnchor(a, verdict, shown, run) {   // the composer's anchor, its snapshot and the run they were taken in
+  S.anchor = a; S.verdict = verdict; S.shown = shown || null; S.anchorRun = a ? (run || S.runId) : null; renderAnchor(); $("text").focus();
+}
+function composerRun() {   // the run the composer posts to, or null when its anchor was taken in another run
+  if (S.anchor && S.anchorRun && S.anchorRun !== S.runId) { toast("The anchor was taken in another run: clear it first."); return null; }
+  return S.anchorRun || S.runId;
+}
 function renderAnchor() {
   $("anchor").innerHTML = S.anchor ? `<span class="chip">on ${esc(S.anchor.kind)} ${esc(S.anchor.id || "")}${S.verdict ? " · " + S.verdict : ""} <button class="link" id="unanchor">×</button></span>` : "";
   if ($("unanchor")) $("unanchor").onclick = () => setAnchor(null, null);
@@ -692,15 +532,17 @@ $("kind").onchange = syncComposer;
 function curStage() { return S.filter || (S.run && S.run.state && S.run.state.state) || ""; }
 $("record").onclick = async () => {
   const text = $("text").value.trim(); if (!text || !S.runId) return;
-  try { await api("/api/feedback", { run: S.runId, kind: $("kind").value, layer: $("layer").value, text, anchor: S.anchor, verdict: S.verdict, proposed_change: $("proposed").value, stage: curStage() });
+  const run = composerRun(); if (!run) return;   // S.anchorRun
+  try { await api("/api/feedback", { run, kind: $("kind").value, layer: $("layer").value, text, anchor: S.anchor, evidence: S.shown, verdict: S.verdict, proposed_change: $("proposed").value, stage: curStage() });
     $("text").value = ""; $("proposed").value = ""; setAnchor(null, null); toast("Feedback recorded"); refresh(); } catch (e) { toast(e.message); }
 };
 $("send").onclick = async () => {
   const text = $("text").value.trim(); if (!text || !S.runId) return;
+  const run = composerRun(); if (!run) return;   // S.anchorRun
   const kind = $("kind").value, btn = $("send");
   btn.disabled = true; btn.textContent = "Thinking…";
   try {
-    const body = { run: S.runId, text, anchor: S.anchor, kind, layer: $("layer").value, proposed_change: $("proposed").value, stage: curStage(), verdict: S.verdict };
+    const body = { run, text, anchor: S.anchor, evidence: S.shown, kind, layer: $("layer").value, proposed_change: $("proposed").value, stage: curStage(), verdict: S.verdict };
     const r = await api("/api/chat", body);
     if (!r.ok) toast(r.error + (r.feedback ? " (the feedback was recorded)" : ""));
     else { $("text").value = ""; $("proposed").value = ""; setAnchor(null, null); S.meta.chat.spent = r.spent; }
@@ -714,10 +556,12 @@ function side(title, html) { $("side-title").textContent = title; $("side-conten
 $("side-close").onclick = () => { $("side").classList.remove("open"); stopLive(); };
 async function openFile(file, anchor) {
   if (!S.runId) return;
-  const url = "/api/file?" + q({ run: S.runId, path: file });
+  const figc = (S.run && S.run.cards || []).find((c) => c.kind === "figure" && c.file === file);
+  const url = /\.(png|jpe?g|svg)$/i.test(file) ? figSrc(file, figc && figc.snapshot) : "/api/file?" + q({ run: S.runId, path: file });
+  if (url === null) { side(file, FIG_NO_DIGEST); return; }
   if (/\.(png|jpe?g|svg)$/i.test(file)) {
     const fig = (S.run.cards || []).find((c) => c.kind === "figure" && c.file === file);
-    side(file, `<img src="${url}">${fig ? `<p>${esc(fig.body)}</p><p class="small muted">${esc(fig.producer || "")} ${fig.sources ? "from <code>" + fig.sources.map(esc).join("</code>, <code>") + "</code>" : ""}</p>` : ""}<div class="acts"><button data-act="comment" data-anchor="${esc(JSON.stringify({ kind: "figure", id: file, file }))}">Comment</button></div>`);
+    side(file, `<img src="${esc(url)}">${fig ? `<p>${esc(fig.body)}</p><p class="small muted">${esc(fig.producer || "")} ${fig.sources ? "from <code>" + fig.sources.map(esc).join("</code>, <code>") + "</code>" : ""}</p>` : ""}<div class="acts"><button data-act="comment" data-ref="${ref({ anchor: { kind: "figure", id: file, file }, evidence: fig && fig.snapshot, run: S.run && S.run.run_dir })}">Comment</button></div>`);
     return;
   }
   let text;
@@ -783,6 +627,3 @@ document.querySelector("main").addEventListener("click", () => $("app").classLis
 { const t = new URLSearchParams(location.search).get("theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; }
 loadRuns();
 setInterval(() => { if (!document.hidden) { refresh(); loadRuns(); } }, 20000);
-</script>
-</body>
-</html>

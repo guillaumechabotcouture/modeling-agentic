@@ -538,11 +538,12 @@ def _load_signoff(run_dir: str) -> dict | None:
     """The harness's geometry sign-off record, or None when the spec has not been signed with one. Unreadable: fail
     closed."""
     p = os.path.join(run_dir, SIGNOFF_FILE)
-    if not os.path.exists(p):
+    if not os.path.lexists(p):
         return None
+    sio = _safe_io()
     try:
-        doc = json.load(open(p, encoding="utf-8"))
-    except (OSError, ValueError) as e:
+        doc = json.loads(sio.read_nofollow(run_dir, SIGNOFF_FILE)[0])     # never through a planted link
+    except (sio.LinkRefused, OSError, ValueError) as e:
         raise GeometryError(f"{SIGNOFF_FILE}: unreadable geometry sign-off record: {e}") from e
     if not isinstance(doc, dict) or not isinstance(doc.get("declaration"), dict):
         raise GeometryError(f"{SIGNOFF_FILE}: not a geometry sign-off record")
@@ -552,16 +553,17 @@ def _load_signoff(run_dir: str) -> dict | None:
 def _spec_signed(run_dir: str) -> bool:
     """Is the decision spec signed? Its own sign-off record (toolkit/spec/signoff.py, agents/stage_machine.py), or
     the brief's when that hashed the spec (scripts/decision_brief.py). A brief-only sign-off is not."""
+    sio = _safe_io()
     for name in SPEC_SIGNOFFS:
         p = os.path.join(run_dir, name)
-        if not os.path.exists(p):
+        if not os.path.lexists(p):
             continue
         if name == "decision_spec.signoff.json":
             return True
         try:
-            doc = json.load(open(p, encoding="utf-8"))
-        except (OSError, ValueError):
-            return True                   # unreadable: assume signed (fail closed: the record must then exist)
+            doc = json.loads(sio.read_nofollow(run_dir, name)[0])
+        except (sio.LinkRefused, OSError, ValueError):
+            return True                   # unreadable or a link: assume signed (fail closed: the record must exist)
         if not isinstance(doc, dict) or (doc.get("sha256") or {}).get(SPEC_FILE) is not None:
             return True
     return False
@@ -687,20 +689,31 @@ def check(run_dir: str, spec: dict | None = None, th: dict | None = None, use_si
     return rep
 
 
+def _safe_io():
+    scripts = os.path.join(ROOT, "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    from lib import safe_io
+    return safe_io
+
+
 def write(run_dir: str, rep: dict, rel: str = ARTIFACT) -> str:
-    p = os.path.join(run_dir, rel)
-    os.makedirs(os.path.dirname(p), exist_ok=True)
-    tmp = p + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(rep, f, indent=1, sort_keys=True)
-    os.replace(tmp, p)
-    return p
+    """Publish a record under the run dir through lib.safe_io (#129): no link followed at any component, a random
+    temporary name, an atomic rename. A planted link refuses the write (GeometryError)."""
+    sio = _safe_io()
+    try:
+        return sio.write_nofollow(run_dir, rel, json.dumps(rep, indent=1, sort_keys=True).encode(), atomic=True)
+    except (sio.LinkRefused, OSError) as e:
+        raise GeometryError(f"{rel}: not written: {e}") from None
 
 
 def run(run_dir: str, spec: dict | None = None) -> dict:
     """check() and write the artifact (harness-owned: data/input_checks.json)."""
     rep = check(run_dir, spec)
-    write(run_dir, rep)
+    try:
+        write(run_dir, rep)
+    except GeometryError as e:           # a planted link at the record: fail closed, the gate sees a HIGH
+        rep = dict(rep, status="failed", reason=str(e), findings=[], signoff_changes=[], acceptance_problems=[])
     return rep
 
 
@@ -1032,6 +1045,26 @@ def _self_test_owner(ok, th) -> None:
         r = check(d, th=th)
         ok(r["status"] == "failed" and FAILED in {f["kind"] for f in findings(r)},
            "IG9f an unreadable geometry sign-off record fails closed")
+        # IG16 (#129 merged): the records go through lib.safe_io: a planted link is never followed
+        outside = os.path.join(d, "outside.json")
+        open(outside, "w").write('{"untouched": true}')
+        os.remove(os.path.join(d, SIGNOFF_FILE))
+        os.symlink(outside, os.path.join(d, SIGNOFF_FILE))
+        r_link = check(d, th=th)
+        for rel in (ARTIFACT,):
+            if os.path.lexists(os.path.join(d, rel)):
+                os.remove(os.path.join(d, rel))
+            os.symlink(outside, os.path.join(d, rel))
+        r_run = run(d)
+        try:
+            freeze(d, "owner", th=th)      # an atomic publish replaces the link at the name, never following it
+        except ValueError:
+            pass
+        ok(r_link["status"] == "failed" and r_run["status"] == "failed"
+           and open(outside).read() == '{"untouched": true}' and not os.path.islink(os.path.join(d, SIGNOFF_FILE)),
+           f"IG16 a link planted at the geometry record or the check's record is never read or written through: the "
+           f"check fails closed, and the sign-off's atomic publish replaces the link ({str(r_link['reason'])[:60]}; "
+           f"{str(r_run['reason'])[:60]})")
     # IG13 (Codex round 2): a signed spec with no geometry record is HIGH (signed before the check, or through a path
     # that skipped the freeze); the owner's approve creates the record (the migration path)
     for how in ("spec", "brief"):

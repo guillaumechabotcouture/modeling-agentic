@@ -1,9 +1,12 @@
 # v2: the run console, a local page for the owner of a run (design note)
 
 **Status:** written before the code (2026-11-02), branch `run-console`, PR into `v2`. v0: one Python
-module (`scripts/run_console.py`) and one HTML file (`scripts/run_console.html`). Nothing in the
-stage machine, the gate or the sign-off code changes. The console reads run artifacts, and it changes
-a run only through the existing sign-off commands.
+module and one HTML file. Nothing in the stage machine, the gate or the sign-off code changes. The
+console reads run artifacts, and it changes a run only through the existing sign-off commands.
+**Review update (PR after #124):** the console now lives in `tools/run_console/` (`run_console.py`,
+`run_console.html`, `run_console.js`), see §11, and the sign-off commands gained the content checks the
+console relies on (`stage_machine.py sign --expect-sha256`, `run_cluster.py sign --label --run
+--expect-spec-sha256`).
 
 ## 1. Who it is for, and what it replaces
 
@@ -106,7 +109,8 @@ Known limits, recorded as open items:
 - `stage_machine.OWNER_LIFECYCLE_WIRED` is `False` on `v2`, so a v2 run does not reach
   OWNER_DECISION today. The card is built from the request file whenever one is pending, so it will work
   once the lifecycle is wired.
-- Remote spec sign-off: `worker_side.sign_side` signs `decision_brief.py` when no scope request is
+- (Fixed in the review PR, §11: a v2 run's remote spec is signed through `stage_machine.py sign
+  --expect-sha256`.) Remote spec sign-off: `worker_side.sign_side` signed `decision_brief.py` when no scope request is
   pending. A v2 run with a spec and no brief needs `stage_machine.py sign` on the worker. That is a
   harness change, not made here; until then the console shows the CLI's refusal.
 
@@ -123,10 +127,13 @@ title. Inside it the runs form a lineage ordered by spec sign-off time, then eng
 history; the sidebar shows the newest on top. Each row shows a short label (the folder's first token:
 `F2_baseline` is "F2" when that is unique), a status chip (completed, failed, stopped, running, waiting),
 the headline number, and one line: the relation to the run before it and the scenario. The relation is
-*amended + re-signed* when the signed spec's sha differs, *resumed* when the history has a FINAL → stage
-transition on the same spec, and *relaunched* otherwise. The scenario is a structured diff of the spec's
-lineage fields (`horizon`, `objective.horizon`, `objective.delivery`, `decision_units.engine_attributes`,
-`decision_units.defaults_accepted` keys, `constraints`, `analysis.decision_tests` ids), shown as a short
+*related run (inferred)* when the spec sha differs (the harness records no parent run id, so the link is
+inferred from the question and the order), *resumed* when the history has a FINAL → stage
+transition on the same spec sha, and *relaunched* otherwise. "Same signed spec" is printed only when the
+shas are equal. The scenario is a structured diff of the spec's
+lineage fields (`horizon`, `objective.outcome`, `objective.horizon`, `objective.delivery`,
+`decision_units.engine_attributes`, `decision_units.defaults_accepted` keys, `constraints`,
+`analysis.decision_tests` by id with their values), shown as a short
 phrase; the sign-off note is its tooltip. The selected run expands to its engine and version (from
 `engine_choice.json`), why it ended, outcome with interval and the largest package-component shift
 against the nearest earlier run with an `allocation.csv`, model spend, spec sha, sign-off time and
@@ -245,7 +252,7 @@ ready to become a learning-loop PR. The console never edits code or the spec.
   The outputs are shown as text; the first status line is parsed into cluster states. Structured
   fields (workers, target, quota refusals) need a `--json` output on `run_cluster.py` (open item).
 
-## 10. Tests (written first, `python3 scripts/run_console.py --self-test`)
+## 10. Tests (written first, `python3 tools/run_console/run_console.py --self-test`)
 
 A synthetic run dir with toy numbers (no licensed data):
 
@@ -264,10 +271,272 @@ A synthetic run dir with toy numbers (no licensed data):
 | RC15 | lineage on a toy lineage of three runs plus two staging copies: one project, order, drafts, relations, the spec diff and its phrase, engine version, chip and end reason, package shift, compare, `/api/runs` projects and `/api/compare` |
 | RC16 | every term the page marks, every gate action, rule and severity has a definition and a source; JSON only for anchors and request bodies; done-when rows join gate status and blocker; the summary's order, intervals and sources; reused batch points |
 | RC17 | the keys the page reads from `/api/runs` are served; errors show in a banner; fetches time out |
-| RC18 | parsed artifacts are cached by mtime and size and re-read when rewritten |
+| RC18 | parsed artifacts are cached by mtime, size, inode and ctime and re-read when rewritten |
 | RC19 | done-when patterns as plain alternatives; component names from the question; project title; operator notes newer than the run; decision-test units |
 | RC20 | `--mirror` with `--roots`: the mirrored run joins the same project's lineage |
 | RC14 | live vs finished: an ETA and live core-seconds only for a fresh progress record on an unfinished run; a progress record left on a finished run, or a stale one, is interrupted; the headline number |
 
 Plus one real end-to-end check, not part of the self-test: start the server on a toy run, hit the
 endpoints, and send one real chat message (spend capped at $1, reported in the PR).
+
+## 11. Review of PR #124 (Codex): what changed
+
+Each finding was reproduced by a failing self-test first (RV1-RV17 in `tools/run_console/run_console.py`, RS1-RS5
+in `cloud/run_cluster.py`, SG11-SG12 in `toolkit/spec/signoff.py`, T70 in `agents/stage_machine.py`).
+
+- **Artifacts are untrusted.** Agents write them. The page script is a separate file under a CSP with no inline
+  script (`script-src 'self'; connect-src 'self'`); every value in an HTML attribute is `esc()` or `ref()` (an
+  index into a JS table: anchors and decision bindings never round-trip through attributes); a served artifact
+  has a sandbox CSP. RV1a lints every `${...}` inside an attribute of the page's templates.
+- **Reads** go through one confined reader (`confined()`): no absolute path, no `..`, no credential file, no
+  link that resolves outside the run dir. The harness readers that open fixed names (`stage_machine.load_state`,
+  `signoff.status`, `scope_signoff`) are pre-checked for links out. Repo files (the page) are read by name.
+- **Writes** (`owner/`, `<root>/_drafts/`, `<root>/_owner/`) open each directory with `O_NOFOLLOW` relative
+  to its parent's fd and the file with `O_NOFOLLOW`; a link or a file with other hard links is refused.
+- **Decisions are bound to what was shown.** Each decision card carries an HMAC ticket over (run dir, card,
+  content); the page sends it with the run id and the content it displayed, and the server refuses a mismatch.
+  The content is then checked again by the command, atomically: `stage_machine.py sign --expect-sha256`
+  (toolkit `signoff.sign` hashes the bytes once and records and copies those bytes), and scope answers keyed
+  by the fingerprints shown, which `scope_signoff.sign` already binds (a changed declaration has a new
+  fingerprint and so no answer). The page drops stale `/api/run` answers (request sequence) and disables
+  decisions while a run loads; an answer being written survives a refresh, keyed by its ticket.
+- **Remote answers name their run.** `run_cluster.py <config> sign <answers> --label L --run RUN
+  [--expect-spec-sha256 SHA] <note>`; `worker_side.sign_side` refuses when the newest run on that label is not
+  RUN, and signs a v2 spec through `stage_machine.py sign --expect-sha256` (a v2 spec without the sha is
+  refused). The label comes from `--remote-label` or the mirror layout `<label>/runs/<run>`; anything else is
+  refused, not guessed. A mirror is classified by path containment, whatever root found it.
+- **Mirror freshness.** The sidebar shows the last successful sync and failures; the mirror is stale with no
+  successful sync yet, after 2 failed syncs in a row, or with no success within 3 sync periods, and remote
+  approval is then refused (page and server). Without `--sync-cmd` freshness is unknown and said so; the remote
+  commands' own checks (run name, sha, fingerprints) still apply. Each sync clears the parse cache.
+- **Chat cost.** Each message reserves its worst case under the lock before its call: input tokens from
+  `messages.count_tokens` (else the UTF-8 byte length, an upper bound), every input token as a 5-minute cache
+  write and a full `max_tokens` of output, on Opus 5.5 ($4/$20, writes $5) and again on the refusal fallback
+  (Opus 5 / 4.8 rates, $5/$25, writes $6.25), from the claude-api skill's price table. A failed stream charges
+  its partial usage when the SDK has a snapshot, else keeps the reservation; a reply served by a fallback keeps
+  the reservation. One run's turns are serialized, so each carries the turns before it.
+- **Four decision-test states**: changed, unchanged, not run, error (cards, compare, chat context).
+- **Evidence and citations.** Feedback stores the anchored file's sha256, round and a short excerpt, shown on
+  the card and in the digest. An anchored chat message carries that excerpt (or the figure's caption). Each
+  `[[file#anchor]]` in a reply is marked checked, anchor not in context, or unchecked (the file's content was
+  not sent). The harness overwrites `critique_<reviewer>.yaml` each round, so earlier rounds are on disk only if
+  a run keeps per-round files; the console lists every `critique_*.yaml` it finds, by its `round`.
+- **Batch reuse.** `scripts/compute.py code_fingerprint` hashes `scripts/` and `toolkit/` whole, so a console
+  edit invalidated every stored engine batch. The smallest correct fix is to move the console out of the
+  fingerprinted directories (to `tools/run_console/`) rather than add a presentation-file exclude list inside
+  the fingerprint, which every later presentation file would have to remember. `scripts/self_tests.py` now
+  includes `tools/` in its discovery scope (ST12). The move changes the fingerprint once (the console's files
+  leave the hash), so batches stored before this PR are recomputed once.
+
+Open items (not built here): a harness read model for events and lineage (parent run ids recorded by the
+harness instead of inferred; one event log instead of rebuilding the story from files), atomic mirror
+generations (sync into a new directory and swap, so a read never sees a half-synced run), per-round critique
+archives, and pricing a fallback's per-model usage split instead of keeping the reservation.
+
+## 12. Review round 2 (Codex, on #129)
+
+Each finding reproduced first (RW1-RW11, SP-RW1-4, SG13-18, SO23, RS6-8, T71).
+
+- **Engine references are an allowlist (harness).** `toolkit/spec/schema.py check_engine_ref` refuses, before any
+  import, an engine reference whose module is not a file under `toolkit/engines/` (plus the repo's
+  `toolkit.spec.priors:ToyPriorEngine` test engine; self-tests may add in-process `TEST_ENGINE_REFS`);
+  `engine_class` checks the Engine contract before instantiation. `load_engine`, the signed candidates, the
+  engine choice, `analysis_backend._card` and `toolkit/engines/benchmark.load_engine` all go through it. A spec
+  naming `subprocess:Popen` or `os:system` is reported invalid and runs nothing. Other dotted-path imports in the
+  repo are fixed module names or benchmark packs shipped under `toolkit/engines/` (repo files, not artifacts);
+  `scripts/compute.py` runs the run's own model code by design.
+- **The sign commands write no-follow and atomically.** `scripts/lib/safe_io.py` gains `read_nofollow` and
+  `write_nofollow` (each component opened with `O_NOFOLLOW` relative to its parent's fd; atomic publish through a
+  temporary file and a rename relative to the directory fd; a hard-linked file is refused before truncation).
+  `toolkit/spec/signoff.sign`, `decision_brief.sign` and `scope_signoff.sign` use them; the spec (and each frozen
+  brief file) is read once and validated, hashed and copied from those bytes.
+- **Reads have no check-then-open window.** The console reads every artifact through `read_nofollow`; a cached
+  parse is reused only for the same inode, mtime, size and ctime as that read. A link anywhere under the run dir
+  is not followed (a linked artifact shows as an error).
+- **The console has its own read model** for the spec sign-off and the scope request (`spec_view`, `inbox`); it
+  no longer calls `signoff.status`, `schema.load` or the scope loaders, which can follow paths the artifacts name.
+  `signoff.derived_changed` reports a derivation output outside the run dir as changed and never hashes it. A batch
+  summary's `fn` outside the run dir (or the repo), or a link under `models/` or `data/` leaving both, is not
+  passed to `compute.code_fingerprint`.
+- **One approval snapshot.** The spec card shows the sheet read once, with the sheet's sha256, the spec's and the
+  derivation record's ("none" when absent). The ticket binds all three and `stage_machine.py sign`
+  (`--expect-sha256`, `--expect-derivations-sha256`, `--expect-sheet-sha256`) checks each. Remote: `run_cluster.py
+  sign --action spec|scope` with the same hashes; an expected spec sha always selects sha-bound spec signing, and a
+  spec action without one fails closed.
+- **Chat:** an interrupted stream keeps its whole reservation (partial usage is a lower bound). The citation index
+  holds only the lines the prompt kept.
+- **Evidence** is captured when a card is rendered (the blocker's or figure's file sha, round, excerpt), sealed with
+  a per-process HMAC; feedback and chat store that snapshot when its seal checks, else one captured at submit time
+  (marked `captured: submit`).
+- **Lineage:** every relation is marked "(inferred)" until the harness records parent run ids.
+
+## 13. Review round 3 (Codex, on #129)
+
+Trust model: the harness must hold when agent-written artifacts in a run dir are hostile (specs, derivation records
+and outputs, links, temporary files). Two shared mechanisms instead of point patches:
+
+- **One import guard** (`toolkit/import_guard.py`). Every module or attribute name that comes from a spec, a
+  benchmark pack or a run artifact is imported through it, with an allowlist policy per kind: engines (modules under
+  `toolkit/engines/`, plus `toolkit.spec.priors:ToyPriorEngine`), oracles (`toolkit.engines.*.oracles` and
+  `toolkit.engines.benchmark`'s self-test generator), calibrators (`toolkit.analysis.calibration` and modules under
+  `toolkit/engines/`). The module must be a file of the repo, checked before anything is imported; private
+  attributes are refused. `schema.load_engine`/`engine_class`/`binding_for_ref` (reached by the sign-off sheet),
+  the legacy `spike/analysis/spec.py` loader, and the benchmark oracle and calibrator imports (including the
+  calibrator code digest) go through it. `scripts/import_audit.py --self-test` greps every tracked Python file for
+  `import_module(`, `__import__(` and `spec_from_file_location(` with a non-literal argument; each must be in the
+  guard or listed in its REVIEWED table with the reason its name cannot come from an artifact (exact counts per
+  file, so a new site fails CI).
+- **One publisher** (`scripts/lib/safe_io.py`): harness writes in a run dir go through `write_nofollow` (no link
+  followed at any component, a random temporary name, atomic rename). Round 3 moves the derivation record
+  (`pipeline._write_json`), the derivation outputs (`pipeline._publish_outputs`: read with no link followed in the
+  work dir, published atomically) and the sign-off sheet (`signoff.write_sheet`, called by the stage machine) onto it.
+
+Also: `compute.code_fingerprint(confined=True)` hashes the run's files through no-follow fds and refuses a link
+anywhere under `models/` or `data/` (the entries themselves included) or a function file outside the run dir and
+the repo; with no links its output is byte-identical to the default, which is unchanged (so batch reuse is
+unchanged). The console uses it. `signoff.derived_changed` reads the record and hashes every output through
+no-follow fds. The sheet writer records the spec and derivation-record hashes it was generated from in the sheet's
+last line; the console marks a sheet whose sources no longer match as stale and disables approval, and the signer
+refuses it. The brief sign-off validates the captured `success_criteria.yaml` bytes. Evidence seals carry the
+canonical run id and are checked against the run they are submitted to; the page clears the composer's anchor when
+the run changes; gate cards and the figure side panel carry their render-time snapshot; a blocker's own `evidence`
+field is kept and the snapshot is stored under `snapshot`.
+
+## 14. Review round 4 (Codex, on #129)
+
+- **Retired derivation outputs** (`pipeline._retire_outputs`): names from the previous derivation record must be
+  plain relative paths under `data/derived/` (checked by parts, so `data/derived/../../x` is refused) and are
+  unlinked relative to a no-follow directory fd (`lib.safe_io.remove_nofollow`).
+- **More writers on `lib.safe_io`**: run_state.json (`save_state`), the machine's JSON and YAML records, the report
+  and deliverable, the evidence and pipeline stubs, the lead's sign-off record, staged inputs, the findings ledger,
+  analysis artifacts and the manifest, compute batch results, summaries, the partial journal (append through
+  `open_append_nofollow`) and the batch lock, and the scope sign-off ledger, trace and request.
+  `scripts/write_audit.py --self-test` scans the v2 harness modules for write-mode `open(`, write-flag `os.open(`,
+  `shutil.copy*/move/rmtree`, `os.replace/rename` and `os.remove/unlink` outside self-test code; each remaining site
+  is in its reviewed table with a reason and an exact count. The table names the run-dir writes still on plain opens
+  as open items (fix loop records, analysis batch files, the compute ledger, a few task outputs, pipeline aside
+  copies); the counts keep new ones out.
+- **The engine policy resolves only engine classes** (a class with describe/parameters/run); the spike loader builds
+  through `schema.engine_class`.
+- **The sign-off sheet is rendered from the captured bytes it hashes** (the spec and the derivation record, read once).
+- **Feedback controls and the composer are bound to the run they were taken in**: a control left from another run is
+  refused on the page, and the server refuses a snapshot that does not check for the run and anchor instead of
+  replacing it with fresh evidence.
+- **Figures are served by their snapshot hash** (`/api/file?...&sha=`); a file whose bytes changed is refused.
+
+## 15. Run dossier: Spec, Evidence, Engine and Calibration tabs
+
+**Status:** written before the code (2026-11-02), branch `run-dossier`, stacked on `fix-run-console-review` (#129).
+
+**Why.** The owner (an expert epidemiological modeller) said the console "doesn't show the spec, or the evidence, or
+the engine details". The Stream and Figures views narrate events: stages, critiques, gate decisions, figures. They do
+not show what the run is made of. The dossier adds four read-only views beside Stream and Figures, each built from
+files the harness already writes.
+
+**Where it lives.** `tools/run_console/dossier.py` builds the data model. It is one small module with its own
+`--self-test`, which `scripts/self_tests.py` discovers. `tools/run_console/dossier.js` renders it, served at
+`/dossier.js` under the page's CSP (`script-src 'self'`). The server adds one endpoint, `GET /api/dossier?run=<id>`,
+which returns `{spec, evidence, engine, calibration}`. The page fetches it only when a dossier tab is open, so the
+20-second poll of `/api/run` does not grow. The module adds no new dependency and writes nothing.
+
+**Read model.** Every run artifact is read through the console's confined reader (`run_console._load_rel`: a plain
+relative path, no `..`, no absolute path, no credential file, no link at any component, one no-follow fd). The
+reader also parses JSON and YAML. Paths named inside artifacts are untrusted and pass through the same reader: the
+units table named by the spec, a derivation's script, inputs and outputs, and the provenance file's inputs.
+Directories are listed through no-follow directory fds (`lib.safe_io.dir_fd_nofollow`). No harness loader runs, and
+no engine is imported or instantiated. The console never calls `toolkit/spec/schema.load` or
+`benchmark.verified_benchmarks(engine)`, because both need an engine instance built from a name in an artifact.
+There is one read outside the run directory: this checkout's own `toolkit/engines/<name>/benchmarks/results.yaml`.
+Its path is built from a fixed pattern (`<name>` must match `[a-z0-9_]+`). It is read only to show the re-stamp
+record, and only when its sha256 equals the one the run recorded in `analysis/engine.yaml` `inputs`. When the hashes
+differ, the tab says so and shows no re-stamp status.
+
+**Fail closed.** Each section, and each part within a section, is either data or
+`{"available": false, "why": "<file>: <reason>"}`. The tab shows "Not available: <why>" in that place, never an empty
+panel. A missing file reads "not written by this run (yet)". A file that cannot be read or parsed shows the reader's
+error.
+
+**Style (as the rest of the console).** Anything with rows and columns is a table. Values carry real units ($, years,
+days, the card's own units), with the existing `num()` formatting. Jargon is marked from the glossary, which gains
+the dossier's terms (emulator, emulator inversion, held out, fitted, price rule, cost basis, re-stamped by proof,
+validate_once, identifiability, clamped, engine attribute binding, defaults accepted). Each section opens with one
+muted line: what it is, and "Needs you: …". No raw JSON or YAML is shown. Each section has a "raw" button that opens
+the source file in the side panel through the existing `/api/file` route (text lines, the confined read).
+
+### 15.1 What each tab shows (artifact names from the code)
+
+| Tab | Part | Source (writer) |
+|---|---|---|
+| Spec | question, decision maker and date | `decision_spec.yaml` (owner, signed by `toolkit/spec/signoff.py`) |
+| | decision units: table, id, label and region columns, count of units and regions | the spec's `decision_units`, plus a count of the rows of the units table it names (`decision_units.csv`) |
+| | engine attribute bindings: attribute, how it is bound (column, columns, value), with the source or split | `decision_units.engine_attributes` |
+| | defaults accepted, each with its reason; populations | `decision_units.defaults_accepted`, `decision_units.populations` |
+| | components (group, eligible population), packages, engine map | `options.components`, `options.packages`, `options.engine_map` |
+| | cost items: component, value, price year, rule, basis, includes, base-year value and the derived per-person cost over the window | `options.cost_items` and `options.prices`. The derivation follows `toolkit/alloc/costs.py` `item_cost`: value × price factor × share × times × years, divided by `people_per_commodity` for `per_commodity`. A `per_outcome` item has no per-person figure; it is priced per outcome |
+| | objective (outcome, sense, outcome window, delivery period, discounting); constraints (envelope, fixed costs, eligibility); comparator | `objective`, `constraints`, `comparator` |
+| | calibration (method, attribute, range, target column, window, metric, target uncertainty, target frame) | `calibration` |
+| | uncertainty sources and draws; cost ranges | `uncertainty` |
+| | decision tests: id, type, what is varied, values with units, question | `analysis.decision_tests`. Units for a parameter test come from the engine card's parameter table (`analysis/engine.yaml`); an interaction test's values are multipliers (×) |
+| | sign-off history: who signed, when, the note, the spec sha256 and the derivation record's sha256; whether the current spec still matches | `decision_spec.signoff.json` (current); `evidence_planner/superseded_signoff_*/decision_spec.signoff.json` (archived) |
+| | for each archived sign-off, a structured diff against the next one: field, before, after, grouped by section | the archived spec is the file under that folder whose sha256 equals the archived record's. The next is the next archived one by `signed_at`, or the current spec for the newest. Lists of objects with an `id` are compared by id. When the archived spec cannot be found by hash, the diff reads "not available" |
+| Evidence | evidence registry: each entry's value, source and citation, where it is used, status. A stub registry (`status: stub`) says that no parameter has been fetched or matched | `evidence/registry.yaml` (`stage_machine.h_EVIDENCE`) |
+| | staged parameter registries: name, value (with interval), kind, source, citation, where the spec uses it (spec fields that name it) | any `data/inputs/**/*registry*.yaml` with a `parameters:` list |
+| | citations: id, title, value, source, DOI or URL, which entries cite it | `citations_*.txt` in `data/inputs/**` or the run root (`## [<id>] <title>` blocks with `- **Key**: value` lines) |
+| | staged inputs: path, source, size, sha256 then and now (match, changed, missing), which derivation reads it, or why it is ignored | `data/inputs_provenance.json` (`inputs`, `cited`), `data/derivations.yaml` |
+| | derivations: input file → script → output columns; the columns used and ignored per input, with reasons; the record (ok, runs, runtime, sandbox, libraries, script and output sha256 then and now) | `data/derivations.yaml`, `data/derivations_record.json` (`scripts/pipeline.py derive`); the output's header row |
+| | input checks (geometry): status, reason, counts, findings (severity, code, units, claim, accepted) | `data/input_checks.json` (`toolkit/spec/geometry.py`), when present |
+| Engine | engine choice: candidates (name, version, eligible, why not), the chosen engine and why | `engine_choice.json` |
+| | engine card: mechanisms; components and their levels; unit attributes with valid range and the spec's binding; outputs; age groups; notes | `analysis/engine.yaml` `data.card` (the harness's snapshot of the card) |
+| | parameters: name, kind (fitted, fixed, scenario), value with units, prior range, fit box and the benchmarks fitted to, verified, source | `analysis/engine.yaml` `data.parameters` and `data.card.fitted` |
+| | benchmarks: id, what it tests, model value, target, band, in or out of band (out-of-band rows flagged), role (fit or held out), source | `analysis/engine.yaml` `data.card.benchmarks` |
+| | re-stamp and confirmation: "re-stamped by proof, not recomputed" or "computed by this code"; the old and new versions; proof identical; `validate_once` pending, done, or not recorded | the checkout's `results.yaml` `restamped` record, shown only under the hash rule above |
+| | engine identity: name, version, card sha256, engine-choice sha256, code fingerprint of the stored batches | `analysis/*.yaml` `engine` block; `analysis/**/*.summary.json` `code_fp`; the results file's `engine_identity` under the hash rule |
+| Calibration | method, attribute, range, metric, target column and window | the spec's `calibration`; `analysis/calibration.yaml` `method` |
+| | per region: units, target mean, calibrated value range, clamped units, smallest slope; per unit behind a toggle | `analysis/calibration.yaml` `data.units` joined with the units table's target and region columns. The model's value at the fitted point is not stored per unit, so the tab says so and shows the inversion's largest residual (`diagnostics.target_logit_residual_max`) |
+| | emulator held-out accuracy: held-out and training points, calibration-metric RMSE (logit), R² (median, 10th percentile), error model | `analysis/emulator.yaml` `data.accuracy` |
+| | clamped units; identifiability verdict, design and unidentified units | `analysis/calibration.yaml` `diagnostics`, `identifiability` |
+
+### 15.2 Tests (written first, `python3 tools/run_console/dossier.py --self-test`)
+
+| Case | Checks |
+|---|---|
+| DS1 | a synthetic run dir with every artifact (toy numbers): two archived sign-offs and the current one, a registry with entries, a staged parameter registry, citations, provenance, a derivation and its record, an input check, engine choice, card, parameters, an out-of-band benchmark, calibration, emulator. Each tab's data model has the expected rows and values: unit and region counts, bindings, the derived per-person cost of a `per_commodity` item, decision-test units, the sign-off history in time order with its diffs (a changed field and an added test), used and ignored columns with reasons, provenance changed and missing, the out-of-band benchmark flagged, re-stamp pending, per-region calibration rows |
+| DS2 | fail closed: every artifact missing gives "not available" with a reason in each part. A file that cannot be parsed, an archived spec not found by hash, and a checkout results file whose hash differs from the run's each give their own reason |
+| DS3 | no reads outside the run dir: a units table, derivation input, provenance path and archived folder named as `../x`, an absolute path, or a link to a sentinel file outside the run dir are refused with a reason, and the sentinel's content never appears. Every file the dossier opens (traced) is under the run dir or is the checkout's results file allowed by the hash rule |
+| DS4 | escaping: the RV1a lint (`_attr_interpolations`) covers `dossier.js`. Hostile strings (`<img src=x onerror=…>`, `" onmouseover="…`) in the spec, registry, card and sign-off note reach the rendered HTML of each tab only escaped (node, with a stub DOM, when node is installed) |
+| DS5 | `/api/dossier` returns the four sections for a known run, refuses an unknown run, and the page loads `/dossier.js` under the CSP; every glossary term the dossier marks has a definition and a source |
+
+Then a check in Chrome on port 8793 against the toy run, and read-only against the owner's real runs.
+
+### 15.3 Review round 1 (Codex, on #132)
+
+Each finding was reproduced by a failing self-test first (DR1-DR9).
+
+- **The calibration is joined only to the inputs it was computed from (DR1).** The tab compares the calibration
+  envelope's `spec_sha256` and its recorded `inputs` hashes with the bytes read now. The units table must be among
+  those inputs, and it is parsed from the same read that was hashed. On any mismatch the section reads "not
+  available: inputs changed since the analysis (<files>)". An envelope without these hashes is not joined either.
+- **The tab renders by the artifact's method (DR2).** `emulator_inversion` shows what it showed before. `likelihood`
+  and `posterior` show convergence, bound hits, the Pearson statistic and residuals, observed vs expected per target,
+  identifiability per parameter, and the fitted values. `none` says the spec calibrates nothing. Any other method
+  reads "not supported". A failure sets "Needs you: yes": clamped units, an identifiability status other than
+  well identified, no convergence, a parameter at a bound, or a target with no expected count.
+- **Required fields per section (DR3).** A payload without its required fields, or with the wrong type, is "not
+  available: <file>: missing <field>", never zeros. The fields: the spec's question and decision units, the
+  registry's entries, the provenance's inputs, the derivations list, the input check's status, counts and findings,
+  the engine choice's engine and candidates, the card's name and benchmarks and the parameters, the calibration's
+  method, units and diagnostics, and the emulator's held-out points.
+- **`per_reached` is priced per person reached (DR4)**, with the reach share in the basis column.
+- **An archived spec is hashed and parsed from one read (DR5).**
+- **The re-stamp chain (DR6).** `restamped.previous` is newest first, so the oldest record's old version computed the
+  numbers, and every later version only re-stamped them: "computed by v0.5; re-stamped by proof to v0.6, v0.7".
+- **Equation and identity benchmarks keep their criterion (DR7):** reference, comparison, tolerance and the absolute
+  and relative errors, in one criterion column beside target-and-band rows.
+- **Small values keep their significant digits (DR8):** below 1e-3 in scientific notation (`1.2e-8`).
+- **Decision tests (DR9):** a removed group rule names the rule and what it was, from `constraints.group_rules`; an
+  added rule names what it adds; an envelope test states it varies the envelope, with values in USD.
+
+Round 2 (Codex, on #132; DR10-DR12): the units table the calibration joins is parsed from the exact entry whose hash
+was checked; the freshness checks run first for every method, `none` included; tolerances are formatted with
+`sig()` (`1e-15`, not `0`); a removed group rule is looked up in the raw spec's list of `constraints.group_rules`
+(`[{id, ...}]`), and the DR9 fixture uses that shape.

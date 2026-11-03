@@ -102,6 +102,7 @@ import hashlib
 import importlib
 import json
 import os
+import re
 import sys
 
 import yaml
@@ -165,9 +166,13 @@ def _leaves(d, pre=()):
             yield pre + (k,), v
 
 
-def load(path: str) -> "Spec":
-    with open(path, encoding="utf-8") as f:
-        raw = yaml.safe_load(f)
+def load(path: str, data: bytes | None = None) -> "Spec":
+    """The spec at `path`. `data`: its bytes, already read (the sign-off validates, hashes and copies one read)."""
+    if data is None:
+        with open(path, encoding="utf-8") as f:
+            raw = yaml.safe_load(f)
+    else:
+        raw = yaml.safe_load(data.decode("utf-8"))
     if not isinstance(raw, dict):
         raise SpecError(f"{path}: the spec must be a mapping")
     base = os.path.dirname(os.path.abspath(path))
@@ -217,6 +222,8 @@ def _resolve_engine_choice(s: "Spec") -> None:
     cands = eng.get("candidates") if isinstance(eng, dict) else None
     if cands is not None and (not isinstance(cands, list) or not all(isinstance(c, str) and ":" in c for c in cands)):
         raise SpecError("engine.candidates: a list of 'module:Class' references")
+    for c in cands or []:
+        check_engine_ref(c)
     cp = os.path.join(s.base, ENGINE_CHOICE)
     if not os.path.exists(cp):
         s.engine_pending = True
@@ -231,6 +238,7 @@ def _resolve_engine_choice(s: "Spec") -> None:
         raise SpecError(f"{ENGINE_CHOICE}: engine must be {{ref: 'module:Class', config: {{...}}}}")
     if cands and e["ref"] not in cands:
         raise SpecError(f"{ENGINE_CHOICE}: engine {e['ref']} is not among the signed candidates {cands}")
+    check_engine_ref(e["ref"])
     s.raw["engine"] = {"ref": e["ref"], **({"config": dict(e["config"])} if e.get("config") else {})}
     s.engine_choice_path = cp
 
@@ -398,11 +406,44 @@ class Spec:
                 "interval": meta, "label": render_claims.interval_label(meta)}
 
 
+# Run console review rounds 2-3 (P1-1): the spec names its engine as "module:Class", and an agent drafts the spec, so
+# the reference is untrusted. Every engine import goes through toolkit/import_guard.py (policy "engine": modules
+# under toolkit/engines/, checked as files before anything is imported); the class must implement the Engine
+# contract before it is instantiated.
+ENGINE_METHODS = ("describe", "parameters", "run")
+
+
+def check_engine_ref(ref) -> tuple[str, str]:
+    """(module, class) of an allowed engine reference, or SpecError. Imports nothing."""
+    from toolkit import import_guard as G
+    try:
+        return G.check_ref("engine", ref)
+    except G.ImportRefused as e:
+        raise SpecError(f"engine {str(ref)[:80]}: {e}") from None
+
+
+def engine_class(ref: str):
+    """The engine class an allowed reference names, checked against the Engine contract; never instantiated."""
+    from toolkit import import_guard as G
+    check_engine_ref(ref)
+    try:
+        k = G.resolve("engine", ref)
+    except G.ImportRefused as e:
+        raise SpecError(str(e)) from None
+    if not isinstance(k, type) or not all(callable(getattr(k, m, None)) for m in ENGINE_METHODS):
+        raise SpecError(f"engine {ref}: not a class implementing the Engine contract ({', '.join(ENGINE_METHODS)})")
+    return k
+
+
 def load_engine(ref):
     if isinstance(ref, str):
         ref = {"ref": ref}
-    mod, cls = str(ref["ref"]).split(":")
-    return getattr(importlib.import_module(mod), cls)(**(ref.get("config") or {}))
+    if not isinstance(ref, dict):
+        raise SpecError("engine: {ref: 'module:Class', config: {...}}")
+    config = ref.get("config") or {}
+    if not isinstance(config, dict):
+        raise SpecError("engine.config must be a mapping")
+    return engine_class(ref.get("ref"))(**config)
 
 
 def _num(v):
@@ -506,9 +547,9 @@ def load_binding(engine) -> tuple[dict, list[str]]:
 
 
 def binding_for_ref(ref: str) -> dict:
-    """The attribute binding of an engine class named 'module:Class' (imported, not constructed)."""
-    mod, cls = str(ref).split(":")
-    return load_binding(getattr(importlib.import_module(mod), cls))[0]
+    """The attribute binding of an engine class named 'module:Class' (imported through the guard, not
+    constructed)."""
+    return load_binding(engine_class(ref))[0]
 
 
 def binding_rule(binding: dict, attr: str):
@@ -1326,6 +1367,7 @@ def _self_test() -> int:
         _self_test_derived(ok)
     except Exception as e:  # noqa: BLE001 -- before the checks exist (step α) this is the failure
         ok(False, f"DI spec checks: {type(e).__name__}: {e}")
+    _self_test_engine_refs(ok)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -1374,6 +1416,83 @@ def derived_toy_spec(d: str, n: int = 12, **kw) -> str:
     if not rep["ok"]:
         raise RuntimeError(f"derived_toy_spec: the fixture's derivation failed: {rep['problems']}")
     return p
+
+
+def _self_test_engine_refs(ok) -> None:
+    """SP-RW1..4 (run console review round 2, P1-1): a spec names its engine by "module:Class"; the spec is drafted by
+    an agent, so a reference outside the registered engines is refused before any import or instantiation."""
+    import tempfile
+    seen, real = [], importlib.import_module
+
+    def spy(name, *a, **k):
+        seen.append(name)
+        return real(name, *a, **k)
+    with tempfile.TemporaryDirectory() as d:
+        marker = os.path.join(d, "ran")
+        importlib.import_module = spy
+        try:
+            refused = []
+            for ref, cfg in (("subprocess:Popen", {"args": ["touch", marker]}), ("os:system", {}),
+                             ("json.decoder:JSONDecoder", {}), ("toolkit.alloc.costs:Nope", {})):
+                try:
+                    load_engine({"ref": ref, "config": cfg})
+                    refused.append(False)
+                except (SpecError, ValueError):
+                    refused.append(True)
+                except Exception:  # noqa: BLE001 -- imported and failed later: not refused up front
+                    refused.append(False)
+        finally:
+            importlib.import_module = real
+        bad = [m for m in seen if m.split(".")[0] in ("subprocess", "os", "json") or m.startswith("toolkit.alloc")]
+        ok(all(refused) and not bad and not os.path.exists(marker),
+           f"SP-RW1 subprocess:Popen, os:system and modules outside toolkit.engines are refused without an import "
+           f"({refused}; imported {bad})")
+        p = toy_spec(d)
+        raw = yaml.safe_load(open(p))
+        raw["engine"] = {"ref": "subprocess:Popen", "config": {"args": ["touch", marker]}}
+        yaml.safe_dump(raw, open(p, "w"))
+        probs = validate(load(p))
+        ok(probs and not os.path.exists(marker) and any("engine" in x for x in probs),
+           f"SP-RW2 validating a spec with such an engine reports it and runs nothing ({probs[:1]})")
+        raw["engine"] = {"auto": True, "candidates": ["os:system", "toolkit.engines.contract:ToyEngine"]}
+        yaml.safe_dump(raw, open(p, "w"))
+        try:
+            load(p)
+            ok(False, "SP-RW3 an unregistered engine among the signed candidates is refused")
+        except SpecError as e:
+            ok("os:system" in str(e), f"SP-RW3 an unregistered engine among the signed candidates is refused ({e})")
+    # SP-RW5/6 (round 3, P1-1): the binding lookup and the legacy spike loader are guarded too
+    seen = []
+    importlib.import_module = spy
+    try:
+        refused = []
+        for fn in (lambda: binding_for_ref("os:system"), lambda: binding_for_ref("subprocess:Popen")):
+            try:
+                fn()
+                refused.append(False)
+            except (SpecError, ValueError):
+                refused.append(True)
+            except Exception:  # noqa: BLE001
+                refused.append(False)
+        try:
+            from spike.analysis import spec as _spike
+            _spike.load_engine("os:system")
+            refused.append(False)
+        except (SpecError, ValueError):
+            refused.append(True)
+        except Exception:  # noqa: BLE001
+            refused.append(False)
+    finally:
+        importlib.import_module = real
+    bad = [m for m in seen if m.split(".")[0] in ("subprocess", "os")]
+    ok(all(refused) and not bad, f"SP-RW5 binding_for_ref and the spike loader refuse os:system and subprocess:Popen "
+                                 f"before an import ({refused}; imported {bad})")
+    try:
+        k = engine_class("toolkit.engines.contract:ToyEngine")
+        ok(k.__name__ == "ToyEngine" and load_engine("toolkit.engines.contract:ToyEngine") is not None,
+           "SP-RW4 a registered engine still loads")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"SP-RW4 a registered engine still loads: {type(e).__name__}: {e}")
 
 
 def _self_test_derived(ok) -> None:

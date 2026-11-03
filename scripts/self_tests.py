@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Find and run every module's --self-test (one discovery rule for CLAUDE.md and CI).
 
-Scope: `main.py`, every tracked `.py` file under `scripts/`, `toolkit/` and `cloud/`, and the
+Scope: `main.py`, every tracked `.py` file under `scripts/`, `toolkit/`, `cloud/` and `tools/`, and the
 harness modules under `agents/` named in AGENT_MODULES (other `agents/` files only mention
 --self-test in text, or run a live preflight). `__init__.py` files are skipped.
 
@@ -25,7 +25,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SCOPE_DIRS = ("scripts/", "toolkit/", "cloud/")
+SCOPE_DIRS = ("scripts/", "toolkit/", "cloud/", "tools/")   # tools/: outside compute.code_fingerprint
 AGENT_MODULES = (
     "agents/stage_machine.py", "agents/findings_ledger.py", "agents/fix_loop.py",
     "agents/analysis_backend.py", "agents/v2_sdk_tasks.py", "agents/output_caps.py",
@@ -194,6 +194,7 @@ def _self_test() -> int:
         ok(not lprob, f"ST11 live tree has no discovery problems ({lprob})")
         ok(not lnotes, f"ST11 live tree has no stale exemptions ({lnotes})")
         ok("main.py" in lrun and "scripts/self_tests.py" in lrun, "ST11 main.py and this file are discovered")
+        ok("tools/run_console/run_console.py" in lrun, "ST12 a module under tools/ (the run console) is discovered")
     except RuntimeError as e:
         fails.append(f"ST11 git ls-files failed: {e}")
     for f in fails:

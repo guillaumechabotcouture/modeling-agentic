@@ -589,8 +589,22 @@ restamped:
     on these inputs. A Coiled pack run (validate_once.sh) is to confirm it; until it has run, the confirmation below
     is pending.
   confirmation:
-    validate_once: pending
-    evidence: null
+    validate_once: done
+    evidence:
+      run_id: run1
+      commit: c0ed7675a4fbdfb198cabf64fad4d3607a075587
+      environment:
+        python: 3.14.3
+        numpy: 2.4.4
+        starsim: 3.3.4
+        platform: Linux-7.0.0-1017-azure-x86_64-with-glibc2.41
+        machine: x86_64
+      date: '2026-11-03'
+      command: bash toolkit/engines/malaria/benchmarks/validate_once.sh 16 12
+      coiled_cluster_id: '2319071'
+      workspace: idm-coiled-idmad-r2
+      stored: outputs/engine-v08-confirm/run1 (storage account modelingagentic)
+      compared: every value equal to this file's; only wall-clock fields and identity hashes differ
   old_code_sha256: 675650c80e7d9c3df9bf234d1f50c135c1fdf6ab9f0a5186f2d610f6e1dea5ee
   previous:
   - by: toolkit/engines/malaria/benchmarks/restamp_proof.py (byte-identity proof, not recomputed)

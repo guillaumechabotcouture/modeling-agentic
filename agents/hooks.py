@@ -391,9 +391,10 @@ def record_lead_answers(run_path: str, input_data: dict, trace_file) -> None:
         return
     import hashlib
     from datetime import timezone
-    try:
-        sha = hashlib.sha256(open(target, "rb").read()).hexdigest()
-    except OSError:
+    from lib.safe_io import LinkRefused, read_nofollow
+    try:                                 # never through a link (lib.safe_io): a planted link records nothing
+        sha = hashlib.sha256(read_nofollow(run_path, decision_brief.LEAD_ANSWERS)[0]).hexdigest()
+    except (LinkRefused, OSError):
         return
     _safe_write(trace_file, {"ts": datetime.now(timezone.utc).isoformat(), "type": LEAD_ANSWERS_EVENT,
                              "agent": "lead", "sha256": sha})

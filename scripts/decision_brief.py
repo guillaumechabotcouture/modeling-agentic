@@ -130,30 +130,40 @@ def _load(path: str):
         return yaml.safe_load(f)
 
 
-def _criteria_ids(run_dir: str) -> set[str]:
+_UNSET = object()
+
+
+def _criteria_ids(run_dir: str, data=_UNSET) -> set[str]:
+    """The success criteria ids. `data`: the bytes of success_criteria.yaml already captured by the sign-off (None:
+    the file was absent), so the sign-off validates what it hashes (review round 3, P2-5)."""
     try:
-        doc = _load(os.path.join(run_dir, CRITERIA)) or {}
-    except (OSError, yaml.YAMLError):
+        if data is _UNSET:
+            doc = _load(os.path.join(run_dir, CRITERIA)) or {}
+        else:
+            doc = (yaml.safe_load(data.decode("utf-8")) if data is not None else {}) or {}
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        return set()
+    if not isinstance(doc, dict):
         return set()
     return {str(c.get("id")) for sec in ("hard_blockers", "minimum_bar", "targets")
             for c in (doc.get(sec) or []) if isinstance(c, dict) and c.get("id")}
 
 
-def load_brief(run_dir: str):
-    """(doc, errors)."""
+def load_brief(run_dir: str, data: bytes | None = None, criteria=_UNSET):
+    """(doc, errors). `data`: the brief's bytes, already read (the sign-off validates the bytes it hashes)."""
     path = os.path.join(run_dir, BRIEF)
-    if not os.path.exists(path):
+    if data is None and not os.path.exists(path):
         return None, [f"{BRIEF} does not exist"]
     try:
-        doc = _load(path)
-    except (OSError, yaml.YAMLError) as e:
+        doc = _load(path) if data is None else yaml.safe_load(data.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
         return None, [f"{BRIEF} does not parse: {str(e)[:120]}"]
     if not isinstance(doc, dict):
         return None, [f"{BRIEF} must be a mapping"]
-    return doc, validate(doc, run_dir)
+    return doc, validate(doc, run_dir, criteria)
 
 
-def validate(doc: dict, run_dir: str) -> list[str]:
+def validate(doc: dict, run_dir: str, criteria=_UNSET) -> list[str]:
     errors = [f"{k}: missing or empty" for k in _TEXT if not str(doc.get(k) or "").strip()]
     seen: set[str] = set()
     for key, prefix in _LISTS.items():
@@ -194,7 +204,7 @@ def validate(doc: dict, run_dir: str) -> list[str]:
     if not isinstance(acc, list) or not acc:
         errors.append("acceptance: list the success_criteria.yaml ids this run is judged by")
     else:
-        known = _criteria_ids(run_dir)
+        known = _criteria_ids(run_dir, criteria)
         unknown = [str(a) for a in acc if str(a) not in known]
         if unknown:
             errors.append(f"acceptance: not in {CRITERIA}: {', '.join(unknown)}")
@@ -342,12 +352,12 @@ def parse_lead_answers(run_dir: str) -> tuple[dict | None, list[str]]:
     (None, [problems]). `accept_proposed` is a YAML boolean (true/false, not a string or a number); `answers` maps
     the brief's own open-question ids to non-empty text; `note` is text; no other keys; and it says something
     (answers, or accept_proposed: true). A missing file is (None, [])."""
-    p = os.path.join(run_dir, LEAD_ANSWERS)
-    if not os.path.exists(p):
+    from lib.safe_io import LinkRefused, read_nofollow
+    if not os.path.lexists(os.path.join(run_dir, LEAD_ANSWERS)):
         return None, []
-    try:
-        doc = yaml.safe_load(open(p, encoding="utf-8"))
-    except (OSError, yaml.YAMLError, UnicodeDecodeError) as e:
+    try:                                 # never through a link (lib.safe_io)
+        doc = yaml.safe_load(read_nofollow(run_dir, LEAD_ANSWERS)[0].decode("utf-8"))
+    except (LinkRefused, OSError, yaml.YAMLError, UnicodeDecodeError) as e:
         return None, [f"{LEAD_ANSWERS} is unreadable: {e}"]
     if not isinstance(doc, dict) or not doc:
         return None, [f"{LEAD_ANSWERS} must be a mapping with answers and/or accept_proposed, and a note"]
@@ -389,10 +399,34 @@ def is_signed(run_dir: str) -> bool:
     return _signoff(run_dir) is not None
 
 
+def _capture(run_dir: str, names) -> dict:
+    """{name: bytes or None}: each file read once, through an fd opened with no link followed (lib.safe_io)."""
+    from lib.safe_io import read_nofollow, LinkRefused
+    out = {}
+    for f in names:
+        try:
+            out[f] = read_nofollow(run_dir, f)[0]
+        except FileNotFoundError:
+            out[f] = None
+        except LinkRefused as e:
+            raise ValueError(f"{f}: {e}") from None
+    return out
+
+
 def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
-         accept_proposed: bool = False) -> dict:
-    """Write the sign-off. Raises ValueError when the brief is not ready."""
-    doc, errors = load_brief(run_dir)
+         accept_proposed: bool = False, expect: dict | None = None, extra_sha: dict | None = None) -> dict:
+    """Write the sign-off. Raises ValueError when the brief is not ready. The frozen files are read once: validated,
+    hashed and copied from the same bytes, never through a link, and the record is published atomically.
+    `expect`: {file: sha256 the owner was shown} (a mismatch is refused); `extra_sha`: further hashes to record."""
+    import hashlib
+    from lib.safe_io import write_nofollow, LinkRefused
+    captured = _capture(run_dir, FROZEN_AT_SIGNOFF)
+    shas = {f: hashlib.sha256(b).hexdigest() if b is not None else None for f, b in captured.items()}
+    for f, want in (expect or {}).items():
+        if shas.get(f) != want:
+            raise ValueError(f"{f} changed since it was shown; read it again before signing")
+    doc, errors = load_brief(run_dir, captured[BRIEF], captured[CRITERIA]) if captured[BRIEF] is not None else (None, [
+        f"{BRIEF} does not exist"])
     if errors:
         raise ValueError("brief not ready: " + "; ".join(errors))
     if is_signed(run_dir):
@@ -402,30 +436,35 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
     missing = [q["id"] for q in qs if q["id"] not in answers and not accept_proposed]
     if missing:
         raise ValueError("no answer for " + ", ".join(missing) + " (give one, or --accept-proposed)")
-    if os.path.exists(os.path.join(run_dir, DECISION_SPEC)):
+    if captured.get(DECISION_SPEC) is not None:
         # Codex round 2 on #131: this sign-off also signs the decision spec, so it freezes the spec's geometry inputs
         # (and, signed by the owner, approves the spec's proposed HIGH geometry exceptions). Brief-only runs skip it.
+        # The spec is the bytes read (and hashed) above, never read again (#129).
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         if root not in sys.path:
             sys.path.insert(0, root)
         from toolkit.spec import geometry
-        geometry.freeze(run_dir, by)
+        try:
+            spec_doc = yaml.safe_load(captured[DECISION_SPEC].decode("utf-8")) or {}
+        except (yaml.YAMLError, UnicodeDecodeError) as e:
+            raise ValueError(f"{DECISION_SPEC} does not parse: {e}") from None
+        geometry.freeze(run_dir, by, spec=spec_doc if isinstance(spec_doc, dict) else {})
     record = {
         "signed_by": by, "signed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "note": note,
         "answers": {q["id"]: answers.get(q["id"], q.get("proposed")) for q in qs},
         "answer_source": {q["id"]: "given" if q["id"] in answers else "proposed accepted" for q in qs},
-        "sha256": {f: _sha(os.path.join(run_dir, f)) for f in FROZEN_AT_SIGNOFF},
+        "sha256": {**shas, **(extra_sha or {})},
         "schema_version": schema_version(doc),
         "producer": "scripts/decision_brief.py",
     }
-    # Gemini review: keep the signed versions, so a changed file can be restored.
-    os.makedirs(os.path.join(run_dir, SIGNED_DIR), exist_ok=True)
-    for f in FROZEN_AT_SIGNOFF:
-        src = os.path.join(run_dir, f)
-        if os.path.exists(src):
-            shutil.copyfile(src, os.path.join(run_dir, SIGNED_DIR, f))
-    with open(os.path.join(run_dir, SIGNOFF), "w", encoding="utf-8") as f:
-        json.dump(record, f, indent=1)
+    try:
+        # Gemini review: keep the signed versions, so a changed file can be restored (the bytes that were hashed).
+        for f, b in captured.items():
+            if b is not None:
+                write_nofollow(run_dir, f"{SIGNED_DIR}/{f}", b, atomic=True)
+        write_nofollow(run_dir, SIGNOFF, json.dumps(record, indent=1).encode(), atomic=True)
+    except (LinkRefused, OSError) as e:
+        raise ValueError(f"sign-off not written: {e}") from None
     return record
 
 
@@ -670,6 +709,71 @@ def example_brief(**over) -> dict:
     return {**doc, **over}
 
 
+def _self_test_lead_and_geometry(ok) -> None:
+    """DB35-DB36 (#131): the lead's answers file is parsed strictly; the brief's sign-off freezes the spec's
+    geometry."""
+    # DB36 (focused check of #131): the lead's answers file is parsed strictly
+    with tempfile.TemporaryDirectory() as d:
+        yaml.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d, CRITERIA), "w"))
+        yaml.safe_dump(example_brief(open_questions=[{"id": "Q1", "question": "Is continuity a constraint?",
+                                                      "proposed": "No", "basis": "decision"}]),
+                       open(os.path.join(d, BRIEF), "w"))
+        cases = {"string false": 'accept_proposed: "false"\n', "list answers": "answers: [Q1]\n",
+                 "unknown id": "answers: {Q99: x}\n", "unknown key": "accept_proposed: true\nsign_as: owner\n",
+                 "nothing": "note: only a note\n", "empty answer": "answers: {Q1: ''}\n",
+                 "numeric bool": "accept_proposed: 1\n"}
+        got36 = {}
+        for name, text in cases.items():
+            open(os.path.join(d, "decision_brief_lead_answers.yaml"), "w").write(text)
+            try:
+                doc, errs = parse_lead_answers(d)
+            except NameError as e:
+                doc, errs = None, [f"missing: {e}"]
+            got36[name] = bool(errs) and doc is None
+        open(os.path.join(d, "decision_brief_lead_answers.yaml"), "w").write(
+            "answers: {Q1: 'Yes: keep currently covered districts'}\nnote: ok\n")
+        try:
+            good = parse_lead_answers(d)
+        except NameError:
+            good = (None, ["missing"])
+        ok(all(got36.values()) and good[1] == [] and good[0]["answers"] == {"Q1": "Yes: keep currently covered "
+                                                                                  "districts"}
+           and good[0]["accept_proposed"] is False,
+           f"DB36 the lead's answers file is parsed strictly: accept_proposed a YAML boolean, answers a mapping of the "
+           f"brief's question ids to non-empty text, no other keys ({got36}; {good[1]})")
+    # DB35 (Codex round 2 on #131): signing the brief signs the decision spec when there is one, so it freezes the
+    # spec's geometry inputs too (toolkit/spec/geometry.py freeze); a brief-only run (no spec) is unchanged.
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from toolkit.spec import geometry as GEO
+    for by in ("owner", "lead"):
+        with tempfile.TemporaryDirectory() as d:
+            GEO.toy_inputs(d)
+            sp = yaml.safe_load(open(os.path.join(d, DECISION_SPEC)))
+            sp["decision_units"][GEO.ACCEPT_KEY] = {"reciprocal_swap:swap_a+swap_b": "rows checked"}
+            yaml.safe_dump(sp, open(os.path.join(d, DECISION_SPEC), "w"))
+            yaml.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d, CRITERIA), "w"))
+            yaml.safe_dump(example_brief(), open(os.path.join(d, BRIEF), "w"))
+            try:
+                sign(d, by, accept_proposed=True)
+                rec = json.load(open(os.path.join(d, GEO.SIGNOFF_FILE)))
+            except (OSError, ValueError) as e:
+                rec = {"error": str(e)}
+            want = ["reciprocal_swap:swap_a+swap_b"] if by == "owner" else []
+            ok(rec.get("signed_by") == by and (rec.get("declaration") or {}).get("enabled") is True
+               and sorted(rec.get("approvals") or {}) == want,
+               f"DB35 ({by}): the brief's sign-off freezes the spec's geometry inputs; only the owner's approves the "
+               f"proposed HIGH exception ({rec.get('signed_by')}, {sorted(rec.get('approvals') or {})}, "
+               f"{rec.get('error')})")
+    with tempfile.TemporaryDirectory() as d:
+        yaml.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d, CRITERIA), "w"))
+        yaml.safe_dump(example_brief(), open(os.path.join(d, BRIEF), "w"))
+        sign(d, "owner", accept_proposed=True)
+        ok(status(d) == "signed" and not os.path.exists(os.path.join(d, GEO.SIGNOFF_FILE)),
+           "DB35b a brief-only run (no decision spec) signs as before and writes no geometry record")
+
+
 def _run_self_test() -> int:
     fails = []
 
@@ -885,66 +989,7 @@ def _run_self_test() -> int:
         ok(status(d) == "signed" and load_brief(d)[1] == [] and "Not ready" not in render_md(d)
            and "schema 1" in render_md(d) and signoff_text(d),
            f"DB34: a schema 1 brief signed before Phase 43 is still signed: {load_brief(d)[1]}")
-    # DB36 (focused check of #131): the lead's answers file is parsed strictly
-    with tempfile.TemporaryDirectory() as d:
-        yaml.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d, CRITERIA), "w"))
-        yaml.safe_dump(example_brief(open_questions=[{"id": "Q1", "question": "Is continuity a constraint?",
-                                                      "proposed": "No", "basis": "decision"}]),
-                       open(os.path.join(d, BRIEF), "w"))
-        cases = {"string false": 'accept_proposed: "false"\n', "list answers": "answers: [Q1]\n",
-                 "unknown id": "answers: {Q99: x}\n", "unknown key": "accept_proposed: true\nsign_as: owner\n",
-                 "nothing": "note: only a note\n", "empty answer": "answers: {Q1: ''}\n",
-                 "numeric bool": "accept_proposed: 1\n"}
-        got36 = {}
-        for name, text in cases.items():
-            open(os.path.join(d, "decision_brief_lead_answers.yaml"), "w").write(text)
-            try:
-                doc, errs = parse_lead_answers(d)
-            except NameError as e:
-                doc, errs = None, [f"missing: {e}"]
-            got36[name] = bool(errs) and doc is None
-        open(os.path.join(d, "decision_brief_lead_answers.yaml"), "w").write(
-            "answers: {Q1: 'Yes: keep currently covered districts'}\nnote: ok\n")
-        try:
-            good = parse_lead_answers(d)
-        except NameError:
-            good = (None, ["missing"])
-        ok(all(got36.values()) and good[1] == [] and good[0]["answers"] == {"Q1": "Yes: keep currently covered "
-                                                                                  "districts"}
-           and good[0]["accept_proposed"] is False,
-           f"DB36 the lead's answers file is parsed strictly: accept_proposed a YAML boolean, answers a mapping of the "
-           f"brief's question ids to non-empty text, no other keys ({got36}; {good[1]})")
-    # DB35 (Codex round 2 on #131): signing the brief signs the decision spec when there is one, so it freezes the
-    # spec's geometry inputs too (toolkit/spec/geometry.py freeze); a brief-only run (no spec) is unchanged.
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    if root not in sys.path:
-        sys.path.insert(0, root)
-    from toolkit.spec import geometry as GEO
-    for by in ("owner", "lead"):
-        with tempfile.TemporaryDirectory() as d:
-            GEO.toy_inputs(d)
-            sp = yaml.safe_load(open(os.path.join(d, DECISION_SPEC)))
-            sp["decision_units"][GEO.ACCEPT_KEY] = {"reciprocal_swap:swap_a+swap_b": "rows checked"}
-            yaml.safe_dump(sp, open(os.path.join(d, DECISION_SPEC), "w"))
-            yaml.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d, CRITERIA), "w"))
-            yaml.safe_dump(example_brief(), open(os.path.join(d, BRIEF), "w"))
-            try:
-                sign(d, by, accept_proposed=True)
-                rec = json.load(open(os.path.join(d, GEO.SIGNOFF_FILE)))
-            except (OSError, ValueError) as e:
-                rec = {"error": str(e)}
-            want = ["reciprocal_swap:swap_a+swap_b"] if by == "owner" else []
-            ok(rec.get("signed_by") == by and (rec.get("declaration") or {}).get("enabled") is True
-               and sorted(rec.get("approvals") or {}) == want,
-               f"DB35 ({by}): the brief's sign-off freezes the spec's geometry inputs; only the owner's approves the "
-               f"proposed HIGH exception ({rec.get('signed_by')}, {sorted(rec.get('approvals') or {})}, "
-               f"{rec.get('error')})")
-    with tempfile.TemporaryDirectory() as d:
-        yaml.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d, CRITERIA), "w"))
-        yaml.safe_dump(example_brief(), open(os.path.join(d, BRIEF), "w"))
-        sign(d, "owner", accept_proposed=True)
-        ok(status(d) == "signed" and not os.path.exists(os.path.join(d, GEO.SIGNOFF_FILE)),
-           "DB35b a brief-only run (no decision spec) signs as before and writes no geometry record")
+    _self_test_lead_and_geometry(ok)
     if fails:
         print("FAIL:", *fails, sep="\n  ")
         return 1
