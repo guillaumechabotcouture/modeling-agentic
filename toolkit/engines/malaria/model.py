@@ -216,9 +216,7 @@ class Malaria(ss.Disease):
     def in_delivery(self):
         """v0.6: inside the delivery period (what the decision pays for); the window when none is set."""
         p = self.pars
-        if p.del_start is None:
-            return self.in_window()
-        return p.del_start <= self.year() < p.del_stop
+        return delivery_contains(self.year(), p.del_start, p.del_stop, p.win_start, p.win_stop)
 
     def step(self):
         p, ti, P = self.pars, self.ti, self.P
@@ -343,9 +341,35 @@ class Malaria(ss.Disease):
         getattr(self, ln)[uo] = ti
 
 
-def _event_tis(sim, targets):
-    yv = np.asarray(sim.t.yearvec)
+def delivery_contains(yr, del_start, del_stop, win_start, win_stop) -> bool:
+    """v0.8: whether a step at decimal year `yr` is in the delivery period, where cost drivers count (the window when
+    no delivery period is set). Malaria.in_delivery and the engine's schedule() share it."""
+    if del_start is None:
+        return win_start is not None and win_start <= yr < win_stop
+    return del_start <= yr < del_stop
+
+
+def event_steps(yv, targets) -> set:
+    """v0.8: the daily steps at which delivery targets (decimal years) act: each target's nearest step inside the
+    time vector; targets on one step are one delivery. The interventions and the engine's schedule() share it."""
+    yv = np.asarray(yv)
     return {int(np.argmin(np.abs(yv - t))) for t in targets if yv[0] - 1e-9 <= t <= yv[-1]}
+
+
+def _event_tis(sim, targets):
+    return event_steps(sim.t.yearvec, targets)
+
+
+def smc_targets(years, months, after=None, before=None) -> list:
+    """Decimal times of SMC rounds: month starts of `months` in `years`, kept when after <= t < before (None: no
+    bound). SMCDelivery and the engine's delivery plan share it."""
+    return [t for t in (y + (m - 1) / 12 for y in years for m in months)
+            if (after is None or t >= after) and (before is None or t < before)]
+
+
+def irs_targets(years, month) -> list:
+    """Decimal times of IRS rounds: the start of `month` in each of `years` (IRSRound and the delivery plan)."""
+    return [y + (month - 1) / 12 for y in years]
 
 
 class ITNCampaign(ss.Intervention):
@@ -377,7 +401,7 @@ class IRSRound(ss.Intervention):
 
     def step(self):
         if not hasattr(self, '_tis'):
-            self._tis = _event_tis(self.sim, [y + (self.month - 1) / 12 for y in self.years])
+            self._tis = _event_tis(self.sim, irs_targets(self.years, self.month))
         if self.ti in self._tis:
             dz = self.sim.diseases.malaria
             u = self.sim.people.auids
@@ -401,8 +425,7 @@ class SMCDelivery(ss.Intervention):
 
     def targets(self):
         """The decimal times of the rounds."""
-        return [t for t in (y + (m - 1) / 12 for y in self.years for m in self.months)
-                if (self.after is None or t >= self.after) and (self.before is None or t < self.before)]
+        return smc_targets(self.years, self.months, self.after, self.before)
 
     def step(self):
         if not hasattr(self, '_tis'):

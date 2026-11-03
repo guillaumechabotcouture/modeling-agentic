@@ -355,7 +355,7 @@ class MalariaEngine:
         months = tuple(a.get("smc_months") or default_smc_months(season))
         years = list(range(int(np.floor(d1)), int(np.ceil(w1)) + 1))
         return {"years": years, "months": months, "after": float(d1), "before": w1,
-                "rounds": [t for t in (y + (m - 1) / 12 for y in years for m in months) if d1 <= t < w1]}
+                "rounds": M.smc_targets(years, months, float(d1), w1)}
 
     @classmethod
     def delivery_plan(cls, a: dict, components: dict, horizon: Horizon) -> dict:
@@ -376,31 +376,31 @@ class MalariaEngine:
         plan = {"net": None, "smc": None, "irs": None, "fork_events": [float(d0)],
                 # the add-on acts in the delivery period; without one it starts at the window and has no end (v0.5)
                 "cm": {"on": bool(int(comp["cm"])), "start": d0, "stop": d1 if ex else None}}
-        ev = []                                      # (component, label, kind, t0, t1) of every delivery event
+        # (intervention, component, label, kind, target) of every delivery: schedule() projects them onto the sim's
+        # daily steps with model.event_steps, as the interventions do
+        ev = []
         timed = []                                   # (component, decimal year) of every event the decision pays for
         if comp["net"] != "none":
             cy = float(a.get("campaign_year", d0))
             plan["net"] = {"years": [cy], "net_type": comp["net"]}
             plan["fork_events"].append(cy)
             timed.append(("net campaign (campaign_year)", cy))
-            ev.append(("net", f"net campaign ({comp['net']})", "decision", cy, None))
+            ev.append(("itn_new", "net", f"net campaign ({comp['net']})", "decision", cy))
         if int(comp["smc"]):
             months = tuple(a.get("smc_months") or default_smc_months(season))
             plan["smc"] = {"years": years, "months": months}
-            ts = [y + (m - 1) / 12 for y in years for m in months]
+            ts = M.smc_targets(years, months)
             plan["fork_events"] += ts
             timed += [("SMC round", t) for t in ts]
-            ev += [("smc", "SMC round", "decision", t, None) for t in ts]
+            ev += [("smc", "smc", "SMC round", "decision", t) for t in ts]
         if int(comp["irs"]):
             month = int(a.get("irs_month") or ((int(np.argmax(season)) - 3) % 12 + 1))
             irs_years = [int(np.floor(float(y))) for y in a.get("irs_years", years)]
             plan["irs"] = {"years": irs_years, "month": month}
-            ts = [y + (month - 1) / 12 for y in irs_years]
+            ts = M.irs_targets(irs_years, month)
             plan["fork_events"] += ts
             timed += [("IRS round", t) for t in ts]
-            ev += [("irs", "IRS round", "decision", t, None) for t in ts]
-        if plan["cm"]["on"]:
-            ev.append(("cm", "enhanced case management (add-on)", "decision", float(d0), float(d1)))
+            ev += [("irs", "irs", "IRS round", "decision", t) for t in ts]
         if ex:
             out = [f"{c} at {t:.3f}" for c, t in timed if not d0 <= t < d1]
             if out:
@@ -415,14 +415,16 @@ class MalariaEngine:
             if bad:
                 raise ValueError("; ".join(bad))
         plan["smc_routine"] = rs
-        ev += [("net", f"past net campaign ({plan['hist_net']})", "history", t, None) for t in plan["hist_years"]]
-        ev += [("net", f"routine net campaign ({plan['hist_net']})", "routine", t, None) for t in plan["routine_years"]]
-        ev += [("smc", "routine SMC round", "routine", t, None) for t in (rs or {}).get("rounds", [])]
-        st, w1 = float(horizon.start), float(horizon.window[1])
-        plan["events"] = sorted(
-            ({"component": c, "label": lb, "kind": k, "t0": float(t0), "t1": None if t1 is None else float(t1),
-              "charged": k == "decision"} for c, lb, k, t0, t1 in ev if st <= t0 < w1),
-            key=lambda x: x["t0"])
+        # one intervention (itn_hist) runs past and routine campaigns, in this order (as _base_sim builds it)
+        ev += [("itn_hist", "net", f"past net campaign ({plan['hist_net']})", "history", t) for t in plan["hist_years"]]
+        ev += [("itn_hist", "net", f"routine net campaign ({plan['hist_net']})", "routine", t)
+               for t in plan["routine_years"]]
+        ev += [("smc_routine", "smc", "routine SMC round", "routine", t) for t in (rs or {}).get("rounds", [])]
+        plan["deliveries"] = ev
+        # where cost drivers count (model.delivery_contains): the delivery period, or the window when none is given
+        w0, w1 = (float(x) for x in horizon.window)
+        plan["accounting"] = {"del_start": d0 if ex else None, "del_stop": d1 if ex else None,
+                              "win_start": w0, "win_stop": w1}
         return plan
 
     def _plan(self, P: dict, a: dict, components: dict, horizon: Horizon) -> dict:
@@ -435,8 +437,50 @@ class MalariaEngine:
         """v0.8 figure hook (toolkit/engines/hooks.py): the unit's delivery events in the arm `package` over
         [horizon.start, window end), from delivery_plan, the code that configures the sim. Pure. A past campaign
         before horizon.start (it acts in the burn-in) and a round after the window's end are not listed."""
-        resolve_params(self, params)                 # unknown parameters fail closed, as in run()
-        return [dict(x) for x in self.delivery_plan(dict(unit.attributes), package.components, horizon)["events"]]
+        P = resolve_params(self, params)             # unknown parameters fail closed, as in run()
+        dp = self.delivery_plan(dict(unit.attributes), package.components, horizon)
+        return self.project_schedule(dp, self._yearvec(P, horizon), horizon)
+
+    @staticmethod
+    def _yearvec(P: dict, horizon: Horizon) -> np.ndarray:
+        """The sim's daily time vector (decimal years), from a Starsim Timeline with the sim's start, stop and step:
+        no sim is built and no random number drawn (self-test S1 checks the projection against the sim's steps)."""
+        import starsim as ss
+        B = int(round(float(P["burnin_years"])))
+        tl = ss.Timeline(start=float(horizon.start) - B, stop=float(horizon.stop), dt=ss.days(1))
+        tl.init()
+        return np.asarray(tl.yearvec)
+
+    @staticmethod
+    def project_schedule(dp: dict, yv, horizon: Horizon) -> list:
+        """The delivery plan's targets as the sim executes them: each target on its daily step (model.event_steps),
+        targets of one intervention on one step as one delivery, t0 the step's year. Fails closed when a decision
+        delivery falls on a step where the sim does not charge it (model.delivery_contains), so `charged` matches
+        the cost drivers. Lists the steps in [horizon.start, window end)."""
+        yv = np.asarray(yv)
+        st, w1 = float(horizon.start), float(horizon.window[1])
+        acc, seen, out, unc = dp["accounting"], set(), [], []
+        for grp, comp, label, kind, t in dp["deliveries"]:
+            steps = M.event_steps(yv, [t])
+            if not steps or (grp, next(iter(steps))) in seen:
+                continue                             # outside the sim, or a delivery already on this step
+            ti = next(iter(steps))
+            seen.add((grp, ti))
+            yr = float(yv[ti])
+            if kind == "decision" and not M.delivery_contains(yr, **acc):
+                unc.append(f"{label} at {yr:.3f}")
+            if st <= yr < w1:
+                out.append({"component": comp, "label": label, "kind": kind, "t0": yr, "t1": None,
+                            "charged": kind == "decision"})
+        lo, hi = ((acc["del_start"], acc["del_stop"]) if acc["del_start"] is not None
+                  else (acc["win_start"], acc["win_stop"]))
+        if unc:
+            raise ValueError(f"schedule: decision deliveries the sim runs but that are not charged (cost drivers count "
+                             f"in [{lo:g}, {hi:g})): {', '.join(unc[:4])}")
+        if dp["cm"]["on"]:
+            out.append({"component": "cm", "label": "enhanced case management (add-on)", "kind": "decision",
+                        "t0": float(lo), "t1": float(hi), "charged": True})
+        return sorted(out, key=lambda x: x["t0"])
 
     @staticmethod
     def _burnin_key(P: dict, a: dict) -> str:
@@ -461,17 +505,16 @@ class MalariaEngine:
         n0 = n if B == 0 else max(int(round(n * np.exp(-POP_GROWTH * B))), 50)
         season = np.asarray(a.get("season", [1.0] * 12), float)
         w0, w1 = horizon.window
-        d0, d1 = delivery_period(horizon)
-        ex = explicit_delivery(horizon)
+        dp = self.delivery_plan(a, {}, horizon)      # v0.8: the history, routine, add-on and accounting (one source)
         m0 = float(a.get("m0", 5.0))
         dis = M.Malaria(M0=m0, season=season, resistance=_resistance(a.get("resistance", 0.5)),
                         ft=float(a.get("cm_ft", 0.3)), species=a.get("species"), P=P,
                         init_eir=min(P["init_eir_per_m0"] * m0, 150.0), win_start=w0, win_stop=w1,
                         smc_months=tuple(a.get("smc_months") or default_smc_months(season)),
                         import_eir=P["import_eir"], irs_product=a.get("irs_product", "pm_cs"),
-                        rec_year=float(horizon.start), del_start=d0 if ex else None, del_stop=d1 if ex else None)
+                        rec_year=float(horizon.start), del_start=dp["accounting"]["del_start"],
+                        del_stop=dp["accounting"]["del_stop"])
         use, capped = access_for_use(float(a.get("itn_use", 0.55)), float(a.get("itn_use_at", 0.0)), P)
-        dp = self.delivery_plan(a, {}, horizon)      # v0.8: the history, routine and add-on timings (one source)
         # v0.6: the add-on acts in the delivery period; without one it starts at the window and has no end (v0.5)
         itv = [M.CaseManagement(base=float(a.get("cm_ft", 0.3)), add=0.0, start=dp["cm"]["start"],
                                 stop=dp["cm"]["stop"], name="cm")]
@@ -551,31 +594,58 @@ class MalariaEngine:
             raise ValueError("run_series: give at least one package")
         _, ser = self._run_members([params] * len(pkgs), [unit] * len(pkgs), pkgs, horizon, seed,
                                    series=list(metrics))
-        return [{"package": s["package"], "t": s["t"], "values": s["values"]} for s in ser]
+        return ser
 
     @staticmethod
-    def _series(sim, horizon: Horizon, metrics: list, pid: str) -> dict:
-        """Monthly steps from horizon.start (step k starts at horizon.start + k/12; the last ends at the window's
-        end). A "mean" metric is the mean of the step's daily values; a "rate" metric the step's sum of daily
-        episodes per person over its length in years. The days of a step are those a named window over the same
-        span selects, so window metrics are the day-weighted (mean) or length-weighted (rate) sums of steps."""
-        yv = np.asarray(sim.t.yearvec)
-        d = sim.diseases.malaria.daily
+    def series_steps(horizon: Horizon) -> tuple:
+        """(starts, ends) of the monthly steps: step k starts at horizon.start + k/12; the last ends at the window's
+        end."""
         st, w1 = float(horizon.start), float(horizon.window[1])
         n = int(np.ceil((w1 - st) * 12 - 1e-9))
         t = [st + k / 12 for k in range(n)]
-        ends = t[1:] + [w1]
+        return t, t[1:] + [w1]
+
+    @staticmethod
+    def _series(sim, horizon: Horizon, metrics: list, pid: str) -> dict:
+        """One package's monthly series, with each step's end (t_end) and its number of simulated days (days). A
+        "mean" metric is the mean of the step's daily values; a "rate" metric the step's sum of daily episodes per
+        person over its length in years. A step's days are those a named window over the same span selects
+        ((yv >= a) & (yv < b), as _outcomes; found once for all steps with searchsorted), so window metrics are the
+        day-weighted (mean) or length-weighted (rate) sums of the steps they contain (series_window)."""
+        yv = np.asarray(sim.t.yearvec)
+        d = sim.diseases.malaria.daily
+        t, ends = MalariaEngine.series_steps(horizon)
+        idx = np.searchsorted(yv, np.asarray(t + ends[-1:], float), side="left")
         vals, days = {m: [] for m in metrics}, []
-        for a, b in zip(t, ends):
-            sel = (yv >= a) & (yv < b)
-            k = int(sel.sum())
-            if k == 0:
+        for k, (a, b) in enumerate(zip(t, ends)):
+            lo, hi = int(idx[k]), int(idx[k + 1])
+            if hi <= lo:
                 raise ValueError(f"run_series: no simulated day in the step [{a:.4f}, {b:.4f})")
-            days.append(k)
+            days.append(hi - lo)
             for m in metrics:
-                x = d[m][sel]
+                x = d[m][lo:hi]
                 vals[m].append(float(x.mean()) if SERIES[m]["aggregate"] == "mean" else float(x.sum() / (b - a)))
-        return {"package": pid, "t": t, "values": vals, "days": days}
+        return {"package": pid, "t": t, "t_end": list(ends), "days": days, "values": vals}
+
+    @staticmethod
+    def series_window(entry: dict, metric: str, a: float, b: float) -> float:
+        """The window metric over [a, b) from one run_series entry: the day-weighted mean of the steps' values
+        ("mean") or the sum of rate x step length ("rate", episodes per person over the window, as the window
+        metrics inc_u5 / inc_all). Exact when [a, b) is a union of steps; a window that cuts through a step fails
+        closed (the step's days cannot be split)."""
+        t, te = np.asarray(entry["t"], float), np.asarray(entry["t_end"], float)
+        n, v = np.asarray(entry["days"], float), np.asarray(entry["values"][metric], float)
+        tol = 1e-9
+        inside = (t >= a - tol) & (te <= b + tol)
+        cut = (t < b - tol) & (te > a + tol) & ~inside
+        if cut.any():
+            raise ValueError(f"series_window: [{a:g}, {b:g}) cuts through the monthly step(s) starting at "
+                             f"{[round(x, 4) for x in t[cut][:3]]}")
+        if not inside.any():
+            raise ValueError(f"series_window: no monthly step inside [{a:g}, {b:g})")
+        if SERIES[metric]["aggregate"] == "mean":
+            return float((v * n)[inside].sum() / n[inside].sum())
+        return float((v * (te - t))[inside].sum())
 
     def _run_members(self, param_sets, units, pkgs, horizon: Horizon, seed: int, series: list | None = None):
         """run_batch's member loop: (outcomes, series) per (parameter set, unit, package); series is None per member

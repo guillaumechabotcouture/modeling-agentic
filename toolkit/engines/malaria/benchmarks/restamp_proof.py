@@ -54,6 +54,44 @@ EVIDENCE_CASES = [
     ("guess_sensitivity", [28.0, "x0.25", 2, 50]),
 ]
 
+# v0.8 (Codex r1 P2-5): pinned scenarios with the features the pack does not use (it builds plain horizons, and its
+# units set neither routine nets nor routine SMC), each one run_batch at its own seed in both trees. Members may set
+# their own unit attributes and parameters (heterogeneous batches, more than one burn-in group).
+_SEASON = [0.3, 0.3, 0.4, 0.6, 0.9, 1.3, 1.8, 2.1, 1.7, 1.1, 0.8, 0.5]
+_BASE_UNIT = {"m0": 6.0, "season": _SEASON, "resistance": 0.6, "species": {"gambiae": 0.6, "funestus": 0.4},
+              "cm_ft": 0.35, "itn_use": 0.55, "itn_use_at": 0.5}
+SCENARIOS = {
+    # GC7-like: delivery 2024-2027 inside outcomes 2024-2029.25, routine nets every 3 y, routine SMC after delivery
+    "gc7_delivery_routine": {
+        "unit": dict(_BASE_UNIT, itn_hist_years=[2021.25], campaign_year=2025.25, itn_routine_interval=3.0,
+                     smc_routine=1),
+        "horizon": {"start": 2023.0, "stop": 2029.25, "window": [2024.0, 2029.25],
+                    "windows": {"y1": [2024.0, 2025.0], "y4": [2027.0, 2028.0], "tail": [2028.0, 2029.25]}},
+        "delivery": [2024.0, 2027.0], "params": {"n_agents": 1500, "burnin_years": 20}, "seed": 21,
+        "members": [{"package": {}}, {"package": {"net": "pyr", "smc": 1}}, {"package": {"net": "pbo", "cm": 1}},
+                    {"package": {"net": "dual", "smc": 1, "irs": 1, "cm": 1}}]},
+    # boundary dates: the campaign and an IRS round at the delivery start, the first routine SMC round and a routine
+    # campaign at the delivery end, the add-on stopping there, windows cutting through months
+    "boundaries": {
+        "unit": dict(_BASE_UNIT, itn_hist_years=[2023.5], campaign_year=2024.0, itn_routine_interval=1.0,
+                     smc_routine=1, smc_months=[1, 2, 3, 4], irs_month=1),
+        "horizon": {"start": 2023.0, "stop": 2026.5, "window": [2024.0, 2026.5],
+                    "windows": {"a": [2024.0, 2025.0], "b": [2025.0, 2026.5], "c": [2024.37, 2025.61]}},
+        "delivery": [2024.0, 2025.0], "params": {"n_agents": 1500, "burnin_years": 20}, "seed": 22,
+        "members": [{"package": {}}, {"package": {"net": "pyr", "smc": 1, "irs": 1, "cm": 1}},
+                    {"package": {"cm": 1}}]},
+    # heterogeneous members: two units, parameters inside and outside the burn-in key, no delivery period (v0.5 path)
+    "heterogeneous": {
+        "unit": dict(_BASE_UNIT, itn_hist_years=[2022.5], campaign_year=2024.25),
+        "horizon": {"start": 2023.0, "stop": 2026.0, "window": [2024.0, 2026.0],
+                    "windows": {"y1": [2024.0, 2025.0], "y2": [2025.0, 2026.0]}},
+        "delivery": None, "params": {"n_agents": 1500, "burnin_years": 20}, "seed": 23,
+        "members": [{"package": {}}, {"package": {"net": "pyr"}, "params": {"smc_pe": 0.8}},
+                    {"package": {"net": "dual", "smc": 1}, "unit": {"m0": 30.0, "hist_net": "dual"}},
+                    {"package": {"irs": 1}, "unit": {"m0": 30.0, "hist_net": "dual"}, "params": {"hh_net_corr": 0.2}},
+                    {"package": {"cm": 1}, "params": {"cm_add": 0.25}}]},
+}
+
 # Run inside one code tree (argv: root, cases json, out json). It imports only what both versions have.
 WORKER = r'''
 import json, os, sys
@@ -88,6 +126,17 @@ for c in json.load(open(cases_path)):
         os_ = e.run_batch([par] * len(arms), UnitSpec(c["setting"], unit),
                           [Package(a, pack["arms"][a].get("package") or {}) for a in arms], h, int(c["seed"]))
         val = {a: strip(o) for a, o in zip(arms, os_)}
+    elif c["kind"] == "scenario":
+        from toolkit.engines.horizon import DeliveryHorizon
+        sp = c["spec"]
+        hz = sp["horizon"]
+        hargs = (float(hz["start"]), float(hz["stop"]), tuple(hz["window"]), dict(hz.get("windows") or {}))
+        h = DeliveryHorizon(*hargs, delivery=tuple(sp["delivery"])) if sp.get("delivery") else Horizon(*hargs)
+        ms = sp["members"]
+        os_ = e.run_batch([{**(sp.get("params") or {}), **fit, **(m.get("params") or {})} for m in ms],
+                          [UnitSpec(c["id"], dict(sp["unit"], **(m.get("unit") or {}))) for m in ms],
+                          [Package(f"m{i}", m.get("package") or {}) for i, m in enumerate(ms)], h, int(sp["seed"]))
+        val = {f"m{i}": strip(o) for i, o in enumerate(os_)}
     else:
         import importlib
         mod = importlib.import_module("toolkit.engines.malaria.benchmarks." + c["kind"])
@@ -102,6 +151,7 @@ def cases(pack: dict, seeds: list) -> list:
     out = [{"id": f"pack:{s}:{sd}", "kind": "pack", "setting": s, "seed": sd} for s in pack["settings"] for sd in seeds]
     out += [{"id": f"{m}:{':'.join(str(x) for x in a[:2])}:seed{a[3] if m == 'equilibration' else a[2]}",
              "kind": m, "args": a} for m, a in EVIDENCE_CASES]
+    out += [{"id": f"scenario:{n}:seed{sp['seed']}", "kind": "scenario", "spec": sp} for n, sp in SCENARIOS.items()]
     return out
 
 
@@ -161,6 +211,8 @@ def prove(old_ref: str, seeds: list, workers: int, settings: list | None = None)
                       "seeds": seeds, "n_agents": "each setting's own (pack.yaml params; 5000 where set, else the "
                       "card's 4000); equilibration 4000; guess sensitivity the card's 4000",
                       "burnin_years": "the card's (50), the pack's own", "evidence_cases": EVIDENCE_CASES,
+                      "scenarios": {n: f"{len(sp['members'])} members, seed {sp['seed']}, delivery "
+                                       f"{sp.get('delivery')}" for n, sp in SCENARIOS.items()},
                       "not_repeated": "calibration-grid runs (same code path at other attribute values)",
                       "compared": "per_capita, windows, cost_drivers and meta (minus wall-clock seconds) exactly as "
                                   "JSON; initial-state dicts exactly"},
