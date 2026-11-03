@@ -224,6 +224,10 @@ CONTINUE_PROMPT = (
     "written and final gate run, or RUN_FAILED).")
 
 
+LEAD_SIGNOFF_PROMPT = (
+    "CONTINUE. The harness has signed the decision brief with your answers (--signoff lead).\n{text}\n"
+    "Continue the pipeline from STAGE 2 (DATA): tell the planner to carry the answers into plan.md if they change "
+    "it, and pass them to every specialist. Do not end your turn until the pipeline reaches a terminal state.")
 SIGNOFF_PROMPT = (
     "CONTINUE. The owner has signed the decision brief.\n{text}\n"
     "Continue the pipeline from STAGE 2 (DATA): tell the planner to carry the owner's answers into plan.md "
@@ -244,7 +248,7 @@ async def wait_for_signoff(run_path: str, run_dir_rel: str, hours: float, poll_s
         pass
     print(f"\n{'='*60}\nWAITING FOR THE OWNER TO SIGN THE DECISION BRIEF\n"
           f"  Read:  {run_dir_rel}/decision_brief.md\n"
-          f"  Sign:  python3 scripts/decision_brief.py sign {run_dir_rel} --answers <answers.yaml> "
+          f"  Sign:  python3 scripts/decision_brief.py sign {run_dir_rel} --by owner --answers <answers.yaml> "
           f"[--note \"...\"]   (or --accept-proposed)\n"
           f"  Waiting up to {hours:g} h.\n{'='*60}", flush=True)
     with open(os.path.join(run_path, "trace.jsonl"), "a") as tf:
@@ -252,10 +256,9 @@ async def wait_for_signoff(run_path: str, run_dir_rel: str, hours: float, poll_s
     deadline = time.time() + hours * 3600
     while time.time() < deadline:
         if decision_brief.status(run_path) == "signed":
-            if integrity is not None:   # the owner signed outside any tool call
-                integrity.harness_wrote(decision_brief.SIGNOFF)
-                for f in decision_brief.FROZEN_AT_SIGNOFF:   # and the signed copies it kept
-                    integrity.harness_wrote(f"{decision_brief.SIGNED_DIR}/{f}")
+            if integrity is not None:   # the owner signed outside any tool call: the record, the signed copies
+                for rel in decision_brief.signoff_outputs(run_path):   # and, with a spec, the geometry record
+                    integrity.harness_wrote(rel)
             with open(os.path.join(run_path, "trace.jsonl"), "a") as tf:
                 tf.write(json.dumps({"ts": datetime.now().isoformat(), "type": "signed_off"}) + "\n")
             print("Decision brief signed; resuming the lead.", flush=True)
@@ -283,7 +286,7 @@ async def wait_for_scope_signoff(run_path: str, run_dir_rel: str, hours: float, 
         pass
     print(f"\n{'='*60}\nWAITING FOR THE OWNER: SCOPE DECLARATIONS THAT BEAR ON THE DECISION\n"
           f"  Read:  {run_dir_rel}/{scope_signoff.MD}\n"
-          f"  Sign:  python3 scripts/scope_signoff.py sign {run_dir_rel} --answers <answers.yaml> "
+          f"  Sign:  python3 scripts/scope_signoff.py sign {run_dir_rel} --by owner --answers <answers.yaml> "
           f"[--note \"...\"]   (or --accept-all / --decline-all)\n"
           f"  Waiting up to {hours:g} h.\n{'='*60}", flush=True)
     with open(os.path.join(run_path, "trace.jsonl"), "a") as tf:
@@ -581,6 +584,15 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                     signoff_waits += 1
                     lead_prompt = SCOPE_SIGNOFF_PROMPT.format(text=scope_signoff.answer_text(run_path))
                     continue
+                if signoff == "lead" and decision_brief.status(run_path) == "awaiting":
+                    # Focused check of #131: --signoff lead; the harness signs the lead's answers file and registers
+                    # what signing wrote (with a decision spec, the geometry record and the spec's signed copy).
+                    # It signs only what the lead itself wrote during this session (the trace's record), and says
+                    # exactly what is missing otherwise, including when there is no answers file at all.
+                    signed, text = harness_sign_brief_lead(run_path, integrity, session_started)
+                    signoff_waits += 1
+                    lead_prompt = LEAD_SIGNOFF_PROMPT.format(text=text) if signed else f"CONTINUE. {text}"
+                    continue
                 if (signoff == "lead" and scope_signoff.status(run_path) == "awaiting"
                         and scope_signoff.lead_answers(run_path)):
                     # Phase 49 β: --signoff lead; the harness signs the lead's answers file.
@@ -689,9 +701,282 @@ async def run(question: str, max_rounds: int, max_sessions: int,
     return status
 
 
+LEAD_ANSWERS_HOWTO = ("Write {name} with the Write tool: `accept_proposed: true` (accept every proposed answer), or "
+                      "`answers: {{Q1: <answer>, ...}}` for the brief's open questions, and `note: <why the brief is an "
+                      "adequate target>`. Then end your turn with the line AWAITING_SIGNOFF; the harness signs it.")
+
+
+def _utc(dt: datetime) -> datetime:
+    """A datetime in UTC, timezone-aware. The hook records UTC-aware times; main.py's session start is local-aware
+    (`datetime.now().astimezone()`); a naive time (an older trace) is read as local time."""
+    from datetime import timezone
+    return dt.astimezone(timezone.utc)
+
+
+def _lead_wrote_answers(run_path: str, since) -> str | None:
+    """None when the trace records the lead's own Write/Edit of the answers file (agents/hooks.py
+    record_lead_answers) after `since`, with the file's current content; else why not."""
+    import decision_brief
+    import hashlib
+    from agents.hooks import LEAD_ANSWERS_EVENT
+    from lib.safe_io import LinkRefused, read_nofollow
+    try:                                 # never through a link (lib.safe_io)
+        sha = hashlib.sha256(read_nofollow(run_path, decision_brief.LEAD_ANSWERS)[0]).hexdigest()
+        lines = read_nofollow(run_path, "trace.jsonl")[0].decode("utf-8", "replace").splitlines()
+    except (LinkRefused, OSError) as e:
+        return f"the answers file or the trace cannot be read without following a link ({e})"
+    for ln in reversed(lines):
+        try:
+            rec = json.loads(ln)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict) or rec.get("type") != LEAD_ANSWERS_EVENT or rec.get("agent") != "lead":
+            continue
+        try:
+            at = _utc(datetime.fromisoformat(str(rec.get("ts"))))
+        except ValueError:
+            continue
+        if since is not None and at < _utc(since):
+            break
+        if rec.get("sha256") == sha:
+            return None
+    return ("it was not written by the lead in this turn: the trace has no record of your own Write of this content "
+            "(a shell write, a write before this turn, or an edit since are not accepted)")
+
+
+def harness_sign_brief_lead(run_path: str, integrity=None, since=None) -> tuple[bool, str]:
+    """--signoff lead: sign the lead's answers file (decision_brief.LEAD_ANSWERS) `by: lead`, as the harness, and
+    register every file signing wrote with the integrity record (focused checks of #131). It signs only a file that
+    the lead itself wrote with the Write/Edit tool after `since` (the start of the current session), recorded in the
+    trace with the file's current sha256 (no specialist may write it: enforcement.OWNED_BY), and only answers that
+    parse strictly (decision_brief.parse_lead_answers). Returns (signed, text for the lead's next prompt); with no
+    answers file the text says exactly what to write."""
+    import decision_brief
+    name = decision_brief.LEAD_ANSWERS
+    if not os.path.exists(os.path.join(run_path, name)):
+        return False, (f"You are in --signoff lead and the decision brief waits for your sign-off, but {name} does not "
+                       "exist. " + LEAD_ANSWERS_HOWTO.format(name=name))
+    la, errs = decision_brief.parse_lead_answers(run_path)
+    why = "; ".join(errs) if errs else _lead_wrote_answers(run_path, since)
+    if why:
+        return False, (f"Your {name} was not signed: {why}. " + LEAD_ANSWERS_HOWTO.format(name=name))
+    try:
+        decision_brief.sign(run_path, "lead", la["answers"] or None, la["note"], la["accept_proposed"])
+    except (ValueError, OSError) as e:
+        return False, (f"Your {name} was not signed: {e}. " + LEAD_ANSWERS_HOWTO.format(name=name))
+    if integrity is not None:            # only after a successful signature: it rewrote each of these files
+        for rel in decision_brief.signoff_outputs(run_path):
+            if os.path.exists(os.path.join(run_path, rel)):
+                integrity.harness_wrote(rel)
+    return True, "Signed by the lead (the harness recorded it). " + (decision_brief.signoff_text(run_path) or "")
+
+
 # ---------------------------------------------------------------------------
 # Self-test (no API calls)
 # ---------------------------------------------------------------------------
+
+# Owner signing (the next PR after #131): owner approvals signed with a key in the owner's keychain and verified by
+# the harness. Until then the tool-hook denial is defence in depth, not authentication; the bypasses it cannot close
+# are recorded as expected failures (XFAIL) below.
+OWNER_SIGNING_PR = "owner-signed approvals (next PR after #131)"
+
+
+def _self_test_owner_cli(ok, td: str, trace, reg) -> None:
+    """SO12-SO13 (Codex round 3 on #131). SO12: owner CLIs take no default signer and no abbreviated flag, and the
+    hook parses a brief sign-off with the CLI's own parser and refuses it (the harness signs in lead mode). SO13a: no Bash
+    call is credited with rewriting the geometry records, so a change during an agent's call is a violation. SO13b
+    (XFAIL until owner signing): indirect forms the command filter cannot see."""
+    import tempfile
+    import yaml as _y
+    import agents as agents_pkg
+    import decision_brief as _db
+    from toolkit.spec import geometry as _geo
+    from toolkit.spec import schema as _schema
+    py = sys.executable
+
+    def hook_denies(mode, cmd, who=None):
+        hk = agents_pkg.create_hooks(td, trace, datetime.now(), registered_agents=reg, signoff=mode)
+        r = asyncio.run(hk["PreToolUse"][0].hooks[0](dict({"tool_name": "Bash", "tool_input": {"command": cmd}},
+                                                          **(who or {})), "so12", None))
+        return (r.get("hookSpecificOutput") or {}).get("permissionDecision") == "deny"
+    bad = [f"python3 scripts/decision_brief.py sign {td} --accept-proposed",
+           f"python3 scripts/decision_brief.py sign {td} --b owner --accept-proposed",
+           f"python3 scripts/decision_brief.py sign {td} --by=owner --accept-proposed",
+           f"python3 scripts/decision_brief.py sign {td} --b lead --accept-proposed",
+           f"python3 scripts/decision_brief.py --accept-proposed sign {td}"]
+    let = [(c, w.get("agent_type", "lead")) for c in bad for w in ({}, {"agent_id": "m12", "agent_type": "modeler"})
+           if not hook_denies("lead", c, w)]
+    ok(not let, f"SO12a a brief sign-off without an explicit --by lead (no --by, an abbreviation, --by=owner) is denied "
+                f"in lead mode, for the lead and a specialist, parsed with the CLI's own parser (allowed: {let[:3]})")
+    lead_cmd = f"python3 scripts/decision_brief.py sign {td} --by lead --accept-proposed --note ok"
+    ok(hook_denies("lead", lead_cmd) and hook_denies("owner", lead_cmd) and hook_denies(None, lead_cmd),
+       "SO12b an explicit --by lead is refused too, in every mode: the harness signs the lead's answers")
+    # SO14-SO17 (focused checks of #131): the lead's sign-off is the harness's action. SO14: it signs the answers the
+    # lead wrote in this turn (recorded by the real PostToolUse hook) and registers what signing wrote. SO15: only the
+    # lead may write the answers file, and the harness refuses one the lead did not write this turn. SO16: strict
+    # types. SO17: the lead is told the procedure (prompt, denial, a specific message when the file is missing).
+    la_name = getattr(_db, "LEAD_ANSWERS", "decision_brief_lead_answers.yaml")
+    with tempfile.TemporaryDirectory() as d5:
+        _geo.toy_inputs(d5)
+        _y.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d5, "success_criteria.yaml"), "w"))
+        _y.safe_dump(_db.example_brief(), open(os.path.join(d5, "decision_brief.yaml"), "w"))
+        _geo.toy_write_sheet(d5)     # the sheet whose geometry evidence the sign-off binds (Codex on 4d20e23)
+        la = os.path.join(d5, la_name)
+        tr5 = open(os.path.join(d5, "trace.jsonl"), "a")
+        hk5 = agents_pkg.create_hooks(d5, tr5, datetime.now(), registered_agents=reg, signoff="lead")
+        pre5, post5 = hk5["PreToolUse"][0].hooks[0], hk5["PostToolUse"][0].hooks[0]
+
+        def lead_write(text, who=None):
+            call = dict({"tool_name": "Write", "tool_input": {"file_path": la, "content": text}}, **(who or {}))
+            r = asyncio.run(pre5(call, "w5", None))
+            if (r.get("hookSpecificOutput") or {}).get("permissionDecision") == "deny":
+                return False
+            open(la, "w").write(text)
+            asyncio.run(post5(call, "w5", None))
+            tr5.flush()
+            return True
+        since = datetime.now().astimezone()    # the value main.py sets (session_started): timezone-aware
+        ig5 = ArtifactIntegrity(d5, process_check=lambda: set())
+        try:
+            r_missing = harness_sign_brief_lead(d5, ig5, since)
+            open(la, "w").write("accept_proposed: true\nnote: written by a shell, not the Write tool\n")
+            r_unrecorded = harness_sign_brief_lead(d5, ig5, since)
+            lead_write("accept_proposed: \"false\"\nnote: a string, not a boolean\n")
+            r_string = harness_sign_brief_lead(d5, ig5, since)
+            lead_write("answers: {Q99: x}\nnote: an unknown question\n")
+            r_unknown = harness_sign_brief_lead(d5, ig5, since)
+            lead_write("accept_proposed: true\nnote: an adequate target\n")
+            open(la, "a").write("# edited after the lead's write\n")
+            r_edited = harness_sign_brief_lead(d5, ig5, since)
+            lead_write("accept_proposed: true\nnote: an adequate target for the question\n")
+            r_ok = harness_sign_brief_lead(d5, ig5, since)
+            g5 = _y.safe_load(open(os.path.join(d5, _geo.SIGNOFF_FILE)))
+            ev5 = [(e["file"], e["change"]) for e in ig5.check_now()]
+        except Exception as e:  # noqa: BLE001 -- before the new contract exists (alpha)
+            r_missing = r_unrecorded = r_string = r_unknown = r_edited = r_ok = (None, f"{type(e).__name__}: {e}")
+            g5, ev5 = {}, ["error"]
+
+        def refused(r, needle):
+            return isinstance(r, tuple) and r[0] is False and needle in str(r[1])
+        ok(isinstance(r_ok, tuple) and r_ok[0] is True and _db.status(d5) == "signed"
+           and (g5 or {}).get("signed_by") == "lead" and ev5 == [],
+           f"SO14 the harness signs the answers the lead wrote this turn and registers what signing wrote; integrity "
+           f"attributes it ({ev5}; {r_ok})")
+        ok(refused(r_unrecorded, "not written by the lead") and refused(r_edited, "not written by the lead"),
+           f"SO15b an answers file with no record of the lead writing it this turn (a shell write, or edited since) is "
+           f"refused, with the reason ({r_unrecorded}; {r_edited})")
+        ok(refused(r_string, "accept_proposed") and refused(r_unknown, "Q99"),
+           f"SO16 strict types: accept_proposed must be a YAML boolean, answers a mapping of known question ids "
+           f"({r_string}; {r_unknown})")
+        ok(refused(r_missing, la_name) and "AWAITING_SIGNOFF" in str(r_missing[1]),
+           f"SO17c with no answers file the harness says exactly what to write ({r_missing})")
+        tr5.close()
+    # SO18 (focused check of #131 at 7374814): the hook resolves the written path as enforcement does (cwd + path,
+    # then realpath): a run-relative path from the repo root is recorded; a bare name written elsewhere is not
+    import io as _io
+    from agents.hooks import record_lead_answers as _rla
+    with tempfile.TemporaryDirectory() as root18:
+        rd = os.path.join(root18, "runs", "example")
+        os.makedirs(rd)
+        open(os.path.join(rd, la_name), "w").write("accept_proposed: true\nnote: ok\n")
+        other = os.path.join(root18, "elsewhere")
+        os.makedirs(other)
+        open(os.path.join(other, la_name), "w").write("accept_proposed: true\nnote: a different file\n")
+        got18 = {}
+        for name, path, cwd in (("relative from root", f"runs/example/{la_name}", root18),
+                                ("bare name elsewhere", la_name, other),
+                                ("absolute", os.path.join(rd, la_name), other)):
+            buf = _io.StringIO()
+            try:
+                _rla(rd, {"tool_name": "Write", "tool_input": {"file_path": path}, "cwd": cwd}, buf)
+            except Exception as e:  # noqa: BLE001
+                buf.write(f"error {e}")
+            got18[name] = "lead_answers_written" in buf.getvalue()
+        recs = [json.loads(x) for x in buf.getvalue().splitlines() if x.startswith("{")]
+        aware = all(datetime.fromisoformat(r["ts"]).tzinfo is not None for r in recs)
+        ok(got18 == {"relative from root": True, "bare name elsewhere": False, "absolute": True} and recs and aware,
+           f"SO18 the hook resolves the written path from cwd as enforcement does and records UTC-aware times "
+           f"({got18}; aware {aware})")
+    # SO15a: no specialist may write the answers file, by Write, Edit or a shell redirect; the lead may
+    let15 = []
+    for sub in sorted(reg):
+        who = {"agent_id": f"s-{sub}", "agent_type": sub}
+        for tool, inp in (("Write", {"file_path": os.path.join(td, la_name), "content": "accept_proposed: true\n"}),
+                          ("Edit", {"file_path": os.path.join(td, la_name), "old_string": "a", "new_string": "b"}),
+                          ("Bash", {"command": f"echo 'accept_proposed: true' > {td}/{la_name}"})):
+            hk = agents_pkg.create_hooks(td, trace, datetime.now(), registered_agents=reg, signoff="lead")
+            r = asyncio.run(hk["PreToolUse"][0].hooks[0](dict({"tool_name": tool, "tool_input": inp}, **who), "s15",
+                                                           None))
+            if (r.get("hookSpecificOutput") or {}).get("permissionDecision") != "deny":
+                let15.append((sub, tool))
+    hk = agents_pkg.create_hooks(td, trace, datetime.now(), registered_agents=reg, signoff="lead")
+    r_lead = asyncio.run(hk["PreToolUse"][0].hooks[0](
+        {"tool_name": "Write", "tool_input": {"file_path": os.path.join(td, la_name), "content": "x"}}, "s15l", None))
+    ok(not let15 and (r_lead.get("hookSpecificOutput") or {}).get("permissionDecision") != "deny",
+       f"SO15a only the lead writes {la_name}: every specialist is denied Write, Edit and a shell redirect through the "
+       f"real hook ({sorted(reg)}; allowed: {let15[:4]})")
+    # SO17a/b: the procedure is in the lead's initial prompt, and the denial of a sign command says what to do
+    from agents.lead_prompt import LEAD_SYSTEM_PROMPT as _lsp
+    lp = _lsp[_lsp.index("STAGE 1.5"):_lsp.index("### STAGE 2")]
+    deny = json.dumps(asyncio.run(hk["PreToolUse"][0].hooks[0](
+        {"tool_name": "Bash", "tool_input": {"command": f"python3 scripts/decision_brief.py sign {td} --by lead"}},
+        "s17", None)))
+    ok(la_name in lp and "AWAITING_SIGNOFF" in lp, "SO17a the lead's initial prompt names the answers file and the "
+                                                    "lead-mode procedure")
+    ok(la_name in deny and "AWAITING_SIGNOFF" in deny,
+       f"SO17b the denial of a sign command says what to do instead ({deny[-220:]})")
+    rc = {}
+    with tempfile.TemporaryDirectory() as d:
+        _y.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d, "success_criteria.yaml"), "w"))
+        _y.safe_dump(_db.example_brief(), open(os.path.join(d, "decision_brief.yaml"), "w"))
+        env = {k: v for k, v in os.environ.items() if k != "MA_SIGNOFF_MODE"}
+        for name, args in (("brief, no --by", ["sign", d, "--accept-proposed"]),
+                           ("brief, --b owner", ["sign", d, "--b", "owner", "--accept-proposed"])):
+            r = subprocess.run([py, os.path.join(REPO_ROOT, "scripts", "decision_brief.py"), *args], env=env,
+                               capture_output=True, text=True)
+            rc[name] = (r.returncode, os.path.exists(os.path.join(d, _db.SIGNOFF)))
+    with tempfile.TemporaryDirectory() as d2:
+        _schema.toy_spec(d2)
+        for name, script, args in (("spec, no --by", "toolkit/spec/signoff.py", ["sign", d2]),
+                                   ("spec, --b owner", "toolkit/spec/signoff.py", ["sign", d2, "--b", "owner"]),
+                                   ("machine, --b owner", "agents/stage_machine.py", ["sign", d2, "--b", "owner"])):
+            r = subprocess.run([py, os.path.join(REPO_ROOT, script), *args], capture_output=True, text=True)
+            rc[name] = (r.returncode, os.path.exists(os.path.join(d2, "decision_spec.signoff.json")))
+    with tempfile.TemporaryDirectory() as d3:
+        _geo.toy_inputs(d3)
+        r = subprocess.run([py, os.path.join(REPO_ROOT, "toolkit", "spec", "geometry.py"), "approve", d3, "--b",
+                            "owner"], capture_output=True, text=True)
+        rc["geometry, --b owner"] = (r.returncode, os.path.exists(os.path.join(d3, _geo.SIGNOFF_FILE)))
+        r = subprocess.run([py, os.path.join(REPO_ROOT, "scripts", "scope_signoff.py"), "sign", d3, "--b", "owner",
+                            "--accept-all"], capture_output=True, text=True)
+        rc["scope, --b owner"] = (r.returncode, False)
+    ok(all(v == (2, False) for v in rc.values()),
+       f"SO12c the owner CLIs refuse a missing signer and an abbreviated flag (argparse exit 2, nothing signed): {rc}")
+    # SO13a: a harmless decision_brief.py call does not cover a rewrite of the geometry record in the same Bash call
+    with tempfile.TemporaryDirectory() as d4:
+        os.makedirs(os.path.join(d4, "data"))
+        open(os.path.join(d4, _geo.SIGNOFF_FILE), "w").write('{"approvals": {}}')
+        ig = ArtifactIntegrity(d4, process_check=lambda: set())
+        ig.on_pre("g13", "Bash", {"command": f"python3 scripts/decision_brief.py status {d4} && python3 {d4}/helper.py"},
+                  None)
+        open(os.path.join(d4, _geo.SIGNOFF_FILE), "w").write('{"approvals": {"x": {"approved_by": "owner"}}}')
+        ev = [(e["file"], e["change"]) for e in ig.on_post("g13")]
+        ok((_geo.SIGNOFF_FILE, "modified") in ev,
+           f"SO13a a geometry record rewritten during an agent's Bash call is an integrity violation, whatever "
+           f"harness script the call also names ({ev})")
+    # SO13b XFAIL: indirect execution the command filter cannot see; owner signing closes it
+    helper = os.path.join(td, "helper.py")
+    indirect = {"helper script": f"python3 scripts/decision_brief.py status {td} && python3 {helper}",
+                "split name": f"G=geom; python3 toolkit/spec/${{G}}etry.py approve {td} --by owner",
+                "python -c, getattr": "python3 -c \"import importlib as i; m=getattr(i, 'import_' + 'module')('toolkit.spec.geo'+"
+                                      f"'metry'); getattr(m, 'app'+'rove')('{td}', 'own'+'er')\"",
+                "xargs": f"echo approve {td} --by owner | xargs python3 toolkit/spec/geo*.py",
+                "symlink": f"ln -s {REPO_ROOT}/toolkit/spec/geometry.py {td}/g.py && python3 {td}/g.py approve {td} "
+                           "--by owner"}
+    for name, cmd in indirect.items():
+        state = "XPASS (denied by the filter)" if hook_denies("lead", cmd) else "XFAIL (allowed)"
+        print(f"{state} SO13b {name}: the tool hook cannot see indirect execution; closed by {OWNER_SIGNING_PR}")
+
 
 def _run_self_test() -> int:
     import tempfile
@@ -1172,8 +1457,10 @@ def _run_self_test() -> int:
         _y.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(td, "success_criteria.yaml"), "w"))
         _y.safe_dump(_db.example_brief(), open(os.path.join(td, "decision_brief.yaml"), "w"))
         ok("AWAITING_SIGNOFF" in (signoff_hold_reason(td, "owner") or "")
-           and "--by lead" in (signoff_hold_reason(td, "lead") or "") and signoff_hold_reason(td, None) is None,
-           "SO2 a ready brief: owner mode waits, lead mode signs, no mode does nothing")
+           and getattr(_db, "LEAD_ANSWERS", "decision_brief_lead_answers.yaml") in (signoff_hold_reason(td, "lead") or "")
+           and "AWAITING_SIGNOFF" in (signoff_hold_reason(td, "lead") or "") and signoff_hold_reason(td, None) is None,
+           "SO2 a ready brief: owner mode waits; lead mode writes its answers and the harness signs; no mode does "
+           "nothing")
         hk5 = agents_pkg.create_hooks(td, trace, datetime.now(), registered_agents=reg, signoff="owner")
         pre5 = hk5["PreToolUse"][0].hooks[0]
 
@@ -1188,7 +1475,8 @@ def _run_self_test() -> int:
         r6 = json.dumps(asyncio.run(hk6["PreToolUse"][0].hooks[0](
             {"tool_name": "Bash", "tool_input": {"command": f"python3 scripts/decision_brief.py sign {td} --by lead"}},
             "so6", None)))
-        ok("agents cannot sign" not in r6, "SO5 in lead mode the lead signs")
+        ok("agents cannot sign" in r6, "SO5 in lead mode the lead does not run the sign-off itself: the harness signs "
+                                       "its answers (focused check of #131: the harness registers what signing writes)")
         ok(asyncio.run(wait_for_signoff(td, "runs/x", hours=0.00001, poll_s=0.01)) is False,
            "SO6 an unsigned wait times out")
         _db.sign(td, "owner")
@@ -1205,6 +1493,49 @@ def _run_self_test() -> int:
            and not _ihp(_RR) and _ihp(os.path.join(_RR, "docs")),
            "SO10 once signed the brief and criteria are frozen for every agent; docs/ (parent of docs/lessons) is harness")
         ok(exit_code_for("awaiting_signoff") == 2, "SO9 a paused run exits 2 (resumable)")
+        # SO11 (Codex round 2 on #131): the owner's commands and records are out of every agent's reach, through the
+        # real PreToolUse hook with v1-style tool calls (the lead and a specialist, in each sign-off mode).
+        owner_cmds = [f"python3 toolkit/spec/geometry.py approve {td} --by owner",
+                      f"cd {_RR} && python3 -m toolkit.spec.geometry approve {td} --by owner --accept a=b",
+                      f"python3 agents/stage_machine.py sign {td} --by owner",
+                      f"python3 toolkit/spec/signoff.py sign {td} --by owner",
+                      f"python3 scripts/scope_signoff.py sign {td} --accept-all",
+                      f"python3 scripts/decision_brief.py sign {td} --by owner --accept-proposed",
+                      f"python3 -c \"from toolkit.spec import geometry; geometry.approve('{td}', 'owner')\""]
+        writes = [("Write", {"file_path": os.path.join(td, "data", "geometry_signoff.json"), "content": "{}"}),
+                  ("Edit", {"file_path": os.path.join(td, "data", "geometry_signoff.json"), "old_string": "a",
+                            "new_string": "b"}),
+                  ("Bash", {"command": f"echo '{{}}' > {td}/data/geometry_signoff.json"}),
+                  ("Write", {"file_path": os.path.join(td, "data", "input_checks.json"), "content": "{}"}),
+                  ("Write", {"file_path": os.path.join(td, "decision_spec.signoff.json"), "content": "{}"})]
+        allowed, denied_all = [], True
+        for mode in ("owner", "lead", None):
+            hk11 = agents_pkg.create_hooks(td, trace, datetime.now(), registered_agents=reg, signoff=mode)
+            pre11 = hk11["PreToolUse"][0].hooks[0]
+            for who in ({}, {"agent_id": "m11", "agent_type": "modeler"}):
+                for tool, inp in [("Bash", {"command": c}) for c in owner_cmds] + writes:
+                    r = asyncio.run(pre11(dict({"tool_name": tool, "tool_input": inp}, **who), "so11", None))
+                    if (r.get("hookSpecificOutput") or {}).get("permissionDecision") != "deny":
+                        denied_all = False
+                        allowed.append((mode, who.get("agent_type", "lead"), tool, str(inp)[:70]))
+        ok(denied_all, f"SO11a every owner command and every write to the owner's records is denied to the lead and to "
+                       f"specialists, in owner, lead and no sign-off mode (allowed: {allowed[:4]})")
+        hk11 = agents_pkg.create_hooks(td, trace, datetime.now(), registered_agents=reg, signoff="lead")
+        r11 = json.dumps(asyncio.run(hk11["PreToolUse"][0].hooks[0](
+            {"tool_name": "Bash", "tool_input": {"command": f"python3 scripts/decision_brief.py sign {td} --by lead "
+                                                            "--accept-proposed --note ok"}}, "so11b", None)))
+        r11c = json.dumps(asyncio.run(hk11["PreToolUse"][0].hooks[0](
+            {"tool_name": "Bash", "tool_input": {"command": f"python3 toolkit/spec/geometry.py check {td}"}},
+            "so11c", None)))
+        ok("deny" in r11 and "deny" not in r11c,
+           "SO11b no agent runs the brief sign-off, even `--by lead` in lead mode (the harness signs); anyone may run "
+           "the check itself")
+        from agents.integrity import _protected_patterns as _pp
+        import fnmatch as _fn
+        ok(all(any(_fn.fnmatch(p, pat) for pat in _pp()) for p in ("data/geometry_signoff.json",
+                                                                       "data/input_checks.json")),
+           "SO11c the integrity record watches the geometry records (an unexplained change is a violation)")
+        _self_test_owner_cli(ok, td, trace, reg)
         # SS1-SS6 (Phase 49 β): decision-bearing declarations wait for the owner.
         import scope_signoff as _ss
         from agents import scope_hold_reason

@@ -204,7 +204,7 @@ spec, which now refuses a `presentation` block with a pointer to the file. Label
 malformed files fail closed. Each figure's provenance records the presentation files and their sha.
 
 The same file can declare `boundaries: {path, feature_id, crosswalk: {path, unit_id, feature_id}, credit}`:
-- GeoJSON Polygon and MultiPolygon exterior rings, read with json and numpy only; no new dependency.
+- GeoJSON Polygon and MultiPolygon with holes, read by toolkit/spec/geometry.py (the one loader, shared with the input geometry check, #131); no new dependency.
 - Units are matched through the crosswalk, or directly by the feature property.
 - Unmatched units are listed in the caption and figures.yaml.
 - Features outside the analysis are drawn grey for context.
@@ -212,7 +212,7 @@ The same file can declare `boundaries: {path, feature_id, crosswalk: {path, unit
 - The credit line is printed on every map.
 
 **Codex round 2 (16 findings; each reproduced by a failing test first, r2 α/β).**
-- **Boundaries.** A crosswalk mapping a unit to two features is refused unless `crosswalk.union: true` is declared. A feature mapped to two units, or a feature id appearing in two features, is refused, and the error names every affected id. A feature with no polygon leaves its unit unmatched. Only geographic coordinates are read (EPSG:4326 / CRS84, longitude within ±180 and latitude within ±90).
+- **Boundaries.** A crosswalk mapping a unit to two features is refused; `crosswalk.union` was removed (#131: a union's area needs exact polygon intersection, and nothing uses it yet). A feature mapped to two units, or a feature id appearing in two features, is refused, and the error names every affected id. A feature with no polygon leaves its unit unmatched. Only geographic coordinates are read (EPSG:4326 / CRS84, longitude within ±180 and latitude within ±90).
 - **Offline rebuild.** The ulp tolerance applies only to the derived field, the calibrated attribute on the log scale (`exp(z)`); every source-bound input must match exactly.
 - **Signed spec.** A `presentation` block is refused on every validation path, including sign-off with `engine: auto` pending.
 - **Trajectory freshness.** The trajectories record the full engine identity (code, params and config fingerprints) and the analysis's engine record, and hash the units table, settings and engine choice as well as the analysis artifacts. The step refuses to run with an engine other than the analysis's.
