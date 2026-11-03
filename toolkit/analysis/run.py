@@ -27,6 +27,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 from toolkit.analysis import (batch as Bt, calibration as C, claims as CL, decision_tests as DT,  # noqa: E402
+                              figure_data as FD,
                               figures as FG, sensitivity as SE, stability as ST, uncertainty as UQ)
 from toolkit.analysis.artifacts import EXPECTED_KINDS, EXPECTED_ROLES, Store, plain, sha256  # noqa: E402
 from toolkit.analysis.core import Analysis, AnalysisBlocked  # noqa: E402
@@ -268,10 +269,13 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
             w.writerow([i, plan[i], round(point["per_unit"][i]["averted"][hl_o], 4), round(cost0[i][plan[i]], 2),
                         A.by_id[i].get(reg, "") if reg else ""])
     S.deliverable(dp, PRODUCER, "allocation")
-    # ---- figures
-    figs = FG.draw(run_dir, point, u["data"], sens, cal, A.primary, arts)
-    arts["figures"] = S.write("figures", {"figures": figs}, FG.PRODUCER,
-                              [arts["point"], arts["uncertainty"], arts["sensitivity"], arts["calibration"]])
+    # ---- figures: the decision numbers they need (no engine runs), then every figure from the saved artifacts
+    fdat = FD.compute(A, plan, out0, ben0, cost0, u["data"], z0, log=log)
+    arts["figure_data"] = S.write("figure_data", fdat, FD.PRODUCER, [arts["point"], arts["uncertainty"]])
+    rend = FG.render(run_dir)
+    figs = rend["figures"]
+    arts["figures"] = S.write("figures", {"figures": figs, "not_produced": rend["not_produced"]}, FG.PRODUCER,
+                              sorted({s for f in figs for s in f["sources"]}))
     for fgd in figs:
         S.deliverable(os.path.join(run_dir, fgd["path"]), FG.PRODUCER, "figure")
     # ---- claims and results.md
