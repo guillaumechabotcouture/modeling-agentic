@@ -2394,6 +2394,34 @@ def _self_test() -> int:
     except Exception as e:  # noqa: BLE001 -- before the runner exists (step α) this is the failure
         print(f"FAIL DI derivation tests: {type(e).__name__}: {e}")
         ok(False, f"DI derivation tests: {type(e).__name__}: {e}")
+    # PL-RW1/2 (run console review round 3, P1-2): harness publication in a run dir never follows a link
+    with tempfile.TemporaryDirectory() as rd, tempfile.TemporaryDirectory() as out:
+        victim = os.path.join(out, "victim")
+        open(victim, "w").write("untouched")
+        os.makedirs(os.path.join(rd, "data"))
+        os.symlink(victim, os.path.join(rd, "data", "derivations_record.json.tmp"))
+        try:
+            _write_json(rd, "data/derivations_record.json", {"x": 1})
+        except (ValueError, OSError):
+            pass
+        ok(open(victim).read() == "untouched", "PL-RW1 a planted .tmp link is not written through by _write_json")
+        work = os.path.join(rd, "_work")
+        os.makedirs(os.path.join(work, "data", "derived"))
+        os.makedirs(os.path.join(rd, "data", "derived"))
+        secret = os.path.join(out, "secret.csv")
+        open(secret, "w").write("SECRET\n")
+        os.symlink(secret, os.path.join(work, "data", "derived", "a.csv"))
+        open(os.path.join(work, "data", "derived", "b.csv"), "w").write("b\n")
+        os.symlink(victim, os.path.join(rd, "data", "derived", "b.csv.tmp"))
+        res = None
+        try:
+            res = _publish_outputs(work, rd, ["data/derived/a.csv", "data/derived/b.csv"])
+        except (ValueError, OSError, NameError) as e:
+            res = e
+        a = os.path.join(rd, "data", "derived", "a.csv")
+        ok(not isinstance(res, NameError) and open(victim).read() == "untouched"
+           and not (os.path.exists(a) and "SECRET" in open(a).read()),
+           f"PL-RW2 derivation outputs are published without following a link in the work dir or a planted .tmp ({res})")
     if fails:
         print("SELF-TEST FAILURES:")
         for f in fails:

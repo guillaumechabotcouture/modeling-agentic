@@ -2096,6 +2096,18 @@ def _self_test() -> int:
                             hashlib.sha256(open(os.path.join(d70, AB.SPEC_FILE), "rb").read()).hexdigest()])
             except SystemExit as e:
                 rc2 = e.code
+        d72, o72 = os.path.join(td, "t72"), os.path.join(td, "t72out")
+        os.makedirs(d72)
+        os.makedirs(o72)
+        _S.toy_spec(d72)
+        open(os.path.join(o72, "v"), "w").write("untouched")
+        os.symlink(os.path.join(o72, "v"), os.path.join(d72, SIGNOFF_SHEET))
+        try:
+            Machine._write_sheet(type("M", (), {"run_dir": d72, "backend": None})())
+        except (ValueError, OSError):
+            pass
+        ok(open(os.path.join(o72, "v")).read() == "untouched",
+           "T72 the sign-off sheet is published without following a link (round 3, P1-2)")
         d71 = os.path.join(td, "t71")
         os.makedirs(d71)
         _S.toy_spec(d71)

@@ -372,6 +372,66 @@ def _self_test() -> int:
         ok(os.listdir(out) == [] and len(opens) <= 1,
            f"SG18 decision_brief.sign hashes and copies the same bytes, never through a linked signed dir "
            f"({os.listdir(out)}, {len(opens)} opens)")
+    # SG19-SG22 (run console review round 3)
+    with tempfile.TemporaryDirectory() as d:
+        p = schema.toy_spec(d)
+        try:
+            write_sheet(d)
+            src = sheet_sources(open(os.path.join(d, SHEET)).read())
+            ok(src and src.get("spec_sha256") == DB._sha(p) and src.get("derivations_sha256") == "none",
+               f"SG19 the sheet writer records the source hashes it was generated from ({src})")
+            with open(p, "a") as f:
+                f.write("\n# a newer spec\n")
+            try:
+                sign(d, "owner", note="n", expect_sha256=DB._sha(p),
+                     expect_sheet_sha256=DB._sha(os.path.join(d, SHEET)), expect_derivations_sha256="none")
+                ok(False, "SG20 a sheet generated from an older spec cannot authorise the newer one")
+            except ValueError as e:
+                ok("sheet" in str(e) and status(d) == "awaiting",
+                   f"SG20 a sheet generated from an older spec cannot authorise the newer one ({e})")
+        except NameError as e:
+            ok(False, f"SG19-SG20 sheet sources: {e}")
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+        schema.toy_spec(d)
+        victim = os.path.join(out, "victim")
+        open(victim, "w").write("untouched")
+        os.symlink(victim, os.path.join(d, SHEET))
+        try:
+            write_sheet(d)
+        except (ValueError, OSError, NameError):
+            pass
+        ok(open(victim).read() == "untouched", "SG21 the sheet is not written through a link")
+    with tempfile.TemporaryDirectory() as d:
+        schema.toy_spec(d)
+        yaml.safe_dump(DB.example_brief(), open(os.path.join(d, DB.BRIEF), "w"))
+        yaml.safe_dump({"hard_blockers": [{"id": "HB-001", "text": "t"}]}, open(os.path.join(d, DB.CRITERIA), "w"))
+        opens, real_open, real_osopen = [], builtins.open, os.open
+        builtins.open = lambda f, *a, **k: (opens.append(f) if str(f).endswith(DB.CRITERIA) else None) or \
+            real_open(f, *a, **k)
+        os.open = lambda f, *a, **k: (opens.append(f) if str(f).endswith(DB.CRITERIA) else None) or \
+            real_osopen(f, *a, **k)
+        try:
+            DB.sign(d, "owner", note="n")
+        except (ValueError, OSError):
+            pass
+        finally:
+            builtins.open, os.open = real_open, real_osopen
+        ok(len(opens) == 1, f"SG22 the brief sign-off reads success_criteria.yaml once ({len(opens)} opens)")
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+        schema.toy_spec(d)
+        open(os.path.join(out, "x.csv"), "w").write("secret\n")
+        os.symlink(out, os.path.join(d, "data"))
+        hashed, real_sha, real_rp = [], DB._sha, os.path.realpath
+        DB._sha = lambda p: hashed.append(p) or real_sha(p)
+        os.path.realpath = lambda p, *a, **k: os.path.abspath(p)       # the check sees no link (a race)
+        try:
+            bad = _outputs_changed(d, {"u": {"outputs": {"data/x.csv": "ab"}}})
+        except NameError as e:
+            bad = e
+        finally:
+            DB._sha, os.path.realpath = real_sha, real_rp
+        ok(not isinstance(bad, NameError) and "data/x.csv" in bad and not any("x.csv" in str(h) for h in hashed),
+           f"SG23 derivation outputs are hashed through no-follow fds: a linked data/ is a change, never read ({bad})")
     # DI6, DI7, DI10 (docs/design/v2-derived-inputs.md): the sign-off freezes the derivation record, and the sheet
     # shows the owner the accepted defaults and the columns the run chose not to use.
     try:

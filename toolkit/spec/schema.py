@@ -1402,6 +1402,32 @@ def _self_test_engine_refs(ok) -> None:
             ok(False, "SP-RW3 an unregistered engine among the signed candidates is refused")
         except SpecError as e:
             ok("os:system" in str(e), f"SP-RW3 an unregistered engine among the signed candidates is refused ({e})")
+    # SP-RW5/6 (round 3, P1-1): the binding lookup and the legacy spike loader are guarded too
+    seen = []
+    importlib.import_module = spy
+    try:
+        refused = []
+        for fn in (lambda: binding_for_ref("os:system"), lambda: binding_for_ref("subprocess:Popen")):
+            try:
+                fn()
+                refused.append(False)
+            except (SpecError, ValueError):
+                refused.append(True)
+            except Exception:  # noqa: BLE001
+                refused.append(False)
+        try:
+            from spike.analysis import spec as _spike
+            _spike.load_engine("os:system")
+            refused.append(False)
+        except (SpecError, ValueError):
+            refused.append(True)
+        except Exception:  # noqa: BLE001
+            refused.append(False)
+    finally:
+        importlib.import_module = real
+    bad = [m for m in seen if m.split(".")[0] in ("subprocess", "os")]
+    ok(all(refused) and not bad, f"SP-RW5 binding_for_ref and the spike loader refuse os:system and subprocess:Popen "
+                                 f"before an import ({refused}; imported {bad})")
     try:
         k = engine_class("toolkit.engines.contract:ToyEngine")
         ok(k.__name__ == "ToyEngine" and load_engine("toolkit.engines.contract:ToyEngine") is not None,

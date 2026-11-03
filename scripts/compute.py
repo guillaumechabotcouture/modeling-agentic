@@ -3057,6 +3057,32 @@ def _self_test() -> int:
         _self_test_infra(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"IR: {type(e).__name__}: {e}")
+    # CF-RW1/2 (run console review round 3, P1-3): a confined fingerprint reads through no-follow fds and equals the
+    # default one on a tree with no links; the default is unchanged
+    with tempfile.TemporaryDirectory() as rd, tempfile.TemporaryDirectory() as out:
+        os.makedirs(os.path.join(rd, "models"))
+        os.makedirs(os.path.join(rd, "data"))
+        open(os.path.join(rd, "models", "m.py"), "w").write("def f(x):\n    return x\n")
+        open(os.path.join(rd, "data", "d.csv"), "w").write("a\n1\n")
+        try:
+            same = code_fingerprint(rd, "models/m.py::f") == code_fingerprint(rd, "models/m.py::f", confined=True)
+        except TypeError as e:
+            same = e
+        ok(same is True, f"CF-RW1 the confined fingerprint equals the default on a tree with no links ({same})")
+        os.makedirs(os.path.join(out, "models"))
+        open(os.path.join(out, "models", "m.py"), "w").write("SECRET = 1\n")
+        import shutil
+        shutil.rmtree(os.path.join(rd, "models"))
+        os.symlink(os.path.join(out, "models"), os.path.join(rd, "models"))
+        try:
+            code_fingerprint(rd, "models/m.py::f", confined=True)
+            r = "not refused"
+        except ValueError:
+            r = "refused"
+        except TypeError as e:
+            r = e
+        ok(r == "refused" and isinstance(code_fingerprint(rd, "models/m.py::f"), str),
+           f"CF-RW2 a linked models/ is refused by the confined fingerprint; the default still follows it ({r})")
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
         return 1

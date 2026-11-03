@@ -2940,6 +2940,8 @@ def _self_test() -> int:
         _self_test_review(ok, tr)
     with tempfile.TemporaryDirectory() as tr2:
         _self_test_review2(ok, tr2)
+    with tempfile.TemporaryDirectory() as tr3:
+        _self_test_review3(ok, tr3)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -2989,6 +2991,97 @@ _SAFE_ATTR = re.compile(r"^\s*(?:esc|ref|q)\(")
 _LIT_TERNARY = re.compile(r"""^[^?`$]*\?\s*("[^"]*"|'[^']*')\s*:\s*("[^"]*"|'[^']*')\s*$""")
 
 
+def _self_test_review3(ok, td: str) -> None:
+    """RX3-RX8: Codex review round 3 of PR #129 (the console's part; the harness's part is in the harness tests)."""
+    from types import SimpleNamespace as NS
+    import builtins
+
+    def case(name, fn):
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001 -- a missing function or a crash is a failing case
+            ok(False, f"{name}: {type(e).__name__}: {str(e)[:300]}")
+
+    # RX3 a linked models/ (the entry itself, not a descendant) is never fingerprinted
+    def rx3():
+        d = _toy_run(os.path.join(td, "rx3", "r"))
+        out = os.path.join(td, "rx3_out")
+        os.makedirs(out)
+        open(os.path.join(out, "rx3_secret_mod.py"), "w").write("SECRET = 1\n")
+        open(os.path.join(d, "f.py"), "w").write("def f(x):\n    return x\n")
+        os.makedirs(os.path.join(d, "analysis", "b"))
+        json.dump({"fn": "f.py::f", "code_fp": "x", "n": 1}, open(os.path.join(d, "analysis", "b", "o.jsonl.summary.json"), "w"))
+        shutil.rmtree(os.path.join(d, "models"))
+        os.symlink(out, os.path.join(d, "models"))
+        opened, real = [], builtins.open
+        builtins.open = lambda f, *a, **k: (opened.append(str(f)) if str(f).endswith("rx3_secret_mod.py") else None) or \
+            real(f, *a, **k)
+        try:
+            br = batch_reuse(d)
+        finally:
+            builtins.open = real
+        ok(not any(o.endswith("rx3_secret_mod.py") for o in opened) and not any(b.get("reused") for b in br),
+           f"RX3 a linked models/ is not read by the batch-reuse fingerprint ({[o for o in opened if "rx3_secret" in o]})")
+    case("RX3", rx3)
+
+    # RX4 a sheet generated from another spec does not enable approval
+    def rx4():
+        from toolkit.spec import schema, signoff as SO
+        d = os.path.join(td, "rx4", "r")
+        _toy_run(d, "SIGN", "awaiting_signoff", None, path=("SPEC", "SIGN"))
+        os.remove(os.path.join(d, "scope_signoff_request.json"))
+        p = schema.toy_spec(d)
+        SO.write_sheet(d)
+        with open(p, "a") as f:
+            f.write("\n# changed after the sheet was written\n")
+        con = Console([os.path.join(td, "rx4")], log=lambda *a: None)
+        card = next((c for c in con.handle("GET", "/api/run", {"run": [d]}, {})[2]["cards"]
+                     if c.get("sub") == "spec"), {})
+        body = {k: card.get(k) for k in ("spec_sha256", "derivations_sha256", "sheet_sha256", "ticket")}
+        r = con.answer(d, "spec", {**body, "note": "n", "confirm": True})
+        ok(card.get("sheet_stale") and not r.get("ok") and "sheet" in (r.get("refused") or ""),
+           f"RX4 a stale sheet is shown as stale and does not enable approval ({card.get('sheet_stale')}, "
+           f"{r.get('refused')})")
+    case("RX4", rx4)
+
+    # RX6 an evidence seal is bound to its run; the page clears the composer anchor when the run changes
+    def rx6():
+        a, b = _toy_run(os.path.join(td, "rx6", "a")), _toy_run(os.path.join(td, "rx6", "b"))
+        card = next(c for c in read_run(a)["cards"] if c["kind"] == "blocker" and c["blocker_id"] == "T-001")
+        snap = card.get("snapshot") or card.get("evidence") or {}
+        row = append_feedback(b, {"kind": "correction", "layer": "critique", "text": "x", "anchor": card["anchor"],
+                                  "evidence": snap})
+        ok((row.get("evidence") or {}).get("captured") == "submit" and snap.get("run"),
+           f"RX6a a snapshot sealed for another run is not stored as this run's ({(row.get('evidence') or {}).get('captured')})")
+        src = _page_sources()
+        sel = src[src.index("async function selectRun"):][:400]
+        ok("setAnchor(null" in sel, "RX6b selecting another run clears the composer's anchor and snapshot")
+    case("RX6", rx6)
+
+    # RX7 gate cards and the figure side panel carry the displayed snapshot
+    def rx7():
+        d = _toy_run(os.path.join(td, "rx7", "a"))
+        g = next(c for c in read_run(d)["cards"] if c["kind"] == "gate")
+        ok(isinstance(g.get("snapshot"), dict) and g["snapshot"].get("mac"), "RX7a a gate card carries its snapshot")
+        src = _page_sources()
+        of = src[src.index("async function openFile"):][:1500]
+        ok("snapshot" in of, "RX7b the figure side panel's Comment carries the figure card's snapshot")
+    case("RX7", rx7)
+
+    # RX8 the critic's own `evidence` field is kept; the snapshot is stored apart
+    def rx8():
+        d = _toy_run(os.path.join(td, "rx8", "a"))
+        yaml.safe_dump({"reviewer": "critique-domain", "round": 1, "blockers": [
+            {"id": "T-001", "severity": "HIGH", "claim": "c", "evidence": "results.md line 4 says so", "resolved": False}]},
+            open(os.path.join(d, "critique_domain.yaml"), "w"))
+        b = next(c for c in read_run(d)["cards"] if c["kind"] == "blocker")
+        src = _page_sources()
+        ok(b.get("evidence") == "results.md line 4 says so" and isinstance(b.get("snapshot"), dict)
+           and "c.snapshot" in src, f"RX8 the blocker's evidence text is kept and the snapshot is separate "
+                                    f"({str(b.get('evidence'))[:60]})")
+    case("RX8", rx8)
+
+
 def _self_test_review2(ok, td: str) -> None:
     """RW1-RW11: Codex review round 2 of PR #129. Each case was written failing first."""
     from types import SimpleNamespace as NS
@@ -3004,7 +3097,11 @@ def _self_test_review2(ok, td: str) -> None:
         _toy_run(d, "SIGN", "awaiting_signoff", None, path=("SPEC", "SIGN"))
         os.remove(os.path.join(d, "scope_signoff_request.json"))
         schema.toy_spec(d)
-        open(os.path.join(d, "decision_spec.signoff_sheet.md"), "w").write("# Sheet\n\nThe toy spec, shown.\n")
+        from toolkit.spec import signoff as _so
+        if hasattr(_so, "write_sheet"):           # round 3: the harness's sheet writer records its source hashes
+            _so.write_sheet(d)
+        else:
+            open(os.path.join(d, "decision_spec.signoff_sheet.md"), "w").write("# Sheet\n\nThe toy spec, shown.\n")
         return d
 
     def need(run, sub):
@@ -3088,7 +3185,7 @@ def _self_test_review2(ok, td: str) -> None:
         d = spec_run(os.path.join(td, "rw5", "r"))
         con = Console([os.path.join(td, "rw5")], log=lambda *a: None)
         card = need(con.handle("GET", "/api/run", {"run": [d]}, {})[2], "spec")
-        ok(card.get("body") == "# Sheet\n\nThe toy spec, shown.\n" and card.get("sheet_sha256")
+        ok(card.get("body") == open(os.path.join(d, "decision_spec.signoff_sheet.md")).read() and card.get("sheet_sha256")
            and "derivations_sha256" in card and card.get("spec_sha256"),
            f"RW5a the spec card holds the sheet, its sha, the spec sha and the derivation record sha "
            f"({sorted(k for k in card if k.endswith('sha256'))})")
@@ -3148,7 +3245,7 @@ def _self_test_review2(ok, td: str) -> None:
         d = _toy_run(os.path.join(td, "rw9", "a"))
         cards = read_run(d)["cards"]
         b = next(c for c in cards if c["kind"] == "blocker" and c["blocker_id"] == "T-001")
-        ev = b.get("evidence") or {}
+        ev = b.get("snapshot") or {}
         before = _sha(os.path.join(d, "critique_domain.yaml"))
         yaml.safe_dump({"reviewer": "critique-domain", "round": 2, "blockers": [
             {"id": "T-001", "severity": "LOW", "claim": "Rewritten later.", "resolved": True}]},

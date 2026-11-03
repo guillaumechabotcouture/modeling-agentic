@@ -1980,6 +1980,24 @@ def _self_test() -> int:
     except Exception as ex:  # noqa: BLE001
         ok(False, f"O20 coverage pack expectations ({type(ex).__name__}: {ex})")
     _self_test_initialisation(ok, pack, eng)
+    # BP-RW1 (run console review round 3, P1-1): oracle and calibrator names come from a pack; they are guarded
+    seen, real = [], importlib.import_module
+    importlib.import_module = lambda name, *a, **k: seen.append(name) or real(name, *a, **k)
+    try:
+        res = []
+        for fn in (lambda: _oracles({"oracles": "os"}),
+                   lambda: calibrator_code_digest({"oracles": "os"}, {"calibrator": {"fn": "subprocess:Popen"}}),
+                   lambda: resolve_calibrator("subprocess:Popen"), lambda: resolve_calibrator("os:system")):
+            try:
+                fn()
+                res.append(False)
+            except (ValueError, NameError) as ex:
+                res.append(isinstance(ex, ValueError))
+    finally:
+        importlib.import_module = real
+    bad = [m for m in seen if m.split(".")[0] in ("subprocess", "os")]
+    ok(all(res) and not bad, f"BP-RW1 a pack's oracle and calibrator are refused before an import unless allowed "
+                             f"({res}; imported {bad})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
