@@ -171,6 +171,26 @@ failed first (α2, α3):
   `confirmation: {validate_once: pending}` until that run reports. Earlier records under
   `previous` keep the wording they were written with.
 
+**#127's round 3: exact half-open boundaries (S15).** The hook contract now compares
+boundaries exactly. `schedule()` reports each event at its executed step's year and charges it
+by the sim's own test (`model.delivery_contains`), so both agree exactly. Tests on the real time
+vector (the card's 50-year burn-in, GC7 dates) show:
+- A GC7 decision campaign at the delivery start is reported at exactly 2024.0 and charged.
+- A past campaign at horizon.start is reported at exactly 2023.0.
+- The first routine SMC round is reported at exactly d1 = 2027.0 and is uncharged.
+- The routine net at campaign + 3 is on its executed step.
+- Nothing is listed at or after the window end.
+
+Starsim rounds its time vector to 9 decimals, so whole years from the sim start are exact.
+Representation-only differences (at most 1e-9 y) are reported at the boundary's own float, but
+only when every membership test agrees, so no event moves across a boundary (S15e).
+
+Sub-day offsets are real, not representation. With an off-grid start (2023.25), the steps
+nearest d0 and d1 lie just after them: the decision is charged and the routine round counts as
+routine. With a delivery start between steps whose nearest step lies before it (delivery
+2024.25, campaign 2024.25, sim start on a whole year), the sim delivers the campaign uncharged.
+`schedule()` then fails closed (S15d). This is unchanged v0.6 behaviour, listed as an open item.
+
 ## v0.7 scope: routine SMC in every arm after the delivery period (written before the v0.7 code)
 
 **The problem.** v0.6 split the delivery period (`objective.delivery`) from the outcome window
