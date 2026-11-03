@@ -276,6 +276,13 @@ def _self_test() -> int:
             ok("card values are shown once" in sec and "**HIGH**" not in sec,
                f"SG15 engine {eng!r} with no candidate known: the sheet says the card values are not yet known: "
                f"{sec[:300]!r}")
+        # review round 3 (R3-4): a pre-sign candidate's configuration is kept, so the right card is loaded
+        raw["engine"] = {"auto": True}
+        yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+        sec = sec_of(sheet(d, candidates=[{"ref": "toolkit.engines.empirical.engine:PackageRateEngine",
+                                           "config": {"components": ["a", "b"]}, "eligible": False, "why_not": []}]))
+        ok("PackageRateEngine`: not a parameter of this engine" in sec and "card not loaded" not in sec,
+           f"SG16 a candidate's configuration is kept when its card is loaded: {sec[:400]!r}")
     # DI6, DI7, DI10 (docs/design/v2-derived-inputs.md): the sign-off freezes the derivation record, and the sheet
     # shows the owner the accepted defaults and the columns the run chose not to use.
     try:

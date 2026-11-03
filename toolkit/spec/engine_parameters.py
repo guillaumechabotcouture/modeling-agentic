@@ -709,8 +709,7 @@ def _self_test() -> int:
     # ------------------------------------------------------------ review round 2 (R2-1): interaction arms at spec values
     def interaction_cases():
         from toolkit.analysis import run as RUN, decision_tests as DTm
-        from toolkit.engines import benchmark as BM
-        from toolkit.engines.contract import ToyEngine
+        from toolkit.engines.contract import engine_identity
         with tempfile.TemporaryDirectory() as d:
             bench, _v_ok, _v_bad = RUN._toy_bench(d)
             p = schema.toy_spec(d, n=24, bench=bench)
@@ -723,32 +722,105 @@ def _self_test() -> int:
             ok(t.get("status") == "not_run" and "benchmark arms not computed at the spec values" in t.get("reason", ""),
                f"EP26 an interaction test whose benchmark arms were computed at the card values is not run when the "
                f"spec sets engine parameter values: {t.get('status')}, {t.get('reason', '')[:160]}")
-            # the arms computed at the spec values, with provenance, beside the spec
-            eng = ToyEngine(results_path=bench)
-            doc = EPm.spec_benchmarks(RUN._toy_pack(), eng, schema.load(p))
-            yaml.safe_dump(doc, open(os.path.join(d, EPm.SPEC_BENCH), "w"), sort_keys=False)
-            b = {x["id"]: x for x in doc["benchmarks"]}["T2"]
-            arm = {k: math.exp(sum(math.log(x[k]) for x in b["arm_or"]) / len(b["arm_or"])) for k in ("a11", "a10", "a01")}
-            cur = arm["a11"] / (arm["a10"] * arm["a01"])
             A = R["_A"]
             z0 = {i: v["z"] for i, v in R["calibration"]["units"].items()}
             out0, ben0, cost0 = A.evaluate(A.theta0, z0)
             plan0 = R["point"]["plan"]
-            dt = {"id": "DTi", "type": "interaction_rescale", "components": ["b"], "with_any": ["a"], "benchmark": "T2",
-                  "values": [cur], "text": "Does the plan change at the engine's own interaction?"}
-            rec = DTm.run_one(A, dt, z0, ben0, cost0, plan0, R["uncertainty"], out0)
+
+            def dt_at(v):
+                return {"id": "DTi", "type": "interaction_rescale", "components": ["b"], "with_any": ["a"],
+                        "benchmark": "T2", "values": [v], "text": "Does the plan change at the engine's own interaction?"}
+            # review round 3 (R3-1): a file with copied producer and identity fields and invented arm ratios is refused
+            card = yaml.safe_load(open(bench))
+            forged = dict(card, spec_parameters={"synergy": 0.05})
+            for row in forged["benchmarks"]:
+                row["arm_or"] = [{"a11": 0.2, "a10": 0.5, "a01": 0.6}]
+            fp = os.path.join(d, EPm.SPEC_BENCH)
+            os.makedirs(os.path.dirname(fp), exist_ok=True)
+            yaml.safe_dump(forged, open(fp, "w"), sort_keys=False)
+            rec = DTm.run_one(A, dt_at(1.0), z0, ben0, cost0, plan0, R["uncertainty"], out0)
+            ok(rec.get("status") == "not_run" and "benchmark arms not computed at the spec values" in rec.get("reason", ""),
+               f"EP30 a benchmark file with copied provenance fields and invented arm ratios is refused (no harness "
+               f"record): {rec.get('status')}, {rec.get('reason', '')[:200]}")
+            os.remove(fp)
+            # R3-2: the harness step refuses a pack whose engine is not the run's engine
+            bad_pack = dict(RUN._toy_pack(), engine="toolkit.spec.engine_parameters:ToySpecEngine")
+            try:     # the stamp must name the engine the arms ran with, not the engine passed in
+                from toolkit.engines.contract import ToyEngine
+                EPm.spec_benchmarks(bad_pack, ToyEngine(results_path=bench), schema.load(p))
+                ok(False, "EP31a arms run by the pack's engine are not stamped with another engine's identity")
+            except Exception as e:  # noqa: BLE001
+                ok("not the run's engine" in str(e),
+                   f"EP31a arms run by the pack's engine are not stamped with another engine's identity: {e}")
+            try:
+                EPm.write_spec_benchmarks(d, bad_pack)
+                ok(False, "EP31 a pack that runs another engine than the run's is refused")
+            except Exception as e:  # noqa: BLE001
+                ok("not the run's engine" in str(e), f"EP31 a pack that runs another engine than the run's is refused: {e}")
+            # the harness step: the arms at the spec values, a harness record of the file and of each arm's engine
+            path = EPm.write_spec_benchmarks(d, RUN._toy_pack())
+            recd = json.load(open(os.path.join(d, EPm.SPEC_BENCH_RECORD)))
+            arms = (recd.get("benchmarks") or {}).get("T2", {}).get("arms") or {}
+            ok(path == os.path.join(d, EPm.SPEC_BENCH) and EPm.SPEC_BENCH.startswith("analysis/")
+               and recd.get("sha256") and set(arms) == {"a11", "a10", "a01", "a00"}
+               and all(x.get("engine_identity") == engine_identity(A.eng) for x in arms.values()),
+               f"EP32 the harness step writes the file under analysis/ with a record of its digest and of the engine and "
+               f"configuration each arm ran with: {sorted(arms)}")
+            doc = yaml.safe_load(open(path))
+            b = {x["id"]: x for x in doc["benchmarks"]}["T2"]
+            arm = {k: math.exp(sum(math.log(x[k]) for x in b["arm_or"]) / len(b["arm_or"])) for k in ("a11", "a10", "a01")}
+            cur = arm["a11"] / (arm["a10"] * arm["a01"])
+            rec = DTm.run_one(A, dt_at(cur), z0, ben0, cost0, plan0, R["uncertainty"], out0)
             base_obj = sum(ben0[i][plan0[i]] for i in A.ids)
             got = (rec.get("results") or [{}])[0].get("point_plan_objective_under_test")
             ok(rec.get("status") == "run" and got is not None and abs(got - base_obj) <= 1e-9 * max(1.0, abs(base_obj))
                and EPm.SPEC_BENCH in str(rec.get("arm_source")),
                f"EP27 with the arms computed at the spec values, testing the engine's own interaction changes no "
                f"benefit: {base_obj} -> {got} ({rec.get('status')}, {rec.get('arm_source')})")
-            doc2 = dict(doc, spec_parameters={"synergy": 0.04})
-            yaml.safe_dump(doc2, open(os.path.join(d, EPm.SPEC_BENCH), "w"), sort_keys=False)
-            rec = DTm.run_one(A, dt, z0, ben0, cost0, plan0, R["uncertainty"], out0)
+            ok(EPm.SPEC_BENCH in str(rec.get("arm_inputs")) and EPm.SPEC_BENCH_RECORD in str(rec.get("arm_inputs")),
+               f"EP33 the decision test names the file and its record as inputs: {rec.get('arm_inputs')}")
+            R2 = RUN.run(d, log=q, compute_kw={"max_workers": 2})
+            dta = yaml.safe_load(open(os.path.join(d, "analysis", "decision_tests.yaml")))
+            ok({x["test_id"]: x for x in R2["decision_tests"]}["DT1"]["status"] == "run"
+               and EPm.SPEC_BENCH in (dta.get("inputs") or {}) and EPm.SPEC_BENCH_RECORD in (dta.get("inputs") or {}),
+               f"EP34 the analysis records the file's digest as an input of the decision tests: "
+               f"{sorted(dta.get('inputs') or {})}")
+            from toolkit.analysis import contract
+            doc_e = yaml.safe_load(open(path))
+            doc_e["benchmarks"][0]["arm_or"] = [{"a11": 0.2, "a10": 0.5, "a01": 0.6}]
+            yaml.safe_dump(doc_e, open(path, "w"), sort_keys=False)
+            rec = DTm.run_one(A, dt_at(cur), z0, ben0, cost0, plan0, R["uncertainty"], out0)
+            kinds = {x["kind"] for x in contract.gate_findings(d)}
+            ok(rec.get("status") == "not_run" and "digest" in rec.get("reason", "")
+               and "analysis_contract_tampered" in kinds or "analysis_contract_stale" in kinds,
+               f"EP35 an edit of the file after the harness wrote it is refused, and the finished run no longer checks: "
+               f"{rec.get('reason', '')[:160]}; {sorted(kinds)}")
+            EPm.write_spec_benchmarks(d, RUN._toy_pack())
+            recd = json.load(open(os.path.join(d, EPm.SPEC_BENCH_RECORD)))
+            recd["spec_parameters"] = {"synergy": 0.04}
+            json.dump(recd, open(os.path.join(d, EPm.SPEC_BENCH_RECORD), "w"))
+            rec = DTm.run_one(A, dt_at(cur), z0, ben0, cost0, plan0, R["uncertainty"], out0)
             ok(rec.get("status") == "not_run" and "benchmark arms not computed at the spec values" in rec.get("reason", ""),
-               f"EP28 arms computed at other values are refused: {rec.get('reason', '')[:160]}")
-    guard("EP26-EP28 interaction arms", interaction_cases)
+               f"EP28 arms recorded at other values are refused: {rec.get('reason', '')[:160]}")
+    guard("EP26-EP35 interaction arms", interaction_cases)
+
+    # ------------------------------------------------------------ review round 3 (R3-3): a trial's own conditions win
+    def precedence_cases():
+        from toolkit.engines import benchmark as BM
+        pk = yaml.safe_load(open(os.path.join(ROOT, "toolkit", "engines", "malaria", "benchmarks", "pack.yaml")))
+        eng = BM.load_engine(pk["engine"], (pk.get("configs") or {}).get(pk.get("default_config")))
+        rn = BM.Runner(pk, eng, 1, [1], base_params={"net_retention_half": 273.75})
+        mul = rn._arm_jobs("mul_pyr", {"irs_kill": 0.4})[0][2]
+        coch = rn._arm_jobs("coch_pyr", {"irs_kill": 0.4})[0][2]
+        ok(mul.get("net_retention_half") == 949.0 and coch.get("net_retention_half") == 273.75
+           and mul.get("irs_kill") == 0.4 and mul.get("n_agents") == 5000,
+           f"EP36 the real B15 setting keeps its own observed net retention (Muleba 949 days) under a spec value; a "
+           f"setting without one takes the spec value; fitted values still apply: {mul.get('net_retention_half')}, "
+           f"{coch.get('net_retention_half')}")
+        rn0 = BM.Runner(pk, eng, 1, [1])
+        ok(rn0._arm_jobs("mul_pyr", {"irs_kill": 0.4})[0][2] == dict(pk["settings"]["muleba"]["params"], irs_kill=0.4),
+           "EP37 without spec values the arm parameters are unchanged (the setting's, then the fitted values)")
+    guard("EP36-EP37 setting precedence", precedence_cases)
 
     # ------------------------------------------------------------ emulator path: application, UQ, decision test, reports
     def emulator_cases():
