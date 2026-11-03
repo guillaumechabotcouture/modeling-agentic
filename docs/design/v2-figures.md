@@ -224,6 +224,13 @@ The same file can declare `boundaries: {path, feature_id, crosswalk: {path, unit
 - **Comparison.** It refuses an output dir inside a source run, and records its sources, presentation files and tier.
 - **Hooks contract (`figures-hooks/1`, sent to the engine agent).** The grid keeps a partial final step when the window ends inside a month, and point events follow `[d0, d1)` exactly.
 
+**Codex round 3 (5 findings; each reproduced by a failing test first, r3 α/β).**
+- **Engine identity on both paths.** The analysis records its full engine identity in `analysis/point.yaml` (`engine_identity`) on both evaluation paths. The trajectory step and the figure verify against it (falling back to batch rows for older runs) and refuse when no identity can be verified.
+- **Optional dependencies.** The settings file and the engine choice are recorded with a null hash when absent, so one that appears or disappears later makes the trajectories stale.
+- **In-run paths.** Boundary and crosswalk files inside the run are recorded relative to it; external files keep absolute paths.
+- **Comparison inputs.** The comparison hashes each run's spec, point, uncertainty and engine artifacts, units table and presentation files, and its presentation records resolve against their own run.
+- **Exact schedule boundaries.** Schedule boundaries are compared exactly in half-open form, with no tolerance at the endpoints.
+
 ## 9. Open questions for the owner
 
 1. The malaria engine v0.8 (`schedule`, `run_series`) and its proof: separate PR, run off the laptop.

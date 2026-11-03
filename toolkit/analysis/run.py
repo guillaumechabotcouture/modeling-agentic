@@ -212,6 +212,10 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     A.guard("point plan", [plan], events0)   # Codex P1-6; every later evaluation is guarded too (r2 P1-3)
     on_plan = []
     point = A.summary(plan, out0, cost0)
+    from toolkit.engines.contract import engine_identity
+    # Codex r3: the analysis's full engine identity (code, params, config), on both evaluation paths, so later steps
+    # (the trajectory step) can be checked against it without batch rows
+    point.update(engine_identity=engine_identity(eng))
     point.update(plan=plan, n_units=len(A.ids), solver={k: sol[k] for k in ("status", "method", "objective", "cost")},
                  interactions=interactions(A, out0), rule=decision_rule(A, out0, plan),
                  model_corrections={"n": len(events0), "on_plan": on_plan, "kinds": sorted({e["kind"] for e in events0}),
@@ -361,6 +365,9 @@ def _self_test() -> int:
         pt = R["point"]
         ok(pt["solver"]["status"] == "optimal" and pt["cost_allocated"] <= 9000 * (1 + 1e-9),
            "R4 the plan is a proven optimum within the budget (toolkit/alloc ILP)")
+        from toolkit.engines.contract import engine_identity as _eid
+        ok(pt.get("engine_identity") == _eid(spec.engine()),
+           "R4b the point artifact records the analysis's full engine identity (emulator path; Codex r3 P1)")
         fp = R["uncertainty"]["fixed_plan"]["dalys"]
         ok(fp["ci_low"] <= fp["median"] <= fp["ci_high"] and "not covered" in R["uncertainty"]["label"],
            f"R5 the interval is computed and labelled with what it covers ({R['uncertainty']['label']})")
@@ -521,6 +528,10 @@ def _self_test() -> int:
         th = R["calibration"]["theta"]
         ok(abs(th["lrr:a"] - math.log(0.6)) < 0.05 and abs(th["lrr:a+b"] - math.log(0.5)) < 0.05,
            f"D1 likelihood calibration recovers the planted package effects ({th})")
+        from toolkit.engines.contract import engine_identity as _eid
+        ok((R["point"].get("engine_identity") or {}).get("code_sha256")
+           == _eid(schema.load(os.path.join(d, "decision_spec.yaml")).engine())["code_sha256"],
+           "D1b the point artifact records the analysis's full engine identity (direct path; Codex r3 P1)")
         ident = R["calibration"]["identifiability"]["parameters"]
         ok(all(v["status"] in ("well_identified", "weakly_identified", "unidentified") for v in ident.values())
            and ident["lrr:a"]["status"] == "well_identified", f"D2 identifiability from scripts/identifiability.py: "

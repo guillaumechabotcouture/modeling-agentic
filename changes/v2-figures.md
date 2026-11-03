@@ -20,3 +20,11 @@ commit: "figures α–β"
 - TJ17–TJ18: trajectory freshness by full engine identity and inputs; rate labels.
 - F28–F34: every sensitivity range kept, explicit deliverable kind, gated compare, presentation files in checked provenance, half-open weighted window means, comparison output and provenance.
 - H13–H14d: partial final monthly step; half-open point events.
+
+**Review round 3.** Each Codex round-3 finding was reproduced by a failing test first:
+- R4b, D1b: the analysis's full engine identity is recorded on both evaluation paths.
+- TJ19–TJ19c: trajectories are verified against that identity, or refused.
+- TJ20–TJ20b: absent optional dependencies are recorded with a null hash.
+- F35–F35b: in-run boundary and crosswalk files are recorded relative to the run.
+- F36–F36c: comparison sources and per-run presentation records.
+- H15–H15d: exact half-open schedule boundaries.

@@ -146,7 +146,7 @@ class RunData:
         if self.pres.get("boundaries") is None:
             return None
         if self._geo is None:
-            self._geo = load_boundaries(self.pres["boundaries"], self.ids, self.region)
+            self._geo = load_boundaries(self.pres["boundaries"], self.ids, self.region, self.dir)
         return self._geo
 
     def use(self, rel: str):
@@ -742,21 +742,16 @@ def _trajectories_current(R):
                       f"{str((tr.get('analysis_engine') or {}).get('card_sha256', ''))[:12]}), this run's is "
                       f"{run_eng.get('name')} (card {str(run_eng.get('card_sha256', ''))[:12]})")
     te = tr.get("engine") or {}
-    rows_p = os.path.join(R.dir, "analysis", "batch", "results.jsonl")
-    be = None
-    if os.path.exists(rows_p):
-        with open(rows_p) as fh:
-            first = json.loads(fh.readline() or "{}")
-        be = ((first.get("result") or {}).get("provenance") or {}).get("engine")
-    if be is not None:
-        diff = [k for k in ("name", "version", "code_sha256", "params_sha256", "config_sha256") if te.get(k) != be.get(k)]
-        if diff:
-            raise Missing(f"the trajectories are stale: their engine identity differs from the analysis batch's in "
-                          f"{', '.join(d.replace('_sha256', '') for d in diff)} (code {str(te.get('code_sha256', ''))[:12]} "
-                          f"vs {str(be.get('code_sha256', ''))[:12]})")
-    elif not run_eng:
-        raise Missing("the trajectories cannot be checked against this run's engine (no batch rows and no analysis "
-                      "engine record)")
+    from toolkit.analysis.trajectories import analysis_identity
+    be, where = analysis_identity(R.dir)
+    if be is None:
+        raise Missing("the trajectories' engine identity cannot be verified: the run records no analysis engine "
+                      "identity (analysis/point.yaml engine_identity) and has no batch rows")
+    diff = [k for k in ("name", "version", "code_sha256", "params_sha256", "config_sha256") if te.get(k) != be.get(k)]
+    if diff:
+        raise Missing(f"the trajectories are stale: their engine identity differs from the analysis's ({where}) in "
+                      f"{', '.join(d.replace('_sha256', '') for d in diff)} (code {str(te.get('code_sha256', ''))[:12]} "
+                      f"vs {str(be.get('code_sha256', ''))[:12]})")
     return tr
 
 
@@ -1067,7 +1062,17 @@ GEOGRAPHIC_CRS = {"EPSG:4326", "urn:ogc:def:crs:EPSG::4326", "urn:ogc:def:crs:OG
                   "urn:ogc:def:crs:OGC::CRS84"}
 
 
-def load_boundaries(cfg: dict, unit_ids: list[str], region_of) -> dict:
+def _record_path(p: str, run_dir: str | None) -> str:
+    """A dependency's path for provenance: relative to the run when it lies inside it (so a moved run checks
+    clean), absolute otherwise."""
+    if run_dir:
+        rp, rd = os.path.realpath(p), os.path.realpath(run_dir)
+        if os.path.commonpath([rp, rd]) == rd:
+            return os.path.relpath(rp, rd)
+    return os.path.abspath(p)
+
+
+def load_boundaries(cfg: dict, unit_ids: list[str], region_of, run_dir: str | None = None) -> dict:
     """Polygons per unit from a GeoJSON FeatureCollection in geographic coordinates (EPSG:4326 / CRS84; Polygon and
     MultiPolygon exterior rings; json and numpy only), matched to the units through the crosswalk or directly by the
     feature property. Fail closed: a malformed file, a projected CRS, coordinates outside the geographic range, a
@@ -1122,7 +1127,7 @@ def load_boundaries(cfg: dict, unit_ids: list[str], region_of) -> dict:
             empty.add(fid)
     if dup:
         raise ValueError(f"{shown}: feature id {cfg['feature_id']} is not unique: {sorted(dup)[:20]}")
-    files = [{"path": cfg["path"], "sha256": sha256(cfg["path"]), "kind": "boundaries"}]
+    files = [{"path": _record_path(cfg["path"], run_dir), "sha256": sha256(cfg["path"]), "kind": "boundaries"}]
     targets = {}
     if cfg.get("crosswalk"):
         c = cfg["crosswalk"]
@@ -1138,7 +1143,7 @@ def load_boundaries(cfg: dict, unit_ids: list[str], region_of) -> dict:
                 tl = targets.setdefault(str(r[c["unit_id"]]), [])
                 if str(r[c["feature_id"]]) not in tl:
                     tl.append(str(r[c["feature_id"]]))
-        files.append({"path": c["path"], "sha256": sha256(c["path"]), "kind": "crosswalk"})
+        files.append({"path": _record_path(c["path"], run_dir), "sha256": sha256(c["path"]), "kind": "crosswalk"})
         multi = sorted(u for u, fl in targets.items() if len(fl) > 1)
         if multi and not c.get("union"):
             raise ValueError(f"{c['shown']}: {len(multi)} units map to more than one feature: {multi[:20]}; declare "
@@ -2011,7 +2016,7 @@ def presentation_findings(run_dir: str, sidecar: dict) -> list[str]:
             out.append(f"malformed presentation record {e!r}")
             continue
         pth = os.path.expanduser(str(e["path"]))
-        pth = pth if os.path.isabs(pth) else os.path.join(run_dir, pth)
+        pth = pth if os.path.isabs(pth) else os.path.join(e.get("run") or run_dir, pth)
         got = sha256(pth)
         if got is None:
             out.append(f"{e['path']} ({e.get('kind', 'presentation')}) is missing")
@@ -2226,8 +2231,13 @@ def _compare_draw(Rs, run_dirs, out_dir, names, t) -> dict:
     # provenance: every run's sources (absolute: the runs differ), the presentation files, the tier
     fv = _fv()
     srcs = [os.path.join(R.dir, rel) for R in Rs for rel in ("decision_spec.yaml", os.path.join("analysis", "point.yaml"),
-                                                             os.path.join("analysis", "uncertainty.yaml"))
+                                                             os.path.join("analysis", "uncertainty.yaml"),
+                                                             os.path.join("analysis", "engine.yaml"),
+                                                             os.path.relpath(os.path.join(R.dir, R.spec["decision_units"]
+                                                                                          ["csv"]), R.dir))
             if os.path.exists(os.path.join(R.dir, rel))]
+    srcs += [p if os.path.isabs(p) else os.path.join(R.dir, p) for R in Rs
+             for p in (os.path.expanduser(str(e["path"])) for e in R.presentation_record())]
     fv.validate_figure(png, source_data_paths=srcs)
     sp = png + ".provenance.json"
     sc = json.load(open(sp))
@@ -2924,6 +2934,38 @@ def _self_test() -> int:
         open(os.path.join(db, "xw.csv"), "a").write("\n")
         ok(presentation_findings(db, scb) and any("xw.csv" in f for f in presentation_findings(db, scb)),
            "F31b a changed crosswalk is found when the figure's provenance is checked")
+        # ---- Codex r3 P2: in-run boundary and crosswalk files are recorded relative to the run (a moved run checks
+        # clean); external files stay absolute
+        d35 = bnd_run("bx35", base_rows)
+        r35 = render(d35, os.path.join(base, "bmap35"), only=["burden_map"])
+        sc35 = json.load(open(os.path.join(base, "bmap35", "burden_map.png.provenance.json"))) if r35["figures"] else {}
+        bpaths = {x.get("kind"): x.get("path") for x in sc35.get("presentation") or []}
+        ok(bpaths.get("boundaries") == "b.geojson" and bpaths.get("crosswalk") == "xw.csv",
+           f"F35 in-run boundary and crosswalk files are recorded relative to the run: {bpaths}")
+        moved35 = d35 + "_moved"
+        os.rename(d35, moved35)
+        try:
+            fm = presentation_findings(moved35, sc35)
+        finally:
+            os.rename(moved35, d35)
+        ok(sc35 and fm == [], f"F35b a moved run's in-run presentation files check clean: {fm}")
+        # ---- Codex r3 P2: the comparison hashes every consumed input; its presentation records resolve per run
+        scc = json.load(open(os.path.join(outc, "comparison.png.provenance.json")))
+        srcs = list((scc.get("source_hashes") or {}))
+        ok(all(any(os.path.join(r, *rel) in x for x in srcs) for r in ("run1", "run4")
+               for rel in (("analysis", "engine.yaml"), ("presentation.yaml",))),
+           f"F36 the comparison's sources include each run's engine artifact and presentation file: {srcs}")
+        ok(all(x.get("run") for x in scc.get("presentation") or []) and presentation_findings(outc, scc) == [],
+           "F36b the comparison's presentation records carry their run and check clean")
+        pres1 = os.path.join(d, "presentation.yaml")
+        keep_p1 = open(pres1).read()
+        open(pres1, "a").write("# edited\n")
+        try:
+            f36 = presentation_findings(outc, scc)
+        finally:
+            open(pres1, "w").write(keep_p1)
+        ok(any("presentation.yaml" in x for x in f36),
+           f"F36c a changed presentation file of a compared run is found, resolved against its run: {f36}")
         # P2-12: a window mean over monthly steps uses the half-open window and weights partial steps
         tg = [k / 12 for k in range(24)]
         vg = [float(k) for k in range(24)]

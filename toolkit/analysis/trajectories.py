@@ -44,6 +44,25 @@ def _data(run_dir, kind):
     return yaml.safe_load(open(p))["data"]
 
 
+def analysis_identity(run_dir: str):
+    """(the analysis's full engine identity, where it was read): analysis/point.yaml `engine_identity` (written on
+    both evaluation paths), else the first batch row's provenance (emulator runs written before it), else (None,
+    "")."""
+    pp = os.path.join(run_dir, "analysis", "point.yaml")
+    if os.path.exists(pp):
+        ident = ((yaml.safe_load(open(pp)) or {}).get("data") or {}).get("engine_identity")
+        if ident:
+            return ident, "analysis/point.yaml"
+    rows_p = os.path.join(run_dir, "analysis", "batch", "results.jsonl")
+    if os.path.exists(rows_p):
+        with open(rows_p) as fh:
+            first = json.loads(fh.readline() or "{}")
+        be = ((first.get("result") or {}).get("provenance") or {}).get("engine")
+        if be:
+            return be, "analysis/batch/results.jsonl"
+    return None, ""
+
+
 def sample_units(units: dict, burden: dict, per_region: int) -> dict:
     """{region: [unit ids]}: per region, `per_region` units spread over the comparator-burden order (lowest, median,
     highest for 3), deterministic. `units`: {id: region}."""
@@ -222,10 +241,12 @@ def run(run_dir: str, per_region: int = 3, seeds: int = 3, metrics=None, log=pri
     sp0 = schema.load(os.path.join(run_dir, "decision_spec.yaml"))
     inputs = ["decision_spec.yaml", "analysis/point.yaml", "analysis/calibration.yaml", "analysis/figure_data.yaml",
               os.path.relpath(sp0.resolve(sp0["decision_units"]["csv"]), run_dir)]
-    if getattr(sp0, "settings_path", None):
-        inputs.append(os.path.relpath(sp0.settings_path, run_dir))
-    if os.path.exists(os.path.join(run_dir, schema.ENGINE_CHOICE)):
-        inputs.append(schema.ENGINE_CHOICE)
+    # optional dependencies are recorded whether or not they exist (a null hash when absent), so one that appears
+    # or disappears later makes the trajectories stale
+    for opt in (schema.SETTINGS, schema.ENGINE_CHOICE):
+        rel = os.path.relpath(os.path.join(os.path.dirname(sp0.path or os.path.join(run_dir, "x")), opt), run_dir)
+        if rel not in inputs:
+            inputs.append(rel)
     try:
         tk, step = tasks(run_dir, per_region, seeds, metrics)
     except hooks.HookUnsupported as e:
@@ -233,15 +254,14 @@ def run(run_dir: str, per_region: int = 3, seeds: int = 3, metrics=None, log=pri
         write(run_dir, data, [p for p in inputs if os.path.exists(os.path.join(run_dir, p))])
         log(f"trajectories: {e}")
         return data
-    rows_p = os.path.join(run_dir, "analysis", "batch", "results.jsonl")
-    if os.path.exists(rows_p):
-        with open(rows_p) as fh:
-            first = json.loads(fh.readline() or "{}")
-        be = ((first.get("result") or {}).get("provenance") or {}).get("engine")
-        if be and be != step["engine"]:
-            raise RuntimeError(f"trajectories: this code's engine (code {step['engine'].get('code_sha256', '')[:12]}) is "
-                               f"not the analysis's (code {str(be.get('code_sha256', ''))[:12]}): run the step with the "
-                               "run's own code")
+    be, where = analysis_identity(run_dir)
+    if be is None:
+        raise RuntimeError("trajectories: the analysis's engine identity cannot be verified (no engine_identity in "
+                           "analysis/point.yaml and no batch rows): rerun the analysis with this code")
+    if be != step["engine"]:
+        raise RuntimeError(f"trajectories: this code's engine (code {step['engine'].get('code_sha256', '')[:12]}) is "
+                           f"not the analysis's (code {str(be.get('code_sha256', ''))[:12]}, from {where}): run the "
+                           "step with the run's own code")
     sys.path.insert(0, os.path.join(ROOT, "scripts"))
     import compute
     out = os.path.join(run_dir, ROWS)
@@ -359,11 +379,50 @@ def _self_test() -> int:
         why3 = {x["figure"]: x["reason"] for x in r3["not_produced"]}.get("trajectories", "")
         ok("stale" in why3 and "units.csv" in why3, f"TJ17b a changed units table makes the trajectories stale: {why3}")
         open(os.path.join(d, "units.csv"), "w").write(keep_units)
+        code0 = docj["data"]["engine"]["code_sha256"]
         docj["data"]["engine"]["code_sha256"] = "0" * 64
         yaml.safe_dump(docj, open(os.path.join(d, OUT), "w"), sort_keys=False)
         r4 = FG.render(d, os.path.join(figs, "d"), only=["trajectories"])
         why4 = {x["figure"]: x["reason"] for x in r4["not_produced"]}.get("trajectories", "")
         ok("stale" in why4 and "code" in why4, f"TJ17c another engine code fingerprint makes them stale: {why4}")
+        # ---- Codex r3 P1: without batch rows (the direct path) the identity is still verified, or refused
+        rows_p = os.path.join(d, "analysis", "batch", "results.jsonl")
+        keep_rows = open(rows_p).read()
+        os.remove(rows_p)
+        r5 = FG.render(d, os.path.join(figs, "e"), only=["trajectories"])
+        why5 = {x["figure"]: x["reason"] for x in r5["not_produced"]}.get("trajectories", "")
+        ok("stale" in why5 and "code" in why5,
+           f"TJ19 without batch rows another engine code is still found, from the analysis's identity record: {why5}")
+        pp = os.path.join(d, "analysis", "point.yaml")
+        keep_point = open(pp).read()
+        ptd = yaml.safe_load(keep_point)
+        ptd["data"].pop("engine_identity", None)
+        yaml.safe_dump(ptd, open(pp, "w"), sort_keys=False)
+        docj["data"]["engine"]["code_sha256"] = code0
+        from toolkit.analysis.artifacts import sha256 as _sha
+        docj["inputs"]["analysis/point.yaml"] = _sha(pp)     # trajectories made against this (old-format) point record
+        yaml.safe_dump(docj, open(os.path.join(d, OUT), "w"), sort_keys=False)
+        r6 = FG.render(d, os.path.join(figs, "f"), only=["trajectories"])
+        why6 = {x["figure"]: x["reason"] for x in r6["not_produced"]}.get("trajectories", "")
+        ok("cannot be verified" in why6, f"TJ19b with no identity record at all the figure is refused: {why6}")
+        try:
+            run(d, per_region=2, seeds=1, log=q, max_workers=2)
+            ok(False, "TJ19c the step refuses a run whose engine identity cannot be verified")
+        except RuntimeError as e:
+            ok("cannot be verified" in str(e), f"TJ19c the step refuses a run whose engine identity cannot be verified: {e}")
+        open(pp, "w").write(keep_point)
+        open(rows_p, "w").write(keep_rows)
+        # ---- Codex r3 P2: an optional dependency that appears later makes the trajectories stale
+        docj = yaml.safe_load(open(os.path.join(d, OUT)))
+        ok({"analysis_settings.yaml", "engine_choice.json"} <= set(docj["inputs"])
+           and docj["inputs"]["analysis_settings.yaml"] is None,
+           f"TJ20 absent optional dependencies are recorded with a null hash: {sorted(docj['inputs'])}")
+        open(os.path.join(d, "analysis_settings.yaml"), "w").write("analysis: {}\n")
+        r7 = FG.render(d, os.path.join(figs, "g"), only=["trajectories"])
+        why7 = {x["figure"]: x["reason"] for x in r7["not_produced"]}.get("trajectories", "")
+        ok("stale" in why7 and "analysis_settings.yaml" in why7,
+           f"TJ20b a settings file that appears after the step makes them stale: {why7}")
+        os.remove(os.path.join(d, "analysis_settings.yaml"))
         # ---- Codex r1
         doc = yaml.safe_load(open(os.path.join(d, OUT)))
         ok(set(doc["inputs"]) >= {"decision_spec.yaml", "analysis/point.yaml", "analysis/calibration.yaml",

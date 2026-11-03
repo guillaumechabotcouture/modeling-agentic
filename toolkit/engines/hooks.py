@@ -44,8 +44,8 @@ it neither hook is offered, and another version is refused. Under version 1:
   metrics     each card entry gives label, units, aggregate (mean | rate) and denominator (e.g. person, person-year):
               values are per member of the unit's simulated population, and the harness weights them by the units
               table's populations
-  schedule    half-open periods: a point event t0 is in [a, b) iff a <= t0 < b, an interval [t0, t1) overlaps it
-              iff t0 < b and t1 > a. Every event lies in [horizon.start, window end); decision events lie in the
+  schedule    half-open periods, compared exactly (no tolerance at the endpoints): a point event t0 is in [a, b)
+              iff a <= t0 < b, an interval [t0, t1) overlaps it iff t0 < b and t1 > a. Every event lies in [horizon.start, window end); decision events lie in the
               delivery period [d0, d1) and only for components the package sets (a decision at d1 is refused);
               history events lie wholly before d0; routine events do not overlap [d0, d1); charged is true exactly
               for decision events
@@ -179,18 +179,19 @@ def schedule(engine, params, unit, package, horizon) -> list[dict]:
             # overlaps [a, b) iff t0 < b and t1 > a
             t0 = float(e["t0"])
             t1 = None if e.get("t1") is None else float(e["t1"])
-            T = GRID_TOL
-            in_h = (h0 - T <= t0 < w1 - T) if t1 is None else (t0 >= h0 - T and t1 <= w1 + T)
+            # exact comparisons: no tolerance shifts the half-open endpoints (an engine emits the period's own
+            # floats, e.g. d0 itself, for an event at its start)
+            in_h = (h0 <= t0 < w1) if t1 is None else (t0 >= h0 and t1 <= w1)
             if not in_h:
                 bad.append(f"event {n}: at {t0:g} is outside the horizon [{h0:g}, {w1:g})")
-            inside = (d0 - T <= t0 < d1 - T) if t1 is None else (t0 < d1 - T and t1 > d0 + T)
-            within = (d0 - T <= t0 < d1 - T) if t1 is None else (t0 >= d0 - T and t1 <= d1 + T)
+            inside = (d0 <= t0 < d1) if t1 is None else (t0 < d1 and t1 > d0)
+            within = (d0 <= t0 < d1) if t1 is None else (t0 >= d0 and t1 <= d1)
             k = e.get("kind")
             if k == "decision" and not within:
                 bad.append(f"event {n}: decision event at {t0:g} is outside the delivery period [{d0:g}, {d1:g})")
             if k == "decision" and e.get("component") not in has:
                 bad.append(f"event {n}: decision event for {e.get('component')!r}, which is not in the package")
-            if k == "history" and (inside or t0 >= d0 - T):
+            if k == "history" and (inside or t0 >= d0):
                 bad.append(f"event {n}: history event at {t0:g} does not lie before the delivery period ({d0:g})")
             if k == "routine" and inside:
                 bad.append(f"event {n}: routine event at {t0:g} falls inside the delivery period [{d0:g}, {d1:g})")
@@ -447,6 +448,15 @@ def _self_test() -> int:
             lambda: schedule(sched([ev(kind="routine", charged=False, t0=1.0)]), {}, u, pa, hd), "routine")
     ok(len(schedule(sched([ev(t0=1.0), ev(kind="routine", charged=False, t0=2.0)]), {}, u, pa, hd)) == 2,
        "H14d a decision at d0 and a routine event at d1 are accepted")
+    # ---- Codex r3 P3: exact half-open comparisons (no tolerance shifting the endpoints)
+    ok(len(schedule(sched([ev(t0=1.9999995)]), {}, u, pa, hd)) == 1,
+       "H15 a decision just before d1 (1.9999995 in [1, 2)) is accepted")
+    refused("H15b a routine event just before d1 is refused (it lies inside [d0, d1))",
+            lambda: schedule(sched([ev(kind="routine", charged=False, t0=1.9999995)]), {}, u, pa, hd), "routine")
+    refused("H15c a decision just before d0 (0.9999995) is refused",
+            lambda: schedule(sched([ev(t0=0.9999995)]), {}, u, pa, hd), "delivery period")
+    ok(len(schedule(sched([ev(kind="history", charged=False, t0=0.9999995)]), {}, u, pa, hd)) == 1,
+       "H15d a history event just before d0 is accepted")
     print("OK: all self-test cases passed." if not fails else f"FAILED: {len(fails)} case(s)")
     return 1 if fails else 0
 
