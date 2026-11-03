@@ -442,6 +442,189 @@ def _self_test_v2_open_items(ok) -> None:
            "WA12 the v2 dry-run stub tasks write nothing through planted links")
 
 
+_BYPASS2 = '''
+import builtins, functools, subprocess, os
+from functools import partial
+from lib.safe_io import publish, append_text
+from lib import safe_io
+def g(p, d):
+    getattr(builtins, "open")(p, "w")
+    functools.partial(open, mode="w")
+    partial(open, p, "a")
+    w = open
+    w(p, "w")
+    subprocess.run("echo x > " + p, shell=True)
+    subprocess.run(["bash", "-c", "echo x > f"])
+    os.system("echo x > f")
+    publish(p, "x")
+    safe_io.append_text(p, "x")
+    _sio().remove_path(p)
+    publish(p, "x", None)
+    publish(p, "x", d)
+    _sio().publish(p, "x", root=d)
+    subprocess.run(["git", "status"])
+    functools.partial(open, mode="r")
+'''
+
+
+def _self_test_round6(ok) -> None:
+    """WA13-WA20: Codex's review of #134, each reproduced: the detached launch, root-less publications, the detached
+    log's reopen, the --no-ledger outputs, the rename source race, the audit bypasses and the mandatory run root."""
+    import json
+    import subprocess as sp
+    import tempfile
+    import types
+    for p in (REPO, os.path.join(REPO, "scripts"), os.path.join(REPO, "agents")):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+    import compute as C
+    from lib import safe_io as SIO
+
+    def run_dir(d):
+        open(os.path.join(d, "metadata.json"), "w").write("{}")      # what marks a run dir (main.py, stage_machine)
+        os.makedirs(os.path.join(d, "models"))
+        open(os.path.join(d, "models", "m.py"), "w").write("def f(p):\n    return {'y': p['x']}\n")
+
+    class _P:
+        def __init__(self, argv, stdout=None, **k):
+            self.pid = os.getpid()
+            if stdout is not None:
+                os.write(stdout.fileno(), b"launched\n")
+
+    def call(fn, *a, **kw):
+        try:
+            try:
+                return fn(*a, **kw)
+            except TypeError:
+                return fn(*a)                       # before the fix: no run-root parameter
+        except (ValueError, OSError):
+            return None
+    real_popen = sp.Popen
+    sp.Popen = _P
+    try:
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+            run_dir(d)
+            os.makedirs(os.path.join(out, "batchdir"))
+            os.makedirs(os.path.join(d, "analysis"))
+            os.symlink(os.path.join(out, "batchdir"), os.path.join(d, "analysis", "batch"))
+            call(C._detach, ["map"], os.path.join(d, "analysis", "batch", "r.jsonl"), 1, run_dir=d)
+            ok(os.listdir(os.path.join(out, "batchdir")) == [],
+               f"WA13 the detached launch anchors at the run dir: a linked analysis/batch receives no launch lock, "
+               f"lock, log or job record ({os.listdir(os.path.join(out, 'batchdir'))})")
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+            run_dir(d)
+            os.makedirs(os.path.join(d, "analysis", "batch"))
+            victim = os.path.join(out, "victim")
+            open(victim, "w").write("untouched")
+            log = os.path.join(d, "analysis", "batch", "r.jsonl.log")
+            real_w = SIO.write_nofollow
+
+            def swap(base, rel, data, *a, **k):
+                r = real_w(base, rel, data, *a, **k)
+                if rel.endswith(".log") and os.path.exists(log):
+                    os.unlink(log)
+                    os.link(victim, log)            # the log swapped for a hard link to a file outside the run
+                return r
+            SIO.write_nofollow = swap
+            try:
+                call(C._detach, ["map"], os.path.join(d, "analysis", "batch", "r.jsonl"), 1, run_dir=d)
+            finally:
+                SIO.write_nofollow = real_w
+            ok(open(victim).read() == "untouched",
+               "WA14 the detached log is not reopened by name: a hard-link swap after it is created is refused")
+    finally:
+        sp.Popen = real_popen
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+        run_dir(d)
+        from toolkit.analysis import batch as Bt
+        os.symlink(out, os.path.join(d, "analysis"))
+        spec = types.SimpleNamespace(sha256="s", settings_sha256=None)
+        call(Bt.ship, os.path.join(d, "analysis", "shipped"), spec, {"points": 1}, [{"id": "a"}],
+             [{"id": "a", "ok": True, "result": {}}], platform={"system": "x"}, run_dir=d)
+        ok(os.listdir(out) == [], f"WA15 a shipped bundle is not published through a planted parent link "
+                                  f"({os.listdir(out)})")
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+        run_dir(d)
+        import figure_validator as FV
+        os.symlink(out, os.path.join(d, "figures"))
+        open(os.path.join(out, "f.png"), "wb").write(b"png")
+        call(FV.validate_figure, os.path.join(d, "figures", "f.png"))
+        ok(os.listdir(out) == ["f.png"], f"WA16 figure provenance is not written through a planted figures/ link "
+                                         f"({os.listdir(out)})")
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+        run_dir(d)
+        inp = os.path.join(d, "in.jsonl")
+        open(inp, "w").write(json.dumps({"x": 1}) + "\n")
+        os.makedirs(os.path.join(out, "batchdir"))
+        os.makedirs(os.path.join(d, "analysis"))
+        os.symlink(os.path.join(out, "batchdir"), os.path.join(d, "analysis", "batch"))
+        import signal
+        argv, h = sys.argv, signal.getsignal(signal.SIGTERM)
+        sys.argv = ["compute.py", "map", d, "--fn", "models/m.py::f", "--inputs", inp, "--out",
+                    os.path.join(d, "analysis", "batch", "r.jsonl"), "--no-ledger", "--backend", "local",
+                    "--max-workers", "1"]
+        try:
+            call(C.main)
+        finally:
+            sys.argv = argv
+            signal.signal(signal.SIGTERM, h)
+        ok(os.listdir(os.path.join(out, "batchdir")) == [],
+           f"WA17 the --no-ledger outputs are not written through a planted analysis/batch link "
+           f"({os.listdir(os.path.join(out, 'batchdir'))})")
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+        secret = os.path.join(out, "secret")
+        open(secret, "w").write("secret")
+        open(os.path.join(d, "src"), "w").write("plain")
+        real_dfd = SIO.dir_fd_nofollow
+
+        def race(base, parts, create=False):
+            if create and not os.path.islink(os.path.join(d, "src")):
+                os.unlink(os.path.join(d, "src"))
+                os.symlink(secret, os.path.join(d, "src"))   # swapped for a link after the type check
+            return real_dfd(base, parts, create)
+        SIO.dir_fd_nofollow = race
+        try:
+            call(SIO.rename_nofollow, d, "src", "sub/dst")
+        finally:
+            SIO.dir_fd_nofollow = real_dfd
+        dst = os.path.join(d, "sub", "dst")
+        ok(not os.path.islink(dst) and open(secret).read() == "secret",
+           "WA18 rename_nofollow moves the bytes of the file it opened, never a link swapped in after the check")
+    s = scan_text(_BYPASS2)
+    lines = _BYPASS2.splitlines()
+    at = (lambda frag: next(i + 1 for i, ln in enumerate(lines) if frag in ln))
+    want = {"getattr-writer": [at("getattr(builtins")], "partial-writer": [at('partial(open, mode="w")'),
+                                                                           at('partial(open, p, "a")')],
+            "open-write": [at('w(p, "w")')],
+            "shell-command": [at("shell=True"), at('"bash", "-c"'), at("os.system")],
+            "safeio-no-root": [at('publish(p, "x")'), at("safe_io.append_text"), at("remove_path(p)"),
+                               at('publish(p, "x", None)')]}
+    clean = [at('publish(p, "x", d)'), at("root=d"), at('"git", "status"'), at('mode="r"')]
+    flat = sum(s.values(), [])
+    ok(all(sorted(s.get(k, [])) == v for k, v in want.items()) and not set(clean) & set(flat),
+       f"WA19 the audit finds getattr(builtins, 'open'), functools.partial(open, write mode), an assigned open alias, "
+       f"shell=True / sh -c / os.system, and safe_io calls without a run root; a rooted call, a plain subprocess "
+       f"and a read-mode partial are not sites ({s})")
+    with tempfile.TemporaryDirectory() as d:
+        run_dir(d)
+        os.makedirs(os.path.join(d, "analysis"))
+        res = []
+        for fn in (lambda: SIO.publish(os.path.join(d, "x.json"), "x"),
+                   lambda: SIO.publish(os.path.join(d, "x.json"), "x", None),
+                   lambda: SIO.append_text(os.path.join(d, "x.log"), "x", None),
+                   lambda: SIO.remove_path(os.path.join(d, "x.json"), None),
+                   lambda: SIO.publish(os.path.join(d, "analysis", "x.json"), "x", os.path.join(d, "analysis"))):
+            try:
+                fn()
+                res.append(False)
+            except (TypeError, ValueError):
+                res.append(True)
+        SIO.publish(os.path.join(d, "ok.json"), "x", d)
+        ok(all(res) and open(os.path.join(d, "ok.json")).read() == "x",
+           f"WA20 safe_io requires the run root for a path under a run dir: omitted, None, or a dir below the run "
+           f"root is refused; the run root is accepted ({res})")
+
+
 def _self_test() -> int:
     fails = []
 
@@ -469,6 +652,7 @@ def _self_test() -> int:
                                                        "not reviewed"], "WA2 an unreviewed site is a problem")
     _self_test_writers(ok)
     _self_test_v2_open_items(ok)
+    _self_test_round6(ok)
     live = problems(sites(), REVIEWED, OPEN_ITEMS)
     n_open = sum(n for pats in OPEN_ITEMS.values() for n, _ in pats.values())
     print(f"NOTE {n_open} attacker-reachable write site(s) remain as counted open items (OPEN_ITEMS)")
