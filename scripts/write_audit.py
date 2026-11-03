@@ -388,6 +388,58 @@ def _self_test_writers(ok) -> None:
         ok(untouched(v), "WA9 a figure is not saved through a planted link")
 
 
+def _self_test_v2_open_items(ok) -> None:
+    """WA10-WA12: the v2 open items (pipeline aside, derived_rebuild sidecars, v2_tasks stubs), each against a planted
+    link, run for real."""
+    import tempfile
+    for p in (REPO, os.path.join(REPO, "scripts"), os.path.join(REPO, "agents")):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+        import pipeline as P
+        secret = os.path.join(out, "secret.csv")
+        open(secret, "w").write("secret\n")
+        os.makedirs(os.path.join(d, ".pipeline_aside_evil", "data"))
+        os.symlink(secret, os.path.join(d, ".pipeline_aside_evil", "data", "x.csv"))
+        try:
+            P._recover_aside(d)
+        except (ValueError, OSError):
+            pass
+        dst = os.path.join(d, "data", "x.csv")
+        ok(not os.path.islink(dst) and os.path.exists(secret),
+           "WA10 a planted aside entry that is a link is not moved into the run dir (pipeline._recover_aside)")
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+        import derived_rebuild as DR
+        os.symlink(out, os.path.join(d, "figures"))
+        real = DR.inside_dir
+        DR.inside_dir = lambda *a, **k: True          # the check saw no link (a race)
+        try:
+            DR._write_sidecar(d, os.path.join(d, "figures", "f.png.provenance.json"), {"x": 1})
+        except (ValueError, OSError):
+            pass
+        finally:
+            DR.inside_dir = real
+        ok(os.listdir(out) == [], f"WA11 a derivation sidecar is not written through a linked figures/ "
+                                  f"({os.listdir(out)})")
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+        from agents import v2_tasks as V
+        vs = []
+        for rel in ("decision_spec.yaml.tmp", "decision_spec.signoff.json", "manuscript.md"):
+            v = os.path.join(out, rel)
+            open(v, "w").write("untouched")
+            os.symlink(v, os.path.join(d, rel))
+            vs.append(v)
+        st = V.StubTasks({})
+        for fn in (lambda: V._yaml_dump({"a": 1}, os.path.join(d, "decision_spec.yaml")),
+                   lambda: st.sign_spec(d), lambda: st.write(d, "draft")):
+            try:
+                fn()
+            except (ValueError, OSError, TypeError, KeyError):
+                pass
+        ok(all(open(v).read() == "untouched" for v in vs),
+           "WA12 the v2 dry-run stub tasks write nothing through planted links")
+
+
 def _self_test() -> int:
     fails = []
 
@@ -414,6 +466,7 @@ def _self_test() -> int:
     ok(problems({"a.py": {"os-remove": [3]}}, {}) == ["a.py: os-remove at lines [3]: not through lib.safe_io and "
                                                        "not reviewed"], "WA2 an unreviewed site is a problem")
     _self_test_writers(ok)
+    _self_test_v2_open_items(ok)
     live = problems(sites(), REVIEWED, OPEN_ITEMS)
     n_open = sum(n for pats in OPEN_ITEMS.values() for n, _ in pats.values())
     print(f"NOTE {n_open} attacker-reachable write site(s) remain as counted open items (OPEN_ITEMS)")
