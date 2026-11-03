@@ -334,13 +334,46 @@ LEAD_ANSWERS = "decision_brief_lead_answers.yaml"
 GEOMETRY_RECORD = "data/geometry_signoff.json"         # toolkit/spec/geometry.py SIGNOFF_FILE
 
 
-def lead_answers(run_dir: str) -> dict | None:
-    """The lead's sign-off file: {answers: {Q-id: answer}, accept_proposed: bool, note: str}, or None."""
+LEAD_ANSWER_KEYS = ("answers", "accept_proposed", "note")
+
+
+def parse_lead_answers(run_dir: str) -> tuple[dict | None, list[str]]:
+    """The lead's sign-off file, parsed strictly (focused check of #131): ({answers, accept_proposed, note}, []) or
+    (None, [problems]). `accept_proposed` is a YAML boolean (true/false, not a string or a number); `answers` maps
+    the brief's own open-question ids to non-empty text; `note` is text; no other keys; and it says something
+    (answers, or accept_proposed: true). A missing file is (None, [])."""
+    p = os.path.join(run_dir, LEAD_ANSWERS)
+    if not os.path.exists(p):
+        return None, []
     try:
-        doc = yaml.safe_load(open(os.path.join(run_dir, LEAD_ANSWERS), encoding="utf-8"))
-    except (OSError, yaml.YAMLError, UnicodeDecodeError):
-        return None
-    return doc if isinstance(doc, dict) and doc else None
+        doc = yaml.safe_load(open(p, encoding="utf-8"))
+    except (OSError, yaml.YAMLError, UnicodeDecodeError) as e:
+        return None, [f"{LEAD_ANSWERS} is unreadable: {e}"]
+    if not isinstance(doc, dict) or not doc:
+        return None, [f"{LEAD_ANSWERS} must be a mapping with answers and/or accept_proposed, and a note"]
+    errs = [f"unknown key {k!r} (allowed: {', '.join(LEAD_ANSWER_KEYS)})" for k in doc if k not in LEAD_ANSWER_KEYS]
+    ap = doc.get("accept_proposed", False)
+    if not isinstance(ap, bool):
+        errs.append(f"accept_proposed must be a YAML boolean (true or false), not {type(ap).__name__} {ap!r}")
+    ans = doc.get("answers")
+    brief, _ = load_brief(run_dir)
+    ids = {str(q.get("id")) for q in (brief or {}).get("open_questions") or [] if isinstance(q, dict)}
+    if ans is not None:
+        if not isinstance(ans, dict):
+            errs.append(f"answers must be a mapping of question id to answer, not {type(ans).__name__}")
+        else:
+            errs += [f"answers: {k!r} is not an open question of the brief (known: {', '.join(sorted(ids)) or 'none'})"
+                     for k in ans if str(k) not in ids]
+            errs += [f"answers: {k} must be non-empty text" for k, v in ans.items()
+                     if not isinstance(v, str) or not v.strip()]
+    note = doc.get("note", "")
+    if not isinstance(note, str):
+        errs.append("note must be text")
+    if not errs and ap is not True and not ans:
+        errs.append("give answers, or accept_proposed: true")
+    if errs:
+        return None, errs
+    return {"answers": {str(k): v for k, v in (ans or {}).items()}, "accept_proposed": ap, "note": note}, []
 
 
 def signoff_outputs(run_dir: str) -> list[str]:
@@ -855,7 +888,9 @@ def _run_self_test() -> int:
     # DB36 (focused check of #131): the lead's answers file is parsed strictly
     with tempfile.TemporaryDirectory() as d:
         yaml.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d, CRITERIA), "w"))
-        yaml.safe_dump(example_brief(), open(os.path.join(d, BRIEF), "w"))
+        yaml.safe_dump(example_brief(open_questions=[{"id": "Q1", "question": "Is continuity a constraint?",
+                                                      "proposed": "No", "basis": "decision"}]),
+                       open(os.path.join(d, BRIEF), "w"))
         cases = {"string false": 'accept_proposed: "false"\n', "list answers": "answers: [Q1]\n",
                  "unknown id": "answers: {Q99: x}\n", "unknown key": "accept_proposed: true\nsign_as: owner\n",
                  "nothing": "note: only a note\n", "empty answer": "answers: {Q1: ''}\n",

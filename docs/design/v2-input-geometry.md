@@ -54,7 +54,7 @@ lie outside their own polygons, so overlapping or nested polygons cannot make on
 | `area_mismatch` | MEDIUM | max(declared, polygon) / min(declared, polygon) > `area_ratio_max`, or there is no positive declared area. |
 | | HIGH | The declared area matches better the polygon where the point lies (beyond the tolerance), within the factor: the row probably belongs to that polygon. |
 | `unmatched` | MEDIUM | A unit with no polygon (no crosswalk row, a feature missing from the file, or a feature that is an empty MultiPolygon) or with no usable point. |
-| `geometry_check_failed` | HIGH | A declared input cannot be read or parsed, which also stops the figures' maps (one loader, below). The cases: invalid JSON; no features; a feature without its id property; a feature id used by two features; a geometry that is not a polygon; a degenerate ring; a non-finite coordinate, or one outside the geographic range; a `crs` other than EPSG:4326 / CRS84; a unit mapped to several features without `crosswalk.union: true`; a feature mapped to two units; or a declared column that is missing. |
+| `geometry_check_failed` | HIGH | A declared input cannot be read or parsed, which also stops the figures' maps (one loader, below). The cases: invalid JSON; no features; a feature without its id property; a feature id used by two features; a geometry that is not a polygon; a degenerate ring; a non-finite coordinate, or one outside the geographic range; a `crs` other than EPSG:4326 / CRS84; a unit mapped to more than one feature, or a declared `crosswalk.union` (unions are not supported); a feature mapped to two units; or a declared column that is missing. |
 | `geometry_check_not_run` | LOW | No boundaries declared, or no coordinates declared ("not run: no coordinates declared"). This is never a silent pass. |
 
 **Thresholds.** These are in `.claude/orchestration/effort_floors.yaml` under a new section,
@@ -146,6 +146,16 @@ rejected. Until then:
   `decision_brief.signed/decision_spec.yaml`) and the geometry record. The owner's wait registers the same list.
   `decision_brief.py` is credited only with what `restore` writes, so no Bash call is credited with the sign-off
   outputs. This is the same pattern as Phase 49's scope answers.
+- Second focused check:
+  - Only the lead may write the answers file (`enforcement.OWNED_BY`; every specialist is denied Write, Edit and
+    shell redirects).
+  - The PostToolUse hook records the lead's own Write or Edit of it in `trace.jsonl` (`lead_answers_written`,
+    with the file's sha256). The harness signs only when such a record from the current session matches the
+    file's content. Otherwise it refuses and says why: a shell write, an earlier session, or an edit since.
+  - The file is parsed strictly. `accept_proposed` must be a YAML boolean, `answers` must map the brief's own
+    question ids to non-empty text, and no other keys are allowed.
+  - The procedure is in the lead's prompt (STAGE 1.5), the denial of a sign command says what to do instead, and
+    the harness answers a missing file with exactly what to write.
 - The CLIs no longer default `--by` to `owner`.
 - The read-only `geometry.py check` also passes; it now prints without writing the record.
 - `data/geometry_signoff.json`, `data/input_checks.json` and `decision_spec.signoff.json` are in the v1
@@ -173,20 +183,17 @@ parser and GeoJSON reader for the figures and for this check:
 - `boundaries_config` reads the declaration, `read_features` the GeoJSON, `read_crosswalk` the crosswalk, and
   `resolve_targets` matches units to features.
 - `toolkit/analysis/figures.py load_boundaries` calls them.
-- #127's declaration keys and `crosswalk.union` are kept, and so are its refusals: a unit mapped to several
-  features without `union`, a feature mapped to two units, a duplicate feature id, a non-geographic CRS, and
-  coordinates outside the geographic range.
+- #127's declaration keys are kept, and so are its refusals: a feature mapped to two units, a duplicate feature
+  id, a non-geographic CRS, and coordinates outside the geographic range.
+- Each unit maps to exactly one feature. `crosswalk.union` is removed (second focused check of #131), and both
+  declaring it and mapping a unit to several features are refused, naming the units. A union's area needs exact
+  polygon intersection: the edge and vertex overlap test tried first missed collinear overlaps (`[0,3]×[0,1]`
+  with `[2,5]×[0,1]` passed with 20% double-counting). Writing that without a geometry library is a lot of code,
+  and nothing uses unions yet. The real crosswalk is strictly 1:1.
 - An empty MultiPolygon leaves its unit unmatched, as in #127.
 - The figures now draw holes: each polygon part is one compound path, the outer ring counter-clockwise and each
   hole clockwise, so the fill leaves the hole empty (BD7).
 - A polygon claimed by two units is now refused by the loader, not reported as a finding.
-- Union members whose interiors overlap are refused, naming the unit (focused check of #131). A union's area is
-  the sum of its members' areas, so an overlap would be counted twice: for example, two rectangles whose union
-  is 1.2 square degrees came out as 2.0. Refusing is simpler than computing the dissolved union, and a boundary
-  set whose features overlap is itself suspect.
-  - Counted as overlap: proper edge crossings, a vertex of one member strictly inside the other, or an interior
-    point of one strictly inside the other (which catches nested and identical members).
-  - Members that only touch along an edge or at a vertex are allowed, and their areas add up exactly (IG15).
 - **A geometry library (shapely/pyproj).** Not needed at this accuracy, and it would add a dependency to the
   harness image.
 - **An edge tolerance relative to unit size.** A fixed distance matches the error sources (simplification,

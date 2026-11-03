@@ -1049,7 +1049,8 @@ def load_presentation(run_dir: str, extra=None, spec: dict | None = None, engine
 
 def _boundaries_config(b, base: str, shown: str) -> dict:
     """The presentation file's boundaries block: toolkit/spec/geometry.py's parser, the one for figures and the
-    input geometry check (keys path, feature_id, crosswalk {path, unit_id, feature_id, union}, credit)."""
+    input geometry check (keys path, feature_id, crosswalk {path, unit_id, feature_id}, credit; `crosswalk.union` is
+    refused: unions are not supported)."""
     from toolkit.spec import geometry as GEO
     return GEO.boundaries_config(b, base, shown)
 
@@ -1081,8 +1082,8 @@ def _part_rings(part) -> list:
 def load_boundaries(cfg: dict, unit_ids: list[str], region_of, run_dir: str | None = None) -> dict:
     """Polygons per unit, read with toolkit/spec/geometry.py (the one loader: EPSG:4326 / CRS84 only, Polygon and
     MultiPolygon with holes, unique feature ids, degenerate rings refused) and matched to the units through the
-    crosswalk or directly by the feature property (geometry.resolve_targets: a unit mapped to several features only
-    with `union: true`, a feature mapped to two units refused). Every refusal raises ValueError naming the affected
+    crosswalk or directly by the feature property (geometry.resolve_targets: a unit mapped to more than one feature,
+    and a feature mapped to two units, are refused; unions are not supported). Every refusal raises ValueError naming the affected
     ids. A feature with no polygon leaves its unit unmatched. Returns {units: {id: [part]}, context: [part],
     unmatched, outline, features, context_features, files: [{path, sha256, kind}]}, where a part is a list of
     closed rings (outer first, then holes) for a compound path."""
@@ -1096,8 +1097,8 @@ def load_boundaries(cfg: dict, unit_ids: list[str], region_of, run_dir: str | No
         c = cfg["crosswalk"]
         xw = GEO.read_crosswalk(c)
         files.append({"path": _record_path(c["path"], run_dir), "sha256": sha256(c["path"]), "kind": "crosswalk"})
-    targets = GEO.resolve_targets(xw, [str(i) for i in unit_ids], bool((cfg.get("crosswalk") or {}).get("union")),
-                                  (cfg.get("crosswalk") or {}).get("shown") or cfg["shown"], feats)
+    targets = GEO.resolve_targets(xw, [str(i) for i in unit_ids],
+                                  (cfg.get("crosswalk") or {}).get("shown") or cfg["shown"])
     units, unmatched, used = {}, [], set()
     for i in unit_ids:
         fl = targets.get(str(i), [])

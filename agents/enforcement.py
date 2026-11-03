@@ -127,7 +127,10 @@ SIGNED_FILES = ("decision_brief.yaml", "success_criteria.yaml")
 # Files only one writer may change (None = the lead). Phase 32 α: the round
 # plan; Phase 33 α: the decision brief (planner) and its amendments (lead).
 OWNED_BY = {"round_plan.yaml": {None}, "brief_amendments.yaml": {None},
-            "decision_brief.yaml": {"planner"}}
+            "decision_brief.yaml": {"planner"},
+            # focused check of #131: the lead's sign-off answers (the harness signs them; main.py
+            # harness_sign_brief_lead also checks the trace for the lead's own write this turn)
+            "decision_brief_lead_answers.yaml": {None}}
 
 # Files the lead may not write directly: it must re-spawn the owning
 # agent. critique_* belong to the critique agents; models/** to the
@@ -640,23 +643,28 @@ def brief_sign_reason(command: str) -> str | None:
                     or t.endswith(".decision_brief")), None)
         if idx is None:
             if re.search(r"decision_brief", seg) and re.search(r"\bsign\b", seg):
-                return OWNER_COMMAND_DENY
+                return BRIEF_SIGN_DENY
             continue
         try:
             with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
                 a = _brief_parser().parse_args(toks[idx + 1:])
         except SystemExit:
             if "sign" in toks[idx + 1:]:
-                return OWNER_COMMAND_DENY
+                return BRIEF_SIGN_DENY
             continue
         except Exception:  # noqa: BLE001 -- the parser could not be loaded: fail closed
-            return OWNER_COMMAND_DENY
+            return BRIEF_SIGN_DENY
         if a.cmd == "sign":
-            return OWNER_COMMAND_DENY
+            return BRIEF_SIGN_DENY
     return None
 OWNER_COMMAND_DENY = ("Agents cannot sign or approve for the owner: this is an owner command (spec or brief sign-off "
                       "as owner, scope declarations, geometry approvals). agents cannot sign them; the run waits for "
                       "the owner.")
+BRIEF_SIGN_DENY = ("agents cannot sign the decision brief. Under --signoff lead, write "
+                   "decision_brief_lead_answers.yaml with the Write tool (`accept_proposed: true`, or `answers: {Q1: "
+                   "<answer>, ...}`, and `note: <why it is an adequate target>`), then end your turn with the line "
+                   "AWAITING_SIGNOFF: the harness signs it. Under --signoff owner, end your turn with AWAITING_SIGNOFF: "
+                   "the owner signs.")
 
 
 def owner_command_reason(command: str) -> str | None:

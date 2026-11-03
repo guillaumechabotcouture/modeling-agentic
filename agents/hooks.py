@@ -354,7 +354,7 @@ def signoff_hold_reason(run_path: str, mode: str | None, run_dir_rel: str = "{ru
         return ("The decision brief is ready and waits for the owner's sign-off. Do not start other work. End your "
                 "turn now with the line AWAITING_SIGNOFF; the harness resumes you with the owner's answers.")
     # Focused check of #131: the harness signs (main.py harness_sign_brief_lead) and registers what signing writes.
-    return (f"Review the decision brief against the question, then write {run_dir_rel}/{decision_brief.LEAD_ANSWERS} "
+    return (f"Review the decision brief against the question, then write {run_dir_rel}/{decision_brief.LEAD_ANSWERS} with the Write tool "
             "(`accept_proposed: true` or `answers: {Q1: <answer>, ...}`, and `note: <why it is an adequate target>`) "
             "and end your turn now with the line AWAITING_SIGNOFF; the harness signs your answers and resumes you.")
 
@@ -372,6 +372,29 @@ def scope_hold_reason(run_path: str, mode: str | None, run_dir_rel: str = "{run_
             f"finding, its declaration and decision test), write {run_dir_rel}/{scope_signoff.LEAD_ANSWERS} (one line "
             "per finding: `\"<finding>\": {decision: accept|decline, note: <why>}`), then end your turn with the line "
             "AWAITING_SIGNOFF; the harness signs your answers and resumes you.")
+
+
+LEAD_ANSWERS_EVENT = "lead_answers_written"
+
+
+def record_lead_answers(run_path: str, input_data: dict, trace_file) -> None:
+    """Focused check of #131: after the lead's own Write/Edit of decision_brief.LEAD_ANSWERS, record the file's
+    sha256 in the trace. The harness signs only answers whose content matches a lead write in the current turn
+    (main.py harness_sign_brief_lead). A specialist's write is denied at PreToolUse (enforcement.OWNED_BY) and never
+    recorded; a shell write is never recorded."""
+    if "agent_id" in input_data or input_data.get("tool_name") not in ("Write", "Edit", "MultiEdit"):
+        return
+    p = str((input_data.get("tool_input") or {}).get("file_path") or "")
+    target = os.path.join(run_path, decision_brief.LEAD_ANSWERS)
+    if not p or os.path.normpath(os.path.join(run_path, p)) != os.path.normpath(target):
+        return
+    import hashlib
+    try:
+        sha = hashlib.sha256(open(target, "rb").read()).hexdigest()
+    except OSError:
+        return
+    _safe_write(trace_file, {"ts": datetime.now().isoformat(), "type": LEAD_ANSWERS_EVENT, "agent": "lead",
+                             "sha256": sha})
 
 
 def create_hooks(run_path: str, trace_file, start_time: datetime,
@@ -571,6 +594,7 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
                     if fname.endswith(".png"):
                         _check_figure_size(os.path.join(fig_dir, fname), agent_id)
         snapshot_report(run_path, snapshot_state)
+        record_lead_answers(run_path, input_data, trace_file)
         if tool_use_id in review_before:
             # Phase 49 δ (Codex): record which draft this presentation review read and
             # whether it produced a usable critique; the gate requires one for the

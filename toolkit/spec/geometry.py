@@ -95,9 +95,9 @@ def thresholds(path: str | None = None) -> dict:
 # --------------------------------------------------------------------------- declarations
 def boundaries_config(b, base: str, shown: str) -> dict:
     """The presentation file's `boundaries` block, the one parser for the figures and this check
-    (docs/design/v2-figures.md): path and feature_id (strings), an optional crosswalk {path, unit_id, feature_id,
-    union} and credit; paths relative to the file. `union: true` lets a unit map to several features (drawn and
-    checked as their union)."""
+    (docs/design/v2-figures.md): path and feature_id (strings), an optional crosswalk {path, unit_id, feature_id}
+    and credit; paths relative to the file. Each unit maps to exactly one feature: `crosswalk.union` (from #127) is
+    refused (focused check of #131: a union's area needs exact polygon intersection, and nothing uses it yet)."""
     def where(p):
         p = os.path.expanduser(str(p))
         return p if os.path.isabs(p) else os.path.join(base, p)
@@ -111,13 +111,14 @@ def boundaries_config(b, base: str, shown: str) -> dict:
     if xw is not None:
         if not isinstance(xw, dict) or not all(isinstance(xw.get(k), str) for k in ("path", "unit_id", "feature_id")):
             raise GeometryError(f"{shown}: boundaries.crosswalk needs path, unit_id and feature_id (strings)")
-        unknown = sorted(set(xw) - {"path", "unit_id", "feature_id", "union"})
+        if "union" in xw:
+            raise GeometryError(f"{shown}: boundaries.crosswalk.union is not supported: unions of features are not "
+                                "supported; map each unit to exactly one feature")
+        unknown = sorted(set(xw) - {"path", "unit_id", "feature_id"})
         if unknown:
             raise GeometryError(f"{shown}: boundaries.crosswalk: unknown keys {unknown}")
-        if "union" in xw and not isinstance(xw["union"], bool):
-            raise GeometryError(f"{shown}: boundaries.crosswalk.union must be true or false")
         out["crosswalk"] = {"path": where(xw["path"]), "shown": xw["path"], "unit_id": xw["unit_id"],
-                            "feature_id": xw["feature_id"], "union": bool(xw.get("union", False))}
+                            "feature_id": xw["feature_id"]}
     if out.get("credit") is not None and not isinstance(out["credit"], str):
         raise GeometryError(f"{shown}: boundaries.credit must be a string")
     return out
@@ -265,76 +266,16 @@ def read_crosswalk(c: dict) -> dict:
     return out
 
 
-def _orient(a, b, c) -> float:
-    return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
-
-
-def _edges(polys):
-    for p in polys:
-        for ring in p:
-            n = len(ring)
-            for i in range(n):
-                yield ring[i], ring[(i + 1) % n]
-
-
-def _interior_point(part):
-    """A point strictly inside a polygon part (outside its holes): the vertex mean, else a diagonal midpoint."""
-    outer = part[0]
-    cands = [(sum(x for x, _ in outer) / len(outer), sum(y for _, y in outer) / len(outer))]
-    cands += [((outer[0][0] + v[0]) / 2, (outer[0][1] + v[1]) / 2) for v in outer[2:]]
-    cands += [((a[0] + c[0]) / 2, (a[1] + c[1]) / 2) for a, c in zip(outer, outer[2:])]
-    for x, y in cands:
-        if contains([part], x, y) and distance_km([part], x, y) > 1e-6:
-            return x, y
-    return None
-
-
-def _strictly_inside(polys, x, y) -> bool:
-    return contains(polys, x, y) and distance_km(polys, x, y) > 1e-6
-
-
-def overlap(a, b) -> bool:
-    """Do two features' interiors overlap? Touching along edges or at vertices does not count. Proper edge
-    crossings, a vertex or an interior point of one strictly inside the other do."""
-    ax0, ay0, ax1, ay1 = bbox(a)
-    bx0, by0, bx1, by1 = bbox(b)
-    if ax1 <= bx0 or bx1 <= ax0 or ay1 <= by0 or by1 <= ay0:
-        return False
-    eb = list(_edges(b))
-    eps = 1e-12
-    for p1, p2 in _edges(a):
-        for q1, q2 in eb:
-            o1, o2 = _orient(p1, p2, q1), _orient(p1, p2, q2)
-            o3, o4 = _orient(q1, q2, p1), _orient(q1, q2, p2)
-            if ((o1 > eps and o2 < -eps) or (o1 < -eps and o2 > eps)) and \
-                    ((o3 > eps and o4 < -eps) or (o3 < -eps and o4 > eps)):
-                return True
-    for x, y in [v for p in a for v in p[0]]:
-        if _strictly_inside(b, x, y):
-            return True
-    for x, y in [v for p in b for v in p[0]]:
-        if _strictly_inside(a, x, y):
-            return True
-    for one, other in ((a, b), (b, a)):
-        for part in one:
-            q = _interior_point(part)
-            if q is not None and _strictly_inside(other, *q):
-                return True
-    return False
-
-
-def resolve_targets(xw: dict | None, unit_ids, union: bool, shown: str, feats: dict | None = None) -> dict:
-    """{unit id: [feature id, ...]} for the units of the table: through the crosswalk, or the unit id itself as the
-    feature id. Refused (GeometryError naming every affected unit): a unit mapped to several features without
-    `crosswalk.union: true`, a feature mapped to two units, and (given `feats`) union members whose interiors
-    overlap: the union's area would count the overlap twice (focused check of #131; refusing is simpler than
-    dissolving the union, and a boundary set whose features overlap is itself suspect)."""
+def resolve_targets(xw: dict | None, unit_ids, shown: str) -> dict:
+    """{unit id: [feature id]} for the units of the table: through the crosswalk, or the unit id itself as the
+    feature id. Refused (GeometryError naming every affected unit): a unit mapped to more than one feature (unions
+    are not supported; focused check of #131) and a feature mapped to two units."""
     ids = [str(u) for u in unit_ids]
     targets = {u: list((xw or {}).get(u, [])) if xw is not None else [u] for u in ids}
     multi = sorted(u for u, fl in targets.items() if len(fl) > 1)
-    if multi and not union:
-        raise GeometryError(f"{shown}: {len(multi)} units map to more than one feature: {multi[:20]}; declare "
-                            "crosswalk.union: true to draw each such unit as the union of its features")
+    if multi:
+        raise GeometryError(f"{shown}: {len(multi)} units map to more than one feature: {multi[:20]}; unions of "
+                            "features are not supported: map each unit to exactly one feature")
     users: dict = {}
     for u, fl in targets.items():
         for fid in fl:
@@ -344,16 +285,6 @@ def resolve_targets(xw: dict | None, unit_ids, union: bool, shown: str, feats: d
         aff = sorted({u for us in shared.values() for u in us})
         raise GeometryError(f"{shown}: {len(shared)} features map to more than one unit (units {aff[:20]}); each "
                             "feature may belong to one unit")
-    if feats is not None:
-        bad = []
-        for u, fl in targets.items():
-            fs = [f for f in fl if feats.get(f)]
-            if any(overlap(feats[fs[i]], feats[fs[j]]) for i in range(len(fs)) for j in range(i + 1, len(fs))):
-                bad.append(u)
-        if bad:
-            raise GeometryError(f"{shown}: {len(bad)} units' union members overlap (units {sorted(bad)[:20]}): the "
-                                "union's area would count the overlap twice; fix the boundary set so a unit's "
-                                "features only touch")
     return targets
 
 
@@ -442,8 +373,7 @@ def _ratio(a, b):
 
 def evaluate(rows: list[dict], cols: dict, feats: dict, targets: dict | None, th: dict) -> dict:
     """The four checks on parsed inputs: {counts, findings, checks}. Pure: no files. `targets` is
-    resolve_targets()'s {unit: [feature id, ...]} (None: each unit id is its feature id); a unit with several
-    features (crosswalk.union) is checked against their union."""
+    resolve_targets()'s {unit: [feature id]} (None: each unit id is its feature id)."""
     uid, latc, lonc, areac = cols["id"], cols["lat"], cols["lon"], cols.get("area")
     tol, rmax = th["edge_tolerance_km"], th["area_ratio_max"]
     ids = [str(r.get(uid, "")).strip() for r in rows]
@@ -643,8 +573,7 @@ def _declaration(cfg, pres, cols, units) -> dict:
     xw = (cfg or {}).get("crosswalk")
     return {"enabled": bool(cfg is not None and cols.get("lat") and cols.get("lon")), "presentation": pres,
             "boundaries": {"path": cfg["shown"], "feature_id": cfg["feature_id"]} if cfg else None,
-            "crosswalk": {"path": xw["shown"], "unit_id": xw["unit_id"], "feature_id": xw["feature_id"],
-                          "union": bool(xw.get("union"))} if xw else None,
+            "crosswalk": {"path": xw["shown"], "unit_id": xw["unit_id"], "feature_id": xw["feature_id"]} if xw else None,
             "columns": {k: cols.get(k) for k in ("id", "lat", "lon", "area")}, "units": units}
 
 
@@ -731,8 +660,7 @@ def check(run_dir: str, spec: dict | None = None, th: dict | None = None, use_si
         feats = read_features(cfg)
         xw = read_crosswalk(cfg["crosswalk"]) if cfg.get("crosswalk") else None
         xw = resolve_targets(xw, [str(r.get(cols["id"], "")).strip() for r in rows],
-                             bool((cfg.get("crosswalk") or {}).get("union")),
-                             (cfg.get("crosswalk") or {}).get("shown") or cfg["shown"], feats)
+                             (cfg.get("crosswalk") or {}).get("shown") or cfg["shown"])
         rep["inputs"]["boundaries"] = {"path": cfg["shown"], "feature_id": cfg["feature_id"],
                                        "sha256": shas["boundaries"]}
         if cfg.get("crosswalk"):
@@ -922,7 +850,6 @@ def _main(argv=None) -> int:
         t.add_argument("--" + k.replace("_", "-"), required=True)
     for k in ("crosswalk", "xw_unit", "xw_feature", "area"):
         t.add_argument("--" + k.replace("_", "-"))
-    t.add_argument("--union", action="store_true")
     p = sub.add_parser("approve", help="the owner: re-freeze the current geometry inputs and approve the spec's "
                                        "proposed HIGH exceptions (and --accept ID=REASON)", allow_abbrev=False)
     p.add_argument("run_dir")
@@ -950,8 +877,7 @@ def _main(argv=None) -> int:
             xw = read_crosswalk({"path": a.crosswalk, "unit_id": a.xw_unit, "feature_id": a.xw_feature}) \
                 if a.crosswalk else None
             rows = read_table(a.units)
-            xw = resolve_targets(xw, [str(r.get(a.id, "")).strip() for r in rows], a.union, a.crosswalk or a.boundaries,
-                                 feats)
+            xw = resolve_targets(xw, [str(r.get(a.id, "")).strip() for r in rows], a.crosswalk or a.boundaries)
             ev = evaluate(rows, {"id": a.id, "lat": a.lat, "lon": a.lon, "area": a.area}, feats, xw, thresholds())
             rep = {"status": "ran", **ev}
         except GeometryError as e:

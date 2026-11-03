@@ -467,6 +467,7 @@ async def run(question: str, max_rounds: int, max_sessions: int,
             print(f"SESSION {session_num}/{max_sessions}", flush=True)
             print(f"{'#'*60}", flush=True)
 
+            session_started = datetime.now()     # the lead's sign-off answers must be written after this
             trace_file = open(trace_path, "a")
             trace_file.write(json.dumps({
                 "ts": datetime.now().isoformat(),
@@ -587,13 +588,12 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                 if signoff == "lead" and decision_brief.status(run_path) == "awaiting":
                     # Focused check of #131: --signoff lead; the harness signs the lead's answers file and registers
                     # what signing wrote (with a decision spec, the geometry record and the spec's signed copy).
-                    text = harness_sign_brief_lead(run_path, integrity)
-                    if text is not None:
-                        signoff_waits += 1
-                        lead_prompt = (LEAD_SIGNOFF_PROMPT.format(text=text)
-                                       if decision_brief.status(run_path) == "signed" else
-                                       f"CONTINUE. {text}")
-                        continue
+                    # It signs only what the lead itself wrote during this session (the trace's record), and says
+                    # exactly what is missing otherwise, including when there is no answers file at all.
+                    signed, text = harness_sign_brief_lead(run_path, integrity, session_started)
+                    signoff_waits += 1
+                    lead_prompt = LEAD_SIGNOFF_PROMPT.format(text=text) if signed else f"CONTINUE. {text}"
+                    continue
                 if (signoff == "lead" and scope_signoff.status(run_path) == "awaiting"
                         and scope_signoff.lead_answers(run_path)):
                     # Phase 49 β: --signoff lead; the harness signs the lead's answers file.
@@ -702,28 +702,66 @@ async def run(question: str, max_rounds: int, max_sessions: int,
     return status
 
 
-def harness_sign_brief_lead(run_path: str, integrity=None) -> str | None:
-    """--signoff lead: sign the lead's answers file (decision_brief.LEAD_ANSWERS) `by: lead`, as the harness, and
-    register every file signing wrote with the integrity record (focused check of #131: when the lead ran
-    `decision_brief.py sign` itself, the geometry record and the spec's signed copy were unexplained writes). Returns
-    the text for the lead's next prompt, or None when there is no answers file yet."""
+LEAD_ANSWERS_HOWTO = ("Write {name} with the Write tool: `accept_proposed: true` (accept every proposed answer), or "
+                      "`answers: {{Q1: <answer>, ...}}` for the brief's open questions, and `note: <why the brief is an "
+                      "adequate target>`. Then end your turn with the line AWAITING_SIGNOFF; the harness signs it.")
+
+
+def _lead_wrote_answers(run_path: str, since) -> str | None:
+    """None when the trace records the lead's own Write/Edit of the answers file (agents/hooks.py
+    record_lead_answers) after `since`, with the file's current content; else why not."""
     import decision_brief
-    la = decision_brief.lead_answers(run_path)
-    if la is None:
-        return None
+    import hashlib
+    from agents.hooks import LEAD_ANSWERS_EVENT
     try:
-        answers = la.get("answers")
-        if answers is not None and not isinstance(answers, dict):
-            raise ValueError("answers must be a mapping of question id to answer")
-        decision_brief.sign(run_path, "lead", answers, str(la.get("note") or ""), bool(la.get("accept_proposed")))
+        sha = hashlib.sha256(open(os.path.join(run_path, decision_brief.LEAD_ANSWERS), "rb").read()).hexdigest()
+        lines = open(os.path.join(run_path, "trace.jsonl"), encoding="utf-8").read().splitlines()
+    except OSError as e:
+        return f"the trace cannot be read ({e})"
+    for ln in reversed(lines):
+        try:
+            rec = json.loads(ln)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict) or rec.get("type") != LEAD_ANSWERS_EVENT or rec.get("agent") != "lead":
+            continue
+        try:
+            at = datetime.fromisoformat(str(rec.get("ts")))
+        except ValueError:
+            continue
+        if since is not None and at < since:
+            break
+        if rec.get("sha256") == sha:
+            return None
+    return ("it was not written by the lead in this turn: the trace has no record of your own Write of this content "
+            "(a shell write, a write before this turn, or an edit since are not accepted)")
+
+
+def harness_sign_brief_lead(run_path: str, integrity=None, since=None) -> tuple[bool, str]:
+    """--signoff lead: sign the lead's answers file (decision_brief.LEAD_ANSWERS) `by: lead`, as the harness, and
+    register every file signing wrote with the integrity record (focused checks of #131). It signs only a file that
+    the lead itself wrote with the Write/Edit tool after `since` (the start of the current session), recorded in the
+    trace with the file's current sha256 (no specialist may write it: enforcement.OWNED_BY), and only answers that
+    parse strictly (decision_brief.parse_lead_answers). Returns (signed, text for the lead's next prompt); with no
+    answers file the text says exactly what to write."""
+    import decision_brief
+    name = decision_brief.LEAD_ANSWERS
+    if not os.path.exists(os.path.join(run_path, name)):
+        return False, (f"You are in --signoff lead and the decision brief waits for your sign-off, but {name} does not "
+                       "exist. " + LEAD_ANSWERS_HOWTO.format(name=name))
+    la, errs = decision_brief.parse_lead_answers(run_path)
+    why = "; ".join(errs) if errs else _lead_wrote_answers(run_path, since)
+    if why:
+        return False, (f"Your {name} was not signed: {why}. " + LEAD_ANSWERS_HOWTO.format(name=name))
+    try:
+        decision_brief.sign(run_path, "lead", la["answers"] or None, la["note"], la["accept_proposed"])
     except (ValueError, OSError) as e:
-        return (f"Your {decision_brief.LEAD_ANSWERS} was not signed: {e}. Fix it and end your turn with "
-                "AWAITING_SIGNOFF again.")
+        return False, (f"Your {name} was not signed: {e}. " + LEAD_ANSWERS_HOWTO.format(name=name))
     if integrity is not None:            # only after a successful signature: it rewrote each of these files
         for rel in decision_brief.signoff_outputs(run_path):
             if os.path.exists(os.path.join(run_path, rel)):
                 integrity.harness_wrote(rel)
-    return "Signed by the lead (the harness recorded it). " + (decision_brief.signoff_text(run_path) or "")
+    return True, "Signed by the lead (the harness recorded it). " + (decision_brief.signoff_text(run_path) or "")
 
 
 # ---------------------------------------------------------------------------

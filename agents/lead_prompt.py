@@ -69,6 +69,12 @@ open questions are decisions that matter (facts are the planner's to find),
 and that the method assessment says why the requested framework fits. Nothing but planning runs until it is signed;
 the harness says whether the owner signs (end your turn with
 AWAITING_SIGNOFF and you are resumed with the owner's answers) or you do.
+Under `--signoff lead` you never run a sign command: write
+`decision_brief_lead_answers.yaml` in the run directory with the Write
+tool (`accept_proposed: true`, or `answers: {Q1: <answer>, ...}` for the
+brief's open questions, plus `note: <why it is an adequate target>`),
+then end your turn with the line AWAITING_SIGNOFF. The harness signs it
+and resumes you; it signs only a file you wrote yourself in that turn.
 After sign-off the brief and success_criteria.yaml are frozen and the
 benchmark bands are locked when the gate first sees them; record framing
 changes you discover in `brief_amendments.yaml` (`amendments:` list of
