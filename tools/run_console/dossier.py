@@ -12,8 +12,12 @@ is data or {"available": False, "why": ...}; the page shows the reason, never an
 """
 from __future__ import annotations
 
+import csv
+import hashlib
+import io
 import json
 import os
+import re
 import sys
 
 import yaml
@@ -22,9 +26,17 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 import run_console as RC  # noqa: E402
+from lib import safe_io  # noqa: E402  (module attributes, so a self-test can trace every no-follow open)
 
 REPO = RC.REPO
 JS = os.path.join(HERE, "dossier.js")
+ENGINE_YAML, CHOICE = "analysis/engine.yaml", "engine_choice.json"
+REGISTRY, PROVENANCE, DERIVATIONS = "evidence/registry.yaml", "data/inputs_provenance.json", "data/derivations.yaml"
+INPUT_CHECKS, CALIBRATION, EMULATOR = "data/input_checks.json", "analysis/calibration.yaml", "analysis/emulator.yaml"
+ARCHIVE_DIR, ARCHIVE_PREFIX = "evidence_planner", "superseded_signoff_"
+# the run's record of the engine's benchmark results file, as analysis/engine.yaml `inputs` names it
+_RESULTS_KEY = re.compile(r"^(?:\.\./)*toolkit/engines/([a-z0-9_]+)/benchmarks/results\.yaml$")
+_NOT_YET = "not written by this run (yet)"
 
 
 def na(why: str) -> dict:
@@ -32,20 +44,711 @@ def na(why: str) -> dict:
     return {"available": False, "why": why}
 
 
+# ------------------------------------------------------------------ confined reads (run_console's read model)
+def _doc(run_dir: str, rel: str):
+    """(parsed, None) or (None, why) of a run artifact through run_console._load_rel."""
+    try:
+        RC.check_rel(rel)
+    except ValueError as e:
+        return None, str(e)
+    if not RC._rexists(run_dir, rel):
+        return None, f"{rel}: {_NOT_YET}"
+    e = RC._load_rel(run_dir, rel)
+    return (e["parsed"], None) if e["err"] is None else (None, f"{rel}: {e['err']}")
+
+
+def _mapping(run_dir: str, rel: str):
+    doc, why = _doc(run_dir, rel)
+    if why is None and not isinstance(doc, dict):
+        return None, f"{rel}: not a mapping"
+    return doc, why
+
+
+def _sha(run_dir: str, rel: str):
+    """(sha256, None) or (None, why)."""
+    try:
+        RC.check_rel(str(rel))
+    except ValueError as e:
+        return None, str(e)
+    if not RC._rexists(run_dir, rel):
+        return None, "missing"
+    e = RC._load_rel(run_dir, rel)
+    return (e["sha256"], None) if e["sha256"] else (None, e["err"])
+
+
+def _state(run_dir: str, rel: str, want) -> tuple[str, str | None]:
+    """match | changed | missing | refused (a path outside the run dir, a link, a credential file)."""
+    sha, why = _sha(run_dir, rel)
+    if sha is None:
+        return ("missing", "not in the run directory") if why == "missing" else ("refused", why)
+    return ("match" if want and sha == want else "changed"), None
+
+
+def _listing(run_dir: str, rel: str = "") -> list:
+    """[(name, is_dir)] of a directory of the run, opened with no link followed; [] when absent or refused."""
+    try:
+        parts = [p for p in rel.split("/") if p] if rel else []
+        if parts:
+            RC.check_rel(rel)
+        fd = safe_io.dir_fd_nofollow(os.path.realpath(run_dir), parts)
+    except (OSError, ValueError):
+        return []
+    try:
+        with os.scandir(fd) as it:
+            return sorted((e.name, e.is_dir(follow_symlinks=False)) for e in it)
+    finally:
+        os.close(fd)
+
+
+def _walk(run_dir: str, rel: str, depth: int = 5) -> list:
+    """Every file under a run directory, no link followed (a link is listed, then refused when read)."""
+    out = []
+    for name, is_dir in _listing(run_dir, rel):
+        sub = f"{rel}/{name}" if rel else name
+        if is_dir and depth > 0:
+            out += _walk(run_dir, sub, depth - 1)
+        elif not is_dir:
+            out.append(sub)
+    return out
+
+
+def _rows(run_dir: str, rel: str):
+    """(header, rows, None) of a CSV in the run dir, or (None, None, why)."""
+    text, why = _doc(run_dir, rel)
+    if why:
+        return None, None, why
+    if not isinstance(text, str):
+        return None, None, f"{rel}: not a text table"
+    r = csv.reader(io.StringIO(text))
+    header = next(r, None)
+    return header or [], [dict(zip(header or [], row)) for row in r if row], None
+
+
+def _m(v) -> dict:
+    return v if isinstance(v, dict) else {}
+
+
+def _l(v) -> list:
+    return v if isinstance(v, list) else []
+
+
+def _num(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def _short(v) -> str:
+    """A leaf for a table cell: scalars as is, a list joined, a mapping as key: value pairs."""
+    if isinstance(v, dict):
+        return "; ".join(f"{k}: {_short(x)}" for k, x in v.items())
+    if isinstance(v, list):
+        return ", ".join(_short(x) for x in v)
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return "" if v is None else str(v)
+
+
+# ------------------------------------------------------------------ Spec
+def _units(run_dir: str, du: dict) -> dict:
+    out = {k: du.get(k) for k in ("csv", "id", "label", "region")}
+    rel = du.get("csv")
+    if not isinstance(rel, str):
+        return {**out, "count": None, "count_why": "the spec names no units table (decision_units.csv)"}
+    header, rows, why = _rows(run_dir, rel)
+    if why:
+        return {**out, "count": None, "count_why": why}
+    reg = du.get("region")
+    regions = len({r.get(reg) for r in rows}) if reg in header else None
+    return {**out, "count": len(rows), "regions": regions, "columns": len(header),
+            "count_why": None if regions is not None or not reg else f"{rel} has no region column {reg}"}
+
+
+def _binding_of(b) -> dict:
+    if not isinstance(b, dict):
+        return {"how": "value", "detail": _short(b)}
+    if "columns" in b:
+        c = b["columns"]
+        detail = ", ".join(f"{k} ← {v}" if k != v else str(k) for k, v in c.items()) if isinstance(c, dict) else _short(c)
+        return {"how": "columns", "detail": detail, "source": b.get("source"), "split": b.get("split")}
+    if "column" in b:
+        return {"how": "column", "detail": _short(b["column"]), "source": b.get("source"), "split": b.get("split")}
+    if "value" in b:
+        return {"how": "value", "detail": _short(b["value"]), "source": b.get("source"), "split": b.get("split")}
+    return {"how": "other", "detail": _short(b), "source": b.get("source"), "split": b.get("split")}
+
+
+def _bindings(du: dict) -> list:
+    return [{"attribute": str(k), **_binding_of(v)} for k, v in _m(du.get("engine_attributes")).items()]
+
+
+def _factor(it: dict, prices: dict):
+    """The price-year factor of toolkit/alloc/costs.py _factor, or None when the spec lacks an entry."""
+    rule = it.get("price_rule")
+    if rule == "as_published":
+        return 1.0
+    b, py = str(prices.get("base_year")), str(it.get("price_year"))
+    try:
+        if rule == "index":
+            idx = {str(k): float(v) for k, v in _m(prices.get("index")).items()}
+            return idx[b] / idx[py]
+        if rule == "local_index":
+            loc = _m(prices.get("local"))
+            xr = {str(k): float(v) for k, v in _m(loc.get("exchange_rate")).items()}
+            li = {str(k): float(v) for k, v in _m(loc.get("index")).items()}
+            return xr[py] / xr[b] * li[b] / li[py]
+    except (KeyError, ValueError, ZeroDivisionError, TypeError):
+        return None
+    return None
+
+
+PER = {"per_person": "per person", "per_eligible": "per eligible person", "per_reached": "per person reached",
+       "per_commodity": "per person covered", "fixed": "fixed", "per_outcome": "per outcome"}
+
+
+def _cost_items(opts: dict) -> list:
+    prices, comps = _m(opts.get("prices")), _m(opts.get("components"))
+    out = []
+    for it in _l(opts.get("cost_items")):
+        if not isinstance(it, dict):
+            continue
+        v, basis = _num(it.get("value")), it.get("basis")
+        f = _factor(it, prices)
+        base = v * f if v is not None and f is not None else None
+        mult = 1.0
+        for k in ("share", "times", "years"):
+            mult *= _num(it.get(k)) if _num(it.get(k)) is not None else 1.0
+        per = None
+        if base is not None and basis in ("per_person", "per_eligible", "per_reached", "per_commodity"):
+            per = base * mult
+            if basis == "per_commodity":
+                ppc = _num(it.get("people_per_commodity"))
+                per = per / ppc if ppc else None
+            elif basis == "per_reached":
+                rs = _num(_m(comps.get(it.get("component"))).get("reach_share"))
+                per = per * rs if rs is not None else None
+        extra = []
+        if it.get("people_per_commodity") is not None:
+            extra.append(f"{it['people_per_commodity']} people per commodity")
+        for k, w in (("share", "share charged"), ("times", "times per year"), ("years", "years")):
+            if it.get(k) is not None:
+                extra.append(f"{w} {it[k]}")
+        if basis == "per_outcome":
+            extra.append(f"outcome {it.get('outcome')}" + (" (incremental)" if it.get("incremental") else ""))
+        out.append({"id": it.get("id"), "component": it.get("component"), "value": v, "price_year": it.get("price_year"),
+                    "rule": it.get("price_rule"), "basis": basis, "includes": _l(it.get("includes")),
+                    "extra": extra, "factor": f, "base_value": base, "per_person": per, "per_label": PER.get(basis, basis),
+                    "why_no_per_person": None if per is not None else
+                    ("priced per outcome (a model output)" if basis == "per_outcome" else "a fixed amount"
+                     if basis == "fixed" else "the price year has no index entry" if f is None else "not computable")})
+    return out
+
+
+def _card_units(run_dir: str) -> dict:
+    doc, _ = _mapping(run_dir, ENGINE_YAML)
+    return {str(p.get("name")): p.get("units") for p in _l(_m(_m(doc).get("data")).get("parameters"))
+            if isinstance(p, dict)}
+
+
+def _decision_tests(spec: dict, units: dict) -> list:
+    out = []
+    for t in _l(_m(spec.get("analysis")).get("decision_tests")):
+        if not isinstance(t, dict):
+            continue
+        typ, unit, values = t.get("type"), "", _l(t.get("values"))
+        if typ == "parameter_value":
+            varied, unit = f"parameter {t.get('parameter')}", units.get(str(t.get("parameter"))) or ""
+        elif typ == "interaction_rescale":
+            varied, unit = (f"interaction of {_short(t.get('components'))} with any of {_short(t.get('with_any'))}"
+                            + (f" (benchmark {t['benchmark']})" if t.get("benchmark") else "")), "×"
+        elif typ == "group_rule":
+            a = _m(t.get("add"))
+            varied = (f"rule {a.get('rule')}: {_short(a.get('components'))} by {a.get('by')}"
+                      + (f" ({a['reason']})" if a.get("reason") else ""))
+        else:
+            varied = _short({k: v for k, v in t.items() if k not in ("id", "type", "text", "values", "finding")})
+        out.append({"id": t.get("id"), "type": typ, "varied": varied, "values": values, "unit": unit,
+                    "question": t.get("text"), "finding": t.get("finding")})
+    return out
+
+
+def _flatten(v, path: str, out: dict) -> dict:
+    """A spec as path -> leaf text. Lists of mappings with an id are keyed by id, so a diff compares them by id."""
+    if isinstance(v, dict):
+        for k in v:
+            _flatten(v[k], f"{path}.{k}" if path else str(k), out)
+    elif isinstance(v, list) and v and all(isinstance(x, dict) and x.get("id") is not None for x in v):
+        for x in v:
+            _flatten(x, f"{path}.{x['id']}", out)
+    else:
+        out[path] = _short(v)
+    return out
+
+
+def spec_diff(before: dict, after: dict) -> list:
+    """[{section, field, before, after}] over two parsed specs; a field one side lacks is None."""
+    a, b = _flatten(before, "", {}), _flatten(after, "", {})
+    return [{"section": k.split(".")[0], "field": k, "before": a.get(k), "after": b.get(k)}
+            for k in sorted(set(a) | set(b)) if a.get(k) != b.get(k)]
+
+
+def _archived_spec(run_dir: str, folder: str, want) -> tuple:
+    """(rel, parsed) of the spec under an archive folder whose sha256 is `want`, or (None, why)."""
+    if not want:
+        return None, "the archived record has no spec sha256"
+    for rel in _walk(run_dir, folder, 3):
+        name = rel.rsplit("/", 1)[-1]
+        if name.startswith("decision_spec") and name.endswith((".yaml", ".yml")) and _sha(run_dir, rel)[0] == want:
+            doc, why = _doc(run_dir, rel)
+            return (rel, doc) if why is None else (None, why)
+    return None, f"no spec in {folder} has the archived sha256 {str(want)[:12]}"
+
+
+def _record(rec: dict, rel: str) -> dict:
+    shas = _m(rec.get("sha256"))
+    return {"file": rel, "signed_by": rec.get("signed_by"), "signed_at": str(rec.get("signed_at") or ""),
+            "note": rec.get("note"), "spec_sha256": shas.get(RC.SPEC), "derivations_sha256": shas.get(RC.DERIV_RECORD)}
+
+
+def _signoffs(run_dir: str, spec: dict, spec_sha) -> list:
+    archived = []
+    for name, _ in _listing(run_dir, ARCHIVE_DIR):
+        if not name.startswith(ARCHIVE_PREFIX):
+            continue
+        folder = f"{ARCHIVE_DIR}/{name}"
+        rel = f"{folder}/{RC.SPEC_SIGNOFF}"
+        rec, why = _mapping(run_dir, rel)
+        if why:
+            archived.append({"file": rel, "folder": folder, "signed_at": "", "available": False, "why": why})
+            continue
+        r = {**_record(rec, rel), "folder": folder, "current": False}
+        r["spec_file"], r["_spec"] = _archived_spec(run_dir, folder, r["spec_sha256"])
+        archived.append(r)
+    archived.sort(key=lambda r: (r.get("signed_at") or "", r["file"]))
+    cur, why = _mapping(run_dir, RC.SPEC_SIGNOFF)
+    current = None
+    if cur is not None:
+        current = {**_record(cur, RC.SPEC_SIGNOFF), "current": True, "spec_file": RC.SPEC,
+                   "matches": cur is not None and _m(cur.get("sha256")).get(RC.SPEC) == spec_sha}
+        d_sha, _ = _sha(run_dir, RC.DERIV_RECORD)
+        current["derivations_match"] = current["derivations_sha256"] == (d_sha if d_sha else None)
+    elif why and _NOT_YET not in why:
+        current = {"file": RC.SPEC_SIGNOFF, "current": True, "available": False, "why": why}
+    nxt = [r for r in archived if r.get("available") is not False]
+    for i, r in enumerate(nxt):
+        after = nxt[i + 1] if i + 1 < len(nxt) else None
+        target, label = (after.get("_spec"), "the next sign-off") if after else \
+            (spec, "the current spec" + (" (signed)" if current and current.get("matches") else " (not signed)"))
+        if not isinstance(r.get("_spec"), dict):
+            r["diff"] = na(r["_spec"] if isinstance(r.get("_spec"), str) else "the archived spec cannot be read")
+        elif not isinstance(target, dict):
+            r["diff"] = na(f"the next spec cannot be read: {target}" if isinstance(target, str) else
+                           "the next spec cannot be read")
+        else:
+            r["diff"] = {"available": True, "against": label, "against_at": after["signed_at"] if after else None,
+                         "rows": spec_diff(r["_spec"], target)}
+    for r in archived:
+        r.pop("_spec", None)
+    return archived + ([current] if current else [])
+
+
 def spec_tab(run_dir: str) -> dict:
-    raise NotImplementedError("β")
+    spec, why = _mapping(run_dir, RC.SPEC)
+    if why:
+        return na(why)
+    sha, _ = _sha(run_dir, RC.SPEC)
+    view = RC.spec_view(run_dir)
+    du, opts = _m(spec.get("decision_units")), _m(spec.get("options"))
+    obj, con, cal, unc = (_m(spec.get(k)) for k in ("objective", "constraints", "calibration", "uncertainty"))
+    comps = _m(opts.get("components"))
+    emap = _m(opts.get("engine_map"))
+    pk = opts.get("packages")
+    return {
+        "available": True, "file": RC.SPEC, "sha256": sha, "status": view.get("status"), "status_error": view.get("error"),
+        "question": spec.get("question"), "decision_maker": spec.get("decision_maker"),
+        "decision_date": spec.get("decision_date"), "horizon": spec.get("horizon"),
+        "units": _units(run_dir, du), "bindings": _bindings(du),
+        "defaults": [{"name": str(k), "reason": _short(v)} for k, v in _m(du.get("defaults_accepted")).items()],
+        "populations": [{"name": str(k), "column": _m(v).get("column", v if not isinstance(v, dict) else None),
+                         "age_groups": _l(_m(v).get("age_groups"))} for k, v in _m(du.get("populations")).items()],
+        "option_populations": [{"name": str(k), "column": _short(v)} for k, v in _m(opts.get("populations")).items()],
+        "components": [{"id": str(k), "group": _m(v).get("group"), "eligible": _m(v).get("eligible"),
+                        "engine": _short(emap.get(k)) if k in emap else None} for k, v in comps.items()],
+        "packages": {"generate": bool(_m(pk).get("generate")),
+                     "list": [{"name": str(k), "components": _l(v)} for k, v in _m(pk).items() if k != "generate"]},
+        "prices": {"base_year": _m(opts.get("prices")).get("base_year"),
+                   "index_name": _m(opts.get("prices")).get("index_name"),
+                   "index": [[str(k), v] for k, v in _m(_m(opts.get("prices")).get("index")).items()]},
+        "cost_items": _cost_items(opts),
+        "objective": {"outcome": obj.get("outcome"), "sense": obj.get("sense"), "window": obj.get("horizon"),
+                      "delivery": obj.get("delivery"), "discounting": obj.get("discounting")},
+        "constraints": {"envelope_usd": con.get("envelope_usd"),
+                        "fixed": [{"name": str(k), "usd": v} for k, v in _m(con.get("fixed_costs_usd")).items()],
+                        "eligibility": [{"component": str(k), "rule": _short(v)} for k, v in
+                                        _m(con.get("eligibility")).items()],
+                        "other": {k: _short(v) for k, v in con.items()
+                                  if k not in ("envelope_usd", "fixed_costs_usd", "eligibility")}},
+        "comparator": {"package": _m(spec.get("comparator")).get("package"),
+                       "text": _m(spec.get("comparator")).get("text")},
+        "calibration": {"method": cal.get("method"), "attribute": cal.get("attribute"), "scale": cal.get("scale"),
+                        "range": cal.get("range"), "target_column": cal.get("target_column"),
+                        "window": cal.get("window"), "metric": cal.get("metric"),
+                        "target_uncertainty": {k: _short(v) for k, v in _m(cal.get("target_uncertainty")).items()},
+                        "target_frame": {k: _short(v) for k, v in _m(cal.get("target_frame")).items()}},
+        "uncertainty": {"level": unc.get("level"), "draws": unc.get("draws"), "seed": unc.get("seed"),
+                        "sources": [{"kind": _m(s).get("kind"),
+                                     "items": [{"id": str(k), "range": v} for k, v in _m(_m(s).get("items")).items()]}
+                                    for s in _l(unc.get("sources"))],
+                        "excluded": _l(unc.get("excluded"))},
+        "analysis": {k: _short(v) for k, v in _m(spec.get("analysis")).items() if k != "decision_tests"},
+        "decision_tests": _decision_tests(spec, _card_units(run_dir)),
+        "signoffs": _signoffs(run_dir, spec, sha),
+    }
+
+
+# ------------------------------------------------------------------ Evidence
+_CIT_HEAD = re.compile(r"^##\s*\[([^\]]+)\]\s*(.*)$")
+_CIT_FIELD = re.compile(r"^\s*-\s*\*\*([^*]+)\*\*:\s*(.*)$")
+
+
+def _citations(run_dir: str) -> dict:
+    files = sorted(r for r in _walk(run_dir, "data/inputs", 6) + [n for n, d in _listing(run_dir) if not d]
+                   if re.match(r"citations_[^/]*\.txt$", r.rsplit("/", 1)[-1]))
+    if not files:
+        return na(f"{_NOT_YET}: no citations_*.txt under data/inputs or in the run directory")
+    entries, errors = [], []
+    for rel in files:
+        text, why = _doc(run_dir, rel)
+        if why or not isinstance(text, str):
+            errors.append(why or f"{rel}: not text")
+            continue
+        cur = None
+        for line in text.splitlines():
+            m = _CIT_HEAD.match(line)
+            if m:
+                cur = {"id": m.group(1).strip(), "title": m.group(2).strip(), "fields": {}, "file": rel, "cited_by": []}
+                entries.append(cur)
+                continue
+            f = _CIT_FIELD.match(line)
+            if f and cur is not None:
+                cur["fields"][f.group(1).strip()] = f.group(2).strip()
+    return {"available": True, "files": files, "entries": entries, "errors": errors}
+
+
+def _used_in(flat: dict, name: str) -> list:
+    pat = re.compile(r"(?<![\w-])" + re.escape(name) + r"(?![\w-])")
+    return [k for k, v in flat.items() if isinstance(v, str) and pat.search(v)]
+
+
+def _cited_ids(text) -> list:
+    return re.findall(r"\b([A-Z]{1,3}\d+[a-z]?)\b", str(text or ""))
+
+
+def _registry(run_dir: str, by_id: dict) -> dict:
+    doc, why = _mapping(run_dir, REGISTRY)
+    if why:
+        return na(why)
+    out = []
+    for e in _l(doc.get("entries")):
+        if not isinstance(e, dict):
+            continue
+        cit = e.get("citation")
+        out.append({"id": e.get("id") or e.get("name") or e.get("parameter"), "value": e.get("value"),
+                    "unit": e.get("units") or e.get("unit"), "source": e.get("source"), "citation": cit,
+                    "citation_title": (by_id.get(str(cit)) or {}).get("title") if cit else None,
+                    "used_in": _l(e.get("used_in") or e.get("where")) or ([e["used_by"]] if e.get("used_by") else []),
+                    "status": e.get("status"),
+                    "more": _short({k: v for k, v in e.items() if k not in ("id", "name", "parameter", "value", "units",
+                                                                            "unit", "source", "citation", "used_in",
+                                                                            "where", "used_by", "status")})})
+    return {"available": True, "file": REGISTRY, "status": doc.get("status"), "stub": doc.get("status") == "stub",
+            "entries": out}
+
+
+def _param_registries(run_dir: str, flat: dict, by_id: dict) -> list:
+    out = []
+    for rel in _walk(run_dir, "data/inputs", 6):
+        name = rel.rsplit("/", 1)[-1]
+        if "registry" not in name or not name.endswith((".yaml", ".yml")):
+            continue
+        doc, why = _mapping(run_dir, rel)
+        if why:
+            out.append({"file": rel, **na(why)})
+            continue
+        if not isinstance(doc.get("parameters"), list):
+            continue
+        rows = []
+        for p in doc["parameters"]:
+            if not isinstance(p, dict) or p.get("name") is None:
+                continue
+            src = p.get("source")
+            cits = [c for c in _cited_ids(src) if c in by_id]
+            rows.append({"name": str(p["name"]), "value": p.get("value"),
+                         "ci": [p.get("ci_low"), p.get("ci_high")] if p.get("ci_low") is not None else None,
+                         "kind": p.get("kind"), "source": src, "subgroup": p.get("subgroup"),
+                         "applies_to": p.get("applies_to"),
+                         "citation_title": "; ".join(by_id[c]["title"] for c in cits) or None,
+                         "used_in": _used_in(flat, str(p["name"]))})
+        out.append({"available": True, "file": rel, "entries": rows})
+    return out
+
+
+def _inputs(run_dir: str, ders: list, ignored: dict) -> dict:
+    doc, why = _mapping(run_dir, PROVENANCE)
+    if why:
+        return na(why)
+    rows = []
+    for rel, p in _m(doc.get("inputs")).items():
+        p = _m(p)
+        st, swhy = _state(run_dir, str(rel), p.get("sha256"))
+        rows.append({"path": str(rel), "source": p.get("source"), "bytes": p.get("bytes"),
+                     "sha256": p.get("sha256"), "state": st, "why": swhy,
+                     "read_by": [str(d.get("id")) for d in ders if rel in _l(d.get("inputs"))],
+                     "ignored": ignored.get(rel)})
+    cited = []
+    for rel, p in _m(doc.get("cited")).items():
+        st, swhy = _state(run_dir, str(rel), _m(p).get("sha256"))
+        cited.append({"path": str(rel), "sha256": _m(p).get("sha256"), "state": st, "why": swhy})
+    return {"available": True, "file": PROVENANCE, "rows": rows, "cited": cited}
+
+
+def _derivations(run_dir: str, ders: list, ignored: dict, why_d) -> dict:
+    if why_d:
+        return na(why_d)
+    rec_doc, rwhy = _mapping(run_dir, RC.DERIV_RECORD)
+    recs = _m(_m(rec_doc).get("derivations"))
+    rows = []
+    for d in ders:
+        rec = _m(recs.get(d.get("id")))
+        cols = _m(d.get("columns"))
+        uses, ign = _m(cols.get("uses")), _m(cols.get("ignores"))
+        ins = []
+        for rel in _l(d.get("inputs")):
+            st, swhy = _state(run_dir, str(rel), _m(rec.get("inputs")).get(rel))
+            ins.append({"path": str(rel), "state": st, "why": swhy, "uses": [str(c) for c in _l(uses.get(rel))],
+                        "ignores": [{"column": str(c), "reason": _short(r)} for c, r in _m(ign.get(rel)).items()]})
+        outs = []
+        for rel in _l(d.get("outputs")):
+            st, swhy = _state(run_dir, str(rel), _m(rec.get("outputs")).get(rel))
+            header = None
+            if st in ("match", "changed") and str(rel).endswith(".csv"):
+                header, _, hwhy = _rows(run_dir, str(rel))
+            outs.append({"path": str(rel), "state": st, "why": swhy, "columns": header or []})
+        script = d.get("script")
+        s_state, s_why = _state(run_dir, str(script), _m(rec.get("script")).get("sha256")) if script else ("missing", None)
+        rows.append({"id": d.get("id"), "script": script, "script_state": s_state, "script_why": s_why,
+                     "inputs": ins, "outputs": outs,
+                     "record": na(rwhy) if rwhy else na(f"{RC.DERIV_RECORD} has no entry {d.get('id')}") if not rec
+                     else {"available": True, "ok": rec.get("ok"), "runs": rec.get("runs"),
+                           "runtime_s": rec.get("runtime_s"), "python": rec.get("python"),
+                           "sandbox": _m(rec.get("sandbox")).get("kind"), "libraries": _m(rec.get("libraries")),
+                           "reason": rec.get("reason")}})
+    return {"available": True, "file": DERIVATIONS, "rows": rows,
+            "ignored_inputs": [{"path": str(k), "reason": _short(v)} for k, v in ignored.items()]}
+
+
+def _input_checks(run_dir: str) -> dict:
+    doc, why = _mapping(run_dir, INPUT_CHECKS)
+    if why:
+        return na(why)
+    return {"available": True, "file": INPUT_CHECKS, "status": doc.get("status"), "reason": doc.get("reason"),
+            "counts": {str(k): v for k, v in _m(doc.get("counts")).items()},
+            "checks": {str(k): _short(v) for k, v in _m(doc.get("checks")).items()},
+            "findings": [{"id": f.get("id"), "code": f.get("code"), "severity": f.get("severity"),
+                          "units": _l(f.get("units")), "claim": f.get("claim"),
+                          "accepted": f.get("accepted")} for f in _l(doc.get("findings")) if isinstance(f, dict)],
+            "acceptance_problems": [_short(p) for p in _l(doc.get("acceptance_problems"))]}
 
 
 def evidence_tab(run_dir: str) -> dict:
-    raise NotImplementedError("β")
+    spec, _ = _mapping(run_dir, RC.SPEC)
+    flat = _flatten(spec, "", {}) if isinstance(spec, dict) else {}
+    cit = _citations(run_dir)
+    by_id = {c["id"]: c for c in cit.get("entries") or []}
+    reg = _registry(run_dir, by_id)
+    params = _param_registries(run_dir, flat, by_id)
+    for c in by_id.values():
+        c["cited_by"] = sorted({e["name"] for r in params for e in r.get("entries") or []
+                                if c["id"] in _cited_ids(e.get("source"))} |
+                               {str(e["id"]) for e in reg.get("entries") or [] if str(e.get("citation")) == c["id"]})
+    dd, dwhy = _mapping(run_dir, DERIVATIONS)
+    ders = [d for d in _l(_m(dd).get("derivations")) if isinstance(d, dict)]
+    ignored = {str(k): _short(v) for k, v in _m(_m(dd).get("ignored_inputs")).items()}
+    return {"registry": reg, "param_registries": params, "citations": cit,
+            "inputs": _inputs(run_dir, ders, ignored), "derivations": _derivations(run_dir, ders, ignored, dwhy),
+            "input_checks": _input_checks(run_dir)}
+
+
+# ------------------------------------------------------------------ Engine
+def _choice(run_dir: str) -> dict:
+    doc, why = _mapping(run_dir, CHOICE)
+    if why:
+        return na(why)
+    return {"available": True, "file": CHOICE, "at": doc.get("at"), "chosen": _m(doc.get("engine")).get("ref"),
+            "why": doc.get("why"),
+            "candidates": [{"ref": c.get("ref"), "name": c.get("name"), "version": c.get("version"),
+                            "eligible": c.get("eligible"), "why_not": [_short(x) for x in _l(c.get("why_not"))],
+                            "mechanisms": len(_l(c.get("mechanisms"))), "benchmarks": c.get("benchmarks")}
+                           for c in _l(doc.get("candidates")) if isinstance(c, dict)]}
+
+
+def _attr_binding(name: str, spec: dict) -> str:
+    du, cal = _m(spec.get("decision_units")), _m(spec.get("calibration"))
+    ea, da = _m(du.get("engine_attributes")), _m(du.get("defaults_accepted"))
+    if name in ea:
+        b = _binding_of(ea[name])
+        return f"{b['how']} {b['detail']}" + (f" (source {b['source']})" if b.get("source") else "")
+    if name in da:
+        return f"default accepted: {_short(da[name])}"
+    if cal.get("attribute") == name:
+        return f"calibrated ({cal.get('method')})"
+    return "not bound (the engine's default)"
+
+
+def _restamp(eng: dict, repo: str) -> dict:
+    keys = [(k, m.group(1)) for k in _m(eng.get("inputs")) for m in [_RESULTS_KEY.match(str(k))] if m]
+    if not keys:
+        return na(f"{ENGINE_YAML} records no engine benchmark results file in its inputs")
+    key, name = keys[0]
+    want, rel = eng["inputs"][key], f"toolkit/engines/{name}/benchmarks/results.yaml"
+    try:
+        data, _ = safe_io.read_nofollow(os.path.realpath(repo), rel, RC._MAX_READ)
+    except FileNotFoundError:
+        return na(f"this checkout has no {rel}")
+    except (OSError, ValueError) as e:
+        return na(f"{rel} in this checkout: not read ({e})")
+    sha = hashlib.sha256(data).hexdigest()
+    if sha != want:
+        return na(f"this checkout's {rel} differs from the one the run used (sha256 {sha[:12]} here, "
+                  f"{str(want)[:12]} in the run): its re-stamp status is not shown")
+    try:
+        doc = yaml.load(data.decode("utf-8"), Loader=RC._LOADER) or {}
+    except (UnicodeDecodeError, yaml.YAMLError) as e:
+        return na(f"{rel}: {type(e).__name__}")
+    ident = _m(doc.get("engine_identity"))
+    rs = doc.get("restamped")
+    base = {"available": True, "file": rel, "sha256": sha, "new_version": ident.get("version") or doc.get("engine_version"),
+            "code_sha256": ident.get("code_sha256")}
+    if not isinstance(rs, dict):
+        return {**base, "state": "recomputed", "by": doc.get("producer"), "validate_once": "not needed"}
+    conf = _m(rs.get("confirmation"))
+    return {**base, "state": "proof" if "not recomputed" in str(rs.get("by") or "") else "restamped",
+            "by": rs.get("by"), "old_version": rs.get("old_engine_version"), "proof_identical": rs.get("proof_identical"),
+            "validate_once": conf.get("validate_once") or "not recorded", "evidence": conf.get("evidence"),
+            "note": rs.get("note")}
 
 
 def engine_tab(run_dir: str, repo: str = REPO) -> dict:
-    raise NotImplementedError("β")
+    spec, _ = _mapping(run_dir, RC.SPEC)
+    spec = spec if isinstance(spec, dict) else {}
+    eng, why = _mapping(run_dir, ENGINE_YAML)
+    data = _m(_m(eng).get("data"))
+    card = data.get("card")
+    if why is None and not isinstance(card, dict):
+        why = f"{ENGINE_YAML}: no data.card"
+    out = {"choice": _choice(run_dir)}
+    if why:
+        out.update(card=na(why), parameters=na(why), benchmarks=na(why), restamp=na(why))
+    else:
+        valid = _m(card.get("valid_ranges"))
+        out["card"] = {
+            "available": True, "file": ENGINE_YAML, "name": card.get("name"), "version": card.get("version"),
+            "mechanisms": [_short(m) for m in _l(card.get("mechanisms"))],
+            "components": [{"name": str(k), "levels": _l(v)} for k, v in _m(card.get("components")).items()],
+            "attributes": [{"name": str(k), "desc": _short(v), "range": valid.get(k), "binding": _attr_binding(str(k), spec)}
+                           for k, v in _m(card.get("unit_attributes")).items()],
+            "outputs": {str(k): _l(v) for k, v in _m(card.get("outputs")).items()},
+            "age_groups": _l(card.get("age_groups")), "notes": [_short(n) for n in _l(card.get("notes"))]}
+        fitted = _m(card.get("fitted"))
+        out["parameters"] = {"available": True, "file": ENGINE_YAML, "rows": [
+            {"name": p.get("name"), "kind": p.get("kind"), "value": p.get("value"), "units": p.get("units"),
+             "lo": p.get("lo"), "hi": p.get("hi"), "box": _m(fitted.get(p.get("name"))).get("box"),
+             "fitted_to": _l(_m(fitted.get(p.get("name"))).get("benchmarks")), "verified": p.get("verified"),
+             "source": p.get("source")} for p in _l(data.get("parameters")) if isinstance(p, dict)]}
+        rows = [{"id": b.get("id"), "metric": b.get("metric"), "role": b.get("role"), "target": b.get("target"),
+                 "band": b.get("band"), "computed": b.get("computed"), "status": b.get("status"),
+                 "in_band": b.get("in_band"), "source": b.get("source"),
+                 "flag": b.get("status") != "in_band"} for b in _l(card.get("benchmarks")) if isinstance(b, dict)]
+        out["benchmarks"] = {"available": True, "file": ENGINE_YAML, "rows": rows, "total": len(rows),
+                             "in_band": sum(r["status"] == "in_band" for r in rows),
+                             "out_of_band": sum(r["status"] == "out_of_band" for r in rows),
+                             "held_out": sum(r["role"] == "held_out" for r in rows),
+                             "held_out_in_band": sum(r["role"] == "held_out" and r["status"] == "in_band" for r in rows)}
+        out["restamp"] = _restamp(eng, repo)
+    e = _m(_m(eng).get("engine"))
+    fps = []
+    for rel in _walk(run_dir, "analysis", 4):
+        if rel.endswith(".summary.json"):
+            s, _ = _mapping(run_dir, rel)
+            if s and s.get("code_fp") and s["code_fp"] not in fps:
+                fps.append(str(s["code_fp"]))
+    rs = out.get("restamp") or {}
+    out["identity"] = na(why) if why and not fps else {
+        "available": True, "name": e.get("name"), "version": e.get("version"), "card_sha256": e.get("card_sha256"),
+        "engine_choice_sha256": _m(eng).get("engine_choice_sha256"), "code_fp": fps,
+        "code_sha256": rs.get("code_sha256") if rs.get("available") else None}
+    return out
 
 
+# ------------------------------------------------------------------ Calibration
 def calibration_tab(run_dir: str) -> dict:
-    raise NotImplementedError("β")
+    spec, _ = _mapping(run_dir, RC.SPEC)
+    spec = spec if isinstance(spec, dict) else {}
+    scal = _m(spec.get("calibration"))
+    settings = {k: scal.get(k) for k in ("method", "attribute", "scale", "range", "target_column", "window", "metric")}
+    doc, why = _mapping(run_dir, CALIBRATION)
+    data = _m(_m(doc).get("data"))
+    if why:
+        return {**na(why), "settings": settings}
+    du = _m(spec.get("decision_units"))
+    idc, regc, tcol = du.get("id"), du.get("region"), scal.get("target_column")
+    table, twhy = {}, None
+    if isinstance(du.get("csv"), str):
+        header, rows, twhy = _rows(run_dir, du["csv"])
+        table = {str(r.get(idc)): r for r in rows or []}
+    units = []
+    for uid, u in _m(data.get("units")).items():
+        u, r = _m(u), table.get(str(uid)) or {}
+        try:
+            target = float(r.get(tcol)) if tcol and r.get(tcol) not in (None, "") else None
+        except ValueError:
+            target = None
+        units.append({"id": str(uid), "region": r.get(regc), "target": target, "z": u.get("z"),
+                      "slope": u.get("slope"), "clamped": bool(u.get("clamped"))})
+    regions: dict = {}
+    for u in units:
+        g = regions.setdefault(str(u["region"]), {"region": str(u["region"]), "n": 0, "targets": [], "z": [],
+                                                  "clamped": 0, "slope_min": None})
+        g["n"] += 1
+        g["clamped"] += u["clamped"]
+        if u["target"] is not None:
+            g["targets"].append(u["target"])
+        if _num(u["z"]) is not None:
+            g["z"].append(u["z"])
+        if _num(u["slope"]) is not None:
+            g["slope_min"] = u["slope"] if g["slope_min"] is None else min(g["slope_min"], u["slope"])
+    reg_rows = [{"region": g["region"], "n": g["n"], "clamped": g["clamped"], "slope_min": g["slope_min"],
+                 "target_mean": sum(g["targets"]) / len(g["targets"]) if g["targets"] else None,
+                 "z_min": min(g["z"]) if g["z"] else None, "z_max": max(g["z"]) if g["z"] else None}
+                for g in sorted(regions.values(), key=lambda g: g["region"])]
+    diag = _m(data.get("diagnostics"))
+    res = diag.get("target_logit_residual_max")
+    em, ewhy = _mapping(run_dir, EMULATOR)
+    acc = _m(_m(_m(em).get("data")).get("accuracy"))
+    return {"available": True, "file": CALIBRATION, "settings": settings, "method": data.get("method"),
+            "target_uncertainty": {k: _short(v) for k, v in _m(scal.get("target_uncertainty")).items()},
+            "units": units, "regions": reg_rows, "join_why": twhy,
+            "model_per_unit": ("not stored: analysis/calibration.yaml keeps each unit's calibrated value (z), slope and "
+                               "clamp, not the model's value at the fitted point"
+                               + (f"; the inversion's largest residual is {res:.2g} on the logit scale"
+                                  if _num(res) is not None else "")),
+            "diagnostics": {str(k): v for k, v in diag.items()},
+            "identifiability": {str(k): v for k, v in _m(data.get("identifiability")).items()},
+            "emulator": na(ewhy) if ewhy else {
+                "available": True, "file": EMULATOR, **{k: acc.get(k) for k in (
+                    "holdout_points", "training_points", "cal_logit_rmse", "reduction_r2_median", "reduction_r2_p10",
+                    "reduction_mae_median", "base_log_rmse")},
+                "error_model": {str(k): v for k, v in _m(acc.get("error_model")).items()},
+                "features": _l(_m(_m(em).get("data")).get("features")),
+                "fit_seconds": _m(_m(em).get("data")).get("fit_seconds")}}
 
 
 def dossier(run_dir: str, repo: str = REPO) -> dict:
@@ -122,7 +825,7 @@ def _toy_spec(horizon_stop: float = 2028.0, tests=("DT1", "DT2"), note_hostile: 
         "comparator": {"package": "none", "text": "no programme in the window"},
         "calibration": {"method": "emulator_inversion", "attribute": "m0", "scale": "log", "range": [-1.0, 2.0],
                         "target_column": "target", "window": [2021.0, 2022.0], "metric": "prev",
-                        "target_uncertainty": {"region_sd_logit": 0.15, "note": "toy common-mode error"},
+                        "target_uncertainty": {"region_sd_logit": 0.15, "note": "toy common-mode error" + note_hostile},
                         "target_frame": {"band": "prev", "source": "toy survey frame"}},
         "uncertainty": {"level": 0.95, "draws": 8, "seed": 1,
                         "sources": [{"kind": "priors"}, {"kind": "costs", "items": {"c_all": [0.8, 1.2]}}],
@@ -517,13 +1220,13 @@ def _self_test() -> int:
                 "() => '' : k === 'forEach' ? () => {} : k === 'search' ? '' : k === 'content' ? 'tok' : P, "
                 "set: () => true, apply: () => P };\nconst P = new Proxy(function () {}, _h);\n"
                 "globalThis.document = P; globalThis.window = P; globalThis.location = { search: '' };\n"
-                "globalThis.matchMedia = () => ({ matches: false }); globalThis.setInterval = () => 0;\n"
+                "globalThis.matchMedia = () => ({ matches: false }); globalThis.setInterval = () => 0; globalThis.setTimeout = () => 0;\n"
                 "globalThis.fetch = () => new Promise(() => {});\n")
             js = open(os.path.join(HERE, "run_console.js"), encoding="utf-8").read() + "\n" + src
             test = (f"\nS.meta = {{ glossary: {json.dumps({k: {'text': v[0], 'source': v[1]} for k, v in RC.GLOSSARY.items()})} }};\n"
                     f"const D = {json.dumps(dd, default=str)};\n"
                     "const out = {}; for (const t of ['spec', 'evidence', 'engine', 'calibration']) out[t] = dossierHTML(t, D[t]);\n"
-                    "process.stdout.write(JSON.stringify(out));\n")
+                    "process.stdout.write(JSON.stringify(out)); process.exit(0);\n")
             p = subprocess.run([node, "-e", stub + js + test], capture_output=True, text=True, timeout=60)
             try:
                 html = json.loads(p.stdout)

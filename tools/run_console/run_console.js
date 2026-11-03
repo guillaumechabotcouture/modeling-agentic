@@ -276,9 +276,10 @@ function renderStepper() {
   document.querySelectorAll(".st").forEach((el) => (el.onclick = () => { S.filter = S.filter === el.dataset.s ? null : el.dataset.s; renderStepper(); renderStream(); }));
   if ($("nofilter")) $("nofilter").onclick = () => { S.filter = null; renderStepper(); renderStream(); };
 }
-$("v-stream").onclick = () => setView("stream");
-$("v-figs").onclick = () => setView("figs");
-function setView(v) { S.view = v; S.cmp = null; $("v-stream").classList.toggle("on", v === "stream"); $("v-figs").classList.toggle("on", v === "figs"); renderStream(); renderRuns(); $("streambox").scrollTop = 0; }
+// Stream and Figures narrate the run; Spec, Evidence, Engine and Calibration (dossier.js) show what it is made of.
+const VIEWS = ["stream", "figs", "spec", "evidence", "engine", "calibration"];
+VIEWS.forEach((v) => { if ($("v-" + v)) $("v-" + v).onclick = () => setView(v); });
+function setView(v) { S.view = v; S.cmp = null; VIEWS.forEach((x) => { if ($("v-" + x)) $("v-" + x).classList.toggle("on", x === v); }); renderStream(); renderRuns(); $("streambox").scrollTop = 0; }
 function renderFigures() {
   const figs = S.run.cards.filter((c) => c.kind === "figure"), sp = S.run.stepper || { stages: [] };
   $("v-figs").textContent = figs.length ? `Figures (${figs.length})` : "Figures";
@@ -316,6 +317,7 @@ async function renderCompare() {
 function renderStream() {
   if (S.cmp) return renderCompare();
   if (S.view === "figs") { $("stream").innerHTML = renderFigures(); wire($("stream")); return; }
+  if (S.view !== "stream" && typeof renderDossier === "function") { renderFigures(); return renderDossier(); }
   renderFigures();
   const box = $("streambox"), atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
   const cards = S.run.cards.filter((c) => !S.filter || c.stage === S.filter), items = [], seen = {};

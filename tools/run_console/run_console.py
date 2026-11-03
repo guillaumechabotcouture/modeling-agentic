@@ -43,9 +43,12 @@ import yaml
 # would invalidate every stored engine batch (review item 17). The console imports the harness by path.
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
-for _p in (REPO, os.path.join(REPO, "scripts"), os.path.join(REPO, "agents")):
+for _p in (REPO, os.path.join(REPO, "scripts"), os.path.join(REPO, "agents"), HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
+# dossier.py (the Spec, Evidence, Engine and Calibration tabs) imports this module by name; when the console runs as a
+# script, that name must be this module, not a second copy.
+sys.modules.setdefault("run_console", sys.modules[__name__])
 from lib.safe_io import LinkRefused, dir_fd_nofollow, read_nofollow  # noqa: E402
 from lib.safe_io import write_nofollow as _safe_write  # noqa: E402
 
@@ -995,6 +998,47 @@ GLOSSARY = {   # term -> (definition, where it is defined). The page marks only 
                    "comparator).", "toolkit/spec/schema.py"),
     "allocatable": ("The envelope minus the spec's fixed costs: what the optimiser may assign to packages.",
                     "analysis/point.yaml budget_allocatable; decision_spec.yaml constraints"),
+    # the run dossier (tools/run_console/dossier.py)
+    "emulator": ("A Gaussian-process surrogate fitted to engine runs at sampled points. The analysis predicts each "
+                 "unit's outcomes and costs from it instead of running the engine for every unit and package.",
+                 "toolkit/analysis/model.py (EmulatorModel)"),
+    "emulator inversion": ("Per unit, the calibrated attribute that reproduces the unit's target on the emulator's "
+                           "calibration metric (logit scale), on a grid over calibration.range. A target outside "
+                           "the grid's range is clamped.", "toolkit/analysis/calibration.py"),
+    "clamped": ("The unit's target lies outside what the calibration range can reach, so its attribute was set to "
+                "the range's end.", "toolkit/analysis/calibration.py"),
+    "slope": ("The local slope of the calibration metric in the attribute at the fitted point. A slope near zero "
+              "means the target does not pin the attribute down.", "toolkit/analysis/calibration.py"),
+    "identifiability": ("Whether the targets pin down what is calibrated. For emulator inversion: one attribute per "
+                        "target, judged by the slope (flat_slope_threshold).", "toolkit/analysis/calibration.py"),
+    "held out": ("A benchmark the calibration and the fitted parameters did not use: a check, not a fit.",
+                 "toolkit/engines/benchmark.py"),
+    "fitted": ("Fitted once to the named benchmarks, within its fit box; not refitted per run.",
+               "toolkit/engines/benchmark.py (fit_rule); the card's fitted block"),
+    "prior range": ("The range the engine card records for a parameter (lo to hi), from the source it cites.",
+                    "analysis/engine.yaml data.parameters (the engine card)"),
+    "price rule": ("How a cost is brought to the base year: as_published (no change), index (the spec's price "
+                   "index, base year over price year), local_index (through the local currency).",
+                   "toolkit/alloc/costs.py (_factor)"),
+    "cost basis": ("What a cost item is charged on: per person, per eligible person, per person reached, per "
+                   "commodity (people per commodity), fixed, or per outcome (a model output).",
+                   "toolkit/alloc/costs.py (item_cost)"),
+    "per person": ("The base-year value times share, times per year and years, divided by people per commodity "
+                   "for a commodity: the cost of covering one person over the window.",
+                   "toolkit/alloc/costs.py (item_cost)"),
+    "re-stamped by proof": ("The benchmark numbers were computed by the previous engine version. A byte-identity "
+                            "proof showed the new code gives identical outputs on the same inputs, so the file's "
+                            "identity was updated without recomputing.",
+                            "toolkit/engines/<engine>/benchmarks/restamp_proof.py"),
+    "validate_once": ("A full run of the benchmark pack on Coiled that confirms a re-stamp. Pending until it has "
+                      "run.", "toolkit/engines/<engine>/benchmarks/validate_once.sh"),
+    "binding": ("How the spec gives the engine a unit attribute: a column of the units table, several columns, or "
+                "one value for every unit, with its source.", "decision_spec.yaml decision_units.engine_attributes"),
+    "defaults accepted": ("Engine defaults the spec accepts by name, each with a reason, for attributes the staged "
+                          "inputs do not give.", "decision_spec.yaml decision_units.defaults_accepted"),
+    "code fingerprint": ("A hash of what a stored engine batch depends on besides its parameters: the run's models/ "
+                         "and data/ files and the repo's scripts/ and toolkit/. Stored results are reused only under "
+                         "the same fingerprint.", "scripts/compute.py (code_fingerprint)"),
 }
 GATE_ACTIONS = ("ACCEPT", "PATCH_OR_RETHINK", "DECLARE_SCOPE", "RETHINK_STRUCTURAL", "RUN_FAILED", "AWAIT_OWNER")
 
@@ -2071,6 +2115,7 @@ class CloudPanel:
 
 # ------------------------------------------------------------------ the server
 JS = os.path.join(os.path.dirname(HTML), "run_console.js")
+DOSSIER_JS = os.path.join(os.path.dirname(HTML), "dossier.js")
 # The page loads its one script from this server; artifact text can never run as script. Inline style attributes
 # remain (style-src 'unsafe-inline'); nothing else is allowed.
 PAGE_CSP = ("default-src 'none'; script-src 'self'; connect-src 'self'; img-src 'self'; style-src 'self' "
@@ -2220,8 +2265,8 @@ class Console:
         if method == "GET" and path == "/":
             with open(HTML, encoding="utf-8") as f:
                 return 200, "text/html; charset=utf-8", f.read().replace("__CONSOLE_TOKEN__", self.token).encode()
-        if method == "GET" and path == "/run_console.js":
-            with open(JS, "rb") as f:
+        if method == "GET" and path in ("/run_console.js", "/dossier.js"):
+            with open(JS if path == "/run_console.js" else DOSSIER_JS, "rb") as f:
                 return 200, "text/javascript; charset=utf-8", f.read()
         if method == "GET" and path == "/api/runs":
             runs = self.runs()
@@ -2247,6 +2292,9 @@ class Console:
         rd, mirror = self.run_dir(q.get("run") or body.get("run") or "")
         if method == "GET" and path == "/api/run":
             return 200, "json", {**self._with_tickets(read_run(rd, self.cap), rd), "mirror": mirror}
+        if method == "GET" and path == "/api/dossier":
+            import dossier as _dossier            # the run dossier (docs/design/v2-run-console.md §15)
+            return 200, "json", _dossier.dossier(rd)
         if method == "GET" and path == "/api/file":
             rel = q.get("path") or ""
             data = read_file_bytes(rd, rel)
@@ -2978,9 +3026,10 @@ def _self_test() -> int:
 def _page_sources() -> str:
     """The page and every script it loads, as text (the self-test reads the page's code)."""
     out = [open(HTML, encoding="utf-8").read()]
-    js = os.path.join(os.path.dirname(HTML), "run_console.js")
-    if os.path.exists(js):
-        out.append(open(js, encoding="utf-8").read())
+    for name in ("run_console.js", "dossier.js"):
+        js = os.path.join(os.path.dirname(HTML), name)
+        if os.path.exists(js):
+            out.append(open(js, encoding="utf-8").read())
     return "\n".join(out)
 
 
