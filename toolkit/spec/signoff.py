@@ -167,7 +167,7 @@ def sheet(run_dir: str, candidates: list | None = None) -> str:
                                      + ", ".join(f"`{o}`" for o in d["outputs"]) for d in ders]
     out += [f"- declaration problem: {e}" for e in errs] + [""]
     from toolkit.spec import engine_parameters as PV
-    out += PV.sheet_lines(raw)          # each spec value, the card value it replaces, and a HIGH note when outside
+    out += PV.sheet_lines(raw, candidates, run_dir)     # each spec value, the card value it replaces, HIGH when outside
     if candidates:
         out.append("## Candidate engines (pre-sign check)")
         for r in candidates:

@@ -173,7 +173,8 @@ def _format_interval(lo: str, hi: str, lo_num: float, hi_num: float) -> str:
 
 
 _SOURCE_ID_RE = re.compile(r"[a-z][a-z_]{0,40}")
-_PARAM_ID_RE = re.compile(r"[a-z][a-z0-9_]{0,40}")
+# engine parameter names as the engine contract allows them (e.g. `efficacy:vax`, `lrr:a+b`): no spaces or free text
+_PARAM_ID_RE = re.compile(r"[A-Za-z][A-Za-z0-9_:+.\-]{0,63}")
 INTERVAL_KEYS = {"level", "covers", "excludes", "prior_dominated", "spec_fixed", "fixed", "fixed_other"}
 
 
@@ -188,7 +189,7 @@ def interval_meta_problem(meta) -> str | None:
     for k in ("prior_dominated", "spec_fixed", "fixed"):
         v = meta.get(k, [])
         if not isinstance(v, list) or not all(isinstance(x, str) and _PARAM_ID_RE.fullmatch(x) for x in v):
-            return f"interval.{k} must be a list of parameter identifiers ([a-z0-9_])"
+            return f"interval.{k} must be a list of parameter identifiers (a letter, then [A-Za-z0-9_:+.-])"
     fo = meta.get("fixed_other", 0)
     if isinstance(fo, bool) or not isinstance(fo, int) or fo < 0:
         return "interval.fixed_other must be a count"

@@ -604,11 +604,14 @@ def fig_parameters(R, t):
                "units": p.get("units") or "", "dist": d.get("dist") or "", "drawn": bool(d),
                "source": textwrap.shorten(str((s or {}).get("source") or d.get("source") or p.get("source") or ""), 90,
                                           placeholder="…")}
-        if s is not None:      # the shown range spans the spec value and the card value it replaces
+        if s is not None:      # the shown range spans the card's range, the draw range, the spec and card values
             card = _num_or_none(s.get("card_value"))
-            ends = [x for x in (lo, hi, val, card) if x is not None]
+            cr = s.get("card_range") or [None, None]
+            clo, chi = _num_or_none(cr[0]), _num_or_none(cr[1])
+            dlo, dhi = (lo, hi) if d.get("range") else (None, None)
+            ends = [x for x in (clo, chi, dlo, dhi, val, card) if x is not None]
             row.update(lo=min(ends) if ends else None, hi=max(ends) if ends else None, card_value=card,
-                       card_lo=lo, card_hi=hi)
+                       card_lo=clo, card_hi=chi, **({"draw_lo": dlo, "draw_hi": dhi} if dlo is not None else {}))
         rows.append(row)
     ranged = [r for r in rows if r["lo"] is not None and r["hi"] is not None and r["hi"] > r["lo"] and
               r["value"] is not None]
@@ -632,6 +635,9 @@ def fig_parameters(R, t):
         if r["kind"] == "spec value" and r.get("card_lo") is not None and r.get("card_hi") is not None:
             ax.plot([(r["card_lo"] - r["lo"]) / (r["hi"] - r["lo"]), (r["card_hi"] - r["lo"]) / (r["hi"] - r["lo"])],
                     [y, y], color=t["ink2"], lw=1.2, solid_capstyle="butt", zorder=2)        # the card's own range
+        if r["kind"] == "spec value" and r.get("draw_lo") is not None and r.get("draw_hi") is not None:
+            ax.plot([(r["draw_lo"] - r["lo"]) / (r["hi"] - r["lo"]), (r["draw_hi"] - r["lo"]) / (r["hi"] - r["lo"])],
+                    [y, y], color=col[r["kind"]], lw=3, alpha=0.45, solid_capstyle="butt", zorder=2)   # its draw range
         if r["kind"] == "spec value" and r.get("card_value") is not None:
             ax.scatter([(r["card_value"] - r["lo"]) / (r["hi"] - r["lo"])], [y], s=34, marker="o", facecolors="none",
                        edgecolors=col[r["kind"]], linewidths=1.2, zorder=3)                 # the card value replaced
@@ -655,8 +661,9 @@ def fig_parameters(R, t):
              + f"); {edge} at a range edge")
     cap = (f"Each parameter's value within its range (fitted: engine fit; prior: drawn from the spec's prior; "
            f"calibrated: the run's calibration"
-           + ("; spec value: set by the signed spec, with the engine card value it replaces as an open circle and the "
-              "card's own range as a thin line" if "spec value" in present else "")
+           + ("; spec value: set by the signed spec, with the engine card value it replaces as an open circle, the "
+              "card's own range as a thin line and, when it is drawn, its own uncertainty range as a coloured band"
+              if "spec value" in present else "")
            + f"). {len(rows) - len(ranged)} parameters without a range are fixed "
            f"values (table view lists all with their sources).")
     return fig, title, cap, rows, "parameters: priors, fitted and calibrated values with their ranges"

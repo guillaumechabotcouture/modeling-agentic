@@ -2,6 +2,8 @@
 """Engine parameter values declared by the signed spec (owner decision, 2026-11-02).
 
     python3 toolkit/spec/engine_parameters.py --self-test
+    python3 toolkit/spec/engine_parameters.py benchmarks <pack.yaml> <decision_spec.yaml> [--only ids]
+                                          # the pack's arms at the spec values, beside the spec
 
 A spec may set the point value of an engine parameter for its run. The value is a scenario
 choice the owner signs, not an engine change and not a fit:
@@ -39,6 +41,11 @@ replaced); without, it is held fixed at the spec value (the card prior is not dr
 interval label says "held fixed at the spec value". On the emulator path, a held parameter that a
 `parameter_value` decision test varies is an emulator input over the box spanning the spec value
 and the tested values, so the test runs; the draws keep it at the spec value.
+
+An interaction_rescale decision test reads its arm ratios from benchmark results computed at the spec
+values (`benchmarks_at_spec_values.yaml` beside the spec, written by the `benchmarks` command with the
+benchmark runner's provenance and `spec_parameters`); results computed at the card values are refused and
+the test is not run, so the rescaling is never derived at one set of parameters and applied at another.
 
 A spec without the field is unchanged: same parameter sets, same batch jobs, same job hashes.
 Nothing here names a disease, a place or an intervention.
@@ -146,6 +153,18 @@ def card_range(engine, name):
     return [float(pr.lo), float(pr.hi)] if pr else None
 
 
+def _outside(v, rg, cr):
+    """Which side of a spec value leaves the card's range: "value", "range" (the value is inside, its uncertainty range
+    is not) or None."""
+    if cr is None:
+        return None
+    if not cr[0] <= v <= cr[1]:
+        return "value"
+    if rg is not None and (rg[0] < cr[0] or rg[1] > cr[1]):
+        return "range"
+    return None
+
+
 def problems(spec, engine) -> list[str]:
     """Every problem with the field on this engine (empty: valid)."""
     bad = shape_problems(spec)
@@ -171,19 +190,20 @@ def problems(spec, engine) -> list[str]:
             continue
         v, rg, cr = float(e["value"]), _range(e), card_range(engine, n)
         flag = e.get("outside_card_range") is True
-        pts = [v] + (rg or [])
-        outside = cr is not None and any(x < cr[0] or x > cr[1] for x in pts)
-        what = "value" + (" or its range" if rg else "")
+        side = _outside(v, rg, cr)
+        then = ("; set outside_card_range: true with the reason (it is then a HIGH note on the sign-off sheet, in "
+                "results.md and in the report)")
         if cr is None:
             if flag:
                 bad.append(f"{w}: outside_card_range is set but the engine card gives no range for {n}")
-        elif outside and not flag:
-            bad.append(f"{w}: the {what} ({v:g}{f', range [{rg[0]:g}, {rg[1]:g}]' if rg else ''}) is outside the "
-                       f"engine card's range [{cr[0]:g}, {cr[1]:g}]; set outside_card_range: true with the reason (it is "
-                       "then a HIGH note on the sign-off sheet, in results.md and in the report)")
-        elif flag and not outside:
-            bad.append(f"{w}: outside_card_range is true but the {what} lies inside the card's range "
-                       f"[{cr[0]:g}, {cr[1]:g}]")
+        elif side == "value" and not flag:
+            bad.append(f"{w}: the value {v:g} is outside the engine card's range [{cr[0]:g}, {cr[1]:g}]{then}")
+        elif side == "range" and not flag:
+            bad.append(f"{w}: the uncertainty range [{rg[0]:g}, {rg[1]:g}] reaches outside the engine card's range "
+                       f"[{cr[0]:g}, {cr[1]:g}] (the value {v:g} is inside){then}")
+        elif flag and side is None:
+            bad.append(f"{w}: outside_card_range is true but the value{' and its range lie' if rg else ' lies'} inside "
+                       f"the card's range [{cr[0]:g}, {cr[1]:g}]")
     return bad
 
 
@@ -197,17 +217,28 @@ def held_fixed(spec) -> dict:
     return {n: v for n, v in values(spec).items() if declared(spec)[n].get("range") is None}
 
 
+def held(spec) -> dict:
+    """{parameter: spec value} for every spec value the effective draw plan does not vary: no range, or a range whose
+    prior the spec excludes (by name or kind). Without an engine to read the plan from: the entries without a range."""
+    vals = values(spec)
+    if not vals or not hasattr(spec, "engine"):
+        return held_fixed(spec)
+    from toolkit.spec import priors as PRI
+    dr = PRI.drawn(spec)
+    return {n: v for n, v in vals.items() if n not in dr}
+
+
 def tested_boxes(spec) -> dict:
     """{parameter: [lo, hi]} for each held spec value that a parameter_value decision test varies: the box spans the
     spec value and the tested values (the emulator design input; the draws keep the spec value)."""
-    held = held_fixed(spec)
+    hv = held(spec)
     out = {}
     for dt in ((_raw(spec).get("analysis") or {}).get("decision_tests") or []):
-        if not isinstance(dt, dict) or dt.get("type") != "parameter_value" or dt.get("parameter") not in held:
+        if not isinstance(dt, dict) or dt.get("type") != "parameter_value" or dt.get("parameter") not in hv:
             continue
         vs = [float(x) for x in dt.get("values") or [] if _isnum(x)]
         if vs:
-            lo, hi = out.get(dt["parameter"], [held[dt["parameter"]]] * 2)
+            lo, hi = out.get(dt["parameter"], [hv[dt["parameter"]]] * 2)
             out[dt["parameter"]] = [min(lo, *vs), max(hi, *vs)]
     return {k: v for k, v in sorted(out.items()) if v[0] < v[1]}
 
@@ -220,9 +251,50 @@ def params(spec, theta=None) -> dict:
     return out
 
 
+# ---- benchmark arms at the spec values (an interaction_rescale decision test reads its arm ratios from them)
+SPEC_BENCH = "benchmarks_at_spec_values.yaml"
+
+
+def spec_benchmarks(pack: dict, engine, spec, fitted: dict | None = None, workers: int = 1, seeds=None) -> dict:
+    """The engine's benchmark pack run with the spec values applied over every arm (as the engine's fitted values are),
+    stamped by the benchmark runner with its provenance and `spec_parameters`. Written beside the spec as SPEC_BENCH."""
+    from toolkit.engines import benchmark as BM
+    vals = values(spec)
+    out = BM.run_pack(pack, engine, BM.Runner(pack, engine, workers, seeds), dict(fitted or {}, **vals))
+    return BM.stamp(dict(out, spec_parameters=vals), engine)
+
+
+def verified_spec_benchmarks(engine, spec) -> tuple[list, str | None]:
+    """(benchmark rows, None) when SPEC_BENCH beside the spec was written by the benchmark runner for this engine's
+    identity and configuration at exactly this spec's values; else ([], why)."""
+    import yaml
+    from toolkit.engines import benchmark as BM
+    from toolkit.engines.contract import engine_identity
+    p = os.path.join(spec.base, SPEC_BENCH)
+    how = (f"compute them with python toolkit/spec/engine_parameters.py benchmarks <pack.yaml> {os.path.basename(spec.path or 'decision_spec.yaml')}"
+           " --only <benchmark id>")
+    if not os.path.exists(p):
+        return [], f"no {SPEC_BENCH} beside the spec; {how}"
+    try:
+        doc = yaml.safe_load(open(p, encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as e:
+        return [], f"{SPEC_BENCH} unreadable: {e}"
+    if doc.get("producer") != BM.PRODUCER:
+        return [], f"{SPEC_BENCH} was not written by {BM.PRODUCER}"
+    if doc.get("engine_identity") != engine_identity(engine):
+        return [], f"{SPEC_BENCH} was computed for another engine identity or code; {how}"
+    if BM.config_digest(engine) is not None and doc.get("engine_config_sha256") != BM.config_digest(engine):
+        return [], f"{SPEC_BENCH} was computed for another engine configuration; {how}"
+    sp, vals = doc.get("spec_parameters") or {}, values(spec)
+    if set(sp) != set(vals) or any(not _isnum(sp[k]) or abs(float(sp[k]) - vals[k]) > 1e-12 * max(1.0, abs(vals[k]))
+                                   for k in vals):
+        return [], f"{SPEC_BENCH} was computed at {sp}, not at this spec's values {vals}; {how}"
+    return list(doc.get("benchmarks") or []), None
+
+
 def rows(spec, engine) -> list[dict]:
     """One row per spec value, for the engine artifact and the reports: the value, the card value it replaces and the
-    card's range, the source and reason, the outside flag and how the uncertainty draws treat it."""
+    card's range, the source and reason, the outside flag (and which side is outside) and how the draws treat it."""
     if not declared(spec):
         return []
     from toolkit.spec import priors as PRI
@@ -240,10 +312,11 @@ def rows(spec, engine) -> list[dict]:
             unc = f"{HELD} (its range is excluded from the draws)"
         else:
             unc = HELD
+        cr = card_range(engine, n)
         out.append({"name": n, "value": v, "units": str(e.get("units") or ps.units or ""), "card_value": float(ps.value),
-                    "card_kind": ps.kind, "card_range": card_range(engine, n), "card_source": ps.source,
-                    "outside_card_range": e.get("outside_card_range") is True, "source": str(e.get("source")).strip(),
-                    "reason": str(e.get("reason")).strip(), "uncertainty": unc})
+                    "card_kind": ps.kind, "card_range": cr, "card_source": ps.source, "range": rg,
+                    "outside_card_range": e.get("outside_card_range") is True, "outside": _outside(v, rg, cr),
+                    "source": str(e.get("source")).strip(), "reason": str(e.get("reason")).strip(), "uncertainty": unc})
     return out
 
 
@@ -276,9 +349,13 @@ def markdown(rws: list[dict], heading: str = HEADING, ref=None) -> list[str]:
     for r in flagged:
         u = f" {r['units']}" if r["units"] else ""
         cr = r["card_range"] or [None, None]
-        L.append(f"- **HIGH**: {r['name']} = {num(r, 'value', r['value'])}{u} is outside the engine card's range "
-                 f"({num(r, 'card_lo', cr[0])} to {num(r, 'card_hi', cr[1])}{u}). The owner signed it "
-                 "(outside_card_range: true); its reason is in the table.")
+        card = f"the engine card's range ({num(r, 'card_lo', cr[0])} to {num(r, 'card_hi', cr[1])}{u})"
+        if r.get("outside") == "range" and r.get("range"):
+            what = (f"the uncertainty range of {r['name']} ({_g(r['range'][0])} to {_g(r['range'][1])}{u}) reaches "
+                    f"outside {card}; the value itself is inside")
+        else:
+            what = f"{r['name']} = {num(r, 'value', r['value'])}{u} is outside {card}"
+        L.append(f"- **HIGH**: {what}. The owner signed it (outside_card_range: true); its reason is in the table.")
     return L + [""]
 
 
@@ -292,26 +369,50 @@ def report_block(run_dir: str) -> list[str]:
     return markdown([dict(r, name=n) for n, r in sv.items()], HEADING + " (rendered by the harness)")
 
 
-def sheet_lines(raw: dict) -> list[str]:
+def _sheet_refs(raw: dict, candidates=None, run_dir: str | None = None) -> list[tuple]:
+    """(ref, engine declaration) for every engine the spec may run: a string or {ref, config} engine; the candidates
+    of engine: auto; else the pre-sign check's candidate rows; else the harness's choice (engine_choice.json)."""
+    import json
+    eng = raw.get("engine")
+    if isinstance(eng, str) and eng != "auto":
+        return [(eng, {"ref": eng})]
+    if isinstance(eng, dict) and eng.get("ref"):
+        return [(eng["ref"], eng)]
+    cands = (eng.get("candidates") if isinstance(eng, dict) else None) or \
+        [r.get("ref") for r in candidates or [] if isinstance(r, dict) and r.get("ref")]
+    if cands:
+        return [(r, {"ref": r}) for r in cands]
+    cp = os.path.join(run_dir, "engine_choice.json") if run_dir else None
+    if cp and os.path.exists(cp):
+        try:
+            e = (json.load(open(cp)) or {}).get("engine") or {}
+            if e.get("ref"):
+                return [(e["ref"], e)]
+        except (OSError, ValueError):
+            pass
+    return []
+
+
+def sheet_lines(raw: dict, candidates=None, run_dir: str | None = None) -> list[str]:
     """The sign-off sheet's section: each value with its source and reason, the card value and range of each engine
-    the spec may run (the engine, or each candidate of engine: auto), and a HIGH note for a value outside a card's
-    range (the owner accepts it by signing)."""
+    the spec may run (_sheet_refs), and a HIGH note for a value or range outside a card's range (the owner accepts it
+    by signing). With engine: auto and no engine known yet, it says the card values are not yet known."""
     from toolkit.spec import schema
     out = ["## Engine parameter values set by the spec"]
     ents = declared(raw)
     if not ents:
         return out + ["None: the run uses the engine card's values.", ""]
-    eng = raw.get("engine")
-    if isinstance(eng, dict) and eng.get("ref"):
-        refs = [(eng["ref"], eng)]
-    else:
-        refs = [(r, {"ref": r}) for r in ((eng or {}).get("candidates") or [] if isinstance(eng, dict) else [])]
+    refs = _sheet_refs(raw, candidates, run_dir)
     engines = {}
     for ref, decl in refs:
         try:
             engines[ref] = schema.load_engine(decl)
         except Exception as e:  # noqa: BLE001 -- the sheet still shows the spec's entries
             engines[ref] = e
+    if not engines:
+        out.append("- engine: auto, and no candidate engine is known yet: the card values are shown once the pre-sign "
+                   "check lists the candidates or the harness has chosen the engine. A value outside the chosen card's "
+                   "range is refused then unless the entry sets outside_card_range.")
     high = []
     for n, e in ents.items():
         if not isinstance(e, dict):
@@ -332,11 +433,43 @@ def sheet_lines(raw: dict) -> list[str]:
             cr = card_range(en, n)
             out.append(f"  - `{ref}`: card value {_g(ps.value)}{u} ({ps.kind}; {ps.source}); card range "
                        + (f"{_g(cr[0])} to {_g(cr[1])}{u}" if cr else "none"))
-            if cr and _isnum(e.get("value")) and any(x < cr[0] or x > cr[1] for x in [float(e["value"])] + (rg or [])):
-                high.append(f"- **HIGH**: {n} = {val}{u} is outside the card range of `{ref}` ({_g(cr[0])} to "
-                            f"{_g(cr[1])}{u}; outside_card_range: {str(e.get('outside_card_range') is True).lower()}). "
-                            "Signing accepts it; its source and reason are above.")
+            side = _outside(float(e["value"]), rg, cr) if _isnum(e.get("value")) else None
+            if side:
+                what = (f"the uncertainty range of {n} ({_g(rg[0])} to {_g(rg[1])}{u}) reaches outside" if side == "range"
+                        else f"{n} = {val}{u} is outside")
+                high.append(f"- **HIGH**: {what} the card range of `{ref}` ({_g(cr[0])} to {_g(cr[1])}{u}; "
+                            f"outside_card_range: {str(e.get('outside_card_range') is True).lower()}). Signing accepts "
+                            "it; its source and reason are above.")
     return out + ([""] + high if high else []) + [""]
+
+
+def _cli(argv) -> int:
+    """benchmarks <pack.yaml> <decision_spec.yaml> [--only ids] [--workers N] [--seeds K]: the pack's arms at the spec
+    values, written beside the spec (SPEC_BENCH)."""
+    import argparse
+    import yaml
+    from toolkit.spec import schema
+    ap = argparse.ArgumentParser(prog="engine_parameters.py benchmarks")
+    ap.add_argument("pack")
+    ap.add_argument("spec")
+    ap.add_argument("--only", default=None, help="only these benchmark ids (comma-separated)")
+    ap.add_argument("--workers", type=int, default=1)
+    ap.add_argument("--seeds", type=int, default=0, help="the first K seeds of the pack (0 = all)")
+    a = ap.parse_args(argv)
+    pack = yaml.safe_load(open(a.pack))
+    if a.only:
+        keep = set(a.only.split(","))
+        pack = dict(pack, benchmarks=[b for b in pack["benchmarks"] if b["id"] in keep])
+    spec = schema.load(a.spec)
+    fp = os.path.join(os.path.dirname(os.path.abspath(a.pack)), "fitted.yaml")
+    f = yaml.safe_load(open(fp)) if os.path.exists(fp) else {}
+    fitted = {k: v["value"] for k, v in (f.get("parameters") or {}).items()}
+    seeds = pack["seeds"][:a.seeds] if a.seeds else pack["seeds"]
+    doc = spec_benchmarks(pack, spec.engine(), spec, fitted, a.workers, seeds)
+    out = os.path.join(spec.base, SPEC_BENCH)
+    yaml.safe_dump(doc, open(out, "w"), sort_keys=False)
+    print(f"wrote {out}")
+    return 0
 
 
 # --------------------------------------------------------------------------- toy engines (self-tests)
@@ -747,4 +880,6 @@ def _self_test() -> int:
 if __name__ == "__main__":
     if sys.argv[1:2] == ["--self-test"]:
         sys.exit(_self_test())
+    if sys.argv[1:2] == ["benchmarks"]:
+        sys.exit(_cli(sys.argv[2:]))
     print(__doc__)
