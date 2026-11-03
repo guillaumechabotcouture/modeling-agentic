@@ -2299,6 +2299,9 @@ class Console:
             rel = q.get("path") or ""
             data = read_file_bytes(rd, rel)
             want = q.get("sha") or ""
+            if q.get("bound") and not re.fullmatch(r"[0-9a-f]{64}", want):
+                # a snapshot-bound request names the digest it was rendered with; none means do not serve (round 5)
+                raise ValueError(f"{rel}: a snapshot-bound request needs the figure's sha256; reload the run")
             if want and hashlib.sha256(data).hexdigest() != want:
                 # the page asks for the bytes its snapshot recorded (review round 4, P2-6)
                 raise ValueError(f"{rel} changed since the page was rendered: reload the run")
@@ -3016,6 +3019,8 @@ def _self_test() -> int:
         _self_test_review3(ok, tr3)
     with tempfile.TemporaryDirectory() as tr4:
         _self_test_review4(ok, tr4)
+    with tempfile.TemporaryDirectory() as tr5:
+        _self_test_review5(ok, tr5)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -3107,9 +3112,38 @@ def _self_test_review4(ok, td: str) -> None:
         except ValueError as e:
             r = str(e)
         src = _page_sources()
-        ok(r != "served" and "sha:" in src[src.index("function renderFigures"):][:1200],
+        ok(r != "served" and "figSrc(" in src[src.index("function renderFigures"):][:1200],
            f"RY6 /api/file refuses a figure whose bytes differ from the snapshot's hash; the page asks by hash ({r[:80]})")
     case("RY6", ry6)
+
+
+def _self_test_review5(ok, td: str) -> None:
+    """RZ5: Codex review round 5 of PR #129 (P2-5): a figure with no digest is never requested unbound."""
+    def case(name, fn):
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001
+            ok(False, f"{name}: {type(e).__name__}: {str(e)[:300]}")
+
+    def rz5():
+        d = _toy_run(os.path.join(td, "rz5", "a"))
+        con = Console([os.path.join(td, "rz5")], log=lambda *a: None)
+        res = []
+        for sha in ("", "nothex"):
+            try:
+                con.handle("GET", "/api/file", {"run": [d], "path": ["figures/plan.png"], "bound": ["1"], "sha": [sha]}, {})
+                res.append("served")
+            except ValueError:
+                res.append("refused")
+        good = hashlib.sha256(open(os.path.join(d, "figures", "plan.png"), "rb").read()).hexdigest()
+        st, _, body = con.handle("GET", "/api/file", {"run": [d], "path": ["figures/plan.png"], "bound": ["1"],
+                                                     "sha": [good]}, {})
+        ok(res == ["refused", "refused"] and st == 200,
+           f"RZ5a a snapshot-bound figure request with an empty or invalid sha is refused ({res})")
+        src = _page_sources()
+        ok("function figSrc" in src and "bound: 1" in src and 'sha256 || ""' not in src,
+           "RZ5b the page builds figure URLs only from a captured digest (figSrc), never with sha=\"\"")
+    case("RZ5", rz5)
 
 
 def _self_test_review3(ok, td: str) -> None:

@@ -280,6 +280,14 @@ function renderStepper() {
 const VIEWS = ["stream", "figs", "spec", "evidence", "engine", "calibration"];
 VIEWS.forEach((v) => { if ($("v-" + v)) $("v-" + v).onclick = () => setView(v); });
 function setView(v) { S.view = v; S.cmp = null; VIEWS.forEach((x) => { if ($("v-" + x)) $("v-" + x).classList.toggle("on", x === v); }); renderStream(); renderRuns(); $("streambox").scrollTop = 0; }
+// A figure is shown only as the bytes its render-time snapshot hashed: the request is snapshot-bound (bound=1, the
+// digest) and refused by the server on a mismatch. With no captured digest (the file could not be read when the
+// card was rendered) no request is made (review round 5, P2-5).
+const FIG_NO_DIGEST = '<div class="empty small">The figure could not be read when this page was rendered (no digest was captured); reload the run.</div>';
+function figSrc(file, snap) {
+  const sha = snap && snap.sha256;
+  return typeof sha === "string" && /^[0-9a-f]{64}$/.test(sha) ? "/api/file?" + q({ run: S.runId, path: file, bound: 1, sha }) : null;
+}
 function renderFigures() {
   const figs = S.run.cards.filter((c) => c.kind === "figure"), sp = S.run.stepper || { stages: [] };
   $("v-figs").textContent = figs.length ? `Figures (${figs.length})` : "Figures";
@@ -290,7 +298,7 @@ function renderFigures() {
       : an.status === "done" ? "ANALYZE wrote none to figures/" : "the run has not reached ANALYZE";
     return `<div class="empty">No figures yet: ${why}.</div>`;
   }
-  return `<div class="figs">${figs.map((c) => `<div class="fig" data-act="open" data-file="${esc(c.file)}"><img loading="lazy" src="/api/file?${q({ run: S.runId, path: c.file, sha: (c.snapshot || {}).sha256 || "" })}" alt="">
+  return `<div class="figs">${figs.map((c) => `<div class="fig" data-act="open" data-file="${esc(c.file)}">${figSrc(c.file, c.snapshot) ? `<img loading="lazy" src="${esc(figSrc(c.file, c.snapshot))}" alt="">` : FIG_NO_DIGEST}
     <div class="c">${esc(c.body || c.title)}</div><div class="p">${esc(c.producer || c.title)}${c.at ? " · " + esc(day(c.at)) + " " + esc(hhmm(c.at)) : ""}</div></div>`).join("")}</div>`;
 }
 async function renderCompare() {
@@ -406,7 +414,7 @@ function card(c) {
     case "stage": return line(c.stage === "FINAL" && /fail/i.test(c.body || "") ? "bad" : "", `<b>${esc(c.title)}</b>${c.body ? " · " + esc(c.body) : ""}${c.spent_usd != null ? ` · ${usd(c.spent_usd)}` : ""}`);
     case "fix_loop": return line("", `<b>Fix loop</b> · ${esc(c.body)}`);
     case "batch": return line("", `<b>Engine batch</b> · ${c.done == null ? "?" : c.done}/${esc(c.n)} done${c.live ? (c.eta_s != null ? " · ETA " + fmtS(c.eta_s) : "") : c.done != null ? " · interrupted" : ""}${c.error ? " · " + esc(c.error) : ""}`);
-    case "figure": return `<div class="card">${head(esc(c.body || c.title))}${ctx("A figure from the analysis.", "no.")}<img class="thumb" loading="lazy" src="/api/file?${q({ run: S.runId, path: c.file, sha: (c.snapshot || {}).sha256 || "" })}" data-act="open" data-file="${esc(c.file)}">
+    case "figure": return `<div class="card">${head(esc(c.body || c.title))}${ctx("A figure from the analysis.", "no.")}${figSrc(c.file, c.snapshot) ? `<img class="thumb" loading="lazy" src="${esc(figSrc(c.file, c.snapshot))}" data-act="open" data-file="${esc(c.file)}">` : FIG_NO_DIGEST}
       <div class="sub">${esc(c.title)}${c.producer ? ` · ${esc(c.producer)}` : ""}</div>${c.provenance_error ? `<div class="sub" style="color:var(--bad)">provenance unreadable: ${esc(c.provenance_error)}</div>` : ""}<div class="acts">${open}${comment}</div></div>`;
     case "gate": return gateCard(c, head, open, comment);
     case "decision_needed": return decisionCard(c, head);
@@ -418,7 +426,7 @@ function card(c) {
       const cost = c.usd != null ? `<span class="tm" title="${esc(c.fallback ? "a refusal fallback answered" + (c.model ? " (" + c.model + ")" : "") + ": charged at the reserved worst case" : c.model && c.model !== "claude-opus-5-5" ? "served by " + c.model + ", priced at Opus 5.5 rates" : "")}">$${Number(c.usd).toFixed(3)}</span>` : "";
       return `<div class="card chat ${esc(c.role)}"><div class="head"><span class="t">${c.role === "assistant" ? "Claude" : "You"}</span>${cost}${when(c.at)}</div><div class="body">${body}</div>${unc}${chk}</div>`;
     }
-    case "feedback": return `<div class="card chat feedback">${head("Feedback: " + esc(c.fb_kind) + (c.verdict ? " · " + esc(c.verdict) : ""), `<span class="tm">${esc(c.layer)}</span>`)}<div class="body">${esc(c.text)}</div>${c.evidence && c.evidence.excerpt ? `<div class="sub" title="${esc("sha256 " + (c.evidence.sha256 || "") + " · " + (c.evidence.at || ""))}">Seen then (round ${esc(c.evidence.round == null ? "?" : c.evidence.round)}, ${esc(String(c.evidence.sha256 || "").slice(0, 10))}): ${esc(clip(String(c.evidence.excerpt), 300))}</div>` : ""}${c.anchor && c.anchor.file ? `<div class="sub">on ${esc(c.anchor.file)}${c.anchor.id ? "#" + esc(c.anchor.id) : ""}</div>` : ""}${c.proposed_change ? `<div class="sub">Proposed: ${esc(c.proposed_change)}</div>` : ""}</div>`;
+    case "feedback": return `<div class="card chat feedback">${head("Feedback: " + esc(c.fb_kind) + (c.verdict ? " · " + esc(c.verdict) : ""), `<span class="tm">${esc(c.layer)}</span>`)}<div class="body">${esc(c.text)}</div>${c.evidence && c.evidence.excerpt ? `<div class="sub" title="${esc("sha256 " + (c.evidence.sha256 || "none") + " · " + (c.evidence.at || ""))}">Seen then (round ${esc(c.evidence.round == null ? "?" : c.evidence.round)}, ${esc(String(c.evidence.sha256 || "none").slice(0, 10))}): ${esc(clip(String(c.evidence.excerpt), 300))}</div>` : ""}${c.anchor && c.anchor.file ? `<div class="sub">on ${esc(c.anchor.file)}${c.anchor.id ? "#" + esc(c.anchor.id) : ""}</div>` : ""}${c.proposed_change ? `<div class="sub">Proposed: ${esc(c.proposed_change)}</div>` : ""}</div>`;
     case "error": return `<div class="card error">${head(esc(c.title))}<div class="body small">${esc(c.body)}</div><div class="acts">${open}</div></div>`;
     default: return `<div class="card">${head(esc(c.title || c.kind))}<div class="body">${esc(c.body || "")}</div></div>`;
   }
@@ -549,7 +557,8 @@ $("side-close").onclick = () => { $("side").classList.remove("open"); stopLive()
 async function openFile(file, anchor) {
   if (!S.runId) return;
   const figc = (S.run && S.run.cards || []).find((c) => c.kind === "figure" && c.file === file);
-  const url = "/api/file?" + q({ run: S.runId, path: file, sha: (figc && figc.snapshot || {}).sha256 || "" });
+  const url = /\.(png|jpe?g|svg)$/i.test(file) ? figSrc(file, figc && figc.snapshot) : "/api/file?" + q({ run: S.runId, path: file });
+  if (url === null) { side(file, FIG_NO_DIGEST); return; }
   if (/\.(png|jpe?g|svg)$/i.test(file)) {
     const fig = (S.run.cards || []).find((c) => c.kind === "figure" && c.file === file);
     side(file, `<img src="${esc(url)}">${fig ? `<p>${esc(fig.body)}</p><p class="small muted">${esc(fig.producer || "")} ${fig.sources ? "from <code>" + fig.sources.map(esc).join("</code>, <code>") + "</code>" : ""}</p>` : ""}<div class="acts"><button data-act="comment" data-ref="${ref({ anchor: { kind: "figure", id: file, file }, evidence: fig && fig.snapshot, run: S.run && S.run.run_dir })}">Comment</button></div>`);
