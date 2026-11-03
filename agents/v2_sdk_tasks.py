@@ -93,7 +93,10 @@ Example:
     - {{file: uncertainty_report.yaml, key: sampler_varied_parameters, op: ">=", value: 16}}
     - {{file: manuscript.md, contains: "decision rule"}}{feedback}
 Then write {out} = {{"ok": true}}.""",
-    "plan_fixes": FIX_PLANNER_PROMPT + "\nThe packet is in {out_in}. Write your JSON to {out}.",
+    # FIX_PLANNER_PROMPT is constant text with a literal JSON example: escape its braces so .format
+    # substitutes only the two paths (PF1-PF3).
+    "plan_fixes": FIX_PLANNER_PROMPT.replace("{", "{{").replace("}", "}}")
+    + "\nThe packet is in {out_in}. Write your JSON to {out}.",
     "fix": COMMON + """
 
 Task: fix task {tid}: {brief}
@@ -566,6 +569,51 @@ def _self_test() -> int:
            f"code and its declaration are the draft task's ({verdicts})")
         ok("derivations.yaml" in PROMPTS["draft_spec"] and "data/derive/" in PROMPTS["draft_spec"],
            "DI1b the draft_spec prompt says the derived tables come from declared derivations the harness runs")
+        # PF1-PF4 (2026-11-02 v2 run: FIX_LOOP crashed with KeyError '"tasks"'): every task method is driven
+        # through a fake _session with its real arguments, so the real prompt assembly runs in CI, not
+        # the fix loop's fake task layer. A template field that is not a plain name is a stray brace.
+        import re as _re
+        import string as _string
+        stray = {}
+        for k, tmpl in PROMPTS.items():
+            try:
+                fields = {f for _, f, _, _ in _string.Formatter().parse(tmpl) if f is not None}
+            except ValueError as e:
+                fields = {f"<unparseable: {e}>"}
+            bad = sorted(f for f in fields if not _re.fullmatch(r"[a-z_]+", f))
+            if bad:
+                stray[k] = bad
+        ok(not stray, f"PF1 no prompt template has a stray brace (a field that is not a plain name) {stray}")
+        seen_prompts, errors = {}, {}
+        t = SdkTasks(d, query_fn=stream(init, res))
+
+        def fake_session(kind, system, prompt, owns, model=None):
+            seen_prompts[kind] = system
+            return TaskResult(True, {"ok": True}, 0.0, "fake")
+        t._session = fake_session
+        calls = {
+            "draft_spec": lambda: t.draft_spec("Q?", d, ["e1"]),
+            "pick_engine": lambda: t.pick_engine({}, {"eligible": ["e"]}),
+            "critique": lambda: t.critique(d, "critique-domain", 1, ["fb"]),
+            "plan_fixes": lambda: t.plan_fixes({"round": 1, "findings": [{"id": "R-001"}]}),
+            "fix": lambda: t.fix({"id": "T1", "brief": "b {x}", "findings": ["R-001"], "owner_state": "MODEL"},
+                                 d, {"k": "{v}"}),
+            "write": lambda: t.write(d, "accepted"),
+        }
+        for k, call in calls.items():
+            try:
+                call()
+            except Exception as e:  # noqa: BLE001 -- the failure is the finding
+                errors[k] = f"{type(e).__name__}: {e}"
+        ok(not errors and set(seen_prompts) == set(PROMPTS),
+           f"PF2 every PROMPTS entry is assembled by its task method with real arguments "
+           f"(errors {errors}; not driven {sorted(set(PROMPTS) - set(seen_prompts))})")
+        ok(seen_prompts.get("plan_fixes") == FIX_PLANNER_PROMPT
+           + "\nThe packet is in _task_input.json. Write your JSON to _task_output.json.",
+           "PF3 the fix planner's prompt is FIX_PLANNER_PROMPT byte for byte, then the two paths")
+        pk = json.load(open(os.path.join(d, "_task_input.json")))
+        ok('{"tasks": [{"id": "T1"' in (seen_prompts.get("plan_fixes") or "") and pk["findings"] == [{"id": "R-001"}],
+           "PF4 plan_fixes keeps the plan's JSON example and writes the packet the prompt names")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

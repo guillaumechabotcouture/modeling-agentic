@@ -1,6 +1,6 @@
-# Malaria engine v0.7: benchmark notes
+# Malaria engine v0.8: benchmark notes
 
-Engine `malaria-starsim` v0.7 (workstream A of architecture v2). Design note:
+Engine `malaria-starsim` v0.8 (workstream A of architecture v2). Design note:
 `docs/design/v2a-malaria-engine.md`. Every number in the tables block is rendered from
 `benchmarks/results.yaml`, `benchmarks/fitted.yaml`, `benchmarks/b15_mechanisms.yaml`,
 `benchmarks/equilibration.yaml` and `benchmarks/runtime.yaml`, with the spike
@@ -8,16 +8,188 @@ Engine `malaria-starsim` v0.7 (workstream A of architecture v2). Design note:
 `results_v0.3-r2.yaml`, `results_v0.3.yaml`, `results_v0.4.yaml`) beside them, by
 `benchmarks/render_notes.py`. Reproduce with `bash toolkit/engines/malaria/benchmarks/validate_once.sh` on a VM.
 
-**v0.7 and v0.6 numbers are v0.5's.** The v0.6 changes act only when a horizon gives a delivery period or a unit sets
-`itn_routine_interval`. The v0.7 change acts only when a unit sets `smc_routine = 1`. The pack and the evidence use
-none of them, so the pack's results, fit, equilibration and guess-sensitivity files keep the numbers v0.5 computed.
-Their identity fields were re-stamped twice by `benchmarks/restamp_proof.py`:
+**v0.8, v0.7 and v0.6 numbers are v0.5's.** The v0.6 changes act only when a horizon gives a delivery period or a unit
+sets `itn_routine_interval`. The v0.7 change acts only when a unit sets `smc_routine = 1`. The v0.8 change adds two
+figure hooks (`schedule`, `run_series`) and leaves `run` and `run_batch` unchanged. The pack and the evidence use none
+of these, so the pack's results, fit, equilibration and guess-sensitivity files keep the numbers v0.5 computed.
+Their identity fields were re-stamped three times by `benchmarks/restamp_proof.py`:
 - for v0.6, after the proof found v0.5 and v0.6 outputs identical;
-- for v0.7, after it found v0.6 and v0.7 outputs identical.
+- for v0.7, after it found v0.6 and v0.7 outputs identical;
+- for v0.8, after it found v0.7 (bf24d1b) and v0.8 outputs identical in 22 of 22 cases (run on a Coiled VM in
+  the IDM default workspace).
 
-Both proofs ran on the pack's settings and the evidence cases (`benchmarks/restamp_proof.yaml` holds the latest).
-Each file's `restamped:` record holds the v0.7 re-stamp, with the v0.6 record under `previous`. A Coiled run of
-`validate_once.sh` is open until it confirms them.
+All three proofs ran on the pack's settings and the evidence cases; the v0.8 proof also ran three pinned scenarios
+with a delivery period, routine nets and SMC, boundary dates and heterogeneous batches
+(`benchmarks/restamp_proof.yaml` holds the latest).
+Each file's `restamped:` record holds the v0.8 re-stamp, with the v0.7 and v0.6 records under `previous`. The
+confirming Coiled run of `validate_once.sh` has not run yet: each v0.8 record says `confirmation: {validate_once:
+pending}` until it reports.
+
+## v0.8 scope: the figure hooks, schedule() and run_series() (written before the v0.8 code)
+
+**The problem.** The v2 figure set (`docs/design/v2-figures.md` §5, PR #127) has two figures the
+harness cannot draw from stored results: a per-region timeline of what is delivered when, and
+monthly trajectories of the calibration metric and incidence for the comparator and the plan.
+PR #127 defines two optional engine hooks for them in `toolkit/engines/hooks.py`; `contract.py` is
+unchanged. v0.8 implements both hooks in the malaria engine, exactly to that interface, and
+changes nothing that `run` and `run_batch` return.
+
+**Hook 1: `schedule(params, unit, package, horizon) -> list[dict]`.**
+- One dict per delivery event, `{component, label, kind, t0, t1, charged}`, over
+  `[horizon.start, window end)`. `charged` is true exactly when `kind` is `decision`.
+- `history`: the unit's past net campaigns (`itn_hist_years`, net type `hist_net`).
+- `decision`: the package's events in the delivery period: the net campaign
+  (`campaign_year`), each SMC round, each IRS round, and the case-management add-on as a period
+  (`t0` the delivery start, `t1` its end; the window end when there is no delivery period, where
+  the add-on has no end).
+- `routine`: routine net campaigns (`itn_routine_interval`) and routine SMC rounds
+  (`smc_routine`), in every arm.
+- Point events (campaigns and rounds) have `t1 = None`. Events the sim would run outside
+  `[horizon.start, window end)` are not listed: a past campaign before `horizon.start` acts in the
+  burn-in, and a round after the window's end has no outcome counted.
+- **One source.** The schedule logic now lives in one pure function, `delivery_plan(a,
+  components, horizon)`. It returns the package's component settings, the history, routine and
+  add-on timings, and the event list. `_plan` (the package's settings for the sim) and
+  `_base_sim` (the history and routine interventions and the add-on period) both read it, and
+  `schedule()` returns its event list. There is no second copy of the schedule rules.
+  `delivery_plan` makes every check `_plan` made before (fail closed), in the same order.
+- **Pure.** No sim is built and no random number is drawn. A self-test runs `schedule()` with
+  `starsim.Sim` replaced by a function that raises, and checks that numpy's global random state
+  and the unit's attributes are unchanged.
+
+**Hook 2: `outputs["series"]` and `run_series(params, unit, packages, horizon, seed, metrics, step="month")`.**
+- The card declares `outputs["series"]`: `pfpr_u5` (under-5 microscopy prevalence, 6-59
+  months: the calibration metric, the same definition as the window metric `pfpr_u5`; aggregate
+  `mean`, units share), `pfpr_2_10` and `pfpr_all` (`mean`, share), `inc_all` (all-age clinical
+  incidence; aggregate `rate`, episodes per person-year) and `inc_u5` (under-5 clinical
+  incidence, `rate`, episodes per child-year).
+- It returns one dict per package, in order: `{"package": id, "t": [...], "values": {metric:
+  [...]}}`. Steps start at `horizon.start + k/12` and run up to the window's end; the last step
+  ends at the window's end.
+- **How it is recorded.** The model already records each of these quantities every day
+  (`Malaria.daily`, the records the named windows read). `run_series` reads those records after
+  each member's run, before they are freed. No analyzer is added and the sim is not changed. A
+  `mean` value is the mean of the step's daily values. A `rate` value is the step's sum of daily
+  episodes per person, divided by the step's length in years.
+- **Consistency with the window metrics.** A window whose bounds lie on the step grid selects the
+  same days as its steps. So its `pfpr_u5` equals the day-weighted mean of the steps' values, and
+  its `inc_u5` / `inc_all` (episodes per person over the window) equal the sum of rate x step
+  length. A self-test checks both to 1e-9.
+- **Shared history.** `run_batch`'s member loop moves into one internal function. `run_batch`
+  and `run_series` both call it, so `run_series` gets the same shared burn-in, history and fork
+  (common random numbers) as `run_batch`. Its packages are therefore identical before the first
+  component event.
+
+**Byte identity.** `run` and `run_batch` build, configure and run the same sims as v0.7, and
+return the same outcomes. The new card output and the code change the engine identity
+(`config_sha256`, `code_sha256`, version 0.8). As for v0.6 (#123) and v0.7 (#126):
+- `benchmarks/restamp_proof.py prove --old-ref origin/v2` compares v0.7 and v0.8 on the pack's
+  settings and the evidence cases. It runs on a Coiled VM in the IDM default workspace, not on
+  the laptop.
+- The stored evidence is re-stamped with `restamp` only when all 19 cases are identical.
+- Self-test S7 checks, on a toy unit with history, decision and routine events, that recording
+  the series does not change the outcomes: the member loop run by `run_series` returns outcomes
+  byte-identical to `run_batch`'s. The v0.7-to-v0.8 comparison itself is the proof above, since
+  a self-test cannot hold the v0.7 code.
+
+**Tests written first (α).** Engine S0–S8:
+- S0: version 0.8, and `hooks.supports` is true for both hooks.
+- S1: `schedule()` for a toy unit with past, decision and routine nets, package and routine SMC,
+  IRS and the add-on equals the event list of the sim the engine builds (its interventions'
+  years, rounds and add-on period). The comparator arm has no decision event.
+- S2: `schedule()` is pure.
+- S3: #127's checker (`hooks.schedule`) accepts every arm's schedule.
+- S4: `run_series` shape and units: one entry per package in order, monthly steps over
+  `[horizon.start, window end)`, the card's labels, units and aggregates.
+- S5: the series averaged over a window equal the window metrics.
+- S6: the packages' series are identical before the fork, and differ after it.
+- S7: `run_batch` is unchanged by series recording.
+- S8: `hooks.run_series` refuses a metric the card does not list.
+
+**Review round 1 (Codex) and #127's hook contract `figures-hooks/1`.** Each change has a test that
+failed first (α2, α3):
+- **Executed events (S1, S10).** `schedule()` now lists deliveries as the sim executes them.
+  `delivery_plan` gives each delivery's raw target and the intervention that runs it. `schedule()`
+  maps every target to its daily step with `model.event_steps`, the function the interventions
+  use (`_event_tis`). Targets of one intervention on one step are one delivery (repeated
+  `itn_hist_years`, or two dates on the same day), and `t0` is the step's year. The sim's time
+  vector comes from a Starsim `Timeline` with the sim's start, stop and step, so no sim is built.
+  SMC and IRS targets come from `model.smc_targets` and `model.irs_targets`, which the
+  interventions also use.
+- **Charging (S9).** A decision delivery is charged only when its step lies where the sim
+  counts cost drivers (`model.delivery_contains`, shared with `Malaria.in_delivery`). Two
+  examples: a campaign before the window start when no delivery period is given, and SMC rounds
+  before a mid-year window start. The sim keeps running these as before, uncharged, but
+  `schedule()` now fails closed rather than reporting a charged event.
+- **Kinds (S12d, S12e).** Under the contract, `history` events precede the delivery period,
+  `routine` events lie outside it, and `decision` events lie inside it and belong to a component
+  the package sets. A past campaign at or after the delivery start makes `schedule()` fail
+  closed.
+- **Series metadata (S11, S12b, S12c).** Each `run_series` entry also returns `t_end` and `days`
+  for every step. `series_window(entry, metric, a, b)` aggregates them exactly into the window
+  metric over any union of steps, and fails closed on a window that cuts through a step.
+  - The grid is the contract's, `hooks.monthly_grid(horizon)`, the same for every arm (round 2
+    below).
+  - Each card metric declares a `denominator`, and the engine declares
+    `hooks_contract = "figures-hooks/1"`.
+  - Step slices are found once with `searchsorted`, with the same day selection as the windows.
+- **Proof coverage (RP10).** The pack builds plain horizons, and none of its units sets routine
+  nets or routine SMC. So `restamp_proof.py` now also runs three pinned scenarios in both trees:
+  - GC7-like delivery with routine nets and routine SMC;
+  - boundary dates (the campaign and an IRS round at the delivery start, routine SMC and a
+    routine campaign at the delivery end, the add-on stopping there, windows cutting through
+    months);
+  - a heterogeneous batch (two units, parameters inside and outside the burn-in key, no delivery
+    period).
+
+**Review round 2 (Codex) and #127's round 2.** Again, each change has a test that failed first
+(α4, α5):
+- **Coverage (S13).** `series_window` refuses a window that reaches outside the entry's
+  coverage `[t[0], t_end[-1])`; before, it silently aggregated only the part it covered. It also
+  needs the window to be covered completely by whole steps.
+- **Grid (S12c, S11).** `run_series` uses `hooks.monthly_grid(horizon)`: a step starts at every
+  `start + k/12` before the window end. When the window ends inside a month, the last step is
+  partial and ends at the window end. Its `mean` is that step's mean, and its `rate` is episodes
+  per person-year over the partial span. `t_end` and `days` follow it, and `series_window` stays
+  exact over it.
+- **Half-open delivery semantics (S14).** Tests at each boundary check the schedule against the
+  sim:
+  - A decision campaign at the delivery start d0 is listed, charged and charged by the sim; one
+    at the delivery end d1 is refused.
+  - A past campaign at d0 is refused.
+  - A routine campaign at d0 is refused; at d1, a routine campaign and the first routine SMC
+    round are accepted, on the steps the sim runs them.
+  - With GC7 dates, routine nets at campaign + 3 and routine SMC from d1 lie outside the delivery
+    period.
+
+  `model.delivery_contains` (`d0 <= t < d1`) already matched these rules, and so did the routine
+  placement.
+- **Proof record (RP11).** Each side of the proof records its Python, NumPy, Starsim and
+  platform versions (fail closed without them). The record's `execution` block names the Coiled
+  cluster id, the run id and the workspace.
+- **Confirmation (RP12).** A re-stamp record no longer says that `validate_once.sh` confirms it:
+  `confirmation: {validate_once: pending}` until that run reports. Earlier records under
+  `previous` keep the wording they were written with.
+
+**#127's round 3: exact half-open boundaries (S15).** The hook contract now compares
+boundaries exactly. `schedule()` reports each event at its executed step's year and charges it
+by the sim's own test (`model.delivery_contains`), so both agree exactly. Tests on the real time
+vector (the card's 50-year burn-in, GC7 dates) show:
+- A GC7 decision campaign at the delivery start is reported at exactly 2024.0 and charged.
+- A past campaign at horizon.start is reported at exactly 2023.0.
+- The first routine SMC round is reported at exactly d1 = 2027.0 and is uncharged.
+- The routine net at campaign + 3 is on its executed step.
+- Nothing is listed at or after the window end.
+
+Starsim rounds its time vector to 9 decimals, so whole years from the sim start are exact.
+Representation-only differences (at most 1e-9 y) are reported at the boundary's own float, but
+only when every membership test agrees, so no event moves across a boundary (S15e).
+
+Sub-day offsets are real, not representation. With an off-grid start (2023.25), the steps
+nearest d0 and d1 lie just after them: the decision is charged and the routine round counts as
+routine. With a delivery start between steps whose nearest step lies before it (delivery
+2024.25, campaign 2024.25, sim start on a whole year), the sim delivers the campaign uncharged.
+`schedule()` then fails closed (S15d). This is unchanged v0.6 behaviour, listed as an open item.
 
 ## v0.7 scope: routine SMC in every arm after the delivery period (written before the v0.7 code)
 

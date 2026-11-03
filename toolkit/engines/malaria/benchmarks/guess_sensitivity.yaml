@@ -1,5 +1,5 @@
 producer: toolkit/engines/malaria/benchmarks/guess_sensitivity.py
-engine_version: '0.7'
+engine_version: '0.8'
 code_sha256: 675650c80e7d9c3df9bf234d1f50c135c1fdf6ab9f0a5186f2d610f6e1dea5ee
 tol: 0.03
 burnin_years: 50
@@ -576,15 +576,83 @@ restamped:
         - x0.25
         - 2
         - 50
+    scenarios:
+      gc7_delivery_routine: 4 members, seed 21, delivery [2024.0, 2027.0]
+      boundaries: 3 members, seed 22, delivery [2024.0, 2025.0]
+      heterogeneous: 5 members, seed 23, delivery None
     not_repeated: calibration-grid runs (same code path at other attribute values)
     compared: per_capita, windows, cost_drivers and meta (minus wall-clock seconds) exactly as JSON; initial-state
       dicts exactly
-  old_engine_version: '0.6'
-  proof_script_commit: 71619f531a21196771cb1654c96ed63a5fe8a421
+  old_engine_version: '0.7'
+  proof_script_commit: 22aa80c4cc3002517a08555cd82186dfb21a75b7
   note: the numbers in this file were computed by the old code; the proof shows the new code gives identical outputs
-    on these inputs. A Coiled pack run (validate_once.sh) confirms it.
+    on these inputs. A Coiled pack run (validate_once.sh) is to confirm it; until it has run, the confirmation below
+    is pending.
+  confirmation:
+    validate_once: pending
+    evidence: null
   old_code_sha256: 675650c80e7d9c3df9bf234d1f50c135c1fdf6ab9f0a5186f2d610f6e1dea5ee
   previous:
+  - by: toolkit/engines/malaria/benchmarks/restamp_proof.py (byte-identity proof, not recomputed)
+    proof: toolkit/engines/malaria/benchmarks/restamp_proof.yaml
+    proof_identical: true
+    scope:
+      pack_settings:
+      - benin
+      - ce_ref
+      - ce_res
+      - cochrane_itn
+      - eir_1
+      - eir_10
+      - eir_100
+      - eir_3
+      - eir_30
+      - eir_300
+      - irs_added
+      - misungwi
+      - muleba
+      - sahel_smc
+      pack_arms: every arm of each setting, in one run_batch per setting and seed
+      seeds:
+      - 11
+      n_agents: each setting's own (pack.yaml params; 5000 where set, else the card's 4000); equilibration 4000;
+        guess sensitivity the card's 4000
+      burnin_years: the card's (50), the pack's own
+      evidence_cases:
+      - - equilibration
+        - - 3.5
+          - base
+          - burnin_years: 50
+          - 1
+      - - equilibration
+        - - 28.0
+          - doubled
+          - burnin_years: 100
+          - 1
+      - - equilibration
+        - - 9.0
+          - guess_hi
+          - burnin_years: 50
+            init_eir_per_m0: 2.4
+          - 2
+      - - guess_sensitivity
+        - - 3.5
+          - x1
+          - 1
+          - 50
+      - - guess_sensitivity
+        - - 28.0
+          - x0.25
+          - 2
+          - 50
+      not_repeated: calibration-grid runs (same code path at other attribute values)
+      compared: per_capita, windows, cost_drivers and meta (minus wall-clock seconds) exactly as JSON; initial-state
+        dicts exactly
+    old_engine_version: '0.6'
+    proof_script_commit: 71619f531a21196771cb1654c96ed63a5fe8a421
+    note: the numbers in this file were computed by the old code; the proof shows the new code gives identical outputs
+      on these inputs. A Coiled pack run (validate_once.sh) confirms it.
+    old_code_sha256: 675650c80e7d9c3df9bf234d1f50c135c1fdf6ab9f0a5186f2d610f6e1dea5ee
   - by: toolkit/engines/malaria/benchmarks/restamp_proof.py (byte-identity proof, not recomputed)
     proof: toolkit/engines/malaria/benchmarks/restamp_proof.yaml
     proof_identical: true

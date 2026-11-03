@@ -40,7 +40,9 @@ KINDS = {
     "stability": ("method", "folds", "metrics", "verdict", "value_verdict"),
     "sensitivity": ("rows",),
     "decision_tests": ("tests",),
+    "figure_data": ("frontier", "dollars", "by_package", "burden", "schedule"),
     "figures": ("figures",),
+    "trajectories": ("status", "sample", "series"),
     "claims": ("n_claims", "unresolved"),
     "blocked": ("reason", "corrections"),
 }

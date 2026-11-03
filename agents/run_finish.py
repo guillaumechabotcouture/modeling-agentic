@@ -521,6 +521,7 @@ def store_run_results(run_path: str, service=None) -> str | None:
     try:
         mp = os.path.join(run_path, "metadata.json")
         meta = json.load(open(mp)) if os.path.exists(mp) else {}
+        meta = meta if isinstance(meta, dict) else {}   # valid JSON that is not an object (ST6)
         meta.update({"stored": blob, "store_error": err})
         json.dump(meta, open(mp, "w"), indent=2)
     except (OSError, ValueError):

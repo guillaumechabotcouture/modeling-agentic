@@ -1,5 +1,5 @@
 name: malaria-starsim
-version: '0.7'
+version: '0.8'
 mechanisms:
 - 'Griffin-lite human natural history and immunity (fixed: Griffin et al. 2010 PLoS Med 10.1371/journal.pmed.1000324;
   2014 Nat Commun; 2015 Lancet Infect Dis)'
@@ -81,6 +81,32 @@ outputs:
   - smc_doses
   - irs_sprayed
   - treated_all
+  series:
+    pfpr_u5:
+      label: microscopy prevalence, children 6-59 months (the calibration metric)
+      units: share
+      aggregate: mean
+      denominator: person aged 6-59 months
+    pfpr_2_10:
+      label: microscopy prevalence, ages 2-10
+      units: share
+      aggregate: mean
+      denominator: person aged 2-10
+    pfpr_all:
+      label: microscopy prevalence, all ages
+      units: share
+      aggregate: mean
+      denominator: person
+    inc_all:
+      label: clinical incidence, all ages
+      units: episodes per person-year
+      aggregate: rate
+      denominator: person-year
+    inc_u5:
+      label: clinical incidence, under 5
+      units: episodes per child-year (under 5)
+      aggregate: rate
+      denominator: person-year under 5
 age_groups:
 - u5
 - '5_14'

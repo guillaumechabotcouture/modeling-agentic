@@ -54,8 +54,63 @@ EVIDENCE_CASES = [
     ("guess_sensitivity", [28.0, "x0.25", 2, 50]),
 ]
 
+# v0.8 (Codex r1 P2-5): pinned scenarios with the features the pack does not use (it builds plain horizons, and its
+# units set neither routine nets nor routine SMC), each one run_batch at its own seed in both trees. Members may set
+# their own unit attributes and parameters (heterogeneous batches, more than one burn-in group).
+_SEASON = [0.3, 0.3, 0.4, 0.6, 0.9, 1.3, 1.8, 2.1, 1.7, 1.1, 0.8, 0.5]
+_BASE_UNIT = {"m0": 6.0, "season": _SEASON, "resistance": 0.6, "species": {"gambiae": 0.6, "funestus": 0.4},
+              "cm_ft": 0.35, "itn_use": 0.55, "itn_use_at": 0.5}
+SCENARIOS = {
+    # GC7-like: delivery 2024-2027 inside outcomes 2024-2029.25, routine nets every 3 y, routine SMC after delivery
+    "gc7_delivery_routine": {
+        "unit": dict(_BASE_UNIT, itn_hist_years=[2021.25], campaign_year=2025.25, itn_routine_interval=3.0,
+                     smc_routine=1),
+        "horizon": {"start": 2023.0, "stop": 2029.25, "window": [2024.0, 2029.25],
+                    "windows": {"y1": [2024.0, 2025.0], "y4": [2027.0, 2028.0], "tail": [2028.0, 2029.25]}},
+        "delivery": [2024.0, 2027.0], "params": {"n_agents": 1500, "burnin_years": 20}, "seed": 21,
+        "members": [{"package": {}}, {"package": {"net": "pyr", "smc": 1}}, {"package": {"net": "pbo", "cm": 1}},
+                    {"package": {"net": "dual", "smc": 1, "irs": 1, "cm": 1}}]},
+    # boundary dates: the campaign and an IRS round at the delivery start, the first routine SMC round and a routine
+    # campaign at the delivery end, the add-on stopping there, windows cutting through months
+    "boundaries": {
+        "unit": dict(_BASE_UNIT, itn_hist_years=[2023.5], campaign_year=2024.0, itn_routine_interval=1.0,
+                     smc_routine=1, smc_months=[1, 2, 3, 4], irs_month=1),
+        "horizon": {"start": 2023.0, "stop": 2026.5, "window": [2024.0, 2026.5],
+                    "windows": {"a": [2024.0, 2025.0], "b": [2025.0, 2026.5], "c": [2024.37, 2025.61]}},
+        "delivery": [2024.0, 2025.0], "params": {"n_agents": 1500, "burnin_years": 20}, "seed": 22,
+        "members": [{"package": {}}, {"package": {"net": "pyr", "smc": 1, "irs": 1, "cm": 1}},
+                    {"package": {"cm": 1}}]},
+    # heterogeneous members: two units, parameters inside and outside the burn-in key, no delivery period (v0.5 path)
+    "heterogeneous": {
+        "unit": dict(_BASE_UNIT, itn_hist_years=[2022.5], campaign_year=2024.25),
+        "horizon": {"start": 2023.0, "stop": 2026.0, "window": [2024.0, 2026.0],
+                    "windows": {"y1": [2024.0, 2025.0], "y2": [2025.0, 2026.0]}},
+        "delivery": None, "params": {"n_agents": 1500, "burnin_years": 20}, "seed": 23,
+        "members": [{"package": {}}, {"package": {"net": "pyr"}, "params": {"smc_pe": 0.8}},
+                    {"package": {"net": "dual", "smc": 1}, "unit": {"m0": 30.0, "hist_net": "dual"}},
+                    {"package": {"irs": 1}, "unit": {"m0": 30.0, "hist_net": "dual"}, "params": {"hh_net_corr": 0.2}},
+                    {"package": {"cm": 1}, "params": {"cm_add": 0.25}}]},
+}
+
+# Codex r2 P3: the execution environment of a worker, recorded per side (the source is shared by the worker, which runs
+# inside either tree, and environment() below)
+ENV_SRC = r'''
+def environment():
+    import platform, sys
+    import numpy, starsim
+    return {"python": sys.version.split()[0], "numpy": numpy.__version__, "starsim": starsim.__version__,
+            "platform": platform.platform(), "machine": platform.machine()}
+'''
+
+
+def environment() -> dict:
+    ns = {}
+    exec(ENV_SRC, ns)  # noqa: S102 -- our own constant source, shared with WORKER
+    return ns["environment"]()
+
+
 # Run inside one code tree (argv: root, cases json, out json). It imports only what both versions have.
-WORKER = r'''
+WORKER = ENV_SRC + r'''
 import json, os, sys
 root, cases_path, out_path = sys.argv[1:4]
 sys.path.insert(0, root)
@@ -74,7 +129,7 @@ def strip(o):
     return {"per_capita": o.per_capita, "windows": o.windows, "cost_drivers": o.cost_drivers,
             "meta": {k: v for k, v in o.meta.items() if k != "seconds"}}
 
-out = {"identity": engine_identity(e), "version": VERSION, "cases": {}}
+out = {"identity": engine_identity(e), "version": VERSION, "environment": environment(), "cases": {}}
 for c in json.load(open(cases_path)):
     if c["kind"] == "pack":
         s = pack["settings"][c["setting"]]
@@ -88,6 +143,17 @@ for c in json.load(open(cases_path)):
         os_ = e.run_batch([par] * len(arms), UnitSpec(c["setting"], unit),
                           [Package(a, pack["arms"][a].get("package") or {}) for a in arms], h, int(c["seed"]))
         val = {a: strip(o) for a, o in zip(arms, os_)}
+    elif c["kind"] == "scenario":
+        from toolkit.engines.horizon import DeliveryHorizon
+        sp = c["spec"]
+        hz = sp["horizon"]
+        hargs = (float(hz["start"]), float(hz["stop"]), tuple(hz["window"]), dict(hz.get("windows") or {}))
+        h = DeliveryHorizon(*hargs, delivery=tuple(sp["delivery"])) if sp.get("delivery") else Horizon(*hargs)
+        ms = sp["members"]
+        os_ = e.run_batch([{**(sp.get("params") or {}), **fit, **(m.get("params") or {})} for m in ms],
+                          [UnitSpec(c["id"], dict(sp["unit"], **(m.get("unit") or {}))) for m in ms],
+                          [Package(f"m{i}", m.get("package") or {}) for i, m in enumerate(ms)], h, int(sp["seed"]))
+        val = {f"m{i}": strip(o) for i, o in enumerate(os_)}
     else:
         import importlib
         mod = importlib.import_module("toolkit.engines.malaria.benchmarks." + c["kind"])
@@ -102,6 +168,7 @@ def cases(pack: dict, seeds: list) -> list:
     out = [{"id": f"pack:{s}:{sd}", "kind": "pack", "setting": s, "seed": sd} for s in pack["settings"] for sd in seeds]
     out += [{"id": f"{m}:{':'.join(str(x) for x in a[:2])}:seed{a[3] if m == 'equilibration' else a[2]}",
              "kind": m, "args": a} for m, a in EVIDENCE_CASES]
+    out += [{"id": f"scenario:{n}:seed{sp['seed']}", "kind": "scenario", "spec": sp} for n, sp in SCENARIOS.items()]
     return out
 
 
@@ -133,7 +200,7 @@ def _run_tree(root: str, cs: list, tmp: str, tag: str) -> dict:
     return json.load(open(op))
 
 
-def prove(old_ref: str, seeds: list, workers: int, settings: list | None = None) -> dict:
+def prove(old_ref: str, seeds: list, workers: int, settings: list | None = None, context: dict | None = None) -> dict:
     pack = yaml.safe_load(open(os.path.join(HERE, "pack.yaml")))
     cs = cases(pack, seeds)
     if settings:
@@ -150,17 +217,31 @@ def prove(old_ref: str, seeds: list, workers: int, settings: list | None = None)
                 old, new = fo.result(), fn.result()
         else:
             old, new = _run_tree(old_root, cs, tmp, "old"), _run_tree(ROOT, cs, tmp, "new")
+    return proof_doc(old_ref, _git("rev-parse", old_ref), _git("rev-parse", "HEAD"), old, new, cs, seeds,
+                     context or {})
+
+
+def proof_doc(old_ref: str, old_commit: str, new_commit: str, old: dict, new: dict, cs: list, seeds: list,
+              context: dict) -> dict:
+    """The proof record from both trees' outputs. Each side names the environment it ran in (fail closed without
+    one); `execution` names where the proof ran (e.g. the Coiled cluster id and the run id)."""
+    for tag, side in (("old", old), ("new", new)):
+        if not isinstance(side.get("environment"), dict) or not side["environment"]:
+            raise ValueError(f"proof: the {tag} side recorded no execution environment")
     rows = compare(old, new)
     return {"producer": f"{REL}/restamp_proof.py",
-            "old": {"ref": old_ref, "commit": _git("rev-parse", old_ref), "identity": old["identity"],
-                    "engine_version": old["version"]},
-            "new": {"commit_of_tree_base": _git("rev-parse", "HEAD"), "identity": new["identity"],
-                    "engine_version": new["version"]},
+            "old": {"ref": old_ref, "commit": old_commit, "identity": old["identity"],
+                    "engine_version": old["version"], "environment": old["environment"]},
+            "new": {"commit_of_tree_base": new_commit, "identity": new["identity"],
+                    "engine_version": new["version"], "environment": new["environment"]},
+            "execution": dict(context),
             "scope": {"pack_settings": sorted({c["setting"] for c in cs if c["kind"] == "pack"}),
                       "pack_arms": "every arm of each setting, in one run_batch per setting and seed",
                       "seeds": seeds, "n_agents": "each setting's own (pack.yaml params; 5000 where set, else the "
                       "card's 4000); equilibration 4000; guess sensitivity the card's 4000",
                       "burnin_years": "the card's (50), the pack's own", "evidence_cases": EVIDENCE_CASES,
+                      "scenarios": {n: f"{len(sp['members'])} members, seed {sp['seed']}, delivery "
+                                       f"{sp.get('delivery')}" for n, sp in SCENARIOS.items()},
                       "not_repeated": "calibration-grid runs (same code path at other attribute values)",
                       "compared": "per_capita, windows, cost_drivers and meta (minus wall-clock seconds) exactly as "
                                   "JSON; initial-state dicts exactly"},
@@ -174,7 +255,10 @@ def _record(doc: dict, proof: dict, script_commit: str) -> dict:
                                                                    .get("version")),
            "proof_script_commit": script_commit,
            "note": "the numbers in this file were computed by the old code; the proof shows the new code gives "
-                   "identical outputs on these inputs. A Coiled pack run (validate_once.sh) confirms it."}
+                   "identical outputs on these inputs. A Coiled pack run (validate_once.sh) is to confirm it; until "
+                   "it has run, the confirmation below is pending.",
+           # Codex r2 P3: not done until a validate_once.sh run reports; its evidence is referenced then
+           "confirmation": {"validate_once": "pending", "evidence": None}}
     if "engine_identity" in doc:
         rec["old_identity"] = dict(doc["engine_identity"])
     if "code_sha256" in doc:
@@ -342,6 +426,53 @@ def _self_test() -> int:
         ok(False, "RP9 a restamped record that is not the file's last key fails closed")
     except ValueError:
         ok(True, "RP9 a restamped record that is not the file's last key fails closed")
+    # v0.8 (Codex r1 P2-5): the pack uses plain horizons with none of the v0.6-v0.7 features, so the proof also runs
+    # pinned scenarios that use them, in both trees
+    sc = [c for c in cases({"settings": {}}, [11]) if c["kind"] == "scenario"]
+    specs = [c["spec"] for c in sc]
+
+    def units(sp):
+        return [dict(sp["unit"], **(m.get("unit") or {})) for m in sp["members"]]
+    has = {
+        "delivery period": any(sp.get("delivery") for sp in specs),
+        "routine nets": any(x.get("itn_routine_interval") for sp in specs for x in units(sp)),
+        "routine SMC": any(x.get("smc_routine") == 1 for sp in specs for x in units(sp)),
+        "add-on with a delivery end (CM stop)": any(sp.get("delivery") and any((m.get("package") or {}).get("cm")
+                                                                              for m in sp["members"]) for sp in specs),
+        "boundary dates": any(sp.get("delivery") and any(float(x.get("campaign_year", -1)) == float(sp["delivery"][0])
+                                                         for x in units(sp))
+                              and float(sp["delivery"][1]).is_integer()
+                              and any(1 in (x.get("smc_months") or []) for x in units(sp)) for sp in specs),
+        "heterogeneous members": any(len({json.dumps(x, sort_keys=True) for x in units(sp)}) > 1
+                                     and len({json.dumps(m.get("params") or {}, sort_keys=True)
+                                              for m in sp["members"]}) > 1 for sp in specs),
+    }
+    ok(sc and all(has.values()) and "scenario" in WORKER and len({c["id"] for c in sc}) == len(sc),
+       f"RP10 the proof runs pinned scenarios covering {sorted(k for k, v in has.items() if v)}; missing: "
+       f"{sorted(k for k, v in has.items() if not v)}")
+    # Codex r2 P3: the proof records where each side ran; the re-stamp record does not claim a confirmation run
+    try:
+        env = environment()
+        ok(all(str(env.get(k) or "").strip() for k in ("python", "numpy", "starsim", "platform"))
+           and "environment()" in WORKER,
+           f"RP11 each tree's worker records its Python, NumPy, Starsim and platform: {env}")
+        side = lambda tag: {"identity": {"version": tag}, "version": tag, "environment": dict(env), "cases": {"x": 1}}  # noqa: E731
+        ctx = {"coiled_cluster_id": "2317758", "run_id": "proof3", "workspace": "w"}
+        doc = proof_doc("bf24d1b", "c0", "c1", side("0.7"), side("0.8"), [{"kind": "pack", "setting": "s"}], [11], ctx)
+        ok(doc["old"]["environment"] == env and doc["new"]["environment"] == env and doc["execution"] == ctx
+           and doc["identical"], "RP11b the proof names both sides' environments and the cluster and run ids")
+        bare = side("0.8")
+        bare.pop("environment")
+        try:
+            proof_doc("bf24d1b", "c0", "c1", side("0.7"), bare, [], [11], ctx)
+            ok(False, "RP11c a side without its environment fails closed")
+        except ValueError:
+            ok(True, "RP11c a side without its environment fails closed")
+    except Exception as ex:  # noqa: BLE001 -- a missing feature is a failing case
+        ok(False, f"RP11 the proof records its execution environment ({type(ex).__name__}: {ex})")
+    rec = _record({"engine_version": "0.7"}, proof, "abc")
+    ok("confirms" not in rec["note"] and (rec.get("confirmation") or {}).get("validate_once") == "pending",
+       f"RP12 the re-stamp record marks the Coiled confirmation run pending, not done: {rec.get('confirmation')}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -356,11 +487,16 @@ def main(argv=None) -> int:
     ap.add_argument("--seeds", default="11")
     ap.add_argument("--settings", default="")
     ap.add_argument("--workers", type=int, default=2)
+    ap.add_argument("--cluster-id", default="", help="where the proof runs (recorded under execution)")
+    ap.add_argument("--run-id", default="", help="the run's id (recorded under execution)")
+    ap.add_argument("--workspace", default="", help="the Coiled workspace (recorded under execution)")
     a = ap.parse_args(argv)
     if a.cmd == "restamp":
         return restamp()
+    ctx = {k: v for k, v in (("coiled_cluster_id", a.cluster_id), ("run_id", a.run_id),
+                             ("workspace", a.workspace)) if v}
     doc = prove(a.old_ref, [int(x) for x in a.seeds.split(",")], min(a.workers, 2),
-                [x for x in a.settings.split(",") if x] or None)
+                [x for x in a.settings.split(",") if x] or None, context=ctx)
     yaml.safe_dump(doc, open(OUT, "w"), sort_keys=False, width=110)
     bad = [k for k, r in doc["cases"].items() if not r["equal"]]
     print(f"{doc['n_cases']} cases, identical: {doc['identical']}" + (f"; differ: {bad}" if bad else ""))

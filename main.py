@@ -2121,6 +2121,74 @@ def _run_self_test() -> int:
     ok(store_run_results(_run) is None or os.environ.get("MA_STORAGE_ACCOUNT"),
        "ST1 nothing is stored when no account is configured")
     shutil.rmtree(_sr, ignore_errors=True)
+    # ST2 (2026-11-02 v2 run crashed in FIX_LOOP, stored=None): a v2 run that raises is still stored,
+    # with the crash recorded in metadata.json, and the exception still propagates (exit 1).
+    _rs = globals().get("run_v2_and_store")
+    _cr = tempfile.mkdtemp()
+    _stored_calls = []
+
+    def _crash():
+        raise KeyError('"tasks"')
+
+    def _fake_store(rp):
+        _stored_calls.append(json.load(open(os.path.join(rp, "metadata.json"))).get("crash"))
+        return "outputs/runs/x.tar.gz"
+    _raised = False
+    if _rs is not None:
+        try:
+            _rs(_crash, _cr, store=_fake_store)
+        except KeyError:
+            _raised = True
+    ok(_rs is not None and _raised and len(_stored_calls) == 1 and "KeyError" in (_stored_calls[0] or ""),
+       f"ST2 a crashed v2 run is stored with its crash recorded, and the crash still propagates ({_stored_calls})")
+    ok(_rs is not None and _rs(lambda: "completed", _cr, store=lambda rp: _stored_calls.append("ok")) == "completed"
+       and _stored_calls[-1] == "ok", "ST2b a finished v2 run is stored once and its status returned")
+
+    # ST3-ST6 (Codex #130 P2): finalization never replaces the run's own exception or its exit code.
+    def _outcome(fn):
+        try:
+            fn()
+        except BaseException as e:  # noqa: BLE001 -- the exception type is the finding
+            return type(e).__name__
+        return None
+
+    def _raise(exc):
+        def f(*a, **k):
+            raise exc
+        return f
+    for _bad in ("[]", "null", '"x"'):
+        open(os.path.join(_cr, "metadata.json"), "w").write(_bad)
+        _calls = []
+        _got = _outcome(lambda: _rs(_crash, _cr, store=lambda rp: _calls.append(rp)))
+        ok(_got == "KeyError" and len(_calls) == 1,
+           f"ST3 metadata.json holding {_bad}: the run's KeyError survives and the run is still stored ({_got}, {_calls})")
+    open(os.path.join(_cr, "metadata.json"), "w").write("{}")
+    _got = _outcome(lambda: _rs(_crash, _cr, store=_raise(AttributeError("store broke"))))
+    ok(_got == "KeyError", f"ST4 a store that raises does not replace the run's exception ({_got})")
+    _got = _outcome(lambda: _rs(_raise(KeyboardInterrupt()), _cr, store=_raise(AttributeError("store broke"))))
+    ok(_got == "KeyboardInterrupt", f"ST5 an interrupt survives a store that raises ({_got})")
+    ok(_outcome(lambda: _rs(lambda: "completed", _cr, store=_raise(RuntimeError("x")))) is None
+       and _rs(lambda: "completed", _cr, store=_raise(RuntimeError("x"))) == "completed",
+       "ST5b a store failure after a finished run is logged, not raised; the status is returned")
+    _saved_mv2, _saved_argv = globals().get("main_v2"), sys.argv
+    globals()["main_v2"] = _raise(KeyboardInterrupt())
+    sys.argv = ["main.py", "--v2", "Q?"]
+    try:
+        _code = _outcome(lambda: None) or main()
+    except BaseException as e:  # noqa: BLE001
+        _code = type(e).__name__
+    finally:
+        globals()["main_v2"], sys.argv = _saved_mv2, _saved_argv
+    ok(_code == 130, f"ST5c an interrupted v2 run exits 130 ({_code})")
+    _sr6 = tempfile.mkdtemp()
+    _run6 = os.path.join(_sr6, "2026-11-02_000000_y")
+    os.makedirs(_run6)
+    open(os.path.join(_run6, "metadata.json"), "w").write("[]")
+    _got = _outcome(lambda: store_run_results(_run6, service=_FS()))
+    ok(_got is None and isinstance(json.load(open(os.path.join(_run6, "metadata.json"))), dict),
+       f"ST6 store_run_results with a non-object metadata.json neither raises nor keeps the bad value ({_got})")
+    shutil.rmtree(_sr6, ignore_errors=True)
+    shutil.rmtree(_cr, ignore_errors=True)
 
     # WU (Phase 29): every run ends with a report.
     ok(writeup_reserve(450.0) == 36.0 and writeup_reserve(8.0) == 4.0 and writeup_reserve(None) == 0.0,
@@ -2546,6 +2614,42 @@ def eval_refusal(args, here: str) -> str | None:
     return None
 
 
+def _metadata_dict(path: str) -> dict:
+    """metadata.json as a dict; {} when it is missing, unreadable, or valid JSON that is not an object."""
+    try:
+        meta = json.load(open(path)) if os.path.exists(path) else {}
+    except (OSError, ValueError):
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def run_v2_and_store(run, run_path: str, store=None):
+    """Run the v2 machine (`run()` returns its status), then store the run directory, also when
+    `run()` raises (ST2): like the lead pipeline's finalize, upload the run when a storage account is
+    configured and record it in metadata.json, which the cloud launcher reads to stop the cluster.
+    A crash (or an interrupt) is recorded in metadata.json (`crash`) before the upload, then re-raised.
+    Finalization never raises: a failure there is logged, so the run's own exception and its exit
+    code survive (ST3-ST5)."""
+    store = store or store_run_results
+    try:
+        return run()
+    except BaseException as e:
+        try:
+            mp = os.path.join(run_path, "metadata.json")
+            meta = _metadata_dict(mp)
+            meta["crash"] = f"{type(e).__name__}: {e}"[:500]
+            os.makedirs(run_path, exist_ok=True)
+            json.dump(meta, open(mp, "w"), indent=2)
+        except Exception as fe:  # noqa: BLE001 -- never replace the run's exception
+            print(f"[ERROR] crash not recorded in metadata.json: {type(fe).__name__}: {fe}", file=sys.stderr, flush=True)
+        raise
+    finally:
+        try:
+            print(f"v2 run stored: {store(run_path)}", flush=True)
+        except Exception as fe:  # noqa: BLE001 -- never replace the run's exception or status
+            print(f"[ERROR] RUN RESULTS NOT STORED: {type(fe).__name__}: {fe}", file=sys.stderr, flush=True)
+
+
 def main_v2(args) -> int:
     """v2 C: the stage machine drives the run; bounded agent tasks (agents/v2_sdk_tasks.py)
     do the judgement. Resumes from run_state.json with --resume. The lead session, its
@@ -2566,14 +2670,11 @@ def main_v2(args) -> int:
         run_path = os.path.join(REPO_ROOT, "runs", create_run_dir(question))
     print(f"Run (v2): {run_path}", flush=True)
     tasks = v2_sdk_tasks.SdkTasks(run_path, allow_cloud=args.cloud)
-    status = stage_machine.run_v2(question, run_path, tasks, max_rounds=args.max_rounds,
-                                  signoff=args.signoff, budget_usd=args.max_budget_usd,
-                                  derive_unsandboxed=getattr(args, "dev_unsandboxed_derivations", False))
+    status = run_v2_and_store(lambda: stage_machine.run_v2(
+        question, run_path, tasks, max_rounds=args.max_rounds, signoff=args.signoff,
+        budget_usd=args.max_budget_usd, derive_unsandboxed=getattr(args, "dev_unsandboxed_derivations", False)),
+        run_path)
     print(f"v2 status: {status}", flush=True)
-    # Like the lead pipeline's finalize: upload the run when a storage account is configured, and
-    # record it in metadata.json, which the cloud launcher reads to stop the cluster.
-    stored = store_run_results(run_path)
-    print(f"v2 run stored: {stored}", flush=True)
     if status.startswith("paused:"):
         return 2
     return exit_code_for(status)
@@ -2635,7 +2736,10 @@ def main() -> int:
         print(f"REFUSED: {why}", file=sys.stderr)
         return 1
     if args.v2:
-        return main_v2(args)
+        try:
+            return main_v2(args)
+        except KeyboardInterrupt:      # ST5c: as the lead pipeline, an interrupt exits 130
+            return 130
     if args.preflight_only or not args.skip_preflight:
         pf = asyncio.run(run_preflight(allow_cloud=args.cloud))
         print(f"Preflight: {'OK' if pf['ok'] else 'FAILED'} | models="
