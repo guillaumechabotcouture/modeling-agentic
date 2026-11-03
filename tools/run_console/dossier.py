@@ -1289,17 +1289,61 @@ def _self_test_review1(ok, td: str) -> None:
     # DR9 (P2) decision tests: a group rule removed; an envelope test in USD
     def dr9():
         spec = _toy_spec()
-        spec["constraints"]["group_rules"] = {"same_region": {"by": "region", "components": ["a", "b"],
-                                                              "rule": "same_choice"}}
+        spec["constraints"]["group_rules"] = [{"id": "same_region", "by": "region", "components": ["a", "b"],
+                                               "rule": "same_choice", "reason": "one choice per region"}]
         spec["analysis"]["decision_tests"] = [
             {"id": "DT4", "type": "group_rule", "rule": "same_region", "text": "without the region rule?"},
             {"id": "DT5", "type": "envelope", "values": [800000, 1200000], "text": "at other envelopes?"}]
         t = {x["id"]: x for x in _decision_tests(spec, {})}
         ok("None" not in t["DT4"]["varied"] and "same_region" in t["DT4"]["varied"] and "removed" in t["DT4"]["varied"]
+           and "same_choice" in t["DT4"]["varied"] and "do not define" not in t["DT4"]["varied"]
            and t["DT5"]["unit"] == "USD" and "envelope" in t["DT5"]["varied"],
            f"DR9 a removed group rule and an envelope test (USD) say what is varied ({t['DT4']['varied']!r}; "
            f"{t['DT5']})")
     case("DR9", dr9)
+
+    # DR10 (P1, round 2) the units table is hashed and parsed from one read
+    def dr10():
+        d = fresh("dr10")
+        calls, real = [], RC._load_rel
+
+        def counting(run_dir, r):
+            if r == "data/derived/units.csv":
+                calls.append(r)
+            return real(run_dir, r)
+        RC._load_rel = counting
+        try:
+            c = calibration_tab(d)
+        finally:
+            RC._load_rel = real
+        ok(c.get("available") is True and len(calls) == 1,
+           f"DR10 the units table the calibration joins is the bytes whose hash was checked: one read ({len(calls)})")
+    case("DR10", dr10)
+
+    # DR11 (P2, round 2) method none: the freshness checks run first too
+    def dr11():
+        d = fresh("dr11")
+        doc = yaml.safe_load(open(os.path.join(d, CALIBRATION)))
+        doc["data"] = {"method": "none", "units": {}, "diagnostics": {}, "identifiability": {"status": "not_applicable"}}
+        _toy_w(d, CALIBRATION, doc)
+        fresh_ok = calibration_tab(d)
+        _toy_w(d, "data/derived/units.csv", UNITS_CSV.replace("u1,R1,100", "u1,R1,999"))
+        stale = calibration_tab(d)
+        ok(fresh_ok.get("available") is True and stale.get("available") is False
+           and "changed since the analysis" in stale.get("why", ""),
+           f"DR11 a method-none calibration is checked against its inputs like any other ({stale.get('why')})")
+    case("DR11", dr11)
+
+    # DR12 (P2, round 2) a benchmark tolerance keeps its significant digits
+    def dr12():
+        if not node:
+            ok(True, "DR12 skipped: node is not installed")
+            return
+        p = _node(node, "process.stdout.write(criterion({kind: 'compare', compare: 'eq', reference: 1, "
+                        "tolerance: {abs: 1e-15}, error_abs: 0, error_rel: 0})); process.exit(0);\n")
+        ok("1e-15" in p.stdout and "abs: 0;" not in p.stdout,
+           f"DR12 a tolerance of 1e-15 is shown as 1e-15, not 0 ({p.stdout[:160]!r})")
+    case("DR12", dr12)
 
 
 def _self_test() -> int:
