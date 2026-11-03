@@ -2340,14 +2340,37 @@ def _self_test_geometry(ok, td: str) -> None:
     ok(hf.get("reciprocal_swap", {}).get("severity") == "HIGH" and hf["reciprocal_swap"]["scope_declarable"] is False,
        f"IG-M3 the gate carries the open swap as a HIGH finding that cannot be declared ({sorted(hf)})")
     d2 = os.path.join(td, "ig2")
-    m2 = setup(d2, {"reciprocal_swap:0+1": "the owner checked both rows against the source"})
+    why = "the owner checked both rows against the source"
+    m2 = setup(d2, {"reciprocal_swap:0+1": why})
     m2.run(max_steps=12)
     rep = json.load(open(os.path.join(d2, GEO.ARTIFACT)))
+    still = "reciprocal_swap" in {f["kind"] for f in m2.harness_findings()}
     ok(m2.st.state == "SIGN" and m2.st.paused == "awaiting_signoff"
-       and [f.get("accepted") for f in rep["findings"]] == ["the owner checked both rows against the source"]
-       and "reciprocal_swap" not in {f["kind"] for f in m2.harness_findings()},
-       f"IG-M2 accepted by name with a reason, the spec reaches SIGN and the gate no longer carries it "
-       f"({m2.st.state}, {m2.st.paused}, {load_state(d2).tries.get('spec_feedback')})")
+       and [f.get("proposed") for f in rep["findings"]] == [why] and still,
+       f"IG-M2a proposed by name with a reason, the spec reaches SIGN, where the owner decides; until then the gate "
+       f"still carries the swap ({m2.st.state}, {m2.st.paused}, {still})")
+    toolkit.sign(d2, "owner")
+    m2.step()
+    ok(m2.st.state == "EVIDENCE" and "reciprocal_swap" not in {f["kind"] for f in m2.harness_findings()},
+       f"IG-M2b the owner's sign-off approves the proposed exception: the run goes on and the gate no longer carries "
+       f"it ({m2.st.state})")
+    # IG-M4 (review P1): under --signoff lead a proposed HIGH exception pauses for the owner, as a spec sign-off does
+    d4 = os.path.join(td, "ig4")
+    os.makedirs(d4)
+    m4 = setup(os.path.join(d4, "run"), {"reciprocal_swap:0+1": why})
+    m4.st.signoff = "lead"
+    m4.run(max_steps=12)
+    from toolkit.spec import signoff as SO
+    ok(m4.st.state == "SIGN" and m4.st.paused == "awaiting_signoff" and SO.status(m4.run_dir) == "awaiting",
+       f"IG-M4a --signoff lead: a HIGH geometry exception is not lead-signed; the run pauses for the owner "
+       f"({m4.st.state}, {m4.st.paused}, {SO.status(m4.run_dir)})")
+    toolkit.sign(m4.run_dir, "owner")
+    m4.step()
+    ok(m4.st.state == "EVIDENCE" and "reciprocal_swap" not in {f["kind"] for f in m4.harness_findings()},
+       f"IG-M4b once the owner signs, the run goes on with the exception approved ({m4.st.state})")
+    import v2_sdk_tasks as SDK
+    ok({GEO.ARTIFACT, GEO.SIGNOFF_FILE} <= set(SDK.HARNESS_FILES),
+       "IG-M5 the check's record and the owner's geometry sign-off are harness files no task can write")
 
 
 def _self_test_derived(ok, td: str) -> None:

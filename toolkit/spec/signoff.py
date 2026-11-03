@@ -241,6 +241,13 @@ def _self_test() -> int:
             rec = sign(d, "owner")
             ok(rec["sha256"].get(DERIVATIONS_RECORD) and status(d) == "signed",
                f"DI6c the sign-off freezes the derivation record's hash next to the spec's: {sorted(rec['sha256'])}")
+            try:
+                g = json.load(open(os.path.join(d, "data", "geometry_signoff.json")))
+            except (OSError, ValueError):
+                g = {}
+            ok(g.get("signed_by") == "owner" and (g.get("declaration") or {}).get("enabled") is False,
+               f"IG-S2 the sign-off also freezes the geometry declaration (here: no boundaries, check not enabled) in "
+               f"the harness's geometry record ({g.get('declaration')})")
             out = os.path.join(d, "data", "derived", "units.csv")
             with open(out, "a") as f:
                 f.write("99,r0,g0,0,1000,0,0.1,x\n")

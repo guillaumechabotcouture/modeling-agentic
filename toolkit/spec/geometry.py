@@ -711,6 +711,140 @@ def toy_inputs(d: str, area_col: bool = True) -> dict:
     return {u: u for u, *_ in rows}
 
 
+def _high_ids(rep) -> set:
+    return {f["key"] for f in findings(rep) if f["severity"] == "HIGH"}
+
+
+def _self_test_owner(ok, th) -> None:
+    """IG8 (review P1): a HIGH exception is the owner's alone. The spec's entries are proposals; a HIGH one counts
+    only once the owner's sign-off (or `approve --by owner`) has recorded it, bound to the current inputs. IG9
+    (review P2): the sign-off freezes the geometry declaration and the boundary and crosswalk hashes; any later
+    change is HIGH, and an approval lapses when its evidence changes. Labels stay unsigned."""
+    import tempfile
+    import yaml
+    with tempfile.TemporaryDirectory() as d:
+        toy_inputs(d)
+        sp = yaml.safe_load(open(os.path.join(d, SPEC_FILE)))
+        highs = ["reciprocal_swap:swap_a+swap_b", "unmatched:feature:F9", "point_outside_own_polygon:stray",
+                 "area_mismatch:stray", "point_outside_own_polygon:holed"]
+        sp["decision_units"][ACCEPT_KEY] = {k: "the planner says it is fine" for k in highs}
+        sp["decision_units"][ACCEPT_KEY]["area_mismatch:big"] = "known boundary vintage difference"
+        yaml.safe_dump(sp, open(os.path.join(d, SPEC_FILE), "w"))
+        r = check(d, th=th)
+        ok(problems(r) == [] and set(owner_pending(r)) == set(highs) and set(highs) <= _high_ids(r),
+           f"IG8a a HIGH the spec proposes as an exception is not accepted: it stays HIGH at the gate and waits for the "
+           f"owner, without sending the spec back ({sorted(_high_ids(r))}, {owner_pending(r)})")
+        ok("area_mismatch:big" not in {f["key"] for f in findings(r)},
+           "IG8b a MEDIUM stays agent-declarable: the spec's entry with a reason clears it")
+        freeze(d, "lead", th=th)
+        r = check(d, th=th)
+        ok(set(highs) <= _high_ids(r) and set(owner_pending(r)) == set(highs),
+           f"IG8c a lead sign-off approves nothing: the HIGH findings stay ({sorted(_high_ids(r))})")
+        try:
+            approve(d, "lead")
+            ok(False, "IG8d only the owner approves a HIGH exception")
+        except ValueError:
+            ok(True, "IG8d only the owner approves a HIGH exception")
+        rec = freeze(d, "owner", th=th)
+        r = check(d, th=th)
+        sw = next(f for f in r["findings"] if f["id"] == highs[0])
+        ok(_high_ids(r) == set() and owner_pending(r) == [] and sw.get("approved_by") == "owner"
+           and sorted(rec.get("approvals") or {}) == sorted(highs),
+           f"IG8e the owner's sign-off records each proposed HIGH exception, bound to the inputs: none is left open "
+           f"({sorted(_high_ids(r))})")
+        # IG9 the frozen declaration
+        pres = yaml.safe_load(open(os.path.join(d, "presentation.yaml")))
+        yaml.safe_dump(dict(pres, labels={"units_title": "Units"}), open(os.path.join(d, "presentation.yaml"), "w"))
+        r = check(d, th=th)
+        ok(_high_ids(r) == set(), f"IG9a labels stay unsigned: a label edit changes nothing ({sorted(_high_ids(r))})")
+        g = json.load(open(os.path.join(d, "b.geojson")))
+        for f in g["features"]:                       # repoint to polygons whose two ids are exchanged
+            f["properties"]["code"] = {"F2": "F3", "F3": "F2"}.get(f["properties"]["code"], f["properties"]["code"])
+        json.dump(g, open(os.path.join(d, "b2.geojson"), "w"))
+        yaml.safe_dump(dict(pres, boundaries=dict(pres["boundaries"], path="b2.geojson")),
+                       open(os.path.join(d, "presentation.yaml"), "w"))
+        r = check(d, th=th)
+        ok(CHANGED in {f["kind"] for f in findings(r) if f["severity"] == "HIGH"}
+           and CHANGED in {p["code"] for p in problems(r)},
+           f"IG9b repointing the boundaries after sign-off (swapped ids make the planted swap pass) is a HIGH change "
+           f"({[f['kind'] for f in findings(r)][:6]})")
+        yaml.safe_dump({k: v for k, v in pres.items() if k != "boundaries"},
+                       open(os.path.join(d, "presentation.yaml"), "w"))
+        r = check(d, th=th)
+        ok(r["status"] == "not_run" and CHANGED in {f["kind"] for f in findings(r) if f["severity"] == "HIGH"},
+           f"IG9c removing the boundaries after sign-off is a HIGH change, not only a LOW note "
+           f"({[(f['kind'], f['severity']) for f in findings(r)]})")
+        yaml.safe_dump(pres, open(os.path.join(d, "presentation.yaml"), "w"))
+        g = json.load(open(os.path.join(d, "b.geojson")))
+        g["features"][0]["properties"]["note"] = "edited"
+        json.dump(g, open(os.path.join(d, "b.geojson"), "w"))
+        r = check(d, th=th)
+        sw = next(f for f in r["findings"] if f["id"] == highs[0])
+        ok(CHANGED in {f["kind"] for f in findings(r)} and not sw.get("accepted") and highs[0] in _high_ids(r),
+           f"IG9d an edit of the boundary file after sign-off is a HIGH change, and the owner's approval lapses with "
+           f"its evidence ({sw.get('accepted')})")
+        approve(d, "owner")
+        r = check(d, th=th)
+        ok(_high_ids(r) == set(), f"IG9e the owner's approve command re-freezes the current inputs and approves the "
+                                  f"proposals again ({sorted(_high_ids(r))})")
+        open(os.path.join(d, SIGNOFF_FILE), "w").write("{oops")
+        r = check(d, th=th)
+        ok(r["status"] == "failed" and FAILED in {f["kind"] for f in findings(r)},
+           "IG9f an unreadable geometry sign-off record fails closed")
+
+
+def _self_test_shapes(ok, th) -> None:
+    """IG10 (review P2): a degenerate ring fails closed. IG11: overlapping or nested polygons do not crash the
+    reciprocal test. IG12: areas by equal-area integration of edges straight in longitude/latitude: closed forms,
+    and resampling an edge with collinear points leaves the area unchanged."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        bad = {"collinear": [[0, 0], [1, 1], [2, 2], [0, 0]], "two distinct": [[0, 0], [1, 0], [1, 0], [1, 0], [0, 0]],
+               "zero area": [[0, 0], [1, 0], [2, 0], [1, 0], [0, 0]]}
+        got = {}
+        for name, ring in bad.items():
+            for hole in (False, True):
+                coords = [_square(-5, -5, 20), ring] if hole else [ring]
+                json.dump({"type": "FeatureCollection", "features": [{"type": "Feature", "properties": {"code": "F0"},
+                                                                       "geometry": {"type": "Polygon",
+                                                                                    "coordinates": coords}}]},
+                          open(os.path.join(d, "g.geojson"), "w"))
+                try:
+                    read_features({"path": os.path.join(d, "g.geojson"), "feature_id": "code"})
+                    got[(name, hole)] = "read"
+                except GeometryError:
+                    got[(name, hole)] = "failed"
+        ok(all(v == "failed" for v in got.values()),
+           f"IG10 a ring without 3 distinct non-collinear vertices or with no area fails closed, as an outer ring or "
+           f"a hole ({got})")
+    rect = lambda x0, y0, x1, y1: [[_ring([[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]], 0, "t")]]  # noqa: E731
+    feats = {"A": rect(0.5, 0, 1.5, 1), "B": rect(0, 0, 2, 1)}              # A nested inside B
+    rows = [{"u": "a", "x": 1.8, "y": 0.5}, {"u": "b", "x": 1.0, "y": 0.5}]  # a's point in B; b's point in A and B
+    try:
+        ev = evaluate(rows, {"id": "u", "lat": "y", "lon": "x"}, feats, {"a": "A", "b": "B"}, th)
+        codes = sorted((f["code"], f["severity"]) for f in ev["findings"])
+        ok(codes == [("point_outside_own_polygon", "HIGH")],
+           f"IG11 nested polygons: a pair forms only when both points lie outside their own polygons ({codes})")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"IG11 nested polygons: a pair forms only when both points lie outside their own polygons: "
+                  f"{type(e).__name__}: {e}")
+    R2 = 6371.0088 ** 2
+    cell = rect(0, 10, 1, 11)
+    exact = R2 * math.radians(1.0) * (math.sin(math.radians(11)) - math.sin(math.radians(10)))
+    octant = [[_ring([[0, 0], [90, 0], [90, 90], [0, 90], [0, 0]], 0, "t")]]
+    ok(abs(area_km2(cell) / exact - 1) < 1e-9 and abs(area_km2(octant) / (math.pi * R2 / 2) - 1) < 1e-9,
+       f"IG12a closed forms: a 1-degree cell ({area_km2(cell):.4f} vs {exact:.4f}) and an octant of the sphere")
+    big = [[0, 0], [10, 0], [10, 20], [0, 20], [0, 0]]
+    dense = [[0, 0], [10, 0], [10, 20]] + [[10 - 10 * k / 50, 20] for k in range(1, 50)] + [[0, 20], [0, 0]]
+    a1, a2 = area_km2([[_ring(big, 0, "t")]]), area_km2([[_ring(dense, 0, "t")]])
+    tri = [[0, 0], [0.5, 0.1], [0.2, 0.6], [0, 0]]
+    tri_d = [[0, 0]] + [[0.5 * k / 9, 0.1 * k / 9] for k in range(1, 10)] + [[0.2, 0.6], [0, 0]]
+    t1, t2 = area_km2([[_ring(tri, 0, "t")]]), area_km2([[_ring(tri_d, 0, "t")]])
+    ok(abs(a2 / a1 - 1) < 1e-9 and abs(t2 / t1 - 1) < 1e-9,
+       f"IG12b resampling an edge with collinear points leaves the area unchanged ({a1:.1f} vs {a2:.1f} km2; "
+       f"{t1:.4f} vs {t2:.4f} km2)")
+
+
 def _self_test() -> int:
     import tempfile
     import yaml
@@ -890,6 +1024,12 @@ def _self_test() -> int:
     t = thresholds()
     ok(t["edge_tolerance_km"] > 0 and t["area_ratio_max"] > 1,
        f"IG6 the thresholds come from effort_floors.yaml input_checks.geometry: {t}")
+    for name, fn in (("IG8-IG9 owner approval and the frozen declaration", _self_test_owner),
+                     ("IG10-IG12 degenerate rings, overlapping polygons, area", _self_test_shapes)):
+        try:
+            fn(ok, th)
+        except Exception as e:  # noqa: BLE001 -- a missing function (step alpha) is a failure, not a crash
+            ok(False, f"{name}: {type(e).__name__}: {e}")
     # IG7 disease-agnostic (CLAUDE.md): no disease, place or intervention words in this module's code
     sys.path.insert(0, os.path.join(ROOT, "scripts"))
     import pipeline as P
