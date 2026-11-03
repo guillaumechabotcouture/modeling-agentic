@@ -1,6 +1,6 @@
 ---
 phase: "v2"
-commit: "HW α-β4"
+commit: "HW α-β5"
 ---
 
 ## Changelog
@@ -33,4 +33,11 @@ The focused check at c22b0e6 led to the following changes (WA21-WA23, each repro
 - `batch.ship` and `merge_shipped` take a required `root=` (in β3 this was `run_dir`). `optimize.benchmark(out=...)` outside a run dir needs `root=`. Neither takes the root from the output path.
 - A remote chunk's `--no-ledger` outputs are anchored at the call dir its worker made (`--out-root`).
 - The audit treats every `partial(open, ...)` as a writer. It flags any argv whose `argv[0]` is a shell and that includes `-c`, `-lc`, `-ec` and similar flags.
+
+Following the focused check at 32a30f2 (WA24-WA25):
+- `analysis_backend.cross_check` now takes the trusted `run_dir` as a required argument, and the stage machine passes it.
+  - Before, it passed its own output dir as the root.
+  - Its units subset is now published below the run dir, with no link followed.
+- The `configure` / `analyze` CLI now takes its root from `MA_PIPELINE_RUN_DIR`, which `scripts/pipeline.py` sets for each step. It no longer uses the spec's directory. It creates its output dir with no link followed.
+- New audit rule `safeio-derived-root`: it flags a `safe_io` root or primitive base derived from the path or the cwd (`os.path.dirname`, `os.getcwd`, `Path.cwd`). There are no such sites in the tree.
 

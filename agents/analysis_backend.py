@@ -136,27 +136,30 @@ def eligible_engines(spec: dict, engines=None) -> list[dict]:
     return rows
 
 
-def cross_check(spec: dict, refs: list[str], work_dir: str, n_units: int = 8) -> dict:
-    """Run the analysis on the first `n_units` units with each engine and compare the plans."""
+def cross_check(spec: dict, refs: list[str], work_dir: str, n_units: int = 8, *, run_dir: str) -> dict:
+    """Run the analysis on the first `n_units` units with each engine and compare the plans. `work_dir` lies in the
+    trusted `run_dir` (required), and every file this writes there is anchored at `run_dir` with no link followed."""
     import csv
+    import io
+    from toolkit.analysis.artifacts import _safe_io
     plans = {}
     for ref in refs:
         s = copy.deepcopy(spec)
         s["engine"] = ref
         d = os.path.join(work_dir, ref.replace(":", "_").replace(".", "_"))
-        os.makedirs(d, exist_ok=True)
         src = s["decision_units"]["csv"]
         rows = list(csv.DictReader(open(src)))[:n_units]
         sub = os.path.join(d, "units.csv")
-        with open(sub, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=list(rows[0]))
-            w.writeheader()
-            w.writerows(rows)
+        buf = io.StringIO(newline="")
+        w = csv.DictWriter(buf, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+        _safe_io().publish(sub, buf.getvalue(), run_dir)     # creates d below run_dir with no link followed
         s["decision_units"]["csv"] = sub
         if isinstance(s.get("options", {}).get("units"), dict):
             s["options"]["units"]["csv"] = sub
         s.setdefault("uncertainty", {})["draws"] = min(int(s["uncertainty"].get("draws", 4)), 4)
-        _configure(s, d, d)
+        _configure(s, d, run_dir)
         A = _analyze(s, d)
         plans[ref] = {u: p for u, p in _plan_of(d).items()}
         plans[ref + "#headline"] = A["point"]["averted"]
@@ -499,7 +502,7 @@ class _ToolkitApi:
         from toolkit.spec import signoff
         return signoff.status(run_dir)
 
-    def cross_check(self, spec, refs, work_dir, n_units: int = 8):
+    def cross_check(self, spec, refs, work_dir, n_units: int = 8, *, run_dir: str):
         return {"skipped": "the cross-engine check runs on the spike analysis only; not yet for workstream B's"}
 
     def validate(self, spec, base=None) -> list[str]:
@@ -566,11 +569,25 @@ def main(argv=None) -> int:
     if argv[:1] == ["--self-test"]:
         return _self_test()
     if len(argv) == 3 and argv[0] in ("configure", "analyze"):
+        # the trusted run dir is the one the pipeline runs this step in (scripts/pipeline.py sets it per step); never
+        # taken from the spec's path, the output dir or the cwd
+        run_dir = os.environ.get("MA_PIPELINE_RUN_DIR")
+        if not run_dir:
+            print("ERROR: MA_PIPELINE_RUN_DIR is not set: run this step through scripts/pipeline.py", file=sys.stderr)
+            return 2
         spec = merged_spec(os.path.dirname(os.path.abspath(argv[1])))   # the spec's directory is the run directory
         out = os.path.abspath(argv[2])
-        os.makedirs(out, exist_ok=True)
+        from toolkit.analysis.artifacts import _safe_io
+        sio = _safe_io()
+        fd, rel = sio.anchored(os.path.join(out, ".keep"), run_dir)     # out lies in the run dir; made no-follow
+        try:
+            parts = rel.split("/")[:-1]
+            if parts:
+                os.close(sio.dir_fd_nofollow(fd, parts, create=True))
+        finally:
+            os.close(fd)
         if argv[0] == "configure":
-            print(json.dumps(_configure(spec, out, os.path.dirname(os.path.abspath(argv[1])))))
+            print(json.dumps(_configure(spec, out, run_dir)))
         else:
             A = _analyze(spec, out)
             print(json.dumps({"point": A["point"]["averted"], "wall_s": A.get("wall_s")}, default=float))
@@ -699,7 +716,7 @@ def _self_test() -> int:
         dtf = [f for f in gate_findings(d) if f["kind"] == "decision_test_changes_plan"]
         ok(dtf and dtf[0].get("decision_bearing") and dtf[0]["severity"] == "HIGH",
            "B18 a measured decision test that changes the plan is a decision-bearing HIGH")
-        cc = cross_check(merged_spec(d), ["toolkit.engines.contract:ToyEngine"] * 2, os.path.join(d, "xc"), 8)
+        cc = cross_check(merged_spec(d), ["toolkit.engines.contract:ToyEngine"] * 2, os.path.join(d, "xc"), 8, run_dir=d)
         ok(cc["agreement"] == 1.0 and cc["units"] == 8, f"B13 the cross-engine check compares plans (same engine twice agrees) {cc['agreement']}")
     from types import SimpleNamespace as NS
     fake = NS(validate=lambda s, b=None: [], headline=lambda d: {}, gate_findings=lambda d: [],

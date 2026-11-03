@@ -751,6 +751,7 @@ def _run_cmd(cmd, cwd, timeout_s, env, shell=False):
 
 def _exec_step(step: dict, run_dir: str, timeout_s: float, python: str | None) -> tuple[int | None, str]:
     env = script_env()
+    env["MA_PIPELINE_RUN_DIR"] = run_dir     # the trusted root a harness step writes under (the dir it runs in)
     # A fresh bytecode cache per step: Python trusts a .pyc whose source has the same
     # size and mtime second, so an edit made within a second of the last run would
     # otherwise run the old code (seen in this file's self-test).

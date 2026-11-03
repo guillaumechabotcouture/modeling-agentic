@@ -1079,7 +1079,7 @@ class Machine:
             try:
                 rec["cross_check"] = self.backend.cross_check(
                     spec, [pick] + [r["ref"] for r in eligible if r["ref"] != pick][:1],
-                    os.path.join(self.run_dir, "analysis", "cross_check"))
+                    os.path.join(self.run_dir, "analysis", "cross_check"), run_dir=self.run_dir)
             except Exception as e:  # noqa: BLE001 -- recorded; the check is optional
                 rec["cross_check"] = {"error": f"{type(e).__name__}: {e}"}
         _write_json(self.run_dir, AB.ENGINE_CHOICE, rec)     # the spec stays as signed

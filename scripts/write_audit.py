@@ -29,6 +29,8 @@ file by path:
   subprocess.* with shell=True (or a non-constant shell=), an argv whose argv[0] (or env's argv[1]) is a shell
   (sh, bash, zsh, dash, ksh, fish by basename) with -c / -lc / -ec ..., os.system / os.popen /
   os.spawn*, asyncio.create_subprocess_shell               a shell can redirect into any path: each is reviewed
+  lib.safe_io publish / append_text / remove_path / anchored, or a no-follow primitive, whose root or base is
+  derived from the path or the cwd (os.path.dirname, os.getcwd, Path.cwd): the root must be the caller's
   lib.safe_io publish / append_text / remove_path / anchored without a run root (omitted or None): the trusted
                                                            root is mandatory (safe_io also refuses an omitted or
                                                            None root at run time, with no parent fallback)
@@ -69,6 +71,9 @@ _OPENS = ("open", "io.open", "codecs.open", "builtins.open", "os.fdopen")
 _SIO_MODS = ("lib.safe_io", "scripts.lib.safe_io", "safe_io")
 _SIO_GETTERS = ("_sio", "_safe_io")
 _SIO_ROOT_ARG = {"publish": 2, "append_text": 2, "remove_path": 1, "anchored": 1}   # index of the run-root argument
+_SIO_BASE_ARG = {**_SIO_ROOT_ARG, "write_nofollow": 0, "open_append_nofollow": 0, "remove_nofollow": 0,
+                 "rename_nofollow": 0, "copy_nofollow": 0, "dir_fd_nofollow": 0}         # ... and of a primitive's base
+_DERIVED_ROOT = {"os.path.dirname", "os.getcwd", "os.getcwdb", "pathlib.Path.cwd", "Path.cwd"}
 _GETATTR_WRITERS = {"open", "fdopen"} | _OS_WRITE | _SHUTIL | _METHOD_WRITES | _NP_SAVE
 _SUBPROCESS = {"subprocess.run", "subprocess.call", "subprocess.check_call", "subprocess.check_output",
                "subprocess.Popen", "asyncio.create_subprocess_exec"}
@@ -128,7 +133,7 @@ class _Scan(ast.NodeVisitor):
 
     def _sio_fn(self, f) -> str | None:
         """The lib.safe_io function a call targets (publish, append_text, remove_path, anchored), or None."""
-        if isinstance(f, ast.Attribute) and f.attr in _SIO_ROOT_ARG:
+        if isinstance(f, ast.Attribute) and f.attr in _SIO_BASE_ARG:
             b = f.value
             if (isinstance(b, ast.Call) and isinstance(b.func, ast.Name) and b.func.id in _SIO_GETTERS) or (
                     isinstance(b, ast.Name) and (b.id in self.sio or self.alias.get(b.id) in _SIO_MODS)):
@@ -137,7 +142,7 @@ class _Scan(ast.NodeVisitor):
             return f.attr if d in _SIO_MODS else None
         d = self._dotted(f) or ""
         mod, _, tail = d.rpartition(".")
-        return tail if mod in _SIO_MODS and tail in _SIO_ROOT_ARG else None
+        return tail if mod in _SIO_MODS and tail in _SIO_BASE_ARG else None
 
     def _shell(self, node, name, kw) -> bool:
         if name in ("os.system", "os.popen", "asyncio.create_subprocess_shell") or name.startswith("os.spawn"):
@@ -182,11 +187,15 @@ class _Scan(ast.NodeVisitor):
         mod = name.rsplit(".", 1)[0] if "." in name else ""
         sio = self._sio_fn(f)
         if sio:
-            i = _SIO_ROOT_ARG[sio]
-            root = node.args[i] if len(node.args) > i else kw.get("root")
+            i = _SIO_BASE_ARG[sio]
+            root = node.args[i] if len(node.args) > i else kw.get("root" if sio in _SIO_ROOT_ARG else "base")
             starred = any(isinstance(a, ast.Starred) for a in node.args) or any(k.arg is None for k in node.keywords)
-            if not starred and (root is None or (isinstance(root, ast.Constant) and root.value is None)):
+            if sio in _SIO_ROOT_ARG and not starred and (
+                    root is None or (isinstance(root, ast.Constant) and root.value is None)):
                 self.add("safeio-no-root", node)
+            elif root is not None and any(isinstance(n, ast.Call) and (self._dotted(n.func) or "") in _DERIVED_ROOT
+                                          for n in ast.walk(root)):
+                self.add("safeio-derived-root", node)   # a root taken from the path or the cwd, not the caller's
         if name == "getattr" and len(node.args) > 1 and isinstance(node.args[1], ast.Constant) and \
                 node.args[1].value in _GETATTR_WRITERS:
             self.add("getattr-writer", node)
@@ -263,8 +272,7 @@ _TMP_REASON = "a temporary directory this process created (tempfile / the worker
 _FIX = "self-test fixture code in a helper the skip rule does not name"
 # REVIEWED: write sites that cannot write inside a run dir a run's agents can reach.
 REVIEWED: dict = {
-    "agents/analysis_backend.py": {"open-write": (2, "cross_check's units subset in its own temporary work dir; "
-                                                    "write_toy_units (a fixture)")},
+    "agents/analysis_backend.py": {"open-write": (1, "write_toy_units (a fixture)")},
     "agents/run_preflight.py": {"shutil": (1, "removes the preflight's own temporary work dir")},
     "scripts/assemble_changes.py": {"open-write": (3, _REPO), "os-remove": (1, _REPO)},
     "scripts/cloud_batch.py": {"open-write": (2, "the operator's local batch files")},
