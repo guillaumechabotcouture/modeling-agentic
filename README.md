@@ -143,10 +143,17 @@ python main.py "Which districts should receive measles follow-up campaigns next 
 | `--max-rounds N` | 5 | Max critique-revision cycles |
 | `--max-sessions N` | 10 | Max top-level sessions (for retry-after-crash / context recovery) |
 | `--resume runs/<dir>` | — | Resume a prior run from its `pipeline_state.yaml` or detected artifacts |
+| `--signoff owner\|lead\|none` | owner | Who signs the decision brief before compute: the owner (the run waits; sign with `python3 scripts/decision_brief.py sign <run_dir>`), the lead (unattended test runs), or nobody |
+| `--signoff-hours H` | 24 | How long an owner sign-off wait lasts before the run pauses (resumable with `--resume`) |
+| `--max-budget-usd X` | — | Hard dollar cap for the whole run, including earlier sessions of a resumed run; stops with `budget_exhausted` (the final gate still runs) |
+| `--methods-critic` | off | Add `critique-methods` to every critique round |
+| `--cross-model` | off | Add a cross-model critic (Codex CLI) to every critique round; sends run artifacts to OpenAI |
 | `--cloud` | off | Pass Azure credentials to agents for Batch UQ |
+| `--preflight-only` | — | Run the ~1-minute live preflight (real CLI, models, PATH, framework imports) and exit |
+| `--skip-preflight` | off | Skip the live preflight before a run (not recommended) |
 | `--self-test` | — | Run inline self-tests (no API calls) and exit |
 
-Exit codes: 0 accepted (`completed`, `completed_with_report_restored`); 2 finished without an accepted gate (`completed_scope_declared`, `completed_gate_not_accepted`, `completed_gate_error`, `completed_gate_not_run`, `completed_no_report`, `run_failed`); 1 `harness_tampered` or error; 130 interrupted.
+Exit codes: 0 accepted (`completed`, `completed_with_report_restored`); 2 finished without an accepted gate, or paused (`completed_scope_declared`, `completed_gate_not_accepted`, `completed_gate_error`, `completed_gate_not_run`, `completed_no_report`, `run_failed`, `budget_exhausted`, `awaiting_signoff`, `awaiting_scope_signoff`, `completed_scope_declined`); 1 `harness_tampered`, `artifact_tampered`, or error; 130 interrupted. The two `awaiting_*` statuses resume with `--resume` once signed.
 
 ## Run outputs
 
@@ -250,3 +257,7 @@ modeling-agentic/
 ## Giving feedback
 
 File issues at the project repo, or use `/feedback` during a Claude Code session.
+
+## License
+
+MIT; see [LICENSE](LICENSE).
