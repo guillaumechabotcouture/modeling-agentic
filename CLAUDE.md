@@ -160,39 +160,9 @@ Before opening a PR, every command below must report
 "OK: all self-test cases passed." (or exit 0):
 
 ```bash
-for f in main.py \
-  scripts/alloc_toolkit_use.py scripts/allocation_robustness.py scripts/ask.py scripts/benchmark_gate.py scripts/benchmark_match.py \
-  scripts/benchmark_transfer.py scripts/model_card.py \
-  scripts/build_claims_ledger.py scripts/data_schema.py scripts/data_use.py \
-  scripts/cloud_batch.py scripts/coherence_audit.py \
-  scripts/comparator_efficiency.py scripts/compare_models.py scripts/compute.py scripts/convergence_report.py \
-  scripts/cross_model_critic.py scripts/decision_brief.py scripts/derived_rebuild.py scripts/done_when.py \
-  scripts/effect_size_registry.py \
-  scripts/assemble_changes.py \
-  scripts/effect_concordance.py \
-  scripts/effort_floors.py scripts/eligibility_probe.py \
-  scripts/figure_validator.py scripts/gate_replay.py scripts/headline_binding.py scripts/identifiability.py \
-  scripts/identifiability_a_priori.py scripts/lessons.py scripts/mechanism_manifest.py \
-  scripts/calibration_spec.py \
-  scripts/gate_fuzz.py \
-  scripts/numeric_consistency.py scripts/open_problems.py scripts/pipeline.py \
-  scripts/optimization_quality.py scripts/plan_criteria.py \
-  scripts/propagate_uncertainty.py scripts/render_claims.py \
-  scripts/results_store.py scripts/run_autopsy.py \
-  cloud/run_health.py \
-  scripts/sanity_checks.py scripts/sdk_scenarios.py \
-  scripts/sensitivity_analysis.py \
-  scripts/source_checks.py scripts/stall_rule.py \
-  scripts/spec_compliance.py scripts/structure_metrics.py scripts/validate_critique_yaml.py \
-  scripts/verdict_binding.py scripts/eval_suite.py scripts/lib/eval_paths.py \
-  scripts/uq_ci_quality.py scripts/validate_skill_attachments.py scripts/watch_run.py \
-  scripts/within_zone_sensitivity.py scripts/writer_qa.py \
-  scripts/lib/expert_priors.py scripts/lib/md_helpers.py \
-  scripts/lib/positive_control.py scripts/lib/provenance.py \
-  scripts/lib/rigor_artifacts.py scripts/lib/safe_io.py \
-  toolkit/alloc/costs.py toolkit/alloc/packages.py toolkit/alloc/optimize.py \
-  scripts/lib/text_spans.py scripts/lib/transcript_cost.py \
-  scripts/declaration_tests.py scripts/lib/scope_declarations.py scripts/scope_signoff.py; do
+for f in main.py $(git ls-files 'scripts/*.py' 'scripts/lib/*.py' 'toolkit/**/*.py' 'cloud/*.py'); do
+  case "$f" in */__init__.py) continue;; esac
+  grep -q -- '--self-test' "$f" || continue   # same discovery as CI
   echo "== $f"; python3 "$f" --self-test || echo "FAILED: $f"
 done
 python3 scripts/validate_skill_attachments.py      # frontmatter + phantoms
