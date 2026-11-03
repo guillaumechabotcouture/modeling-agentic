@@ -746,10 +746,12 @@ def _signoff(run_dir: str) -> dict | None:
         return None
 
 
-def sign(run_dir: str, by: str, note: str = "") -> dict:
+def sign(run_dir: str, by: str, note: str = "", expect_sha256: str | None = None) -> dict:
     rec = {"by": by, "note": note, "at": _now(), "spec_sha256": signed_hash(run_dir)}
     if rec["spec_sha256"] is None:
         raise ValueError(f"no {AB.SPEC_FILE} to sign")
+    if expect_sha256 is not None and rec["spec_sha256"] != expect_sha256:
+        raise ValueError(f"{AB.SPEC_FILE} changed since it was shown; read it again before signing")
     with open(os.path.join(run_dir, SIGNOFF_FILE), "w") as f:
         json.dump(rec, f, indent=1)
     return rec
@@ -2076,27 +2078,27 @@ def _self_test() -> int:
             import traceback
             traceback.print_exc()
             ok(False, f"DI machine tests: {type(e).__name__}: {e}")
-        # T61 (run console review, finding 6): `sign --expect-sha256` refuses a spec other than the one shown.
+        # T70 (run console review, finding 6): `sign --expect-sha256` refuses a spec other than the one shown.
         from toolkit.spec import schema as _S, signoff as _SO
-        d61 = os.path.join(td, "t61")
-        os.makedirs(d61)
-        _S.toy_spec(d61)
+        d70 = os.path.join(td, "t61")
+        os.makedirs(d70)
+        _S.toy_spec(d70)
         import contextlib
         import io
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             try:
-                rc = main(["sign", d61, "--by", "owner", "--note", "n", "--expect-sha256", "0" * 64])
+                rc = main(["sign", d70, "--by", "owner", "--note", "n", "--expect-sha256", "0" * 64])
             except SystemExit as e:
                 rc = e.code
-            st61 = _SO.status(d61)
+            st70 = _SO.status(d70)
             try:
-                rc2 = main(["sign", d61, "--by", "owner", "--note", "n", "--expect-sha256",
-                            hashlib.sha256(open(os.path.join(d61, AB.SPEC_FILE), "rb").read()).hexdigest()])
+                rc2 = main(["sign", d70, "--by", "owner", "--note", "n", "--expect-sha256",
+                            hashlib.sha256(open(os.path.join(d70, AB.SPEC_FILE), "rb").read()).hexdigest()])
             except SystemExit as e:
                 rc2 = e.code
-        ok(rc not in (0, None) and st61 == "awaiting" and rc2 == 0 and _SO.status(d61) == "signed",
-           f"T61 stage_machine.py sign --expect-sha256 refuses another spec's sha and signs the shown one "
-           f"(rc {rc}, {st61}; rc {rc2}, {_SO.status(d61)})")
+        ok(rc not in (0, None) and st70 == "awaiting" and rc2 == 0 and _SO.status(d70) == "signed",
+           f"T70 stage_machine.py sign --expect-sha256 refuses another spec's sha and signs the shown one "
+           f"(rc {rc}, {st70}; rc {rc2}, {_SO.status(d70)})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -2401,6 +2403,8 @@ def main(argv=None) -> int:
     s2.add_argument("run_dir")
     s2.add_argument("--by", choices=["owner"], required=True)
     s2.add_argument("--note", default="")
+    s2.add_argument("--expect-sha256", default=None,
+                    help="the sha256 of the decision_spec.yaml the owner read; a different spec is not signed")
     a = ap.parse_args(argv)
     if a.cmd == "status":
         st = load_state(a.run_dir)
@@ -2412,7 +2416,12 @@ def main(argv=None) -> int:
             print(h)
         return 0
     b = AB.backend()
-    rec = b.sign(a.run_dir, a.by, a.note) if getattr(b, "sign", None) else sign(a.run_dir, a.by, a.note)
+    kw = {"expect_sha256": a.expect_sha256} if a.expect_sha256 else {}
+    try:
+        rec = b.sign(a.run_dir, a.by, a.note, **kw) if getattr(b, "sign", None) else sign(a.run_dir, a.by, a.note, **kw)
+    except ValueError as e:
+        print(f"Not signed: {e}", file=sys.stderr)
+        return 1
     print(json.dumps(rec, default=str))
     return 0
 

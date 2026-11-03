@@ -616,22 +616,40 @@ def brief_side(label):
     return {"run_dir": rd, "status": r.stdout.strip() or r.stderr.strip(), "brief_md": md}
 
 
-def sign_side(label, answers_yaml, note):
+def sign_side(label, answers_yaml, note, run_name=None, expect_spec_sha256=None, _runner=None):
+    """The owner's answer for the newest run on `label`. `run_name` (the run console passes it): the run dir the
+    owner was shown; another newest run is refused. A pending scope sign-off is answered first; else a v2 run
+    (run_state.json) signs its spec through agents/stage_machine.py sign, which needs `expect_spec_sha256`; else
+    the v1 brief. `_runner` is for the self-test."""
     import os, subprocess, sys, tempfile
+    run = _runner or subprocess.run
     rd = _run_dir(label)
     if not rd:
         return {"rc": 1, "out": "no run directory yet"}
+    name = os.path.basename(rd.rstrip("/"))
+    if run_name is not None and name != run_name:
+        return {"rc": 1, "out": f"not signed: the newest run on {label} is {name}, not {run_name} (the run shown)"}
+    env = {k: v for k, v in os.environ.items() if k != "MA_SIGNOFF_MODE"}
+    # Phase 49 β: a pending scope sign-off (AWAIT_OWNER) is answered first; else the spec or the brief.
+    st = run([sys.executable, "scripts/scope_signoff.py", "status", rd], cwd=f"{WORK}/{label}",
+             env=env, capture_output=True, text=True).stdout.strip()
+    if st != "awaiting" and os.path.exists(os.path.join(rd, "run_state.json")):
+        if not expect_spec_sha256:
+            return {"rc": 1, "out": "not signed: a v2 spec is signed with the sha256 of the spec the owner read "
+                                    "(--expect-spec-sha256)"}
+        cmd = [sys.executable, "agents/stage_machine.py", "sign", rd, "--by", "owner", "--note", note,
+               "--expect-sha256", expect_spec_sha256]
+        r = run(cmd, cwd=f"{WORK}/{label}", env=env, capture_output=True, text=True)
+        return {"rc": r.returncode, "out": (r.stdout + r.stderr).strip()}
     fd, p = tempfile.mkstemp(suffix=".yaml")
     os.write(fd, answers_yaml.encode())
     os.close(fd)
-    env = {k: v for k, v in os.environ.items() if k != "MA_SIGNOFF_MODE"}
-    # Phase 49 β: a pending scope sign-off (AWAIT_OWNER) is answered first; else the brief.
-    st = subprocess.run([sys.executable, "scripts/scope_signoff.py", "status", rd], cwd=f"{WORK}/{label}",
-                        env=env, capture_output=True, text=True).stdout.strip()
-    script = "scripts/scope_signoff.py" if st == "awaiting" else "scripts/decision_brief.py"
-    r = subprocess.run([sys.executable, script, "sign", rd, "--by", "owner",
-                        "--answers", p, "--note", note], cwd=f"{WORK}/{label}", env=env,
-                       capture_output=True, text=True)
+    try:
+        script = "scripts/scope_signoff.py" if st == "awaiting" else "scripts/decision_brief.py"
+        r = run([sys.executable, script, "sign", rd, "--by", "owner", "--answers", p, "--note", note],
+                cwd=f"{WORK}/{label}", env=env, capture_output=True, text=True)
+    finally:
+        os.remove(p)
     return {"rc": r.returncode, "out": (r.stdout + r.stderr).strip()}
 
 

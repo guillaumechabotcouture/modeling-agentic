@@ -18,9 +18,9 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import hashlib
 import json
 import os
-import shutil
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -94,10 +94,19 @@ def signed_sha(run_dir: str) -> str | None:
     return (rec.get("sha256") or {}).get(SPEC) if rec else None
 
 
-def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, accept_proposed: bool = False) -> dict:
+def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, accept_proposed: bool = False,
+         expect_sha256: str | None = None) -> dict:
+    """`expect_sha256`: the hash of the spec the owner was shown (the run console passes it). Another spec is
+    refused; without a brief, the record and the signed copy are made from the same bytes that were checked."""
     path = os.path.join(run_dir, SPEC)
     if not os.path.exists(path):
         raise ValueError(f"{SPEC} does not exist")
+    with open(path, "rb") as f:
+        data = f.read()
+    sha = hashlib.sha256(data).hexdigest()
+    if expect_sha256 is not None and sha != expect_sha256:
+        raise ValueError(f"{SPEC} changed since it was shown (sha256 {sha[:12]}, shown {str(expect_sha256)[:12]}): "
+                         "read it again before signing")
     errs = schema.validate(schema.load(path), pending_ok=True)
     if errs:
         raise ValueError("spec not ready: " + "; ".join(errs[:10]))
@@ -105,13 +114,18 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
         raise ValueError("the spec is already signed; a change needs a new sign-off by the owner")
     if os.path.exists(os.path.join(run_dir, DB.BRIEF)):
         DB.sign(run_dir, by, answers=answers, note=note, accept_proposed=accept_proposed)
-        return _freeze_record(run_dir, os.path.join(run_dir, DB.SIGNOFF))
+        rec = _freeze_record(run_dir, os.path.join(run_dir, DB.SIGNOFF))
+        if expect_sha256 is not None and (rec.get("sha256") or {}).get(SPEC) != expect_sha256:
+            os.remove(os.path.join(run_dir, DB.SIGNOFF))   # the spec changed while the brief was being signed
+            raise ValueError(f"{SPEC} changed while it was being signed; read it again")
+        return rec
     record = {"signed_by": by, "signed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "note": note,
-              "sha256": {SPEC: DB._sha(path), DERIVATIONS_RECORD: DB._sha(os.path.join(run_dir, DERIVATIONS_RECORD))},
+              "sha256": {SPEC: sha, DERIVATIONS_RECORD: DB._sha(os.path.join(run_dir, DERIVATIONS_RECORD))},
               "producer": "toolkit/spec/signoff.py",
               "schema_version": schema.SCHEMA_VERSION}
     os.makedirs(os.path.join(run_dir, DB.SIGNED_DIR), exist_ok=True)
-    shutil.copyfile(path, os.path.join(run_dir, DB.SIGNED_DIR, SPEC))
+    with open(os.path.join(run_dir, DB.SIGNED_DIR, SPEC), "wb") as f:
+        f.write(data)                      # the bytes that were hashed, not a second read of the file
     with open(os.path.join(run_dir, SPEC_SIGNOFF), "w", encoding="utf-8") as f:
         json.dump(record, f, indent=1)
     return record

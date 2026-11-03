@@ -6,7 +6,8 @@
     python cloud/run_cluster.py <config.py> brief|report      # decision brief / convergence measures of a live run
     python cloud/run_cluster.py <config.py> health [--loop] [--interval S] [--log PATH] [--thresholds YAML]
                                                               # anomalies of a live run (cloud/run_health.py)
-    python cloud/run_cluster.py <config.py> sign <answers.yaml> [note]   # the brief, or pending scope declarations
+    python cloud/run_cluster.py <config.py> sign <answers.yaml> [--label L] [--run RUN] [--expect-spec-sha256 SHA] [note]
+                                                              # pending scope declarations, a v2 spec, or the brief
     python cloud/run_cluster.py <config.py> relaunch <label>
     python cloud/run_cluster.py <config.py> shutdown          # cluster, overflow pool and keeper, by hand
     python cloud/run_cluster.py <config.py> report-cost [--ledger PATH]... [--start ISO] [--end ISO]
@@ -830,6 +831,25 @@ def relaunch(cfg, label):
                          eval_inputs_sha256=eval_paths.archive_sha256(code))
     json.dump(assign, open(cfg.state_file, "w"), indent=1)
     print(f"re-fired {label} -> {assign[label]['worker']} @ {commit}")
+
+
+def parse_sign_args(rest: list, labels) -> dict:
+    """`sign <answers.yaml> [--label L] [--run RUN_DIR_NAME] [--expect-spec-sha256 SHA] [note ...]`. The options
+    name the remote run the owner was shown (the run console passes all three); without --label the config's
+    first label is used, as before."""
+    if not rest:
+        raise SystemExit("sign needs <answers.yaml>")
+    out, i = {"answers": rest[0], "label": None, "run": None, "expect": None}, 1
+    flags = {"--label": "label", "--run": "run", "--expect-spec-sha256": "expect"}
+    while i < len(rest) and rest[i] in flags:
+        if i + 1 >= len(rest):
+            raise SystemExit(f"sign: {rest[i]} needs a value")
+        out[flags[rest[i]]] = rest[i + 1]
+        i += 2
+    out["note"] = " ".join(rest[i:])
+    if out["label"] is not None and out["label"] not in labels:
+        raise SystemExit(f"sign: label {out['label']} is not one this config runs ({', '.join(labels)})")
+    return out
 
 
 def _side(cfg, fn, *args, label=None):
@@ -1796,7 +1816,13 @@ def main(argv) -> int:
     elif cmd == "health":
         return health(cfg, rest)
     elif cmd == "sign":
-        r = _side(cfg, ws.sign_side, open(rest[0]).read(), " ".join(rest[1:]))
+        a = parse_sign_args(rest, cfg.labels)
+        try:   # sent by value: a worker uploaded before --run existed still runs this sign_side
+            import cloudpickle
+            cloudpickle.register_pickle_by_value(ws)
+        except ImportError:
+            pass
+        r = _side(cfg, ws.sign_side, open(a["answers"]).read(), a["note"], a["run"], a["expect"], label=a["label"])
         print(r["out"])
         return r["rc"]
     else:
