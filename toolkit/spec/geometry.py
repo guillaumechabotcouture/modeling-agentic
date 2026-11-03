@@ -1145,6 +1145,28 @@ def _self_test_shapes(ok, th) -> None:
            f"IG14d a unit whose feature is an empty MultiPolygon is unmatched ({r_empty['reason']})")
         ok(r_crs["status"] == "failed" and "CRS" in r_crs["reason"] and r_crs84["status"] == "ran",
            f"IG14e a projected CRS is refused; CRS84 is accepted ({r_crs['reason'][:80]})")
+    # IG15 (focused check of #131, P2): union members must not overlap, or the union's area would count the overlap
+    # twice (two rectangles whose union is 1.2 square degrees counted as 2.0); touching members are fine
+    sets = {"overlapping": {"A": rect(0, 0, 1, 1), "B": rect(0.2, 0, 1.2, 1)},
+            "nested": {"A": rect(0, 0, 1, 1), "B": rect(0.2, 0.2, 0.4, 0.4)},
+            "identical": {"A": rect(0, 0, 1, 1), "B": rect(0, 0, 1, 1)},
+            "touching": {"A": rect(0, 0, 1, 1), "B": rect(1, 0, 2, 1)},
+            "apart": {"A": rect(0, 0, 1, 1), "B": rect(3, 0, 4, 1)}}
+    got15 = {}
+    for name, fs in sets.items():
+        try:
+            resolve_targets({"u": ["A", "B"]}, ["u"], True, "xw.csv", fs)
+            got15[name] = "ok"
+        except GeometryError as e:
+            got15[name] = "refused" if "u" in str(e) and "overlap" in str(e) else f"refused: {e}"
+        except Exception as e:  # noqa: BLE001 -- before the rule exists (alpha)
+            got15[name] = f"{type(e).__name__}"
+    ev15 = evaluate([{"u": "u", "x": "0.5", "y": "0.5", "a": str(2 * area_km2(rect(0, 0, 1, 1)))}],
+                    {"id": "u", "lat": "y", "lon": "x", "area": "a"}, sets["touching"], {"u": ["A", "B"]}, th)
+    ok(got15 == {"overlapping": "refused", "nested": "refused", "identical": "refused", "touching": "ok",
+                 "apart": "ok"} and ev15["findings"] == [],
+       f"IG15 union members that overlap (partly, nested or identical) are refused, naming the unit; touching or "
+       f"separate members are allowed and their areas add up exactly ({got15}; {ev15['findings'][:1]})")
     R2 = 6371.0088 ** 2
     cell = rect(0, 10, 1, 11)
     exact = R2 * math.radians(1.0) * (math.sin(math.radians(11)) - math.sin(math.radians(10)))

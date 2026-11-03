@@ -727,8 +727,28 @@ def _self_test_owner_cli(ok, td: str, trace, reg) -> None:
     ok(not let, f"SO12a a brief sign-off without an explicit --by lead (no --by, an abbreviation, --by=owner) is denied "
                 f"in lead mode, for the lead and a specialist, parsed with the CLI's own parser (allowed: {let[:3]})")
     lead_cmd = f"python3 scripts/decision_brief.py sign {td} --by lead --accept-proposed --note ok"
-    ok(not hook_denies("lead", lead_cmd) and hook_denies("owner", lead_cmd) and hook_denies(None, lead_cmd),
-       "SO12b an explicit --by lead passes only in lead mode")
+    ok(hook_denies("lead", lead_cmd) and hook_denies("owner", lead_cmd) and hook_denies(None, lead_cmd),
+       "SO12b an explicit --by lead is refused too, in every mode: the harness signs the lead's answers")
+    # SO14 (focused check of #131, P1): a lead sign-off with a decision spec writes the geometry record and the signed
+    # copy of the spec; the harness signs it and registers those writes, so integrity attributes them
+    with tempfile.TemporaryDirectory() as d5:
+        _geo.toy_inputs(d5)
+        _y.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d5, "success_criteria.yaml"), "w"))
+        _y.safe_dump(_db.example_brief(), open(os.path.join(d5, "decision_brief.yaml"), "w"))
+        ig5 = ArtifactIntegrity(d5, process_check=lambda: set())
+        try:
+            no_answers = harness_sign_brief_lead(d5, ig5)
+            _y.safe_dump({"accept_proposed": True, "note": "an adequate target for the question"},
+                         open(os.path.join(d5, getattr(_db, "LEAD_ANSWERS", "decision_brief_lead_answers.yaml")), "w"))
+            text = harness_sign_brief_lead(d5, ig5)
+            g5 = _y.safe_load(open(os.path.join(d5, _geo.SIGNOFF_FILE)))
+            ev5 = [(e["file"], e["change"]) for e in ig5.check_now()]
+        except Exception as e:  # noqa: BLE001 -- before the harness action exists (alpha)
+            no_answers, text, g5, ev5 = "error", f"{type(e).__name__}: {e}", {}, ["error"]
+        ok(no_answers is None and _db.status(d5) == "signed" and (g5 or {}).get("signed_by") == "lead"
+           and ev5 == [] and "signed" in str(text).lower(),
+           f"SO14 lead mode: the harness signs the lead's answers file and registers what signing wrote (the geometry "
+           f"record, the signed copies); integrity attributes them ({ev5}; {str(text)[:80]})")
     rc = {}
     with tempfile.TemporaryDirectory() as d:
         _y.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d, "success_criteria.yaml"), "w"))
@@ -1261,8 +1281,10 @@ def _run_self_test() -> int:
         _y.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(td, "success_criteria.yaml"), "w"))
         _y.safe_dump(_db.example_brief(), open(os.path.join(td, "decision_brief.yaml"), "w"))
         ok("AWAITING_SIGNOFF" in (signoff_hold_reason(td, "owner") or "")
-           and "--by lead" in (signoff_hold_reason(td, "lead") or "") and signoff_hold_reason(td, None) is None,
-           "SO2 a ready brief: owner mode waits, lead mode signs, no mode does nothing")
+           and getattr(_db, "LEAD_ANSWERS", "decision_brief_lead_answers.yaml") in (signoff_hold_reason(td, "lead") or "")
+           and "AWAITING_SIGNOFF" in (signoff_hold_reason(td, "lead") or "") and signoff_hold_reason(td, None) is None,
+           "SO2 a ready brief: owner mode waits; lead mode writes its answers and the harness signs; no mode does "
+           "nothing")
         hk5 = agents_pkg.create_hooks(td, trace, datetime.now(), registered_agents=reg, signoff="owner")
         pre5 = hk5["PreToolUse"][0].hooks[0]
 
@@ -1277,7 +1299,8 @@ def _run_self_test() -> int:
         r6 = json.dumps(asyncio.run(hk6["PreToolUse"][0].hooks[0](
             {"tool_name": "Bash", "tool_input": {"command": f"python3 scripts/decision_brief.py sign {td} --by lead"}},
             "so6", None)))
-        ok("agents cannot sign" not in r6, "SO5 in lead mode the lead signs")
+        ok("agents cannot sign" in r6, "SO5 in lead mode the lead does not run the sign-off itself: the harness signs "
+                                       "its answers (focused check of #131: the harness registers what signing writes)")
         ok(asyncio.run(wait_for_signoff(td, "runs/x", hours=0.00001, poll_s=0.01)) is False,
            "SO6 an unsigned wait times out")
         _db.sign(td, "owner")
@@ -1328,8 +1351,9 @@ def _run_self_test() -> int:
         r11c = json.dumps(asyncio.run(hk11["PreToolUse"][0].hooks[0](
             {"tool_name": "Bash", "tool_input": {"command": f"python3 toolkit/spec/geometry.py check {td}"}},
             "so11c", None)))
-        ok("deny" not in r11 and "deny" not in r11c,
-           "SO11b the lead still signs the brief as the lead in lead mode, and anyone may run the check itself")
+        ok("deny" in r11 and "deny" not in r11c,
+           "SO11b no agent runs the brief sign-off, even `--by lead` in lead mode (the harness signs); anyone may run "
+           "the check itself")
         from agents.integrity import _protected_patterns as _pp
         import fnmatch as _fn
         ok(all(any(_fn.fnmatch(p, pat) for pat in _pp()) for p in ("data/geometry_signoff.json",
