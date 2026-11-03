@@ -67,7 +67,7 @@ def tasks(run_dir: str, per_region: int = 3, seeds: int = 3, metrics=None) -> tu
     spec = schema.load(os.path.join(run_dir, "decision_spec.yaml"))
     eng = spec.engine()
     if not hooks.supports(eng, "series"):
-        raise hooks.HookUnsupported("run_series", eng)
+        raise hooks._unsupported("run_series", eng)
     known = hooks.series_metrics(eng)
     metrics = list(metrics or known)
     point, cal, fd = _data(run_dir, "point"), _data(run_dir, "calibration"), _data(run_dir, "figure_data")
@@ -76,7 +76,12 @@ def tasks(run_dir: str, per_region: int = 3, seeds: int = 3, metrics=None) -> tu
     theta = dict(A.theta0, **(cal.get("theta") or {}))
     reg = spec["decision_units"].get("region")
     units = {i: str(A.by_id[i].get(reg, "")) if reg else "" for i in A.ids}
-    burden = {i: (v or {}).get("per_person") or 0.0 for i, v in (fd.get("burden") or {}).items()}
+    bd = fd.get("burden") or {}
+    miss = [i for i in A.ids if (bd.get(i) or {}).get("per_person") is None]
+    if miss:
+        raise ValueError(f"trajectories: figure_data has no comparator burden for {len(miss)} units (e.g. {miss[:3]}); "
+                         "the purposive sample needs every unit's burden")
+    burden = {i: float(bd[i]["per_person"]) for i in A.ids}
     smp = sample_units(units, burden, per_region)
     h = spec.horizon({})
     hz = {"start": float(h.start), "stop": float(h.stop), "window": [float(x) for x in h.window]}
@@ -84,20 +89,27 @@ def tasks(run_dir: str, per_region: int = 3, seeds: int = 3, metrics=None) -> tu
         hz["delivery"] = [float(x) for x in h.delivery]
     cal_attr = spec["calibration"].get("attribute")
     seed0 = int((spec.get("uncertainty") or {}).get("seed", 42))
+    if cal_attr:
+        nz = [i for ids in smp.values() for i in ids if ((cal.get("units") or {}).get(i) or {}).get("z") is None]
+        if nz:
+            raise ValueError(f"trajectories: {len(nz)} sampled units have no calibrated attribute {cal_attr} in "
+                             f"analysis/calibration.yaml (e.g. {nz[:3]})")
     out = []
     for r, ids in smp.items():
         for i in ids:
             a = dict(spec.unit_attributes(A.by_id[i]))
-            z = ((cal.get("units") or {}).get(i) or {}).get("z")
-            if cal_attr and z is not None:
-                a[cal_attr] = calibrated_value(spec, z)
+            if cal_attr:
+                a[cal_attr] = calibrated_value(spec, cal["units"][i]["z"])
             arms = [[A.comp, spec.engine_package(A.pk[A.comp])], [plan[i], spec.engine_package(A.pk[plan[i]])]]
             for s in range(seeds):
                 out.append({"unit": i, "region": r, "attributes": a, "arms": arms, "params": theta,
                             "engine": spec["engine"],     # engine: auto is resolved to the chosen engine on load
                             "horizon": hz, "seed": seed0 + 1000 * s + 7, "metrics": metrics})
+    from toolkit.engines.contract import engine_identity
     step = {"sample": smp, "per_region": per_region, "seeds": seeds, "metrics": metrics,
-            "metric_info": {m: known[m] for m in metrics}, "plan": plan, "units": units}
+            "metric_info": {m: known[m] for m in metrics}, "plan": plan, "units": units,
+            "engine": engine_identity(eng), "hooks_contract": hooks.HOOKS_CONTRACT,
+            "selection": "purposive: per region, the units at the lowest, median and highest comparator burden"}
     return out, step
 
 
@@ -119,7 +131,20 @@ def run_task(task: dict) -> dict:
 def target_interval(targets, weights, regions, sd: float, level: float = 0.95, draws: int = 4000) -> dict:
     """Weighted mean target and its interval: one common-mode logit error per region (sd), independent across
     regions, applied to each unit before weighting."""
-    raise NotImplementedError("figures r1 β")
+    v = np.clip(np.asarray(targets, float), 1e-9, 1 - 1e-9)
+    w = np.asarray(weights, float)
+    w = w / w.sum()
+    value = float(np.sum(v * w))
+    if not sd > 0:
+        return {"value": value, "lo": value, "hi": value}
+    regs = sorted(set(regions))
+    idx = np.array([regs.index(r) for r in regions])
+    rng = np.random.default_rng(20261103)
+    sh = rng.normal(0.0, sd, size=(draws, len(regs)))[:, idx]          # common mode within a region
+    lg = np.log(v / (1 - v))
+    m = (1 / (1 + np.exp(-(lg[None, :] + sh)))) @ w
+    a = 100 * (1 - level) / 2
+    return {"value": value, "lo": float(np.percentile(m, a)), "hi": float(np.percentile(m, 100 - a))}
 
 
 def aggregate(run_dir: str, step: dict, results: list[dict]) -> dict:
@@ -130,12 +155,16 @@ def aggregate(run_dir: str, step: dict, results: list[dict]) -> dict:
     by_id = {str(u[spec.uid]): u for u in spec.units()}
     w = {i: sum(float(by_id[i][pm["column"]]) for pm in pops.values()) for i in by_id}
     metrics = step["metrics"]
+    from toolkit.engines.hooks import GRID_TOL, HookInvalid
     acc = {}
     t = None
     for r in results:
         for k, arm in enumerate(("comparator", "plan")):
             s = r["series"][k]
             t = t or s["t"]
+            if len(s["t"]) != len(t) or any(abs(a - b) > GRID_TOL for a, b in zip(s["t"], t)):
+                raise HookInvalid(f"trajectories: unit {r['unit']} seed {r.get('seed')} {arm} is on another time grid "
+                                  "than the first series; series are averaged step by step only on one grid")
             e = acc.setdefault(r["unit"], {}).setdefault(arm, {m: [] for m in metrics})
             for m in metrics:
                 e[m].append(s["values"][m])
@@ -150,17 +179,16 @@ def aggregate(run_dir: str, step: dict, results: list[dict]) -> dict:
     tgt_col, cal_metric = cal.get("target_column"), cal.get("metric")
     sd = float((cal.get("target_uncertainty") or {}).get("region_sd_logit") or 0.0)
 
+    reg_col = spec["decision_units"].get("region")
+    level = float((spec.get("uncertainty") or {}).get("level", 0.95))
+
     def target(ids):
         if not tgt_col or cal_metric not in metrics:
             return {}
-        v = np.array([float(by_id[i][tgt_col]) for i in ids])
-        ws = np.array([w[i] for i in ids])
-        c = float(np.sum(v * ws) / np.sum(ws))
-        lg = np.log(c / (1 - c))
-        il = lambda x: float(1 / (1 + np.exp(-x)))  # noqa: E731
+        ti = target_interval([float(by_id[i][tgt_col]) for i in ids], [w[i] for i in ids],
+                             [str(by_id[i].get(reg_col, "")) if reg_col else "" for i in ids], sd, level)
         win = cal.get("window") or [None, None]
-        return {"value": c, "lo": il(lg - 1.96 * sd), "hi": il(lg + 1.96 * sd),
-                "t": (float(win[0]) + float(win[1])) / 2 if win[0] is not None else None}
+        return dict(ti, level=level, t=(float(win[0]) + float(win[1])) / 2 if win[0] is not None else None)
     regions = {r: {"t": t, "arms": wmean(ids), "target": target(ids), "units": ids}
                for r, ids in step["sample"].items() if ids}
     allids = [i for ids in step["sample"].values() for i in ids]
@@ -206,6 +234,7 @@ def run(run_dir: str, per_region: int = 3, seeds: int = 3, metrics=None, log=pri
     h = spec.horizon({})
     d = getattr(h, "delivery", None) or h.window
     data = {"status": "ok", "sample": step["sample"], "per_region": per_region, "seeds": seeds,
+            "engine": step["engine"], "hooks_contract": step["hooks_contract"], "selection": step["selection"],
             "metrics": step["metrics"], "metric_info": step["metric_info"],
             "calibration_metric": (spec.get("calibration") or {}).get("metric"),
             "delivery": [float(x) for x in d], "window": [float(x) for x in h.window], "series": series,

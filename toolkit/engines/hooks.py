@@ -73,26 +73,60 @@ def _num(x) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
 
 
+GRID_TOL = 1e-6                 # years: a monthly step start may differ from horizon.start + k/12 by this much
+META_KEYS = ("label", "units", "aggregate", "denominator")
+
+
+def _contract(engine):
+    """The engine's declared hooks contract (None when it declares none); another version is refused."""
+    v = getattr(engine, "hooks_contract", None)
+    if v is not None and v != HOOKS_CONTRACT:
+        raise HookInvalid(f"engine declares hooks contract {v!r}; this harness reads {HOOKS_CONTRACT!r}")
+    return v
+
+
 def supports(engine, hook: str) -> bool:
+    if hook not in ("schedule", "series"):
+        raise ValueError(f"unknown hook {hook!r}")
+    if getattr(engine, "hooks_contract", None) is None:
+        return False
     if hook == "schedule":
         return callable(getattr(engine, "schedule", None))
-    if hook == "series":
-        return callable(getattr(engine, "run_series", None)) and bool(series_metrics(engine))
-    raise ValueError(f"unknown hook {hook!r}")
+    return callable(getattr(engine, "run_series", None)) and bool(series_metrics(engine))
 
 
 def series_metrics(engine) -> dict:
-    """{metric: {label, units, aggregate}} from the card; {} when the engine declares none."""
+    """{metric: {label, units, aggregate, denominator}} from the card; {} when the engine declares none."""
     s = (engine.describe().outputs or {}).get("series") or {}
     return dict(s) if isinstance(s, dict) else {}
 
 
+def _unsupported(hook, engine):
+    _contract(engine)
+    if getattr(engine, "hooks_contract", None) is None and callable(getattr(engine, hook, None)):
+        e = HookUnsupported(hook, engine)
+        e.args = (f"{e.args[0]}: it declares no hooks contract (hooks_contract = {HOOKS_CONTRACT!r})",)
+        return e
+    return HookUnsupported(hook, engine)
+
+
+def monthly_grid(horizon) -> list[float]:
+    """The contract's grid: monthly step starts from horizon.start through the outcome window's end."""
+    n = int(round((float(horizon.window[1]) - float(horizon.start)) * 12))
+    return [float(horizon.start) + k / 12 for k in range(n)]
+
+
 def schedule(engine, params, unit, package, horizon) -> list[dict]:
     """The engine's delivery schedule for one unit and arm, checked (fail closed)."""
+    _contract(engine)
     if not supports(engine, "schedule"):
-        raise HookUnsupported("schedule", engine)
+        raise _unsupported("schedule", engine)
+    from toolkit.engines.horizon import delivery_period
     ev = engine.schedule(params, unit, package, horizon)
     comps = set(engine.describe().components)
+    h0, w1 = float(horizon.start), float(horizon.window[1])
+    d0, d1 = delivery_period(horizon)
+    has = {c for c, v in (package.components or {}).items() if v not in (0, None, "none", False)}
     if not isinstance(ev, list):
         raise HookInvalid(f"schedule() returned {type(ev).__name__}, not a list")
     out, bad = [], []
@@ -110,6 +144,19 @@ def schedule(engine, params, unit, package, horizon) -> list[dict]:
             bad.append(f"event {n}: charged must be true exactly for kind decision")
         if not str(e.get("label") or "").strip():
             bad.append(f"event {n}: no label")
+        if _num(e.get("t0")) and (e.get("t1") is None or _num(e.get("t1"))):
+            t0, t1 = float(e["t0"]), float(e["t0"] if e.get("t1") is None else e["t1"])
+            if t0 < h0 - GRID_TOL or t1 > w1 + GRID_TOL:
+                bad.append(f"event {n}: [{t0:g}, {t1:g}] is outside the horizon [{h0:g}, {w1:g}]")
+            k = e.get("kind")
+            if k == "decision" and not (d0 - GRID_TOL <= t0 and t1 <= d1 + GRID_TOL):
+                bad.append(f"event {n}: decision event at {t0:g} is outside the delivery period [{d0:g}, {d1:g})")
+            if k == "decision" and e.get("component") not in has:
+                bad.append(f"event {n}: decision event for {e.get('component')!r}, which is not in the package")
+            if k == "history" and t1 > d0 + GRID_TOL:
+                bad.append(f"event {n}: history event at {t0:g} does not end before the delivery period ({d0:g})")
+            if k == "routine" and t1 > d0 + GRID_TOL and t0 < d1 - GRID_TOL:
+                bad.append(f"event {n}: routine event at {t0:g} falls inside the delivery period [{d0:g}, {d1:g})")
         out.append({k: e.get(k) for k in ("component", "label", "kind", "t0", "t1", "charged")})
     if bad:
         raise HookInvalid("; ".join(bad[:5]))
@@ -118,12 +165,19 @@ def schedule(engine, params, unit, package, horizon) -> list[dict]:
 
 def run_series(engine, params, unit, packages, horizon, seed, metrics, step="month") -> list[dict]:
     """The engine's monthly series for one unit, its packages and one seed, checked (fail closed)."""
+    _contract(engine)
     if not supports(engine, "series"):
-        raise HookUnsupported("run_series", engine)
+        raise _unsupported("run_series", engine)
     known = series_metrics(engine)
     miss = [m for m in metrics if m not in known]
     if miss:
         raise HookInvalid(f"metrics {miss} are not in the card's outputs['series'] ({sorted(known)})")
+    for m in metrics:
+        meta = known[m] if isinstance(known[m], dict) else {}
+        lack = [k for k in META_KEYS if not (isinstance(meta.get(k), str) and meta[k].strip())]
+        if lack:
+            raise HookInvalid(f"series metric {m}: the card must give {', '.join(lack)} (label, units, aggregate, "
+                              "denominator)")
     bad_agg = [m for m in metrics if (known[m] or {}).get("aggregate") not in AGGREGATES]
     if bad_agg:
         raise HookInvalid(f"metrics {bad_agg}: aggregate must be one of {AGGREGATES}")
@@ -140,6 +194,10 @@ def run_series(engine, params, unit, packages, horizon, seed, metrics, step="mon
             raise HookInvalid(f"run_series(): {p.id}: t must be increasing numbers")
         if not (t[0] >= float(horizon.start) - 1e-9 and t[-1] < float(horizon.window[1]) + 1e-9):
             raise HookInvalid(f"run_series(): {p.id}: t must lie in [horizon.start, window end)")
+        g = monthly_grid(horizon)
+        if len(t) != len(g) or any(abs(a - b) > GRID_TOL for a, b in zip(t, g)):
+            raise HookInvalid(f"run_series(): {p.id}: t must be the complete monthly grid from {g[0]:g} "
+                              f"({len(g)} steps through the window end); got {len(t)} steps")
         vals = r.get("values")
         if not isinstance(vals, dict) or set(vals) != set(metrics):
             raise HookInvalid(f"run_series(): {p.id}: values must hold exactly the requested metrics")

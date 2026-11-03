@@ -31,8 +31,28 @@ if ROOT not in sys.path:
 from toolkit.analysis import figure_style as FS  # noqa: E402
 
 PRODUCER = "toolkit/analysis/figures.py"
-ORDER = ("headline", "allocation_map", "stability_map", "burden_map", "calibration_fit", "frontier", "dollars",
-         "cost_per_outcome", "sensitivity", "timeline", "trajectories")
+# The figure set in three tiers (owner, 2026-11-02). Tiers 1 and 2 are drawn for every run; tier 3 depends on the
+# question: DECISION_SETS maps the spec's deliverable.kind to its decision figures (one declared table; an unknown
+# kind gets a not-produced entry, fail closed).
+TIERS = {
+    "data_model": ("calibration_fit", "sensitivity"),
+    "simulation": ("timeline", "trajectories"),
+}
+DECISION_SETS = {
+    "package_per_unit": ("headline", "allocation_map", "stability_map", "burden_map", "dollars", "frontier",
+                         "cost_per_outcome"),
+}
+TIER_OF = {n: k for k, v in TIERS.items() for n in v}
+TIER_OF.update({n: "decision" for v in DECISION_SETS.values() for n in v})
+
+
+def tiers_for(spec: dict) -> dict:
+    kind = ((spec or {}).get("deliverable") or {}).get("kind", "package_per_unit")
+    return dict(TIERS, decision=DECISION_SETS.get(kind, ()))
+
+
+ORDER = TIERS["data_model"] + TIERS["simulation"] + tuple(n for v in DECISION_SETS.values() for n in v
+                                                         if n not in TIERS["data_model"] + TIERS["simulation"])
 TITLE_MAX = 95
 CAPTION_MAX = 230          # two lines of the report's caption width
 
@@ -105,6 +125,10 @@ class RunData:
         if rel not in self.used:
             self.used.append(rel)
         return doc["data"]
+
+    def doc(self, kind):
+        """The whole artifact document (envelope included), or None."""
+        return self._load(os.path.join("analysis", f"{kind}.yaml"))
 
     def opt(self, kind):
         try:
@@ -231,16 +255,16 @@ def _top(fig, inches=0.62):
 
 def _comp_colors(R, t) -> dict:
     """One categorical slot per component the plan uses, in the spec's component order, contiguous from slot 1 (so
-    a stack of them shows only validated adjacent pairs); the same mapping in every figure of the run."""
+    a stack of them shows only validated adjacent pairs); the same mapping in every figure of the run. Components past
+    the eighth share one neutral "other" colour (never a ninth hue)."""
     mix = (R.opt("point") or {}).get("mix") or {}
     used = [c for c in R.components if mix.get(c, 0) > 0] or list(R.components)
-    used = used[:FS.MAX_CATEGORIES]
-    return {c: t["cat"][n] for n, c in enumerate(used)}
+    return {c: (t["cat"][n] if n < FS.MAX_CATEGORIES else t["ink2"]) for n, c in enumerate(used)}
 
 
 def spec_differences(Rs) -> list[str]:
     """What differs between the runs' specs where it bears on the headline (window, delivery, envelope, comparator,
-    uncertainty sources, engine choice), in words."""
+    uncertainty sources and level, engine mappings and choice, package definitions), in words."""
     def get(R, path):
         x = R.spec
         for k in path:
@@ -249,6 +273,8 @@ def spec_differences(Rs) -> list[str]:
     checks = [(("objective", "horizon"), "outcome window"), (("objective", "delivery"), "delivery period"),
               (("constraints", "envelope_usd"), "envelope"), (("constraints", "fixed_costs_usd"), "fixed costs"),
               (("comparator", "package"), "comparator"), (("uncertainty", "sources"), "uncertainty sources"),
+              (("uncertainty", "level"), "interval level"),
+              (("options", "engine_map"), "component engine mappings"),
               (("decision_units", "engine_attributes"), "engine unit attributes"),
               (("analysis", "decision_tests"), "decision tests")]
     out = []
@@ -256,10 +282,27 @@ def spec_differences(Rs) -> list[str]:
         vals = [json.dumps(get(R, path), sort_keys=True, default=str) for R in Rs]
         if len(set(vals)) > 1:
             out.append(name)
+    defs = {}
+    for R in Rs:
+        for k, cs in R.pk.items():
+            defs.setdefault(k, set()).add(tuple(sorted(cs)))
+    if any(len(v) > 1 for v in defs.values()):
+        out.append("package definitions")
     engs = {json.dumps((R.opt("engine") or {}).get("card", {}).get("version")) for R in Rs}
     if len(engs) > 1:
         out.append("engine version")
     return out
+
+
+def _spec_threshold(R) -> tuple[float, str]:
+    """The share of units whose package must change for a test to count as changing the plan: the spec's
+    analysis.share_threshold, else thresholds.yaml."""
+    v = (R.spec.get("analysis") or {}).get("share_threshold")
+    if v is not None:
+        return float(v), "spec analysis.share_threshold"
+    import yaml
+    return float(yaml.safe_load(open(os.path.join(ROOT, "toolkit", "analysis", "thresholds.yaml")))
+                 ["decision_tests"]["share_threshold"]), "thresholds.yaml"
 
 
 def fig_headline(R, t):
@@ -464,76 +507,111 @@ def fig_calibration(R, t):
     method = cal.get("method", cs.get("method"))
     if method == "none":
         raise Missing("the spec has no calibration (method none)")
-    fig = _fig(t, 7.8, 4.6)
-    h = fig.get_figheight()
-    a1 = fig.add_axes([0.085, 0.6 / h, 0.37, _top(fig, 0.95) - 0.6 / h])
-    a2 = fig.add_axes([0.62, 0.6 / h, 0.36, _top(fig, 0.95) - 0.6 / h])
-    FS.style(a1, t, grid="both")
-    FS.style(a2, t, grid="x")
     rows = []
     lg = lambda p: np.log(p / (1 - p))  # noqa: E731
     il = lambda x: 1 / (1 + np.exp(-x))  # noqa: E731
     regs = R.regions()
     RT = R.labels.region_title()
+    diag = cal.get("diagnostics") or {}
+    n_cl = int(diag.get("clamped_units") or 0)
     if method == "emulator_inversion":
         tc = cs["target_column"]
         tgt = {i: float(R.by_id[i][tc]) for i in R.ids}
         fd = R.opt("figure_data") or {}
         mod_src = ((fd.get("calibration") or {}).get("units")) or {}
-        resid_max = float((cal.get("diagnostics") or {}).get("target_logit_residual_max") or 0.0)
-        modelled = {i: float(mod_src[i]["modelled"]) if i in mod_src else None for i in R.ids}
-        have_mod = all(v is not None for v in modelled.values())
+        have_mod = all(i in mod_src and mod_src[i].get("modelled") is not None for i in R.ids)
         sd = float((cs.get("target_uncertainty") or {}).get("region_sd_logit") or 0.0)
-        acc = (R.opt("emulator") or {}).get("accuracy") or {}
-        e_rmse = acc.get("cal_logit_rmse")
-        x = np.array([tgt[i] for i in R.ids])
-        y = np.array([modelled[i] if have_mod else tgt[i] for i in R.ids])
-        m = float(max(x.max(), y.max())) * 1.06
-        gx = np.linspace(max(m / 400, 1e-4), m, 200)
-        if e_rmse:
-            a1.fill_between(gx, il(lg(gx) - 1.96 * e_rmse), il(lg(gx) + 1.96 * e_rmse), color=t["band"], lw=0,
-                            zorder=0, label="emulator held-out error (95%)")
-        a1.plot([0, m], [0, m], color=t["ink2"], lw=0.8, zorder=2)
-        a1.scatter(x, y, s=12, color=t["cat"][0], edgecolors=t["surface"], linewidths=0.5, zorder=3)
-        a1.set_xlim(0, m)
-        a1.set_ylim(0, m)
-        FS.set_axis_format(a1, "x", "percent")
-        FS.set_axis_format(a1, "y", "percent")
+        e_rmse = ((R.opt("emulator") or {}).get("accuracy") or {}).get("cal_logit_rmse")
         metric = R.labels.metric(cs.get("metric", "metric"))
-        a1.set_xlabel(f"target {metric}", fontsize=8)
-        a1.set_ylabel("model at the fitted attribute", fontsize=8)
-        if e_rmse:
-            a1.legend(loc="upper left", fontsize=7)
-        # right: targets by region with the region-level target interval (common-mode error on the logit scale)
-        for yv, r in enumerate(regs[::-1]):
-            v = np.array([tgt[i] for i in R.ids if R.region(i) == r])
-            if sd > 0 and len(v):
-                c = float(np.mean(lg(np.clip(v, 1e-6, 1 - 1e-6))))
-                a2.plot([il(c - 1.96 * sd), il(c + 1.96 * sd)], [yv, yv], color=t["cat"][1], lw=5, alpha=0.35,
-                        solid_capstyle="round", zorder=1)
-            a2.scatter(v, [yv] * len(v), s=10, color=t["cat"][0], edgecolors=t["surface"], linewidths=0.4, zorder=3)
-        a2.set_yticks(range(len(regs)))
-        a2.set_yticklabels(regs[::-1], fontsize=7.5)
-        a2.set_xlim(0, m)
-        FS.set_axis_format(a2, "x", "percent")
-        a2.set_xlabel(f"target {metric} per unit; bar: {RT.lower()} interval (95%)" if sd > 0 else
-                      f"target {metric} per unit", fontsize=8)
-        res = {i: (float(lg(np.clip(modelled[i], 1e-9, 1 - 1e-9)) - lg(np.clip(tgt[i], 1e-9, 1 - 1e-9)))
-                   if have_mod else None) for i in R.ids}
-        worst = max(abs(v) for v in res.values()) if have_mod else resid_max
-        for i in R.ids:
-            rows.append({"unit": i, "region": R.region(i), "target": tgt[i], "modelled": modelled[i],
-                         "residual_logit": res[i]})
-        title = f"Inversion reproduces all {len(R.ids)} targets exactly; the uncertainty is in the targets"
-        cap = (f"Left: target against model, 1:1 line"
-               + (f"; band: emulator held-out error ({FS.fmt(e_rmse)} logit RMSE)" if e_rmse else "")
-               + f". Right: targets by {RT.lower()}" + (f", bar: {RT.lower()} target interval (sd {FS.fmt(sd)} "
-                                                       f"logit)" if sd > 0 else "")
-               + f". All residuals within {worst:.1g} logit.")
+        m = max(tgt.values()) * 1.06
+
+        def targets_panel(ax):
+            for yv, r in enumerate(regs[::-1]):
+                v = np.array([tgt[i] for i in R.ids if R.region(i) == r])
+                if sd > 0 and len(v):
+                    lo = float(np.mean(il(lg(np.clip(v, 1e-6, 1 - 1e-6)) - 1.96 * sd)))
+                    hi = float(np.mean(il(lg(np.clip(v, 1e-6, 1 - 1e-6)) + 1.96 * sd)))
+                    ax.plot([lo, hi], [yv, yv], color=t["cat"][1], lw=5, alpha=0.35, solid_capstyle="round", zorder=1)
+                ax.scatter(v, [yv] * len(v), s=10, color=t["cat"][0], edgecolors=t["surface"], linewidths=0.4,
+                           zorder=3)
+            ax.set_yticks(range(len(regs)))
+            ax.set_yticklabels(regs[::-1], fontsize=7.5)
+            ax.set_xlim(0, m)
+            FS.set_axis_format(ax, "x", "percent")
+            ax.set_xlabel(f"target {metric} per unit" + (f"; bar: shift of the {RT.lower()}'s targets by its 95% "
+                                                         "common-mode error" if sd > 0 else ""), fontsize=8)
+        if have_mod:
+            mod = {i: float(mod_src[i]["modelled"]) for i in R.ids}
+            res = {i: float(lg(np.clip(mod[i], 1e-9, 1 - 1e-9)) - lg(np.clip(tgt[i], 1e-9, 1 - 1e-9))) for i in R.ids}
+            fig = _fig(t, 7.8, 4.6)
+            h = fig.get_figheight()
+            a1 = fig.add_axes([0.085, 0.6 / h, 0.37, _top(fig, 0.95) - 0.6 / h])
+            a2 = fig.add_axes([0.62, 0.6 / h, 0.36, _top(fig, 0.95) - 0.6 / h])
+            FS.style(a1, t, grid="both")
+            FS.style(a2, t, grid="x")
+            x = np.array([tgt[i] for i in R.ids])
+            y = np.array([mod[i] for i in R.ids])
+            m = float(max(x.max(), y.max())) * 1.06
+            gx = np.linspace(max(m / 400, 1e-4), m, 200)
+            if e_rmse:
+                a1.fill_between(gx, il(lg(gx) - 1.96 * e_rmse), il(lg(gx) + 1.96 * e_rmse), color=t["band"], lw=0,
+                                zorder=0, label="emulator held-out error (95%)")
+                a1.legend(loc="upper left", fontsize=7)
+            a1.plot([0, m], [0, m], color=t["ink2"], lw=0.8, zorder=2)
+            a1.scatter(x, y, s=12, color=t["cat"][0], edgecolors=t["surface"], linewidths=0.5, zorder=3)
+            a1.set_xlim(0, m)
+            a1.set_ylim(0, m)
+            FS.set_axis_format(a1, "x", "percent")
+            FS.set_axis_format(a1, "y", "percent")
+            a1.set_xlabel(f"target {metric}", fontsize=8)
+            a1.set_ylabel("model at the fitted attribute", fontsize=8)
+            if sd > 0:
+                a2.axvspan(-1.96 * sd, 1.96 * sd, color=t["band"], lw=0, zorder=0)
+            for yv, r in enumerate(regs[::-1]):
+                v = [res[i] for i in R.ids if R.region(i) == r]
+                a2.scatter(v, [yv] * len(v), s=10, color=t["cat"][0], edgecolors=t["surface"], linewidths=0.4,
+                           zorder=3)
+            a2.axvline(0, color=t["ink2"], lw=0.8)
+            a2.set_yticks(range(len(regs)))
+            a2.set_yticklabels(regs[::-1], fontsize=7.5)
+            lim = max(1.96 * sd * 1.2, max(abs(v) for v in res.values()) * 1.2, 0.05)
+            a2.set_xlim(-lim, lim)
+            FS.set_axis_format(a2, "x", "signed")
+            a2.set_xlabel("model minus target, logit scale" + (" (band: 95% target error)" if sd > 0 else ""),
+                          fontsize=8)
+            worst = max(abs(v) for v in res.values())
+            title = (f"Calibration: largest residual {worst:.2g} logit over {len(R.ids)} targets"
+                     + (f"; {n_cl} clamped at the attribute range" if n_cl else "; none clamped"))
+            cap = (f"Left: target {metric} against the model at each unit's fitted attribute, 1:1 line"
+                   + (f"; band: emulator held-out error ({FS.fmt(e_rmse)} logit RMSE)" if e_rmse else "")
+                   + f". Right: residuals by {RT.lower()}" + (f"; band: target error (sd {FS.fmt(sd)} logit)." if sd > 0
+                                                              else "."))
+            panels = ["fit", "residuals"]
+            rows = [{"unit": i, "region": R.region(i), "target": tgt[i], "modelled": mod[i], "residual_logit": res[i]}
+                    for i in R.ids]
+        else:
+            fig = _fig(t, 7.8, 0.28 * len(regs) + 1.4)
+            h = fig.get_figheight()
+            ax = fig.add_axes([0.2, 0.6 / h, 0.76, _top(fig, 0.6) - 0.6 / h])
+            FS.style(ax, t, grid="x")
+            targets_panel(ax)
+            rmax = diag.get("target_logit_residual_max")
+            title = f"Calibration targets by {RT.lower()} with their error; per-unit model values not stored"
+            cap = (f"Target {metric} per unit by {RT.lower()}. The fit panel is withheld: this run did not store the "
+                   f"model's value per unit" + (f"; its recorded largest residual is {rmax:.1g} logit" if rmax is not None
+                                                else "") + (f"; {n_cl} units clamped." if n_cl else "."))
+            panels = ["targets"]
+            rows = [{"unit": i, "region": R.region(i), "target": tgt[i]} for i in R.ids]
     else:
-        fit = (cal.get("diagnostics") or {}).get("fit") or []
+        fit = diag.get("fit") or []
         if not fit:
             raise Missing(f"calibration method {method} recorded no fit rows")
+        fig = _fig(t, 7.8, 4.6)
+        h = fig.get_figheight()
+        a1 = fig.add_axes([0.085, 0.6 / h, 0.37, _top(fig, 0.95) - 0.6 / h])
+        a2 = fig.add_axes([0.62, 0.6 / h, 0.36, _top(fig, 0.95) - 0.6 / h])
+        FS.style(a1, t, grid="both")
+        FS.style(a2, t, grid="x")
         x = np.array([float(r["observed"]) for r in fit])
         y = np.array([float(r["expected"]) for r in fit])
         a1.scatter(x, y, s=12, color=t["cat"][0], edgecolors=t["surface"], linewidths=0.5, zorder=3)
@@ -560,15 +638,16 @@ def fig_calibration(R, t):
         title = f"{len(fit)} calibration targets; {out2} Pearson residuals beyond ±2"
         cap = (f"Calibration ({method}): observed against model expected, 1:1 line; right, Pearson residuals by "
                f"{RT.lower()}.")
-    return fig, title, cap, rows, "calibration fit"
+        panels = ["fit", "residuals"]
+    return fig, title, cap, rows, "calibration fit", {"panels": panels}
 
 
 def fig_frontier(R, t):
     fd = R.art("figure_data")
     fr = fd["frontier"]
-    pts = fr["points"]
-    if len(pts) < 2:
-        raise Missing("the frontier has fewer than two envelopes")
+    xs, ys = _frontier_xy(fr, R.primary)
+    if len(xs) < 2:
+        raise Missing("the frontier has fewer than two solved envelopes")
     pt = R.art("point")
     olab = R.labels.outcome(R.primary)
     fig = _fig(t, 7.2, 4.2)
@@ -576,10 +655,8 @@ def fig_frontier(R, t):
     ax = fig.add_axes([0.1, 0.55 / h, 0.86, _top(fig, 0.6) - 0.55 / h])
     FS.style(ax, t, grid="both")
     fixed = float(fr.get("fixed_costs_usd") or 0.0)
-    xs = [fixed] + [p["envelope_usd"] for p in pts]
-    ys = [0.0] + [p["objective"] for p in pts]
     ax.plot(xs, ys, color=t["cat"][0], lw=2, zorder=2)
-    ax.scatter(xs[1:], ys[1:], s=22, color=t["cat"][0], edgecolors=t["surface"], linewidths=1.2, zorder=3)
+    ax.scatter(xs, ys, s=22, color=t["cat"][0], edgecolors=t["surface"], linewidths=1.2, zorder=3)
     env = fr["envelope_usd"]
     ax.axvline(env, color=t["muted"], lw=0.9, zorder=1)
     ax.text(env, 1.0, " declared envelope", transform=ax.get_xaxis_transform(), va="top", fontsize=7.5,
@@ -588,28 +665,39 @@ def fig_frontier(R, t):
         ax.axvspan(0, fixed, color=t["band"], lw=0, zorder=0)
         ax.text(fixed / 2, 0.03, f"fixed\n{FS.fmt(fixed, 'money')}", transform=ax.get_xaxis_transform(),
                 ha="center", fontsize=7, color=t["ink2"])
-    obj = float(pt["solver"]["objective"])
-    ax.scatter([env], [obj], s=70, color=t["cat"][1], edgecolors=t["surface"], linewidths=1.8, zorder=4)
-    ax.annotate(f"plan: {FS.fmt(obj)} {olab}", (env, obj), xytext=(8, -16), textcoords="offset points",
+    got = float(pt["averted"][R.primary])
+    ax.scatter([env], [got], s=70, color=t["cat"][1], edgecolors=t["surface"], linewidths=1.8, zorder=4)
+    ax.annotate(f"plan: {FS.fmt(got)} {olab}", (env, got), xytext=(8, -16), textcoords="offset points",
                 fontsize=8, color=t["ink"])
-    ax.set_xlim(0, max(xs) * 1.04)
-    ax.set_ylim(0, max(ys) * 1.1)
+    ax.set_xlim(0, max(xs + [env]) * 1.04)
+    ax.set_ylim(0, max(ys + [got]) * 1.1)
     FS.set_axis_format(ax, "x", "money")
     FS.set_axis_format(ax, "y")
     ax.set_xlabel("envelope (fixed costs included)", fontsize=8)
-    ax.set_ylabel(f"{olab} averted", fontsize=8)
+    dfac = float(fr.get("discount_factor") or 1.0)
+    ax.set_ylabel(f"{olab} averted" + (" (undiscounted)" if abs(dfac - 1) > 1e-12 else ""), fontsize=8)
     mg = fr.get("marginal") or {}
-    avg = pt["cost_allocated"] / max(float(pt["averted"][R.primary]), 1e-12)
+    avg = pt["cost_allocated"] / max(got, 1e-12)
     if mg.get("usd_per_outcome"):
         title = (f"At the envelope, the next {_sing(olab)} averted costs {FS.fmt(mg['usd_per_outcome'], 'money')} "
                  f"(average {FS.fmt(avg, 'money')}, fixed costs excluded)")
     else:
-        title = f"{olab} averted rises from {FS.fmt(ys[1])} to {FS.fmt(ys[-1])} across the envelopes tested"
-    cap = (f"The plan re-solved by the run's own solver and emulator at {min(p['fraction'] for p in pts):.0%}–"
-           f"{max(p['fraction'] for p in pts):.0%} of the declared envelope, fixed costs held. Marginal cost: "
-           f"central difference over 90–110% of the envelope.")
-    rows = [{"fraction": p["fraction"], "envelope_usd": p["envelope_usd"], "objective": p["objective"],
-             "cost": p["cost"], **{f"units_{k}": v for k, v in (p.get("packages") or {}).items()}} for p in pts]
+        title = f"{olab} averted rises from {FS.fmt(ys[0])} to {FS.fmt(ys[-1])} across the envelopes solved"
+    notes = []
+    if fr.get("infeasible"):
+        notes.append("infeasible at " + ", ".join(f"{x['fraction']:.0%}" for x in fr["infeasible"]))
+    if fr.get("excluded"):
+        notes.append("left out (model corrections bear on the plan) at "
+                     + ", ".join(f"{x['fraction']:.0%}" for x in fr["excluded"]))
+    if fr.get("skipped"):
+        notes.append("below the fixed costs at " + ", ".join(f"{x['fraction']:.0%}" for x in fr["skipped"]))
+    cap = (f"The plan re-solved by the run's own solver and emulator at fractions of the declared envelope, fixed costs "
+           f"held; marginal over 90–110%." + (f" Not drawn: {'; '.join(notes)}." if notes else ""))
+    rows = [{"fraction": p["fraction"], "envelope_usd": p["envelope_usd"], "averted": p["averted"][R.primary],
+             "objective": p["objective"], "cost": p["cost"],
+             **{f"units_{k}": v for k, v in (p.get("packages") or {}).items()}} for p in fr["points"]]
+    rows += [{"fraction": x["fraction"], "status": k} for k in ("infeasible", "excluded", "skipped")
+             for x in fr.get(k) or []]
     if mg:
         rows.append({"marginal_usd_per_outcome": mg.get("usd_per_outcome"), "average_usd_per_outcome": avg})
     return fig, title, cap, rows, "efficiency frontier: outcome averted against budget"
@@ -618,14 +706,16 @@ def fig_frontier(R, t):
 def fig_dollars(R, t):
     dl = R.art("figure_data")["dollars"]
     col = _comp_colors(R, t)
-    comps = [c for c in col if dl["by_component"].get(c, 0) > 0]
-    fixed = sum(dl["fixed_costs_usd"].values())
-    env = dl["envelope_usd"]
-    tot = dl["allocated_usd"]
-    regs = sorted(dl["by_region"], key=lambda r: -sum(dl["by_region"][r].values()))
+    bc = dl.get("by_component") or {}
+    comps = [c for c in list(R.components) + [c for c in bc if c not in R.components] if bc.get(c, 0) > 0]
+    fixed = sum((dl.get("fixed_costs_usd") or {}).values())
+    env = float(dl["envelope_usd"])
+    tot = float(dl.get("allocated_usd") or sum(bc.values()))
+    unspent = max(env - fixed - tot, 0.0)
+    regs = sorted(dl.get("by_region") or {}, key=lambda r: -sum(dl["by_region"][r].values()))
     RT = R.labels.region_title()
     ncol = len(comps) + 1
-    fig = _fig(t, 7.9, 0.26 * len(regs) + 3.1)
+    fig = _fig(t, 7.9, (0.26 * len(regs) + 3.1) if comps else 2.2)
     h = fig.get_figheight()
     top = _top(fig, 0.45)
     a1 = fig.add_axes([0.17, top - 0.42 / h, 0.8, 0.38 / h])
@@ -637,9 +727,13 @@ def fig_dollars(R, t):
                 color=t["ink"])
         left = fixed
     for c in comps:
-        v = dl["by_component"][c]
-        a1.barh(0, v, left=left, height=0.8, color=col[c], edgecolor=t["surface"], linewidth=2)
+        v = bc[c]
+        a1.barh(0, v, left=left, height=0.8, color=col.get(c, t["ink2"]), edgecolor=t["surface"], linewidth=2)
         left += v
+    if unspent > 0:
+        a1.barh(0, unspent, left=left, height=0.8, color=t["surface"], edgecolor=t["axis"], linewidth=1)
+        a1.text(left + unspent / 2, 0, f"unspent {FS.fmt(unspent, 'money')}", ha="center", va="center", fontsize=7,
+                color=t["ink2"])
     a1.axvline(env, color=t["ink"], lw=1.2)
     a1.text(env, 0.75, f"envelope {FS.fmt(env, 'money')} ", ha="right", va="bottom", fontsize=7.5, color=t["ink"],
             transform=a1.get_xaxis_transform())
@@ -649,81 +743,108 @@ def fig_dollars(R, t):
     a1.set_xlim(0, max(env, left) * 1.01)
     FS.set_axis_format(a1, "x", "money")
     import matplotlib.patches as mp
-    fig.legend(handles=[mp.Patch(color=col[c], label=f"{R.labels.component(c)} {FS.fmt(dl['by_component'][c], 'money')}")
-                        for c in comps], loc="upper left", bbox_to_anchor=(0.17, top - 0.72 / h),
-               ncol=min(3, len(comps)), fontsize=7.5)
-    # region x component: a table of bars, one column per component, the same x scale in every column
-    gs = fig.add_gridspec(1, ncol, left=0.17, right=0.97, top=top - 1.75 / h, bottom=0.35 / h, wspace=0.12)
-    vmax = max(max(dl["by_region"][r].get(c, 0.0) for r in regs) for c in comps)
-    rows = []
-    for k, c in enumerate(comps + ["__total"]):
-        ax = fig.add_subplot(gs[0, k])
-        FS.style(ax, t, grid="x")
-        if c == "__total":
-            vals = [sum(dl["by_region"][r].values()) for r in regs]
-            ax.barh(range(len(regs))[::-1], vals, height=0.62, color=t["ink2"])
-            ax.set_xlim(0, max(vals) * 1.15)
-            ax.set_title("all components", fontsize=8, loc="left", color=t["ink"])
-        else:
-            vals = [dl["by_region"][r].get(c, 0.0) for r in regs]
-            ax.barh(range(len(regs))[::-1], vals, height=0.62, color=col[c])
-            ax.set_xlim(0, vmax * 1.1)
-            ax.set_title(textwrap.fill(R.labels.component(c), 16), fontsize=8, loc="left", color=t["ink"])
-        ax.set_yticks(range(len(regs)))
-        ax.set_yticklabels(regs[::-1] if k == 0 else [], fontsize=7.5)
-        ax.set_ylim(-0.6, len(regs) - 0.4)
-        FS.set_axis_format(ax, "x", "money")
-        ax.locator_params(axis="x", nbins=2)
-        ax.tick_params(labelsize=6.5)
-    title = (f"The plan uses {FS.fmt((tot + fixed) / env, 'percent')} of the {FS.fmt(env, 'money')} envelope; "
-             f"{R.labels.component(max(comps, key=lambda c: dl['by_component'][c]))} take "
-             f"{FS.fmt(max(dl['by_component'][c] for c in comps) / tot, 'percent')} of allocated dollars")
-    cap = (f"Top: the envelope split into fixed costs and the plan's dollars by component. Bottom: allocated dollars by "
-           f"{RT.lower()} and component (same scale per component column; fixed costs not split by {RT.lower()}).")
-    rows = [{"region": r, **{c: dl["by_region"][r].get(c, 0.0) for c in R.components}} for r in regs] + \
-        [{"region": "ALL", **dl["by_component"], "fixed": fixed, "envelope": env}]
+    if comps:
+        fig.legend(handles=[mp.Patch(color=col.get(c, t["ink2"]),
+                                     label=f"{R.labels.component(c)} {FS.fmt(bc[c], 'money')}") for c in comps],
+                   loc="upper left", bbox_to_anchor=(0.17, top - 0.72 / h), ncol=min(3, len(comps)), fontsize=7.5)
+        gs = fig.add_gridspec(1, ncol, left=0.17, right=0.97, top=top - 1.75 / h, bottom=0.35 / h, wspace=0.12)
+        vmax = max(max(dl["by_region"][r].get(c, 0.0) for r in regs) for c in comps) if regs else 1.0
+        for k, c in enumerate(comps + ["__total"]):
+            ax = fig.add_subplot(gs[0, k])
+            FS.style(ax, t, grid="x")
+            if c == "__total":
+                vals = [sum(dl["by_region"][r].values()) for r in regs]
+                ax.barh(range(len(regs))[::-1], vals, height=0.62, color=t["ink2"])
+                ax.set_xlim(0, max(vals + [1e-9]) * 1.15)
+                ax.set_title("all components", fontsize=8, loc="left", color=t["ink"])
+            else:
+                vals = [dl["by_region"][r].get(c, 0.0) for r in regs]
+                ax.barh(range(len(regs))[::-1], vals, height=0.62, color=col.get(c, t["ink2"]))
+                ax.set_xlim(0, max(vmax, 1e-9) * 1.1)
+                ax.set_title(textwrap.fill(R.labels.component(c), 16), fontsize=8, loc="left", color=t["ink"])
+            ax.set_yticks(range(len(regs)))
+            ax.set_yticklabels(regs[::-1] if k == 0 else [], fontsize=7.5)
+            ax.set_ylim(-0.6, len(regs) - 0.4)
+            FS.set_axis_format(ax, "x", "money")
+            ax.locator_params(axis="x", nbins=2)
+            ax.tick_params(labelsize=6.5)
+        topc = max(comps, key=lambda c: bc[c])
+        title = (f"The plan uses {FS.fmt((tot + fixed) / env, 'percent')} of the {FS.fmt(env, 'money')} envelope; "
+                 f"{R.labels.component(topc)} take {FS.fmt(bc[topc] / tot, 'percent')} of allocated dollars")
+        if unspent > 0.005 * env:
+            title = (f"{FS.fmt(unspent, 'money')} of the {FS.fmt(env, 'money')} envelope is unspent; "
+                     f"{R.labels.component(topc)} take {FS.fmt(bc[topc] / tot, 'percent')} of allocated dollars")
+    else:
+        title = (f"The plan spends nothing beyond fixed costs: {FS.fmt(fixed, 'money')} fixed, "
+                 f"{FS.fmt(unspent, 'money')} unspent of {FS.fmt(env, 'money')}")
+    cap = (f"Top: the envelope split into fixed costs, the plan's dollars by component and any unspent funds. Bottom: "
+           f"allocated dollars by {RT.lower()} and component (same scale per component column; fixed costs not split)."
+           if comps else "The envelope split into fixed costs and unspent funds; the plan allocates nothing.")
+    rows = [{"region": r, **{c: dl["by_region"][r].get(c, 0.0) for c in comps or R.components}} for r in regs] + \
+        [{"region": "ALL", **{c: bc.get(c, 0.0) for c in comps or R.components}, "fixed": fixed, "unspent": unspent,
+          "envelope": env}]
     return fig, title, cap, rows, "dollars by component and region against the envelope"
 
 
 def fig_cost_per_outcome(R, t):
     fd = R.art("figure_data")
-    bp = {k: v for k, v in fd["by_package"].items() if k != R.comparator and v.get("usd_per_outcome")}
-    if not bp:
-        raise Missing("no package in the plan averts any outcome")
     olab = R.labels.outcome(R.primary)
     U = R.labels.unit_title()
-    order = sorted(bp, key=lambda k: bp[k]["usd_per_outcome"])
+    allp = {k: v for k, v in fd["by_package"].items() if k != R.comparator}
+
+    def status(v):
+        if v.get("averted", 0) < 0:
+            return "harmful"
+        if not v.get("averted"):
+            return "undefined"
+        return "free" if float(v.get("cost") or 0) <= 0 else "cost"
+    st = {k: status(v) for k, v in allp.items()}
+    shown = sorted([k for k in allp if st[k] in ("cost", "free")], key=lambda k: allp[k]["cost"] / allp[k]["averted"])
+    other = [k for k in allp if st[k] not in ("cost", "free")]
+    if not shown and not other:
+        raise Missing("the plan gives no unit a package")
+    rep = fd.get("replay") or {}
+    lvl = float(rep.get("level") or (R.opt("uncertainty") or {}).get("interval", {}).get("level") or 0.95)
     inc = {c: v for c, v in (fd.get("component_increment") or {}).items() if v.get("outcome_per_usd")}
-    npk, nin = len(order), len(inc)
-    fig = _fig(t, 7.6, 0.3 * (npk + nin) + 2.2)
+    nrow = len(shown) + len(other)
+    fig = _fig(t, 7.6, 0.3 * (nrow + len(inc)) + 2.2)
     h = fig.get_figheight()
     top = _top(fig, 0.6)
     avail = top - 0.55 / h - 0.75 / h
-    h1 = avail * (npk + 0.6) / (npk + nin + 1.2)
+    h1 = avail * (nrow + 0.6) / (nrow + len(inc) + 1.2)
     a1 = fig.add_axes([0.38, top - 0.25 / h - h1, 0.5, h1])
     FS.style(a1, t, grid="x")
-    vals = []
-    have_ci = False
+    vals, have_ci, withheld = [1e-9], False, []
+    order = shown + other
     for y, k in enumerate(order[::-1]):
-        v = bp[k]
-        ci = v.get("usd_per_outcome_interval")
-        if ci:
-            have_ci = True
-            a1.plot([ci["ci_low"], ci["ci_high"]], [y, y], color=t["cat"][0], lw=2, solid_capstyle="round", zorder=2)
-            vals += [ci["ci_low"], ci["ci_high"]]
-        a1.scatter([v["usd_per_outcome"]], [y], s=34, color=t["cat"][0], edgecolors=t["surface"], linewidths=1.2,
-                   zorder=3)
-        vals.append(v["usd_per_outcome"])
+        v = allp[k]
+        if st[k] in ("cost", "free"):
+            x = v["cost"] / v["averted"]
+            ci = v.get("usd_per_outcome_interval")
+            if ci:
+                have_ci = True
+                a1.plot([ci["ci_low"], ci["ci_high"]], [y, y], color=t["cat"][0], lw=2, solid_capstyle="round",
+                        zorder=2)
+                vals += [ci["ci_low"], ci["ci_high"]]
+            elif v.get("interval_withheld"):
+                withheld.append((k, v["interval_withheld"]))
+            a1.scatter([x], [y], s=34, color=t["cat"][0], edgecolors=t["surface"], linewidths=1.2, zorder=3)
+            if st[k] == "free":
+                a1.text(x, y, "  free", va="center", fontsize=7, color=t["ink2"])
+            vals.append(x)
+        else:
+            msg = (f"harms: {FS.fmt(-v['averted'])} more {olab}" if st[k] == "harmful" else f"no {olab} averted")
+            a1.text(0, y, " " + msg, va="center", fontsize=7.5, color=t["ink2"])
         a1.text(1.02, y, f"{v['units']}", transform=a1.get_yaxis_transform(), va="center", fontsize=7.5,
                 color=t["ink2"])
-    a1.text(1.02, npk - 0.3, U, transform=a1.get_yaxis_transform(), fontsize=7.5, color=t["ink2"])
-    a1.set_yticks(range(npk))
+    a1.text(1.02, nrow - 0.3, U, transform=a1.get_yaxis_transform(), fontsize=7.5, color=t["ink2"])
+    a1.set_yticks(range(nrow))
     a1.set_yticklabels([R.labels.package(R.pk[k]) for k in order[::-1]], fontsize=7.5)
     a1.set_xlim(0, max(vals) * 1.08)
-    a1.set_ylim(-0.6, npk - 0.4)
+    a1.set_ylim(-0.6, nrow - 0.4)
     FS.set_axis_format(a1, "x", "money")
-    a1.set_title(f"$ per {_sing(olab)} averted, by package" + (" (line: 95% UI)" if have_ci else ""), fontsize=8.5,
-                 loc="left", color=t["ink"])
+    a1.set_title(f"$ per {_sing(olab)} averted, by package" + (f" (line: {lvl:.0%} UI)" if have_ci else ""),
+                 fontsize=8.5, loc="left", color=t["ink"])
     if inc:
         h2 = avail - h1 - 0.5 / h
         a2 = fig.add_axes([0.38, 0.55 / h, 0.5, h2])
@@ -742,29 +863,31 @@ def fig_cost_per_outcome(R, t):
         FS.set_axis_format(a2, "x", "money")
         a2.set_title(f"$ per {_sing(olab)} averted by adding each component (point estimate)", fontsize=8.5,
                      loc="left", color=t["ink"])
-    lo, hi = order[0], order[-1]
-    title = (f"Cost per {_sing(olab)} averted: {FS.fmt(bp[lo]['usd_per_outcome'], 'money')} to "
-             f"{FS.fmt(bp[hi]['usd_per_outcome'], 'money')} across the plan's {npk} packages")
-    rep = fd.get("replay") or {}
-    cap = (f"Top: each package's cost over its {olab} averted in the {U} that get it, with the interval over the "
-           f"uncertainty draws{'' if rep.get('reproduced') else ' (withheld: the replay did not reproduce)'}. "
-           f"Bottom: each component against the same package without it, in the {U} that get it.")
-    rows = [{"package": k, "label": R.labels.package(R.pk[k]), **{x: bp[k].get(x) for x in
-            ("units", "cost", "averted", "usd_per_outcome")},
-             "ci_low": (bp[k].get("usd_per_outcome_interval") or {}).get("ci_low"),
-             "ci_high": (bp[k].get("usd_per_outcome_interval") or {}).get("ci_high")} for k in order] + \
+    if shown:
+        lo, hi = shown[0], shown[-1]
+        title = (f"Cost per {_sing(olab)} averted: {FS.fmt(allp[lo]['cost'] / allp[lo]['averted'], 'money')} to "
+                 f"{FS.fmt(allp[hi]['cost'] / allp[hi]['averted'], 'money')} across {len(shown)} packages"
+                 + (f"; {len(other)} avert none" if other else ""))
+    else:
+        title = f"No package in the plan averts {olab}"
+    wh = ""
+    if withheld:
+        sh = [w.get("share_draws_nonpositive") for _k, w in withheld if w.get("share_draws_nonpositive") is not None]
+        wh = (f" {len(withheld)} intervals withheld: {withheld[0][1].get('reason')}"
+              + (f" (up to {FS.fmt(max(sh), 'percent')} of draws)" if sh else "") + ".")
+    cap = (f"Top: each package's cost over its {olab} averted in the {U} that get it, with the {lvl:.0%} interval over "
+           f"the uncertainty draws.{wh} Bottom: each component against the same package without it.")
+    rows = [{"package": k, "label": R.labels.package(R.pk[k]), "status": st[k],
+             **{x: allp[k].get(x) for x in ("units", "cost", "averted", "usd_per_outcome")},
+             "ci_low": (allp[k].get("usd_per_outcome_interval") or {}).get("ci_low"),
+             "ci_high": (allp[k].get("usd_per_outcome_interval") or {}).get("ci_high"),
+             "interval_withheld": (allp[k].get("interval_withheld") or {}).get("reason"),
+             "share_draws_nonpositive": (allp[k].get("interval_withheld") or {}).get("share_draws_nonpositive")}
+            for k in order] + \
         [{"component": c, "label": R.labels.component(c), "usd_per_outcome_added": 1.0 / v["outcome_per_usd"],
-          "units": v["units"], "units_without_counterpart": v.get("units_without_counterpart")} for c, v in inc.items()]
+          "units": v["units"], "units_without_counterpart": v.get("units_without_counterpart"),
+          "units_with_corrections": v.get("units_with_corrections")} for c, v in inc.items()]
     return fig, title, cap, rows, "cost per outcome averted by package and by component"
-
-
-def _threshold(dts) -> float:
-    for x in dts or []:
-        if x.get("threshold_pct") is not None:
-            return float(x["threshold_pct"]) / 100.0
-    import yaml
-    return float(yaml.safe_load(open(os.path.join(ROOT, "toolkit", "analysis", "thresholds.yaml")))
-                 ["decision_tests"]["share_threshold"])
 
 
 def fig_sensitivity(R, t):
@@ -775,32 +898,39 @@ def fig_sensitivity(R, t):
     base = float(se["objective_point"])
     dts = (R.opt("decision_tests") or {}).get("tests") or []
     by_test = {x["test_id"]: x for x in dts}
-    thr = _threshold(dts)
+    spec_thr, spec_src = _spec_threshold(R)
     out = []
     for r in rows_in:
         lo, hi = r["low"]["point_plan_objective"] - base, r["high"]["point_plan_objective"] - base
         tst = by_test.get(f"prior_range_{r['name']}")
-        share = max(float(r["low"].get("share_units_changed") or 0), float(r["high"].get("share_units_changed") or 0))
-        changes = (tst["verdict"] == "CHANGES_PLAN") if tst and tst.get("verdict") in ("CHANGES_PLAN", "NO_CHANGE") \
-            else share > thr
+        if tst and tst.get("verdict") in ("CHANGES_PLAN", "NO_CHANGE") and tst.get("share_pct") is not None:
+            # one calculation: the prior-range decision test's verdict, share and threshold
+            share = float(tst["share_pct"]) / 100.0
+            thr = float(tst["threshold_pct"]) / 100.0 if tst.get("threshold_pct") is not None else spec_thr
+            changes, by = tst["verdict"] == "CHANGES_PLAN", f"decision test {tst['test_id']}"
+        else:
+            share = max(float(r["low"].get("share_units_changed") or 0), float(r["high"].get("share_units_changed")
+                                                                             or 0))
+            thr, changes, by = spec_thr, None, f"sensitivity re-optimisation ({spec_src})"
+            changes = share > thr
         out.append({"name": r["name"], "label": R.labels.parameter(r["name"]), "units": R.labels.parameter_units(r["name"]),
                     "point": r.get("point"), "low": r["low"]["value"], "high": r["high"]["value"], "d_low": lo,
-                    "d_high": hi, "changes_plan": bool(changes), "share_units_changed": share,
-                    "basis": r.get("basis"), "by": "decision test " + tst["test_id"] if tst else "share of units"})
+                    "d_high": hi, "changes_plan": bool(changes), "share_units_changed": share, "threshold": thr,
+                    "basis": r.get("basis"), "by": by})
     out.sort(key=lambda x: -max(abs(x["d_low"]), abs(x["d_high"])))
     out = out[:14]
     fig = _fig(t, 7.8, 0.46 * len(out) + 1.45)
     h = fig.get_figheight()
     ax = fig.add_axes([0.33, 0.85 / h, 0.45, _top(fig, 0.55) - 0.85 / h])
     FS.style(ax, t, grid="x")
+    U = R.labels.unit_title()
     for y, r in enumerate(out[::-1]):
         ax.barh(y + 0.17, r["d_low"], height=0.3, color=t["cat"][0], zorder=2)
         ax.barh(y - 0.17, r["d_high"], height=0.3, color=t["cat"][1], zorder=2)
         if r["changes_plan"]:
             ax.scatter([1.04], [y], marker="D", s=24, color=t["ink"], transform=ax.get_yaxis_transform(),
                        clip_on=False, zorder=4)
-            ax.text(1.075, y, f"changes the plan\n({FS.fmt(r['share_units_changed'], 'percent')} of "
-                              f"{R.labels.unit_title()})",
+            ax.text(1.075, y, f"changes the plan\n({FS.fmt(r['share_units_changed'], 'percent')} of {U})",
                     transform=ax.get_yaxis_transform(), va="center", fontsize=7, color=t["ink"], linespacing=1.1)
     ax.axvline(0, color=t["ink2"], lw=0.9, zorder=3)
     labels = []
@@ -813,7 +943,9 @@ def fig_sensitivity(R, t):
     ax.set_xlim(-m, m)
     FS.set_axis_format(ax, "x", "signed")
     olab = R.labels.outcome(se.get("outcome") or R.primary)
-    ax.set_xlabel(f"change in the plan's {olab} averted", fontsize=8)
+    dfac = float((R.opt("point") or {}).get("discount_factor") or 1.0)
+    ax.set_xlabel(f"change in the plan's objective ({'discounted ' if abs(dfac - 1) > 1e-12 else ''}{olab} averted)",
+                  fontsize=8)
     import matplotlib.patches as mp
     fig.legend(handles=[mp.Patch(color=t["cat"][0], label="low end of the range"),
                         mp.Patch(color=t["cat"][1], label="high end of the range")],
@@ -822,9 +954,11 @@ def fig_sensitivity(R, t):
     title = f"{k} of {len(out)} tested ranges change the plan; {out[0]['label']} moves {olab} averted most"
     if len(title) > TITLE_MAX:
         title = f"{k} of {len(out)} tested ranges change the plan"
+    thrs = sorted({r["threshold"] for r in out})
     cap = (f"One at a time, each parameter at the ends of its tested range; change in the point plan's objective "
-           f"(base {FS.fmt(base)}). Diamond: the re-optimised plan moves more than {FS.fmt(thr, 'percent')} of units "
-           f"(per its prior-range decision test where one exists).")
+           f"(base {FS.fmt(base)}). Diamond: more than "
+           + (f"{FS.fmt(thrs[0], 'percent')}" if len(thrs) == 1 else "the threshold")
+           + f" of {U} change package, per the prior-range decision test where one exists (table: share, threshold, source).")
     return fig, title, cap, out, "one-at-a-time sensitivity with plan changes marked"
 
 
@@ -894,8 +1028,21 @@ def fig_trajectories(R, t):
     if not tr or tr.get("status") != "ok":
         raise Missing("needs trajectory runs (python -m toolkit.analysis.trajectories run <run_dir>)"
                       + (f": {tr.get('reason')}" if tr and tr.get("reason") else ""))
+    doc = R.doc("trajectories") or {}
+    from toolkit.analysis.artifacts import sha256
+    stale = [rel for rel, h in (doc.get("inputs") or {}).items() if sha256(os.path.join(R.dir, rel)) != h]
+    if stale:
+        raise Missing(f"the trajectories are stale: {', '.join(stale)} changed after they were computed; rerun "
+                      "python -m toolkit.analysis.trajectories run <run_dir>")
+    run_eng = (R.doc("point") or {}).get("engine") or {}
+    te = tr.get("engine") or {}
+    if run_eng and (te.get("name"), str(te.get("version"))) != (run_eng.get("name"), str(run_eng.get("version"))):
+        raise Missing(f"the trajectories are stale: computed by engine {te.get('name')} v{te.get('version')}, the "
+                      f"analysis by {run_eng.get('name')} v{run_eng.get('version')}")
     ser = tr["series"]
     metrics = tr["metrics"]
+    sample = tr.get("sample") or {}
+    n_units = sum(len(v) for v in sample.values())
     panels = ["total"] + sorted(ser.get("regions") or {})
     ncol = 4
     nrow = math.ceil(len(panels) / ncol)
@@ -917,8 +1064,10 @@ def fig_trajectories(R, t):
             if tg.get("value") is not None:
                 ax.errorbar([tg["t"]], [tg["value"]], yerr=[[tg["value"] - tg["lo"]], [tg["hi"] - tg["value"]]],
                             fmt="o", color=t["ink"], ms=3.5, lw=1, capsize=0, zorder=4)
-            ax.set_title(("All sampled units" if p == "total" else p) + (f": {meta.get('label', m)}" if n == 0 else ""),
-                         fontsize=7.5, loc="left", color=t["ink"])
+            k_units = len(s.get("units") or [])
+            name = f"Purposive sample, {k_units} units" if p == "total" else f"{p}: {k_units} sampled units"
+            ax.set_title(name + (f" ({meta.get('label', m)})" if n == 0 else ""), fontsize=7.5, loc="left",
+                         color=t["ink"])
             FS.set_axis_format(ax, "y", "percent" if meta.get("units") == "share" else "number")
             ax.set_ylim(0, None)
             ax.tick_params(labelsize=6.5)
@@ -926,20 +1075,23 @@ def fig_trajectories(R, t):
                 rows.append({"metric": m, "panel": p, "t": s["t"][k], "comparator": s["arms"]["comparator"][m][k],
                              "plan": s["arms"]["plan"][m][k]})
     from matplotlib.lines import Line2D
+    lvl = next((s.get("target", {}).get("level") for s in [ser["total"]] if s.get("target")), None) or 0.95
     fig.legend(handles=[Line2D([0], [0], color=t["muted"], lw=1.4, label="comparator"),
                         Line2D([0], [0], color=t["cat"][0], lw=1.6, label="plan"),
-                        Line2D([0], [0], marker="o", ls="", color=t["ink"], label="target (interval)")],
+                        Line2D([0], [0], marker="o", ls="", color=t["ink"], label=f"target ({lvl:.0%} interval)")],
                loc="upper right", bbox_to_anchor=(0.99, 1 - 0.2 / fig.get_figheight()), ncol=3, fontsize=7.5)
-    title = (f"Modelled {' and '.join(tr['metric_info'].get(m, {}).get('label', m) for m in metrics)} over time: "
-             f"comparator and plan")
-    cap = (f"Population-weighted means over {len(tr['sample'])} sampled units ({tr.get('per_region')} per region, "
-           f"{tr.get('seeds')} seeds); shaded: delivery period {d0:g}–{d1:g}.")
-    return fig, title, cap, rows, "modelled trajectories by region"
+    title = (f"Modelled {' and '.join(tr['metric_info'].get(m, {}).get('label', m) for m in metrics)} in a purposive "
+             f"sample: comparator and plan")
+    cap = (f"A purposive sample of {n_units} units ({tr.get('per_region')} per region at the lowest, median and highest "
+           f"comparator burden; {tr.get('seeds')} seeds), population-weighted within the sample: not a regional "
+           f"estimate. Shaded: delivery period {d0:g}–{d1:g}.")
+    return fig, title, cap, rows, "modelled trajectories in a purposive sample (diagnostic)"
 
 
 def _frontier_xy(fr: dict, primary: str) -> tuple[list, list]:
     """The frontier's plotted points: solved envelopes only, on outcome averted."""
-    raise NotImplementedError("figures r1 β")
+    pts = fr.get("points") or []
+    return [float(p["envelope_usd"]) for p in pts], [float(p["averted"][primary]) for p in pts]
 
 
 FUNCS = {"headline": fig_headline, "allocation_map": fig_allocation, "stability_map": fig_stability,
@@ -999,10 +1151,12 @@ def render(run_dir: str, out_dir: str | None = None, labels_overlay: dict | None
     for name in only or ORDER:
         R.used = []
         try:
-            fig, title, cap, rows, shows = FUNCS[name](R, t)
+            got = FUNCS[name](R, t)
         except Missing as e:
-            notp.append({"figure": name, "reason": str(e)})
+            notp.append({"figure": name, "reason": str(e), "tier": TIER_OF[name]})
             continue
+        fig, title, cap, rows, shows = got[:5]
+        extra = got[5] if len(got) > 5 else {}
         if len(title) > TITLE_MAX:
             title = title[:TITLE_MAX - 1].rsplit(" ", 1)[0] + "…"
         FS.title(fig, title, t)
@@ -1014,12 +1168,16 @@ def render(run_dir: str, out_dir: str | None = None, labels_overlay: dict | None
         _write_csv(table, rows)
         cap = cap if len(cap) <= CAPTION_MAX else cap[:CAPTION_MAX - 1].rsplit(" ", 1)[0] + "…"
         rel = (lambda p: os.path.relpath(p, run_dir)) if harness else (lambda p: p)
-        figs.append({"figure": name, "path": rel(files["png"]), "svg": rel(files["svg"]), "table": rel(table),
-                     "title": title, "caption": cap, "shows": shows, "sources": sources, "offset_free": clean,
-                     "theme": theme})
-    res = {"figures": figs, "not_produced": notp}
+        figs.append(dict({"figure": name, "path": rel(files["png"]), "svg": rel(files["svg"]), "table": rel(table),
+                          "title": title, "caption": cap, "shows": shows, "sources": sources, "offset_free": clean,
+                          "theme": theme, "tier": TIER_OF[name],
+                          "group": "decision" if TIER_OF[name] == "decision" else "diagnostics"}, **extra))
+    res = {"figures": figs, "not_produced": notp, "tiers": {k: list(v) for k, v in tiers_for(R.spec).items()},
+           "groups": {"decision": list(tiers_for(R.spec)["decision"]),
+                      "diagnostics": [n for k in ("data_model", "simulation") for n in tiers_for(R.spec)[k]]}}
     if not harness or write_index:
         import yaml
+        os.makedirs(dest, exist_ok=True)
         with open(os.path.join(dest, "figures.yaml"), "w") as f:
             yaml.safe_dump({"run_dir": run_dir, "producer": PRODUCER, **res}, f, sort_keys=False, width=120)
     return res
@@ -1034,8 +1192,8 @@ def _run_name(d):
 def compare(run_dirs: list[str], out_dir: str, names: list[str] | None = None, labels_overlay: dict | None = None,
             theme: str = "light") -> dict:
     """The headline with its interval, and the component and package counts, side by side across runs of one project
-    (same units, components and objective outcome; anything else is refused). Spec differences that bear on the
-    headline are named in the caption."""
+    (same units, components and objective outcome; anything else is refused). Packages are matched by their
+    component sets, not their names; spec differences that bear on the headline are named in the caption."""
     if len(run_dirs) < 2:
         raise ValueError("compare needs at least two run dirs")
     if len(run_dirs) > FS.MAX_CATEGORIES:
@@ -1056,11 +1214,20 @@ def compare(run_dirs: list[str], out_dir: str, names: list[str] | None = None, l
     olab = L.outcome(r0.primary)
     U = L.unit_title()
     comps = [c for c in r0.components if any(p["mix"].get(c, 0) for p in pts)]
-    pkgs = sorted([k for k in r0.pk if any(p["packages"].get(k) for p in pts)],
-                  key=lambda k: -sum(p["packages"].get(k, 0) for p in pts))
+    # packages reconciled by component set across runs (names may mean different sets in different specs)
+    keyed = []
+    for R, p in zip(Rs, pts):
+        cnt = {}
+        for name, n in (p.get("packages") or {}).items():
+            cs = tuple(sorted(R.pk.get(name, ())))
+            cnt[cs] = cnt.get(cs, 0) + n
+        keyed.append(cnt)
+    sets = sorted({cs for c in keyed for cs in c}, key=lambda cs: -sum(c.get(cs, 0) for c in keyed))
+    levels = [float(u["fixed_plan"][r0.primary].get("level", 0.95)) for u in uqs]
+    lvl_txt = f"{levels[0]:.0%}" if len(set(levels)) == 1 else "/".join(f"{x:.0%}" for x in levels)
     nr = len(Rs)
     row_h = 0.16 * nr + 0.12
-    h1, h2, h3 = 0.36 * nr + 0.25, row_h * len(comps), row_h * len(pkgs)
+    h1, h2, h3 = 0.36 * nr + 0.25, row_h * len(comps), row_h * len(sets)
     H = h1 + h2 + h3 + 0.6 + 3 * 0.5 + 0.35
     fig = _fig(t, 7.8, H)
     y = H - 0.6 - 0.3
@@ -1081,27 +1248,28 @@ def compare(run_dirs: list[str], out_dir: str, names: list[str] | None = None, l
         a1.text(1.02, yy, f"{FS.fmt(p['averted'][r0.primary])} ({FS.fmt(q['ci_low'])}–{FS.fmt(q['ci_high'])})",
                 transform=a1.get_yaxis_transform(), va="center", fontsize=7.5)
         rows.append({"run": n, "point": p["averted"][r0.primary], "ci_low": q["ci_low"], "ci_high": q["ci_high"],
-                     "cost": p["cost_allocated"], "window": json.dumps(Rs[j].spec["objective"]["horizon"]),
+                     "level": q.get("level", 0.95), "cost": p["cost_allocated"],
+                     "window": json.dumps(Rs[j].spec["objective"]["horizon"]),
                      **{f"units_{c_}": p["mix"].get(c_, 0) for c_ in comps},
-                     **{f"package_{k}": p["packages"].get(k, 0) for k in pkgs}})
+                     **{f"package_{'+'.join(cs) or 'none'}": keyed[j].get(cs, 0) for cs in sets}})
     a1.set_yticks(range(nr))
     a1.set_yticklabels(names[::-1], fontsize=8)
     a1.set_ylim(-0.6, nr - 0.4)
     FS.set_axis_format(a1, "x")
-    a1.set_title(f"{olab} averted, point and 95% UI", fontsize=8.5, loc="left", color=t["ink"])
+    a1.set_title(f"{olab} averted, point and {lvl_txt} UI", fontsize=8.5, loc="left", color=t["ink"])
     bh = 0.8 / nr
-    for ax, keys, get, lab in ((a2, comps, lambda p, k: p["mix"].get(k, 0), L.component),
-                               (a3, pkgs, lambda p, k: p["packages"].get(k, 0),
-                                lambda k: textwrap.shorten(L.package(r0.pk[k]), 44, placeholder="…"))):
-        for j, p in enumerate(pts):
+    for ax, keys, get, lab in ((a2, comps, lambda j, k: pts[j]["mix"].get(k, 0), L.component),
+                               (a3, sets, lambda j, k: keyed[j].get(k, 0),
+                                lambda k: textwrap.shorten(L.package(k), 44, placeholder="…"))):
+        for j in range(nr):
             ys = [len(keys) - 1 - yk + ((nr - 1) / 2 - j) * bh for yk in range(len(keys))]
-            ax.barh(ys, [get(p, k) for k in keys], height=bh * 0.9, color=t["cat"][j], label=names[j])
+            ax.barh(ys, [get(j, k) for k in keys], height=bh * 0.9, color=t["cat"][j], label=names[j])
         ax.set_yticks(range(len(keys)))
         ax.set_yticklabels([lab(k) for k in keys][::-1], fontsize=7.5)
         ax.set_ylim(-0.6, len(keys) - 0.4)
         FS.set_axis_format(ax, "x", "count")
     a2.set_title(f"{U} per component", fontsize=8.5, loc="left", color=t["ink"])
-    a3.set_title(f"{U} per package", fontsize=8.5, loc="left", color=t["ink"])
+    a3.set_title(f"{U} per package (matched by components)", fontsize=8.5, loc="left", color=t["ink"])
     a2.legend(loc="lower right", fontsize=7.5)
     d = [p["averted"][r0.primary] for p in pts]
     title = (f"{olab} averted: " + " vs ".join(f"{FS.fmt(x)} ({n})" for x, n in zip(d, names)))
@@ -1118,12 +1286,15 @@ def compare(run_dirs: list[str], out_dir: str, names: list[str] | None = None, l
     import matplotlib.pyplot as plt
     plt.close(fig)
     _write_csv(os.path.join(out_dir, "comparison.csv"), rows)
-    cap = ("Each run's point plan: headline with its 95% UI over that run's declared sources, and its units per "
-           "component and per package." + (f" The specs differ in: {', '.join(diffs)}." if diffs else
-                                            " The specs agree on window, envelope, comparator and sources."))
+    cap = (f"Each run's point plan: headline with its {lvl_txt} UI over that run's declared sources, and its units per "
+           f"component and per package (packages matched by their components)."
+           + (" The package definitions differ between the runs; packages are matched by their components."
+              if "package definitions" in diffs else "")
+           + (f" The specs differ in: {', '.join(diffs)}." if diffs else
+              " The specs agree on window, envelope, comparator, sources and package definitions."))
     entry = {"figure": "comparison", "path": png, "svg": svg, "table": os.path.join(out_dir, "comparison.csv"),
              "title": title, "caption": cap, "runs": [os.path.abspath(d) for d in run_dirs], "names": names,
-             "spec_differences": diffs, "offset_free": clean}
+             "spec_differences": diffs, "offset_free": clean, "group": "decision"}
     import yaml
     with open(os.path.join(out_dir, "figures.yaml"), "w") as f:
         yaml.safe_dump({"producer": PRODUCER, "figures": [entry], "not_produced": []}, f, sort_keys=False, width=120)
@@ -1248,8 +1419,10 @@ def toy_run(d: str, n: int = 24, regions: int = 3, coords: bool = False, labels:
     art("sensitivity", {"rows": rows, "objective_point": 1.234e7, "outcome": "dalys"})
     art("engine", {"card": {"name": "toy"}, "parameters": [{"name": "p_eff", "units": "share"},
                                                            {"name": "p_dur", "units": "days"}]})
-    art("decision_tests", {"tests": [{"test_id": "prior_range_p_eff", "verdict": "CHANGES_PLAN", "threshold_pct": 10.0},
-                                     {"test_id": "prior_range_p_dur", "verdict": "NO_CHANGE", "threshold_pct": 10.0}]})
+    art("decision_tests", {"tests": [{"test_id": "prior_range_p_eff", "verdict": "CHANGES_PLAN", "threshold_pct": 10.0,
+                                      "share_pct": 30.0, "status": "run", "statement": "toy"},
+                                     {"test_id": "prior_range_p_dur", "verdict": "NO_CHANGE", "threshold_pct": 10.0,
+                                      "share_pct": 5.0, "status": "run", "statement": "toy"}]})
     art("calibration", {"method": "emulator_inversion", "units": {u: {"z": 0.0} for u in ids},
                         "diagnostics": {"target_logit_residual_max": 7e-5}})
     art("emulator", {"accuracy": {"cal_logit_rmse": 0.13}})
@@ -1286,6 +1459,11 @@ def toy_run(d: str, n: int = 24, regions: int = 3, coords: bool = False, labels:
                          if schedule else
                          {"status": "not_offered",
                           "reason": "engine toy v1 does not offer schedule() (toolkit/engines/hooks.py)"})})
+        fdp = os.path.join(d, "analysis", "figure_data.yaml")
+        doc = yaml.safe_load(open(fdp))
+        for pt in doc["data"]["frontier"]["points"]:
+            pt["averted"] = {"dalys": pt["objective"]}
+        yaml.safe_dump(doc, open(fdp, "w"), sort_keys=False)
     return d
 
 
