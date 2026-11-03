@@ -1464,6 +1464,54 @@ def toy_run(d: str, n: int = 24, regions: int = 3, coords: bool = False, labels:
         for pt in doc["data"]["frontier"]["points"]:
             pt["averted"] = {"dalys": pt["objective"]}
         yaml.safe_dump(doc, open(fdp, "w"), sort_keys=False)
+    # tier-1 inputs: bound engine attributes (one column, one monthly profile), the emulator design, parameter
+    # ranges and kinds, the drawn priors, and a derivation record
+    import math as _m
+    up = os.path.join(d, "units.csv")
+    lines = open(up).read().splitlines()
+    out = [lines[0] + ",cov," + ",".join(f"m{k:02d}" for k in range(1, 13))]
+    for i, line in enumerate(lines[1:]):
+        prof = [1 + 0.8 * _m.sin(2 * _m.pi * (k + i % 3) / 12) for k in range(12)]
+        out.append(line + f",{0.2 + 0.6 * ((i * 5) % n) / n:.3f}," + ",".join(f"{v:.3f}" for v in prof))
+    open(up, "w").write("\n".join(out) + "\n")
+    sp = yaml.safe_load(open(os.path.join(d, "decision_spec.yaml")))
+    sp["decision_units"]["engine_attributes"] = {"access": {"column": "cov"},
+                                                 "profile": {"columns": [f"m{k:02d}" for k in range(1, 13)]},
+                                                 "level": {"value": 0.5, "source": "toy assumption"}}
+    sp["analysis"] = dict(sp.get("analysis") or {}, emulator={"features": ["cov"]})
+    sp["deliverable"]["kind"] = "package_per_unit"
+    yaml.safe_dump(sp, open(os.path.join(d, "decision_spec.yaml"), "w"), sort_keys=False)
+    os.makedirs(os.path.join(d, "analysis", "batch"), exist_ok=True)
+    pts = [{"point": k, "unit_id": f"u{(k * 7) % n}", "z": -1.5 + 3.0 * k / 39, "seed": 1000 + k,
+            "theta": {"p_eff": 0.3 + 0.4 * ((k * 3) % 40) / 39, "p_dur": 480 + 380 * ((k * 11) % 40) / 39},
+            "holdout": k % 10 == 0} for k in range(40)]
+    json.dump({"points": pts, "fitted_names": ["p_eff"], "prior_names": ["p_dur"], "packages": list(pk)},
+              open(os.path.join(d, "analysis", "batch", "design.json"), "w"))
+    eng = yaml.safe_load(open(os.path.join(d, "analysis", "engine.yaml")))
+    eng["data"]["parameters"] = [
+        {"name": "p_eff", "value": 0.5, "kind": "fitted", "units": "share", "lo": 0.3, "hi": 0.7, "source": "fitted"},
+        {"name": "p_dur", "value": 600.0, "kind": "fixed", "units": "days", "lo": 480.0, "hi": 860.0,
+         "source": "a published review"},
+        {"name": "p_cost", "value": 1.0, "kind": "scenario", "units": "", "lo": None, "hi": None, "source": "toy"}]
+    yaml.safe_dump(eng, open(os.path.join(d, "analysis", "engine.yaml"), "w"), sort_keys=False)
+    calp = os.path.join(d, "analysis", "calibration.yaml")
+    cal = yaml.safe_load(open(calp))
+    cal["data"]["units"] = {f"u{i}": {"z": -1.0 + 2.0 * i / n, "clamped": i == 5} for i in range(n)}
+    yaml.safe_dump(cal, open(calp, "w"), sort_keys=False)
+    rp = os.path.join(d, "uncertainty_report.yaml")
+    rep = yaml.safe_load(open(rp)) if os.path.exists(rp) else {}
+    rep["parameters_drawn"] = [{"name": "p_dur", "source_kind": "prior", "dist": "uniform", "range": [480.0, 860.0],
+                                "source": "a published review"},
+                               {"name": "p_eff", "source_kind": "engine_parameters", "dist": "uniform",
+                                "range": [0.3, 0.7], "source": "fitted"}]
+    yaml.safe_dump(rep, open(rp, "w"))
+    os.makedirs(os.path.join(d, "data"), exist_ok=True)
+    yaml.safe_dump({"derivations": [{"id": "units", "script": "data/derive/units.py",
+                                     "inputs": ["data/inputs/a.csv", "data/inputs/b.csv"], "outputs": ["units.csv"],
+                                     "columns": {"uses": {"data/inputs/a.csv": ["uid", "pop"],
+                                                          "data/inputs/b.csv": ["cov", "m*"]},
+                                                 "ignores": {"data/inputs/a.csv": {"area": "not used"}}}}]},
+                   open(os.path.join(d, "data", "derivations.yaml"), "w"), sort_keys=False)
     return d
 
 
@@ -1701,6 +1749,49 @@ def _self_test() -> int:
         ok("90% UI" in el["headline"]["title"] and "90%" in el["cost_per_outcome"]["caption"]
            and "95%" not in el["cost_per_outcome"]["caption"] and "90%" in el2["caption"] and "95%" not in el2["caption"],
            "F25 interval levels come from the stored artifacts")
+        # ---------------- owner: three tiers (data and model, simulation, decision)
+        rt = render(d, os.path.join(base, "tiers"))
+        idx_t = yaml.safe_load(open(os.path.join(base, "tiers", "figures.yaml")))
+        ent_t = {f["figure"]: f for f in rt["figures"]}
+        np_t = {x["figure"]: x for x in rt["not_produced"]}
+        ok(all(f.get("tier") in ("data_model", "simulation", "decision") for f in rt["figures"])
+           and all(x.get("tier") in ("data_model", "simulation", "decision") for x in rt["not_produced"])
+           and set(idx_t.get("tiers") or {}) == {"data_model", "simulation", "decision"},
+           "TT1 every figure and not-produced entry records its tier; figures.yaml lists the three tiers")
+        want1 = {"data_coverage", "unit_attributes", "parameters", "calibration_fit", "design_coverage"}
+        ok(want1 <= {n for n, f in ent_t.items() if f["tier"] == "data_model"},
+           f"TT2 tier 1 (data and model) is drawn from the run's own inputs: "
+           f"{sorted(n for n, f in ent_t.items() if f['tier'] == 'data_model')} / "
+           f"{ {k: v['reason'][:60] for k, v in np_t.items() if v['tier'] == 'data_model'} }")
+        cov = list(csv.DictReader(open(ent_t["data_coverage"]["table"]))) if "data_coverage" in ent_t else []
+        ok(any(r.get("attribute") == "profile" and "m01" in (r.get("binding") or "") for r in cov)
+           and any(r.get("input") == "data/inputs/b.csv" for r in cov),
+           "TT2b data coverage lists each bound attribute's binding and each staged input's columns")
+        pr = list(csv.DictReader(open(ent_t["parameters"]["table"]))) if "parameters" in ent_t else []
+        ok({r["name"]: r["kind"] for r in pr if r.get("name")}.items() >= {"p_eff": "fitted", "p_dur": "prior"}.items(),
+           f"TT2c parameters show fitted against prior-drawn values with their ranges: {pr[:3]}")
+        dsg = ent_t.get("design_coverage") or {}
+        ok(dsg and "40 design points" in dsg.get("caption", ""), f"TT2d design coverage counts the design points: {dsg}")
+        sim = {"timeline", "trajectories", "burn_in", "seasonality", "stochastic_noise"}
+        ok(sim <= {n for n, x in np_t.items() if x["tier"] == "simulation"}
+           and "run_series" in np_t["burn_in"]["reason"] and "trajectory" in np_t["stochastic_noise"]["reason"],
+           f"TT3 tier 2 figures without their inputs are not produced, each with its reason: "
+           f"{ {k: np_t[k]['reason'][:50] for k in sim if k in np_t} }")
+        ok("decision_tests" in ent_t and ent_t["decision_tests"]["tier"] == "decision"
+           and "1 of 2" in ent_t["decision_tests"]["title"],
+           f"TT4 the decision tests are a decision figure: {ent_t.get('decision_tests', {}).get('title')}")
+        ov = idx_t.get("overviews") or {}
+        ok(all(os.path.exists(ov.get(k, "")) for k in ("data_model", "decision")),
+           f"TT5 one overview contact sheet per tier with figures: {ov}")
+        du = toy_run(os.path.join(base, "runu"))
+        spu = yaml.safe_load(open(os.path.join(du, "decision_spec.yaml")))
+        spu["deliverable"]["kind"] = "threshold_rule"
+        yaml.safe_dump(spu, open(os.path.join(du, "decision_spec.yaml"), "w"), sort_keys=False)
+        ru = render(du, os.path.join(base, "unk"))
+        npu = [x for x in ru["not_produced"] if x["tier"] == "decision"]
+        ok(not [f for f in ru["figures"] if f["tier"] == "decision"] and npu
+           and "no decision figure set declared for kind threshold_rule" in npu[0]["reason"],
+           f"TT6 an undeclared deliverable kind gets no decision figures and says why: {npu}")
         # design: decision figures and modeller diagnostics are grouped in figures.yaml
         idx = yaml.safe_load(open(os.path.join(out, "figures.yaml")))
         grp = idx.get("groups") or {}

@@ -296,6 +296,18 @@ def _self_test() -> int:
         ok(res["series"]["total"]["target"].get("value") is not None, "TJ7 the calibration target is carried per panel")
         r2 = FG.render(d, os.path.join(figs, "b"))
         ok(any(f["figure"] == "trajectories" for f in r2["figures"]), "TJ8 the trajectories figure is produced")
+        # ---- owner: tier-2 figures and their paired checks
+        e2 = {f["figure"]: f for f in r2["figures"]}
+        n2 = {x["figure"]: x["reason"] for x in r2["not_produced"]}
+        chk = {c["check"]: c for c in (e2.get("trajectories") or {}).get("checks") or []}
+        ok(chk.get("plan_equals_comparator_before_delivery", {}).get("status") == "pass"
+           and "pre_intervention_vs_target" in chk,
+           f"TJ14 the trajectory figure carries its checks (plan equals comparator before delivery; pre-intervention "
+           f"level against target): {list(chk)}")
+        ok("stochastic_noise" in e2 and e2["stochastic_noise"]["tier"] == "simulation",
+           f"TJ15 seed-to-seed spread is drawn from the trajectory seeds: {n2.get('stochastic_noise')}")
+        ok("seasonality" not in e2 and "monthly profile" in n2.get("seasonality", ""),
+           f"TJ16 without a monthly profile attribute the seasonality check says why: {n2.get('seasonality')}")
         # ---- Codex r1
         doc = yaml.safe_load(open(os.path.join(d, OUT)))
         ok(set(doc["inputs"]) >= {"decision_spec.yaml", "analysis/point.yaml", "analysis/calibration.yaml",
