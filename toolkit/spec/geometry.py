@@ -928,6 +928,22 @@ def _square(x0, y0, s):
     return [[x0, y0], [x0 + s, y0], [x0 + s, y0 + s], [x0, y0 + s], [x0, y0]]
 
 
+def toy_write_sheet(d: str, footer: bool = True) -> str:
+    """A minimal sign-off sheet for a toy run dir: the geometry section and, with `footer`, the sources line
+    (spec sha256, no derivation record, the shown geometry evidence) the real sheet writer records. For self-tests
+    of signers that do not build the full sheet (toolkit/spec/signoff.write_sheet does)."""
+    rep = run(d)
+    spec_sha = _sha(os.path.join(d, SPEC_FILE))
+    text = "# Decision spec sign-off sheet\n\n" + "\n".join(sheet_lines(d)) + "\n"
+    if footer:
+        src = json.dumps({"spec_sha256": spec_sha, "derivations_sha256": "none",
+                          "geometry_evidence_sha256": str(rep.get("evidence_sha256") or "none")}, sort_keys=True)
+        text += f"\n<!-- signoff-sheet-sources: {src} -->\n"
+    p = os.path.join(d, "decision_spec.signoff_sheet.md")
+    open(p, "w").write(text)
+    return p
+
+
 def toy_spec_with_boundaries(d: str, accept: dict | None = None) -> str:
     """A schema-valid toy spec (toolkit/spec/schema.py toy_spec) whose units carry points, with a square per unit in
     b.geojson declared in presentation.yaml; units 0 and 1 carry each other's points (one reciprocal swap).

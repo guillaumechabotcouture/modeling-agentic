@@ -756,6 +756,7 @@ def _self_test_lead_and_geometry(ok) -> None:
             yaml.safe_dump(sp, open(os.path.join(d, DECISION_SPEC), "w"))
             yaml.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d, CRITERIA), "w"))
             yaml.safe_dump(example_brief(), open(os.path.join(d, BRIEF), "w"))
+            GEO.toy_write_sheet(d)             # the sheet the signer reads the shown geometry evidence from
             try:
                 sign(d, by, accept_proposed=True)
                 rec = json.load(open(os.path.join(d, GEO.SIGNOFF_FILE)))
@@ -773,6 +774,37 @@ def _self_test_lead_and_geometry(ok) -> None:
         sign(d, "owner", accept_proposed=True)
         ok(status(d) == "signed" and not os.path.exists(os.path.join(d, GEO.SIGNOFF_FILE)),
            "DB35b a brief-only run (no decision spec) signs as before and writes no geometry record")
+    # DB37 (Codex on 4d20e23, P1): with a decision spec, every brief sign-off, the CLI included, binds the geometry
+    # evidence the current sheet shows: no sheet, or a sheet without it, refuses ("regenerate the sheet"); evidence
+    # changed since the sheet refuses; the unchanged evidence signs and approves the proposed exception
+    env = {k: v for k, v in os.environ.items() if k != "MA_SIGNOFF_MODE"}
+    got37 = {}
+    for case in ("no sheet", "no evidence", "changed", "unchanged"):
+        with tempfile.TemporaryDirectory() as d:
+            GEO.toy_inputs(d)
+            sp = yaml.safe_load(open(os.path.join(d, DECISION_SPEC)))
+            sp["decision_units"][GEO.ACCEPT_KEY] = {"reciprocal_swap:swap_a+swap_b": "rows checked"}
+            yaml.safe_dump(sp, open(os.path.join(d, DECISION_SPEC), "w"))
+            yaml.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d, CRITERIA), "w"))
+            yaml.safe_dump(example_brief(), open(os.path.join(d, BRIEF), "w"))
+            if case != "no sheet":
+                GEO.toy_write_sheet(d, footer=case != "no evidence")
+            if case == "changed":
+                g = json.load(open(os.path.join(d, "b.geojson")))
+                g["features"][0]["properties"]["note"] = "changed after the sheet"
+                json.dump(g, open(os.path.join(d, "b.geojson"), "w"))
+            import subprocess
+            r = subprocess.run([sys.executable, os.path.abspath(__file__), "sign", d, "--by", "owner",
+                                "--accept-proposed"], env=env, capture_output=True, text=True)
+            appr = {}
+            if os.path.exists(os.path.join(d, GEO.SIGNOFF_FILE)):
+                appr = json.load(open(os.path.join(d, GEO.SIGNOFF_FILE))).get("approvals") or {}
+            got37[case] = (r.returncode, status(d), "regenerate" in r.stderr, sorted(appr))
+    ok(got37["no sheet"][:3] == (1, "awaiting", True) and got37["no evidence"][:3] == (1, "awaiting", True)
+       and got37["changed"][:2] == (1, "awaiting") and got37["unchanged"] == (0, "signed", False,
+                                                                                ["reciprocal_swap:swap_a+swap_b"]),
+       f"DB37 the brief CLI reads the shown geometry evidence from the current sheet and refuses without it or when it "
+       f"changed ({got37})")
 
 
 def _run_self_test() -> int:

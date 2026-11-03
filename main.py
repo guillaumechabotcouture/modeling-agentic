@@ -820,6 +820,7 @@ def _self_test_owner_cli(ok, td: str, trace, reg) -> None:
         _geo.toy_inputs(d5)
         _y.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d5, "success_criteria.yaml"), "w"))
         _y.safe_dump(_db.example_brief(), open(os.path.join(d5, "decision_brief.yaml"), "w"))
+        _geo.toy_write_sheet(d5)     # the sheet whose geometry evidence the sign-off binds (Codex on 4d20e23)
         la = os.path.join(d5, la_name)
         tr5 = open(os.path.join(d5, "trace.jsonl"), "a")
         hk5 = agents_pkg.create_hooks(d5, tr5, datetime.now(), registered_agents=reg, signoff="lead")

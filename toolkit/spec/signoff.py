@@ -619,6 +619,21 @@ def _self_test() -> int:
                f"unchanged evidence signs with the approval ({has}; {refused[:90]}; {sorted(appr)})")
     except Exception as e:  # noqa: BLE001 -- before the evidence is recorded (step α)
         ok(False, f"IG-S3 the sheet binds the geometry evidence: {type(e).__name__}: {e}")
+    # IG-S4 (Codex on 4d20e23, P2): a sheet with no sources footer is refused, not skipped
+    try:
+        from toolkit.spec import geometry
+        with tempfile.TemporaryDirectory() as d:
+            geometry.toy_spec_with_boundaries(d, accept={"reciprocal_swap:0+1": "rows checked by the owner"})
+            geometry.toy_write_sheet(d, footer=False)
+            try:
+                sign(d, "owner", note="n")
+                why = ""
+            except ValueError as e:
+                why = str(e)
+            ok("predates source binding" in why and status(d) == "awaiting",
+               f"IG-S4 a sheet without its sources footer is refused: it predates source binding ({why[:90]})")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"IG-S4 a sheet without its sources footer is refused: {type(e).__name__}: {e}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
