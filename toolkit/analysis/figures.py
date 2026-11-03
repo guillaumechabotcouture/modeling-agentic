@@ -1966,11 +1966,12 @@ def toy_run(d: str, n: int = 24, regions: int = 3, coords: bool = False, labels:
             "calibration": {"method": "emulator_inversion", "attribute": "x", "target_column": "tgt", "metric": "prev",
                             "target_uncertainty": {"region_sd_logit": 0.15}},
             "deliverable": {"headline": {"name": "total", "outcome": "dalys"}}}
-    if labels:
-        spec["presentation"] = {"labels": {"components": {"ca": "Alpha service", "cb": "Beta service"},
-                                           "parameters": {"p_eff": "Effect size"}, "outcomes": {"dalys": "DALYs",
-                                                                                                 "cases": "Cases"}}}
     yaml.safe_dump(spec, open(os.path.join(d, "decision_spec.yaml"), "w"), sort_keys=False)
+    if labels:      # display names live in the unsigned presentation file beside the spec (owner, 2026-11-02)
+        yaml.safe_dump({"labels": {"components": {"ca": "Alpha service", "cb": "Beta service"},
+                                   "parameters": {"p_eff": "Effect size"},
+                                   "outcomes": {"dalys": "DALYs", "cases": "Cases"}}},
+                       open(os.path.join(d, "presentation.yaml"), "w"), sort_keys=False)
     from toolkit.alloc import costs as acosts
     pk = acosts.packages(spec["options"])
     names = [k for k in pk if k != "none"]
@@ -2377,6 +2378,79 @@ def _self_test() -> int:
         ok(not [f for f in ru["figures"] if f["tier"] == "decision"] and npu
            and "no decision figure set declared for kind threshold_rule" in npu[0]["reason"],
            f"TT6 an undeclared deliverable kind gets no decision figures and says why: {npu}")
+        # ---------------- owner: unsigned presentation file (labels, boundaries)
+        sc = json.load(open(os.path.join(d, ents["sensitivity"]["path"]) + ".provenance.json"))
+        ok((sc.get("presentation") or [{}])[0].get("path") == "presentation.yaml"
+           and len((sc.get("presentation") or [{}])[0].get("sha256") or "") == 64,
+           f"PL1 each figure's provenance records the presentation file and its sha: {sc.get('presentation')}")
+        dm = toy_run(os.path.join(base, "runm"))
+        open(os.path.join(dm, "presentation.yaml"), "w").write("labels: [not, a, mapping]\n")
+        try:
+            render(dm, os.path.join(base, "m1"))
+            ok(False, "PL2 a malformed presentation file fails closed")
+        except ValueError as e:
+            ok("presentation.yaml" in str(e), f"PL2 a malformed presentation file fails closed: {e}")
+        open(os.path.join(dm, "presentation.yaml"), "w").write("labels:\n  components: {zz: Zed}\n")
+        try:
+            render(dm, os.path.join(base, "m2"))
+            ok(False, "PL2b labels for ids the spec does not have fail closed")
+        except ValueError as e:
+            ok("zz" in str(e), f"PL2b labels for ids the spec does not have fail closed: {e}")
+        ovp = os.path.join(base, "over.yaml")
+        yaml.safe_dump({"labels": {"components": {"ca": "Overlay A"}}}, open(ovp, "w"))
+        r = subprocess.run([sys.executable, "-m", "toolkit.analysis.figures", "render", d, "--out",
+                            os.path.join(base, "ov"), "--labels", ovp, "--only", "cost_per_outcome"],
+                           cwd=ROOT, capture_output=True, text=True)
+        cpo2 = open(os.path.join(base, "ov", "cost_per_outcome.csv")).read() if r.returncode == 0 else ""
+        ok("Overlay A" in cpo2 and "Beta service" in cpo2,
+           f"PL3 a --labels file overrides the run dir's presentation file, id by id: {r.stderr[-200:]}")
+
+        # boundaries: GeoJSON polygons matched to units directly or through a crosswalk
+        def geo(dd, ids, extra=2, key="code"):
+            feats = []
+            for k, u in enumerate(ids + [f"ctx{j}" for j in range(extra)]):
+                x0, y0 = (k % 6) * 1.0, (k // 6) * 1.0
+                ring = [[x0, y0], [x0 + 1, y0], [x0 + 1, y0 + 1], [x0, y0 + 1], [x0, y0]]
+                gtype, coords = (("MultiPolygon", [[ring]]) if k % 2 else ("Polygon", [ring]))
+                feats.append({"type": "Feature", "properties": {key: f"S-{u}"},
+                              "geometry": {"type": gtype, "coordinates": coords}})
+            json.dump({"type": "FeatureCollection", "features": feats}, open(os.path.join(dd, "b.geojson"), "w"))
+        db = toy_run(os.path.join(base, "runb"))
+        uids = [f"u{i}" for i in range(24)]
+        geo(db, uids)
+        with open(os.path.join(db, "xw.csv"), "w") as fh:
+            fh.write("uid,code\n" + "".join(f"{u},S-{u}\n" for u in uids[1:]))      # u0 has no polygon
+        pres = yaml.safe_load(open(os.path.join(db, "presentation.yaml")))
+        pres["boundaries"] = {"path": "b.geojson", "feature_id": "code", "credit": "Boundaries: toy (CC0)",
+                              "crosswalk": {"path": "xw.csv", "unit_id": "uid", "feature_id": "code"}}
+        yaml.safe_dump(pres, open(os.path.join(db, "presentation.yaml"), "w"))
+        rb = render(db, os.path.join(base, "bmap"), only=["allocation_map", "stability_map", "burden_map"])
+        eb = {f["figure"]: f for f in rb["figures"]}
+        ok(set(eb) == {"allocation_map", "stability_map", "burden_map"}
+           and all(f.get("layout") == "boundaries" and f.get("unmatched") == ["u0"]
+                   and "u0" in f["caption"] and f.get("credit") == "Boundaries: toy (CC0)" for f in eb.values())
+           and all(f.get("context_features") == 2 for f in eb.values()),
+           f"BD1 with a boundary file and crosswalk the maps draw polygons, list unmatched units, credit the source and "
+           f"draw context features: {[(k, v.get('layout'), v.get('unmatched'), v.get('context_features')) for k, v in eb.items()]}")
+        db2 = toy_run(os.path.join(base, "runb2"))
+        geo(db2, uids, key="uid_prop")
+        sp2 = yaml.safe_load(open(os.path.join(db2, "presentation.yaml")))
+        lines = open(os.path.join(db2, "units.csv")).read().splitlines()
+        open(os.path.join(db2, "units.csv"), "w").write("\n".join([lines[0]] + [ln.replace(f"{ln.split(',')[0]},",
+                                                                                         f"S-{ln.split(',')[0]},", 1)
+                                                                             for ln in lines[1:]]) + "\n")
+        edit(db2, "point", lambda x: x.update(plan={f"S-{k}": v for k, v in x["plan"].items()}))
+        sp2["boundaries"] = {"path": "b.geojson", "feature_id": "uid_prop"}
+        yaml.safe_dump(sp2, open(os.path.join(db2, "presentation.yaml"), "w"))
+        e2b, why = one(db2, "allocation_map", "bmap2")
+        ok(e2b and e2b.get("layout") == "boundaries" and e2b.get("unmatched") == [],
+           f"BD2 without a crosswalk the unit id matches the feature property directly: {e2b and e2b.get('unmatched')} {why}")
+        open(os.path.join(db, "b.geojson"), "w").write("{\"type\": \"FeatureCollection\", \"features\": [{}]}")
+        try:
+            render(db, os.path.join(base, "bmap3"), only=["allocation_map"])
+            ok(False, "BD3 a malformed boundary file fails closed")
+        except ValueError as e:
+            ok("b.geojson" in str(e), f"BD3 a malformed boundary file fails closed: {e}")
         # design: decision figures and modeller diagnostics are grouped in figures.yaml
         idx = yaml.safe_load(open(os.path.join(out, "figures.yaml")))
         grp = idx.get("groups") or {}
