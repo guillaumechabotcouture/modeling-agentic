@@ -2012,6 +2012,51 @@ def _run_self_test() -> int:
        f"ST2 a crashed v2 run is stored with its crash recorded, and the crash still propagates ({_stored_calls})")
     ok(_rs is not None and _rs(lambda: "completed", _cr, store=lambda rp: _stored_calls.append("ok")) == "completed"
        and _stored_calls[-1] == "ok", "ST2b a finished v2 run is stored once and its status returned")
+
+    # ST3-ST6 (Codex #130 P2): finalization never replaces the run's own exception or its exit code.
+    def _outcome(fn):
+        try:
+            fn()
+        except BaseException as e:  # noqa: BLE001 -- the exception type is the finding
+            return type(e).__name__
+        return None
+
+    def _raise(exc):
+        def f(*a, **k):
+            raise exc
+        return f
+    for _bad in ("[]", "null", '"x"'):
+        open(os.path.join(_cr, "metadata.json"), "w").write(_bad)
+        _calls = []
+        _got = _outcome(lambda: _rs(_crash, _cr, store=lambda rp: _calls.append(rp)))
+        ok(_got == "KeyError" and len(_calls) == 1,
+           f"ST3 metadata.json holding {_bad}: the run's KeyError survives and the run is still stored ({_got}, {_calls})")
+    open(os.path.join(_cr, "metadata.json"), "w").write("{}")
+    _got = _outcome(lambda: _rs(_crash, _cr, store=_raise(AttributeError("store broke"))))
+    ok(_got == "KeyError", f"ST4 a store that raises does not replace the run's exception ({_got})")
+    _got = _outcome(lambda: _rs(_raise(KeyboardInterrupt()), _cr, store=_raise(AttributeError("store broke"))))
+    ok(_got == "KeyboardInterrupt", f"ST5 an interrupt survives a store that raises ({_got})")
+    ok(_outcome(lambda: _rs(lambda: "completed", _cr, store=_raise(RuntimeError("x")))) is None
+       and _rs(lambda: "completed", _cr, store=_raise(RuntimeError("x"))) == "completed",
+       "ST5b a store failure after a finished run is logged, not raised; the status is returned")
+    _saved_mv2, _saved_argv = globals().get("main_v2"), sys.argv
+    globals()["main_v2"] = _raise(KeyboardInterrupt())
+    sys.argv = ["main.py", "--v2", "Q?"]
+    try:
+        _code = _outcome(lambda: None) or main()
+    except BaseException as e:  # noqa: BLE001
+        _code = type(e).__name__
+    finally:
+        globals()["main_v2"], sys.argv = _saved_mv2, _saved_argv
+    ok(_code == 130, f"ST5c an interrupted v2 run exits 130 ({_code})")
+    _sr6 = tempfile.mkdtemp()
+    _run6 = os.path.join(_sr6, "2026-11-02_000000_y")
+    os.makedirs(_run6)
+    open(os.path.join(_run6, "metadata.json"), "w").write("[]")
+    _got = _outcome(lambda: store_run_results(_run6, service=_FS()))
+    ok(_got is None and isinstance(json.load(open(os.path.join(_run6, "metadata.json"))), dict),
+       f"ST6 store_run_results with a non-object metadata.json neither raises nor keeps the bad value ({_got})")
+    shutil.rmtree(_sr6, ignore_errors=True)
     shutil.rmtree(_cr, ignore_errors=True)
 
     # WU (Phase 29): every run ends with a report.
