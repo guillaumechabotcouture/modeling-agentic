@@ -265,10 +265,70 @@ def read_crosswalk(c: dict) -> dict:
     return out
 
 
-def resolve_targets(xw: dict | None, unit_ids, union: bool, shown: str) -> dict:
+def _orient(a, b, c) -> float:
+    return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+
+def _edges(polys):
+    for p in polys:
+        for ring in p:
+            n = len(ring)
+            for i in range(n):
+                yield ring[i], ring[(i + 1) % n]
+
+
+def _interior_point(part):
+    """A point strictly inside a polygon part (outside its holes): the vertex mean, else a diagonal midpoint."""
+    outer = part[0]
+    cands = [(sum(x for x, _ in outer) / len(outer), sum(y for _, y in outer) / len(outer))]
+    cands += [((outer[0][0] + v[0]) / 2, (outer[0][1] + v[1]) / 2) for v in outer[2:]]
+    cands += [((a[0] + c[0]) / 2, (a[1] + c[1]) / 2) for a, c in zip(outer, outer[2:])]
+    for x, y in cands:
+        if contains([part], x, y) and distance_km([part], x, y) > 1e-6:
+            return x, y
+    return None
+
+
+def _strictly_inside(polys, x, y) -> bool:
+    return contains(polys, x, y) and distance_km(polys, x, y) > 1e-6
+
+
+def overlap(a, b) -> bool:
+    """Do two features' interiors overlap? Touching along edges or at vertices does not count. Proper edge
+    crossings, a vertex or an interior point of one strictly inside the other do."""
+    ax0, ay0, ax1, ay1 = bbox(a)
+    bx0, by0, bx1, by1 = bbox(b)
+    if ax1 <= bx0 or bx1 <= ax0 or ay1 <= by0 or by1 <= ay0:
+        return False
+    eb = list(_edges(b))
+    eps = 1e-12
+    for p1, p2 in _edges(a):
+        for q1, q2 in eb:
+            o1, o2 = _orient(p1, p2, q1), _orient(p1, p2, q2)
+            o3, o4 = _orient(q1, q2, p1), _orient(q1, q2, p2)
+            if ((o1 > eps and o2 < -eps) or (o1 < -eps and o2 > eps)) and \
+                    ((o3 > eps and o4 < -eps) or (o3 < -eps and o4 > eps)):
+                return True
+    for x, y in [v for p in a for v in p[0]]:
+        if _strictly_inside(b, x, y):
+            return True
+    for x, y in [v for p in b for v in p[0]]:
+        if _strictly_inside(a, x, y):
+            return True
+    for one, other in ((a, b), (b, a)):
+        for part in one:
+            q = _interior_point(part)
+            if q is not None and _strictly_inside(other, *q):
+                return True
+    return False
+
+
+def resolve_targets(xw: dict | None, unit_ids, union: bool, shown: str, feats: dict | None = None) -> dict:
     """{unit id: [feature id, ...]} for the units of the table: through the crosswalk, or the unit id itself as the
     feature id. Refused (GeometryError naming every affected unit): a unit mapped to several features without
-    `crosswalk.union: true`, and a feature mapped to two units."""
+    `crosswalk.union: true`, a feature mapped to two units, and (given `feats`) union members whose interiors
+    overlap: the union's area would count the overlap twice (focused check of #131; refusing is simpler than
+    dissolving the union, and a boundary set whose features overlap is itself suspect)."""
     ids = [str(u) for u in unit_ids]
     targets = {u: list((xw or {}).get(u, [])) if xw is not None else [u] for u in ids}
     multi = sorted(u for u, fl in targets.items() if len(fl) > 1)
@@ -284,6 +344,16 @@ def resolve_targets(xw: dict | None, unit_ids, union: bool, shown: str) -> dict:
         aff = sorted({u for us in shared.values() for u in us})
         raise GeometryError(f"{shown}: {len(shared)} features map to more than one unit (units {aff[:20]}); each "
                             "feature may belong to one unit")
+    if feats is not None:
+        bad = []
+        for u, fl in targets.items():
+            fs = [f for f in fl if feats.get(f)]
+            if any(overlap(feats[fs[i]], feats[fs[j]]) for i in range(len(fs)) for j in range(i + 1, len(fs))):
+                bad.append(u)
+        if bad:
+            raise GeometryError(f"{shown}: {len(bad)} units' union members overlap (units {sorted(bad)[:20]}): the "
+                                "union's area would count the overlap twice; fix the boundary set so a unit's "
+                                "features only touch")
     return targets
 
 
@@ -662,7 +732,7 @@ def check(run_dir: str, spec: dict | None = None, th: dict | None = None, use_si
         xw = read_crosswalk(cfg["crosswalk"]) if cfg.get("crosswalk") else None
         xw = resolve_targets(xw, [str(r.get(cols["id"], "")).strip() for r in rows],
                              bool((cfg.get("crosswalk") or {}).get("union")),
-                             (cfg.get("crosswalk") or {}).get("shown") or cfg["shown"])
+                             (cfg.get("crosswalk") or {}).get("shown") or cfg["shown"], feats)
         rep["inputs"]["boundaries"] = {"path": cfg["shown"], "feature_id": cfg["feature_id"],
                                        "sha256": shas["boundaries"]}
         if cfg.get("crosswalk"):
@@ -880,7 +950,8 @@ def _main(argv=None) -> int:
             xw = read_crosswalk({"path": a.crosswalk, "unit_id": a.xw_unit, "feature_id": a.xw_feature}) \
                 if a.crosswalk else None
             rows = read_table(a.units)
-            xw = resolve_targets(xw, [str(r.get(a.id, "")).strip() for r in rows], a.union, a.crosswalk or a.boundaries)
+            xw = resolve_targets(xw, [str(r.get(a.id, "")).strip() for r in rows], a.union, a.crosswalk or a.boundaries,
+                                 feats)
             ev = evaluate(rows, {"id": a.id, "lat": a.lat, "lon": a.lon, "area": a.area}, feats, xw, thresholds())
             rep = {"status": "ran", **ev}
         except GeometryError as e:

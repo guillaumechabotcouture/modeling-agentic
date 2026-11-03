@@ -601,9 +601,9 @@ def kill_reason(command: str) -> str | None:
 
 
 # Codex round 2 on #131: the owner's commands. The CLIs take `--by owner` on trust (owner authentication is an open
-# decision for the owner), so no agent may run them, by script path, module or Python call. The lead signs the
-# decision brief `--by lead` in lead mode; that stays allowed. A heuristic over the whole command, like the others
-# here: it refuses some harmless mentions rather than miss a call.
+# decision for the owner), so no agent may run them, by script path, module or Python call. No agent signs the
+# decision brief either: in lead mode the lead writes its answers and the harness signs (focused check of #131). A
+# heuristic over the whole command, like the others here: it refuses some harmless mentions rather than miss a call.
 _OWNER_COMMANDS = tuple(re.compile(p, re.S) for p in (
     r"\bgeometry(?:\.py)?\b.*\bapprove\b",                        # toolkit/spec/geometry.py approve
     r"\bgeometry\b.*\b(?:approve|freeze)\s*\(",                     # geometry.approve(...) / freeze(...)
@@ -626,9 +626,10 @@ def _brief_parser():
 
 
 def brief_sign_reason(command: str) -> str | None:
-    """A `decision_brief.py sign` an agent may run: only one that names `--by lead` explicitly, parsed with the CLI's
-    own parser (no abbreviations, no default signer). Anything that mentions the brief together with `sign` but
-    cannot be parsed as such a call is refused (fail closed). The sign-off mode is checked in agents/hooks.py."""
+    """No agent runs `decision_brief.py sign`, whoever it names as signer (focused check of #131: in lead mode the
+    lead writes decision_brief.LEAD_ANSWERS and the harness signs and registers what signing writes). The command is
+    parsed with the CLI's own parser, so `status`, `show` and `restore` pass; anything that mentions the brief with
+    `sign` but does not parse is refused (fail closed)."""
     import contextlib
     import io
     for seg in _shell_tokens(command):
@@ -650,7 +651,7 @@ def brief_sign_reason(command: str) -> str | None:
             continue
         except Exception:  # noqa: BLE001 -- the parser could not be loaded: fail closed
             return OWNER_COMMAND_DENY
-        if a.cmd == "sign" and a.by != "lead":
+        if a.cmd == "sign":
             return OWNER_COMMAND_DENY
     return None
 OWNER_COMMAND_DENY = ("Agents cannot sign or approve for the owner: this is an owner command (spec or brief sign-off "
@@ -659,8 +660,8 @@ OWNER_COMMAND_DENY = ("Agents cannot sign or approve for the owner: this is an o
 
 
 def owner_command_reason(command: str) -> str | None:
-    """Deny reason when a Bash command runs one of the owner's commands (any sign-off mode, any agent). The lead's
-    `decision_brief.py sign --by lead` passes brief_sign_reason (agents/hooks.py gates it by mode).
+    """Deny reason when a Bash command runs one of the owner's commands, or signs the brief (any sign-off mode, any
+    agent; brief_sign_reason).
 
     Defence in depth, not authentication: an agent runs as the same OS user as the owner, so indirect execution
     (a helper script, a computed name, xargs) can reach these commands. Owner-signed approvals (the next PR after

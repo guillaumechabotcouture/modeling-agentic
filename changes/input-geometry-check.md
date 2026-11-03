@@ -15,4 +15,8 @@ commit: "IG α-β"
 - Maps draw holes (compound paths, BD7).
 - A polygon claimed by two units is now refused, not reported as a finding.
 
+Focused check:
+- In lead mode the lead writes `decision_brief_lead_answers.yaml`; the harness (`main.py harness_sign_brief_lead`) signs it and registers every file signing wrote (record, signed copies, geometry record), and the owner's wait registers the same list. No agent runs `decision_brief.py sign`, and `decision_brief.py` is credited only with what `restore` writes.
+- Union members that overlap are refused (refusing rather than dissolving the union); touching members add up exactly.
+
 Tests were written first: SO11a-c (`main.py`, through the real PreToolUse hook), DB35 (`scripts/decision_brief.py`), IG13, IG1-IG12 (`toolkit/spec/geometry.py`), IG-M1-M5 (`agents/stage_machine.py`) and IG-S1-S2 (`toolkit/spec/signoff.py`). A local check against the real run's files found the 4 pairs (counts only in the PR).

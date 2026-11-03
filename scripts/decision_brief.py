@@ -328,6 +328,30 @@ def status(run_dir: str) -> str:
     return "invalid" if errors else "awaiting"
 
 
+# --signoff lead (focused check of #131): the lead writes its answers here and ends its turn; the harness (main.py
+# harness_sign_brief_lead) signs them `by: lead` and registers what signing wrote. No agent runs `sign`.
+LEAD_ANSWERS = "decision_brief_lead_answers.yaml"
+GEOMETRY_RECORD = "data/geometry_signoff.json"         # toolkit/spec/geometry.py SIGNOFF_FILE
+
+
+def lead_answers(run_dir: str) -> dict | None:
+    """The lead's sign-off file: {answers: {Q-id: answer}, accept_proposed: bool, note: str}, or None."""
+    try:
+        doc = yaml.safe_load(open(os.path.join(run_dir, LEAD_ANSWERS), encoding="utf-8"))
+    except (OSError, yaml.YAMLError, UnicodeDecodeError):
+        return None
+    return doc if isinstance(doc, dict) and doc else None
+
+
+def signoff_outputs(run_dir: str) -> list[str]:
+    """What sign() writes (run-relative): the record, the signed copies of the frozen files that exist, and the
+    spec's geometry record when there is a spec. The harness registers these after it signs."""
+    out = [SIGNOFF] + [f"{SIGNED_DIR}/{f}" for f in FROZEN_AT_SIGNOFF if os.path.exists(os.path.join(run_dir, f))]
+    if os.path.exists(os.path.join(run_dir, DECISION_SPEC)):
+        out.append(GEOMETRY_RECORD)
+    return out
+
+
 def is_signed(run_dir: str) -> bool:
     return _signoff(run_dir) is not None
 

@@ -1097,7 +1097,7 @@ def load_boundaries(cfg: dict, unit_ids: list[str], region_of, run_dir: str | No
         xw = GEO.read_crosswalk(c)
         files.append({"path": _record_path(c["path"], run_dir), "sha256": sha256(c["path"]), "kind": "crosswalk"})
     targets = GEO.resolve_targets(xw, [str(i) for i in unit_ids], bool((cfg.get("crosswalk") or {}).get("union")),
-                                  (cfg.get("crosswalk") or {}).get("shown") or cfg["shown"])
+                                  (cfg.get("crosswalk") or {}).get("shown") or cfg["shown"], feats)
     units, unmatched, used = {}, [], set()
     for i in unit_ids:
         fl = targets.get(str(i), [])

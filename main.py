@@ -224,6 +224,10 @@ CONTINUE_PROMPT = (
     "written and final gate run, or RUN_FAILED).")
 
 
+LEAD_SIGNOFF_PROMPT = (
+    "CONTINUE. The harness has signed the decision brief with your answers (--signoff lead).\n{text}\n"
+    "Continue the pipeline from STAGE 2 (DATA): tell the planner to carry the answers into plan.md if they change "
+    "it, and pass them to every specialist. Do not end your turn until the pipeline reaches a terminal state.")
 SIGNOFF_PROMPT = (
     "CONTINUE. The owner has signed the decision brief.\n{text}\n"
     "Continue the pipeline from STAGE 2 (DATA): tell the planner to carry the owner's answers into plan.md "
@@ -252,10 +256,9 @@ async def wait_for_signoff(run_path: str, run_dir_rel: str, hours: float, poll_s
     deadline = time.time() + hours * 3600
     while time.time() < deadline:
         if decision_brief.status(run_path) == "signed":
-            if integrity is not None:   # the owner signed outside any tool call
-                integrity.harness_wrote(decision_brief.SIGNOFF)
-                for f in decision_brief.FROZEN_AT_SIGNOFF:   # and the signed copies it kept
-                    integrity.harness_wrote(f"{decision_brief.SIGNED_DIR}/{f}")
+            if integrity is not None:   # the owner signed outside any tool call: the record, the signed copies
+                for rel in decision_brief.signoff_outputs(run_path):   # and, with a spec, the geometry record
+                    integrity.harness_wrote(rel)
             with open(os.path.join(run_path, "trace.jsonl"), "a") as tf:
                 tf.write(json.dumps({"ts": datetime.now().isoformat(), "type": "signed_off"}) + "\n")
             print("Decision brief signed; resuming the lead.", flush=True)
@@ -581,6 +584,16 @@ async def run(question: str, max_rounds: int, max_sessions: int,
                     signoff_waits += 1
                     lead_prompt = SCOPE_SIGNOFF_PROMPT.format(text=scope_signoff.answer_text(run_path))
                     continue
+                if signoff == "lead" and decision_brief.status(run_path) == "awaiting":
+                    # Focused check of #131: --signoff lead; the harness signs the lead's answers file and registers
+                    # what signing wrote (with a decision spec, the geometry record and the spec's signed copy).
+                    text = harness_sign_brief_lead(run_path, integrity)
+                    if text is not None:
+                        signoff_waits += 1
+                        lead_prompt = (LEAD_SIGNOFF_PROMPT.format(text=text)
+                                       if decision_brief.status(run_path) == "signed" else
+                                       f"CONTINUE. {text}")
+                        continue
                 if (signoff == "lead" and scope_signoff.status(run_path) == "awaiting"
                         and scope_signoff.lead_answers(run_path)):
                     # Phase 49 β: --signoff lead; the harness signs the lead's answers file.
@@ -689,6 +702,30 @@ async def run(question: str, max_rounds: int, max_sessions: int,
     return status
 
 
+def harness_sign_brief_lead(run_path: str, integrity=None) -> str | None:
+    """--signoff lead: sign the lead's answers file (decision_brief.LEAD_ANSWERS) `by: lead`, as the harness, and
+    register every file signing wrote with the integrity record (focused check of #131: when the lead ran
+    `decision_brief.py sign` itself, the geometry record and the spec's signed copy were unexplained writes). Returns
+    the text for the lead's next prompt, or None when there is no answers file yet."""
+    import decision_brief
+    la = decision_brief.lead_answers(run_path)
+    if la is None:
+        return None
+    try:
+        answers = la.get("answers")
+        if answers is not None and not isinstance(answers, dict):
+            raise ValueError("answers must be a mapping of question id to answer")
+        decision_brief.sign(run_path, "lead", answers, str(la.get("note") or ""), bool(la.get("accept_proposed")))
+    except (ValueError, OSError) as e:
+        return (f"Your {decision_brief.LEAD_ANSWERS} was not signed: {e}. Fix it and end your turn with "
+                "AWAITING_SIGNOFF again.")
+    if integrity is not None:            # only after a successful signature: it rewrote each of these files
+        for rel in decision_brief.signoff_outputs(run_path):
+            if os.path.exists(os.path.join(run_path, rel)):
+                integrity.harness_wrote(rel)
+    return "Signed by the lead (the harness recorded it). " + (decision_brief.signoff_text(run_path) or "")
+
+
 # ---------------------------------------------------------------------------
 # Self-test (no API calls)
 # ---------------------------------------------------------------------------
@@ -701,7 +738,7 @@ OWNER_SIGNING_PR = "owner-signed approvals (next PR after #131)"
 
 def _self_test_owner_cli(ok, td: str, trace, reg) -> None:
     """SO12-SO13 (Codex round 3 on #131). SO12: owner CLIs take no default signer and no abbreviated flag, and the
-    hook parses a brief sign-off with the CLI's own parser (lead mode: only an explicit `--by lead`). SO13a: no Bash
+    hook parses a brief sign-off with the CLI's own parser and refuses it (the harness signs in lead mode). SO13a: no Bash
     call is credited with rewriting the geometry records, so a change during an agent's call is a violation. SO13b
     (XFAIL until owner signing): indirect forms the command filter cannot see."""
     import tempfile

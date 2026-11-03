@@ -136,10 +136,17 @@ rejected. Until then:
   - `stage_machine.py sign`;
   - `signoff.py sign`;
   - `scope_signoff.py sign`;
-  - any `decision_brief.py sign` that does not name `--by lead` explicitly. The hook parses it with
-    `decision_brief.cli_parser()`, so a missing `--by`, an abbreviation (`--b owner`), `--by=owner` or an
-    unparseable call is refused (round 3).
-- `--by lead` passes only in lead mode. The CLIs no longer default `--by` to `owner`.
+  - any `decision_brief.py sign`, `--by lead` included. The hook parses it with
+    `decision_brief.cli_parser()`, so `status`, `show` and `restore` pass, and an unparseable call that mentions
+    `sign` is refused (rounds 3 and 4).
+- Lead mode is a harness action (focused check of #131). The lead writes `decision_brief_lead_answers.yaml`
+  (`accept_proposed` or `answers`, and a `note`) and ends its turn with AWAITING_SIGNOFF. `main.py
+  harness_sign_brief_lead` then signs `by: lead` and registers every file the signature wrote with the integrity
+  record (`decision_brief.signoff_outputs`): the sign-off record, the signed copies (with a spec,
+  `decision_brief.signed/decision_spec.yaml`) and the geometry record. The owner's wait registers the same list.
+  `decision_brief.py` is credited only with what `restore` writes, so no Bash call is credited with the sign-off
+  outputs. This is the same pattern as Phase 49's scope answers.
+- The CLIs no longer default `--by` to `owner`.
 - The read-only `geometry.py check` also passes; it now prints without writing the record.
 - `data/geometry_signoff.json`, `data/input_checks.json` and `decision_spec.signoff.json` are in the v1
   `SCRIPT_OUTPUTS`. That denies Write, Edit and shell redirects to them, and the integrity record watches them.
@@ -173,6 +180,13 @@ parser and GeoJSON reader for the figures and for this check:
 - The figures now draw holes: each polygon part is one compound path, the outer ring counter-clockwise and each
   hole clockwise, so the fill leaves the hole empty (BD7).
 - A polygon claimed by two units is now refused by the loader, not reported as a finding.
+- Union members whose interiors overlap are refused, naming the unit (focused check of #131). A union's area is
+  the sum of its members' areas, so an overlap would be counted twice: for example, two rectangles whose union
+  is 1.2 square degrees came out as 2.0. Refusing is simpler than computing the dissolved union, and a boundary
+  set whose features overlap is itself suspect.
+  - Counted as overlap: proper edge crossings, a vertex of one member strictly inside the other, or an interior
+    point of one strictly inside the other (which catches nested and identical members).
+  - Members that only touch along an edge or at a vertex are allowed, and their areas add up exactly (IG15).
 - **A geometry library (shapely/pyproj).** Not needed at this accuracy, and it would add a dependency to the
   harness image.
 - **An edge tolerance relative to unit size.** A fixed distance matches the error sources (simplification,
@@ -231,9 +245,6 @@ Run against the boundary file, crosswalk and geography table of the run in §1 (
   the owner's macOS keychain and verified by the harness. That closes the indirect-execution class listed as
   XFAIL in SO13b. Until it lands, an agent can still forge a record through indirect execution. The integrity
   record flags the change after the fact, but nothing prevents it.
-- A v1 lead-mode run that has a decision spec and signs the brief `--by lead` writes the geometry record inside
-  an agent's Bash call. The integrity record then flags that as a violation, because no script is credited
-  with it. v1 runs have no decision spec today. Owner signing will replace this path.
 - The check finds rows whose geometry fields disagree with the boundaries. It cannot tell which other columns
   (population, raster-derived values) came along with the swapped geometry. The finding says they probably
   did, and the fix belongs in the derivation.
