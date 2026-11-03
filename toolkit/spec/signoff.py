@@ -151,6 +151,13 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
             src is None or src.get("spec_sha256") != sha or src.get("derivations_sha256") != (dsha or "none")):
         raise ValueError(f"{SHEET} was generated from another spec or derivation record (it is stale): the sheet is "
                          "regenerated before the owner signs; read the new one")
+    # Codex on 08f96a9: the geometry evidence the sheet showed must still be current when the freeze approves
+    geo_expect = None
+    if src is not None:
+        geo_expect = src.get("geometry_evidence_sha256")
+        if not isinstance(geo_expect, str):
+            raise ValueError(f"{SHEET} records no geometry evidence (it predates the geometry check): the sheet is "
+                             "regenerated before the owner signs; read the new one")
     errs = schema.validate(schema.load(os.path.join(run_dir, SPEC), data=data), pending_ok=True)
     if errs:
         raise ValueError("spec not ready: " + "; ".join(errs[:10]))
@@ -159,7 +166,7 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     if os.path.lexists(os.path.join(run_dir, DB.BRIEF)):
         # decision_brief.sign freezes the spec's geometry too (#131)
         return DB.sign(run_dir, by, answers=answers, note=note, accept_proposed=accept_proposed,
-                       expect={SPEC: sha}, extra_sha={DERIVATIONS_RECORD: dsha})
+                       expect={SPEC: sha}, extra_sha={DERIVATIONS_RECORD: dsha}, expect_geometry=geo_expect)
     # The geometry part of the unsigned presentation file and its input hashes are frozen with the spec; an owner's
     # sign-off also approves the HIGH geometry exceptions the spec proposes (docs/design/v2-input-geometry.md §2).
     # The spec is the bytes read, validated and hashed above, never read again (#129: SG15).
@@ -169,7 +176,7 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
         spec_doc = yaml.safe_load(data.decode("utf-8")) or {}
     except (yaml.YAMLError, UnicodeDecodeError) as e:
         raise ValueError(f"{SPEC} does not parse: {e}") from None
-    geometry.freeze(run_dir, by, spec=spec_doc if isinstance(spec_doc, dict) else {})
+    geometry.freeze(run_dir, by, spec=spec_doc if isinstance(spec_doc, dict) else {}, expect_evidence=geo_expect)
     record = {"signed_by": by, "signed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "note": note,
               "sha256": {SPEC: sha, DERIVATIONS_RECORD: dsha},
               "producer": "toolkit/spec/signoff.py",
@@ -214,16 +221,29 @@ def write_sheet(run_dir: str, candidates: list | None = None) -> str:
         rec_bytes = None
     except LinkRefused as e:
         raise ValueError(f"{DERIVATIONS_RECORD}: {e}") from None
-    text = sheet(run_dir, candidates, spec_bytes=spec_bytes, record_bytes=rec_bytes)
+    # The input geometry check, re-run on the spec bytes read above, then shown from the record it wrote; its evidence
+    # hash (declaration plus boundary, crosswalk and units sha256: what an approval binds to) is a recorded source,
+    # so the signer refuses when the geometry inputs changed after the owner saw the sheet (Codex on 08f96a9).
+    import yaml
+    from toolkit.spec import geometry
+    try:
+        spec_doc = yaml.safe_load(spec_bytes.decode("utf-8"))
+    except (yaml.YAMLError, UnicodeDecodeError):
+        spec_doc = None
+    if isinstance(spec_doc, dict):
+        geometry.run(run_dir, spec_doc)
+    section = geometry.sheet_section(run_dir)
+    text = sheet(run_dir, candidates, spec_bytes=spec_bytes, record_bytes=rec_bytes, geometry_section=section)
     src = json.dumps({"spec_sha256": hashlib.sha256(spec_bytes).hexdigest(),
-                      "derivations_sha256": hashlib.sha256(rec_bytes).hexdigest() if rec_bytes is not None else "none"},
+                      "derivations_sha256": hashlib.sha256(rec_bytes).hexdigest() if rec_bytes is not None else "none",
+                      "geometry_evidence_sha256": section[1]},
                      sort_keys=True)
     write_nofollow(run_dir, SHEET, (text.rstrip("\n") + f"\n\n{SHEET_SOURCES}{src} -->\n").encode(), atomic=True)
     return os.path.join(run_dir, SHEET)
 
 
 def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None = None,
-          record_bytes: bytes | None = None) -> str:
+          record_bytes: bytes | None = None, geometry_section: tuple | None = None) -> str:
     """The sign-off sheet (markdown): what signing accepts beyond the spec's text. Each engine default the spec
     accepts by name, with the card's meaning and the spec's reason; the staged columns and tables the derivations
     do not use, with their reasons; the derivations; and, when given, the candidate engines and why any is
@@ -278,8 +298,10 @@ def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None
     out += ["", "## Derivations"] + [f"- **{d['id']}**: `{d['script']}` reads {len(d['inputs'])} file(s), writes "
                                      + ", ".join(f"`{o}`" for o in d["outputs"]) for d in ders]
     out += [f"- declaration problem: {e}" for e in errs] + [""]
-    from toolkit.spec import geometry
-    out += geometry.sheet_lines(run_dir)       # the input geometry check and the findings accepted by name
+    if geometry_section is None:
+        from toolkit.spec import geometry
+        geometry_section = geometry.sheet_section(run_dir)
+    out += geometry_section[0]                 # the input geometry check and the findings accepted by name
     if candidates:
         out.append("## Candidate engines (pre-sign check)")
         for r in candidates:

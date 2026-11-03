@@ -414,7 +414,8 @@ def _capture(run_dir: str, names) -> dict:
 
 
 def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
-         accept_proposed: bool = False, expect: dict | None = None, extra_sha: dict | None = None) -> dict:
+         accept_proposed: bool = False, expect: dict | None = None, extra_sha: dict | None = None,
+         expect_geometry: str | None = None) -> dict:
     """Write the sign-off. Raises ValueError when the brief is not ready. The frozen files are read once: validated,
     hashed and copied from the same bytes, never through a link, and the record is published atomically.
     `expect`: {file: sha256 the owner was shown} (a mismatch is refused); `extra_sha`: further hashes to record."""
@@ -448,7 +449,7 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
             spec_doc = yaml.safe_load(captured[DECISION_SPEC].decode("utf-8")) or {}
         except (yaml.YAMLError, UnicodeDecodeError) as e:
             raise ValueError(f"{DECISION_SPEC} does not parse: {e}") from None
-        geometry.freeze(run_dir, by, spec=spec_doc if isinstance(spec_doc, dict) else {})
+        geometry.freeze(run_dir, by, spec=spec_doc if isinstance(spec_doc, dict) else {}, expect_evidence=expect_geometry)
     record = {
         "signed_by": by, "signed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "note": note,
         "answers": {q["id"]: answers.get(q["id"], q.get("proposed")) for q in qs},

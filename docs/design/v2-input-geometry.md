@@ -115,6 +115,18 @@ or removing the `boundaries` block, which before this change gave only a LOW not
 `approve`, which re-freezes the current inputs, or by restoring the files. Labels stay unsigned: the
 presentation file's own hash is not frozen. A check that failed cannot be signed over (the sign-off refuses).
 
+**Bound to what the owner saw** (Codex on 08f96a9):
+- The sign-off sheet writer re-runs the check on the spec bytes it read, then shows the check's record. Its
+  sources line records that record's evidence hash, `geometry_evidence_sha256`, which is the declaration plus the
+  boundary, crosswalk and units sha256, the same hash an approval binds to.
+- The signer (`signoff.sign`, and through it `decision_brief.sign`) passes that hash to the freeze. If the
+  current evidence differs, the sign-off is refused: HIGH exceptions are never approved against boundaries
+  nobody saw. A sheet with no recorded geometry evidence is stale and regenerated.
+- Every signer, including the spike adapter `stage_machine.sign`, reads the spec once without following a link
+  and hashes and freezes that same content.
+- The sheet reads the check's record with `read_nofollow`. A link there is refused on the sheet, and nothing
+  can be signed over it.
+
 **The tool-hook denial is defence in depth, not authentication.** An agent runs as the same OS user as the
 owner. Command-pattern filtering cannot be a security boundary against that user: a helper script, a computed
 name, `python -c`, `env -S`, `xargs` or a symlinked script reaches the owner's commands and records. The

@@ -757,13 +757,26 @@ def _signoff(run_dir: str) -> dict | None:
 
 
 def sign(run_dir: str, by: str, note: str = "", expect_sha256: str | None = None) -> dict:
-    rec = {"by": by, "note": note, "at": _now(), "spec_sha256": signed_hash(run_dir)}
-    if rec["spec_sha256"] is None:
-        raise ValueError(f"no {AB.SPEC_FILE} to sign")
+    """The spike adapter's sign-off. The spec is read once, never through a link (lib.safe_io); that same content is
+    hashed into the record and frozen with its geometry inputs (Codex on 08f96a9)."""
+    import yaml
+    from lib.safe_io import LinkRefused, read_nofollow
+    try:
+        data = read_nofollow(run_dir, AB.SPEC_FILE)[0]
+    except FileNotFoundError:
+        raise ValueError(f"no {AB.SPEC_FILE} to sign") from None
+    except (LinkRefused, OSError) as e:
+        raise ValueError(f"{AB.SPEC_FILE}: {e}") from None
+    rec = {"by": by, "note": note, "at": _now(), "spec_sha256": hashlib.sha256(data).hexdigest()}
     if expect_sha256 is not None and rec["spec_sha256"] != expect_sha256:
         raise ValueError(f"{AB.SPEC_FILE} changed since it was shown; read it again before signing")
+    try:
+        spec_doc = yaml.safe_load(data.decode("utf-8")) or {}
+    except (yaml.YAMLError, UnicodeDecodeError) as e:
+        raise ValueError(f"{AB.SPEC_FILE} does not parse: {e}") from None
     from toolkit.spec import geometry as GEO
-    GEO.freeze(run_dir, by)              # the geometry declaration and input hashes; the owner's approvals
+    # the geometry declaration and input hashes of this content; the owner's approvals
+    GEO.freeze(run_dir, by, spec=spec_doc if isinstance(spec_doc, dict) else {})
     _put(run_dir, SIGNOFF_FILE, json.dumps(rec, indent=1))
     return rec
 

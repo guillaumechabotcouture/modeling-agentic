@@ -717,17 +717,22 @@ def run(run_dir: str, spec: dict | None = None) -> dict:
     return rep
 
 
-def freeze(run_dir: str, by: str, extra: dict | None = None, spec: dict | None = None, th: dict | None = None) -> dict:
+def freeze(run_dir: str, by: str, extra: dict | None = None, spec: dict | None = None, th: dict | None = None,
+           expect_evidence: str | None = None) -> dict:
     """The sign-off's geometry record (data/geometry_signoff.json): the declaration and input hashes as signed, and,
     when the owner signs, an approval of each HIGH finding the spec proposes as an exception (plus `extra`
     {finding id: reason}), bound to the evidence hash. A lead sign-off approves nothing. A check that failed cannot be
-    signed over (ValueError)."""
+    signed over (ValueError). `expect_evidence`: the evidence hash the sign-off sheet showed (Codex on 08f96a9); a
+    different current hash refuses the sign-off, so nothing is approved against evidence nobody saw."""
     import datetime as _dt
     if by not in ("owner", "lead"):
         raise ValueError(f"sign-off by {by!r}: owner or lead")
     rep = check(run_dir, spec, th, use_signoff=False)
     if rep["status"] == "failed":
         raise ValueError(f"the input geometry check failed: {rep['reason']}")
+    if expect_evidence is not None and (rep.get("evidence_sha256") or "none") != expect_evidence:
+        raise ValueError("the geometry inputs (declaration, boundary, crosswalk or units files) changed since the "
+                         "sign-off sheet was shown: regenerate the sheet and read it again before signing")
     now = _dt.datetime.now(_dt.timezone.utc).isoformat()
     approvals = {}
     if by == "owner":
@@ -816,11 +821,27 @@ def findings(rep: dict) -> list[dict]:
 
 def sheet_lines(run_dir: str) -> list[str]:
     """The sign-off sheet's section, from the artifact the harness wrote."""
+    return sheet_section(run_dir)[0]
+
+
+def sheet_section(run_dir: str) -> tuple[list[str], str]:
+    """(the sheet's lines, the evidence hash they show or "none"). The record is read once, never through a link
+    (lib.safe_io); a link is refused on the sheet (Codex on 08f96a9). The hash is what the sheet's sources line
+    records and what the signer requires to be current."""
     out = ["## Input geometry check"]
+    sio = _safe_io()
     try:
-        rep = json.load(open(os.path.join(run_dir, ARTIFACT), encoding="utf-8"))
+        rep = json.loads(sio.read_nofollow(run_dir, ARTIFACT)[0])
+    except sio.LinkRefused as e:
+        return out + [f"The check's record ({ARTIFACT}) was refused: it is a link, and the sheet does not read "
+                      f"through links ({e}). Nothing here can be signed over.", ""], "none"
     except (OSError, ValueError):
-        return out + [f"No record ({ARTIFACT} is missing): the check has not run.", ""]
+        return out + [f"No record ({ARTIFACT} is missing): the check has not run.", ""], "none"
+    ev = str(rep.get("evidence_sha256") or "none")
+    return _sheet_body(rep, out), ev
+
+
+def _sheet_body(rep: dict, out: list[str]) -> list[str]:
     st = rep.get("status")
     if st == "not_run":
         return out + [f"The check did not run: {rep.get('reason')}. Signing freezes that: declaring boundaries "
