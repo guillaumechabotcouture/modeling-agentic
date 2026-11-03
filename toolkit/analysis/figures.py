@@ -621,9 +621,9 @@ def fig_parameters(R, t):
     from matplotlib.lines import Line2D
     fig.legend(handles=[Line2D([0], [0], marker=markers.get(k, "o"), ls="", color=col[k], label=k) for k in present],
                loc="lower left", bbox_to_anchor=(0.42, 0.0), ncol=len(present), fontsize=7.5)
-    cnt = {k: sum(r["kind"] == k for r in rows) for k in present}
-    title = (", ".join(f"{v} {k}" for k, v in cnt.items()) + f" of {len(rows)} parameters have ranges; "
-             f"{edge} at a range edge")
+    cnt = {k: sum(r["kind"] == k for r in ranged) for k in present}
+    title = (f"{len(ranged)} of {len(rows)} parameters have ranges (" + ", ".join(f"{v} {k}" for k, v in cnt.items())
+             + f"); {edge} at a range edge")
     cap = (f"Each parameter's value within its range (fitted: engine fit; prior: drawn from the spec's prior; "
            f"calibrated: the run's calibration). {len(rows) - len(ranged)} parameters without a range are fixed "
            f"values (table view lists all with their sources).")
