@@ -54,6 +54,13 @@ delivery period's end to the outcome window's end, in every package including th
 needs an explicit delivery period (fail closed). With package SMC as well, the package's delivery seasons and the
 routine seasons must form one continuous season sequence (smc_schedule_problems). With the attribute absent or 0,
 a run is byte-identical to v0.6 (self-test R7; benchmarks/restamp_proof.py).
+
+v0.8: the two figure hooks of toolkit/engines/hooks.py. schedule() lists the unit's delivery events in one arm
+(history, decision, routine) from delivery_plan(), the one function the sim's configuration also reads; it is pure.
+run_series() returns monthly series of the card's outputs["series"] (under-5 prevalence, the calibration metric;
+all-age and under-5 clinical incidence per person-year; two more prevalence bands), read from the model's daily
+records through run_batch's member loop (shared burn-in and history). run and run_batch are unchanged (self-test S7;
+benchmarks/restamp_proof.py compares the v0.7 and v0.8 code).
 """
 from __future__ import annotations
 
@@ -82,7 +89,7 @@ RESULTS = os.path.join(HERE, "benchmarks", "results.yaml")
 AGES = ["u5", "5_14", "15p"]
 GRIFFIN = "Griffin et al. 2010 PLoS Med 10.1371/journal.pmed.1000324; 2014 Nat Commun; 2015 Lancet Infect Dis"
 A8 = "E7 attempt 8 value (models/malaria_abm.py VC), kept"
-VERSION = "0.7"
+VERSION = "0.8"
 BV = "Bertozzi-Villa et al. 2021 Nat Commun 10.1038/s41467-021-23707-7 (PMC8196080)"
 
 # name, value, kind, units, lo, hi, source, verified
@@ -141,6 +148,20 @@ POST_FORK = frozenset({"irs_kill", "irs_rep", "irs_half", "irs_coverage", "smc_p
                        "dur_moderate_d", "dur_severe_d", "le_u5", "le_5_14", "le_15p"})
 DUAL_NET = frozenset({"cfp_kill", "cfp_half"})
 IMM_BANDS = (("0_5", 0.0, 5.0), ("5_15", 5.0, 15.0), ("15_30", 15.0, 30.0), ("30p", 30.0, 1e9), ("15p", 15.0, 1e9))
+# v0.8: the monthly series run_series offers (toolkit/engines/hooks.py), each one of the model's daily records
+# (model.DAILY) with the same definition as the window metric of the same name
+SERIES = {
+    "pfpr_u5": {"label": "microscopy prevalence, children 6-59 months (the calibration metric)",
+                "units": "share", "aggregate": "mean", "denominator": "person aged 6-59 months"},
+    "pfpr_2_10": {"label": "microscopy prevalence, ages 2-10", "units": "share", "aggregate": "mean",
+                  "denominator": "person aged 2-10"},
+    "pfpr_all": {"label": "microscopy prevalence, all ages", "units": "share", "aggregate": "mean",
+                 "denominator": "person"},
+    "inc_all": {"label": "clinical incidence, all ages", "units": "episodes per person-year", "aggregate": "rate",
+                "denominator": "person-year"},
+    "inc_u5": {"label": "clinical incidence, under 5", "units": "episodes per child-year (under 5)",
+               "aggregate": "rate", "denominator": "person-year under 5"},
+}
 
 
 def _people(n):
@@ -262,7 +283,8 @@ class MalariaEngine:
             outputs={"per_capita": ["cases", "severe", "deaths", "treated", "dalys"],
                      "windows": list(M.PFPR_BANDS) + ["inc_u5", "inc_all", "inc_u5_smc", "eir_annual",
                                                       "net_use", "net_access"],
-                     "cost_drivers": ["nets_given", "smc_doses", "irs_sprayed", "treated_all"]},
+                     "cost_drivers": ["nets_given", "smc_doses", "irs_sprayed", "treated_all"],
+                     "series": {k: dict(v) for k, v in SERIES.items()}},
             age_groups=AGES,
             valid_ranges={"m0": [0.2, 400], "resistance": [0.1, 1.0], "cm_ft": [0.0, 0.95], "eir_annual": [0.1, 300]},
             fitted={k: v for k, v in self.fitted.items()},
@@ -283,6 +305,8 @@ class MalariaEngine:
     batch_shares_state = True
     # v0.6: honours horizon.delivery (toolkit/engines/horizon.py); the spec validator refuses the field otherwise
     supports_delivery = True
+    # v0.8: the figure hooks' contract version (toolkit/engines/hooks.py HOOKS_CONTRACT)
+    hooks_contract = "figures-hooks/1"
 
     def initialisation(self) -> dict:
         P = resolve_params(self, {})
@@ -336,11 +360,15 @@ class MalariaEngine:
         months = tuple(a.get("smc_months") or default_smc_months(season))
         years = list(range(int(np.floor(d1)), int(np.ceil(w1)) + 1))
         return {"years": years, "months": months, "after": float(d1), "before": w1,
-                "rounds": [t for t in (y + (m - 1) / 12 for y in years for m in months) if d1 <= t < w1]}
+                "rounds": M.smc_targets(years, months, float(d1), w1)}
 
-    def _plan(self, P: dict, a: dict, components: dict, horizon: Horizon) -> dict:
-        """The package's component settings and the decimal years at which they first act. v0.6: components act in
-        the delivery period (the decision window unless horizon.delivery is given)."""
+    @classmethod
+    def delivery_plan(cls, a: dict, components: dict, horizon: Horizon) -> dict:
+        """v0.8: the one source of a unit's delivery schedule in one arm, read by the sim (_plan for the package's
+        components, _base_sim for the past and routine campaigns, routine SMC and the add-on period) and by
+        schedule(). Pure: no sim, no random numbers. Fails closed as _plan did up to v0.7, in the same order.
+        v0.6: the package's components act in the delivery period (the decision window unless horizon.delivery is
+        given)."""
         bad = delivery_problems(horizon)
         if bad:
             raise ValueError("; ".join(bad))
@@ -348,40 +376,131 @@ class MalariaEngine:
         comp.update(components)
         season = np.asarray(a.get("season", [1.0] * 12), float)
         d0, d1 = delivery_period(horizon)
+        ex = explicit_delivery(horizon)
         years = list(range(int(np.floor(d0)), int(np.ceil(d1))))
-        cfg = {"cm_add": P["cm_add"] if int(comp["cm"]) else 0.0, "net": None, "smc": None, "irs": None,
-               "events": [float(d0)]}
+        plan = {"net": None, "smc": None, "irs": None, "fork_events": [float(d0)],
+                # the add-on acts in the delivery period; without one it starts at the window and has no end (v0.5)
+                "cm": {"on": bool(int(comp["cm"])), "start": d0, "stop": d1 if ex else None}}
+        # (intervention, component, label, kind, target) of every delivery: schedule() projects them onto the sim's
+        # daily steps with model.event_steps, as the interventions do
+        ev = []
         timed = []                                   # (component, decimal year) of every event the decision pays for
         if comp["net"] != "none":
             cy = float(a.get("campaign_year", d0))
-            cfg["net"] = {"years": [cy], "net_type": comp["net"]}
-            cfg["events"].append(cy)
+            plan["net"] = {"years": [cy], "net_type": comp["net"]}
+            plan["fork_events"].append(cy)
             timed.append(("net campaign (campaign_year)", cy))
+            ev.append(("itn_new", "net", f"net campaign ({comp['net']})", "decision", cy))
         if int(comp["smc"]):
             months = tuple(a.get("smc_months") or default_smc_months(season))
-            cfg["smc"] = {"years": years, "months": months}
-            ev = [y + (m - 1) / 12 for y in years for m in months]
-            cfg["events"] += ev
-            timed += [("SMC round", t) for t in ev]
+            plan["smc"] = {"years": years, "months": months}
+            ts = M.smc_targets(years, months)
+            plan["fork_events"] += ts
+            timed += [("SMC round", t) for t in ts]
+            ev += [("smc", "smc", "SMC round", "decision", t) for t in ts]
         if int(comp["irs"]):
             month = int(a.get("irs_month") or ((int(np.argmax(season)) - 3) % 12 + 1))
             irs_years = [int(np.floor(float(y))) for y in a.get("irs_years", years)]
-            cfg["irs"] = {"years": irs_years, "month": month}
-            ev = [y + (month - 1) / 12 for y in irs_years]
-            cfg["events"] += ev
-            timed += [("IRS round", t) for t in ev]
-        if explicit_delivery(horizon):
+            plan["irs"] = {"years": irs_years, "month": month}
+            ts = M.irs_targets(irs_years, month)
+            plan["fork_events"] += ts
+            timed += [("IRS round", t) for t in ts]
+            ev += [("irs", "irs", "IRS round", "decision", t) for t in ts]
+        if ex:
             out = [f"{c} at {t:.3f}" for c, t in timed if not d0 <= t < d1]
             if out:
                 raise ValueError(f"outside the delivery period [{d0:g}, {d1:g}): {', '.join(out[:4])}")
-        self._routine_years(a, horizon)              # validated here, before any sim is built
-        rs = self._smc_routine(a, horizon)           # v0.7: and routine SMC with the package's own rounds
+        plan["hist_years"] = [float(y) for y in a.get("itn_hist_years", [])]
+        plan["hist_net"] = a.get("hist_net", "pyr")
+        plan["routine_years"] = cls._routine_years(a, horizon)   # validated here, before any sim is built
+        rs = cls._smc_routine(a, horizon)            # v0.7: and routine SMC with the package's own rounds
         if rs is not None:
             pkg = [t for c, t in timed if c == "SMC round"]
             bad = smc_schedule_problems(pkg, rs["rounds"], rs["months"], d0, d1, float(horizon.window[1]))
             if bad:
                 raise ValueError("; ".join(bad))
-        return cfg
+        plan["smc_routine"] = rs
+        # one intervention (itn_hist) runs past and routine campaigns, in this order (as _base_sim builds it)
+        ev += [("itn_hist", "net", f"past net campaign ({plan['hist_net']})", "history", t) for t in plan["hist_years"]]
+        ev += [("itn_hist", "net", f"routine net campaign ({plan['hist_net']})", "routine", t)
+               for t in plan["routine_years"]]
+        ev += [("smc_routine", "smc", "routine SMC round", "routine", t) for t in (rs or {}).get("rounds", [])]
+        plan["deliveries"] = ev
+        # where cost drivers count (model.delivery_contains): the delivery period, or the window when none is given
+        w0, w1 = (float(x) for x in horizon.window)
+        plan["accounting"] = {"del_start": d0 if ex else None, "del_stop": d1 if ex else None,
+                              "win_start": w0, "win_stop": w1}
+        return plan
+
+    def _plan(self, P: dict, a: dict, components: dict, horizon: Horizon) -> dict:
+        """The package's component settings and the decimal years at which they first act (from delivery_plan)."""
+        dp = self.delivery_plan(a, components, horizon)
+        return {"cm_add": P["cm_add"] if dp["cm"]["on"] else 0.0, "net": dp["net"], "smc": dp["smc"],
+                "irs": dp["irs"], "events": dp["fork_events"]}
+
+    def schedule(self, params, unit: UnitSpec, package: Package, horizon: Horizon) -> list:
+        """v0.8 figure hook (toolkit/engines/hooks.py): the unit's delivery events in the arm `package` over
+        [horizon.start, window end), from delivery_plan, the code that configures the sim. Pure. A past campaign
+        before horizon.start (it acts in the burn-in) and a round after the window's end are not listed."""
+        P = resolve_params(self, params)             # unknown parameters fail closed, as in run()
+        dp = self.delivery_plan(dict(unit.attributes), package.components, horizon)
+        return self.project_schedule(dp, self._yearvec(P, horizon), horizon)
+
+    @staticmethod
+    def _yearvec(P: dict, horizon: Horizon) -> np.ndarray:
+        """The sim's daily time vector (decimal years), from a Starsim Timeline with the sim's start, stop and step:
+        no sim is built and no random number drawn (self-test S1 checks the projection against the sim's steps)."""
+        import starsim as ss
+        B = int(round(float(P["burnin_years"])))
+        tl = ss.Timeline(start=float(horizon.start) - B, stop=float(horizon.stop), dt=ss.days(1))
+        tl.init()
+        return np.asarray(tl.yearvec)
+
+    @staticmethod
+    def project_schedule(dp: dict, yv, horizon: Horizon) -> list:
+        """The delivery plan's targets as the sim executes them: each target on its daily step (model.event_steps),
+        targets of one intervention on one step as one delivery, t0 the step's year. Fails closed when a decision
+        delivery falls on a step where the sim does not charge it (model.delivery_contains), so `charged` matches
+        the cost drivers. Lists the steps in [horizon.start, window end)."""
+        yv = np.asarray(yv)
+        st, w1 = float(horizon.start), float(horizon.window[1])
+        acc, seen, out, unc = dp["accounting"], set(), [], []
+        dlo, dhi = delivery_period(horizon)          # hooks contract: history before it, routine outside it
+        for grp, comp, label, kind, t in dp["deliveries"]:
+            steps = M.event_steps(yv, [t])
+            if not steps or (grp, next(iter(steps))) in seen:
+                continue                             # outside the sim, or a delivery already on this step
+            ti = next(iter(steps))
+            seen.add((grp, ti))
+            yr = float(yv[ti])
+            # #127 r3: boundaries are compared exactly. A step that differs from a boundary by representation only
+            # (<= 1e-9 y, far below a day) is reported at the boundary's own float, but only when every membership
+            # test (charging by the sim's own delivery_contains, coverage, before / inside the delivery period) gives
+            # the same answer for both, so the event is never moved across a boundary.
+            sides = lambda x: (M.delivery_contains(x, **acc), st <= x < w1, x < dlo, dlo <= x < dhi)  # noqa: E731
+            for bnd in (dlo, dhi, st, w1):
+                if yr != bnd and abs(yr - bnd) <= 1e-9 and sides(bnd) == sides(yr):
+                    yr = float(bnd)
+                    break
+            if kind == "decision" and not M.delivery_contains(yr, **acc):
+                unc.append(f"{label} at {yr:.3f}")
+            if kind == "history" and yr >= dlo:
+                unc.append(f"{label} at {yr:.3f} (a past campaign at or after the delivery start, {dlo:g})")
+            if kind == "routine" and dlo <= yr < dhi:
+                unc.append(f"{label} at {yr:.3f} (a routine delivery inside the delivery period)")
+            if st <= yr < w1:
+                out.append({"component": comp, "label": label, "kind": kind, "t0": yr, "t1": None,
+                            "charged": kind == "decision"})
+        lo, hi = ((acc["del_start"], acc["del_stop"]) if acc["del_start"] is not None
+                  else (acc["win_start"], acc["win_stop"]))
+        if unc:
+            raise ValueError(f"schedule: deliveries outside their kind's period (decision events must be charged: "
+                             f"cost drivers count in [{lo:g}, {hi:g}); history events precede the delivery period; "
+                             f"routine events fall outside it): {', '.join(unc[:4])}")
+        if dp["cm"]["on"]:
+            out.append({"component": "cm", "label": "enhanced case management (add-on)", "kind": "decision",
+                        "t0": float(lo), "t1": float(hi), "charged": True})
+        return sorted(out, key=lambda x: x["t0"])
 
     @staticmethod
     def _burnin_key(P: dict, a: dict) -> str:
@@ -406,25 +525,26 @@ class MalariaEngine:
         n0 = n if B == 0 else max(int(round(n * np.exp(-POP_GROWTH * B))), 50)
         season = np.asarray(a.get("season", [1.0] * 12), float)
         w0, w1 = horizon.window
-        d0, d1 = delivery_period(horizon)
-        ex = explicit_delivery(horizon)
+        dp = self.delivery_plan(a, {}, horizon)      # v0.8: the history, routine, add-on and accounting (one source)
         m0 = float(a.get("m0", 5.0))
         dis = M.Malaria(M0=m0, season=season, resistance=_resistance(a.get("resistance", 0.5)),
                         ft=float(a.get("cm_ft", 0.3)), species=a.get("species"), P=P,
                         init_eir=min(P["init_eir_per_m0"] * m0, 150.0), win_start=w0, win_stop=w1,
                         smc_months=tuple(a.get("smc_months") or default_smc_months(season)),
                         import_eir=P["import_eir"], irs_product=a.get("irs_product", "pm_cs"),
-                        rec_year=float(horizon.start), del_start=d0 if ex else None, del_stop=d1 if ex else None)
+                        rec_year=float(horizon.start), del_start=dp["accounting"]["del_start"],
+                        del_stop=dp["accounting"]["del_stop"])
         use, capped = access_for_use(float(a.get("itn_use", 0.55)), float(a.get("itn_use_at", 0.0)), P)
         # v0.6: the add-on acts in the delivery period; without one it starts at the window and has no end (v0.5)
-        itv = [M.CaseManagement(base=float(a.get("cm_ft", 0.3)), add=0.0, start=d0, stop=d1 if ex else None, name="cm")]
-        hist = [float(y) for y in a.get("itn_hist_years", [])] + self._routine_years(a, horizon)
+        itv = [M.CaseManagement(base=float(a.get("cm_ft", 0.3)), add=0.0, start=dp["cm"]["start"],
+                                stop=dp["cm"]["stop"], name="cm")]
+        hist = dp["hist_years"] + dp["routine_years"]
         if hist:
-            itv.append(M.ITNCampaign(years=hist, use=use, net_type=a.get("hist_net", "pyr"), name="itn_hist"))
+            itv.append(M.ITNCampaign(years=hist, use=use, net_type=dp["hist_net"], name="itn_hist"))
         itv += [M.ITNCampaign(years=[], use=use, net_type="pyr", count=True, name="itn_new"),
                 M.SMCDelivery(years=[], pe=P["smc_pe"], hi_frac=P["smc_hi_frac"], name="smc"),
                 M.IRSRound(years=[], coverage=P["irs_coverage"], name="irs")]
-        rs = self._smc_routine(a, horizon)
+        rs = dp["smc_routine"]
         if rs is not None:     # v0.7: built only when set, last, so a unit without it gets the v0.6 sim exactly
             itv.append(M.SMCDelivery(years=rs["years"], months=rs["months"], pe=P["smc_pe"], hi_frac=P["smc_hi_frac"],
                                      count=False, after=rs["after"], before=rs["before"], name="smc_routine"))
@@ -472,13 +592,99 @@ class MalariaEngine:
         `packages` one Package or one per pair. Pairs whose burn-in inputs agree (the unit and every parameter outside
         POST_FORK) share one burn-in and one history up to the earliest component event of any of them; each pair is
         then continued from an exact copy. Each pair's outcomes equal run() of that pair (self-test V4)."""
-        import gc
-        import pickle
         B = len(param_sets)
         units = list(unit) if isinstance(unit, (list, tuple)) else [unit] * B
         pkgs = list(packages) if isinstance(packages, (list, tuple)) else [packages] * B
         if B == 0 or len(units) != B or len(pkgs) != B:
             raise ValueError("run_batch: give one unit (or one per pair) and one package (or one per pair)")
+        return self._run_members(param_sets, units, pkgs, horizon, seed)[0]
+
+    def run_series(self, params, unit: UnitSpec, packages: list, horizon: Horizon, seed: int, metrics: list,
+                   step: str = "month") -> list:
+        """v0.8 figure hook (toolkit/engines/hooks.py): monthly series of `metrics` (keys of the card's
+        outputs["series"]) for each package, in order, at one seed. The packages share the burn-in and the history
+        (run_batch's member loop); the series are read from the model's daily records, so the sims are run_batch's."""
+        if step != "month":
+            raise ValueError(f"run_series: step {step!r} is not supported (month)")
+        miss = [m for m in metrics if m not in SERIES]
+        if miss or not metrics:
+            raise ValueError(f"run_series: metrics {miss or metrics} are not in the card's series {sorted(SERIES)}")
+        pkgs = list(packages)
+        if not pkgs:
+            raise ValueError("run_series: give at least one package")
+        _, ser = self._run_members([params] * len(pkgs), [unit] * len(pkgs), pkgs, horizon, seed,
+                                   series=list(metrics))
+        return ser
+
+    @staticmethod
+    def series_steps(horizon: Horizon) -> tuple:
+        """(starts, ends) of the monthly steps: the contract's grid (hooks.monthly_grid, figures-hooks/1), whose
+        last step ends at the window's end (a partial step when the window ends inside a month)."""
+        if __package__:
+            from ..hooks import monthly_grid
+        else:  # pragma: no cover
+            from toolkit.engines.hooks import monthly_grid
+        t = [float(x) for x in monthly_grid(horizon)]
+        if not t:
+            raise ValueError("run_series: the outcome window ends at or before horizon.start (no monthly step)")
+        return t, t[1:] + [float(horizon.window[1])]
+
+    @staticmethod
+    def _series(sim, horizon: Horizon, metrics: list, pid: str) -> dict:
+        """One package's monthly series, with each step's end (t_end) and its number of simulated days (days). A
+        "mean" metric is the mean of the step's daily values; a "rate" metric the step's sum of daily episodes per
+        person over its length in years. A step's days are those a named window over the same span selects
+        ((yv >= a) & (yv < b), as _outcomes; found once for all steps with searchsorted), so window metrics are the
+        day-weighted (mean) or length-weighted (rate) sums of the steps they contain (series_window)."""
+        yv = np.asarray(sim.t.yearvec)
+        d = sim.diseases.malaria.daily
+        t, ends = MalariaEngine.series_steps(horizon)
+        idx = np.searchsorted(yv, np.asarray(t + ends[-1:], float), side="left")
+        vals, days = {m: [] for m in metrics}, []
+        for k, (a, b) in enumerate(zip(t, ends)):
+            lo, hi = int(idx[k]), int(idx[k + 1])
+            if hi <= lo:
+                raise ValueError(f"run_series: no simulated day in the step [{a:.4f}, {b:.4f})")
+            days.append(hi - lo)
+            for m in metrics:
+                x = d[m][lo:hi]
+                vals[m].append(float(x.mean()) if SERIES[m]["aggregate"] == "mean" else float(x.sum() / (b - a)))
+        return {"package": pid, "t": t, "t_end": list(ends), "days": days, "values": vals}
+
+    @staticmethod
+    def series_window(entry: dict, metric: str, a: float, b: float) -> float:
+        """The window metric over [a, b) from one run_series entry: the day-weighted mean of the steps' values
+        ("mean") or the sum of rate x step length ("rate", episodes per person over the window, as the window
+        metrics inc_u5 / inc_all). Exact when [a, b) is a union of steps. Fails closed (Codex r2) when [a, b) reaches
+        outside the entry's coverage [t[0], t_end[-1]), when it cuts through a step (the step's days cannot be split),
+        or when the steps inside do not cover it completely."""
+        t, te = np.asarray(entry["t"], float), np.asarray(entry["t_end"], float)
+        n, v = np.asarray(entry["days"], float), np.asarray(entry["values"][metric], float)
+        tol = 1e-9
+        if not (b > a and a >= t[0] - tol and b <= te[-1] + tol):
+            raise ValueError(f"series_window: [{a:g}, {b:g}) is not inside the series' coverage "
+                             f"[{t[0]:g}, {te[-1]:g})")
+        inside = (t >= a - tol) & (te <= b + tol)
+        cut = (t < b - tol) & (te > a + tol) & ~inside
+        if cut.any():
+            raise ValueError(f"series_window: [{a:g}, {b:g}) cuts through the monthly step(s) starting at "
+                             f"{[round(x, 4) for x in t[cut][:3]]}")
+        ts, es = t[inside], te[inside]
+        if (not inside.any() or abs(ts[0] - a) > tol or abs(es[-1] - b) > tol
+                or np.any(np.abs(ts[1:] - es[:-1]) > tol)):
+            raise ValueError(f"series_window: the whole steps inside [{a:g}, {b:g}) do not cover it completely "
+                             "(coverage)")
+        if SERIES[metric]["aggregate"] == "mean":
+            return float((v * n)[inside].sum() / n[inside].sum())
+        return float((v * (te - t))[inside].sum())
+
+    def _run_members(self, param_sets, units, pkgs, horizon: Horizon, seed: int, series: list | None = None):
+        """run_batch's member loop: (outcomes, series) per (parameter set, unit, package); series is None per member
+        unless `series` lists metrics (v0.8), which are read from the daily records after the run and change
+        nothing in it (self-test S7)."""
+        import gc
+        import pickle
+        B = len(param_sets)
         mem = []
         for p, u, k in zip(param_sets, units, pkgs):
             P = resolve_params(self, p)
@@ -487,7 +693,7 @@ class MalariaEngine:
         groups = {}
         for i, (P, a, _) in enumerate(mem):
             groups.setdefault(self._burnin_key(P, a), []).append(i)
-        out = [None] * B
+        out, ser = [None] * B, [None] * B
         for idx in groups.values():
             t0 = time.time()
             P0, a0, _ = mem[idx[0]]
@@ -513,6 +719,8 @@ class MalariaEngine:
                     "burnin_years": int(round(P["burnin_years"])), "n_burnin_start": n0, "n_start": dz.n_start,
                     "fork_year": round(float(yv[ti_f]), 6), "burnin_members": len(idx),
                     "start_state_sha256": dz.start_sha})
+                if series:
+                    ser[i] = self._series(s, horizon, series, pkgs[i].id)
                 if n == len(idx) - 2:
                     snap = None                # the last member continues the original sim
                 try:
@@ -524,7 +732,7 @@ class MalariaEngine:
                 gc.collect()                   # Starsim sims hold reference cycles: free each member before the next
             del sim
             gc.collect()
-        return out
+        return out, ser
 
     def initial_state(self, params, unit: UnitSpec, package: Package | None = None, horizon: Horizon | None = None,
                       seed: int = 1) -> dict:
@@ -734,6 +942,7 @@ def _self_test() -> int:
     _self_test_v05(ok, e, unit)
     _self_test_v06(ok, e, unit)
     _self_test_v07(ok, e, unit)
+    _self_test_v08(ok, e, unit)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -984,7 +1193,7 @@ def _self_test_v07(ok, e, unit) -> None:
     full = Package("full", {"net": "pyr", "smc": 1, "irs": 1, "cm": 1})
 
     def r0():
-        ok(VERSION == "0.7" and "smc_routine" in e.describe().unit_attributes,
+        ok(tuple(int(x) for x in VERSION.split(".")) >= (0, 7) and "smc_routine" in e.describe().unit_attributes,
            "R0 engine v0.7 declares the routine-SMC unit attribute on its card")
         b = yaml.safe_load(open(os.path.join(HERE, "attribute_binding.yaml")))["attribute_binding"]
         ok(isinstance(b.get("smc_routine"), dict) and str(b["smc_routine"].get("default")) == "0",
@@ -1073,6 +1282,388 @@ def _self_test_v07(ok, e, unit) -> None:
                        f"attribute absent for {len(pk)} packages")
     case("R7", r7)
 
+
+
+def _self_test_v08(ok, e, unit) -> None:
+    """v0.8: the figure hooks of toolkit/engines/hooks.py (#127). schedule() is pure and comes from the code that
+    configures the sim (delivery_plan); run_series() reads the model's daily records through run_batch's member loop,
+    so run / run_batch are unchanged (S7; benchmarks/restamp_proof.py compares the v0.7 and v0.8 code)."""
+    def case(label, fn):
+        try:
+            fn()
+        except Exception as ex:  # noqa: BLE001 -- a missing feature is a failing case, not a crash of the test
+            ok(False, f"{label} ({type(ex).__name__}: {ex})")
+
+    import copy
+    from toolkit.engines import hooks as HK
+    from toolkit.engines.horizon import DeliveryHorizon
+    base = {"n_agents": 500, "burnin_years": 2}
+    season = [0.4, 0.4, 0.5, 0.7, 1.0, 1.4, 1.8, 2.0, 1.6, 1.0, 0.7, 0.5]
+    wins = {"y1": [2016.0, 2017.0], "y3": [2018.0, 2019.0], "all": [2015.0, 2019.0]}
+    # past campaigns before (burn-in) and inside the covered range; routine nets 2017.1, 2018.1; routine SMC 2017-18
+    attrs = dict(unit.attributes, season=season, itn_hist_years=[2014.5, 2015.3], campaign_year=2016.1, irs_month=4,
+                 itn_routine_interval=1.0, smc_routine=1)
+    u = UnitSpec("t", attrs)
+    hd = DeliveryHorizon(2015.0, 2019.0, (2016.0, 2019.0), dict(wins), delivery=(2016.0, 2017.0))
+    none, full = Package("none", {}), Package("full", {"net": "pyr", "smc": 1, "irs": 1, "cm": 1})
+    smc_only = Package("smc", {"smc": 1})
+    metrics = ["pfpr_u5", "inc_all", "inc_u5"]
+
+    def s0():
+        ok(tuple(int(x) for x in VERSION.split(".")) >= (0, 8) and HK.supports(e, "schedule")
+           and HK.supports(e, "series"), "S0 engine v0.8 offers both figure hooks (hooks.supports)")
+    case("S0", s0)
+
+    def s1():
+        from toolkit.engines.malaria import model as MM
+        w1, st = float(hd.window[1]), float(hd.start)
+        for pkg in (none, full, smc_only):
+            ev = e.schedule(base, u, pkg, hd)
+            sim, _ = e.build_sim(base, u, pkg, hd, 3)
+            sim.init()
+            itv, yv = sim.interventions, np.asarray(sim.t.yearvec)
+            ran = lambda ts: sorted(round(float(yv[i]), 9) for i in MM._event_tis(sim, ts) if st <= yv[i] < w1)  # noqa
+            want = {"net:past+routine": ran(itv["itn_hist"].years), "net:decision": ran(itv["itn_new"].years),
+                    "smc:decision": ran(itv["smc"].targets()),
+                    "irs:decision": ran([y + (itv["irs"].month - 1) / 12 for y in itv["irs"].years]),
+                    "smc:routine": ran(itv["smc_routine"].targets())}
+            pick = lambda c, ks: sorted(round(x["t0"], 9) for x in ev if x["component"] == c and x["kind"] in ks)  # noqa
+            have = {"net:past+routine": pick("net", ("history", "routine")), "net:decision": pick("net", ("decision",)),
+                    "smc:decision": pick("smc", ("decision",)), "irs:decision": pick("irs", ("decision",)),
+                    "smc:routine": pick("smc", ("routine",))}
+            ok(have == want and len(pick("net", ("history",))) == 1 and len(pick("net", ("routine",))) == 2,
+               f"S1 ({pkg.id}) every event is a step the sim executes, and every executed step is listed: "
+               f"{ {k: (len(have[k]), len(want[k])) for k in want} }")
+            cm = [x for x in ev if x["component"] == "cm"]
+            c = itv["cm"]
+            ok((cm == [] if c.add == 0 else len(cm) == 1 and abs(cm[0]["t0"] - c.start) < 1e-9
+                and abs(cm[0]["t1"] - (c.stop if c.stop is not None else w1)) < 1e-9)
+               and all(x["charged"] == (x["kind"] == "decision") for x in ev),
+               f"S1b ({pkg.id}) the add-on period is the sim's; charged exactly for decision events")
+        evn = e.schedule(base, u, none, hd)
+        evf = e.schedule(base, u, full, hd)
+        ok(not [x for x in evn if x["kind"] == "decision"]
+           and {x["component"] for x in evf if x["kind"] == "decision"} == {"net", "smc", "irs", "cm"}
+           and [x for x in evn if x["kind"] != "decision"] == [x for x in evf if x["kind"] != "decision"],
+           "S1c the comparator has no decision event; every arm has the same history and routine events")
+    case("S1", s1)
+
+    def s2():
+        import starsim as ss
+        ua = UnitSpec("t", copy.deepcopy(attrs))
+        before, st0 = copy.deepcopy(ua.attributes), np.random.get_state()
+        real = ss.Sim
+
+        def no_sim(*a, **k):
+            raise AssertionError("schedule() built a sim")
+        ss.Sim = no_sim
+        try:
+            a1 = e.schedule(base, ua, full, hd)
+            a2 = e.schedule(base, ua, full, hd)
+        finally:
+            ss.Sim = real
+        st1 = np.random.get_state()
+        ok(a1 == a2 and ua.attributes == before and st0[0] == st1[0] and np.array_equal(st0[1], st1[1])
+           and st0[2:] == st1[2:], "S2 schedule() is pure: no sim, no random draw, the unit unchanged, same answer")
+    case("S2", s2)
+
+    def s3():
+        hw = Horizon(2015.0, 2019.0, (2016.0, 2019.0), dict(wins))
+        uw = UnitSpec("t", {k: v for k, v in attrs.items() if k not in ("smc_routine", "itn_routine_interval")})
+        for pkg in (none, full, smc_only):
+            for h, uu, nm in ((hd, u, "delivery"), (hw, uw, "window")):
+                s = HK.schedule(e, base, uu, pkg, h)
+                ok(all(float(h.start) <= x["t0"] < float(h.window[1]) for x in s),
+                   f"S3 ({pkg.id}, {nm}) #127's checker accepts the schedule ({len(s)} events in "
+                   "[horizon.start, window end))")
+        try:
+            e.schedule(base, UnitSpec("t", dict(attrs, campaign_year=2017.5)), full, hd)
+            ok(False, "S3b a campaign outside the delivery period fails closed in schedule() as in the sim")
+        except ValueError as ex:
+            ok("delivery period" in str(ex), f"S3b a campaign outside the delivery period fails closed in schedule() "
+                                             f"as in the sim ({ex})")
+    case("S3", s3)
+
+    def s4():
+        card = e.describe().outputs.get("series") or {}
+        ok(card.get("pfpr_u5", {}).get("aggregate") == "mean" and card.get("inc_all", {}).get("aggregate") == "rate"
+           and card.get("inc_u5", {}).get("aggregate") == "rate" and "year" in card.get("inc_all", {}).get("units", "")
+           and "year" in card.get("inc_u5", {}).get("units", "")
+           and all(str(v.get("label") or "").strip() for v in card.values()),
+           f"S4 the card declares the series: under-5 prevalence (mean), all-age and under-5 incidence (rate per "
+           f"person-year): {card}")
+        r = HK.run_series(e, base, u, [full, none], hd, 5, metrics)
+        t = r[0]["t"]
+        ok([x["package"] for x in r] == ["full", "none"] and len(t) == 48 and abs(t[0] - 2015.0) < 1e-12
+           and np.allclose(np.diff(t), 1 / 12) and t[-1] < 2019.0,
+           f"S4b one entry per package in order, monthly steps over [horizon.start, window end): {len(t)} steps")
+        v = r[1]["values"]
+        ok(all(0.0 <= x <= 1.0 for x in v["pfpr_u5"]) and all(x >= 0 for x in v["inc_all"] + v["inc_u5"])
+           and 0.05 < float(np.mean(v["inc_all"])) < 20,
+           f"S4c prevalence is a share and incidence episodes per person-year (comparator mean all-age "
+           f"{float(np.mean(v['inc_all'])):.2f})")
+    case("S4", s4)
+
+    def s5():
+        outs, ser = e._run_members([base] * 2, [u] * 2, [none, full], hd, 5, series=metrics)
+        pub = e.run_series(base, u, [none, full], hd, 5, metrics)
+        ok([s["values"] for s in ser] == [p["values"] for p in pub] and [s["t"] for s in ser] == [p["t"] for p in pub],
+           "S5 run_series returns the member loop's series")
+        for o, s, pb in zip(outs, ser, pub):
+            t, n = np.asarray(s["t"]), np.asarray(s["days"], float)
+            ends = np.append(t[1:], float(hd.window[1]))
+            for w, (a, b) in wins.items():
+                m = (t >= a - 1e-9) & (t < b - 1e-9)
+                p = float((np.asarray(s["values"]["pfpr_u5"])[m] * n[m]).sum() / n[m].sum())
+                i5 = float((np.asarray(s["values"]["inc_u5"])[m] * (ends - t)[m]).sum())
+                ia = float((np.asarray(s["values"]["inc_all"])[m] * (ends - t)[m]).sum())
+                W = o.windows[w]
+                ok(abs(p - W["pfpr_u5"]) < 1e-9 and abs(i5 - W["inc_u5"]) < 1e-9 * max(1, W["inc_u5"])
+                   and abs(ia - W["inc_all"]) < 1e-9 * max(1, W["inc_all"]),
+                   f"S5b ({s['package']}, {w}) the series over the window equal the window metrics: pfpr_u5 "
+                   f"{p:.6f} vs {W['pfpr_u5']:.6f}, inc_u5 {i5:.6f} vs {W['inc_u5']:.6f}, inc_all {ia:.6f} vs "
+                   f"{W['inc_all']:.6f}")
+                pm = float(np.mean(np.asarray(pb["values"]["pfpr_u5"])[m]))
+                ok(abs(pm - W["pfpr_u5"]) <= 0.02 * max(W["pfpr_u5"], 1e-3),
+                   f"S5c ({s['package']}, {w}) the plain mean of the public monthly prevalence is within 2% of the "
+                   f"window metric ({pm:.4f} vs {W['pfpr_u5']:.4f})")
+    case("S5", s5)
+
+    def s6():
+        a, b = e.run_series(base, u, [none, full], hd, 6, metrics)
+        t = np.asarray(a["t"])
+        pre = t < 2016.0 - 1e-9
+        ok(all(np.array_equal(np.asarray(a["values"][m])[pre], np.asarray(b["values"][m])[pre]) for m in metrics)
+           and any(not np.array_equal(np.asarray(a["values"][m])[~pre], np.asarray(b["values"][m])[~pre])
+                   for m in metrics),
+           "S6 packages share their history: identical series before the first component event, different after")
+    case("S6", s6)
+
+    def s7():
+        strip = lambda o: (o.per_capita, o.windows, o.cost_drivers,  # noqa: E731
+                           {k: v for k, v in o.meta.items() if k != "seconds"})
+        pk = [none, full, smc_only]
+        a = [strip(o) for o in e.run_batch([base] * 3, u, pk, hd, 7)]
+        outs, _ = e._run_members([base] * 3, [u] * 3, pk, hd, 7, series=metrics)
+        ok(a == [strip(o) for o in outs], "S7 recording the series leaves the outcomes byte-identical to run_batch's")
+    case("S7", s7)
+
+    def s8():
+        try:
+            HK.run_series(e, base, u, [none], hd, 1, ["no_such_metric"])
+            ok(False, "S8 a metric the card does not list is refused")
+        except HK.HookInvalid as ex:
+            ok("not in the card" in str(ex), f"S8 a metric the card does not list is refused ({ex})")
+    case("S8", s8)
+
+    plain = {k: v for k, v in attrs.items() if k not in ("smc_routine", "itn_routine_interval")}
+    hw = Horizon(2015.0, 2019.0, (2016.0, 2019.0), {})
+
+    def refused(fn):
+        try:
+            fn()
+            return None
+        except ValueError as ex:
+            return str(ex)
+
+    def s9():
+        # Codex r1 P2-2: a decision event the sim delivers but does not charge (counting is by in_delivery())
+        ux, net = UnitSpec("t", dict(plain, campaign_year=2015.5)), Package("pyr", {"net": "pyr"})
+        o = e.run(base, ux, net, hw, 3)
+        why = refused(lambda: e.schedule(base, ux, net, hw))
+        ok(o.cost_drivers["nets_given"] == 0 and why is not None and "charged" in why,
+           f"S9 a decision campaign the sim delivers uncharged (nets_given {o.cost_drivers['nets_given']}) makes "
+           f"schedule() fail closed ({why})")
+        hm = Horizon(2015.0, 2019.0, (2016.5, 2019.0), {})
+        us, smc1 = UnitSpec("t", dict(plain, campaign_year=2016.5, smc_months=[5, 6, 7, 8])), Package("s", {"smc": 1})
+        o2 = e.run(base, us, smc1, hm, 3)
+        why2 = refused(lambda: e.schedule(base, us, smc1, hm))
+        ok(o2.cost_drivers["smc_doses"] > 0 and why2 is not None and "charged" in why2,
+           f"S9b SMC rounds before a mid-year window start run uncharged: schedule() fails closed ({why2})")
+        for pkg, drv in ((Package("n", {"net": "pyr"}), "nets_given"), (smc1, "smc_doses"),
+                         (Package("i", {"irs": 1}), "irs_sprayed")):
+            ev = [x for x in e.schedule(base, u, pkg, hd) if x["charged"]]
+            oo = e.run(base, u, pkg, hd, 3)
+            ok(ev and oo.cost_drivers[drv] > 0,
+               f"S9c ({pkg.id}) the charged events are charged by the sim ({len(ev)} events, {drv} "
+               f"{oo.cost_drivers[drv]:.3f})")
+    case("S9", s9)
+
+    def s10():
+        # Codex r1 P2-3: repeated or same-day targets are one delivery in the sim
+        from toolkit.engines.malaria import model as MM
+        ud = UnitSpec("t", dict(plain, itn_hist_years=[2015.25, 2015.25, 2015.25 + 0.2 / 365]))
+        ev = [x for x in e.schedule(base, ud, none, hw) if x["kind"] == "history"]
+        sim, _ = e.build_sim(base, ud, none, hw, 3)
+        sim.init()
+        ran = MM._event_tis(sim, sim.interventions["itn_hist"].years)
+        ok(len(ev) == len(ran) == 1, f"S10 three past-campaign targets on one daily step are one event, as the sim "
+                                     f"runs them ({len(ev)} listed, {len(ran)} executed)")
+    case("S10", s10)
+
+    def s11():
+        # Codex r1 P2-4: the public series carry their day counts and step ends, and reconcile exactly
+        w1 = 2018.0 + 1 / 365                         # off the monthly grid: a final step of one or two days
+        wn = {"all": [2015.0, w1], "last": [2015.0 + 35 / 12, w1], "y1": [2016.0, 2017.0]}
+        hp = DeliveryHorizon(2015.0, 2018.1, (2016.0, w1), dict(wn), delivery=(2016.0, 2017.0))
+        r = HK.run_series(e, base, u, [none, full], hp, 5, metrics)
+        outs = e.run_batch([base] * 2, u, [none, full], hp, 5)
+        ok(all(len(x["days"]) == len(x["t"]) == len(x["t_end"]) and abs(x["t_end"][-1] - w1) < 1e-12 for x in r),
+           "S11 each public entry carries the day count and the end of every step")
+        for x, o in zip(r, outs):
+            for w, (a0, b0) in wn.items():
+                got = {m: e.series_window(x, m, a0, b0) for m in metrics}
+                W = o.windows[w]
+                ok(all(abs(got[m] - W[m]) <= 1e-9 * max(1.0, abs(W[m])) for m in metrics),
+                   f"S11b ({x['package']}, {w}) the public series reconcile exactly with the window metrics: "
+                   f"{ {m: (round(got[m], 6), round(W[m], 6)) for m in metrics} }")
+        why = refused(lambda: e.series_window(r[0], "pfpr_u5", 2016.04, 2017.0))
+        ok(why is not None and "step" in why, f"S11c a window that cuts through a monthly step fails closed ({why})")
+    case("S11", s11)
+
+    def s12():
+        # #127 r1 (H9-H12): the hooks contract version, series metadata, the monthly grid and schedule semantics
+        ok(getattr(e, "hooks_contract", None) == "figures-hooks/1", "S12 the engine declares hooks contract "
+                                                                     "figures-hooks/1")
+        card = e.describe().outputs.get("series") or {}
+        ok(card and all(all(isinstance(v.get(k), str) and v.get(k).strip() for k in ("label", "units", "aggregate",
+                                                                                     "denominator"))
+                        and v["aggregate"] in ("mean", "rate") for v in card.values()),
+           f"S12b every series metric has label, units, aggregate and denominator: "
+           f"{ {k: v.get('denominator') for k, v in card.items()} }")
+        w1 = 2018.0 + 1 / 365
+        hp = DeliveryHorizon(2015.0, 2018.1, (2016.0, w1), {}, delivery=(2016.0, 2017.0))
+        for h in (hd, hp):
+            r = HK.run_series(e, base, u, [none, full], h, 4, ["pfpr_u5"])
+            n = int(np.ceil((float(h.window[1]) - float(h.start)) * 12 - 1e-9))
+            ok(all(len(x["t"]) == n and all(abs(x["t"][k] - (float(h.start) + k / 12)) < 1e-6 for k in range(n))
+                   and x["t"] == HK.monthly_grid(h) and abs(x["t_end"][-1] - float(h.window[1])) < 1e-12
+                   for x in r) and r[0]["t"] == r[1]["t"],
+               f"S12c the grid is hooks.monthly_grid: every step start horizon.start + k/12 before the window end "
+               f"({n}; a partial last step ending at the window end), the same for every arm")
+        d0, d1 = delivery_period(hd)
+        for pkg in (none, full, smc_only):
+            ev = HK.schedule(e, base, u, pkg, hd)
+            setc = {k for k, v in pkg.components.items() if v not in (0, None, "none")}
+            bad = [x for x in ev if not (float(hd.start) <= x["t0"] <= float(hd.window[1]))
+                   or (x["t1"] is not None and not float(hd.start) <= x["t1"] <= float(hd.window[1]))
+                   or (x["kind"] == "decision" and (not d0 <= x["t0"] <= d1 or x["component"] not in setc))
+                   or (x["kind"] == "history" and not x["t0"] < d0)
+                   or (x["kind"] == "routine" and d0 <= x["t0"] < d1)]
+            ok(not bad, f"S12d ({pkg.id}) every event keeps #127's schedule semantics: {bad[:2]}")
+        why = refused(lambda: e.schedule(base, UnitSpec("t", dict(attrs, itn_hist_years=[2016.5])), none, hd))
+        ok(why is not None and "history" in why, f"S12e a past campaign inside the delivery period fails closed in "
+                                                 f"schedule() ({why})")
+    case("S12", s12)
+
+    def s13():
+        # Codex r2 P2: a window outside the series' coverage is refused, not truncated
+        t = [2015.0 + k / 12 for k in range(48)]
+        ent = {"package": "x", "t": t, "t_end": t[1:] + [2019.0], "days": [30] * 48,
+               "values": {"pfpr_u5": [0.1] * 48, "inc_u5": [1.0] * 48}}
+        for a0, b0, nm in ((2018.0, 2020.0, "past the series end"), (2014.0, 2016.0, "before the series start"),
+                           (2014.5, 2020.0, "both sides")):
+            why = refused(lambda: e.series_window(ent, "inc_u5", a0, b0))
+            ok(why is not None and "coverage" in why, f"S13 a window {nm} ([{a0:g}, {b0:g})) is refused, not truncated "
+                                                      f"({why})")
+        ok(abs(e.series_window(ent, "inc_u5", 2018.0, 2019.0) - 1.0) < 1e-12
+           and abs(e.series_window(ent, "pfpr_u5", 2015.0, 2019.0) - 0.1) < 1e-12,
+           "S13b windows covered by whole steps inside the coverage are aggregated")
+    case("S13", s13)
+
+    def s14():
+        # #127 r2 (P2-11): half-open delivery semantics at each boundary, against what the sim does
+        from toolkit.engines.malaria import model as MM
+        d0, d1 = delivery_period(hd)
+        net = Package("pyr", {"net": "pyr"})
+        ev = e.schedule(base, UnitSpec("t", dict(attrs, campaign_year=d0)), net, hd)
+        dec = [x for x in ev if x["kind"] == "decision"]
+        o = e.run(base, UnitSpec("t", dict(attrs, campaign_year=d0)), net, hd, 3)
+        ok(len(dec) == 1 and dec[0]["t0"] == d0 and dec[0]["charged"] and o.cost_drivers["nets_given"] > 0,
+           f"S14 a decision campaign at the delivery start d0 is inside, charged in the schedule and by the sim "
+           f"(nets_given {o.cost_drivers['nets_given']:.3f})")
+        for at, pkg, label, needle in (
+                ({"campaign_year": d1}, net, "S14b a decision campaign at the delivery end d1 is refused",
+                 "delivery period"),
+                ({"itn_hist_years": [d0]}, net, "S14c a past campaign at d0 is refused", "history"),
+                ({"campaign_year": d0 - 0.5, "itn_routine_interval": 0.5}, none,   # routine nets run in every arm
+                 "S14d a routine campaign at d0 is refused", "routine")):
+            why = refused(lambda: e.schedule(base, UnitSpec("t", dict(attrs, **at)), pkg, hd))
+            ok(why is not None and needle in why, f"{label} ({why})")
+        ur = UnitSpec("t", dict(attrs, campaign_year=d0, itn_routine_interval=1.0, smc_months=[1, 2, 3, 4]))
+        ev = e.schedule(base, ur, Package("ps", {"net": "pyr", "smc": 1}), hd)
+        rn = sorted(x["t0"] for x in ev if x["kind"] == "routine" and x["component"] == "net")
+        rs = sorted(x["t0"] for x in ev if x["kind"] == "routine" and x["component"] == "smc")
+        sim, _ = e.build_sim(base, ur, Package("ps", {"net": "pyr", "smc": 1}), hd, 3)
+        sim.init()
+        yv = np.asarray(sim.t.yearvec)
+        ran = sorted(float(yv[i]) for i in MM._event_tis(sim, sim.interventions["smc_routine"].targets()))
+        ok(rn and rn[0] == d1 and rs and rs[0] == d1 and rs == [t for t in ran if t < float(hd.window[1])]
+           and all(x["t0"] < float(hd.window[1]) for x in ev),
+           f"S14e a routine campaign and the first routine SMC round at d1 are accepted, as the sim runs them "
+           f"(nets {rn}, first SMC {rs[:1]})")
+        g = DeliveryHorizon(2023.0, 2029.25, (2024.0, 2029.25), {}, delivery=(2024.0, 2027.0))
+        ug = UnitSpec("t", dict(attrs, itn_hist_years=[2021.25], campaign_year=2024.25, itn_routine_interval=3.0))
+        evg = HK.schedule(e, {"n_agents": 200}, ug, Package("ps", {"net": "pyr", "smc": 1}), g)
+        rg = sorted(round(x["t0"], 3) for x in evg if x["kind"] == "routine" and x["component"] == "net")
+        sg = [x["t0"] for x in evg if x["kind"] == "routine" and x["component"] == "smc"]
+        ok(rg in ([2027.249], [2027.25]) and bool(sg) and min(sg) >= 2027.0,
+           f"S14f GC7 dates: the routine campaign at campaign + 3 ({rg}) and routine SMC from d1 (first "
+           f"{round(min(sg), 3) if sg else None}) lie outside the delivery period; #127's checker accepts them")
+    case("S14", s14)
+
+    def s15():
+        # #127 r3: exact half-open boundaries; the hook reports and charges each event on the side the sim does,
+        # checked on the real time vector (Starsim rounds it to 9 decimals: whole years from the sim start are exact)
+        from toolkit.engines.malaria import model as MM
+        net = Package("pyr", {"net": "pyr"})
+        g = DeliveryHorizon(2023.0, 2029.25, (2024.0, 2029.25), {}, delivery=(2024.0, 2027.0))
+        gp = {"n_agents": 200}                       # the card's 50-year burn-in: the real GC7 time vector
+        ug = dict(attrs, itn_hist_years=[2023.0], campaign_year=2024.0, smc_months=[1, 2, 3, 4], itn_routine_interval=3.0)
+        ev = HK.schedule(e, gp, UnitSpec("t", ug), Package("ps", {"net": "pyr", "smc": 1}), g)
+        P = resolve_params(e, gp)
+        yv = e._yearvec(P, g)
+        acc = e.delivery_plan(ug, {"net": "pyr", "smc": 1}, g)["accounting"]
+        dec = [x for x in ev if x["kind"] == "decision" and x["component"] == "net"]
+        his = [x for x in ev if x["kind"] == "history"]
+        rsm = sorted(x["t0"] for x in ev if x["kind"] == "routine" and x["component"] == "smc")
+        rnt = [x["t0"] for x in ev if x["kind"] == "routine" and x["component"] == "net"]
+        ok(dec and dec[0]["t0"] == 2024.0 and dec[0]["charged"] and MM.delivery_contains(dec[0]["t0"], **acc)
+           and his and his[0]["t0"] == 2023.0 and rsm and rsm[0] == 2027.0
+           and not MM.delivery_contains(rsm[0], **acc) and rnt == [float(yv[min(MM.event_steps(yv, [2027.0]))])],
+           f"S15 on the GC7 time vector the decision at d0 is exactly 2024.0 and charged, the past campaign at "
+           f"horizon.start is exactly 2023.0, the first routine SMC round is exactly d1 and uncharged, and the "
+           f"routine net at campaign + 3 is on its executed step ({rnt})")
+        ok(all(x["t0"] < 2029.25 for x in ev) and all(x["t1"] is None or x["t1"] <= 2029.25 for x in ev),
+           f"S15b nothing is listed at or after the window end (last t0 {max(x['t0'] for x in ev):.6f})")
+        # a start off the day grid: d0 and d1 fall between steps; the nearest steps lie after both
+        g2 = DeliveryHorizon(2023.25, 2029.25, (2024.0, 2029.25), {}, delivery=(2024.0, 2027.0))
+        ev2 = e.schedule({"n_agents": 200, "burnin_years": 20}, UnitSpec("t", ug), Package("ps", {"net": "pyr", "smc": 1}), g2)
+        d2 = [x for x in ev2 if x["kind"] == "decision" and x["component"] == "net"]
+        r2 = sorted(x["t0"] for x in ev2 if x["kind"] == "routine" and x["component"] == "smc")
+        ok(d2 and 2024.0 < d2[0]["t0"] < 2024.002 and d2[0]["charged"] and r2 and 2027.0 < r2[0] < 2027.002,
+           f"S15c with an off-grid start, the decision at d0 runs on the next step ({d2[0]['t0'] if d2 else None}) "
+           f"and is charged; the routine round at d1 runs after d1 ({r2[:1]})")
+        # a delivery start between steps whose nearest step lies before it: the sim does not charge the campaign
+        g3 = DeliveryHorizon(2023.0, 2025.0, (2024.0, 2025.0), {}, delivery=(2024.25, 2025.0))
+        u3 = UnitSpec("t", dict(plain, campaign_year=2024.25))
+        o3 = e.run({"n_agents": 300, "burnin_years": 2}, u3, net, g3, 3)
+        why = refused(lambda: e.schedule({"n_agents": 300, "burnin_years": 2}, u3, net, g3))
+        ok(o3.cost_drivers["nets_given"] == 0 and why is not None and "charged" in why,
+           f"S15d a campaign at a delivery start the nearest step precedes is not charged by the sim "
+           f"(nets_given {o3.cost_drivers['nets_given']}), and schedule() fails closed ({why})")
+        # representation: an executed step one ulp-scale off d0 is reported at d0 when it is on d0's side, and
+        # never moved across it
+        dp = e.delivery_plan(ug, {"net": "pyr"}, g)
+        i0 = min(MM.event_steps(yv, [2024.0]))
+        up, dn = yv.copy(), yv.copy()
+        up[i0], dn[i0] = 2024.0 + 1e-12, 2024.0 - 1e-12
+        a = [x for x in e.project_schedule(dp, up, g) if x["kind"] == "decision" and x["component"] == "net"]
+        why2 = refused(lambda: e.project_schedule(dp, dn, g))
+        ok(a and a[0]["t0"] == 2024.0 and a[0]["charged"] and why2 is not None and "charged" in why2,
+           f"S15e a step 1e-12 after d0 is reported exactly at d0; one 1e-12 before it is not charged by the sim's "
+           f"test and is refused, not moved ({why2})")
+    case("S15", s15)
 
 def write_card(path: str) -> None:
     """Engine card (describe() plus every parameter with its kind, range and source) as YAML."""

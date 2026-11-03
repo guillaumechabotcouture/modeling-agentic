@@ -42,7 +42,6 @@ EXEMPT = {
     "toolkit/analysis/claims.py": "analysis-engine library; exercised by toolkit/analysis/run.py --self-test",
     "toolkit/analysis/core.py": "analysis-engine library; exercised by toolkit/analysis/run.py --self-test",
     "toolkit/analysis/decision_tests.py": "analysis-engine library; exercised by toolkit/analysis/run.py --self-test",
-    "toolkit/analysis/figures.py": "analysis-engine library; exercised by toolkit/analysis/run.py --self-test",
     "toolkit/analysis/sensitivity.py": "analysis-engine library; exercised by toolkit/analysis/run.py --self-test",
     "toolkit/analysis/stability.py": "analysis-engine library; exercised by toolkit/analysis/run.py --self-test",
     "toolkit/analysis/uncertainty.py": "analysis-engine library; exercised by toolkit/analysis/run.py --self-test",

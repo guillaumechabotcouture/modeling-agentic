@@ -30,7 +30,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 from toolkit.analysis.artifacts import (ENVELOPE, EXPECTED_KINDS, EXPECTED_ROLES, KINDS, MANIFEST,  # noqa: E402
                                         PRODUCED_BY, PRODUCER_PREFIX, sha256)
-from toolkit.analysis.figures import resolve_source  # noqa: E402
+from toolkit.analysis.figures import presentation_findings, resolve_source  # noqa: E402
 
 SPEC = "decision_spec.yaml"
 ENGINE_CHOICE = "engine_choice.json"     # toolkit/spec/schema.py ENGINE_CHOICE
@@ -292,6 +292,9 @@ def _figures(run_dir, man) -> list[dict]:
             elif sha256(p) != h:
                 out.append(_f("analysis_contract_figure", f"{rel}: source {os.path.relpath(p, os.path.realpath(run_dir))}"
                                                           " changed after the figure was drawn", rel))
+        # the unsigned presentation files (labels, boundaries, crosswalk) the figure read, with their sha
+        for why in presentation_findings(run_dir, sc):
+            out.append(_f("analysis_contract_figure", f"{rel}: presentation input {why}", rel))
     return out
 
 
