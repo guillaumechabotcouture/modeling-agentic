@@ -1603,6 +1603,59 @@ def _self_test_v08(ok, e, unit) -> None:
            f"{round(min(sg), 3) if sg else None}) lie outside the delivery period; #127's checker accepts them")
     case("S14", s14)
 
+    def s15():
+        # #127 r3: exact half-open boundaries; the hook reports and charges each event on the side the sim does,
+        # checked on the real time vector (Starsim rounds it to 9 decimals: whole years from the sim start are exact)
+        from toolkit.engines.malaria import model as MM
+        net = Package("pyr", {"net": "pyr"})
+        g = DeliveryHorizon(2023.0, 2029.25, (2024.0, 2029.25), {}, delivery=(2024.0, 2027.0))
+        gp = {"n_agents": 200}                       # the card's 50-year burn-in: the real GC7 time vector
+        ug = dict(attrs, itn_hist_years=[2023.0], campaign_year=2024.0, smc_months=[1, 2, 3, 4], itn_routine_interval=3.0)
+        ev = HK.schedule(e, gp, UnitSpec("t", ug), Package("ps", {"net": "pyr", "smc": 1}), g)
+        P = resolve_params(e, gp)
+        yv = e._yearvec(P, g)
+        acc = e.delivery_plan(ug, {"net": "pyr", "smc": 1}, g)["accounting"]
+        dec = [x for x in ev if x["kind"] == "decision" and x["component"] == "net"]
+        his = [x for x in ev if x["kind"] == "history"]
+        rsm = sorted(x["t0"] for x in ev if x["kind"] == "routine" and x["component"] == "smc")
+        rnt = [x["t0"] for x in ev if x["kind"] == "routine" and x["component"] == "net"]
+        ok(dec and dec[0]["t0"] == 2024.0 and dec[0]["charged"] and MM.delivery_contains(dec[0]["t0"], **acc)
+           and his and his[0]["t0"] == 2023.0 and rsm and rsm[0] == 2027.0
+           and not MM.delivery_contains(rsm[0], **acc) and rnt == [float(yv[min(MM.event_steps(yv, [2027.0]))])],
+           f"S15 on the GC7 time vector the decision at d0 is exactly 2024.0 and charged, the past campaign at "
+           f"horizon.start is exactly 2023.0, the first routine SMC round is exactly d1 and uncharged, and the "
+           f"routine net at campaign + 3 is on its executed step ({rnt})")
+        ok(all(x["t0"] < 2029.25 for x in ev) and all(x["t1"] is None or x["t1"] <= 2029.25 for x in ev),
+           f"S15b nothing is listed at or after the window end (last t0 {max(x['t0'] for x in ev):.6f})")
+        # a start off the day grid: d0 and d1 fall between steps; the nearest steps lie after both
+        g2 = DeliveryHorizon(2023.25, 2029.25, (2024.0, 2029.25), {}, delivery=(2024.0, 2027.0))
+        ev2 = e.schedule({"n_agents": 200, "burnin_years": 20}, UnitSpec("t", ug), Package("ps", {"net": "pyr", "smc": 1}), g2)
+        d2 = [x for x in ev2 if x["kind"] == "decision" and x["component"] == "net"]
+        r2 = sorted(x["t0"] for x in ev2 if x["kind"] == "routine" and x["component"] == "smc")
+        ok(d2 and 2024.0 < d2[0]["t0"] < 2024.002 and d2[0]["charged"] and r2 and 2027.0 < r2[0] < 2027.002,
+           f"S15c with an off-grid start, the decision at d0 runs on the next step ({d2[0]['t0'] if d2 else None}) "
+           f"and is charged; the routine round at d1 runs after d1 ({r2[:1]})")
+        # a delivery start between steps whose nearest step lies before it: the sim does not charge the campaign
+        g3 = DeliveryHorizon(2023.0, 2025.0, (2024.0, 2025.0), {}, delivery=(2024.25, 2025.0))
+        u3 = UnitSpec("t", dict(plain, campaign_year=2024.25))
+        o3 = e.run({"n_agents": 300, "burnin_years": 2}, u3, net, g3, 3)
+        why = refused(lambda: e.schedule({"n_agents": 300, "burnin_years": 2}, u3, net, g3))
+        ok(o3.cost_drivers["nets_given"] == 0 and why is not None and "charged" in why,
+           f"S15d a campaign at a delivery start the nearest step precedes is not charged by the sim "
+           f"(nets_given {o3.cost_drivers['nets_given']}), and schedule() fails closed ({why})")
+        # representation: an executed step one ulp-scale off d0 is reported at d0 when it is on d0's side, and
+        # never moved across it
+        dp = e.delivery_plan(ug, {"net": "pyr"}, g)
+        i0 = min(MM.event_steps(yv, [2024.0]))
+        up, dn = yv.copy(), yv.copy()
+        up[i0], dn[i0] = 2024.0 + 1e-12, 2024.0 - 1e-12
+        a = [x for x in e.project_schedule(dp, up, g) if x["kind"] == "decision" and x["component"] == "net"]
+        why2 = refused(lambda: e.project_schedule(dp, dn, g))
+        ok(a and a[0]["t0"] == 2024.0 and a[0]["charged"] and why2 is not None and "charged" in why2,
+           f"S15e a step 1e-12 after d0 is reported exactly at d0; one 1e-12 before it is not charged by the sim's "
+           f"test and is refused, not moved ({why2})")
+    case("S15", s15)
+
 def write_card(path: str) -> None:
     """Engine card (describe() plus every parameter with its kind, range and source) as YAML."""
     e = MalariaEngine()
