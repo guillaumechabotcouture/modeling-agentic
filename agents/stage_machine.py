@@ -1433,6 +1433,14 @@ def render_report(run_dir: str, backend=AB) -> str:
     lines = ["", "<!-- harness: rendered from analysis/analysis.json -->", "## Numbers (rendered by the harness)", "",
              "| quantity | value |", "|---|---|"]
     lines += [f"| {k} | {v:,.4g} |" if isinstance(v, (int, float)) else f"| {k} | {v} |" for k, v in h.items()]
+    try:    # engine parameter values the signed spec sets, each with the card value it replaces (HIGH when outside)
+        from toolkit.spec import engine_parameters as PV
+        sv = PV.report_block(run_dir)
+    except Exception as e:  # noqa: BLE001 -- fail closed: the report says the block could not be rendered
+        sv = ["## Engine parameter values set by the signed spec", "",
+              f"Could not be rendered from analysis/engine.yaml: {type(e).__name__}: {e}", ""]
+    if sv:
+        lines += [""] + sv[:-1]
     try:
         decl = (yaml.safe_load(open(os.path.join(run_dir, "scope_declaration.yaml"))) or {}).get("declarations") or []
     except OSError:

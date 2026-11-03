@@ -22,6 +22,11 @@ places declare priors:
                       for engine parameters of kind `scenario` (for example an achieved coverage) or a
                       `fixed` parameter the card gives no prior. A scenario parameter without one is held
                       at its value, and the interval label says so.
+  spec values         `engine_parameters.<name>` (toolkit/spec/engine_parameters.py) sets a parameter's
+                      point value. With `range` and `dist` it is a prior over that range, with the mode of a
+                      triangular prior at the spec value (origin `spec_value`); it replaces a card prior.
+                      Without, it is held fixed at the spec value (a card prior on it is not drawn) and the
+                      label names it apart: "held fixed at the spec value".
 
 Distributions are bounded, so the emulator design box (toolkit/analysis/batch.py) spans every draw:
 `uniform`, `loguniform` and `triangular` (mode at the engine's point value). A prior is drawn unless
@@ -163,15 +168,18 @@ def kind_excluded(u: dict, kind: str) -> str | None:
     return None
 
 
-def spec_priors(u: dict, engine, card: dict, bound: dict | None = None) -> tuple[dict, list[str]]:
+def spec_priors(u: dict, engine, card: dict, bound: dict | None = None, declared=()) -> tuple[dict, list[str]]:
     """`bound`: the unit attributes the spec binds to data columns ({attribute: column}); a prior on one is refused
-    with its own explanation (docs/design/v2-derived-inputs.md §3.4)."""
+    with its own explanation (docs/design/v2-derived-inputs.md §3.4). `declared`: the parameters whose value the spec
+    sets (engine_parameters); a prior on one is refused there (toolkit/spec/engine_parameters.py), not drawn."""
     specs = {q.name: q for q in engine.parameters()}
     out, bad = {}, []
     sp = u.get("priors") or {}
     if not isinstance(sp, dict):
         return {}, ["uncertainty.priors: a mapping {parameter: {dist, range, source}}"]
     for name, d in sp.items():
+        if name in declared:
+            continue
         ps = specs.get(name)
         if ps is None:
             why = (f"; it is a unit attribute bound to data column {bound[name]}: declare that column's uncertainty "
@@ -193,15 +201,45 @@ def spec_priors(u: dict, engine, card: dict, bound: dict | None = None) -> tuple
     return out, bad
 
 
+def spec_value_priors(spec, engine) -> dict:
+    """{name: Prior} for the spec values that declare a range (engine_parameters: {value, range, dist}): drawn over
+    that range, the mode of a triangular prior at the spec value (toolkit/spec/engine_parameters.py checks them)."""
+    from dataclasses import replace
+    from toolkit.spec import engine_parameters as PV
+    specs = {q.name: q for q in engine.parameters()}
+    out = {}
+    for n, e in PV.declared(spec).items():
+        if not isinstance(e, dict) or e.get("range") is None or n not in specs or not _isnum(e.get("value")):
+            continue
+        pr, _bad = _check_prior(n, {"dist": e.get("dist"), "range": e.get("range"), "source": e.get("source")},
+                                replace(specs[n], value=float(e["value"])), PV.FIELD)
+        if pr:
+            pr.verified, pr.origin = str(e.get("verified", "unverified")), "spec_value"
+            out[n] = pr
+    return out
+
+
+def all_priors(spec, engine, card: dict, sp: dict) -> dict:
+    """Every declared prior: the card's and the spec's, minus the parameters whose value the spec sets, plus the spec
+    values that declare a range (a spec value replaces the card prior: held fixed without a range)."""
+    from toolkit.spec import engine_parameters as PV
+    names = set(PV.declared(spec))
+    out = {k: v for k, v in dict(card["priors"], **sp).items() if k not in names}
+    out.update(spec_value_priors(spec, engine))
+    return out
+
+
 def problems(spec) -> list[str]:
     """Spec-level problems with the priors (needs the engine)."""
+    from toolkit.spec import engine_parameters as PV
     eng = spec.engine()
     u = spec.raw["uncertainty"]
     card = load_card(eng)
     from toolkit.spec.schema import data_bound_attributes
-    sp, bad = spec_priors(u, eng, card, data_bound_attributes(spec.raw.get("decision_units") or {}))
+    sp, bad = spec_priors(u, eng, card, data_bound_attributes(spec.raw.get("decision_units") or {}),
+                          declared=PV.declared(spec))
     bad = card["problems"] + bad
-    allp = set(card["priors"]) | set(sp)
+    allp = set(all_priors(spec, eng, card, sp))
     for name, why in excluded_parameters(u).items():
         if name not in allp:
             bad.append(f"uncertainty.excluded: parameter {name} has no prior (only a prior parameter is excluded by name)")
@@ -226,21 +264,25 @@ def drawn(spec) -> dict:
     u = spec.raw["uncertainty"]
     if kind_excluded(u, "priors"):
         return {}
+    from toolkit.spec import engine_parameters as PV
     eng = spec.engine()
     card = load_card(eng)
-    sp, _ = spec_priors(u, eng, card)
+    sp, _ = spec_priors(u, eng, card, declared=PV.declared(spec))
     exc = excluded_parameters(u)
-    allp = dict(card["priors"], **sp)
+    allp = all_priors(spec, eng, card, sp)
     return {k: allp[k] for k in sorted(allp) if k not in exc}
 
 
 def plan(spec) -> dict:
     """The draw plan: every uncertainty source and every engine parameter, drawn or fixed, with why."""
     from toolkit.spec.schema import UNCERTAINTY_KINDS
+    from toolkit.spec import engine_parameters as PV
     u = spec.raw["uncertainty"]
     eng = spec.engine()
     card = load_card(eng)
-    sp, _ = spec_priors(u, eng, card)
+    sp, _ = spec_priors(u, eng, card, declared=PV.declared(spec))
+    sp = dict(sp, **spec_value_priors(spec, eng))
+    svals, sdecl = PV.values(spec), PV.declared(spec)
     dr = drawn(spec)
     exc = excluded_parameters(u)
     inc = [x.get("kind") for x in u.get("sources") or [] if isinstance(x, dict)]
@@ -253,6 +295,7 @@ def plan(spec) -> dict:
             declared = set(card["priors"]) | set(sp)
             st = "drawn" if dr else "excluded" if (k in kex or declared) else "none_declared"
             why = kex.get(k) or ("" if dr else "; ".join(f"{n} excluded: {exc[n]}" for n in sorted(exc) if n in declared)
+                                 or "; ".join(f"{n} {PV.HELD}" for n in sorted(svals) if n in declared)
                                  or "no prior parameter on the engine card or in the spec")
         else:
             st = "drawn" if k in inc else "excluded"
@@ -265,10 +308,18 @@ def plan(spec) -> dict:
             params.append(dict(asdict(p), range=[p.lo, p.hi], status="drawn", source_kind="priors",
                                identifiability="prior_dominated",
                                basis="the calibration does not condition on it (it moves only "
-                                     f"{', '.join(map(str, moves)) or 'nothing'}); contraction 0"))
+                                     f"{', '.join(map(str, moves)) or 'nothing'}); contraction 0",
+                               **({"spec_value": True, "card_value": ps.value} if p.origin == "spec_value" else {})))
             continue
         row = {"name": ps.name, "kind": ps.kind, "value": ps.value, "units": ps.units}
-        if ps.kind == "fitted":
+        if ps.name in svals:
+            e = sdecl[ps.name]
+            why = (f"; its range is excluded: {exc.get(ps.name) or kex.get('priors')}" if e.get("range") is not None
+                   else "")
+            row.update(status="fixed", value=svals[ps.name], card_value=ps.value, spec_value=True,
+                       source=str(e.get("source") or ""),
+                       reason=f"{PV.HELD} (engine_parameters: {str(e.get('reason') or '').strip()}){why}")
+        elif ps.kind == "fitted":
             on = "engine_parameters" in inc
             row.update(status="drawn" if on else "fixed", source_kind="engine_parameters", range=[ps.lo, ps.hi],
                        dist="uniform", source=ps.source,
@@ -299,11 +350,15 @@ PRIORS_WHAT = "engine parameters with published ranges (engine-card or spec prio
 
 def label_fixed(spec, dr, fixed_rows) -> dict:
     """What the interval label names as held fixed: scenario parameters without a range and parameters excluded by
-    name; the other fixed parameters are counted (each is listed with its reason in the draw plan)."""
+    name; the other fixed parameters are counted (each is listed with its reason in the draw plan). Parameters held
+    at a spec-declared value (engine_parameters) are named apart, as `spec_fixed`."""
     exc = excluded_parameters(spec.raw["uncertainty"])
-    named = sorted(r["name"] for r in fixed_rows if r["status"] == "fixed" and (r["kind"] == "scenario" or r["name"] in exc))
-    other = sum(1 for r in fixed_rows if r["status"] == "fixed" and r["name"] not in named and r["kind"] == "fixed")
-    return {"named": named, "other": other}
+    held = sorted(r["name"] for r in fixed_rows if r["status"] == "fixed" and r.get("spec_value"))
+    named = sorted(r["name"] for r in fixed_rows if r["status"] == "fixed" and r["name"] not in held
+                   and (r["kind"] == "scenario" or r["name"] in exc))
+    other = sum(1 for r in fixed_rows if r["status"] == "fixed" and r["name"] not in named and r["name"] not in held
+                and r["kind"] == "fixed")
+    return {"named": named, "other": other, **({"spec_fixed": held} if held else {})}
 
 
 def _sha(p):

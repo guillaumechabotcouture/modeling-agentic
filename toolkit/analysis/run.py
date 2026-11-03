@@ -120,8 +120,12 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     from toolkit.spec import priors as PRI
     eng_files = [f for f in (getattr(eng, "results_path", None), getattr(eng, "fitted_path", None),
                              PRI.priors_path(eng)) if f and os.path.exists(f)]
-    arts["engine"] = S.write("engine", {"card": card.to_dict(), "parameters": [vars(p) for p in eng.parameters()]},
-                             PRODUCER, [spec_path] + eng_files)
+    from toolkit.spec import engine_parameters as PV
+    eng_data = {"card": card.to_dict(), "parameters": [vars(p) for p in eng.parameters()]}
+    svr = PV.rows(spec, eng)            # spec-declared engine parameter values, with the card values they replace
+    if svr:
+        eng_data["spec_values"] = {r["name"]: {k: v for k, v in r.items() if k != "name"} for r in svr}
+    arts["engine"] = S.write("engine", eng_data, PRODUCER, [spec_path] + eng_files)
     data_in = [spec.resolve(spec["decision_units"]["csv"])]
     if spec["calibration"].get("method") in ("likelihood", "posterior"):
         data_in.append(spec.resolve(spec["calibration"]["targets"]["csv"]))

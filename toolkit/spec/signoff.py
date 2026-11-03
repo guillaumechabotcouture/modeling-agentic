@@ -120,8 +120,9 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
 def sheet(run_dir: str, candidates: list | None = None) -> str:
     """The sign-off sheet (markdown): what signing accepts beyond the spec's text. Each engine default the spec
     accepts by name, with the card's meaning and the spec's reason; the staged columns and tables the derivations
-    do not use, with their reasons; the derivations; and, when given, the candidate engines and why any is
-    ineligible ({ref, eligible, why_not} rows from the pre-sign check)."""
+    do not use, with their reasons; the derivations; each engine parameter value the spec sets, with the card value
+    it replaces and a HIGH note for one outside the card's range; and, when given, the candidate engines and why any
+    is ineligible ({ref, eligible, why_not} rows from the pre-sign check)."""
     import yaml
     path = os.path.join(run_dir, SPEC)
     try:
@@ -165,6 +166,8 @@ def sheet(run_dir: str, candidates: list | None = None) -> str:
     out += ["", "## Derivations"] + [f"- **{d['id']}**: `{d['script']}` reads {len(d['inputs'])} file(s), writes "
                                      + ", ".join(f"`{o}`" for o in d["outputs"]) for d in ders]
     out += [f"- declaration problem: {e}" for e in errs] + [""]
+    from toolkit.spec import engine_parameters as PV
+    out += PV.sheet_lines(raw)          # each spec value, the card value it replaces, and a HIGH note when outside
     if candidates:
         out.append("## Candidate engines (pre-sign check)")
         for r in candidates:

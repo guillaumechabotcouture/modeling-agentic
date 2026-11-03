@@ -129,7 +129,8 @@ class Likelihood:
         self.zrange = list(cal["range"])
 
     def split(self, x: dict):
-        theta = {p: x[p] for p in self.params}
+        from toolkit.spec import engine_parameters as PV
+        theta = PV.params(self.spec, {p: x[p] for p in self.params})   # the spec's engine parameter values under it
         zs = dict(self.fixed_z)
         zs.update({u: x[f"z:{u}"] for u in self.units})
         return theta, zs

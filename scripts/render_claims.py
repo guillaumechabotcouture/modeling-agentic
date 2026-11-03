@@ -174,16 +174,18 @@ def _format_interval(lo: str, hi: str, lo_num: float, hi_num: float) -> str:
 
 _SOURCE_ID_RE = re.compile(r"[a-z][a-z_]{0,40}")
 _PARAM_ID_RE = re.compile(r"[a-z][a-z0-9_]{0,40}")
-INTERVAL_KEYS = {"level", "covers", "excludes", "prior_dominated", "fixed", "fixed_other"}
+INTERVAL_KEYS = {"level", "covers", "excludes", "prior_dominated", "spec_fixed", "fixed", "fixed_other"}
 
 
 def interval_meta_problem(meta) -> str | None:
     """Why an `interval:` block is unusable (None when it is fine): a level in [0.5, 1), and `covers` (non-empty) and
     `excludes` as lists of source identifiers (lower-case letters and underscores, no free text). Optional (v2 priors):
-    `prior_dominated` and `fixed`, lists of parameter identifiers, and `fixed_other`, a count."""
+    `prior_dominated`, `spec_fixed` (held at a spec-declared value) and `fixed`, lists of parameter identifiers, and
+    `fixed_other`, a count."""
     if not isinstance(meta, dict) or set(meta) - INTERVAL_KEYS:
-        return "interval must be a mapping of level, covers, excludes, prior_dominated, fixed and fixed_other only"
-    for k in ("prior_dominated", "fixed"):
+        return ("interval must be a mapping of level, covers, excludes, prior_dominated, spec_fixed, fixed and "
+                "fixed_other only")
+    for k in ("prior_dominated", "spec_fixed", "fixed"):
         v = meta.get(k, [])
         if not isinstance(v, list) or not all(isinstance(x, str) and _PARAM_ID_RE.fullmatch(x) for x in v):
             return f"interval.{k} must be a list of parameter identifiers ([a-z0-9_])"
@@ -210,6 +212,8 @@ def interval_label(meta: dict) -> str:
     lab = f"{float(meta['level']) * 100:g}% UI over {words(meta['covers'])}"
     if meta.get("prior_dominated"):
         lab += f"; set by declared ranges, not by data: {', '.join(meta['prior_dominated'])}"
+    if meta.get("spec_fixed"):
+        lab += f"; held fixed at the spec value: {', '.join(meta['spec_fixed'])}"
     fx, fo = list(meta.get("fixed") or []), int(meta.get("fixed_other") or 0)
     if fx or fo:
         other = f"{fo} {'other ' if fx else ''}engine parameter{'s' if fo != 1 else ''}"

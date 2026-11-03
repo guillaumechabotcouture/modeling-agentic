@@ -58,42 +58,285 @@ from toolkit.engines.empirical.engine import PackageRateEngine  # noqa: E402
 from toolkit.engines.hooks import ToyScheduleEngine  # noqa: E402
 
 FIELD = "engine_parameters"
+KEYS = ("value", "units", "source", "reason", "outside_card_range", "range", "dist", "verified")
+KINDS = ("fixed", "scenario")
+DISTS = ("uniform", "loguniform", "triangular")      # toolkit/spec/priors.py DISTS: bounded, so the design box spans them
+HELD = "held fixed at the spec value"
+HEADING = "## Engine parameter values set by the signed spec"
+
+
+def _raw(spec) -> dict:
+    r = spec.raw if hasattr(spec, "raw") else spec
+    return r if isinstance(r, dict) else {}
+
+
+def _isnum(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def _range(e: dict):
+    rg = e.get("range")
+    return [float(rg[0]), float(rg[1])] if (isinstance(rg, list) and len(rg) == 2 and all(_isnum(x) for x in rg)
+                                            and rg[0] < rg[1]) else None
 
 
 def declared(spec) -> dict:
-    raise NotImplementedError
+    """The field as written ({} when absent or not a mapping; shape_problems reports the latter)."""
+    d = _raw(spec).get(FIELD)
+    return d if isinstance(d, dict) else {}
+
+
+def _entry_shape(n, e) -> list[str]:
+    w = f"{FIELD}.{n}"
+    if not isinstance(e, dict):
+        return [f"{w}: a mapping {{value, source, reason, ...}}"]
+    bad = []
+    unk = sorted(set(map(str, e)) - set(KEYS))
+    if unk:
+        bad.append(f"{w}: unknown keys {unk} (known: {', '.join(KEYS)})")
+    if not _isnum(e.get("value")):
+        bad.append(f"{w}: value must be a finite number")
+    for k, what in (("source", "where the value comes from"), ("reason", "why this run uses it")):
+        if not str(e.get(k) or "").strip():
+            bad.append(f"{w}: {k} ({what}) is empty")
+    if "outside_card_range" in e and not isinstance(e["outside_card_range"], bool):
+        bad.append(f"{w}: outside_card_range is true or false")
+    if "units" in e and not isinstance(e["units"], str):
+        bad.append(f"{w}: units is text")
+    if e.get("range") is not None:
+        rg = _range(e)
+        if rg is None or (_isnum(e.get("value")) and not rg[0] <= float(e["value"]) <= rg[1]):
+            bad.append(f"{w}: range [lo, hi] with lo < hi containing the value")
+        if e.get("dist") not in DISTS:
+            bad.append(f"{w}: dist (one of {', '.join(DISTS)}) is required with range")
+        elif e["dist"] == "loguniform" and rg is not None and rg[0] <= 0:
+            bad.append(f"{w}: a loguniform range must be positive")
+    elif "dist" in e:
+        bad.append(f"{w}: dist without range (give range [lo, hi], or drop dist: the value is then held fixed)")
+    return bad
 
 
 def shape_problems(spec) -> list[str]:
-    raise NotImplementedError
+    """Checks that need no engine (also the sign-off checks of an engine: auto spec before the choice)."""
+    raw = _raw(spec)
+    if raw.get(FIELD) is None:
+        return []
+    if not isinstance(raw[FIELD], dict):
+        return [f"{FIELD}: a mapping {{parameter: {{value, source, reason, ...}}}}"]
+    bad = []
+    for n, e in raw[FIELD].items():
+        bad += _entry_shape(n, e)
+    pri = (raw.get("uncertainty") or {}).get("priors") if isinstance(raw.get("uncertainty"), dict) else None
+    for n in raw[FIELD]:
+        if isinstance(pri, dict) and n in pri:
+            bad.append(f"uncertainty.priors: {n} has its value in {FIELD}; declare its range there "
+                       f"({FIELD}.{n}.range and dist)")
+    return bad
+
+
+def card_range(engine, name):
+    """The engine card's range of a parameter: its own lo/hi, else its engine-card prior's range (None: none)."""
+    ps = {p.name: p for p in engine.parameters()}.get(name)
+    if ps is None:
+        return None
+    if ps.lo is not None and ps.hi is not None:
+        return [float(ps.lo), float(ps.hi)]
+    from toolkit.spec import priors as PRI
+    pr = PRI.load_card(engine)["priors"].get(name)
+    return [float(pr.lo), float(pr.hi)] if pr else None
 
 
 def problems(spec, engine) -> list[str]:
-    raise NotImplementedError
+    """Every problem with the field on this engine (empty: valid)."""
+    bad = shape_problems(spec)
+    card = engine.describe()
+    specs = {p.name: p for p in engine.parameters()}
+    for n, e in declared(spec).items():
+        w = f"{FIELD}.{n}"
+        if not isinstance(e, dict):
+            continue
+        ps = specs.get(n)
+        if ps is None:
+            why = ("; it is a unit attribute of the engine: bind it in decision_units.engine_attributes"
+                   if n in (card.unit_attributes or {}) else "")
+            bad.append(f"{w}: not an engine parameter of {card.name}{why}")
+            continue
+        if ps.kind not in KINDS:
+            bad.append(f"{w}: of kind {ps.kind}; a spec value is for a fixed or scenario parameter (fitted and "
+                       "calibrated values come from fitting)")
+            continue
+        if isinstance(e.get("units"), str) and e["units"].strip() != (ps.units or ""):
+            bad.append(f"{w}: units {e['units']!r} differ from the engine card's {ps.units or ''!r}")
+        if not _isnum(e.get("value")):
+            continue
+        v, rg, cr = float(e["value"]), _range(e), card_range(engine, n)
+        flag = e.get("outside_card_range") is True
+        pts = [v] + (rg or [])
+        outside = cr is not None and any(x < cr[0] or x > cr[1] for x in pts)
+        what = "value" + (" or its range" if rg else "")
+        if cr is None:
+            if flag:
+                bad.append(f"{w}: outside_card_range is set but the engine card gives no range for {n}")
+        elif outside and not flag:
+            bad.append(f"{w}: the {what} ({v:g}{f', range [{rg[0]:g}, {rg[1]:g}]' if rg else ''}) is outside the "
+                       f"engine card's range [{cr[0]:g}, {cr[1]:g}]; set outside_card_range: true with the reason (it is "
+                       "then a HIGH note on the sign-off sheet, in results.md and in the report)")
+        elif flag and not outside:
+            bad.append(f"{w}: outside_card_range is true but the {what} lies inside the card's range "
+                       f"[{cr[0]:g}, {cr[1]:g}]")
+    return bad
 
 
 def values(spec) -> dict:
-    raise NotImplementedError
+    """{parameter: spec value} for every entry with a numeric value."""
+    return {str(n): float(e["value"]) for n, e in declared(spec).items() if isinstance(e, dict) and _isnum(e.get("value"))}
 
 
 def held_fixed(spec) -> dict:
-    raise NotImplementedError
+    """{parameter: spec value} for the entries without a range (never drawn)."""
+    return {n: v for n, v in values(spec).items() if declared(spec)[n].get("range") is None}
 
 
 def tested_boxes(spec) -> dict:
-    raise NotImplementedError
+    """{parameter: [lo, hi]} for each held spec value that a parameter_value decision test varies: the box spans the
+    spec value and the tested values (the emulator design input; the draws keep the spec value)."""
+    held = held_fixed(spec)
+    out = {}
+    for dt in ((_raw(spec).get("analysis") or {}).get("decision_tests") or []):
+        if not isinstance(dt, dict) or dt.get("type") != "parameter_value" or dt.get("parameter") not in held:
+            continue
+        vs = [float(x) for x in dt.get("values") or [] if _isnum(x)]
+        if vs:
+            lo, hi = out.get(dt["parameter"], [held[dt["parameter"]]] * 2)
+            out[dt["parameter"]] = [min(lo, *vs), max(hi, *vs)]
+    return {k: v for k, v in sorted(out.items()) if v[0] < v[1]}
 
 
 def params(spec, theta=None) -> dict:
-    raise NotImplementedError
+    """The one application: the spec values, with `theta` applied over them (a draw or a decision test that sets the
+    parameter wins). Without the field this is `theta` unchanged."""
+    out = values(spec)
+    out.update(theta or {})
+    return out
 
 
 def rows(spec, engine) -> list[dict]:
-    raise NotImplementedError
+    """One row per spec value, for the engine artifact and the reports: the value, the card value it replaces and the
+    card's range, the source and reason, the outside flag and how the uncertainty draws treat it."""
+    if not declared(spec):
+        return []
+    from toolkit.spec import priors as PRI
+    specs = {p.name: p for p in engine.parameters()}
+    dr = PRI.drawn(spec) if hasattr(spec, "raw") else {}
+    out = []
+    for n, v in values(spec).items():
+        e, ps = declared(spec)[n], specs.get(n)
+        if ps is None:
+            continue
+        rg = _range(e)
+        if n in dr:
+            unc = f"drawn over [{dr[n].lo:g}, {dr[n].hi:g}] ({dr[n].dist})"
+        elif rg:
+            unc = f"{HELD} (its range is excluded from the draws)"
+        else:
+            unc = HELD
+        out.append({"name": n, "value": v, "units": str(e.get("units") or ps.units or ""), "card_value": float(ps.value),
+                    "card_kind": ps.kind, "card_range": card_range(engine, n), "card_source": ps.source,
+                    "outside_card_range": e.get("outside_card_range") is True, "source": str(e.get("source")).strip(),
+                    "reason": str(e.get("reason")).strip(), "uncertainty": unc})
+    return out
+
+
+def _g(x) -> str:
+    return "none" if x is None else f"{float(x):.6g}"
+
+
+def markdown(rws: list[dict], heading: str = HEADING, ref=None) -> list[str]:
+    """The block results.md and the report show. `ref(name, key)`: a claim reference for a number (results.md), or
+    None for the number itself (the harness-rendered report block)."""
+    if not rws:
+        return []
+    num = (lambda r, k, x: (ref(r["name"], k) if ref else None) or _g(x))  # noqa: E731
+    L = [heading, "",
+         "The signed spec sets these engine parameter values for every engine evaluation of the run (the point "
+         "outcomes, the uncertainty draws, the decision tests, stability and trajectories). Each replaces the engine "
+         "card's value; it is not an engine change and not a fit.", "",
+         "| Parameter | Spec value | Card value it replaces | Card range | Uncertainty | Source | Reason |",
+         "|---|---|---|---|---|---|---|"]
+    for r in rws:
+        u = f" {r['units']}" if r["units"] else ""
+        cr = r["card_range"]
+        rng = f"{num(r, 'card_lo', cr[0] if cr else None)} to {num(r, 'card_hi', cr[1] if cr else None)}{u}" if cr \
+            else "none on the card"
+        L.append(f"| {r['name']} | {num(r, 'value', r['value'])}{u} | {num(r, 'card_value', r['card_value'])}{u} | "
+                 f"{rng} | {r['uncertainty']} | {r['source']} | {r['reason']} |")
+    flagged = [r for r in rws if r["outside_card_range"]]
+    if flagged:
+        L.append("")
+    for r in flagged:
+        u = f" {r['units']}" if r["units"] else ""
+        cr = r["card_range"] or [None, None]
+        L.append(f"- **HIGH**: {r['name']} = {num(r, 'value', r['value'])}{u} is outside the engine card's range "
+                 f"({num(r, 'card_lo', cr[0])} to {num(r, 'card_hi', cr[1])}{u}). The owner signed it "
+                 "(outside_card_range: true); its reason is in the table.")
+    return L + [""]
 
 
 def report_block(run_dir: str) -> list[str]:
-    raise NotImplementedError
+    """The report's harness block, from the run's engine artifact (analysis/engine.yaml `spec_values`)."""
+    import yaml
+    p = os.path.join(run_dir, "analysis", "engine.yaml")
+    if not os.path.exists(p):
+        return []
+    sv = ((yaml.safe_load(open(p, encoding="utf-8")) or {}).get("data") or {}).get("spec_values") or {}
+    return markdown([dict(r, name=n) for n, r in sv.items()], HEADING + " (rendered by the harness)")
+
+
+def sheet_lines(raw: dict) -> list[str]:
+    """The sign-off sheet's section: each value with its source and reason, the card value and range of each engine
+    the spec may run (the engine, or each candidate of engine: auto), and a HIGH note for a value outside a card's
+    range (the owner accepts it by signing)."""
+    from toolkit.spec import schema
+    out = ["## Engine parameter values set by the spec"]
+    ents = declared(raw)
+    if not ents:
+        return out + ["None: the run uses the engine card's values.", ""]
+    eng = raw.get("engine")
+    if isinstance(eng, dict) and eng.get("ref"):
+        refs = [(eng["ref"], eng)]
+    else:
+        refs = [(r, {"ref": r}) for r in ((eng or {}).get("candidates") or [] if isinstance(eng, dict) else [])]
+    engines = {}
+    for ref, decl in refs:
+        try:
+            engines[ref] = schema.load_engine(decl)
+        except Exception as e:  # noqa: BLE001 -- the sheet still shows the spec's entries
+            engines[ref] = e
+    high = []
+    for n, e in ents.items():
+        if not isinstance(e, dict):
+            continue
+        u = f" {e['units']}" if isinstance(e.get("units"), str) and e["units"] else ""
+        rg = _range(e)
+        unc = f"drawn over [{rg[0]:g}, {rg[1]:g}] ({e.get('dist')})" if rg else HELD
+        val = _g(e["value"]) if _isnum(e.get("value")) else repr(e.get("value"))
+        out.append(f"- **{n}** = {val}{u}. Source: {e.get('source')}. Reason: {e.get('reason')}. Uncertainty: {unc}.")
+        for ref, en in engines.items():
+            if isinstance(en, Exception):
+                out.append(f"  - `{ref}`: card not loaded ({type(en).__name__}: {en})")
+                continue
+            ps = {p.name: p for p in en.parameters()}.get(n)
+            if ps is None:
+                out.append(f"  - `{ref}`: not a parameter of this engine (the engine is ineligible)")
+                continue
+            cr = card_range(en, n)
+            out.append(f"  - `{ref}`: card value {_g(ps.value)}{u} ({ps.kind}; {ps.source}); card range "
+                       + (f"{_g(cr[0])} to {_g(cr[1])}{u}" if cr else "none"))
+            if cr and _isnum(e.get("value")) and any(x < cr[0] or x > cr[1] for x in [float(e["value"])] + (rg or [])):
+                high.append(f"- **HIGH**: {n} = {val}{u} is outside the card range of `{ref}` ({_g(cr[0])} to "
+                            f"{_g(cr[1])}{u}; outside_card_range: {str(e.get('outside_card_range') is True).lower()}). "
+                            "Signing accepts it; its source and reason are above.")
+    return out + ([""] + high if high else []) + [""]
 
 
 # --------------------------------------------------------------------------- toy engines (self-tests)
@@ -217,7 +460,7 @@ def _self_test() -> int:
                 "EP6c the flag on a value inside the card's range is refused")
             bad({"synergy": dict(good, value=0.1, outside_card_range=True)}, "gives no range",
                 "EP6d the flag on a parameter whose card gives no range is refused")
-            bad({"base": dict(good, range=[0.5, 0.6], dist="uniform")}, "containing the value",
+            bad({"base": dict(good, range=[0.56, 0.6], dist="uniform")}, "containing the value",
                 "EP7a a range that excludes the value is refused")
             bad({"base": dict(good, range=[0.45, 0.6])}, "dist", "EP7b a range without its distribution is refused")
             bad({"base": dict(good, range=[0.3, 0.6], dist="uniform")}, "outside_card_range",

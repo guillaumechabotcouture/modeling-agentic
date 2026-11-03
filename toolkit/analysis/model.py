@@ -97,7 +97,15 @@ class EmulatorModel:
         if extra:
             raise ValueError(f"emulator design: its prior inputs {extra} are not drawn by this spec; rebuild the batch "
                              "from toolkit/analysis/batch.py design() so the design and the draws agree")
-        self.param_names = list(self.fitted_names) + self.prior_names
+        # held spec values a parameter_value test varies (toolkit/spec/engine_parameters.py): design inputs too
+        from toolkit.spec import engine_parameters as PV
+        self.spec_names = list(design.get("spec_value_names") or [])
+        want_s = list(PV.tested_boxes(spec))
+        if self.spec_names != want_s:
+            raise ValueError(f"emulator design: its spec-value inputs {self.spec_names} are not the held spec values "
+                             f"this spec's decision tests vary {want_s}; rebuild the batch from "
+                             "toolkit/analysis/batch.py design()")
+        self.param_names = list(self.fitted_names) + self.prior_names + self.spec_names
         self.packages = design["packages"]
         self.comp = spec.comparator
         self.pops = spec["decision_units"]["populations"]
@@ -116,6 +124,7 @@ class EmulatorModel:
         self.input_names = ["z"] + self.param_names + list(self.features)
         fr = {q.name: (q.lo, q.hi) for q in spec.engine().parameters() if q.kind == "fitted"}
         fr.update({k: (p.lo, p.hi) for k, p in want.items()})
+        fr.update({k: tuple(v) for k, v in (design.get("spec_value_ranges") or {}).items()})
         fr.update({k: tuple(v) for k, v in (design.get("design_ranges") or {}).items() if k in fr})   # test values
         zr = spec["calibration"]["range"]
         npar = len(self.param_names)
