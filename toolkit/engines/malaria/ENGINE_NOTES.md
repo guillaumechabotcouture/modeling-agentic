@@ -15,9 +15,12 @@ of these, so the pack's results, fit, equilibration and guess-sensitivity files 
 Their identity fields were re-stamped three times by `benchmarks/restamp_proof.py`:
 - for v0.6, after the proof found v0.5 and v0.6 outputs identical;
 - for v0.7, after it found v0.6 and v0.7 outputs identical;
-- for v0.8, after it found v0.7 and v0.8 outputs identical (run on a Coiled VM in the IDM default workspace).
+- for v0.8, after it found v0.7 (bf24d1b) and v0.8 outputs identical in 22 of 22 cases (run on a Coiled VM in
+  the IDM default workspace).
 
-All three proofs ran on the pack's settings and the evidence cases (`benchmarks/restamp_proof.yaml` holds the latest).
+All three proofs ran on the pack's settings and the evidence cases; the v0.8 proof also ran three pinned scenarios
+with a delivery period, routine nets and SMC, boundary dates and heterogeneous batches
+(`benchmarks/restamp_proof.yaml` holds the latest).
 Each file's `restamped:` record holds the v0.8 re-stamp, with the v0.7 and v0.6 records under `previous`. A Coiled run
 of `validate_once.sh` is open until it confirms them.
 
