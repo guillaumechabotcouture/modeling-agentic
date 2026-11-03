@@ -142,6 +142,12 @@ def _self_test() -> int:
        and callable(resolve("calibrator", "toolkit.analysis.calibration:posterior"))
        and resolve("engine", "toolkit.spec.priors:ToyPriorEngine").__name__ == "ToyPriorEngine",
        "IG2 the shipped engines, oracles and calibrator resolve")
+    try:
+        resolve("engine", "toolkit.engines.malaria.benchmarks.render_notes:write")
+        r4 = "resolved"
+    except ImportRefused:
+        r4 = "refused"
+    ok(r4 == "refused", f"IG4 the engine policy resolves only classes with the Engine contract, not a function ({r4})")
     import types
     sys.modules["_ig_test_mod"] = types.ModuleType("_ig_test_mod")
     sys.modules["_ig_test_mod"].f = lambda: 1

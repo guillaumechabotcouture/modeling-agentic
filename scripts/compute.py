@@ -3114,6 +3114,20 @@ def _self_test() -> int:
         _self_test_infra(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"IR: {type(e).__name__}: {e}")
+    # CF-RW3 (round 4, P1-2): a batch's results, summary and journal never follow a planted link or .tmp
+    with tempfile.TemporaryDirectory() as rd, tempfile.TemporaryDirectory() as out_:
+        os.makedirs(os.path.join(rd, "models"))
+        open(os.path.join(rd, "models", "m.py"), "w").write("def f(p):\n    return {'y': p['x']}\n")
+        victim = os.path.join(out_, "v")
+        open(victim, "w").write("untouched")
+        o = os.path.join(rd, "models", "r.jsonl")
+        for suffix in (".tmp", ".summary.json.tmp", PARTIAL_EXT + ".tmp"):
+            os.symlink(victim, o + suffix)
+        try:
+            run_map(rd, "models/m.py::f", [{"x": 1}], o, backend="local", max_workers=1)
+        except (ValueError, OSError):
+            pass
+        ok(open(victim).read() == "untouched", "CF-RW3 run_map writes nothing through a planted .tmp link")
     # CF-RW1/2 (run console review round 3, P1-3): a confined fingerprint reads through no-follow fds and equals the
     # default one on a tree with no links; the default is unchanged
     with tempfile.TemporaryDirectory() as rd, tempfile.TemporaryDirectory() as out:

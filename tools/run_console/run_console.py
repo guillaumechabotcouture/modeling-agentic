@@ -2951,6 +2951,8 @@ def _self_test() -> int:
         _self_test_review2(ok, tr2)
     with tempfile.TemporaryDirectory() as tr3:
         _self_test_review3(ok, tr3)
+    with tempfile.TemporaryDirectory() as tr4:
+        _self_test_review4(ok, tr4)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -2998,6 +3000,52 @@ def _attr_interpolations(src: str) -> list:
 
 _SAFE_ATTR = re.compile(r"^\s*(?:esc|ref|q)\(")
 _LIT_TERNARY = re.compile(r"""^[^?`$]*\?\s*("[^"]*"|'[^']*')\s*:\s*("[^"]*"|'[^']*')\s*$""")
+
+
+def _self_test_review4(ok, td: str) -> None:
+    """RY5-RY6: Codex review round 4 of PR #129 (the console's part)."""
+    def case(name, fn):
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001
+            ok(False, f"{name}: {type(e).__name__}: {str(e)[:300]}")
+
+    # RY5 every feedback control and the composer are bound to the run they were taken in
+    def ry5():
+        src = _page_sources()
+        agree = src[src.index('case "agree"'):][:600]
+        rec = src[src.index('$("record").onclick'):][:900]
+        snd = src[src.index('$("send").onclick'):][:1200]
+        ok("R.run" in agree and "S.anchorRun" in rec and "S.anchorRun" in snd,
+           "RY5a agree, record and send post to the run the control or the anchor was taken in, and refuse another")
+        a, b = _toy_run(os.path.join(td, "ry5", "a")), _toy_run(os.path.join(td, "ry5", "b"))
+        card = next(c for c in read_run(a)["cards"] if c["kind"] == "blocker")
+        con = Console([os.path.join(td, "ry5")], log=lambda *a: None)
+        try:
+            con.handle("POST", "/api/feedback", {}, {"run": b, "kind": "approval", "layer": "critique", "text": "x",
+                                                      "anchor": card["anchor"], "evidence": card["snapshot"]})
+            r = "accepted"
+        except ValueError as e:
+            r = str(e)
+        ok(r != "accepted" and not read_jsonl_rel(b, FEEDBACK)[0],
+           f"RY5b the server refuses a snapshot from another run instead of substituting fresh evidence ({r[:80]})")
+    case("RY5", ry5)
+
+    # RY6 a figure is served by the hash its snapshot recorded
+    def ry6():
+        d = _toy_run(os.path.join(td, "ry6", "a"))
+        fig = next(c for c in read_run(d)["cards"] if c["kind"] == "figure")
+        open(os.path.join(d, "figures", "plan.png"), "wb").write(b"\x89PNG\r\n\x1a\nCHANGED")
+        con = Console([os.path.join(td, "ry6")], log=lambda *a: None)
+        try:
+            con.handle("GET", "/api/file", {"run": [d], "path": ["figures/plan.png"], "sha": [fig["snapshot"]["sha256"]]}, {})
+            r = "served"
+        except ValueError as e:
+            r = str(e)
+        src = _page_sources()
+        ok(r != "served" and "sha:" in src[src.index("function renderFigures"):][:1200],
+           f"RY6 /api/file refuses a figure whose bytes differ from the snapshot's hash; the page asks by hash ({r[:80]})")
+    case("RY6", ry6)
 
 
 def _self_test_review3(ok, td: str) -> None:
@@ -3058,10 +3106,16 @@ def _self_test_review3(ok, td: str) -> None:
         a, b = _toy_run(os.path.join(td, "rx6", "a")), _toy_run(os.path.join(td, "rx6", "b"))
         card = next(c for c in read_run(a)["cards"] if c["kind"] == "blocker" and c["blocker_id"] == "T-001")
         snap = card.get("snapshot") or card.get("evidence") or {}
-        row = append_feedback(b, {"kind": "correction", "layer": "critique", "text": "x", "anchor": card["anchor"],
-                                  "evidence": snap})
-        ok((row.get("evidence") or {}).get("captured") == "submit" and snap.get("run"),
-           f"RX6a a snapshot sealed for another run is not stored as this run's ({(row.get('evidence') or {}).get('captured')})")
+        n_before = len(read_jsonl_rel(b, FEEDBACK)[0])
+        try:
+            append_feedback(b, {"kind": "correction", "layer": "critique", "text": "x", "anchor": card["anchor"],
+                                "evidence": snap})
+            refused = False
+        except ValueError:
+            refused = True
+        ok(refused and snap.get("run") and len(read_jsonl_rel(b, FEEDBACK)[0]) == n_before,
+           f"RX6a feedback carrying a snapshot sealed for another run is refused, never re-captured (round 4) "
+           f"({refused})")
         src = _page_sources()
         sel = src[src.index("async function selectRun"):][:400]
         ok("setAnchor(null" in sel, "RX6b selecting another run clears the composer's anchor and snapshot")
@@ -3266,10 +3320,13 @@ def _self_test_review2(ok, td: str) -> None:
         ok(ev.get("sha256") == before and got.get("sha256") == before and "omits one source" in (got.get("excerpt") or "")
            and got.get("round") == 1, f"RW9a feedback keeps the evidence the card was rendered with ({got})")
         forged = dict(ev, excerpt="forged", mac="0" * 64)
-        row = append_feedback(d, {"kind": "correction", "layer": "critique", "text": "no", "anchor": b["anchor"],
-                                  "evidence": forged})
-        ok((row.get("evidence") or {}).get("excerpt") != "forged",
-           "RW9b an evidence snapshot the server did not issue is not stored as such")
+        try:
+            row = append_feedback(d, {"kind": "correction", "layer": "critique", "text": "no", "anchor": b["anchor"],
+                                      "evidence": forged})
+        except ValueError:
+            row = {"refused": True}
+        ok(row.get("refused") or (row.get("evidence") or {}).get("excerpt") != "forged",
+           "RW9b an evidence snapshot the server did not issue is not stored as such (round 4: refused)")
         opens, real = [], builtins.open
         builtins.open = lambda f, *a, **k: (opens.append(f) if str(f).endswith("critique_domain.yaml") else None) \
             or real(f, *a, **k)

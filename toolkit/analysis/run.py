@@ -530,6 +530,23 @@ def _self_test() -> int:
         ok(contract.gate_findings(d) == [], f"D6 contract checks pass on the direct path: {contract.gate_findings(d)}")
     _self_test_priors(ok, q)
     _self_test_posterior(ok, q)
+    # AR-RW1 (run console review round 4, P1-2): artifacts and the manifest never follow a link or a planted .tmp
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as d, _tf.TemporaryDirectory() as out:
+        open(os.path.join(out, "v"), "w").write("untouched")
+        os.makedirs(os.path.join(d, "analysis"))
+        os.symlink(os.path.join(out, "v"), os.path.join(d, "analysis", "point.yaml"))
+        st_ = Store(d, None, False, {})
+        os.symlink(os.path.join(out, "v"), os.path.join(d, "analysis", "manifest.json.tmp"))
+        for fn in (lambda: st_.write("point", {k: 0 for k in __import__("toolkit.analysis.artifacts", fromlist=["KINDS"]
+                                                                         ).KINDS["point"]}, "t"),
+                   lambda: st_.finalize("blocked", "t")):
+            try:
+                fn()
+            except (ValueError, OSError):
+                pass
+        ok(open(os.path.join(out, "v")).read() == "untouched",
+           "AR-RW1 an analysis artifact and the manifest are not written through a link or a planted .tmp")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

@@ -2109,6 +2109,20 @@ def _self_test() -> int:
             pass
         ok(open(os.path.join(o72, "v")).read() == "untouched",
            "T72 the sign-off sheet is published without following a link (round 3, P1-2)")
+        # T73 (round 4, P1-2): run_state.json and the machine's records never follow a planted .tmp link
+        d73, o73 = os.path.join(td, "t73"), os.path.join(td, "t73out")
+        os.makedirs(d73)
+        os.makedirs(o73)
+        open(os.path.join(o73, "v"), "w").write("untouched")
+        os.symlink(os.path.join(o73, "v"), os.path.join(d73, STATE_FILE + ".tmp"))
+        os.symlink(os.path.join(o73, "v"), os.path.join(d73, "rec.json.tmp"))
+        for fn in (lambda: save_state(d73, RunState(question="q", state="SPEC")), lambda: _write_json(d73, "rec.json", {})):
+            try:
+                fn()
+            except (ValueError, OSError):
+                pass
+        ok(open(os.path.join(o73, "v")).read() == "untouched",
+           "T73 save_state and the machine's JSON records do not write through a planted .tmp link")
         d71 = os.path.join(td, "t71")
         os.makedirs(d71)
         _S.toy_spec(d71)

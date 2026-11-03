@@ -455,6 +455,15 @@ def _self_test() -> int:
             ok(True, "L12 an unreadable ledger line fails closed")
         ok(decision_test_result(d, "../x.yaml")["valid"] is False and decision_test_result(d, "nope.yaml")["valid"] is False,
            "L13 a decision test outside the run or missing is invalid")
+    # L14 (run console review round 4, P1-2): the ledger is not written through a planted .tmp link
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+        open(os.path.join(out, "v"), "w").write("untouched")
+        os.symlink(os.path.join(out, "v"), os.path.join(d, LEDGER + ".tmp"))
+        try:
+            save(d, {})
+        except (ValueError, OSError):
+            pass
+        ok(open(os.path.join(out, "v")).read() == "untouched", "L14 the ledger is not written through a planted .tmp link")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

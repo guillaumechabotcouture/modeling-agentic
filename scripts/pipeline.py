@@ -2412,6 +2412,22 @@ def _self_test() -> int:
     except Exception as e:  # noqa: BLE001 -- before the runner exists (step α) this is the failure
         print(f"FAIL DI derivation tests: {type(e).__name__}: {e}")
         ok(False, f"DI derivation tests: {type(e).__name__}: {e}")
+    # PL-RW3 (round 4, P1-1): retiring outputs of a derivation no longer declared never removes outside the run dir
+    with tempfile.TemporaryDirectory() as root:
+        rd = os.path.join(root, "a", "b", "run")
+        os.makedirs(os.path.join(rd, "data", "derived"))
+        victim = os.path.join(root, "victim.md")
+        open(victim, "w").write("keep me")
+        keep = os.path.join(rd, "data", "derived", "old.csv")
+        open(keep, "w").write("old\n")
+        rel = "data/derived/" + os.path.relpath(victim, os.path.join(rd, "data", "derived"))
+        try:
+            _retire_outputs(rd, {"gone": {"outputs": {rel: "x", "data/derived/old.csv": "y"}}}, {})
+            r = None
+        except NameError as e:
+            r = e
+        ok(r is None and os.path.exists(victim) and not os.path.exists(keep),
+           f"PL-RW3 an old record's ../ output name is not removed outside the run dir; a real retired output is ({r})")
     # PL-RW1/2 (run console review round 3, P1-2): harness publication in a run dir never follows a link
     with tempfile.TemporaryDirectory() as rd, tempfile.TemporaryDirectory() as out:
         victim = os.path.join(out, "victim")

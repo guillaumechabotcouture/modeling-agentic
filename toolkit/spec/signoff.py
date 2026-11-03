@@ -486,6 +486,17 @@ def _self_test() -> int:
             DB._sha, os.path.realpath = real_sha, real_rp
         ok(not isinstance(bad, NameError) and "data/x.csv" in bad and not any("x.csv" in str(h) for h in hashed),
            f"SG23 derivation outputs are hashed through no-follow fds: a linked data/ is a change, never read ({bad})")
+    # SG24 (round 4, P1-4): the sheet is rendered from the same captured spec bytes it records the hash of
+    with tempfile.TemporaryDirectory() as d:
+        schema.toy_spec(d)
+        opens, real_open, real_osopen = [], builtins.open, os.open
+        builtins.open = lambda f, *a, **k: (opens.append(f) if str(f).endswith(SPEC) else None) or real_open(f, *a, **k)
+        os.open = lambda f, *a, **k: (opens.append(f) if str(f).endswith(SPEC) else None) or real_osopen(f, *a, **k)
+        try:
+            write_sheet(d)
+        finally:
+            builtins.open, os.open = real_open, real_osopen
+        ok(len(opens) == 1, f"SG24 write_sheet reads the spec once and renders and hashes those bytes ({len(opens)})")
     # DI6, DI7, DI10 (docs/design/v2-derived-inputs.md): the sign-off freezes the derivation record, and the sheet
     # shows the owner the accepted defaults and the columns the run chose not to use.
     try:
