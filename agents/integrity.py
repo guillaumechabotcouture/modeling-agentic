@@ -115,9 +115,10 @@ SCRIPT_PRODUCES: dict[str, tuple[str, ...]] = {
                                   # Phase 49 β: the owner's sign-off request.
                                   "scope_signoff_request.json", "scope_signoff_request.json.tmp"),
     "decision_brief.py": ("decision_brief.signoff.json", "decision_brief.yaml", "success_criteria.yaml",
-                          "decision_brief.signed/decision_brief.yaml", "decision_brief.signed/success_criteria.yaml",
-                          # Codex round 2 on #131: with a decision spec, the brief's sign-off freezes its geometry
-                          "data/geometry_signoff.json", "data/geometry_signoff.json.tmp"),
+                          "decision_brief.signed/decision_brief.yaml", "decision_brief.signed/success_criteria.yaml"),
+    # Codex round 3 on #131: no script an agent runs is credited with the geometry records (data/geometry_signoff.json,
+    # data/input_checks.json). A grant covers the whole Bash call, so a harmless `decision_brief.py status && helper`
+    # would cover a forged approval. Any change to them during an agent's call is a violation.
     "cross_model_critic.py": ("critique_crossmodel.yaml", "critique_crossmodel.yaml.tmp",
                               "critique_crossmodel.md"),
     "eligibility_probe.py": ("models/eligibility_probe.yaml",),

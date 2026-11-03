@@ -2485,11 +2485,12 @@ def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["--self-test"]:
         return _self_test()
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 allow_abbrev=False)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    s1 = sub.add_parser("status")
+    s1 = sub.add_parser("status", allow_abbrev=False)
     s1.add_argument("run_dir")
-    s2 = sub.add_parser("sign")
+    s2 = sub.add_parser("sign", allow_abbrev=False)
     s2.add_argument("run_dir")
     s2.add_argument("--by", choices=["owner"], required=True)
     s2.add_argument("--note", default="")

@@ -610,9 +610,49 @@ _OWNER_COMMANDS = tuple(re.compile(p, re.S) for p in (
     r"\bstage_machine(?:\.py)?\b.*\bsign\b",                        # agents/stage_machine.py sign --by owner
     r"\bsignoff(?:\.py)?\b.*\bsign\b",                              # toolkit/spec/signoff.py sign
     r"\bscope_signoff(?:\.py)?\b.*\bsign\b",                        # scripts/scope_signoff.py sign
-    r"\bdecision_brief(?:\.py)?\b.*\bsign\b.*--by(?:=|\s+)['\"]?owner",
     r"\b(?:signoff|stage_machine|decision_brief|scope_signoff)\b.*\bsign\s*\(",
 ))
+_BRIEF_NAMES = ("decision_brief.py", "decision_brief")
+
+
+def _brief_parser():
+    """scripts/decision_brief.py's own argument parser (Codex round 3 on #131: parse, never regex, the one owner
+    command an agent may run in a restricted form)."""
+    scripts = os.path.join(REPO_ROOT, "scripts")
+    if scripts not in __import__("sys").path:
+        __import__("sys").path.insert(0, scripts)
+    import decision_brief
+    return decision_brief.cli_parser()
+
+
+def brief_sign_reason(command: str) -> str | None:
+    """A `decision_brief.py sign` an agent may run: only one that names `--by lead` explicitly, parsed with the CLI's
+    own parser (no abbreviations, no default signer). Anything that mentions the brief together with `sign` but
+    cannot be parsed as such a call is refused (fail closed). The sign-off mode is checked in agents/hooks.py."""
+    import contextlib
+    import io
+    for seg in _shell_tokens(command):
+        if seg in ("(", ")"):
+            continue
+        toks = _tokens(seg)
+        idx = next((i for i, t in enumerate(toks) if os.path.basename(t) in _BRIEF_NAMES
+                    or t.endswith(".decision_brief")), None)
+        if idx is None:
+            if re.search(r"decision_brief", seg) and re.search(r"\bsign\b", seg):
+                return OWNER_COMMAND_DENY
+            continue
+        try:
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                a = _brief_parser().parse_args(toks[idx + 1:])
+        except SystemExit:
+            if "sign" in toks[idx + 1:]:
+                return OWNER_COMMAND_DENY
+            continue
+        except Exception:  # noqa: BLE001 -- the parser could not be loaded: fail closed
+            return OWNER_COMMAND_DENY
+        if a.cmd == "sign" and a.by != "lead":
+            return OWNER_COMMAND_DENY
+    return None
 OWNER_COMMAND_DENY = ("Agents cannot sign or approve for the owner: this is an owner command (spec or brief sign-off "
                       "as owner, scope declarations, geometry approvals). agents cannot sign them; the run waits for "
                       "the owner.")
@@ -620,8 +660,14 @@ OWNER_COMMAND_DENY = ("Agents cannot sign or approve for the owner: this is an o
 
 def owner_command_reason(command: str) -> str | None:
     """Deny reason when a Bash command runs one of the owner's commands (any sign-off mode, any agent). The lead's
-    `decision_brief.py sign --by lead` matches none of them (agents/hooks.py gates it by mode)."""
-    return OWNER_COMMAND_DENY if any(p.search(command) for p in _OWNER_COMMANDS) else None
+    `decision_brief.py sign --by lead` passes brief_sign_reason (agents/hooks.py gates it by mode).
+
+    Defence in depth, not authentication: an agent runs as the same OS user as the owner, so indirect execution
+    (a helper script, a computed name, xargs) can reach these commands. Owner-signed approvals (the next PR after
+    #131) are the boundary: a record without the owner's signature is rejected."""
+    if any(p.search(command) for p in _OWNER_COMMANDS):
+        return OWNER_COMMAND_DENY
+    return brief_sign_reason(command)
 
 
 def bash_reason(command: str, run_path: str, agent_type: str | None,

@@ -817,10 +817,11 @@ def _self_test() -> int:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 allow_abbrev=False)
     ap.add_argument("cmd", nargs="?", choices=["show", "status", "sign"])
     ap.add_argument("run_dir", nargs="?")
-    ap.add_argument("--by", default="owner", choices=["owner"])
+    ap.add_argument("--by", default=None, choices=["owner"])
     ap.add_argument("--answers", help="YAML mapping finding -> accept|decline (or {decision, note})")
     ap.add_argument("--accept-all", action="store_true")
     ap.add_argument("--decline-all", action="store_true")
@@ -844,6 +845,8 @@ def main(argv=None) -> int:
         print("Agents cannot sign scope declarations. Owner: sign from your own shell. Lead (--signoff lead): "
               f"write {LEAD_ANSWERS} and end your turn with AWAITING_SIGNOFF.", file=sys.stderr)
         return 1
+    if a.by is None:
+        ap.error("sign needs --by owner")
     try:
         answers = yaml.safe_load(open(a.answers, encoding="utf-8")) if a.answers else None
         if answers is not None and not isinstance(answers, dict):

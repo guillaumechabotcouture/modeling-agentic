@@ -790,17 +790,17 @@ def sheet_lines(run_dir: str) -> list[str]:
 # --------------------------------------------------------------------------- CLI
 def _main(argv=None) -> int:
     import argparse
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], allow_abbrev=False)
     sub = ap.add_subparsers(dest="cmd")
-    c = sub.add_parser("check")
+    c = sub.add_parser("check", allow_abbrev=False)
     c.add_argument("run_dir")
-    t = sub.add_parser("table")
+    t = sub.add_parser("table", allow_abbrev=False)
     for k in ("boundaries", "feature_id", "units", "id", "lat", "lon"):
         t.add_argument("--" + k.replace("_", "-"), required=True)
     for k in ("crosswalk", "xw_unit", "xw_feature", "area"):
         t.add_argument("--" + k.replace("_", "-"))
     p = sub.add_parser("approve", help="the owner: re-freeze the current geometry inputs and approve the spec's "
-                                       "proposed HIGH exceptions (and --accept ID=REASON)")
+                                       "proposed HIGH exceptions (and --accept ID=REASON)", allow_abbrev=False)
     p.add_argument("run_dir")
     p.add_argument("--by", choices=["owner"], required=True)
     p.add_argument("--accept", action="append", default=[], metavar="ID=REASON")

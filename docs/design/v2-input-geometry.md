@@ -117,7 +117,20 @@ or removing the `boundaries` block, which before this change gave only a LOW not
 `approve`, which re-freezes the current inputs, or by restoring the files. Labels stay unsigned: the
 presentation file's own hash is not frozen. A check that failed cannot be signed over (the sign-off refuses).
 
-**Enforcement and entry points (Codex round 2 on #131).**
+**The tool-hook denial is defence in depth, not authentication.** An agent runs as the same OS user as the
+owner. Command-pattern filtering cannot be a security boundary against that user: a helper script, a computed
+name, `python -c`, `env -S`, `xargs` or a symlinked script reaches the owner's commands and records. The
+boundary is owner signing, which comes in the next PR: owner approvals are signed with a key held only in the
+owner's macOS keychain and verified by the harness, so a `geometry_signoff.json` without a valid signature is
+rejected. Until then:
+- the hook refuses the direct forms;
+- the brief's sign-off is parsed with the CLI's own parser;
+- the owner CLIs take no default signer and no abbreviated flag (`allow_abbrev=False`);
+- no Bash call is credited with writing the geometry records, so a change to them during an agent's call is
+  an integrity violation, found after the fact;
+- the self-tests list the indirect forms as expected failures (SO13b, XFAIL), pointing to the owner-signing PR.
+
+**Enforcement and entry points (Codex rounds 2 and 3 on #131).**
 - `--by owner` is taken on trust; owner authentication is an open decision for the owner. So the owner's
   commands are denied to every agent at the tool hook (`agents/enforcement.py owner_command_reason`, reached
   from the v1 `PreToolUse` hook through `check_tool_use`), in every sign-off mode:
@@ -125,12 +138,15 @@ presentation file's own hash is not frozen. A check that failed cannot be signed
   - `stage_machine.py sign`;
   - `signoff.py sign`;
   - `scope_signoff.py sign`;
-  - `decision_brief.py sign --by owner`.
-- The lead's own `decision_brief.py sign --by lead` in lead mode still works, and so does the read-only
-  `geometry.py check`, which now prints without writing the record.
+  - any `decision_brief.py sign` that does not name `--by lead` explicitly. The hook parses it with
+    `decision_brief.cli_parser()`, so a missing `--by`, an abbreviation (`--b owner`), `--by=owner` or an
+    unparseable call is refused (round 3).
+- `--by lead` passes only in lead mode. The CLIs no longer default `--by` to `owner`.
+- The read-only `geometry.py check` also passes; it now prints without writing the record.
 - `data/geometry_signoff.json`, `data/input_checks.json` and `decision_spec.signoff.json` are in the v1
   `SCRIPT_OUTPUTS`. That denies Write, Edit and shell redirects to them, and the integrity record watches them.
-  Only `decision_brief.py` is credited with writing the geometry record. The v2 tasks have `HARNESS_FILES`.
+  No script is credited with writing the geometry records (round 3: a grant covers the whole Bash call). The
+  v2 tasks have `HARNESS_FILES`.
 - Every spec-signing entry point freezes the geometry: `toolkit/spec/signoff.py sign` (spec only),
   `agents/stage_machine.py sign` (spike) and `scripts/decision_brief.py sign` when the run has a
   `decision_spec.yaml`. A brief-only v1 run is unchanged.
@@ -204,10 +220,13 @@ Run against the boundary file, crosswalk and geography table of the run in §1 (
   cannot accept the run (fail closed).
 - A run signed before this change has no geometry record: that is now HIGH `geometry_record_missing` until
   the owner's `approve` creates the record.
-- **Owner authentication (held for the owner's decision).** The hook denial is a heuristic over the agent's
-  command. A deliberate same-user evasion is outside this threat model, as in Phase 49 (A24): for example,
-  writing the record from code that a harness step later imports. Real proof that `--by owner` is the owner is
-  a separate design.
+- **Owner signing (the next PR; the owner chose it).** Owner approvals will be signed with a key held only in
+  the owner's macOS keychain and verified by the harness. That closes the indirect-execution class listed as
+  XFAIL in SO13b. Until it lands, an agent can still forge a record through indirect execution. The integrity
+  record flags the change after the fact, but nothing prevents it.
+- A v1 lead-mode run that has a decision spec and signs the brief `--by lead` writes the geometry record inside
+  an agent's Bash call. The integrity record then flags that as a violation, because no script is credited
+  with it. v1 runs have no decision spec today. Owner signing will replace this path.
 - The check finds rows whose geometry fields disagree with the boundaries. It cannot tell which other columns
   (population, raster-derived values) came along with the swapped geometry. The finding says they probably
   did, and the fix belongs in the derivation.

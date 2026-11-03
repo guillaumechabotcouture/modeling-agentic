@@ -448,8 +448,10 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
             from agents.integrity import pipeline_builds
             if pipeline_builds(str(tool_input.get("command") or ""), input_data.get("cwd")):
                 deny_reason = PIPELINE_BUILD_DENY
-        if (not deny_reason and signoff == "owner" and tool_name == "Bash"
-                and re.search(r"decision_brief\.py\b.*\bsign\b", str(tool_input.get("command") or ""), re.S)):
+        if (not deny_reason and signoff != "lead" and tool_name == "Bash"
+                and re.search(r"decision_brief\b.*\bsign\b", str(tool_input.get("command") or ""), re.S)):
+            # Codex round 3 on #131: the lead signs the brief (`--by lead`, checked by enforcement with the CLI's
+            # own parser) only in lead mode; in any other mode no agent signs it.
             deny_reason = "The owner signs the decision brief in this run; agents cannot sign it."
         if (not deny_reason and signoff in ("owner", "lead") and tool_name == "Bash"
                 and re.search(r"scope_signoff\.py\b.*\bsign\b", str(tool_input.get("command") or ""), re.S)):

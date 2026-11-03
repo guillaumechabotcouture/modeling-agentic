@@ -947,7 +947,8 @@ def answer_scope(run_dir: str, answers: dict, note: str, confirm: bool, mirror: 
     with os.fdopen(fd, "w") as f:
         yaml.safe_dump(clean, f, sort_keys=True)
     try:
-        return _run([sys.executable, "scripts/scope_signoff.py", "sign", run_dir, "--answers", p, "--note", note],
+        return _run([sys.executable, "scripts/scope_signoff.py", "sign", run_dir, "--by", "owner", "--answers", p,
+                     "--note", note],
                     runner)
     finally:
         os.remove(p)

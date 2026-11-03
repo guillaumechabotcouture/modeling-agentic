@@ -294,12 +294,14 @@ def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["--self-test"]:
         return _self_test()
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(allow_abbrev=False)
     ap.add_argument("action", choices=["status", "sign", "sheet"])
     ap.add_argument("run_dir")
-    ap.add_argument("--by", default="owner", choices=["owner", "lead"])
+    ap.add_argument("--by", default=None, choices=["owner", "lead"])
     ap.add_argument("--note", default="")
     a = ap.parse_args(argv)
+    if a.action == "sign" and a.by is None:
+        ap.error("sign needs --by owner or --by lead")
     if a.action == "status":
         print(status(a.run_dir))
         return 0

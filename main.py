@@ -244,7 +244,7 @@ async def wait_for_signoff(run_path: str, run_dir_rel: str, hours: float, poll_s
         pass
     print(f"\n{'='*60}\nWAITING FOR THE OWNER TO SIGN THE DECISION BRIEF\n"
           f"  Read:  {run_dir_rel}/decision_brief.md\n"
-          f"  Sign:  python3 scripts/decision_brief.py sign {run_dir_rel} --answers <answers.yaml> "
+          f"  Sign:  python3 scripts/decision_brief.py sign {run_dir_rel} --by owner --answers <answers.yaml> "
           f"[--note \"...\"]   (or --accept-proposed)\n"
           f"  Waiting up to {hours:g} h.\n{'='*60}", flush=True)
     with open(os.path.join(run_path, "trace.jsonl"), "a") as tf:
@@ -283,7 +283,7 @@ async def wait_for_scope_signoff(run_path: str, run_dir_rel: str, hours: float, 
         pass
     print(f"\n{'='*60}\nWAITING FOR THE OWNER: SCOPE DECLARATIONS THAT BEAR ON THE DECISION\n"
           f"  Read:  {run_dir_rel}/{scope_signoff.MD}\n"
-          f"  Sign:  python3 scripts/scope_signoff.py sign {run_dir_rel} --answers <answers.yaml> "
+          f"  Sign:  python3 scripts/scope_signoff.py sign {run_dir_rel} --by owner --answers <answers.yaml> "
           f"[--note \"...\"]   (or --accept-all / --decline-all)\n"
           f"  Waiting up to {hours:g} h.\n{'='*60}", flush=True)
     with open(os.path.join(run_path, "trace.jsonl"), "a") as tf:

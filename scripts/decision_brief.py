@@ -866,21 +866,30 @@ def _run_self_test() -> int:
     return 0
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description="Decision brief: show, sign, check")
+def cli_parser() -> argparse.ArgumentParser:
+    """The CLI's arguments. agents/enforcement.py parses agent commands with this same definition (Codex round 3
+    on #131): no abbreviations, and `sign` names its signer explicitly (no default)."""
+    ap = argparse.ArgumentParser(description="Decision brief: show, sign, check", allow_abbrev=False)
     ap.add_argument("cmd", nargs="?", choices=["show", "sign", "status", "restore"])
     ap.add_argument("run_dir", nargs="?")
-    ap.add_argument("--by", default="owner")
+    ap.add_argument("--by", choices=["owner", "lead"], default=None)
     ap.add_argument("--answers", help="YAML mapping Q-id -> answer")
     ap.add_argument("--accept-proposed", action="store_true")
     ap.add_argument("--note", default="")
     ap.add_argument("--self-test", action="store_true")
-    a = ap.parse_args()
+    return ap
+
+
+def main(argv=None) -> int:
+    ap = cli_parser()
+    a = ap.parse_args(argv)
     if a.self_test:
         return _run_self_test()
     if not a.cmd or not a.run_dir:
         ap.print_help()
         return 2
+    if a.cmd == "sign" and a.by is None:
+        ap.error("sign needs --by owner or --by lead")
     if a.cmd == "show":
         print(render_md(a.run_dir))
         return 0
