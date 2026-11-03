@@ -345,6 +345,14 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
     missing = [q["id"] for q in qs if q["id"] not in answers and not accept_proposed]
     if missing:
         raise ValueError("no answer for " + ", ".join(missing) + " (give one, or --accept-proposed)")
+    if os.path.exists(os.path.join(run_dir, DECISION_SPEC)):
+        # Codex round 2 on #131: this sign-off also signs the decision spec, so it freezes the spec's geometry inputs
+        # (and, signed by the owner, approves the spec's proposed HIGH geometry exceptions). Brief-only runs skip it.
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from toolkit.spec import geometry
+        geometry.freeze(run_dir, by)
     record = {
         "signed_by": by, "signed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "note": note,
         "answers": {q["id"]: answers.get(q["id"], q.get("proposed")) for q in qs},

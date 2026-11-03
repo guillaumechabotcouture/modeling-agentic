@@ -103,13 +103,13 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
         raise ValueError("spec not ready: " + "; ".join(errs[:10]))
     if _spec_record(run_dir) is not None:
         raise ValueError("the spec is already signed; a change needs a new sign-off by the owner")
+    if os.path.exists(os.path.join(run_dir, DB.BRIEF)):
+        DB.sign(run_dir, by, answers=answers, note=note, accept_proposed=accept_proposed)   # freezes the geometry too
+        return _freeze_record(run_dir, os.path.join(run_dir, DB.SIGNOFF))
     # The geometry part of the unsigned presentation file and its input hashes are frozen with the spec; an owner's
     # sign-off also approves the HIGH geometry exceptions the spec proposes (docs/design/v2-input-geometry.md §2).
     from toolkit.spec import geometry
     geometry.freeze(run_dir, by)
-    if os.path.exists(os.path.join(run_dir, DB.BRIEF)):
-        DB.sign(run_dir, by, answers=answers, note=note, accept_proposed=accept_proposed)
-        return _freeze_record(run_dir, os.path.join(run_dir, DB.SIGNOFF))
     record = {"signed_by": by, "signed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "note": note,
               "sha256": {SPEC: DB._sha(path), DERIVATIONS_RECORD: DB._sha(os.path.join(run_dir, DERIVATIONS_RECORD))},
               "producer": "toolkit/spec/signoff.py",

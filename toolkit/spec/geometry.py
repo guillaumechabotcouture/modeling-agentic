@@ -2,7 +2,7 @@
 """Input geometry check: the units table's coordinates and areas against declared boundaries, before SIGN and at the
 gate (design: docs/design/v2-input-geometry.md).
 
-    python3 toolkit/spec/geometry.py check <run_dir>      # writes data/input_checks.json, prints the counts
+    python3 toolkit/spec/geometry.py check <run_dir>      # prints the counts (the harness writes the record)
     python3 toolkit/spec/geometry.py table --boundaries B.geojson --feature-id F [--crosswalk X.csv --xw-unit U
         --xw-feature G] --units T.csv --id I --lat LAT --lon LON [--area A]   # ad hoc: prints counts, writes nothing
     python3 toolkit/spec/geometry.py --self-test
@@ -57,6 +57,8 @@ CODES = ("reciprocal_swap", "point_outside_own_polygon", "area_mismatch", "unmat
 FAILED, NOT_RUN, ACCEPT_BAD, EDGE = ("geometry_check_failed", "geometry_check_not_run", "geometry_acceptance_invalid",
                                      "point_near_own_boundary")
 CHANGED = "geometry_inputs_changed_after_signoff"
+MISSING = "geometry_record_missing"       # a signed spec with no geometry sign-off record (Codex round 2 on #131)
+SPEC_SIGNOFFS = ("decision_spec.signoff.json", "decision_brief.signoff.json")   # the spec's own; the brief's
 ACCEPT_KEY = "geometry_accepted"          # in the spec: proposals (a HIGH one counts only once the owner approves it)
 # The harness's geometry sign-off record (written by the sign-off and by `approve --by owner`; no task can write it):
 # the frozen declaration, the input hashes, and the owner's approvals of HIGH exceptions bound to those hashes.
@@ -497,6 +499,24 @@ def _load_signoff(run_dir: str) -> dict | None:
     return doc
 
 
+def _spec_signed(run_dir: str) -> bool:
+    """Is the decision spec signed? Its own sign-off record (toolkit/spec/signoff.py, agents/stage_machine.py), or
+    the brief's when that hashed the spec (scripts/decision_brief.py). A brief-only sign-off is not."""
+    for name in SPEC_SIGNOFFS:
+        p = os.path.join(run_dir, name)
+        if not os.path.exists(p):
+            continue
+        if name == "decision_spec.signoff.json":
+            return True
+        try:
+            doc = json.load(open(p, encoding="utf-8"))
+        except (OSError, ValueError):
+            return True                   # unreadable: assume signed (fail closed: the record must then exist)
+        if not isinstance(doc, dict) or (doc.get("sha256") or {}).get(SPEC_FILE) is not None:
+            return True
+    return False
+
+
 def _declaration(cfg, pres, cols, units) -> dict:
     """The geometry part of the inputs, as declared (paths as written, so a moved run compares equal); labels are not
     part of it."""
@@ -549,6 +569,7 @@ def check(run_dir: str, spec: dict | None = None, th: dict | None = None, use_si
             acc = {}
         acc = acc or {}
         signed = _load_signoff(run_dir) if use_signoff else None
+        rep["record_missing"] = bool(use_signoff and signed is None and _spec_signed(run_dir))
         cfg, pres = presentation_boundaries(run_dir)
         upath = du["csv"] if os.path.isabs(du["csv"]) else os.path.join(run_dir, du["csv"])
         rows = read_table(upath)
@@ -687,6 +708,12 @@ def problems(rep: dict) -> list[dict]:
         out.append({"code": FAILED, "claim": f"the input geometry check could not run on its declared inputs: "
                                              f"{rep.get('reason')}"})
     out += [{"code": ACCEPT_BAD, "claim": p} for p in rep.get("acceptance_problems") or []]
+    if rep.get("record_missing"):
+        out.append({"code": MISSING, "claim": "the decision spec is signed but there is no geometry sign-off record "
+                                              f"({SIGNOFF_FILE}): it was signed before the check existed, or through a "
+                                              "path that skipped it, so its geometry inputs are not frozen. The owner "
+                                              "runs `python3 toolkit/spec/geometry.py approve <run_dir> --by owner` "
+                                              "to freeze them"})
     out += [{"code": CHANGED, "claim": f"the geometry inputs changed after sign-off: {c}; the owner re-approves them "
                                        f"(`python3 toolkit/spec/geometry.py approve <run_dir> --by owner`) or restores "
                                        f"them"} for c in rep.get("signoff_changes") or []]
@@ -702,7 +729,7 @@ def findings(rep: dict) -> list[dict]:
     edge cases. Stage PLAN, as the derivation findings."""
     base = {"stage": "PLAN", "target_stage": "PLAN"}
     out = [dict(base, kind=p["code"], severity="HIGH", scope_declarable=False, key=p["code"], claim=p["claim"])
-           for p in problems(rep) if p["code"] in (FAILED, ACCEPT_BAD, CHANGED)]
+           for p in problems(rep) if p["code"] in (FAILED, ACCEPT_BAD, CHANGED, MISSING)]
     for f in rep.get("findings") or []:
         if f.get("accepted") or f["severity"] not in ("HIGH", "MEDIUM"):
             continue
@@ -792,7 +819,7 @@ def _main(argv=None) -> int:
         run(a.run_dir)
         return 0
     if a.cmd == "check":
-        rep = run(a.run_dir)
+        rep = check(a.run_dir)          # prints only: data/input_checks.json is the harness's (Machine)
     elif a.cmd == "table":
         try:
             feats = read_features({"path": a.boundaries, "feature_id": a.feature_id})

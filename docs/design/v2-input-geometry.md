@@ -117,6 +117,27 @@ or removing the `boundaries` block, which before this change gave only a LOW not
 `approve`, which re-freezes the current inputs, or by restoring the files. Labels stay unsigned: the
 presentation file's own hash is not frozen. A check that failed cannot be signed over (the sign-off refuses).
 
+**Enforcement and entry points (Codex round 2 on #131).**
+- `--by owner` is taken on trust; owner authentication is an open decision for the owner. So the owner's
+  commands are denied to every agent at the tool hook (`agents/enforcement.py owner_command_reason`, reached
+  from the v1 `PreToolUse` hook through `check_tool_use`), in every sign-off mode:
+  - `geometry.py approve`, by path, `-m` module or Python call;
+  - `stage_machine.py sign`;
+  - `signoff.py sign`;
+  - `scope_signoff.py sign`;
+  - `decision_brief.py sign --by owner`.
+- The lead's own `decision_brief.py sign --by lead` in lead mode still works, and so does the read-only
+  `geometry.py check`, which now prints without writing the record.
+- `data/geometry_signoff.json`, `data/input_checks.json` and `decision_spec.signoff.json` are in the v1
+  `SCRIPT_OUTPUTS`. That denies Write, Edit and shell redirects to them, and the integrity record watches them.
+  Only `decision_brief.py` is credited with writing the geometry record. The v2 tasks have `HARNESS_FILES`.
+- Every spec-signing entry point freezes the geometry: `toolkit/spec/signoff.py sign` (spec only),
+  `agents/stage_machine.py sign` (spike) and `scripts/decision_brief.py sign` when the run has a
+  `decision_spec.yaml`. A brief-only v1 run is unchanged.
+- A spec that is signed (its own record, or a brief record that hashes the spec) with no geometry record is
+  `geometry_record_missing` (HIGH, not declarable). The migration path for runs signed before this change is the
+  owner's `approve`, which creates the record.
+
 ## 3. Alternatives considered
 
 - **A check inside `schema.validate`.** This would run at every validation, including once per candidate
@@ -181,8 +202,12 @@ Run against the boundary file, crosswalk and geography table of the run in §1 (
   figures read exterior rings only; this check needs holes).
 - With `--signoff none` there is no sign-off, so a proposed HIGH exception is never approved, and the gate
   cannot accept the run (fail closed).
-- A run signed before this change has no geometry record, so nothing is frozen for it. The first owner
-  `approve` creates the record.
+- A run signed before this change has no geometry record: that is now HIGH `geometry_record_missing` until
+  the owner's `approve` creates the record.
+- **Owner authentication (held for the owner's decision).** The hook denial is a heuristic over the agent's
+  command. A deliberate same-user evasion is outside this threat model, as in Phase 49 (A24): for example,
+  writing the record from code that a harness step later imports. Real proof that `--by owner` is the owner is
+  a separate design.
 - The check finds rows whose geometry fields disagree with the boundaries. It cannot tell which other columns
   (population, raster-derived values) came along with the swapped geometry. The finding says they probably
   did, and the fix belongs in the derivation.

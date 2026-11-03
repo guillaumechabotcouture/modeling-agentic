@@ -91,6 +91,13 @@ SCRIPT_OUTPUTS = (
     "scope_signoff_request.json.tmp",
     "scope_signoff_ledger.json",     # Phase 49 β: the harness's record of the answers (main.py)
     "decision_brief.signed/*",       # the signed copies, for restoring a changed file
+    # v2 input geometry (toolkit/spec/geometry.py; Codex round 2 on #131): the spec's own sign-off, the check's
+    # record and the owner's geometry sign-off (frozen declaration, input hashes, approvals of HIGH exceptions).
+    "decision_spec.signoff.json",
+    "data/input_checks.json",
+    "data/input_checks.json.tmp",
+    "data/geometry_signoff.json",
+    "data/geometry_signoff.json.tmp",
     "acceptance_lock.json",          # Phase 33 α: written by the gate
     "done_when_registry.json",       # Phase 34: frozen finding tests, written by the gate
     "done_when_registry.json.tmp",
@@ -593,10 +600,37 @@ def kill_reason(command: str) -> str | None:
         return None
 
 
+# Codex round 2 on #131: the owner's commands. The CLIs take `--by owner` on trust (owner authentication is an open
+# decision for the owner), so no agent may run them, by script path, module or Python call. The lead signs the
+# decision brief `--by lead` in lead mode; that stays allowed. A heuristic over the whole command, like the others
+# here: it refuses some harmless mentions rather than miss a call.
+_OWNER_COMMANDS = tuple(re.compile(p, re.S) for p in (
+    r"\bgeometry(?:\.py)?\b.*\bapprove\b",                        # toolkit/spec/geometry.py approve
+    r"\bgeometry\b.*\b(?:approve|freeze)\s*\(",                     # geometry.approve(...) / freeze(...)
+    r"\bstage_machine(?:\.py)?\b.*\bsign\b",                        # agents/stage_machine.py sign --by owner
+    r"\bsignoff(?:\.py)?\b.*\bsign\b",                              # toolkit/spec/signoff.py sign
+    r"\bscope_signoff(?:\.py)?\b.*\bsign\b",                        # scripts/scope_signoff.py sign
+    r"\bdecision_brief(?:\.py)?\b.*\bsign\b.*--by(?:=|\s+)['\"]?owner",
+    r"\b(?:signoff|stage_machine|decision_brief|scope_signoff)\b.*\bsign\s*\(",
+))
+OWNER_COMMAND_DENY = ("Agents cannot sign or approve for the owner: this is an owner command (spec or brief sign-off "
+                      "as owner, scope declarations, geometry approvals). agents cannot sign them; the run waits for "
+                      "the owner.")
+
+
+def owner_command_reason(command: str) -> str | None:
+    """Deny reason when a Bash command runs one of the owner's commands (any sign-off mode, any agent). The lead's
+    `decision_brief.py sign --by lead` matches none of them (agents/hooks.py gates it by mode)."""
+    return OWNER_COMMAND_DENY if any(p.search(command) for p in _OWNER_COMMANDS) else None
+
+
 def bash_reason(command: str, run_path: str, agent_type: str | None,
                 cwd: str | None = None) -> str | None:
     """Deny reason for a Bash command, or None."""
     reason = kill_reason(command)
+    if reason:
+        return reason
+    reason = owner_command_reason(command)
     if reason:
         return reason
     if _CHMOD.search(command) and _HARNESS_WORDS.search(command):
