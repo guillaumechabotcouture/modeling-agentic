@@ -2251,6 +2251,9 @@ class Console:
             rel = q.get("path") or ""
             data = read_file_bytes(rd, rel)
             want = q.get("sha") or ""
+            if q.get("bound") and not re.fullmatch(r"[0-9a-f]{64}", want):
+                # a snapshot-bound request names the digest it was rendered with; none means do not serve (round 5)
+                raise ValueError(f"{rel}: a snapshot-bound request needs the figure's sha256; reload the run")
             if want and hashlib.sha256(data).hexdigest() != want:
                 # the page asks for the bytes its snapshot recorded (review round 4, P2-6)
                 raise ValueError(f"{rel} changed since the page was rendered: reload the run")
@@ -3060,7 +3063,7 @@ def _self_test_review4(ok, td: str) -> None:
         except ValueError as e:
             r = str(e)
         src = _page_sources()
-        ok(r != "served" and "sha:" in src[src.index("function renderFigures"):][:1200],
+        ok(r != "served" and "figSrc(" in src[src.index("function renderFigures"):][:1200],
            f"RY6 /api/file refuses a figure whose bytes differ from the snapshot's hash; the page asks by hash ({r[:80]})")
     case("RY6", ry6)
 
