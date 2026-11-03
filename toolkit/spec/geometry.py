@@ -13,7 +13,7 @@ units table is the spec's decision_units.csv; its point and area columns are `de
 area_km2}`, or columns named lat/latitude and lon/lng/long/longitude (the figures' convention) and area_km2. Without
 boundaries or without coordinates the check does not run, and says so ("not run: ...").
 
-Checks (pure Python and json; planar geometry with a cos-latitude scale):
+Checks (pure Python and json; distances on a plane scaled by cos(latitude), areas by equal-area integration):
   reciprocal_swap            HIGH  unit A's point is in B's polygon and B's point is in A's: the two rows'
                                    geometry-derived fields are probably exchanged
   point_outside_own_polygon  HIGH  the point lies farther than edge_tolerance_km outside its own polygon
@@ -23,9 +23,17 @@ Checks (pure Python and json; planar geometry with a cos-latitude scale):
   unmatched                  MEDIUM a unit with no polygon (or no usable point); HIGH a polygon two units claim
 A file that cannot be read or parsed is geometry_check_failed (HIGH): never a silent pass.
 
-A HIGH finding blocks SIGN until the data are fixed or the finding is accepted by name in the signed spec,
-`decision_units.geometry_accepted: {<finding id>: "<reason>"}` (the defaults_accepted pattern; the sign-off sheet
-lists each acceptance). Thresholds: .claude/orchestration/effort_floors.yaml `input_checks.geometry`.
+Exceptions. `decision_units.geometry_accepted: {<finding id>: "<reason>"}` in the spec holds proposals. A MEDIUM or
+LOW one is accepted by its entry. A HIGH one counts only once the owner approves it: the owner's sign-off (or
+`python3 toolkit/spec/geometry.py approve <run_dir> --by owner` after it) records the approval in
+data/geometry_signoff.json, bound to the evidence hash of the current inputs. A lead sign-off approves nothing, and
+the run pauses at SIGN for the owner. A HIGH with no proposal sends the spec back to the planner.
+
+Freeze. Every sign-off writes data/geometry_signoff.json: the geometry declaration (enabled or not, the boundaries
+and crosswalk as declared, the columns) and the sha256 of the boundary, crosswalk and units files. Any later change
+is geometry_inputs_changed_after_signoff (HIGH), and an approval lapses when its evidence changes. Labels stay
+unsigned. Areas: equal-area integration of edges straight in longitude/latitude (exact for such edges; resampling
+an edge leaves the area unchanged). Thresholds: .claude/orchestration/effort_floors.yaml `input_checks.geometry`.
 """
 from __future__ import annotations
 
@@ -48,7 +56,11 @@ THRESHOLDS_FILE = os.path.join(ROOT, ".claude", "orchestration", "effort_floors.
 CODES = ("reciprocal_swap", "point_outside_own_polygon", "area_mismatch", "unmatched")
 FAILED, NOT_RUN, ACCEPT_BAD, EDGE = ("geometry_check_failed", "geometry_check_not_run", "geometry_acceptance_invalid",
                                      "point_near_own_boundary")
-ACCEPT_KEY = "geometry_accepted"
+CHANGED = "geometry_inputs_changed_after_signoff"
+ACCEPT_KEY = "geometry_accepted"          # in the spec: proposals (a HIGH one counts only once the owner approves it)
+# The harness's geometry sign-off record (written by the sign-off and by `approve --by owner`; no task can write it):
+# the frozen declaration, the input hashes, and the owner's approvals of HIGH exceptions bound to those hashes.
+SIGNOFF_FILE = "data/geometry_signoff.json"
 KM_PER_DEG = math.pi / 180.0 * 6371.0088          # mean Earth radius (IUGG)
 LAT_NAMES, LON_NAMES, AREA_NAMES = ("lat", "latitude"), ("lon", "lng", "long", "longitude"), ("area_km2",)
 
@@ -159,8 +171,13 @@ def _ring(r, k, shown):
         out.append((x, y))
     if out[0] == out[-1]:
         out = out[:-1]
-    if len(out) < 3:
+    if len(set(out)) < 3:
         raise GeometryError(f"{shown}: feature {k} has a ring with fewer than 3 distinct positions")
+    x0, y0 = out[0]
+    if all(abs((x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0)) <= 1e-12 for (x1, y1), (x2, y2) in zip(out, out[1:])):
+        raise GeometryError(f"{shown}: feature {k} has a ring whose vertices are collinear")
+    if _ring_area(out) <= 1e-9:                       # km2: a ring that encloses nothing
+        raise GeometryError(f"{shown}: feature {k} has a ring with no area")
     return out
 
 
@@ -271,25 +288,23 @@ def distance_km(polys, x, y) -> float:
     return best
 
 
-def _shoelace(ring) -> float:
+def _ring_area(ring) -> float:
+    """km2 enclosed by a ring on the sphere, its edges straight in longitude/latitude: the equal-area integral
+    R^2 |loop-integral of sin(lat) d(lon)|, exact for each such edge (sin(lat) integrated along the edge's linear
+    path). Splitting an edge with a collinear point splits its integral, so resampling leaves the area unchanged."""
     s = 0.0
     n = len(ring)
     for i in range(n):
-        x1, y1 = ring[i]
-        x2, y2 = ring[(i + 1) % n]
-        s += x1 * y2 - x2 * y1
-    return abs(s) / 2.0
+        l1, p1 = math.radians(ring[i][0]), math.radians(ring[i][1])
+        l2, p2 = math.radians(ring[(i + 1) % n][0]), math.radians(ring[(i + 1) % n][1])
+        h = (p2 - p1) / 2
+        s += (l2 - l1) * math.sin((p1 + p2) / 2) * (math.sin(h) / h if h else 1.0)
+    return abs(s) * (KM_PER_DEG * 180 / math.pi) ** 2
 
 
 def area_km2(polys) -> float:
-    """Outer rings less holes, each part on a plane scaled by cos(its mean latitude) (error ~ dlat^2/24 for a part
-    spanning dlat radians)."""
-    tot = 0.0
-    for p in polys:
-        lat0 = sum(y for _, y in p[0]) / len(p[0])
-        k = KM_PER_DEG * KM_PER_DEG * math.cos(math.radians(lat0))
-        tot += k * (_shoelace(p[0]) - sum(_shoelace(h) for h in p[1:]))
-    return max(tot, 0.0)
+    """Outer rings less holes, summed over parts (equal-area integration, _ring_area)."""
+    return max(sum(_ring_area(p[0]) - sum(_ring_area(h) for h in p[1:]) for p in polys), 0.0)
 
 
 # --------------------------------------------------------------------------- the check
@@ -354,7 +369,10 @@ def evaluate(rows: list[dict], cols: dict, feats: dict, xw: dict | None, th: dic
     for a in sorted(outside):
         for fb in outside[a]["in"]:
             for b in claim_of.get(fb, []):
-                if b != a and b in pt and b in own and contains(feats[own[a]], *pt[b]) and a not in swapped:
+                # a pair only when both points lie outside their own polygons (overlapping or nested polygons can
+                # put b's point in a's polygon while it is also inside b's own)
+                if b != a and b in outside and a not in swapped and b not in swapped \
+                        and contains(feats[own[a]], *pt[b]):
                     swapped[a], swapped[b] = b, a
     area_of = {}
     if areac:
@@ -464,10 +482,60 @@ def _load_spec(run_dir: str):
     return doc
 
 
-def check(run_dir: str, spec: dict | None = None, th: dict | None = None) -> dict:
+def _load_signoff(run_dir: str) -> dict | None:
+    """The harness's geometry sign-off record, or None when the spec has not been signed with one. Unreadable: fail
+    closed."""
+    p = os.path.join(run_dir, SIGNOFF_FILE)
+    if not os.path.exists(p):
+        return None
+    try:
+        doc = json.load(open(p, encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise GeometryError(f"{SIGNOFF_FILE}: unreadable geometry sign-off record: {e}") from e
+    if not isinstance(doc, dict) or not isinstance(doc.get("declaration"), dict):
+        raise GeometryError(f"{SIGNOFF_FILE}: not a geometry sign-off record")
+    return doc
+
+
+def _declaration(cfg, pres, cols, units) -> dict:
+    """The geometry part of the inputs, as declared (paths as written, so a moved run compares equal); labels are not
+    part of it."""
+    xw = (cfg or {}).get("crosswalk")
+    return {"enabled": bool(cfg is not None and cols.get("lat") and cols.get("lon")), "presentation": pres,
+            "boundaries": {"path": cfg["shown"], "feature_id": cfg["feature_id"]} if cfg else None,
+            "crosswalk": {"path": xw["shown"], "unit_id": xw["unit_id"], "feature_id": xw["feature_id"]} if xw else None,
+            "columns": {k: cols.get(k) for k in ("id", "lat", "lon", "area")}, "units": units}
+
+
+def _evidence(decl: dict, shas: dict) -> str:
+    return hashlib.sha256(json.dumps({"declaration": decl, "sha256": shas}, sort_keys=True).encode()).hexdigest()
+
+
+def _changes(signed: dict, decl: dict, shas: dict) -> list[str]:
+    """What differs from the geometry frozen at sign-off (empty: nothing)."""
+    old, out = signed.get("declaration") or {}, []
+    if bool(old.get("enabled")) != decl["enabled"]:
+        out.append("the check was " + ("enabled" if old.get("enabled") else "not enabled") + " at sign-off and is "
+                   + ("enabled" if decl["enabled"] else "not enabled") + " now")
+    for k in ("presentation", "boundaries", "crosswalk", "columns", "units"):
+        if old.get(k) != decl.get(k):
+            out.append(f"the {k} declaration changed ({old.get(k)} -> {decl.get(k)})")
+    was = signed.get("input_sha256") or {}
+    for k in ("boundaries", "crosswalk", "units"):
+        if was.get(k) != shas.get(k):
+            out.append(f"the {k} file changed (sha256 {str(was.get(k))[:12]} -> {str(shas.get(k))[:12]})")
+    return out
+
+
+def check(run_dir: str, spec: dict | None = None, th: dict | None = None, use_signoff: bool = True) -> dict:
     """The report for a run directory: status ran | not_run | failed, with reason, inputs (paths and sha256), the
-    thresholds, counts, findings (each marked with its acceptance) and acceptance problems. Never raises."""
-    rep = {"producer": PRODUCER, "version": 1, "status": "failed", "reason": None, "inputs": {}, "thresholds": None,
+    declaration and its evidence hash, the changes since the geometry sign-off, the thresholds, counts, findings
+    (each with the spec's proposal and its acceptance) and acceptance problems. Never raises.
+
+    Acceptance: a MEDIUM or LOW finding is accepted by the spec's entry with a reason. A HIGH one only by an owner
+    approval in the harness's sign-off record whose evidence hash matches the current inputs."""
+    rep = {"producer": PRODUCER, "version": 2, "status": "failed", "reason": None, "inputs": {}, "thresholds": None,
+           "declaration": None, "evidence_sha256": None, "signoff": None, "signoff_changes": [],
            "counts": {}, "checks": {}, "findings": [], "acceptance_problems": []}
     try:
         spec = _load_spec(run_dir) if spec is None else spec
@@ -480,6 +548,7 @@ def check(run_dir: str, spec: dict | None = None, th: dict | None = None) -> dic
             rep["acceptance_problems"].append(f"decision_units.{ACCEPT_KEY}: a mapping of finding id to a reason")
             acc = {}
         acc = acc or {}
+        signed = _load_signoff(run_dir) if use_signoff else None
         cfg, pres = presentation_boundaries(run_dir)
         upath = du["csv"] if os.path.isabs(du["csv"]) else os.path.join(run_dir, du["csv"])
         rows = read_table(upath)
@@ -493,6 +562,18 @@ def check(run_dir: str, spec: dict | None = None, th: dict | None = None) -> dic
             raise GeometryError(f"{du['csv']}: no id column {cols['id']}")
         rep["inputs"] = {"units": {"path": du["csv"], "sha256": _sha(upath)}, "columns": cols,
                          "presentation": pres}
+        decl = _declaration(cfg, pres, cols, du["csv"])
+        shas = {"units": _sha(upath), "boundaries": _sha(cfg["path"]) if cfg else None,
+                "crosswalk": _sha(cfg["crosswalk"]["path"]) if cfg and cfg.get("crosswalk") else None}
+        ev_sha = _evidence(decl, shas)
+        rep.update(declaration=decl, input_sha256=shas, evidence_sha256=ev_sha)
+        approvals = {}
+        if signed is not None:
+            rep["signoff"] = {"signed_by": signed.get("signed_by"), "at": signed.get("at")}
+            rep["signoff_changes"] = _changes(signed, decl, shas)
+            approvals = {k: a for k, a in (signed.get("approvals") or {}).items()
+                         if isinstance(a, dict) and a.get("approved_by") == "owner"
+                         and a.get("evidence_sha256") == ev_sha and str(a.get("reason") or "").strip()}
         why = []
         if not (cols["lat"] and cols["lon"]):
             why.append("no coordinates declared (decision_units.coordinates {lat, lon}, or lat/lon columns)")
@@ -507,15 +588,22 @@ def check(run_dir: str, spec: dict | None = None, th: dict | None = None) -> dic
         rep["thresholds"] = th
         feats = read_features(cfg)
         xw = read_crosswalk(cfg["crosswalk"]) if cfg.get("crosswalk") else None
-        rep["inputs"]["boundaries"] = {"path": cfg["shown"], "feature_id": cfg["feature_id"], "sha256": _sha(cfg["path"])}
+        rep["inputs"]["boundaries"] = {"path": cfg["shown"], "feature_id": cfg["feature_id"],
+                                       "sha256": shas["boundaries"]}
         if cfg.get("crosswalk"):
             c = cfg["crosswalk"]
             rep["inputs"]["crosswalk"] = {"path": c["shown"], "unit_id": c["unit_id"], "feature_id": c["feature_id"],
-                                          "sha256": _sha(c["path"])}
+                                          "sha256": shas["crosswalk"]}
         ev = evaluate(rows, cols, feats, xw, th)
         ids = {f["id"] for f in ev["findings"]}
         for f in ev["findings"]:
-            f["accepted"] = acc.get(f["id"])
+            f["proposed"] = acc.get(f["id"])
+            if f["severity"] == "HIGH":
+                a = approvals.get(f["id"])
+                f["accepted"] = a["reason"] if a else None
+                f["approved_by"] = "owner" if a else None
+            else:
+                f["accepted"] = f["proposed"]
         rep["acceptance_problems"] += [f"decision_units.{ACCEPT_KEY}: {k} names no current finding" for k in sorted(acc)
                                        if k not in ids]
         rep.update(status="ran", counts=ev["counts"], checks=ev["checks"], findings=ev["findings"])
@@ -526,8 +614,8 @@ def check(run_dir: str, spec: dict | None = None, th: dict | None = None) -> dic
     return rep
 
 
-def write(run_dir: str, rep: dict) -> str:
-    p = os.path.join(run_dir, ARTIFACT)
+def write(run_dir: str, rep: dict, rel: str = ARTIFACT) -> str:
+    p = os.path.join(run_dir, rel)
     os.makedirs(os.path.dirname(p), exist_ok=True)
     tmp = p + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -543,33 +631,84 @@ def run(run_dir: str, spec: dict | None = None) -> dict:
     return rep
 
 
-_ACCEPT_HINT = (f"fix the data (the derivation, the crosswalk or the boundary file), or the owner accepts the "
-                f"finding by name in decision_units.{ACCEPT_KEY} with a reason (listed on the sign-off sheet)")
+def freeze(run_dir: str, by: str, extra: dict | None = None, spec: dict | None = None, th: dict | None = None) -> dict:
+    """The sign-off's geometry record (data/geometry_signoff.json): the declaration and input hashes as signed, and,
+    when the owner signs, an approval of each HIGH finding the spec proposes as an exception (plus `extra`
+    {finding id: reason}), bound to the evidence hash. A lead sign-off approves nothing. A check that failed cannot be
+    signed over (ValueError)."""
+    import datetime as _dt
+    if by not in ("owner", "lead"):
+        raise ValueError(f"sign-off by {by!r}: owner or lead")
+    rep = check(run_dir, spec, th, use_signoff=False)
+    if rep["status"] == "failed":
+        raise ValueError(f"the input geometry check failed: {rep['reason']}")
+    now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    approvals = {}
+    if by == "owner":
+        highs = {f["id"]: f for f in rep["findings"] if f["severity"] == "HIGH"}
+        want = {k: f["proposed"] for k, f in highs.items() if f.get("proposed")}
+        for k, why in (extra or {}).items():
+            if k not in highs or not str(why or "").strip():
+                raise ValueError(f"approve {k}: not a current HIGH finding, or no reason")
+            want[k] = str(why)
+        approvals = {k: {"reason": why, "evidence_sha256": rep["evidence_sha256"], "severity": "HIGH",
+                         "approved_by": "owner", "at": now} for k, why in sorted(want.items())}
+    rec = {"producer": PRODUCER, "version": 1, "signed_by": by, "at": now, "declaration": rep["declaration"],
+           "input_sha256": rep["input_sha256"], "evidence_sha256": rep["evidence_sha256"], "approvals": approvals}
+    write(run_dir, rec, SIGNOFF_FILE)
+    return rec
+
+
+def approve(run_dir: str, by: str, extra: dict | None = None) -> dict:
+    """The owner's command after sign-off: re-freeze the current geometry inputs and approve the spec's proposed HIGH
+    exceptions (and `extra`). Only the owner (ValueError otherwise)."""
+    if by != "owner":
+        raise ValueError("only the owner approves a HIGH geometry exception")
+    return freeze(run_dir, "owner", extra)
+
+
+def owner_pending(rep: dict) -> list[str]:
+    """HIGH findings the spec proposes as exceptions that the owner has not approved: the run waits for the owner."""
+    return [f["id"] for f in rep.get("findings") or [] if f["severity"] == "HIGH" and f.get("proposed")
+            and not f.get("accepted")]
+
+
+_FIX_HINT = (f"fix the data (the derivation, the crosswalk or the boundary file), or propose it as an exception in "
+             f"decision_units.{ACCEPT_KEY} with a reason: only the owner's sign-off approves a HIGH exception")
+_OWNER_HINT = ("proposed as an exception; it waits for the owner's approval (the owner's sign-off, or "
+               "`python3 toolkit/spec/geometry.py approve <run_dir> --by owner` after it)")
 
 
 def problems(rep: dict) -> list[dict]:
-    """What blocks SIGN: [{code, claim}] (the derivation_problems shape)."""
+    """What sends the spec back before SIGN: [{code, claim}] (the derivation_problems shape). A HIGH the spec proposes
+    as an exception is not one: it goes to the owner (owner_pending)."""
     out = []
     if rep.get("status") == "failed":
         out.append({"code": FAILED, "claim": f"the input geometry check could not run on its declared inputs: "
                                              f"{rep.get('reason')}"})
     out += [{"code": ACCEPT_BAD, "claim": p} for p in rep.get("acceptance_problems") or []]
-    out += [{"code": f["code"], "claim": f"{f['claim']} [{f['id']}]: {_ACCEPT_HINT}"}
-            for f in rep.get("findings") or [] if f.get("severity") == "HIGH" and not f.get("accepted")]
+    out += [{"code": CHANGED, "claim": f"the geometry inputs changed after sign-off: {c}; the owner re-approves them "
+                                       f"(`python3 toolkit/spec/geometry.py approve <run_dir> --by owner`) or restores "
+                                       f"them"} for c in rep.get("signoff_changes") or []]
+    out += [{"code": f["code"], "claim": f"{f['claim']} [{f['id']}]: {_FIX_HINT}"}
+            for f in rep.get("findings") or [] if f.get("severity") == "HIGH" and not f.get("accepted")
+            and not f.get("proposed")]
     return out
 
 
 def findings(rep: dict) -> list[dict]:
-    """The gate's view: unaccepted HIGH (not declarable) and MEDIUM (declarable) findings, a failed check (HIGH),
-    and LOW notes for a check that did not run and for edge cases. Stage PLAN, as the derivation findings."""
+    """The gate's view: a failed check, an invalid proposal, a change since sign-off and every HIGH the owner has not
+    approved (HIGH, not declarable); unaccepted MEDIUM (declarable); LOW notes for a check that did not run and for
+    edge cases. Stage PLAN, as the derivation findings."""
     base = {"stage": "PLAN", "target_stage": "PLAN"}
     out = [dict(base, kind=p["code"], severity="HIGH", scope_declarable=False, key=p["code"], claim=p["claim"])
-           for p in problems(rep) if p["code"] in (FAILED, ACCEPT_BAD)]
+           for p in problems(rep) if p["code"] in (FAILED, ACCEPT_BAD, CHANGED)]
     for f in rep.get("findings") or []:
         if f.get("accepted") or f["severity"] not in ("HIGH", "MEDIUM"):
             continue
+        tail = f"; {_OWNER_HINT}" if f["severity"] == "HIGH" and f.get("proposed") else ""
         out.append(dict(base, kind=f["code"], severity=f["severity"], scope_declarable=f["severity"] != "HIGH",
-                        key=f["id"][:60], claim=f"{f['claim']} [{f['id']}]"))
+                        key=f["id"][:60], claim=f"{f['claim']} [{f['id']}]{tail}"))
     if rep.get("status") == "not_run":
         out.append(dict(base, kind=NOT_RUN, severity="LOW", scope_declarable=True, key="geometry",
                         claim=f"input geometry check {rep.get('reason')}: the units' coordinates and areas were "
@@ -592,7 +731,8 @@ def sheet_lines(run_dir: str) -> list[str]:
         return out + [f"No record ({ARTIFACT} is missing): the check has not run.", ""]
     st = rep.get("status")
     if st == "not_run":
-        return out + [f"The check did not run: {rep.get('reason')}.", ""]
+        return out + [f"The check did not run: {rep.get('reason')}. Signing freezes that: declaring boundaries "
+                      "later needs the owner.", ""]
     if st == "failed":
         return out + [f"The check failed: {rep.get('reason')}.", ""]
     c = rep.get("counts") or {}
@@ -600,15 +740,22 @@ def sheet_lines(run_dir: str) -> list[str]:
                f"{c.get('reciprocal_swaps')} reciprocal swap(s), {c.get('points_outside')} point(s) outside their "
                f"polygon beyond the tolerance, {c.get('edge_cases')} edge case(s), {c.get('area_mismatches')} area "
                f"mismatch(es), {c.get('units_unmatched')} unmatched unit(s), {c.get('features_claimed_twice')} "
-               f"feature(s) claimed twice. Area check: {(rep.get('checks') or {}).get('area')}.")
-    acc = [f for f in rep.get("findings") or [] if f.get("accepted")]
-    out.append("")
-    out.append("Accepted by name (signing accepts these rows as they are):")
+               f"feature(s) claimed twice. Area check: {(rep.get('checks') or {}).get('area')}. Signing freezes the "
+               "boundary declaration and the boundary and crosswalk files (sha256); a later change needs the owner.")
+    fs = rep.get("findings") or []
+    prop = [f for f in fs if f["severity"] == "HIGH" and f.get("proposed") and not f.get("accepted")]
+    out += ["", "Proposed exceptions to HIGH findings (the owner's sign-off approves them; a lead sign-off does not):"]
+    out += [f"- **{f['id']}**: {f['claim']}. Reason given: {f['proposed']}" for f in prop] or ["- none"]
+    appr = [f for f in fs if f["severity"] == "HIGH" and f.get("accepted")]
+    if appr:
+        out += ["", "Approved by the owner:"] + [f"- **{f['id']}**: {f['claim']}. Reason: {f['accepted']}"
+                                                 for f in appr]
+    acc = [f for f in fs if f["severity"] != "HIGH" and f.get("accepted")]
+    out += ["", "Accepted by name in the spec (MEDIUM and LOW):"]
     out += [f"- **{f['id']}** ({f['severity']}): {f['claim']}. Reason: {f['accepted']}" for f in acc] or ["- none"]
-    opn = [f for f in rep.get("findings") or [] if not f.get("accepted") and f["severity"] in ("HIGH", "MEDIUM")]
+    opn = [f for f in fs if not f.get("accepted") and not f.get("proposed") and f["severity"] in ("HIGH", "MEDIUM")]
     if opn:
-        out.append("")
-        out.append("Open (MEDIUM findings stay open at the gate):")
+        out += ["", "Open (MEDIUM findings stay open at the gate):"]
         out += [f"- {f['id']} ({f['severity']}): {f['claim']}" for f in opn]
     return out + [""]
 
@@ -625,10 +772,25 @@ def _main(argv=None) -> int:
         t.add_argument("--" + k.replace("_", "-"), required=True)
     for k in ("crosswalk", "xw_unit", "xw_feature", "area"):
         t.add_argument("--" + k.replace("_", "-"))
+    p = sub.add_parser("approve", help="the owner: re-freeze the current geometry inputs and approve the spec's "
+                                       "proposed HIGH exceptions (and --accept ID=REASON)")
+    p.add_argument("run_dir")
+    p.add_argument("--by", choices=["owner"], required=True)
+    p.add_argument("--accept", action="append", default=[], metavar="ID=REASON")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args(argv)
     if a.self_test:
         return _self_test()
+    if a.cmd == "approve":
+        extra = dict(x.split("=", 1) for x in a.accept if "=" in x)
+        try:
+            rec = approve(a.run_dir, a.by, extra)
+        except ValueError as e:
+            print(f"refused: {e}")
+            return 1
+        print(json.dumps({"approvals": sorted(rec["approvals"]), "evidence_sha256": rec["evidence_sha256"]}))
+        run(a.run_dir)
+        return 0
     if a.cmd == "check":
         rep = run(a.run_dir)
     elif a.cmd == "table":
@@ -934,9 +1096,10 @@ def _self_test() -> int:
                                             "area_mismatch:stray": "known boundary change",
                                             "point_outside_own_polygon:holed": "the point is the enclave's town"}
         rep2 = check(d, sp, th)
-        ok(problems(rep2) == [] and (rep2["findings"][0].get("accepted") is not None
-                                     or any(f.get("accepted") for f in rep2["findings"])),
-           f"IG3c accepted by name with a reason: SIGN is no longer blocked ({problems(rep2)[:2]})")
+        ok(problems(rep2) == [] and len(owner_pending(rep2)) == 5 and not any(
+            f.get("accepted") for f in rep2["findings"] if f["severity"] == "HIGH"),
+           f"IG3c proposed by name with a reason, the spec is not sent back, and the HIGH findings wait for the owner "
+           f"({problems(rep2)[:2]}, {owner_pending(rep2)})")
         sp["decision_units"][ACCEPT_KEY]["reciprocal_swap:x+y"] = "stale"
         ok([p["code"] for p in problems(check(d, sp, th))] == [ACCEPT_BAD],
            "IG3d an acceptance that names no current finding is itself a problem")

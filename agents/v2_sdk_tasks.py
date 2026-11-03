@@ -28,7 +28,7 @@ HARNESS_FILES = ("run_state.json", "findings.jsonl", "impact_ledger.jsonl", "met
                  "decision_spec.signoff.json", "engine_choice.json", "validator_history.jsonl", "done_when_registry.json",
                  "report.md", "allocation_optimized.csv", "data/inputs_provenance.json", "declared_findings.yaml",
                  "data/derivations_record.json", "decision_spec.signoff_sheet.md",
-                 "data/input_checks.json")
+                 "data/input_checks.json", "data/geometry_signoff.json")
 # data/derived/ (v2-derived-inputs): the tables the spec reads are written only by the harness's derivation runner.
 HARNESS_PREFIXES = ("analysis/", "models/pipeline", "gate_r", "fix_plan_r", "evidence/", "data/inputs/", "data/derived/")
 

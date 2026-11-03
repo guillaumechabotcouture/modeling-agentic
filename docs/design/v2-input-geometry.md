@@ -37,9 +37,14 @@ Without a crosswalk, a unit id matches the feature property directly. The units 
 lacks is an error, not a fallback.
 
 **Checks** (`toolkit/spec/geometry.py`). They use pure Python and json, with no new dependency.
-Point-in-polygon uses ray casting (even-odd, so holes and MultiPolygon parts are handled). Areas and
-distances are computed on a plane scaled by cos(latitude): the area error for a part spanning Δφ radians is
-about Δφ²/24, under 0.01% for a one-degree cell.
+Point-in-polygon uses ray casting (even-odd, so holes and MultiPolygon parts are handled). Distances are
+computed on a plane scaled by cos(latitude) at the point. Areas use equal-area integration on the sphere,
+R²·|∮ sin φ dλ|, integrated exactly along each edge taken as straight in longitude/latitude
+(Δλ·sin φ̄·sinc(Δφ/2)). This is exact for a latitude/longitude cell and for an octant, and adding collinear
+points to an edge leaves the area unchanged. (Review of #131: the first version scaled by the ring's mean
+latitude, so densifying one edge changed the area.) A ring needs 3 distinct, non-collinear vertices and a
+positive area; otherwise the result is `geometry_check_failed`. A reciprocal pair forms only when both points
+lie outside their own polygons, so overlapping or nested polygons cannot make one.
 
 | Code | Severity | When |
 |---|---|---|
@@ -71,10 +76,13 @@ column names used and where they came from, the thresholds, the counts, and ever
 severity, units, claim, evidence and acceptance.
 
 **Where it surfaces.** It follows the derivation checks (`input_column_unaccounted` and the others):
-- *Before SIGN* (`h_SPEC`, both backends, after `pre_sign_problems`): each HIGH finding not accepted by name
-  is a `code: claim` problem. The spec goes back to the planner with it, so it blocks signing. The problem
-  text says how to clear it: fix the data (the derivation, the crosswalk or the boundary file), or the owner
-  accepts the finding by name.
+- *Before SIGN* (`h_SPEC`, both backends, after `pre_sign_problems`): each HIGH finding that the spec does not
+  propose as an exception is a `code: claim` problem. The spec goes back to the planner with it, so it blocks
+  signing. The problem text says how to clear it: fix the data (the derivation, the crosswalk or the boundary
+  file), or propose an exception for the owner.
+- *At SIGN* (`h_SIGN`): when a proposed HIGH exception has no owner approval, the run pauses at
+  `awaiting_signoff`, as for a spec sign-off. With `--signoff lead` too, because a lead sign-off approves
+  nothing.
 - *At every gate* (`Machine.harness_findings`): the check re-runs on the current files. An unaccepted HIGH is a
   HIGH finding that cannot be declared; a MEDIUM is a declarable MEDIUM; the not-run note and the edge-case
   summary are LOW. All have stage PLAN. They reach `findings.jsonl` through the gate, as the derivation
@@ -82,11 +90,32 @@ severity, units, claim, evidence and acceptance.
 - *Sign-off sheet* (`decision_spec.signoff_sheet.md`): a section with the counts, each finding accepted by
   name with its reason, and the open findings, or the not-run or failed reason.
 
-**Acceptance** reuses the `defaults_accepted` pattern: `decision_units.geometry_accepted: {<finding id>:
-"<reason>"}` in the signed spec. Finding ids are stable and readable: `reciprocal_swap:<a>+<b>`,
-`point_outside_own_polygon:<u>`, `area_mismatch:<u>`, `unmatched:<u>`, `unmatched:feature:<f>`. An acceptance
-with no reason, or one that names no current finding (for example, after the data were fixed), is
-`geometry_acceptance_invalid` (HIGH). An acceptance therefore always matches the data the owner signed over.
+**Exceptions** (revised after the review of #131). `decision_units.geometry_accepted: {<finding id>:
+"<reason>"}` in the spec holds *proposals*, which the planner may write. Finding ids are stable and readable:
+`reciprocal_swap:<a>+<b>`, `point_outside_own_polygon:<u>`, `area_mismatch:<u>`, `unmatched:<u>`,
+`unmatched:feature:<f>`.
+- A MEDIUM or LOW proposal with a reason is accepted, as `defaults_accepted` is.
+- A HIGH proposal counts only once the owner approves it. The approval is a harness record,
+  `data/geometry_signoff.json`, which no task can write (it is in `HARNESS_FILES`). It is written by the owner's
+  sign-off (`agents/stage_machine.py sign --by owner`, `toolkit/spec/signoff.py sign`), or after sign-off by
+  `python3 toolkit/spec/geometry.py approve <run_dir> --by owner [--accept ID=REASON]`.
+- Each approval is bound to the finding id and to the evidence hash: the sha256 of the declaration plus the
+  boundary, crosswalk and units file hashes. When the evidence changes, the approval lapses.
+- A lead sign-off approves nothing, and `approve` refuses anyone but the owner.
+- A proposal with no reason, or one that names no current finding, is `geometry_acceptance_invalid` (HIGH).
+
+**Freeze.** Every sign-off, by the lead or the owner, writes the geometry part of the inputs into that record:
+- whether the check is enabled;
+- the presentation file's name;
+- the boundaries and crosswalk as declared (paths as written, feature and unit id fields);
+- the columns used;
+- the sha256 of the boundary, crosswalk and units files.
+
+These sit alongside the spec and derivation hashes in the spec's own sign-off. Any later difference is
+`geometry_inputs_changed_after_signoff` (HIGH, not declarable): repointing the boundaries, editing either file,
+or removing the `boundaries` block, which before this change gave only a LOW note. Only the owner clears it, with
+`approve`, which re-freezes the current inputs, or by restoring the files. Labels stay unsigned: the
+presentation file's own hash is not frozen. A check that failed cannot be signed over (the sign-off refuses).
 
 ## 3. Alternatives considered
 
@@ -119,9 +148,26 @@ with no reason, or one that names no current finding (for example, after the dat
 - IG6: thresholds read from the config.
 - IG7: no disease, place or intervention words in the module (the `pipeline.domain_terms` scan).
 
-Through the machine (`agents/stage_machine.py`): IG-M1, a planted swap refuses the spec before SIGN, and
-IG-M2, the owner's acceptance by name lets it reach SIGN with the acceptance on the sheet. IG-M3: the gate
-carries the finding. `toolkit/spec/signoff.py`: IG-S1, the sheet section.
+Added after the review of #131, written first:
+- IG8: a HIGH that the spec proposes stays HIGH at the gate and waits for the owner. A MEDIUM proposal is
+  accepted. A lead sign-off approves nothing. `approve` refuses anyone but the owner. The owner's sign-off
+  approves the proposals.
+- IG9: a label edit changes nothing. Repointing to polygons with swapped ids, removing `boundaries`, or editing
+  the boundary file after sign-off is HIGH. An approval lapses with its evidence. `approve` re-freezes. An
+  unreadable record fails closed.
+- IG10: collinear, two-vertex and zero-area rings fail closed, as outer rings and as holes.
+- IG11: nested polygons do not crash the pair test.
+- IG12: closed forms (a 1-degree cell and an octant, to 1e-9), and densifying a rectangle edge or a sloped
+  triangle edge leaves the area unchanged.
+
+Through the machine (`agents/stage_machine.py`):
+- IG-M1: a planted swap with no proposal refuses the spec before SIGN.
+- IG-M2: a proposed swap reaches SIGN and stays HIGH until the owner signs; then the run goes on.
+- IG-M3: the gate carries the open finding.
+- IG-M4: under `--signoff lead` the run pauses for the owner instead of lead-signing.
+- IG-M5: both records are harness files.
+
+`toolkit/spec/signoff.py`: IG-S1, the sheet section, and IG-S2, the sign-off writes the geometry record.
 
 ## 5. Real check (local only; counts and field names, no data)
 
@@ -133,9 +179,10 @@ Run against the boundary file, crosswalk and geography table of the run in §1 (
 
 - When PR #127 or this PR lands second, figures.py and this module should share one boundaries loader (the
   figures read exterior rings only; this check needs holes).
-- The planner task writes `decision_spec.yaml`, so it can write `geometry_accepted`, just as it can write
-  `defaults_accepted`. The sign-off sheet is where the owner sees and confirms each acceptance. With
-  `--signoff lead`, no person sees it.
+- With `--signoff none` there is no sign-off, so a proposed HIGH exception is never approved, and the gate
+  cannot accept the run (fail closed).
+- A run signed before this change has no geometry record, so nothing is frozen for it. The first owner
+  `approve` creates the record.
 - The check finds rows whose geometry fields disagree with the boundaries. It cannot tell which other columns
   (population, raster-derived values) came along with the swapped geometry. The finding says they probably
   did, and the fix belongs in the derivation.

@@ -750,6 +750,8 @@ def sign(run_dir: str, by: str, note: str = "") -> dict:
     rec = {"by": by, "note": note, "at": _now(), "spec_sha256": signed_hash(run_dir)}
     if rec["spec_sha256"] is None:
         raise ValueError(f"no {AB.SPEC_FILE} to sign")
+    from toolkit.spec import geometry as GEO
+    GEO.freeze(run_dir, by)              # the geometry declaration and input hashes; the owner's approvals
     with open(os.path.join(run_dir, SIGNOFF_FILE), "w") as f:
         json.dump(rec, f, indent=1)
     return rec
@@ -911,6 +913,13 @@ class Machine:
         from toolkit.spec import geometry as GEO
         return [f"{p['code']}: {p['claim']}" for p in GEO.problems(GEO.run(self.run_dir))]
 
+    def _geometry_owner_pending(self) -> list[str]:
+        """HIGH geometry findings the spec proposes as exceptions and the owner has not approved."""
+        if not os.path.exists(os.path.join(self.run_dir, AB.SPEC_FILE)):
+            return []
+        from toolkit.spec import geometry as GEO
+        return GEO.owner_pending(GEO.run(self.run_dir))
+
     def _signed_ref(self, run_dir: str):
         """The signed spec's sha256: from the backend's own sign-off (B) or the machine's."""
         if getattr(self.backend, "sign", None):
@@ -1039,9 +1048,16 @@ class Machine:
         if mode == "none":
             return self._go("EVIDENCE", "sign-off not required (--signoff none)")
         by = self._signed_by()
-        if by and (mode == "lead" or by == "owner"):
+        # A HIGH geometry finding the spec proposes as an exception is the owner's to approve (review of #131, P1):
+        # a lead sign-off approves nothing, so the run waits for the owner here, as for a spec sign-off.
+        pend = self._geometry_owner_pending()
+        if by and (mode == "lead" or by == "owner") and not pend:
             return self._go("EVIDENCE", f"spec signed by {by}")
-        if mode == "lead":
+        if pend:
+            how = ("python3 toolkit/spec/geometry.py approve" if by else "python3 agents/stage_machine.py sign")
+            self.log(f"[machine] {len(pend)} HIGH geometry exception(s) wait for the owner ({', '.join(pend[:4])}): "
+                     f"{how} {self.run_dir} --by owner")
+        elif mode == "lead":
             res = self._task(f"SIGN#{self._visit()}:sign_spec", "sign_spec", self.run_dir)
             note = (_signoff(self.run_dir) or {}).get("note", "")
             if res is not None and res.ok:
