@@ -535,3 +535,8 @@ Each finding was reproduced by a failing self-test first (DR1-DR9).
 - **Small values keep their significant digits (DR8):** below 1e-3 in scientific notation (`1.2e-8`).
 - **Decision tests (DR9):** a removed group rule names the rule and what it was, from `constraints.group_rules`; an
   added rule names what it adds; an envelope test states it varies the envelope, with values in USD.
+
+Round 2 (Codex, on #132; DR10-DR12): the units table the calibration joins is parsed from the exact entry whose hash
+was checked; the freshness checks run first for every method, `none` included; tolerances are formatted with
+`sig()` (`1e-15`, not `0`); a removed group rule is looked up in the raw spec's list of `constraints.group_rules`
+(`[{id, ...}]`), and the DR9 fixture uses that shape.

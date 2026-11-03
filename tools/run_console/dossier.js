@@ -237,9 +237,10 @@ function engineHTML(d) {
 }
 
 const CMP = { eq: "equal to the reference within the tolerance", le: "at most the reference", differ: "differs from the reference" };
+const tol = (x) => (x && typeof x === "object" && !Array.isArray(x) ? Object.entries(x).map(([k, v]) => `${esc(k)}: ${sig(v)}`).join("; ") || "—" : sig(x));
 function criterion(b) {   // a band benchmark: target and band; an equation or identity one: reference, compare, tolerance, errors
   if (b.kind !== "compare") return `target ${num(b.target)}<div class="sub">band ${span(b.band)}</div>`;
-  return `reference ${sig(b.reference, 6)} <span class="muted">(${esc(CMP[b.compare] || b.compare)})</span><div class="sub">tolerance ${val(b.tolerance)}; error ${sig(b.error_abs)} abs${b.error_rel != null ? `, ${sig(b.error_rel)} rel` : ""}</div>`;
+  return `reference ${sig(b.reference, 6)} <span class="muted">(${esc(CMP[b.compare] || b.compare)})</span><div class="sub">tolerance ${tol(b.tolerance)}; error ${sig(b.error_abs)} abs${b.error_rel != null ? `, ${sig(b.error_rel)} rel` : ""}</div>`;
 }
 
 // ---- Calibration

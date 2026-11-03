@@ -297,7 +297,9 @@ def _decision_tests(spec: dict, units: dict) -> list:
                       f"{a.get('by') or '(no grouping column)'}" + (f" ({a['reason']})" if a.get("reason") else ""))
         elif typ == "group_rule":
             rid = t.get("rule")
-            r = _m(_m(_m(spec.get("constraints")).get("group_rules")).get(rid))
+            grs = _m(spec.get("constraints")).get("group_rules")    # the raw spec: a list of {id, ...}
+            r = (next((g for g in grs if isinstance(g, dict) and g.get("id") == rid), {}) if isinstance(grs, list)
+                 else _m(_m(grs).get(rid)))
             varied = (f"group rule {rid} removed" + (f" ({r.get('rule')} on {_short(r.get('components'))} by "
                                                      f"{r.get('by')})" if r else " (the spec's constraints do not "
                                                                                  "define it)"))
@@ -744,30 +746,31 @@ def engine_tab(run_dir: str, repo: str = REPO) -> dict:
 CAL_METHODS = ("emulator_inversion", "likelihood", "posterior", "none")
 
 
-def _cal_inputs(run_dir: str, doc: dict, spec_sha, units_rel) -> str | None:
-    """Why the calibration may not be joined to the current spec and units table, or None. Each hash is compared with
-    the bytes read now; the units table is parsed from the same read (_cal_units)."""
+def _cal_inputs(run_dir: str, doc: dict, spec_sha, units_rel) -> tuple:
+    """(why the calibration may not be joined to the current spec and units table, or None; {rel: entry read}). Each
+    hash is compared with the bytes read now, and the entries are returned so that the units table is parsed from
+    exactly the bytes that were hashed (_cal_units)."""
     if not doc.get("spec_sha256"):
-        return f"{CALIBRATION} records no spec sha256, so its inputs cannot be checked"
+        return f"{CALIBRATION} records no spec sha256, so its inputs cannot be checked", {}
     changed = [] if doc.get("spec_sha256") == spec_sha else [RC.SPEC]
     inputs = doc.get("inputs")
     if not isinstance(inputs, dict):
-        return f"{CALIBRATION} records no input hashes, so its inputs cannot be checked"
+        return f"{CALIBRATION} records no input hashes, so its inputs cannot be checked", {}
     if units_rel and units_rel not in inputs:
-        return f"{CALIBRATION} does not record the units table {units_rel} among its inputs"
+        return f"{CALIBRATION} does not record the units table {units_rel} among its inputs", {}
+    read = {}
     for rel, want in inputs.items():
-        e = _entry(run_dir, str(rel))
+        e = read[str(rel)] = _entry(run_dir, str(rel))
         if e is None or e["sha256"] != want:
             changed.append(str(rel))
     if changed:
         return (f"inputs changed since the analysis ({', '.join(changed)}): {CALIBRATION} was computed from other "
-                "inputs, so its fit is not joined to the current ones")
-    return None
+                "inputs, so its fit is not joined to the current ones"), {}
+    return None, read
 
 
-def _cal_units(run_dir: str, units_rel, idc, regc, tcol) -> tuple:
-    """{unit id: row} of the units table, from one read, and why not."""
-    e = _entry(run_dir, units_rel) if isinstance(units_rel, str) else None
+def _cal_units(e, units_rel, idc) -> tuple:
+    """{unit id: row} of the units table from the entry whose hash was checked, and why not."""
     if e is None or e["err"] is not None or not isinstance(e["parsed"], str):
         return {}, f"{units_rel}: not read" if units_rel else "the spec names no units table"
     rows = list(csv.DictReader(io.StringIO(e["parsed"])))
@@ -786,17 +789,19 @@ def calibration_tab(run_dir: str) -> dict:
     if method not in CAL_METHODS:
         return {**na(f"{CALIBRATION}: calibration method {method!r} is not supported by the dossier"),
                 "settings": settings}
+    du = _m(spec.get("decision_units"))
+    why, read = _cal_inputs(run_dir, doc, se["sha256"] if se else None, du.get("csv"))   # every method, first
+    if why:
+        return {**na(why), "settings": settings}
     if method == "none":
         return {"available": True, "file": CALIBRATION, "method": "none", "settings": settings, "needs_owner": False,
                 "units": [], "regions": []}
     why = _invalid(data, CALIBRATION, [("units", dict), ("diagnostics", dict)] +
                    ([("diagnostics.converged", bool)] if method != "emulator_inversion" else []))
-    du = _m(spec.get("decision_units"))
-    why = why or _cal_inputs(run_dir, doc, se["sha256"] if se else None, du.get("csv"))
     if why:
         return {**na(why), "settings": settings}
     idc, regc, tcol = du.get("id"), du.get("region"), scal.get("target_column")
-    table, twhy = _cal_units(run_dir, du.get("csv"), idc, regc, tcol)
+    table, twhy = _cal_units(read.get(du.get("csv")), du.get("csv"), idc)
     units = []
     for uid, u in data["units"].items():
         u, r = _m(u), table.get(str(uid)) or {}
