@@ -92,8 +92,25 @@ SCENARIOS = {
                     {"package": {"cm": 1}, "params": {"cm_add": 0.25}}]},
 }
 
+# Codex r2 P3: the execution environment of a worker, recorded per side (the source is shared by the worker, which runs
+# inside either tree, and environment() below)
+ENV_SRC = r'''
+def environment():
+    import platform, sys
+    import numpy, starsim
+    return {"python": sys.version.split()[0], "numpy": numpy.__version__, "starsim": starsim.__version__,
+            "platform": platform.platform(), "machine": platform.machine()}
+'''
+
+
+def environment() -> dict:
+    ns = {}
+    exec(ENV_SRC, ns)  # noqa: S102 -- our own constant source, shared with WORKER
+    return ns["environment"]()
+
+
 # Run inside one code tree (argv: root, cases json, out json). It imports only what both versions have.
-WORKER = r'''
+WORKER = ENV_SRC + r'''
 import json, os, sys
 root, cases_path, out_path = sys.argv[1:4]
 sys.path.insert(0, root)
@@ -112,7 +129,7 @@ def strip(o):
     return {"per_capita": o.per_capita, "windows": o.windows, "cost_drivers": o.cost_drivers,
             "meta": {k: v for k, v in o.meta.items() if k != "seconds"}}
 
-out = {"identity": engine_identity(e), "version": VERSION, "cases": {}}
+out = {"identity": engine_identity(e), "version": VERSION, "environment": environment(), "cases": {}}
 for c in json.load(open(cases_path)):
     if c["kind"] == "pack":
         s = pack["settings"][c["setting"]]
@@ -183,7 +200,7 @@ def _run_tree(root: str, cs: list, tmp: str, tag: str) -> dict:
     return json.load(open(op))
 
 
-def prove(old_ref: str, seeds: list, workers: int, settings: list | None = None) -> dict:
+def prove(old_ref: str, seeds: list, workers: int, settings: list | None = None, context: dict | None = None) -> dict:
     pack = yaml.safe_load(open(os.path.join(HERE, "pack.yaml")))
     cs = cases(pack, seeds)
     if settings:
@@ -200,12 +217,24 @@ def prove(old_ref: str, seeds: list, workers: int, settings: list | None = None)
                 old, new = fo.result(), fn.result()
         else:
             old, new = _run_tree(old_root, cs, tmp, "old"), _run_tree(ROOT, cs, tmp, "new")
+    return proof_doc(old_ref, _git("rev-parse", old_ref), _git("rev-parse", "HEAD"), old, new, cs, seeds,
+                     context or {})
+
+
+def proof_doc(old_ref: str, old_commit: str, new_commit: str, old: dict, new: dict, cs: list, seeds: list,
+              context: dict) -> dict:
+    """The proof record from both trees' outputs. Each side names the environment it ran in (fail closed without
+    one); `execution` names where the proof ran (e.g. the Coiled cluster id and the run id)."""
+    for tag, side in (("old", old), ("new", new)):
+        if not isinstance(side.get("environment"), dict) or not side["environment"]:
+            raise ValueError(f"proof: the {tag} side recorded no execution environment")
     rows = compare(old, new)
     return {"producer": f"{REL}/restamp_proof.py",
-            "old": {"ref": old_ref, "commit": _git("rev-parse", old_ref), "identity": old["identity"],
-                    "engine_version": old["version"]},
-            "new": {"commit_of_tree_base": _git("rev-parse", "HEAD"), "identity": new["identity"],
-                    "engine_version": new["version"]},
+            "old": {"ref": old_ref, "commit": old_commit, "identity": old["identity"],
+                    "engine_version": old["version"], "environment": old["environment"]},
+            "new": {"commit_of_tree_base": new_commit, "identity": new["identity"],
+                    "engine_version": new["version"], "environment": new["environment"]},
+            "execution": dict(context),
             "scope": {"pack_settings": sorted({c["setting"] for c in cs if c["kind"] == "pack"}),
                       "pack_arms": "every arm of each setting, in one run_batch per setting and seed",
                       "seeds": seeds, "n_agents": "each setting's own (pack.yaml params; 5000 where set, else the "
@@ -226,7 +255,10 @@ def _record(doc: dict, proof: dict, script_commit: str) -> dict:
                                                                    .get("version")),
            "proof_script_commit": script_commit,
            "note": "the numbers in this file were computed by the old code; the proof shows the new code gives "
-                   "identical outputs on these inputs. A Coiled pack run (validate_once.sh) confirms it."}
+                   "identical outputs on these inputs. A Coiled pack run (validate_once.sh) is to confirm it; until "
+                   "it has run, the confirmation below is pending.",
+           # Codex r2 P3: not done until a validate_once.sh run reports; its evidence is referenced then
+           "confirmation": {"validate_once": "pending", "evidence": None}}
     if "engine_identity" in doc:
         rec["old_identity"] = dict(doc["engine_identity"])
     if "code_sha256" in doc:
@@ -455,11 +487,16 @@ def main(argv=None) -> int:
     ap.add_argument("--seeds", default="11")
     ap.add_argument("--settings", default="")
     ap.add_argument("--workers", type=int, default=2)
+    ap.add_argument("--cluster-id", default="", help="where the proof runs (recorded under execution)")
+    ap.add_argument("--run-id", default="", help="the run's id (recorded under execution)")
+    ap.add_argument("--workspace", default="", help="the Coiled workspace (recorded under execution)")
     a = ap.parse_args(argv)
     if a.cmd == "restamp":
         return restamp()
+    ctx = {k: v for k, v in (("coiled_cluster_id", a.cluster_id), ("run_id", a.run_id),
+                             ("workspace", a.workspace)) if v}
     doc = prove(a.old_ref, [int(x) for x in a.seeds.split(",")], min(a.workers, 2),
-                [x for x in a.settings.split(",") if x] or None)
+                [x for x in a.settings.split(",") if x] or None, context=ctx)
     yaml.safe_dump(doc, open(OUT, "w"), sort_keys=False, width=110)
     bad = [k for k, r in doc["cases"].items() if not r["equal"]]
     print(f"{doc['n_cases']} cases, identical: {doc['identical']}" + (f"; differ: {bad}" if bad else ""))

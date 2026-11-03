@@ -643,18 +643,25 @@ class MalariaEngine:
     def series_window(entry: dict, metric: str, a: float, b: float) -> float:
         """The window metric over [a, b) from one run_series entry: the day-weighted mean of the steps' values
         ("mean") or the sum of rate x step length ("rate", episodes per person over the window, as the window
-        metrics inc_u5 / inc_all). Exact when [a, b) is a union of steps; a window that cuts through a step fails
-        closed (the step's days cannot be split)."""
+        metrics inc_u5 / inc_all). Exact when [a, b) is a union of steps. Fails closed (Codex r2) when [a, b) reaches
+        outside the entry's coverage [t[0], t_end[-1]), when it cuts through a step (the step's days cannot be split),
+        or when the steps inside do not cover it completely."""
         t, te = np.asarray(entry["t"], float), np.asarray(entry["t_end"], float)
         n, v = np.asarray(entry["days"], float), np.asarray(entry["values"][metric], float)
         tol = 1e-9
+        if not (b > a and a >= t[0] - tol and b <= te[-1] + tol):
+            raise ValueError(f"series_window: [{a:g}, {b:g}) is not inside the series' coverage "
+                             f"[{t[0]:g}, {te[-1]:g})")
         inside = (t >= a - tol) & (te <= b + tol)
         cut = (t < b - tol) & (te > a + tol) & ~inside
         if cut.any():
             raise ValueError(f"series_window: [{a:g}, {b:g}) cuts through the monthly step(s) starting at "
                              f"{[round(x, 4) for x in t[cut][:3]]}")
-        if not inside.any():
-            raise ValueError(f"series_window: no monthly step inside [{a:g}, {b:g})")
+        ts, es = t[inside], te[inside]
+        if (not inside.any() or abs(ts[0] - a) > tol or abs(es[-1] - b) > tol
+                or np.any(np.abs(ts[1:] - es[:-1]) > tol)):
+            raise ValueError(f"series_window: the whole steps inside [{a:g}, {b:g}) do not cover it completely "
+                             "(coverage)")
         if SERIES[metric]["aggregate"] == "mean":
             return float((v * n)[inside].sum() / n[inside].sum())
         return float((v * (te - t))[inside].sum())
