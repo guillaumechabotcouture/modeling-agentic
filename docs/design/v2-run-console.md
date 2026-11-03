@@ -423,3 +423,120 @@ field is kept and the snapshot is stored under `snapshot`.
   refused on the page, and the server refuses a snapshot that does not check for the run and anchor instead of
   replacing it with fresh evidence.
 - **Figures are served by their snapshot hash** (`/api/file?...&sha=`); a file whose bytes changed is refused.
+
+## 15. Run dossier: Spec, Evidence, Engine and Calibration tabs
+
+**Status:** written before the code (2026-11-02), branch `run-dossier`, stacked on `fix-run-console-review` (#129).
+
+**Why.** The owner (an expert epidemiological modeller) said the console "doesn't show the spec, or the evidence, or
+the engine details". The Stream and Figures views narrate events: stages, critiques, gate decisions, figures. They do
+not show what the run is made of. The dossier adds four read-only views beside Stream and Figures, each built from
+files the harness already writes.
+
+**Where it lives.** `tools/run_console/dossier.py` builds the data model. It is one small module with its own
+`--self-test`, which `scripts/self_tests.py` discovers. `tools/run_console/dossier.js` renders it, served at
+`/dossier.js` under the page's CSP (`script-src 'self'`). The server adds one endpoint, `GET /api/dossier?run=<id>`,
+which returns `{spec, evidence, engine, calibration}`. The page fetches it only when a dossier tab is open, so the
+20-second poll of `/api/run` does not grow. The module adds no new dependency and writes nothing.
+
+**Read model.** Every run artifact is read through the console's confined reader (`run_console._load_rel`: a plain
+relative path, no `..`, no absolute path, no credential file, no link at any component, one no-follow fd). The
+reader also parses JSON and YAML. Paths named inside artifacts are untrusted and pass through the same reader: the
+units table named by the spec, a derivation's script, inputs and outputs, and the provenance file's inputs.
+Directories are listed through no-follow directory fds (`lib.safe_io.dir_fd_nofollow`). No harness loader runs, and
+no engine is imported or instantiated. The console never calls `toolkit/spec/schema.load` or
+`benchmark.verified_benchmarks(engine)`, because both need an engine instance built from a name in an artifact.
+There is one read outside the run directory: this checkout's own `toolkit/engines/<name>/benchmarks/results.yaml`.
+Its path is built from a fixed pattern (`<name>` must match `[a-z0-9_]+`). It is read only to show the re-stamp
+record, and only when its sha256 equals the one the run recorded in `analysis/engine.yaml` `inputs`. When the hashes
+differ, the tab says so and shows no re-stamp status.
+
+**Fail closed.** Each section, and each part within a section, is either data or
+`{"available": false, "why": "<file>: <reason>"}`. The tab shows "Not available: <why>" in that place, never an empty
+panel. A missing file reads "not written by this run (yet)". A file that cannot be read or parsed shows the reader's
+error.
+
+**Style (as the rest of the console).** Anything with rows and columns is a table. Values carry real units ($, years,
+days, the card's own units), with the existing `num()` formatting. Jargon is marked from the glossary, which gains
+the dossier's terms (emulator, emulator inversion, held out, fitted, price rule, cost basis, re-stamped by proof,
+validate_once, identifiability, clamped, engine attribute binding, defaults accepted). Each section opens with one
+muted line: what it is, and "Needs you: …". No raw JSON or YAML is shown. Each section has a "raw" button that opens
+the source file in the side panel through the existing `/api/file` route (text lines, the confined read).
+
+### 15.1 What each tab shows (artifact names from the code)
+
+| Tab | Part | Source (writer) |
+|---|---|---|
+| Spec | question, decision maker and date | `decision_spec.yaml` (owner, signed by `toolkit/spec/signoff.py`) |
+| | decision units: table, id, label and region columns, count of units and regions | the spec's `decision_units`, plus a count of the rows of the units table it names (`decision_units.csv`) |
+| | engine attribute bindings: attribute, how it is bound (column, columns, value), with the source or split | `decision_units.engine_attributes` |
+| | defaults accepted, each with its reason; populations | `decision_units.defaults_accepted`, `decision_units.populations` |
+| | components (group, eligible population), packages, engine map | `options.components`, `options.packages`, `options.engine_map` |
+| | cost items: component, value, price year, rule, basis, includes, base-year value and the derived per-person cost over the window | `options.cost_items` and `options.prices`. The derivation follows `toolkit/alloc/costs.py` `item_cost`: value × price factor × share × times × years, divided by `people_per_commodity` for `per_commodity`. A `per_outcome` item has no per-person figure; it is priced per outcome |
+| | objective (outcome, sense, outcome window, delivery period, discounting); constraints (envelope, fixed costs, eligibility); comparator | `objective`, `constraints`, `comparator` |
+| | calibration (method, attribute, range, target column, window, metric, target uncertainty, target frame) | `calibration` |
+| | uncertainty sources and draws; cost ranges | `uncertainty` |
+| | decision tests: id, type, what is varied, values with units, question | `analysis.decision_tests`. Units for a parameter test come from the engine card's parameter table (`analysis/engine.yaml`); an interaction test's values are multipliers (×) |
+| | sign-off history: who signed, when, the note, the spec sha256 and the derivation record's sha256; whether the current spec still matches | `decision_spec.signoff.json` (current); `evidence_planner/superseded_signoff_*/decision_spec.signoff.json` (archived) |
+| | for each archived sign-off, a structured diff against the next one: field, before, after, grouped by section | the archived spec is the file under that folder whose sha256 equals the archived record's. The next is the next archived one by `signed_at`, or the current spec for the newest. Lists of objects with an `id` are compared by id. When the archived spec cannot be found by hash, the diff reads "not available" |
+| Evidence | evidence registry: each entry's value, source and citation, where it is used, status. A stub registry (`status: stub`) says that no parameter has been fetched or matched | `evidence/registry.yaml` (`stage_machine.h_EVIDENCE`) |
+| | staged parameter registries: name, value (with interval), kind, source, citation, where the spec uses it (spec fields that name it) | any `data/inputs/**/*registry*.yaml` with a `parameters:` list |
+| | citations: id, title, value, source, DOI or URL, which entries cite it | `citations_*.txt` in `data/inputs/**` or the run root (`## [<id>] <title>` blocks with `- **Key**: value` lines) |
+| | staged inputs: path, source, size, sha256 then and now (match, changed, missing), which derivation reads it, or why it is ignored | `data/inputs_provenance.json` (`inputs`, `cited`), `data/derivations.yaml` |
+| | derivations: input file → script → output columns; the columns used and ignored per input, with reasons; the record (ok, runs, runtime, sandbox, libraries, script and output sha256 then and now) | `data/derivations.yaml`, `data/derivations_record.json` (`scripts/pipeline.py derive`); the output's header row |
+| | input checks (geometry): status, reason, counts, findings (severity, code, units, claim, accepted) | `data/input_checks.json` (`toolkit/spec/geometry.py`), when present |
+| Engine | engine choice: candidates (name, version, eligible, why not), the chosen engine and why | `engine_choice.json` |
+| | engine card: mechanisms; components and their levels; unit attributes with valid range and the spec's binding; outputs; age groups; notes | `analysis/engine.yaml` `data.card` (the harness's snapshot of the card) |
+| | parameters: name, kind (fitted, fixed, scenario), value with units, prior range, fit box and the benchmarks fitted to, verified, source | `analysis/engine.yaml` `data.parameters` and `data.card.fitted` |
+| | benchmarks: id, what it tests, model value, target, band, in or out of band (out-of-band rows flagged), role (fit or held out), source | `analysis/engine.yaml` `data.card.benchmarks` |
+| | re-stamp and confirmation: "re-stamped by proof, not recomputed" or "computed by this code"; the old and new versions; proof identical; `validate_once` pending, done, or not recorded | the checkout's `results.yaml` `restamped` record, shown only under the hash rule above |
+| | engine identity: name, version, card sha256, engine-choice sha256, code fingerprint of the stored batches | `analysis/*.yaml` `engine` block; `analysis/**/*.summary.json` `code_fp`; the results file's `engine_identity` under the hash rule |
+| Calibration | method, attribute, range, metric, target column and window | the spec's `calibration`; `analysis/calibration.yaml` `method` |
+| | per region: units, target mean, calibrated value range, clamped units, smallest slope; per unit behind a toggle | `analysis/calibration.yaml` `data.units` joined with the units table's target and region columns. The model's value at the fitted point is not stored per unit, so the tab says so and shows the inversion's largest residual (`diagnostics.target_logit_residual_max`) |
+| | emulator held-out accuracy: held-out and training points, calibration-metric RMSE (logit), R² (median, 10th percentile), error model | `analysis/emulator.yaml` `data.accuracy` |
+| | clamped units; identifiability verdict, design and unidentified units | `analysis/calibration.yaml` `diagnostics`, `identifiability` |
+
+### 15.2 Tests (written first, `python3 tools/run_console/dossier.py --self-test`)
+
+| Case | Checks |
+|---|---|
+| DS1 | a synthetic run dir with every artifact (toy numbers): two archived sign-offs and the current one, a registry with entries, a staged parameter registry, citations, provenance, a derivation and its record, an input check, engine choice, card, parameters, an out-of-band benchmark, calibration, emulator. Each tab's data model has the expected rows and values: unit and region counts, bindings, the derived per-person cost of a `per_commodity` item, decision-test units, the sign-off history in time order with its diffs (a changed field and an added test), used and ignored columns with reasons, provenance changed and missing, the out-of-band benchmark flagged, re-stamp pending, per-region calibration rows |
+| DS2 | fail closed: every artifact missing gives "not available" with a reason in each part. A file that cannot be parsed, an archived spec not found by hash, and a checkout results file whose hash differs from the run's each give their own reason |
+| DS3 | no reads outside the run dir: a units table, derivation input, provenance path and archived folder named as `../x`, an absolute path, or a link to a sentinel file outside the run dir are refused with a reason, and the sentinel's content never appears. Every file the dossier opens (traced) is under the run dir or is the checkout's results file allowed by the hash rule |
+| DS4 | escaping: the RV1a lint (`_attr_interpolations`) covers `dossier.js`. Hostile strings (`<img src=x onerror=…>`, `" onmouseover="…`) in the spec, registry, card and sign-off note reach the rendered HTML of each tab only escaped (node, with a stub DOM, when node is installed) |
+| DS5 | `/api/dossier` returns the four sections for a known run, refuses an unknown run, and the page loads `/dossier.js` under the CSP; every glossary term the dossier marks has a definition and a source |
+
+Then a check in Chrome on port 8793 against the toy run, and read-only against the owner's real runs.
+
+### 15.3 Review round 1 (Codex, on #132)
+
+Each finding was reproduced by a failing self-test first (DR1-DR9).
+
+- **The calibration is joined only to the inputs it was computed from (DR1).** The tab compares the calibration
+  envelope's `spec_sha256` and its recorded `inputs` hashes with the bytes read now. The units table must be among
+  those inputs, and it is parsed from the same read that was hashed. On any mismatch the section reads "not
+  available: inputs changed since the analysis (<files>)". An envelope without these hashes is not joined either.
+- **The tab renders by the artifact's method (DR2).** `emulator_inversion` shows what it showed before. `likelihood`
+  and `posterior` show convergence, bound hits, the Pearson statistic and residuals, observed vs expected per target,
+  identifiability per parameter, and the fitted values. `none` says the spec calibrates nothing. Any other method
+  reads "not supported". A failure sets "Needs you: yes": clamped units, an identifiability status other than
+  well identified, no convergence, a parameter at a bound, or a target with no expected count.
+- **Required fields per section (DR3).** A payload without its required fields, or with the wrong type, is "not
+  available: <file>: missing <field>", never zeros. The fields: the spec's question and decision units, the
+  registry's entries, the provenance's inputs, the derivations list, the input check's status, counts and findings,
+  the engine choice's engine and candidates, the card's name and benchmarks and the parameters, the calibration's
+  method, units and diagnostics, and the emulator's held-out points.
+- **`per_reached` is priced per person reached (DR4)**, with the reach share in the basis column.
+- **An archived spec is hashed and parsed from one read (DR5).**
+- **The re-stamp chain (DR6).** `restamped.previous` is newest first, so the oldest record's old version computed the
+  numbers, and every later version only re-stamped them: "computed by v0.5; re-stamped by proof to v0.6, v0.7".
+- **Equation and identity benchmarks keep their criterion (DR7):** reference, comparison, tolerance and the absolute
+  and relative errors, in one criterion column beside target-and-band rows.
+- **Small values keep their significant digits (DR8):** below 1e-3 in scientific notation (`1.2e-8`).
+- **Decision tests (DR9):** a removed group rule names the rule and what it was, from `constraints.group_rules`; an
+  added rule names what it adds; an envelope test states it varies the envelope, with values in USD.
+
+Round 2 (Codex, on #132; DR10-DR12): the units table the calibration joins is parsed from the exact entry whose hash
+was checked; the freshness checks run first for every method, `none` included; tolerances are formatted with
+`sig()` (`1e-15`, not `0`); a removed group rule is looked up in the raw spec's list of `constraints.group_rules`
+(`[{id, ...}]`), and the DR9 fixture uses that shape.

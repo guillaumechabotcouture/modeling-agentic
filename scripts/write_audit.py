@@ -26,7 +26,7 @@ HARNESS = (
     "agents/v2_sdk_tasks.py", "agents/v2_tasks.py",
     "scripts/pipeline.py", "scripts/compute.py", "scripts/scope_signoff.py", "scripts/decision_brief.py",
     "toolkit/spec/signoff.py", "toolkit/spec/schema.py", "toolkit/analysis/artifacts.py", "toolkit/analysis/run.py",
-    "toolkit/analysis/batch.py", "tools/run_console/run_console.py",
+    "toolkit/analysis/batch.py", "tools/run_console/run_console.py", "tools/run_console/dossier.py",
 )
 PATTERNS = {
     "open-write": re.compile(r"""(?<![\w.])open\(.*?,\s*(?:mode\s*=\s*)?["'][rwab+x]*[wax+][rwab+x]*["']"""),
