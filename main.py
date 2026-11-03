@@ -467,7 +467,6 @@ async def run(question: str, max_rounds: int, max_sessions: int,
             print(f"SESSION {session_num}/{max_sessions}", flush=True)
             print(f"{'#'*60}", flush=True)
 
-            session_started = datetime.now()     # the lead's sign-off answers must be written after this
             trace_file = open(trace_path, "a")
             trace_file.write(json.dumps({
                 "ts": datetime.now().isoformat(),
@@ -707,6 +706,13 @@ LEAD_ANSWERS_HOWTO = ("Write {name} with the Write tool: `accept_proposed: true`
                       "adequate target>`. Then end your turn with the line AWAITING_SIGNOFF; the harness signs it.")
 
 
+def _utc(dt: datetime) -> datetime:
+    """A datetime in UTC, timezone-aware. The hook records UTC-aware times; main.py's session start is local-aware
+    (`datetime.now().astimezone()`); a naive time (an older trace) is read as local time."""
+    from datetime import timezone
+    return dt.astimezone(timezone.utc)
+
+
 def _lead_wrote_answers(run_path: str, since) -> str | None:
     """None when the trace records the lead's own Write/Edit of the answers file (agents/hooks.py
     record_lead_answers) after `since`, with the file's current content; else why not."""
@@ -726,10 +732,10 @@ def _lead_wrote_answers(run_path: str, since) -> str | None:
         if not isinstance(rec, dict) or rec.get("type") != LEAD_ANSWERS_EVENT or rec.get("agent") != "lead":
             continue
         try:
-            at = datetime.fromisoformat(str(rec.get("ts")))
+            at = _utc(datetime.fromisoformat(str(rec.get("ts"))))
         except ValueError:
             continue
-        if since is not None and at < since:
+        if since is not None and at < _utc(since):
             break
         if rec.get("sha256") == sha:
             return None

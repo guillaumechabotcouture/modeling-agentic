@@ -385,16 +385,18 @@ def record_lead_answers(run_path: str, input_data: dict, trace_file) -> None:
     if "agent_id" in input_data or input_data.get("tool_name") not in ("Write", "Edit", "MultiEdit"):
         return
     p = str((input_data.get("tool_input") or {}).get("file_path") or "")
-    target = os.path.join(run_path, decision_brief.LEAD_ANSWERS)
-    if not p or os.path.normpath(os.path.join(run_path, p)) != os.path.normpath(target):
+    target = os.path.realpath(os.path.join(run_path, decision_brief.LEAD_ANSWERS))
+    # resolved as enforcement resolves a tool's path: the call's cwd (else the repo root) plus the path, then realpath
+    if not p or os.path.realpath(enforcement._abspath(p, input_data.get("cwd"))) != target:
         return
     import hashlib
+    from datetime import timezone
     try:
         sha = hashlib.sha256(open(target, "rb").read()).hexdigest()
     except OSError:
         return
-    _safe_write(trace_file, {"ts": datetime.now().isoformat(), "type": LEAD_ANSWERS_EVENT, "agent": "lead",
-                             "sha256": sha})
+    _safe_write(trace_file, {"ts": datetime.now(timezone.utc).isoformat(), "type": LEAD_ANSWERS_EVENT,
+                             "agent": "lead", "sha256": sha})
 
 
 def create_hooks(run_path: str, trace_file, start_time: datetime,
