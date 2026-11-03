@@ -1015,9 +1015,10 @@ class Machine:
         return [f"{p['code']}: {p['claim']}" for p in rep["problems"]]
 
     def _write_sheet(self) -> None:
+        """The sign-off sheet, with the source hashes it was made from, published with no link followed (review
+        round 3: signoff.write_sheet)."""
         from toolkit.spec import signoff
-        with open(os.path.join(self.run_dir, SIGNOFF_SHEET), "w") as f:
-            f.write(signoff.sheet(self.run_dir, getattr(self.backend, "candidates", None)))
+        signoff.write_sheet(self.run_dir, getattr(self.backend, "candidates", None))
 
     def h_SIGN(self):
         mode = self.st.signoff
@@ -2362,7 +2363,8 @@ def _self_test_derived(ok, td: str) -> None:
     with open(os.path.join(mods, "attribute_binding.yaml"), "w") as f:
         yaml.safe_dump({"attribute_binding": {"x": "required", "group": "required"}}, f)
     sys.path.insert(0, mods)
-    S.TEST_ENGINE_REFS.add("di8_engines:NeedsGroup")       # a test engine outside toolkit/engines (allowlist)
+    from toolkit import import_guard as _G
+    _G.allow_for_test("engine", "di8_engines")             # a test engine outside toolkit/engines (allowlist)
     fake = os.path.join(td, "di8repo")
     os.makedirs(os.path.join(fake, "toyraw"))
     tmp = os.path.join(td, "di8src")

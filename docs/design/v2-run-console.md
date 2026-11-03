@@ -369,3 +369,35 @@ Each finding reproduced first (RW1-RW11, SP-RW1-4, SG13-18, SO23, RS6-8, T71).
   a per-process HMAC; feedback and chat store that snapshot when its seal checks, else one captured at submit time
   (marked `captured: submit`).
 - **Lineage:** every relation is marked "(inferred)" until the harness records parent run ids.
+
+## 13. Review round 3 (Codex, on #129)
+
+Trust model: the harness must hold when agent-written artifacts in a run dir are hostile (specs, derivation records
+and outputs, links, temporary files). Two shared mechanisms instead of point patches:
+
+- **One import guard** (`toolkit/import_guard.py`). Every module or attribute name that comes from a spec, a
+  benchmark pack or a run artifact is imported through it, with an allowlist policy per kind: engines (modules under
+  `toolkit/engines/`, plus `toolkit.spec.priors:ToyPriorEngine`), oracles (`toolkit.engines.*.oracles` and
+  `toolkit.engines.benchmark`'s self-test generator), calibrators (`toolkit.analysis.calibration` and modules under
+  `toolkit/engines/`). The module must be a file of the repo, checked before anything is imported; private
+  attributes are refused. `schema.load_engine`/`engine_class`/`binding_for_ref` (reached by the sign-off sheet),
+  the legacy `spike/analysis/spec.py` loader, and the benchmark oracle and calibrator imports (including the
+  calibrator code digest) go through it. `scripts/import_audit.py --self-test` greps every tracked Python file for
+  `import_module(`, `__import__(` and `spec_from_file_location(` with a non-literal argument; each must be in the
+  guard or listed in its REVIEWED table with the reason its name cannot come from an artifact (exact counts per
+  file, so a new site fails CI).
+- **One publisher** (`scripts/lib/safe_io.py`): harness writes in a run dir go through `write_nofollow` (no link
+  followed at any component, a random temporary name, atomic rename). Round 3 moves the derivation record
+  (`pipeline._write_json`), the derivation outputs (`pipeline._publish_outputs`: read with no link followed in the
+  work dir, published atomically) and the sign-off sheet (`signoff.write_sheet`, called by the stage machine) onto it.
+
+Also: `compute.code_fingerprint(confined=True)` hashes the run's files through no-follow fds and refuses a link
+anywhere under `models/` or `data/` (the entries themselves included) or a function file outside the run dir and
+the repo; with no links its output is byte-identical to the default, which is unchanged (so batch reuse is
+unchanged). The console uses it. `signoff.derived_changed` reads the record and hashes every output through
+no-follow fds. The sheet writer records the spec and derivation-record hashes it was generated from in the sheet's
+last line; the console marks a sheet whose sources no longer match as stale and disables approval, and the signer
+refuses it. The brief sign-off validates the captured `success_criteria.yaml` bytes. Evidence seals carry the
+canonical run id and are checked against the run they are submitted to; the page clears the composer's anchor when
+the run changes; gate cards and the figure side panel carry their render-time snapshot; a blocker's own `evidence`
+field is kept and the snapshot is stored under `snapshot`.

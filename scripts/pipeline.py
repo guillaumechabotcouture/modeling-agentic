@@ -627,12 +627,29 @@ def _load_state(run_dir: str) -> dict:
 
 
 def _write_json(run_dir: str, rel: str, obj) -> str:
-    p = os.path.join(run_dir, rel)
-    os.makedirs(os.path.dirname(p), exist_ok=True)
-    with open(p + ".tmp", "w") as f:
-        json.dump(obj, f, indent=1, sort_keys=True)
-    os.replace(p + ".tmp", p)
-    return rel.replace(os.sep, "/")
+    """Publish a harness record in the run dir atomically, with no link followed (lib.safe_io; a random temporary
+    name, never a predictable `.tmp` an artifact could plant)."""
+    from lib.safe_io import write_nofollow
+    rel = rel.replace(os.sep, "/")
+    write_nofollow(run_dir, rel, json.dumps(obj, indent=1, sort_keys=True).encode(), atomic=True)
+    return rel
+
+
+def _publish_outputs(work: str, run_dir: str, outputs) -> dict:
+    """Copy a derivation's outputs from its work dir into the run dir: each read with no link followed in the work
+    dir (an output that is a link is refused) and published atomically with no link followed in the run dir.
+    Returns {output: sha256 of the bytes published}."""
+    import hashlib
+    from lib.safe_io import read_nofollow, write_nofollow, LinkRefused
+    out = {}
+    for o in outputs:
+        try:
+            data = read_nofollow(work, o)[0]
+        except LinkRefused as e:
+            raise ValueError(f"derivation output {o}: {e}") from None
+        write_nofollow(run_dir, o, data, atomic=True)
+        out[o] = hashlib.sha256(data).hexdigest()
+    return out
 
 
 def _why_stale(step: dict, run_dir: str, rec: dict | None) -> str | None:
@@ -1589,13 +1606,14 @@ def derive(run_dir: str, unsandboxed_ok: bool = False, limits: dict | None = Non
                                + ("could not be made" if runs[-1]["rc"] != 0 else "changed")
                                + ", so the derivation uses them: move them to columns.uses")
             if not why:
-                for o in d["outputs"]:
-                    dest = os.path.join(run_dir, o)
-                    os.makedirs(os.path.dirname(dest), exist_ok=True)
-                    shutil.copyfile(os.path.join(runs[0]["work"], o), dest + ".tmp")
-                    os.replace(dest + ".tmp", dest)
-                entry.update(ok=True, code=None, outputs={o: _sha(os.path.join(run_dir, o)) for o in d["outputs"]})
-                rep["ran"].append(sid)
+                try:
+                    published = _publish_outputs(runs[0]["work"], run_dir, d["outputs"])
+                except (ValueError, OSError) as e:
+                    why.append(f"outputs not published: {e}")
+                    entry["code"] = "derivation_output_unsafe"
+                else:
+                    entry.update(ok=True, code=None, outputs=published)
+                    rep["ran"].append(sid)
         finally:
             for r in runs:
                 shutil.rmtree(r["work"], ignore_errors=True)

@@ -130,16 +130,26 @@ def _load(path: str):
         return yaml.safe_load(f)
 
 
-def _criteria_ids(run_dir: str) -> set[str]:
+_UNSET = object()
+
+
+def _criteria_ids(run_dir: str, data=_UNSET) -> set[str]:
+    """The success criteria ids. `data`: the bytes of success_criteria.yaml already captured by the sign-off (None:
+    the file was absent), so the sign-off validates what it hashes (review round 3, P2-5)."""
     try:
-        doc = _load(os.path.join(run_dir, CRITERIA)) or {}
-    except (OSError, yaml.YAMLError):
+        if data is _UNSET:
+            doc = _load(os.path.join(run_dir, CRITERIA)) or {}
+        else:
+            doc = (yaml.safe_load(data.decode("utf-8")) if data is not None else {}) or {}
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        return set()
+    if not isinstance(doc, dict):
         return set()
     return {str(c.get("id")) for sec in ("hard_blockers", "minimum_bar", "targets")
             for c in (doc.get(sec) or []) if isinstance(c, dict) and c.get("id")}
 
 
-def load_brief(run_dir: str, data: bytes | None = None):
+def load_brief(run_dir: str, data: bytes | None = None, criteria=_UNSET):
     """(doc, errors). `data`: the brief's bytes, already read (the sign-off validates the bytes it hashes)."""
     path = os.path.join(run_dir, BRIEF)
     if data is None and not os.path.exists(path):
@@ -150,10 +160,10 @@ def load_brief(run_dir: str, data: bytes | None = None):
         return None, [f"{BRIEF} does not parse: {str(e)[:120]}"]
     if not isinstance(doc, dict):
         return None, [f"{BRIEF} must be a mapping"]
-    return doc, validate(doc, run_dir)
+    return doc, validate(doc, run_dir, criteria)
 
 
-def validate(doc: dict, run_dir: str) -> list[str]:
+def validate(doc: dict, run_dir: str, criteria=_UNSET) -> list[str]:
     errors = [f"{k}: missing or empty" for k in _TEXT if not str(doc.get(k) or "").strip()]
     seen: set[str] = set()
     for key, prefix in _LISTS.items():
@@ -194,7 +204,7 @@ def validate(doc: dict, run_dir: str) -> list[str]:
     if not isinstance(acc, list) or not acc:
         errors.append("acceptance: list the success_criteria.yaml ids this run is judged by")
     else:
-        known = _criteria_ids(run_dir)
+        known = _criteria_ids(run_dir, criteria)
         unknown = [str(a) for a in acc if str(a) not in known]
         if unknown:
             errors.append(f"acceptance: not in {CRITERIA}: {', '.join(unknown)}")
@@ -358,7 +368,7 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
     for f, want in (expect or {}).items():
         if shas.get(f) != want:
             raise ValueError(f"{f} changed since it was shown; read it again before signing")
-    doc, errors = load_brief(run_dir, captured[BRIEF]) if captured[BRIEF] is not None else (None, [
+    doc, errors = load_brief(run_dir, captured[BRIEF], captured[CRITERIA]) if captured[BRIEF] is not None else (None, [
         f"{BRIEF} does not exist"])
     if errors:
         raise ValueError("brief not ready: " + "; ".join(errors))

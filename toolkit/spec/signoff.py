@@ -65,33 +65,41 @@ def status(run_dir: str) -> str:
 
 def derived_changed(run_dir: str, rec: dict) -> list[str]:
     """What changed since sign-off among the derivation record and the derived files it lists (empty: nothing). A
-    sign-off made before the record existed, in a run that has none, is unaffected."""
+    sign-off made before the record existed, in a run that has none, is unaffected. Everything is read through
+    no-follow fds (review round 3, P1-3): there is no path check to race."""
     signed = (rec.get("sha256") or {}).get(DERIVATIONS_RECORD)
-    now = DB._sha(os.path.join(run_dir, DERIVATIONS_RECORD))
+    try:
+        raw = read_nofollow(run_dir, DERIVATIONS_RECORD)[0]
+    except FileNotFoundError:
+        raw = None
+    except (LinkRefused, OSError):
+        return [DERIVATIONS_RECORD]
+    now = hashlib.sha256(raw).hexdigest() if raw is not None else None
     if signed is None and now is None:
         return []
     if signed != now:
         return [DERIVATIONS_RECORD]
     try:
-        derivs = (json.load(open(os.path.join(run_dir, DERIVATIONS_RECORD))) or {}).get("derivations") or {}
-    except (OSError, ValueError):
+        derivs = (json.loads(raw.decode("utf-8")) or {}).get("derivations") or {}
+    except (UnicodeDecodeError, ValueError, AttributeError):
         return [DERIVATIONS_RECORD]
+    return _outputs_changed(run_dir, derivs)
+
+
+def _outputs_changed(run_dir: str, derivs: dict) -> list[str]:
+    """The listed derivation outputs whose bytes differ from the record. Each is hashed through a no-follow fd; an
+    output outside the run dir, behind a link, or unreadable is a change and is never read (the record is written by
+    a derivation script an agent wrote)."""
     out = []
-    for e in derivs.values():
-        for o, h in ((e or {}).get("outputs") or {}).items():
-            # The record is written by a derivation script an agent wrote: an output outside the run dir is a change
-            # (it cannot have been derived here) and is never hashed (review round 2, P1-4).
-            if not _inside(run_dir, str(o)) or DB._sha(os.path.join(run_dir, o)) != h:
+    for e in (derivs or {}).values():
+        for o, h in ((e or {}).get("outputs") or {}).items() if isinstance(e, dict) else []:
+            try:
+                same = _sha_nofollow(run_dir, str(o)) == h
+            except (ValueError, OSError):
+                same = False
+            if not same:
                 out.append(o)
     return sorted(out)
-
-
-def _inside(run_dir: str, rel: str) -> bool:
-    parts = rel.replace("\\", "/").split("/")
-    if not rel or os.path.isabs(rel) or ".." in parts:
-        return False
-    root = os.path.realpath(run_dir)
-    return os.path.realpath(os.path.join(root, rel)).startswith(root + os.sep)
 
 
 def _sha_nofollow(run_dir: str, rel: str) -> str | None:
@@ -129,8 +137,20 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     dsha = _sha_nofollow(run_dir, DERIVATIONS_RECORD)
     if expect_derivations_sha256 is not None and (dsha or "none") != expect_derivations_sha256:
         raise ValueError(f"{DERIVATIONS_RECORD} changed since the sheet was shown: read it again before signing")
-    if expect_sheet_sha256 is not None and (_sha_nofollow(run_dir, SHEET) or "none") != expect_sheet_sha256:
+    try:
+        sheet_bytes = read_nofollow(run_dir, SHEET)[0]
+    except FileNotFoundError:
+        sheet_bytes = None
+    except LinkRefused as e:
+        raise ValueError(f"{SHEET}: {e}") from None
+    sheet_sha = hashlib.sha256(sheet_bytes).hexdigest() if sheet_bytes is not None else "none"
+    if expect_sheet_sha256 is not None and sheet_sha != expect_sheet_sha256:
         raise ValueError(f"{SHEET} changed since it was shown: read it again before signing")
+    src = sheet_sources(sheet_bytes.decode("utf-8", "replace")) if sheet_bytes is not None else None
+    if sheet_bytes is not None and (src is not None or expect_sheet_sha256 not in (None, "none")) and (
+            src is None or src.get("spec_sha256") != sha or src.get("derivations_sha256") != (dsha or "none")):
+        raise ValueError(f"{SHEET} was generated from another spec or derivation record (it is stale): the sheet is "
+                         "regenerated before the owner signs; read the new one")
     errs = schema.validate(schema.load(os.path.join(run_dir, SPEC), data=data), pending_ok=True)
     if errs:
         raise ValueError("spec not ready: " + "; ".join(errs[:10]))
@@ -149,6 +169,40 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     except (LinkRefused, OSError) as e:
         raise ValueError(f"sign-off not written: {e}") from None
     return record
+
+
+SHEET_SOURCES = "<!-- signoff-sheet-sources: "
+
+
+def sheet_sources(text) -> dict | None:
+    """The source hashes the sheet writer recorded in the sheet ({spec_sha256, derivations_sha256}), or None."""
+    if not isinstance(text, str):
+        return None
+    for line in reversed(text.splitlines()):
+        if line.startswith(SHEET_SOURCES) and line.endswith(" -->"):
+            try:
+                d = json.loads(line[len(SHEET_SOURCES):-4])
+            except ValueError:
+                return None
+            return d if isinstance(d, dict) else None
+    return None
+
+
+def write_sheet(run_dir: str, candidates: list | None = None) -> str:
+    """Generate the sign-off sheet and publish it (no link followed, atomic), with the hashes of the spec and the
+    derivation record it was generated from recorded in its last line. The hashes are taken before and after the
+    sheet is generated; a change in between is retried, so the record is the sources the text was made from. The
+    console disables approval and the signer refuses when they no longer match (review round 3, P1-4)."""
+    for _ in range(3):
+        before = (_sha_nofollow(run_dir, SPEC), _sha_nofollow(run_dir, DERIVATIONS_RECORD) or "none")
+        text = sheet(run_dir, candidates)
+        after = (_sha_nofollow(run_dir, SPEC), _sha_nofollow(run_dir, DERIVATIONS_RECORD) or "none")
+        if before == after:
+            src = json.dumps({"spec_sha256": before[0], "derivations_sha256": before[1]}, sort_keys=True)
+            write_nofollow(run_dir, SHEET, (text.rstrip("\n") + f"\n\n{SHEET_SOURCES}{src} -->\n").encode(),
+                           atomic=True)
+            return os.path.join(run_dir, SHEET)
+    raise ValueError(f"{SPEC} or {DERIVATIONS_RECORD} kept changing while the sheet was written")
 
 
 def sheet(run_dir: str, candidates: list | None = None) -> str:
@@ -339,7 +393,7 @@ def _self_test() -> int:
         ok(len(opens) == 1, f"SG15 the spec is read once: validated, hashed and copied from the same bytes ({opens})")
     with tempfile.TemporaryDirectory() as d:
         p = schema.toy_spec(d)
-        open(os.path.join(d, SHEET), "w").write("sheet\n")
+        write_sheet(d)        # round 3: the sheet records the sources it was made from
         sh = DB._sha(p)
         res = []
         for kw in ({"expect_derivations_sha256": "0" * 64}, {"expect_sheet_sha256": "0" * 64}):

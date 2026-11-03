@@ -213,7 +213,10 @@ async function renderLearning() {
 }
 
 // ---- one run: header, stepper, stream
-async function selectRun(id) { S.runId = id; S.filter = null; S.cmp = null; await refresh(); if (S.tab === "runs") renderRuns(); }
+async function selectRun(id) {   // the composer's anchor and snapshot belong to the run they were taken in
+  if (id !== S.runId) setAnchor(null, null, null);
+  S.runId = id; S.filter = null; S.cmp = null; await refresh(); if (S.tab === "runs") renderRuns();
+}
 async function refresh() {
   // Only the answer to the latest request is shown: a slower answer for an earlier request, or for a run no
   // longer selected, is dropped (request sequence). Decisions are disabled until the answer is in.
@@ -364,7 +367,7 @@ function blockerTable(g) {
     const tog = "bt" + (++TOG_N);
     return `<tr class="row" data-tog="${esc(tog)}"><td>${esc(c.blocker_id)}</td><td>${T(c.severity)}</td><td>${esc(c.reviewer || "")}</td><td>${esc(stage(c.target_stage))}</td><td class="clip">${bench(String(c.claim || "").split("\n")[0])}</td><td>${c.resolved ? '<span class="ok-i">✓ resolved</span>' : "open"}</td></tr>
       <tr class="more" id="${esc(tog)}" hidden><td colspan="6"><div>${bench(c.claim || "")}</div>${c.evidence ? `<div class="sub">Evidence: ${bench(c.evidence)}</div>` : ""}${c.fix_requires ? `<div class="sub">Fix requires: ${bench(c.fix_requires)}</div>` : ""}
-      <div class="acts"><button data-act="agree" data-ref="${ref({ anchor: c.anchor || {}, evidence: c.evidence })}">Agree</button><button data-act="disagree" data-ref="${ref({ anchor: c.anchor || {}, evidence: c.evidence })}">Disagree</button><button data-act="comment" data-ref="${ref({ anchor: c.anchor || {}, evidence: c.evidence })}">Comment</button><button data-act="open" data-file="${esc(c.anchor.file)}" data-anchor-id="${esc(c.blocker_id)}">Open</button></div></td></tr>`;
+      <div class="acts"><button data-act="agree" data-ref="${ref({ anchor: c.anchor || {}, evidence: c.snapshot })}">Agree</button><button data-act="disagree" data-ref="${ref({ anchor: c.anchor || {}, evidence: c.snapshot })}">Disagree</button><button data-act="comment" data-ref="${ref({ anchor: c.anchor || {}, evidence: c.snapshot })}">Comment</button><button data-act="open" data-file="${esc(c.anchor.file)}" data-anchor-id="${esc(c.blocker_id)}">Open</button></div></td></tr>`;
   }).join("");
   const high = g.rows.filter((c) => c.severity === "HIGH" && !c.resolved).length;
   return `<div class="card"><div class="head"><span class="t">Critique${g.round != null ? " round " + esc(g.round) : ""}: ${g.rows.length} ${T("blocker", "blockers")}, ${high} open ${T("HIGH")}</span>${when(g.at)}</div>
@@ -391,7 +394,7 @@ function dtTable(g) {
     <table class="t"><tr><th>id</th><th style="width:44%">what it tests</th><th class="n">value tested</th><th>plan changes?</th><th class="n">units changed</th><th class="n"><span class="term" tabindex="0" title="The objective of the plan re-solved at the tested value, relative to the point plan's objective evaluated at the same value: how much re-optimising gains (models/decision_tests/*.yaml: objective vs point_plan_objective_under_test).">re-solved vs point plan</span></th></tr>${rows}</table></div>`;
 }
 function card(c) {
-  const comment = c.anchor ? `<button data-act="comment" data-ref="${ref({ anchor: c.anchor, evidence: c.evidence })}">Comment</button>` : "";
+  const comment = c.anchor ? `<button data-act="comment" data-ref="${ref({ anchor: c.anchor, evidence: c.snapshot })}">Comment</button>` : "";
   const open = c.anchor && c.anchor.file ? `<button data-act="open" data-file="${esc(c.anchor.file)}" data-anchor-id="${esc(c.anchor.id || "")}">Open</button>` : "";
   const head = (t, extra) => `<div class="head"><span class="t">${t}</span>${extra || ""}${when(c.at)}</div>`;
   const line = (cls, txt) => `<div class="line ${esc(cls || "")}"><span class="x">${txt}</span>${when(c.at)}</div>`;
@@ -426,7 +429,7 @@ function decisionCard(c, head) {
   // The controls act on the run and the content this card was rendered for (ref), never on whatever run is
   // selected when the button is pressed; the server checks the ticket and the sign command the content.
   const k = ref({ run: c.run_id, ticket: c.ticket, sub: c.sub, sha: c.spec_sha256, dsha: c.derivations_sha256, ssha: c.sheet_sha256, fps: c.fingerprints || [] });
-  const block = remoteBlock(), dis = block ? " disabled" : "";
+  const block = remoteBlock() || (c.sub === "spec" && c.sheet_stale ? `The sign-off sheet is stale (${c.sheet_stale}); approval waits for the regenerated sheet.` : ""), dis = block ? " disabled" : "";
   const blockNote = block ? `<div class="small" style="color:var(--bad)">${esc(block)}</div>` : "";
   if (c.sub === "spec") return `<div class="card need">${head(esc(c.title))}${ctx("The run waits for the owner to sign its decision spec.", "yes, answer below.")}<div class="body">${md(c.body)}</div>
     <div class="small muted">Signing binds to decision_spec.yaml sha256 ${esc(String(c.spec_sha256 || "?").slice(0, 12))}; a spec changed since this page loaded is refused.</div>
@@ -536,7 +539,7 @@ async function openFile(file, anchor) {
   const url = "/api/file?" + q({ run: S.runId, path: file });
   if (/\.(png|jpe?g|svg)$/i.test(file)) {
     const fig = (S.run.cards || []).find((c) => c.kind === "figure" && c.file === file);
-    side(file, `<img src="${esc(url)}">${fig ? `<p>${esc(fig.body)}</p><p class="small muted">${esc(fig.producer || "")} ${fig.sources ? "from <code>" + fig.sources.map(esc).join("</code>, <code>") + "</code>" : ""}</p>` : ""}<div class="acts"><button data-act="comment" data-ref="${ref({ anchor: { kind: "figure", id: file, file } })}">Comment</button></div>`);
+    side(file, `<img src="${esc(url)}">${fig ? `<p>${esc(fig.body)}</p><p class="small muted">${esc(fig.producer || "")} ${fig.sources ? "from <code>" + fig.sources.map(esc).join("</code>, <code>") + "</code>" : ""}</p>` : ""}<div class="acts"><button data-act="comment" data-ref="${ref({ anchor: { kind: "figure", id: file, file }, evidence: fig && fig.snapshot })}">Comment</button></div>`);
     return;
   }
   let text;

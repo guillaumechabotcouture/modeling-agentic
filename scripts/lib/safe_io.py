@@ -266,8 +266,9 @@ def dir_fd_nofollow(base: str, parts, create: bool = False) -> int:
         raise
 
 
-def read_nofollow(base: str, rel: str, max_bytes: int | None = None) -> tuple[bytes, os.stat_result]:
-    """(bytes, fstat of the open file) of base/rel, read through one fd opened with no link followed."""
+def open_nofollow(base: str, rel: str) -> int:
+    """A read-only fd on the plain file base/rel, opened with no link followed at any component. The caller closes
+    it."""
     parts = _parts(rel)
     dfd = dir_fd_nofollow(base, parts[:-1])
     try:
@@ -279,10 +280,17 @@ def read_nofollow(base: str, rel: str, max_bytes: int | None = None) -> tuple[by
             raise LinkRefused(f"{rel}: cannot be opened without following a link ({e.strerror})") from None
     finally:
         os.close(dfd)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise LinkRefused(f"{rel}: not a plain file")
+    return fd
+
+
+def read_nofollow(base: str, rel: str, max_bytes: int | None = None) -> tuple[bytes, os.stat_result]:
+    """(bytes, fstat of the open file) of base/rel, read through one fd opened with no link followed."""
+    fd = open_nofollow(base, rel)
     try:
         st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            raise LinkRefused(f"{rel}: not a plain file")
         chunks, left = [], max_bytes if max_bytes is not None else -1
         while left != 0:
             b = os.read(fd, 1 << 20 if left < 0 else min(left, 1 << 20))

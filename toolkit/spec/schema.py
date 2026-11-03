@@ -406,36 +406,30 @@ class Spec:
                 "interval": meta, "label": render_claims.interval_label(meta)}
 
 
-# Run console review round 2 (P1-1): the spec names its engine as "module:Class", and an agent drafts the spec, so
-# the reference is untrusted. Only engines that ship under toolkit/engines/ load (the module's file must be there,
-# checked without importing anything), plus the repo's own test engines below; the class must implement the Engine
-# contract before it is instantiated. Anything else (subprocess:Popen, os:system, any other module) is refused
-# before an import.
-ENGINE_PACKAGE = "toolkit.engines"
-ENGINE_REFS_OUTSIDE_PACKAGE = frozenset({"toolkit.spec.priors:ToyPriorEngine"})   # a repo test engine
-TEST_ENGINE_REFS: set = set()        # self-tests only, in-process: engines a test writes into a temporary module
+# Run console review rounds 2-3 (P1-1): the spec names its engine as "module:Class", and an agent drafts the spec, so
+# the reference is untrusted. Every engine import goes through toolkit/import_guard.py (policy "engine": modules
+# under toolkit/engines/, checked as files before anything is imported); the class must implement the Engine
+# contract before it is instantiated.
 ENGINE_METHODS = ("describe", "parameters", "run")
-_REF = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*:[A-Za-z]\w*")
 
 
 def check_engine_ref(ref) -> tuple[str, str]:
     """(module, class) of an allowed engine reference, or SpecError. Imports nothing."""
-    if not isinstance(ref, str) or not _REF.fullmatch(ref):
-        raise SpecError(f"engine reference {str(ref)[:80]!r}: not 'module:Class'")
-    mod, cls = ref.split(":")
-    if ref in ENGINE_REFS_OUTSIDE_PACKAGE or ref in TEST_ENGINE_REFS:
-        return mod, cls
-    rel = os.path.join(ROOT, *mod.split("."))
-    if not mod.startswith(ENGINE_PACKAGE + ".") or not (os.path.isfile(rel + ".py")
-                                                        or os.path.isfile(os.path.join(rel, "__init__.py"))):
-        raise SpecError(f"engine {ref}: only engines under toolkit/engines/ are loaded (refused before any import)")
-    return mod, cls
+    from toolkit import import_guard as G
+    try:
+        return G.check_ref("engine", ref)
+    except G.ImportRefused as e:
+        raise SpecError(f"engine {str(ref)[:80]}: {e}") from None
 
 
 def engine_class(ref: str):
     """The engine class an allowed reference names, checked against the Engine contract; never instantiated."""
-    mod, cls = check_engine_ref(ref)
-    k = getattr(importlib.import_module(mod), cls, None)
+    from toolkit import import_guard as G
+    check_engine_ref(ref)
+    try:
+        k = G.resolve("engine", ref)
+    except G.ImportRefused as e:
+        raise SpecError(str(e)) from None
     if not isinstance(k, type) or not all(callable(getattr(k, m, None)) for m in ENGINE_METHODS):
         raise SpecError(f"engine {ref}: not a class implementing the Engine contract ({', '.join(ENGINE_METHODS)})")
     return k
@@ -552,9 +546,9 @@ def load_binding(engine) -> tuple[dict, list[str]]:
 
 
 def binding_for_ref(ref: str) -> dict:
-    """The attribute binding of an engine class named 'module:Class' (imported, not constructed)."""
-    mod, cls = str(ref).split(":")
-    return load_binding(getattr(importlib.import_module(mod), cls))[0]
+    """The attribute binding of an engine class named 'module:Class' (imported through the guard, not
+    constructed)."""
+    return load_binding(engine_class(ref))[0]
 
 
 def binding_rule(binding: dict, attr: str):

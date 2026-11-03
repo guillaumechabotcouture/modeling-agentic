@@ -2263,17 +2263,24 @@ _FP_RUNNER_FILES = ("pipeline.yaml", "pipeline_state.json", "pipeline_report.jso
 _FP_HASH_MB = 64           # files up to this size are fingerprinted by content, larger ones by size and mtime
 
 
-def code_fingerprint(run_dir: str, fn_spec: str, exclude=()) -> str:
+def code_fingerprint(run_dir: str, fn_spec: str, exclude=(), confined: bool = False) -> str:
     """What a result depends on besides its params: every file under the run's
     models/ and data/ (following symlinked directories) and the repo's
     scripts/ and toolkit/, except (outside data/) logs, figures, summaries, the ledger, the
     pipeline runner's own files in models/ (_FP_RUNNER_FILES), and this call's own results file (`exclude`), and any batch's partial rows or
     detached-job record; files up to 64 MB by content, larger ones by
-    size and mtime. Any change and earlier rows are not reused."""
+    size and mtime. Any change and earlier rows are not reused.
+
+    `confined` (the run console, which treats run artifacts as hostile; review round 3, P1-3): the run's files are
+    read through no-follow directory and file fds (lib.safe_io), a link anywhere under models/ or data/ (the entries
+    themselves included) or a function file outside the run dir and the repo raises ValueError, and nothing outside
+    the run dir is read. On a tree with no links the result is byte-identical to the default, which is unchanged."""
     run_dir = os.path.realpath(run_dir)
     h = hashlib.sha256()
     path = fn_spec.partition("::")[0]
     fn_file = path if os.path.isabs(path) else os.path.join(run_dir, path)
+    if confined:
+        _confined_check(run_dir, path)
     skip = {os.path.realpath(x) for x in exclude}
     files = {fn_file}
     links = []
@@ -2310,6 +2317,10 @@ def code_fingerprint(run_dir: str, fn_spec: str, exclude=()) -> str:
     for f in sorted(files):
         if os.path.realpath(f) in skip:
             continue
+        in_run = f.startswith(run_dir + os.sep)
+        if confined and in_run:
+            _hash_confined(h, run_dir, os.path.relpath(f, run_dir))
+            continue
         try:
             st = os.stat(f)
         except OSError:
@@ -2324,6 +2335,52 @@ def code_fingerprint(run_dir: str, fn_spec: str, exclude=()) -> str:
             h.update(f"{st.st_size}:{st.st_mtime_ns}".encode())
         h.update(b"\0")
     return h.hexdigest()[:20]
+
+
+def _confined_check(run_dir: str, fn_path: str) -> None:
+    """code_fingerprint(confined=True): no link under the run's models/ or data/ (the entries themselves included),
+    and the function file inside the run dir (relative, no "..") or inside the repo."""
+    for sub in ("models", "data"):
+        top = os.path.join(run_dir, sub)
+        if os.path.islink(top):
+            raise ValueError(f"{sub}/ is a link: not fingerprinted (confined)")
+        for dp, dirs, fns in os.walk(top):
+            for x in dirs + fns:
+                if os.path.islink(os.path.join(dp, x)):
+                    raise ValueError(f"{os.path.relpath(os.path.join(dp, x), run_dir)} is a link: not fingerprinted "
+                                     "(confined)")
+    if os.path.isabs(fn_path):
+        if not os.path.realpath(fn_path).startswith(os.path.realpath(REPO) + os.sep):
+            raise ValueError("the batch function's file is outside the run dir and the repo (confined)")
+    elif not fn_path or ".." in fn_path.replace("\\", "/").split("/"):
+        raise ValueError("the batch function's path leaves the run dir (confined)")
+
+
+def _hash_confined(h, run_dir: str, rel: str) -> None:
+    """The default loop's update for one run file, read through no-follow fds (a link raises ValueError)."""
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    from lib.safe_io import open_nofollow, LinkRefused
+    try:
+        fd = open_nofollow(run_dir, rel)
+    except FileNotFoundError:
+        return
+    except (LinkRefused, OSError) as e:
+        raise ValueError(f"{rel}: {e} (confined)") from None
+    try:
+        st = os.fstat(fd)
+        h.update(rel.encode() + b"\0")
+        if st.st_size <= _FP_HASH_MB * 2**20:
+            while True:
+                block = os.read(fd, 2**20)
+                if not block:
+                    break
+                h.update(block)
+        else:
+            h.update(f"{st.st_size}:{st.st_mtime_ns}".encode())
+        h.update(b"\0")
+    finally:
+        os.close(fd)
 
 
 def input_keys(inputs) -> list[str]:

@@ -149,7 +149,15 @@ def _side_refs(x, kind: str) -> list:
 
 
 def _oracles(pack: dict):
-    return importlib.import_module(pack["oracles"]) if pack.get("oracles") else None
+    """The pack's oracle module, through toolkit/import_guard.py (policy "oracle")."""
+    from toolkit import import_guard as G
+    return G.module("oracle", pack["oracles"]) if pack.get("oracles") else None
+
+
+def resolve_calibrator(fn: str):
+    """A pack's calibrator "module:function", through toolkit/import_guard.py (policy "calibrator")."""
+    from toolkit import import_guard as G
+    return G.resolve("calibrator", fn)
 
 
 def _config_name(pack: dict, setting: dict):
@@ -457,9 +465,9 @@ def _coverage_job(args) -> dict:
         if key not in _ENGINE:
             _ENGINE[key] = load_engine(ref, cfg)
         return _ENGINE[key]
-    gen = getattr(importlib.import_module(oracles), "generate_" + gfn)
-    mod, fn = cfn.split(":")
-    cal = getattr(importlib.import_module(mod), fn)
+    from toolkit import import_guard as G
+    gen = G.attr("oracle", oracles, "generate_" + gfn)
+    cal = resolve_calibrator(cfn)
     rng = np.random.default_rng([seed, r])
     data, truth = gen(rng, **gargs)
     out = {"replicate": r, "hits": {}, "class_ok": {}, "width": {}, "invalid": False, "ridge_ok": False}
@@ -814,8 +822,7 @@ class Runner:
         om = _oracles(self.pack)
         gen = getattr(om, "generate_" + e["generator"]["fn"])
         try:
-            mod, fn = e["calibrator"]["fn"].split(":")
-            cal = getattr(importlib.import_module(mod), fn)
+            cal = resolve_calibrator(e["calibrator"]["fn"])
         except (ImportError, AttributeError, ValueError) as ex:
             return {"computed": None, "in_band": False, "status": "not_assessable",
                     "not_assessable_because": f"calibrator {e['calibrator']['fn']} not available "
@@ -1278,11 +1285,14 @@ def calibrator_code_digest(pack: dict, e: dict) -> str:
     import hashlib
     h = hashlib.sha256()
     mods = [e["calibrator"]["fn"].split(":")[0], "toolkit.analysis.observation", pack["oracles"]]
-    for m in mods:
+    from toolkit import import_guard as G
+    kinds = ["calibrator", None, "oracle"]               # the observation module is named here, not by the pack
+    for kind, m in zip(kinds, mods):
         try:
-            f = getattr(importlib.import_module(m), "__file__", None)
+            mod = G.module(kind, m) if kind else importlib.import_module("toolkit.analysis.observation")
+            f = getattr(mod, "__file__", None)               # a name the policy refuses raises (ImportRefused)
         except ImportError:
-            f = None
+            f = None                                          # missing: the digest records the name only
         h.update(m.encode() + b"\0")
         if f and os.path.exists(f):
             h.update(open(f, "rb").read())
@@ -1694,6 +1704,9 @@ def _self_test() -> int:
     om.generate_normal = _gen
     om.calibrate_normal = _cal
     sys.modules["_bp_oracles"] = om
+    from toolkit import import_guard as _G
+    for _k in ("oracle", "calibrator"):
+        _G.allow_for_test(_k, "_bp_oracles")              # the self-test's own oracle module (in process only)
     p5 = {"initialisation": {"method": "closed form", "evidence": ["not applicable: no dynamic state"]}, "engine": "toolkit.engines.contract:ToyEngine", "oracles": "_bp_oracles", "seeds": [1, 2],
           "horizon": pack["horizon"],
           "settings": {"s": {"unit": {"x": 0.3}}},
