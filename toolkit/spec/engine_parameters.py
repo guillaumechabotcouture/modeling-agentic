@@ -270,6 +270,13 @@ def _sha(path: str) -> str | None:
         return None
 
 
+def _config_sha(engine):
+    """The engine's full configuration digest (benchmark.config_digest), or a fixed marker for an engine with no
+    config(): engine_identity() hashes only the card's structure and leaves out some dynamics settings (R4-1)."""
+    from toolkit.engines import benchmark as BM
+    return BM.config_digest(engine) or "no-config"
+
+
 def _ref_of(spec) -> str | None:
     e = _raw(spec).get("engine")
     return e if isinstance(e, str) else (e.get("ref") if isinstance(e, dict) else None)
@@ -322,6 +329,7 @@ def _arm_records(pack: dict, runner, vals: dict) -> dict:
             own = st.get("params") or {}
             arms[role] = {"arm": a, "setting": cfg["setting"], "ref": pack["engine"], "config": conf,
                           "config_name": name, "engine_identity": engine_identity(en),
+                          "config_sha256": BM.config_digest(en),
                           "superseded": {k: own[k] for k in vals if k in own}}
         out[b["id"]] = {"arms": arms}
     return out
@@ -355,7 +363,8 @@ def write_spec_benchmarks(run_dir: str, pack: dict, fitted: dict | None = None, 
     rec = {"producer": RECORD_PRODUCER, "written_at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
            "file": SPEC_BENCH, "sha256": _sha(path), "spec_sha256": spec.sha256, "spec_parameters": values(spec),
            "pack_sha256": __import__("hashlib").sha256(json.dumps(pack, sort_keys=True, default=str).encode()).hexdigest(),
-           "engine_identity": engine_identity(spec.engine()), "benchmarks": doc["arm_engines"]}
+           "engine_identity": engine_identity(spec.engine()), "config_sha256": _config_sha(spec.engine()),
+           "benchmarks": doc["arm_engines"]}
     json.dump(rec, open(os.path.join(run_dir, SPEC_BENCH_RECORD), "w"), indent=1, sort_keys=True)
     return path
 
@@ -389,18 +398,22 @@ def verified_spec_benchmarks(engine, spec, bench_id: str | None = None) -> tuple
         return [], f"the arms were computed at {sp}, not at this spec's values {vals}; {how}"
     if rec.get("engine_identity") != engine_identity(engine):
         return [], f"the arms were computed for another engine identity or code than the run's; {how}"
+    if rec.get("config_sha256") is None or rec["config_sha256"] != _config_sha(engine):
+        return [], f"the arms were computed for another engine configuration than the run's (configuration digest); {how}"
     bms = rec.get("benchmarks") or {}
     for bid, b in sorted(bms.items()):
         if bench_id is not None and bid != bench_id:
             continue
         for role, a in sorted((b.get("arms") or {}).items()):
             try:
-                now = engine_identity(engine) if a.get("config_name") is None else \
-                    engine_identity(BM.load_engine(a["ref"], a.get("config")))
+                en = engine if a.get("config_name") is None else BM.load_engine(a["ref"], a.get("config"))
+                now, now_cfg = engine_identity(en), BM.config_digest(en)
             except Exception as e:  # noqa: BLE001 -- fail closed
                 return [], f"benchmark {bid} arm {role}: its engine cannot be rebuilt ({type(e).__name__}: {e})"
-            if a.get("ref") != _ref_of(spec) or a.get("engine_identity") != now:
-                return [], f"benchmark {bid} arm {role} ran with another engine or configuration than it would now; {how}"
+            if a.get("ref") != _ref_of(spec) or a.get("engine_identity") != now or "config_sha256" not in a \
+                    or a["config_sha256"] != now_cfg:
+                return [], (f"benchmark {bid} arm {role} ran with another engine or configuration (identity or "
+                            f"configuration digest) than it would now; {how}")
     if bench_id is not None and bench_id not in bms:
         return [], f"benchmark {bench_id} has no arm record in {SPEC_BENCH_RECORD}; {how}"
     doc = yaml.safe_load(open(p, encoding="utf-8")) or {}
@@ -494,12 +507,15 @@ def _sheet_refs(raw: dict, candidates=None, run_dir: str | None = None) -> list[
     if isinstance(eng, dict) and eng.get("ref"):
         return [(eng["ref"], eng)]
     cands = eng.get("candidates") if isinstance(eng, dict) else None
-    if cands:
-        return [(r, {"ref": r}) for r in cands]
     rows_ = [r for r in candidates or [] if isinstance(r, dict) and r.get("ref")]
+    conf = {r["ref"]: dict(r["config"]) for r in rows_ if isinstance(r.get("config"), dict) and r["config"]}
+
+    def decl(ref):   # a candidate with the configuration the pre-sign check used for it, when it supplied one
+        return (ref, {"ref": ref, **({"config": conf[ref]} if ref in conf else {})})
+    if cands:
+        return [decl(r) for r in cands]
     if rows_:        # the pre-sign check's rows: each with its configuration
-        return [(r["ref"], {"ref": r["ref"], **({"config": dict(r["config"])} if r.get("config") else {})})
-                for r in rows_]
+        return [decl(r["ref"]) for r in rows_]
     cp = os.path.join(run_dir, "engine_choice.json") if run_dir else None
     if cp and os.path.exists(cp):
         try:
