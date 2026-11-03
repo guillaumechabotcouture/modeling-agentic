@@ -2483,26 +2483,40 @@ def eval_refusal(args, here: str) -> str | None:
     return None
 
 
+def _metadata_dict(path: str) -> dict:
+    """metadata.json as a dict; {} when it is missing, unreadable, or valid JSON that is not an object."""
+    try:
+        meta = json.load(open(path)) if os.path.exists(path) else {}
+    except (OSError, ValueError):
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
 def run_v2_and_store(run, run_path: str, store=None):
     """Run the v2 machine (`run()` returns its status), then store the run directory, also when
     `run()` raises (ST2): like the lead pipeline's finalize, upload the run when a storage account is
     configured and record it in metadata.json, which the cloud launcher reads to stop the cluster.
-    A crash is recorded in metadata.json (`crash`) before the upload, and then re-raised."""
+    A crash (or an interrupt) is recorded in metadata.json (`crash`) before the upload, then re-raised.
+    Finalization never raises: a failure there is logged, so the run's own exception and its exit
+    code survive (ST3-ST5)."""
     store = store or store_run_results
     try:
         return run()
-    except Exception as e:
+    except BaseException as e:
         try:
             mp = os.path.join(run_path, "metadata.json")
-            meta = json.load(open(mp)) if os.path.exists(mp) else {}
+            meta = _metadata_dict(mp)
             meta["crash"] = f"{type(e).__name__}: {e}"[:500]
             os.makedirs(run_path, exist_ok=True)
             json.dump(meta, open(mp, "w"), indent=2)
-        except (OSError, ValueError):
-            pass
+        except Exception as fe:  # noqa: BLE001 -- never replace the run's exception
+            print(f"[ERROR] crash not recorded in metadata.json: {type(fe).__name__}: {fe}", file=sys.stderr, flush=True)
         raise
     finally:
-        print(f"v2 run stored: {store(run_path)}", flush=True)
+        try:
+            print(f"v2 run stored: {store(run_path)}", flush=True)
+        except Exception as fe:  # noqa: BLE001 -- never replace the run's exception or status
+            print(f"[ERROR] RUN RESULTS NOT STORED: {type(fe).__name__}: {fe}", file=sys.stderr, flush=True)
 
 
 def main_v2(args) -> int:
@@ -2591,7 +2605,10 @@ def main() -> int:
         print(f"REFUSED: {why}", file=sys.stderr)
         return 1
     if args.v2:
-        return main_v2(args)
+        try:
+            return main_v2(args)
+        except KeyboardInterrupt:      # ST5c: as the lead pipeline, an interrupt exits 130
+            return 130
     if args.preflight_only or not args.skip_preflight:
         pf = asyncio.run(run_preflight(allow_cloud=args.cloud))
         print(f"Preflight: {'OK' if pf['ok'] else 'FAILED'} | models="
