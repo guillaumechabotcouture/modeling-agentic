@@ -827,7 +827,7 @@ def _self_test_owner_cli(ok, td: str, trace, reg) -> None:
             asyncio.run(post5(call, "w5", None))
             tr5.flush()
             return True
-        since = datetime.now()
+        since = datetime.now().astimezone()    # the value main.py sets (session_started): timezone-aware
         ig5 = ArtifactIntegrity(d5, process_check=lambda: set())
         try:
             r_missing = harness_sign_brief_lead(d5, ig5, since)
@@ -863,6 +863,32 @@ def _self_test_owner_cli(ok, td: str, trace, reg) -> None:
         ok(refused(r_missing, la_name) and "AWAITING_SIGNOFF" in str(r_missing[1]),
            f"SO17c with no answers file the harness says exactly what to write ({r_missing})")
         tr5.close()
+    # SO18 (focused check of #131 at 7374814): the hook resolves the written path as enforcement does (cwd + path,
+    # then realpath): a run-relative path from the repo root is recorded; a bare name written elsewhere is not
+    import io as _io
+    from agents.hooks import record_lead_answers as _rla
+    with tempfile.TemporaryDirectory() as root18:
+        rd = os.path.join(root18, "runs", "example")
+        os.makedirs(rd)
+        open(os.path.join(rd, la_name), "w").write("accept_proposed: true\nnote: ok\n")
+        other = os.path.join(root18, "elsewhere")
+        os.makedirs(other)
+        open(os.path.join(other, la_name), "w").write("accept_proposed: true\nnote: a different file\n")
+        got18 = {}
+        for name, path, cwd in (("relative from root", f"runs/example/{la_name}", root18),
+                                ("bare name elsewhere", la_name, other),
+                                ("absolute", os.path.join(rd, la_name), other)):
+            buf = _io.StringIO()
+            try:
+                _rla(rd, {"tool_name": "Write", "tool_input": {"file_path": path}, "cwd": cwd}, buf)
+            except Exception as e:  # noqa: BLE001
+                buf.write(f"error {e}")
+            got18[name] = "lead_answers_written" in buf.getvalue()
+        recs = [json.loads(x) for x in buf.getvalue().splitlines() if x.startswith("{")]
+        aware = all(datetime.fromisoformat(r["ts"]).tzinfo is not None for r in recs)
+        ok(got18 == {"relative from root": True, "bare name elsewhere": False, "absolute": True} and recs and aware,
+           f"SO18 the hook resolves the written path from cwd as enforcement does and records UTC-aware times "
+           f"({got18}; aware {aware})")
     # SO15a: no specialist may write the answers file, by Write, Edit or a shell redirect; the lead may
     let15 = []
     for sub in sorted(reg):
