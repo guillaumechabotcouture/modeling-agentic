@@ -1214,34 +1214,31 @@ def _self_test_v08(ok, e, unit) -> None:
     case("S0", s0)
 
     def s1():
-        key = lambda ev: (ev["component"], ev["kind"], round(float(ev["t0"]), 9),  # noqa: E731
-                          None if ev["t1"] is None else round(float(ev["t1"]), 9))
+        from toolkit.engines.malaria import model as MM
         w1, st = float(hd.window[1]), float(hd.start)
-        cov = lambda ts: sorted(round(float(t), 9) for t in ts if st <= float(t) < w1)  # noqa: E731
         for pkg in (none, full, smc_only):
             ev = e.schedule(base, u, pkg, hd)
             sim, _ = e.build_sim(base, u, pkg, hd, 3)
             sim.init()
-            itv = sim.interventions
-            nets = cov(itv["itn_hist"].years)
-            got = sorted(round(x["t0"], 9) for x in ev if x["component"] == "net" and x["kind"] != "decision")
-            hist = sorted(round(x["t0"], 9) for x in ev if x["component"] == "net" and x["kind"] == "history")
-            rout = sorted(round(x["t0"], 9) for x in ev if x["component"] == "net" and x["kind"] == "routine")
-            ok(got == nets and hist == [2015.3] and np.allclose(rout, [2017.1, 2018.1]),
-               f"S1 ({pkg.id}) past and routine net campaigns equal the sim's: {got} vs {nets}")
-            want = {("net", "decision", t, None) for t in cov(itv["itn_new"].years)}
-            want |= {("smc", "decision", t, None) for t in cov(itv["smc"].targets())}
-            want |= {("irs", "decision", t, None) for t in cov(y + (itv["irs"].month - 1) / 12 for y in itv["irs"].years)}
-            want |= {("smc", "routine", t, None) for t in cov(itv["smc_routine"].targets())}
-            if itv["cm"].add > 0:
-                want.add(("cm", "decision", round(itv["cm"].start, 9),
-                          round(itv["cm"].stop if itv["cm"].stop is not None else w1, 9)))
-            have = {key(x) for x in ev if not (x["component"] == "net" and x["kind"] != "decision")}
-            ok(have == want and len(have) == len([x for x in ev if not (x["component"] == "net"
-                                                                       and x["kind"] != "decision")])
+            itv, yv = sim.interventions, np.asarray(sim.t.yearvec)
+            ran = lambda ts: sorted(round(float(yv[i]), 9) for i in MM._event_tis(sim, ts) if st <= yv[i] < w1)  # noqa
+            want = {"net:past+routine": ran(itv["itn_hist"].years), "net:decision": ran(itv["itn_new"].years),
+                    "smc:decision": ran(itv["smc"].targets()),
+                    "irs:decision": ran([y + (itv["irs"].month - 1) / 12 for y in itv["irs"].years]),
+                    "smc:routine": ran(itv["smc_routine"].targets())}
+            pick = lambda c, ks: sorted(round(x["t0"], 9) for x in ev if x["component"] == c and x["kind"] in ks)  # noqa
+            have = {"net:past+routine": pick("net", ("history", "routine")), "net:decision": pick("net", ("decision",)),
+                    "smc:decision": pick("smc", ("decision",)), "irs:decision": pick("irs", ("decision",)),
+                    "smc:routine": pick("smc", ("routine",))}
+            ok(have == want and len(pick("net", ("history",))) == 1 and len(pick("net", ("routine",))) == 2,
+               f"S1 ({pkg.id}) every event is a step the sim executes, and every executed step is listed: "
+               f"{ {k: (len(have[k]), len(want[k])) for k in want} }")
+            cm = [x for x in ev if x["component"] == "cm"]
+            c = itv["cm"]
+            ok((cm == [] if c.add == 0 else len(cm) == 1 and abs(cm[0]["t0"] - c.start) < 1e-9
+                and abs(cm[0]["t1"] - (c.stop if c.stop is not None else w1)) < 1e-9)
                and all(x["charged"] == (x["kind"] == "decision") for x in ev),
-               f"S1b ({pkg.id}) decision and routine SMC / IRS / net / add-on events equal the sim's "
-               f"({len(have)} vs {len(want)}; differing: {sorted(have ^ want, key=str)[:4]})")
+               f"S1b ({pkg.id}) the add-on period is the sim's; charged exactly for decision events")
         evn = e.schedule(base, u, none, hd)
         evf = e.schedule(base, u, full, hd)
         ok(not [x for x in evn if x["kind"] == "decision"]
@@ -1357,6 +1354,71 @@ def _self_test_v08(ok, e, unit) -> None:
         except HK.HookInvalid as ex:
             ok("not in the card" in str(ex), f"S8 a metric the card does not list is refused ({ex})")
     case("S8", s8)
+
+    plain = {k: v for k, v in attrs.items() if k not in ("smc_routine", "itn_routine_interval")}
+    hw = Horizon(2015.0, 2019.0, (2016.0, 2019.0), {})
+
+    def refused(fn):
+        try:
+            fn()
+            return None
+        except ValueError as ex:
+            return str(ex)
+
+    def s9():
+        # Codex r1 P2-2: a decision event the sim delivers but does not charge (counting is by in_delivery())
+        ux, net = UnitSpec("t", dict(plain, campaign_year=2015.5)), Package("pyr", {"net": "pyr"})
+        o = e.run(base, ux, net, hw, 3)
+        why = refused(lambda: e.schedule(base, ux, net, hw))
+        ok(o.cost_drivers["nets_given"] == 0 and why is not None and "charged" in why,
+           f"S9 a decision campaign the sim delivers uncharged (nets_given {o.cost_drivers['nets_given']}) makes "
+           f"schedule() fail closed ({why})")
+        hm = Horizon(2015.0, 2019.0, (2016.5, 2019.0), {})
+        us, smc1 = UnitSpec("t", dict(plain, campaign_year=2016.5, smc_months=[5, 6, 7, 8])), Package("s", {"smc": 1})
+        o2 = e.run(base, us, smc1, hm, 3)
+        why2 = refused(lambda: e.schedule(base, us, smc1, hm))
+        ok(o2.cost_drivers["smc_doses"] > 0 and why2 is not None and "charged" in why2,
+           f"S9b SMC rounds before a mid-year window start run uncharged: schedule() fails closed ({why2})")
+        for pkg, drv in ((Package("n", {"net": "pyr"}), "nets_given"), (smc1, "smc_doses"),
+                         (Package("i", {"irs": 1}), "irs_sprayed")):
+            ev = [x for x in e.schedule(base, u, pkg, hd) if x["charged"]]
+            oo = e.run(base, u, pkg, hd, 3)
+            ok(ev and oo.cost_drivers[drv] > 0,
+               f"S9c ({pkg.id}) the charged events are charged by the sim ({len(ev)} events, {drv} "
+               f"{oo.cost_drivers[drv]:.3f})")
+    case("S9", s9)
+
+    def s10():
+        # Codex r1 P2-3: repeated or same-day targets are one delivery in the sim
+        from toolkit.engines.malaria import model as MM
+        ud = UnitSpec("t", dict(plain, itn_hist_years=[2015.25, 2015.25, 2015.25 + 0.2 / 365]))
+        ev = [x for x in e.schedule(base, ud, none, hw) if x["kind"] == "history"]
+        sim, _ = e.build_sim(base, ud, none, hw, 3)
+        sim.init()
+        ran = MM._event_tis(sim, sim.interventions["itn_hist"].years)
+        ok(len(ev) == len(ran) == 1, f"S10 three past-campaign targets on one daily step are one event, as the sim "
+                                     f"runs them ({len(ev)} listed, {len(ran)} executed)")
+    case("S10", s10)
+
+    def s11():
+        # Codex r1 P2-4: the public series carry their day counts and step ends, and reconcile exactly
+        w1 = 2018.0 + 1 / 365                         # off the monthly grid: a final step of one or two days
+        wn = {"all": [2015.0, w1], "last": [2018.0, w1], "y1": [2016.0, 2017.0]}
+        hp = DeliveryHorizon(2015.0, 2018.1, (2016.0, w1), dict(wn), delivery=(2016.0, 2017.0))
+        r = HK.run_series(e, base, u, [none, full], hp, 5, metrics)
+        outs = e.run_batch([base] * 2, u, [none, full], hp, 5)
+        ok(all(len(x["days"]) == len(x["t"]) == len(x["t_end"]) and abs(x["t_end"][-1] - w1) < 1e-12 for x in r),
+           "S11 each public entry carries the day count and the end of every step")
+        for x, o in zip(r, outs):
+            for w, (a0, b0) in wn.items():
+                got = {m: e.series_window(x, m, a0, b0) for m in metrics}
+                W = o.windows[w]
+                ok(all(abs(got[m] - W[m]) <= 1e-9 * max(1.0, abs(W[m])) for m in metrics),
+                   f"S11b ({x['package']}, {w}) the public series reconcile exactly with the window metrics: "
+                   f"{ {m: (round(got[m], 6), round(W[m], 6)) for m in metrics} }")
+        why = refused(lambda: e.series_window(r[0], "pfpr_u5", 2016.04, 2017.0))
+        ok(why is not None and "step" in why, f"S11c a window that cuts through a monthly step fails closed ({why})")
+    case("S11", s11)
 
 def write_card(path: str) -> None:
     """Engine card (describe() plus every parameter with its kind, range and source) as YAML."""

@@ -342,6 +342,30 @@ def _self_test() -> int:
         ok(False, "RP9 a restamped record that is not the file's last key fails closed")
     except ValueError:
         ok(True, "RP9 a restamped record that is not the file's last key fails closed")
+    # v0.8 (Codex r1 P2-5): the pack uses plain horizons with none of the v0.6-v0.7 features, so the proof also runs
+    # pinned scenarios that use them, in both trees
+    sc = [c for c in cases({"settings": {}}, [11]) if c["kind"] == "scenario"]
+    specs = [c["spec"] for c in sc]
+
+    def units(sp):
+        return [dict(sp["unit"], **(m.get("unit") or {})) for m in sp["members"]]
+    has = {
+        "delivery period": any(sp.get("delivery") for sp in specs),
+        "routine nets": any(x.get("itn_routine_interval") for sp in specs for x in units(sp)),
+        "routine SMC": any(x.get("smc_routine") == 1 for sp in specs for x in units(sp)),
+        "add-on with a delivery end (CM stop)": any(sp.get("delivery") and any((m.get("package") or {}).get("cm")
+                                                                              for m in sp["members"]) for sp in specs),
+        "boundary dates": any(sp.get("delivery") and any(float(x.get("campaign_year", -1)) == float(sp["delivery"][0])
+                                                         for x in units(sp))
+                              and float(sp["delivery"][1]).is_integer()
+                              and any(1 in (x.get("smc_months") or []) for x in units(sp)) for sp in specs),
+        "heterogeneous members": any(len({json.dumps(x, sort_keys=True) for x in units(sp)}) > 1
+                                     and len({json.dumps(m.get("params") or {}, sort_keys=True)
+                                              for m in sp["members"]}) > 1 for sp in specs),
+    }
+    ok(sc and all(has.values()) and "scenario" in WORKER and len({c["id"] for c in sc}) == len(sc),
+       f"RP10 the proof runs pinned scenarios covering {sorted(k for k, v in has.items() if v)}; missing: "
+       f"{sorted(k for k, v in has.items() if not v)}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
