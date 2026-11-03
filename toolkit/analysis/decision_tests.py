@@ -239,6 +239,8 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
     if t == "interaction_rescale":
         rec["engine_arm_or"], rec["engine_interaction"] = extra.get("_arm"), extra.get("_int")
         rec["arm_source"] = extra.get("_src")
+        if extra.get("_inputs"):
+            rec["arm_inputs"] = extra["_inputs"]
     return rec
 
 
@@ -255,15 +257,17 @@ def _interaction(A, dt, ben0, cost0, plan, out0) -> dict:
     if PV.values(A.spec):
         # the outcomes are at the spec values, so the arms must be too (review round 2, R2-1): never derive the
         # rescaling from arms at the card values and apply it to outcomes at the spec values
-        rows, why = PV.verified_spec_benchmarks(A.eng, A.spec)
+        rows, why = PV.verified_spec_benchmarks(A.eng, A.spec, dt.get("benchmark"))
         if why:
             return {"not_run": f"benchmark arms not computed at the spec values ({why})"}
-        src = f"{PV.SPEC_BENCH} beside the spec (the benchmark runner at the spec values)"
+        src = f"{PV.SPEC_BENCH} (the harness step at the spec values; record {PV.SPEC_BENCH_RECORD})"
+        arm_inputs = {f: PV._sha(os.path.join(A.spec.base, f)) for f in (PV.SPEC_BENCH, PV.SPEC_BENCH_RECORD)}
     else:
         rows, why = verified_benchmarks(A.eng)
         if why:
             return {"not_run": f"the engine's benchmark arm ratios are not verified ({why})"}
         src = "toolkit/engines/benchmark.py"
+        arm_inputs = None
     b = {r.get("id"): r for r in rows}.get(dt.get("benchmark"))
     if not b or not b.get("arm_or"):
         return {"not_run": f"benchmark {dt.get('benchmark')} with arm odds ratios is not in the verified results"}
@@ -276,7 +280,8 @@ def _interaction(A, dt, ben0, cost0, plan, out0) -> dict:
     inter = lambda g: arm["a10"] * _rescale(r_inc, g) / (arm["a10"] * arm["a01"])  # noqa: E731
     comp, with_any = set(dt["components"]), set(dt["with_any"])
     cases, lowers, rejected = [], [], []
-    extra = {"_arm": arm, "_int": eng_int, "_src": f"verified benchmark results ({dt.get('benchmark')}), {src}"}
+    extra = {"_arm": arm, "_int": eng_int, "_src": f"verified benchmark results ({dt.get('benchmark')}), {src}",
+             "_inputs": arm_inputs}
     lo_reach, hi_reach = inter(MAX_SCALE), inter(0.0)
     o = A.primary
     for v in dt["values"]:

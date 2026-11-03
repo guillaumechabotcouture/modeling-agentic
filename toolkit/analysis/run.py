@@ -260,7 +260,8 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
          "share_pct": None if x["share_units_changed"] is None else 100.0 * x["share_units_changed"],
          "statement": x["statement"], "detail": {k: x[k] for k in ("engine_arm_or", "engine_interaction",
                                                     "rejected_values", "reachable_interaction") if k in x}} for x in dts]}, DT.PRODUCER,
-        [arts["point"], arts["uncertainty"]] + eng_files)
+        [arts["point"], arts["uncertainty"]] + eng_files
+        + sorted({os.path.join(run_dir, f) for x in dts for f in (x.get("arm_inputs") or {})}))
     for x in dts:
         if x["path"]:
             S.deliverable(os.path.join(run_dir, x["path"]), DT.PRODUCER, "decision_test")

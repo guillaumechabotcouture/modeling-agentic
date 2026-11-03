@@ -2,8 +2,8 @@
 """Engine parameter values declared by the signed spec (owner decision, 2026-11-02).
 
     python3 toolkit/spec/engine_parameters.py --self-test
-    python3 toolkit/spec/engine_parameters.py benchmarks <pack.yaml> <decision_spec.yaml> [--only ids]
-                                          # the pack's arms at the spec values, beside the spec
+    python3 toolkit/spec/engine_parameters.py benchmarks <pack.yaml> <run_dir> [--only ids]
+                                          # harness step: the pack's arms at the run's spec values
 
 A spec may set the point value of an engine parameter for its run. The value is a scenario
 choice the owner signs, not an engine change and not a fit:
@@ -43,9 +43,11 @@ interval label says "held fixed at the spec value". On the emulator path, a held
 and the tested values, so the test runs; the draws keep it at the spec value.
 
 An interaction_rescale decision test reads its arm ratios from benchmark results computed at the spec
-values (`benchmarks_at_spec_values.yaml` beside the spec, written by the `benchmarks` command with the
-benchmark runner's provenance and `spec_parameters`); results computed at the card values are refused and
-the test is not run, so the rescaling is never derived at one set of parameters and applied at another.
+values: `analysis/benchmarks_at_spec_values.yaml`, written only by the harness step (`benchmarks`), with a
+harness record of its digest, the values and each arm's engine and configuration; it is an input of the
+decision-test artifact. Otherwise the test is not run, so the rescaling is never derived at one set of
+parameters and applied at another. In those arms a benchmark setting's own parameters (a trial's observed
+conditions) win over the spec values, which replace only engine defaults.
 
 A spec without the field is unchanged: same parameter sets, same batch jobs, same job hashes.
 Nothing here names a disease, a place or an intervention.
@@ -252,43 +254,156 @@ def params(spec, theta=None) -> dict:
 
 
 # ---- benchmark arms at the spec values (an interaction_rescale decision test reads its arm ratios from them)
-SPEC_BENCH = "benchmarks_at_spec_values.yaml"
+# Harness outputs (review round 3, R3-1): written only by write_spec_benchmarks(), under analysis/ (a v2 harness prefix
+# agents cannot write; agents/enforcement.py SCRIPT_OUTPUTS in v1). The record holds the file's digest and how each arm
+# was computed; verification reads the record and recomputes each arm's engine identity, never fields of the file alone.
+SPEC_BENCH = "analysis/benchmarks_at_spec_values.yaml"
+SPEC_BENCH_RECORD = "analysis/benchmarks_at_spec_values.record.json"
+RECORD_PRODUCER = "toolkit/spec/engine_parameters.py:write_spec_benchmarks"
+
+
+def _sha(path: str) -> str | None:
+    import hashlib
+    try:
+        return hashlib.sha256(open(path, "rb").read()).hexdigest()
+    except OSError:
+        return None
+
+
+def _ref_of(spec) -> str | None:
+    e = _raw(spec).get("engine")
+    return e if isinstance(e, str) else (e.get("ref") if isinstance(e, dict) else None)
+
+
+def _pack_engine(pack: dict):
+    from toolkit.engines import benchmark as BM
+    return BM.load_engine(pack["engine"], (pack.get("configs") or {}).get(pack.get("default_config")))
+
+
+def _check_pack_engine(pack: dict, spec, engine=None):
+    """The engine the pack's runner builds (its reference and default configuration) must be the run's engine:
+    the stamp and the record name the engine the arms ran with (review round 3, R3-2)."""
+    from toolkit.engines import benchmark as BM
+    from toolkit.engines.contract import engine_identity
+    run_eng = spec.engine()
+    pe = _pack_engine(pack)
+    why = []
+    if pack.get("engine") != _ref_of(spec):
+        why.append(f"the pack runs {pack.get('engine')}, the run {_ref_of(spec)}")
+    elif engine_identity(pe) != engine_identity(run_eng) or BM.config_digest(pe) != BM.config_digest(run_eng):
+        why.append("the pack's default configuration gives another engine identity or configuration than the run's")
+    if engine is not None and engine_identity(engine) != engine_identity(run_eng):
+        why.append("the engine passed in is not the run's")
+    if why:
+        raise ValueError("benchmark pack: not the run's engine (" + "; ".join(why) + ")")
+    return pe
+
+
+def _arm_records(pack: dict, runner, vals: dict) -> dict:
+    """{benchmark id: {"arms": {role: {arm, setting, ref, config, engine_identity, superseded}}}}: the engine and
+    configuration each arm actually ran with, and the spec values its setting's own parameters replaced."""
+    from toolkit.engines import benchmark as BM
+    from toolkit.engines.contract import engine_identity
+    out = {}
+    for b in pack.get("benchmarks") or []:
+        est = b.get("estimand") or {}
+        roles = {k: est[k] for k in ("a11", "a10", "a01", "a00") if isinstance(est.get(k), str)} \
+            or {a: a for a in BM._arms_of(est) if isinstance(a, str)}
+        arms = {}
+        for role, a in roles.items():
+            cfg = (pack.get("arms") or {}).get(a)
+            if not cfg:
+                continue
+            st = pack["settings"][cfg["setting"]]
+            name = BM._config_name(pack, st)
+            conf = (pack.get("configs") or {}).get(name) if name is not None else \
+                (pack.get("configs") or {}).get(pack.get("default_config"))
+            en = runner.make_engine(name) if name is not None else runner.engine
+            own = st.get("params") or {}
+            arms[role] = {"arm": a, "setting": cfg["setting"], "ref": pack["engine"], "config": conf,
+                          "config_name": name, "engine_identity": engine_identity(en),
+                          "superseded": {k: own[k] for k in vals if k in own}}
+        out[b["id"]] = {"arms": arms}
+    return out
 
 
 def spec_benchmarks(pack: dict, engine, spec, fitted: dict | None = None, workers: int = 1, seeds=None) -> dict:
-    """The engine's benchmark pack run with the spec values applied over every arm (as the engine's fitted values are),
-    stamped by the benchmark runner with its provenance and `spec_parameters`. Written beside the spec as SPEC_BENCH."""
+    """The run's benchmark pack with the spec values applied under each setting's own parameters (a setting's observed
+    conditions win; review round 3, R3-3) and over the engine defaults, stamped by the benchmark runner for the engine
+    the arms ran with. `engine` must be the run's engine (it is checked, not used)."""
     from toolkit.engines import benchmark as BM
+    pe = _check_pack_engine(pack, spec, engine)
     vals = values(spec)
-    out = BM.run_pack(pack, engine, BM.Runner(pack, engine, workers, seeds), dict(fitted or {}, **vals))
-    return BM.stamp(dict(out, spec_parameters=vals), engine)
+    runner = BM.Runner(pack, pe, workers, seeds, base_params=vals)
+    out = BM.run_pack(pack, pe, runner, dict(fitted or {}))
+    return BM.stamp(dict(out, spec_parameters=vals, arm_engines=_arm_records(pack, runner, vals)), pe)
 
 
-def verified_spec_benchmarks(engine, spec) -> tuple[list, str | None]:
-    """(benchmark rows, None) when SPEC_BENCH beside the spec was written by the benchmark runner for this engine's
-    identity and configuration at exactly this spec's values; else ([], why)."""
+def write_spec_benchmarks(run_dir: str, pack: dict, fitted: dict | None = None, workers: int = 1, seeds=None) -> str:
+    """The harness step: computes the arms at the run's spec values, writes SPEC_BENCH and its harness record
+    SPEC_BENCH_RECORD (the file's digest, the spec values, the run's engine identity, and each arm's engine and
+    configuration). Returns the file's path."""
+    import datetime as _dt
+    import yaml
+    from toolkit.engines.contract import engine_identity
+    from toolkit.spec import schema
+    spec = schema.load(os.path.join(run_dir, "decision_spec.yaml"))
+    doc = spec_benchmarks(pack, spec.engine(), spec, fitted, workers, seeds)
+    path = os.path.join(run_dir, SPEC_BENCH)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    yaml.safe_dump(doc, open(path, "w"), sort_keys=False)
+    rec = {"producer": RECORD_PRODUCER, "written_at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
+           "file": SPEC_BENCH, "sha256": _sha(path), "spec_sha256": spec.sha256, "spec_parameters": values(spec),
+           "pack_sha256": __import__("hashlib").sha256(json.dumps(pack, sort_keys=True, default=str).encode()).hexdigest(),
+           "engine_identity": engine_identity(spec.engine()), "benchmarks": doc["arm_engines"]}
+    json.dump(rec, open(os.path.join(run_dir, SPEC_BENCH_RECORD), "w"), indent=1, sort_keys=True)
+    return path
+
+
+def verified_spec_benchmarks(engine, spec, bench_id: str | None = None) -> tuple[list, str | None]:
+    """(benchmark rows, None) when the harness step wrote SPEC_BENCH for this run: its harness record exists, the file
+    matches the record's digest, the record's values are this spec's, the run's engine identity matches, and each arm
+    of the benchmark (all, without `bench_id`) still has the engine identity its recorded reference and configuration
+    give now. Else ([], why)."""
     import yaml
     from toolkit.engines import benchmark as BM
     from toolkit.engines.contract import engine_identity
-    p = os.path.join(spec.base, SPEC_BENCH)
-    how = (f"compute them with python toolkit/spec/engine_parameters.py benchmarks <pack.yaml> {os.path.basename(spec.path or 'decision_spec.yaml')}"
-           " --only <benchmark id>")
-    if not os.path.exists(p):
-        return [], f"no {SPEC_BENCH} beside the spec; {how}"
+    base = spec.base
+    p, rp = os.path.join(base, SPEC_BENCH), os.path.join(base, SPEC_BENCH_RECORD)
+    how = ("compute them with the harness step: python toolkit/spec/engine_parameters.py benchmarks <pack.yaml> "
+           "<run_dir> --only <benchmark id>")
+    if not os.path.exists(rp):
+        return [], f"no harness record {SPEC_BENCH_RECORD}; {how}"
     try:
-        doc = yaml.safe_load(open(p, encoding="utf-8")) or {}
-    except (OSError, yaml.YAMLError) as e:
-        return [], f"{SPEC_BENCH} unreadable: {e}"
-    if doc.get("producer") != BM.PRODUCER:
-        return [], f"{SPEC_BENCH} was not written by {BM.PRODUCER}"
-    if doc.get("engine_identity") != engine_identity(engine):
-        return [], f"{SPEC_BENCH} was computed for another engine identity or code; {how}"
-    if BM.config_digest(engine) is not None and doc.get("engine_config_sha256") != BM.config_digest(engine):
-        return [], f"{SPEC_BENCH} was computed for another engine configuration; {how}"
-    sp, vals = doc.get("spec_parameters") or {}, values(spec)
+        rec = json.load(open(rp, encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        return [], f"{SPEC_BENCH_RECORD} unreadable: {e}"
+    if not isinstance(rec, dict) or rec.get("producer") != RECORD_PRODUCER:
+        return [], f"{SPEC_BENCH_RECORD} was not written by the harness step"
+    if not os.path.exists(p) or _sha(p) != rec.get("sha256"):
+        return [], f"{SPEC_BENCH} does not match the digest in its harness record (missing, or edited after the harness " \
+                   f"wrote it); {how}"
+    sp, vals = rec.get("spec_parameters") or {}, values(spec)
     if set(sp) != set(vals) or any(not _isnum(sp[k]) or abs(float(sp[k]) - vals[k]) > 1e-12 * max(1.0, abs(vals[k]))
                                    for k in vals):
-        return [], f"{SPEC_BENCH} was computed at {sp}, not at this spec's values {vals}; {how}"
+        return [], f"the arms were computed at {sp}, not at this spec's values {vals}; {how}"
+    if rec.get("engine_identity") != engine_identity(engine):
+        return [], f"the arms were computed for another engine identity or code than the run's; {how}"
+    bms = rec.get("benchmarks") or {}
+    for bid, b in sorted(bms.items()):
+        if bench_id is not None and bid != bench_id:
+            continue
+        for role, a in sorted((b.get("arms") or {}).items()):
+            try:
+                now = engine_identity(engine) if a.get("config_name") is None else \
+                    engine_identity(BM.load_engine(a["ref"], a.get("config")))
+            except Exception as e:  # noqa: BLE001 -- fail closed
+                return [], f"benchmark {bid} arm {role}: its engine cannot be rebuilt ({type(e).__name__}: {e})"
+            if a.get("ref") != _ref_of(spec) or a.get("engine_identity") != now:
+                return [], f"benchmark {bid} arm {role} ran with another engine or configuration than it would now; {how}"
+    if bench_id is not None and bench_id not in bms:
+        return [], f"benchmark {bench_id} has no arm record in {SPEC_BENCH_RECORD}; {how}"
+    doc = yaml.safe_load(open(p, encoding="utf-8")) or {}
     return list(doc.get("benchmarks") or []), None
 
 
@@ -378,10 +493,13 @@ def _sheet_refs(raw: dict, candidates=None, run_dir: str | None = None) -> list[
         return [(eng, {"ref": eng})]
     if isinstance(eng, dict) and eng.get("ref"):
         return [(eng["ref"], eng)]
-    cands = (eng.get("candidates") if isinstance(eng, dict) else None) or \
-        [r.get("ref") for r in candidates or [] if isinstance(r, dict) and r.get("ref")]
+    cands = eng.get("candidates") if isinstance(eng, dict) else None
     if cands:
         return [(r, {"ref": r}) for r in cands]
+    rows_ = [r for r in candidates or [] if isinstance(r, dict) and r.get("ref")]
+    if rows_:        # the pre-sign check's rows: each with its configuration
+        return [(r["ref"], {"ref": r["ref"], **({"config": dict(r["config"])} if r.get("config") else {})})
+                for r in rows_]
     cp = os.path.join(run_dir, "engine_choice.json") if run_dir else None
     if cp and os.path.exists(cp):
         try:
@@ -444,14 +562,14 @@ def sheet_lines(raw: dict, candidates=None, run_dir: str | None = None) -> list[
 
 
 def _cli(argv) -> int:
-    """benchmarks <pack.yaml> <decision_spec.yaml> [--only ids] [--workers N] [--seeds K]: the pack's arms at the spec
-    values, written beside the spec (SPEC_BENCH)."""
+    """benchmarks <pack.yaml> <run_dir> [--only ids] [--workers N] [--seeds K]: the harness step that computes the pack's
+    arms at the run's spec values (SPEC_BENCH and its record SPEC_BENCH_RECORD)."""
     import argparse
     import yaml
     from toolkit.spec import schema
     ap = argparse.ArgumentParser(prog="engine_parameters.py benchmarks")
     ap.add_argument("pack")
-    ap.add_argument("spec")
+    ap.add_argument("run_dir")
     ap.add_argument("--only", default=None, help="only these benchmark ids (comma-separated)")
     ap.add_argument("--workers", type=int, default=1)
     ap.add_argument("--seeds", type=int, default=0, help="the first K seeds of the pack (0 = all)")
@@ -460,15 +578,12 @@ def _cli(argv) -> int:
     if a.only:
         keep = set(a.only.split(","))
         pack = dict(pack, benchmarks=[b for b in pack["benchmarks"] if b["id"] in keep])
-    spec = schema.load(a.spec)
     fp = os.path.join(os.path.dirname(os.path.abspath(a.pack)), "fitted.yaml")
     f = yaml.safe_load(open(fp)) if os.path.exists(fp) else {}
     fitted = {k: v["value"] for k, v in (f.get("parameters") or {}).items()}
     seeds = pack["seeds"][:a.seeds] if a.seeds else pack["seeds"]
-    doc = spec_benchmarks(pack, spec.engine(), spec, fitted, a.workers, seeds)
-    out = os.path.join(spec.base, SPEC_BENCH)
-    yaml.safe_dump(doc, open(out, "w"), sort_keys=False)
-    print(f"wrote {out}")
+    out = write_spec_benchmarks(a.run_dir, pack, fitted, a.workers, seeds)
+    print(f"wrote {out} and {SPEC_BENCH_RECORD}")
     return 0
 
 
