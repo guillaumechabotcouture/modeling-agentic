@@ -686,17 +686,18 @@ def _self_test_round6(ok) -> None:
     lines = _BYPASS2.splitlines()
     at = (lambda frag: next(i + 1 for i, ln in enumerate(lines) if frag in ln))
     want = {"getattr-writer": [at("getattr(builtins")], "partial-writer": [at('partial(open, mode="w")'),
-                                                                           at('partial(open, p, "a")')],
+                                                                           at('partial(open, p, "a")'),
+                                                                           at('partial(open, mode="r")')],
             "open-write": [at('w(p, "w")')],
             "shell-command": [at("shell=True"), at('"bash", "-c"'), at("os.system")],
             "safeio-no-root": [at('publish(p, "x")'), at("safe_io.append_text"), at("remove_path(p)"),
                                at('publish(p, "x", None)')]}
-    clean = [at('publish(p, "x", d)'), at("root=d"), at('"git", "status"'), at('mode="r"')]
+    clean = [at('publish(p, "x", d)'), at("root=d"), at('"git", "status"')]
     flat = sum(s.values(), [])
     ok(all(sorted(s.get(k, [])) == v for k, v in want.items()) and not set(clean) & set(flat),
-       f"WA19 the audit finds getattr(builtins, 'open'), functools.partial(open, write mode), an assigned open alias, "
-       f"shell=True / sh -c / os.system, and safe_io calls without a run root; a rooted call, a plain subprocess "
-       f"and a read-mode partial are not sites ({s})")
+       f"WA19 the audit finds getattr(builtins, 'open'), functools.partial(open, ...) whatever its mode, an assigned "
+       f"open alias, shell=True / sh -c / os.system, and safe_io calls without a run root; a rooted call and a plain "
+       f"subprocess are not sites ({s})")
     with tempfile.TemporaryDirectory() as d:
         run_dir(d)
         os.makedirs(os.path.join(d, "analysis"))
@@ -715,6 +716,59 @@ def _self_test_round6(ok) -> None:
         ok(all(res) and open(os.path.join(d, "ok.json")).read() == "x",
            f"WA20 safe_io requires the run root for a path under a run dir: omitted, None, or a dir below the run "
            f"root is refused; the run root is accepted ({res})")
+
+
+_BYPASS3 = '''
+import subprocess
+from functools import partial
+def h(p):
+    w = partial(open, p)
+    w(mode="w")
+    subprocess.run(["bash", "-lc", "echo x > f"])
+    subprocess.run(["/bin/zsh", "-ec", "echo x > f"])
+    subprocess.run(["python3", "-c", "print(1)"])
+'''
+
+
+def _self_test_round7(ok) -> None:
+    """WA21-WA23: the focused check of #134 at c22b0e6: the root's identity, run identity from markers, and two
+    same-module audit bypasses."""
+    import tempfile
+    for p in (REPO, os.path.join(REPO, "scripts")):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+    from lib import safe_io as SIO
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+        open(os.path.join(d, "metadata.json"), "w").write("{}")
+        os.makedirs(os.path.join(out, "sub"))
+        os.symlink(os.path.join(out, "sub"), os.path.join(d, "analysis"))
+        try:
+            SIO.publish(os.path.join(d, "x.json"), "x", os.path.join(d, "analysis", ".."))
+        except (ValueError, OSError):
+            pass
+        ok(os.listdir(out) == ["sub"],
+           f"WA21 a root spelled through a planted link (run/analysis/..) is not resolved to the link's parent: "
+           f"validated and anchored on one identity ({os.listdir(out)})")
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+        import figure_validator as FV
+        os.symlink(out, os.path.join(d, "figures"))         # the run's marker deleted by an agent: no metadata.json
+        open(os.path.join(out, "f.png"), "wb").write(b"png")
+        for fn in (lambda: SIO.publish(os.path.join(d, "figures", "x.json"), "x", None),
+                   lambda: FV.validate_figure(os.path.join(d, "figures", "f.png"))):
+            try:
+                fn()
+            except (ValueError, OSError, TypeError):
+                pass
+        ok(sorted(os.listdir(out)) == ["f.png"],
+           f"WA22 with the run marker deleted, a root-less publish and validate_figure without run_dir write nothing "
+           f"through a planted link: no write path chooses its root from markers or the parent ({os.listdir(out)})")
+    s = scan_text(_BYPASS3)
+    lines = _BYPASS3.splitlines()
+    at = (lambda frag: next(i + 1 for i, ln in enumerate(lines) if frag in ln))
+    ok(s.get("partial-writer") == [at("partial(open, p)")] and s.get("shell-command") == [at('"-lc"'), at('"-ec"')]
+       and at('"python3"') not in sum(s.values(), []),
+       f"WA23 a partial(open, p) given its mode at call time, and a shell run through an argv list with -lc / -ec, "
+       f"are sites; python3 -c is not ({s})")
 
 
 def _self_test() -> int:
@@ -745,6 +799,7 @@ def _self_test() -> int:
     _self_test_writers(ok)
     _self_test_v2_open_items(ok)
     _self_test_round6(ok)
+    _self_test_round7(ok)
     live = problems(sites(), REVIEWED, OPEN_ITEMS)
     n_open = sum(n for pats in OPEN_ITEMS.values() for n, _ in pats.values())
     print(f"NOTE {n_open} attacker-reachable write site(s) remain as counted open items (OPEN_ITEMS)")
