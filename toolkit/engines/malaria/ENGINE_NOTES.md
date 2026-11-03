@@ -102,6 +102,42 @@ return the same outcomes. The new card output and the code change the engine ide
 - S7: `run_batch` is unchanged by series recording.
 - S8: `hooks.run_series` refuses a metric the card does not list.
 
+**Review round 1 (Codex) and #127's hook contract `figures-hooks/1`.** Each change has a test that
+failed first (α2, α3):
+- **Executed events (S1, S10).** `schedule()` now lists deliveries as the sim executes them.
+  `delivery_plan` gives each delivery's raw target and the intervention that runs it. `schedule()`
+  maps every target to its daily step with `model.event_steps`, the function the interventions
+  use (`_event_tis`). Targets of one intervention on one step are one delivery (repeated
+  `itn_hist_years`, or two dates on the same day), and `t0` is the step's year. The sim's time
+  vector comes from a Starsim `Timeline` with the sim's start, stop and step, so no sim is built.
+  SMC and IRS targets come from `model.smc_targets` and `model.irs_targets`, which the
+  interventions also use.
+- **Charging (S9).** A decision delivery is charged only when its step lies where the sim
+  counts cost drivers (`model.delivery_contains`, shared with `Malaria.in_delivery`). Two
+  examples: a campaign before the window start when no delivery period is given, and SMC rounds
+  before a mid-year window start. The sim keeps running these as before, uncharged, but
+  `schedule()` now fails closed rather than reporting a charged event.
+- **Kinds (S12d, S12e).** Under the contract, `history` events precede the delivery period,
+  `routine` events lie outside it, and `decision` events lie inside it and belong to a component
+  the package sets. A past campaign at or after the delivery start makes `schedule()` fail
+  closed.
+- **Series metadata (S11, S12b, S12c).** Each `run_series` entry also returns `t_end` and `days`
+  for every step. `series_window(entry, metric, a, b)` aggregates them exactly into the window
+  metric over any union of steps, and fails closed on a window that cuts through a step.
+  - The grid has `round((window end - start) x 12)` steps starting at `start + k/12`, the same
+    for every arm, and the last step ends at the window end.
+  - Each card metric declares a `denominator`, and the engine declares
+    `hooks_contract = "figures-hooks/1"`.
+  - Step slices are found once with `searchsorted`, with the same day selection as the windows.
+- **Proof coverage (RP10).** The pack builds plain horizons, and none of its units sets routine
+  nets or routine SMC. So `restamp_proof.py` now also runs three pinned scenarios in both trees:
+  - GC7-like delivery with routine nets and routine SMC;
+  - boundary dates (the campaign and an IRS round at the delivery start, routine SMC and a
+    routine campaign at the delivery end, the add-on stopping there, windows cutting through
+    months);
+  - a heterogeneous batch (two units, parameters inside and outside the burn-in key, no delivery
+    period).
+
 ## v0.7 scope: routine SMC in every arm after the delivery period (written before the v0.7 code)
 
 **The problem.** v0.6 split the delivery period (`objective.delivery`) from the outcome window
