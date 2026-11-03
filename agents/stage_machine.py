@@ -2076,6 +2076,27 @@ def _self_test() -> int:
             import traceback
             traceback.print_exc()
             ok(False, f"DI machine tests: {type(e).__name__}: {e}")
+        # T61 (run console review, finding 6): `sign --expect-sha256` refuses a spec other than the one shown.
+        from toolkit.spec import schema as _S, signoff as _SO
+        d61 = os.path.join(td, "t61")
+        os.makedirs(d61)
+        _S.toy_spec(d61)
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                rc = main(["sign", d61, "--by", "owner", "--note", "n", "--expect-sha256", "0" * 64])
+            except SystemExit as e:
+                rc = e.code
+            st61 = _SO.status(d61)
+            try:
+                rc2 = main(["sign", d61, "--by", "owner", "--note", "n", "--expect-sha256",
+                            hashlib.sha256(open(os.path.join(d61, AB.SPEC_FILE), "rb").read()).hexdigest()])
+            except SystemExit as e:
+                rc2 = e.code
+        ok(rc not in (0, None) and st61 == "awaiting" and rc2 == 0 and _SO.status(d61) == "signed",
+           f"T61 stage_machine.py sign --expect-sha256 refuses another spec's sha and signs the shown one "
+           f"(rc {rc}, {st61}; rc {rc2}, {_SO.status(d61)})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

@@ -231,6 +231,24 @@ def _self_test() -> int:
                f"SG10 a spec with engine: auto can be signed before the engine is chosen ({st0})")
         except ValueError as e:
             ok(False, f"SG10 a spec with engine: auto can be signed before the engine is chosen: {e}")
+    # SG11-SG12 (run console review, finding 6): a sign-off names the spec it was shown; another spec is refused.
+    with tempfile.TemporaryDirectory() as d:
+        p = schema.toy_spec(d)
+        shown = DB._sha(p)
+        with open(p, "a") as f:
+            f.write("\n# edited after the owner read it\n")
+        try:
+            sign(d, "owner", note="n", expect_sha256=shown)
+            ok(False, "SG11 a sign-off for a spec other than the one shown is refused")
+        except (ValueError, TypeError) as e:
+            ok(isinstance(e, ValueError) and "changed" in str(e) and status(d) == "awaiting",
+               f"SG11 a sign-off for a spec other than the one shown is refused ({e})")
+        try:
+            rec = sign(d, "owner", note="n", expect_sha256=DB._sha(p))
+            ok(rec["sha256"][SPEC] == DB._sha(p) and status(d) == "signed",
+               "SG12 the sign-off records the hash of the bytes it checked")
+        except (ValueError, TypeError) as e:
+            ok(False, f"SG12 the sign-off records the hash of the bytes it checked ({e})")
     # DI6, DI7, DI10 (docs/design/v2-derived-inputs.md): the sign-off freezes the derivation record, and the sheet
     # shows the owner the accepted defaults and the columns the run chose not to use.
     try:

@@ -2320,11 +2320,562 @@ def _self_test() -> int:
                and sm[0]["source"] == "analysis/point.yaml" and sm[2]["source"] == "decision_spec.yaml"
                and sm[-1]["of"] == 10 and batch_info(d)[0]["reused"] == 3,
                f"RC16d the summary: headline first with its UI, each value with its source; reused batch points ({sm})")
+    with tempfile.TemporaryDirectory() as tr:
+        _self_test_review(ok, tr)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _page_sources() -> str:
+    """The page and every script it loads, as text (the self-test reads the page's code)."""
+    out = [open(HTML, encoding="utf-8").read()]
+    js = os.path.join(os.path.dirname(HTML), "run_console.js")
+    if os.path.exists(js):
+        out.append(open(js, encoding="utf-8").read())
+    return "\n".join(out)
+
+
+def _attr_interpolations(src: str) -> list:
+    """Every ${...} inside a double-quoted HTML attribute of the page's templates: [(attribute, expression)]."""
+    out = []
+    for m in re.finditer(r'\s([a-zA-Z][\w-]*)="', src):
+        i, n = m.end(), len(src)
+        while i < n and src[i] not in '"\n':
+            if src.startswith("${", i):
+                depth, j, quote = 1, i + 2, None
+                while j < n and depth:
+                    ch = src[j]
+                    if quote:
+                        if ch == "\\":
+                            j += 1
+                        elif ch == quote:
+                            quote = None
+                    elif ch in "\"'":
+                        quote = ch
+                    elif ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                    j += 1
+                out.append((m.group(1), src[i + 2:j - 1]))
+                i = j
+            else:
+                i += 1
+    return out
+
+
+_SAFE_ATTR = re.compile(r"^\s*(?:esc|ref|q)\(")
+_LIT_TERNARY = re.compile(r"""^[^?`$]*\?\s*("[^"]*"|'[^']*')\s*:\s*("[^"]*"|'[^']*')\s*$""")
+
+
+def _self_test_review(ok, td: str) -> None:
+    """RV1-RV17: the Codex review of PR #124. Each case was written failing first, against the code as merged."""
+    from types import SimpleNamespace as NS
+    import urllib.request
+
+    def case(name, fn):
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001 -- a missing function or a crash is a failing case
+            ok(False, f"{name}: {type(e).__name__}: {str(e)[:300]}")
+
+    def serve(con):
+        srv = make_server(con, "127.0.0.1", 0)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv, f"http://127.0.0.1:{srv.server_address[1]}"
+
+    def post(base, path, body, token):
+        req = urllib.request.Request(base + path, data=json.dumps(body).encode(), method="POST",
+                                     headers={"X-Console-Token": token, "Content-Type": "application/json"})
+        try:
+            return json.load(urllib.request.urlopen(req))
+        except urllib.error.HTTPError as e:
+            return {"ok": False, "http": e.code, **json.loads(e.read() or b"{}")}
+
+    def get(base, path):
+        return json.load(urllib.request.urlopen(base + path))
+
+    def spec_run(d):
+        """A toy run whose decision spec waits for the owner's sign-off."""
+        from toolkit.spec import schema
+        _toy_run(d, "SIGN", "awaiting_signoff", None, path=("SPEC", "SIGN"))
+        os.remove(os.path.join(d, "scope_signoff_request.json"))
+        schema.toy_spec(d)
+        return d
+
+    def need(run, sub):
+        return next((c for c in run["cards"] if c["kind"] == "decision_needed" and c.get("sub") == sub), {})
+
+    # RV1 XSS: artifact text never reaches an attribute unescaped; a CSP forbids inline script
+    def rv1():
+        src = _page_sources()
+        bad = [(a, e) for a, e in _attr_interpolations(src) if not _SAFE_ATTR.match(e) and not _LIT_TERNARY.match(e)]
+        ok(not bad, f"RV1a every ${{...}} in an HTML attribute is esc(), ref(), q() or a ternary of literals "
+                    f"({len(bad)} not: {bad[:6]})")
+        d = _toy_run(os.path.join(td, "rv1", "runs", "r"))
+        open(os.path.join(d, "figures", "x.svg"), "w").write('<svg xmlns="http://www.w3.org/2000/svg"><script>'
+                                                              'alert(1)</script></svg>')
+        con = Console([os.path.join(td, "rv1")], log=lambda *a: None)
+        srv, base = serve(con)
+        try:
+            r = urllib.request.urlopen(base + "/")
+            page, csp = r.read().decode(), r.headers.get("Content-Security-Policy") or ""
+            f = urllib.request.urlopen(base + "/api/file?" + urllib.parse.urlencode({"run": d, "path": "figures/x.svg"}))
+            fcsp = f.headers.get("Content-Security-Policy") or ""
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        inline = re.findall(r"<script(?![^>]*\bsrc=)[^>]*>\s*\S", page)
+        ok("connect-src 'self'" in csp and "script-src 'self'" in csp and "unsafe-inline" not in csp.split(
+            "script-src")[-1].split(";")[0] and not inline,
+           f"RV1b the page has a CSP (script-src 'self', connect-src 'self') and no inline script ({csp!r}; "
+           f"{len(inline)} inline)")
+        ok("sandbox" in fcsp and "default-src 'none'" in fcsp, f"RV1c a served artifact (an SVG may hold a script) "
+           f"is sandboxed ({fcsp!r})")
+        node = shutil.which("node")
+        if node:
+            js = src[src.index("const esc ="):]
+            fn = js[:js.index("\n", 0)] + "\n" + js[js.index("function num("):js.index("\n}\n", js.index(
+                "function num(")) + 3]
+            out = subprocess.run([node, "-e", fn + '\nprocess.stdout.write(num("<img src=x onerror=alert(1)>"))'],
+                                 capture_output=True, text=True, timeout=30).stdout
+            ok("<img" not in out and out, f"RV1d num() escapes a non-number from an artifact ({out!r})")
+    case("RV1", rv1)
+
+    # RV2 the console's writes never follow a symlink out of owner/, _drafts/ or _owner/
+    def rv2():
+        out1, out2, out3 = (os.path.join(td, f"rv2_out{i}") for i in (1, 2, 3))
+        for o in (out1, out2, out3):
+            os.makedirs(o)
+        d = _toy_run(os.path.join(td, "rv2", "a"))
+        os.symlink(out1, os.path.join(d, "owner"))
+        d2 = _toy_run(os.path.join(td, "rv2", "b"))
+        os.makedirs(os.path.join(d2, "owner"))
+        tgt = os.path.join(out2, "victim.jsonl")
+        open(tgt, "w").write("")
+        os.symlink(tgt, os.path.join(d2, "owner", "feedback.jsonl"))
+        refused = []
+        for rd_ in (d, d2):
+            try:
+                append_feedback(rd_, {"kind": "guidance", "layer": "writer", "text": "x"})
+                refused.append(False)
+            except (ValueError, OSError):
+                refused.append(True)
+        ok(all(refused) and os.listdir(out1) == [] and open(tgt).read() == "",
+           f"RV2a feedback is not written through a symlinked owner/ or owner/feedback.jsonl ({refused})")
+        root = os.path.join(td, "rv2")
+        os.symlink(out3, os.path.join(root, "_drafts"))
+        os.symlink(out3, os.path.join(root, "_owner"))
+        res = []
+        for fn in (lambda: build_on(d2, os.path.join(root, "_drafts")),
+                   lambda: export_digest([d2], os.path.join(root, "_owner"))):
+            try:
+                fn()
+                res.append(False)
+            except (ValueError, OSError):
+                res.append(True)
+        ok(all(res) and os.listdir(out3) == [], f"RV2b a draft and a digest are not written through a symlinked "
+           f"_drafts/ or _owner/ ({res}, {os.listdir(out3)})")
+    case("RV2", rv2)
+
+    # RV3 every artifact read stays inside the run dir
+    def rv3():
+        d = _toy_run(os.path.join(td, "rv3", "r"))
+        sec = os.path.join(td, "rv3_secret.yaml")
+        yaml.safe_dump({"question": "OUTSIDE-SECRET", "decision_changes": True}, open(sec, "w"))
+        open(os.path.join(d, ".env"), "w").write("ANTHROPIC_API_KEY=ENV-SECRET\n")
+        yaml.safe_dump({"data": {"tests": [{"test_id": "DT1", "path": os.path.relpath(sec, d), "verdict": "NO_CHANGE"},
+                                           {"test_id": "DT2", "path": sec, "verdict": "NO_CHANGE"},
+                                           {"test_id": "DT3", "path": ".env", "verdict": "NO_CHANGE"}]}},
+                       open(os.path.join(d, "analysis", "decision_tests.yaml"), "w"))
+        cards = decision_test_cards(d)
+        blob = json.dumps(cards, default=str)
+        ok("OUTSIDE-SECRET" not in blob and "ENV-SECRET" not in blob and len(cards) == 3
+           and all(c.get("state") == "error" for c in cards),
+           f"RV3a a decision test's path outside the run dir, absolute or a credential file is an error, not read "
+           f"({[c.get('state') for c in cards]})")
+        md_out = os.path.join(td, "rv3_results.md")
+        open(md_out, "w").write("# R\n\n## Recommendation\n\nOUTSIDE-SECRET averts 9 events.\n")
+        os.remove(os.path.join(d, "results.md"))
+        os.symlink(md_out, os.path.join(d, "results.md"))
+        st_out = os.path.join(td, "rv3_state.json")
+        shutil.copy(os.path.join(d, "run_state.json"), st_out)
+        d2 = _toy_run(os.path.join(td, "rv3", "r2"))
+        os.remove(os.path.join(d2, "run_state.json"))
+        os.symlink(st_out, os.path.join(d2, "run_state.json"))
+        r = json.dumps(read_run(d), default=str)
+        ok("OUTSIDE-SECRET" not in r and "OUTSIDE-SECRET" not in chat_context(d)["run"]
+           and load_run_state(d2)[0] is None,
+           "RV3b fixed-name artifacts (results.md, run_state.json) that link outside the run dir are not read")
+    case("RV3", rv3)
+
+    # RV4 a sign-off is bound to the run it was shown for
+    def rv4():
+        root = os.path.join(td, "rv4")
+        a = spec_run(os.path.join(root, "A"))
+        b = os.path.join(root, "B")
+        shutil.copytree(a, b)
+        con = Console([root], log=lambda *a: None)
+        srv, base = serve(con)
+        try:
+            card = need(get(base, "/api/run?run=" + urllib.parse.quote(a)), "spec")
+            r = post(base, "/api/sign_spec", {"run": b, "note": "n", "confirm": True, "ticket": card.get("ticket"),
+                                              "spec_sha256": card.get("spec_sha256")}, con.token)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        from toolkit.spec import signoff
+        ok(card.get("ticket") and not r.get("ok") and signoff.status(b) == "awaiting" and signoff.status(a) == "awaiting",
+           f"RV4a a sign request for run B carrying the card shown for run A is refused ({r.get('refused') or r})")
+        src = _page_sources()
+        ok("S.loadSeq" in src and re.search(r"seq\s*!==\s*S\.loadSeq", src) and "S.loading" in src,
+           "RV4b the page discards a stale /api/run answer (request sequence) and disables decisions while loading")
+    case("RV4", rv4)
+
+    # RV5 a remote answer names the remote label and run dir it answers
+    def rv5():
+        m = os.path.join(td, "rv5")
+        d = _toy_run(os.path.join(m, "F1", "runs", "2026_x"))
+        d2 = _toy_run(os.path.join(td, "rv5b", "2026_y"))
+        con = Console([], mirror=m, cloud_config="c.py", log=lambda *a: None)
+        con2 = Console([], mirror=os.path.join(td, "rv5b"), cloud_config="c.py", log=lambda *a: None)
+        ok(con.remote_target(d) == ("F1", "2026_x"), "RV5a a mirrored <label>/runs/<run> names its label and run")
+        try:
+            con2.remote_target(d2)
+            ok(False, "RV5b a mirrored run with no label is refused without --remote-label")
+        except ValueError:
+            ok(True, "RV5b a mirrored run with no label is refused without --remote-label")
+        seen = []
+        fp = (inbox(d)["scope"]["items"] or [{}])[0].get("fingerprint")
+        r = answer_scope(d, {fp: "accept"}, "remote", True, mirror=True, cloud_config="c.py", fingerprints=[fp],
+                         remote=("F1", "2026_x"), runner=lambda cmd, **k: seen.append(cmd)
+                         or NS(returncode=0, stdout="ok", stderr=""))
+        cmd = seen[0] if seen else []
+        ok(r.get("ok") and cmd[1:4] == ["cloud/run_cluster.py", "c.py", "sign"] and cmd[5:9] == ["--label", "F1", "--run",
+                                                                                                  "2026_x"],
+           f"RV5c the remote sign passes --label and --run ({cmd})")
+    case("RV5", rv5)
+
+    # RV6 the answer is bound to the content shown: the spec's sha256, the scope items' fingerprints
+    def rv6():
+        root = os.path.join(td, "rv6")
+        a = spec_run(os.path.join(root, "A"))
+        s = _toy_run(os.path.join(root, "S"))
+        con = Console([root], log=lambda *a: None)
+        srv, base = serve(con)
+        from toolkit.spec import signoff
+        import scope_signoff as SS
+        try:
+            card = need(get(base, "/api/run?run=" + urllib.parse.quote(a)), "spec")
+            with open(os.path.join(a, "decision_spec.yaml"), "a") as f:
+                f.write("\n# changed after the owner read it\n")
+            r = post(base, "/api/sign_spec", {"run": a, "note": "n", "confirm": True, "ticket": card.get("ticket"),
+                                              "spec_sha256": card.get("spec_sha256")}, con.token)
+            ok(card.get("spec_sha256") and not r.get("ok") and signoff.status(a) == "awaiting",
+               f"RV6a a spec edited after it was shown is not signed ({r.get('refused') or r.get('out') or r})")
+            sc = need(get(base, "/api/run?run=" + urllib.parse.quote(s)), "scope")
+            fps = sc.get("fingerprints") or []
+            rq = json.load(open(os.path.join(s, SS.REQUEST)))
+            rq["items"][0]["fingerprint"] = "fp-changed-0000"
+            json.dump(rq, open(os.path.join(s, SS.REQUEST), "w"))
+            r2 = post(base, "/api/scope", {"run": s, "note": "n", "confirm": True, "ticket": sc.get("ticket"),
+                                           "fingerprints": fps, "answers": {f: "accept" for f in fps}}, con.token)
+            ok(fps and not r2.get("ok") and not os.path.exists(os.path.join(s, SS.SIGNOFF)),
+               f"RV6b a scope request changed after it was shown is not answered ({r2.get('refused') or r2})")
+            sc2 = need(get(base, "/api/run?run=" + urllib.parse.quote(s)), "scope")
+            r3 = post(base, "/api/scope", {"run": s, "note": "n", "confirm": True, "ticket": sc2.get("ticket"),
+                                           "fingerprints": sc2.get("fingerprints"),
+                                           "answers": {f: "accept" for f in sc2.get("fingerprints") or []}}, con.token)
+            ok(r3.get("ok") and (SS.load_answers(s)[0].get("fp-changed-0000") or {}).get("decision") == "accept",
+               f"RV6c answers keyed by the fingerprints shown are recorded ({r3.get('refused') or r3.get('out')})")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+    case("RV6", rv6)
+
+    # RV7 a run under a mirror root is a mirror, whatever the order the roots are walked in
+    def rv7():
+        t = os.path.join(td, "rv7")
+        _toy_run(os.path.join(t, "local"))
+        _toy_run(os.path.join(t, "live", "2026_m"))
+        runs = {r["name"]: r["mirror"] for r in Console([t], mirror=os.path.join(t, "live"), log=lambda *a: None).runs()}
+        ok(runs == {"local": False, "2026_m": True}, f"RV7 overlapping roots keep the mirror mark ({runs})")
+    case("RV7", rv7)
+
+    class Msgs:
+        def __init__(self, tokens=1000, stream=None):
+            self.tokens, self.stream_fn, self.calls = tokens, stream, []
+
+        def count_tokens(self, **kw):
+            if isinstance(self.tokens, Exception):
+                raise self.tokens
+            return NS(input_tokens=self.tokens)
+
+    def msg(text="ok", usage=None):
+        return NS(content=[NS(type="text", text=text)], stop_reason="end_turn", model=MODEL,
+                  usage=usage or NS(input_tokens=10, output_tokens=10, cache_creation_input_tokens=0,
+                                    cache_read_input_tokens=0))
+
+    def client_with(stream, tokens=1000):
+        m = Msgs(tokens)
+        return NS(messages=m, beta=NS(messages=NS(stream=stream)))
+
+    # RV8 concurrent chats: each reserves its worst case under the lock; one run's turns are serialized
+    def rv8():
+        gate, calls = threading.Event(), []
+
+        class Slow:
+            def __init__(self, kw):
+                calls.append(kw)
+
+            def __enter__(self):
+                gate.wait(10)
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def get_final_message(self):
+                return msg(f"reply {len(calls)}")
+        os.environ["ANTHROPIC_API_KEY"], prev = "sk-test-x", os.environ.get("ANTHROPIC_API_KEY")
+        try:
+            r1, r2 = _toy_run(os.path.join(td, "rv8", "a")), _toy_run(os.path.join(td, "rv8", "b"))
+            cl = client_with(lambda **kw: Slow(kw), 1000)
+            cs = ChatSession(1.25 * worst_case_usd(1000), lambda: cl, log=lambda *a: None)
+            res = []
+            ts = [threading.Thread(target=lambda d=d: res.append(cs.send(d, "q"))) for d in (r1, r2)]
+            for th in ts:
+                th.start()
+                time.sleep(0.3)
+            gate.set()
+            for th in ts:
+                th.join(10)
+            ok(len(calls) == 1 and sum(1 for x in res if not x.get("ok") and "chat cap" in (x.get("error") or "")) == 1,
+               f"RV8a two concurrent messages that together pass the cap: one is refused before its call "
+               f"({len(calls)} calls; {[x.get('error') for x in res]})")
+            gate.clear()
+            calls.clear()
+            cs2 = ChatSession(100.0, lambda: cl, log=lambda *a: None)
+            r3 = _toy_run(os.path.join(td, "rv8", "c"))
+            ts = [threading.Thread(target=lambda t=t: cs2.send(r3, t)) for t in ("first", "second")]
+            for th in ts:
+                th.start()
+                time.sleep(0.3)
+            gate.set()
+            for th in ts:
+                th.join(10)
+            later = calls[-1]["messages"] if len(calls) == 2 else []
+            ok(len(calls) == 2 and any(m_["role"] == "assistant" for m_ in later),
+               f"RV8b two messages on one run are serialized: the second carries the first reply "
+               f"({[m_['role'] for m_ in later]})")
+        finally:
+            gate.set()
+            if prev is None:
+                os.environ.pop("ANTHROPIC_API_KEY", None)
+            else:
+                os.environ["ANTHROPIC_API_KEY"] = prev
+    case("RV8", rv8)
+
+    # RV9 failed streams and the worst-case bound
+    def rv9():
+        os.environ["ANTHROPIC_API_KEY"], prev = "sk-test-x", os.environ.get("ANTHROPIC_API_KEY")
+        try:
+            d = _toy_run(os.path.join(td, "rv9", "a"))
+
+            class Boom:
+                def __init__(self, kw, snap=None):
+                    self.snap = snap
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+                @property
+                def current_message_snapshot(self):
+                    if self.snap is None:
+                        raise AssertionError("no snapshot")
+                    return self.snap
+
+                def get_final_message(self):
+                    raise RuntimeError("stream broke")
+            cs = ChatSession(5.0, lambda: client_with(lambda **kw: Boom(kw), 2000), log=lambda *a: None)
+            r = cs.send(d, "q")
+            ok(not r["ok"] and abs(cs.spent - worst_case_usd(2000)) < 1e-9,
+               f"RV9a a failed stream with no usage keeps its reservation ({cs.spent})")
+            part = NS(input_tokens=2000, output_tokens=50, cache_creation_input_tokens=0, cache_read_input_tokens=0)
+            cs = ChatSession(5.0, lambda: client_with(lambda **kw: Boom(kw, NS(usage=part, model=MODEL)), 2000),
+                             log=lambda *a: None)
+            cs.send(d, "q")
+            ok(abs(cs.spent - price(part)) < 1e-9, f"RV9b a failed stream's partial usage is charged ({cs.spent})")
+            made = []
+            cs = ChatSession(2.0, lambda: client_with(lambda **kw: made.append(1), 1_000_000), log=lambda *a: None)
+            r = cs.send(d, "q")
+            ok(not r["ok"] and "chat cap" in r["error"] and not made,
+               "RV9c the input bound is the API's token count: a 1M-token prompt is refused under a $2 cap")
+            sysb = [{"type": "text", "text": "é" * 100}]
+            n, how = input_token_bound(None, sysb, [{"role": "user", "content": "😀" * 10}])
+            ok(n >= 200 + 40 and "byte" in how, f"RV9d without a count the bound is the UTF-8 byte length ({n}, {how})")
+            ok(PRICE == {"in": 4.0, "out": 20.0, "cache_write": 5.0, "cache_read": 0.20}
+               and FALLBACK_PRICE["out"] >= 25.0 and FALLBACK_PRICE["cache_write"] >= 6.25
+               and abs(worst_case_usd(1000) - (1000 * (5.0 + FALLBACK_PRICE["cache_write"])
+                                              + MAX_TOKENS * (20.0 + FALLBACK_PRICE["out"])) / 1e6) < 1e-9,
+               "RV9e the worst case: every input token a cache write and full max_tokens, on Opus 5.5 and again on "
+               "the refusal fallback (claude-api skill price table)")
+        finally:
+            if prev is None:
+                os.environ.pop("ANTHROPIC_API_KEY", None)
+            else:
+                os.environ["ANTHROPIC_API_KEY"] = prev
+    case("RV9", rv9)
+
+    # RV10 four decision-test states: changed, unchanged, not run, error
+    def rv10():
+        d = _toy_run(os.path.join(td, "rv10", "a"))
+        yaml.safe_dump({"data": {"tests": [
+            {"test_id": "DT1", "path": "models/decision_tests/DT1.yaml", "verdict": "CHANGES_PLAN"},
+            {"test_id": "DT2", "verdict": "NO_CHANGE"}, {"test_id": "DT3", "verdict": "NOT_RUN"},
+            {"test_id": "DT4", "path": "models/decision_tests/missing.yaml", "verdict": "NO_CHANGE"}]}},
+            open(os.path.join(d, "analysis", "decision_tests.yaml"), "w"))
+        st = {c["test_id"]: (c.get("state"), c["title"]) for c in decision_test_cards(d)}
+        ok({k: v[0] for k, v in st.items()} == {"DT1": "changed", "DT2": "unchanged", "DT3": "not_run", "DT4": "error"}
+           and "does not change" not in st["DT3"][1] + st["DT4"][1],
+           f"RV10a NOT_RUN and an unreadable result are their own states ({st})")
+        ok("not run" in chat_context(d)["run"] and run_summary(d)["tests"].get("DT3") == "not_run",
+           "RV10b chat context and the run summary (compare) keep the not-run state")
+        src = _page_sources()
+        ok('"not_run"' in src and "not run" in src and '"error"' in src, "RV10c the page shows not run and error")
+    case("RV10", rv10)
+
+    # RV11 the mirror's sync status is visible; a stale mirror cannot be approved remotely
+    def rv11():
+        m = os.path.join(td, "rv11")
+        d = _toy_run(os.path.join(m, "F1", "runs", "2026_x"))
+        con = Console([], mirror=m, sync_cmd="true", sync_s=60, cloud_config="c.py", log=lambda *a: None)
+        con.sync_once(runner=lambda *a, **k: NS(returncode=0, stdout="", stderr=""), now=1000.0)
+        fresh = con.sync_status(now=1030.0)
+        for t in (1060.0, 1120.0):
+            con.sync_once(runner=lambda *a, **k: NS(returncode=1, stdout="", stderr="rsync: refused"), now=t)
+        stale = con.sync_status(now=1130.0)
+        ok(not fresh["stale"] and stale["stale"] and stale["failures"] == 2 and stale["last_ok_at"]
+           and "refused" in stale["last_error"], f"RV11a sync status: last success, failures, stale after 2 ({stale})")
+        fp = inbox(d)["scope"]["items"][0]["fingerprint"]
+        r = con.answer(d, "scope", {"fingerprints": [fp], "answers": {fp: "accept"}, "note": "n", "confirm": True},
+                       now=1130.0)
+        ok(not r.get("ok") and "stale" in (r.get("refused") or ""), f"RV11b a stale mirror is not approved ({r})")
+        ok("S.meta.sync" in _page_sources() and "sync" in re.search(r"const PAGE_NEEDS = \[([^\]]*)\]",
+                                                                     _page_sources()).group(1),
+           "RV11c the page shows the sync status")
+    case("RV11", rv11)
+
+    # RV12 a refresh does not wipe an answer being written
+    def rv12():
+        src = _page_sources()
+        body = src[src.index("function renderStream"):][:2500]
+        ok("saveForms()" in body and "restoreForms(" in body, "RV12 renderStream keeps the open answer forms' state")
+    case("RV12", rv12)
+
+    # RV13 the parse cache sees a same-size, same-mtime replacement; a sync clears it
+    def rv13():
+        f = os.path.join(td, "rv13.yaml")
+        open(f, "w").write("x: 1\n")
+        st0 = os.stat(f)
+        first = _read(f)[0]
+        tmp = f + ".new"
+        open(tmp, "w").write("x: 2\n")
+        os.utime(tmp, ns=(st0.st_atime_ns, st0.st_mtime_ns))
+        os.replace(tmp, f)
+        ok(first == {"x": 1} and _read(f)[0] == {"x": 2}, "RV13a a replaced file with the same size and mtime is read "
+                                                          "again (inode and ctime in the key)")
+        con = Console([], mirror=td, sync_cmd="true", log=lambda *a: None)
+        _read(f)
+        con.sync_once(runner=lambda *a, **k: NS(returncode=0, stdout="", stderr=""))
+        ok(not _CACHE, "RV13b each sync clears the parse cache")
+    case("RV13", rv13)
+
+    # RV14 feedback carries an evidence snapshot
+    def rv14():
+        d = _toy_run(os.path.join(td, "rv14", "a"))
+        row = append_feedback(d, {"kind": "correction", "layer": "critique", "text": "no",
+                                  "anchor": {"kind": "blocker", "id": "T-001", "file": "critique_domain.yaml"}})
+        ev = row.get("evidence") or {}
+        ok(ev.get("sha256") == _sha(os.path.join(d, "critique_domain.yaml")) and ev.get("round") == 1
+           and "The interval omits one source." in (ev.get("excerpt") or ""),
+           f"RV14 feedback stores the anchored artifact's round, sha256 and an excerpt ({ev})")
+    case("RV14", rv14)
+
+    # RV15 lineage honesty
+    def rv15():
+        t = os.path.join(td, "rv15")
+        spec = {"objective": {"outcome": "dalys"}, "analysis": {"decision_tests": [{"id": "DT1", "values": [1, 2]}]}}
+        ds = []
+        for i, (lab, sp, note) in enumerate((("A", spec, "a"), ("B", spec, "b"),
+                                             ("C", {"objective": {"outcome": "deaths"}, "analysis": {
+                                                 "decision_tests": [{"id": "DT1", "values": [1, 3]}]}}, "c"))):
+            d = _toy_run(os.path.join(t, lab), "FINAL", None, "completed",
+                         path=("SPEC", "SIGN", "EVIDENCE", "ENGINE_CHOICE", "ANALYZE", "FINAL"))
+            st_ = json.load(open(os.path.join(d, "run_state.json")))
+            st_["question"] = "Toy lineage question."
+            for h in st_["history"]:
+                h["at"] = h["at"].replace("2026-01-01", f"2026-01-0{i + 1}")
+            json.dump(st_, open(os.path.join(d, "run_state.json"), "w"))
+            open(os.path.join(d, "decision_spec.yaml"), "w").write(yaml.safe_dump(sp) + f"# {note}\n")
+            json.dump({"engine": {"ref": "toy"}, "at": f"2026-01-0{i + 1}"}, open(os.path.join(d, "engine_choice.json"), "w"))
+            ds.append(d)
+        pj = projects(discover([t]))
+        lin = {r["name"]: r for r in pj[0]["lineage"]} if len(pj) == 1 else {}
+        ok(lin and lin["B"]["relation"] == "related run (inferred)" and lin["B"]["scenario"] != "same signed spec",
+           f"RV15a a different spec sha is a related run (inferred), never 'same signed spec' "
+           f"({lin.get('B', {}).get('relation')}, {lin.get('B', {}).get('scenario')!r})")
+        fields = {x["field"] for x in lin.get("C", {}).get("diff") or []}
+        ok("objective.outcome" in fields and any(f.startswith("analysis.decision_tests.DT1") for f in fields),
+           f"RV15b the diff includes objective.outcome and the decision tests' values ({sorted(fields)})")
+    case("RV15", rv15)
+
+    # RV16 chat: the anchored artifact's excerpt is in the context; citations are checked against what was sent
+    def rv16():
+        os.environ["ANTHROPIC_API_KEY"], prev = "sk-test-x", os.environ.get("ANTHROPIC_API_KEY")
+        try:
+            d = _toy_run(os.path.join(td, "rv16", "a"))
+            calls = []
+
+            class S1:
+                def __init__(self, kw):
+                    calls.append(kw)
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+                def get_final_message(self):
+                    return msg("It averts 120 [[results.md#Recommendation]]; see [[nowhere.md#x]].")
+            cs = ChatSession(5.0, lambda: client_with(lambda **kw: S1(kw)), log=lambda *a: None)
+            r = cs.send(d, "what does it show?", {"kind": "figure", "id": "figures/plan.png", "file": "figures/plan.png"})
+            last = calls[-1]["messages"][-1]["content"] if calls else ""
+            cits = {(c["file"], c["status"]) for c in (r.get("reply") or {}).get("citations") or []}
+            ok("plan option counts" in last, "RV16a an anchored message carries the artifact's caption or excerpt")
+            ok(cits == {("results.md", "checked"), ("nowhere.md", "unchecked")},
+               f"RV16b each citation is checked against the files in the context; others are unchecked ({cits})")
+        finally:
+            if prev is None:
+                os.environ.pop("ANTHROPIC_API_KEY", None)
+            else:
+                os.environ["ANTHROPIC_API_KEY"] = prev
+    case("RV16", rv16)
+
+    # RV17 editing the console does not invalidate numerical batch reuse
+    def rv17():
+        import compute as C
+        here = os.path.realpath(__file__)
+        under = [x for x in C.REPO_CODE_DIRS if here.startswith(os.path.join(os.path.realpath(C.REPO), x) + os.sep)]
+        ok(not under, f"RV17 the console is outside compute.code_fingerprint's repo dirs ({under})")
+    case("RV17", rv17)
 
 
 def main(argv=None) -> int:
