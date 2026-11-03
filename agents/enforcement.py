@@ -71,6 +71,10 @@ SCRIPT_OUTPUTS = (
     "models/claims_ledger.yaml",      # Phase 22 γ: scripts/build_claims_ledger.py
     "claims_ledger.yaml",
     "report.md",          # produced by scripts/render_claims.py
+    # benchmark arms at a spec's engine parameter values, and the harness record that verifies them
+    # (toolkit/spec/engine_parameters.py write_spec_benchmarks); in v2 the analysis/ prefix is harness-only too
+    "analysis/benchmarks_at_spec_values.yaml",
+    "analysis/benchmarks_at_spec_values.record.json",
     # Written by main.py itself (plain Python, not a tool call). The
     # validator reads the research question from metadata.json, so an
     # agent rewriting it could neuter spec-compliance.

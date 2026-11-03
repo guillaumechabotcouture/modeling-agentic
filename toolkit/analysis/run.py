@@ -120,8 +120,12 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     from toolkit.spec import priors as PRI
     eng_files = [f for f in (getattr(eng, "results_path", None), getattr(eng, "fitted_path", None),
                              PRI.priors_path(eng)) if f and os.path.exists(f)]
-    arts["engine"] = S.write("engine", {"card": card.to_dict(), "parameters": [vars(p) for p in eng.parameters()]},
-                             PRODUCER, [spec_path] + eng_files)
+    from toolkit.spec import engine_parameters as PV
+    eng_data = {"card": card.to_dict(), "parameters": [vars(p) for p in eng.parameters()]}
+    svr = PV.rows(spec, eng)            # spec-declared engine parameter values, with the card values they replace
+    if svr:
+        eng_data["spec_values"] = {r["name"]: {k: v for k, v in r.items() if k != "name"} for r in svr}
+    arts["engine"] = S.write("engine", eng_data, PRODUCER, [spec_path] + eng_files)
     data_in = [spec.resolve(spec["decision_units"]["csv"])]
     if spec["calibration"].get("method") in ("likelihood", "posterior"):
         data_in.append(spec.resolve(spec["calibration"]["targets"]["csv"]))
@@ -255,7 +259,8 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
          "share_pct": None if x["share_units_changed"] is None else 100.0 * x["share_units_changed"],
          "statement": x["statement"], "detail": {k: x[k] for k in ("engine_arm_or", "engine_interaction",
                                                     "rejected_values", "reachable_interaction") if k in x}} for x in dts]}, DT.PRODUCER,
-        [arts["point"], arts["uncertainty"]] + eng_files)
+        [arts["point"], arts["uncertainty"]] + eng_files
+        + sorted({os.path.join(run_dir, f) for x in dts for f in (x.get("arm_inputs") or {})}))
     for x in dts:
         if x["path"]:
             S.deliverable(os.path.join(run_dir, x["path"]), DT.PRODUCER, "decision_test")
@@ -303,14 +308,9 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
 
 
 # --------------------------------------------------------------------------- self-test
-def _toy_bench(d):
-    """Stamped benchmark results for the toy engine (toolkit/engines/benchmark.py): T2 is its interaction benchmark."""
-    import yaml
-    from toolkit.engines import benchmark as BM
-    from toolkit.engines.contract import ToyEngine
-    path = os.path.join(d, "toy_bench.yaml")
-    eng = ToyEngine(results_path=path)
-    pack = {"engine": "toolkit.engines.contract:ToyEngine", "seeds": [1],
+def _toy_pack() -> dict:
+    """The toy engine's benchmark pack: T2 is its interaction benchmark."""
+    return {"engine": "toolkit.engines.contract:ToyEngine", "seeds": [1],
             "horizon": {"start": 0, "stop": 3, "window": [0, 3], "windows": {"w": [1, 2]}},
             "settings": {"s": {"unit": {"x": 0.0}}},
             "arms": {"none": {"setting": "s", "package": {}}, "a": {"setting": "s", "package": {"a": 1}},
@@ -318,6 +318,16 @@ def _toy_bench(d):
             "benchmarks": [{"id": "T2", "metric": "interaction", "target": 1.0, "band": [0.8, 1.25],
                             "estimand": {"type": "interaction_or", "a11": "ab", "a10": "a", "a01": "b", "a00": "none",
                                          "value": "windows.w.prev"}}]}
+
+
+def _toy_bench(d):
+    """Stamped benchmark results for the toy engine (toolkit/engines/benchmark.py): T2 is its interaction benchmark."""
+    import yaml
+    from toolkit.engines import benchmark as BM
+    from toolkit.engines.contract import ToyEngine
+    path = os.path.join(d, "toy_bench.yaml")
+    eng = ToyEngine(results_path=path)
+    pack = _toy_pack()
     res = BM.run_pack(pack, eng, BM.Runner(pack, eng, 1), {})
     yaml.safe_dump(BM.stamp(res, eng), open(path, "w"), sort_keys=False)
     b = res["benchmarks"][0]

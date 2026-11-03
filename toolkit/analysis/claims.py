@@ -64,11 +64,30 @@ def claim_spec(A, arts: dict, point: dict, uq: dict, stab: dict, dts: list, cal:
         if d.get("status") != "not_run":
             cl.append(_c(f"dt.{d['test_id']}.share", "percentage", arts["decision_tests"],
                          f"data.tests[{j}].share_pct", "%"))
+    for r in _spec_rows(A, claimable=True):     # spec-declared engine parameter values and the card values they replace
+        n, f = r["name"], f"data.spec_values.{r['name']}"
+        cl.append(_c(f"spec_value.{n}.value", "scalar", arts["engine"], f"{f}.value", r["units"]))
+        cl.append(_c(f"spec_value.{n}.card_value", "scalar", arts["engine"], f"{f}.card_value", r["units"]))
+        if r["card_range"]:
+            cl.append(_c(f"spec_value.{n}.card_lo", "scalar", arts["engine"], f"{f}.card_range[0]", r["units"]))
+            cl.append(_c(f"spec_value.{n}.card_hi", "scalar", arts["engine"], f"{f}.card_range[1]", r["units"]))
     if cal.get("method") == "emulator_inversion":
         cl.append(_c("calibration.clamped", "count", arts["calibration"], "data.diagnostics.clamped_units", "units"))
     elif cal.get("method") == "likelihood":
         cl.append(_c("calibration.dispersion", "scalar", arts["calibration"], "data.diagnostics.dispersion"))
     return cl
+
+
+def _claimable(name: str) -> bool:
+    import re
+    return bool(re.fullmatch(r"[A-Za-z0-9_\-]+", name))
+
+
+def _spec_rows(A, claimable=False) -> list[dict]:
+    """The spec's engine parameter values (toolkit/spec/engine_parameters.py); `claimable`: only those whose name a
+    claim id can carry (the others are rendered with their values in results.md)."""
+    from toolkit.spec import engine_parameters as PV
+    return [r for r in PV.rows(A.spec, A.eng) if not claimable or _claimable(r["name"])]
 
 
 def write(A, run_dir, arts, point, uq, stab, sens, dts, cal, emu_acc) -> dict:
@@ -125,6 +144,10 @@ def results_template(A, point, uq, stab, sens, dts, cal, emu_acc) -> str:
               f"{', '.join(r['units'][:12])}{' ...' if len(r['units']) > 12 else ''} |" for r in rule]
     for oc in A.outcomes[1:]:
         L += ["", f"Also averted: [CLAIM:averted.{oc}.point] {oc} (median [CLAIM:averted.{oc}.median])."]
+    from toolkit.spec import engine_parameters as PV
+    sv = PV.markdown(_spec_rows(A), ref=lambda n, k: f"[CLAIM:spec_value.{n}.{k}]" if _claimable(n) else None)
+    if sv:
+        L += [""] + sv[:-1]
     L += ["", "## Uncertainty: what the interval covers", "",
           f"Interval over [CLAIM:uq.draws] draws: **{uq['label']}**.", ""]
     for e in uq["excludes"]:

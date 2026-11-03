@@ -53,7 +53,10 @@ class Analysis:
         from toolkit.spec import priors as PRI
         self.pr = PRI.drawn(spec)             # prior parameters, drawn in every uncertainty draw
         self.dr = dict(self.fr, **{k: (p.lo, p.hi, p.value) for k, p in self.pr.items()})   # every drawn parameter
-        self.theta0 = {k: v[2] for k, v in self.dr.items()}
+        from toolkit.spec import engine_parameters as PV
+        # the spec's engine parameter values under every parameter set built from here (point, draws, decision tests,
+        # stability, sensitivity, schedule and trajectory tasks); without the field this is the drawn point values
+        self.theta0 = PV.params(spec, {k: v[2] for k, v in self.dr.items()})
         self.dfac = discount_factor(spec)
         self.method = spec["calibration"].get("method", "none")
         self.lik = None

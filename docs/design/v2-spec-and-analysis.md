@@ -30,6 +30,7 @@ One YAML file, `decision_spec.yaml` in the run directory. Typed sections:
 |---|---|---|
 | `question`, `decision_maker`, `decision_date` | text; date is a year or ISO date | non-empty |
 | `engine` | `{ref: module:Class, config: {...}}` | imports, implements the contract |
+| `engine_parameters` (optional, 2026-11-02) | per parameter: `value`, `source`, `reason`; optional `units`, `range` + `dist`, `outside_card_range` (`toolkit/spec/engine_parameters.py`) | a `fixed` or `scenario` parameter on the engine card; card units; a value outside the card's range only with the flag (a HIGH note on the sign-off sheet and in the report) |
 | `decision_units` | units table, id, label, region, hold-out group, engine attribute mapping, populations (unit column to engine age groups) | engine card attributes and age groups; table columns |
 | `options` | toolkit/alloc `components`, `packages`, `prices`, `cost_items`, `engine_map` | toolkit/alloc cost validation; engine component values |
 | `objective` | `outcome`, `sense: avert`, `horizon: [t0, t1]` (outcomes counted over it), optional `delivery: [t0, t1]` (the years whose components the decision delivers and pays for; default `horizon`), `discounting: {rate, base_year}` | outcome is an engine per-capita output; horizon inside the engine horizon; delivery inside horizon, and only for an engine that declares `supports_delivery` (`toolkit/engines/horizon.py`) |

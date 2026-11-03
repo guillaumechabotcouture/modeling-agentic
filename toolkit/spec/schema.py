@@ -15,6 +15,8 @@ docs/design/v2-spec-and-analysis.md §1):
     engine: {ref: "pkg.module:Class", config: {...}}       # constructor keyword arguments; or `auto` /
                                                            # {auto: true, candidates: [...]}: chosen after sign-off,
                                                            # read from engine_choice.json (harness-written)
+    engine_parameters:                     # optional: a fixed or scenario parameter's point value for this run
+      p: {value, units, source, reason, outside_card_range, range, dist}    # toolkit/spec/engine_parameters.py
     horizon: {start: 2016.0, stop: 2027.0}                 # simulated period
     decision_units:
       csv: data/units.csv
@@ -396,6 +398,8 @@ class Spec:
                 at = inc.index("engine_parameters") + 1 if "engine_parameters" in inc else 0
                 meta["covers"] = inc = inc[:at] + ["priors"] + inc[at:]
                 meta["prior_dominated"] = P["prior_dominated"]
+            if P["label_fixed"].get("spec_fixed"):
+                meta["spec_fixed"] = P["label_fixed"]["spec_fixed"]
             if P["label_fixed"]["named"]:
                 meta["fixed"] = P["label_fixed"]["named"]
             if P["label_fixed"]["other"]:
@@ -667,6 +671,8 @@ def _validate_pending(s: Spec) -> list[str]:
     if r["comparator"].get("package") not in s.packages():
         bad.append(f"comparator: package {r['comparator'].get('package')!r} is not a package")
     bad += [e for e in _validate_uncertainty(s, {}) if "the engine" not in e]
+    from toolkit.spec import engine_parameters as PV
+    bad += PV.shape_problems(s)           # the engine-dependent checks run per candidate and after the choice
     for dt in r["analysis"].get("decision_tests") or []:
         if dt.get("type") not in DECISION_TEST_TYPES:
             bad.append(f"decision test {dt.get('id')}: type {dt.get('type')!r} not in {DECISION_TEST_TYPES}")
@@ -696,6 +702,8 @@ def _validate(s: Spec) -> list[str]:
         return bad + ["engine does not implement the Engine contract (describe, parameters, run)"]
     card = eng.describe()
     pnames = {p.name: p for p in eng.parameters()}
+    from toolkit.spec import engine_parameters as PV
+    bad += PV.problems(s, eng)            # before the checks that return early: a candidate engine shows them too
     try:
         units = s.units()
     except OSError as e:

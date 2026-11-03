@@ -173,20 +173,23 @@ def _format_interval(lo: str, hi: str, lo_num: float, hi_num: float) -> str:
 
 
 _SOURCE_ID_RE = re.compile(r"[a-z][a-z_]{0,40}")
-_PARAM_ID_RE = re.compile(r"[a-z][a-z0-9_]{0,40}")
-INTERVAL_KEYS = {"level", "covers", "excludes", "prior_dominated", "fixed", "fixed_other"}
+# engine parameter names as the engine contract allows them (e.g. `efficacy:vax`, `lrr:a+b`): no spaces or free text
+_PARAM_ID_RE = re.compile(r"[A-Za-z][A-Za-z0-9_:+.\-]{0,63}")
+INTERVAL_KEYS = {"level", "covers", "excludes", "prior_dominated", "spec_fixed", "fixed", "fixed_other"}
 
 
 def interval_meta_problem(meta) -> str | None:
     """Why an `interval:` block is unusable (None when it is fine): a level in [0.5, 1), and `covers` (non-empty) and
     `excludes` as lists of source identifiers (lower-case letters and underscores, no free text). Optional (v2 priors):
-    `prior_dominated` and `fixed`, lists of parameter identifiers, and `fixed_other`, a count."""
+    `prior_dominated`, `spec_fixed` (held at a spec-declared value) and `fixed`, lists of parameter identifiers, and
+    `fixed_other`, a count."""
     if not isinstance(meta, dict) or set(meta) - INTERVAL_KEYS:
-        return "interval must be a mapping of level, covers, excludes, prior_dominated, fixed and fixed_other only"
-    for k in ("prior_dominated", "fixed"):
+        return ("interval must be a mapping of level, covers, excludes, prior_dominated, spec_fixed, fixed and "
+                "fixed_other only")
+    for k in ("prior_dominated", "spec_fixed", "fixed"):
         v = meta.get(k, [])
         if not isinstance(v, list) or not all(isinstance(x, str) and _PARAM_ID_RE.fullmatch(x) for x in v):
-            return f"interval.{k} must be a list of parameter identifiers ([a-z0-9_])"
+            return f"interval.{k} must be a list of parameter identifiers (a letter, then [A-Za-z0-9_:+.-])"
     fo = meta.get("fixed_other", 0)
     if isinstance(fo, bool) or not isinstance(fo, int) or fo < 0:
         return "interval.fixed_other must be a count"
@@ -210,6 +213,8 @@ def interval_label(meta: dict) -> str:
     lab = f"{float(meta['level']) * 100:g}% UI over {words(meta['covers'])}"
     if meta.get("prior_dominated"):
         lab += f"; set by declared ranges, not by data: {', '.join(meta['prior_dominated'])}"
+    if meta.get("spec_fixed"):
+        lab += f"; held fixed at the spec value: {', '.join(meta['spec_fixed'])}"
     fx, fo = list(meta.get("fixed") or []), int(meta.get("fixed_other") or 0)
     if fx or fo:
         other = f"{fo} {'other ' if fx else ''}engine parameter{'s' if fo != 1 else ''}"
@@ -570,6 +575,27 @@ def _self_test() -> int:
     ok(lab == "95% UI over engine parameters, priors; set by declared ranges, not by data: smc_pe, dw_5_14; held fixed: "
               "cm_add and 3 other engine parameters; not covered: costs",
        f"T1d v2 priors: the label names the prior-dominated and the fixed parameters: {lab!r}")
+    try:
+        lab = interval_label({"level": 0.95, "covers": ["priors"], "excludes": [], "prior_dominated": ["use_rate"],
+                              "spec_fixed": ["retention_half"], "fixed": ["cm_add"]})
+    except ValueError as e:
+        lab = f"refused: {e}"
+    ok(lab == "95% UI over priors; set by declared ranges, not by data: use_rate; held fixed at the spec value: "
+              "retention_half; held fixed: cm_add",
+       f"T1e spec-declared engine parameter values held fixed are named as such in the label: {lab!r}")
+    ok(interval_meta_problem({"level": 0.95, "covers": ["priors"], "spec_fixed": ["held at 0.75 y"]}) is not None,
+       "T1f the spec-value list holds parameter identifiers only (no free text)")
+    try:      # review round 2 (R2-2): the engine contract's parameter names (compartmental, package-rate engines)
+        lab = interval_label({"level": 0.95, "covers": ["priors"], "prior_dominated": ["efficacy:vax"],
+                              "fixed": ["lrr:a+b"], "spec_fixed": ["coverage:routine"]})
+    except ValueError as e:
+        lab = f"refused: {e}"
+    ok(lab == "95% UI over priors; set by declared ranges, not by data: efficacy:vax; held fixed at the spec value: "
+              "coverage:routine; held fixed: lrr:a+b",
+       f"T1g parameter names with ':' and '+' are identifiers the label accepts: {lab!r}")
+    ok(all(interval_meta_problem({"level": 0.95, "covers": ["priors"], "fixed": [bad]}) is not None
+           for bad in ("held at 3%", "a b", "x;y", "", ":lead", "a" * 90)),
+       "T1h free text is still refused (spaces, punctuation outside the contract's names, empty, overlong)")
     with tempfile.TemporaryDirectory() as d_il:
         for bad_c, why in (({"interval_label": "95% UI over everything"}, "free text"),
                            ({"interval": {"level": 0.95, "covers": ["costs"], "fixed": ["held at 3%"]}},

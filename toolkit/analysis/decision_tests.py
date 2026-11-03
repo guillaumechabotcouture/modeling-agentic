@@ -9,7 +9,9 @@ Types (spec `analysis.decision_tests`):
                        A value the rescaling cannot reach (scale outside [0, MAX_SCALE]) is rejected,
                        and every reached value is checked: the achieved interaction equals the
                        requested one (Codex P1-12);
-  parameter_value      an engine parameter set to each value (an emulator input on the emulator path);
+  parameter_value      an engine parameter set to each value (an emulator input on the emulator path). For a
+                       parameter whose value the signed spec sets (engine_parameters), the point plan is the
+                       headline at the spec value, and the result records the card value (`spec_value`);
   group_rule           a constraints.group_rules rule removed (or `add:` a rule) and the plan re-solved;
   envelope             the plan re-solved at each envelope;
   prior_range          (automatic, v2d note §2.4) one per prior-dominated parameter the draws vary
@@ -107,6 +109,7 @@ def _not_run(A, dt, why, extra=None) -> dict:
 def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
     t = dt["type"]
     thr = _threshold(A)
+    sv = None                      # a parameter_value test on a spec-declared engine parameter value
     evs = {}                       # model corrections per tested value (Codex r2 P1-3)
     extra, rejected = {}, []
     if t == "interaction_rescale":
@@ -116,13 +119,20 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
         varied, cases, lowers, extra, rejected = r["varied"], r["cases"], r["lowers"], r["extra"], r["rejected"]
     elif t in ("parameter_value", "prior_range"):
         p = dt["parameter"]
-        if A.model.kind == "emulator" and p not in A.dr and not p.startswith("z:"):
+        if A.model.kind == "emulator" and p not in A.dr and p not in getattr(A.model, "spec_names", ()) \
+                and not p.startswith("z:"):
             return _not_run(A, dt, f"{p} is not an emulator input; it needs engine runs (direct evaluation), or a "
                                    "published prior so it enters the emulator design")
         varied = (f"engine parameter {p} set to each end of its declared prior range ({dt.get('source')})"
                   if t == "prior_range" else f"engine parameter {p} set to each tested value")
         cases, lowers = [], []
         vals = list(dt["values"])
+        from toolkit.spec import engine_parameters as PV
+        if t == "parameter_value" and p in PV.values(A.spec):   # the headline runs at the spec value: record the card
+            # value it replaces
+            cv = float(next(x.value for x in A.eng.parameters() if x.name == p))
+            sv = {"value": PV.values(A.spec)[p], "card_value": cv,
+                  "card_value_tested": any(abs(float(v) - cv) <= 1e-9 * max(1.0, abs(cv)) for v in vals)}
         if A.model.kind == "emulator":
             # an emulator answer outside its design box is an extrapolation (and the plan guard would block the whole
             # analysis): such a value is refused, with the box; toolkit/analysis/batch.py widens the box to span the
@@ -206,6 +216,10 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
     else:
         stmt = "This test can move the plan: it was re-solved for each value"
         can_move = True
+    if sv:
+        stmt += (f"; the headline uses the spec value of {dt['parameter']} (engine_parameters), and the engine card "
+                 "value " + ("is one of the tested values" if sv["card_value_tested"]
+                             else "is not among the tested values"))
     if rejected:
         stmt += "; some requested values could not be reached and were rejected"
     if any(r.get("calibration_clamped_units") for r in results):
@@ -218,12 +232,16 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
            "decision_changes": bool(share > thr), "share_units_changed": float(share), "share_threshold": thr,
            "recommendation": {"with": A.mix_text(plan), "without": worst["recommendation"]},
            "results": results, "rejected_values": rejected, "produced_by": "harness", "producer": PRODUCER}
+    if sv:
+        rec["spec_value"] = sv
     if comps:
         rec["relevance"] = {"components": sorted(comps), "units_with_component_point_plan": in_plan,
                             "components_in_any_draw_plan": in_draws}
     if t == "interaction_rescale":
         rec["engine_arm_or"], rec["engine_interaction"] = extra.get("_arm"), extra.get("_int")
         rec["arm_source"] = extra.get("_src")
+        if extra.get("_inputs"):
+            rec["arm_inputs"] = extra["_inputs"]
     return rec
 
 
@@ -236,9 +254,21 @@ def _rescale(ratio: float, g: float) -> float:
 
 
 def _interaction(A, dt, ben0, cost0, plan, out0) -> dict:
-    rows, why = verified_benchmarks(A.eng)
-    if why:
-        return {"not_run": f"the engine's benchmark arm ratios are not verified ({why})"}
+    from toolkit.spec import engine_parameters as PV
+    if PV.values(A.spec):
+        # the outcomes are at the spec values, so the arms must be too (review round 2, R2-1): never derive the
+        # rescaling from arms at the card values and apply it to outcomes at the spec values
+        rows, why = PV.verified_spec_benchmarks(A.eng, A.spec, dt.get("benchmark"))
+        if why:
+            return {"not_run": f"benchmark arms not computed at the spec values ({why})"}
+        src = f"{PV.SPEC_BENCH} (the harness step at the spec values; record {PV.SPEC_BENCH_RECORD})"
+        arm_inputs = {f: PV._sha(os.path.join(A.spec.base, f)) for f in (PV.SPEC_BENCH, PV.SPEC_BENCH_RECORD)}
+    else:
+        rows, why = verified_benchmarks(A.eng)
+        if why:
+            return {"not_run": f"the engine's benchmark arm ratios are not verified ({why})"}
+        src = "toolkit/engines/benchmark.py"
+        arm_inputs = None
     b = {r.get("id"): r for r in rows}.get(dt.get("benchmark"))
     if not b or not b.get("arm_or"):
         return {"not_run": f"benchmark {dt.get('benchmark')} with arm odds ratios is not in the verified results"}
@@ -251,8 +281,8 @@ def _interaction(A, dt, ben0, cost0, plan, out0) -> dict:
     inter = lambda g: arm["a10"] * _rescale(r_inc, g) / (arm["a10"] * arm["a01"])  # noqa: E731
     comp, with_any = set(dt["components"]), set(dt["with_any"])
     cases, lowers, rejected = [], [], []
-    extra = {"_arm": arm, "_int": eng_int,
-             "_src": f"verified benchmark results ({dt.get('benchmark')}), toolkit/engines/benchmark.py"}
+    extra = {"_arm": arm, "_int": eng_int, "_src": f"verified benchmark results ({dt.get('benchmark')}), {src}",
+             "_inputs": arm_inputs}
     lo_reach, hi_reach = inter(MAX_SCALE), inter(0.0)
     o = A.primary
     for v in dt["values"]:

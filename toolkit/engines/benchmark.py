@@ -526,8 +526,11 @@ def _spread(per) -> dict:
 
 
 class Runner:
-    def __init__(self, pack: dict, engine, workers: int = 1, seeds=None):
+    def __init__(self, pack: dict, engine, workers: int = 1, seeds=None, base_params: dict | None = None):
         self.pack, self.engine, self.workers = pack, engine, workers
+        # values under every setting's own parameters (a spec's engine parameter values, toolkit/spec/
+        # engine_parameters.py): they replace engine defaults, never a setting's observed conditions
+        self.base_params = dict(base_params or {})
         self.seeds = list(seeds or pack.get("seeds") or [1])
         self.ref = pack["engine"]
         self.cache = {}
@@ -594,7 +597,7 @@ class Runner:
             unit, hor, par = self._setting(n)
             for g in c["grid"]:
                 for sd in self.seeds[:2]:
-                    jobs.append((self.ref, self._config(n), dict(par, **fitted), dict(unit, **{c["attribute"]: g}),
+                    jobs.append((self.ref, self._config(n), self._params(par, fitted), dict(unit, **{c["attribute"]: g}),
                                  c.get("arm_package") or {}, hor, sd))
                     idx.append((n, g))
         res = self._map(jobs)
@@ -624,7 +627,15 @@ class Runner:
         name = _config_name(self.pack, self.pack["settings"][cfg["setting"]])
         if name is not None:
             self.exercised.add(name)
-        return [(self.ref, conf, dict(par, **fitted), unit, cfg.get("package") or {}, hor, sd) for sd in self.seeds]
+        return [(self.ref, conf, self._params(par, fitted), unit, cfg.get("package") or {}, hor, sd) for sd in self.seeds]
+
+    def _params(self, par: dict, fitted: dict) -> dict:
+        """An arm's parameters: the base values, then the setting's own parameters, then the fitted values (without
+        base values this is the setting's parameters with the fitted values applied, as before)."""
+        out = dict(self.base_params)
+        out.update(par)
+        out.update(fitted)
+        return out
 
     def prefetch(self, arms, fitted_list):
         """Run every (arm, fitted) pair not yet cached in one parallel batch."""

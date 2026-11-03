@@ -614,27 +614,42 @@ def fig_parameters(R, t):
         pass
     drawn = {x["name"]: x for x in rep.get("parameters_drawn") or [] if isinstance(x, dict) and x.get("name")}
     cal_theta = (R.opt("calibration") or {}).get("theta") or {}
+    sv = eng.get("spec_values") or {}       # values the signed spec sets (toolkit/spec/engine_parameters.py)
     rows = []
     for p in params:
         name = p["name"]
         d = drawn.get(name) or {}
-        if d.get("source_kind") in ("priors", "prior"):          # toolkit/spec/priors.py plan(): "priors"
+        s = sv.get(name) if isinstance(sv.get(name), dict) else None
+        if s is not None:
+            kind = "spec value"
+        elif d.get("source_kind") in ("priors", "prior"):          # toolkit/spec/priors.py plan(): "priors"
             kind = "prior"
         elif name in cal_theta or d.get("source_kind") == "calibration":
             kind = "calibrated"
         else:
             kind = p.get("kind") or "fixed"
-        rng = d.get("range") if d.get("range") else [p.get("lo"), p.get("hi")]
+        rng = d.get("range") if d.get("range") else (s.get("card_range") if s is not None else None) \
+            or [p.get("lo"), p.get("hi")]
         lo, hi = (_num_or_none(rng[0]), _num_or_none(rng[1])) if rng else (None, None)
-        val = _num_or_none(cal_theta.get(name, p.get("value")))
-        rows.append({"name": name, "label": R.labels.parameter(name), "kind": kind, "value": val, "lo": lo, "hi": hi,
-                     "units": p.get("units") or "", "dist": d.get("dist") or "", "drawn": bool(d),
-                     "source": textwrap.shorten(str(d.get("source") or p.get("source") or ""), 90, placeholder="…")})
+        val = _num_or_none(s["value"] if s is not None else cal_theta.get(name, p.get("value")))
+        row = {"name": name, "label": R.labels.parameter(name), "kind": kind, "value": val, "lo": lo, "hi": hi,
+               "units": p.get("units") or "", "dist": d.get("dist") or "", "drawn": bool(d),
+               "source": textwrap.shorten(str((s or {}).get("source") or d.get("source") or p.get("source") or ""), 90,
+                                          placeholder="…")}
+        if s is not None:      # the shown range spans the card's range, the draw range, the spec and card values
+            card = _num_or_none(s.get("card_value"))
+            cr = s.get("card_range") or [None, None]
+            clo, chi = _num_or_none(cr[0]), _num_or_none(cr[1])
+            dlo, dhi = (lo, hi) if d.get("range") else (None, None)
+            ends = [x for x in (clo, chi, dlo, dhi, val, card) if x is not None]
+            row.update(lo=min(ends) if ends else None, hi=max(ends) if ends else None, card_value=card,
+                       card_lo=clo, card_hi=chi, **({"draw_lo": dlo, "draw_hi": dhi} if dlo is not None else {}))
+        rows.append(row)
     ranged = [r for r in rows if r["lo"] is not None and r["hi"] is not None and r["hi"] > r["lo"] and
               r["value"] is not None]
     if not ranged:
         raise Missing("no engine parameter declares a range")
-    kinds = ["fitted", "prior", "calibrated", "fixed", "scenario"]
+    kinds = ["spec value", "fitted", "prior", "calibrated", "fixed", "scenario"]
     present = [k for k in kinds if any(r["kind"] == k for r in ranged)] + \
         sorted({r["kind"] for r in ranged} - set(kinds))
     col = {k: (t["cat"][n] if n < FS.MAX_SCATTER_CATEGORIES else t["ink2"]) for n, k in enumerate(present)}
@@ -644,27 +659,44 @@ def fig_parameters(R, t):
     ax = fig.add_axes([0.42, 0.75 / h, 0.5, _top(fig, 0.6) - 0.75 / h])
     FS.style(ax, t, grid="x")
     edge = 0
-    markers = {"fitted": "o", "prior": "D", "calibrated": "s"}
+    markers = {"fitted": "o", "prior": "D", "calibrated": "s", "spec value": "*"}
     for y, r in enumerate(ranged[::-1]):
         pos = (r["value"] - r["lo"]) / (r["hi"] - r["lo"])
         edge += pos <= 0.02 or pos >= 0.98
         ax.plot([0, 1], [y, y], color=t["neutral"], lw=3, solid_capstyle="round", zorder=1)
-        ax.scatter([pos], [y], s=36, marker=markers.get(r["kind"], "o"), color=col[r["kind"]],
-                   edgecolors=t["surface"], linewidths=1, zorder=3)
+        if r["kind"] == "spec value" and r.get("card_lo") is not None and r.get("card_hi") is not None:
+            ax.plot([(r["card_lo"] - r["lo"]) / (r["hi"] - r["lo"]), (r["card_hi"] - r["lo"]) / (r["hi"] - r["lo"])],
+                    [y, y], color=t["ink2"], lw=1.2, solid_capstyle="butt", zorder=2)        # the card's own range
+        if r["kind"] == "spec value" and r.get("draw_lo") is not None and r.get("draw_hi") is not None:
+            ax.plot([(r["draw_lo"] - r["lo"]) / (r["hi"] - r["lo"]), (r["draw_hi"] - r["lo"]) / (r["hi"] - r["lo"])],
+                    [y, y], color=col[r["kind"]], lw=3, alpha=0.45, solid_capstyle="butt", zorder=2)   # its draw range
+        if r["kind"] == "spec value" and r.get("card_value") is not None:
+            ax.scatter([(r["card_value"] - r["lo"]) / (r["hi"] - r["lo"])], [y], s=34, marker="o", facecolors="none",
+                       edgecolors=col[r["kind"]], linewidths=1.2, zorder=3)                 # the card value replaced
+        ax.scatter([pos], [y], s=60 if r["kind"] == "spec value" else 36, marker=markers.get(r["kind"], "o"),
+                   color=col[r["kind"]], edgecolors=t["surface"], linewidths=1, zorder=4)
     ax.set_yticks(range(len(ranged)))
-    ax.set_yticklabels([f"{r['label']}  {FS.fmt(r['value'])} {r['units']}".rstrip() + f"  ({FS.fmt(r['lo'])}–"
-                        f"{FS.fmt(r['hi'])})" for r in ranged[::-1]], fontsize=7)
+    ax.set_yticklabels([f"{r['label']}  {FS.fmt(r['value'])} {r['units']}".rstrip()
+                        + (f"  spec value (card {FS.fmt(r['card_value'])})" if r["kind"] == "spec value" else "")
+                        + f"  ({FS.fmt(r['lo'])}–{FS.fmt(r['hi'])})" for r in ranged[::-1]], fontsize=7)
     ax.set_xlim(-0.05, 1.05)
     ax.set_xticks([0, 0.5, 1])
     ax.set_xticklabels(["low end", "middle", "high end"], fontsize=7)
     from matplotlib.lines import Line2D
-    fig.legend(handles=[Line2D([0], [0], marker=markers.get(k, "o"), ls="", color=col[k], label=k) for k in present],
-               loc="lower left", bbox_to_anchor=(0.42, 0.0), ncol=len(present), fontsize=7.5)
+    hand = [Line2D([0], [0], marker=markers.get(k, "o"), ls="", color=col[k], label=k) for k in present]
+    if "spec value" in present:
+        hand.append(Line2D([0], [0], marker="o", ls="", markerfacecolor="none", color=col["spec value"],
+                           label="card value"))
+    fig.legend(handles=hand, loc="lower left", bbox_to_anchor=(0.42, 0.0), ncol=len(hand), fontsize=7.5)
     cnt = {k: sum(r["kind"] == k for r in ranged) for k in present}
     title = (f"{len(ranged)} of {len(rows)} parameters have ranges (" + ", ".join(f"{v} {k}" for k, v in cnt.items())
              + f"); {edge} at a range edge")
     cap = (f"Each parameter's value within its range (fitted: engine fit; prior: drawn from the spec's prior; "
-           f"calibrated: the run's calibration). {len(rows) - len(ranged)} parameters without a range are fixed "
+           f"calibrated: the run's calibration"
+           + ("; spec value: set by the signed spec, with the engine card value it replaces as an open circle, the "
+              "card's own range as a thin line and, when it is drawn, its own uncertainty range as a coloured band"
+              if "spec value" in present else "")
+           + f"). {len(rows) - len(ranged)} parameters without a range are fixed "
            f"values (table view lists all with their sources).")
     return fig, title, cap, rows, "parameters: priors, fitted and calibrated values with their ranges"
 
@@ -2710,6 +2742,36 @@ def _self_test() -> int:
         pr = list(csv.DictReader(open(ent_t["parameters"]["table"]))) if "parameters" in ent_t else []
         ok({r["name"]: r["kind"] for r in pr if r.get("name")}.items() >= {"p_eff": "fitted", "p_dur": "prior"}.items(),
            f"TT2c parameters show fitted against prior-drawn values with their ranges: {pr[:3]}")
+        # a spec-declared engine parameter value (toolkit/spec/engine_parameters.py): shown as "spec value", with
+        # the card value it replaces marked, even when the card gives the parameter no range
+        import shutil
+        dsv = os.path.join(base, "run_spec_value")
+        shutil.copytree(d, dsv)
+        edit(dsv, "engine", lambda x: x.update(spec_values={"p_cost": {
+            "value": 2.0, "units": "", "card_value": 1.0, "card_range": None, "outside_card_range": False,
+            "source": "toy source", "reason": "toy reason", "uncertainty": "held fixed at the spec value"}}))
+        rsv = render(dsv, os.path.join(base, "spec_value"), only=["parameters"])
+        esv = {f["figure"]: f for f in rsv["figures"]}.get("parameters") or {}
+        prs = {x["name"]: x for x in csv.DictReader(open(esv["table"]))} if esv else {}
+        ok(prs.get("p_cost", {}).get("kind") == "spec value" and float(prs["p_cost"]["value"]) == 2.0
+           and float(prs["p_cost"]["card_value"]) == 1.0 and "spec value" in esv.get("caption", "")
+           and prs.get("p_eff", {}).get("kind") == "fitted",
+           f"TT2e a spec value is shown as such, with the card value it replaces: {prs.get('p_cost')}")
+        # review round 2 (R2-5): a spec value drawn over its own range keeps that range apart from the card's
+        edit(dsv, "engine", lambda x: x.update(spec_values={"p_dur": {
+            "value": 300.0, "units": "days", "card_value": 600.0, "card_range": [480.0, 860.0],
+            "outside_card_range": True, "source": "toy source", "reason": "toy reason",
+            "uncertainty": "drawn over [250, 350] (uniform)"}}))
+        edit(dsv, None, lambda x: x.update(parameters_drawn=[
+            {"name": "p_dur", "source_kind": "priors", "dist": "uniform", "range": [250.0, 350.0], "source": "toy"}]),
+             rel="uncertainty_report.yaml")
+        rsv = render(dsv, os.path.join(base, "spec_value2"), only=["parameters"])
+        esv = {f["figure"]: f for f in rsv["figures"]}.get("parameters") or {}
+        prs = {x["name"]: x for x in csv.DictReader(open(esv["table"]))} if esv else {}
+        pd_ = prs.get("p_dur", {})
+        ok(pd_.get("kind") == "spec value" and pd_.get("card_lo") == "480.0" and pd_.get("card_hi") == "860.0"
+           and pd_.get("draw_lo") == "250.0" and pd_.get("draw_hi") == "350.0",
+           f"TT2f the card range and the spec value's own uncertainty range are kept apart: {pd_}")
         dsg = ent_t.get("design_coverage") or {}
         ok(dsg and "40 design points" in dsg.get("caption", ""), f"TT2d design coverage counts the design points: {dsg}")
         sim = {"timeline", "trajectories", "burn_in", "seasonality", "stochastic_noise"}
