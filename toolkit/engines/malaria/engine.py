@@ -1536,6 +1536,21 @@ def _self_test_v08(ok, e, unit) -> None:
                                                  f"schedule() ({why})")
     case("S12", s12)
 
+    def s13():
+        # Codex r2 P2: a window outside the series' coverage is refused, not truncated
+        t = [2015.0 + k / 12 for k in range(48)]
+        ent = {"package": "x", "t": t, "t_end": t[1:] + [2019.0], "days": [30] * 48,
+               "values": {"pfpr_u5": [0.1] * 48, "inc_u5": [1.0] * 48}}
+        for a0, b0, nm in ((2018.0, 2020.0, "past the series end"), (2014.0, 2016.0, "before the series start"),
+                           (2014.5, 2020.0, "both sides")):
+            why = refused(lambda: e.series_window(ent, "inc_u5", a0, b0))
+            ok(why is not None and "coverage" in why, f"S13 a window {nm} ([{a0:g}, {b0:g})) is refused, not truncated "
+                                                      f"({why})")
+        ok(abs(e.series_window(ent, "inc_u5", 2018.0, 2019.0) - 1.0) < 1e-12
+           and abs(e.series_window(ent, "pfpr_u5", 2015.0, 2019.0) - 0.1) < 1e-12,
+           "S13b windows covered by whole steps inside the coverage are aggregated")
+    case("S13", s13)
+
 def write_card(path: str) -> None:
     """Engine card (describe() plus every parameter with its kind, range and source) as YAML."""
     e = MalariaEngine()

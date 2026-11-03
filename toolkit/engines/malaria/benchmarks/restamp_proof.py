@@ -418,6 +418,29 @@ def _self_test() -> int:
     ok(sc and all(has.values()) and "scenario" in WORKER and len({c["id"] for c in sc}) == len(sc),
        f"RP10 the proof runs pinned scenarios covering {sorted(k for k, v in has.items() if v)}; missing: "
        f"{sorted(k for k, v in has.items() if not v)}")
+    # Codex r2 P3: the proof records where each side ran; the re-stamp record does not claim a confirmation run
+    try:
+        env = environment()
+        ok(all(str(env.get(k) or "").strip() for k in ("python", "numpy", "starsim", "platform"))
+           and "environment()" in WORKER,
+           f"RP11 each tree's worker records its Python, NumPy, Starsim and platform: {env}")
+        side = lambda tag: {"identity": {"version": tag}, "version": tag, "environment": dict(env), "cases": {"x": 1}}  # noqa: E731
+        ctx = {"coiled_cluster_id": "2317758", "run_id": "proof3", "workspace": "w"}
+        doc = proof_doc("bf24d1b", "c0", "c1", side("0.7"), side("0.8"), [{"kind": "pack", "setting": "s"}], [11], ctx)
+        ok(doc["old"]["environment"] == env and doc["new"]["environment"] == env and doc["execution"] == ctx
+           and doc["identical"], "RP11b the proof names both sides' environments and the cluster and run ids")
+        bare = side("0.8")
+        bare.pop("environment")
+        try:
+            proof_doc("bf24d1b", "c0", "c1", side("0.7"), bare, [], [11], ctx)
+            ok(False, "RP11c a side without its environment fails closed")
+        except ValueError:
+            ok(True, "RP11c a side without its environment fails closed")
+    except Exception as ex:  # noqa: BLE001 -- a missing feature is a failing case
+        ok(False, f"RP11 the proof records its execution environment ({type(ex).__name__}: {ex})")
+    rec = _record({"engine_version": "0.7"}, proof, "abc")
+    ok("confirms" not in rec["note"] and (rec.get("confirmation") or {}).get("validate_once") == "pending",
+       f"RP12 the re-stamp record marks the Coiled confirmation run pending, not done: {rec.get('confirmation')}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
