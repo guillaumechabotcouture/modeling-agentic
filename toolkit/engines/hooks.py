@@ -447,6 +447,15 @@ def _self_test() -> int:
             lambda: schedule(sched([ev(kind="routine", charged=False, t0=1.0)]), {}, u, pa, hd), "routine")
     ok(len(schedule(sched([ev(t0=1.0), ev(kind="routine", charged=False, t0=2.0)]), {}, u, pa, hd)) == 2,
        "H14d a decision at d0 and a routine event at d1 are accepted")
+    # ---- Codex r3 P3: exact half-open comparisons (no tolerance shifting the endpoints)
+    ok(len(schedule(sched([ev(t0=1.9999995)]), {}, u, pa, hd)) == 1,
+       "H15 a decision just before d1 (1.9999995 in [1, 2)) is accepted")
+    refused("H15b a routine event just before d1 is refused (it lies inside [d0, d1))",
+            lambda: schedule(sched([ev(kind="routine", charged=False, t0=1.9999995)]), {}, u, pa, hd), "routine")
+    refused("H15c a decision just before d0 (0.9999995) is refused",
+            lambda: schedule(sched([ev(t0=0.9999995)]), {}, u, pa, hd), "delivery period")
+    ok(len(schedule(sched([ev(kind="history", charged=False, t0=0.9999995)]), {}, u, pa, hd)) == 1,
+       "H15d a history event just before d0 is accepted")
     print("OK: all self-test cases passed." if not fails else f"FAILED: {len(fails)} case(s)")
     return 1 if fails else 0
 

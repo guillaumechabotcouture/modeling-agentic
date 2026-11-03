@@ -2924,6 +2924,38 @@ def _self_test() -> int:
         open(os.path.join(db, "xw.csv"), "a").write("\n")
         ok(presentation_findings(db, scb) and any("xw.csv" in f for f in presentation_findings(db, scb)),
            "F31b a changed crosswalk is found when the figure's provenance is checked")
+        # ---- Codex r3 P2: in-run boundary and crosswalk files are recorded relative to the run (a moved run checks
+        # clean); external files stay absolute
+        d35 = bnd_run("bx35", base_rows)
+        r35 = render(d35, os.path.join(base, "bmap35"), only=["burden_map"])
+        sc35 = json.load(open(os.path.join(base, "bmap35", "burden_map.png.provenance.json"))) if r35["figures"] else {}
+        bpaths = {x.get("kind"): x.get("path") for x in sc35.get("presentation") or []}
+        ok(bpaths.get("boundaries") == "b.geojson" and bpaths.get("crosswalk") == "xw.csv",
+           f"F35 in-run boundary and crosswalk files are recorded relative to the run: {bpaths}")
+        moved35 = d35 + "_moved"
+        os.rename(d35, moved35)
+        try:
+            fm = presentation_findings(moved35, sc35)
+        finally:
+            os.rename(moved35, d35)
+        ok(sc35 and fm == [], f"F35b a moved run's in-run presentation files check clean: {fm}")
+        # ---- Codex r3 P2: the comparison hashes every consumed input; its presentation records resolve per run
+        scc = json.load(open(os.path.join(outc, "comparison.png.provenance.json")))
+        srcs = list((scc.get("source_hashes") or {}))
+        ok(all(any(os.path.join(r, *rel) in x for x in srcs) for r in ("run1", "run4")
+               for rel in (("analysis", "engine.yaml"), ("presentation.yaml",))),
+           f"F36 the comparison's sources include each run's engine artifact and presentation file: {srcs}")
+        ok(all(x.get("run") for x in scc.get("presentation") or []) and presentation_findings(outc, scc) == [],
+           "F36b the comparison's presentation records carry their run and check clean")
+        pres1 = os.path.join(d, "presentation.yaml")
+        keep_p1 = open(pres1).read()
+        open(pres1, "a").write("# edited\n")
+        try:
+            f36 = presentation_findings(outc, scc)
+        finally:
+            open(pres1, "w").write(keep_p1)
+        ok(any("presentation.yaml" in x for x in f36),
+           f"F36c a changed presentation file of a compared run is found, resolved against its run: {f36}")
         # P2-12: a window mean over monthly steps uses the half-open window and weights partial steps
         tg = [k / 12 for k in range(24)]
         vg = [float(k) for k in range(24)]

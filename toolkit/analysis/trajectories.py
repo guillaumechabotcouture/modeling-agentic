@@ -359,11 +359,48 @@ def _self_test() -> int:
         why3 = {x["figure"]: x["reason"] for x in r3["not_produced"]}.get("trajectories", "")
         ok("stale" in why3 and "units.csv" in why3, f"TJ17b a changed units table makes the trajectories stale: {why3}")
         open(os.path.join(d, "units.csv"), "w").write(keep_units)
+        code0 = docj["data"]["engine"]["code_sha256"]
         docj["data"]["engine"]["code_sha256"] = "0" * 64
         yaml.safe_dump(docj, open(os.path.join(d, OUT), "w"), sort_keys=False)
         r4 = FG.render(d, os.path.join(figs, "d"), only=["trajectories"])
         why4 = {x["figure"]: x["reason"] for x in r4["not_produced"]}.get("trajectories", "")
         ok("stale" in why4 and "code" in why4, f"TJ17c another engine code fingerprint makes them stale: {why4}")
+        # ---- Codex r3 P1: without batch rows (the direct path) the identity is still verified, or refused
+        rows_p = os.path.join(d, "analysis", "batch", "results.jsonl")
+        keep_rows = open(rows_p).read()
+        os.remove(rows_p)
+        r5 = FG.render(d, os.path.join(figs, "e"), only=["trajectories"])
+        why5 = {x["figure"]: x["reason"] for x in r5["not_produced"]}.get("trajectories", "")
+        ok("stale" in why5 and "code" in why5,
+           f"TJ19 without batch rows another engine code is still found, from the analysis's identity record: {why5}")
+        pp = os.path.join(d, "analysis", "point.yaml")
+        keep_point = open(pp).read()
+        ptd = yaml.safe_load(keep_point)
+        ptd["data"].pop("engine_identity", None)
+        yaml.safe_dump(ptd, open(pp, "w"), sort_keys=False)
+        docj["data"]["engine"]["code_sha256"] = code0
+        yaml.safe_dump(docj, open(os.path.join(d, OUT), "w"), sort_keys=False)
+        r6 = FG.render(d, os.path.join(figs, "f"), only=["trajectories"])
+        why6 = {x["figure"]: x["reason"] for x in r6["not_produced"]}.get("trajectories", "")
+        ok("cannot be verified" in why6, f"TJ19b with no identity record at all the figure is refused: {why6}")
+        try:
+            run(d, per_region=2, seeds=1, log=q, max_workers=2)
+            ok(False, "TJ19c the step refuses a run whose engine identity cannot be verified")
+        except RuntimeError as e:
+            ok("cannot be verified" in str(e), f"TJ19c the step refuses a run whose engine identity cannot be verified: {e}")
+        open(pp, "w").write(keep_point)
+        open(rows_p, "w").write(keep_rows)
+        # ---- Codex r3 P2: an optional dependency that appears later makes the trajectories stale
+        docj = yaml.safe_load(open(os.path.join(d, OUT)))
+        ok({"analysis_settings.yaml", "engine_choice.json"} <= set(docj["inputs"])
+           and docj["inputs"]["analysis_settings.yaml"] is None,
+           f"TJ20 absent optional dependencies are recorded with a null hash: {sorted(docj['inputs'])}")
+        open(os.path.join(d, "analysis_settings.yaml"), "w").write("analysis: {}\n")
+        r7 = FG.render(d, os.path.join(figs, "g"), only=["trajectories"])
+        why7 = {x["figure"]: x["reason"] for x in r7["not_produced"]}.get("trajectories", "")
+        ok("stale" in why7 and "analysis_settings.yaml" in why7,
+           f"TJ20b a settings file that appears after the step makes them stale: {why7}")
+        os.remove(os.path.join(d, "analysis_settings.yaml"))
         # ---- Codex r1
         doc = yaml.safe_load(open(os.path.join(d, OUT)))
         ok(set(doc["inputs"]) >= {"decision_spec.yaml", "analysis/point.yaml", "analysis/calibration.yaml",

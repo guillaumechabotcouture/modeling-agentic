@@ -361,6 +361,9 @@ def _self_test() -> int:
         pt = R["point"]
         ok(pt["solver"]["status"] == "optimal" and pt["cost_allocated"] <= 9000 * (1 + 1e-9),
            "R4 the plan is a proven optimum within the budget (toolkit/alloc ILP)")
+        from toolkit.engines.contract import engine_identity as _eid
+        ok(pt.get("engine_identity") == _eid(spec.engine()),
+           "R4b the point artifact records the analysis's full engine identity (emulator path; Codex r3 P1)")
         fp = R["uncertainty"]["fixed_plan"]["dalys"]
         ok(fp["ci_low"] <= fp["median"] <= fp["ci_high"] and "not covered" in R["uncertainty"]["label"],
            f"R5 the interval is computed and labelled with what it covers ({R['uncertainty']['label']})")
@@ -521,6 +524,10 @@ def _self_test() -> int:
         th = R["calibration"]["theta"]
         ok(abs(th["lrr:a"] - math.log(0.6)) < 0.05 and abs(th["lrr:a+b"] - math.log(0.5)) < 0.05,
            f"D1 likelihood calibration recovers the planted package effects ({th})")
+        from toolkit.engines.contract import engine_identity as _eid
+        ok((R["point"].get("engine_identity") or {}).get("code_sha256")
+           == _eid(schema.load(os.path.join(d, "decision_spec.yaml")).engine())["code_sha256"],
+           "D1b the point artifact records the analysis's full engine identity (direct path; Codex r3 P1)")
         ident = R["calibration"]["identifiability"]["parameters"]
         ok(all(v["status"] in ("well_identified", "weakly_identified", "unidentified") for v in ident.values())
            and ident["lrr:a"]["status"] == "well_identified", f"D2 identifiability from scripts/identifiability.py: "
