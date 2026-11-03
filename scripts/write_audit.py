@@ -770,6 +770,56 @@ def _self_test_round7(ok) -> None:
        f"are sites; python3 -c is not ({s})")
 
 
+_BYPASS4 = '''
+import os
+from lib.safe_io import publish, remove_path, write_nofollow
+def k(p, run_dir):
+    publish(p, "x", os.path.dirname(p))
+    remove_path(p, os.getcwd())
+    write_nofollow(os.path.realpath(os.path.dirname(p)), "x", b"")
+    publish(p, "x", run_dir)
+    write_nofollow(run_dir, "x", b"")
+'''
+
+
+def _self_test_round8(ok) -> None:
+    """WA24-WA25: the focused check of #134 at 32a30f2: a caller passing its output dir as the trusted root
+    (analysis_backend.cross_check -> _configure), and an audit rule for roots derived from the path or the cwd."""
+    import tempfile
+    for p in (REPO, os.path.join(REPO, "scripts"), os.path.join(REPO, "agents")):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+    from agents import analysis_backend as AB
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+        ref = "toolkit.engines.contract:ToyEngine"
+        sub = ref.replace(":", "_").replace(".", "_")
+        os.makedirs(os.path.join(out, "cross_check", sub))
+        for f in ("results.jsonl", "results_prev.jsonl"):
+            open(os.path.join(out, "cross_check", sub, f), "w").write("external\n")
+        os.symlink(out, os.path.join(d, "analysis"))           # the run's marker removed, analysis/ linked outside
+        units = os.path.join(d, "units.csv")
+        open(units, "w").write("unit,pop\na,1\n")
+        spec = {"decision_units": {"csv": units}, "uncertainty": {"draws": 2}}
+        try:
+            try:
+                AB.cross_check(spec, [ref, ref], os.path.join(d, "analysis", "cross_check"), 8, run_dir=d)
+            except TypeError:
+                AB.cross_check(spec, [ref, ref], os.path.join(d, "analysis", "cross_check"), 8)
+        except Exception:  # noqa: BLE001 -- the outcome is what the outside dir holds, not the exception
+            pass
+        left = sorted(os.listdir(os.path.join(out, "cross_check", sub)))
+        ok(left == ["results.jsonl", "results_prev.jsonl"],
+           f"WA24 the cross-engine check anchors at the run dir, not its own output dir: a linked analysis/ loses no "
+           f"external results and receives no units subset ({left})")
+    s = scan_text(_BYPASS4)
+    lines = _BYPASS4.splitlines()
+    at = (lambda frag: next(i + 1 for i, ln in enumerate(lines) if frag in ln))
+    ok(s.get("safeio-derived-root") == [at("os.path.dirname(p))"), at("os.getcwd()"), at("realpath(os.path")]
+       and not {at('publish(p, "x", run_dir)'), at('write_nofollow(run_dir')} & set(sum(s.values(), [])),
+       f"WA25 the audit flags a safe_io root or base derived from the path (dirname) or the cwd; a passed run dir is "
+       f"not a site ({s})")
+
+
 def _self_test() -> int:
     fails = []
 
@@ -799,6 +849,7 @@ def _self_test() -> int:
     _self_test_v2_open_items(ok)
     _self_test_round6(ok)
     _self_test_round7(ok)
+    _self_test_round8(ok)
     live = problems(sites(), REVIEWED, OPEN_ITEMS)
     n_open = sum(n for pats in OPEN_ITEMS.values() for n, _ in pats.values())
     print(f"NOTE {n_open} attacker-reachable write site(s) remain as counted open items (OPEN_ITEMS)")
