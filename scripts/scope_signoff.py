@@ -809,6 +809,18 @@ def _self_test() -> int:
             os.environ.pop("MA_SIGNOFF_MODE", None)
         else:
             os.environ["MA_SIGNOFF_MODE"] = old_mode
+    # SO23 (run console review round 2, P1-2): the record is not written through a link
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+        json.dump({"pending": True, "round": 1, "items": [{"finding": "f", "fingerprint": "fp1"}]},
+                  open(os.path.join(d, REQUEST), "w"))
+        victim = os.path.join(out, "victim.json")
+        open(victim, "w").write("untouched")
+        os.symlink(victim, os.path.join(d, SIGNOFF))
+        try:
+            sign(d, "owner", {"fp1": "accept"}, note="n")
+        except (ValueError, OSError):
+            pass
+        ok(open(victim).read() == "untouched", "SO23 scope_signoff.json is not written through a link")
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
         return 1

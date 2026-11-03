@@ -2793,6 +2793,8 @@ def _self_test() -> int:
                f"RC16d the summary: headline first with its UI, each value with its source; reused batch points ({sm})")
     with tempfile.TemporaryDirectory() as tr:
         _self_test_review(ok, tr)
+    with tempfile.TemporaryDirectory() as tr2:
+        _self_test_review2(ok, tr2)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -2840,6 +2842,226 @@ def _attr_interpolations(src: str) -> list:
 
 _SAFE_ATTR = re.compile(r"^\s*(?:esc|ref|q)\(")
 _LIT_TERNARY = re.compile(r"""^[^?`$]*\?\s*("[^"]*"|'[^']*')\s*:\s*("[^"]*"|'[^']*')\s*$""")
+
+
+def _self_test_review2(ok, td: str) -> None:
+    """RW1-RW11: Codex review round 2 of PR #129. Each case was written failing first."""
+    from types import SimpleNamespace as NS
+
+    def case(name, fn):
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001 -- a missing function or a crash is a failing case
+            ok(False, f"{name}: {type(e).__name__}: {str(e)[:300]}")
+
+    def spec_run(d):
+        from toolkit.spec import schema
+        _toy_run(d, "SIGN", "awaiting_signoff", None, path=("SPEC", "SIGN"))
+        os.remove(os.path.join(d, "scope_signoff_request.json"))
+        schema.toy_spec(d)
+        open(os.path.join(d, "decision_spec.signoff_sheet.md"), "w").write("# Sheet\n\nThe toy spec, shown.\n")
+        return d
+
+    def need(run, sub):
+        return next((c for c in run["cards"] if c["kind"] == "decision_needed" and c.get("sub") == sub), {})
+
+    # RW1 a spec naming an arbitrary class is never imported by the console (the harness part is SP-RW in schema.py)
+    def rw1():
+        import importlib
+        d = spec_run(os.path.join(td, "rw1", "r"))
+        marker = os.path.join(td, "rw1_marker")
+        raw = yaml.safe_load(open(os.path.join(d, "decision_spec.yaml")))
+        raw["engine"] = {"ref": "subprocess:Popen", "config": {"args": ["touch", marker]}}
+        yaml.safe_dump(raw, open(os.path.join(d, "decision_spec.yaml"), "w"))
+        seen, real = [], importlib.import_module
+        importlib.import_module = lambda name, *a, **k: seen.append(name) or real(name, *a, **k)
+        try:
+            read_run(d)
+        finally:
+            importlib.import_module = real
+        ok(not os.path.exists(marker) and "subprocess" not in seen,
+           f"RW1 loading a run whose spec names subprocess:Popen imports and runs nothing ({seen[:5]})")
+    case("RW1", rw1)
+
+    # RW3 reads open through directory fds with no-follow traversal: a check-then-open race cannot follow a link
+    def rw3():
+        d = _toy_run(os.path.join(td, "rw3", "r"))
+        out = os.path.join(td, "rw3_out")
+        os.makedirs(out)
+        open(os.path.join(out, "results.md"), "w").write("## Recommendation\n\nRACE-SECRET averts 1.\n")
+        open(os.path.join(out, "plan.png"), "w").write("RACE-SECRET")
+        os.remove(os.path.join(d, "results.md"))
+        os.symlink(os.path.join(out, "results.md"), os.path.join(d, "results.md"))
+        os.rename(os.path.join(d, "figures"), os.path.join(d, "figures_real"))
+        os.symlink(out, os.path.join(d, "figures"))
+        real = os.path.realpath
+        os.path.realpath = lambda p, *a, **k: os.path.abspath(p)      # the check saw no link (the race)
+        _CACHE.clear()
+        got = []
+        try:
+            got.append(str(_rread(d, "results.md")[0]))
+            try:
+                got.append(open(safe_path(d, "figures/plan.png")).read())
+            except ValueError:
+                pass
+            got.append(json.dumps(evidence(d, {"kind": "figure", "id": "figures/plan.png", "file": "results.md"})))
+            got.append(str(_sha_rel(d, "results.md")))
+        finally:
+            os.path.realpath = real
+        leak = [g for g in got if "RACE-SECRET" in g or g == _sha(os.path.join(out, "results.md"))]
+        ok(not leak, f"RW3 a read whose path check raced a link swap does not follow the link ({len(leak)} leaked)")
+    case("RW3", rw3)
+
+    # RW4 indirect readers: spec status, derivation outputs and batch fn paths stay inside the run dir
+    def rw4():
+        from toolkit.spec import signoff as SO, schema as SC
+        import compute as C
+        d = spec_run(os.path.join(td, "rw4", "r"))
+        calls = []
+        real_status, real_load, real_fp = SO.status, SC.load, C.code_fingerprint
+        SO.status = lambda *a, **k: calls.append("signoff.status") or real_status(*a, **k)
+        SC.load = lambda *a, **k: calls.append("schema.load") or real_load(*a, **k)
+        C.code_fingerprint = lambda *a, **k: calls.append(("code_fingerprint", a[1])) or "x"
+        try:
+            box = inbox(d)
+            os.makedirs(os.path.join(d, "models", "b"), exist_ok=True)
+            json.dump({"fn": "../../elsewhere/m.py::f", "code_fp": "x", "n": 1},
+                      open(os.path.join(d, "models", "b", "o.jsonl.summary.json"), "w"))
+            json.dump({"fn": "/etc/m.py::f", "code_fp": "x", "n": 1},
+                      open(os.path.join(d, "models", "b", "p.jsonl.summary.json"), "w"))
+            br = batch_reuse(d)
+        finally:
+            SO.status, SC.load, C.code_fingerprint = real_status, real_load, real_fp
+        ok(box["spec"].get("status") == "awaiting" and "signoff.status" not in calls and "schema.load" not in calls,
+           f"RW4a the console's spec status is its own read model: no harness loader runs ({calls})")
+        ok(not any(isinstance(c, tuple) for c in calls) and len(br) == 2 and not any(b["reused"] for b in br),
+           f"RW4b a batch fn path outside the run dir (or the repo) is not passed to code_fingerprint ({calls})")
+    case("RW4", rw4)
+
+    # RW5 the approval is one snapshot: the sheet shown, the spec sha and the derivation record sha, all checked
+    def rw5():
+        d = spec_run(os.path.join(td, "rw5", "r"))
+        con = Console([os.path.join(td, "rw5")], log=lambda *a: None)
+        card = need(con.handle("GET", "/api/run", {"run": [d]}, {})[2], "spec")
+        ok(card.get("body") == "# Sheet\n\nThe toy spec, shown.\n" and card.get("sheet_sha256")
+           and "derivations_sha256" in card and card.get("spec_sha256"),
+           f"RW5a the spec card holds the sheet, its sha, the spec sha and the derivation record sha "
+           f"({sorted(k for k in card if k.endswith('sha256'))})")
+        seen = []
+        body = {k: card.get(k) for k in ("spec_sha256", "sheet_sha256", "derivations_sha256", "ticket")}
+        con.runner = lambda cmd, **k: seen.append(cmd) or NS(returncode=0, stdout="{}", stderr="")
+        r = con.answer(d, "spec", {**body, "note": "n", "confirm": True})
+        cmd = seen[0] if seen else []
+        ok(r.get("ok") and "--expect-sha256" in cmd and "--expect-derivations-sha256" in cmd
+           and "--expect-sheet-sha256" in cmd, f"RW5b the sign command checks every sha of the snapshot ({cmd[-8:]})")
+        con.runner = None
+        os.makedirs(os.path.join(d, "data"), exist_ok=True)
+        json.dump({"derivations": {}}, open(os.path.join(d, "data", "derivations_record.json"), "w"))
+        r = con.answer(d, "spec", {**body, "note": "n", "confirm": True})
+        from toolkit.spec import signoff as SO
+        ok(not r.get("ok") and SO.status(d) != "signed",
+           f"RW5c a derivation record written after the snapshot is not signed over ({r.get('refused') or r.get('out')})")
+    case("RW5", rw5)
+
+    # RW7 an interrupted stream keeps its whole reservation (partial usage is a lower bound)
+    def rw7():
+        os.environ["ANTHROPIC_API_KEY"], prev = "sk-test-x", os.environ.get("ANTHROPIC_API_KEY")
+        try:
+            d = _toy_run(os.path.join(td, "rw7", "a"))
+            part = NS(input_tokens=2000, output_tokens=50, cache_creation_input_tokens=0, cache_read_input_tokens=0)
+
+            class Boom:
+                current_message_snapshot = NS(usage=part, model=MODEL)
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+                def get_final_message(self):
+                    raise RuntimeError("stream broke")
+            calls = []
+            cl = NS(messages=NS(count_tokens=lambda **k: NS(input_tokens=2000)),
+                    beta=NS(messages=NS(stream=lambda **k: calls.append(1) or Boom())))
+            cs = ChatSession(0.40, lambda: cl, log=lambda *a: None)
+            for _ in range(3):
+                cs.send(d, "q")
+            ok(len(calls) == 1 and abs(cs.spent - worst_case_usd(2000)) < 1e-9,
+               f"RW7 an interrupted stream keeps its reservation: one call under a $0.40 cap ({len(calls)} calls, "
+               f"${cs.spent:.3f})")
+        finally:
+            if prev is None:
+                os.environ.pop("ANTHROPIC_API_KEY", None)
+            else:
+                os.environ["ANTHROPIC_API_KEY"] = prev
+    case("RW7", rw7)
+
+    # RW9 feedback evidence is the snapshot the card was rendered with, and evidence() parses the bytes it hashed
+    def rw9():
+        import builtins
+        d = _toy_run(os.path.join(td, "rw9", "a"))
+        cards = read_run(d)["cards"]
+        b = next(c for c in cards if c["kind"] == "blocker" and c["blocker_id"] == "T-001")
+        ev = b.get("evidence") or {}
+        before = _sha(os.path.join(d, "critique_domain.yaml"))
+        yaml.safe_dump({"reviewer": "critique-domain", "round": 2, "blockers": [
+            {"id": "T-001", "severity": "LOW", "claim": "Rewritten later.", "resolved": True}]},
+            open(os.path.join(d, "critique_domain.yaml"), "w"))
+        row = append_feedback(d, {"kind": "correction", "layer": "critique", "text": "no", "anchor": b["anchor"],
+                                  "evidence": ev})
+        got = row.get("evidence") or {}
+        ok(ev.get("sha256") == before and got.get("sha256") == before and "omits one source" in (got.get("excerpt") or "")
+           and got.get("round") == 1, f"RW9a feedback keeps the evidence the card was rendered with ({got})")
+        forged = dict(ev, excerpt="forged", mac="0" * 64)
+        row = append_feedback(d, {"kind": "correction", "layer": "critique", "text": "no", "anchor": b["anchor"],
+                                  "evidence": forged})
+        ok((row.get("evidence") or {}).get("excerpt") != "forged",
+           "RW9b an evidence snapshot the server did not issue is not stored as such")
+        opens, real = [], builtins.open
+        builtins.open = lambda f, *a, **k: (opens.append(f) if str(f).endswith("critique_domain.yaml") else None) \
+            or real(f, *a, **k)
+        _CACHE.clear()
+        try:
+            evidence(d, b["anchor"])
+        finally:
+            builtins.open = real
+        ok(not opens, f"RW9c evidence() reads the file once, through the fd reader, and parses those bytes ({opens})")
+    case("RW9", rw9)
+
+    # RW10 the citation index holds only what the prompt kept
+    def rw10():
+        d = _toy_run(os.path.join(td, "rw10", "a"))
+        yaml.safe_dump({"reviewer": "critique-redteam", "round": 1, "blockers": [
+            {"id": f"Z-{i:03d}", "severity": "HIGH", "claim": "x" * 300, "resolved": False} for i in range(10)]},
+            open(os.path.join(d, "critique_redteam.yaml"), "w"))
+        old = BUDGET["blockers"]
+        BUDGET["blockers"] = 400
+        try:
+            ctx = chat_context(d)
+        finally:
+            BUDGET["blockers"] = old
+        c = check_citations("[[critique_redteam.yaml#Z-009]]", ctx["seen"])
+        ok("Z-009" not in ctx["run"] and c and c[0]["status"] != "checked",
+           f"RW10 a blocker cut from the prompt is not a checked citation ({c})")
+    case("RW10", rw10)
+
+    # RW11 lineage stays inferred while the harness records no parent run
+    def rw11():
+        t = os.path.join(td, "rw11")
+        for i, lab in enumerate(("A", "B")):
+            d = _toy_run(os.path.join(t, lab), "FINAL", None, "completed",
+                         path=("SPEC", "SIGN", "EVIDENCE", "ENGINE_CHOICE", "ANALYZE", "FINAL"))
+            st_ = json.load(open(os.path.join(d, "run_state.json")))
+            st_["question"] = "Toy lineage question two."
+            for h in st_["history"]:
+                h["at"] = h["at"].replace("2026-01-01", f"2026-01-0{i + 1}")
+            json.dump(st_, open(os.path.join(d, "run_state.json"), "w"))
+            open(os.path.join(d, "decision_spec.yaml"), "w").write("objective: {outcome: dalys}\n")
+        pj = projects(discover([t]))
+        rel = [r["relation"] for r in pj[0]["lineage"]][1:] if len(pj) == 1 else []
+        ok(rel and all("(inferred)" in str(x) for x in rel), f"RW11 an equal spec sha is still an inferred relation ({rel})")
+    case("RW11", rw11)
 
 
 def _self_test_review(ok, td: str) -> None:
@@ -3182,7 +3404,9 @@ def _self_test_review(ok, td: str) -> None:
             cs = ChatSession(5.0, lambda: client_with(lambda **kw: Boom(kw, NS(usage=part, model=MODEL)), 2000),
                              log=lambda *a: None)
             cs.send(d, "q")
-            ok(abs(cs.spent - price(part)) < 1e-9, f"RV9b a failed stream's partial usage is charged ({cs.spent})")
+            ok(abs(cs.spent - worst_case_usd(2000)) < 1e-9,
+               f"RV9b a failed stream with partial usage keeps its whole reservation (round 2: partial usage is a "
+               f"lower bound) ({cs.spent})")
             made = []
             cs = ChatSession(2.0, lambda: client_with(lambda **kw: made.append(1), 1_000_000), log=lambda *a: None)
             r = cs.send(d, "q")

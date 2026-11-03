@@ -263,6 +263,94 @@ def _self_test() -> int:
                "SG12 the sign-off records the hash of the bytes it checked")
         except (ValueError, TypeError) as e:
             ok(False, f"SG12 the sign-off records the hash of the bytes it checked ({e})")
+    # SG13-SG17 (run console review round 2)
+    import builtins
+    for target in ("signed_dir", "record"):
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+            schema.toy_spec(d)
+            victim = os.path.join(out, "victim")
+            open(victim, "w").write("untouched")
+            if target == "signed_dir":
+                os.symlink(out, os.path.join(d, DB.SIGNED_DIR))
+            else:
+                os.symlink(victim, os.path.join(d, SPEC_SIGNOFF))
+            try:
+                sign(d, "owner", note="n")
+            except (ValueError, OSError):
+                pass
+            ok(open(victim).read() == "untouched" and sorted(os.listdir(out)) == ["victim"],
+               f"SG13 the sign-off is not written through a linked {target} ({sorted(os.listdir(out))})")
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+        schema.toy_spec(d)
+        os.makedirs(os.path.join(d, "data"))
+        private = os.path.join(out, "private.csv")
+        open(private, "w").write("secret\n")
+        rel = os.path.relpath(private, d)
+        json.dump({"derivations": {"u": {"outputs": {rel: "ab"}}}}, open(os.path.join(d, DERIVATIONS_RECORD), "w"))
+        hashed, real_sha = [], DB._sha
+        DB._sha = lambda p: hashed.append(os.path.realpath(p)) or real_sha(p)
+        try:
+            bad = derived_changed(d, {"sha256": {DERIVATIONS_RECORD: real_sha(os.path.join(d, DERIVATIONS_RECORD))}})
+        finally:
+            DB._sha = real_sha
+        ok(rel in bad and os.path.realpath(private) not in hashed,
+           f"SG14 a derivation output outside the run dir is reported changed and never hashed ({bad})")
+    with tempfile.TemporaryDirectory() as d:
+        p = schema.toy_spec(d)
+        opens, real_open, real_osopen = [], builtins.open, os.open
+
+        def bopen(f, *a, **k):
+            if str(f).endswith(SPEC):
+                opens.append(str(f))
+            return real_open(f, *a, **k)
+
+        def oopen(f, *a, **k):
+            if str(f).endswith(SPEC):
+                opens.append(str(f))
+            return real_osopen(f, *a, **k)
+        builtins.open, os.open = bopen, oopen
+        try:
+            sign(d, "owner", note="n", expect_sha256=DB._sha(p))
+        except Exception as e:  # noqa: BLE001
+            opens.append(f"error {e}")
+        finally:
+            builtins.open, os.open = real_open, real_osopen
+        ok(len(opens) == 1, f"SG15 the spec is read once: validated, hashed and copied from the same bytes ({opens})")
+    with tempfile.TemporaryDirectory() as d:
+        p = schema.toy_spec(d)
+        open(os.path.join(d, SHEET), "w").write("sheet\n")
+        sh = DB._sha(p)
+        res = []
+        for kw in ({"expect_derivations_sha256": "0" * 64}, {"expect_sheet_sha256": "0" * 64}):
+            try:
+                sign(d, "owner", note="n", expect_sha256=sh, **kw)
+                res.append(False)
+            except (ValueError, TypeError) as e:
+                res.append(isinstance(e, ValueError))
+        ok(all(res) and status(d) == "awaiting",
+           f"SG16 the sign-off checks the derivation record's and the sheet's sha256 too ({res})")
+        try:
+            sign(d, "owner", note="n", expect_sha256=sh, expect_derivations_sha256="none",
+                 expect_sheet_sha256=DB._sha(os.path.join(d, SHEET)))
+            ok(status(d) == "signed", "SG17 with every sha matching the spec is signed")
+        except (ValueError, TypeError) as e:
+            ok(False, f"SG17 with every sha matching the spec is signed ({e})")
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+        schema.toy_spec(d)
+        yaml.safe_dump(DB.example_brief(), open(os.path.join(d, DB.BRIEF), "w"))
+        yaml.safe_dump({"hard_blockers": [{"id": "HB-001", "text": "t"}]}, open(os.path.join(d, DB.CRITERIA), "w"))
+        os.symlink(out, os.path.join(d, DB.SIGNED_DIR))
+        opens, real_open = [], builtins.open
+        builtins.open = lambda f, *a, **k: (opens.append(f) if str(f).endswith(SPEC) else None) or real_open(f, *a, **k)
+        try:
+            DB.sign(d, "owner", note="n")
+        except (ValueError, OSError):
+            pass
+        finally:
+            builtins.open = real_open
+        ok(os.listdir(out) == [] and len(opens) <= 1,
+           f"SG18 decision_brief.sign hashes and copies the same bytes, never through a linked signed dir "
+           f"({os.listdir(out)}, {len(opens)} opens)")
     # DI6, DI7, DI10 (docs/design/v2-derived-inputs.md): the sign-off freezes the derivation record, and the sheet
     # shows the owner the accepted defaults and the columns the run chose not to use.
     try:

@@ -1597,6 +1597,24 @@ def _self_test_sign(ok) -> None:
                f"RS5 a v2 spec sign without the displayed spec's sha256 is refused ({r})")
         except Exception as e:  # noqa: BLE001
             ok(False, f"RS3-RS5 worker sign: {type(e).__name__}: {e}")
+        # RS6-RS8 (round 2, P1-6): the action is explicit; an expected spec sha always means sha-bound spec signing
+        try:
+            os.remove(os.path.join(td, "F1", "runs", "2026_b", "run_state.json"))
+            seen.clear()
+            r = ws.sign_side("F1", "", "n", run_name="2026_b", expect_spec_sha256="ab12", _runner=fake)
+            cmd = seen[-1] if seen else []
+            ok(r["rc"] == 0 and "agents/stage_machine.py" in cmd and "ab12" in cmd
+               and not any("decision_brief.py" in c for c in seen),
+               f"RS6 with an expected spec sha and no run_state.json the spec is still signed sha-bound ({cmd})")
+            seen.clear()
+            r = ws.sign_side("F1", "", "n", run_name="2026_b", action="spec", _runner=fake)
+            ok(r["rc"] != 0 and not any("sign" in c for c in seen), f"RS7 action spec without a sha fails closed ({r})")
+            a = parse_sign_args(["a.yaml", "--action", "spec", "--expect-derivations-sha256", "none",
+                                 "--expect-sheet-sha256", "cd", "n"], ["F1"])
+            ok(a.get("action") == "spec" and a.get("expect_derivations") == "none" and a.get("expect_sheet") == "cd",
+               f"RS8 sign parses --action and the snapshot's other shas ({a})")
+        except Exception as e:  # noqa: BLE001
+            ok(False, f"RS6-RS8 worker sign action: {type(e).__name__}: {e}")
         finally:
             ws.WORK = old_work
 

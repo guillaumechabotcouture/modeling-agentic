@@ -2096,6 +2096,26 @@ def _self_test() -> int:
                             hashlib.sha256(open(os.path.join(d70, AB.SPEC_FILE), "rb").read()).hexdigest()])
             except SystemExit as e:
                 rc2 = e.code
+        d71 = os.path.join(td, "t71")
+        os.makedirs(d71)
+        _S.toy_spec(d71)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                rc71 = main(["sign", d71, "--by", "owner", "--note", "n", "--expect-sha256",
+                             hashlib.sha256(open(os.path.join(d71, AB.SPEC_FILE), "rb").read()).hexdigest(),
+                             "--expect-derivations-sha256", "0" * 64])
+            except SystemExit as e:
+                rc71 = e.code
+            st71 = _SO.status(d71)
+            try:
+                rc71b = main(["sign", d71, "--by", "owner", "--note", "n", "--expect-sha256",
+                              hashlib.sha256(open(os.path.join(d71, AB.SPEC_FILE), "rb").read()).hexdigest(),
+                              "--expect-derivations-sha256", "none"])
+            except SystemExit as e:
+                rc71b = e.code
+        ok(rc71 not in (0, None) and st71 == "awaiting" and rc71b == 0 and _SO.status(d71) == "signed",
+           f"T71 sign --expect-derivations-sha256 refuses a derivation record other than the one shown and signs "
+           f"with the one shown (rc {rc71}, {st71}; rc {rc71b})")
         ok(rc not in (0, None) and st70 == "awaiting" and rc2 == 0 and _SO.status(d70) == "signed",
            f"T70 stage_machine.py sign --expect-sha256 refuses another spec's sha and signs the shown one "
            f"(rc {rc}, {st70}; rc {rc2}, {_SO.status(d70)})")

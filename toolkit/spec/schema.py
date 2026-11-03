@@ -1261,6 +1261,7 @@ def _self_test() -> int:
         _self_test_derived(ok)
     except Exception as e:  # noqa: BLE001 -- before the checks exist (step α) this is the failure
         ok(False, f"DI spec checks: {type(e).__name__}: {e}")
+    _self_test_engine_refs(ok)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -1309,6 +1310,57 @@ def derived_toy_spec(d: str, n: int = 12, **kw) -> str:
     if not rep["ok"]:
         raise RuntimeError(f"derived_toy_spec: the fixture's derivation failed: {rep['problems']}")
     return p
+
+
+def _self_test_engine_refs(ok) -> None:
+    """SP-RW1..4 (run console review round 2, P1-1): a spec names its engine by "module:Class"; the spec is drafted by
+    an agent, so a reference outside the registered engines is refused before any import or instantiation."""
+    import tempfile
+    seen, real = [], importlib.import_module
+
+    def spy(name, *a, **k):
+        seen.append(name)
+        return real(name, *a, **k)
+    with tempfile.TemporaryDirectory() as d:
+        marker = os.path.join(d, "ran")
+        importlib.import_module = spy
+        try:
+            refused = []
+            for ref, cfg in (("subprocess:Popen", {"args": ["touch", marker]}), ("os:system", {}),
+                             ("json.decoder:JSONDecoder", {}), ("toolkit.alloc.costs:Nope", {})):
+                try:
+                    load_engine({"ref": ref, "config": cfg})
+                    refused.append(False)
+                except (SpecError, ValueError):
+                    refused.append(True)
+                except Exception:  # noqa: BLE001 -- imported and failed later: not refused up front
+                    refused.append(False)
+        finally:
+            importlib.import_module = real
+        bad = [m for m in seen if m.split(".")[0] in ("subprocess", "os", "json") or m.startswith("toolkit.alloc")]
+        ok(all(refused) and not bad and not os.path.exists(marker),
+           f"SP-RW1 subprocess:Popen, os:system and modules outside toolkit.engines are refused without an import "
+           f"({refused}; imported {bad})")
+        p = toy_spec(d)
+        raw = yaml.safe_load(open(p))
+        raw["engine"] = {"ref": "subprocess:Popen", "config": {"args": ["touch", marker]}}
+        yaml.safe_dump(raw, open(p, "w"))
+        probs = validate(load(p))
+        ok(probs and not os.path.exists(marker) and any("engine" in x for x in probs),
+           f"SP-RW2 validating a spec with such an engine reports it and runs nothing ({probs[:1]})")
+        raw["engine"] = {"auto": True, "candidates": ["os:system", "toolkit.engines.contract:ToyEngine"]}
+        yaml.safe_dump(raw, open(p, "w"))
+        try:
+            load(p)
+            ok(False, "SP-RW3 an unregistered engine among the signed candidates is refused")
+        except SpecError as e:
+            ok("os:system" in str(e), f"SP-RW3 an unregistered engine among the signed candidates is refused ({e})")
+    try:
+        k = engine_class("toolkit.engines.contract:ToyEngine")
+        ok(k.__name__ == "ToyEngine" and load_engine("toolkit.engines.contract:ToyEngine") is not None,
+           "SP-RW4 a registered engine still loads")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"SP-RW4 a registered engine still loads: {type(e).__name__}: {e}")
 
 
 def _self_test_derived(ok) -> None:
