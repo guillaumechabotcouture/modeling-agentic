@@ -775,49 +775,43 @@ def _validate(s: Spec) -> list[str]:
     bad += PRI.problems(s)
     bad += _validate_analysis(s, card, pnames, cols, pk)
     bad += _validate_deliverable(s)
-    bad += presentation_problems(r, pnames, card)
+    if "presentation" in r:
+        bad.append("presentation: display labels are not part of the signed spec; put them in presentation.yaml "
+                   "beside the spec (unsigned, read only by the figures) or pass --labels to the figure renderer")
     return bad
-
-
-def labels_problems(raw: dict, labels: dict, pnames=None, card=None) -> list[str]:
-    """Problems with a labels mapping (from the unsigned presentation file) against this spec."""
-    raise NotImplementedError("figures labels β")
 
 
 PRESENTATION_LABELS = ("components", "parameters", "outcomes", "metrics")
 PRESENTATION_TITLES = ("regions_title", "units_title")
 
 
-def presentation_problems(raw: dict, pnames=None, card=None) -> list[str]:
-    """The optional presentation block (display names read only by the figures, docs/design/v2-figures.md §3):
-    strings only, and every id must be a component, engine parameter, reported outcome or engine window metric."""
-    pres = raw.get("presentation")
-    if pres is None:
-        return []
-    if not isinstance(pres, dict) or set(pres) - {"labels"}:
-        return ["presentation: a mapping with one key, labels"]
-    lab = pres.get("labels") or {}
-    if not isinstance(lab, dict):
-        return ["presentation.labels: a mapping"]
-    bad = [f"presentation.labels.{k}: unknown key (known: {', '.join(PRESENTATION_LABELS + PRESENTATION_TITLES)})"
-           for k in lab if k not in PRESENTATION_LABELS + PRESENTATION_TITLES]
+def labels_problems(raw: dict, labels: dict, pnames=None, card=None) -> list[str]:
+    """Problems with a labels mapping from the unsigned presentation file (docs/design/v2-figures.md §3): strings
+    only, and every id must be a component, engine parameter, reported outcome or engine metric of this spec."""
+    if not isinstance(labels, dict):
+        return ["labels: a mapping"]
+    bad = [f"labels.{k}: unknown key (known: {', '.join(PRESENTATION_LABELS + PRESENTATION_TITLES)})"
+           for k in labels if k not in PRESENTATION_LABELS + PRESENTATION_TITLES]
+    outs = (getattr(card, "outputs", None) if card is not None and not isinstance(card, dict)
+            else (card or {}).get("outputs")) or {}
     known = {"components": set((raw.get("options") or {}).get("components") or {}),
              "parameters": set(pnames or ()),
              "outcomes": {(raw.get("objective") or {}).get("outcome")} | set(raw.get("outcomes_reported") or []),
-             "metrics": set((card.outputs.get("windows", []) if card is not None else ()))}
+             "metrics": set(outs.get("windows", []) or []) | set((outs.get("series") or {}))}
     for k in PRESENTATION_LABELS:
-        m = lab.get(k)
+        m = labels.get(k)
         if m is None:
             continue
         if not isinstance(m, dict) or not all(isinstance(v, str) and v.strip() for v in m.values()):
-            bad.append(f"presentation.labels.{k}: a mapping of id to a non-empty display name")
+            bad.append(f"labels.{k}: a mapping of id to a non-empty display name")
             continue
-        unknown = [i for i in m if i not in known[k]] if (k != "parameters" or pnames) else []
+        check = (k != "parameters" or pnames) and (k != "metrics" or known["metrics"])
+        unknown = [i for i in m if i not in known[k]] if check else []
         if unknown:
-            bad.append(f"presentation.labels.{k}: {unknown} are not {k} of this spec")
+            bad.append(f"labels.{k}: {unknown} are not {k} of this spec")
     for k in PRESENTATION_TITLES:
-        if k in lab and not (isinstance(lab[k], str) and lab[k].strip()):
-            bad.append(f"presentation.labels.{k}: a non-empty string")
+        if k in labels and not (isinstance(labels[k], str) and labels[k].strip()):
+            bad.append(f"labels.{k}: a non-empty string")
     return bad
 
 

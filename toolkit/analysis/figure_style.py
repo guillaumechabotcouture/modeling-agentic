@@ -132,12 +132,12 @@ def offset_free(ax) -> bool:
 
 # --------------------------------------------------------------------------- labels
 class Labels:
-    """Display names. Order: overlay (render --labels), the spec's presentation.labels, then a fallback: the id made
-    readable, with a definition line for the legend (from the spec's engine_map and the engine card)."""
+    """Display names from the unsigned presentation file's labels (`overlay`; never from the signed spec), else a
+    fallback: the id made readable, with a definition line for the legend (from the spec's engine_map)."""
 
     def __init__(self, spec_raw: dict, card: dict | None = None, params: list | None = None,
                  overlay: dict | None = None):
-        pres = ((spec_raw or {}).get("presentation") or {}).get("labels") or {}
+        pres = {}
         ov = overlay or {}
         self.given = {k: dict(pres.get(k) or {}, **(ov.get(k) or {})) for k in ("components", "parameters",
                                                                                "outcomes", "metrics")}
@@ -228,11 +228,13 @@ def _self_test() -> int:
        f"S2 the formatter removes offset notation (matplotlib default had an offset: {plain_offset})")
     plt.close(fig)
     spec = {"decision_units": {"region": "zone"}, "options": {"engine_map": {"c_x": {"eng": "v1"}}},
-            "presentation": {"labels": {"components": {"c_y": "Component Y"}, "parameters": {"p1": "Param one"}}}}
-    L = Labels(spec, params=[{"name": "p1", "units": "days"}], overlay={"components": {"c_z": "Zed"}})
-    ok(L.component("c_y") == "Component Y" and L.component("c_z") == "Zed" and L.parameter("p1") == "Param one",
-       "S3 labels come from the spec's presentation block and the overlay")
-    ok(L.component("c_x") == "C x" and L.legend_lines() == ["c_x: engine eng = v1"],
+            "presentation": {"labels": {"components": {"c_q": "From the spec"}}}}
+    L = Labels(spec, params=[{"name": "p1", "units": "days"}],
+               overlay={"components": {"c_y": "Component Y", "c_z": "Zed"}, "parameters": {"p1": "Param one"}})
+    ok(L.component("c_y") == "Component Y" and L.component("c_z") == "Zed" and L.parameter("p1") == "Param one"
+       and L.component("c_q") == "C q",
+       "S3 labels come from the presentation file only, never from the signed spec")
+    ok(L.component("c_x") == "C x" and "c_x: engine eng = v1" in L.legend_lines(),
        f"S4 a component with no label gets a readable fallback and a definition line: {L.legend_lines()}")
     ok(L.package(["c_y", "c_z"]) == "Component Y + Zed" and L.package([]) == "No package",
        "S5 packages read as their components' names")

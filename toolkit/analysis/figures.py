@@ -100,7 +100,10 @@ class RunData:
         self.spec = yaml.safe_load(open(sp, encoding="utf-8"))
         self.override = {"figure_data": figure_data, "trajectories": trajectories}
         eng = self.opt("engine") or {}
-        self.labels = FS.Labels(self.spec, card=eng.get("card"), params=eng.get("parameters"), overlay=labels_overlay)
+        self.pres = load_presentation(self.dir, labels_overlay, self.spec, eng)
+        self.labels = FS.Labels(self.spec, card=eng.get("card"), params=eng.get("parameters"),
+                                overlay=self.pres["labels"])
+        self._geo = None
         du = self.spec["decision_units"]
         self.uid, self.region_col = du["id"], du.get("region")
         with open(os.path.join(self.dir, du["csv"]), newline="", encoding="utf-8") as f:
@@ -129,6 +132,15 @@ class RunData:
         if rel not in self.used:
             self.used.append(rel)
         return doc["data"]
+
+    @property
+    def geo(self):
+        """Unit polygons from the presentation file's boundaries (None without one); loaded once, fail closed."""
+        if self.pres.get("boundaries") is None:
+            return None
+        if self._geo is None:
+            self._geo = load_boundaries(self.pres["boundaries"], self.ids, self.region)
+        return self._geo
 
     def use(self, rel: str):
         """Record a source file this figure read (besides the analysis artifacts)."""
@@ -207,8 +219,34 @@ def _legend_handles(t, items):
 
 
 def _unit_layout(R, ax, t, colors: dict, layout: str, order: list[str], size=None, edge=None, labels=True):
-    """Draw one dot per unit: at its coordinates (layout 'map') or in a by-region strip (rows = regions)."""
+    """Draw every unit: as its polygon (layout 'boundaries', context features in grey, region outlines heavier), as a
+    dot at its coordinates ('map'), or in a by-region strip (rows = regions)."""
     ax.set_facecolor(t["surface"])
+    if layout == "boundaries":
+        import numpy as np
+        from matplotlib.collections import LineCollection, PolyCollection
+        B = R.geo
+        if B["context"]:
+            ax.add_collection(PolyCollection(B["context"], facecolors=t["band"], edgecolors=t["surface"],
+                                             linewidths=0.3, zorder=1))
+        polys, cols = [], []
+        for i in order:
+            for ring in B["units"].get(i, []):
+                polys.append(ring)
+                cols.append(colors[i])
+        ax.add_collection(PolyCollection(polys, facecolors=cols, edgecolors=t["surface"], linewidths=0.25, zorder=2))
+        if B["outline"]:
+            ax.add_collection(LineCollection(B["outline"], colors=t["ink2"], linewidths=0.7, zorder=3))
+        allp = np.vstack(polys + B["context"]) if (polys or B["context"]) else np.zeros((1, 2))
+        ax.set_xlim(allp[:, 0].min(), allp[:, 0].max())
+        ax.set_ylim(allp[:, 1].min(), allp[:, 1].max())
+        lat = float(np.mean(allp[:, 1]))
+        ax.set_aspect(1 / max(math.cos(math.radians(lat)), 0.2) if -90 <= lat <= 90 else 1.0)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for s in ax.spines.values():
+            s.set_visible(False)
+        return
     if layout == "map":
         xy = R.coords()
         ids = order
@@ -239,6 +277,8 @@ def _unit_layout(R, ax, t, colors: dict, layout: str, order: list[str], size=Non
 
 
 def _layout(R):
+    if R.geo:
+        return "boundaries", "units on their boundaries"
     return ("map", "units at their coordinates") if R.coords() else \
         ("strip", f"one row per {R.labels.region_title().lower()}, one dot per unit")
 
@@ -400,7 +440,7 @@ def fig_data_coverage(R, t):
     for k, x in enumerate([r for r in rows if "attribute" in r]):
         yy = 1 - (k + 0.5) / max(na, 1)
         a2.text(0.0, yy, x["attribute"], fontsize=7.5, color=t["ink"], va="center", transform=a2.transAxes)
-        a2.text(0.22, yy, "← " + textwrap.shorten(str(x["shown"]), 60, placeholder="…"), fontsize=7.5,
+        a2.text(0.22, yy, "from " + textwrap.shorten(str(x["shown"]), 60, placeholder="…"), fontsize=7.5,
                 color=t["ink2"], va="center", transform=a2.transAxes)
         miss = f"{x['missing_cells']} of {x['cells']} cells missing" if x["cells"] else textwrap.shorten(
             str(x["source"]), 40, placeholder="…")
@@ -420,7 +460,7 @@ def fig_data_coverage(R, t):
                            fontsize=7)
         FS.set_axis_format(a3, "x", "count")
         a3.legend(loc="lower right", fontsize=7)
-        a3.set_title(f"staged inputs → derivation → units table: columns per input", fontsize=8.5, loc="left",
+        a3.set_title("staged inputs, through the derivation, to the units table: columns per input", fontsize=8.5, loc="left",
                      color=t["ink"])
     cs = R.spec.get("calibration") or {}
     meas = []
@@ -890,6 +930,162 @@ def contact_sheets(res: dict, dest: str, run_dir: str, harness: bool) -> dict:
     return out
 
 
+def load_presentation(run_dir: str, extra=None, spec: dict | None = None, engine_art: dict | None = None) -> dict:
+    """The unsigned presentation files (owner, 2026-11-02): presentation.yaml (or labels.yaml) in the run dir, then
+    `extra` (a path given with --labels, or a labels mapping), each overriding the one before id by id. A file holds
+    `labels:` (display names) and/or `boundaries:` ({path, feature_id, crosswalk: {path, unit_id, feature_id},
+    credit}). Malformed files and ids the spec does not have fail closed (ValueError naming the file). Returns
+    {labels, boundaries, files: [{path, sha256}]}; labels never change a number, so the files are not in the spec."""
+    import yaml
+    from toolkit.analysis.artifacts import sha256
+    from toolkit.spec import schema
+    keys = set(schema.PRESENTATION_LABELS + schema.PRESENTATION_TITLES)
+    eng = engine_art or {}
+    pnames = [p.get("name") for p in eng.get("parameters") or [] if isinstance(p, dict)]
+    found = [n for n in ("presentation.yaml", "labels.yaml") if os.path.exists(os.path.join(run_dir, n))]
+    if len(found) > 1:
+        raise ValueError(f"{run_dir}: both presentation.yaml and labels.yaml; keep one presentation file")
+    srcs = [(os.path.join(run_dir, n), n) for n in found]
+    if isinstance(extra, str):
+        srcs.append((os.path.abspath(os.path.expanduser(extra)), os.path.abspath(os.path.expanduser(extra))))
+    labels, bnd, files = {}, None, []
+    for path, shown in srcs:
+        try:
+            doc = yaml.safe_load(open(path, encoding="utf-8"))
+        except (OSError, yaml.YAMLError) as e:
+            raise ValueError(f"{shown}: unreadable presentation file: {e}") from e
+        doc = {} if doc is None else doc
+        if not isinstance(doc, dict):
+            raise ValueError(f"{shown}: a mapping with labels and/or boundaries")
+        if doc and set(doc) <= keys:                      # a bare labels mapping
+            doc = {"labels": doc}
+        unknown = sorted(set(doc) - {"labels", "boundaries"})
+        if unknown:
+            raise ValueError(f"{shown}: unknown keys {unknown} (known: labels, boundaries)")
+        lab = doc.get("labels") if doc.get("labels") is not None else {}
+        probs = schema.labels_problems(spec or {}, lab, pnames, eng.get("card"))
+        if probs:
+            raise ValueError(f"{shown}: {'; '.join(probs)}")
+        for k, v in lab.items():
+            if isinstance(v, dict):
+                labels.setdefault(k, {}).update(v)
+            else:
+                labels[k] = v
+        if doc.get("boundaries") is not None:
+            bnd = _boundaries_config(doc["boundaries"], os.path.dirname(path), shown)
+        files.append({"path": shown, "sha256": sha256(path)})
+    if isinstance(extra, dict):
+        for k, v in extra.items():
+            if isinstance(v, dict):
+                labels.setdefault(k, {}).update(v)
+            else:
+                labels[k] = v
+    return {"labels": labels, "boundaries": bnd, "files": files}
+
+
+def _boundaries_config(b, base: str, shown: str) -> dict:
+    def where(p):
+        p = os.path.expanduser(str(p))
+        return p if os.path.isabs(p) else os.path.join(base, p)
+    if not isinstance(b, dict) or not isinstance(b.get("path"), str) or not isinstance(b.get("feature_id"), str):
+        raise ValueError(f"{shown}: boundaries needs path and feature_id (strings)")
+    unknown = sorted(set(b) - {"path", "feature_id", "crosswalk", "credit"})
+    if unknown:
+        raise ValueError(f"{shown}: boundaries: unknown keys {unknown}")
+    out = {"path": where(b["path"]), "shown": b["path"], "feature_id": b["feature_id"], "credit": b.get("credit")}
+    xw = b.get("crosswalk")
+    if xw is not None:
+        if not isinstance(xw, dict) or not all(isinstance(xw.get(k), str) for k in ("path", "unit_id", "feature_id")):
+            raise ValueError(f"{shown}: boundaries.crosswalk needs path, unit_id and feature_id (strings)")
+        out["crosswalk"] = {"path": where(xw["path"]), "shown": xw["path"], "unit_id": xw["unit_id"],
+                            "feature_id": xw["feature_id"]}
+    if out.get("credit") is not None and not isinstance(out["credit"], str):
+        raise ValueError(f"{shown}: boundaries.credit must be a string")
+    return out
+
+
+def load_boundaries(cfg: dict, unit_ids: list[str], region_of) -> dict:
+    """Polygons per unit from a GeoJSON FeatureCollection (Polygon and MultiPolygon exterior rings; json and numpy
+    only), matched to the units through the crosswalk or directly by the feature property. Fail closed on a malformed
+    file. Returns {units: {id: [ring]}, context: [ring], unmatched: [ids], outline: [segment], features}."""
+    import numpy as np
+    shown = cfg["shown"]
+    try:
+        doc = json.load(open(cfg["path"], encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise ValueError(f"{shown}: unreadable boundary file: {e}") from e
+    feats = doc.get("features") if isinstance(doc, dict) else None
+    if not isinstance(feats, list) or not feats:
+        raise ValueError(f"{shown}: not a GeoJSON FeatureCollection with features")
+    by_fid = {}
+    for k, f in enumerate(feats):
+        g = f.get("geometry") if isinstance(f, dict) else None
+        props = f.get("properties") if isinstance(f, dict) else None
+        if not isinstance(g, dict) or not isinstance(props, dict):
+            raise ValueError(f"{shown}: feature {k} lacks geometry or properties")
+        if props.get(cfg["feature_id"]) is None:
+            raise ValueError(f"{shown}: feature {k} has no property {cfg['feature_id']}")
+        typ, co = g.get("type"), g.get("coordinates")
+        polys = [co] if typ == "Polygon" else co if typ == "MultiPolygon" else None
+        if not isinstance(polys, list):
+            raise ValueError(f"{shown}: feature {k} geometry {typ!r} is not a Polygon or MultiPolygon")
+        rings = []
+        for poly in polys:
+            try:
+                ring = np.asarray(poly[0], float)[:, :2]
+            except (TypeError, ValueError, IndexError) as e:
+                raise ValueError(f"{shown}: feature {k} has malformed coordinates") from e
+            if ring.ndim != 2 or len(ring) < 3 or not np.isfinite(ring).all():
+                raise ValueError(f"{shown}: feature {k} has malformed coordinates")
+            rings.append(ring)
+        by_fid.setdefault(str(props[cfg["feature_id"]]), []).extend(rings)
+    xw = None
+    if cfg.get("crosswalk"):
+        c = cfg["crosswalk"]
+        try:
+            with open(c["path"], newline="", encoding="utf-8") as fh:
+                rows = list(csv.DictReader(fh))
+        except OSError as e:
+            raise ValueError(f"{c['shown']}: unreadable crosswalk: {e}") from e
+        if not rows or c["unit_id"] not in rows[0] or c["feature_id"] not in rows[0]:
+            raise ValueError(f"{c['shown']}: the crosswalk needs columns {c['unit_id']} and {c['feature_id']}")
+        xw = {str(r[c["unit_id"]]): str(r[c["feature_id"]]) for r in rows if r.get(c["feature_id"])}
+    units, unmatched, used = {}, [], set()
+    for i in unit_ids:
+        fid = xw.get(i) if xw is not None else i
+        if fid is not None and fid in by_fid:
+            units[i] = by_fid[fid]
+            used.add(fid)
+        else:
+            unmatched.append(i)
+    context = [r for fid, rs in by_fid.items() if fid not in used for r in rs]
+    # region outlines: polygon edges not shared with another unit of the same region
+    seg_n = {}
+    for i, rings in units.items():
+        r = region_of(i)
+        for ring in rings:
+            q = np.round(ring, 5)
+            for a, b in zip(q[:-1], q[1:]):
+                key = (r, tuple(sorted([tuple(a), tuple(b)])))
+                seg_n[key] = seg_n.get(key, 0) + 1
+    outline = [list(k[1]) for k, n in seg_n.items() if n == 1]
+    return {"units": units, "context": context, "unmatched": unmatched, "outline": outline,
+            "features": len(feats), "context_features": sum(1 for fid in by_fid if fid not in used)}
+
+
+def _map_extra(R, layout: str) -> dict:
+    """What a unit-layout figure records: its layout and, on boundaries, the unmatched units, the credit and the
+    context features (a note the renderer appends to the caption untruncated)."""
+    if layout != "boundaries":
+        return {"layout": layout}
+    B, cfg = R.geo, R.pres["boundaries"]
+    um = B["unmatched"]
+    note = (f" Not on the map (no boundary): {', '.join(um[:12])}" + (f" and {len(um) - 12} more" if len(um) > 12
+                                                                      else "") + "." if um else "")
+    return {"layout": "boundaries", "unmatched": list(um), "credit": cfg.get("credit"),
+            "context_features": B["context_features"], "caption_note": note}
+
+
 def fig_headline(R, t):
     pt, uq = R.art("point"), R.art("uncertainty")
     outs = [R.primary] + [o for o in (R.spec.get("outcomes_reported") or []) if o != R.primary]
@@ -988,7 +1184,7 @@ def fig_allocation(R, t):
     cap = (f"Recommended package per unit ({how}; within a row, ordered by {ordered_by})"
            + (". Filled dot: the unit gets the component" if mode.startswith("small") else "")
            + (f". Ids: {'; '.join(defs)}" if defs else "") + ".")
-    return fig, title, cap, rows, f"where each package goes ({mode})"
+    return fig, title, cap, rows, f"where each package goes ({mode})", _map_extra(R, layout)
 
 
 def _binned(t, vals, edges, fmtk):
@@ -1049,7 +1245,7 @@ def fig_stability(R, t):
            f"panel) and each component's yes/no; {how}, ordered by {ordered_by}.")
     rows = [{"unit": i, "region": R.region(i), "package": plan[i], "share_keeping_package": share[i],
              **{f"share_keeping_{c}": comp_keep[c][i] for c in comps}} for i in order]
-    return fig, title, cap, rows, "assignment stability over the uncertainty draws (package and components)"
+    return fig, title, cap, rows, "assignment stability over the uncertainty draws (package and components)", _map_extra(R, layout)
 
 
 def fig_burden(R, t):
@@ -1082,7 +1278,7 @@ def fig_burden(R, t):
            f"{how}, ordered by {ordered_by}.")
     rows = [{"unit": i, "region": R.region(i), f"{R.primary}_{per.replace(' ', '_').replace(',', '')}": v[i]}
             for i in order]
-    return fig, title, cap, rows, "comparator burden per person"
+    return fig, title, cap, rows, "comparator burden per person", _map_extra(R, layout)
 
 
 def fig_calibration(R, t):
@@ -1682,7 +1878,7 @@ def _offset_free(fig) -> bool:
                for a in fig.axes)
 
 
-def _save(fig, out_dir, name, run_dir, sources, harness: bool, t) -> dict:
+def _save(fig, out_dir, name, run_dir, sources, harness: bool, t, presentation=None) -> dict:
     import matplotlib.pyplot as plt
     os.makedirs(out_dir, exist_ok=True)
     png = os.path.join(out_dir, f"{name}.png")
@@ -1700,6 +1896,7 @@ def _save(fig, out_dir, name, run_dir, sources, harness: bool, t) -> dict:
               source_hashes={os.path.relpath(p, run_dir): h for p, h in (sc.get("source_hashes") or {}).items()})
     if not harness:
         sc["run_dir"] = run_dir
+    sc["presentation"] = list(presentation or [])        # the unsigned labels/boundaries files used, with their sha
     with open(sp, "w") as f:
         json.dump(sc, f, indent=2, sort_keys=True)
     return {"png": png, "svg": svg}
@@ -1741,18 +1938,22 @@ def render(run_dir: str, out_dir: str | None = None, labels_overlay: dict | None
         if len(title) > TITLE_MAX:
             title = title[:TITLE_MAX - 1].rsplit(" ", 1)[0] + "…"
         FS.title(fig, title, t)
+        if extra.get("credit"):
+            fig.text(0.995, 0.004, extra["credit"], ha="right", va="bottom", fontsize=6.5, color=t["ink2"])
         clean = _offset_free(fig)
         sources = list(R.used) + (["decision_spec.yaml", os.path.relpath(os.path.join(run_dir, R.spec["decision_units"]["csv"]), run_dir)])
         sources = [s for s in sources if os.path.exists(os.path.join(run_dir, s))]
-        files = _save(fig, dest, name, run_dir, sources, harness, t)
+        files = _save(fig, dest, name, run_dir, sources, harness, t, R.pres["files"])
         table = os.path.join(dest, f"{name}.csv")
         _write_csv(table, rows)
         cap = cap if len(cap) <= CAPTION_MAX else cap[:CAPTION_MAX - 1].rsplit(" ", 1)[0] + "…"
+        cap += extra.pop("caption_note", "")
         rel = (lambda p: os.path.relpath(p, run_dir)) if harness else (lambda p: p)
         figs.append(dict({"figure": name, "path": rel(files["png"]), "svg": rel(files["svg"]), "table": rel(table),
                           "title": title, "caption": cap, "shows": shows, "sources": sources, "offset_free": clean,
                           "theme": theme, "tier": TIER_OF[name],
-                          "group": "decision" if TIER_OF[name] == "decision" else "diagnostics"}, **extra))
+                          "group": "decision" if TIER_OF[name] == "decision" else "diagnostics",
+                          "presentation": R.pres["files"]}, **extra))
     res = {"figures": figs, "not_produced": notp, "tiers": {k: list(v) for k, v in tiers_for(R.spec).items()},
            "groups": {"decision": list(tiers_for(R.spec)["decision"]),
                       "diagnostics": [n for k in ("data_model", "simulation") for n in tiers_for(R.spec)[k]]}}
@@ -1894,7 +2095,9 @@ def main(argv=None) -> int:
     r.add_argument("run_dir")
     r.add_argument("--out", required=True)
     r.add_argument("--recompute", action="store_true", help="rebuild figure_data from the stored batch (no engine runs)")
-    r.add_argument("--labels", help="YAML with presentation labels (components, parameters, outcomes, ...)")
+    r.add_argument("--labels", help="an unsigned presentation file: labels and/or boundaries (overrides the run "
+                                    "dir's presentation.yaml id by id)")
+    r.add_argument("--only", help="comma-separated figure names")
     r.add_argument("--figure-data", help="a figure_data YAML written by an earlier --recompute (its data block)")
     r.add_argument("--trajectories", help="a trajectories YAML (analysis/trajectories.yaml format)")
     r.add_argument("--theme", default="light", choices=sorted(FS.THEMES))
@@ -1906,9 +2109,7 @@ def main(argv=None) -> int:
     c.add_argument("--theme", default="light", choices=sorted(FS.THEMES))
     a = ap.parse_args(argv)
     import yaml
-    ov = yaml.safe_load(open(a.labels)) if a.labels else None
-    if ov and "labels" in ov:
-        ov = ov["labels"]
+    ov = a.labels or None                       # a presentation file path; RunData loads and checks it
     if a.cmd == "compare":
         e = compare(a.run_dirs, a.out, a.names.split(",") if a.names else None, ov, a.theme)
         print(json.dumps({"comparison": e["path"]}))
@@ -1929,7 +2130,7 @@ def main(argv=None) -> int:
         except FD.RebuildRefused as e:
             print(f"recompute refused: {e}", file=sys.stderr)
             fd = None
-    res = render(a.run_dir, a.out, ov, fd, tj, theme=a.theme)
+    res = render(a.run_dir, a.out, ov, fd, tj, theme=a.theme, only=a.only.split(",") if a.only else None)
     print(json.dumps({"produced": [f["figure"] for f in res["figures"]], "not_produced": res["not_produced"]}, indent=1))
     return 0
 
@@ -2280,7 +2481,7 @@ def _self_test() -> int:
         e, why = one(dt, "trajectories", "t1")
         ok(e is None and why and "stale" in why, f"F19 trajectories computed from other inputs are not plotted: {why}")
         # P2-11: every component counts in the dollars summary
-        d9 = toy_run(os.path.join(base, "run9"))
+        d9 = toy_run(os.path.join(base, "run9"), labels=False)     # its components are replaced below
         comps9 = [f"k{j}" for j in range(9)]
         edit(d9, "figure_data", lambda x: x["dollars"].update(
             allocated_usd=900.0, by_component={c: 100.0 for c in comps9},
@@ -2429,7 +2630,7 @@ def _self_test() -> int:
         ok(set(eb) == {"allocation_map", "stability_map", "burden_map"}
            and all(f.get("layout") == "boundaries" and f.get("unmatched") == ["u0"]
                    and "u0" in f["caption"] and f.get("credit") == "Boundaries: toy (CC0)" for f in eb.values())
-           and all(f.get("context_features") == 2 for f in eb.values()),
+           and all(f.get("context_features") == 3 for f in eb.values()),     # 2 context + the one u0 is not mapped to
            f"BD1 with a boundary file and crosswalk the maps draw polygons, list unmatched units, credit the source and "
            f"draw context features: {[(k, v.get('layout'), v.get('unmatched'), v.get('context_features')) for k, v in eb.items()]}")
         db2 = toy_run(os.path.join(base, "runb2"))
