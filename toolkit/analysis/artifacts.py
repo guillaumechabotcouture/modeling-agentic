@@ -81,6 +81,16 @@ def plain(x):
     return x
 
 
+def _safe_io():
+    """scripts/lib/safe_io.py: no-follow, atomic writes in the run dir (review round 4, P1-2)."""
+    import sys
+    scripts = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    from lib import safe_io
+    return safe_io
+
+
 class Store:
     def __init__(self, run_dir: str, spec_sha: str | None, spec_signed: bool, engine_info: dict,
                  settings_sha: str | None = None, engine_choice_sha: str | None = None):
@@ -90,8 +100,7 @@ class Store:
         os.makedirs(os.path.join(self.run_dir, "analysis"), exist_ok=True)
         # Codex P1-9: a run's manifest is published once, atomically, when the run ends; an earlier run's manifest is
         # withdrawn first, so a run that stops half way can never leave a complete-looking certificate behind.
-        if os.path.exists(self.path(MANIFEST)):
-            os.remove(self.path(MANIFEST))
+        _safe_io().remove_nofollow(self.run_dir, MANIFEST)      # no link followed (review round 4, P1-2)
         self.manifest = {"produced_by": PRODUCED_BY, "spec_sha256": spec_sha, "spec_signed": spec_signed,
                          "settings_sha256": settings_sha, "engine_choice_sha256": engine_choice_sha,
                          "engine": engine_info, "artifacts": {}, "deliverables": {}}
@@ -116,9 +125,10 @@ class Store:
                           for p in inputs},
                "written_at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
                "data": plain(data)}
-        with open(self.path(rel), "w", encoding="utf-8") as f:
-            yaml.safe_dump(doc, f, sort_keys=False, width=120)
-        self.manifest["artifacts"][rel] = {"kind": kind, "sha256": sha256(self.path(rel)), "producer": producer}
+        data = yaml.safe_dump(doc, sort_keys=False, width=120).encode("utf-8")
+        _safe_io().write_nofollow(self.run_dir, rel.replace(os.sep, "/"), data, atomic=True)
+        self.manifest["artifacts"][rel] = {"kind": kind, "sha256": hashlib.sha256(data).hexdigest(),
+                                           "producer": producer}
         return rel
 
     def deliverable(self, path: str, producer: str, role: str) -> str:
@@ -132,12 +142,8 @@ class Store:
             raise ValueError(status)
         self.manifest.update(status=status, complete=status == "complete", reason=reason,
                              finished_at=_dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"))
-        tmp = self.path(MANIFEST) + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(plain(self.manifest), f, indent=1, sort_keys=True)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, self.path(MANIFEST))
+        _safe_io().write_nofollow(self.run_dir, MANIFEST.replace(os.sep, "/"),
+                                  json.dumps(plain(self.manifest), indent=1, sort_keys=True).encode(), atomic=True)
         return MANIFEST
 
 

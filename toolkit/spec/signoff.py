@@ -18,9 +18,9 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import hashlib
 import json
 import os
-import shutil
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -28,6 +28,7 @@ for p in (ROOT, os.path.join(ROOT, "scripts")):
     if p not in sys.path:
         sys.path.insert(0, p)
 import decision_brief as DB  # noqa: E402
+from lib.safe_io import LinkRefused, read_nofollow, write_nofollow  # noqa: E402
 from toolkit.spec import schema  # noqa: E402
 
 SPEC = DB.DECISION_SPEC
@@ -64,29 +65,51 @@ def status(run_dir: str) -> str:
 
 def derived_changed(run_dir: str, rec: dict) -> list[str]:
     """What changed since sign-off among the derivation record and the derived files it lists (empty: nothing). A
-    sign-off made before the record existed, in a run that has none, is unaffected."""
+    sign-off made before the record existed, in a run that has none, is unaffected. Everything is read through
+    no-follow fds (review round 3, P1-3): there is no path check to race."""
     signed = (rec.get("sha256") or {}).get(DERIVATIONS_RECORD)
-    now = DB._sha(os.path.join(run_dir, DERIVATIONS_RECORD))
+    try:
+        raw = read_nofollow(run_dir, DERIVATIONS_RECORD)[0]
+    except FileNotFoundError:
+        raw = None
+    except (LinkRefused, OSError):
+        return [DERIVATIONS_RECORD]
+    now = hashlib.sha256(raw).hexdigest() if raw is not None else None
     if signed is None and now is None:
         return []
     if signed != now:
         return [DERIVATIONS_RECORD]
     try:
-        derivs = (json.load(open(os.path.join(run_dir, DERIVATIONS_RECORD))) or {}).get("derivations") or {}
-    except (OSError, ValueError):
+        derivs = (json.loads(raw.decode("utf-8")) or {}).get("derivations") or {}
+    except (UnicodeDecodeError, ValueError, AttributeError):
         return [DERIVATIONS_RECORD]
-    return sorted(o for e in derivs.values() for o, h in ((e or {}).get("outputs") or {}).items()
-                  if DB._sha(os.path.join(run_dir, o)) != h)
+    return _outputs_changed(run_dir, derivs)
 
 
-def _freeze_record(run_dir: str, path: str) -> dict:
-    """Add the derivation record's hash to a sign-off file (the brief's or the spec's own)."""
-    with open(path, encoding="utf-8") as f:
-        rec = json.load(f)
-    rec.setdefault("sha256", {})[DERIVATIONS_RECORD] = DB._sha(os.path.join(run_dir, DERIVATIONS_RECORD))
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(rec, f, indent=1)
-    return rec
+def _outputs_changed(run_dir: str, derivs: dict) -> list[str]:
+    """The listed derivation outputs whose bytes differ from the record. Each is hashed through a no-follow fd; an
+    output outside the run dir, behind a link, or unreadable is a change and is never read (the record is written by
+    a derivation script an agent wrote)."""
+    out = []
+    for e in (derivs or {}).values():
+        for o, h in ((e or {}).get("outputs") or {}).items() if isinstance(e, dict) else []:
+            try:
+                same = _sha_nofollow(run_dir, str(o)) == h
+            except (ValueError, OSError):
+                same = False
+            if not same:
+                out.append(o)
+    return sorted(out)
+
+
+def _sha_nofollow(run_dir: str, rel: str) -> str | None:
+    """sha256 of run_dir/rel read through a no-follow fd; None when absent; ValueError for a link."""
+    try:
+        return hashlib.sha256(read_nofollow(run_dir, rel)[0]).hexdigest()
+    except FileNotFoundError:
+        return None
+    except LinkRefused as e:
+        raise ValueError(f"{rel}: {e}") from None
 
 
 def signed_sha(run_dir: str) -> str | None:
@@ -94,30 +117,102 @@ def signed_sha(run_dir: str) -> str | None:
     return (rec.get("sha256") or {}).get(SPEC) if rec else None
 
 
-def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, accept_proposed: bool = False) -> dict:
-    path = os.path.join(run_dir, SPEC)
-    if not os.path.exists(path):
-        raise ValueError(f"{SPEC} does not exist")
-    errs = schema.validate(schema.load(path), pending_ok=True)
+def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, accept_proposed: bool = False,
+         expect_sha256: str | None = None, expect_derivations_sha256: str | None = None,
+         expect_sheet_sha256: str | None = None) -> dict:
+    """Sign the spec. The expect_* hashes are what the owner was shown (the run console's approval snapshot): the
+    spec, the derivation record ("none": there was none) and the sign-off sheet; a mismatch is refused. The spec is
+    read once: validated, hashed and copied from those bytes; nothing is read or written through a link; the record
+    is published atomically."""
+    try:
+        data = read_nofollow(run_dir, SPEC)[0]
+    except FileNotFoundError:
+        raise ValueError(f"{SPEC} does not exist") from None
+    except LinkRefused as e:
+        raise ValueError(f"{SPEC}: {e}") from None
+    sha = hashlib.sha256(data).hexdigest()
+    if expect_sha256 is not None and sha != expect_sha256:
+        raise ValueError(f"{SPEC} changed since it was shown (sha256 {sha[:12]}, shown {str(expect_sha256)[:12]}): "
+                         "read it again before signing")
+    dsha = _sha_nofollow(run_dir, DERIVATIONS_RECORD)
+    if expect_derivations_sha256 is not None and (dsha or "none") != expect_derivations_sha256:
+        raise ValueError(f"{DERIVATIONS_RECORD} changed since the sheet was shown: read it again before signing")
+    try:
+        sheet_bytes = read_nofollow(run_dir, SHEET)[0]
+    except FileNotFoundError:
+        sheet_bytes = None
+    except LinkRefused as e:
+        raise ValueError(f"{SHEET}: {e}") from None
+    sheet_sha = hashlib.sha256(sheet_bytes).hexdigest() if sheet_bytes is not None else "none"
+    if expect_sheet_sha256 is not None and sheet_sha != expect_sheet_sha256:
+        raise ValueError(f"{SHEET} changed since it was shown: read it again before signing")
+    src = sheet_sources(sheet_bytes.decode("utf-8", "replace")) if sheet_bytes is not None else None
+    if sheet_bytes is not None and (src is not None or expect_sheet_sha256 not in (None, "none")) and (
+            src is None or src.get("spec_sha256") != sha or src.get("derivations_sha256") != (dsha or "none")):
+        raise ValueError(f"{SHEET} was generated from another spec or derivation record (it is stale): the sheet is "
+                         "regenerated before the owner signs; read the new one")
+    errs = schema.validate(schema.load(os.path.join(run_dir, SPEC), data=data), pending_ok=True)
     if errs:
         raise ValueError("spec not ready: " + "; ".join(errs[:10]))
     if _spec_record(run_dir) is not None:
         raise ValueError("the spec is already signed; a change needs a new sign-off by the owner")
-    if os.path.exists(os.path.join(run_dir, DB.BRIEF)):
-        DB.sign(run_dir, by, answers=answers, note=note, accept_proposed=accept_proposed)
-        return _freeze_record(run_dir, os.path.join(run_dir, DB.SIGNOFF))
+    if os.path.lexists(os.path.join(run_dir, DB.BRIEF)):
+        return DB.sign(run_dir, by, answers=answers, note=note, accept_proposed=accept_proposed,
+                       expect={SPEC: sha}, extra_sha={DERIVATIONS_RECORD: dsha})
     record = {"signed_by": by, "signed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "note": note,
-              "sha256": {SPEC: DB._sha(path), DERIVATIONS_RECORD: DB._sha(os.path.join(run_dir, DERIVATIONS_RECORD))},
+              "sha256": {SPEC: sha, DERIVATIONS_RECORD: dsha},
               "producer": "toolkit/spec/signoff.py",
               "schema_version": schema.SCHEMA_VERSION}
-    os.makedirs(os.path.join(run_dir, DB.SIGNED_DIR), exist_ok=True)
-    shutil.copyfile(path, os.path.join(run_dir, DB.SIGNED_DIR, SPEC))
-    with open(os.path.join(run_dir, SPEC_SIGNOFF), "w", encoding="utf-8") as f:
-        json.dump(record, f, indent=1)
+    try:
+        write_nofollow(run_dir, f"{DB.SIGNED_DIR}/{SPEC}", data, atomic=True)   # the bytes that were hashed
+        write_nofollow(run_dir, SPEC_SIGNOFF, json.dumps(record, indent=1).encode(), atomic=True)
+    except (LinkRefused, OSError) as e:
+        raise ValueError(f"sign-off not written: {e}") from None
     return record
 
 
-def sheet(run_dir: str, candidates: list | None = None) -> str:
+SHEET_SOURCES = "<!-- signoff-sheet-sources: "
+
+
+def sheet_sources(text) -> dict | None:
+    """The source hashes the sheet writer recorded in the sheet ({spec_sha256, derivations_sha256}), or None."""
+    if not isinstance(text, str):
+        return None
+    for line in reversed(text.splitlines()):
+        if line.startswith(SHEET_SOURCES) and line.endswith(" -->"):
+            try:
+                d = json.loads(line[len(SHEET_SOURCES):-4])
+            except ValueError:
+                return None
+            return d if isinstance(d, dict) else None
+    return None
+
+
+def write_sheet(run_dir: str, candidates: list | None = None) -> str:
+    """Generate the sign-off sheet and publish it (no link followed, atomic), with the hashes of the spec and the
+    derivation record it was generated from recorded in its last line. The spec and the record are each read once;
+    the sheet is rendered from those bytes and records their hashes (review round 4, P1-4). The console disables
+    approval and the signer refuses when they no longer match."""
+    try:
+        spec_bytes = read_nofollow(run_dir, SPEC)[0]
+    except (FileNotFoundError, LinkRefused) as e:
+        raise ValueError(f"{SPEC}: {e}") from None
+    try:
+        rec_bytes = read_nofollow(run_dir, DERIVATIONS_RECORD)[0]
+    except FileNotFoundError:
+        rec_bytes = None
+    except LinkRefused as e:
+        raise ValueError(f"{DERIVATIONS_RECORD}: {e}") from None
+    text = sheet(run_dir, candidates, spec_bytes=spec_bytes, record_bytes=rec_bytes)
+    src = json.dumps({"spec_sha256": hashlib.sha256(spec_bytes).hexdigest(),
+                      "derivations_sha256": hashlib.sha256(rec_bytes).hexdigest() if rec_bytes is not None else "none"},
+                     sort_keys=True)
+    write_nofollow(run_dir, SHEET, (text.rstrip("\n") + f"\n\n{SHEET_SOURCES}{src} -->\n").encode(), atomic=True)
+    return os.path.join(run_dir, SHEET)
+
+
+def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None = None,
+          record_bytes: bytes | None = None) -> str:
     """The sign-off sheet (markdown): what signing accepts beyond the spec's text. Each engine default the spec
     accepts by name, with the card's meaning and the spec's reason; the staged columns and tables the derivations
     do not use, with their reasons; the derivations; and, when given, the candidate engines and why any is
@@ -125,12 +220,19 @@ def sheet(run_dir: str, candidates: list | None = None) -> str:
     import yaml
     path = os.path.join(run_dir, SPEC)
     try:
-        raw = yaml.safe_load(open(path, encoding="utf-8")) or {}
-    except (OSError, yaml.YAMLError) as e:
+        if spec_bytes is None:
+            with open(path, "rb") as f:
+                spec_bytes = f.read()
+            record_bytes = record_bytes if record_bytes is not None else (
+                open(os.path.join(run_dir, DERIVATIONS_RECORD), "rb").read()
+                if os.path.exists(os.path.join(run_dir, DERIVATIONS_RECORD)) else None)
+        raw = yaml.safe_load(spec_bytes.decode("utf-8")) or {}
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
         return f"# Decision spec sign-off sheet\n\n{SPEC} unreadable: {e}\n"
+    rsha = hashlib.sha256(record_bytes).hexdigest() if record_bytes is not None else "none"
     out = ["# Decision spec sign-off sheet", "",
-           f"Signing accepts `{SPEC}` (sha256 `{(DB._sha(path) or '')[:16]}`) and the derived data recorded in "
-           f"`{DERIVATIONS_RECORD}` (sha256 `{(DB._sha(os.path.join(run_dir, DERIVATIONS_RECORD)) or 'none')[:16]}`). "
+           f"Signing accepts `{SPEC}` (sha256 `{hashlib.sha256(spec_bytes).hexdigest()[:16]}`) and the derived data "
+           f"recorded in `{DERIVATIONS_RECORD}` (sha256 `{rsha[:16]}`). "
            "It also accepts what follows.", ""]
     eng = raw.get("engine")
     refs = [eng["ref"]] if isinstance(eng, dict) and eng.get("ref") else \
@@ -231,6 +333,184 @@ def _self_test() -> int:
                f"SG10 a spec with engine: auto can be signed before the engine is chosen ({st0})")
         except ValueError as e:
             ok(False, f"SG10 a spec with engine: auto can be signed before the engine is chosen: {e}")
+    # SG11-SG12 (run console review, finding 6): a sign-off names the spec it was shown; another spec is refused.
+    with tempfile.TemporaryDirectory() as d:
+        p = schema.toy_spec(d)
+        shown = DB._sha(p)
+        with open(p, "a") as f:
+            f.write("\n# edited after the owner read it\n")
+        try:
+            sign(d, "owner", note="n", expect_sha256=shown)
+            ok(False, "SG11 a sign-off for a spec other than the one shown is refused")
+        except (ValueError, TypeError) as e:
+            ok(isinstance(e, ValueError) and "changed" in str(e) and status(d) == "awaiting",
+               f"SG11 a sign-off for a spec other than the one shown is refused ({e})")
+        try:
+            rec = sign(d, "owner", note="n", expect_sha256=DB._sha(p))
+            ok(rec["sha256"][SPEC] == DB._sha(p) and status(d) == "signed",
+               "SG12 the sign-off records the hash of the bytes it checked")
+        except (ValueError, TypeError) as e:
+            ok(False, f"SG12 the sign-off records the hash of the bytes it checked ({e})")
+    # SG13-SG17 (run console review round 2)
+    import builtins
+    for target in ("signed_dir", "record"):
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+            schema.toy_spec(d)
+            victim = os.path.join(out, "victim")
+            open(victim, "w").write("untouched")
+            if target == "signed_dir":
+                os.symlink(out, os.path.join(d, DB.SIGNED_DIR))
+            else:
+                os.symlink(victim, os.path.join(d, SPEC_SIGNOFF))
+            try:
+                sign(d, "owner", note="n")
+            except (ValueError, OSError):
+                pass
+            ok(open(victim).read() == "untouched" and sorted(os.listdir(out)) == ["victim"],
+               f"SG13 the sign-off is not written through a linked {target} ({sorted(os.listdir(out))})")
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+        schema.toy_spec(d)
+        os.makedirs(os.path.join(d, "data"))
+        private = os.path.join(out, "private.csv")
+        open(private, "w").write("secret\n")
+        rel = os.path.relpath(private, d)
+        json.dump({"derivations": {"u": {"outputs": {rel: "ab"}}}}, open(os.path.join(d, DERIVATIONS_RECORD), "w"))
+        hashed, real_sha = [], DB._sha
+        DB._sha = lambda p: hashed.append(os.path.realpath(p)) or real_sha(p)
+        try:
+            bad = derived_changed(d, {"sha256": {DERIVATIONS_RECORD: real_sha(os.path.join(d, DERIVATIONS_RECORD))}})
+        finally:
+            DB._sha = real_sha
+        ok(rel in bad and os.path.realpath(private) not in hashed,
+           f"SG14 a derivation output outside the run dir is reported changed and never hashed ({bad})")
+    with tempfile.TemporaryDirectory() as d:
+        p = schema.toy_spec(d)
+        shown = DB._sha(p)
+        opens, real_open, real_osopen = [], builtins.open, os.open
+
+        def bopen(f, *a, **k):
+            if str(f).endswith(SPEC):
+                opens.append(str(f))
+            return real_open(f, *a, **k)
+
+        def oopen(f, *a, **k):
+            if str(f).endswith(SPEC):
+                opens.append(str(f))
+            return real_osopen(f, *a, **k)
+        builtins.open, os.open = bopen, oopen
+        try:
+            sign(d, "owner", note="n", expect_sha256=shown)
+        except Exception as e:  # noqa: BLE001
+            opens.append(f"error {e}")
+        finally:
+            builtins.open, os.open = real_open, real_osopen
+        ok(len(opens) == 1, f"SG15 the spec is read once: validated, hashed and copied from the same bytes ({opens})")
+    with tempfile.TemporaryDirectory() as d:
+        p = schema.toy_spec(d)
+        write_sheet(d)        # round 3: the sheet records the sources it was made from
+        sh = DB._sha(p)
+        res = []
+        for kw in ({"expect_derivations_sha256": "0" * 64}, {"expect_sheet_sha256": "0" * 64}):
+            try:
+                sign(d, "owner", note="n", expect_sha256=sh, **kw)
+                res.append(False)
+            except (ValueError, TypeError) as e:
+                res.append(isinstance(e, ValueError))
+        ok(all(res) and status(d) == "awaiting",
+           f"SG16 the sign-off checks the derivation record's and the sheet's sha256 too ({res})")
+        try:
+            sign(d, "owner", note="n", expect_sha256=sh, expect_derivations_sha256="none",
+                 expect_sheet_sha256=DB._sha(os.path.join(d, SHEET)))
+            ok(status(d) == "signed", "SG17 with every sha matching the spec is signed")
+        except (ValueError, TypeError) as e:
+            ok(False, f"SG17 with every sha matching the spec is signed ({e})")
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+        schema.toy_spec(d)
+        yaml.safe_dump(DB.example_brief(), open(os.path.join(d, DB.BRIEF), "w"))
+        yaml.safe_dump({"hard_blockers": [{"id": "HB-001", "text": "t"}]}, open(os.path.join(d, DB.CRITERIA), "w"))
+        os.symlink(out, os.path.join(d, DB.SIGNED_DIR))
+        opens, real_open = [], builtins.open
+        builtins.open = lambda f, *a, **k: (opens.append(f) if str(f).endswith(SPEC) else None) or real_open(f, *a, **k)
+        try:
+            DB.sign(d, "owner", note="n")
+        except (ValueError, OSError):
+            pass
+        finally:
+            builtins.open = real_open
+        ok(os.listdir(out) == [] and len(opens) <= 1,
+           f"SG18 decision_brief.sign hashes and copies the same bytes, never through a linked signed dir "
+           f"({os.listdir(out)}, {len(opens)} opens)")
+    # SG19-SG22 (run console review round 3)
+    with tempfile.TemporaryDirectory() as d:
+        p = schema.toy_spec(d)
+        try:
+            write_sheet(d)
+            src = sheet_sources(open(os.path.join(d, SHEET)).read())
+            ok(src and src.get("spec_sha256") == DB._sha(p) and src.get("derivations_sha256") == "none",
+               f"SG19 the sheet writer records the source hashes it was generated from ({src})")
+            with open(p, "a") as f:
+                f.write("\n# a newer spec\n")
+            try:
+                sign(d, "owner", note="n", expect_sha256=DB._sha(p),
+                     expect_sheet_sha256=DB._sha(os.path.join(d, SHEET)), expect_derivations_sha256="none")
+                ok(False, "SG20 a sheet generated from an older spec cannot authorise the newer one")
+            except ValueError as e:
+                ok("sheet" in str(e) and status(d) == "awaiting",
+                   f"SG20 a sheet generated from an older spec cannot authorise the newer one ({e})")
+        except NameError as e:
+            ok(False, f"SG19-SG20 sheet sources: {e}")
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+        schema.toy_spec(d)
+        victim = os.path.join(out, "victim")
+        open(victim, "w").write("untouched")
+        os.symlink(victim, os.path.join(d, SHEET))
+        try:
+            write_sheet(d)
+        except (ValueError, OSError, NameError):
+            pass
+        ok(open(victim).read() == "untouched", "SG21 the sheet is not written through a link")
+    with tempfile.TemporaryDirectory() as d:
+        schema.toy_spec(d)
+        yaml.safe_dump(DB.example_brief(), open(os.path.join(d, DB.BRIEF), "w"))
+        yaml.safe_dump({"hard_blockers": [{"id": "HB-001", "text": "t"}]}, open(os.path.join(d, DB.CRITERIA), "w"))
+        opens, real_open, real_osopen = [], builtins.open, os.open
+        builtins.open = lambda f, *a, **k: (opens.append(f) if str(f).endswith(DB.CRITERIA) else None) or \
+            real_open(f, *a, **k)
+        os.open = lambda f, *a, **k: (opens.append(f) if str(f).endswith(DB.CRITERIA) else None) or \
+            real_osopen(f, *a, **k)
+        try:
+            DB.sign(d, "owner", note="n")
+        except (ValueError, OSError):
+            pass
+        finally:
+            builtins.open, os.open = real_open, real_osopen
+        ok(len(opens) == 1, f"SG22 the brief sign-off reads success_criteria.yaml once ({len(opens)} opens)")
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+        schema.toy_spec(d)
+        open(os.path.join(out, "x.csv"), "w").write("secret\n")
+        os.symlink(out, os.path.join(d, "data"))
+        hashed, real_sha, real_rp = [], DB._sha, os.path.realpath
+        DB._sha = lambda p: hashed.append(p) or real_sha(p)
+        os.path.realpath = lambda p, *a, **k: os.path.abspath(p)       # the check sees no link (a race)
+        try:
+            bad = _outputs_changed(d, {"u": {"outputs": {"data/x.csv": "ab"}}})
+        except NameError as e:
+            bad = e
+        finally:
+            DB._sha, os.path.realpath = real_sha, real_rp
+        ok(not isinstance(bad, NameError) and "data/x.csv" in bad and not any("x.csv" in str(h) for h in hashed),
+           f"SG23 derivation outputs are hashed through no-follow fds: a linked data/ is a change, never read ({bad})")
+    # SG24 (round 4, P1-4): the sheet is rendered from the same captured spec bytes it records the hash of
+    with tempfile.TemporaryDirectory() as d:
+        schema.toy_spec(d)
+        opens, real_open, real_osopen = [], builtins.open, os.open
+        builtins.open = lambda f, *a, **k: (opens.append(f) if str(f).endswith(SPEC) else None) or real_open(f, *a, **k)
+        os.open = lambda f, *a, **k: (opens.append(f) if str(f).endswith(SPEC) else None) or real_osopen(f, *a, **k)
+        try:
+            write_sheet(d)
+        finally:
+            builtins.open, os.open = real_open, real_osopen
+        ok(len(opens) == 1, f"SG24 write_sheet reads the spec once and renders and hashes those bytes ({len(opens)})")
     # DI6, DI7, DI10 (docs/design/v2-derived-inputs.md): the sign-off freezes the derivation record, and the sheet
     # shows the owner the accepted defaults and the columns the run chose not to use.
     try:

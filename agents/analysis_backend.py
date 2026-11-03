@@ -63,8 +63,8 @@ def _card(ref: str, card_path: str | None, config: dict | None = None):
         with open(os.path.join(REPO, card_path)) as f:
             doc = yaml.safe_load(f) or {}
         return EngineCard(**{k: v for k, v in doc.items() if k in EngineCard.__dataclass_fields__})
-    mod, cls = ref.split(":")
-    return getattr(importlib.import_module(mod), cls)(**(config or {})).describe()
+    from toolkit.spec import schema
+    return schema.engine_class(ref)(**(config or {})).describe()     # refused before any import when not allowed
 
 
 def engine_needs(spec: dict) -> dict:
@@ -484,9 +484,12 @@ class _ToolkitApi:
         return dict(schema.load(os.path.join(run_dir, SPEC_FILE)).raw, _run_dir=run_dir)
 
     # B signs the spec itself (toolkit/spec/signoff.py); its analysis refuses an unsigned spec.
-    def sign(self, run_dir: str, by: str, note: str = "") -> dict:
+    def sign(self, run_dir: str, by: str, note: str = "", expect_sha256: str | None = None,
+             expect_derivations_sha256: str | None = None, expect_sheet_sha256: str | None = None) -> dict:
         from toolkit.spec import signoff
-        return signoff.sign(run_dir, by, note)
+        return signoff.sign(run_dir, by, note, expect_sha256=expect_sha256,
+                            expect_derivations_sha256=expect_derivations_sha256,
+                            expect_sheet_sha256=expect_sheet_sha256)
 
     def signed_sha(self, run_dir: str):
         from toolkit.spec import signoff

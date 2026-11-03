@@ -130,30 +130,40 @@ def _load(path: str):
         return yaml.safe_load(f)
 
 
-def _criteria_ids(run_dir: str) -> set[str]:
+_UNSET = object()
+
+
+def _criteria_ids(run_dir: str, data=_UNSET) -> set[str]:
+    """The success criteria ids. `data`: the bytes of success_criteria.yaml already captured by the sign-off (None:
+    the file was absent), so the sign-off validates what it hashes (review round 3, P2-5)."""
     try:
-        doc = _load(os.path.join(run_dir, CRITERIA)) or {}
-    except (OSError, yaml.YAMLError):
+        if data is _UNSET:
+            doc = _load(os.path.join(run_dir, CRITERIA)) or {}
+        else:
+            doc = (yaml.safe_load(data.decode("utf-8")) if data is not None else {}) or {}
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        return set()
+    if not isinstance(doc, dict):
         return set()
     return {str(c.get("id")) for sec in ("hard_blockers", "minimum_bar", "targets")
             for c in (doc.get(sec) or []) if isinstance(c, dict) and c.get("id")}
 
 
-def load_brief(run_dir: str):
-    """(doc, errors)."""
+def load_brief(run_dir: str, data: bytes | None = None, criteria=_UNSET):
+    """(doc, errors). `data`: the brief's bytes, already read (the sign-off validates the bytes it hashes)."""
     path = os.path.join(run_dir, BRIEF)
-    if not os.path.exists(path):
+    if data is None and not os.path.exists(path):
         return None, [f"{BRIEF} does not exist"]
     try:
-        doc = _load(path)
-    except (OSError, yaml.YAMLError) as e:
+        doc = _load(path) if data is None else yaml.safe_load(data.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
         return None, [f"{BRIEF} does not parse: {str(e)[:120]}"]
     if not isinstance(doc, dict):
         return None, [f"{BRIEF} must be a mapping"]
-    return doc, validate(doc, run_dir)
+    return doc, validate(doc, run_dir, criteria)
 
 
-def validate(doc: dict, run_dir: str) -> list[str]:
+def validate(doc: dict, run_dir: str, criteria=_UNSET) -> list[str]:
     errors = [f"{k}: missing or empty" for k in _TEXT if not str(doc.get(k) or "").strip()]
     seen: set[str] = set()
     for key, prefix in _LISTS.items():
@@ -194,7 +204,7 @@ def validate(doc: dict, run_dir: str) -> list[str]:
     if not isinstance(acc, list) or not acc:
         errors.append("acceptance: list the success_criteria.yaml ids this run is judged by")
     else:
-        known = _criteria_ids(run_dir)
+        known = _criteria_ids(run_dir, criteria)
         unknown = [str(a) for a in acc if str(a) not in known]
         if unknown:
             errors.append(f"acceptance: not in {CRITERIA}: {', '.join(unknown)}")
@@ -332,10 +342,34 @@ def is_signed(run_dir: str) -> bool:
     return _signoff(run_dir) is not None
 
 
+def _capture(run_dir: str, names) -> dict:
+    """{name: bytes or None}: each file read once, through an fd opened with no link followed (lib.safe_io)."""
+    from lib.safe_io import read_nofollow, LinkRefused
+    out = {}
+    for f in names:
+        try:
+            out[f] = read_nofollow(run_dir, f)[0]
+        except FileNotFoundError:
+            out[f] = None
+        except LinkRefused as e:
+            raise ValueError(f"{f}: {e}") from None
+    return out
+
+
 def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
-         accept_proposed: bool = False) -> dict:
-    """Write the sign-off. Raises ValueError when the brief is not ready."""
-    doc, errors = load_brief(run_dir)
+         accept_proposed: bool = False, expect: dict | None = None, extra_sha: dict | None = None) -> dict:
+    """Write the sign-off. Raises ValueError when the brief is not ready. The frozen files are read once: validated,
+    hashed and copied from the same bytes, never through a link, and the record is published atomically.
+    `expect`: {file: sha256 the owner was shown} (a mismatch is refused); `extra_sha`: further hashes to record."""
+    import hashlib
+    from lib.safe_io import write_nofollow, LinkRefused
+    captured = _capture(run_dir, FROZEN_AT_SIGNOFF)
+    shas = {f: hashlib.sha256(b).hexdigest() if b is not None else None for f, b in captured.items()}
+    for f, want in (expect or {}).items():
+        if shas.get(f) != want:
+            raise ValueError(f"{f} changed since it was shown; read it again before signing")
+    doc, errors = load_brief(run_dir, captured[BRIEF], captured[CRITERIA]) if captured[BRIEF] is not None else (None, [
+        f"{BRIEF} does not exist"])
     if errors:
         raise ValueError("brief not ready: " + "; ".join(errors))
     if is_signed(run_dir):
@@ -349,18 +383,18 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
         "signed_by": by, "signed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "note": note,
         "answers": {q["id"]: answers.get(q["id"], q.get("proposed")) for q in qs},
         "answer_source": {q["id"]: "given" if q["id"] in answers else "proposed accepted" for q in qs},
-        "sha256": {f: _sha(os.path.join(run_dir, f)) for f in FROZEN_AT_SIGNOFF},
+        "sha256": {**shas, **(extra_sha or {})},
         "schema_version": schema_version(doc),
         "producer": "scripts/decision_brief.py",
     }
-    # Gemini review: keep the signed versions, so a changed file can be restored.
-    os.makedirs(os.path.join(run_dir, SIGNED_DIR), exist_ok=True)
-    for f in FROZEN_AT_SIGNOFF:
-        src = os.path.join(run_dir, f)
-        if os.path.exists(src):
-            shutil.copyfile(src, os.path.join(run_dir, SIGNED_DIR, f))
-    with open(os.path.join(run_dir, SIGNOFF), "w", encoding="utf-8") as f:
-        json.dump(record, f, indent=1)
+    try:
+        # Gemini review: keep the signed versions, so a changed file can be restored (the bytes that were hashed).
+        for f, b in captured.items():
+            if b is not None:
+                write_nofollow(run_dir, f"{SIGNED_DIR}/{f}", b, atomic=True)
+        write_nofollow(run_dir, SIGNOFF, json.dumps(record, indent=1).encode(), atomic=True)
+    except (LinkRefused, OSError) as e:
+        raise ValueError(f"sign-off not written: {e}") from None
     return record
 
 

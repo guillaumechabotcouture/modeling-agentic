@@ -627,12 +627,51 @@ def _load_state(run_dir: str) -> dict:
 
 
 def _write_json(run_dir: str, rel: str, obj) -> str:
-    p = os.path.join(run_dir, rel)
-    os.makedirs(os.path.dirname(p), exist_ok=True)
-    with open(p + ".tmp", "w") as f:
-        json.dump(obj, f, indent=1, sort_keys=True)
-    os.replace(p + ".tmp", p)
-    return rel.replace(os.sep, "/")
+    """Publish a harness record in the run dir atomically, with no link followed (lib.safe_io; a random temporary
+    name, never a predictable `.tmp` an artifact could plant)."""
+    from lib.safe_io import write_nofollow
+    rel = rel.replace(os.sep, "/")
+    write_nofollow(run_dir, rel, json.dumps(obj, indent=1, sort_keys=True).encode(), atomic=True)
+    return rel
+
+
+def _retire_outputs(run_dir: str, old: dict, entries: dict) -> list:
+    """Remove the outputs of derivations no longer declared. The names come from the previous derivation record, an
+    artifact: each must be a plain relative path under data/derived/ (no "..", checked by its parts, not by prefix)
+    and is unlinked relative to a no-follow directory fd, never outside the run dir (review round 4, P1-1)."""
+    from lib.safe_io import remove_nofollow, LinkRefused
+    removed = []
+    for sid, e in (old or {}).items():
+        if sid in entries or not isinstance(e, dict):
+            continue
+        for o in e.get("outputs") or {}:
+            o = str(o)
+            parts = o.replace("\\", "/").split("/")
+            if not o.startswith(DERIVED_PREFIX) or any(x in ("", ".", "..") for x in parts) or os.path.isabs(o):
+                continue
+            try:
+                if remove_nofollow(run_dir, o):
+                    removed.append(o)
+            except (LinkRefused, OSError):
+                continue
+    return removed
+
+
+def _publish_outputs(work: str, run_dir: str, outputs) -> dict:
+    """Copy a derivation's outputs from its work dir into the run dir: each read with no link followed in the work
+    dir (an output that is a link is refused) and published atomically with no link followed in the run dir.
+    Returns {output: sha256 of the bytes published}."""
+    import hashlib
+    from lib.safe_io import read_nofollow, write_nofollow, LinkRefused
+    out = {}
+    for o in outputs:
+        try:
+            data = read_nofollow(work, o)[0]
+        except LinkRefused as e:
+            raise ValueError(f"derivation output {o}: {e}") from None
+        write_nofollow(run_dir, o, data, atomic=True)
+        out[o] = hashlib.sha256(data).hexdigest()
+    return out
 
 
 def _why_stale(step: dict, run_dir: str, rec: dict | None) -> str | None:
@@ -1589,13 +1628,14 @@ def derive(run_dir: str, unsandboxed_ok: bool = False, limits: dict | None = Non
                                + ("could not be made" if runs[-1]["rc"] != 0 else "changed")
                                + ", so the derivation uses them: move them to columns.uses")
             if not why:
-                for o in d["outputs"]:
-                    dest = os.path.join(run_dir, o)
-                    os.makedirs(os.path.dirname(dest), exist_ok=True)
-                    shutil.copyfile(os.path.join(runs[0]["work"], o), dest + ".tmp")
-                    os.replace(dest + ".tmp", dest)
-                entry.update(ok=True, code=None, outputs={o: _sha(os.path.join(run_dir, o)) for o in d["outputs"]})
-                rep["ran"].append(sid)
+                try:
+                    published = _publish_outputs(runs[0]["work"], run_dir, d["outputs"])
+                except (ValueError, OSError) as e:
+                    why.append(f"outputs not published: {e}")
+                    entry["code"] = "derivation_output_unsafe"
+                else:
+                    entry.update(ok=True, code=None, outputs=published)
+                    rep["ran"].append(sid)
         finally:
             for r in runs:
                 shutil.rmtree(r["work"], ignore_errors=True)
@@ -1606,12 +1646,7 @@ def derive(run_dir: str, unsandboxed_ok: bool = False, limits: dict | None = Non
             rep["ok"] = False
             rep["problems"].append({"code": entry["code"], "id": sid, "claim": f"derivation {sid}: {entry['reason']}"
                                     + (f" | stderr: {entry['stderr_tail'][-400:]}" if entry["stderr_tail"] else "")})
-    for sid, e in old.items():                 # a derivation no longer declared: its outputs go
-        if sid not in entries:
-            for o in (e or {}).get("outputs") or {}:
-                p = os.path.join(run_dir, o)
-                if o.startswith(DERIVED_PREFIX) and os.path.isfile(p):
-                    os.remove(p)
+    _retire_outputs(run_dir, old, entries)
     _write_json(run_dir, DERIVATIONS_RECORD, {"version": 1, "producer": "scripts/pipeline.py derive",
                                               "declaration_sha256": _sha(os.path.join(run_dir, DERIVATIONS)),
                                               "derivations": entries})
@@ -2394,6 +2429,50 @@ def _self_test() -> int:
     except Exception as e:  # noqa: BLE001 -- before the runner exists (step α) this is the failure
         print(f"FAIL DI derivation tests: {type(e).__name__}: {e}")
         ok(False, f"DI derivation tests: {type(e).__name__}: {e}")
+    # PL-RW3 (round 4, P1-1): retiring outputs of a derivation no longer declared never removes outside the run dir
+    with tempfile.TemporaryDirectory() as root:
+        rd = os.path.join(root, "a", "b", "run")
+        os.makedirs(os.path.join(rd, "data", "derived"))
+        victim = os.path.join(root, "victim.md")
+        open(victim, "w").write("keep me")
+        keep = os.path.join(rd, "data", "derived", "old.csv")
+        open(keep, "w").write("old\n")
+        rel = "data/derived/" + os.path.relpath(victim, os.path.join(rd, "data", "derived"))
+        try:
+            _retire_outputs(rd, {"gone": {"outputs": {rel: "x", "data/derived/old.csv": "y"}}}, {})
+            r = None
+        except NameError as e:
+            r = e
+        ok(r is None and os.path.exists(victim) and not os.path.exists(keep),
+           f"PL-RW3 an old record's ../ output name is not removed outside the run dir; a real retired output is ({r})")
+    # PL-RW1/2 (run console review round 3, P1-2): harness publication in a run dir never follows a link
+    with tempfile.TemporaryDirectory() as rd, tempfile.TemporaryDirectory() as out:
+        victim = os.path.join(out, "victim")
+        open(victim, "w").write("untouched")
+        os.makedirs(os.path.join(rd, "data"))
+        os.symlink(victim, os.path.join(rd, "data", "derivations_record.json.tmp"))
+        try:
+            _write_json(rd, "data/derivations_record.json", {"x": 1})
+        except (ValueError, OSError):
+            pass
+        ok(open(victim).read() == "untouched", "PL-RW1 a planted .tmp link is not written through by _write_json")
+        work = os.path.join(rd, "_work")
+        os.makedirs(os.path.join(work, "data", "derived"))
+        os.makedirs(os.path.join(rd, "data", "derived"))
+        secret = os.path.join(out, "secret.csv")
+        open(secret, "w").write("SECRET\n")
+        os.symlink(secret, os.path.join(work, "data", "derived", "a.csv"))
+        open(os.path.join(work, "data", "derived", "b.csv"), "w").write("b\n")
+        os.symlink(victim, os.path.join(rd, "data", "derived", "b.csv.tmp"))
+        res = None
+        try:
+            res = _publish_outputs(work, rd, ["data/derived/a.csv", "data/derived/b.csv"])
+        except (ValueError, OSError, NameError) as e:
+            res = e
+        a = os.path.join(rd, "data", "derived", "a.csv")
+        ok(not isinstance(res, NameError) and open(victim).read() == "untouched"
+           and not (os.path.exists(a) and "SECRET" in open(a).read()),
+           f"PL-RW2 derivation outputs are published without following a link in the work dir or a planted .tmp ({res})")
     if fails:
         print("SELF-TEST FAILURES:")
         for f in fails:

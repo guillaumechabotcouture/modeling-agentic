@@ -1,9 +1,12 @@
 # v2: the run console, a local page for the owner of a run (design note)
 
 **Status:** written before the code (2026-11-02), branch `run-console`, PR into `v2`. v0: one Python
-module (`scripts/run_console.py`) and one HTML file (`scripts/run_console.html`). Nothing in the
-stage machine, the gate or the sign-off code changes. The console reads run artifacts, and it changes
-a run only through the existing sign-off commands.
+module and one HTML file. Nothing in the stage machine, the gate or the sign-off code changes. The
+console reads run artifacts, and it changes a run only through the existing sign-off commands.
+**Review update (PR after #124):** the console now lives in `tools/run_console/` (`run_console.py`,
+`run_console.html`, `run_console.js`), see §11, and the sign-off commands gained the content checks the
+console relies on (`stage_machine.py sign --expect-sha256`, `run_cluster.py sign --label --run
+--expect-spec-sha256`).
 
 ## 1. Who it is for, and what it replaces
 
@@ -106,7 +109,8 @@ Known limits, recorded as open items:
 - `stage_machine.OWNER_LIFECYCLE_WIRED` is `False` on `v2`, so a v2 run does not reach
   OWNER_DECISION today. The card is built from the request file whenever one is pending, so it will work
   once the lifecycle is wired.
-- Remote spec sign-off: `worker_side.sign_side` signs `decision_brief.py` when no scope request is
+- (Fixed in the review PR, §11: a v2 run's remote spec is signed through `stage_machine.py sign
+  --expect-sha256`.) Remote spec sign-off: `worker_side.sign_side` signed `decision_brief.py` when no scope request is
   pending. A v2 run with a spec and no brief needs `stage_machine.py sign` on the worker. That is a
   harness change, not made here; until then the console shows the CLI's refusal.
 
@@ -123,10 +127,13 @@ title. Inside it the runs form a lineage ordered by spec sign-off time, then eng
 history; the sidebar shows the newest on top. Each row shows a short label (the folder's first token:
 `F2_baseline` is "F2" when that is unique), a status chip (completed, failed, stopped, running, waiting),
 the headline number, and one line: the relation to the run before it and the scenario. The relation is
-*amended + re-signed* when the signed spec's sha differs, *resumed* when the history has a FINAL → stage
-transition on the same spec, and *relaunched* otherwise. The scenario is a structured diff of the spec's
-lineage fields (`horizon`, `objective.horizon`, `objective.delivery`, `decision_units.engine_attributes`,
-`decision_units.defaults_accepted` keys, `constraints`, `analysis.decision_tests` ids), shown as a short
+*related run (inferred)* when the spec sha differs (the harness records no parent run id, so the link is
+inferred from the question and the order), *resumed* when the history has a FINAL → stage
+transition on the same spec sha, and *relaunched* otherwise. "Same signed spec" is printed only when the
+shas are equal. The scenario is a structured diff of the spec's
+lineage fields (`horizon`, `objective.outcome`, `objective.horizon`, `objective.delivery`,
+`decision_units.engine_attributes`, `decision_units.defaults_accepted` keys, `constraints`,
+`analysis.decision_tests` by id with their values), shown as a short
 phrase; the sign-off note is its tooltip. The selected run expands to its engine and version (from
 `engine_choice.json`), why it ended, outcome with interval and the largest package-component shift
 against the nearest earlier run with an `allocation.csv`, model spend, spec sha, sign-off time and
@@ -245,7 +252,7 @@ ready to become a learning-loop PR. The console never edits code or the spec.
   The outputs are shown as text; the first status line is parsed into cluster states. Structured
   fields (workers, target, quota refusals) need a `--json` output on `run_cluster.py` (open item).
 
-## 10. Tests (written first, `python3 scripts/run_console.py --self-test`)
+## 10. Tests (written first, `python3 tools/run_console/run_console.py --self-test`)
 
 A synthetic run dir with toy numbers (no licensed data):
 
@@ -264,10 +271,155 @@ A synthetic run dir with toy numbers (no licensed data):
 | RC15 | lineage on a toy lineage of three runs plus two staging copies: one project, order, drafts, relations, the spec diff and its phrase, engine version, chip and end reason, package shift, compare, `/api/runs` projects and `/api/compare` |
 | RC16 | every term the page marks, every gate action, rule and severity has a definition and a source; JSON only for anchors and request bodies; done-when rows join gate status and blocker; the summary's order, intervals and sources; reused batch points |
 | RC17 | the keys the page reads from `/api/runs` are served; errors show in a banner; fetches time out |
-| RC18 | parsed artifacts are cached by mtime and size and re-read when rewritten |
+| RC18 | parsed artifacts are cached by mtime, size, inode and ctime and re-read when rewritten |
 | RC19 | done-when patterns as plain alternatives; component names from the question; project title; operator notes newer than the run; decision-test units |
 | RC20 | `--mirror` with `--roots`: the mirrored run joins the same project's lineage |
 | RC14 | live vs finished: an ETA and live core-seconds only for a fresh progress record on an unfinished run; a progress record left on a finished run, or a stale one, is interrupted; the headline number |
 
 Plus one real end-to-end check, not part of the self-test: start the server on a toy run, hit the
 endpoints, and send one real chat message (spend capped at $1, reported in the PR).
+
+## 11. Review of PR #124 (Codex): what changed
+
+Each finding was reproduced by a failing self-test first (RV1-RV17 in `tools/run_console/run_console.py`, RS1-RS5
+in `cloud/run_cluster.py`, SG11-SG12 in `toolkit/spec/signoff.py`, T70 in `agents/stage_machine.py`).
+
+- **Artifacts are untrusted.** Agents write them. The page script is a separate file under a CSP with no inline
+  script (`script-src 'self'; connect-src 'self'`); every value in an HTML attribute is `esc()` or `ref()` (an
+  index into a JS table: anchors and decision bindings never round-trip through attributes); a served artifact
+  has a sandbox CSP. RV1a lints every `${...}` inside an attribute of the page's templates.
+- **Reads** go through one confined reader (`confined()`): no absolute path, no `..`, no credential file, no
+  link that resolves outside the run dir. The harness readers that open fixed names (`stage_machine.load_state`,
+  `signoff.status`, `scope_signoff`) are pre-checked for links out. Repo files (the page) are read by name.
+- **Writes** (`owner/`, `<root>/_drafts/`, `<root>/_owner/`) open each directory with `O_NOFOLLOW` relative
+  to its parent's fd and the file with `O_NOFOLLOW`; a link or a file with other hard links is refused.
+- **Decisions are bound to what was shown.** Each decision card carries an HMAC ticket over (run dir, card,
+  content); the page sends it with the run id and the content it displayed, and the server refuses a mismatch.
+  The content is then checked again by the command, atomically: `stage_machine.py sign --expect-sha256`
+  (toolkit `signoff.sign` hashes the bytes once and records and copies those bytes), and scope answers keyed
+  by the fingerprints shown, which `scope_signoff.sign` already binds (a changed declaration has a new
+  fingerprint and so no answer). The page drops stale `/api/run` answers (request sequence) and disables
+  decisions while a run loads; an answer being written survives a refresh, keyed by its ticket.
+- **Remote answers name their run.** `run_cluster.py <config> sign <answers> --label L --run RUN
+  [--expect-spec-sha256 SHA] <note>`; `worker_side.sign_side` refuses when the newest run on that label is not
+  RUN, and signs a v2 spec through `stage_machine.py sign --expect-sha256` (a v2 spec without the sha is
+  refused). The label comes from `--remote-label` or the mirror layout `<label>/runs/<run>`; anything else is
+  refused, not guessed. A mirror is classified by path containment, whatever root found it.
+- **Mirror freshness.** The sidebar shows the last successful sync and failures; the mirror is stale with no
+  successful sync yet, after 2 failed syncs in a row, or with no success within 3 sync periods, and remote
+  approval is then refused (page and server). Without `--sync-cmd` freshness is unknown and said so; the remote
+  commands' own checks (run name, sha, fingerprints) still apply. Each sync clears the parse cache.
+- **Chat cost.** Each message reserves its worst case under the lock before its call: input tokens from
+  `messages.count_tokens` (else the UTF-8 byte length, an upper bound), every input token as a 5-minute cache
+  write and a full `max_tokens` of output, on Opus 5.5 ($4/$20, writes $5) and again on the refusal fallback
+  (Opus 5 / 4.8 rates, $5/$25, writes $6.25), from the claude-api skill's price table. A failed stream charges
+  its partial usage when the SDK has a snapshot, else keeps the reservation; a reply served by a fallback keeps
+  the reservation. One run's turns are serialized, so each carries the turns before it.
+- **Four decision-test states**: changed, unchanged, not run, error (cards, compare, chat context).
+- **Evidence and citations.** Feedback stores the anchored file's sha256, round and a short excerpt, shown on
+  the card and in the digest. An anchored chat message carries that excerpt (or the figure's caption). Each
+  `[[file#anchor]]` in a reply is marked checked, anchor not in context, or unchecked (the file's content was
+  not sent). The harness overwrites `critique_<reviewer>.yaml` each round, so earlier rounds are on disk only if
+  a run keeps per-round files; the console lists every `critique_*.yaml` it finds, by its `round`.
+- **Batch reuse.** `scripts/compute.py code_fingerprint` hashes `scripts/` and `toolkit/` whole, so a console
+  edit invalidated every stored engine batch. The smallest correct fix is to move the console out of the
+  fingerprinted directories (to `tools/run_console/`) rather than add a presentation-file exclude list inside
+  the fingerprint, which every later presentation file would have to remember. `scripts/self_tests.py` now
+  includes `tools/` in its discovery scope (ST12). The move changes the fingerprint once (the console's files
+  leave the hash), so batches stored before this PR are recomputed once.
+
+Open items (not built here): a harness read model for events and lineage (parent run ids recorded by the
+harness instead of inferred; one event log instead of rebuilding the story from files), atomic mirror
+generations (sync into a new directory and swap, so a read never sees a half-synced run), per-round critique
+archives, and pricing a fallback's per-model usage split instead of keeping the reservation.
+
+## 12. Review round 2 (Codex, on #129)
+
+Each finding reproduced first (RW1-RW11, SP-RW1-4, SG13-18, SO23, RS6-8, T71).
+
+- **Engine references are an allowlist (harness).** `toolkit/spec/schema.py check_engine_ref` refuses, before any
+  import, an engine reference whose module is not a file under `toolkit/engines/` (plus the repo's
+  `toolkit.spec.priors:ToyPriorEngine` test engine; self-tests may add in-process `TEST_ENGINE_REFS`);
+  `engine_class` checks the Engine contract before instantiation. `load_engine`, the signed candidates, the
+  engine choice, `analysis_backend._card` and `toolkit/engines/benchmark.load_engine` all go through it. A spec
+  naming `subprocess:Popen` or `os:system` is reported invalid and runs nothing. Other dotted-path imports in the
+  repo are fixed module names or benchmark packs shipped under `toolkit/engines/` (repo files, not artifacts);
+  `scripts/compute.py` runs the run's own model code by design.
+- **The sign commands write no-follow and atomically.** `scripts/lib/safe_io.py` gains `read_nofollow` and
+  `write_nofollow` (each component opened with `O_NOFOLLOW` relative to its parent's fd; atomic publish through a
+  temporary file and a rename relative to the directory fd; a hard-linked file is refused before truncation).
+  `toolkit/spec/signoff.sign`, `decision_brief.sign` and `scope_signoff.sign` use them; the spec (and each frozen
+  brief file) is read once and validated, hashed and copied from those bytes.
+- **Reads have no check-then-open window.** The console reads every artifact through `read_nofollow`; a cached
+  parse is reused only for the same inode, mtime, size and ctime as that read. A link anywhere under the run dir
+  is not followed (a linked artifact shows as an error).
+- **The console has its own read model** for the spec sign-off and the scope request (`spec_view`, `inbox`); it
+  no longer calls `signoff.status`, `schema.load` or the scope loaders, which can follow paths the artifacts name.
+  `signoff.derived_changed` reports a derivation output outside the run dir as changed and never hashes it. A batch
+  summary's `fn` outside the run dir (or the repo), or a link under `models/` or `data/` leaving both, is not
+  passed to `compute.code_fingerprint`.
+- **One approval snapshot.** The spec card shows the sheet read once, with the sheet's sha256, the spec's and the
+  derivation record's ("none" when absent). The ticket binds all three and `stage_machine.py sign`
+  (`--expect-sha256`, `--expect-derivations-sha256`, `--expect-sheet-sha256`) checks each. Remote: `run_cluster.py
+  sign --action spec|scope` with the same hashes; an expected spec sha always selects sha-bound spec signing, and a
+  spec action without one fails closed.
+- **Chat:** an interrupted stream keeps its whole reservation (partial usage is a lower bound). The citation index
+  holds only the lines the prompt kept.
+- **Evidence** is captured when a card is rendered (the blocker's or figure's file sha, round, excerpt), sealed with
+  a per-process HMAC; feedback and chat store that snapshot when its seal checks, else one captured at submit time
+  (marked `captured: submit`).
+- **Lineage:** every relation is marked "(inferred)" until the harness records parent run ids.
+
+## 13. Review round 3 (Codex, on #129)
+
+Trust model: the harness must hold when agent-written artifacts in a run dir are hostile (specs, derivation records
+and outputs, links, temporary files). Two shared mechanisms instead of point patches:
+
+- **One import guard** (`toolkit/import_guard.py`). Every module or attribute name that comes from a spec, a
+  benchmark pack or a run artifact is imported through it, with an allowlist policy per kind: engines (modules under
+  `toolkit/engines/`, plus `toolkit.spec.priors:ToyPriorEngine`), oracles (`toolkit.engines.*.oracles` and
+  `toolkit.engines.benchmark`'s self-test generator), calibrators (`toolkit.analysis.calibration` and modules under
+  `toolkit/engines/`). The module must be a file of the repo, checked before anything is imported; private
+  attributes are refused. `schema.load_engine`/`engine_class`/`binding_for_ref` (reached by the sign-off sheet),
+  the legacy `spike/analysis/spec.py` loader, and the benchmark oracle and calibrator imports (including the
+  calibrator code digest) go through it. `scripts/import_audit.py --self-test` greps every tracked Python file for
+  `import_module(`, `__import__(` and `spec_from_file_location(` with a non-literal argument; each must be in the
+  guard or listed in its REVIEWED table with the reason its name cannot come from an artifact (exact counts per
+  file, so a new site fails CI).
+- **One publisher** (`scripts/lib/safe_io.py`): harness writes in a run dir go through `write_nofollow` (no link
+  followed at any component, a random temporary name, atomic rename). Round 3 moves the derivation record
+  (`pipeline._write_json`), the derivation outputs (`pipeline._publish_outputs`: read with no link followed in the
+  work dir, published atomically) and the sign-off sheet (`signoff.write_sheet`, called by the stage machine) onto it.
+
+Also: `compute.code_fingerprint(confined=True)` hashes the run's files through no-follow fds and refuses a link
+anywhere under `models/` or `data/` (the entries themselves included) or a function file outside the run dir and
+the repo; with no links its output is byte-identical to the default, which is unchanged (so batch reuse is
+unchanged). The console uses it. `signoff.derived_changed` reads the record and hashes every output through
+no-follow fds. The sheet writer records the spec and derivation-record hashes it was generated from in the sheet's
+last line; the console marks a sheet whose sources no longer match as stale and disables approval, and the signer
+refuses it. The brief sign-off validates the captured `success_criteria.yaml` bytes. Evidence seals carry the
+canonical run id and are checked against the run they are submitted to; the page clears the composer's anchor when
+the run changes; gate cards and the figure side panel carry their render-time snapshot; a blocker's own `evidence`
+field is kept and the snapshot is stored under `snapshot`.
+
+## 14. Review round 4 (Codex, on #129)
+
+- **Retired derivation outputs** (`pipeline._retire_outputs`): names from the previous derivation record must be
+  plain relative paths under `data/derived/` (checked by parts, so `data/derived/../../x` is refused) and are
+  unlinked relative to a no-follow directory fd (`lib.safe_io.remove_nofollow`).
+- **More writers on `lib.safe_io`**: run_state.json (`save_state`), the machine's JSON and YAML records, the report
+  and deliverable, the evidence and pipeline stubs, the lead's sign-off record, staged inputs, the findings ledger,
+  analysis artifacts and the manifest, compute batch results, summaries, the partial journal (append through
+  `open_append_nofollow`) and the batch lock, and the scope sign-off ledger, trace and request.
+  `scripts/write_audit.py --self-test` scans the v2 harness modules for write-mode `open(`, write-flag `os.open(`,
+  `shutil.copy*/move/rmtree`, `os.replace/rename` and `os.remove/unlink` outside self-test code; each remaining site
+  is in its reviewed table with a reason and an exact count. The table names the run-dir writes still on plain opens
+  as open items (fix loop records, analysis batch files, the compute ledger, a few task outputs, pipeline aside
+  copies); the counts keep new ones out.
+- **The engine policy resolves only engine classes** (a class with describe/parameters/run); the spike loader builds
+  through `schema.engine_class`.
+- **The sign-off sheet is rendered from the captured bytes it hashes** (the spec and the derivation record, read once).
+- **Feedback controls and the composer are bound to the run they were taken in**: a control left from another run is
+  refused on the page, and the server refuses a snapshot that does not check for the run and anchor instead of
+  replacing it with fresh evidence.
+- **Figures are served by their snapshot hash** (`/api/file?...&sha=`); a file whose bytes changed is refused.
