@@ -199,6 +199,47 @@ def _self_test() -> int:
         ok("tools/run_console/run_console.py" in lrun, "ST12 a module under tools/ (the run console) is discovered")
     except RuntimeError as e:
         fails.append(f"ST11 git ls-files failed: {e}")
+    # ST13: the per-test watchdog. A hung self-test (with a child of its own) is killed as a process group, named and
+    # reported failed, and the others still run and pass.
+    import contextlib
+    import io
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        os.makedirs(os.path.join(td, "scripts"))
+        pidf = os.path.join(td, "child.pid")
+        with open(os.path.join(td, "scripts", "hang.py"), "w") as f:
+            f.write("import subprocess, sys, time\n"
+                    "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])\n"
+                    f"open({pidf!r}, 'w').write(str(c.pid))\n"
+                    "time.sleep(300)\n")
+        for name in ("a.py", "b.py"):
+            with open(os.path.join(td, "scripts", name), "w") as f:
+                f.write("print('OK: all self-test cases passed.')\n")
+        buf, t0 = io.StringIO(), time.time()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = run_all(sys.executable, 2, repo=td, per_test_timeout=3.0,
+                             files=["scripts/a.py", "scripts/hang.py", "scripts/b.py"])
+        except Exception as e:  # noqa: BLE001 -- reported in the case
+            rc = f"{type(e).__name__}: {e}"
+        dt, out = time.time() - t0, buf.getvalue()
+        child_alive = None
+        if os.path.exists(pidf):
+            pid = int(open(pidf).read())
+            for _ in range(50):
+                try:
+                    os.kill(pid, 0)
+                    child_alive = True
+                except ProcessLookupError:
+                    child_alive = False
+                    break
+                time.sleep(0.1)
+            if child_alive:
+                os.kill(pid, 9)
+        ok(rc == 1 and dt < 60 and "scripts/hang.py" in out and "timed out" in out and child_alive is False
+           and "2/3 self-tests passed" in out,
+           f"ST13 a hung self-test is killed with its process group, named and failed; the rest pass "
+           f"(rc {rc!r}, {dt:.0f}s, child alive {child_alive}): {out[-400:]!r}")
     for f in fails:
         print(f"FAIL: {f}")
     if fails:

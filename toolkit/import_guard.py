@@ -149,6 +149,15 @@ def _describe(kind: str) -> str:
     return "; ".join(bits)
 
 
+def _ref_state(ref: str) -> str:
+    """IG6 worker: whether this process allows `ref` (a spawned worker)."""
+    try:
+        check_ref("engine", ref)
+        return "allowed"
+    except ImportRefused:
+        return "refused"
+
+
 def _self_test() -> int:
     fails = []
 
@@ -195,6 +204,41 @@ def _self_test() -> int:
         r = True
     allow_for_test("calibrator", "_ig_test_mod")
     ok(r and resolve("calibrator", "_ig_test_mod:f")() == 1, "IG3 a self-test's own module needs allow_for_test")
+    # IG5 (Codex P1 on #133): no environment variable enables a test-only reference; a fresh process with the former
+    # MA_IMPORT_GUARD_TEST_REFS set refuses them, and a pool started there carries no registration to its workers.
+    import json
+    import subprocess
+    toys = list(TEST_ONLY_REFS["engine"])
+    code = ("import sys, json; sys.path.insert(0, %r)\n"
+            "from toolkit import import_guard as G\n"
+            "out = {}\n"
+            "for r in %r:\n"
+            "    try:\n"
+            "        G.check_ref('engine', r); out[r] = 'allowed'\n"
+            "    except G.ImportRefused:\n"
+            "        out[r] = 'refused'\n"
+            "out['pool'] = repr(getattr(G, 'pool_kwargs', lambda: 'missing')())\n"
+            "print(json.dumps(out))") % (ROOT, toys)
+    env = dict(os.environ, MA_IMPORT_GUARD_TEST_REFS=json.dumps([f"engine|{r}" for r in toys] + toys))
+    res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, cwd=ROOT)
+    got = json.loads(res.stdout or "{}") if res.returncode == 0 else {}
+    ok(got and all(got.get(r) == "refused" for r in toys) and got.get("pool") == "{}",
+       f"IG5 the environment enables no test-only reference, and a production pool gets no initializer: "
+       f"{got or res.stderr[-300:]}")
+    # IG6: a registration made in this process reaches a worker only through the explicit pool initializer
+    from concurrent.futures import ProcessPoolExecutor
+    import multiprocessing as mp
+    try:
+        allow_test_refs("engine", toys[:1])
+        kw = pool_kwargs()
+        with ProcessPoolExecutor(1, mp_context=mp.get_context("spawn"), **kw) as ex:
+            with_init = ex.submit(_ref_state, toys[0]).result(60)
+        with ProcessPoolExecutor(1, mp_context=mp.get_context("spawn")) as ex:
+            without = ex.submit(_ref_state, toys[0]).result(60)
+        ig6 = (with_init, without)
+    except Exception as e:  # noqa: BLE001 -- reported in the case
+        ig6 = (f"{type(e).__name__}: {e}"[:200], None)
+    ok(ig6 == ("allowed", "refused"), f"IG6 a worker allows a test reference only with the pool initializer ({ig6})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

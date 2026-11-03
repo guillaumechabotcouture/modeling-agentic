@@ -695,6 +695,43 @@ def _self_test() -> int:
            and read_nofollow(d, "link")[0] == b"new",
            f"SI-NF links and hard links are refused; an atomic write replaces a link, never follows it ({res})")
 
+    # SI-AR (follow-up to #133): several processes creating then appending to the same new files at once. Every line
+    # is written exactly once and no call raises (macOS returned ENOENT from openat(O_CREAT) under this race).
+    import multiprocessing as _mp
+    with tempfile.TemporaryDirectory() as d:
+        n_proc, n_app, n_names = 4, 400, 40
+        jobs = [(d, mode, w, n_app, n_names) for mode in ("write", "open", "text") for w in range(n_proc)]
+        with _mp.get_context("spawn").Pool(n_proc) as pool:
+            errs = [e for got in pool.map(_append_stress, jobs) for e in got]
+        lines = []
+        for mode in ("write", "open", "text"):
+            for k in range(n_names):
+                p = os.path.join(d, mode, f"f{k}.log")
+                lines += open(p).read().splitlines() if os.path.exists(p) else []
+        want = {f"{mode} {w} {k}" for mode in ("write", "open", "text") for w in range(n_proc) for k in range(n_app)}
+        ok(not errs and len(lines) == len(want) and set(lines) == want,
+           f"SI-AR {n_proc} processes x {n_app} appends to new files: every line once, no exception "
+           f"({len(errs)} errors, e.g. {errs[:2]}; {len(lines)} of {len(want)} lines)")
+    # SI-AR2: the append paths keep refusing links and hard links (the retry never opens one)
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+        open(os.path.join(out, "v"), "w").write("outside")
+        os.symlink(os.path.join(out, "v"), os.path.join(d, "link"))
+        os.symlink(out, os.path.join(d, "ldir"))
+        os.link(os.path.join(out, "v"), os.path.join(d, "hard"))
+        res = []
+        for fn in (lambda: open_append_nofollow(d, "link").close(), lambda: open_append_nofollow(d, "ldir/new").close(),
+                   lambda: open_append_nofollow(d, "hard").close(), lambda: write_nofollow(d, "link", b"x", append=True),
+                   lambda: write_nofollow(d, "hard", b"x", append=True),
+                   lambda: append_text(os.path.join(d, "ldir", "new"), "x", d),
+                   lambda: append_text(os.path.join(d, "link"), "x", d)):
+            try:
+                fn()
+                res.append(False)
+            except LinkRefused:
+                res.append(True)
+        ok(all(res) and open(os.path.join(out, "v")).read() == "outside" and not os.path.exists(os.path.join(out, "new")),
+           f"SI-AR2 appends through a link, a linked directory or a hard link are refused ({res})")
+
     if failures:
         print("FAIL:", file=sys.stderr)
         for fl in failures:
@@ -702,6 +739,25 @@ def _self_test() -> int:
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _append_stress(job) -> list:
+    """SI-AR worker (a spawned process): `n` appends cycling over `names` new files under <d>/<mode>/."""
+    d, mode, w, n, names = job
+    errs = []
+    for k in range(n):
+        rel, line = f"{mode}/f{k % names}.log", f"{mode} {w} {k}\n"
+        try:
+            if mode == "write":
+                write_nofollow(d, rel, line.encode(), append=True)
+            elif mode == "open":
+                with open_append_nofollow(d, rel) as f:
+                    f.write(line)
+            else:
+                append_text(os.path.join(d, rel), line, d)
+        except Exception as e:  # noqa: BLE001 -- the case reports every failure
+            errs.append(f"{type(e).__name__}: {e}"[:200])
+    return errs
 
 
 if __name__ == "__main__":

@@ -970,7 +970,21 @@ def _self_test() -> int:
                 pass
         ok(hasattr(G, "allow_test_refs") and not bad,
            f"EP41 a test registration can enable only the named self-test toy engines: accepted {bad}")
-    guard("EP40-EP41 test-only toy engines", guard_cases)
+        # EP42 (Codex P1 on #133): the environment never enables anything. A production entry point
+        # (toolkit/analysis/run.py) with both former variables set refuses the toy engine, and no call log is written.
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as logs:
+            yaml.safe_dump(toy_raw(d), open(os.path.join(d, "decision_spec.yaml"), "w"), sort_keys=False)
+            env = {k: v for k, v in os.environ.items() if not k.startswith(("MA_IMPORT_GUARD", "MA_TOY_SPEC"))}
+            env.update(MA_IMPORT_GUARD_TEST_REFS=json.dumps(sorted(f"engine|{r}" for r in TOYS.REFS) + list(TOYS.REFS)),
+                       MA_TOY_SPEC_LOG_DIR=logs)
+            res = subprocess.run([sys.executable, os.path.join(ROOT, "toolkit", "analysis", "run.py"), d, "--unsigned"],
+                                 capture_output=True, text=True, env=env, cwd=ROOT, timeout=600)
+            err = res.stdout[-400:] + res.stderr[-400:]
+            ok(res.returncode != 0 and "refused outside a self-test" in err and not os.listdir(logs)
+               and not glob.glob(os.path.join(d, "calls.*.jsonl")),
+               f"EP42 with MA_IMPORT_GUARD_TEST_REFS and MA_TOY_SPEC_LOG_DIR set, a production run refuses the toy "
+               f"engine and writes no call log (exit {res.returncode}; logs {os.listdir(logs)}): {err[-300:]!r}")
+    guard("EP40-EP42 test-only toy engines", guard_cases)
 
     # ------------------------------------------------------------ emulator path: application, UQ, decision test, reports
     def emulator_cases():
