@@ -212,6 +212,10 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     A.guard("point plan", [plan], events0)   # Codex P1-6; every later evaluation is guarded too (r2 P1-3)
     on_plan = []
     point = A.summary(plan, out0, cost0)
+    from toolkit.engines.contract import engine_identity
+    # Codex r3: the analysis's full engine identity (code, params, config), on both evaluation paths, so later steps
+    # (the trajectory step) can be checked against it without batch rows
+    point.update(engine_identity=engine_identity(eng))
     point.update(plan=plan, n_units=len(A.ids), solver={k: sol[k] for k in ("status", "method", "objective", "cost")},
                  interactions=interactions(A, out0), rule=decision_rule(A, out0, plan),
                  model_corrections={"n": len(events0), "on_plan": on_plan, "kinds": sorted({e["kind"] for e in events0}),
