@@ -1,6 +1,6 @@
-# Malaria engine v0.7: benchmark notes
+# Malaria engine v0.8: benchmark notes
 
-Engine `malaria-starsim` v0.7 (workstream A of architecture v2). Design note:
+Engine `malaria-starsim` v0.8 (workstream A of architecture v2). Design note:
 `docs/design/v2a-malaria-engine.md`. Every number in the tables block is rendered from
 `benchmarks/results.yaml`, `benchmarks/fitted.yaml`, `benchmarks/b15_mechanisms.yaml`,
 `benchmarks/equilibration.yaml` and `benchmarks/runtime.yaml`, with the spike
@@ -8,16 +8,18 @@ Engine `malaria-starsim` v0.7 (workstream A of architecture v2). Design note:
 `results_v0.3-r2.yaml`, `results_v0.3.yaml`, `results_v0.4.yaml`) beside them, by
 `benchmarks/render_notes.py`. Reproduce with `bash toolkit/engines/malaria/benchmarks/validate_once.sh` on a VM.
 
-**v0.7 and v0.6 numbers are v0.5's.** The v0.6 changes act only when a horizon gives a delivery period or a unit sets
-`itn_routine_interval`. The v0.7 change acts only when a unit sets `smc_routine = 1`. The pack and the evidence use
-none of them, so the pack's results, fit, equilibration and guess-sensitivity files keep the numbers v0.5 computed.
-Their identity fields were re-stamped twice by `benchmarks/restamp_proof.py`:
+**v0.8, v0.7 and v0.6 numbers are v0.5's.** The v0.6 changes act only when a horizon gives a delivery period or a unit
+sets `itn_routine_interval`. The v0.7 change acts only when a unit sets `smc_routine = 1`. The v0.8 change adds two
+figure hooks (`schedule`, `run_series`) and leaves `run` and `run_batch` unchanged. The pack and the evidence use none
+of these, so the pack's results, fit, equilibration and guess-sensitivity files keep the numbers v0.5 computed.
+Their identity fields were re-stamped three times by `benchmarks/restamp_proof.py`:
 - for v0.6, after the proof found v0.5 and v0.6 outputs identical;
-- for v0.7, after it found v0.6 and v0.7 outputs identical.
+- for v0.7, after it found v0.6 and v0.7 outputs identical;
+- for v0.8, after it found v0.7 and v0.8 outputs identical (run on a Coiled VM in the IDM default workspace).
 
-Both proofs ran on the pack's settings and the evidence cases (`benchmarks/restamp_proof.yaml` holds the latest).
-Each file's `restamped:` record holds the v0.7 re-stamp, with the v0.6 record under `previous`. A Coiled run of
-`validate_once.sh` is open until it confirms them.
+All three proofs ran on the pack's settings and the evidence cases (`benchmarks/restamp_proof.yaml` holds the latest).
+Each file's `restamped:` record holds the v0.8 re-stamp, with the v0.7 and v0.6 records under `previous`. A Coiled run
+of `validate_once.sh` is open until it confirms them.
 
 ## v0.8 scope: the figure hooks, schedule() and run_series() (written before the v0.8 code)
 
