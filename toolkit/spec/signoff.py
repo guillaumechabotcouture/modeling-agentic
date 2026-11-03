@@ -570,6 +570,33 @@ def _self_test() -> int:
                "open ones")
     except Exception as e:  # noqa: BLE001 -- before the record and the sheet exist (step α) this is the failure
         ok(False, f"DI6/DI7/DI10 sign-off: {type(e).__name__}: {e}")
+    # IG-S3 (Codex on 08f96a9, P1): the sheet records the geometry evidence it shows; a boundary change after the
+    # sheet was generated refuses the sign-off, so no HIGH exception is approved against evidence nobody saw
+    try:
+        from toolkit.spec import geometry
+        with tempfile.TemporaryDirectory() as d:
+            geometry.toy_spec_with_boundaries(d, accept={"reciprocal_swap:0+1": "rows checked by the owner"})
+            write_sheet(d)
+            src = sheet_sources(open(os.path.join(d, SHEET)).read()) or {}
+            has = src.get("geometry_evidence_sha256") not in (None, "none")
+            bpath = os.path.join(d, "b.geojson")
+            orig = open(bpath).read()
+            g = json.loads(orig)
+            g["features"][5]["properties"]["note"] = "changed after the sheet"
+            open(bpath, "w").write(json.dumps(g))
+            try:
+                sign(d, "owner", note="n", expect_sheet_sha256=DB._sha(os.path.join(d, SHEET)))
+                refused = ""
+            except ValueError as e:
+                refused = str(e)
+            open(bpath, "w").write(orig)
+            rec = sign(d, "owner", note="n", expect_sheet_sha256=DB._sha(os.path.join(d, SHEET)))
+            appr = json.load(open(os.path.join(d, geometry.SIGNOFF_FILE))).get("approvals") or {}
+            ok(has and "geometry" in refused and rec and sorted(appr) == ["reciprocal_swap:0+1"],
+               f"IG-S3 the sheet records the geometry evidence; a boundary change after it refuses the sign-off, and the "
+               f"unchanged evidence signs with the approval ({has}; {refused[:90]}; {sorted(appr)})")
+    except Exception as e:  # noqa: BLE001 -- before the evidence is recorded (step α)
+        ok(False, f"IG-S3 the sheet binds the geometry evidence: {type(e).__name__}: {e}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

@@ -2462,6 +2462,34 @@ def _self_test_geometry(ok, td: str) -> None:
     import v2_sdk_tasks as SDK
     ok({GEO.ARTIFACT, GEO.SIGNOFF_FILE} <= set(SDK.HARNESS_FILES),
        "IG-M5 the check's record and the owner's geometry sign-off are harness files no task can write")
+    # IG-M6 (Codex on 08f96a9, P2): the spike signer reads the spec once (no link followed), then hashes and freezes
+    # that same content
+    import builtins
+    d6 = os.path.join(td, "ig6")
+    os.makedirs(d6)
+    try:
+        GEO.toy_spec_with_boundaries(d6)
+        opens, real_open, real_osopen = [], builtins.open, os.open
+
+        def bopen(f, *a, **k):
+            if str(f).endswith(AB.SPEC_FILE):
+                opens.append(str(f))
+            return real_open(f, *a, **k)
+
+        def oopen(f, *a, **k):
+            if str(f).endswith(AB.SPEC_FILE):
+                opens.append(str(f))
+            return real_osopen(f, *a, **k)
+        builtins.open, os.open = bopen, oopen
+        try:
+            rec6 = sign(d6, "owner", "n")
+        finally:
+            builtins.open, os.open = real_open, real_osopen
+        g6 = json.load(open(os.path.join(d6, GEO.SIGNOFF_FILE)))
+        ok(len(opens) == 1 and rec6["spec_sha256"] == signed_hash(d6) and (g6.get("declaration") or {}).get("enabled"),
+           f"IG-M6 the spike signer reads the spec once, then hashes and freezes that content ({len(opens)} opens)")
+    except Exception as e:  # noqa: BLE001 -- before the shared fixture exists (step α)
+        ok(False, f"IG-M6 the spike signer reads the spec once: {type(e).__name__}: {e}")
 
 
 def _self_test_derived(ok, td: str) -> None:

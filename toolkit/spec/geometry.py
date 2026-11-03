@@ -907,6 +907,32 @@ def _square(x0, y0, s):
     return [[x0, y0], [x0 + s, y0], [x0 + s, y0 + s], [x0, y0 + s], [x0, y0]]
 
 
+def toy_spec_with_boundaries(d: str, accept: dict | None = None) -> str:
+    """A schema-valid toy spec (toolkit/spec/schema.py toy_spec) whose units carry points, with a square per unit in
+    b.geojson declared in presentation.yaml; units 0 and 1 carry each other's points (one reciprocal swap).
+    `accept`: decision_units.geometry_accepted. Returns the spec path. For the sign-off and machine self-tests."""
+    import yaml
+    from toolkit.spec import schema as S
+    p = S.toy_spec(d)
+    raw = yaml.safe_load(open(p))
+    rows = open(os.path.join(d, "units.csv")).read().strip().split("\n")
+    feats, out = [], [rows[0] + ",lon,lat"]
+    for k, line in enumerate(rows[1:]):
+        x = k * 0.6
+        feats.append({"type": "Feature", "properties": {"fid": str(k)}, "geometry": {
+            "type": "Polygon", "coordinates": [[[x, 10], [x + 0.5, 10], [x + 0.5, 10.5], [x, 10.5], [x, 10]]]}})
+        j = {0: 1, 1: 0}.get(k, k)
+        out.append(f"{line},{j * 0.6 + 0.25:.3f},10.25")
+    open(os.path.join(d, "units.csv"), "w").write("\n".join(out) + "\n")
+    json.dump({"type": "FeatureCollection", "features": feats}, open(os.path.join(d, "b.geojson"), "w"))
+    yaml.safe_dump({"boundaries": {"path": "b.geojson", "feature_id": "fid"}},
+                   open(os.path.join(d, "presentation.yaml"), "w"))
+    if accept:
+        raw["decision_units"][ACCEPT_KEY] = accept
+    yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+    return p
+
+
 def toy_inputs(d: str, area_col: bool = True) -> dict:
     """A synthetic run dir: squares of 0.5 degrees near 10N and a units table with one clean unit, one edge-case point
     just outside its square, one reciprocal swapped pair (points and areas exchanged), one area mismatch, one unit
@@ -1065,6 +1091,16 @@ def _self_test_owner(ok, th) -> None:
            f"IG16 a link planted at the geometry record or the check's record is never read or written through: the "
            f"check fails closed, and the sign-off's atomic publish replaces the link ({str(r_link['reason'])[:60]}; "
            f"{str(r_run['reason'])[:60]})")
+    # IG17 (Codex on 08f96a9, P2): the sheet reads the check's record without following a link, and says so
+    with tempfile.TemporaryDirectory() as d:
+        toy_inputs(d)
+        outside = os.path.join(d, "outside.json")
+        json.dump({"status": "ran", "counts": {"points_checked": 999}, "findings": []}, open(outside, "w"))
+        os.makedirs(os.path.join(d, "data"), exist_ok=True)
+        os.symlink(outside, os.path.join(d, ARTIFACT))
+        txt = "\n".join(sheet_lines(d))
+        ok("999" not in txt and "link" in txt and "refused" in txt,
+           f"IG17 the sheet never reads the check's record through a link and shows the refusal ({txt[:140]!r})")
     # IG13 (Codex round 2): a signed spec with no geometry record is HIGH (signed before the check, or through a path
     # that skipped the freeze); the owner's approve creates the record (the migration path)
     for how in ("spec", "brief"):
