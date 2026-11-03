@@ -766,26 +766,93 @@ def _self_test_owner_cli(ok, td: str, trace, reg) -> None:
     lead_cmd = f"python3 scripts/decision_brief.py sign {td} --by lead --accept-proposed --note ok"
     ok(hook_denies("lead", lead_cmd) and hook_denies("owner", lead_cmd) and hook_denies(None, lead_cmd),
        "SO12b an explicit --by lead is refused too, in every mode: the harness signs the lead's answers")
-    # SO14 (focused check of #131, P1): a lead sign-off with a decision spec writes the geometry record and the signed
-    # copy of the spec; the harness signs it and registers those writes, so integrity attributes them
+    # SO14-SO17 (focused checks of #131): the lead's sign-off is the harness's action. SO14: it signs the answers the
+    # lead wrote in this turn (recorded by the real PostToolUse hook) and registers what signing wrote. SO15: only the
+    # lead may write the answers file, and the harness refuses one the lead did not write this turn. SO16: strict
+    # types. SO17: the lead is told the procedure (prompt, denial, a specific message when the file is missing).
+    la_name = getattr(_db, "LEAD_ANSWERS", "decision_brief_lead_answers.yaml")
     with tempfile.TemporaryDirectory() as d5:
         _geo.toy_inputs(d5)
         _y.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d5, "success_criteria.yaml"), "w"))
         _y.safe_dump(_db.example_brief(), open(os.path.join(d5, "decision_brief.yaml"), "w"))
+        la = os.path.join(d5, la_name)
+        tr5 = open(os.path.join(d5, "trace.jsonl"), "a")
+        hk5 = agents_pkg.create_hooks(d5, tr5, datetime.now(), registered_agents=reg, signoff="lead")
+        pre5, post5 = hk5["PreToolUse"][0].hooks[0], hk5["PostToolUse"][0].hooks[0]
+
+        def lead_write(text, who=None):
+            call = dict({"tool_name": "Write", "tool_input": {"file_path": la, "content": text}}, **(who or {}))
+            r = asyncio.run(pre5(call, "w5", None))
+            if (r.get("hookSpecificOutput") or {}).get("permissionDecision") == "deny":
+                return False
+            open(la, "w").write(text)
+            asyncio.run(post5(call, "w5", None))
+            tr5.flush()
+            return True
+        since = datetime.now()
         ig5 = ArtifactIntegrity(d5, process_check=lambda: set())
         try:
-            no_answers = harness_sign_brief_lead(d5, ig5)
-            _y.safe_dump({"accept_proposed": True, "note": "an adequate target for the question"},
-                         open(os.path.join(d5, getattr(_db, "LEAD_ANSWERS", "decision_brief_lead_answers.yaml")), "w"))
-            text = harness_sign_brief_lead(d5, ig5)
+            r_missing = harness_sign_brief_lead(d5, ig5, since)
+            open(la, "w").write("accept_proposed: true\nnote: written by a shell, not the Write tool\n")
+            r_unrecorded = harness_sign_brief_lead(d5, ig5, since)
+            lead_write("accept_proposed: \"false\"\nnote: a string, not a boolean\n")
+            r_string = harness_sign_brief_lead(d5, ig5, since)
+            lead_write("answers: {Q99: x}\nnote: an unknown question\n")
+            r_unknown = harness_sign_brief_lead(d5, ig5, since)
+            lead_write("accept_proposed: true\nnote: an adequate target\n")
+            open(la, "a").write("# edited after the lead's write\n")
+            r_edited = harness_sign_brief_lead(d5, ig5, since)
+            lead_write("accept_proposed: true\nnote: an adequate target for the question\n")
+            r_ok = harness_sign_brief_lead(d5, ig5, since)
             g5 = _y.safe_load(open(os.path.join(d5, _geo.SIGNOFF_FILE)))
             ev5 = [(e["file"], e["change"]) for e in ig5.check_now()]
-        except Exception as e:  # noqa: BLE001 -- before the harness action exists (alpha)
-            no_answers, text, g5, ev5 = "error", f"{type(e).__name__}: {e}", {}, ["error"]
-        ok(no_answers is None and _db.status(d5) == "signed" and (g5 or {}).get("signed_by") == "lead"
-           and ev5 == [] and "signed" in str(text).lower(),
-           f"SO14 lead mode: the harness signs the lead's answers file and registers what signing wrote (the geometry "
-           f"record, the signed copies); integrity attributes them ({ev5}; {str(text)[:80]})")
+        except Exception as e:  # noqa: BLE001 -- before the new contract exists (alpha)
+            r_missing = r_unrecorded = r_string = r_unknown = r_edited = r_ok = (None, f"{type(e).__name__}: {e}")
+            g5, ev5 = {}, ["error"]
+
+        def refused(r, needle):
+            return isinstance(r, tuple) and r[0] is False and needle in str(r[1])
+        ok(isinstance(r_ok, tuple) and r_ok[0] is True and _db.status(d5) == "signed"
+           and (g5 or {}).get("signed_by") == "lead" and ev5 == [],
+           f"SO14 the harness signs the answers the lead wrote this turn and registers what signing wrote; integrity "
+           f"attributes it ({ev5}; {r_ok})")
+        ok(refused(r_unrecorded, "not written by the lead") and refused(r_edited, "not written by the lead"),
+           f"SO15b an answers file with no record of the lead writing it this turn (a shell write, or edited since) is "
+           f"refused, with the reason ({r_unrecorded}; {r_edited})")
+        ok(refused(r_string, "accept_proposed") and refused(r_unknown, "Q99"),
+           f"SO16 strict types: accept_proposed must be a YAML boolean, answers a mapping of known question ids "
+           f"({r_string}; {r_unknown})")
+        ok(refused(r_missing, la_name) and "AWAITING_SIGNOFF" in str(r_missing[1]),
+           f"SO17c with no answers file the harness says exactly what to write ({r_missing})")
+        tr5.close()
+    # SO15a: no specialist may write the answers file, by Write, Edit or a shell redirect; the lead may
+    let15 = []
+    for sub in sorted(reg):
+        who = {"agent_id": f"s-{sub}", "agent_type": sub}
+        for tool, inp in (("Write", {"file_path": os.path.join(td, la_name), "content": "accept_proposed: true\n"}),
+                          ("Edit", {"file_path": os.path.join(td, la_name), "old_string": "a", "new_string": "b"}),
+                          ("Bash", {"command": f"echo 'accept_proposed: true' > {td}/{la_name}"})):
+            hk = agents_pkg.create_hooks(td, trace, datetime.now(), registered_agents=reg, signoff="lead")
+            r = asyncio.run(hk["PreToolUse"][0].hooks[0](dict({"tool_name": tool, "tool_input": inp}, **who), "s15",
+                                                           None))
+            if (r.get("hookSpecificOutput") or {}).get("permissionDecision") != "deny":
+                let15.append((sub, tool))
+    hk = agents_pkg.create_hooks(td, trace, datetime.now(), registered_agents=reg, signoff="lead")
+    r_lead = asyncio.run(hk["PreToolUse"][0].hooks[0](
+        {"tool_name": "Write", "tool_input": {"file_path": os.path.join(td, la_name), "content": "x"}}, "s15l", None))
+    ok(not let15 and (r_lead.get("hookSpecificOutput") or {}).get("permissionDecision") != "deny",
+       f"SO15a only the lead writes {la_name}: every specialist is denied Write, Edit and a shell redirect through the "
+       f"real hook ({sorted(reg)}; allowed: {let15[:4]})")
+    # SO17a/b: the procedure is in the lead's initial prompt, and the denial of a sign command says what to do
+    from agents.lead_prompt import LEAD_SYSTEM_PROMPT as _lsp
+    lp = _lsp[_lsp.index("STAGE 1.5"):_lsp.index("### STAGE 2")]
+    deny = json.dumps(asyncio.run(hk["PreToolUse"][0].hooks[0](
+        {"tool_name": "Bash", "tool_input": {"command": f"python3 scripts/decision_brief.py sign {td} --by lead"}},
+        "s17", None)))
+    ok(la_name in lp and "AWAITING_SIGNOFF" in lp, "SO17a the lead's initial prompt names the answers file and the "
+                                                    "lead-mode procedure")
+    ok(la_name in deny and "AWAITING_SIGNOFF" in deny,
+       f"SO17b the denial of a sign command says what to do instead ({deny[-220:]})")
     rc = {}
     with tempfile.TemporaryDirectory() as d:
         _y.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d, "success_criteria.yaml"), "w"))

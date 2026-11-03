@@ -852,6 +852,33 @@ def _run_self_test() -> int:
         ok(status(d) == "signed" and load_brief(d)[1] == [] and "Not ready" not in render_md(d)
            and "schema 1" in render_md(d) and signoff_text(d),
            f"DB34: a schema 1 brief signed before Phase 43 is still signed: {load_brief(d)[1]}")
+    # DB36 (focused check of #131): the lead's answers file is parsed strictly
+    with tempfile.TemporaryDirectory() as d:
+        yaml.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d, CRITERIA), "w"))
+        yaml.safe_dump(example_brief(), open(os.path.join(d, BRIEF), "w"))
+        cases = {"string false": 'accept_proposed: "false"\n', "list answers": "answers: [Q1]\n",
+                 "unknown id": "answers: {Q99: x}\n", "unknown key": "accept_proposed: true\nsign_as: owner\n",
+                 "nothing": "note: only a note\n", "empty answer": "answers: {Q1: ''}\n",
+                 "numeric bool": "accept_proposed: 1\n"}
+        got36 = {}
+        for name, text in cases.items():
+            open(os.path.join(d, "decision_brief_lead_answers.yaml"), "w").write(text)
+            try:
+                doc, errs = parse_lead_answers(d)
+            except NameError as e:
+                doc, errs = None, [f"missing: {e}"]
+            got36[name] = bool(errs) and doc is None
+        open(os.path.join(d, "decision_brief_lead_answers.yaml"), "w").write(
+            "answers: {Q1: 'Yes: keep currently covered districts'}\nnote: ok\n")
+        try:
+            good = parse_lead_answers(d)
+        except NameError:
+            good = (None, ["missing"])
+        ok(all(got36.values()) and good[1] == [] and good[0]["answers"] == {"Q1": "Yes: keep currently covered "
+                                                                                  "districts"}
+           and good[0]["accept_proposed"] is False,
+           f"DB36 the lead's answers file is parsed strictly: accept_proposed a YAML boolean, answers a mapping of the "
+           f"brief's question ids to non-empty text, no other keys ({got36}; {good[1]})")
     # DB35 (Codex round 2 on #131): signing the brief signs the decision spec when there is one, so it freezes the
     # spec's geometry inputs too (toolkit/spec/geometry.py freeze); a brief-only run (no spec) is unchanged.
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

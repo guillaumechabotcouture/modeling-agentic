@@ -2801,9 +2801,12 @@ def _self_test() -> int:
             except ValueError as e:
                 ok(needle in str(e) and "u1" in str(e), f"{label}: {e}")
         dd = bnd_run("bxu", [r for r in base_rows if r[0] != "u2"] + [("u1", "S-u2")], union=True)
-        eu, why = one(dd, "burden_map", "bxu_o")
-        ok(eu and "u2" in eu.get("unmatched", []) and "u1" not in eu.get("unmatched", []),
-           f"BD4c a declared union draws both features for the unit: {eu and eu.get('unmatched')} {why}")
+        try:
+            render(dd, os.path.join(base, "bxu_o"), only=["burden_map"])
+            ok(False, "BD4c a declared crosswalk.union is refused: unions are not supported (focused check of #131)")
+        except ValueError as e:
+            ok("not supported" in str(e), f"BD4c a declared crosswalk.union is refused: unions are not supported "
+                                         f"(focused check of #131): {e}")
         dd = bnd_run("bxe", base_rows, feats=lambda fs: fs[3].update(geometry={"type": "MultiPolygon",
                                                                               "coordinates": []}))
         ee, why = one(dd, "burden_map", "bxe_o")

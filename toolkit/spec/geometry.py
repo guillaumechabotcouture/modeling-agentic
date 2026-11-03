@@ -1202,12 +1202,10 @@ def _self_test_shapes(ok, th) -> None:
         r_empty = run_with(edit=lambda fs: fs[4].update(geometry={"type": "MultiPolygon", "coordinates": []}))
         r_crs = run_with(crs="EPSG:3857")
         r_crs84 = run_with(crs="urn:ogc:def:crs:OGC:1.3:CRS84")
-        cl = [f["id"] for f in r_union.get("findings") or [] if "clean" in f["units"]]
-        ok(r_multi["status"] == "failed" and "clean" in r_multi["reason"] and "union" in r_multi["reason"]
-           and r_union["status"] == "ran" and cl == ["area_mismatch:clean"],
-           f"IG14a a unit mapped to two features is refused (naming it) unless crosswalk.union: true; with union it is "
-           f"checked against the union (its point is inside, its area is now half the union's) "
-           f"({r_multi['reason'][:80]}; {cl})")
+        ok(r_multi["status"] == "failed" and "clean" in r_multi["reason"] and "not supported" in str(r_multi["reason"])
+           and r_union["status"] == "failed" and "not supported" in str(r_union["reason"]),
+           f"IG14a a unit mapped to two features is refused, naming it: unions are not supported (focused check of "
+           f"#131), and declaring crosswalk.union is refused too ({str(r_multi['reason'])[:90]}; {str(r_union['reason'])[:90]})")
         ok(r_shared["status"] == "failed" and "clean" in r_shared["reason"] and "nomatch" in r_shared["reason"],
            f"IG14b a feature mapped to two units is refused, naming both ({r_shared['reason'][:100]})")
         ok(r_dup["status"] == "failed" and "not unique" in r_dup["reason"],
@@ -1216,28 +1214,6 @@ def _self_test_shapes(ok, th) -> None:
            f"IG14d a unit whose feature is an empty MultiPolygon is unmatched ({r_empty['reason']})")
         ok(r_crs["status"] == "failed" and "CRS" in r_crs["reason"] and r_crs84["status"] == "ran",
            f"IG14e a projected CRS is refused; CRS84 is accepted ({r_crs['reason'][:80]})")
-    # IG15 (focused check of #131, P2): union members must not overlap, or the union's area would count the overlap
-    # twice (two rectangles whose union is 1.2 square degrees counted as 2.0); touching members are fine
-    sets = {"overlapping": {"A": rect(0, 0, 1, 1), "B": rect(0.2, 0, 1.2, 1)},
-            "nested": {"A": rect(0, 0, 1, 1), "B": rect(0.2, 0.2, 0.4, 0.4)},
-            "identical": {"A": rect(0, 0, 1, 1), "B": rect(0, 0, 1, 1)},
-            "touching": {"A": rect(0, 0, 1, 1), "B": rect(1, 0, 2, 1)},
-            "apart": {"A": rect(0, 0, 1, 1), "B": rect(3, 0, 4, 1)}}
-    got15 = {}
-    for name, fs in sets.items():
-        try:
-            resolve_targets({"u": ["A", "B"]}, ["u"], True, "xw.csv", fs)
-            got15[name] = "ok"
-        except GeometryError as e:
-            got15[name] = "refused" if "u" in str(e) and "overlap" in str(e) else f"refused: {e}"
-        except Exception as e:  # noqa: BLE001 -- before the rule exists (alpha)
-            got15[name] = f"{type(e).__name__}"
-    ev15 = evaluate([{"u": "u", "x": "0.5", "y": "0.5", "a": str(2 * area_km2(rect(0, 0, 1, 1)))}],
-                    {"id": "u", "lat": "y", "lon": "x", "area": "a"}, sets["touching"], {"u": ["A", "B"]}, th)
-    ok(got15 == {"overlapping": "refused", "nested": "refused", "identical": "refused", "touching": "ok",
-                 "apart": "ok"} and ev15["findings"] == [],
-       f"IG15 union members that overlap (partly, nested or identical) are refused, naming the unit; touching or "
-       f"separate members are allowed and their areas add up exactly ({got15}; {ev15['findings'][:1]})")
     R2 = 6371.0088 ** 2
     cell = rect(0, 10, 1, 11)
     exact = R2 * math.radians(1.0) * (math.sin(math.radians(11)) - math.sin(math.radians(10)))
