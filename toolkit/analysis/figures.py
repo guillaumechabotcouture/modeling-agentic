@@ -2093,6 +2093,13 @@ def _save(fig, out_dir, name, run_dir, sources, harness: bool, t, presentation=N
     return {"png": png, "svg": svg}
 
 
+def _check_out_outside(run_dir: str, out_dir: str) -> None:
+    """An offline --out must lie outside the run dir (the run's artifacts are not modified); checked before anything
+    is created or written."""
+    if os.path.commonpath([os.path.realpath(out_dir), os.path.realpath(run_dir)]) == os.path.realpath(run_dir):
+        raise ValueError("--out must be outside the run dir (the run's artifacts are not modified)")
+
+
 def render(run_dir: str, out_dir: str | None = None, labels_overlay: dict | None = None,
            figure_data: dict | None = None, trajectories: dict | None = None, theme: str = "light",
            only=None, write_index: bool | None = None) -> dict:
@@ -2102,9 +2109,8 @@ def render(run_dir: str, out_dir: str | None = None, labels_overlay: dict | None
     run_dir = os.path.abspath(run_dir)
     harness = out_dir is None
     dest = os.path.join(run_dir, "figures") if harness else os.path.abspath(out_dir)
-    if not harness and os.path.commonpath([os.path.realpath(dest), os.path.realpath(run_dir)]) == \
-            os.path.realpath(run_dir):
-        raise ValueError("--out must be outside the run dir (the run's artifacts are not modified)")
+    if not harness:
+        _check_out_outside(run_dir, dest)
     t = FS.setup(theme)
     figs, notp = [], []
     try:
@@ -2319,6 +2325,7 @@ def main(argv=None) -> int:
         e = compare(a.run_dirs, a.out, a.names.split(",") if a.names else None, ov, a.theme)
         print(json.dumps({"comparison": e["path"]}))
         return 0
+    _check_out_outside(a.run_dir, a.out)         # before --out is created or --recompute publishes into it
     fd = yaml.safe_load(open(a.figure_data))["data"] if a.figure_data else None
     tj = yaml.safe_load(open(a.trajectories))["data"] if a.trajectories else None
     if fd is None and a.recompute and not os.path.exists(os.path.join(a.run_dir, "analysis", "figure_data.yaml")):

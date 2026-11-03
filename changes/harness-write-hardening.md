@@ -1,6 +1,6 @@
 ---
 phase: "v2"
-commit: "HW α-β6"
+commit: "HW α-β7"
 ---
 
 ## Changelog
@@ -48,4 +48,4 @@ After the merge of v2 (#129, #132, #135; WA9 updated, WA26-WA27):
 - The audit now treats PIL's `<image>.save(path)` as a writer; a module's own `save()` is not.
   - The v1 image resize in `agents/hooks.py` becomes a counted v1 open item (59 in total).
 - The run dossier (#132) only reads; the AST audit scans it with the rest of `tools/`.
-
+- `figures render RUN --out <inside RUN> --recompute` is now refused before `--out` is created or `figure_data.yaml` is published (WA28).
