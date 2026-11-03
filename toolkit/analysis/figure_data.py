@@ -362,6 +362,108 @@ def _self_test() -> int:
         fd2 = compute(A, plan, out0, ben0, cost0, R["uncertainty"], z0, log=q)
         ok(abs(fd2["frontier"]["points"][-1]["objective"] - fr[-1]["objective"]) <= 1e-6 * abs(fr[-1]["objective"]),
            "FD11 the rebuilt frontier equals the harness's")
+        # ---- Codex r1 P1-2: rows are taken only when their own inputs are proven to match
+        import hashlib
+        import numpy as np
+        from toolkit.analysis import batch as Bt
+        rows = os.path.join(d, "analysis", "batch", "results.jsonl")
+        bpath = os.path.join(d, "analysis", "batch.yaml")
+        keep_rows, keep_b = open(rows).read(), open(bpath).read()
+
+        def rewrite(fn):
+            out = []
+            for n, line in enumerate(keep_rows.splitlines()):
+                r = json.loads(line)
+                fn(n, r)
+                out.append(json.dumps(r))
+            open(rows, "w").write("\n".join(out) + "\n")
+            b = yaml.safe_load(keep_b)            # as if the batch had been written so on its own platform
+            b["inputs"]["analysis/batch/results.jsonl"] = hashlib.sha256(open(rows, "rb").read()).hexdigest()
+            yaml.safe_dump(b, open(bpath, "w"), sort_keys=False)
+        _d, jobs = Bt.design(A.spec)
+        j5 = json.loads(json.dumps(jobs[5]))
+        leaf = sorted(k for k, v in j5["params"].items() if isinstance(v, float))[0]
+        j5["params"][leaf] = float(np.nextafter(j5["params"][leaf], np.inf))
+        rewrite(lambda n, r: r["result"]["provenance"].update(job_sha=Bt.job_sha(j5)) if n == 5 else None)
+        A2, plan2, *_ = rebuild(d, log=q)
+        info = getattr(A2, "rebuild_info", {}) or {}
+        ok(plan2 == plan and [(x["job"], x["field"], x["ulps"]) for x in info.get("by_ulp", [])]
+           == [(jobs[5]["id"], f"params.{leaf}", 1)],
+           f"FD14 a row whose job differs from the rebuilt job by 1 ulp in one input is taken, and recorded: {info}")
+        rewrite(lambda n, r: r["result"]["provenance"].update(job_sha="0" * 64) if n == 5 else None)
+        try:
+            rebuild(d, log=q)
+            ok(False, "FD14b a row whose inputs cannot be matched within the bound is refused")
+        except RebuildRefused as e:
+            ok("within" in str(e), f"FD14b a row whose inputs cannot be matched within the bound is refused: {e}")
+        rewrite(lambda n, r: r["result"]["provenance"]["engine"].update(version="0") if n == 7 else None)
+        try:
+            rebuild(d, log=q)
+            ok(False, "FD14c a later row from another engine identity is refused")
+        except RebuildRefused as e:
+            ok("engine" in str(e), f"FD14c a later row from another engine identity is refused: {e}")
+        open(rows, "w").write(keep_rows)
+        b = yaml.safe_load(keep_b)
+        b["inputs"]["analysis/batch/results.jsonl"] = "f" * 64
+        yaml.safe_dump(b, open(bpath, "w"), sort_keys=False)
+        try:
+            rebuild(d, log=q)
+            ok(False, "FD14d batch rows that are not the ones the analysis recorded are refused")
+        except RebuildRefused as e:
+            ok("batch.yaml" in str(e), f"FD14d batch rows that are not the ones the analysis recorded are refused: {e}")
+        open(bpath, "w").write(keep_b)
+        # ---- Codex r1 P1-3: frontier and component plans are guarded against model corrections
+        star = [{"unit": A.ids[0], "package": "*", "kind": "clip"}]
+        fr_g = frontier(A, ben0, cost0, out0, events=star)
+        ok(fr_g["points"] == [] and len(fr_g["excluded"]) == len(FRACTIONS)
+           and all("correction" in x["reason"] for x in fr_g["excluded"]),
+           "FD15 frontier plans that model corrections bear on are excluded with the reason")
+        cpk = {i: plan[i] for i in A.ids}
+        by_set = {cs: k for k, cs in A.pk.items()}
+        unit_c = next(i for i in A.ids if len(A.pk[plan[i]]) == 2)
+        c0 = sorted(A.pk[plan[unit_c]])[0]
+        alt = by_set[frozenset(set(A.pk[plan[unit_c]]) - {c0})]
+        ci = component_increment(A, cpk, ben0, cost0, events=[{"unit": unit_c, "package": alt, "kind": "clip"}])
+        ok(ci[c0].get("units_with_corrections") == 1,
+           f"FD15b a component increment whose counterfactual package has corrections is excluded: {ci[c0]}")
+        # ---- Codex r1 P1-4: an infeasible exploratory envelope is recorded; a genuine solver failure propagates
+        orig = A.solve
+
+        def infeasible_low(ben, cost, budget=None, feas=None):
+            if budget is not None and budget < 0.6 * A.budget:
+                raise RuntimeError("optimizer status infeasible")
+            return orig(ben, cost, budget, feas)
+        A.solve = infeasible_low
+        fr_i = frontier(A, ben0, cost0, out0)
+        ok([x["fraction"] for x in fr_i.get("infeasible", [])] == [0.25, 0.5]
+           and all(p["fraction"] >= 0.75 for p in fr_i["points"]),
+           f"FD16 infeasible exploratory envelopes are recorded separately: {fr_i.get('infeasible')}")
+
+        def broken(ben, cost, budget=None, feas=None):
+            raise RuntimeError("optimizer status time_limit")
+        A.solve = broken
+        try:
+            frontier(A, ben0, cost0, out0)
+            ok(False, "FD16b a solver failure other than infeasibility propagates")
+        except RuntimeError:
+            ok(True, "FD16b a solver failure other than infeasibility propagates")
+        A.solve = orig
+        # ---- Codex r1 P2-8: the frontier reports outcome averted, not the (possibly discounted) objective
+        half = {i: {k: 0.5 * v for k, v in ben0[i].items()} for i in A.ids}
+        fr_h = frontier(A, half, cost0, out0)
+        pts = {p["fraction"]: p for p in fr_h["points"]}
+        want = ((pts[1.1]["averted"][A.primary] - pts[0.9]["averted"][A.primary])
+                / (pts[1.1]["cost"] - pts[0.9]["cost"]))
+        ok(abs(fr_h["marginal"]["outcome_per_usd"] - want) <= 1e-9 * abs(want),
+           "FD18 the marginal is computed on outcome averted, not on the discounted objective")
+        # ---- Codex r1 P2-12: package intervals withheld with a reason and the share of draws
+        k0 = next(k for k in set(plan.values()) if k != A.comp)
+        rep = {"reproduced": True, "draws": 4, "level": 0.95, "per_draw": [
+            {k0: {"units": 1, "cost": 10.0, "averted": a}} for a in (5.0, 4.0, -1.0, 6.0)]}
+        bp = by_package(A, plan, out0, cost0, rep)
+        w = bp[k0].get("interval_withheld") or {}
+        ok(bp[k0].get("usd_per_outcome_interval") is None and w.get("share_draws_nonpositive") == 0.25
+           and w.get("reason"), f"FD17 a withheld package interval says why and in what share of draws: {w}")
         # a stale engine identity is refused
         rows = os.path.join(d, "analysis", "batch", "results.jsonl")
         txt = open(rows).read().replace('"version": "1"', '"version": "0"', 1)

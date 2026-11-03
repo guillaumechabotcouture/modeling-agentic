@@ -937,6 +937,11 @@ def fig_trajectories(R, t):
     return fig, title, cap, rows, "modelled trajectories by region"
 
 
+def _frontier_xy(fr: dict, primary: str) -> tuple[list, list]:
+    """The frontier's plotted points: solved envelopes only, on outcome averted."""
+    raise NotImplementedError("figures r1 β")
+
+
 FUNCS = {"headline": fig_headline, "allocation_map": fig_allocation, "stability_map": fig_stability,
          "burden_map": fig_burden, "calibration_fit": fig_calibration, "frontier": fig_frontier,
          "dollars": fig_dollars, "cost_per_outcome": fig_cost_per_outcome, "sensitivity": fig_sensitivity,
@@ -1406,6 +1411,125 @@ def _self_test() -> int:
            "F15 with the engine's schedule, the timeline shows history, decision and routine deliveries per region")
         resd = render(d, os.path.join(base, "dark"), theme="dark")
         ok(len(resd["figures"]) == len(res["figures"]), "F14 the dark theme renders the same set")
+
+        # ---------------- Codex r1
+        def edit(dd, kind, fn, rel=None):
+            pth = os.path.join(dd, rel or os.path.join("analysis", f"{kind}.yaml"))
+            doc = yaml.safe_load(open(pth))
+            fn(doc["data"] if "data" in doc else doc)
+            yaml.safe_dump(doc, open(pth, "w"), sort_keys=False)
+
+        def one(dd, name, out):
+            r = render(dd, os.path.join(base, out), only=[name])
+            e = {f["figure"]: f for f in r["figures"]}.get(name)
+            return e, {x["figure"]: x["reason"] for x in r["not_produced"]}.get(name)
+        # P1-1: no fabricated fit; the title follows the actual residuals and clamping
+        e, _ = one(d, "calibration_fit", "c1")
+        ok(e and e.get("panels") == ["targets"] and "exactly" not in e["title"] and "reproduces" not in e["title"],
+           f"F16 without modelled values the fit panel is withheld and nothing claims a fit: {e and e['title']}")
+        dc = toy_run(os.path.join(base, "runc"))
+        ids = [f"u{i}" for i in range(24)]
+        edit(dc, "figure_data", lambda x: x.update(calibration={"metric": "prev", "units": {
+            u: {"target": 0.1 + 0.3 * (i % 7) / 7, "modelled": 0.1 + 0.3 * (i % 7) / 7 + (0.05 if i == 3 else 0.0)}
+            for i, u in enumerate(ids)}}))
+        edit(dc, "calibration", lambda x: x["diagnostics"].update(clamped_units=2))
+        e, _ = one(dc, "calibration_fit", "c2")
+        ok(e and e.get("panels") == ["fit", "residuals"] and "2 clamped" in e["title"] and "exactly" not in e["title"],
+           f"F16b with modelled values the title states the largest residual and the clamped units: {e and e['title']}")
+        # P1-4 and P2-8: the frontier plots solved points only, on outcome averted
+        df = toy_run(os.path.join(base, "runf"))
+        edit(df, "figure_data", lambda x: (x["frontier"].update(infeasible=[{"fraction": 0.25, "reason": "infeasible"}]),
+                                           [pt.update(averted={"dalys": pt["objective"]}, objective=2 * pt["objective"])
+                                            for pt in x["frontier"]["points"]]))
+        fdd = yaml.safe_load(open(os.path.join(df, "analysis", "figure_data.yaml")))["data"]
+        xs, ys = _frontier_xy(fdd["frontier"], "dalys")
+        ok(len(xs) == len(fdd["frontier"]["points"]) and 0.0 not in ys
+           and ys == [pt["averted"]["dalys"] for pt in fdd["frontier"]["points"]],
+           "F17 the frontier draws only solved points (no unsolved origin), on outcome averted (F20)")
+        e, _ = one(df, "frontier", "f1")
+        ok(e and "infeasible" in e["caption"], f"F17b infeasible envelopes are named in the caption: {e and e['caption']}")
+        # P1-5: a plan that spends nothing
+        dz = toy_run(os.path.join(base, "runz"))
+        edit(dz, "figure_data", lambda x: x["dollars"].update(allocated_usd=0.0, by_component={"ca": 0.0, "cb": 0.0},
+                                                               by_region={r: {"ca": 0.0, "cb": 0.0} for r in
+                                                                          ("Z0", "Z1", "Z2")}))
+        e, why = one(dz, "dollars", "z1")
+        ok(e and "unspent" in e["title"], f"F18 a zero-spend plan draws fixed costs and unspent funds: {e or why}")
+        # P1-7: stale trajectories are not plotted
+        dt = toy_run(os.path.join(base, "runt"))
+        tj = {"schema": "analysis.trajectories/1", "inputs": {"analysis/point.yaml": "0" * 64}, "data": {
+            "status": "ok", "engine": {"name": "toy"}, "sample": {"Z0": ["u0"]}, "per_region": 1, "seeds": 1,
+            "metrics": ["prev"], "metric_info": {"prev": {"label": "prevalence", "units": "share"}},
+            "delivery": [1.0, 2.0], "window": [1.0, 3.0], "calibration_metric": "prev",
+            "series": {"total": {"t": [0.0, 1.0], "arms": {"comparator": {"prev": [0.5, 0.5]},
+                                                            "plan": {"prev": [0.5, 0.4]}}, "target": {}},
+                       "regions": {}}}}
+        yaml.safe_dump(tj, open(os.path.join(dt, "analysis", "trajectories.yaml"), "w"))
+        e, why = one(dt, "trajectories", "t1")
+        ok(e is None and why and "stale" in why, f"F19 trajectories computed from other inputs are not plotted: {why}")
+        # P2-11: every component counts in the dollars summary
+        d9 = toy_run(os.path.join(base, "run9"))
+        comps9 = [f"k{j}" for j in range(9)]
+        edit(d9, "figure_data", lambda x: x["dollars"].update(
+            allocated_usd=900.0, by_component={c: 100.0 for c in comps9},
+            by_region={r: {c: 100.0 / 3 for c in comps9} for r in ("Z0", "Z1", "Z2")}))
+        sp9 = yaml.safe_load(open(os.path.join(d9, "decision_spec.yaml")))
+        sp9["options"]["components"] = {c: {} for c in comps9}
+        yaml.safe_dump(sp9, open(os.path.join(d9, "decision_spec.yaml"), "w"), sort_keys=False)
+        edit(d9, "point", lambda x: x.update(mix={c: 3 for c in comps9}))
+        e, why = one(d9, "dollars", "d9")
+        rows9 = list(csv.DictReader(open(e["table"]))) if e else []
+        allrow = [r for r in rows9 if r.get("region") == "ALL"]
+        ok(e and allrow and all(float(allrow[0][c]) == 100.0 for c in comps9) and "11%" in e["title"],
+           f"F21 the dollars summary covers all nine components: {e and e['title']} {why}")
+        # P2-12: free, harmful and undefined packages are shown, not dropped
+        dp = toy_run(os.path.join(base, "runp"))
+
+        def pk_edit(x):
+            ks = sorted(x["by_package"])
+            x["by_package"][ks[0]].update(cost=0.0, usd_per_outcome=0.0)
+            x["by_package"][ks[1]].update(averted=-5.0, usd_per_outcome=None, usd_per_outcome_interval=None)
+            x["by_package"][ks[2]].update(averted=0.0, usd_per_outcome=None, usd_per_outcome_interval=None)
+        edit(dp, "figure_data", pk_edit)
+        e, why = one(dp, "cost_per_outcome", "p1")
+        st = {r.get("status") for r in csv.DictReader(open(e["table"]))} if e else set()
+        ok(e and {"free", "harmful", "undefined"} <= st, f"F22 free, harmful and undefined packages are shown: {st} {why}")
+        # P2-13: verdict, share and threshold from one calculation
+        ds = toy_run(os.path.join(base, "runs"))
+        edit(ds, "decision_tests", lambda x: x["tests"][0].update(share_pct=30.0, threshold_pct=25.0))
+        sps = yaml.safe_load(open(os.path.join(ds, "decision_spec.yaml")))
+        sps["analysis"] = {"share_threshold": 0.04}
+        yaml.safe_dump(sps, open(os.path.join(ds, "decision_spec.yaml"), "w"), sort_keys=False)
+        e, _ = one(ds, "sensitivity", "s1")
+        sr = {r["name"]: r for r in csv.DictReader(open(e["table"]))}
+        ok(float(sr["p_eff"]["share_units_changed"]) == 0.30 and float(sr["p_eff"]["threshold"]) == 0.25
+           and float(sr["p_cost"]["threshold"]) == 0.04 and sr["p_cost"]["changes_plan"] == "True",
+           f"F23 each marker's verdict, share and threshold come from one source: "
+           f"{[(k, v['share_units_changed'], v['threshold'], v['changes_plan']) for k, v in sr.items()]}")
+        # P2-14: package definitions that differ across runs are reconciled and disclosed
+        dk = toy_run(os.path.join(base, "runk"))
+        spk = yaml.safe_load(open(os.path.join(dk, "decision_spec.yaml")))
+        spk["options"]["packages"] = {"none": [], "ca": ["cb"], "cb": ["ca"], "ca+cb": ["ca", "cb"]}
+        yaml.safe_dump(spk, open(os.path.join(dk, "decision_spec.yaml"), "w"), sort_keys=False)
+        ek = compare([d, dk], os.path.join(base, "cmpk"), names=["A", "K"])
+        ok("package definitions differ" in ek["caption"], f"F24 differing package definitions are disclosed: {ek['caption']}")
+        # P2-15: the stored interval level, not a hardcoded 95%
+        dl = toy_run(os.path.join(base, "runl"))
+        edit(dl, "uncertainty", lambda x: [v.update(level=0.9) for v in x["fixed_plan"].values()])
+        edit(dl, "figure_data", lambda x: x["replay"].update(level=0.9))
+        rl = render(dl, os.path.join(base, "l1"), only=["headline", "cost_per_outcome"])
+        el = {f["figure"]: f for f in rl["figures"]}
+        el2 = compare([dl, dl], os.path.join(base, "cmpl"), names=["X", "Y"])
+        ok("90% UI" in el["headline"]["title"] and "90%" in el["cost_per_outcome"]["caption"]
+           and "95%" not in el["cost_per_outcome"]["caption"] and "90%" in el2["caption"] and "95%" not in el2["caption"],
+           "F25 interval levels come from the stored artifacts")
+        # design: decision figures and modeller diagnostics are grouped in figures.yaml
+        idx = yaml.safe_load(open(os.path.join(out, "figures.yaml")))
+        grp = idx.get("groups") or {}
+        ok(set(grp.get("decision", [])) >= {"allocation_map", "dollars", "stability_map", "frontier"}
+           and set(grp.get("diagnostics", [])) >= {"calibration_fit", "sensitivity", "trajectories"}
+           and all(f.get("group") in ("decision", "diagnostics") for f in idx["figures"]),
+           f"F27 figures.yaml separates decision figures from modeller diagnostics: {grp}")
     print("OK: all self-test cases passed." if not fails else f"FAILED: {len(fails)} case(s)")
     return 1 if fails else 0
 

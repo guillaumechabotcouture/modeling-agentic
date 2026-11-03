@@ -48,6 +48,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+# Contract version of these hooks (grids, metric units and denominators, schedule semantics). An engine opts in by
+# declaring `hooks_contract = HOOKS_CONTRACT`; another value is refused.
+HOOKS_CONTRACT = "figures-hooks/1"
 KINDS = ("history", "decision", "routine")
 AGGREGATES = ("mean", "rate")
 STEPS = ("month",)
@@ -160,11 +163,15 @@ class ToyScheduleEngine(_toy_base()):
     of the decision window. Series: prevalence 1 - exp(-burden) and incidence = burden per person-year, monthly, with the
     package's effect from the window start (the toy engine's closed form)."""
 
+    hooks_contract = HOOKS_CONTRACT
+
     def describe(self):
         from toolkit.engines.contract import EngineCard
         c = super().describe()
-        out = dict(c.outputs, series={"prev": {"label": "prevalence", "units": "share", "aggregate": "mean"},
-                                      "inc": {"label": "incidence", "units": "per person-year", "aggregate": "rate"}})
+        out = dict(c.outputs, series={"prev": {"label": "prevalence", "units": "share", "aggregate": "mean",
+                                               "denominator": "person"},
+                                      "inc": {"label": "incidence", "units": "per person-year", "aggregate": "rate",
+                                              "denominator": "person-year"}})
         return EngineCard(**dict(c.to_dict(), outputs=out))
 
     def schedule(self, params, unit, package, horizon):
@@ -192,7 +199,7 @@ class ToyScheduleEngine(_toy_base()):
                 bur = p["base"] * math.exp(p["k"] * x) * (m if tt >= float(horizon.window[0]) else 1.0)
                 vals["prev"].append(1 - math.exp(-bur))
                 vals["inc"].append(bur)
-            res.append({"package": pk.id, "t": t, "values": {k: vals[k] for k in metrics}})
+            res.append({"package": pk.id, "t": list(t), "values": {k: vals[k] for k in metrics}})
         return res
 
 # --------------------------------------------------------------------------- self-test
@@ -242,6 +249,82 @@ def _self_test() -> int:
             ok(False, label)
         except HookInvalid as e:
             ok(needle in str(e), f"{label}: {e}")
+    # ---- Codex r1 (P1-6, P2-16, design): grids, schedule semantics, contract version, metric metadata
+    from toolkit.engines.horizon import make_horizon
+
+    def refused(label, call, needle, exc=HookInvalid):
+        try:
+            call()
+            ok(False, label)
+        except exc as e:
+            ok(needle in str(e), f"{label}: {e}")
+
+    class Gap(Hooked):                       # a month missing from the grid
+        def run_series(self, params, unit, packages, horizon, seed, metrics, step="month"):
+            r = super().run_series(params, unit, packages, horizon, seed, metrics, step)
+            for x in r:
+                x["t"] = x["t"][:5] + x["t"][6:]
+                x["values"] = {m: v[:5] + v[6:] for m, v in x["values"].items()}
+            return r
+
+    class Short(Hooked):                     # stops a year before the window ends
+        def run_series(self, params, unit, packages, horizon, seed, metrics, step="month"):
+            r = super().run_series(params, unit, packages, horizon, seed, metrics, step)
+            for x in r:
+                x["t"] = x["t"][:-12]
+                x["values"] = {m: v[:-12] for m, v in x["values"].items()}
+            return r
+
+    class Skew(Hooked):                      # the second arm on another grid
+        def run_series(self, params, unit, packages, horizon, seed, metrics, step="month"):
+            r = super().run_series(params, unit, packages, horizon, seed, metrics, step)
+            r[-1]["t"] = [t + 0.01 for t in r[-1]["t"]]
+            return r
+    refused("H9 a grid with a missing month is refused", lambda: run_series(Gap(), {}, u, [p0, pa], h, 1, ["prev"]),
+            "monthly")
+    refused("H9b a grid that stops before the window ends is refused",
+            lambda: run_series(Short(), {}, u, [p0, pa], h, 1, ["prev"]), "monthly")
+    refused("H9c arms on different grids are refused", lambda: run_series(Skew(), {}, u, [p0, pa], h, 1, ["prev"]),
+            "monthly")
+
+    def sched(events):
+        class S(Hooked):
+            def schedule(self, params, unit, package, horizon):
+                return events
+        return S()
+    hd = make_horizon(0.0, 3.0, (1.0, 3.0), {}, delivery=(1.0, 2.0))
+    ev = lambda **k: dict({"component": "a", "label": "round", "kind": "decision", "t0": 1.5, "t1": None,  # noqa: E731
+                           "charged": True}, **k)
+    refused("H10 a decision event for a component the package does not have is refused",
+            lambda: schedule(sched([ev(component="b")]), {}, u, pa, hd), "not in the package")
+    refused("H10b a decision event outside the delivery period is refused",
+            lambda: schedule(sched([ev(t0=2.5)]), {}, u, pa, hd), "delivery period")
+    refused("H10c an event outside [horizon.start, window end] is refused",
+            lambda: schedule(sched([ev(kind="history", charged=False, t0=-1.0)]), {}, u, pa, hd), "horizon")
+    refused("H10d a history event inside the delivery period is refused",
+            lambda: schedule(sched([ev(kind="history", charged=False, t0=1.5)]), {}, u, pa, hd), "history")
+    refused("H10e a routine event inside the delivery period is refused",
+            lambda: schedule(sched([ev(kind="routine", charged=False, t0=1.5)]), {}, u, pa, hd), "routine")
+    ok(len(schedule(sched([ev(), ev(kind="routine", charged=False, t0=2.5),
+                           ev(kind="history", charged=False, t0=0.5)]), {}, u, pa, hd)) == 3,
+       "H10f events that respect the delivery period are accepted")
+
+    class NoContract(Hooked):
+        hooks_contract = None
+
+    class OtherContract(Hooked):
+        hooks_contract = "figures-hooks/0"
+    ok(not supports(NoContract(), "schedule"), "H11 an engine that declares no hooks contract does not offer the hooks")
+    refused("H11b an engine on another hooks contract is refused", lambda: schedule(OtherContract(), {}, u, pa, h),
+            "figures-hooks/0")
+
+    class BadMeta(Hooked):
+        def describe(self):
+            from toolkit.engines.contract import EngineCard
+            c = super().describe()
+            return EngineCard(**dict(c.to_dict(), outputs=dict(c.outputs, series={"prev": {"aggregate": "mean"}})))
+    refused("H12 a series metric without label, units and denominator is refused",
+            lambda: run_series(BadMeta(), {}, u, [pa], h, 1, ["prev"]), "denominator")
     print("OK: all self-test cases passed." if not fails else f"FAILED: {len(fails)} case(s)")
     return 1 if fails else 0
 
