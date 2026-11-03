@@ -21,8 +21,9 @@ Their identity fields were re-stamped three times by `benchmarks/restamp_proof.p
 All three proofs ran on the pack's settings and the evidence cases; the v0.8 proof also ran three pinned scenarios
 with a delivery period, routine nets and SMC, boundary dates and heterogeneous batches
 (`benchmarks/restamp_proof.yaml` holds the latest).
-Each file's `restamped:` record holds the v0.8 re-stamp, with the v0.7 and v0.6 records under `previous`. A Coiled run
-of `validate_once.sh` is open until it confirms them.
+Each file's `restamped:` record holds the v0.8 re-stamp, with the v0.7 and v0.6 records under `previous`. The
+confirming Coiled run of `validate_once.sh` has not run yet: each v0.8 record says `confirmation: {validate_once:
+pending}` until it reports.
 
 ## v0.8 scope: the figure hooks, schedule() and run_series() (written before the v0.8 code)
 
@@ -127,8 +128,8 @@ failed first (α2, α3):
 - **Series metadata (S11, S12b, S12c).** Each `run_series` entry also returns `t_end` and `days`
   for every step. `series_window(entry, metric, a, b)` aggregates them exactly into the window
   metric over any union of steps, and fails closed on a window that cuts through a step.
-  - The grid has `round((window end - start) x 12)` steps starting at `start + k/12`, the same
-    for every arm, and the last step ends at the window end.
+  - The grid is the contract's, `hooks.monthly_grid(horizon)`, the same for every arm (round 2
+    below).
   - Each card metric declares a `denominator`, and the engine declares
     `hooks_contract = "figures-hooks/1"`.
   - Step slices are found once with `searchsorted`, with the same day selection as the windows.
@@ -140,6 +141,35 @@ failed first (α2, α3):
     months);
   - a heterogeneous batch (two units, parameters inside and outside the burn-in key, no delivery
     period).
+
+**Review round 2 (Codex) and #127's round 2.** Again, each change has a test that failed first
+(α4, α5):
+- **Coverage (S13).** `series_window` refuses a window that reaches outside the entry's
+  coverage `[t[0], t_end[-1])`; before, it silently aggregated only the part it covered. It also
+  needs the window to be covered completely by whole steps.
+- **Grid (S12c, S11).** `run_series` uses `hooks.monthly_grid(horizon)`: a step starts at every
+  `start + k/12` before the window end. When the window ends inside a month, the last step is
+  partial and ends at the window end. Its `mean` is that step's mean, and its `rate` is episodes
+  per person-year over the partial span. `t_end` and `days` follow it, and `series_window` stays
+  exact over it.
+- **Half-open delivery semantics (S14).** Tests at each boundary check the schedule against the
+  sim:
+  - A decision campaign at the delivery start d0 is listed, charged and charged by the sim; one
+    at the delivery end d1 is refused.
+  - A past campaign at d0 is refused.
+  - A routine campaign at d0 is refused; at d1, a routine campaign and the first routine SMC
+    round are accepted, on the steps the sim runs them.
+  - With GC7 dates, routine nets at campaign + 3 and routine SMC from d1 lie outside the delivery
+    period.
+
+  `model.delivery_contains` (`d0 <= t < d1`) already matched these rules, and so did the routine
+  placement.
+- **Proof record (RP11).** Each side of the proof records its Python, NumPy, Starsim and
+  platform versions (fail closed without them). The record's `execution` block names the Coiled
+  cluster id, the run id and the workspace.
+- **Confirmation (RP12).** A re-stamp record no longer says that `validate_once.sh` confirms it:
+  `confirmation: {validate_once: pending}` until that run reports. Earlier records under
+  `previous` keep the wording they were written with.
 
 ## v0.7 scope: routine SMC in every arm after the delivery period (written before the v0.7 code)
 
