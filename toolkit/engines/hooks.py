@@ -147,34 +147,64 @@ def run_series(engine, params, unit, packages, horizon, seed, metrics, step="mon
     return res
 
 
+
+# --------------------------------------------------------------------------- toy engine with both hooks
+def _toy_base():
+    from toolkit.engines.contract import ToyEngine
+    return ToyEngine
+
+
+class ToyScheduleEngine(_toy_base()):
+    """The contract's toy engine plus both hooks (self-tests of the hooks, figure_data and trajectories). One event per
+    component: a past round at horizon.start (every arm) and, when the package has the component, a round at the start
+    of the decision window. Series: prevalence 1 - exp(-burden) and incidence = burden per person-year, monthly, with the
+    package's effect from the window start (the toy engine's closed form)."""
+
+    def describe(self):
+        from toolkit.engines.contract import EngineCard
+        c = super().describe()
+        out = dict(c.outputs, series={"prev": {"label": "prevalence", "units": "share", "aggregate": "mean"},
+                                      "inc": {"label": "incidence", "units": "per person-year", "aggregate": "rate"}})
+        return EngineCard(**dict(c.to_dict(), outputs=out))
+
+    def schedule(self, params, unit, package, horizon):
+        ev = []
+        for comp in sorted(self.describe().components):
+            ev.append({"component": comp, "label": "past round", "kind": "history", "t0": float(horizon.start),
+                       "t1": None, "charged": False})
+            if package.components.get(comp):
+                ev.append({"component": comp, "label": "round", "kind": "decision", "t0": float(horizon.window[0]),
+                           "t1": None, "charged": True})
+        return ev
+
+    def run_series(self, params, unit, packages, horizon, seed, metrics, step="month"):
+        from toolkit.engines.contract import resolve_params
+        p = resolve_params(self, params)
+        x = float(unit.attributes.get("x", 0.0))
+        n = int(round((float(horizon.window[1]) - float(horizon.start)) * 12))
+        t = [float(horizon.start) + k / 12 for k in range(n)]
+        res = []
+        for pk in packages:
+            a, b = int(pk.components.get("a", 0)), int(pk.components.get("b", 0))
+            m = (1 - p["eff_a"] * a) * (1 - p["eff_b"] * b) + p["synergy"] * a * b
+            vals = {"prev": [], "inc": []}
+            for tt in t:
+                bur = p["base"] * math.exp(p["k"] * x) * (m if tt >= float(horizon.window[0]) else 1.0)
+                vals["prev"].append(1 - math.exp(-bur))
+                vals["inc"].append(bur)
+            res.append({"package": pk.id, "t": t, "values": {k: vals[k] for k in metrics}})
+        return res
+
 # --------------------------------------------------------------------------- self-test
 def _self_test() -> int:
-    from toolkit.engines.contract import EngineCard, Horizon, Package, ToyEngine, UnitSpec
+    from toolkit.engines.contract import Horizon, Package, ToyEngine, UnitSpec
+    Hooked = ToyScheduleEngine
     fails = []
 
     def ok(c, m):
         print(("PASS " if c else "FAIL ") + m)
         if not c:
             fails.append(m)
-
-    class Hooked(ToyEngine):
-        def describe(self):
-            c = super().describe()
-            out = dict(c.outputs, series={"prev": {"label": "prevalence", "units": "share", "aggregate": "mean"}})
-            return EngineCard(**dict(c.to_dict(), outputs=out))
-
-        def schedule(self, params, unit, package, horizon):
-            ev = [{"component": "a", "label": "past round", "kind": "history", "t0": horizon.start, "t1": None,
-                   "charged": False}]
-            if package.components.get("a"):
-                ev.append({"component": "a", "label": "round", "kind": "decision", "t0": horizon.window[0],
-                           "t1": None, "charged": True})
-            return ev
-
-        def run_series(self, params, unit, packages, horizon, seed, metrics, step="month"):
-            n = int(round((horizon.window[1] - horizon.start) * 12))
-            t = [horizon.start + k / 12 for k in range(n)]
-            return [{"package": p.id, "t": t, "values": {m: [0.1] * n for m in metrics}} for p in packages]
 
     h = Horizon(0.0, 3.0, (1.0, 3.0), {})
     u = UnitSpec("u", {"x": 0.0})
@@ -190,8 +220,8 @@ def _self_test() -> int:
             ok(f"{hook}()" in str(e) and "toy" in str(e), f"H2 {hook}: an engine without the hook fails closed: {e}")
     E = Hooked()
     s = schedule(E, {}, u, pa, h)
-    ok([x["kind"] for x in s] == ["history", "decision"] and s[1]["charged"], "H3 a valid schedule is returned")
-    ok([x["kind"] for x in schedule(E, {}, u, p0, h)] == ["history"], "H4 the comparator arm has no decision event")
+    ok([x["kind"] for x in s] == ["history", "decision", "history"] and s[1]["charged"], "H3 a valid schedule is returned")
+    ok([x["kind"] for x in schedule(E, {}, u, p0, h)] == ["history", "history"], "H4 the comparator arm has no decision event")
     r = run_series(E, {}, u, [p0, pa], h, 1, ["prev"])
     ok([x["package"] for x in r] == ["none", "a"] and len(r[0]["t"]) == 36, "H5 a valid series is returned")
 
@@ -205,7 +235,7 @@ def _self_test() -> int:
     for label, call, needle in (
             ("H6 a malformed schedule is refused", lambda: schedule(Bad(), {}, u, pa, h), "not an engine component"),
             ("H7 a malformed series is refused", lambda: run_series(Bad(), {}, u, [pa], h, 1, ["prev"]), "increasing"),
-            ("H8 a metric the card does not list is refused", lambda: run_series(E, {}, u, [pa], h, 1, ["inc"]),
+            ("H8 a metric the card does not list is refused", lambda: run_series(E, {}, u, [pa], h, 1, ["zz"]),
              "not in the card")):
         try:
             call()
