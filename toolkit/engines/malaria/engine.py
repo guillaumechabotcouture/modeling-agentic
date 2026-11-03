@@ -609,13 +609,16 @@ class MalariaEngine:
 
     @staticmethod
     def series_steps(horizon: Horizon) -> tuple:
-        """(starts, ends) of the monthly steps (hooks contract figures-hooks/1): step k starts at horizon.start +
-        k/12 for k < round((window end - start) x 12); the last ends at the window's end (a little longer or shorter
-        than a month when the window end is off the monthly grid)."""
-        st, w1 = float(horizon.start), float(horizon.window[1])
-        n = max(int(round((w1 - st) * 12)), 1)
-        t = [st + k / 12 for k in range(n)]
-        return t, t[1:] + [w1]
+        """(starts, ends) of the monthly steps: the contract's grid (hooks.monthly_grid, figures-hooks/1), whose
+        last step ends at the window's end (a partial step when the window ends inside a month)."""
+        if __package__:
+            from ..hooks import monthly_grid
+        else:  # pragma: no cover
+            from toolkit.engines.hooks import monthly_grid
+        t = [float(x) for x in monthly_grid(horizon)]
+        if not t:
+            raise ValueError("run_series: the outcome window ends at or before horizon.start (no monthly step)")
+        return t, t[1:] + [float(horizon.window[1])]
 
     @staticmethod
     def _series(sim, horizon: Horizon, metrics: list, pid: str) -> dict:
