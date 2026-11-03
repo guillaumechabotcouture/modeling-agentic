@@ -991,6 +991,37 @@ def _self_test() -> int:
                "EP39 a record without the configuration digest is refused (fail closed)")
     guard("EP38-EP39 configuration digest", config_digest_cases)
 
+    # ------------------------------------------------------------ review round 5 (R5-1): toy engines are test-only
+    def guard_cases():
+        import subprocess
+        refs = ["toolkit.spec.engine_parameters:ToySpecEngine", "toolkit.spec.engine_parameters:ToySpecRateEngine",
+                "toolkit.spec.toy_engines:ToySpecEngine", "toolkit.spec.toy_engines:ToySpecRateEngine"]
+        code = ("import sys, json; sys.path.insert(0, %r)\n"
+                "from toolkit import import_guard as G\n"
+                "out = {}\n"
+                "for r in %r:\n"
+                "    try:\n"
+                "        G.check_ref('engine', r); out[r] = 'allowed'\n"
+                "    except G.ImportRefused:\n"
+                "        out[r] = 'refused'\n"
+                "print(json.dumps(out))") % (ROOT, refs)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("MA_IMPORT_GUARD")}
+        res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, cwd=ROOT)
+        got = json.loads(res.stdout or "{}") if res.returncode == 0 else {}
+        ok(got and all(v == "refused" for v in got.values()),
+           f"EP40 a production process (no test registration) refuses the self-test toy engines: {got or res.stderr[-300:]}")
+        from toolkit import import_guard as G
+        bad = []
+        for r in ("subprocess:Popen", "toolkit.engines.contract:ToyEngine", "toolkit.spec.schema:Spec"):
+            try:
+                G.allow_test_refs("engine", [r])
+                bad.append(r)
+            except (G.ImportRefused, AttributeError, ValueError):
+                pass
+        ok(hasattr(G, "allow_test_refs") and not bad,
+           f"EP41 a test registration can enable only the named self-test toy engines: accepted {bad}")
+    guard("EP40-EP41 test-only toy engines", guard_cases)
+
     # ------------------------------------------------------------ emulator path: application, UQ, decision test, reports
     def emulator_cases():
         from toolkit.analysis import run as RUN, trajectories as TR
