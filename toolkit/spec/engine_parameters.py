@@ -62,9 +62,6 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
-from toolkit.engines.contract import ParamSpec, resolve_params  # noqa: E402
-from toolkit.engines.empirical.engine import PackageRateEngine  # noqa: E402
-from toolkit.engines.hooks import ToyScheduleEngine  # noqa: E402
 
 FIELD = "engine_parameters"
 KEYS = ("value", "units", "source", "reason", "outside_card_range", "range", "dist", "verified")
@@ -605,57 +602,6 @@ def _cli(argv) -> int:
     return 0
 
 
-# --------------------------------------------------------------------------- toy engines (self-tests)
-class ToySpecEngine(ToyScheduleEngine):
-    """The toy engine with both hooks, a card range on `base` ([0.4, 0.6]) and a calibrated parameter `c_rate` (unused
-    by the model). `log_path`: every run, schedule and run_series call appends the resolved base, k and synergy as a
-    JSON line (worker processes included), so a self-test can see what each engine evaluation received."""
-
-    def __init__(self, results_path: str | None = None, log_path: str | None = None):
-        super().__init__(results_path)
-        self.log_path = log_path
-
-    def parameters(self) -> list:
-        out = [ParamSpec("base", 0.5, "fixed", lo=0.4, hi=0.6, source="toy card range") if p.name == "base" else p
-               for p in super().parameters()]
-        return out + [ParamSpec("c_rate", 1.0, "calibrated", source="toy")]
-
-    def _log(self, call, params):
-        if self.log_path:
-            p = resolve_params(self, params)
-            with open(self.log_path, "a") as f:
-                f.write(json.dumps({"call": call, **{k: p[k] for k in ("base", "k", "synergy")}}) + "\n")
-
-    def run(self, params, unit, package, horizon, seed):
-        self._log("run", params)
-        return super().run(params, unit, package, horizon, seed)
-
-    def schedule(self, params, unit, package, horizon):
-        self._log("schedule", params)
-        return super().schedule(params, unit, package, horizon)
-
-    def run_series(self, params, unit, packages, horizon, seed, metrics, step="month"):
-        self._log("run_series", params)
-        return super().run_series(params, unit, packages, horizon, seed, metrics, step)
-
-
-class ToySpecRateEngine(PackageRateEngine):
-    """The package-rate engine with a fixed multiplier `scale` on the rate (no card range). In-process runs record the
-    resolved scale in CALLS (the direct path's self-test)."""
-    CALLS: list = []
-
-    def parameters(self) -> list:
-        return super().parameters() + [ParamSpec("scale", 1.0, "fixed", "multiplier", source="toy")]
-
-    def run(self, params, unit, package, horizon, seed):
-        p = resolve_params(self, params)
-        ToySpecRateEngine.CALLS.append(p["scale"])
-        o = super().run({k: v for k, v in p.items() if k != "scale"}, unit, package, horizon, seed)
-        o.per_capita = {k: {g: v * p["scale"] for g, v in d.items()} for k, d in o.per_capita.items()}
-        o.windows = {w: {m: v * p["scale"] for m, v in d.items()} for w, d in o.windows.items()}
-        return o
-
-
 # --------------------------------------------------------------------------- self-test
 # Job hashes of the toy specs' emulator batches before this field existed (base c0ed767): a spec without the field
 # must keep them byte for byte (sha256 over the concatenated job_sha values, first 16 hex digits; the temporary run
@@ -672,6 +618,9 @@ def _self_test() -> int:
     import yaml
     from toolkit.spec import schema, signoff
     from toolkit.spec import engine_parameters as EPm     # the module the engine loader imports, not __main__
+    from toolkit.spec import toy_engines as TOYS
+    from toolkit import import_guard as G
+    G.allow_test_refs("engine", TOYS.REFS)     # this process and the workers it starts (never a production run)
     fails = []
 
     def ok(cond, msg):
@@ -692,7 +641,7 @@ def _self_test() -> int:
 
     def toy_raw(d, **entries):
         raw = yaml.safe_load(open(schema.toy_spec(d, n=24)))
-        raw["engine"] = {"ref": "toolkit.spec.engine_parameters:ToySpecEngine",
+        raw["engine"] = {"ref": "toolkit.spec.toy_engines:ToySpecEngine",
                          "config": {"log_path": os.path.join(d, "calls.jsonl")}}
         if entries:
             raw[FIELD] = entries
@@ -758,14 +707,14 @@ def _self_test() -> int:
                f"EP7j the report's HIGH note names the range that is outside, not the value: {md[-260:]!r}")
             # engine: auto. Shape checks at sign-off; each candidate checked against its own card
             ra = toy_raw(d, base={"value": 0.55, "source": SRC})
-            ra["engine"] = {"auto": True, "candidates": ["toolkit.spec.engine_parameters:ToySpecEngine",
+            ra["engine"] = {"auto": True, "candidates": ["toolkit.spec.toy_engines:ToySpecEngine",
                                                          "toolkit.engines.empirical.engine:PackageRateEngine"]}
             errs = schema.validate(schema.Spec(ra, d), pending_ok=True)
             ok(any(FIELD in e and "reason" in e for e in errs),
                f"EP9a engine: auto before the choice: the entry's shape is checked at sign-off: {errs[:2]}")
             ra[FIELD]["base"]["reason"] = WHY
             sa = schema.Spec(ra, d)
-            e_ok = schema.validate(schema.with_engine(sa, "toolkit.spec.engine_parameters:ToySpecEngine"))
+            e_ok = schema.validate(schema.with_engine(sa, "toolkit.spec.toy_engines:ToySpecEngine"))
             e_bad = schema.validate(schema.with_engine(sa, "toolkit.engines.empirical.engine:PackageRateEngine",
                                                        {"components": ["a", "b"]}))
             ok(schema.validate(sa, pending_ok=True) == [] and not [e for e in e_ok if FIELD in e]
@@ -877,7 +826,7 @@ def _self_test() -> int:
                f"record): {rec.get('status')}, {rec.get('reason', '')[:200]}")
             os.remove(fp)
             # R3-2: the harness step refuses a pack whose engine is not the run's engine
-            bad_pack = dict(RUN._toy_pack(), engine="toolkit.spec.engine_parameters:ToySpecEngine")
+            bad_pack = dict(RUN._toy_pack(), engine="toolkit.spec.toy_engines:ToySpecEngine")
             try:     # the stamp must name the engine the arms ran with, not the engine passed in
                 from toolkit.engines.contract import ToyEngine
                 EPm.spec_benchmarks(bad_pack, ToyEngine(results_path=bench), schema.load(p))
@@ -1121,15 +1070,15 @@ def _self_test() -> int:
             RUN._direct_toy(d)
             p = os.path.join(d, "decision_spec.yaml")
             r = yaml.safe_load(open(p))
-            r["engine"]["ref"] = "toolkit.spec.engine_parameters:ToySpecRateEngine"
+            r["engine"]["ref"] = "toolkit.spec.toy_engines:ToySpecRateEngine"
             r[FIELD] = {"scale": {"value": 1.25, "units": "multiplier", "source": SRC, "reason": WHY}}
             r["analysis"]["decision_tests"].append({"id": "DTs", "type": "parameter_value", "parameter": "scale",
                                                     "values": [1.0], "text": "Does the plan change at the card value?"})
             yaml.safe_dump(r, open(p, "w"), sort_keys=False)
             signoff.sign(d, "lead", note="self-test")
-            EPm.ToySpecRateEngine.CALLS.clear()
+            TOYS.ToySpecRateEngine.CALLS.clear()
             R = RUN.run(d, log=q)
-            calls = list(EPm.ToySpecRateEngine.CALLS)
+            calls = list(TOYS.ToySpecRateEngine.CALLS)
             n_eval = len(R["_A"].ids) * len(R["_A"].pk)
             ok(calls and set(calls) == {1.25, 1.0} and calls.count(1.0) == n_eval,
                f"EP23 direct path: every engine run (calibration fit, point, draws, stability refits) receives the spec "

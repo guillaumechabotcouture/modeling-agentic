@@ -87,8 +87,6 @@ REVIEWED = {
                            "the rest is self-test fixture code"),
         "remove": (1, _TEST), "shutil": (1, _TEST)},
     "toolkit/spec/schema.py": {"open-write": (1, "a string: the toy derivation script's source text")},
-    "toolkit/spec/engine_parameters.py": {"open-write": (1, "ToySpecEngine's call log (self-test toy engine; its log "
-                                                            "path is a temporary file the self-test names)")},
     "tools/run_console/run_console.py": {"remove": (2, "the console's own temporary answers file (tempfile.mkstemp)")},
 }
 

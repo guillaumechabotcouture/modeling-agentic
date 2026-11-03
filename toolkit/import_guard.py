@@ -9,8 +9,8 @@ goes through `resolve(kind, "module:attr")` or `module(kind, "module")`, which c
 policy before anything is imported; scripts/import_audit.py fails CI on a dynamic import that does not.
 
 Policies (a module must also be a file of this repo, checked without importing it):
-  engine      modules under toolkit.engines (an Engine class), plus the self-test toy engines
-              toolkit.spec.priors:ToyPriorEngine and toolkit.spec.engine_parameters:ToySpecEngine / ToySpecRateEngine
+  engine      modules under toolkit.engines (an Engine class), plus toolkit.spec.priors:ToyPriorEngine (a toy that
+              reads its priors file and writes nothing)
   oracle      modules under toolkit.engines whose last part is `oracles` (benchmark data generators), and
               toolkit.engines.benchmark (its self-test generator, used across worker processes)
   calibrator  toolkit.analysis.calibration, or a module under toolkit.engines (benchmark calibrators)
@@ -26,9 +26,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 POLICIES = {
-    "engine": {"prefixes": ("toolkit.engines.",), "modules": (),
-               "refs": ("toolkit.spec.priors:ToyPriorEngine", "toolkit.spec.engine_parameters:ToySpecEngine",
-                        "toolkit.spec.engine_parameters:ToySpecRateEngine"),
+    "engine": {"prefixes": ("toolkit.engines.",), "modules": (), "refs": ("toolkit.spec.priors:ToyPriorEngine",),
                "suffix": None},
     # toolkit.engines.benchmark holds the self-test's generator used across worker processes
     "oracle": {"prefixes": ("toolkit.engines.",), "modules": ("toolkit.engines.benchmark",), "refs": (),
@@ -37,6 +35,11 @@ POLICIES = {
                    "suffix": None},
 }
 _TEST_MODULES: dict = {k: set() for k in POLICIES}
+# Self-test toy engines that are never allowed in production (ToySpecEngine appends to a path its configuration names).
+# Only these references can be enabled, and only by a self-test (allow_test_refs), for its process and the worker
+# processes it starts (an environment variable they inherit); a production run never sets it.
+TEST_ONLY_REFS = {"engine": ("toolkit.spec.toy_engines:ToySpecEngine", "toolkit.spec.toy_engines:ToySpecRateEngine")}
+_TEST_REFS_ENV = "MA_IMPORT_GUARD_TEST_REFS"
 ENGINE_METHODS = ("describe", "parameters", "run")      # the Engine contract (toolkit/engines/contract.py)
 _MOD = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*")
 _ATTR = re.compile(r"[A-Za-z]\w*")
@@ -44,6 +47,29 @@ _ATTR = re.compile(r"[A-Za-z]\w*")
 
 class ImportRefused(ValueError):
     """A data-supplied module or attribute name the kind's policy does not allow (nothing was imported)."""
+
+
+def allow_test_refs(kind: str, refs) -> None:
+    """Self-tests only: enable named self-test toy engines (TEST_ONLY_REFS) in this process and its worker processes.
+    Any other reference is refused."""
+    import json as _json
+    refs = list(refs)
+    bad = [r for r in refs if r not in TEST_ONLY_REFS.get(kind, ())]
+    if bad:
+        raise ImportRefused(f"{kind} {bad}: only the self-test toy engines {TEST_ONLY_REFS.get(kind, ())} can be "
+                            "enabled for a test")
+    cur = set(_test_refs())
+    cur |= {f"{kind}|{r}" for r in refs}
+    os.environ[_TEST_REFS_ENV] = _json.dumps(sorted(cur))
+
+
+def _test_refs() -> list:
+    import json as _json
+    try:
+        v = _json.loads(os.environ.get(_TEST_REFS_ENV) or "[]")
+    except ValueError:
+        return []
+    return [x for x in v if isinstance(x, str)] if isinstance(v, list) else []
 
 
 def allow_for_test(kind: str, module: str) -> None:
@@ -82,6 +108,10 @@ def check_ref(kind: str, ref) -> tuple[str, str]:
         raise ImportRefused(f"{kind} {ref}: attribute {attr!r} is not a public name")
     if ref in POLICIES.get(kind, {}).get("refs", ()):
         return mod, attr
+    if ref in TEST_ONLY_REFS.get(kind, ()):        # never by module prefix: only a self-test's registration
+        if f"{kind}|{ref}" in _test_refs() and _repo_module(mod):
+            return mod, attr
+        raise ImportRefused(f"{kind} {ref}: a self-test toy engine, refused outside a self-test")
     return check_module(kind, mod), attr
 
 

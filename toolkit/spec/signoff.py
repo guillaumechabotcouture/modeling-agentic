@@ -555,12 +555,15 @@ def _self_test() -> int:
         finally:
             builtins.open, os.open = real_open, real_osopen
         ok(len(opens) == 1, f"SG24 write_sheet reads the spec once and renders and hashes those bytes ({len(opens)})")
+    from toolkit import import_guard as _G
+    from toolkit.spec import toy_engines as _TOYS
+    _G.allow_test_refs("engine", _TOYS.REFS)       # the self-test toy engines (refused in production)
     # Spec-declared engine parameter values (toolkit/spec/engine_parameters.py): the sheet shows each with its source,
     # its reason and the card value it replaces; a value outside the card's range is a HIGH note the owner signs.
     with tempfile.TemporaryDirectory() as d:
         p = schema.toy_spec(d)
         raw = yaml.safe_load(open(p))
-        raw["engine"] = {"ref": "toolkit.spec.engine_parameters:ToySpecEngine"}
+        raw["engine"] = {"ref": "toolkit.spec.toy_engines:ToySpecEngine"}
         raw["engine_parameters"] = {
             "base": {"value": 0.3, "outside_card_range": True, "source": "a toy sweep", "reason": "toy headline"},
             "k": {"value": 0.9, "source": "a toy survey", "reason": "toy setting"}}
@@ -572,7 +575,7 @@ def _self_test() -> int:
            and "0.4" in sec and "0.6" in sec and "a toy survey" in sec and "0.8" in sec,
            f"SV1 the sheet lists each spec value (source, reason, card value) and a HIGH note for the one outside the "
            f"card's range: {sec[:300]!r}")
-        raw["engine"] = {"auto": True, "candidates": ["toolkit.spec.engine_parameters:ToySpecEngine",
+        raw["engine"] = {"auto": True, "candidates": ["toolkit.spec.toy_engines:ToySpecEngine",
                                                       "toolkit.engines.contract:ToyEngine"]}
         yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
         sec = sheet(d).split("## Engine parameter values set by the spec")[-1].split("\n## ")[0]
@@ -581,12 +584,12 @@ def _self_test() -> int:
         # review round 2 (R2-4): a string engine reference, and engine: auto with the candidates of the pre-sign check
         def sec_of(md):
             return md.split("## Engine parameter values set by the spec")[-1].split("\n## ")[0]
-        raw["engine"] = "toolkit.spec.engine_parameters:ToySpecEngine"
+        raw["engine"] = "toolkit.spec.toy_engines:ToySpecEngine"
         yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
         sec = sec_of(sheet(d))
         ok("ToySpecEngine" in sec and sec.count("**HIGH**") == 1 and "0.4" in sec,
            f"SV3 a string engine reference shows its card values and the HIGH note: {sec[:300]!r}")
-        cands = [{"ref": "toolkit.spec.engine_parameters:ToySpecEngine", "eligible": True, "why_not": []}]
+        cands = [{"ref": "toolkit.spec.toy_engines:ToySpecEngine", "eligible": True, "why_not": []}]
         for eng in ("auto", {"auto": True}):
             raw["engine"] = eng
             yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
@@ -605,7 +608,7 @@ def _self_test() -> int:
         ok("PackageRateEngine`: not a parameter of this engine" in sec and "card not loaded" not in sec,
            f"SV6 a candidate's configuration is kept when its card is loaded: {sec[:400]!r}")
         # review round 4 (R4-2): the spec lists the candidates and the pre-sign check supplies their configurations
-        raw["engine"] = {"auto": True, "candidates": ["toolkit.spec.engine_parameters:ToySpecEngine",
+        raw["engine"] = {"auto": True, "candidates": ["toolkit.spec.toy_engines:ToySpecEngine",
                                                       "toolkit.engines.empirical.engine:PackageRateEngine"]}
         yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
         sec = sec_of(sheet(d, candidates=[{"ref": "toolkit.engines.empirical.engine:PackageRateEngine",
