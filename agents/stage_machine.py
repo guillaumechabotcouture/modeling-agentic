@@ -894,7 +894,22 @@ class Machine:
             except Exception:  # noqa: BLE001 -- the spec's own findings say why; the data refs need it
                 spec = None
             out += P.derivation_findings(self.run_dir, spec, required=self.st.derived_inputs)
+        out += self._geometry_findings()
         return out
+
+    def _geometry_findings(self) -> list[dict]:
+        """The standing input geometry check (toolkit/spec/geometry.py, docs/design/v2-input-geometry.md): the units'
+        coordinates and areas against the declared boundaries, re-run on the current files at every gate."""
+        if not os.path.exists(os.path.join(self.run_dir, AB.SPEC_FILE)):
+            return []
+        from toolkit.spec import geometry as GEO
+        return GEO.findings(GEO.run(self.run_dir))
+
+    def _geometry_problems(self) -> list[str]:
+        """Before SIGN: a HIGH geometry finding not accepted by name in the spec, or a check that failed on its
+        declared inputs. Writes data/input_checks.json, which the sign-off sheet reads."""
+        from toolkit.spec import geometry as GEO
+        return [f"{p['code']}: {p['claim']}" for p in GEO.problems(GEO.run(self.run_dir))]
 
     def _signed_ref(self, run_dir: str):
         """The signed spec's sha256: from the backend's own sign-off (B) or the machine's."""
@@ -992,10 +1007,12 @@ class Machine:
                         errs = [f"{p['code']}: {p['claim']}" for p in P.derivation_problems(
                             self.run_dir, self._spec(), required=True)]
                     errs = errs or self.backend.pre_sign_problems(self.run_dir, derived=True)
+                    errs = errs or self._geometry_problems()
                     if not errs:
                         self._write_sheet()
                 else:
                     errs = errs or self.backend.pre_sign_problems(self.run_dir)
+                    errs = errs or self._geometry_problems()
             except Exception as e:  # noqa: BLE001
                 errs = [f"spec unreadable: {e}"]
         if errs:

@@ -60,7 +60,22 @@ class GeometryError(ValueError):
 # --------------------------------------------------------------------------- thresholds
 def thresholds(path: str | None = None) -> dict:
     """{edge_tolerance_km, area_ratio_max} from effort_floors.yaml `input_checks.geometry` (fail closed)."""
-    raise NotImplementedError("input geometry check: step beta")
+    import yaml
+    p = path or THRESHOLDS_FILE
+    try:
+        doc = yaml.safe_load(open(p, encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as e:
+        raise GeometryError(f"{p}: unreadable thresholds: {e}") from e
+    g = ((doc.get("input_checks") or {}) if isinstance(doc, dict) else {}).get("geometry")
+    out = {}
+    for k in ("edge_tolerance_km", "area_ratio_max"):
+        v = g.get(k) if isinstance(g, dict) else None
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0:
+            raise GeometryError(f"{p}: input_checks.geometry.{k} must be a positive number")
+        out[k] = float(v)
+    if out["area_ratio_max"] <= 1:
+        raise GeometryError(f"{p}: input_checks.geometry.area_ratio_max must exceed 1")
+    return out
 
 
 # --------------------------------------------------------------------------- declarations
@@ -90,13 +105,43 @@ def boundaries_config(b, base: str, shown: str) -> dict:
 def presentation_boundaries(run_dir: str) -> tuple[dict | None, str | None]:
     """(boundaries config or None, the presentation file's name or None). Both presentation files, an unreadable
     file, or a malformed block: GeometryError."""
-    raise NotImplementedError("input geometry check: step beta")
+    import yaml
+    found = [n for n in PRESENTATION_FILES if os.path.exists(os.path.join(run_dir, n))]
+    if len(found) > 1:
+        raise GeometryError(f"{run_dir}: both presentation.yaml and labels.yaml; keep one presentation file")
+    if not found:
+        return None, None
+    path = os.path.join(run_dir, found[0])
+    try:
+        doc = yaml.safe_load(open(path, encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as e:
+        raise GeometryError(f"{found[0]}: unreadable presentation file: {e}") from e
+    doc = {} if doc is None else doc
+    if not isinstance(doc, dict):
+        raise GeometryError(f"{found[0]}: a mapping with labels and/or boundaries")
+    if doc.get("boundaries") is None:
+        return None, found[0]
+    return boundaries_config(doc["boundaries"], os.path.dirname(path), found[0]), found[0]
 
 
 def unit_columns(du: dict, header: list[str]) -> tuple[dict, list[str]]:
     """({id, lat, lon, area, from}, problems). Declared decision_units.coordinates {lat, lon, area_km2} win; else
     the figures' column names. A declared column the table lacks is a problem (fail closed)."""
-    raise NotImplementedError("input geometry check: step beta")
+    c = du.get("coordinates")
+    bad = []
+    if c is not None and not (isinstance(c, dict) and all(isinstance(c.get(k), str) and c[k].strip()
+                                                           for k in c) and set(c) <= {"lat", "lon", "area_km2"}):
+        return {}, ["decision_units.coordinates: a mapping {lat, lon, area_km2} of column names"]
+    c = c or {}
+    low = {h.lower(): h for h in header}
+    lat = c.get("lat") or next((low[k] for k in LAT_NAMES if k in low), None)
+    lon = c.get("lon") or next((low[k] for k in LON_NAMES if k in low), None)
+    area = c.get("area_km2") or next((low[k] for k in AREA_NAMES if k in low), None)
+    for k, v in (("lat", c.get("lat")), ("lon", c.get("lon")), ("area_km2", c.get("area_km2"))):
+        if v and v not in header:
+            bad.append(f"decision_units.coordinates.{k}: the units table has no column {v}")
+    return {"id": du.get("id"), "lat": lat, "lon": lon, "area": area,
+            "from": "declared" if c else "column names"}, bad
 
 
 # --------------------------------------------------------------------------- reading
@@ -123,13 +168,56 @@ def read_features(cfg: dict) -> dict:
     """{feature id: [polygon]} with polygon = [outer ring, hole, ...] and ring = [(lon, lat)], from a GeoJSON
     FeatureCollection of Polygon and MultiPolygon features. Features sharing an id are parts of one unit (the
     figures' rule). Anything else: GeometryError."""
-    raise NotImplementedError("input geometry check: step beta")
+    shown = cfg.get("shown") or cfg["path"]
+    try:
+        with open(cfg["path"], encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, ValueError) as e:
+        raise GeometryError(f"{shown}: unreadable boundary file: {e}") from e
+    feats = doc.get("features") if isinstance(doc, dict) else None
+    if not isinstance(feats, list) or not feats:
+        raise GeometryError(f"{shown}: not a GeoJSON FeatureCollection with features")
+    out: dict = {}
+    for k, f in enumerate(feats):
+        g = f.get("geometry") if isinstance(f, dict) else None
+        props = f.get("properties") if isinstance(f, dict) else None
+        if not isinstance(g, dict) or not isinstance(props, dict):
+            raise GeometryError(f"{shown}: feature {k} lacks geometry or properties")
+        if props.get(cfg["feature_id"]) in (None, ""):
+            raise GeometryError(f"{shown}: feature {k} has no property {cfg['feature_id']}")
+        typ, co = g.get("type"), g.get("coordinates")
+        polys = [co] if typ == "Polygon" else co if typ == "MultiPolygon" else None
+        if not isinstance(polys, list) or not polys:
+            raise GeometryError(f"{shown}: feature {k} geometry {typ!r} is not a Polygon or MultiPolygon")
+        parts = []
+        for poly in polys:
+            if not isinstance(poly, list) or not poly:
+                raise GeometryError(f"{shown}: feature {k} has malformed coordinates")
+            parts.append([_ring(r, k, shown) for r in poly])
+        out.setdefault(str(props[cfg["feature_id"]]), []).extend(parts)
+    return out
 
 
 def read_crosswalk(c: dict) -> dict:
     """{unit id: feature id}; rows with an empty feature id are skipped (no polygon). A unit listed twice with two
     different features: GeometryError."""
-    raise NotImplementedError("input geometry check: step beta")
+    shown = c.get("shown") or c["path"]
+    try:
+        with open(c["path"], newline="", encoding="utf-8") as fh:
+            rows = list(csv.DictReader(fh))
+    except (OSError, csv.Error, UnicodeDecodeError) as e:
+        raise GeometryError(f"{shown}: unreadable crosswalk: {e}") from e
+    if not rows or c["unit_id"] not in rows[0] or c["feature_id"] not in rows[0]:
+        raise GeometryError(f"{shown}: the crosswalk needs columns {c['unit_id']} and {c['feature_id']}")
+    out: dict = {}
+    for r in rows:
+        u, fid = str(r[c["unit_id"]] or "").strip(), str(r[c["feature_id"]] or "").strip()
+        if not u or not fid:
+            continue
+        if out.get(u, fid) != fid:
+            raise GeometryError(f"{shown}: unit {u} maps to two features ({out[u]}, {fid})")
+        out[u] = fid
+    return out
 
 
 def read_table(path: str) -> list[dict]:
@@ -157,7 +245,7 @@ def _in_ring(ring, x, y) -> bool:
 
 def contains(polys, x, y) -> bool:
     """Inside a part's outer ring and in none of its holes, for any part."""
-    raise NotImplementedError("input geometry check: step beta")
+    return any(_in_ring(p[0], x, y) and not any(_in_ring(h, x, y) for h in p[1:]) for p in polys)
 
 
 def bbox(polys) -> tuple:
@@ -168,7 +256,19 @@ def bbox(polys) -> tuple:
 
 def distance_km(polys, x, y) -> float:
     """Shortest distance from the point to any ring edge, on a plane scaled by cos(latitude) at the point."""
-    raise NotImplementedError("input geometry check: step beta")
+    kx, ky = KM_PER_DEG * math.cos(math.radians(y)), KM_PER_DEG
+    best = math.inf
+    for p in polys:
+        for ring in p:
+            n = len(ring)
+            for i in range(n):
+                ax, ay = (ring[i][0] - x) * kx, (ring[i][1] - y) * ky
+                bx, by = (ring[(i + 1) % n][0] - x) * kx, (ring[(i + 1) % n][1] - y) * ky
+                dx, dy = bx - ax, by - ay
+                L = dx * dx + dy * dy
+                t = 0.0 if L == 0 else max(0.0, min(1.0, -(ax * dx + ay * dy) / L))
+                best = min(best, math.hypot(ax + t * dx, ay + t * dy))
+    return best
 
 
 def _shoelace(ring) -> float:
@@ -184,7 +284,12 @@ def _shoelace(ring) -> float:
 def area_km2(polys) -> float:
     """Outer rings less holes, each part on a plane scaled by cos(its mean latitude) (error ~ dlat^2/24 for a part
     spanning dlat radians)."""
-    raise NotImplementedError("input geometry check: step beta")
+    tot = 0.0
+    for p in polys:
+        lat0 = sum(y for _, y in p[0]) / len(p[0])
+        k = KM_PER_DEG * KM_PER_DEG * math.cos(math.radians(lat0))
+        tot += k * (_shoelace(p[0]) - sum(_shoelace(h) for h in p[1:]))
+    return max(tot, 0.0)
 
 
 # --------------------------------------------------------------------------- the check
@@ -202,7 +307,142 @@ def _ratio(a, b):
 
 def evaluate(rows: list[dict], cols: dict, feats: dict, xw: dict | None, th: dict) -> dict:
     """The four checks on parsed inputs: {counts, findings, checks}. Pure: no files."""
-    raise NotImplementedError("input geometry check: step beta")
+    uid, latc, lonc, areac = cols["id"], cols["lat"], cols["lon"], cols.get("area")
+    tol, rmax = th["edge_tolerance_km"], th["area_ratio_max"]
+    ids = [str(r.get(uid, "")).strip() for r in rows]
+    by = dict(zip(ids, rows))
+    boxes = {fid: bbox(p) for fid, p in feats.items()}
+    areas = {fid: area_km2(p) for fid, p in feats.items()}
+    findings, own, pt = [], {}, {}
+    claim_of: dict = {}
+    for u in ids:
+        fid = (xw or {}).get(u) if xw is not None else u
+        why = []
+        if fid is None:
+            why.append("no crosswalk row")
+        elif fid not in feats:
+            why.append(f"feature {fid} is not in the boundary file")
+        else:
+            own[u] = fid
+            claim_of.setdefault(fid, []).append(u)
+        lon, lat = _num(by[u].get(lonc)), _num(by[u].get(latc))
+        if lon is None or lat is None or not (-180 <= lon <= 180 and -90 <= lat <= 90):
+            why.append("no usable coordinates")
+        else:
+            pt[u] = (lon, lat)
+        if why:
+            findings.append({"id": f"unmatched:{u}", "code": "unmatched", "severity": "MEDIUM", "units": [u],
+                             "claim": f"unit {u}: {' and '.join(why)}; its point and area cannot be checked",
+                             "evidence": {"feature": fid}})
+    for fid, us in sorted(claim_of.items()):
+        if len(us) > 1:
+            findings.append({"id": f"unmatched:feature:{fid}", "code": "unmatched", "severity": "HIGH", "units": us,
+                             "claim": f"feature {fid} is claimed by {len(us)} units ({', '.join(us)}): at most one "
+                                      "of them has its own polygon", "evidence": {"feature": fid}})
+
+    def holders(x, y):
+        return [f for f, (x0, y0, x1, y1) in boxes.items() if x0 <= x <= x1 and y0 <= y <= y1
+                and contains(feats[f], x, y)]
+    inside, outside = {}, {}
+    for u, fid in own.items():
+        if u not in pt:
+            continue
+        inside[u] = contains(feats[fid], *pt[u])
+        if not inside[u]:
+            outside[u] = {"distance_km": distance_km(feats[fid], *pt[u]), "in": holders(*pt[u])}
+    swapped: dict = {}
+    for a in sorted(outside):
+        for fb in outside[a]["in"]:
+            for b in claim_of.get(fb, []):
+                if b != a and b in pt and b in own and contains(feats[own[a]], *pt[b]) and a not in swapped:
+                    swapped[a], swapped[b] = b, a
+    area_of = {}
+    if areac:
+        for u in own:
+            area_of[u] = _num(by[u].get(areac))
+    done = set()
+    for a in sorted(swapped):
+        b = swapped[a]
+        if a in done:
+            continue
+        done |= {a, b}
+        ev = {"features": {a: own[a], b: own[b]},
+              "distance_km": {a: round(outside[a]["distance_km"], 2), b: round(outside[b]["distance_km"], 2)}}
+        if areac and area_of.get(a) and area_of.get(b):
+            own_r = [_ratio(area_of[a], areas[own[a]]), _ratio(area_of[b], areas[own[b]])]
+            sw_r = [_ratio(area_of[a], areas[own[b]]), _ratio(area_of[b], areas[own[a]])]
+            ev["area_ratio_own"], ev["area_ratio_swapped"] = [round(r, 3) for r in own_r], [round(r, 3) for r in sw_r]
+            ev["areas_consistent_with_swap"] = max(sw_r) < min(own_r) or (max(sw_r) <= rmax < max(own_r))
+        findings.append({"id": f"reciprocal_swap:{a}+{b}", "code": "reciprocal_swap", "severity": "HIGH",
+                         "units": [a, b], "evidence": ev,
+                         "claim": f"units {a} and {b}: each unit's point lies inside the other's polygon; the two "
+                                  "rows' geometry-derived fields (coordinates, area, and anything computed from "
+                                  "them, such as population or raster values) are probably exchanged"
+                                  + ("; the declared areas match the swapped polygons better"
+                                     if ev.get("areas_consistent_with_swap") else "")})
+    for u in sorted(outside):
+        if u in swapped:
+            continue
+        o = outside[u]
+        other = [f for f in o["in"] if f != own[u]]
+        ev = {"feature": own[u], "distance_km": round(o["distance_km"], 2), "in_features": other,
+              "in_units": sorted({b for f in other for b in claim_of.get(f, [])})}
+        if o["distance_km"] <= tol:
+            findings.append({"id": f"point_outside_own_polygon:{u}", "code": "point_outside_own_polygon",
+                             "severity": "LOW", "edge": True, "units": [u], "evidence": ev,
+                             "claim": f"unit {u}: the point is {o['distance_km']:.1f} km outside its own polygon "
+                                      f"(within the {tol:g} km edge tolerance)"})
+        else:
+            where = (f"; it lies in feature {other[0]}" + (f" (unit {', '.join(ev['in_units'])})" if ev["in_units"]
+                                                           else "") if other else "; it lies in no polygon")
+            findings.append({"id": f"point_outside_own_polygon:{u}", "code": "point_outside_own_polygon",
+                             "severity": "HIGH", "units": [u], "evidence": ev,
+                             "claim": f"unit {u}: the point is {o['distance_km']:.1f} km outside its own polygon "
+                                      f"(edge tolerance {tol:g} km){where}"})
+    if areac:
+        for u in sorted(own):
+            if u in swapped:
+                continue
+            d, pa = area_of.get(u), areas[own[u]]
+            if d is None or d <= 0:
+                findings.append({"id": f"area_mismatch:{u}", "code": "area_mismatch", "severity": "MEDIUM",
+                                 "units": [u], "evidence": {"declared_km2": d, "polygon_km2": round(pa, 1)},
+                                 "claim": f"unit {u}: no positive declared area in column {areac}"})
+                continue
+            r = _ratio(d, pa)
+            if r <= rmax:
+                continue
+            ev = {"declared_km2": round(d, 1), "polygon_km2": round(pa, 1), "ratio": round(r, 3)}
+            sev, extra = "MEDIUM", ""
+            # the polygon the point falls in, when it lies beyond the edge tolerance (an edge-case point says
+            # nothing about which polygon the row's fields came from)
+            o = outside.get(u) or {}
+            alt = [f for f in o.get("in", []) if f != own[u]] if o.get("distance_km", 0) > tol else []
+            if alt:
+                rs = _ratio(d, areas[alt[0]])
+                ev.update(point_feature=alt[0], point_feature_km2=round(areas[alt[0]], 1), ratio_swapped=round(rs, 3))
+                if rs < r and rs <= rmax:
+                    sev, extra = "HIGH", (f"; it matches feature {alt[0]}, where the point lies, better "
+                                          f"(ratio {rs:.2f}): the row's geometry fields probably belong elsewhere")
+            findings.append({"id": f"area_mismatch:{u}", "code": "area_mismatch", "severity": sev, "units": [u],
+                             "evidence": ev,
+                             "claim": f"unit {u}: declared area {d:,.0f} km2, polygon {pa:,.0f} km2 (ratio {r:.2f} "
+                                      f"> {rmax:g}){extra}"})
+    edge = [f for f in findings if f.get("edge")]
+    counts = {"units": len(ids), "features": len(feats), "units_with_polygon": len(own), "units_with_point": len(pt),
+              "points_checked": len(inside), "points_inside": sum(inside.values()), "edge_cases": len(edge),
+              "reciprocal_swaps": sum(f["code"] == "reciprocal_swap" for f in findings),
+              "points_outside": sum(f["code"] == "point_outside_own_polygon" and not f.get("edge") for f in findings),
+              "area_checked": len([u for u in own if u not in swapped]) if areac else 0,
+              "area_mismatches": sum(f["code"] == "area_mismatch" for f in findings),
+              "area_mismatches_escalated": sum(f["code"] == "area_mismatch" and f["severity"] == "HIGH"
+                                               for f in findings),
+              "units_unmatched": sum(f["id"].startswith("unmatched:") and not f["id"].startswith("unmatched:feature:")
+                                     for f in findings),
+              "features_claimed_twice": sum(f["id"].startswith("unmatched:feature:") for f in findings)}
+    checks = {"point": "ran", "reciprocal": "ran",
+              "area": "ran" if areac else "not run: no area column declared", "unmatched": "ran"}
+    return {"counts": counts, "findings": findings, "checks": checks}
 
 
 def _sha(path: str) -> str | None:
@@ -227,7 +467,63 @@ def _load_spec(run_dir: str):
 def check(run_dir: str, spec: dict | None = None, th: dict | None = None) -> dict:
     """The report for a run directory: status ran | not_run | failed, with reason, inputs (paths and sha256), the
     thresholds, counts, findings (each marked with its acceptance) and acceptance problems. Never raises."""
-    raise NotImplementedError("input geometry check: step beta")
+    rep = {"producer": PRODUCER, "version": 1, "status": "failed", "reason": None, "inputs": {}, "thresholds": None,
+           "counts": {}, "checks": {}, "findings": [], "acceptance_problems": []}
+    try:
+        spec = _load_spec(run_dir) if spec is None else spec
+        du = spec.get("decision_units") if isinstance(spec, dict) else None
+        if not isinstance(du, dict) or not isinstance(du.get("csv"), str) or not du.get("id"):
+            raise GeometryError("decision_units: the spec names no units table and id column")
+        acc = du.get(ACCEPT_KEY)
+        if acc is not None and not (isinstance(acc, dict) and all(isinstance(k, str) and isinstance(v, str)
+                                                                  and v.strip() for k, v in acc.items())):
+            rep["acceptance_problems"].append(f"decision_units.{ACCEPT_KEY}: a mapping of finding id to a reason")
+            acc = {}
+        acc = acc or {}
+        cfg, pres = presentation_boundaries(run_dir)
+        upath = du["csv"] if os.path.isabs(du["csv"]) else os.path.join(run_dir, du["csv"])
+        rows = read_table(upath)
+        header = list(rows[0]) if rows else []
+        if not rows:
+            raise GeometryError(f"{du['csv']}: the units table is empty")
+        cols, bad = unit_columns(du, header)
+        if bad:
+            raise GeometryError("; ".join(bad))
+        if cols["id"] not in header:
+            raise GeometryError(f"{du['csv']}: no id column {cols['id']}")
+        rep["inputs"] = {"units": {"path": du["csv"], "sha256": _sha(upath)}, "columns": cols,
+                         "presentation": pres}
+        why = []
+        if not (cols["lat"] and cols["lon"]):
+            why.append("no coordinates declared (decision_units.coordinates {lat, lon}, or lat/lon columns)")
+        if cfg is None:
+            why.append("no boundaries declared (presentation.yaml boundaries: {path, feature_id, crosswalk})")
+        if why:
+            rep.update(status="not_run", reason="not run: " + "; ".join(why))
+            rep["acceptance_problems"] += [f"decision_units.{ACCEPT_KEY}: {k} names no current finding (the check "
+                                           "did not run)" for k in sorted(acc)]
+            return rep
+        th = th or thresholds()
+        rep["thresholds"] = th
+        feats = read_features(cfg)
+        xw = read_crosswalk(cfg["crosswalk"]) if cfg.get("crosswalk") else None
+        rep["inputs"]["boundaries"] = {"path": cfg["shown"], "feature_id": cfg["feature_id"], "sha256": _sha(cfg["path"])}
+        if cfg.get("crosswalk"):
+            c = cfg["crosswalk"]
+            rep["inputs"]["crosswalk"] = {"path": c["shown"], "unit_id": c["unit_id"], "feature_id": c["feature_id"],
+                                          "sha256": _sha(c["path"])}
+        ev = evaluate(rows, cols, feats, xw, th)
+        ids = {f["id"] for f in ev["findings"]}
+        for f in ev["findings"]:
+            f["accepted"] = acc.get(f["id"])
+        rep["acceptance_problems"] += [f"decision_units.{ACCEPT_KEY}: {k} names no current finding" for k in sorted(acc)
+                                       if k not in ids]
+        rep.update(status="ran", counts=ev["counts"], checks=ev["checks"], findings=ev["findings"])
+    except GeometryError as e:
+        rep.update(status="failed", reason=str(e))
+    except Exception as e:  # noqa: BLE001 -- fail closed: an unexpected input is a finding, not a crash
+        rep.update(status="failed", reason=f"{type(e).__name__}: {e}")
+    return rep
 
 
 def write(run_dir: str, rep: dict) -> str:
@@ -253,18 +549,68 @@ _ACCEPT_HINT = (f"fix the data (the derivation, the crosswalk or the boundary fi
 
 def problems(rep: dict) -> list[dict]:
     """What blocks SIGN: [{code, claim}] (the derivation_problems shape)."""
-    raise NotImplementedError("input geometry check: step beta")
+    out = []
+    if rep.get("status") == "failed":
+        out.append({"code": FAILED, "claim": f"the input geometry check could not run on its declared inputs: "
+                                             f"{rep.get('reason')}"})
+    out += [{"code": ACCEPT_BAD, "claim": p} for p in rep.get("acceptance_problems") or []]
+    out += [{"code": f["code"], "claim": f"{f['claim']} [{f['id']}]: {_ACCEPT_HINT}"}
+            for f in rep.get("findings") or [] if f.get("severity") == "HIGH" and not f.get("accepted")]
+    return out
 
 
 def findings(rep: dict) -> list[dict]:
     """The gate's view: unaccepted HIGH (not declarable) and MEDIUM (declarable) findings, a failed check (HIGH),
     and LOW notes for a check that did not run and for edge cases. Stage PLAN, as the derivation findings."""
-    raise NotImplementedError("input geometry check: step beta")
+    base = {"stage": "PLAN", "target_stage": "PLAN"}
+    out = [dict(base, kind=p["code"], severity="HIGH", scope_declarable=False, key=p["code"], claim=p["claim"])
+           for p in problems(rep) if p["code"] in (FAILED, ACCEPT_BAD)]
+    for f in rep.get("findings") or []:
+        if f.get("accepted") or f["severity"] not in ("HIGH", "MEDIUM"):
+            continue
+        out.append(dict(base, kind=f["code"], severity=f["severity"], scope_declarable=f["severity"] != "HIGH",
+                        key=f["id"][:60], claim=f"{f['claim']} [{f['id']}]"))
+    if rep.get("status") == "not_run":
+        out.append(dict(base, kind=NOT_RUN, severity="LOW", scope_declarable=True, key="geometry",
+                        claim=f"input geometry check {rep.get('reason')}: the units' coordinates and areas were "
+                              "not checked against boundaries"))
+    edge = [f for f in rep.get("findings") or [] if f.get("edge")]
+    if edge:
+        out.append(dict(base, kind=EDGE, severity="LOW", scope_declarable=True, key="geometry_edge",
+                        claim=f"{len(edge)} unit point(s) lie just outside their own polygon, within the "
+                              f"{(rep.get('thresholds') or {}).get('edge_tolerance_km')} km edge tolerance: "
+                              + ", ".join(f["units"][0] for f in edge[:12]) + (" ..." if len(edge) > 12 else "")))
+    return out
 
 
 def sheet_lines(run_dir: str) -> list[str]:
     """The sign-off sheet's section, from the artifact the harness wrote."""
-    raise NotImplementedError("input geometry check: step beta")
+    out = ["## Input geometry check"]
+    try:
+        rep = json.load(open(os.path.join(run_dir, ARTIFACT), encoding="utf-8"))
+    except (OSError, ValueError):
+        return out + [f"No record ({ARTIFACT} is missing): the check has not run.", ""]
+    st = rep.get("status")
+    if st == "not_run":
+        return out + [f"The check did not run: {rep.get('reason')}.", ""]
+    if st == "failed":
+        return out + [f"The check failed: {rep.get('reason')}.", ""]
+    c = rep.get("counts") or {}
+    out.append(f"Checked {c.get('points_checked')} unit point(s) against {c.get('features')} boundary feature(s): "
+               f"{c.get('reciprocal_swaps')} reciprocal swap(s), {c.get('points_outside')} point(s) outside their "
+               f"polygon beyond the tolerance, {c.get('edge_cases')} edge case(s), {c.get('area_mismatches')} area "
+               f"mismatch(es), {c.get('units_unmatched')} unmatched unit(s), {c.get('features_claimed_twice')} "
+               f"feature(s) claimed twice. Area check: {(rep.get('checks') or {}).get('area')}.")
+    acc = [f for f in rep.get("findings") or [] if f.get("accepted")]
+    out.append("")
+    out.append("Accepted by name (signing accepts these rows as they are):")
+    out += [f"- **{f['id']}** ({f['severity']}): {f['claim']}. Reason: {f['accepted']}" for f in acc] or ["- none"]
+    opn = [f for f in rep.get("findings") or [] if not f.get("accepted") and f["severity"] in ("HIGH", "MEDIUM")]
+    if opn:
+        out.append("")
+        out.append("Open (MEDIUM findings stay open at the gate):")
+        out += [f"- {f['id']} ({f['severity']}): {f['claim']}" for f in opn]
+    return out + [""]
 
 
 # --------------------------------------------------------------------------- CLI

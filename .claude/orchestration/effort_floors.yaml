@@ -192,3 +192,20 @@ floors:
       handlers, hard-coded "shortcut" literals (n_replicates=1,
       maxiter=10, n_draws=10, n_trials=5). Each marker is one
       MEDIUM; >= 3 markers escalates to HIGH (handled in validator).
+
+# Input geometry check (toolkit/spec/geometry.py; docs/design/v2-input-geometry.md). These are tolerances of a
+# standing data check, not effort floors. They live here, not in toolkit/analysis/thresholds.yaml, because that
+# file is hashed into every benchmark's declaration digest (toolkit/engines/benchmark.py declaration_digest): a key
+# added there would mark every stored benchmark stamp stale.
+input_checks:
+  geometry:
+    # A point outside its own polygon by at most this distance is an edge case (LOW), not a finding. 5 km covers
+    # the error sources that move a correct point across a border: boundary simplification (vertex displacement of
+    # ~1-2 km in the simplified boundary sets used for maps), coordinates rounded to 0.01 degree (~1.1 km), and
+    # reference points such as a main town placed near a border. A swapped row's point usually lies tens of km
+    # outside; reciprocal swaps are found whatever the distance.
+    edge_tolerance_km: 5.0
+    # Declared and polygon areas may differ by up to this factor. Simplification changes polygon areas by a few
+    # percent, and boundary vintages by tens of percent; 1.5 tolerates both and still flags a row carrying a
+    # neighbour's area when the two units differ in size by half or more.
+    area_ratio_max: 1.5

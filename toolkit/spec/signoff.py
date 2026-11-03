@@ -165,6 +165,8 @@ def sheet(run_dir: str, candidates: list | None = None) -> str:
     out += ["", "## Derivations"] + [f"- **{d['id']}**: `{d['script']}` reads {len(d['inputs'])} file(s), writes "
                                      + ", ".join(f"`{o}`" for o in d["outputs"]) for d in ders]
     out += [f"- declaration problem: {e}" for e in errs] + [""]
+    from toolkit.spec import geometry
+    out += geometry.sheet_lines(run_dir)       # the input geometry check and the findings accepted by name
     if candidates:
         out.append("## Candidate engines (pre-sign check)")
         for r in candidates:
