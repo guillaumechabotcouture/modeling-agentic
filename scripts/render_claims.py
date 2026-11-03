@@ -473,8 +473,8 @@ def render_run(run_dir: str) -> dict:
             body = dl.expand(run_dir, body)
         except dl.DeclaredLimitsError as e:
             limits_error.append(f"declared limits not rendered: {e}")
-        with open(report_path, "w") as f:
-            f.write(body)
+        from lib.safe_io import publish                 # no link followed (follow-up to review round 5)
+        publish(report_path, body, run_dir)
 
     protected = _fenced_or_inline_code_spans(text)
     n_refs = sum(1 for m in _CLAIM_REF_RE.finditer(text)
@@ -487,7 +487,8 @@ def render_run(run_dir: str) -> dict:
                 # Codex round 2: the expanded report has an unrendered snapshot even
                 # with no claim references, so the gate reads the draft it came from.
                 snap = os.path.join(run_dir, "report.unrendered.md")
-                shutil.copy2(source_path, snap)
+                from lib.safe_io import publish
+                publish(snap, open(source_path, "rb").read(), run_dir)
             _write_report(text)
         out = {"ok": not limits_error, "n_refs": 0, "n_unresolved": 0,
                "unresolved_ids": [], "snapshot_path": snap,
@@ -505,7 +506,8 @@ def render_run(run_dir: str) -> dict:
 
     # Snapshot the writer's draft before substitution.
     snapshot_path = os.path.join(run_dir, "report.unrendered.md")
-    shutil.copy2(source_path, snapshot_path)
+    from lib.safe_io import publish
+    publish(snapshot_path, open(source_path, "rb").read(), run_dir)
 
     new_text, unresolved = render_text(text, claims)
 

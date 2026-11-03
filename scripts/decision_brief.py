@@ -514,7 +514,8 @@ def restore(run_dir: str) -> list[str]:
     for f in FROZEN_AT_SIGNOFF:
         saved = os.path.join(run_dir, SIGNED_DIR, f)
         if os.path.exists(saved) and _sha(os.path.join(run_dir, f)) != (so.get("sha256") or {}).get(f):
-            shutil.copyfile(saved, os.path.join(run_dir, f))
+            from lib.safe_io import read_nofollow, write_nofollow
+            write_nofollow(run_dir, f, read_nofollow(run_dir, f"{SIGNED_DIR}/{f}")[0], atomic=True)
             done.append(f)
     return done
 
@@ -678,8 +679,8 @@ def gate_findings(run_dir: str) -> list[dict]:
     bt = _sha(os.path.join(run_dir, BENCHMARKS))
     if bt and BENCHMARKS not in lock:
         lock[BENCHMARKS] = {"sha256": bt, "locked_at": _dt.datetime.now(_dt.timezone.utc).isoformat()}
-        with open(lock_path, "w", encoding="utf-8") as f:
-            json.dump(lock | {"producer": "scripts/decision_brief.py"}, f, indent=1)
+        from lib.safe_io import publish
+        publish(lock_path, json.dumps(lock | {"producer": "scripts/decision_brief.py"}, indent=1), run_dir)
     elif BENCHMARKS in lock and bt != lock[BENCHMARKS].get("sha256"):
         high("acceptance_criteria_changed",
              f"{BENCHMARKS} changed after it was locked ({lock[BENCHMARKS].get('locked_at')}). Benchmark bands "

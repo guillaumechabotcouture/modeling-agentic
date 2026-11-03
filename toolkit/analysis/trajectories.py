@@ -228,9 +228,8 @@ def write(run_dir: str, data: dict, inputs: list[str]) -> str:
     doc = {"schema": "analysis.trajectories/1", "produced_by": "harness", "producer": PRODUCER,
            "inputs": {p: sha256(os.path.join(run_dir, p)) for p in inputs},
            "written_at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"), "data": plain(data)}
-    p = os.path.join(run_dir, OUT)
-    with open(p, "w") as f:
-        yaml.safe_dump(doc, f, sort_keys=False, width=120)
+    from toolkit.analysis.artifacts import _safe_io
+    _safe_io().publish(os.path.join(run_dir, OUT), yaml.safe_dump(doc, sort_keys=False, width=120), run_dir)
     return OUT
 
 

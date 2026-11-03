@@ -798,7 +798,7 @@ def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: lis
                 env["MA_COMPUTE_BREAKER_MIN"] = "0"     # a rerun tail: only the batch-wide breaker applies
             cancel_mark = os.path.join(calls, "cancel")
             cmd = [sys.executable, script, "map", run_dir, "--fn", fn_spec, "--inputs", inp,
-                   "--out", out, "--backend", "local", "--max-workers", str(procs), "--no-ledger",
+                   "--out", out, "--out-root", td, "--backend", "local", "--max-workers", str(procs), "--no-ledger",
                    "--max-tasks", str(max(1, len(chunk)))]   # the caller already enforced its limit
             if chunk_allowance_s is not None:
                 cmd += ["--max-core-hours", f"{chunk_allowance_s / 3600:.6f}"]
@@ -1605,13 +1605,16 @@ class _LedgerLock:
     """Exclusive lock on the run's compute ledger (POSIX advisory lock)."""
 
     def __init__(self, run_dir):
-        os.makedirs(os.path.join(run_dir, "models"), exist_ok=True)
+        self.run_dir = os.path.realpath(run_dir)
         self.path = os.path.join(run_dir, LEDGER_REL)
-        self.lock = self.path + ".lock"
+        self.rel = LEDGER_REL.replace(os.sep, "/")
 
     def __enter__(self):
         import fcntl
-        self.f = open(self.lock, "w")
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        from lib.safe_io import open_append_nofollow
+        self.f = open_append_nofollow(self.run_dir, self.rel + ".lock")     # never truncated, no link followed
         fcntl.flock(self.f, fcntl.LOCK_EX)
         # Only a missing ledger starts at zero: an unreadable one must not
         # hand out a fresh budget (writes are atomic, so this is not a torn write).
@@ -1632,10 +1635,11 @@ class _LedgerLock:
         return self.led
 
     def __exit__(self, *exc):
-        tmp = self.path + ".tmp"
-        json.dump(self.led, open(tmp, "w"), indent=1)
-        os.replace(tmp, self.path)
-        self.f.close()
+        from lib.safe_io import write_nofollow
+        try:
+            write_nofollow(self.run_dir, self.rel, json.dumps(self.led, indent=1).encode(), atomic=True)
+        finally:
+            self.f.close()
         return False
 
 
@@ -1773,15 +1777,15 @@ def _write_note_locked(progress: dict, rec: dict | None) -> None:
             return
         rec = dict(progress["_last"], t=time.time())
     progress["_last"] = rec
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    from lib.safe_io import publish, remove_path
     try:
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(rec, f)
-        os.replace(tmp, path)
+        publish(path, json.dumps(rec), progress.get("_root"))
     except (OSError, TypeError, ValueError):
         progress["_file"] = None
         try:
-            os.remove(path)
+            remove_path(path, progress.get("_root"))
         except FileNotFoundError:
             pass
         except OSError:
@@ -2063,8 +2067,11 @@ def _drop_progress(progress: dict) -> None:
     else:
         path, progress["_file"] = progress.get("_file"), None
     if path:
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        from lib.safe_io import remove_path
         try:
-            os.remove(path)
+            remove_path(path, progress.get("_root"))
         except OSError:
             pass
 
@@ -2098,8 +2105,9 @@ def _live_reservations(led, run_dir=None, now=None) -> float:
                                  "task_core_s": round(charge, 1), **parts, "ts": time.strftime("%FT%T")})
             path, _ = _progress_path(r.get("progress"), run_dir)
             if path:
+                from lib.safe_io import remove_path
                 try:
-                    os.remove(path)
+                    remove_path(path, run_dir)
                 except OSError:
                     pass
     return total
@@ -2153,6 +2161,7 @@ def map_fn(run_dir: str, fn_spec: str, inputs: list, backend: str = "auto",
             try:
                 os.makedirs(os.path.dirname(pfile), exist_ok=True)
                 progress["_file"], progress["_hb"] = pfile, PROGRESS_HEARTBEAT_S
+                progress["_root"] = os.path.realpath(run_dir)
                 _note(progress, [])
             except OSError:
                 progress["_file"] = None
@@ -2432,7 +2441,7 @@ def run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dict
     computed, so rerunning a stopped or partly failed batch completes it.
     Writes --out and its summary; returns (rows, summary). Phase 42 α: one
     batch at a time per --out (`<out>.lock`); a second is refused."""
-    lock = _out_lock(out)
+    lock = _out_lock(out, run_dir=run_dir)
     if lock is None:
         raise RuntimeError(f"another batch is writing {out}; wait for it (compute.py wait {out}) "
                            "or choose another --out")
@@ -2442,21 +2451,28 @@ def run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dict
         lock.close()
 
 
-def _out_base(out: str) -> tuple[str, str]:
-    """(directory, name) for no-follow writes of `out` and its sidecars: the parent resolved once, the name never
-    followed (lib.safe_io; review round 4, P1-2)."""
-    return os.path.realpath(os.path.dirname(os.path.abspath(out))), os.path.basename(out)
+def _out_base(out: str, run_dir: str) -> tuple[int, str]:
+    """(root fd, rel) for no-follow writes of `out` and its sidecars, anchored at the trusted run dir (`out` must lie
+    in it): every component below the run dir is traversed with no link followed, so a planted analysis/batch link
+    is refused, not resolved (lib.safe_io.anchored; no parent fallback). The caller closes the fd."""
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    from lib.safe_io import anchored
+    return anchored(out, run_dir)
 
 
-def _out_lock(out: str, block: bool = False, suffix: str = ".lock"):
+def _out_lock(out: str, block: bool = False, suffix: str = ".lock", run_dir: str | None = None):
     """An exclusive lock on `out` (an open file; closing releases it), or None if another process holds it. The lock
     file is opened for append with no link followed (never truncated)."""
     import fcntl
     if HERE not in sys.path:
         sys.path.insert(0, HERE)
     from lib.safe_io import open_append_nofollow
-    base, name = _out_base(out)
-    f = open_append_nofollow(base, name + suffix)
+    base, name = _out_base(out, run_dir)
+    try:
+        f = open_append_nofollow(base, name + suffix)
+    finally:
+        os.close(base)
     try:
         fcntl.flock(f, fcntl.LOCK_EX | (0 if block else fcntl.LOCK_NB))
     except OSError:
@@ -2479,11 +2495,14 @@ def _run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dic
         # The rows kept so far are copied to a new journal that replaces the old
         # one only once complete (a kill during the copy loses nothing).
         from lib.safe_io import open_append_nofollow, write_nofollow
-        base, name = _out_base(out)
+        base, name = _out_base(out, run_dir)
         journal = json.dumps({"_partial": {"fn": fn_spec, "code_fp": fp, "n": len(inputs)}}) + "\n" + "".join(
             json.dumps({**r, "key": key}) + "\n" for key, r in old.items())
-        write_nofollow(base, name + PARTIAL_EXT, journal.encode(), atomic=True)
-        part = open_append_nofollow(base, name + PARTIAL_EXT)
+        try:
+            write_nofollow(base, name + PARTIAL_EXT, journal.encode(), atomic=True)
+            part = open_append_nofollow(base, name + PARTIAL_EXT)
+        finally:
+            os.close(base)
 
         def sink(got):
             for r in got:
@@ -2513,13 +2532,16 @@ def _run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dic
                "computed": len(todo), "reused": len(rows) - len(todo),
                "fn": fn_spec, "code_fp": fp, "out": rel_out, "purpose": kw.get("purpose")}
     from lib.safe_io import remove_nofollow, write_nofollow
-    base, name = _out_base(out)
-    write_nofollow(base, name, "".join(json.dumps(r) + "\n" for r in rows).encode(), atomic=True)
-    write_nofollow(base, name + ".summary.json", json.dumps(summary, indent=1).encode(), atomic=True)
+    base, name = _out_base(out, run_dir)
     try:
-        remove_nofollow(base, name + PARTIAL_EXT)
-    except OSError:
-        pass
+        write_nofollow(base, name, "".join(json.dumps(r) + "\n" for r in rows).encode(), atomic=True)
+        write_nofollow(base, name + ".summary.json", json.dumps(summary, indent=1).encode(), atomic=True)
+        try:
+            remove_nofollow(base, name + PARTIAL_EXT)
+        except OSError:
+            pass
+    finally:
+        os.close(base)
     return rows, summary
 
 
@@ -4817,20 +4839,22 @@ def job_status(out: str) -> dict:
                     "(rows already finished are kept)"}
 
 
-def _detach(argv: list, out: str, n: int) -> int:
+def _detach(argv: list, out: str, n: int, run_dir: str | None) -> int:
     """Start this same `map` command in its own session (an agent's tool
-    timeout or a killed shell does not reach it) and return at once."""
+    timeout or a killed shell does not reach it) and return at once. Every
+    file it writes (launch lock, lock, log, job record) is anchored at the
+    trusted run dir, with no link followed below it."""
     import subprocess
-    launch = _out_lock(out, block=True, suffix=".launch.lock")    # one launch at a time per --out
+    launch = _out_lock(out, block=True, suffix=".launch.lock", run_dir=run_dir)   # one launch at a time per --out
     try:
-        return _detach_locked(argv, out, n, subprocess)
+        return _detach_locked(argv, out, n, subprocess, run_dir)
     finally:
         launch.close()
 
 
-def _detach_locked(argv, out, n, subprocess) -> int:
+def _detach_locked(argv, out, n, subprocess, run_dir) -> int:
     st = job_status(out)
-    busy = _out_lock(out)
+    busy = _out_lock(out, run_dir=run_dir)
     if busy is not None:
         busy.close()
     if st["state"] == RUNNING or busy is None:
@@ -4838,13 +4862,20 @@ def _detach_locked(argv, out, n, subprocess) -> int:
         return 4
     log = out + ".log"
     t0 = time.time()
-    with open(log, "w") as lf:
+    from lib.safe_io import publish, open_append_nofollow
+    base, rel = _out_base(log, run_dir)
+    publish(log, b"", run_dir)                                   # a fresh log file, no link followed
+    # the child's stdout is the checked append primitive's own descriptor: opened with no link followed and refused
+    # when the file has other hard links (a swap after the fresh file was published is not appended to)
+    try:
+        lf = open_append_nofollow(base, rel)
+    finally:
+        os.close(base)
+    with lf:
         p = subprocess.Popen([sys.executable, os.path.abspath(__file__)] + argv, stdin=subprocess.DEVNULL,
                              stdout=lf, stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
     job = {"pid": p.pid, "pid_start": _pid_start(p.pid), "started": t0, "n": n, "log": log, "argv": argv}
-    tmp = out + JOB_EXT + ".tmp"
-    json.dump(job, open(tmp, "w"), indent=1)
-    os.replace(tmp, out + JOB_EXT)
+    publish(out + JOB_EXT, json.dumps(job, indent=1), run_dir)
     print(json.dumps({"detached": True, "pid": p.pid, "out": out, "log": log,
                       "next": f"python3 scripts/compute.py wait {out} --timeout-s 540  "
                               "(repeat while it exits 3 = still running)"}))
@@ -4873,6 +4904,7 @@ def main() -> int:
     ap.add_argument("--fresh", action="store_true",
                     help="recompute every row (default: keep rows of an earlier run of the same command and code)")
     ap.add_argument("--no-ledger", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--out-root", help=argparse.SUPPRESS)   # a remote chunk: the call dir its worker made for --out
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
     if a.self_test:
@@ -4916,14 +4948,14 @@ def main() -> int:
     if a.detach:
         if a.no_ledger:
             ap.error("--detach is for ledgered batches")
-        return _detach([x for x in sys.argv[1:] if x != "--detach"], a.out, len(_read_inputs(a.inputs)))
+        return _detach([x for x in sys.argv[1:] if x != "--detach"], a.out, len(_read_inputs(a.inputs)), a.run_dir)
     if a.no_ledger:   # a remote chunk: plain map, no reuse (the caller already chose the rows)
         rows, summary = map_fn(a.run_dir, a.fn, _read_inputs(a.inputs), a.backend, a.max_workers,
                                a.max_tasks, a.timeout_s, ledger=False, max_core_hours=a.max_core_hours)
-        with open(a.out, "w") as f:
-            for r in rows:
-                f.write(json.dumps(r) + "\n")
-        json.dump(summary, open(a.out + ".summary.json", "w"), indent=1)
+        from lib.safe_io import publish   # anchored at the trusted root: --out-root (the worker's call dir) or the run dir
+        root = a.out_root or a.run_dir
+        publish(a.out, "".join(json.dumps(r) + "\n" for r in rows), root)
+        publish(a.out + ".summary.json", json.dumps(summary, indent=1), root)
     else:
         rows, summary = run_map(a.run_dir, a.fn, _read_inputs(a.inputs), a.out, fresh=a.fresh,
                                 backend=a.backend, max_workers=a.max_workers, max_tasks=a.max_tasks,

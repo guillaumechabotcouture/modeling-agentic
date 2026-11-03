@@ -451,10 +451,11 @@ def run(run_dir: str, critiques: dict, round_n: int, record: bool = True, exclud
 
 
 def _save(run_dir: str, reg: dict) -> None:
-    tmp = os.path.join(run_dir, REGISTRY + ".tmp")   # a fixed name the integrity record knows
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(reg, f, indent=1, default=str)
-    os.replace(tmp, os.path.join(run_dir, REGISTRY))
+    import sys as _sys
+    if os.path.dirname(os.path.abspath(__file__)) not in _sys.path:
+        _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from lib.safe_io import write_nofollow          # atomic, no link followed (follow-up to review round 5)
+    write_nofollow(run_dir, REGISTRY.replace(os.sep, "/"), json.dumps(reg, indent=1, default=str).encode(), atomic=True)
 
 
 def gate_findings(result: dict) -> list[dict]:

@@ -1544,7 +1544,10 @@ def _self_test() -> int:
 
             def t_os_open(p, flags, *a, **k):
                 if k.get("dir_fd") is None and not isinstance(p, int):
-                    seen.append(("os.open", os.path.realpath(p)))
+                    # lib.safe_io opens a trusted root by walking it from "/" (a directory fd, O_NOFOLLOW below it);
+                    # that walk's start is recorded apart: it reads no file
+                    walk = p == os.sep and flags & os.O_DIRECTORY
+                    seen.append(("walk" if walk else "os.open", os.path.realpath(p)))
                 return real_os_open(p, flags, *a, **k)
 
             def t_scan(p="."):
@@ -1580,7 +1583,7 @@ def _self_test() -> int:
 
             def inside(p):
                 return p == root or p.startswith(root + os.sep)
-            stray = [s for s in seen if not inside(s[1]) and s not in allowed_repo
+            stray = [s for s in seen if s[0] != "walk" and not inside(s[1]) and s not in allowed_repo
                      and not (s[0] == "dirfd" and s[1] == rrepo)
                      and not (s[0] == "os.open" and s[1] == rrepo)]
             ok(seen and not stray, f"DS3d every file the dossier opens or lists is under the run dir, or the checkout's "

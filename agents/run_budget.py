@@ -146,8 +146,11 @@ def conversation_cost(records: list[dict]) -> float | None:
 def write_budget_ledger(run_path: str, ledger: dict, cap: float | None, integrity=None) -> None:
     ledger = {**ledger, "cap_usd": cap,
               "spent_usd": round(sum(e.get("total_cost_usd") or 0 for e in ledger["sessions"]), 4)}
-    with open(os.path.join(run_path, BUDGET_LEDGER), "w") as f:
-        json.dump(ledger, f, indent=2)
+    scripts = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    from lib.safe_io import write_nofollow       # no link followed, atomic (follow-up to review round 5)
+    write_nofollow(run_path, BUDGET_LEDGER, json.dumps(ledger, indent=2).encode(), atomic=True)
     if integrity is not None:
         integrity.harness_wrote(BUDGET_LEDGER)
 
