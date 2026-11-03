@@ -1473,7 +1473,7 @@ def _self_test_v08(ok, e, unit) -> None:
     def s11():
         # Codex r1 P2-4: the public series carry their day counts and step ends, and reconcile exactly
         w1 = 2018.0 + 1 / 365                         # off the monthly grid: a final step of one or two days
-        wn = {"all": [2015.0, w1], "last": [2018.0, w1], "y1": [2016.0, 2017.0]}
+        wn = {"all": [2015.0, w1], "last": [2015.0 + 35 / 12, w1], "y1": [2016.0, 2017.0]}
         hp = DeliveryHorizon(2015.0, 2018.1, (2016.0, w1), dict(wn), delivery=(2016.0, 2017.0))
         r = HK.run_series(e, base, u, [none, full], hp, 5, metrics)
         outs = e.run_batch([base] * 2, u, [none, full], hp, 5)
@@ -1489,6 +1489,40 @@ def _self_test_v08(ok, e, unit) -> None:
         why = refused(lambda: e.series_window(r[0], "pfpr_u5", 2016.04, 2017.0))
         ok(why is not None and "step" in why, f"S11c a window that cuts through a monthly step fails closed ({why})")
     case("S11", s11)
+
+    def s12():
+        # #127 r1 (H9-H12): the hooks contract version, series metadata, the monthly grid and schedule semantics
+        ok(getattr(e, "hooks_contract", None) == "figures-hooks/1", "S12 the engine declares hooks contract "
+                                                                     "figures-hooks/1")
+        card = e.describe().outputs.get("series") or {}
+        ok(card and all(all(isinstance(v.get(k), str) and v.get(k).strip() for k in ("label", "units", "aggregate",
+                                                                                     "denominator"))
+                        and v["aggregate"] in ("mean", "rate") for v in card.values()),
+           f"S12b every series metric has label, units, aggregate and denominator: "
+           f"{ {k: v.get('denominator') for k, v in card.items()} }")
+        w1 = 2018.0 + 1 / 365
+        hp = DeliveryHorizon(2015.0, 2018.1, (2016.0, w1), {}, delivery=(2016.0, 2017.0))
+        for h in (hd, hp):
+            r = HK.run_series(e, base, u, [none, full], h, 4, ["pfpr_u5"])
+            n = int(round((float(h.window[1]) - float(h.start)) * 12))
+            ok(all(len(x["t"]) == n and all(abs(x["t"][k] - (float(h.start) + k / 12)) < 1e-6 for k in range(n))
+                   and abs(x["t_end"][-1] - float(h.window[1])) < 1e-12 for x in r) and r[0]["t"] == r[1]["t"],
+               f"S12c the grid is horizon.start + k/12 for k < round((window end - start) x 12) = {n}, ends at the "
+               "window end, and is the same for every arm")
+        d0, d1 = delivery_period(hd)
+        for pkg in (none, full, smc_only):
+            ev = HK.schedule(e, base, u, pkg, hd)
+            setc = {k for k, v in pkg.components.items() if v not in (0, None, "none")}
+            bad = [x for x in ev if not (float(hd.start) <= x["t0"] <= float(hd.window[1]))
+                   or (x["t1"] is not None and not float(hd.start) <= x["t1"] <= float(hd.window[1]))
+                   or (x["kind"] == "decision" and (not d0 <= x["t0"] <= d1 or x["component"] not in setc))
+                   or (x["kind"] == "history" and not x["t0"] < d0)
+                   or (x["kind"] == "routine" and d0 <= x["t0"] < d1)]
+            ok(not bad, f"S12d ({pkg.id}) every event keeps #127's schedule semantics: {bad[:2]}")
+        why = refused(lambda: e.schedule(base, UnitSpec("t", dict(attrs, itn_hist_years=[2016.5])), none, hd))
+        ok(why is not None and "history" in why, f"S12e a past campaign inside the delivery period fails closed in "
+                                                 f"schedule() ({why})")
+    case("S12", s12)
 
 def write_card(path: str) -> None:
     """Engine card (describe() plus every parameter with its kind, range and source) as YAML."""
