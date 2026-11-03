@@ -338,6 +338,90 @@ def status(run_dir: str) -> str:
     return "invalid" if errors else "awaiting"
 
 
+# --signoff lead (focused check of #131): the lead writes its answers here and ends its turn; the harness (main.py
+# harness_sign_brief_lead) signs them `by: lead` and registers what signing wrote. No agent runs `sign`.
+LEAD_ANSWERS = "decision_brief_lead_answers.yaml"
+GEOMETRY_RECORD = "data/geometry_signoff.json"         # toolkit/spec/geometry.py SIGNOFF_FILE
+
+
+LEAD_ANSWER_KEYS = ("answers", "accept_proposed", "note")
+
+
+def parse_lead_answers(run_dir: str) -> tuple[dict | None, list[str]]:
+    """The lead's sign-off file, parsed strictly (focused check of #131): ({answers, accept_proposed, note}, []) or
+    (None, [problems]). `accept_proposed` is a YAML boolean (true/false, not a string or a number); `answers` maps
+    the brief's own open-question ids to non-empty text; `note` is text; no other keys; and it says something
+    (answers, or accept_proposed: true). A missing file is (None, [])."""
+    from lib.safe_io import LinkRefused, read_nofollow
+    if not os.path.lexists(os.path.join(run_dir, LEAD_ANSWERS)):
+        return None, []
+    try:                                 # never through a link (lib.safe_io)
+        doc = yaml.safe_load(read_nofollow(run_dir, LEAD_ANSWERS)[0].decode("utf-8"))
+    except (LinkRefused, OSError, yaml.YAMLError, UnicodeDecodeError) as e:
+        return None, [f"{LEAD_ANSWERS} is unreadable: {e}"]
+    if not isinstance(doc, dict) or not doc:
+        return None, [f"{LEAD_ANSWERS} must be a mapping with answers and/or accept_proposed, and a note"]
+    errs = [f"unknown key {k!r} (allowed: {', '.join(LEAD_ANSWER_KEYS)})" for k in doc if k not in LEAD_ANSWER_KEYS]
+    ap = doc.get("accept_proposed", False)
+    if not isinstance(ap, bool):
+        errs.append(f"accept_proposed must be a YAML boolean (true or false), not {type(ap).__name__} {ap!r}")
+    ans = doc.get("answers")
+    brief, _ = load_brief(run_dir)
+    ids = {str(q.get("id")) for q in (brief or {}).get("open_questions") or [] if isinstance(q, dict)}
+    if ans is not None:
+        if not isinstance(ans, dict):
+            errs.append(f"answers must be a mapping of question id to answer, not {type(ans).__name__}")
+        else:
+            errs += [f"answers: {k!r} is not an open question of the brief (known: {', '.join(sorted(ids)) or 'none'})"
+                     for k in ans if str(k) not in ids]
+            errs += [f"answers: {k} must be non-empty text" for k, v in ans.items()
+                     if not isinstance(v, str) or not v.strip()]
+    note = doc.get("note", "")
+    if not isinstance(note, str):
+        errs.append("note must be text")
+    if not errs and ap is not True and not ans:
+        errs.append("give answers, or accept_proposed: true")
+    if errs:
+        return None, errs
+    return {"answers": {str(k): v for k, v in (ans or {}).items()}, "accept_proposed": ap, "note": note}, []
+
+
+REGENERATE_SHEET = "regenerate the sheet (python3 toolkit/spec/signoff.py sheet <run_dir> --write) and read it again"
+
+
+def _sheet_geometry_evidence(run_dir: str, spec_sha: str) -> str:
+    """The geometry evidence hash the current sign-off sheet shows (its sources line), for the spec with `spec_sha`.
+    Read once without following a link. No sheet, a sheet without a sources line or without the evidence, or a sheet
+    generated from another spec: ValueError ("regenerate the sheet")."""
+    from lib.safe_io import LinkRefused, read_nofollow
+    from toolkit.spec import signoff as SO
+    try:
+        text = read_nofollow(run_dir, SO.SHEET)[0].decode("utf-8", "replace")
+    except FileNotFoundError:
+        raise ValueError(f"no sign-off sheet ({SO.SHEET}) shows the geometry evidence this sign-off would approve: "
+                         + REGENERATE_SHEET) from None
+    except (LinkRefused, OSError) as e:
+        raise ValueError(f"{SO.SHEET} cannot be read without following a link ({e}): " + REGENERATE_SHEET) from None
+    src = SO.sheet_sources(text)
+    if src is None:
+        raise ValueError(f"{SO.SHEET} predates source binding (no sources line): " + REGENERATE_SHEET)
+    ev = src.get("geometry_evidence_sha256")
+    if not isinstance(ev, str):
+        raise ValueError(f"{SO.SHEET} records no geometry evidence: " + REGENERATE_SHEET)
+    if src.get("spec_sha256") != spec_sha:
+        raise ValueError(f"{SO.SHEET} was generated from another spec (it is stale): " + REGENERATE_SHEET)
+    return ev
+
+
+def signoff_outputs(run_dir: str) -> list[str]:
+    """What sign() writes (run-relative): the record, the signed copies of the frozen files that exist, and the
+    spec's geometry record when there is a spec. The harness registers these after it signs."""
+    out = [SIGNOFF] + [f"{SIGNED_DIR}/{f}" for f in FROZEN_AT_SIGNOFF if os.path.exists(os.path.join(run_dir, f))]
+    if os.path.exists(os.path.join(run_dir, DECISION_SPEC)):
+        out.append(GEOMETRY_RECORD)
+    return out
+
+
 def is_signed(run_dir: str) -> bool:
     return _signoff(run_dir) is not None
 
@@ -357,7 +441,8 @@ def _capture(run_dir: str, names) -> dict:
 
 
 def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
-         accept_proposed: bool = False, expect: dict | None = None, extra_sha: dict | None = None) -> dict:
+         accept_proposed: bool = False, expect: dict | None = None, extra_sha: dict | None = None,
+         expect_geometry: str | None = None) -> dict:
     """Write the sign-off. Raises ValueError when the brief is not ready. The frozen files are read once: validated,
     hashed and copied from the same bytes, never through a link, and the record is published atomically.
     `expect`: {file: sha256 the owner was shown} (a mismatch is refused); `extra_sha`: further hashes to record."""
@@ -379,6 +464,24 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
     missing = [q["id"] for q in qs if q["id"] not in answers and not accept_proposed]
     if missing:
         raise ValueError("no answer for " + ", ".join(missing) + " (give one, or --accept-proposed)")
+    if captured.get(DECISION_SPEC) is not None:
+        # Codex round 2 on #131: this sign-off also signs the decision spec, so it freezes the spec's geometry inputs
+        # (and, signed by the owner, approves the spec's proposed HIGH geometry exceptions). Brief-only runs skip it.
+        # The spec is the bytes read (and hashed) above, never read again (#129).
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from toolkit.spec import geometry
+        if expect_geometry is None:
+            # Codex on 4d20e23: every entry point (the CLI, the harness's lead sign-off) binds the geometry evidence
+            # the current sign-off sheet shows; a sheet that lacks it (or no sheet) refuses
+            import hashlib as _hl
+            expect_geometry = _sheet_geometry_evidence(run_dir, _hl.sha256(captured[DECISION_SPEC]).hexdigest())
+        try:
+            spec_doc = yaml.safe_load(captured[DECISION_SPEC].decode("utf-8")) or {}
+        except (yaml.YAMLError, UnicodeDecodeError) as e:
+            raise ValueError(f"{DECISION_SPEC} does not parse: {e}") from None
+        geometry.freeze(run_dir, by, spec=spec_doc if isinstance(spec_doc, dict) else {}, expect_evidence=expect_geometry)
     record = {
         "signed_by": by, "signed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "note": note,
         "answers": {q["id"]: answers.get(q["id"], q.get("proposed")) for q in qs},
@@ -639,6 +742,103 @@ def example_brief(**over) -> dict:
     return {**doc, **over}
 
 
+def _self_test_lead_and_geometry(ok) -> None:
+    """DB35-DB36 (#131): the lead's answers file is parsed strictly; the brief's sign-off freezes the spec's
+    geometry."""
+    # DB36 (focused check of #131): the lead's answers file is parsed strictly
+    with tempfile.TemporaryDirectory() as d:
+        yaml.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d, CRITERIA), "w"))
+        yaml.safe_dump(example_brief(open_questions=[{"id": "Q1", "question": "Is continuity a constraint?",
+                                                      "proposed": "No", "basis": "decision"}]),
+                       open(os.path.join(d, BRIEF), "w"))
+        cases = {"string false": 'accept_proposed: "false"\n', "list answers": "answers: [Q1]\n",
+                 "unknown id": "answers: {Q99: x}\n", "unknown key": "accept_proposed: true\nsign_as: owner\n",
+                 "nothing": "note: only a note\n", "empty answer": "answers: {Q1: ''}\n",
+                 "numeric bool": "accept_proposed: 1\n"}
+        got36 = {}
+        for name, text in cases.items():
+            open(os.path.join(d, "decision_brief_lead_answers.yaml"), "w").write(text)
+            try:
+                doc, errs = parse_lead_answers(d)
+            except NameError as e:
+                doc, errs = None, [f"missing: {e}"]
+            got36[name] = bool(errs) and doc is None
+        open(os.path.join(d, "decision_brief_lead_answers.yaml"), "w").write(
+            "answers: {Q1: 'Yes: keep currently covered districts'}\nnote: ok\n")
+        try:
+            good = parse_lead_answers(d)
+        except NameError:
+            good = (None, ["missing"])
+        ok(all(got36.values()) and good[1] == [] and good[0]["answers"] == {"Q1": "Yes: keep currently covered "
+                                                                                  "districts"}
+           and good[0]["accept_proposed"] is False,
+           f"DB36 the lead's answers file is parsed strictly: accept_proposed a YAML boolean, answers a mapping of the "
+           f"brief's question ids to non-empty text, no other keys ({got36}; {good[1]})")
+    # DB35 (Codex round 2 on #131): signing the brief signs the decision spec when there is one, so it freezes the
+    # spec's geometry inputs too (toolkit/spec/geometry.py freeze); a brief-only run (no spec) is unchanged.
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from toolkit.spec import geometry as GEO
+    for by in ("owner", "lead"):
+        with tempfile.TemporaryDirectory() as d:
+            GEO.toy_inputs(d)
+            sp = yaml.safe_load(open(os.path.join(d, DECISION_SPEC)))
+            sp["decision_units"][GEO.ACCEPT_KEY] = {"reciprocal_swap:swap_a+swap_b": "rows checked"}
+            yaml.safe_dump(sp, open(os.path.join(d, DECISION_SPEC), "w"))
+            yaml.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d, CRITERIA), "w"))
+            yaml.safe_dump(example_brief(), open(os.path.join(d, BRIEF), "w"))
+            GEO.toy_write_sheet(d)             # the sheet the signer reads the shown geometry evidence from
+            try:
+                sign(d, by, accept_proposed=True)
+                rec = json.load(open(os.path.join(d, GEO.SIGNOFF_FILE)))
+            except (OSError, ValueError) as e:
+                rec = {"error": str(e)}
+            want = ["reciprocal_swap:swap_a+swap_b"] if by == "owner" else []
+            ok(rec.get("signed_by") == by and (rec.get("declaration") or {}).get("enabled") is True
+               and sorted(rec.get("approvals") or {}) == want,
+               f"DB35 ({by}): the brief's sign-off freezes the spec's geometry inputs; only the owner's approves the "
+               f"proposed HIGH exception ({rec.get('signed_by')}, {sorted(rec.get('approvals') or {})}, "
+               f"{rec.get('error')})")
+    with tempfile.TemporaryDirectory() as d:
+        yaml.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d, CRITERIA), "w"))
+        yaml.safe_dump(example_brief(), open(os.path.join(d, BRIEF), "w"))
+        sign(d, "owner", accept_proposed=True)
+        ok(status(d) == "signed" and not os.path.exists(os.path.join(d, GEO.SIGNOFF_FILE)),
+           "DB35b a brief-only run (no decision spec) signs as before and writes no geometry record")
+    # DB37 (Codex on 4d20e23, P1): with a decision spec, every brief sign-off, the CLI included, binds the geometry
+    # evidence the current sheet shows: no sheet, or a sheet without it, refuses ("regenerate the sheet"); evidence
+    # changed since the sheet refuses; the unchanged evidence signs and approves the proposed exception
+    env = {k: v for k, v in os.environ.items() if k != "MA_SIGNOFF_MODE"}
+    got37 = {}
+    for case in ("no sheet", "no evidence", "changed", "unchanged"):
+        with tempfile.TemporaryDirectory() as d:
+            GEO.toy_inputs(d)
+            sp = yaml.safe_load(open(os.path.join(d, DECISION_SPEC)))
+            sp["decision_units"][GEO.ACCEPT_KEY] = {"reciprocal_swap:swap_a+swap_b": "rows checked"}
+            yaml.safe_dump(sp, open(os.path.join(d, DECISION_SPEC), "w"))
+            yaml.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d, CRITERIA), "w"))
+            yaml.safe_dump(example_brief(), open(os.path.join(d, BRIEF), "w"))
+            if case != "no sheet":
+                GEO.toy_write_sheet(d, footer=case != "no evidence")
+            if case == "changed":
+                g = json.load(open(os.path.join(d, "b.geojson")))
+                g["features"][0]["properties"]["note"] = "changed after the sheet"
+                json.dump(g, open(os.path.join(d, "b.geojson"), "w"))
+            import subprocess
+            r = subprocess.run([sys.executable, os.path.abspath(__file__), "sign", d, "--by", "owner",
+                                "--accept-proposed"], env=env, capture_output=True, text=True)
+            appr = {}
+            if os.path.exists(os.path.join(d, GEO.SIGNOFF_FILE)):
+                appr = json.load(open(os.path.join(d, GEO.SIGNOFF_FILE))).get("approvals") or {}
+            got37[case] = (r.returncode, status(d), "regenerate" in r.stderr, sorted(appr))
+    ok(got37["no sheet"][:3] == (1, "awaiting", True) and got37["no evidence"][:3] == (1, "awaiting", True)
+       and got37["changed"][:2] == (1, "awaiting") and got37["unchanged"] == (0, "signed", False,
+                                                                                ["reciprocal_swap:swap_a+swap_b"]),
+       f"DB37 the brief CLI reads the shown geometry evidence from the current sheet and refuses without it or when it "
+       f"changed ({got37})")
+
+
 def _run_self_test() -> int:
     fails = []
 
@@ -854,6 +1054,7 @@ def _run_self_test() -> int:
         ok(status(d) == "signed" and load_brief(d)[1] == [] and "Not ready" not in render_md(d)
            and "schema 1" in render_md(d) and signoff_text(d),
            f"DB34: a schema 1 brief signed before Phase 43 is still signed: {load_brief(d)[1]}")
+    _self_test_lead_and_geometry(ok)
     if fails:
         print("FAIL:", *fails, sep="\n  ")
         return 1
@@ -861,21 +1062,30 @@ def _run_self_test() -> int:
     return 0
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description="Decision brief: show, sign, check")
+def cli_parser() -> argparse.ArgumentParser:
+    """The CLI's arguments. agents/enforcement.py parses agent commands with this same definition (Codex round 3
+    on #131): no abbreviations, and `sign` names its signer explicitly (no default)."""
+    ap = argparse.ArgumentParser(description="Decision brief: show, sign, check", allow_abbrev=False)
     ap.add_argument("cmd", nargs="?", choices=["show", "sign", "status", "restore"])
     ap.add_argument("run_dir", nargs="?")
-    ap.add_argument("--by", default="owner")
+    ap.add_argument("--by", choices=["owner", "lead"], default=None)
     ap.add_argument("--answers", help="YAML mapping Q-id -> answer")
     ap.add_argument("--accept-proposed", action="store_true")
     ap.add_argument("--note", default="")
     ap.add_argument("--self-test", action="store_true")
-    a = ap.parse_args()
+    return ap
+
+
+def main(argv=None) -> int:
+    ap = cli_parser()
+    a = ap.parse_args(argv)
     if a.self_test:
         return _run_self_test()
     if not a.cmd or not a.run_dir:
         ap.print_help()
         return 2
+    if a.cmd == "sign" and a.by is None:
+        ap.error("sign needs --by owner or --by lead")
     if a.cmd == "show":
         print(render_md(a.run_dir))
         return 0

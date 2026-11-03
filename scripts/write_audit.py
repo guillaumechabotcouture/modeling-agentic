@@ -25,7 +25,8 @@ HARNESS = (
     "agents/stage_machine.py", "agents/findings_ledger.py", "agents/fix_loop.py", "agents/analysis_backend.py",
     "agents/v2_sdk_tasks.py", "agents/v2_tasks.py",
     "scripts/pipeline.py", "scripts/compute.py", "scripts/scope_signoff.py", "scripts/decision_brief.py",
-    "toolkit/spec/signoff.py", "toolkit/spec/schema.py", "toolkit/analysis/artifacts.py", "toolkit/analysis/run.py",
+    "toolkit/spec/signoff.py", "toolkit/spec/schema.py", "toolkit/spec/geometry.py", "toolkit/analysis/artifacts.py",
+    "toolkit/analysis/run.py",
     "toolkit/analysis/batch.py", "tools/run_console/run_console.py", "tools/run_console/dossier.py",
     "toolkit/spec/engine_parameters.py",
 )

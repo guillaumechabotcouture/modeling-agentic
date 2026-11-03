@@ -147,18 +147,41 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     if expect_sheet_sha256 is not None and sheet_sha != expect_sheet_sha256:
         raise ValueError(f"{SHEET} changed since it was shown: read it again before signing")
     src = sheet_sources(sheet_bytes.decode("utf-8", "replace")) if sheet_bytes is not None else None
-    if sheet_bytes is not None and (src is not None or expect_sheet_sha256 not in (None, "none")) and (
-            src is None or src.get("spec_sha256") != sha or src.get("derivations_sha256") != (dsha or "none")):
+    if sheet_bytes is not None and src is None:
+        # Codex on 4d20e23: a sheet without its sources footer cannot show which spec, record and geometry evidence
+        # it was generated from; it is refused, never skipped
+        raise ValueError(f"{SHEET} predates source binding (no sources line); regenerate the sheet (python3 "
+                         "toolkit/spec/signoff.py sheet <run_dir> --write) and read it again")
+    if sheet_bytes is not None and (
+            src.get("spec_sha256") != sha or src.get("derivations_sha256") != (dsha or "none")):
         raise ValueError(f"{SHEET} was generated from another spec or derivation record (it is stale): the sheet is "
                          "regenerated before the owner signs; read the new one")
+    # Codex on 08f96a9: the geometry evidence the sheet showed must still be current when the freeze approves
+    geo_expect = None
+    if src is not None:
+        geo_expect = src.get("geometry_evidence_sha256")
+        if not isinstance(geo_expect, str):
+            raise ValueError(f"{SHEET} records no geometry evidence (it predates the geometry check): the sheet is "
+                             "regenerated before the owner signs; read the new one")
     errs = schema.validate(schema.load(os.path.join(run_dir, SPEC), data=data), pending_ok=True)
     if errs:
         raise ValueError("spec not ready: " + "; ".join(errs[:10]))
     if _spec_record(run_dir) is not None:
         raise ValueError("the spec is already signed; a change needs a new sign-off by the owner")
     if os.path.lexists(os.path.join(run_dir, DB.BRIEF)):
+        # decision_brief.sign freezes the spec's geometry too (#131)
         return DB.sign(run_dir, by, answers=answers, note=note, accept_proposed=accept_proposed,
-                       expect={SPEC: sha}, extra_sha={DERIVATIONS_RECORD: dsha})
+                       expect={SPEC: sha}, extra_sha={DERIVATIONS_RECORD: dsha}, expect_geometry=geo_expect)
+    # The geometry part of the unsigned presentation file and its input hashes are frozen with the spec; an owner's
+    # sign-off also approves the HIGH geometry exceptions the spec proposes (docs/design/v2-input-geometry.md §2).
+    # The spec is the bytes read, validated and hashed above, never read again (#129: SG15).
+    import yaml
+    from toolkit.spec import geometry
+    try:
+        spec_doc = yaml.safe_load(data.decode("utf-8")) or {}
+    except (yaml.YAMLError, UnicodeDecodeError) as e:
+        raise ValueError(f"{SPEC} does not parse: {e}") from None
+    geometry.freeze(run_dir, by, spec=spec_doc if isinstance(spec_doc, dict) else {}, expect_evidence=geo_expect)
     record = {"signed_by": by, "signed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "note": note,
               "sha256": {SPEC: sha, DERIVATIONS_RECORD: dsha},
               "producer": "toolkit/spec/signoff.py",
@@ -203,16 +226,29 @@ def write_sheet(run_dir: str, candidates: list | None = None) -> str:
         rec_bytes = None
     except LinkRefused as e:
         raise ValueError(f"{DERIVATIONS_RECORD}: {e}") from None
-    text = sheet(run_dir, candidates, spec_bytes=spec_bytes, record_bytes=rec_bytes)
+    # The input geometry check, re-run on the spec bytes read above, then shown from the record it wrote; its evidence
+    # hash (declaration plus boundary, crosswalk and units sha256: what an approval binds to) is a recorded source,
+    # so the signer refuses when the geometry inputs changed after the owner saw the sheet (Codex on 08f96a9).
+    import yaml
+    from toolkit.spec import geometry
+    try:
+        spec_doc = yaml.safe_load(spec_bytes.decode("utf-8"))
+    except (yaml.YAMLError, UnicodeDecodeError):
+        spec_doc = None
+    if isinstance(spec_doc, dict):
+        geometry.run(run_dir, spec_doc)
+    section = geometry.sheet_section(run_dir)
+    text = sheet(run_dir, candidates, spec_bytes=spec_bytes, record_bytes=rec_bytes, geometry_section=section)
     src = json.dumps({"spec_sha256": hashlib.sha256(spec_bytes).hexdigest(),
-                      "derivations_sha256": hashlib.sha256(rec_bytes).hexdigest() if rec_bytes is not None else "none"},
+                      "derivations_sha256": hashlib.sha256(rec_bytes).hexdigest() if rec_bytes is not None else "none",
+                      "geometry_evidence_sha256": section[1]},
                      sort_keys=True)
     write_nofollow(run_dir, SHEET, (text.rstrip("\n") + f"\n\n{SHEET_SOURCES}{src} -->\n").encode(), atomic=True)
     return os.path.join(run_dir, SHEET)
 
 
 def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None = None,
-          record_bytes: bytes | None = None) -> str:
+          record_bytes: bytes | None = None, geometry_section: tuple | None = None) -> str:
     """The sign-off sheet (markdown): what signing accepts beyond the spec's text. Each engine default the spec
     accepts by name, with the card's meaning and the spec's reason; the staged columns and tables the derivations
     do not use, with their reasons; the derivations; each engine parameter value the spec sets, with the card value
@@ -268,6 +304,10 @@ def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None
     out += ["", "## Derivations"] + [f"- **{d['id']}**: `{d['script']}` reads {len(d['inputs'])} file(s), writes "
                                      + ", ".join(f"`{o}`" for o in d["outputs"]) for d in ders]
     out += [f"- declaration problem: {e}" for e in errs] + [""]
+    if geometry_section is None:
+        from toolkit.spec import geometry
+        geometry_section = geometry.sheet_section(run_dir)
+    out += geometry_section[0]                 # the input geometry check and the findings accepted by name
     from toolkit.spec import engine_parameters as PV
     out += PV.sheet_lines(raw, candidates, run_dir)     # each spec value, the card value it replaces, HIGH when outside
     if candidates:
@@ -318,6 +358,7 @@ def _self_test() -> int:
         schema.toy_spec(d)
         yaml.safe_dump(DB.example_brief(), open(os.path.join(d, DB.BRIEF), "w"))
         yaml.safe_dump({"hard_blockers": [{"id": "HB-001", "text": "t"}]}, open(os.path.join(d, DB.CRITERIA), "w"))
+        write_sheet(d)                 # with a spec, a brief sign-off binds the sheet's geometry evidence (#131)
         rec = sign(d, "owner")
         ok(rec.get("producer") == "scripts/decision_brief.py" and rec["sha256"].get(SPEC) and status(d) == "signed"
            and DB.status(d) == "signed", f"SG8 with a brief, the brief machinery signs and freezes the spec: {rec}")
@@ -580,6 +621,13 @@ def _self_test() -> int:
             rec = sign(d, "owner")
             ok(rec["sha256"].get(DERIVATIONS_RECORD) and status(d) == "signed",
                f"DI6c the sign-off freezes the derivation record's hash next to the spec's: {sorted(rec['sha256'])}")
+            try:
+                g = json.load(open(os.path.join(d, "data", "geometry_signoff.json")))
+            except (OSError, ValueError):
+                g = {}
+            ok(g.get("signed_by") == "owner" and (g.get("declaration") or {}).get("enabled") is False,
+               f"IG-S2 the sign-off also freezes the geometry declaration (here: no boundaries, check not enabled) in "
+               f"the harness's geometry record ({g.get('declaration')})")
             out = os.path.join(d, "data", "derived", "units.csv")
             with open(out, "a") as f:
                 f.write("99,r0,g0,0,1000,0,0.1,x\n")
@@ -597,8 +645,62 @@ def _self_test() -> int:
                f"DI7f the sign-off sheet lists each accepted default with its card meaning and the spec's reason")
             ok("elig" in md and "not used by the toy" in md and "units_raw.csv" in md,
                "DI10c the sign-off sheet lists the ignored columns per input")
+            ok("## Input geometry check" in md and "has not run" in md,
+               "IG-S1a with no geometry record the sheet says the check has not run (never a silent pass)")
+            from toolkit.spec import geometry
+            geometry.toy_inputs(d)                   # its own spec and units in the same dir: the sheet reads the record
+            sp = _y.safe_load(open(os.path.join(d, SPEC)))
+            sp["decision_units"][geometry.ACCEPT_KEY] = {"reciprocal_swap:swap_a+swap_b": "rows checked by the owner"}
+            geometry.write(d, geometry.check(d, sp, {"edge_tolerance_km": 5.0, "area_ratio_max": 1.5}))
+            md = sheet(d)
+            ok("reciprocal_swap:swap_a+swap_b" in md and "rows checked by the owner" in md
+               and "1 reciprocal swap(s)" in md and "point_outside_own_polygon:stray" in md,
+               "IG-S1b the sheet lists the counts, each geometry finding accepted by name with its reason, and the "
+               "open ones")
     except Exception as e:  # noqa: BLE001 -- before the record and the sheet exist (step α) this is the failure
         ok(False, f"DI6/DI7/DI10 sign-off: {type(e).__name__}: {e}")
+    # IG-S3 (Codex on 08f96a9, P1): the sheet records the geometry evidence it shows; a boundary change after the
+    # sheet was generated refuses the sign-off, so no HIGH exception is approved against evidence nobody saw
+    try:
+        from toolkit.spec import geometry
+        with tempfile.TemporaryDirectory() as d:
+            geometry.toy_spec_with_boundaries(d, accept={"reciprocal_swap:0+1": "rows checked by the owner"})
+            write_sheet(d)
+            src = sheet_sources(open(os.path.join(d, SHEET)).read()) or {}
+            has = src.get("geometry_evidence_sha256") not in (None, "none")
+            bpath = os.path.join(d, "b.geojson")
+            orig = open(bpath).read()
+            g = json.loads(orig)
+            g["features"][5]["properties"]["note"] = "changed after the sheet"
+            open(bpath, "w").write(json.dumps(g))
+            try:
+                sign(d, "owner", note="n", expect_sheet_sha256=DB._sha(os.path.join(d, SHEET)))
+                refused = ""
+            except ValueError as e:
+                refused = str(e)
+            open(bpath, "w").write(orig)
+            rec = sign(d, "owner", note="n", expect_sheet_sha256=DB._sha(os.path.join(d, SHEET)))
+            appr = json.load(open(os.path.join(d, geometry.SIGNOFF_FILE))).get("approvals") or {}
+            ok(has and "geometry" in refused and rec and sorted(appr) == ["reciprocal_swap:0+1"],
+               f"IG-S3 the sheet records the geometry evidence; a boundary change after it refuses the sign-off, and the "
+               f"unchanged evidence signs with the approval ({has}; {refused[:90]}; {sorted(appr)})")
+    except Exception as e:  # noqa: BLE001 -- before the evidence is recorded (step α)
+        ok(False, f"IG-S3 the sheet binds the geometry evidence: {type(e).__name__}: {e}")
+    # IG-S4 (Codex on 4d20e23, P2): a sheet with no sources footer is refused, not skipped
+    try:
+        from toolkit.spec import geometry
+        with tempfile.TemporaryDirectory() as d:
+            geometry.toy_spec_with_boundaries(d, accept={"reciprocal_swap:0+1": "rows checked by the owner"})
+            geometry.toy_write_sheet(d, footer=False)
+            try:
+                sign(d, "owner", note="n")
+                why = ""
+            except ValueError as e:
+                why = str(e)
+            ok("predates source binding" in why and status(d) == "awaiting",
+               f"IG-S4 a sheet without its sources footer is refused: it predates source binding ({why[:90]})")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"IG-S4 a sheet without its sources footer is refused: {type(e).__name__}: {e}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -610,17 +712,21 @@ def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["--self-test"]:
         return _self_test()
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(allow_abbrev=False)
     ap.add_argument("action", choices=["status", "sign", "sheet"])
     ap.add_argument("run_dir")
-    ap.add_argument("--by", default="owner", choices=["owner", "lead"])
+    ap.add_argument("--by", default=None, choices=["owner", "lead"])
     ap.add_argument("--note", default="")
+    ap.add_argument("--write", action="store_true", help="sheet: regenerate and publish the sheet (with its sources "
+                                                         "line) instead of printing it")
     a = ap.parse_args(argv)
+    if a.action == "sign" and a.by is None:
+        ap.error("sign needs --by owner or --by lead")
     if a.action == "status":
         print(status(a.run_dir))
         return 0
     if a.action == "sheet":
-        print(sheet(a.run_dir))
+        print(write_sheet(a.run_dir) if a.write else sheet(a.run_dir))
         return 0
     print(json.dumps(sign(a.run_dir, a.by, a.note), indent=1))
     return 0
