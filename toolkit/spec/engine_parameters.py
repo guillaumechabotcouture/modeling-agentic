@@ -642,7 +642,8 @@ def _self_test() -> int:
     def toy_raw(d, **entries):
         raw = yaml.safe_load(open(schema.toy_spec(d, n=24)))
         raw["engine"] = {"ref": "toolkit.spec.toy_engines:ToySpecEngine",
-                         "config": {"log_path": os.path.join(d, "calls.jsonl")}}
+                         "config": {"log": True}}
+        os.environ[TOYS.LOG_ENV] = d          # the call log's root, inherited by worker processes
         if entries:
             raw[FIELD] = entries
         return raw
@@ -1006,7 +1007,7 @@ def _self_test() -> int:
                f"EP11 the batch: k held at its spec value in every job; base (a decision test varies it) an emulator "
                f"input over the box from its spec value to the tested value; synergy drawn over its range: "
                f"{design.get('spec_value_names')}, {design.get('prior_names')}")
-            calls = [json.loads(x) for x in open(os.path.join(d, "calls.jsonl"))]
+            calls = [json.loads(x) for f in sorted(glob.glob(os.path.join(d, "calls.*.jsonl"))) for x in open(f)]
             runs = [c for c in calls if c["call"] == "run"]
             sch = [c for c in calls if c["call"] == "schedule"]
             ok(runs and all(c["k"] == 0.9 for c in calls) and sch and all(c["base"] == 0.3 for c in sch),

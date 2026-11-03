@@ -221,6 +221,7 @@ def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
 def write_report(run_dir, report) -> str:
     p = os.path.join(run_dir, "uncertainty_report.yaml")
     from toolkit.analysis.artifacts import plain
-    with open(p, "w") as f:
-        yaml.safe_dump(plain(report), f, sort_keys=False)
+    from toolkit.analysis.artifacts import _safe_io
+    _safe_io().write_nofollow(run_dir, "uncertainty_report.yaml", yaml.safe_dump(plain(report), sort_keys=False).encode(),
+                              atomic=True)
     return p

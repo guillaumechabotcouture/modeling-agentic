@@ -169,8 +169,9 @@ def compare(on_disk: Any, rebuilt: dict) -> list[str]:
 def write(run_dir: str) -> tuple[dict | None, list[str]]:
     doc, errors = build(run_dir)
     if doc is not None:
-        with open(os.path.join(run_dir, LEDGER_REL), "w", encoding="utf-8") as f:
-            yaml.safe_dump(doc, f, sort_keys=False, allow_unicode=True)
+        from lib.safe_io import write_nofollow      # atomic, no link followed (follow-up to review round 5)
+        write_nofollow(run_dir, LEDGER_REL.replace(os.sep, "/"),
+                       yaml.safe_dump(doc, sort_keys=False, allow_unicode=True).encode("utf-8"), atomic=True)
     return doc, errors
 
 

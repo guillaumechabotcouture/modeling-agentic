@@ -218,8 +218,18 @@ def check_task(run_dir: str, task: dict, ledger: dict, gate_ids: set[str]) -> di
     return res
 
 
+def _sio():
+    """scripts/lib/safe_io.py: run-dir writes with no link followed (follow-up to review round 5)."""
+    import sys
+    scripts = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    from lib import safe_io
+    return safe_io
+
+
 def append_impact(run_dir: str, row: dict) -> None:
-    with open(os.path.join(run_dir, IMPACT), "a", encoding="utf-8") as f:
+    with _sio().open_append_nofollow(run_dir, IMPACT) as f:
         f.write(json.dumps(row, sort_keys=True, default=str) + "\n")
 
 
@@ -232,16 +242,12 @@ def _read_or_none(path: str):
 
 
 def _restore(run_dir: str, saved: dict) -> None:
+    sio = _sio()
     for rel, text in saved.items():
-        p = os.path.join(run_dir, rel)
-        if os.path.islink(p):
-            os.remove(p)
         if text is None:
-            if os.path.exists(p):
-                os.remove(p)
+            sio.remove_nofollow(run_dir, rel)          # the entry itself (a link included), never its target
         else:
-            with open(p, "w", encoding="utf-8") as f:
-                f.write(text)
+            sio.write_nofollow(run_dir, rel, text.encode("utf-8"), atomic=True)   # replaces a planted link
 
 
 def run_loop(run_dir: str, round_n: int, max_rounds: int, gate: dict | None, tasks, rebuild, harness_ids,
@@ -270,8 +276,8 @@ def run_loop(run_dir: str, round_n: int, max_rounds: int, gate: dict | None, tas
     if errs:
         log(f"[fix loop] planner output rejected twice ({'; '.join(errs)[:300]}); harness default plan")
         plan = default_plan(packet)
-    with open(os.path.join(run_dir, f"fix_plan_r{round_n}.json"), "w") as f:
-        json.dump({"round": round_n, "plan": plan, "rejected": errs}, f, indent=1)
+    _sio().write_nofollow(run_dir, f"fix_plan_r{round_n}.json",
+                          json.dumps({"round": round_n, "plan": plan, "rejected": errs}, indent=1).encode(), atomic=True)
     done = {r.get("task") for r in impact_rows(run_dir) if r.get("round") == round_n}
     prog_p = os.path.join(run_dir, f"fix_progress_r{round_n}.json")
     try:
@@ -308,8 +314,7 @@ def run_loop(run_dir: str, round_n: int, max_rounds: int, gate: dict | None, tas
                     "before_ids": sorted(harness_ids(run_dir)), "snap": snapshot(run_dir),
                     "saved": {rel: _read_or_none(os.path.join(run_dir, rel)) for rel in protect}}
             progress[t["id"]] = pend
-            with open(prog_p, "w") as f:
-                json.dump(progress, f, default=str)
+            _sio().publish(prog_p, json.dumps(progress, default=str), run_dir)
         evidence, rebuilt, attempts_, rejected, rep, r = None, [], 0, [], {}, None
         agent_changed: set = set()
         check, passed, now_ids = {}, False, set(pend["before_ids"])

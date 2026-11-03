@@ -569,8 +569,11 @@ def _one(benefit, cost, feasible, budget, caps, methods, time_limit, brute_limit
 
 
 def benchmark(benefit, cost, feasible, budget, caps=None, primary="ilp", methods=None, run_dir=None, out=None,
-              objective_name="benefit", sweep_budgets=None, time_limit=300, brute_limit=2_000_000) -> dict:
-    """Run every applicable method, check them against each other, and write the optimizer quality report."""
+              objective_name="benefit", sweep_budgets=None, time_limit=300, brute_limit=2_000_000,
+              root=None) -> dict:
+    """Run every applicable method, check them against each other, and write the optimizer quality report.
+    The report is written under a trusted root the caller names: `run_dir`, or `root` for an `out=` outside a run
+    dir (an `out=` with neither is refused; the root is never taken from the output path)."""
     us, opts, caps_l, names, b0 = _prepare(benefit, cost, feasible, budget, caps)
     if caps is None:
         caps = caps_l
@@ -650,9 +653,12 @@ def benchmark(benefit, cost, feasible, budget, caps=None, primary="ilp", methods
         report["sweep"] = sweep
     path = out or (os.path.join(run_dir, "models", "optimization_quality.yaml") if run_dir else None)
     if path:
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        with open(path, "w") as f:
-            yaml.safe_dump(report, f, sort_keys=False)
+        import sys as _sys
+        _scripts = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "scripts")
+        if _scripts not in _sys.path:
+            _sys.path.insert(0, _scripts)
+        from lib.safe_io import publish                # no link followed (follow-up to review round 5)
+        publish(path, yaml.safe_dump(report, sort_keys=False), run_dir or root)   # None is refused by safe_io
     report["results"] = res
     report["path"] = path
     return report
@@ -881,7 +887,7 @@ def _self_test() -> int:
            f"TC25 the written optimization_quality.yaml passes scripts/optimization_quality.py: {v}")
         ok({b["method"] for b in yaml.safe_load(open(rep["path"]))["benchmark_methods"]} == {"greedy"}
            and "brute_force not run" in rep["notes"], "TC26 brute force is skipped, and says so, on 40 units")
-        rg = benchmark(sb, sc, sf, B2, caps=scap, primary="greedy", out=os.path.join(d, "g.yaml"))
+        rg = benchmark(sb, sc, sf, B2, caps=scap, primary="greedy", out=os.path.join(d, "g.yaml"), root=d)
         vg = oq.validate_optimization_quality(os.path.join(d, "g.yaml"))
         ok(vg["verdict"] in ("CLEAN", "GAP_TOO_LARGE") and abs(vg["gap_pct"] - rg["gap_pct"]) < 1e-9
            and rg["primary_objective"] <= max(b["objective"] for b in rg["benchmark_methods"]),
@@ -919,7 +925,7 @@ def _self_test() -> int:
         ok(rb["gain_gap_pct"] == 0.0 and rb["baseline_objective"] == 1e9, "TC35 the gain-relative gap is reported")
         # Codex review 3: a budget that buys nothing gives an undefined gap, said so, and no crash
         rz = benchmark({"a": {"none": 0.0, "x": 1.0}}, {"a": {"none": 0.0, "x": 1.0}},
-                       {"a": {"none": True, "x": True}}, 0.0, out=os.path.join(d, "z.yaml"))
+                       {"a": {"none": True, "x": True}}, 0.0, out=os.path.join(d, "z.yaml"), root=d)
         ok(rz["gap_pct"] is None and "gap_pct is undefined" in rz["notes"]
            and oq.validate_optimization_quality(os.path.join(d, "z.yaml"))["verdict"] == "MALFORMED",
            "TC30 (Codex) a zero best objective: gap undefined, noted, and the checker fails closed")

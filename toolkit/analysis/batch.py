@@ -249,10 +249,9 @@ def run(run_dir: str, jobs: list[dict], engine, out_rel: str = "analysis/batch/r
                 for j, row in zip(g["jobs"], r["result"]["rows"]):
                     byid[j["id"]] = row
         rows = [{"ok": True, "result": byid[j["id"]]} if j["id"] in byid else {"ok": False} for j in jobs]
-        with open(out, "w") as f:
-            for n, (j, r) in enumerate(zip(jobs, rows)):
-                if r["ok"]:
-                    f.write(json.dumps({"i": n, "ok": True, "result": r["result"]}) + "\n")
+        from toolkit.analysis.artifacts import _safe_io
+        _safe_io().publish(out, "".join(json.dumps({"i": n, "ok": True, "result": r["result"]}) + "\n"
+                                        for n, (j, r) in enumerate(zip(jobs, rows)) if r["ok"]), run_dir)
         summ = dict(summ, tasks=len(groups), n=len(jobs), n_failed=sum(not r["ok"] for r in rows))
     res, problems = verify_rows([dict(r, id=j["id"]) for j, r in zip(jobs, rows) if r.get("ok")], jobs, engine)
     return {"results": res, "problems": problems,
@@ -372,12 +371,12 @@ def adopt(run_dir: str, src_results: str, src_jobs: str, src_design: str, jobs: 
         raise ValueError("stored batch not adopted: the current engine does not reproduce it: " + "; ".join(mism))
     ident = engine_identity(engine)
     out = os.path.join(run_dir, "analysis", "batch", "results.jsonl")
-    os.makedirs(os.path.dirname(out), exist_ok=True)
     src = {"path": os.path.abspath(src_results), "sha256": sha256(src_results), "jobs_sha256": sha256(src_jobs)}
-    with open(out, "w") as f:
-        for n, j in enumerate(jobs):
-            f.write(json.dumps({"i": n, "ok": True, "result": {"result": stored[j["id"]], "provenance": {
-                "job_sha": job_sha(j), "engine": ident, "producer": PRODUCER, "adopted_from": src}}}) + "\n")
+    from toolkit.analysis.artifacts import _safe_io
+    _safe_io().write_nofollow(run_dir, "analysis/batch/results.jsonl", "".join(
+        json.dumps({"i": n, "ok": True, "result": {"result": stored[j["id"]], "provenance": {
+            "job_sha": job_sha(j), "engine": ident, "producer": PRODUCER, "adopted_from": src}}}) + "\n"
+        for n, j in enumerate(jobs)).encode(), atomic=True)
     return {"path": out, "adopted_from": src, "jobs_matched": len(seen), "rerun_sample": pick,
             "rerun_reproduced": len(pick), "rtol": rtol, "rerun_max_rel_diff": worst[0],
             "ignored": sorted(TIMING_KEYS)}
@@ -429,31 +428,36 @@ def _file_sha(path: str) -> str | None:
     return sha256(path)
 
 
-def _write_bundle(out_dir: str, man: dict, design_: dict, jobs: list[dict], rows: list[dict]) -> dict:
-    os.makedirs(out_dir, exist_ok=True)
-    p = {k: os.path.join(out_dir, v) for k, v in SHIP_FILES.items()}
-    with open(p["jobs"], "w") as f:
-        f.write("".join(json.dumps(j, sort_keys=True) + "\n" for j in jobs))
-    with open(p["design"], "w") as f:
-        json.dump(design_, f, indent=1, sort_keys=True)
-    with open(p["results"], "w") as f:
-        f.write("".join(json.dumps({"id": r["id"], "ok": True, "result": r["result"]}, sort_keys=True) + "\n"
-                        for r in rows))
+def _write_bundle(out_dir: str, man: dict, design_: dict, jobs: list[dict], rows: list[dict], root: str) -> dict:
+    """Publish the bundle with no link followed under the trusted `root` the caller names (the run dir when `out_dir`
+    lies in one, else the dir the caller made for its bundles); no root is refused, never taken from `out_dir`. The
+    manifest hashes the bytes published."""
+    import hashlib
+    from toolkit.analysis.artifacts import _safe_io
+    sio = _safe_io()
+    body = {"jobs": "".join(json.dumps(j, sort_keys=True) + "\n" for j in jobs),
+            "design": json.dumps(design_, indent=1, sort_keys=True),
+            "results": "".join(json.dumps({"id": r["id"], "ok": True, "result": r["result"]}, sort_keys=True) + "\n"
+                               for r in rows)}
+    for k, name in SHIP_FILES.items():
+        sio.publish(os.path.join(out_dir, name), body[k], root)
     man = dict(man, producer=PRODUCER, n_jobs=len(jobs), n_rows=len(rows),
-               **{f"{k}_sha256": _file_sha(v) for k, v in p.items()})
-    with open(os.path.join(out_dir, SHIP_MANIFEST), "w") as f:
-        json.dump(man, f, indent=1, sort_keys=True)
+               **{f"{k}_sha256": hashlib.sha256(body[k].encode("utf-8")).hexdigest() for k in SHIP_FILES})
+    sio.publish(os.path.join(out_dir, SHIP_MANIFEST), json.dumps(man, indent=1, sort_keys=True), root)
     return man
 
 
-def ship(out_dir: str, spec, design_: dict, jobs: list[dict], rows: list[dict], platform: dict | None = None) -> dict:
+def ship(out_dir: str, spec, design_: dict, jobs: list[dict], rows: list[dict], platform: dict | None = None,
+         root: str | None = None) -> dict:
     """Write a shipped batch (or one shard of it) where it was computed: the exact jobs, the design, the ok rows
     ({"id", "ok", "result": run_job output}) and a manifest with each file's sha256, the decision spec's sha256 and
-    the computing platform. Returns the manifest."""
+    the computing platform. `root` (required): the trusted dir the bundle is written under, the run dir when
+    `out_dir` lies in one; without it the write is refused. Returns the manifest."""
     ids = {j["id"] for j in jobs}
     ok_rows = [r for r in rows if r.get("ok") and r.get("id") in ids]
     return _write_bundle(out_dir, {"platform": platform or platform_info(), "spec_sha256": spec.sha256,
-                                   "settings_sha256": getattr(spec, "settings_sha256", None)}, design_, jobs, ok_rows)
+                                   "settings_sha256": getattr(spec, "settings_sha256", None)}, design_, jobs, ok_rows,
+                         root)
 
 
 def _read_bundle(d: str) -> tuple[dict, dict, list[dict], list[dict]]:
@@ -478,7 +482,7 @@ def _read_bundle(d: str) -> tuple[dict, dict, list[dict], list[dict]]:
     return man, des, jobs, rows
 
 
-def merge_shipped(out_dir: str, parts: list[str]) -> dict:
+def merge_shipped(out_dir: str, parts: list[str], root: str | None = None) -> dict:
     """Merge shipped shards into one shipped batch. They must come from one platform, one decision spec and one
     design, with no job in two shards; each shard's hashes are checked. The merged jobs are the shards' own."""
     if not parts:
@@ -506,7 +510,7 @@ def merge_shipped(out_dir: str, parts: list[str]) -> dict:
                                    "settings_sha256": mans[0].get("settings_sha256"),
                                    "merged_from": [{"path": os.path.basename(os.path.normpath(p)),
                                                     "results_sha256": m.get("results_sha256")}
-                                                   for p, m in zip(parts, mans)]}, des, jobs, rows)
+                                                   for p, m in zip(parts, mans)]}, des, jobs, rows, root)
 
 
 def _input_diff(a, b, worst) -> bool:
@@ -651,13 +655,13 @@ def _self_test() -> int:
                 mine = [j for j in jobs if j["point"] % 2 == k]
                 ids = {j["id"] for j in mine}
                 g["ship"](sd, spec, vm_design, mine, [r for r in rws if r["id"] in ids],
-                          platform=plat_a if k == 0 or plat_b is None else plat_b)
+                          platform=plat_a if k == 0 or plat_b is None else plat_b, root=d)
                 out.append(sd)
             return out
 
         def merged(sds):
             m = os.path.join(d, f"merged{made[0]}")
-            g["merge_shipped"](m, sds)
+            g["merge_shipped"](m, sds, root=d)
             return m
 
         def b1():
