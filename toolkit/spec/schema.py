@@ -102,6 +102,7 @@ import hashlib
 import importlib
 import json
 import os
+import re
 import sys
 
 import yaml
@@ -165,9 +166,13 @@ def _leaves(d, pre=()):
             yield pre + (k,), v
 
 
-def load(path: str) -> "Spec":
-    with open(path, encoding="utf-8") as f:
-        raw = yaml.safe_load(f)
+def load(path: str, data: bytes | None = None) -> "Spec":
+    """The spec at `path`. `data`: its bytes, already read (the sign-off validates, hashes and copies one read)."""
+    if data is None:
+        with open(path, encoding="utf-8") as f:
+            raw = yaml.safe_load(f)
+    else:
+        raw = yaml.safe_load(data.decode("utf-8"))
     if not isinstance(raw, dict):
         raise SpecError(f"{path}: the spec must be a mapping")
     base = os.path.dirname(os.path.abspath(path))
@@ -217,6 +222,8 @@ def _resolve_engine_choice(s: "Spec") -> None:
     cands = eng.get("candidates") if isinstance(eng, dict) else None
     if cands is not None and (not isinstance(cands, list) or not all(isinstance(c, str) and ":" in c for c in cands)):
         raise SpecError("engine.candidates: a list of 'module:Class' references")
+    for c in cands or []:
+        check_engine_ref(c)
     cp = os.path.join(s.base, ENGINE_CHOICE)
     if not os.path.exists(cp):
         s.engine_pending = True
@@ -231,6 +238,7 @@ def _resolve_engine_choice(s: "Spec") -> None:
         raise SpecError(f"{ENGINE_CHOICE}: engine must be {{ref: 'module:Class', config: {{...}}}}")
     if cands and e["ref"] not in cands:
         raise SpecError(f"{ENGINE_CHOICE}: engine {e['ref']} is not among the signed candidates {cands}")
+    check_engine_ref(e["ref"])
     s.raw["engine"] = {"ref": e["ref"], **({"config": dict(e["config"])} if e.get("config") else {})}
     s.engine_choice_path = cp
 
@@ -398,11 +406,50 @@ class Spec:
                 "interval": meta, "label": render_claims.interval_label(meta)}
 
 
+# Run console review round 2 (P1-1): the spec names its engine as "module:Class", and an agent drafts the spec, so
+# the reference is untrusted. Only engines that ship under toolkit/engines/ load (the module's file must be there,
+# checked without importing anything), plus the repo's own test engines below; the class must implement the Engine
+# contract before it is instantiated. Anything else (subprocess:Popen, os:system, any other module) is refused
+# before an import.
+ENGINE_PACKAGE = "toolkit.engines"
+ENGINE_REFS_OUTSIDE_PACKAGE = frozenset({"toolkit.spec.priors:ToyPriorEngine"})   # a repo test engine
+TEST_ENGINE_REFS: set = set()        # self-tests only, in-process: engines a test writes into a temporary module
+ENGINE_METHODS = ("describe", "parameters", "run")
+_REF = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*:[A-Za-z]\w*")
+
+
+def check_engine_ref(ref) -> tuple[str, str]:
+    """(module, class) of an allowed engine reference, or SpecError. Imports nothing."""
+    if not isinstance(ref, str) or not _REF.fullmatch(ref):
+        raise SpecError(f"engine reference {str(ref)[:80]!r}: not 'module:Class'")
+    mod, cls = ref.split(":")
+    if ref in ENGINE_REFS_OUTSIDE_PACKAGE or ref in TEST_ENGINE_REFS:
+        return mod, cls
+    rel = os.path.join(ROOT, *mod.split("."))
+    if not mod.startswith(ENGINE_PACKAGE + ".") or not (os.path.isfile(rel + ".py")
+                                                        or os.path.isfile(os.path.join(rel, "__init__.py"))):
+        raise SpecError(f"engine {ref}: only engines under toolkit/engines/ are loaded (refused before any import)")
+    return mod, cls
+
+
+def engine_class(ref: str):
+    """The engine class an allowed reference names, checked against the Engine contract; never instantiated."""
+    mod, cls = check_engine_ref(ref)
+    k = getattr(importlib.import_module(mod), cls, None)
+    if not isinstance(k, type) or not all(callable(getattr(k, m, None)) for m in ENGINE_METHODS):
+        raise SpecError(f"engine {ref}: not a class implementing the Engine contract ({', '.join(ENGINE_METHODS)})")
+    return k
+
+
 def load_engine(ref):
     if isinstance(ref, str):
         ref = {"ref": ref}
-    mod, cls = str(ref["ref"]).split(":")
-    return getattr(importlib.import_module(mod), cls)(**(ref.get("config") or {}))
+    if not isinstance(ref, dict):
+        raise SpecError("engine: {ref: 'module:Class', config: {...}}")
+    config = ref.get("config") or {}
+    if not isinstance(config, dict):
+        raise SpecError("engine.config must be a mapping")
+    return engine_class(ref.get("ref"))(**config)
 
 
 def _num(v):

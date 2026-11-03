@@ -46,6 +46,8 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 for _p in (REPO, os.path.join(REPO, "scripts"), os.path.join(REPO, "agents")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
+from lib.safe_io import LinkRefused, dir_fd_nofollow, read_nofollow  # noqa: E402
+from lib.safe_io import write_nofollow as _safe_write  # noqa: E402
 
 HTML = os.path.join(HERE, "run_console.html")
 OWNER_DIR = "owner"
@@ -103,75 +105,99 @@ def _rel(run_dir: str, p: str) -> str:
 
 
 _LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
-_CACHE: dict = {}              # path -> ((mtime_ns, size, ino, ctime_ns), result); the page polls, files rarely change
+_CACHE: dict = {}              # path -> entry; the page polls, files rarely change (see _load_rel)
 _CACHE_MAX = 2000
+_KEEP_BYTES = 2_000_000        # an entry keeps its bytes up to this size (evidence excerpts, served files)
+_MAX_READ = 64_000_000
 # Never read, whatever the path: credential files (the run's .env and the like).
 _CREDENTIAL = re.compile(r"^(?:\.env(?:\..*)?|\.netrc|id_(?:rsa|ed25519|ecdsa).*|.*\.(?:pem|key|p12)|credentials.*)$", re.I)
 
 
-def confined(run_dir: str, rel: str) -> str:
-    """The real path of `rel` inside the run dir, or ValueError. Run artifacts are written by agents, so a path
-    from an artifact is untrusted: no absolute path, no "..", no credential file, and no link that resolves
-    outside the run dir. Every artifact read goes through this; the repo's own files are read by name."""
+def check_rel(rel: str) -> str:
+    """`rel` if it is a plain relative path inside a run dir and not a credential file; else ValueError. Run
+    artifacts are written by agents, so a path from an artifact is untrusted."""
     rel = str(rel or "")
     parts = rel.replace("\\", "/").split("/")
-    if not rel or os.path.isabs(rel) or "\0" in rel or ".." in parts:
+    if not rel or os.path.isabs(rel) or "\0" in rel or any(p in ("", ".", "..") for p in parts):
         raise ValueError(f"{rel[:120]!r}: not a relative path inside the run directory")
     if any(_CREDENTIAL.match(x) for x in parts):
         raise ValueError(f"{rel[:120]}: credential files are not read")
+    return rel
+
+
+def confined(run_dir: str, rel: str) -> str:
+    """The path of `rel` under the run dir, after check_rel. Naming only: every read opens through read_nofollow
+    (no link is followed at any component, so a check cannot race the open)."""
+    return os.path.join(os.path.realpath(run_dir), check_rel(rel))
+
+
+def _parse(rel: str, data: bytes):
+    try:
+        raw = data.decode("utf-8")
+        if rel.endswith(".json"):
+            return json.loads(raw), None
+        if rel.endswith((".yaml", ".yml")):
+            return yaml.load(raw, Loader=_LOADER), None
+        return raw, None
+    except (UnicodeDecodeError, ValueError, yaml.YAMLError) as e:
+        return None, f"{type(e).__name__}: {str(e)[:200]}"
+
+
+def _load_rel(run_dir: str, rel: str) -> dict:
+    """One artifact, read once through an fd opened with no link followed (lib.safe_io.read_nofollow):
+    {parsed, err, sha256, data (when small), size}. Parsed value and sha256 come from the same bytes. Cached by
+    the file's mtime, size, inode and ctime; a cache hit needs the same inode as the no-follow read, so a path
+    swapped for a link (another inode) is read, and refused, again."""
+    try:
+        check_rel(rel)
+    except ValueError as e:
+        return {"parsed": None, "err": str(e), "sha256": None}
     root = os.path.realpath(run_dir)
-    p = os.path.realpath(os.path.join(root, rel))
-    if not p.startswith(root + os.sep):
-        raise ValueError(f"{rel[:120]}: resolves outside the run directory")
-    if _CREDENTIAL.match(os.path.basename(p)):
-        raise ValueError(f"{rel[:120]}: credential files are not read")
-    return p
+    path = os.path.join(root, rel)
+    try:
+        st = os.lstat(path)
+    except OSError as e:
+        return {"parsed": None, "err": f"{type(e).__name__}: {e.strerror}", "sha256": None}
+    key = (st.st_mtime_ns, st.st_size, st.st_ino, st.st_ctime_ns)
+    hit = _CACHE.get(("rel", path))
+    if hit and hit[0] == key:
+        return hit[1]
+    try:
+        data, fst = read_nofollow(root, rel, _MAX_READ)
+    except (LinkRefused, OSError) as e:
+        return {"parsed": None, "err": f"not read: {e}", "sha256": None}
+    parsed, err = _parse(rel, data)
+    entry = {"parsed": parsed, "err": err, "sha256": hashlib.sha256(data).hexdigest(), "size": len(data),
+             "data": data if len(data) <= _KEEP_BYTES else None}
+    if len(_CACHE) >= _CACHE_MAX:
+        _CACHE.clear()
+    _CACHE[("rel", path)] = ((fst.st_mtime_ns, fst.st_size, fst.st_ino, fst.st_ctime_ns), entry)
+    return entry
 
 
 def _rread(run_dir: str, rel: str):
-    """_read of a run artifact through confined(): (parsed, None) or (None, error)."""
-    try:
-        return _read(confined(run_dir, rel))
-    except ValueError as e:
-        return None, str(e)
+    """(parsed, None) or (None, error) for a run artifact (_load_rel)."""
+    e = _load_rel(run_dir, rel)
+    return (e["parsed"], None) if e["err"] is None else (None, e["err"])
 
 
 def _rexists(run_dir: str, rel: str) -> bool:
-    """The entry exists (a link too, so that a link out of the run dir is read, and refused, not skipped)."""
+    """The entry exists (a link too, so that a linked artifact is read, and refused, not skipped)."""
     return os.path.lexists(os.path.join(run_dir, rel))
 
 
-def _harness_reads_ok(run_dir: str, names) -> str | None:
-    """The harness's own readers (stage_machine, signoff, scope_signoff) open fixed names in the run dir: refuse
-    when one of them is a link out of it."""
-    for n in names:
-        if os.path.lexists(os.path.join(run_dir, n)):
-            try:
-                confined(run_dir, n)
-            except ValueError as e:
-                return str(e)
-    return None
-
-
 def _read(path: str):
-    """(parsed, None) or (None, error). JSON or YAML by extension; text otherwise. Cached by the file's
-    mtime, size, inode and ctime (a same-size replacement in the same second is read again), so callers treat
-    the parsed value as read-only."""
+    """(parsed, None) or (None, error) of a plain path (the repo's own files and the self-test), cached by mtime,
+    size, inode and ctime. Run artifacts go through _rread."""
     try:
         st = os.stat(path)
         key = (st.st_mtime_ns, st.st_size, st.st_ino, st.st_ctime_ns)
         hit = _CACHE.get(path)
         if hit and hit[0] == key:
             return hit[1]
-        with open(path, encoding="utf-8") as f:
-            raw = f.read()
-        if path.endswith(".json"):
-            out = (json.loads(raw), None)
-        elif path.endswith((".yaml", ".yml")):
-            out = (yaml.load(raw, Loader=_LOADER), None)
-        else:
-            out = (raw, None)
-    except (OSError, UnicodeDecodeError, ValueError, yaml.YAMLError) as e:
+        with open(path, "rb") as f:
+            out = _parse(path, f.read())
+    except OSError as e:
         return None, f"{type(e).__name__}: {str(e)[:200]}"
     if len(_CACHE) >= _CACHE_MAX:
         _CACHE.clear()
@@ -180,32 +206,40 @@ def _read(path: str):
 
 
 def read_jsonl_rel(run_dir: str, rel: str) -> tuple[list, list]:
+    """(rows, errors) of a JSON-lines artifact read through read_nofollow; a torn or non-object line is an error."""
+    if not _rexists(run_dir, rel):
+        return [], []
     try:
-        return read_jsonl(confined(run_dir, rel))
-    except ValueError as e:
-        return [], [str(e)]
+        data = read_nofollow(os.path.realpath(run_dir), check_rel(rel), _MAX_READ)[0].decode("utf-8")
+    except (ValueError, OSError, UnicodeDecodeError) as e:
+        return [], [f"{os.path.basename(rel)}: {e}"]
+    return _jsonl_rows(data, os.path.basename(rel))
+
+
+def _jsonl_rows(text: str, name: str) -> tuple[list, list]:
+    rows, errs = [], []
+    for n, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            r = json.loads(line)
+            if not isinstance(r, dict):
+                raise ValueError("not an object")
+            rows.append(r)
+        except ValueError as e:
+            errs.append(f"{name} line {n}: {e}")
+    return rows, errs
 
 
 def read_jsonl(path: str) -> tuple[list, list]:
-    """(rows, errors): a torn or non-object line is an error, not skipped silently."""
-    rows, errs = [], []
+    """(rows, errors) of a plain path."""
     if not os.path.exists(path):
-        return rows, errs
+        return [], []
     try:
         with open(path, encoding="utf-8") as f:
-            for n, line in enumerate(f, 1):
-                if not line.strip():
-                    continue
-                try:
-                    r = json.loads(line)
-                    if not isinstance(r, dict):
-                        raise ValueError("not an object")
-                    rows.append(r)
-                except ValueError as e:
-                    errs.append(f"{os.path.basename(path)} line {n}: {e}")
+            return _jsonl_rows(f.read(), os.path.basename(path))
     except (OSError, UnicodeDecodeError) as e:
-        errs.append(f"{os.path.basename(path)}: {e}")
-    return rows, errs
+        return [], [f"{os.path.basename(path)}: {e}"]
 
 
 def _err_card(run_dir: str, path: str, stage: str, err: str) -> dict:
@@ -216,68 +250,39 @@ def _err_card(run_dir: str, path: str, stage: str, err: str) -> dict:
 
 def _mtime(path: str) -> str:
     try:
-        return _iso(os.path.getmtime(path))
+        return _iso(os.lstat(path).st_mtime)
     except OSError:
         return ""
 
 
+def read_file_bytes(run_dir: str, rel: str, max_bytes: int = 4_000_000) -> bytes:
+    """A run file's bytes for /api/file, through read_nofollow; ValueError when it cannot be served."""
+    try:
+        return read_nofollow(os.path.realpath(run_dir), check_rel(rel), max_bytes)[0]
+    except (LinkRefused, OSError) as e:
+        raise ValueError(f"{rel}: not a plain file in the run directory ({e})") from None
+
+
 def safe_path(run_dir: str, rel: str) -> str:
-    """An existing file inside the run dir (confined()), never a credential file."""
-    p = confined(run_dir, rel)
-    if not os.path.isfile(p):
-        raise ValueError(f"{rel}: not a file in the run directory")
-    return p
+    """The run file's path after the checks of read_file_bytes (a read through read_nofollow); kept for callers
+    that name a file. Reading from the returned path is not safe: use read_file_bytes."""
+    read_file_bytes(run_dir, rel, 0)
+    return confined(run_dir, rel)
 
 
-# ------------------------------------------------------------------ writes: never through a link
-def _dir_fd(base: str, parts) -> int:
-    """An fd on base/parts..., each component created if missing and opened without following a link."""
-    fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        for part in parts:
-            if part in ("", ".", ".."):
-                raise ValueError(f"{part!r}: not a directory name")
-            try:
-                os.mkdir(part, 0o755, dir_fd=fd)
-            except FileExistsError:
-                pass
-            try:
-                nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
-            except OSError as e:
-                raise ValueError(f"{part}: not a plain directory (a link is refused): {e.strerror}") from None
-            os.close(fd)
-            fd = nfd
-        return fd
-    except BaseException:
-        os.close(fd)
-        raise
-
-
+# ------------------------------------------------------------------ writes: never through a link (lib.safe_io)
 def write_nofollow(base: str, rel: str, data: bytes, append: bool = False, exclusive: bool = False) -> str:
-    """Write base/rel without following a link at any component (directories opened relative to their parent's
-    fd, the file with O_NOFOLLOW), and never into a file with other hard links. Returns the path written."""
-    base = os.path.realpath(base)
-    parts = rel.split("/")
-    fd = _dir_fd(base, parts[:-1])
     try:
-        flags = (os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | (os.O_APPEND if append else os.O_TRUNC)
-                 | (os.O_EXCL if exclusive else 0))
-        try:
-            f = os.open(parts[-1], flags, 0o644, dir_fd=fd)
-        except OSError as e:
-            raise ValueError(f"{rel}: cannot be written without following a link ({e.strerror})") from None
-        try:
-            st = os.fstat(f)
-            if not stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
-                raise ValueError(f"{rel}: not a plain file with one link; not written")
-            view = memoryview(data)
-            while view:
-                view = view[os.write(f, view):]
-        finally:
-            os.close(f)
-    finally:
-        os.close(fd)
-    return os.path.join(base, rel)
+        return _safe_write(base, rel, data, append=append, exclusive=exclusive)
+    except LinkRefused as e:
+        raise ValueError(str(e)) from None
+
+
+def _dir_fd(base: str, parts) -> int:
+    try:
+        return dir_fd_nofollow(base, parts, create=True)
+    except LinkRefused as e:
+        raise ValueError(str(e)) from None
 
 
 def states() -> tuple:
@@ -287,15 +292,18 @@ def states() -> tuple:
 
 # ------------------------------------------------------------------ state, stepper, cards
 def load_run_state(run_dir: str):
-    """(state dict, None) through the harness's reader, or (None, error)."""
-    bad = _harness_reads_ok(run_dir, ("run_state.json",))
-    if bad:
-        return None, f"run_state.json not read: {bad}"
+    """(state dict, None) or (None, error): run_state.json read through _load_rel and checked as stage_machine's
+    load_state checks it (a known state), without the harness opening the file."""
+    if not _rexists(run_dir, "run_state.json"):
+        return None, "no run_state.json"
+    doc, err = _rread(run_dir, "run_state.json")
+    if err or not isinstance(doc, dict):
+        return None, f"run_state.json unreadable: {err or 'not a mapping'}"
     try:
         from agents import stage_machine
-        st = stage_machine.load_state(run_dir)
-        if st is None:
-            return None, "no run_state.json"
+        st = stage_machine.RunState(**{k: v for k, v in doc.items() if k in stage_machine.RunState.__dataclass_fields__})
+        if st.state not in stage_machine.STATES:
+            raise ValueError(f"unknown state {st.state!r}")
         return st.to_dict(), None
     except Exception as e:  # noqa: BLE001 -- fail closed: shown on the page
         return None, f"run_state.json unreadable: {type(e).__name__}: {str(e)[:200]}"
@@ -361,7 +369,8 @@ def critique_cards(run_dir: str) -> list:
     out = []
     for p in sorted(glob.glob(os.path.join(run_dir, "critique_*.yaml"))):
         rel = _rel(run_dir, p)
-        doc, err = _rread(run_dir, rel)
+        ent = _load_rel(run_dir, rel)
+        doc, err = ent["parsed"], ent["err"]
         if err or not isinstance(doc, dict) or not isinstance(doc.get("blockers", []), list):
             out.append(_err_card(run_dir, p, "CRITIQUE", err or "not a mapping with a `blockers` list"))
             continue
@@ -375,7 +384,10 @@ def critique_cards(run_dir: str) -> list:
                         "reviewer": doc.get("reviewer"), "round": doc.get("round"), "blocker_id": bid,
                         **{k: b.get(k) for k in ("severity", "category", "target_stage", "claim", "fix_requires",
                                                  "done_when", "resolved", "first_seen_round", "evidence")},
-                        "anchor": {"kind": "blocker", "id": bid, "file": rel}})
+                        "anchor": {"kind": "blocker", "id": bid, "file": rel},
+                        "evidence": sealed({"file": rel, "anchor_id": bid, "sha256": ent["sha256"],
+                                            "round": doc.get("round"), "excerpt": _blocker_excerpt(b), "at": _now(),
+                                            "captured": "render"})})
     return out
 
 
@@ -491,6 +503,9 @@ def figure_cards(run_dir: str) -> list:
         rel = _rel(run_dir, p)
         card = {"id": f"figure:{rel}", "kind": "figure", "stage": "ANALYZE", "at": _mtime(p), "title": rel,
                 "body": caps.get(rel, ""), "file": rel, "anchor": {"kind": "figure", "id": rel, "file": rel}}
+        card["evidence"] = sealed({"file": rel, "anchor_id": rel, "sha256": _sha_rel(run_dir, rel), "round": None,
+                                   "excerpt": caps.get(rel) or "(no caption recorded)", "at": _now(),
+                                   "captured": "render"})
         prov = p + ".provenance.json"
         if os.path.lexists(prov):
             doc, err = _rread(run_dir, rel + ".provenance.json")
@@ -634,41 +649,80 @@ def compute_status(run_dir: str, cap_core_hours: float | None = None, st: dict |
     return out
 
 
-SPEC_FILES = ("decision_spec.yaml", "decision_spec.signoff.json", "decision_brief.yaml", "decision_brief.signoff.json",
-              "data/derivations_record.json")
-SCOPE_FILES = ("scope_signoff_request.json", "scope_signoff.json", "scope_signoff_ledger.json", "trace.jsonl")
+SPEC, SPEC_SIGNOFF, BRIEF_SIGNOFF = "decision_spec.yaml", "decision_spec.signoff.json", "decision_brief.signoff.json"
+DERIV_RECORD, SHEET = "data/derivations_record.json", "decision_spec.signoff_sheet.md"
+
+
+def spec_view(run_dir: str) -> dict:
+    """The console's own read model of the spec sign-off: it parses JSON and YAML it reads through _load_rel and
+    never runs the harness's loaders (toolkit/spec/schema.load can instantiate the engine a spec names; review
+    round 2, P1-1 and P1-4). status: absent | awaiting | signed | changed | (None with an error). "awaiting"
+    does not say the spec is valid: the sign command validates it and refuses an invalid one. With it, the approval
+    snapshot: the sheet's text and sha256, the spec's sha256 and the derivation record's ("none" when absent), each
+    from one read, so the card shows exactly what the signer is told to check."""
+    spec = _load_rel(run_dir, SPEC) if _rexists(run_dir, SPEC) else None
+    if spec is not None and spec["sha256"] is None:
+        return {"status": None, "error": f"{SPEC}: {spec['err']}"}
+    rec = None
+    for name in (BRIEF_SIGNOFF, SPEC_SIGNOFF):
+        if _rexists(run_dir, name):
+            doc, err = _rread(run_dir, name)
+            if err or not isinstance(doc, dict):
+                return {"status": None, "error": f"{name}: {err or 'not a mapping'}"}
+            if (doc.get("sha256") or {}).get(SPEC) is not None or name == SPEC_SIGNOFF:
+                rec = doc
+                break
+    deriv = _load_rel(run_dir, DERIV_RECORD) if _rexists(run_dir, DERIV_RECORD) else None
+    if deriv is not None and deriv["sha256"] is None:
+        return {"status": None, "error": f"{DERIV_RECORD}: {deriv['err']}"}
+    dsha = deriv["sha256"] if deriv else None
+    if spec is None:
+        return {"status": "changed" if rec is not None else "absent", "error": None}
+    if rec is not None:
+        shas = rec.get("sha256") or {}
+        same = spec["sha256"] == shas.get(SPEC) and dsha == shas.get(DERIV_RECORD)
+        if same and deriv is not None:
+            outs = [o for e in ((deriv["parsed"] or {}).get("derivations") or {}).values() if isinstance(e, dict)
+                    for o in [(o, h) for o, h in (e.get("outputs") or {}).items()]]
+            same = all(_load_rel(run_dir, str(o))["sha256"] == h for o, h in outs)   # outside the run dir: refused
+        return {"status": "signed" if same else "changed", "error": None}
+    sheet = _load_rel(run_dir, SHEET) if _rexists(run_dir, SHEET) else None
+    return {"status": "awaiting", "error": None, "spec_sha256": spec["sha256"], "derivations_sha256": dsha or "none",
+            "sheet": sheet["parsed"] if sheet and sheet["err"] is None else None,
+            "sheet_error": None if sheet and sheet["err"] is None else (sheet["err"] if sheet else f"no {SHEET} yet"),
+            "sheet_sha256": sheet["sha256"] if sheet and sheet["err"] is None else "none"}
 
 
 def _spec_status(run_dir: str):
-    bad = _harness_reads_ok(run_dir, SPEC_FILES)
-    if bad:
-        return None, f"not read: {bad}"
-    try:
-        from toolkit.spec import signoff
-        return signoff.status(run_dir), None
-    except Exception as e:  # noqa: BLE001
-        return None, f"{type(e).__name__}: {str(e)[:200]}"
+    v = spec_view(run_dir)
+    return v.get("status"), v.get("error")
+
+
+def _scope_answers(run_dir: str, name: str) -> tuple[dict, str | None]:
+    """{fingerprint: answer} from scope_signoff.json, checked as scope_signoff.load_answers checks it."""
+    import scope_signoff as SS
+    if not _rexists(run_dir, name):
+        return {}, None
+    doc, err = _rread(run_dir, name)
+    ans = doc.get("answers") if isinstance(doc, dict) else None
+    if err or not isinstance(ans, dict) or not all(isinstance(a, dict) and a.get("decision") in SS.DECISIONS
+                                                   for a in ans.values()):
+        return {}, f"{name}: {err or 'answers must map fingerprints to {decision: accept|decline}'}"
+    return ans, None
 
 
 def inbox(run_dir: str) -> dict:
-    """The questions the run waits on: the spec sign-off and pending scope declarations."""
+    """The questions the run waits on: the spec sign-off and pending scope declarations, from the console's own
+    read model (spec_view; the scope request and answers parsed here)."""
     import scope_signoff as SS
-    out = {}
-    spec, err = _spec_status(run_dir)
-    out["spec"] = {"status": spec, "error": err}
-    if spec == "awaiting":
-        sheet = "decision_spec.signoff_sheet.md"
-        txt, serr = _rread(run_dir, sheet) if _rexists(run_dir, sheet) else (None, f"no {sheet} yet")
-        out["spec"].update(sheet=txt, sheet_error=serr, spec_sha256=_sha_rel(run_dir, "decision_spec.yaml"))
+    v = spec_view(run_dir)
+    out = {"spec": dict(v)}
     if _rexists(run_dir, SS.REQUEST):
         req, rerr = _rread(run_dir, SS.REQUEST)
-        bad_link = _harness_reads_ok(run_dir, SCOPE_FILES)
-        if bad_link:
-            out["scope"] = {"error": f"not read: {bad_link}"}
-        elif rerr or not isinstance(req, dict):
+        if rerr or not isinstance(req, dict):
             out["scope"] = {"error": f"{SS.REQUEST}: {rerr or 'not a mapping'}"}
         elif req.get("pending"):
-            answers, bad = SS.load_answers(run_dir)
+            answers, bad = _scope_answers(run_dir, SS.SIGNOFF)
             items = []
             for it in req.get("items") or []:
                 if not isinstance(it, dict):
@@ -676,13 +730,14 @@ def inbox(run_dir: str) -> dict:
                 items.append({"finding": it.get("finding"), "fingerprint": it.get("fingerprint"),
                               "reason": it.get("reason"), "claim": it.get("claim"),
                               "declarations": [{"id": d.get("id"), "test": SS._test_md(d.get("test") or {}),
-                                                "text": d.get("text") or {}} for d in it.get("declarations") or []],
+                                                "text": d.get("text") or {}} for d in it.get("declarations") or []
+                                               if isinstance(d, dict)],
                               "answer": (answers.get(it.get("fingerprint")) or {}).get("decision")})
+            done = items and all(i["answer"] for i in items)
             out["scope"] = {"pending": True, "round": req.get("round"), "items": items,
                             "fingerprints": sorted(str(i.get("fingerprint")) for i in items),
                             "rationale": req.get("decision_rationale"),
-                            "status": SS.status(run_dir, verified=False),
-                            "error": bad[0]["claim"] if bad else None}
+                            "status": "answered" if done and not bad else "awaiting", "error": bad}
     return out
 
 
@@ -698,6 +753,7 @@ def _inbox_cards(run_dir: str, box: dict, st: dict) -> list:
                     "at": _mtime(os.path.join(run_dir, "decision_spec.yaml")), "title": "Your decision needed: "
                     "sign the decision spec", "body": spec.get("sheet") or spec.get("sheet_error") or "",
                     "paused": st.get("paused"), "spec_sha256": spec.get("spec_sha256"),
+                    "sheet_sha256": spec.get("sheet_sha256"), "derivations_sha256": spec.get("derivations_sha256"),
                     "anchor": {"kind": "spec", "id": "signoff",
                                                            "file": "decision_spec.signoff_sheet.md"}})
     sc = box.get("scope")
@@ -945,42 +1001,70 @@ def read_run(run_dir: str, cap=None) -> dict:
 
 
 # ------------------------------------------------------------------ feedback and the learning view
-def evidence(run_dir: str, anchor: dict | None) -> dict | None:
-    """What the owner was looking at, kept with the feedback or the chat turn so it stays meaningful after the file
-    is overwritten: the file's sha256, the round it records, and a short excerpt (the blocker's claim, the figure's
-    caption, the decision test's question, or the lines around the anchor id)."""
+# Evidence snapshots (review round 2, P2-9): what a card showed, sealed by this console process when the card was
+# rendered, so feedback keeps it even when the file is overwritten before the owner submits. A snapshot the page
+# sends back is used only when its seal checks; otherwise the evidence is captured at submit time and says so.
+_EVIDENCE_KEY = secrets.token_bytes(32)
+_EV_FIELDS = ("file", "anchor_id", "sha256", "round", "excerpt", "at", "captured")
+
+
+def _ev_mac(ev: dict) -> str:
+    return hmac.new(_EVIDENCE_KEY, json.dumps([ev.get(k) for k in _EV_FIELDS], default=str).encode(),
+                    hashlib.sha256).hexdigest()
+
+
+def sealed(ev: dict) -> dict:
+    ev = {k: ev.get(k) for k in _EV_FIELDS}
+    ev["mac"] = _ev_mac(ev)
+    return ev
+
+
+def evidence_ok(ev, anchor: dict | None) -> bool:
+    a = anchor or {}
+    return (isinstance(ev, dict) and isinstance(ev.get("mac"), str) and hmac.compare_digest(ev["mac"], _ev_mac(ev))
+            and ev.get("file") == a.get("file") and str(ev.get("anchor_id") or "") == str(a.get("id") or ""))
+
+
+def _blocker_excerpt(b: dict) -> str:
+    return " ".join(str(b.get(k) or "") for k in ("severity", "claim", "fix_requires") if b.get(k)).strip()[:600]
+
+
+def evidence(run_dir: str, anchor: dict | None, captured: str = "submit") -> dict | None:
+    """The anchored artifact now: sha256, round and a short excerpt (the blocker's claim, the figure's caption, the
+    decision test's question, or the lines around the anchor id), all from one no-follow read of the file."""
     a = anchor or {}
     f = a.get("file")
     if not f:
         return None
-    try:
-        p = confined(run_dir, str(f))
-        with open(p, "rb") as fh:
-            data = fh.read(8_000_000)
-    except (ValueError, OSError) as e:
-        return {"file": f, "error": str(e)[:200]}
-    out = {"file": f, "sha256": hashlib.sha256(data).hexdigest(), "at": _now()}
-    doc, _ = _read(p)
+    e = _load_rel(run_dir, str(f))
+    if e["sha256"] is None:
+        return {"file": f, "error": str(e["err"])[:200]}
+    doc, aid = e["parsed"], str(a.get("id") or "")
     rnd = doc.get("round") if isinstance(doc, dict) else None
-    excerpt, aid = "", str(a.get("id") or "")
+    excerpt = ""
     if a.get("kind") == "blocker" and isinstance(doc, dict):
-        b = next((x for x in doc.get("blockers") or [] if isinstance(x, dict) and str(x.get("id")) == aid), {})
-        excerpt = " ".join(str(b.get(k) or "") for k in ("severity", "claim", "fix_requires") if b.get(k))
+        excerpt = _blocker_excerpt(next((x for x in doc.get("blockers") or [] if isinstance(x, dict)
+                                         and str(x.get("id")) == aid), {}))
     elif a.get("kind") == "figure":
         c = next((x for x in figure_cards(run_dir) if x.get("file") == f), {})
         excerpt = " · ".join(str(x) for x in (c.get("body"), c.get("producer")) if x) or "(no caption recorded)"
     elif a.get("kind") == "decision_test":
         c = next((x for x in decision_test_cards(run_dir) if x.get("test_id") == aid), {})
         excerpt = f"{c.get('title') or ''}. {c.get('body') or ''}".strip(". ")
-    if not excerpt:
-        lines = data.decode("utf-8", "replace").splitlines()
+    if not excerpt and isinstance(e.get("data"), bytes):
+        lines = e["data"].decode("utf-8", "replace").splitlines()
         hit = next((i for i, ln in enumerate(lines) if aid and aid in ln), 0)
         excerpt = "\n".join(lines[hit:hit + 6])
     if rnd is None:
         st, _ = load_run_state(run_dir)
         rnd = (st or {}).get("round")
-    out.update(round=rnd, excerpt=excerpt.strip()[:600])
-    return out
+    return sealed({"file": f, "anchor_id": aid, "sha256": e["sha256"], "round": rnd, "excerpt": excerpt.strip()[:600],
+                   "at": _now(), "captured": captured})
+
+
+def _evidence_for(run_dir: str, anchor: dict | None, shown) -> dict | None:
+    """The snapshot the page showed when its seal checks, else one captured now."""
+    return dict(shown) if evidence_ok(shown, anchor) else evidence(run_dir, anchor)
 
 
 def append_feedback(run_dir: str, rec: dict) -> dict:
@@ -1000,7 +1084,7 @@ def append_feedback(run_dir: str, rec: dict) -> dict:
             out[k] = rec[k]
     if out.get("verdict") not in (None, "agree", "disagree"):
         raise ValueError("verdict must be agree or disagree")
-    ev = evidence(run_dir, out["anchor"])
+    ev = _evidence_for(run_dir, out["anchor"], rec.get("evidence"))
     if ev:
         out["evidence"] = ev
     _append(run_dir, FEEDBACK, out)
@@ -1074,9 +1158,20 @@ def _run(cmd: list, runner=None) -> dict:
         return {"ok": False, "rc": None, "out": f"{type(e).__name__}: {e}", "cmd": cmd}
 
 
-def _remote_sign(cfg: str, answers: dict, note: str, remote, runner=None, expect_sha256: str | None = None) -> dict:
-    """run_cluster.py <config> sign <answers> --label L --run RUN [--expect-spec-sha256 SHA] <note>: the worker
-    refuses another run than the one shown, and stage_machine.py refuses another spec."""
+def _snapshot_flags(snap: dict | None) -> list:
+    snap = snap or {}
+    out = []
+    for flag, k in (("--expect-derivations-sha256", "derivations_sha256"), ("--expect-sheet-sha256", "sheet_sha256")):
+        if snap.get(k):
+            out += [flag, str(snap[k])]
+    return out
+
+
+def _remote_sign(cfg: str, answers: dict, note: str, remote, runner=None, expect_sha256: str | None = None,
+                 action: str = "scope", snapshot: dict | None = None) -> dict:
+    """run_cluster.py <config> sign <answers> --label L --run RUN --action spec|scope [--expect-spec-sha256 SHA
+    --expect-derivations-sha256 SHA --expect-sheet-sha256 SHA] <note>: the worker refuses another run than the one
+    shown, and stage_machine.py refuses a snapshot other than the one shown."""
     if not remote or not all(remote):
         return {"ok": False, "refused": "the remote label and run of this mirrored run are not known"}
     fd, p = tempfile.mkstemp(suffix=".yaml", prefix="console_answers_")
@@ -1084,34 +1179,49 @@ def _remote_sign(cfg: str, answers: dict, note: str, remote, runner=None, expect
         yaml.safe_dump(answers, f, sort_keys=True)
     try:
         return _run([sys.executable, "cloud/run_cluster.py", cfg, "sign", p, "--label", str(remote[0]), "--run",
-                     str(remote[1])] + (["--expect-spec-sha256", expect_sha256] if expect_sha256 else []) + [note],
-                    runner)
+                     str(remote[1]), "--action", action]
+                    + (["--expect-spec-sha256", expect_sha256] + _snapshot_flags(snapshot) if expect_sha256 else [])
+                    + [note], runner)
     finally:
         os.remove(p)
 
 
+_SHA = re.compile(r"[0-9a-f]{64}")
+
+
 def sign_spec(run_dir: str, note: str, confirm: bool, mirror: bool = False, cloud_config: str | None = None,
-              status_fn=None, runner=None, expect_sha256: str | None = None, remote=None) -> dict:
-    """The owner signs decision_spec.yaml through agents/stage_machine.py sign --expect-sha256 <the sha shown>
-    (remote: run_cluster sign). The command, not the console, makes the check that binds the signature."""
+              status_fn=None, runner=None, expect_sha256: str | None = None, remote=None,
+              snapshot: dict | None = None) -> dict:
+    """The owner signs decision_spec.yaml through agents/stage_machine.py sign with the approval snapshot shown:
+    --expect-sha256 (the spec), --expect-derivations-sha256 and --expect-sheet-sha256 (remote: run_cluster sign).
+    The command, not the console, makes the check that binds the signature."""
     if not confirm:
         return {"ok": False, "refused": "not confirmed: tick the confirmation to sign"}
     if not str(note or "").strip():
         return {"ok": False, "refused": "the owner's note is required"}
-    if not re.fullmatch(r"[0-9a-f]{64}", str(expect_sha256 or "")):
+    if not _SHA.fullmatch(str(expect_sha256 or "")):
         return {"ok": False, "refused": "the sha256 of the spec you were shown is missing: reload the run"}
+    if snapshot is not None and not all(_SHA.fullmatch(str(snapshot.get(k) or "")) or snapshot.get(k) == "none"
+                                        for k in ("derivations_sha256", "sheet_sha256")):
+        return {"ok": False, "refused": "the approval snapshot is incomplete: reload the run"}
     if mirror:
         if not cloud_config:
             return {"ok": False, "refused": "a mirrored run is signed on the cluster: start the console with "
                                             "--cloud-config"}
-        return _remote_sign(cloud_config, {}, note, remote, runner, expect_sha256)
-    status, err = (status_fn(run_dir), None) if status_fn else _spec_status(run_dir)
+        return _remote_sign(cloud_config, {}, note, remote, runner, expect_sha256, "spec", snapshot)
+    if status_fn:
+        status, view = status_fn(run_dir), None
+    else:
+        view = spec_view(run_dir)
+        status = view.get("status")
     if status != "awaiting":
-        return {"ok": False, "refused": f"the spec is not awaiting sign-off (status {status or err})"}
-    if not status_fn and _sha_rel(run_dir, "decision_spec.yaml") != expect_sha256:
-        return {"ok": False, "refused": "decision_spec.yaml changed since it was shown: reload the run and read it again"}
+        return {"ok": False, "refused": f"the spec is not awaiting sign-off (status {status or (view or {}).get('error')})"}
+    if view is not None and (view.get("spec_sha256") != expect_sha256 or (snapshot is not None and any(
+            view.get(k) != snapshot.get(k) for k in ("derivations_sha256", "sheet_sha256")))):
+        return {"ok": False, "refused": "the spec, its sheet or the derivation record changed since they were shown: "
+                                        "reload the run and read them again"}
     return _run([sys.executable, "agents/stage_machine.py", "sign", run_dir, "--by", "owner", "--note", note,
-                 "--expect-sha256", expect_sha256], runner)
+                 "--expect-sha256", expect_sha256] + _snapshot_flags(snapshot), runner)
 
 
 def answer_scope(run_dir: str, answers: dict, note: str, confirm: bool, mirror: bool = False,
@@ -1125,7 +1235,8 @@ def answer_scope(run_dir: str, answers: dict, note: str, confirm: bool, mirror: 
         return {"ok": False, "refused": "not confirmed: tick the confirmation to answer"}
     if not str(note or "").strip():
         return {"ok": False, "refused": "the owner's note is required"}
-    req = SS._load_request(run_dir)
+    req, _ = _rread(run_dir, SS.REQUEST) if _rexists(run_dir, SS.REQUEST) else (None, None)
+    req = req if isinstance(req, dict) else None
     if not req or not req.get("pending") or not req.get("items"):
         return {"ok": False, "refused": "no scope declaration is waiting for an answer"}
     now_fps = sorted(str(it.get("fingerprint")) for it in req["items"])
@@ -1146,7 +1257,7 @@ def answer_scope(run_dir: str, answers: dict, note: str, confirm: bool, mirror: 
         if not cloud_config:
             return {"ok": False, "refused": "a mirrored run is answered on the cluster: start the console with "
                                             "--cloud-config"}
-        return _remote_sign(cloud_config, clean, note, remote, runner)
+        return _remote_sign(cloud_config, clean, note, remote, runner, action="scope")
     fd, p = tempfile.mkstemp(suffix=".yaml", prefix="console_scope_")
     with os.fdopen(fd, "w") as f:
         yaml.safe_dump(clean, f, sort_keys=True)
@@ -1206,18 +1317,19 @@ def chat_context(run_dir: str) -> dict:
     lines = [(f"- [[{c['anchor']['file']}#{c['blocker_id']}]] {c.get('severity')} {c.get('category')} → "
               f"{c.get('target_stage')}: {str(c.get('claim') or '').strip()[:400]}") if c["kind"] == "blocker"
              else f"- {c['title']}: {c['body']}" for c in bl]
-    parts.append("## Unresolved blockers (critique_*.yaml)\n" + _cut("blockers", "\n".join(lines) or "none",
-                                                                    BUDGET["blockers"], cut))
+    kept = _cut("blockers", "\n".join(lines) or "none", BUDGET["blockers"], cut)
+    parts.append("## Unresolved blockers (critique_*.yaml)\n" + kept)
     for c, ln in zip(bl, lines):
-        if c["kind"] == "blocker":
+        if c["kind"] == "blocker" and ln in kept:          # only what the prompt kept counts as seen
             saw(c["anchor"]["file"], ln)
     dts = decision_test_cards(run_dir)
     lines = [f"- [[{c['anchor']['file']}#{c['anchor']['id']}]] {c['title']}. {c.get('body') or ''} Criterion: "
              f"{c.get('criterion')}" if c["kind"] == "decision_test" else f"- {c['title']}: {c['body']}" for c in dts]
+    kept = _cut("decision tests", "\n".join(lines) or "none", BUDGET["tests"], cut)
     parts.append("## Decision tests (each one: changes the plan, does not change the plan, not run, or its result "
-                 "cannot be read)\n" + _cut("decision tests", "\n".join(lines) or "none", BUDGET["tests"], cut))
+                 "cannot be read)\n" + kept)
     for c, ln in zip(dts, lines):
-        if c["kind"] == "decision_test":
+        if c["kind"] == "decision_test" and ln in kept:
             saw(c["anchor"]["file"], ln)
             saw("analysis/decision_tests.yaml", ln)
     box = inbox(run_dir)
@@ -1342,21 +1454,21 @@ class ChatSession:
 
     def send(self, run_dir: str, text: str, anchor: dict | None = None, kind: str = "question",
              layer: str | None = None, proposed_change: str | None = None, stage: str | None = None,
-             verdict: str | None = None) -> dict:
+             verdict: str | None = None, shown_evidence: dict | None = None) -> dict:
         if not str(text or "").strip():
             return {"ok": False, "error": "empty message"}
         if kind not in KINDS:
             return {"ok": False, "error": f"kind must be one of {', '.join(KINDS)}"}
         with self._run_lock(run_dir):
-            return self._send(run_dir, text, anchor, kind, layer, proposed_change, stage, verdict)
+            return self._send(run_dir, text, anchor, kind, layer, proposed_change, stage, verdict, shown_evidence)
 
-    def _send(self, run_dir, text, anchor, kind, layer, proposed_change, stage, verdict) -> dict:
+    def _send(self, run_dir, text, anchor, kind, layer, proposed_change, stage, verdict, shown_evidence=None) -> dict:
         fb = None
         if kind in STEERING:
             try:
                 fb = append_feedback(run_dir, {"kind": kind, "layer": layer, "text": text, "anchor": anchor,
                                                "proposed_change": proposed_change, "stage": stage,
-                                               "verdict": verdict})
+                                               "verdict": verdict, "evidence": shown_evidence})
             except ValueError as e:
                 return {"ok": False, "error": str(e)}
         ctx = chat_context(run_dir)
@@ -1365,7 +1477,7 @@ class ChatSession:
                 if r.get("role") in ("user", "assistant") and r.get("text")]
         a = anchor or {}
         prefix = (f"[Anchored to {a.get('kind')} {a.get('id')} in {a.get('file')}]\n" if a.get("kind") else "")
-        ev = (fb or {}).get("evidence") or (evidence(run_dir, a) if a.get("file") else None)
+        ev = (fb or {}).get("evidence") or (_evidence_for(run_dir, a, shown_evidence) if a.get("file") else None)
         if ev and ev.get("excerpt") is not None:
             prefix += (f"[Evidence from {ev['file']} (sha256 {str(ev.get('sha256'))[:12]}, round {ev.get('round')}): "
                        f"{ev['excerpt']}]\n")
@@ -1408,12 +1520,13 @@ class ChatSession:
                         snap = None
                     raise
         except Exception as e:  # noqa: BLE001 -- the SDK's typed errors, shown as text (never the key)
+            # No final usage: a partial snapshot is a lower bound (output may have been billed after it), so the whole
+            # reservation is kept as spent (review round 2, P2-7). The partial figure is logged, not charged.
             u = getattr(snap, "usage", None)
-            known = u is not None and getattr(snap, "model", MODEL) == MODEL
-            usd = price(u) if known else worst      # usage unknown: the reservation is kept as spent
+            usd = worst
             self._settle(worst, usd)
-            self.log(f"[console] chat call failed: {type(e).__name__}; charged ${usd:.4f} "
-                     f"({'partial usage' if known else 'the reservation: usage unknown'})")
+            self.log(f"[console] chat call failed: {type(e).__name__}; charged the reservation ${usd:.4f}"
+                     + (f" (partial usage seen: ${price(u):.4f})" if u is not None else ""))
             return {"ok": False, "feedback": fb, "error": f"Claude API error: {type(e).__name__}: {str(e)[:300]}",
                     "charged": usd, "spent": self.spent}
         fell_back = _fallback_ran(msg)
@@ -1582,7 +1695,11 @@ def package_counts(run_dir: str) -> dict:
         return {}
     counts: dict = {}
     try:
-        with open(confined(run_dir, "allocation.csv"), newline="", encoding="utf-8") as f:
+        e = _load_rel(run_dir, "allocation.csv")
+        if e["err"]:
+            raise ValueError(e["err"])
+        import io
+        with io.StringIO(e["parsed"], newline="") as f:
             for row in csv.DictReader(f):
                 for c in str(row.get("package") or "").split("+"):
                     if c.strip():
@@ -1601,10 +1718,8 @@ def _sha(path: str) -> str | None:
 
 
 def _sha_rel(run_dir: str, rel: str) -> str | None:
-    try:
-        return _sha(confined(run_dir, rel))
-    except ValueError:
-        return None
+    """sha256 of a run artifact, read through read_nofollow (None when it cannot be read)."""
+    return _load_rel(run_dir, rel)["sha256"] if _rexists(run_dir, rel) else None
 
 
 def end_reason(st: dict | None, status: str | None, chip: str) -> str:
@@ -1722,7 +1837,8 @@ def projects(runs: list) -> list:
                 r["prev"], r["diff"] = prev["id"], spec_diff(prev.get("spec_fields") or {}, r.get("spec_fields") or {})
                 # Inferred from the question and the order: the harness records no parent run id (open item).
                 same = bool(r.get("spec_sha")) and r.get("spec_sha") == prev.get("spec_sha")
-                r["relation"] = ("resumed" if r.get("resumed") else "relaunched") if same else "related run (inferred)"
+                r["relation"] = (("resumed (inferred)" if r.get("resumed") else "relaunched (inferred)") if same
+                                 else "related run (inferred)")
                 r["scenario"] = (("same signed spec" if r.get("signed_at") and prev.get("signed_at") else "same spec")
                                  if same else diff_phrase(r["diff"]) or "the spec differs outside the compared fields")
                 base = next((x for x in reversed(pj["lineage"][:pj["lineage"].index(r)]) if x.get("packages")), None)
@@ -1768,6 +1884,32 @@ def compare(a: dict, b: dict) -> dict:
                                                                           [b.get("chip"), b.get("ended")]]}
 
 
+def _fingerprint_refusal(run_dir: str, fn: str) -> str | None:
+    """Why compute.code_fingerprint is not run for this summary, or None. The summary is an artifact, so its fn path
+    is untrusted: a relative path must stay inside the run dir with no link, an absolute one inside the repo; and
+    code_fingerprint follows links under models/ and data/, so a link there that leaves the run dir and the repo is
+    refused too (review round 2, P1-4)."""
+    f = fn.partition("::")[0]
+    if os.path.isabs(f):
+        if not _within(f, REPO):
+            return "the batch function's file is outside the run dir and the repo: not checked"
+        if not os.path.isfile(f):
+            return "the batch function's file is not at that path on this machine"
+    else:
+        try:
+            check_rel(f)
+            read_nofollow(os.path.realpath(run_dir), f, 0)
+        except (ValueError, OSError) as e:
+            return f"the batch function's file is not a plain file inside the run dir: not checked ({e})"
+    for sub in ("models", "data"):
+        for dp, dirs, fns in os.walk(os.path.join(run_dir, sub)):
+            for x in dirs + fns:
+                q = os.path.join(dp, x)
+                if os.path.islink(q) and not (_within(q, run_dir) or _within(q, REPO)):
+                    return f"{_rel(run_dir, q)} links outside the run dir and the repo: not checked"
+    return None
+
+
 def batch_reuse(run_dir: str) -> list:
     """For each stored engine batch (an --out with its .summary.json): would scripts/compute.py reuse its rows
     with today's code? The same test _reusable makes: the summary's fn and code_fp against code_fingerprint."""
@@ -1781,10 +1923,9 @@ def batch_reuse(run_dir: str) -> list:
         if err or not isinstance(doc, dict) or not doc.get("fn") or not doc.get("code_fp"):
             out.append({"out": rel, "reused": False, "why": err or "the summary names no fn and code_fp"})
             continue
-        fn_file = doc["fn"].partition("::")[0]
-        if os.path.isabs(fn_file) and not os.path.exists(fn_file):
-            out.append({"out": rel, "fn": doc["fn"], "reused": False,
-                        "why": "the batch function's file is not at that path on this machine"})
+        why = _fingerprint_refusal(run_dir, str(doc["fn"]))
+        if why:
+            out.append({"out": rel, "fn": doc["fn"], "reused": False, "why": why})
             continue
         o = s[:-len(".summary.json")]
         fp = C.code_fingerprint(run_dir, doc["fn"], exclude=(o, o + ".tmp", o + ".summary.json",
@@ -1804,7 +1945,6 @@ BUILD_ON_DIRS = ("data/derive", "data/derived")
 def build_on(run_dir: str, drafts_root: str) -> dict:
     """A draft for a new run that reuses this run's assets. Launches nothing; the page shows the commands. Every
     file is read through confined() and written without following a link; links in the source are skipped."""
-    from toolkit.spec import signoff
     st, err = load_run_state(run_dir)
     if err:
         raise ValueError(err)
@@ -1818,8 +1958,7 @@ def build_on(run_dir: str, drafts_root: str) -> dict:
 
     def put(src_rel, dest_rel):
         try:
-            with open(confined(run_dir, src_rel), "rb") as f:
-                data = f.read()
+            data = read_nofollow(os.path.realpath(run_dir), check_rel(src_rel), _MAX_READ)[0]
         except (ValueError, OSError) as e:
             skipped.append(f"{src_rel}: {e}")
             return None
@@ -1858,7 +1997,9 @@ def build_on(run_dir: str, drafts_root: str) -> dict:
         "spec": {"copied_from": spec_rel if spec_bytes is not None else None,
                  "sha256": hashlib.sha256(spec_bytes).hexdigest() if spec_bytes is not None else None,
                  "signoff_status": spec_status or serr,
-                 "signed_sha256": signoff.signed_sha(run_dir) if spec_status else None},
+                 "signed_sha256": ((_rread(run_dir, SPEC_SIGNOFF)[0] or {}).get("sha256") or {}).get(SPEC)
+                 if spec_status in ("signed", "changed") and isinstance(_rread(run_dir, SPEC_SIGNOFF)[0], dict)
+                 else None},
         "engine": engine_of(run_dir, st), "copied": copied, "skipped": skipped, "batches": batch_reuse(run_dir),
         "commands": {"continue_this_run": f"python3 main.py --v2 --resume {run_dir}",
                      "new_run": f"python3 main.py --v2 {json.dumps(q)}"},
@@ -2013,9 +2154,12 @@ class Console:
         msg = json.dumps([os.path.realpath(run_dir), sub, content], sort_keys=True, default=str).encode()
         return hmac.new(self._secret, msg, hashlib.sha256).hexdigest()
 
+    SNAPSHOT_KEYS = ("spec_sha256", "derivations_sha256", "sheet_sha256")
+
     def _content(self, sub: str, body: dict):
-        return str(body.get("spec_sha256") or "") if sub == "spec" else sorted(str(x) for x in body.get("fingerprints")
-                                                                               or [])
+        """What a decision card binds: the whole approval snapshot (spec), or the fingerprints shown (scope)."""
+        return [str(body.get(k) or "") for k in self.SNAPSHOT_KEYS] if sub == "spec" else sorted(
+            str(x) for x in body.get("fingerprints") or [])
 
     def answer(self, run_dir: str, sub: str, body: dict, now: float | None = None) -> dict:
         """A sign-off or scope answer from the page. Refused when the mirror is stale, when the remote run cannot
@@ -2036,7 +2180,8 @@ class Console:
                                             "run and answer again"}
         if sub == "spec":
             return sign_spec(run_dir, body.get("note", ""), body.get("confirm") is True, mirror, self.cloud_config,
-                             runner=self.runner, expect_sha256=body.get("spec_sha256"), remote=remote)
+                             runner=self.runner, expect_sha256=body.get("spec_sha256"), remote=remote,
+                             snapshot={k: body.get(k) for k in ("derivations_sha256", "sheet_sha256")})
         return answer_scope(run_dir, body.get("answers") or {}, body.get("note", ""), body.get("confirm") is True,
                             mirror, self.cloud_config, self.runner, fingerprints=body.get("fingerprints"),
                             remote=remote)
@@ -2044,8 +2189,7 @@ class Console:
     def _with_tickets(self, run: dict, run_dir: str) -> dict:
         for c in run.get("cards") or []:
             if c.get("kind") == "decision_needed":
-                content = (c.get("spec_sha256") or "") if c.get("sub") == "spec" else sorted(
-                    str(x) for x in c.get("fingerprints") or [])
+                content = self._content(c.get("sub"), c)
                 c["ticket"], c["run_id"] = self.ticket(run_dir, c.get("sub"), content), run_dir
         return run
 
@@ -2084,12 +2228,12 @@ class Console:
         if method == "GET" and path == "/api/run":
             return 200, "json", {**self._with_tickets(read_run(rd, self.cap), rd), "mirror": mirror}
         if method == "GET" and path == "/api/file":
-            p = safe_path(rd, q.get("path") or "")
-            ext = os.path.splitext(p)[1].lower()
+            rel = q.get("path") or ""
+            data = read_file_bytes(rd, rel)
+            ext = os.path.splitext(rel)[1].lower()
             ctype = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".svg": "image/svg+xml"}.get(
                 ext, "text/plain; charset=utf-8")
-            with open(p, "rb") as f:
-                return 200, ctype, f.read(4_000_000)
+            return 200, ctype, data
         if method != "POST":
             return 404, "json", {"error": "not found"}
         if path == "/api/feedback":
@@ -2097,7 +2241,8 @@ class Console:
         if path == "/api/chat":
             return 200, "json", self.chat.send(rd, body.get("text", ""), body.get("anchor"),
                                                body.get("kind", "question"), body.get("layer"),
-                                               body.get("proposed_change"), body.get("stage"), body.get("verdict"))
+                                               body.get("proposed_change"), body.get("stage"), body.get("verdict"),
+                                               body.get("evidence"))
         if path == "/api/sign_spec":
             return 200, "json", self.answer(rd, "spec", body)
         if path == "/api/scope":
@@ -2670,7 +2815,7 @@ def _self_test() -> int:
                f"RC15a one project per question; lineage A, B, C by sign-off; staging copies are drafts "
                f"({[(r['label'], r.get('draft')) for r in runs]})")
             A, B, C = (pj[0]["lineage"] + [{}] * 3)[:3] if pj else ({}, {}, {})
-            ok([A["relation"], B["relation"], C["relation"]] == [None, "resumed", "related run (inferred)"]
+            ok([A["relation"], B["relation"], C["relation"]] == [None, "resumed (inferred)", "related run (inferred)"]
                and B["scenario"] == "same signed spec",
                f"RC15b relations: resumed (FINAL -> ANALYZE, same spec sha), related run (inferred) (another spec sha) "
                f"({[A['relation'], B['relation'], C['relation']]})")

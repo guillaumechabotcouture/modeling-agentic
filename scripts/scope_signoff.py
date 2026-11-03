@@ -569,8 +569,11 @@ def sign(run_dir: str, by: str, answers: Optional[dict] = None, all_decision: Op
         raise ValueError("no accept/decline answer for " + ", ".join(missing))
     doc = {"answers": {**prior, **new}, "last_signed_by": by, "last_signed_at": now,
            "producer": "scripts/scope_signoff.py"}
-    with open(os.path.join(run_dir, SIGNOFF), "w", encoding="utf-8") as f:
-        json.dump(doc, f, indent=1)
+    from lib.safe_io import LinkRefused, write_nofollow
+    try:          # never through a link; published atomically (run console review round 2, P1-2)
+        write_nofollow(run_dir, SIGNOFF, json.dumps(doc, indent=1).encode(), atomic=True)
+    except (LinkRefused, OSError) as e:
+        raise ValueError(f"{SIGNOFF} not written: {e}") from None
     return {"signed_by": by, "signed_at": now, "answers": new}
 
 

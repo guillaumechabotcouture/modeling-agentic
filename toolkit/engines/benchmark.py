@@ -122,9 +122,10 @@ JOINT_RULES = {
 
 
 def load_engine(ref: str, config: dict | None = None):
-    """The engine class `module:Class`, built with the pack configuration's keywords (none: no arguments)."""
-    mod, cls = ref.split(":")
-    return getattr(importlib.import_module(mod), cls)(**(config or {}))
+    """The engine class `module:Class`, built with the pack configuration's keywords (none: no arguments). The
+    reference is checked against the allowed engines first (toolkit/spec/schema.py check_engine_ref)."""
+    from toolkit.spec import schema
+    return schema.engine_class(ref)(**(config or {}))
 
 
 def _engine_key(ref: str, config: dict | None) -> tuple:

@@ -28,6 +28,7 @@ for p in (ROOT, os.path.join(ROOT, "scripts")):
     if p not in sys.path:
         sys.path.insert(0, p)
 import decision_brief as DB  # noqa: E402
+from lib.safe_io import LinkRefused, read_nofollow, write_nofollow  # noqa: E402
 from toolkit.spec import schema  # noqa: E402
 
 SPEC = DB.DECISION_SPEC
@@ -75,18 +76,32 @@ def derived_changed(run_dir: str, rec: dict) -> list[str]:
         derivs = (json.load(open(os.path.join(run_dir, DERIVATIONS_RECORD))) or {}).get("derivations") or {}
     except (OSError, ValueError):
         return [DERIVATIONS_RECORD]
-    return sorted(o for e in derivs.values() for o, h in ((e or {}).get("outputs") or {}).items()
-                  if DB._sha(os.path.join(run_dir, o)) != h)
+    out = []
+    for e in derivs.values():
+        for o, h in ((e or {}).get("outputs") or {}).items():
+            # The record is written by a derivation script an agent wrote: an output outside the run dir is a change
+            # (it cannot have been derived here) and is never hashed (review round 2, P1-4).
+            if not _inside(run_dir, str(o)) or DB._sha(os.path.join(run_dir, o)) != h:
+                out.append(o)
+    return sorted(out)
 
 
-def _freeze_record(run_dir: str, path: str) -> dict:
-    """Add the derivation record's hash to a sign-off file (the brief's or the spec's own)."""
-    with open(path, encoding="utf-8") as f:
-        rec = json.load(f)
-    rec.setdefault("sha256", {})[DERIVATIONS_RECORD] = DB._sha(os.path.join(run_dir, DERIVATIONS_RECORD))
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(rec, f, indent=1)
-    return rec
+def _inside(run_dir: str, rel: str) -> bool:
+    parts = rel.replace("\\", "/").split("/")
+    if not rel or os.path.isabs(rel) or ".." in parts:
+        return False
+    root = os.path.realpath(run_dir)
+    return os.path.realpath(os.path.join(root, rel)).startswith(root + os.sep)
+
+
+def _sha_nofollow(run_dir: str, rel: str) -> str | None:
+    """sha256 of run_dir/rel read through a no-follow fd; None when absent; ValueError for a link."""
+    try:
+        return hashlib.sha256(read_nofollow(run_dir, rel)[0]).hexdigest()
+    except FileNotFoundError:
+        return None
+    except LinkRefused as e:
+        raise ValueError(f"{rel}: {e}") from None
 
 
 def signed_sha(run_dir: str) -> str | None:
@@ -95,39 +110,44 @@ def signed_sha(run_dir: str) -> str | None:
 
 
 def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, accept_proposed: bool = False,
-         expect_sha256: str | None = None) -> dict:
-    """`expect_sha256`: the hash of the spec the owner was shown (the run console passes it). Another spec is
-    refused; without a brief, the record and the signed copy are made from the same bytes that were checked."""
-    path = os.path.join(run_dir, SPEC)
-    if not os.path.exists(path):
-        raise ValueError(f"{SPEC} does not exist")
-    with open(path, "rb") as f:
-        data = f.read()
+         expect_sha256: str | None = None, expect_derivations_sha256: str | None = None,
+         expect_sheet_sha256: str | None = None) -> dict:
+    """Sign the spec. The expect_* hashes are what the owner was shown (the run console's approval snapshot): the
+    spec, the derivation record ("none": there was none) and the sign-off sheet; a mismatch is refused. The spec is
+    read once: validated, hashed and copied from those bytes; nothing is read or written through a link; the record
+    is published atomically."""
+    try:
+        data = read_nofollow(run_dir, SPEC)[0]
+    except FileNotFoundError:
+        raise ValueError(f"{SPEC} does not exist") from None
+    except LinkRefused as e:
+        raise ValueError(f"{SPEC}: {e}") from None
     sha = hashlib.sha256(data).hexdigest()
     if expect_sha256 is not None and sha != expect_sha256:
         raise ValueError(f"{SPEC} changed since it was shown (sha256 {sha[:12]}, shown {str(expect_sha256)[:12]}): "
                          "read it again before signing")
-    errs = schema.validate(schema.load(path), pending_ok=True)
+    dsha = _sha_nofollow(run_dir, DERIVATIONS_RECORD)
+    if expect_derivations_sha256 is not None and (dsha or "none") != expect_derivations_sha256:
+        raise ValueError(f"{DERIVATIONS_RECORD} changed since the sheet was shown: read it again before signing")
+    if expect_sheet_sha256 is not None and (_sha_nofollow(run_dir, SHEET) or "none") != expect_sheet_sha256:
+        raise ValueError(f"{SHEET} changed since it was shown: read it again before signing")
+    errs = schema.validate(schema.load(os.path.join(run_dir, SPEC), data=data), pending_ok=True)
     if errs:
         raise ValueError("spec not ready: " + "; ".join(errs[:10]))
     if _spec_record(run_dir) is not None:
         raise ValueError("the spec is already signed; a change needs a new sign-off by the owner")
-    if os.path.exists(os.path.join(run_dir, DB.BRIEF)):
-        DB.sign(run_dir, by, answers=answers, note=note, accept_proposed=accept_proposed)
-        rec = _freeze_record(run_dir, os.path.join(run_dir, DB.SIGNOFF))
-        if expect_sha256 is not None and (rec.get("sha256") or {}).get(SPEC) != expect_sha256:
-            os.remove(os.path.join(run_dir, DB.SIGNOFF))   # the spec changed while the brief was being signed
-            raise ValueError(f"{SPEC} changed while it was being signed; read it again")
-        return rec
+    if os.path.lexists(os.path.join(run_dir, DB.BRIEF)):
+        return DB.sign(run_dir, by, answers=answers, note=note, accept_proposed=accept_proposed,
+                       expect={SPEC: sha}, extra_sha={DERIVATIONS_RECORD: dsha})
     record = {"signed_by": by, "signed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "note": note,
-              "sha256": {SPEC: sha, DERIVATIONS_RECORD: DB._sha(os.path.join(run_dir, DERIVATIONS_RECORD))},
+              "sha256": {SPEC: sha, DERIVATIONS_RECORD: dsha},
               "producer": "toolkit/spec/signoff.py",
               "schema_version": schema.SCHEMA_VERSION}
-    os.makedirs(os.path.join(run_dir, DB.SIGNED_DIR), exist_ok=True)
-    with open(os.path.join(run_dir, DB.SIGNED_DIR, SPEC), "wb") as f:
-        f.write(data)                      # the bytes that were hashed, not a second read of the file
-    with open(os.path.join(run_dir, SPEC_SIGNOFF), "w", encoding="utf-8") as f:
-        json.dump(record, f, indent=1)
+    try:
+        write_nofollow(run_dir, f"{DB.SIGNED_DIR}/{SPEC}", data, atomic=True)   # the bytes that were hashed
+        write_nofollow(run_dir, SPEC_SIGNOFF, json.dumps(record, indent=1).encode(), atomic=True)
+    except (LinkRefused, OSError) as e:
+        raise ValueError(f"sign-off not written: {e}") from None
     return record
 
 
@@ -297,6 +317,7 @@ def _self_test() -> int:
            f"SG14 a derivation output outside the run dir is reported changed and never hashed ({bad})")
     with tempfile.TemporaryDirectory() as d:
         p = schema.toy_spec(d)
+        shown = DB._sha(p)
         opens, real_open, real_osopen = [], builtins.open, os.open
 
         def bopen(f, *a, **k):
@@ -310,7 +331,7 @@ def _self_test() -> int:
             return real_osopen(f, *a, **k)
         builtins.open, os.open = bopen, oopen
         try:
-            sign(d, "owner", note="n", expect_sha256=DB._sha(p))
+            sign(d, "owner", note="n", expect_sha256=shown)
         except Exception as e:  # noqa: BLE001
             opens.append(f"error {e}")
         finally:

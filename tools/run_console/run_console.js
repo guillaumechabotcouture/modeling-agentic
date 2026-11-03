@@ -361,10 +361,10 @@ function gateCard(c, head, open, comment) {
 }
 function blockerTable(g) {
   const rows = g.rows.map((c, i) => {
-    const tog = "bt" + (++TOG_N), A = () => ref({ anchor: c.anchor || {} });
+    const tog = "bt" + (++TOG_N);
     return `<tr class="row" data-tog="${esc(tog)}"><td>${esc(c.blocker_id)}</td><td>${T(c.severity)}</td><td>${esc(c.reviewer || "")}</td><td>${esc(stage(c.target_stage))}</td><td class="clip">${bench(String(c.claim || "").split("\n")[0])}</td><td>${c.resolved ? '<span class="ok-i">✓ resolved</span>' : "open"}</td></tr>
       <tr class="more" id="${esc(tog)}" hidden><td colspan="6"><div>${bench(c.claim || "")}</div>${c.evidence ? `<div class="sub">Evidence: ${bench(c.evidence)}</div>` : ""}${c.fix_requires ? `<div class="sub">Fix requires: ${bench(c.fix_requires)}</div>` : ""}
-      <div class="acts"><button data-act="agree" data-ref="${ref({ anchor: c.anchor || {} })}">Agree</button><button data-act="disagree" data-ref="${ref({ anchor: c.anchor || {} })}">Disagree</button><button data-act="comment" data-ref="${ref({ anchor: c.anchor || {} })}">Comment</button><button data-act="open" data-file="${esc(c.anchor.file)}" data-anchor-id="${esc(c.blocker_id)}">Open</button></div></td></tr>`;
+      <div class="acts"><button data-act="agree" data-ref="${ref({ anchor: c.anchor || {}, evidence: c.evidence })}">Agree</button><button data-act="disagree" data-ref="${ref({ anchor: c.anchor || {}, evidence: c.evidence })}">Disagree</button><button data-act="comment" data-ref="${ref({ anchor: c.anchor || {}, evidence: c.evidence })}">Comment</button><button data-act="open" data-file="${esc(c.anchor.file)}" data-anchor-id="${esc(c.blocker_id)}">Open</button></div></td></tr>`;
   }).join("");
   const high = g.rows.filter((c) => c.severity === "HIGH" && !c.resolved).length;
   return `<div class="card"><div class="head"><span class="t">Critique${g.round != null ? " round " + esc(g.round) : ""}: ${g.rows.length} ${T("blocker", "blockers")}, ${high} open ${T("HIGH")}</span>${when(g.at)}</div>
@@ -391,7 +391,7 @@ function dtTable(g) {
     <table class="t"><tr><th>id</th><th style="width:44%">what it tests</th><th class="n">value tested</th><th>plan changes?</th><th class="n">units changed</th><th class="n"><span class="term" tabindex="0" title="The objective of the plan re-solved at the tested value, relative to the point plan's objective evaluated at the same value: how much re-optimising gains (models/decision_tests/*.yaml: objective vs point_plan_objective_under_test).">re-solved vs point plan</span></th></tr>${rows}</table></div>`;
 }
 function card(c) {
-  const comment = c.anchor ? `<button data-act="comment" data-ref="${ref({ anchor: c.anchor })}">Comment</button>` : "";
+  const comment = c.anchor ? `<button data-act="comment" data-ref="${ref({ anchor: c.anchor, evidence: c.evidence })}">Comment</button>` : "";
   const open = c.anchor && c.anchor.file ? `<button data-act="open" data-file="${esc(c.anchor.file)}" data-anchor-id="${esc(c.anchor.id || "")}">Open</button>` : "";
   const head = (t, extra) => `<div class="head"><span class="t">${t}</span>${extra || ""}${when(c.at)}</div>`;
   const line = (cls, txt) => `<div class="line ${esc(cls || "")}"><span class="x">${txt}</span>${when(c.at)}</div>`;
@@ -425,7 +425,7 @@ function remoteBlock() {   // a remote answer needs a fresh mirror: why not, or 
 function decisionCard(c, head) {
   // The controls act on the run and the content this card was rendered for (ref), never on whatever run is
   // selected when the button is pressed; the server checks the ticket and the sign command the content.
-  const k = ref({ run: c.run_id, ticket: c.ticket, sub: c.sub, sha: c.spec_sha256, fps: c.fingerprints || [] });
+  const k = ref({ run: c.run_id, ticket: c.ticket, sub: c.sub, sha: c.spec_sha256, dsha: c.derivations_sha256, ssha: c.sheet_sha256, fps: c.fingerprints || [] });
   const block = remoteBlock(), dis = block ? " disabled" : "";
   const blockNote = block ? `<div class="small" style="color:var(--bad)">${esc(block)}</div>` : "";
   if (c.sub === "spec") return `<div class="card need">${head(esc(c.title))}${ctx("The run waits for the owner to sign its decision spec.", "yes, answer below.")}<div class="body">${md(c.body)}</div>
@@ -473,14 +473,15 @@ function wire(root) {
   root.querySelectorAll("[data-act]").forEach((b) => (b.onclick = () => act(b)));
 }
 async function act(b) {
-  const anchor = b.dataset.ref ? getRef(b.dataset.ref).anchor || null : null;
+  // The anchor and the evidence snapshot the card was rendered with (sealed by the server) travel together.
+  const anchor = b.dataset.ref ? getRef(b.dataset.ref).anchor || null : null, shown = b.dataset.ref ? getRef(b.dataset.ref).evidence || null : null;
   switch (b.dataset.act) {
     case "open": return openFile(b.dataset.file, b.dataset.anchorId || "");
-    case "comment": return setAnchor(anchor, null);
+    case "comment": return setAnchor(anchor, null, shown);
     case "agree":
-      try { await api("/api/feedback", { run: S.runId, kind: "approval", layer: "critique", verdict: "agree", anchor, text: `Agree with ${anchor.id}`, stage: "CRITIQUE" }); toast(`Recorded: agree with ${anchor.id}`); refresh(); } catch (e) { toast(e.message); }
+      try { await api("/api/feedback", { run: S.runId, kind: "approval", layer: "critique", verdict: "agree", anchor, evidence: shown, text: `Agree with ${anchor.id}`, stage: "CRITIQUE" }); toast(`Recorded: agree with ${anchor.id}`); refresh(); } catch (e) { toast(e.message); }
       return;
-    case "disagree": setAnchor(anchor, "disagree"); $("kind").value = "correction"; $("layer").value = "critique"; syncComposer(); $("text").placeholder = `Why do you disagree with ${anchor.id}?`; return;
+    case "disagree": setAnchor(anchor, "disagree", shown); $("kind").value = "correction"; $("layer").value = "critique"; syncComposer(); $("text").placeholder = `Why do you disagree with ${anchor.id}?`; return;
     case "sign-spec": case "scope": {
       const box = b.closest(".answer"), note = box.querySelector(".note").value, confirmed = box.querySelector(".confirm").checked;
       const res = box.querySelector(".result"), R = getRef(box.dataset.ref);
@@ -488,7 +489,7 @@ async function act(b) {
       if (remoteBlock()) { res.textContent = remoteBlock(); return; }
       const body = { run: R.run, ticket: R.ticket, note, confirm: confirmed };
       if (b.dataset.act === "scope") { body.fingerprints = R.fps; body.answers = {}; b.closest(".card").querySelectorAll("input[type=radio]:checked").forEach((r) => (body.answers[r.dataset.f] = r.value)); }
-      else body.spec_sha256 = R.sha;
+      else { body.spec_sha256 = R.sha; body.derivations_sha256 = R.dsha; body.sheet_sha256 = R.ssha; }
       if (!confirmed) { res.textContent = "Tick the confirmation first."; return; }
       if (!window.confirm(b.dataset.act === "scope" ? "Submit these answers through scripts/scope_signoff.py sign?" : "Sign the decision spec through agents/stage_machine.py sign?")) return;
       try { const r = await api(b.dataset.act === "scope" ? "/api/scope" : "/api/sign_spec", body);
@@ -500,7 +501,7 @@ async function act(b) {
 }
 
 // ---- composer
-function setAnchor(a, verdict) { S.anchor = a; S.verdict = verdict; renderAnchor(); $("text").focus(); }
+function setAnchor(a, verdict, shown) { S.anchor = a; S.verdict = verdict; S.shown = shown || null; renderAnchor(); $("text").focus(); }
 function renderAnchor() {
   $("anchor").innerHTML = S.anchor ? `<span class="chip">on ${esc(S.anchor.kind)} ${esc(S.anchor.id || "")}${S.verdict ? " · " + S.verdict : ""} <button class="link" id="unanchor">×</button></span>` : "";
   if ($("unanchor")) $("unanchor").onclick = () => setAnchor(null, null);
@@ -510,7 +511,7 @@ $("kind").onchange = syncComposer;
 function curStage() { return S.filter || (S.run && S.run.state && S.run.state.state) || ""; }
 $("record").onclick = async () => {
   const text = $("text").value.trim(); if (!text || !S.runId) return;
-  try { await api("/api/feedback", { run: S.runId, kind: $("kind").value, layer: $("layer").value, text, anchor: S.anchor, verdict: S.verdict, proposed_change: $("proposed").value, stage: curStage() });
+  try { await api("/api/feedback", { run: S.runId, kind: $("kind").value, layer: $("layer").value, text, anchor: S.anchor, evidence: S.shown, verdict: S.verdict, proposed_change: $("proposed").value, stage: curStage() });
     $("text").value = ""; $("proposed").value = ""; setAnchor(null, null); toast("Feedback recorded"); refresh(); } catch (e) { toast(e.message); }
 };
 $("send").onclick = async () => {
@@ -518,7 +519,7 @@ $("send").onclick = async () => {
   const kind = $("kind").value, btn = $("send");
   btn.disabled = true; btn.textContent = "Thinking…";
   try {
-    const body = { run: S.runId, text, anchor: S.anchor, kind, layer: $("layer").value, proposed_change: $("proposed").value, stage: curStage(), verdict: S.verdict };
+    const body = { run: S.runId, text, anchor: S.anchor, evidence: S.shown, kind, layer: $("layer").value, proposed_change: $("proposed").value, stage: curStage(), verdict: S.verdict };
     const r = await api("/api/chat", body);
     if (!r.ok) toast(r.error + (r.feedback ? " (the feedback was recorded)" : ""));
     else { $("text").value = ""; $("proposed").value = ""; setAnchor(null, null); S.meta.chat.spent = r.spent; }

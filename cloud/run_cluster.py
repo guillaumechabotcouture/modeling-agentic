@@ -6,7 +6,8 @@
     python cloud/run_cluster.py <config.py> brief|report      # decision brief / convergence measures of a live run
     python cloud/run_cluster.py <config.py> health [--loop] [--interval S] [--log PATH] [--thresholds YAML]
                                                               # anomalies of a live run (cloud/run_health.py)
-    python cloud/run_cluster.py <config.py> sign <answers.yaml> [--label L] [--run RUN] [--expect-spec-sha256 SHA] [note]
+    python cloud/run_cluster.py <config.py> sign <answers.yaml> [--label L] [--run RUN] [--action spec|scope]
+                         [--expect-spec-sha256 SHA] [--expect-derivations-sha256 SHA|none] [--expect-sheet-sha256 SHA] [note]
                                                               # pending scope declarations, a v2 spec, or the brief
     python cloud/run_cluster.py <config.py> relaunch <label>
     python cloud/run_cluster.py <config.py> shutdown          # cluster, overflow pool and keeper, by hand
@@ -839,14 +840,18 @@ def parse_sign_args(rest: list, labels) -> dict:
     first label is used, as before."""
     if not rest:
         raise SystemExit("sign needs <answers.yaml>")
-    out, i = {"answers": rest[0], "label": None, "run": None, "expect": None}, 1
-    flags = {"--label": "label", "--run": "run", "--expect-spec-sha256": "expect"}
+    out, i = {"answers": rest[0], "label": None, "run": None, "expect": None, "action": None,
+              "expect_derivations": None, "expect_sheet": None}, 1
+    flags = {"--label": "label", "--run": "run", "--expect-spec-sha256": "expect", "--action": "action",
+             "--expect-derivations-sha256": "expect_derivations", "--expect-sheet-sha256": "expect_sheet"}
     while i < len(rest) and rest[i] in flags:
         if i + 1 >= len(rest):
             raise SystemExit(f"sign: {rest[i]} needs a value")
         out[flags[rest[i]]] = rest[i + 1]
         i += 2
     out["note"] = " ".join(rest[i:])
+    if out["action"] not in (None, "spec", "scope"):
+        raise SystemExit(f"sign: --action is spec or scope, not {out['action']}")
     if out["label"] is not None and out["label"] not in labels:
         raise SystemExit(f"sign: label {out['label']} is not one this config runs ({', '.join(labels)})")
     return out
@@ -1560,7 +1565,8 @@ def _self_test_sign(ok) -> None:
     try:
         a = parse_sign_args(["ans.yaml", "--label", "F2", "--run", "2026_b", "--expect-spec-sha256", "ab12",
                              "looks", "right"], ["F1", "F2"])
-        ok(a == {"answers": "ans.yaml", "note": "looks right", "label": "F2", "run": "2026_b", "expect": "ab12"},
+        ok({k: a.get(k) for k in ("answers", "note", "label", "run", "expect")}
+           == {"answers": "ans.yaml", "note": "looks right", "label": "F2", "run": "2026_b", "expect": "ab12"},
            f"RS1 sign parses --label, --run and --expect-spec-sha256 before the note ({a})")
         try:
             parse_sign_args(["ans.yaml", "--label", "F9", "n"], ["F1", "F2"])
@@ -1840,7 +1846,8 @@ def main(argv) -> int:
             cloudpickle.register_pickle_by_value(ws)
         except ImportError:
             pass
-        r = _side(cfg, ws.sign_side, open(a["answers"]).read(), a["note"], a["run"], a["expect"], label=a["label"])
+        r = _side(cfg, ws.sign_side, open(a["answers"]).read(), a["note"], a["run"], a["expect"], None, a["action"],
+                  a["expect_derivations"], a["expect_sheet"], label=a["label"])
         print(r["out"])
         return r["rc"]
     else:

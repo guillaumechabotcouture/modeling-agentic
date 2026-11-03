@@ -2350,6 +2350,7 @@ def _self_test_derived(ok, td: str) -> None:
     with open(os.path.join(mods, "attribute_binding.yaml"), "w") as f:
         yaml.safe_dump({"attribute_binding": {"x": "required", "group": "required"}}, f)
     sys.path.insert(0, mods)
+    S.TEST_ENGINE_REFS.add("di8_engines:NeedsGroup")       # a test engine outside toolkit/engines (allowlist)
     fake = os.path.join(td, "di8repo")
     os.makedirs(os.path.join(fake, "toyraw"))
     tmp = os.path.join(td, "di8src")
@@ -2425,6 +2426,10 @@ def main(argv=None) -> int:
     s2.add_argument("--note", default="")
     s2.add_argument("--expect-sha256", default=None,
                     help="the sha256 of the decision_spec.yaml the owner read; a different spec is not signed")
+    s2.add_argument("--expect-derivations-sha256", default=None,
+                    help="the sha256 of data/derivations_record.json when the sheet was shown ('none': there was none)")
+    s2.add_argument("--expect-sheet-sha256", default=None,
+                    help="the sha256 of the sign-off sheet the owner read ('none': there was none)")
     a = ap.parse_args(argv)
     if a.cmd == "status":
         st = load_state(a.run_dir)
@@ -2436,7 +2441,12 @@ def main(argv=None) -> int:
             print(h)
         return 0
     b = AB.backend()
-    kw = {"expect_sha256": a.expect_sha256} if a.expect_sha256 else {}
+    kw = {k: v for k, v in (("expect_sha256", a.expect_sha256),
+                            ("expect_derivations_sha256", a.expect_derivations_sha256),
+                            ("expect_sheet_sha256", a.expect_sheet_sha256)) if v}
+    if not getattr(b, "sign", None) and set(kw) - {"expect_sha256"}:
+        print("Not signed: this backend's sign-off records no derivation record or sheet hash", file=sys.stderr)
+        return 1
     try:
         rec = b.sign(a.run_dir, a.by, a.note, **kw) if getattr(b, "sign", None) else sign(a.run_dir, a.by, a.note, **kw)
     except ValueError as e:

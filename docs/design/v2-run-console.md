@@ -332,3 +332,40 @@ Open items (not built here): a harness read model for events and lineage (parent
 harness instead of inferred; one event log instead of rebuilding the story from files), atomic mirror
 generations (sync into a new directory and swap, so a read never sees a half-synced run), per-round critique
 archives, and pricing a fallback's per-model usage split instead of keeping the reservation.
+
+## 12. Review round 2 (Codex, on #129)
+
+Each finding reproduced first (RW1-RW11, SP-RW1-4, SG13-18, SO23, RS6-8, T71).
+
+- **Engine references are an allowlist (harness).** `toolkit/spec/schema.py check_engine_ref` refuses, before any
+  import, an engine reference whose module is not a file under `toolkit/engines/` (plus the repo's
+  `toolkit.spec.priors:ToyPriorEngine` test engine; self-tests may add in-process `TEST_ENGINE_REFS`);
+  `engine_class` checks the Engine contract before instantiation. `load_engine`, the signed candidates, the
+  engine choice, `analysis_backend._card` and `toolkit/engines/benchmark.load_engine` all go through it. A spec
+  naming `subprocess:Popen` or `os:system` is reported invalid and runs nothing. Other dotted-path imports in the
+  repo are fixed module names or benchmark packs shipped under `toolkit/engines/` (repo files, not artifacts);
+  `scripts/compute.py` runs the run's own model code by design.
+- **The sign commands write no-follow and atomically.** `scripts/lib/safe_io.py` gains `read_nofollow` and
+  `write_nofollow` (each component opened with `O_NOFOLLOW` relative to its parent's fd; atomic publish through a
+  temporary file and a rename relative to the directory fd; a hard-linked file is refused before truncation).
+  `toolkit/spec/signoff.sign`, `decision_brief.sign` and `scope_signoff.sign` use them; the spec (and each frozen
+  brief file) is read once and validated, hashed and copied from those bytes.
+- **Reads have no check-then-open window.** The console reads every artifact through `read_nofollow`; a cached
+  parse is reused only for the same inode, mtime, size and ctime as that read. A link anywhere under the run dir
+  is not followed (a linked artifact shows as an error).
+- **The console has its own read model** for the spec sign-off and the scope request (`spec_view`, `inbox`); it
+  no longer calls `signoff.status`, `schema.load` or the scope loaders, which can follow paths the artifacts name.
+  `signoff.derived_changed` reports a derivation output outside the run dir as changed and never hashes it. A batch
+  summary's `fn` outside the run dir (or the repo), or a link under `models/` or `data/` leaving both, is not
+  passed to `compute.code_fingerprint`.
+- **One approval snapshot.** The spec card shows the sheet read once, with the sheet's sha256, the spec's and the
+  derivation record's ("none" when absent). The ticket binds all three and `stage_machine.py sign`
+  (`--expect-sha256`, `--expect-derivations-sha256`, `--expect-sheet-sha256`) checks each. Remote: `run_cluster.py
+  sign --action spec|scope` with the same hashes; an expected spec sha always selects sha-bound spec signing, and a
+  spec action without one fails closed.
+- **Chat:** an interrupted stream keeps its whole reservation (partial usage is a lower bound). The citation index
+  holds only the lines the prompt kept.
+- **Evidence** is captured when a card is rendered (the blocker's or figure's file sha, round, excerpt), sealed with
+  a per-process HMAC; feedback and chat store that snapshot when its seal checks, else one captured at submit time
+  (marked `captured: submit`).
+- **Lineage:** every relation is marked "(inferred)" until the harness records parent run ids.

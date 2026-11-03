@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import stat
 import sys
 import traceback
 from typing import Any, Callable, Iterable, Optional
@@ -224,6 +225,122 @@ def read_jsonl(path):
     return out
 
 
+# Run console review round 2 (P1-2, P1-3): reads and writes inside a directory that never follow a link. Each path
+# component is opened relative to its parent's fd with O_NOFOLLOW, so there is no check-then-open window: a
+# component swapped for a link between a check and the open is refused by the open itself.
+
+class LinkRefused(ValueError):
+    """A path inside the base directory that is a link, leaves the base, or is not a plain file."""
+
+
+def _parts(rel: str) -> list:
+    rel = str(rel or "")
+    parts = rel.replace("\\", "/").split("/")
+    if not rel or os.path.isabs(rel) or "\0" in rel or any(p in ("", ".", "..") for p in parts):
+        raise LinkRefused(f"{rel[:120]!r}: not a plain relative path inside the directory")
+    return parts
+
+
+def dir_fd_nofollow(base: str, parts, create: bool = False) -> int:
+    """An fd on base/parts..., every component opened with O_NOFOLLOW relative to its parent (created when
+    `create`). The caller closes it."""
+    fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts:
+            if create:
+                try:
+                    os.mkdir(part, 0o755, dir_fd=fd)
+                except FileExistsError:
+                    pass
+            try:
+                nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except FileNotFoundError:
+                raise
+            except OSError as e:
+                raise LinkRefused(f"{part}: not a plain directory (links are not followed): {e.strerror}") from None
+            os.close(fd)
+            fd = nfd
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def read_nofollow(base: str, rel: str, max_bytes: int | None = None) -> tuple[bytes, os.stat_result]:
+    """(bytes, fstat of the open file) of base/rel, read through one fd opened with no link followed."""
+    parts = _parts(rel)
+    dfd = dir_fd_nofollow(base, parts[:-1])
+    try:
+        try:
+            fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0), dir_fd=dfd)
+        except FileNotFoundError:
+            raise
+        except OSError as e:
+            raise LinkRefused(f"{rel}: cannot be opened without following a link ({e.strerror})") from None
+    finally:
+        os.close(dfd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise LinkRefused(f"{rel}: not a plain file")
+        chunks, left = [], max_bytes if max_bytes is not None else -1
+        while left != 0:
+            b = os.read(fd, 1 << 20 if left < 0 else min(left, 1 << 20))
+            if not b:
+                break
+            chunks.append(b)
+            if left > 0:
+                left -= len(b)
+        return b"".join(chunks), st
+    finally:
+        os.close(fd)
+
+
+def write_nofollow(base: str, rel: str, data: bytes, append: bool = False, exclusive: bool = False,
+                   atomic: bool = False) -> str:
+    """Write base/rel with no link followed at any component. `atomic`: a temporary file in the same directory,
+    fsynced, then renamed over the name (a link at the name is replaced, never followed; a reader sees the old or
+    the new file). Otherwise O_NOFOLLOW (and O_EXCL when `exclusive`), and a file with other hard links is refused
+    before it is truncated or appended to. Directories are created as needed. Returns base/rel."""
+    import secrets as _secrets
+    base = os.path.realpath(base)
+    parts = _parts(rel)
+    dfd = dir_fd_nofollow(base, parts[:-1], create=True)
+    try:
+        if atomic:
+            tmp = f".{parts[-1]}.{_secrets.token_hex(6)}.tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dfd)
+            try:
+                view = memoryview(data)
+                while view:
+                    view = view[os.write(fd, view):]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(tmp, parts[-1], src_dir_fd=dfd, dst_dir_fd=dfd)
+            return os.path.join(base, rel)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | (os.O_APPEND if append else 0) | (os.O_EXCL if exclusive
+                                                                                            else 0)
+        try:
+            fd = os.open(parts[-1], flags, 0o644, dir_fd=dfd)
+        except OSError as e:
+            raise LinkRefused(f"{rel}: cannot be written without following a link ({e.strerror})") from None
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
+                raise LinkRefused(f"{rel}: not a plain file with one link; not written")
+            if not append:
+                os.ftruncate(fd, 0)
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dfd)
+    return os.path.join(base, rel)
+
+
 # --------------------------------------------------------------------------- #
 # Self-test
 # --------------------------------------------------------------------------- #
@@ -345,6 +462,31 @@ def _self_test() -> int:
         j = write(d, "a.jsonl", '{"a": 1}\nnot json\n[2]\n')
         ok(read_jsonl(j) == [{"a": 1}, [2]], "S12c bad line skipped")
         ok(read_jsonl(os.path.join(d, "missing")) == [], "S12d missing → []")
+
+    # SI-NF (run console review round 2): no-follow reads and writes
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+        open(os.path.join(out, "v"), "w").write("outside")
+        os.symlink(os.path.join(out, "v"), os.path.join(d, "link"))
+        os.symlink(out, os.path.join(d, "ldir"))
+        res = []
+        for fn in (lambda: read_nofollow(d, "link"), lambda: read_nofollow(d, "ldir/v"),
+                   lambda: write_nofollow(d, "link", b"x"), lambda: write_nofollow(d, "ldir/new", b"x"),
+                   lambda: read_nofollow(d, "../x")):
+            try:
+                fn()
+                res.append(False)
+            except LinkRefused:
+                res.append(True)
+        os.link(os.path.join(out, "v"), os.path.join(d, "hard"))
+        try:
+            write_nofollow(d, "hard", b"x")
+            res.append(False)
+        except LinkRefused:
+            res.append(True)
+        write_nofollow(d, "link", b"new", atomic=True)
+        ok(all(res) and open(os.path.join(out, "v")).read() == "outside" and not os.path.islink(os.path.join(d, "link"))
+           and read_nofollow(d, "link")[0] == b"new",
+           f"SI-NF links and hard links are refused; an atomic write replaces a link, never follows it ({res})")
 
     if failures:
         print("FAIL:", file=sys.stderr)
