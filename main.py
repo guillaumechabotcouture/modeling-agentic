@@ -693,6 +693,95 @@ async def run(question: str, max_rounds: int, max_sessions: int,
 # Self-test (no API calls)
 # ---------------------------------------------------------------------------
 
+# Owner signing (the next PR after #131): owner approvals signed with a key in the owner's keychain and verified by
+# the harness. Until then the tool-hook denial is defence in depth, not authentication; the bypasses it cannot close
+# are recorded as expected failures (XFAIL) below.
+OWNER_SIGNING_PR = "owner-signed approvals (next PR after #131)"
+
+
+def _self_test_owner_cli(ok, td: str, trace, reg) -> None:
+    """SO12-SO13 (Codex round 3 on #131). SO12: owner CLIs take no default signer and no abbreviated flag, and the
+    hook parses a brief sign-off with the CLI's own parser (lead mode: only an explicit `--by lead`). SO13a: no Bash
+    call is credited with rewriting the geometry records, so a change during an agent's call is a violation. SO13b
+    (XFAIL until owner signing): indirect forms the command filter cannot see."""
+    import tempfile
+    import yaml as _y
+    import agents as agents_pkg
+    import decision_brief as _db
+    from toolkit.spec import geometry as _geo
+    from toolkit.spec import schema as _schema
+    py = sys.executable
+
+    def hook_denies(mode, cmd, who=None):
+        hk = agents_pkg.create_hooks(td, trace, datetime.now(), registered_agents=reg, signoff=mode)
+        r = asyncio.run(hk["PreToolUse"][0].hooks[0](dict({"tool_name": "Bash", "tool_input": {"command": cmd}},
+                                                          **(who or {})), "so12", None))
+        return (r.get("hookSpecificOutput") or {}).get("permissionDecision") == "deny"
+    bad = [f"python3 scripts/decision_brief.py sign {td} --accept-proposed",
+           f"python3 scripts/decision_brief.py sign {td} --b owner --accept-proposed",
+           f"python3 scripts/decision_brief.py sign {td} --by=owner --accept-proposed",
+           f"python3 scripts/decision_brief.py sign {td} --b lead --accept-proposed",
+           f"python3 scripts/decision_brief.py --accept-proposed sign {td}"]
+    let = [(c, w.get("agent_type", "lead")) for c in bad for w in ({}, {"agent_id": "m12", "agent_type": "modeler"})
+           if not hook_denies("lead", c, w)]
+    ok(not let, f"SO12a a brief sign-off without an explicit --by lead (no --by, an abbreviation, --by=owner) is denied "
+                f"in lead mode, for the lead and a specialist, parsed with the CLI's own parser (allowed: {let[:3]})")
+    lead_cmd = f"python3 scripts/decision_brief.py sign {td} --by lead --accept-proposed --note ok"
+    ok(not hook_denies("lead", lead_cmd) and hook_denies("owner", lead_cmd) and hook_denies(None, lead_cmd),
+       "SO12b an explicit --by lead passes only in lead mode")
+    rc = {}
+    with tempfile.TemporaryDirectory() as d:
+        _y.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d, "success_criteria.yaml"), "w"))
+        _y.safe_dump(_db.example_brief(), open(os.path.join(d, "decision_brief.yaml"), "w"))
+        env = {k: v for k, v in os.environ.items() if k != "MA_SIGNOFF_MODE"}
+        for name, args in (("brief, no --by", ["sign", d, "--accept-proposed"]),
+                           ("brief, --b owner", ["sign", d, "--b", "owner", "--accept-proposed"])):
+            r = subprocess.run([py, os.path.join(REPO_ROOT, "scripts", "decision_brief.py"), *args], env=env,
+                               capture_output=True, text=True)
+            rc[name] = (r.returncode, os.path.exists(os.path.join(d, _db.SIGNOFF)))
+    with tempfile.TemporaryDirectory() as d2:
+        _schema.toy_spec(d2)
+        for name, script, args in (("spec, no --by", "toolkit/spec/signoff.py", ["sign", d2]),
+                                   ("spec, --b owner", "toolkit/spec/signoff.py", ["sign", d2, "--b", "owner"]),
+                                   ("machine, --b owner", "agents/stage_machine.py", ["sign", d2, "--b", "owner"])):
+            r = subprocess.run([py, os.path.join(REPO_ROOT, script), *args], capture_output=True, text=True)
+            rc[name] = (r.returncode, os.path.exists(os.path.join(d2, "decision_spec.signoff.json")))
+    with tempfile.TemporaryDirectory() as d3:
+        _geo.toy_inputs(d3)
+        r = subprocess.run([py, os.path.join(REPO_ROOT, "toolkit", "spec", "geometry.py"), "approve", d3, "--b",
+                            "owner"], capture_output=True, text=True)
+        rc["geometry, --b owner"] = (r.returncode, os.path.exists(os.path.join(d3, _geo.SIGNOFF_FILE)))
+        r = subprocess.run([py, os.path.join(REPO_ROOT, "scripts", "scope_signoff.py"), "sign", d3, "--b", "owner",
+                            "--accept-all"], capture_output=True, text=True)
+        rc["scope, --b owner"] = (r.returncode, False)
+    ok(all(v == (2, False) for v in rc.values()),
+       f"SO12c the owner CLIs refuse a missing signer and an abbreviated flag (argparse exit 2, nothing signed): {rc}")
+    # SO13a: a harmless decision_brief.py call does not cover a rewrite of the geometry record in the same Bash call
+    with tempfile.TemporaryDirectory() as d4:
+        os.makedirs(os.path.join(d4, "data"))
+        open(os.path.join(d4, _geo.SIGNOFF_FILE), "w").write('{"approvals": {}}')
+        ig = ArtifactIntegrity(d4, process_check=lambda: set())
+        ig.on_pre("g13", "Bash", {"command": f"python3 scripts/decision_brief.py status {d4} && python3 {d4}/helper.py"},
+                  None)
+        open(os.path.join(d4, _geo.SIGNOFF_FILE), "w").write('{"approvals": {"x": {"approved_by": "owner"}}}')
+        ev = [(e["file"], e["change"]) for e in ig.on_post("g13")]
+        ok((_geo.SIGNOFF_FILE, "modified") in ev,
+           f"SO13a a geometry record rewritten during an agent's Bash call is an integrity violation, whatever "
+           f"harness script the call also names ({ev})")
+    # SO13b XFAIL: indirect execution the command filter cannot see; owner signing closes it
+    helper = os.path.join(td, "helper.py")
+    indirect = {"helper script": f"python3 scripts/decision_brief.py status {td} && python3 {helper}",
+                "split name": f"G=geom; python3 toolkit/spec/${{G}}etry.py approve {td} --by owner",
+                "python -c, getattr": "python3 -c \"import importlib as i; m=i.import_module('toolkit.spec.geo'+"
+                                      f"'metry'); getattr(m, 'app'+'rove')('{td}', 'own'+'er')\"",
+                "xargs": f"echo approve {td} --by owner | xargs python3 toolkit/spec/geo*.py",
+                "symlink": f"ln -s {REPO_ROOT}/toolkit/spec/geometry.py {td}/g.py && python3 {td}/g.py approve {td} "
+                           "--by owner"}
+    for name, cmd in indirect.items():
+        state = "XPASS (denied by the filter)" if hook_denies("lead", cmd) else "XFAIL (allowed)"
+        print(f"{state} SO13b {name}: the tool hook cannot see indirect execution; closed by {OWNER_SIGNING_PR}")
+
+
 def _run_self_test() -> int:
     import tempfile
     import agents as agents_pkg
@@ -1246,6 +1335,7 @@ def _run_self_test() -> int:
         ok(all(any(_fn.fnmatch(p, pat) for pat in _pp()) for p in ("data/geometry_signoff.json",
                                                                        "data/input_checks.json")),
            "SO11c the integrity record watches the geometry records (an unexplained change is a violation)")
+        _self_test_owner_cli(ok, td, trace, reg)
         # SS1-SS6 (Phase 49 β): decision-bearing declarations wait for the owner.
         import scope_signoff as _ss
         from agents import scope_hold_reason
