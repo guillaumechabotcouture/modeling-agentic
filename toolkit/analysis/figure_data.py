@@ -47,61 +47,269 @@ class RebuildRefused(RuntimeError):
 
 
 def _fixed(spec) -> dict:
-    raise NotImplementedError("figures β")
+    return {k: float(v) for k, v in ((spec["constraints"].get("fixed_costs_usd") or {}).items())}
 
 
 def frontier(A, ben0, cost0, out0, fractions=FRACTIONS) -> dict:
-    raise NotImplementedError("figures β")
+    env = float(A.spec["constraints"]["envelope_usd"])
+    fixed = sum(_fixed(A.spec).values())
+    rows, skipped = [], []
+    for f in fractions:
+        b = f * env - fixed
+        if b <= 0:
+            skipped.append({"fraction": f, "reason": "the fixed costs exceed this envelope"})
+            continue
+        sol = A.solve(ben0, cost0, budget=b)
+        s = A.summary(sol["choice"], out0, cost0)
+        rows.append({"fraction": f, "envelope_usd": f * env, "budget_allocatable": b, "objective": sol["objective"],
+                     "cost": s["cost_allocated"], "averted": s["averted"], "packages": s["packages"], "mix": s["mix"]})
+    by = {r["fraction"]: r for r in rows}
+    marg = None
+    if 0.9 in by and 1.1 in by:
+        d_obj = by[1.1]["objective"] - by[0.9]["objective"]
+        d_usd = by[1.1]["cost"] - by[0.9]["cost"]
+        marg = {"from_fraction": 0.9, "to_fraction": 1.1, "outcome_per_usd": d_obj / d_usd if d_usd > 0 else None,
+                "usd_per_outcome": d_usd / d_obj if d_obj > 0 else None}
+    return {"envelope_usd": env, "fixed_costs_usd": fixed, "points": rows, "skipped": skipped, "marginal": marg}
 
 
 def dollars(A, plan, out0) -> dict:
-    raise NotImplementedError("figures β")
+    from toolkit.alloc import costs as acosts
+    units = [A.by_id[i] for i in A.ids]
+    fn = lambda u, p: out0[str(u[A.spec.uid])]["cost"][p]  # noqa: E731
+    cm = acosts.cost_matrix(A.alloc, units, outcome=fn)
+    item_comp = {it["id"]: it["component"] for it in A.spec["options"]["cost_items"]}
+    comps = list(A.spec["options"]["components"])
+    by_c = {c: 0.0 for c in comps}
+    by_r = {}
+    for i in A.ids:
+        r = str(A.by_id[i].get(A.region, "")) if A.region else ""
+        row = by_r.setdefault(r, {c: 0.0 for c in comps})
+        for it, v in cm[i][plan[i]]["items"].items():
+            by_c[item_comp[it]] += v
+            row[item_comp[it]] += v
+    return {"envelope_usd": float(A.spec["constraints"]["envelope_usd"]), "fixed_costs_usd": _fixed(A.spec),
+            "budget_allocatable": float(A.budget), "by_component": by_c, "by_region": by_r,
+            "allocated_usd": sum(by_c.values())}
 
 
 def _package_sums(A, plan, out, cost) -> dict:
-    raise NotImplementedError("figures β")
+    s = {}
+    for i in A.ids:
+        k = plan[i]
+        e = s.setdefault(k, {"units": 0, "cost": 0.0, "averted": 0.0})
+        e["units"] += 1
+        e["cost"] += cost[i][k]
+        e["averted"] += out[i]["y"][A.comp][A.primary] - out[i]["y"][k][A.primary]
+    return s
 
 
 def replay(A, plan, uq: dict) -> dict:
     """Per-package sums over the uncertainty step's draws (same Drawer, seed and call order); `reproduced` says
     whether the replay gives the stored fixed-plan interval of the primary outcome."""
-    raise NotImplementedError("figures β")
+    from toolkit.analysis import uncertainty as UQ
+    from toolkit.analysis.core import q
+    nd, seed = int(uq["draws"]), int(uq["seed"])
+    D = UQ.Drawer(A, seed)
+    D.prepare(nd)
+    tot, per = [], []
+    for _ in range(nd):
+        D.last_clamped = []
+        theta, zs, noise, mult, _s = D.draw()
+        out, _ben, cost = A.evaluate(theta, zs, noise=noise, cost_mult=mult)
+        tot.append(sum(out[i]["y"][A.comp][A.primary] - out[i]["y"][plan[i]][A.primary] for i in A.ids))
+        per.append(_package_sums(A, plan, out, cost))
+    lvl = float((uq.get("interval") or {}).get("level", 0.95))
+    got, want = q(tot, lvl), (uq.get("fixed_plan") or {}).get(A.primary) or {}
+    same = bool(want) and all(abs(got[k] - float(want[k])) <= REPLAY_RTOL * max(abs(float(want[k])), 1.0)
+                              for k in ("median", "ci_low", "ci_high"))
+    return {"draws": nd, "seed": seed, "level": lvl, "reproduced": same, "replayed": got, "stored": want,
+            "per_draw": per}
 
 
 def by_package(A, plan, out0, cost0, rep: dict | None) -> dict:
-    raise NotImplementedError("figures β")
+    from toolkit.analysis.core import q
+    pt = _package_sums(A, plan, out0, cost0)
+    out = {}
+    for k, e in pt.items():
+        row = dict(e, components=sorted(A.pk[k]),
+                   usd_per_outcome=e["cost"] / e["averted"] if e["averted"] > 0 else None)
+        if rep and rep["reproduced"]:
+            ratios = [d[k]["cost"] / d[k]["averted"] for d in rep["per_draw"] if k in d and d[k]["averted"] > 0]
+            row["usd_per_outcome_interval"] = q(ratios, rep["level"]) if len(ratios) == rep["draws"] else None
+        out[k] = row
+    return out
 
 
 def component_increment(A, plan, ben0, cost0) -> dict:
-    raise NotImplementedError("figures β")
+    by_set = {cs: k for k, cs in A.pk.items()}
+    res = {}
+    for c in A.spec["options"]["components"]:
+        r = {"units": 0, "units_without_counterpart": 0, "averted": 0.0, "cost": 0.0}
+        for i in A.ids:
+            cs = A.pk[plan[i]]
+            if c not in cs:
+                continue
+            alt = by_set.get(frozenset(set(cs) - {c}))
+            if alt is None:
+                r["units_without_counterpart"] += 1
+                continue
+            r["units"] += 1
+            r["averted"] += (ben0[i][plan[i]] - ben0[i][alt]) / max(A.dfac, 1e-12)
+            r["cost"] += cost0[i][plan[i]] - cost0[i][alt]
+        r["outcome_per_usd"] = r["averted"] / r["cost"] if r["cost"] > 0 else None
+        res[c] = r
+    return res
 
 
 def burden(A, out0) -> dict:
-    raise NotImplementedError("figures β")
+    pops = A.spec["decision_units"]["populations"]
+    res = {}
+    for i in A.ids:
+        n = sum(float(A.by_id[i][pm["column"]]) for pm in pops.values())
+        res[i] = {"population": n, "per_person": out0[i]["y"][A.comp][A.primary] / n if n > 0 else None,
+                  "comparator_total": out0[i]["y"][A.comp][A.primary]}
+    return res
 
 
 def calibration_modelled(A, z0) -> dict | None:
-    raise NotImplementedError("figures β")
+    from toolkit.analysis import calibration as C
+    fn = getattr(C, "modelled_targets", None)
+    if fn is None or A.method != "emulator_inversion":
+        return None
+    return {"metric": A.spec["calibration"].get("metric"), "units": fn(A.spec, A.model, A.theta0, z0)}
 
 
 def schedule(A, plan, z0) -> dict:
     """Per region, the engine's delivery events (hooks.schedule) in the comparator arm (history and routine events,
     every arm) and in each unit's plan arm (decision events), with unit counts."""
-    raise NotImplementedError("figures β")
+    from toolkit.analysis.batch import calibrated_value
+    from toolkit.engines import hooks
+    from toolkit.engines.contract import Package, UnitSpec
+    eng = A.eng
+    if not hooks.supports(eng, "schedule"):
+        return {"status": "not_offered", "reason": str(hooks.HookUnsupported("schedule", eng))}
+    h = A.spec.horizon({})
+    cal_attr = A.spec["calibration"].get("attribute")
+    regions = {}
+    for i in A.ids:
+        u = A.by_id[i]
+        a = dict(A.spec.unit_attributes(u))
+        if cal_attr and z0.get(i) is not None:
+            a[cal_attr] = calibrated_value(A.spec, z0[i])
+        us = UnitSpec(i, a)
+        r = str(u.get(A.region, "")) if A.region else ""
+        ev = [e for e in hooks.schedule(eng, A.theta0, us, Package(A.comp, A.spec.engine_package(A.pk[A.comp])), h)
+              if e["kind"] != "decision"]
+        ev += [e for e in hooks.schedule(eng, A.theta0, us, Package(plan[i], A.spec.engine_package(A.pk[plan[i]])), h)
+               if e["kind"] == "decision"]
+        reg = regions.setdefault(r, {"units": 0, "events": {}})
+        reg["units"] += 1
+        for e in ev:
+            key = json.dumps([e["component"], e["label"], e["kind"], round(e["t0"], 4),
+                              None if e["t1"] is None else round(e["t1"], 4)])
+            reg["events"][key] = reg["events"].get(key, 0) + 1
+    out = {}
+    for r, reg in regions.items():
+        out[r] = {"units": reg["units"], "events": [dict(zip(("component", "label", "kind", "t0", "t1"), json.loads(k)),
+                                                         units=n) for k, n in sorted(reg["events"].items())]}
+    d = h.delivery if getattr(h, "delivery", None) is not None else h.window
+    return {"status": "ok", "delivery": [float(x) for x in d], "window": [float(x) for x in h.window],
+            "start": float(h.start), "regions": out}
 
 
 def compute(A, plan, out0, ben0, cost0, uq: dict | None, z0: dict | None = None, log=print) -> dict:
-    raise NotImplementedError("figures β")
+    rep = None
+    if uq and uq.get("draws"):
+        rep = replay(A, plan, uq)
+        if not rep["reproduced"]:
+            log(f"figure_data: the draw replay did not reproduce the stored interval ({rep['replayed']} vs "
+                f"{rep['stored']}); package intervals withheld")
+    try:
+        sch = schedule(A, plan, z0 or {})
+    except Exception as e:  # noqa: BLE001 - a malformed schedule is recorded, not fatal for the other figures
+        sch = {"status": "invalid", "reason": f"{type(e).__name__}: {e}"}
+    return {"primary": A.primary, "comparator": A.comp, "region": A.region,
+            "frontier": frontier(A, ben0, cost0, out0), "dollars": dollars(A, plan, out0),
+            "by_package": by_package(A, plan, out0, cost0, rep),
+            "replay": {k: rep[k] for k in ("draws", "seed", "level", "reproduced", "replayed", "stored")} if rep
+            else {"reproduced": False, "reason": "no uncertainty draws"},
+            "component_increment": component_increment(A, plan, ben0, cost0), "burden": burden(A, out0),
+            "calibration": calibration_modelled(A, z0 or {}), "schedule": sch}
 
 
 # --------------------------------------------------------------------------- offline rebuild
 def _canon(x):
-    raise NotImplementedError("figures β")
+    return json.loads(json.dumps(x, sort_keys=True, default=str))
 
 
 def rebuild(run_dir: str, log=print):
     """(A, plan, out0, ben0, cost0, z0) of a finished emulator-path run, from its stored batch (no engine runs)."""
-    raise NotImplementedError("figures β")
+    import yaml
+    from toolkit.analysis import batch as Bt
+    from toolkit.analysis.core import Analysis
+    from toolkit.analysis.model import EmulatorModel
+    from toolkit.engines.contract import engine_identity
+    from toolkit.spec import schema
+    run_dir = os.path.abspath(run_dir)
+    spec = schema.load(os.path.join(run_dir, "decision_spec.yaml"))
+    if spec["analysis"]["evaluation"] != "emulator":
+        raise RebuildRefused("the run evaluates the engine directly; a rebuild would run the engine")
+    eng = spec.engine()
+    rows = os.path.join(run_dir, "analysis", "batch", "results.jsonl")
+    if not os.path.exists(rows):
+        raise RebuildRefused("no stored batch rows (analysis/batch/results.jsonl)")
+    with open(rows) as f:
+        first = json.loads(f.readline())
+    stored_ident = ((first.get("result") or {}).get("provenance") or {}).get("engine")
+    if stored_ident != engine_identity(eng):
+        raise RebuildRefused(f"the batch was computed by engine {stored_ident and stored_ident.get('name')} "
+                             f"v{stored_ident and stored_ident.get('version')} (code "
+                             f"{(stored_ident or {}).get('code_sha256', '')[:12]}); this code's engine is "
+                             f"v{engine_identity(eng)['version']} (code {engine_identity(eng)['code_sha256'][:12]}): "
+                             "re-render with the run's own code")
+    design, jobs = Bt.design(spec)
+    stored = json.load(open(os.path.join(run_dir, "analysis", "batch", "design.json")))
+    if _canon(stored) != _canon(design):
+        raise RebuildRefused("the stored batch design differs from the spec's design (a shipped batch?)")
+    res, probs = Bt.load_results(rows, jobs, eng)
+    accepted_by_index = []
+    if probs and all(p.endswith("inputs differ from the current job") for p in probs):
+        # The run's own analysis verified every row on the computing platform (batch.yaml rejected_rows 0, manifest
+        # complete); a job rebuilt here can differ from it in the last bit of a derived float (libm differs across
+        # platforms, as batch.adopt notes), which changes its hash. Such rows are taken by their index, and the
+        # rebuilt plan must still equal the stored plan below.
+        man = json.load(open(os.path.join(run_dir, "analysis", "manifest.json")))
+        bsum = (yaml.safe_load(open(os.path.join(run_dir, "analysis", "batch.yaml")))["data"].get("summary") or {})
+        if man.get("status") != "complete" or bsum.get("rejected_rows") != 0:
+            raise RebuildRefused(f"{len(probs)} batch rows lack matching provenance and the run's analysis did not "
+                                 "verify them")
+        with open(rows) as f:
+            for line in f:
+                r = json.loads(line)
+                jid = jobs[r["i"]]["id"]
+                if jid not in res and r.get("ok"):
+                    res[jid] = r["result"]["result"]
+                    accepted_by_index.append(jid)
+        probs = []
+    if probs or len(res) != len(jobs):
+        raise RebuildRefused(f"{len(probs)} batch rows lack matching provenance, {len(jobs) - len(res)} jobs missing")
+    if accepted_by_index:
+        log(f"rebuild: {len(accepted_by_index)} rows taken by index (job hash differs on this platform), e.g. "
+            f"{accepted_by_index[:2]}")
+    model = EmulatorModel(spec, design, res, log=log).fit()
+    A = Analysis(spec, model, log=log)
+    A.fit_calibration()
+    cal0 = A.calibrate(A.theta0)
+    z0 = {i: v[0] for i, v in cal0.items()}
+    out0, ben0, cost0 = A.evaluate(A.theta0, z0)
+    sol = A.solve(ben0, cost0)
+    point = yaml.safe_load(open(os.path.join(run_dir, "analysis", "point.yaml")))["data"]
+    plan = {str(k): v for k, v in point["plan"].items()}
+    diff = [i for i in A.ids if sol["choice"][i] != plan.get(i)]
+    if diff:
+        raise RebuildRefused(f"the rebuilt plan differs from the stored plan in {len(diff)} units")
+    return A, plan, out0, ben0, cost0, z0
 
 
 # --------------------------------------------------------------------------- self-test

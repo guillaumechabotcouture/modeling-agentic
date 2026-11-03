@@ -786,7 +786,34 @@ PRESENTATION_TITLES = ("regions_title", "units_title")
 def presentation_problems(raw: dict, pnames=None, card=None) -> list[str]:
     """The optional presentation block (display names read only by the figures, docs/design/v2-figures.md §3):
     strings only, and every id must be a component, engine parameter, reported outcome or engine window metric."""
-    return []   # figures β
+    pres = raw.get("presentation")
+    if pres is None:
+        return []
+    if not isinstance(pres, dict) or set(pres) - {"labels"}:
+        return ["presentation: a mapping with one key, labels"]
+    lab = pres.get("labels") or {}
+    if not isinstance(lab, dict):
+        return ["presentation.labels: a mapping"]
+    bad = [f"presentation.labels.{k}: unknown key (known: {', '.join(PRESENTATION_LABELS + PRESENTATION_TITLES)})"
+           for k in lab if k not in PRESENTATION_LABELS + PRESENTATION_TITLES]
+    known = {"components": set((raw.get("options") or {}).get("components") or {}),
+             "parameters": set(pnames or ()),
+             "outcomes": {(raw.get("objective") or {}).get("outcome")} | set(raw.get("outcomes_reported") or []),
+             "metrics": set((card.outputs.get("windows", []) if card is not None else ()))}
+    for k in PRESENTATION_LABELS:
+        m = lab.get(k)
+        if m is None:
+            continue
+        if not isinstance(m, dict) or not all(isinstance(v, str) and v.strip() for v in m.values()):
+            bad.append(f"presentation.labels.{k}: a mapping of id to a non-empty display name")
+            continue
+        unknown = [i for i in m if i not in known[k]] if (k != "parameters" or pnames) else []
+        if unknown:
+            bad.append(f"presentation.labels.{k}: {unknown} are not {k} of this spec")
+    for k in PRESENTATION_TITLES:
+        if k in lab and not (isinstance(lab[k], str) and lab[k].strip()):
+            bad.append(f"presentation.labels.{k}: a non-empty string")
+    return bad
 
 
 def _validate_calibration(s, card, pnames, cols) -> list[str]:

@@ -42,13 +42,21 @@ class Missing(Exception):
 
 
 def _fv():
-    raise NotImplementedError("figures β")
+    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    import figure_validator
+    return figure_validator
 
 
 def resolve_source(run_dir: str, src) -> tuple[str | None, str]:
     """(absolute path, "") of a figure source recorded relative to the run dir, or (None, why) when the recorded path
     is not a string or points outside the run dir. A legacy absolute path inside the run dir is accepted as is."""
-    raise NotImplementedError("figures β")
+    if not isinstance(src, str) or not src:
+        return None, f"source {src!r} is not a path"
+    root = os.path.realpath(run_dir)
+    p = os.path.realpath(src if os.path.isabs(src) else os.path.join(run_dir, src))
+    if os.path.commonpath([root, p]) != root:
+        return None, f"source {src} is outside the run dir"
+    return p, ""
 
 
 # --------------------------------------------------------------------------- run data
@@ -57,139 +65,876 @@ class RunData:
 
     def __init__(self, run_dir: str, labels_overlay: dict | None = None, figure_data: dict | None = None,
                  trajectories: dict | None = None):
-        raise NotImplementedError("figures β")
+        import yaml
+        self.dir = os.path.abspath(run_dir)
+        self._yaml = yaml
+        self._cache = {}
+        self.used: list[str] = []
+        sp = os.path.join(self.dir, "decision_spec.yaml")
+        if not os.path.exists(sp):
+            raise Missing("no decision_spec.yaml in the run dir")
+        self.spec = yaml.safe_load(open(sp, encoding="utf-8"))
+        self.override = {"figure_data": figure_data, "trajectories": trajectories}
+        eng = self.opt("engine") or {}
+        self.labels = FS.Labels(self.spec, card=eng.get("card"), params=eng.get("parameters"), overlay=labels_overlay)
+        du = self.spec["decision_units"]
+        self.uid, self.region_col = du["id"], du.get("region")
+        with open(os.path.join(self.dir, du["csv"]), newline="", encoding="utf-8") as f:
+            self.units = list(csv.DictReader(f))
+        self.by_id = {str(u[self.uid]): u for u in self.units}
+        self.ids = [str(u[self.uid]) for u in self.units]
+        from toolkit.alloc import costs as acosts
+        self.pk = acosts.packages(self.spec["options"])
+        self.components = list(self.spec["options"]["components"])
+        self.primary = self.spec["objective"]["outcome"]
+        self.comparator = self.spec["comparator"]["package"]
 
     def _load(self, rel):
-        raise NotImplementedError("figures β")
+        if rel not in self._cache:
+            p = os.path.join(self.dir, rel)
+            self._cache[rel] = self._yaml.safe_load(open(p, encoding="utf-8")) if os.path.exists(p) else None
+        return self._cache[rel]
 
     def art(self, kind: str) -> dict:
-        raise NotImplementedError("figures β")
+        if self.override.get(kind) is not None:
+            return self.override[kind]
+        doc = self._load(os.path.join("analysis", f"{kind}.yaml"))
+        if doc is None:
+            raise Missing(f"needs analysis/{kind}.yaml, which this run does not have")
+        rel = os.path.join("analysis", f"{kind}.yaml")
+        if rel not in self.used:
+            self.used.append(rel)
+        return doc["data"]
 
     def opt(self, kind):
-        raise NotImplementedError("figures β")
+        try:
+            return self.art(kind)
+        except Missing:
+            return None
 
     def report(self) -> dict:
-        raise NotImplementedError("figures β")
+        doc = self._load("uncertainty_report.yaml")
+        if doc is None:
+            raise Missing("needs uncertainty_report.yaml (per-unit package counts over the draws)")
+        if "uncertainty_report.yaml" not in self.used:
+            self.used.append("uncertainty_report.yaml")
+        return doc
 
     def region(self, i) -> str:
-        raise NotImplementedError("figures β")
+        return str(self.by_id[i].get(self.region_col, "")) if self.region_col else ""
 
     def regions(self) -> list[str]:
-        raise NotImplementedError("figures β")
+        return sorted({self.region(i) for i in self.ids})
 
     def plan(self) -> dict:
-        raise NotImplementedError("figures β")
+        return {str(k): v for k, v in self.art("point")["plan"].items()}
 
     def coords(self):
         """{unit: (lon, lat)} from decision_units.coordinates or lat/lon columns; None when either is missing."""
-        raise NotImplementedError("figures β")
+        c = self.spec["decision_units"].get("coordinates") or {}
+        cols = {k.lower(): k for k in (self.units[0] if self.units else {})}
+        lat = c.get("lat") or next((cols[k] for k in ("lat", "latitude") if k in cols), None)
+        lon = c.get("lon") or next((cols[k] for k in ("lon", "lng", "long", "longitude") if k in cols), None)
+        if not lat or not lon:
+            return None
+        try:
+            return {i: (float(self.by_id[i][lon]), float(self.by_id[i][lat])) for i in self.ids}
+        except (KeyError, ValueError):
+            return None
 
     def unit_order(self) -> tuple[list[str], str]:
         """Units in display order within a region, and what the order is."""
-        raise NotImplementedError("figures β")
+        fd = self.opt("figure_data")
+        if fd and fd.get("burden"):
+            b = fd["burden"]
+            return sorted(self.ids, key=lambda i: -(b.get(i, {}).get("per_person") or 0)), \
+                "comparator burden per person, highest first"
+        return sorted(self.ids, key=lambda i: (len(i), i)), self.spec["decision_units"]["id"]
 
     def window(self):
-        raise NotImplementedError("figures β")
+        return [float(x) for x in self.spec["objective"]["horizon"]]
 
 
 # --------------------------------------------------------------------------- drawing helpers
 def _fig(t, w, h):
-    raise NotImplementedError("figures β")
+    import matplotlib.pyplot as plt
+    fig = plt.figure(figsize=(w, h))
+    fig.patch.set_facecolor(t["surface"])
+    return fig
 
 
 def _sing(label: str) -> str:
-    raise NotImplementedError("figures β")
+    return label[:-1] if label.endswith("s") and not label.endswith("ss") else label
 
 
 def _legend_handles(t, items):
-    raise NotImplementedError("figures β")
+    from matplotlib.lines import Line2D
+    return [Line2D([0], [0], marker="o", ls="", markerfacecolor=c, markeredgecolor=c, markersize=7, label=lab)
+            for lab, c in items]
 
 
 def _unit_layout(R, ax, t, colors: dict, layout: str, order: list[str], size=None, edge=None, labels=True):
     """Draw one dot per unit: at its coordinates (layout 'map') or in a by-region strip (rows = regions)."""
-    raise NotImplementedError("figures β")
+    ax.set_facecolor(t["surface"])
+    if layout == "map":
+        xy = R.coords()
+        ids = order
+        ax.scatter([xy[i][0] for i in ids], [xy[i][1] for i in ids], c=[colors[i] for i in ids],
+                   s=size or 22, edgecolors=edge or t["surface"], linewidths=0.6, zorder=3)
+        ax.set_aspect("equal", adjustable="datalim")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for s in ax.spines.values():
+            s.set_visible(False)
+        return
+    regs = R.regions()
+    by = {r: [i for i in order if R.region(i) == r] for r in regs}
+    nmax = max(len(v) for v in by.values())
+    s = size or max(9, min(40, 2600 / max(nmax, 1) ** 1.25))
+    for y, r in enumerate(regs[::-1]):
+        xs = list(range(len(by[r])))
+        ax.scatter(xs, [y] * len(xs), c=[colors[i] for i in by[r]], s=s, edgecolors=edge or t["surface"],
+                   linewidths=0.5, zorder=3)
+    ax.set_yticks(range(len(regs)))
+    ax.set_yticklabels([f"{r} ({len(by[r])})" for r in regs[::-1]], fontsize=7.5)
+    ax.set_xlim(-1, nmax)
+    ax.set_ylim(-0.7, len(regs) - 0.3)
+    ax.set_xticks([])
+    for sp in ax.spines.values():
+        sp.set_visible(False)
+    ax.tick_params(length=0, colors=t["ink2"], labelleft=labels)
 
 
 def _layout(R):
-    raise NotImplementedError("figures β")
+    return ("map", "units at their coordinates") if R.coords() else \
+        ("strip", f"one row per {R.labels.region_title().lower()}, one dot per unit")
 
 
 def _write_csv(path, rows: list[dict]):
-    raise NotImplementedError("figures β")
+    if not rows:
+        rows = [{"note": "no rows"}]
+    keys = []
+    for r in rows:
+        keys += [k for k in r if k not in keys]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=keys)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
 
 
 # --------------------------------------------------------------------------- figures
 def _top(fig, inches=0.62):
     """The axes top (figure fraction) that leaves `inches` for the title."""
-    raise NotImplementedError("figures β")
+    return 1 - inches / fig.get_figheight()
 
 
 def _comp_colors(R, t) -> dict:
     """One categorical slot per component the plan uses, in the spec's component order, contiguous from slot 1 (so
     a stack of them shows only validated adjacent pairs); the same mapping in every figure of the run."""
-    raise NotImplementedError("figures β")
+    mix = (R.opt("point") or {}).get("mix") or {}
+    used = [c for c in R.components if mix.get(c, 0) > 0] or list(R.components)
+    used = used[:FS.MAX_CATEGORIES]
+    return {c: t["cat"][n] for n, c in enumerate(used)}
 
 
 def spec_differences(Rs) -> list[str]:
     """What differs between the runs' specs where it bears on the headline (window, delivery, envelope, comparator,
     uncertainty sources, engine choice), in words."""
-    raise NotImplementedError("figures β")
+    def get(R, path):
+        x = R.spec
+        for k in path:
+            x = (x or {}).get(k) if isinstance(x, dict) else None
+        return x
+    checks = [(("objective", "horizon"), "outcome window"), (("objective", "delivery"), "delivery period"),
+              (("constraints", "envelope_usd"), "envelope"), (("constraints", "fixed_costs_usd"), "fixed costs"),
+              (("comparator", "package"), "comparator"), (("uncertainty", "sources"), "uncertainty sources"),
+              (("decision_units", "engine_attributes"), "engine unit attributes"),
+              (("analysis", "decision_tests"), "decision tests")]
+    out = []
+    for path, name in checks:
+        vals = [json.dumps(get(R, path), sort_keys=True, default=str) for R in Rs]
+        if len(set(vals)) > 1:
+            out.append(name)
+    engs = {json.dumps((R.opt("engine") or {}).get("card", {}).get("version")) for R in Rs}
+    if len(engs) > 1:
+        out.append("engine version")
+    return out
 
 
 def fig_headline(R, t):
-    raise NotImplementedError("figures β")
+    pt, uq = R.art("point"), R.art("uncertainty")
+    outs = [R.primary] + [o for o in (R.spec.get("outcomes_reported") or []) if o != R.primary]
+    outs = [o for o in outs if o in (uq.get("fixed_plan") or {}) and o in pt["averted"]]
+    if not outs:
+        raise Missing("the uncertainty artifact has no fixed-plan interval")
+    lvl = float(uq["fixed_plan"][outs[0]].get("level", 0.95))
+    fig = _fig(t, 7.2, 0.6 * len(outs) + 1.15)
+    h = fig.get_figheight()
+    gs = fig.add_gridspec(len(outs), 1, left=0.2, right=0.78, top=_top(fig, 0.55), bottom=0.62 / h, hspace=1.2)
+    rows = []
+    for k, o in enumerate(outs):
+        ax = fig.add_subplot(gs[k, 0])
+        FS.style(ax, t, grid="x")
+        q, p = uq["fixed_plan"][o], float(pt["averted"][o])
+        ax.plot([q["ci_low"], q["ci_high"]], [0, 0], color=t["cat"][0], lw=2.4, solid_capstyle="round", zorder=2)
+        ax.plot([q["median"]] * 2, [-0.32, 0.32], color=t["ink2"], lw=1.4, zorder=3)
+        ax.scatter([p], [0], s=46, color=t["cat"][0], edgecolors=t["surface"], linewidths=1.5, zorder=4)
+        span = q["ci_high"] - q["ci_low"]
+        lo, hi = min(q["ci_low"], p), max(q["ci_high"], p)
+        ax.set_xlim(lo - 0.6 * span, hi + 0.6 * span)
+        ax.set_ylim(-1, 1)
+        ax.set_yticks([0])
+        ax.set_yticklabels([f"{R.labels.outcome(o)} averted"], fontsize=9, color=t["ink"])
+        FS.set_axis_format(ax, "x")
+        ax.locator_params(axis="x", nbins=5)
+        ax.text(1.02, 0.5, f"{FS.fmt(p)}  ({FS.fmt(q['ci_low'])}–{FS.fmt(q['ci_high'])})", transform=ax.transAxes,
+                va="center", fontsize=8.5, color=t["ink"])
+        rows.append({"outcome": o, "label": R.labels.outcome(o), "point": p, "median": q["median"],
+                     "ci_low": q["ci_low"], "ci_high": q["ci_high"], "level": lvl, "draws": uq.get("draws")})
+    from matplotlib.lines import Line2D
+    fig.legend(handles=[Line2D([0], [0], marker="o", ls="", color=t["cat"][0], label="point estimate (the plan)"),
+                        Line2D([0], [0], marker="|", ls="", color=t["ink2"], markersize=9, label="median of draws"),
+                        Line2D([0], [0], color=t["cat"][0], lw=2.4, label=f"{lvl:.0%} uncertainty interval")],
+               loc="lower left", bbox_to_anchor=(0.2, 0.0), ncol=3, fontsize=7.5)
+    o0 = rows[0]
+    title = (f"{FS.fmt(o0['point'])} {o0['label']} averted by the plan ({lvl:.0%} UI {FS.fmt(o0['ci_low'])}–"
+             f"{FS.fmt(o0['ci_high'])})")
+    covers = ", ".join(str(c).replace("_", " ") for c in uq.get("covers") or [])
+    excl = ", ".join(str((e or {}).get("kind", e)).replace("_", " ") for e in uq.get("excludes") or [])
+    cap = (f"Point plan's outcomes averted against the comparator: point estimate, median and {lvl:.0%} interval over "
+           f"{uq.get('draws')} draws of {covers or 'the declared sources'}" + (f"; not covered: {excl}." if excl else "."))
+    return fig, title, cap, rows, "the headline outcomes and their uncertainty intervals"
 
 
 def _alloc_colors(R, plan):
-    raise NotImplementedError("figures β")
+    present = [k for k in R.pk if k in set(plan.values())]
+    return present
 
 
 def fig_allocation(R, t):
-    raise NotImplementedError("figures β")
+    plan = R.plan()
+    layout, how = _layout(R)
+    order, ordered_by = R.unit_order()
+    present = _alloc_colors(R, plan)
+    U = R.labels.unit_title()
+    N = len(R.ids)
+    rows = [{"unit": i, "region": R.region(i), "package": plan[i], "package_label": R.labels.package(R.pk[plan[i]])}
+            for i in order]
+    n_none = sum(plan[i] == R.comparator for i in R.ids)
+    coloured = [k for k in present if k != R.comparator]
+    if len(coloured) <= FS.MAX_SCATTER_CATEGORIES:
+        col = {k: t["cat"][n] for n, k in enumerate(coloured)}
+        col[R.comparator] = t["neutral"]
+        fig = _fig(t, 7.6, 0.3 * len(R.regions()) + 1.9 if layout == "strip" else 6.5)
+        h = fig.get_figheight()
+        ax = fig.add_axes([0.2, 0.62 / h, 0.78, _top(fig) - 0.62 / h])
+        _unit_layout(R, ax, t, {i: col[plan[i]] for i in R.ids}, layout, order)
+        cnt = {k: sum(plan[i] == k for i in R.ids) for k in present}
+        fig.legend(handles=_legend_handles(t, [(f"{R.labels.package(R.pk[k])} ({cnt[k]})", col[k]) for k in present]),
+                   loc="lower left", bbox_to_anchor=(0.2, 0.0), ncol=3, fontsize=7.5)
+        top = max(cnt, key=cnt.get)
+        title = f"Most common package: {R.labels.package(R.pk[top])}, in {cnt[top]} of {N} {U}"
+        mode = "by package"
+    else:
+        comps = R.components
+        ncol = 2 if len(comps) <= 4 else 3
+        nrow = math.ceil(len(comps) / ncol)
+        ph = 0.19 * len(R.regions()) + 0.45 if layout == "strip" else 2.8
+        fig = _fig(t, 3.1 * ncol + 1.1, ph * nrow + 0.75)
+        gs = fig.add_gridspec(nrow, ncol, left=0.12, right=0.995, top=_top(fig, 0.75), bottom=0.02,
+                              hspace=0.22, wspace=0.04)
+        cnt = {}
+        for n, c in enumerate(comps):
+            ax = fig.add_subplot(gs[n // ncol, n % ncol])
+            has = {i: c in R.pk[plan[i]] for i in R.ids}
+            cnt[c] = sum(has.values())
+            _unit_layout(R, ax, t, {i: (t["cat"][0] if has[i] else t["neutral"]) for i in R.ids}, layout, order,
+                         labels=(n % ncol == 0))
+            ax.set_title(f"{R.labels.component(c)}: {cnt[c]} {U}", fontsize=8.5, color=t["ink"], loc="left", pad=3)
+        top = max(cnt, key=cnt.get)
+        title = (f"{R.labels.component(top)} reach {cnt[top]} of {N} {U}; {len(present)} packages in all"
+                 + (f", {n_none} {U} get none" if n_none else ""))
+        mode = "small multiples by component"
+    defs = R.labels.legend_lines()
+    cap = (f"Recommended package per unit ({how}; within a row, ordered by {ordered_by})"
+           + (". Filled dot: the unit gets the component" if mode.startswith("small") else "")
+           + (f". Ids: {'; '.join(defs)}" if defs else "") + ".")
+    return fig, title, cap, rows, f"where each package goes ({mode})"
 
 
 def _binned(t, vals, edges, fmtk):
-    raise NotImplementedError("figures β")
+    ramp = t["ramp"]
+    def color(v):
+        for n in range(len(edges) - 1):
+            if v < edges[n + 1] or n == len(edges) - 2:
+                return ramp[min(n, len(ramp) - 1)]
+        return ramp[-1]
+    labels = [f"{FS.fmt(edges[n], fmtk)}–{FS.fmt(edges[n + 1], fmtk)}" for n in range(len(edges) - 1)]
+    return color, labels
 
 
 def fig_stability(R, t):
-    raise NotImplementedError("figures β")
+    plan = R.plan()
+    cat = R.report().get("categorical_outputs") or {}
+    share, comp_keep = {}, {c: {} for c in R.components}
+    for i in R.ids:
+        e = cat.get(f"package:{i}")
+        if not e or not e.get("n"):
+            raise Missing(f"uncertainty_report.yaml has no package counts for unit {i}")
+        counts, n = e.get("counts") or {}, float(e["n"])
+        share[i] = float(counts.get(plan[i], 0)) / n
+        for c in R.components:
+            mine = c in R.pk[plan[i]]
+            comp_keep[c][i] = sum(v for k, v in counts.items() if (c in R.pk.get(k, ())) == mine) / n
+    edges = [0.0, 0.5, 0.7, 0.9, 1.0]
+    color, labs = _binned(t, list(share.values()), edges, "percent")
+    layout, how = _layout(R)
+    order, ordered_by = R.unit_order()
+    U = R.labels.unit_title()
+    comps = [c for c in R.components if any(c in R.pk[plan[i]] for i in R.ids)
+             or any(v < 1.0 for v in comp_keep[c].values())]
+    panels = [("package", "whole package", share)] + [(c, R.labels.component(c), comp_keep[c]) for c in comps]
+    ncol = 1 if len(panels) == 1 else (2 if len(panels) <= 4 else 3)
+    nrow = math.ceil(len(panels) / ncol)
+    ph = 0.19 * len(R.regions()) + 0.45 if layout == "strip" else 2.8
+    fig = _fig(t, 3.1 * ncol + 1.1, ph * nrow + 1.25)
+    h = fig.get_figheight()
+    gs = fig.add_gridspec(nrow, ncol, left=0.12, right=0.995, top=_top(fig, 0.75), bottom=0.55 / h, hspace=0.22,
+                          wspace=0.06)
+    for n, (key, name, vals) in enumerate(panels):
+        ax = fig.add_subplot(gs[n // ncol, n % ncol])
+        _unit_layout(R, ax, t, {i: color(vals[i]) for i in R.ids}, layout, order, labels=(n % ncol == 0))
+        n90 = sum(v >= 0.9 for v in vals.values())
+        ax.set_title(f"{name}: {n90} {U} at 90% or more", fontsize=8.5, color=t["ink"], loc="left", pad=3)
+    fig.legend(handles=_legend_handles(t, list(zip(labs, t["ramp"]))), loc="lower left", bbox_to_anchor=(0.12, 0.0),
+               ncol=4, fontsize=7.5, title="share of draws in which the re-optimised plan keeps the unit's choice",
+               title_fontsize=7.5)
+    n90 = sum(v >= 0.9 for v in share.values())
+    ck = {c: sum(v >= 0.9 for v in comp_keep[c].values()) for c in comps}
+    least = min(ck, key=ck.get) if ck else None
+    title = (f"{n90} of {len(share)} {U} keep their whole package in 90% of draws; "
+             f"{R.labels.component(least)} only {ck[least]}" if least else
+             f"{n90} of {len(share)} {U} keep their whole package in 90% of draws")
+    nd = next(iter(cat.values())).get("n")
+    cap = (f"Share of {nd} draws in which the re-optimised plan keeps the unit's choice: the whole package (first "
+           f"panel) and each component's yes/no; {how}, ordered by {ordered_by}.")
+    rows = [{"unit": i, "region": R.region(i), "package": plan[i], "share_keeping_package": share[i],
+             **{f"share_keeping_{c}": comp_keep[c][i] for c in comps}} for i in order]
+    return fig, title, cap, rows, "assignment stability over the uncertainty draws (package and components)"
 
 
 def fig_burden(R, t):
-    raise NotImplementedError("figures β")
+    fd = R.art("figure_data")
+    b = fd.get("burden") or {}
+    vals = {i: (b.get(i) or {}).get("per_person") for i in R.ids}
+    if any(v is None for v in vals.values()):
+        raise Missing("figure_data has no burden for every unit")
+    scale = 1000.0 if max(vals.values()) < 10 else 1.0
+    v = {i: x * scale for i, x in vals.items()}
+    import numpy as np
+    edges = list(np.quantile(list(v.values()), [0, 0.25, 0.5, 0.75, 1.0]))
+    color, labs = _binned(t, list(v.values()), edges, "number")
+    layout, how = _layout(R)
+    order, ordered_by = R.unit_order()
+    fig = _fig(t, 7.6, 0.3 * len(R.regions()) + 1.9 if layout == "strip" else 6.5)
+    h = fig.get_figheight()
+    ax = fig.add_axes([0.2, 0.66 / h, 0.78, _top(fig) - 0.66 / h])
+    _unit_layout(R, ax, t, {i: color(v[i]) for i in R.ids}, layout, order)
+    w0, w1 = R.window()
+    per = "per 1,000 people" if scale == 1000 else "per person"
+    olab = R.labels.outcome(R.primary)
+    fig.legend(handles=_legend_handles(t, list(zip(labs, t["ramp"]))), loc="lower left", bbox_to_anchor=(0.2, 0.0),
+               ncol=4, fontsize=7.5, title=f"{olab} {per} over {w0:g}–{w1:g} without the plan (quartiles)",
+               title_fontsize=7.5)
+    hi = max(R.regions(), key=lambda r: np.mean([v[i] for i in R.ids if R.region(i) == r]))
+    title = (f"Burden without the plan: {FS.fmt(min(v.values()))}–{FS.fmt(max(v.values()))} {olab} {per}; "
+             f"highest mean in {hi}")
+    cap = (f"{olab} {per} over {w0:g}–{w1:g} under the comparator ({R.spec['comparator'].get('text', R.comparator)}); "
+           f"{how}, ordered by {ordered_by}.")
+    rows = [{"unit": i, "region": R.region(i), f"{R.primary}_{per.replace(' ', '_').replace(',', '')}": v[i]}
+            for i in order]
+    return fig, title, cap, rows, "comparator burden per person"
 
 
 def fig_calibration(R, t):
-    raise NotImplementedError("figures β")
+    import numpy as np
+    cal = R.art("calibration")
+    cs = R.spec.get("calibration") or {}
+    method = cal.get("method", cs.get("method"))
+    if method == "none":
+        raise Missing("the spec has no calibration (method none)")
+    fig = _fig(t, 7.8, 4.6)
+    h = fig.get_figheight()
+    a1 = fig.add_axes([0.085, 0.6 / h, 0.37, _top(fig, 0.95) - 0.6 / h])
+    a2 = fig.add_axes([0.62, 0.6 / h, 0.36, _top(fig, 0.95) - 0.6 / h])
+    FS.style(a1, t, grid="both")
+    FS.style(a2, t, grid="x")
+    rows = []
+    lg = lambda p: np.log(p / (1 - p))  # noqa: E731
+    il = lambda x: 1 / (1 + np.exp(-x))  # noqa: E731
+    regs = R.regions()
+    RT = R.labels.region_title()
+    if method == "emulator_inversion":
+        tc = cs["target_column"]
+        tgt = {i: float(R.by_id[i][tc]) for i in R.ids}
+        fd = R.opt("figure_data") or {}
+        mod_src = ((fd.get("calibration") or {}).get("units")) or {}
+        resid_max = float((cal.get("diagnostics") or {}).get("target_logit_residual_max") or 0.0)
+        modelled = {i: float(mod_src[i]["modelled"]) if i in mod_src else None for i in R.ids}
+        have_mod = all(v is not None for v in modelled.values())
+        sd = float((cs.get("target_uncertainty") or {}).get("region_sd_logit") or 0.0)
+        acc = (R.opt("emulator") or {}).get("accuracy") or {}
+        e_rmse = acc.get("cal_logit_rmse")
+        x = np.array([tgt[i] for i in R.ids])
+        y = np.array([modelled[i] if have_mod else tgt[i] for i in R.ids])
+        m = float(max(x.max(), y.max())) * 1.06
+        gx = np.linspace(max(m / 400, 1e-4), m, 200)
+        if e_rmse:
+            a1.fill_between(gx, il(lg(gx) - 1.96 * e_rmse), il(lg(gx) + 1.96 * e_rmse), color=t["band"], lw=0,
+                            zorder=0, label="emulator held-out error (95%)")
+        a1.plot([0, m], [0, m], color=t["ink2"], lw=0.8, zorder=2)
+        a1.scatter(x, y, s=12, color=t["cat"][0], edgecolors=t["surface"], linewidths=0.5, zorder=3)
+        a1.set_xlim(0, m)
+        a1.set_ylim(0, m)
+        FS.set_axis_format(a1, "x", "percent")
+        FS.set_axis_format(a1, "y", "percent")
+        metric = R.labels.metric(cs.get("metric", "metric"))
+        a1.set_xlabel(f"target {metric}", fontsize=8)
+        a1.set_ylabel("model at the fitted attribute", fontsize=8)
+        if e_rmse:
+            a1.legend(loc="upper left", fontsize=7)
+        # right: targets by region with the region-level target interval (common-mode error on the logit scale)
+        for yv, r in enumerate(regs[::-1]):
+            v = np.array([tgt[i] for i in R.ids if R.region(i) == r])
+            if sd > 0 and len(v):
+                c = float(np.mean(lg(np.clip(v, 1e-6, 1 - 1e-6))))
+                a2.plot([il(c - 1.96 * sd), il(c + 1.96 * sd)], [yv, yv], color=t["cat"][1], lw=5, alpha=0.35,
+                        solid_capstyle="round", zorder=1)
+            a2.scatter(v, [yv] * len(v), s=10, color=t["cat"][0], edgecolors=t["surface"], linewidths=0.4, zorder=3)
+        a2.set_yticks(range(len(regs)))
+        a2.set_yticklabels(regs[::-1], fontsize=7.5)
+        a2.set_xlim(0, m)
+        FS.set_axis_format(a2, "x", "percent")
+        a2.set_xlabel(f"target {metric} per unit; bar: {RT.lower()} interval (95%)" if sd > 0 else
+                      f"target {metric} per unit", fontsize=8)
+        res = {i: (float(lg(np.clip(modelled[i], 1e-9, 1 - 1e-9)) - lg(np.clip(tgt[i], 1e-9, 1 - 1e-9)))
+                   if have_mod else None) for i in R.ids}
+        worst = max(abs(v) for v in res.values()) if have_mod else resid_max
+        for i in R.ids:
+            rows.append({"unit": i, "region": R.region(i), "target": tgt[i], "modelled": modelled[i],
+                         "residual_logit": res[i]})
+        title = f"Inversion reproduces all {len(R.ids)} targets exactly; the uncertainty is in the targets"
+        cap = (f"Left: target against model, 1:1 line"
+               + (f"; band: emulator held-out error ({FS.fmt(e_rmse)} logit RMSE)" if e_rmse else "")
+               + f". Right: targets by {RT.lower()}" + (f", bar: {RT.lower()} target interval (sd {FS.fmt(sd)} "
+                                                       f"logit)" if sd > 0 else "")
+               + f". All residuals within {worst:.1g} logit.")
+    else:
+        fit = (cal.get("diagnostics") or {}).get("fit") or []
+        if not fit:
+            raise Missing(f"calibration method {method} recorded no fit rows")
+        x = np.array([float(r["observed"]) for r in fit])
+        y = np.array([float(r["expected"]) for r in fit])
+        a1.scatter(x, y, s=12, color=t["cat"][0], edgecolors=t["surface"], linewidths=0.5, zorder=3)
+        m = float(max(x.max(), y.max())) * 1.05
+        a1.plot([0, m], [0, m], color=t["ink2"], lw=0.8)
+        FS.set_axis_format(a1, "x")
+        FS.set_axis_format(a1, "y")
+        a1.set_xlabel("observed", fontsize=8)
+        a1.set_ylabel("model expected", fontsize=8)
+        pr = []
+        for yv, r in enumerate(regs[::-1]):
+            v = [(float(f["expected"]) - float(f["observed"])) / math.sqrt(max(float(f["expected"]), 1e-9))
+                 for f in fit if str(f.get("unit")) in R.by_id and R.region(str(f["unit"])) == r]
+            pr += v
+            a2.scatter(v, [yv] * len(v), s=10, color=t["cat"][0], zorder=3)
+        a2.axvline(0, color=t["ink2"], lw=0.8)
+        a2.axvspan(-2, 2, color=t["band"], lw=0, zorder=0)
+        a2.set_yticks(range(len(regs)))
+        a2.set_yticklabels(regs[::-1], fontsize=7.5)
+        FS.set_axis_format(a2, "x", "signed")
+        a2.set_xlabel("Pearson residual (band: ±2)", fontsize=8)
+        rows = [dict(r) for r in fit]
+        out2 = sum(abs(v) > 2 for v in pr)
+        title = f"{len(fit)} calibration targets; {out2} Pearson residuals beyond ±2"
+        cap = (f"Calibration ({method}): observed against model expected, 1:1 line; right, Pearson residuals by "
+               f"{RT.lower()}.")
+    return fig, title, cap, rows, "calibration fit"
 
 
 def fig_frontier(R, t):
-    raise NotImplementedError("figures β")
+    fd = R.art("figure_data")
+    fr = fd["frontier"]
+    pts = fr["points"]
+    if len(pts) < 2:
+        raise Missing("the frontier has fewer than two envelopes")
+    pt = R.art("point")
+    olab = R.labels.outcome(R.primary)
+    fig = _fig(t, 7.2, 4.2)
+    h = fig.get_figheight()
+    ax = fig.add_axes([0.1, 0.55 / h, 0.86, _top(fig, 0.6) - 0.55 / h])
+    FS.style(ax, t, grid="both")
+    fixed = float(fr.get("fixed_costs_usd") or 0.0)
+    xs = [fixed] + [p["envelope_usd"] for p in pts]
+    ys = [0.0] + [p["objective"] for p in pts]
+    ax.plot(xs, ys, color=t["cat"][0], lw=2, zorder=2)
+    ax.scatter(xs[1:], ys[1:], s=22, color=t["cat"][0], edgecolors=t["surface"], linewidths=1.2, zorder=3)
+    env = fr["envelope_usd"]
+    ax.axvline(env, color=t["muted"], lw=0.9, zorder=1)
+    ax.text(env, 1.0, " declared envelope", transform=ax.get_xaxis_transform(), va="top", fontsize=7.5,
+            color=t["ink2"])
+    if fixed:
+        ax.axvspan(0, fixed, color=t["band"], lw=0, zorder=0)
+        ax.text(fixed / 2, 0.03, f"fixed\n{FS.fmt(fixed, 'money')}", transform=ax.get_xaxis_transform(),
+                ha="center", fontsize=7, color=t["ink2"])
+    obj = float(pt["solver"]["objective"])
+    ax.scatter([env], [obj], s=70, color=t["cat"][1], edgecolors=t["surface"], linewidths=1.8, zorder=4)
+    ax.annotate(f"plan: {FS.fmt(obj)} {olab}", (env, obj), xytext=(8, -16), textcoords="offset points",
+                fontsize=8, color=t["ink"])
+    ax.set_xlim(0, max(xs) * 1.04)
+    ax.set_ylim(0, max(ys) * 1.1)
+    FS.set_axis_format(ax, "x", "money")
+    FS.set_axis_format(ax, "y")
+    ax.set_xlabel("envelope (fixed costs included)", fontsize=8)
+    ax.set_ylabel(f"{olab} averted", fontsize=8)
+    mg = fr.get("marginal") or {}
+    avg = pt["cost_allocated"] / max(float(pt["averted"][R.primary]), 1e-12)
+    if mg.get("usd_per_outcome"):
+        title = (f"At the envelope, the next {_sing(olab)} averted costs {FS.fmt(mg['usd_per_outcome'], 'money')} "
+                 f"(average {FS.fmt(avg, 'money')}, fixed costs excluded)")
+    else:
+        title = f"{olab} averted rises from {FS.fmt(ys[1])} to {FS.fmt(ys[-1])} across the envelopes tested"
+    cap = (f"The plan re-solved by the run's own solver and emulator at {min(p['fraction'] for p in pts):.0%}–"
+           f"{max(p['fraction'] for p in pts):.0%} of the declared envelope, fixed costs held. Marginal cost: "
+           f"central difference over 90–110% of the envelope.")
+    rows = [{"fraction": p["fraction"], "envelope_usd": p["envelope_usd"], "objective": p["objective"],
+             "cost": p["cost"], **{f"units_{k}": v for k, v in (p.get("packages") or {}).items()}} for p in pts]
+    if mg:
+        rows.append({"marginal_usd_per_outcome": mg.get("usd_per_outcome"), "average_usd_per_outcome": avg})
+    return fig, title, cap, rows, "efficiency frontier: outcome averted against budget"
 
 
 def fig_dollars(R, t):
-    raise NotImplementedError("figures β")
+    dl = R.art("figure_data")["dollars"]
+    col = _comp_colors(R, t)
+    comps = [c for c in col if dl["by_component"].get(c, 0) > 0]
+    fixed = sum(dl["fixed_costs_usd"].values())
+    env = dl["envelope_usd"]
+    tot = dl["allocated_usd"]
+    regs = sorted(dl["by_region"], key=lambda r: -sum(dl["by_region"][r].values()))
+    RT = R.labels.region_title()
+    ncol = len(comps) + 1
+    fig = _fig(t, 7.9, 0.26 * len(regs) + 3.1)
+    h = fig.get_figheight()
+    top = _top(fig, 0.45)
+    a1 = fig.add_axes([0.17, top - 0.42 / h, 0.8, 0.38 / h])
+    FS.style(a1, t, grid="x")
+    left = 0.0
+    if fixed:
+        a1.barh(0, fixed, left=0, height=0.8, color=t["neutral"], edgecolor=t["surface"], linewidth=2)
+        a1.text(fixed / 2, 0, f"fixed {FS.fmt(fixed, 'money')}", ha="center", va="center", fontsize=7,
+                color=t["ink"])
+        left = fixed
+    for c in comps:
+        v = dl["by_component"][c]
+        a1.barh(0, v, left=left, height=0.8, color=col[c], edgecolor=t["surface"], linewidth=2)
+        left += v
+    a1.axvline(env, color=t["ink"], lw=1.2)
+    a1.text(env, 0.75, f"envelope {FS.fmt(env, 'money')} ", ha="right", va="bottom", fontsize=7.5, color=t["ink"],
+            transform=a1.get_xaxis_transform())
+    a1.set_yticks([0])
+    a1.set_yticklabels(["whole plan"], fontsize=8)
+    a1.set_ylim(-0.5, 1.4)
+    a1.set_xlim(0, max(env, left) * 1.01)
+    FS.set_axis_format(a1, "x", "money")
+    import matplotlib.patches as mp
+    fig.legend(handles=[mp.Patch(color=col[c], label=f"{R.labels.component(c)} {FS.fmt(dl['by_component'][c], 'money')}")
+                        for c in comps], loc="upper left", bbox_to_anchor=(0.17, top - 0.72 / h),
+               ncol=min(3, len(comps)), fontsize=7.5)
+    # region x component: a table of bars, one column per component, the same x scale in every column
+    gs = fig.add_gridspec(1, ncol, left=0.17, right=0.97, top=top - 1.75 / h, bottom=0.35 / h, wspace=0.12)
+    vmax = max(max(dl["by_region"][r].get(c, 0.0) for r in regs) for c in comps)
+    rows = []
+    for k, c in enumerate(comps + ["__total"]):
+        ax = fig.add_subplot(gs[0, k])
+        FS.style(ax, t, grid="x")
+        if c == "__total":
+            vals = [sum(dl["by_region"][r].values()) for r in regs]
+            ax.barh(range(len(regs))[::-1], vals, height=0.62, color=t["ink2"])
+            ax.set_xlim(0, max(vals) * 1.15)
+            ax.set_title("all components", fontsize=8, loc="left", color=t["ink"])
+        else:
+            vals = [dl["by_region"][r].get(c, 0.0) for r in regs]
+            ax.barh(range(len(regs))[::-1], vals, height=0.62, color=col[c])
+            ax.set_xlim(0, vmax * 1.1)
+            ax.set_title(textwrap.fill(R.labels.component(c), 16), fontsize=8, loc="left", color=t["ink"])
+        ax.set_yticks(range(len(regs)))
+        ax.set_yticklabels(regs[::-1] if k == 0 else [], fontsize=7.5)
+        ax.set_ylim(-0.6, len(regs) - 0.4)
+        FS.set_axis_format(ax, "x", "money")
+        ax.locator_params(axis="x", nbins=2)
+        ax.tick_params(labelsize=6.5)
+    title = (f"The plan uses {FS.fmt((tot + fixed) / env, 'percent')} of the {FS.fmt(env, 'money')} envelope; "
+             f"{R.labels.component(max(comps, key=lambda c: dl['by_component'][c]))} take "
+             f"{FS.fmt(max(dl['by_component'][c] for c in comps) / tot, 'percent')} of allocated dollars")
+    cap = (f"Top: the envelope split into fixed costs and the plan's dollars by component. Bottom: allocated dollars by "
+           f"{RT.lower()} and component (same scale per component column; fixed costs not split by {RT.lower()}).")
+    rows = [{"region": r, **{c: dl["by_region"][r].get(c, 0.0) for c in R.components}} for r in regs] + \
+        [{"region": "ALL", **dl["by_component"], "fixed": fixed, "envelope": env}]
+    return fig, title, cap, rows, "dollars by component and region against the envelope"
 
 
 def fig_cost_per_outcome(R, t):
-    raise NotImplementedError("figures β")
+    fd = R.art("figure_data")
+    bp = {k: v for k, v in fd["by_package"].items() if k != R.comparator and v.get("usd_per_outcome")}
+    if not bp:
+        raise Missing("no package in the plan averts any outcome")
+    olab = R.labels.outcome(R.primary)
+    U = R.labels.unit_title()
+    order = sorted(bp, key=lambda k: bp[k]["usd_per_outcome"])
+    inc = {c: v for c, v in (fd.get("component_increment") or {}).items() if v.get("outcome_per_usd")}
+    npk, nin = len(order), len(inc)
+    fig = _fig(t, 7.6, 0.3 * (npk + nin) + 2.2)
+    h = fig.get_figheight()
+    top = _top(fig, 0.6)
+    avail = top - 0.55 / h - 0.75 / h
+    h1 = avail * (npk + 0.6) / (npk + nin + 1.2)
+    a1 = fig.add_axes([0.38, top - 0.25 / h - h1, 0.5, h1])
+    FS.style(a1, t, grid="x")
+    vals = []
+    have_ci = False
+    for y, k in enumerate(order[::-1]):
+        v = bp[k]
+        ci = v.get("usd_per_outcome_interval")
+        if ci:
+            have_ci = True
+            a1.plot([ci["ci_low"], ci["ci_high"]], [y, y], color=t["cat"][0], lw=2, solid_capstyle="round", zorder=2)
+            vals += [ci["ci_low"], ci["ci_high"]]
+        a1.scatter([v["usd_per_outcome"]], [y], s=34, color=t["cat"][0], edgecolors=t["surface"], linewidths=1.2,
+                   zorder=3)
+        vals.append(v["usd_per_outcome"])
+        a1.text(1.02, y, f"{v['units']}", transform=a1.get_yaxis_transform(), va="center", fontsize=7.5,
+                color=t["ink2"])
+    a1.text(1.02, npk - 0.3, U, transform=a1.get_yaxis_transform(), fontsize=7.5, color=t["ink2"])
+    a1.set_yticks(range(npk))
+    a1.set_yticklabels([R.labels.package(R.pk[k]) for k in order[::-1]], fontsize=7.5)
+    a1.set_xlim(0, max(vals) * 1.08)
+    a1.set_ylim(-0.6, npk - 0.4)
+    FS.set_axis_format(a1, "x", "money")
+    a1.set_title(f"$ per {_sing(olab)} averted, by package" + (" (line: 95% UI)" if have_ci else ""), fontsize=8.5,
+                 loc="left", color=t["ink"])
+    if inc:
+        h2 = avail - h1 - 0.5 / h
+        a2 = fig.add_axes([0.38, 0.55 / h, 0.5, h2])
+        FS.style(a2, t, grid="x")
+        cs = sorted(inc, key=lambda c: inc[c]["outcome_per_usd"])
+        usd = [1.0 / inc[c]["outcome_per_usd"] for c in cs]
+        a2.scatter(usd, range(len(cs))[::-1], s=34, color=t["cat"][0], edgecolors=t["surface"], linewidths=1.2)
+        for y, c in zip(range(len(cs))[::-1], cs):
+            a2.text(1.02, y, f"{inc[c]['units']}", transform=a2.get_yaxis_transform(), va="center", fontsize=7.5,
+                    color=t["ink2"])
+        a2.text(1.02, len(cs) - 0.3, U, transform=a2.get_yaxis_transform(), fontsize=7.5, color=t["ink2"])
+        a2.set_yticks(range(len(cs))[::-1])
+        a2.set_yticklabels([R.labels.component(c) for c in cs], fontsize=7.5)
+        a2.set_xlim(0, max(vals + usd) * 1.08)
+        a2.set_ylim(-0.6, len(cs) - 0.4)
+        FS.set_axis_format(a2, "x", "money")
+        a2.set_title(f"$ per {_sing(olab)} averted by adding each component (point estimate)", fontsize=8.5,
+                     loc="left", color=t["ink"])
+    lo, hi = order[0], order[-1]
+    title = (f"Cost per {_sing(olab)} averted: {FS.fmt(bp[lo]['usd_per_outcome'], 'money')} to "
+             f"{FS.fmt(bp[hi]['usd_per_outcome'], 'money')} across the plan's {npk} packages")
+    rep = fd.get("replay") or {}
+    cap = (f"Top: each package's cost over its {olab} averted in the {U} that get it, with the interval over the "
+           f"uncertainty draws{'' if rep.get('reproduced') else ' (withheld: the replay did not reproduce)'}. "
+           f"Bottom: each component against the same package without it, in the {U} that get it.")
+    rows = [{"package": k, "label": R.labels.package(R.pk[k]), **{x: bp[k].get(x) for x in
+            ("units", "cost", "averted", "usd_per_outcome")},
+             "ci_low": (bp[k].get("usd_per_outcome_interval") or {}).get("ci_low"),
+             "ci_high": (bp[k].get("usd_per_outcome_interval") or {}).get("ci_high")} for k in order] + \
+        [{"component": c, "label": R.labels.component(c), "usd_per_outcome_added": 1.0 / v["outcome_per_usd"],
+          "units": v["units"], "units_without_counterpart": v.get("units_without_counterpart")} for c, v in inc.items()]
+    return fig, title, cap, rows, "cost per outcome averted by package and by component"
 
 
 def _threshold(dts) -> float:
-    raise NotImplementedError("figures β")
+    for x in dts or []:
+        if x.get("threshold_pct") is not None:
+            return float(x["threshold_pct"]) / 100.0
+    import yaml
+    return float(yaml.safe_load(open(os.path.join(ROOT, "toolkit", "analysis", "thresholds.yaml")))
+                 ["decision_tests"]["share_threshold"])
 
 
 def fig_sensitivity(R, t):
-    raise NotImplementedError("figures β")
+    se = R.art("sensitivity")
+    rows_in = [r for r in se.get("rows") or [] if r.get("low") and r.get("high")]
+    if not rows_in:
+        raise Missing("the sensitivity artifact has no rows")
+    base = float(se["objective_point"])
+    dts = (R.opt("decision_tests") or {}).get("tests") or []
+    by_test = {x["test_id"]: x for x in dts}
+    thr = _threshold(dts)
+    out = []
+    for r in rows_in:
+        lo, hi = r["low"]["point_plan_objective"] - base, r["high"]["point_plan_objective"] - base
+        tst = by_test.get(f"prior_range_{r['name']}")
+        share = max(float(r["low"].get("share_units_changed") or 0), float(r["high"].get("share_units_changed") or 0))
+        changes = (tst["verdict"] == "CHANGES_PLAN") if tst and tst.get("verdict") in ("CHANGES_PLAN", "NO_CHANGE") \
+            else share > thr
+        out.append({"name": r["name"], "label": R.labels.parameter(r["name"]), "units": R.labels.parameter_units(r["name"]),
+                    "point": r.get("point"), "low": r["low"]["value"], "high": r["high"]["value"], "d_low": lo,
+                    "d_high": hi, "changes_plan": bool(changes), "share_units_changed": share,
+                    "basis": r.get("basis"), "by": "decision test " + tst["test_id"] if tst else "share of units"})
+    out.sort(key=lambda x: -max(abs(x["d_low"]), abs(x["d_high"])))
+    out = out[:14]
+    fig = _fig(t, 7.8, 0.46 * len(out) + 1.45)
+    h = fig.get_figheight()
+    ax = fig.add_axes([0.33, 0.85 / h, 0.45, _top(fig, 0.55) - 0.85 / h])
+    FS.style(ax, t, grid="x")
+    for y, r in enumerate(out[::-1]):
+        ax.barh(y + 0.17, r["d_low"], height=0.3, color=t["cat"][0], zorder=2)
+        ax.barh(y - 0.17, r["d_high"], height=0.3, color=t["cat"][1], zorder=2)
+        if r["changes_plan"]:
+            ax.scatter([1.04], [y], marker="D", s=24, color=t["ink"], transform=ax.get_yaxis_transform(),
+                       clip_on=False, zorder=4)
+            ax.text(1.075, y, f"changes the plan\n({FS.fmt(r['share_units_changed'], 'percent')} of "
+                              f"{R.labels.unit_title()})",
+                    transform=ax.get_yaxis_transform(), va="center", fontsize=7, color=t["ink"], linespacing=1.1)
+    ax.axvline(0, color=t["ink2"], lw=0.9, zorder=3)
+    labels = []
+    for r in out[::-1]:
+        u = f" {r['units']}" if r["units"] else ""
+        labels.append(f"{r['label']}\n{FS.fmt(r['low'])}–{FS.fmt(r['high'])}{u} (base {FS.fmt(r['point'])})")
+    ax.set_yticks(range(len(out)))
+    ax.set_yticklabels(labels, fontsize=7.5)
+    m = max(max(abs(r["d_low"]), abs(r["d_high"])) for r in out) * 1.12
+    ax.set_xlim(-m, m)
+    FS.set_axis_format(ax, "x", "signed")
+    olab = R.labels.outcome(se.get("outcome") or R.primary)
+    ax.set_xlabel(f"change in the plan's {olab} averted", fontsize=8)
+    import matplotlib.patches as mp
+    fig.legend(handles=[mp.Patch(color=t["cat"][0], label="low end of the range"),
+                        mp.Patch(color=t["cat"][1], label="high end of the range")],
+               loc="lower left", bbox_to_anchor=(0.33, 0.0), ncol=2, fontsize=7.5)
+    k = sum(r["changes_plan"] for r in out)
+    title = f"{k} of {len(out)} tested ranges change the plan; {out[0]['label']} moves {olab} averted most"
+    if len(title) > TITLE_MAX:
+        title = f"{k} of {len(out)} tested ranges change the plan"
+    cap = (f"One at a time, each parameter at the ends of its tested range; change in the point plan's objective "
+           f"(base {FS.fmt(base)}). Diamond: the re-optimised plan moves more than {FS.fmt(thr, 'percent')} of units "
+           f"(per its prior-range decision test where one exists).")
+    return fig, title, cap, out, "one-at-a-time sensitivity with plan changes marked"
 
 
 def fig_timeline(R, t):
-    raise NotImplementedError("figures β")
+    fd = R.art("figure_data")
+    sch = fd.get("schedule") or {}
+    if sch.get("status") != "ok":
+        raise Missing(f"needs the engine's schedule hook: {sch.get('reason', 'no schedule recorded')}")
+    regs = sorted(sch["regions"])
+    comps = sorted({e["component"] for r in regs for e in sch["regions"][r]["events"]})
+    nc = max(len(comps), 1)
+    fig = _fig(t, 7.8, 0.22 * len(regs) * nc + 1.7)
+    h = fig.get_figheight()
+    ax = fig.add_axes([0.24, 0.75 / h, 0.66, _top(fig, 0.8) - 0.75 / h])
+    FS.style(ax, t, grid="x")
+    d0, d1 = sch["delivery"]
+    w0, w1 = sch["window"]
+    ax.axvspan(d0, d1, color=t["band"], lw=0, zorder=0)
+    ax.text((d0 + d1) / 2, 0.005, "delivery period", transform=ax.get_xaxis_transform(), ha="center",
+            va="bottom", fontsize=7, color=t["ink2"])
+    ax.annotate("", (w0, 1.035), (w1, 1.035), xycoords=("data", "axes fraction"),
+                arrowprops={"arrowstyle": "|-|", "color": t["ink2"], "lw": 0.9, "shrinkA": 0, "shrinkB": 0})
+    ax.text(w1, 1.035, " outcome window", transform=ax.get_xaxis_transform(), va="center", fontsize=7,
+            color=t["ink2"])
+    rows, ylabels = [], []
+    kinds = {"history": dict(facecolors="none", edgecolors=t["ink2"]),
+             "decision": dict(facecolors=t["cat"][0], edgecolors=t["cat"][0]),
+             "routine": dict(facecolors="none", edgecolors=t["cat"][1])}
+    y = 0
+    for r in regs[::-1]:
+        reg = sch["regions"][r]
+        for c in comps[::-1]:
+            for e in [e for e in reg["events"] if e["component"] == c]:
+                frac = e["units"] / max(reg["units"], 1)
+                if e.get("t1") is not None:
+                    ax.plot([e["t0"], e["t1"]], [y, y], color=kinds[e["kind"]]["edgecolors"], lw=3,
+                            alpha=0.3 + 0.7 * frac, solid_capstyle="butt")
+                else:
+                    ax.scatter([e["t0"]], [y], marker="o", s=14 + 30 * frac, linewidths=1.1, zorder=3,
+                               **kinds[e["kind"]])
+                rows.append({"region": r, **e, "region_units": reg["units"]})
+            ylabels.append(f"{r}: {R.labels.readable(c)}" if c == comps[0] else R.labels.readable(c))
+            y += 1
+        ax.axhline(y - 0.5, color=t["grid"], lw=0.8)
+    ax.set_yticks(range(y))
+    ax.set_yticklabels(ylabels, fontsize=7)
+    ax.set_ylim(-0.6, y - 0.4)
+    ax.set_xlim(sch["start"] - 0.3, w1 + 0.3)
+    from matplotlib.ticker import FuncFormatter, MultipleLocator
+    ax.xaxis.set_major_locator(MultipleLocator(1))
+    ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _p: f"{v:.0f}"))
+    from matplotlib.lines import Line2D
+    hs = [Line2D([0], [0], marker="o", ls="", markerfacecolor="none", markeredgecolor=t["ink2"],
+                 label="before delivery (every arm)"),
+          Line2D([0], [0], marker="o", ls="", color=t["cat"][0], label="funded by the decision"),
+          Line2D([0], [0], marker="o", ls="", markerfacecolor="none", markeredgecolor=t["cat"][1],
+                 label="routine, not funded")]
+    fig.legend(handles=hs, loc="lower left", bbox_to_anchor=(0.24, 0.0), ncol=3, fontsize=7.5)
+    title = f"The decision delivers in {d0:g}–{d1:g}; outcomes are counted over {w0:g}–{w1:g}"
+    cap = ("What is delivered when, per region and engine component, from the engine's own schedule; marker size "
+           "and line opacity grow with the share of the region's units reached (counts in the table view).")
+    return fig, title, cap, rows, "delivery timeline by region"
 
 
 def fig_trajectories(R, t):
-    raise NotImplementedError("figures β")
+    tr = R.opt("trajectories")
+    if not tr or tr.get("status") != "ok":
+        raise Missing("needs trajectory runs (python -m toolkit.analysis.trajectories run <run_dir>)"
+                      + (f": {tr.get('reason')}" if tr and tr.get("reason") else ""))
+    ser = tr["series"]
+    metrics = tr["metrics"]
+    panels = ["total"] + sorted(ser.get("regions") or {})
+    ncol = 4
+    nrow = math.ceil(len(panels) / ncol)
+    fig = _fig(t, 8.0, 1.55 * nrow * len(metrics) + 1.0)
+    gs = fig.add_gridspec(nrow * len(metrics), ncol, left=0.07, right=0.99, top=1 - 0.75 / fig.get_figheight(),
+                          bottom=0.06, hspace=0.75, wspace=0.28)
+    d0, d1 = tr["delivery"]
+    rows = []
+    for mi, m in enumerate(metrics):
+        meta = tr["metric_info"].get(m, {})
+        for n, p in enumerate(panels):
+            s = ser["total"] if p == "total" else ser["regions"][p]
+            ax = fig.add_subplot(gs[mi * nrow + n // ncol, n % ncol])
+            FS.style(ax, t, grid="y")
+            ax.axvspan(d0, d1, color=t["band"], lw=0, zorder=0)
+            ax.plot(s["t"], s["arms"]["comparator"][m], color=t["muted"], lw=1.4, label="comparator")
+            ax.plot(s["t"], s["arms"]["plan"][m], color=t["cat"][0], lw=1.6, label="plan")
+            tg = (s.get("target") or {}) if m == tr.get("calibration_metric") else {}
+            if tg.get("value") is not None:
+                ax.errorbar([tg["t"]], [tg["value"]], yerr=[[tg["value"] - tg["lo"]], [tg["hi"] - tg["value"]]],
+                            fmt="o", color=t["ink"], ms=3.5, lw=1, capsize=0, zorder=4)
+            ax.set_title(("All sampled units" if p == "total" else p) + (f": {meta.get('label', m)}" if n == 0 else ""),
+                         fontsize=7.5, loc="left", color=t["ink"])
+            FS.set_axis_format(ax, "y", "percent" if meta.get("units") == "share" else "number")
+            ax.set_ylim(0, None)
+            ax.tick_params(labelsize=6.5)
+            for k in range(len(s["t"])):
+                rows.append({"metric": m, "panel": p, "t": s["t"][k], "comparator": s["arms"]["comparator"][m][k],
+                             "plan": s["arms"]["plan"][m][k]})
+    from matplotlib.lines import Line2D
+    fig.legend(handles=[Line2D([0], [0], color=t["muted"], lw=1.4, label="comparator"),
+                        Line2D([0], [0], color=t["cat"][0], lw=1.6, label="plan"),
+                        Line2D([0], [0], marker="o", ls="", color=t["ink"], label="target (interval)")],
+               loc="upper right", bbox_to_anchor=(0.99, 1 - 0.2 / fig.get_figheight()), ncol=3, fontsize=7.5)
+    title = (f"Modelled {' and '.join(tr['metric_info'].get(m, {}).get('label', m) for m in metrics)} over time: "
+             f"comparator and plan")
+    cap = (f"Population-weighted means over {len(tr['sample'])} sampled units ({tr.get('per_region')} per region, "
+           f"{tr.get('seeds')} seeds); shaded: delivery period {d0:g}–{d1:g}.")
+    return fig, title, cap, rows, "modelled trajectories by region"
 
 
 FUNCS = {"headline": fig_headline, "allocation_map": fig_allocation, "stability_map": fig_stability,
@@ -200,11 +945,32 @@ FUNCS = {"headline": fig_headline, "allocation_map": fig_allocation, "stability_
 
 # --------------------------------------------------------------------------- rendering
 def _offset_free(fig) -> bool:
-    raise NotImplementedError("figures β")
+    fig.canvas.draw()
+    return all(not a.xaxis.get_offset_text().get_text() and not a.yaxis.get_offset_text().get_text()
+               for a in fig.axes)
 
 
 def _save(fig, out_dir, name, run_dir, sources, harness: bool, t) -> dict:
-    raise NotImplementedError("figures β")
+    import matplotlib.pyplot as plt
+    os.makedirs(out_dir, exist_ok=True)
+    png = os.path.join(out_dir, f"{name}.png")
+    svg = os.path.join(out_dir, f"{name}.svg")
+    fig.savefig(png, dpi=FS.DPI, facecolor=t["surface"])
+    fig.savefig(svg, facecolor=t["surface"])
+    plt.close(fig)
+    fv = _fv()
+    fv.validate_figure(png, source_data_paths=[os.path.join(run_dir, s) for s in sources])
+    sp = png + ".provenance.json"
+    with open(sp) as f:
+        sc = json.load(f)
+    sc.update(produced_by="harness" if harness else "harness_rerender", producer=PRODUCER,
+              paths_relative_to="run_dir", png_path=os.path.relpath(png, run_dir) if harness else png,
+              source_hashes={os.path.relpath(p, run_dir): h for p, h in (sc.get("source_hashes") or {}).items()})
+    if not harness:
+        sc["run_dir"] = run_dir
+    with open(sp, "w") as f:
+        json.dump(sc, f, indent=2, sort_keys=True)
+    return {"png": png, "svg": svg}
 
 
 def render(run_dir: str, out_dir: str | None = None, labels_overlay: dict | None = None,
@@ -213,12 +979,51 @@ def render(run_dir: str, out_dir: str | None = None, labels_overlay: dict | None
     """Draw every figure that has its inputs. Returns {"figures": [entry], "not_produced": [{figure, reason}]}; with
     `out_dir` (offline) also writes <out_dir>/figures.yaml. Entries: path (run-relative in the harness), svg, table,
     title, caption, shows, sources, offset_free."""
-    raise NotImplementedError("figures β")
+    run_dir = os.path.abspath(run_dir)
+    harness = out_dir is None
+    dest = os.path.join(run_dir, "figures") if harness else os.path.abspath(out_dir)
+    if not harness and os.path.commonpath([os.path.realpath(dest), os.path.realpath(run_dir)]) == \
+            os.path.realpath(run_dir):
+        raise ValueError("--out must be outside the run dir (the run's artifacts are not modified)")
+    t = FS.setup(theme)
+    figs, notp = [], []
+    try:
+        R = RunData(run_dir, labels_overlay, figure_data, trajectories)
+    except Missing as e:
+        return {"figures": [], "not_produced": [{"figure": n, "reason": str(e)} for n in ORDER]}
+    for name in only or ORDER:
+        R.used = []
+        try:
+            fig, title, cap, rows, shows = FUNCS[name](R, t)
+        except Missing as e:
+            notp.append({"figure": name, "reason": str(e)})
+            continue
+        if len(title) > TITLE_MAX:
+            title = title[:TITLE_MAX - 1].rsplit(" ", 1)[0] + "…"
+        FS.title(fig, title, t)
+        clean = _offset_free(fig)
+        sources = list(R.used) + (["decision_spec.yaml", os.path.relpath(os.path.join(run_dir, R.spec["decision_units"]["csv"]), run_dir)])
+        sources = [s for s in sources if os.path.exists(os.path.join(run_dir, s))]
+        files = _save(fig, dest, name, run_dir, sources, harness, t)
+        table = os.path.join(dest, f"{name}.csv")
+        _write_csv(table, rows)
+        cap = cap if len(cap) <= CAPTION_MAX else cap[:CAPTION_MAX - 1].rsplit(" ", 1)[0] + "…"
+        rel = (lambda p: os.path.relpath(p, run_dir)) if harness else (lambda p: p)
+        figs.append({"figure": name, "path": rel(files["png"]), "svg": rel(files["svg"]), "table": rel(table),
+                     "title": title, "caption": cap, "shows": shows, "sources": sources, "offset_free": clean,
+                     "theme": theme})
+    res = {"figures": figs, "not_produced": notp}
+    if not harness or write_index:
+        import yaml
+        with open(os.path.join(dest, "figures.yaml"), "w") as f:
+            yaml.safe_dump({"run_dir": run_dir, "producer": PRODUCER, **res}, f, sort_keys=False, width=120)
+    return res
 
 
 # --------------------------------------------------------------------------- comparison
 def _run_name(d):
-    raise NotImplementedError("figures β")
+    b = os.path.basename(os.path.normpath(d))
+    return os.path.basename(os.path.dirname(os.path.normpath(d))) if b[:4].isdigit() else b
 
 
 def compare(run_dirs: list[str], out_dir: str, names: list[str] | None = None, labels_overlay: dict | None = None,
@@ -226,12 +1031,146 @@ def compare(run_dirs: list[str], out_dir: str, names: list[str] | None = None, l
     """The headline with its interval, and the component and package counts, side by side across runs of one project
     (same units, components and objective outcome; anything else is refused). Spec differences that bear on the
     headline are named in the caption."""
-    raise NotImplementedError("figures β")
+    if len(run_dirs) < 2:
+        raise ValueError("compare needs at least two run dirs")
+    if len(run_dirs) > FS.MAX_CATEGORIES:
+        raise ValueError(f"compare takes at most {FS.MAX_CATEGORIES} runs")
+    t = FS.setup(theme)
+    Rs = [RunData(d, labels_overlay) for d in run_dirs]
+    names = names or [_run_name(d) for d in run_dirs]
+    if len(names) != len(Rs):
+        raise ValueError("give one name per run")
+    r0 = Rs[0]
+    for R in Rs[1:]:
+        if set(R.ids) != set(r0.ids) or R.primary != r0.primary or R.components != r0.components:
+            raise ValueError(f"{R.dir}: not the same project (units, components or objective outcome differ)")
+    pts = [R.art("point") for R in Rs]
+    uqs = [R.art("uncertainty") for R in Rs]
+    diffs = spec_differences(Rs)
+    L = r0.labels
+    olab = L.outcome(r0.primary)
+    U = L.unit_title()
+    comps = [c for c in r0.components if any(p["mix"].get(c, 0) for p in pts)]
+    pkgs = sorted([k for k in r0.pk if any(p["packages"].get(k) for p in pts)],
+                  key=lambda k: -sum(p["packages"].get(k, 0) for p in pts))
+    nr = len(Rs)
+    row_h = 0.16 * nr + 0.12
+    h1, h2, h3 = 0.36 * nr + 0.25, row_h * len(comps), row_h * len(pkgs)
+    H = h1 + h2 + h3 + 0.6 + 3 * 0.5 + 0.35
+    fig = _fig(t, 7.8, H)
+    y = H - 0.6 - 0.3
+    a1 = fig.add_axes([0.36, (y - h1) / H, 0.44, h1 / H])
+    y -= h1 + 0.6
+    a2 = fig.add_axes([0.36, (y - h2) / H, 0.6, h2 / H])
+    y -= h2 + 0.6
+    a3 = fig.add_axes([0.36, (y - h3) / H, 0.6, h3 / H])
+    for a in (a1, a2, a3):
+        FS.style(a, t, grid="x")
+    rows = []
+    for j, (n, p, u) in enumerate(zip(names, pts, uqs)):
+        yy = nr - 1 - j
+        q = u["fixed_plan"][r0.primary]
+        c = t["cat"][j]
+        a1.plot([q["ci_low"], q["ci_high"]], [yy, yy], color=c, lw=2.4, solid_capstyle="round")
+        a1.scatter([p["averted"][r0.primary]], [yy], s=44, color=c, edgecolors=t["surface"], linewidths=1.4, zorder=3)
+        a1.text(1.02, yy, f"{FS.fmt(p['averted'][r0.primary])} ({FS.fmt(q['ci_low'])}–{FS.fmt(q['ci_high'])})",
+                transform=a1.get_yaxis_transform(), va="center", fontsize=7.5)
+        rows.append({"run": n, "point": p["averted"][r0.primary], "ci_low": q["ci_low"], "ci_high": q["ci_high"],
+                     "cost": p["cost_allocated"], "window": json.dumps(Rs[j].spec["objective"]["horizon"]),
+                     **{f"units_{c_}": p["mix"].get(c_, 0) for c_ in comps},
+                     **{f"package_{k}": p["packages"].get(k, 0) for k in pkgs}})
+    a1.set_yticks(range(nr))
+    a1.set_yticklabels(names[::-1], fontsize=8)
+    a1.set_ylim(-0.6, nr - 0.4)
+    FS.set_axis_format(a1, "x")
+    a1.set_title(f"{olab} averted, point and 95% UI", fontsize=8.5, loc="left", color=t["ink"])
+    bh = 0.8 / nr
+    for ax, keys, get, lab in ((a2, comps, lambda p, k: p["mix"].get(k, 0), L.component),
+                               (a3, pkgs, lambda p, k: p["packages"].get(k, 0),
+                                lambda k: textwrap.shorten(L.package(r0.pk[k]), 44, placeholder="…"))):
+        for j, p in enumerate(pts):
+            ys = [len(keys) - 1 - yk + ((nr - 1) / 2 - j) * bh for yk in range(len(keys))]
+            ax.barh(ys, [get(p, k) for k in keys], height=bh * 0.9, color=t["cat"][j], label=names[j])
+        ax.set_yticks(range(len(keys)))
+        ax.set_yticklabels([lab(k) for k in keys][::-1], fontsize=7.5)
+        ax.set_ylim(-0.6, len(keys) - 0.4)
+        FS.set_axis_format(ax, "x", "count")
+    a2.set_title(f"{U} per component", fontsize=8.5, loc="left", color=t["ink"])
+    a3.set_title(f"{U} per package", fontsize=8.5, loc="left", color=t["ink"])
+    a2.legend(loc="lower right", fontsize=7.5)
+    d = [p["averted"][r0.primary] for p in pts]
+    title = (f"{olab} averted: " + " vs ".join(f"{FS.fmt(x)} ({n})" for x, n in zip(d, names)))
+    if diffs:
+        title += f"; specs differ in {diffs[0]}" + (" and more" if len(diffs) > 1 else "")
+    if len(title) > TITLE_MAX:
+        title = title[:TITLE_MAX - 1].rsplit(" ", 1)[0] + "…"
+    FS.title(fig, title, t)
+    os.makedirs(out_dir, exist_ok=True)
+    png, svg = os.path.join(out_dir, "comparison.png"), os.path.join(out_dir, "comparison.svg")
+    clean = _offset_free(fig)
+    fig.savefig(png, dpi=FS.DPI, facecolor=t["surface"])
+    fig.savefig(svg, facecolor=t["surface"])
+    import matplotlib.pyplot as plt
+    plt.close(fig)
+    _write_csv(os.path.join(out_dir, "comparison.csv"), rows)
+    cap = ("Each run's point plan: headline with its 95% UI over that run's declared sources, and its units per "
+           "component and per package." + (f" The specs differ in: {', '.join(diffs)}." if diffs else
+                                            " The specs agree on window, envelope, comparator and sources."))
+    entry = {"figure": "comparison", "path": png, "svg": svg, "table": os.path.join(out_dir, "comparison.csv"),
+             "title": title, "caption": cap, "runs": [os.path.abspath(d) for d in run_dirs], "names": names,
+             "spec_differences": diffs, "offset_free": clean}
+    import yaml
+    with open(os.path.join(out_dir, "figures.yaml"), "w") as f:
+        yaml.safe_dump({"producer": PRODUCER, "figures": [entry], "not_produced": []}, f, sort_keys=False, width=120)
+    return entry
 
 
 # --------------------------------------------------------------------------- CLI
 def main(argv=None) -> int:
-    raise NotImplementedError("figures β")
+    ap = argparse.ArgumentParser(prog="python -m toolkit.analysis.figures")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    r = sub.add_parser("render", help="re-render a run's figures from its saved artifacts into --out")
+    r.add_argument("run_dir")
+    r.add_argument("--out", required=True)
+    r.add_argument("--recompute", action="store_true", help="rebuild figure_data from the stored batch (no engine runs)")
+    r.add_argument("--labels", help="YAML with presentation labels (components, parameters, outcomes, ...)")
+    r.add_argument("--figure-data", help="a figure_data YAML written by an earlier --recompute (its data block)")
+    r.add_argument("--trajectories", help="a trajectories YAML (analysis/trajectories.yaml format)")
+    r.add_argument("--theme", default="light", choices=sorted(FS.THEMES))
+    c = sub.add_parser("compare", help="headline and counts side by side across runs")
+    c.add_argument("run_dirs", nargs="+")
+    c.add_argument("--out", required=True)
+    c.add_argument("--names", help="comma-separated run names")
+    c.add_argument("--labels")
+    c.add_argument("--theme", default="light", choices=sorted(FS.THEMES))
+    a = ap.parse_args(argv)
+    import yaml
+    ov = yaml.safe_load(open(a.labels)) if a.labels else None
+    if ov and "labels" in ov:
+        ov = ov["labels"]
+    if a.cmd == "compare":
+        e = compare(a.run_dirs, a.out, a.names.split(",") if a.names else None, ov, a.theme)
+        print(json.dumps({"comparison": e["path"]}))
+        return 0
+    fd = yaml.safe_load(open(a.figure_data))["data"] if a.figure_data else None
+    tj = yaml.safe_load(open(a.trajectories))["data"] if a.trajectories else None
+    if fd is None and a.recompute and not os.path.exists(os.path.join(a.run_dir, "analysis", "figure_data.yaml")):
+        from toolkit.analysis import figure_data as FD
+        os.makedirs(a.out, exist_ok=True)
+        try:
+            A, plan, out0, ben0, cost0, z0 = FD.rebuild(a.run_dir)
+            uq = yaml.safe_load(open(os.path.join(a.run_dir, "analysis", "uncertainty.yaml")))["data"]
+            from toolkit.analysis.artifacts import plain
+            fd = plain(FD.compute(A, plan, out0, ben0, cost0, uq, z0))
+            with open(os.path.join(a.out, "figure_data.yaml"), "w") as f:
+                yaml.safe_dump({"producer": FD.PRODUCER, "recomputed_from": os.path.abspath(a.run_dir), "data": fd},
+                               f, sort_keys=False, width=120)
+        except FD.RebuildRefused as e:
+            print(f"recompute refused: {e}", file=sys.stderr)
+            fd = None
+    res = render(a.run_dir, a.out, ov, fd, tj, theme=a.theme)
+    print(json.dumps({"produced": [f["figure"] for f in res["figures"]], "not_produced": res["not_produced"]}, indent=1))
+    return 0
 
 
 # --------------------------------------------------------------------------- self-test (synthetic toy run dir)

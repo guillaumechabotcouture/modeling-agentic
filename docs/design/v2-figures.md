@@ -125,7 +125,7 @@ Each figure is produced only when its inputs exist; otherwise a `not_produced` e
 
 | # | File | What it shows | Needs |
 |---|---|---|---|
-| 1 | `allocation_map` | each unit at its coordinates, coloured by package; small multiples per component when there are more than 8 packages; without coordinates, a by-region dot strip (one row per region, one dot per unit) | plan, units |
+| 1 | `allocation_map` | each unit at its coordinates, coloured by package; small multiples per component when there are more than 3 packages (three categorical slots are validated on all pairs); without coordinates, a by-region dot strip (one row per region, one dot per unit) | plan, units |
 | 2 | `stability_map` | the same layout, coloured by the share of draws in which the unit keeps its package | uncertainty report |
 | 3 | `burden_map` | the same layout, coloured by the comparator outcome per person | figure_data |
 | 4 | `calibration_fit` | target (with its interval) against model, a 1:1 line; a by-region residual strip | calibration |
@@ -142,7 +142,29 @@ run from its artifacts into `<dir>` (never into the run dir). `python -m toolkit
 <run_dir> <run_dir> ... --out <dir>` renders the headline with its interval and the component and package
 counts side by side across runs of one project.
 
-## 7. Open questions for the owner
+## 7. As built (β), and what differs from §1-§6
+
+- **Calibration by inversion.** Inversion fits each target exactly, so a residual strip would show only zeros. The
+  figure plots target against model with the emulator's held-out error as a band. Its right panel shows the
+  targets by region with the region-level target interval, and the caption gives the largest residual. For
+  `likelihood` and `posterior`, the right panel is the by-region Pearson residual strip.
+- **Stability.** The figure shows the whole package and each component's yes/no as small multiples. In the
+  re-rendered runs, few units keep their whole package across the draws, but most keep each net or spray
+  decision. Package identity alone would hide that.
+- **Colours.** Components get contiguous categorical slots in spec order, among the components the plan uses, so a
+  stack shows only validated adjacent pairs. Dollars by region are a table of bars, one column per component,
+  rather than stacked bars, because non-adjacent slot pairs fail the dark-mode CVD check.
+- **Offline rebuild.** Runs computed on another platform can rebuild a job whose hash differs from the stored row
+  in the last bit of a derived float. In both re-rendered runs this was one design point (32 rows). Those rows are
+  taken by their index, but only when the run's own analysis verified every row (`batch.yaml` `rejected_rows: 0`,
+  manifest complete). The rebuilt plan must still equal the stored plan, and the draw replay must still reproduce
+  the stored interval. Both held for both runs.
+- **Comparison.** `compare` names the spec differences that bear on the headline (outcome window, delivery period,
+  envelope, comparator, uncertainty sources, engine attributes or version) in the title and caption.
+- **trajectories.yaml** is written by its own step after the analysis. It uses the analysis envelope, and the
+  manifest is not changed.
+
+## 8. Open questions for the owner
 
 1. The malaria engine v0.8 (`schedule`, `run_series`) and its proof: separate PR, run off the laptop.
 2. Whether `presentation.labels` belongs in the signed spec (it changes the spec hash, not the analysis) or in a

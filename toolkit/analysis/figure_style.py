@@ -39,39 +39,95 @@ MAX_SCATTER_CATEGORIES = 3   # the reference palette validates its first three s
 
 
 def theme(name: str = "light") -> dict:
-    raise NotImplementedError("figures β")
+    if name not in THEMES:
+        raise ValueError(f"unknown theme {name!r} (known: {sorted(THEMES)})")
+    return THEMES[name]
 
 
 # --------------------------------------------------------------------------- numbers
 def _compact(v: float, digits: int = 3) -> str:
-    raise NotImplementedError("figures β")
+    a = abs(v)
+    units = ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K"))
+    for n, (div, suf) in enumerate(units):
+        if a >= div:
+            x = v / div
+            if abs(round(x)) >= 1000 and n > 0:          # 999.97K reads as 1M, not 1000K
+                div, suf = units[n - 1]
+                x = v / div
+            dec = max(digits - len(str(int(abs(round(x, 6))))), 0)
+            s = f"{x:.{dec}f}"
+            if "." in s:
+                s = s.rstrip("0").rstrip(".")
+            return s + suf
+    if a >= 100 or v == int(v):
+        return f"{v:,.0f}"
+    if a >= 1:
+        return f"{v:.3g}"
+    return f"{v:.2g}"
 
 
 def fmt(v, kind: str = "number", digits: int = 3) -> str:
     """12.3M / $1.2M / 45% / 1,234 / 0.042. kind: number | money | percent (v a share) | count."""
-    raise NotImplementedError("figures β")
+    if v is None or (isinstance(v, float) and not math.isfinite(v)):
+        return "n/a"
+    v = float(v)
+    if kind == "money":
+        s = _compact(abs(v), digits)
+        return ("-" if v < 0 else "") + "$" + s
+    if kind == "percent":
+        p = 100 * v
+        return f"{p:.0f}%" if abs(p) >= 10 or p == int(p) else f"{p:.1f}%"
+    if kind == "count":
+        return _compact(v, digits) if abs(v) >= 10000 else f"{v:,.0f}"
+    if kind == "signed":
+        return ("+" if v > 0 else "") + _compact(v, digits) if v != 0 else "0"
+    return _compact(v, digits)
 
 
 def set_axis_format(ax, axis: str = "x", kind: str = "number") -> None:
     """A FuncFormatter with `fmt` (no offset, no scientific notation) on one axis."""
-    raise NotImplementedError("figures β")
+    from matplotlib.ticker import FuncFormatter
+    f = FuncFormatter(lambda v, _p: fmt(v, "signed" if kind == "signed" else kind, 3))
+    (ax.xaxis if axis == "x" else ax.yaxis).set_major_formatter(f)
 
 
 def style(ax, t: dict, grid: str = "x") -> None:
-    raise NotImplementedError("figures β")
+    ax.set_facecolor(t["surface"])
+    for s in ("top", "right", "left"):
+        ax.spines[s].set_visible(False)
+    ax.spines["bottom"].set_color(t["axis"])
+    ax.tick_params(colors=t["ink2"], labelsize=8, length=0)
+    if grid:
+        ax.grid(axis=grid, color=t["grid"], lw=0.8)
+        ax.set_axisbelow(True)
 
 
 def setup(theme_name: str = "light") -> dict:
-    raise NotImplementedError("figures β")
+    import matplotlib
+    matplotlib.use("Agg")
+    t = theme(theme_name)
+    matplotlib.rcParams.update({
+        "axes.formatter.useoffset": False, "axes.formatter.use_mathtext": False,
+        "font.family": "sans-serif", "font.sans-serif": ["Helvetica Neue", "Helvetica", "Arial", "DejaVu Sans"],
+        "font.size": 9, "text.color": t["ink"], "axes.labelcolor": t["ink2"], "axes.edgecolor": t["axis"],
+        "figure.facecolor": t["surface"], "savefig.facecolor": t["surface"], "axes.titlelocation": "left",
+        "legend.frameon": False, "legend.fontsize": 8, "svg.fonttype": "none",
+        "text.parse_math": False})             # "$1.2M" is money, not mathtext
+    return t
 
 
 def title(fig, text: str, t: dict, sub: str | None = None) -> None:
-    raise NotImplementedError("figures β")
+    fig.text(0.01, 0.995, text, ha="left", va="top", fontsize=11.5, fontweight="bold", color=t["ink"])
+    if sub:
+        fig.text(0.01, 0.995 - 0.075 * 3.2 / max(fig.get_figheight(), 1.6), sub, ha="left", va="top", fontsize=8.5,
+                 color=t["ink2"])
 
 
 def offset_free(ax) -> bool:
     """True when no axis of `ax` shows an offset or scientific multiplier (tests and the renderer's own check)."""
-    raise NotImplementedError("figures β")
+    import matplotlib.pyplot as plt  # noqa: F401
+    ax.figure.canvas.draw()
+    return not ax.xaxis.get_offset_text().get_text() and not ax.yaxis.get_offset_text().get_text()
 
 
 # --------------------------------------------------------------------------- labels
@@ -81,47 +137,68 @@ class Labels:
 
     def __init__(self, spec_raw: dict, card: dict | None = None, params: list | None = None,
                  overlay: dict | None = None):
-        raise NotImplementedError("figures β")
+        pres = ((spec_raw or {}).get("presentation") or {}).get("labels") or {}
+        ov = overlay or {}
+        self.given = {k: dict(pres.get(k) or {}, **(ov.get(k) or {})) for k in ("components", "parameters",
+                                                                               "outcomes", "metrics")}
+        self.titles = {k: ov.get(k) or pres.get(k) for k in ("regions_title", "units_title")}
+        self.spec = spec_raw or {}
+        self.card = card or {}
+        self.params = {p["name"]: p for p in (params or []) if isinstance(p, dict) and "name" in p}
+        self.used_fallback: dict[str, set] = {"components": set(), "parameters": set(), "outcomes": set(),
+                                              "metrics": set()}
 
     @staticmethod
     def readable(code: str) -> str:
-        raise NotImplementedError("figures β")
+        s = str(code).replace("_", " ").strip()
+        return s[:1].upper() + s[1:]
 
     def _get(self, kind, code):
-        raise NotImplementedError("figures β")
+        v = self.given[kind].get(code)
+        if v:
+            return str(v)
+        self.used_fallback[kind].add(code)
+        return None
 
     def component(self, c: str) -> str:
-        raise NotImplementedError("figures β")
+        return self._get("components", c) or self.readable(c)
 
     def metric(self, m: str) -> str:
-        raise NotImplementedError("figures β")
+        return self._get("metrics", m) or self.readable(m)
 
     def outcome(self, o: str, plural: bool = True) -> str:
-        raise NotImplementedError("figures β")
+        v = self._get("outcomes", o)
+        return v if v else (o.upper() if len(o) <= 5 else self.readable(o))
 
     def parameter(self, p: str) -> str:
-        raise NotImplementedError("figures β")
+        return self._get("parameters", p) or self.readable(p)
 
     def package(self, members) -> str:
         """A package as its components' names joined by ' + ' (the comparator: 'No package')."""
-        raise NotImplementedError("figures β")
+        order = list(((self.spec.get("options") or {}).get("components") or {}))
+        m = sorted(members, key=lambda c: (order.index(c) if c in order else len(order), c))
+        return " + ".join(self.component(c) for c in m) if m else "No package"
 
     def region_title(self) -> str:
-        raise NotImplementedError("figures β")
+        return self.titles.get("regions_title") or self.readable(str((self.spec.get("decision_units") or {}).get(
+            "region") or "region"))
 
     def unit_title(self) -> str:
-        raise NotImplementedError("figures β")
+        return self.titles.get("units_title") or "units"
 
     def component_definition(self, c: str) -> str:
         """'<id>: engine <component> = <value>' from the spec's engine_map (the legend line for a fallback)."""
-        raise NotImplementedError("figures β")
+        em = ((self.spec.get("options") or {}).get("engine_map") or {}).get(c) or {}
+        parts = [f"{k} = {v}" for k, v in em.items()] if isinstance(em, dict) else [str(em)]
+        return f"{c}: engine {', '.join(parts)}" if parts else c
 
     def parameter_units(self, p: str) -> str:
-        raise NotImplementedError("figures β")
+        return str((self.params.get(p) or {}).get("units") or "")
 
     def legend_lines(self) -> list[str]:
         """Definitions for every id shown with its fallback name (for the figure's footnote)."""
-        raise NotImplementedError("figures β")
+        out = [self.component_definition(c) for c in sorted(self.used_fallback["components"])]
+        return out
 
 
 # --------------------------------------------------------------------------- self-test

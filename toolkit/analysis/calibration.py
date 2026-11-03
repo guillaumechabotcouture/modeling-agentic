@@ -63,17 +63,27 @@ def invert(spec, model, theta, shifts=None, ids=None):
     return out
 
 
+def _cal_logit(model, theta, zs, ids) -> dict:
+    """The emulator's calibration metric (logit scale) per unit at its attribute z."""
+    X = model._scale(np.asarray([model._x(zs[i], theta, model.by_id[i]) for i in ids], float))
+    return {i: float(v) for i, v in zip(ids, model.gps[("cal",)].predict(X))}
+
+
+def modelled_targets(spec, model, theta, zs) -> dict:
+    """{unit: {"target", "modelled"}} on the metric's own scale at the fitted attributes (the calibration figure)."""
+    ids = list(zs)
+    tc = spec["calibration"]["target_column"]
+    pred = _cal_logit(model, theta, zs, ids)
+    return {i: {"target": float(model.by_id[i][tc]), "modelled": float(1.0 / (1.0 + np.exp(-pred[i])))} for i in ids}
+
+
 def inversion_report(spec, model, theta, cal) -> dict:
     ids = list(cal)
     zs = {i: cal[i][0] for i in ids}
     slope = model.cal_slope(ids, theta, zs)
     flat = [i for i, s in zip(ids, slope) if not abs(s) >= FLAT_SLOPE]
     tc = spec["calibration"]["target_column"]
-    pred = {}
-    X = model._scale(np.asarray([model._x(zs[i], theta, model.by_id[i]) for i in ids], float))
-    p = model.gps[("cal",)].predict(X)
-    for i, v in zip(ids, p):
-        pred[i] = float(v)
+    pred = _cal_logit(model, theta, zs, ids)
     resid = [pred[i] - float(_logit(np.array([float(model.by_id[i][tc])]))[0]) for i in ids]
     return {
         "method": "emulator_inversion",
