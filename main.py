@@ -2438,6 +2438,28 @@ def eval_refusal(args, here: str) -> str | None:
     return None
 
 
+def run_v2_and_store(run, run_path: str, store=None):
+    """Run the v2 machine (`run()` returns its status), then store the run directory, also when
+    `run()` raises (ST2): like the lead pipeline's finalize, upload the run when a storage account is
+    configured and record it in metadata.json, which the cloud launcher reads to stop the cluster.
+    A crash is recorded in metadata.json (`crash`) before the upload, and then re-raised."""
+    store = store or store_run_results
+    try:
+        return run()
+    except Exception as e:
+        try:
+            mp = os.path.join(run_path, "metadata.json")
+            meta = json.load(open(mp)) if os.path.exists(mp) else {}
+            meta["crash"] = f"{type(e).__name__}: {e}"[:500]
+            os.makedirs(run_path, exist_ok=True)
+            json.dump(meta, open(mp, "w"), indent=2)
+        except (OSError, ValueError):
+            pass
+        raise
+    finally:
+        print(f"v2 run stored: {store(run_path)}", flush=True)
+
+
 def main_v2(args) -> int:
     """v2 C: the stage machine drives the run; bounded agent tasks (agents/v2_sdk_tasks.py)
     do the judgement. Resumes from run_state.json with --resume. The lead session, its
@@ -2458,14 +2480,11 @@ def main_v2(args) -> int:
         run_path = os.path.join(REPO_ROOT, "runs", create_run_dir(question))
     print(f"Run (v2): {run_path}", flush=True)
     tasks = v2_sdk_tasks.SdkTasks(run_path, allow_cloud=args.cloud)
-    status = stage_machine.run_v2(question, run_path, tasks, max_rounds=args.max_rounds,
-                                  signoff=args.signoff, budget_usd=args.max_budget_usd,
-                                  derive_unsandboxed=getattr(args, "dev_unsandboxed_derivations", False))
+    status = run_v2_and_store(lambda: stage_machine.run_v2(
+        question, run_path, tasks, max_rounds=args.max_rounds, signoff=args.signoff,
+        budget_usd=args.max_budget_usd, derive_unsandboxed=getattr(args, "dev_unsandboxed_derivations", False)),
+        run_path)
     print(f"v2 status: {status}", flush=True)
-    # Like the lead pipeline's finalize: upload the run when a storage account is configured, and
-    # record it in metadata.json, which the cloud launcher reads to stop the cluster.
-    stored = store_run_results(run_path)
-    print(f"v2 run stored: {stored}", flush=True)
     if status.startswith("paused:"):
         return 2
     return exit_code_for(status)

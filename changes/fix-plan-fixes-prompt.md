@@ -1,0 +1,8 @@
+---
+phase: "v2"
+commit: "plan-fixes-prompt"
+---
+
+## Changelog
+
+**v2: the SDK fix planner's prompt formats, and a v2 run that crashes is still stored.** A real v2 run (2026-11-02) crashed at FIX_LOOP with `KeyError: '"tasks"'`: `agents/v2_sdk_tasks.py` built `PROMPTS["plan_fixes"]` as `FIX_PLANNER_PROMPT + "...{out_in}...{out}"` and called `.format` on it, and `FIX_PLANNER_PROMPT` (`agents/fix_loop.py`) holds a literal JSON example (`{"tasks": [...]}`). So the SDK-backed fix loop could never run. Its braces are now escaped where the template is built, so `.format` substitutes only the two paths and the prompt the model sees is `FIX_PLANNER_PROMPT` byte for byte plus the path line. No test caught it because the fix loop's self-tests use a fake task layer and the v2_sdk_tasks self-test never assembled the `plan_fixes` prompt. It now drives every task method through a fake `_session` with its real arguments and fails if a `PROMPTS` entry is not driven, so a new prompt cannot skip the check. The other prompts (`draft_spec`, `pick_engine`, `critique`, `fix`, `write`) splice in only `COMMON`, which has no braces, and were not affected. `main.py` `main_v2` stored the run only after `run_v2` returned, so a crash left `metadata.json` without `stored` and the cloud worker reported `stored=None`. `run_v2_and_store` now records the crash in `metadata.json` (`crash`), stores the run, and re-raises (exit 1 as before). Tests, written first: PF1-PF4 (`agents/v2_sdk_tasks.py`), ST2/ST2b (`main.py`).

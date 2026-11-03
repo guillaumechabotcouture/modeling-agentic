@@ -92,7 +92,10 @@ Example:
     - {{file: uncertainty_report.yaml, key: sampler_varied_parameters, op: ">=", value: 16}}
     - {{file: manuscript.md, contains: "decision rule"}}{feedback}
 Then write {out} = {{"ok": true}}.""",
-    "plan_fixes": FIX_PLANNER_PROMPT + "\nThe packet is in {out_in}. Write your JSON to {out}.",
+    # FIX_PLANNER_PROMPT is constant text with a literal JSON example: escape its braces so .format
+    # substitutes only the two paths (PF1-PF3).
+    "plan_fixes": FIX_PLANNER_PROMPT.replace("{", "{{").replace("}", "}}")
+    + "\nThe packet is in {out_in}. Write your JSON to {out}.",
     "fix": COMMON + """
 
 Task: fix task {tid}: {brief}
