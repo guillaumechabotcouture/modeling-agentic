@@ -136,12 +136,16 @@ def load_state(run_dir: str) -> RunState | None:
     return st
 
 
+def _put(run_dir: str, rel: str, text: str) -> None:
+    """A harness file in the run dir, published atomically with no link followed (lib.safe_io; review round 4)."""
+    from lib.safe_io import write_nofollow
+    write_nofollow(run_dir, rel.replace(os.sep, "/"), text.encode("utf-8"), atomic=True)
+
+
 def save_state(run_dir: str, st: RunState) -> None:
-    p = os.path.join(run_dir, STATE_FILE)
-    tmp = p + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(st.to_dict(), f, indent=1, default=str)
-    os.replace(tmp, p)
+    """run_state.json, published atomically with no link followed (lib.safe_io; review round 4, P1-2)."""
+    from lib.safe_io import write_nofollow
+    write_nofollow(run_dir, STATE_FILE, json.dumps(st.to_dict(), indent=1, default=str).encode(), atomic=True)
 
 
 # ------------------------------------------------------------------ gate routing (pure)
@@ -479,10 +483,10 @@ DECLARED_FILE = "declared_findings.yaml"
 
 def write_declared(run_dir: str, opened: list[dict], decision: dict) -> None:
     import yaml
-    with open(os.path.join(run_dir, DECLARED_FILE), "w") as f:
-        yaml.safe_dump({"rule": decision.get("rule_matched"), "rationale": decision.get("rationale"),
-                        "declared": [{"id": o["id"], "severity": o["severity"], "source": o["source"],
-                                      "claim": o["claim"]} for o in opened]}, f, sort_keys=False)
+    _put(run_dir, DECLARED_FILE, yaml.safe_dump({
+        "rule": decision.get("rule_matched"), "rationale": decision.get("rationale"),
+        "declared": [{"id": o["id"], "severity": o["severity"], "source": o["source"], "claim": o["claim"]}
+                     for o in opened]}, sort_keys=False))
 
 
 # ---- provenance of inputs
@@ -532,8 +536,14 @@ def _safe_dest(run_dir: str, rel: str) -> str:
     return cur
 
 
-def _copy_nofollow(src: str, dest: str) -> None:
+def _copy_nofollow(src: str, dest: str, run_dir: str | None = None) -> None:
+    """Copy a repo file into the run dir. With `run_dir`, published through lib.safe_io (no link at any component,
+    atomic); without, the final component is opened with O_NOFOLLOW."""
     data = open(src, "rb").read()
+    if run_dir is not None:
+        from lib.safe_io import write_nofollow
+        write_nofollow(run_dir, os.path.relpath(dest, run_dir).replace(os.sep, "/"), data, atomic=True)
+        return
     fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o644)
     with os.fdopen(fd, "wb") as f:
         f.write(data)
@@ -557,7 +567,7 @@ def stage_inputs(run_dir: str, question: str) -> list[str]:
         parent = os.path.dirname(dest)
         os.makedirs(parent, exist_ok=True)
         _safe_dest(run_dir, dest_rel)                      # nothing linked was created on the way
-        _copy_nofollow(src, dest)
+        _copy_nofollow(src, os.path.join(os.path.realpath(run_dir), dest_rel), os.path.realpath(run_dir))
         prov["inputs"][dest_rel] = {"source": rel, "sha256": _sha256(src), "bytes": os.path.getsize(src)}
         staged.append(dest_rel)
     _safe_dest(run_dir, PROVENANCE)
@@ -746,12 +756,13 @@ def _signoff(run_dir: str) -> dict | None:
         return None
 
 
-def sign(run_dir: str, by: str, note: str = "") -> dict:
+def sign(run_dir: str, by: str, note: str = "", expect_sha256: str | None = None) -> dict:
     rec = {"by": by, "note": note, "at": _now(), "spec_sha256": signed_hash(run_dir)}
     if rec["spec_sha256"] is None:
         raise ValueError(f"no {AB.SPEC_FILE} to sign")
-    with open(os.path.join(run_dir, SIGNOFF_FILE), "w") as f:
-        json.dump(rec, f, indent=1)
+    if expect_sha256 is not None and rec["spec_sha256"] != expect_sha256:
+        raise ValueError(f"{AB.SPEC_FILE} changed since it was shown; read it again before signing")
+    _put(run_dir, SIGNOFF_FILE, json.dumps(rec, indent=1))
     return rec
 
 
@@ -1013,9 +1024,10 @@ class Machine:
         return [f"{p['code']}: {p['claim']}" for p in rep["problems"]]
 
     def _write_sheet(self) -> None:
+        """The sign-off sheet, with the source hashes it was made from, published with no link followed (review
+        round 3: signoff.write_sheet)."""
         from toolkit.spec import signoff
-        with open(os.path.join(self.run_dir, SIGNOFF_SHEET), "w") as f:
-            f.write(signoff.sheet(self.run_dir, getattr(self.backend, "candidates", None)))
+        signoff.write_sheet(self.run_dir, getattr(self.backend, "candidates", None))
 
     def h_SIGN(self):
         mode = self.st.signoff
@@ -1029,7 +1041,8 @@ class Machine:
             note = (_signoff(self.run_dir) or {}).get("note", "")
             if res is not None and res.ok:
                 if os.path.exists(os.path.join(self.run_dir, SIGNOFF_FILE)) and getattr(self.backend, "sign", None):
-                    os.remove(os.path.join(self.run_dir, SIGNOFF_FILE))   # the lead's note; B writes its own record
+                    from lib.safe_io import remove_nofollow
+                    remove_nofollow(self.run_dir, SIGNOFF_FILE)   # the lead's note; B writes its own record
                 try:
                     self._sign("lead", note)              # the harness records the hash
                     return self._go("EVIDENCE", "spec signed by the lead")
@@ -1043,10 +1056,8 @@ class Machine:
 
     def h_EVIDENCE(self):
         # Stub (workstream V5): every parameter is an assumption until the evidence service checks it.
-        os.makedirs(os.path.join(self.run_dir, "evidence"), exist_ok=True)
-        with open(os.path.join(self.run_dir, "evidence", "registry.yaml"), "w") as f:
-            f.write("# evidence service stub (v2 C): no parameter has been fetched or matched yet\n"
-                    "status: stub\nentries: []\n")
+        _put(self.run_dir, "evidence/registry.yaml", "# evidence service stub (v2 C): no parameter has been fetched or "
+             "matched yet\nstatus: stub\nentries: []\n")
         return self._go("ENGINE_CHOICE", "evidence stub")
 
     def h_ENGINE_CHOICE(self):
@@ -1089,9 +1100,7 @@ class Machine:
             steps = self.backend.pipeline_steps(os.path.join(self.run_dir, AB.SPEC_FILE), self.run_dir)
         except Exception as e:  # noqa: BLE001
             return f"the pipeline could not be written: {type(e).__name__}: {e}"
-        os.makedirs(os.path.join(self.run_dir, "models"), exist_ok=True)
-        with open(os.path.join(self.run_dir, "models", "pipeline.yaml"), "w") as f:
-            yaml.safe_dump({"version": 1, "steps": steps}, f, sort_keys=False)
+        _put(self.run_dir, "models/pipeline.yaml", yaml.safe_dump({"version": 1, "steps": steps}, sort_keys=False))
         return None
 
     def reopen_interrupted_analysis(self) -> str | None:
@@ -1307,11 +1316,9 @@ class _Journaled:
 
 
 def _write_json(run_dir: str, rel: str, obj) -> None:
-    p = os.path.join(run_dir, rel)
-    tmp = p + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(obj, f, indent=1, default=str)
-    os.replace(tmp, p)
+    """A harness record in the run dir, published atomically with no link followed (lib.safe_io)."""
+    from lib.safe_io import write_nofollow
+    write_nofollow(run_dir, rel.replace(os.sep, "/"), json.dumps(obj, indent=1, default=str).encode(), atomic=True)
 
 
 def _rep_error(rep: dict) -> str:
@@ -1457,8 +1464,7 @@ def render_report(run_dir: str, backend=AB) -> str:
     if dec2.get("declared"):
         lines += ["", "## Open findings, declared (not resolved)", "", str(dec2.get("rationale") or ""), ""]
         lines += [f"- **{e['id']}** ({e['severity']}, {e['source']}): {e['claim']}" for e in dec2["declared"]]
-    with open(os.path.join(run_dir, "report.md"), "w") as f:
-        f.write(draft.rstrip() + "\n" + "\n".join(lines) + "\n")
+    _put(run_dir, "report.md", draft.rstrip() + "\n" + "\n".join(lines) + "\n")
     _write_deliverable(run_dir)
     return os.path.join(run_dir, "report.md")
 
@@ -1475,12 +1481,14 @@ def _write_deliverable(run_dir: str) -> None:
         return                      # an invalid destination is a HIGH finding, never written
     rows = list(csv.DictReader(open(src)))
     names = df.get("package_names") or {}
-    with open(os.path.join(run_dir, df["path"]), "w", newline="") as f:
-        w = csv.writer(f)
-        cols = df["columns"]
-        w.writerow(list(cols))
-        for r in rows:
-            w.writerow([names.get(r[c], r[c]) if c == "package" else r[c] for c in cols.values()])
+    import io
+    buf = io.StringIO(newline="")
+    w = csv.writer(buf)
+    cols = df["columns"]
+    w.writerow(list(cols))
+    for r in rows:
+        w.writerow([names.get(r[c], r[c]) if c == "package" else r[c] for c in cols.values()])
+    _put(run_dir, str(df["path"]), buf.getvalue())
 
 
 def init_run(run_dir: str, question: str, max_rounds: int = 3, signoff: str = "owner", gate_mode: str = "v2",
@@ -2084,6 +2092,73 @@ def _self_test() -> int:
             import traceback
             traceback.print_exc()
             ok(False, f"DI machine tests: {type(e).__name__}: {e}")
+        # T70 (run console review, finding 6): `sign --expect-sha256` refuses a spec other than the one shown.
+        from toolkit.spec import schema as _S, signoff as _SO
+        d70 = os.path.join(td, "t61")
+        os.makedirs(d70)
+        _S.toy_spec(d70)
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                rc = main(["sign", d70, "--by", "owner", "--note", "n", "--expect-sha256", "0" * 64])
+            except SystemExit as e:
+                rc = e.code
+            st70 = _SO.status(d70)
+            try:
+                rc2 = main(["sign", d70, "--by", "owner", "--note", "n", "--expect-sha256",
+                            hashlib.sha256(open(os.path.join(d70, AB.SPEC_FILE), "rb").read()).hexdigest()])
+            except SystemExit as e:
+                rc2 = e.code
+        d72, o72 = os.path.join(td, "t72"), os.path.join(td, "t72out")
+        os.makedirs(d72)
+        os.makedirs(o72)
+        _S.toy_spec(d72)
+        open(os.path.join(o72, "v"), "w").write("untouched")
+        os.symlink(os.path.join(o72, "v"), os.path.join(d72, SIGNOFF_SHEET))
+        try:
+            Machine._write_sheet(type("M", (), {"run_dir": d72, "backend": None})())
+        except (ValueError, OSError):
+            pass
+        ok(open(os.path.join(o72, "v")).read() == "untouched",
+           "T72 the sign-off sheet is published without following a link (round 3, P1-2)")
+        # T73 (round 4, P1-2): run_state.json and the machine's records never follow a planted .tmp link
+        d73, o73 = os.path.join(td, "t73"), os.path.join(td, "t73out")
+        os.makedirs(d73)
+        os.makedirs(o73)
+        open(os.path.join(o73, "v"), "w").write("untouched")
+        os.symlink(os.path.join(o73, "v"), os.path.join(d73, STATE_FILE + ".tmp"))
+        os.symlink(os.path.join(o73, "v"), os.path.join(d73, "rec.json.tmp"))
+        for fn in (lambda: save_state(d73, RunState(question="q", state="SPEC")), lambda: _write_json(d73, "rec.json", {})):
+            try:
+                fn()
+            except (ValueError, OSError):
+                pass
+        ok(open(os.path.join(o73, "v")).read() == "untouched",
+           "T73 save_state and the machine's JSON records do not write through a planted .tmp link")
+        d71 = os.path.join(td, "t71")
+        os.makedirs(d71)
+        _S.toy_spec(d71)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                rc71 = main(["sign", d71, "--by", "owner", "--note", "n", "--expect-sha256",
+                             hashlib.sha256(open(os.path.join(d71, AB.SPEC_FILE), "rb").read()).hexdigest(),
+                             "--expect-derivations-sha256", "0" * 64])
+            except SystemExit as e:
+                rc71 = e.code
+            st71 = _SO.status(d71)
+            try:
+                rc71b = main(["sign", d71, "--by", "owner", "--note", "n", "--expect-sha256",
+                              hashlib.sha256(open(os.path.join(d71, AB.SPEC_FILE), "rb").read()).hexdigest(),
+                              "--expect-derivations-sha256", "none"])
+            except SystemExit as e:
+                rc71b = e.code
+        ok(rc71 not in (0, None) and st71 == "awaiting" and rc71b == 0 and _SO.status(d71) == "signed",
+           f"T71 sign --expect-derivations-sha256 refuses a derivation record other than the one shown and signs "
+           f"with the one shown (rc {rc71}, {st71}; rc {rc71b})")
+        ok(rc not in (0, None) and st70 == "awaiting" and rc2 == 0 and _SO.status(d70) == "signed",
+           f"T70 stage_machine.py sign --expect-sha256 refuses another spec's sha and signs the shown one "
+           f"(rc {rc}, {st70}; rc {rc2}, {_SO.status(d70)})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -2315,6 +2390,8 @@ def _self_test_derived(ok, td: str) -> None:
     with open(os.path.join(mods, "attribute_binding.yaml"), "w") as f:
         yaml.safe_dump({"attribute_binding": {"x": "required", "group": "required"}}, f)
     sys.path.insert(0, mods)
+    from toolkit import import_guard as _G
+    _G.allow_for_test("engine", "di8_engines")             # a test engine outside toolkit/engines (allowlist)
     fake = os.path.join(td, "di8repo")
     os.makedirs(os.path.join(fake, "toyraw"))
     tmp = os.path.join(td, "di8src")
@@ -2388,6 +2465,12 @@ def main(argv=None) -> int:
     s2.add_argument("run_dir")
     s2.add_argument("--by", choices=["owner"], required=True)
     s2.add_argument("--note", default="")
+    s2.add_argument("--expect-sha256", default=None,
+                    help="the sha256 of the decision_spec.yaml the owner read; a different spec is not signed")
+    s2.add_argument("--expect-derivations-sha256", default=None,
+                    help="the sha256 of data/derivations_record.json when the sheet was shown ('none': there was none)")
+    s2.add_argument("--expect-sheet-sha256", default=None,
+                    help="the sha256 of the sign-off sheet the owner read ('none': there was none)")
     a = ap.parse_args(argv)
     if a.cmd == "status":
         st = load_state(a.run_dir)
@@ -2399,7 +2482,17 @@ def main(argv=None) -> int:
             print(h)
         return 0
     b = AB.backend()
-    rec = b.sign(a.run_dir, a.by, a.note) if getattr(b, "sign", None) else sign(a.run_dir, a.by, a.note)
+    kw = {k: v for k, v in (("expect_sha256", a.expect_sha256),
+                            ("expect_derivations_sha256", a.expect_derivations_sha256),
+                            ("expect_sheet_sha256", a.expect_sheet_sha256)) if v}
+    if not getattr(b, "sign", None) and set(kw) - {"expect_sha256"}:
+        print("Not signed: this backend's sign-off records no derivation record or sheet hash", file=sys.stderr)
+        return 1
+    try:
+        rec = b.sign(a.run_dir, a.by, a.note, **kw) if getattr(b, "sign", None) else sign(a.run_dir, a.by, a.note, **kw)
+    except ValueError as e:
+        print(f"Not signed: {e}", file=sys.stderr)
+        return 1
     print(json.dumps(rec, default=str))
     return 0
 

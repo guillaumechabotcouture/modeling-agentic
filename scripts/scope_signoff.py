@@ -341,9 +341,9 @@ def harness_record(run_dir: str) -> str:
     for fp, a in answers.items():
         if not (isinstance(led.get(fp), dict) and led[fp].get("sha256") == _answer_sha(a)):
             led[fp] = {"sha256": _answer_sha(a), "nonce": nonce, "by": a.get("by"), "recorded_at": now}
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump({"entries": led, "producer": "main.py"}, f, indent=1)
-    with open(os.path.join(run_dir, TRACE), "a", encoding="utf-8") as f:
+    from lib.safe_io import open_append_nofollow, write_nofollow    # no link followed (review round 4, P1-2)
+    write_nofollow(run_dir, LEDGER, json.dumps({"entries": led, "producer": "main.py"}, indent=1).encode(), atomic=True)
+    with open_append_nofollow(run_dir, TRACE) as f:
         f.write(json.dumps({"ts": now, "type": "scope_signoff_recorded", "nonce": nonce}) + "\n")
     return nonce
 
@@ -466,10 +466,8 @@ def record(run_dir: str, decision: dict, round_n: Optional[int] = None) -> Optio
         if not old or not old.get("pending"):
             return None
         doc = dict(old, pending=False, superseded_at=now, superseded_by=decision.get("action"))
-    tmp = p + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(doc, f, indent=1)
-    os.replace(tmp, p)
+    from lib.safe_io import write_nofollow    # atomic, no link followed (review round 4, P1-2)
+    write_nofollow(run_dir, REQUEST, json.dumps(doc, indent=1).encode(), atomic=True)
     return p
 
 
@@ -569,8 +567,11 @@ def sign(run_dir: str, by: str, answers: Optional[dict] = None, all_decision: Op
         raise ValueError("no accept/decline answer for " + ", ".join(missing))
     doc = {"answers": {**prior, **new}, "last_signed_by": by, "last_signed_at": now,
            "producer": "scripts/scope_signoff.py"}
-    with open(os.path.join(run_dir, SIGNOFF), "w", encoding="utf-8") as f:
-        json.dump(doc, f, indent=1)
+    from lib.safe_io import LinkRefused, write_nofollow
+    try:          # never through a link; published atomically (run console review round 2, P1-2)
+        write_nofollow(run_dir, SIGNOFF, json.dumps(doc, indent=1).encode(), atomic=True)
+    except (LinkRefused, OSError) as e:
+        raise ValueError(f"{SIGNOFF} not written: {e}") from None
     return {"signed_by": by, "signed_at": now, "answers": new}
 
 
@@ -809,6 +810,18 @@ def _self_test() -> int:
             os.environ.pop("MA_SIGNOFF_MODE", None)
         else:
             os.environ["MA_SIGNOFF_MODE"] = old_mode
+    # SO23 (run console review round 2, P1-2): the record is not written through a link
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+        json.dump({"pending": True, "round": 1, "items": [{"finding": "f", "fingerprint": "fp1"}]},
+                  open(os.path.join(d, REQUEST), "w"))
+        victim = os.path.join(out, "victim.json")
+        open(victim, "w").write("untouched")
+        os.symlink(victim, os.path.join(d, SIGNOFF))
+        try:
+            sign(d, "owner", {"fp1": "accept"}, note="n")
+        except (ValueError, OSError):
+            pass
+        ok(open(victim).read() == "untouched", "SO23 scope_signoff.json is not written through a link")
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
         return 1

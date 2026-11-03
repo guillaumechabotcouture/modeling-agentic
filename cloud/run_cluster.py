@@ -6,7 +6,9 @@
     python cloud/run_cluster.py <config.py> brief|report      # decision brief / convergence measures of a live run
     python cloud/run_cluster.py <config.py> health [--loop] [--interval S] [--log PATH] [--thresholds YAML]
                                                               # anomalies of a live run (cloud/run_health.py)
-    python cloud/run_cluster.py <config.py> sign <answers.yaml> [note]   # the brief, or pending scope declarations
+    python cloud/run_cluster.py <config.py> sign <answers.yaml> [--label L] [--run RUN] [--action spec|scope]
+                         [--expect-spec-sha256 SHA] [--expect-derivations-sha256 SHA|none] [--expect-sheet-sha256 SHA] [note]
+                                                              # pending scope declarations, a v2 spec, or the brief
     python cloud/run_cluster.py <config.py> relaunch <label>
     python cloud/run_cluster.py <config.py> shutdown          # cluster, overflow pool and keeper, by hand
     python cloud/run_cluster.py <config.py> report-cost [--ledger PATH]... [--start ISO] [--end ISO]
@@ -832,6 +834,29 @@ def relaunch(cfg, label):
     print(f"re-fired {label} -> {assign[label]['worker']} @ {commit}")
 
 
+def parse_sign_args(rest: list, labels) -> dict:
+    """`sign <answers.yaml> [--label L] [--run RUN_DIR_NAME] [--expect-spec-sha256 SHA] [note ...]`. The options
+    name the remote run the owner was shown (the run console passes all three); without --label the config's
+    first label is used, as before."""
+    if not rest:
+        raise SystemExit("sign needs <answers.yaml>")
+    out, i = {"answers": rest[0], "label": None, "run": None, "expect": None, "action": None,
+              "expect_derivations": None, "expect_sheet": None}, 1
+    flags = {"--label": "label", "--run": "run", "--expect-spec-sha256": "expect", "--action": "action",
+             "--expect-derivations-sha256": "expect_derivations", "--expect-sheet-sha256": "expect_sheet"}
+    while i < len(rest) and rest[i] in flags:
+        if i + 1 >= len(rest):
+            raise SystemExit(f"sign: {rest[i]} needs a value")
+        out[flags[rest[i]]] = rest[i + 1]
+        i += 2
+    out["note"] = " ".join(rest[i:])
+    if out["action"] not in (None, "spec", "scope"):
+        raise SystemExit(f"sign: --action is spec or scope, not {out['action']}")
+    if out["label"] is not None and out["label"] not in labels:
+        raise SystemExit(f"sign: label {out['label']} is not one this config runs ({', '.join(labels)})")
+    return out
+
+
 def _side(cfg, fn, *args, label=None):
     label = label or cfg.labels[0]
     assign = json.load(open(cfg.state_file))
@@ -1533,6 +1558,73 @@ def _self_test_bwrap(ok) -> None:
     ok("not Linux" in note and calls == [], f"RC61g not Linux: nothing is run ({note})")
 
 
+def _self_test_sign(ok) -> None:
+    """RS1-RS5 (run console review, finding 5): `sign` names the remote run it answers. The label and the run
+    dir name come from the caller; the worker refuses a mismatch and signs a v2 spec through stage_machine.py."""
+    import tempfile
+    try:
+        a = parse_sign_args(["ans.yaml", "--label", "F2", "--run", "2026_b", "--expect-spec-sha256", "ab12",
+                             "looks", "right"], ["F1", "F2"])
+        ok({k: a.get(k) for k in ("answers", "note", "label", "run", "expect")}
+           == {"answers": "ans.yaml", "note": "looks right", "label": "F2", "run": "2026_b", "expect": "ab12"},
+           f"RS1 sign parses --label, --run and --expect-spec-sha256 before the note ({a})")
+        try:
+            parse_sign_args(["ans.yaml", "--label", "F9", "n"], ["F1", "F2"])
+            ok(False, "RS2 a label the config does not run is refused")
+        except SystemExit as e:
+            ok("F9" in str(e), f"RS2 a label the config does not run is refused ({e})")
+        old = parse_sign_args(["ans.yaml", "a", "note"], ["F1"])
+        ok(old["label"] is None and old["note"] == "a note", "RS2b the old form (answers, note) still parses")
+    except Exception as e:  # noqa: BLE001 -- before the fix there is no parse_sign_args
+        ok(False, f"RS1-RS2 sign arguments: {type(e).__name__}: {e}")
+    with tempfile.TemporaryDirectory() as td:
+        for n in ("2026_a", "2026_b"):
+            os.makedirs(os.path.join(td, "F1", "runs", n))
+        open(os.path.join(td, "F1", "runs", "2026_b", "run_state.json"), "w").write("{}")
+        seen = []
+
+        def fake(cmd, **k):
+            seen.append(cmd)
+            return type("R", (), {"returncode": 0, "stdout": "none\n" if "status" in cmd else "{}", "stderr": ""})()
+        old_work = ws.WORK
+        ws.WORK = td
+        try:
+            r = ws.sign_side("F1", "", "n", run_name="2026_a", _runner=fake)
+            ok(r["rc"] != 0 and "2026_b" in r["out"] and "2026_a" in r["out"] and not any("sign" in c for c in seen),
+               f"RS3 the worker refuses a sign for another run than the newest on that label ({r})")
+            seen.clear()
+            r = ws.sign_side("F1", "", "n", run_name="2026_b", expect_spec_sha256="ab12", _runner=fake)
+            cmd = seen[-1] if seen else []
+            ok(r["rc"] == 0 and "agents/stage_machine.py" in cmd and "sign" in cmd and "--expect-sha256" in cmd
+               and "ab12" in cmd, f"RS4 a v2 run's spec is signed through stage_machine.py sign --expect-sha256 ({cmd})")
+            seen.clear()
+            r = ws.sign_side("F1", "", "n", run_name="2026_b", _runner=fake)
+            ok(r["rc"] != 0 and not any("stage_machine" in " ".join(c) for c in seen),
+               f"RS5 a v2 spec sign without the displayed spec's sha256 is refused ({r})")
+        except Exception as e:  # noqa: BLE001
+            ok(False, f"RS3-RS5 worker sign: {type(e).__name__}: {e}")
+        # RS6-RS8 (round 2, P1-6): the action is explicit; an expected spec sha always means sha-bound spec signing
+        try:
+            os.remove(os.path.join(td, "F1", "runs", "2026_b", "run_state.json"))
+            seen.clear()
+            r = ws.sign_side("F1", "", "n", run_name="2026_b", expect_spec_sha256="ab12", _runner=fake)
+            cmd = seen[-1] if seen else []
+            ok(r["rc"] == 0 and "agents/stage_machine.py" in cmd and "ab12" in cmd
+               and not any("decision_brief.py" in c for c in seen),
+               f"RS6 with an expected spec sha and no run_state.json the spec is still signed sha-bound ({cmd})")
+            seen.clear()
+            r = ws.sign_side("F1", "", "n", run_name="2026_b", action="spec", _runner=fake)
+            ok(r["rc"] != 0 and not any("sign" in c for c in seen), f"RS7 action spec without a sha fails closed ({r})")
+            a = parse_sign_args(["a.yaml", "--action", "spec", "--expect-derivations-sha256", "none",
+                                 "--expect-sheet-sha256", "cd", "n"], ["F1"])
+            ok(a.get("action") == "spec" and a.get("expect_derivations") == "none" and a.get("expect_sheet") == "cd",
+               f"RS8 sign parses --action and the snapshot's other shas ({a})")
+        except Exception as e:  # noqa: BLE001
+            ok(False, f"RS6-RS8 worker sign action: {type(e).__name__}: {e}")
+        finally:
+            ws.WORK = old_work
+
+
 def _self_test() -> int:
     import datetime as dt
     import io
@@ -1702,6 +1794,7 @@ def _self_test() -> int:
     _self_test_51c(ok)
     _self_test_52(ok)
     _self_test_attach(ok)
+    _self_test_sign(ok)
     for f in sorted(os.listdir(os.path.join(HERE, "configs"))):
         if f.endswith(".py") and not f.startswith("_"):   # _*.py: shared helpers (configs/_eval.py)
             try:
@@ -1747,7 +1840,14 @@ def main(argv) -> int:
     elif cmd == "health":
         return health(cfg, rest)
     elif cmd == "sign":
-        r = _side(cfg, ws.sign_side, open(rest[0]).read(), " ".join(rest[1:]))
+        a = parse_sign_args(rest, cfg.labels)
+        try:   # sent by value: a worker uploaded before --run existed still runs this sign_side
+            import cloudpickle
+            cloudpickle.register_pickle_by_value(ws)
+        except ImportError:
+            pass
+        r = _side(cfg, ws.sign_side, open(a["answers"]).read(), a["note"], a["run"], a["expect"], None, a["action"],
+                  a["expect_derivations"], a["expect_sheet"], label=a["label"])
         print(r["out"])
         return r["rc"]
     else:

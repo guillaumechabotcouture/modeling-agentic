@@ -355,17 +355,19 @@ def write_spec_benchmarks(run_dir: str, pack: dict, fitted: dict | None = None, 
     import yaml
     from toolkit.engines.contract import engine_identity
     from toolkit.spec import schema
+    if os.path.join(ROOT, "scripts") not in sys.path:
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    from lib.safe_io import write_nofollow      # the trusted run root; no link followed, atomic publish
     spec = schema.load(os.path.join(run_dir, "decision_spec.yaml"))
     doc = spec_benchmarks(pack, spec.engine(), spec, fitted, workers, seeds)
+    write_nofollow(run_dir, SPEC_BENCH, yaml.safe_dump(doc, sort_keys=False).encode(), atomic=True)
     path = os.path.join(run_dir, SPEC_BENCH)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    yaml.safe_dump(doc, open(path, "w"), sort_keys=False)
     rec = {"producer": RECORD_PRODUCER, "written_at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
            "file": SPEC_BENCH, "sha256": _sha(path), "spec_sha256": spec.sha256, "spec_parameters": values(spec),
            "pack_sha256": __import__("hashlib").sha256(json.dumps(pack, sort_keys=True, default=str).encode()).hexdigest(),
            "engine_identity": engine_identity(spec.engine()), "config_sha256": _config_sha(spec.engine()),
            "benchmarks": doc["arm_engines"]}
-    json.dump(rec, open(os.path.join(run_dir, SPEC_BENCH_RECORD), "w"), indent=1, sort_keys=True)
+    write_nofollow(run_dir, SPEC_BENCH_RECORD, json.dumps(rec, indent=1, sort_keys=True).encode(), atomic=True)
     return path
 
 

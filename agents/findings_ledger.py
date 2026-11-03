@@ -126,12 +126,13 @@ def load(run_dir: str) -> dict[str, Finding]:
 
 def save(run_dir: str, ledger: dict[str, Finding]) -> str:
     p = os.path.join(run_dir, LEDGER)
-    tmp = p + ".tmp"
     rows = sorted(ledger.values(), key=lambda f: (f.status != "open", _SEV_ORDER.get(f.severity, 3), f.id))
-    with open(tmp, "w", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r.to_row(), sort_keys=True, default=str) + "\n")
-    os.replace(tmp, p)
+    text = "".join(json.dumps(r.to_row(), sort_keys=True, default=str) + "\n" for r in rows)
+    _scripts = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
+    if _scripts not in sys.path:
+        sys.path.insert(0, _scripts)
+    from lib.safe_io import write_nofollow       # atomic, no link followed (review round 4, P1-2)
+    write_nofollow(run_dir, LEDGER.replace(os.sep, "/"), text.encode(), atomic=True)
     return p
 
 
@@ -455,6 +456,15 @@ def _self_test() -> int:
             ok(True, "L12 an unreadable ledger line fails closed")
         ok(decision_test_result(d, "../x.yaml")["valid"] is False and decision_test_result(d, "nope.yaml")["valid"] is False,
            "L13 a decision test outside the run or missing is invalid")
+    # L14 (run console review round 4, P1-2): the ledger is not written through a planted .tmp link
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+        open(os.path.join(out, "v"), "w").write("untouched")
+        os.symlink(os.path.join(out, "v"), os.path.join(d, LEDGER + ".tmp"))
+        try:
+            save(d, {})
+        except (ValueError, OSError):
+            pass
+        ok(open(os.path.join(out, "v")).read() == "untouched", "L14 the ledger is not written through a planted .tmp link")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

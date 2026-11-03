@@ -2263,17 +2263,24 @@ _FP_RUNNER_FILES = ("pipeline.yaml", "pipeline_state.json", "pipeline_report.jso
 _FP_HASH_MB = 64           # files up to this size are fingerprinted by content, larger ones by size and mtime
 
 
-def code_fingerprint(run_dir: str, fn_spec: str, exclude=()) -> str:
+def code_fingerprint(run_dir: str, fn_spec: str, exclude=(), confined: bool = False) -> str:
     """What a result depends on besides its params: every file under the run's
     models/ and data/ (following symlinked directories) and the repo's
     scripts/ and toolkit/, except (outside data/) logs, figures, summaries, the ledger, the
     pipeline runner's own files in models/ (_FP_RUNNER_FILES), and this call's own results file (`exclude`), and any batch's partial rows or
     detached-job record; files up to 64 MB by content, larger ones by
-    size and mtime. Any change and earlier rows are not reused."""
+    size and mtime. Any change and earlier rows are not reused.
+
+    `confined` (the run console, which treats run artifacts as hostile; review round 3, P1-3): the run's files are
+    read through no-follow directory and file fds (lib.safe_io), a link anywhere under models/ or data/ (the entries
+    themselves included) or a function file outside the run dir and the repo raises ValueError, and nothing outside
+    the run dir is read. On a tree with no links the result is byte-identical to the default, which is unchanged."""
     run_dir = os.path.realpath(run_dir)
     h = hashlib.sha256()
     path = fn_spec.partition("::")[0]
     fn_file = path if os.path.isabs(path) else os.path.join(run_dir, path)
+    if confined:
+        _confined_check(run_dir, path)
     skip = {os.path.realpath(x) for x in exclude}
     files = {fn_file}
     links = []
@@ -2310,6 +2317,10 @@ def code_fingerprint(run_dir: str, fn_spec: str, exclude=()) -> str:
     for f in sorted(files):
         if os.path.realpath(f) in skip:
             continue
+        in_run = f.startswith(run_dir + os.sep)
+        if confined and in_run:
+            _hash_confined(h, run_dir, os.path.relpath(f, run_dir))
+            continue
         try:
             st = os.stat(f)
         except OSError:
@@ -2324,6 +2335,52 @@ def code_fingerprint(run_dir: str, fn_spec: str, exclude=()) -> str:
             h.update(f"{st.st_size}:{st.st_mtime_ns}".encode())
         h.update(b"\0")
     return h.hexdigest()[:20]
+
+
+def _confined_check(run_dir: str, fn_path: str) -> None:
+    """code_fingerprint(confined=True): no link under the run's models/ or data/ (the entries themselves included),
+    and the function file inside the run dir (relative, no "..") or inside the repo."""
+    for sub in ("models", "data"):
+        top = os.path.join(run_dir, sub)
+        if os.path.islink(top):
+            raise ValueError(f"{sub}/ is a link: not fingerprinted (confined)")
+        for dp, dirs, fns in os.walk(top):
+            for x in dirs + fns:
+                if os.path.islink(os.path.join(dp, x)):
+                    raise ValueError(f"{os.path.relpath(os.path.join(dp, x), run_dir)} is a link: not fingerprinted "
+                                     "(confined)")
+    if os.path.isabs(fn_path):
+        if not os.path.realpath(fn_path).startswith(os.path.realpath(REPO) + os.sep):
+            raise ValueError("the batch function's file is outside the run dir and the repo (confined)")
+    elif not fn_path or ".." in fn_path.replace("\\", "/").split("/"):
+        raise ValueError("the batch function's path leaves the run dir (confined)")
+
+
+def _hash_confined(h, run_dir: str, rel: str) -> None:
+    """The default loop's update for one run file, read through no-follow fds (a link raises ValueError)."""
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    from lib.safe_io import open_nofollow, LinkRefused
+    try:
+        fd = open_nofollow(run_dir, rel)
+    except FileNotFoundError:
+        return
+    except (LinkRefused, OSError) as e:
+        raise ValueError(f"{rel}: {e} (confined)") from None
+    try:
+        st = os.fstat(fd)
+        h.update(rel.encode() + b"\0")
+        if st.st_size <= _FP_HASH_MB * 2**20:
+            while True:
+                block = os.read(fd, 2**20)
+                if not block:
+                    break
+                h.update(block)
+        else:
+            h.update(f"{st.st_size}:{st.st_mtime_ns}".encode())
+        h.update(b"\0")
+    finally:
+        os.close(fd)
 
 
 def input_keys(inputs) -> list[str]:
@@ -2385,10 +2442,21 @@ def run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dict
         lock.close()
 
 
+def _out_base(out: str) -> tuple[str, str]:
+    """(directory, name) for no-follow writes of `out` and its sidecars: the parent resolved once, the name never
+    followed (lib.safe_io; review round 4, P1-2)."""
+    return os.path.realpath(os.path.dirname(os.path.abspath(out))), os.path.basename(out)
+
+
 def _out_lock(out: str, block: bool = False, suffix: str = ".lock"):
-    """An exclusive lock on `out` (an open file; closing releases it), or None if another process holds it."""
+    """An exclusive lock on `out` (an open file; closing releases it), or None if another process holds it. The lock
+    file is opened for append with no link followed (never truncated)."""
     import fcntl
-    f = open(out + suffix, "w")
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    from lib.safe_io import open_append_nofollow
+    base, name = _out_base(out)
+    f = open_append_nofollow(base, name + suffix)
     try:
         fcntl.flock(f, fcntl.LOCK_EX | (0 if block else fcntl.LOCK_NB))
     except OSError:
@@ -2410,14 +2478,12 @@ def _run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dic
         # an interrupted or killed batch keeps them (rerunning reuses them).
         # The rows kept so far are copied to a new journal that replaces the old
         # one only once complete (a kill during the copy loses nothing).
-        with open(out + PARTIAL_EXT + ".tmp", "w") as f:
-            f.write(json.dumps({"_partial": {"fn": fn_spec, "code_fp": fp, "n": len(inputs)}}) + "\n")
-            for key, r in old.items():
-                f.write(json.dumps({**r, "key": key}) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(out + PARTIAL_EXT + ".tmp", out + PARTIAL_EXT)
-        part = open(out + PARTIAL_EXT, "a")
+        from lib.safe_io import open_append_nofollow, write_nofollow
+        base, name = _out_base(out)
+        journal = json.dumps({"_partial": {"fn": fn_spec, "code_fp": fp, "n": len(inputs)}}) + "\n" + "".join(
+            json.dumps({**r, "key": key}) + "\n" for key, r in old.items())
+        write_nofollow(base, name + PARTIAL_EXT, journal.encode(), atomic=True)
+        part = open_append_nofollow(base, name + PARTIAL_EXT)
 
         def sink(got):
             for r in got:
@@ -2446,15 +2512,12 @@ def _run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dic
                "n_failed": sum(not r["ok"] for r in rows), "failed_by_kind": failed_by,
                "computed": len(todo), "reused": len(rows) - len(todo),
                "fn": fn_spec, "code_fp": fp, "out": rel_out, "purpose": kw.get("purpose")}
-    tmp = out + ".tmp"
-    with open(tmp, "w") as f:
-        for r in rows:
-            f.write(json.dumps(r) + "\n")
-    os.replace(tmp, out)
-    json.dump(summary, open(out + ".summary.json.tmp", "w"), indent=1)
-    os.replace(out + ".summary.json.tmp", out + ".summary.json")
+    from lib.safe_io import remove_nofollow, write_nofollow
+    base, name = _out_base(out)
+    write_nofollow(base, name, "".join(json.dumps(r) + "\n" for r in rows).encode(), atomic=True)
+    write_nofollow(base, name + ".summary.json", json.dumps(summary, indent=1).encode(), atomic=True)
     try:
-        os.remove(out + PARTIAL_EXT)
+        remove_nofollow(base, name + PARTIAL_EXT)
     except OSError:
         pass
     return rows, summary
@@ -3057,6 +3120,46 @@ def _self_test() -> int:
         _self_test_infra(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"IR: {type(e).__name__}: {e}")
+    # CF-RW3 (round 4, P1-2): a batch's results, summary and journal never follow a planted link or .tmp
+    with tempfile.TemporaryDirectory() as rd, tempfile.TemporaryDirectory() as out_:
+        os.makedirs(os.path.join(rd, "models"))
+        open(os.path.join(rd, "models", "m.py"), "w").write("def f(p):\n    return {'y': p['x']}\n")
+        victim = os.path.join(out_, "v")
+        open(victim, "w").write("untouched")
+        o = os.path.join(rd, "models", "r.jsonl")
+        for suffix in (".tmp", ".summary.json.tmp", PARTIAL_EXT + ".tmp"):
+            os.symlink(victim, o + suffix)
+        try:
+            run_map(rd, "models/m.py::f", [{"x": 1}], o, backend="local", max_workers=1)
+        except (ValueError, OSError):
+            pass
+        ok(open(victim).read() == "untouched", "CF-RW3 run_map writes nothing through a planted .tmp link")
+    # CF-RW1/2 (run console review round 3, P1-3): a confined fingerprint reads through no-follow fds and equals the
+    # default one on a tree with no links; the default is unchanged
+    with tempfile.TemporaryDirectory() as rd, tempfile.TemporaryDirectory() as out:
+        os.makedirs(os.path.join(rd, "models"))
+        os.makedirs(os.path.join(rd, "data"))
+        open(os.path.join(rd, "models", "m.py"), "w").write("def f(x):\n    return x\n")
+        open(os.path.join(rd, "data", "d.csv"), "w").write("a\n1\n")
+        try:
+            same = code_fingerprint(rd, "models/m.py::f") == code_fingerprint(rd, "models/m.py::f", confined=True)
+        except TypeError as e:
+            same = e
+        ok(same is True, f"CF-RW1 the confined fingerprint equals the default on a tree with no links ({same})")
+        os.makedirs(os.path.join(out, "models"))
+        open(os.path.join(out, "models", "m.py"), "w").write("SECRET = 1\n")
+        import shutil
+        shutil.rmtree(os.path.join(rd, "models"))
+        os.symlink(os.path.join(out, "models"), os.path.join(rd, "models"))
+        try:
+            code_fingerprint(rd, "models/m.py::f", confined=True)
+            r = "not refused"
+        except ValueError:
+            r = "refused"
+        except TypeError as e:
+            r = e
+        ok(r == "refused" and isinstance(code_fingerprint(rd, "models/m.py::f"), str),
+           f"CF-RW2 a linked models/ is refused by the confined fingerprint; the default still follows it ({r})")
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
         return 1
