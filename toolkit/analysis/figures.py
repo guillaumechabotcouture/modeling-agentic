@@ -1890,6 +1890,16 @@ def _frontier_xy(fr: dict, primary: str) -> tuple[list, list]:
     return [float(p["envelope_usd"]) for p in pts], [float(p["averted"][primary]) for p in pts]
 
 
+def _window_mean(t, v, w0: float, w1: float, step: float = 1 / 12) -> float:
+    """Mean of a step series over the half-open window [w0, w1), each step weighted by its overlap."""
+    raise NotImplementedError("figures r2 β")
+
+
+def presentation_findings(run_dir: str, sidecar: dict) -> list[str]:
+    """Files of a figure's presentation record (labels, boundaries, crosswalk) that changed since it was drawn."""
+    raise NotImplementedError("figures r2 β")
+
+
 FUNCS = {"data_coverage": fig_data_coverage, "unit_attributes": fig_unit_attributes, "parameters": fig_parameters,
          "design_coverage": fig_design_coverage, "burn_in": fig_burn_in, "seasonality": fig_seasonality,
          "stochastic_noise": fig_stochastic_noise, "decision_tests": fig_decision_tests, "comparison": fig_comparison,
@@ -2680,6 +2690,118 @@ def _self_test() -> int:
             ok(False, "BD3 a malformed boundary file fails closed")
         except ValueError as e:
             ok("b.geojson" in str(e), f"BD3 a malformed boundary file fails closed: {e}")
+        # ---------------- Codex r2
+        def bnd_run(name, xw_rows=None, feats=None, crs=None, union=False):
+            dd = toy_run(os.path.join(base, name))
+            geo(dd, uids)
+            if feats is not None or crs is not None:
+                g = json.load(open(os.path.join(dd, "b.geojson")))
+                if feats is not None:
+                    feats(g["features"])
+                if crs is not None:
+                    g["crs"] = {"type": "name", "properties": {"name": crs}}
+                json.dump(g, open(os.path.join(dd, "b.geojson"), "w"))
+            bd = {"path": "b.geojson", "feature_id": "code"}
+            if xw_rows is not None:
+                with open(os.path.join(dd, "xw.csv"), "w") as fh:
+                    fh.write("uid,code\n" + "".join(f"{u},{c}\n" for u, c in xw_rows))
+                bd["crosswalk"] = dict({"path": "xw.csv", "unit_id": "uid", "feature_id": "code"},
+                                       **({"union": True} if union else {}))
+            pr = yaml.safe_load(open(os.path.join(dd, "presentation.yaml")))
+            pr["boundaries"] = bd
+            yaml.safe_dump(pr, open(os.path.join(dd, "presentation.yaml"), "w"))
+            return dd
+        base_rows = [(u, f"S-{u}") for u in uids]
+        for label, rows, needle in (
+                ("BD4 a unit mapped to two features is refused, naming the unit (P1-1)",
+                 base_rows + [("u1", "S-u2")], "u1"),
+                ("BD4b two units mapped to one feature are refused, naming both (P1-1)",
+                 [r for r in base_rows if r[0] != "u2"] + [("u2", "S-u1")], "u2")):
+            dd = bnd_run("bx" + label[2:4].strip(), rows)
+            try:
+                render(dd, os.path.join(base, "bx" + label[:4].strip()), only=["burden_map"])
+                ok(False, label)
+            except ValueError as e:
+                ok(needle in str(e) and "u1" in str(e), f"{label}: {e}")
+        dd = bnd_run("bxu", [r for r in base_rows if r[0] != "u2"] + [("u1", "S-u2")], union=True)
+        eu, why = one(dd, "burden_map", "bxu_o")
+        ok(eu and "u2" in eu.get("unmatched", []) and "u1" not in eu.get("unmatched", []),
+           f"BD4c a declared union draws both features for the unit: {eu and eu.get('unmatched')} {why}")
+        dd = bnd_run("bxe", base_rows, feats=lambda fs: fs[3].update(geometry={"type": "MultiPolygon",
+                                                                              "coordinates": []}))
+        ee, why = one(dd, "burden_map", "bxe_o")
+        ok(ee and "u3" in ee.get("unmatched", []), f"BD5 a unit whose feature is an empty MultiPolygon is unmatched: "
+                                                 f"{ee and ee.get('unmatched')} {why}")
+        for label, kw, needle in (("BD6 a projected CRS is refused (P2-9)", {"crs": "EPSG:3857"}, "CRS"),
+                                  ("BD6b coordinates outside the geographic range are refused",
+                                   {"feats": lambda fs: fs[0]["geometry"].update(coordinates=[[[5e5, 4e6], [5e5 + 1, 4e6],
+                                                                                              [5e5 + 1, 4e6 + 1],
+                                                                                              [5e5, 4e6]]],
+                                                                                 type="Polygon")}, "geographic")):
+            dd = bnd_run("bxc" + label[3:5].strip(), base_rows, **kw)
+            try:
+                render(dd, os.path.join(base, "bxc_o" + label[3:5].strip()), only=["burden_map"])
+                ok(False, label)
+            except ValueError as e:
+                ok(needle in str(e), f"{label}: {e}")
+        dd = bnd_run("bxg", base_rows, crs="urn:ogc:def:crs:OGC:1.3:CRS84")
+        eg, why = one(dd, "burden_map", "bxg_o")
+        ok(eg is not None, f"BD6c CRS84 is accepted: {why}")
+        # P1-5: every tested range is kept; a plan-changing range is never dropped
+        dr = toy_run(os.path.join(base, "runr"))
+
+        def many(x):
+            x["rows"] = [{"name": f"q{k:02d}", "kind": "parameter", "basis": "declared prior range", "point": 1.0,
+                          "low": {"value": 0.9, "point_plan_objective": 1.234e7 - (16 - k) * 1e5,
+                                  "share_units_changed": 0.5 if k == 15 else 0.0},
+                          "high": {"value": 1.1, "point_plan_objective": 1.234e7 + (16 - k) * 1e5,
+                                   "share_units_changed": 0.0}} for k in range(16)]
+        edit(dr, "sensitivity", many)
+        er, _ = one(dr, "sensitivity", "r1")
+        srows = list(csv.DictReader(open(er["table"]))) if er else []
+        ok(len(srows) == 16 and {r["name"]: r["changes_plan"] for r in srows}.get("q15") == "True",
+           f"F28 all 16 ranges are kept, including the only plan-changing one with the smallest effect: {len(srows)}")
+        # P2-6: an explicit deliverable kind is required, and compare() applies the gate
+        dk2 = toy_run(os.path.join(base, "runk2"))
+        spk2 = yaml.safe_load(open(os.path.join(dk2, "decision_spec.yaml")))
+        spk2["deliverable"].pop("kind", None)
+        yaml.safe_dump(spk2, open(os.path.join(dk2, "decision_spec.yaml"), "w"), sort_keys=False)
+        rk2 = render(dk2, os.path.join(base, "k2o"))
+        nk2 = [x for x in rk2["not_produced"] if x["tier"] == "decision"]
+        ok(not [f for f in rk2["figures"] if f["tier"] == "decision"] and nk2
+           and "deliverable.kind" in nk2[0]["reason"],
+           f"F29 a spec without deliverable.kind gets no decision figures and says why: {nk2[:1]}")
+        try:
+            compare([du, du], os.path.join(base, "cmpu"))
+            ok(False, "F30 compare refuses a kind with no declared comparison")
+        except ValueError as e:
+            ok("threshold_rule" in str(e), f"F30 compare refuses a kind with no declared comparison: {e}")
+        try:
+            compare([d, d4], os.path.join(d4, "analysis", "cmp"))
+            ok(False, "F33 compare refuses an output dir inside a source run (P2-14)")
+        except ValueError as e:
+            ok("inside" in str(e), f"F33 compare refuses an output dir inside a source run: {e}")
+        # P2-15: the comparison carries provenance from every run, the presentation record and the tier
+        scc = json.load(open(os.path.join(outc, "comparison.png.provenance.json"))) \
+            if os.path.exists(os.path.join(outc, "comparison.png.provenance.json")) else {}
+        srcs = list((scc.get("source_hashes") or {}))
+        ok(any(os.path.join("run1", "analysis", "point.yaml") in x for x in srcs)
+           and any(os.path.join("run4", "analysis", "point.yaml") in x for x in srcs)
+           and scc.get("tier") == "decision" and scc.get("presentation") is not None,
+           f"F34 the comparison's provenance lists every run's sources, the presentation files and the tier: {srcs[:4]}")
+        # P2-7: the presentation, boundary and crosswalk files are in each figure's checked provenance
+        scb = json.load(open(os.path.join(base, "bmap", "burden_map.png.provenance.json")))
+        kinds_b = {x.get("kind") for x in scb.get("presentation") or []}
+        ok(kinds_b >= {"presentation", "boundaries", "crosswalk"},
+           f"F31 map provenance records the presentation, boundary and crosswalk files: {kinds_b}")
+        open(os.path.join(db, "xw.csv"), "a").write("\n")
+        ok(presentation_findings(db, scb) and any("xw.csv" in f for f in presentation_findings(db, scb)),
+           "F31b a changed crosswalk is found when the figure's provenance is checked")
+        # P2-12: a window mean over monthly steps uses the half-open window and weights partial steps
+        tg = [k / 12 for k in range(24)]
+        vg = [float(k) for k in range(24)]
+        wm = _window_mean(tg, vg, 0.125, 0.375)        # 1.5 to 4.5 months: half of step 1, steps 2-3, half of step 4
+        ok(abs(wm - (0.5 * 1 + 2 + 3 + 0.5 * 4) / 3.0) < 1e-9, f"F32 the window mean weights partial steps: {wm}")
         # design: decision figures and modeller diagnostics are grouped in figures.yaml
         idx = yaml.safe_load(open(os.path.join(out, "figures.yaml")))
         grp = idx.get("groups") or {}

@@ -287,6 +287,11 @@ def compute(A, plan, out0, ben0, cost0, uq: dict | None, z0: dict | None = None,
     return out
 
 
+def derived_fields(spec_raw: dict) -> list[str]:
+    """The job inputs computed by a transcendental function (so a platform's libm can move their last bits)."""
+    raise NotImplementedError("figures r2 β")
+
+
 ULP_BOUND = 4          # a stored row's job may differ from the rebuilt one by at most this many ulps in one input
 
 
@@ -408,6 +413,7 @@ def rebuild(run_dir: str, log=print):
 
 # --------------------------------------------------------------------------- self-test
 def _self_test() -> int:
+    import copy
     import tempfile
     import yaml
     fails = []
@@ -479,11 +485,21 @@ def _self_test() -> int:
         leaf = sorted(k for k, v in j5["params"].items() if isinstance(v, float))[0]
         j5["params"][leaf] = float(np.nextafter(j5["params"][leaf], np.inf))
         rewrite(lambda n, r: r["result"]["provenance"].update(job_sha=Bt.job_sha(j5)) if n == 5 else None)
-        A2, plan2, *_ = rebuild(d, log=q)
-        info = getattr(A2, "rebuild_info", {}) or {}
-        ok(plan2 == plan and [(x["job"], x["field"], x["ulps"]) for x in info.get("by_ulp", [])]
-           == [(jobs[5]["id"], f"params.{leaf}", 1)],
-           f"FD14 a row whose job differs from the rebuilt job by 1 ulp in one input is taken, and recorded: {info}")
+        try:            # Codex r2 P1-2: a parameter is source-bound (the design's own value); 1 ulp off is refused
+            rebuild(d, log=q)
+            ok(False, "FD14 a row whose source-bound parameter differs by 1 ulp is refused")
+        except RebuildRefused as e:
+            ok("within" in str(e), f"FD14 a row whose source-bound parameter differs by 1 ulp is refused: {e}")
+        # the tolerance applies only to the derived field (the calibrated attribute on the log scale: exp(z))
+        jx = json.loads(json.dumps(jobs[5]))
+        jx["unit"]["x"] = float(np.nextafter(float(jx["unit"]["x"]), np.inf))
+        ok(ulp_match(jobs[5], Bt.job_sha(jx), Bt.job_sha, fields=["unit.x"]) == ("unit.x", 1)
+           and ulp_match(jobs[5], Bt.job_sha(j5), Bt.job_sha, fields=["unit.x"]) is None,
+           "FD19 the ulp tolerance covers only the declared derived fields")
+        lg = copy.deepcopy(A.spec.raw)
+        lg["calibration"]["scale"] = "log"
+        ok(derived_fields(lg) == ["unit.x"] and derived_fields(A.spec.raw) == [],
+           f"FD19b the derived field is the calibrated attribute on the log scale only: {derived_fields(lg)}")
         rewrite(lambda n, r: r["result"]["provenance"].update(job_sha="0" * 64) if n == 5 else None)
         try:
             rebuild(d, log=q)

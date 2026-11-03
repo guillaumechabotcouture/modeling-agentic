@@ -1170,6 +1170,14 @@ def _self_test() -> int:
         # owner 2026-11-02: display labels are not part of the signed spec (an unsigned presentation.yaml instead)
         bad(lambda r: r.update(presentation={"labels": {"components": {"a": "Service A"}}}), "presentation.yaml",
             "SP-P1 a presentation block in the signed spec is refused, with a pointer to the presentation file")
+        # Codex r2 P1-3: the refusal also holds for engine: auto before the choice (the sign-off path)
+        r_pend = copy.deepcopy(s.raw)
+        r_pend["engine"] = {"auto": True, "candidates": ["toolkit.engines.contract:ToyEngine"]}
+        r_pend["presentation"] = {"labels": {"components": {"a": "Service A"}}}
+        sp_pend = Spec(r_pend, d)
+        errs_pend = validate(sp_pend, pending_ok=True)
+        ok(sp_pend.engine_pending and any("presentation.yaml" in e for e in errs_pend),
+           f"SP-P5 a presentation block is refused at sign-off too (engine pending): {errs_pend[:3]}")
         eng = s.engine()
         pn, card = {p.name for p in eng.parameters()}, eng.describe()
         lab_ok = {"components": {"a": "Service A"}, "parameters": {"eff_a": "Effect of A"}, "outcomes": {"dalys": "DALYs"},

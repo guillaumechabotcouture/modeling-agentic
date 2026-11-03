@@ -257,8 +257,8 @@ class ToyScheduleEngine(_toy_base()):
         from toolkit.engines.contract import resolve_params
         p = resolve_params(self, params)
         x = float(unit.attributes.get("x", 0.0))
-        n = int(round((float(horizon.window[1]) - float(horizon.start)) * 12))
-        t = [float(horizon.start) + k / 12 for k in range(n)]
+        t = monthly_grid(horizon)           # the contract's grid (one definition)
+        n = len(t)
         res = []
         for pk in packages:
             a, b = int(pk.components.get("a", 0)), int(pk.components.get("b", 0))
@@ -394,6 +394,30 @@ def _self_test() -> int:
             return EngineCard(**dict(c.to_dict(), outputs=dict(c.outputs, series={"prev": {"aggregate": "mean"}})))
     refused("H12 a series metric without label, units and denominator is refused",
             lambda: run_series(BadMeta(), {}, u, [pa], h, 1, ["prev"]), "denominator")
+    # ---- Codex r2 P2-10: a window end inside a month keeps its final partial step
+    hu = Horizon(0.0, 4.0, (1.0, 3.0 + 1 / 24), {})
+    ok(len(monthly_grid(hu)) == 37 and monthly_grid(hu)[-1] < 3.0 + 1 / 24,
+       f"H13 the grid keeps every step that starts before the window end (partial last step): {len(monthly_grid(hu))}")
+    ok(len(run_series(E, {}, u, [p0, pa], hu, 1, ["prev"])[0]["t"]) == 37, "H13b a 37-step answer is accepted")
+
+    class Rounded(Hooked):                   # the old rounding: drops the partial step
+        def run_series(self, params, unit, packages, horizon, seed, metrics, step="month"):
+            r = super().run_series(params, unit, packages, horizon, seed, metrics, step)
+            for x in r:
+                x["t"] = x["t"][:-1]
+                x["values"] = {m: v[:-1] for m, v in x["values"].items()}
+            return r
+    refused("H13c an answer that omits the partial final step is refused",
+            lambda: run_series(Rounded(), {}, u, [p0, pa], hu, 1, ["prev"]), "monthly")
+    # ---- Codex r2 P2-11: point events follow [d0, d1) exactly
+    refused("H14 a charged decision event at the delivery end d1 is refused",
+            lambda: schedule(sched([ev(t0=2.0)]), {}, u, pa, hd), "delivery period")
+    refused("H14b a history event at the delivery start d0 is refused",
+            lambda: schedule(sched([ev(kind="history", charged=False, t0=1.0)]), {}, u, pa, hd), "history")
+    refused("H14c a routine event at the delivery start d0 is refused",
+            lambda: schedule(sched([ev(kind="routine", charged=False, t0=1.0)]), {}, u, pa, hd), "routine")
+    ok(len(schedule(sched([ev(t0=1.0), ev(kind="routine", charged=False, t0=2.0)]), {}, u, pa, hd)) == 2,
+       "H14d a decision at d0 and a routine event at d1 are accepted")
     print("OK: all self-test cases passed." if not fails else f"FAILED: {len(fails)} case(s)")
     return 1 if fails else 0
 

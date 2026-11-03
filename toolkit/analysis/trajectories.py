@@ -315,6 +315,28 @@ def _self_test() -> int:
            f"TJ15 seed-to-seed spread is drawn from the trajectory seeds: {n2.get('stochastic_noise')}")
         ok("seasonality" not in e2 and "monthly profile" in n2.get("seasonality", ""),
            f"TJ16 without a monthly profile attribute the seasonality check says why: {n2.get('seasonality')}")
+        # ---- Codex r2 P2-13: a rate metric's seed effect is labelled as a rate, not a window total
+        sn = e2.get("stochastic_noise") or {}
+        ok("per person-year" in sn.get("caption", "") and "averted per person over the outcome window"
+           not in open(sn["table"]).read() if sn else False,
+           f"TJ18 the noise figure labels a rate metric as a mean rate per person-year: {sn.get('caption')}")
+        # ---- Codex r2 P1-4: freshness covers the full engine identity and every consumed input
+        docj = yaml.safe_load(open(os.path.join(d, OUT)))
+        ok("units.csv" in docj["inputs"] and set(docj["data"].get("engine") or {}) >= {"code_sha256", "config_sha256"}
+           and docj["data"].get("analysis_engine"),
+           f"TJ17 trajectories record the units table, the full engine identity and the analysis's engine: "
+           f"{sorted(docj['inputs'])}")
+        keep_units = open(os.path.join(d, "units.csv")).read()
+        open(os.path.join(d, "units.csv"), "w").write(keep_units + "\n")
+        r3 = FG.render(d, os.path.join(figs, "c"), only=["trajectories"])
+        why3 = {x["figure"]: x["reason"] for x in r3["not_produced"]}.get("trajectories", "")
+        ok("stale" in why3 and "units.csv" in why3, f"TJ17b a changed units table makes the trajectories stale: {why3}")
+        open(os.path.join(d, "units.csv"), "w").write(keep_units)
+        docj["data"]["engine"]["code_sha256"] = "0" * 64
+        yaml.safe_dump(docj, open(os.path.join(d, OUT), "w"), sort_keys=False)
+        r4 = FG.render(d, os.path.join(figs, "d"), only=["trajectories"])
+        why4 = {x["figure"]: x["reason"] for x in r4["not_produced"]}.get("trajectories", "")
+        ok("stale" in why4 and "code" in why4, f"TJ17c another engine code fingerprint makes them stale: {why4}")
         # ---- Codex r1
         doc = yaml.safe_load(open(os.path.join(d, OUT)))
         ok(set(doc["inputs"]) >= {"decision_spec.yaml", "analysis/point.yaml", "analysis/calibration.yaml",
