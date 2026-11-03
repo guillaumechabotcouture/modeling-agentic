@@ -12,7 +12,7 @@
 # --- Harness (main.py, agents/, scripts/) ---
 claude-agent-sdk==0.2.169   # bundles CLI 2.1.305; must know the pinned MODEL_* ids (agents/enforcement.py)
 python-dotenv==1.2.2
-anthropic==2.3.0        # scripts/run_console.py chat only (official SDK, imported on the first chat message)
+anthropic==2.3.0        # tools/run_console/run_console.py chat only (official SDK, imported on the first chat message)
 PyYAML==6.0.3
 Pillow==12.2.0          # agents/hooks.py figure checks
 psutil==7.2.2           # orphan-process cleanup, compute.py worker checks

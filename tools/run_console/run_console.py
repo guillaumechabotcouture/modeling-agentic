@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """The run console: a local page for the owner of a v2 run (docs/design/v2-run-console.md).
 
-    python3 scripts/run_console.py --run-dir runs/<run>                    # one local run
-    python3 scripts/run_console.py --roots runs ~/keep                     # every run under these roots
-    python3 scripts/run_console.py --mirror <dir> --sync-cmd "<command>" --cloud-config cloud/configs/<x>.py
-    python3 scripts/run_console.py --self-test
+    python3 tools/run_console/run_console.py --run-dir runs/<run>                    # one local run
+    python3 tools/run_console/run_console.py --roots runs ~/keep                     # every run under these roots
+    python3 tools/run_console/run_console.py --mirror <dir> --sync-cmd "<command>" --cloud-config cloud/configs/<x>.py
+    python3 tools/run_console/run_console.py --self-test
 
-Serves one page (scripts/run_console.html) on 127.0.0.1 only. It reads run artifacts and
+Serves one page (tools/run_console/run_console.html and its script) on 127.0.0.1 only. It reads run artifacts and
 rebuilds the run's story as event cards; the owner chats with Claude about the run, records
 feedback for the learning loop (<run_dir>/owner/feedback.jsonl) and answers the questions the
 run waits on. The only writes that change a run go through the existing sign-off commands
@@ -39,12 +39,15 @@ import urllib.parse
 
 import yaml
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# tools/run_console/, outside scripts/ and toolkit/: compute.code_fingerprint hashes those whole, so a console edit
+# would invalidate every stored engine batch (review item 17). The console imports the harness by path.
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(os.path.dirname(HERE))
 for _p in (REPO, os.path.join(REPO, "scripts"), os.path.join(REPO, "agents")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-HTML = os.path.join(REPO, "scripts", "run_console.html")
+HTML = os.path.join(HERE, "run_console.html")
 OWNER_DIR = "owner"
 FEEDBACK, CHAT = "owner/feedback.jsonl", "owner/chat.jsonl"
 KINDS = ("question", "correction", "guidance", "approval")
