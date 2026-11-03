@@ -9,15 +9,31 @@ old:
     params_sha256: 04b1cab140eb45c36aa89d24656fddfdf500d28596f50523dcdd606ae2de6992
     version: '0.7'
   engine_version: '0.7'
+  environment:
+    machine: x86_64
+    numpy: 2.4.4
+    platform: Linux-7.0.0-1017-azure-x86_64-with-glibc2.41
+    python: 3.14.3
+    starsim: 3.3.4
 new:
-  commit_of_tree_base: 0d660012aa3da3554a947cc09c731c096f2dd97c
+  commit_of_tree_base: 663a37926abfcf5c2f31dba883658745d04a0fcb
   identity:
-    code_sha256: edd92865a8d372c8299756a35edced7f60cf614dde782e2b120034dbc0eb5284
+    code_sha256: 425a4d16d29c812a7ced39de9ad5bcacab62b7df16e1f3bf8c7307bbd558f6ca
     config_sha256: 4b86811a290ba8b0d9cff872a840ee2d2e4543eee525495e640008bcf214032c
     name: malaria-starsim
     params_sha256: 04b1cab140eb45c36aa89d24656fddfdf500d28596f50523dcdd606ae2de6992
     version: '0.8'
   engine_version: '0.8'
+  environment:
+    machine: x86_64
+    numpy: 2.4.4
+    platform: Linux-7.0.0-1017-azure-x86_64-with-glibc2.41
+    python: 3.14.3
+    starsim: 3.3.4
+execution:
+  coiled_cluster_id: '2318449'
+  run_id: proof4
+  workspace: idm-coiled-idmad-r2
 scope:
   pack_settings:
   - benin
