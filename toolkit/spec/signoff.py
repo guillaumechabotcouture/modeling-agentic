@@ -257,6 +257,25 @@ def _self_test() -> int:
         sec = sheet(d).split("## Engine parameter values set by the spec")[-1].split("\n## ")[0]
         ok("ToySpecEngine" in sec and "ToyEngine" in sec and sec.count("**HIGH**") == 1,
            f"SG12 with engine: auto, the card values are shown per candidate engine: {sec[:300]!r}")
+        # review round 2 (R2-4): a string engine reference, and engine: auto with the candidates of the pre-sign check
+        def sec_of(md):
+            return md.split("## Engine parameter values set by the spec")[-1].split("\n## ")[0]
+        raw["engine"] = "toolkit.spec.engine_parameters:ToySpecEngine"
+        yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+        sec = sec_of(sheet(d))
+        ok("ToySpecEngine" in sec and sec.count("**HIGH**") == 1 and "0.4" in sec,
+           f"SG13 a string engine reference shows its card values and the HIGH note: {sec[:300]!r}")
+        cands = [{"ref": "toolkit.spec.engine_parameters:ToySpecEngine", "eligible": True, "why_not": []}]
+        for eng in ("auto", {"auto": True}):
+            raw["engine"] = eng
+            yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+            sec = sec_of(sheet(d, candidates=cands))
+            ok("ToySpecEngine" in sec and sec.count("**HIGH**") == 1,
+               f"SG14 engine {eng!r}: the pre-sign check's candidates give the card values: {sec[:300]!r}")
+            sec = sec_of(sheet(d))
+            ok("card values are shown once" in sec and "**HIGH**" not in sec,
+               f"SG15 engine {eng!r} with no candidate known: the sheet says the card values are not yet known: "
+               f"{sec[:300]!r}")
     # DI6, DI7, DI10 (docs/design/v2-derived-inputs.md): the sign-off freezes the derivation record, and the sheet
     # shows the owner the accepted defaults and the columns the run chose not to use.
     try:

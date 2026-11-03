@@ -2772,6 +2772,21 @@ def _self_test() -> int:
            and float(prs["p_cost"]["card_value"]) == 1.0 and "spec value" in esv.get("caption", "")
            and prs.get("p_eff", {}).get("kind") == "fitted",
            f"TT2e a spec value is shown as such, with the card value it replaces: {prs.get('p_cost')}")
+        # review round 2 (R2-5): a spec value drawn over its own range keeps that range apart from the card's
+        edit(dsv, "engine", lambda x: x.update(spec_values={"p_dur": {
+            "value": 300.0, "units": "days", "card_value": 600.0, "card_range": [480.0, 860.0],
+            "outside_card_range": True, "source": "toy source", "reason": "toy reason",
+            "uncertainty": "drawn over [250, 350] (uniform)"}}))
+        edit(dsv, None, lambda x: x.update(parameters_drawn=[
+            {"name": "p_dur", "source_kind": "priors", "dist": "uniform", "range": [250.0, 350.0], "source": "toy"}]),
+             rel="uncertainty_report.yaml")
+        rsv = render(dsv, os.path.join(base, "spec_value2"), only=["parameters"])
+        esv = {f["figure"]: f for f in rsv["figures"]}.get("parameters") or {}
+        prs = {x["name"]: x for x in csv.DictReader(open(esv["table"]))} if esv else {}
+        pd_ = prs.get("p_dur", {})
+        ok(pd_.get("kind") == "spec value" and pd_.get("card_lo") == "480.0" and pd_.get("card_hi") == "860.0"
+           and pd_.get("draw_lo") == "250.0" and pd_.get("draw_hi") == "350.0",
+           f"TT2f the card range and the spec value's own uncertainty range are kept apart: {pd_}")
         dsg = ent_t.get("design_coverage") or {}
         ok(dsg and "40 design points" in dsg.get("caption", ""), f"TT2d design coverage counts the design points: {dsg}")
         sim = {"timeline", "trajectories", "burn_in", "seasonality", "stochastic_noise"}

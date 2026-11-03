@@ -305,14 +305,9 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
 
 
 # --------------------------------------------------------------------------- self-test
-def _toy_bench(d):
-    """Stamped benchmark results for the toy engine (toolkit/engines/benchmark.py): T2 is its interaction benchmark."""
-    import yaml
-    from toolkit.engines import benchmark as BM
-    from toolkit.engines.contract import ToyEngine
-    path = os.path.join(d, "toy_bench.yaml")
-    eng = ToyEngine(results_path=path)
-    pack = {"engine": "toolkit.engines.contract:ToyEngine", "seeds": [1],
+def _toy_pack() -> dict:
+    """The toy engine's benchmark pack: T2 is its interaction benchmark."""
+    return {"engine": "toolkit.engines.contract:ToyEngine", "seeds": [1],
             "horizon": {"start": 0, "stop": 3, "window": [0, 3], "windows": {"w": [1, 2]}},
             "settings": {"s": {"unit": {"x": 0.0}}},
             "arms": {"none": {"setting": "s", "package": {}}, "a": {"setting": "s", "package": {"a": 1}},
@@ -320,6 +315,16 @@ def _toy_bench(d):
             "benchmarks": [{"id": "T2", "metric": "interaction", "target": 1.0, "band": [0.8, 1.25],
                             "estimand": {"type": "interaction_or", "a11": "ab", "a10": "a", "a01": "b", "a00": "none",
                                          "value": "windows.w.prev"}}]}
+
+
+def _toy_bench(d):
+    """Stamped benchmark results for the toy engine (toolkit/engines/benchmark.py): T2 is its interaction benchmark."""
+    import yaml
+    from toolkit.engines import benchmark as BM
+    from toolkit.engines.contract import ToyEngine
+    path = os.path.join(d, "toy_bench.yaml")
+    eng = ToyEngine(results_path=path)
+    pack = _toy_pack()
     res = BM.run_pack(pack, eng, BM.Runner(pack, eng, 1), {})
     yaml.safe_dump(BM.stamp(res, eng), open(path, "w"), sort_keys=False)
     b = res["benchmarks"][0]

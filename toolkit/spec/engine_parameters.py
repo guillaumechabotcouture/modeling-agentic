@@ -401,6 +401,7 @@ def _self_test() -> int:
     import copy
     import glob
     import hashlib
+    import math
     import tempfile
     import yaml
     from toolkit.spec import schema, signoff
@@ -476,6 +477,19 @@ def _self_test() -> int:
             r[FIELD] = ["base"]
             errs = schema.validate(schema.Spec(r, d))
             ok(any(e.startswith(FIELD) and "mapping" in e for e in errs), f"EP7h a non-mapping field is refused: {errs[:2]}")
+            # review round 2 (R2-6): a range that leaves the card's range is not reported as an out-of-range value
+            r = toy_raw(d, base=dict(good, range=[0.3, 0.6], dist="uniform"))
+            errs = [e for e in schema.validate(schema.Spec(r, d)) if FIELD in e]
+            ok(errs and "uncertainty range [0.3, 0.6]" in errs[0] and "value 0.55 is inside" in errs[0]
+               and "the value (0.55" not in errs[0],
+               f"EP7i a range reaching outside the card's range is named as the range, with the value inside: {errs[:1]}")
+            r = toy_raw(d, base=dict(good, range=[0.3, 0.6], dist="uniform", outside_card_range=True))
+            sr = schema.Spec(r, d)
+            rw = {x["name"]: x for x in rows(sr, sr.engine())}
+            md = "\n".join(markdown(list(rw.values())))
+            ok(schema.validate(sr) == [] and rw["base"].get("outside") == "range"
+               and "uncertainty range" in md and "base = 0.55 is outside" not in md,
+               f"EP7j the report's HIGH note names the range that is outside, not the value: {md[-260:]!r}")
             # engine: auto. Shape checks at sign-off; each candidate checked against its own card
             ra = toy_raw(d, base={"value": 0.55, "source": SRC})
             ra["engine"] = {"auto": True, "candidates": ["toolkit.spec.engine_parameters:ToySpecEngine",
@@ -541,6 +555,67 @@ def _self_test() -> int:
                and "k" not in j0[0]["params"],
                "EP-H3 with the field, the value enters every job's params (so job hashes change) and nothing else does")
     guard("EP-H job hashes", hash_cases)
+
+    # ------------------------------------------------------------ review round 2 (R2-3): a ranged value held fixed
+    def excluded_range_cases():
+        from toolkit.analysis import batch as Bt
+        with tempfile.TemporaryDirectory() as d:
+            r = toy_raw(d, base={"value": 0.3, "range": [0.25, 0.35], "dist": "uniform", "outside_card_range": True,
+                                 "source": SRC, "reason": WHY})
+            r["uncertainty"]["excluded"].append({"kind": "priors", "reason": "owner: hold the priors for this test"})
+            r["analysis"]["decision_tests"] = [{"id": "DTc", "type": "parameter_value", "parameter": "base",
+                                                "values": [0.5], "text": "Does the plan change at the card value?"}]
+            s = schema.Spec(r, d)
+            dsg, jobs = Bt.design(s)
+            ok(schema.validate(s) == [] and tested_boxes(s) == {"base": [0.3, 0.5]}
+               and dsg.get("spec_value_names") == ["base"] and "base" not in (dsg.get("prior_names") or []),
+               f"EP29 a ranged spec value whose priors are excluded is held, so the test that varies it is a design "
+               f"input: {tested_boxes(s)}, {dsg.get('spec_value_names')}")
+    guard("EP29 excluded range", excluded_range_cases)
+
+    # ------------------------------------------------------------ review round 2 (R2-1): interaction arms at spec values
+    def interaction_cases():
+        from toolkit.analysis import run as RUN, decision_tests as DTm
+        from toolkit.engines import benchmark as BM
+        from toolkit.engines.contract import ToyEngine
+        with tempfile.TemporaryDirectory() as d:
+            bench, _v_ok, _v_bad = RUN._toy_bench(d)
+            p = schema.toy_spec(d, n=24, bench=bench)
+            r = yaml.safe_load(open(p))
+            r[FIELD] = {"synergy": {"value": 0.05, "source": SRC, "reason": WHY}}
+            yaml.safe_dump(r, open(p, "w"), sort_keys=False)
+            signoff.sign(d, "lead", note="self-test")
+            R = RUN.run(d, log=q, compute_kw={"max_workers": 2})
+            t = {x["test_id"]: x for x in R["decision_tests"]}.get("DT1") or {}
+            ok(t.get("status") == "not_run" and "benchmark arms not computed at the spec values" in t.get("reason", ""),
+               f"EP26 an interaction test whose benchmark arms were computed at the card values is not run when the "
+               f"spec sets engine parameter values: {t.get('status')}, {t.get('reason', '')[:160]}")
+            # the arms computed at the spec values, with provenance, beside the spec
+            eng = ToyEngine(results_path=bench)
+            doc = EPm.spec_benchmarks(RUN._toy_pack(), eng, schema.load(p))
+            yaml.safe_dump(doc, open(os.path.join(d, EPm.SPEC_BENCH), "w"), sort_keys=False)
+            b = {x["id"]: x for x in doc["benchmarks"]}["T2"]
+            arm = {k: math.exp(sum(math.log(x[k]) for x in b["arm_or"]) / len(b["arm_or"])) for k in ("a11", "a10", "a01")}
+            cur = arm["a11"] / (arm["a10"] * arm["a01"])
+            A = R["_A"]
+            z0 = {i: v["z"] for i, v in R["calibration"]["units"].items()}
+            out0, ben0, cost0 = A.evaluate(A.theta0, z0)
+            plan0 = R["point"]["plan"]
+            dt = {"id": "DTi", "type": "interaction_rescale", "components": ["b"], "with_any": ["a"], "benchmark": "T2",
+                  "values": [cur], "text": "Does the plan change at the engine's own interaction?"}
+            rec = DTm.run_one(A, dt, z0, ben0, cost0, plan0, R["uncertainty"], out0)
+            base_obj = sum(ben0[i][plan0[i]] for i in A.ids)
+            got = (rec.get("results") or [{}])[0].get("point_plan_objective_under_test")
+            ok(rec.get("status") == "run" and got is not None and abs(got - base_obj) <= 1e-9 * max(1.0, abs(base_obj))
+               and EPm.SPEC_BENCH in str(rec.get("arm_source")),
+               f"EP27 with the arms computed at the spec values, testing the engine's own interaction changes no "
+               f"benefit: {base_obj} -> {got} ({rec.get('status')}, {rec.get('arm_source')})")
+            doc2 = dict(doc, spec_parameters={"synergy": 0.04})
+            yaml.safe_dump(doc2, open(os.path.join(d, EPm.SPEC_BENCH), "w"), sort_keys=False)
+            rec = DTm.run_one(A, dt, z0, ben0, cost0, plan0, R["uncertainty"], out0)
+            ok(rec.get("status") == "not_run" and "benchmark arms not computed at the spec values" in rec.get("reason", ""),
+               f"EP28 arms computed at other values are refused: {rec.get('reason', '')[:160]}")
+    guard("EP26-EP28 interaction arms", interaction_cases)
 
     # ------------------------------------------------------------ emulator path: application, UQ, decision test, reports
     def emulator_cases():

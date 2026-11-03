@@ -582,6 +582,17 @@ def _self_test() -> int:
        f"T1e spec-declared engine parameter values held fixed are named as such in the label: {lab!r}")
     ok(interval_meta_problem({"level": 0.95, "covers": ["priors"], "spec_fixed": ["held at 0.75 y"]}) is not None,
        "T1f the spec-value list holds parameter identifiers only (no free text)")
+    try:      # review round 2 (R2-2): the engine contract's parameter names (compartmental, package-rate engines)
+        lab = interval_label({"level": 0.95, "covers": ["priors"], "prior_dominated": ["efficacy:vax"],
+                              "fixed": ["lrr:a+b"], "spec_fixed": ["coverage:routine"]})
+    except ValueError as e:
+        lab = f"refused: {e}"
+    ok(lab == "95% UI over priors; set by declared ranges, not by data: efficacy:vax; held fixed at the spec value: "
+              "coverage:routine; held fixed: lrr:a+b",
+       f"T1g parameter names with ':' and '+' are identifiers the label accepts: {lab!r}")
+    ok(all(interval_meta_problem({"level": 0.95, "covers": ["priors"], "fixed": [bad]}) is not None
+           for bad in ("held at 3%", "a b", "x;y", "", ":lead", "a" * 90)),
+       "T1h free text is still refused (spaces, punctuation outside the contract's names, empty, overlong)")
     with tempfile.TemporaryDirectory() as d_il:
         for bad_c, why in (({"interval_label": "95% UI over everything"}, "free text"),
                            ({"interval": {"level": 0.95, "covers": ["costs"], "fixed": ["held at 3%"]}},
