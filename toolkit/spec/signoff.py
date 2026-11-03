@@ -283,6 +283,15 @@ def _self_test() -> int:
                                            "config": {"components": ["a", "b"]}, "eligible": False, "why_not": []}]))
         ok("PackageRateEngine`: not a parameter of this engine" in sec and "card not loaded" not in sec,
            f"SG16 a candidate's configuration is kept when its card is loaded: {sec[:400]!r}")
+        # review round 4 (R4-2): the spec lists the candidates and the pre-sign check supplies their configurations
+        raw["engine"] = {"auto": True, "candidates": ["toolkit.spec.engine_parameters:ToySpecEngine",
+                                                      "toolkit.engines.empirical.engine:PackageRateEngine"]}
+        yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+        sec = sec_of(sheet(d, candidates=[{"ref": "toolkit.engines.empirical.engine:PackageRateEngine",
+                                           "config": {"components": ["a", "b"]}, "eligible": False, "why_not": []}]))
+        ok("PackageRateEngine`: not a parameter of this engine" in sec and "card not loaded" not in sec
+           and "ToySpecEngine`: card value" in sec,
+           f"SG17 the spec's candidate refs are merged with the supplied candidate configurations: {sec[:500]!r}")
     # DI6, DI7, DI10 (docs/design/v2-derived-inputs.md): the sign-off freezes the derivation record, and the sheet
     # shows the owner the accepted defaults and the columns the run chose not to use.
     try:

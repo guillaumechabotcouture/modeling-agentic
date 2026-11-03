@@ -877,7 +877,8 @@ def _self_test() -> int:
             recd = json.load(open(os.path.join(d, EPm.SPEC_BENCH_RECORD)))
             arms = (recd.get("benchmarks") or {}).get("T2", {}).get("arms") or {}
             ok(path == os.path.join(d, EPm.SPEC_BENCH) and EPm.SPEC_BENCH.startswith("analysis/")
-               and recd.get("sha256") and set(arms) == {"a11", "a10", "a01", "a00"}
+               and recd.get("sha256") and set(arms) == {"a11", "a10", "a01", "a00"} and "config_sha256" in recd
+               and all("config_sha256" in x for x in arms.values())
                and all(x.get("engine_identity") == engine_identity(A.eng) for x in arms.values()),
                f"EP32 the harness step writes the file under analysis/ with a record of its digest and of the engine and "
                f"configuration each arm ran with: {sorted(arms)}")
@@ -936,6 +937,41 @@ def _self_test() -> int:
         ok(rn0._arm_jobs("mul_pyr", {"irs_kill": 0.4})[0][2] == dict(pk["settings"]["muleba"]["params"], irs_kill=0.4),
            "EP37 without spec values the arm parameters are unchanged (the setting's, then the fitted values)")
     guard("EP36-EP37 setting precedence", precedence_cases)
+
+    # ------------------------------------------------------------ review round 4 (R4-1): the full configuration digest
+    def config_digest_cases():
+        from toolkit.engines import benchmark as BM
+        from toolkit.engines.compartmental.engine import CompartmentalEngine
+        from toolkit.engines.contract import engine_identity
+        ref = "toolkit.engines.compartmental.engine:CompartmentalEngine"
+        e1, e2 = CompartmentalEngine(generation_interval=[1.0]), CompartmentalEngine(generation_interval=[0.5, 0.5])
+
+        class _S:            # a spec stub: the verification reads raw, base and path only
+            def __init__(self, d, cfg):
+                self.raw = {"engine": {"ref": ref, "config": cfg}, FIELD: {"r0": {"value": 1.5}}}
+                self.base, self.path = d, None
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "analysis"))
+            fp = os.path.join(d, EPm.SPEC_BENCH)
+            yaml.safe_dump({"benchmarks": []}, open(fp, "w"))
+            cfg1 = {"generation_interval": [1.0]}
+            arm = {"arm": "x", "setting": "s", "ref": ref, "config": cfg1, "config_name": None,
+                   "engine_identity": engine_identity(e1), "config_sha256": BM.config_digest(e1), "superseded": {}}
+            rec = {"producer": EPm.RECORD_PRODUCER, "file": EPm.SPEC_BENCH, "sha256": EPm._sha(fp),
+                   "spec_parameters": {"r0": 1.5}, "engine_identity": engine_identity(e1),
+                   "config_sha256": BM.config_digest(e1), "benchmarks": {"B": {"arms": {"a": arm}}}}
+            json.dump(rec, open(os.path.join(d, EPm.SPEC_BENCH_RECORD), "w"))
+            same = EPm.verified_spec_benchmarks(e1, _S(d, cfg1), "B")[1]
+            other = EPm.verified_spec_benchmarks(e2, _S(d, {"generation_interval": [0.5, 0.5]}), "B")[1]
+            ok(engine_identity(e1) == engine_identity(e2) and BM.config_digest(e1) != BM.config_digest(e2)
+               and same is None and other is not None and "configuration" in other,
+               f"EP38 a record made with generation_interval [1.0] is refused for [0.5, 0.5] (same identity, other "
+               f"configuration digest); accepted for its own: {same!r}, {other!r}")
+            del rec["config_sha256"]
+            json.dump(rec, open(os.path.join(d, EPm.SPEC_BENCH_RECORD), "w"))
+            ok(EPm.verified_spec_benchmarks(e1, _S(d, cfg1), "B")[1] is not None,
+               "EP39 a record without the configuration digest is refused (fail closed)")
+    guard("EP38-EP39 configuration digest", config_digest_cases)
 
     # ------------------------------------------------------------ emulator path: application, UQ, decision test, reports
     def emulator_cases():
