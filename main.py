@@ -1205,6 +1205,47 @@ def _run_self_test() -> int:
            and not _ihp(_RR) and _ihp(os.path.join(_RR, "docs")),
            "SO10 once signed the brief and criteria are frozen for every agent; docs/ (parent of docs/lessons) is harness")
         ok(exit_code_for("awaiting_signoff") == 2, "SO9 a paused run exits 2 (resumable)")
+        # SO11 (Codex round 2 on #131): the owner's commands and records are out of every agent's reach, through the
+        # real PreToolUse hook with v1-style tool calls (the lead and a specialist, in each sign-off mode).
+        owner_cmds = [f"python3 toolkit/spec/geometry.py approve {td} --by owner",
+                      f"cd {_RR} && python3 -m toolkit.spec.geometry approve {td} --by owner --accept a=b",
+                      f"python3 agents/stage_machine.py sign {td} --by owner",
+                      f"python3 toolkit/spec/signoff.py sign {td} --by owner",
+                      f"python3 scripts/scope_signoff.py sign {td} --accept-all",
+                      f"python3 scripts/decision_brief.py sign {td} --by owner --accept-proposed",
+                      f"python3 -c \"from toolkit.spec import geometry; geometry.approve('{td}', 'owner')\""]
+        writes = [("Write", {"file_path": os.path.join(td, "data", "geometry_signoff.json"), "content": "{}"}),
+                  ("Edit", {"file_path": os.path.join(td, "data", "geometry_signoff.json"), "old_string": "a",
+                            "new_string": "b"}),
+                  ("Bash", {"command": f"echo '{{}}' > {td}/data/geometry_signoff.json"}),
+                  ("Write", {"file_path": os.path.join(td, "data", "input_checks.json"), "content": "{}"}),
+                  ("Write", {"file_path": os.path.join(td, "decision_spec.signoff.json"), "content": "{}"})]
+        allowed, denied_all = [], True
+        for mode in ("owner", "lead", None):
+            hk11 = agents_pkg.create_hooks(td, trace, datetime.now(), registered_agents=reg, signoff=mode)
+            pre11 = hk11["PreToolUse"][0].hooks[0]
+            for who in ({}, {"agent_id": "m11", "agent_type": "modeler"}):
+                for tool, inp in [("Bash", {"command": c}) for c in owner_cmds] + writes:
+                    r = asyncio.run(pre11(dict({"tool_name": tool, "tool_input": inp}, **who), "so11", None))
+                    if (r.get("hookSpecificOutput") or {}).get("permissionDecision") != "deny":
+                        denied_all = False
+                        allowed.append((mode, who.get("agent_type", "lead"), tool, str(inp)[:70]))
+        ok(denied_all, f"SO11a every owner command and every write to the owner's records is denied to the lead and to "
+                       f"specialists, in owner, lead and no sign-off mode (allowed: {allowed[:4]})")
+        hk11 = agents_pkg.create_hooks(td, trace, datetime.now(), registered_agents=reg, signoff="lead")
+        r11 = json.dumps(asyncio.run(hk11["PreToolUse"][0].hooks[0](
+            {"tool_name": "Bash", "tool_input": {"command": f"python3 scripts/decision_brief.py sign {td} --by lead "
+                                                            "--accept-proposed --note ok"}}, "so11b", None)))
+        r11c = json.dumps(asyncio.run(hk11["PreToolUse"][0].hooks[0](
+            {"tool_name": "Bash", "tool_input": {"command": f"python3 toolkit/spec/geometry.py check {td}"}},
+            "so11c", None)))
+        ok("deny" not in r11 and "deny" not in r11c,
+           "SO11b the lead still signs the brief as the lead in lead mode, and anyone may run the check itself")
+        from agents.integrity import _protected_patterns as _pp
+        import fnmatch as _fn
+        ok(all(any(_fn.fnmatch(p, pat) for pat in _pp()) for p in ("data/geometry_signoff.json",
+                                                                       "data/input_checks.json")),
+           "SO11c the integrity record watches the geometry records (an unexplained change is a violation)")
         # SS1-SS6 (Phase 49 β): decision-bearing declarations wait for the owner.
         import scope_signoff as _ss
         from agents import scope_hold_reason

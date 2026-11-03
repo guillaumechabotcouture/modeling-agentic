@@ -953,6 +953,36 @@ def _self_test_owner(ok, th) -> None:
         r = check(d, th=th)
         ok(r["status"] == "failed" and FAILED in {f["kind"] for f in findings(r)},
            "IG9f an unreadable geometry sign-off record fails closed")
+    # IG13 (Codex round 2): a signed spec with no geometry record is HIGH (signed before the check, or through a path
+    # that skipped the freeze); the owner's approve creates the record (the migration path)
+    for how in ("spec", "brief"):
+        with tempfile.TemporaryDirectory() as d:
+            toy_inputs(d)
+            r0 = check(d, th=th)
+            if how == "spec":
+                json.dump({"signed_by": "owner", "sha256": {SPEC_FILE: _sha(os.path.join(d, SPEC_FILE))}},
+                          open(os.path.join(d, "decision_spec.signoff.json"), "w"))
+            else:
+                json.dump({"signed_by": "owner", "sha256": {SPEC_FILE: _sha(os.path.join(d, SPEC_FILE)),
+                                                            "decision_brief.yaml": None}},
+                          open(os.path.join(d, "decision_brief.signoff.json"), "w"))
+            r1 = check(d, th=th)
+            k1 = {(f["kind"], f["severity"], f["scope_declarable"]) for f in findings(r1)}
+            try:
+                approve(d, "owner")
+                k2 = {f["kind"] for f in findings(check(d, th=th))}
+            except (NameError, ValueError) as e:
+                k2 = {f"error: {e}"}
+            ok(MISSING not in {f["kind"] for f in findings(r0)} and (MISSING, "HIGH", False) in k1
+               and MISSING not in k2,
+               f"IG13 ({how}): a signed spec without a geometry record is HIGH {MISSING}, not declarable; the owner's "
+               f"approve creates the record ({sorted(k1)[:3]}; after: {sorted(k2)[:3]})")
+    with tempfile.TemporaryDirectory() as d:
+        toy_inputs(d)
+        os.remove(os.path.join(d, SPEC_FILE))
+        json.dump({"signed_by": "owner", "sha256": {"decision_brief.yaml": "x", SPEC_FILE: None}},
+                  open(os.path.join(d, "decision_brief.signoff.json"), "w"))
+        ok(not _spec_signed(d), "IG13b a brief-only sign-off (no spec hashed) is not a signed spec")
 
 
 def _self_test_shapes(ok, th) -> None:

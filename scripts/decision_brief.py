@@ -820,6 +820,37 @@ def _run_self_test() -> int:
         ok(status(d) == "signed" and load_brief(d)[1] == [] and "Not ready" not in render_md(d)
            and "schema 1" in render_md(d) and signoff_text(d),
            f"DB34: a schema 1 brief signed before Phase 43 is still signed: {load_brief(d)[1]}")
+    # DB35 (Codex round 2 on #131): signing the brief signs the decision spec when there is one, so it freezes the
+    # spec's geometry inputs too (toolkit/spec/geometry.py freeze); a brief-only run (no spec) is unchanged.
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from toolkit.spec import geometry as GEO
+    for by in ("owner", "lead"):
+        with tempfile.TemporaryDirectory() as d:
+            GEO.toy_inputs(d)
+            sp = yaml.safe_load(open(os.path.join(d, DECISION_SPEC)))
+            sp["decision_units"][GEO.ACCEPT_KEY] = {"reciprocal_swap:swap_a+swap_b": "rows checked"}
+            yaml.safe_dump(sp, open(os.path.join(d, DECISION_SPEC), "w"))
+            yaml.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d, CRITERIA), "w"))
+            yaml.safe_dump(example_brief(), open(os.path.join(d, BRIEF), "w"))
+            try:
+                sign(d, by, accept_proposed=True)
+                rec = json.load(open(os.path.join(d, GEO.SIGNOFF_FILE)))
+            except (OSError, ValueError) as e:
+                rec = {"error": str(e)}
+            want = ["reciprocal_swap:swap_a+swap_b"] if by == "owner" else []
+            ok(rec.get("signed_by") == by and (rec.get("declaration") or {}).get("enabled") is True
+               and sorted(rec.get("approvals") or {}) == want,
+               f"DB35 ({by}): the brief's sign-off freezes the spec's geometry inputs; only the owner's approves the "
+               f"proposed HIGH exception ({rec.get('signed_by')}, {sorted(rec.get('approvals') or {})}, "
+               f"{rec.get('error')})")
+    with tempfile.TemporaryDirectory() as d:
+        yaml.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d, CRITERIA), "w"))
+        yaml.safe_dump(example_brief(), open(os.path.join(d, BRIEF), "w"))
+        sign(d, "owner", accept_proposed=True)
+        ok(status(d) == "signed" and not os.path.exists(os.path.join(d, GEO.SIGNOFF_FILE)),
+           "DB35b a brief-only run (no decision spec) signs as before and writes no geometry record")
     if fails:
         print("FAIL:", *fails, sep="\n  ")
         return 1
