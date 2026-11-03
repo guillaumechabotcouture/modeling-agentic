@@ -20,7 +20,7 @@ Checks (pure Python and json; distances on a plane scaled by cos(latitude), area
                              LOW   within the tolerance (an edge case, listed, never blocking)
   area_mismatch              MEDIUM the declared area and the polygon area differ by more than area_ratio_max;
                              HIGH  when the declared area matches the polygon the point falls in better
-  unmatched                  MEDIUM a unit with no polygon (or no usable point); HIGH a polygon two units claim
+  unmatched                  MEDIUM a unit with no polygon (or no usable point) (a polygon two units claim is refused)
 A file that cannot be read or parsed is geometry_check_failed (HIGH): never a silent pass.
 
 Exceptions. `decision_units.geometry_accepted: {<finding id>: "<reason>"}` in the spec holds proposals. A MEDIUM or
@@ -94,8 +94,10 @@ def thresholds(path: str | None = None) -> dict:
 
 # --------------------------------------------------------------------------- declarations
 def boundaries_config(b, base: str, shown: str) -> dict:
-    """The presentation file's `boundaries` block, as the figures read it (docs/design/v2-figures.md): path and
-    feature_id (strings), an optional crosswalk {path, unit_id, feature_id} and credit; paths relative to the file."""
+    """The presentation file's `boundaries` block, the one parser for the figures and this check
+    (docs/design/v2-figures.md): path and feature_id (strings), an optional crosswalk {path, unit_id, feature_id,
+    union} and credit; paths relative to the file. `union: true` lets a unit map to several features (drawn and
+    checked as their union)."""
     def where(p):
         p = os.path.expanduser(str(p))
         return p if os.path.isabs(p) else os.path.join(base, p)
@@ -109,8 +111,13 @@ def boundaries_config(b, base: str, shown: str) -> dict:
     if xw is not None:
         if not isinstance(xw, dict) or not all(isinstance(xw.get(k), str) for k in ("path", "unit_id", "feature_id")):
             raise GeometryError(f"{shown}: boundaries.crosswalk needs path, unit_id and feature_id (strings)")
+        unknown = sorted(set(xw) - {"path", "unit_id", "feature_id", "union"})
+        if unknown:
+            raise GeometryError(f"{shown}: boundaries.crosswalk: unknown keys {unknown}")
+        if "union" in xw and not isinstance(xw["union"], bool):
+            raise GeometryError(f"{shown}: boundaries.crosswalk.union must be true or false")
         out["crosswalk"] = {"path": where(xw["path"]), "shown": xw["path"], "unit_id": xw["unit_id"],
-                            "feature_id": xw["feature_id"]}
+                            "feature_id": xw["feature_id"], "union": bool(xw.get("union", False))}
     if out.get("credit") is not None and not isinstance(out["credit"], str):
         raise GeometryError(f"{shown}: boundaries.credit must be a string")
     return out
@@ -168,8 +175,11 @@ def _ring(r, k, shown):
                                                                        and not isinstance(v, bool) for v in pt[:2])):
             raise GeometryError(f"{shown}: feature {k} has malformed coordinates")
         x, y = float(pt[0]), float(pt[1])
-        if not (math.isfinite(x) and math.isfinite(y) and -180 <= x <= 180 and -90 <= y <= 90):
-            raise GeometryError(f"{shown}: feature {k} has a position that is not longitude/latitude degrees")
+        if not (math.isfinite(x) and math.isfinite(y)):
+            raise GeometryError(f"{shown}: feature {k} has malformed coordinates (not finite)")
+        if not (-180 <= x <= 180 and -90 <= y <= 90):
+            raise GeometryError(f"{shown}: feature {k} has coordinates outside the geographic range (longitude "
+                                "within ±180, latitude within ±90): a projected file? Reproject to EPSG:4326")
         out.append((x, y))
     if out[0] == out[-1]:
         out = out[:-1]
@@ -183,10 +193,16 @@ def _ring(r, k, shown):
     return out
 
 
+GEOGRAPHIC_CRS = {"EPSG:4326", "urn:ogc:def:crs:EPSG::4326", "urn:ogc:def:crs:OGC:1.3:CRS84", "OGC:CRS84", "CRS84",
+                  "urn:ogc:def:crs:OGC::CRS84"}
+
+
 def read_features(cfg: dict) -> dict:
     """{feature id: [polygon]} with polygon = [outer ring, hole, ...] and ring = [(lon, lat)], from a GeoJSON
-    FeatureCollection of Polygon and MultiPolygon features. Features sharing an id are parts of one unit (the
-    figures' rule). Anything else: GeometryError."""
+    FeatureCollection of Polygon and MultiPolygon features in geographic coordinates (EPSG:4326 / CRS84). The one
+    reader for the figures and this check. Fail closed (GeometryError): an unreadable file, a projected CRS,
+    coordinates outside the geographic range, a malformed or degenerate ring, and a feature id used by two features.
+    An empty MultiPolygon is a feature with no polygon ([]): its unit is unmatched."""
     shown = cfg.get("shown") or cfg["path"]
     try:
         with open(cfg["path"], encoding="utf-8") as f:
@@ -196,7 +212,13 @@ def read_features(cfg: dict) -> dict:
     feats = doc.get("features") if isinstance(doc, dict) else None
     if not isinstance(feats, list) or not feats:
         raise GeometryError(f"{shown}: not a GeoJSON FeatureCollection with features")
+    crs = doc.get("crs")
+    name = ((crs.get("properties") or {}).get("name") if isinstance(crs, dict) else None)
+    if crs is not None and name not in GEOGRAPHIC_CRS:
+        raise GeometryError(f"{shown}: CRS {name or crs!r} is not geographic (EPSG:4326 / CRS84 only); reproject the "
+                            "file")
     out: dict = {}
+    dup = set()
     for k, f in enumerate(feats):
         g = f.get("geometry") if isinstance(f, dict) else None
         props = f.get("properties") if isinstance(f, dict) else None
@@ -206,20 +228,24 @@ def read_features(cfg: dict) -> dict:
             raise GeometryError(f"{shown}: feature {k} has no property {cfg['feature_id']}")
         typ, co = g.get("type"), g.get("coordinates")
         polys = [co] if typ == "Polygon" else co if typ == "MultiPolygon" else None
-        if not isinstance(polys, list) or not polys:
+        if not isinstance(polys, list) or (typ == "Polygon" and not co):
             raise GeometryError(f"{shown}: feature {k} geometry {typ!r} is not a Polygon or MultiPolygon")
         parts = []
         for poly in polys:
             if not isinstance(poly, list) or not poly:
                 raise GeometryError(f"{shown}: feature {k} has malformed coordinates")
             parts.append([_ring(r, k, shown) for r in poly])
-        out.setdefault(str(props[cfg["feature_id"]]), []).extend(parts)
+        fid = str(props[cfg["feature_id"]])
+        if fid in out:
+            dup.add(fid)
+        out[fid] = parts
+    if dup:
+        raise GeometryError(f"{shown}: feature id {cfg['feature_id']} is not unique: {sorted(dup)[:20]}")
     return out
 
 
 def read_crosswalk(c: dict) -> dict:
-    """{unit id: feature id}; rows with an empty feature id are skipped (no polygon). A unit listed twice with two
-    different features: GeometryError."""
+    """{unit id: [feature id, ...]} in file order; rows with an empty feature id are skipped (no polygon)."""
     shown = c.get("shown") or c["path"]
     try:
         with open(c["path"], newline="", encoding="utf-8") as fh:
@@ -233,10 +259,32 @@ def read_crosswalk(c: dict) -> dict:
         u, fid = str(r[c["unit_id"]] or "").strip(), str(r[c["feature_id"]] or "").strip()
         if not u or not fid:
             continue
-        if out.get(u, fid) != fid:
-            raise GeometryError(f"{shown}: unit {u} maps to two features ({out[u]}, {fid})")
-        out[u] = fid
+        fl = out.setdefault(u, [])
+        if fid not in fl:
+            fl.append(fid)
     return out
+
+
+def resolve_targets(xw: dict | None, unit_ids, union: bool, shown: str) -> dict:
+    """{unit id: [feature id, ...]} for the units of the table: through the crosswalk, or the unit id itself as the
+    feature id. Refused (GeometryError naming every affected unit): a unit mapped to several features without
+    `crosswalk.union: true`, and a feature mapped to two units."""
+    ids = [str(u) for u in unit_ids]
+    targets = {u: list((xw or {}).get(u, [])) if xw is not None else [u] for u in ids}
+    multi = sorted(u for u, fl in targets.items() if len(fl) > 1)
+    if multi and not union:
+        raise GeometryError(f"{shown}: {len(multi)} units map to more than one feature: {multi[:20]}; declare "
+                            "crosswalk.union: true to draw each such unit as the union of its features")
+    users: dict = {}
+    for u, fl in targets.items():
+        for fid in fl:
+            users.setdefault(fid, []).append(u)
+    shared = {fid: us for fid, us in users.items() if len(us) > 1}
+    if shared:
+        aff = sorted({u for us in shared.values() for u in us})
+        raise GeometryError(f"{shown}: {len(shared)} features map to more than one unit (units {aff[:20]}); each "
+                            "feature may belong to one unit")
+    return targets
 
 
 def read_table(path: str) -> list[dict]:
@@ -322,26 +370,34 @@ def _ratio(a, b):
     return math.inf if min(a, b) <= 0 else max(a, b) / min(a, b)
 
 
-def evaluate(rows: list[dict], cols: dict, feats: dict, xw: dict | None, th: dict) -> dict:
-    """The four checks on parsed inputs: {counts, findings, checks}. Pure: no files."""
+def evaluate(rows: list[dict], cols: dict, feats: dict, targets: dict | None, th: dict) -> dict:
+    """The four checks on parsed inputs: {counts, findings, checks}. Pure: no files. `targets` is
+    resolve_targets()'s {unit: [feature id, ...]} (None: each unit id is its feature id); a unit with several
+    features (crosswalk.union) is checked against their union."""
     uid, latc, lonc, areac = cols["id"], cols["lat"], cols["lon"], cols.get("area")
     tol, rmax = th["edge_tolerance_km"], th["area_ratio_max"]
     ids = [str(r.get(uid, "")).strip() for r in rows]
     by = dict(zip(ids, rows))
-    boxes = {fid: bbox(p) for fid, p in feats.items()}
-    areas = {fid: area_km2(p) for fid, p in feats.items()}
-    findings, own, pt = [], {}, {}
-    claim_of: dict = {}
+    if targets is None:
+        targets = {u: [u] for u in ids}
+    live = {fid: p for fid, p in feats.items() if p}             # features with at least one polygon
+    boxes = {fid: bbox(p) for fid, p in live.items()}
+    farea = {fid: area_km2(p) for fid, p in live.items()}
+    findings, own, poly, pt = [], {}, {}, {}
     for u in ids:
-        fid = (xw or {}).get(u) if xw is not None else u
+        fl = targets.get(u, [])
         why = []
-        if fid is None:
+        if not fl:
             why.append("no crosswalk row")
-        elif fid not in feats:
-            why.append(f"feature {fid} is not in the boundary file")
-        else:
-            own[u] = fid
-            claim_of.setdefault(fid, []).append(u)
+        missing = [f for f in fl if f not in feats]
+        empty = [f for f in fl if f in feats and not feats[f]]
+        if missing:
+            why.append(f"feature(s) {', '.join(missing)} not in the boundary file")
+        if empty:
+            why.append(f"feature(s) {', '.join(empty)} have no polygon")
+        if fl and not missing and not empty:
+            own[u] = list(fl)
+            poly[u] = [p for f in fl for p in feats[f]]
         lon, lat = _num(by[u].get(lonc)), _num(by[u].get(latc))
         if lon is None or lat is None or not (-180 <= lon <= 180 and -90 <= lat <= 90):
             why.append("no usable coordinates")
@@ -350,47 +406,42 @@ def evaluate(rows: list[dict], cols: dict, feats: dict, xw: dict | None, th: dic
         if why:
             findings.append({"id": f"unmatched:{u}", "code": "unmatched", "severity": "MEDIUM", "units": [u],
                              "claim": f"unit {u}: {' and '.join(why)}; its point and area cannot be checked",
-                             "evidence": {"feature": fid}})
-    for fid, us in sorted(claim_of.items()):
-        if len(us) > 1:
-            findings.append({"id": f"unmatched:feature:{fid}", "code": "unmatched", "severity": "HIGH", "units": us,
-                             "claim": f"feature {fid} is claimed by {len(us)} units ({', '.join(us)}): at most one "
-                                      "of them has its own polygon", "evidence": {"feature": fid}})
+                             "evidence": {"features": fl}})
+    owner_of = {f: u for u, fl in own.items() for f in fl}       # one unit per feature (resolve_targets)
+    uarea = {u: sum(farea[f] for f in fl) for u, fl in own.items()}
 
     def holders(x, y):
         return [f for f, (x0, y0, x1, y1) in boxes.items() if x0 <= x <= x1 and y0 <= y <= y1
-                and contains(feats[f], x, y)]
+                and contains(live[f], x, y)]
     inside, outside = {}, {}
-    for u, fid in own.items():
+    for u in own:
         if u not in pt:
             continue
-        inside[u] = contains(feats[fid], *pt[u])
+        inside[u] = contains(poly[u], *pt[u])
         if not inside[u]:
-            outside[u] = {"distance_km": distance_km(feats[fid], *pt[u]), "in": holders(*pt[u])}
+            outside[u] = {"distance_km": distance_km(poly[u], *pt[u]),
+                          "in": [f for f in holders(*pt[u]) if f not in own[u]]}
     swapped: dict = {}
     for a in sorted(outside):
         for fb in outside[a]["in"]:
-            for b in claim_of.get(fb, []):
-                # a pair only when both points lie outside their own polygons (overlapping or nested polygons can
-                # put b's point in a's polygon while it is also inside b's own)
-                if b != a and b in outside and a not in swapped and b not in swapped \
-                        and contains(feats[own[a]], *pt[b]):
-                    swapped[a], swapped[b] = b, a
-    area_of = {}
-    if areac:
-        for u in own:
-            area_of[u] = _num(by[u].get(areac))
+            b = owner_of.get(fb)
+            # a pair only when both points lie outside their own polygons (overlapping or nested polygons can
+            # put b's point in a's polygon while it is also inside b's own)
+            if b is not None and b != a and b in outside and a not in swapped and b not in swapped \
+                    and contains(poly[a], *pt[b]):
+                swapped[a], swapped[b] = b, a
+    area_of = {u: _num(by[u].get(areac)) for u in own} if areac else {}
     done = set()
     for a in sorted(swapped):
         b = swapped[a]
         if a in done:
             continue
         done |= {a, b}
-        ev = {"features": {a: own[a], b: own[b]},
+        ev = {"features": {a: "+".join(own[a]), b: "+".join(own[b])},
               "distance_km": {a: round(outside[a]["distance_km"], 2), b: round(outside[b]["distance_km"], 2)}}
         if areac and area_of.get(a) and area_of.get(b):
-            own_r = [_ratio(area_of[a], areas[own[a]]), _ratio(area_of[b], areas[own[b]])]
-            sw_r = [_ratio(area_of[a], areas[own[b]]), _ratio(area_of[b], areas[own[a]])]
+            own_r = [_ratio(area_of[a], uarea[a]), _ratio(area_of[b], uarea[b])]
+            sw_r = [_ratio(area_of[a], uarea[b]), _ratio(area_of[b], uarea[a])]
             ev["area_ratio_own"], ev["area_ratio_swapped"] = [round(r, 3) for r in own_r], [round(r, 3) for r in sw_r]
             ev["areas_consistent_with_swap"] = max(sw_r) < min(own_r) or (max(sw_r) <= rmax < max(own_r))
         findings.append({"id": f"reciprocal_swap:{a}+{b}", "code": "reciprocal_swap", "severity": "HIGH",
@@ -404,9 +455,9 @@ def evaluate(rows: list[dict], cols: dict, feats: dict, xw: dict | None, th: dic
         if u in swapped:
             continue
         o = outside[u]
-        other = [f for f in o["in"] if f != own[u]]
-        ev = {"feature": own[u], "distance_km": round(o["distance_km"], 2), "in_features": other,
-              "in_units": sorted({b for f in other for b in claim_of.get(f, [])})}
+        other = o["in"]
+        ev = {"feature": "+".join(own[u]), "distance_km": round(o["distance_km"], 2), "in_features": other,
+              "in_units": sorted({owner_of[f] for f in other if f in owner_of})}
         if o["distance_km"] <= tol:
             findings.append({"id": f"point_outside_own_polygon:{u}", "code": "point_outside_own_polygon",
                              "severity": "LOW", "edge": True, "units": [u], "evidence": ev,
@@ -423,7 +474,7 @@ def evaluate(rows: list[dict], cols: dict, feats: dict, xw: dict | None, th: dic
         for u in sorted(own):
             if u in swapped:
                 continue
-            d, pa = area_of.get(u), areas[own[u]]
+            d, pa = area_of.get(u), uarea[u]
             if d is None or d <= 0:
                 findings.append({"id": f"area_mismatch:{u}", "code": "area_mismatch", "severity": "MEDIUM",
                                  "units": [u], "evidence": {"declared_km2": d, "polygon_km2": round(pa, 1)},
@@ -435,12 +486,13 @@ def evaluate(rows: list[dict], cols: dict, feats: dict, xw: dict | None, th: dic
             ev = {"declared_km2": round(d, 1), "polygon_km2": round(pa, 1), "ratio": round(r, 3)}
             sev, extra = "MEDIUM", ""
             # the polygon the point falls in, when it lies beyond the edge tolerance (an edge-case point says
-            # nothing about which polygon the row's fields came from)
+            # nothing about which polygon the row's fields came from); its unit's whole polygon when it has one
             o = outside.get(u) or {}
-            alt = [f for f in o.get("in", []) if f != own[u]] if o.get("distance_km", 0) > tol else []
+            alt = o.get("in", []) if o.get("distance_km", 0) > tol else []
             if alt:
-                rs = _ratio(d, areas[alt[0]])
-                ev.update(point_feature=alt[0], point_feature_km2=round(areas[alt[0]], 1), ratio_swapped=round(rs, 3))
+                alt_km2 = uarea[owner_of[alt[0]]] if alt[0] in owner_of else farea[alt[0]]
+                rs = _ratio(d, alt_km2)
+                ev.update(point_feature=alt[0], point_feature_km2=round(alt_km2, 1), ratio_swapped=round(rs, 3))
                 if rs < r and rs <= rmax:
                     sev, extra = "HIGH", (f"; it matches feature {alt[0]}, where the point lies, better "
                                           f"(ratio {rs:.2f}): the row's geometry fields probably belong elsewhere")
@@ -457,9 +509,7 @@ def evaluate(rows: list[dict], cols: dict, feats: dict, xw: dict | None, th: dic
               "area_mismatches": sum(f["code"] == "area_mismatch" for f in findings),
               "area_mismatches_escalated": sum(f["code"] == "area_mismatch" and f["severity"] == "HIGH"
                                                for f in findings),
-              "units_unmatched": sum(f["id"].startswith("unmatched:") and not f["id"].startswith("unmatched:feature:")
-                                     for f in findings),
-              "features_claimed_twice": sum(f["id"].startswith("unmatched:feature:") for f in findings)}
+              "units_unmatched": sum(f["code"] == "unmatched" for f in findings)}
     checks = {"point": "ran", "reciprocal": "ran",
               "area": "ran" if areac else "not run: no area column declared", "unmatched": "ran"}
     return {"counts": counts, "findings": findings, "checks": checks}
@@ -523,7 +573,8 @@ def _declaration(cfg, pres, cols, units) -> dict:
     xw = (cfg or {}).get("crosswalk")
     return {"enabled": bool(cfg is not None and cols.get("lat") and cols.get("lon")), "presentation": pres,
             "boundaries": {"path": cfg["shown"], "feature_id": cfg["feature_id"]} if cfg else None,
-            "crosswalk": {"path": xw["shown"], "unit_id": xw["unit_id"], "feature_id": xw["feature_id"]} if xw else None,
+            "crosswalk": {"path": xw["shown"], "unit_id": xw["unit_id"], "feature_id": xw["feature_id"],
+                          "union": bool(xw.get("union"))} if xw else None,
             "columns": {k: cols.get(k) for k in ("id", "lat", "lon", "area")}, "units": units}
 
 
@@ -609,6 +660,9 @@ def check(run_dir: str, spec: dict | None = None, th: dict | None = None, use_si
         rep["thresholds"] = th
         feats = read_features(cfg)
         xw = read_crosswalk(cfg["crosswalk"]) if cfg.get("crosswalk") else None
+        xw = resolve_targets(xw, [str(r.get(cols["id"], "")).strip() for r in rows],
+                             bool((cfg.get("crosswalk") or {}).get("union")),
+                             (cfg.get("crosswalk") or {}).get("shown") or cfg["shown"])
         rep["inputs"]["boundaries"] = {"path": cfg["shown"], "feature_id": cfg["feature_id"],
                                        "sha256": shas["boundaries"]}
         if cfg.get("crosswalk"):
@@ -766,8 +820,7 @@ def sheet_lines(run_dir: str) -> list[str]:
     out.append(f"Checked {c.get('points_checked')} unit point(s) against {c.get('features')} boundary feature(s): "
                f"{c.get('reciprocal_swaps')} reciprocal swap(s), {c.get('points_outside')} point(s) outside their "
                f"polygon beyond the tolerance, {c.get('edge_cases')} edge case(s), {c.get('area_mismatches')} area "
-               f"mismatch(es), {c.get('units_unmatched')} unmatched unit(s), {c.get('features_claimed_twice')} "
-               f"feature(s) claimed twice. Area check: {(rep.get('checks') or {}).get('area')}. Signing freezes the "
+               f"mismatch(es), {c.get('units_unmatched')} unmatched unit(s). Area check: {(rep.get('checks') or {}).get('area')}. Signing freezes the "
                "boundary declaration and the boundary and crosswalk files (sha256); a later change needs the owner.")
     fs = rep.get("findings") or []
     prop = [f for f in fs if f["severity"] == "HIGH" and f.get("proposed") and not f.get("accepted")]
@@ -799,6 +852,7 @@ def _main(argv=None) -> int:
         t.add_argument("--" + k.replace("_", "-"), required=True)
     for k in ("crosswalk", "xw_unit", "xw_feature", "area"):
         t.add_argument("--" + k.replace("_", "-"))
+    t.add_argument("--union", action="store_true")
     p = sub.add_parser("approve", help="the owner: re-freeze the current geometry inputs and approve the spec's "
                                        "proposed HIGH exceptions (and --accept ID=REASON)", allow_abbrev=False)
     p.add_argument("run_dir")
@@ -825,8 +879,9 @@ def _main(argv=None) -> int:
             feats = read_features({"path": a.boundaries, "feature_id": a.feature_id})
             xw = read_crosswalk({"path": a.crosswalk, "unit_id": a.xw_unit, "feature_id": a.xw_feature}) \
                 if a.crosswalk else None
-            ev = evaluate(read_table(a.units), {"id": a.id, "lat": a.lat, "lon": a.lon, "area": a.area}, feats, xw,
-                          thresholds())
+            rows = read_table(a.units)
+            xw = resolve_targets(xw, [str(r.get(a.id, "")).strip() for r in rows], a.union, a.crosswalk or a.boundaries)
+            ev = evaluate(rows, {"id": a.id, "lat": a.lat, "lon": a.lon, "area": a.area}, feats, xw, thresholds())
             rep = {"status": "ran", **ev}
         except GeometryError as e:
             rep = {"status": "failed", "reason": str(e)}
@@ -845,8 +900,8 @@ def _square(x0, y0, s):
 def toy_inputs(d: str, area_col: bool = True) -> dict:
     """A synthetic run dir: squares of 0.5 degrees near 10N and a units table with one clean unit, one edge-case point
     just outside its square, one reciprocal swapped pair (points and areas exchanged), one area mismatch, one unit
-    whose point and area belong to another unit's square (not reciprocal), one unit with no crosswalk row, two units
-    claiming one feature, a MultiPolygon unit (point in its second part) and a unit with a hole (point in the
+    whose point and area belong to another unit's square (not reciprocal), one unit with no crosswalk row,
+    a MultiPolygon unit (point in its second part) and a unit with a hole (point in the
     hole). Returns {name: unit id}."""
     import yaml
     s = 0.5
@@ -868,7 +923,7 @@ def toy_inputs(d: str, area_col: bool = True) -> dict:
     rows = [("clean", "F0", c["F0"], A), ("edge", "F1", (edge_lon, c["F1"][1]), A),
             ("swap_a", "F2", c["F3"], A * 2.5), ("swap_b", "F3", c["F2"], A),
             ("big", "F4", c["F4"], A * 3), ("stray", "F5", c["F6"], A), ("owner6", "F6", c["F6"], A),
-            ("nomatch", None, c["F9"], A), ("twin_a", "F9", c["F9"], A), ("twin_b", "F9", c["F9"], A),
+            ("nomatch", None, c["F9"], A),
             ("multi", "F7", (c["F7"][0], c["F7"][1] + 0.6), 2 * A), ("holed", "F8", c["F8"], A * (1 - 0.16))]
     # swap_a's square is shrunk so the swapped areas tell: give F3 a 2.5x area by a taller polygon
     feats[3]["geometry"] = {"type": "Polygon", "coordinates": [[[1.8, 10.0], [2.3, 10.0], [2.3, 11.25], [1.8, 11.25],
@@ -914,7 +969,7 @@ def _self_test_owner(ok, th) -> None:
     with tempfile.TemporaryDirectory() as d:
         toy_inputs(d)
         sp = yaml.safe_load(open(os.path.join(d, SPEC_FILE)))
-        highs = ["reciprocal_swap:swap_a+swap_b", "unmatched:feature:F9", "point_outside_own_polygon:stray",
+        highs = ["reciprocal_swap:swap_a+swap_b", "point_outside_own_polygon:stray",
                  "area_mismatch:stray", "point_outside_own_polygon:holed"]
         sp["decision_units"][ACCEPT_KEY] = {k: "the planner says it is fine" for k in highs}
         sp["decision_units"][ACCEPT_KEY]["area_mismatch:big"] = "known boundary vintage difference"
@@ -1047,6 +1102,49 @@ def _self_test_shapes(ok, th) -> None:
     except Exception as e:  # noqa: BLE001
         ok(False, f"IG11 nested polygons: a pair forms only when both points lie outside their own polygons: "
                   f"{type(e).__name__}: {e}")
+    # IG14 (the one loader for figures and check, merged from #127): crosswalk union and its refusals, unique feature
+    # ids, an empty MultiPolygon, and the geographic-CRS rule
+    import yaml
+    with tempfile.TemporaryDirectory() as d:
+        def run_with(xw_rows=None, union=None, edit=None, crs=None):
+            toy_inputs(d)
+            if xw_rows is not None:
+                open(os.path.join(d, "xw.csv"), "w").write("uid,code\n" + "".join(f"{u},{f}\n" for u, f in xw_rows))
+            if union is not None:
+                p = yaml.safe_load(open(os.path.join(d, "presentation.yaml")))
+                p["boundaries"]["crosswalk"]["union"] = union
+                yaml.safe_dump(p, open(os.path.join(d, "presentation.yaml"), "w"))
+            if edit or crs:
+                g = json.load(open(os.path.join(d, "b.geojson")))
+                if edit:
+                    edit(g["features"])
+                if crs:
+                    g["crs"] = {"type": "name", "properties": {"name": crs}}
+                json.dump(g, open(os.path.join(d, "b.geojson"), "w"))
+            return check(d, th=th)
+        base = [(u, f) for u, f in (("clean", "F0"), ("edge", "F1"), ("swap_a", "F2"), ("swap_b", "F3"), ("big", "F4"),
+                                    ("stray", "F5"), ("owner6", "F6"), ("multi", "F7"), ("holed", "F8"))]
+        r_multi = run_with(base + [("clean", "F9")])
+        r_union = run_with(base + [("clean", "F9")], union=True)
+        r_shared = run_with(base + [("nomatch", "F0")])
+        r_dup = run_with(edit=lambda fs: fs[9]["properties"].update(code="F0"))
+        r_empty = run_with(edit=lambda fs: fs[4].update(geometry={"type": "MultiPolygon", "coordinates": []}))
+        r_crs = run_with(crs="EPSG:3857")
+        r_crs84 = run_with(crs="urn:ogc:def:crs:OGC:1.3:CRS84")
+        cl = [f["id"] for f in r_union.get("findings") or [] if "clean" in f["units"]]
+        ok(r_multi["status"] == "failed" and "clean" in r_multi["reason"] and "union" in r_multi["reason"]
+           and r_union["status"] == "ran" and cl == ["area_mismatch:clean"],
+           f"IG14a a unit mapped to two features is refused (naming it) unless crosswalk.union: true; with union it is "
+           f"checked against the union (its point is inside, its area is now half the union's) "
+           f"({r_multi['reason'][:80]}; {cl})")
+        ok(r_shared["status"] == "failed" and "clean" in r_shared["reason"] and "nomatch" in r_shared["reason"],
+           f"IG14b a feature mapped to two units is refused, naming both ({r_shared['reason'][:100]})")
+        ok(r_dup["status"] == "failed" and "not unique" in r_dup["reason"],
+           f"IG14c a feature id used by two features is refused ({r_dup['reason'][:80]})")
+        ok(r_empty["status"] == "ran" and any(f["id"] == "unmatched:big" for f in r_empty["findings"]),
+           f"IG14d a unit whose feature is an empty MultiPolygon is unmatched ({r_empty['reason']})")
+        ok(r_crs["status"] == "failed" and "CRS" in r_crs["reason"] and r_crs84["status"] == "ran",
+           f"IG14e a projected CRS is refused; CRS84 is accepted ({r_crs['reason'][:80]})")
     R2 = 6371.0088 ** 2
     cell = rect(0, 10, 1, 11)
     exact = R2 * math.radians(1.0) * (math.sin(math.radians(11)) - math.sin(math.radians(10)))
@@ -1121,10 +1219,8 @@ def _self_test() -> int:
            and sa.get("severity") == "HIGH" and sa["evidence"]["ratio_swapped"] < 1.01,
            f"IG2e a point in another unit's polygon (not reciprocal) is HIGH, and its area mismatch escalates to HIGH "
            f"because it matches that polygon: {st.get('evidence')} {sa.get('evidence')}")
-        ok((by.get("unmatched:nomatch") or {}).get("severity") == "MEDIUM"
-           and (by.get("unmatched:feature:F9") or {}).get("units") == ["twin_a", "twin_b"]
-           and by["unmatched:feature:F9"]["severity"] == "HIGH",
-           "IG2f a unit with no polygon is MEDIUM unmatched; a polygon two units claim is HIGH")
+        ok((by.get("unmatched:nomatch") or {}).get("severity") == "MEDIUM",
+           "IG2f a unit with no polygon is MEDIUM unmatched")
         ok(not any("multi" in f["units"] for f in rep["findings"]),
            "IG2g a MultiPolygon unit whose point is in its second part, with the summed area, has no finding")
         h = by.get("point_outside_own_polygon:holed") or {}
@@ -1133,12 +1229,12 @@ def _self_test() -> int:
            f"({h.get('evidence')})")
         c = rep["counts"]
         ok((c["reciprocal_swaps"], c["edge_cases"], c["points_outside"], c["area_mismatches"],
-            c["area_mismatches_escalated"], c["units_unmatched"], c["features_claimed_twice"]) == (1, 1, 2, 2, 1, 1, 1),
+            c["area_mismatches_escalated"], c["units_unmatched"]) == (1, 1, 2, 2, 1, 1),
            f"IG2i the counts: {c}")
 
         # IG3 pre-sign problems and the gate's view; acceptance by name
         pr = {p["code"] for p in problems(rep)}
-        ok(pr == {"reciprocal_swap", "point_outside_own_polygon", "area_mismatch", "unmatched"}
+        ok(pr == {"reciprocal_swap", "point_outside_own_polygon", "area_mismatch"}
            and all(p["code"] != "area_mismatch" or "stray" in p["claim"] for p in problems(rep)),
            f"IG3a every unaccepted HIGH blocks SIGN, and nothing below HIGH does ({sorted(pr)})")
         g = {(f["kind"], f["key"]): f for f in findings(rep)}
@@ -1148,12 +1244,11 @@ def _self_test() -> int:
            "IG3b at the gate: HIGH not declarable, MEDIUM declarable, edge cases one LOW note, stage PLAN")
         sp = yaml.safe_load(open(os.path.join(d, SPEC_FILE)))
         sp["decision_units"][ACCEPT_KEY] = {"reciprocal_swap:swap_a+swap_b": "checked by the owner: correct as is",
-                                            "unmatched:feature:F9": "two units share one boundary by design",
                                             "point_outside_own_polygon:stray": "the point is the main town",
                                             "area_mismatch:stray": "known boundary change",
                                             "point_outside_own_polygon:holed": "the point is the enclave's town"}
         rep2 = check(d, sp, th)
-        ok(problems(rep2) == [] and len(owner_pending(rep2)) == 5 and not any(
+        ok(problems(rep2) == [] and len(owner_pending(rep2)) == 4 and not any(
             f.get("accepted") for f in rep2["findings"] if f["severity"] == "HIGH"),
            f"IG3c proposed by name with a reason, the spec is not sent back, and the HIGH findings wait for the owner "
            f"({problems(rep2)[:2]}, {owner_pending(rep2)})")

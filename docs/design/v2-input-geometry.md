@@ -53,9 +53,8 @@ lie outside their own polygons, so overlapping or nested polygons cannot make on
 | | LOW | Within the tolerance: an edge case, listed but never blocking. |
 | `area_mismatch` | MEDIUM | max(declared, polygon) / min(declared, polygon) > `area_ratio_max`, or there is no positive declared area. |
 | | HIGH | The declared area matches better the polygon where the point lies (beyond the tolerance), within the factor: the row probably belongs to that polygon. |
-| `unmatched` | MEDIUM | A unit with no polygon (no crosswalk row, or a feature missing from the file) or with no usable point. |
-| | HIGH | One feature claimed by two or more units. |
-| `geometry_check_failed` | HIGH | A declared input cannot be read or parsed: invalid JSON, no features, a feature without its id property, a geometry that is not a polygon, a ring with fewer than 3 positions, a non-finite or non-degree coordinate, a crosswalk that maps one unit to two features, or a declared column that is missing. |
+| `unmatched` | MEDIUM | A unit with no polygon (no crosswalk row, a feature missing from the file, or a feature that is an empty MultiPolygon) or with no usable point. |
+| `geometry_check_failed` | HIGH | A declared input cannot be read or parsed, which also stops the figures' maps (one loader, below). The cases: invalid JSON; no features; a feature without its id property; a feature id used by two features; a geometry that is not a polygon; a degenerate ring; a non-finite coordinate, or one outside the geographic range; a `crs` other than EPSG:4326 / CRS84; a unit mapped to several features without `crosswalk.union: true`; a feature mapped to two units; or a declared column that is missing. |
 | `geometry_check_not_run` | LOW | No boundaries declared, or no coordinates declared ("not run: no coordinates declared"). This is never a silent pass. |
 
 **Thresholds.** These are in `.claude/orchestration/effort_floors.yaml` under a new section,
@@ -92,8 +91,7 @@ severity, units, claim, evidence and acceptance.
 
 **Exceptions** (revised after the review of #131). `decision_units.geometry_accepted: {<finding id>:
 "<reason>"}` in the spec holds *proposals*, which the planner may write. Finding ids are stable and readable:
-`reciprocal_swap:<a>+<b>`, `point_outside_own_polygon:<u>`, `area_mismatch:<u>`, `unmatched:<u>`,
-`unmatched:feature:<f>`.
+`reciprocal_swap:<a>+<b>`, `point_outside_own_polygon:<u>`, `area_mismatch:<u>`, `unmatched:<u>`.
 - A MEDIUM or LOW proposal with a reason is accepted, as `defaults_accepted` is.
 - A HIGH proposal counts only once the owner approves it. The approval is a harness record,
   `data/geometry_signoff.json`, which no task can write (it is in `HARNESS_FILES`). It is written by the owner's
@@ -161,9 +159,20 @@ rejected. Until then:
   boundary file changes. The check needs only the units table and the boundaries, so it runs once in `h_SPEC`
   and at the gate.
 - **A new checks config for the boundaries.** The figures already declare them, so a second declaration
-  could disagree with the first. The keys and file discovery are the figures' own. The declaration parser is
-  duplicated for now, because PR #127 is not merged, and the second PR to land imports the other's (agreed
-  with the figures work).
+  could disagree with the first. The keys and file discovery are the figures' own.
+
+**One loader (after #127 merged into v2).** `toolkit/spec/geometry.py` is the single boundaries declaration
+parser and GeoJSON reader for the figures and for this check:
+- `boundaries_config` reads the declaration, `read_features` the GeoJSON, `read_crosswalk` the crosswalk, and
+  `resolve_targets` matches units to features.
+- `toolkit/analysis/figures.py load_boundaries` calls them.
+- #127's declaration keys and `crosswalk.union` are kept, and so are its refusals: a unit mapped to several
+  features without `union`, a feature mapped to two units, a duplicate feature id, a non-geographic CRS, and
+  coordinates outside the geographic range.
+- An empty MultiPolygon leaves its unit unmatched, as in #127.
+- The figures now draw holes: each polygon part is one compound path, the outer ring counter-clockwise and each
+  hole clockwise, so the fill leaves the hole empty (BD7).
+- A polygon claimed by two units is now refused by the loader, not reported as a finding.
 - **A geometry library (shapely/pyproj).** Not needed at this accuracy, and it would add a dependency to the
   harness image.
 - **An edge tolerance relative to unit size.** A fixed distance matches the error sources (simplification,
@@ -214,8 +223,6 @@ Run against the boundary file, crosswalk and geography table of the run in §1 (
 
 ## 6. Open items
 
-- When PR #127 or this PR lands second, figures.py and this module should share one boundaries loader (the
-  figures read exterior rings only; this check needs holes).
 - With `--signoff none` there is no sign-off, so a proposed HIGH exception is never approved, and the gate
   cannot accept the run (fail closed).
 - A run signed before this change has no geometry record: that is now HIGH `geometry_record_missing` until

@@ -204,7 +204,7 @@ spec, which now refuses a `presentation` block with a pointer to the file. Label
 malformed files fail closed. Each figure's provenance records the presentation files and their sha.
 
 The same file can declare `boundaries: {path, feature_id, crosswalk: {path, unit_id, feature_id}, credit}`:
-- GeoJSON Polygon and MultiPolygon exterior rings, read with json and numpy only; no new dependency.
+- GeoJSON Polygon and MultiPolygon with holes, read by toolkit/spec/geometry.py (the one loader, shared with the input geometry check, #131); no new dependency.
 - Units are matched through the crosswalk, or directly by the feature property.
 - Unmatched units are listed in the caption and figures.yaml.
 - Features outside the analysis are drawn grey for context.

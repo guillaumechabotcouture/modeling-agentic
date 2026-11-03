@@ -9,4 +9,10 @@ commit: "IG α-β"
 - The hook parses a brief sign-off with `decision_brief.cli_parser()` and allows only an explicit `--by lead`, and only in lead mode.
 - The owner CLIs (`decision_brief.py`, `signoff.py`, `scope_signoff.py`, `stage_machine.py`, `geometry.py`) take no default signer and no abbreviated flag.
 - No Bash call is credited with writing the geometry records; any change to them during an agent's call is an integrity violation.
-- The tool-hook denial is defence in depth, not authentication. Owner-signed approvals (next PR) are the boundary, and the indirect forms are self-test XFAILs (SO13b). Tests were written first: SO11a-c (`main.py`, through the real PreToolUse hook), DB35 (`scripts/decision_brief.py`), IG13, IG1-IG12 (`toolkit/spec/geometry.py`), IG-M1-M5 (`agents/stage_machine.py`) and IG-S1-S2 (`toolkit/spec/signoff.py`). A local check against the real run's files found the 4 pairs (counts only in the PR).
+- The tool-hook denial is defence in depth, not authentication. Owner-signed approvals (next PR) are the boundary, and the indirect forms are self-test XFAILs (SO13b). One loader (after #127 merged into v2):
+- `toolkit/spec/geometry.py` is the single boundaries declaration parser and GeoJSON reader; `toolkit/analysis/figures.py load_boundaries` uses it.
+- #127's keys, `crosswalk.union` and its refusals are kept: a unit mapped to several features without union, a feature mapped to two units, a duplicate feature id, a non-geographic CRS, and coordinates outside the geographic range. An empty MultiPolygon leaves its unit unmatched.
+- Maps draw holes (compound paths, BD7).
+- A polygon claimed by two units is now refused, not reported as a finding.
+
+Tests were written first: SO11a-c (`main.py`, through the real PreToolUse hook), DB35 (`scripts/decision_brief.py`), IG13, IG1-IG12 (`toolkit/spec/geometry.py`), IG-M1-M5 (`agents/stage_machine.py`) and IG-S1-S2 (`toolkit/spec/signoff.py`). A local check against the real run's files found the 4 pairs (counts only in the PR).
