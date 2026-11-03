@@ -167,7 +167,8 @@ def _caller_script_path() -> str | None:
 def validate_figure(png_path: str,
                     source_data_paths: list[str] | None = None,
                     expected_annotations: list[str] | None = None,
-                    expected_n_data_points: int | None = None) -> None:
+                    expected_n_data_points: int | None = None,
+                    run_dir: str | None = None) -> None:
     """Record figure provenance and assert annotation correctness.
 
     Writes (or overwrites) `<png_path>.provenance.json` with the
@@ -201,6 +202,10 @@ def validate_figure(png_path: str,
     expected_n_data_points
         Optional sanity check, recorded in the sidecar for
         downstream consumers. Not asserted here.
+    run_dir
+        The run directory the sidecar is written in (default: the run
+        dir the PNG lies in, found by its run marker). The sidecar is
+        written with no link followed below it.
     """
     if not os.path.exists(png_path):
         raise FileNotFoundError(
@@ -252,8 +257,10 @@ def validate_figure(png_path: str,
     import sys as _sys
     if os.path.dirname(os.path.abspath(__file__)) not in _sys.path:
         _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from lib.safe_io import publish                 # no link followed at the sidecar (follow-up to review round 5)
-    publish(_provenance_path(png_path), json.dumps(sidecar, indent=2, sort_keys=True))
+    from lib.safe_io import publish, run_root_of    # no link followed at the sidecar (follow-up to review round 5)
+    # anchored at the run dir the PNG lies in (its outermost run marker), so a planted figures/ link is refused
+    publish(_provenance_path(png_path), json.dumps(sidecar, indent=2, sort_keys=True),
+            run_dir or run_root_of(png_path))
 
 
 def check_staleness(png_path: str) -> dict:

@@ -61,13 +61,13 @@ def _sio():
     return safe_io
 
 
-def _yaml_dump(obj, path):
+def _yaml_dump(obj, path, root):
     """Publish YAML atomically with no link followed (a random temporary name, never a planted `.tmp`)."""
     import yaml
-    _sio().publish(path, yaml.safe_dump(obj, sort_keys=False))
+    _sio().publish(path, yaml.safe_dump(obj, sort_keys=False), root)
 
 
-def set_key(path: str, dotted: str, value) -> None:
+def set_key(path: str, dotted: str, value, root: str | None) -> None:
     """Set a dotted key in a YAML file (the stub fixer's one edit)."""
     import yaml
     doc = (yaml.safe_load(open(path)) or {}) if os.path.exists(path) else {}
@@ -76,7 +76,7 @@ def set_key(path: str, dotted: str, value) -> None:
     for p in parts[:-1]:
         cur = cur.setdefault(p, {})
     cur[parts[-1]] = value
-    _yaml_dump(doc, path)
+    _yaml_dump(doc, path, root)
 
 
 class StubTasks:
@@ -117,9 +117,9 @@ class StubTasks:
             spec = spec(question, run_dir)
         if not isinstance(spec, dict):
             return self._r("draft_spec", False, note="no spec scripted")
-        _yaml_dump(spec, os.path.join(run_dir, "decision_spec.yaml"))
+        _yaml_dump(spec, os.path.join(run_dir, "decision_spec.yaml"), run_dir)
         if isinstance(self.s.get("settings"), dict):
-            _yaml_dump(self.s["settings"], os.path.join(run_dir, "analysis_settings.yaml"))
+            _yaml_dump(self.s["settings"], os.path.join(run_dir, "analysis_settings.yaml"), run_dir)
         return self._r("draft_spec", note=f"feedback={len(feedback or [])}")
 
     def sign_spec(self, run_dir):
@@ -165,7 +165,7 @@ class StubTasks:
         doc = {"reviewer": reviewer, "round": round_n,
                "verdict": "REVISE" if any(not b["resolved"] for b in blockers) else "PASS",
                "structural_mismatch": sm, "carried_forward": carried, "blockers": blockers}
-        _yaml_dump(doc, path)
+        _yaml_dump(doc, path, run_dir)
         return self._r(f"critique:{reviewer}:{round_n}")
 
     def plan_fixes(self, packet):
@@ -182,7 +182,7 @@ class StubTasks:
                 done.append(fid)
             elif edit:
                 for rel, key, value in edit:
-                    set_key(os.path.join(run_dir, rel), key, value)
+                    set_key(os.path.join(run_dir, rel), key, value, run_dir)
                 done.append(fid)
         return self._r(f"fix:{task['id']}", note=f"edited for {done}" if done else "no scripted edit")
 

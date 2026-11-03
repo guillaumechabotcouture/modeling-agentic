@@ -322,11 +322,11 @@ def pipeline_steps(spec_path: str, run_dir: str) -> list[dict]:
     ]
 
 
-def _configure(spec: dict, out: str) -> dict:
+def _configure(spec: dict, out: str, root: str | None = None) -> dict:
     from spike.analysis import batch as B
     from toolkit.analysis.artifacts import _safe_io
     for f in ("results.jsonl", "results_prev.jsonl"):
-        _safe_io().remove_path(os.path.join(out, f))      # a changed spec invalidates every engine run
+        _safe_io().remove_path(os.path.join(out, f), root)      # a changed spec invalidates every engine run
     d = B.design(spec, out)
     s = B.run(out, max(1, min(2, os.cpu_count() or 1)))   # at most 2 local workers
     return {"design": d, "batch": s}
@@ -570,7 +570,7 @@ def main(argv=None) -> int:
         out = os.path.abspath(argv[2])
         os.makedirs(out, exist_ok=True)
         if argv[0] == "configure":
-            print(json.dumps(_configure(spec, out)))
+            print(json.dumps(_configure(spec, out, os.path.dirname(os.path.abspath(argv[1])))))
         else:
             A = _analyze(spec, out)
             print(json.dumps({"point": A["point"]["averted"], "wall_s": A.get("wall_s")}, default=float))

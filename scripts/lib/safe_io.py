@@ -304,54 +304,93 @@ def read_nofollow(base: str, rel: str, max_bytes: int | None = None) -> tuple[by
         os.close(fd)
 
 
-def anchored(path: str, root: str | None = None) -> tuple[str, str]:
-    """(base, rel) for a no-follow write of `path`: anchored at the trusted `root` (a run dir) when `path` lies under
-    it, compared lexically (no link resolved below the root, so a planted link inside the run dir is caught by the
-    no-follow traversal, not resolved away); else at the path's own parent, resolved once."""
+RUN_MARKERS = ("metadata.json",)     # written at a run dir's creation by main.py (v1) and stage_machine (v2)
+
+
+def run_root_of(path: str) -> str | None:
+    """The run dir `path` lies in, compared lexically: the outermost ancestor of abspath(path) that holds a run
+    marker. Outermost, so a marker an agent plants in a subdirectory (or behind a link) cannot move the root inward."""
     ap = os.path.abspath(path)
+    parts = ap.split(os.sep)
+    for i in range(2, len(parts)):
+        a = os.sep.join(parts[:i]) or os.sep
+        if any(os.path.lexists(os.path.join(a, m)) for m in RUN_MARKERS):
+            return a
+    return None
+
+
+def _same_dir(a: str, b: str) -> bool:
+    return os.path.abspath(a) == os.path.abspath(b) or os.path.realpath(a) == os.path.realpath(b)
+
+
+def anchored(path: str, root: str | None) -> tuple[str, str]:
+    """(base, rel) for a no-follow write of `path`. The run root is mandatory for a path under a run dir: `root` must
+    be that run dir and the path is anchored there, compared lexically (no link resolved below the root, so a planted
+    link inside the run dir is caught by the no-follow traversal, not resolved away); an omitted, None or inner root
+    is refused (LinkRefused). A path under no run dir is anchored at `root` when it lies under it, else at its own
+    parent, resolved once."""
+    ap = os.path.abspath(path)
+    rd = run_root_of(ap)
+    if rd is not None and not (root and _same_dir(root, rd)):
+        raise LinkRefused(f"{path}: under the run dir {rd}; pass that run dir as the root (got {root!r})")
     if root:
         for r in (os.path.abspath(root), os.path.realpath(root)):
             rel = os.path.relpath(ap, r)
             if rel != "." and not rel.startswith(".." + os.sep) and rel != "..":
                 return os.path.realpath(root), rel.replace(os.sep, "/")
+        if rd is not None:
+            raise LinkRefused(f"{path}: not under the run root {root}")
     return os.path.realpath(os.path.dirname(ap)), os.path.basename(ap)
 
 
-def publish(path: str, data, root: str | None = None) -> str:
-    """write_nofollow(atomic) of `path` (str data is UTF-8), anchored by anchored(path, root)."""
+def publish(path: str, data, root: str | None) -> str:
+    """write_nofollow(atomic) of `path` (str data is UTF-8), anchored by anchored(path, root) (root mandatory)."""
     base, rel = anchored(path, root)
     return write_nofollow(base, rel, data.encode("utf-8") if isinstance(data, str) else data, atomic=True)
 
 
-def append_text(path: str, text: str, root: str | None = None) -> None:
+def append_text(path: str, text: str, root: str | None) -> None:
     """Append text to `path` with no link followed (open_append_nofollow), anchored by anchored(path, root)."""
     base, rel = anchored(path, root)
     with open_append_nofollow(base, rel) as f:
         f.write(text)
 
 
-def remove_path(path: str, root: str | None = None) -> bool:
+def remove_path(path: str, root: str | None) -> bool:
     """remove_nofollow of `path`, anchored by anchored(path, root)."""
     base, rel = anchored(path, root)
     return remove_nofollow(base, rel)
 
 
 def rename_nofollow(base: str, src_rel: str, dst_rel: str) -> None:
-    """Move base/src_rel to base/dst_rel: both parents opened with no link followed (dst's created as needed), the
-    source must be a plain file (a link or a directory is refused, never moved), the rename relative to the two dir
-    fds. A link at the destination name is replaced, never followed."""
-    sp, dp = _parts(src_rel), _parts(dst_rel)
+    """Move base/src_rel to base/dst_rel without a check-then-rename window: the source is opened with no link
+    followed as a plain file (a link or a directory is refused, never moved), its bytes are published from that fd at
+    the destination (atomic, no link followed; a link at the destination name is replaced, never followed), then the
+    source entry is removed only if it is still the file that was read."""
     base = os.path.realpath(base)
+    sp = _parts(src_rel)
+    _parts(dst_rel)
+    fd = open_nofollow(base, src_rel)
+    try:
+        st = os.fstat(fd)
+        chunks = []
+        while True:
+            b = os.read(fd, 1 << 20)
+            if not b:
+                break
+            chunks.append(b)
+    finally:
+        os.close(fd)
+    write_nofollow(base, dst_rel, b"".join(chunks), atomic=True)
     sfd = dir_fd_nofollow(base, sp[:-1])
     try:
-        st = os.stat(sp[-1], dir_fd=sfd, follow_symlinks=False)
-        if not stat.S_ISREG(st.st_mode):
-            raise LinkRefused(f"{src_rel}: not a plain file (a link or a directory is not moved)")
-        dfd = dir_fd_nofollow(base, dp[:-1], create=True)
         try:
-            os.replace(sp[-1], dp[-1], src_dir_fd=sfd, dst_dir_fd=dfd)
-        finally:
-            os.close(dfd)
+            now = os.stat(sp[-1], dir_fd=sfd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino):
+            raise LinkRefused(f"{src_rel}: replaced while it was moved; the new entry is left in place")
+        os.unlink(sp[-1], dir_fd=sfd)
     finally:
         os.close(sfd)
 

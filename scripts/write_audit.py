@@ -22,6 +22,19 @@ file by path:
   json/yaml/pickle dump to a handle that is not a plain name (a call such as os.fdopen(...))
   tempfile.mkstemp / mkdtemp / NamedTemporaryFile / TemporaryFile / SpooledTemporaryFile with dir= (a chosen
                                                            destination; without dir= it is the system's temp dir)
+  getattr(<x>, "open" / a writer name)                    a writer fetched by name (getattr(builtins, "open"))
+  functools.partial(open, <write or unknown mode>) / partial(os.remove, ...) and the other writers
+  <name> = open / os.remove / ...                          an assigned alias: later calls of <name> are that writer
+  subprocess.* with shell=True (or a non-constant shell=), [sh|bash ..., "-c", ...], os.system / os.popen /
+  os.spawn*, asyncio.create_subprocess_shell               a shell can redirect into any path: each is reviewed
+  lib.safe_io publish / append_text / remove_path / anchored without a run root (omitted or None): the root is
+                                                           mandatory for a run-dir path (safe_io also refuses it at
+                                                           run time when the path lies under a run marker)
+
+Known limit (not solved statically): a helper in another module that returns `open` (or a writer) and is used
+there, e.g. `yaml.safe_dump(doc, stream=helpers.opener(p))`, is a call this per-module scan cannot resolve; the
+dump-to-handle rule flags the dump only when the stream is not a plain name. Such helpers are found by review, and
+lib.safe_io's runtime refusal (a run-dir path needs its run root) covers the safe_io entry points.
 
 Self-test and fixture code is skipped (functions named `_self_test*`, `_toy*`, `toy_*`, `derived_toy_*`,
 `*fixture*`, `example_*`, and the `if __name__ == "__main__"` guard's own self-test branch is not special-cased: a
@@ -49,6 +62,14 @@ _DUMPS = {"dump", "safe_dump", "dump_all", "safe_dump_all"}
 _TEMP = {"mkstemp", "mkdtemp", "NamedTemporaryFile", "TemporaryFile", "SpooledTemporaryFile"}
 _METHOD_WRITES = {"write_text", "write_bytes", "tofile", "to_csv", "to_parquet", "to_json", "to_excel", "to_pickle",
                   "savefig"}
+_OPENS = ("open", "io.open", "codecs.open", "builtins.open", "os.fdopen")
+_SIO_MODS = ("lib.safe_io", "scripts.lib.safe_io", "safe_io")
+_SIO_GETTERS = ("_sio", "_safe_io")
+_SIO_ROOT_ARG = {"publish": 2, "append_text": 2, "remove_path": 1, "anchored": 1}   # index of the run-root argument
+_GETATTR_WRITERS = {"open", "fdopen"} | _OS_WRITE | _SHUTIL | _METHOD_WRITES | _NP_SAVE
+_SUBPROCESS = {"subprocess.run", "subprocess.call", "subprocess.check_call", "subprocess.check_output",
+               "subprocess.Popen", "asyncio.create_subprocess_exec"}
+_SHELLS = {"sh", "bash", "zsh", "dash", "/bin/sh", "/bin/bash", "/bin/zsh", "/usr/bin/env"}
 
 
 def _is_fixture(name: str) -> bool:
@@ -67,6 +88,7 @@ def _mode_writes(node) -> bool | None:
 class _Scan(ast.NodeVisitor):
     def __init__(self):
         self.alias: dict = {}        # local name -> dotted origin ("os", "os.remove", "numpy", "pathlib.Path", ...)
+        self.sio: set = set()        # local names bound to lib.safe_io (an `_sio()` / `_safe_io()` result)
         self.sites: dict = {}
 
     def add(self, kind, node):
@@ -81,6 +103,54 @@ class _Scan(ast.NodeVisitor):
         for a in node.names:
             if node.module:
                 self.alias[a.asname or a.name] = f"{node.module}.{a.name}"
+
+    # ---- assigned aliases: `w = open` makes `w(p, "w")` an open; `sio = _safe_io()` makes `sio.publish` safe_io's
+    def _writer(self, dotted: str) -> bool:
+        mod, _, tail = dotted.rpartition(".")
+        return dotted in _OPENS or (mod == "os" and tail in _OS_WRITE) or (mod == "shutil" and tail in _SHUTIL) or (
+            mod == "numpy" and tail in _NP_SAVE)
+
+    def visit_Assign(self, node):
+        v = node.value
+        for t in node.targets:
+            if not isinstance(t, ast.Name):
+                continue
+            d = self._dotted(v) if isinstance(v, (ast.Name, ast.Attribute)) else None
+            if d and self._writer(d):
+                self.alias[t.id] = d
+            if isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id in _SIO_GETTERS:
+                self.sio.add(t.id)
+        self.generic_visit(node)
+
+    def _sio_fn(self, f) -> str | None:
+        """The lib.safe_io function a call targets (publish, append_text, remove_path, anchored), or None."""
+        if isinstance(f, ast.Attribute) and f.attr in _SIO_ROOT_ARG:
+            b = f.value
+            if (isinstance(b, ast.Call) and isinstance(b.func, ast.Name) and b.func.id in _SIO_GETTERS) or (
+                    isinstance(b, ast.Name) and (b.id in self.sio or self.alias.get(b.id) in _SIO_MODS)):
+                return f.attr
+            d = self._dotted(b)
+            return f.attr if d in _SIO_MODS else None
+        d = self._dotted(f) or ""
+        mod, _, tail = d.rpartition(".")
+        return tail if mod in _SIO_MODS and tail in _SIO_ROOT_ARG else None
+
+    def _shell(self, node, name, kw) -> bool:
+        if name in ("os.system", "os.popen", "asyncio.create_subprocess_shell") or name.startswith("os.spawn"):
+            return True
+        if name not in _SUBPROCESS:
+            return False
+        sh = kw.get("shell")
+        if sh is not None and not (isinstance(sh, ast.Constant) and not sh.value):
+            return True
+        cmd = node.args[0] if node.args else kw.get("args")
+        if name == "asyncio.create_subprocess_exec":
+            cmd = ast.List(elts=list(node.args))
+        if isinstance(cmd, (ast.List, ast.Tuple)) and cmd.elts:
+            c = [e.value for e in cmd.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+            if c and c[0] in _SHELLS and "-c" in c:
+                return True
+        return False
 
     # ---- self-test and fixture code is skipped
     def visit_FunctionDef(self, node):
@@ -104,7 +174,28 @@ class _Scan(ast.NodeVisitor):
         kw = {k.arg: k.value for k in node.keywords if k.arg}
         tail = name.rsplit(".", 1)[-1]
         mod = name.rsplit(".", 1)[0] if "." in name else ""
-        if name in ("open", "io.open", "codecs.open", "builtins.open", "os.fdopen"):
+        sio = self._sio_fn(f)
+        if sio:
+            i = _SIO_ROOT_ARG[sio]
+            root = node.args[i] if len(node.args) > i else kw.get("root")
+            starred = any(isinstance(a, ast.Starred) for a in node.args) or any(k.arg is None for k in node.keywords)
+            if not starred and (root is None or (isinstance(root, ast.Constant) and root.value is None)):
+                self.add("safeio-no-root", node)
+        if name == "getattr" and len(node.args) > 1 and isinstance(node.args[1], ast.Constant) and \
+                node.args[1].value in _GETATTR_WRITERS:
+            self.add("getattr-writer", node)
+        elif name == "functools.partial" and node.args and self._writer(self._dotted(node.args[0]) or ""):
+            t = self._dotted(node.args[0])
+            if t in _OPENS:
+                mode = node.args[2] if len(node.args) > 2 else kw.get("mode")
+                w = _mode_writes(mode)
+                if w or (w is None and mode is not None):
+                    self.add("partial-writer", node)
+            else:
+                self.add("partial-writer", node)
+        elif self._shell(node, name, kw):
+            self.add("shell-command", node)
+        elif name in _OPENS:
             mode = node.args[1] if len(node.args) > 1 else kw.get("mode")
             w = _mode_writes(mode)
             if w or (w is None and mode is not None):
@@ -179,22 +270,23 @@ REVIEWED: dict = {
     "scripts/assemble_changes.py": {"open-write": (3, _REPO), "os-remove": (1, _REPO)},
     "scripts/cloud_batch.py": {"open-write": (2, "the operator's local batch files")},
     "scripts/compute.py": {
-        "open-write": (13, "worker init markers, chunk inputs, stderr and the worker's sync record (" + _TMP_REASON + "); the "
-                           "detached job's log fd, opened through lib.safe_io's no-follow dir fd; a remote chunk's "
-                           "--out in the worker's temporary dir"),
+        "open-write": (10, "worker init markers, chunk inputs, stderr and the worker's sync record (" + _TMP_REASON + ")"),
         "os-remove": (5, "stale bundle members and pid files on a worker (" + _TMP_REASON + "); the worker's TLS files"),
         "shutil": (1, "the worker's own __pycache__"), "os-rename": (1, "a pid file in the worker's call dir"),
         "os-link": (1, "the claim file in the worker's call dir (atomic claim)"),
-        "os.open-write": (2, "the worker's TLS files (O_EXCL, private dir); the detached job's log, opened O_NOFOLLOW "
-                             "relative to a lib.safe_io dir fd")},
+        "os.open-write": (1, "the worker's TLS files (O_EXCL, private dir)")},
     "scripts/eval_private.py": {"shutil": (4, _EVAL), "open-write": (5, _EVAL)},
-    "scripts/eval_suite.py": {"open-write": (7, _EVAL), "os-symlink": (1, _EVAL), "os-remove": (1, _EVAL)},
+    "scripts/eval_suite.py": {"open-write": (7, _EVAL), "os-symlink": (1, _EVAL), "os-remove": (1, _EVAL),
+                              "shell-command": (1, _EVAL + " (--execute runs the cloud launch commands it printed)")},
     "scripts/fixtures.py": {"shutil": (5, _EVAL), "open-write": (7, _EVAL), "os-remove": (1, _EVAL)},
     "scripts/gate_fuzz.py": {"shutil": (6, _EVAL), "open-write": (7, _EVAL), "os-remove": (2, _EVAL), "os-symlink": (1, _EVAL)},
     "scripts/gate_replay.py": {"shutil": (3, _EVAL), "open-write": (1, _EVAL)},
     "scripts/golden_traces.py": {"shutil": (6, _EVAL), "os-remove": (2, _EVAL), "tempfile-dir": (2, _EVAL),
                                  "open-write": (1, _EVAL)},
     "scripts/pipeline.py": {
+        "shell-command": (1, "_run_cmd runs a step's declared `run` command (shell=True for a non-compute step): the "
+                             "agent's own command, run in the run dir with the agent's reach; the harness writes "
+                             "nothing through the shell, and the step's outputs are hashed after it exits"),
         "shutil": (10, "the step's pyc cache and derivation work dirs (" + _TMP_REASON + "); the aside dir the harness "
                        "made (mkdtemp) and a planted .pipeline_aside_* dir, removed with rmtree, which removes links, "
                        "never their targets; the scratch copy (copytree with symlinks=True, a sibling temp dir the "

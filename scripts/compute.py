@@ -4830,20 +4830,22 @@ def job_status(out: str) -> dict:
                     "(rows already finished are kept)"}
 
 
-def _detach(argv: list, out: str, n: int) -> int:
+def _detach(argv: list, out: str, n: int, run_dir: str | None) -> int:
     """Start this same `map` command in its own session (an agent's tool
-    timeout or a killed shell does not reach it) and return at once."""
+    timeout or a killed shell does not reach it) and return at once. Every
+    file it writes (launch lock, lock, log, job record) is anchored at the
+    trusted run dir, with no link followed below it."""
     import subprocess
-    launch = _out_lock(out, block=True, suffix=".launch.lock")    # one launch at a time per --out
+    launch = _out_lock(out, block=True, suffix=".launch.lock", run_dir=run_dir)   # one launch at a time per --out
     try:
-        return _detach_locked(argv, out, n, subprocess)
+        return _detach_locked(argv, out, n, subprocess, run_dir)
     finally:
         launch.close()
 
 
-def _detach_locked(argv, out, n, subprocess) -> int:
+def _detach_locked(argv, out, n, subprocess, run_dir) -> int:
     st = job_status(out)
-    busy = _out_lock(out)
+    busy = _out_lock(out, run_dir=run_dir)
     if busy is not None:
         busy.close()
     if st["state"] == RUNNING or busy is None:
@@ -4851,19 +4853,16 @@ def _detach_locked(argv, out, n, subprocess) -> int:
         return 4
     log = out + ".log"
     t0 = time.time()
-    from lib.safe_io import anchored, publish, write_nofollow, dir_fd_nofollow
-    base, rel = anchored(log)
-    write_nofollow(base, rel, b"", atomic=True)                  # a fresh log file, no link followed
-    dfd = dir_fd_nofollow(base, rel.split("/")[:-1])
-    try:
-        lfd = os.open(rel.split("/")[-1], os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0), dir_fd=dfd)
-    finally:
-        os.close(dfd)
-    with os.fdopen(lfd, "w") as lf:
+    from lib.safe_io import publish, open_append_nofollow
+    base, rel = _out_base(log, run_dir)
+    publish(log, b"", run_dir)                                   # a fresh log file, no link followed
+    # the child's stdout is the checked append primitive's own descriptor: opened with no link followed and refused
+    # when the file has other hard links (a swap after the fresh file was published is not appended to)
+    with open_append_nofollow(base, rel) as lf:
         p = subprocess.Popen([sys.executable, os.path.abspath(__file__)] + argv, stdin=subprocess.DEVNULL,
                              stdout=lf, stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
     job = {"pid": p.pid, "pid_start": _pid_start(p.pid), "started": t0, "n": n, "log": log, "argv": argv}
-    publish(out + JOB_EXT, json.dumps(job, indent=1))
+    publish(out + JOB_EXT, json.dumps(job, indent=1), run_dir)
     print(json.dumps({"detached": True, "pid": p.pid, "out": out, "log": log,
                       "next": f"python3 scripts/compute.py wait {out} --timeout-s 540  "
                               "(repeat while it exits 3 = still running)"}))
@@ -4935,14 +4934,13 @@ def main() -> int:
     if a.detach:
         if a.no_ledger:
             ap.error("--detach is for ledgered batches")
-        return _detach([x for x in sys.argv[1:] if x != "--detach"], a.out, len(_read_inputs(a.inputs)))
+        return _detach([x for x in sys.argv[1:] if x != "--detach"], a.out, len(_read_inputs(a.inputs)), a.run_dir)
     if a.no_ledger:   # a remote chunk: plain map, no reuse (the caller already chose the rows)
         rows, summary = map_fn(a.run_dir, a.fn, _read_inputs(a.inputs), a.backend, a.max_workers,
                                a.max_tasks, a.timeout_s, ledger=False, max_core_hours=a.max_core_hours)
-        with open(a.out, "w") as f:
-            for r in rows:
-                f.write(json.dumps(r) + "\n")
-        json.dump(summary, open(a.out + ".summary.json", "w"), indent=1)
+        from lib.safe_io import publish   # anchored at the run dir when --out lies in it; a worker's temp dir otherwise
+        publish(a.out, "".join(json.dumps(r) + "\n" for r in rows), a.run_dir)
+        publish(a.out + ".summary.json", json.dumps(summary, indent=1), a.run_dir)
     else:
         rows, summary = run_map(a.run_dir, a.fn, _read_inputs(a.inputs), a.out, fresh=a.fresh,
                                 backend=a.backend, max_workers=a.max_workers, max_tasks=a.max_tasks,
