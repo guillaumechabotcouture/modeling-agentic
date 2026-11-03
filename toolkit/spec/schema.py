@@ -429,12 +429,13 @@ def validate(spec: "Spec | dict", base: str | None = None, pending_ok: bool = Fa
     if derived is not None:
         spec.derived = derived
     try:
+        pres = presentation_refusal(spec.raw)         # every path, sign-off with engine: auto pending included
         if spec.engine_pending:
             if not pending_ok:
                 return [f"engine: auto, and the harness has not written {ENGINE_CHOICE} yet (engine-dependent sections "
-                        "cannot be checked)"]
-            return _validate_pending(spec) + (_derived_checks(spec, None) if obligations(spec) else [])
-        return _validate(spec) + (_derived_checks(spec, spec.engine()) if obligations(spec) else [])
+                        "cannot be checked)"] + pres
+            return pres + _validate_pending(spec) + (_derived_checks(spec, None) if obligations(spec) else [])
+        return pres + _validate(spec) + (_derived_checks(spec, spec.engine()) if obligations(spec) else [])
     except Exception as e:  # noqa: BLE001 -- a malformed section must be a finding, not a crash
         return [f"spec could not be checked: {type(e).__name__}: {e}"]
 
@@ -775,10 +776,16 @@ def _validate(s: Spec) -> list[str]:
     bad += PRI.problems(s)
     bad += _validate_analysis(s, card, pnames, cols, pk)
     bad += _validate_deliverable(s)
-    if "presentation" in r:
-        bad.append("presentation: display labels are not part of the signed spec; put them in presentation.yaml "
-                   "beside the spec (unsigned, read only by the figures) or pass --labels to the figure renderer")
     return bad
+
+
+def presentation_refusal(raw: dict) -> list[str]:
+    """Display labels are never part of the signed spec (owner, 2026-11-02): a presentation block is refused on
+    every validation path."""
+    if isinstance(raw, dict) and "presentation" in raw:
+        return ["presentation: display labels are not part of the signed spec; put them in presentation.yaml beside "
+                "the spec (unsigned, read only by the figures) or pass --labels to the figure renderer"]
+    return []
 
 
 PRESENTATION_LABELS = ("components", "parameters", "outcomes", "metrics")

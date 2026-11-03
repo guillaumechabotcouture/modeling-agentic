@@ -96,13 +96,19 @@ and `hooks.run_series()`, which check the answer and raise `HookUnsupported` (fi
 text) or `HookInvalid`.
 
 ```python
+class MyEngine:
+    hooks_contract = "figures-hooks/1"        # hooks.HOOKS_CONTRACT: without it neither hook is offered
+
 engine.schedule(params: dict, unit: UnitSpec, package: Package, horizon: Horizon) -> list[dict]
 #   [{component, label, kind: history|decision|routine, t0, t1|None, charged}]; pure, from the code that
-#   configures the simulation
-EngineCard.outputs["series"] = {metric: {"label": str, "units": str, "aggregate": "mean" | "rate"}}
+#   configures the simulation; half-open periods: decision events in [d0, d1), history wholly before d0,
+#   routine not overlapping [d0, d1), every event in [horizon.start, window end)
+EngineCard.outputs["series"] = {metric: {"label": str, "units": str, "aggregate": "mean" | "rate",
+                                         "denominator": str}}       # e.g. "person", "person-year"
 engine.run_series(params, unit, packages: list[Package], horizon, seed: int, metrics: list[str],
                   step: str = "month") -> list[dict]
-#   per package, in order: {"package", "t": [step starts, horizon.start .. window end), "values": {metric: [...]}}
+#   per package, in order: {"package", "t": hooks.monthly_grid(horizon), "values": {metric: [...]}}; the grid is
+#   every monthly step start before the window end (a window end inside a month gives a partial final step)
 ```
 
 `run` and `run_batch` are untouched, so an engine that adds the hooks keeps every existing run byte-identical
@@ -204,6 +210,19 @@ The same file can declare `boundaries: {path, feature_id, crosswalk: {path, unit
 - Features outside the analysis are drawn grey for context.
 - Region outlines are drawn from polygon edges not shared within a region.
 - The credit line is printed on every map.
+
+**Codex round 2 (16 findings; each reproduced by a failing test first, r2 α/β).**
+- **Boundaries.** A crosswalk mapping a unit to two features is refused unless `crosswalk.union: true` is declared. A feature mapped to two units, or a feature id appearing in two features, is refused, and the error names every affected id. A feature with no polygon leaves its unit unmatched. Only geographic coordinates are read (EPSG:4326 / CRS84, longitude within ±180 and latitude within ±90).
+- **Offline rebuild.** The ulp tolerance applies only to the derived field, the calibrated attribute on the log scale (`exp(z)`); every source-bound input must match exactly.
+- **Signed spec.** A `presentation` block is refused on every validation path, including sign-off with `engine: auto` pending.
+- **Trajectory freshness.** The trajectories record the full engine identity (code, params and config fingerprints) and the analysis's engine record, and hash the units table, settings and engine choice as well as the analysis artifacts. The step refuses to run with an engine other than the analysis's.
+- **Sensitivity.** Every tested range is kept.
+- **Deliverable kind.** The kind must be explicit, and `compare()` applies the same gate.
+- **Checked provenance.** The labels, boundary and crosswalk files and their sha are part of each figure's checked provenance; the contract check reads them.
+- **Window means.** Calibration-window and outcome-window means use the half-open window with overlap-weighted steps.
+- **Noise figure.** Rate metrics are labelled as mean rates per person-year.
+- **Comparison.** It refuses an output dir inside a source run, and records its sources, presentation files and tier.
+- **Hooks contract (`figures-hooks/1`, sent to the engine agent).** The grid keeps a partial final step when the window ends inside a month, and point events follow `[d0, d1)` exactly.
 
 ## 9. Open questions for the owner
 

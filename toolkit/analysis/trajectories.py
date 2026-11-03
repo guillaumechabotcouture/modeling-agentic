@@ -170,10 +170,12 @@ def aggregate(run_dir: str, step: dict, results: list[dict]) -> dict:
                 e[m].append(s["values"][m])
     # per unit and seed: comparator minus plan, averaged over the outcome window (the stochastic-noise figure)
     w0, w1 = (float(x) for x in spec["objective"]["horizon"])
-    inwin = np.array([(w0 - 1e-9) <= x < w1 for x in (t or [])])
-    seed_effects = {i: {m: [float(np.mean(np.asarray(c)[inwin] - np.asarray(p)[inwin]))
+    from toolkit.engines.hooks import window_mean
+    # per unit and seed: comparator minus plan over the outcome window, each monthly step weighted by its overlap
+    # with [w0, w1): for a `rate` metric a mean rate (per person-year), for a `mean` metric a mean level
+    seed_effects = {i: {m: [window_mean(t, list(np.asarray(c) - np.asarray(p)), w0, w1, end=w1)
                             for c, p in zip(a["comparator"][m], a["plan"][m])] for m in metrics}
-                    for i, a in acc.items()} if inwin.any() else {}
+                    for i, a in acc.items()} if t else {}
     per_unit = {i: {arm: {m: list(np.mean(np.asarray(v[m], float), axis=0)) for m in metrics} for arm, v in a.items()}
                 for i, a in acc.items()}
 
@@ -216,7 +218,14 @@ def write(run_dir: str, data: dict, inputs: list[str]) -> str:
 def run(run_dir: str, per_region: int = 3, seeds: int = 3, metrics=None, log=print, **compute_kw) -> dict:
     from toolkit.engines import hooks
     run_dir = os.path.abspath(run_dir)
-    inputs = ["decision_spec.yaml", "analysis/point.yaml", "analysis/calibration.yaml", "analysis/figure_data.yaml"]
+    from toolkit.spec import schema
+    sp0 = schema.load(os.path.join(run_dir, "decision_spec.yaml"))
+    inputs = ["decision_spec.yaml", "analysis/point.yaml", "analysis/calibration.yaml", "analysis/figure_data.yaml",
+              os.path.relpath(sp0.resolve(sp0["decision_units"]["csv"]), run_dir)]
+    if getattr(sp0, "settings_path", None):
+        inputs.append(os.path.relpath(sp0.settings_path, run_dir))
+    if os.path.exists(os.path.join(run_dir, schema.ENGINE_CHOICE)):
+        inputs.append(schema.ENGINE_CHOICE)
     try:
         tk, step = tasks(run_dir, per_region, seeds, metrics)
     except hooks.HookUnsupported as e:
@@ -224,6 +233,15 @@ def run(run_dir: str, per_region: int = 3, seeds: int = 3, metrics=None, log=pri
         write(run_dir, data, [p for p in inputs if os.path.exists(os.path.join(run_dir, p))])
         log(f"trajectories: {e}")
         return data
+    rows_p = os.path.join(run_dir, "analysis", "batch", "results.jsonl")
+    if os.path.exists(rows_p):
+        with open(rows_p) as fh:
+            first = json.loads(fh.readline() or "{}")
+        be = ((first.get("result") or {}).get("provenance") or {}).get("engine")
+        if be and be != step["engine"]:
+            raise RuntimeError(f"trajectories: this code's engine (code {step['engine'].get('code_sha256', '')[:12]}) is "
+                               f"not the analysis's (code {str(be.get('code_sha256', ''))[:12]}): run the step with the "
+                               "run's own code")
     sys.path.insert(0, os.path.join(ROOT, "scripts"))
     import compute
     out = os.path.join(run_dir, ROWS)
@@ -240,7 +258,9 @@ def run(run_dir: str, per_region: int = 3, seeds: int = 3, metrics=None, log=pri
     spec = schema.load(os.path.join(run_dir, "decision_spec.yaml"))
     h = spec.horizon({})
     d = getattr(h, "delivery", None) or h.window
+    analysis_engine = (yaml.safe_load(open(os.path.join(run_dir, "analysis", "point.yaml"))) or {}).get("engine")
     data = {"status": "ok", "sample": step["sample"], "per_region": per_region, "seeds": seeds,
+            "analysis_engine": analysis_engine,
             "engine": step["engine"], "hooks_contract": step["hooks_contract"], "selection": step["selection"],
             "metrics": step["metrics"], "metric_info": step["metric_info"],
             "calibration_metric": (spec.get("calibration") or {}).get("metric"),
@@ -283,11 +303,18 @@ def _self_test() -> int:
         why = {x["figure"]: x["reason"] for x in r["not_produced"]}.get("trajectories", "")
         ok("needs trajectory runs" in why and "run_series()" in why,
            f"TJ4 the figure is not produced and says why: {why}")
-        # the same run with an engine that offers the hook (the toy engine plus hooks)
+        # a stepped engine other than the analysis's is refused (Codex r2 P1-4)
         sp = os.path.join(d, "decision_spec.yaml")
         raw = yaml.safe_load(open(sp))
         raw["engine"]["ref"] = "toolkit.engines.hooks:ToyScheduleEngine"
         yaml.safe_dump(raw, open(sp, "w"), sort_keys=False)
+        try:
+            run(d, per_region=2, seeds=2, log=q, max_workers=2)
+            ok(False, "TJ17d the step refuses an engine other than the analysis's")
+        except RuntimeError as e:
+            ok("run's own code" in str(e), f"TJ17d the step refuses an engine other than the analysis's: {e}")
+        # the run analysed with the engine that offers the hook (the toy engine plus hooks), then the step
+        RUN.run(d, log=q, compute_kw={"max_workers": 2}, unsigned=True)     # the spec changed engine
         res = run(d, per_region=2, seeds=2, log=q, max_workers=2)
         tot = res["series"]["total"]
         n_units = sum(len(v) for v in res["sample"].values())

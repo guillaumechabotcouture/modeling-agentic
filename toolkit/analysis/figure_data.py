@@ -288,8 +288,13 @@ def compute(A, plan, out0, ben0, cost0, uq: dict | None, z0: dict | None = None,
 
 
 def derived_fields(spec_raw: dict) -> list[str]:
-    """The job inputs computed by a transcendental function (so a platform's libm can move their last bits)."""
-    raise NotImplementedError("figures r2 β")
+    """The job inputs computed by a transcendental function, so a platform's libm can move their last bits: the
+    calibrated attribute on the log scale (batch.calibrated_value: exp(z)). Every other input is source-bound (copied
+    from the units table, the spec or the design) and must match exactly."""
+    cal = (spec_raw or {}).get("calibration") or {}
+    if cal.get("attribute") and cal.get("scale", "log") == "log":
+        return [f"unit.{cal['attribute']}"]
+    return []
 
 
 ULP_BOUND = 4          # a stored row's job may differ from the rebuilt one by at most this many ulps in one input
@@ -311,11 +316,15 @@ def _float_leaves(x, path=()):
         yield path, x
 
 
-def ulp_match(job: dict, stored_sha: str, job_sha, bound: int = ULP_BOUND):
-    """The single float input of `job` (in its unit attributes or parameters) that, moved by at most `bound` ulps,
-    reproduces `stored_sha`: (dotted path, ulps), or None. Exactly one candidate must match."""
+def ulp_match(job: dict, stored_sha: str, job_sha, bound: int = ULP_BOUND, fields=()):
+    """The single derived input of `job` (a dotted path in `fields`, e.g. unit.<attribute>) that, moved by at most
+    `bound` ulps, reproduces `stored_sha`: (dotted path, ulps), or None. Exactly one candidate must match; inputs not
+    in `fields` are never moved."""
     hits = []
+    allowed = set(fields or ())
     for path, v in _float_leaves({k: job[k] for k in ("unit", "params") if k in job}):
+        if ".".join(str(p) for p in path) not in allowed:
+            continue
         for k in [x for n in range(1, bound + 1) for x in (n, -n)]:
             w = v
             for _ in range(abs(k)):
@@ -335,8 +344,8 @@ def rebuild(run_dir: str, log=print):
 
     Fail closed: the stored design and every stored batch file must have the hashes batch.yaml recorded; every row
     must carry this code's engine identity; a row whose job hash differs from the rebuilt job is taken only when one
-    float input moved by at most ULP_BOUND ulps reproduces its stored hash (a platform's libm, e.g. exp of the
-    calibrated attribute), recorded in A.rebuild_info; the rebuilt plan must equal the stored plan. A.point_events
+    derived input (derived_fields: exp of the calibrated attribute) moved by at most ULP_BOUND ulps reproduces its
+    stored hash, recorded in A.rebuild_info; every source-bound input must match exactly; the rebuilt plan must equal the stored plan. A.point_events
     holds the point evaluation's model corrections."""
     import yaml
     from toolkit.analysis import batch as Bt
@@ -364,6 +373,7 @@ def rebuild(run_dir: str, log=print):
     if _canon(stored) != _canon(design):
         raise RebuildRefused("the stored batch design differs from the spec's design (a shipped batch?)")
     res, by_ulp, other = {}, [], []
+    dfields = derived_fields(spec.raw)
     with open(rows) as f:
         for line in f:
             r = json.loads(line)
@@ -379,15 +389,15 @@ def rebuild(run_dir: str, log=print):
                                      f"engine is v{ident['version']} (code {ident['code_sha256'][:12]}): re-render with "
                                      "the run's own code")
             if pv.get("job_sha") != Bt.job_sha(job):
-                m = ulp_match(job, pv.get("job_sha"), Bt.job_sha)
+                m = ulp_match(job, pv.get("job_sha"), Bt.job_sha, fields=dfields)
                 if m is None:
                     other.append(job["id"])
                     continue
                 by_ulp.append({"job": job["id"], "field": m[0], "ulps": m[1]})
             res[job["id"]] = body["result"]
     if other:
-        raise RebuildRefused(f"{len(other)} rows' inputs differ from the rebuilt jobs by more than one input within "
-                             f"{ULP_BOUND} ulps (e.g. {other[:3]})")
+        raise RebuildRefused(f"{len(other)} rows' inputs differ from the rebuilt jobs by more than one derived input "
+                             f"({', '.join(dfields) or 'none declared'}) within {ULP_BOUND} ulps (e.g. {other[:3]})")
     if len(res) != len(jobs):
         raise RebuildRefused(f"{len(jobs) - len(res)} jobs have no stored row")
     if by_ulp:

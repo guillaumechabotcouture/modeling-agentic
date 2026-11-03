@@ -12,3 +12,11 @@ commit: "figures α–β"
 - **Three tiers (owner).** Every figure records `tier: data_model | simulation | decision`, and each tier gets an overview sheet. New tier-1 figures: data coverage and provenance, unit attributes, parameters, design coverage. New tier-2 figures: burn-in, seasonality, seed noise, and checks paired with the trajectories. New tier-3 figure: decision tests. A declared `DECISION_SETS` table maps the deliverable kind to its decision figures, and an undeclared kind fails closed. Tests TT1–TT6, TJ14–TJ16.
 - **Labels file (owner).** The spec refuses a `presentation` block (SP-P1). Labels files are checked (`labels_problems`), and their path and sha are recorded in each figure's provenance (PL1–PL3).
 - **Boundaries (owner).** Optional GeoJSON boundaries, read with json and numpy and matched directly or through a crosswalk. Unmatched units are listed, context features are drawn grey, region outlines are heavier, and the source is credited (BD1–BD3).
+
+**Review round 2.** Each Codex round-2 finding was reproduced by a failing test first:
+- BD4–BD6c: crosswalk cardinality and declared unions, empty geometries, geographic CRS only.
+- FD14, FD19: ulp tolerance only on the derived field.
+- SP-P5: presentation block refused at sign-off.
+- TJ17–TJ18: trajectory freshness by full engine identity and inputs; rate labels.
+- F28–F34: every sensitivity range kept, explicit deliverable kind, gated compare, presentation files in checked provenance, half-open weighted window means, comparison output and provenance.
+- H13–H14d: partial final monthly step; half-open point events.
