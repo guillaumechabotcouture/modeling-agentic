@@ -152,12 +152,15 @@ IMM_BANDS = (("0_5", 0.0, 5.0), ("5_15", 5.0, 15.0), ("15_30", 15.0, 30.0), ("30
 # (model.DAILY) with the same definition as the window metric of the same name
 SERIES = {
     "pfpr_u5": {"label": "microscopy prevalence, children 6-59 months (the calibration metric)",
-                "units": "share", "aggregate": "mean"},
-    "pfpr_2_10": {"label": "microscopy prevalence, ages 2-10", "units": "share", "aggregate": "mean"},
-    "pfpr_all": {"label": "microscopy prevalence, all ages", "units": "share", "aggregate": "mean"},
-    "inc_all": {"label": "clinical incidence, all ages", "units": "episodes per person-year", "aggregate": "rate"},
+                "units": "share", "aggregate": "mean", "denominator": "person aged 6-59 months"},
+    "pfpr_2_10": {"label": "microscopy prevalence, ages 2-10", "units": "share", "aggregate": "mean",
+                  "denominator": "person aged 2-10"},
+    "pfpr_all": {"label": "microscopy prevalence, all ages", "units": "share", "aggregate": "mean",
+                 "denominator": "person"},
+    "inc_all": {"label": "clinical incidence, all ages", "units": "episodes per person-year", "aggregate": "rate",
+                "denominator": "person-year"},
     "inc_u5": {"label": "clinical incidence, under 5", "units": "episodes per child-year (under 5)",
-               "aggregate": "rate"},
+               "aggregate": "rate", "denominator": "person-year under 5"},
 }
 
 
@@ -302,6 +305,8 @@ class MalariaEngine:
     batch_shares_state = True
     # v0.6: honours horizon.delivery (toolkit/engines/horizon.py); the spec validator refuses the field otherwise
     supports_delivery = True
+    # v0.8: the figure hooks' contract version (toolkit/engines/hooks.py HOOKS_CONTRACT)
+    hooks_contract = "figures-hooks/1"
 
     def initialisation(self) -> dict:
         P = resolve_params(self, {})
@@ -460,6 +465,7 @@ class MalariaEngine:
         yv = np.asarray(yv)
         st, w1 = float(horizon.start), float(horizon.window[1])
         acc, seen, out, unc = dp["accounting"], set(), [], []
+        dlo, dhi = delivery_period(horizon)          # hooks contract: history before it, routine outside it
         for grp, comp, label, kind, t in dp["deliveries"]:
             steps = M.event_steps(yv, [t])
             if not steps or (grp, next(iter(steps))) in seen:
@@ -469,14 +475,19 @@ class MalariaEngine:
             yr = float(yv[ti])
             if kind == "decision" and not M.delivery_contains(yr, **acc):
                 unc.append(f"{label} at {yr:.3f}")
+            if kind == "history" and yr >= dlo:
+                unc.append(f"{label} at {yr:.3f} (a past campaign at or after the delivery start, {dlo:g})")
+            if kind == "routine" and dlo <= yr < dhi:
+                unc.append(f"{label} at {yr:.3f} (a routine delivery inside the delivery period)")
             if st <= yr < w1:
                 out.append({"component": comp, "label": label, "kind": kind, "t0": yr, "t1": None,
                             "charged": kind == "decision"})
         lo, hi = ((acc["del_start"], acc["del_stop"]) if acc["del_start"] is not None
                   else (acc["win_start"], acc["win_stop"]))
         if unc:
-            raise ValueError(f"schedule: decision deliveries the sim runs but that are not charged (cost drivers count "
-                             f"in [{lo:g}, {hi:g})): {', '.join(unc[:4])}")
+            raise ValueError(f"schedule: deliveries outside their kind's period (decision events must be charged: "
+                             f"cost drivers count in [{lo:g}, {hi:g}); history events precede the delivery period; "
+                             f"routine events fall outside it): {', '.join(unc[:4])}")
         if dp["cm"]["on"]:
             out.append({"component": "cm", "label": "enhanced case management (add-on)", "kind": "decision",
                         "t0": float(lo), "t1": float(hi), "charged": True})
@@ -598,10 +609,11 @@ class MalariaEngine:
 
     @staticmethod
     def series_steps(horizon: Horizon) -> tuple:
-        """(starts, ends) of the monthly steps: step k starts at horizon.start + k/12; the last ends at the window's
-        end."""
+        """(starts, ends) of the monthly steps (hooks contract figures-hooks/1): step k starts at horizon.start +
+        k/12 for k < round((window end - start) x 12); the last ends at the window's end (a little longer or shorter
+        than a month when the window end is off the monthly grid)."""
         st, w1 = float(horizon.start), float(horizon.window[1])
-        n = int(np.ceil((w1 - st) * 12 - 1e-9))
+        n = max(int(round((w1 - st) * 12)), 1)
         t = [st + k / 12 for k in range(n)]
         return t, t[1:] + [w1]
 

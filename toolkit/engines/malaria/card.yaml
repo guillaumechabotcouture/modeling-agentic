@@ -86,22 +86,27 @@ outputs:
       label: microscopy prevalence, children 6-59 months (the calibration metric)
       units: share
       aggregate: mean
+      denominator: person aged 6-59 months
     pfpr_2_10:
       label: microscopy prevalence, ages 2-10
       units: share
       aggregate: mean
+      denominator: person aged 2-10
     pfpr_all:
       label: microscopy prevalence, all ages
       units: share
       aggregate: mean
+      denominator: person
     inc_all:
       label: clinical incidence, all ages
       units: episodes per person-year
       aggregate: rate
+      denominator: person-year
     inc_u5:
       label: clinical incidence, under 5
       units: episodes per child-year (under 5)
       aggregate: rate
+      denominator: person-year under 5
 age_groups:
 - u5
 - '5_14'
