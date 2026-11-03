@@ -473,6 +473,15 @@ class MalariaEngine:
             ti = next(iter(steps))
             seen.add((grp, ti))
             yr = float(yv[ti])
+            # #127 r3: boundaries are compared exactly. A step that differs from a boundary by representation only
+            # (<= 1e-9 y, far below a day) is reported at the boundary's own float, but only when every membership
+            # test (charging by the sim's own delivery_contains, coverage, before / inside the delivery period) gives
+            # the same answer for both, so the event is never moved across a boundary.
+            sides = lambda x: (M.delivery_contains(x, **acc), st <= x < w1, x < dlo, dlo <= x < dhi)  # noqa: E731
+            for bnd in (dlo, dhi, st, w1):
+                if yr != bnd and abs(yr - bnd) <= 1e-9 and sides(bnd) == sides(yr):
+                    yr = float(bnd)
+                    break
             if kind == "decision" and not M.delivery_contains(yr, **acc):
                 unc.append(f"{label} at {yr:.3f}")
             if kind == "history" and yr >= dlo:
