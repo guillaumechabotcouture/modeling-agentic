@@ -290,17 +290,34 @@ def _layout(R):
         ("strip", f"one row per {R.labels.region_title().lower()}, one dot per unit")
 
 
-def _write_csv(path, rows: list[dict]):
+def _publish(path: str, data, root: str) -> None:
+    """Publish under the trusted root (the run dir in the harness, the operator's --out offline): atomic, no link
+    followed (lib.safe_io)."""
+    from toolkit.analysis.artifacts import _safe_io
+    _safe_io().publish(path, data, root)
+
+
+def _fig_bytes(fig, fmt: str, **kw) -> bytes:
+    """The figure rendered into memory (it is then published, never saved by path)."""
+    import io
+    buf = io.BytesIO()
+    fig.savefig(buf, format=fmt, **kw)
+    return buf.getvalue()
+
+
+def _write_csv(path, rows: list[dict], root: str):
+    import io
     if not rows:
         rows = [{"note": "no rows"}]
     keys = []
     for r in rows:
         keys += [k for k in r if k not in keys]
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=keys)
-        w.writeheader()
-        for r in rows:
-            w.writerow(r)
+    f = io.StringIO(newline="")
+    w = csv.DictWriter(f, fieldnames=keys)
+    w.writeheader()
+    for r in rows:
+        w.writerow(r)
+    _publish(path, f.getvalue(), root)
 
 
 # --------------------------------------------------------------------------- figures
@@ -974,7 +991,10 @@ def contact_sheets(res: dict, dest: str, run_dir: str, harness: bool) -> dict:
         for n, im in enumerate(thumbs):
             sheet.paste(im, ((n % ncol) * cw + 10, (n // ncol) * ch + 40))
         path = os.path.join(dest, f"overview_{tier}.png")
-        sheet.save(path, dpi=(FS.DPI, FS.DPI))
+        import io
+        buf = io.BytesIO()
+        sheet.save(buf, format="PNG", dpi=(FS.DPI, FS.DPI))
+        _publish(path, buf.getvalue(), run_dir if harness else dest)
         out[tier] = os.path.relpath(path, run_dir) if harness else path
     return out
 
@@ -2042,26 +2062,34 @@ def _offset_free(fig) -> bool:
 
 
 def _save(fig, out_dir, name, run_dir, sources, harness: bool, t, presentation=None) -> dict:
+    """Publish the PNG, SVG and provenance with no link followed, under the trusted root: the run dir in the harness,
+    the operator's --out (outside the run, checked by render) offline."""
     import matplotlib.pyplot as plt
-    os.makedirs(out_dir, exist_ok=True)
+    root = run_dir if harness else out_dir
+    if not harness:
+        os.makedirs(out_dir, exist_ok=True)          # the operator's --out, outside the run
     png = os.path.join(out_dir, f"{name}.png")
     svg = os.path.join(out_dir, f"{name}.svg")
-    fig.savefig(png, dpi=FS.DPI, facecolor=t["surface"])
-    fig.savefig(svg, facecolor=t["surface"])
+    _publish(png, _fig_bytes(fig, "png", dpi=FS.DPI, facecolor=t["surface"]), root)
+    _publish(svg, _fig_bytes(fig, "svg", facecolor=t["surface"]), root)
     plt.close(fig)
     fv = _fv()
-    fv.validate_figure(png, source_data_paths=[os.path.join(run_dir, s) for s in sources])
+    fv.validate_figure(png, source_data_paths=[os.path.join(run_dir, s) for s in sources], run_dir=root)
     sp = png + ".provenance.json"
-    with open(sp) as f:
-        sc = json.load(f)
+    from toolkit.analysis.artifacts import _safe_io
+    sio = _safe_io()
+    fd, rel = sio.anchored(sp, root)
+    try:
+        sc = json.loads(sio.read_nofollow(fd, rel)[0])
+    finally:
+        os.close(fd)
     sc.update(produced_by="harness" if harness else "harness_rerender", producer=PRODUCER,
               paths_relative_to="run_dir", png_path=os.path.relpath(png, run_dir) if harness else png,
               source_hashes={os.path.relpath(p, run_dir): h for p, h in (sc.get("source_hashes") or {}).items()})
     if not harness:
         sc["run_dir"] = run_dir
     sc["presentation"] = list(presentation or [])        # the unsigned labels/boundaries files used, with their sha
-    with open(sp, "w") as f:
-        json.dump(sc, f, indent=2, sort_keys=True)
+    _publish(sp, json.dumps(sc, indent=2, sort_keys=True), root)
     return {"png": png, "svg": svg}
 
 
@@ -2110,7 +2138,7 @@ def render(run_dir: str, out_dir: str | None = None, labels_overlay: dict | None
         sources = [s for s in sources if os.path.exists(os.path.join(run_dir, s))]
         files = _save(fig, dest, name, run_dir, sources, harness, t, R.presentation_record())
         table = os.path.join(dest, f"{name}.csv")
-        _write_csv(table, rows)
+        _write_csv(table, rows, run_dir if harness else dest)
         cap = cap if len(cap) <= CAPTION_MAX else cap[:CAPTION_MAX - 1].rsplit(" ", 1)[0] + "…"
         cap += extra.pop("caption_note", "")
         rel = (lambda p: os.path.relpath(p, run_dir)) if harness else (lambda p: p)
@@ -2128,9 +2156,11 @@ def render(run_dir: str, out_dir: str | None = None, labels_overlay: dict | None
         res["overviews"] = {"error": f"{type(e).__name__}: {e}"}
     if not harness or write_index:
         import yaml
-        os.makedirs(dest, exist_ok=True)
-        with open(os.path.join(dest, "figures.yaml"), "w") as f:
-            yaml.safe_dump({"run_dir": run_dir, "producer": PRODUCER, **res}, f, sort_keys=False, width=120)
+        if not harness:
+            os.makedirs(dest, exist_ok=True)
+        _publish(os.path.join(dest, "figures.yaml"),
+                 yaml.safe_dump({"run_dir": run_dir, "producer": PRODUCER, **res}, sort_keys=False, width=120),
+                 run_dir if harness else dest)
     return res
 
 
@@ -2223,11 +2253,11 @@ def _compare_draw(Rs, run_dirs, out_dir, names, t) -> dict:
     os.makedirs(out_dir, exist_ok=True)
     png, svg = os.path.join(out_dir, "comparison.png"), os.path.join(out_dir, "comparison.svg")
     clean = _offset_free(fig)
-    fig.savefig(png, dpi=FS.DPI, facecolor=t["surface"])
-    fig.savefig(svg, facecolor=t["surface"])
+    _publish(png, _fig_bytes(fig, "png", dpi=FS.DPI, facecolor=t["surface"]), out_dir)   # the operator's --out
+    _publish(svg, _fig_bytes(fig, "svg", facecolor=t["surface"]), out_dir)
     import matplotlib.pyplot as plt
     plt.close(fig)
-    _write_csv(os.path.join(out_dir, "comparison.csv"), rows)
+    _write_csv(os.path.join(out_dir, "comparison.csv"), rows, out_dir)
     # provenance: every run's sources (absolute: the runs differ), the presentation files, the tier
     fv = _fv()
     srcs = [os.path.join(R.dir, rel) for R in Rs for rel in ("decision_spec.yaml", os.path.join("analysis", "point.yaml"),
@@ -2238,14 +2268,13 @@ def _compare_draw(Rs, run_dirs, out_dir, names, t) -> dict:
             if os.path.exists(os.path.join(R.dir, rel))]
     srcs += [p if os.path.isabs(p) else os.path.join(R.dir, p) for R in Rs
              for p in (os.path.expanduser(str(e["path"])) for e in R.presentation_record())]
-    fv.validate_figure(png, source_data_paths=srcs)
+    fv.validate_figure(png, source_data_paths=srcs, run_dir=out_dir)
     sp = png + ".provenance.json"
     sc = json.load(open(sp))
     pres = [dict(e, run=R.dir) for R in Rs for e in R.presentation_record()]
     sc.update(produced_by="harness_compare", producer=PRODUCER, tier="decision", runs=[R.dir for R in Rs],
               presentation=pres, paths_relative_to="absolute")
-    with open(sp, "w") as f:
-        json.dump(sc, f, indent=2, sort_keys=True)
+    _publish(sp, json.dumps(sc, indent=2, sort_keys=True), out_dir)
     cap = (f"Each run's point plan: headline with its {lvl_txt} UI over that run's declared sources, and its units per "
            f"component and per package (packages matched by their components)."
            + (" The package definitions differ between the runs; packages are matched by their components."
@@ -2257,8 +2286,9 @@ def _compare_draw(Rs, run_dirs, out_dir, names, t) -> dict:
              "spec_differences": diffs, "offset_free": clean, "group": "decision", "tier": "decision",
              "provenance": sp, "presentation": pres}
     import yaml
-    with open(os.path.join(out_dir, "figures.yaml"), "w") as f:
-        yaml.safe_dump({"producer": PRODUCER, "figures": [entry], "not_produced": []}, f, sort_keys=False, width=120)
+    _publish(os.path.join(out_dir, "figures.yaml"),
+             yaml.safe_dump({"producer": PRODUCER, "figures": [entry], "not_produced": []}, sort_keys=False, width=120),
+             out_dir)
     return entry
 
 
@@ -2299,9 +2329,9 @@ def main(argv=None) -> int:
             uq = yaml.safe_load(open(os.path.join(a.run_dir, "analysis", "uncertainty.yaml")))["data"]
             from toolkit.analysis.artifacts import plain
             fd = plain(FD.compute(A, plan, out0, ben0, cost0, uq, z0))
-            with open(os.path.join(a.out, "figure_data.yaml"), "w") as f:
-                yaml.safe_dump({"producer": FD.PRODUCER, "recomputed_from": os.path.abspath(a.run_dir), "data": fd},
-                               f, sort_keys=False, width=120)
+            _publish(os.path.join(a.out, "figure_data.yaml"),
+                     yaml.safe_dump({"producer": FD.PRODUCER, "recomputed_from": os.path.abspath(a.run_dir), "data": fd},
+                                    sort_keys=False, width=120), a.out)   # the operator's --out
         except FD.RebuildRefused as e:
             print(f"recompute refused: {e}", file=sys.stderr)
             fd = None

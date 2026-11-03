@@ -14,7 +14,7 @@ file by path:
   open / io.open / codecs.open / os.fdopen / <path>.open    with a constant write mode (w, a, x, +), or any
                                                            non-constant mode (it may write)
   <path>.write_text / .write_bytes, <array>.tofile, <frame>.to_csv / to_parquet / to_json / to_excel / to_pickle,
-  <figure>.savefig
+  <figure>.savefig, <image>.save (PIL; a module's own save() is not a site)
   os.open                                                  with O_WRONLY, O_RDWR, O_CREAT, O_APPEND or O_TRUNC
   os.remove / unlink / rmdir / removedirs / rename / renames / replace / truncate / symlink / link
   shutil.copy / copy2 / copyfile / copytree / move / rmtree
@@ -214,7 +214,8 @@ class _Scan(ast.NodeVisitor):
             w = _mode_writes(mode)
             if w or (w is None and mode is not None):
                 self.add("path-open-write" if w else "open-dynamic-mode", node)
-        elif isinstance(f, ast.Attribute) and f.attr in _METHOD_WRITES and mod not in ("os", "shutil"):
+        elif isinstance(f, ast.Attribute) and (f.attr in _METHOD_WRITES or (f.attr == "save" and not (
+                isinstance(f.value, ast.Name) and f.value.id in self.alias))) and mod not in ("os", "shutil"):
             self.add("method-write", node)
         elif name == "os.open":
             flags = node.args[1] if len(node.args) > 1 else kw.get("flags")
@@ -316,7 +317,8 @@ REVIEWED: dict = {
     "scripts/telemetry.py": {"open-write": (1, "the operator's --out CSV")},
     "scripts/lib/positive_control.py": {"open-write": (2, "builds the positive-control fixture run in a dir it creates")},
     "scripts/validate_critique_yaml.py": {"os-remove": (1, "its own NamedTemporaryFile in the system temp dir")},
-    "toolkit/analysis/figures.py": {"method-write": (1, "savefig into an in-memory buffer, then lib.safe_io")},
+    "toolkit/analysis/figures.py": {"method-write": (2, "savefig / Image.save into an in-memory buffer "
+                                                         "(_fig_bytes, contact_sheets), then lib.safe_io")},
     "toolkit/analysis/run.py": {"open-write": (5, _FIX + " (_resign, _direct_toy)"), "os-remove": (1, _FIX),
                                 "shutil": (1, _FIX)},
     "toolkit/engines/benchmark.py": {"open-write": (4, _REPO + " (the benchmark CLI's outputs)")},
@@ -338,7 +340,8 @@ _V1 = ("v1 pipeline (main.py without --v2, its hooks and gates): writes in its r
 # OPEN_ITEMS: attacker-reachable write sites not yet on lib.safe_io. Counted exactly, so none is added; each migration
 # lowers a count. These are known gaps, not exemptions.
 OPEN_ITEMS: dict = {
-    "agents/hooks.py": {"shutil": (1, _V1)},
+    "agents/hooks.py": {"shutil": (1, _V1), "method-write": (1, _V1 + " (an oversized image resized in place; "
+                                                              "found when <image>.save became a site)")},
     "agents/integrity.py": {"open-write": (1, _V1)},
     "agents/observability.py": {"open-write": (5, _V1), "os-rename": (1, _V1), "os-remove": (3, _V1)},
     "agents/output_caps.py": {"open-write": (1, _V1)},

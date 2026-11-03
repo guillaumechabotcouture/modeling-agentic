@@ -1,6 +1,6 @@
 ---
 phase: "v2"
-commit: "HW α-β5"
+commit: "HW α-β6"
 ---
 
 ## Changelog
@@ -40,4 +40,12 @@ Following the focused check at 32a30f2 (WA24-WA25):
   - Its units subset is now published below the run dir, with no link followed.
 - The `configure` / `analyze` CLI now takes its root from `MA_PIPELINE_RUN_DIR`, which `scripts/pipeline.py` sets for each step. It no longer uses the spec's directory. It creates its output dir with no link followed.
 - New audit rule `safeio-derived-root`: it flags a `safe_io` root or primitive base derived from the path or the cwd (`os.path.dirname`, `os.getcwd`, `Path.cwd`). There are no such sites in the tree.
+
+After the merge of v2 (#129, #132, #135; WA9 updated, WA26-WA27):
+- The v2 figure set now publishes through `lib.safe_io`. Each figure's PNG, SVG and provenance is rendered into memory and published with no link followed. So are its CSV tables, the overview sheets and `figures.yaml`, and the trajectories record.
+  - The root is the run dir in the harness.
+  - The root is the operator's `--out` offline and for `compare` (outside the runs).
+- The audit now treats PIL's `<image>.save(path)` as a writer; a module's own `save()` is not.
+  - The v1 image resize in `agents/hooks.py` becomes a counted v1 open item (59 in total).
+- The run dossier (#132) only reads; the AST audit scans it with the rest of `tools/`.
 
