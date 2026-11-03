@@ -485,7 +485,8 @@ def _self_test_writers(ok) -> None:
         os.makedirs(os.path.join(d, "figures"))
         v = planted(d, "figures/f.png", out)
         fig = plt.figure()
-        attempt(lambda: FG._save(fig, d, "f.png", []))
+        from toolkit.analysis import figure_style as FS
+        attempt(lambda: FG._save(fig, os.path.join(d, "figures"), "f", d, [], True, FS.setup("light"), []))
         ok(untouched(v), "WA9 a figure is not saved through a planted link")
 
 
@@ -828,6 +829,52 @@ def _self_test_round8(ok) -> None:
        f"not a site ({s})")
 
 
+def _self_test_merge_v2(ok) -> None:
+    """WA26-WA27: writers that came in with the merge of v2 (#132, #135): the figure set (figures.py _save, its
+    tables, overview sheets and index) and the trajectories record, each against a planted link; and PIL's
+    Image.save as an audited writer."""
+    import tempfile
+    for p in (REPO, os.path.join(REPO, "scripts")):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from toolkit.analysis import figures as FG, figure_style as FS, trajectories as TJ
+        open(os.path.join(d, "metadata.json"), "w").write("{}")
+        os.symlink(out, os.path.join(d, "figures"))
+        os.makedirs(os.path.join(out, "x"))
+        os.symlink(os.path.join(out, "x"), os.path.join(d, "analysis"))
+        t = FS.setup("light")
+        for fn in (lambda: FG._save(plt.figure(), os.path.join(d, "figures"), "f", d, [], True, t, []),
+                   lambda: FG._write_csv(os.path.join(d, "figures", "f.csv"), [{"a": 1}], d),
+                   lambda: TJ.write(d, {}, [])):
+            try:
+                fn()
+            except TypeError:
+                try:
+                    FG._write_csv(os.path.join(d, "figures", "f.csv"), [{"a": 1}])
+                except (ValueError, OSError):
+                    pass
+            except (ValueError, OSError):
+                pass
+        png = os.path.join(out, "src.png")
+        plt.figure().savefig(png)
+        try:
+            FG.contact_sheets({"figures": [{"path": png, "tier": "decision"}]}, os.path.join(d, "figures"), d, True)
+        except (ValueError, OSError):
+            pass
+        got = sorted(os.listdir(out)) + sorted(os.listdir(os.path.join(out, "x")))
+        ok(got == ["src.png", "x"], f"WA26 the v2 figure set (_save, its tables, overview sheets) and the "
+                                   f"trajectories record write nothing through planted figures/ and analysis/ "
+                                   f"links ({got})")
+    s = scan_text("from PIL import Image\nimport fix_loop as FL\ndef m(p, d):\n    Image.open(p).save(p)\n"
+                  "    FL.save(d, {})\n")
+    ok(s.get("method-write") == [4], f"WA27 PIL's <image>.save(path) is an audited writer; a module's save() is "
+                                     f"not ({s})")
+
+
 def _self_test() -> int:
     fails = []
 
@@ -858,6 +905,7 @@ def _self_test() -> int:
     _self_test_round6(ok)
     _self_test_round7(ok)
     _self_test_round8(ok)
+    _self_test_merge_v2(ok)
     live = problems(sites(), REVIEWED, OPEN_ITEMS)
     n_open = sum(n for pats in OPEN_ITEMS.values() for n, _ in pats.values())
     print(f"NOTE {n_open} attacker-reachable write site(s) remain as counted open items (OPEN_ITEMS)")
